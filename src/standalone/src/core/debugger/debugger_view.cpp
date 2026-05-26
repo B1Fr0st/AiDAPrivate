@@ -4703,10 +4703,9 @@ void render(float pos_x, float pos_y, float width, float height,
 			run_target::launch_result_t lr{};
 			bool ok = debugger_engine::spawn_and_attach_target(opts, &new_pid, &lr);
 			std::wstring sandbox_dir_snapshot = lr.sandbox_dir;
-			bool sandbox_registered = lr.sandbox_pid_registered;
-			bool net_logger_registered = lr.net_logger_registered;
-			bool integrity_lowered = lr.integrity_lowered;
-			if (lr.thread_handle != 0) {
+			if (opts.isolation == run_target::isolation_t::windows_sandbox) {
+				run_target::cleanup(lr);
+			} else if (lr.thread_handle != 0) {
 				CloseHandle(reinterpret_cast<HANDLE>(lr.thread_handle));
 				lr.thread_handle = 0;
 			}
@@ -4721,26 +4720,14 @@ void render(float pos_x, float pos_y, float width, float height,
 					toast_notification::toast_type_t::error);
 			} else if (opts.isolation == run_target::isolation_t::windows_sandbox) {
 				toast_notification::push(
-					"Launched Windows Sandbox session.",
-					toast_notification::toast_type_t::success);
-			} else if (opts.malware_safe_mode
-			           || opts.isolation == run_target::isolation_t::malware_safe_desktop) {
-				char ok_msg[256];
-				std::snprintf(ok_msg, sizeof(ok_msg),
-					"Launched PID %u in malware-safe mode (kernel_guard=%d, net_log=%d, il_lowered=%d)",
-					static_cast<unsigned>(new_pid),
-					sandbox_registered ? 1 : 0,
-					net_logger_registered ? 1 : 0,
-					integrity_lowered ? 1 : 0);
-				toast_notification::push(ok_msg,
+					"Launched interactive malware lab VM.",
 					toast_notification::toast_type_t::success);
 			} else {
 				char ok_msg[160];
 				std::snprintf(ok_msg, sizeof(ok_msg),
-					"Launched PID %u (%s isolation)",
+					"Host launch started PID %u (iso=%d)",
 					static_cast<unsigned>(new_pid),
-					opts.isolation == run_target::isolation_t::appcontainer
-						? "AppContainer" : "jobbed");
+					static_cast<int>(opts.isolation));
 				toast_notification::push(ok_msg,
 					toast_notification::toast_type_t::success);
 			}

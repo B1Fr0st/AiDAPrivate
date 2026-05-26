@@ -769,7 +769,7 @@ static void render_session_tabs(float x, float y, float width, float height, flo
 		ImVec2 b(a.x + card_w, a.y + card_h);
 		dl->AddRectFilled(a, b, aida::ui::with_alpha(th.bg_elevated, 0.5f * alpha), 6.f);
 		dl->AddRect(a, b, aida::ui::with_alpha(th.border_subtle, 0.6f * alpha), 6.f, 0, 1.f);
-		const char* msg = "No binary open. Click a file in the Explorer, attach to a process, or launch a binary.";
+		const char* msg = "No binary open. Click a file in the Explorer, attach to a process, or press Run.";
 		ImVec2 ts = ImGui::CalcTextSize(msg);
 		dl->AddText(ImVec2(a.x + (card_w - ts.x) * 0.5f, a.y + (card_h - ts.y) * 0.5f),
 			aida::ui::with_alpha(th.text_dim, 0.85f * alpha), msg);
@@ -789,7 +789,7 @@ static void render_session_tabs(float x, float y, float width, float height, flo
 			dl->AddLine(ImVec2(cx - 5.f, cy), ImVec2(cx + 5.f, cy), plus_col, 1.6f);
 			dl->AddLine(ImVec2(cx, cy - 5.f), ImVec2(cx, cy + 5.f), plus_col, 1.6f);
 			if (plus_hov && !ui_input_gate::popup_blocks_background_input()) {
-				ImGui::SetTooltip("New session\nLeft-click: Open File...\nRight-click: Attach to Process...\nMiddle-click: Run Binary...");
+				ImGui::SetTooltip("New session\nLeft-click: Open File...\nRight-click: Attach to Process...\nMiddle-click: Run...");
 				if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
 					anti_tamper::webhook::write_log("file_dialog", "session_tab_plus left_click open_file_dialog");
 					std::string fpath = disasm::open_file_dialog(g_hwnd);
@@ -992,7 +992,7 @@ static void render_session_tabs(float x, float y, float width, float height, flo
 			dl->AddLine(ImVec2(cxp - 6.f, cyp), ImVec2(cxp + 6.f, cyp), plus_col, 1.6f);
 			dl->AddLine(ImVec2(cxp, cyp - 6.f), ImVec2(cxp, cyp + 6.f), plus_col, 1.6f);
 			if (plus_hov && !ui_input_gate::popup_blocks_background_input()) {
-				ImGui::SetTooltip("New session\nLeft-click: Open File...\nRight-click: Attach to Process...\nMiddle-click: Run Binary...");
+				ImGui::SetTooltip("New session\nLeft-click: Open File...\nRight-click: Attach to Process...\nMiddle-click: Run...");
 				if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
 					anti_tamper::webhook::write_log("file_dialog", "session_tab_plus(open) left_click");
 					std::string fpath = disasm::open_file_dialog(g_hwnd);
@@ -5642,7 +5642,7 @@ void helpers::render_title()
 				strncpy_s(spawn_target_dialog::detail::cwd_buf(), 1024, cwd_v.c_str(), _TRUNCATE);
 			}
 			output_log::push(bottom_tab_t::sandbox_log,
-				std::string("[Run] Opening Launch Target dialog for: ") + path);
+				std::string("[Run] Opening launch choice dialog for: ") + path);
 		};
 
 		if (run_clicked) {
@@ -5710,8 +5710,8 @@ void helpers::render_title()
 				}
 				output_log::push(bottom_tab_t::sandbox_log,
 					prefill_exe.empty()
-						? std::string("[Run] Opening Launch Target dialog (no file pre-fill).")
-						: std::string("[Run] Opening Launch Target dialog for: ") + prefill_exe);
+						? std::string("[Run] Opening launch choice dialog (no file pre-fill).")
+						: std::string("[Run] Opening launch choice dialog for: ") + prefill_exe);
 				_snprintf_s(log_buf, sizeof(log_buf), _TRUNCATE,
 					"run sessions=0 choice=fallback status=dialog");
 				anti_tamper::webhook::write_log("chrome", log_buf);
@@ -5734,9 +5734,9 @@ void helpers::render_title()
 			ImGui::SetNextWindowSize(ImVec2(440.f, 0.f), ImGuiCond_Appearing);
 			if (ImGui::BeginPopupModal("##chrome_run_confirm", nullptr,
 				ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
-				ImGui::TextUnformatted("Run binary?");
+				ImGui::TextUnformatted("Open launch choice?");
 				ImGui::Separator();
-				ImGui::TextWrapped("Launch: %s", s_run_confirm_label.c_str());
+				ImGui::TextWrapped("Sample: %s", s_run_confirm_label.c_str());
 				ImGui::Spacing();
 				bool yes = aida::ui::components::button("Yes",
 					aida::ui::components::button_kind_t::primary,
@@ -5808,7 +5808,7 @@ void helpers::render_title()
 				}
 				ImGui::EndChild();
 				ImGui::Spacing();
-				bool launch_btn = aida::ui::components::button("Launch",
+				bool launch_btn = aida::ui::components::button("Continue",
 					aida::ui::components::button_kind_t::primary,
 					aida::ui::components::size_t_::md, ImVec2(110.f, 26.f));
 				ImGui::SameLine();
@@ -5865,12 +5865,15 @@ void helpers::render_title()
 				 + " block_net=" + (opts.block_network ? "1" : "0")
 				 + " kill_on_exit=" + (opts.kill_on_host_exit ? "1" : "0")
 				 + " attach=" + (opts.attach_after_resume ? "1" : "0")).c_str());
+			const bool dispatch_vm = opts.isolation == run_target::isolation_t::windows_sandbox;
 			output_log::push(bottom_tab_t::sandbox_log,
-				std::string("[Run] Launching ") + exe_log
+				std::string("[Run] Starting ") + (dispatch_vm ? "interactive VM" : "host launch")
+					+ " for " + exe_log
 					+ " iso=" + std::to_string(static_cast<int>(opts.isolation))
 					+ " block_net=" + (opts.block_network ? "1" : "0"));
 			toast_notification::push(
-				std::string("Launching ") + (exe_log.empty() ? std::string("target") : exe_log),
+				std::string(dispatch_vm ? "Starting malware lab VM for " : "Starting host run for ")
+					+ (exe_log.empty() ? std::string("target") : exe_log),
 				toast_notification::toast_type_t::info, 3.0f);
 
 			work_queue::post([opts, exe_log]() {
@@ -5878,11 +5881,9 @@ void helpers::render_title()
 				run_target::launch_result_t lr{};
 				bool ok = debugger_engine::spawn_and_attach_target(opts, &new_pid, &lr);
 				std::wstring sandbox_dir_snapshot = lr.sandbox_dir;
-				bool sandbox_registered = lr.sandbox_pid_registered;
-				bool net_logger_registered = lr.net_logger_registered;
-				bool integrity_lowered = lr.integrity_lowered;
-				bool mitigations_applied = lr.mitigations_applied;
-				if (lr.thread_handle != 0) {
+				if (opts.isolation == run_target::isolation_t::windows_sandbox) {
+					run_target::cleanup(lr);
+				} else if (lr.thread_handle != 0) {
 					CloseHandle(reinterpret_cast<HANDLE>(lr.thread_handle));
 					lr.thread_handle = 0;
 				}
@@ -5903,58 +5904,21 @@ void helpers::render_title()
 					anti_tamper::webhook::write_log("run",
 						"launch_ok windows_sandbox_session_started");
 					output_log::push(bottom_tab_t::sandbox_log,
-						"[Run] Windows Sandbox session launched.");
-					toast_notification::push("Windows Sandbox started",
+						"[Run] Interactive Windows Sandbox VM launched.");
+					toast_notification::push("Malware lab VM started",
 						toast_notification::toast_type_t::success, 4.0f);
-				} else if (opts.malware_safe_mode
-				           || opts.isolation == run_target::isolation_t::malware_safe_desktop) {
-					char line[256];
-					std::snprintf(line, sizeof(line),
-						"[Run] PID %u launched in malware-safe mode kguard=%d net_log=%d il=%d mitig=%d.",
-						static_cast<unsigned>(new_pid),
-						sandbox_registered ? 1 : 0,
-						net_logger_registered ? 1 : 0,
-						integrity_lowered ? 1 : 0,
-						mitigations_applied ? 1 : 0);
-					output_log::push(bottom_tab_t::sandbox_log, line);
-					anti_tamper::webhook::write_log("run",
-						(std::string("launch_ok malware_safe pid=") + std::to_string(static_cast<unsigned>(new_pid))
-						 + " iso=" + std::to_string(static_cast<int>(opts.isolation))
-						 + " exe='" + exe_log + "'").c_str());
-					std::string exe_leaf = exe_log;
-					{
-						size_t sl = exe_leaf.find_last_of("/\\");
-						if (sl != std::string::npos) exe_leaf = exe_leaf.substr(sl + 1);
-					}
-					char toast_line[256];
-					std::snprintf(toast_line, sizeof(toast_line),
-						"Started %s in malware-safe mode (PID %u)",
-						exe_leaf.empty() ? "target" : exe_leaf.c_str(),
-						static_cast<unsigned>(new_pid));
-					toast_notification::push(toast_line,
-						toast_notification::toast_type_t::success, 5.0f);
 				} else {
 					char line[160];
 					std::snprintf(line, sizeof(line),
-						"[Run] PID %u launched (iso=%d).",
+						"[Run] Host launch started pid=%u iso=%d.",
 						static_cast<unsigned>(new_pid),
 						static_cast<int>(opts.isolation));
 					output_log::push(bottom_tab_t::sandbox_log, line);
 					anti_tamper::webhook::write_log("run",
-						(std::string("launch_ok pid=") + std::to_string(static_cast<unsigned>(new_pid))
+						(std::string("launch_ok_host pid=") + std::to_string(static_cast<unsigned>(new_pid))
 						 + " iso=" + std::to_string(static_cast<int>(opts.isolation))
 						 + " exe='" + exe_log + "'").c_str());
-					std::string exe_leaf = exe_log;
-					{
-						size_t sl = exe_leaf.find_last_of("/\\");
-						if (sl != std::string::npos) exe_leaf = exe_leaf.substr(sl + 1);
-					}
-					char toast_line[200];
-					std::snprintf(toast_line, sizeof(toast_line),
-						"Started %s (PID %u)",
-						exe_leaf.empty() ? "target" : exe_leaf.c_str(),
-						static_cast<unsigned>(new_pid));
-					toast_notification::push(toast_line,
+					toast_notification::push("Host launch started",
 						toast_notification::toast_type_t::success, 4.0f);
 				}
 			});
@@ -6086,7 +6050,7 @@ void helpers::render_title()
 		if (!overlay_blocking) {
 			const char* hint = !g_disasm.file.err.empty()     ? g_disasm.file.err.c_str()
 				             : !g_disasm.file.loaded           ? "Choose a file to begin"
-				             :                                   "Click 'Run' to execute in sandbox";
+				             :                                   "Click 'Run' to choose VM or host launch";
 			ImVec2 ht2 = ImGui::CalcTextSize(hint);
 			float  window_h = ImGui::GetWindowHeight();
 			cdl->AddText(ImVec2(orig.x + vw*0.5f - ht2.x*0.5f, orig.y + window_h * 0.5f - ht2.y*0.5f),

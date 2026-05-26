@@ -10,8 +10,10 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <sstream>
 #include <string>
+#include <vector>
 
 namespace aida {
 namespace burp {
@@ -138,10 +140,14 @@ tool_result_t tool_headless_start(const json& params)
             cfg.locale = params["locale"].get<std::string>();
         if (params.contains("humanize") && params["humanize"].is_boolean())
             cfg.humanize = params["humanize"].get<bool>();
+        if (params.contains("geoip") && params["geoip"].is_boolean())
+            cfg.geoip = params["geoip"].get<bool>();
         if (params.contains("block_images") && params["block_images"].is_boolean())
             cfg.block_images = params["block_images"].get<bool>();
         if (params.contains("block_webrtc") && params["block_webrtc"].is_boolean())
             cfg.block_webrtc = params["block_webrtc"].get<bool>();
+        if (params.contains("enable_trace") && params["enable_trace"].is_boolean())
+            cfg.enable_trace = params["enable_trace"].get<bool>();
         if (params.contains("python_executable") && params["python_executable"].is_string())
             cfg.python_executable = params["python_executable"].get<std::string>();
         if (params.contains("server_module") && params["server_module"].is_string())
@@ -149,9 +155,9 @@ tool_result_t tool_headless_start(const json& params)
         if (params.contains("launch_timeout_ms") && params["launch_timeout_ms"].is_number_integer())
             cfg.launch_timeout_ms = params["launch_timeout_ms"].get<int>();
     }
-    diag::log_tagged_fmt("mcp_burp", "headless_start config headless=%d has_proxy=%d proxy_len=%zu os=%s locale=%s humanize=%d block_images=%d block_webrtc=%d python=%s module=%s timeout_ms=%d",
+    diag::log_tagged_fmt("mcp_burp", "headless_start config headless=%d has_proxy=%d proxy_len=%zu os=%s locale=%s humanize=%d geoip=%d block_images=%d block_webrtc=%d enable_trace=%d python=%s module=%s timeout_ms=%d",
         (int)cfg.headless, (int)!cfg.proxy.empty(), cfg.proxy.size(), cfg.os.c_str(), cfg.locale.c_str(),
-        (int)cfg.humanize, (int)cfg.block_images, (int)cfg.block_webrtc,
+        (int)cfg.humanize, (int)cfg.geoip, (int)cfg.block_images, (int)cfg.block_webrtc, (int)cfg.enable_trace,
         cfg.python_executable.c_str(), cfg.server_module.c_str(), cfg.launch_timeout_ms);
     bool ok = camoufox::start_bridge(cfg);
     auto s = camoufox::get_status();
@@ -168,6 +174,349 @@ tool_result_t tool_headless_start(const json& params)
         state_label(s.state), (int)s.browser_open, static_cast<unsigned long long>(s.total_calls),
         static_cast<unsigned long long>(s.total_errors), json_shape(j).c_str());
     return tool_result_t::ok(j);
+}
+
+int json_int_param(const json& params, const char* name, int fallback)
+{
+    if (!params.is_object() || !params.contains(name))
+        return fallback;
+    const json& v = params[name];
+    try
+    {
+        if (v.is_number_integer())
+            return v.get<int>();
+        if (v.is_number())
+            return static_cast<int>(v.get<double>());
+    }
+    catch (...) {}
+    return fallback;
+}
+
+bool json_bool_param(const json& params, const char* name, bool fallback)
+{
+    if (!params.is_object() || !params.contains(name) || !params[name].is_boolean())
+        return fallback;
+    return params[name].get<bool>();
+}
+
+std::string json_string_param(const json& params, const char* name, const std::string& fallback = std::string())
+{
+    if (!params.is_object() || !params.contains(name) || !params[name].is_string())
+        return fallback;
+    return params[name].get<std::string>();
+}
+
+json camoufox_args(const json& params)
+{
+    json args = params.is_object() ? params : json::object();
+    args.erase("binary_id");
+    args.erase("call_timeout_ms");
+    args.erase("launch_timeout_ms");
+    args.erase("python_executable");
+    args.erase("server_module");
+    return args;
+}
+
+int camoufox_timeout_ms(const json& params, int fallback)
+{
+    int timeout_ms = fallback > 0 ? fallback : 30000;
+    timeout_ms = json_int_param(params, "call_timeout_ms", timeout_ms);
+    timeout_ms = json_int_param(params, "timeout_ms", timeout_ms);
+    const int timeout = json_int_param(params, "timeout", 0);
+    if (timeout > 0)
+        timeout_ms = (std::max)(timeout_ms, timeout + 5000);
+    const int duration = json_int_param(params, "duration", 0);
+    if (duration > 0)
+        timeout_ms = (std::max)(timeout_ms, duration * 1000 + 15000);
+    if (timeout_ms < 5000) timeout_ms = 5000;
+    if (timeout_ms > 300000) timeout_ms = 300000;
+    return timeout_ms;
+}
+
+tool_result_t bridge_result_to_tool_result(const camoufox::call_result_t& r)
+{
+    if (r.ok)
+    {
+        if (!r.data.is_null() && !r.data.empty())
+            return tool_result_t::ok(r.data);
+        if (!r.text.empty())
+            return tool_result_t::ok(r.text);
+        return tool_result_t::ok(json{{"status", "ok"}});
+    }
+
+    tool_result_t out;
+    out.success = false;
+    out.text = r.error.empty() ? (r.text.empty() ? std::string("camoufox tool failed") : r.text) : r.error;
+    if (!r.data.is_null() && !r.data.empty())
+        out.data = r.data;
+    return out;
+}
+
+camoufox::launch_config_t launch_config_from_mcp_params(const json& params)
+{
+    camoufox::launch_config_t cfg;
+    cfg.headless = json_bool_param(params, "headless", cfg.headless);
+    cfg.proxy = json_string_param(params, "proxy", cfg.proxy);
+    cfg.os = json_string_param(params, "os_type", json_string_param(params, "os", cfg.os));
+    cfg.locale = json_string_param(params, "locale", cfg.locale);
+    cfg.humanize = json_bool_param(params, "humanize", cfg.humanize);
+    cfg.geoip = json_bool_param(params, "geoip", cfg.geoip);
+    cfg.block_images = json_bool_param(params, "block_images", cfg.block_images);
+    cfg.block_webrtc = json_bool_param(params, "block_webrtc", cfg.block_webrtc);
+    cfg.enable_trace = json_bool_param(params, "enable_trace", cfg.enable_trace);
+    cfg.python_executable = json_string_param(params, "python_executable", cfg.python_executable);
+    cfg.server_module = json_string_param(params, "server_module", cfg.server_module);
+    cfg.launch_timeout_ms = json_int_param(params, "launch_timeout_ms", cfg.launch_timeout_ms);
+    return cfg;
+}
+
+tool_result_t tool_launch_browser(const json& params)
+{
+    camoufox::launch_config_t cfg = launch_config_from_mcp_params(params);
+    bool ok = camoufox::start_bridge(cfg);
+    json j = status_to_json(camoufox::get_status());
+    if (!ok)
+    {
+        tool_result_t out;
+        out.success = false;
+        out.text = j.value("last_error", std::string("camoufox launch_browser failed"));
+        out.data = j;
+        return out;
+    }
+    return tool_result_t::ok(j);
+}
+
+tool_result_t tool_close_browser(const json&)
+{
+    bool ok = camoufox::stop_bridge();
+    json j = status_to_json(camoufox::get_status());
+    if (!ok)
+    {
+        tool_result_t out;
+        out.success = false;
+        out.text = j.value("last_error", std::string("camoufox close_browser failed"));
+        out.data = j;
+        return out;
+    }
+    return tool_result_t::ok(j);
+}
+
+tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json& params, int default_timeout_ms)
+{
+    json args = camoufox_args(params);
+    int timeout_ms = camoufox_timeout_ms(params, default_timeout_ms);
+    diag::log_tagged_fmt("mcp_burp", "camoufox_passthrough tool=%s timeout_ms=%d args_shape=%s",
+        tool_name.c_str(), timeout_ms, json_shape(args).c_str());
+    return bridge_result_to_tool_result(camoufox::call_tool(tool_name, args, timeout_ms));
+}
+
+struct camoufox_tool_spec_t
+{
+    const char* name;
+    const char* description;
+    std::vector<compat_param_t> params;
+    bool read_only;
+    int timeout_ms;
+};
+
+std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
+{
+    return {
+        {"launch_browser", "Launch the bundled Camoufox anti-detection browser through AiDA's integrated bridge.",
+            {{"headless", "boolean", "Run in headless mode; AiDA defaults to visible headed Camoufox", false},
+             {"os_type", "string", "Spoofed OS: auto, windows, macos, or linux", false},
+             {"locale", "string", "Browser locale such as en-US; auto uses the system locale", false},
+             {"proxy", "string", "Proxy URL such as http://127.0.0.1:8443", false},
+             {"humanize", "boolean", "Enable humanized mouse movement", false},
+             {"geoip", "boolean", "Infer geolocation from proxy IP", false},
+             {"block_images", "boolean", "Block image loading", false},
+             {"block_webrtc", "boolean", "Block WebRTC to prevent IP leaks", false},
+             {"enable_trace", "boolean", "Enable engine-level property access tracing", false},
+             {"python_executable", "string", "Override Python interpreter path", false},
+             {"server_module", "string", "Override Python module name", false},
+             {"launch_timeout_ms", "number", "Launch timeout in milliseconds", false}}, false, 240000},
+        {"close_browser", "Close Camoufox and stop the hidden bundled Python bridge.", {}, false, 30000},
+        {"navigate", "Navigate the active Camoufox page with optional hook pre-injection and redirect tracing.",
+            {{"url", "string", "Target URL", true},
+             {"wait_until", "string", "load, domcontentloaded, or networkidle", false},
+             {"pre_inject_hooks", "array", "Hook preset names to register before navigation", false},
+             {"collect_response_chain", "boolean", "Record response chain for final status resolution", false},
+             {"clear_network_capture", "boolean", "Clear stale network capture before navigating", false},
+             {"include_title", "boolean", "Return page title when available", false}}, false, 60000},
+        {"reload", "Reload the current Camoufox page while preserving init scripts.",
+            {{"wait_until", "string", "load, domcontentloaded, or networkidle", false}}, false, 45000},
+        {"take_screenshot", "Capture a base64 PNG screenshot of the current page or selected element.",
+            {{"full_page", "boolean", "Capture the full scrollable page", false},
+             {"selector", "string", "CSS selector for an element screenshot", false}}, true, 60000},
+        {"take_snapshot", "Return a token-efficient accessibility snapshot of the current page.", {}, true, 30000},
+        {"click", "Click an element matching a CSS selector in the active Camoufox page.",
+            {{"selector", "string", "CSS selector", true}}, false, 30000},
+        {"type_text", "Type text into an element with realistic keystroke delay.",
+            {{"selector", "string", "CSS selector", true},
+             {"text", "string", "Text to type", true},
+             {"delay", "number", "Delay between key presses in milliseconds", false}}, false, 30000},
+        {"wait_for", "Wait for a selector or URL pattern in Camoufox.",
+            {{"selector", "string", "CSS selector to wait for", false},
+             {"url_pattern", "string", "URL pattern to wait for", false},
+             {"timeout", "number", "Wait timeout in milliseconds", false}}, true, 45000},
+        {"get_page_info", "Return current page URL, title, and viewport size.", {}, true, 30000},
+        {"reset_browser_state", "Clear Camoufox residual state such as persistent hooks, capture buffers, routes, cookies, or storage.",
+            {{"clear_persistent_hooks", "boolean", "Remove persistent init scripts", false},
+             {"clear_network_capture", "boolean", "Clear network capture buffer and stop captures", false},
+             {"clear_active_routes", "boolean", "Clear instrumentation routes", false},
+             {"clear_cookies", "boolean", "Clear browser cookies", false},
+             {"clear_storage", "boolean", "Clear localStorage and sessionStorage", false}}, false, 45000},
+        {"evaluate_js", "Execute a JavaScript expression in the active page context.",
+            {{"expression", "string", "JavaScript expression", true},
+             {"await_promise", "boolean", "Await promise return values", false}}, false, 45000},
+        {"hook_function", "Hook or trace a JavaScript function by path.",
+            {{"function_path", "string", "Path such as window.encrypt or XMLHttpRequest.prototype.open", true},
+             {"mode", "string", "intercept or trace", false},
+             {"hook_code", "string", "Custom hook code for intercept mode", false},
+             {"position", "string", "before, after, or replace", false},
+             {"non_overridable", "boolean", "Install a non-overridable descriptor", false},
+             {"persistent", "boolean", "Persist across navigations", false},
+             {"log_args", "boolean", "Capture function arguments", false},
+             {"log_return", "boolean", "Capture return values", false},
+             {"log_stack", "boolean", "Capture stack traces", false},
+             {"max_captures", "number", "Maximum captures to keep", false}}, false, 45000},
+        {"add_init_script", "Register JavaScript to run before page scripts on future navigations.",
+            {{"script", "string", "JavaScript source", true},
+             {"name", "string", "Optional script name", false}}, false, 30000},
+        {"inject_hook_preset", "Inject a built-in hook preset such as xhr, fetch, crypto, websocket, cookie, or runtime_probe.",
+            {{"preset", "string", "Preset name", true},
+             {"persistent", "boolean", "Persist across navigations", false}}, false, 30000},
+        {"remove_hooks", "Remove installed JavaScript hooks and restore originals.",
+            {{"keep_persistent", "boolean", "Keep persistent init scripts registered", false}}, false, 30000},
+        {"get_console_logs", "Return console output collected from the active page.",
+            {{"level", "string", "Filter by log, warn, error, or info", false},
+             {"keyword", "string", "Filter logs containing this text", false},
+             {"clear", "boolean", "Clear the log buffer after retrieval", false}}, true, 30000},
+        {"network_capture", "Start, stop, clear, or report Camoufox network capture.",
+            {{"action", "string", "start, stop, clear, or status", true},
+             {"url_pattern", "string", "URL glob pattern", false},
+             {"capture_body", "boolean", "Capture response bodies", false}}, false, 30000},
+        {"list_network_requests", "List captured network requests with optional filters.",
+            {{"url_filter", "string", "Substring filter for URLs", false},
+             {"url_contains_domain", "string", "Domain substring filter", false},
+             {"method", "string", "HTTP method filter", false},
+             {"resource_type", "string", "Resource type filter", false},
+             {"status_code", "number", "HTTP status code filter", false}}, true, 30000},
+        {"get_network_request", "Return full details for a captured network request.",
+            {{"request_id", "number", "Request id from list_network_requests", true},
+             {"include_body", "boolean", "Include response body", false},
+             {"include_headers", "boolean", "Include request and response headers", false},
+             {"max_body_size", "number", "Maximum body characters", false}}, true, 30000},
+        {"get_request_initiator", "Return the JavaScript call stack that initiated a captured request.",
+            {{"request_id", "number", "Request id from list_network_requests", true}}, true, 30000},
+        {"intercept_request", "Intercept matching network requests and log, block, modify, mock, or stop routing.",
+            {{"url_pattern", "string", "URL glob pattern", true},
+             {"action", "string", "log, block, modify, mock, or stop", false},
+             {"modify_headers", "object", "Headers to add or override", false},
+             {"modify_body", "string", "Replacement request body", false},
+             {"mock_response", "object", "Mock response object", false}}, false, 30000},
+        {"scripts", "List loaded scripts, get source for one script, or save a script to disk.",
+            {{"action", "string", "list, get, or save", true},
+             {"url", "string", "Script URL for get or save", false},
+             {"save_path", "string", "Destination path for save", false}}, false, 30000},
+        {"search_code", "Search loaded scripts for a keyword.",
+            {{"keyword", "string", "Keyword to search for", true},
+             {"script_url", "string", "Optional script URL to limit the search", false},
+             {"context_chars", "number", "Characters of context around matches", false},
+             {"context_lines", "number", "Lines of context around matches", false},
+             {"max_results", "number", "Maximum matches", false}}, true, 30000},
+        {"cookies", "Get, set, or delete browser cookies.",
+            {{"action", "string", "get, set, or delete", true},
+             {"domain", "string", "Domain filter", false},
+             {"cookies_list", "array", "Cookie objects to set", false},
+             {"name", "string", "Cookie name for delete", false}}, false, 30000},
+        {"get_storage", "Return localStorage or sessionStorage from the active page.",
+            {{"storage_type", "string", "local or session", false}}, true, 30000},
+        {"export_state", "Export cookies and storage to a JSON file.",
+            {{"save_path", "string", "Destination JSON path", true}}, false, 30000},
+        {"import_state", "Import cookies and storage from a JSON file into a new context.",
+            {{"state_path", "string", "Source JSON path", true}}, false, 30000},
+        {"hook_jsvmp_interpreter", "Install a JSVMP runtime probe for interpreter analysis.",
+            {{"script_url", "string", "Optional script URL focus", false},
+             {"persistent", "boolean", "Persist across navigations", false},
+             {"mode", "string", "Probe mode", false},
+             {"track_calls", "boolean", "Track calls", false},
+             {"track_props", "boolean", "Track property access", false},
+             {"track_reflect", "boolean", "Track Reflect APIs", false},
+             {"proxy_objects", "array", "Global objects to proxy", false},
+             {"max_entries", "number", "Maximum log entries", false}}, false, 45000},
+        {"compare_env", "Collect browser environment fingerprint data for comparison.",
+            {{"properties", "array", "Specific properties to check", false}}, true, 30000},
+        {"instrumentation", "Install, query, stop, or reload source-level JSVMP instrumentation.",
+            {{"action", "string", "install, status, log, stop, or reload", true},
+             {"url_pattern", "string", "URL glob to instrument", false},
+             {"mode", "string", "ast or regex", false},
+             {"tag", "string", "Instrumentation tag", false},
+             {"rewrite_member_access", "boolean", "Rewrite member property access", false},
+             {"rewrite_calls", "boolean", "Rewrite calls", false},
+             {"max_rewrites", "number", "Maximum rewrites", false},
+             {"fallback_on_error", "boolean", "Fall back when AST rewrite fails", false},
+             {"ignore_csp", "boolean", "Bypass CSP for injected scripts", false},
+             {"clear_log", "boolean", "Clear log before reload", false},
+             {"wait_until", "string", "Navigation wait state for reload", false},
+             {"tag_filter", "string", "Filter instrumentation log by tag", false},
+             {"type_filter", "string", "Filter instrumentation log by event type", false},
+             {"key_filter", "string", "Filter instrumentation log by key", false},
+             {"limit", "number", "Maximum log entries", false},
+             {"clear", "boolean", "Clear log after retrieval", false},
+             {"filter_property_names", "array", "Property-name allowlist", false},
+             {"filter_object_names", "array", "Object-name allowlist", false},
+             {"max_file_size", "number", "Maximum script size to rewrite", false},
+             {"on_oversized", "string", "Oversized script policy", false}}, false, 60000},
+        {"check_environment", "Check Camoufox MCP dependencies and browser state.", {}, true, 30000},
+        {"verify_signer_offline", "Verify a candidate JavaScript signing function against captured samples offline.",
+            {{"signer_code", "string", "Candidate signer source", true},
+             {"samples", "array", "Request/signature samples", true},
+             {"compare_params", "array", "Parameter names to compare", false}}, true, 30000},
+        {"trace_property_access", "Collect engine-level DOM property access trace data.",
+            {{"duration", "number", "Trace duration in seconds", false},
+             {"mode", "string", "summary, timeline, sequence, or search", false},
+             {"filter_object", "string", "Object name filter", false},
+             {"search_query", "string", "Search query", false},
+             {"limit", "number", "Maximum events", false},
+             {"bucket_ms", "number", "Timeline bucket size in milliseconds", false},
+             {"collect_values", "boolean", "Collect property values", false}}, true, 120000},
+        {"list_trace_files", "List persisted Camoufox property trace files.",
+            {{"limit", "number", "Maximum files", false}}, true, 30000},
+        {"query_trace_file", "Query a persisted Camoufox property trace file.",
+            {{"file_path", "string", "Trace JSONL path", true},
+             {"mode", "string", "summary, timeline, sequence, or search", false},
+             {"filter_object", "string", "Object name filter", false},
+             {"search_query", "string", "Search query", false},
+             {"limit", "number", "Maximum events", false},
+             {"bucket_ms", "number", "Timeline bucket size in milliseconds", false}}, true, 60000},
+        {"analyze_cookie_sources", "Attribute observed cookies to HTTP headers or JavaScript writes.",
+            {{"name_filter", "string", "Optional cookie-name filter", false}}, true, 30000}
+    };
+}
+
+void register_camoufox_reverse_tools(mcp_standalone::server_t& srv)
+{
+    for (const auto& spec : camoufox_tool_specs())
+    {
+        const std::string tool_name = spec.name;
+        const int timeout_ms = spec.timeout_ms;
+        auto handler = [tool_name, timeout_ms](const json& params) -> tool_result_t {
+            if (tool_name == "launch_browser")
+                return tool_launch_browser(params);
+            if (tool_name == "close_browser")
+                return tool_close_browser(params);
+            return tool_camoufox_passthrough(tool_name, params, timeout_ms);
+        };
+        register_compat(srv, {
+            spec.name,
+            "camoufox_reverse",
+            spec.description,
+            spec.params,
+            handler,
+            spec.read_only
+        });
+    }
 }
 
 tool_result_t tool_headless_stop(const json& params)
@@ -494,6 +843,8 @@ tool_result_t tool_headless_reset_state(const json& params)
 
 void register_camoufox_tools(mcp_standalone::server_t& srv)
 {
+    register_camoufox_reverse_tools(srv);
+
     register_compat(srv, {
         "burp_headless_start",
         "headless_browser",
@@ -506,11 +857,13 @@ void register_camoufox_tools(mcp_standalone::server_t& srv)
             {"os",                "string",  "Spoofed OS: auto/windows/macos/linux", false},
             {"locale",            "string",  "Browser locale, default auto", false},
             {"humanize",          "boolean", "Enable humanized mouse movement", false},
+            {"geoip",             "boolean", "Infer geolocation from proxy IP", false},
             {"block_images",      "boolean", "Block image loading", false},
             {"block_webrtc",      "boolean", "Block WebRTC to prevent IP leaks", false},
+            {"enable_trace",      "boolean", "Enable engine-level property access tracing", false},
             {"python_executable", "string",  "Override python interpreter path", false},
             {"server_module",     "string",  "MCP server module name (default camoufox_reverse_mcp)", false},
-            {"launch_timeout_ms", "number",  "Launch handshake timeout in ms (default 5000, max 5000)", false},
+            {"launch_timeout_ms", "number",  "Launch handshake timeout in ms (default 180000, max 240000)", false},
         },
         tool_headless_start,
         false

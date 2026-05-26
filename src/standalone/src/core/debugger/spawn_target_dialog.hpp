@@ -78,8 +78,23 @@ inline result_t& pending_result() {
 	return r;
 }
 
+inline run_target::capability_probe_t& cached_capabilities() {
+	static run_target::capability_probe_t p;
+	return p;
+}
+
 inline int& isolation_choice() {
-	static int v = static_cast<int>(run_target::isolation_t::same_desktop_jobbed);
+	static int v = static_cast<int>(run_target::isolation_t::windows_sandbox);
+	return v;
+}
+
+inline int& run_mode_choice() {
+	static int v = 0;
+	return v;
+}
+
+inline bool& host_confirm_open() {
+	static bool v = false;
 	return v;
 }
 
@@ -147,8 +162,10 @@ inline void reset_inputs() {
 	std::memset(exe_buf(), 0, 1024);
 	std::memset(args_buf(), 0, 2048);
 	std::memset(cwd_buf(), 0, 1024);
-	isolation_choice() = static_cast<int>(run_target::isolation_t::same_desktop_jobbed);
-	block_network_flag() = false;
+	isolation_choice() = static_cast<int>(run_target::isolation_t::windows_sandbox);
+	run_mode_choice() = 0;
+	host_confirm_open() = false;
+	block_network_flag() = true;
 	kill_on_host_exit_flag() = true;
 	memory_cap_mb_value() = 0;
 	auto_terminate_sec_value() = 0;
@@ -204,6 +221,62 @@ inline std::string trim(const char* s) {
 	}
 	if (i > 0) out.erase(0, i);
 	return out;
+}
+
+inline void open_url(const wchar_t* url) {
+	if (!url || !*url) return;
+	ShellExecuteW(g_hwnd, L"open", url, nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+inline bool prepare_launch_result(bool host_mode) {
+	std::string exe_trim = trim(exe_buf());
+	if (exe_trim.empty()) return false;
+	std::string args_trim = trim(args_buf());
+	std::string cwd_trim = host_mode ? trim(cwd_buf()) : std::string();
+
+	result_t& pending = pending_result();
+	pending = result_t{};
+	pending.exe_path     = widen_utf8(exe_trim.c_str());
+	pending.args         = widen_utf8(args_trim.c_str());
+	pending.working_dir  = widen_utf8(cwd_trim.c_str());
+
+	run_target::launch_options_t& lo = pending.launch_options;
+	lo.exe_path           = pending.exe_path;
+	lo.args               = pending.args;
+	lo.working_dir        = pending.working_dir;
+	lo.isolation          = host_mode
+		? run_target::isolation_t::same_desktop_jobbed
+		: run_target::isolation_t::windows_sandbox;
+	lo.block_network      = block_network_flag();
+	lo.kill_on_host_exit  = kill_on_host_exit_flag();
+	lo.attach_after_resume = host_mode;
+	int mem = memory_cap_mb_value();
+	lo.memory_cap_mb      = mem > 0 ? static_cast<uint32_t>(mem) : 0u;
+	int term = auto_terminate_sec_value();
+	lo.auto_terminate_sec = term > 0 ? static_cast<uint32_t>(term) : 0u;
+	lo.malware_safe_mode = false;
+	lo.log_network_traffic = false;
+	lo.lower_integrity_untrusted = false;
+	lo.allow_child_processes = true;
+	lo.force_mitigations_strict = false;
+	lo.redirect_user_paths_to_sandbox = false;
+	lo.register_kernel_sandbox_guard = false;
+
+	pending.accepted = true;
+	pending_result_ready() = true;
+
+	diag::log_tagged_critical_fmt("spawn",
+		"spawn_dialog_launch exe='%s' args_len=%zu cwd='%s' iso=%d block_net=%d kill_on_exit=%d mem_cap=%u auto_term=%u attach=%d host_mode=%d",
+		exe_trim.c_str(), args_trim.size(),
+		cwd_trim.empty() ? "<inherit>" : cwd_trim.c_str(),
+		static_cast<int>(lo.isolation),
+		lo.block_network ? 1 : 0,
+		lo.kill_on_host_exit ? 1 : 0,
+		static_cast<unsigned>(lo.memory_cap_mb),
+		static_cast<unsigned>(lo.auto_terminate_sec),
+		lo.attach_after_resume ? 1 : 0,
+		host_mode ? 1 : 0);
+	return true;
 }
 
 inline void browse_executable() {
@@ -304,6 +377,7 @@ inline void request_open() {
 	detail::reset_inputs();
 	detail::pending_result_ready() = false;
 	detail::pending_result() = result_t{};
+	detail::cached_capabilities() = run_target::probe_capabilities();
 	detail::should_open() = true;
 	diag::log_tagged_critical("spawn", "spawn_dialog_open_requested");
 }
@@ -323,7 +397,7 @@ inline void render() {
 	s_last_render_frame = cur_frame;
 
 	if (detail::should_open()) {
-		ImGui::OpenPopup("Launch Target###aida_spawn_target_dialog");
+		ImGui::OpenPopup("Malware Lab Run###aida_spawn_target_dialog");
 		detail::should_open() = false;
 		detail::open_flag() = true;
 	}
@@ -348,8 +422,9 @@ inline void render() {
 	bool open_flag_local = true;
 	bool launch_now = false;
 	bool cancel_now = false;
+	bool close_parent_after_host_confirm = false;
 
-	if (ImGui::BeginPopupModal("Launch Target###aida_spawn_target_dialog",
+	if (ImGui::BeginPopupModal("Malware Lab Run###aida_spawn_target_dialog",
 	                           &open_flag_local,
 	                           ImGuiWindowFlags_NoSavedSettings |
 	                           ImGuiWindowFlags_NoResize)) {
@@ -360,12 +435,12 @@ inline void render() {
 
 		if (title_font) ImGui::PushFont(title_font);
 		ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(tk.text_primary),
-		                   "Launch Target");
+		                   "Malware Lab Run");
 		if (title_font) ImGui::PopFont();
 
 		if (caption) ImGui::PushFont(caption);
 		ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(tk.text_secondary),
-		                   "Spawn a binary on the host and immediately attach AiDA's driver.");
+		                   "Choose Run in VM or Run in Host every time you launch a sample.");
 		if (caption) ImGui::PopFont();
 		ImGui::Dummy(ImVec2(0.f, 4.f));
 
@@ -395,42 +470,85 @@ inline void render() {
 		                     false, ImVec2(0.f, 36.f));
 		ImGui::Dummy(ImVec2(0.f, 2.f));
 
-		ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(tk.text_secondary),
-		                   "Working directory (optional, defaults to executable's directory)");
-		aida::ui::input_text("##spawn_cwd", detail::cwd_buf(), 1024,
-		                     "C:\\analysis\\workdir", false,
-		                     ImVec2(input_w, 36.f));
-		ImGui::SameLine();
-		if (aida::ui::button("Browse...##cwd", aida::ui::button_kind_t::secondary,
-		                     aida::ui::size_t_::md,
-		                     ImVec2(browse_btn_w, 36.f), false, nullptr, false)) {
-			detail::browse_working_dir();
-		}
-
 		if (body_font) ImGui::PopFont();
 
 		ImGui::Dummy(ImVec2(0.f, 10.f));
 
 		if (body_font) ImGui::PushFont(body_font);
 		ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(tk.text_secondary),
-		                   "Launch options");
+		                   "Launch target");
 		if (body_font) ImGui::PopFont();
 		ImGui::Dummy(ImVec2(0.f, 2.f));
 
 		{
-			int* iso = &detail::isolation_choice();
-			aida::ui::radio_button(
-				"Same desktop  (jobbed; interact + driver attach)",
-				iso, static_cast<int>(run_target::isolation_t::same_desktop_jobbed));
-			aida::ui::radio_button(
-				"Malware-safe desktop  (restricted token + kernel guard + network log; UI visible)",
-				iso, static_cast<int>(run_target::isolation_t::malware_safe_desktop));
-			aida::ui::radio_button(
-				"AppContainer  (FS/registry isolated)",
-				iso, static_cast<int>(run_target::isolation_t::appcontainer));
-			aida::ui::radio_button(
-				"Windows Sandbox  (separate desktop, max safety)",
-				iso, static_cast<int>(run_target::isolation_t::windows_sandbox));
+			int& mode = detail::run_mode_choice();
+			ImGui::RadioButton("Run in VM", &mode, 0);
+			ImGui::SameLine(0.f, 28.f);
+			ImGui::RadioButton("Run in Host", &mode, 1);
+			detail::isolation_choice() = mode == 0
+				? static_cast<int>(run_target::isolation_t::windows_sandbox)
+				: static_cast<int>(run_target::isolation_t::same_desktop_jobbed);
+		}
+
+		ImGui::Dummy(ImVec2(0.f, 4.f));
+		const bool vm_mode = detail::run_mode_choice() == 0;
+		if (vm_mode) {
+			if (caption) ImGui::PushFont(caption);
+			ImGui::TextWrapped("First-time setup for Run in VM");
+			ImGui::BulletText("Windows edition: Pro, Enterprise, or Education. Windows Home users need a full VM such as VMware Workstation Pro or VirtualBox.");
+			ImGui::BulletText("Download for full VM fallback: VMware Workstation Pro or Oracle VirtualBox, then a Windows evaluation ISO.");
+			ImGui::BulletText("BIOS/UEFI: enable Intel VT-x or AMD-V/SVM, then boot back into Windows.");
+			ImGui::BulletText("Admin PowerShell: Enable-WindowsOptionalFeature -Online -FeatureName Containers-DisposableClientVM -All");
+			ImGui::BulletText("Reboot, reopen AiDA, press Run, select Run in VM, then Open VM.");
+			ImGui::BulletText("The sample window opens inside Windows Sandbox. AiDA's guest MCP tools inspect memory through the VM bridge.");
+			const auto& caps = detail::cached_capabilities();
+			if (!caps.has_windows_sandbox) {
+				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(tk.warning),
+				                   "Windows Sandbox is not available on this PC right now.");
+			}
+			if (caption) ImGui::PopFont();
+			if (aida::ui::button("Sandbox Docs", aida::ui::button_kind_t::secondary,
+			                     aida::ui::size_t_::sm, ImVec2(118.f, 30.f), false, nullptr, false)) {
+				detail::open_url(L"https://learn.microsoft.com/windows/security/application-security/application-isolation/windows-sandbox/windows-sandbox-install");
+			}
+			ImGui::SameLine();
+			if (aida::ui::button("WSB Config", aida::ui::button_kind_t::secondary,
+			                     aida::ui::size_t_::sm, ImVec2(104.f, 30.f), false, nullptr, false)) {
+				detail::open_url(L"https://learn.microsoft.com/windows/security/application-security/application-isolation/windows-sandbox/windows-sandbox-configure-using-wsb-file");
+			}
+			ImGui::SameLine();
+			if (aida::ui::button("Eval ISO", aida::ui::button_kind_t::secondary,
+			                     aida::ui::size_t_::sm, ImVec2(90.f, 30.f), false, nullptr, false)) {
+				detail::open_url(L"https://www.microsoft.com/en-us/evalcenter/download-windows-11-enterprise");
+			}
+			if (aida::ui::button("VMware", aida::ui::button_kind_t::secondary,
+			                     aida::ui::size_t_::sm, ImVec2(92.f, 30.f), false, nullptr, false)) {
+				detail::open_url(L"https://knowledge.broadcom.com/external/article/344595/downloading-vmware-workstation-pro.html");
+			}
+			ImGui::SameLine();
+			if (aida::ui::button("VirtualBox", aida::ui::button_kind_t::secondary,
+			                     aida::ui::size_t_::sm, ImVec2(108.f, 30.f), false, nullptr, false)) {
+				detail::open_url(L"https://www.virtualbox.org/wiki/Downloads");
+			}
+		} else {
+			if (caption) ImGui::PushFont(caption);
+			ImGui::TextWrapped("Host mode runs the selected binary on this Windows installation. It is not a malware or BYOVD containment boundary and can compromise the host.");
+			if (caption) ImGui::PopFont();
+			ImGui::Dummy(ImVec2(0.f, 2.f));
+			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(tk.text_secondary),
+			                   "Working directory");
+			float browse_btn_w2 = 96.f;
+			float input_w2 = ImGui::GetContentRegionAvail().x - browse_btn_w2 - 10.f;
+			if (input_w2 < 200.f) input_w2 = 200.f;
+			aida::ui::input_text("##spawn_cwd", detail::cwd_buf(), 1024,
+			                     "C:\\path\\to\\working-directory", false,
+			                     ImVec2(input_w2, 36.f));
+			ImGui::SameLine();
+			if (aida::ui::button("Browse##cwd", aida::ui::button_kind_t::secondary,
+			                     aida::ui::size_t_::md,
+			                     ImVec2(browse_btn_w2, 36.f), false, nullptr, false)) {
+				detail::browse_working_dir();
+			}
 		}
 
 		ImGui::Dummy(ImVec2(0.f, 4.f));
@@ -462,70 +580,18 @@ inline void render() {
 
 		ImGui::Dummy(ImVec2(0.f, 10.f));
 
-		bool malware_section_available =
-			(detail::isolation_choice() == static_cast<int>(run_target::isolation_t::same_desktop_jobbed)
-			 || detail::isolation_choice() == static_cast<int>(run_target::isolation_t::malware_safe_desktop));
-
-		if (malware_section_available) {
-			if (body_font) ImGui::PushFont(body_font);
-			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(tk.text_secondary),
-			                   "Malware Safety");
-			if (body_font) ImGui::PopFont();
-			if (caption) ImGui::PushFont(caption);
-			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(tk.text_secondary),
-			                   "Run unknown samples on the host with restricted token, mitigation policy, and per-launch sandbox.");
-			if (caption) ImGui::PopFont();
+		if (!detail::last_sandbox_dir().empty()) {
 			ImGui::Dummy(ImVec2(0.f, 4.f));
-
-			{
-				bool* ms = &detail::malware_safe_mode_flag();
-				aida::ui::toggle_switch("Treat as malware (recommended for unknown samples)",
-				                       ms, aida::ui::size_t_::sm);
-			}
-			ImGui::Dummy(ImVec2(0.f, 2.f));
-			{
-				bool* lt = &detail::log_network_traffic_flag();
-				aida::ui::toggle_switch("Log network traffic (driver-level packet capture)",
-				                       lt, aida::ui::size_t_::sm);
-				ImGui::SameLine(0.f, 18.f);
-				bool* kg = &detail::register_kernel_guard_flag();
-				aida::ui::toggle_switch("Register kernel sandbox guard",
-				                       kg, aida::ui::size_t_::sm);
-			}
-			ImGui::Dummy(ImVec2(0.f, 2.f));
-			{
-				bool* lu = &detail::lower_integrity_untrusted_flag();
-				aida::ui::toggle_switch("Lower integrity to Untrusted (paranoid)",
-				                       lu, aida::ui::size_t_::sm);
-				ImGui::SameLine(0.f, 18.f);
-				bool* ac = &detail::allow_child_processes_flag();
-				aida::ui::toggle_switch("Allow target to spawn children",
-				                       ac, aida::ui::size_t_::sm);
-			}
-			ImGui::Dummy(ImVec2(0.f, 2.f));
-			{
-				bool* rp = &detail::redirect_user_paths_flag();
-				aida::ui::toggle_switch("Redirect AppData/Temp/UserProfile into sandbox",
-				                       rp, aida::ui::size_t_::sm);
-				ImGui::SameLine(0.f, 18.f);
-				bool* fm = &detail::force_mitigations_strict_flag();
-				aida::ui::toggle_switch("Strict signature mitigations (may break packers)",
-				                       fm, aida::ui::size_t_::sm);
-			}
-
-			if (!detail::last_sandbox_dir().empty()) {
-				ImGui::Dummy(ImVec2(0.f, 4.f));
-				std::string sb_utf8 = detail::narrow_utf8(detail::last_sandbox_dir().c_str());
-				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(tk.text_secondary),
-				                   "Last sandbox: %s", sb_utf8.c_str());
-				ImGui::SameLine();
-				if (aida::ui::button("Open folder##spawn_open_sandbox",
-				                     aida::ui::button_kind_t::secondary,
-				                     aida::ui::size_t_::sm,
-				                     ImVec2(110.f, 28.f), false, nullptr, false)) {
-					ShellExecuteW(g_hwnd, L"open", detail::last_sandbox_dir().c_str(),
-					              nullptr, nullptr, SW_SHOWNORMAL);
-				}
+			std::string sb_utf8 = detail::narrow_utf8(detail::last_sandbox_dir().c_str());
+			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(tk.text_secondary),
+			                   "Last VM workspace: %s", sb_utf8.c_str());
+			ImGui::SameLine();
+			if (aida::ui::button("Open folder##spawn_open_sandbox",
+			                     aida::ui::button_kind_t::secondary,
+			                     aida::ui::size_t_::sm,
+			                     ImVec2(110.f, 28.f), false, nullptr, false)) {
+				ShellExecuteW(g_hwnd, L"open", detail::last_sandbox_dir().c_str(),
+				              nullptr, nullptr, SW_SHOWNORMAL);
 			}
 		}
 
@@ -543,14 +609,11 @@ inline void render() {
 			float fs_title = warn_font->FontSize;
 			float fs_body = base->FontSize;
 
-			const bool malware_active =
-				malware_section_available && detail::malware_safe_mode_flag();
-			const char* warn_title = malware_active
-				? "Malware-safe mode active"
-				: "Caution: live execution on host";
-			const char* warn_body  = malware_active
-				? "The target's UI is visible. Host filesystem outside the sandbox folder is protected by token IL + mitigation policy + job UI limits. Network traffic is recorded if the driver is loaded. Persistence sites, raw disk, and kernel handles are gated by WhosWho."
-				: "AiDA spawns the target inside a Job Object (and optional AppContainer / Windows Sandbox), optionally blocks the network, then attaches the driver. Containment level is your choice above.";
+			const bool host_mode = detail::run_mode_choice() == 1;
+			const char* warn_title = host_mode ? "Host execution warning" : "Interactive VM sandbox";
+			const char* warn_body  = host_mode
+				? "Run in Host starts the selected binary on this Windows installation and may attach AiDA's host driver. Do not use this for malware, cheat loaders, BYOVD samples, unknown drivers, or anything you do not fully trust."
+				: "Run in VM copies the sample into a disposable Windows Sandbox workspace, disables clipboard and device redirection, optionally disables networking, and starts the sample in the sandbox window. AiDA does not attach the host driver to this process because the process is not running in the host OS.";
 
 			ImVec2 ts_title = warn_font->CalcTextSizeA(fs_title, FLT_MAX, w - pad_x * 2.f, warn_title);
 			ImVec2 ts_body = base->CalcTextSizeA(fs_body, FLT_MAX, w - pad_x * 2.f, warn_body);
@@ -572,7 +635,8 @@ inline void render() {
 		ImGui::Dummy(ImVec2(0.f, 6.f));
 
 		std::string exe_trim = detail::trim(detail::exe_buf());
-		bool launch_disabled = exe_trim.empty();
+		bool launch_disabled = exe_trim.empty()
+			|| (detail::run_mode_choice() == 0 && !detail::cached_capabilities().has_windows_sandbox);
 
 		float total_w = ImGui::GetContentRegionAvail().x;
 		float btn_w = 130.f;
@@ -589,7 +653,8 @@ inline void render() {
 			cancel_now = true;
 		}
 		ImGui::SameLine(0.f, gap);
-		if (aida::ui::button("Launch", aida::ui::button_kind_t::primary,
+		const char* launch_label = detail::run_mode_choice() == 0 ? "Open VM" : "Run Host";
+		if (aida::ui::button(launch_label, aida::ui::button_kind_t::primary,
 		                     aida::ui::size_t_::md,
 		                     ImVec2(btn_w, 40.f), launch_disabled, nullptr, false)) {
 			launch_now = true;
@@ -602,64 +667,70 @@ inline void render() {
 			launch_now = true;
 
 		if (launch_now && !launch_disabled) {
-			std::string args_trim = detail::trim(detail::args_buf());
-			std::string cwd_trim  = detail::trim(detail::cwd_buf());
-
-			result_t& pending = detail::pending_result();
-			pending.exe_path     = detail::widen_utf8(exe_trim.c_str());
-			pending.args         = detail::widen_utf8(args_trim.c_str());
-			pending.working_dir  = detail::widen_utf8(cwd_trim.c_str());
-
-			run_target::launch_options_t& lo = pending.launch_options;
-			lo.exe_path           = pending.exe_path;
-			lo.args               = pending.args;
-			lo.working_dir        = pending.working_dir;
-			lo.isolation          = static_cast<run_target::isolation_t>(detail::isolation_choice());
-			lo.block_network      = detail::block_network_flag();
-			lo.kill_on_host_exit  = detail::kill_on_host_exit_flag();
-			lo.attach_after_resume = (lo.isolation != run_target::isolation_t::windows_sandbox);
-			int mem = detail::memory_cap_mb_value();
-			lo.memory_cap_mb      = mem > 0 ? static_cast<uint32_t>(mem) : 0u;
-			int term = detail::auto_terminate_sec_value();
-			lo.auto_terminate_sec = term > 0 ? static_cast<uint32_t>(term) : 0u;
-
-			const bool iso_supports_malware =
-				(lo.isolation == run_target::isolation_t::same_desktop_jobbed
-				 || lo.isolation == run_target::isolation_t::malware_safe_desktop);
-			lo.malware_safe_mode = iso_supports_malware && detail::malware_safe_mode_flag();
-			lo.log_network_traffic = iso_supports_malware && detail::log_network_traffic_flag();
-			lo.lower_integrity_untrusted = iso_supports_malware && detail::lower_integrity_untrusted_flag();
-			lo.allow_child_processes = !iso_supports_malware || detail::allow_child_processes_flag();
-			lo.force_mitigations_strict = iso_supports_malware && detail::force_mitigations_strict_flag();
-			lo.redirect_user_paths_to_sandbox = iso_supports_malware && detail::redirect_user_paths_flag();
-			lo.register_kernel_sandbox_guard = iso_supports_malware && detail::register_kernel_guard_flag();
-
-			pending.accepted = true;
-			detail::pending_result_ready() = true;
-
-			diag::log_tagged_critical_fmt("spawn",
-				"spawn_dialog_launch exe='%s' args_len=%zu cwd='%s' iso=%d block_net=%d kill_on_exit=%d mem_cap=%u auto_term=%u malware_safe=%d log_net=%d untrusted=%d allow_children=%d strict=%d redirect_paths=%d kernel_guard=%d",
-				exe_trim.c_str(), args_trim.size(),
-				cwd_trim.empty() ? "<inherit>" : cwd_trim.c_str(),
-				static_cast<int>(lo.isolation),
-				lo.block_network ? 1 : 0,
-				lo.kill_on_host_exit ? 1 : 0,
-				static_cast<unsigned>(lo.memory_cap_mb),
-				static_cast<unsigned>(lo.auto_terminate_sec),
-				lo.malware_safe_mode ? 1 : 0,
-				lo.log_network_traffic ? 1 : 0,
-				lo.lower_integrity_untrusted ? 1 : 0,
-				lo.allow_child_processes ? 1 : 0,
-				lo.force_mitigations_strict ? 1 : 0,
-				lo.redirect_user_paths_to_sandbox ? 1 : 0,
-				lo.register_kernel_sandbox_guard ? 1 : 0);
-
-			ImGui::CloseCurrentPopup();
-			detail::open_flag() = false;
+			if (detail::run_mode_choice() == 1) {
+				detail::host_confirm_open() = true;
+				ImGui::OpenPopup("Confirm Host Run###aida_spawn_host_confirm");
+			} else if (detail::prepare_launch_result(false)) {
+				ImGui::CloseCurrentPopup();
+				detail::open_flag() = false;
+			}
 		} else if (cancel_now || !open_flag_local) {
 			detail::pending_result_ready() = false;
 			detail::pending_result() = result_t{};
 			diag::log_tagged_critical("spawn", "spawn_dialog_cancelled");
+			ImGui::CloseCurrentPopup();
+			detail::open_flag() = false;
+		}
+
+		if (detail::host_confirm_open()) {
+			ImGui::SetNextWindowSize(ImVec2(520.f, 0.f), ImGuiCond_Appearing);
+			bool confirm_open = true;
+			if (ImGui::BeginPopupModal("Confirm Host Run###aida_spawn_host_confirm",
+			                           &confirm_open,
+			                           ImGuiWindowFlags_NoSavedSettings |
+			                           ImGuiWindowFlags_NoResize)) {
+				if (title_font) ImGui::PushFont(title_font);
+				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(tk.warning),
+				                   "Run in Host?");
+				if (title_font) ImGui::PopFont();
+				if (caption) ImGui::PushFont(caption);
+				ImGui::TextWrapped("This will execute the selected binary on your real desktop, not inside the VM.");
+				ImGui::TextWrapped("Cancel unless the file is trusted. Host mode can expose your PC, credentials, kernel, files, and drivers to the sample.");
+				if (caption) ImGui::PopFont();
+				ImGui::Dummy(ImVec2(0.f, 8.f));
+				float cw = ImGui::GetContentRegionAvail().x;
+				float cbw = 150.f;
+				float cgap = 10.f;
+				float cx = cw - cbw * 2.f - cgap;
+				if (cx < 0.f) cx = 0.f;
+				ImGui::Dummy(ImVec2(cx, 0.f));
+				ImGui::SameLine();
+				if (aida::ui::button("Cancel", aida::ui::button_kind_t::secondary,
+				                     aida::ui::size_t_::md,
+				                     ImVec2(cbw, 40.f), false, nullptr, false)) {
+					detail::host_confirm_open() = false;
+					ImGui::CloseCurrentPopup();
+				}
+				ImGui::SameLine(0.f, cgap);
+				if (aida::ui::button("Run in Host", aida::ui::button_kind_t::destructive,
+				                     aida::ui::size_t_::md,
+				                     ImVec2(cbw, 40.f), false, nullptr, false)) {
+					if (detail::prepare_launch_result(true)) {
+						detail::host_confirm_open() = false;
+						ImGui::CloseCurrentPopup();
+						close_parent_after_host_confirm = true;
+					}
+				}
+				if (!confirm_open) {
+					detail::host_confirm_open() = false;
+				}
+				ImGui::EndPopup();
+			} else if (!confirm_open) {
+				detail::host_confirm_open() = false;
+			}
+		}
+
+		if (close_parent_after_host_confirm) {
 			ImGui::CloseCurrentPopup();
 			detail::open_flag() = false;
 		}

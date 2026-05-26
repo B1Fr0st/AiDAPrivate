@@ -312,12 +312,15 @@ namespace net_fingerprint {
 }
 namespace net_dpi {
     NTSTATUS init();
+    NTSTATUS start();
+    void stop();
     void analyze_packet(UINT64 timestamp, UINT32 direction, UINT32 protocol,
                         UINT32 src_port, UINT32 dst_port,
                         const UINT8* src_addr, const UINT8* dst_addr,
                         UINT32 af, UINT32 pid,
                         const UINT8* payload, UINT32 payload_len);
     BOOLEAN is_active();
+    LONG entry_count();
     void cleanup();
 }
 namespace net_intercept {
@@ -3689,6 +3692,11 @@ NTSTATUS functions::handle_net_cap_ctrl(p_net_cap_ctrl request) {
 
             _InterlockedExchange(&net_capture::g_total_captured, 0);
             _InterlockedExchange(&net_capture::g_total_dropped, 0);
+            NTSTATUS dpi_status = net_dpi::start();
+            if (!NT_SUCCESS(dpi_status)) {
+                NET_ERR("handle_net_cap_ctrl: DPI start FAILED status=0x%08lx", dpi_status);
+                return dpi_status;
+            }
             _InterlockedExchange(&net_capture::g_capture_active, 1);
 
             NET_DBG("handle_net_cap_ctrl: capture STARTED pid=%u port=%u proto=%u max_bytes=%u",
@@ -3698,6 +3706,7 @@ NTSTATUS functions::handle_net_cap_ctrl(p_net_cap_ctrl request) {
         }
         case 1: {
             _InterlockedExchange(&net_capture::g_capture_active, 0);
+            net_dpi::stop();
             net_capture::g_filter_pid = 0;
             net_capture::g_filter_port = 0;
             net_capture::g_filter_protocol = 0;
@@ -6572,6 +6581,32 @@ namespace net_dpi {
         return STATUS_SUCCESS;
     }
 
+    NTSTATUS start() {
+        NTSTATUS st = init();
+        if (!NT_SUCCESS(st)) return st;
+
+        KIRQL irql;
+        KeAcquireSpinLock(&g_dpi_lock, &irql);
+        g_dpi_head = 0;
+        g_dpi_tail = 0;
+        g_dpi_count = 0;
+        strong::kmemset(g_dpi_ring, 0, (SIZE_T)DPI_RING_SIZE * sizeof(DPI_HEADER_INFO));
+        KeReleaseSpinLock(&g_dpi_lock, irql);
+
+        _InterlockedExchange(&g_dpi_active, 1);
+        NET_DBG("net_dpi::start active=1");
+        return STATUS_SUCCESS;
+    }
+
+    void stop() {
+        _InterlockedExchange(&g_dpi_active, 0);
+        NET_DBG("net_dpi::stop count=%ld", g_dpi_count);
+    }
+
+    LONG entry_count() {
+        return g_dpi_count;
+    }
+
 
     static UINT32 detect_http_method(const UINT8* data, UINT32 len) {
         if (len < 4) return 0;
@@ -8396,7 +8431,19 @@ NTSTATUS functions::handle_deep_inspect(p_dpi_request request) {
     if (request->filter_pid != 0) {
         aida_refresh_pid_cache_for_process(request->filter_pid, request->filter_protocol);
     }
-    return net_dpi::get_results(request);
+    const LONG before = net_dpi::entry_count();
+    const BOOLEAN active = net_dpi::is_active();
+    NTSTATUS st = net_dpi::get_results(request);
+    NET_DBG("netaction::DPIN active=%u ring_count=%ld filter_pid=%u filter_proto=%u filter_port=%u flags=0x%08x results=%u status=0x%08lx",
+        active ? 1u : 0u,
+        before,
+        request->filter_pid,
+        request->filter_protocol,
+        request->filter_port,
+        request->flags,
+        request->result_count,
+        st);
+    return st;
 }
 
 NTSTATUS functions::handle_intercept_hold(p_intercept_request request) {

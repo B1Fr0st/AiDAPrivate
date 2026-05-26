@@ -4,6 +4,7 @@
 #include <wmmintrin.h>
 #include <emmintrin.h>
 
+#pragma warning(disable: 4330)
 #pragma section(".payload", read, write, execute)
 #pragma code_seg(".payload")
 
@@ -34,6 +35,9 @@ typedef struct list_entry_s {
     struct list_entry_s* Flink;
     struct list_entry_s* Blink;
 } list_entry_t;
+
+static int resolve_apiset_host(const char* name, size_t name_len,
+                               char* out, size_t out_cap, size_t* out_len);
 
 typedef struct ldr_entry_s {
     list_entry_t InLoadOrderLinks;

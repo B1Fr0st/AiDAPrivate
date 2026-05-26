@@ -22,12 +22,14 @@ struct launch_config_t
     std::string              os                 = "auto";
     std::string              locale             = "auto";
     bool                     humanize           = false;
+    bool                     geoip              = false;
     bool                     block_images       = false;
     bool                     block_webrtc       = false;
+    bool                     enable_trace       = false;
     std::string              python_executable;
     std::string              server_module      = "camoufox_reverse_mcp";
     std::vector<std::string> extra_args;
-    int                      launch_timeout_ms  = 5000;
+    int                      launch_timeout_ms  = 180000;
 };
 
 enum class bridge_state_t : int

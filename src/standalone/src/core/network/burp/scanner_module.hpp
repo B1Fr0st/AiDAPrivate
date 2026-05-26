@@ -30,6 +30,7 @@ struct module_context_t
     bool                              tls = false;
     int                               timeout_ms = 15000;
     bool                              follow_redirects = false;
+    std::function<bool()>             cancelled;
     uint64_t                          baseline_latency_ms = 0;
     std::vector<uint8_t>              baseline_response_body;
     std::vector<std::pair<std::string, std::string>> baseline_response_headers;

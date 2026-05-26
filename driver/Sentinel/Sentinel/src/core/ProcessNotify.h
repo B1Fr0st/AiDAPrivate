@@ -28,6 +28,7 @@ namespace process_notify {
         PEPROCESS process, HANDLE pid, PPS_CREATE_NOTIFY_INFO create_info)
     {
         UNREFERENCED_PARAMETER(process);
+        UNREFERENCED_PARAMETER(pid);
 
         if (!create_info)
             return;

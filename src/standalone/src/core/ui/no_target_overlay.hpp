@@ -85,7 +85,7 @@ namespace aida::ui::no_target_overlay {
 				nullptr, card_w - 48.f);
 		}
 
-		const char* labels[3] = { "Open File...", "Attach to Process...", "Run Binary..." };
+		const char* labels[3] = { "Open File...", "Attach to Process...", "Run..." };
 		float btn_widths[3];
 		float btn_total = 0.f;
 		float btn_gap = 12.f;

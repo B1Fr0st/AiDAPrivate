@@ -73,7 +73,7 @@ Use Context7 for library/API documentation:
 
 ## Driver Rebuild Pipeline
 
-When editing files under `driver/WhosWho/`, `driver/Sentinel/`, `driver/AiDAShadowFS/`, or `mapper/`:
+When editing files under `driver/WhosWho/`, `driver/Sentinel/`, or `mapper/`:
 
 1. Build the driver `.sln` in Visual Studio/MSBuild x64 Release (outputs to `build-ninja/Release/`).
 2. Run CMake configure to pick up new binaries: `cmake --preset ninja-msvc-release`.
@@ -115,7 +115,7 @@ Server: `ruarr@23.88.62.199`, SSH key path: `~/.ssh/aida_server`. Do not expose 
 
 ### `driver/`
 
-Purpose: Windows x64 kernel driver stack: WhosWho KMDF driver, Sentinel companion integrity/attestation driver, AiDAShadowFS minifilter, shared user-mode communication/test code.
+Purpose: Windows x64 kernel driver stack: WhosWho KMDF driver, Sentinel companion integrity/attestation driver, shared user-mode communication/test code.
 
 Key files:
 - `driver/comm.h` / `driver/comm.cpp`: user-mode `voyager::device_t` API and driver connection logic.
@@ -125,10 +125,6 @@ Key files:
 - `driver/WhosWho/WhosWho/src/function/CoreSecurity.h`: dynamic key/device-name logic and secure wire headers.
 - `driver/Sentinel/Sentinel/src/DriverEntry.cpp`: Sentinel entry, delayed bridge scan, integrity/guardian startup.
 - `driver/Sentinel/Sentinel/src/core/WskTransport.h`: kernel WSK/TLS heartbeat to `aidapro.net:443` with SPKI pins.
-- `driver/AiDAShadowFS/AiDAShadowFS/src/DriverEntry.cpp`: minifilter entry, callbacks, communication port.
-- `driver/AiDAShadowFS/AiDAShadowFS/src/ShadowFSProtocol.h`: ShadowFS user/kernel protocol and flags.
-- `driver/AiDAShadowFS/AiDAShadowFS/AiDAShadowFS.inf`: minifilter metadata; altitude is `385701`.
-
 Rules:
 - Treat `comm.h` and WhosWho `Struct.h` layouts as ABI. Preserve packing, field order, sizes, and static asserts.
 - Kernel code uses `ExAllocatePool2`, pool tags, `RtlSecureZeroMemory`, SEH, explicit IRQL checks, and requestor-mode checks. Preserve those patterns.
@@ -194,7 +190,7 @@ Key modules:
 - `src/agent_tools.cpp` / `src/agent_tools.hpp`: MCP tool registry and implementations, including mutating tools such as patch/rename/type/comment and `execute_python`.
 - `src/mcp_server.cpp` / `src/mcp_server.hpp`: localhost MCP server, SSE/HTTP endpoints, multi-IDA registry, client config writing.
 - `src/license.cpp` / `src/license.hpp`, `src/settings.cpp` / `src/settings.hpp`: license validation, heartbeat, local config, provider keys, session tokens.
-- `src/driver_loader.cpp`: decrypts/stages embedded mapper and kernel driver blobs, starts hidden mapper process, and can install/load ShadowFS.
+- `src/driver_loader.cpp`: decrypts/stages embedded mapper and kernel driver blobs, then starts the hidden mapper process.
 - `src/anti_re.hpp`, `src/aida_ipc.cpp`: anti-debug/tamper/self-analysis enforcement, manual-map IPC, heartbeat/HMAC pipe auth.
 - `src/ida_utils.*`, `src/analysis_db.hpp`, `src/graphrag.*`, `src/emulation_engine.*`: IDA context extraction, persisted analysis/chat data, graph context, driver-backed emulation.
 - `src/vuln/*`: vulnerability analysis engines and tools; symbolic/SMT/Z3 verification paths.

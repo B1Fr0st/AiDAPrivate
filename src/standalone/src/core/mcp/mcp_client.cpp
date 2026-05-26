@@ -1031,9 +1031,11 @@ client_t::client_t(client_t&& o) noexcept
     _child_process    = o._child_process;
     _child_stdin_w    = o._child_stdin_w;
     _child_stdout_r   = o._child_stdout_r;
+    _child_process_id = o._child_process_id;
     o._child_process  = nullptr;
     o._child_stdin_w  = nullptr;
     o._child_stdout_r = nullptr;
+    o._child_process_id = 0;
     o._state          = connection_state_t::disconnected;
     o._oauth_status   = oauth_status_t::not_required;
     o._transport_mode = transport_mode_t::auto_detect;
@@ -1065,9 +1067,11 @@ client_t& client_t::operator=(client_t&& o) noexcept
         _child_process    = o._child_process;
         _child_stdin_w    = o._child_stdin_w;
         _child_stdout_r   = o._child_stdout_r;
+        _child_process_id = o._child_process_id;
         o._child_process  = nullptr;
         o._child_stdin_w  = nullptr;
         o._child_stdout_r = nullptr;
+        o._child_process_id = 0;
         o._state          = connection_state_t::disconnected;
         o._oauth_status   = oauth_status_t::not_required;
         o._transport_mode = transport_mode_t::auto_detect;
@@ -1617,6 +1621,12 @@ const server_config_t& client_t::config() const
 {
     std::lock_guard<std::mutex> lk(_mtx);
     return _cfg;
+}
+
+std::uint32_t client_t::child_process_id() const
+{
+    std::lock_guard<std::mutex> lk(_mtx);
+    return _child_process_id;
 }
 
 const std::vector<remote_tool_t>& client_t::cached_tools() const
@@ -2180,6 +2190,7 @@ bool client_t::launch_stdio_process()
 
     CloseHandle(pi.hThread);
     _child_process  = pi.hProcess;
+    _child_process_id = pi.dwProcessId;
     _child_stdin_w  = stdin_write;
     _child_stdout_r = stdout_read;
 
@@ -2216,6 +2227,7 @@ void client_t::kill_stdio_process()
         WaitForSingleObject(static_cast<HANDLE>(_child_process), 3000);
         CloseHandle(static_cast<HANDLE>(_child_process));
         _child_process = nullptr;
+        _child_process_id = 0;
     }
 }
 

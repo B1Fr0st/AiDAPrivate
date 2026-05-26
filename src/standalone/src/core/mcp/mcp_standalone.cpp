@@ -325,6 +325,26 @@ bool current_call_cancelled() noexcept
 server_t::server_t()  = default;
 server_t::~server_t() { stop(); }
 
+static bool is_camoufox_reverse_tool_name(const std::string& name)
+{
+    static const char* const names[] = {
+        "launch_browser", "close_browser", "navigate", "reload", "take_screenshot", "take_snapshot",
+        "click", "type_text", "wait_for", "get_page_info", "reset_browser_state", "evaluate_js",
+        "hook_function", "add_init_script", "inject_hook_preset", "remove_hooks", "get_console_logs",
+        "network_capture", "list_network_requests", "get_network_request", "get_request_initiator",
+        "intercept_request", "scripts", "search_code", "cookies", "get_storage", "export_state",
+        "import_state", "hook_jsvmp_interpreter", "compare_env", "instrumentation", "check_environment",
+        "verify_signer_offline", "trace_property_access", "list_trace_files", "query_trace_file",
+        "analyze_cookie_sources"
+    };
+    for (const char* n : names)
+    {
+        if (name == n)
+            return true;
+    }
+    return false;
+}
+
 bool server_t::register_tool(tool_def_t tool)
 {
     bool already_has_binary_id = false;
@@ -332,7 +352,8 @@ bool server_t::register_tool(tool_def_t tool)
         if (p.name == "binary_id") { already_has_binary_id = true; break; }
     }
     bool is_targetless_tool = tool.name.rfind("sessions_", 0) == 0 ||
-                              tool.name == "get_tool_descriptions";
+                              tool.name == "get_tool_descriptions" ||
+                              is_camoufox_reverse_tool_name(tool.name);
     if (!already_has_binary_id && !is_targetless_tool) {
         tool.params.push_back(tool_param_t{
             "binary_id",
@@ -555,7 +576,8 @@ json server_t::handle_initialize(const json& id, const json&)
         "- Disassemble x64 code at any address or from PE files\n"
         "- Attach to / detach from running processes\n"
         "- Execute untrusted binaries in Windows Sandbox\n"
-        "- Convert numbers between bases (hex, decimal, binary, ASCII)\n\n"
+        "- Convert numbers between bases (hex, decimal, binary, ASCII)\n"
+        "- Use bundled Camoufox reverse-engineering browser tools such as launch_browser, navigate, evaluate_js, network_capture, and hook_function\n\n"
         "## Tool usage guidelines\n"
         "- Always call `driver_status` first to check backend state\n"
         "- Call `driver_load` when kernel backend is not active and deep runtime access is required\n"
@@ -1333,40 +1355,51 @@ static bool write_json_file(const std::string& path, const json& data)
     return write_string_to_file(path, json_dump_safe(data, 2) + "\n");
 }
 
-static const char* MCP_NAME = "AiDA-Pro-MCP";
+static const char* MCP_NAME = "aida-pro-mcp";
 
 struct client_cfg_t {
     const char* name;
-    enum { URL, SERVERURL, OPENCODE, VSCODE, VSCODE_JSON, CLINE, ZED, CODEX, CLAUDE_CODE, CLAUDE_BRIDGE } format;
+    enum { URL, SERVERURL, OPENCODE, VSCODE, VSCODE_JSON, CLINE, ZED, CODEX, CLAUDE_CODE } format;
     const char* win_path;
 };
 
 static const client_cfg_t g_clients[] = {
-    { "Amazon Q",        client_cfg_t::URL,          "~/.aws/amazonq/mcp_config.json" },
-    { "Antigravity IDE", client_cfg_t::SERVERURL,    "~/.gemini/antigravity/mcp_config.json" },
-    { "Claude",          client_cfg_t::CLAUDE_BRIDGE, "%APPDATA%/Claude/claude_desktop_config.json" },
-    { "Copilot CLI",     client_cfg_t::URL,          "~/.copilot/mcp-config.json" },
+    { "Cline",           client_cfg_t::CLINE,        "%APPDATA%/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json" },
+    { "Roo Code",        client_cfg_t::CLINE,        "%APPDATA%/Code/User/globalStorage/rooveterinaryinc.roo-cline/settings/mcp_settings.json" },
+    { "Kilo Code",       client_cfg_t::CLINE,        "%APPDATA%/Code/User/globalStorage/kilocode.kilo-code/settings/mcp_settings.json" },
+    { "Claude",          client_cfg_t::URL,          "%APPDATA%/Claude/claude_desktop_config.json" },
     { "Cursor",          client_cfg_t::URL,          "~/.cursor/mcp.json" },
-    { "Gemini CLI",      client_cfg_t::URL,          "~/.gemini/settings.json" },
-    { "Kiro",            client_cfg_t::URL,          "~/.kiro/mcp_config.json" },
+    { "Windsurf",        client_cfg_t::URL,          "~/.codeium/windsurf/mcp_config.json" },
+    { "Claude Code",     client_cfg_t::CLAUDE_CODE,  "~/.claude.json" },
     { "LM Studio",       client_cfg_t::URL,          "~/.lmstudio/mcp.json" },
+    { "Codex",           client_cfg_t::CODEX,        "~/.codex/config.toml" },
+    { "Zed",             client_cfg_t::ZED,          "%APPDATA%/Zed/settings.json" },
+    { "Gemini CLI",      client_cfg_t::URL,          "~/.gemini/settings.json" },
+    { "Qwen Coder",      client_cfg_t::URL,          "~/.qwen/settings.json" },
+    { "Copilot CLI",     client_cfg_t::URL,          "~/.copilot/mcp-config.json" },
+    { "Crush",           client_cfg_t::URL,          "~/crush.json" },
+    { "Augment Code",    client_cfg_t::VSCODE,       "%APPDATA%/Code/User/settings.json" },
+    { "Qodo Gen",        client_cfg_t::VSCODE,       "%APPDATA%/Code/User/settings.json" },
+    { "Antigravity IDE", client_cfg_t::SERVERURL,    "~/.gemini/antigravity/mcp_config.json" },
+    { "Warp",            client_cfg_t::URL,          "~/.warp/mcp_config.json" },
+    { "Amazon Q",        client_cfg_t::URL,          "~/.aws/amazonq/mcp_config.json" },
     { "Opencode",        client_cfg_t::OPENCODE,     "~/.config/opencode/opencode.json" },
-    { "Windsurf",        client_cfg_t::SERVERURL,    "~/.codeium/windsurf/mcp_config.json" },
+    { "Kiro",            client_cfg_t::URL,          "~/.kiro/mcp_config.json" },
+    { "Trae",            client_cfg_t::URL,          "~/.trae/mcp_config.json" },
     { "VS Code",         client_cfg_t::VSCODE,       "%APPDATA%/Code/User/settings.json" },
     { "VS Code Insiders",client_cfg_t::VSCODE,       "%APPDATA%/Code - Insiders/User/settings.json" },
     { "VS Code (mcp.json)", client_cfg_t::VSCODE_JSON, "%APPDATA%/Code/User/mcp.json" },
-    { "Cline",           client_cfg_t::CLINE,        "%APPDATA%/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json" },
-    { "Roo Code",        client_cfg_t::CLINE,        "%APPDATA%/Code/User/globalStorage/rooveterinaryinc.roo-cline/settings/mcp_settings.json" },
-    { "Zed",             client_cfg_t::ZED,          "%APPDATA%/Zed/settings.json" },
-    { "Codex",           client_cfg_t::CODEX,        "~/.codex/config.toml" },
-    { "Claude Code",     client_cfg_t::CLAUDE_CODE,  "~/.claude.json" },
+    { "VS Code Insiders (mcp.json)", client_cfg_t::VSCODE_JSON, "%APPDATA%/Code - Insiders/User/mcp.json" },
 };
 
 static bool is_managed_key(const std::string& key)
 {
     return key == MCP_NAME ||
+           key == "AiDA-Pro-MCP" ||
            key == "aida-standalone-mcp" ||
-           key == "aida-pro-mcp";
+           key == "camoufox-reverse-mcp" ||
+           key == "camoufox_reverse_mcp" ||
+           key == "camoufox-reverse";
 }
 
 static void erase_managed_keys(json& root)
@@ -1404,7 +1437,7 @@ static bool write_opencode(const std::string& path, const std::string& url)
     if (!config.contains("mcp") || !config["mcp"].is_object())
         config["mcp"] = json::object();
     erase_managed_keys(config["mcp"]);
-    config["mcp"][MCP_NAME] = {{"type", "remote"}, {"url", url}, {"enabled", true}};
+    config["mcp"][MCP_NAME] = {{"type", "remote"}, {"url", url}};
     return write_json_file(path, config);
 }
 
@@ -1444,8 +1477,6 @@ static bool write_cline(const std::string& path, const std::string& url)
     json entry;
     entry["type"] = "http";
     entry["url"] = url;
-    entry["disabled"] = false;
-    entry["autoApprove"] = json::array();
     config["mcpServers"][MCP_NAME] = entry;
     return write_json_file(path, config);
 }
@@ -1477,6 +1508,10 @@ static bool write_codex(const std::string& path, const std::string& url)
     };
     strip_section(content, "[mcp_servers.aida-standalone-mcp]");
     strip_section(content, "[mcp_servers.aida-pro-mcp]");
+    strip_section(content, "[mcp_servers.AiDA-Pro-MCP]");
+    strip_section(content, "[mcp_servers.camoufox-reverse-mcp]");
+    strip_section(content, "[mcp_servers.camoufox_reverse_mcp]");
+    strip_section(content, "[mcp_servers.camoufox-reverse]");
     strip_section(content, std::string("[mcp_servers.") + MCP_NAME + "]");
     if (!content.empty() && content.back() != '\n') {
         content += "\n";
@@ -1497,25 +1532,12 @@ static bool write_claude_code(const std::string& path, const std::string& url)
     return write_json_file(path, config);
 }
 
-static bool write_claude_bridge(const std::string& path, const std::string& url)
-{
-    json config;
-    if (std::filesystem::exists(path)) parse_json_file(path, config, false);
-    if (!config.is_object()) config = json::object();
-    if (!config.contains("mcpServers") || !config["mcpServers"].is_object())
-        config["mcpServers"] = json::object();
-    erase_managed_keys(config["mcpServers"]);
-    config["mcpServers"][MCP_NAME] = {{"command", "npx"}, {"args", json::array({"-y", "mcp-bridge", url})}};
-    return write_json_file(path, config);
-}
-
 void server_t::write_client_configs() const
 {
     if (!_running.load()) return;
 
     std::string port_str = std::to_string(_port);
     std::string http_url = "http://127.0.0.1:" + port_str + "/mcp";
-    std::string sse_url  = "http://127.0.0.1:" + port_str + "/sse";
 
     std::set<std::string> written;
     int ok = 0, skip = 0, fail = 0;
@@ -1542,7 +1564,6 @@ void server_t::write_client_configs() const
         case client_cfg_t::ZED:          success = write_zed(path, http_url); break;
         case client_cfg_t::CODEX:        success = write_codex(path, http_url); break;
         case client_cfg_t::CLAUDE_CODE:  success = write_claude_code(path, http_url); break;
-        case client_cfg_t::CLAUDE_BRIDGE:success = write_claude_bridge(path, sse_url); break;
         }
 
         if (success) { written.insert(path); ++ok; }

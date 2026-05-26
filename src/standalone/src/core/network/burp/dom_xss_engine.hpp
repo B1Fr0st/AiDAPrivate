@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -54,6 +55,10 @@ struct scan_options_t
     bool   capture_screenshots        = false;
     int    per_payload_timeout_ms     = 8000;
     size_t max_payloads_per_point     = 16;
+    uint64_t deadline_ms              = 0;
+    size_t max_browser_failures       = 1;
+    bool   abort_on_browser_error     = true;
+    std::function<bool()> cancelled;
     uint64_t audit_id                 = 0;
     std::string scheme;
     std::string host;

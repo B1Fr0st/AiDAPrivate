@@ -40,6 +40,8 @@ struct audit_runtime_t
     std::vector<uint8_t>        raw_request;
     std::atomic<bool>           cancel_flag{false};
     std::atomic<size_t>         in_flight{0};
+    std::atomic<size_t>         active_workers{0};
+    std::atomic<size_t>         queued_workers{0};
     std::atomic<size_t>         module_request_count{0};
     std::map<std::string, std::atomic<size_t>> per_module_count;
     std::mutex                  pmc_mtx;
@@ -107,9 +109,10 @@ void release_inflight(audit_runtime_t& rt)
 }
 
 scanner::send_fn_t make_send_fn(std::shared_ptr<audit_runtime_t> rt_ptr,
-                                const std::string& mod_id)
+                                const std::string& mod_id,
+                                bool count_completed)
 {
-    return [rt_ptr, mod_id](const std::vector<uint8_t>& raw_req, const scanner::probe_t& probe) -> std::optional<exchange_observed_t> {
+    return [rt_ptr, mod_id, count_completed](const std::vector<uint8_t>& raw_req, const scanner::probe_t& probe) -> std::optional<exchange_observed_t> {
         (void)probe;
         if (rt_ptr->cancel_flag.load()) return std::nullopt;
         if (rt_ptr->config.per_module_request_cap > 0 &&
@@ -120,8 +123,13 @@ scanner::send_fn_t make_send_fn(std::shared_ptr<audit_runtime_t> rt_ptr,
         opt.timeout_ms = rt_ptr->config.timeout_ms;
         opt.follow_redirects = rt_ptr->config.follow_redirects;
         opt.enforce_scope = rt_ptr->config.scope_only;
-        return audit_http::send(raw_req, rt_ptr->status.host, rt_ptr->status.port,
-                                rt_ptr->status.tls, opt);
+        auto observed = audit_http::send(raw_req, rt_ptr->status.host, rt_ptr->status.port,
+                                         rt_ptr->status.tls, opt);
+        if (count_completed) {
+            std::lock_guard<std::mutex> lk(rt_ptr->status_mtx);
+            rt_ptr->status.completed_probes++;
+        }
+        return observed;
     };
 }
 
@@ -156,6 +164,9 @@ void run_module_for_point(std::shared_ptr<audit_runtime_t> rt_ptr,
     ctx.url = rt_ptr->status.url;
     ctx.timeout_ms = rt_ptr->config.timeout_ms;
     ctx.follow_redirects = rt_ptr->config.follow_redirects;
+    ctx.cancelled = [rt_ptr]() {
+        return rt_ptr->cancel_flag.load(std::memory_order_acquire);
+    };
 
     audit_http::send_options_t base_opt;
     base_opt.timeout_ms = rt_ptr->config.timeout_ms;
@@ -176,12 +187,14 @@ void run_module_for_point(std::shared_ptr<audit_runtime_t> rt_ptr,
             static_cast<unsigned long long>(rt_ptr->status.id), mod.id.c_str());
     }
 
-    auto send_fn = make_send_fn(rt_ptr, mod.id);
+    auto send_fn = make_send_fn(rt_ptr, mod.id, false);
 
     if (mod.custom_run) {
         diag::log_tagged_fmt("scanner", "run_module_for_point custom_run audit=%llu module=%s",
             static_cast<unsigned long long>(rt_ptr->status.id), mod.id.c_str());
-        mod.custom_run(ip, ctx, send_fn);
+        auto custom_send_fn = make_send_fn(rt_ptr, mod.id, true);
+        mod.custom_run(ip, ctx, custom_send_fn);
+        if (rt_ptr->cancel_flag.load()) return;
         if (!mod.probes || !mod.detect) return;
     }
 
@@ -276,22 +289,37 @@ void run_audit(std::shared_ptr<audit_runtime_t> rt_ptr)
             std::shared_ptr<audit_runtime_t> captured = rt_ptr;
             scanner::module_t mod_copy = mod;
             insertion_point_t ip_copy = ip;
+            rt_ptr->queued_workers.fetch_add(1, std::memory_order_relaxed);
+            rt_ptr->active_workers.fetch_add(1, std::memory_order_relaxed);
             work_queue::post([captured, mod_copy, ip_copy]() {
+                struct worker_guard_t
+                {
+                    std::shared_ptr<audit_runtime_t> rt;
+                    ~worker_guard_t()
+                    {
+                        rt->active_workers.fetch_sub(1, std::memory_order_acq_rel);
+                        rt->cancel_cv.notify_all();
+                    }
+                } guard{captured};
                 run_module_for_point(captured, mod_copy, ip_copy);
             });
         }
     }
 
+    auto cancel_wait_started = std::chrono::steady_clock::time_point{};
     while (true) {
-        if (rt_ptr->cancel_flag.load()) break;
-        size_t completed;
-        size_t total;
-        {
-            std::lock_guard<std::mutex> lk(rt_ptr->status_mtx);
-            completed = rt_ptr->status.completed_probes;
-            total = rt_ptr->status.total_probes;
+        const size_t active_workers = rt_ptr->active_workers.load(std::memory_order_acquire);
+        const size_t in_flight = rt_ptr->in_flight.load(std::memory_order_acquire);
+        if (active_workers == 0 && in_flight == 0) break;
+        if (rt_ptr->cancel_flag.load(std::memory_order_acquire)) {
+            if (cancel_wait_started == std::chrono::steady_clock::time_point{})
+                cancel_wait_started = std::chrono::steady_clock::now();
+            if (std::chrono::steady_clock::now() - cancel_wait_started > std::chrono::seconds(15)) {
+                diag::log_tagged_fmt("burp", "active_scanner cancel_drain_timeout id=%llu active_workers=%zu in_flight=%zu",
+                    static_cast<unsigned long long>(rt_ptr->status.id), active_workers, in_flight);
+                break;
+            }
         }
-        if (rt_ptr->in_flight.load() == 0 && (total == 0 || completed >= total)) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 

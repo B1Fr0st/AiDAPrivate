@@ -199,6 +199,7 @@ public:
     const std::string&   server_name()   const;
     const std::string&   last_error()    const;
     const server_config_t& config()      const;
+    std::uint32_t        child_process_id() const;
 
 
     const std::vector<remote_tool_t>& cached_tools() const;
@@ -262,6 +263,7 @@ private:
     void*   _child_process  = nullptr;
     void*   _child_stdin_w  = nullptr;
     void*   _child_stdout_r = nullptr;
+    std::uint32_t _child_process_id = 0;
 };
 
 

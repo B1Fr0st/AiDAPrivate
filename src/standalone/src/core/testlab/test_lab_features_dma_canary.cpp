@@ -96,6 +96,14 @@ namespace {
 			return;
 		}
 
+		bool heartbeat_ok = device->send_heartbeat();
+		if (!heartbeat_ok) {
+			r.error = "send_heartbeat failed before canary registration";
+			r.ok = false;
+			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
+			return;
+		}
+
 		bool ok = device->canary_register_for_pid(register_va, register_size, register_pid);
 		std::uint32_t canary_count = 0;
 		bool query_ok = device->canary_query_count(canary_count);
@@ -119,6 +127,7 @@ namespace {
 		}
 
 		r.parsed.push_back({ "via", "device->canary_register_for_pid() (public wrapper)" });
+		r.parsed.push_back({ "heartbeat_before_register", heartbeat_ok ? "true" : "false" });
 		r.parsed.push_back({ "used_self_fixture", used_self_fixture ? "true" : "false" });
 		r.parsed.push_back({ "requested_va", hex_u64(s.addr) });
 		r.parsed.push_back({ "requested_size", std::to_string(s.size) });

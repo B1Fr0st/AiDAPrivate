@@ -9,8 +9,7 @@ namespace test_lab {
 
 	enum class driver_e : int {
 		whoswho = 0,
-		shadowfs = 1,
-		sentinel = 2,
+		sentinel = 1,
 	};
 
 	enum class run_state_e : int {

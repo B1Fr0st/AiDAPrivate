@@ -1199,7 +1199,7 @@ std::string saml_decode_request(const std::string& saml_b64)
         tmp.reserve(s_in.size());
         for (size_t i = 0; i < s_in.size(); ++i) {
             char c = s_in[i];
-            if (c == '+') tmp.push_back(' ');
+            if (c == '+') tmp.push_back('+');
             else if (c == '%' && i + 2 < s_in.size()) {
                 int hi = -1, lo = -1;
                 char h = s_in[i + 1], l = s_in[i + 2];
@@ -1223,6 +1223,11 @@ std::string saml_decode_request(const std::string& saml_b64)
         set_err("saml_decode_request: base64 decode failed");
         return std::string();
     }
+    std::string raw_trimmed = trim(raw);
+    if (!raw_trimmed.empty() && raw_trimmed.front() == '<') {
+        diag::log_tagged_fmt("auth_lab", "saml_decode_request raw_xml_len=%zu formatting_xml", raw.size());
+        return pretty_xml(raw);
+    }
     diag::log_tagged_fmt("auth_lab", "saml_decode_request b64_ok raw_len=%zu inflating", raw.size());
     std::vector<uint8_t> inflated;
     inflated.reserve(raw.size() * 4 + 32);
@@ -1239,7 +1244,7 @@ std::string saml_decode_request(const std::string& saml_b64)
         strm.next_out = chunk;
         strm.avail_out = sizeof(chunk);
         ret = inflate(&strm, Z_NO_FLUSH);
-        if (ret == Z_NEED_DICT || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR) {
+        if (ret == Z_NEED_DICT || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR || ret == Z_BUF_ERROR) {
             inflateEnd(&strm);
             diag::log_tagged_fmt("auth_lab", "saml_decode_request inflate_failed ret=%d raw_len=%zu using_raw_xml", ret, raw.size());
             return pretty_xml(raw);
@@ -1247,9 +1252,18 @@ std::string saml_decode_request(const std::string& saml_b64)
         const size_t produced = sizeof(chunk) - strm.avail_out;
         inflated.insert(inflated.end(), chunk, chunk + produced);
         if (ret == Z_STREAM_END) break;
-        if (produced == 0) break;
+        if (produced == 0) {
+            inflateEnd(&strm);
+            diag::log_tagged_fmt("auth_lab", "saml_decode_request inflate_no_progress ret=%d raw_len=%zu using_raw_xml", ret, raw.size());
+            return pretty_xml(raw);
+        }
     }
     inflateEnd(&strm);
+    if (ret != Z_STREAM_END || inflated.empty()) {
+        diag::log_tagged_fmt("auth_lab", "saml_decode_request inflate_incomplete ret=%d inflated_len=%zu using_raw_xml",
+            ret, inflated.size());
+        return pretty_xml(raw);
+    }
     std::string xml(reinterpret_cast<const char*>(inflated.data()), inflated.size());
     diag::log_tagged_fmt("auth_lab", "saml_decode_request inflated_len=%zu formatting_xml", inflated.size());
     return pretty_xml(xml);

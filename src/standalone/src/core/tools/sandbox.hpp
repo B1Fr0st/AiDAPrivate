@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -116,6 +117,111 @@ namespace sandbox
             return std::string((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
         }
 
+        inline bool read_json_file(const std::filesystem::path& path, nlohmann::json& out)
+        {
+            const std::string raw = read_utf8_file(path);
+            if (raw.empty())
+                return false;
+            auto parsed = nlohmann::json::parse(raw, nullptr, false);
+            if (parsed.is_discarded() || !parsed.is_object())
+                return false;
+            out = std::move(parsed);
+            return true;
+        }
+
+        inline bool json_bool_field(const nlohmann::json& value, const char* key, bool fallback)
+        {
+            if (!value.is_object() || !value.contains(key))
+                return fallback;
+            const auto& field = value[key];
+            if (field.is_boolean())
+                return field.get<bool>();
+            if (field.is_number_integer())
+                return field.get<int64_t>() != 0;
+            if (field.is_number_unsigned())
+                return field.get<uint64_t>() != 0;
+            if (field.is_string()) {
+                std::string text = field.get<std::string>();
+                std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
+                    return static_cast<char>(std::tolower(c));
+                });
+                if (text == "true" || text == "1" || text == "yes")
+                    return true;
+                if (text == "false" || text == "0" || text == "no")
+                    return false;
+            }
+            return fallback;
+        }
+
+        inline uint32_t json_u32_field(const nlohmann::json& value, const char* key, uint32_t fallback)
+        {
+            if (!value.is_object() || !value.contains(key))
+                return fallback;
+            const auto& field = value[key];
+            if (field.is_number_unsigned()) {
+                uint64_t raw = field.get<uint64_t>();
+                return raw > 0xFFFFFFFFull ? 0xFFFFFFFFu : static_cast<uint32_t>(raw);
+            }
+            if (field.is_number_integer()) {
+                int64_t raw = field.get<int64_t>();
+                if (raw < 0)
+                    return fallback;
+                return raw > 0xFFFFFFFFll ? 0xFFFFFFFFu : static_cast<uint32_t>(raw);
+            }
+            if (field.is_string()) {
+                try {
+                    std::string text = field.get<std::string>();
+                    size_t idx = 0;
+                    unsigned long long raw = std::stoull(text, &idx, 0);
+                    if (idx == text.size())
+                        return raw > 0xFFFFFFFFull ? 0xFFFFFFFFu : static_cast<uint32_t>(raw);
+                } catch (...) {
+                }
+            }
+            return fallback;
+        }
+
+        struct close_window_ctx
+        {
+            DWORD pid = 0;
+            bool posted = false;
+        };
+
+        inline BOOL CALLBACK close_window_enum_proc(HWND hwnd, LPARAM param)
+        {
+            auto* ctx = reinterpret_cast<close_window_ctx*>(param);
+            DWORD pid = 0;
+            GetWindowThreadProcessId(hwnd, &pid);
+            if (ctx && pid == ctx->pid && IsWindowVisible(hwnd)) {
+                PostMessageW(hwnd, WM_CLOSE, 0, 0);
+                ctx->posted = true;
+            }
+            return TRUE;
+        }
+
+        inline bool request_process_window_close(DWORD pid)
+        {
+            if (pid == 0)
+                return false;
+            close_window_ctx ctx;
+            ctx.pid = pid;
+            EnumWindows(close_window_enum_proc, reinterpret_cast<LPARAM>(&ctx));
+            return ctx.posted;
+        }
+
+        inline void close_or_terminate_process(HANDLE process, DWORD pid, DWORD close_wait_ms)
+        {
+            if (!process || process == INVALID_HANDLE_VALUE)
+                return;
+            if (WaitForSingleObject(process, 0) == WAIT_OBJECT_0)
+                return;
+            if (request_process_window_close(pid)) {
+                if (WaitForSingleObject(process, close_wait_ms) == WAIT_OBJECT_0)
+                    return;
+            }
+            TerminateProcess(process, 0);
+        }
+
         inline void copy_workspace(const std::filesystem::path& source_dir,
                                    const std::filesystem::path& target_dir)
         {
@@ -171,6 +277,7 @@ namespace sandbox
             ofs << L"$stdoutFile = Join-Path $guestRoot 'stdout.txt'\n";
             ofs << L"$stderrFile = Join-Path $guestRoot 'stderr.txt'\n";
             ofs << L"$metaFile = Join-Path $guestRoot 'metadata.json'\n";
+            ofs << L"$tmpMetaFile = Join-Path $guestRoot ('metadata.' + [guid]::NewGuid().ToString('N') + '.tmp')\n";
             ofs << L"$workDir = Split-Path -Path $exePath -Parent\n";
             ofs << L"$sw = [System.Diagnostics.Stopwatch]::StartNew()\n";
             ofs << L"$timedOut = $false\n";
@@ -179,6 +286,8 @@ namespace sandbox
             ofs << L"$pidValue = 0\n";
             ofs << L"if (" << (capture_stdout ? L"$true" : L"$false") << L") { if (Test-Path $stdoutFile) { Remove-Item $stdoutFile -Force } }\n";
             ofs << L"if (" << (capture_stderr ? L"$true" : L"$false") << L") { if (Test-Path $stderrFile) { Remove-Item $stderrFile -Force } }\n";
+            ofs << L"if (Test-Path $metaFile) { Remove-Item $metaFile -Force }\n";
+            ofs << L"if (Test-Path $tmpMetaFile) { Remove-Item $tmpMetaFile -Force }\n";
             ofs << L"$proc = Start-Process -FilePath $exePath -ArgumentList $argLine -WorkingDirectory $workDir "
                    L"-PassThru -WindowStyle Hidden"
                 << (capture_stdout ? L" -RedirectStandardOutput $stdoutFile" : L"")
@@ -193,7 +302,8 @@ namespace sandbox
             ofs << L"  $proc.WaitForExit(5000) | Out-Null\n";
             ofs << L"}\n";
             ofs << L"$sw.Stop()\n";
-            ofs << L"if ($proc.HasExited) { $exitCode = $proc.ExitCode }\n";
+            ofs << L"if ($proc.HasExited -and $null -ne $proc.ExitCode) { $exitCode = [int]$proc.ExitCode }\n";
+            ofs << L"if ($null -eq $exitCode) { $exitCode = 0 }\n";
             ofs << L"$meta = [ordered]@{\n";
             ofs << L"  success = $true\n";
             ofs << L"  exit_code = $exitCode\n";
@@ -202,7 +312,10 @@ namespace sandbox
             ofs << L"  killed = $killed\n";
             ofs << L"  elapsed_ms = [int]$sw.ElapsedMilliseconds\n";
             ofs << L"}\n";
-            ofs << L"$meta | ConvertTo-Json -Depth 4 | Out-File -FilePath $metaFile -Encoding utf8\n";
+            ofs << L"$json = $meta | ConvertTo-Json -Depth 4\n";
+            ofs << L"$utf8NoBom = New-Object System.Text.UTF8Encoding($false)\n";
+            ofs << L"[System.IO.File]::WriteAllText($tmpMetaFile, $json, $utf8NoBom)\n";
+            ofs << L"Move-Item -LiteralPath $tmpMetaFile -Destination $metaFile -Force\n";
         }
 
         inline void write_wsb(const std::filesystem::path& wsb_path,
@@ -323,20 +436,27 @@ namespace sandbox
         const uint32_t host_timeout = (std::max)(cfg.timeout_ms + 120000u, 180000u);
         bool sandbox_alive = true;
         bool cancelled = false;
+        bool process_exited = false;
+        DWORD exit_tick = 0;
+        bool metadata_ready = false;
+        nlohmann::json meta;
         while ((GetTickCount() - start_tick) < host_timeout) {
             if (cfg.cancel_token && cfg.cancel_token->load(std::memory_order_acquire)) {
                 cancelled = true;
                 break;
             }
-            if (std::filesystem::exists(host_meta))
+            if (detail::read_json_file(host_meta, meta)) {
+                metadata_ready = true;
                 break;
+            }
             DWORD wait_state = WaitForSingleObject(pi.hProcess, 500);
             if (wait_state == WAIT_OBJECT_0) {
                 sandbox_alive = false;
-                if (std::filesystem::exists(host_meta))
-                    break;
-                std::this_thread::sleep_for(std::chrono::milliseconds(1500));
-                if (!std::filesystem::exists(host_meta))
+                if (!process_exited) {
+                    process_exited = true;
+                    exit_tick = GetTickCount();
+                }
+                if ((GetTickCount() - exit_tick) > 5000)
                     break;
             }
         }
@@ -358,7 +478,7 @@ namespace sandbox
             return res;
         }
 
-        if (!std::filesystem::exists(host_meta)) {
+        if (!metadata_ready) {
             res.timed_out = !sandbox_alive ? false : true;
             res.killed = sandbox_alive;
             if (sandbox_alive)
@@ -372,22 +492,14 @@ namespace sandbox
             return res;
         }
 
-        TerminateProcess(pi.hProcess, 0);
+        detail::close_or_terminate_process(pi.hProcess, pi.dwProcessId, 8000);
         CloseHandle(pi.hProcess);
 
-        auto meta = nlohmann::json::parse(detail::read_utf8_file(host_meta), nullptr, false);
-        if (meta.is_discarded() || !meta.is_object()) {
-            res.error = "Sandbox metadata was unreadable.";
-            res.session_dir = detail::narrow(session_dir.wstring());
-            res.wsb_path = detail::narrow(host_wsb.wstring());
-            return res;
-        }
-
-        res.success = meta.value("success", false);
-        res.exit_code = meta.value("exit_code", 0u);
-        res.timed_out = meta.value("timed_out", false);
-        res.killed = meta.value("killed", false);
-        res.elapsed_ms = meta.value("elapsed_ms", static_cast<uint32_t>(GetTickCount() - start_tick));
+        res.success = detail::json_bool_field(meta, "success", false);
+        res.exit_code = detail::json_u32_field(meta, "exit_code", 0u);
+        res.timed_out = detail::json_bool_field(meta, "timed_out", false);
+        res.killed = detail::json_bool_field(meta, "killed", false);
+        res.elapsed_ms = detail::json_u32_field(meta, "elapsed_ms", static_cast<uint32_t>(GetTickCount() - start_tick));
         res.stdout_data = cfg.capture_stdout ? detail::read_utf8_file(host_stdout) : std::string();
         res.stderr_data = cfg.capture_stderr ? detail::read_utf8_file(host_stderr) : std::string();
         res.session_dir = detail::narrow(session_dir.wstring());

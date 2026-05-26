@@ -9,7 +9,4 @@ namespace driver_loader
     void mark_already_loaded();
     const std::string& last_error();
 
-    bool load_shadow_fs();
-    bool is_shadow_fs_loaded();
-    void mark_shadow_fs_loaded();
 }

@@ -1252,7 +1252,7 @@ static json handle_initialize(const json& id, const json& )
     capabilities["logging"]   = json::object();
 
     json server_info;
-    server_info[OBFSTR_C("name")] = OBFSTR("AiDA-IDA-MCP");
+    server_info[OBFSTR_C("name")] = OBFSTR("aida-ida-mcp");
     server_info["version"] = AIDA_VERSION;
 
     json result;
@@ -2277,7 +2277,7 @@ void mcp_server_t::server_thread_func(int port)
     svr.Get("/health", [](const httplib::Request&, httplib::Response& res) {
         json health;
         health["status"] = "ok";
-        health["server"] = OBFSTR("AiDA-IDA-MCP");
+        health["server"] = OBFSTR("aida-ida-mcp");
         health["version"] = AIDA_VERSION;
         health["tools_count"] = agent_tools::ToolRegistry::instance().get_tool_names().size();
         res.set_content(json_dump_safe(health), "application/json");
@@ -2285,7 +2285,7 @@ void mcp_server_t::server_thread_func(int port)
 
     svr.Get("/config", [](const httplib::Request&, httplib::Response& res) {
         json config;
-        config["name"] = "AiDA-IDA-MCP";
+        config["name"] = "aida-ida-mcp";
         config["version"] = AIDA_VERSION;
         config["transport"] = "streamable-http";
         config["legacy_sse"] = true;
@@ -2295,10 +2295,10 @@ void mcp_server_t::server_thread_func(int port)
             auto self = registry->self_record();
             config["self"] = record_to_public_json(self);
             config["mcpServers"] = json::object({
-                {"AiDA-IDA-MCP", json::object({{"type", "http"}, {"url", self.mcp_url}})}
+                {"aida-ida-mcp", json::object({{"type", "http"}, {"url", self.mcp_url}})}
             });
             config["sseServers"] = json::object({
-                {"AiDA-IDA-MCP", json::object({{"url", self.sse_url}})}
+                {"aida-ida-mcp", json::object({{"url", self.sse_url}})}
             });
         }
         res.set_content(json_dump_safe(config, 2), "application/json");
@@ -2306,7 +2306,7 @@ void mcp_server_t::server_thread_func(int port)
 
     svr.Get("/profile.txt", [](const httplib::Request&, httplib::Response& res) {
         std::string profile;
-        profile += "AiDA-IDA-MCP\n";
+        profile += "aida-ida-mcp\n";
         profile += "version=";
         profile += AIDA_VERSION;
         profile += "\ntransport=streamable-http\n";
@@ -2332,9 +2332,9 @@ void mcp_server_t::server_thread_func(int port)
             sse_url = self.sse_url;
         }
         std::string html =
-            "<!doctype html><html><head><meta charset=\"utf-8\"><title>AiDA-IDA-MCP</title>"
+            "<!doctype html><html><head><meta charset=\"utf-8\"><title>aida-ida-mcp</title>"
             "<style>body{font-family:Segoe UI,Arial,sans-serif;margin:32px;line-height:1.5}code,pre{background:#f3f4f6;padding:2px 4px;border-radius:4px}pre{padding:12px;overflow:auto}</style>"
-            "</head><body><h1>AiDA-IDA-MCP</h1><p>Streamable HTTP endpoint:</p><pre>"
+            "</head><body><h1>aida-ida-mcp</h1><p>Streamable HTTP endpoint:</p><pre>"
             + mcp_url +
             "</pre><p>Legacy SSE endpoint:</p><pre>"
             + sse_url +
@@ -2625,8 +2625,7 @@ enum class mcp_cfg_format_t
     cline_mcp,
     zed_context,
     codex_toml,
-    claude_code_json,
-    claude_desktop_bridge
+    claude_code_json
 };
 
 struct mcp_client_def_t
@@ -2656,7 +2655,7 @@ static const mcp_client_def_t g_mcp_client_defs[] =
     },
     {
         "Claude",
-        mcp_cfg_format_t::claude_desktop_bridge,
+        mcp_cfg_format_t::mcpservers_url,
         "%APPDATA%/Claude/claude_desktop_config.json",
         "~/Library/Application Support/Claude/claude_desktop_config.json",
         nullptr
@@ -2734,7 +2733,7 @@ static const mcp_client_def_t g_mcp_client_defs[] =
 
     {
         "Windsurf",
-        mcp_cfg_format_t::mcpservers_serverurl,
+        mcp_cfg_format_t::mcpservers_url,
         "~/.codeium/windsurf/mcp_config.json",
         "~/.codeium/windsurf/mcp_config.json",
         "~/.codeium/windsurf/mcp_config.json"
@@ -2848,9 +2847,10 @@ static const mcp_client_def_t g_mcp_client_defs[] =
 #endif
 };
 
-static const std::string MCP_SERVER_NAME       = OBFSTR("AiDA-IDA-MCP");
-static const std::string MCP_AGGREGATOR_NAME    = OBFSTR("AiDA-IDA-MCP");
-static const std::string MCP_LEGACY_PREFIX      = OBFSTR("aida-pro-mcp");
+static const std::string MCP_SERVER_NAME       = OBFSTR("aida-ida-mcp");
+static const std::string MCP_AGGREGATOR_NAME    = OBFSTR("aida-ida-mcp");
+static const std::string MCP_OLD_SERVER_NAME   = OBFSTR("AiDA-IDA-MCP");
+static const std::string MCP_OLD_PRO_PREFIX    = OBFSTR("AiDA-Pro-MCP");
 static const std::string MCP_INSTANCE_PREFIX    = OBFSTR("AiDA-IDA-MCP-");
 static const std::string MCP_OLD_INSTANCE_PREFIX = OBFSTR("aida-ida-");
 
@@ -2868,11 +2868,19 @@ static bool mcp_is_aida_managed_key(const std::string& key)
         return true;
     if (key == MCP_AGGREGATOR_NAME)
         return true;
-    if (key == MCP_LEGACY_PREFIX)
+    if (key == MCP_OLD_SERVER_NAME)
+        return true;
+    if (key == MCP_OLD_PRO_PREFIX)
         return true;
     if (key == OBFSTR("aida-standalone-mcp"))
         return true;
     if (key == OBFSTR("aida-ida-all"))
+        return true;
+    if (key == OBFSTR("camoufox-reverse-mcp"))
+        return true;
+    if (key == OBFSTR("camoufox_reverse_mcp"))
+        return true;
+    if (key == OBFSTR("camoufox-reverse"))
         return true;
     if (key.size() >= MCP_INSTANCE_PREFIX.size()
         && key.compare(0, MCP_INSTANCE_PREFIX.size(), MCP_INSTANCE_PREFIX) == 0)
@@ -3022,36 +3030,6 @@ static bool mcp_read_file_contents(const std::string& path, std::string& out)
 
 static bool mcp_parse_json_file(const std::string& path, json& out, bool allow_jsonc);
 static bool mcp_write_json_file(const std::string& path, const json& data);
-
-static bool mcp_write_claude_desktop_bridge(const std::string& path,
-                                            const std::vector<mcp_entry_t>& entries)
-{
-    json config;
-    if (qfileexist(path.c_str()))
-    {
-        if (!mcp_parse_json_file(path, config, false))
-            config = json::object();
-    }
-    if (!config.is_object())
-        config = json::object();
-
-    if (!config.contains("mcpServers") || !config["mcpServers"].is_object())
-        config["mcpServers"] = json::object();
-
-    auto& root = config["mcpServers"];
-    for (const auto& key : mcp_collect_managed_keys(root))
-        root.erase(key);
-
-    for (const auto& e : entries)
-    {
-        json entry;
-        entry["command"] = "npx";
-        entry["args"]    = json::array({"-y", "mcp-bridge", e.sse_url});
-        root[e.name] = entry;
-    }
-
-    return mcp_write_json_file(path, config);
-}
 
 static bool mcp_write_file_contents(const std::string& path, const std::string& content)
 {
@@ -3259,7 +3237,6 @@ static bool mcp_write_opencode_json(const std::string& path,
         json entry;
         entry[OBFSTR_C("type")] = "remote";
         entry["url"] = e.http_url;
-        entry["enabled"] = true;
         root[e.name] = entry;
     }
 
@@ -3283,23 +3260,14 @@ static bool mcp_write_cline_config(const std::string& path,
 
     auto& root = config["mcpServers"];
 
-    std::map<std::string, json> preserved_auto_approve;
     for (const auto& key : mcp_collect_managed_keys(root))
-    {
-        if (root[key].is_object() && root[key].contains("autoApprove"))
-            preserved_auto_approve[key] = root[key]["autoApprove"];
         root.erase(key);
-    }
 
     for (const auto& e : entries)
     {
         json entry;
         entry[OBFSTR_C("type")] = "http";
         entry["url"] = e.http_url;
-        entry["disabled"] = false;
-        entry["autoApprove"] = preserved_auto_approve.count(e.name)
-                              ? preserved_auto_approve[e.name]
-                              : json::array();
         root[e.name] = entry;
     }
 
@@ -3421,9 +3389,13 @@ static bool mcp_write_codex_toml(const std::string& path,
 
     {
         const std::vector<std::string> names = {
-            OBFSTR("aida-pro-mcp"),
+            OBFSTR("AiDA-Pro-MCP"),
             OBFSTR("aida-standalone-mcp"),
             OBFSTR("aida-ida-all"),
+            OBFSTR("camoufox-reverse-mcp"),
+            OBFSTR("camoufox_reverse_mcp"),
+            OBFSTR("camoufox-reverse"),
+            MCP_OLD_SERVER_NAME,
             MCP_SERVER_NAME,
             MCP_AGGREGATOR_NAME
         };
@@ -3538,8 +3510,6 @@ static bool mcp_write_single_client(
     case mcp_cfg_format_t::claude_code_json:
         return mcp_write_claude_code_json(path, entries);
 
-    case mcp_cfg_format_t::claude_desktop_bridge:
-        return mcp_write_claude_desktop_bridge(path, entries);
     }
     return false;
 }
@@ -3549,7 +3519,7 @@ static void mcp_write_reference_config(
     const ida_instance_record_t& self_rec)
 {
     json config;
-    config["_comment"] = OBFSTR("MCP Server - Auto-configured endpoints. Multi-IDA instance aware. Each running IDA contributes its own entry; AiDA-IDA-MCP is the aggregator.");
+    config["_comment"] = OBFSTR("MCP Server - Auto-configured endpoint. aida-ida-mcp is the only IDA client entry and routes to live instances internally.");
     config["_version"] = AIDA_VERSION;
     config["self"] = {
         {"instance_id",       self_rec.instance_id},
@@ -3604,18 +3574,7 @@ void mcp_server_t::write_mcp_client_configs() const
     auto live = _registry->all_live_instances();
 
     std::vector<mcp_entry_t> entries;
-    entries.reserve(live.size() + 1);
-    for (const auto& r : live)
-    {
-        if (r.config_entry_name.empty() || r.port <= 0)
-            continue;
-        mcp_entry_t e;
-        e.name        = r.config_entry_name;
-        e.http_url    = r.mcp_url.empty() ? (r.base_url + "/mcp") : r.mcp_url;
-        e.sse_url     = r.sse_url.empty() ? (r.base_url + "/sse") : r.sse_url;
-        e.description = r.display_name;
-        entries.push_back(std::move(e));
-    }
+    entries.reserve(1);
 
     {
         mcp_entry_t agg;
@@ -3719,10 +3678,9 @@ void mcp_server_t::write_mcp_client_configs() const
     if (failed_count > 0)
         msg("  Clients failed        : %d\n", failed_count);
     msg("------------------------------------------------------------\n");
-    msg("  Each running IDA Pro instance is exposed as its own MCP\n");
-    msg("  server entry. Connect to %s for cross-instance\n", MCP_AGGREGATOR_NAME.c_str());
-    msg("  fan-out (list_ida_instances, query_all_instances) or to\n");
-    msg("  any specific AiDA-IDA-MCP-<basename>-<id> entry directly.\n");
+    msg("  Client config exposes one IDA MCP server entry: %s.\n", MCP_AGGREGATOR_NAME.c_str());
+    msg("  Use list_ida_instances, query_all_instances, instance_id,\n");
+    msg("  or pid routing through that single entry for live IDA targets.\n");
     msg("------------------------------------------------------------\n");
     msg("  Reference config      : %s\n", ref_file.c_str());
     msg("============================================================\n\n");

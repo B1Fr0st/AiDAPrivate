@@ -101,7 +101,7 @@ namespace test_all_features {
 		constexpr int kNetworkFeatureTests = 125;
 		constexpr int kBurpFeatureTests = 184;
 		constexpr int kDisasmFeatureTests = 110;
-		constexpr int kMcpFeatureTests = 509;
+		constexpr int kMcpFeatureTests = 521;
 
 
 		void format_timestamp(char* out, std::size_t cap) {

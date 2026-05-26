@@ -78,6 +78,10 @@ void xss_browser_confirm_run(const insertion_point_t& ip, const module_context_t
     diag::log_tagged_fmt("mod_xss", "xss_browser_confirm_run entry ip=%s:%s url=%s",
                          ip.kind.c_str(), ip.name.c_str(), ctx.url.c_str());
     (void)send;
+    if (ctx.cancelled && ctx.cancelled()) {
+        diag::log_tagged_fmt("mod_xss", "xss_browser_confirm_run cancelled before browser ip=%s:%s", ip.kind.c_str(), ip.name.c_str());
+        return;
+    }
     if (!camoufox::ensure_ready()) {
         diag::log_tagged_fmt("mod_xss", "xss_browser_confirm_run skip camoufox not ready ip=%s:%s", ip.kind.c_str(), ip.name.c_str());
         return;
@@ -100,9 +104,16 @@ void xss_browser_confirm_run(const insertion_point_t& ip, const module_context_t
     opts.scheme                 = ctx.tls ? std::string("https") : std::string("http");
     opts.host                   = ctx.host;
     opts.port                   = ctx.port;
+    opts.cancelled              = ctx.cancelled;
 
     using namespace std::chrono;
     uint64_t t0 = static_cast<uint64_t>(duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count());
+    uint64_t scan_budget_ms = ctx.timeout_ms > 0 ? static_cast<uint64_t>(ctx.timeout_ms) : 30000ULL;
+    if (scan_budget_ms < 5000ULL) scan_budget_ms = 5000ULL;
+    if (scan_budget_ms > 45000ULL) scan_budget_ms = 45000ULL;
+    opts.deadline_ms = t0 + scan_budget_ms;
+    opts.abort_on_browser_error = true;
+    opts.max_browser_failures = 1;
     size_t emitted = dom_xss::scan_insertion_point(ip, opts);
     uint64_t t1 = static_cast<uint64_t>(duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count());
     diag::log_tagged_fmt("xss",

@@ -8683,7 +8683,7 @@ static tool_result_t server_health(const json&)
     qstring procname = inf_get_procname();
     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - g_start_time).count();
     data["status"] = "ok";
-    data["server"] = "AiDA-IDA-MCP";
+    data["server"] = "aida-ida-mcp";
     data["compatibility"] = "ida-pro-mcp-enhancement";
     data["processor"] = procname.c_str();
     data["bitness"] = inf_get_app_bitness();

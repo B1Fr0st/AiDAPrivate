@@ -48,6 +48,18 @@ void set_err(const std::string& msg)
     diag::log_tagged("dom_xss", msg.c_str());
 }
 
+void clear_err()
+{
+    std::lock_guard<std::mutex> lk(err_mtx());
+    err_slot().clear();
+}
+
+std::string current_err()
+{
+    std::lock_guard<std::mutex> lk(err_mtx());
+    return err_slot();
+}
+
 uint64_t now_ms_steady()
 {
     using namespace std::chrono;
@@ -92,6 +104,44 @@ std::string replace_all(std::string s, const std::string& from, const std::strin
         p += to.size();
     }
     return s;
+}
+
+std::string ascii_lower_copy(std::string s)
+{
+    for (char& c : s)
+    {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + 32);
+    }
+    return s;
+}
+
+bool is_browser_transport_error(const std::string& msg)
+{
+    std::string s = ascii_lower_copy(msg);
+    return s.find("connection closed while reading from the driver") != std::string::npos ||
+           s.find("connection closed") != std::string::npos ||
+           s.find("camoufox driver closed") != std::string::npos ||
+           s.find("camoufox bridge not ready") != std::string::npos ||
+           s.find("bridge state is busy") != std::string::npos ||
+           s.find("target page, context or browser has been closed") != std::string::npos ||
+           s.find("browser has been closed") != std::string::npos ||
+           s.find("page has been closed") != std::string::npos ||
+           s.find("target closed") != std::string::npos ||
+           s.find("page crashed") != std::string::npos ||
+           s.find("deadline exceeded") != std::string::npos ||
+           s.find("add_init_script failed") != std::string::npos ||
+           s.find("navigate failed") != std::string::npos ||
+           s.find("harness navigate") != std::string::npos ||
+           s.find("harness evaluate_js failed") != std::string::npos ||
+           s.find("results read failed") != std::string::npos;
+}
+
+void recover_browser_transport(const char* phase, int attempt, const std::string& err)
+{
+    diag::log_tagged_fmt("dom_xss", "browser_transport_recover phase=%s attempt=%d err=%s",
+        phase ? phase : "", attempt, err.c_str());
+    camoufox::stop_bridge();
+    std::this_thread::sleep_for(std::chrono::milliseconds(750 + (attempt * 500)));
 }
 
 std::string js_string_literal(const std::string& s)
@@ -371,15 +421,40 @@ bool navigate_with_init_script(const std::string& abs_url,
                                int                timeout_ms)
 {
     std::string pre = build_pre_injection_script(s);
-    if (!camoufox::add_init_script(pre)) {
+    constexpr int kMaxAttempts = 3;
+    for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
+        if (!camoufox::ensure_ready()) {
+            std::string e = camoufox::last_error();
+            if (!is_browser_transport_error(e) || attempt == kMaxAttempts) {
+                set_err(e.empty() ? std::string("camoufox bridge not ready") : e);
+                return false;
+            }
+            recover_browser_transport("ensure_ready", attempt, e);
+            continue;
+        }
+        if (!camoufox::add_init_script(pre)) {
+            std::string e = camoufox::last_error();
+            diag::log_tagged_fmt("dom_xss", "add_init_script failed attempt=%d err=%s", attempt, e.c_str());
+            if (!is_browser_transport_error(e) || attempt == kMaxAttempts) {
+                set_err(std::string("add_init_script failed: ") + e);
+                return false;
+            }
+            recover_browser_transport("add_init_script", attempt, e);
+            continue;
+        }
+        if (camoufox::navigate(abs_url, "load", timeout_ms)) {
+            return true;
+        }
         std::string e = camoufox::last_error();
-        diag::log_tagged_fmt("dom_xss", "add_init_script failed: %s", e.c_str());
+        diag::log_tagged_fmt("dom_xss", "navigate failed attempt=%d err=%s", attempt, e.c_str());
+        if (!is_browser_transport_error(e) || attempt == kMaxAttempts) {
+            set_err(std::string("navigate failed: ") + e);
+            return false;
+        }
+        recover_browser_transport("navigate", attempt, e);
     }
-    if (!camoufox::navigate(abs_url, "load", timeout_ms)) {
-        set_err(std::string("navigate failed: ") + camoufox::last_error());
-        return false;
-    }
-    return true;
+    set_err("navigate failed: exhausted browser transport retries");
+    return false;
 }
 
 bool drive_fetch_harness(const std::string& abs_url,
@@ -396,20 +471,51 @@ bool drive_fetch_harness(const std::string& abs_url,
         return false;
     }
     std::string pre = build_pre_injection_script(s);
-    if (!camoufox::add_init_script(pre)) {
-        diag::log_tagged_fmt("dom_xss", "add_init_script(harness) failed: %s", camoufox::last_error().c_str());
+    constexpr int kMaxAttempts = 3;
+    for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
+        if (!camoufox::ensure_ready()) {
+            std::string e = camoufox::last_error();
+            if (!is_browser_transport_error(e) || attempt == kMaxAttempts) {
+                set_err(e.empty() ? std::string("camoufox bridge not ready") : e);
+                return false;
+            }
+            recover_browser_transport("harness_ensure_ready", attempt, e);
+            continue;
+        }
+        if (!camoufox::add_init_script(pre)) {
+            std::string e = camoufox::last_error();
+            diag::log_tagged_fmt("dom_xss", "add_init_script(harness) failed attempt=%d err=%s", attempt, e.c_str());
+            if (!is_browser_transport_error(e) || attempt == kMaxAttempts) {
+                set_err(std::string("add_init_script(harness) failed: ") + e);
+                return false;
+            }
+            recover_browser_transport("harness_add_init_script", attempt, e);
+            continue;
+        }
+        if (!camoufox::navigate("about:blank", "load", timeout_ms)) {
+            std::string e = camoufox::last_error();
+            diag::log_tagged_fmt("dom_xss", "harness navigate(about:blank) failed attempt=%d err=%s", attempt, e.c_str());
+            if (!is_browser_transport_error(e) || attempt == kMaxAttempts) {
+                set_err(std::string("harness navigate(about:blank) failed: ") + e);
+                return false;
+            }
+            recover_browser_transport("harness_navigate", attempt, e);
+            continue;
+        }
+        std::string js = build_fetch_harness_js(method, abs_url, headers, body);
+        auto r = camoufox::evaluate_js(js, true);
+        if (r.ok) {
+            return true;
+        }
+        std::string e = r.error;
+        if (!is_browser_transport_error(e) || attempt == kMaxAttempts) {
+            set_err(std::string("harness evaluate_js failed: ") + e);
+            return false;
+        }
+        recover_browser_transport("harness_evaluate_js", attempt, e);
     }
-    if (!camoufox::navigate("about:blank", "load", timeout_ms)) {
-        set_err(std::string("harness navigate(about:blank) failed: ") + camoufox::last_error());
-        return false;
-    }
-    std::string js = build_fetch_harness_js(method, abs_url, headers, body);
-    auto r = camoufox::evaluate_js(js, true);
-    if (!r.ok) {
-        set_err(std::string("harness evaluate_js failed: ") + r.error);
-        return false;
-    }
-    return true;
+    set_err("harness failed: exhausted browser transport retries");
+    return false;
 }
 
 std::vector<std::string> read_results(const sentinel_t& s)
@@ -419,6 +525,7 @@ std::vector<std::string> read_results(const sentinel_t& s)
     auto r = camoufox::evaluate_js(js, true);
     if (!r.ok) {
         diag::log_tagged_fmt("dom_xss", "results read failed: %s", r.error.c_str());
+        set_err(std::string("results read failed: ") + r.error);
         return out;
     }
     nlohmann::json arr;
@@ -663,6 +770,7 @@ fire_result_t fire_payload(const insertion_point_t& ip,
 {
     std::lock_guard<std::mutex> global_lk(browser_global_mtx());
     fire_result_t out;
+    clear_err();
 
     if (!camoufox::ensure_ready()) {
         out.error = "camoufox bridge not ready";
@@ -752,15 +860,23 @@ fire_result_t fire_payload(const insertion_point_t& ip,
         ok = drive_fetch_harness(abs_url, built, s, per_payload_timeout_ms);
     }
     if (!ok) {
-        out.error = err_slot();
+        out.error = current_err();
         return out;
     }
 
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
 
     out.sink_log = read_results(s);
+    if (out.sink_log.empty()) {
+        std::string e = current_err();
+        if (is_browser_transport_error(e)) {
+            out.error = e;
+            return out;
+        }
+    }
     out.canary_fired = !out.sink_log.empty();
     out.ok = true;
+    if (out.canary_fired) clear_err();
 
     if (out.canary_fired && capture_screenshot) {
         std::string sp = make_screenshot_path(s.token.substr(0, 8));
@@ -782,8 +898,18 @@ size_t scan_insertion_point(const insertion_point_t& ip, const scan_options_t& o
 {
     diag::log_tagged_fmt("dom_xss", "scan_insertion_point entry kind=%s param=%s host=%s",
         ip.kind.c_str(), ip.name.c_str(), opts.host.c_str());
+    clear_err();
+    if (opts.cancelled && opts.cancelled()) {
+        set_err("DOM-XSS scan cancelled");
+        return 0;
+    }
+    if (opts.deadline_ms != 0 && now_ms_steady() >= opts.deadline_ms) {
+        set_err("DOM-XSS scan deadline exceeded");
+        return 0;
+    }
     if (!camoufox::ensure_ready()) {
         diag::log_tagged("dom_xss", "scan_insertion_point: camoufox not ready, skipping");
+        set_err("camoufox bridge not ready");
         return 0;
     }
     last_scan_ms().store(now_ms_wall());
@@ -817,15 +943,40 @@ size_t scan_insertion_point(const insertion_point_t& ip, const scan_options_t& o
     size_t budget = opts.max_payloads_per_point;
     if (budget == 0) budget = 16;
     if (budget > 64) budget = 64;
+    size_t browser_failures = 0;
+    size_t max_browser_failures = opts.max_browser_failures == 0 ? 1 : opts.max_browser_failures;
 
     for (const auto* set : active) {
         if (fired >= budget) break;
         for (const auto& tpl : set->templates) {
             if (fired >= budget) break;
+            if (opts.cancelled && opts.cancelled()) {
+                set_err("DOM-XSS scan cancelled");
+                diag::log_tagged_fmt("dom_xss", "scan_insertion_point cancelled kind=%s param=%s fired=%zu issued=%zu",
+                    ip.kind.c_str(), ip.name.c_str(), fired, issued);
+                return issued;
+            }
+            if (opts.deadline_ms != 0 && now_ms_steady() >= opts.deadline_ms) {
+                set_err("DOM-XSS scan deadline exceeded");
+                diag::log_tagged_fmt("dom_xss", "scan_insertion_point deadline kind=%s param=%s fired=%zu issued=%zu",
+                    ip.kind.c_str(), ip.name.c_str(), fired, issued);
+                return issued;
+            }
             ++fired;
             auto r = fire_payload(ip, tpl, s, opts.capture_screenshots, opts.per_payload_timeout_ms,
                                   opts.scheme, opts.port);
-            if (!r.ok) continue;
+            if (!r.ok) {
+                std::string e = r.error.empty() ? current_err() : r.error;
+                if (is_browser_transport_error(e)) {
+                    ++browser_failures;
+                    if (e.empty()) e = "DOM-XSS browser execution failed";
+                    set_err(e);
+                    diag::log_tagged_fmt("dom_xss", "scan_insertion_point browser_abort kind=%s param=%s failures=%zu fired=%zu error=%s",
+                        ip.kind.c_str(), ip.name.c_str(), browser_failures, fired, e.c_str());
+                    if (opts.abort_on_browser_error || browser_failures >= max_browser_failures) return issued;
+                }
+                continue;
+            }
             if (!r.canary_fired) continue;
             std::string type_key = (set->name == "dom_only") ? "xss.dom_browser_confirmed"
                                                               : "xss.reflected_browser_confirmed";

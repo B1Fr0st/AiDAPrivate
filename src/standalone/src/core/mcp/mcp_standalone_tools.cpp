@@ -6,6 +6,7 @@
 #include "standalone_tools_fwd.hpp"
 #include "sandbox.hpp"
 #include "standalone_driver.hpp"
+#include "guest_lab_bridge.hpp"
 #include "standalone_settings.hpp"
 #include "zydis_disasm.hpp"
 #include "source_reconstructor.hpp"
@@ -147,6 +148,102 @@ namespace
         return tool_result_t::error(text);
     }
 
+    std::string requested_target(const json& params)
+    {
+        if (params.contains("target") && params["target"].is_string())
+            return to_lower(params["target"].get<std::string>());
+        return "auto";
+    }
+
+    bool wants_guest_target(const json& params)
+    {
+        if (!guest_lab::is_active())
+            return false;
+        const std::string target = requested_target(params);
+        return target != "host";
+    }
+
+    uint32_t guest_timeout_ms(const json& params)
+    {
+        uint32_t timeout = 5000;
+        if (params.contains("timeout_ms")) {
+            const auto& value = params["timeout_ms"];
+            uint64_t raw = 0;
+            if (value.is_number_unsigned()) {
+                raw = value.get<uint64_t>();
+            } else if (value.is_number_integer()) {
+                const int64_t signed_raw = value.get<int64_t>();
+                if (signed_raw > 0)
+                    raw = static_cast<uint64_t>(signed_raw);
+            }
+            if (raw > 0)
+                timeout = static_cast<uint32_t>(raw > 300000 ? 300000 : raw);
+        }
+        return timeout;
+    }
+
+    json guest_params_from(const json& params)
+    {
+        json p = params.is_object() ? params : json::object();
+        p.erase("target");
+        p.erase("timeout_ms");
+        return p;
+    }
+
+    void enrich_guest_data(json& data)
+    {
+        data["backend"] = "windows_sandbox_guest";
+        auto session = guest_lab::current();
+        data["sandbox_dir"] = wide_to_utf8_lossy(session.session_dir);
+        data["guest_bridge_dir"] = wide_to_utf8_lossy(session.bridge_dir);
+        if (data.contains("artifact_name") && data["artifact_name"].is_string()) {
+            std::string host_path = guest_lab::artifact_host_path(data["artifact_name"].get<std::string>());
+            if (!host_path.empty())
+                data["host_artifact_path"] = host_path;
+        }
+    }
+
+    tool_result_t guest_call(const std::string& command, const json& params, const std::string& message)
+    {
+        std::string err;
+        json response = guest_lab::request(command, guest_params_from(params), guest_timeout_ms(params), &err);
+        if (!err.empty())
+            return error(err);
+        json data = response.value("data", json::object());
+        enrich_guest_data(data);
+        return tool_result_t::ok(message, data);
+    }
+
+    bool hex_to_bytes_string(const std::string& hex, std::vector<uint8_t>& out)
+    {
+        out.clear();
+        if (hex.size() % 2 != 0)
+            return false;
+        out.reserve(hex.size() / 2);
+        auto nibble = [](char c, uint8_t& v) {
+            if (c >= '0' && c <= '9') {
+                v = static_cast<uint8_t>(c - '0');
+                return true;
+            }
+            if (c >= 'a' && c <= 'f') {
+                v = static_cast<uint8_t>(c - 'a' + 10);
+                return true;
+            }
+            if (c >= 'A' && c <= 'F') {
+                v = static_cast<uint8_t>(c - 'A' + 10);
+                return true;
+            }
+            return false;
+        };
+        for (size_t i = 0; i < hex.size(); i += 2) {
+            uint8_t hi = 0, lo = 0;
+            if (!nibble(hex[i], hi) || !nibble(hex[i + 1], lo))
+                return false;
+            out.push_back(static_cast<uint8_t>((hi << 4) | lo));
+        }
+        return true;
+    }
+
     std::mutex& s_last_web_error_mtx()
     {
         static std::mutex m;
@@ -179,6 +276,115 @@ namespace
         return tool_result_t::ok(driver_bridge::status(), out);
     }
 
+    tool_result_t handle_guest_lab_status(const json& params)
+    {
+        diag::log_tagged_fmt("mcp_tools", "handle_guest_lab_status entry");
+        auto session = guest_lab::current();
+        json out;
+        out["active"] = session.active;
+        out["sandbox_dir"] = wide_to_utf8_lossy(session.session_dir);
+        out["guest_bridge_dir"] = wide_to_utf8_lossy(session.bridge_dir);
+        out["sample_path"] = wide_to_utf8_lossy(session.sample_path);
+        out["started_ms"] = session.started_ms;
+        out["backend"] = "windows_sandbox_guest";
+        if (!session.active)
+            return tool_result_t::ok("No active Windows Sandbox guest lab.", out);
+        std::string err;
+        json response = guest_lab::request("status", json::object(), guest_timeout_ms(params), &err);
+        if (!err.empty()) {
+            out["agent_ready"] = false;
+            out["agent_error"] = err;
+            return tool_result_t::ok("Windows Sandbox guest lab is active, but the agent is not ready.", out);
+        }
+        json data = response.value("data", json::object());
+        enrich_guest_data(data);
+        out["agent_ready"] = true;
+        out["agent"] = data;
+        const char* keys[] = {
+            "agent_pid",
+            "active_pid",
+            "sample_pid",
+            "sample_path",
+            "sample_args",
+            "sample_alive",
+            "sample_exit_code",
+            "process_alive",
+            "attached_pid",
+            "launch_error"
+        };
+        for (const char* key : keys) {
+            if (data.contains(key))
+                out[key] = data[key];
+        }
+        return tool_result_t::ok("Windows Sandbox guest lab is active.", out);
+    }
+
+    tool_result_t handle_guest_lab_attach(const json& params)
+    {
+        diag::log_tagged_fmt("mcp_tools", "handle_guest_lab_attach entry");
+        return guest_call("attach", params, "Attached to guest process.");
+    }
+
+    tool_result_t handle_guest_lab_detach(const json& params)
+    {
+        diag::log_tagged_fmt("mcp_tools", "handle_guest_lab_detach entry");
+        return guest_call("detach", params, "Detached from guest process.");
+    }
+
+    tool_result_t handle_guest_lab_list_processes(const json& params)
+    {
+        diag::log_tagged_fmt("mcp_tools", "handle_guest_lab_list_processes entry");
+        return guest_call("list_processes", params, "Enumerated guest processes.");
+    }
+
+    tool_result_t handle_guest_lab_memory_map(const json& params)
+    {
+        diag::log_tagged_fmt("mcp_tools", "handle_guest_lab_memory_map entry");
+        return guest_call("memory_map", params, "Enumerated guest memory map.");
+    }
+
+    tool_result_t handle_guest_lab_query_memory(const json& params)
+    {
+        diag::log_tagged_fmt("mcp_tools", "handle_guest_lab_query_memory entry");
+        return guest_call("query_memory", params, "Queried guest memory region.");
+    }
+
+    tool_result_t handle_guest_lab_read_memory(const json& params)
+    {
+        diag::log_tagged_fmt("mcp_tools", "handle_guest_lab_read_memory entry");
+        return guest_call("read_memory", params, "Read guest process memory.");
+    }
+
+    tool_result_t handle_guest_lab_read_string(const json& params)
+    {
+        diag::log_tagged_fmt("mcp_tools", "handle_guest_lab_read_string entry");
+        return guest_call("read_string", params, "Read guest process string.");
+    }
+
+    tool_result_t handle_guest_lab_enumerate_modules(const json& params)
+    {
+        diag::log_tagged_fmt("mcp_tools", "handle_guest_lab_enumerate_modules entry");
+        return guest_call("modules", params, "Enumerated guest modules.");
+    }
+
+    tool_result_t handle_guest_lab_enumerate_threads(const json& params)
+    {
+        diag::log_tagged_fmt("mcp_tools", "handle_guest_lab_enumerate_threads entry");
+        return guest_call("threads", params, "Enumerated guest threads.");
+    }
+
+    tool_result_t handle_guest_lab_dump_region(const json& params)
+    {
+        diag::log_tagged_fmt("mcp_tools", "handle_guest_lab_dump_region entry");
+        return guest_call("dump_region", params, "Dumped guest memory region.");
+    }
+
+    tool_result_t handle_guest_lab_search_memory(const json& params)
+    {
+        diag::log_tagged_fmt("mcp_tools", "handle_guest_lab_search_memory entry");
+        return guest_call("search_memory", params, "Searched guest process memory.");
+    }
+
     tool_result_t handle_driver_load(const json&)
     {
         diag::log_tagged_fmt("mcp_tools", "handle_driver_load entry");
@@ -190,6 +396,8 @@ namespace
     tool_result_t handle_list_processes(const json& params)
     {
         diag::log_tagged_fmt("mcp_tools", "handle_list_processes entry");
+        if (wants_guest_target(params))
+            return handle_guest_lab_list_processes(params);
         const std::string filter = to_lower(params.value("filter", std::string()));
         json items = json::array();
         for (const auto& proc : driver_bridge::enumerate_processes()) {
@@ -203,6 +411,8 @@ namespace
     tool_result_t handle_driver_attach(const json& params)
     {
         diag::log_tagged_fmt("mcp_tools", "handle_driver_attach entry");
+        if (wants_guest_target(params))
+            return handle_guest_lab_attach(params);
         if (params.contains("pid") && params["pid"].is_number_integer()) {
             uint32_t pid = params["pid"].get<uint32_t>();
             if (pid == static_cast<uint32_t>(GetCurrentProcessId()))
@@ -225,9 +435,11 @@ namespace
         return error("Provide either a numeric pid or a process name.");
     }
 
-    tool_result_t handle_driver_detach(const json&)
+    tool_result_t handle_driver_detach(const json& params)
     {
         diag::log_tagged_fmt("mcp_tools", "handle_driver_detach entry");
+        if (wants_guest_target(params))
+            return handle_guest_lab_detach(params);
         driver_bridge::detach();
         return tool_result_t::ok("Detached from the live process.");
     }
@@ -242,6 +454,8 @@ namespace
     tool_result_t handle_read_memory(const json& params)
     {
         diag::log_tagged_fmt("mcp_tools", "handle_read_memory entry");
+        if (wants_guest_target(params))
+            return handle_guest_lab_read_memory(params);
         auto chk = ensure_attached();
         if (!chk.success)
             return chk;
@@ -278,6 +492,8 @@ namespace
     tool_result_t handle_read_string(const json& params)
     {
         diag::log_tagged_fmt("mcp_tools", "handle_read_string entry");
+        if (wants_guest_target(params))
+            return handle_guest_lab_read_string(params);
         auto chk = ensure_attached();
         if (!chk.success)
             return chk;
@@ -296,6 +512,8 @@ namespace
     tool_result_t handle_query_memory(const json& params)
     {
         diag::log_tagged_fmt("mcp_tools", "handle_query_memory entry");
+        if (wants_guest_target(params))
+            return handle_guest_lab_query_memory(params);
         auto chk = ensure_attached();
         if (!chk.success)
             return chk;
@@ -317,9 +535,11 @@ namespace
         return tool_result_t::ok("Queried memory region.", out);
     }
 
-    tool_result_t handle_enumerate_modules(const json&)
+    tool_result_t handle_enumerate_modules(const json& params)
     {
         diag::log_tagged_fmt("mcp_tools", "handle_enumerate_modules entry");
+        if (wants_guest_target(params))
+            return handle_guest_lab_enumerate_modules(params);
         auto chk = ensure_attached();
         if (!chk.success)
             return chk;
@@ -336,9 +556,11 @@ namespace
         return tool_result_t::ok("Enumerated modules.", json{{"modules", modules}});
     }
 
-    tool_result_t handle_enumerate_threads(const json&)
+    tool_result_t handle_enumerate_threads(const json& params)
     {
         diag::log_tagged_fmt("mcp_tools", "handle_enumerate_threads entry");
+        if (wants_guest_target(params))
+            return handle_guest_lab_enumerate_threads(params);
         auto chk = ensure_attached();
         if (!chk.success)
             return chk;
@@ -357,6 +579,46 @@ namespace
     tool_result_t handle_disassemble_address(const json& params)
     {
         diag::log_tagged_fmt("mcp_tools", "handle_disassemble_address entry");
+        if (wants_guest_target(params)) {
+            const auto address = parse_addr_opt(params, "address");
+            if (!address)
+                return error("Missing or invalid address.");
+            const size_t bytes_to_read = static_cast<size_t>(params.value("size", 128));
+            const size_t max_count = static_cast<size_t>(params.value("count", 32));
+            json read_params = guest_params_from(params);
+            read_params["size"] = bytes_to_read;
+            std::string err;
+            json response = guest_lab::request("read_memory", read_params, guest_timeout_ms(params), &err);
+            if (!err.empty())
+                return error(err);
+            json data = response.value("data", json::object());
+            std::string hex = data.value("hex", std::string());
+            std::vector<uint8_t> bytes;
+            if (!hex_to_bytes_string(hex, bytes))
+                return error("Guest memory response contained invalid hex.");
+            json instructions = json::array();
+            uint64_t cursor = *address;
+            size_t offset = 0;
+            while (offset < bytes.size() && instructions.size() < max_count) {
+                const auto insn = zydis_decode_one(bytes.data() + offset,
+                                                   static_cast<int>(bytes.size() - offset), cursor);
+                instructions.push_back({
+                    {"address", hex_addr(insn.addr)},
+                    {"mnemonic", insn.mnem},
+                    {"operands", insn.ops},
+                    {"length", insn.len}
+                });
+                const int advance = (insn.len > 1) ? insn.len : 1;
+                offset += static_cast<size_t>(advance);
+                cursor += static_cast<uint64_t>(advance);
+            }
+            json out;
+            out["address"] = hex_addr(*address);
+            out["instructions"] = instructions;
+            out["bytes_read"] = bytes.size();
+            enrich_guest_data(out);
+            return tool_result_t::ok("Disassembled guest process memory.", out);
+        }
         auto chk = ensure_attached();
         if (!chk.success)
             return chk;
@@ -1416,22 +1678,62 @@ namespace mcp_standalone
             true,
             [&srv](const json& params) { return srv.describe_tools(params); }});
 
-        srv.register_tool({"driver_load", "Load and connect the kernel driver backend for deep runtime analysis.", {}, false, handle_driver_load});
-        srv.register_tool({"driver_detach", "Detach from the current live process.", {}, false, handle_driver_detach});
-        srv.register_tool({"list_processes", "Enumerate currently running processes.",
-            {{"filter", "string", "Optional substring filter", false}}, true, handle_list_processes});
-        srv.register_tool({"read_memory", "Read bytes from the attached process.",
-            {{"address", "string", "Target address", true}, {"size", "number", "Bytes to read", false}},
+        srv.register_tool({"driver_status", "Return the host kernel driver status. Use guest_lab_status for the active Windows Sandbox VM.", {}, true, handle_driver_status});
+        srv.register_tool({"driver_load", "Load and connect the host kernel driver backend for host live analysis.", {}, false, handle_driver_load});
+        srv.register_tool({"driver_attach", "Attach to a process. If a Windows Sandbox guest lab is active this attaches inside the VM by default; pass target='host' for host attach.",
+            {{"pid", "number", "Process id", false}, {"process", "string", "Process image name", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "Guest bridge timeout", false}},
+            false, handle_driver_attach});
+        srv.register_tool({"driver_detach", "Detach from the current process. If a Windows Sandbox guest lab is active this detaches the guest active process by default; pass target='host' for host detach.",
+            {{"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "Guest bridge timeout", false}},
+            false, handle_driver_detach});
+        srv.register_tool({"guest_lab_status", "Return the active interactive Windows Sandbox malware lab and guest agent status.", {{"timeout_ms", "number", "Guest bridge timeout", false}}, true, handle_guest_lab_status});
+        srv.register_tool({"guest_lab_attach", "Attach the guest agent to a process inside the Windows Sandbox VM by pid or process name.",
+            {{"pid", "number", "Guest process id", false}, {"process", "string", "Guest process image name", false}, {"timeout_ms", "number", "Guest bridge timeout", false}},
+            false, handle_guest_lab_attach});
+        srv.register_tool({"guest_lab_detach", "Detach the guest agent from the active guest process.", {{"timeout_ms", "number", "Guest bridge timeout", false}}, false, handle_guest_lab_detach});
+        srv.register_tool({"guest_lab_list_processes", "Enumerate processes inside the active Windows Sandbox VM.",
+            {{"filter", "string", "Optional substring filter", false}, {"timeout_ms", "number", "Guest bridge timeout", false}},
+            true, handle_guest_lab_list_processes});
+        srv.register_tool({"guest_lab_memory_map", "Enumerate the memory map of the active or supplied guest process.",
+            {{"pid", "number", "Guest process id; defaults to active guest attach", false}, {"limit", "number", "Maximum regions", false}, {"readable_only", "boolean", "Only readable committed regions", false}, {"timeout_ms", "number", "Guest bridge timeout", false}},
+            true, handle_guest_lab_memory_map});
+        srv.register_tool({"guest_lab_query_memory", "Query a guest memory region containing an address.",
+            {{"address", "string", "Guest virtual address", true}, {"pid", "number", "Guest process id; defaults to active guest attach", false}, {"timeout_ms", "number", "Guest bridge timeout", false}},
+            true, handle_guest_lab_query_memory});
+        srv.register_tool({"guest_lab_read_memory", "Read bytes from a guest process inside the Windows Sandbox VM.",
+            {{"address", "string", "Guest virtual address", true}, {"size", "number", "Bytes to read, capped in the guest", false}, {"pid", "number", "Guest process id; defaults to active guest attach", false}, {"timeout_ms", "number", "Guest bridge timeout", false}},
+            true, handle_guest_lab_read_memory});
+        srv.register_tool({"guest_lab_read_string", "Read an ASCII or UTF-16 string from a guest process inside the Windows Sandbox VM.",
+            {{"address", "string", "Guest virtual address", true}, {"max_length", "number", "Maximum characters", false}, {"encoding", "string", "ascii|utf16", false}, {"pid", "number", "Guest process id; defaults to active guest attach", false}, {"timeout_ms", "number", "Guest bridge timeout", false}},
+            true, handle_guest_lab_read_string});
+        srv.register_tool({"guest_lab_enumerate_modules", "List modules for the active or supplied guest process.",
+            {{"pid", "number", "Guest process id; defaults to active guest attach", false}, {"timeout_ms", "number", "Guest bridge timeout", false}},
+            true, handle_guest_lab_enumerate_modules});
+        srv.register_tool({"guest_lab_enumerate_threads", "List threads for the active or supplied guest process.",
+            {{"pid", "number", "Guest process id; defaults to active guest attach", false}, {"timeout_ms", "number", "Guest bridge timeout", false}},
+            true, handle_guest_lab_enumerate_threads});
+        srv.register_tool({"guest_lab_dump_region", "Dump guest process memory to the sandbox output artifacts folder and return the host artifact path.",
+            {{"address", "string", "Guest virtual address", true}, {"size", "number", "Bytes to dump; 0 dumps the containing region up to the cap", false}, {"pid", "number", "Guest process id; defaults to active guest attach", false}, {"timeout_ms", "number", "Guest bridge timeout", false}},
+            true, handle_guest_lab_dump_region});
+        srv.register_tool({"guest_lab_search_memory", "Search readable guest process memory for a hex pattern; use ?? for wildcard bytes.",
+            {{"pattern", "string", "Hex pattern such as 48 8B ?? ??", true}, {"pid", "number", "Guest process id; defaults to active guest attach", false}, {"max_hits", "number", "Maximum hits", false}, {"max_scan_mb", "number", "Maximum readable memory to scan", false}, {"timeout_ms", "number", "Guest bridge timeout", false}},
+            true, handle_guest_lab_search_memory});
+        srv.register_tool({"list_processes", "Enumerate processes. If a Windows Sandbox guest lab is active this lists guest processes by default; pass target='host' for host processes.",
+            {{"filter", "string", "Optional substring filter", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "Guest bridge timeout", false}}, true, handle_list_processes});
+        srv.register_tool({"read_memory", "Read bytes from the attached process. If a Windows Sandbox guest lab is active this reads guest memory by default; pass target='host' for host memory.",
+            {{"address", "string", "Target address", true}, {"size", "number", "Bytes to read", false}, {"pid", "number", "Guest process id when target is guest", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "Guest bridge timeout", false}},
             true, handle_read_memory});
-        srv.register_tool({"read_string", "Read a UTF-8/ASCII string from the attached process.",
-            {{"address", "string", "Target address", true}, {"max_length", "number", "Maximum bytes to inspect", false}},
+        srv.register_tool({"read_string", "Read a UTF-8/ASCII string from the attached process. If a Windows Sandbox guest lab is active this reads guest memory by default; pass target='host' for host memory.",
+            {{"address", "string", "Target address", true}, {"max_length", "number", "Maximum bytes to inspect", false}, {"encoding", "string", "ascii|utf16 for guest reads", false}, {"pid", "number", "Guest process id when target is guest", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "Guest bridge timeout", false}},
             true, handle_read_string});
-        srv.register_tool({"query_memory", "Query the memory region containing an address.",
-            {{"address", "string", "Target address", true}}, true, handle_query_memory});
-        srv.register_tool({"enumerate_modules", "List modules for the attached process.", {}, true, handle_enumerate_modules});
-        srv.register_tool({"enumerate_threads", "List threads for the attached process.", {}, true, handle_enumerate_threads});
-        srv.register_tool({"disassemble_address", "Disassemble bytes from the attached process using Zydis.",
-            {{"address", "string", "Start address", true}, {"size", "number", "Bytes to read", false}, {"count", "number", "Maximum instructions", false}},
+        srv.register_tool({"query_memory", "Query the memory region containing an address. If a Windows Sandbox guest lab is active this queries guest memory by default; pass target='host' for host memory.",
+            {{"address", "string", "Target address", true}, {"pid", "number", "Guest process id when target is guest", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "Guest bridge timeout", false}}, true, handle_query_memory});
+        srv.register_tool({"enumerate_modules", "List modules for the attached process. If a Windows Sandbox guest lab is active this lists guest modules by default; pass target='host' for host modules.",
+            {{"pid", "number", "Guest process id when target is guest", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "Guest bridge timeout", false}}, true, handle_enumerate_modules});
+        srv.register_tool({"enumerate_threads", "List threads for the attached process. If a Windows Sandbox guest lab is active this lists guest threads by default; pass target='host' for host threads.",
+            {{"pid", "number", "Guest process id when target is guest", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "Guest bridge timeout", false}}, true, handle_enumerate_threads});
+        srv.register_tool({"disassemble_address", "Disassemble bytes from the attached process using Zydis. If a Windows Sandbox guest lab is active this reads guest memory by default; pass target='host' for host memory.",
+            {{"address", "string", "Start address", true}, {"size", "number", "Bytes to read", false}, {"count", "number", "Maximum instructions", false}, {"pid", "number", "Guest process id when target is guest", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "Guest bridge timeout", false}},
             true, handle_disassemble_address});
         srv.register_tool({"disassemble_file", "Disassemble a PE file from disk using Zydis.",
             {{"path", "string", "Path to an EXE/DLL/SYS file", true}, {"count", "number", "Maximum instructions", false}},

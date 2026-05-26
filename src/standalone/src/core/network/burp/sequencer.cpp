@@ -523,7 +523,7 @@ static analysis_result_t analyze_internal(const std::vector<std::string>& tokens
         size_t K = total_bits / L;
         if (K > Q + 16) {
             K -= Q;
-            std::vector<size_t> T(1 << L, 0);
+            std::vector<size_t> T(size_t{1} << L, 0);
             for (size_t i = 1; i <= Q; ++i) {
                 size_t v = 0;
                 for (size_t j = 0; j < L; ++j) {

@@ -410,6 +410,7 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			result["new_coverage_finds"] = stats.new_coverage_finds;
 			result["corpus_size"] = stats.corpus_size;
 			result["elapsed_seconds"] = stats.elapsed_seconds;
+			result["setup_error"] = fuzzer_engine::g_state.setup_error;
 
 			json crashes_arr = json::array();
 			for (auto& c : fuzzer_engine::g_state.unique_crashes) {

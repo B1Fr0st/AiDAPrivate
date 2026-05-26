@@ -1,7 +1,6 @@
 #include "test_lab.hpp"
 #include "test_lab_format.hpp"
 #include "../../../../driver/comm.h"
-#include "../runtime/shadow_fs_client.hpp"
 #include "imgui/imgui.h"
 
 #include <Windows.h>
@@ -100,6 +99,37 @@ namespace {
 				}
 			}
 		}
+		return true;
+	}
+
+	bool read_ascii_file(const char* path, std::string& out, DWORD* out_error = nullptr) {
+		out.clear();
+		if (out_error) *out_error = 0u;
+		if (path == nullptr) {
+			if (out_error) *out_error = ERROR_INVALID_PARAMETER;
+			return false;
+		}
+		HANDLE h = CreateFileA(path,
+			GENERIC_READ,
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+			nullptr,
+			OPEN_EXISTING,
+			FILE_ATTRIBUTE_NORMAL,
+			nullptr);
+		if (h == INVALID_HANDLE_VALUE) {
+			if (out_error) *out_error = GetLastError();
+			return false;
+		}
+		char buf[256];
+		DWORD read = 0;
+		BOOL ok = ReadFile(h, buf, static_cast<DWORD>(sizeof(buf)), &read, nullptr);
+		DWORD err = ok ? 0u : GetLastError();
+		CloseHandle(h);
+		if (!ok) {
+			if (out_error) *out_error = err;
+			return false;
+		}
+		out.assign(buf, buf + read);
 		return true;
 	}
 
@@ -1544,146 +1574,6 @@ namespace {
 		}
 	}
 
-	void run_verify_shadowfs_round_trip(test_lab::state_t& s, test_lab::result_t& r) {
-		(void)s;
-		if (!shadow_fs_client::is_connected()) {
-			shadow_fs_client::initialize();
-		}
-		if (!shadow_fs_client::is_connected()) {
-			r.ok = false;
-			r.error = "shadowfs port unreachable";
-			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
-			return;
-		}
-		r.parsed.push_back({ "step1_shadowfs_connected", "1" });
-
-		const char* sandbox_root_utf8 = "C:\\Users\\Public\\Desktop\\aida_sandbox_test\\";
-		DWORD cd_err = 0u;
-		BOOL cd = ensure_directory_tree_ascii(sandbox_root_utf8, &cd_err) ? TRUE : FALSE;
-		if (!cd) {
-			char b[96];
-			std::snprintf(b, sizeof(b), "ensure_directory_tree_ascii err=%lu", static_cast<unsigned long>(cd_err));
-			r.parsed.push_back({ "step2_mkdir_warning", std::string(b) });
-		} else {
-			r.parsed.push_back({ "step2_sandbox_root", sandbox_root_utf8 });
-		}
-		const char* sandbox_cow_parent_utf8 = "C:\\Users\\Public\\Desktop\\aida_sandbox_test\\__cow\\Users\\Public\\Documents\\";
-		DWORD cow_err = 0u;
-		bool cow_ok = ensure_directory_tree_ascii(sandbox_cow_parent_utf8, &cow_err);
-		r.parsed.push_back({ "step2_cow_parent", sandbox_cow_parent_utf8 });
-		r.parsed.push_back({ "step2_cow_parent_ready", cow_ok ? "1" : "0" });
-		r.parsed.push_back({ "step2_cow_parent_error", fmt_u32(cow_err) });
-
-		const std::wstring root = L"C:\\Users\\Public\\Desktop\\aida_sandbox_test\\";
-		const std::uint32_t self_pid = static_cast<std::uint32_t>(GetCurrentProcessId());
-		bool reg_ok = shadow_fs_client::register_sandbox_pid(self_pid, shadow_fs_client::k_default_flags, root);
-		r.parsed.push_back({ "step3_register_sandbox_pid_ok", reg_ok ? "1" : "0" });
-		if (!reg_ok) {
-			const std::string& err = shadow_fs_client::last_error();
-			r.parsed.push_back({ "step3_register_err", err.empty() ? "(no detail)" : err });
-			r.ok = false;
-			r.error = "register_sandbox_pid failed";
-			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
-			return;
-		}
-
-		std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-		shadow_fs_client::shadow_stats_t before{};
-		bool ok_before = shadow_fs_client::query_stats(before);
-		if (!ok_before) {
-			shadow_fs_client::unregister_sandbox_pid(self_pid);
-			r.ok = false;
-			r.error = "query_stats (baseline) failed";
-			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
-			return;
-		}
-		r.parsed.push_back({ "baseline_redirects", fmt_u64(static_cast<std::uint64_t>(before.redirects)) });
-		r.parsed.push_back({ "baseline_copies", fmt_u64(static_cast<std::uint64_t>(before.copies)) });
-		r.parsed.push_back({ "baseline_denials", fmt_u64(static_cast<std::uint64_t>(before.denials)) });
-
-		const char* test_path = "C:\\Users\\Public\\Documents\\aida_outside_sandbox_test.txt";
-		DeleteFileA(test_path);
-		HANDLE h = CreateFileA(test_path,
-			GENERIC_WRITE,
-			FILE_SHARE_READ,
-			nullptr,
-			CREATE_ALWAYS,
-			FILE_ATTRIBUTE_NORMAL,
-			nullptr);
-		bool create_ok = (h != INVALID_HANDLE_VALUE);
-		bool write_ok = false;
-		DWORD create_err = create_ok ? 0u : GetLastError();
-		DWORD write_err = 0u;
-		DWORD written = 0;
-		if (h != INVALID_HANDLE_VALUE) {
-			const char* payload = "round-trip test";
-			write_ok = WriteFile(h, payload, static_cast<DWORD>(std::strlen(payload)), &written, nullptr) != FALSE;
-			write_err = write_ok ? 0u : GetLastError();
-			CloseHandle(h);
-		} else {
-			char b[96];
-			std::snprintf(b, sizeof(b), "CreateFileA err=%lu", static_cast<unsigned long>(create_err));
-			r.parsed.push_back({ "step5_write_err", std::string(b) });
-		}
-		bool write_complete = create_ok && write_ok && written == static_cast<DWORD>(std::strlen("round-trip test"));
-		if (create_ok && !write_ok) {
-			char b[96];
-			std::snprintf(b, sizeof(b), "WriteFile err=%lu", static_cast<unsigned long>(write_err));
-			r.parsed.push_back({ "step5_write_err", std::string(b) });
-		}
-		r.parsed.push_back({ "step5_createfile_ok", create_ok ? "1" : "0" });
-		r.parsed.push_back({ "step5_createfile_error", fmt_u32(create_err) });
-		r.parsed.push_back({ "step5_writefile_ok", write_ok ? "1" : "0" });
-		r.parsed.push_back({ "step5_writefile_error", fmt_u32(write_err) });
-		r.parsed.push_back({ "step5_write_bytes", fmt_u32(written) });
-		r.parsed.push_back({ "step5_write_attempted", write_complete ? "1" : "0" });
-		r.parsed.push_back({ "step5_write_complete", write_complete ? "1" : "0" });
-
-		std::this_thread::sleep_for(std::chrono::milliseconds(150));
-
-		shadow_fs_client::shadow_stats_t after{};
-		bool ok_after = shadow_fs_client::query_stats(after);
-		shadow_fs_client::unregister_sandbox_pid(self_pid);
-		r.parsed.push_back({ "step7_unregister", "done" });
-		if (!ok_after) {
-			r.ok = false;
-			r.error = "query_stats (post-write) failed";
-			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
-			return;
-		}
-		r.parsed.push_back({ "after_redirects", fmt_u64(static_cast<std::uint64_t>(after.redirects)) });
-		r.parsed.push_back({ "after_copies", fmt_u64(static_cast<std::uint64_t>(after.copies)) });
-		r.parsed.push_back({ "after_denials", fmt_u64(static_cast<std::uint64_t>(after.denials)) });
-
-		const std::int64_t d_red = after.redirects - before.redirects;
-		const std::int64_t d_cop = after.copies - before.copies;
-		const std::int64_t d_den = after.denials - before.denials;
-		char b1[32], b2[32], b3[32];
-		std::snprintf(b1, sizeof(b1), "%lld", static_cast<long long>(d_red));
-		std::snprintf(b2, sizeof(b2), "%lld", static_cast<long long>(d_cop));
-		std::snprintf(b3, sizeof(b3), "%lld", static_cast<long long>(d_den));
-		r.parsed.push_back({ "delta_redirects", std::string(b1) });
-		r.parsed.push_back({ "delta_copies", std::string(b2) });
-		r.parsed.push_back({ "delta_denials", std::string(b3) });
-
-		bool any_change = (d_red > 0) || (d_cop > 0) || (d_den > 0);
-		if (!write_complete) {
-			r.ok = false;
-			r.error = !create_ok ? "ShadowFS write probe did not exercise CreateFileA successfully" : "ShadowFS write probe did not complete WriteFile successfully";
-			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
-			r.parsed.push_back({ "shadowfs_write_materialization_degraded", any_change ? "1" : "0" });
-		} else if (any_change) {
-			r.ntstatus = 0;
-			r.ok = true;
-			r.parsed.push_back({ "shadowfs_write_materialization_degraded", "0" });
-		} else {
-			r.ok = false;
-			r.error = "registration ok but minifilter did not intercept our write -- check Altitude / minifilter state";
-			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
-		}
-	}
-
 	bool start_external_tcp_probe(tcp_probe_state_t& probe) {
 		probe.close();
 		SOCKET sk = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -2040,14 +1930,6 @@ TESTLAB_REGISTER(g_reg_verify_memory_round_trip,
 	"AM allocate 4096 in self -> user-mode write 0xDEADBEEFCAFEBABE pattern -> QM verify MEM_COMMIT -> FM free -> QM verify MEM_FREE.",
 	&render_inputs_empty,
 	&run_verify_memory_round_trip);
-
-TESTLAB_REGISTER(g_reg_verify_shadowfs_round_trip,
-	"verify",
-	test_lab::driver_e::shadowfs,
-	"ShadowFS sandbox round-trip",
-	"Connect shadowfs port -> mkdir sandbox -> register self PID -> complete CreateFile/WriteFile probe -> query_stats and assert redirects/copies/denials counter incremented -> unregister.",
-	&render_inputs_empty,
-	&run_verify_shadowfs_round_trip);
 
 TESTLAB_REGISTER(g_reg_verify_tcpip_connection_visible,
 	"verify",

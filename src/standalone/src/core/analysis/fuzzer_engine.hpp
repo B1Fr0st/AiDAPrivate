@@ -136,6 +136,7 @@ struct state_t {
 	std::vector<crash_info_t>   crashes;
 	std::vector<crash_info_t>   unique_crashes;
 	std::set<uint64_t>          crash_hashes;
+	std::string                 setup_error;
 
 	std::mutex      mutex;
 	std::atomic<bool> running{false};
@@ -539,6 +540,7 @@ inline void start_fuzzing()
 		std::memset(g_state.coverage.bitmap, 0, sizeof(g_state.coverage.bitmap));
 		g_state.coverage.edge_count = 0;
 		g_state.coverage.total_edges_discovered = 0;
+		g_state.setup_error.clear();
 		g_state.active = true;
 	}
 
@@ -571,11 +573,30 @@ inline void start_fuzzing()
 			seed.data = seed_input;
 			seed.source = "seed";
 			g_state.corpus.push_back(std::move(seed));
+			g_state.stats.corpus_size = static_cast<uint32_t>(g_state.corpus.size());
 		}
 
 		emulation::process_snapshot_t snapshot;
 		if (cfg.pid != 0 && cfg.tid != 0) {
-			snapshot = emulation::driver_snapshot(cfg.pid, cfg.tid);
+			std::uint64_t snapshot_base = cfg.target_address & ~0xFFFULL;
+			std::uint64_t snapshot_size = 0x20000ULL;
+			if (cfg.end_address > cfg.target_address && cfg.end_address - snapshot_base < 0x400000ULL)
+				snapshot_size = std::max<std::uint64_t>(snapshot_size, (cfg.end_address - snapshot_base + 0xFFFULL) & ~0xFFFULL);
+			snapshot = emulation::driver_snapshot(cfg.pid, cfg.tid, snapshot_base, snapshot_size);
+		}
+		if (!snapshot.success || snapshot.regions.empty()) {
+			std::string err = !snapshot.error.empty() ? snapshot.error : "snapshot has no memory regions";
+			{
+				std::lock_guard<std::mutex> lk(g_state.mutex);
+				g_state.setup_error = err;
+				g_state.active = false;
+			}
+			diag::log_tagged_fmt("fuzzer", "setup_failed pid=%u tid=%u target=0x%llX err=%s",
+				cfg.pid, cfg.tid,
+				static_cast<unsigned long long>(cfg.target_address),
+				err.c_str());
+			g_state.running.store(false);
+			return;
 		}
 
 		auto start_time = std::chrono::high_resolution_clock::now();

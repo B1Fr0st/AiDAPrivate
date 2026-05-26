@@ -46,6 +46,12 @@ uint64_t now_ms_wall()
     return static_cast<uint64_t>(duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count());
 }
 
+uint64_t now_ms_steady()
+{
+    using namespace std::chrono;
+    return static_cast<uint64_t>(duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count());
+}
+
 const char* json_type_name(const json& j)
 {
     if (j.is_object()) return "object";
@@ -78,6 +84,35 @@ std::string json_shape(const json& j, size_t max_keys = 12)
         oss << "[" << j.size() << "]";
     }
     return oss.str();
+}
+
+std::string ascii_lower_copy(std::string s)
+{
+    for (char& c : s)
+    {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + 32);
+    }
+    return s;
+}
+
+bool is_browser_infrastructure_error(const std::string& msg)
+{
+    std::string s = ascii_lower_copy(msg);
+    return s.find("connection closed while reading from the driver") != std::string::npos ||
+           s.find("connection closed") != std::string::npos ||
+           s.find("camoufox bridge not ready") != std::string::npos ||
+           s.find("camoufox driver closed") != std::string::npos ||
+           s.find("bridge state is busy") != std::string::npos ||
+           s.find("target page, context or browser has been closed") != std::string::npos ||
+           s.find("browser has been closed") != std::string::npos ||
+           s.find("page has been closed") != std::string::npos ||
+           s.find("target closed") != std::string::npos ||
+           s.find("page crashed") != std::string::npos ||
+           s.find("deadline exceeded") != std::string::npos ||
+           s.find("harness navigate") != std::string::npos ||
+           s.find("navigate failed") != std::string::npos ||
+           s.find("evaluate_js failed") != std::string::npos ||
+           s.find("add_init_script") != std::string::npos;
 }
 
 std::string path_without_query(std::string path)
@@ -264,6 +299,8 @@ tool_result_t tool_test_payload(const json& params)
     data["screenshot_path"] = r.last_screenshot_path;
     data["sentinel_token"] = s.token;
     data["canary_fn"] = s.canary_fn;
+    if (!r.ok && is_browser_infrastructure_error(r.error))
+        return tool_result_t::error(r.error.empty() ? std::string("DOM-XSS browser execution failed") : r.error);
     return tool_result_t::ok(data);
 }
 
@@ -346,12 +383,22 @@ tool_result_t tool_scan(const json& params)
         if (v > 64) v = 64;
         opts.max_payloads_per_point = v;
     }
+    int scan_timeout_ms = 120000;
+    if (params.contains("scan_timeout_ms") && params["scan_timeout_ms"].is_number_integer())
+        scan_timeout_ms = params["scan_timeout_ms"].get<int>();
+    else if (params.contains("timeout_ms") && params["timeout_ms"].is_number_integer())
+        scan_timeout_ms = params["timeout_ms"].get<int>();
+    if (scan_timeout_ms < 5000) scan_timeout_ms = 5000;
+    if (scan_timeout_ms > 300000) scan_timeout_ms = 300000;
+    opts.deadline_ms = now_ms_steady() + static_cast<uint64_t>(scan_timeout_ms);
+    opts.abort_on_browser_error = true;
+    opts.max_browser_failures = 1;
     opts.scheme = scheme;
     opts.host   = host;
     opts.port   = port;
-    diag::log_tagged_fmt("mcp_burp", "dom_xss_scan options polyglot=%d standard=%d dom_only=%d screenshots=%d per_timeout_ms=%d max_payloads=%zu raw_len=%zu",
+    diag::log_tagged_fmt("mcp_burp", "dom_xss_scan options polyglot=%d standard=%d dom_only=%d screenshots=%d per_timeout_ms=%d max_payloads=%zu scan_timeout_ms=%d raw_len=%zu",
         (int)opts.include_polyglot, (int)opts.include_standard, (int)opts.include_dom_only,
-        (int)opts.capture_screenshots, opts.per_payload_timeout_ms, opts.max_payloads_per_point, raw_request.size());
+        (int)opts.capture_screenshots, opts.per_payload_timeout_ms, opts.max_payloads_per_point, scan_timeout_ms, raw_request.size());
 
     auto points = insertion_points::analyze(raw_request, target_url);
     diag::log_tagged_fmt("mcp_burp", "dom_xss_scan insertion_points total=%zu host=%s path=%s", points.size(), host.c_str(), safe_path.c_str());
@@ -364,11 +411,20 @@ tool_result_t tool_scan(const json& params)
         size_t emitted = dom_xss::scan_insertion_point(ip, opts);
         total_emitted += emitted;
         total_payloads_slot().fetch_add(opts.max_payloads_per_point);
+        std::string point_error = dom_xss::last_error();
         json e;
         e["kind"] = ip.kind;
         e["name"] = ip.name;
         e["emitted"] = emitted;
+        e["error"] = point_error;
         per_point.push_back(std::move(e));
+        if (!point_error.empty() && is_browser_infrastructure_error(point_error)) {
+            last_scan_ms_slot().store(now_ms_wall());
+            total_scans_slot().fetch_add(1);
+            diag::log_tagged_fmt("mcp_burp", "dom_xss_scan abort host=%s path=%s points_scanned=%zu issues_emitted=%zu error=%s",
+                host.c_str(), safe_path.c_str(), per_point.size(), total_emitted, point_error.c_str());
+            return tool_result_t::error(point_error);
+        }
     }
     last_scan_ms_slot().store(now_ms_wall());
     total_scans_slot().fetch_add(1);
@@ -379,10 +435,13 @@ tool_result_t tool_scan(const json& params)
     data["points_scanned"] = per_point.size();
     data["per_point"]     = per_point;
     data["issues_emitted"] = total_emitted;
-    data["last_engine_error"] = dom_xss::last_error();
+    std::string engine_error = dom_xss::last_error();
+    data["last_engine_error"] = engine_error;
     diag::log_tagged_fmt("mcp_burp", "dom_xss_scan ok host=%s path=%s points_total=%zu points_scanned=%zu issues_emitted=%zu engine_error_len=%zu response_shape=%s",
         host.c_str(), safe_path.c_str(), points.size(), per_point.size(), total_emitted,
-        dom_xss::last_error().size(), json_shape(data).c_str());
+        engine_error.size(), json_shape(data).c_str());
+    if (!engine_error.empty() && is_browser_infrastructure_error(engine_error))
+        return tool_result_t::error(engine_error);
     return tool_result_t::ok(data);
 }
 
@@ -433,7 +492,9 @@ void register_dom_xss_tools(mcp_standalone::server_t& srv)
             {"include_dom_only",        "boolean", "Include DOM-only fragment/event payload set (default true).", false},
             {"capture_screenshots",     "boolean", "Capture a screenshot on each certain hit (default false).", false},
             {"max_payloads_per_point",  "number",  "Cap on payloads per insertion point (1-64, default 16).", false},
-            {"per_payload_timeout_ms",  "number",  "Per-payload navigation/eval timeout in milliseconds (1000-30000, default 8000).", false}
+            {"per_payload_timeout_ms",  "number",  "Per-payload navigation/eval timeout in milliseconds (1000-30000, default 8000).", false},
+            {"scan_timeout_ms",         "number",  "Total scan deadline in milliseconds (5000-300000, default 120000).", false},
+            {"timeout_ms",              "number",  "Alias for scan_timeout_ms.", false}
         },
         tool_scan, false
     });

@@ -325,7 +325,140 @@ if(WIN32 AND MSVC)
     set(OPENSSL_VERSION "3.0.0" CACHE STRING "" FORCE)
 
     message(STATUS "AiDA: OpenSSL static linking enabled (root=${_aida_openssl_root})")
+    set(CMAKE_INSTALL_UCRT_LIBRARIES TRUE)
+    set(CMAKE_INSTALL_OPENMP_LIBRARIES TRUE)
+    include(InstallRequiredSystemLibraries)
 endif()
+
+function(aida_collect_windows_runtime_dlls out_var)
+    set(_aida_result)
+    foreach(_aida_system_runtime_dll IN LISTS CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS)
+        if(EXISTS "${_aida_system_runtime_dll}")
+            list(APPEND _aida_result "${_aida_system_runtime_dll}")
+        endif()
+    endforeach()
+
+    if(MSVC)
+        set(_aida_vs_redist_roots)
+        if(DEFINED ENV{VCToolsRedistDir} AND NOT "$ENV{VCToolsRedistDir}" STREQUAL "")
+            file(TO_CMAKE_PATH "$ENV{VCToolsRedistDir}" _aida_vc_redist_env)
+            list(APPEND _aida_vs_redist_roots "${_aida_vc_redist_env}")
+        endif()
+        if(CMAKE_CXX_COMPILER)
+            get_filename_component(_aida_msvc_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
+            get_filename_component(_aida_msvc_tools_version "${_aida_msvc_bin}/../../.." ABSOLUTE)
+            get_filename_component(_aida_vc_root "${_aida_msvc_tools_version}/../../.." ABSOLUTE)
+            list(APPEND _aida_vs_redist_roots "${_aida_vc_root}/Redist/MSVC")
+        endif()
+        list(APPEND _aida_vs_redist_roots
+            "C:/Program Files/Microsoft Visual Studio/2022/Professional/VC/Redist/MSVC"
+            "C:/Program Files/Microsoft Visual Studio/2022/Enterprise/VC/Redist/MSVC"
+            "C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Redist/MSVC"
+            "C:/Program Files/Microsoft Visual Studio/2022/BuildTools/VC/Redist/MSVC"
+            "C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Redist/MSVC"
+        )
+        list(REMOVE_DUPLICATES _aida_vs_redist_roots)
+
+        set(_aida_crt_dirs)
+        foreach(_aida_vs_redist_root IN LISTS _aida_vs_redist_roots)
+            file(GLOB _aida_crt_root_dirs CONFIGURE_DEPENDS
+                "${_aida_vs_redist_root}/x64/Microsoft.VC*.CRT"
+                "${_aida_vs_redist_root}/*/x64/Microsoft.VC*.CRT")
+            list(APPEND _aida_crt_dirs ${_aida_crt_root_dirs})
+        endforeach()
+        if(NOT _aida_crt_dirs)
+            foreach(_aida_vs_redist_root IN LISTS _aida_vs_redist_roots)
+                file(GLOB _aida_crt_spectre_dirs CONFIGURE_DEPENDS
+                    "${_aida_vs_redist_root}/spectre/x64/Microsoft.VC*.CRT"
+                    "${_aida_vs_redist_root}/*/spectre/x64/Microsoft.VC*.CRT")
+                list(APPEND _aida_crt_dirs ${_aida_crt_spectre_dirs})
+            endforeach()
+        endif()
+        if(_aida_crt_dirs)
+            list(REMOVE_DUPLICATES _aida_crt_dirs)
+            list(SORT _aida_crt_dirs COMPARE NATURAL ORDER DESCENDING)
+            list(GET _aida_crt_dirs 0 _aida_crt_dir)
+            file(GLOB _aida_crt_dlls CONFIGURE_DEPENDS "${_aida_crt_dir}/*.dll")
+            list(APPEND _aida_result ${_aida_crt_dlls})
+        else()
+            message(FATAL_ERROR "AiDA: Visual C++ x64 redistributable DLLs not found. Install the VS 2022 C++ redistributable files with the build tools.")
+        endif()
+
+        set(_aida_ucrt_dirs)
+        if(DEFINED ENV{UniversalCRTSdkDir} AND NOT "$ENV{UniversalCRTSdkDir}" STREQUAL "")
+            file(TO_CMAKE_PATH "$ENV{UniversalCRTSdkDir}" _aida_ucrt_sdk_dir)
+            if(DEFINED ENV{UCRTVersion} AND NOT "$ENV{UCRTVersion}" STREQUAL "")
+                list(APPEND _aida_ucrt_dirs "${_aida_ucrt_sdk_dir}/Redist/$ENV{UCRTVersion}/ucrt/DLLs/x64")
+            endif()
+            list(APPEND _aida_ucrt_dirs "${_aida_ucrt_sdk_dir}/Redist/ucrt/DLLs/x64")
+        endif()
+        file(GLOB _aida_ucrt_redist_dirs CONFIGURE_DEPENDS
+            "C:/Program Files (x86)/Windows Kits/10/Redist/*/ucrt/DLLs/x64")
+        list(APPEND _aida_ucrt_dirs ${_aida_ucrt_redist_dirs})
+        list(APPEND _aida_ucrt_dirs
+            "C:/Program Files (x86)/Windows Kits/10/Redist/ucrt/DLLs/x64"
+            "C:/Program Files/Windows Kits/10/Redist/ucrt/DLLs/x64"
+        )
+        list(REMOVE_DUPLICATES _aida_ucrt_dirs)
+        set(_aida_existing_ucrt_dirs)
+        foreach(_aida_ucrt_dir IN LISTS _aida_ucrt_dirs)
+            if(EXISTS "${_aida_ucrt_dir}/ucrtbase.dll")
+                list(APPEND _aida_existing_ucrt_dirs "${_aida_ucrt_dir}")
+            endif()
+        endforeach()
+        if(_aida_existing_ucrt_dirs)
+            list(SORT _aida_existing_ucrt_dirs COMPARE NATURAL ORDER DESCENDING)
+            list(GET _aida_existing_ucrt_dirs 0 _aida_ucrt_dir)
+            file(GLOB _aida_ucrt_dlls CONFIGURE_DEPENDS "${_aida_ucrt_dir}/*.dll")
+            list(APPEND _aida_result ${_aida_ucrt_dlls})
+        else()
+            message(FATAL_ERROR "AiDA: Windows UCRT x64 redistributable DLLs not found. Install a Windows 10/11 SDK with Redist/ucrt/DLLs/x64.")
+        endif()
+
+        set(_aida_d3dcompiler_candidates)
+        if(DEFINED ENV{WindowsSdkDir} AND NOT "$ENV{WindowsSdkDir}" STREQUAL "")
+            file(TO_CMAKE_PATH "$ENV{WindowsSdkDir}" _aida_windows_sdk_dir)
+            list(APPEND _aida_d3dcompiler_candidates "${_aida_windows_sdk_dir}/Redist/D3D/x64/d3dcompiler_47.dll")
+        endif()
+        list(APPEND _aida_d3dcompiler_candidates
+            "C:/Program Files (x86)/Windows Kits/10/Redist/D3D/x64/d3dcompiler_47.dll"
+            "C:/Program Files/Windows Kits/10/Redist/D3D/x64/d3dcompiler_47.dll"
+            "$ENV{SystemRoot}/System32/D3DCompiler_47.dll"
+        )
+        set(_aida_d3dcompiler_dll "")
+        foreach(_aida_d3dcompiler_candidate IN LISTS _aida_d3dcompiler_candidates)
+            if(EXISTS "${_aida_d3dcompiler_candidate}")
+                set(_aida_d3dcompiler_dll "${_aida_d3dcompiler_candidate}")
+                break()
+            endif()
+        endforeach()
+        if(_aida_d3dcompiler_dll)
+            list(APPEND _aida_result "${_aida_d3dcompiler_dll}")
+        else()
+            message(FATAL_ERROR "AiDA: d3dcompiler_47.dll redistributable not found. Install the Windows 10/11 SDK D3D redist.")
+        endif()
+    endif()
+
+    list(REMOVE_DUPLICATES _aida_result)
+    set(${out_var} "${_aida_result}" PARENT_SCOPE)
+endfunction()
+
+function(aida_dedupe_runtime_dlls_by_filename out_var)
+    set(_aida_result)
+    set(_aida_seen_names)
+    foreach(_aida_runtime_dll IN LISTS ARGN)
+        if(NOT EXISTS "${_aida_runtime_dll}")
+            continue()
+        endif()
+        get_filename_component(_aida_runtime_name "${_aida_runtime_dll}" NAME)
+        string(TOLOWER "${_aida_runtime_name}" _aida_runtime_name_lower)
+        if(NOT _aida_runtime_name_lower IN_LIST _aida_seen_names)
+            list(APPEND _aida_seen_names "${_aida_runtime_name_lower}")
+            list(APPEND _aida_result "${_aida_runtime_dll}")
+        endif()
+    endforeach()
+    set(${out_var} "${_aida_result}" PARENT_SCOPE)
+endfunction()
 
 set(ZYDIS_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
 set(ZYDIS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
@@ -477,6 +610,31 @@ endif()
 set(Z3_INCLUDE_DIRS "${Z3_INSTALL_DIR}/include" CACHE PATH "Z3 include directory" FORCE)
 set(Z3_LIBRARIES "${Z3_INSTALL_DIR}/bin/libz3.lib" CACHE FILEPATH "Z3 library" FORCE)
 set(Z3_FOUND TRUE CACHE BOOL "" FORCE)
+set(AIDA_Z3_RUNTIME_DLL_NAMES
+    msvcp140.dll
+    msvcp140_1.dll
+    msvcp140_2.dll
+    msvcp140_atomic_wait.dll
+    msvcp140_codecvt_ids.dll
+    vcomp140.dll
+    vcruntime140.dll
+    vcruntime140_1.dll
+    vcruntime140_threads.dll
+)
+foreach(_aida_z3_runtime_name IN LISTS AIDA_Z3_RUNTIME_DLL_NAMES)
+    if(NOT EXISTS "${Z3_INSTALL_DIR}/bin/${_aida_z3_runtime_name}")
+        message(FATAL_ERROR "Z3 runtime dependency missing: ${Z3_INSTALL_DIR}/bin/${_aida_z3_runtime_name}")
+    endif()
+endforeach()
+set(Z3_MSVCP140_DLL_PATH             "${Z3_INSTALL_DIR}/bin/msvcp140.dll")
+set(Z3_MSVCP140_1_DLL_PATH           "${Z3_INSTALL_DIR}/bin/msvcp140_1.dll")
+set(Z3_MSVCP140_2_DLL_PATH           "${Z3_INSTALL_DIR}/bin/msvcp140_2.dll")
+set(Z3_MSVCP140_ATOMIC_WAIT_DLL_PATH "${Z3_INSTALL_DIR}/bin/msvcp140_atomic_wait.dll")
+set(Z3_MSVCP140_CODECVT_IDS_DLL_PATH "${Z3_INSTALL_DIR}/bin/msvcp140_codecvt_ids.dll")
+set(Z3_VCOMP140_DLL_PATH             "${Z3_INSTALL_DIR}/bin/vcomp140.dll")
+set(Z3_VCRUNTIME140_DLL_PATH         "${Z3_INSTALL_DIR}/bin/vcruntime140.dll")
+set(Z3_VCRUNTIME140_1_DLL_PATH       "${Z3_INSTALL_DIR}/bin/vcruntime140_1.dll")
+set(Z3_VCRUNTIME140_THREADS_DLL_PATH "${Z3_INSTALL_DIR}/bin/vcruntime140_threads.dll")
 
 # --- Capstone (required by Triton) ---
 set(CAPSTONE_BUILD_SHARED OFF CACHE BOOL "" FORCE)
@@ -700,18 +858,14 @@ if(Python3_FOUND)
         CACHE FILEPATH "Path to the built Sentinel.sys")
     set(WINDMAPPER_BINARY "${AIDA_DRIVER_OUTPUT_DIR}/WindMapper.exe"
         CACHE FILEPATH "Path to the built WindMapper.exe")
-    set(SHADOWFS_BINARY   "${AIDA_DRIVER_OUTPUT_DIR}/AiDAShadowFS.sys"
-        CACHE FILEPATH "Path to the built AiDAShadowFS.sys")
 
     set(WHOSWHO_HEX    "${CMAKE_CURRENT_SOURCE_DIR}/WhosWho.c")
     set(SENTINEL_HEX   "${CMAKE_CURRENT_SOURCE_DIR}/Sentinel.c")
     set(WINDMAPPER_HEX "${CMAKE_CURRENT_SOURCE_DIR}/WindMapper.c")
-    set(SHADOWFS_HEX   "${CMAKE_CURRENT_SOURCE_DIR}/AiDAShadowFS.c")
 
     set(WHOSWHO_SCRIPT    "${CMAKE_CURRENT_SOURCE_DIR}/src/encrypt_whoswho.py")
     set(SENTINEL_SCRIPT   "${CMAKE_CURRENT_SOURCE_DIR}/src/encrypt_sentinel.py")
     set(WINDMAPPER_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/src/encrypt_windmapper.py")
-    set(SHADOWFS_SCRIPT   "${CMAKE_CURRENT_SOURCE_DIR}/src/encrypt_shadowfs.py")
 
     set(ENCRYPT_DRIVERS_STAMPS "")
 
@@ -762,11 +916,6 @@ if(Python3_FOUND)
         "${WINDMAPPER_BINARY}" "${WINDMAPPER_HEX}" "${WINDMAPPER_SCRIPT}"
         "${CMAKE_BINARY_DIR}/windmapper_encrypted.stamp"
         "Encrypting WindMapper -> windmapper_data.inc")
-    _aida_emit_encrypt_rule("AiDAShadowFS"
-        "${SHADOWFS_BINARY}" "${SHADOWFS_HEX}" "${SHADOWFS_SCRIPT}"
-        "${CMAKE_BINARY_DIR}/shadowfs_encrypted.stamp"
-        "Encrypting AiDAShadowFS -> shadowfs_encrypted.h")
-
     if(ENCRYPT_DRIVERS_STAMPS)
         add_custom_target(encrypt_drivers DEPENDS ${ENCRYPT_DRIVERS_STAMPS})
         add_custom_target(reencrypt_drivers
@@ -793,7 +942,6 @@ set(ENCRYPTED_DRIVER_HEADERS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/sentinel_encrypted.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/windmapper_embedded.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/windmapper_data.inc"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/shadowfs_encrypted.h"
 )
 set_source_files_properties(
     src/driver_loader.cpp
@@ -1056,7 +1204,7 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/mcp/mcp_standalone_tools.cpp"
             "${STANDALONE_ROOT}/core/runtime/standalone_driver.cpp"
             "${STANDALONE_ROOT}/core/runtime/run_target.cpp"
-            "${STANDALONE_ROOT}/core/runtime/shadow_fs_client.cpp"
+            "${STANDALONE_ROOT}/core/runtime/guest_lab_bridge.cpp"
             "${STANDALONE_ROOT}/core/ai/standalone_ai_client.cpp"
             "${STANDALONE_ROOT}/core/ai/standalone_chat.cpp"
             "${STANDALONE_ROOT}/core/runtime/standalone_license.cpp"
@@ -1261,7 +1409,6 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/testlab/test_lab_features_target_latch.cpp"
             "${STANDALONE_ROOT}/core/testlab/test_lab_features_sandbox.cpp"
             "${STANDALONE_ROOT}/core/testlab/test_lab_features_net_logging.cpp"
-            "${STANDALONE_ROOT}/core/testlab/test_lab_features_shadowfs.cpp"
             "${STANDALONE_ROOT}/core/testlab/test_lab_features_verify.cpp"
             "${STANDALONE_ROOT}/core/testlab/test_lab_features_sentinel.cpp"
             "${STANDALONE_ROOT}/core/testlab/test_all_features.cpp"
@@ -1368,6 +1515,41 @@ if(WIN32)
             "${STANDALONE_ROOT}/resources/aida_embedded.rc.in"
             "${CMAKE_BINARY_DIR}/aida_embedded.rc"
             @ONLY
+        )
+
+        set(STANDALONE_GUEST_AGENT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/guest_agent")
+        add_executable(AiDAGuestAgent
+            "${STANDALONE_GUEST_AGENT_ROOT}/aida_guest_agent.cpp"
+        )
+        target_include_directories(AiDAGuestAgent PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs"
+        )
+        target_compile_definitions(AiDAGuestAgent PRIVATE
+            _CRT_SECURE_NO_WARNINGS
+            NOMINMAX
+            WIN32_LEAN_AND_MEAN
+            UNICODE
+            _UNICODE
+        )
+        target_compile_options(AiDAGuestAgent PRIVATE
+            /W3
+            /EHsc
+            /Zc:__cplusplus
+            /permissive-
+            /bigobj
+        )
+        if(TARGET aida_hardening)
+            target_link_libraries(AiDAGuestAgent PRIVATE aida_hardening)
+        endif()
+        set_target_properties(AiDAGuestAgent PROPERTIES
+            CXX_STANDARD 17
+            CXX_STANDARD_REQUIRED YES
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+            OUTPUT_NAME "AiDAGuestAgent"
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
+            RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_BINARY_DIR}/Debug"
+            RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/Release"
+            RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_BINARY_DIR}/RelWithDebInfo"
         )
 
         add_executable(AiDAStandalone WIN32
@@ -1564,6 +1746,31 @@ if(WIN32)
             COMPILE_PDB_OUTPUT_DIRECTORY_DEBUG "${CMAKE_BINARY_DIR}/Debug"
             COMPILE_PDB_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/Release"
             COMPILE_PDB_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_BINARY_DIR}/RelWithDebInfo"
+        )
+
+        aida_collect_windows_runtime_dlls(_aida_standalone_runtime_candidates)
+        foreach(_aida_z3_runtime_name IN LISTS AIDA_Z3_RUNTIME_DLL_NAMES)
+            list(APPEND _aida_standalone_runtime_candidates "${Z3_INSTALL_DIR}/bin/${_aida_z3_runtime_name}")
+        endforeach()
+        aida_dedupe_runtime_dlls_by_filename(AIDA_STANDALONE_APPLOCAL_RUNTIME_DLLS ${_aida_standalone_runtime_candidates})
+        if(AIDA_STANDALONE_APPLOCAL_RUNTIME_DLLS)
+            add_custom_command(TARGET AiDAStandalone POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    ${AIDA_STANDALONE_APPLOCAL_RUNTIME_DLLS}
+                    "$<TARGET_FILE_DIR:AiDAStandalone>"
+                COMMAND_EXPAND_LISTS
+                COMMENT "Staging app-local runtime DLLs beside AiDAStandalone.exe..."
+                VERBATIM
+            )
+        endif()
+
+        add_dependencies(AiDAStandalone AiDAGuestAgent)
+        add_custom_command(TARGET AiDAStandalone POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:AiDAGuestAgent>"
+                "$<TARGET_FILE_DIR:AiDAStandalone>/AiDAGuestAgent.exe"
+            COMMENT "Staging AiDAGuestAgent beside AiDAStandalone.exe..."
+            VERBATIM
         )
 
         add_dependencies(AiDAStandalone ghidra_specs)
@@ -1898,7 +2105,6 @@ set(AIDA_HEADERS
     src/whoswho_encrypted.h
     src/sentinel_encrypted.h
     src/windmapper_embedded.h
-    src/shadowfs_encrypted.h
 )
 
 if(WIN32)
@@ -2009,7 +2215,7 @@ if(WIN32)
         $<$<COMPILE_LANGUAGE:CXX>:/Zc:__cplusplus>
         $<$<COMPILE_LANGUAGE:CXX>:/permissive->
         $<$<COMPILE_LANGUAGE:CXX>:/Zp8>
-        $<$<COMPILE_LANGUAGE:CXX>:/EHa>
+        $<$<COMPILE_LANGUAGE:CXX>:/EHsc>
         $<$<COMPILE_LANGUAGE:CXX>:/MD>
         $<$<COMPILE_LANGUAGE:CXX>:/GR->
         $<$<COMPILE_LANGUAGE:CXX>:/GF>
@@ -2560,5 +2766,21 @@ if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/test_target/CMak
             RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_BINARY_DIR}/Debug"
             RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_BINARY_DIR}/RelWithDebInfo"
         )
+        if(TARGET AiDAStandalone)
+            add_dependencies(AiDAStandalone AiDA_TestTarget)
+            add_custom_command(TARGET AiDAStandalone POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "$<TARGET_FILE:AiDA_TestTarget>"
+                    "$<TARGET_FILE_DIR:AiDAStandalone>/AiDA_TestTarget.exe"
+                COMMENT "Staging AiDA_TestTarget beside AiDAStandalone.exe..."
+                VERBATIM
+            )
+        endif()
+    endif()
+    if(TARGET AiDA_TestTarget AND TARGET AiDA_TargetProtocolFixture)
+        add_dependencies(AiDA_TestTarget AiDA_TargetProtocolFixture)
+    endif()
+    if(TARGET AiDAStandalone AND TARGET AiDA_TargetProtocolFixture)
+        add_dependencies(AiDAStandalone AiDA_TargetProtocolFixture)
     endif()
 endif()

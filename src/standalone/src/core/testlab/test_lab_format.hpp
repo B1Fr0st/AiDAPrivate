@@ -14,7 +14,6 @@ namespace test_lab_format {
 	inline const char* testlab_driver_name(test_lab::driver_e d) {
 		switch (d) {
 			case test_lab::driver_e::whoswho:  return "whoswho";
-			case test_lab::driver_e::shadowfs: return "shadowfs";
 			case test_lab::driver_e::sentinel: return "sentinel";
 		}
 		return "unknown";

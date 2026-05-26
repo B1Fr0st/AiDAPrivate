@@ -9,7 +9,6 @@
 #include "../ui/theme.hpp"
 #include "../ui/ui_anim.hpp"
 #include "../../../../driver/comm.h"
-#include "../runtime/shadow_fs_client.hpp"
 #include "../../helpers/diag_log.hpp"
 
 #include <Windows.h>
@@ -37,7 +36,6 @@ namespace test_lab_view {
 		const char* driver_label(test_lab::driver_e d) {
 			switch (d) {
 				case test_lab::driver_e::whoswho:  return "WHO";
-				case test_lab::driver_e::shadowfs: return "SFS";
 				case test_lab::driver_e::sentinel: return "SEN";
 			}
 			return "?";
@@ -47,7 +45,6 @@ namespace test_lab_view {
 			const auto& t = aida::ui::resolved();
 			switch (d) {
 				case test_lab::driver_e::whoswho:  return aida::ui::with_alpha(t.accent_u32, alpha);
-				case test_lab::driver_e::shadowfs: return aida::ui::with_alpha(t.info, alpha);
 				case test_lab::driver_e::sentinel: return aida::ui::with_alpha(t.warning, alpha);
 			}
 			return aida::ui::with_alpha(t.text_dim, alpha);
@@ -118,7 +115,6 @@ namespace test_lab_view {
 		const char* driver_name(test_lab::driver_e d) {
 			switch (d) {
 				case test_lab::driver_e::whoswho:  return "whoswho";
-				case test_lab::driver_e::shadowfs: return "shadowfs";
 				case test_lab::driver_e::sentinel: return "sentinel";
 			}
 			return "unknown";
@@ -242,16 +238,7 @@ namespace test_lab_view {
 			std::uint64_t base = 0;
 			std::uint64_t alloc_addr = 0;
 			bool sandbox_self_registered = false;
-			bool shadowfs_self_registered = false;
 		};
-
-		const char* shadowfs_sandbox_root_a() {
-			return "C:\\Users\\Public\\Desktop\\aida_test_sandbox\\";
-		}
-
-		const wchar_t* shadowfs_sandbox_root_w() {
-			return L"C:\\Users\\Public\\Desktop\\aida_test_sandbox\\";
-		}
 
 		std::uint64_t resolve_ntdll_base() {
 			HMODULE h = GetModuleHandleW(L"ntdll.dll");
@@ -264,7 +251,6 @@ namespace test_lab_view {
 			cache.base = 0;
 			cache.alloc_addr = 0;
 			cache.sandbox_self_registered = false;
-			cache.shadowfs_self_registered = false;
 			if (!device || !device->is_connected()) return;
 			std::uint32_t self_pid = static_cast<std::uint32_t>(GetCurrentProcessId());
 			device->set_process_id(self_pid);
@@ -273,7 +259,6 @@ namespace test_lab_view {
 			cache.base = device->get_base_address();
 			std::uint64_t alloc_va = device->allocate_memory(0x1000);
 			if (alloc_va != 0) cache.alloc_addr = alloc_va;
-			CreateDirectoryA(shadowfs_sandbox_root_a(), nullptr);
 			diag::log_tagged_fmt("testlab",
 				"run-all cache primed: pid=%u dtb=0x%016llX base=0x%016llX alloc_addr=0x%016llX",
 				static_cast<unsigned>(self_pid),
@@ -416,35 +401,6 @@ namespace test_lab_view {
 					}
 				}
 				s.u32_a = 1u;
-				return;
-			}
-			if (name_starts_with(name, "REGISTER_PID")) {
-				if (!shadow_fs_client::is_connected()) {
-					shadow_fs_client::initialize();
-				}
-				s.text_a = shadowfs_sandbox_root_a();
-				s.u32_a = 0;
-				return;
-			}
-			if (name_starts_with(name, "UNREGISTER_PID")) {
-				if (!shadow_fs_client::is_connected()) {
-					shadow_fs_client::initialize();
-				}
-				if (!cache.shadowfs_self_registered && shadow_fs_client::is_connected()) {
-					if (shadow_fs_client::register_sandbox_pid(
-						s.pid, 0, shadowfs_sandbox_root_w()))
-					{
-						cache.shadowfs_self_registered = true;
-					}
-				}
-				return;
-			}
-			if (name_starts_with(name, "PING") ||
-				name_starts_with(name, "QUERY_STATS"))
-			{
-				if (!shadow_fs_client::is_connected()) {
-					shadow_fs_client::initialize();
-				}
 				return;
 			}
 		}

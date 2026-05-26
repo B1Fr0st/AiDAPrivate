@@ -19,8 +19,8 @@
 #include <shlobj.h>
 
 #include "run_target.hpp"
+#include "guest_lab_bridge.hpp"
 #include "standalone_driver.hpp"
-#include "shadow_fs_client.hpp"
 #include "../../helpers/diag_log.hpp"
 
 #include <atomic>
@@ -228,6 +228,155 @@ std::wstring resolve_windows_sandbox_exe() {
 	std::wstring p = std::wstring(sysroot) + L"\\WindowsSandbox.exe";
 	if (!file_exists_w(p)) return {};
 	return p;
+}
+
+std::wstring resolve_guest_agent_exe() {
+	wchar_t module_path[MAX_PATH] = {};
+	DWORD n = GetModuleFileNameW(nullptr, module_path, MAX_PATH);
+	if (n == 0 || n >= MAX_PATH) return {};
+	std::filesystem::path p(module_path);
+	std::filesystem::path agent = p.parent_path() / L"AiDAGuestAgent.exe";
+	if (!file_exists_w(agent.wstring())) return {};
+	return agent.wstring();
+}
+
+void stage_file_if_present(const std::filesystem::path& src, const std::filesystem::path& dst_dir) {
+	std::error_code ec;
+	if (src.empty() || !std::filesystem::exists(src, ec) || ec)
+		return;
+	ec.clear();
+	std::filesystem::copy_file(src, dst_dir / src.filename(),
+		std::filesystem::copy_options::overwrite_existing, ec);
+	diag::log_tagged_critical_fmt("run_target",
+		"stage_dependency name='%s' copied=%d ec=%d msg='%s'",
+		narrow_utf8(src.filename().wstring()).c_str(),
+		ec ? 0 : 1,
+		ec.value(),
+		ec.message().c_str());
+}
+
+std::wstring lowercase_ascii(std::wstring value) {
+	for (wchar_t& ch : value) {
+		if (ch >= L'A' && ch <= L'Z')
+			ch = static_cast<wchar_t>(ch - L'A' + L'a');
+	}
+	return value;
+}
+
+bool starts_with_w(const std::wstring& value, const wchar_t* prefix) {
+	if (prefix == nullptr) return false;
+	size_t i = 0;
+	for (; prefix[i] != L'\0'; ++i) {
+		if (i >= value.size() || value[i] != prefix[i])
+			return false;
+	}
+	return true;
+}
+
+bool is_runtime_dependency_filename(const std::wstring& filename) {
+	std::wstring lower = lowercase_ascii(filename);
+	return lower == L"msvcp140.dll"
+		|| lower == L"msvcp140_1.dll"
+		|| lower == L"msvcp140_2.dll"
+		|| lower == L"msvcp140_atomic_wait.dll"
+		|| lower == L"msvcp140_codecvt_ids.dll"
+		|| lower == L"vcruntime140.dll"
+		|| lower == L"vcruntime140_1.dll"
+		|| lower == L"vcruntime140_threads.dll"
+		|| lower == L"vccorlib140.dll"
+		|| lower == L"vcomp140.dll"
+		|| lower == L"concrt140.dll"
+		|| lower == L"ucrtbase.dll"
+		|| lower == L"d3dcompiler_47.dll"
+		|| starts_with_w(lower, L"api-ms-win-crt-")
+		|| starts_with_w(lower, L"api-ms-win-core-");
+}
+
+void stage_runtime_dependency_directory(const std::filesystem::path& root,
+                                        const std::filesystem::path& dst_dir) {
+	std::error_code ec;
+	if (root.empty() || !std::filesystem::exists(root, ec) || ec)
+		return;
+	for (const auto& entry : std::filesystem::directory_iterator(root, ec)) {
+		if (ec) {
+			ec.clear();
+			break;
+		}
+		if (!entry.is_regular_file(ec)) {
+			ec.clear();
+			continue;
+		}
+		const std::wstring filename = entry.path().filename().wstring();
+		if (!is_runtime_dependency_filename(filename))
+			continue;
+		stage_file_if_present(entry.path(), dst_dir);
+	}
+}
+
+void stage_common_runtime_dependencies(const std::filesystem::path& host_input) {
+	std::vector<std::filesystem::path> roots;
+	wchar_t sysdir[MAX_PATH] = {};
+	UINT sys_n = GetSystemDirectoryW(sysdir, MAX_PATH);
+	if (sys_n > 0 && sys_n < MAX_PATH)
+		roots.emplace_back(sysdir);
+
+	std::filesystem::path module_dir;
+	wchar_t module_path[MAX_PATH] = {};
+	DWORD module_n = GetModuleFileNameW(nullptr, module_path, MAX_PATH);
+	if (module_n > 0 && module_n < MAX_PATH) {
+		module_dir = std::filesystem::path(module_path).parent_path();
+		roots.emplace_back(module_dir);
+	}
+
+	const wchar_t* names[] = {
+		L"MSVCP140.dll",
+		L"MSVCP140_1.dll",
+		L"MSVCP140_2.dll",
+		L"MSVCP140_ATOMIC_WAIT.dll",
+		L"MSVCP140_CODECVT_IDS.dll",
+		L"VCRUNTIME140.dll",
+		L"VCRUNTIME140_1.dll",
+		L"VCRUNTIME140_THREADS.dll",
+		L"VCOMP140.dll",
+		L"concrt140.dll",
+		L"vccorlib140.dll",
+		L"ucrtbase.dll",
+		L"D3DCompiler_47.dll",
+		L"api-ms-win-crt-conio-l1-1-0.dll",
+		L"api-ms-win-crt-convert-l1-1-0.dll",
+		L"api-ms-win-crt-environment-l1-1-0.dll",
+		L"api-ms-win-crt-filesystem-l1-1-0.dll",
+		L"api-ms-win-crt-heap-l1-1-0.dll",
+		L"api-ms-win-crt-locale-l1-1-0.dll",
+		L"api-ms-win-crt-math-l1-1-0.dll",
+		L"api-ms-win-crt-multibyte-l1-1-0.dll",
+		L"api-ms-win-crt-private-l1-1-0.dll",
+		L"api-ms-win-crt-process-l1-1-0.dll",
+		L"api-ms-win-crt-runtime-l1-1-0.dll",
+		L"api-ms-win-crt-stdio-l1-1-0.dll",
+		L"api-ms-win-crt-string-l1-1-0.dll",
+		L"api-ms-win-crt-time-l1-1-0.dll",
+		L"api-ms-win-crt-utility-l1-1-0.dll"
+	};
+	for (const wchar_t* name : names) {
+		bool copied = false;
+		for (const auto& root : roots) {
+			std::error_code ec;
+			std::filesystem::path src = root / name;
+			if (!std::filesystem::exists(src, ec) || ec)
+				continue;
+			stage_file_if_present(src, host_input);
+			copied = true;
+			break;
+		}
+		if (!copied) {
+			diag::log_tagged_critical_fmt("run_target",
+				"stage_dependency_missing name='%s'",
+				narrow_utf8(name).c_str());
+		}
+	}
+	if (!module_dir.empty())
+		stage_runtime_dependency_directory(module_dir, host_input);
 }
 
 std::string make_unique_rule_name() {
@@ -752,11 +901,6 @@ bool try_register_kernel_sandbox_guard(uint32_t pid, bool log_network, bool bloc
 
 void try_unregister_kernel_sandbox_guard(uint32_t pid) {
 	if (pid == 0) return;
-	if (shadow_fs_client::is_connected()) {
-		bool sh_off = shadow_fs_client::unregister_sandbox_pid(pid);
-		diag::log_tagged_critical_fmt("shadow_fs",
-			"unregister_pid pid=%u ok=%d", pid, sh_off ? 1 : 0);
-	}
 	if (!driver_bridge::is_loaded()) return;
 	bool stopped = driver_bridge::stop_capture();
 	bool net_off = driver_bridge::malware_safe_net_log(pid, false);
@@ -1485,32 +1629,6 @@ bool launch_malware_safe_desktop(const launch_options_t& opts, launch_result_t& 
 			pi.dwProcessId, started ? 1 : 0);
 	}
 
-	if (opts.redirect_user_paths_to_sandbox && !sandbox_root.empty()) {
-		if (!shadow_fs_client::is_connected()) {
-			shadow_fs_client::initialize();
-		}
-		if (shadow_fs_client::is_connected()) {
-			uint32_t shadow_flags = shadow_fs_client::k_default_flags;
-			bool reg_ok = shadow_fs_client::register_sandbox_pid(
-				pi.dwProcessId,
-				shadow_flags,
-				sandbox_root);
-			out.shadow_fs_registered = reg_ok;
-			diag::log_tagged_critical_fmt("shadow_fs",
-				"register_pid pid=%lu flags=0x%08lX ok=%d err='%s'",
-				pi.dwProcessId,
-				static_cast<unsigned long>(shadow_flags),
-				reg_ok ? 1 : 0,
-				reg_ok ? "" : shadow_fs_client::last_error().c_str());
-		} else {
-			out.shadow_fs_registered = false;
-			diag::log_tagged_critical_fmt("shadow_fs",
-				"register_pid_SKIPPED port_not_connected pid=%lu err='%s'",
-				pi.dwProcessId,
-				shadow_fs_client::last_error().c_str());
-		}
-	}
-
 	out.ok = true;
 	out.pid = pi.dwProcessId;
 	out.process_handle = reinterpret_cast<uintptr_t>(pi.hProcess);
@@ -1522,14 +1640,13 @@ bool launch_malware_safe_desktop(const launch_options_t& opts, launch_result_t& 
 	}
 
 	diag::log_tagged_critical_fmt("malware_safe",
-		"launch ok pid=%lu sandbox='%s' kernel_guard=%d net_log=%d il_lowered=%d mitigations=%d shadow_fs=%d firewall_rule='%s'",
+		"launch ok pid=%lu sandbox='%s' kernel_guard=%d net_log=%d il_lowered=%d mitigations=%d firewall_rule='%s'",
 		pi.dwProcessId,
 		narrow_utf8(sandbox_root).c_str(),
 		out.sandbox_pid_registered ? 1 : 0,
 		out.net_logger_registered ? 1 : 0,
 		out.integrity_lowered ? 1 : 0,
 		out.mitigations_applied ? 1 : 0,
-		out.shadow_fs_registered ? 1 : 0,
 		out.firewall_rule_name.c_str());
 
 	return true;
@@ -1565,7 +1682,7 @@ std::wstring ps_quote_w(const std::wstring& text) {
 bool launch_windows_sandbox(const launch_options_t& opts, launch_result_t& out) {
 	std::wstring sandbox_exe = resolve_windows_sandbox_exe();
 	if (sandbox_exe.empty()) {
-		out.error = "Windows Sandbox is unavailable. Enable the Windows Sandbox feature first.";
+		out.error = "Windows Sandbox is unavailable. Enable Windows Sandbox on Windows Pro, Enterprise, or Education with virtualization enabled. Admin PowerShell: Enable-WindowsOptionalFeature -Online -FeatureName Containers-DisposableClientVM -All";
 		diag::log_tagged_critical("run_target",
 			"launch_windows_sandbox unavailable_no_exe");
 		return false;
@@ -1583,6 +1700,14 @@ bool launch_windows_sandbox(const launch_options_t& opts, launch_result_t& out) 
 		diag::log_tagged_critical_fmt("run_target",
 			"launch_windows_sandbox exe_missing path='%s'",
 			narrow_utf8(opts.exe_path).c_str());
+		return false;
+	}
+
+	std::wstring guest_agent_src = resolve_guest_agent_exe();
+	if (guest_agent_src.empty()) {
+		out.error = "AiDAGuestAgent.exe is missing beside AiDAStandalone.exe. Rebuild AiDAStandalone so the sandbox bridge agent is staged.";
+		diag::log_tagged_critical("run_target",
+			"launch_windows_sandbox guest_agent_missing");
 		return false;
 	}
 
@@ -1604,46 +1729,62 @@ bool launch_windows_sandbox(const launch_options_t& opts, launch_result_t& out) 
 
 	std::filesystem::path host_input = session_dir / L"input";
 	std::filesystem::create_directories(host_input, ec);
-
-	std::filesystem::path host_script = session_dir / L"run.ps1";
-	std::filesystem::path host_wsb = session_dir / L"session.wsb";
-
-	std::filesystem::path source_dir =
-		(!opts.working_dir.empty() && std::filesystem::exists(opts.working_dir, ec))
-		? std::filesystem::path(opts.working_dir)
-		: exe_path.parent_path();
-
-	if (std::filesystem::exists(source_dir, ec)) {
-		for (auto it = std::filesystem::recursive_directory_iterator(source_dir, ec);
-		     it != std::filesystem::recursive_directory_iterator(); ++it) {
-			if (ec) break;
-			auto rel = std::filesystem::relative(it->path(), source_dir, ec);
-			if (ec) { ec.clear(); continue; }
-			auto dst = host_input / rel;
-			if (it->is_directory(ec)) {
-				std::filesystem::create_directories(dst, ec);
-				ec.clear();
-				continue;
-			}
-			if (!it->is_regular_file(ec)) { ec.clear(); continue; }
-			std::filesystem::create_directories(dst.parent_path(), ec);
-			ec.clear();
-			std::filesystem::copy_file(it->path(), dst,
-				std::filesystem::copy_options::overwrite_existing, ec);
-			ec.clear();
-		}
+	if (ec) {
+		out.error = "Failed to create sandbox input directory.";
+		diag::log_tagged_critical_fmt("run_target",
+			"launch_windows_sandbox create_input_dir_FAILED ec=%d msg='%s'",
+			ec.value(), ec.message().c_str());
+		return false;
 	}
 
+	std::filesystem::path host_output = session_dir / L"output";
+	std::filesystem::create_directories(host_output, ec);
+	if (ec) {
+		out.error = "Failed to create sandbox output directory.";
+		diag::log_tagged_critical_fmt("run_target",
+			"launch_windows_sandbox create_output_dir_FAILED ec=%d msg='%s'",
+			ec.value(), ec.message().c_str());
+		return false;
+	}
+
+	std::filesystem::path host_script = host_input / L"run.ps1";
+	std::filesystem::path host_wsb = session_dir / L"session.wsb";
+
 	std::filesystem::path target_in_input = host_input / exe_path.filename();
-	if (!std::filesystem::exists(target_in_input, ec)) {
-		std::filesystem::copy_file(exe_path, target_in_input,
-			std::filesystem::copy_options::overwrite_existing, ec);
+	std::filesystem::copy_file(exe_path, target_in_input,
+		std::filesystem::copy_options::overwrite_existing, ec);
+	if (ec) {
+		out.error = "Failed to stage target executable for Windows Sandbox.";
+		diag::log_tagged_critical_fmt("run_target",
+			"launch_windows_sandbox copy_target_FAILED src='%s' dst='%s' ec=%d msg='%s'",
+			narrow_utf8(exe_path.wstring()).c_str(),
+			narrow_utf8(target_in_input.wstring()).c_str(),
+			ec.value(), ec.message().c_str());
+		return false;
 	}
 	ec.clear();
 
+	std::filesystem::path host_agent = host_input / L"AiDAGuestAgent.exe";
+	std::filesystem::copy_file(std::filesystem::path(guest_agent_src), host_agent,
+		std::filesystem::copy_options::overwrite_existing, ec);
+	if (ec) {
+		out.error = "Failed to stage AiDA guest agent for Windows Sandbox.";
+		diag::log_tagged_critical_fmt("run_target",
+			"launch_windows_sandbox copy_guest_agent_FAILED src='%s' dst='%s' ec=%d msg='%s'",
+			narrow_utf8(guest_agent_src).c_str(),
+			narrow_utf8(host_agent.wstring()).c_str(),
+			ec.value(), ec.message().c_str());
+		return false;
+	}
+	ec.clear();
+
+	stage_common_runtime_dependencies(host_input);
+
 	std::wstring guest_root = L"C:\\Users\\WDAGUtilityAccount\\Desktop\\AiDAWorkspace";
 	std::wstring guest_input = guest_root + L"\\input";
+	std::wstring guest_output = guest_root + L"\\output";
 	std::wstring guest_exe = guest_input + L"\\" + exe_path.filename().wstring();
+	std::wstring guest_agent = guest_input + L"\\AiDAGuestAgent.exe";
 
 	{
 		std::wofstream ofs(host_script.wstring(), std::ios::trunc);
@@ -1652,16 +1793,28 @@ bool launch_windows_sandbox(const launch_options_t& opts, launch_result_t& out) 
 			return false;
 		}
 		ofs.imbue(std::locale::classic());
-		ofs << L"$ErrorActionPreference = 'SilentlyContinue'\n";
+		ofs << L"$ErrorActionPreference = 'Continue'\n";
 		ofs << L"$exePath = " << ps_quote_w(guest_exe) << L"\n";
 		ofs << L"$argLine = " << ps_quote_w(opts.args) << L"\n";
+		ofs << L"$outDir = " << ps_quote_w(guest_output) << L"\n";
+		ofs << L"$agentPath = " << ps_quote_w(guest_agent) << L"\n";
+		ofs << L"New-Item -ItemType Directory -Force -Path $outDir | Out-Null\n";
+		ofs << L"New-Item -ItemType Directory -Force -Path (Join-Path $outDir 'requests') | Out-Null\n";
+		ofs << L"New-Item -ItemType Directory -Force -Path (Join-Path $outDir 'responses') | Out-Null\n";
+		ofs << L"New-Item -ItemType Directory -Force -Path (Join-Path $outDir 'artifacts') | Out-Null\n";
+		ofs << L"Set-Content -Path (Join-Path $outDir 'launch.txt') -Value ('AiDA sandbox launch ' + (Get-Date).ToString('o'))\n";
 		ofs << L"$workDir = Split-Path -Path $exePath -Parent\n";
-		ofs << L"if ([string]::IsNullOrWhiteSpace($argLine)) {\n";
-		ofs << L"  $proc = Start-Process -FilePath $exePath -WorkingDirectory $workDir -PassThru -WindowStyle Normal\n";
-		ofs << L"} else {\n";
-		ofs << L"  $proc = Start-Process -FilePath $exePath -ArgumentList $argLine -WorkingDirectory $workDir -PassThru -WindowStyle Normal\n";
+		ofs << L"$cfg = @{ sample = $exePath; args = $argLine; created = (Get-Date).ToString('o') } | ConvertTo-Json -Compress\n";
+		ofs << L"$utf8NoBom = New-Object System.Text.UTF8Encoding($false)\n";
+		ofs << L"[System.IO.File]::WriteAllText((Join-Path $outDir 'launch_config.json'), $cfg, $utf8NoBom)\n";
+		ofs << L"try {\n";
+		ofs << L"  $proc = Start-Process -FilePath $agentPath -ArgumentList @('--bridge', $outDir) -WorkingDirectory $workDir -PassThru -WindowStyle Hidden\n";
+		ofs << L"  if ($proc -ne $null) {\n";
+		ofs << L"    Set-Content -Path (Join-Path $outDir 'agent_pid.txt') -Value $proc.Id\n";
+		ofs << L"  }\n";
+		ofs << L"} catch {\n";
+		ofs << L"  Set-Content -Path (Join-Path $outDir 'launch_error.txt') -Value $_.Exception.Message\n";
 		ofs << L"}\n";
-		ofs << L"if ($proc -ne $null) { $proc.WaitForExit() }\n";
 	}
 
 	uint64_t script_bytes = 0;
@@ -1678,13 +1831,14 @@ bool launch_windows_sandbox(const launch_options_t& opts, launch_result_t& out) 
 			return false;
 		}
 		ofs.imbue(std::locale::classic());
-		std::wstring host_root_esc = xml_escape_w(session_dir.wstring());
-		std::wstring guest_root_esc = xml_escape_w(guest_root);
 		std::wstring host_input_esc = xml_escape_w(host_input.wstring());
 		std::wstring guest_input_esc = xml_escape_w(guest_input);
+		std::wstring host_output_esc = xml_escape_w(host_output.wstring());
+		std::wstring guest_output_esc = xml_escape_w(guest_output);
 
 		ofs << L"<Configuration>\n";
 		ofs << L"  <Networking>" << (opts.block_network ? L"Disable" : L"Default") << L"</Networking>\n";
+		ofs << L"  <ProtectedClient>Enable</ProtectedClient>\n";
 		ofs << L"  <ClipboardRedirection>Disable</ClipboardRedirection>\n";
 		ofs << L"  <PrinterRedirection>Disable</PrinterRedirection>\n";
 		ofs << L"  <AudioInput>Disable</AudioInput>\n";
@@ -1699,14 +1853,14 @@ bool launch_windows_sandbox(const launch_options_t& opts, launch_result_t& out) 
 		ofs << L"      <ReadOnly>true</ReadOnly>\n";
 		ofs << L"    </MappedFolder>\n";
 		ofs << L"    <MappedFolder>\n";
-		ofs << L"      <HostFolder>" << host_root_esc << L"</HostFolder>\n";
-		ofs << L"      <SandboxFolder>" << guest_root_esc << L"</SandboxFolder>\n";
+		ofs << L"      <HostFolder>" << host_output_esc << L"</HostFolder>\n";
+		ofs << L"      <SandboxFolder>" << guest_output_esc << L"</SandboxFolder>\n";
 		ofs << L"      <ReadOnly>false</ReadOnly>\n";
 		ofs << L"    </MappedFolder>\n";
 		ofs << L"  </MappedFolders>\n";
 		ofs << L"  <LogonCommand>\n";
 		ofs << L"    <Command>powershell.exe -ExecutionPolicy Bypass -File "
-		    << guest_root_esc << L"\\run.ps1</Command>\n";
+		    << guest_input_esc << L"\\run.ps1</Command>\n";
 		ofs << L"  </LogonCommand>\n";
 		ofs << L"</Configuration>\n";
 	}
@@ -1745,6 +1899,8 @@ bool launch_windows_sandbox(const launch_options_t& opts, launch_result_t& out) 
 	out.process_handle = reinterpret_cast<uintptr_t>(pi.hProcess);
 	out.thread_handle = 0;
 	out.job_handle = 0;
+	out.sandbox_dir = session_dir.wstring();
+	guest_lab::activate(out.sandbox_dir, opts.exe_path);
 
 	if (opts.auto_terminate_sec > 0) {
 		spawn_watchdog_kill(pi.hProcess, nullptr, opts.auto_terminate_sec, pi.dwProcessId);

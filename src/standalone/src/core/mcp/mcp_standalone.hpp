@@ -21,7 +21,7 @@ namespace mcp_standalone
     static constexpr int JSONRPC_INTERNAL_ERROR   = -32603;
 
     static constexpr const char* PROTOCOL_VERSION = "2025-06-18";
-    static constexpr const char* SERVER_NAME      = "AiDA-Pro-MCP";
+    static constexpr const char* SERVER_NAME      = "aida-pro-mcp";
     static constexpr const char* SERVER_VERSION   = "1.0.0";
 
     struct tool_result_t

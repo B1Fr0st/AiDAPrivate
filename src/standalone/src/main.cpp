@@ -25,7 +25,6 @@
 #include "standalone_settings.hpp"
 #include "standalone_driver.hpp"
 #include "standalone_tools_fwd.hpp"
-#include "core/runtime/shadow_fs_client.hpp"
 #include "core/runtime/arc_loader.hpp"
 #include "core/anti-tamper/orchestrator.hpp"
 #include "core/anti-tamper/hv_preflight.hpp"
@@ -1675,7 +1674,6 @@ int main(int, char**)
     script_engine::shutdown();
     workflow_tools::shutdown_services();
     shutdown_standalone_chat();
-    shadow_fs_client::shutdown();
     aida::auth::http::cleanup();
     Blur::Shutdown();
     ImGui_ImplDX11_Shutdown();

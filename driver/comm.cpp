@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <intrin.h>
 #include <cstdio>
+#include <cstring>
 
 #ifdef _DEBUG
 #define RC_UM_DBG(fmt, ...) do { char _rc_buf[512]; _snprintf_s(_rc_buf, sizeof(_rc_buf), _TRUNCATE, "[AIDA-RC-UM] " fmt "\n", ##__VA_ARGS__); OutputDebugStringA(_rc_buf); } while(0)
@@ -116,6 +117,154 @@ namespace syscall_indices {
 
 namespace {
     constexpr std::size_t k_staged_physical_chunk_size = 0x1000;
+
+    struct dpi_payload_view_t {
+        const std::uint8_t* data = nullptr;
+        std::uint32_t size = 0;
+    };
+
+    static dpi_payload_view_t dpi_select_app_payload(const std::vector<std::uint8_t>& payload, std::uint32_t protocol) noexcept {
+        dpi_payload_view_t direct{payload.data(), static_cast<std::uint32_t>(payload.size())};
+        if (protocol != 6 || payload.size() < 20)
+            return direct;
+        const std::uint8_t header_len = static_cast<std::uint8_t>(((payload[12] >> 4) & 0x0F) * 4);
+        if (header_len >= 20 && header_len <= payload.size())
+            return {payload.data() + header_len, static_cast<std::uint32_t>(payload.size() - header_len)};
+        return direct;
+    }
+
+    static std::uint32_t dpi_http_method_id(const std::uint8_t* data, std::uint32_t len) noexcept {
+        if (!data || len < 4) return 0;
+        if (len >= 4 && std::memcmp(data, "GET ", 4) == 0) return 1;
+        if (len >= 5 && std::memcmp(data, "POST ", 5) == 0) return 2;
+        if (len >= 4 && std::memcmp(data, "PUT ", 4) == 0) return 3;
+        if (len >= 7 && std::memcmp(data, "DELETE ", 7) == 0) return 4;
+        if (len >= 5 && std::memcmp(data, "HEAD ", 5) == 0) return 5;
+        if (len >= 5 && std::memcmp(data, "HTTP/", 5) == 0) return 6;
+        return 0;
+    }
+
+    static void dpi_extract_http_header_value(const std::uint8_t* data, std::uint32_t len, const char* name, std::string& out) {
+        out.clear();
+        if (!data || !name || len == 0) return;
+        const std::size_t name_len = std::strlen(name);
+        for (std::uint32_t i = 0; i + name_len + 1 < len; ++i) {
+            if (i != 0 && data[i - 1] != '\n') continue;
+            std::uint32_t j = 0;
+            while (j < name_len && i + j < len &&
+                   std::tolower(static_cast<unsigned char>(data[i + j])) == std::tolower(static_cast<unsigned char>(name[j]))) {
+                ++j;
+            }
+            if (j != name_len || i + j >= len || data[i + j] != ':') continue;
+            j++;
+            while (i + j < len && (data[i + j] == ' ' || data[i + j] == '\t')) ++j;
+            const std::uint32_t start = i + j;
+            while (i + j < len && data[i + j] != '\r' && data[i + j] != '\n') ++j;
+            out.assign(reinterpret_cast<const char*>(data + start), j - (start - i));
+            return;
+        }
+    }
+
+    static void dpi_extract_http_path(const std::uint8_t* data, std::uint32_t len, std::string& out) {
+        out.clear();
+        if (!data || len == 0) return;
+        std::uint32_t i = 0;
+        while (i < len && data[i] != ' ' && data[i] != '\r' && data[i] != '\n') ++i;
+        if (i >= len || data[i] != ' ') return;
+        ++i;
+        const std::uint32_t start = i;
+        while (i < len && data[i] != ' ' && data[i] != '\r' && data[i] != '\n') ++i;
+        if (i > start)
+            out.assign(reinterpret_cast<const char*>(data + start), i - start);
+    }
+
+    static void dpi_detect_tls(const std::uint8_t* data, std::uint32_t len, voyager::device_t::dpi_result& out) {
+        if (!data || len < 5) return;
+        const std::uint8_t content_type = data[0];
+        const std::uint16_t version = static_cast<std::uint16_t>((static_cast<std::uint16_t>(data[1]) << 8) | data[2]);
+        if (content_type < 20 || content_type > 23 || data[1] != 0x03)
+            return;
+        out.is_tls = true;
+        out.tls_version = version;
+        out.tls_content_type = content_type;
+        if (content_type != 22 || len < 9 || data[5] != 1)
+            return;
+        std::uint32_t pos = 5 + 4 + 2 + 32;
+        if (pos >= len) return;
+        pos += 1 + data[pos];
+        if (pos + 2 > len) return;
+        const std::uint16_t cs_len = static_cast<std::uint16_t>((static_cast<std::uint16_t>(data[pos]) << 8) | data[pos + 1]);
+        pos += 2 + cs_len;
+        if (pos >= len) return;
+        pos += 1 + data[pos];
+        if (pos + 2 > len) return;
+        const std::uint16_t ext_len = static_cast<std::uint16_t>((static_cast<std::uint16_t>(data[pos]) << 8) | data[pos + 1]);
+        pos += 2;
+        std::uint32_t ext_end = pos + ext_len;
+        if (ext_end > len) ext_end = len;
+        while (pos + 4 <= ext_end) {
+            const std::uint16_t ext_type = static_cast<std::uint16_t>((static_cast<std::uint16_t>(data[pos]) << 8) | data[pos + 1]);
+            const std::uint16_t item_len = static_cast<std::uint16_t>((static_cast<std::uint16_t>(data[pos + 2]) << 8) | data[pos + 3]);
+            pos += 4;
+            if (pos + item_len > ext_end) break;
+            if (ext_type == 0 && item_len >= 5) {
+                std::uint32_t sni_pos = pos + 2;
+                if (sni_pos < pos + item_len && data[sni_pos] == 0) {
+                    ++sni_pos;
+                    if (sni_pos + 2 <= pos + item_len) {
+                        const std::uint16_t name_len = static_cast<std::uint16_t>((static_cast<std::uint16_t>(data[sni_pos]) << 8) | data[sni_pos + 1]);
+                        sni_pos += 2;
+                        if (sni_pos + name_len <= pos + item_len)
+                            out.tls_sni.assign(reinterpret_cast<const char*>(data + sni_pos), name_len);
+                    }
+                }
+                return;
+            }
+            pos += item_len;
+        }
+    }
+
+    static bool dpi_result_matches_filters(const voyager::device_t::dpi_result& d,
+                                           std::uint32_t filter_pid,
+                                           std::uint32_t filter_protocol,
+                                           std::uint32_t filter_port,
+                                           std::uint32_t flags) noexcept {
+        if (filter_pid != 0 && d.pid != filter_pid) return false;
+        if (filter_protocol != 0 && d.protocol != filter_protocol) return false;
+        if (filter_port != 0 && d.src_port != filter_port && d.dst_port != filter_port) return false;
+        if ((flags & 1) != 0 && !d.is_http) return false;
+        if ((flags & 2) != 0 && !d.is_tls) return false;
+        if ((flags & 4) != 0 && !d.is_dns) return false;
+        return true;
+    }
+
+    static bool dpi_from_captured_packet(const voyager::device_t::captured_packet& pkt,
+                                         voyager::device_t::dpi_result& out) {
+        if (pkt.payload.empty()) return false;
+        out = {};
+        out.timestamp = pkt.timestamp;
+        out.direction = pkt.direction;
+        out.protocol = pkt.protocol;
+        out.src_port = pkt.local_port;
+        out.dst_port = pkt.remote_port;
+        out.pid = pkt.pid;
+        out.payload_size = pkt.payload_size;
+        out.af = pkt.address_family;
+        std::memcpy(out.src_addr, pkt.local_addr, sizeof(out.src_addr));
+        std::memcpy(out.dst_addr, pkt.remote_addr, sizeof(out.dst_addr));
+        const auto app = dpi_select_app_payload(pkt.payload, pkt.protocol);
+        const std::uint32_t method = dpi_http_method_id(app.data, app.size);
+        if (method != 0) {
+            out.is_http = true;
+            out.http_method = method;
+            dpi_extract_http_header_value(app.data, app.size, "host", out.http_host);
+            dpi_extract_http_path(app.data, app.size, out.http_path);
+        }
+        dpi_detect_tls(app.data, app.size, out);
+        if ((pkt.local_port == 53 || pkt.remote_port == 53) && app.size >= 12)
+            out.is_dns = true;
+        return true;
+    }
 
     class virtual_alloc_buffer_t final {
     public:
@@ -2858,6 +3007,18 @@ std::vector<voyager::device_t::dpi_result> voyager::device_t::get_dpi_results(
     }
 
     VirtualFree(req, 0, MEM_RELEASE);
+    if (result.empty()) {
+        const auto captured = get_captured_packets(detail::DPI_MAX_RESULTS);
+        result.reserve(captured.size());
+        for (const auto& pkt : captured) {
+            dpi_result d{};
+            if (!dpi_from_captured_packet(pkt, d))
+                continue;
+            if (!dpi_result_matches_filters(d, filter_pid, filter_protocol, filter_port, flags))
+                continue;
+            result.push_back(std::move(d));
+        }
+    }
     return result;
 }
 

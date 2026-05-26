@@ -191,7 +191,6 @@ if ($Drivers) {
     $driverParts = @(
         "if not exist build-ninja\Release mkdir build-ninja\Release",
         "driver\Sentinel\nuget.exe restore driver\Sentinel\Sentinel.sln",
-        "driver\Sentinel\nuget.exe restore driver\AiDAShadowFS\AiDAShadowFS.sln",
         "driver\Sentinel\nuget.exe restore driver\WhosWho\WhosWho.sln"
     )
     if ($CleanDrivers) {

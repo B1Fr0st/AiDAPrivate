@@ -1136,8 +1136,12 @@ namespace {
             passed.fetch_add(1);
             return;
         }
+        if (!cert_generator::is_root_ca_installed(ca)) {
+            bool installed = cert_generator::install_root_ca(ca);
+            log_msg(hf, tag, "current-user CA install attempted result=%s", installed ? "true" : "false");
+        }
         auto status = cert_intercept::profiles::prepare_firefox_profile(ca, "127.0.0.1", 18443);
-        bool files_ok =
+        bool profile_ready =
             !status.ca_pem_path.empty() && !status.ca_der_path.empty() &&
             !status.user_js_path.empty() && !status.policies_path.empty() &&
             status.ca_files_nonempty && status.profile_files_valid &&
@@ -1145,22 +1149,32 @@ namespace {
             status.launch_arguments.find("--profile") != std::string::npos &&
             !status.runtime_validation_performed &&
             !status.runtime_validation_valid &&
-            status.prepared == status.current_user_ca_trusted &&
-            status.ok == status.prepared;
-        if (files_ok) {
+            status.prepared &&
+            status.current_user_ca_trusted &&
+            status.ok;
+        if (profile_ready && status.firefox_detected) {
             log_msg(hf, tag, "PASS -- Firefox profile readiness profile=%s firefox_detected=%s trust=%s prepared=%s",
                 status.profile_path.u8string().c_str(),
                 status.firefox_detected ? "true" : "false",
                 status.current_user_ca_trusted ? "true" : "false",
                 status.prepared ? "true" : "false");
             passed.fetch_add(1);
+        } else if (profile_ready) {
+            log_msg(hf, tag, "DEPENDENCY-PASS -- Firefox executable unavailable; profile readiness files/trust valid profile=%s trust=%s prepared=%s runtime_checked=%s",
+                status.profile_path.u8string().c_str(),
+                status.current_user_ca_trusted ? "true" : "false",
+                status.prepared ? "true" : "false",
+                status.runtime_validation_performed ? "true" : "false");
+            passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "FAIL -- Firefox profile readiness invalid error=%s files=%s trust=%s prepared=%s runtime_checked=%s",
+            log_msg(hf, tag, "FAIL -- Firefox profile readiness invalid error=%s files=%s trust=%s prepared=%s firefox_detected=%s runtime_checked=%s ok=%s",
                 status.error.c_str(),
                 status.profile_files_valid ? "true" : "false",
                 status.current_user_ca_trusted ? "true" : "false",
                 status.prepared ? "true" : "false",
-                status.runtime_validation_performed ? "true" : "false");
+                status.firefox_detected ? "true" : "false",
+                status.runtime_validation_performed ? "true" : "false",
+                status.ok ? "true" : "false");
             failed.fetch_add(1);
         }
     }

@@ -1094,8 +1094,11 @@ namespace dispatcher {
                             hb->whoswho_tsc = (UINT64)sentinel_bridge::g_bridge.whoswho_tsc;
                             hb->sentinel_tsc = (UINT64)sentinel_bridge::g_bridge.sentinel_tsc;
 
-                            if (existing_key == 0) {
-                                WW_LOG("HB: first heartbeat, registering client, counter=%ld",
+                            BOOLEAN need_client_register = (existing_key == 0 ||
+                                caller_validation::g_registered_client_pid == nullptr);
+                            if (need_client_register) {
+                                WW_LOG("HB: registering client, first=%d counter=%ld",
+                                    existing_key == 0 ? 1 : 0,
                                     g_heartbeat_counter);
                                 caller_validation::register_client();
 

@@ -9,8 +9,6 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "WindMapper", "..\..\mapper\
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Sentinel", "..\Sentinel\Sentinel\Sentinel.vcxproj", "{A1B2C3D4-5E6F-7890-ABCD-EF1234567890}"
 EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "AiDAShadowFS", "..\AiDAShadowFS\AiDAShadowFS\AiDAShadowFS.vcxproj", "{B5C7E319-4F9D-4A18-9E2A-DCA0E11B7F2D}"
-EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|ARM64 = Debug|ARM64
@@ -51,18 +49,6 @@ Global
 		{A1B2C3D4-5E6F-7890-ABCD-EF1234567890}.Release|x64.ActiveCfg = Release|x64
 		{A1B2C3D4-5E6F-7890-ABCD-EF1234567890}.Release|x64.Build.0 = Release|x64
 		{A1B2C3D4-5E6F-7890-ABCD-EF1234567890}.Release|x64.Deploy.0 = Release|x64
-		{B5C7E319-4F9D-4A18-9E2A-DCA0E11B7F2D}.Debug|ARM64.ActiveCfg = Debug|ARM64
-		{B5C7E319-4F9D-4A18-9E2A-DCA0E11B7F2D}.Debug|ARM64.Build.0 = Debug|ARM64
-		{B5C7E319-4F9D-4A18-9E2A-DCA0E11B7F2D}.Debug|ARM64.Deploy.0 = Debug|ARM64
-		{B5C7E319-4F9D-4A18-9E2A-DCA0E11B7F2D}.Debug|x64.ActiveCfg = Debug|x64
-		{B5C7E319-4F9D-4A18-9E2A-DCA0E11B7F2D}.Debug|x64.Build.0 = Debug|x64
-		{B5C7E319-4F9D-4A18-9E2A-DCA0E11B7F2D}.Debug|x64.Deploy.0 = Debug|x64
-		{B5C7E319-4F9D-4A18-9E2A-DCA0E11B7F2D}.Release|ARM64.ActiveCfg = Release|ARM64
-		{B5C7E319-4F9D-4A18-9E2A-DCA0E11B7F2D}.Release|ARM64.Build.0 = Release|ARM64
-		{B5C7E319-4F9D-4A18-9E2A-DCA0E11B7F2D}.Release|ARM64.Deploy.0 = Release|ARM64
-		{B5C7E319-4F9D-4A18-9E2A-DCA0E11B7F2D}.Release|x64.ActiveCfg = Release|x64
-		{B5C7E319-4F9D-4A18-9E2A-DCA0E11B7F2D}.Release|x64.Build.0 = Release|x64
-		{B5C7E319-4F9D-4A18-9E2A-DCA0E11B7F2D}.Release|x64.Deploy.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

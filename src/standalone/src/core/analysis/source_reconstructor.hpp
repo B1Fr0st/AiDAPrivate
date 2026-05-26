@@ -176,9 +176,13 @@ inline std::vector<function_info_t> collect_functions(
 		fi.name = exp.name.empty() ? ("ordinal_" + std::to_string(exp.ordinal)) : sanitize_name(exp.name);
 		fi.is_export = true;
 		funcs.push_back(std::move(fi));
+		if (max_functions > 0 && static_cast<int>(funcs.size()) >= max_functions)
+			break;
 	}
 
 	for (auto& sec : pe.sections) {
+		if (max_functions > 0 && static_cast<int>(funcs.size()) >= max_functions)
+			break;
 		if (!(sec.characteristics & 0x20000000)) continue;
 
 		uint64_t sec_start = base + sec.virtual_address;
@@ -186,6 +190,8 @@ inline std::vector<function_info_t> collect_functions(
 		const size_t chunk_size = 0x10000;
 
 		for (uint64_t scan_off = 0; scan_off < sec.virtual_size; scan_off += chunk_size) {
+			if (max_functions > 0 && static_cast<int>(funcs.size()) >= max_functions)
+				break;
 			if (cancelled()) return funcs;
 
 			uint64_t scan_addr = sec_start + scan_off;
@@ -229,6 +235,8 @@ inline std::vector<function_info_t> collect_functions(
 							snprintf(nm, sizeof(nm), "sub_%llX", static_cast<unsigned long long>(target));
 							fi.name = nm;
 							funcs.push_back(std::move(fi));
+							if (max_functions > 0 && static_cast<int>(funcs.size()) >= max_functions)
+								break;
 						}
 					}
 				}
@@ -727,7 +735,8 @@ inline void reconstruct(const reconstruction_config_t& config) {
 		g_state.progress.store(0.01f);
 
 		pe_parser::pe_info_t pe;
-		if (!pe_parser::parse(config.module_base, pe)) {
+		const bool parse_directories = config.include_imports || config.include_exports;
+		if (!pe_parser::parse(config.module_base, pe, parse_directories)) {
 			finish(false, "Failed to parse PE headers at base " + detail::to_hex(config.module_base));
 			return;
 		}
@@ -796,8 +805,7 @@ inline void reconstruct(const reconstruction_config_t& config) {
 
 
 		std::atomic<bool> progress_done{false};
-		std::atomic<bool> progress_thread_exited{false};
-		if (!work_queue::post([&]() {
+		std::thread progress_thread([&]() {
 			while (!progress_done.load(std::memory_order_acquire)) {
 				int done = decompile_count.load(std::memory_order_relaxed);
 				float pct = 0.07f + 0.63f * (static_cast<float>(done) / static_cast<float>(total));
@@ -814,11 +822,7 @@ inline void reconstruct(const reconstruction_config_t& config) {
 
 				std::this_thread::sleep_for(std::chrono::milliseconds(50));
 			}
-			progress_thread_exited.store(true, std::memory_order_release);
-		}))
-		{
-			progress_thread_exited.store(true, std::memory_order_release);
-		}
+		});
 
 
 		std::vector<ghidra_decompiler::ghidra_result_t> batch_results;
@@ -827,8 +831,8 @@ inline void reconstruct(const reconstruction_config_t& config) {
 			entries, batch_results, &decompile_count, &g_state.cancel_requested);
 
 		progress_done.store(true, std::memory_order_release);
-		while (!progress_thread_exited.load(std::memory_order_acquire))
-			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		if (progress_thread.joinable())
+			progress_thread.join();
 
 
 		for (size_t i = 0; i < funcs.size() && i < batch_results.size(); ++i) {

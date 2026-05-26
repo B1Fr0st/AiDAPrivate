@@ -48,7 +48,6 @@ struct launch_result_t {
 	bool        token_restricted = false;
 	bool        integrity_lowered = false;
 	bool        mitigations_applied = false;
-	bool        shadow_fs_registered = false;
 	std::string error;
 };
 

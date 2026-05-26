@@ -476,6 +476,9 @@ static tool_result_t burp_h2_send(const json& params)
     diag::log_tagged_fmt("mcp_burp", "h2_send result ok=%d status=%d latency=%llums err_len=%zu headers=%zu body_len=%zu wire_in=%zu wire_out=%zu",
         (int)r.ok, r.status_code, static_cast<unsigned long long>(r.latency_ms), r.error_msg.size(),
         r.headers.size(), r.body.size(), r.raw_wire_in.size(), r.raw_wire_out.size());
+    if (!r.ok) {
+        return tool_result_t::error(r.error_msg.empty() ? std::string("h2_send_failed") : r.error_msg);
+    }
     return tool_result_t::ok(out);
 }
 

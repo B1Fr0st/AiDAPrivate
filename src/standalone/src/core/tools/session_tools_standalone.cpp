@@ -6,6 +6,7 @@
 #include "../session/session_health.hpp"
 #include "../runtime/standalone_driver.hpp"
 #include "../runtime/run_target.hpp"
+#include "../runtime/guest_lab_bridge.hpp"
 #include "../ui/loading_binary_overlay.hpp"
 #include "../../helpers/diag_log.hpp"
 
@@ -54,6 +55,32 @@ uint32_t parse_pid(const json& v)
 		catch (...) { return 0u; }
 	}
 	return 0u;
+}
+
+bool parse_u32_value(const json& v, uint32_t& out)
+{
+	uint64_t raw = 0;
+	if (v.is_number_unsigned()) {
+		raw = v.get<uint64_t>();
+	} else if (v.is_number_integer()) {
+		int64_t s = v.get<int64_t>();
+		if (s < 0)
+			return false;
+		raw = static_cast<uint64_t>(s);
+	} else if (v.is_string()) {
+		try {
+			const std::string text = v.get<std::string>();
+			if (!text.empty() && text[0] == '-')
+				return false;
+			raw = std::stoull(text, nullptr, 0);
+		} catch (...) {
+			return false;
+		}
+	} else {
+		return false;
+	}
+	out = static_cast<uint32_t>(raw > 0xFFFFFFFFull ? 0xFFFFFFFFu : raw);
+	return true;
 }
 
 bool wait_for_binary_load_quiescent(uint32_t timeout_ms)
@@ -331,6 +358,18 @@ static std::wstring widen(const std::string& s)
 	return out;
 }
 
+static std::string narrow(const std::wstring& s)
+{
+	if (s.empty()) return {};
+	int needed = WideCharToMultiByte(CP_UTF8, 0, s.c_str(),
+		static_cast<int>(s.size()), nullptr, 0, nullptr, nullptr);
+	if (needed <= 0) return {};
+	std::string out(static_cast<size_t>(needed), '\0');
+	WideCharToMultiByte(CP_UTF8, 0, s.c_str(),
+		static_cast<int>(s.size()), out.data(), needed, nullptr, nullptr);
+	return out;
+}
+
 static tool_result_t sessions_run_binary(const json& params)
 {
 	diag::log_tagged_fmt("sess_tools", "sessions_run_binary entry path='%.120s'",
@@ -341,6 +380,8 @@ static tool_result_t sessions_run_binary(const json& params)
 	}
 	run_target::launch_options_t opts;
 	opts.exe_path = widen(params["path"].get<std::string>());
+	opts.isolation = run_target::isolation_t::windows_sandbox;
+	opts.attach_after_resume = false;
 	if (params.contains("args") && params["args"].is_string())
 		opts.args = widen(params["args"].get<std::string>());
 	if (params.contains("working_dir") && params["working_dir"].is_string())
@@ -349,18 +390,19 @@ static tool_result_t sessions_run_binary(const json& params)
 		opts.block_network = params["block_network"].get<bool>();
 	if (params.contains("kill_on_host_exit") && params["kill_on_host_exit"].is_boolean())
 		opts.kill_on_host_exit = params["kill_on_host_exit"].get<bool>();
-	if (params.contains("attach_after_resume") && params["attach_after_resume"].is_boolean())
-		opts.attach_after_resume = params["attach_after_resume"].get<bool>();
-	if (params.contains("memory_cap_mb") && params["memory_cap_mb"].is_number_unsigned())
-		opts.memory_cap_mb = static_cast<uint32_t>(params["memory_cap_mb"].get<uint64_t>());
-	if (params.contains("auto_terminate_sec") && params["auto_terminate_sec"].is_number_unsigned())
-		opts.auto_terminate_sec = static_cast<uint32_t>(params["auto_terminate_sec"].get<uint64_t>());
+	if (params.contains("attach_after_resume") && params["attach_after_resume"].is_boolean()
+	    && params["attach_after_resume"].get<bool>())
+		return tool_result_t::error("sessions_run_binary uses Windows Sandbox and cannot attach the host driver to the guest process.");
+	uint32_t parsed_u32 = 0;
+	if (params.contains("memory_cap_mb") && parse_u32_value(params["memory_cap_mb"], parsed_u32))
+		opts.memory_cap_mb = parsed_u32;
+	if (params.contains("auto_terminate_sec") && parse_u32_value(params["auto_terminate_sec"], parsed_u32))
+		opts.auto_terminate_sec = parsed_u32;
 
 	if (params.contains("isolation") && params["isolation"].is_string()) {
 		std::string iso = params["isolation"].get<std::string>();
-		if (iso == "appcontainer") opts.isolation = run_target::isolation_t::appcontainer;
-		else if (iso == "windows_sandbox") opts.isolation = run_target::isolation_t::windows_sandbox;
-		else opts.isolation = run_target::isolation_t::same_desktop_jobbed;
+		if (iso != "windows_sandbox")
+			return tool_result_t::error("sessions_run_binary no longer supports host execution. Use windows_sandbox for interactive malware lab runs.");
 	}
 
 	run_target::launch_result_t result;
@@ -380,10 +422,14 @@ static tool_result_t sessions_run_binary(const json& params)
 	json root;
 	root["pid"] = result.pid;
 	root["firewall_rule_name"] = result.firewall_rule_name;
-	root["attached"] = (opts.attach_after_resume && result.pid != 0);
+	root["sandbox_dir"] = narrow(result.sandbox_dir);
+	root["guest_lab_active"] = guest_lab::is_active();
+	root["guest_bridge_dir"] = narrow(guest_lab::current().bridge_dir);
+	root["attached"] = false;
 	diag::log_tagged_fmt("sess_tools",
 		"sessions_run_binary launched pid=%u",
 		result.pid);
+	run_target::cleanup(result);
 	return tool_result_t::ok(root);
 }
 
@@ -440,15 +486,15 @@ void register_session_tools(mcp_standalone::server_t& srv)
 
 	srv.register_tool({
 		"sessions_run_binary",
-		"Launch a binary inside an isolation container (default: same-desktop jobbed with firewall block) and optionally attach to it. Returns the new pid.",
+		"Launch a binary inside an interactive Windows Sandbox VM. Host execution and host driver attach are disabled for malware safety.",
 		{
 			{"path", "string", "Absolute path to the binary to launch", true},
 			{"args", "string", "Command-line arguments (optional)", false},
-			{"working_dir", "string", "Working directory (optional)", false},
-			{"isolation", "string", "Isolation level: same_desktop_jobbed | appcontainer | windows_sandbox", false},
+			{"working_dir", "string", "Ignored for Windows Sandbox runs; the sample starts from the VM input folder", false},
+			{"isolation", "string", "Isolation level: windows_sandbox", false},
 			{"block_network", "boolean", "Block all outbound network traffic from the target (default true)", false},
 			{"kill_on_host_exit", "boolean", "Kill the target when AiDAStandalone exits (default true)", false},
-			{"attach_after_resume", "boolean", "Auto-attach as a live session after launch (default true)", false},
+			{"attach_after_resume", "boolean", "Must be false because the process runs inside the VM", false},
 			{"memory_cap_mb", "number", "Hard memory cap in MiB (0 = unlimited)", false},
 			{"auto_terminate_sec", "number", "Kill the target after this many seconds (0 = never)", false}
 		},
