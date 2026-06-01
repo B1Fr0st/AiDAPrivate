@@ -22,6 +22,77 @@ namespace dbg_capture {
 
     static const wchar_t* const kLogPath = L"\\??\\C:\\Users\\Public\\Desktop\\aida_kernel.log";
 
+    static BOOLEAN is_hex_digit_char(char c)
+    {
+        return (c >= '0' && c <= '9') ||
+               (c >= 'a' && c <= 'f') ||
+               (c >= 'A' && c <= 'F');
+    }
+
+    static BOOLEAN token_matches(const char* text, const char* token)
+    {
+        while (*token) {
+            if (*text++ != *token++) return FALSE;
+        }
+        return TRUE;
+    }
+
+    static SIZE_T token_length(const char* token)
+    {
+        SIZE_T len = 0;
+        while (token[len]) ++len;
+        return len;
+    }
+
+    static void redact_labeled_hex_values(char* text)
+    {
+        static const char* const labels[] = {
+            "session_key=0x", "session=0x", "g_session=0x",
+            "magic=0x", "expected=0x", "received=0x",
+            "existing=0x", "new=0x", "hb_key=0x",
+            "key=0x", "proof=0x", "nonce=0x",
+            "token=0x", "challenge=0x", "response=0x",
+            "raw_cmd=0x", "raw_param=0x", "enc_cmd=0x", "enc_param=0x"
+        };
+
+        for (char* p = text; p && *p; ++p) {
+            for (ULONG i = 0; i < RTL_NUMBER_OF(labels); ++i) {
+                if (!token_matches(p, labels[i])) continue;
+                char* v = p + token_length(labels[i]);
+                while (*v && is_hex_digit_char(*v)) {
+                    *v++ = 'x';
+                }
+                break;
+            }
+        }
+    }
+
+    static void redact_long_hex_runs(char* text)
+    {
+        char* p = text;
+        while (p && *p) {
+            char* start = p;
+            ULONG hex_count = 0;
+            while (*p && (is_hex_digit_char(*p) || *p == '`')) {
+                if (is_hex_digit_char(*p)) ++hex_count;
+                ++p;
+            }
+            if (hex_count >= 12) {
+                for (char* q = start; q < p; ++q) {
+                    if (is_hex_digit_char(*q)) *q = 'x';
+                }
+            }
+            if (p == start) ++p;
+        }
+    }
+
+    static void scrub_message(char* text)
+    {
+        if (!text) return;
+        redact_labeled_hex_values(text);
+        redact_long_hex_runs(text);
+    }
+
     static void copy_into_ring_locked(const char* data, ULONG len)
     {
         ULONG wpos = g_write_pos;
@@ -93,6 +164,7 @@ namespace dbg_capture {
 
         size_t out_len = 0;
         if (!NT_SUCCESS(RtlStringCbLengthA(buf, sizeof(buf), &out_len))) return;
+        scrub_message(buf);
         push_raw(buf, static_cast<ULONG>(out_len));
     }
 
@@ -156,6 +228,58 @@ namespace dbg_capture {
                 g_flush_buffer, snapshot_len, &offset_li, NULL);
             ZwClose(hFile);
         }
+    }
+
+    static void write_immediate_raw(const char* data, ULONG len)
+    {
+        if (!data || len == 0 || KeGetCurrentIrql() != PASSIVE_LEVEL) return;
+
+        UNICODE_STRING path;
+        RtlInitUnicodeString(&path, kLogPath);
+
+        OBJECT_ATTRIBUTES oa;
+        InitializeObjectAttributes(&oa, &path,
+            OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+        HANDLE hFile = nullptr;
+        IO_STATUS_BLOCK iosb = {};
+        NTSTATUS st = ZwCreateFile(
+            &hFile,
+            FILE_APPEND_DATA | SYNCHRONIZE,
+            &oa,
+            &iosb,
+            NULL,
+            FILE_ATTRIBUTE_NORMAL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            FILE_OPEN_IF,
+            FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+            NULL, 0);
+
+        if (NT_SUCCESS(st) && hFile) {
+            LARGE_INTEGER offset_li;
+            offset_li.HighPart = -1;
+            offset_li.LowPart = FILE_WRITE_TO_END_OF_FILE;
+            ZwWriteFile(hFile, NULL, NULL, NULL, &iosb,
+                const_cast<char*>(data), len, &offset_li, NULL);
+            ZwClose(hFile);
+        }
+    }
+
+    void write_immediate_formatted(const char* fmt, ...)
+    {
+        if (!fmt) return;
+
+        char buf[kMaxMessageLen];
+        va_list ap;
+        va_start(ap, fmt);
+        NTSTATUS s = RtlStringCbVPrintfA(buf, sizeof(buf), fmt, ap);
+        va_end(ap);
+        if (!NT_SUCCESS(s) && s != STATUS_BUFFER_OVERFLOW) return;
+
+        size_t out_len = 0;
+        if (!NT_SUCCESS(RtlStringCbLengthA(buf, sizeof(buf), &out_len))) return;
+        scrub_message(buf);
+        write_immediate_raw(buf, static_cast<ULONG>(out_len));
     }
 
     static VOID NTAPI drain_thread_routine(PVOID context)

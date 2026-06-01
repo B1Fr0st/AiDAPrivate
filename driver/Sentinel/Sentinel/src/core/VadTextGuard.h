@@ -91,6 +91,8 @@ namespace vad_text_guard {
 
     __forceinline void check(HANDLE client_pid)
     {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+            return;
         UINT64 text_base = g_text_base;
         UINT64 text_size = g_text_size;
         if (!text_base || !text_size || !client_pid)

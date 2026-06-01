@@ -3,17 +3,18 @@
 const crypto = require('crypto');
 const pool = require('../db/pool');
 const canonicalResponse = require('../crypto/canonical_response');
+const sessionAead = require('../crypto/session_aead');
 
 const RATCHET_VERIFY_LABEL = Buffer.from('auth', 'utf8');
 const RATCHET_INFO_LABEL = 'ratchet|';
 const RATCHET_BOOTSTRAP_LABEL = Buffer.from('aida_session_ratchet/v1/bootstrap', 'utf8');
 const RATCHET_VERIFY_TOKEN_LABEL = Buffer.from('aida_session_ratchet/v1/verify', 'utf8');
+const MAX_SESSION_TOKEN_LEN = 1024;
 
-function isHexString(value, minLen, maxLen) {
+function isSessionTokenFormat(value) {
     if (typeof value !== 'string') return false;
-    if (typeof minLen === 'number' && value.length < minLen) return false;
-    if (typeof maxLen === 'number' && value.length > maxLen) return false;
-    return /^[0-9a-fA-F]+$/.test(value);
+    if (value.length < 32 || value.length > MAX_SESSION_TOKEN_LEN) return false;
+    return sessionAead.isSealedFormat(value);
 }
 
 function deriveBootstrapSecret(sessionToken) {
@@ -146,7 +147,7 @@ function enforce(options) {
                 if (!required) return next();
                 return res.status(401).json({ error: 'session_ratchet_mismatch' });
             }
-            if (!isHexString(sessionToken, 16, 256)) {
+            if (!isSessionTokenFormat(sessionToken)) {
                 return res.status(401).json({ error: 'session_ratchet_mismatch' });
             }
             const row = await loadOrBootstrap(sessionToken, licenseKey);
@@ -183,4 +184,8 @@ module.exports = {
     bootstrapForSession,
     deriveBootstrapSecret,
     deriveExpectedToken,
+    _internal: {
+        isSessionTokenFormat,
+        MAX_SESSION_TOKEN_LEN,
+    },
 };

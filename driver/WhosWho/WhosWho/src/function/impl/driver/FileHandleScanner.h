@@ -29,6 +29,11 @@ namespace file_handle_scanner {
     inline volatile LONG g_scanner_active = 0;
     inline KTIMER g_scan_timer = {};
     inline KDPC g_scan_dpc = {};
+    inline WORK_QUEUE_ITEM g_scan_work_item = {};
+    inline KEVENT g_scan_work_done = {};
+    inline volatile LONG g_scan_work_sync_initialized = 0;
+    inline volatile LONG g_scan_work_queued = 0;
+    inline volatile LONG g_scan_work_running = 0;
 
     inline UNICODE_STRING g_our_device_name = {};
     inline WCHAR g_our_device_buf[128] = {};
@@ -50,6 +55,11 @@ namespace file_handle_scanner {
                 break;
             }
         }
+    }
+
+    __forceinline void ensure_work_sync_initialized() {
+        if (_InterlockedCompareExchange(&g_scan_work_sync_initialized, 1, 0) == 0)
+            KeInitializeEvent(&g_scan_work_done, NotificationEvent, TRUE);
     }
 
     __forceinline bool _match_tool(const char* image_name) {
@@ -92,6 +102,8 @@ namespace file_handle_scanner {
     }
 
     __forceinline void scan_file_handles() {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+            return;
         if (!_PsLookupProcessByProcessId || !_ObfDereferenceObject)
             return;
 
@@ -225,6 +237,8 @@ namespace file_handle_scanner {
     }
 
     __forceinline void scan_vad_sections() {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+            return;
         if (!_PsLookupProcessByProcessId || !_ObfDereferenceObject || !_MmIsAddressValid)
             return;
 
@@ -372,13 +386,17 @@ namespace file_handle_scanner {
     }
 
     __forceinline void NTAPI scan_work_routine(PVOID) {
+        _InterlockedExchange(&g_scan_work_running, 1);
         __try {
-            scan_file_handles();
-            scan_vad_sections();
+            if (_InterlockedCompareExchange(&g_scanner_active, 1, 1) == 1) {
+                scan_file_handles();
+                scan_vad_sections();
+            }
         } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        _InterlockedExchange(&g_scan_work_running, 0);
+        _InterlockedExchange(&g_scan_work_queued, 0);
+        KeSetEvent(&g_scan_work_done, IO_NO_INCREMENT, FALSE);
     }
-
-    inline WORK_QUEUE_ITEM g_scan_work_item = {};
 
     static void NTAPI scan_dpc_callback(
         PKDPC,
@@ -388,7 +406,11 @@ namespace file_handle_scanner {
     {
         if (!_InterlockedCompareExchange(&g_scanner_active, 0, 0))
             return;
+        ensure_work_sync_initialized();
+        if (_InterlockedCompareExchange(&g_scan_work_queued, 1, 0) != 0)
+            return;
 
+        KeClearEvent(&g_scan_work_done);
         ExInitializeWorkItem(&g_scan_work_item,
             (PWORKER_THREAD_ROUTINE)scan_work_routine, nullptr);
         ExQueueWorkItem(&g_scan_work_item, DelayedWorkQueue);
@@ -397,6 +419,10 @@ namespace file_handle_scanner {
     __forceinline void start(ULONG interval_seconds = 30) {
         if (_InterlockedCompareExchange(&g_scanner_active, 1, 0) != 0)
             return;
+        ensure_work_sync_initialized();
+        _InterlockedExchange(&g_scan_work_queued, 0);
+        _InterlockedExchange(&g_scan_work_running, 0);
+        KeSetEvent(&g_scan_work_done, IO_NO_INCREMENT, FALSE);
 
         KeInitializeTimer(&g_scan_timer);
         KeInitializeDpc(&g_scan_dpc, scan_dpc_callback, nullptr);
@@ -412,6 +438,15 @@ namespace file_handle_scanner {
     __forceinline void stop() {
         _InterlockedExchange(&g_scanner_active, 0);
         KeCancelTimer(&g_scan_timer);
+        KeFlushQueuedDpcs();
+        ensure_work_sync_initialized();
+        if (KeGetCurrentIrql() == PASSIVE_LEVEL &&
+            (_InterlockedCompareExchange(&g_scan_work_queued, 0, 0) != 0 ||
+             _InterlockedCompareExchange(&g_scan_work_running, 0, 0) != 0)) {
+            LARGE_INTEGER timeout;
+            timeout.QuadPart = -50'000'000LL;
+            KeWaitForSingleObject(&g_scan_work_done, Executive, KernelMode, FALSE, &timeout);
+        }
         WW_LOG("FileHandleScanner: stopped");
     }
 }

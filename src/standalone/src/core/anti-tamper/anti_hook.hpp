@@ -468,6 +468,20 @@ namespace veh_chain {
         return v;
     }
 
+    inline bool pointer_readable(const void* p, size_t bytes)
+    {
+        if (!p || bytes == 0) return false;
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery(p, &mbi, sizeof(mbi)))
+            return false;
+        if (mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_NOACCESS) || (mbi.Protect & PAGE_GUARD))
+            return false;
+        uintptr_t start = reinterpret_cast<uintptr_t>(p);
+        uintptr_t end = start + bytes;
+        uintptr_t region_end = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+        return end >= start && end <= region_end;
+    }
+
     inline uint64_t locate_veh_list_head()
     {
         HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
@@ -524,6 +538,8 @@ namespace veh_chain {
         }
 
         auto* head = reinterpret_cast<_VECTORED_HANDLER_LIST*>(head_addr);
+        if (!pointer_readable(head, sizeof(_VECTORED_HANDLER_LIST)))
+            return false;
 
         __try
         {
@@ -531,7 +547,11 @@ namespace veh_chain {
             uint32_t guard = 0;
             while (cursor != &head->ListHead && guard < 256)
             {
+                if (!pointer_readable(cursor, sizeof(LIST_ENTRY)))
+                    return false;
                 auto* entry = CONTAINING_RECORD(cursor, _VECTORED_HANDLER_ENTRY, Entry);
+                if (!pointer_readable(entry, sizeof(_VECTORED_HANDLER_ENTRY)))
+                    return false;
                 handlers.push_back(reinterpret_cast<uint64_t>(entry->VectoredHandler));
                 cursor = cursor->Flink;
                 ++guard;

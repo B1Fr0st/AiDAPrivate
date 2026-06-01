@@ -12,7 +12,6 @@ endif()
 
 add_executable(DAG_DISPATCH_TEST
     "${CMAKE_CURRENT_SOURCE_DIR}/dag_dispatch_test.cpp"
-    "${CMAKE_SOURCE_DIR}/src/shared/hardware_id/hardware_id.cpp"
     "${CMAKE_SOURCE_DIR}/src/shared/hardware_id/hardware_id_v2.cpp"
 )
 

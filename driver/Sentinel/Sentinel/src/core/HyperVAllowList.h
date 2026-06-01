@@ -12,6 +12,30 @@ namespace hv_allow_list {
         if (_InterlockedCompareExchange(&g_checked, 0, 0) != 0)
             return;
 
+        __try {
+            struct {
+                BOOLEAN SecureKernelRunning;
+                BOOLEAN HvciEnabled;
+                BOOLEAN HvciStrictMode;
+                BOOLEAN DebugEnabled;
+                BOOLEAN FirmwarePageProtection;
+                BOOLEAN EncryptionKeyAvailable;
+                BOOLEAN SpareFlags;
+                BOOLEAN TrustletRunning;
+                BOOLEAN HvciDisableAllowed;
+                BOOLEAN Reserved[7];
+            } ium = {};
+
+            ULONG ret = 0;
+            NTSTATUS st = ZwQuerySystemInformation(
+                static_cast<SYSTEM_INFORMATION_CLASS_INTERNAL>(0xA5),
+                &ium, sizeof(ium), &ret);
+
+            if (NT_SUCCESS(st) && (ium.SecureKernelRunning || ium.HvciEnabled)) {
+                _InterlockedExchange(&g_has_vbs, 1);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
         int regs[4] = {};
         __cpuid(regs, 1);
         if ((regs[2] & (1 << 31)) == 0) {
@@ -60,30 +84,6 @@ namespace hv_allow_list {
         }
 
         _InterlockedExchange(&g_is_ms_hv_root, 1);
-
-        __try {
-            struct {
-                BOOLEAN SecureKernelRunning;
-                BOOLEAN HvciEnabled;
-                BOOLEAN HvciStrictMode;
-                BOOLEAN DebugEnabled;
-                BOOLEAN FirmwarePageProtection;
-                BOOLEAN EncryptionKeyAvailable;
-                BOOLEAN SpareFlags;
-                BOOLEAN TrustletRunning;
-                BOOLEAN HvciDisableAllowed;
-                BOOLEAN Reserved[7];
-            } ium = {};
-
-            ULONG ret = 0;
-            NTSTATUS st = ZwQuerySystemInformation(
-                static_cast<SYSTEM_INFORMATION_CLASS_INTERNAL>(0xA5),
-                &ium, sizeof(ium), &ret);
-
-            if (NT_SUCCESS(st) && (ium.SecureKernelRunning || ium.HvciEnabled)) {
-                _InterlockedExchange(&g_has_vbs, 1);
-            }
-        } __except (EXCEPTION_EXECUTE_HANDLER) {}
 
         _InterlockedExchange(&g_checked, 1);
     }

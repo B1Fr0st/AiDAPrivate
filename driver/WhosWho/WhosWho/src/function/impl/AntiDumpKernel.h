@@ -12,6 +12,35 @@ namespace anti_dump_kernel {
 
     inline volatile LONG g_permitted_pids[8] = {};
 
+    inline NTSTATUS hide_thread_object_from_debugger(PETHREAD thread)
+    {
+        if (!thread || !_ObOpenObjectByPointer || !_ZwSetInformationThread ||
+            !PsThreadType || !*PsThreadType)
+            return STATUS_NOT_SUPPORTED;
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+            return STATUS_INVALID_DEVICE_STATE;
+
+        HANDLE thread_handle = nullptr;
+        NTSTATUS status = _ObOpenObjectByPointer(
+            thread,
+            OBJ_KERNEL_HANDLE,
+            nullptr,
+            THREAD_SET_INFORMATION,
+            *PsThreadType,
+            KernelMode,
+            &thread_handle);
+        if (!NT_SUCCESS(status))
+            return status;
+
+        status = _ZwSetInformationThread(
+            thread_handle,
+            0x11u,
+            nullptr,
+            0);
+        _ZwClose(thread_handle);
+        return status;
+    }
+
     inline bool is_permitted_pid(UINT32 pid)
     {
         if (pid == 0) return false;
@@ -157,10 +186,9 @@ namespace anti_dump_kernel {
         __try {
             PETHREAD thread = nullptr;
             while ((thread = _PsGetNextProcessThread(process, thread)) != nullptr) {
-                UINT8* thread_ptr = (UINT8*)thread;
-                volatile ULONG* cross_flags = (volatile ULONG*)(thread_ptr + 0x74);
-                InterlockedOr((volatile LONG*)cross_flags, 0x4);
-                hidden++;
+                NTSTATUS hs = hide_thread_object_from_debugger(thread);
+                if (NT_SUCCESS(hs))
+                    hidden++;
             }
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -175,6 +203,8 @@ namespace anti_dump_kernel {
 
     inline NTSTATUS erase_pe_headers(UINT32 pid)
     {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
+
         PEPROCESS process = nullptr;
         NTSTATUS status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &process);
         if (!NT_SUCCESS(status))
@@ -239,6 +269,8 @@ namespace anti_dump_kernel {
 
     inline NTSTATUS corrupt_section_headers(UINT32 pid)
     {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
+
         PEPROCESS process = nullptr;
         NTSTATUS status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &process);
         if (!NT_SUCCESS(status)) return status;
@@ -290,6 +322,8 @@ namespace anti_dump_kernel {
 
     inline NTSTATUS scramble_peb_loader_data(UINT32 pid)
     {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
+
         PEPROCESS process = nullptr;
         NTSTATUS status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &process);
         if (!NT_SUCCESS(status)) return status;
@@ -333,6 +367,8 @@ namespace anti_dump_kernel {
 
     inline NTSTATUS full_protect(UINT32 pid)
     {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
+
         NTSTATUS status;
 
         status = register_handle_filter(pid);
@@ -468,7 +504,7 @@ namespace continuous_anti_dump {
             return;
         }
 
-        {
+        __try {
             UINT32 pid = g_target_pid;
             if (pid == 0) {
                 _InterlockedExchange(&g_work_item_queued, 0);
@@ -496,6 +532,9 @@ namespace continuous_anti_dump {
                 anti_dump_kernel::scramble_peb_loader_data(pid);
             }
         }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            WW_LOG("continuous_admp: work_exception");
+        }
 
         _InterlockedExchange(&g_work_item_queued, 0);
     }
@@ -511,7 +550,10 @@ namespace continuous_anti_dump {
 
         if (_InterlockedCompareExchange(&g_work_item_queued, 1, 0) == 0) {
             ExInitializeWorkItem(&g_work_item, work_item_callback, nullptr);
-            _ExQueueWorkItem(&g_work_item, DelayedWorkQueue);
+            if (_ExQueueWorkItem)
+                _ExQueueWorkItem(&g_work_item, DelayedWorkQueue);
+            else
+                ExQueueWorkItem(&g_work_item, DelayedWorkQueue);
         }
     }
 

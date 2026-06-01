@@ -3,6 +3,7 @@
 #ifdef __NT__
 #include "../driver/comm.h"
 #include <nlohmann/json.hpp>
+#include <exception>
 #include <wincrypt.h>
 #include <shlobj.h>
 #include <bcrypt.h>
@@ -1607,23 +1608,28 @@ bool TlsKeyExtractor::start_keylog(const keylog_config_t& config) {
     _keylog_config = config;
     _keylog_active.store(true);
 
-    _keylog_thread = std::thread([this]() {
-        while (_keylog_active.load()) {
-            tls_key_scan_config_t scan_cfg;
-            scan_cfg.pid = _keylog_config.pid;
+    try {
+        _keylog_thread = std::thread([this]() {
+            while (_keylog_active.load()) {
+                tls_key_scan_config_t scan_cfg;
+                scan_cfg.pid = _keylog_config.pid;
 
-            auto keys = extract_keys(scan_cfg);
-            if (!keys.empty()) {
-                write_keylog_file(_keylog_config.output_file, keys, _keylog_config.append);
-            }
+                auto keys = extract_keys(scan_cfg);
+                if (!keys.empty()) {
+                    write_keylog_file(_keylog_config.output_file, keys, _keylog_config.append);
+                }
 
-            for (std::uint32_t elapsed = 0;
-                 elapsed < _keylog_config.poll_interval_ms && _keylog_active.load();
-                 elapsed += 50) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                for (std::uint32_t elapsed = 0;
+                     elapsed < _keylog_config.poll_interval_ms && _keylog_active.load();
+                     elapsed += 50) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                }
             }
-        }
-    });
+        });
+    } catch (...) {
+        _keylog_active.store(false);
+        return false;
+    }
 
     return true;
 }
@@ -2830,19 +2836,20 @@ bool AutoResponder::start() {
 
     _active.store(true);
 
-    _responder_thread = std::thread([this]() {
-        while (_active.load()) {
-            if (!device || !device->is_connected()) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                continue;
-            }
-
-            auto held = device->get_held_packets();
-            for (const auto& pkt : held) {
-                if (pkt.payload.empty()) {
-                    device->intercept_op(3, 0, 0, 0, pkt.hold_id, nullptr, 0, nullptr, nullptr);
+    try {
+        _responder_thread = std::thread([this]() {
+            while (_active.load()) {
+                if (!device || !device->is_connected()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
                     continue;
                 }
+
+                auto held = device->get_held_packets();
+                for (const auto& pkt : held) {
+                    if (pkt.payload.empty()) {
+                        device->intercept_op(3, 0, 0, 0, pkt.hold_id, nullptr, 0, nullptr, nullptr);
+                        continue;
+                    }
 
                 if (pkt.payload.size() > 5 && pkt.payload[0] == 0x16) {
                     std::string sni = extract_tls_sni(pkt.payload.data(), pkt.payload.size());
@@ -2960,9 +2967,15 @@ bool AutoResponder::start() {
                 }
             }
 
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
-    });
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        });
+    } catch (...) {
+        _active.store(false);
+        if (device && device->is_connected())
+            device->intercept_op(2, 0, 0, 0);
+        return false;
+    }
 
     return true;
 }

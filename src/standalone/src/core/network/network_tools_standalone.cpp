@@ -13,6 +13,7 @@
 #include "page_guard_engine.hpp"
 #include "packet_callstack.hpp"
 #include "pre_encrypt_hook.hpp"
+#include "api_monitor.hpp"
 #include "display_filter.hpp"
 #include "protobuf_codec.hpp"
 #include "network_view.hpp"
@@ -1811,6 +1812,76 @@ tool_result_t network_export_pcap(const json& params)
     return tool_result_t::ok(std::to_string(pcap.packets.size()) + OBFSTR(" packets exported to ") + path, r);
 }
 
+tool_result_t api_monitor_start(const json& params)
+{
+    if (!params.contains("apis") || !params["apis"].is_array())
+        return tool_result_t::error(OBFSTR("Missing required parameter: apis"));
+
+    std::vector<api_monitor::api_request_t> apis;
+    apis.reserve(params["apis"].size());
+    for (const auto& item : params["apis"]) {
+        api_monitor::api_request_t request;
+        std::string error;
+        if (!api_monitor::parse_request_json(item, request, error))
+            return tool_result_t::error(OBFSTR("Invalid apis entry: ") + error);
+        apis.push_back(std::move(request));
+    }
+
+    uint32_t pid = 0;
+    if (params.contains("pid")) {
+        if (params["pid"].is_number_unsigned()) {
+            const auto raw = params["pid"].get<uint64_t>();
+            if (raw <= UINT32_MAX)
+                pid = static_cast<uint32_t>(raw);
+        } else if (params["pid"].is_number_integer()) {
+            const auto raw = params["pid"].get<int64_t>();
+            if (raw > 0 && raw <= UINT32_MAX)
+                pid = static_cast<uint32_t>(raw);
+        } else if (params["pid"].is_string()) {
+            uint64_t parsed = 0;
+            if (api_monitor::parse_u64(params["pid"].get<std::string>(), parsed) && parsed <= UINT32_MAX)
+                pid = static_cast<uint32_t>(parsed);
+        }
+    }
+
+    const bool log_callstack = params.value("log_callstack", false);
+    const bool capture_buffer = params.value("capture_buffer", true);
+    uint32_t max_capture_bytes = params.value("max_capture_bytes", static_cast<uint32_t>(256));
+    size_t max_events = params.value("max_events", static_cast<size_t>(4096));
+
+    diag::log_tagged_fmt("net_tools", "api_monitor_start pid=%u apis=%zu callstack=%d capture=%d max_bytes=%u",
+        pid, apis.size(), log_callstack ? 1 : 0, capture_buffer ? 1 : 0, max_capture_bytes);
+
+    json summary = json::object();
+    std::string error;
+    if (!api_monitor::start(pid, apis, log_callstack, capture_buffer, max_capture_bytes, max_events, summary, error)) {
+        diag::log_tagged_fmt("net_tools", "api_monitor_start failed pid=%u error=%s", pid, error.c_str());
+        return tool_result_t::error(error);
+    }
+
+    const int resolved_count = summary.contains("resolved") && summary["resolved"].is_array()
+        ? static_cast<int>(summary["resolved"].size()) : 0;
+    diag::log_tagged_fmt("net_tools", "api_monitor_start active resolved=%d", resolved_count);
+    return tool_result_t::ok(OBFSTR("API monitor started with ") + std::to_string(resolved_count) + OBFSTR(" resolved API target(s)"), summary);
+}
+
+tool_result_t api_monitor_results(const json& params)
+{
+    size_t limit = params.value("limit", static_cast<size_t>(64));
+    std::string filter_api;
+    if (params.contains("filter_api") && params["filter_api"].is_string())
+        filter_api = params["filter_api"].get<std::string>();
+    const bool clear_after = params.value("clear", false);
+    const bool stop_after = params.value("stop", false);
+
+    diag::log_tagged_fmt("net_tools", "api_monitor_results limit=%zu filter=%s clear=%d stop=%d",
+        limit, filter_api.c_str(), clear_after ? 1 : 0, stop_after ? 1 : 0);
+
+    json result = api_monitor::results(limit, filter_api, clear_after, stop_after);
+    const int count = result.value("count", 0);
+    return tool_result_t::ok(std::to_string(count) + OBFSTR(" API monitor event(s)"), result);
+}
+
 void register_network_tools(mcp_standalone::server_t& srv) {
     diag::log_tagged("net_tools", "register_network_tools entry");
         aida::burp::register_all_tools(srv);
@@ -2709,6 +2780,36 @@ void register_network_tools(mcp_standalone::server_t& srv) {
             }
             return tool_result_t::error("Unknown operation '" + op + "'. Use enable|disable|get|recent|clear");
         }, true});
+
+    register_compat(srv, {
+        OBFSTR("api_monitor_start"), OBFSTR("network"),
+        OBFSTR("Start a native dynamic API monitor for an attached x64 target process. "
+               "Resolves requested APIs such as ws2_32.dll!send, ws2_32.dll!WSASend, "
+               "kernel32.dll!DeviceIoControl, or ntdll.dll!NtDeviceIoControlFile in the target, "
+               "programs hardware execute breakpoints through the existing driver bridge, and "
+               "records calls in a background debug-event loop without patching target code. "
+               "Captured events include API name, timestamp, thread, return address, caller module "
+               "where resolvable, handle/socket/IOCTL metadata, and bounded hex buffers for outbound "
+               "or input buffers where obtainable."),
+        {{OBFSTR("apis"), OBFSTR("array"), OBFSTR("Array of API specs like 'ws2_32.dll!send' or objects with api, buffer_kind, buffer_reg, size_reg"), true},
+         {OBFSTR("pid"), OBFSTR("number"), OBFSTR("Target PID. Defaults to the currently attached driver target"), false},
+         {OBFSTR("log_callstack"), OBFSTR("boolean"), OBFSTR("Capture a bounded callstack for each API hit"), false},
+         {OBFSTR("capture_buffer"), OBFSTR("boolean"), OBFSTR("Read bounded input/outbound buffers from the target process"), false},
+         {OBFSTR("max_capture_bytes"), OBFSTR("number"), OBFSTR("Maximum bytes captured per buffer, capped at 2048"), false},
+         {OBFSTR("max_events"), OBFSTR("number"), OBFSTR("Maximum buffered events, capped at 16384"), false}},
+        api_monitor_start, false});
+
+    register_compat(srv, {
+        OBFSTR("api_monitor_results"), OBFSTR("network"),
+        OBFSTR("Return buffered native API monitor events. Results can be filtered by API name and "
+               "include exact return addresses, caller address when direct-call decoding is possible, "
+               "register snapshots, endpoint/handle/IOCTL metadata, and bounded hex buffer captures. "
+               "Optional clear drains buffered events; optional stop tears down the active monitor."),
+        {{OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum events to return, capped at 512"), false},
+         {OBFSTR("filter_api"), OBFSTR("string"), OBFSTR("Case-insensitive substring filter for API name"), false},
+         {OBFSTR("clear"), OBFSTR("boolean"), OBFSTR("Clear buffered events after reading"), false},
+         {OBFSTR("stop"), OBFSTR("boolean"), OBFSTR("Stop the active monitor after reading results"), false}},
+        api_monitor_results, false});
 
     register_compat(srv, {
         OBFSTR("network_pre_encrypt_hook"), OBFSTR("network"),

@@ -2535,13 +2535,8 @@ inline packed_section_layout_t build_packed_section(pe_file::pe_image_t& pe,
                     stub_code.data(), stub_code.size());
     }
 
-    char packed_name[8] = { 0 };
-    for (int i = 0; i < 7; ++i) {
-        uint8_t r;
-        rng.get(&r, 1);
-        packed_name[i] = static_cast<char>('A' + (r % 26u));
-    }
-    packed_name[7] = '\0';
+    (void)rng;
+    char packed_name[8] = { '.', 'p', 'a', 'c', 'k', 'e', 'd', 0 };
 
     uint32_t packed_chars = IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE | IMAGE_SCN_MEM_EXECUTE
                             | IMAGE_SCN_CNT_CODE | IMAGE_SCN_CNT_INITIALIZED_DATA;
@@ -3985,10 +3980,17 @@ inline bool apply_merge_sections(pe_file::pe_image_t& pe, uint64_t seed) {
     }
     const auto& last = pe.sections[pe.sections.size() - 1];
     const auto& prev = pe.sections[pe.sections.size() - 2];
-    if (section_skip_list::name_equals(last.name, ".dseal") ||
+    uint32_t last_magic = 0;
+    if (last.data.size() >= sizeof(last_magic)) {
+        std::memcpy(&last_magic, last.data.data(), sizeof(last_magic));
+    }
+    if (section_skip_list::name_equals(last.name, ".packed") ||
+        last_magic == kPackedMagic ||
+        section_skip_list::name_equals(last.name, ".dseal") ||
         section_skip_list::name_equals(last.name, ".dthunk") ||
         section_skip_list::name_equals(last.name, ".licbind") ||
         section_skip_list::name_equals(last.name, ".feat") ||
+        section_skip_list::name_equals(prev.name, ".packed") ||
         section_skip_list::name_equals(prev.name, ".dseal") ||
         section_skip_list::name_equals(prev.name, ".dthunk") ||
         section_skip_list::name_equals(prev.name, ".licbind") ||
@@ -4116,6 +4118,31 @@ inline bool patch_aux_signature(pe_file::pe_image_t& pe,
     std::memcpy(&aux, sec->data.data() + layout.aux_offset, sizeof(aux_block_t));
     aux.polymorphic_build_nonce = build_nonce;
     aux.stub_signature_tag = stub_signature_tag;
+    std::memcpy(sec->data.data() + layout.aux_offset, &aux, sizeof(aux_block_t));
+    return true;
+}
+
+inline bool patch_aux_phase_flags(pe_file::pe_image_t& pe,
+                                  uint32_t packed_section_rva,
+                                  const packed_section_layout_t& layout,
+                                  uint32_t clear_mask,
+                                  uint32_t set_mask) {
+    pe_file::section_t* sec = pe.section_from_rva(packed_section_rva);
+    if (sec == nullptr) {
+        return false;
+    }
+    if (layout.aux_offset == 0u) {
+        return false;
+    }
+    if (static_cast<size_t>(layout.aux_offset) + sizeof(aux_block_t) > sec->data.size()) {
+        return false;
+    }
+    aux_block_t aux{};
+    std::memcpy(&aux, sec->data.data() + layout.aux_offset, sizeof(aux_block_t));
+    if (aux.magic != kAuxMagic || aux.version != kAuxVersion) {
+        return false;
+    }
+    aux.phase_flags = (aux.phase_flags & ~clear_mask) | set_mask;
     std::memcpy(sec->data.data() + layout.aux_offset, &aux, sizeof(aux_block_t));
     return true;
 }

@@ -20,6 +20,7 @@
 #include "imgui/imgui.h"
 #include "components.hpp"
 #include "theme.hpp"
+#include "../core/infra/work_queue.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -118,7 +119,21 @@ void file_browser::refresh(const std::string& dir)
         }
     };
 
-    local::scan(current_dir, 0, expanded_paths, entries);
+    try {
+        local::scan(current_dir, 0, expanded_paths, entries);
+    }
+    catch (const std::exception& ex) {
+        entries.clear();
+        needs_refresh = false;
+        diag::log_tagged_fmt("file_browser", "refresh_exception dir=%s err=%s",
+            current_dir.c_str(), ex.what());
+    }
+    catch (...) {
+        entries.clear();
+        needs_refresh = false;
+        diag::log_tagged_fmt("file_browser", "refresh_exception_unknown dir=%s",
+            current_dir.c_str());
+    }
 }
 
 
@@ -560,7 +575,7 @@ struct watcher_t {
     std::atomic<bool>       running{false};
     std::atomic<bool>       stop{false};
     std::atomic<bool>       has_change{false};
-    std::thread             th;
+    std::atomic<bool>       worker_done{true};
     std::string             watched_dir;
     HANDLE                  wake_event = nullptr;
     std::mutex              mtx;
@@ -577,10 +592,11 @@ inline void stop_watcher_locked(watcher_t& w)
     if (!w.running.load(std::memory_order_acquire)) return;
     w.stop.store(true, std::memory_order_release);
     if (w.wake_event) ::SetEvent(w.wake_event);
-    if (w.th.joinable()) w.th.join();
+    for (int i = 0; i < 200 && !w.worker_done.load(std::memory_order_acquire); ++i)
+        ::Sleep(5);
     w.running.store(false, std::memory_order_release);
     w.stop.store(false, std::memory_order_release);
-    if (w.wake_event) {
+    if (w.wake_event && w.worker_done.load(std::memory_order_acquire)) {
         ::CloseHandle(w.wake_event);
         w.wake_event = nullptr;
     }
@@ -618,6 +634,8 @@ inline void watcher_thread(std::string dir, HANDLE wake_event)
     }
     if (wdir.empty()) {
         diag::log_tagged("file_browser_watcher", "thread_exit empty_dir");
+        w.running.store(false, std::memory_order_release);
+        w.worker_done.store(true, std::memory_order_release);
         return;
     }
 
@@ -633,6 +651,8 @@ inline void watcher_thread(std::string dir, HANDLE wake_event)
         diag::log_tagged_fmt("file_browser_watcher",
             "thread_exit CreateFileW failed err=%lu dir=%s",
             static_cast<unsigned long>(err), dir.c_str());
+        w.running.store(false, std::memory_order_release);
+        w.worker_done.store(true, std::memory_order_release);
         return;
     }
 
@@ -715,6 +735,8 @@ inline void watcher_thread(std::string dir, HANDLE wake_event)
     ::CloseHandle(h);
     diag::log_tagged_fmt("file_browser_watcher",
         "thread_exit dir=%s", dir.c_str());
+    w.running.store(false, std::memory_order_release);
+    w.worker_done.store(true, std::memory_order_release);
 }
 
 inline void ensure_running_for(const std::string& dir)
@@ -722,6 +744,15 @@ inline void ensure_running_for(const std::string& dir)
     watcher_t& w = g_watcher();
     std::lock_guard<std::mutex> lk(w.mtx);
     if (w.running.load(std::memory_order_acquire) && w.watched_dir == dir) return;
+
+    static uint64_t s_next_retry_ms = 0;
+    LARGE_INTEGER qpc{}, freq{};
+    QueryPerformanceCounter(&qpc);
+    QueryPerformanceFrequency(&freq);
+    uint64_t now_ms = freq.QuadPart
+        ? static_cast<uint64_t>((qpc.QuadPart * 1000ull) / static_cast<uint64_t>(freq.QuadPart))
+        : 0ull;
+    if (s_next_retry_ms != 0 && now_ms < s_next_retry_ms) return;
 
     if (w.running.load(std::memory_order_acquire)) {
         stop_watcher_locked(w);
@@ -735,9 +766,25 @@ inline void ensure_running_for(const std::string& dir)
     w.watched_dir = dir;
     HANDLE we = w.wake_event;
     std::string cap = dir;
-    w.th = std::thread([cap, we]() { watcher_thread(cap, we); });
-    w.running.store(true, std::memory_order_release);
-    diag::log_tagged_fmt("file_browser_watcher", "ensure_running_for dir=%s", dir.c_str());
+    w.worker_done.store(false, std::memory_order_release);
+    if (work_queue::post([cap, we]() { watcher_thread(cap, we); })) {
+        w.running.store(true, std::memory_order_release);
+        s_next_retry_ms = 0;
+        diag::log_tagged_fmt("file_browser_watcher", "ensure_running_for dir=%s", dir.c_str());
+    }
+    else {
+        if (w.wake_event) {
+            ::CloseHandle(w.wake_event);
+            w.wake_event = nullptr;
+        }
+        w.watched_dir.clear();
+        w.stop.store(false, std::memory_order_release);
+        w.running.store(false, std::memory_order_release);
+        w.worker_done.store(true, std::memory_order_release);
+        s_next_retry_ms = now_ms + 5000ull;
+        diag::log_tagged_fmt("file_browser_watcher", "work_queue_post_failed dir=%s",
+            dir.c_str());
+    }
 }
 
 }

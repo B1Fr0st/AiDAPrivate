@@ -146,6 +146,20 @@ tool_result_t tool_quick_navigate(const json& params)
     out["url"] = url;
     out["navigated"] = true;
 
+    aida::burp::camoufox::call_result_t page;
+    try { page = aida::burp::camoufox::get_page_info(); }
+    catch (...) { page.ok = false; page.error = "get_page_info_threw"; }
+    if (page.ok) {
+        out["page"] = page.data;
+        if (page.data.is_object() && page.data.contains("url") && page.data["url"].is_string())
+            out["final_url"] = page.data["url"].get<std::string>();
+        if (page.data.is_object() && page.data.contains("title") && page.data["title"].is_string())
+            out["title"] = page.data["title"].get<std::string>();
+    } else {
+        out["page"] = nullptr;
+        out["page_error"] = page.error;
+    }
+
     if (!eval_after.empty()) {
         aida::burp::camoufox::call_result_t r;
         try { r = aida::burp::camoufox::evaluate_js(eval_after, true); }
@@ -235,6 +249,19 @@ tool_result_t tool_install(const json& params)
 
 void register_headless_view_tools(mcp_standalone::server_t& srv)
 {
+    {
+        tool_def_t t;
+        t.name = "camoufox_open_url";
+        t.description = "One-call agent-friendly browser opener. Opens visible Camoufox if needed, navigates to the URL, retries once after a stale browser context, and returns final URL/title/page info. Use this for simple requests like opening google.com; no driver_status or separate launch_browser/navigate call is needed.";
+        t.params = {
+            {"url", "string", "Fully-qualified URL to open, such as https://www.google.com/.", true},
+            {"eval_after_load", "string", "Optional JavaScript expression evaluated after the page reports 'load'.", false},
+            {"wait_ms", "number", "Navigation timeout in milliseconds (default 30000, max 120000).", false},
+        };
+        t.read_only = false;
+        t.handler = tool_quick_navigate;
+        srv.register_tool(std::move(t));
+    }
     {
         tool_def_t t;
         t.name = "burp_headless_view_status";

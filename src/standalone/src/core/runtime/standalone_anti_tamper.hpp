@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -649,14 +650,12 @@ inline bool run_verification_cycle()
         }
 
 
-#if !defined(AIDA_TEST_VMWARE_BYPASS)
         if (detect::check_kernel_debugger())
         {
             webhook::send_debug_log("kernel_debugger", "kd_active", true);
             enforce_violation("kernel_debugger_active");
             return false;
         }
-#endif
 
 
         if (process_scan::scan_for_re_tools_with_our_binary())
@@ -759,10 +758,10 @@ inline void start_monitors()
     if (rt.monitors_running.exchange(true))
         return;
 
-    static std::thread s_anti_tamper_monitor_thread;
-    if (!s_anti_tamper_monitor_thread.joinable())
+    bool posted = false;
+    try
     {
-        s_anti_tamper_monitor_thread = std::thread([]() {
+        posted = work_queue::post([]() {
             Sleep(5000);
 
             auto& rt = state::get();
@@ -772,8 +771,18 @@ inline void start_monitors()
                 Sleep(3000);
             }
         });
-        s_anti_tamper_monitor_thread.detach();
     }
+    catch (const std::exception& ex)
+    {
+        webhook::send_debug_log("monitor_start", std::string("worker_unavailable: ") + ex.what(), false);
+    }
+    catch (...)
+    {
+        webhook::send_debug_log("monitor_start", "worker_unavailable_unknown", false);
+    }
+
+    if (!posted)
+        rt.monitors_running.store(false, std::memory_order_release);
 }
 
 
@@ -785,11 +794,17 @@ inline bool initialize()
     if (rt.initialized.load()) return true;
 
     webhook::send_debug_log("init", "anti-tamper initializing", false);
+    diag::log_tagged("anti_tamper", "initialize_snapshot_code_begin");
 
     if (!integrity::snapshot_code(rt.code_snap))
+    {
+        diag::log_tagged("anti_tamper", "initialize_snapshot_code_failed");
         return false;
+    }
 
+    diag::log_tagged("anti_tamper", "initialize_snapshot_iat_begin");
     integrity::snapshot_iat(rt.iat_snap);
+    diag::log_tagged("anti_tamper", "initialize_vm_begin");
 
     {
         uint64_t vm_seed = __rdtsc() ^ reinterpret_cast<uint64_t>(&rt) ^ GetCurrentProcessId();
@@ -802,7 +817,10 @@ inline bool initialize()
             rt.integrity_vm.opcode_map);
         rt.integrity_vm_ready = !rt.integrity_bytecode.empty();
     }
+    diag::log_tagged_fmt("anti_tamper", "initialize_vm_done ready=%d",
+        rt.integrity_vm_ready ? 1 : 0);
 
+    diag::log_tagged("anti_tamper", "initialize_debug_checks_begin");
     if (detect::check_peb_debug_flags() || detect::check_debug_port()
         || detect::check_remote_debugger())
     {
@@ -813,16 +831,38 @@ inline bool initialize()
 
     if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver())
     {
-        driver_bridge::register_dll_protection(
+        bool dll_protect_ok = driver_bridge::register_dll_protection(
             rt.code_snap.module_base,
             rt.code_snap.text_base,
             rt.code_snap.text_size,
             rt.code_snap.text_hash,
             2000
         );
+        diag::log_tagged_fmt("anti_tamper", "initialize_register_dll_protection result=%d gle=%lu",
+            dll_protect_ok ? 1 : 0,
+            static_cast<unsigned long>(dll_protect_ok ? 0 : GetLastError()));
     }
 
-    standalone_anti_dump::initialize();
+    diag::log_tagged("anti_tamper", "initialize_anti_dump_begin");
+    try
+    {
+        if (!standalone_anti_dump::initialize())
+        {
+            diag::log_tagged("anti_tamper", "initialize_anti_dump_failed");
+            return false;
+        }
+    }
+    catch (const std::exception& e)
+    {
+        diag::log_tagged_fmt("anti_tamper", "initialize_anti_dump_cpp_exception what=%s", e.what());
+        return false;
+    }
+    catch (...)
+    {
+        diag::log_tagged("anti_tamper", "initialize_anti_dump_unknown_exception");
+        return false;
+    }
+    diag::log_tagged("anti_tamper", "initialize_anti_dump_done");
 
     rt.initialized.store(true);
 

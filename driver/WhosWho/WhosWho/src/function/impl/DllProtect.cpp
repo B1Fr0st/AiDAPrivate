@@ -29,12 +29,23 @@ namespace dll_protection {
     static protection_entry_t g_slots[MAX_PROTECT_SLOTS] = {};
     static KDPC   g_timer_dpc;
     static KTIMER g_timer;
+    static WORK_QUEUE_ITEM g_timer_work_item = {};
+    static KEVENT g_timer_work_done = {};
     static volatile LONG g_timer_initialized = 0;
+    static volatile LONG g_timer_work_sync_initialized = 0;
     static volatile LONG g_timer_running = 0;
+    static volatile LONG g_timer_work_item_queued = 0;
+    static volatile LONG g_timer_work_item_running = 0;
 
 
     static UINT64 compute_code_hash_physical(UINT32 pid, UINT64 va, UINT32 size);
     static BOOLEAN check_peb_debugger_physical(UINT32 pid);
+
+    static void ensure_timer_work_sync_initialized()
+    {
+        if (_InterlockedCompareExchange(&g_timer_work_sync_initialized, 1, 0) == 0)
+            KeInitializeEvent(&g_timer_work_done, NotificationEvent, TRUE);
+    }
 
 
     __forceinline UINT64 crc_combine(UINT64 h1, UINT64 h2, const UINT8* data, SIZE_T len) {
@@ -179,7 +190,8 @@ namespace dll_protection {
             volatile PVOID* debug_port = (volatile PVOID*)(eprocess + 0x578);
             if (_MmIsAddressValid((PVOID)debug_port)) {
                 PVOID port = *debug_port;
-                if (port != nullptr) {
+                UINT64 port_value = (UINT64)(ULONG_PTR)port;
+                if (port != nullptr && port_value >= 0xFFFF800000000000ull) {
                     *out_port = (UINT64)(ULONG_PTR)port;
                     detected = TRUE;
                 }
@@ -192,6 +204,12 @@ namespace dll_protection {
         return detected;
     }
 
+
+    static BOOLEAN is_canonical_pointer(UINT64 value) {
+        return value == 0 ||
+            value < 0x0000800000000000ull ||
+            value >= 0xFFFF800000000000ull;
+    }
 
     static BOOLEAN check_foreign_instrumentation(UINT32 pid, UINT64* out_cb) {
         *out_cb = 0;
@@ -209,8 +227,15 @@ namespace dll_protection {
             if (_MmIsAddressValid((PVOID)instr_cb)) {
                 PVOID cb = *instr_cb;
                 if (cb != nullptr) {
-                    *out_cb = (UINT64)(ULONG_PTR)cb;
-                    detected = TRUE;
+                    UINT64 cb_value = (UINT64)(ULONG_PTR)cb;
+                    *out_cb = cb_value;
+                    if (is_canonical_pointer(cb_value)) {
+                        detected = TRUE;
+                    } else {
+                        UINT32 cb_tag = static_cast<UINT32>((cb_value >> 32) ^ cb_value ^ 0x0A1DA460u);
+                        WW_LOG("[DLL-PROTECT] pid=%u instrumentation_noncanonical_ignored cb_tag=0x%08X",
+                            pid, cb_tag);
+                    }
                 }
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -228,6 +253,8 @@ namespace dll_protection {
         *out_index = -1;
         *out_dr_value = 0;
 
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+            return FALSE;
         if (!_PsGetNextProcessThread || !_PsGetContextThread)
             return FALSE;
 
@@ -342,14 +369,22 @@ namespace dll_protection {
     static void stop_timer() {
         if (_InterlockedCompareExchange(&g_timer_running, 0, 1) == 1)
             KeCancelTimer(&g_timer);
+        if (_KeFlushQueuedDpcs)
+            _KeFlushQueuedDpcs();
+        ensure_timer_work_sync_initialized();
+        if (KeGetCurrentIrql() == PASSIVE_LEVEL &&
+            (_InterlockedCompareExchange(&g_timer_work_item_queued, 0, 0) != 0 ||
+             _InterlockedCompareExchange(&g_timer_work_item_running, 0, 0) != 0)) {
+            LARGE_INTEGER timeout;
+            timeout.QuadPart = -50'000'000LL;
+            KeWaitForSingleObject(&g_timer_work_done, Executive, KernelMode, FALSE, &timeout);
+        }
     }
 
     static void start_or_restart_timer();
 
 
-    static VOID NTAPI protection_timer_dpc(
-        PKDPC , PVOID ,
-        PVOID , PVOID )
+    static void protection_timer_body()
     {
         for (int i = 0; i < (int)MAX_PROTECT_SLOTS; i++) {
             if (_InterlockedCompareExchange(&g_slots[i].active, 1, 1) != 1)
@@ -371,11 +406,10 @@ namespace dll_protection {
 
             UINT64 debug_port = 0;
             if (check_debug_port_eprocess(slot.pid, &debug_port)) {
-                slot.status = DPRT_STATUS_DEBUGGER;
-                _InterlockedExchange(&slot.active, 0);
-                KeBugCheckEx(0xDEAD0ADAu, (ULONG_PTR)slot.pid,
-                             (ULONG_PTR)slot.text_va, (ULONG_PTR)debug_port, 0xDBDBu);
-                return;
+                UINT32 port_tag = static_cast<UINT32>((debug_port >> 32) ^ debug_port ^ 0x0A1DADBAu);
+                WW_LOG("[DLL-PROTECT] pid=%u debug_port_present tag=0x%08X", slot.pid, port_tag);
+                sentinel_bridge::g_bridge.sentinel_cmd = sentinel_bridge::BRIDGE_CMD_DEBUGGER_FOUND;
+                sentinel_bridge::g_bridge.sentinel_cmd_param = port_tag;
             }
 
 
@@ -399,10 +433,11 @@ namespace dll_protection {
             {
                 UINT64 instr_cb = 0;
                 BOOLEAN has_instr = check_foreign_instrumentation(slot.pid, &instr_cb);
-                WW_LOG("[DLL-PROTECT] pid=%u check_foreign_instrumentation=%d cb=%p",
-                    slot.pid, has_instr ? 1 : 0, (PVOID)instr_cb);
+                UINT32 instr_tag = static_cast<UINT32>((instr_cb >> 32) ^ instr_cb ^ 0x0A1DA461u);
+                WW_LOG("[DLL-PROTECT] pid=%u check_foreign_instrumentation=%d cb_present=%u cb_tag=0x%08X",
+                    slot.pid, has_instr ? 1 : 0, instr_cb != 0 ? 1u : 0u, instr_tag);
                 if (has_instr) {
-                    WW_LOG("[DLL-PROTECT] pid=%u FOREIGN_INSTR_CB=%p triggering BRIDGE_CMD_DEBUGGER_FOUND", slot.pid, (PVOID)instr_cb);
+                    WW_LOG("[DLL-PROTECT] pid=%u FOREIGN_INSTR_CB triggering BRIDGE_CMD_DEBUGGER_FOUND cb_tag=0x%08X", slot.pid, instr_tag);
                     sentinel_bridge::g_bridge.sentinel_cmd = sentinel_bridge::BRIDGE_CMD_DEBUGGER_FOUND;
                     sentinel_bridge::g_bridge.sentinel_cmd_param = (ULONG)(instr_cb & 0xFFFFFFFFu);
                 }
@@ -436,8 +471,49 @@ namespace dll_protection {
         }
 
 
-        if (!any_active())
-            stop_timer();
+        if (!any_active()) {
+            _InterlockedExchange(&g_timer_running, 0);
+            KeCancelTimer(&g_timer);
+        }
+    }
+
+    static VOID NTAPI protection_timer_work_item(PVOID)
+    {
+        _InterlockedExchange(&g_timer_work_item_running, 1);
+        if (_InterlockedCompareExchange(&g_timer_running, 1, 1) != 1) {
+            _InterlockedExchange(&g_timer_work_item_running, 0);
+            _InterlockedExchange(&g_timer_work_item_queued, 0);
+            KeSetEvent(&g_timer_work_done, IO_NO_INCREMENT, FALSE);
+            return;
+        }
+
+        __try {
+            protection_timer_body();
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            WW_LOG("[DLL-PROTECT] protection work exception");
+        }
+
+        _InterlockedExchange(&g_timer_work_item_running, 0);
+        _InterlockedExchange(&g_timer_work_item_queued, 0);
+        KeSetEvent(&g_timer_work_done, IO_NO_INCREMENT, FALSE);
+    }
+
+    static VOID NTAPI protection_timer_dpc(
+        PKDPC , PVOID ,
+        PVOID , PVOID )
+    {
+        if (_InterlockedCompareExchange(&g_timer_running, 1, 1) != 1)
+            return;
+        if (_InterlockedCompareExchange(&g_timer_work_item_queued, 1, 0) != 0)
+            return;
+
+        ensure_timer_work_sync_initialized();
+        KeClearEvent(&g_timer_work_done);
+        ExInitializeWorkItem(&g_timer_work_item, protection_timer_work_item, nullptr);
+        if (_ExQueueWorkItem)
+            _ExQueueWorkItem(&g_timer_work_item, DelayedWorkQueue);
+        else
+            ExQueueWorkItem(&g_timer_work_item, DelayedWorkQueue);
     }
 
     static void start_or_restart_timer() {
@@ -448,6 +524,8 @@ namespace dll_protection {
         }
 
         if (_InterlockedCompareExchange(&g_timer_initialized, 1, 0) == 0) {
+            ensure_timer_work_sync_initialized();
+            KeSetEvent(&g_timer_work_done, IO_NO_INCREMENT, FALSE);
             KeInitializeTimer(&g_timer);
             KeInitializeDpc(&g_timer_dpc, protection_timer_dpc, nullptr);
         }
@@ -465,25 +543,8 @@ namespace anti_dump_driver {
 
     inline NTSTATUS trim_working_set(UINT32 pid)
     {
-        PEPROCESS process = nullptr;
-        NTSTATUS status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &process);
-        if (!NT_SUCCESS(status)) return status;
-
-        __try {
-            UCHAR* eproc = (UCHAR*)process;
-            volatile UINT64* ws_lock = (volatile UINT64*)(eproc + 0x4E0);
-            volatile UINT32* ws_size = (volatile UINT32*)(eproc + 0x4E8);
-
-            if (_MmIsAddressValid((PVOID)ws_size) && *ws_size > 256) {
-                InterlockedExchange((volatile LONG*)ws_size, 64);
-            }
-        } __except(EXCEPTION_EXECUTE_HANDLER) {
-            ObDereferenceObject(process);
-            return STATUS_UNSUCCESSFUL;
-        }
-
-        ObDereferenceObject(process);
-        return STATUS_SUCCESS;
+        UNREFERENCED_PARAMETER(pid);
+        return STATUS_NOT_SUPPORTED;
     }
 
     inline NTSTATUS detect_external_handles(UINT32 target_pid, UINT64* suspicious_pid)
@@ -553,46 +614,9 @@ namespace anti_dump_driver {
 
     inline NTSTATUS corrupt_vad_protection(UINT32 pid, UINT64 region_base)
     {
-        PEPROCESS process = nullptr;
-        NTSTATUS status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &process);
-        if (!NT_SUCCESS(status)) return status;
-
-        __try {
-            UCHAR* eproc = (UCHAR*)process;
-            PVOID vad_root = *(PVOID*)(eproc + 0x7D8);
-
-            if (!vad_root || !_MmIsAddressValid(vad_root)) {
-                ObDereferenceObject(process);
-                return STATUS_NOT_FOUND;
-            }
-
-            UINT64 vpn = region_base >> 12;
-
-            PVOID node = vad_root;
-            for (int depth = 0; depth < 64 && node && _MmIsAddressValid(node); ++depth) {
-                UINT64 start_vpn = *(UINT64*)((UCHAR*)node + 0x18);
-                UINT64 end_vpn = *(UINT64*)((UCHAR*)node + 0x20);
-
-                if (vpn < start_vpn) {
-                    node = *(PVOID*)((UCHAR*)node + 0x00);
-                } else if (vpn > end_vpn) {
-                    node = *(PVOID*)((UCHAR*)node + 0x08);
-                } else {
-                    volatile UINT32* protection = (volatile UINT32*)((UCHAR*)node + 0x30);
-                    if (_MmIsAddressValid((PVOID)protection)) {
-                        *protection = (*protection & ~0x1F) | 0x01;
-                    }
-                    ObDereferenceObject(process);
-                    return STATUS_SUCCESS;
-                }
-            }
-        } __except(EXCEPTION_EXECUTE_HANDLER) {
-            ObDereferenceObject(process);
-            return STATUS_UNSUCCESSFUL;
-        }
-
-        ObDereferenceObject(process);
-        return STATUS_NOT_FOUND;
+        UNREFERENCED_PARAMETER(pid);
+        UNREFERENCED_PARAMETER(region_base);
+        return STATUS_NOT_SUPPORTED;
     }
 
 }

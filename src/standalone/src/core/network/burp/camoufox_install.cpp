@@ -15,10 +15,13 @@
 #include <winhttp.h>
 #include <softpub.h>
 #include <wintrust.h>
+#include <bcrypt.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <mutex>
@@ -107,6 +110,13 @@ bool spawn_capture_streaming(const std::string& cmdline, DWORD timeout_ms, DWORD
 std::string trim_view(const std::string& s);
 std::string compact_log(std::string s, size_t limit = 1200);
 void set_status_locked(install_state_t st, const std::string& msg);
+
+constexpr wchar_t kPythonInstallerHost[] = L"www.python.org";
+constexpr wchar_t kPythonInstallerPath[] = L"/ftp/python/3.12.10/python-3.12.10-amd64.exe";
+constexpr wchar_t kPythonInstallerName[] = L"python-3.12.10-amd64.exe";
+constexpr wchar_t kPythonRuntimeDirName[] = L"Python312-3.12.10-x64";
+constexpr uint64_t kPythonInstallerSize = 26964224ull;
+constexpr char kPythonInstallerSha256[] = "67b5635e80ea51072b87941312d00ec8927c4db9ba18938f7ad2d27b328b95fb";
 
 bool file_exists_w(const std::wstring& path)
 {
@@ -221,16 +231,15 @@ bool discover_bundled_browser_dir(std::wstring& out_dir)
 
 bool discover_bundled_python_installer(std::wstring& out_path)
 {
-    const std::wstring name = L"python-3.12.10-amd64.exe";
     for (const auto& base : runtime_base_dirs())
     {
-        std::wstring candidate = join_path_w(join_path_w(base, L"deps"), name);
+        std::wstring candidate = join_path_w(join_path_w(base, L"deps"), kPythonInstallerName);
         if (file_exists_w(candidate))
         {
             out_path = candidate;
             return true;
         }
-        candidate = join_path_w(base, name);
+        candidate = join_path_w(base, kPythonInstallerName);
         if (file_exists_w(candidate))
         {
             out_path = candidate;
@@ -248,20 +257,26 @@ std::wstring local_appdata_camoufox_cache()
     return join_path_w(join_path_w(join_path_w(root, L"camoufox"), L"camoufox"), L"Cache");
 }
 
-std::wstring local_appdata_python_target()
+std::wstring local_appdata_aida_root()
 {
     wchar_t root[MAX_PATH] = {};
     DWORD got = GetEnvironmentVariableW(L"LOCALAPPDATA", root, MAX_PATH);
     if (got == 0 || got >= MAX_PATH) return {};
-    return join_path_w(join_path_w(join_path_w(root, L"Programs"), L"Python"), L"Python312");
+    return join_path_w(root, L"AiDA");
+}
+
+std::wstring local_appdata_python_target()
+{
+    std::wstring root = local_appdata_aida_root();
+    if (root.empty()) return {};
+    return join_path_w(join_path_w(join_path_w(root, L"runtimes"), L"python"), kPythonRuntimeDirName);
 }
 
 std::wstring local_appdata_setup_cache()
 {
-    wchar_t root[MAX_PATH] = {};
-    DWORD got = GetEnvironmentVariableW(L"LOCALAPPDATA", root, MAX_PATH);
-    if (got == 0 || got >= MAX_PATH) return {};
-    return join_path_w(join_path_w(root, L"AiDA"), L"setup-cache");
+    std::wstring root = local_appdata_aida_root();
+    if (root.empty()) return {};
+    return join_path_w(join_path_w(join_path_w(root, L"setup-cache"), L"python"), L"3.12.10-x64");
 }
 
 bool write_text_file_w(const std::wstring& path, const char* data, std::string& log)
@@ -304,8 +319,6 @@ bool download_python_installer_w(const std::wstring& destination, std::string& l
         return false;
     }
 
-    const wchar_t* host = L"www.python.org";
-    const wchar_t* path = L"/ftp/python/3.12.10/python-3.12.10-amd64.exe";
     winhttp_handle_t session(WinHttpOpen(L"AiDA-CamoufoxSetup/1.0",
                                          WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                                          WINHTTP_NO_PROXY_NAME,
@@ -324,7 +337,7 @@ bool download_python_installer_w(const std::wstring& destination, std::string& l
     }
     WinHttpSetTimeouts(session.h, 30000, 30000, 30000, 300000);
 
-    winhttp_handle_t connect(WinHttpConnect(session.h, host, INTERNET_DEFAULT_HTTPS_PORT, 0));
+    winhttp_handle_t connect(WinHttpConnect(session.h, kPythonInstallerHost, INTERNET_DEFAULT_HTTPS_PORT, 0));
     if (!connect.h)
     {
         log += "WinHttpConnect failed err=" + std::to_string(GetLastError()) + "\n";
@@ -333,7 +346,7 @@ bool download_python_installer_w(const std::wstring& destination, std::string& l
 
     winhttp_handle_t request(WinHttpOpenRequest(connect.h,
                                                 L"GET",
-                                                path,
+                                                kPythonInstallerPath,
                                                 nullptr,
                                                 WINHTTP_NO_REFERER,
                                                 WINHTTP_DEFAULT_ACCEPT_TYPES,
@@ -409,10 +422,10 @@ bool download_python_installer_w(const std::wstring& destination, std::string& l
     }
     CloseHandle(hf);
 
-    if (total < 10ull * 1024ull * 1024ull)
+    if (total != kPythonInstallerSize)
     {
         DeleteFileW(tmp.c_str());
-        log += "Python installer download was unexpectedly small\n";
+        log += "Python installer download size mismatch bytes=" + std::to_string(total) + "\n";
         return false;
     }
     if (!MoveFileExW(tmp.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
@@ -422,6 +435,74 @@ bool download_python_installer_w(const std::wstring& destination, std::string& l
         return false;
     }
     log += "downloaded Python installer bytes=" + std::to_string(total) + "\n";
+    return true;
+}
+
+std::string hex_lower(const std::array<unsigned char, 32>& bytes)
+{
+    static const char kHex[] = "0123456789abcdef";
+    std::string out;
+    out.resize(bytes.size() * 2);
+    for (size_t i = 0; i < bytes.size(); ++i)
+    {
+        out[i * 2] = kHex[(bytes[i] >> 4) & 0x0F];
+        out[i * 2 + 1] = kHex[bytes[i] & 0x0F];
+    }
+    return out;
+}
+
+bool sha256_file_w(const std::wstring& path, std::string& out_hex, std::string& log)
+{
+    out_hex.clear();
+    HANDLE hf = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hf == INVALID_HANDLE_VALUE)
+    {
+        log += "CreateFile failed for sha256 err=" + std::to_string(GetLastError()) + "\n";
+        return false;
+    }
+
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    std::array<unsigned char, 32> digest{};
+    bool ok = false;
+    NTSTATUS st = BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
+    if (BCRYPT_SUCCESS(st))
+        st = BCryptCreateHash(alg, &hash, nullptr, 0, nullptr, 0, 0);
+    if (BCRYPT_SUCCESS(st))
+    {
+        std::array<unsigned char, 65536> buf{};
+        for (;;)
+        {
+            DWORD read = 0;
+            if (!ReadFile(hf, buf.data(), static_cast<DWORD>(buf.size()), &read, nullptr))
+            {
+                log += "ReadFile failed for sha256 err=" + std::to_string(GetLastError()) + "\n";
+                break;
+            }
+            if (read == 0)
+            {
+                st = BCryptFinishHash(hash, digest.data(), static_cast<ULONG>(digest.size()), 0);
+                ok = BCRYPT_SUCCESS(st);
+                if (!ok) log += "BCryptFinishHash failed status=" + std::to_string(static_cast<long>(st)) + "\n";
+                break;
+            }
+            st = BCryptHashData(hash, buf.data(), read, 0);
+            if (!BCRYPT_SUCCESS(st))
+            {
+                log += "BCryptHashData failed status=" + std::to_string(static_cast<long>(st)) + "\n";
+                break;
+            }
+        }
+    }
+    else
+    {
+        log += "BCrypt SHA256 setup failed status=" + std::to_string(static_cast<long>(st)) + "\n";
+    }
+    if (hash) BCryptDestroyHash(hash);
+    if (alg) BCryptCloseAlgorithmProvider(alg, 0);
+    CloseHandle(hf);
+    if (!ok) return false;
+    out_hex = hex_lower(digest);
     return true;
 }
 
@@ -447,6 +528,33 @@ bool verify_authenticode_w(const std::wstring& path, std::string& log)
     if (status == ERROR_SUCCESS) return true;
     log += "Authenticode verification failed for " + wide_to_utf8(path) + " status=" + std::to_string(status) + "\n";
     return false;
+}
+
+bool verify_python_installer_w(const std::wstring& path, std::string& log)
+{
+    WIN32_FILE_ATTRIBUTE_DATA attrs{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &attrs))
+    {
+        log += "GetFileAttributesEx failed for Python installer err=" + std::to_string(GetLastError()) + "\n";
+        return false;
+    }
+    uint64_t size = (static_cast<uint64_t>(attrs.nFileSizeHigh) << 32) | attrs.nFileSizeLow;
+    if (size != kPythonInstallerSize)
+    {
+        log += "Python installer size mismatch bytes=" + std::to_string(size) + "\n";
+        return false;
+    }
+
+    std::string sha;
+    if (!sha256_file_w(path, sha, log)) return false;
+    if (_stricmp(sha.c_str(), kPythonInstallerSha256) != 0)
+    {
+        log += "Python installer sha256 mismatch got=" + sha + "\n";
+        return false;
+    }
+    if (!verify_authenticode_w(path, log)) return false;
+    log += "verified Python installer sha256=" + sha + "\n";
+    return true;
 }
 
 bool copy_directory_tree_w(const std::wstring& src, const std::wstring& dst, std::string& log)
@@ -485,6 +593,52 @@ bool copy_directory_tree_w(const std::wstring& src, const std::wstring& dst, std
     return true;
 }
 
+bool remove_directory_tree_w(const std::wstring& dir, std::string& log)
+{
+    namespace fs = std::filesystem;
+    std::wstring root = local_appdata_aida_root();
+    bool under_root = !root.empty() && dir.size() > root.size() && _wcsnicmp(dir.c_str(), root.c_str(), root.size()) == 0;
+    if (under_root)
+    {
+        wchar_t sep = dir[root.size()];
+        under_root = sep == L'\\' || sep == L'/';
+    }
+    if (!under_root)
+    {
+        log += "refusing to repair Python runtime outside AiDA local app data\n";
+        return false;
+    }
+    std::error_code ec;
+    fs::remove_all(fs::path(dir), ec);
+    if (ec)
+    {
+        log += "remove_all failed for Python runtime: " + ec.message() + "\n";
+        return false;
+    }
+    return true;
+}
+
+bool validate_app_local_python_w(const std::wstring& python_exe, std::string& log)
+{
+    if (!file_exists_w(python_exe)) return false;
+    DWORD code = 0;
+    std::string captured;
+    std::string cmd = quote_arg(wide_to_utf8(python_exe)) +
+        " -c \"import sys, pip; assert sys.version_info.major == 3 and 10 <= sys.version_info.minor <= 13; print(f'{sys.version_info.major}.{sys.version_info.minor}')\"";
+    if (!spawn_capture_streaming(cmd, 30000, code, captured))
+    {
+        log += "app-local Python validation spawn failed\n";
+        return false;
+    }
+    if (code != 0)
+    {
+        log += "app-local Python validation failed: " + compact_log(captured) + "\n";
+        return false;
+    }
+    log += "validated app-local Python runtime version=" + compact_log(captured) + "\n";
+    return true;
+}
+
 bool bootstrap_python_runtime(std::string& out_log)
 {
     std::wstring target_dir = local_appdata_python_target();
@@ -494,7 +648,31 @@ bool bootstrap_python_runtime(std::string& out_log)
         return false;
     }
     std::wstring python_exe = join_path_w(target_dir, L"python.exe");
-    if (file_exists_w(python_exe)) return true;
+    if (file_exists_w(python_exe))
+    {
+        std::string validation_log;
+        if (validate_app_local_python_w(python_exe, validation_log))
+        {
+            out_log += validation_log;
+            return true;
+        }
+        out_log += validation_log;
+        {
+            std::lock_guard<std::mutex> lk(sg().mtx);
+            set_status_locked(install_state_t::installing, "repairing app-local Python runtime");
+        }
+        if (!remove_directory_tree_w(target_dir, out_log)) return false;
+    }
+    else
+    {
+        DWORD attr = GetFileAttributesW(target_dir.c_str());
+        if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY))
+        {
+            std::lock_guard<std::mutex> lk(sg().mtx);
+            set_status_locked(install_state_t::installing, "removing partial Python runtime");
+            if (!remove_directory_tree_w(target_dir, out_log)) return false;
+        }
+    }
 
     std::wstring cache_dir = local_appdata_setup_cache();
     if (cache_dir.empty())
@@ -502,23 +680,37 @@ bool bootstrap_python_runtime(std::string& out_log)
         out_log += "LOCALAPPDATA not available for setup cache\n";
         return false;
     }
-    std::wstring installer = join_path_w(cache_dir, L"python-3.12.10-amd64.exe");
+    std::wstring installer = join_path_w(cache_dir, kPythonInstallerName);
 
     {
         std::lock_guard<std::mutex> lk(sg().mtx);
         set_status_locked(install_state_t::installing, "downloading Python 3.12 runtime");
     }
 
+    bool using_bundled_installer = false;
     if (!file_exists_w(installer))
     {
         std::wstring bundled_installer;
         if (discover_bundled_python_installer(bundled_installer))
+        {
             installer = bundled_installer;
+            using_bundled_installer = true;
+        }
         else if (!download_python_installer_w(installer, out_log))
             return false;
     }
-    if (!verify_authenticode_w(installer, out_log))
-        return false;
+    {
+        std::lock_guard<std::mutex> lk(sg().mtx);
+        set_status_locked(install_state_t::installing, "verifying Python 3.12 runtime installer");
+    }
+    if (!verify_python_installer_w(installer, out_log))
+    {
+        if (using_bundled_installer) return false;
+        DeleteFileW(installer.c_str());
+        out_log += "discarded invalid cached Python installer\n";
+        if (!download_python_installer_w(installer, out_log)) return false;
+        if (!verify_python_installer_w(installer, out_log)) return false;
+    }
 
     {
         std::lock_guard<std::mutex> lk(sg().mtx);
@@ -547,6 +739,10 @@ bool bootstrap_python_runtime(std::string& out_log)
         out_log += "Python installer completed but python.exe was not found at " + wide_to_utf8(python_exe) + "\n";
         return false;
     }
+    if (!validate_app_local_python_w(python_exe, out_log)) return false;
+    const std::string metadata = std::string("{\"component\":\"camoufox-python\",\"version\":\"3.12.10\",\"arch\":\"x64\",\"source\":\"https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe\",\"sha256\":\"") +
+        kPythonInstallerSha256 + "\"}";
+    if (!write_text_file_w(join_path_w(target_dir, L"aida-runtime.json"), metadata.c_str(), out_log)) return false;
     out_log += "installed Python runtime at " + wide_to_utf8(python_exe) + "\n";
     return true;
 }
@@ -790,18 +986,9 @@ bool initialize()
     {
         std::lock_guard<std::mutex> lk(sg().mtx);
         sg().status.state = install_state_t::unknown;
+        sg().status.last_message = "camoufox setup will run on first browser use";
+        sg().last_error.clear();
     }
-    work_queue::post([]() {
-        if (sg().busy.exchange(true)) return;
-        try {
-            probe_impl(true, kBackgroundProbeTimeoutMs);
-        } catch (...) {
-            std::lock_guard<std::mutex> lk(sg().mtx);
-            sg().last_error = "camoufox startup probe failed";
-            set_status_locked(install_state_t::install_failed, sg().last_error);
-        }
-        sg().busy.store(false, std::memory_order_release);
-    });
     return true;
 }
 

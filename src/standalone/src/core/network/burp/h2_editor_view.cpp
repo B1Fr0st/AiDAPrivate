@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -255,18 +256,26 @@ void render(float pos_x, float pos_y, float width, float height,
             }
 
             st.in_flight.store(true);
-            std::thread([&st, req]() {
-                h2_editor::response_t r = h2_editor::send(req);
-                {
-                    std::lock_guard<std::mutex> lk(st.resp_mtx);
-                    st.last_response = std::move(r);
-                    st.has_response = true;
-                }
-                ::diag::log_tagged_fmt("h2_v", "send_response_received status=%d ok=%d latency=%llums",
-                    st.last_response.status_code, st.last_response.ok ? 1 : 0,
-                    static_cast<unsigned long long>(st.last_response.latency_ms));
+            try {
+                std::thread([&st, req]() {
+                    h2_editor::response_t r = h2_editor::send(req);
+                    {
+                        std::lock_guard<std::mutex> lk(st.resp_mtx);
+                        st.last_response = std::move(r);
+                        st.has_response = true;
+                    }
+                    ::diag::log_tagged_fmt("h2_v", "send_response_received status=%d ok=%d latency=%llums",
+                        st.last_response.status_code, st.last_response.ok ? 1 : 0,
+                        static_cast<unsigned long long>(st.last_response.latency_ms));
+                    st.in_flight.store(false);
+                }).detach();
+            } catch (const std::exception& ex) {
                 st.in_flight.store(false);
-            }).detach();
+                ::diag::log_tagged_fmt("h2_v", "send_thread_failed err=%s", ex.what());
+            } catch (...) {
+                st.in_flight.store(false);
+                ::diag::log_tagged("h2_v", "send_thread_failed");
+            }
             ::diag::log_tagged_fmt("h2_v", "send host=%s port=%d method=%s path=%s raw=%d",
                                  req.host.c_str(), req.port,
                                  req.pseudo.method.c_str(), req.pseudo.path.c_str(),

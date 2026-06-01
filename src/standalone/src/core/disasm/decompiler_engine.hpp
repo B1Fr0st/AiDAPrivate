@@ -680,20 +680,29 @@ inline void decompile_function_native(uint64_t func_addr, const DisasmFile* file
 				static_cast<unsigned long long>(func_addr),
 				static_cast<unsigned long long>(mem.size()));
 
-			if (mem.empty() && has_static) {
+			bool mem_junk = !mem.empty() && disasm::buffer_is_zero_padding(mem);
+			if ((mem.empty() || mem_junk) && has_static) {
 				diag::log_tagged_critical_fmt("dec", "decompile_function_native_pre_static_read addr=0x%llX size=%llu",
 					static_cast<unsigned long long>(func_addr),
 					static_cast<unsigned long long>(static_cast<uint64_t>(PREREAD_SIZE)));
-				static_analysis::read_bytes_from_pe(*effective_file, func_addr, PREREAD_SIZE, mem);
-				diag::log_tagged_critical_fmt("dec", "decompile_function_native_post_static_read addr=0x%llX bytes=%llu",
+				std::vector<uint8_t> static_mem;
+				static_analysis::read_bytes_from_pe(*effective_file, func_addr, PREREAD_SIZE, static_mem);
+				if (!static_mem.empty() && !disasm::buffer_is_zero_padding(static_mem))
+					mem = std::move(static_mem);
+				diag::log_tagged_critical_fmt("dec", "decompile_function_native_post_static_read addr=0x%llX bytes=%llu used=%d prior_junk=%d",
 					static_cast<unsigned long long>(func_addr),
-					static_cast<unsigned long long>(mem.size()));
+					static_cast<unsigned long long>(mem.size()),
+					(!mem.empty() && !disasm::buffer_is_zero_padding(mem)) ? 1 : 0,
+					mem_junk ? 1 : 0);
 			}
+			mem_junk = !mem.empty() && disasm::buffer_is_zero_padding(mem);
 
-			if (mem.empty()) {
+			if (mem.empty() || mem_junk) {
 				uint32_t pid_post = driver_bridge::attached_pid();
 				std::string err;
-				if (pid_post != 0 && has_static) {
+				if (mem_junk) {
+					err = "selected address resolves to zero-filled padding, not executable function bytes";
+				} else if (pid_post != 0 && has_static) {
 					err = "no executable bytes at this address (driver returned 0 bytes and address is outside loaded PE sections)";
 				} else if (pid_post != 0) {
 					err = "driver returned no bytes at this address (load a PE file via File > Open to enable static fallback)";
@@ -705,10 +714,12 @@ inline void decompile_function_native(uint64_t func_addr, const DisasmFile* file
 					err = "no source available: open a PE file via File > Open or attach a process via File > Attach";
 				}
 				publish_error(err);
-				diag::log_tagged_critical_fmt("dec", "decompile_function_native_exit addr=0x%llX reason=read_failed pid_post=%u has_static=%d",
+				diag::log_tagged_critical_fmt("dec", "decompile_function_native_exit addr=0x%llX reason=read_failed pid_post=%u has_static=%d mem_junk=%d bytes=%llu",
 					static_cast<unsigned long long>(func_addr),
 					pid_post,
-					has_static ? 1 : 0);
+					has_static ? 1 : 0,
+					mem_junk ? 1 : 0,
+					static_cast<unsigned long long>(mem.size()));
 				return;
 			}
 

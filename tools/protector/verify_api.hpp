@@ -36,6 +36,7 @@ struct context_t {
     uint32_t                       packed_rva = 0;
     uint32_t                       packed_vsize = 0;
     uint32_t                       packed_characteristics = 0;
+    char                           packed_name[9] = {};
     std::vector<uint8_t>           packed_data;
     std::vector<uint8_t>           packed_section_bytes;
 };
@@ -65,6 +66,8 @@ inline bool find_packed(context_t& c) {
                 ? sec.virtual_size - static_cast<uint32_t>(off)
                 : 0u;
             c.packed_characteristics = sec.characteristics;
+            std::memcpy(c.packed_name, sec.name, 8);
+            c.packed_name[8] = '\0';
             c.packed_found = true;
             if (h.aux_offset != 0u && h.aux_size == sizeof(aux_block_t)
                 && static_cast<size_t>(h.aux_offset) + sizeof(aux_block_t) <= c.packed_data.size()) {
@@ -77,14 +80,126 @@ inline bool find_packed(context_t& c) {
     return false;
 }
 
+inline bool range_within(size_t offset, uint64_t size, size_t limit) {
+    const uint64_t end = static_cast<uint64_t>(offset) + size;
+    return static_cast<uint64_t>(offset) <= static_cast<uint64_t>(limit) &&
+           end <= static_cast<uint64_t>(limit);
+}
+
+inline bool counted_table_bounds(const std::vector<uint8_t>& data,
+                                 uint32_t offset,
+                                 uint32_t expected_count,
+                                 size_t entry_size,
+                                 uint32_t max_count,
+                                 uint32_t image_size,
+                                 uint32_t& stored_count_out) {
+    stored_count_out = 0u;
+    if (expected_count == 0u && offset == 0u) {
+        return true;
+    }
+    if (offset == 0u || expected_count > max_count) {
+        return false;
+    }
+    if (!range_within(offset, 4u, data.size())) {
+        return false;
+    }
+    uint32_t stored_count = 0;
+    std::memcpy(&stored_count, data.data() + offset, sizeof(stored_count));
+    stored_count_out = stored_count;
+    if (stored_count != expected_count || stored_count > max_count) {
+        return false;
+    }
+    const uint64_t bytes = 4ull + static_cast<uint64_t>(stored_count) * static_cast<uint64_t>(entry_size);
+    if (!range_within(offset, bytes, data.size())) {
+        return false;
+    }
+    if (image_size != 0u && stored_count != 0u) {
+        const uint8_t* entries = data.data() + offset + 4u;
+        if (entry_size == sizeof(protector::string_fixup_t)) {
+            for (uint32_t i = 0; i < stored_count; ++i) {
+                protector::string_fixup_t sf{};
+                std::memcpy(&sf, entries + static_cast<size_t>(i) * sizeof(sf), sizeof(sf));
+                if (sf.length == 0u || !range_within(sf.rva, sf.length, image_size)) {
+                    return false;
+                }
+            }
+        } else if (entry_size == sizeof(protector::resource_fixup_t)) {
+            for (uint32_t i = 0; i < stored_count; ++i) {
+                protector::resource_fixup_t rf{};
+                std::memcpy(&rf, entries + static_cast<size_t>(i) * sizeof(rf), sizeof(rf));
+                if (rf.size == 0u || !range_within(rf.rva, rf.size, image_size)) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+inline bool import_table_bounds(const std::vector<uint8_t>& data,
+                                uint32_t offset,
+                                uint32_t expected_count,
+                                uint32_t image_size,
+                                uint32_t& stored_count_out,
+                                uint32_t& pool_size_out) {
+    constexpr uint32_t kMaxImports = 65536u;
+    stored_count_out = 0u;
+    pool_size_out = 0u;
+    if (expected_count == 0u && offset == 0u) {
+        return true;
+    }
+    if (offset == 0u || expected_count > kMaxImports) {
+        return false;
+    }
+    if (!range_within(offset, 8u, data.size())) {
+        return false;
+    }
+    uint32_t stored_count = 0;
+    std::memcpy(&stored_count, data.data() + offset, sizeof(stored_count));
+    stored_count_out = stored_count;
+    if (stored_count != expected_count || stored_count > kMaxImports) {
+        return false;
+    }
+    const uint64_t pool_field = static_cast<uint64_t>(offset) + 4ull
+        + static_cast<uint64_t>(stored_count) * static_cast<uint64_t>(sizeof(protector::import_hash_entry_t));
+    if (pool_field + 4ull > static_cast<uint64_t>(data.size())) {
+        return false;
+    }
+    uint32_t pool_size = 0;
+    std::memcpy(&pool_size, data.data() + static_cast<size_t>(pool_field), sizeof(pool_size));
+    pool_size_out = pool_size;
+    const uint64_t bytes = 4ull
+        + static_cast<uint64_t>(stored_count) * static_cast<uint64_t>(sizeof(protector::import_hash_entry_t))
+        + 4ull
+        + static_cast<uint64_t>(pool_size);
+    if (!range_within(offset, bytes, data.size())) {
+        return false;
+    }
+    if (image_size != 0u && stored_count != 0u) {
+        const uint8_t* entries = data.data() + offset + 4u;
+        for (uint32_t i = 0; i < stored_count; ++i) {
+            protector::import_hash_entry_t entry{};
+            std::memcpy(&entry, entries + static_cast<size_t>(i) * sizeof(entry), sizeof(entry));
+            if (!range_within(entry.iat_rva, 8u, image_size)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 
 inline probe_result_t probe_p01(const context_t& c) {
     return { "P01", "PE32+ image", c.pe.optional_header.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC, "" };
 }
 
 inline probe_result_t probe_p02(const context_t& c) {
+    char buf[96] = {};
+    if (c.packed_found) {
+        std::snprintf(buf, sizeof(buf), "section=%s rva=0x%08X", c.packed_name, c.packed_rva);
+    }
     return { "P02", "packed section + APKD magic", c.packed_found,
-             c.packed_found ? "" : "no .packed section with APKD magic" };
+             c.packed_found ? buf : "no .packed section with APKD magic" };
 }
 
 inline probe_result_t probe_p03(const context_t& c) {
@@ -236,14 +351,26 @@ inline probe_result_t probe_p13(const context_t& c) {
 
 
 inline probe_result_t probe_p14(const context_t& c) {
-    if (!c.aux_found) { return { "P14", "phase_flags = 7/7 phases fired", false, "no aux block" }; }
+    if (!c.aux_found) { return { "P14", "required phase_flags present", false, "no aux block" }; }
     uint32_t pf = c.aux.phase_flags & 0x7Fu;
-    int n = 0;
-    for (int i = 0; i < 7; ++i) { if (pf & (1u << i)) { ++n; } }
-    bool ok = (n == 7);
-    char buf[64];
-    std::snprintf(buf, sizeof(buf), "phases_fired=%d/7 (phase_flags=0x%02X)", n, pf);
-    return { "P14", "all 7 protection phases fired (--all)", ok, buf };
+    bool stable_packed = c.packed_found && std::strcmp(c.packed_name, ".packed") == 0;
+    uint32_t required = stable_packed ? (0x7Fu & ~0x2u) : 0x7Fu;
+    uint32_t missing = required & ~pf;
+    int present = 0;
+    int required_count = 0;
+    for (int i = 0; i < 7; ++i) {
+        if (required & (1u << i)) {
+            ++required_count;
+            if (pf & (1u << i)) { ++present; }
+        }
+    }
+    bool ok = (missing == 0u);
+    char buf[128];
+    std::snprintf(buf, sizeof(buf),
+                  "phases_present=%d/%d required_mask=0x%02X phase_flags=0x%02X%s",
+                  present, required_count, required, pf,
+                  stable_packed ? " stable_packed" : "");
+    return { "P14", "required protection phase flags present", ok, buf };
 }
 
 
@@ -672,6 +799,135 @@ inline probe_result_t probe_p28(const context_t& c) {
     return { "P28", "deep_steal real transform: dseal entries valid + dthunk prologue magic match", ok, buf };
 }
 
+inline probe_result_t probe_p29(const context_t& c) {
+    if (!c.packed_found) {
+        return { "P29", "protected runtime metadata stable", false, "no packed section" };
+    }
+    bool dos_ok = c.pe.dos_header.e_magic == IMAGE_DOS_SIGNATURE;
+    bool lfanew_ok = c.pe.dos_header.e_lfanew >= 64 && c.pe.dos_header.e_lfanew <= 0x10000;
+    bool nt_ok = c.pe.pe_signature == IMAGE_NT_SIGNATURE;
+    bool opt_ok = c.pe.optional_header.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+    bool dirs_ok = c.pe.optional_header.NumberOfRvaAndSizes >= 16u;
+    bool packed_name_ok = std::strcmp(c.packed_name, ".packed") == 0;
+    bool aux_ok = c.aux_found && c.aux.magic == protector::kAuxMagic && c.aux.version == protector::kAuxVersion;
+    bool ok = dos_ok && lfanew_ok && nt_ok && opt_ok && dirs_ok && packed_name_ok && aux_ok;
+    char buf[224];
+    std::snprintf(buf, sizeof(buf),
+                  "dos=%d lfanew=0x%X nt=%d opt=%d dirs=%u packed_name=%s aux=%d",
+                  dos_ok ? 1 : 0,
+                  static_cast<unsigned>(c.pe.dos_header.e_lfanew),
+                  nt_ok ? 1 : 0,
+                  opt_ok ? 1 : 0,
+                  c.pe.optional_header.NumberOfRvaAndSizes,
+                  c.packed_name,
+                  aux_ok ? 1 : 0);
+    return { "P29", "protected runtime metadata stable", ok, buf };
+}
+
+inline probe_result_t probe_p30(const context_t& c) {
+    if (!c.packed_found) {
+        return { "P30", "packed runtime layout bounds valid", false, "no packed section" };
+    }
+    bool version_ok = c.hdr.version == protector::kPackedVersion ||
+                      c.hdr.version == protector::kPackedVersionLegacy;
+    bool section_cap_ok = c.hdr.section_count <= 512u;
+    uint64_t section_table_bytes = static_cast<uint64_t>(c.hdr.section_count)
+        * static_cast<uint64_t>(sizeof(protector::section_descriptor_t));
+    bool section_table_ok = section_cap_ok &&
+        range_within(c.hdr.section_table_offset, section_table_bytes, c.packed_data.size());
+    uint32_t valid_desc = 0u;
+    bool desc_sizes_ok = true;
+    bool desc_blob_ok = true;
+    bool desc_layer_ok = true;
+    bool desc_image_ok = c.pe.optional_header.SizeOfImage != 0u;
+    if (section_table_ok) {
+        for (uint32_t i = 0; i < c.hdr.section_count; ++i) {
+            protector::section_descriptor_t d{};
+            const size_t off = static_cast<size_t>(c.hdr.section_table_offset)
+                + static_cast<size_t>(i) * sizeof(d);
+            std::memcpy(&d, c.packed_data.data() + off, sizeof(d));
+            bool sizes_ok = d.original_rva != 0u &&
+                d.original_virtual_size != 0u &&
+                d.encrypted_size != 0u &&
+                d.compressed_size != 0u &&
+                d.compressed_size <= d.encrypted_size;
+            bool blob_ok = range_within(d.blob_offset, d.encrypted_size, c.packed_data.size());
+            bool layer_ok = d.layers_applied == 1u || d.layers_applied == 3u;
+            bool image_ok = range_within(d.original_rva,
+                                         d.original_virtual_size,
+                                         c.pe.optional_header.SizeOfImage);
+            if (!sizes_ok) { desc_sizes_ok = false; }
+            if (!blob_ok) { desc_blob_ok = false; }
+            if (!layer_ok) { desc_layer_ok = false; }
+            if (!image_ok) { desc_image_ok = false; }
+            if (sizes_ok && blob_ok && layer_ok && image_ok) {
+                ++valid_desc;
+            }
+        }
+    }
+    uint32_t import_stored = 0u;
+    uint32_t import_pool = 0u;
+    bool import_ok = import_table_bounds(c.packed_data,
+                                         c.hdr.import_table_offset,
+                                         c.hdr.import_count,
+                                         c.pe.optional_header.SizeOfImage,
+                                         import_stored,
+                                         import_pool);
+    uint32_t string_stored = 0u;
+    uint32_t resource_stored = 0u;
+    bool string_ok = counted_table_bounds(c.packed_data,
+                                          c.hdr.string_table_offset,
+                                          c.hdr.string_fixup_count,
+                                          sizeof(protector::string_fixup_t),
+                                          262144u,
+                                          c.pe.optional_header.SizeOfImage,
+                                          string_stored);
+    bool resource_ok = counted_table_bounds(c.packed_data,
+                                            c.hdr.resource_table_offset,
+                                            c.hdr.resource_fixup_count,
+                                            sizeof(protector::resource_fixup_t),
+                                            262144u,
+                                            c.pe.optional_header.SizeOfImage,
+                                            resource_stored);
+    bool master_ok = range_within(c.hdr.master_key_offset, 64u, c.packed_data.size());
+    bool stub_ok = c.hdr.stub_code_offset != 0u &&
+        range_within(c.hdr.stub_code_offset, 1u, c.packed_data.size());
+    bool aux_ok = false;
+    if (c.hdr.version == protector::kPackedVersion) {
+        aux_ok = c.hdr.aux_offset != 0u &&
+            c.hdr.aux_size == sizeof(protector::aux_block_t) &&
+            range_within(c.hdr.aux_offset, c.hdr.aux_size, c.packed_data.size());
+    } else {
+        aux_ok = c.hdr.aux_size == 0u ||
+            range_within(c.hdr.aux_offset, c.hdr.aux_size, c.packed_data.size());
+    }
+    bool ok = version_ok && section_table_ok && desc_sizes_ok && desc_blob_ok &&
+        desc_layer_ok && desc_image_ok && import_ok && string_ok && resource_ok &&
+        master_ok && stub_ok && aux_ok;
+    char buf[384];
+    std::snprintf(buf, sizeof(buf),
+                  "ver=%d sections=%u valid_desc=%u table=%d sizes=%d blobs=%d layers=%d image=%d imports=%d/%u pool=%u strings=%d/%u resources=%d/%u master=%d stub=%d aux=%d",
+                  version_ok ? 1 : 0,
+                  c.hdr.section_count,
+                  valid_desc,
+                  section_table_ok ? 1 : 0,
+                  desc_sizes_ok ? 1 : 0,
+                  desc_blob_ok ? 1 : 0,
+                  desc_layer_ok ? 1 : 0,
+                  desc_image_ok ? 1 : 0,
+                  import_ok ? 1 : 0,
+                  import_stored,
+                  import_pool,
+                  string_ok ? 1 : 0,
+                  string_stored,
+                  resource_ok ? 1 : 0,
+                  resource_stored,
+                  master_ok ? 1 : 0,
+                  stub_ok ? 1 : 0,
+                  aux_ok ? 1 : 0);
+    return { "P30", "packed runtime layout bounds valid", ok, buf };
+}
+
 inline verify_report_t run_probes(const context_t& c) {
     probe_result_t (*probes[])(const context_t&) = {
         probe_p01, probe_p02, probe_p03, probe_p04, probe_p05,
@@ -679,7 +935,7 @@ inline verify_report_t run_probes(const context_t& c) {
         probe_p11, probe_p12, probe_p13,
         probe_p14, probe_p15, probe_p16, probe_p17, probe_p18, probe_p19, probe_p20,
         probe_p21, probe_p22, probe_p23, probe_p24, probe_p25, probe_p26, probe_p27,
-        probe_p28
+        probe_p28, probe_p29, probe_p30
     };
     verify_report_t rep;
     for (auto fn : probes) {

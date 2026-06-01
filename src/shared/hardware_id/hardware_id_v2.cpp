@@ -17,9 +17,11 @@
 #include <intrin.h>
 #include <tbs.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <cstdio>
+#include <utility>
 #include <vector>
 
 #pragma comment(lib, "advapi32.lib")
@@ -328,6 +330,34 @@ namespace aida::hardware_id::v2
             return true;
         }
 
+        struct mac_candidate_t
+        {
+            std::string value;
+            bool permanent = false;
+        };
+
+        bool usable_mac(const std::uint8_t mac[6]) noexcept
+        {
+            bool all_zero = true;
+            bool all_ff = true;
+            for (int i = 0; i < 6; ++i) {
+                if (mac[i] != 0x00) all_zero = false;
+                if (mac[i] != 0xFF) all_ff = false;
+            }
+            return !all_zero && !all_ff;
+        }
+
+        void add_mac_candidate(std::vector<mac_candidate_t>& candidates,
+                               const std::uint8_t mac[6],
+                               bool permanent)
+        {
+            if (!usable_mac(mac)) return;
+            mac_candidate_t c;
+            c.value = normalize_mac(mac);
+            c.permanent = permanent;
+            candidates.push_back(std::move(c));
+        }
+
         bool collect_permanent_mac(std::vector<std::uint8_t>& out) noexcept
         {
             ULONG sz = 0;
@@ -347,6 +377,7 @@ namespace aida::hardware_id::v2
                                      nullptr, adapters, &got_sz) != NO_ERROR) {
                 return false;
             }
+            std::vector<mac_candidate_t> candidates;
             for (auto* a = adapters; a; a = a->Next) {
                 if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
                 if (a->IfType == IF_TYPE_TUNNEL) continue;
@@ -371,26 +402,27 @@ namespace aida::hardware_id::v2
                                               &returned, nullptr);
                     CloseHandle(h);
                     if (ok && returned >= 6) {
-                        bool all_zero = true;
-                        for (int i = 0; i < 6; ++i) if (mac[i] != 0) all_zero = false;
-                        if (!all_zero) {
-                            std::string s = normalize_mac(mac);
-                            out.assign(s.begin(), s.end());
-                            return true;
-                        }
+                        add_mac_candidate(candidates, mac, true);
                     }
                 }
                 std::uint8_t mac2[6];
                 std::memcpy(mac2, a->PhysicalAddress, 6);
-                bool all_zero = true;
-                for (int i = 0; i < 6; ++i) if (mac2[i] != 0) all_zero = false;
-                if (!all_zero) {
-                    std::string s = normalize_mac(mac2);
-                    out.assign(s.begin(), s.end());
-                    return true;
-                }
+                add_mac_candidate(candidates, mac2, false);
             }
-            return false;
+            if (candidates.empty()) return false;
+            std::sort(candidates.begin(), candidates.end(),
+                      [](const mac_candidate_t& a, const mac_candidate_t& b) {
+                          if (a.permanent != b.permanent) return a.permanent && !b.permanent;
+                          return a.value < b.value;
+                      });
+            auto last = std::unique(candidates.begin(), candidates.end(),
+                                    [](const mac_candidate_t& a, const mac_candidate_t& b) {
+                                        return a.permanent == b.permanent && a.value == b.value;
+                                    });
+            candidates.erase(last, candidates.end());
+            const std::string& selected = candidates.front().value;
+            out.assign(selected.begin(), selected.end());
+            return true;
         }
 
         bool collect_cpuid_brand(std::vector<std::uint8_t>& out) noexcept
@@ -667,31 +699,9 @@ namespace aida::hardware_id::v2
                                    bool& out_present) noexcept
         {
             out_present = false;
-            std::vector<std::uint8_t> der;
-            if (!tpm_nv_read_full(kEkNvIndexRsa, der) || der.empty()) {
-                if (!tpm_nv_read_full(kEkNvIndexEcc, der) || der.empty()) {
-                    const char* literal = "no_tpm";
-                    out.assign(reinterpret_cast<const std::uint8_t*>(literal),
-                               reinterpret_cast<const std::uint8_t*>(literal) + 6);
-                    return true;
-                }
-            }
-            std::array<std::uint8_t, 32> hash{};
-            if (!sha256_compute(der.data(), der.size(), hash)) {
-                const char* literal = "no_tpm";
-                out.assign(reinterpret_cast<const std::uint8_t*>(literal),
-                           reinterpret_cast<const std::uint8_t*>(literal) + 6);
-                return true;
-            }
-            static const char* hex = "0123456789abcdef";
-            std::string s;
-            s.resize(64);
-            for (int i = 0; i < 32; ++i) {
-                s[i * 2]     = hex[(hash[i] >> 4) & 0xF];
-                s[i * 2 + 1] = hex[hash[i] & 0xF];
-            }
-            out.assign(s.begin(), s.end());
-            out_present = true;
+            const char* literal = "no_tpm";
+            out.assign(reinterpret_cast<const std::uint8_t*>(literal),
+                       reinterpret_cast<const std::uint8_t*>(literal) + 6);
             return true;
         }
 

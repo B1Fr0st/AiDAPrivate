@@ -154,11 +154,15 @@ tool_result_t tool_headless_start(const json& params)
             cfg.server_module = params["server_module"].get<std::string>();
         if (params.contains("launch_timeout_ms") && params["launch_timeout_ms"].is_number_integer())
             cfg.launch_timeout_ms = params["launch_timeout_ms"].get<int>();
+        if (params.contains("window_width") && params["window_width"].is_number_integer())
+            cfg.window_width = params["window_width"].get<int>();
+        if (params.contains("window_height") && params["window_height"].is_number_integer())
+            cfg.window_height = params["window_height"].get<int>();
     }
-    diag::log_tagged_fmt("mcp_burp", "headless_start config headless=%d has_proxy=%d proxy_len=%zu os=%s locale=%s humanize=%d geoip=%d block_images=%d block_webrtc=%d enable_trace=%d python=%s module=%s timeout_ms=%d",
+    diag::log_tagged_fmt("mcp_burp", "headless_start config headless=%d has_proxy=%d proxy_len=%zu os=%s locale=%s humanize=%d geoip=%d block_images=%d block_webrtc=%d enable_trace=%d python=%s module=%s timeout_ms=%d window=%dx%d",
         (int)cfg.headless, (int)!cfg.proxy.empty(), cfg.proxy.size(), cfg.os.c_str(), cfg.locale.c_str(),
         (int)cfg.humanize, (int)cfg.geoip, (int)cfg.block_images, (int)cfg.block_webrtc, (int)cfg.enable_trace,
-        cfg.python_executable.c_str(), cfg.server_module.c_str(), cfg.launch_timeout_ms);
+        cfg.python_executable.c_str(), cfg.server_module.c_str(), cfg.launch_timeout_ms, cfg.window_width, cfg.window_height);
     bool ok = camoufox::start_bridge(cfg);
     auto s = camoufox::get_status();
     json j = status_to_json(s);
@@ -267,6 +271,8 @@ camoufox::launch_config_t launch_config_from_mcp_params(const json& params)
     cfg.python_executable = json_string_param(params, "python_executable", cfg.python_executable);
     cfg.server_module = json_string_param(params, "server_module", cfg.server_module);
     cfg.launch_timeout_ms = json_int_param(params, "launch_timeout_ms", cfg.launch_timeout_ms);
+    cfg.window_width = json_int_param(params, "window_width", json_int_param(params, "width", cfg.window_width));
+    cfg.window_height = json_int_param(params, "window_height", json_int_param(params, "height", cfg.window_height));
     return cfg;
 }
 
@@ -334,7 +340,9 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"enable_trace", "boolean", "Enable engine-level property access tracing", false},
              {"python_executable", "string", "Override Python interpreter path", false},
              {"server_module", "string", "Override Python module name", false},
-             {"launch_timeout_ms", "number", "Launch timeout in milliseconds", false}}, false, 240000},
+             {"launch_timeout_ms", "number", "Launch timeout in milliseconds", false},
+             {"window_width", "number", "Initial outer browser window width in pixels", false},
+             {"window_height", "number", "Initial outer browser window height in pixels", false}}, false, 240000},
         {"close_browser", "Close Camoufox and stop the hidden bundled Python bridge.", {}, false, 30000},
         {"navigate", "Navigate the active Camoufox page with optional hook pre-injection and redirect tracing.",
             {{"url", "string", "Target URL", true},
@@ -864,6 +872,8 @@ void register_camoufox_tools(mcp_standalone::server_t& srv)
             {"python_executable", "string",  "Override python interpreter path", false},
             {"server_module",     "string",  "MCP server module name (default camoufox_reverse_mcp)", false},
             {"launch_timeout_ms", "number",  "Launch handshake timeout in ms (default 180000, max 240000)", false},
+            {"window_width",      "number",  "Initial outer browser window width in pixels", false},
+            {"window_height",     "number",  "Initial outer browser window height in pixels", false},
         },
         tool_headless_start,
         false

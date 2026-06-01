@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <exception>
 #include <functional>
 #include <mutex>
 #include <queue>
@@ -46,21 +47,28 @@ inline void initialize() {
             p.alive.store(false, std::memory_order_release);
             return;
         }
-        p.workers.reserve(POOL_SIZE);
-        for (int i = 0; i < POOL_SIZE; ++i) {
-            p.workers.emplace_back([&p]() {
-                while (true) {
-                    std::function<void()> task;
-                    {
-                        std::unique_lock<std::mutex> lk(p.mtx);
-                        p.cv.wait(lk, [&p]() { return !p.tasks.empty() || !p.alive.load(); });
-                        if (!p.alive.load() && p.tasks.empty()) return;
-                        task = std::move(p.tasks.front());
-                        p.tasks.pop();
+        try {
+            p.workers.reserve(POOL_SIZE);
+            for (int i = 0; i < POOL_SIZE; ++i) {
+                p.workers.emplace_back([&p]() {
+                    while (true) {
+                        std::function<void()> task;
+                        {
+                            std::unique_lock<std::mutex> lk(p.mtx);
+                            p.cv.wait(lk, [&p]() { return !p.tasks.empty() || !p.alive.load(); });
+                            if (!p.alive.load() && p.tasks.empty()) return;
+                            task = std::move(p.tasks.front());
+                            p.tasks.pop();
+                        }
+                        try { task(); } catch (...) {}
                     }
-                    try { task(); } catch (...) {}
-                }
-            });
+                });
+            }
+        } catch (...) {
+            if (p.workers.empty()) {
+                p.alive.store(false, std::memory_order_release);
+                p.cv.notify_all();
+            }
         }
     }
 }
@@ -72,7 +80,11 @@ inline bool post(std::function<void()> f) {
     {
         std::lock_guard<std::mutex> lk(p.mtx);
         if (!p.alive.load(std::memory_order_acquire) || p.shutting_down.load(std::memory_order_acquire)) return false;
-        p.tasks.push(std::move(f));
+        try {
+            p.tasks.push(std::move(f));
+        } catch (...) {
+            return false;
+        }
     }
     p.cv.notify_one();
     return true;

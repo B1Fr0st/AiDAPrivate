@@ -13,6 +13,8 @@
 
 void init_standalone_chat();
 void shutdown_standalone_chat();
+void mark_ide_ready_for_mcp_services();
+void start_authorized_mcp_services();
 
 
 void tick_ai_chat();

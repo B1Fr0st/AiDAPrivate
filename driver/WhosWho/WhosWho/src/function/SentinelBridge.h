@@ -331,34 +331,13 @@ namespace sentinel_bridge {
                 || reason == RE_REASON_DMA_CANARY;
         }
 
-        __forceinline void add_evidence(ULONG reason) {
-            UINT64 now = __rdtsc();
-            UINT32 family = classify_family(reason);
-
-            LONG count = _InterlockedCompareExchange(&g_entry_count, 0, 0);
-            for (LONG i = 0; i < count && i < MAX_ENTRIES; i++) {
-                if (g_entries[i].reason == reason)
-                    return;
-            }
-
-            LONG idx = _InterlockedIncrement(&g_entry_count) - 1;
-            if (idx >= MAX_ENTRIES) {
-                _InterlockedDecrement(&g_entry_count);
-                return;
-            }
-
-            g_entries[idx].reason = reason;
-            g_entries[idx].family = family;
-            g_entries[idx].tsc = now;
-        }
-
         __forceinline ULONG popcount32(UINT32 v) {
             ULONG c = 0;
             while (v) { v &= (v - 1); c++; }
             return c;
         }
 
-        __forceinline bool should_bugcheck() {
+        __forceinline UINT32 active_family_mask() {
             UINT64 now = __rdtsc();
             UINT32 families_present = 0;
             LONG count = _InterlockedCompareExchange(&g_entry_count, 0, 0);
@@ -369,6 +348,55 @@ namespace sentinel_bridge {
                 families_present |= g_entries[i].family;
             }
 
+            return families_present;
+        }
+
+        __forceinline void add_evidence(ULONG reason) {
+            UINT64 now = __rdtsc();
+            UINT32 family = classify_family(reason);
+
+            LONG count = _InterlockedCompareExchange(&g_entry_count, 0, 0);
+            for (LONG i = 0; i < count && i < MAX_ENTRIES; i++) {
+                if (g_entries[i].reason == reason) {
+                    UINT32 active = active_family_mask();
+                    UINT32 non_sc = active & ~EVIDENCE_FAMILY_SIDECHANNEL;
+                    WW_LOG("evidence_accumulator: duplicate reason=0x%lx family=0x%lx active=0x%lx non_sc=0x%lx quorum=%lu/%lu decision=observe",
+                        reason,
+                        family,
+                        active,
+                        non_sc,
+                        popcount32(active),
+                        REQUIRED_FAMILIES);
+                    return;
+                }
+            }
+
+            LONG idx = _InterlockedIncrement(&g_entry_count) - 1;
+            if (idx >= MAX_ENTRIES) {
+                _InterlockedDecrement(&g_entry_count);
+                WW_LOG("evidence_accumulator: full reason=0x%lx family=0x%lx decision=observe", reason, family);
+                return;
+            }
+
+            g_entries[idx].reason = reason;
+            g_entries[idx].family = family;
+            g_entries[idx].tsc = now;
+            UINT32 active = active_family_mask();
+            UINT32 non_sc = active & ~EVIDENCE_FAMILY_SIDECHANNEL;
+            ULONG family_count = popcount32(active);
+            WW_LOG("evidence_accumulator: add reason=0x%lx family=0x%lx active=0x%lx non_sc=0x%lx quorum=%lu/%lu sidechannel_only=%d decision=%s",
+                reason,
+                family,
+                active,
+                non_sc,
+                family_count,
+                REQUIRED_FAMILIES,
+                non_sc == 0 ? 1 : 0,
+                (non_sc != 0 && family_count >= REQUIRED_FAMILIES) ? "deny" : "observe");
+        }
+
+        __forceinline bool should_bugcheck() {
+            UINT32 families_present = active_family_mask();
             UINT32 non_sc = families_present & ~EVIDENCE_FAMILY_SIDECHANNEL;
             if (non_sc == 0)
                 return false;
@@ -605,16 +633,9 @@ namespace sentinel_bridge {
             streak, STALE_THRESHOLD, current_sentinel_tsc, last);
 
         if (streak >= STALE_THRESHOLD) {
-            WW_LOG("watchdog_dpc: BUGCHECK! streak=%ld >= threshold=%ld, sentinel_tsc=%lld, last=%lld, elapsed=%lld",
+            WW_LOG("watchdog_dpc: sentinel_absent_nonfatal streak=%ld >= threshold=%ld, sentinel_tsc=%lld, last=%lld, elapsed=%lld",
                 streak, STALE_THRESHOLD, current_sentinel_tsc, last, elapsed);
-            if (_KeBugCheckEx) {
-                _KeBugCheckEx(
-                    BUGCHECK_SENTINEL_ABSENT,
-                    static_cast<ULONG_PTR>(last),
-                    static_cast<ULONG_PTR>(current_sentinel_tsc),
-                    static_cast<ULONG_PTR>(elapsed),
-                    static_cast<ULONG_PTR>(streak));
-            }
+            _InterlockedExchange(&g_stale_streak, STALE_THRESHOLD);
         }
     }
 

@@ -471,8 +471,9 @@ bool load_from_disk()
     diag::log_tagged_fmt("issue", "load_from_disk path=%s", path.c_str());
     std::ifstream f(path, std::ios::binary);
     if (!f.is_open()) {
-        diag::log_tagged_fmt("issue", "load_from_disk file_not_found path=%s", path.c_str());
-        return false;
+        diag::log_tagged_fmt("issue", "load_from_disk new_store path=%s", path.c_str());
+        save_to_disk();
+        return true;
     }
     std::string raw((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     if (raw.empty()) {

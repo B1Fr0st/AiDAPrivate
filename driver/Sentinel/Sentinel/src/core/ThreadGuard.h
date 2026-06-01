@@ -8,6 +8,7 @@ namespace thread_guard {
     inline volatile UINT64 g_target_base = 0;
     inline volatile UINT64 g_target_size = 0;
     inline volatile LONG   g_initialized = 0;
+    inline volatile LONG   g_not_initialized_logged = 0;
 
 
     inline volatile LONG   g_targeted_debug_strikes = 0;
@@ -22,6 +23,7 @@ namespace thread_guard {
 
         g_target_base = target_base;
         g_target_size = target_size;
+        _InterlockedExchange(&g_not_initialized_logged, 0);
         _InterlockedExchange(&g_initialized, 1);
         SN_LOG("thread_guard::init: SUCCESS");
         return true;
@@ -31,51 +33,116 @@ namespace thread_guard {
     __forceinline ULONG_PTR NTAPI ipi_clear_callback(ULONG_PTR Context) {
         UNREFERENCED_PARAMETER(Context);
 
+        __try {
+            UINT64 dr0 = __readdr(0);
+            UINT64 dr1 = __readdr(1);
+            UINT64 dr2 = __readdr(2);
+            UINT64 dr3 = __readdr(3);
 
-        UINT64 dr0 = __readdr(0);
-        UINT64 dr1 = __readdr(1);
-        UINT64 dr2 = __readdr(2);
-        UINT64 dr3 = __readdr(3);
+            UINT64 base = g_target_base;
+            UINT64 end  = base + g_target_size;
 
-        UINT64 base = g_target_base;
-        UINT64 end  = base + g_target_size;
-
-        volatile LONG* flag = (volatile LONG*)Context;
+            volatile LONG* flag = (volatile LONG*)Context;
 
 
-        if (base && end > base) {
-            if ((dr0 >= base && dr0 < end) ||
-                (dr1 >= base && dr1 < end) ||
-                (dr2 >= base && dr2 < end) ||
-                (dr3 >= base && dr3 < end)) {
-                if (flag)
-                    _InterlockedExchange(flag, 1);
+            if (base && end > base) {
+                if ((dr0 >= base && dr0 < end) ||
+                    (dr1 >= base && dr1 < end) ||
+                    (dr2 >= base && dr2 < end) ||
+                    (dr3 >= base && dr3 < end)) {
+                    if (flag)
+                        _InterlockedExchange(flag, 1);
+                }
             }
+
+            __writedr(0, 0);
+            __writedr(1, 0);
+            __writedr(2, 0);
+            __writedr(3, 0);
+            __writedr(7, 0);
         }
-
-
-        __writedr(0, 0);
-        __writedr(1, 0);
-        __writedr(2, 0);
-        __writedr(3, 0);
-        __writedr(7, 0);
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
 
         return 0;
     }
 
 
     __forceinline void clear_debug_registers_current_cpu() {
-        __writedr(0, 0);
-        __writedr(1, 0);
-        __writedr(2, 0);
-        __writedr(3, 0);
-        __writedr(7, 0);
+        __try {
+            __writedr(0, 0);
+            __writedr(1, 0);
+            __writedr(2, 0);
+            __writedr(3, 0);
+            __writedr(7, 0);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            SN_LOG("thread_guard::clear_current_cpu: EXCEPTION");
+        }
+    }
+
+    __forceinline void record_targeted_debug_detection() {
+        LONG strikes = _InterlockedIncrement(&g_targeted_debug_strikes);
+
+        if (strikes >= STRIKE_THRESHOLD) {
+            targeting_latch::latch_targeting(
+                targeting_latch::RE_REASON_DR_ON_TEXT,
+                g_target_base,
+                g_target_size,
+                static_cast<UINT64>(strikes),
+                0
+            );
+        }
+    }
+
+    __forceinline bool check_and_clear_current_cpu() {
+        if (!_InterlockedCompareExchange(&g_initialized, 1, 1)) {
+            if (_InterlockedCompareExchange(&g_not_initialized_logged, 1, 0) == 0)
+                SN_LOG("thread_guard::current_cpu: not initialized, skip");
+            return true;
+        }
+
+        bool targeted = false;
+        __try {
+            UINT64 dr0 = __readdr(0);
+            UINT64 dr1 = __readdr(1);
+            UINT64 dr2 = __readdr(2);
+            UINT64 dr3 = __readdr(3);
+
+            UINT64 base = g_target_base;
+            UINT64 end  = base + g_target_size;
+            if (base && end > base) {
+                targeted = (dr0 >= base && dr0 < end) ||
+                           (dr1 >= base && dr1 < end) ||
+                           (dr2 >= base && dr2 < end) ||
+                           (dr3 >= base && dr3 < end);
+            }
+
+            __writedr(0, 0);
+            __writedr(1, 0);
+            __writedr(2, 0);
+            __writedr(3, 0);
+            __writedr(7, 0);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            SN_LOG("thread_guard::current_cpu: EXCEPTION");
+            return true;
+        }
+
+        if (targeted) {
+            record_targeted_debug_detection();
+            return true;
+        }
+
+        _InterlockedExchange(&g_targeted_debug_strikes, 0);
+        return true;
     }
 
 
     __forceinline bool ipi_clear_all_cpus() {
         if (!_InterlockedCompareExchange(&g_initialized, 1, 1)) {
-            SN_LOG("thread_guard::ipi_clear: not initialized, skip");
+            if (_InterlockedCompareExchange(&g_not_initialized_logged, 1, 0) == 0)
+                SN_LOG("thread_guard::ipi_clear: not initialized, skip");
             return true;
         }
 
@@ -100,19 +167,7 @@ namespace thread_guard {
 
         if (_InterlockedCompareExchange(&targeted_debug_detected, 0, 0) != 0) {
 
-            LONG strikes = _InterlockedIncrement(&g_targeted_debug_strikes);
-
-            if (strikes >= STRIKE_THRESHOLD) {
-                targeting_latch::latch_targeting(
-                    targeting_latch::RE_REASON_DR_ON_TEXT,
-                    g_target_base,
-                    g_target_size,
-                    static_cast<UINT64>(strikes),
-                    0
-                );
-            }
-
-
+            record_targeted_debug_detection();
             return true;
         }
 

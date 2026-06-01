@@ -702,6 +702,10 @@ NTSTATUS functions::handle7783(p_alloc_mem request) {
         return STATUS_INVALID_PARAMETER;
     }
 
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
     if (request->pid == 0 || request->pid <= 4) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -769,6 +773,10 @@ NTSTATUS functions::handle7783(p_alloc_mem request) {
 NTSTATUS functions::handle7784(p_free_mem request) {
     if (!request) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        return STATUS_INVALID_DEVICE_STATE;
     }
 
     if (request->pid == 0 || request->pid <= 4) {

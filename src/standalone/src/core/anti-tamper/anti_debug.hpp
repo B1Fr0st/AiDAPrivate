@@ -356,7 +356,8 @@ inline bool check_kd_shared_data()
     __try
     {
         uint8_t kd_enabled = *(kuser + 0x2D4);
-        return kd_enabled != 0;
+        uint8_t kd_not_present = *(kuser + 0x2D5);
+        return kd_enabled != 0 && kd_not_present == 0;
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
@@ -404,82 +405,17 @@ inline bool check_thread_hidden()
 
 inline bool check_branch_miss_flat()
 {
-    HANDLE this_thread = GetCurrentThread();
-    DWORD_PTR prev_mask = SetThreadAffinityMask(this_thread, 1ull);
-    if (prev_mask == 0)
+    driver_bridge::anti_debug_result_t kernel{};
+    if (!driver_bridge::kernel_anti_debug_query(kernel))
         return false;
 
-    int regs[4] = {};
-    __cpuid(regs, 0xA);
-    const unsigned arch_perf_version = static_cast<unsigned>(regs[0] & 0xFF);
-    const unsigned num_counters = static_cast<unsigned>((regs[0] >> 8) & 0xFF);
-    if (arch_perf_version == 0 || num_counters == 0) {
-        SetThreadAffinityMask(this_thread, prev_mask);
-        return false;
-    }
-
-    constexpr unsigned BRANCH_MISS_FIXED_INDEX = 0x40000001u;
-    uint64_t snap_a = 0;
-    uint64_t snap_b = 0;
-    bool measured = false;
-
-    __try {
-        _mm_lfence();
-        snap_a = __readpmc(BRANCH_MISS_FIXED_INDEX);
-        _mm_lfence();
-        measured = true;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        measured = false;
-    }
-
-    if (!measured) {
-        SetThreadAffinityMask(this_thread, prev_mask);
-        return false;
-    }
-
-    LARGE_INTEGER freq{};
-    LARGE_INTEGER t0{};
-    LARGE_INTEGER t1{};
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&t0);
-
-    volatile uint64_t pseudo = 0xA5A5A5A5A5A5A5A5ULL;
-    volatile uint64_t accumulator = 0;
-    while (true) {
-        QueryPerformanceCounter(&t1);
-        const double elapsed_ms = static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0
-                                  / static_cast<double>(freq.QuadPart);
-        if (elapsed_ms >= 10.0)
-            break;
-
-        for (int i = 0; i < 4096; ++i) {
-            pseudo ^= pseudo << 13;
-            pseudo ^= pseudo >> 7;
-            pseudo ^= pseudo << 17;
-            if ((pseudo & 0x1ULL) != 0)
-                accumulator += static_cast<uint64_t>(i) * 31u;
-            else
-                accumulator -= static_cast<uint64_t>(i) * 17u;
-        }
-    }
-
-    bool flat = false;
-    __try {
-        _mm_lfence();
-        snap_b = __readpmc(BRANCH_MISS_FIXED_INDEX);
-        _mm_lfence();
-        const uint64_t delta = snap_b - snap_a;
-        const uint32_t kind_flags = (delta == 0) ? (TIMING_FLAG_FLAT | TIMING_FLAG_ANOMALY) : 0u;
-        timing_ring_push(TIMING_KIND_BRANCH_MISS, kind_flags, delta, accumulator);
-        flat = (delta == 0);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        flat = false;
-    }
-
-    SetThreadAffinityMask(this_thread, prev_mask);
-    return flat;
+    constexpr uint32_t kernel_detect_timing_attack = 0x00000010u;
+    const bool timing_attack = (kernel.result_flags & kernel_detect_timing_attack) != 0;
+    timing_ring_push(TIMING_KIND_BRANCH_MISS,
+                     timing_attack ? TIMING_FLAG_ANOMALY : 0u,
+                     kernel.result_flags,
+                     kernel.dr_clear_count);
+    return timing_attack;
 }
 
 inline bool check_page_fault_timing_anomaly()
@@ -846,16 +782,10 @@ inline debug_report_t full_scan(uint64_t mod_base = 0, uint64_t mod_end = 0)
     }
 
     report.kernel_debugger = check_kernel_debugger();
-#if defined(AIDA_TEST_VMWARE_BYPASS)
-    report.kernel_debugger = false;
-#endif
     if (report.kernel_debugger)
         webhook::send_debug_log("kernel_debugger", "KdEnabled", true);
 
     report.kd_shared_data = check_kd_shared_data();
-#if defined(AIDA_TEST_VMWARE_BYPASS)
-    report.kd_shared_data = false;
-#endif
     if (report.kd_shared_data)
         webhook::send_debug_log("kd_shared_data", "KUSER_SharedData.KdDebuggerEnabled", true);
 
@@ -869,7 +799,7 @@ inline debug_report_t full_scan(uint64_t mod_base = 0, uint64_t mod_end = 0)
 
     report.branch_miss_flat = check_branch_miss_flat();
     if (report.branch_miss_flat)
-        webhook::send_debug_log("branch_miss_flat", "rdpmc_branch_delta=0", true);
+        webhook::send_debug_log("branch_miss_flat", "kernel_timing_attack", true);
 
     report.page_fault_timing_anomaly = check_page_fault_timing_anomaly();
     if (report.page_fault_timing_anomaly)

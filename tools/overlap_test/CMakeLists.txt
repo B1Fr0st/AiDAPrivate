@@ -45,7 +45,7 @@ target_compile_definitions(OVERLAP_TEST PRIVATE
 
 if(MSVC)
     target_compile_options(OVERLAP_TEST PRIVATE
-        /W3 /EHa /permissive- /Zc:__cplusplus /Zp8 /MD /bigobj
+        /W3 /EHsc /permissive- /Zc:__cplusplus /Zp8 /MD /bigobj
     )
 endif()
 

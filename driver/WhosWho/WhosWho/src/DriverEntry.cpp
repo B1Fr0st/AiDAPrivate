@@ -362,11 +362,18 @@ static void ZeroUninitializedSectionsSelf(PVOID self_anchor)
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
 
+    dbg_capture::write_immediate_formatted("[WW-EARLY] DriverEntry entered driver_object_present=%u registry_path_present=%u\n",
+        DriverObject != nullptr ? 1u : 0u,
+        RegistryPath != nullptr ? 1u : 0u);
     ZeroUninitializedSectionsSelf(reinterpret_cast<PVOID>(&DriverEntry));
+    dbg_capture::write_immediate_formatted("[WW-EARLY] SetupFunctions begin\n");
 
     if (!SetupFunctions()) {
+        dbg_capture::write_immediate_formatted("[WW-EARLY] SetupFunctions FAILED\n");
         return STATUS_UNSUCCESSFUL;
     }
+
+    dbg_capture::write_immediate_formatted("[WW-EARLY] SetupFunctions OK\n");
 
     dbg_capture::initialize();
 
@@ -399,7 +406,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
         return status;
     }
 
-    WW_LOG("DriverEntry: device created at %p", deviceObject);
+    WW_LOG("DriverEntry: device created present=%u", deviceObject != nullptr ? 1u : 0u);
 
     UNICODE_STRING symLink = {};
     _RtlInitUnicodeString(&symLink, device_names::get_symlink_name());
@@ -444,7 +451,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     if (DriverObject->DriverSection) {
         auto ldr = static_cast<PLDR_DATA_TABLE_ENTRY>(DriverObject->DriverSection);
         PVOID base = ldr->DllBase;
-        WW_LOG("DriverEntry: DriverSection base=%p SizeOfImage=0x%lx", base, ldr->SizeOfImage);
+        WW_LOG("DriverEntry: DriverSection base_present=%u SizeOfImage=0x%lx", base != nullptr ? 1u : 0u, ldr->SizeOfImage);
         if (base && _MmIsAddressValid(base)) {
             PIMAGE_DOS_HEADER dos = static_cast<PIMAGE_DOS_HEADER>(base);
             if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
@@ -462,7 +469,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
                             sec[i].Name[4] == 't') {
                             PVOID text_base = static_cast<UCHAR*>(base) + sec[i].VirtualAddress;
                             ULONG text_size = sec[i].Misc.VirtualSize;
-                            WW_LOG("DriverEntry: .text found at %p size=0x%lx", text_base, text_size);
+                            WW_LOG("DriverEntry: .text found present=%u size=0x%lx", text_base != nullptr ? 1u : 0u, text_size);
                             sentinel_bridge::init(text_base, text_size);
                             found_text = true;
                             break;
@@ -478,7 +485,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
                 WW_LOG("DriverEntry: DOS signature invalid");
             }
         } else {
-            WW_LOG("DriverEntry: base invalid or not valid address: %p", base);
+            WW_LOG("DriverEntry: base invalid or not valid address present=%u", base != nullptr ? 1u : 0u);
         }
     } else {
         WW_LOG("DriverEntry: DriverSection is NULL");
@@ -506,7 +513,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     WW_LOG("DriverEntry: debug_events::initialize returned 0x%08lx", dbe_status);
 
     WW_LOG("DriverEntry: invoking malware_safe::init (after process_guard)...");
-    NTSTATUS ms_status = malware_safe::init();
+    NTSTATUS ms_status = malware_safe::init(DriverObject);
     if (!NT_SUCCESS(ms_status) && ms_status != STATUS_ALREADY_REGISTERED) {
         WW_LOG("DriverEntry: malware_safe::init FAILED 0x%08lx - continuing with malware-safe gating DISABLED",
             ms_status);
@@ -530,8 +537,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     WW_LOG("DriverEntry: deleting driver on disk...");
     DeleteDriverOnDisk(RegistryPath);
 
-    WW_LOG("DriverEntry: COMPLETE, bridge at %p magic=0x%lx whoswho_tsc=%lld sentinel_tsc=%lld",
-        &sentinel_bridge::g_bridge, sentinel_bridge::g_bridge.magic,
+    WW_LOG("DriverEntry: COMPLETE, bridge_present=1 magic_set=%u whoswho_tsc=%lld sentinel_tsc=%lld",
+        sentinel_bridge::g_bridge.magic != 0 ? 1u : 0u,
         sentinel_bridge::g_bridge.whoswho_tsc, sentinel_bridge::g_bridge.sentinel_tsc);
 
     return STATUS_SUCCESS;

@@ -31,6 +31,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -1354,23 +1355,10 @@ int tab_count()
 std::vector<tab_info_t> snapshot_tabs()
 {
 	std::vector<tab_info_t> out;
-	diag::log_tagged_critical_fmt("psv", "snapshot_tabs ENTER tid=%lu",
-		static_cast<unsigned long>(GetCurrentThreadId()));
 	std::lock_guard<std::mutex> guard(state_mutex());
 	auto& s = state();
-	diag::log_tagged_critical_fmt("psv", "snapshot_tabs locked tabs=%zu active=%d",
-		s.tabs.size(), s.active_index);
 	out.reserve(s.tabs.size());
 	for (auto& t : s.tabs) {
-		diag::log_tagged_critical_fmt("psv",
-			"snapshot_tabs tab_raw=%p addr=0x%llX label=%s loaded=%d pending=%d decompiling=%d error=%d",
-			t.get(),
-			static_cast<unsigned long long>(t->addr),
-			t->label.c_str(),
-			t->loaded ? 1 : 0,
-			t->pending ? 1 : 0,
-			t->decompiling ? 1 : 0,
-			t->is_error ? 1 : 0);
 		tab_info_t ti;
 		ti.addr = t->addr;
 		ti.label = t->label;
@@ -1380,7 +1368,6 @@ std::vector<tab_info_t> snapshot_tabs()
 		ti.is_error = t->is_error;
 		out.push_back(std::move(ti));
 	}
-	diag::log_tagged_critical_fmt("psv", "snapshot_tabs EXIT count=%zu", out.size());
 	return out;
 }
 
@@ -1564,6 +1551,14 @@ void render(float pos_x, float pos_y, float width, float height,
 			    && ImGui::IsKeyPressed(ImGuiKey_F5, false)) {
 				uint64_t f5_cursor = resolve_disasm_cursor_addr();
 				uint64_t f5_entry = 0;
+				bool f5_zero_padding = false;
+				const auto& f5_instrs = g_disasm.file.instrs;
+				int f5_row = disasm_view::g_state.selected_row;
+				if (f5_row >= 0 && f5_row < static_cast<int>(f5_instrs.size())) {
+					const auto& ins = f5_instrs[static_cast<size_t>(f5_row)];
+					f5_zero_padding = ins.raw[0] == 0 && ins.raw[1] == 0 &&
+						std::strcmp(ins.mnem, "add") == 0;
+				}
 				if (f5_cursor != 0) {
 					f5_entry = disasm_view::enclosing_function_start(f5_cursor, g_disasm.file);
 					if (f5_entry == 0) f5_entry = f5_cursor;
@@ -1583,6 +1578,21 @@ void render(float pos_x, float pos_y, float width, float height,
 					}
 					diag::log_tagged_critical_fmt("f5", "psv_f5_no_cursor active_addr=0x%llX",
 						static_cast<unsigned long long>(f5_active_addr));
+				} else if (f5_zero_padding) {
+					if (!s.error_popup_active) {
+						s.error_popup_active = true;
+						s.error_popup_message = "selected row is zero-filled padding, not a function";
+						s.error_popup_label = active->label;
+						s.error_popup_addr = f5_active_addr;
+						globals::ui::decompile_popup_active.store(false, std::memory_order_release);
+#ifdef _WIN32
+						MessageBeep(MB_ICONERROR);
+#endif
+					}
+					diag::log_tagged_critical_fmt("f5",
+						"psv_f5_rejected_zero_padding cursor=0x%llX row=%d",
+						static_cast<unsigned long long>(f5_cursor),
+						f5_row);
 				} else {
 					bool same_addr = (f5_entry == f5_active_addr);
 					diag::log_tagged_critical_fmt("f5",

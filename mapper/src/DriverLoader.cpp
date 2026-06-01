@@ -15,7 +15,7 @@ static void DLDbgLog(const char* func, const char* fmt, ...) {
     fflush(stdout);
     OutputDebugStringA(buf);
     OutputDebugStringA("\n");
-    if (g_LogFile) { fprintf(g_LogFile, "%s\n", buf); fflush(g_LogFile); }
+    if (g_LogFile) { fprintf(g_LogFile, "%s\n", buf); FlushMapperLogFile(); }
 }
 #define DLLOG(fmt, ...) DLDbgLog(__FUNCTION__, fmt, ##__VA_ARGS__)
 #define DLLOG_STATUS(msg, st) DLDbgLog(__FUNCTION__, "%s: 0x%08X (%s)", msg, (DWORD)(st), NT_SUCCESS(st) ? "SUCCESS" : "FAILED")
@@ -74,6 +74,22 @@ namespace DriverLoader {
         DWORD typeValue = 1;
         status = RtlWriteRegistryValuePtr(0, servicePath, L"Type", REG_DWORD, &typeValue, sizeof(DWORD));
         DLLOG_STATUS("RtlWriteRegistryValue (Type)", status);
+
+        if (!NT_SUCCESS(status)) {
+            return status;
+        }
+
+        DWORD startValue = 3;
+        status = RtlWriteRegistryValuePtr(0, servicePath, L"Start", REG_DWORD, &startValue, sizeof(DWORD));
+        DLLOG_STATUS("RtlWriteRegistryValue (Start)", status);
+
+        if (!NT_SUCCESS(status)) {
+            return status;
+        }
+
+        DWORD errorControlValue = 1;
+        status = RtlWriteRegistryValuePtr(0, servicePath, L"ErrorControl", REG_DWORD, &errorControlValue, sizeof(DWORD));
+        DLLOG_STATUS("RtlWriteRegistryValue (ErrorControl)", status);
 
         if (!NT_SUCCESS(status)) {
             return status;

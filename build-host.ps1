@@ -8,7 +8,7 @@ param(
     [switch]$PlanOnly,
     [switch]$NoToast,
     [string]$Preset = "ninja-msvc-release",
-    [string]$VsVars = "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat"
+    [string]$VsVars = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -28,9 +28,35 @@ if ($FullClean) {
     $Configure = $true
 }
 
-if (-not (Test-Path -LiteralPath $VsVars)) {
-    throw "vcvars64.bat was not found at $VsVars"
+function Resolve-VsVarsPath {
+    param([string]$Requested)
+    $candidates = New-Object System.Collections.Generic.List[string]
+    if (-not [string]::IsNullOrWhiteSpace($Requested)) {
+        $candidates.Add($Requested)
+    }
+    $editions = @("Professional", "Community", "Enterprise", "BuildTools")
+    foreach ($edition in $editions) {
+        $candidates.Add("C:\Program Files\Microsoft Visual Studio\2022\$edition\VC\Auxiliary\Build\vcvars64.bat")
+        $candidates.Add("C:\Program Files (x86)\Microsoft Visual Studio\2022\$edition\VC\Auxiliary\Build\vcvars64.bat")
+    }
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+    if (Test-Path -LiteralPath $vswhere) {
+        $installations = @(& $vswhere -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null)
+        foreach ($install in $installations) {
+            if (-not [string]::IsNullOrWhiteSpace($install)) {
+                $candidates.Add((Join-Path $install "VC\Auxiliary\Build\vcvars64.bat"))
+            }
+        }
+    }
+    foreach ($candidate in $candidates) {
+        if (-not [string]::IsNullOrWhiteSpace($candidate) -and (Test-Path -LiteralPath $candidate)) {
+            return $candidate
+        }
+    }
+    throw "vcvars64.bat was not found. Checked: $($candidates -join '; ')"
 }
+
+$VsVars = Resolve-VsVarsPath $VsVars
 
 if ($CleanBuildTree) {
     $Configure = $true
@@ -189,14 +215,16 @@ $steps = New-Object System.Collections.Generic.List[object]
 
 if ($Drivers) {
     $driverParts = @(
-        "if not exist build-ninja\Release mkdir build-ninja\Release",
+        "(if not exist build-ninja\Release mkdir build-ninja\Release)",
         "driver\Sentinel\nuget.exe restore driver\Sentinel\Sentinel.sln",
         "driver\Sentinel\nuget.exe restore driver\WhosWho\WhosWho.sln"
     )
     if ($CleanDrivers) {
-        $driverParts += "msbuild driver\WhosWho\WhosWho.sln /t:Clean /p:Configuration=Release /p:Platform=x64 /m /v:minimal"
+        $driverParts += "msbuild driver\Sentinel\Sentinel.sln /t:Clean /p:Configuration=Release /p:Platform=x64 /m:1 /p:BuildInParallel=false /v:minimal"
+        $driverParts += "msbuild driver\WhosWho\WhosWho.sln /t:Clean /p:Configuration=Release /p:Platform=x64 /m:1 /p:BuildInParallel=false /v:minimal"
     }
-    $driverParts += "msbuild driver\WhosWho\WhosWho.sln /t:Build /p:Configuration=Release /p:Platform=x64 /m /v:minimal"
+    $driverParts += "msbuild driver\Sentinel\Sentinel.sln /t:Build /p:Configuration=Release /p:Platform=x64 /m:1 /p:BuildInParallel=false /v:minimal"
+    $driverParts += "msbuild driver\WhosWho\WhosWho.sln /t:Build /p:Configuration=Release /p:Platform=x64 /m:1 /p:BuildInParallel=false /v:minimal"
     $steps.Add((New-Step "drivers" ($driverParts -join " && ") "driver.log" (Join-Path $env:TEMP "aida_driver_build_out.txt")))
 }
 

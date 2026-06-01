@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -388,7 +389,19 @@ namespace aida_ipc
         g_pipe_secret.assign(proof.pipe_secret,
                               proof.pipe_secret + aida_manual_map::kPipeSecretLen);
         g_running.store(true, std::memory_order_release);
-        std::thread(worker_thread).detach();
+        try
+        {
+            std::thread(worker_thread).detach();
+        }
+        catch (...)
+        {
+            g_running.store(false, std::memory_order_release);
+            g_authenticated.store(false, std::memory_order_release);
+            g_thread_started.store(false, std::memory_order_release);
+            SecureZeroMemory(g_pipe_secret.data(), g_pipe_secret.size());
+            g_pipe_secret.clear();
+            return false;
+        }
         return true;
     }
 

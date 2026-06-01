@@ -411,8 +411,8 @@ namespace process_guard {
                 HANDLE registered = caller_validation::g_registered_client_pid;
                 if (registered &&
                     reinterpret_cast<UINT64>(registered) == static_cast<UINT64>(dying_pid)) {
-                    caller_validation::unregister_client();
-                    WW_LOG("create_process_notify: registered client pid=%u exited, unregistered (canaries_cleared=%lu)",
+                    dispatcher::reset_dynamic_session_state("registered_client_exit", registered, cleared, FALSE);
+                    WW_LOG("create_process_notify: registered client pid=%u exited, session reset (canaries_cleared=%lu)",
                         dying_pid, cleared);
                 } else if (cleared) {
                     WW_LOG("create_process_notify: pid=%u exited, canaries_cleared=%lu",

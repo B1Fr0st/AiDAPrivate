@@ -303,6 +303,7 @@ const TELEGRAM_CHAT_ID    = process.env.TELEGRAM_CHAT_ID || '';
 const SLACK_WEBHOOK_URL   = process.env.SLACK_WEBHOOK_URL || '';
 const TPM_REQUIRED_TIERS  = new Set((process.env.TPM_REQUIRED_TIERS || '').split(',').map(s => s.trim()).filter(Boolean));
 const ANOMALY_DISABLED    = (process.env.ANOMALY_DISABLED || '0') === '1';
+const ACTIVATION_WEBHOOK_URL = process.env.ACTIVATION_WEBHOOK_URL || DISCORD_WEBHOOK_URL;
 
 const ED25519_KEY_ROTATION_NOT_BEFORE = parseInt(process.env.ED25519_KEY_NOT_BEFORE || '0', 10) || 0;
 const ED25519_NEXT_PUBKEY_B64 = process.env.ED25519_NEXT_PUBKEY_B64 || '';
@@ -705,6 +706,214 @@ async function sendSlackAlert(title, fields, severity) {
             body: JSON.stringify({ text: fallback, blocks }),
         });
     } catch (_) { }
+}
+
+
+async function fetchGeolocation(ip) {
+    if (!ip || ip === '127.0.0.1' || ip === '::1') {
+        return { country: 'localhost', countryCode: '', city: 'localhost', region: '', zip: '', lat: null, lon: null, timezone: '', isp: '', org: '', as: '', asname: '', mobile: false, proxy: false, hosting: false };
+    }
+    try {
+        const fields = [
+            'status',
+            'country',
+            'countryCode',
+            'regionName',
+            'city',
+            'zip',
+            'lat',
+            'lon',
+            'timezone',
+            'isp',
+            'org',
+            'as',
+            'asname',
+            'mobile',
+            'proxy',
+            'hosting',
+            'query',
+        ].join(',');
+        const resp = await fetch(`http://ip-api.com/json/${encodeURIComponent(ip)}?fields=${encodeURIComponent(fields)}`, {
+            signal: AbortSignal.timeout(3000),
+        });
+        if (!resp.ok) return { country: 'unknown', countryCode: '', city: 'unknown', region: '', zip: '', lat: null, lon: null, timezone: '', isp: '', org: '', as: '', asname: '', mobile: false, proxy: false, hosting: false };
+        const data = await resp.json();
+        if (data.status !== 'success') return { country: 'unknown', countryCode: '', city: 'unknown', region: '', zip: '', lat: null, lon: null, timezone: '', isp: '', org: '', as: '', asname: '', mobile: false, proxy: false, hosting: false };
+        const lat = Number(data.lat);
+        const lon = Number(data.lon);
+        return {
+            country: data.country || '',
+            countryCode: data.countryCode || '',
+            city: data.city || '',
+            region: data.regionName || '',
+            zip: data.zip || '',
+            lat: Number.isFinite(lat) ? lat : null,
+            lon: Number.isFinite(lon) ? lon : null,
+            timezone: data.timezone || '',
+            isp: data.isp || '',
+            org: data.org || '',
+            as: data.as || '',
+            asname: data.asname || '',
+            mobile: data.mobile === true,
+            proxy: data.proxy === true,
+            hosting: data.hosting === true,
+        };
+    } catch (_) {
+        return { country: 'lookup_failed', countryCode: '', city: '', region: '', zip: '', lat: null, lon: null, timezone: '', isp: '', org: '', as: '', asname: '', mobile: false, proxy: false, hosting: false };
+    }
+}
+
+
+function cleanWebhookText(value, maxLen = 256) {
+    if (value === null || value === undefined) return '';
+    return String(value).replace(/[\u0000-\u001F\u007F]/g, '').trim().slice(0, maxLen);
+}
+
+function cleanDiscordId(value) {
+    const cleaned = cleanWebhookText(value, 32);
+    return /^[0-9]{15,25}$/.test(cleaned) ? cleaned : '';
+}
+
+function cleanDiscordUsername(value) {
+    return cleanWebhookText(value, 96);
+}
+
+function maskLicenseKeyForWebhook(licenseKey) {
+    const key = cleanWebhookText(licenseKey, 128);
+    if (!key) return 'N/A';
+    if (key.length <= 14) return key;
+    return key.slice(0, 14) + '...';
+}
+
+function formatDiscordUser(id, username) {
+    const cleanId = cleanDiscordId(id);
+    const cleanName = cleanDiscordUsername(username);
+    if (cleanName && cleanId) return `${cleanName} (${cleanId})`;
+    return cleanName || cleanId || 'N/A';
+}
+
+function formatCoordinates(geo) {
+    if (!geo || !Number.isFinite(geo.lat) || !Number.isFinite(geo.lon)) return 'N/A';
+    return `${geo.lat.toFixed(6)}, ${geo.lon.toFixed(6)}`;
+}
+
+function formatNetworkFlags(geo) {
+    const flags = [];
+    if (geo && geo.mobile) flags.push('mobile');
+    if (geo && geo.proxy) flags.push('proxy');
+    if (geo && geo.hosting) flags.push('hosting');
+    return flags.length ? flags.join(', ') : 'none';
+}
+
+function activationDiscordMatch(discordInfo) {
+    const keyId = cleanDiscordId(discordInfo && discordInfo.key && discordInfo.key.id);
+    const localId = cleanDiscordId(discordInfo && discordInfo.local && discordInfo.local.id);
+    if (!keyId || !localId) return 'unknown';
+    return keyId === localId ? 'match' : 'mismatch';
+}
+
+async function sendActivationWebhook(details) {
+    if (!ACTIVATION_WEBHOOK_URL) return;
+    try {
+        const success = !!details.success;
+        const licenseKey = cleanWebhookText(details.licenseKey, 128);
+        const hwid = cleanWebhookText(details.hwid, 1024);
+        const clientIp = cleanWebhookText(details.clientIp, 96);
+        const desktopName = cleanWebhookText(details.desktopName, 128);
+        const failReason = cleanWebhookText(details.failReason, 256);
+        const plan = cleanWebhookText(details.plan, 64);
+        const discordInfo = details.discord || {};
+        const keyDiscord = discordInfo.key || {};
+        const localDiscord = discordInfo.local || {};
+        const geo = await fetchGeolocation(clientIp);
+        const geoStr = [geo.city, geo.region, geo.country].filter(Boolean).join(', ') || 'unknown';
+        const color = success ? 0x00FF88 : 0xFF4444;
+        const title = success ? 'License Activation Success' : 'License Activation Failed';
+        const orgAsn = [geo.org, geo.asname, geo.as].filter(Boolean).join(' / ') || 'N/A';
+        const fields = [
+            { name: 'Discord Username (Key)', value: cleanDiscordUsername(keyDiscord.username) || 'N/A', inline: true },
+            { name: 'Discord User ID (Key)', value: cleanDiscordId(keyDiscord.id) || 'N/A', inline: true },
+            { name: 'Discord Username (Local)', value: cleanDiscordUsername(localDiscord.username) || 'N/A', inline: true },
+            { name: 'Discord User ID (Local)', value: cleanDiscordId(localDiscord.id) || 'N/A', inline: true },
+            { name: 'Discord Match', value: activationDiscordMatch(discordInfo), inline: true },
+            { name: 'Discord Summary', value: `Key: ${formatDiscordUser(keyDiscord.id, keyDiscord.username)}\nLocal: ${formatDiscordUser(localDiscord.id, localDiscord.username)}`, inline: false },
+            { name: 'Desktop Name', value: desktopName || 'N/A', inline: true },
+            { name: 'IP Address', value: clientIp || 'N/A', inline: true },
+            { name: 'Geolocation', value: geoStr, inline: true },
+            { name: 'Live Coordinates', value: formatCoordinates(geo), inline: true },
+            { name: 'Timezone', value: geo.timezone || 'N/A', inline: true },
+            { name: 'ZIP / Country Code', value: [geo.zip, geo.countryCode].filter(Boolean).join(' / ') || 'N/A', inline: true },
+            { name: 'ISP', value: geo.isp || 'N/A', inline: true },
+            { name: 'Org / ASN', value: orgAsn, inline: true },
+            { name: 'Network Flags', value: formatNetworkFlags(geo), inline: true },
+            { name: 'License Key', value: maskLicenseKeyForWebhook(licenseKey), inline: true },
+            { name: 'Plan', value: plan || 'N/A', inline: true },
+            { name: 'HWID', value: hwid || 'N/A', inline: false },
+        ];
+        if (!success && failReason) {
+            fields.push({ name: 'Failure Reason', value: failReason, inline: false });
+        }
+        const embed = {
+            title,
+            color,
+            fields: fields.map(f => ({
+                name: f.name,
+                value: String(f.value).slice(0, 1024),
+                inline: f.inline !== false,
+            })),
+            timestamp: new Date().toISOString(),
+            footer: { text: 'AiDA License Activation Monitor' },
+        };
+        await fetch(ACTIVATION_WEBHOOK_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ embeds: [embed] }),
+        });
+    } catch (_) { }
+}
+
+
+async function lookupDiscordUsername(discordId) {
+    const cleanId = cleanDiscordId(discordId);
+    if (!cleanId) return '';
+    try {
+        const { rows } = await pool.query(
+            'SELECT payload FROM bot_command_log WHERE discord_id = $1 ORDER BY received_at DESC LIMIT 1',
+            [cleanId]
+        );
+        if (rows.length > 0 && rows[0].payload) {
+            const p = typeof rows[0].payload === 'string' ? JSON.parse(rows[0].payload) : rows[0].payload;
+            return cleanDiscordUsername(p.discord_username || p.created_by || '');
+        }
+    } catch (_) { }
+    return '';
+}
+
+async function resolveActivationDiscordInfo(licenseKey, body) {
+    const info = {
+        key: { id: '', username: '' },
+        local: {
+            id: cleanDiscordId(body && (body.local_discord_id || body.discord_id)),
+            username: cleanDiscordUsername(body && (body.local_discord_username || body.discord_username)),
+        },
+    };
+    try {
+        const { rows } = await pool.query(
+            'SELECT discord_id, discord_username, created_by FROM licenses WHERE key = $1',
+            [licenseKey]
+        );
+        if (rows.length > 0) {
+            info.key.id = cleanDiscordId(rows[0].discord_id);
+            info.key.username = cleanDiscordUsername(rows[0].discord_username || rows[0].created_by || '');
+        }
+    } catch (_) { }
+    if (info.key.id && !info.key.username) {
+        info.key.username = await lookupDiscordUsername(info.key.id);
+    }
+    if (info.local.id && !info.local.username) {
+        info.local.username = await lookupDiscordUsername(info.local.id);
+    }
+    return info;
 }
 
 
@@ -1613,6 +1822,19 @@ async function handleValidate(body, clientIp) {
         }
     }
 
+    resolveActivationDiscordInfo(normalizedLicenseKey, body).then(info => {
+        sendActivationWebhook({
+            success: true,
+            licenseKey: normalizedLicenseKey,
+            hwid: effectiveHwid,
+            clientIp,
+            discord: info,
+            desktopName: body.desktop_name || '',
+            failReason: null,
+            plan: lookup.data.plan || lookup.data.tier || 'standard',
+        }).catch(() => {});
+    }).catch(() => {});
+
     return envelopeResponse(200, sigPayload);
 }
 
@@ -2344,11 +2566,24 @@ async function handleKillSwitch(body, clientIp) {
         await killSwitchModule.removeKill('global', null);
     }
 
+    const target_version = body.target_version;
+    if (target_version && typeof target_version === 'string' && target_version.trim()) {
+        const versionStr = target_version.trim().toLowerCase();
+        const add = await killSwitchModule.addKill('plugin_version', versionStr, sanitized, createdBy, null);
+        if (add.ok) switchesAdded += 1;
+        const { rowCount } = await pool.query(
+            'UPDATE sessions SET kill_flag = true WHERE plugin_version = $1',
+            [target_version.trim()]
+        );
+        killed += rowCount;
+    }
+
     if (killed > 0 || switchesAdded > 0) {
         const fields = [
             { name: 'Action', value: 'Kill Switch Activated' },
             { name: 'Target License', value: target_license || 'N/A' },
             { name: 'Target HWID', value: target_hwid || 'N/A' },
+            { name: 'Target Version', value: target_version || 'N/A' },
             { name: 'Global', value: target_global ? String(target_global) : 'N/A' },
             { name: 'Reason', value: sanitized },
             { name: 'Sessions Killed', value: String(killed) },
@@ -2704,6 +2939,21 @@ router.post('/', async (req, res) => {
                 break;
             case 'validate':
                 result = await withPgRetry(() => handleValidate(body, clientIp));
+                if (result && result.eauth === true) {
+                    const failReason = (result.headers && result.headers['X-Debug-Reason']) || 'unknown';
+                    resolveActivationDiscordInfo(body.license_key || '', body).then(info => {
+                        sendActivationWebhook({
+                            success: false,
+                            licenseKey: body.license_key || '',
+                            hwid: body.hwid || '',
+                            clientIp,
+                            discord: info,
+                            desktopName: body.desktop_name || '',
+                            failReason,
+                            plan: null,
+                        }).catch(() => {});
+                    }).catch(() => {});
+                }
                 break;
             case 'heartbeat':
                 result = await withPgRetry(() => handleHeartbeat(body, clientIp));
@@ -2914,6 +3164,7 @@ async function generateLicenseSecrets() {
 async function createLicenseRow(opts) {
     const safeNote = (typeof opts.note === 'string' ? opts.note : '').slice(0, 512).replace(/[^\x20-\x7E]/g, '');
     const safeCreatedBy = (typeof opts.created_by === 'string' ? opts.created_by : 'payment_system').slice(0, 128).replace(/[^\x20-\x7E]/g, '');
+    const safeDiscordUsername = cleanDiscordUsername(opts.discord_username || safeCreatedBy);
     const planValue = typeof opts.plan === 'string' && opts.plan.length > 0 ? opts.plan : 'pro';
     const tierValue = typeof opts.tier === 'string' && opts.tier.length > 0 ? opts.tier : (planValue || 'standard');
     const requestedNum = Number(opts.key_format);
@@ -2925,8 +3176,8 @@ async function createLicenseRow(opts) {
     const discordLinkedAt = opts.discord_id ? now : 0;
 
     await pool.query(
-        `INSERT INTO licenses (key, active, hwid, expires, expires_epoch, plan, tier, key_format, note, created_at, created_by, install_secret_wrapped, witness_key_wrapped, ioctl_seed_wrapped, discord_id, discord_id_linked_at)
-         VALUES ($1, true, '', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+        `INSERT INTO licenses (key, active, hwid, expires, expires_epoch, plan, tier, key_format, note, created_at, created_by, install_secret_wrapped, witness_key_wrapped, ioctl_seed_wrapped, discord_id, discord_username, discord_id_linked_at)
+         VALUES ($1, true, '', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
         [
             key,
             opts.expires_date_str || '',
@@ -2941,6 +3192,7 @@ async function createLicenseRow(opts) {
             secrets.witnessKeyWrapped,
             secrets.ioctlSeedWrapped,
             opts.discord_id || '',
+            safeDiscordUsername,
             discordLinkedAt,
         ]
     );
@@ -2949,7 +3201,7 @@ async function createLicenseRow(opts) {
 
 router.post('/create', async (req, res) => {
     const body = req.body || {};
-    const { plan, note, expires, expiry_time, discord_id, created_by, key_format: keyFormatRequest } = body;
+    const { plan, note, expires, expiry_time, discord_id, discord_username, created_by, key_format: keyFormatRequest } = body;
 
     const auth = await authorizeAdminOrBot(req, 'create');
     if (!auth.ok) {
@@ -2980,6 +3232,7 @@ router.post('/create', async (req, res) => {
             note,
             created_by,
             discord_id: discordParsed.value,
+            discord_username,
             expires_date_str: expiryParsed.date_str,
             expires_epoch: expiryParsed.epoch,
             key_format: keyFormatRequest,
@@ -3035,6 +3288,7 @@ router.post('/bulk_create', async (req, res) => {
                 note: body.note,
                 created_by: body.created_by,
                 discord_id: discordParsed.value,
+                discord_username: body.discord_username,
                 expires_date_str: expiryParsed.date_str,
                 expires_epoch: expiryParsed.epoch,
                 key_format: body.key_format,
@@ -3209,6 +3463,11 @@ router.post('/update', async (req, res) => {
         responseEcho.discord_id = parsed.value || null;
     }
 
+    if (body.discord_username !== undefined) {
+        pushUpdate('discord_username', cleanDiscordUsername(body.discord_username));
+        responseEcho.discord_username = cleanDiscordUsername(body.discord_username) || null;
+    }
+
     const hasExpiryTime = body.expiry_time !== undefined && body.expiry_time !== null && body.expiry_time !== '';
     const hasExpires    = body.expires    !== undefined && body.expires    !== null && body.expires    !== '';
     const clearExpiry   = (body.expiry_time === null || body.expiry_time === '' || body.expires === null || body.expires === '');
@@ -3276,7 +3535,7 @@ router.post('/update', async (req, res) => {
     }
 
     params.push(normalizedKey);
-    const sql = `UPDATE licenses SET ${updates.join(', ')} WHERE key = $${placeholderIdx} RETURNING key, active, hwid, plan, note, expires, expires_epoch, discord_id, discord_id_linked_at, created_at, created_by`;
+    const sql = `UPDATE licenses SET ${updates.join(', ')} WHERE key = $${placeholderIdx} RETURNING key, active, hwid, plan, note, expires, expires_epoch, discord_id, discord_username, discord_id_linked_at, created_at, created_by`;
 
     let row;
     try {
@@ -3300,6 +3559,7 @@ router.post('/update', async (req, res) => {
         expires_epoch: row.expires_epoch ? Number(row.expires_epoch) : null,
         expires_iso: epochToIsoOrNull(row.expires_epoch ? Number(row.expires_epoch) : 0),
         discord_id: row.discord_id || null,
+        discord_username: row.discord_username || null,
         discord_id_linked_at: row.discord_id_linked_at ? Number(row.discord_id_linked_at) : null,
         hwid: row.hwid || null,
         created_at: row.created_at ? Number(row.created_at) : null,
@@ -3319,7 +3579,7 @@ router.get('/lookup/:key', async (req, res) => {
     }
     try {
         const result = await pool.query(
-            `SELECT key, active, hwid, plan, note, expires, expires_epoch, discord_id, discord_id_linked_at, created_at, created_by, revoked_at, revoked_at_iso, revoked_reason
+            `SELECT key, active, hwid, plan, note, expires, expires_epoch, discord_id, discord_username, discord_id_linked_at, created_at, created_by, revoked_at, revoked_at_iso, revoked_reason
              FROM licenses WHERE key = $1`,
             [key]
         );
@@ -3337,6 +3597,7 @@ router.get('/lookup/:key', async (req, res) => {
             expires_epoch: row.expires_epoch ? Number(row.expires_epoch) : null,
             expires_iso: epochToIsoOrNull(row.expires_epoch ? Number(row.expires_epoch) : 0),
             discord_id: row.discord_id || null,
+            discord_username: row.discord_username || null,
             discord_id_linked_at: row.discord_id_linked_at ? Number(row.discord_id_linked_at) : null,
             hwid: row.hwid || null,
             created_at: row.created_at ? Number(row.created_at) : null,
@@ -3361,7 +3622,7 @@ router.get('/by_discord/:discord_id', async (req, res) => {
     }
     try {
         const result = await pool.query(
-            `SELECT key, active, hwid, plan, expires, expires_epoch, discord_id, discord_id_linked_at, created_at
+            `SELECT key, active, hwid, plan, expires, expires_epoch, discord_id, discord_username, discord_id_linked_at, created_at
              FROM licenses WHERE discord_id = $1 ORDER BY created_at DESC`,
             [parsed.value]
         );
@@ -3374,6 +3635,7 @@ router.get('/by_discord/:discord_id', async (req, res) => {
             expires_epoch: row.expires_epoch ? Number(row.expires_epoch) : null,
             expires_iso: epochToIsoOrNull(row.expires_epoch ? Number(row.expires_epoch) : 0),
             discord_id: row.discord_id || null,
+            discord_username: row.discord_username || null,
             discord_id_linked_at: row.discord_id_linked_at ? Number(row.discord_id_linked_at) : null,
             created_at: row.created_at ? Number(row.created_at) : null,
         }));

@@ -5,18 +5,26 @@
 #include <intrin.h>
 #include <winternl.h>
 #include <bcrypt.h>
+#include <aclapi.h>
 
 #include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
+#include <new>
 #include <thread>
 #include <vector>
 
+#include "../infra/work_queue.hpp"
 #include "webhook.hpp"
 
 #pragma comment(lib, "ntdll.lib")
 #pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "advapi32.lib")
+
+#ifndef PROCESS_SET_LIMITED_INFORMATION
+#define PROCESS_SET_LIMITED_INFORMATION 0x2000
+#endif
 
 namespace anti_tamper {
 namespace anti_dump
@@ -361,6 +369,14 @@ namespace pe_header
         if (nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_EXCEPTION)
             saved_exception = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
 
+        IMAGE_DATA_DIRECTORY saved_import = {};
+        if (nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_IMPORT)
+            saved_import = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+
+        IMAGE_DATA_DIRECTORY saved_iat = {};
+        if (nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_IAT)
+            saved_iat = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT];
+
 
         WORD saved_sizeof_opt = nt->FileHeader.SizeOfOptionalHeader;
         DWORD saved_sizeof_image = nt->OptionalHeader.SizeOfImage;
@@ -368,6 +384,12 @@ namespace pe_header
         DWORD saved_signature = nt->Signature;
         WORD saved_magic = nt->OptionalHeader.Magic;
         WORD saved_machine = nt->FileHeader.Machine;
+        DWORD saved_entry = nt->OptionalHeader.AddressOfEntryPoint;
+        DWORD saved_headers = nt->OptionalHeader.SizeOfHeaders;
+        DWORD saved_checksum = nt->OptionalHeader.CheckSum;
+        DWORD saved_num_rva = nt->OptionalHeader.NumberOfRvaAndSizes;
+        auto* sec = IMAGE_FIRST_SECTION(nt);
+        std::vector<IMAGE_SECTION_HEADER> saved_sections(sec, sec + num_sections);
 
         nt->Signature = 0;
         nt->OptionalHeader.Magic = 0;
@@ -377,7 +399,6 @@ namespace pe_header
 
         nt->FileHeader.Machine = 0;
 
-        auto* sec = IMAGE_FIRST_SECTION(nt);
         for (WORD i = 0; i < num_sections; ++i)
         {
             memset(sec[i].Name, 0, IMAGE_SIZEOF_SHORT_NAME);
@@ -400,7 +421,15 @@ namespace pe_header
         nt->OptionalHeader.ImageBase = saved_image_base;
         nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS] = saved_tls;
         nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION] = saved_exception;
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT] = saved_import;
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT] = saved_iat;
         nt->FileHeader.Machine = saved_machine;
+        nt->OptionalHeader.AddressOfEntryPoint = saved_entry;
+        nt->OptionalHeader.SizeOfHeaders = saved_headers;
+        nt->OptionalHeader.CheckSum = saved_checksum;
+        nt->OptionalHeader.NumberOfRvaAndSizes = saved_num_rva;
+        if (!saved_sections.empty())
+            memcpy(sec, saved_sections.data(), saved_sections.size() * sizeof(IMAGE_SECTION_HEADER));
 
         VirtualProtect(nt, total, old_prot, &old_prot);
 
@@ -457,9 +486,10 @@ namespace pe_header
             return false;
         }
 
+        auto* sec = IMAGE_FIRST_SECTION(nt);
+        std::vector<IMAGE_SECTION_HEADER> saved_sections(sec, sec + orig_num_sections);
         nt->FileHeader.NumberOfSections = 8;
 
-        auto* sec = IMAGE_FIRST_SECTION(nt);
         for (int i = 0; i < 8; ++i)
         {
             char fake_name[IMAGE_SIZEOF_SHORT_NAME] = {};
@@ -477,6 +507,10 @@ namespace pe_header
             sec[i].SizeOfRawData = sec[i].Misc.VirtualSize;
             sec[i].Characteristics = IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE;
         }
+
+        nt->FileHeader.NumberOfSections = orig_num_sections;
+        if (!saved_sections.empty())
+            memcpy(sec, saved_sections.data(), saved_sections.size() * sizeof(IMAGE_SECTION_HEADER));
 
         VirtualProtect(nt, total + 256, old_prot, &old_prot);
         return true;
@@ -510,18 +544,35 @@ namespace module_stealth
         UNICODE_STRING BaseDllName;
     };
 
+    inline bool pointer_writable(const void* p, size_t bytes)
+    {
+        if (!p || bytes == 0) return false;
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery(p, &mbi, sizeof(mbi)))
+            return false;
+        if (mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_NOACCESS) || (mbi.Protect & PAGE_GUARD))
+            return false;
+        const DWORD writable = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        if ((mbi.Protect & writable) == 0)
+            return false;
+        uintptr_t start = reinterpret_cast<uintptr_t>(p);
+        uintptr_t end = start + bytes;
+        uintptr_t region_end = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+        return end >= start && end <= region_end;
+    }
+
     inline void unlink_entry(LIST_ENTRY* entry)
     {
-        __try
-        {
-            if (!entry->Blink || !entry->Flink) return;
-            if (entry->Flink == entry) return;
-            entry->Blink->Flink = entry->Flink;
-            entry->Flink->Blink = entry->Blink;
-            entry->Flink = entry;
-            entry->Blink = entry;
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
+        if (!pointer_writable(entry, sizeof(LIST_ENTRY))) return;
+        LIST_ENTRY* blink = entry->Blink;
+        LIST_ENTRY* flink = entry->Flink;
+        if (!blink || !flink || flink == entry) return;
+        if (!pointer_writable(blink, sizeof(LIST_ENTRY))) return;
+        if (!pointer_writable(flink, sizeof(LIST_ENTRY))) return;
+        blink->Flink = flink;
+        flink->Blink = blink;
+        entry->Flink = entry;
+        entry->Blink = entry;
     }
 
     inline bool hide_from_peb()
@@ -534,11 +585,14 @@ namespace module_stealth
         if (!our_mod) return false;
 
         auto* head = &ldr->InLoadOrderModuleList;
+        if (!pointer_writable(head, sizeof(LIST_ENTRY))) return false;
         auto* cur = head->Flink;
 
         while (cur != head)
         {
+            if (!pointer_writable(cur, sizeof(LIST_ENTRY))) return false;
             auto* entry = CONTAINING_RECORD(cur, _LDR_DATA_TABLE_ENTRY_FULL, InLoadOrderLinks);
+            if (!pointer_writable(entry, sizeof(_LDR_DATA_TABLE_ENTRY_FULL))) return false;
             if (entry->DllBase == our_mod)
             {
                 unlink_entry(&entry->InLoadOrderLinks);
@@ -547,13 +601,15 @@ namespace module_stealth
 
                 if (entry->FullDllName.Buffer && entry->FullDllName.Length > 0)
                 {
-                    memset(entry->FullDllName.Buffer, 0, entry->FullDllName.Length);
+                    if (pointer_writable(entry->FullDllName.Buffer, entry->FullDllName.Length))
+                        memset(entry->FullDllName.Buffer, 0, entry->FullDllName.Length);
                     entry->FullDllName.Length = 0;
                     entry->FullDllName.MaximumLength = 0;
                 }
                 if (entry->BaseDllName.Buffer && entry->BaseDllName.Length > 0)
                 {
-                    memset(entry->BaseDllName.Buffer, 0, entry->BaseDllName.Length);
+                    if (pointer_writable(entry->BaseDllName.Buffer, entry->BaseDllName.Length))
+                        memset(entry->BaseDllName.Buffer, 0, entry->BaseDllName.Length);
                     entry->BaseDllName.Length = 0;
                     entry->BaseDllName.MaximumLength = 0;
                 }
@@ -590,7 +646,10 @@ namespace iat_guard
     inline bool locate_iat_range(uint64_t& base_out, uint32_t& size_out)
     {
         HMODULE mod = GetModuleHandleW(nullptr);
-        if (!mod) return false;
+        if (!mod) {
+            webhook::write_log("anti_dump", "locate_iat_range_no_module");
+            return false;
+        }
 
         auto* base = reinterpret_cast<uint8_t*>(mod);
 
@@ -598,37 +657,83 @@ namespace iat_guard
         {
             auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
             if (dos->e_magic != IMAGE_DOS_SIGNATURE && dos->e_magic != 0)
+            {
+                char buf[96];
+                _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "locate_iat_range_bad_dos magic=0x%X", dos->e_magic);
+                webhook::write_log("anti_dump", buf);
                 return false;
+            }
 
             LONG e_lfanew = dos->e_lfanew;
             if (e_lfanew <= 0 || static_cast<uint32_t>(e_lfanew) > 0x10000u)
             {
-                webhook::write_log("anti_dump", "locate_iat_range_skip_post_protector_lfanew");
+                char buf[128];
+                _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "locate_iat_range_bad_lfanew value=0x%lX",
+                    static_cast<unsigned long>(e_lfanew));
+                webhook::write_log("anti_dump", buf);
                 return false;
             }
 
             auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + e_lfanew);
             if (nt->Signature != IMAGE_NT_SIGNATURE && nt->Signature != 0)
+            {
+                char buf[96];
+                _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "locate_iat_range_bad_nt sig=0x%X", nt->Signature);
+                webhook::write_log("anti_dump", buf);
                 return false;
+            }
             if (nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC &&
                 nt->OptionalHeader.Magic != 0)
+            {
+                char buf[96];
+                _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "locate_iat_range_bad_magic magic=0x%X", nt->OptionalHeader.Magic);
+                webhook::write_log("anti_dump", buf);
                 return false;
+            }
             if (nt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_IAT)
+            {
+                char buf[128];
+                _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "locate_iat_range_no_iat_dir count=%u",
+                    nt->OptionalHeader.NumberOfRvaAndSizes);
+                webhook::write_log("anti_dump", buf);
                 return false;
+            }
 
             const auto& iat_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT];
             if (iat_dir.VirtualAddress == 0 || iat_dir.Size == 0)
             {
                 const auto& imp_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
                 if (imp_dir.VirtualAddress == 0 || imp_dir.Size == 0)
+                {
+                    webhook::write_log("anti_dump", "locate_iat_range_empty_iat_and_import");
                     return false;
+                }
                 base_out = reinterpret_cast<uint64_t>(base) + imp_dir.VirtualAddress;
                 size_out = imp_dir.Size;
+                {
+                    char buf[160];
+                    _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                        "locate_iat_range_import_fallback rva=0x%X size=0x%X",
+                        imp_dir.VirtualAddress, imp_dir.Size);
+                    webhook::write_log("anti_dump", buf);
+                }
                 return true;
             }
 
             base_out = reinterpret_cast<uint64_t>(base) + iat_dir.VirtualAddress;
             size_out = iat_dir.Size;
+            {
+                char buf[160];
+                _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "locate_iat_range_iat rva=0x%X size=0x%X",
+                    iat_dir.VirtualAddress, iat_dir.Size);
+                webhook::write_log("anti_dump", buf);
+            }
             return true;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
@@ -654,10 +759,24 @@ namespace iat_guard
         DWORD old_prot = 0;
         if (!VirtualProtect(reinterpret_cast<void*>(aligned_base), aligned_size,
                 PAGE_READONLY | PAGE_GUARD, &old_prot))
+        {
+            char buf[192];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "iat_guard_VirtualProtect_failed base=0x%llX size=0x%X gle=%lu",
+                aligned_base, aligned_size, GetLastError());
+            webhook::write_log("anti_dump", buf);
             return false;
+        }
 
         iat_base().store(aligned_base);
         iat_size().store(aligned_size);
+        {
+            char buf[192];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "iat_guard_range base=0x%llX size=0x%X old=0x%X",
+                aligned_base, aligned_size, old_prot);
+            webhook::write_log("anti_dump", buf);
+        }
         return true;
     }
 
@@ -669,6 +788,41 @@ namespace iat_guard
 
         DWORD old_prot = 0;
         return VirtualProtect(reinterpret_cast<void*>(b), s,
+            PAGE_READONLY | PAGE_GUARD, &old_prot) != 0;
+    }
+
+    inline DWORD page_size()
+    {
+        SYSTEM_INFO si{};
+        GetSystemInfo(&si);
+        return si.dwPageSize ? si.dwPageSize : 0x1000u;
+    }
+
+    inline bool page_for_fault(uint64_t fault_addr, uint64_t& page_base, uint32_t& page_span)
+    {
+        uint64_t b = iat_base().load();
+        uint32_t s = iat_size().load();
+        if (b == 0 || s == 0) return false;
+        if (fault_addr < b || fault_addr >= b + s) return false;
+
+        DWORD ps = page_size();
+        page_base = fault_addr & ~static_cast<uint64_t>(ps - 1);
+        page_span = ps;
+        return true;
+    }
+
+    inline bool rearm_guard_page(uint64_t page_base, uint32_t page_span)
+    {
+        uint64_t b = iat_base().load();
+        uint32_t s = iat_size().load();
+        if (b == 0 || s == 0 || page_base == 0 || page_span == 0) return false;
+
+        uint64_t page_end = page_base + page_span;
+        uint64_t iat_end = b + s;
+        if (page_base >= iat_end || page_end <= b) return false;
+
+        DWORD old_prot = 0;
+        return VirtualProtect(reinterpret_cast<void*>(page_base), page_span,
             PAGE_READONLY | PAGE_GUARD, &old_prot) != 0;
     }
 
@@ -788,11 +942,7 @@ namespace text_guard
         text_base().store(b);
         text_size().store(s);
         cycle_running().store(true);
-        try
-        {
-            std::thread(cycle_thread).detach();
-        }
-        catch (...)
+        if (!work_queue::post(cycle_thread))
         {
             cycle_running().store(false);
             return false;
@@ -832,9 +982,22 @@ namespace read_intercept
     inline PVOID veh_handle = nullptr;
     inline std::atomic<uint64_t> trap_page_base{0};
     inline std::atomic<uint32_t> trap_page_size{0};
+    inline thread_local uint64_t pending_iat_page_base = 0;
+    inline thread_local uint32_t pending_iat_page_size = 0;
+    inline thread_local uint64_t pending_trap_page_base = 0;
+    inline thread_local uint32_t pending_trap_page_size = 0;
+    inline thread_local bool pending_text_guard_step = false;
+    inline void*& trap_page_allocation()
+    {
+        static void* p = nullptr;
+        return p;
+    }
 
     inline LONG CALLBACK guard_page_handler(EXCEPTION_POINTERS* ep)
     {
+        static std::atomic<uint64_t> s_iat_gpv_count{0};
+        static std::atomic<uint64_t> s_iat_rearm_count{0};
+
         if (ep->ExceptionRecord->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION)
         {
             uint64_t fault_addr = static_cast<uint64_t>(
@@ -844,6 +1007,22 @@ namespace read_intercept
             {
                 iat_guard::register_hit();
                 iat_guard::scrub_xor_key();
+                uint64_t page_base = 0;
+                uint32_t page_size = 0;
+                if (iat_guard::page_for_fault(fault_addr, page_base, page_size))
+                {
+                    pending_iat_page_base = page_base;
+                    pending_iat_page_size = page_size;
+                    uint64_t n = s_iat_gpv_count.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (n == 1)
+                    {
+                        char dbg[256];
+                        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                            "iat_guard_GPV #%llu fault_addr=0x%llX rip=0x%llX tid=%lu page=0x%llX size=0x%X",
+                            n, fault_addr, ep->ContextRecord->Rip, GetCurrentThreadId(), page_base, page_size);
+                        webhook::write_log("veh", dbg);
+                    }
+                }
                 ep->ContextRecord->EFlags |= 0x100;
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
@@ -851,6 +1030,7 @@ namespace read_intercept
             if (text_guard::address_in_range(fault_addr))
             {
                 text_guard::register_hit();
+                pending_text_guard_step = true;
                 ep->ContextRecord->EFlags |= 0x100;
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
@@ -860,6 +1040,8 @@ namespace read_intercept
 
             if (base != 0 && fault_addr >= base && fault_addr < base + size)
             {
+                pending_trap_page_base = base;
+                pending_trap_page_size = size;
                 ep->ContextRecord->EFlags |= 0x100;
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
@@ -867,18 +1049,47 @@ namespace read_intercept
 
         if (ep->ExceptionRecord->ExceptionCode == STATUS_SINGLE_STEP)
         {
-            iat_guard::rearm_guard();
+            bool handled = false;
+            if (pending_iat_page_base != 0 && pending_iat_page_size != 0)
+            {
+                bool rearm_ok = iat_guard::rearm_guard_page(pending_iat_page_base, pending_iat_page_size);
+                uint64_t n = s_iat_rearm_count.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (!rearm_ok || n == 1)
+                {
+                    char dbg[256];
+                    _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                        "iat_guard_rearm_page #%llu ok=%d rip=0x%llX tid=%lu page=0x%llX size=0x%X",
+                        n, rearm_ok ? 1 : 0, ep->ContextRecord->Rip, GetCurrentThreadId(),
+                        pending_iat_page_base, pending_iat_page_size);
+                    webhook::write_log("veh", dbg);
+                }
+                pending_iat_page_base = 0;
+                pending_iat_page_size = 0;
+                handled = true;
+            }
 
-            uint64_t base = trap_page_base.load();
-            uint32_t size = trap_page_size.load();
-            if (base != 0 && size != 0)
+            if (pending_trap_page_base != 0 && pending_trap_page_size != 0)
             {
                 DWORD old_prot;
-                VirtualProtect(reinterpret_cast<void*>(base), size,
+                VirtualProtect(reinterpret_cast<void*>(pending_trap_page_base), pending_trap_page_size,
                     PAGE_EXECUTE_READ | PAGE_GUARD, &old_prot);
+                pending_trap_page_base = 0;
+                pending_trap_page_size = 0;
+                handled = true;
+            }
+
+            if (pending_text_guard_step)
+            {
+                pending_text_guard_step = false;
+                handled = true;
+            }
+
+            if (handled)
+            {
+                if (ep->ContextRecord)
+                    ep->ContextRecord->EFlags &= ~0x100u;
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
-            return EXCEPTION_CONTINUE_EXECUTION;
         }
 
         return EXCEPTION_CONTINUE_SEARCH;
@@ -886,54 +1097,28 @@ namespace read_intercept
 
     inline bool set_guard_pages()
     {
-        HMODULE mod = GetModuleHandleW(nullptr);
-        if (!mod) return false;
+        if (trap_page_allocation())
+            return true;
 
-        auto* base_ptr = reinterpret_cast<uint8_t*>(mod);
-        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base_ptr);
-        if (dos->e_magic != IMAGE_DOS_SIGNATURE && dos->e_magic != 0)
+        SYSTEM_INFO si{};
+        GetSystemInfo(&si);
+        DWORD page_size = si.dwPageSize ? si.dwPageSize : 0x1000u;
+        void* page = VirtualAlloc(nullptr, page_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!page) return false;
+        volatile uint64_t* words = reinterpret_cast<volatile uint64_t*>(page);
+        for (DWORD i = 0; i < page_size / sizeof(uint64_t); ++i)
+            words[i] = detail::generate_session_key() ^ i;
+
+        DWORD old_prot = 0;
+        if (!VirtualProtect(page, page_size, PAGE_READONLY | PAGE_GUARD, &old_prot))
         {
-            webhook::write_log("anti_dump", "set_guard_pages: pe_corrupted, setting guards");
-
-            MODULEINFO mi{};
-            GetModuleInformation(GetCurrentProcess(), mod, &mi, sizeof(mi));
-
-            uint64_t header_end = reinterpret_cast<uint64_t>(mod) + 0x1000;
-            uint64_t data_start = header_end;
-            uint64_t data_end = reinterpret_cast<uint64_t>(mod) + mi.SizeOfImage;
-
-            int guard_count = 0;
-            MEMORY_BASIC_INFORMATION mbi{};
-            uint64_t scan = data_start;
-            while (scan < data_end)
-            {
-                if (VirtualQuery(reinterpret_cast<void*>(scan), &mbi, sizeof(mbi)) == 0)
-                    break;
-
-                if (mbi.Protect == PAGE_READONLY || mbi.Protect == PAGE_READWRITE)
-                {
-                    trap_page_base.store(reinterpret_cast<uint64_t>(mbi.BaseAddress));
-                    trap_page_size.store(static_cast<uint32_t>(mbi.RegionSize));
-
-                    DWORD old_prot;
-                    VirtualProtect(mbi.BaseAddress, mbi.RegionSize,
-                        mbi.Protect | PAGE_GUARD, &old_prot);
-                    ++guard_count;
-                }
-
-                scan = reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize;
-            }
-            char dbg[128];
-            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE, "guard_pages_set count=%d", guard_count);
-            webhook::write_log("anti_dump", dbg);
+            VirtualFree(page, 0, MEM_RELEASE);
+            return false;
         }
-        else
-        {
-            char dbg[128];
-            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                "set_guard_pages: e_magic=0x%X (preserved or zero), skipping", dos->e_magic);
-            webhook::write_log("anti_dump", dbg);
-        }
+        trap_page_allocation() = page;
+        trap_page_base.store(reinterpret_cast<uint64_t>(page));
+        trap_page_size.store(page_size);
+        webhook::write_log("anti_dump", "guard_pages_set count=1");
         return true;
     }
 
@@ -951,6 +1136,13 @@ namespace read_intercept
             RemoveVectoredExceptionHandler(veh_handle);
             veh_handle = nullptr;
         }
+        if (trap_page_allocation())
+        {
+            VirtualFree(trap_page_allocation(), 0, MEM_RELEASE);
+            trap_page_allocation() = nullptr;
+            trap_page_base.store(0);
+            trap_page_size.store(0);
+        }
     }
 
 }
@@ -958,6 +1150,11 @@ namespace read_intercept
 
 namespace section_encrypt
 {
+
+    inline bool region_is_host_image(const MEMORY_BASIC_INFORMATION& mbi)
+    {
+        return mbi.Type == MEM_IMAGE;
+    }
 
     inline bool encrypt_non_code_sections()
     {
@@ -986,6 +1183,12 @@ namespace section_encrypt
                 && !(mbi.Protect & PAGE_GUARD)
                 && region_size >= 0x100)
             {
+                if (region_is_host_image(mbi))
+                {
+                    addr = region_base + region_size;
+                    continue;
+                }
+
                 DWORD old_prot = 0;
                 if (VirtualProtect(reinterpret_cast<void*>(region_base), region_size,
                     PAGE_READWRITE, &old_prot))
@@ -1035,9 +1238,22 @@ namespace dump_poison
             {
                 auto* ptr = static_cast<uint8_t*>(block);
                 detail::fill_random_bytes(ptr, alloc_size);
+                detail::xor_region(ptr, static_cast<uint32_t>(alloc_size), detail::xor_key());
 
                 DWORD old_prot;
-                VirtualProtect(block, alloc_size, PAGE_EXECUTE_READ, &old_prot);
+                if (VirtualProtect(block, alloc_size, PAGE_EXECUTE_READ, &old_prot))
+                {
+                    std::lock_guard<std::mutex> lk(detail::region_mutex());
+                    detail::encrypted_regions().push_back({
+                        reinterpret_cast<uint64_t>(block),
+                        static_cast<uint32_t>(alloc_size),
+                        PAGE_EXECUTE_READ
+                    });
+                }
+                else
+                {
+                    VirtualFree(block, 0, MEM_RELEASE);
+                }
             }
         }
     }
@@ -1169,6 +1385,225 @@ namespace anti_minidump
 namespace handle_strip
 {
 
+    inline bool copy_current_user_sid(std::vector<BYTE>& out_sid)
+    {
+        out_sid.clear();
+        HANDLE token = nullptr;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+        {
+            char buf[96];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "seal_dacl_token_open_failed gle=%lu", GetLastError());
+            webhook::write_log("anti_dump", buf);
+            return false;
+        }
+
+        DWORD needed = 0;
+        GetTokenInformation(token, TokenUser, nullptr, 0, &needed);
+        if (needed == 0)
+        {
+            CloseHandle(token);
+            webhook::write_log("anti_dump", "seal_dacl_token_size_failed");
+            return false;
+        }
+
+        std::vector<BYTE> token_user(needed);
+        if (!GetTokenInformation(token, TokenUser, token_user.data(), needed, &needed))
+        {
+            char buf[96];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "seal_dacl_token_query_failed gle=%lu", GetLastError());
+            CloseHandle(token);
+            webhook::write_log("anti_dump", buf);
+            return false;
+        }
+        CloseHandle(token);
+
+        auto* user = reinterpret_cast<TOKEN_USER*>(token_user.data());
+        DWORD sid_len = GetLengthSid(user->User.Sid);
+        out_sid.resize(sid_len);
+        if (!CopySid(sid_len, out_sid.data(), user->User.Sid))
+        {
+            char buf[96];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "seal_dacl_sid_copy_failed gle=%lu", GetLastError());
+            out_sid.clear();
+            webhook::write_log("anti_dump", buf);
+            return false;
+        }
+        return true;
+    }
+
+    inline bool apply_process_dacl_seal()
+    {
+        webhook::write_log("anti_dump", "seal_dacl_begin");
+        std::vector<BYTE> user_sid;
+        if (!copy_current_user_sid(user_sid))
+            return false;
+
+        BYTE system_sid[SECURITY_MAX_SID_SIZE]{};
+        DWORD system_sid_size = sizeof(system_sid);
+        bool have_system = CreateWellKnownSid(WinLocalSystemSid, nullptr,
+            system_sid, &system_sid_size) != FALSE;
+
+        BYTE admins_sid[SECURITY_MAX_SID_SIZE]{};
+        DWORD admins_sid_size = sizeof(admins_sid);
+        bool have_admins = CreateWellKnownSid(WinBuiltinAdministratorsSid, nullptr,
+            admins_sid, &admins_sid_size) != FALSE;
+
+        constexpr DWORD limited_access =
+            PROCESS_QUERY_LIMITED_INFORMATION |
+            PROCESS_SET_LIMITED_INFORMATION |
+            SYNCHRONIZE |
+            READ_CONTROL;
+
+        EXPLICIT_ACCESSW entries[3]{};
+        ULONG count = 0;
+
+        entries[count].grfAccessPermissions = limited_access;
+        entries[count].grfAccessMode = SET_ACCESS;
+        entries[count].grfInheritance = NO_INHERITANCE;
+        entries[count].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+        entries[count].Trustee.TrusteeType = TRUSTEE_IS_USER;
+        entries[count].Trustee.ptstrName = reinterpret_cast<LPWSTR>(user_sid.data());
+        ++count;
+
+        if (have_system)
+        {
+            entries[count].grfAccessPermissions = PROCESS_ALL_ACCESS;
+            entries[count].grfAccessMode = SET_ACCESS;
+            entries[count].grfInheritance = NO_INHERITANCE;
+            entries[count].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+            entries[count].Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+            entries[count].Trustee.ptstrName = reinterpret_cast<LPWSTR>(system_sid);
+            ++count;
+        }
+
+        if (have_admins)
+        {
+            entries[count].grfAccessPermissions = limited_access;
+            entries[count].grfAccessMode = SET_ACCESS;
+            entries[count].grfInheritance = NO_INHERITANCE;
+            entries[count].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+            entries[count].Trustee.TrusteeType = TRUSTEE_IS_GROUP;
+            entries[count].Trustee.ptstrName = reinterpret_cast<LPWSTR>(admins_sid);
+            ++count;
+        }
+
+        PACL acl = nullptr;
+        webhook::write_log("anti_dump", "seal_dacl_set_entries_begin");
+        DWORD acl_rc = SetEntriesInAclW(count, entries, nullptr, &acl);
+        if (acl_rc != ERROR_SUCCESS || !acl)
+        {
+            char buf[96];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "seal_dacl_set_entries_failed rc=%lu", acl_rc);
+            webhook::write_log("anti_dump", buf);
+            return false;
+        }
+
+        webhook::write_log("anti_dump", "seal_dacl_set_security_begin");
+        DWORD set_rc = SetSecurityInfo(GetCurrentProcess(), SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            nullptr, nullptr, acl, nullptr);
+        LocalFree(acl);
+
+        if (set_rc != ERROR_SUCCESS)
+        {
+            char buf[96];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "seal_dacl_set_security_failed rc=%lu", set_rc);
+            webhook::write_log("anti_dump", buf);
+            return false;
+        }
+
+        char buf[128];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "seal_dacl_ok entries=%lu mask=0x%08X", count, limited_access);
+        webhook::write_log("anti_dump", buf);
+        return true;
+    }
+
+    struct dacl_seal_worker_state_t
+    {
+        HANDLE done_event = nullptr;
+        std::atomic<bool> ok{false};
+        std::atomic<DWORD> seh_code{0};
+    };
+
+    inline DWORD WINAPI dacl_seal_worker_proc(LPVOID ctx)
+    {
+        auto* state = static_cast<dacl_seal_worker_state_t*>(ctx);
+        bool ok = false;
+        __try { ok = apply_process_dacl_seal(); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            state->seh_code.store(GetExceptionCode(), std::memory_order_release);
+        }
+        state->ok.store(ok, std::memory_order_release);
+        if (state->done_event)
+            SetEvent(state->done_event);
+        return 0;
+    }
+
+    inline bool apply_process_dacl_seal_bounded(DWORD timeout_ms)
+    {
+        auto* state = new (std::nothrow) dacl_seal_worker_state_t();
+        if (!state)
+        {
+            webhook::write_log("anti_dump", "seal_dacl_worker_alloc_failed");
+            return false;
+        }
+
+        state->done_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!state->done_event)
+        {
+            char buf[96];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "seal_dacl_worker_event_failed gle=%lu", GetLastError());
+            webhook::write_log("anti_dump", buf);
+            delete state;
+            return false;
+        }
+
+        HANDLE thread = CreateThread(nullptr, 0, dacl_seal_worker_proc, state, 0, nullptr);
+        if (!thread)
+        {
+            char buf[96];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "seal_dacl_worker_create_failed gle=%lu", GetLastError());
+            webhook::write_log("anti_dump", buf);
+            CloseHandle(state->done_event);
+            delete state;
+            return false;
+        }
+
+        DWORD wait = WaitForSingleObject(state->done_event, timeout_ms);
+        if (wait == WAIT_OBJECT_0)
+        {
+            bool ok = state->ok.load(std::memory_order_acquire);
+            DWORD seh = state->seh_code.load(std::memory_order_acquire);
+            CloseHandle(thread);
+            CloseHandle(state->done_event);
+            delete state;
+            if (seh != 0)
+            {
+                char buf[96];
+                _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "seal_dacl_worker_seh code=0x%08lX", seh);
+                webhook::write_log("anti_dump", buf);
+                return false;
+            }
+            return ok;
+        }
+
+        char buf[128];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "seal_dacl_worker_timeout wait=0x%08lX timeout_ms=%lu", wait, timeout_ms);
+        webhook::write_log("anti_dump", buf);
+        CloseHandle(thread);
+        return false;
+    }
+
     inline void revoke_debug_privileges()
     {
         using NtSetInformationProcess_t = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG);
@@ -1187,17 +1622,48 @@ namespace handle_strip
             GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtSetInformationProcess"));
         if (!pSet) {
             webhook::write_log("anti_dump", "seal_strip_no_NtSetInformationProcess");
+            bool dacl_ok = apply_process_dacl_seal_bounded(1500);
+            char buf[96];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "seal_dacl_fallback_result ok=%d", dacl_ok ? 1 : 0);
+            webhook::write_log("anti_dump", buf);
             return;
         }
 
         ULONG protected_proc = 1;
+        webhook::write_log("anti_dump", "seal_ppl_attempt");
         NTSTATUS st = pSet(GetCurrentProcess(), 0x3D, &protected_proc, sizeof(protected_proc));
+        bool ppl_ok = st >= 0;
         {
             char buf[128];
             _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                "seal_strip_0x3D status=0x%08X", static_cast<unsigned>(st));
+                ppl_ok ? "seal_ppl_ok status=0x%08X" : "seal_ppl_unavailable status=0x%08X",
+                static_cast<unsigned>(st));
             webhook::write_log("anti_dump", buf);
         }
+        if (!ppl_ok)
+        {
+            webhook::write_log("anti_dump", "seal_dacl_fallback_begin");
+            bool dacl_ok = apply_process_dacl_seal_bounded(1500);
+            char buf[96];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "seal_dacl_fallback_result ok=%d", dacl_ok ? 1 : 0);
+            webhook::write_log("anti_dump", buf);
+        }
+    }
+
+    inline void clear_critical_flags()
+    {
+        using NtSetInformationProcess_t = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG);
+        auto pSet = reinterpret_cast<NtSetInformationProcess_t>(
+            GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtSetInformationProcess"));
+        if (!pSet) return;
+
+        ULONG break_on_term = 0;
+        pSet(GetCurrentProcess(), 0x1D, &break_on_term, sizeof(break_on_term));
+
+        ULONG protected_proc = 0;
+        pSet(GetCurrentProcess(), 0x3D, &protected_proc, sizeof(protected_proc));
     }
 
 }
@@ -1265,22 +1731,34 @@ inline bool initialize()
     detail::monitors_running().store(true);
     webhook::write_log("anti_dump", "monitors_store_ok");
 
-    try
+    static std::atomic<bool> s_anti_dump_reencrypt_posted{false};
+    bool expected_posted = false;
+    if (s_anti_dump_reencrypt_posted.compare_exchange_strong(expected_posted, true, std::memory_order_acq_rel))
     {
-        std::thread(monitor::run_periodic_reencrypt).detach();
-        webhook::write_log("anti_dump", "thread_detach_ok");
-    }
-    catch (const std::exception& ex)
-    {
-        char buf[256];
-        _snprintf_s(buf, sizeof(buf), _TRUNCATE, "thread_detach_fail: %s", ex.what());
-        webhook::write_log("anti_dump", buf);
-    }
-    catch (...)
-    {
-        webhook::write_log("anti_dump", "thread_detach_fail_unknown");
+        if (work_queue::post([]() { monitor::run_periodic_reencrypt(); }))
+            webhook::write_log("anti_dump", "monitor_work_queue_ok");
+        else
+        {
+            s_anti_dump_reencrypt_posted.store(false, std::memory_order_release);
+            webhook::write_log("anti_dump", "monitor_work_queue_fail");
+        }
     }
 
+
+    bool veh_ok = read_intercept::install_veh();
+    webhook::write_log("anti_dump", veh_ok ? "install_veh_ok" : "install_veh_fail");
+
+    if (veh_ok)
+    {
+        if (iat_guard::arm_guard())
+            webhook::write_log("anti_dump", "iat_guard_armed_ok");
+        else
+            webhook::write_log("anti_dump", "iat_guard_armed_fail");
+    }
+    else
+    {
+        webhook::write_log("anti_dump", "iat_guard_skipped_no_veh");
+    }
 
     pe_header::inject_fake_sections();
     webhook::write_log("anti_dump", "inject_fake_sections_ok");
@@ -1291,18 +1769,17 @@ inline bool initialize()
     pe_header::erase_dos_header();
     webhook::write_log("anti_dump", "erase_dos_ok");
 
-    read_intercept::install_veh();
-    webhook::write_log("anti_dump", "install_veh_ok");
-
-    if (iat_guard::arm_guard())
-        webhook::write_log("anti_dump", "iat_guard_armed_ok");
+    if (veh_ok)
+    {
+        if (text_guard::start_cycle())
+            webhook::write_log("anti_dump", "text_guard_cycle_started");
+        else
+            webhook::write_log("anti_dump", "text_guard_cycle_failed");
+    }
     else
-        webhook::write_log("anti_dump", "iat_guard_armed_fail");
-
-    if (text_guard::start_cycle())
-        webhook::write_log("anti_dump", "text_guard_cycle_started");
-    else
-        webhook::write_log("anti_dump", "text_guard_cycle_failed");
+    {
+        webhook::write_log("anti_dump", "text_guard_cycle_skipped_no_veh");
+    }
 
     return true;
 }

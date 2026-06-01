@@ -165,6 +165,12 @@ typedef struct resource_fixup_s {
 #define IMG_MAGIC           0x41504B44u
 #define IMG_VERSION_LEGACY  0x00020000u
 #define IMG_VERSION_MATRYO  0x00030000u
+#define IMG_NT_SIGNATURE    0x00004550u
+#define IMG_OPT64_MAGIC     0x020Bu
+#define IMG_AUX_BLOCK_SIZE  368u
+#define IMG_MAX_SECTIONS    512u
+#define IMG_MAX_IMPORTS     65536u
+#define IMG_MAX_FIXUPS      262144u
 #define MATRYOSHKA_LAYERS_LEGACY 1u
 #define MATRYOSHKA_LAYERS_FULL   3u
 #define MEM_COMMIT_RESERVE  0x3000u
@@ -202,6 +208,206 @@ static int mem_eq(const void* a, const void* b, size_t n) {
         if (aa[i] != bb[i]) {
             return 0;
         }
+    }
+    return 1;
+}
+
+static int range_u32_ok(uint32_t off, uint64_t len, uint32_t limit) {
+    uint64_t end = (uint64_t)off + len;
+    return off <= limit && end <= (uint64_t)limit;
+}
+
+static uint32_t image_size_from_headers(uint8_t* image_base) {
+    if (image_base == 0) {
+        return 0;
+    }
+    uint16_t mz = 0;
+    mem_copy(&mz, image_base, 2);
+    if (mz != 0x5A4Du) {
+        return 0;
+    }
+    uint32_t e_lfanew = 0;
+    mem_copy(&e_lfanew, image_base + 0x3C, 4);
+    if (e_lfanew < 64u || e_lfanew > 0x10000u) {
+        return 0;
+    }
+    uint8_t* nt = image_base + e_lfanew;
+    uint32_t sig = 0;
+    mem_copy(&sig, nt, 4);
+    if (sig != IMG_NT_SIGNATURE) {
+        return 0;
+    }
+    uint16_t opt_magic = 0;
+    mem_copy(&opt_magic, nt + 0x18, 2);
+    if (opt_magic != IMG_OPT64_MAGIC) {
+        return 0;
+    }
+    uint32_t size_of_image = 0;
+    mem_copy(&size_of_image, nt + 0x18 + 56, 4);
+    return size_of_image;
+}
+
+static int validate_counted_table(uint8_t* packed_base, uint32_t packed_size,
+                                  uint32_t offset, uint32_t expected_count,
+                                  uint32_t elem_size, uint32_t max_count,
+                                  uint32_t image_size) {
+    if (expected_count == 0u && offset == 0u) {
+        return 1;
+    }
+    if (offset == 0u || expected_count > max_count) {
+        return 0;
+    }
+    if (!range_u32_ok(offset, 4u, packed_size)) {
+        return 0;
+    }
+    uint32_t stored_count = 0;
+    mem_copy(&stored_count, packed_base + offset, 4);
+    if (stored_count != expected_count || stored_count > max_count) {
+        return 0;
+    }
+    uint64_t bytes = 4ull + (uint64_t)stored_count * (uint64_t)elem_size;
+    if (!range_u32_ok(offset, bytes, packed_size)) {
+        return 0;
+    }
+    if (image_size != 0u && stored_count != 0u) {
+        uint8_t* entries = packed_base + offset + 4u;
+        if (elem_size == sizeof(string_fixup_t)) {
+            for (uint32_t i = 0; i < stored_count; ++i) {
+                string_fixup_t* sf = (string_fixup_t*)(entries + (size_t)i * sizeof(string_fixup_t));
+                if (sf->length == 0u || !range_u32_ok(sf->rva, sf->length, image_size)) {
+                    return 0;
+                }
+            }
+        } else if (elem_size == sizeof(resource_fixup_t)) {
+            for (uint32_t i = 0; i < stored_count; ++i) {
+                resource_fixup_t* rf = (resource_fixup_t*)(entries + (size_t)i * sizeof(resource_fixup_t));
+                if (rf->size == 0u || !range_u32_ok(rf->rva, rf->size, image_size)) {
+                    return 0;
+                }
+            }
+        }
+    }
+    return 1;
+}
+
+static int validate_import_table(uint8_t* packed_base, uint32_t packed_size,
+                                 uint32_t offset, uint32_t expected_count,
+                                 uint32_t image_size) {
+    if (expected_count == 0u && offset == 0u) {
+        return 1;
+    }
+    if (offset == 0u || expected_count > IMG_MAX_IMPORTS) {
+        return 0;
+    }
+    if (!range_u32_ok(offset, 8u, packed_size)) {
+        return 0;
+    }
+    uint32_t stored_count = 0;
+    mem_copy(&stored_count, packed_base + offset, 4);
+    if (stored_count != expected_count || stored_count > IMG_MAX_IMPORTS) {
+        return 0;
+    }
+    uint64_t pool_field = (uint64_t)offset + 4ull + (uint64_t)stored_count * (uint64_t)sizeof(import_entry_t);
+    if (pool_field + 4ull > (uint64_t)packed_size) {
+        return 0;
+    }
+    uint32_t pool_size = 0;
+    mem_copy(&pool_size, packed_base + (uint32_t)pool_field, 4);
+    uint64_t bytes = 4ull + (uint64_t)stored_count * (uint64_t)sizeof(import_entry_t) + 4ull + (uint64_t)pool_size;
+    if (!range_u32_ok(offset, bytes, packed_size)) {
+        return 0;
+    }
+    if (image_size != 0u && stored_count != 0u) {
+        import_entry_t* entries = (import_entry_t*)(packed_base + offset + 4u);
+        for (uint32_t i = 0; i < stored_count; ++i) {
+            if (!range_u32_ok(entries[i].iat_rva, 8u, image_size)) {
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+static int validate_section_table(uint8_t* image_base, uint8_t* packed_base,
+                                  uint32_t packed_size, uint32_t image_size,
+                                  const packed_header_t* hdr) {
+    if (hdr->section_count == 0u) {
+        return range_u32_ok(hdr->section_table_offset, 0u, packed_size);
+    }
+    if (hdr->section_count > IMG_MAX_SECTIONS) {
+        return 0;
+    }
+    uint64_t table_bytes = (uint64_t)hdr->section_count * (uint64_t)sizeof(section_descriptor_t);
+    if (!range_u32_ok(hdr->section_table_offset, table_bytes, packed_size)) {
+        return 0;
+    }
+    (void)image_base;
+    section_descriptor_t* descs = (section_descriptor_t*)(packed_base + hdr->section_table_offset);
+    for (uint32_t i = 0; i < hdr->section_count; ++i) {
+        section_descriptor_t* d = &descs[i];
+        if (d->original_rva == 0u || d->original_virtual_size == 0u) {
+            return 0;
+        }
+        if (d->encrypted_size == 0u || d->compressed_size == 0u || d->compressed_size > d->encrypted_size) {
+            return 0;
+        }
+        if (!range_u32_ok(d->blob_offset, d->encrypted_size, packed_size)) {
+            return 0;
+        }
+        if (d->layers_applied != MATRYOSHKA_LAYERS_LEGACY && d->layers_applied != MATRYOSHKA_LAYERS_FULL) {
+            return 0;
+        }
+        if (image_size != 0u && !range_u32_ok(d->original_rva, d->original_virtual_size, image_size)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int validate_packed_header(uint8_t* image_base, uint8_t* packed_base,
+                                  uint32_t packed_size, const packed_header_t* hdr) {
+    if (packed_base == 0 || hdr == 0 || packed_size < sizeof(packed_header_t)) {
+        return 0;
+    }
+    if (hdr->magic != IMG_MAGIC) {
+        return 0;
+    }
+    if (hdr->version != IMG_VERSION_LEGACY && hdr->version != IMG_VERSION_MATRYO) {
+        return 0;
+    }
+    uint32_t image_size = image_size_from_headers(image_base);
+    if (image_size == 0u) {
+        return 0;
+    }
+    if (!validate_section_table(image_base, packed_base, packed_size, image_size, hdr)) {
+        return 0;
+    }
+    if (!validate_import_table(packed_base, packed_size, hdr->import_table_offset, hdr->import_count, image_size)) {
+        return 0;
+    }
+    if (!validate_counted_table(packed_base, packed_size, hdr->string_table_offset,
+                                hdr->string_fixup_count, sizeof(string_fixup_t), IMG_MAX_FIXUPS, image_size)) {
+        return 0;
+    }
+    if (!validate_counted_table(packed_base, packed_size, hdr->resource_table_offset,
+                                hdr->resource_fixup_count, sizeof(resource_fixup_t), IMG_MAX_FIXUPS, image_size)) {
+        return 0;
+    }
+    if (!range_u32_ok(hdr->master_key_offset, 64u, packed_size)) {
+        return 0;
+    }
+    if (hdr->stub_code_offset == 0u || !range_u32_ok(hdr->stub_code_offset, 1u, packed_size)) {
+        return 0;
+    }
+    if (hdr->version == IMG_VERSION_MATRYO) {
+        if (hdr->aux_offset == 0u || hdr->aux_size != IMG_AUX_BLOCK_SIZE) {
+            return 0;
+        }
+        if (!range_u32_ok(hdr->aux_offset, hdr->aux_size, packed_size)) {
+            return 0;
+        }
+    } else if (hdr->aux_size != 0u && !range_u32_ok(hdr->aux_offset, hdr->aux_size, packed_size)) {
+        return 0;
     }
     return 1;
 }
@@ -1209,22 +1415,37 @@ static int resolve_all(resolved_t* r) {
 }
 
 static uint8_t* find_packed_section(uint8_t* image_base, uint32_t* out_size) {
-    uint32_t e_lfanew = *(uint32_t*)(image_base + 0x3C);
+    uint32_t image_size = image_size_from_headers(image_base);
+    if (image_size == 0u) {
+        return 0;
+    }
+    uint32_t e_lfanew = 0;
+    mem_copy(&e_lfanew, image_base + 0x3C, 4);
     uint8_t* nt = image_base + e_lfanew;
-    uint16_t n_sections = *(uint16_t*)(nt + 6);
-    uint16_t opt_size = *(uint16_t*)(nt + 0x14);
+    uint16_t n_sections = 0;
+    uint16_t opt_size = 0;
+    mem_copy(&n_sections, nt + 6, 2);
+    mem_copy(&opt_size, nt + 0x14, 2);
+    if (n_sections == 0u || n_sections > IMG_MAX_SECTIONS || opt_size < 0xF0u) {
+        return 0;
+    }
     uint8_t* sec = nt + 0x18 + opt_size;
     for (int32_t i = (int32_t)n_sections - 1; i >= 0; --i) {
         uint8_t* s = sec + (uint32_t)i * 40u;
-        uint32_t va = *(uint32_t*)(s + 12);
-        uint32_t vsize = *(uint32_t*)(s + 8);
+        uint32_t va = 0;
+        uint32_t vsize = 0;
+        mem_copy(&vsize, s + 8, 4);
+        mem_copy(&va, s + 12, 4);
         if (va == 0u || vsize < 8u) { continue; }
+        if (!range_u32_ok(va, vsize, image_size)) { continue; }
         uint8_t* base = image_base + va;
         uint32_t step = 8u;
         for (uint32_t off = 0; off + 8u <= vsize; off += step) {
-            uint32_t magic = *(uint32_t*)(base + off);
+            uint32_t magic = 0;
+            mem_copy(&magic, base + off, 4);
             if (magic != IMG_MAGIC) { continue; }
-            uint32_t version = *(uint32_t*)(base + off + 4u);
+            uint32_t version = 0;
+            mem_copy(&version, base + off + 4u, 4);
             if (version != IMG_VERSION_LEGACY && version != IMG_VERSION_MATRYO) { continue; }
             if (out_size != 0) { *out_size = vsize - off; }
             return base + off;
@@ -2045,11 +2266,11 @@ void __cdecl aida_unpack(void* image_base_arg) {
     uint32_t packed_vsize = 0;
     uint8_t* packed_base = find_packed_section(image_base, &packed_vsize);
     if (packed_base == 0) {
-        for (;;) { }
+        __fastfail(0xA1DA0001u);
     }
     packed_header_t* hdr = (packed_header_t*)packed_base;
-    if (hdr->magic != IMG_MAGIC) {
-        for (;;) { }
+    if (!validate_packed_header(image_base, packed_base, packed_vsize, hdr)) {
+        __fastfail(0xA1DA0002u);
     }
     uint8_t* obfuscated = packed_base + hdr->master_key_offset;
     uint8_t* mask = obfuscated + 32;

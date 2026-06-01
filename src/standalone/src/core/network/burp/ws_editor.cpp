@@ -24,6 +24,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -674,7 +675,35 @@ uint64_t connect(const ws_connection_config_t& cfg)
         cptr->id = r.next_id.fetch_add(1);
         r.by_id.emplace(cptr->id, cptr);
     }
-    cptr->recv_thread = std::thread([cptr]() { receive_loop(cptr); });
+    try {
+        cptr->recv_thread = std::thread([cptr]() { receive_loop(cptr); });
+    } catch (const std::exception& ex) {
+        diag::log_tagged_fmt("ws_edit", "recv_thread_failed id=%llu err=%s",
+            static_cast<unsigned long long>(cptr->id), ex.what());
+        cptr->running.store(false);
+        cptr->connected.store(false);
+        cleanup_connection(*cptr);
+        {
+            auto& r = registry();
+            std::lock_guard<std::mutex> lk(r.mtx);
+            r.by_id.erase(cptr->id);
+        }
+        set_err("ws_editor: receive worker unavailable");
+        return 0;
+    } catch (...) {
+        diag::log_tagged_fmt("ws_edit", "recv_thread_failed id=%llu",
+            static_cast<unsigned long long>(cptr->id));
+        cptr->running.store(false);
+        cptr->connected.store(false);
+        cleanup_connection(*cptr);
+        {
+            auto& r = registry();
+            std::lock_guard<std::mutex> lk(r.mtx);
+            r.by_id.erase(cptr->id);
+        }
+        set_err("ws_editor: receive worker unavailable");
+        return 0;
+    }
     diag::log_tagged_fmt("burp.ws_editor", "connected id=%llu host=%s:%u path=%s",
         static_cast<unsigned long long>(cptr->id), cptr->cfg.host.c_str(), cptr->cfg.port, cptr->cfg.path.c_str());
     diag::log_tagged_fmt("ws_edit", "connect ok id=%llu host=%s",

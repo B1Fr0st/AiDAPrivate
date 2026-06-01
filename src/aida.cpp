@@ -34,6 +34,7 @@ const PfnDliHook __pfnDliNotifyHook2 = aida_plugin_delay_load_hook;
 #include "aida_manual_map_proof.hpp"
 #include "aida_ipc.hpp"
 #include <atomic>
+#include <exception>
 #include <thread>
 #include <tlhelp32.h>
 #include <bcrypt.h>
@@ -452,7 +453,20 @@ void start_standalone_watchdog()
     bool expected = false;
     if (!g_standalone_watchdog_started.compare_exchange_strong(expected, true))
         return;
-    std::thread(standalone_watchdog_thread).detach();
+    try
+    {
+        std::thread(standalone_watchdog_thread).detach();
+    }
+    catch (const std::exception& ex)
+    {
+        g_standalone_watchdog_started.store(false, std::memory_order_release);
+        msg(OBFSTR_C("AiDA standalone watchdog worker unavailable: %s\n"), ex.what());
+    }
+    catch (...)
+    {
+        g_standalone_watchdog_started.store(false, std::memory_order_release);
+        msg(OBFSTR_C("AiDA standalone watchdog worker unavailable.\n"));
+    }
 }
 
 constexpr DWORD kVirtualMachineFastFailCode = 0xA1DAB10Cu;
@@ -810,9 +824,20 @@ aida_plugin_t::aida_plugin_t()
     std::string bin_hash = aida_db::AnalysisDB::instance().get_binary_hash();
     if (!bin_hash.empty())
     {
-        std::thread([bin_hash]() {
-            graphrag::load_graph(bin_hash);
-        }).detach();
+        try
+        {
+            std::thread([bin_hash]() {
+                graphrag::load_graph(bin_hash);
+            }).detach();
+        }
+        catch (const std::exception& ex)
+        {
+            msg(OBFSTR_C("AiDA GraphRAG load worker unavailable: %s\n"), ex.what());
+        }
+        catch (...)
+        {
+            msg(OBFSTR_C("AiDA GraphRAG load worker unavailable.\n"));
+        }
     }
 }
 
@@ -998,7 +1023,18 @@ static plugmod_t* idaapi init()
         return PLUGIN_SKIP;
 
 
-    std::thread([]() { discord_webhook::get_public_ip(); }).detach();
+    try
+    {
+        std::thread([]() { discord_webhook::get_public_ip(); }).detach();
+    }
+    catch (const std::exception& ex)
+    {
+        msg(OBFSTR_C("AiDA public IP worker unavailable: %s\n"), ex.what());
+    }
+    catch (...)
+    {
+        msg(OBFSTR_C("AiDA public IP worker unavailable.\n"));
+    }
 
     register_timer(10000, self_analysis_watchdog, nullptr);
 

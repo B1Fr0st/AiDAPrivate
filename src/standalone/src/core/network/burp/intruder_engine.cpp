@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -1838,9 +1839,19 @@ static void job_main(std::shared_ptr<job_t> job)
             if (pool > 128) pool = 128;
             diag::log_tagged_fmt("intruder", "job_main dispatching http1_pooled pool=%zu job_id=%llu", pool, static_cast<unsigned long long>(job->id));
             std::vector<std::thread> ws;
-            ws.reserve(pool);
-            for (size_t i = 0; i < pool; ++i) {
-                ws.emplace_back([job]() { worker_pooled_h1(job); });
+            try {
+                ws.reserve(pool);
+                for (size_t i = 0; i < pool; ++i) {
+                    ws.emplace_back([job]() { worker_pooled_h1(job); });
+                }
+            } catch (const std::exception& ex) {
+                diag::log_tagged_fmt("intruder", "pooled_worker_start_failed job_id=%llu started=%zu err=%s",
+                    static_cast<unsigned long long>(job->id), ws.size(), ex.what());
+                job->running.store(false);
+            } catch (...) {
+                diag::log_tagged_fmt("intruder", "pooled_worker_start_failed job_id=%llu started=%zu",
+                    static_cast<unsigned long long>(job->id), ws.size());
+                job->running.store(false);
             }
             for (auto& t : ws) if (t.joinable()) t.join();
             break;
@@ -1912,7 +1923,23 @@ uint64_t start(config_t cfg)
     diag::log_tagged_fmt("intruder", "start job_id=%llu concurrency=%zu timeout_ms=%d max_resp_bytes=%zu",
         static_cast<unsigned long long>(job->id), job->cfg.concurrency,
         job->cfg.timeout_ms, job->cfg.max_response_body_bytes);
-    std::thread([job]() { job_main(job); }).detach();
+    try {
+        std::thread([job]() { job_main(job); }).detach();
+    } catch (const std::exception& ex) {
+        diag::log_tagged_fmt("intruder", "start_thread_failed job_id=%llu err=%s",
+            static_cast<unsigned long long>(job->id), ex.what());
+        job->running.store(false);
+        std::lock_guard<std::mutex> lk(reg().mtx);
+        reg().jobs.erase(job->id);
+        return 0;
+    } catch (...) {
+        diag::log_tagged_fmt("intruder", "start_thread_failed job_id=%llu",
+            static_cast<unsigned long long>(job->id));
+        job->running.store(false);
+        std::lock_guard<std::mutex> lk(reg().mtx);
+        reg().jobs.erase(job->id);
+        return 0;
+    }
     return job->id;
 }
 

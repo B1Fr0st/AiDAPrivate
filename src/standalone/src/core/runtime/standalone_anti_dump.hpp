@@ -5,17 +5,24 @@
 #include <psapi.h>
 #include <intrin.h>
 #include <winternl.h>
+#include <aclapi.h>
 
 #include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
+#include <new>
 #include <thread>
 #include <vector>
 
 #include "obfuscation.hpp"
 
 #pragma comment(lib, "ntdll.lib")
+#pragma comment(lib, "advapi32.lib")
+
+#ifndef PROCESS_SET_LIMITED_INFORMATION
+#define PROCESS_SET_LIMITED_INFORMATION 0x2000
+#endif
 
 namespace standalone_anti_dump
 {
@@ -160,6 +167,13 @@ namespace pe_header
         ULONGLONG saved_image_base = nt->OptionalHeader.ImageBase;
         DWORD saved_signature = nt->Signature;
         WORD saved_magic = nt->OptionalHeader.Magic;
+        WORD saved_machine = nt->FileHeader.Machine;
+        DWORD saved_entry = nt->OptionalHeader.AddressOfEntryPoint;
+        DWORD saved_headers = nt->OptionalHeader.SizeOfHeaders;
+        DWORD saved_checksum = nt->OptionalHeader.CheckSum;
+        DWORD saved_num_rva = nt->OptionalHeader.NumberOfRvaAndSizes;
+        auto* sec = IMAGE_FIRST_SECTION(nt);
+        std::vector<IMAGE_SECTION_HEADER> saved_sections(sec, sec + num_sections);
 
         nt->Signature = 0;
         nt->OptionalHeader.Magic = 0;
@@ -169,7 +183,6 @@ namespace pe_header
 
         nt->FileHeader.Machine = 0;
 
-        auto* sec = IMAGE_FIRST_SECTION(nt);
         for (WORD i = 0; i < num_sections; ++i)
         {
             memset(sec[i].Name, 0, IMAGE_SIZEOF_SHORT_NAME);
@@ -192,6 +205,13 @@ namespace pe_header
         nt->OptionalHeader.ImageBase = saved_image_base;
         nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS] = saved_tls;
         nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION] = saved_exception;
+        nt->FileHeader.Machine = saved_machine;
+        nt->OptionalHeader.AddressOfEntryPoint = saved_entry;
+        nt->OptionalHeader.SizeOfHeaders = saved_headers;
+        nt->OptionalHeader.CheckSum = saved_checksum;
+        nt->OptionalHeader.NumberOfRvaAndSizes = saved_num_rva;
+        if (!saved_sections.empty())
+            memcpy(sec, saved_sections.data(), saved_sections.size() * sizeof(IMAGE_SECTION_HEADER));
 
         VirtualProtect(nt, total, old_prot, &old_prot);
         return true;
@@ -213,9 +233,12 @@ namespace pe_header
         if (!VirtualProtect(nt, total + 256, PAGE_READWRITE, &old_prot))
             return false;
 
+        WORD orig_num_sections = nt->FileHeader.NumberOfSections;
+        auto* sec = IMAGE_FIRST_SECTION(nt);
+        std::vector<IMAGE_SECTION_HEADER> saved_sections(sec, sec + orig_num_sections);
+
         nt->FileHeader.NumberOfSections = 8;
 
-        auto* sec = IMAGE_FIRST_SECTION(nt);
         for (int i = 0; i < 8; ++i)
         {
             char fake_name[IMAGE_SIZEOF_SHORT_NAME] = {};
@@ -227,6 +250,10 @@ namespace pe_header
             sec[i].SizeOfRawData = sec[i].Misc.VirtualSize;
             sec[i].Characteristics = IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE;
         }
+
+        nt->FileHeader.NumberOfSections = orig_num_sections;
+        if (!saved_sections.empty())
+            memcpy(sec, saved_sections.data(), saved_sections.size() * sizeof(IMAGE_SECTION_HEADER));
 
         VirtualProtect(nt, total + 256, old_prot, &old_prot);
         return true;
@@ -260,10 +287,33 @@ namespace module_stealth
         UNICODE_STRING BaseDllName;
     };
 
+    inline bool pointer_writable(const void* p, size_t bytes)
+    {
+        if (!p || bytes == 0) return false;
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery(p, &mbi, sizeof(mbi)))
+            return false;
+        if (mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_NOACCESS) || (mbi.Protect & PAGE_GUARD))
+            return false;
+        const DWORD writable = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        if ((mbi.Protect & writable) == 0)
+            return false;
+        uintptr_t start = reinterpret_cast<uintptr_t>(p);
+        uintptr_t end = start + bytes;
+        uintptr_t region_end = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+        return end >= start && end <= region_end;
+    }
+
     inline void unlink_entry(LIST_ENTRY* entry)
     {
-        entry->Blink->Flink = entry->Flink;
-        entry->Flink->Blink = entry->Blink;
+        if (!pointer_writable(entry, sizeof(LIST_ENTRY))) return;
+        LIST_ENTRY* blink = entry->Blink;
+        LIST_ENTRY* flink = entry->Flink;
+        if (!blink || !flink || flink == entry) return;
+        if (!pointer_writable(blink, sizeof(LIST_ENTRY))) return;
+        if (!pointer_writable(flink, sizeof(LIST_ENTRY))) return;
+        blink->Flink = flink;
+        flink->Blink = blink;
         entry->Flink = entry;
         entry->Blink = entry;
     }
@@ -278,11 +328,14 @@ namespace module_stealth
         if (!our_mod) return false;
 
         auto* head = &ldr->InLoadOrderModuleList;
+        if (!pointer_writable(head, sizeof(LIST_ENTRY))) return false;
         auto* cur = head->Flink;
 
         while (cur != head)
         {
+            if (!pointer_writable(cur, sizeof(LIST_ENTRY))) return false;
             auto* entry = CONTAINING_RECORD(cur, _LDR_DATA_TABLE_ENTRY_FULL, InLoadOrderLinks);
+            if (!pointer_writable(entry, sizeof(_LDR_DATA_TABLE_ENTRY_FULL))) return false;
             if (entry->DllBase == our_mod)
             {
                 unlink_entry(&entry->InLoadOrderLinks);
@@ -291,13 +344,15 @@ namespace module_stealth
 
                 if (entry->FullDllName.Buffer && entry->FullDllName.Length > 0)
                 {
-                    memset(entry->FullDllName.Buffer, 0, entry->FullDllName.Length);
+                    if (pointer_writable(entry->FullDllName.Buffer, entry->FullDllName.Length))
+                        memset(entry->FullDllName.Buffer, 0, entry->FullDllName.Length);
                     entry->FullDllName.Length = 0;
                     entry->FullDllName.MaximumLength = 0;
                 }
                 if (entry->BaseDllName.Buffer && entry->BaseDllName.Length > 0)
                 {
-                    memset(entry->BaseDllName.Buffer, 0, entry->BaseDllName.Length);
+                    if (pointer_writable(entry->BaseDllName.Buffer, entry->BaseDllName.Length))
+                        memset(entry->BaseDllName.Buffer, 0, entry->BaseDllName.Length);
                     entry->BaseDllName.Length = 0;
                     entry->BaseDllName.MaximumLength = 0;
                 }
@@ -322,8 +377,13 @@ namespace read_intercept
     inline PVOID veh_handle = nullptr;
     inline std::atomic<uint64_t> trap_page_base{0};
     inline std::atomic<uint32_t> trap_page_size{0};
-
-    inline std::atomic<bool> expecting_single_step{false};
+    inline thread_local uint64_t pending_trap_page_base = 0;
+    inline thread_local uint32_t pending_trap_page_size = 0;
+    inline void*& trap_page_allocation()
+    {
+        static void* p = nullptr;
+        return p;
+    }
 
     inline LONG CALLBACK guard_page_handler(EXCEPTION_POINTERS* ep)
     {
@@ -333,7 +393,7 @@ namespace read_intercept
         if (ep->ExceptionRecord->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION)
         {
             uint64_t gpv_n = s_gpv_count.fetch_add(1) + 1;
-            if (gpv_n <= 10 || (gpv_n % 100) == 0) {
+            if (gpv_n == 1) {
                 uint64_t fault = (ep->ExceptionRecord->NumberParameters >= 2)
                     ? static_cast<uint64_t>(ep->ExceptionRecord->ExceptionInformation[1]) : 0;
                 char dbg[256];
@@ -352,7 +412,8 @@ namespace read_intercept
 
                 if (base != 0 && fault_addr >= base && fault_addr < base + size)
                 {
-                    expecting_single_step.store(true);
+                    pending_trap_page_base = base;
+                    pending_trap_page_size = size;
                     ep->ContextRecord->EFlags |= 0x100;
                     return EXCEPTION_CONTINUE_EXECUTION;
                 }
@@ -362,25 +423,23 @@ namespace read_intercept
         if (ep->ExceptionRecord->ExceptionCode == STATUS_SINGLE_STEP)
         {
             uint64_t ss_n = s_ss_count.fetch_add(1) + 1;
-            if (ss_n <= 10 || (ss_n % 100) == 0) {
+            if (ss_n == 1) {
                 char dbg[256];
                 _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
                     "SS #%llu rip=0x%llX tid=%lu expecting=%d",
                     ss_n, ep->ContextRecord->Rip, GetCurrentThreadId(),
-                    expecting_single_step.load() ? 1 : 0);
+                    (pending_trap_page_base != 0 && pending_trap_page_size != 0) ? 1 : 0);
                 anti_tamper::webhook::write_log("veh", dbg);
             }
-            if (expecting_single_step.exchange(false))
+            if (pending_trap_page_base != 0 && pending_trap_page_size != 0)
             {
-                uint64_t base = trap_page_base.load();
-                uint32_t size = trap_page_size.load();
-
-                if (base != 0 && size != 0)
-                {
-                    DWORD old_prot;
-                    VirtualProtect(reinterpret_cast<void*>(base), size,
-                        PAGE_EXECUTE_READ | PAGE_GUARD, &old_prot);
-                }
+                DWORD old_prot;
+                VirtualProtect(reinterpret_cast<void*>(pending_trap_page_base), pending_trap_page_size,
+                    PAGE_EXECUTE_READ | PAGE_GUARD, &old_prot);
+                pending_trap_page_base = 0;
+                pending_trap_page_size = 0;
+                if (ep->ContextRecord)
+                    ep->ContextRecord->EFlags &= ~0x100u;
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
         }
@@ -390,60 +449,35 @@ namespace read_intercept
 
     inline bool set_guard_pages()
     {
-        HMODULE mod = GetModuleHandleW(nullptr);
-        if (!mod) return false;
+        if (trap_page_allocation())
+            return true;
 
-        auto* base_ptr = reinterpret_cast<uint8_t*>(mod);
-        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base_ptr);
-        if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_magic == 0)
+        SYSTEM_INFO si{};
+        GetSystemInfo(&si);
+        DWORD page_size = si.dwPageSize ? si.dwPageSize : 0x1000u;
+        void* page = VirtualAlloc(nullptr, page_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!page) return false;
+        volatile uint64_t* words = reinterpret_cast<volatile uint64_t*>(page);
+        for (DWORD i = 0; i < page_size / sizeof(uint64_t); ++i)
+            words[i] = detail::generate_session_key() ^ i;
+
+        DWORD old_prot = 0;
+        if (!VirtualProtect(page, page_size, PAGE_READONLY | PAGE_GUARD, &old_prot))
         {
-            anti_tamper::webhook::write_log("anti_dump", "sa_set_guard_pages: pe_corrupted, setting guards");
-            auto* nt_at_offset = reinterpret_cast<IMAGE_NT_HEADERS64*>(
-                base_ptr + dos->e_lfanew);
-
-            MODULEINFO mi{};
-            GetModuleInformation(GetCurrentProcess(), mod, &mi, sizeof(mi));
-
-            uint64_t header_end = reinterpret_cast<uint64_t>(mod) + 0x1000;
-            uint64_t data_start = header_end;
-            uint64_t data_end = reinterpret_cast<uint64_t>(mod) + mi.SizeOfImage;
-
-            int guard_count = 0;
-            MEMORY_BASIC_INFORMATION mbi{};
-            uint64_t scan = data_start;
-            while (scan < data_end)
-            {
-                if (VirtualQuery(reinterpret_cast<void*>(scan), &mbi, sizeof(mbi)) == 0)
-                    break;
-
-                if (mbi.Protect == PAGE_READONLY || mbi.Protect == PAGE_READWRITE)
-                {
-                    trap_page_base.store(reinterpret_cast<uint64_t>(mbi.BaseAddress));
-                    trap_page_size.store(static_cast<uint32_t>(mbi.RegionSize));
-
-                    DWORD old_prot;
-                    VirtualProtect(mbi.BaseAddress, mbi.RegionSize,
-                        mbi.Protect | PAGE_GUARD, &old_prot);
-                    ++guard_count;
-                }
-
-                scan = reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize;
-            }
-            char dbg[128];
-            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE, "sa_guard_pages_set count=%d", guard_count);
-            anti_tamper::webhook::write_log("anti_dump", dbg);
+            VirtualFree(page, 0, MEM_RELEASE);
+            return false;
         }
-        else
-        {
-            anti_tamper::webhook::write_log("anti_dump", "sa_set_guard_pages: e_magic=MZ (preserved), skipping guard pages");
-        }
+        trap_page_allocation() = page;
+        trap_page_base.store(reinterpret_cast<uint64_t>(page));
+        trap_page_size.store(page_size);
+        anti_tamper::webhook::write_log("anti_dump", "sa_guard_pages_set count=1");
         return true;
     }
 
     inline bool install_veh()
     {
         if (veh_handle) return true;
-        veh_handle = AddVectoredExceptionHandler(1, guard_page_handler);
+        veh_handle = AddVectoredExceptionHandler(0, guard_page_handler);
         return veh_handle != nullptr;
     }
 
@@ -453,6 +487,13 @@ namespace read_intercept
         {
             RemoveVectoredExceptionHandler(veh_handle);
             veh_handle = nullptr;
+        }
+        if (trap_page_allocation())
+        {
+            VirtualFree(trap_page_allocation(), 0, MEM_RELEASE);
+            trap_page_allocation() = nullptr;
+            trap_page_base.store(0);
+            trap_page_size.store(0);
         }
     }
 
@@ -478,6 +519,11 @@ namespace section_encrypt
                 region_index, region_base, region_size, GetExceptionCode());
         }
         return ok;
+    }
+
+    inline bool region_is_host_image(const MEMORY_BASIC_INFORMATION& mbi)
+    {
+        return mbi.Type == MEM_IMAGE;
     }
 
     inline bool encrypt_non_code_sections()
@@ -526,6 +572,16 @@ namespace section_encrypt
                 && !(mbi.Protect & PAGE_GUARD)
                 && region_size >= 0x100)
             {
+                if (region_is_host_image(mbi))
+                {
+                    anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+                        "encrypt_non_code_region_skipped #%d reason=host_image_live_data base=0x%llX size=0x%X",
+                        region_index, region_base, region_size);
+                    addr = region_base + region_size;
+                    ++region_index;
+                    continue;
+                }
+
                 anti_tamper::webhook::write_log_critical_fmt("anti_dump",
                     "encrypt_non_code_region_pre_VirtualProtect #%d base=0x%llX size=0x%X protect=0x%X",
                     region_index, region_base, region_size, mbi.Protect);
@@ -542,8 +598,8 @@ namespace section_encrypt
                 if (vp1_ok)
                 {
                     anti_tamper::webhook::write_log_critical_fmt("anti_dump",
-                        "encrypt_non_code_region_pre_xor #%d base=0x%llX size=0x%X xor_key=0x%llX",
-                        region_index, region_base, region_size, detail::xor_key());
+                        "encrypt_non_code_region_pre_xor #%d base=0x%llX size=0x%X",
+                        region_index, region_base, region_size);
 
                     bool xor_ok = xor_region_seh(region_base, region_size,
                         detail::xor_key(), region_index);
@@ -582,8 +638,8 @@ namespace section_encrypt
         {
             char dbg[256];
             _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                "encrypt_non_code_done total_encrypted=%d total_regions_walked=%d xor_key=0x%llX",
-                encrypted_count, region_index, detail::xor_key());
+                "encrypt_non_code_done total_encrypted=%d total_regions_walked=%d",
+                encrypted_count, region_index);
             anti_tamper::webhook::write_log_critical("anti_dump", dbg);
         }
 
@@ -620,9 +676,22 @@ namespace dump_poison
                     if (j + 8 <= alloc_size)
                         *reinterpret_cast<uint64_t*>(ptr + j) = garbage;
                 }
+                detail::xor_region(ptr, static_cast<uint32_t>(alloc_size), detail::xor_key());
 
                 DWORD old_prot;
-                VirtualProtect(block, alloc_size, PAGE_EXECUTE_READ, &old_prot);
+                if (VirtualProtect(block, alloc_size, PAGE_EXECUTE_READ, &old_prot))
+                {
+                    std::lock_guard<std::mutex> lk(detail::region_mutex());
+                    detail::encrypted_regions().push_back({
+                        reinterpret_cast<uint64_t>(block),
+                        static_cast<uint32_t>(alloc_size),
+                        PAGE_EXECUTE_READ
+                    });
+                }
+                else
+                {
+                    VirtualFree(block, 0, MEM_RELEASE);
+                }
             }
         }
     }
@@ -734,6 +803,206 @@ namespace handle_strip
 
     using NtSetInformationProcess_t = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG);
 
+    inline bool copy_current_user_sid(std::vector<BYTE>& out_sid)
+    {
+        out_sid.clear();
+        HANDLE token = nullptr;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+        {
+            anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+                "sa_seal_dacl_token_open_failed gle=%lu", GetLastError());
+            return false;
+        }
+
+        DWORD needed = 0;
+        GetTokenInformation(token, TokenUser, nullptr, 0, &needed);
+        if (needed == 0)
+        {
+            CloseHandle(token);
+            anti_tamper::webhook::write_log_critical("anti_dump",
+                "sa_seal_dacl_token_size_failed");
+            return false;
+        }
+
+        std::vector<BYTE> token_user(needed);
+        if (!GetTokenInformation(token, TokenUser, token_user.data(), needed, &needed))
+        {
+            anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+                "sa_seal_dacl_token_query_failed gle=%lu", GetLastError());
+            CloseHandle(token);
+            return false;
+        }
+        CloseHandle(token);
+
+        auto* user = reinterpret_cast<TOKEN_USER*>(token_user.data());
+        DWORD sid_len = GetLengthSid(user->User.Sid);
+        out_sid.resize(sid_len);
+        if (!CopySid(sid_len, out_sid.data(), user->User.Sid))
+        {
+            anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+                "sa_seal_dacl_sid_copy_failed gle=%lu", GetLastError());
+            out_sid.clear();
+            return false;
+        }
+        return true;
+    }
+
+    inline bool apply_process_dacl_seal()
+    {
+        anti_tamper::webhook::write_log_critical("anti_dump", "sa_seal_dacl_begin");
+        std::vector<BYTE> user_sid;
+        if (!copy_current_user_sid(user_sid))
+            return false;
+
+        BYTE system_sid[SECURITY_MAX_SID_SIZE]{};
+        DWORD system_sid_size = sizeof(system_sid);
+        bool have_system = CreateWellKnownSid(WinLocalSystemSid, nullptr,
+            system_sid, &system_sid_size) != FALSE;
+
+        BYTE admins_sid[SECURITY_MAX_SID_SIZE]{};
+        DWORD admins_sid_size = sizeof(admins_sid);
+        bool have_admins = CreateWellKnownSid(WinBuiltinAdministratorsSid, nullptr,
+            admins_sid, &admins_sid_size) != FALSE;
+
+        constexpr DWORD limited_access =
+            PROCESS_QUERY_LIMITED_INFORMATION |
+            PROCESS_SET_LIMITED_INFORMATION |
+            SYNCHRONIZE |
+            READ_CONTROL;
+
+        EXPLICIT_ACCESSW entries[3]{};
+        ULONG count = 0;
+
+        entries[count].grfAccessPermissions = limited_access;
+        entries[count].grfAccessMode = SET_ACCESS;
+        entries[count].grfInheritance = NO_INHERITANCE;
+        entries[count].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+        entries[count].Trustee.TrusteeType = TRUSTEE_IS_USER;
+        entries[count].Trustee.ptstrName = reinterpret_cast<LPWSTR>(user_sid.data());
+        ++count;
+
+        if (have_system)
+        {
+            entries[count].grfAccessPermissions = PROCESS_ALL_ACCESS;
+            entries[count].grfAccessMode = SET_ACCESS;
+            entries[count].grfInheritance = NO_INHERITANCE;
+            entries[count].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+            entries[count].Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+            entries[count].Trustee.ptstrName = reinterpret_cast<LPWSTR>(system_sid);
+            ++count;
+        }
+
+        if (have_admins)
+        {
+            entries[count].grfAccessPermissions = limited_access;
+            entries[count].grfAccessMode = SET_ACCESS;
+            entries[count].grfInheritance = NO_INHERITANCE;
+            entries[count].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+            entries[count].Trustee.TrusteeType = TRUSTEE_IS_GROUP;
+            entries[count].Trustee.ptstrName = reinterpret_cast<LPWSTR>(admins_sid);
+            ++count;
+        }
+
+        PACL acl = nullptr;
+        anti_tamper::webhook::write_log_critical("anti_dump", "sa_seal_dacl_set_entries_begin");
+        DWORD acl_rc = SetEntriesInAclW(count, entries, nullptr, &acl);
+        if (acl_rc != ERROR_SUCCESS || !acl)
+        {
+            anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+                "sa_seal_dacl_set_entries_failed rc=%lu", acl_rc);
+            return false;
+        }
+
+        anti_tamper::webhook::write_log_critical("anti_dump", "sa_seal_dacl_set_security_begin");
+        DWORD set_rc = SetSecurityInfo(GetCurrentProcess(), SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            nullptr, nullptr, acl, nullptr);
+        LocalFree(acl);
+
+        if (set_rc != ERROR_SUCCESS)
+        {
+            anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+                "sa_seal_dacl_set_security_failed rc=%lu", set_rc);
+            return false;
+        }
+
+        anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+            "sa_seal_dacl_ok entries=%lu mask=0x%08X", count, limited_access);
+        return true;
+    }
+
+    struct dacl_seal_worker_state_t
+    {
+        HANDLE done_event = nullptr;
+        std::atomic<bool> ok{false};
+        std::atomic<DWORD> seh_code{0};
+    };
+
+    inline DWORD WINAPI dacl_seal_worker_proc(LPVOID ctx)
+    {
+        auto* state = static_cast<dacl_seal_worker_state_t*>(ctx);
+        bool ok = false;
+        __try { ok = apply_process_dacl_seal(); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            state->seh_code.store(GetExceptionCode(), std::memory_order_release);
+        }
+        state->ok.store(ok, std::memory_order_release);
+        if (state->done_event)
+            SetEvent(state->done_event);
+        return 0;
+    }
+
+    inline bool apply_process_dacl_seal_bounded(DWORD timeout_ms)
+    {
+        auto* state = new (std::nothrow) dacl_seal_worker_state_t();
+        if (!state)
+        {
+            anti_tamper::webhook::write_log_critical("anti_dump", "sa_seal_dacl_worker_alloc_failed");
+            return false;
+        }
+
+        state->done_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!state->done_event)
+        {
+            anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+                "sa_seal_dacl_worker_event_failed gle=%lu", GetLastError());
+            delete state;
+            return false;
+        }
+
+        HANDLE thread = CreateThread(nullptr, 0, dacl_seal_worker_proc, state, 0, nullptr);
+        if (!thread)
+        {
+            anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+                "sa_seal_dacl_worker_create_failed gle=%lu", GetLastError());
+            CloseHandle(state->done_event);
+            delete state;
+            return false;
+        }
+
+        DWORD wait = WaitForSingleObject(state->done_event, timeout_ms);
+        if (wait == WAIT_OBJECT_0)
+        {
+            bool ok = state->ok.load(std::memory_order_acquire);
+            DWORD seh = state->seh_code.load(std::memory_order_acquire);
+            CloseHandle(thread);
+            CloseHandle(state->done_event);
+            delete state;
+            if (seh != 0)
+            {
+                anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+                    "sa_seal_dacl_worker_seh code=0x%08lX", seh);
+                return false;
+            }
+            return ok;
+        }
+
+        anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+            "sa_seal_dacl_worker_timeout wait=0x%08lX timeout_ms=%lu", wait, timeout_ms);
+        CloseHandle(thread);
+        return false;
+    }
+
     inline NtSetInformationProcess_t get_nt_set_info()
     {
         return reinterpret_cast<NtSetInformationProcess_t>(
@@ -752,10 +1021,30 @@ namespace handle_strip
     inline void strip_process_handle_access()
     {
         auto pSet = get_nt_set_info();
-        if (!pSet) return;
+        if (!pSet)
+        {
+            anti_tamper::webhook::write_log_critical("anti_dump",
+                "sa_seal_no_NtSetInformationProcess");
+            bool dacl_ok = apply_process_dacl_seal_bounded(1500);
+            anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+                "sa_seal_dacl_fallback_result ok=%d", dacl_ok ? 1 : 0);
+            return;
+        }
 
         ULONG protected_proc = 1;
-        pSet(GetCurrentProcess(), 0x3D, &protected_proc, sizeof(protected_proc));
+        anti_tamper::webhook::write_log_critical("anti_dump", "sa_seal_ppl_attempt");
+        NTSTATUS st = pSet(GetCurrentProcess(), 0x3D, &protected_proc, sizeof(protected_proc));
+        bool ppl_ok = st >= 0;
+        anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+            ppl_ok ? "sa_seal_ppl_ok status=0x%08X" : "sa_seal_ppl_unavailable status=0x%08X",
+            static_cast<unsigned>(st));
+        if (!ppl_ok)
+        {
+            anti_tamper::webhook::write_log_critical("anti_dump", "sa_seal_dacl_fallback_begin");
+            bool dacl_ok = apply_process_dacl_seal_bounded(1500);
+            anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+                "sa_seal_dacl_fallback_result ok=%d", dacl_ok ? 1 : 0);
+        }
     }
 
     inline void clear_critical_flags()
@@ -793,8 +1082,8 @@ namespace monitor
             {
                 char dbg[256];
                 _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                    "reencrypt iter=%llu regions=%zu old_key=0x%llX new_key=0x%llX",
-                    reencrypt_iter, region_count, detail::xor_key(), new_key);
+                    "reencrypt iter=%llu regions=%zu",
+                    reencrypt_iter, region_count);
                 anti_tamper::webhook::write_log("anti_dump", dbg);
             }
 
@@ -883,13 +1172,15 @@ __declspec(noinline) static void sa_init_call_erase_dos_seh()
     }
 }
 
-__declspec(noinline) static void sa_init_call_install_veh_seh()
+__declspec(noinline) static bool sa_init_call_install_veh_seh()
 {
-    __try { read_intercept::install_veh(); }
+    bool ok = false;
+    __try { ok = read_intercept::install_veh(); }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         anti_tamper::webhook::write_log_critical_fmt("anti_dump",
             "sa_install_veh_SEH code=0x%08X", GetExceptionCode());
     }
+    return ok;
 }
 
 __declspec(noinline) static void sa_init_call_encrypt_non_code_seh()
@@ -901,13 +1192,15 @@ __declspec(noinline) static void sa_init_call_encrypt_non_code_seh()
     }
 }
 
-__declspec(noinline) static void sa_init_call_set_guard_pages_seh()
+__declspec(noinline) static bool sa_init_call_set_guard_pages_seh()
 {
-    __try { read_intercept::set_guard_pages(); }
+    bool ok = false;
+    __try { ok = read_intercept::set_guard_pages(); }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         anti_tamper::webhook::write_log_critical_fmt("anti_dump",
             "sa_set_guard_pages_SEH code=0x%08X", GetExceptionCode());
     }
+    return ok;
 }
 
 
@@ -964,8 +1257,8 @@ inline bool initialize()
 
     {
         char dbg[128];
-        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE, "pe_intact=%d xor_key=0x%llX",
-            pe_intact ? 1 : 0, detail::xor_key());
+        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE, "pe_intact=%d xor_key_ready=1",
+            pe_intact ? 1 : 0);
         anti_tamper::webhook::write_log_critical("anti_dump", dbg);
     }
 
@@ -999,19 +1292,30 @@ inline bool initialize()
         sa_init_call_erase_dos_seh();
         anti_tamper::webhook::write_log_critical("anti_dump", "erase_dos_ok");
 
-        anti_tamper::webhook::write_log_critical("anti_dump", "sa_install_veh_pre");
-        sa_init_call_install_veh_seh();
-        anti_tamper::webhook::write_log_critical("anti_dump", "install_veh_ok");
-
         anti_tamper::webhook::write_log_critical("anti_dump", "sa_encrypt_non_code_entering");
         sa_init_call_encrypt_non_code_seh();
         anti_tamper::webhook::write_log_critical("anti_dump", "sa_encrypt_non_code_ok");
 
-        anti_tamper::webhook::write_log_critical("anti_dump", "sa_set_guard_pages_entering");
-        sa_init_call_set_guard_pages_seh();
+        anti_tamper::webhook::write_log_critical("anti_dump", "sa_install_veh_pre");
+        bool sa_veh_ok = sa_init_call_install_veh_seh();
+        anti_tamper::webhook::write_log_critical("anti_dump",
+            sa_veh_ok ? "install_veh_ok" : "install_veh_fail");
+
+        bool guard_pages_ok = false;
+        if (sa_veh_ok)
+        {
+            anti_tamper::webhook::write_log_critical("anti_dump", "sa_set_guard_pages_entering");
+            guard_pages_ok = sa_init_call_set_guard_pages_seh();
+        }
+        else
+        {
+            anti_tamper::webhook::write_log_critical("anti_dump", "sa_set_guard_pages_skipped_no_veh");
+        }
         {
             char dbg[128];
-            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE, "guard_pages_set trap_base=0x%llX trap_size=0x%X",
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "guard_pages_set ok=%d trap_base=0x%llX trap_size=0x%X",
+                guard_pages_ok ? 1 : 0,
                 read_intercept::trap_page_base.load(), read_intercept::trap_page_size.load());
             anti_tamper::webhook::write_log_critical("anti_dump", dbg);
         }
@@ -1031,23 +1335,17 @@ inline bool initialize()
     anti_tamper::webhook::write_log("anti_dump", "active_store_ok");
     detail::monitors_running().store(true);
     anti_tamper::webhook::write_log("anti_dump", "monitors_store_ok");
-    try
+    static std::atomic<bool> s_anti_dump_reencrypt_posted{false};
+    bool expected_posted = false;
+    if (s_anti_dump_reencrypt_posted.compare_exchange_strong(expected_posted, true, std::memory_order_acq_rel))
     {
-        static std::thread s_anti_dump_reencrypt_thread;
-        if (!s_anti_dump_reencrypt_thread.joinable())
+        if (work_queue::post([]() { monitor::run_periodic_reencrypt(); }))
+            anti_tamper::webhook::write_log("anti_dump", "sa_monitor_work_queue_ok");
+        else
         {
-            s_anti_dump_reencrypt_thread = std::thread([]() { monitor::run_periodic_reencrypt(); });
-            s_anti_dump_reencrypt_thread.detach();
+            s_anti_dump_reencrypt_posted.store(false, std::memory_order_release);
+            anti_tamper::webhook::write_log("anti_dump", "sa_monitor_work_queue_fail");
         }
-        anti_tamper::webhook::write_log("anti_dump", "sa_thread_detach_ok");
-    }
-    catch (const std::exception& ex) {
-        char buf[256];
-        _snprintf_s(buf, sizeof(buf), _TRUNCATE, "sa_thread_detach_fail: %s", ex.what());
-        anti_tamper::webhook::write_log("anti_dump", buf);
-    }
-    catch (...) {
-        anti_tamper::webhook::write_log("anti_dump", "sa_thread_detach_fail_unknown");
     }
 
     if (pe_intact)

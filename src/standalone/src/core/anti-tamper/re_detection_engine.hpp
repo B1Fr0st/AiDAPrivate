@@ -634,10 +634,8 @@ namespace detail {
         if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver()) {
             driver_bridge::anti_debug_result_t ar{};
             if (driver_bridge::kernel_anti_debug_query(ar)) {
-#if !defined(AIDA_TEST_VMWARE_BYPASS)
                 if ((ar.result_flags & 0x1u) != 0)
                     mask |= SIGNAL_KERNEL_DEBUG;
-#endif
             }
         }
 
@@ -669,10 +667,8 @@ namespace detail {
         if (detect_debug_reattach())
             mask |= SIGNAL_DEBUG_REATTACH;
 
-#if !defined(AIDA_TEST_VMWARE_BYPASS)
         if (detect_kd_targeting_us())
             mask |= SIGNAL_KD_TARGETING_US;
-#endif
 
         return mask;
     }

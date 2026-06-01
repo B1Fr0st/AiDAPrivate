@@ -21,6 +21,7 @@
 
 #include <ctime>
 #include <cstring>
+#include <exception>
 #include <sstream>
 #include <iomanip>
 
@@ -1044,18 +1045,40 @@ bool license_manager_t::validate()
 
     std::atomic<bool> fallback_done{false};
     bool fallback_ok = false;
-    std::thread fallback_worker([this, &key, &current_hwid, &fallback_ok, &fallback_done]() {
-        fallback_ok = validate_with_cloud_function(key, current_hwid);
-        fallback_done.store(true, std::memory_order_release);
-    });
+    std::thread fallback_worker;
+    bool fallback_worker_started = false;
+    try
+    {
+        fallback_worker = std::thread([this, &key, &current_hwid, &fallback_ok, &fallback_done]() {
+            fallback_ok = validate_with_cloud_function(key, current_hwid);
+            fallback_done.store(true, std::memory_order_release);
+        });
+        fallback_worker_started = true;
+    }
+    catch (const std::exception& ex)
+    {
+        msg(OBFSTR_C("AiDA license validation worker unavailable: %s\n"), ex.what());
+    }
+    catch (...)
+    {
+        msg(OBFSTR_C("AiDA license validation worker unavailable.\n"));
+    }
 
     show_wait_box("HIDECANCEL\nAiDA: Validating license...");
-    while (!fallback_done.load(std::memory_order_acquire))
+    if (fallback_worker_started)
     {
-        user_cancelled();
-        Sleep(30);
+        while (!fallback_done.load(std::memory_order_acquire))
+        {
+            user_cancelled();
+            Sleep(30);
+        }
+        fallback_worker.join();
     }
-    fallback_worker.join();
+    else
+    {
+        fallback_ok = validate_with_cloud_function(key, current_hwid);
+        fallback_done.store(true, std::memory_order_release);
+    }
     hide_wait_box();
 
     if (fallback_ok)
@@ -1201,18 +1224,40 @@ bool license_manager_t::show_activation_dialog()
 
     std::atomic<bool> validation_done{false};
     bool valid = false;
-    std::thread validation_worker([this, &key, &current_hwid, &valid, &validation_done]() {
-        valid = validate_with_cloud_function(key, current_hwid);
-        validation_done.store(true, std::memory_order_release);
-    });
+    std::thread validation_worker;
+    bool validation_worker_started = false;
+    try
+    {
+        validation_worker = std::thread([this, &key, &current_hwid, &valid, &validation_done]() {
+            valid = validate_with_cloud_function(key, current_hwid);
+            validation_done.store(true, std::memory_order_release);
+        });
+        validation_worker_started = true;
+    }
+    catch (const std::exception& ex)
+    {
+        msg(OBFSTR_C("AiDA activation validation worker unavailable: %s\n"), ex.what());
+    }
+    catch (...)
+    {
+        msg(OBFSTR_C("AiDA activation validation worker unavailable.\n"));
+    }
 
     show_wait_box("HIDECANCEL\nAiDA: Validating license key...");
-    while (!validation_done.load(std::memory_order_acquire))
+    if (validation_worker_started)
     {
-        user_cancelled();
-        Sleep(30);
+        while (!validation_done.load(std::memory_order_acquire))
+        {
+            user_cancelled();
+            Sleep(30);
+        }
+        validation_worker.join();
     }
-    validation_worker.join();
+    else
+    {
+        valid = validate_with_cloud_function(key, current_hwid);
+        validation_done.store(true, std::memory_order_release);
+    }
     hide_wait_box();
 
     if (valid)
@@ -1346,7 +1391,7 @@ static int idaapi license_revalidation_timer_cb(void* )
     }
 
 
-    std::thread([]() {
+    auto heartbeat_tick = []() {
         auto& bg_lm = license_manager_t::instance();
         if (!bg_lm.perform_heartbeat())
         {
@@ -1367,7 +1412,22 @@ static int idaapi license_revalidation_timer_cb(void* )
                 execute_sync(*(new invalidate_req_t()), MFF_NOWAIT);
             }
         }
-    }).detach();
+    };
+
+    try
+    {
+        std::thread(heartbeat_tick).detach();
+    }
+    catch (const std::exception& ex)
+    {
+        msg(OBFSTR_C("AiDA heartbeat worker unavailable, running inline: %s\n"), ex.what());
+        heartbeat_tick();
+    }
+    catch (...)
+    {
+        msg(OBFSTR_C("AiDA heartbeat worker unavailable, running inline.\n"));
+        heartbeat_tick();
+    }
 
     if (!lm.verify_integrity_inline())
     {

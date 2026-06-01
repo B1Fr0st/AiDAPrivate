@@ -1362,234 +1362,6 @@ tool_result_t list_globals(const json& params)
     return tool_result_t::ok(OBFSTR("Globals listed"), result);
 }
 
-tool_result_t convert_number(const json& params)
-{
-    std::string value_str = params["value"].get<std::string>();
-
-    while (!value_str.empty() && std::isspace(static_cast<unsigned char>(value_str.front())))
-        value_str.erase(value_str.begin());
-    while (!value_str.empty() && std::isspace(static_cast<unsigned char>(value_str.back())))
-        value_str.pop_back();
-
-    if (value_str.empty())
-        return tool_result_t::error(OBFSTR("Empty value string"));
-
-    uint64_t value = 0;
-    bool parsed = false;
-    std::string input_base = "unknown";
-
-    bool is_negative = (!value_str.empty() && value_str[0] == '-');
-    if (is_negative)
-    {
-        try
-        {
-            size_t idx = 0;
-            int64_t sval = std::stoll(value_str, &idx, 0);
-            if (idx == value_str.length())
-            {
-                value = static_cast<uint64_t>(sval);
-                parsed = true;
-                input_base = "decimal";
-            }
-        }
-        catch (...) {}
-    }
-
-    if (!parsed)
-    {
-        ea_t ea_val = 0;
-        if (atoea(&ea_val, value_str.c_str()))
-        {
-            value = static_cast<uint64_t>(ea_val);
-            parsed = true;
-
-            if (value_str.size() > 2
-                && value_str[0] == '0'
-                && (value_str[1] == 'x' || value_str[1] == 'X'))
-                input_base = "hexadecimal";
-            else if (value_str.size() > 2
-                     && value_str[0] == '0'
-                     && (value_str[1] == 'b' || value_str[1] == 'B'))
-                input_base = "binary";
-            else if (value_str.size() > 1
-                     && value_str[0] == '0'
-                     && std::isdigit(static_cast<unsigned char>(value_str[1])))
-                input_base = "octal";
-            else
-                input_base = "decimal";
-        }
-    }
-
-    if (!parsed)
-    {
-        try
-        {
-            size_t idx = 0;
-            if (value_str.size() > 2
-                && value_str[0] == '0'
-                && (value_str[1] == 'b' || value_str[1] == 'B'))
-            {
-                value = std::stoull(value_str.substr(2), &idx, 2);
-                if (idx == value_str.length() - 2)
-                {
-                    parsed = true;
-                    input_base = "binary";
-                }
-            }
-            else
-            {
-                value = std::stoull(value_str, &idx, 0);
-                if (idx == value_str.length())
-                {
-                    parsed = true;
-                    if (value_str.size() > 2
-                        && value_str[0] == '0'
-                        && (value_str[1] == 'x' || value_str[1] == 'X'))
-                        input_base = "hexadecimal";
-                    else if (value_str.size() > 1 && value_str[0] == '0')
-                        input_base = "octal";
-                    else
-                        input_base = "decimal";
-                }
-            }
-        }
-        catch (...) {}
-    }
-
-    if (!parsed)
-        return tool_result_t::error(OBFSTR("Invalid number: ") + value_str);
-
-    int min_bytes;
-    if (value <= 0xFFULL)
-        min_bytes = 1;
-    else if (value <= 0xFFFFULL)
-        min_bytes = 2;
-    else if (value <= 0xFFFFFFFFULL)
-        min_bytes = 4;
-    else
-        min_bytes = 8;
-
-    int display_bytes = min_bytes;
-    if (params.contains("size") && params["size"].is_number())
-    {
-        int requested = params["size"].get<int>();
-        if (requested == 1 || requested == 2 || requested == 4 || requested == 8)
-            display_bytes = std::max(requested, min_bytes);
-    }
-
-    json result;
-
-    result["input"] = value_str;
-    result["input_base"] = input_base;
-
-    result["decimal"] = value;
-    result["signed_decimal"] = static_cast<int64_t>(value);
-
-    std::ostringstream hex_ss;
-    hex_ss << "0x" << std::hex << std::uppercase << value;
-    result["hex"] = hex_ss.str();
-
-    std::ostringstream oct_ss;
-    oct_ss << "0" << std::oct << value;
-    result["octal"] = oct_ss.str();
-
-    std::string binary;
-    uint64_t temp = value;
-    do {
-        binary = static_cast<char>('0' + (temp & 1)) + binary;
-        temp >>= 1;
-    } while (temp);
-    result["binary"] = "0b" + binary;
-
-    result["min_size_bytes"] = min_bytes;
-
-    auto format_bytes_le = [](uint64_t val, int num_bytes) -> std::string {
-        std::ostringstream ss;
-        for (int i = 0; i < num_bytes; i++)
-        {
-            if (i > 0) ss << " ";
-            ss << std::hex << std::uppercase << std::setw(2) << std::setfill('0')
-               << ((val >> (i * 8)) & 0xFF);
-        }
-        return ss.str();
-    };
-
-    auto format_bytes_be = [](uint64_t val, int num_bytes) -> std::string {
-        std::ostringstream ss;
-        for (int i = num_bytes - 1; i >= 0; i--)
-        {
-            if (i < num_bytes - 1) ss << " ";
-            ss << std::hex << std::uppercase << std::setw(2) << std::setfill('0')
-               << ((val >> (i * 8)) & 0xFF);
-        }
-        return ss.str();
-    };
-
-    result["bytes_le"] = format_bytes_le(value, display_bytes);
-    result["bytes_be"] = format_bytes_be(value, display_bytes);
-
-    if (min_bytes <= 1)
-    {
-        result["as_int8_le"] = format_bytes_le(value, 1);
-        result["as_int8_signed"] = static_cast<int64_t>(extend_sign(value, 1, true));
-    }
-    if (min_bytes <= 2)
-    {
-        result["as_int16_le"] = format_bytes_le(value, 2);
-        result["as_int16_be"] = format_bytes_be(value, 2);
-        result["as_int16_signed"] = static_cast<int64_t>(extend_sign(value, 2, true));
-    }
-    if (min_bytes <= 4)
-    {
-        result["as_int32_le"] = format_bytes_le(value, 4);
-        result["as_int32_be"] = format_bytes_be(value, 4);
-        result["as_int32_signed"] = static_cast<int64_t>(extend_sign(value, 4, true));
-    }
-    result["as_int64_le"] = format_bytes_le(value, 8);
-    result["as_int64_be"] = format_bytes_be(value, 8);
-    result["as_int64_signed"] = static_cast<int64_t>(value);
-
-    std::string ascii_le;
-    for (int i = 0; i < display_bytes; i++)
-    {
-        char c = static_cast<char>((value >> (i * 8)) & 0xFF);
-        if (c >= 32 && c < 127)
-            ascii_le += c;
-        else
-            ascii_le += '.';
-    }
-    result["ascii"] = ascii_le;
-
-    std::string ascii_be;
-    for (int i = display_bytes - 1; i >= 0; i--)
-    {
-        char c = static_cast<char>((value >> (i * 8)) & 0xFF);
-        if (c >= 32 && c < 127)
-            ascii_be += c;
-        else
-            ascii_be += '.';
-    }
-    result["ascii_be"] = ascii_be;
-
-    if (min_bytes <= 4)
-    {
-        uint32_t f_bits = static_cast<uint32_t>(value & 0xFFFFFFFF);
-        float f;
-        std::memcpy(&f, &f_bits, sizeof(float));
-        if (std::isfinite(f))
-            result["as_float"] = f;
-    }
-
-    {
-        double d;
-        std::memcpy(&d, &value, sizeof(double));
-        if (std::isfinite(d))
-            result["as_double"] = d;
-    }
-
-    return tool_result_t::ok(OBFSTR("Number converted"), result);
-}
-
 void register_tools()
 {
     auto& registry = ToolRegistry::instance();
@@ -1693,34 +1465,6 @@ void register_tools()
         list_globals
     });
 
-    registry.register_tool({
-        OBFSTR("convert_number"),
-        OBFSTR("memory"),
-        OBFSTR("[MANDATORY for base conversions] Convert a number between bases and show byte/ASCII ") +
-        OBFSTR("representation. You MUST use this tool for all hex-to-decimal conversions and for ") +
-        OBFSTR("interpreting hex values as ASCII characters ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â NEVER do those manually. ") +
-        OBFSTR("Returns: `input` (echo), `input_base` (detected base), `decimal` (unsigned), ") +
-        OBFSTR("`signed_decimal` (int64 interpretation), `hex`, `octal`, `binary`, `bytes_le`, ") +
-        OBFSTR("`bytes_be`, `ascii` (LE byte order), and `ascii_be` (BE / natural string order). ") +
-        OBFSTR("`min_size_bytes` ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â the smallest standard integer width (1, 2, 4, or 8) that holds the value. ") +
-        OBFSTR("Per-width fields: `as_int8_le`, `as_int16_le`/`as_int16_be`, `as_int32_le`/`as_int32_be`, ") +
-        OBFSTR("`as_int64_le`/`as_int64_be` are provided for each applicable width. ") +
-        OBFSTR("Signed fields: `as_int8_signed`, `as_int16_signed`, `as_int32_signed`, `as_int64_signed` ") +
-        OBFSTR("give the signed decimal interpretation at each width (e.g. 0xFF ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ as_int8_signed = -1). ") +
-        OBFSTR("IEEE 754 fields: `as_float` (when min_size_bytes <= 4) and `as_double` are provided ") +
-        OBFSTR("when the bit pattern represents a finite float/double ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â useful for game RE values. ") +
-        OBFSTR("CRITICAL: when decompiled code casts a local variable to (char*) and indexes beyond ") +
-        OBFSTR("min_size_bytes, the extra bytes come from ADJACENT stack variables, NOT from zero-padding. ") +
-        OBFSTR("Accepts a SINGLE numeric literal: decimal (e.g. '50463490'), hex (e.g. '0x426D416C'), ") +
-        OBFSTR("binary (e.g. '0b1010'), octal (e.g. '0777'), or negative decimal (e.g. '-1'). ") +
-        OBFSTR("Does NOT accept arithmetic expressions ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â compute sums first, then pass the result."),
-        {
-            {OBFSTR("value"), OBFSTR("string"), OBFSTR("Number to convert (decimal, 0x hex, 0b binary, 0 octal, or negative)"), true},
-            {OBFSTR("size"), OBFSTR("number"), OBFSTR("Override byte width for bytes_le/bytes_be/ascii (1, 2, 4, or 8). ") +
-                OBFSTR("If omitted, uses the minimum natural size for the value."), false}
-        },
-        convert_number
-    });
 }
 
 }
@@ -8485,7 +8229,7 @@ void register_tools()
 }
 
 
-namespace ida_pro_mcp_compat_tools
+namespace aida_ida_batch_tools
 {
 
 static auto g_start_time = std::chrono::steady_clock::now();
@@ -8684,7 +8428,7 @@ static tool_result_t server_health(const json&)
     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - g_start_time).count();
     data["status"] = "ok";
     data["server"] = "aida-ida-mcp";
-    data["compatibility"] = "ida-pro-mcp-enhancement";
+    data["server_family"] = "aida-ida-mcp";
     data["processor"] = procname.c_str();
     data["bitness"] = inf_get_app_bitness();
     data["is_64bit"] = inf_is_64bit();
@@ -8693,7 +8437,7 @@ static tool_result_t server_health(const json&)
     data["uptime_seconds"] = elapsed;
     data["function_count"] = (size_t)get_func_qty();
     data["segment_count"] = get_segm_qty();
-    return tool_result_t::ok(OBFSTR("IDA compatibility server is healthy"), data);
+    return tool_result_t::ok(OBFSTR("IDA server is healthy"), data);
 }
 
 static tool_result_t server_warmup(const json& params)
@@ -8706,7 +8450,7 @@ static tool_result_t server_warmup(const json& params)
     data["auto_analysis_complete"] = auto_is_ok();
     data["hexrays_available"] = init_hexrays ? init_hexrays_plugin() : false;
     data["function_count"] = (size_t)get_func_qty();
-    return tool_result_t::ok(OBFSTR("IDA compatibility warmup complete"), data);
+    return tool_result_t::ok(OBFSTR("IDA warmup complete"), data);
 }
 
 static tool_result_t decompile(const json& params)
@@ -8795,7 +8539,7 @@ static tool_result_t imports_query(const json& params)
     return tool_result_t::ok(OBFSTR("Import query complete"), results);
 }
 
-static tool_result_t list_globals_compat(const json& params)
+static tool_result_t list_globals_batch(const json& params)
 {
     if (!params.contains("queries") && !params.contains("query"))
         return memory_tools::list_globals(params);
@@ -8930,7 +8674,7 @@ static tool_result_t basic_blocks(const json& params)
     return tool_result_t::ok(OBFSTR("Basic blocks retrieved"), results);
 }
 
-static tool_result_t get_bytes_compat(const json& params)
+static tool_result_t get_bytes_batch(const json& params)
 {
     json regions = get_list_param(params, "regions", "items");
     json results = json::array();
@@ -9383,7 +9127,7 @@ static tool_result_t read_struct(const json& params)
     return tool_result_t::ok(OBFSTR("Struct reads processed"), results);
 }
 
-static tool_result_t search_structs_compat(const json& params)
+static tool_result_t search_structs_batch(const json& params)
 {
     json p;
     p["pattern"] = params.value("filter", params.value("pattern", ".*"));
@@ -9527,7 +9271,7 @@ static tool_result_t func_profile(const json& params)
     return tool_result_t::ok(OBFSTR("Function profile complete"), data);
 }
 
-static tool_result_t analyze_function_compat(const json& params)
+static tool_result_t analyze_function_batch(const json& params)
 {
     std::string addr = address_param(params);
     if (addr.empty())
@@ -9562,7 +9306,7 @@ static tool_result_t analyze_batch(const json& params)
     {
         json p;
         p["addr"] = first_string_field(item, {"addr", "address", "ea", "func"});
-        auto r = analyze_function_compat(p);
+        auto r = analyze_function_batch(p);
         results.push_back(r.success ? r.data : json{{"addr", p["addr"]}, {"error", r.output}});
     }
     return tool_result_t::ok(OBFSTR("Batch analysis complete"), results);
@@ -9634,7 +9378,7 @@ static tool_result_t xrefs_to_field(const json& params)
     return type_tools::get_struct_field_xrefs(p);
 }
 
-static tool_result_t find_compat(const json& params)
+static tool_result_t find_batch(const json& params)
 {
     std::string kind = params.value("kind", params.value("type", "text"));
     std::transform(kind.begin(), kind.end(), kind.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
@@ -9773,64 +9517,64 @@ static tool_result_t py_eval(const json& params)
 void register_tools()
 {
     auto& registry = ToolRegistry::instance();
-    registry.register_tool({OBFSTR("server_health"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Return IDA plugin health and static analysis state."), {}, server_health, true});
-    registry.register_tool({OBFSTR("server_warmup"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Warm IDA analysis/decompiler state for compatibility clients."), {{OBFSTR("wait_auto_analysis"), OBFSTR("boolean"), OBFSTR("Wait for auto-analysis"), false}, {OBFSTR("init_hexrays"), OBFSTR("boolean"), OBFSTR("Initialize Hex-Rays"), false}}, server_warmup, true});
-    registry.register_tool({OBFSTR("idb_save"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Save the current IDB."), {{OBFSTR("path"), OBFSTR("string"), OBFSTR("Optional output IDB path"), false}, {OBFSTR("backup"), OBFSTR("boolean"), OBFSTR("Create an IDB backup"), false}, {OBFSTR("compact"), OBFSTR("boolean"), OBFSTR("Compact database during save"), false}}, idb_save, false});
-    registry.register_tool({OBFSTR("decompile"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Compatibility alias for decompile_function."), {{OBFSTR("addr"), OBFSTR("string"), OBFSTR("Function address or name"), true}}, decompile, true});
-    registry.register_tool({OBFSTR("disasm"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Compatibility alias for disassemble_function."), {{OBFSTR("addr"), OBFSTR("string"), OBFSTR("Function address or name"), true}}, disasm, true});
-    registry.register_tool({OBFSTR("list_funcs"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("List functions using competitor-compatible pagination."), {{OBFSTR("offset"), OBFSTR("number"), OBFSTR("Start offset"), false}, {OBFSTR("count"), OBFSTR("number"), OBFSTR("Result count"), false}, {OBFSTR("filter"), OBFSTR("string"), OBFSTR("Name filter"), false}}, list_funcs, true});
-    registry.register_tool({OBFSTR("lookup_funcs"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Lookup functions by address or name."), {{OBFSTR("queries"), OBFSTR("array"), OBFSTR("Function lookup requests"), true}}, lookup_funcs, true});
-    registry.register_tool({OBFSTR("func_query"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Batch function catalog query."), {{OBFSTR("queries"), OBFSTR("array"), OBFSTR("Function query requests"), true}}, func_query, true});
-    registry.register_tool({OBFSTR("func_profile"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Return function metadata, complexity, and control-flow profile."), {{OBFSTR("addr"), OBFSTR("string"), OBFSTR("Function address or name"), true}}, func_profile, true});
-    registry.register_tool({OBFSTR("analyze_function"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Return a composite function analysis package."), {{OBFSTR("addr"), OBFSTR("string"), OBFSTR("Function address or name"), true}, {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Xref limit"), false}}, analyze_function_compat, true});
-    registry.register_tool({OBFSTR("analyze_batch"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Analyze multiple functions."), {{OBFSTR("addrs"), OBFSTR("array"), OBFSTR("Function addresses"), true}}, analyze_batch, true});
-    registry.register_tool({OBFSTR("analyze_component"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Analyze a component represented by a batch of functions."), {{OBFSTR("functions"), OBFSTR("array"), OBFSTR("Component function addresses"), true}}, analyze_component, true});
-    registry.register_tool({OBFSTR("diff_before_after"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Apply a supported edit and return before/after decompilation data."), {{OBFSTR("addr"), OBFSTR("string"), OBFSTR("Function address or name"), true}, {OBFSTR("action"), OBFSTR("string"), OBFSTR("Edit action"), true}, {OBFSTR("args"), OBFSTR("object"), OBFSTR("Action arguments"), false}}, diff_before_after, false});
-    registry.register_tool({OBFSTR("trace_data_flow"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Trace local data-flow around an address."), {{OBFSTR("addr"), OBFSTR("string"), OBFSTR("Instruction address"), true}, {OBFSTR("max_depth"), OBFSTR("number"), OBFSTR("Maximum scan depth"), false}}, trace_data_flow, true});
-    registry.register_tool({OBFSTR("imports"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("List imports using offset/count."), {{OBFSTR("offset"), OBFSTR("number"), OBFSTR("Start offset"), false}, {OBFSTR("count"), OBFSTR("number"), OBFSTR("Result count"), false}, {OBFSTR("filter"), OBFSTR("string"), OBFSTR("Name filter"), false}}, imports, true});
-    registry.register_tool({OBFSTR("imports_query"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Batch import catalog query."), {{OBFSTR("queries"), OBFSTR("array"), OBFSTR("Import query requests"), true}}, imports_query, true});
-    registry.register_tool({OBFSTR("export_funcs"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("List exports using competitor-compatible pagination."), {{OBFSTR("offset"), OBFSTR("number"), OBFSTR("Start offset"), false}, {OBFSTR("count"), OBFSTR("number"), OBFSTR("Result count"), false}, {OBFSTR("filter"), OBFSTR("string"), OBFSTR("Name filter"), false}}, export_funcs, true});
-    registry.register_tool({OBFSTR("list_globals"), OBFSTR("memory"), OBFSTR("List globals with AiDA and ida-pro-mcp-compatible query shapes."), {{OBFSTR("offset"), OBFSTR("number"), OBFSTR("Start offset"), false}, {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max results"), false}, {OBFSTR("filter"), OBFSTR("string"), OBFSTR("Regex filter"), false}, {OBFSTR("queries"), OBFSTR("array"), OBFSTR("Compatibility query batch"), false}}, list_globals_compat, true});
-    registry.register_tool({OBFSTR("entity_query"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Query function/global/import entity catalogs."), {{OBFSTR("queries"), OBFSTR("array"), OBFSTR("Entity query requests"), true}}, entity_query, true});
-    registry.register_tool({OBFSTR("xrefs_to"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Compatibility alias for get_xrefs_to."), {{OBFSTR("addrs"), OBFSTR("array"), OBFSTR("Target addresses"), true}, {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum xrefs"), false}}, xrefs_to, true});
-    registry.register_tool({OBFSTR("xref_query"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Batch xref query with to/from direction."), {{OBFSTR("queries"), OBFSTR("array"), OBFSTR("Xref query requests"), true}}, xref_query, true});
-    registry.register_tool({OBFSTR("xrefs_to_field"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Return information for a struct field and suggested offset search."), {{OBFSTR("struct_name"), OBFSTR("string"), OBFSTR("Struct name"), true}, {OBFSTR("field_name"), OBFSTR("string"), OBFSTR("Field name"), true}, {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum xrefs"), false}}, xrefs_to_field, true});
-    registry.register_tool({OBFSTR("callees"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("List callees for functions."), {{OBFSTR("addrs"), OBFSTR("array"), OBFSTR("Function addresses"), true}}, callees, true});
-    registry.register_tool({OBFSTR("basic_blocks"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("List basic blocks for functions."), {{OBFSTR("addrs"), OBFSTR("array"), OBFSTR("Function addresses"), true}}, basic_blocks, true});
-    registry.register_tool({OBFSTR("callgraph"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Build a call graph from a root function."), {{OBFSTR("addr"), OBFSTR("string"), OBFSTR("Root function address"), true}, {OBFSTR("depth"), OBFSTR("number"), OBFSTR("Maximum depth"), false}}, callgraph, true});
-    registry.register_tool({OBFSTR("find"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Compatibility finder across text, bytes, instructions, functions, imports, and exports."), {{OBFSTR("kind"), OBFSTR("string"), OBFSTR("Result kind"), false}, {OBFSTR("pattern"), OBFSTR("string"), OBFSTR("Search pattern"), false}, {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum results"), false}}, find_compat, true});
-    registry.register_tool({OBFSTR("find_regex"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Search strings and instructions by regex/text pattern."), {{OBFSTR("pattern"), OBFSTR("string"), OBFSTR("Regex pattern"), true}, {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum results per class"), false}}, find_regex, true});
-    registry.register_tool({OBFSTR("search_text"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Search IDA string literals by text or regex."), {{OBFSTR("text"), OBFSTR("string"), OBFSTR("Search text"), true}, {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum results"), false}}, search_text, true});
-    registry.register_tool({OBFSTR("insn_query"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Batch instruction text query."), {{OBFSTR("queries"), OBFSTR("array"), OBFSTR("Instruction query requests"), true}}, insn_query, true});
-    registry.register_tool({OBFSTR("get_bytes"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Read byte regions using {addr,size} requests."), {{OBFSTR("regions"), OBFSTR("array"), OBFSTR("Memory regions"), true}}, get_bytes_compat, true});
-    registry.register_tool({OBFSTR("get_int"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Read integers using {addr,ty} requests."), {{OBFSTR("queries"), OBFSTR("array"), OBFSTR("Integer read requests"), true}}, get_int, true});
-    registry.register_tool({OBFSTR("get_string"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Read strings from addresses."), {{OBFSTR("addrs"), OBFSTR("array"), OBFSTR("String addresses"), true}}, get_string, true});
-    registry.register_tool({OBFSTR("get_global_value"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Read global values by address or name."), {{OBFSTR("queries"), OBFSTR("array"), OBFSTR("Global value requests"), true}}, get_global_value, true});
-    registry.register_tool({OBFSTR("patch"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Patch bytes using {addr,data} requests."), {{OBFSTR("patches"), OBFSTR("array"), OBFSTR("Patch requests"), true}}, patch, false});
-    registry.register_tool({OBFSTR("patch_asm"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Assemble and patch instructions at addresses."), {{OBFSTR("items"), OBFSTR("array"), OBFSTR("Assembly patch requests"), false}, {OBFSTR("addr"), OBFSTR("string"), OBFSTR("Patch address"), false}, {OBFSTR("asm"), OBFSTR("string"), OBFSTR("Assembly instruction"), false}}, patch_asm, false});
-    registry.register_tool({OBFSTR("put_int"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Patch integer values using {addr,ty,value} requests."), {{OBFSTR("items"), OBFSTR("array"), OBFSTR("Integer write requests"), true}}, put_int, false});
-    registry.register_tool({OBFSTR("set_comments"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Set comments at addresses."), {{OBFSTR("items"), OBFSTR("array"), OBFSTR("Comment requests"), true}}, set_comments, false});
-    registry.register_tool({OBFSTR("append_comments"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Append comments at addresses."), {{OBFSTR("items"), OBFSTR("array"), OBFSTR("Comment append requests"), true}}, append_comments, false});
-    registry.register_tool({OBFSTR("rename"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Batch rename functions, globals, and locals."), {{OBFSTR("func"), OBFSTR("array"), OBFSTR("Function renames"), false}, {OBFSTR("data"), OBFSTR("array"), OBFSTR("Data renames"), false}, {OBFSTR("global"), OBFSTR("array"), OBFSTR("Global renames"), false}, {OBFSTR("local"), OBFSTR("array"), OBFSTR("Local renames"), false}}, rename, false});
-    registry.register_tool({OBFSTR("define_func"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Define functions."), {{OBFSTR("items"), OBFSTR("array"), OBFSTR("Function definition requests"), true}}, define_func, false});
-    registry.register_tool({OBFSTR("define_code"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Create code at addresses."), {{OBFSTR("items"), OBFSTR("array"), OBFSTR("Code definition requests"), true}}, define_code, false});
-    registry.register_tool({OBFSTR("stack_frame"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Read function stack frames."), {{OBFSTR("addrs"), OBFSTR("array"), OBFSTR("Function addresses"), true}}, stack_frame, true});
-    registry.register_tool({OBFSTR("declare_stack"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Declare stack variables."), {{OBFSTR("items"), OBFSTR("array"), OBFSTR("Stack variable declarations"), true}}, declare_stack, false});
-    registry.register_tool({OBFSTR("delete_stack"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Delete stack variables."), {{OBFSTR("items"), OBFSTR("array"), OBFSTR("Stack variable deletes"), true}}, delete_stack, false});
-    registry.register_tool({OBFSTR("declare_type"), OBFSTR("type"), OBFSTR("Declare C types with AiDA and compatibility request shapes."), {{OBFSTR("decls"), OBFSTR("array"), OBFSTR("C type declarations"), false}, {OBFSTR("declaration"), OBFSTR("string"), OBFSTR("Single C type declaration"), false}}, declare_type, false});
-    registry.register_tool({OBFSTR("enum_upsert"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Create enum types from compatibility requests."), {{OBFSTR("items"), OBFSTR("array"), OBFSTR("Enum definitions"), false}, {OBFSTR("name"), OBFSTR("string"), OBFSTR("Enum name"), false}, {OBFSTR("members"), OBFSTR("array"), OBFSTR("Enum members"), false}}, enum_upsert, false});
-    registry.register_tool({OBFSTR("read_struct"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Read struct members at addresses."), {{OBFSTR("queries"), OBFSTR("array"), OBFSTR("Struct read requests"), true}}, read_struct, true});
-    registry.register_tool({OBFSTR("search_structs"), OBFSTR("type"), OBFSTR("Search structs/types using filter or pattern."), {{OBFSTR("filter"), OBFSTR("string"), OBFSTR("Name filter"), false}, {OBFSTR("pattern"), OBFSTR("string"), OBFSTR("Regex pattern"), false}, {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max results"), false}}, search_structs_compat, true});
-    registry.register_tool({OBFSTR("type_query"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Batch type catalog query."), {{OBFSTR("queries"), OBFSTR("array"), OBFSTR("Type query requests"), true}}, type_query, true});
-    registry.register_tool({OBFSTR("type_inspect"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Inspect a named type or list local types."), {{OBFSTR("name"), OBFSTR("string"), OBFSTR("Type name"), false}, {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum list results"), false}}, type_inspect, true});
-    registry.register_tool({OBFSTR("set_type"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Apply function/global types."), {{OBFSTR("edits"), OBFSTR("array"), OBFSTR("Type edit requests"), true}}, set_type, false});
-    registry.register_tool({OBFSTR("type_apply_batch"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Apply multiple type edits."), {{OBFSTR("edits"), OBFSTR("array"), OBFSTR("Type edit requests"), true}}, type_apply_batch, false});
-    registry.register_tool({OBFSTR("infer_types"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Infer types at addresses."), {{OBFSTR("addrs"), OBFSTR("array"), OBFSTR("Addresses"), true}}, infer_types, true});
-    registry.register_tool({OBFSTR("survey_binary"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Return a compact binary survey."), {{OBFSTR("count"), OBFSTR("number"), OBFSTR("Sample count"), false}}, survey_binary, true});
-    registry.register_tool({OBFSTR("make_signature"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Generate a byte-pattern signature for an address or function."), {{OBFSTR("addr"), OBFSTR("string"), OBFSTR("Address or function name"), true}, {OBFSTR("max_bytes"), OBFSTR("number"), OBFSTR("Maximum bytes"), false}}, make_signature, true});
-    registry.register_tool({OBFSTR("make_signature_for_function"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Generate a byte-pattern signature for a function."), {{OBFSTR("addr"), OBFSTR("string"), OBFSTR("Function address or name"), true}, {OBFSTR("max_bytes"), OBFSTR("number"), OBFSTR("Maximum bytes"), false}}, make_signature_for_function, true});
-    registry.register_tool({OBFSTR("py_eval"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Execute Python code in IDA context."), {{OBFSTR("code"), OBFSTR("string"), OBFSTR("Python code or expression"), false}, {OBFSTR("expr"), OBFSTR("string"), OBFSTR("Python expression"), false}}, py_eval, false});
-    registry.register_tool({OBFSTR("py_exec_file"), OBFSTR("ida_pro_mcp_compat"), OBFSTR("Execute a Python file in IDA context."), {{OBFSTR("path"), OBFSTR("string"), OBFSTR("Python file path"), true}}, py_exec_file, false});
+    registry.register_tool({OBFSTR("server_health"), OBFSTR("aida_ida_batch"), OBFSTR("Return IDA plugin health and static analysis state."), {}, server_health, true});
+    registry.register_tool({OBFSTR("server_warmup"), OBFSTR("aida_ida_batch"), OBFSTR("Warm IDA analysis/decompiler state for AiDA clients."), {{OBFSTR("wait_auto_analysis"), OBFSTR("boolean"), OBFSTR("Wait for auto-analysis"), false}, {OBFSTR("init_hexrays"), OBFSTR("boolean"), OBFSTR("Initialize Hex-Rays"), false}}, server_warmup, true});
+    registry.register_tool({OBFSTR("idb_save"), OBFSTR("aida_ida_batch"), OBFSTR("Save the current IDB."), {{OBFSTR("path"), OBFSTR("string"), OBFSTR("Optional output IDB path"), false}, {OBFSTR("backup"), OBFSTR("boolean"), OBFSTR("Create an IDB backup"), false}, {OBFSTR("compact"), OBFSTR("boolean"), OBFSTR("Compact database during save"), false}}, idb_save, false});
+    registry.register_tool({OBFSTR("decompile"), OBFSTR("aida_ida_batch"), OBFSTR("AiDA alias for decompile_function."), {{OBFSTR("addr"), OBFSTR("string"), OBFSTR("Function address or name"), true}}, decompile, true});
+    registry.register_tool({OBFSTR("disasm"), OBFSTR("aida_ida_batch"), OBFSTR("AiDA alias for disassemble_function."), {{OBFSTR("addr"), OBFSTR("string"), OBFSTR("Function address or name"), true}}, disasm, true});
+    registry.register_tool({OBFSTR("list_funcs"), OBFSTR("aida_ida_batch"), OBFSTR("List functions using offset/count pagination."), {{OBFSTR("offset"), OBFSTR("number"), OBFSTR("Start offset"), false}, {OBFSTR("count"), OBFSTR("number"), OBFSTR("Result count"), false}, {OBFSTR("filter"), OBFSTR("string"), OBFSTR("Name filter"), false}}, list_funcs, true});
+    registry.register_tool({OBFSTR("lookup_funcs"), OBFSTR("aida_ida_batch"), OBFSTR("Lookup functions by address or name."), {{OBFSTR("queries"), OBFSTR("array"), OBFSTR("Function lookup requests"), true}}, lookup_funcs, true});
+    registry.register_tool({OBFSTR("func_query"), OBFSTR("aida_ida_batch"), OBFSTR("Batch function catalog query."), {{OBFSTR("queries"), OBFSTR("array"), OBFSTR("Function query requests"), true}}, func_query, true});
+    registry.register_tool({OBFSTR("func_profile"), OBFSTR("aida_ida_batch"), OBFSTR("Return function metadata, complexity, and control-flow profile."), {{OBFSTR("addr"), OBFSTR("string"), OBFSTR("Function address or name"), true}}, func_profile, true});
+    registry.register_tool({OBFSTR("analyze_function"), OBFSTR("aida_ida_batch"), OBFSTR("Return a composite function analysis package."), {{OBFSTR("addr"), OBFSTR("string"), OBFSTR("Function address or name"), true}, {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Xref limit"), false}}, analyze_function_batch, true});
+    registry.register_tool({OBFSTR("analyze_batch"), OBFSTR("aida_ida_batch"), OBFSTR("Analyze multiple functions."), {{OBFSTR("addrs"), OBFSTR("array"), OBFSTR("Function addresses"), true}}, analyze_batch, true});
+    registry.register_tool({OBFSTR("analyze_component"), OBFSTR("aida_ida_batch"), OBFSTR("Analyze a component represented by a batch of functions."), {{OBFSTR("functions"), OBFSTR("array"), OBFSTR("Component function addresses"), true}}, analyze_component, true});
+    registry.register_tool({OBFSTR("diff_before_after"), OBFSTR("aida_ida_batch"), OBFSTR("Apply a supported edit and return before/after decompilation data."), {{OBFSTR("addr"), OBFSTR("string"), OBFSTR("Function address or name"), true}, {OBFSTR("action"), OBFSTR("string"), OBFSTR("Edit action"), true}, {OBFSTR("args"), OBFSTR("object"), OBFSTR("Action arguments"), false}}, diff_before_after, false});
+    registry.register_tool({OBFSTR("trace_data_flow"), OBFSTR("aida_ida_batch"), OBFSTR("Trace local data-flow around an address."), {{OBFSTR("addr"), OBFSTR("string"), OBFSTR("Instruction address"), true}, {OBFSTR("max_depth"), OBFSTR("number"), OBFSTR("Maximum scan depth"), false}}, trace_data_flow, true});
+    registry.register_tool({OBFSTR("imports"), OBFSTR("aida_ida_batch"), OBFSTR("List imports using offset/count."), {{OBFSTR("offset"), OBFSTR("number"), OBFSTR("Start offset"), false}, {OBFSTR("count"), OBFSTR("number"), OBFSTR("Result count"), false}, {OBFSTR("filter"), OBFSTR("string"), OBFSTR("Name filter"), false}}, imports, true});
+    registry.register_tool({OBFSTR("imports_query"), OBFSTR("aida_ida_batch"), OBFSTR("Batch import catalog query."), {{OBFSTR("queries"), OBFSTR("array"), OBFSTR("Import query requests"), true}}, imports_query, true});
+    registry.register_tool({OBFSTR("export_funcs"), OBFSTR("aida_ida_batch"), OBFSTR("List exports using offset/count pagination."), {{OBFSTR("offset"), OBFSTR("number"), OBFSTR("Start offset"), false}, {OBFSTR("count"), OBFSTR("number"), OBFSTR("Result count"), false}, {OBFSTR("filter"), OBFSTR("string"), OBFSTR("Name filter"), false}}, export_funcs, true});
+    registry.register_tool({OBFSTR("list_globals"), OBFSTR("memory"), OBFSTR("List globals with AiDA batch query shapes."), {{OBFSTR("offset"), OBFSTR("number"), OBFSTR("Start offset"), false}, {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max results"), false}, {OBFSTR("filter"), OBFSTR("string"), OBFSTR("Regex filter"), false}, {OBFSTR("queries"), OBFSTR("array"), OBFSTR("Batch query requests"), false}}, list_globals_batch, true});
+    registry.register_tool({OBFSTR("entity_query"), OBFSTR("aida_ida_batch"), OBFSTR("Query function/global/import entity catalogs."), {{OBFSTR("queries"), OBFSTR("array"), OBFSTR("Entity query requests"), true}}, entity_query, true});
+    registry.register_tool({OBFSTR("xrefs_to"), OBFSTR("aida_ida_batch"), OBFSTR("AiDA alias for get_xrefs_to."), {{OBFSTR("addrs"), OBFSTR("array"), OBFSTR("Target addresses"), true}, {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum xrefs"), false}}, xrefs_to, true});
+    registry.register_tool({OBFSTR("xref_query"), OBFSTR("aida_ida_batch"), OBFSTR("Batch xref query with to/from direction."), {{OBFSTR("queries"), OBFSTR("array"), OBFSTR("Xref query requests"), true}}, xref_query, true});
+    registry.register_tool({OBFSTR("xrefs_to_field"), OBFSTR("aida_ida_batch"), OBFSTR("Return information for a struct field and suggested offset search."), {{OBFSTR("struct_name"), OBFSTR("string"), OBFSTR("Struct name"), true}, {OBFSTR("field_name"), OBFSTR("string"), OBFSTR("Field name"), true}, {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum xrefs"), false}}, xrefs_to_field, true});
+    registry.register_tool({OBFSTR("callees"), OBFSTR("aida_ida_batch"), OBFSTR("List callees for functions."), {{OBFSTR("addrs"), OBFSTR("array"), OBFSTR("Function addresses"), true}}, callees, true});
+    registry.register_tool({OBFSTR("basic_blocks"), OBFSTR("aida_ida_batch"), OBFSTR("List basic blocks for functions."), {{OBFSTR("addrs"), OBFSTR("array"), OBFSTR("Function addresses"), true}}, basic_blocks, true});
+    registry.register_tool({OBFSTR("callgraph"), OBFSTR("aida_ida_batch"), OBFSTR("Build a call graph from a root function."), {{OBFSTR("addr"), OBFSTR("string"), OBFSTR("Root function address"), true}, {OBFSTR("depth"), OBFSTR("number"), OBFSTR("Maximum depth"), false}}, callgraph, true});
+    registry.register_tool({OBFSTR("find"), OBFSTR("aida_ida_batch"), OBFSTR("AiDA finder across text, bytes, instructions, functions, imports, and exports."), {{OBFSTR("kind"), OBFSTR("string"), OBFSTR("Result kind"), false}, {OBFSTR("pattern"), OBFSTR("string"), OBFSTR("Search pattern"), false}, {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum results"), false}}, find_batch, true});
+    registry.register_tool({OBFSTR("find_regex"), OBFSTR("aida_ida_batch"), OBFSTR("Search strings and instructions by regex/text pattern."), {{OBFSTR("pattern"), OBFSTR("string"), OBFSTR("Regex pattern"), true}, {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum results per class"), false}}, find_regex, true});
+    registry.register_tool({OBFSTR("search_text"), OBFSTR("aida_ida_batch"), OBFSTR("Search IDA string literals by text or regex."), {{OBFSTR("text"), OBFSTR("string"), OBFSTR("Search text"), true}, {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum results"), false}}, search_text, true});
+    registry.register_tool({OBFSTR("insn_query"), OBFSTR("aida_ida_batch"), OBFSTR("Batch instruction text query."), {{OBFSTR("queries"), OBFSTR("array"), OBFSTR("Instruction query requests"), true}}, insn_query, true});
+    registry.register_tool({OBFSTR("get_bytes"), OBFSTR("aida_ida_batch"), OBFSTR("Read byte regions using {addr,size} requests."), {{OBFSTR("regions"), OBFSTR("array"), OBFSTR("Memory regions"), true}}, get_bytes_batch, true});
+    registry.register_tool({OBFSTR("get_int"), OBFSTR("aida_ida_batch"), OBFSTR("Read integers using {addr,ty} requests."), {{OBFSTR("queries"), OBFSTR("array"), OBFSTR("Integer read requests"), true}}, get_int, true});
+    registry.register_tool({OBFSTR("get_string"), OBFSTR("aida_ida_batch"), OBFSTR("Read strings from addresses."), {{OBFSTR("addrs"), OBFSTR("array"), OBFSTR("String addresses"), true}}, get_string, true});
+    registry.register_tool({OBFSTR("get_global_value"), OBFSTR("aida_ida_batch"), OBFSTR("Read global values by address or name."), {{OBFSTR("queries"), OBFSTR("array"), OBFSTR("Global value requests"), true}}, get_global_value, true});
+    registry.register_tool({OBFSTR("patch"), OBFSTR("aida_ida_batch"), OBFSTR("Patch bytes using {addr,data} requests."), {{OBFSTR("patches"), OBFSTR("array"), OBFSTR("Patch requests"), true}}, patch, false});
+    registry.register_tool({OBFSTR("patch_asm"), OBFSTR("aida_ida_batch"), OBFSTR("Assemble and patch instructions at addresses."), {{OBFSTR("items"), OBFSTR("array"), OBFSTR("Assembly patch requests"), false}, {OBFSTR("addr"), OBFSTR("string"), OBFSTR("Patch address"), false}, {OBFSTR("asm"), OBFSTR("string"), OBFSTR("Assembly instruction"), false}}, patch_asm, false});
+    registry.register_tool({OBFSTR("put_int"), OBFSTR("aida_ida_batch"), OBFSTR("Patch integer values using {addr,ty,value} requests."), {{OBFSTR("items"), OBFSTR("array"), OBFSTR("Integer write requests"), true}}, put_int, false});
+    registry.register_tool({OBFSTR("set_comments"), OBFSTR("aida_ida_batch"), OBFSTR("Set comments at addresses."), {{OBFSTR("items"), OBFSTR("array"), OBFSTR("Comment requests"), true}}, set_comments, false});
+    registry.register_tool({OBFSTR("append_comments"), OBFSTR("aida_ida_batch"), OBFSTR("Append comments at addresses."), {{OBFSTR("items"), OBFSTR("array"), OBFSTR("Comment append requests"), true}}, append_comments, false});
+    registry.register_tool({OBFSTR("rename"), OBFSTR("aida_ida_batch"), OBFSTR("Batch rename functions, globals, and locals."), {{OBFSTR("func"), OBFSTR("array"), OBFSTR("Function renames"), false}, {OBFSTR("data"), OBFSTR("array"), OBFSTR("Data renames"), false}, {OBFSTR("global"), OBFSTR("array"), OBFSTR("Global renames"), false}, {OBFSTR("local"), OBFSTR("array"), OBFSTR("Local renames"), false}}, rename, false});
+    registry.register_tool({OBFSTR("define_func"), OBFSTR("aida_ida_batch"), OBFSTR("Define functions."), {{OBFSTR("items"), OBFSTR("array"), OBFSTR("Function definition requests"), true}}, define_func, false});
+    registry.register_tool({OBFSTR("define_code"), OBFSTR("aida_ida_batch"), OBFSTR("Create code at addresses."), {{OBFSTR("items"), OBFSTR("array"), OBFSTR("Code definition requests"), true}}, define_code, false});
+    registry.register_tool({OBFSTR("stack_frame"), OBFSTR("aida_ida_batch"), OBFSTR("Read function stack frames."), {{OBFSTR("addrs"), OBFSTR("array"), OBFSTR("Function addresses"), true}}, stack_frame, true});
+    registry.register_tool({OBFSTR("declare_stack"), OBFSTR("aida_ida_batch"), OBFSTR("Declare stack variables."), {{OBFSTR("items"), OBFSTR("array"), OBFSTR("Stack variable declarations"), true}}, declare_stack, false});
+    registry.register_tool({OBFSTR("delete_stack"), OBFSTR("aida_ida_batch"), OBFSTR("Delete stack variables."), {{OBFSTR("items"), OBFSTR("array"), OBFSTR("Stack variable deletes"), true}}, delete_stack, false});
+    registry.register_tool({OBFSTR("declare_type"), OBFSTR("type"), OBFSTR("Declare C types with AiDA batch request shapes."), {{OBFSTR("decls"), OBFSTR("array"), OBFSTR("C type declarations"), false}, {OBFSTR("declaration"), OBFSTR("string"), OBFSTR("Single C type declaration"), false}}, declare_type, false});
+    registry.register_tool({OBFSTR("enum_upsert"), OBFSTR("aida_ida_batch"), OBFSTR("Create enum types from AiDA batch requests."), {{OBFSTR("items"), OBFSTR("array"), OBFSTR("Enum definitions"), false}, {OBFSTR("name"), OBFSTR("string"), OBFSTR("Enum name"), false}, {OBFSTR("members"), OBFSTR("array"), OBFSTR("Enum members"), false}}, enum_upsert, false});
+    registry.register_tool({OBFSTR("read_struct"), OBFSTR("aida_ida_batch"), OBFSTR("Read struct members at addresses."), {{OBFSTR("queries"), OBFSTR("array"), OBFSTR("Struct read requests"), true}}, read_struct, true});
+    registry.register_tool({OBFSTR("search_structs"), OBFSTR("type"), OBFSTR("Search structs/types using filter or pattern."), {{OBFSTR("filter"), OBFSTR("string"), OBFSTR("Name filter"), false}, {OBFSTR("pattern"), OBFSTR("string"), OBFSTR("Regex pattern"), false}, {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max results"), false}}, search_structs_batch, true});
+    registry.register_tool({OBFSTR("type_query"), OBFSTR("aida_ida_batch"), OBFSTR("Batch type catalog query."), {{OBFSTR("queries"), OBFSTR("array"), OBFSTR("Type query requests"), true}}, type_query, true});
+    registry.register_tool({OBFSTR("type_inspect"), OBFSTR("aida_ida_batch"), OBFSTR("Inspect a named type or list local types."), {{OBFSTR("name"), OBFSTR("string"), OBFSTR("Type name"), false}, {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum list results"), false}}, type_inspect, true});
+    registry.register_tool({OBFSTR("set_type"), OBFSTR("aida_ida_batch"), OBFSTR("Apply function/global types."), {{OBFSTR("edits"), OBFSTR("array"), OBFSTR("Type edit requests"), true}}, set_type, false});
+    registry.register_tool({OBFSTR("type_apply_batch"), OBFSTR("aida_ida_batch"), OBFSTR("Apply multiple type edits."), {{OBFSTR("edits"), OBFSTR("array"), OBFSTR("Type edit requests"), true}}, type_apply_batch, false});
+    registry.register_tool({OBFSTR("infer_types"), OBFSTR("aida_ida_batch"), OBFSTR("Infer types at addresses."), {{OBFSTR("addrs"), OBFSTR("array"), OBFSTR("Addresses"), true}}, infer_types, true});
+    registry.register_tool({OBFSTR("survey_binary"), OBFSTR("aida_ida_batch"), OBFSTR("Return a compact binary survey."), {{OBFSTR("count"), OBFSTR("number"), OBFSTR("Sample count"), false}}, survey_binary, true});
+    registry.register_tool({OBFSTR("make_signature"), OBFSTR("aida_ida_batch"), OBFSTR("Generate a byte-pattern signature for an address or function."), {{OBFSTR("addr"), OBFSTR("string"), OBFSTR("Address or function name"), true}, {OBFSTR("max_bytes"), OBFSTR("number"), OBFSTR("Maximum bytes"), false}}, make_signature, true});
+    registry.register_tool({OBFSTR("make_signature_for_function"), OBFSTR("aida_ida_batch"), OBFSTR("Generate a byte-pattern signature for a function."), {{OBFSTR("addr"), OBFSTR("string"), OBFSTR("Function address or name"), true}, {OBFSTR("max_bytes"), OBFSTR("number"), OBFSTR("Maximum bytes"), false}}, make_signature_for_function, true});
+    registry.register_tool({OBFSTR("py_eval"), OBFSTR("aida_ida_batch"), OBFSTR("Execute Python code in IDA context."), {{OBFSTR("code"), OBFSTR("string"), OBFSTR("Python code or expression"), false}, {OBFSTR("expr"), OBFSTR("string"), OBFSTR("Python expression"), false}}, py_eval, false});
+    registry.register_tool({OBFSTR("py_exec_file"), OBFSTR("aida_ida_batch"), OBFSTR("Execute a Python file in IDA context."), {{OBFSTR("path"), OBFSTR("string"), OBFSTR("Python file path"), true}}, py_exec_file, false});
 }
 
 }
@@ -9854,7 +9598,7 @@ void initialize_all_tools()
     vuln_tools::register_tools();
     vuln_tools::register_advanced_tools();
     aida::vuln::verify::tools::register_verification_tools();
-    ida_pro_mcp_compat_tools::register_tools();
+    aida_ida_batch_tools::register_tools();
 
     ToolRegistry::instance().register_tool({
         OBFSTR("list_all_available_tools"), OBFSTR("meta"),

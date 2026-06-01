@@ -11,6 +11,8 @@
 
 #pragma comment(lib, "ntdll.lib")
 
+void FlushMapperLogFile();
+
 #ifndef STATUS_SUCCESS
 #define STATUS_SUCCESS          ((NTSTATUS)0x00000000L)
 #endif
@@ -307,7 +309,9 @@ namespace Utils {
     BOOL SecureDeleteFile(PCWSTR filePath);
     BOOL PosixDeleteFile(PCWSTR filePath);
     BOOL ForceDeleteOrRename(PCWSTR filePath);
+    BOOL HideLoadedImagePath(PCWSTR filePath);
     std::wstring GetTempFilePath(PCWSTR extension);
+    std::wstring GetSiblingTempFilePath(PCWSTR basePath, PCWSTR extension);
 }
 
 namespace DriverLoader {

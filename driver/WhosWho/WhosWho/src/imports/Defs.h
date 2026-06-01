@@ -240,6 +240,7 @@ inline NTSTATUS           (NTAPI* _ZwProtectVirtualMemory)         (HANDLE, PVOI
 inline NTSTATUS           (NTAPI* _ObOpenObjectByPointer)          (PVOID, ULONG, PACCESS_STATE, ACCESS_MASK, POBJECT_TYPE, KPROCESSOR_MODE, PHANDLE);
 inline NTSTATUS           (NTAPI* _ZwSuspendThread)                (HANDLE, PULONG);
 inline NTSTATUS           (NTAPI* _ZwResumeThread)                 (HANDLE, PULONG);
+inline NTSTATUS           (NTAPI* _ZwSetInformationThread)         (HANDLE, ULONG, PVOID, ULONG);
 
 inline POBJECT_TYPE*       _IoFileObjectType = nullptr;
 inline POBJECT_TYPE        (NTAPI* _ObGetObjectType)(PVOID) = nullptr;
@@ -309,9 +310,6 @@ namespace ssdt_resolver {
     inline volatile LONG g_funcs_resolved = 0;
     inline volatile LONG g_ctx_funcs_resolved = 0;
     inline volatile UINT64 g_lstar = 0;
-
-
-    constexpr ULONG KTHREAD_PREVIOUSMODE_OFFSET = 0x232;
 
     __forceinline BOOLEAN find_ssdt() {
         LONG prev = _InterlockedCompareExchange(&g_ssdt_found, 1, 0);
@@ -511,28 +509,18 @@ namespace ssdt_resolver {
 
     __forceinline NTSTATUS call_NtSuspendThread(HANDLE thread_handle, PULONG prev_count) {
         if (!g_NtSuspendThread) return STATUS_PROCEDURE_NOT_FOUND;
-
-        PUCHAR kthread = (PUCHAR)PsGetCurrentThread();
-        CHAR saved_mode = kthread[KTHREAD_PREVIOUSMODE_OFFSET];
-        kthread[KTHREAD_PREVIOUSMODE_OFFSET] = KernelMode;
-
-        NTSTATUS status = g_NtSuspendThread(thread_handle, prev_count);
-
-        kthread[KTHREAD_PREVIOUSMODE_OFFSET] = saved_mode;
-        return status;
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
+        UNREFERENCED_PARAMETER(thread_handle);
+        UNREFERENCED_PARAMETER(prev_count);
+        return STATUS_NOT_SUPPORTED;
     }
 
     __forceinline NTSTATUS call_NtResumeThread(HANDLE thread_handle, PULONG prev_count) {
         if (!g_NtResumeThread) return STATUS_PROCEDURE_NOT_FOUND;
-
-        PUCHAR kthread = (PUCHAR)PsGetCurrentThread();
-        CHAR saved_mode = kthread[KTHREAD_PREVIOUSMODE_OFFSET];
-        kthread[KTHREAD_PREVIOUSMODE_OFFSET] = KernelMode;
-
-        NTSTATUS status = g_NtResumeThread(thread_handle, prev_count);
-
-        kthread[KTHREAD_PREVIOUSMODE_OFFSET] = saved_mode;
-        return status;
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
+        UNREFERENCED_PARAMETER(thread_handle);
+        UNREFERENCED_PARAMETER(prev_count);
+        return STATUS_NOT_SUPPORTED;
     }
 
     __forceinline BOOLEAN resolve_thread_context() {
@@ -619,28 +607,18 @@ namespace ssdt_resolver {
 
     __forceinline NTSTATUS call_NtGetContextThread(HANDLE thread_handle, PCONTEXT context) {
         if (!g_NtGetContextThread) return STATUS_PROCEDURE_NOT_FOUND;
-
-        PUCHAR kthread = (PUCHAR)PsGetCurrentThread();
-        CHAR saved_mode = kthread[KTHREAD_PREVIOUSMODE_OFFSET];
-        kthread[KTHREAD_PREVIOUSMODE_OFFSET] = KernelMode;
-
-        NTSTATUS status = g_NtGetContextThread(thread_handle, context);
-
-        kthread[KTHREAD_PREVIOUSMODE_OFFSET] = saved_mode;
-        return status;
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
+        UNREFERENCED_PARAMETER(thread_handle);
+        UNREFERENCED_PARAMETER(context);
+        return STATUS_NOT_SUPPORTED;
     }
 
     __forceinline NTSTATUS call_NtSetContextThread(HANDLE thread_handle, PCONTEXT context) {
         if (!g_NtSetContextThread) return STATUS_PROCEDURE_NOT_FOUND;
-
-        PUCHAR kthread = (PUCHAR)PsGetCurrentThread();
-        CHAR saved_mode = kthread[KTHREAD_PREVIOUSMODE_OFFSET];
-        kthread[KTHREAD_PREVIOUSMODE_OFFSET] = KernelMode;
-
-        NTSTATUS status = g_NtSetContextThread(thread_handle, context);
-
-        kthread[KTHREAD_PREVIOUSMODE_OFFSET] = saved_mode;
-        return status;
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
+        UNREFERENCED_PARAMETER(thread_handle);
+        UNREFERENCED_PARAMETER(context);
+        return STATUS_NOT_SUPPORTED;
     }
 }
 
@@ -705,6 +683,7 @@ inline bool SetupFunctions() {
     *(PVOID*)&_ObOpenObjectByPointer = GetProcAddress(kernelBase, (PCHAR)skCrypt("ObOpenObjectByPointer"));
     *(PVOID*)&_ZwSuspendThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwSuspendThread"));
     *(PVOID*)&_ZwResumeThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwResumeThread"));
+    *(PVOID*)&_ZwSetInformationThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwSetInformationThread"));
 
     _IoFileObjectType = (POBJECT_TYPE*)GetProcAddress(kernelBase, (PCHAR)skCrypt("IoFileObjectType"));
     *(PVOID*)&_ObGetObjectType = GetProcAddress(kernelBase, (PCHAR)skCrypt("ObGetObjectType"));
@@ -753,7 +732,7 @@ inline bool SetupFunctions() {
     WW_LOG("SetupFunctions: _PsLookupThreadByThreadId=%p _PsGetNextProcessThread=%p _PsGetThreadId=%p", _PsLookupThreadByThreadId, _PsGetNextProcessThread, _PsGetThreadId);
     WW_LOG("SetupFunctions: _PsGetContextThread=%p _PsSetContextThread=%p _PsSuspendThread=%p _PsResumeThread=%p", _PsGetContextThread, _PsSetContextThread, _PsSuspendThread, _PsResumeThread);
     WW_LOG("SetupFunctions: _PsGetProcessPeb=%p _ZwQueryVirtualMemory=%p _ZwProtectVirtualMemory=%p", _PsGetProcessPeb, _ZwQueryVirtualMemory, _ZwProtectVirtualMemory);
-    WW_LOG("SetupFunctions: _ObOpenObjectByPointer=%p _ZwSuspendThread=%p _ZwResumeThread=%p", _ObOpenObjectByPointer, _ZwSuspendThread, _ZwResumeThread);
+    WW_LOG("SetupFunctions: _ObOpenObjectByPointer=%p _ZwSuspendThread=%p _ZwResumeThread=%p _ZwSetInformationThread=%p", _ObOpenObjectByPointer, _ZwSuspendThread, _ZwResumeThread, _ZwSetInformationThread);
     WW_LOG("SetupFunctions: _IoFileObjectType=%p _ObGetObjectType=%p _ObReferenceObjectSafe=%p", _IoFileObjectType, _ObGetObjectType, _ObReferenceObjectSafe);
     WW_LOG("SetupFunctions: _ZwOpenKey=%p _ZwQueryValueKey=%p _ZwDeleteFile=%p _ZwSetInformationFile=%p", _ZwOpenKey, _ZwQueryValueKey, _ZwDeleteFile, _ZwSetInformationFile);
     WW_LOG("SetupFunctions: _IoCreateFileEx=%p _KeBugCheckEx=%p _KdRefreshDebuggerNotPresent=%p", _IoCreateFileEx, _KeBugCheckEx, _KdRefreshDebuggerNotPresent);

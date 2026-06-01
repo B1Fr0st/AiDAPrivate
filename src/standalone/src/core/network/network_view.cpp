@@ -1,6 +1,7 @@
 #include "network_view.hpp"
 #include "work_queue.hpp"
 #include "standalone_driver.hpp"
+#include "../runtime/standalone_license.hpp"
 #include "protocol_parser.hpp"
 #include "mitm_proxy.hpp"
 #include "cert_pin_bypass.hpp"
@@ -65,6 +66,7 @@
 #include <ws2tcpip.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <climits>
@@ -73,12 +75,15 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <initializer_list>
 #include <regex>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace network_view {
@@ -207,6 +212,51 @@ struct capture_rate_smooth_t {
     size_t last_count = 0;
 };
 static capture_rate_smooth_t s_cap_rate;
+static std::mutex s_capture_control_mutex;
+static std::string s_capture_control_status;
+
+static void set_capture_control_status(const char* text) {
+    std::lock_guard<std::mutex> lock(s_capture_control_mutex);
+    s_capture_control_status = text ? text : "";
+}
+
+static std::string capture_control_status() {
+    std::lock_guard<std::mutex> lock(s_capture_control_mutex);
+    return s_capture_control_status;
+}
+
+template <typename Fn>
+static bool post_network_task(const char* name, Fn&& fn) {
+    try {
+        bool ok = work_queue::post(std::function<void()>(std::forward<Fn>(fn)));
+        diag::log_tagged_fmt("network", "work_queue_post name=%s ok=%d",
+            name ? name : "?", ok ? 1 : 0);
+        return ok;
+    } catch (const std::exception& e) {
+        diag::log_tagged_fmt("network", "work_queue_post_cpp_exception name=%s what=%s",
+            name ? name : "?", e.what());
+        return false;
+    } catch (...) {
+        diag::log_tagged_fmt("network", "work_queue_post_unknown_exception name=%s",
+            name ? name : "?");
+        return false;
+    }
+}
+
+static bool initialize_work_queue_for_network() {
+    try {
+        diag::log_tagged("network", "work_queue_initialize_begin");
+        work_queue::initialize();
+        diag::log_tagged("network", "work_queue_initialize_ok");
+        return true;
+    } catch (const std::exception& e) {
+        diag::log_tagged_fmt("network", "work_queue_initialize_cpp_exception what=%s", e.what());
+        return false;
+    } catch (...) {
+        diag::log_tagged("network", "work_queue_initialize_unknown_exception");
+        return false;
+    }
+}
 
 static float capture_rate_tick(size_t total_packets) {
     float now = aida::ui::clock::seconds();
@@ -370,13 +420,65 @@ static bool filter_text_match(const char* filter, const std::string& text) {
     return lower_text.find(lower_filter) != std::string::npos;
 }
 
+static bool driver_feature_ready(const char* feature, int iter = -1) {
+    bool drv_ok = driver_bridge::using_kernel_driver();
+    bool auth_ok = drv_ok && standalone_license::is_valid();
+    if (!auth_ok && (iter < 0 || iter <= 3 || (iter % 60) == 0)) {
+        diag::log_tagged_fmt("network", "%s_driver_gate drv_ok=%d auth_ok=%d iter=%d",
+            feature ? feature : "network",
+            drv_ok ? 1 : 0,
+            auth_ok ? 1 : 0,
+            iter);
+    }
+    if (!auth_ok)
+        return false;
+
+    static std::atomic<uint64_t> s_bridge_cooldown_until_ms{0};
+    uint64_t now = static_cast<uint64_t>(GetTickCount64());
+    uint64_t cooldown_until = s_bridge_cooldown_until_ms.load(std::memory_order_acquire);
+    if (cooldown_until != 0 && now < cooldown_until) {
+        if (iter < 0 || iter <= 3 || (iter % 10) == 0) {
+            diag::log_tagged_fmt("network",
+                "%s_driver_gate bridge_cooldown iter=%d remaining_ms=%llu",
+                feature ? feature : "network",
+                iter,
+                static_cast<unsigned long long>(cooldown_until - now));
+        }
+        return false;
+    }
+
+    ::SetLastError(ERROR_SUCCESS);
+    bool bridge_ok = driver_bridge::refresh_heartbeat();
+    DWORD bridge_err = bridge_ok ? ERROR_SUCCESS : ::GetLastError();
+    if (!bridge_ok) {
+        constexpr uint64_t kBridgeFailureCooldownMs = 5000;
+        s_bridge_cooldown_until_ms.store(now + kBridgeFailureCooldownMs, std::memory_order_release);
+        diag::log_tagged_fmt("network",
+            "%s_driver_gate bridge_heartbeat_failed iter=%d err=%lu cooldown_ms=%llu",
+            feature ? feature : "network",
+            iter,
+            static_cast<unsigned long>(bridge_err),
+            static_cast<unsigned long long>(kBridgeFailureCooldownMs));
+        return false;
+    }
+
+    if (cooldown_until != 0) {
+        s_bridge_cooldown_until_ms.store(0, std::memory_order_release);
+        diag::log_tagged_fmt("network",
+            "%s_driver_gate bridge_heartbeat_recovered iter=%d",
+            feature ? feature : "network",
+            iter);
+    }
+    return true;
+}
+
 
 static void connection_poll_thread(state_t& state) {
     diag::log_tagged_fmt("network", "connection_poll_thread_started auto_refresh=%d filter_pid=%u filter_proto=%u",
         state.conn_auto_refresh ? 1 : 0, state.conn_filter_pid, state.conn_filter_protocol);
     int poll_iter = 0;
     while (state.conn_polling.load()) {
-        bool drv_ok = driver_bridge::using_kernel_driver();
+        bool drv_ok = driver_feature_ready("connection_poll", poll_iter);
         ++poll_iter;
         if (drv_ok && state.conn_auto_refresh) {
             auto raw_conns = driver_bridge::enumerate_connections(
@@ -434,7 +536,7 @@ static void capture_poll_thread(state_t& state) {
         poll_iter = 0;
         diag::log_tagged("network", "capture_poll_loop_armed");
         while (state.cap_polling.load()) {
-            bool drv_ok = driver_bridge::using_kernel_driver();
+            bool drv_ok = driver_feature_ready("capture_poll", poll_iter);
             if (poll_iter < 5 || (poll_iter % 100) == 0) {
                 diag::log_tagged_fmt("network", "capture_poll iter=%d drv_ok=%d", poll_iter, drv_ok ? 1 : 0);
             }
@@ -500,7 +602,7 @@ static void dns_poll_thread(state_t& state) {
         poll_iter = 0;
         diag::log_tagged("network", "dns_poll_loop_armed");
         while (state.dns_polling.load()) {
-            bool drv_ok = driver_bridge::using_kernel_driver();
+            bool drv_ok = driver_feature_ready("dns_poll", poll_iter);
             if (poll_iter < 5 || (poll_iter % 100) == 0) {
                 diag::log_tagged_fmt("network", "dns_poll iter=%d drv_ok=%d filter_pid=%u",
                     poll_iter, drv_ok ? 1 : 0, state.dns_filter_pid);
@@ -628,12 +730,147 @@ static void bandwidth_poll_thread(state_t& state) {
 
 static void run_fuzzer_thread(state_t& state);
 
+static bool start_connection_worker(state_t& state) {
+    if (!state.conn_thread_done.load(std::memory_order_acquire))
+        return true;
+    state.conn_polling.store(true);
+    state.conn_thread_done.store(false, std::memory_order_release);
+    if (post_network_task("connection_poll", []() {
+            try {
+                connection_poll_thread(g_state);
+            } catch (const std::exception& e) {
+                diag::log_tagged_fmt("network", "connection_poll_cpp_exception what=%s", e.what());
+            } catch (...) {
+                diag::log_tagged("network", "connection_poll_unknown_exception");
+            }
+            g_state.conn_thread_done.store(true, std::memory_order_release);
+        })) {
+        return true;
+    }
+    state.conn_polling.store(false);
+    state.conn_thread_done.store(true, std::memory_order_release);
+    diag::log_tagged("network", "connection_worker_post_failed");
+    return false;
+}
+
+static bool start_capture_worker(state_t& state) {
+    if (!state.cap_thread_done.load(std::memory_order_acquire) &&
+        state.cap_thread_alive.load(std::memory_order_acquire)) {
+        return true;
+    }
+    state.cap_thread_alive.store(true, std::memory_order_release);
+    state.cap_thread_done.store(false, std::memory_order_release);
+    if (post_network_task("capture_poll", []() {
+            try {
+                capture_poll_thread(g_state);
+            } catch (const std::exception& e) {
+                diag::log_tagged_fmt("network", "capture_poll_cpp_exception what=%s", e.what());
+            } catch (...) {
+                diag::log_tagged("network", "capture_poll_unknown_exception");
+            }
+            g_state.cap_thread_done.store(true, std::memory_order_release);
+        })) {
+        return true;
+    }
+    state.cap_thread_alive.store(false, std::memory_order_release);
+    state.cap_thread_done.store(true, std::memory_order_release);
+    diag::log_tagged("network", "capture_worker_post_failed");
+    return false;
+}
+
+static bool start_dns_worker(state_t& state) {
+    if (!state.dns_thread_done.load(std::memory_order_acquire) &&
+        state.dns_thread_alive.load(std::memory_order_acquire)) {
+        return true;
+    }
+    state.dns_thread_alive.store(true, std::memory_order_release);
+    state.dns_thread_done.store(false, std::memory_order_release);
+    if (post_network_task("dns_poll", []() {
+            try {
+                dns_poll_thread(g_state);
+            } catch (const std::exception& e) {
+                diag::log_tagged_fmt("network", "dns_poll_cpp_exception what=%s", e.what());
+            } catch (...) {
+                diag::log_tagged("network", "dns_poll_unknown_exception");
+            }
+            g_state.dns_thread_done.store(true, std::memory_order_release);
+        })) {
+        return true;
+    }
+    state.dns_thread_alive.store(false, std::memory_order_release);
+    state.dns_thread_done.store(true, std::memory_order_release);
+    diag::log_tagged("network", "dns_worker_post_failed");
+    return false;
+}
+
+static bool start_bandwidth_worker(state_t& state) {
+    if (!state.bw_thread_done.load(std::memory_order_acquire) &&
+        state.bw_thread_alive.load(std::memory_order_acquire)) {
+        return true;
+    }
+    state.bw_thread_alive.store(true, std::memory_order_release);
+    state.bw_thread_done.store(false, std::memory_order_release);
+    if (post_network_task("bandwidth_poll", []() {
+            try {
+                bandwidth_poll_thread(g_state);
+            } catch (const std::exception& e) {
+                diag::log_tagged_fmt("network", "bandwidth_poll_cpp_exception what=%s", e.what());
+            } catch (...) {
+                diag::log_tagged("network", "bandwidth_poll_unknown_exception");
+            }
+            g_state.bw_thread_done.store(true, std::memory_order_release);
+        })) {
+        return true;
+    }
+    state.bw_thread_alive.store(false, std::memory_order_release);
+    state.bw_thread_done.store(true, std::memory_order_release);
+    diag::log_tagged("network", "bandwidth_worker_post_failed");
+    return false;
+}
+
+static bool start_fuzzer_worker(state_t& state) {
+    if (!state.fuzz_thread_done.load(std::memory_order_acquire) &&
+        state.fuzz_thread_alive.load(std::memory_order_acquire)) {
+        return true;
+    }
+    state.fuzz_thread_alive.store(true, std::memory_order_release);
+    state.fuzz_thread_done.store(false, std::memory_order_release);
+    if (post_network_task("fuzzer", []() {
+            try {
+                diag::log_tagged("network", "fuzzer_thread_started");
+                while (true) {
+                    {
+                        std::unique_lock<std::mutex> lk(g_state.fuzz_cv_mutex);
+                        g_state.fuzz_cv.wait(lk, []() {
+                            return g_state.fuzz_running.load() || !g_state.fuzz_thread_alive.load();
+                        });
+                    }
+                    if (!g_state.fuzz_thread_alive.load())
+                        break;
+                    run_fuzzer_thread(g_state);
+                }
+            } catch (const std::exception& e) {
+                diag::log_tagged_fmt("network", "fuzzer_cpp_exception what=%s", e.what());
+            } catch (...) {
+                diag::log_tagged("network", "fuzzer_unknown_exception");
+            }
+            g_state.fuzz_thread_done.store(true, std::memory_order_release);
+            diag::log_tagged("network", "fuzzer_thread_exited");
+        })) {
+        return true;
+    }
+    state.fuzz_thread_alive.store(false, std::memory_order_release);
+    state.fuzz_thread_done.store(true, std::memory_order_release);
+    diag::log_tagged("network", "fuzzer_thread_post_failed");
+    return false;
+}
+
 void initialize() {
     g_state.active = true;
     diag::log_tagged("network", "initialize_begin");
     anti_tamper::webhook::write_log("net_audit", "[net_audit] network_view initialize begin");
 
-    work_queue::initialize();
+    bool work_queue_ready = initialize_work_queue_for_network();
 
     mitm_proxy::set_ws_frame_callback([](const mitm_proxy::ws_frame_observed_t& frame) {
         state_t::ws_frame_entry_t entry;
@@ -671,69 +908,35 @@ void initialize() {
     });
     anti_tamper::webhook::write_log("net_audit", "[net_audit] websocket ws_frame_callback installed");
 
-    g_state.conn_polling.store(true);
-    g_state.conn_thread_done.store(false, std::memory_order_release);
-    if (!work_queue::post([]() {
-            connection_poll_thread(g_state);
-            g_state.conn_thread_done.store(true, std::memory_order_release);
-        }))
-    {
+    if (work_queue_ready) {
+        start_connection_worker(g_state);
+        start_capture_worker(g_state);
+        start_dns_worker(g_state);
+        start_bandwidth_worker(g_state);
+        start_fuzzer_worker(g_state);
+    } else {
+        g_state.conn_polling.store(false);
         g_state.conn_thread_done.store(true, std::memory_order_release);
-    }
-
-    g_state.cap_thread_alive.store(true);
-    g_state.cap_thread_done.store(false, std::memory_order_release);
-    if (!work_queue::post([]() {
-            capture_poll_thread(g_state);
-            g_state.cap_thread_done.store(true, std::memory_order_release);
-        }))
-    {
+        g_state.cap_thread_alive.store(false, std::memory_order_release);
         g_state.cap_thread_done.store(true, std::memory_order_release);
-    }
-
-    g_state.dns_thread_alive.store(true);
-    g_state.dns_thread_done.store(false, std::memory_order_release);
-    if (!work_queue::post([]() {
-            dns_poll_thread(g_state);
-            g_state.dns_thread_done.store(true, std::memory_order_release);
-        }))
-    {
+        g_state.dns_thread_alive.store(false, std::memory_order_release);
         g_state.dns_thread_done.store(true, std::memory_order_release);
-    }
-
-    g_state.bw_thread_alive.store(true);
-    g_state.bw_thread_done.store(false, std::memory_order_release);
-    if (!work_queue::post([]() {
-            bandwidth_poll_thread(g_state);
-            g_state.bw_thread_done.store(true, std::memory_order_release);
-        }))
-    {
+        g_state.bw_thread_alive.store(false, std::memory_order_release);
         g_state.bw_thread_done.store(true, std::memory_order_release);
+        g_state.fuzz_thread_alive.store(false, std::memory_order_release);
+        g_state.fuzz_thread_done.store(true, std::memory_order_release);
+        diag::log_tagged("network", "initialize_continuing_without_poll_workers");
     }
 
-    g_state.fuzz_thread_alive.store(true);
-    g_state.fuzz_thread_done.store(false, std::memory_order_release);
-    if (!work_queue::post([]() {
-            diag::log_tagged("network", "fuzzer_thread_started");
-            while (true) {
-                {
-                    std::unique_lock<std::mutex> lk(g_state.fuzz_cv_mutex);
-                    g_state.fuzz_cv.wait(lk, []() {
-                        return g_state.fuzz_running.load() || !g_state.fuzz_thread_alive.load();
-                    });
-                }
-                if (!g_state.fuzz_thread_alive.load())
-                    break;
-                run_fuzzer_thread(g_state);
-            }
-            g_state.fuzz_thread_done.store(true, std::memory_order_release);
-            diag::log_tagged("network", "fuzzer_thread_exited");
-        }))
-    {
-        g_state.fuzz_thread_done.store(true, std::memory_order_release);
-        diag::log_tagged("network", "fuzzer_thread_post_failed");
+    try {
+        diag::log_tagged("network", "burp_initialize_begin");
+        bool burp_ok = aida::burp::initialize();
+        diag::log_tagged_fmt("network", "burp_initialize_result ok=%d", burp_ok ? 1 : 0);
+    } catch (const std::exception& e) {
+        diag::log_tagged_fmt("network", "burp_initialize_cpp_exception what=%s", e.what());
+    } catch (...) {
+        diag::log_tagged("network", "burp_initialize_unknown_exception");
     }
-    aida::burp::initialize();
 
     diag::log_tagged("network", "initialize_complete");
 }
@@ -749,6 +952,9 @@ void shutdown() {
     g_state.bw_cv.notify_all();
 
     g_state.cap_polling.store(false);
+    g_state.cap_running.store(false, std::memory_order_release);
+    g_state.cap_start_pending.store(false, std::memory_order_release);
+    g_state.cap_stop_pending.store(false, std::memory_order_release);
     g_state.cap_thread_alive.store(false);
     g_state.cap_cv.notify_all();
 
@@ -1207,6 +1413,108 @@ static void render_connections(state_t& state, float x, float y, float w, float 
 }
 
 
+static void request_capture_start(state_t& state) {
+    bool expected = false;
+    if (!state.cap_start_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        diag::log_tagged("network", "start_capture_ignored_already_pending");
+        return;
+    }
+    set_capture_control_status("Starting capture...");
+    uint32_t filter_pid = state.cap_filter_pid;
+    uint32_t filter_port = static_cast<uint32_t>(state.cap_filter_port);
+    uint32_t filter_protocol = state.cap_filter_protocol;
+    bool driver_ok = driver_feature_ready("start_capture");
+    if (!driver_ok) {
+        set_capture_control_status("Capture unavailable until AiDA is authorized");
+        state.cap_start_pending.store(false, std::memory_order_release);
+        return;
+    }
+    bool poll_ready = start_capture_worker(state);
+    diag::log_tagged_fmt("network",
+        "start_capture_requested filter_pid=%u filter_port=%u filter_proto=%u drv_ok=%d poll_ready=%d cap_thread_done=%d cap_thread_alive=%d",
+        filter_pid, filter_port, filter_protocol,
+        driver_ok ? 1 : 0,
+        poll_ready ? 1 : 0,
+        state.cap_thread_done.load(std::memory_order_acquire) ? 1 : 0,
+        state.cap_thread_alive.load(std::memory_order_acquire) ? 1 : 0);
+    if (!poll_ready) {
+        set_capture_control_status("Capture worker unavailable");
+        state.cap_start_pending.store(false, std::memory_order_release);
+        return;
+    }
+
+    if (!post_network_task("capture_start_control", [filter_pid, filter_port, filter_protocol]() {
+            ULONGLONG t0 = GetTickCount64();
+            bool ok = false;
+            try {
+                ok = driver_feature_ready("start_capture_async") &&
+                     driver_bridge::start_capture(filter_pid, filter_port, filter_protocol, nullptr);
+            } catch (const std::exception& e) {
+                diag::log_tagged_fmt("network", "start_capture_cpp_exception what=%s", e.what());
+            } catch (...) {
+                diag::log_tagged("network", "start_capture_unknown_exception");
+            }
+            ULONGLONG elapsed = GetTickCount64() - t0;
+            if (ok) {
+                g_state.cap_running.store(true, std::memory_order_release);
+                g_state.cap_polling.store(true, std::memory_order_release);
+                g_state.cap_cv.notify_all();
+                set_capture_control_status("Capture running");
+                diag::log_tagged_fmt("network", "start_capture_ok async elapsed_ms=%llu poll_thread_signaled=%d",
+                    static_cast<unsigned long long>(elapsed),
+                    g_state.cap_thread_alive.load(std::memory_order_acquire) ? 1 : 0);
+                anti_tamper::webhook::write_log("net_audit",
+                    "[net_audit] capture started ok");
+            } else {
+                set_capture_control_status("Capture start failed");
+                diag::log_tagged_fmt("network", "start_capture_failed async elapsed_ms=%llu kernel_mode=%d",
+                    static_cast<unsigned long long>(elapsed),
+                    driver_bridge::using_kernel_driver() ? 1 : 0);
+                anti_tamper::webhook::write_log("net_audit",
+                    "[net_audit] capture start FAILED driver call returned false");
+            }
+            g_state.cap_start_pending.store(false, std::memory_order_release);
+        })) {
+        set_capture_control_status("Capture start queue failed");
+        state.cap_start_pending.store(false, std::memory_order_release);
+    }
+}
+
+static void request_capture_stop(state_t& state) {
+    bool expected = false;
+    if (!state.cap_stop_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        diag::log_tagged("network", "stop_capture_ignored_already_pending");
+        return;
+    }
+    set_capture_control_status("Stopping capture...");
+    diag::log_tagged("network", "stop_capture_requested");
+    if (!post_network_task("capture_stop_control", []() {
+            ULONGLONG t0 = GetTickCount64();
+            bool ok = false;
+            try {
+                ok = driver_bridge::stop_capture();
+            } catch (const std::exception& e) {
+                diag::log_tagged_fmt("network", "stop_capture_cpp_exception what=%s", e.what());
+            } catch (...) {
+                diag::log_tagged("network", "stop_capture_unknown_exception");
+            }
+            ULONGLONG elapsed = GetTickCount64() - t0;
+            g_state.cap_running.store(false, std::memory_order_release);
+            g_state.cap_polling.store(false, std::memory_order_release);
+            set_capture_control_status(ok ? "Capture stopped" : "Capture stop failed");
+            diag::log_tagged_fmt("network", "stop_capture_complete ok=%d elapsed_ms=%llu",
+                ok ? 1 : 0,
+                static_cast<unsigned long long>(elapsed));
+            anti_tamper::webhook::write_log("net_audit",
+                ok ? "[net_audit] capture stopped by user" : "[net_audit] capture stop FAILED driver call returned false");
+            g_state.cap_stop_pending.store(false, std::memory_order_release);
+        })) {
+        set_capture_control_status("Capture stop queue failed");
+        state.cap_stop_pending.store(false, std::memory_order_release);
+    }
+}
+
+
 static void render_capture(state_t& state, float x, float y, float w, float h,
                             float alpha, float ar, float ag, float ab) {
     (void)ar; (void)ag; (void)ab;
@@ -1214,7 +1522,10 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
     ImGui::SetCursorPos(ImVec2(x, y));
     ImGui::BeginChild("##net_cap", ImVec2(w, h), false, ImGuiWindowFlags_NoBackground);
 
-    bool driver_ok = driver_bridge::using_kernel_driver();
+    bool driver_ok = driver_feature_ready("bandwidth");
+    bool cap_running = state.cap_running.load(std::memory_order_acquire);
+    bool cap_start_pending = state.cap_start_pending.load(std::memory_order_acquire);
+    bool cap_stop_pending = state.cap_stop_pending.load(std::memory_order_acquire);
 
     size_t pkt_count = 0;
     {
@@ -1232,8 +1543,10 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
         float bh = 24.f;
 
         char live_buf[64];
-        if (state.cap_running) {
+        if (cap_running) {
             snprintf(live_buf, sizeof(live_buf), "LIVE  -  %.1f pkt/s", live_rate);
+        } else if (cap_start_pending || cap_stop_pending) {
+            snprintf(live_buf, sizeof(live_buf), "%s", cap_start_pending ? "STARTING" : "STOPPING");
         } else {
             snprintf(live_buf, sizeof(live_buf), "PAUSED");
         }
@@ -1242,16 +1555,16 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
         float pad_x = 10.f;
         float bw = dot_d + text_w + pad_x * 2.f + 4.f;
 
-        ImU32 fill_col = state.cap_running
+        ImU32 fill_col = cap_running
             ? aida::ui::with_alpha(th.error, 0.18f * alpha)
             : aida::ui::with_alpha(th.text_dim, 0.18f * alpha);
-        ImU32 border_col = state.cap_running
+        ImU32 border_col = cap_running
             ? aida::ui::with_alpha(th.error, 0.55f * alpha)
             : aida::ui::with_alpha(th.text_dim, 0.55f * alpha);
         hdr_dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw, by + bh), fill_col, bh * 0.5f);
         hdr_dl->AddRect(ImVec2(bx, by), ImVec2(bx + bw, by + bh), border_col, bh * 0.5f, 0, 1.f);
 
-        if (state.cap_running) {
+        if (cap_running) {
             float pulse = aida::ui::clock::pulse(0.8f, 0.45f, 1.0f);
             ImU32 dot_col = aida::ui::with_alpha(th.error, alpha);
             ImU32 halo_col = aida::ui::with_alpha(th.error, alpha * 0.35f * pulse);
@@ -1261,7 +1574,7 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
             ImU32 dot_col = aida::ui::with_alpha(th.text_dim, alpha);
             hdr_dl->AddCircleFilled(ImVec2(bx + pad_x + 5.f, by + bh * 0.5f), 4.f, dot_col, 16);
         }
-        ImU32 text_col = state.cap_running
+        ImU32 text_col = cap_running
             ? aida::ui::with_alpha(th.error, alpha)
             : aida::ui::with_alpha(th.text_secondary, alpha);
         hdr_dl->AddText(ImVec2(bx + pad_x + dot_d, by + (bh - ImGui::GetTextLineHeight()) * 0.5f),
@@ -1273,39 +1586,35 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
 
     if (!driver_ok) ImGui::BeginDisabled();
 
-    if (!state.cap_running) {
+    if (cap_start_pending || cap_stop_pending)
+        ImGui::BeginDisabled();
+
+    if (!cap_running) {
         if (aida::ui::button("Start Capture", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
             diag::log_tagged_fmt("network", "start_capture_clicked filter_pid=%u filter_port=%u filter_proto=%u drv_ok=%d",
                 state.cap_filter_pid, state.cap_filter_port, state.cap_filter_protocol,
                 driver_bridge::using_kernel_driver() ? 1 : 0);
-            if (driver_bridge::start_capture(state.cap_filter_pid,
-                                       static_cast<uint32_t>(state.cap_filter_port),
-                                       state.cap_filter_protocol, nullptr)) {
-                diag::log_tagged("network", "start_capture_ok poll_thread_signaled");
-                anti_tamper::webhook::write_log("net_audit",
-                    "[net_audit] capture started ok");
-                state.cap_running = true;
-                state.cap_polling.store(true);
-                state.cap_cv.notify_all();
-            } else {
-                diag::log_tagged_fmt("network", "start_capture_failed kernel_mode=%d",
-                    driver_bridge::using_kernel_driver() ? 1 : 0);
-                anti_tamper::webhook::write_log("net_audit",
-                    "[net_audit] capture start FAILED driver call returned false");
-            }
+            request_capture_start(state);
         }
     } else {
         if (aida::ui::button("Stop Capture", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
             diag::log_tagged("network", "stop_capture_clicked");
-            driver_bridge::stop_capture();
-            state.cap_running = false;
-            state.cap_polling.store(false);
-            anti_tamper::webhook::write_log("net_audit",
-                "[net_audit] capture stopped by user");
+            request_capture_stop(state);
         }
     }
 
+    if (cap_start_pending || cap_stop_pending)
+        ImGui::EndDisabled();
+
     if (!driver_ok) ImGui::EndDisabled();
+
+    std::string capture_status = capture_control_status();
+    if (!capture_status.empty()) {
+        ImGui::SameLine(0.f, 12.f);
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
+                           "%s", capture_status.c_str());
+    }
 
     ImGui::SameLine(0.f, 12.f);
     ImGui::AlignTextToFramePadding();
@@ -1410,8 +1719,8 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
         if (state.captured_packets.empty()) {
             aida::ui::empty_state::config_t cfg;
             cfg.glyph = aida::ui::empty_state::glyph_t::network;
-            cfg.title = state.cap_running ? "Waiting for packets..." : "Capture not running";
-            cfg.body  = state.cap_running
+            cfg.title = cap_running ? "Waiting for packets..." : "Capture not running";
+            cfg.body  = cap_running
                 ? "Packets will stream in here as they are observed by the kernel driver."
                 : "Press Start Capture above to begin recording network traffic.";
             aida::ui::empty_state::render(ImVec2(list_org.x, list_org.y), ImVec2(list_sz.x, list_h), cfg);

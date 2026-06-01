@@ -610,7 +610,7 @@ namespace aida::license_state
         license_state_t st{};
         if (!read_state(st, err)) return false;
         return st.status == static_cast<uint8_t>(status_valid)
-            || st.status == static_cast<uint8_t>(status_degraded);
+            && ((st.flags & static_cast<uint8_t>(flag_arc_loaded)) != 0);
     }
 
     bool is_arc_loaded()

@@ -7,6 +7,7 @@
 #include <bcrypt.h>
 #include <mutex>
 #include <chrono>
+#include <exception>
 #include <thread>
 #include <atomic>
 #include <random>
@@ -231,13 +232,22 @@ namespace aida::telemetry
             m_running = true;
         }
         if (g_thread_alive.exchange(true)) return;
-        std::thread([this]() {
-            while (m_running) {
-                std::this_thread::sleep_for(std::chrono::seconds(30));
-                flush_blocking();
-            }
+        try
+        {
+            std::thread([this]() {
+                while (m_running) {
+                    std::this_thread::sleep_for(std::chrono::seconds(30));
+                    flush_blocking();
+                }
+                g_thread_alive = false;
+            }).detach();
+        }
+        catch (...)
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            m_running = false;
             g_thread_alive = false;
-        }).detach();
+        }
     }
 
     void telemetry_client_t::stop() noexcept

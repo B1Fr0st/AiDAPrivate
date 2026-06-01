@@ -314,7 +314,6 @@ namespace {
             "driver_detach",
             "driver_unattach",
             "driver_enumerate_kernel_modules",
-            "driver_dump_kernel_module",
             "driver_read_kernel_memory",
             "driver_write_kernel_memory"
         };
@@ -4485,6 +4484,24 @@ namespace {
                 failed.fetch_add(1);
                 return;
             }
+            for (const auto& tool : list_resp["result"]["tools"]) {
+                if (!tool.contains("name") || !tool["name"].is_string())
+                    continue;
+                const std::string listed_name = tool["name"].get<std::string>();
+                if (is_ai_related_mcp_tool(listed_name)) {
+                    log_msg(hf, tag, "FAIL -- tools/list exposed internal AI/workflow tool \"%s\"",
+                        listed_name.c_str());
+                    failed.fetch_add(1);
+                    return;
+                }
+                if (!tool.contains("description") || !tool["description"].is_string() ||
+                    tool["description"].get<std::string>().empty()) {
+                    log_msg(hf, tag, "FAIL -- tools/list exposed tool \"%s\" without a description",
+                        listed_name.c_str());
+                    failed.fetch_add(1);
+                    return;
+                }
+            }
 
             mcp_standalone::json call_req = {
                 {"jsonrpc", "2.0"},
@@ -4565,7 +4582,7 @@ namespace {
         (void)skipped;
         const char* tag = "mcp.get_tool_descriptions";
         mcp_standalone::json args;
-        args["names"] = mcp_standalone::json::array({"get_tool_descriptions", "driver_status"});
+        args["names"] = mcp_standalone::json::array({"get_tool_descriptions", "driver_status", "switch_agent"});
         args["include_schema"] = true;
         g_invoked_tools.insert("get_tool_descriptions");
         auto timed = invoke_tool_bounded(get_server(), "get_tool_descriptions", args, tool_timeout_ms("get_tool_descriptions"));
@@ -4584,18 +4601,20 @@ namespace {
         const std::string text_lc = lower_copy(ir.text);
         const bool has_self = text_lc.find("### get_tool_descriptions") != std::string::npos;
         const bool has_driver_status = text_lc.find("### driver_status") != std::string::npos;
+        const bool leaked_internal = text_lc.find("### switch_agent") != std::string::npos;
         const bool has_schema = text_lc.find("`names`") != std::string::npos &&
             text_lc.find("include_schema") != std::string::npos;
-        if (has_self && has_driver_status && has_schema) {
+        if (has_self && has_driver_status && has_schema && !leaked_internal) {
             log_msg(hf, tag, "PASS -- returned detailed schemas for selected tools");
             record_tool_status("get_tool_descriptions", mcp_tool_call_status_t::passed);
             passed.fetch_add(1);
             return;
         }
-        log_msg(hf, tag, "FAIL -- response missing expected detail self=%s driver_status=%s schema=%s text=%s",
+        log_msg(hf, tag, "FAIL -- response missing expected detail self=%s driver_status=%s schema=%s leaked_internal=%s text=%s",
             has_self ? "true" : "false",
             has_driver_status ? "true" : "false",
             has_schema ? "true" : "false",
+            leaked_internal ? "true" : "false",
             compact_text(ir.text, 900).c_str());
         record_tool_status("get_tool_descriptions", mcp_tool_call_status_t::failed);
         failed.fetch_add(1);
@@ -5200,83 +5219,6 @@ namespace {
 
     void test_tool_driver_enumerate_kernel_modules(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         test_tool_call(hf, "mcp.driver_enumerate_kernel_modules", get_server(), "driver_enumerate_kernel_modules", {}, passed, failed, skipped);
-    }
-
-    void test_tool_driver_dump_kernel_module(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const char* tag = "mcp.driver_dump_kernel_module";
-        mcp_standalone::json args;
-        args["module"] = "ntoskrnl.exe";
-        args["from_memory"] = false;
-        args["patch_idb"] = false;
-        args["analyze"] = false;
-        args["output_path"] = temp_file_narrow("aida_mcp_ntoskrnl_disk_dump.bin");
-
-        const int seq = g_mcp_tool_sequence.fetch_add(1, std::memory_order_acq_rel) + 1;
-        char step[256];
-        _snprintf_s(step, sizeof(step), _TRUNCATE, "mcp tool #%d: driver_dump_kernel_module disk-smoke", seq);
-        set_progress_step(step);
-
-        log_msg(hf, tag,
-            "START -- \"driver_dump_kernel_module\" seq=%d bounded disk-smoke args=%s",
-            seq, compact_json(args).c_str());
-        g_invoked_tools.insert("driver_dump_kernel_module");
-
-        auto timed = invoke_tool_bounded(get_server(), "driver_dump_kernel_module", args, 45000);
-        auto ir = std::move(timed.result);
-        auto ms = timed.elapsed_ms;
-
-        if (timed.timed_out) {
-            log_msg(hf, tag, "FAIL -- bounded disk-smoke timed out after %lld ms", (long long)ms);
-            record_tool_status("driver_dump_kernel_module", mcp_tool_call_status_t::timed_out);
-            failed.fetch_add(1);
-            return;
-        }
-
-        if (!ir.found) {
-            log_msg(hf, tag, "FAIL -- tool \"driver_dump_kernel_module\" not registered");
-            record_tool_status("driver_dump_kernel_module", mcp_tool_call_status_t::failed);
-            failed.fetch_add(1);
-            return;
-        }
-        if (ir.threw) {
-            log_msg(hf, tag, "FAIL -- bounded disk-smoke threw: %s (elapsed %lld ms)",
-                ir.exception_msg.c_str(), (long long)ms);
-            record_tool_status("driver_dump_kernel_module", mcp_tool_call_status_t::failed);
-            failed.fetch_add(1);
-            return;
-        }
-        if (!ir.success) {
-            log_msg(hf, tag, "SKIP -- bounded disk-smoke returned precondition error: %s (elapsed %lld ms)",
-                ir.text.c_str(), (long long)ms);
-            record_tool_status("driver_dump_kernel_module", mcp_tool_call_status_t::skipped);
-            skipped.fetch_add(1);
-            return;
-        }
-
-        const std::string output_path = args["output_path"].get<std::string>();
-        std::vector<unsigned char> prefix;
-        if (!read_file_prefix(output_path, prefix, 64) || prefix.size() < 2) {
-            log_msg(hf, tag,
-                "FAIL -- bounded disk-smoke reported success but output file is missing/empty path=\"%s\" text=%s (elapsed %lld ms)",
-                output_path.c_str(), ir.text.c_str(), (long long)ms);
-            record_tool_status("driver_dump_kernel_module", mcp_tool_call_status_t::failed);
-            failed.fetch_add(1);
-            return;
-        }
-        if (prefix[0] != 'M' || prefix[1] != 'Z') {
-            log_msg(hf, tag,
-                "FAIL -- bounded disk-smoke output is not a PE image path=\"%s\" first2=%02X %02X text=%s (elapsed %lld ms)",
-                output_path.c_str(), prefix[0], prefix[1], ir.text.c_str(), (long long)ms);
-            record_tool_status("driver_dump_kernel_module", mcp_tool_call_status_t::failed);
-            failed.fetch_add(1);
-            return;
-        }
-
-        log_msg(hf, tag,
-            "PASS -- bounded disk-smoke dumped PE header path=\"%s\" first2=MZ bytes_checked=%zu (elapsed %lld ms) -> %s",
-            output_path.c_str(), prefix.size(), (long long)ms, ir.text.c_str());
-        record_tool_status("driver_dump_kernel_module", mcp_tool_call_status_t::passed);
-        passed.fetch_add(1);
     }
 
     void test_tool_driver_read_kernel_memory(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -9856,7 +9798,6 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_driver_read_pointer_chain(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_enumerate_modules(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_enumerate_kernel_modules(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_dump_kernel_module(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_read_kernel_memory(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_write_kernel_memory(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_allocate_memory(hf, passed, failed, skipped);

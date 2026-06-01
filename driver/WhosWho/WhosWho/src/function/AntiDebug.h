@@ -46,6 +46,35 @@ namespace anti_debug {
     inline volatile UCHAR g_kd_baseline = 0;
     inline volatile LONG  g_kd_baseline_captured = 0;
 
+    __forceinline NTSTATUS hide_thread_object_from_debugger(PETHREAD thread)
+    {
+        if (!thread || !_ObOpenObjectByPointer || !_ZwSetInformationThread ||
+            !PsThreadType || !*PsThreadType)
+            return STATUS_NOT_SUPPORTED;
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+            return STATUS_INVALID_DEVICE_STATE;
+
+        HANDLE thread_handle = nullptr;
+        NTSTATUS status = _ObOpenObjectByPointer(
+            thread,
+            OBJ_KERNEL_HANDLE,
+            nullptr,
+            THREAD_SET_INFORMATION,
+            *PsThreadType,
+            KernelMode,
+            &thread_handle);
+        if (!NT_SUCCESS(status))
+            return status;
+
+        status = _ZwSetInformationThread(
+            thread_handle,
+            0x11u,
+            nullptr,
+            0);
+        _ZwClose(thread_handle);
+        return status;
+    }
+
     __forceinline UCHAR read_kd_shared_byte() {
         UCHAR volatile* kud = reinterpret_cast<UCHAR volatile*>(0xFFFFF78000000000ULL + 0x2D4);
         return *kud;
@@ -205,15 +234,8 @@ namespace anti_debug {
 
     __forceinline BOOLEAN check_timing_attack() {
         __try {
-            if (KeGetCurrentIrql() > APC_LEVEL) {
+            if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
                 return FALSE;
-            }
-
-            BOOLEAN hvci_on = hvci_detect::is_hvci_enabled();
-            UINT64 old_irql = 0;
-            if (!hvci_on) {
-                old_irql = __readcr8();
-                __writecr8(2);
             }
 
             constexpr UINT32 NUM_TRIALS = 3;
@@ -235,10 +257,6 @@ namespace anti_debug {
                 if (elapsed > TIMING_THRESHOLD) {
                     fail_count++;
                 }
-            }
-
-            if (!hvci_on) {
-                __writecr8(old_irql);
             }
 
             if (fail_count == NUM_TRIALS) {
@@ -472,9 +490,7 @@ namespace anti_debug {
         }
 
         __try {
-            UINT8* thread_ptr = (UINT8*)thread;
-            volatile ULONG* cross_flags = (volatile ULONG*)(thread_ptr + 0x74);
-            InterlockedOr((volatile LONG*)cross_flags, 0x4);
+            status = hide_thread_object_from_debugger(thread);
         } __except(EXCEPTION_EXECUTE_HANDLER) {
             status = STATUS_UNSUCCESSFUL;
         }
@@ -489,6 +505,7 @@ namespace anti_debug {
 
     inline NTSTATUS clear_process_debug_registers(UINT32 pid)
     {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
         if (!_PsGetNextProcessThread) return STATUS_NOT_SUPPORTED;
 
         PEPROCESS process = nullptr;
@@ -512,11 +529,6 @@ namespace anti_debug {
                 CONTEXT ctx = {};
                 ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
 
-                UINT8* thread_ptr = (UINT8*)PsGetCurrentThread();
-                KPROCESSOR_MODE* prev_mode = (KPROCESSOR_MODE*)(thread_ptr + 0x232);
-                KPROCESSOR_MODE old_mode = *prev_mode;
-                *prev_mode = KernelMode;
-
                 hs = _PsGetContextThread(thread, &ctx, KernelMode);
                 if (NT_SUCCESS(hs)) {
                     BOOLEAN need_clear = (ctx.Dr0 != 0 || ctx.Dr1 != 0 ||
@@ -534,8 +546,6 @@ namespace anti_debug {
                         if (NT_SUCCESS(hs)) cleared++;
                     }
                 }
-
-                *prev_mode = old_mode;
                 _ZwClose(thread_handle);
             }
         }
@@ -551,6 +561,7 @@ namespace anti_debug {
 
     inline NTSTATUS hide_all_process_threads(UINT32 pid)
     {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
         if (!_PsGetNextProcessThread) return STATUS_NOT_SUPPORTED;
 
         PEPROCESS process = nullptr;
@@ -563,10 +574,8 @@ namespace anti_debug {
             PETHREAD thread = nullptr;
             while ((thread = _PsGetNextProcessThread(process, thread)) != nullptr)
             {
-                UINT8* thread_ptr = (UINT8*)thread;
-                volatile ULONG* cross_flags = (volatile ULONG*)(thread_ptr + 0x74);
-                ULONG old_flags = InterlockedOr((volatile LONG*)cross_flags, 0x4);
-                if (!(old_flags & 0x4)) hidden++;
+                NTSTATUS hs = hide_thread_object_from_debugger(thread);
+                if (NT_SUCCESS(hs)) hidden++;
             }
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -589,6 +598,8 @@ namespace anti_debug {
 
     inline NTSTATUS install_instrumentation_callback(UINT32 pid, PVOID callback_addr)
     {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
+
         PEPROCESS process = nullptr;
         NTSTATUS status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &process);
         if (!NT_SUCCESS(status)) return status;
@@ -608,31 +619,24 @@ namespace anti_debug {
         info.Reserved = 0;
         info.Callback = callback_addr;
 
-        typedef NTSTATUS(NTAPI* fn_NtSetInformationProcess)(
+        typedef NTSTATUS(NTAPI* fn_ZwSetInformationProcess)(
             HANDLE, ULONG, PVOID, ULONG);
 
-        static fn_NtSetInformationProcess pNtSetInfoProc = nullptr;
-        if (!pNtSetInfoProc) {
+        static fn_ZwSetInformationProcess pZwSetInfoProc = nullptr;
+        if (!pZwSetInfoProc) {
             PVOID nt_base = (PVOID)get_nt_base();
             if (nt_base) {
-                CHAR name[] = { 'N','t','S','e','t','I','n','f','o','r','m','a','t','i','o','n','P','r','o','c','e','s','s',0 };
-                pNtSetInfoProc = (fn_NtSetInformationProcess)GetProcAddress(nt_base, name);
+                CHAR name[] = { 'Z','w','S','e','t','I','n','f','o','r','m','a','t','i','o','n','P','r','o','c','e','s','s',0 };
+                pZwSetInfoProc = (fn_ZwSetInformationProcess)GetProcAddress(nt_base, name);
             }
         }
 
-        if (pNtSetInfoProc) {
-            UINT8* thread_ptr = (UINT8*)PsGetCurrentThread();
-            KPROCESSOR_MODE* prev_mode = (KPROCESSOR_MODE*)(thread_ptr + 0x232);
-            KPROCESSOR_MODE old_mode = *prev_mode;
-            *prev_mode = KernelMode;
-
-            status = pNtSetInfoProc(
+        if (pZwSetInfoProc) {
+            status = pZwSetInfoProc(
                 proc_handle,
                 40,
                 &info,
                 sizeof(info));
-
-            *prev_mode = old_mode;
 
             if (NT_SUCCESS(status)) {
                 g_instrumentation_callback = callback_addr;
@@ -654,6 +658,8 @@ namespace anti_debug {
 
     inline NTSTATUS clear_debug_objects(UINT32 pid)
     {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
+
         PEPROCESS process = nullptr;
         NTSTATUS status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &process);
         if (!NT_SUCCESS(status)) return status;
@@ -661,9 +667,10 @@ namespace anti_debug {
         __try {
             UINT8* eprocess = (UINT8*)process;
             volatile PVOID* debug_port = (volatile PVOID*)(eprocess + 0x578);
-            if (*debug_port != nullptr) {
-                InterlockedExchangePointer(debug_port, nullptr);
-                WW_LOG("anti_debug: cleared debug port for pid=%u", pid);
+            if (_MmIsAddressValid((PVOID)debug_port) && *debug_port != nullptr) {
+                UINT64 port_value = reinterpret_cast<UINT64>(*debug_port);
+                UINT32 port_tag = static_cast<UINT32>((port_value >> 32) ^ port_value ^ 0x0A1DAD57u);
+                WW_LOG("anti_debug: debug port present for pid=%u tag=0x%08X", pid, port_tag);
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             status = STATUS_UNSUCCESSFUL;
@@ -688,41 +695,11 @@ namespace anti_debug {
 
             UCHAR* img_name = PsGetProcessImageFileName(process);
 
-            PVOID val_430 = *(volatile PVOID*)(eprocess + 0x430);
-            PVOID val_438 = *(volatile PVOID*)(eprocess + 0x438);
-            PVOID val_440 = *(volatile PVOID*)(eprocess + 0x440);
-            PVOID val_448 = *(volatile PVOID*)(eprocess + 0x448);
-            PVOID val_450 = *(volatile PVOID*)(eprocess + 0x450);
-            PVOID val_458 = *(volatile PVOID*)(eprocess + 0x458);
-            PVOID val_460 = *(volatile PVOID*)(eprocess + 0x460);
-            PVOID val_468 = *(volatile PVOID*)(eprocess + 0x468);
-            PVOID val_470 = *(volatile PVOID*)(eprocess + 0x470);
-            PVOID val_478 = *(volatile PVOID*)(eprocess + 0x478);
-            PVOID val_4D0 = *(volatile PVOID*)(eprocess + 0x4D0);
-            PVOID val_4D8 = *(volatile PVOID*)(eprocess + 0x4D8);
-            PVOID val_4E0 = *(volatile PVOID*)(eprocess + 0x4E0);
-            PVOID val_4E8 = *(volatile PVOID*)(eprocess + 0x4E8);
-            PVOID val_5C0 = *(volatile PVOID*)(eprocess + 0x5C0);
-            PVOID val_5C8 = *(volatile PVOID*)(eprocess + 0x5C8);
-
-            WW_LOG("[INSTR-DUMP] pid=%u name=%s eprocess=%p build=%lu.%lu g_instr_cb=%p",
+            WW_LOG("[INSTR-DUMP] pid=%u name=%s eprocess_redacted=1 build=%lu.%lu g_instr_cb_redacted=1",
                 pid,
                 img_name ? (const char*)img_name : "?",
-                (PVOID)eprocess,
                 osver.dwMajorVersion * 1000 + osver.dwMinorVersion,
-                osver.dwBuildNumber,
-                g_instrumentation_callback);
-
-            WW_LOG("[INSTR-DUMP] +0x430=%p +0x438=%p +0x440=%p +0x448=%p",
-                val_430, val_438, val_440, val_448);
-            WW_LOG("[INSTR-DUMP] +0x450=%p +0x458=%p +0x460=%p +0x468=%p",
-                val_450, val_458, val_460, val_468);
-            WW_LOG("[INSTR-DUMP] +0x470=%p +0x478=%p",
-                val_470, val_478);
-            WW_LOG("[INSTR-DUMP] +0x4D0=%p +0x4D8=%p +0x4E0=%p +0x4E8=%p",
-                val_4D0, val_4D8, val_4E0, val_4E8);
-            WW_LOG("[INSTR-DUMP] +0x5C0=%p +0x5C8=%p",
-                val_5C0, val_5C8);
+                osver.dwBuildNumber);
 
             volatile PVOID* instr_cb = (volatile PVOID*)(eprocess + 0x460);
             PVOID cur = *instr_cb;
@@ -730,15 +707,26 @@ namespace anti_debug {
                 ((UINT64)cur < 0x00007FFFFFFFFFFull) ||
                 ((UINT64)cur >= 0xFFFF800000000000ull);
 
-            WW_LOG("[INSTR-DUMP] offset=0x460 cur=%p is_canonical=%d matches_own=%d",
-                cur, is_canonical ? 1 : 0,
-                (cur == g_instrumentation_callback) ? 1 : 0);
+            UINT64 cur_value = reinterpret_cast<UINT64>(cur);
+            UINT32 cur_tag = static_cast<UINT32>((cur_value >> 32) ^ cur_value ^ 0x0A1DA460u);
+            UINT64 own_value = reinterpret_cast<UINT64>(g_instrumentation_callback);
+            UINT32 own_tag = static_cast<UINT32>((own_value >> 32) ^ own_value ^ 0x0A1DA461u);
 
-            if (cur != nullptr && cur != g_instrumentation_callback) {
-                WW_LOG("[INSTR-DUMP] WOULD_CLEAR pid=%u cur=%p g=%p — SKIPPING CLEAR, logging only",
-                    pid, cur, g_instrumentation_callback);
+            WW_LOG("[INSTR-DUMP] offset=0x460 present=%d is_canonical=%d matches_own=%d cur_tag=0x%08X own_tag=0x%08X",
+                cur != nullptr ? 1 : 0,
+                is_canonical ? 1 : 0,
+                (cur == g_instrumentation_callback) ? 1 : 0,
+                cur_tag,
+                own_tag);
+
+            if (cur != nullptr && !is_canonical) {
+                WW_LOG("[INSTR-DUMP] noncanonical cb ignored for pid=%u build=%lu cur_tag=0x%08X",
+                    pid, osver.dwBuildNumber, cur_tag);
+            } else if (cur != nullptr && cur != g_instrumentation_callback) {
+                WW_LOG("[INSTR-DUMP] WOULD_CLEAR pid=%u cur_tag=0x%08X own_tag=0x%08X",
+                    pid, cur_tag, own_tag);
             } else {
-                WW_LOG("[INSTR-DUMP] no foreign cb at 0x460 for pid=%u (cur=%p)", pid, cur);
+                WW_LOG("[INSTR-DUMP] no foreign cb at 0x460 for pid=%u present=%d", pid, cur != nullptr ? 1 : 0);
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             WW_LOG("[INSTR-DUMP] EXCEPTION during dump for pid=%u", pid);

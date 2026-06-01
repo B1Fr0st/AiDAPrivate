@@ -12,6 +12,7 @@
 #include <thread>
 #include <chrono>
 #include <array>
+#include <system_error>
 
 #include "ghost_veh.hpp"
 
@@ -102,6 +103,8 @@ namespace detail {
         std::atomic<uint32_t> rotation_cursor{0};
         std::atomic<bool>     refresher_running{false};
         std::atomic<bool>     refresher_stop{false};
+        std::atomic<bool>     refresher_degraded{false};
+        std::atomic<uint32_t> refresher_start_error{0};
         std::thread           refresher_thread;
         DWORD                 owner_pid{0};
     };
@@ -800,7 +803,30 @@ inline bool initialize()
     s.initialized.store(true, std::memory_order_release);
 
     s.refresher_stop.store(false, std::memory_order_release);
-    s.refresher_thread = std::thread(detail::refresher_thread_proc);
+    s.refresher_degraded.store(false, std::memory_order_release);
+    s.refresher_start_error.store(0, std::memory_order_release);
+    try
+    {
+        s.refresher_thread = std::thread(detail::refresher_thread_proc);
+    }
+    catch (const std::system_error& ex)
+    {
+        s.refresher_degraded.store(true, std::memory_order_release);
+        s.refresher_running.store(false, std::memory_order_release);
+        s.refresher_start_error.store(static_cast<uint32_t>(ex.code().value()), std::memory_order_release);
+    }
+    catch (const std::exception&)
+    {
+        s.refresher_degraded.store(true, std::memory_order_release);
+        s.refresher_running.store(false, std::memory_order_release);
+        s.refresher_start_error.store(GetLastError(), std::memory_order_release);
+    }
+    catch (...)
+    {
+        s.refresher_degraded.store(true, std::memory_order_release);
+        s.refresher_running.store(false, std::memory_order_release);
+        s.refresher_start_error.store(GetLastError(), std::memory_order_release);
+    }
 
     return true;
 }
@@ -876,17 +902,37 @@ inline void rotate_keys()
     auto& s = detail::state();
     if (!s.initialized.load()) return;
 
-    std::lock_guard<std::mutex> lk(s.mtx);
-
-    uint64_t new_key = __rdtsc() * 6364136223846793005ULL + 1442695040888963407ULL;
-
-    for (uint32_t i = 0; i < s.count; ++i)
     {
-        detail::decrypt_entry(s.entries[i], s.encryption_key);
-        detail::encrypt_entry(s.entries[i], new_key);
+        std::lock_guard<std::mutex> lk(s.mtx);
+
+        uint64_t new_key = __rdtsc() * 6364136223846793005ULL + 1442695040888963407ULL;
+
+        for (uint32_t i = 0; i < s.count; ++i)
+        {
+            detail::decrypt_entry(s.entries[i], s.encryption_key);
+            detail::encrypt_entry(s.entries[i], new_key);
+        }
+
+        s.encryption_key = new_key;
     }
 
-    s.encryption_key = new_key;
+    if (s.refresher_degraded.load(std::memory_order_acquire))
+        refresh_all_threads();
+}
+
+inline bool refresher_degraded()
+{
+    return detail::state().refresher_degraded.load(std::memory_order_acquire);
+}
+
+inline bool refresher_running()
+{
+    return detail::state().refresher_running.load(std::memory_order_acquire);
+}
+
+inline uint32_t refresher_start_error()
+{
+    return detail::state().refresher_start_error.load(std::memory_order_acquire);
 }
 
 

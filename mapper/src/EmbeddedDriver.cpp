@@ -7,6 +7,7 @@
 
 // Forward declare from MapperCore.cpp
 extern FILE* g_LogFile;
+extern void FlushMapperLogFile();
 static void EDDbgLog(const char* func, const char* fmt, ...) {
     char buf[2048];
     va_list args;
@@ -19,7 +20,7 @@ static void EDDbgLog(const char* func, const char* fmt, ...) {
     fflush(stdout);
     OutputDebugStringA(buf);
     OutputDebugStringA("\n");
-    if (g_LogFile) { fprintf(g_LogFile, "%s\n", buf); fflush(g_LogFile); }
+    if (g_LogFile) { fprintf(g_LogFile, "%s\n", buf); FlushMapperLogFile(); }
 }
 #define EDLOG(fmt, ...) EDDbgLog(__FUNCTION__, fmt, ##__VA_ARGS__)
 

@@ -104,7 +104,6 @@ namespace memory_tools
     tool_result_t make_data(const nlohmann::json& params);
     tool_result_t undefine(const nlohmann::json& params);
     tool_result_t list_globals(const nlohmann::json& params);
-    tool_result_t convert_number(const nlohmann::json& params);
 
     void register_tools();
 }
@@ -178,7 +177,7 @@ namespace python_tools
     void register_tools();
 }
 
-namespace ida_pro_mcp_compat_tools
+namespace aida_ida_batch_tools
 {
     void register_tools();
 }

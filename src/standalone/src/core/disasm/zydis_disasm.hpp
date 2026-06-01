@@ -116,28 +116,19 @@ namespace static_analysis
         out.clear();
         if (!file.loaded || file.sections.empty() || len == 0) return false;
 
-        out.resize(len, 0);
-        size_t filled = 0;
-
         for (auto& sec : file.sections) {
             uint64_t sec_start = sec.va;
             uint64_t sec_end   = sec_start + sec.bytes.size();
-            if (va + len <= sec_start || va >= sec_end) continue;
+            if (va < sec_start || va >= sec_end) continue;
 
-            uint64_t overlap_start = (va > sec_start) ? va : sec_start;
-            uint64_t overlap_end   = (va + len < sec_end) ? va + len : sec_end;
-            size_t src_off = static_cast<size_t>(overlap_start - sec_start);
-            size_t dst_off = static_cast<size_t>(overlap_start - va);
-            size_t copy_sz = static_cast<size_t>(overlap_end - overlap_start);
-            std::memcpy(out.data() + dst_off, sec.bytes.data() + src_off, copy_sz);
-            filled += copy_sz;
+            size_t src_off = static_cast<size_t>(va - sec_start);
+            size_t copy_sz = sec.bytes.size() - src_off;
+            if (copy_sz > len) copy_sz = len;
+            if (copy_sz == 0) return false;
+            out.assign(sec.bytes.data() + src_off, sec.bytes.data() + src_off + copy_sz);
+            return true;
         }
-        if (filled == 0) {
-            out.clear();
-            return false;
-        }
-        if (filled < len) out.resize(filled);
-        return true;
+        return false;
     }
 
     inline uint64_t total_image_size(const DisasmFile& file)
@@ -279,6 +270,43 @@ inline AsmInstr zydis_decode_one(const uint8_t* code, int avail, uint64_t va)
 
 namespace disasm
 {
+    inline size_t zero_run_length(const uint8_t* data, int size, int off)
+    {
+        if (!data || off < 0 || off >= size || data[off] != 0) return 0;
+        int cur = off;
+        while (cur < size && data[cur] == 0)
+            ++cur;
+        return static_cast<size_t>(cur - off);
+    }
+
+    inline bool summarize_bytes(const uint8_t* data, size_t size, size_t& zero_count, size_t& longest_zero_run)
+    {
+        zero_count = 0;
+        longest_zero_run = 0;
+        if (!data || size == 0) return false;
+        size_t current = 0;
+        for (size_t i = 0; i < size; ++i) {
+            if (data[i] == 0) {
+                ++zero_count;
+                ++current;
+                if (current > longest_zero_run)
+                    longest_zero_run = current;
+            } else {
+                current = 0;
+            }
+        }
+        return true;
+    }
+
+    inline bool buffer_is_zero_padding(const std::vector<uint8_t>& bytes)
+    {
+        size_t zero_count = 0;
+        size_t longest_zero_run = 0;
+        if (!summarize_bytes(bytes.data(), bytes.size(), zero_count, longest_zero_run))
+            return true;
+        return longest_zero_run >= 256 || (bytes.size() >= 256 && zero_count * 100 >= bytes.size() * 90);
+    }
+
     inline std::string open_file_dialog(HWND owner)
     {
         char buf[MAX_PATH] = {};
@@ -407,6 +435,11 @@ namespace disasm
             uint64_t        va   = section.va;
 
             while (off < sz) {
+                size_t zr = zero_run_length(data, sz, off);
+                if (zr >= 16) {
+                    off += static_cast<int>(zr);
+                    continue;
+                }
                 const int remaining = sz - off;
                 const int avail = (remaining < 15) ? remaining : 15;
                 AsmInstr ins = zydis_decode_one(data + off, avail, va + off);
@@ -456,6 +489,11 @@ namespace disasm
                 static_cast<unsigned long long>(va), sz, file.instrs.size(), max_instrs);
 
             while (off < sz && file.instrs.size() < max_instrs) {
+                size_t zr = zero_run_length(data, sz, off);
+                if (zr >= 16) {
+                    off += static_cast<int>(zr);
+                    continue;
+                }
                 const int remaining = sz - off;
                 const int avail = (remaining < 15) ? remaining : 15;
                 AsmInstr ins = zydis_decode_one(data + off, avail, va + off);
@@ -572,19 +610,33 @@ namespace disasm
 
             std::vector<AsmInstr> instrs;
             if (!mem.empty()) {
+                size_t zero_count = 0;
+                size_t longest_zero_run = 0;
+                summarize_bytes(mem.data(), mem.size(), zero_count, longest_zero_run);
+                diag::log_tagged_fmt("disasm",
+                    "live_decode_worker_memory_profile bytes=%llu zero=%llu longest_zero_run=%llu mostly_zero=%d",
+                    static_cast<unsigned long long>(mem.size()),
+                    static_cast<unsigned long long>(zero_count),
+                    static_cast<unsigned long long>(longest_zero_run),
+                    buffer_is_zero_padding(mem) ? 1 : 0);
                 instrs.reserve(mem.size() / 4);
                 const uint8_t* data = mem.data();
                 int sz = static_cast<int>(mem.size());
                 int off = 0;
                 size_t since_yield = 0;
                 while (off < sz) {
+                    size_t zr = zero_run_length(data, sz, off);
+                    if (zr >= 16) {
+                        off += static_cast<int>(zr);
+                        continue;
+                    }
                     int remaining = sz - off;
                     int avail = (remaining < 15) ? remaining : 15;
                     AsmInstr ins = zydis_decode_one(data + off, avail, win_start + off);
                     int raw_len = (ins.len < 15) ? ins.len : 15;
                     memcpy(ins.raw, data + off, static_cast<size_t>(raw_len));
                     instrs.push_back(ins);
-                    off += ins.len;
+                    off += (ins.len > 0) ? ins.len : 1;
                     if (++since_yield >= 16384) {
                         since_yield = 0;
                         std::this_thread::yield();

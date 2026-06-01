@@ -74,188 +74,23 @@ namespace dbg_guard {
 
 namespace trapframe_ctx {
 
-    constexpr ULONG KTHREAD_TRAPFRAME_OFFSET = 0x90;
-    constexpr ULONG KTHREAD_DEBUG_ACTIVE     = 0x03;
     constexpr ULONG DR7_USER_MASK            = 0xFFFF0355;
-    constexpr ULONG DR7_ACTIVE_BITS          = 0x0355;
     constexpr UINT64 DR7_GLOBAL_ENABLE_BITS  = 0xAAULL;
 
     __forceinline UINT64 sanitize_user_dr7(UINT64 dr7) {
         return (dr7 & DR7_USER_MASK) & ~DR7_GLOBAL_ENABLE_BITS;
     }
 
-
-    constexpr ULONG TF_RAX    = 0x30;
-    constexpr ULONG TF_RCX    = 0x38;
-    constexpr ULONG TF_RDX    = 0x40;
-    constexpr ULONG TF_R8     = 0x48;
-    constexpr ULONG TF_R9     = 0x50;
-    constexpr ULONG TF_R10    = 0x58;
-    constexpr ULONG TF_R11    = 0x60;
-    constexpr ULONG TF_DR0    = 0xD8;
-    constexpr ULONG TF_DR1    = 0xE0;
-    constexpr ULONG TF_DR2    = 0xE8;
-    constexpr ULONG TF_DR3    = 0xF0;
-    constexpr ULONG TF_DR6    = 0xF8;
-    constexpr ULONG TF_DR7    = 0x100;
-    constexpr ULONG TF_RBX    = 0x140;
-    constexpr ULONG TF_RDI    = 0x148;
-    constexpr ULONG TF_RSI    = 0x150;
-    constexpr ULONG TF_RBP    = 0x158;
-    constexpr ULONG TF_RIP    = 0x168;
-    constexpr ULONG TF_SEGCS  = 0x170;
-    constexpr ULONG TF_EFLAGS = 0x178;
-    constexpr ULONG TF_RSP    = 0x180;
-    constexpr ULONG TF_SEGSS  = 0x188;
-
     NTSTATUS get_context(PETHREAD thread, p_thread_ctx request) {
-        __try {
-            PUCHAR kthread = (PUCHAR)thread;
-            PUCHAR tf = *(PUCHAR*)(kthread + KTHREAD_TRAPFRAME_OFFSET);
-
-            if (!tf || !_MmIsAddressValid(tf) || !_MmIsAddressValid(tf + TF_SEGSS + 7)) {
-                return STATUS_UNSUCCESSFUL;
-            }
-
-
-            UINT16 cs_check = *(UINT16*)(tf + TF_SEGCS);
-            if (cs_check != 0x33) {
-                PUCHAR user_tf = nullptr;
-
-                for (ULONG off = 0x190; off < 0x4000; off += 8) {
-                    PUCHAR candidate = tf + off;
-                    if (!_MmIsAddressValid(candidate + TF_SEGSS + 7))
-                        break;
-                    UINT16 cand_cs  = *(UINT16*)(candidate + TF_SEGCS);
-                    UINT16 cand_ss  = *(UINT16*)(candidate + TF_SEGSS);
-                    UINT64 cand_rip = *(UINT64*)(candidate + TF_RIP);
-                    UINT64 cand_rsp = *(UINT64*)(candidate + TF_RSP);
-
-                    if (cand_cs == 0x33 && cand_ss == 0x2B &&
-                        cand_rip < 0x7FFFFFFFFFFULL && cand_rsp < 0x7FFFFFFFFFFULL) {
-                        user_tf = candidate;
-                        break;
-                    }
-                }
-                if (user_tf) {
-                    tf = user_tf;
-                } else {
-                }
-            }
-
-            request->rax = *(UINT64*)(tf + TF_RAX);
-            request->rcx = *(UINT64*)(tf + TF_RCX);
-            request->rdx = *(UINT64*)(tf + TF_RDX);
-            request->r8  = *(UINT64*)(tf + TF_R8);
-            request->r9  = *(UINT64*)(tf + TF_R9);
-            request->r10 = *(UINT64*)(tf + TF_R10);
-            request->r11 = *(UINT64*)(tf + TF_R11);
-            request->rdi = *(UINT64*)(tf + TF_RDI);
-            request->rsi = *(UINT64*)(tf + TF_RSI);
-            request->rbp = *(UINT64*)(tf + TF_RBP);
-            request->rip = *(UINT64*)(tf + TF_RIP);
-            request->rsp = *(UINT64*)(tf + TF_RSP);
-            request->rflags = (UINT64)*(UINT32*)(tf + TF_EFLAGS);
-            request->cs  = (UINT64)*(UINT16*)(tf + TF_SEGCS);
-            request->ss  = (UINT64)*(UINT16*)(tf + TF_SEGSS);
-
-            UINT8 debug_active = *(volatile UINT8*)(kthread + KTHREAD_DEBUG_ACTIVE);
-            if (debug_active & 0x01) {
-                request->dr0 = *(UINT64*)(tf + TF_DR0);
-                request->dr1 = *(UINT64*)(tf + TF_DR1);
-                request->dr2 = *(UINT64*)(tf + TF_DR2);
-                request->dr3 = *(UINT64*)(tf + TF_DR3);
-                request->dr6 = *(UINT64*)(tf + TF_DR6);
-                request->dr7 = *(UINT64*)(tf + TF_DR7);
-            } else {
-                request->dr0 = 0; request->dr1 = 0;
-                request->dr2 = 0; request->dr3 = 0;
-                request->dr6 = 0; request->dr7 = 0;
-            }
-
-
-            request->rbx = *(UINT64*)(tf + TF_RBX);
-            request->r12 = 0;
-            request->r13 = 0;
-            request->r14 = 0;
-            request->r15 = 0;
-
-
-            return STATUS_SUCCESS;
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            return STATUS_ACCESS_VIOLATION;
-        }
+        UNREFERENCED_PARAMETER(thread);
+        UNREFERENCED_PARAMETER(request);
+        return STATUS_NOT_SUPPORTED;
     }
 
     NTSTATUS set_context(PETHREAD thread, p_thread_ctx request) {
-        __try {
-            PUCHAR kthread = (PUCHAR)thread;
-            PUCHAR tf = *(PUCHAR*)(kthread + KTHREAD_TRAPFRAME_OFFSET);
-
-            if (!tf || !_MmIsAddressValid(tf) || !_MmIsAddressValid(tf + TF_SEGSS + 7)) {
-                return STATUS_UNSUCCESSFUL;
-            }
-
-
-            UINT16 cs_check = *(UINT16*)(tf + TF_SEGCS);
-            if (cs_check != 0x33) {
-                for (ULONG off = 0x190; off < 0x4000; off += 8) {
-                    PUCHAR candidate = tf + off;
-                    if (!_MmIsAddressValid(candidate + TF_SEGSS + 7))
-                        break;
-                    UINT16 cand_cs  = *(UINT16*)(candidate + TF_SEGCS);
-                    UINT16 cand_ss  = *(UINT16*)(candidate + TF_SEGSS);
-                    UINT64 cand_rip = *(UINT64*)(candidate + TF_RIP);
-                    UINT64 cand_rsp = *(UINT64*)(candidate + TF_RSP);
-                    if (cand_cs == 0x33 && cand_ss == 0x2B &&
-                        cand_rip < 0x7FFFFFFFFFFULL && cand_rsp < 0x7FFFFFFFFFFULL) {
-                        tf = candidate;
-                        break;
-                    }
-                }
-            }
-
-            UINT64 mask = request->register_mask;
-
-            if (mask & (1ULL << 0))  *(UINT64*)(tf + TF_RAX) = request->rax;
-            if (mask & (1ULL << 2))  *(UINT64*)(tf + TF_RCX) = request->rcx;
-            if (mask & (1ULL << 3))  *(UINT64*)(tf + TF_RDX) = request->rdx;
-            if (mask & (1ULL << 4))  *(UINT64*)(tf + TF_RSI) = request->rsi;
-            if (mask & (1ULL << 5))  *(UINT64*)(tf + TF_RDI) = request->rdi;
-            if (mask & (1ULL << 6))  *(UINT64*)(tf + TF_RBP) = request->rbp;
-            if (mask & (1ULL << 7))  *(UINT64*)(tf + TF_RSP) = request->rsp;
-            if (mask & (1ULL << 8))  *(UINT64*)(tf + TF_R8) = request->r8;
-            if (mask & (1ULL << 9))  *(UINT64*)(tf + TF_R9) = request->r9;
-            if (mask & (1ULL << 10)) *(UINT64*)(tf + TF_R10) = request->r10;
-            if (mask & (1ULL << 11)) *(UINT64*)(tf + TF_R11) = request->r11;
-            if (mask & (1ULL << 1))  *(UINT64*)(tf + TF_RBX) = request->rbx;
-
-            if (mask & (1ULL << 16)) *(UINT64*)(tf + TF_RIP) = request->rip;
-            if (mask & (1ULL << 17)) *(UINT32*)(tf + TF_EFLAGS) = (UINT32)request->rflags;
-            if (mask & (1ULL << 18)) *(UINT64*)(tf + TF_DR0) = request->dr0;
-            if (mask & (1ULL << 19)) *(UINT64*)(tf + TF_DR1) = request->dr1;
-            if (mask & (1ULL << 20)) *(UINT64*)(tf + TF_DR2) = request->dr2;
-            if (mask & (1ULL << 21)) *(UINT64*)(tf + TF_DR3) = request->dr3;
-            if (mask & (1ULL << 22)) *(UINT64*)(tf + TF_DR6) = request->dr6;
-            if (mask & (1ULL << 23)) {
-                UINT64 sanitized = sanitize_user_dr7(request->dr7);
-                *(UINT64*)(tf + TF_DR7) = sanitized;
-            }
-
-            constexpr UINT64 DR_MASK = (1ULL<<18)|(1ULL<<19)|(1ULL<<20)|(1ULL<<21)|(1ULL<<22)|(1ULL<<23);
-            if (mask & DR_MASK) {
-                UINT64 dr7_val = *(UINT64*)(tf + TF_DR7);
-                volatile LONG* header = reinterpret_cast<volatile LONG*>(kthread);
-                if (dr7_val & DR7_ACTIVE_BITS)
-                    _interlockedbittestandset(header, 24);
-                else
-                    _interlockedbittestandreset(header, 24);
-            }
-
-            return STATUS_SUCCESS;
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            return STATUS_ACCESS_VIOLATION;
-        }
+        UNREFERENCED_PARAMETER(thread);
+        UNREFERENCED_PARAMETER(request);
+        return STATUS_NOT_SUPPORTED;
     }
 }
 
@@ -263,6 +98,10 @@ namespace trapframe_ctx {
 NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
     if (!request || request->pid == 0 || request->tid == 0) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        return STATUS_INVALID_DEVICE_STATE;
     }
 
     if (!_PsLookupProcessByProcessId || !_PsLookupThreadByThreadId ||
@@ -325,9 +164,6 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
                 suspend_status = _PsSuspendThread(thread, &prev_count);
             } else if (_ZwSuspendThread) {
                 suspend_status = _ZwSuspendThread(ctx_thread_handle, &prev_count);
-            } else if (ssdt_resolver::resolve_suspend_resume()) {
-                suspend_status = ssdt_resolver::call_NtSuspendThread(ctx_thread_handle, &prev_count);
-            } else {
             }
 
             if (NT_SUCCESS(suspend_status)) {
@@ -338,13 +174,21 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
         }
     }
 
+    if (!ctx_thread_suspended) {
+        if (ctx_thread_handle) {
+            _ZwClose(ctx_thread_handle);
+        }
+        _ObfDereferenceObject(thread);
+        _ObfDereferenceObject(process);
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
     CONTEXT ctx;
     strong::kmemset(&ctx, 0, sizeof(ctx));
 
 
     BOOLEAN has_ps_get = (_PsGetContextThread != nullptr);
     BOOLEAN has_ps_set = (_PsSetContextThread != nullptr);
-    BOOLEAN has_nt_context = (ctx_thread_handle != nullptr) && ssdt_resolver::resolve_thread_context();
 
     if (request->should_set == 0) {
 
@@ -355,10 +199,6 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
             status = STATUS_PROCEDURE_NOT_FOUND;
             if (has_ps_get) {
                 status = _PsGetContextThread(thread, &ctx, KernelMode);
-            }
-
-            if (!NT_SUCCESS(status) && has_nt_context) {
-                status = ssdt_resolver::call_NtGetContextThread(ctx_thread_handle, &ctx);
             }
 
             if (NT_SUCCESS(status)) {
@@ -402,10 +242,6 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
             if (has_ps_get) {
                 get_status = _PsGetContextThread(thread, &ctx, KernelMode);
             }
-            if (!NT_SUCCESS(get_status) && has_nt_context) {
-                get_status = ssdt_resolver::call_NtGetContextThread(ctx_thread_handle, &ctx);
-            }
-
             if (NT_SUCCESS(get_status)) {
                 UINT64 mask = request->register_mask;
                 if (mask & (1ULL << 0))  ctx.Rax    = request->rax;
@@ -438,9 +274,6 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
                 if (has_ps_set) {
                     status = _PsSetContextThread(thread, &ctx, KernelMode);
                 }
-                if (!NT_SUCCESS(status) && has_nt_context) {
-                    status = ssdt_resolver::call_NtSetContextThread(ctx_thread_handle, &ctx);
-                }
             }
         } else {
         }
@@ -449,14 +282,11 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
 
     if (ctx_thread_suspended && ctx_thread_handle) {
         ULONG prev_count = 0;
-        NTSTATUS resume_status = STATUS_PROCEDURE_NOT_FOUND;
 
         if (_PsResumeThread) {
-            resume_status = _PsResumeThread(thread, &prev_count);
+            (void)_PsResumeThread(thread, &prev_count);
         } else if (_ZwResumeThread) {
-            resume_status = _ZwResumeThread(ctx_thread_handle, &prev_count);
-        } else if (ssdt_resolver::g_NtResumeThread) {
-            resume_status = ssdt_resolver::call_NtResumeThread(ctx_thread_handle, &prev_count);
+            (void)_ZwResumeThread(ctx_thread_handle, &prev_count);
         }
 
     }
@@ -474,6 +304,10 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
 NTSTATUS functions::handle_thread_enum(p_thread_enum request) {
     if (!request || request->pid == 0) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        return STATUS_INVALID_DEVICE_STATE;
     }
 
     if (!_PsLookupProcessByProcessId || !_ObfDereferenceObject) {
@@ -580,20 +414,14 @@ NTSTATUS functions::handle_suspend_resume_thread(p_suspend_resume_thread request
         return STATUS_INVALID_PARAMETER;
     }
 
-    BOOLEAN use_ps = (_PsSuspendThread != nullptr && _PsResumeThread != nullptr);
-    BOOLEAN use_zw = (_ObOpenObjectByPointer != nullptr && _ZwSuspendThread != nullptr && _ZwResumeThread != nullptr && _ZwClose != nullptr);
-    BOOLEAN use_ssdt = FALSE;
-
-    if (!use_ps && !use_zw) {
-
-
-        if (_ObOpenObjectByPointer != nullptr && _ZwClose != nullptr &&
-            ssdt_resolver::resolve_suspend_resume()) {
-            use_ssdt = TRUE;
-        }
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        return STATUS_INVALID_DEVICE_STATE;
     }
 
-    if (!_PsLookupThreadByThreadId || !_ObfDereferenceObject || (!use_ps && !use_zw && !use_ssdt)) {
+    BOOLEAN use_ps = (_PsSuspendThread != nullptr && _PsResumeThread != nullptr);
+    BOOLEAN use_zw = (_ObOpenObjectByPointer != nullptr && _ZwSuspendThread != nullptr && _ZwResumeThread != nullptr && _ZwClose != nullptr);
+
+    if (!_PsLookupThreadByThreadId || !_ObfDereferenceObject || (!use_ps && !use_zw)) {
         return STATUS_PROCEDURE_NOT_FOUND;
     }
 
@@ -637,16 +465,6 @@ NTSTATUS functions::handle_suspend_resume_thread(p_suspend_resume_thread request
                     status = _ZwResumeThread(thread_handle, &prev_count);
                 }
             }
-            else {
-
-
-                if (request->should_resume == 0) {
-                    status = ssdt_resolver::call_NtSuspendThread(thread_handle, &prev_count);
-                }
-                else {
-                    status = ssdt_resolver::call_NtResumeThread(thread_handle, &prev_count);
-                }
-            }
             _ZwClose(thread_handle);
         }
         else {
@@ -663,6 +481,10 @@ NTSTATUS functions::handle_suspend_resume_thread(p_suspend_resume_thread request
 NTSTATUS functions::handle_query_memory(p_query_memory request) {
     if (!request || request->pid == 0) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        return STATUS_INVALID_DEVICE_STATE;
     }
 
     if (!_PsLookupProcessByProcessId || !_KeStackAttachProcess ||
@@ -715,6 +537,11 @@ NTSTATUS functions::handle_protect_memory(p_protect_memory request) {
     if (!request) {
         WW_LOG("memory::protect_memory: REJECT request=null");
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        WW_LOG("memory::protect_memory: REJECT irql=%lu", KeGetCurrentIrql());
+        return STATUS_INVALID_DEVICE_STATE;
     }
 
     WW_LOG("memory::protect_memory: handle ENTER pid=%lu addr=0x%016llX size=0x%llX new=0x%08X",
@@ -835,6 +662,10 @@ NTSTATUS functions::handle_enum_regions(p_enum_regions request) {
         return STATUS_INVALID_PARAMETER;
     }
 
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
     if (!_PsLookupProcessByProcessId || !_KeStackAttachProcess ||
         !_KeUnstackDetachProcess || !_ZwQueryVirtualMemory || !_ObfDereferenceObject) {
         return STATUS_PROCEDURE_NOT_FOUND;
@@ -905,6 +736,10 @@ NTSTATUS functions::handle_read_peb(p_read_peb request) {
         return STATUS_INVALID_PARAMETER;
     }
 
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
     if (!_PsLookupProcessByProcessId || !_PsGetProcessPeb ||
         !_KeStackAttachProcess || !_KeUnstackDetachProcess || !_ObfDereferenceObject) {
         return STATUS_PROCEDURE_NOT_FOUND;
@@ -961,6 +796,10 @@ NTSTATUS functions::handle_spoof_debug_flags(p_spoof_debug request) {
         return STATUS_INVALID_PARAMETER;
     }
 
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
     if (!_PsLookupProcessByProcessId || !_PsGetProcessPeb ||
         !_KeStackAttachProcess || !_KeUnstackDetachProcess || !_ObfDereferenceObject) {
         return STATUS_PROCEDURE_NOT_FOUND;
@@ -976,37 +815,6 @@ NTSTATUS functions::handle_spoof_debug_flags(p_spoof_debug request) {
     }
 
     UINT32 cleared = 0;
-
-
-    {
-        ULONG build = strong::get_windows_version();
-        ULONG debug_port_offset = 0;
-        if (build >= 22000) {
-            debug_port_offset = 0x578;
-        }
-        else if (build >= 19041) {
-            debug_port_offset = 0x578;
-        }
-        else if (build >= 17763) {
-            debug_port_offset = 0x550;
-        }
-        else {
-            debug_port_offset = 0x420;
-        }
-
-        if (debug_port_offset > 0) {
-            __try {
-                UINT64* debug_port = (UINT64*)((UCHAR*)process + debug_port_offset);
-                if (*debug_port != 0) {
-                    *debug_port = 0;
-                    cleared |= 1;
-                }
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER) {
-
-            }
-        }
-    }
 
 
     PVOID peb = (PVOID)_PsGetProcessPeb(process);
@@ -1184,18 +992,29 @@ namespace debug_attach_monitor {
         }
         ObDereferenceObject(proc);
 
+        if (debug_port != nullptr &&
+            reinterpret_cast<UINT64>(debug_port) < 0xFFFF800000000000ull) {
+            debug_port = nullptr;
+        }
+
         BOOLEAN kd_enabled_now = anti_debug::kd_transitioned_to_enabled();
+        bool debug_port_confirmed = false;
+        ULONG evidence_reason = sentinel_bridge::RE_REASON_DEBUG_ATTACH;
 
-        if (debug_port != nullptr || kd_enabled_now) {
-            LONG strikes = _InterlockedIncrement(&g_strikes);
-
-            ULONG evidence_reason = sentinel_bridge::RE_REASON_DEBUG_ATTACH;
-            if (debug_port != nullptr) {
-                HANDLE pid_handle = reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(pid));
-                if (attribute_debugger_to_re_tool(pid_handle)) {
-                    evidence_reason = sentinel_bridge::RE_REASON_DEBUG_BY_RE_TOOL;
-                }
+        if (debug_port != nullptr) {
+            HANDLE pid_handle = reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(pid));
+            debug_port_confirmed = attribute_debugger_to_re_tool(pid_handle);
+            if (debug_port_confirmed)
+                evidence_reason = sentinel_bridge::RE_REASON_DEBUG_BY_RE_TOOL;
+            else {
+                UINT64 port_value = reinterpret_cast<UINT64>(debug_port);
+                UINT32 port_tag = static_cast<UINT32>((port_value >> 32) ^ port_value ^ 0x0A1DDB6u);
+                WW_LOG("debug_attach_monitor: unconfirmed debug port pid=%lu tag=0x%08X", pid, port_tag);
             }
+        }
+
+        if (debug_port_confirmed || kd_enabled_now) {
+            LONG strikes = _InterlockedIncrement(&g_strikes);
 
             sentinel_bridge::populate_evidence_blob(
                 0x20u,

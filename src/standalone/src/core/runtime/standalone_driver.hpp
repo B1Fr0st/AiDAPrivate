@@ -299,6 +299,7 @@ namespace driver_bridge
 
     bool initialize();
     bool load_kernel_driver();
+    void invalidate_kernel_session(const char* reason);
     bool is_loaded();
     bool using_kernel_driver();
     bool can_read_memory();
@@ -398,8 +399,10 @@ namespace driver_bridge
     uint64_t sentinel_ready_since_tsc();
 
     bool register_dll_protection(uint64_t module_base, uint64_t text_va, uint32_t text_size, uint64_t expected_hash, uint32_t check_interval_ms = 2000);
+    bool register_self_dll_protection(uint64_t module_base, uint64_t text_va, uint32_t text_size, uint64_t expected_hash, uint32_t check_interval_ms = 2000);
     bool query_dll_protection(dll_protect_status_t& out);
     bool unregister_dll_protection();
+    bool unregister_self_dll_protection(uint64_t module_base = 0);
 
 
     bool trigger_kernel_bsod(uint32_t reason_code, uint64_t evidence_hash);

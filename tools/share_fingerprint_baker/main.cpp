@@ -183,13 +183,14 @@ bool parse_pe_layout(const std::vector<uint8_t>& file, pe_layout_t& out) {
 
 bool rva_to_file_offset(const pe_layout_t& pe, uint32_t rva, uint32_t length, uint32_t& out_offset) {
     for (const auto& sec : pe.sections) {
-        if (sec.virtual_size == 0) {
+        if (sec.raw_size == 0) {
             continue;
         }
-        uint32_t sec_end_va = sec.virtual_address + sec.virtual_size;
-        if (rva >= sec.virtual_address && rva < sec_end_va) {
+        uint64_t sec_span = (std::max)(static_cast<uint64_t>(sec.virtual_size), static_cast<uint64_t>(sec.raw_size));
+        uint64_t sec_end_va = static_cast<uint64_t>(sec.virtual_address) + sec_span;
+        if (static_cast<uint64_t>(rva) >= sec.virtual_address && static_cast<uint64_t>(rva) < sec_end_va) {
             uint32_t off_in_sec = rva - sec.virtual_address;
-            if (off_in_sec + length > sec.raw_size) {
+            if (static_cast<uint64_t>(off_in_sec) + length > sec.raw_size) {
                 return false;
             }
             out_offset = sec.raw_offset + off_in_sec;

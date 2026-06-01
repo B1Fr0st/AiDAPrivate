@@ -1,4 +1,5 @@
 #include "blur.h"
+#include "blur_shaders.hpp"
 #include "../core/ui/theme.hpp"
 
 ID3D11Device* Blur::s_device = nullptr;
@@ -14,50 +15,9 @@ ID3D11Buffer* Blur::s_cb = nullptr;
 int                       Blur::s_w = 0;
 int                       Blur::s_h = 0;
 
-static const char* vs_src = R"(
-struct VS_OUT { float4 pos : SV_POSITION; float2 uv : TEXCOORD; };
-VS_OUT main(uint id : SV_VertexID) {
-    VS_OUT o;
-    o.uv  = float2((id & 1) ? 1.0 : 0.0, (id & 2) ? 1.0 : 0.0);
-    o.pos = float4(o.uv * float2(2,-2) + float2(-1,1), 0, 1);
-    return o;
-}
-)";
-
-static const char* ps_h_src = R"(
-Texture2D tex : register(t0);
-SamplerState smp : register(s0);
-cbuffer CB : register(b0) { float2 texel; float2 pad; }
-struct PS_IN { float4 pos : SV_POSITION; float2 uv : TEXCOORD; };
-float4 main(PS_IN i) : SV_Target {
-    float w[5] = { 0.227027, 0.194595, 0.121622, 0.054054, 0.016216 };
-    float4 c = tex.Sample(smp, i.uv) * w[0];
-    for (int k = 1; k < 5; k++) {
-        c += tex.Sample(smp, i.uv + float2(texel.x * k, 0)) * w[k];
-        c += tex.Sample(smp, i.uv - float2(texel.x * k, 0)) * w[k];
-    }
-    return c;
-}
-)";
-
-static const char* ps_v_src = R"(
-Texture2D tex : register(t0);
-SamplerState smp : register(s0);
-cbuffer CB : register(b0) { float2 texel; float2 pad; }
-struct PS_IN { float4 pos : SV_POSITION; float2 uv : TEXCOORD; };
-float4 main(PS_IN i) : SV_Target {
-    float w[5] = { 0.227027, 0.194595, 0.121622, 0.054054, 0.016216 };
-    float4 c = tex.Sample(smp, i.uv) * w[0];
-    for (int k = 1; k < 5; k++) {
-        c += tex.Sample(smp, i.uv + float2(0, texel.y * k)) * w[k];
-        c += tex.Sample(smp, i.uv - float2(0, texel.y * k)) * w[k];
-    }
-    return c;
-}
-)";
-
 void Blur::Init(ID3D11Device* device, ID3D11DeviceContext* ctx, int w, int h)
 {
+    if (!device || !ctx || w <= 0 || h <= 0) return;
     s_device = device; s_ctx = ctx; s_w = w; s_h = h;
 
     D3D11_TEXTURE2D_DESC td = {};
@@ -77,13 +37,18 @@ void Blur::Init(ID3D11Device* device, ID3D11DeviceContext* ctx, int w, int h)
     device->CreateRenderTargetView(s_pingpong[0], nullptr, &s_rtv[0]);
     device->CreateRenderTargetView(s_pingpong[1], nullptr, &s_rtv[1]);
 
-    ID3DBlob* blob = nullptr;
-    D3DCompile(vs_src, strlen(vs_src), nullptr, nullptr, nullptr, "main", "vs_4_0", 0, 0, &blob, nullptr);
-    device->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &s_vs); blob->Release();
-    D3DCompile(ps_h_src, strlen(ps_h_src), nullptr, nullptr, nullptr, "main", "ps_4_0", 0, 0, &blob, nullptr);
-    device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &s_ps[0]); blob->Release();
-    D3DCompile(ps_v_src, strlen(ps_v_src), nullptr, nullptr, nullptr, "main", "ps_4_0", 0, 0, &blob, nullptr);
-    device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &s_ps[1]); blob->Release();
+    if (!s_copy || !s_pingpong[0] || !s_pingpong[1] || !s_srv[0] || !s_srv[1] || !s_srv[2] || !s_rtv[0] || !s_rtv[1]) {
+        Shutdown();
+        return;
+    }
+
+    HRESULT hr_vs = device->CreateVertexShader(blur_shaders::fullscreen_vs, blur_shaders::fullscreen_vs_size, nullptr, &s_vs);
+    HRESULT hr_h = device->CreatePixelShader(blur_shaders::horizontal_ps, blur_shaders::horizontal_ps_size, nullptr, &s_ps[0]);
+    HRESULT hr_v = device->CreatePixelShader(blur_shaders::vertical_ps, blur_shaders::vertical_ps_size, nullptr, &s_ps[1]);
+    if (FAILED(hr_vs) || FAILED(hr_h) || FAILED(hr_v) || !s_vs || !s_ps[0] || !s_ps[1]) {
+        Shutdown();
+        return;
+    }
 
     D3D11_SAMPLER_DESC sd = {};
     sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
@@ -94,12 +59,14 @@ void Blur::Init(ID3D11Device* device, ID3D11DeviceContext* ctx, int w, int h)
     bd.ByteWidth = 16; bd.Usage = D3D11_USAGE_DYNAMIC;
     bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER; bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     device->CreateBuffer(&bd, nullptr, &s_cb);
+    if (!s_sampler || !s_cb) Shutdown();
 }
 
 void Blur::ApplyPass(ID3D11ShaderResourceView* src, ID3D11RenderTargetView* dst, bool horizontal)
 {
+    if (!s_ctx || !s_cb || !src || !dst || !s_vs || !s_ps[horizontal ? 0 : 1]) return;
     D3D11_MAPPED_SUBRESOURCE mapped;
-    s_ctx->Map(s_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (FAILED(s_ctx->Map(s_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) return;
     float* cb = (float*)mapped.pData;
     cb[0] = horizontal ? 1.0f / s_w : 0.0f;
     cb[1] = horizontal ? 0.0f : 1.0f / s_h;
@@ -175,6 +142,7 @@ static void BlurCallback(const ImDrawList*, const ImDrawCmd* cmd)
 
 void Blur::Draw(ImDrawList* dl, ImVec2 min, ImVec2 max)
 {
+    if (!dl || !s_srv[2] || !s_ctx || !s_copy || !s_rtv[0] || !s_rtv[1] || !s_vs || !s_ps[0] || !s_ps[1]) return;
     auto* data = new BlurCallbackData{ min, max };
     dl->AddCallback(BlurCallback, data);
     dl->AddImage((ImTextureID)s_srv[2], min, max);

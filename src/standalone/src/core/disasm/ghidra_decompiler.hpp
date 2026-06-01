@@ -83,6 +83,24 @@ struct state_t {
 
 inline state_t g_state;
 
+inline bool buffer_is_zero_padding(const std::vector<uint8_t>& bytes)
+{
+	if (bytes.empty()) return true;
+	size_t zero_count = 0;
+	size_t longest = 0;
+	size_t cur = 0;
+	for (uint8_t b : bytes) {
+		if (b == 0) {
+			++zero_count;
+			++cur;
+			if (cur > longest) longest = cur;
+		} else {
+			cur = 0;
+		}
+	}
+	return longest >= 256 || (bytes.size() >= 256 && zero_count * 100 >= bytes.size() * 90);
+}
+
 enum class wd_state_t : uint32_t {
 	running   = 0,
 	completed = 1,
@@ -712,6 +730,11 @@ inline ghidra_result_t decompile_function(uint64_t entry_addr,
 		result.error_text = "failed to read memory at target address";
 		return result;
 	}
+	if (buffer_is_zero_padding(mem)) {
+		result.is_error = true;
+		result.error_text = "selected address resolves to zero-filled padding, not executable function bytes";
+		return result;
+	}
 
 	auto arch_desc = aida_ghidra::detect_arch_default_x64();
 
@@ -802,6 +825,10 @@ inline bool preload_module(uint64_t base, size_t size, std::vector<uint8_t>& out
 	out.clear();
 	if (size == 0 || size > 0x10000000) return false;
 	driver_bridge::read_memory(base, size, out);
+	if (buffer_is_zero_padding(out)) {
+		out.clear();
+		return false;
+	}
 	return !out.empty();
 }
 

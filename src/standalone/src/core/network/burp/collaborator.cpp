@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <memory>
 #include <unordered_map>
 
@@ -810,9 +811,21 @@ bool start(const collaborator_config_t& cfg)
 
         std::string bind_ip = cfg.bind_ip;
         uint16_t port = cfg.http_port;
-        g_state.http_thread = std::thread([bind_ip, port]() {
-            http_thread_main(bind_ip, port);
-        });
+        try {
+            g_state.http_thread = std::thread([bind_ip, port]() {
+                http_thread_main(bind_ip, port);
+            });
+        } catch (const std::exception& ex) {
+            diag::log_tagged_fmt("collaborator", "http_thread_failed err=%s", ex.what());
+            set_last_error("http_thread_failed");
+            stop();
+            return false;
+        } catch (...) {
+            diag::log_tagged("collaborator", "http_thread_failed");
+            set_last_error("http_thread_failed");
+            stop();
+            return false;
+        }
         DWORD wait_iter = 0;
         while (!g_state.http_alive.load() && wait_iter < 60 && g_state.http_thread_alive.load()) {
             Sleep(50);
@@ -827,9 +840,21 @@ bool start(const collaborator_config_t& cfg)
         uint16_t port = cfg.dns_port;
         std::string public_host = cfg.public_host;
         std::string public_ip = cfg.public_ip;
-        g_state.dns_thread = std::thread([bind_ip, port, public_host, public_ip]() {
-            dns_thread_main(bind_ip, port, public_host, public_ip);
-        });
+        try {
+            g_state.dns_thread = std::thread([bind_ip, port, public_host, public_ip]() {
+                dns_thread_main(bind_ip, port, public_host, public_ip);
+            });
+        } catch (const std::exception& ex) {
+            diag::log_tagged_fmt("collaborator", "dns_thread_failed err=%s", ex.what());
+            set_last_error("dns_thread_failed");
+            stop();
+            return false;
+        } catch (...) {
+            diag::log_tagged("collaborator", "dns_thread_failed");
+            set_last_error("dns_thread_failed");
+            stop();
+            return false;
+        }
         DWORD wait_iter = 0;
         while (!g_state.dns_alive.load() && wait_iter < 60 && g_state.dns_thread_alive.load()) {
             Sleep(50);
@@ -844,9 +869,21 @@ bool start(const collaborator_config_t& cfg)
         uint16_t port = cfg.smtp_port;
         std::string public_host = cfg.public_host;
         int max_msg = cfg.smtp_max_message;
-        g_state.smtp_thread = std::thread([bind_ip, port, public_host, max_msg]() {
-            smtp_thread_main(bind_ip, port, public_host, max_msg);
-        });
+        try {
+            g_state.smtp_thread = std::thread([bind_ip, port, public_host, max_msg]() {
+                smtp_thread_main(bind_ip, port, public_host, max_msg);
+            });
+        } catch (const std::exception& ex) {
+            diag::log_tagged_fmt("collaborator", "smtp_thread_failed err=%s", ex.what());
+            set_last_error("smtp_thread_failed");
+            stop();
+            return false;
+        } catch (...) {
+            diag::log_tagged("collaborator", "smtp_thread_failed");
+            set_last_error("smtp_thread_failed");
+            stop();
+            return false;
+        }
         DWORD wait_iter = 0;
         while (!g_state.smtp_alive.load() && wait_iter < 60 && g_state.smtp_thread_alive.load()) {
             Sleep(50);

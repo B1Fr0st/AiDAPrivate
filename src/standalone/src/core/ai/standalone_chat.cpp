@@ -60,6 +60,7 @@
 #include <chrono>
 #include <cstring>
 #include <map>
+#include <exception>
 
 #include <nlohmann/json.hpp>
 
@@ -149,6 +150,8 @@ std::string get_chat_last_assistant_message_id_locked()
 mcp_standalone::server_t s_mcp_server;
 bool                     s_server_started = false;
 bool                     s_initialized    = false;
+bool                     s_mcp_tools_registered = false;
+std::atomic<bool>        s_ide_ready_for_mcp_services{false};
 
 
 bool                  s_mcp_clients_connected = false;
@@ -590,6 +593,9 @@ std::string build_system_prompt(bool force_xml_fallback = false)
         "## Available Tools\n"
         "Below is the list of all tool names you can call. To learn a tool's parameters "
         "and description before using it, call `get_tool_descriptions` with the tool names you need.\n\n";
+    prompt +=
+        "For simple visible browser tasks, use `camoufox_open_url` directly with a fully-qualified URL. "
+        "Do not call `driver_status`, `check_environment`, `launch_browser`, or separate `navigate` first unless diagnostics or advanced browser instrumentation are needed.\n\n";
 
     {
         auto& tools = s_mcp_server.get_tools();
@@ -639,6 +645,16 @@ std::string execute_tool(const std::string& raw_name, const json& arguments)
     }
 
     (void)standalone_license::verify_entitlement_state();
+    {
+        std::string lifecycle_reason;
+        if (!mcp_standalone::lifecycle_authorized(&lifecycle_reason)) {
+            diag::log_tagged_fmt("mcp_standalone",
+                "local_tool_dispatch_blocked tool='%s' reason='%.160s'",
+                name.c_str(),
+                lifecycle_reason.c_str());
+            return "Error: AiDA MCP is not authorized. Open AiDAStandalone.exe, authenticate, and wait for the protected runtime to finish loading.";
+        }
+    }
 
     output_log::push(bottom_tab_t::mcp_log, "[tool] Executing: " + name);
 
@@ -1593,13 +1609,15 @@ void register_standalone_protection() {
             return;
     }
 
+    if (!standalone_license::is_valid()) {
+        diag::log_tagged_fmt("init_chat",
+            "register_standalone_protection_deferred auth_ok=0 arc_loaded=%d",
+            standalone_license::is_arc_loaded() ? 1 : 0);
+        return;
+    }
+
     if (!driver_bridge::refresh_heartbeat())
         return;
-
-    const DWORD own_pid = GetCurrentProcessId();
-    if (!driver_bridge::attach(own_pid))
-        return;
-
 
     HMODULE exe_module = GetModuleHandleW(nullptr);
     if (!exe_module)
@@ -1615,13 +1633,20 @@ void register_standalone_protection() {
     if (text_hash == 0)
         return;
 
-    driver_bridge::register_dll_protection(
+    const bool protected_ok = driver_bridge::register_self_dll_protection(
         reinterpret_cast<std::uint64_t>(exe_module),
         text_base,
         text_size,
         text_hash,
         2000
     );
+    diag::log_tagged_fmt("init_chat",
+        "register_standalone_protection_result ok=%d image=0x%016llX text=0x%016llX text_size=0x%08X hash=0x%016llX",
+        protected_ok ? 1 : 0,
+        static_cast<unsigned long long>(reinterpret_cast<std::uint64_t>(exe_module)),
+        static_cast<unsigned long long>(text_base),
+        text_size,
+        static_cast<unsigned long long>(text_hash));
 }
 
 }
@@ -1785,17 +1810,8 @@ void init_standalone_chat()
     aida::settings_overlay::initialize();
     diag::log_tagged("init_chat", "views_initialize_done");
 
-    diag::log_tagged("init_chat", "mcp_register_tools_start");
-    mcp_standalone::register_standalone_tools(s_mcp_server);
-    diag::log_tagged("init_chat", "mcp_register_tools_done");
-    if (g_sa_settings.mcp_enabled) {
-        diag::log_tagged_fmt("init_chat", "mcp_server_start port=%d", g_sa_settings.mcp_port);
-        if (s_mcp_server.start(g_sa_settings.mcp_port)) {
-            s_server_started = true;
-            s_mcp_server.write_client_configs();
-        }
-        diag::log_tagged_fmt("init_chat", "mcp_server_start_done started=%d", s_server_started ? 1 : 0);
-    }
+    diag::log_tagged("init_chat", "mcp_register_tools_deferred_until_authorized_ide");
+    diag::log_tagged("init_chat", "mcp_server_start_deferred_until_authorized_ide");
 
     diag::log_tagged_fmt("init_chat", "mcp_client_add_servers count=%zu", g_sa_settings.mcp_client_servers.size());
     for (const auto& srv : g_sa_settings.mcp_client_servers) {
@@ -1821,19 +1837,11 @@ void init_standalone_chat()
         s_mcp_client_mgr.add_server(cfg);
     }
     diag::log_tagged("init_chat", "mcp_client_connect_all_start");
-    s_mcp_client_mgr.connect_all();
-    s_mcp_clients_connected = true;
-    diag::log_tagged("init_chat", "mcp_client_connect_all_done");
+    diag::log_tagged("init_chat", "mcp_client_connect_all_deferred_until_authorized_ide");
 
     diag::log_tagged("init_chat", "marketplace_load_installed_start");
     mcp_marketplace::load_installed(g_sa_settings.marketplace_installed_json);
-    {
-        auto installed = mcp_marketplace::get_installed();
-        for (auto& srv : installed) {
-            if (srv.enabled && srv.auto_connect)
-                mcp_marketplace::activate_server(srv);
-        }
-    }
+    diag::log_tagged("init_chat", "marketplace_autoconnect_deferred_until_authorized_ide");
     diag::log_tagged("init_chat", "marketplace_load_installed_done");
 
     diag::log_tagged("init_chat", "driver_bridge_initialize_start");
@@ -1861,6 +1869,107 @@ void init_standalone_chat()
     s_initialized = true;
 }
 
+void start_authorized_mcp_services()
+{
+    if (!s_initialized)
+        return;
+
+    std::string missing_exports;
+    const bool ide_ready = s_ide_ready_for_mcp_services.load(std::memory_order_acquire);
+    const bool valid = license::validated && standalone_license::is_valid();
+    const bool arc_loaded = standalone_license::is_arc_loaded();
+    const bool exports_ok = valid && arc_loaded && standalone_license::validate_arc_required_exports(missing_exports);
+    if (!ide_ready || !valid || !arc_loaded || !exports_ok)
+    {
+        mcp_standalone::set_ide_lifecycle_ready(false);
+        static auto s_last_block_log = std::chrono::steady_clock::time_point{};
+        auto now = std::chrono::steady_clock::now();
+        if (s_last_block_log == std::chrono::steady_clock::time_point{} ||
+            std::chrono::duration_cast<std::chrono::seconds>(now - s_last_block_log).count() >= 2)
+        {
+            diag::log_tagged_fmt("init_chat",
+                "authorized_mcp_services_blocked ide=%d validated=%d valid=%d arc=%d exports=%d missing='%.160s'",
+                ide_ready ? 1 : 0,
+                license::validated ? 1 : 0,
+                standalone_license::is_valid() ? 1 : 0,
+                standalone_license::is_arc_loaded() ? 1 : 0,
+                exports_ok ? 1 : 0,
+                missing_exports.c_str());
+            s_last_block_log = now;
+        }
+        return;
+    }
+
+    mcp_standalone::set_ide_lifecycle_ready(true);
+
+    if (!s_mcp_tools_registered)
+    {
+        diag::log_tagged("init_chat", "authorized_mcp_register_tools_start");
+        mcp_standalone::register_standalone_tools(s_mcp_server);
+        s_mcp_tools_registered = true;
+        diag::log_tagged("init_chat", "authorized_mcp_register_tools_done");
+    }
+
+    if (g_sa_settings.mcp_enabled && !s_server_started)
+    {
+        static auto s_last_start_attempt = std::chrono::steady_clock::time_point{};
+        auto now = std::chrono::steady_clock::now();
+        if (s_last_start_attempt != std::chrono::steady_clock::time_point{} &&
+            std::chrono::duration_cast<std::chrono::seconds>(now - s_last_start_attempt).count() < 2)
+        {
+            return;
+        }
+        s_last_start_attempt = now;
+        diag::log_tagged_fmt("init_chat",
+            "authorized_mcp_server_start port=%d ide=%d validated=%d valid=%d arc=%d exports=%d",
+            g_sa_settings.mcp_port,
+            ide_ready ? 1 : 0,
+            license::validated ? 1 : 0,
+            standalone_license::is_valid() ? 1 : 0,
+            standalone_license::is_arc_loaded() ? 1 : 0,
+            exports_ok ? 1 : 0);
+        if (s_mcp_server.start(g_sa_settings.mcp_port))
+        {
+            s_server_started = true;
+            bool posted = work_queue::post([] {
+                try {
+                    diag::log_tagged("init_chat", "authorized_mcp_write_client_configs_start");
+                    s_mcp_server.write_client_configs();
+                    diag::log_tagged("init_chat", "authorized_mcp_write_client_configs_done");
+                } catch (const std::exception& e) {
+                    diag::log_tagged_fmt("init_chat", "authorized_mcp_write_client_configs_cpp_exception what=%s", e.what());
+                } catch (...) {
+                    diag::log_tagged("init_chat", "authorized_mcp_write_client_configs_cpp_exception what=<unknown>");
+                }
+            });
+            if (!posted)
+                diag::log_tagged("init_chat", "authorized_mcp_write_client_configs_post_failed");
+        }
+        diag::log_tagged_fmt("init_chat", "authorized_mcp_server_start_done started=%d", s_server_started ? 1 : 0);
+    }
+
+    if (!s_mcp_clients_connected)
+    {
+        diag::log_tagged("init_chat", "authorized_mcp_client_connect_all_start");
+        s_mcp_client_mgr.connect_all();
+        s_mcp_clients_connected = true;
+        diag::log_tagged("init_chat", "authorized_mcp_client_connect_all_done");
+
+        auto installed = mcp_marketplace::get_installed();
+        for (auto& srv : installed)
+        {
+            if (srv.enabled && srv.auto_connect)
+                mcp_marketplace::activate_server(srv);
+        }
+        diag::log_tagged_fmt("init_chat", "authorized_marketplace_autoconnect_done count=%zu", installed.size());
+    }
+}
+
+void mark_ide_ready_for_mcp_services()
+{
+    s_ide_ready_for_mcp_services.store(true, std::memory_order_release);
+}
+
 void shutdown_standalone_chat()
 {
     diag::log_tagged("chat", "shutdown_standalone_chat enter");
@@ -1875,7 +1984,12 @@ void shutdown_standalone_chat()
         }
     }
     if (s_server_started)
+    {
         s_mcp_server.stop();
+        s_server_started = false;
+    }
+    mcp_standalone::set_ide_lifecycle_ready(false);
+    s_ide_ready_for_mcp_services.store(false, std::memory_order_release);
 
 
     if (s_mcp_clients_connected) {
@@ -2124,6 +2238,39 @@ void poll_ai_chat()
         diag::log_tagged_fmt("license",
             "DIAG_DIALOG_TRIGGER source=poll_ai_chat tid=%lu runtime_locked=%d err=%.200s",
             GetCurrentThreadId(), runtime_locked ? 1 : 0, license::error_msg.c_str());
+        mcp_standalone::set_ide_lifecycle_ready(false);
+        s_ide_ready_for_mcp_services.store(false, std::memory_order_release);
+        if (s_server_started) {
+            diag::log_tagged("init_chat", "authorized_mcp_server_stop_auth_lost");
+            s_mcp_server.stop();
+            s_server_started = false;
+        }
+        if (s_mcp_clients_connected) {
+            diag::log_tagged("init_chat", "authorized_mcp_client_disconnect_auth_lost");
+            s_mcp_client_mgr.disconnect_all();
+            s_mcp_clients_connected = false;
+        }
+    }
+
+    {
+        std::string lifecycle_reason;
+        if ((s_server_started || s_mcp_clients_connected) &&
+            !mcp_standalone::lifecycle_authorized(&lifecycle_reason))
+        {
+            diag::log_tagged_fmt("init_chat",
+                "authorized_mcp_services_stop_unauthorized reason='%.160s'",
+                lifecycle_reason.c_str());
+            mcp_standalone::set_ide_lifecycle_ready(false);
+            s_ide_ready_for_mcp_services.store(false, std::memory_order_release);
+            if (s_server_started) {
+                s_mcp_server.stop();
+                s_server_started = false;
+            }
+            if (s_mcp_clients_connected) {
+                s_mcp_client_mgr.disconnect_all();
+                s_mcp_clients_connected = false;
+            }
+        }
     }
 
 

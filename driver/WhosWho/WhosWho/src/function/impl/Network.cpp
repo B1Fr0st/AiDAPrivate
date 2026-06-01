@@ -2421,6 +2421,10 @@ namespace net_capture {
         NET_DBG("initialize: register_wfp status=0x%08x", status);
         if (!NT_SUCCESS(status)) {
             NET_ERR("initialize: register_wfp FAILED 0x%08x", status);
+            WW_LOG("net_capture::initialize FAIL step=register_wfp status=0x%08X ring_ready=%u dns_ready=%u",
+                status,
+                g_ring_buffer != nullptr ? 1u : 0u,
+                g_dns_ring != nullptr ? 1u : 0u);
             net_dpi::cleanup();
             if (g_ring_buffer) {
                 ExFreePoolWithTag(g_ring_buffer, 'pkNW');
@@ -2437,6 +2441,10 @@ namespace net_capture {
         KeMemoryBarrier();
         _InterlockedExchange(&g_wfp_initialized, 2);
         NET_DBG("initialize: WFP fully initialized (state=2)");
+        WW_LOG("net_capture::initialize OK state=2 ring_ready=%u dns_ready=%u max_payload=%u",
+            g_ring_buffer != nullptr ? 1u : 0u,
+            g_dns_ring != nullptr ? 1u : 0u,
+            g_max_payload);
 
 
         NET_DBG("initialize: pre-resolving AFD offsets");
@@ -3651,6 +3659,14 @@ NTSTATUS functions::handle_net_enum_conn(p_net_enum_conn request) {
 
 NTSTATUS functions::handle_net_cap_ctrl(p_net_cap_ctrl request) {
     if (!request) { NET_ERR("handle_net_cap_ctrl: NULL request"); return STATUS_INVALID_PARAMETER; }
+    WW_LOG("net_capture::ctrl ENTER op=%u state=%ld active=%ld pid_filter=%u port_filter=%u proto_filter=%u max_bytes=%u",
+        request->operation,
+        net_capture::g_wfp_initialized,
+        net_capture::g_capture_active,
+        request->filter_pid,
+        request->filter_port,
+        request->filter_protocol,
+        request->max_packet_bytes);
 
     if (net_capture::g_wfp_initialized != 2) {
 
@@ -3660,11 +3676,17 @@ NTSTATUS functions::handle_net_cap_ctrl(p_net_cap_ctrl request) {
             NTSTATUS reinit_status = net_capture::initialize(net_capture::g_device_object);
             if (!NT_SUCCESS(reinit_status)) {
                 NET_ERR("handle_net_cap_ctrl: lazy WFP re-init FAILED status=0x%08lx", reinit_status);
+                WW_LOG("net_capture::ctrl FAIL step=lazy_reinit status=0x%08X state=%ld",
+                    reinit_status,
+                    net_capture::g_wfp_initialized);
                 return STATUS_DEVICE_NOT_READY;
             }
             NET_DBG("handle_net_cap_ctrl: lazy WFP re-init OK");
         } else {
             NET_ERR("handle_net_cap_ctrl: WFP not initialized (state=%d) and no device object", (int)net_capture::g_wfp_initialized);
+            WW_LOG("net_capture::ctrl FAIL step=wfp_not_ready status=0x%08X state=%ld device_ready=0",
+                STATUS_DEVICE_NOT_READY,
+                net_capture::g_wfp_initialized);
             return STATUS_DEVICE_NOT_READY;
         }
     }
@@ -3695,12 +3717,18 @@ NTSTATUS functions::handle_net_cap_ctrl(p_net_cap_ctrl request) {
             NTSTATUS dpi_status = net_dpi::start();
             if (!NT_SUCCESS(dpi_status)) {
                 NET_ERR("handle_net_cap_ctrl: DPI start FAILED status=0x%08lx", dpi_status);
+                WW_LOG("net_capture::ctrl FAIL step=dpi_start status=0x%08X", dpi_status);
                 return dpi_status;
             }
             _InterlockedExchange(&net_capture::g_capture_active, 1);
 
             NET_DBG("handle_net_cap_ctrl: capture STARTED pid=%u port=%u proto=%u max_bytes=%u",
                     request->filter_pid, request->filter_port, request->filter_protocol, net_capture::g_max_payload);
+            WW_LOG("net_capture::ctrl STARTED pid_filter=%u port_filter=%u proto_filter=%u max_bytes=%u",
+                request->filter_pid,
+                request->filter_port,
+                request->filter_protocol,
+                net_capture::g_max_payload);
             request->capture_active = 1;
             break;
         }
@@ -3712,13 +3740,24 @@ NTSTATUS functions::handle_net_cap_ctrl(p_net_cap_ctrl request) {
             net_capture::g_filter_protocol = 0;
             strong::kmemset(net_capture::g_filter_ip, 0, sizeof(net_capture::g_filter_ip));
             NET_DBG("handle_net_cap_ctrl: capture STOPPED");
+            WW_LOG("net_capture::ctrl STOPPED captured=%ld dropped=%ld",
+                net_capture::g_total_captured,
+                net_capture::g_total_dropped);
             request->capture_active = 0;
             break;
         }
         case 2: {
+            WW_LOG("net_capture::ctrl STATUS active=%ld captured=%ld dropped=%ld ring_count=%ld",
+                net_capture::g_capture_active,
+                net_capture::g_total_captured,
+                net_capture::g_total_dropped,
+                net_capture::g_ring_count);
             break;
         }
         default:
+            WW_LOG("net_capture::ctrl FAIL step=invalid_operation op=%u status=0x%08X",
+                request->operation,
+                STATUS_INVALID_PARAMETER);
             return STATUS_INVALID_PARAMETER;
     }
 
@@ -3759,6 +3798,12 @@ NTSTATUS functions::handle_net_cap_get(p_net_cap_get request) {
     request->packet_count = to_read;
 
     KeReleaseSpinLock(&net_capture::g_ring_lock, old_irql);
+    WW_LOG("net_capture::get packets=%u requested=%u available_before=%u active=%ld dropped=%ld",
+        to_read,
+        max_packets,
+        available,
+        net_capture::g_capture_active,
+        net_capture::g_total_dropped);
 
     return STATUS_SUCCESS;
 }

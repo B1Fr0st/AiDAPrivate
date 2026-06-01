@@ -89,12 +89,167 @@ static bool find_target_text(PVOID target_base, PVOID* out_text, ULONG* out_text
 }
 
 
+static UINT32 compute_target_device_key() {
+    int cpu[4] = {};
+    __cpuid(cpu, 0);
+    UINT32 h = 0x811C9DC5u;
+    h = (h ^ static_cast<UINT32>(cpu[1])) * 0x01000193u;
+    h = (h ^ static_cast<UINT32>(cpu[2])) * 0x01000193u;
+    h = (h ^ static_cast<UINT32>(cpu[3])) * 0x01000193u;
+    __cpuid(cpu, 1);
+    h = (h ^ static_cast<UINT32>(cpu[0])) * 0x01000193u;
+    h = (h ^ static_cast<UINT32>(cpu[3])) * 0x01000193u;
+    volatile UINT32 build = *reinterpret_cast<volatile UINT32*>(0xFFFFF78000000260ULL) & 0xFFFFu;
+    h = (h ^ build) * 0x01000193u;
+    h ^= h >> 16;
+    h *= 0x85ebca6bu;
+    h ^= h >> 13;
+    if (h == 0) h = 1;
+    return h;
+}
+
+static SIZE_T copy_wstr(WCHAR* dest, SIZE_T dest_count, const WCHAR* src) {
+    SIZE_T i = 0;
+    while (src[i] && (i + 1) < dest_count) {
+        dest[i] = src[i];
+        i++;
+    }
+    dest[i] = L'\0';
+    return i;
+}
+
+static void append_decimal_suffix(WCHAR* buffer, SIZE_T buffer_count, SIZE_T current_len, UINT32 seed) {
+    UINT32 suffix_val = (seed >> 8) % 100;
+    if (current_len + 3 >= buffer_count)
+        return;
+
+    if (suffix_val >= 10) {
+        buffer[current_len] = L'0' + static_cast<WCHAR>((suffix_val / 10) % 10);
+        buffer[current_len + 1] = L'0' + static_cast<WCHAR>(suffix_val % 10);
+        buffer[current_len + 2] = L'\0';
+    } else {
+        buffer[current_len] = L'0' + static_cast<WCHAR>(suffix_val);
+        buffer[current_len + 1] = L'\0';
+    }
+}
+
+static BOOLEAN build_target_device_name(WCHAR* buffer, SIZE_T buffer_count) {
+    if (!buffer || buffer_count < 32)
+        return FALSE;
+
+    static const WCHAR* const bases[] = {
+        L"RdpRefMp",
+        L"KsecDD",
+        L"MountPointManager",
+        L"VolumesSafeForWriteAccess",
+        L"VolMgrControl",
+        L"DeviceApi",
+        L"Ucx01000",
+        L"USBPDO",
+        L"ACPI_HAL",
+        L"PnpManager",
+        L"WdfLdr",
+        L"KernelCng",
+        L"WUDFLpcDevice",
+        L"DxgKrnl",
+        L"NdisCap",
+        L"WfpLwfs",
+    };
+
+    UINT32 seed = compute_target_device_key();
+    seed = (seed * 0x45D9F3Bu) ^ (seed >> 16);
+    seed = (seed * 0x1B873593u) ^ (seed >> 13);
+
+    SIZE_T pos = copy_wstr(buffer, buffer_count, L"\\Device\\");
+    const WCHAR* base_name = bases[seed % (sizeof(bases) / sizeof(bases[0]))];
+    pos += copy_wstr(buffer + pos, buffer_count - pos, base_name);
+    append_decimal_suffix(buffer, buffer_count, pos, seed >> 4);
+    return TRUE;
+}
+
+static BOOLEAN validate_target_driver_object(PDRIVER_OBJECT driver_object, PVOID target_base) {
+    if (!driver_object || !target_base || !_MmIsAddressValid(driver_object))
+        return FALSE;
+
+    __try {
+        if (!driver_object->DriverSection || !_MmIsAddressValid(driver_object->DriverSection))
+            return FALSE;
+
+        PLDR_DATA_TABLE_ENTRY ldr = static_cast<PLDR_DATA_TABLE_ENTRY>(driver_object->DriverSection);
+        if (!_MmIsAddressValid(ldr) || ldr->DllBase != target_base)
+            return FALSE;
+
+        PDEVICE_OBJECT device = driver_object->DeviceObject;
+        if (!device || !_MmIsAddressValid(device) || device->DriverObject != driver_object)
+            return FALSE;
+
+        PDRIVER_DISPATCH create_handler = driver_object->MajorFunction[IRP_MJ_CREATE];
+        PDRIVER_DISPATCH ioctl_handler = driver_object->MajorFunction[IRP_MJ_DEVICE_CONTROL];
+        if (!create_handler || !ioctl_handler)
+            return FALSE;
+
+        if (reinterpret_cast<ULONG_PTR>(create_handler) < 0xFFFF800000000000ULL ||
+            reinterpret_cast<ULONG_PTR>(ioctl_handler) < 0xFFFF800000000000ULL)
+            return FALSE;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+static PDRIVER_OBJECT resolve_target_driver_object_from_device(PVOID target_base) {
+    if (!target_base || KeGetCurrentIrql() != PASSIVE_LEVEL)
+        return nullptr;
+
+    WCHAR device_name_buffer[80] = {};
+    if (!build_target_device_name(device_name_buffer, sizeof(device_name_buffer) / sizeof(device_name_buffer[0])))
+        return nullptr;
+
+    UNICODE_STRING device_name;
+    RtlInitUnicodeString(&device_name, device_name_buffer);
+
+    PFILE_OBJECT file_object = nullptr;
+    PDEVICE_OBJECT device_object = nullptr;
+    NTSTATUS status = IoGetDeviceObjectPointer(&device_name, FILE_READ_DATA, &file_object, &device_object);
+    if (!NT_SUCCESS(status) || !file_object || !device_object) {
+        SN_LOG("find_target_driver_object: device_resolve_failed status=0x%08lx", status);
+        if (file_object)
+            ObDereferenceObject(file_object);
+        return nullptr;
+    }
+
+    PDRIVER_OBJECT driver_object = nullptr;
+    __try {
+        if (_MmIsAddressValid(device_object))
+            driver_object = device_object->DriverObject;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        driver_object = nullptr;
+    }
+
+    BOOLEAN valid = validate_target_driver_object(driver_object, target_base);
+    SN_LOG("find_target_driver_object: device_resolve status=0x%08lx valid=%u", status, valid ? 1u : 0u);
+    ObDereferenceObject(file_object);
+
+    return valid ? driver_object : nullptr;
+}
+
 static PDRIVER_OBJECT find_target_driver_object(PVOID target_base) {
-    UNREFERENCED_PARAMETER(target_base);
-
-    if (g_target_driver_object && _MmIsAddressValid((PVOID)g_target_driver_object))
+    if (g_target_driver_object && validate_target_driver_object(static_cast<PDRIVER_OBJECT>((PVOID)g_target_driver_object), target_base)) {
+        SN_LOG("find_target_driver_object: using preseeded object valid=1");
         return static_cast<PDRIVER_OBJECT>((PVOID)g_target_driver_object);
+    }
 
+    PDRIVER_OBJECT resolved = resolve_target_driver_object_from_device(target_base);
+    if (resolved) {
+        g_target_driver_object = resolved;
+        SN_LOG("find_target_driver_object: resolved from device valid=1");
+        return resolved;
+    }
+
+    SN_LOG("find_target_driver_object: unavailable preseeded_object=%u target_base_set=%u dispatch_snapshot_coverage=0",
+        g_target_driver_object != nullptr ? 1u : 0u,
+        target_base != nullptr ? 1u : 0u);
 
     return nullptr;
 }
@@ -487,7 +642,7 @@ discovery_done:
         SN_LOG("init_thread: target .text at %p size=0x%lx", target_text, target_text_size);
 
         PDRIVER_OBJECT target_driver_obj = find_target_driver_object(target_base);
-        SN_LOG("init_thread: target_driver_obj=%p", target_driver_obj);
+        SN_LOG("init_thread: target_driver_obj_present=%u", target_driver_obj != nullptr ? 1u : 0u);
 
 
         bool integrity_ok = integrity::init(target_text, target_text_size);
@@ -498,7 +653,9 @@ discovery_done:
             bool dg_ok = dispatch_guard::snapshot(target_driver_obj);
             SN_LOG("init_thread: dispatch_guard::snapshot = %d", (int)dg_ok);
         } else {
-            SN_LOG("init_thread: skip dispatch_guard::snapshot (no driver obj)");
+            SN_LOG("init_thread: skip dispatch_guard::snapshot reason=target_driver_object_unavailable coverage=0 base_known=%u size_known=%u",
+                g_target_driver_base != nullptr ? 1u : 0u,
+                g_target_driver_size != 0 ? 1u : 0u);
         }
 
 
@@ -552,13 +709,7 @@ discovery_done:
                 RtlSecureZeroMemory(bridge_key, sizeof(bridge_key));
             }
 
-            NTSTATUS wsk_st = wsk_transport::init();
-            SN_LOG("init_thread: wsk_transport::init status=0x%08lx", wsk_st);
-
-            if (NT_SUCCESS(wsk_st)) {
-                wsk_transport::start_heartbeat_timer();
-                SN_LOG("init_thread: wsk heartbeat timer started");
-            }
+            SN_LOG("init_thread: wsk cloud heartbeat not started; client license heartbeat carries live driver proof");
 
             bool attest_ok = attestation::init();
             SN_LOG("init_thread: attestation::init = %d", (int)attest_ok);
@@ -572,6 +723,20 @@ discovery_done:
             integrity::collect_sensor_baseline();
             SN_LOG("init_thread: integrity::collect_sensor_baseline done");
         }
+
+
+        SN_LOG("init_thread: calling thread_guard::check_and_clear_current_cpu");
+        if (g_target_driver_base && g_target_driver_size) {
+            UINT64 tg_base = reinterpret_cast<UINT64>(const_cast<PVOID>(g_target_driver_base));
+            UINT64 tg_size = static_cast<UINT64>(g_target_driver_size);
+            bool tg_ok = thread_guard::init(tg_base, tg_size);
+            SN_LOG("init_thread: thread_guard::init base=0x%llx size=0x%llx = %d",
+                tg_base, tg_size, (int)tg_ok);
+        } else {
+            SN_LOG("init_thread: thread_guard::init SKIPPED (no target base/size)");
+        }
+        thread_guard::check_and_clear_current_cpu();
+        SN_LOG("init_thread: thread_guard done");
 
 
         SN_LOG("init_thread: starting guardian...");
@@ -622,21 +787,6 @@ discovery_done:
             bool pn_ok = process_notify::init();
             SN_LOG("init_thread: process_notify::init = %d", (int)pn_ok);
         }
-
-
-        SN_LOG("init_thread: calling thread_guard::ipi_clear_all_cpus");
-        if (g_target_driver_base && g_target_driver_size) {
-            UINT64 tg_base = reinterpret_cast<UINT64>(const_cast<PVOID>(g_target_driver_base));
-            UINT64 tg_size = static_cast<UINT64>(g_target_driver_size);
-            bool tg_ok = thread_guard::init(tg_base, tg_size);
-            SN_LOG("init_thread: thread_guard::init base=0x%llx size=0x%llx = %d",
-                tg_base, tg_size, (int)tg_ok);
-        } else {
-            SN_LOG("init_thread: thread_guard::init SKIPPED (no target base/size)");
-        }
-        thread_guard::ipi_clear_all_cpus();
-        SN_LOG("init_thread: thread_guard done");
-
 
         __try {
             SN_LOG("init_thread: calling self_protect::apply_stealth");

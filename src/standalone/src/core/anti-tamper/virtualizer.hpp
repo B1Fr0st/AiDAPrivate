@@ -1558,39 +1558,8 @@ namespace detail
 
     __forceinline bool vm_anti_emu_rdpmc_check(vm_state_t& vm)
     {
-        uint64_t pmc_value = 0;
-        bool readable = false;
-
-        __try {
-            pmc_value = __readpmc(0x40000000u);
-            readable = true;
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            readable = false;
-        }
-
-        if (!readable)
-        {
-            vm.anti_emu_pmc_failures = 0;
-            vm.anti_emu_last_pmc = 0;
-            return true;
-        }
-
-        if (vm.anti_emu_last_pmc != 0 && pmc_value <= vm.anti_emu_last_pmc)
-        {
-            ++vm.anti_emu_pmc_failures;
-            if (vm.anti_emu_pmc_failures >= 3)
-            {
-                vm.anti_emu_corruption_flags |= ANTI_EMU_FLAG_RDPMC;
-                vm.anti_emu_last_pmc = pmc_value;
-                return false;
-            }
-        }
-        else
-        {
-            vm.anti_emu_pmc_failures = 0;
-        }
-
-        vm.anti_emu_last_pmc = pmc_value;
+        vm.anti_emu_pmc_failures = 0;
+        vm.anti_emu_last_pmc = 0;
         return true;
     }
 

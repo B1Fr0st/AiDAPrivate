@@ -13,7 +13,7 @@
 #include <vector>
 
 #include "key_pipeline.hpp"
-#include "hardware_id/hardware_id.hpp"
+#include "hardware_id/hardware_id_v2.hpp"
 
 namespace anti_tamper {
 namespace state {
@@ -139,14 +139,22 @@ namespace detail_master_key {
 
     inline bool derive_into(uint8_t out[32])
     {
-        auto anchors = aida::hardware_id::collect_user_mode();
-        std::string canonical = aida::hardware_id::canonical_string(anchors);
+        aida::hardware_id::v2::collection_t collection{};
+        std::string err;
+        bool collected = aida::hardware_id::v2::collect(collection, err);
 
-        bool ok = key_pipeline::derive(
-            "aida.vm.master",
-            reinterpret_cast<const uint8_t*>(canonical.data()),
-            canonical.size(),
+        bool ok = collected && key_pipeline::derive(
+            "aida.vm.master.v2",
+            collection.hwid_hash.data(),
+            collection.hwid_hash.size(),
             out, 32);
+
+        SecureZeroMemory(collection.hwid_hash.data(), collection.hwid_hash.size());
+        for (auto& factor : collection.factors)
+        {
+            SecureZeroMemory(factor.factor_hash.data(), factor.factor_hash.size());
+            if (!factor.bytes.empty()) SecureZeroMemory(factor.bytes.data(), factor.bytes.size());
+        }
 
         if (!ok)
         {

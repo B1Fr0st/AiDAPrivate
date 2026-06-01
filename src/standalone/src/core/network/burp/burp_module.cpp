@@ -34,6 +34,7 @@
 #include "../../../helpers/diag_log.hpp"
 
 #include <atomic>
+#include <exception>
 
 namespace aida {
 namespace burp {
@@ -67,6 +68,28 @@ std::atomic<bool>& initialized_flag()
     return f;
 }
 
+template <typename Fn>
+void run_init_phase(const char* name, Fn&& fn)
+{
+    diag::log_tagged_fmt("burp_module", "init_phase_begin name=%s", name ? name : "?");
+    try
+    {
+        fn();
+        diag::log_tagged_fmt("burp_module", "init_phase_ok name=%s", name ? name : "?");
+    }
+    catch (const std::exception& e)
+    {
+        diag::log_tagged_fmt("burp_module", "init_phase_cpp_exception name=%s what=%s",
+            name ? name : "?", e.what());
+        throw;
+    }
+    catch (...)
+    {
+        diag::log_tagged_fmt("burp_module", "init_phase_unknown_exception name=%s", name ? name : "?");
+        throw;
+    }
+}
+
 }
 
 bool initialize()
@@ -74,39 +97,57 @@ bool initialize()
     bool expected = false;
     if (!initialized_flag().compare_exchange_strong(expected, true)) return true;
 
-    scope::initialize();
-    issue_store::initialize();
-    cookie_jar::initialize();
-    payloads::initialize();
-    sitemap::initialize();
+    try
+    {
+        run_init_phase("scope", []() { (void)scope::initialize(); });
+        run_init_phase("issue_store", []() { (void)issue_store::initialize(); });
+        run_init_phase("cookie_jar", []() { (void)cookie_jar::initialize(); });
+        run_init_phase("payloads", []() { (void)payloads::initialize(); });
+        run_init_phase("sitemap", []() { (void)sitemap::initialize(); });
 
-    passive_scanner::initialize();
-    active_scanner::initialize();
-    dom_xss::initialize();
+        run_init_phase("passive_scanner", []() { (void)passive_scanner::initialize(); });
+        run_init_phase("active_scanner", []() { (void)active_scanner::initialize(); });
+        run_init_phase("dom_xss", []() { (void)dom_xss::initialize(); });
 
-    crawler::initialize();
-    content_discovery::initialize();
-    subdomain_enum::initialize();
+        run_init_phase("crawler", []() { (void)crawler::initialize(); });
+        run_init_phase("content_discovery", []() { (void)content_discovery::initialize(); });
+        run_init_phase("subdomain_enum", []() { (void)subdomain_enum::initialize(); });
 
-    auth_lab::initialize();
-    jwt_lab::initialize();
-    match_replace::initialize();
-    session_handler::initialize();
+        run_init_phase("auth_lab", []() { (void)auth_lab::initialize(); });
+        run_init_phase("jwt_lab", []() { (void)jwt_lab::initialize(); });
+        run_init_phase("match_replace", []() { (void)match_replace::initialize(); });
+        run_init_phase("session_handler", []() { (void)session_handler::initialize(); });
 
-    api_definition::initialize();
-    ws_editor::initialize();
-    logger::initialize();
+        run_init_phase("api_definition", []() { (void)api_definition::initialize(); });
+        run_init_phase("ws_editor", []() { (void)ws_editor::initialize(); });
+        run_init_phase("logger", []() { (void)logger::initialize(); });
 
-    browser::initialize();
-    csp::initialize();
-    tech::initialize();
-    upstream::initialize();
+        run_init_phase("browser", []() { (void)browser::initialize(); });
+        run_init_phase("csp", []() { (void)csp::initialize(); });
+        run_init_phase("tech", []() { (void)tech::initialize(); });
+        run_init_phase("upstream", []() { (void)upstream::initialize(); });
 
-    camoufox::install::initialize();
-    headless_view::initialize();
+        run_init_phase("camoufox_install", []() { (void)camoufox::install::initialize(); });
+        run_init_phase("headless_view", []() { (void)headless_view::initialize(); });
 
-    diag::log_tagged("burp_module", "initialized");
-    return true;
+        diag::log_tagged("burp_module", "initialized");
+        return true;
+    }
+    catch (...)
+    {
+        diag::log_tagged("burp_module", "initialize_failed_unwinding");
+        try
+        {
+            shutdown();
+        }
+        catch (...)
+        {
+            initialized_flag().store(false);
+            diag::log_tagged("burp_module", "initialize_unwind_exception");
+        }
+        initialized_flag().store(false);
+        throw;
+    }
 }
 
 void shutdown()

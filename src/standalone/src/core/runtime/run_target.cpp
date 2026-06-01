@@ -27,6 +27,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <locale>
@@ -575,22 +576,37 @@ void spawn_watchdog_kill(HANDLE process_handle, HANDLE job_handle, uint32_t sec,
 
 	const uint32_t timeout_ms = sec * 1000u;
 	uint32_t local_pid = pid;
-	std::thread([dup_proc, dup_job, timeout_ms, local_pid]() mutable {
-		DWORD w = WaitForSingleObject(dup_proc, timeout_ms);
-		if (w == WAIT_TIMEOUT) {
-			diag::log_tagged_critical_fmt("run_target",
-				"watchdog auto_terminate pid=%u after_ms=%lu",
-				static_cast<unsigned>(local_pid),
-				static_cast<unsigned long>(timeout_ms));
-			if (dup_job) {
-				TerminateJobObject(dup_job, 0xDEAD);
-			} else {
-				TerminateProcess(dup_proc, 0xDEAD);
+	try {
+		std::thread([dup_proc, dup_job, timeout_ms, local_pid]() mutable {
+			DWORD w = WaitForSingleObject(dup_proc, timeout_ms);
+			if (w == WAIT_TIMEOUT) {
+				diag::log_tagged_critical_fmt("run_target",
+					"watchdog auto_terminate pid=%u after_ms=%lu",
+					static_cast<unsigned>(local_pid),
+					static_cast<unsigned long>(timeout_ms));
+				if (dup_job) {
+					TerminateJobObject(dup_job, 0xDEAD);
+				} else {
+					TerminateProcess(dup_proc, 0xDEAD);
+				}
 			}
-		}
+			if (dup_job) CloseHandle(dup_job);
+			CloseHandle(dup_proc);
+		}).detach();
+	} catch (const std::exception& ex) {
+		diag::log_tagged_critical_fmt("run_target",
+			"watchdog worker unavailable pid=%u err=%s",
+			static_cast<unsigned>(local_pid),
+			ex.what());
 		if (dup_job) CloseHandle(dup_job);
 		CloseHandle(dup_proc);
-	}).detach();
+	} catch (...) {
+		diag::log_tagged_critical_fmt("run_target",
+			"watchdog worker unavailable pid=%u",
+			static_cast<unsigned>(local_pid));
+		if (dup_job) CloseHandle(dup_job);
+		CloseHandle(dup_proc);
+	}
 }
 
 bool launch_jobbed(const launch_options_t& opts, launch_result_t& out, bool inherit_appcontainer);

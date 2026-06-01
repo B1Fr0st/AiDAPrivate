@@ -38,6 +38,9 @@ AiDA uses CMake 3.25+ with Ninja generator and MSVC (Visual Studio 2022 Professi
 - Ask concise questions before making risky assumptions. If there are no blocking questions, proceed and say so in the report.
 - Prefer evidence over speculation. For crashes or "not working" reports, inspect logs first. `aida_debug.log` is the canonical evidence source for license/chat/anti-tamper state; grep `arc_loaded=`, `arc_grace=`, `validated=`, gate slot checks, and heartbeat status before forming a diagnosis.
 - If something is crashing or behavior is unclear, add comprehensive debug logging in the narrow path, rebuild, and ask the user to run the rebuilt binary and paste the output.
+- For crashes, BSODs, hangs, startup stalls, loader stalls, Runtime Integrity Lock failures, and any other not-working report, do not diagnose from code structure, intuition, or PDB/symbol guesses alone. Treat logs, dumps, and explicit breadcrumbs as the source of truth. If the existing logs do not identify the exact failing call and state, first add narrow, extremely comprehensive debug logging around the confirmed evidence window, rebuild, and ask the user to reproduce with the rebuilt binary.
+- Crash logging must capture entry/exit, PID, TID, timestamps, elapsed durations, phase/step names, module base/end, VA/RVA/size/protection/state for memory operations, Win32 last-error/NTSTATUS values, IOCTL inputs/results, and before/after state for guard pages, `VirtualProtect`/`NtProtectVirtualMemory`, driver calls, anti-tamper gates, and background work items.
+- Do not claim root cause for crashes unless the logs or dump prove it. Use "first confirmed failure marker" or "current evidence window" when the evidence is not yet conclusive, and keep adding breadcrumbs until the failing call is proven.
 
 Useful files:
 1. `C:\Users\ruar1337\AiDAPrivate\sys_to_hex.py`

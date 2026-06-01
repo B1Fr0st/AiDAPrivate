@@ -24,7 +24,8 @@ namespace dispatch_guard {
     inline volatile LONG g_module_list_initialized = 0;
 
     __forceinline bool init_module_list(PDRIVER_OBJECT sentinel_driver_object) {
-        SN_LOG("dispatch_guard::init_module_list: driver_object=%p", sentinel_driver_object);
+        SN_LOG("dispatch_guard::init_module_list: driver_object_present=%u",
+            sentinel_driver_object != nullptr ? 1u : 0u);
         if (!sentinel_driver_object || !_MmIsAddressValid(sentinel_driver_object)) {
             SN_LOG("dispatch_guard::init_module_list: FAIL - invalid driver object");
             return false;
@@ -41,7 +42,7 @@ namespace dispatch_guard {
             sentinel_driver_object->DriverSection);
         g_module_list_head = &ldr->InLoadOrderModuleList;
         _InterlockedExchange(&g_module_list_initialized, 1);
-        SN_LOG("dispatch_guard::init_module_list: SUCCESS list_head=%p", g_module_list_head);
+        SN_LOG("dispatch_guard::init_module_list: SUCCESS list_head_present=%u", g_module_list_head != nullptr ? 1u : 0u);
         return true;
     }
 
@@ -155,7 +156,7 @@ namespace dispatch_guard {
     }
 
     __forceinline bool snapshot(PDRIVER_OBJECT driver_object) {
-        SN_LOG("dispatch_guard::snapshot: driver_object=%p", driver_object);
+        SN_LOG("dispatch_guard::snapshot: driver_object_present=%u", driver_object != nullptr ? 1u : 0u);
         if (!driver_object || !_MmIsAddressValid(driver_object)) {
             SN_LOG("dispatch_guard::snapshot: FAIL - invalid driver object");
             return false;
@@ -209,7 +210,7 @@ namespace dispatch_guard {
         if (!drv_obj || !_MmIsAddressValid(drv_obj))
             return true;
 
-        SN_LOG("dispatch_guard::verify: checking driver_object=%p", drv_obj);
+        SN_LOG("dispatch_guard::verify: checking driver_object_present=1");
 
 
         module_range_t mod_cache[MAX_CACHED_MODULES];

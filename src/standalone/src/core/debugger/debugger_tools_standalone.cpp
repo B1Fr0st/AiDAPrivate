@@ -17,13 +17,20 @@
 #include "pe_parser.hpp"
 #include "code_patcher.hpp"
 #include "stealth_engine.hpp"
+#include "../editor/expression_eval.hpp"
 #include "../../helpers/diag_log.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <cctype>
+#include <cstdio>
 #include <cstdint>
+#include <cstring>
+#include <limits>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -299,6 +306,796 @@ static int int_param_clamped(const json& params, const char* key, int fallback, 
 static bool deadline_expired(const std::chrono::steady_clock::time_point& deadline)
 {
     return std::chrono::steady_clock::now() >= deadline || mcp_standalone::current_call_cancelled();
+}
+
+static std::string lower_ascii(std::string s)
+{
+    for (char& c : s)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+static std::string trim_ascii(std::string s)
+{
+    auto is_ws = [](char c) {
+        return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+    };
+    while (!s.empty() && is_ws(s.front()))
+        s.erase(s.begin());
+    while (!s.empty() && is_ws(s.back()))
+        s.pop_back();
+    return s;
+}
+
+static std::optional<std::uint64_t> parse_u64_json(const json& value)
+{
+    if (value.is_number_unsigned())
+        return value.get<std::uint64_t>();
+    if (value.is_number_integer()) {
+        const auto raw = value.get<std::int64_t>();
+        if (raw < 0)
+            return std::nullopt;
+        return static_cast<std::uint64_t>(raw);
+    }
+    if (value.is_string())
+        return sa_parse_address(value.get<std::string>());
+    if (value.is_object() && value.contains("value"))
+        return parse_u64_json(value["value"]);
+    return std::nullopt;
+}
+
+static std::optional<std::uint64_t> parse_u64_param(const json& params, const char* key)
+{
+    if (!params.contains(key))
+        return std::nullopt;
+    return parse_u64_json(params[key]);
+}
+
+static std::string bytes_to_hex(const std::vector<std::uint8_t>& bytes, std::size_t limit = std::numeric_limits<std::size_t>::max())
+{
+    const std::size_t count = std::min(bytes.size(), limit);
+    std::string hex;
+    hex.reserve(count * 3);
+    char buf[4] = {};
+    for (std::size_t i = 0; i < count; ++i) {
+        if (i != 0)
+            hex.push_back(' ');
+        std::snprintf(buf, sizeof(buf), "%02X", static_cast<unsigned>(bytes[i]));
+        hex.append(buf, 2);
+    }
+    return hex;
+}
+
+static std::string bytes_to_hex(const std::uint8_t* bytes, std::size_t size)
+{
+    std::vector<std::uint8_t> tmp(bytes, bytes + size);
+    return bytes_to_hex(tmp);
+}
+
+static bool parse_protection_value(const json& params, std::uint32_t& protect, std::string& normalized, std::string& error)
+{
+    protect = PAGE_EXECUTE_READWRITE;
+    normalized = OBFSTR("PAGE_EXECUTE_READWRITE");
+
+    if (!params.contains("protection"))
+        return true;
+
+    const auto& value = params["protection"];
+    if (auto numeric = parse_u64_json(value)) {
+        if (*numeric == 0 || *numeric > 0xFFFFFFFFULL) {
+            error = OBFSTR("Invalid PAGE_* protection value.");
+            return false;
+        }
+        protect = static_cast<std::uint32_t>(*numeric);
+        normalized = debugger_engine::format_protect(protect);
+        return true;
+    }
+
+    if (!value.is_string()) {
+        error = OBFSTR("'protection' must be a PAGE_* string or numeric Win32 constant.");
+        return false;
+    }
+
+    std::string text = lower_ascii(trim_ascii(value.get<std::string>()));
+    if (text.empty()) {
+        error = OBFSTR("'protection' cannot be empty.");
+        return false;
+    }
+
+    for (char& c : text) {
+        if (c == '|' || c == '+' || c == ',')
+            c = ' ';
+    }
+
+    std::uint32_t base = 0;
+    std::uint32_t modifiers = 0;
+    std::istringstream iss(text);
+    std::string token;
+    while (iss >> token) {
+        if (token.rfind("page_", 0) == 0)
+            token.erase(0, 5);
+
+        std::uint32_t token_value = 0;
+        bool is_modifier = false;
+        if (token == "noaccess" || token == "none") token_value = PAGE_NOACCESS;
+        else if (token == "readonly" || token == "read" || token == "r") token_value = PAGE_READONLY;
+        else if (token == "readwrite" || token == "rw") token_value = PAGE_READWRITE;
+        else if (token == "writecopy" || token == "wc") token_value = PAGE_WRITECOPY;
+        else if (token == "execute" || token == "x") token_value = PAGE_EXECUTE;
+        else if (token == "execute_read" || token == "executeread" || token == "rx" || token == "xr") token_value = PAGE_EXECUTE_READ;
+        else if (token == "execute_readwrite" || token == "executereadwrite" || token == "rwx" || token == "xrw") token_value = PAGE_EXECUTE_READWRITE;
+        else if (token == "execute_writecopy" || token == "executewritecopy") token_value = PAGE_EXECUTE_WRITECOPY;
+        else if (token == "guard") { token_value = PAGE_GUARD; is_modifier = true; }
+        else if (token == "nocache") { token_value = PAGE_NOCACHE; is_modifier = true; }
+        else if (token == "writecombine") { token_value = PAGE_WRITECOMBINE; is_modifier = true; }
+        else if (auto parsed = sa_parse_address(token)) token_value = static_cast<std::uint32_t>(*parsed);
+        else {
+            error = OBFSTR("Unsupported protection token: ") + token;
+            return false;
+        }
+
+        if (is_modifier)
+            modifiers |= token_value;
+        else {
+            if (base != 0 && token_value != base) {
+                error = OBFSTR("Specify only one base PAGE_* protection.");
+                return false;
+            }
+            base = token_value;
+        }
+    }
+
+    if (base == 0) {
+        error = OBFSTR("Missing base PAGE_* protection.");
+        return false;
+    }
+
+    protect = base | modifiers;
+    normalized = debugger_engine::format_protect(protect);
+    return true;
+}
+
+static std::optional<std::string> canonical_mutable_register(std::string name)
+{
+    name = lower_ascii(trim_ascii(std::move(name)));
+    static const std::array<const char*, 18> regs = {
+        "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+        "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+        "rip", "rflags"
+    };
+    if (name == "eflags")
+        return std::string("rflags");
+    for (const char* reg : regs) {
+        if (name == reg)
+            return name;
+    }
+    return std::nullopt;
+}
+
+static bool read_register_value(const debugger_engine::register_set_t& regs, const std::string& name, std::uint64_t& out)
+{
+    const std::string lower = lower_ascii(name);
+    if      (lower == "rax") out = regs.rax;
+    else if (lower == "rbx") out = regs.rbx;
+    else if (lower == "rcx") out = regs.rcx;
+    else if (lower == "rdx") out = regs.rdx;
+    else if (lower == "rsi") out = regs.rsi;
+    else if (lower == "rdi") out = regs.rdi;
+    else if (lower == "rbp") out = regs.rbp;
+    else if (lower == "rsp") out = regs.rsp;
+    else if (lower == "r8")  out = regs.r8;
+    else if (lower == "r9")  out = regs.r9;
+    else if (lower == "r10") out = regs.r10;
+    else if (lower == "r11") out = regs.r11;
+    else if (lower == "r12") out = regs.r12;
+    else if (lower == "r13") out = regs.r13;
+    else if (lower == "r14") out = regs.r14;
+    else if (lower == "r15") out = regs.r15;
+    else if (lower == "rip") out = regs.rip;
+    else if (lower == "rflags" || lower == "eflags") out = regs.rflags;
+    else return false;
+    return true;
+}
+
+static json registers_to_json(const debugger_engine::register_set_t& regs)
+{
+    json r;
+    r["rax"] = sa_format_address(regs.rax);
+    r["rbx"] = sa_format_address(regs.rbx);
+    r["rcx"] = sa_format_address(regs.rcx);
+    r["rdx"] = sa_format_address(regs.rdx);
+    r["rsi"] = sa_format_address(regs.rsi);
+    r["rdi"] = sa_format_address(regs.rdi);
+    r["rbp"] = sa_format_address(regs.rbp);
+    r["rsp"] = sa_format_address(regs.rsp);
+    r["r8"]  = sa_format_address(regs.r8);
+    r["r9"]  = sa_format_address(regs.r9);
+    r["r10"] = sa_format_address(regs.r10);
+    r["r11"] = sa_format_address(regs.r11);
+    r["r12"] = sa_format_address(regs.r12);
+    r["r13"] = sa_format_address(regs.r13);
+    r["r14"] = sa_format_address(regs.r14);
+    r["r15"] = sa_format_address(regs.r15);
+    r["rip"] = sa_format_address(regs.rip);
+    r["rflags"] = sa_format_address(regs.rflags);
+    r["flags_decoded"] = debugger_engine::format_flags(regs.rflags);
+    r["cs"] = sa_format_address(regs.cs);
+    r["ss"] = sa_format_address(regs.ss);
+    r["dr0"] = sa_format_address(regs.dr0);
+    r["dr1"] = sa_format_address(regs.dr1);
+    r["dr2"] = sa_format_address(regs.dr2);
+    r["dr3"] = sa_format_address(regs.dr3);
+    r["dr6"] = sa_format_address(regs.dr6);
+    r["dr7"] = sa_format_address(regs.dr7);
+    return r;
+}
+
+static expression_eval::context_t trace_eval_context(const debugger_engine::register_set_t& regs)
+{
+    expression_eval::context_t ctx;
+    ctx.rax = regs.rax; ctx.rbx = regs.rbx; ctx.rcx = regs.rcx; ctx.rdx = regs.rdx;
+    ctx.rsi = regs.rsi; ctx.rdi = regs.rdi; ctx.rbp = regs.rbp; ctx.rsp = regs.rsp;
+    ctx.r8  = regs.r8;  ctx.r9  = regs.r9;  ctx.r10 = regs.r10; ctx.r11 = regs.r11;
+    ctx.r12 = regs.r12; ctx.r13 = regs.r13; ctx.r14 = regs.r14; ctx.r15 = regs.r15;
+    ctx.rip = regs.rip; ctx.rflags = regs.rflags;
+    ctx.read_mem = [](std::uint64_t addr, std::size_t size, void* out) -> bool {
+        if (!out || size == 0)
+            return false;
+        std::vector<std::uint8_t> buf;
+        if (!driver_bridge::read_memory(addr, size, buf) || buf.size() < size)
+            return false;
+        std::memcpy(out, buf.data(), size);
+        return true;
+    };
+    return ctx;
+}
+
+static bool evaluate_trace_condition(const std::string& condition,
+                                     const debugger_engine::register_set_t& regs,
+                                     bool& matched,
+                                     std::string& error)
+{
+    matched = false;
+    if (condition.empty())
+        return true;
+    auto ctx = trace_eval_context(regs);
+    auto er = expression_eval::evaluate(condition, ctx);
+    if (!er.ok) {
+        error = er.error;
+        return false;
+    }
+    matched = er.value != 0;
+    return true;
+}
+
+static std::string zydis_reg_name(std::uint16_t reg)
+{
+    if (reg == static_cast<std::uint16_t>(ZYDIS_REGISTER_NONE))
+        return {};
+    const char* name = ZydisRegisterGetString(static_cast<ZydisRegister>(reg));
+    return name ? std::string(name) : std::string();
+}
+
+static bool zydis_gpr_value(std::uint16_t reg, const debugger_engine::register_set_t& regs, std::uint64_t& out)
+{
+    switch (static_cast<ZydisRegister>(reg)) {
+    case ZYDIS_REGISTER_RAX: case ZYDIS_REGISTER_EAX: out = regs.rax; return true;
+    case ZYDIS_REGISTER_RBX: case ZYDIS_REGISTER_EBX: out = regs.rbx; return true;
+    case ZYDIS_REGISTER_RCX: case ZYDIS_REGISTER_ECX: out = regs.rcx; return true;
+    case ZYDIS_REGISTER_RDX: case ZYDIS_REGISTER_EDX: out = regs.rdx; return true;
+    case ZYDIS_REGISTER_RSI: case ZYDIS_REGISTER_ESI: out = regs.rsi; return true;
+    case ZYDIS_REGISTER_RDI: case ZYDIS_REGISTER_EDI: out = regs.rdi; return true;
+    case ZYDIS_REGISTER_RBP: case ZYDIS_REGISTER_EBP: out = regs.rbp; return true;
+    case ZYDIS_REGISTER_RSP: case ZYDIS_REGISTER_ESP: out = regs.rsp; return true;
+    case ZYDIS_REGISTER_R8:  case ZYDIS_REGISTER_R8D:  out = regs.r8;  return true;
+    case ZYDIS_REGISTER_R9:  case ZYDIS_REGISTER_R9D:  out = regs.r9;  return true;
+    case ZYDIS_REGISTER_R10: case ZYDIS_REGISTER_R10D: out = regs.r10; return true;
+    case ZYDIS_REGISTER_R11: case ZYDIS_REGISTER_R11D: out = regs.r11; return true;
+    case ZYDIS_REGISTER_R12: case ZYDIS_REGISTER_R12D: out = regs.r12; return true;
+    case ZYDIS_REGISTER_R13: case ZYDIS_REGISTER_R13D: out = regs.r13; return true;
+    case ZYDIS_REGISTER_R14: case ZYDIS_REGISTER_R14D: out = regs.r14; return true;
+    case ZYDIS_REGISTER_R15: case ZYDIS_REGISTER_R15D: out = regs.r15; return true;
+    case ZYDIS_REGISTER_RIP: case ZYDIS_REGISTER_EIP: out = regs.rip; return true;
+    default: break;
+    }
+    return false;
+}
+
+static bool decode_trace_instruction(std::uint64_t address, AsmInstr& ins)
+{
+    std::vector<std::uint8_t> code;
+    if (!driver_bridge::read_memory(address, 16, code) || code.empty())
+        return false;
+    ins = zydis_decode_one(code.data(), static_cast<int>(code.size()), address);
+    return true;
+}
+
+static bool compute_effective_address(const AsmInstr& ins,
+                                      const debugger_engine::register_set_t& regs,
+                                      std::uint64_t& out)
+{
+    if (!ins.has_mem_op)
+        return false;
+
+    std::uint64_t total = 0;
+    bool has_component = false;
+
+    if (ins.mem_op.base_reg != static_cast<std::uint16_t>(ZYDIS_REGISTER_NONE)) {
+        std::uint64_t base = 0;
+        if (ins.mem_op.base_reg == static_cast<std::uint16_t>(ZYDIS_REGISTER_RIP) ||
+            ins.mem_op.base_reg == static_cast<std::uint16_t>(ZYDIS_REGISTER_EIP)) {
+            base = regs.rip + static_cast<std::uint64_t>(std::max(ins.len, 0));
+        } else if (!zydis_gpr_value(ins.mem_op.base_reg, regs, base)) {
+            return false;
+        }
+        total += base;
+        has_component = true;
+    }
+
+    if (ins.mem_op.index_reg != static_cast<std::uint16_t>(ZYDIS_REGISTER_NONE)) {
+        std::uint64_t index = 0;
+        if (!zydis_gpr_value(ins.mem_op.index_reg, regs, index))
+            return false;
+        const std::uint8_t scale = ins.mem_op.scale == 0 ? 1 : ins.mem_op.scale;
+        total += index * static_cast<std::uint64_t>(scale);
+        has_component = true;
+    }
+
+    if (ins.mem_op.has_disp || has_component) {
+        total += static_cast<std::uint64_t>(ins.mem_op.disp);
+        out = total;
+        return true;
+    }
+
+    return false;
+}
+
+static json trace_record_to_json(const debugger_engine::trace_record_t& tr)
+{
+    json tj;
+    tj["index"] = tr.index;
+    tj["address"] = sa_format_address(tr.address);
+    tj["rip"] = sa_format_address(tr.regs.rip);
+    tj["disasm"] = tr.disasm_text;
+    tj["instruction"] = tr.disasm_text;
+    tj["registers"] = registers_to_json(tr.regs);
+
+    AsmInstr ins{};
+    if (decode_trace_instruction(tr.address, ins)) {
+        tj["size"] = ins.len;
+        tj["bytes"] = bytes_to_hex(ins.raw, static_cast<std::size_t>(std::clamp(ins.len, 0, 16)));
+        if (ins.has_mem_op) {
+            json mem;
+            mem["has_memory_operand"] = true;
+            mem["base_register"] = zydis_reg_name(ins.mem_op.base_reg);
+            mem["index_register"] = zydis_reg_name(ins.mem_op.index_reg);
+            mem["scale"] = ins.mem_op.scale;
+            mem["displacement"] = ins.mem_op.disp;
+            mem["size_bits"] = ins.mem_op.size;
+            mem["segment"] = zydis_reg_name(ins.mem_op.segment);
+            std::uint64_t effective = 0;
+            if (compute_effective_address(ins, tr.regs, effective)) {
+                mem["effective_address"] = sa_format_address(effective);
+                const std::size_t sample_size = std::min<std::size_t>(16, std::max<std::size_t>(1, (static_cast<std::size_t>(ins.mem_op.size) + 7) / 8));
+                std::vector<std::uint8_t> sample;
+                if (driver_bridge::read_memory(effective, sample_size, sample) && !sample.empty()) {
+                    mem["sample_size"] = sample.size();
+                    mem["sample_hex"] = bytes_to_hex(sample);
+                }
+            }
+            tj["memory_access"] = std::move(mem);
+        }
+    }
+
+    return tj;
+}
+
+struct trace_session_t
+{
+    std::string id;
+    std::uint32_t pid = 0;
+    std::uint32_t tid = 0;
+    std::string condition;
+    std::string stop_reason;
+    std::string error;
+    int max_instructions = 0;
+    int executed_instructions = 0;
+    std::uint32_t timeout_ms = 0;
+    std::uint64_t duration_ms = 0;
+    bool completed = false;
+    bool condition_met = false;
+    bool cancelled = false;
+    bool timed_out = false;
+    std::vector<debugger_engine::trace_record_t> entries;
+};
+
+static std::mutex& trace_session_mutex()
+{
+    static std::mutex m;
+    return m;
+}
+
+static std::map<std::string, trace_session_t>& trace_sessions()
+{
+    static std::map<std::string, trace_session_t> sessions;
+    return sessions;
+}
+
+static std::string next_trace_id_locked()
+{
+    static std::uint64_t next_id = 1;
+    char buf[32] = {};
+    std::snprintf(buf, sizeof(buf), "trace-%06llu", static_cast<unsigned long long>(next_id++));
+    return std::string(buf);
+}
+
+static std::string store_trace_session(trace_session_t session)
+{
+    std::lock_guard<std::mutex> lk(trace_session_mutex());
+    session.id = next_trace_id_locked();
+    const std::string id = session.id;
+    auto& sessions = trace_sessions();
+    sessions[id] = std::move(session);
+    while (sessions.size() > 16)
+        sessions.erase(sessions.begin());
+    return id;
+}
+
+static bool load_trace_session(const std::string& id, trace_session_t& out)
+{
+    std::lock_guard<std::mutex> lk(trace_session_mutex());
+    auto& sessions = trace_sessions();
+    auto it = sessions.find(id);
+    if (it == sessions.end())
+        return false;
+    out = it->second;
+    return true;
+}
+
+static tool_result_t handle_debugger_set_register(const json& params, bool allow_value_alias)
+{
+    diag::log_tagged_fmt("dbg_tools", "debugger_set_register: entry");
+    if (auto err = ensure_attached(params))
+        return *err;
+
+    auto tid = parse_tid(params);
+    if (!tid)
+        return tool_result_t::error(OBFSTR("'tid' is required."));
+    if (!params.contains("register") || !params["register"].is_string())
+        return tool_result_t::error(OBFSTR("'register' is required."));
+
+    const char* value_key = nullptr;
+    if (params.contains("hex_value"))
+        value_key = "hex_value";
+    else if (allow_value_alias && params.contains("value"))
+        value_key = "value";
+    if (!value_key)
+        return tool_result_t::error(allow_value_alias ? OBFSTR("'hex_value' or 'value' is required.") : OBFSTR("'hex_value' is required."));
+
+    auto value = parse_u64_json(params[value_key]);
+    if (!value)
+        return tool_result_t::error(OBFSTR("Invalid register value."));
+
+    auto reg = canonical_mutable_register(params["register"].get<std::string>());
+    if (!reg)
+        return tool_result_t::error(OBFSTR("Unsupported register. Use a 64-bit general register, RIP, RSP, RBP, or RFLAGS."));
+
+    debugger_engine::g_state.active_tid = *tid;
+    auto before_regs = debugger_engine::get_registers();
+    std::uint64_t before_value = 0;
+    read_register_value(before_regs, *reg, before_value);
+
+    diag::log_tagged_fmt("dbg_tools", "debugger_set_register: tid=%u reg=%s value=0x%llX",
+        *tid, reg->c_str(), static_cast<unsigned long long>(*value));
+    if (!debugger_engine::set_register(*reg, *value)) {
+        const std::string detail = debugger_engine::last_error().empty()
+            ? OBFSTR("debugger_engine::set_register failed.")
+            : debugger_engine::last_error();
+        diag::log_tagged_fmt("dbg_tools", "debugger_set_register: failed tid=%u reg=%s detail=%s",
+            *tid, reg->c_str(), detail.c_str());
+        return tool_result_t::error(detail);
+    }
+
+    auto after_regs = debugger_engine::get_registers();
+    std::uint64_t after_value = 0;
+    read_register_value(after_regs, *reg, after_value);
+
+    json result;
+    result["tid"] = *tid;
+    result["register"] = *reg;
+    result["before"] = sa_format_address(before_value);
+    result["after"] = sa_format_address(after_value);
+    result["requested"] = sa_format_address(*value);
+    result["registers"] = registers_to_json(after_regs);
+    return tool_result_t::ok(OBFSTR("Register updated."), result);
+}
+
+static tool_result_t handle_debugger_allocate_memory(const json& params)
+{
+    diag::log_tagged_fmt("dbg_tools", "debugger_allocate_memory: entry");
+    if (auto err = ensure_attached(params))
+        return *err;
+
+    auto size_value = parse_u64_param(params, "size");
+    if (!size_value)
+        return tool_result_t::error(OBFSTR("'size' is required."));
+    constexpr std::uint64_t kMaxAlloc = 64ULL * 1024ULL * 1024ULL;
+    if (*size_value == 0 || *size_value > kMaxAlloc)
+        return tool_result_t::error(OBFSTR("'size' must be between 1 byte and 64 MiB."));
+
+    std::uint32_t protect = 0;
+    std::string protect_name;
+    std::string protect_error;
+    if (!parse_protection_value(params, protect, protect_name, protect_error))
+        return tool_result_t::error(protect_error);
+
+    const std::size_t size = static_cast<std::size_t>(*size_value);
+    const std::uint64_t remote = driver_bridge::allocate_memory(size);
+    diag::log_tagged_fmt("dbg_tools", "debugger_allocate_memory: size=%zu protect=0x%X addr=0x%llX",
+        size, protect, static_cast<unsigned long long>(remote));
+    if (remote == 0)
+        return tool_result_t::error(OBFSTR("driver_bridge::allocate_memory failed: ") + driver_bridge::last_error());
+
+    std::uint32_t old_protect = 0;
+    if (!driver_bridge::protect_memory(remote, size, protect, &old_protect)) {
+        const std::string detail = driver_bridge::last_error();
+        driver_bridge::free_memory(remote);
+        diag::log_tagged_fmt("dbg_tools", "debugger_allocate_memory: protect failed addr=0x%llX detail=%s",
+            static_cast<unsigned long long>(remote), detail.c_str());
+        return tool_result_t::error(OBFSTR("Memory allocated but protection update failed; allocation was freed: ") + detail);
+    }
+
+    json result;
+    result["address"] = sa_format_address(remote);
+    result["size"] = size;
+    result["protection"] = protect_name;
+    result["protection_value"] = sa_format_address(protect);
+    result["old_protection"] = debugger_engine::format_protect(old_protect);
+    result["pid"] = driver_bridge::attached_pid();
+    return tool_result_t::ok(OBFSTR("Memory allocated."), result);
+}
+
+static tool_result_t handle_debugger_call_function(const json& params)
+{
+    diag::log_tagged_fmt("dbg_tools", "debugger_call_function: entry");
+    if (auto err = ensure_attached(params))
+        return *err;
+    if (!driver_bridge::using_kernel_driver())
+        return tool_result_t::error(OBFSTR("Remote function calls require the kernel driver backend."));
+
+    auto address = parse_u64_param(params, "address");
+    if (!address || *address == 0)
+        return tool_result_t::error(OBFSTR("'address' must be a nonzero function address."));
+
+    std::string cc = OBFSTR("win64");
+    if (params.contains("calling_convention")) {
+        if (!params["calling_convention"].is_string())
+            return tool_result_t::error(OBFSTR("'calling_convention' must be a string."));
+        cc = lower_ascii(trim_ascii(params["calling_convention"].get<std::string>()));
+    }
+
+    if (!(cc.empty() || cc == "win64" || cc == "x64" || cc == "ms_x64" || cc == "fastcall" || cc == "default"))
+        return tool_result_t::error(OBFSTR("Only the Windows x64 calling convention is supported by this target."));
+
+    std::array<std::uint64_t, 4> args = {0, 0, 0, 0};
+    std::size_t arg_count = 0;
+    if (params.contains("args")) {
+        if (!params["args"].is_array())
+            return tool_result_t::error(OBFSTR("'args' must be an array."));
+        if (params["args"].size() > args.size())
+            return tool_result_t::error(OBFSTR("This remote-call primitive accepts up to 4 integer/pointer arguments."));
+        for (const auto& item : params["args"]) {
+            auto parsed = parse_u64_json(item);
+            if (!parsed)
+                return tool_result_t::error(OBFSTR("Invalid argument value."));
+            args[arg_count++] = *parsed;
+        }
+    }
+
+    diag::log_tagged_fmt("dbg_tools", "debugger_call_function: address=0x%llX argc=%zu",
+        static_cast<unsigned long long>(*address), arg_count);
+    const std::uint64_t ret = driver_bridge::call_function(*address, args[0], args[1], args[2], args[3]);
+
+    json arg_json = json::array();
+    for (std::size_t i = 0; i < arg_count; ++i)
+        arg_json.push_back(sa_format_address(args[i]));
+
+    json result;
+    result["address"] = sa_format_address(*address);
+    result["calling_convention"] = cc.empty() ? OBFSTR("win64") : cc;
+    result["args"] = std::move(arg_json);
+    result["return_value"] = sa_format_address(ret);
+    result["rax"] = sa_format_address(ret);
+    result["pid"] = driver_bridge::attached_pid();
+    return tool_result_t::ok(OBFSTR("Function call completed."), result);
+}
+
+static tool_result_t handle_debugger_start_trace(const json& params)
+{
+    diag::log_tagged_fmt("dbg_tools", "debugger_start_trace: entry");
+    if (auto err = ensure_attached(params))
+        return *err;
+
+    auto tid = parse_tid(params);
+    if (!tid)
+        return tool_result_t::error(OBFSTR("'tid' is required."));
+
+    int max_instructions = int_param_clamped(params, "max_instructions", 256, 1, 4096);
+    if (!params.contains("max_instructions") && params.contains("max_records"))
+        max_instructions = int_param_clamped(params, "max_records", max_instructions, 1, 4096);
+    const int timeout_ms_i = int_param_clamped(params, "timeout_ms", 30000, 100, 120000);
+    const std::uint32_t timeout_ms = static_cast<std::uint32_t>(timeout_ms_i);
+
+    std::string condition;
+    if (params.contains("condition")) {
+        if (!params["condition"].is_string())
+            return tool_result_t::error(OBFSTR("'condition' must be a string expression."));
+        condition = trim_ascii(params["condition"].get<std::string>());
+        if (condition.size() > 512)
+            return tool_result_t::error(OBFSTR("'condition' is too long."));
+    }
+
+    debugger_engine::g_state.active_tid = *tid;
+    bool initial_matched = false;
+    std::string condition_error;
+    if (!condition.empty()) {
+        auto initial_regs = debugger_engine::get_registers();
+        if (!evaluate_trace_condition(condition, initial_regs, initial_matched, condition_error))
+            return tool_result_t::error(OBFSTR("Invalid trace condition: ") + condition_error);
+    }
+
+    if (!debugger_engine::start_trace(max_instructions))
+        return tool_result_t::error(OBFSTR("Trace is already active."));
+
+    trace_session_t session;
+    session.pid = driver_bridge::attached_pid();
+    session.tid = *tid;
+    session.condition = condition;
+    session.max_instructions = max_instructions;
+    session.timeout_ms = timeout_ms;
+    session.stop_reason = OBFSTR("max_instructions");
+
+    const auto started = std::chrono::steady_clock::now();
+    const auto deadline = started + std::chrono::milliseconds(timeout_ms);
+
+    if (initial_matched) {
+        session.completed = true;
+        session.condition_met = true;
+        session.stop_reason = OBFSTR("condition");
+    } else {
+        for (int i = 0; i < max_instructions; ++i) {
+            if (mcp_standalone::current_call_cancelled()) {
+                session.cancelled = true;
+                session.stop_reason = OBFSTR("cancelled");
+                break;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                session.timed_out = true;
+                session.stop_reason = OBFSTR("timeout");
+                break;
+            }
+
+            if (!debugger_engine::step_into()) {
+                session.error = debugger_engine::last_error().empty()
+                    ? OBFSTR("step_into failed.")
+                    : debugger_engine::last_error();
+                session.stop_reason = OBFSTR("step_failed");
+                break;
+            }
+
+            ++session.executed_instructions;
+
+            if (std::chrono::steady_clock::now() >= deadline) {
+                session.timed_out = true;
+                session.stop_reason = OBFSTR("timeout");
+                break;
+            }
+
+            if (!condition.empty()) {
+                bool matched = false;
+                auto regs = debugger_engine::get_registers();
+                if (!evaluate_trace_condition(condition, regs, matched, condition_error)) {
+                    session.error = OBFSTR("Trace condition evaluation failed: ") + condition_error;
+                    session.stop_reason = OBFSTR("condition_error");
+                    break;
+                }
+                if (matched) {
+                    session.condition_met = true;
+                    session.completed = true;
+                    session.stop_reason = OBFSTR("condition");
+                    break;
+                }
+            }
+        }
+
+        if (session.executed_instructions >= max_instructions) {
+            session.completed = true;
+            session.stop_reason = OBFSTR("max_instructions");
+        }
+    }
+
+    debugger_engine::stop_trace();
+
+    {
+        std::lock_guard<std::mutex> lk(debugger_engine::g_state.trace_mutex);
+        session.entries = debugger_engine::g_state.trace_log;
+    }
+
+    session.duration_ms = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count());
+
+    const std::string trace_id = store_trace_session(std::move(session));
+    trace_session_t stored;
+    load_trace_session(trace_id, stored);
+
+    diag::log_tagged_fmt("dbg_tools", "debugger_start_trace: id=%s tid=%u entries=%zu reason=%s duration_ms=%llu",
+        trace_id.c_str(), *tid, stored.entries.size(), stored.stop_reason.c_str(),
+        static_cast<unsigned long long>(stored.duration_ms));
+
+    json result;
+    result["trace_id"] = trace_id;
+    result["pid"] = stored.pid;
+    result["tid"] = stored.tid;
+    result["entries"] = stored.entries.size();
+    result["executed_instructions"] = stored.executed_instructions;
+    result["max_instructions"] = stored.max_instructions;
+    result["stop_reason"] = stored.stop_reason;
+    result["completed"] = stored.completed;
+    result["condition_met"] = stored.condition_met;
+    result["cancelled"] = stored.cancelled;
+    result["timed_out"] = stored.timed_out;
+    result["duration_ms"] = stored.duration_ms;
+    if (!stored.condition.empty())
+        result["condition"] = stored.condition;
+    if (!stored.error.empty())
+        result["error"] = stored.error;
+    return tool_result_t::ok(OBFSTR("Trace recorded."), result);
+}
+
+static tool_result_t handle_debugger_get_trace(const json& params)
+{
+    diag::log_tagged_fmt("dbg_tools", "debugger_get_trace: entry");
+    if (!params.contains("trace_id") || !params["trace_id"].is_string())
+        return tool_result_t::error(OBFSTR("'trace_id' is required."));
+
+    const std::string trace_id = params["trace_id"].get<std::string>();
+    trace_session_t session;
+    if (!load_trace_session(trace_id, session))
+        return tool_result_t::error(OBFSTR("Trace ID not found."));
+
+    const int offset = int_param_clamped(params, "offset", 0, 0, static_cast<int>(std::min<std::size_t>(session.entries.size(), 1000000)));
+    const int limit = int_param_clamped(params, "limit", 200, 1, 1000);
+
+    json entries = json::array();
+    const int end = std::min<int>(static_cast<int>(session.entries.size()), offset + limit);
+    for (int i = offset; i < end; ++i)
+        entries.push_back(trace_record_to_json(session.entries[static_cast<std::size_t>(i)]));
+
+    json result;
+    result["trace_id"] = session.id;
+    result["pid"] = session.pid;
+    result["tid"] = session.tid;
+    result["total"] = session.entries.size();
+    result["offset"] = offset;
+    result["returned"] = entries.size();
+    result["executed_instructions"] = session.executed_instructions;
+    result["max_instructions"] = session.max_instructions;
+    result["timeout_ms"] = session.timeout_ms;
+    result["duration_ms"] = session.duration_ms;
+    result["stop_reason"] = session.stop_reason;
+    result["completed"] = session.completed;
+    result["condition_met"] = session.condition_met;
+    result["cancelled"] = session.cancelled;
+    result["timed_out"] = session.timed_out;
+    if (!session.condition.empty())
+        result["condition"] = session.condition;
+    if (!session.error.empty())
+        result["error"] = session.error;
+    result["entries"] = std::move(entries);
+    diag::log_tagged_fmt("dbg_tools", "debugger_get_trace: id=%s total=%zu returned=%zu",
+        trace_id.c_str(), session.entries.size(), result["returned"].get<std::size_t>());
+    return tool_result_t::ok(OBFSTR("Trace returned."), result);
 }
 
 
@@ -1479,6 +2276,52 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         }
     });
 
+    register_compat(srv, {
+        OBFSTR("debugger_set_register"), OBFSTR("debugger"),
+        OBFSTR("Set a CPU register for a specific target thread. Accepts 64-bit GPR names, RIP, RSP, RBP, and RFLAGS."),
+        {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID"), true},
+         {OBFSTR("register"), OBFSTR("string"), OBFSTR("Register name such as RAX, RCX, RIP, RSP, or RFLAGS"), true},
+         {OBFSTR("hex_value"), OBFSTR("string"), OBFSTR("New register value as hex or decimal"), true},
+         {OBFSTR("target_pid"), OBFSTR("number"), OBFSTR("Optional PID override. Switches the active attach context for this call."), false}},
+        [](const json& params) -> tool_result_t {
+            return handle_debugger_set_register(params, false);
+        }, false});
+
+    register_compat(srv, {
+        OBFSTR("debugger_allocate_memory"), OBFSTR("debugger"),
+        OBFSTR("Allocate memory in the attached process and apply a Win32 PAGE_* protection such as PAGE_EXECUTE_READWRITE."),
+        {{OBFSTR("size"), OBFSTR("number"), OBFSTR("Allocation size in bytes, capped at 64 MiB"), true},
+         {OBFSTR("protection"), OBFSTR("string"), OBFSTR("PAGE_* protection string or numeric constant; default PAGE_EXECUTE_READWRITE"), false},
+         {OBFSTR("target_pid"), OBFSTR("number"), OBFSTR("Optional PID override. Switches the active attach context for this call."), false}},
+        handle_debugger_allocate_memory, false});
+
+    register_compat(srv, {
+        OBFSTR("debugger_call_function"), OBFSTR("debugger"),
+        OBFSTR("Execute a function inside the attached x64 target with up to four integer or pointer arguments and return RAX."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address to call"), true},
+         {OBFSTR("calling_convention"), OBFSTR("string"), OBFSTR("Calling convention, currently Windows x64 only"), false},
+         {OBFSTR("args"), OBFSTR("array"), OBFSTR("Array of up to four integer or pointer arguments"), false},
+         {OBFSTR("target_pid"), OBFSTR("number"), OBFSTR("Optional PID override. Switches the active attach context for this call."), false}},
+        handle_debugger_call_function, false});
+
+    register_compat(srv, {
+        OBFSTR("debugger_start_trace"), OBFSTR("debugger"),
+        OBFSTR("Record a bounded synchronous single-step trace for a thread until max_instructions, timeout, cancellation, or a condition expression is reached."),
+        {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID"), true},
+         {OBFSTR("max_instructions"), OBFSTR("number"), OBFSTR("Maximum instructions to single-step, default 256, cap 4096"), false},
+         {OBFSTR("condition"), OBFSTR("string"), OBFSTR("Optional expression such as 'rip == 0x140001000' or 'rax == 0'"), false},
+         {OBFSTR("timeout_ms"), OBFSTR("number"), OBFSTR("Overall trace timeout, default 30000, cap 120000"), false},
+         {OBFSTR("target_pid"), OBFSTR("number"), OBFSTR("Optional PID override. Switches the active attach context for this call."), false}},
+        handle_debugger_start_trace, false});
+
+    register_compat(srv, {
+        OBFSTR("debugger_get_trace"), OBFSTR("debugger"),
+        OBFSTR("Return a recorded debugger_start_trace log with registers, flags, disassembly, and practical memory operand metadata."),
+        {{OBFSTR("trace_id"), OBFSTR("string"), OBFSTR("Trace ID returned by debugger_start_trace"), true},
+         {OBFSTR("offset"), OBFSTR("number"), OBFSTR("Start entry offset, default 0"), false},
+         {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum entries to return, default 200, cap 1000"), false}},
+        handle_debugger_get_trace, true});
+
     srv.register_tool({
         "debugger_get_breakpoints",
         "List every breakpoint tracked by the debugger engine, including disabled and one-shot entries.",
@@ -2159,20 +3002,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
          {OBFSTR("value"), OBFSTR("string"), OBFSTR("New value (hex)"), true},
          {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         [](const json& params) -> tool_result_t {
-            diag::log_tagged_fmt("dbg_tools", "dbg_set_register: entry");
-            if (auto err = ensure_attached(params)) return *err;
-            auto tid = parse_tid(params);
-            if (!tid) return tool_result_t::error(OBFSTR("'tid' is required."));
-            if (!params.contains("register") || !params.contains("value"))
-                return tool_result_t::error(OBFSTR("'register' and 'value' required."));
-            auto val = sa_parse_address(params["value"].get<std::string>());
-            if (!val) return tool_result_t::error(OBFSTR("Invalid value."));
-            const std::string reg_name = params["register"].get<std::string>();
-            diag::log_tagged_fmt("dbg_tools", "dbg_set_register: tid=%u reg=%s val=0x%llX", *tid, reg_name.c_str(), (unsigned long long)*val);
-            debugger_engine::g_state.active_tid = *tid;
-            debugger_engine::set_register(reg_name, *val);
-            diag::log_tagged_fmt("dbg_tools", "dbg_set_register: set_register done");
-            return tool_result_t::ok(OBFSTR("Register set."));
+            return handle_debugger_set_register(params, true);
         }, false});
 
     register_compat(srv, {

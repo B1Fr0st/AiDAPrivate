@@ -18,7 +18,7 @@ static void KDbgLog(const char* func, const char* fmt, ...) {
     fflush(stdout);
     OutputDebugStringA(buf);
     OutputDebugStringA("\n");
-    if (g_LogFile) { fprintf(g_LogFile, "%s\n", buf); fflush(g_LogFile); }
+    if (g_LogFile) { fprintf(g_LogFile, "%s\n", buf); FlushMapperLogFile(); }
 }
 #define KLOG(fmt, ...) KDbgLog(__FUNCTION__, fmt, ##__VA_ARGS__)
 #define KLOG_STATUS(msg, st) KDbgLog(__FUNCTION__, "%s: 0x%08X (%s)", msg, (DWORD)(st), NT_SUCCESS(st) ? "SUCCESS" : "FAILED")

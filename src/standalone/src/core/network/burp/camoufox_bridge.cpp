@@ -22,7 +22,9 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <cwctype>
 #include <cstring>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -179,6 +181,14 @@ std::vector<std::wstring> runtime_base_dirs()
     return bases;
 }
 
+std::wstring local_appdata_aida_root()
+{
+    wchar_t root[MAX_PATH] = {};
+    DWORD got = GetEnvironmentVariableW(L"LOCALAPPDATA", root, MAX_PATH);
+    if (got == 0 || got >= MAX_PATH) return {};
+    return join_path_w(root, L"AiDA");
+}
+
 void append_bundled_python_candidates(std::vector<std::string>& candidates)
 {
     std::vector<std::wstring> rels = {
@@ -199,6 +209,14 @@ void append_bundled_python_candidates(std::vector<std::string>& candidates)
                 candidates.push_back(wide_to_utf8(candidate));
         }
     }
+}
+
+void append_app_local_python_candidates(std::vector<std::string>& candidates)
+{
+    std::wstring root = local_appdata_aida_root();
+    if (root.empty()) return;
+    std::wstring exact = join_path_w(join_path_w(join_path_w(join_path_w(root, L"runtimes"), L"python"), L"Python312-3.12.10-x64"), L"python.exe");
+    if (path_exists_w(exact)) candidates.push_back(wide_to_utf8(exact));
 }
 
 bool try_search_path(const wchar_t* exe_name, std::string& out_path)
@@ -269,12 +287,25 @@ bool try_env_python_root(const wchar_t* env_name, const wchar_t* suffix, std::st
 
 bool try_known_python_roots(std::string& out_path)
 {
+    std::wstring aida_root = local_appdata_aida_root();
+    if (!aida_root.empty() && try_python_directory(join_path_w(join_path_w(aida_root, L"runtimes"), L"python"), out_path)) return true;
     if (try_env_python_root(L"ProgramFiles", L"", out_path)) return true;
     if (try_env_python_root(L"ProgramFiles", L"\\Python", out_path)) return true;
     if (try_env_python_root(L"ProgramFiles(x86)", L"", out_path)) return true;
     if (try_env_python_root(L"ProgramFiles(x86)", L"\\Python", out_path)) return true;
     if (try_env_python_root(L"LOCALAPPDATA", L"\\Programs\\Python", out_path)) return true;
     return false;
+}
+
+bool is_windows_store_python_alias(const std::string& path)
+{
+    std::wstring w = utf8_to_wide(path);
+    if (w.empty()) return false;
+    for (wchar_t& c : w) if (c == L'/') c = L'\\';
+    std::wstring lower = w;
+    std::wstring needle = L"\\microsoft\\windowsapps\\";
+    for (wchar_t& c : lower) c = static_cast<wchar_t>(std::towlower(c));
+    return lower.find(needle) != std::wstring::npos;
 }
 
 bool spawn_capture(const std::string& cmdline, DWORD timeout_ms, DWORD& out_exit_code, std::string& out_stdout)
@@ -550,30 +581,46 @@ bool is_driver_closed_error(const std::string& msg)
 void disconnect_client_async(std::shared_ptr<mcp_client::client_t> cli, const std::string& reason)
 {
     if (!cli) return;
-    std::thread([cli, reason]() {
-        diag::log_tagged_fmt("camoufox", "disconnect_async start reason=%s", reason.c_str());
-        cli->disconnect();
-        diag::log_tagged_fmt("camoufox", "disconnect_async done reason=%s", reason.c_str());
-    }).detach();
+    try {
+        std::thread([cli, reason]() {
+            diag::log_tagged_fmt("camoufox", "disconnect_async start reason=%s", reason.c_str());
+            cli->disconnect();
+            diag::log_tagged_fmt("camoufox", "disconnect_async done reason=%s", reason.c_str());
+        }).detach();
+    } catch (const std::exception& ex) {
+        diag::log_tagged_fmt("camoufox", "disconnect_async_thread_failed reason=%s err=%s",
+            reason.c_str(), ex.what());
+    } catch (...) {
+        diag::log_tagged_fmt("camoufox", "disconnect_async_thread_failed reason=%s",
+            reason.c_str());
+    }
 }
 
 void terminate_process_id_async(uint32_t pid, const std::string& reason)
 {
     if (pid == 0) return;
-    std::thread([pid, reason]() {
-        HANDLE h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, static_cast<DWORD>(pid));
-        if (!h) {
-            diag::log_tagged_fmt("camoufox", "terminate_process open_failed pid=%lu reason=%s gle=%lu",
-                static_cast<unsigned long>(pid), reason.c_str(), static_cast<unsigned long>(GetLastError()));
-            return;
-        }
-        BOOL ok = TerminateProcess(h, 1);
-        DWORD gle = ok ? 0 : GetLastError();
-        WaitForSingleObject(h, 3000);
-        CloseHandle(h);
-        diag::log_tagged_fmt("camoufox", "terminate_process pid=%lu reason=%s ok=%d gle=%lu",
-            static_cast<unsigned long>(pid), reason.c_str(), ok ? 1 : 0, static_cast<unsigned long>(gle));
-    }).detach();
+    try {
+        std::thread([pid, reason]() {
+            HANDLE h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, static_cast<DWORD>(pid));
+            if (!h) {
+                diag::log_tagged_fmt("camoufox", "terminate_process open_failed pid=%lu reason=%s gle=%lu",
+                    static_cast<unsigned long>(pid), reason.c_str(), static_cast<unsigned long>(GetLastError()));
+                return;
+            }
+            BOOL ok = TerminateProcess(h, 1);
+            DWORD gle = ok ? 0 : GetLastError();
+            WaitForSingleObject(h, 3000);
+            CloseHandle(h);
+            diag::log_tagged_fmt("camoufox", "terminate_process pid=%lu reason=%s ok=%d gle=%lu",
+                static_cast<unsigned long>(pid), reason.c_str(), ok ? 1 : 0, static_cast<unsigned long>(gle));
+        }).detach();
+    } catch (const std::exception& ex) {
+        diag::log_tagged_fmt("camoufox", "terminate_process_thread_failed pid=%lu reason=%s err=%s",
+            static_cast<unsigned long>(pid), reason.c_str(), ex.what());
+    } catch (...) {
+        diag::log_tagged_fmt("camoufox", "terminate_process_thread_failed pid=%lu reason=%s",
+            static_cast<unsigned long>(pid), reason.c_str());
+    }
 }
 
 bool parse_text_to_json(const std::string& text, nlohmann::json& out)
@@ -838,11 +885,19 @@ call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::j
         }
         if (timed_out_client)
         {
-            std::thread([timed_out_client, tool_name]() {
-                diag::log_tagged_fmt("camoufox", "timeout_disconnect_async start tool=%s", tool_name.c_str());
-                timed_out_client->disconnect();
-                diag::log_tagged_fmt("camoufox", "timeout_disconnect_async done tool=%s", tool_name.c_str());
-            }).detach();
+            try {
+                std::thread([timed_out_client, tool_name]() {
+                    diag::log_tagged_fmt("camoufox", "timeout_disconnect_async start tool=%s", tool_name.c_str());
+                    timed_out_client->disconnect();
+                    diag::log_tagged_fmt("camoufox", "timeout_disconnect_async done tool=%s", tool_name.c_str());
+                }).detach();
+            } catch (const std::exception& ex) {
+                diag::log_tagged_fmt("camoufox", "timeout_disconnect_thread_failed tool=%s err=%s",
+                    tool_name.c_str(), ex.what());
+            } catch (...) {
+                diag::log_tagged_fmt("camoufox", "timeout_disconnect_thread_failed tool=%s",
+                    tool_name.c_str());
+            }
         }
         publish_state(bridge_state_t::error, std::string("timeout on ") + tool_name);
         sg().total_errors.fetch_add(1, std::memory_order_relaxed);
@@ -978,14 +1033,6 @@ bool prepare_install_for_launch_locked(std::string& python_path)
 
     if (st.state != install::install_state_t::ok)
     {
-        if (st.state == install::install_state_t::missing_python)
-        {
-            sg().last_error = st.last_message.empty() ? install::last_error() : st.last_message;
-            if (sg().last_error.empty()) sg().last_error = "supported Python 3.10-3.13 interpreter not found for Camoufox";
-            diag::log_tagged_fmt("camoufox", "prepare_install_for_launch missing_python err=%s", sg().last_error.c_str());
-            return false;
-        }
-
         std::string setup_log;
         bool ready = false;
         try { ready = install::ensure_ready(setup_log); } catch (...) { ready = false; }
@@ -1018,8 +1065,36 @@ nlohmann::json build_launch_args(const launch_config_t& cfg)
     j["block_images"] = cfg.block_images;
     j["block_webrtc"] = cfg.block_webrtc;
     j["enable_trace"] = cfg.enable_trace;
+    j["window_width"] = cfg.window_width > 0 ? cfg.window_width : 1280;
+    j["window_height"] = cfg.window_height > 0 ? cfg.window_height : 900;
     if (!cfg.proxy.empty()) j["proxy"] = cfg.proxy;
     return j;
+}
+
+int json_int_or(const nlohmann::json& j, const char* key, int fallback)
+{
+    if (!j.is_object()) return fallback;
+    auto it = j.find(key);
+    if (it == j.end()) return fallback;
+    if (it->is_number_integer() || it->is_number_unsigned()) return it->get<int>();
+    if (it->is_number_float()) return static_cast<int>(it->get<double>());
+    return fallback;
+}
+
+double json_double_or(const nlohmann::json& j, const char* key, double fallback)
+{
+    if (!j.is_object()) return fallback;
+    auto it = j.find(key);
+    if (it == j.end() || !it->is_number()) return fallback;
+    return it->get<double>();
+}
+
+std::string json_string_or(const nlohmann::json& j, const char* key, const std::string& fallback)
+{
+    if (!j.is_object()) return fallback;
+    auto it = j.find(key);
+    if (it == j.end() || !it->is_string()) return fallback;
+    return it->get<std::string>();
 }
 
 }
@@ -1027,32 +1102,59 @@ nlohmann::json build_launch_args(const launch_config_t& cfg)
 bool ensure_python_available(std::string& out_python_path)
 {
     diag::log_tagged_fmt("camoufox", "ensure_python_available entry");
-    std::lock_guard<std::recursive_mutex> lk(sg().mtx);
-    if (!sg().cached_python_path.empty() && path_exists_w(utf8_to_wide(sg().cached_python_path)))
+    std::string cached_python_path;
+    {
+        std::lock_guard<std::recursive_mutex> lk(sg().mtx);
+        cached_python_path = sg().cached_python_path;
+    }
+    if (!cached_python_path.empty() && path_exists_w(utf8_to_wide(cached_python_path)))
     {
         std::string reason;
-        if (supported_camoufox_python(sg().cached_python_path, &reason))
+        if (supported_camoufox_python(cached_python_path, &reason))
         {
-            diag::log_tagged_fmt("camoufox", "ensure_python_available cached path=%s %s", sg().cached_python_path.c_str(), reason.c_str());
-            out_python_path = sg().cached_python_path;
+            diag::log_tagged_fmt("camoufox", "ensure_python_available cached path=%s %s", cached_python_path.c_str(), reason.c_str());
+            out_python_path = cached_python_path;
             return true;
         }
         diag::log_tagged_fmt("camoufox", "ensure_python_available cached rejected path=%s reason=%s",
-            sg().cached_python_path.c_str(), reason.c_str());
-        sg().cached_python_path.clear();
+            cached_python_path.c_str(), reason.c_str());
+        {
+            std::lock_guard<std::recursive_mutex> lk(sg().mtx);
+            if (_stricmp(sg().cached_python_path.c_str(), cached_python_path.c_str()) == 0)
+                sg().cached_python_path.clear();
+        }
     }
     std::vector<std::string> candidates;
     append_bundled_python_candidates(candidates);
+    append_app_local_python_candidates(candidates);
     std::string found;
     if (try_search_path(L"python.exe", found)) candidates.push_back(found);
     found.clear();
     if (try_search_path(L"python3.exe", found)) candidates.push_back(found);
     found.clear();
     if (try_known_python_roots(found)) candidates.push_back(found);
-    std::sort(candidates.begin(), candidates.end());
-    candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+    std::vector<std::string> unique_candidates;
+    for (const auto& candidate : candidates)
+    {
+        bool seen = false;
+        for (const auto& existing : unique_candidates)
+        {
+            if (_stricmp(existing.c_str(), candidate.c_str()) == 0)
+            {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) unique_candidates.push_back(candidate);
+    }
+    candidates.swap(unique_candidates);
     for (const std::string& candidate : candidates)
     {
+        if (is_windows_store_python_alias(candidate))
+        {
+            diag::log_tagged_fmt("camoufox", "ensure_python_available rejected path=%s reason=windows store python alias", candidate.c_str());
+            continue;
+        }
         std::string reason;
         if (!supported_camoufox_python(candidate, &reason))
         {
@@ -1060,12 +1162,18 @@ bool ensure_python_available(std::string& out_python_path)
             continue;
         }
         diag::log_tagged_fmt("camoufox", "ensure_python_available found path=%s %s", candidate.c_str(), reason.c_str());
-        sg().cached_python_path = candidate;
+        {
+            std::lock_guard<std::recursive_mutex> lk(sg().mtx);
+            sg().cached_python_path = candidate;
+        }
         out_python_path         = candidate;
         return true;
     }
     diag::log_tagged_fmt("camoufox", "ensure_python_available python_not_found");
-    set_error_locked("supported Python 3.10-3.13 interpreter not found for camoufox");
+    {
+        std::lock_guard<std::recursive_mutex> lk(sg().mtx);
+        set_error_locked("supported Python 3.10-3.13 interpreter not found for camoufox");
+    }
     return false;
 }
 
@@ -1077,8 +1185,9 @@ bool start_bridge(const launch_config_t& cfg)
         diag::log_tagged_fmt("camoufox", "start_bridge forcing_visible requested_headless=1");
         effective_cfg.headless = false;
     }
-    diag::log_tagged_fmt("camoufox", "start_bridge entry headless=%d module=%s",
-        static_cast<int>(effective_cfg.headless), effective_cfg.server_module.c_str());
+    diag::log_tagged_fmt("camoufox", "start_bridge entry headless=%d module=%s window=%dx%d",
+        static_cast<int>(effective_cfg.headless), effective_cfg.server_module.c_str(),
+        effective_cfg.window_width, effective_cfg.window_height);
     std::lock_guard<std::recursive_mutex> lk(sg().mtx);
 
     if (sg().state == bridge_state_t::ready && sg().client)
@@ -1216,6 +1325,12 @@ bool start_bridge(const launch_config_t& cfg)
     sg().active_cfg     = effective_cfg;
 
     nlohmann::json args = build_launch_args(effective_cfg);
+    diag::log_tagged_fmt("camoufox", "launch_browser request headless=%d has_proxy=%d os=%s locale=%s window=%dx%d timeout_ms=%d",
+        static_cast<int>(effective_cfg.headless), static_cast<int>(!effective_cfg.proxy.empty()),
+        (effective_cfg.os.empty() ? "auto" : effective_cfg.os.c_str()),
+        (effective_cfg.locale.empty() ? "auto" : effective_cfg.locale.c_str()),
+        json_int_or(args, "window_width", -1), json_int_or(args, "window_height", -1),
+        effective_cfg.launch_timeout_ms);
     struct launch_state_t
     {
         std::mutex                mtx;
@@ -1229,6 +1344,7 @@ bool start_bridge(const launch_config_t& cfg)
     int launch_wait_ms = effective_cfg.launch_timeout_ms > 0 ? effective_cfg.launch_timeout_ms : 180000;
     if (launch_wait_ms < 15000) launch_wait_ms = 15000;
     if (launch_wait_ms > 240000) launch_wait_ms = 240000;
+    const uint64_t launch_call_start_ms = now_ms();
     bool launch_posted = work_queue::post([launch_state, launch_client, args]() {
         mcp_client::call_result_t r = launch_client->call_tool("launch_browser", args);
         {
@@ -1272,6 +1388,10 @@ bool start_bridge(const launch_config_t& cfg)
         }
         launch = std::move(launch_state->result);
     }
+    const uint64_t launch_elapsed_ms = now_ms() - launch_call_start_ms;
+    diag::log_tagged_fmt("camoufox", "launch_browser response success=%d elapsed_ms=%llu text_len=%zu data_shape=%s error_len=%zu",
+        static_cast<int>(launch.success), static_cast<unsigned long long>(launch_elapsed_ms),
+        launch.text.size(), json_shape(launch.data).c_str(), launch.success ? static_cast<size_t>(0) : launch.text.size());
     if (!launch.success)
     {
         sg().last_error = std::string("launch_browser failed: ") + launch.text;
@@ -1286,6 +1406,31 @@ bool start_bridge(const launch_config_t& cfg)
     }
     nlohmann::json parsed;
     parse_text_to_json(launch.text, parsed);
+    if (parsed.is_object())
+    {
+        const nlohmann::json diagnostics = parsed.contains("diagnostics") && parsed["diagnostics"].is_object()
+            ? parsed["diagnostics"] : nlohmann::json::object();
+        const nlohmann::json window = diagnostics.contains("window") && diagnostics["window"].is_object()
+            ? diagnostics["window"] : nlohmann::json::object();
+        const nlohmann::json bounds = diagnostics.contains("page_bounds") && diagnostics["page_bounds"].is_object()
+            ? diagnostics["page_bounds"] : nlohmann::json::object();
+        const nlohmann::json viewport = diagnostics.contains("viewport") && diagnostics["viewport"].is_object()
+            ? diagnostics["viewport"] : nlohmann::json::object();
+        diag::log_tagged_fmt("camoufox", "launch_browser parsed status=%s diag_elapsed_ms=%d window=%dx%d requested=%dx%d work_area=%dx%d viewport=%dx%d inner=%dx%d outer=%dx%d pos=%d,%d screen=%dx%d avail=%dx%d dpr=%.2f",
+            json_string_or(parsed, "status", "unknown").c_str(),
+            json_int_or(diagnostics, "elapsed_ms", -1),
+            json_int_or(window, "width", -1), json_int_or(window, "height", -1),
+            json_int_or(window, "requested_width", -1), json_int_or(window, "requested_height", -1),
+            json_int_or(window.contains("work_area") && window["work_area"].is_object() ? window["work_area"] : nlohmann::json::object(), "width", -1),
+            json_int_or(window.contains("work_area") && window["work_area"].is_object() ? window["work_area"] : nlohmann::json::object(), "height", -1),
+            json_int_or(viewport, "width", -1), json_int_or(viewport, "height", -1),
+            json_int_or(bounds, "innerWidth", -1), json_int_or(bounds, "innerHeight", -1),
+            json_int_or(bounds, "outerWidth", -1), json_int_or(bounds, "outerHeight", -1),
+            json_int_or(bounds, "screenX", -1), json_int_or(bounds, "screenY", -1),
+            json_int_or(bounds, "screenWidth", -1), json_int_or(bounds, "screenHeight", -1),
+            json_int_or(bounds, "availWidth", -1), json_int_or(bounds, "availHeight", -1),
+            json_double_or(bounds, "devicePixelRatio", 0.0));
+    }
     if (parsed.is_object() && parsed.contains("error") && parsed["error"].is_string())
     {
         sg().last_error = std::string("launch_browser returned error: ") + parsed["error"].get<std::string>();
@@ -1310,26 +1455,43 @@ bool start_bridge(const launch_config_t& cfg)
 bool stop_bridge()
 {
     diag::log_tagged_fmt("camoufox", "stop_bridge entry");
-    std::lock_guard<std::recursive_mutex> lk(sg().mtx);
-    if (sg().state == bridge_state_t::stopped)
+    std::shared_ptr<mcp_client::client_t> cli;
+    bool browser_open = false;
     {
-        diag::log_tagged_fmt("camoufox", "stop_bridge already_stopped");
+        std::unique_lock<std::recursive_mutex> lk(sg().mtx, std::try_to_lock);
+        if (!lk.owns_lock())
+        {
+            diag::log_tagged_fmt("camoufox", "stop_bridge busy_force_reset");
+            publish_state(bridge_state_t::stopped, std::string());
+            return true;
+        }
+        if (sg().state == bridge_state_t::stopped)
+        {
+            diag::log_tagged_fmt("camoufox", "stop_bridge already_stopped");
+            sg().client.reset();
+            return true;
+        }
+        cli = sg().client;
+        browser_open = sg().browser_open;
         sg().client.reset();
-        return true;
-    }
-    if (sg().client && sg().browser_open)
-    {
-        diag::log_tagged_fmt("camoufox", "stop_bridge sending_close_browser");
-        mcp_client::call_result_t r = sg().client->call_tool("close_browser", nlohmann::json::object());
-        (void)r;
-        sg().browser_open    = false;
+        sg().browser_open = false;
         sg().active_page_url.clear();
+        sg().child_pid = 0;
+        sg().state = bridge_state_t::stopped;
+        sg().last_error.clear();
     }
-    if (sg().client) sg().client->disconnect();
-    sg().client.reset();
-    sg().child_pid = 0;
-    sg().state = bridge_state_t::stopped;
-    sg().last_error.clear();
+    if (cli && browser_open)
+    {
+        diag::log_tagged_fmt("camoufox", "stop_bridge sending_close_browser_async");
+        work_queue::post([cli]() {
+            (void)cli->call_tool("close_browser", nlohmann::json::object());
+            cli->disconnect();
+        });
+    }
+    else if (cli)
+    {
+        disconnect_client_async(cli, "stop_bridge");
+    }
     publish_state(bridge_state_t::stopped, std::string());
     diag::log_tagged("camoufox", "bridge stopped");
     return true;
@@ -1475,6 +1637,13 @@ bool navigate(const std::string& url, const std::string& wait_until, int timeout
     a["include_title"]          = false;
     int call_timeout = timeout_ms > 0 ? timeout_ms + 5000 : 35000;
     call_result_t r = call_with_deadline("navigate", a, call_timeout);
+    if (!r.ok && is_driver_closed_error(r.error))
+    {
+        diag::log_tagged_fmt("camoufox", "navigate driver_closed_retry host=%s path=%s err=%s",
+            u.host.c_str(), u.path.c_str(), r.error.c_str());
+        if (ensure_ready())
+            r = call_with_deadline("navigate", a, call_timeout);
+    }
     if (!r.ok)
     {
         diag::log_tagged_fmt("camoufox", "navigate failed host=%s path=%s err=%s", u.host.c_str(), u.path.c_str(), r.error.c_str());
@@ -1702,8 +1871,17 @@ call_result_t get_page_info()
         std::lock_guard<std::recursive_mutex> lk(sg().mtx);
         sg().active_page_url = r.data["url"].get<std::string>();
         const url_log_t u = summarize_url_for_log(sg().active_page_url);
-        diag::log_tagged_fmt("camoufox", "get_page_info ok host=%s path=%s query=%d url_len=%zu",
-            u.host.c_str(), u.path.c_str(), static_cast<int>(u.has_query), u.length);
+        const nlohmann::json bounds = r.data.contains("window_bounds") && r.data["window_bounds"].is_object()
+            ? r.data["window_bounds"] : nlohmann::json::object();
+        diag::log_tagged_fmt("camoufox", "get_page_info ok host=%s path=%s query=%d url_len=%zu viewport=%dx%d inner=%dx%d outer=%dx%d pos=%d,%d screen=%dx%d avail=%dx%d dpr=%.2f",
+            u.host.c_str(), u.path.c_str(), static_cast<int>(u.has_query), u.length,
+            json_int_or(r.data, "viewport_width", -1), json_int_or(r.data, "viewport_height", -1),
+            json_int_or(bounds, "innerWidth", -1), json_int_or(bounds, "innerHeight", -1),
+            json_int_or(bounds, "outerWidth", -1), json_int_or(bounds, "outerHeight", -1),
+            json_int_or(bounds, "screenX", -1), json_int_or(bounds, "screenY", -1),
+            json_int_or(bounds, "screenWidth", -1), json_int_or(bounds, "screenHeight", -1),
+            json_int_or(bounds, "availWidth", -1), json_int_or(bounds, "availHeight", -1),
+            json_double_or(bounds, "devicePixelRatio", 0.0));
     } else {
         diag::log_tagged_fmt("camoufox", "get_page_info ok no_url_in_result");
     }

@@ -6,9 +6,12 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <mutex>
+#include <system_error>
 #include <thread>
 
 #ifdef AIDA_STANDALONE
@@ -604,6 +607,56 @@ namespace detail {
             select_and_install_offset(s);
         }
     }
+
+    inline void log_init_event(const char* message)
+    {
+        char line[512];
+        SYSTEMTIME st{};
+        GetLocalTime(&st);
+        _snprintf_s(line, sizeof(line), _TRUNCATE,
+            "[%02u:%02u:%02u.%03u] [ghost_veh] %s\r\n",
+            static_cast<unsigned>(st.wHour),
+            static_cast<unsigned>(st.wMinute),
+            static_cast<unsigned>(st.wSecond),
+            static_cast<unsigned>(st.wMilliseconds),
+            message ? message : "event=<null>");
+
+        char path[MAX_PATH];
+        DWORD n = GetModuleFileNameA(nullptr, path, MAX_PATH);
+        bool wrote = false;
+        if (n != 0 && n < MAX_PATH)
+        {
+            char* slash = strrchr(path, '\\');
+            if (slash)
+            {
+                slash[1] = '\0';
+                strncat_s(path, MAX_PATH, "aida_debug.log", _TRUNCATE);
+                HANDLE h = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (h != INVALID_HANDLE_VALUE)
+                {
+                    DWORD wr = 0;
+                    wrote = WriteFile(h, line, static_cast<DWORD>(strlen(line)), &wr, nullptr) != FALSE;
+                    CloseHandle(h);
+                }
+            }
+        }
+        OutputDebugStringA(line);
+        (void)wrote;
+    }
+
+    inline void log_init_event_fmt(const char* fmt,
+                                   unsigned long a = 0,
+                                   unsigned long b = 0,
+                                   const char* text = nullptr)
+    {
+        char buf[384];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE, fmt,
+            a,
+            b,
+            text ? text : "");
+        log_init_event(buf);
+    }
 }
 
 inline bool is_active()
@@ -638,13 +691,20 @@ inline bool initialize()
     s.fake_ntdll_ra = detail::pick_ntdll_text_ra();
 
     if (!detail::collect_candidate_offsets(s))
+    {
+        detail::log_init_event("initialize_failed_collect_candidate_offsets");
         return false;
+    }
 
     if (!detail::create_dual_mapping(s, detail::kSectionSize))
+    {
+        detail::log_init_event("initialize_failed_create_dual_mapping");
         return false;
+    }
 
     if (!detail::select_and_install_offset(s))
     {
+        detail::log_init_event("initialize_failed_select_and_install_offset");
         detail::destroy_dual_mapping(s);
         return false;
     }
@@ -655,8 +715,58 @@ inline bool initialize()
     if (s.regen_stop_event == nullptr)
         s.regen_stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 
-    s.regen_thread_running.store(true, std::memory_order_release);
-    s.regen_thread = std::thread(detail::regen_loop);
+    bool regen_started = false;
+    if (s.regen_stop_event == nullptr)
+    {
+        detail::log_init_event_fmt(
+            "regen_event_create_failed gle=%lu flags=0x%lx detail=%s",
+            GetLastError(),
+            detail::ghost_flags_ref().load(std::memory_order_acquire),
+            "static_detour_mode");
+    }
+    else
+    {
+        try
+        {
+            s.regen_thread_running.store(true, std::memory_order_release);
+            s.regen_thread = std::thread(detail::regen_loop);
+            regen_started = true;
+        }
+        catch (const std::system_error& e)
+        {
+            s.regen_thread_running.store(false, std::memory_order_release);
+            detail::log_init_event_fmt(
+                "regen_thread_start_failed system_error=%lu category=%lu what=%s static_detour_mode",
+                static_cast<unsigned long>(e.code().value()),
+                0,
+                e.what());
+        }
+        catch (const std::exception& e)
+        {
+            s.regen_thread_running.store(false, std::memory_order_release);
+            detail::log_init_event_fmt(
+                "regen_thread_start_failed exception=%lu category=%lu what=%s static_detour_mode",
+                0,
+                0,
+                e.what());
+        }
+        catch (...)
+        {
+            s.regen_thread_running.store(false, std::memory_order_release);
+            detail::log_init_event("regen_thread_start_failed unknown_exception static_detour_mode");
+        }
+    }
+
+    if (regen_started)
+    {
+        detail::ghost_flags_ref().store(0x3u, std::memory_order_release);
+        detail::log_init_event("initialize_ok regen=1");
+    }
+    else
+    {
+        detail::ghost_flags_ref().store(0x1u, std::memory_order_release);
+        detail::log_init_event("initialize_ok regen=0 static_detour_mode=1");
+    }
 
     return true;
 }

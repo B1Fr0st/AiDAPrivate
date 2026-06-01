@@ -48,11 +48,43 @@ namespace detail {
         return s_path;
     }
 
-    inline std::mutex& log_mtx()
+    inline std::recursive_mutex& log_mtx()
     {
-        static std::mutex m;
+        static std::recursive_mutex m;
         return m;
     }
+
+    inline bool& log_reentry()
+    {
+        static thread_local bool active = false;
+        return active;
+    }
+
+    struct log_scope
+    {
+        bool entered;
+
+        log_scope() : entered(false)
+        {
+            bool& active = log_reentry();
+            if (!active)
+            {
+                active = true;
+                entered = true;
+            }
+        }
+
+        ~log_scope()
+        {
+            if (entered)
+                log_reentry() = false;
+        }
+
+        explicit operator bool() const
+        {
+            return entered;
+        }
+    };
 
     inline std::atomic<int>& debug_count()
     {
@@ -100,69 +132,83 @@ namespace detail {
 
 inline void write_log(const char* tag, const char* detail)
 {
-    std::lock_guard<std::mutex> lk(detail::log_mtx());
-    HANDLE& hf = detail::log_handle();
-    if (hf == INVALID_HANDLE_VALUE)
+    detail::log_scope scope;
+    if (!scope) return;
+
+    try
     {
-        const char* path = detail::log_path();
-        hf = CreateFileA(path, FILE_APPEND_DATA | SYNCHRONIZE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (hf == INVALID_HANDLE_VALUE) return;
-    }
+        std::lock_guard<std::recursive_mutex> lk(detail::log_mtx());
+        HANDLE& hf = detail::log_handle();
+        if (hf == INVALID_HANDLE_VALUE)
+        {
+            const char* path = detail::log_path();
+            hf = CreateFileA(path, FILE_APPEND_DATA | SYNCHRONIZE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (hf == INVALID_HANDLE_VALUE) return;
+        }
 
-    SYSTEMTIME st{};
-    GetLocalTime(&st);
-    char line[1024];
-    int len = _snprintf_s(line, sizeof(line), _TRUNCATE,
-        "[%02d:%02d:%02d.%03d] [%s] %s\r\n",
-        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
-        tag, detail);
-    if (len > 0) {
-        DWORD written;
-        WriteFile(hf, line, static_cast<DWORD>(len), &written, nullptr);
-
-        char dbg_line[1100];
-        _snprintf_s(dbg_line, sizeof(dbg_line), _TRUNCATE,
-            "[AIDA][%02d:%02d:%02d.%03d] [%s] %s",
+        SYSTEMTIME st{};
+        GetLocalTime(&st);
+        char line[1024];
+        int len = _snprintf_s(line, sizeof(line), _TRUNCATE,
+            "[%02d:%02d:%02d.%03d] [%s] %s\r\n",
             st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
             tag, detail);
-        OutputDebugStringA(dbg_line);
+        if (len > 0) {
+            DWORD written;
+            WriteFile(hf, line, static_cast<DWORD>(len), &written, nullptr);
+
+            char dbg_line[1100];
+            _snprintf_s(dbg_line, sizeof(dbg_line), _TRUNCATE,
+                "[AIDA][%02d:%02d:%02d.%03d] [%s] %s",
+                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+                tag, detail);
+            OutputDebugStringA(dbg_line);
+        }
     }
+    catch (...) {}
 }
 
 inline void write_log_critical(const char* tag, const char* detail)
 {
-    std::lock_guard<std::mutex> lk(detail::log_mtx());
-    const char* path = detail::log_path();
-    HANDLE hf = CreateFileA(path,
-        FILE_APPEND_DATA | SYNCHRONIZE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-        OPEN_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
-        nullptr);
-    if (hf == INVALID_HANDLE_VALUE) return;
+    detail::log_scope scope;
+    if (!scope) return;
 
-    SYSTEMTIME st{};
-    GetLocalTime(&st);
-    char line[2048];
-    int len = _snprintf_s(line, sizeof(line), _TRUNCATE,
-        "[%02d:%02d:%02d.%03d] [%s] %s\r\n",
-        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
-        tag, detail);
-    if (len > 0) {
-        DWORD written;
-        WriteFile(hf, line, static_cast<DWORD>(len), &written, nullptr);
-        FlushFileBuffers(hf);
+    try
+    {
+        std::lock_guard<std::recursive_mutex> lk(detail::log_mtx());
+        const char* path = detail::log_path();
+        HANDLE hf = CreateFileA(path,
+            FILE_APPEND_DATA | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+            OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
+            nullptr);
+        if (hf == INVALID_HANDLE_VALUE) return;
 
-        char dbg_line[2100];
-        _snprintf_s(dbg_line, sizeof(dbg_line), _TRUNCATE,
-            "[AIDA-CRIT][%02d:%02d:%02d.%03d] [%s] %s",
+        SYSTEMTIME st{};
+        GetLocalTime(&st);
+        char line[2048];
+        int len = _snprintf_s(line, sizeof(line), _TRUNCATE,
+            "[%02d:%02d:%02d.%03d] [%s] %s\r\n",
             st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
             tag, detail);
-        OutputDebugStringA(dbg_line);
+        if (len > 0) {
+            DWORD written;
+            WriteFile(hf, line, static_cast<DWORD>(len), &written, nullptr);
+            FlushFileBuffers(hf);
+
+            char dbg_line[2100];
+            _snprintf_s(dbg_line, sizeof(dbg_line), _TRUNCATE,
+                "[AIDA-CRIT][%02d:%02d:%02d.%03d] [%s] %s",
+                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+                tag, detail);
+            OutputDebugStringA(dbg_line);
+        }
+        CloseHandle(hf);
     }
-    CloseHandle(hf);
+    catch (...) {}
 }
 
 inline void write_log_critical_fmt(const char* tag, const char* fmt, ...)

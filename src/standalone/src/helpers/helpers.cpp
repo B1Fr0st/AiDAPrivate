@@ -14,8 +14,10 @@
 #include <algorithm>
 #include <iostream>
 #include <string>
+#include <atomic>
 #include <thread>
 #include <chrono>
+#include <exception>
 #include <nlohmann/json.hpp>
 #include "blur.h"
 #include "../assets/icons.h"
@@ -192,6 +194,165 @@ static bool trusted_show_folder(HWND owner,
 {
 	anti_tamper::token_chain::trusted_interaction_scope_t trusted_scope;
 	return win32_dialog::show_open_folder_dialog(owner, title, out_path, caller_name);
+}
+
+namespace file_menu_deferred
+{
+	enum class action_t
+	{
+		none,
+		open_file,
+		open_folder
+	};
+
+	struct result_t
+	{
+		action_t action = action_t::none;
+		bool ok = false;
+		std::string path;
+	};
+
+	static std::atomic<int>& pending_action()
+	{
+		static std::atomic<int> value{ static_cast<int>(action_t::none) };
+		return value;
+	}
+
+	static std::atomic<bool>& active()
+	{
+		static std::atomic<bool> value{ false };
+		return value;
+	}
+
+	static std::atomic<bool>& result_ready()
+	{
+		static std::atomic<bool> value{ false };
+		return value;
+	}
+
+	static std::mutex& result_mutex()
+	{
+		static std::mutex value;
+		return value;
+	}
+
+	static result_t& result_state()
+	{
+		static result_t value;
+		return value;
+	}
+
+	static void store_result(action_t action, bool ok, std::string path)
+	{
+		{
+			std::lock_guard<std::mutex> lock(result_mutex());
+			result_state() = result_t{ action, ok, std::move(path) };
+		}
+		result_ready().store(true, std::memory_order_release);
+	}
+
+	static void request(action_t action)
+	{
+		pending_action().store(static_cast<int>(action), std::memory_order_release);
+		diag::log_tagged_fmt("file_dialog", "deferred_request action=%d active=%d", static_cast<int>(action), active().load(std::memory_order_acquire) ? 1 : 0);
+	}
+
+	static void run_pending()
+	{
+		if (result_ready().exchange(false, std::memory_order_acq_rel)) {
+			result_t result;
+			{
+				std::lock_guard<std::mutex> lock(result_mutex());
+				result = std::move(result_state());
+				result_state() = {};
+			}
+
+			if (result.action == action_t::open_file) {
+				if (result.ok && !result.path.empty()) {
+					diag::log_tagged_fmt("file_dialog", "deferred_open_file picked path=%.260s", result.path.c_str());
+					file_browser::open_path(result.path);
+				} else {
+					diag::log_tagged_critical("file_dialog", "deferred_open_file cancelled_or_failed");
+				}
+				diag::log_tagged_critical("file_dialog", "deferred_open_file end");
+			} else if (result.action == action_t::open_folder) {
+				if (result.ok && !result.path.empty()) {
+					file_browser::refresh(result.path);
+					g_sa_settings.workspace.root_path = result.path;
+					g_sa_settings_request_save();
+					diag::log_tagged_fmt("file_dialog", "deferred_open_folder picked path=%.260s", result.path.c_str());
+				} else {
+					diag::log_tagged_critical("file_dialog", "deferred_open_folder cancelled_or_failed");
+				}
+				diag::log_tagged_critical("file_dialog", "deferred_open_folder end");
+			}
+		}
+
+		if (active().load(std::memory_order_acquire))
+			return;
+
+		int raw = pending_action().exchange(static_cast<int>(action_t::none), std::memory_order_acq_rel);
+		action_t action = static_cast<action_t>(raw);
+		if (action == action_t::none)
+			return;
+
+		active().store(true, std::memory_order_release);
+		auto task = [action]() {
+			try {
+				if (action == action_t::open_file) {
+					diag::log_tagged_critical("file_dialog", "deferred_open_file worker_begin");
+					char buf[MAX_PATH] = {};
+					static const char k_open_file_filter[] =
+						"All files (*.*)\0*.*\0"
+						"C/C++ (*.c;*.cpp;*.h;*.hpp)\0*.c;*.cpp;*.h;*.hpp\0\0";
+					bool ok = trusted_show_open_file(nullptr,
+						"Open File",
+						k_open_file_filter,
+						buf, sizeof(buf),
+						"file_menu_open");
+					store_result(action, ok, ok ? std::string(buf) : std::string());
+					diag::log_tagged_fmt("file_dialog", "deferred_open_file worker_end ok=%d", ok ? 1 : 0);
+				} else if (action == action_t::open_folder) {
+					diag::log_tagged_critical("file_dialog", "deferred_open_folder worker_begin");
+					std::string folder;
+					bool ok = trusted_show_folder(nullptr,
+						L"Open Workspace Folder",
+						folder,
+						"workspace_open_folder");
+					store_result(action, ok, ok ? folder : std::string());
+					diag::log_tagged_fmt("file_dialog", "deferred_open_folder worker_end ok=%d", ok ? 1 : 0);
+				} else {
+					store_result(action_t::none, false, {});
+				}
+			} catch (const std::exception& ex) {
+				diag::log_tagged_fmt("file_dialog", "deferred_worker exception=%s", ex.what());
+				store_result(action, false, {});
+			} catch (...) {
+				diag::log_tagged_critical("file_dialog", "deferred_worker unknown_exception");
+				store_result(action, false, {});
+			}
+			active().store(false, std::memory_order_release);
+		};
+		bool queued = false;
+		try {
+			queued = work_queue::post(std::move(task));
+		} catch (const std::exception& ex) {
+			active().store(false, std::memory_order_release);
+			diag::log_tagged_fmt("file_dialog", "deferred_post exception=%s", ex.what());
+			store_result(action, false, {});
+			return;
+		} catch (...) {
+			active().store(false, std::memory_order_release);
+			diag::log_tagged_critical("file_dialog", "deferred_post unknown_exception");
+			store_result(action, false, {});
+			return;
+		}
+		if (!queued) {
+			active().store(false, std::memory_order_release);
+			diag::log_tagged_critical("file_dialog", "deferred_post failed");
+			store_result(action, false, {});
+		}
+	}
 }
 
 static bool has_any_target()
@@ -1079,6 +1240,7 @@ void helpers::render_title()
 	g_render_section = "entry";
 	float dt = ImGui::GetIO().DeltaTime;
 	globals::ui::load_timer += dt;
+	file_menu_deferred::run_pending();
 
 	static bool bg_completed = false;
 	static float bg_completed_at = 0.f;
@@ -1145,6 +1307,8 @@ void helpers::render_title()
 			diag::log_tagged("license", "DIAG_DIALOG_RECOVERED_RUNTIME_VALIDITY");
 		}
 	}
+
+	const bool runtime_ready = license::validated && standalone_license::is_valid();
 
 	g_render_section = "theme_resolve";
 	if (custom_themes::active_custom >= 0 &&
@@ -1488,7 +1652,7 @@ void helpers::render_title()
 		float tw, th;
 		if (!globals::ui::welcome_done) {
 			tw = 560.f; th = 360.f;
-		} else if (!license::validated) {
+		} else if (!runtime_ready) {
 			tw = 620.f; th = 540.f;
 		} else {
 			MONITORINFO mi = { sizeof(mi) };
@@ -1500,7 +1664,7 @@ void helpers::render_title()
 
 		static bool initial_grow_done = false;
 		if (!initial_grow_done) {
-			if (globals::ui::welcome_done && license::validated) {
+			if (globals::ui::welcome_done && runtime_ready) {
 				initial_grow_done = true;
 				globals::ui::maximized = true;
 				MONITORINFO mi2 = { sizeof(mi2) };
@@ -1542,7 +1706,7 @@ void helpers::render_title()
 	bool welcome_ready = !loading && globals::ui::window_w >= 470.f && globals::ui::window_h >= 270.f;
 	bool ui_ready      = globals::ui::window_w >= 1000.f && globals::ui::window_h >= 600.f;
 
-	if (ui_ready && globals::ui::welcome_done && license::validated)
+	if (ui_ready && globals::ui::welcome_done && runtime_ready)
 	{
 		static float raw = 0.f;
 		raw += dt;
@@ -1868,7 +2032,7 @@ void helpers::render_title()
 			float msg_a = std::min(std::max(t - 1.4f, 0.f) / 0.5f, 1.f) * fade_out;
 			if (msg_a > 0.01f)
 			{
-				const char* msg = license::validated
+				const char* msg = runtime_ready
 					? "Your session is ready."
 					: "Enter your license key to continue.";
 				float msg_sz = body->FontSize;
@@ -1884,7 +2048,7 @@ void helpers::render_title()
 	}
 
 
-	if (!license::validated)
+	if (!runtime_ready)
 	{
 		const auto& th = aida::ui::resolved();
 		static float license_alpha = 0.f;
@@ -2491,7 +2655,7 @@ void helpers::render_title()
 			}
 		}
 
-		if (license::validated) {
+		if (license::validated && standalone_license::is_valid()) {
 			static aida::ui::transition_t check_anim;
 			static aida::ui::transition_t burst_anim;
 			static bool started = false;
@@ -3452,49 +3616,10 @@ void helpers::render_title()
 							globals::ui::active_center_view = center_view_t::code_editor;
 						}
 						if (menu_item("Open File...", "Ctrl+O")) {
-							char buf[MAX_PATH] = {};
-							static const char k_open_file_filter[] =
-								"All files (*.*)\0*.*\0"
-								"C/C++ (*.c;*.cpp;*.h;*.hpp)\0*.c;*.cpp;*.h;*.hpp\0\0";
-							if (trusted_show_open_file(g_hwnd,
-								"Open File",
-								k_open_file_filter,
-								buf, sizeof(buf),
-								"file_menu_open")) {
-								std::string content;
-								FILE* f = nullptr;
-								fopen_s(&f, buf, "rb");
-								if (f) {
-									fseek(f, 0, SEEK_END);
-									long sz = ftell(f);
-									fseek(f, 0, SEEK_SET);
-									content.resize(sz);
-									fread(&content[0], 1, sz, f);
-									fclose(f);
-								}
-								std::string fname = buf;
-								auto pos = fname.find_last_of("\\/");
-								if (pos != std::string::npos) fname = fname.substr(pos + 1);
-								file_tabs::open_or_focus(buf, fname, content);
-								globals::ui::active_center_view = center_view_t::code_editor;
-							}
+							file_menu_deferred::request(file_menu_deferred::action_t::open_file);
 						}
 						if (menu_item("Open Folder...", "Ctrl+K")) {
-							std::string folder;
-							if (trusted_show_folder(g_hwnd,
-								L"Open Workspace Folder",
-								folder,
-								"workspace_open_folder")) {
-								file_browser::refresh(folder);
-								g_sa_settings.workspace.root_path = folder;
-								g_sa_settings_request_save();
-								char buf[600];
-								_snprintf_s(buf, sizeof(buf), _TRUNCATE,
-									"open_folder picked=%s", folder.c_str());
-								anti_tamper::webhook::write_log("chrome", buf);
-							} else {
-								anti_tamper::webhook::write_log("chrome", "open_folder cancelled");
-							}
+							file_menu_deferred::request(file_menu_deferred::action_t::open_folder);
 						}
 						menu_sep();
 						if (menu_item("Save", "Ctrl+S", code_editor::active)) {
@@ -3963,6 +4088,7 @@ void helpers::render_title()
 	}
 
 	if (left_w > 1.f && globals::ui::panel_left_visible) {
+	g_render_section = "left_panel";
 	ImGui::SetCursorPos(ImVec2(fb_x, fb_y));
 	begin_child("##filebrowser", ImVec2(fb_x, fb_y), ImVec2(left_w, total_h), a);
 	{
@@ -3972,6 +4098,7 @@ void helpers::render_title()
 		float fh = ImGui::GetWindowHeight();
 
 		if (globals::ui::active_activity == activity_item_t::search) {
+			g_render_section = "left_panel_search";
 
 			const char* search_lbl = "SEARCH";
 			float search_hdr_h = 28.f;
@@ -4183,6 +4310,7 @@ void helpers::render_title()
 			ImGui::EndChild();
 			ImGui::PopStyleVar();
 		} else if (globals::ui::active_activity == activity_item_t::recent) {
+			g_render_section = "left_panel_recent";
 
 			const char* rc_lbl = "RECENT";
 			fdl->AddText(ImVec2(fwp.x + 10.f, fwp.y + 8.f),
@@ -4380,6 +4508,7 @@ void helpers::render_title()
 			ImGui::PopStyleVar();
 
 		} else {
+		g_render_section = "left_panel_explorer";
 
 		const char* explorer_lbl = "EXPLORER";
 		float fb_header_h = 26.f;
@@ -4449,6 +4578,7 @@ void helpers::render_title()
 
 
 		{
+			g_render_section = "left_panel_theme_icon";
 			ID3D11ShaderResourceView* icon_srv = get_active_theme_icon();
 			if (icon_srv) {
 				int icon_idx = g_sa_settings.theme_icon_index;
@@ -7924,6 +8054,13 @@ void helpers::render_title()
 	static std::vector<driver_bridge::process_info_t> pa_proc_list;
 	static float pa_refresh_timer = 0.f;
 	static int pa_selected = -1;
+	static std::mutex pa_proc_pending_mtx;
+	static std::vector<driver_bridge::process_info_t> pa_pending_proc_list;
+	static uint64_t pa_pending_epoch = 0;
+	static std::atomic<bool> pa_refresh_inflight{false};
+	static std::atomic<bool> pa_refresh_ready{false};
+	static uint64_t pa_refresh_epoch = 0;
+	static uint64_t pa_applied_epoch = 0;
 
 	{
 		float dt_pa = ImGui::GetIO().DeltaTime;
@@ -7937,6 +8074,7 @@ void helpers::render_title()
 			pa_open_frame = -1;
 			pa_anim = 0.f;
 			pa_selected = -1;
+			pa_refresh_timer = 0.f;
 			globals::ui::process_filter_buf[0] = '\0';
 		}
 	}
@@ -8040,14 +8178,40 @@ void helpers::render_title()
 				ImGui::Spacing();
 
 
-				pa_refresh_timer -= ImGui::GetIO().DeltaTime;
-				if (pa_refresh_timer <= 0.f || pa_proc_list.empty()) {
-					try {
-						pa_proc_list = driver_bridge::enumerate_processes();
-					} catch (...) {
-						OutputDebugStringA("AiDA Standalone: EXCEPTION in enumerate_processes()\n");
+				if (pa_refresh_ready.exchange(false, std::memory_order_acq_rel)) {
+					std::lock_guard<std::mutex> lock(pa_proc_pending_mtx);
+					if (pa_pending_epoch > pa_applied_epoch) {
+						pa_proc_list = std::move(pa_pending_proc_list);
+						pa_applied_epoch = pa_pending_epoch;
+						if (pa_selected >= static_cast<int>(pa_proc_list.size()))
+							pa_selected = -1;
 					}
-					pa_refresh_timer = 2.f;
+					pa_refresh_inflight.store(false, std::memory_order_release);
+				}
+
+				pa_refresh_timer -= ImGui::GetIO().DeltaTime;
+				if ((pa_refresh_timer <= 0.f || pa_proc_list.empty()) &&
+					!pa_refresh_inflight.exchange(true, std::memory_order_acq_rel)) {
+					const uint64_t epoch = ++pa_refresh_epoch;
+					if (!work_queue::post([epoch]() {
+						std::vector<driver_bridge::process_info_t> list;
+						try {
+							list = driver_bridge::enumerate_processes();
+						} catch (...) {
+							OutputDebugStringA("AiDA Standalone: EXCEPTION in enumerate_processes()\n");
+						}
+						{
+							std::lock_guard<std::mutex> lock(pa_proc_pending_mtx);
+							pa_pending_proc_list = std::move(list);
+							pa_pending_epoch = epoch;
+						}
+						pa_refresh_ready.store(true, std::memory_order_release);
+					})) {
+						pa_refresh_inflight.store(false, std::memory_order_release);
+						pa_refresh_timer = 1.f;
+					} else {
+						pa_refresh_timer = 2.f;
+					}
 				}
 
 

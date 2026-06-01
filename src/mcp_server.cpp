@@ -5,6 +5,7 @@
 #include <queue>
 #include <deque>
 #include <chrono>
+#include <exception>
 #include <future>
 #include <bcrypt.h>
 #pragma comment(lib, "bcrypt.lib")
@@ -252,8 +253,9 @@ static const std::string& get_mcp_protocol_version()
 static const std::string& get_mcp_server_instructions()
 {
     static const std::string instructions =
-        "AiDA IDA Pro Plugin — STATIC zero-day analysis for binaries loaded in IDA Pro. This plugin performs ONLY static analysis. Runtime, debugger, kernel-memory, and network-interception capabilities live in AiDAStandalone and are NOT available here.\n\n"
-        "MANDATORY RULE: For ALL number base conversions (hexadecimal to decimal, decimal to hexadecimal, binary conversions, computing byte representations of integers, interpreting stack-constructed byte sequences as characters, ASCII character value lookups), you MUST use the `convert_number` tool. NEVER interpret hex byte values as ASCII characters manually or convert between number bases in your head.\n\n"
+        "AiDA IDA Pro Plugin MCP is self-describing. Do not expect external markdown files such as TOOLS.md; shipped users normally receive only AiDA.dll and AiDAStandalone.exe. Learn the available surface from this initialize response, `tools/list`, and targeted tool-schema discovery.\n\n"
+        "AiDA IDA Pro Plugin - STATIC zero-day analysis for binaries loaded in IDA Pro. This plugin performs ONLY static analysis. Runtime, debugger, kernel-memory, number/address conversion, sandbox, browser, and network-interception capabilities live in AiDAStandalone and are NOT available here.\n\n"
+        "Number, endian, VA, RVA, and file-offset conversions are handled by AiDAStandalone's `convert_number` tool. This IDA plugin does not expose `convert_number`; use IDA addresses as database EAs and prefer IDA segment/image-base evidence when reporting offsets.\n\n"
         "Capability families exposed by this plugin:\n"
         "- Function, decompilation, xref, type, and segment introspection over the loaded IDB.\n"
         "- Pattern-based searches: strings, byte patterns, immediate values, and instruction patterns.\n"
@@ -261,8 +263,8 @@ static const std::string& get_mcp_server_instructions()
         "- Static deobfuscation: control-flow flattening unflattening, opaque predicate solving, stack-string decoding, anti-debug NOP patching of the in-memory IDB, import reconstruction, and section unpacking — all performed statically against the database.\n"
         "- GraphRAG: semantic search, taint paths, function communities, and network-flow graphs over the indexed binary.\n"
         "- Zero-day vulnerability tools: callsite enumeration of dangerous APIs, format-string bug discovery, microcode SSA dataflow analysis, interprocedural taint path enumeration, kernel IOCTL handler discovery with ProbeForRead/ProbeForWrite coverage analysis, attack-surface scoring, indirect-call resolution, and check-bypass path enumeration.\n\n"
-        "Use GraphRAG first on indexed binaries: `get_graph_stats` to confirm indexing, then `search_semantic` before slower IDA search tools. NEVER use `find_instructions` or `search_strings` if the binary is indexed — `search_semantic` is orders of magnitude faster.\n\n"
-        "Batch related read-only tool calls aggressively, avoid duplicate calls with identical parameters, and keep conclusions tied to concrete addresses, imports, strings, decompilation, microcode, or taint evidence.\n\n"
+        "First-use workflow: call `wait_for_analysis`, then `get_binary_info` or `survey_binary`, then `get_graph_stats`. If indexed, prefer `search_semantic` before slower string or instruction searches. Follow with `get_function`, `decompile_function`, `disassemble_function`, xrefs, basic blocks, and targeted type/comment tools.\n\n"
+        "Batch related read-only tool calls aggressively, avoid duplicate calls with identical parameters, use pagination/limits before broad searches, and keep conclusions tied to concrete addresses, imports, strings, decompilation, microcode, or taint evidence. Mutating tools can patch or change the IDB; use them only when requested.\n\n"
         "MULTI-INSTANCE: Every running IDA Pro is a peer in this MCP mesh. Start by calling `list_ida_instances` "
         "to enumerate all live IDAs; each entry has instance_id (stable UUID), pid (OS process id), display_name, "
         "idb_path, input_file, file_md5/sha256, processor, bitness, port, and base_url. To target a specific IDA, "
@@ -1931,24 +1933,38 @@ static agent_tools::tool_result_t aggregator_query_all(const json& params)
             }
             else
             {
-                task.fut = std::async(std::launch::async,
-                    [tool_name, local_args]() -> json {
-                        auto tr = execute_tool_in_main_thread(tool_name, local_args);
-                        json content = json::array();
-                        if (!tr.output.empty())
-                            content.push_back({ {"type","text"}, {"text",sanitize_utf8(tr.output)} });
-                        if (!tr.data.is_null() && !tr.data.empty())
-                            content.push_back({ {"type","text"},
-                                {"text", sanitize_utf8(json_dump_safe(tr.data, 2))} });
-                        if (content.empty())
-                            content.push_back({ {"type","text"},
-                                {"text", tr.success ? "ok" : "error"} });
-                        json result;
-                        result["content"] = content;
-                        if (!tr.success)
-                            result["isError"] = true;
-                        return result;
+                try
+                {
+                    task.fut = std::async(std::launch::async,
+                        [tool_name, local_args]() -> json {
+                            auto tr = execute_tool_in_main_thread(tool_name, local_args);
+                            json content = json::array();
+                            if (!tr.output.empty())
+                                content.push_back({ {"type","text"}, {"text",sanitize_utf8(tr.output)} });
+                            if (!tr.data.is_null() && !tr.data.empty())
+                                content.push_back({ {"type","text"},
+                                    {"text", sanitize_utf8(json_dump_safe(tr.data, 2))} });
+                            if (content.empty())
+                                content.push_back({ {"type","text"},
+                                    {"text", tr.success ? "ok" : "error"} });
+                            json result;
+                            result["content"] = content;
+                            if (!tr.success)
+                                result["isError"] = true;
+                            return result;
+                        });
+                }
+                catch (const std::exception& ex)
+                {
+                    json err;
+                    err["isError"] = true;
+                    err["content"] = json::array({
+                        { {"type","text"}, {"text", std::string("Tool worker unavailable: ") + ex.what()} }
                     });
+                    std::promise<json> pr;
+                    pr.set_value(err);
+                    task.fut = pr.get_future();
+                }
             }
         }
         else
@@ -1956,10 +1972,24 @@ static agent_tools::tool_result_t aggregator_query_all(const json& params)
             ida_instance_record_t peer = rec;
             json fwd_args = arguments;
             int t_seconds = timeout_seconds;
-            task.fut = std::async(std::launch::async,
-                [peer, tool_name, fwd_args, t_seconds]() -> json {
-                    return mcp_proxy_tools_call_to_peer(peer, tool_name, fwd_args, t_seconds);
+            try
+            {
+                task.fut = std::async(std::launch::async,
+                    [peer, tool_name, fwd_args, t_seconds]() -> json {
+                        return mcp_proxy_tools_call_to_peer(peer, tool_name, fwd_args, t_seconds);
+                    });
+            }
+            catch (const std::exception& ex)
+            {
+                json err;
+                err["isError"] = true;
+                err["content"] = json::array({
+                    { {"type","text"}, {"text", std::string("Forward worker unavailable: ") + ex.what()} }
                 });
+                std::promise<json> pr;
+                pr.set_value(err);
+                task.fut = pr.get_future();
+            }
         }
         tasks.push_back(std::move(task));
     }
@@ -2690,6 +2720,13 @@ static const mcp_client_def_t g_mcp_client_defs[] =
     },
     {
         "Kiro",
+        mcp_cfg_format_t::mcpservers_url,
+        "~/.kiro/settings/mcp.json",
+        "~/.kiro/settings/mcp.json",
+        "~/.kiro/settings/mcp.json"
+    },
+    {
+        "Kiro Legacy",
         mcp_cfg_format_t::mcpservers_url,
         "~/.kiro/mcp_config.json",
         "~/.kiro/mcp_config.json",

@@ -132,8 +132,27 @@ namespace
         return true;
     }
 
+    std::wstring get_module_dir();
+    std::wstring random_token(size_t bytes);
+
     std::wstring get_stage_dir()
     {
+        wchar_t override_dir[MAX_PATH] = {};
+        DWORD override_len = GetEnvironmentVariableW(L"AIDA_DRIVER_STAGE_DIR", override_dir, MAX_PATH);
+        if (override_len > 0 && override_len < MAX_PATH) {
+            std::filesystem::path p(override_dir);
+            std::error_code ec;
+            std::filesystem::create_directories(p, ec);
+            if (!ec)
+                return p.wstring();
+            loader_diag_fmt("stage_override_create_failed path=\"%s\" ec=%lu",
+                utf8_from_wide(p.wstring()).c_str(),
+                static_cast<unsigned long>(ec.value()));
+        }
+
+        std::wstring token = random_token(8);
+        if (token.empty())
+            return {};
         wchar_t* local = nullptr;
         if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_CREATE, nullptr, &local)) || !local)
             return {};
@@ -141,7 +160,8 @@ namespace
         CoTaskMemFree(local);
         p /= L"AiDA";
         p /= L"Standalone";
-        p /= L"stage";
+        p /= L"AiDADriverStage";
+        p /= token;
         std::error_code ec;
         std::filesystem::create_directories(p, ec);
         if (ec)
@@ -157,6 +177,23 @@ namespace
             return {};
         std::filesystem::path p(path);
         return p.parent_path().wstring();
+    }
+
+    std::wstring resolve_mapper_log_path()
+    {
+        PWSTR docs = nullptr;
+        if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, KF_FLAG_CREATE, nullptr, &docs)) && docs) {
+            std::filesystem::path path(docs);
+            CoTaskMemFree(docs);
+            return (path / L"windmapper.log").wstring();
+        }
+        if (docs)
+            CoTaskMemFree(docs);
+
+        std::wstring module_dir = get_module_dir();
+        if (!module_dir.empty())
+            return (std::filesystem::path(module_dir) / L"WindMapper_debug.log").wstring();
+        return {};
     }
 
     std::wstring random_token(size_t bytes)
@@ -181,9 +218,12 @@ namespace
     {
         if (dir.empty())
             return {};
-        std::wstring name = random_token(8);
-        if (name.empty())
+        if (!ext || !*ext)
             return {};
+        std::wstring token = random_token(12);
+        if (token.empty())
+            return {};
+        std::wstring name = token;
         std::filesystem::path p = std::filesystem::path(dir) / (name + ext);
         return p.wstring();
     }
@@ -365,15 +405,21 @@ namespace
         if (hf != INVALID_HANDLE_VALUE) {
             LARGE_INTEGER size;
             if (GetFileSizeEx(hf, &size) && size.QuadPart > 0) {
-                auto* zeros = static_cast<unsigned char*>(
-                    VirtualAlloc(nullptr, static_cast<SIZE_T>(size.QuadPart),
-                                 MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-                if (zeros) {
+                unsigned char zeros[65536];
+                SecureZeroMemory(zeros, sizeof(zeros));
+                LARGE_INTEGER pos = {};
+                SetFilePointerEx(hf, pos, nullptr, FILE_BEGIN);
+                LONGLONG remaining = size.QuadPart;
+                while (remaining > 0) {
+                    DWORD chunk = remaining > static_cast<LONGLONG>(sizeof(zeros))
+                        ? static_cast<DWORD>(sizeof(zeros))
+                        : static_cast<DWORD>(remaining);
                     DWORD written = 0;
-                    WriteFile(hf, zeros, static_cast<DWORD>(size.QuadPart), &written, nullptr);
-                    FlushFileBuffers(hf);
-                    VirtualFree(zeros, 0, MEM_RELEASE);
+                    if (!WriteFile(hf, zeros, chunk, &written, nullptr) || written == 0)
+                        break;
+                    remaining -= written;
                 }
+                FlushFileBuffers(hf);
             }
             CloseHandle(hf);
         }
@@ -395,6 +441,17 @@ namespace
             label ? label : "?",
             path_utf8.empty() ? "<empty>" : path_utf8.c_str());
         secure_delete(path);
+    }
+
+    void cleanup_stage_dir(const std::wstring& path)
+    {
+        if (path.empty() || should_keep_stage())
+            return;
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+        loader_diag_fmt("stage_dir_delete path=\"%s\" ec=%lu",
+            utf8_from_wide(path).c_str(),
+            static_cast<unsigned long>(ec.value()));
     }
 
 }
@@ -437,7 +494,7 @@ namespace driver_loader
         std::wstring whoswho_path = make_stage_path(stage, L".sys");
         std::wstring sentinel_path = make_stage_path(stage, L".sys");
         if (mapper_path.empty() || whoswho_path.empty() || sentinel_path.empty()) {
-            set_last_error("Failed to allocate randomized stage paths");
+            set_last_error("Failed to allocate driver stage paths");
             return false;
         }
         loader_diag_fmt("stage_paths mapper=\"%s\" whoswho=\"%s\" sentinel=\"%s\"",
@@ -451,6 +508,7 @@ namespace driver_loader
                                g_windmapper_tag, sizeof(g_windmapper_tag),
                                mapper_path, "windmapper")) {
             cleanup_stage_file(mapper_path, "windmapper");
+            cleanup_stage_dir(stage);
             return false;
         }
 
@@ -461,6 +519,7 @@ namespace driver_loader
                                whoswho_path, "whoswho")) {
             cleanup_stage_file(mapper_path, "windmapper");
             cleanup_stage_file(whoswho_path, "whoswho");
+            cleanup_stage_dir(stage);
             return false;
         }
 
@@ -472,6 +531,7 @@ namespace driver_loader
             cleanup_stage_file(mapper_path, "windmapper");
             cleanup_stage_file(whoswho_path, "whoswho");
             cleanup_stage_file(sentinel_path, "sentinel");
+            cleanup_stage_dir(stage);
             return false;
         }
 
@@ -479,10 +539,8 @@ namespace driver_loader
                                whoswho_path + L"\" \"" + sentinel_path + L"\"";
         loader_diag_fmt("mapper_cmdline=\"%s\"", utf8_from_wide(cmdline).c_str());
 
-        std::wstring mapper_log_path;
-        std::wstring module_dir = get_module_dir();
-        if (!module_dir.empty()) {
-            mapper_log_path = (std::filesystem::path(module_dir) / L"WindMapper_debug.log").wstring();
+        std::wstring mapper_log_path = resolve_mapper_log_path();
+        if (!mapper_log_path.empty()) {
             SetEnvironmentVariableW(L"AIDA_MAPPER_LOG", mapper_log_path.c_str());
             loader_diag_fmt("mapper_log_path=\"%s\"", utf8_from_wide(mapper_log_path).c_str());
         } else {
@@ -511,8 +569,16 @@ namespace driver_loader
             cleanup_stage_file(mapper_path, "windmapper");
             cleanup_stage_file(whoswho_path, "whoswho");
             cleanup_stage_file(sentinel_path, "sentinel");
-            set_last_error_fmt("CreateProcessW failed for mapper stage gle=%lu mapper=\"%s\"",
-                static_cast<unsigned long>(gle), utf8_from_wide(mapper_path).c_str());
+            cleanup_stage_dir(stage);
+            if (gle == ERROR_VIRUS_INFECTED || gle == ERROR_VIRUS_DELETED) {
+                set_last_error_fmt("Security software blocked mapper stage gle=%lu mapper=\"%s\" stage_dir=\"%s\"",
+                    static_cast<unsigned long>(gle),
+                    utf8_from_wide(mapper_path).c_str(),
+                    utf8_from_wide(stage).c_str());
+            } else {
+                set_last_error_fmt("CreateProcessW failed for mapper stage gle=%lu mapper=\"%s\"",
+                    static_cast<unsigned long>(gle), utf8_from_wide(mapper_path).c_str());
+            }
             return false;
         }
         loader_diag_fmt("mapper_create_process_ok pid=%lu tid=%lu",
@@ -535,9 +601,13 @@ namespace driver_loader
         }
 
         DWORD resume_result = ResumeThread(pi.hThread);
-        loader_diag_fmt("mapper_resume result=%lu gle=%lu",
-            static_cast<unsigned long>(resume_result),
-            static_cast<unsigned long>(GetLastError()));
+        if (resume_result == static_cast<DWORD>(-1)) {
+            loader_diag_fmt("mapper_resume_failed gle=%lu",
+                static_cast<unsigned long>(GetLastError()));
+        } else {
+            loader_diag_fmt("mapper_resume_ok previous_suspend_count=%lu",
+                static_cast<unsigned long>(resume_result));
+        }
 
         DWORD wait_result = WaitForSingleObject(pi.hProcess, 90000);
         DWORD wait_gle = GetLastError();
@@ -561,6 +631,7 @@ namespace driver_loader
         cleanup_stage_file(mapper_path, "windmapper");
         cleanup_stage_file(whoswho_path, "whoswho");
         cleanup_stage_file(sentinel_path, "sentinel");
+        cleanup_stage_dir(stage);
 
         if (wait_result == WAIT_TIMEOUT) {
             set_last_error_fmt("Mapper stage timed out after 90000 ms log=\"%s\"",

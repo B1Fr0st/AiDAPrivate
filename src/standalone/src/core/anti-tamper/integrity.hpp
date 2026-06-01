@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -19,6 +20,7 @@
 #include "key_pipeline.hpp"
 #include "tpm_attest.hpp"
 #include "webhook.hpp"
+#include "../infra/work_queue.hpp"
 
 #pragma comment(lib, "bcrypt.lib")
 
@@ -641,17 +643,56 @@ namespace detail {
     inline bool rebuild_page_table_locked(page_table_t& pt, uint64_t base, uint32_t size)
     {
         if (base == 0 || size == 0) return false;
+        uint64_t started_ms = GetTickCount64();
+        MEMORY_BASIC_INFORMATION entry_mbi{};
+        SIZE_T entry_vq = VirtualQuery(reinterpret_cast<const void*>(base), &entry_mbi, sizeof(entry_mbi));
         pt.base = base;
         pt.size = size;
         uint32_t pages = (size + kPageSize - 1) / kPageSize;
-        pt.entries.assign(pages, page_mac_t{});
+        size_t old_entries = pt.entries.size();
         uint64_t epoch = pt.key_epoch.load();
+        webhook::write_log_critical_fmt("page_mac",
+            "rebuild_entry pid=%lu tid=%lu tick=%llu base=0x%llX size=0x%X pages=%u old_entries=%zu epoch=%llu vq=%llu mbi_base=0x%llX alloc_base=0x%llX region=0x%llX state=0x%lX protect=0x%lX type=0x%lX",
+            GetCurrentProcessId(),
+            GetCurrentThreadId(),
+            static_cast<unsigned long long>(started_ms),
+            static_cast<unsigned long long>(base),
+            size,
+            pages,
+            old_entries,
+            static_cast<unsigned long long>(epoch),
+            static_cast<unsigned long long>(entry_vq),
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(entry_mbi.BaseAddress)),
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(entry_mbi.AllocationBase)),
+            static_cast<unsigned long long>(entry_mbi.RegionSize),
+            static_cast<unsigned long>(entry_mbi.State),
+            static_cast<unsigned long>(entry_mbi.Protect),
+            static_cast<unsigned long>(entry_mbi.Type));
+        pt.entries.assign(pages, page_mac_t{});
+        webhook::write_log_critical_fmt("page_mac",
+            "rebuild_entries_assigned pages=%u entries=%zu elapsed_ms=%llu",
+            pages,
+            pt.entries.size(),
+            static_cast<unsigned long long>(GetTickCount64() - started_ms));
 
         uint8_t base_secret[32];
-        compute_session_secret(base_secret);
+        bool base_secret_ok = compute_session_secret(base_secret);
         uint8_t key[16];
         derive_page_key(base_secret, epoch, key);
+        webhook::write_log_critical_fmt("page_mac",
+            "rebuild_secret_ready secret_ok=%d epoch=%llu elapsed_ms=%llu",
+            base_secret_ok ? 1 : 0,
+            static_cast<unsigned long long>(epoch),
+            static_cast<unsigned long long>(GetTickCount64() - started_ms));
 
+        uint64_t first_pass_tick = GetTickCount64();
+        const uint32_t progress_stride = pages >= 8192 ? 2048u : (pages >= 2048 ? 512u : (pages >= 256 ? 128u : 1u));
+        webhook::write_log_critical_fmt("page_mac",
+            "rebuild_first_pass_begin pages=%u stride=%u base=0x%llX size=0x%X",
+            pages,
+            progress_stride,
+            static_cast<unsigned long long>(base),
+            size);
         for (uint32_t i = 0; i < pages; ++i)
         {
             uint32_t this_size = kPageSize;
@@ -661,6 +702,13 @@ namespace detail {
             uint8_t tag[16];
             if (!compute_page_full_tag(pt, i, page, this_size, key, tag))
             {
+                webhook::write_log_critical_fmt("page_mac",
+                    "rebuild_first_pass_tag_failed page=%u/%u offset=0x%X this_size=0x%X elapsed_ms=%llu",
+                    i,
+                    pages,
+                    offset,
+                    this_size,
+                    static_cast<unsigned long long>(GetTickCount64() - first_pass_tick));
                 SecureZeroMemory(base_secret, sizeof(base_secret));
                 SecureZeroMemory(key, sizeof(key));
                 return false;
@@ -672,52 +720,109 @@ namespace detail {
                 page, this_size,
                 load_k0() ^ static_cast<uint64_t>(i),
                 load_k1() ^ static_cast<uint64_t>(i + 1));
+            if (i == 0 || i + 1 == pages || ((i + 1) % progress_stride) == 0)
+            {
+                webhook::write_log_critical_fmt("page_mac",
+                    "rebuild_first_pass_progress page=%u/%u offset=0x%X this_size=0x%X elapsed_ms=%llu baseline=0x%016llX",
+                    i + 1,
+                    pages,
+                    offset,
+                    this_size,
+                    static_cast<unsigned long long>(GetTickCount64() - first_pass_tick),
+                    static_cast<unsigned long long>(pt.entries[i].baseline_siphash));
+            }
         }
+        webhook::write_log_critical_fmt("page_mac",
+            "rebuild_first_pass_done pages=%u elapsed_ms=%llu total_elapsed_ms=%llu",
+            pages,
+            static_cast<unsigned long long>(GetTickCount64() - first_pass_tick),
+            static_cast<unsigned long long>(GetTickCount64() - started_ms));
 
         if (pages > 0)
         {
             const uint8_t* page0 = reinterpret_cast<const uint8_t*>(base);
             uint32_t page0_size = (kPageSize > size) ? size : kPageSize;
-            char hex_first[129];
             char hex_tag0[33];
-            char hex_secret[17];
-            diag::hex_encode(hex_first, sizeof(hex_first), page0,
-                             page0_size < 64 ? page0_size : 64);
             diag::hex_encode(hex_tag0, sizeof(hex_tag0), pt.entries[0].full_tag, 16);
-            diag::hex_encode(hex_secret, sizeof(hex_secret), base_secret, 8);
+            uint64_t page0_head_hash = siphash::hash(page0,
+                page0_size < 64 ? page0_size : 64,
+                load_k0() ^ 0xA1DA1001ULL,
+                load_k1() ^ 0xA1DA1002ULL);
+            uint64_t secret_hash = siphash::hash(base_secret, sizeof(base_secret),
+                load_k0() ^ 0xA1DA1003ULL,
+                load_k1() ^ 0xA1DA1004ULL);
             webhook::write_log_critical_fmt("page_mac",
                 "rebuild_baseline pages=%u epoch=%llu base=0x%llX size=0x%X "
-                "page0_first64=%s page0_tag=%s page0_baseline_siphash=0x%016llX session_secret_pfx=%s",
+                "page0_head64_hash=0x%016llX page0_tag=%s page0_baseline_siphash=0x%016llX session_secret_hash=0x%016llX",
                 pages,
                 static_cast<unsigned long long>(epoch),
                 static_cast<unsigned long long>(base),
                 size,
-                hex_first,
+                static_cast<unsigned long long>(page0_head_hash),
                 hex_tag0,
                 static_cast<unsigned long long>(pt.entries[0].baseline_siphash),
-                hex_secret);
+                static_cast<unsigned long long>(secret_hash));
         }
         SecureZeroMemory(base_secret, sizeof(base_secret));
         SecureZeroMemory(key, sizeof(key));
+        webhook::write_log_critical_fmt("page_mac",
+            "rebuild_first_secret_zeroed elapsed_ms=%llu",
+            static_cast<unsigned long long>(GetTickCount64() - started_ms));
 
         uint64_t anchor = 0;
         uint8_t accum[32];
-        compute_session_secret(accum);
+        bool accum_secret_ok = compute_session_secret(accum);
+        uint64_t anchor_tick = GetTickCount64();
+        webhook::write_log_critical_fmt("page_mac",
+            "rebuild_anchor_begin pages=%u secret_ok=%d elapsed_ms=%llu",
+            pages,
+            accum_secret_ok ? 1 : 0,
+            static_cast<unsigned long long>(anchor_tick - started_ms));
         for (uint32_t i = 0; i < pages; ++i)
         {
             uint8_t buf[16 + 16];
             memcpy(buf, pt.entries[i].full_tag, 16);
             memcpy(buf + 16, accum, 16);
-            uint8_t mac[32];
-            sha256::hmac(accum, 32, buf, sizeof(buf), mac);
+            uint8_t mac[32] = {};
+            bool hmac_ok = sha256::hmac(accum, 32, buf, sizeof(buf), mac);
+            if (!hmac_ok)
+            {
+                webhook::write_log_critical_fmt("page_mac",
+                    "rebuild_anchor_hmac_failed page=%u/%u elapsed_ms=%llu",
+                    i,
+                    pages,
+                    static_cast<unsigned long long>(GetTickCount64() - anchor_tick));
+            }
             memcpy(accum, mac, 32);
             anchor ^= reinterpret_cast<const uint64_t*>(mac)[0];
             SecureZeroMemory(buf, sizeof(buf));
+            if (i == 0 || i + 1 == pages || ((i + 1) % progress_stride) == 0)
+            {
+                webhook::write_log_critical_fmt("page_mac",
+                    "rebuild_anchor_progress page=%u/%u elapsed_ms=%llu anchor_nonzero=%d hmac_ok=%d",
+                    i + 1,
+                    pages,
+                    static_cast<unsigned long long>(GetTickCount64() - anchor_tick),
+                    anchor != 0 ? 1 : 0,
+                    hmac_ok ? 1 : 0);
+            }
         }
         s_text_chain_anchor.store(anchor, std::memory_order_release);
+        webhook::write_log_critical_fmt("page_mac",
+            "rebuild_anchor_done pages=%u elapsed_ms=%llu total_elapsed_ms=%llu anchor_nonzero=%d",
+            pages,
+            static_cast<unsigned long long>(GetTickCount64() - anchor_tick),
+            static_cast<unsigned long long>(GetTickCount64() - started_ms),
+            anchor != 0 ? 1 : 0);
         SecureZeroMemory(accum, sizeof(accum));
 
-        pt.last_rotation_qpc.store(qpc_now_ms(), std::memory_order_release);
+        uint64_t last_rotation = qpc_now_ms();
+        pt.last_rotation_qpc.store(last_rotation, std::memory_order_release);
+        webhook::write_log_critical_fmt("page_mac",
+            "rebuild_done pages=%u last_rotation_qpc=%llu total_elapsed_ms=%llu",
+            pages,
+            static_cast<unsigned long long>(last_rotation),
+            static_cast<unsigned long long>(GetTickCount64() - started_ms));
         return true;
     }
 
@@ -757,25 +862,27 @@ namespace detail {
             uint32_t page0_size = (kPageSize > pt.size) ? pt.size : kPageSize;
             uint64_t live_siphash = siphash::hash(
                 page0, page0_size, load_k0(), load_k1() ^ 1ULL);
-            char hex_first[129];
             char hex_tag0[33];
-            char hex_secret[17];
-            diag::hex_encode(hex_first, sizeof(hex_first), page0,
-                             page0_size < 64 ? page0_size : 64);
             diag::hex_encode(hex_tag0, sizeof(hex_tag0), pt.entries[0].full_tag, 16);
-            diag::hex_encode(hex_secret, sizeof(hex_secret), base_secret, 8);
+            uint64_t page0_head_hash = siphash::hash(page0,
+                page0_size < 64 ? page0_size : 64,
+                load_k0() ^ 0xA1DA2001ULL,
+                load_k1() ^ 0xA1DA2002ULL);
+            uint64_t secret_hash = siphash::hash(base_secret, sizeof(base_secret),
+                load_k0() ^ 0xA1DA2003ULL,
+                load_k1() ^ 0xA1DA2004ULL);
             webhook::write_log_critical_fmt("page_mac",
                 "rotate old_epoch=%llu new_epoch=%llu pages=%zu "
-                "page0_first64=%s page0_new_tag=%s page0_baseline_siphash=0x%016llX "
-                "page0_live_siphash=0x%016llX session_secret_pfx=%s",
+                "page0_head64_hash=0x%016llX page0_new_tag=%s page0_baseline_siphash=0x%016llX "
+                "page0_live_siphash=0x%016llX session_secret_hash=0x%016llX",
                 static_cast<unsigned long long>(old_epoch),
                 static_cast<unsigned long long>(new_epoch),
                 pt.entries.size(),
-                hex_first,
+                static_cast<unsigned long long>(page0_head_hash),
                 hex_tag0,
                 static_cast<unsigned long long>(pt.entries[0].baseline_siphash),
                 static_cast<unsigned long long>(live_siphash),
-                hex_secret);
+                static_cast<unsigned long long>(secret_hash));
         }
         SecureZeroMemory(base_secret, sizeof(base_secret));
         SecureZeroMemory(new_key, sizeof(new_key));
@@ -809,20 +916,22 @@ namespace detail {
         uint8_t tag[16];
         if (!compute_page_full_tag(pt, page_index, page, this_size, key, tag))
         {
-            char hex_secret[17];
-            char hex_key[33];
-            diag::hex_encode(hex_secret, sizeof(hex_secret), base_secret, 8);
-            diag::hex_encode(hex_key, sizeof(hex_key), key, 16);
+            uint64_t secret_hash = siphash::hash(base_secret, sizeof(base_secret),
+                load_k0() ^ 0xA1DA3001ULL,
+                load_k1() ^ 0xA1DA3002ULL);
+            uint64_t key_hash = siphash::hash(key, sizeof(key),
+                load_k0() ^ 0xA1DA3003ULL,
+                load_k1() ^ 0xA1DA3004ULL);
             webhook::write_log_critical_fmt("page_mac",
                 "verify_page_locked_FAIL_path_B page=%u offset=0x%X size=0x%X epoch=%llu "
-                "secret_ok=%d session_secret_pfx=%s derived_key=%s pt_base=0x%llX pt_size=0x%X",
+                "secret_ok=%d session_secret_hash=0x%016llX derived_key_hash=0x%016llX pt_base=0x%llX pt_size=0x%X",
                 page_index,
                 offset,
                 this_size,
                 static_cast<unsigned long long>(cur_epoch),
                 secret_ok ? 1 : 0,
-                hex_secret,
-                hex_key,
+                static_cast<unsigned long long>(secret_hash),
+                static_cast<unsigned long long>(key_hash),
                 static_cast<unsigned long long>(pt.base),
                 pt.size);
             SecureZeroMemory(base_secret, sizeof(base_secret));
@@ -837,26 +946,26 @@ namespace detail {
                 page, this_size,
                 load_k0() ^ static_cast<uint64_t>(page_index),
                 load_k1() ^ static_cast<uint64_t>(page_index + 1));
-            uint64_t k0v = load_k0();
-            uint64_t k1v = load_k1();
-            uint64_t lo = s_session_secret_lo.load(std::memory_order_acquire);
-            uint64_t hi = s_session_secret_hi.load(std::memory_order_acquire);
-            char hex_first[129];
-            char hex_last[65];
             char hex_expected[33];
             char hex_computed[33];
-            char hex_secret[17];
-            char hex_key[33];
-            diag::hex_encode(hex_first, sizeof(hex_first), page,
-                             this_size < 64 ? this_size : 64);
             uint32_t tail_off = (this_size > 32) ? this_size - 32 : 0;
             uint32_t tail_len = (this_size > 32) ? 32 : this_size;
-            diag::hex_encode(hex_last, sizeof(hex_last), page + tail_off, tail_len);
             diag::hex_encode(hex_expected, sizeof(hex_expected),
                              pt.entries[page_index].full_tag, 16);
             diag::hex_encode(hex_computed, sizeof(hex_computed), tag, 16);
-            diag::hex_encode(hex_secret, sizeof(hex_secret), base_secret, 8);
-            diag::hex_encode(hex_key, sizeof(hex_key), key, 16);
+            uint64_t first_hash = siphash::hash(page,
+                this_size < 64 ? this_size : 64,
+                load_k0() ^ 0xA1DA4001ULL,
+                load_k1() ^ 0xA1DA4002ULL);
+            uint64_t last_hash = siphash::hash(page + tail_off, tail_len,
+                load_k0() ^ 0xA1DA4003ULL,
+                load_k1() ^ 0xA1DA4004ULL);
+            uint64_t secret_hash = siphash::hash(base_secret, sizeof(base_secret),
+                load_k0() ^ 0xA1DA4005ULL,
+                load_k1() ^ 0xA1DA4006ULL);
+            uint64_t key_hash = siphash::hash(key, sizeof(key),
+                load_k0() ^ 0xA1DA4007ULL,
+                load_k1() ^ 0xA1DA4008ULL);
             const char* diagnosis =
                 (live_siphash == baseline) ? "key_or_iv_mismatch"
                                            : "page_contents_changed";
@@ -864,9 +973,8 @@ namespace detail {
                 "verify_FAIL page=%u offset=0x%X size=0x%X epoch=%llu "
                 "diagnosis=%s live_siphash=0x%016llX baseline_siphash=0x%016llX "
                 "expected_tag=%s computed_tag=%s "
-                "session_secret_lo=0x%016llX session_secret_hi=0x%016llX "
-                "k0=0x%016llX k1=0x%016llX session_secret_pfx=%s derived_key=%s "
-                "first64=%s last32=%s",
+                "session_secret_hash=0x%016llX derived_key_hash=0x%016llX "
+                "first64_hash=0x%016llX last32_hash=0x%016llX",
                 page_index,
                 offset,
                 this_size,
@@ -876,14 +984,10 @@ namespace detail {
                 static_cast<unsigned long long>(baseline),
                 hex_expected,
                 hex_computed,
-                static_cast<unsigned long long>(lo),
-                static_cast<unsigned long long>(hi),
-                static_cast<unsigned long long>(k0v),
-                static_cast<unsigned long long>(k1v),
-                hex_secret,
-                hex_key,
-                hex_first,
-                hex_last);
+                static_cast<unsigned long long>(secret_hash),
+                static_cast<unsigned long long>(key_hash),
+                static_cast<unsigned long long>(first_hash),
+                static_cast<unsigned long long>(last_hash));
         }
         SecureZeroMemory(base_secret, sizeof(base_secret));
         SecureZeroMemory(key, sizeof(key));
@@ -903,6 +1007,341 @@ __forceinline uint64_t hash_memory_fixed_key(const void* data, size_t size,
                                               uint64_t k0, uint64_t k1)
 {
     return siphash::hash(static_cast<const uint8_t*>(data), size, k0, k1);
+}
+
+namespace detail {
+
+struct cached_code_layout_t
+{
+    std::mutex mtx;
+    bool valid = false;
+    uint64_t module_base = 0;
+    uint64_t module_end = 0;
+    uint64_t text_base = 0;
+    uint32_t text_size = 0;
+    uint32_t section_index = 0;
+    uint32_t section_count = 0;
+    uint32_t section_characteristics = 0;
+    uint8_t text_sha256[32] = {};
+};
+
+inline cached_code_layout_t& code_layout_cache()
+{
+    static cached_code_layout_t v;
+    return v;
+}
+
+inline void store_code_layout_cache(uint64_t module_base,
+                                    uint64_t module_end,
+                                    uint64_t text_base,
+                                    uint32_t text_size,
+                                    uint32_t section_index,
+                                    uint32_t section_count,
+                                    uint32_t section_characteristics,
+                                    const uint8_t text_sha256[32])
+{
+    auto& cache = code_layout_cache();
+    std::lock_guard<std::mutex> lk(cache.mtx);
+    cache.valid = true;
+    cache.module_base = module_base;
+    cache.module_end = module_end;
+    cache.text_base = text_base;
+    cache.text_size = text_size;
+    cache.section_index = section_index;
+    cache.section_count = section_count;
+    cache.section_characteristics = section_characteristics;
+    memcpy(cache.text_sha256, text_sha256, 32);
+}
+
+inline bool load_code_layout_cache(uint64_t module_base,
+                                   cached_code_layout_t& out)
+{
+    auto& cache = code_layout_cache();
+    std::lock_guard<std::mutex> lk(cache.mtx);
+    if (!cache.valid || cache.module_base != module_base)
+        return false;
+    out.valid = cache.valid;
+    out.module_base = cache.module_base;
+    out.module_end = cache.module_end;
+    out.text_base = cache.text_base;
+    out.text_size = cache.text_size;
+    out.section_index = cache.section_index;
+    out.section_count = cache.section_count;
+    out.section_characteristics = cache.section_characteristics;
+    memcpy(out.text_sha256, cache.text_sha256, 32);
+    return true;
+}
+
+inline bool snapshot_code_from_layout(state::code_snapshot_t& snap,
+                                      uint64_t module_base,
+                                      uint64_t module_end,
+                                      uint64_t text_base,
+                                      uint32_t text_size,
+                                      uint32_t section_index,
+                                      uint32_t section_count,
+                                      uint32_t section_characteristics,
+                                      const char* source,
+                                      const uint8_t* expected_sha256,
+                                      bool update_cache)
+{
+    if (module_base == 0 || text_base == 0 || text_size == 0)
+    {
+        webhook::write_log_critical_fmt("integrity",
+            "snapshot_code_%s_invalid_layout module_base=0x%llX module_end=0x%llX text_base=0x%llX text_size=0x%X",
+            source,
+            static_cast<unsigned long long>(module_base),
+            static_cast<unsigned long long>(module_end),
+            static_cast<unsigned long long>(text_base),
+            text_size);
+        return false;
+    }
+
+    if (module_end != 0 && (text_base < module_base || text_base + text_size > module_end || text_base + text_size < text_base))
+    {
+        webhook::write_log_critical_fmt("integrity",
+            "snapshot_code_%s_text_out_of_image module_base=0x%llX module_end=0x%llX text_base=0x%llX text_size=0x%X",
+            source,
+            static_cast<unsigned long long>(module_base),
+            static_cast<unsigned long long>(module_end),
+            static_cast<unsigned long long>(text_base),
+            text_size);
+        return false;
+    }
+
+    MEMORY_BASIC_INFORMATION mbi{};
+    SIZE_T vq = VirtualQuery(reinterpret_cast<const void*>(text_base), &mbi, sizeof(mbi));
+    if (vq == 0 || mbi.State != MEM_COMMIT)
+    {
+        webhook::write_log_critical_fmt("integrity",
+            "snapshot_code_%s_text_vq_failed vq=%zu state=0x%lX protect=0x%lX err=%lu text_base=0x%llX text_size=0x%X",
+            source,
+            static_cast<size_t>(vq),
+            static_cast<unsigned long>(mbi.State),
+            static_cast<unsigned long>(mbi.Protect),
+            vq == 0 ? GetLastError() : 0,
+            static_cast<unsigned long long>(text_base),
+            text_size);
+        return false;
+    }
+
+    uint8_t stable_sha256[32] = {};
+    if (!sha256::hash(reinterpret_cast<const void*>(text_base), text_size, stable_sha256))
+    {
+        webhook::write_log_critical_fmt("integrity",
+            "snapshot_code_%s_sha256_failed text_base=0x%llX text_size=0x%X",
+            source,
+            static_cast<unsigned long long>(text_base),
+            text_size);
+        return false;
+    }
+
+    if (expected_sha256 && memcmp(stable_sha256, expected_sha256, 32) != 0)
+    {
+        char expected_hex[65];
+        char actual_hex[65];
+        diag::hex_encode(expected_hex, sizeof(expected_hex), expected_sha256, 32);
+        diag::hex_encode(actual_hex, sizeof(actual_hex), stable_sha256, 32);
+        webhook::write_log_critical_fmt("integrity",
+            "snapshot_code_%s_cached_text_sha_mismatch module_base=0x%llX text_base=0x%llX text_size=0x%X expected=%s actual=%s",
+            source,
+            static_cast<unsigned long long>(module_base),
+            static_cast<unsigned long long>(text_base),
+            text_size,
+            expected_hex,
+            actual_hex);
+        return false;
+    }
+
+    state::code_snapshot_t next{};
+    next.module_base = module_base;
+    next.module_end = module_end;
+    next.text_base = text_base;
+    next.text_size = text_size;
+    memcpy(next.text_sha256, stable_sha256, 32);
+
+    derive_session_keys(reinterpret_cast<const uint8_t*>(next.text_base), next.text_size);
+    next.text_hash = hash_memory(reinterpret_cast<const void*>(next.text_base), next.text_size);
+
+    uint64_t seed_value = fresh_entropy();
+    if (seed_value == 0) seed_value = 0xA1DAA0E2DEADBEEFULL;
+    s_self_chain_seed.store(seed_value, std::memory_order_release);
+    uint64_t per_call = siphash::siphash_3u64(seed_value, load_k0(), load_k1());
+    uint64_t chain = self_hash_chain_compute(per_call);
+    if (chain != 0)
+    {
+        uint8_t mat[16];
+        memcpy(mat + 0, &chain, 8);
+        memcpy(mat + 8, &per_call, 8);
+        uint8_t mac[32] = {};
+        uint8_t base_secret[32] = {};
+        bool secret_ok = compute_session_secret(base_secret);
+        bool hmac_ok = secret_ok && sha256::hmac(base_secret, 32, mat, sizeof(mat), mac);
+        SecureZeroMemory(base_secret, sizeof(base_secret));
+        if (hmac_ok)
+        {
+            uint64_t anchor = 0;
+            memcpy(&anchor, mac, 8);
+            s_self_chain_anchor.store(anchor ^ seed_value, std::memory_order_release);
+        }
+        else
+        {
+            s_self_chain_anchor.store(0, std::memory_order_release);
+        }
+        SecureZeroMemory(mac, sizeof(mac));
+        SecureZeroMemory(mat, sizeof(mat));
+    }
+    else
+    {
+        s_self_chain_anchor.store(0, std::memory_order_release);
+    }
+
+    {
+        auto& pt = page_table();
+        std::lock_guard<std::mutex> lk(pt.mtx);
+        uint64_t rebuild_tick = GetTickCount64();
+        webhook::write_log_critical_fmt("integrity",
+            "snapshot_code_%s_page_table_rebuild_enter pid=%lu tid=%lu tick=%llu text_base=0x%llX text_size=0x%X",
+            source,
+            GetCurrentProcessId(),
+            GetCurrentThreadId(),
+            static_cast<unsigned long long>(rebuild_tick),
+            static_cast<unsigned long long>(next.text_base),
+            next.text_size);
+        bool rebuilt = rebuild_page_table_locked(pt, next.text_base, next.text_size);
+        webhook::write_log_critical_fmt("integrity",
+            "snapshot_code_%s_page_table_rebuild_exit rebuilt=%d elapsed_ms=%llu text_base=0x%llX text_size=0x%X",
+            source,
+            rebuilt ? 1 : 0,
+            static_cast<unsigned long long>(GetTickCount64() - rebuild_tick),
+            static_cast<unsigned long long>(next.text_base),
+            next.text_size);
+        if (!rebuilt)
+        {
+            webhook::write_log_critical_fmt("integrity",
+                "snapshot_code_%s_page_table_rebuild_failed text_base=0x%llX text_size=0x%X",
+                source,
+                static_cast<unsigned long long>(next.text_base),
+                next.text_size);
+            return false;
+        }
+    }
+
+    if (tpm_attest::is_available())
+        tpm_attest::extend_version_pcr(next.text_sha256);
+
+    if (next.text_hash == 0)
+    {
+        webhook::write_log_critical_fmt("integrity",
+            "snapshot_code_%s_zero_text_hash text_base=0x%llX text_size=0x%X",
+            source,
+            static_cast<unsigned long long>(next.text_base),
+            next.text_size);
+        return false;
+    }
+
+    snap = next;
+    if (update_cache)
+        store_code_layout_cache(module_base, module_end, text_base, text_size,
+            section_index, section_count, section_characteristics, next.text_sha256);
+
+    webhook::write_log_critical_fmt("integrity",
+        "snapshot_code_%s_ok module_base=0x%llX module_end=0x%llX text_base=0x%llX text_size=0x%X text_hash=0x%016llX section=%u/%u chars=0x%X cache_update=%d",
+        source,
+        static_cast<unsigned long long>(snap.module_base),
+        static_cast<unsigned long long>(snap.module_end),
+        static_cast<unsigned long long>(snap.text_base),
+        snap.text_size,
+        static_cast<unsigned long long>(snap.text_hash),
+        section_index,
+        section_count,
+        section_characteristics,
+        update_cache ? 1 : 0);
+    return true;
+}
+
+struct live_pe_layout_t
+{
+    const char* fail_reason = "unknown";
+    DWORD seh_code = 0;
+    uint16_t dos_magic = 0;
+    LONG e_lfanew = 0;
+    DWORD nt_signature = 0;
+    WORD opt_magic = 0;
+    WORD section_count = 0;
+    DWORD size_of_image = 0;
+    uint64_t text_base = 0;
+    uint32_t text_size = 0;
+    uint32_t section_index = 0;
+    uint32_t section_characteristics = 0;
+    bool parsed = false;
+};
+
+__declspec(noinline) static void read_live_pe_layout_seh(HMODULE mod,
+                                                         uint64_t module_base,
+                                                         live_pe_layout_t& out)
+{
+    __try
+    {
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(mod);
+        out.dos_magic = dos->e_magic;
+        out.e_lfanew = dos->e_lfanew;
+        if (out.dos_magic != IMAGE_DOS_SIGNATURE)
+        {
+            out.fail_reason = "bad_dos_magic";
+        }
+        else if (out.e_lfanew <= 0 || static_cast<uint32_t>(out.e_lfanew) > 0x10000u)
+        {
+            out.fail_reason = "bad_e_lfanew";
+        }
+        else
+        {
+            const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(
+                reinterpret_cast<const uint8_t*>(mod) + out.e_lfanew);
+            out.nt_signature = nt->Signature;
+            out.opt_magic = nt->OptionalHeader.Magic;
+            out.section_count = nt->FileHeader.NumberOfSections;
+            out.size_of_image = nt->OptionalHeader.SizeOfImage;
+            if (out.nt_signature != IMAGE_NT_SIGNATURE)
+            {
+                out.fail_reason = "bad_nt_signature";
+            }
+            else if (out.opt_magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+            {
+                out.fail_reason = "bad_optional_magic";
+            }
+            else if (out.section_count == 0 || out.section_count > 96)
+            {
+                out.fail_reason = "bad_section_count";
+            }
+            else
+            {
+                const auto* sec = IMAGE_FIRST_SECTION(nt);
+                for (WORD i = 0; i < out.section_count; ++i)
+                {
+                    if ((sec[i].Characteristics & IMAGE_SCN_CNT_CODE) != 0
+                        && sec[i].Misc.VirtualSize > 0)
+                    {
+                        out.text_base = module_base + sec[i].VirtualAddress;
+                        out.text_size = sec[i].Misc.VirtualSize;
+                        out.section_index = i;
+                        out.section_characteristics = sec[i].Characteristics;
+                        out.parsed = true;
+                        out.fail_reason = "none";
+                        break;
+                    }
+                }
+                if (!out.parsed)
+                    out.fail_reason = "no_code_section";
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        out.seh_code = GetExceptionCode();
+        out.fail_reason = "seh";
+    }
+}
+
 }
 
 struct block_chain_verify_result_t
@@ -1056,89 +1495,165 @@ inline bool verify_self_hash()
 inline bool snapshot_code(state::code_snapshot_t& snap)
 {
     HMODULE mod = GetModuleHandleW(nullptr);
-    if (!mod) return false;
-
-    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(mod);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
-
-    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(
-        reinterpret_cast<const uint8_t*>(mod) + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
-
-    const auto* sec = IMAGE_FIRST_SECTION(nt);
-    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i)
+    if (!mod)
     {
-        if ((sec[i].Characteristics & IMAGE_SCN_CNT_CODE) != 0
-            && sec[i].Misc.VirtualSize > 0)
-        {
-            snap.text_base = reinterpret_cast<uint64_t>(mod) + sec[i].VirtualAddress;
-            snap.text_size = sec[i].Misc.VirtualSize;
-            break;
-        }
+        webhook::write_log_critical("integrity", "snapshot_code_failed_no_module");
+        return false;
     }
 
+    uint64_t module_base = reinterpret_cast<uint64_t>(mod);
+    uint64_t module_end = 0;
+    uint32_t module_size = 0;
     MODULEINFO mi{};
     if (GetModuleInformation(GetCurrentProcess(), mod, &mi, sizeof(mi)))
     {
-        snap.module_base = reinterpret_cast<uint64_t>(mod);
-        snap.module_end = snap.module_base + mi.SizeOfImage;
+        module_size = mi.SizeOfImage;
+        module_end = module_base + mi.SizeOfImage;
     }
 
-    if (snap.text_base == 0 || snap.text_size == 0) return false;
+    detail::live_pe_layout_t live{};
+    detail::read_live_pe_layout_seh(mod, module_base, live);
 
-    detail::derive_session_keys(
-        reinterpret_cast<const uint8_t*>(snap.text_base), snap.text_size);
+    if (module_end == 0 && live.size_of_image != 0)
+        module_end = module_base + live.size_of_image;
 
-    snap.text_hash = hash_memory(
-        reinterpret_cast<const void*>(snap.text_base), snap.text_size);
-
-    sha256::hash(reinterpret_cast<const void*>(snap.text_base),
-                 snap.text_size, snap.text_sha256);
-
-    uint64_t seed_value = detail::fresh_entropy();
-    if (seed_value == 0) seed_value = 0xA1DAA0E2DEADBEEFULL;
-    detail::s_self_chain_seed.store(seed_value, std::memory_order_release);
-    uint64_t per_call = siphash::siphash_3u64(seed_value, detail::load_k0(), detail::load_k1());
-    uint64_t chain = detail::self_hash_chain_compute(per_call);
-    if (chain != 0)
+    if (live.parsed)
     {
-        uint8_t mat[16];
-        memcpy(mat + 0, &chain, 8);
-        memcpy(mat + 8, &per_call, 8);
-        uint8_t mac[32] = {};
-        uint8_t base_secret[32] = {};
-        bool secret_ok = detail::compute_session_secret(base_secret);
-        bool hmac_ok = secret_ok && sha256::hmac(base_secret, 32, mat, sizeof(mat), mac);
-        SecureZeroMemory(base_secret, sizeof(base_secret));
-        if (hmac_ok)
+        return detail::snapshot_code_from_layout(snap,
+            module_base,
+            module_end,
+            live.text_base,
+            live.text_size,
+            live.section_index,
+            live.section_count,
+            live.section_characteristics,
+            "live_pe",
+            nullptr,
+            true);
+    }
+
+    webhook::write_log_critical_fmt("integrity",
+        "snapshot_code_live_pe_failed reason=%s module_base=0x%llX module_size=0x%X module_end=0x%llX dos_magic=0x%04X e_lfanew=0x%lX nt_sig=0x%08lX opt_magic=0x%04X sections=%u sizeof_image=0x%lX seh=0x%08lX prior_base=0x%llX prior_size=0x%X prior_hash=0x%016llX",
+        live.fail_reason,
+        static_cast<unsigned long long>(module_base),
+        module_size,
+        static_cast<unsigned long long>(module_end),
+        live.dos_magic,
+        static_cast<unsigned long>(live.e_lfanew),
+        static_cast<unsigned long>(live.nt_signature),
+        live.opt_magic,
+        live.section_count,
+        static_cast<unsigned long>(live.size_of_image),
+        static_cast<unsigned long>(live.seh_code),
+        static_cast<unsigned long long>(snap.text_base),
+        snap.text_size,
+        static_cast<unsigned long long>(snap.text_hash));
+
+    if (snap.text_base != 0 && snap.text_size != 0 && snap.text_hash != 0)
+    {
+        uint8_t current_sha[32] = {};
+        MEMORY_BASIC_INFORMATION prior_mbi{};
+        SIZE_T prior_vq = VirtualQuery(reinterpret_cast<const void*>(snap.text_base), &prior_mbi, sizeof(prior_mbi));
+        uint64_t prior_hash_tick = GetTickCount64();
+        webhook::write_log_critical_fmt("integrity",
+            "snapshot_code_prior_baseline_hash_pre pid=%lu tid=%lu tick=%llu text_base=0x%llX text_size=0x%X hash=0x%016llX vq=%llu mbi_base=0x%llX alloc_base=0x%llX region=0x%llX state=0x%lX protect=0x%lX type=0x%lX",
+            GetCurrentProcessId(),
+            GetCurrentThreadId(),
+            static_cast<unsigned long long>(prior_hash_tick),
+            static_cast<unsigned long long>(snap.text_base),
+            snap.text_size,
+            static_cast<unsigned long long>(snap.text_hash),
+            static_cast<unsigned long long>(prior_vq),
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(prior_mbi.BaseAddress)),
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(prior_mbi.AllocationBase)),
+            static_cast<unsigned long long>(prior_mbi.RegionSize),
+            static_cast<unsigned long>(prior_mbi.State),
+            static_cast<unsigned long>(prior_mbi.Protect),
+            static_cast<unsigned long>(prior_mbi.Type));
+        bool prior_hash_ok = sha256::hash(reinterpret_cast<const void*>(snap.text_base), snap.text_size, current_sha);
+        bool prior_match = prior_hash_ok && memcmp(current_sha, snap.text_sha256, 32) == 0;
+        webhook::write_log_critical_fmt("integrity",
+            "snapshot_code_prior_baseline_hash_post hash_ok=%d match=%d elapsed_ms=%llu text_base=0x%llX text_size=0x%X",
+            prior_hash_ok ? 1 : 0,
+            prior_match ? 1 : 0,
+            static_cast<unsigned long long>(GetTickCount64() - prior_hash_tick),
+            static_cast<unsigned long long>(snap.text_base),
+            snap.text_size);
+        if (prior_match)
         {
-            uint64_t anchor = 0;
-            memcpy(&anchor, mac, 8);
-            detail::s_self_chain_anchor.store(anchor ^ seed_value, std::memory_order_release);
+            webhook::write_log_critical_fmt("integrity",
+                "snapshot_code_prior_baseline_reuse module_base=0x%llX text_base=0x%llX text_size=0x%X hash=0x%016llX",
+                static_cast<unsigned long long>(snap.module_base),
+                static_cast<unsigned long long>(snap.text_base),
+                snap.text_size,
+                static_cast<unsigned long long>(snap.text_hash));
+            bool rebuilt = false;
+            uint64_t rebuild_tick = GetTickCount64();
+            webhook::write_log_critical_fmt("integrity",
+                "snapshot_code_prior_baseline_rebuild_enter pid=%lu tid=%lu tick=%llu text_base=0x%llX text_size=0x%X",
+                GetCurrentProcessId(),
+                GetCurrentThreadId(),
+                static_cast<unsigned long long>(rebuild_tick),
+                static_cast<unsigned long long>(snap.text_base),
+                snap.text_size);
+            {
+                auto& pt = detail::page_table();
+                std::lock_guard<std::mutex> lk(pt.mtx);
+                rebuilt = detail::rebuild_page_table_locked(pt, snap.text_base, snap.text_size);
+            }
+            webhook::write_log_critical_fmt("integrity",
+                "snapshot_code_prior_baseline_rebuild_exit rebuilt=%d elapsed_ms=%llu text_base=0x%llX text_size=0x%X",
+                rebuilt ? 1 : 0,
+                static_cast<unsigned long long>(GetTickCount64() - rebuild_tick),
+                static_cast<unsigned long long>(snap.text_base),
+                snap.text_size);
+            if (rebuilt)
+            {
+                webhook::write_log_critical("integrity", "snapshot_code_prior_baseline_reuse_return_true");
+                return true;
+            }
+            webhook::write_log_critical("integrity", "snapshot_code_prior_baseline_page_table_rebuild_failed");
         }
         else
         {
-            detail::s_self_chain_anchor.store(0, std::memory_order_release);
+            webhook::write_log_critical_fmt("integrity",
+                "snapshot_code_prior_baseline_sha_failed_or_mismatch hash_ok=%d match=%d text_base=0x%llX text_size=0x%X",
+                prior_hash_ok ? 1 : 0,
+                prior_match ? 1 : 0,
+                static_cast<unsigned long long>(snap.text_base),
+                snap.text_size);
         }
-        SecureZeroMemory(mac, sizeof(mac));
-        SecureZeroMemory(mat, sizeof(mat));
     }
-    else
+
+    detail::cached_code_layout_t cache{};
+    if (!detail::load_code_layout_cache(module_base, cache))
     {
-        detail::s_self_chain_anchor.store(0, std::memory_order_release);
+        webhook::write_log_critical_fmt("integrity",
+            "snapshot_code_cached_layout_unavailable module_base=0x%llX",
+            static_cast<unsigned long long>(module_base));
+        return false;
     }
 
-    {
-        auto& pt = detail::page_table();
-        std::lock_guard<std::mutex> lk(pt.mtx);
-        if (!detail::rebuild_page_table_locked(pt, snap.text_base, snap.text_size))
-            return false;
-    }
-
-    if (tpm_attest::is_available())
-        tpm_attest::extend_version_pcr(snap.text_sha256);
-
-    return snap.text_hash != 0;
+    webhook::write_log_critical_fmt("integrity",
+        "snapshot_code_cached_layout_attempt module_base=0x%llX module_end=0x%llX text_base=0x%llX text_size=0x%X section=%u/%u chars=0x%X",
+        static_cast<unsigned long long>(cache.module_base),
+        static_cast<unsigned long long>(cache.module_end),
+        static_cast<unsigned long long>(cache.text_base),
+        cache.text_size,
+        cache.section_index,
+        cache.section_count,
+        cache.section_characteristics);
+    return detail::snapshot_code_from_layout(snap,
+        cache.module_base,
+        cache.module_end,
+        cache.text_base,
+        cache.text_size,
+        cache.section_index,
+        cache.section_count,
+        cache.section_characteristics,
+        "cached_layout",
+        cache.text_sha256,
+        false);
 }
 
 inline bool verify_usermode(const state::code_snapshot_t& snap)
@@ -1165,26 +1680,64 @@ inline bool verify_usermode(const state::code_snapshot_t& snap)
 
 inline void snapshot_iat(std::vector<state::iat_entry_t>& snap)
 {
+    const uint64_t started = GetTickCount64();
+    webhook::write_log_critical_fmt("integrity",
+        "snapshot_iat_enter pid=%lu tid=%lu tick=%llu prior_entries=%zu",
+        GetCurrentProcessId(),
+        GetCurrentThreadId(),
+        static_cast<unsigned long long>(started),
+        snap.size());
     snap.clear();
 
     HMODULE mod = GetModuleHandleW(nullptr);
-    if (!mod) return;
+    if (!mod) {
+        webhook::write_log_critical_fmt("integrity",
+            "snapshot_iat_exit reason=no_module err=%lu elapsed_ms=%llu",
+            static_cast<unsigned long>(GetLastError()),
+            static_cast<unsigned long long>(GetTickCount64() - started));
+        return;
+    }
 
     const auto* base = reinterpret_cast<const uint8_t*>(mod);
     const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+        webhook::write_log_critical_fmt("integrity",
+            "snapshot_iat_exit reason=bad_dos module=0x%llX dos=0x%04X elapsed_ms=%llu",
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(mod)),
+            dos->e_magic,
+            static_cast<unsigned long long>(GetTickCount64() - started));
+        return;
+    }
 
     const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+    if (nt->Signature != IMAGE_NT_SIGNATURE) {
+        webhook::write_log_critical_fmt("integrity",
+            "snapshot_iat_exit reason=bad_nt module=0x%llX e_lfanew=0x%lX sig=0x%08lX elapsed_ms=%llu",
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(mod)),
+            static_cast<unsigned long>(dos->e_lfanew),
+            static_cast<unsigned long>(nt->Signature),
+            static_cast<unsigned long long>(GetTickCount64() - started));
+        return;
+    }
 
     const auto& imp_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    if (imp_dir.VirtualAddress == 0 || imp_dir.Size == 0) return;
+    if (imp_dir.VirtualAddress == 0 || imp_dir.Size == 0) {
+        webhook::write_log_critical_fmt("integrity",
+            "snapshot_iat_exit reason=no_import_dir module=0x%llX import_rva=0x%lX import_size=0x%lX elapsed_ms=%llu",
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(mod)),
+            static_cast<unsigned long>(imp_dir.VirtualAddress),
+            static_cast<unsigned long>(imp_dir.Size),
+            static_cast<unsigned long long>(GetTickCount64() - started));
+        return;
+    }
 
     auto* imp = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(
         base + imp_dir.VirtualAddress);
 
+    uint32_t descriptor_count = 0;
     for (; imp->Name != 0; ++imp)
     {
+        ++descriptor_count;
         auto* thunk = reinterpret_cast<const IMAGE_THUNK_DATA64*>(
             base + imp->FirstThunk);
 
@@ -1196,6 +1749,14 @@ inline void snapshot_iat(std::vector<state::iat_entry_t>& snap)
             });
         }
     }
+    webhook::write_log_critical_fmt("integrity",
+        "snapshot_iat_exit reason=ok module=0x%llX descriptors=%u entries=%zu import_rva=0x%lX import_size=0x%lX elapsed_ms=%llu",
+        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(mod)),
+        descriptor_count,
+        snap.size(),
+        static_cast<unsigned long>(imp_dir.VirtualAddress),
+        static_cast<unsigned long>(imp_dir.Size),
+        static_cast<unsigned long long>(GetTickCount64() - started));
 }
 
 inline bool verify_iat(const std::vector<state::iat_entry_t>& snap)
@@ -1212,23 +1773,74 @@ inline bool verify_iat(const std::vector<state::iat_entry_t>& snap)
 inline bool verify_page_protections(const state::code_snapshot_t& snap)
 {
     if (snap.text_base == 0 || snap.text_size == 0)
+    {
+        webhook::write_log_critical_fmt("integrity",
+            "verify_page_protections_exit reason=empty_snapshot base=0x%llX size=0x%X",
+            static_cast<unsigned long long>(snap.text_base),
+            snap.text_size);
         return true;
+    }
 
+    const uint64_t started = GetTickCount64();
+    webhook::write_log_critical_fmt("integrity",
+        "verify_page_protections_enter pid=%lu tid=%lu tick=%llu base=0x%llX size=0x%X",
+        GetCurrentProcessId(),
+        GetCurrentThreadId(),
+        static_cast<unsigned long long>(started),
+        static_cast<unsigned long long>(snap.text_base),
+        snap.text_size);
     MEMORY_BASIC_INFORMATION mbi{};
     uint64_t addr = snap.text_base;
     const uint64_t end = snap.text_base + snap.text_size;
+    uint32_t region_count = 0;
 
     while (addr < end)
     {
-        if (VirtualQuery(reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi)) == 0)
+        SIZE_T vq = VirtualQuery(reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi));
+        if (vq == 0)
+        {
+            webhook::write_log_critical_fmt("integrity",
+                "verify_page_protections_exit reason=vq_failed addr=0x%llX err=%lu regions=%u elapsed_ms=%llu",
+                static_cast<unsigned long long>(addr),
+                static_cast<unsigned long>(GetLastError()),
+                region_count,
+                static_cast<unsigned long long>(GetTickCount64() - started));
             return false;
+        }
+
+        webhook::write_log_critical_fmt("integrity",
+            "verify_page_protections_region idx=%u addr=0x%llX vq=%llu base=0x%llX alloc=0x%llX region=0x%llX state=0x%lX protect=0x%lX type=0x%lX elapsed_ms=%llu",
+            region_count,
+            static_cast<unsigned long long>(addr),
+            static_cast<unsigned long long>(vq),
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(mbi.BaseAddress)),
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(mbi.AllocationBase)),
+            static_cast<unsigned long long>(mbi.RegionSize),
+            static_cast<unsigned long>(mbi.State),
+            static_cast<unsigned long>(mbi.Protect),
+            static_cast<unsigned long>(mbi.Type),
+            static_cast<unsigned long long>(GetTickCount64() - started));
 
         if (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE |
                            PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY))
+        {
+            webhook::write_log_critical_fmt("integrity",
+                "verify_page_protections_exit reason=writable_region idx=%u base=0x%llX region=0x%llX protect=0x%lX elapsed_ms=%llu",
+                region_count,
+                static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(mbi.BaseAddress)),
+                static_cast<unsigned long long>(mbi.RegionSize),
+                static_cast<unsigned long>(mbi.Protect),
+                static_cast<unsigned long long>(GetTickCount64() - started));
             return false;
+        }
 
         addr = reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize;
+        ++region_count;
     }
+    webhook::write_log_critical_fmt("integrity",
+        "verify_page_protections_exit reason=ok regions=%u elapsed_ms=%llu",
+        region_count,
+        static_cast<unsigned long long>(GetTickCount64() - started));
     return true;
 }
 
@@ -1480,7 +2092,7 @@ inline void rotate_page_keys_if_due()
 
 namespace periodic {
 
-    constexpr uint32_t kCadenceMs = 100;
+    constexpr uint32_t kCadenceMs = 5000;
     constexpr uint32_t kWorkerCount = 3;
 
     inline std::atomic<bool>& stop_flag()
@@ -1489,9 +2101,9 @@ namespace periodic {
         return v;
     }
 
-    inline std::vector<std::thread>& worker_threads()
+    inline std::atomic<uint64_t>& run_generation()
     {
-        static std::vector<std::thread> v;
+        static std::atomic<uint64_t> v{0};
         return v;
     }
 
@@ -1552,10 +2164,11 @@ namespace periodic {
         return signature;
     }
 
-    inline void worker_loop(int worker_id)
+    inline void worker_loop(int worker_id, uint64_t generation)
     {
         Sleep(50 * worker_id);
-        while (!stop_flag().load(std::memory_order_acquire))
+        while (!stop_flag().load(std::memory_order_acquire)
+            && run_generation().load(std::memory_order_acquire) == generation)
         {
             uint64_t start_ms = detail::qpc_now_ms();
             auto& pt = detail::page_table();
@@ -1688,31 +2301,79 @@ namespace periodic {
         }
     }
 
-    inline void start()
+    inline bool start()
     {
         auto& running = detail::periodic_running_flag();
         bool expected = false;
-        if (!running.compare_exchange_strong(expected, true)) return;
+        if (!running.compare_exchange_strong(expected, true))
+        {
+            webhook::write_log_critical("page_mac", "periodic_start_already_running");
+            return true;
+        }
         stop_flag().store(false, std::memory_order_release);
+        uint64_t generation = run_generation().fetch_add(1, std::memory_order_acq_rel) + 1;
+        uint32_t posted = 0;
         for (int i = 0; i < static_cast<int>(kWorkerCount); ++i)
         {
             try
             {
-                worker_threads().emplace_back(worker_loop, i);
+                bool ok = work_queue::post([i, generation]() {
+                    worker_loop(i, generation);
+                });
+                if (!ok)
+                {
+                    webhook::write_log_critical_fmt("page_mac",
+                        "periodic_worker_post_failed worker=%d posted=%u",
+                        i,
+                        posted);
+                    continue;
+                }
+                ++posted;
+                webhook::write_log_critical_fmt("page_mac",
+                    "periodic_worker_post_ok worker=%d posted=%u generation=%llu",
+                    i,
+                    posted,
+                    static_cast<unsigned long long>(generation));
             }
-            catch (...) {}
+            catch (const std::exception& ex)
+            {
+                webhook::write_log_critical_fmt("page_mac",
+                    "periodic_worker_post_exception worker=%d what=%.160s",
+                    i,
+                    ex.what());
+            }
+            catch (...)
+            {
+                webhook::write_log_critical_fmt("page_mac",
+                    "periodic_worker_post_unknown_exception worker=%d",
+                    i);
+            }
+        }
+        if (posted != kWorkerCount)
+        {
+            stop_flag().store(true, std::memory_order_release);
+            run_generation().fetch_add(1, std::memory_order_acq_rel);
+            running.store(false, std::memory_order_release);
+            webhook::write_log_critical_fmt("page_mac",
+                "periodic_start_failed posted=%u expected=%u generation=%llu",
+                posted,
+                kWorkerCount,
+                static_cast<unsigned long long>(generation));
+            return false;
         }
         install_page_mac_veh();
+        webhook::write_log_critical_fmt("page_mac",
+            "periodic_start_ok workers=%u generation=%llu",
+            posted,
+            static_cast<unsigned long long>(generation));
+        return true;
     }
 
     inline void stop()
     {
         stop_flag().store(true, std::memory_order_release);
-        for (auto& t : worker_threads())
-        {
-            if (t.joinable()) t.detach();
-        }
-        worker_threads().clear();
+        run_generation().fetch_add(1, std::memory_order_acq_rel);
+        invalidate_all_slots();
         detail::periodic_running_flag().store(false, std::memory_order_release);
     }
 

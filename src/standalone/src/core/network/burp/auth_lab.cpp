@@ -19,6 +19,7 @@
 #include <chrono>
 #include <cstring>
 #include <iomanip>
+#include <limits>
 #include <mutex>
 #include <random>
 #include <sstream>
@@ -26,9 +27,6 @@
 #include <vector>
 
 #include <openssl/evp.h>
-#include <openssl/provider.h>
-#include <openssl/params.h>
-#include <openssl/core_names.h>
 
 #include <zlib.h>
 
@@ -45,11 +43,8 @@ namespace {
 struct state_t
 {
     std::atomic<bool>   initialized{false};
-    std::atomic<bool>   legacy_loaded{false};
     std::mutex          err_mtx;
     std::string         last_err;
-    OSSL_PROVIDER*      legacy = nullptr;
-    OSSL_PROVIDER*      default_p = nullptr;
 };
 
 state_t& s()
@@ -317,13 +312,6 @@ bool md4_fallback_bytes(const uint8_t* data, size_t len, std::vector<uint8_t>& o
 
 bool evp_md4_bytes(const uint8_t* data, size_t len, std::vector<uint8_t>& out)
 {
-    EVP_MD* md4 = EVP_MD_fetch(nullptr, "MD4", nullptr);
-    if (md4) {
-        bool ok = evp_digest_bytes(md4, data, len, out);
-        EVP_MD_free(md4);
-        if (ok)
-            return true;
-    }
     return md4_fallback_bytes(data, len, out);
 }
 
@@ -336,55 +324,45 @@ bool hmac_md5_bytes(const uint8_t* key, size_t key_len,
                     const uint8_t* data, size_t data_len,
                     std::vector<uint8_t>& out)
 {
-    EVP_MAC* mac = EVP_MAC_fetch(nullptr, "HMAC", nullptr);
-    if (!mac) return false;
-    EVP_MAC_CTX* ctx = EVP_MAC_CTX_new(mac);
-    EVP_MAC_free(mac);
-    if (!ctx) return false;
-    char digest_name[] = "MD5";
-    OSSL_PARAM params[2];
-    params[0] = OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_DIGEST, digest_name, 0);
-    params[1] = OSSL_PARAM_construct_end();
-    bool ok = false;
-    if (EVP_MAC_init(ctx, key, key_len, params) > 0 &&
-        EVP_MAC_update(ctx, data, data_len) > 0) {
-        out.assign(EVP_MAX_MD_SIZE, 0);
-        size_t olen = out.size();
-        if (EVP_MAC_final(ctx, out.data(), &olen, out.size()) > 0) {
-            out.resize(olen);
-            ok = true;
-        }
-    }
-    EVP_MAC_CTX_free(ctx);
-    return ok;
-}
-
-bool ensure_legacy_provider_loaded()
-{
-    diag::log_tagged_fmt("auth_lab", "ensure_legacy_provider_loaded entry");
-    auto& st = s();
-    if (st.legacy_loaded.load(std::memory_order_acquire)) {
-        diag::log_tagged_fmt("auth_lab", "ensure_legacy_provider_loaded already_loaded");
-        return true;
-    }
-    diag::log_tagged_fmt("auth_lab", "ensure_legacy_provider_loaded loading_providers");
-    OSSL_PROVIDER* def = st.default_p ? nullptr : OSSL_PROVIDER_load(nullptr, "default");
-    OSSL_PROVIDER* legacy = OSSL_PROVIDER_load(nullptr, "legacy");
-    if (!legacy) {
-        diag::log_tagged_fmt("auth_lab", "ensure_legacy_provider_loaded error legacy_load_failed");
-        if (def && !st.default_p)
-            st.default_p = def;
-        else if (def)
-            OSSL_PROVIDER_unload(def);
-        set_err("legacy provider load failed");
+    if ((!key && key_len != 0) || (!data && data_len != 0))
         return false;
-    }
-    st.legacy = legacy;
-    if (def)
-        st.default_p = def;
-    st.legacy_loaded.store(true, std::memory_order_release);
-    diag::log_tagged_fmt("auth_lab", "ensure_legacy_provider_loaded success");
-    return true;
+    if (key_len > static_cast<size_t>(std::numeric_limits<ULONG>::max()) ||
+        data_len > static_cast<size_t>(std::numeric_limits<ULONG>::max()))
+        return false;
+
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    DWORD hash_len = 0;
+    DWORD cb = 0;
+    bool ok = false;
+
+    NTSTATUS st = BCryptOpenAlgorithmProvider(&alg, BCRYPT_MD5_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG);
+    if (!BCRYPT_SUCCESS(st)) goto cleanup;
+
+    st = BCryptGetProperty(alg, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&hash_len),
+        sizeof(hash_len), &cb, 0);
+    if (!BCRYPT_SUCCESS(st) || hash_len == 0) goto cleanup;
+
+    st = BCryptCreateHash(alg, &hash, nullptr, 0,
+        const_cast<PUCHAR>(reinterpret_cast<const UCHAR*>(key)),
+        static_cast<ULONG>(key_len), 0);
+    if (!BCRYPT_SUCCESS(st)) goto cleanup;
+
+    st = BCryptHashData(hash,
+        const_cast<PUCHAR>(reinterpret_cast<const UCHAR*>(data)),
+        static_cast<ULONG>(data_len), 0);
+    if (!BCRYPT_SUCCESS(st)) goto cleanup;
+
+    out.assign(hash_len, 0);
+    st = BCryptFinishHash(hash, reinterpret_cast<PUCHAR>(out.data()), hash_len, 0);
+    ok = BCRYPT_SUCCESS(st);
+    if (!ok)
+        out.clear();
+
+cleanup:
+    if (hash) BCryptDestroyHash(hash);
+    if (alg) BCryptCloseAlgorithmProvider(alg, 0);
+    return ok;
 }
 
 std::string parse_quoted_or_token(const std::string& v, size_t& pos)
@@ -603,7 +581,6 @@ bool initialize()
     auto& st = s();
     bool expected = false;
     if (!st.initialized.compare_exchange_strong(expected, true)) return true;
-    ensure_legacy_provider_loaded();
     diag::log_tagged("burp", "auth_lab_initialized");
     return true;
 }
@@ -616,9 +593,6 @@ void shutdown()
         diag::log_tagged_fmt("auth_lab", "shutdown already_stopped");
         return;
     }
-    if (st.legacy) { OSSL_PROVIDER_unload(st.legacy); st.legacy = nullptr; }
-    if (st.default_p) { OSSL_PROVIDER_unload(st.default_p); st.default_p = nullptr; }
-    st.legacy_loaded.store(false, std::memory_order_release);
     diag::log_tagged_fmt("auth_lab", "shutdown complete");
 }
 
@@ -846,8 +820,6 @@ std::string ntlm_type3(const std::string& type2_b64,
     if (target_info_off + target_info_len <= raw_type2.size()) {
         target_info.assign(t2 + target_info_off, t2 + target_info_off + target_info_len);
     }
-
-    (void)ensure_legacy_provider_loaded();
 
     std::vector<uint8_t> pass_utf16 = utf16le(pass);
     std::vector<uint8_t> ntlm_hash;

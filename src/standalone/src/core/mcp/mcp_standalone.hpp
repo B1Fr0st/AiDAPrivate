@@ -53,6 +53,8 @@ namespace mcp_standalone
 
     std::atomic<bool>* current_cancel_token() noexcept;
     bool current_call_cancelled() noexcept;
+    void set_ide_lifecycle_ready(bool ready) noexcept;
+    bool lifecycle_authorized(std::string* reason = nullptr);
 
     struct tool_def_t
     {

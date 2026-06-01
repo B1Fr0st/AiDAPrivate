@@ -171,7 +171,9 @@ struct state_t {
     std::deque<packet_entry_t>    captured_packets;
     size_t                        cap_max_packets = 8192;
     int                           cap_selected = -1;
-    bool                          cap_running = false;
+    std::atomic<bool>             cap_running{false};
+    std::atomic<bool>             cap_start_pending{false};
+    std::atomic<bool>             cap_stop_pending{false};
     uint32_t                      cap_filter_pid = 0;
     uint16_t                      cap_filter_port = 0;
     uint8_t                       cap_filter_protocol = 0;

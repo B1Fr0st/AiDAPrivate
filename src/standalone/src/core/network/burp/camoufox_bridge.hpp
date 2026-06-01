@@ -30,6 +30,8 @@ struct launch_config_t
     std::string              server_module      = "camoufox_reverse_mcp";
     std::vector<std::string> extra_args;
     int                      launch_timeout_ms  = 180000;
+    int                      window_width       = 1280;
+    int                      window_height      = 900;
 };
 
 enum class bridge_state_t : int

@@ -2085,7 +2085,7 @@ namespace arc_loader
         return true;
     }
 
-    void unload(loaded_module_t& mod)
+    static void unload_impl(loaded_module_t& mod, bool call_entry_detach)
     {
         g_last_error.clear();
 
@@ -2102,7 +2102,9 @@ namespace arc_loader
         }
 
         if (mod.initialized && mod.entry_point != nullptr) {
-            if (mod.sealed) {
+            if (!call_entry_detach) {
+                arc_breadcrumb("unload_dllmain_detach_suppressed_unbound");
+            } else if (mod.sealed) {
                 arc_breadcrumb("unload_dllmain_detach_skipped_sealed");
             } else {
                 using DllMain_t = BOOL(WINAPI*)(HINSTANCE, DWORD, LPVOID);
@@ -2161,6 +2163,16 @@ namespace arc_loader
         mod.ldr_unlinked         = false;
         mod.ldr_unlink_count     = 0;
         mod.unwind_isolated      = false;
+    }
+
+    void unload(loaded_module_t& mod)
+    {
+        unload_impl(mod, true);
+    }
+
+    void unload_without_detach(loaded_module_t& mod)
+    {
+        unload_impl(mod, false);
     }
 
     const std::string& last_error()

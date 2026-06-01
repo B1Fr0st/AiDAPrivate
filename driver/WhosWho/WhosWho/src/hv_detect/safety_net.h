@@ -299,6 +299,124 @@ namespace safety_net {
 		inline idt_regs_ecode_t* context_storage = 0;
 
 		inline bool should_disable_lbr = false;
+		inline volatile LONG64 last_exception_vector = -1;
+		inline volatile LONG64 last_exception_error_code = 0;
+		inline volatile LONG64 last_exception_rip = 0;
+		inline volatile LONG64 last_exception_rsp = 0;
+		inline volatile LONG probe_recovery_count = 0;
+		inline volatile LONG unresolved_exception_count = 0;
+		constexpr ULONG max_seh_runtime_functions = 0x20000;
+		constexpr ULONG max_seh_stack_qwords = 512;
+
+		inline bool is_canonical_address(uint64_t value) {
+			uint64_t upper = value >> 48;
+			return upper == 0 || upper == 0xFFFF;
+		}
+
+		inline bool safe_read_u64(uint64_t address, uint64_t* value) {
+			if (!value || !address || !is_canonical_address(address))
+				return false;
+
+			__try {
+				*value = *reinterpret_cast<uint64_t*>(address);
+				return true;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				*value = 0;
+				return false;
+			}
+		}
+
+		inline void publish_exception_snapshot(idt_regs_ecode_t* record) {
+			if (!record)
+				return;
+
+			_InterlockedExchange64(&last_exception_vector, static_cast<LONG64>(record->exception_vector));
+			_InterlockedExchange64(&last_exception_error_code, static_cast<LONG64>(record->error_code));
+			_InterlockedExchange64(&last_exception_rip, static_cast<LONG64>(record->rip));
+			_InterlockedExchange64(&last_exception_rsp, static_cast<LONG64>(record->rsp));
+		}
+
+		inline void get_last_exception_snapshot(uint64_t* vector, uint64_t* error_code, uint64_t* rip, uint64_t* rsp) {
+			if (vector)
+				*vector = static_cast<uint64_t>(_InterlockedCompareExchange64(&last_exception_vector, 0, 0));
+			if (error_code)
+				*error_code = static_cast<uint64_t>(_InterlockedCompareExchange64(&last_exception_error_code, 0, 0));
+			if (rip)
+				*rip = static_cast<uint64_t>(_InterlockedCompareExchange64(&last_exception_rip, 0, 0));
+			if (rsp)
+				*rsp = static_cast<uint64_t>(_InterlockedCompareExchange64(&last_exception_rsp, 0, 0));
+		}
+
+		inline LONG consume_probe_recovery_count(void) {
+			return _InterlockedExchange(&probe_recovery_count, 0);
+		}
+
+		inline LONG consume_unresolved_exception_count(void) {
+			return _InterlockedExchange(&unresolved_exception_count, 0);
+		}
+
+		inline bool is_rip_in_probe_helper(uint64_t rip, void (*proc)(void), uint64_t span) {
+			uint64_t start = reinterpret_cast<uint64_t>(proc);
+			return rip >= start && rip < start + span;
+		}
+
+		inline bool is_rip_in_probe_helper(uint64_t rip, void (*proc)(void*), uint64_t span) {
+			uint64_t start = reinterpret_cast<uint64_t>(proc);
+			return rip >= start && rip < start + span;
+		}
+
+		inline bool is_known_probe_helper_rip(uint64_t rip) {
+			return is_rip_in_probe_helper(rip, __lock_sidt, 32) ||
+				   is_rip_in_probe_helper(rip, __ss_fault_sidt, 32) ||
+				   is_rip_in_probe_helper(rip, __gp_fault_sidt, 32) ||
+				   is_rip_in_probe_helper(rip, __lock_lidt, 32) ||
+				   is_rip_in_probe_helper(rip, __ss_fault_lidt, 32) ||
+				   is_rip_in_probe_helper(rip, __gp_fault_lidt, 32) ||
+				   is_rip_in_probe_helper(rip, __cause_ve, 16);
+		}
+
+		inline void mark_unresolved_exception(idt_regs_ecode_t* record, const char* reason) {
+			publish_exception_snapshot(record);
+			_InterlockedIncrement(&unresolved_exception_count);
+			HVD_LOG("safety_exception_unresolved reason=%s vector=0x%llx error=0x%llx rip=0x%llx rsp=0x%llx cpu=%lu irql=%lu",
+				reason ? reason : "unknown",
+				record ? record->exception_vector : 0,
+				record ? record->error_code : 0,
+				record ? record->rip : 0,
+				record ? record->rsp : 0,
+				KeGetCurrentProcessorNumber(),
+				(ULONG)KeGetCurrentIrql());
+		}
+
+		inline bool recover_known_probe_helper_fault(idt_regs_ecode_t* record, const char* reason) {
+			if (!record || !is_known_probe_helper_rip(record->rip))
+				return false;
+			if (!record->rsp || !is_canonical_address(record->rsp))
+				return false;
+
+			uint64_t return_address = 0;
+			if (!safe_read_u64(record->rsp, &return_address))
+				return false;
+			if (return_address < g_image_base || return_address >= g_image_base + g_image_size)
+				return false;
+
+			_InterlockedIncrement(&probe_recovery_count);
+			HVD_LOG("safety_exception_probe_recovered reason=%s vector=0x%llx error=0x%llx rip=0x%llx return=0x%llx rsp=0x%llx cpu=%lu irql=%lu",
+				reason ? reason : "unknown",
+				record->exception_vector,
+				record->error_code,
+				record->rip,
+				return_address,
+				record->rsp,
+				KeGetCurrentProcessorNumber(),
+				(ULONG)KeGetCurrentIrql());
+
+			record->rip = return_address;
+			record->rsp += sizeof(uint64_t);
+			publish_exception_snapshot(record);
+			return true;
+		}
 
 
 		inline segment_descriptor_interrupt_gate_64 create_interrupt_gate(void* assembly_handler) {
@@ -357,6 +475,8 @@ namespace safety_net {
 		}
 
 		inline void safe_interrupt_record(idt_regs_ecode_t* record) {
+			publish_exception_snapshot(record);
+
 			if (!idt_inited || total_interrupts >= MAX_RECORDABLE_INTERRUPTS)
 				return;
 
@@ -436,15 +556,25 @@ namespace safety_net {
 			if (record->exception_vector == nmi)
 				return;
 
+			if (!g_image_base || !g_image_size || !is_canonical_address(g_image_base)) {
+				if (recover_known_probe_helper_fault(record, "image_context_unavailable"))
+					return;
+				mark_unresolved_exception(record, "image_context_unavailable");
+				return;
+			}
+
 			IMAGE_DOS_HEADER* dos_header = (IMAGE_DOS_HEADER*)g_image_base;
 			IMAGE_NT_HEADERS64* nt_headers = (IMAGE_NT_HEADERS64*)(g_image_base + dos_header->e_lfanew);
 			IMAGE_DATA_DIRECTORY* exception = &nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
 			RUNTIME_FUNCTION* rt_functions = (RUNTIME_FUNCTION*)(g_image_base + exception->VirtualAddress);
+			ULONG runtime_function_count = exception->Size / sizeof(RUNTIME_FUNCTION);
+			if (runtime_function_count > max_seh_runtime_functions)
+				runtime_function_count = max_seh_runtime_functions;
 
 			uint64_t rip_rva = record->rip - g_image_base;
 
 
-			for (ULONG idx = 0; idx < exception->Size / sizeof(RUNTIME_FUNCTION); ++idx) {
+			for (ULONG idx = 0; idx < runtime_function_count; ++idx) {
 				RUNTIME_FUNCTION* function = &rt_functions[idx];
 				if (!(rip_rva >= function->BeginAddress && rip_rva < function->EndAddress))
 					continue;
@@ -467,18 +597,29 @@ namespace safety_net {
 
 
 			uint64_t* stack_ptr = (uint64_t*)record->rsp;
-			while (stack_ptr) {
-				uint64_t potential_caller_rip = *stack_ptr;
+			for (ULONG stack_idx = 0; stack_ptr && stack_idx < max_seh_stack_qwords; ++stack_idx) {
+				uint64_t stack_slot = reinterpret_cast<uint64_t>(stack_ptr + stack_idx);
+				if (!is_canonical_address(stack_slot)) {
+					if (recover_known_probe_helper_fault(record, "seh_stack_noncanonical"))
+						return;
+					mark_unresolved_exception(record, "seh_stack_noncanonical");
+					return;
+				}
+
+				uint64_t potential_caller_rip = 0;
+				if (!safe_read_u64(stack_slot, &potential_caller_rip)) {
+					if (recover_known_probe_helper_fault(record, "seh_stack_read_failed"))
+						return;
+					mark_unresolved_exception(record, "seh_stack_read_failed");
+					return;
+				}
+				if (potential_caller_rip < g_image_base || potential_caller_rip >= g_image_base + g_image_size)
+					continue;
+
 				uint64_t potential_caller_rva = potential_caller_rip - g_image_base;
 
 
-				if (potential_caller_rva > g_image_size) {
-					stack_ptr++;
-					continue;
-				}
-
-
-				for (ULONG idx = 0; idx < exception->Size / sizeof(RUNTIME_FUNCTION); ++idx) {
+				for (ULONG idx = 0; idx < runtime_function_count; ++idx) {
 					RUNTIME_FUNCTION* function = &rt_functions[idx];
 					if (!(potential_caller_rva >= function->BeginAddress && potential_caller_rva < function->EndAddress))
 						continue;
@@ -493,15 +634,18 @@ namespace safety_net {
 						if (potential_caller_rva >= scope_record->BeginAddress && potential_caller_rva < scope_record->EndAddress) {
 
 							record->rip = g_image_base + scope_record->JumpTarget;
-							record->rsp = (uint64_t)(stack_ptr + 1);
+							record->rsp = (uint64_t)(stack_ptr + stack_idx + 1);
 
 							return;
 						}
 					}
 				}
-
-				stack_ptr++;
 			}
+
+			if (recover_known_probe_helper_fault(record, "seh_stack_scan_exhausted"))
+				return;
+
+			mark_unresolved_exception(record, "seh_stack_scan_exhausted");
 		}
 #else
 		;
@@ -820,6 +964,12 @@ namespace safety_net {
 
 
 	inline KPCR* safety_net_kpcr = 0;
+	inline volatile LONG safety_net_active = 0;
+	inline volatile LONG64 safety_net_start_sequence = 0;
+
+	inline bool interrupts_enabled(void) {
+		return (__readeflags() & 0x200ULL) != 0;
+	}
 
 	inline bool is_safety_net_active(void) {
 		if (!inited)
@@ -866,63 +1016,251 @@ namespace safety_net {
 	}
 
 	inline bool init_safety_net(uint64_t image_base, uint64_t image_size) {
-		if (!image_base || !image_size)
+		HVD_LOG_IMMEDIATE("safety_init_enter image_present=%u image_size=0x%llx inited=%u active=%ld cpu=%lu irql=%lu if=%u",
+			image_base != 0 ? 1u : 0u,
+			image_size,
+			inited ? 1u : 0u,
+			_InterlockedCompareExchange(&safety_net_active, 0, 0),
+			KeGetCurrentProcessorNumber(),
+			(ULONG)KeGetCurrentIrql(),
+			interrupts_enabled() ? 1u : 0u);
+		if (!image_base || !image_size) {
+			HVD_LOG_IMMEDIATE("safety_init_reject reason=missing_image cpu=%lu irql=%lu if=%u",
+				KeGetCurrentProcessorNumber(),
+				(ULONG)KeGetCurrentIrql(),
+				interrupts_enabled() ? 1u : 0u);
 			return false;
+		}
 
 		g_image_base = image_base;
 		g_image_size = image_size;
 
-		if (!gdt::init_gdt())
+		HVD_LOG_IMMEDIATE("safety_init_step_pre step=gdt cpu=%lu irql=%lu if=%u",
+			KeGetCurrentProcessorNumber(),
+			(ULONG)KeGetCurrentIrql(),
+			interrupts_enabled() ? 1u : 0u);
+		if (!gdt::init_gdt()) {
+			HVD_LOG_IMMEDIATE("safety_init_step_post step=gdt ok=0 cpu=%lu irql=%lu if=%u",
+				KeGetCurrentProcessorNumber(),
+				(ULONG)KeGetCurrentIrql(),
+				interrupts_enabled() ? 1u : 0u);
 			return false;
+		}
+		HVD_LOG_IMMEDIATE("safety_init_step_post step=gdt ok=1 cpu=%lu irql=%lu if=%u",
+			KeGetCurrentProcessorNumber(),
+			(ULONG)KeGetCurrentIrql(),
+			interrupts_enabled() ? 1u : 0u);
 
-		if (!idt::init_idt())
+		HVD_LOG_IMMEDIATE("safety_init_step_pre step=idt cpu=%lu irql=%lu if=%u",
+			KeGetCurrentProcessorNumber(),
+			(ULONG)KeGetCurrentIrql(),
+			interrupts_enabled() ? 1u : 0u);
+		if (!idt::init_idt()) {
+			HVD_LOG_IMMEDIATE("safety_init_step_post step=idt ok=0 cpu=%lu irql=%lu if=%u",
+				KeGetCurrentProcessorNumber(),
+				(ULONG)KeGetCurrentIrql(),
+				interrupts_enabled() ? 1u : 0u);
 			return false;
+		}
+		HVD_LOG_IMMEDIATE("safety_init_step_post step=idt ok=1 cpu=%lu irql=%lu if=%u",
+			KeGetCurrentProcessorNumber(),
+			(ULONG)KeGetCurrentIrql(),
+			interrupts_enabled() ? 1u : 0u);
 
-		if (!cpl::init_cpl_switcher())
+		HVD_LOG_IMMEDIATE("safety_init_step_pre step=cpl_switch cpu=%lu irql=%lu if=%u",
+			KeGetCurrentProcessorNumber(),
+			(ULONG)KeGetCurrentIrql(),
+			interrupts_enabled() ? 1u : 0u);
+		if (!cpl::init_cpl_switcher()) {
+			HVD_LOG_IMMEDIATE("safety_init_step_post step=cpl_switch ok=0 cpu=%lu irql=%lu if=%u",
+				KeGetCurrentProcessorNumber(),
+				(ULONG)KeGetCurrentIrql(),
+				interrupts_enabled() ? 1u : 0u);
 			return false;
+		}
+		HVD_LOG_IMMEDIATE("safety_init_step_post step=cpl_switch ok=1 cpu=%lu irql=%lu if=%u",
+			KeGetCurrentProcessorNumber(),
+			(ULONG)KeGetCurrentIrql(),
+			interrupts_enabled() ? 1u : 0u);
 
-		if (!execution_mode::init_execution_mode_changer())
+		HVD_LOG_IMMEDIATE("safety_init_step_pre step=execution_mode cpu=%lu irql=%lu if=%u",
+			KeGetCurrentProcessorNumber(),
+			(ULONG)KeGetCurrentIrql(),
+			interrupts_enabled() ? 1u : 0u);
+		if (!execution_mode::init_execution_mode_changer()) {
+			HVD_LOG_IMMEDIATE("safety_init_step_post step=execution_mode ok=0 cpu=%lu irql=%lu if=%u",
+				KeGetCurrentProcessorNumber(),
+				(ULONG)KeGetCurrentIrql(),
+				interrupts_enabled() ? 1u : 0u);
 			return false;
+		}
+		HVD_LOG_IMMEDIATE("safety_init_step_post step=execution_mode ok=1 cpu=%lu irql=%lu if=%u",
+			KeGetCurrentProcessorNumber(),
+			(ULONG)KeGetCurrentIrql(),
+			interrupts_enabled() ? 1u : 0u);
 
 		inited = true;
 
+		HVD_LOG_IMMEDIATE("safety_init_exit ok=1 image_size=0x%llx cpu=%lu irql=%lu if=%u",
+			image_size,
+			KeGetCurrentProcessorNumber(),
+			(ULONG)KeGetCurrentIrql(),
+			interrupts_enabled() ? 1u : 0u);
 		return true;
 	}
 
 	inline void free_safety_net(void) {
+		HVD_LOG_IMMEDIATE("safety_free_enter inited=%u active=%ld gdt=%u tss=%u stack=%u idt=%u ctx=%u compat_stack=%u compat_exec=%u compat_data=%u cpu=%lu irql=%lu if=%u",
+			inited ? 1u : 0u,
+			_InterlockedCompareExchange(&safety_net_active, 0, 0),
+			gdt::my_gdt ? 1u : 0u,
+			gdt::my_tss ? 1u : 0u,
+			gdt::interrupt_stack ? 1u : 0u,
+			idt::my_idt ? 1u : 0u,
+			idt::context_storage ? 1u : 0u,
+			execution_mode::compatibility_stack ? 1u : 0u,
+			execution_mode::compatibility_execution_page ? 1u : 0u,
+			execution_mode::compatibility_data_page ? 1u : 0u,
+			KeGetCurrentProcessorNumber(),
+			(ULONG)KeGetCurrentIrql(),
+			interrupts_enabled() ? 1u : 0u);
 
-		MmFreeContiguousMemory(gdt::my_gdt);
-		MmFreeContiguousMemory(gdt::my_tss);
-		MmFreeContiguousMemory(gdt::interrupt_stack);
+		if (gdt::my_gdt) {
+			MmFreeContiguousMemory(gdt::my_gdt);
+			gdt::my_gdt = 0;
+		}
+		if (gdt::my_tss) {
+			MmFreeContiguousMemory(gdt::my_tss);
+			gdt::my_tss = 0;
+		}
+		if (gdt::interrupt_stack) {
+			MmFreeContiguousMemory(gdt::interrupt_stack);
+			gdt::interrupt_stack = 0;
+		}
 
 
-		MmFreeContiguousMemory(idt::my_idt);
-		MmFreeContiguousMemory(idt::context_storage);
+		if (idt::my_idt) {
+			MmFreeContiguousMemory(idt::my_idt);
+			idt::my_idt = 0;
+		}
+		if (idt::context_storage) {
+			MmFreeContiguousMemory(idt::context_storage);
+			idt::context_storage = 0;
+		}
 
 
-		MmFreeContiguousMemory(execution_mode::compatibility_stack);
-		MmFreeContiguousMemory(execution_mode::compatibility_execution_page);
-		MmFreeContiguousMemory(execution_mode::compatibility_data_page);
+		if (execution_mode::compatibility_stack) {
+			MmFreeContiguousMemory(execution_mode::compatibility_stack);
+			execution_mode::compatibility_stack = 0;
+		}
+		if (execution_mode::compatibility_execution_page) {
+			MmFreeContiguousMemory(execution_mode::compatibility_execution_page);
+			execution_mode::compatibility_execution_page = 0;
+		}
+		if (execution_mode::compatibility_data_page) {
+			MmFreeContiguousMemory(execution_mode::compatibility_data_page);
+			execution_mode::compatibility_data_page = 0;
+		}
+		_InterlockedExchange(&safety_net_active, 0);
+		gdt::gdt_inited = false;
+		gdt::my_gdtr = { 0 };
+		idt::idt_inited = false;
+		idt::my_idtr = { 0 };
+		cpl::cpl_switching_inited = false;
+		execution_mode::execution_mode_changing_allocated = false;
+		execution_mode::execution_mode_changing_remapped = false;
+		inited = false;
+		HVD_LOG_IMMEDIATE("safety_free_exit cpu=%lu irql=%lu if=%u",
+			KeGetCurrentProcessorNumber(),
+			(ULONG)KeGetCurrentIrql(),
+			interrupts_enabled() ? 1u : 0u);
 	}
 
 
 	inline bool start_safety_net(safety_net_t& info_storage) {
-		if (!inited)
+		const LONG64 seq = _InterlockedIncrement64(&safety_net_start_sequence);
+		RtlZeroMemory(&info_storage, sizeof(info_storage));
+		HVD_LOG_IMMEDIATE("safety_start_enter seq=%lld inited=%u active=%ld physmem=%u cpu=%lu irql=%lu if=%u",
+			seq,
+			inited ? 1u : 0u,
+			_InterlockedCompareExchange(&safety_net_active, 0, 0),
+			physmem::is_initialized() ? 1u : 0u,
+			KeGetCurrentProcessorNumber(),
+			(ULONG)KeGetCurrentIrql(),
+			interrupts_enabled() ? 1u : 0u);
+		if (!inited || !physmem::is_initialized()) {
+			HVD_LOG_IMMEDIATE("safety_start_reject seq=%lld reason=not_initialized inited=%u physmem=%u cpu=%lu irql=%lu if=%u",
+				seq,
+				inited ? 1u : 0u,
+				physmem::is_initialized() ? 1u : 0u,
+				KeGetCurrentProcessorNumber(),
+				(ULONG)KeGetCurrentIrql(),
+				interrupts_enabled() ? 1u : 0u);
 			return false;
+		}
+		if (KeGetCurrentIrql() != PASSIVE_LEVEL || !interrupts_enabled()) {
+			HVD_LOG_IMMEDIATE("safety_start_reject seq=%lld reason=unsafe_precondition cpu=%lu irql=%lu if=%u",
+				seq,
+				KeGetCurrentProcessorNumber(),
+				(ULONG)KeGetCurrentIrql(),
+				interrupts_enabled() ? 1u : 0u);
+			return false;
+		}
+		if (_InterlockedCompareExchange(&safety_net_active, 1, 0) != 0) {
+			HVD_LOG_IMMEDIATE("safety_start_reject seq=%lld reason=already_active cpu=%lu irql=%lu if=%u",
+				seq,
+				KeGetCurrentProcessorNumber(),
+				(ULONG)KeGetCurrentIrql(),
+				interrupts_enabled() ? 1u : 0u);
+			return false;
+		}
 
-		_cli();
+		bool ok = false;
+		bool loaded_gdt = false;
+		bool wrote_segments = false;
+		bool wrote_tr = false;
+		bool loaded_idt = false;
+		bool loaded_cr3 = false;
+		bool loaded_cr4 = false;
+		bool wrote_gs = false;
+		ULONG failed_step = 0;
+		ULONG seh_code = 0;
 
+		__try {
+			failed_step = 1;
+			HVD_LOG_IMMEDIATE("safety_start_step_pre seq=%lld step=%lu name=cli cpu=%lu irql=%lu if=%u",
+				seq, failed_step, KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql(), interrupts_enabled() ? 1u : 0u);
+			_cli();
+			HVD_LOG_FAST("safety_start_step_post seq=%lld step=%lu name=cli ok=1 cpu=%lu irql=%lu if=%u",
+				seq, failed_step, KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql(), interrupts_enabled() ? 1u : 0u);
+
+			failed_step = 2;
+			HVD_LOG_FAST("safety_start_step_pre seq=%lld step=%lu name=gs_base cpu=%lu irql=%lu if=%u",
+				seq, failed_step, KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql(), interrupts_enabled() ? 1u : 0u);
 		info_storage.safed_kpcr = (KPCR*)__readmsr(IA32_GS_BASE);
-		if (safety_net_kpcr)
+		if (safety_net_kpcr) {
 			__writemsr(IA32_GS_BASE, (uint64_t)safety_net_kpcr);
+				wrote_gs = true;
+			}
+			HVD_LOG_FAST("safety_start_step_post seq=%lld step=%lu name=gs_base ok=1 kpcr_override=%u cpu=%lu irql=%lu if=%u",
+				seq, failed_step, wrote_gs ? 1u : 0u, KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql(), interrupts_enabled() ? 1u : 0u);
 
 
+			failed_step = 3;
+			HVD_LOG_FAST("safety_start_step_pre seq=%lld step=%lu name=sgdt_lgdt cpu=%lu irql=%lu if=%u",
+				seq, failed_step, KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql(), interrupts_enabled() ? 1u : 0u);
 		_sgdt(&info_storage.safed_gdtr);
 
 
 		_lgdt(&gdt::my_gdtr);
+			loaded_gdt = true;
+			HVD_LOG_FAST("safety_start_step_post seq=%lld step=%lu name=sgdt_lgdt ok=1 cpu=%lu irql=%lu if=%u",
+				seq, failed_step, KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql(), interrupts_enabled() ? 1u : 0u);
 
 
+			failed_step = 4;
+			HVD_LOG_FAST("safety_start_step_pre seq=%lld step=%lu name=segments cpu=%lu irql=%lu if=%u",
+				seq, failed_step, KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql(), interrupts_enabled() ? 1u : 0u);
 		info_storage.safed_ss = __read_ss().flags;
 		info_storage.safed_cs = __read_cs().flags;
 		info_storage.safed_tr = __read_tr().flags;
@@ -930,23 +1268,47 @@ namespace safety_net {
 
 		__write_ss(gdt::constructed_cpl0_ss.flags);
 		__write_cs(gdt::constructed_cpl0_cs.flags);
+			wrote_segments = true;
+			HVD_LOG_FAST("safety_start_step_post seq=%lld step=%lu name=segments ok=1 cpu=%lu irql=%lu if=%u",
+				seq, failed_step, KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql(), interrupts_enabled() ? 1u : 0u);
 
 
+			failed_step = 5;
+			HVD_LOG_FAST("safety_start_step_pre seq=%lld step=%lu name=tr cpu=%lu irql=%lu if=%u",
+				seq, failed_step, KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql(), interrupts_enabled() ? 1u : 0u);
 		gdt::my_gdt[gdt::constructed_tr.index].type = SEGMENT_DESCRIPTOR_TYPE_TSS_AVAILABLE;
 		__write_tr(gdt::constructed_tr.flags);
+			wrote_tr = true;
+			HVD_LOG_FAST("safety_start_step_post seq=%lld step=%lu name=tr ok=1 cpu=%lu irql=%lu if=%u",
+				seq, failed_step, KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql(), interrupts_enabled() ? 1u : 0u);
 
 
+			failed_step = 6;
+			HVD_LOG_FAST("safety_start_step_pre seq=%lld step=%lu name=sidt_lidt cpu=%lu irql=%lu if=%u",
+				seq, failed_step, KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql(), interrupts_enabled() ? 1u : 0u);
 		__sidt(&info_storage.safed_idtr);
 
 
 		__lidt(&idt::my_idtr);
+			loaded_idt = true;
+			HVD_LOG_FAST("safety_start_step_post seq=%lld step=%lu name=sidt_lidt ok=1 cpu=%lu irql=%lu if=%u",
+				seq, failed_step, KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql(), interrupts_enabled() ? 1u : 0u);
 
 
+			failed_step = 7;
+			HVD_LOG_FAST("safety_start_step_pre seq=%lld step=%lu name=cr3 cpu=%lu irql=%lu if=%u",
+				seq, failed_step, KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql(), interrupts_enabled() ? 1u : 0u);
 		info_storage.safed_cr3 = __readcr3();
 
 
 		__writecr3(physmem::util::get_constructed_cr3().flags);
+			loaded_cr3 = true;
+			HVD_LOG_FAST("safety_start_step_post seq=%lld step=%lu name=cr3 ok=1 cpu=%lu irql=%lu if=%u",
+				seq, failed_step, KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql(), interrupts_enabled() ? 1u : 0u);
 
+			failed_step = 8;
+			HVD_LOG_FAST("safety_start_step_pre seq=%lld step=%lu name=cr4 cpu=%lu irql=%lu if=%u",
+				seq, failed_step, KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql(), interrupts_enabled() ? 1u : 0u);
 		cr4 curr_cr4;
 		curr_cr4.flags = __readcr4();
 		info_storage.safed_cr4 = curr_cr4.flags;
@@ -954,31 +1316,172 @@ namespace safety_net {
 		curr_cr4.smap_enable = 0;
 		curr_cr4.smep_enable = 0;
 		__writecr4(curr_cr4.flags);
+			loaded_cr4 = true;
+			HVD_LOG_FAST("safety_start_step_post seq=%lld step=%lu name=cr4 ok=1 cpu=%lu irql=%lu if=%u",
+				seq, failed_step, KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql(), interrupts_enabled() ? 1u : 0u);
 
+			ok = true;
+		}
+		__except ((seh_code = GetExceptionCode()), EXCEPTION_EXECUTE_HANDLER) {
+			HVD_LOG_FAST("safety_start_exception seq=%lld step=%lu code=0x%08lx loaded_gdt=%u segments=%u tr=%u idt=%u cr3=%u cr4=%u gs=%u cpu=%lu irql=%lu if=%u",
+				seq,
+				failed_step,
+				seh_code,
+				loaded_gdt ? 1u : 0u,
+				wrote_segments ? 1u : 0u,
+				wrote_tr ? 1u : 0u,
+				loaded_idt ? 1u : 0u,
+				loaded_cr3 ? 1u : 0u,
+				loaded_cr4 ? 1u : 0u,
+				wrote_gs ? 1u : 0u,
+				KeGetCurrentProcessorNumber(),
+				(ULONG)KeGetCurrentIrql(),
+				interrupts_enabled() ? 1u : 0u);
+		}
+
+		if (!ok) {
+			__try {
+				if (loaded_cr4)
+					__writecr4(info_storage.safed_cr4);
+				if (loaded_cr3)
+					__writecr3(info_storage.safed_cr3);
+				if (loaded_idt)
+					__lidt(&info_storage.safed_idtr);
+				if (loaded_gdt)
+					_lgdt(&info_storage.safed_gdtr);
+				if (wrote_segments) {
+					__write_ss(info_storage.safed_ss);
+					__write_cs(info_storage.safed_cs);
+				}
+				if (wrote_tr) {
+					segment_descriptor_32* saved_gdt = (segment_descriptor_32*)info_storage.safed_gdtr.base_address;
+					segment_selector tr_selec;
+					tr_selec.flags = info_storage.safed_tr;
+					if (saved_gdt)
+						saved_gdt[tr_selec.index].type = SEGMENT_DESCRIPTOR_TYPE_TSS_AVAILABLE;
+					__write_tr(info_storage.safed_tr);
+				}
+				if (wrote_gs)
+					__writemsr(IA32_GS_BASE, (uint64_t)info_storage.safed_kpcr);
+				if (!interrupts_enabled())
+					_sti();
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				if (!interrupts_enabled())
+					_sti();
+			}
+			_InterlockedExchange(&safety_net_active, 0);
+			HVD_LOG_IMMEDIATE("safety_start_exit seq=%lld ok=0 failed_step=%lu exception=0x%08lx cpu=%lu irql=%lu if=%u",
+				seq,
+				failed_step,
+				seh_code,
+				KeGetCurrentProcessorNumber(),
+				(ULONG)KeGetCurrentIrql(),
+				interrupts_enabled() ? 1u : 0u);
+			return false;
+		}
+
+		HVD_LOG_FAST("safety_start_exit seq=%lld ok=1 cpu=%lu irql=%lu if=%u",
+			seq,
+			KeGetCurrentProcessorNumber(),
+			(ULONG)KeGetCurrentIrql(),
+			interrupts_enabled() ? 1u : 0u);
 		return true;
 	}
 
 	inline void stop_safety_net(safety_net_t& info_storage) {
+		const LONG64 seq = _InterlockedCompareExchange64(&safety_net_start_sequence, 0, 0);
+		ULONG failed_step = 0;
+		ULONG seh_code = 0;
+		bool ok = false;
+		HVD_LOG_FAST("safety_stop_enter seq=%lld active=%ld cpu=%lu irql=%lu if=%u",
+			seq,
+			_InterlockedCompareExchange(&safety_net_active, 0, 0),
+			KeGetCurrentProcessorNumber(),
+			(ULONG)KeGetCurrentIrql(),
+			interrupts_enabled() ? 1u : 0u);
+		__try {
+			failed_step = 1;
+			HVD_LOG_FAST("safety_stop_step_pre seq=%lld step=%lu name=lgdt cpu=%lu irql=%lu if=%u",
+				seq, failed_step, KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql(), interrupts_enabled() ? 1u : 0u);
 		_lgdt(&info_storage.safed_gdtr);
+			HVD_LOG_FAST("safety_stop_step_post seq=%lld step=%lu name=lgdt ok=1 cpu=%lu irql=%lu if=%u",
+				seq, failed_step, KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql(), interrupts_enabled() ? 1u : 0u);
 
+			failed_step = 2;
+			HVD_LOG_FAST("safety_stop_step_pre seq=%lld step=%lu name=segments cpu=%lu irql=%lu if=%u",
+				seq, failed_step, KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql(), interrupts_enabled() ? 1u : 0u);
 		__write_ss(info_storage.safed_ss);
 		__write_cs(info_storage.safed_cs);
+			HVD_LOG_FAST("safety_stop_step_post seq=%lld step=%lu name=segments ok=1 cpu=%lu irql=%lu if=%u",
+				seq, failed_step, KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql(), interrupts_enabled() ? 1u : 0u);
 
 
+			failed_step = 3;
+			HVD_LOG_FAST("safety_stop_step_pre seq=%lld step=%lu name=tr cpu=%lu irql=%lu if=%u",
+				seq, failed_step, KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql(), interrupts_enabled() ? 1u : 0u);
 		segment_descriptor_32* gdt = (segment_descriptor_32*)info_storage.safed_gdtr.base_address;
 		segment_selector tr_selec;
 		tr_selec.flags = info_storage.safed_tr;
-		gdt[tr_selec.index].type = SEGMENT_DESCRIPTOR_TYPE_TSS_AVAILABLE;
+		if (gdt)
+			gdt[tr_selec.index].type = SEGMENT_DESCRIPTOR_TYPE_TSS_AVAILABLE;
 		__write_tr(info_storage.safed_tr);
+			HVD_LOG_FAST("safety_stop_step_post seq=%lld step=%lu name=tr ok=1 cpu=%lu irql=%lu if=%u",
+				seq, failed_step, KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql(), interrupts_enabled() ? 1u : 0u);
 
+			failed_step = 4;
+			HVD_LOG_FAST("safety_stop_step_pre seq=%lld step=%lu name=lidt cpu=%lu irql=%lu if=%u",
+				seq, failed_step, KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql(), interrupts_enabled() ? 1u : 0u);
 		__lidt(&info_storage.safed_idtr);
+			HVD_LOG_FAST("safety_stop_step_post seq=%lld step=%lu name=lidt ok=1 cpu=%lu irql=%lu if=%u",
+				seq, failed_step, KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql(), interrupts_enabled() ? 1u : 0u);
 
+			failed_step = 5;
+			HVD_LOG_FAST("safety_stop_step_pre seq=%lld step=%lu name=cr3 cpu=%lu irql=%lu if=%u",
+				seq, failed_step, KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql(), interrupts_enabled() ? 1u : 0u);
 		__writecr3(info_storage.safed_cr3);
+			HVD_LOG_FAST("safety_stop_step_post seq=%lld step=%lu name=cr3 ok=1 cpu=%lu irql=%lu if=%u",
+				seq, failed_step, KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql(), interrupts_enabled() ? 1u : 0u);
 
+			failed_step = 6;
+			HVD_LOG_FAST("safety_stop_step_pre seq=%lld step=%lu name=cr4 cpu=%lu irql=%lu if=%u",
+				seq, failed_step, KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql(), interrupts_enabled() ? 1u : 0u);
 		__writecr4(info_storage.safed_cr4);
+			HVD_LOG_FAST("safety_stop_step_post seq=%lld step=%lu name=cr4 ok=1 cpu=%lu irql=%lu if=%u",
+				seq, failed_step, KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql(), interrupts_enabled() ? 1u : 0u);
 
+			failed_step = 7;
+			HVD_LOG_FAST("safety_stop_step_pre seq=%lld step=%lu name=gs_base cpu=%lu irql=%lu if=%u",
+				seq, failed_step, KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql(), interrupts_enabled() ? 1u : 0u);
 		__writemsr(IA32_GS_BASE, (uint64_t)info_storage.safed_kpcr);
+			HVD_LOG_FAST("safety_stop_step_post seq=%lld step=%lu name=gs_base ok=1 cpu=%lu irql=%lu if=%u",
+				seq, failed_step, KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql(), interrupts_enabled() ? 1u : 0u);
 
+			failed_step = 8;
+			HVD_LOG_FAST("safety_stop_step_pre seq=%lld step=%lu name=sti cpu=%lu irql=%lu if=%u",
+				seq, failed_step, KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql(), interrupts_enabled() ? 1u : 0u);
 		_sti();
+			ok = true;
+		}
+		__except ((seh_code = GetExceptionCode()), EXCEPTION_EXECUTE_HANDLER) {
+			HVD_LOG_FAST("safety_stop_exception seq=%lld step=%lu code=0x%08lx cpu=%lu irql=%lu if=%u",
+				seq,
+				failed_step,
+				seh_code,
+				KeGetCurrentProcessorNumber(),
+				(ULONG)KeGetCurrentIrql(),
+				interrupts_enabled() ? 1u : 0u);
+			if (!interrupts_enabled())
+				_sti();
+		}
+		_InterlockedExchange(&safety_net_active, 0);
+		HVD_LOG_IMMEDIATE("safety_stop_exit seq=%lld ok=%u failed_step=%lu exception=0x%08lx cpu=%lu irql=%lu if=%u",
+			seq,
+			ok ? 1u : 0u,
+			failed_step,
+			seh_code,
+			KeGetCurrentProcessorNumber(),
+			(ULONG)KeGetCurrentIrql(),
+			interrupts_enabled() ? 1u : 0u);
 	}
 };

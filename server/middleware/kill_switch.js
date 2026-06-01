@@ -11,6 +11,7 @@ let s_cache_global    = false;
 let s_cache_keys      = new Set();
 let s_cache_hwids     = new Set();
 let s_cache_sessions  = new Set();
+let s_cache_versions  = new Set();
 let s_loading         = null;
 let s_hmac_key        = null;
 
@@ -68,6 +69,7 @@ async function reloadCache() {
             const newKeys     = new Set();
             const newHwids    = new Set();
             const newSessions = new Set();
+            const newVersions = new Set();
             let global = false;
             for (const r of rows) {
                 const t = String(r.target_type || '');
@@ -77,11 +79,13 @@ async function reloadCache() {
                 if (t === 'license_key') newKeys.add(v);
                 else if (t === 'hwid_hash') newHwids.add(v);
                 else if (t === 'session_id') newSessions.add(v);
+                else if (t === 'plugin_version') newVersions.add(v.toLowerCase());
             }
             s_cache_global = global;
             s_cache_keys = newKeys;
             s_cache_hwids = newHwids;
             s_cache_sessions = newSessions;
+            s_cache_versions = newVersions;
             s_cache_loaded_at = Date.now();
         } catch (err) {
             console.warn('[kill_switch] reload failed:', err && err.message ? err.message : err);
@@ -132,6 +136,17 @@ function bodySessionId(req) {
     return '';
 }
 
+function bodyPluginVersion(req) {
+    const body = req && req.body;
+    if (!body || typeof body !== 'object') return '';
+    const candidates = ['plugin_version', 'pluginVersion', 'version'];
+    for (const k of candidates) {
+        const v = body[k];
+        if (typeof v === 'string' && v.length > 0) return v.trim();
+    }
+    return '';
+}
+
 async function isDropped(req) {
     await ensureFresh();
     if (s_cache_global) {
@@ -154,6 +169,10 @@ async function isDropped(req) {
         if (s_cache_sessions.has(sh) || s_cache_sessions.has(sid)) {
             return { dropped: true, reason: 'session_id' };
         }
+    }
+    const pv = bodyPluginVersion(req);
+    if (pv && s_cache_versions.has(pv.toLowerCase())) {
+        return { dropped: true, reason: 'plugin_version' };
     }
     return { dropped: false };
 }
@@ -191,7 +210,7 @@ async function middleware(req, res, next) {
 }
 
 async function addKill(targetType, targetValue, reason, createdBy, expiresAt) {
-    const validTypes = ['license_key', 'hwid_hash', 'session_id', 'global'];
+    const validTypes = ['license_key', 'hwid_hash', 'session_id', 'global', 'plugin_version'];
     if (!validTypes.includes(targetType)) {
         return { ok: false, reason: 'invalid_target_type' };
     }

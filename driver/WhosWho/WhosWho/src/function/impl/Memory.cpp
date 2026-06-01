@@ -57,6 +57,7 @@ NTSTATUS functions::handle777e(p_physical_rw request) {
 
     const BOOLEAN softfault_eligible =
         (!is_write) &&
+        (KeGetCurrentIrql() == PASSIVE_LEVEL) &&
         (target_pid != 0) &&
         (_PsLookupProcessByProcessId != nullptr) &&
         (_KeStackAttachProcess != nullptr) &&

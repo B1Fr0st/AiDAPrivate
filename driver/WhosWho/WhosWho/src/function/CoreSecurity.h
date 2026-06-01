@@ -45,7 +45,6 @@ namespace dynamic_key {
     __forceinline void set_server_seed(UINT64 server_nonce, UINT32 token_hash, UINT32 session_key) {
         UINT64 mix = server_nonce;
         mix ^= (static_cast<UINT64>(token_hash) << 32) | session_key;
-        mix ^= __rdtsc();
 
         UINT32 seed = static_cast<UINT32>(mix) ^ static_cast<UINT32>(mix >> 32);
         seed ^= _rotl(seed, 7) ^ 0x9E3779B9u;

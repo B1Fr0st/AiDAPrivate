@@ -19,6 +19,7 @@
 #include <intrin.h>
 
 #include <cstdint>
+#include <exception>
 #include <mutex>
 #include <vector>
 #include <thread>
@@ -603,19 +604,32 @@ inline void schedule_verify_async(runtime_state_t& runtime)
 		return;
 
 	runtime.verify_inflight.store(true, std::memory_order_release);
-	std::thread([]()
+	try
 	{
-		ULONGLONG t0 = GetTickCount64();
-		auto& async_runtime = state();
-		std::lock_guard<std::mutex> async_lock(async_runtime.mutex);
-		bool ok = verify_locked(async_runtime);
-		async_runtime.verify_inflight.store(false, std::memory_order_release);
-		ULONGLONG dt = GetTickCount64() - t0;
-		msg(OBFSTR_C("AiDA PERF: anti_re async verify dt=%llums ok=%d trusted=%d\n"),
-			static_cast<unsigned long long>(dt),
-			ok ? 1 : 0,
-			async_runtime.trusted.load(std::memory_order_acquire) ? 1 : 0);
-	}).detach();
+		std::thread([]()
+		{
+			ULONGLONG t0 = GetTickCount64();
+			auto& async_runtime = state();
+			std::lock_guard<std::mutex> async_lock(async_runtime.mutex);
+			bool ok = verify_locked(async_runtime);
+			async_runtime.verify_inflight.store(false, std::memory_order_release);
+			ULONGLONG dt = GetTickCount64() - t0;
+			msg(OBFSTR_C("AiDA PERF: anti_re async verify dt=%llums ok=%d trusted=%d\n"),
+				static_cast<unsigned long long>(dt),
+				ok ? 1 : 0,
+				async_runtime.trusted.load(std::memory_order_acquire) ? 1 : 0);
+		}).detach();
+	}
+	catch (const std::exception& ex)
+	{
+		runtime.verify_inflight.store(false, std::memory_order_release);
+		msg(OBFSTR_C("AiDA anti_re async verify worker unavailable: %s\n"), ex.what());
+	}
+	catch (...)
+	{
+		runtime.verify_inflight.store(false, std::memory_order_release);
+		msg(OBFSTR_C("AiDA anti_re async verify worker unavailable.\n"));
+	}
 }
 
 inline bool verify_locked(runtime_state_t& runtime)
@@ -880,9 +894,20 @@ inline void sync_latched_violation_with_server()
 
 	std::string reason = latched_violation_reason();
 
-	std::thread([reason]() {
-		report_violation_to_server(reason.c_str());
-	}).detach();
+	try
+	{
+		std::thread([reason]() {
+			report_violation_to_server(reason.c_str());
+		}).detach();
+	}
+	catch (const std::exception& ex)
+	{
+		msg(OBFSTR_C("AiDA anti_re violation sync worker unavailable: %s\n"), ex.what());
+	}
+	catch (...)
+	{
+		msg(OBFSTR_C("AiDA anti_re violation sync worker unavailable.\n"));
+	}
 }
 
 inline std::uint64_t g_aida_module_base = 0;
@@ -938,39 +963,50 @@ inline void guard_driver_self_module(std::uint64_t target_pid, std::uint64_t mod
 
 inline void start_pipe_monitor()
 {
-	std::thread([]() {
-		g_violation_pipe = CreateNamedPipeW(
-			L"\\\\.\\pipe\\AiDA_Guard",
-			PIPE_ACCESS_INBOUND,
-			PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-			1, 512, 512, 0, nullptr);
+	try
+	{
+		std::thread([]() {
+			g_violation_pipe = CreateNamedPipeW(
+				L"\\\\.\\pipe\\AiDA_Guard",
+				PIPE_ACCESS_INBOUND,
+				PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+				1, 512, 512, 0, nullptr);
 
-		if (g_violation_pipe == INVALID_HANDLE_VALUE)
-			return;
+			if (g_violation_pipe == INVALID_HANDLE_VALUE)
+				return;
 
-		while (true)
-		{
-			if (!ConnectNamedPipe(g_violation_pipe, nullptr)
-				&& GetLastError() != ERROR_PIPE_CONNECTED)
-				break;
-
-			char buf[256] = {};
-			DWORD bytesRead = 0;
-			if (ReadFile(g_violation_pipe, buf, sizeof(buf) - 1,
-				&bytesRead, nullptr) && bytesRead > 0)
+			while (true)
 			{
-				buf[bytesRead] = '\0';
-				if (strstr(buf, OBFSTR_C("VIOLATION:CONFIRMED:")))
+				if (!ConnectNamedPipe(g_violation_pipe, nullptr)
+					&& GetLastError() != ERROR_PIPE_CONNECTED)
+					break;
+
+				char buf[256] = {};
+				DWORD bytesRead = 0;
+				if (ReadFile(g_violation_pipe, buf, sizeof(buf) - 1,
+					&bytesRead, nullptr) && bytesRead > 0)
 				{
-					latch_self_analysis_violation(buf);
-					arm_destructive_enforcement();
-					sync_latched_violation_with_server();
-					enforce_self_analysis_violation();
+					buf[bytesRead] = '\0';
+					if (strstr(buf, OBFSTR_C("VIOLATION:CONFIRMED:")))
+					{
+						latch_self_analysis_violation(buf);
+						arm_destructive_enforcement();
+						sync_latched_violation_with_server();
+						enforce_self_analysis_violation();
+					}
 				}
+				DisconnectNamedPipe(g_violation_pipe);
 			}
-			DisconnectNamedPipe(g_violation_pipe);
-		}
-	}).detach();
+		}).detach();
+	}
+	catch (const std::exception& ex)
+	{
+		msg(OBFSTR_C("AiDA anti_re pipe monitor worker unavailable: %s\n"), ex.what());
+	}
+	catch (...)
+	{
+		msg(OBFSTR_C("AiDA anti_re pipe monitor worker unavailable.\n"));
+	}
 }
 
 inline std::atomic<bool> g_process_scanner_running{false};
@@ -1022,33 +1058,36 @@ inline bool compute_file_sha256(const wchar_t* file_path, uint8_t out[32])
 
 inline void start_process_hash_scanner(const uint8_t* self_hash, size_t hash_len)
 {
-	if (g_process_scanner_running.exchange(true))
-		return;
-
 	if (self_hash == nullptr || hash_len != 32)
 		return;
 
-	std::vector<uint8_t> hash_copy(self_hash, self_hash + hash_len);
+	bool expected = false;
+	if (!g_process_scanner_running.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+		return;
 
-	std::thread([hash_copy]() {
-		while (g_process_scanner_running.load())
-		{
-			Sleep(10000);
-
-			DWORD myPid = GetCurrentProcessId();
-			HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-			if (snap == INVALID_HANDLE_VALUE)
-				continue;
-
-			PROCESSENTRY32W pe = {};
-			pe.dwSize = sizeof(pe);
-
-			for (BOOL ok = Process32FirstW(snap, &pe); ok;
-				ok = Process32NextW(snap, &pe))
+	std::vector<uint8_t> hash_copy;
+	try
+	{
+		hash_copy.assign(self_hash, self_hash + hash_len);
+		std::thread([hash_copy]() {
+			while (g_process_scanner_running.load())
 			{
-				if (pe.th32ProcessID == myPid || pe.th32ProcessID == 0
-					|| pe.th32ProcessID == 4)
+				Sleep(10000);
+
+				DWORD myPid = GetCurrentProcessId();
+				HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+				if (snap == INVALID_HANDLE_VALUE)
 					continue;
+
+				PROCESSENTRY32W pe = {};
+				pe.dwSize = sizeof(pe);
+
+				for (BOOL ok = Process32FirstW(snap, &pe); ok;
+					ok = Process32NextW(snap, &pe))
+				{
+					if (pe.th32ProcessID == myPid || pe.th32ProcessID == 0
+						|| pe.th32ProcessID == 4)
+						continue;
 
 				wchar_t exe_lower[MAX_PATH] = {};
 				for (size_t ci = 0; ci < MAX_PATH - 1 && pe.szExeFile[ci]; ++ci)
@@ -1189,7 +1228,18 @@ inline void start_process_hash_scanner(const uint8_t* self_hash, size_t hash_len
 			}
 			CloseHandle(snap);
 		}
-	}).detach();
+		}).detach();
+	}
+	catch (const std::exception& ex)
+	{
+		g_process_scanner_running.store(false, std::memory_order_release);
+		msg(OBFSTR_C("AiDA anti_re process scanner worker unavailable: %s\n"), ex.what());
+	}
+	catch (...)
+	{
+		g_process_scanner_running.store(false, std::memory_order_release);
+		msg(OBFSTR_C("AiDA anti_re process scanner worker unavailable.\n"));
+	}
 }
 
 inline std::atomic<bool> g_driver_tamper_running{false};
@@ -1233,59 +1283,73 @@ inline bool is_anticheat_active()
 
 inline void start_driver_tamper_monitor()
 {
-	if (g_driver_tamper_running.exchange(true))
+	bool expected = false;
+	if (!g_driver_tamper_running.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
 		return;
 
-	std::thread([]() {
-		Sleep(5000);
+	try
+	{
+		std::thread([]() {
+			Sleep(5000);
 
-		auto& runtime = detail::state();
+			auto& runtime = detail::state();
 
-		while (g_driver_tamper_running.load())
-		{
-			Sleep(3000);
-
-			const bool ac_active = is_anticheat_active();
-			const char* violation = nullptr;
-
+			while (g_driver_tamper_running.load())
 			{
-				std::lock_guard<std::mutex> lock(runtime.mutex);
+				Sleep(3000);
 
-				if (!runtime.initialized.load(std::memory_order_acquire))
-					continue;
+				const bool ac_active = is_anticheat_active();
+				const char* violation = nullptr;
 
-				detail::prepare_driver(runtime);
-
-
-				if (!detail::verify_peb_state_locked(runtime))
-					violation = "SUSPECT:debugger_attached";
-				else if (!detail::verify_code_integrity_kernel(runtime))
-					violation = "SUSPECT:code_tampered_kernel";
-				else if (!detail::verify_code_integrity_usermode(runtime))
-					violation = "SUSPECT:code_tampered_usermode";
-
-
-				if (!violation && !ac_active)
 				{
-					if (!detail::verify_hw_breakpoints_kernel(runtime))
-						violation = "SUSPECT:hardware_breakpoint";
-					else if (!detail::verify_iat_locked(runtime))
-						violation = "SUSPECT:iat_hooked";
-					else if (!detail::verify_page_protections(runtime))
-						violation = "SUSPECT:writable_code_page";
+					std::lock_guard<std::mutex> lock(runtime.mutex);
+
+					if (!runtime.initialized.load(std::memory_order_acquire))
+						continue;
+
+					detail::prepare_driver(runtime);
+
+
+					if (!detail::verify_peb_state_locked(runtime))
+						violation = "SUSPECT:debugger_attached";
+					else if (!detail::verify_code_integrity_kernel(runtime))
+						violation = "SUSPECT:code_tampered_kernel";
+					else if (!detail::verify_code_integrity_usermode(runtime))
+						violation = "SUSPECT:code_tampered_usermode";
+
+
+					if (!violation && !ac_active)
+					{
+						if (!detail::verify_hw_breakpoints_kernel(runtime))
+							violation = "SUSPECT:hardware_breakpoint";
+						else if (!detail::verify_iat_locked(runtime))
+							violation = "SUSPECT:iat_hooked";
+						else if (!detail::verify_page_protections(runtime))
+							violation = "SUSPECT:writable_code_page";
+					}
+				}
+
+				if (violation)
+				{
+					latch_self_analysis_violation(violation);
+					arm_destructive_enforcement();
+					sync_latched_violation_with_server();
+					enforce_self_analysis_violation();
+					return;
 				}
 			}
-
-			if (violation)
-			{
-				latch_self_analysis_violation(violation);
-				arm_destructive_enforcement();
-				sync_latched_violation_with_server();
-				enforce_self_analysis_violation();
-				return;
-			}
-		}
-	}).detach();
+		}).detach();
+	}
+	catch (const std::exception& ex)
+	{
+		g_driver_tamper_running.store(false, std::memory_order_release);
+		msg(OBFSTR_C("AiDA anti_re driver tamper worker unavailable: %s\n"), ex.what());
+	}
+	catch (...)
+	{
+		g_driver_tamper_running.store(false, std::memory_order_release);
+		msg(OBFSTR_C("AiDA anti_re driver tamper worker unavailable.\n"));
+	}
 }
 
 inline void revoke_license_on_server(const std::string& license_key, const std::string& hwid, const std::string& reason)

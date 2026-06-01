@@ -298,6 +298,140 @@ namespace {
     };
 }
 
+std::uint32_t voyager::device_t::compute_dynamic_key_snapshot() const noexcept {
+    int cpu[4] = {0};
+    __cpuid(cpu, 0);
+    std::uint32_t h = 0x811C9DC5u;
+    h = (h ^ static_cast<std::uint32_t>(cpu[1])) * 0x01000193u;
+    h = (h ^ static_cast<std::uint32_t>(cpu[2])) * 0x01000193u;
+    h = (h ^ static_cast<std::uint32_t>(cpu[3])) * 0x01000193u;
+    __cpuid(cpu, 1);
+    h = (h ^ static_cast<std::uint32_t>(cpu[0])) * 0x01000193u;
+    h = (h ^ static_cast<std::uint32_t>(cpu[3])) * 0x01000193u;
+    volatile std::uint32_t build = *reinterpret_cast<volatile std::uint32_t*>(static_cast<std::uintptr_t>(0x7FFE0260)) & 0xFFFFu;
+    h = (h ^ build) * 0x01000193u;
+    if (server_seed_ != 0) {
+        h = (h ^ server_seed_) * 0x01000193u;
+        h ^= _rotl(server_seed_, 11);
+    }
+    h ^= h >> 16;
+    h *= 0x85ebca6bu;
+    h ^= h >> 13;
+    if (h == 0) h = 1;
+    return h;
+}
+
+std::uint32_t voyager::device_t::compute_ioctl_base_snapshot() const noexcept {
+    const std::uint32_t key = compute_dynamic_key_snapshot();
+    std::uint32_t base = ((hash_build_key(key) ^ secondary_hash(key >> 3)) & 0x7FF) | 0x800;
+    if (server_ioctl_seed_ != 0) {
+        base ^= hash_build_key(server_ioctl_seed_) & 0x7FF;
+        base = (base & 0x7FF) | 0x800;
+    }
+    return base;
+}
+
+DWORD voyager::device_t::make_ioctl_snapshot(std::uint32_t offset) const noexcept {
+    return static_cast<DWORD>(0x00220000u | ((compute_ioctl_base_snapshot() + offset) << 2));
+}
+
+std::uint32_t voyager::device_t::heartbeat_magic_snapshot() const noexcept {
+    return 0xDEADBEEFu ^ compute_dynamic_key_snapshot();
+}
+
+bool voyager::device_t::decode_ioctl_offset_snapshot(DWORD control_code, std::uint32_t& offset) const noexcept {
+    if ((control_code & 0xFFFF0000u) != 0x00220000u)
+        return false;
+    const std::uint32_t encoded = (control_code & 0x0000FFFFu) >> 2;
+    const std::uint32_t instance_base = compute_ioctl_base_snapshot();
+    if (encoded >= instance_base) {
+        const std::uint32_t candidate = encoded - instance_base;
+        if (candidate <= 59u) {
+            offset = candidate;
+            return true;
+        }
+    }
+
+    sync_dynamic_security_state();
+    const std::uint32_t synced_base = ioctl_codes::get_base();
+    if (encoded >= synced_base) {
+        const std::uint32_t candidate = encoded - synced_base;
+        if (candidate <= 59u) {
+            offset = candidate;
+            return true;
+        }
+    }
+
+    const std::uint32_t saved_server_seed = dynamic_key::g_server_seed;
+    const std::uint32_t saved_ioctl_seed = ioctl_codes::g_server_ioctl_seed;
+    const std::uint32_t saved_cached_key = dynamic_key::g_cached_key;
+    dynamic_key::g_server_seed = 0;
+    dynamic_key::g_cached_key = 0;
+    ioctl_codes::g_server_ioctl_seed = 0;
+    const std::uint32_t base_unseeded = ioctl_codes::get_base();
+    dynamic_key::g_server_seed = saved_server_seed;
+    dynamic_key::g_cached_key = saved_cached_key;
+    ioctl_codes::g_server_ioctl_seed = saved_ioctl_seed;
+    if (encoded >= base_unseeded) {
+        const std::uint32_t candidate = encoded - base_unseeded;
+        if (candidate <= 59u) {
+            offset = candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
+void voyager::device_t::capture_heartbeat_security_snapshot(std::uint32_t offset, DWORD ioctl_code, std::uint32_t magic) const noexcept {
+    last_heartbeat_ioctl_code_ = static_cast<std::uint32_t>(ioctl_code);
+    last_heartbeat_magic_ = magic;
+    last_heartbeat_base_ = compute_ioctl_base_snapshot();
+    last_heartbeat_key_hash_ = hash_build_key(compute_dynamic_key_snapshot());
+    last_heartbeat_ioctl_seed_hash_ = server_ioctl_seed_ != 0 ? hash_build_key(server_ioctl_seed_) : 0;
+    last_heartbeat_server_seed_present_ = server_seed_ != 0 ? 1u : 0u;
+    last_heartbeat_ioctl_seed_present_ = server_ioctl_seed_ != 0 ? 1u : 0u;
+    last_heartbeat_global_server_seed_present_ = dynamic_key::g_server_seed != 0 ? 1u : 0u;
+    last_heartbeat_global_ioctl_seed_present_ = ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u;
+    last_heartbeat_offset_ = offset;
+}
+
+void voyager::device_t::log_security_snapshot(const char* where, DWORD requested, DWORD effective, DWORD err) const noexcept {
+    const char* label = where ? where : "snapshot";
+    const bool suspicious = std::strstr(label, "suspicious") != nullptr;
+    if (err == 0 && !suspicious &&
+        (std::strstr(label, "_pre") != nullptr ||
+         std::strstr(label, "_ok") != nullptr ||
+         std::strcmp(label, "send_request_pre") == 0 ||
+         std::strcmp(label, "send_request_ok") == 0 ||
+         std::strcmp(label, "send_heartbeat_pre") == 0 ||
+         std::strcmp(label, "send_heartbeat_ok") == 0 ||
+         std::strcmp(label, "force_heartbeat_pre") == 0 ||
+         std::strcmp(label, "force_heartbeat_ok") == 0)) {
+        return;
+    }
+
+    diag::log_tagged_fmt("comm-sec",
+        "%s requested=0x%08X effective=0x%08X err=%lu connected=%d handle=0x%llX pid=%u session=%d inst_seed=%u/%u glob_seed=%u/%u base=0x%04X key_hash=0x%08X ioctl_seed_hash=0x%08X hb_tsc=%llu whoswho_seen=%u sentinel_seen=%u",
+        label,
+        requested,
+        effective,
+        static_cast<unsigned long>(err),
+        is_connected() ? 1 : 0,
+        reinterpret_cast<unsigned long long>(driver_handle_),
+        process_id_,
+        session_key_ != 0 ? 1 : 0,
+        server_seed_ != 0 ? 1u : 0u,
+        server_ioctl_seed_ != 0 ? 1u : 0u,
+        dynamic_key::g_server_seed != 0 ? 1u : 0u,
+        ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u,
+        compute_ioctl_base_snapshot(),
+        hash_build_key(compute_dynamic_key_snapshot()),
+        server_ioctl_seed_ != 0 ? hash_build_key(server_ioctl_seed_) : 0,
+        static_cast<unsigned long long>(last_heartbeat_tsc_),
+        last_bridge_whoswho_tsc_ != 0 ? 1u : 0u,
+        last_bridge_sentinel_tsc_ != 0 ? 1u : 0u);
+}
+
 bool voyager::device_t::connect() noexcept {
     SPOOF_FUNC;
 
@@ -308,7 +442,7 @@ bool voyager::device_t::connect() noexcept {
     std::wstring device_path = device_names_um::get_device_path();
     driver_handle_ = CreateFileW(
         device_path.c_str(),
-        GENERIC_READ,
+        GENERIC_READ | GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
         nullptr,
         OPEN_EXISTING,
@@ -317,10 +451,31 @@ bool voyager::device_t::connect() noexcept {
     );
 
     if (!is_connected()) {
+        DWORD rw_error = GetLastError();
+        driver_handle_ = CreateFileW(
+            device_path.c_str(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            nullptr,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr
+        );
+        if (is_connected()) {
+            diag::log_tagged_fmt("comm", "connect_rw_denied_fallback_read path_opened=1 rw_gle=%lu",
+                static_cast<unsigned long>(rw_error));
+        }
+    }
+
+    if (!is_connected()) {
         last_connect_error_ = GetLastError();
         return false;
     }
     last_connect_error_ = 0;
+    server_seed_ = 0;
+    server_ioctl_seed_ = 0;
+    dynamic_key::reset_server_seed();
+    ioctl_codes::reset_server_ioctl_seed();
     session_key_ = static_cast<std::uint32_t>(__rdtsc() ^ 0xDEADC0DEu);
     if (session_key_ == 0) session_key_ = 0x12345678u;
     if (!send_heartbeat()) {
@@ -339,6 +494,10 @@ bool voyager::device_t::connect() noexcept {
         CloseHandle(driver_handle_);
         driver_handle_ = INVALID_HANDLE_VALUE;
         session_key_ = 0;
+        server_seed_ = 0;
+        server_ioctl_seed_ = 0;
+        dynamic_key::reset_server_seed();
+        ioctl_codes::reset_server_ioctl_seed();
         return false;
     }
 
@@ -357,6 +516,10 @@ void voyager::device_t::disconnect() noexcept {
 
     kernel_dtb_ = 0;
     session_key_ = 0;
+    server_seed_ = 0;
+    server_ioctl_seed_ = 0;
+    dynamic_key::reset_server_seed();
+    ioctl_codes::reset_server_ioctl_seed();
     last_heartbeat_tsc_ = 0;
     last_bridge_whoswho_tsc_ = 0;
     last_bridge_sentinel_tsc_ = 0;
@@ -444,18 +607,22 @@ bool voyager::device_t::send_heartbeat() noexcept {
         last_heartbeat_response_ = 0;
         last_heartbeat_ioctl_code_ = 0;
         last_heartbeat_magic_ = 0;
+        capture_heartbeat_security_snapshot(8, 0, 0);
+        log_security_snapshot("send_heartbeat_not_connected", 0, 0, ERROR_INVALID_HANDLE);
         return false;
     }
 
+    sync_dynamic_security_state();
+
     detail::heartbeat_request hb{};
-    hb.magic = detail::get_heartbeat_magic();
+    hb.magic = heartbeat_magic_snapshot();
     hb.session_key = session_key_;
     hb.timestamp = __rdtsc();
     hb.response = 0;
 
-    DWORD ioctlCode = ioctl_codes::HB();
-    last_heartbeat_ioctl_code_ = static_cast<std::uint32_t>(ioctlCode);
-    last_heartbeat_magic_ = hb.magic;
+    DWORD ioctlCode = make_ioctl_snapshot(8);
+    capture_heartbeat_security_snapshot(8, ioctlCode, hb.magic);
+    log_security_snapshot("send_heartbeat_pre", ioctlCode, ioctlCode, 0);
 
     DWORD bytes_returned = 0;
     SetLastError(0);
@@ -470,21 +637,37 @@ bool voyager::device_t::send_heartbeat() noexcept {
         nullptr
     );
     DWORD captured_error = GetLastError();
+    bool hb_ok = result && bytes_returned >= sizeof(hb) && hb.response != 0;
+    DWORD effective_error = result ? ERROR_SUCCESS : captured_error;
+    if (!hb_ok) {
+        if (effective_error == ERROR_SUCCESS) {
+            if (result && bytes_returned < sizeof(hb))
+                effective_error = ERROR_MORE_DATA;
+            else if (result && hb.response == 0)
+                effective_error = ERROR_ACCESS_DENIED;
+            else
+                effective_error = ERROR_GEN_FAILURE;
+        }
+    }
 
     last_heartbeat_dioctl_result_ = result;
     last_heartbeat_bytes_ = bytes_returned;
     last_heartbeat_response_ = hb.response;
-    last_heartbeat_error_ = result ? 0 : captured_error;
+    last_heartbeat_error_ = hb_ok ? 0 : effective_error;
+    capture_heartbeat_security_snapshot(8, ioctlCode, hb.magic);
 
-    if (result && bytes_returned >= sizeof(hb) && hb.response != 0) {
+    if (hb_ok) {
         last_heartbeat_tsc_ = __rdtsc();
         last_bridge_whoswho_tsc_ = hb.whoswho_tsc;
         last_bridge_sentinel_tsc_ = hb.sentinel_tsc;
         if (hb.sentinel_tsc != 0 && first_sentinel_ready_tsc_ == 0)
             first_sentinel_ready_tsc_ = hb.sentinel_tsc;
+        log_security_snapshot("send_heartbeat_ok", ioctlCode, ioctlCode, 0);
         return true;
     }
 
+    log_security_snapshot("send_heartbeat_failed", ioctlCode, ioctlCode, effective_error);
+    SetLastError(effective_error);
     return false;
 }
 
@@ -1329,24 +1512,43 @@ bool voyager::device_t::send_poll_request(void* input, DWORD input_size) const n
 
 
 bool voyager::device_t::force_heartbeat() const noexcept {
+    sync_dynamic_security_state();
+
     detail::heartbeat_request hb{};
-    hb.magic = detail::get_heartbeat_magic();
+    hb.magic = heartbeat_magic_snapshot();
     hb.session_key = session_key_;
     hb.timestamp = __rdtsc();
     hb.response = 0;
 
+    const DWORD ioctl_code = make_ioctl_snapshot(8);
+    capture_heartbeat_security_snapshot(8, ioctl_code, hb.magic);
+    log_security_snapshot("force_heartbeat_pre", ioctl_code, ioctl_code, 0);
+
     DWORD hb_bytes = 0;
+    SetLastError(0);
     BOOL hb_result = DeviceIoControl(
         driver_handle_,
-        ioctl_codes::HB(),
+        ioctl_code,
         &hb, sizeof(hb),
         &hb, sizeof(hb),
         &hb_bytes, nullptr);
+    const DWORD hb_err = hb_result ? ERROR_SUCCESS : GetLastError();
+    last_heartbeat_dioctl_result_ = hb_result;
+    last_heartbeat_bytes_ = hb_bytes;
+    last_heartbeat_response_ = hb.response;
+    last_heartbeat_error_ = hb_result ? 0 : hb_err;
+    capture_heartbeat_security_snapshot(8, ioctl_code, hb.magic);
 
     if (hb_result && hb_bytes >= sizeof(hb) && hb.response != 0) {
         last_heartbeat_tsc_ = __rdtsc();
+        last_bridge_whoswho_tsc_ = hb.whoswho_tsc;
+        last_bridge_sentinel_tsc_ = hb.sentinel_tsc;
+        if (hb.sentinel_tsc != 0 && first_sentinel_ready_tsc_ == 0)
+            first_sentinel_ready_tsc_ = hb.sentinel_tsc;
+        log_security_snapshot("force_heartbeat_ok", ioctl_code, ioctl_code, 0);
         return true;
     }
+    log_security_snapshot("force_heartbeat_failed", ioctl_code, ioctl_code, hb_err);
     return false;
 }
 
@@ -1698,27 +1900,73 @@ std::uint64_t voyager::device_t::call_function_attempt(
 }
 
 bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD input_size) const noexcept {
+    DWORD effective_control_code = control_code;
+    std::uint32_t dynamic_offset = 0;
+    bool dynamic_offset_valid = decode_ioctl_offset_snapshot(control_code, dynamic_offset);
+
+    sync_dynamic_security_state();
+
+    if (dynamic_offset_valid) {
+        effective_control_code = make_ioctl_snapshot(dynamic_offset);
+    }
+    const bool hvdt_request = dynamic_offset_valid && dynamic_offset == 52u;
+    const DWORD hvdt_expected_code = make_ioctl_snapshot(52u);
+    log_security_snapshot("send_request_pre", control_code, effective_control_code, 0);
+    if (hvdt_request || control_code == hvdt_expected_code || effective_control_code == hvdt_expected_code) {
+        diag::log_tagged_critical_fmt("comm",
+            "send_request_hvdt_pre raw=0x%08X effective=0x%08X expected=0x%08X dyn_valid=%d dyn_offset=%u input_size=%u connected=%d input=%p handle=0x%llX local_pid=%lu local_tid=%lu target_pid=%u session=%d server_seed=%d ioctl_seed=%d",
+            control_code,
+            effective_control_code,
+            hvdt_expected_code,
+            dynamic_offset_valid ? 1 : 0,
+            dynamic_offset,
+            input_size,
+            is_connected() ? 1 : 0,
+            input,
+            reinterpret_cast<unsigned long long>(driver_handle_),
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            process_id_,
+            session_key_ != 0 ? 1 : 0,
+            dynamic_key::g_server_seed != 0 ? 1 : 0,
+            ioctl_codes::g_server_ioctl_seed != 0 ? 1 : 0);
+    }
+
     if (!is_connected() || !input || input_size == 0) {
         diag::log_tagged_fmt("comm",
             "send_request REJECT ioctl=0x%08X input_size=%u connected=%d input=%p handle=0x%llX pid=%u",
-            control_code, input_size, is_connected() ? 1 : 0, input,
+            effective_control_code, input_size, is_connected() ? 1 : 0, input,
             reinterpret_cast<unsigned long long>(driver_handle_), process_id_);
+        log_security_snapshot("send_request_reject", control_code, effective_control_code, ERROR_INVALID_HANDLE);
         return false;
     }
 
-    if (control_code != ioctl_codes::HB()) {
+    if (effective_control_code != make_ioctl_snapshot(8)) {
         std::uint64_t current_tsc = __rdtsc();
         if (last_heartbeat_tsc_ == 0 || (current_tsc - last_heartbeat_tsc_) > detail::HEARTBEAT_REFRESH_INTERVAL) {
             detail::heartbeat_request hb{};
-            hb.magic = detail::get_heartbeat_magic();
+            hb.magic = heartbeat_magic_snapshot();
             hb.session_key = session_key_;
             hb.timestamp = current_tsc;
             hb.response = 0;
+            const DWORD hb_ioctl = make_ioctl_snapshot(8);
+            capture_heartbeat_security_snapshot(8, hb_ioctl, hb.magic);
+            log_security_snapshot("send_request_embedded_hb_pre", hb_ioctl, hb_ioctl, 0);
+            if (hvdt_request || control_code == hvdt_expected_code || effective_control_code == hvdt_expected_code) {
+                diag::log_tagged_critical_fmt("comm",
+                    "send_request_hvdt_embedded_hb_pre hb_ioctl=0x%08X last_hb_tsc=%llu current_tsc=%llu local_pid=%lu local_tid=%lu",
+                    hb_ioctl,
+                    static_cast<unsigned long long>(last_heartbeat_tsc_),
+                    static_cast<unsigned long long>(current_tsc),
+                    static_cast<unsigned long>(GetCurrentProcessId()),
+                    static_cast<unsigned long>(GetCurrentThreadId()));
+            }
 
             DWORD hb_bytes = 0;
+            SetLastError(0);
             BOOL hb_result = DeviceIoControl(
                 driver_handle_,
-                ioctl_codes::HB(),
+                hb_ioctl,
                 &hb,
                 sizeof(hb),
                 &hb,
@@ -1726,21 +1974,71 @@ bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD inpu
                 &hb_bytes,
                 nullptr
             );
+            const DWORD hb_err = hb_result ? ERROR_SUCCESS : GetLastError();
+            last_heartbeat_dioctl_result_ = hb_result;
+            last_heartbeat_bytes_ = hb_bytes;
+            last_heartbeat_response_ = hb.response;
+            last_heartbeat_error_ = hb_result ? 0 : hb_err;
+            capture_heartbeat_security_snapshot(8, hb_ioctl, hb.magic);
 
-            if (hb_result && hb_bytes >= sizeof(hb) && hb.response != 0) {
+            bool hb_ok = hb_result && hb_bytes >= sizeof(hb) && hb.response != 0;
+            DWORD effective_hb_err = hb_result ? ERROR_SUCCESS : hb_err;
+            if (!hb_ok) {
+                if (effective_hb_err == ERROR_SUCCESS) {
+                    if (hb_result && hb_bytes < sizeof(hb))
+                        effective_hb_err = ERROR_MORE_DATA;
+                    else if (hb_result && hb.response == 0)
+                        effective_hb_err = ERROR_ACCESS_DENIED;
+                    else
+                        effective_hb_err = ERROR_GEN_FAILURE;
+                }
+                last_heartbeat_error_ = effective_hb_err;
+            }
+
+            if (hb_ok) {
                 last_heartbeat_tsc_ = __rdtsc();
                 last_bridge_whoswho_tsc_ = hb.whoswho_tsc;
                 last_bridge_sentinel_tsc_ = hb.sentinel_tsc;
                 if (hb.sentinel_tsc != 0 && first_sentinel_ready_tsc_ == 0)
                     first_sentinel_ready_tsc_ = hb.sentinel_tsc;
+                log_security_snapshot("send_request_embedded_hb_ok", hb_ioctl, hb_ioctl, 0);
+            } else {
+                log_security_snapshot("send_request_embedded_hb_failed", hb_ioctl, hb_ioctl, effective_hb_err);
+            }
+            if (hvdt_request || control_code == hvdt_expected_code || effective_control_code == hvdt_expected_code) {
+                diag::log_tagged_critical_fmt("comm",
+                    "send_request_hvdt_embedded_hb_post ok=%d hb_ioctl=0x%08X bytes=%lu err=%lu response=0x%llX whoswho_tsc=%llu sentinel_tsc=%llu local_pid=%lu local_tid=%lu",
+                    hb_result ? 1 : 0,
+                    hb_ioctl,
+                    static_cast<unsigned long>(hb_bytes),
+                    hb_err,
+                    static_cast<unsigned long long>(hb.response),
+                    static_cast<unsigned long long>(hb.whoswho_tsc),
+                    static_cast<unsigned long long>(hb.sentinel_tsc),
+                    static_cast<unsigned long>(GetCurrentProcessId()),
+                    static_cast<unsigned long>(GetCurrentThreadId()));
+            }
+            if (!hb_ok) {
+                SetLastError(effective_hb_err);
+                return false;
             }
         }
     }
 
+    if (hvdt_request || control_code == hvdt_expected_code || effective_control_code == hvdt_expected_code) {
+        diag::log_tagged_critical_fmt("comm",
+            "send_request_hvdt_pre_obfuscation raw=0x%08X effective=0x%08X input_size=%u local_pid=%lu local_tid=%lu",
+            control_code,
+            effective_control_code,
+            input_size,
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+    }
     spoofer::scatter_execution();
     thread_hijack::collect_entropy();
 
     volatile std::uint32_t pre_delay = static_cast<std::uint32_t>((__rdtsc() ^ thread_hijack::g_entropy_pool) & 0x7);
+    const std::uint32_t hvdt_pre_delay = pre_delay;
     while (pre_delay--) {
         _mm_pause();
         spoofer::compiler_barrier();
@@ -1748,10 +2046,22 @@ bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD inpu
 
     DWORD bytes_returned = 0;
     const ULONGLONG ioctl_start = GetTickCount64();
+    if (hvdt_request || control_code == hvdt_expected_code || effective_control_code == hvdt_expected_code) {
+        diag::log_tagged_critical_fmt("comm",
+            "send_request_hvdt_deviceiocontrol_pre effective=0x%08X input_size=%u pre_delay=%u handle=0x%llX local_pid=%lu local_tid=%lu target_pid=%u session=%d",
+            effective_control_code,
+            input_size,
+            hvdt_pre_delay,
+            reinterpret_cast<unsigned long long>(driver_handle_),
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            process_id_,
+            session_key_ != 0 ? 1 : 0);
+    }
 
     BOOL result = DeviceIoControl(
         driver_handle_,
-        control_code,
+        effective_control_code,
         input,
         input_size,
         input,
@@ -1759,24 +2069,62 @@ bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD inpu
         &bytes_returned,
         nullptr
     );
+    const DWORD hvdt_post_err = result ? ERROR_SUCCESS : GetLastError();
+    if (hvdt_request || control_code == hvdt_expected_code || effective_control_code == hvdt_expected_code) {
+        diag::log_tagged_critical_fmt("comm",
+            "send_request_hvdt_deviceiocontrol_post ok=%d effective=0x%08X input_size=%u bytes=%lu err=%lu elapsed_ms=%llu local_pid=%lu local_tid=%lu",
+            result ? 1 : 0,
+            effective_control_code,
+            input_size,
+            static_cast<unsigned long>(bytes_returned),
+            hvdt_post_err,
+            static_cast<unsigned long long>(GetTickCount64() - ioctl_start),
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        if (!result) {
+            SetLastError(hvdt_post_err);
+        }
+    }
 
     if (!result) {
         DWORD err = GetLastError();
         RC_UM_DBG("send_request FAILED ioctl=0x%08X input_size=%u err=%lu handle=0x%llX",
-            control_code, input_size, err, reinterpret_cast<unsigned long long>(driver_handle_));
-        diag::log_tagged_fmt("comm",
-            "send_request FAILED ioctl=0x%08X input_size=%u bytes=%lu err=%lu handle=0x%llX pid=%u session=%d elapsed_ms=%llu",
-            control_code, input_size, static_cast<unsigned long>(bytes_returned), err,
-            reinterpret_cast<unsigned long long>(driver_handle_), process_id_,
-            session_key_ != 0 ? 1 : 0,
-            static_cast<unsigned long long>(GetTickCount64() - ioctl_start));
+            effective_control_code, input_size, err, reinterpret_cast<unsigned long long>(driver_handle_));
+        log_security_snapshot("send_request_failed", control_code, effective_control_code, err);
+        if (effective_control_code == ioctl_codes::ADBG() && input_size >= sizeof(detail::anti_debug_request)) {
+            const auto* adbg = static_cast<const detail::anti_debug_request*>(input);
+            diag::log_tagged_fmt("comm",
+                "send_request FAILED ioctl=0x%08X domain=ADBG op=%u req_pid=%u req_tid=%u input_size=%u bytes=%lu err=%lu handle=0x%llX pid=%u session=%d elapsed_ms=%llu",
+                effective_control_code,
+                adbg->operation,
+                adbg->pid,
+                adbg->tid,
+                input_size,
+                static_cast<unsigned long>(bytes_returned),
+                err,
+                reinterpret_cast<unsigned long long>(driver_handle_),
+                process_id_,
+                session_key_ != 0 ? 1 : 0,
+                static_cast<unsigned long long>(GetTickCount64() - ioctl_start));
+        } else {
+            diag::log_tagged_fmt("comm",
+                "send_request FAILED ioctl=0x%08X input_size=%u bytes=%lu err=%lu handle=0x%llX pid=%u session=%d elapsed_ms=%llu",
+                effective_control_code, input_size, static_cast<unsigned long>(bytes_returned), err,
+                reinterpret_cast<unsigned long long>(driver_handle_), process_id_,
+                session_key_ != 0 ? 1 : 0,
+                static_cast<unsigned long long>(GetTickCount64() - ioctl_start));
+        }
+        SetLastError(err);
     } else if (bytes_returned == 0 || (GetTickCount64() - ioctl_start) > 250) {
         diag::log_tagged_fmt("comm",
             "send_request OK_SUSPICIOUS ioctl=0x%08X input_size=%u bytes=%lu handle=0x%llX pid=%u session=%d elapsed_ms=%llu",
-            control_code, input_size, static_cast<unsigned long>(bytes_returned),
+            effective_control_code, input_size, static_cast<unsigned long>(bytes_returned),
             reinterpret_cast<unsigned long long>(driver_handle_), process_id_,
             session_key_ != 0 ? 1 : 0,
             static_cast<unsigned long long>(GetTickCount64() - ioctl_start));
+        log_security_snapshot("send_request_ok_suspicious", control_code, effective_control_code, 0);
+    } else {
+        log_security_snapshot("send_request_ok", control_code, effective_control_code, 0);
     }
 
     spoofer::scatter_execution();
@@ -3411,37 +3759,65 @@ bool voyager::device_t::register_dll_protection(
     std::uint32_t text_size, std::uint64_t expected_hash,
     std::uint32_t check_interval_ms) noexcept
 {
-    if (!is_connected() || process_id_ == 0) {
+    const std::uint32_t target_pid = process_id_ != 0 ? process_id_ : GetCurrentProcessId();
+    return register_dll_protection_for_pid(target_pid, module_base, text_va, text_size,
+                                           expected_hash, check_interval_ms);
+}
+
+bool voyager::device_t::register_dll_protection_for_pid(
+    std::uint32_t pid, std::uint64_t module_base, std::uint64_t text_va,
+    std::uint32_t text_size, std::uint64_t expected_hash,
+    std::uint32_t check_interval_ms) noexcept
+{
+    sync_dynamic_security_state();
+
+    if (!is_connected() || pid == 0) {
+        SetLastError(!is_connected() ? ERROR_INVALID_HANDLE : ERROR_INVALID_PARAMETER);
         return false;
     }
 
     detail::dll_protect_request req{};
     req.operation = detail::DPRT_OP_REGISTER;
-    req.pid = process_id_;
+    req.pid = pid;
     req.module_base = module_base;
     req.text_section_va = text_va;
     req.text_section_size = text_size;
     req.expected_hash = expected_hash;
     req.check_interval = check_interval_ms;
 
-    if (!send_request(ioctl_codes::DPRT(), &req, static_cast<DWORD>(sizeof(req)))) {
+    SetLastError(ERROR_SUCCESS);
+    const DWORD ioctl_code = ioctl_codes::DPRT();
+    if (!send_request(ioctl_code, &req, static_cast<DWORD>(sizeof(req)))) {
         return false;
     }
 
-    return req.status == detail::DPRT_STATUS_ACTIVE;
+    if (req.status == detail::DPRT_STATUS_ACTIVE) {
+        SetLastError(ERROR_SUCCESS);
+        return true;
+    }
+
+    if (req.status == detail::DPRT_STATUS_TAMPERED || req.status == detail::DPRT_STATUS_DEBUGGER) {
+        SetLastError(ERROR_ACCESS_DENIED);
+    } else {
+        SetLastError(ERROR_NOT_READY);
+    }
+    return false;
 }
 
 bool voyager::device_t::query_dll_protection(dll_protect_status& out) noexcept
 {
+    sync_dynamic_security_state();
+
     if (!is_connected()) {
         return false;
     }
 
     detail::dll_protect_request req{};
     req.operation = detail::DPRT_OP_QUERY;
-    req.pid = process_id_;
+    req.pid = process_id_ != 0 ? process_id_ : GetCurrentProcessId();
 
-    if (!send_request(ioctl_codes::DPRT(), &req, static_cast<DWORD>(sizeof(req)))) {
+    const DWORD ioctl_code = ioctl_codes::DPRT();
+    if (!send_request(ioctl_code, &req, static_cast<DWORD>(sizeof(req)))) {
         return false;
     }
 
@@ -3454,15 +3830,25 @@ bool voyager::device_t::query_dll_protection(dll_protect_status& out) noexcept
 
 bool voyager::device_t::unregister_dll_protection() noexcept
 {
-    if (!is_connected()) {
+    const std::uint32_t target_pid = process_id_ != 0 ? process_id_ : GetCurrentProcessId();
+    return unregister_dll_protection_for_pid(target_pid, 0);
+}
+
+bool voyager::device_t::unregister_dll_protection_for_pid(std::uint32_t pid, std::uint64_t module_base) noexcept
+{
+    sync_dynamic_security_state();
+
+    if (!is_connected() || pid == 0) {
+        SetLastError(!is_connected() ? ERROR_INVALID_HANDLE : ERROR_INVALID_PARAMETER);
         return false;
     }
-
     detail::dll_protect_request req{};
     req.operation = detail::DPRT_OP_UNREGISTER;
-    req.pid = process_id_;
+    req.pid = pid;
+    req.module_base = module_base;
 
-    bool ok = send_request(ioctl_codes::DPRT(), &req, static_cast<DWORD>(sizeof(req)));
+    const DWORD ioctl_code = ioctl_codes::DPRT();
+    bool ok = send_request(ioctl_code, &req, static_cast<DWORD>(sizeof(req)));
     return ok;
 }
 
@@ -3504,6 +3890,9 @@ bool voyager::device_t::latch_targeting_from_usermode(std::uint32_t reason) noex
 bool voyager::device_t::tier_a_driver_present_query(bool& out_present, std::uint32_t* out_mask,
                                                     std::uint64_t* out_first_base) noexcept
 {
+    sync_dynamic_security_state();
+    log_security_snapshot("tier_a_query_entry", 0, 0, 0);
+
     out_present = false;
     if (out_mask) *out_mask = 0;
     if (out_first_base) *out_first_base = 0;
@@ -3511,15 +3900,32 @@ bool voyager::device_t::tier_a_driver_present_query(bool& out_present, std::uint
     if (!is_connected()) return false;
 
     detail::tier_a_query_request req{};
-    req.magic = session_key_ ^ dynamic_key::get() ^ 0x7A1E0011u;
+    req.magic = session_key_ ^ compute_dynamic_key_snapshot() ^ 0x7A1E0011u;
     req.session_key = session_key_;
 
-    if (!send_request(ioctl_codes::TIRA(), &req, static_cast<DWORD>(sizeof(req))))
+    const DWORD ioctl_code = make_ioctl_snapshot(48);
+    log_security_snapshot("tier_a_query_pre", ioctl_code, ioctl_code, 0);
+    if (!send_request(ioctl_code, &req, static_cast<DWORD>(sizeof(req)))) {
+        DWORD err = GetLastError();
+        diag::log_tagged_fmt("comm",
+            "tier_a_driver_present_query FAILED ioctl=0x%08X err=%lu instance_seed=%d module_seed=%d session=%d base=0x%04X key_hash=0x%08X ioctl_seed_hash=0x%08X",
+            ioctl_code,
+            static_cast<unsigned long>(err),
+            (server_seed_ != 0 && server_ioctl_seed_ != 0) ? 1 : 0,
+            (dynamic_key::g_server_seed != 0 && ioctl_codes::g_server_ioctl_seed != 0) ? 1 : 0,
+            session_key_ != 0 ? 1 : 0,
+            compute_ioctl_base_snapshot(),
+            hash_build_key(compute_dynamic_key_snapshot()),
+            server_ioctl_seed_ != 0 ? hash_build_key(server_ioctl_seed_) : 0);
+        log_security_snapshot("tier_a_query_failed", ioctl_code, ioctl_code, err);
+        SetLastError(err);
         return false;
+    }
 
     out_present = req.present_flag != 0;
     if (out_mask) *out_mask = req.tier_mask;
     if (out_first_base) *out_first_base = req.first_driver_base;
+    log_security_snapshot("tier_a_query_ok", ioctl_code, ioctl_code, 0);
     return true;
 }
 
@@ -3606,8 +4012,8 @@ bool voyager::device_t::re_confirmed_usermode_bsod(const detail::re_evidence_blo
 
 bool voyager::device_t::protect_sandbox_pid(std::uint32_t pid, std::uint32_t flags, std::uint64_t* out_denials) noexcept
 {
-    diag::log_tagged_fmt("ww:malsafe-um", "protect_sandbox_pid ENTER pid=%u flags_in=0x%08X connected=%d session=0x%08X self_pid=%lu",
-        pid, flags, is_connected() ? 1 : 0, session_key_, GetCurrentProcessId());
+    diag::log_tagged_fmt("ww:malsafe-um", "protect_sandbox_pid ENTER pid=%u flags_in=0x%08X connected=%d session_present=%d self_pid=%lu",
+        pid, flags, is_connected() ? 1 : 0, session_key_ != 0 ? 1 : 0, GetCurrentProcessId());
 
     if (!is_connected()) {
         diag::log_tagged_fmt("ww:malsafe-um", "protect_sandbox_pid REJECT not_connected pid=%u", pid);
@@ -3624,8 +4030,8 @@ bool voyager::device_t::protect_sandbox_pid(std::uint32_t pid, std::uint32_t fla
     req.pid = pid;
     req.flags = (flags == 0) ? detail::SANDBOX_FLAG_DEFAULT : flags;
 
-    diag::log_tagged_fmt("ww:malsafe-um", "protect_sandbox_pid SEND ioctl=0x%08X pid=%u flags_effective=0x%08X magic=0x%08X session_key=0x%08X size=%u",
-        ioctl_codes::PSBX(), req.pid, req.flags, req.magic, req.session_key, static_cast<unsigned>(sizeof(req)));
+    diag::log_tagged_fmt("ww:malsafe-um", "protect_sandbox_pid SEND ioctl=0x%08X pid=%u flags_effective=0x%08X magic_set=%d session_present=%d size=%u",
+        ioctl_codes::PSBX(), req.pid, req.flags, req.magic != 0 ? 1 : 0, req.session_key != 0 ? 1 : 0, static_cast<unsigned>(sizeof(req)));
 
     if (!send_request(ioctl_codes::PSBX(), &req, static_cast<DWORD>(sizeof(req)))) {
         DWORD err = GetLastError();
@@ -3641,8 +4047,8 @@ bool voyager::device_t::protect_sandbox_pid(std::uint32_t pid, std::uint32_t fla
 
 bool voyager::device_t::unprotect_sandbox_pid(std::uint32_t pid, std::uint64_t* out_denials) noexcept
 {
-    diag::log_tagged_fmt("ww:malsafe-um", "unprotect_sandbox_pid ENTER pid=%u connected=%d session=0x%08X self_pid=%lu",
-        pid, is_connected() ? 1 : 0, session_key_, GetCurrentProcessId());
+    diag::log_tagged_fmt("ww:malsafe-um", "unprotect_sandbox_pid ENTER pid=%u connected=%d session_present=%d self_pid=%lu",
+        pid, is_connected() ? 1 : 0, session_key_ != 0 ? 1 : 0, GetCurrentProcessId());
 
     if (!is_connected()) {
         diag::log_tagged_fmt("ww:malsafe-um", "unprotect_sandbox_pid REJECT not_connected pid=%u", pid);
@@ -3659,8 +4065,8 @@ bool voyager::device_t::unprotect_sandbox_pid(std::uint32_t pid, std::uint64_t* 
     req.pid = pid;
     req.flags = 0;
 
-    diag::log_tagged_fmt("ww:malsafe-um", "unprotect_sandbox_pid SEND ioctl=0x%08X pid=%u magic=0x%08X session_key=0x%08X size=%u",
-        ioctl_codes::USBX(), req.pid, req.magic, req.session_key, static_cast<unsigned>(sizeof(req)));
+    diag::log_tagged_fmt("ww:malsafe-um", "unprotect_sandbox_pid SEND ioctl=0x%08X pid=%u magic_set=%d session_present=%d size=%u",
+        ioctl_codes::USBX(), req.pid, req.magic != 0 ? 1 : 0, req.session_key != 0 ? 1 : 0, static_cast<unsigned>(sizeof(req)));
 
     if (!send_request(ioctl_codes::USBX(), &req, static_cast<DWORD>(sizeof(req)))) {
         DWORD err = GetLastError();
@@ -3676,8 +4082,8 @@ bool voyager::device_t::unprotect_sandbox_pid(std::uint32_t pid, std::uint64_t* 
 
 bool voyager::device_t::net_log_register_pid(std::uint32_t pid, bool enable) noexcept
 {
-    diag::log_tagged_fmt("ww:malsafe-um", "net_log_register_pid ENTER pid=%u enable=%d connected=%d session=0x%08X self_pid=%lu",
-        pid, enable ? 1 : 0, is_connected() ? 1 : 0, session_key_, GetCurrentProcessId());
+    diag::log_tagged_fmt("ww:malsafe-um", "net_log_register_pid ENTER pid=%u enable=%d connected=%d session_present=%d self_pid=%lu",
+        pid, enable ? 1 : 0, is_connected() ? 1 : 0, session_key_ != 0 ? 1 : 0, GetCurrentProcessId());
 
     if (!is_connected()) {
         diag::log_tagged_fmt("ww:malsafe-um", "net_log_register_pid REJECT not_connected pid=%u", pid);
@@ -3694,8 +4100,8 @@ bool voyager::device_t::net_log_register_pid(std::uint32_t pid, bool enable) noe
     req.pid = pid;
     req.operation = enable ? 1u : 0u;
 
-    diag::log_tagged_fmt("ww:malsafe-um", "net_log_register_pid SEND ioctl=0x%08X pid=%u op=%u magic=0x%08X session_key=0x%08X size=%u",
-        ioctl_codes::NLOG(), req.pid, req.operation, req.magic, req.session_key, static_cast<unsigned>(sizeof(req)));
+    diag::log_tagged_fmt("ww:malsafe-um", "net_log_register_pid SEND ioctl=0x%08X pid=%u op=%u magic_set=%d session_present=%d size=%u",
+        ioctl_codes::NLOG(), req.pid, req.operation, req.magic != 0 ? 1 : 0, req.session_key != 0 ? 1 : 0, static_cast<unsigned>(sizeof(req)));
 
     if (!send_request(ioctl_codes::NLOG(), &req, static_cast<DWORD>(sizeof(req)))) {
         DWORD err = GetLastError();
@@ -3816,7 +4222,15 @@ bool voyager::device_t::kernel_anti_debug_scan_debuggers(std::uint64_t* out_debu
     req.operation = 2;
 
     if (!send_request(ioctl_codes::ADBG(), &req, static_cast<DWORD>(sizeof(req))))
+    {
+        if (GetLastError() == ERROR_NOT_FOUND)
+        {
+            if (out_debugger_pid) *out_debugger_pid = 0;
+            SetLastError(ERROR_SUCCESS);
+            return true;
+        }
         return false;
+    }
 
     if (out_debugger_pid) *out_debugger_pid = req.detected_debugger_pid;
     return true;
@@ -3995,6 +4409,9 @@ bool voyager::device_t::kernel_anti_dump_start_continuous(std::uint32_t pid) noe
 
 bool voyager::device_t::relay_server_token(std::uint32_t token_hash, std::uint64_t server_nonce) noexcept
 {
+    sync_dynamic_security_state();
+    log_security_snapshot("relay_server_token_entry", 0, 0, 0);
+
     if (!is_connected()) return false;
 
     detail::server_token_relay req{};
@@ -4003,14 +4420,28 @@ bool voyager::device_t::relay_server_token(std::uint32_t token_hash, std::uint64
     req.timestamp = __rdtsc();
     req.server_nonce = server_nonce;
 
-    if (!send_request(ioctl_codes::SRVT(), &req, static_cast<DWORD>(sizeof(req))))
+    const DWORD ioctl_code = make_ioctl_snapshot(44);
+    log_security_snapshot("relay_server_token_pre", ioctl_code, ioctl_code, 0);
+    if (!send_request(ioctl_code, &req, static_cast<DWORD>(sizeof(req))))
         return false;
 
-    return req.result == 1;
+    if (req.result == 1) {
+        server_seed_ = dynamic_key::derive_server_seed(server_nonce, token_hash, session_key_);
+        server_ioctl_seed_ = ioctl_codes::derive_server_ioctl_seed(server_nonce, token_hash, session_key_);
+        dynamic_key::set_server_seed(server_nonce, token_hash, session_key_);
+        ioctl_codes::set_server_ioctl_seed(server_nonce, token_hash, session_key_);
+        log_security_snapshot("relay_server_token_seeded", ioctl_code, make_ioctl_snapshot(44), 0);
+        return true;
+    }
+    log_security_snapshot("relay_server_token_rejected", ioctl_code, ioctl_code, ERROR_ACCESS_DENIED);
+    return false;
 }
 
 bool voyager::device_t::relay_server_token_v2(std::uint32_t token_hash, std::uint64_t server_nonce, std::uint64_t* out_driver_proof) noexcept
 {
+    sync_dynamic_security_state();
+    log_security_snapshot("relay_server_token_v2_entry", 0, 0, 0);
+
     if (!is_connected()) return false;
 
     detail::server_token_relay_v2 req{};
@@ -4019,15 +4450,83 @@ bool voyager::device_t::relay_server_token_v2(std::uint32_t token_hash, std::uin
     req.timestamp = __rdtsc();
     req.server_nonce = server_nonce;
 
-    if (!send_request(ioctl_codes::SRV2(), &req, static_cast<DWORD>(sizeof(req))))
-        return false;
+    const DWORD ioctl_code = make_ioctl_snapshot(46);
+    log_security_snapshot("relay_server_token_v2_pre", ioctl_code, ioctl_code, 0);
+    if (!send_request(ioctl_code, &req, static_cast<DWORD>(sizeof(req)))) {
+        DWORD first_err = GetLastError();
+        log_security_snapshot("relay_server_token_v2_first_failed", ioctl_code, ioctl_code, first_err);
+        if (first_err != ERROR_INVALID_FUNCTION)
+            return false;
+
+        server_seed_ = 0;
+        server_ioctl_seed_ = 0;
+        dynamic_key::reset_server_seed();
+        ioctl_codes::reset_server_ioctl_seed();
+        const DWORD retry_ioctl_code = make_ioctl_snapshot(46);
+
+        if (!send_heartbeat()) {
+            DWORD hb_err = last_heartbeat_error_;
+            if (hb_err == 0 && last_heartbeat_dioctl_result_) {
+                if (last_heartbeat_bytes_ < sizeof(detail::heartbeat_request)) {
+                    hb_err = ERROR_MORE_DATA;
+                } else if (last_heartbeat_response_ == 0) {
+                    hb_err = ERROR_ACCESS_DENIED;
+                }
+            }
+            if (hb_err == 0)
+                hb_err = ERROR_GEN_FAILURE;
+            log_security_snapshot("relay_server_token_v2_recover_heartbeat_failed", retry_ioctl_code, retry_ioctl_code, hb_err);
+            SetLastError(hb_err);
+            return false;
+        }
+        log_security_snapshot("relay_server_token_v2_recover_heartbeat_ok", retry_ioctl_code, retry_ioctl_code, 0);
+
+        detail::server_token_relay_v2 retry{};
+        retry.token_hash = token_hash;
+        retry.session_key = session_key_;
+        retry.timestamp = __rdtsc();
+        retry.server_nonce = server_nonce;
+        log_security_snapshot("relay_server_token_v2_retry_pre", retry_ioctl_code, retry_ioctl_code, 0);
+        if (!send_request(retry_ioctl_code, &retry, static_cast<DWORD>(sizeof(retry)))) {
+            log_security_snapshot("relay_server_token_v2_retry_failed", retry_ioctl_code, retry_ioctl_code, GetLastError());
+            SetLastError(first_err);
+            return false;
+        }
+        req = retry;
+    }
 
     if (out_driver_proof) *out_driver_proof = req.driver_proof;
-    return req.result == 1;
+    if (req.result == 1) {
+        server_seed_ = dynamic_key::derive_server_seed(server_nonce, token_hash, session_key_);
+        server_ioctl_seed_ = ioctl_codes::derive_server_ioctl_seed(server_nonce, token_hash, session_key_);
+        dynamic_key::set_server_seed(server_nonce, token_hash, session_key_);
+        ioctl_codes::set_server_ioctl_seed(server_nonce, token_hash, session_key_);
+        log_security_snapshot("relay_server_token_v2_seeded", ioctl_code, make_ioctl_snapshot(46), 0);
+        return true;
+    }
+    log_security_snapshot("relay_server_token_v2_rejected", ioctl_code, ioctl_code, ERROR_ACCESS_DENIED);
+    return false;
 }
 
 bool voyager::device_t::run_hv_detect(detail::hv_detect_result& out) noexcept {
+    const DWORD local_pid = GetCurrentProcessId();
+    const DWORD local_tid = GetCurrentThreadId();
+    const ULONGLONG start_tick = GetTickCount64();
+    diag::log_tagged_critical_fmt("driver",
+        "run_hv_detect_enter connected=%d local_pid=%lu local_tid=%lu target_pid=%u handle=0x%llX",
+        is_connected() ? 1 : 0,
+        static_cast<unsigned long>(local_pid),
+        static_cast<unsigned long>(local_tid),
+        process_id_,
+        reinterpret_cast<unsigned long long>(driver_handle_));
     if (!is_connected()) {
+        diag::log_tagged_critical_fmt("driver",
+            "run_hv_detect_reject reason=not_connected elapsed_ms=%llu local_pid=%lu local_tid=%lu target_pid=%u handle=0x%llX",
+            static_cast<unsigned long long>(GetTickCount64() - start_tick),
+            static_cast<unsigned long>(local_pid),
+            static_cast<unsigned long>(local_tid),
+            process_id_,
+            reinterpret_cast<unsigned long long>(driver_handle_));
         return false;
     }
 
@@ -4038,11 +4537,47 @@ bool voyager::device_t::run_hv_detect(detail::hv_detect_result& out) noexcept {
     buf.req.flags = 0;
 
     DWORD buf_size = sizeof(buf);
-    if (!send_request(ioctl_codes::HVDT(), &buf, buf_size)) {
+    const DWORD ioctl_code = ioctl_codes::HVDT();
+    diag::log_tagged_critical_fmt("driver",
+        "run_hv_detect_send_pre ioctl=0x%08X buf_size=%u flags=0x%llX elapsed_ms=%llu local_pid=%lu local_tid=%lu target_pid=%u",
+        ioctl_code,
+        buf_size,
+        static_cast<unsigned long long>(buf.req.flags),
+        static_cast<unsigned long long>(GetTickCount64() - start_tick),
+        static_cast<unsigned long>(local_pid),
+        static_cast<unsigned long>(local_tid),
+        process_id_);
+    if (!send_request(ioctl_code, &buf, buf_size)) {
+        const DWORD err = GetLastError();
+        diag::log_tagged_critical_fmt("driver",
+            "run_hv_detect_send_post ok=0 err=%lu elapsed_ms=%llu local_pid=%lu local_tid=%lu target_pid=%u",
+            err,
+            static_cast<unsigned long long>(GetTickCount64() - start_tick),
+            static_cast<unsigned long>(local_pid),
+            static_cast<unsigned long>(local_tid),
+            process_id_);
+        SetLastError(err);
         return false;
     }
+    diag::log_tagged_critical_fmt("driver",
+        "run_hv_detect_send_post ok=1 elapsed_ms=%llu total_run=%u total_failed=%u ms_hv_root=%u is_vm=%u vendor16=%.16s local_pid=%lu local_tid=%lu target_pid=%u",
+        static_cast<unsigned long long>(GetTickCount64() - start_tick),
+        static_cast<unsigned>(buf.result.total_run),
+        static_cast<unsigned>(buf.result.total_failed),
+        static_cast<unsigned>(buf.result.ms_hv_root),
+        static_cast<unsigned>(buf.result.is_virtual_machine),
+        buf.result.vm_vendor_name,
+        static_cast<unsigned long>(local_pid),
+        static_cast<unsigned long>(local_tid),
+        process_id_);
 
     std::memcpy(&out, &buf.result, sizeof(out));
+    diag::log_tagged_critical_fmt("driver",
+        "run_hv_detect_exit ok=1 elapsed_ms=%llu local_pid=%lu local_tid=%lu target_pid=%u",
+        static_cast<unsigned long long>(GetTickCount64() - start_tick),
+        static_cast<unsigned long>(local_pid),
+        static_cast<unsigned long>(local_tid),
+        process_id_);
     return true;
 }
 

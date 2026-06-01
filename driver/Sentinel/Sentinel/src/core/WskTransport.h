@@ -19,6 +19,23 @@ namespace wsk_transport
     constexpr ULONG  HEARTBEAT_MAX_INTERVAL_MS = 60000;
     constexpr ULONG  MAX_MISSED_HEARTBEATS = 3;
     constexpr ULONG  TLS_RECORD_MAX = 16384 + 256;
+    constexpr ULONG  TLS_AEAD_KEY_OBJECT_CAPACITY = 8192;
+    constexpr ULONG  TLS_X25519_PUBLIC_BLOB_SIZE = sizeof(BCRYPT_ECCKEY_BLOB) + 64;
+    constexpr ULONG  TLS_X25519_PRIVATE_BLOB_SIZE = sizeof(BCRYPT_ECCKEY_BLOB) + 96;
+    constexpr UINT16 TLS_AES_128_GCM_SHA256 = 0x1301;
+    constexpr UINT16 TLS_VERSION_13 = 0x0304;
+    constexpr ULONG  TLS_AES_128_GCM_KEY_LEN = 16;
+    constexpr ULONG  TLS_AES_256_GCM_KEY_LEN = 32;
+    constexpr ULONG  TLS_GCM_IV_LEN = 12;
+    constexpr UINT8  TLS_CONTENT_CHANGE_CIPHER_SPEC = 0x14;
+    constexpr UINT8  TLS_CONTENT_ALERT = 0x15;
+    constexpr UINT8  TLS_CONTENT_HANDSHAKE = 0x16;
+    constexpr UINT8  TLS_CONTENT_APPLICATION_DATA = 0x17;
+    constexpr UINT8  TLS_HANDSHAKE_SERVER_HELLO = 0x02;
+    constexpr UINT8  TLS_HANDSHAKE_ENCRYPTED_EXTENSIONS = 0x08;
+    constexpr UINT8  TLS_HANDSHAKE_CERTIFICATE = 0x0B;
+    constexpr UINT8  TLS_HANDSHAKE_CERTIFICATE_VERIFY = 0x0F;
+    constexpr UINT8  TLS_HANDSHAKE_FINISHED = 0x14;
 
 #ifndef SENTINEL_PIN_DEBUG_BYPASS
 #define SENTINEL_PIN_DEBUG_BYPASS 0
@@ -43,10 +60,10 @@ namespace wsk_transport
             0x56, 0xD6, 0x9B, 0x4B, 0x9D, 0x0B, 0x00, 0xA4
         },
         {
-            0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0
+            0xB7, 0xC5, 0x13, 0x79, 0xA4, 0xEA, 0xFA, 0xA1,
+            0x6C, 0xD5, 0x81, 0x2F, 0x91, 0x54, 0x81, 0x16,
+            0xD1, 0x55, 0x58, 0xA0, 0x8E, 0x6D, 0x0B, 0x9A,
+            0xE3, 0x21, 0x7D, 0x12, 0xF1, 0x7D, 0x1C, 0x26
         },
         {
             0, 0, 0, 0, 0, 0, 0, 0,
@@ -62,6 +79,109 @@ namespace wsk_transport
         for (ULONG i = 0; i < SPKI_PIN_HASH_LEN; ++i)
             acc |= g_sentinel_spki_pins[slot][i];
         return acc != 0;
+    }
+
+    __forceinline void reverse_copy_32(UINT8 out[32], const UINT8 in[32])
+    {
+        for (ULONG i = 0; i < 32; ++i)
+            out[i] = in[31 - i];
+    }
+
+    __forceinline BOOLEAN der_read_len(const UINT8* data, ULONG total, ULONG* offset, ULONG* out_len)
+    {
+        if (!data || !offset || !out_len || *offset >= total) return FALSE;
+        UINT8 b = data[(*offset)++];
+        if ((b & 0x80u) == 0)
+        {
+            *out_len = b;
+            return TRUE;
+        }
+        ULONG count = b & 0x7Fu;
+        if (count == 0 || count > sizeof(ULONG) || *offset + count > total) return FALSE;
+        ULONG len = 0;
+        for (ULONG i = 0; i < count; ++i)
+        {
+            len = (len << 8) | data[(*offset)++];
+        }
+        if (len > total - *offset) return FALSE;
+        *out_len = len;
+        return TRUE;
+    }
+
+    __forceinline BOOLEAN der_read_tlv(const UINT8* data,
+                                       ULONG total,
+                                       ULONG* offset,
+                                       UINT8* out_tag,
+                                       ULONG* out_value_off,
+                                       ULONG* out_value_len,
+                                       ULONG* out_full_off,
+                                       ULONG* out_full_len)
+    {
+        if (!data || !offset || !out_tag || !out_value_off || !out_value_len ||
+            !out_full_off || !out_full_len || *offset >= total) return FALSE;
+        ULONG start = *offset;
+        UINT8 tag = data[(*offset)++];
+        ULONG len = 0;
+        if (!der_read_len(data, total, offset, &len)) return FALSE;
+        if (len > total - *offset) return FALSE;
+        *out_tag = tag;
+        *out_value_off = *offset;
+        *out_value_len = len;
+        *offset += len;
+        *out_full_off = start;
+        *out_full_len = *offset - start;
+        return TRUE;
+    }
+
+    __forceinline BOOLEAN extract_leaf_spki_der(const UINT8* cert,
+                                                ULONG cert_len,
+                                                const UINT8** out_spki,
+                                                ULONG* out_spki_len)
+    {
+        if (!cert || !out_spki || !out_spki_len) return FALSE;
+        *out_spki = nullptr;
+        *out_spki_len = 0;
+        ULONG off = 0;
+        UINT8 tag = 0;
+        ULONG value_off = 0;
+        ULONG value_len = 0;
+        ULONG full_off = 0;
+        ULONG full_len = 0;
+        if (!der_read_tlv(cert, cert_len, &off, &tag, &value_off, &value_len, &full_off, &full_len) ||
+            tag != 0x30 || value_off + value_len > cert_len)
+        {
+            return FALSE;
+        }
+        ULONG cert_end = value_off + value_len;
+        off = value_off;
+        ULONG tbs_value_off = 0;
+        ULONG tbs_value_len = 0;
+        if (!der_read_tlv(cert, cert_end, &off, &tag, &tbs_value_off, &tbs_value_len, &full_off, &full_len) ||
+            tag != 0x30 || tbs_value_off + tbs_value_len > cert_end)
+        {
+            return FALSE;
+        }
+        ULONG tbs_end = tbs_value_off + tbs_value_len;
+        off = tbs_value_off;
+        ULONG probe = off;
+        if (der_read_tlv(cert, tbs_end, &probe, &tag, &value_off, &value_len, &full_off, &full_len) &&
+            tag == 0xA0)
+        {
+            off = probe;
+        }
+        for (ULONG i = 0; i < 5; ++i)
+        {
+            if (!der_read_tlv(cert, tbs_end, &off, &tag, &value_off, &value_len, &full_off, &full_len))
+                return FALSE;
+        }
+        if (!der_read_tlv(cert, tbs_end, &off, &tag, &value_off, &value_len, &full_off, &full_len) ||
+            tag != 0x30 || full_len == 0 || full_off + full_len > cert_len)
+        {
+            return FALSE;
+        }
+        *out_spki = cert + full_off;
+        *out_spki_len = full_len;
+        return TRUE;
     }
 
     inline const char g_server_hostname[] = "aidapro.net";
@@ -97,11 +217,17 @@ namespace wsk_transport
         UINT8  shared_secret[32];
         UINT8  handshake_secret[32];
         UINT8  master_secret[32];
+        UINT8  client_hs_traffic_secret[32];
+        UINT8  server_hs_traffic_secret[32];
+        UINT8  client_app_traffic_secret[32];
+        UINT8  server_app_traffic_secret[32];
         UINT8  client_traffic_key[32];
         UINT8  server_traffic_key[32];
         UINT8  client_traffic_iv[12];
         UINT8  server_traffic_iv[12];
         UINT8  spki_observed_sha256[32];
+        ULONG  traffic_key_len;
+        UINT16 cipher_suite;
         BOOLEAN spki_matched;
         ULONGLONG client_seq;
         ULONGLONG server_seq;
@@ -113,20 +239,43 @@ namespace wsk_transport
         UINT8  scratch_fin_msg[256];
         UINT8  scratch_payload[1024];
         UINT8  scratch_resp[1024];
-        UINT8  scratch_aead_keyobj[1024];
+        UINT8  scratch_aead_keyobj[TLS_AEAD_KEY_OBJECT_CAPACITY];
     };
 
-    static void hkdf_expand_label(const UINT8* secret, ULONG secret_len,
+    struct tls13_handshake_reader_t
+    {
+        UINT8* record_buf;
+        ULONG record_buf_len;
+        ULONG record_len;
+        ULONG record_pos;
+        BOOLEAN encrypted;
+        ULONG skipped_ccs;
+        ULONG records_read;
+    };
+
+    static NTSTATUS hkdf_expand_label(const UINT8* secret, ULONG secret_len,
         const char* label, const UINT8* context, ULONG context_len,
         UINT8* out, ULONG out_len)
     {
+        if (!secret || !label || !out || secret_len == 0 || out_len == 0 ||
+            (context_len != 0 && !context) || context_len > 255 ||
+            out_len > (255UL * 32UL))
+            return STATUS_INVALID_PARAMETER;
+
         UINT8 info[256];
         ULONG info_len = 0;
         info[info_len++] = static_cast<UINT8>((out_len >> 8) & 0xFF);
         info[info_len++] = static_cast<UINT8>(out_len & 0xFF);
         UINT8 prefix_len = 6;
         ULONG label_len = 0;
-        while (label[label_len]) ++label_len;
+        while (label[label_len])
+        {
+            ++label_len;
+            if (label_len > 249)
+                return STATUS_INVALID_PARAMETER;
+        }
+        if (3 + prefix_len + label_len + context_len > sizeof(info))
+            return STATUS_BUFFER_TOO_SMALL;
         info[info_len++] = static_cast<UINT8>(prefix_len + label_len);
         const char* prefix = "tls13 ";
         for (UINT8 i = 0; i < prefix_len; ++i) info[info_len++] = prefix[i];
@@ -146,14 +295,79 @@ namespace wsk_transport
             for (ULONG i = 0; i < info_len; ++i) buf[bp++] = info[i];
             buf[bp++] = counter;
             UINT8 t_next[32] = {};
-            kernel_crypto::hmac_sha256(secret, secret_len, buf, bp, t_next);
+            NTSTATUS st = kernel_crypto::hmac_sha256(secret, secret_len, buf, bp, t_next);
+            RtlSecureZeroMemory(buf, sizeof(buf));
+            if (!NT_SUCCESS(st))
+            {
+                RtlSecureZeroMemory(out, out_len);
+                RtlSecureZeroMemory(t_prev, sizeof(t_prev));
+                RtlSecureZeroMemory(t_next, sizeof(t_next));
+                return st;
+            }
             ULONG copy_len = (out_len - written) < 32 ? (out_len - written) : 32;
             RtlCopyMemory(out + written, t_next, copy_len);
             RtlCopyMemory(t_prev, t_next, 32);
+            RtlSecureZeroMemory(t_next, sizeof(t_next));
             t_prev_len = 32;
             written += copy_len;
             ++counter;
         }
+        RtlSecureZeroMemory(t_prev, sizeof(t_prev));
+        RtlSecureZeroMemory(info, sizeof(info));
+        return STATUS_SUCCESS;
+    }
+
+    static NTSTATUS tls13_apply_traffic_secrets(tls13_session_t* sess,
+        const UINT8 client_secret[32],
+        const UINT8 server_secret[32],
+        ULONG key_len)
+    {
+        if (!sess || !client_secret || !server_secret ||
+            (key_len != TLS_AES_128_GCM_KEY_LEN && key_len != TLS_AES_256_GCM_KEY_LEN))
+            return STATUS_INVALID_PARAMETER;
+
+        RtlSecureZeroMemory(sess->client_traffic_key, sizeof(sess->client_traffic_key));
+        RtlSecureZeroMemory(sess->server_traffic_key, sizeof(sess->server_traffic_key));
+        RtlSecureZeroMemory(sess->client_traffic_iv, sizeof(sess->client_traffic_iv));
+        RtlSecureZeroMemory(sess->server_traffic_iv, sizeof(sess->server_traffic_iv));
+
+        NTSTATUS st = hkdf_expand_label(client_secret, 32, "key", nullptr, 0,
+            sess->client_traffic_key, key_len);
+        if (!NT_SUCCESS(st))
+        {
+            sess->traffic_key_len = 0;
+            return st;
+        }
+        st = hkdf_expand_label(server_secret, 32, "key", nullptr, 0,
+            sess->server_traffic_key, key_len);
+        if (!NT_SUCCESS(st))
+        {
+            RtlSecureZeroMemory(sess->client_traffic_key, sizeof(sess->client_traffic_key));
+            sess->traffic_key_len = 0;
+            return st;
+        }
+        st = hkdf_expand_label(client_secret, 32, "iv", nullptr, 0,
+            sess->client_traffic_iv, TLS_GCM_IV_LEN);
+        if (!NT_SUCCESS(st))
+        {
+            RtlSecureZeroMemory(sess->client_traffic_key, sizeof(sess->client_traffic_key));
+            RtlSecureZeroMemory(sess->server_traffic_key, sizeof(sess->server_traffic_key));
+            sess->traffic_key_len = 0;
+            return st;
+        }
+        st = hkdf_expand_label(server_secret, 32, "iv", nullptr, 0,
+            sess->server_traffic_iv, TLS_GCM_IV_LEN);
+        if (!NT_SUCCESS(st))
+        {
+            RtlSecureZeroMemory(sess->client_traffic_key, sizeof(sess->client_traffic_key));
+            RtlSecureZeroMemory(sess->server_traffic_key, sizeof(sess->server_traffic_key));
+            RtlSecureZeroMemory(sess->client_traffic_iv, sizeof(sess->client_traffic_iv));
+            sess->traffic_key_len = 0;
+            return st;
+        }
+
+        sess->traffic_key_len = key_len;
+        return STATUS_SUCCESS;
     }
 
     __forceinline NTSTATUS NTAPI wsk_completion_routine(
@@ -396,8 +610,8 @@ namespace wsk_transport
 
         g_server_ip_bytes[0] = 104;
         g_server_ip_bytes[1] = 21;
-        g_server_ip_bytes[2] = 64;
-        g_server_ip_bytes[3] = 1;
+        g_server_ip_bytes[2] = 20;
+        g_server_ip_bytes[3] = 46;
         _InterlockedExchange(&g_server_ip_resolved, 2);
         return *reinterpret_cast<ULONG*>(g_server_ip_bytes);
     }
@@ -433,19 +647,30 @@ namespace wsk_transport
         ULONG blob_len = 0;
         st = BCryptExportKey(key, nullptr, BCRYPT_ECCPRIVATE_BLOB,
             blob, sizeof(blob), &blob_len, 0);
-        if (NT_SUCCESS(st) && blob_len >= sizeof(BCRYPT_ECCKEY_BLOB) + 96)
+        if (NT_SUCCESS(st) && blob_len >= TLS_X25519_PRIVATE_BLOB_SIZE)
         {
+            BCRYPT_ECCKEY_BLOB* hdr = reinterpret_cast<BCRYPT_ECCKEY_BLOB*>(blob);
+            if (hdr->dwMagic != BCRYPT_ECDH_PRIVATE_GENERIC_MAGIC || hdr->cbKey != 32)
+            {
+                SN_LOG("tls13_x25519: private_blob_unexpected magic=0x%08lx cbKey=%lu len=%lu",
+                    hdr->dwMagic, hdr->cbKey, blob_len);
+                RtlSecureZeroMemory(blob, sizeof(blob));
+                BCryptDestroyKey(key);
+                BCryptCloseAlgorithmProvider(alg, 0);
+                return STATUS_INVALID_PARAMETER;
+            }
             UINT8* keymat = blob + sizeof(BCRYPT_ECCKEY_BLOB);
             RtlCopyMemory(pub_out, keymat, 32);
             RtlCopyMemory(priv_out, keymat + 64, 32);
         }
         else
         {
-            kernel_crypto::gen_random(priv_out, 32);
-            priv_out[0] &= 248;
-            priv_out[31] &= 127;
-            priv_out[31] |= 64;
-            kernel_crypto::sha256(priv_out, 32, pub_out);
+            SN_LOG("tls13_x25519: private_export_failed status=0x%08lx len=%lu",
+                st, blob_len);
+            RtlSecureZeroMemory(blob, sizeof(blob));
+            BCryptDestroyKey(key);
+            BCryptCloseAlgorithmProvider(alg, 0);
+            return NT_SUCCESS(st) ? STATUS_INVALID_PARAMETER : st;
         }
         RtlSecureZeroMemory(blob, sizeof(blob));
         BCryptDestroyKey(key);
@@ -453,8 +678,10 @@ namespace wsk_transport
         return STATUS_SUCCESS;
     }
 
-    static NTSTATUS x25519_shared(const UINT8 priv[32], const UINT8 their_pub[32],
-                                         UINT8 shared_out[32])
+    static NTSTATUS x25519_shared(const UINT8 priv[32],
+                                  const UINT8 own_pub[32],
+                                  const UINT8 their_pub[32],
+                                  UINT8 shared_out[32])
     {
         BCRYPT_ALG_HANDLE alg = nullptr;
         NTSTATUS st = BCryptOpenAlgorithmProvider(&alg, BCRYPT_ECDH_ALGORITHM, nullptr, 0);
@@ -464,22 +691,121 @@ namespace wsk_transport
             sizeof(BCRYPT_ECC_CURVE_25519), 0);
         if (!NT_SUCCESS(st)) { BCryptCloseAlgorithmProvider(alg, 0); return st; }
 
-        UINT8 mat[witness_key::KW_SIZE] = {};
-        UINT8 derived[32] = {};
-        kernel_crypto::hmac_sha256(priv, 32, their_pub, 32, derived);
-        RtlCopyMemory(shared_out, derived, 32);
-        RtlSecureZeroMemory(mat, sizeof(mat));
-        RtlSecureZeroMemory(derived, sizeof(derived));
+        UINT8 priv_blob[TLS_X25519_PRIVATE_BLOB_SIZE] = {};
+        UINT8 pub_blob[TLS_X25519_PUBLIC_BLOB_SIZE] = {};
+
+        BCRYPT_ECCKEY_BLOB* priv_hdr = reinterpret_cast<BCRYPT_ECCKEY_BLOB*>(priv_blob);
+        priv_hdr->dwMagic = BCRYPT_ECDH_PRIVATE_GENERIC_MAGIC;
+        priv_hdr->cbKey = 32;
+        RtlCopyMemory(priv_blob + sizeof(BCRYPT_ECCKEY_BLOB), own_pub, 32);
+        RtlCopyMemory(priv_blob + sizeof(BCRYPT_ECCKEY_BLOB) + 64, priv, 32);
+
+        BCRYPT_ECCKEY_BLOB* pub_hdr = reinterpret_cast<BCRYPT_ECCKEY_BLOB*>(pub_blob);
+        pub_hdr->dwMagic = BCRYPT_ECDH_PUBLIC_GENERIC_MAGIC;
+        pub_hdr->cbKey = 32;
+        RtlCopyMemory(pub_blob + sizeof(BCRYPT_ECCKEY_BLOB), their_pub, 32);
+
+        BCRYPT_KEY_HANDLE priv_key = nullptr;
+        BCRYPT_KEY_HANDLE pub_key = nullptr;
+        BCRYPT_SECRET_HANDLE secret = nullptr;
+        ULONG derived_len = 0;
+        UINT8 cng_secret[32] = {};
+
+        st = BCryptImportKeyPair(alg, nullptr, BCRYPT_ECCPRIVATE_BLOB,
+            &priv_key, priv_blob, sizeof(priv_blob), 0);
+        if (!NT_SUCCESS(st))
+        {
+            SN_LOG("tls13_x25519: private_import_failed status=0x%08lx", st);
+            goto cleanup;
+        }
+
+        st = BCryptImportKeyPair(alg, nullptr, BCRYPT_ECCPUBLIC_BLOB,
+            &pub_key, pub_blob, sizeof(pub_blob), 0);
+        if (!NT_SUCCESS(st))
+        {
+            UINT8 peer_hash[32] = {};
+            UINT8 blob_hash[32] = {};
+            kernel_crypto::sha256(their_pub, 32, peer_hash);
+            kernel_crypto::sha256(pub_blob, sizeof(pub_blob), blob_hash);
+            SN_LOG("tls13_x25519: public_import_failed status=0x%08lx irql=%lu blob_len=%lu magic=0x%08lx cbKey=%lu peer_first8=%02X%02X%02X%02X%02X%02X%02X%02X peer_last8=%02X%02X%02X%02X%02X%02X%02X%02X peer_sha256=%02X%02X%02X%02X%02X%02X%02X%02X blob_x_first8=%02X%02X%02X%02X%02X%02X%02X%02X blob_x_last8=%02X%02X%02X%02X%02X%02X%02X%02X blob_sha256=%02X%02X%02X%02X%02X%02X%02X%02X",
+                st,
+                KeGetCurrentIrql(),
+                (ULONG)sizeof(pub_blob),
+                pub_hdr->dwMagic,
+                pub_hdr->cbKey,
+                their_pub[0], their_pub[1], their_pub[2], their_pub[3],
+                their_pub[4], their_pub[5], their_pub[6], their_pub[7],
+                their_pub[24], their_pub[25], their_pub[26], their_pub[27],
+                their_pub[28], their_pub[29], their_pub[30], their_pub[31],
+                peer_hash[0], peer_hash[1], peer_hash[2], peer_hash[3],
+                peer_hash[4], peer_hash[5], peer_hash[6], peer_hash[7],
+                pub_blob[sizeof(BCRYPT_ECCKEY_BLOB) + 0],
+                pub_blob[sizeof(BCRYPT_ECCKEY_BLOB) + 1],
+                pub_blob[sizeof(BCRYPT_ECCKEY_BLOB) + 2],
+                pub_blob[sizeof(BCRYPT_ECCKEY_BLOB) + 3],
+                pub_blob[sizeof(BCRYPT_ECCKEY_BLOB) + 4],
+                pub_blob[sizeof(BCRYPT_ECCKEY_BLOB) + 5],
+                pub_blob[sizeof(BCRYPT_ECCKEY_BLOB) + 6],
+                pub_blob[sizeof(BCRYPT_ECCKEY_BLOB) + 7],
+                pub_blob[sizeof(BCRYPT_ECCKEY_BLOB) + 24],
+                pub_blob[sizeof(BCRYPT_ECCKEY_BLOB) + 25],
+                pub_blob[sizeof(BCRYPT_ECCKEY_BLOB) + 26],
+                pub_blob[sizeof(BCRYPT_ECCKEY_BLOB) + 27],
+                pub_blob[sizeof(BCRYPT_ECCKEY_BLOB) + 28],
+                pub_blob[sizeof(BCRYPT_ECCKEY_BLOB) + 29],
+                pub_blob[sizeof(BCRYPT_ECCKEY_BLOB) + 30],
+                pub_blob[sizeof(BCRYPT_ECCKEY_BLOB) + 31],
+                blob_hash[0], blob_hash[1], blob_hash[2], blob_hash[3],
+                blob_hash[4], blob_hash[5], blob_hash[6], blob_hash[7]);
+            goto cleanup;
+        }
+
+        st = BCryptSecretAgreement(priv_key, pub_key, &secret, 0);
+        if (!NT_SUCCESS(st))
+        {
+            SN_LOG("tls13_x25519: secret_agreement_failed status=0x%08lx", st);
+            goto cleanup;
+        }
+
+        st = BCryptDeriveKey(secret, BCRYPT_KDF_RAW_SECRET, nullptr,
+            cng_secret, sizeof(cng_secret), &derived_len, 0);
+        if (NT_SUCCESS(st) && derived_len != 32)
+            st = STATUS_DATA_ERROR;
+        if (!NT_SUCCESS(st))
+        {
+            SN_LOG("tls13_x25519: derive_raw_secret_failed status=0x%08lx len=%lu",
+                st, derived_len);
+            RtlSecureZeroMemory(shared_out, 32);
+        }
+        else
+        {
+            reverse_copy_32(shared_out, cng_secret);
+        }
+
+    cleanup:
+        if (secret)
+            BCryptDestroySecret(secret);
+        if (pub_key)
+            BCryptDestroyKey(pub_key);
+        if (priv_key)
+            BCryptDestroyKey(priv_key);
+        RtlSecureZeroMemory(priv_blob, sizeof(priv_blob));
+        RtlSecureZeroMemory(pub_blob, sizeof(pub_blob));
+        RtlSecureZeroMemory(cng_secret, sizeof(cng_secret));
         BCryptCloseAlgorithmProvider(alg, 0);
-        return STATUS_SUCCESS;
+        return st;
     }
 
-    static NTSTATUS aead_encrypt_aes256gcm(const UINT8 key[32], const UINT8 iv[12],
+    static NTSTATUS aead_encrypt_aesgcm(const UINT8* key, ULONG key_len, const UINT8 iv[12],
         const UINT8* aad, ULONG aad_len,
         const UINT8* pt, ULONG pt_len,
         UINT8* ct_out, UINT8 tag_out[16],
         UINT8* keyobj, ULONG keyobj_capacity)
     {
+        if (!key || !iv || !pt || !ct_out || !tag_out ||
+            (key_len != TLS_AES_128_GCM_KEY_LEN && key_len != TLS_AES_256_GCM_KEY_LEN))
+            return STATUS_INVALID_PARAMETER;
+
         BCRYPT_ALG_HANDLE alg = nullptr;
         NTSTATUS st = BCryptOpenAlgorithmProvider(&alg, BCRYPT_AES_ALGORITHM, nullptr, 0);
         if (!NT_SUCCESS(st)) return st;
@@ -491,16 +817,44 @@ namespace wsk_transport
         BCRYPT_KEY_HANDLE kh = nullptr;
         ULONG keyobj_size = 0;
         ULONG cb = 0;
-        BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&keyobj_size, sizeof(keyobj_size), &cb, 0);
-        if (keyobj_size > keyobj_capacity)
+        st = BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&keyobj_size, sizeof(keyobj_size), &cb, 0);
+        if (!NT_SUCCESS(st) || keyobj_size == 0)
         {
+            SN_LOG("tls13_aead_encrypt: key_object_len_failed status=0x%08lx size=%lu cb=%lu cap=%lu key_len=%lu",
+                st, keyobj_size, cb, keyobj_capacity, key_len);
             BCryptCloseAlgorithmProvider(alg, 0);
-            return STATUS_BUFFER_TOO_SMALL;
+            return NT_SUCCESS(st) ? STATUS_INVALID_PARAMETER : st;
         }
-        RtlZeroMemory(keyobj, keyobj_size);
-        st = BCryptGenerateSymmetricKey(alg, &kh, keyobj, keyobj_size,
-            const_cast<PUCHAR>(key), 32, 0);
-        if (!NT_SUCCESS(st)) { BCryptCloseAlgorithmProvider(alg, 0); return st; }
+        UINT8* active_keyobj = keyobj;
+        BOOLEAN allocated_keyobj = FALSE;
+        if (!active_keyobj || keyobj_size > keyobj_capacity)
+        {
+            active_keyobj = static_cast<UINT8*>(
+                ExAllocatePool2(POOL_FLAG_NON_PAGED, keyobj_size, WSK_POOL_TAG));
+            if (!active_keyobj)
+            {
+                SN_LOG("tls13_aead_encrypt: key_object_alloc_failed required=%lu cap=%lu key_len=%lu",
+                    keyobj_size, keyobj_capacity, key_len);
+                BCryptCloseAlgorithmProvider(alg, 0);
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
+            allocated_keyobj = TRUE;
+            SN_LOG("tls13_aead_encrypt: key_object_scratch_expanded required=%lu cap=%lu key_len=%lu",
+                keyobj_size, keyobj_capacity, key_len);
+        }
+        RtlZeroMemory(active_keyobj, keyobj_size);
+        st = BCryptGenerateSymmetricKey(alg, &kh, active_keyobj, keyobj_size,
+            const_cast<PUCHAR>(key), key_len, 0);
+        if (!NT_SUCCESS(st))
+        {
+            SN_LOG("tls13_aead_encrypt: generate_key_failed status=0x%08lx keyobj_size=%lu cap=%lu key_len=%lu",
+                st, keyobj_size, keyobj_capacity, key_len);
+            RtlSecureZeroMemory(active_keyobj, keyobj_size);
+            if (allocated_keyobj)
+                ExFreePoolWithTag(active_keyobj, WSK_POOL_TAG);
+            BCryptCloseAlgorithmProvider(alg, 0);
+            return st;
+        }
 
         BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO info{};
         BCRYPT_INIT_AUTH_MODE_INFO(info);
@@ -514,17 +868,31 @@ namespace wsk_transport
         ULONG out_len = 0;
         st = BCryptEncrypt(kh, const_cast<PUCHAR>(pt), pt_len, &info,
             nullptr, 0, ct_out, pt_len, &out_len, 0);
+        if (NT_SUCCESS(st) && out_len != pt_len)
+            st = STATUS_DATA_ERROR;
+        if (!NT_SUCCESS(st))
+        {
+            SN_LOG("tls13_aead_encrypt: encrypt_failed status=0x%08lx pt_len=%lu out_len=%lu keyobj_size=%lu key_len=%lu",
+                st, pt_len, out_len, keyobj_size, key_len);
+        }
         BCryptDestroyKey(kh);
+        RtlSecureZeroMemory(active_keyobj, keyobj_size);
+        if (allocated_keyobj)
+            ExFreePoolWithTag(active_keyobj, WSK_POOL_TAG);
         BCryptCloseAlgorithmProvider(alg, 0);
         return st;
     }
 
-    static NTSTATUS aead_decrypt_aes256gcm(const UINT8 key[32], const UINT8 iv[12],
+    static NTSTATUS aead_decrypt_aesgcm(const UINT8* key, ULONG key_len, const UINT8 iv[12],
         const UINT8* aad, ULONG aad_len,
         const UINT8* ct, ULONG ct_len,
         const UINT8 tag[16], UINT8* pt_out,
         UINT8* keyobj, ULONG keyobj_capacity)
     {
+        if (!key || !iv || !ct || !tag || !pt_out ||
+            (key_len != TLS_AES_128_GCM_KEY_LEN && key_len != TLS_AES_256_GCM_KEY_LEN))
+            return STATUS_INVALID_PARAMETER;
+
         BCRYPT_ALG_HANDLE alg = nullptr;
         NTSTATUS st = BCryptOpenAlgorithmProvider(&alg, BCRYPT_AES_ALGORITHM, nullptr, 0);
         if (!NT_SUCCESS(st)) return st;
@@ -536,16 +904,44 @@ namespace wsk_transport
         BCRYPT_KEY_HANDLE kh = nullptr;
         ULONG keyobj_size = 0;
         ULONG cb = 0;
-        BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&keyobj_size, sizeof(keyobj_size), &cb, 0);
-        if (keyobj_size > keyobj_capacity)
+        st = BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&keyobj_size, sizeof(keyobj_size), &cb, 0);
+        if (!NT_SUCCESS(st) || keyobj_size == 0)
         {
+            SN_LOG("tls13_aead_decrypt: key_object_len_failed status=0x%08lx size=%lu cb=%lu cap=%lu key_len=%lu",
+                st, keyobj_size, cb, keyobj_capacity, key_len);
             BCryptCloseAlgorithmProvider(alg, 0);
-            return STATUS_BUFFER_TOO_SMALL;
+            return NT_SUCCESS(st) ? STATUS_INVALID_PARAMETER : st;
         }
-        RtlZeroMemory(keyobj, keyobj_size);
-        st = BCryptGenerateSymmetricKey(alg, &kh, keyobj, keyobj_size,
-            const_cast<PUCHAR>(key), 32, 0);
-        if (!NT_SUCCESS(st)) { BCryptCloseAlgorithmProvider(alg, 0); return st; }
+        UINT8* active_keyobj = keyobj;
+        BOOLEAN allocated_keyobj = FALSE;
+        if (!active_keyobj || keyobj_size > keyobj_capacity)
+        {
+            active_keyobj = static_cast<UINT8*>(
+                ExAllocatePool2(POOL_FLAG_NON_PAGED, keyobj_size, WSK_POOL_TAG));
+            if (!active_keyobj)
+            {
+                SN_LOG("tls13_aead_decrypt: key_object_alloc_failed required=%lu cap=%lu key_len=%lu",
+                    keyobj_size, keyobj_capacity, key_len);
+                BCryptCloseAlgorithmProvider(alg, 0);
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
+            allocated_keyobj = TRUE;
+            SN_LOG("tls13_aead_decrypt: key_object_scratch_expanded required=%lu cap=%lu key_len=%lu",
+                keyobj_size, keyobj_capacity, key_len);
+        }
+        RtlZeroMemory(active_keyobj, keyobj_size);
+        st = BCryptGenerateSymmetricKey(alg, &kh, active_keyobj, keyobj_size,
+            const_cast<PUCHAR>(key), key_len, 0);
+        if (!NT_SUCCESS(st))
+        {
+            SN_LOG("tls13_aead_decrypt: generate_key_failed status=0x%08lx keyobj_size=%lu cap=%lu key_len=%lu",
+                st, keyobj_size, keyobj_capacity, key_len);
+            RtlSecureZeroMemory(active_keyobj, keyobj_size);
+            if (allocated_keyobj)
+                ExFreePoolWithTag(active_keyobj, WSK_POOL_TAG);
+            BCryptCloseAlgorithmProvider(alg, 0);
+            return st;
+        }
 
         BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO info{};
         BCRYPT_INIT_AUTH_MODE_INFO(info);
@@ -559,7 +955,17 @@ namespace wsk_transport
         ULONG out_len = 0;
         st = BCryptDecrypt(kh, const_cast<PUCHAR>(ct), ct_len, &info,
             nullptr, 0, pt_out, ct_len, &out_len, 0);
+        if (NT_SUCCESS(st) && out_len != ct_len)
+            st = STATUS_DATA_ERROR;
+        if (!NT_SUCCESS(st))
+        {
+            SN_LOG("tls13_aead_decrypt: decrypt_failed status=0x%08lx ct_len=%lu out_len=%lu keyobj_size=%lu key_len=%lu",
+                st, ct_len, out_len, keyobj_size, key_len);
+        }
         BCryptDestroyKey(kh);
+        RtlSecureZeroMemory(active_keyobj, keyobj_size);
+        if (allocated_keyobj)
+            ExFreePoolWithTag(active_keyobj, WSK_POOL_TAG);
         BCryptCloseAlgorithmProvider(alg, 0);
         return st;
     }
@@ -590,6 +996,14 @@ namespace wsk_transport
     {
         if (encrypted)
         {
+            if (sess->traffic_key_len != TLS_AES_128_GCM_KEY_LEN &&
+                sess->traffic_key_len != TLS_AES_256_GCM_KEY_LEN)
+            {
+                SN_LOG("tls13_send_record: invalid_key_len=%lu cipher=0x%04X",
+                    sess->traffic_key_len, sess->cipher_suite);
+                return STATUS_INVALID_PARAMETER;
+            }
+
             UINT8 nonce[12] = {};
             RtlCopyMemory(nonce, sess->client_traffic_iv, 12);
             for (int i = 0; i < 8; ++i)
@@ -600,7 +1014,7 @@ namespace wsk_transport
                 ExAllocatePool2(POOL_FLAG_NON_PAGED, 5 + inner_len, WSK_POOL_TAG));
             if (!record) return STATUS_INSUFFICIENT_RESOURCES;
 
-            record[0] = 0x17;
+            record[0] = TLS_CONTENT_APPLICATION_DATA;
             record[1] = 0x03; record[2] = 0x03;
             record[3] = static_cast<UINT8>((inner_len >> 8) & 0xFF);
             record[4] = static_cast<UINT8>(inner_len & 0xFF);
@@ -618,7 +1032,7 @@ namespace wsk_transport
             UINT8 tag[16] = {};
             UINT8 aad[5];
             RtlCopyMemory(aad, record, 5);
-            NTSTATUS st = aead_encrypt_aes256gcm(sess->client_traffic_key, nonce,
+            NTSTATUS st = aead_encrypt_aesgcm(sess->client_traffic_key, sess->traffic_key_len, nonce,
                 aad, 5, inner, payload_len + 1, record + 5, tag,
                 sess->scratch_aead_keyobj, sizeof(sess->scratch_aead_keyobj));
             ExFreePoolWithTag(inner, WSK_POOL_TAG);
@@ -668,7 +1082,7 @@ namespace wsk_transport
         st = recv_exact(sock, record, record_len);
         if (!NT_SUCCESS(st)) { ExFreePoolWithTag(record, WSK_POOL_TAG); return st; }
 
-        if (!encrypted || hdr[0] != 0x17)
+        if (!encrypted || hdr[0] != TLS_CONTENT_APPLICATION_DATA)
         {
             *type_out = hdr[0];
             if (record_len > payload_buf_len) { ExFreePoolWithTag(record, WSK_POOL_TAG); return STATUS_BUFFER_TOO_SMALL; }
@@ -679,6 +1093,14 @@ namespace wsk_transport
         }
 
         if (record_len < 17) { ExFreePoolWithTag(record, WSK_POOL_TAG); return STATUS_DATA_ERROR; }
+        if (sess->traffic_key_len != TLS_AES_128_GCM_KEY_LEN &&
+            sess->traffic_key_len != TLS_AES_256_GCM_KEY_LEN)
+        {
+            SN_LOG("tls13_recv_record: invalid_key_len=%lu cipher=0x%04X server_seq=%llu",
+                sess->traffic_key_len, sess->cipher_suite, sess->server_seq);
+            ExFreePoolWithTag(record, WSK_POOL_TAG);
+            return STATUS_INVALID_PARAMETER;
+        }
         ULONG ct_len = record_len - 16;
         UINT8 nonce[12] = {};
         RtlCopyMemory(nonce, sess->server_traffic_iv, 12);
@@ -688,16 +1110,27 @@ namespace wsk_transport
         UINT8* pt = static_cast<UINT8*>(
             ExAllocatePool2(POOL_FLAG_NON_PAGED, ct_len, WSK_POOL_TAG));
         if (!pt) { ExFreePoolWithTag(record, WSK_POOL_TAG); return STATUS_INSUFFICIENT_RESOURCES; }
-        st = aead_decrypt_aes256gcm(sess->server_traffic_key, nonce, hdr, 5,
+        st = aead_decrypt_aesgcm(sess->server_traffic_key, sess->traffic_key_len, nonce, hdr, 5,
             record, ct_len, record + ct_len, pt,
             sess->scratch_aead_keyobj, sizeof(sess->scratch_aead_keyobj));
         ExFreePoolWithTag(record, WSK_POOL_TAG);
-        if (!NT_SUCCESS(st)) { ExFreePoolWithTag(pt, WSK_POOL_TAG); return st; }
+        if (!NT_SUCCESS(st))
+        {
+            SN_LOG("tls13_recv_record: decrypt_failed status=0x%08lx hdr_type=0x%02X record_len=%lu ct_len=%lu payload_cap=%lu server_seq=%llu cipher=0x%04X key_len=%lu",
+                st, hdr[0], record_len, ct_len, payload_buf_len, sess->server_seq,
+                sess->cipher_suite, sess->traffic_key_len);
+            ExFreePoolWithTag(pt, WSK_POOL_TAG);
+            return st;
+        }
         sess->server_seq++;
 
         if (ct_len == 0) { ExFreePoolWithTag(pt, WSK_POOL_TAG); return STATUS_DATA_ERROR; }
-        UINT8 inner_type = pt[ct_len - 1];
-        ULONG plain_len = ct_len - 1;
+        ULONG end = ct_len;
+        while (end > 0 && pt[end - 1] == 0)
+            --end;
+        if (end == 0) { ExFreePoolWithTag(pt, WSK_POOL_TAG); return STATUS_DATA_ERROR; }
+        UINT8 inner_type = pt[end - 1];
+        ULONG plain_len = end - 1;
         if (plain_len > payload_buf_len)
         {
             ExFreePoolWithTag(pt, WSK_POOL_TAG);
@@ -710,13 +1143,152 @@ namespace wsk_transport
         return STATUS_SUCCESS;
     }
 
+    static NTSTATUS tls13_recv_handshake_message(PWSK_SOCKET sock,
+        tls13_session_t* sess,
+        tls13_handshake_reader_t* reader,
+        UINT8 expected_handshake_type,
+        UINT8* msg_buf,
+        ULONG msg_buf_len,
+        ULONG* msg_len_out)
+    {
+        if (!sock || !sess || !reader || !reader->record_buf || reader->record_buf_len == 0 ||
+            !msg_buf || !msg_len_out)
+            return STATUS_INVALID_PARAMETER;
+
+        *msg_len_out = 0;
+        ULONG copied = 0;
+        ULONG needed = 4;
+        UINT8 msg_type = 0;
+        ULONG body_len = 0;
+
+        while (copied < needed)
+        {
+            if (reader->record_pos >= reader->record_len)
+            {
+                reader->record_pos = 0;
+                reader->record_len = 0;
+
+                for (;;)
+                {
+                    UINT8 record_type = 0;
+                    ULONG record_len = 0;
+                    NTSTATUS st = tls13_recv_record(sock,
+                        &record_type,
+                        reader->record_buf,
+                        reader->record_buf_len,
+                        &record_len,
+                        sess,
+                        reader->encrypted);
+                    if (!NT_SUCCESS(st))
+                    {
+                        SN_LOG("tls13_handshake: recv_msg_failed expected=0x%02X status=0x%08lx records=%lu copied=%lu needed=%lu",
+                            expected_handshake_type, st, reader->records_read, copied, needed);
+                        return st;
+                    }
+
+                    reader->records_read++;
+                    UINT8 first = record_len ? reader->record_buf[0] : 0;
+                    UINT8 second = record_len > 1 ? reader->record_buf[1] : 0;
+
+                    if (record_type == TLS_CONTENT_CHANGE_CIPHER_SPEC &&
+                        record_len == 1 &&
+                        first == 0x01)
+                    {
+                        reader->skipped_ccs++;
+                        SN_LOG("tls13_handshake: skipped_compat_ccs expected=0x%02X skipped=%lu records=%lu",
+                            expected_handshake_type, reader->skipped_ccs, reader->records_read);
+                        continue;
+                    }
+
+                    if (record_type == TLS_CONTENT_ALERT)
+                    {
+                        SN_LOG("tls13_handshake: alert_record expected=0x%02X len=%lu level=0x%02X desc=0x%02X records=%lu",
+                            expected_handshake_type, record_len, first, second, reader->records_read);
+                        return STATUS_DATA_ERROR;
+                    }
+
+                    if (record_type != TLS_CONTENT_HANDSHAKE)
+                    {
+                        SN_LOG("tls13_handshake: non_handshake_record expected=0x%02X record_type=0x%02X len=%lu first=0x%02X records=%lu",
+                            expected_handshake_type, record_type, record_len, first, reader->records_read);
+                        return STATUS_DATA_ERROR;
+                    }
+
+                    if (record_len == 0)
+                    {
+                        SN_LOG("tls13_handshake: empty_handshake_record expected=0x%02X records=%lu",
+                            expected_handshake_type, reader->records_read);
+                        return STATUS_DATA_ERROR;
+                    }
+
+                    reader->record_len = record_len;
+                    reader->record_pos = 0;
+                    break;
+                }
+            }
+
+            ULONG available = reader->record_len - reader->record_pos;
+            ULONG want = needed - copied;
+            ULONG take = available < want ? available : want;
+            if (copied + take > msg_buf_len)
+            {
+                SN_LOG("tls13_handshake: msg_buffer_overrun expected=0x%02X copied=%lu take=%lu cap=%lu",
+                    expected_handshake_type, copied, take, msg_buf_len);
+                return STATUS_BUFFER_TOO_SMALL;
+            }
+
+            RtlCopyMemory(msg_buf + copied, reader->record_buf + reader->record_pos, take);
+            copied += take;
+            reader->record_pos += take;
+
+            if (copied == 4 && needed == 4)
+            {
+                msg_type = msg_buf[0];
+                body_len = (static_cast<ULONG>(msg_buf[1]) << 16) |
+                           (static_cast<ULONG>(msg_buf[2]) << 8) |
+                           static_cast<ULONG>(msg_buf[3]);
+                needed = body_len + 4;
+                if (needed < 4 || needed > msg_buf_len)
+                {
+                    SN_LOG("tls13_handshake: msg_len_invalid expected=0x%02X actual=0x%02X body=%lu cap=%lu",
+                        expected_handshake_type, msg_type, body_len, msg_buf_len);
+                    return STATUS_BUFFER_TOO_SMALL;
+                }
+                if (msg_type != expected_handshake_type)
+                {
+                    SN_LOG("tls13_handshake: msg_type_unexpected expected=0x%02X actual=0x%02X body=%lu record_remain=%lu ccs_skipped=%lu",
+                        expected_handshake_type,
+                        msg_type,
+                        body_len,
+                        reader->record_len - reader->record_pos,
+                        reader->skipped_ccs);
+                    return STATUS_DATA_ERROR;
+                }
+            }
+        }
+
+        *msg_len_out = copied;
+        SN_LOG("tls13_handshake: msg_ok type=0x%02X len=%lu records=%lu record_remain=%lu ccs_skipped=%lu",
+            expected_handshake_type,
+            copied,
+            reader->records_read,
+            reader->record_len - reader->record_pos,
+            reader->skipped_ccs);
+        return STATUS_SUCCESS;
+    }
+
     static NTSTATUS tls13_handshake(PWSK_SOCKET sock, tls13_session_t* sess)
     {
         sess->client_seq = 0;
         sess->server_seq = 0;
         sess->spki_matched = FALSE;
         kernel_crypto::gen_random(sess->client_random, 32);
-        x25519_keypair(sess->client_priv, sess->client_pub);
+        NTSTATUS st = x25519_keypair(sess->client_priv, sess->client_pub);
+        if (!NT_SUCCESS(st))
+        {
+            SN_LOG("tls13_handshake: x25519_keypair_failed status=0x%08lx", st);
+            return st;
+        }
 
         UINT8* ch = sess->scratch_ch;
         RtlZeroMemory(ch, sizeof(sess->scratch_ch));
@@ -757,8 +1329,9 @@ namespace wsk_transport
         RtlCopyMemory(ch + ch_len, sess->client_pub, 32); ch_len += 32;
 
         ch[ch_len++] = 0x00; ch[ch_len++] = 0x0D;
+        ch[ch_len++] = 0x00; ch[ch_len++] = 0x06;
         ch[ch_len++] = 0x00; ch[ch_len++] = 0x04;
-        ch[ch_len++] = 0x00; ch[ch_len++] = 0x02;
+        ch[ch_len++] = 0x04; ch[ch_len++] = 0x03;
         ch[ch_len++] = 0x08; ch[ch_len++] = 0x04;
 
         ULONG ext_len = ch_len - ext_off - 2;
@@ -770,122 +1343,333 @@ namespace wsk_transport
         ch[ch_body_off + 1] = static_cast<UINT8>((body_len >> 8) & 0xFF);
         ch[ch_body_off + 2] = static_cast<UINT8>(body_len & 0xFF);
 
-        NTSTATUS st = tls13_send_record(sock, 0x16, ch, ch_len, sess, FALSE);
-        if (!NT_SUCCESS(st)) return st;
+        st = tls13_send_record(sock, TLS_CONTENT_HANDSHAKE, ch, ch_len, sess, FALSE);
+        if (!NT_SUCCESS(st))
+        {
+            SN_LOG("tls13_handshake: client_hello_send_failed status=0x%08lx len=%lu", st, ch_len);
+            return st;
+        }
 
         UINT8* sh = sess->scratch_sh;
         RtlZeroMemory(sh, sizeof(sess->scratch_sh));
         ULONG sh_len = 0;
         UINT8 type = 0;
         st = tls13_recv_record(sock, &type, sh, sizeof(sess->scratch_sh), &sh_len, sess, FALSE);
-        if (!NT_SUCCESS(st)) return st;
-        if (type != 0x16 || sh_len < 6 || sh[0] != 0x02) return STATUS_DATA_ERROR;
-        if (sh_len < 38) return STATUS_DATA_ERROR;
+        if (!NT_SUCCESS(st))
+        {
+            SN_LOG("tls13_handshake: server_hello_recv_failed status=0x%08lx", st);
+            return st;
+        }
+        if (type != TLS_CONTENT_HANDSHAKE || sh_len < 6 || sh[0] != TLS_HANDSHAKE_SERVER_HELLO)
+        {
+            SN_LOG("tls13_handshake: server_hello_unexpected type=0x%02X len=%lu first=0x%02X",
+                type, sh_len, sh_len ? sh[0] : 0);
+            return STATUS_DATA_ERROR;
+        }
+        if (sh_len < 38)
+        {
+            SN_LOG("tls13_handshake: server_hello_short len=%lu", sh_len);
+            return STATUS_DATA_ERROR;
+        }
 
         RtlCopyMemory(sess->server_random, sh + 6, 32);
 
         ULONG cur = 38;
-        if (cur >= sh_len) return STATUS_DATA_ERROR;
+        if (cur >= sh_len)
+        {
+            SN_LOG("tls13_handshake: server_hello_missing_session_id cur=%lu len=%lu", cur, sh_len);
+            return STATUS_DATA_ERROR;
+        }
         UINT8 ses_id_len = sh[cur++];
         cur += ses_id_len;
-        if (cur + 3 > sh_len) return STATUS_DATA_ERROR;
+        if (cur + 3 > sh_len)
+        {
+            SN_LOG("tls13_handshake: server_hello_session_overrun sid_len=%u cur=%lu len=%lu",
+                ses_id_len, cur, sh_len);
+            return STATUS_DATA_ERROR;
+        }
+        UINT16 selected_cipher = static_cast<UINT16>((sh[cur] << 8) | sh[cur + 1]);
         cur += 2;
-        cur += 1;
-        if (cur + 2 > sh_len) return STATUS_DATA_ERROR;
+        UINT8 compression_method = sh[cur++];
+        if (selected_cipher != TLS_AES_128_GCM_SHA256)
+        {
+            SN_LOG("tls13_handshake: unsupported_cipher=0x%04X len=%lu", selected_cipher, sh_len);
+            return STATUS_NOT_SUPPORTED;
+        }
+        if (compression_method != 0)
+        {
+            SN_LOG("tls13_handshake: invalid_compression method=0x%02X cipher=0x%04X",
+                compression_method, selected_cipher);
+            return STATUS_DATA_ERROR;
+        }
+        sess->cipher_suite = selected_cipher;
+        sess->traffic_key_len = TLS_AES_128_GCM_KEY_LEN;
+        if (cur + 2 > sh_len)
+        {
+            SN_LOG("tls13_handshake: server_hello_missing_extensions_len cur=%lu len=%lu", cur, sh_len);
+            return STATUS_DATA_ERROR;
+        }
+        UINT16 extensions_len = static_cast<UINT16>((sh[cur] << 8) | sh[cur + 1]);
         cur += 2;
+        if (cur + extensions_len > sh_len)
+        {
+            SN_LOG("tls13_handshake: server_hello_extensions_overrun ext_len=%u cur=%lu len=%lu",
+                extensions_len, cur, sh_len);
+            return STATUS_DATA_ERROR;
+        }
+        ULONG extensions_end = cur + extensions_len;
 
         BOOLEAN got_pub = FALSE;
-        while (cur + 4 <= sh_len)
+        BOOLEAN got_tls13_version = FALSE;
+        UINT16 selected_version = 0;
+        while (cur + 4 <= extensions_end)
         {
             UINT16 ext_type = static_cast<UINT16>((sh[cur] << 8) | sh[cur + 1]);
             UINT16 ext_size = static_cast<UINT16>((sh[cur + 2] << 8) | sh[cur + 3]);
             cur += 4;
-            if (cur + ext_size > sh_len) break;
+            if (cur + ext_size > extensions_end)
+            {
+                SN_LOG("tls13_handshake: server_hello_ext_overrun ext=0x%04X size=%u cur=%lu end=%lu len=%lu",
+                    ext_type, ext_size, cur, extensions_end, sh_len);
+                return STATUS_DATA_ERROR;
+            }
             if (ext_type == 0x33 && ext_size >= 36)
             {
                 ULONG p = cur;
                 UINT16 group = static_cast<UINT16>((sh[p] << 8) | sh[p + 1]);
                 UINT16 ksize = static_cast<UINT16>((sh[p + 2] << 8) | sh[p + 3]);
+                SN_LOG("tls13_handshake: key_share_ext size=%u group=0x%04X ksize=%u cur=%lu end=%lu",
+                    ext_size, group, ksize, cur, extensions_end);
                 if (group == 0x001D && ksize == 32)
                 {
                     RtlCopyMemory(sess->server_pub, sh + p + 4, 32);
+                    UINT8 server_pub_hash[32] = {};
+                    kernel_crypto::sha256(sess->server_pub, 32, server_pub_hash);
+                    SN_LOG("tls13_handshake: server_x25519_pub first8=%02X%02X%02X%02X%02X%02X%02X%02X last8=%02X%02X%02X%02X%02X%02X%02X%02X sha256=%02X%02X%02X%02X%02X%02X%02X%02X",
+                        sess->server_pub[0], sess->server_pub[1], sess->server_pub[2], sess->server_pub[3],
+                        sess->server_pub[4], sess->server_pub[5], sess->server_pub[6], sess->server_pub[7],
+                        sess->server_pub[24], sess->server_pub[25], sess->server_pub[26], sess->server_pub[27],
+                        sess->server_pub[28], sess->server_pub[29], sess->server_pub[30], sess->server_pub[31],
+                        server_pub_hash[0], server_pub_hash[1], server_pub_hash[2], server_pub_hash[3],
+                        server_pub_hash[4], server_pub_hash[5], server_pub_hash[6], server_pub_hash[7]);
                     got_pub = TRUE;
                 }
             }
+            else if (ext_type == 0x2B && ext_size == 2)
+            {
+                selected_version = static_cast<UINT16>((sh[cur] << 8) | sh[cur + 1]);
+                got_tls13_version = (selected_version == TLS_VERSION_13);
+            }
             cur += ext_size;
         }
-        if (!got_pub) return STATUS_DATA_ERROR;
+        if (cur != extensions_end)
+        {
+            SN_LOG("tls13_handshake: server_hello_ext_trailing cur=%lu end=%lu len=%lu",
+                cur, extensions_end, sh_len);
+            return STATUS_DATA_ERROR;
+        }
+        if (!got_tls13_version)
+        {
+            SN_LOG("tls13_handshake: tls13_version_missing_or_invalid selected=0x%04X cipher=0x%04X",
+                selected_version, selected_cipher);
+            return STATUS_NOT_SUPPORTED;
+        }
+        if (!got_pub)
+        {
+            SN_LOG("tls13_handshake: server_hello_missing_x25519_key len=%lu", sh_len);
+            return STATUS_DATA_ERROR;
+        }
+        SN_LOG("tls13_handshake: server_hello_ok cipher=0x%04X key_len=%lu version=0x%04X sh_len=%lu",
+            selected_cipher, sess->traffic_key_len, selected_version, sh_len);
 
-        x25519_shared(sess->client_priv, sess->server_pub, sess->shared_secret);
+        st = x25519_shared(sess->client_priv, sess->client_pub, sess->server_pub, sess->shared_secret);
+        if (!NT_SUCCESS(st))
+        {
+            SN_LOG("tls13_handshake: x25519_shared_failed status=0x%08lx", st);
+            return st;
+        }
         UINT8 zero[32] = {};
+        UINT8 empty_hkdf_input[1] = {};
         UINT8 early_secret[32] = {};
-        kernel_crypto::hmac_sha256(zero, 32, zero, 32, early_secret);
+        st = kernel_crypto::hmac_sha256(zero, 32, empty_hkdf_input, 0, early_secret);
+        if (!NT_SUCCESS(st))
+        {
+            SN_LOG("tls13_handshake: early_secret_failed status=0x%08lx", st);
+            return st;
+        }
         UINT8 derived[32] = {};
-        hkdf_expand_label(early_secret, 32, "derived", nullptr, 0, derived, 32);
-        kernel_crypto::hmac_sha256(derived, 32, sess->shared_secret, 32, sess->handshake_secret);
+        UINT8 empty_hash[32] = {};
+        st = kernel_crypto::sha256(empty_hkdf_input, 0, empty_hash);
+        if (!NT_SUCCESS(st))
+        {
+            SN_LOG("tls13_handshake: empty_hash_failed status=0x%08lx", st);
+            return st;
+        }
+        st = hkdf_expand_label(early_secret, 32, "derived", empty_hash, 32, derived, 32);
+        if (!NT_SUCCESS(st))
+        {
+            SN_LOG("tls13_handshake: early_derived_failed status=0x%08lx", st);
+            return st;
+        }
+        st = kernel_crypto::hmac_sha256(derived, 32, sess->shared_secret, 32, sess->handshake_secret);
+        if (!NT_SUCCESS(st))
+        {
+            SN_LOG("tls13_handshake: handshake_secret_failed status=0x%08lx", st);
+            return st;
+        }
 
         UINT8* transcript = sess->scratch_transcript;
         RtlZeroMemory(transcript, sizeof(sess->scratch_transcript));
         ULONG tlen = 0;
+        if (ch_len + sh_len > sizeof(sess->scratch_transcript))
+        {
+            SN_LOG("tls13_handshake: transcript_overflow ch=%lu sh=%lu cap=%lu",
+                ch_len, sh_len, (ULONG)sizeof(sess->scratch_transcript));
+            return STATUS_BUFFER_TOO_SMALL;
+        }
         RtlCopyMemory(transcript + tlen, ch, ch_len); tlen += ch_len;
         RtlCopyMemory(transcript + tlen, sh, sh_len); tlen += sh_len;
 
         UINT8 t_hash[32] = {};
-        kernel_crypto::sha256(transcript, tlen, t_hash);
+        st = kernel_crypto::sha256(transcript, tlen, t_hash);
+        if (!NT_SUCCESS(st))
+        {
+            SN_LOG("tls13_handshake: transcript_hash_failed status=0x%08lx len=%lu", st, tlen);
+            return st;
+        }
 
-        hkdf_expand_label(sess->handshake_secret, 32, "c hs traffic", t_hash, 32,
-            sess->client_traffic_key, 32);
-        hkdf_expand_label(sess->handshake_secret, 32, "s hs traffic", t_hash, 32,
-            sess->server_traffic_key, 32);
-        hkdf_expand_label(sess->client_traffic_key, 32, "iv", nullptr, 0,
-            sess->client_traffic_iv, 12);
-        hkdf_expand_label(sess->server_traffic_key, 32, "iv", nullptr, 0,
-            sess->server_traffic_iv, 12);
+        st = hkdf_expand_label(sess->handshake_secret, 32, "c hs traffic", t_hash, 32,
+            sess->client_hs_traffic_secret, 32);
+        if (!NT_SUCCESS(st))
+        {
+            SN_LOG("tls13_handshake: client_hs_secret_failed status=0x%08lx", st);
+            return st;
+        }
+        st = hkdf_expand_label(sess->handshake_secret, 32, "s hs traffic", t_hash, 32,
+            sess->server_hs_traffic_secret, 32);
+        if (!NT_SUCCESS(st))
+        {
+            SN_LOG("tls13_handshake: server_hs_secret_failed status=0x%08lx", st);
+            return st;
+        }
+        st = tls13_apply_traffic_secrets(sess,
+            sess->client_hs_traffic_secret,
+            sess->server_hs_traffic_secret,
+            sess->traffic_key_len);
+        if (!NT_SUCCESS(st))
+        {
+            SN_LOG("tls13_handshake: apply_hs_keys_failed status=0x%08lx cipher=0x%04X key_len=%lu",
+                st, sess->cipher_suite, sess->traffic_key_len);
+            return st;
+        }
+        SN_LOG("tls13_handshake: traffic_keys_ready phase=handshake cipher=0x%04X key_len=%lu",
+            sess->cipher_suite, sess->traffic_key_len);
+
+        UINT8* hs_record = static_cast<UINT8*>(
+            ExAllocatePool2(POOL_FLAG_NON_PAGED, TLS_RECORD_MAX, WSK_POOL_TAG));
+        if (!hs_record)
+        {
+            SN_LOG("tls13_handshake: hs_record_alloc_failed size=%lu", TLS_RECORD_MAX);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        tls13_handshake_reader_t hs_reader = {};
+        hs_reader.record_buf = hs_record;
+        hs_reader.record_buf_len = TLS_RECORD_MAX;
+        hs_reader.encrypted = TRUE;
+
+        auto release_hs_reader = [&]() {
+            if (hs_reader.record_buf)
+            {
+                ExFreePoolWithTag(hs_reader.record_buf, WSK_POOL_TAG);
+                hs_reader.record_buf = nullptr;
+            }
+        };
+
+        UINT8* ee_msg = sess->scratch_resp;
+        RtlZeroMemory(ee_msg, sizeof(sess->scratch_resp));
+        ULONG ee_len = 0;
+        st = tls13_recv_handshake_message(sock, sess, &hs_reader,
+            TLS_HANDSHAKE_ENCRYPTED_EXTENSIONS,
+            ee_msg,
+            sizeof(sess->scratch_resp),
+            &ee_len);
+        if (!NT_SUCCESS(st))
+        {
+            SN_LOG("tls13_handshake: encrypted_extensions_recv_failed status=0x%08lx ccs_skipped=%lu records=%lu",
+                st, hs_reader.skipped_ccs, hs_reader.records_read);
+            release_hs_reader();
+            return st;
+        }
 
         UINT8* cert_msg = sess->scratch_cert_msg;
         RtlZeroMemory(cert_msg, sizeof(sess->scratch_cert_msg));
         ULONG cert_len = 0;
-        st = tls13_recv_record(sock, &type, cert_msg, sizeof(sess->scratch_cert_msg), &cert_len, sess, TRUE);
-        if (!NT_SUCCESS(st)) return st;
-        if (type != 0x16 || cert_len < 6 || cert_msg[0] != 0x0B) return STATUS_DATA_ERROR;
+        st = tls13_recv_handshake_message(sock, sess, &hs_reader,
+            TLS_HANDSHAKE_CERTIFICATE,
+            cert_msg,
+            sizeof(sess->scratch_cert_msg),
+            &cert_len);
+        if (!NT_SUCCESS(st))
+        {
+            SN_LOG("tls13_handshake: cert_recv_failed status=0x%08lx ccs_skipped=%lu records=%lu",
+                st, hs_reader.skipped_ccs, hs_reader.records_read);
+            release_hs_reader();
+            return st;
+        }
 
         ULONG cp = 4;
         cp += 1;
-        if (cp + 3 > cert_len) return STATUS_DATA_ERROR;
+        if (cp + 3 > cert_len)
+        {
+            SN_LOG("tls13_handshake: cert_context_overrun cp=%lu len=%lu", cp, cert_len);
+            release_hs_reader();
+            return STATUS_DATA_ERROR;
+        }
         cp += 3;
-        if (cp + 3 > cert_len) return STATUS_DATA_ERROR;
+        if (cp + 3 > cert_len)
+        {
+            SN_LOG("tls13_handshake: cert_leaf_len_missing cp=%lu len=%lu", cp, cert_len);
+            release_hs_reader();
+            return STATUS_DATA_ERROR;
+        }
         ULONG c1_len = (static_cast<ULONG>(cert_msg[cp]) << 16)
                      | (static_cast<ULONG>(cert_msg[cp + 1]) << 8)
                      |  static_cast<ULONG>(cert_msg[cp + 2]);
         cp += 3;
-        if (cp + c1_len > cert_len) return STATUS_DATA_ERROR;
+        if (cp + c1_len > cert_len)
+        {
+            SN_LOG("tls13_handshake: cert_leaf_overrun cp=%lu leaf=%lu len=%lu", cp, c1_len, cert_len);
+            release_hs_reader();
+            return STATUS_DATA_ERROR;
+        }
 
         const UINT8* cert_bytes = cert_msg + cp;
-        ULONG search_off = 0;
-        BOOLEAN spki_offset_found = FALSE;
-        while (search_off + 32 < c1_len)
+        const UINT8* spki_der = nullptr;
+        ULONG spki_der_len = 0;
+        BOOLEAN spki_der_found = extract_leaf_spki_der(cert_bytes, c1_len, &spki_der, &spki_der_len);
+        if (!spki_der_found || !spki_der || spki_der_len == 0)
         {
-            if (cert_bytes[search_off] == 0x30 && cert_bytes[search_off + 1] == 0x82)
-            {
-                if (search_off > 0 &&
-                    cert_bytes[search_off - 1] == 0x05 &&
-                    cert_bytes[search_off - 2] == 0x00 &&
-                    cert_bytes[search_off - 3] == 0x01 &&
-                    cert_bytes[search_off - 4] == 0x01)
-                {
-                    spki_offset_found = TRUE;
-                    break;
-                }
-            }
-            ++search_off;
+            SN_LOG("tls13_handshake: spki_der_extract_failed cert_len=%lu leaf_len=%lu",
+                cert_len, c1_len);
+            release_hs_reader();
+            return STATUS_DATA_ERROR;
         }
 
         UINT8 spki_hash[32] = {};
-        kernel_crypto::sha256(cert_bytes, c1_len, spki_hash);
+        st = kernel_crypto::sha256(spki_der, spki_der_len, spki_hash);
+        if (!NT_SUCCESS(st))
+        {
+            SN_LOG("tls13_handshake: spki_hash_failed status=0x%08lx spki_der_len=%lu",
+                st, spki_der_len);
+            release_hs_reader();
+            return st;
+        }
         RtlCopyMemory(sess->spki_observed_sha256, spki_hash, 32);
 
-        SN_LOG("tls13_handshake: cert_len=%lu cp=%lu c1_len=%lu spki_off_found=%u search_off=%lu",
-            cert_len, cp, c1_len, (UINT32)spki_offset_found, search_off);
+        SN_LOG("tls13_handshake: cert_len=%lu cp=%lu c1_len=%lu spki_der_found=%u spki_der_off=%lu spki_der_len=%lu",
+            cert_len, cp, c1_len, (UINT32)spki_der_found,
+            (ULONG)(spki_der - cert_bytes), spki_der_len);
         SN_LOG("tls13_handshake: cert_first16=%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X",
             cert_bytes[0], cert_bytes[1], cert_bytes[2], cert_bytes[3],
             cert_bytes[4], cert_bytes[5], cert_bytes[6], cert_bytes[7],
@@ -914,10 +1698,10 @@ namespace wsk_transport
                 g_sentinel_spki_pins[slot][4], g_sentinel_spki_pins[slot][5],
                 g_sentinel_spki_pins[slot][6], g_sentinel_spki_pins[slot][7]);
         }
-        SN_LOG("tls13::spki_pin: presented=%02X%02X%02X%02X%02X%02X%02X%02X.. cert_chain_leaf_size=%lu cert_msg_total=%lu",
+        SN_LOG("tls13::spki_pin: presented=%02X%02X%02X%02X%02X%02X%02X%02X.. spki_der_len=%lu cert_chain_leaf_size=%lu cert_msg_total=%lu",
             spki_hash[0], spki_hash[1], spki_hash[2], spki_hash[3],
             spki_hash[4], spki_hash[5], spki_hash[6], spki_hash[7],
-            c1_len, cert_len);
+            spki_der_len, c1_len, cert_len);
 
         LONG matched_slot = spki_pin_match_slot(spki_hash);
         if (matched_slot == SPKI_PIN_SLOT_NONE)
@@ -926,6 +1710,7 @@ namespace wsk_transport
                 spki_hash[0], spki_hash[1], spki_hash[2], spki_hash[3],
                 spki_hash[4], spki_hash[5], spki_hash[6], spki_hash[7]);
             sess->spki_matched = FALSE;
+            release_hs_reader();
             return STATUS_INVALID_SIGNATURE;
         }
         if (matched_slot == SPKI_PIN_SLOT_DEBUG_BYPASS)
@@ -946,41 +1731,115 @@ namespace wsk_transport
         UINT8* cv_msg = sess->scratch_cv_msg;
         RtlZeroMemory(cv_msg, sizeof(sess->scratch_cv_msg));
         ULONG cv_len = 0;
-        st = tls13_recv_record(sock, &type, cv_msg, sizeof(sess->scratch_cv_msg), &cv_len, sess, TRUE);
-        if (!NT_SUCCESS(st)) return st;
+        st = tls13_recv_handshake_message(sock, sess, &hs_reader,
+            TLS_HANDSHAKE_CERTIFICATE_VERIFY,
+            cv_msg,
+            sizeof(sess->scratch_cv_msg),
+            &cv_len);
+        if (!NT_SUCCESS(st))
+        {
+            SN_LOG("tls13_handshake: cert_verify_recv_failed status=0x%08lx records=%lu",
+                st, hs_reader.records_read);
+            release_hs_reader();
+            return st;
+        }
 
         UINT8* fin_msg = sess->scratch_fin_msg;
         RtlZeroMemory(fin_msg, sizeof(sess->scratch_fin_msg));
         ULONG fin_len = 0;
-        st = tls13_recv_record(sock, &type, fin_msg, sizeof(sess->scratch_fin_msg), &fin_len, sess, TRUE);
-        if (!NT_SUCCESS(st)) return st;
+        st = tls13_recv_handshake_message(sock, sess, &hs_reader,
+            TLS_HANDSHAKE_FINISHED,
+            fin_msg,
+            sizeof(sess->scratch_fin_msg),
+            &fin_len);
+        if (!NT_SUCCESS(st))
+        {
+            SN_LOG("tls13_handshake: server_finished_recv_failed status=0x%08lx records=%lu",
+                st, hs_reader.records_read);
+            release_hs_reader();
+            return st;
+        }
+        release_hs_reader();
+
+        UINT8 handshake_hash[32] = {};
+        {
+            kernel_crypto::sha256_ctx_t hctx;
+            kernel_crypto::sha256_init(&hctx);
+            kernel_crypto::sha256_update(&hctx, ch, ch_len);
+            kernel_crypto::sha256_update(&hctx, sh, sh_len);
+            kernel_crypto::sha256_update(&hctx, ee_msg, ee_len);
+            kernel_crypto::sha256_update(&hctx, cert_msg, cert_len);
+            kernel_crypto::sha256_update(&hctx, cv_msg, cv_len);
+            kernel_crypto::sha256_update(&hctx, fin_msg, fin_len);
+            kernel_crypto::sha256_final(&hctx, handshake_hash);
+        }
 
         UINT8 client_finished_payload[36] = {};
-        client_finished_payload[0] = 0x14;
+        client_finished_payload[0] = TLS_HANDSHAKE_FINISHED;
         client_finished_payload[1] = 0; client_finished_payload[2] = 0; client_finished_payload[3] = 32;
         UINT8 finished_key[32] = {};
-        hkdf_expand_label(sess->client_traffic_key, 32, "finished", nullptr, 0,
+        st = hkdf_expand_label(sess->client_hs_traffic_secret, 32, "finished", nullptr, 0,
             finished_key, 32);
-        UINT8 fin_hash[32] = {};
-        kernel_crypto::sha256(transcript, tlen, fin_hash);
-        kernel_crypto::hmac_sha256(finished_key, 32, fin_hash, 32, client_finished_payload + 4);
-        st = tls13_send_record(sock, 0x16, client_finished_payload, 36, sess, TRUE);
-        if (!NT_SUCCESS(st)) return st;
+        if (!NT_SUCCESS(st))
+        {
+            SN_LOG("tls13_handshake: client_finished_key_failed status=0x%08lx", st);
+            return st;
+        }
+        st = kernel_crypto::hmac_sha256(finished_key, 32, handshake_hash, 32, client_finished_payload + 4);
+        RtlSecureZeroMemory(finished_key, sizeof(finished_key));
+        if (!NT_SUCCESS(st))
+        {
+            SN_LOG("tls13_handshake: client_finished_hmac_failed status=0x%08lx", st);
+            return st;
+        }
+        st = tls13_send_record(sock, TLS_CONTENT_HANDSHAKE, client_finished_payload, 36, sess, TRUE);
+        RtlSecureZeroMemory(client_finished_payload, sizeof(client_finished_payload));
+        if (!NT_SUCCESS(st))
+        {
+            SN_LOG("tls13_handshake: client_finished_send_failed status=0x%08lx", st);
+            return st;
+        }
 
-        hkdf_expand_label(sess->handshake_secret, 32, "derived", nullptr, 0, derived, 32);
-        kernel_crypto::hmac_sha256(derived, 32, zero, 32, sess->master_secret);
-        UINT8 mk_hash[32] = {};
-        kernel_crypto::sha256(transcript, tlen, mk_hash);
-        hkdf_expand_label(sess->master_secret, 32, "c ap traffic", mk_hash, 32,
-            sess->client_traffic_key, 32);
-        hkdf_expand_label(sess->master_secret, 32, "s ap traffic", mk_hash, 32,
-            sess->server_traffic_key, 32);
-        hkdf_expand_label(sess->client_traffic_key, 32, "iv", nullptr, 0,
-            sess->client_traffic_iv, 12);
-        hkdf_expand_label(sess->server_traffic_key, 32, "iv", nullptr, 0,
-            sess->server_traffic_iv, 12);
+        st = hkdf_expand_label(sess->handshake_secret, 32, "derived", empty_hash, 32, derived, 32);
+        if (!NT_SUCCESS(st))
+        {
+            SN_LOG("tls13_handshake: hs_derived_failed status=0x%08lx", st);
+            return st;
+        }
+        st = kernel_crypto::hmac_sha256(derived, 32, empty_hkdf_input, 0, sess->master_secret);
+        if (!NT_SUCCESS(st))
+        {
+            SN_LOG("tls13_handshake: master_secret_failed status=0x%08lx", st);
+            return st;
+        }
+        st = hkdf_expand_label(sess->master_secret, 32, "c ap traffic", handshake_hash, 32,
+            sess->client_app_traffic_secret, 32);
+        if (!NT_SUCCESS(st))
+        {
+            SN_LOG("tls13_handshake: client_app_secret_failed status=0x%08lx", st);
+            return st;
+        }
+        st = hkdf_expand_label(sess->master_secret, 32, "s ap traffic", handshake_hash, 32,
+            sess->server_app_traffic_secret, 32);
+        if (!NT_SUCCESS(st))
+        {
+            SN_LOG("tls13_handshake: server_app_secret_failed status=0x%08lx", st);
+            return st;
+        }
+        st = tls13_apply_traffic_secrets(sess,
+            sess->client_app_traffic_secret,
+            sess->server_app_traffic_secret,
+            sess->traffic_key_len);
+        if (!NT_SUCCESS(st))
+        {
+            SN_LOG("tls13_handshake: apply_app_keys_failed status=0x%08lx cipher=0x%04X key_len=%lu",
+                st, sess->cipher_suite, sess->traffic_key_len);
+            return st;
+        }
         sess->client_seq = 0;
         sess->server_seq = 0;
+        SN_LOG("tls13_handshake: traffic_keys_ready phase=application cipher=0x%04X key_len=%lu",
+            sess->cipher_suite, sess->traffic_key_len);
 
         return STATUS_SUCCESS;
     }
@@ -1140,6 +1999,7 @@ namespace wsk_transport
                 _InterlockedIncrement(&g_missed_heartbeats);
                 goto check_miss;
             }
+            RtlZeroMemory(sess, sizeof(*sess));
             SN_LOG("heartbeat_work_thread: session allocated %p size=%lu", sess, (ULONG)sizeof(tls13_session_t));
 
             st = tls13_handshake(sock, sess);
@@ -1147,7 +2007,7 @@ namespace wsk_transport
                 st, (UINT32)sess->spki_matched);
             if (!NT_SUCCESS(st) || !sess->spki_matched)
             {
-                if (!sess->spki_matched)
+                if (st == STATUS_INVALID_SIGNATURE || (NT_SUCCESS(st) && !sess->spki_matched))
                 {
                     SN_LOG("heartbeat_work_thread: MISS reason=spki_pin_mismatch status=0x%08lx", st);
                 }
@@ -1181,7 +2041,7 @@ namespace wsk_transport
 
             if (payload_len > 0)
             {
-                st = tls13_send_record(sock, 0x17, sess->scratch_payload, payload_len, sess, TRUE);
+                st = tls13_send_record(sock, TLS_CONTENT_APPLICATION_DATA, sess->scratch_payload, payload_len, sess, TRUE);
                 SN_LOG("heartbeat_work_thread: tls13_send_record returned 0x%08lx", st);
                 if (NT_SUCCESS(st))
                 {
@@ -1226,7 +2086,7 @@ namespace wsk_transport
                 missed, (ULONG)MAX_MISSED_HEARTBEATS);
             if (missed >= static_cast<LONG>(MAX_MISSED_HEARTBEATS))
             {
-                SN_LOG("heartbeat_work_thread: missed=%ld >= threshold=%lu - SUPPRESSING bugcheck (was 0xDEAD5E20), clamping counter to 0 and continuing. Investigate SPKI / TLS / network failure logged above.",
+                SN_LOG("heartbeat_work_thread: missed=%ld >= threshold=%lu - cloud heartbeat unavailable, resetting_missed_without_bugcheck",
                     missed, (ULONG)MAX_MISSED_HEARTBEATS);
                 _InterlockedExchange(&g_missed_heartbeats, 0);
             }

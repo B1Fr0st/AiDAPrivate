@@ -29,7 +29,7 @@ static void VDbgLog(const char* func, const char* fmt, ...) {
     fflush(stdout);
     OutputDebugStringA(buf);
     OutputDebugStringA("\n");
-    if (g_LogFile) { fprintf(g_LogFile, "%s\n", buf); fflush(g_LogFile); }
+    if (g_LogFile) { fprintf(g_LogFile, "%s\n", buf); FlushMapperLogFile(); }
 }
 #define VLOG(fmt, ...) VDbgLog(__FUNCTION__, fmt, ##__VA_ARGS__)
 #define VLOG_STATUS(msg, st) VDbgLog(__FUNCTION__, "%s: 0x%08X (%s)", msg, (DWORD)(st), NT_SUCCESS(st) ? "SUCCESS" : "FAILED")
@@ -1630,4 +1630,3 @@ namespace SignedMemory {
         return TRUE;
     }
 }
-

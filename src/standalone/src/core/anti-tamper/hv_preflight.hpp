@@ -830,6 +830,8 @@ inline bool hv_interface_signature_is_hv1()
 }
 
 inline bool g_ms_hv_approved = false;
+inline bool g_hvci_enabled = false;
+inline bool g_vbs_enabled = false;
 
 inline report_t run()
 {
@@ -856,6 +858,7 @@ inline report_t run()
     bool ci_ok = detail::query_code_integrity(ci_options);
     r.hvci_enabled = ci_ok && (ci_options & detail::kCodeIntegrityHvciKmciEnabled) != 0;
     r.test_signing = ci_ok && (ci_options & detail::kCodeIntegrityTestSign) != 0;
+    g_hvci_enabled = r.hvci_enabled;
     diag::log_tagged_fmt("hv_pf", "query_code_integrity_done ok=%d opts=0x%lX", ci_ok ? 1 : 0, static_cast<unsigned long>(ci_options));
 
     diag::log_tagged("hv_pf", "query_isolated_user_mode_start");
@@ -864,8 +867,12 @@ inline report_t run()
     {
         r.vbs_enabled = ium.SecureKernelRunning != 0;
         if (ium.HvciEnabled) r.hvci_enabled = true;
+        g_vbs_enabled = r.vbs_enabled;
+        g_hvci_enabled = r.hvci_enabled;
     }
-    diag::log_tagged("hv_pf", "query_isolated_user_mode_done");
+    diag::log_tagged_fmt("hv_pf", "query_isolated_user_mode_done vbs=%d hvci=%d",
+        r.vbs_enabled ? 1 : 0,
+        r.hvci_enabled ? 1 : 0);
 
     diag::log_tagged("hv_pf", "read_cpuid_hv_bit_start");
     r.hv_bit_set = detail::read_cpuid_hv_bit();

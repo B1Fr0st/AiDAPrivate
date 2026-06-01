@@ -105,7 +105,6 @@ namespace functions {
                              (LONG)expected_hash);
         _InterlockedExchange64(&dispatcher::g_server_token_time,
                                current_time.QuadPart);
-        _InterlockedExchange(&dispatcher::g_driver_activated, 1);
         _InterlockedExchange64(&dispatcher::g_last_heartbeat_time,
                                current_time.QuadPart);
 
@@ -147,12 +146,19 @@ namespace functions {
         }
 
         proof ^= dynamic_key::get();
+        dispatcher::activate_server_seed_state(request->server_nonce, request->token_hash, request->session_key);
+        _InterlockedExchange(&dispatcher::g_driver_activated, 1);
 
         request->driver_proof = proof;
         request->result = 1;
 
-        WW_LOG("SRVT2: proof=0x%llx token=0x%lx nonce=0x%llx action=%u",
-               proof, request->token_hash, request->server_nonce, request->action);
+        WW_LOG("SRVT2: proof_set=%u token_present=%u nonce_present=%u action=%u server_seed_set=%u ioctl_seed_set=%u",
+               proof != 0 ? 1u : 0u,
+               request->token_hash != 0 ? 1u : 0u,
+               request->server_nonce != 0 ? 1u : 0u,
+               request->action,
+               dynamic_key::g_server_seed != 0 ? 1u : 0u,
+               ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u);
 
         return STATUS_SUCCESS;
     }

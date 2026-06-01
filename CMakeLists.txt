@@ -159,7 +159,7 @@ if(WIN32)
     endif()
     execute_process(
         COMMAND "${AIDA_POWERSHELL_EXECUTABLE}" -NoLogo -NoProfile -NonInteractive -Command
-            "$hex='${AIDA_BUILD_SEED}'; $bytes=for ($i=0; $i -lt $hex.Length; $i+=2) { [Convert]::ToByte($hex.Substring($i,2),16) }; [System.IO.File]::WriteAllBytes('${AIDA_BUILD_SEED_BIN}', [byte[]]$bytes); $acl=Get-Acl '${AIDA_BUILD_SEED_BIN}'; $acl.SetAccessRuleProtection($true, $false); $rule=New-Object System.Security.AccessControl.FileSystemAccessRule([System.Security.Principal.WindowsIdentity]::GetCurrent().User, 'FullControl', 'Allow'); $acl.AddAccessRule($rule); Set-Acl '${AIDA_BUILD_SEED_BIN}' $acl"
+            "$hex='${AIDA_BUILD_SEED}'; $bytes=for ($i=0; $i -lt $hex.Length; $i+=2) { [Convert]::ToByte($hex.Substring($i,2),16) }; [System.IO.File]::WriteAllBytes('${AIDA_BUILD_SEED_BIN}', [byte[]]$bytes); $acl=New-Object System.Security.AccessControl.FileSecurity; $acl.SetAccessRuleProtection($true, $false); $rule=New-Object System.Security.AccessControl.FileSystemAccessRule([System.Security.Principal.WindowsIdentity]::GetCurrent().User, 'FullControl', 'Allow'); $acl.SetAccessRule($rule); [System.IO.File]::SetAccessControl('${AIDA_BUILD_SEED_BIN}', $acl)"
         RESULT_VARIABLE _aida_seed_bin_rc
         OUTPUT_QUIET
         ERROR_QUIET
@@ -287,12 +287,21 @@ if(WIN32 AND MSVC)
     endif()
     set(_aida_openssl_lib_release "${_aida_openssl_root}/lib/VC/x64/MD")
     set(_aida_openssl_lib_debug   "${_aida_openssl_root}/lib/VC/x64/MDd")
+    set(_aida_openssl_lib_release_mt "${_aida_openssl_root}/lib/VC/x64/MT")
+    set(_aida_openssl_lib_debug_mt   "${_aida_openssl_root}/lib/VC/x64/MTd")
     if(NOT EXISTS "${_aida_openssl_lib_release}/libssl_static.lib"
        OR NOT EXISTS "${_aida_openssl_lib_release}/libcrypto_static.lib")
         message(FATAL_ERROR
             "OpenSSL static libraries not present at ${_aida_openssl_lib_release}. "
             "Reinstall OpenSSL with the static-libs option enabled so AiDAStandalone "
             "can link without runtime DLL dependencies (libssl-3-x64.dll / libcrypto-3-x64.dll).")
+    endif()
+    if(NOT EXISTS "${_aida_openssl_lib_release_mt}/libssl_static.lib"
+       OR NOT EXISTS "${_aida_openssl_lib_release_mt}/libcrypto_static.lib")
+        message(FATAL_ERROR
+            "OpenSSL /MT static libraries not present at ${_aida_openssl_lib_release_mt}. "
+            "Reinstall OpenSSL with the static-libs option enabled so AiDAStandalone "
+            "can be shipped as a single executable.")
     endif()
 
     add_library(aida_openssl_crypto STATIC IMPORTED GLOBAL)
@@ -315,6 +324,28 @@ if(WIN32 AND MSVC)
         IMPORTED_LOCATION_DEBUG          "${_aida_openssl_lib_debug}/libssl_static.lib"
         INTERFACE_INCLUDE_DIRECTORIES    "${_aida_openssl_root}/include"
         INTERFACE_LINK_LIBRARIES         "aida_openssl_crypto"
+    )
+
+    add_library(aida_openssl_crypto_mt STATIC IMPORTED GLOBAL)
+    set_target_properties(aida_openssl_crypto_mt PROPERTIES
+        IMPORTED_LOCATION                "${_aida_openssl_lib_release_mt}/libcrypto_static.lib"
+        IMPORTED_LOCATION_RELEASE        "${_aida_openssl_lib_release_mt}/libcrypto_static.lib"
+        IMPORTED_LOCATION_RELWITHDEBINFO "${_aida_openssl_lib_release_mt}/libcrypto_static.lib"
+        IMPORTED_LOCATION_MINSIZEREL     "${_aida_openssl_lib_release_mt}/libcrypto_static.lib"
+        IMPORTED_LOCATION_DEBUG          "${_aida_openssl_lib_debug_mt}/libcrypto_static.lib"
+        INTERFACE_INCLUDE_DIRECTORIES    "${_aida_openssl_root}/include"
+        INTERFACE_LINK_LIBRARIES         "ws2_32;crypt32;advapi32;user32;gdi32"
+    )
+
+    add_library(aida_openssl_ssl_mt STATIC IMPORTED GLOBAL)
+    set_target_properties(aida_openssl_ssl_mt PROPERTIES
+        IMPORTED_LOCATION                "${_aida_openssl_lib_release_mt}/libssl_static.lib"
+        IMPORTED_LOCATION_RELEASE        "${_aida_openssl_lib_release_mt}/libssl_static.lib"
+        IMPORTED_LOCATION_RELWITHDEBINFO "${_aida_openssl_lib_release_mt}/libssl_static.lib"
+        IMPORTED_LOCATION_MINSIZEREL     "${_aida_openssl_lib_release_mt}/libssl_static.lib"
+        IMPORTED_LOCATION_DEBUG          "${_aida_openssl_lib_debug_mt}/libssl_static.lib"
+        INTERFACE_INCLUDE_DIRECTORIES    "${_aida_openssl_root}/include"
+        INTERFACE_LINK_LIBRARIES         "aida_openssl_crypto_mt"
     )
 
     set(OPENSSL_FOUND TRUE CACHE BOOL "" FORCE)
@@ -415,28 +446,6 @@ function(aida_collect_windows_runtime_dlls out_var)
             message(FATAL_ERROR "AiDA: Windows UCRT x64 redistributable DLLs not found. Install a Windows 10/11 SDK with Redist/ucrt/DLLs/x64.")
         endif()
 
-        set(_aida_d3dcompiler_candidates)
-        if(DEFINED ENV{WindowsSdkDir} AND NOT "$ENV{WindowsSdkDir}" STREQUAL "")
-            file(TO_CMAKE_PATH "$ENV{WindowsSdkDir}" _aida_windows_sdk_dir)
-            list(APPEND _aida_d3dcompiler_candidates "${_aida_windows_sdk_dir}/Redist/D3D/x64/d3dcompiler_47.dll")
-        endif()
-        list(APPEND _aida_d3dcompiler_candidates
-            "C:/Program Files (x86)/Windows Kits/10/Redist/D3D/x64/d3dcompiler_47.dll"
-            "C:/Program Files/Windows Kits/10/Redist/D3D/x64/d3dcompiler_47.dll"
-            "$ENV{SystemRoot}/System32/D3DCompiler_47.dll"
-        )
-        set(_aida_d3dcompiler_dll "")
-        foreach(_aida_d3dcompiler_candidate IN LISTS _aida_d3dcompiler_candidates)
-            if(EXISTS "${_aida_d3dcompiler_candidate}")
-                set(_aida_d3dcompiler_dll "${_aida_d3dcompiler_candidate}")
-                break()
-            endif()
-        endforeach()
-        if(_aida_d3dcompiler_dll)
-            list(APPEND _aida_result "${_aida_d3dcompiler_dll}")
-        else()
-            message(FATAL_ERROR "AiDA: d3dcompiler_47.dll redistributable not found. Install the Windows 10/11 SDK D3D redist.")
-        endif()
     endif()
 
     list(REMOVE_DUPLICATES _aida_result)
@@ -458,6 +467,40 @@ function(aida_dedupe_runtime_dlls_by_filename out_var)
         endif()
     endforeach()
     set(${out_var} "${_aida_result}" PARENT_SCOPE)
+endfunction()
+
+function(aida_strip_msvc_runtime_compile_options target_name)
+    if(NOT MSVC OR NOT TARGET ${target_name})
+        return()
+    endif()
+    foreach(_aida_runtime_prop IN ITEMS COMPILE_OPTIONS INTERFACE_COMPILE_OPTIONS)
+        get_target_property(_aida_runtime_opts ${target_name} ${_aida_runtime_prop})
+        if(NOT _aida_runtime_opts)
+            continue()
+        endif()
+        set(_aida_runtime_filtered)
+        foreach(_aida_runtime_opt IN LISTS _aida_runtime_opts)
+            if(_aida_runtime_opt MATCHES "^/M[DT]d?$" OR
+               _aida_runtime_opt MATCHES "^\\$<.*:/M[DT]d?>$")
+                continue()
+            endif()
+            list(APPEND _aida_runtime_filtered "${_aida_runtime_opt}")
+        endforeach()
+        set_target_properties(${target_name} PROPERTIES ${_aida_runtime_prop} "${_aida_runtime_filtered}")
+    endforeach()
+endfunction()
+
+function(aida_use_static_msvc_runtime)
+    if(NOT MSVC)
+        return()
+    endif()
+    foreach(_aida_runtime_target IN LISTS ARGN)
+        if(TARGET ${_aida_runtime_target})
+            aida_strip_msvc_runtime_compile_options(${_aida_runtime_target})
+            set_property(TARGET ${_aida_runtime_target} PROPERTY
+                MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        endif()
+    endforeach()
 endfunction()
 
 set(ZYDIS_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
@@ -785,7 +828,8 @@ if(MSVC)
     if(CMAKE_GENERATOR MATCHES "Ninja")
         set_property(TARGET ghidra_sleigh_compiler PROPERTY JOB_POOL_COMPILE aida_serial_compile)
     endif()
-    target_compile_options(ghidra_sleigh_compiler PRIVATE /W0 /EHsc /MD /O2)
+    target_compile_options(ghidra_sleigh_compiler PRIVATE /W0 /EHsc /O2)
+    aida_use_static_msvc_runtime(ghidra_sleigh_compiler)
 endif()
 target_link_libraries(ghidra_sleigh_compiler PRIVATE zlibstatic)
 
@@ -1008,9 +1052,10 @@ if(WIN32)
             $<$<COMPILE_LANGUAGE:CXX>:/Zc:__cplusplus>
             $<$<COMPILE_LANGUAGE:CXX>:/permissive->
             $<$<COMPILE_LANGUAGE:CXX>:/Zp8>
-            $<$<COMPILE_LANGUAGE:CXX>:/MD>
             $<$<COMPILE_LANGUAGE:CXX>:/wd4201>
         )
+
+        aida_use_static_msvc_runtime(DriverTest)
 
         target_link_libraries(DriverTest PRIVATE
             Zydis
@@ -1197,6 +1242,7 @@ if(WIN32)
             "${STANDALONE_ROOT}/main.cpp"
             "${STANDALONE_ROOT}/helpers/helpers.cpp"
             "${STANDALONE_ROOT}/helpers/blur.cpp"
+            "${STANDALONE_ROOT}/helpers/imgui_dx11_d3dcompile_stub.cpp"
             "${STANDALONE_ROOT}/helpers/icon_loodr.cpp"
             "${STANDALONE_ROOT}/helpers/file_browser.cpp"
             "${STANDALONE_ROOT}/helpers/embedded_assets.cpp"
@@ -1420,7 +1466,6 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/testlab/test_all_disasm.cpp"
             "${STANDALONE_ROOT}/core/testlab/test_all_mcp.cpp"
             "${DEPS_DIR}/sqlite-amalgamation-3530000/sqlite3.c"
-            "${CMAKE_CURRENT_SOURCE_DIR}/src/shared/hardware_id/hardware_id.cpp"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/shared/hardware_id/hardware_id_v2.cpp"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/shared/telemetry/telemetry_client.cpp"
         )
@@ -1552,6 +1597,34 @@ if(WIN32)
             RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_BINARY_DIR}/RelWithDebInfo"
         )
 
+        add_executable(AIDADialogBroker
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/dialog_broker.cpp"
+        )
+        target_compile_definitions(AIDADialogBroker PRIVATE
+            _CRT_SECURE_NO_WARNINGS
+            NOMINMAX
+            WIN32_LEAN_AND_MEAN
+            UNICODE
+            _UNICODE
+        )
+        target_compile_options(AIDADialogBroker PRIVATE
+            /W3
+            /EHsc
+            /Zc:__cplusplus
+            /permissive-
+        )
+        target_link_libraries(AIDADialogBroker PRIVATE ole32 shell32 uuid)
+        set_target_properties(AIDADialogBroker PROPERTIES
+            CXX_STANDARD 17
+            CXX_STANDARD_REQUIRED YES
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+            OUTPUT_NAME "AIDADialogBroker"
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
+            RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_BINARY_DIR}/Debug"
+            RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/Release"
+            RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_BINARY_DIR}/RelWithDebInfo"
+        )
+
         add_executable(AiDAStandalone WIN32
             ${STANDALONE_SOURCES}
             ${IMGUI_SOURCES}
@@ -1621,7 +1694,6 @@ if(WIN32)
             TRITON_Z3_INTERFACE
             GHIDRA_SPECS_DIR=${GHIDRA_SPECS_OUTPUT_DIR}
             AIDA_DEEP_STEAL=1
-            AIDA_TEST_VMWARE_BYPASS=1
             AIDA_STANDALONE
         )
 
@@ -1633,8 +1705,29 @@ if(WIN32)
             /Zc:__cplusplus
             /permissive-
             /Zp8
-            /MD
             /bigobj
+        )
+
+        aida_use_static_msvc_runtime(
+            AiDAStandalone
+            AiDAStandalone_asm
+            Zydis
+            Zycore
+            unicorn
+            unicorn-common
+            x86_64-softmmu
+            triton
+            capstone
+            capstone_static
+            libdecomp_aida
+            zlibstatic
+            zlib
+            brotlidec
+            brotlienc
+            brotlicommon
+            llhttp_static
+            nghttp2_static
+            lua54_static
         )
 
         target_precompile_headers(AiDAStandalone PRIVATE
@@ -1695,10 +1788,9 @@ if(WIN32)
             llhttp_static
             nghttp2_static
             lua54_static
-            aida_openssl_ssl
-            aida_openssl_crypto
+            aida_openssl_ssl_mt
+            aida_openssl_crypto_mt
             d3d11
-            d3dcompiler
             dxgi
             dwmapi
             ws2_32
@@ -1719,7 +1811,7 @@ if(WIN32)
         target_link_options(AiDAStandalone PRIVATE
             $<IF:$<BOOL:${AIDA_FAST_LINK}>,/DEBUG,/DEBUG:FULL>
             /ENTRY:mainCRTStartup
-            /NODEFAULTLIB:LIBCMT
+            /NODEFAULTLIB:d3dcompiler
             /IGNORE:4099
             "/MANIFESTUAC:level='requireAdministrator' uiAccess='false'"
             /DELAYLOAD:libz3.dll
@@ -1748,20 +1840,23 @@ if(WIN32)
             COMPILE_PDB_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_BINARY_DIR}/RelWithDebInfo"
         )
 
-        aida_collect_windows_runtime_dlls(_aida_standalone_runtime_candidates)
-        foreach(_aida_z3_runtime_name IN LISTS AIDA_Z3_RUNTIME_DLL_NAMES)
-            list(APPEND _aida_standalone_runtime_candidates "${Z3_INSTALL_DIR}/bin/${_aida_z3_runtime_name}")
-        endforeach()
-        aida_dedupe_runtime_dlls_by_filename(AIDA_STANDALONE_APPLOCAL_RUNTIME_DLLS ${_aida_standalone_runtime_candidates})
-        if(AIDA_STANDALONE_APPLOCAL_RUNTIME_DLLS)
-            add_custom_command(TARGET AiDAStandalone POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    ${AIDA_STANDALONE_APPLOCAL_RUNTIME_DLLS}
-                    "$<TARGET_FILE_DIR:AiDAStandalone>"
-                COMMAND_EXPAND_LISTS
-                COMMENT "Staging app-local runtime DLLs beside AiDAStandalone.exe..."
-                VERBATIM
-            )
+        option(AIDA_STANDALONE_STAGE_APPLOCAL_RUNTIME_DLLS "Stage app-local runtime DLLs beside AiDAStandalone.exe" OFF)
+        if(AIDA_STANDALONE_STAGE_APPLOCAL_RUNTIME_DLLS)
+            aida_collect_windows_runtime_dlls(_aida_standalone_runtime_candidates)
+            foreach(_aida_z3_runtime_name IN LISTS AIDA_Z3_RUNTIME_DLL_NAMES)
+                list(APPEND _aida_standalone_runtime_candidates "${Z3_INSTALL_DIR}/bin/${_aida_z3_runtime_name}")
+            endforeach()
+            aida_dedupe_runtime_dlls_by_filename(AIDA_STANDALONE_APPLOCAL_RUNTIME_DLLS ${_aida_standalone_runtime_candidates})
+            if(AIDA_STANDALONE_APPLOCAL_RUNTIME_DLLS)
+                add_custom_command(TARGET AiDAStandalone POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        ${AIDA_STANDALONE_APPLOCAL_RUNTIME_DLLS}
+                        "$<TARGET_FILE_DIR:AiDAStandalone>"
+                    COMMAND_EXPAND_LISTS
+                    COMMENT "Staging app-local runtime DLLs beside AiDAStandalone.exe..."
+                    VERBATIM
+                )
+            endif()
         endif()
 
         add_dependencies(AiDAStandalone AiDAGuestAgent)
@@ -1770,6 +1865,15 @@ if(WIN32)
                 "$<TARGET_FILE:AiDAGuestAgent>"
                 "$<TARGET_FILE_DIR:AiDAStandalone>/AiDAGuestAgent.exe"
             COMMENT "Staging AiDAGuestAgent beside AiDAStandalone.exe..."
+            VERBATIM
+        )
+
+        add_dependencies(AiDAStandalone AIDADialogBroker)
+        add_custom_command(TARGET AiDAStandalone POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:AIDADialogBroker>"
+                "$<TARGET_FILE_DIR:AiDAStandalone>/AIDADialogBroker.exe"
+            COMMENT "Staging AIDADialogBroker beside AiDAStandalone.exe..."
             VERBATIM
         )
 
@@ -1802,8 +1906,9 @@ if(WIN32)
             /EHsc
             /Zc:__cplusplus
             /permissive-
-            /MD
         )
+
+        aida_use_static_msvc_runtime(AiDAParserProof)
 
         target_link_libraries(AiDAParserProof PRIVATE
             llhttp_static
@@ -2216,7 +2321,6 @@ if(WIN32)
         $<$<COMPILE_LANGUAGE:CXX>:/permissive->
         $<$<COMPILE_LANGUAGE:CXX>:/Zp8>
         $<$<COMPILE_LANGUAGE:CXX>:/EHsc>
-        $<$<COMPILE_LANGUAGE:CXX>:/MD>
         $<$<COMPILE_LANGUAGE:CXX>:/GR->
         $<$<COMPILE_LANGUAGE:CXX>:/GF>
         $<$<COMPILE_LANGUAGE:CXX>:/Gy>
@@ -2232,6 +2336,8 @@ if(WIN32)
         $<$<COMPILE_LANGUAGE:CXX>:/wd5219>
         $<$<COMPILE_LANGUAGE:CXX>:/wd5240>
     )
+
+    aida_use_static_msvc_runtime(AiDA)
 
     target_precompile_headers(AiDA PRIVATE
         <Windows.h>
@@ -2288,8 +2394,8 @@ if(WIN32)
     endif()
 
     target_link_libraries(AiDA PRIVATE
-        aida_openssl_ssl
-        aida_openssl_crypto
+        aida_openssl_ssl_mt
+        aida_openssl_crypto_mt
         ws2_32
         crypt32
         Shlwapi
@@ -2641,7 +2747,7 @@ if(BUILD_PROTECTOR)
         add_custom_command(TARGET AiDAStandalone POST_BUILD
             COMMAND ${CMAKE_COMMAND}
                 "-DRETRY_LABEL=AiDAStandalone.exe-protect"
-                "-DRETRY_CMD=$<TARGET_FILE:AiDAProtector>;--input;$<TARGET_FILE:AiDAStandalone>;--output;$<TARGET_FILE:AiDAStandalone>;--all;--no-encrypt-imports;--bind-machine;--tamper-level;3;--jit;--no-llm-poison;--verbose"
+                "-DRETRY_CMD=$<TARGET_FILE:AiDAProtector>;--input;$<TARGET_FILE:AiDAStandalone>;--output;$<TARGET_FILE:AiDAStandalone>;--all;--no-encrypt-imports;--tamper-level;3;--jit;--no-llm-poison;--verbose"
                 -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
             COMMENT "Protecting AiDAStandalone.exe (with AV/indexer retry)..."
             VERBATIM

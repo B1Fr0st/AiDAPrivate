@@ -24,6 +24,10 @@ namespace guardian {
     inline volatile LONG g_lbr_baseline_available = 0;
     inline volatile LONG g_aperf_baseline_captured = 0;
     inline volatile UINT64 g_aperf_ratio_baseline = 0;
+    inline volatile UINT64 g_aperf_last_ratio = 0;
+    inline volatile UINT64 g_aperf_last_deviation = 0;
+    inline volatile UINT64 g_aperf_last_threshold = 0;
+    inline volatile LONG g_aperf_consecutive_anomalies = 0;
     inline volatile LONG g_hv_gate_logged = 0;
 
     constexpr LONG APERF_WARMUP_CYCLES = 30;
@@ -127,6 +131,15 @@ namespace guardian {
 
             UINT64 deviation = (ratio > baseline) ? (ratio - baseline) : (baseline - ratio);
             UINT64 threshold = baseline / 3;
+            _InterlockedExchange64(
+                reinterpret_cast<volatile LONG64*>(&g_aperf_last_ratio),
+                static_cast<LONG64>(ratio));
+            _InterlockedExchange64(
+                reinterpret_cast<volatile LONG64*>(&g_aperf_last_deviation),
+                static_cast<LONG64>(deviation));
+            _InterlockedExchange64(
+                reinterpret_cast<volatile LONG64*>(&g_aperf_last_threshold),
+                static_cast<LONG64>(threshold));
 
             return deviation > threshold;
         } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -139,25 +152,29 @@ namespace guardian {
 
     inline KTIMER       g_timer = {};
     inline KDPC         g_dpc = {};
+    inline WORK_QUEUE_ITEM g_work_item = {};
     inline volatile LONG g_cycle_count = 0;
     inline volatile LONG g_running = 0;
     inline volatile LONG g_timer_active = 0;
+    inline volatile LONG g_work_item_queued = 0;
 
 
-    static void NTAPI dpc_callback(
-        PKDPC ,
-        PVOID ,
-        PVOID ,
-        PVOID )
+    static void NTAPI work_item_callback(PVOID)
     {
-
-
-        if (_InterlockedCompareExchange(&g_running, 1, 0) != 0) {
-            SN_LOG("guardian::dpc: SKIP (already running)");
+        if (!_InterlockedCompareExchange(&g_timer_active, 1, 1)) {
+            _InterlockedExchange(&g_work_item_queued, 0);
             return;
         }
 
-        LONG cycle = _InterlockedIncrement(&g_cycle_count);
+        if (_InterlockedCompareExchange(&g_running, 1, 0) != 0) {
+            SN_LOG("guardian::work: SKIP (already running)");
+            _InterlockedExchange(&g_work_item_queued, 0);
+            return;
+        }
+
+        LONG cycle = 0;
+        __try {
+        cycle = _InterlockedIncrement(&g_cycle_count);
         SN_LOG("guardian::dpc: cycle=%ld", cycle);
 
 
@@ -187,8 +204,8 @@ namespace guardian {
 
         dispatch_guard::verify();
 
-        SN_LOG("guardian::dpc: IPI clear (cycle %ld)", cycle);
-        thread_guard::ipi_clear_all_cpus();
+        SN_LOG("guardian::dpc: local debug register clear (cycle %ld)", cycle);
+        thread_guard::check_and_clear_current_cpu();
 
         callback_scanner::verify();
 
@@ -209,7 +226,9 @@ namespace guardian {
         heartbeat::verify_challenge_response();
         heartbeat::issue_challenge();
 
-        if (!hv_allow_list::is_microsoft_hyperv_root()) {
+        BOOLEAN ms_hv_root = hv_allow_list::is_microsoft_hyperv_root();
+        BOOLEAN vbs_hvci = hv_allow_list::has_vbs_or_hvci();
+        if (!ms_hv_root && !vbs_hvci) {
             if (detect_lbr_interception()) {
                 SN_LOG("guardian::dpc: LBR interception detected - hostile HV");
                 heartbeat::send_command(heartbeat::BRIDGE_CMD_RE_EVIDENCE, 0x0000AE01u);
@@ -219,13 +238,61 @@ namespace guardian {
                 if (cycle >= APERF_WARMUP_CYCLES)
                     _InterlockedExchange(&g_aperf_warmup_done, 1);
             } else if (detect_aperf_anomaly()) {
-                SN_LOG("guardian::dpc: APERF/MPERF anomaly detected - possible HV");
-                heartbeat::send_command(heartbeat::BRIDGE_CMD_RE_EVIDENCE, 0x0000AE02u);
+                LONG consecutive = _InterlockedIncrement(&g_aperf_consecutive_anomalies);
+                UINT64 ratio = static_cast<UINT64>(_InterlockedCompareExchange64(
+                    reinterpret_cast<volatile LONG64*>(&g_aperf_last_ratio), 0, 0));
+                UINT64 baseline = static_cast<UINT64>(_InterlockedCompareExchange64(
+                    reinterpret_cast<volatile LONG64*>(&g_aperf_ratio_baseline), 0, 0));
+                UINT64 deviation = static_cast<UINT64>(_InterlockedCompareExchange64(
+                    reinterpret_cast<volatile LONG64*>(&g_aperf_last_deviation), 0, 0));
+                UINT64 threshold = static_cast<UINT64>(_InterlockedCompareExchange64(
+                    reinterpret_cast<volatile LONG64*>(&g_aperf_last_threshold), 0, 0));
+                SN_LOG("guardian::dpc: APERF/MPERF anomaly cycle=%ld consecutive=%ld ratio=%llu baseline=%llu deviation=%llu threshold=%llu ms_hv_root=%d vbs_hvci=%d",
+                    cycle,
+                    consecutive,
+                    static_cast<unsigned long long>(ratio),
+                    static_cast<unsigned long long>(baseline),
+                    static_cast<unsigned long long>(deviation),
+                    static_cast<unsigned long long>(threshold),
+                    (int)ms_hv_root,
+                    (int)vbs_hvci);
+                if (consecutive >= 3) {
+                    heartbeat::send_command(heartbeat::BRIDGE_CMD_RE_EVIDENCE, 0x0000AE02u);
+                }
+            } else {
+                _InterlockedExchange(&g_aperf_consecutive_anomalies, 0);
             }
+        } else if (cycle == APERF_WARMUP_CYCLES || cycle == APERF_WARMUP_CYCLES + 1) {
+            SN_LOG("guardian::dpc: side-channel HV detectors gated ms_hv_root=%d vbs_hvci=%d", (int)ms_hv_root, (int)vbs_hvci);
+        }
+
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            SN_LOG("guardian::work: EXCEPTION");
         }
 
         _InterlockedExchange(&g_running, 0);
-        SN_LOG("guardian::dpc: cycle=%ld done", cycle);
+        _InterlockedExchange(&g_work_item_queued, 0);
+        if (cycle != 0)
+            SN_LOG("guardian::dpc: cycle=%ld done", cycle);
+    }
+
+    static void NTAPI dpc_callback(
+        PKDPC ,
+        PVOID ,
+        PVOID ,
+        PVOID )
+    {
+        if (!_InterlockedCompareExchange(&g_timer_active, 1, 1))
+            return;
+        if (_InterlockedCompareExchange(&g_work_item_queued, 1, 0) != 0)
+            return;
+
+        ExInitializeWorkItem(&g_work_item, work_item_callback, nullptr);
+        if (_ExQueueWorkItem)
+            _ExQueueWorkItem(&g_work_item, DelayedWorkQueue);
+        else
+            ExQueueWorkItem(&g_work_item, DelayedWorkQueue);
     }
 
 
@@ -239,8 +306,9 @@ namespace guardian {
 
         if (!_InterlockedCompareExchange(&g_hv_gate_logged, 1, 0)) {
             BOOLEAN ms_hv = hv_allow_list::is_microsoft_hyperv_root();
-            SN_LOG("guardian::start: MS Hyper-V root=%d (side-channel HV detectors %s)",
-                (int)ms_hv, ms_hv ? "GATED" : "ACTIVE");
+            BOOLEAN vbs_hvci = hv_allow_list::has_vbs_or_hvci();
+            SN_LOG("guardian::start: MS Hyper-V root=%d VBS/HVCI=%d (side-channel HV detectors %s)",
+                (int)ms_hv, (int)vbs_hvci, (ms_hv || vbs_hvci) ? "GATED" : "ACTIVE");
         }
 
 

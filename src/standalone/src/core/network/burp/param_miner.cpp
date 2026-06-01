@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -446,7 +447,23 @@ uint64_t start(config_t cfg)
     }
     diag::log_tagged_fmt("param_miner", "start job_id=%llu concurrency=%zu timeout_ms=%d sigma=%.1f",
         static_cast<unsigned long long>(job->id), job->cfg.concurrency, job->cfg.timeout_ms, job->cfg.diff_sigma_threshold);
-    std::thread([job]() { miner_main(job); }).detach();
+    try {
+        std::thread([job]() { miner_main(job); }).detach();
+    } catch (const std::exception& ex) {
+        diag::log_tagged_fmt("param_miner", "start_thread_failed job_id=%llu err=%s",
+            static_cast<unsigned long long>(job->id), ex.what());
+        job->running.store(false);
+        std::lock_guard<std::mutex> lk(reg().mtx);
+        reg().jobs.erase(job->id);
+        return 0;
+    } catch (...) {
+        diag::log_tagged_fmt("param_miner", "start_thread_failed job_id=%llu",
+            static_cast<unsigned long long>(job->id));
+        job->running.store(false);
+        std::lock_guard<std::mutex> lk(reg().mtx);
+        reg().jobs.erase(job->id);
+        return 0;
+    }
     return job->id;
 }
 

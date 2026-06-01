@@ -44,6 +44,8 @@ namespace arc_loader
 
     void unload(loaded_module_t& mod);
 
+    void unload_without_detach(loaded_module_t& mod);
+
 
     const std::string& last_error();
 

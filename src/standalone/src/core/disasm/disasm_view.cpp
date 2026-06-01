@@ -6831,6 +6831,16 @@ void render(float pos_x, float pos_y, float width, float height,
                     output_log::push(bottom_tab_t::output,
                         "[disasm] F5: no cursor address available; aborting decompile.");
                     diag::log_tagged_critical("f5", "disasm_f5_no_cursor");
+                } else if (st.selected_row >= 0 && st.selected_row < n &&
+                           instrs[st.selected_row].raw[0] == 0 &&
+                           instrs[st.selected_row].raw[1] == 0 &&
+                           std::strcmp(instrs[st.selected_row].mnem, "add") == 0) {
+                    output_log::push(bottom_tab_t::output,
+                        "[disasm] F5: selected row is zero-filled padding, not a function.");
+                    diag::log_tagged_critical_fmt("f5",
+                        "disasm_f5_rejected_zero_padding cursor=0x%llX row=%d",
+                        static_cast<unsigned long long>(f5_cursor_addr),
+                        st.selected_row);
                 } else {
                     uint64_t f5_entry = find_enclosing_function_start(f5_cursor_addr, disasm.file);
                     if (f5_entry == 0) f5_entry = f5_cursor_addr;

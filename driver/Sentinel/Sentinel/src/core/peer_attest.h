@@ -59,6 +59,9 @@ namespace peer_attest {
         if (!target || !peer_hash) {
             return STATUS_INVALID_PARAMETER;
         }
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+            return STATUS_INVALID_DEVICE_STATE;
+        }
 
         KAPC_STATE apc_state = {};
         BOOLEAN attached = FALSE;

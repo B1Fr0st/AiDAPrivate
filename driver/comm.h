@@ -14,6 +14,19 @@
 
 namespace dynamic_key {
     inline std::uint32_t g_cached_key = 0;
+    inline std::uint32_t g_server_seed = 0;
+
+    __forceinline std::uint32_t derive_server_seed(std::uint64_t server_nonce, std::uint32_t token_hash, std::uint32_t session_key) {
+        std::uint64_t mix = server_nonce;
+        mix ^= (static_cast<std::uint64_t>(token_hash) << 32) | session_key;
+
+        std::uint32_t seed = static_cast<std::uint32_t>(mix) ^ static_cast<std::uint32_t>(mix >> 32);
+        seed ^= _rotl(seed, 7) ^ 0x9E3779B9u;
+        seed *= 0x85ebca6bu;
+        seed ^= seed >> 13;
+        if (seed == 0) seed = 1;
+        return seed;
+    }
 
     __forceinline std::uint32_t compute() {
         int cpu[4] = {0};
@@ -27,6 +40,10 @@ namespace dynamic_key {
         h = (h ^ static_cast<std::uint32_t>(cpu[3])) * 0x01000193u;
         volatile std::uint32_t build = *reinterpret_cast<volatile std::uint32_t*>(static_cast<std::uintptr_t>(0x7FFE0260)) & 0xFFFFu;
         h = (h ^ build) * 0x01000193u;
+        if (g_server_seed != 0) {
+            h = (h ^ g_server_seed) * 0x01000193u;
+            h ^= _rotl(g_server_seed, 11);
+        }
         h ^= h >> 16;
         h *= 0x85ebca6bu;
         h ^= h >> 13;
@@ -38,6 +55,16 @@ namespace dynamic_key {
         if (g_cached_key != 0) return g_cached_key;
         g_cached_key = compute();
         return g_cached_key;
+    }
+
+    __forceinline void set_server_seed(std::uint64_t server_nonce, std::uint32_t token_hash, std::uint32_t session_key) {
+        g_server_seed = derive_server_seed(server_nonce, token_hash, session_key);
+        g_cached_key = 0;
+    }
+
+    __forceinline void reset_server_seed() {
+        g_server_seed = 0;
+        g_cached_key = 0;
     }
 }
 
@@ -58,9 +85,33 @@ __forceinline std::uint32_t secondary_hash(std::uint32_t key) {
 }
 
 namespace ioctl_codes {
+    inline std::uint32_t g_server_ioctl_seed = 0;
+
     __forceinline std::uint32_t get_base() {
         std::uint32_t key = dynamic_key::get();
-        return ((hash_build_key(key) ^ secondary_hash(key >> 3)) & 0x7FF) | 0x800;
+        std::uint32_t base = ((hash_build_key(key) ^ secondary_hash(key >> 3)) & 0x7FF) | 0x800;
+        if (g_server_ioctl_seed != 0) {
+            base ^= hash_build_key(g_server_ioctl_seed) & 0x7FF;
+            base = (base & 0x7FF) | 0x800;
+        }
+        return base;
+    }
+
+    __forceinline std::uint32_t derive_server_ioctl_seed(std::uint64_t server_nonce, std::uint32_t token_hash, std::uint32_t session_key) {
+        std::uint32_t nonce_lo = static_cast<std::uint32_t>(server_nonce);
+        std::uint32_t nonce_hi = static_cast<std::uint32_t>(server_nonce >> 32);
+        std::uint32_t seed = hash_build_key(nonce_lo ^ _rotl(nonce_hi, 7) ^ token_hash ^ _rotl(session_key, 13));
+        seed ^= secondary_hash(token_hash ^ session_key ^ 0xA17A5EEDu);
+        if (seed == 0) seed = 1;
+        return seed;
+    }
+
+    __forceinline void set_server_ioctl_seed(std::uint64_t server_nonce, std::uint32_t token_hash, std::uint32_t session_key) {
+        g_server_ioctl_seed = derive_server_ioctl_seed(server_nonce, token_hash, session_key);
+    }
+
+    __forceinline void reset_server_ioctl_seed() {
+        g_server_ioctl_seed = 0;
     }
 
     __forceinline DWORD make(std::uint32_t offset) {
@@ -1671,8 +1722,14 @@ namespace voyager {
                                      std::uint64_t text_va, std::uint32_t text_size,
                                      std::uint64_t expected_hash,
                                      std::uint32_t check_interval_ms = 2000) noexcept;
+        bool register_dll_protection_for_pid(std::uint32_t pid,
+                                             std::uint64_t module_base,
+                                             std::uint64_t text_va, std::uint32_t text_size,
+                                             std::uint64_t expected_hash,
+                                             std::uint32_t check_interval_ms = 2000) noexcept;
         bool query_dll_protection(dll_protect_status& out) noexcept;
         bool unregister_dll_protection() noexcept;
+        bool unregister_dll_protection_for_pid(std::uint32_t pid, std::uint64_t module_base = 0) noexcept;
 
 
         bool trigger_kernel_bsod(std::uint32_t reason_code, std::uint64_t evidence_hash) noexcept;
@@ -1796,11 +1853,33 @@ namespace voyager {
         [[nodiscard]] std::uint32_t get_last_heartbeat_ioctl_code() const noexcept { return last_heartbeat_ioctl_code_; }
         [[nodiscard]] std::uint32_t get_last_heartbeat_magic() const noexcept { return last_heartbeat_magic_; }
         [[nodiscard]] BOOL get_last_heartbeat_dioctl_result() const noexcept { return last_heartbeat_dioctl_result_; }
+        [[nodiscard]] std::uint32_t get_last_heartbeat_base() const noexcept { return last_heartbeat_base_; }
+        [[nodiscard]] std::uint32_t get_last_heartbeat_key_hash() const noexcept { return last_heartbeat_key_hash_; }
+        [[nodiscard]] std::uint32_t get_last_heartbeat_ioctl_seed_hash() const noexcept { return last_heartbeat_ioctl_seed_hash_; }
+        [[nodiscard]] std::uint32_t get_last_heartbeat_server_seed_present() const noexcept { return last_heartbeat_server_seed_present_; }
+        [[nodiscard]] std::uint32_t get_last_heartbeat_ioctl_seed_present() const noexcept { return last_heartbeat_ioctl_seed_present_; }
+        [[nodiscard]] std::uint32_t get_last_heartbeat_global_server_seed_present() const noexcept { return last_heartbeat_global_server_seed_present_; }
+        [[nodiscard]] std::uint32_t get_last_heartbeat_global_ioctl_seed_present() const noexcept { return last_heartbeat_global_ioctl_seed_present_; }
+        [[nodiscard]] std::uint32_t get_last_heartbeat_offset() const noexcept { return last_heartbeat_offset_; }
 
         void set_process_id(std::uint32_t pid) noexcept { process_id_ = pid; }
         void set_base_address(std::uint64_t base) noexcept { base_address_ = base; }
         void set_dtb(std::uint64_t dtb) noexcept { dtb_ = dtb; }
         void set_kernel_dtb(std::uint64_t dtb) noexcept { kernel_dtb_ = dtb; }
+        void sync_dynamic_security_state() const noexcept {
+            if (dynamic_key::g_server_seed != server_seed_) {
+                dynamic_key::g_server_seed = server_seed_;
+                dynamic_key::g_cached_key = 0;
+            }
+            ioctl_codes::g_server_ioctl_seed = server_ioctl_seed_;
+        }
+        [[nodiscard]] std::uint32_t compute_dynamic_key_snapshot() const noexcept;
+        [[nodiscard]] std::uint32_t compute_ioctl_base_snapshot() const noexcept;
+        [[nodiscard]] DWORD make_ioctl_snapshot(std::uint32_t offset) const noexcept;
+        [[nodiscard]] std::uint32_t heartbeat_magic_snapshot() const noexcept;
+        [[nodiscard]] bool decode_ioctl_offset_snapshot(DWORD control_code, std::uint32_t& offset) const noexcept;
+        void capture_heartbeat_security_snapshot(std::uint32_t offset, DWORD ioctl_code, std::uint32_t magic) const noexcept;
+        void log_security_snapshot(const char* where, DWORD requested, DWORD effective, DWORD err) const noexcept;
 
     private:
         HANDLE driver_handle_ = INVALID_HANDLE_VALUE;
@@ -1811,6 +1890,8 @@ namespace voyager {
         std::uint64_t shellcode_address_ = 0;
         std::uint64_t spoof_gadget_ = 0;
         std::uint32_t session_key_ = 0;
+        std::uint32_t server_seed_ = 0;
+        std::uint32_t server_ioctl_seed_ = 0;
         mutable std::uint64_t last_heartbeat_tsc_ = 0;
         mutable std::uint64_t last_bridge_whoswho_tsc_ = 0;
         mutable std::uint64_t last_bridge_sentinel_tsc_ = 0;
@@ -1824,6 +1905,14 @@ namespace voyager {
         mutable std::uint32_t last_heartbeat_ioctl_code_ = 0;
         mutable std::uint32_t last_heartbeat_magic_ = 0;
         mutable BOOL  last_heartbeat_dioctl_result_ = FALSE;
+        mutable std::uint32_t last_heartbeat_base_ = 0;
+        mutable std::uint32_t last_heartbeat_key_hash_ = 0;
+        mutable std::uint32_t last_heartbeat_ioctl_seed_hash_ = 0;
+        mutable std::uint32_t last_heartbeat_server_seed_present_ = 0;
+        mutable std::uint32_t last_heartbeat_ioctl_seed_present_ = 0;
+        mutable std::uint32_t last_heartbeat_global_server_seed_present_ = 0;
+        mutable std::uint32_t last_heartbeat_global_ioctl_seed_present_ = 0;
+        mutable std::uint32_t last_heartbeat_offset_ = 0;
 
 
         std::uint64_t ntdll_base_ = 0;

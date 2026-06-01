@@ -16,8 +16,12 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <regex>
@@ -768,28 +772,535 @@ namespace
     tool_result_t handle_convert_number(const json& params)
     {
         diag::log_tagged_fmt("mcp_tools", "handle_convert_number entry");
-        if (!params.contains("value") || !params["value"].is_string())
-            return error("Missing required parameter: value");
+        auto value_text = [](const json& v) -> std::optional<std::string> {
+            if (v.is_string())
+                return v.get<std::string>();
+            if (v.is_number_unsigned())
+                return std::to_string(v.get<uint64_t>());
+            if (v.is_number_integer())
+                return std::to_string(v.get<int64_t>());
+            return std::nullopt;
+        };
 
-        const auto input = params["value"].get<std::string>();
-        uint64_t value = 0;
-        if (!parse_addr(input, value))
+        auto parse_radix = [](const json& root) -> int {
+            const char* radix_key = root.contains("input_base") ? "input_base" : root.contains("from") ? "from" : nullptr;
+            if (radix_key) {
+                const auto& v = root[radix_key];
+                if (v.is_number_integer())
+                    return v.get<int>();
+                if (v.is_string()) {
+                    const auto s = to_lower(trim(v.get<std::string>()));
+                    if (s == "auto")
+                        return 0;
+                    if (s == "hex" || s == "hexadecimal")
+                        return 16;
+                    if (s == "dec" || s == "decimal")
+                        return 10;
+                    if (s == "bin" || s == "binary")
+                        return 2;
+                    if (s == "oct" || s == "octal")
+                        return 8;
+                }
+            }
+            if (root.contains("base")) {
+                const auto& v = root["base"];
+                if (v.is_number_integer()) {
+                    const int base = v.get<int>();
+                    if (base == 0 || base == 2 || base == 8 || base == 10 || base == 16)
+                        return base;
+                }
+                if (v.is_string()) {
+                    const auto s = to_lower(trim(v.get<std::string>()));
+                    if (s == "auto")
+                        return 0;
+                    if (s == "hex" || s == "hexadecimal")
+                        return 16;
+                    if (s == "dec" || s == "decimal")
+                        return 10;
+                    if (s == "bin" || s == "binary")
+                        return 2;
+                    if (s == "oct" || s == "octal")
+                        return 8;
+                    try {
+                        const int base = std::stoi(s);
+                        if (base == 0 || base == 2 || base == 8 || base == 10 || base == 16)
+                            return base;
+                    } catch (...) {
+                    }
+                }
+            }
+            return 0;
+        };
+
+        struct parsed_number_t {
+            uint64_t value = 0;
+            std::string normalized;
+            std::string input_base;
+            bool negative = false;
+        };
+
+        auto parse_number = [](std::string text, int forced_base) -> std::optional<parsed_number_t> {
+            text = trim(text);
+            if (text.empty())
+                return std::nullopt;
+
+            std::string compact;
+            compact.reserve(text.size());
+            for (char c : text) {
+                if (c != '_' && c != '\'' && c != '`' && !std::isspace(static_cast<unsigned char>(c)))
+                    compact.push_back(c);
+            }
+            if (compact.empty())
+                return std::nullopt;
+
+            bool negative = false;
+            if (compact.front() == '+' || compact.front() == '-') {
+                negative = compact.front() == '-';
+                compact.erase(compact.begin());
+            }
+            if (compact.empty())
+                return std::nullopt;
+
+            int base = forced_base;
+            if (base != 0 && base != 2 && base != 8 && base != 10 && base != 16)
+                return std::nullopt;
+
+            std::string digits = compact;
+            if (digits.size() > 2 && digits[0] == '0' && (digits[1] == 'x' || digits[1] == 'X')) {
+                if (base != 0 && base != 16)
+                    return std::nullopt;
+                base = 16;
+                digits = digits.substr(2);
+            } else if (digits.size() > 2 && digits[0] == '0' && (digits[1] == 'b' || digits[1] == 'B')) {
+                if (base != 0 && base != 2)
+                    return std::nullopt;
+                base = 2;
+                digits = digits.substr(2);
+            } else if (digits.size() > 2 && digits[0] == '0' && (digits[1] == 'o' || digits[1] == 'O')) {
+                if (base != 0 && base != 8)
+                    return std::nullopt;
+                base = 8;
+                digits = digits.substr(2);
+            } else if (!digits.empty()) {
+                const char suffix = static_cast<char>(std::tolower(static_cast<unsigned char>(digits.back())));
+                if (suffix == 'h' || suffix == 'b' || suffix == 'o' || suffix == 'd') {
+                    const int suffix_base = suffix == 'h' ? 16 : suffix == 'b' ? 2 : suffix == 'o' ? 8 : 10;
+                    if (base != 0 && base != suffix_base)
+                        return std::nullopt;
+                    base = suffix_base;
+                    digits.pop_back();
+                }
+            }
+
+            if (digits.empty())
+                return std::nullopt;
+            if (base == 0)
+                base = (digits.size() > 1 && digits[0] == '0') ? 8 : 10;
+
+            auto digit_value = [](char c) -> int {
+                if (c >= '0' && c <= '9')
+                    return c - '0';
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                if (c >= 'a' && c <= 'f')
+                    return c - 'a' + 10;
+                return -1;
+            };
+
+            uint64_t magnitude = 0;
+            for (char c : digits) {
+                const int d = digit_value(c);
+                if (d < 0 || d >= base)
+                    return std::nullopt;
+                const uint64_t ubase = static_cast<uint64_t>(base);
+                if (magnitude > (std::numeric_limits<uint64_t>::max() - static_cast<uint64_t>(d)) / ubase)
+                    return std::nullopt;
+                magnitude = magnitude * ubase + static_cast<uint64_t>(d);
+            }
+
+            parsed_number_t parsed;
+            parsed.value = negative ? (0ULL - magnitude) : magnitude;
+            parsed.normalized = (negative ? "-" : "") + digits;
+            parsed.input_base = base == 16 ? "hexadecimal" : base == 10 ? "decimal" : base == 8 ? "octal" : "binary";
+            parsed.negative = negative;
+            return parsed;
+        };
+
+        std::optional<std::string> input_opt;
+        std::string inferred_kind;
+        if (params.contains("value")) {
+            input_opt = value_text(params["value"]);
+        } else {
+            for (const char* key : {"va", "rva", "file_offset", "foa"}) {
+                if (!params.contains(key))
+                    continue;
+                input_opt = value_text(params[key]);
+                inferred_kind = key;
+                break;
+            }
+        }
+        if (!input_opt)
+            return error("Provide value, va, rva, file_offset, or foa as a string or integer.");
+
+        const auto parsed = parse_number(*input_opt, parse_radix(params));
+        if (!parsed)
             return error("Unable to parse the provided number.");
 
-        std::string binary;
-        for (int i = 63; i >= 0; --i)
-            binary.push_back(((value >> i) & 1ULL) ? '1' : '0');
-        binary.erase(0, binary.find_first_not_of('0'));
-        if (binary.empty())
-            binary = "0";
+        const uint64_t value = parsed->value;
+
+        auto mask_bits = [](int bits) -> uint64_t {
+            return bits >= 64 ? std::numeric_limits<uint64_t>::max() : ((1ULL << bits) - 1ULL);
+        };
+
+        auto signed_value = [&](int bits) -> int64_t {
+            const uint64_t mask = mask_bits(bits);
+            const uint64_t masked = value & mask;
+            if (bits >= 64)
+                return static_cast<int64_t>(masked);
+            const uint64_t sign = 1ULL << (bits - 1);
+            if ((masked & sign) == 0)
+                return static_cast<int64_t>(masked);
+            const uint64_t magnitude = ((~masked) & mask) + 1ULL;
+            return -static_cast<int64_t>(magnitude);
+        };
+
+        auto hex_width = [](uint64_t v, int digits) -> std::string {
+            std::ostringstream ss;
+            ss << "0x" << std::uppercase << std::hex << std::setw(digits) << std::setfill('0') << v;
+            return ss.str();
+        };
+
+        auto octal_text = [](uint64_t v) -> std::string {
+            std::ostringstream ss;
+            ss << "0o" << std::oct << v;
+            return ss.str();
+        };
+
+        auto binary_text = [](uint64_t v, int bits) -> std::string {
+            std::string s;
+            s.reserve(static_cast<size_t>(bits) + 2);
+            for (int i = bits - 1; i >= 0; --i)
+                s.push_back(((v >> i) & 1ULL) ? '1' : '0');
+            const auto first = s.find_first_not_of('0');
+            if (first == std::string::npos)
+                s = "0";
+            else
+                s.erase(0, first);
+            return "0b" + s;
+        };
+
+        auto bytes_hex = [&](uint64_t v, int bytes, bool little) -> std::string {
+            std::ostringstream ss;
+            for (int n = 0; n < bytes; ++n) {
+                const int i = little ? n : bytes - 1 - n;
+                if (n)
+                    ss << ' ';
+                ss << std::uppercase << std::hex << std::setw(2) << std::setfill('0')
+                   << static_cast<unsigned int>((v >> (i * 8)) & 0xFFULL);
+            }
+            return ss.str();
+        };
+
+        auto byte_array = [&](uint64_t v, int bytes, bool little) -> json {
+            json arr = json::array();
+            for (int n = 0; n < bytes; ++n) {
+                const int i = little ? n : bytes - 1 - n;
+                arr.push_back(static_cast<unsigned int>((v >> (i * 8)) & 0xFFULL));
+            }
+            return arr;
+        };
+
+        auto ascii_for = [&](uint64_t v, int bytes, bool little) -> std::string {
+            std::string s;
+            s.reserve(static_cast<size_t>(bytes));
+            for (int n = 0; n < bytes; ++n) {
+                const int i = little ? n : bytes - 1 - n;
+                const char c = static_cast<char>((v >> (i * 8)) & 0xFFULL);
+                s.push_back(c >= 32 && c < 127 ? c : '.');
+            }
+            return s;
+        };
+
+        auto bit_count = [](uint64_t v) -> int {
+            int n = 0;
+            while (v) {
+                v &= v - 1ULL;
+                ++n;
+            }
+            return n;
+        };
+
+        auto low_bit_index = [](uint64_t v) -> int {
+            if (!v)
+                return -1;
+            int i = 0;
+            while ((v & 1ULL) == 0) {
+                v >>= 1;
+                ++i;
+            }
+            return i;
+        };
+
+        auto high_bit_index = [](uint64_t v) -> int {
+            if (!v)
+                return -1;
+            int i = 63;
+            while (((v >> i) & 1ULL) == 0)
+                --i;
+            return i;
+        };
+
+        auto align_down = [](uint64_t v, uint64_t a) -> uint64_t {
+            return a ? (v / a) * a : v;
+        };
+
+        auto align_up = [](uint64_t v, uint64_t a) -> uint64_t {
+            if (!a)
+                return v;
+            const uint64_t down = (v / a) * a;
+            if (down == v)
+                return v;
+            if (down > std::numeric_limits<uint64_t>::max() - a)
+                return std::numeric_limits<uint64_t>::max();
+            return down + a;
+        };
+
+        auto min_bytes = [](uint64_t v) -> int {
+            if (v <= 0xFFULL)
+                return 1;
+            if (v <= 0xFFFFULL)
+                return 2;
+            if (v <= 0xFFFFFFFFULL)
+                return 4;
+            return 8;
+        };
+
+        int display_bytes = min_bytes(value);
+        if (params.contains("size") && params["size"].is_number_integer()) {
+            const int requested = params["size"].get<int>();
+            if (requested == 1 || requested == 2 || requested == 4 || requested == 8)
+                display_bytes = requested;
+        } else if (params.contains("bytes") && params["bytes"].is_number_integer()) {
+            const int requested = params["bytes"].get<int>();
+            if (requested == 1 || requested == 2 || requested == 4 || requested == 8)
+                display_bytes = requested;
+        } else if (params.contains("bits") && params["bits"].is_number_integer()) {
+            const int requested = params["bits"].get<int>();
+            if (requested == 8 || requested == 16 || requested == 32 || requested == 64)
+                display_bytes = requested / 8;
+        }
 
         json out;
+        out["input"] = *input_opt;
+        out["normalized_input"] = parsed->normalized;
+        out["input_base"] = parsed->input_base;
+        out["negative_input"] = parsed->negative;
         out["decimal"] = value;
-        out["hex"] = hex_addr(value);
-        out["binary"] = "0b" + binary;
+        out["decimal_string"] = std::to_string(value);
         out["signed_decimal"] = static_cast<int64_t>(value);
-        if (value >= 32 && value < 127)
-            out["ascii"] = std::string(1, static_cast<char>(value));
+        out["hex"] = hex_addr(value);
+        out["hex_u64"] = hex_width(value, 16);
+        out["octal"] = octal_text(value);
+        out["binary"] = binary_text(value, std::max(1, high_bit_index(value) + 1));
+        out["min_size_bytes"] = min_bytes(value);
+        out["display_size_bytes"] = display_bytes;
+        out["bytes_le"] = bytes_hex(value, display_bytes, true);
+        out["bytes_be"] = bytes_hex(value, display_bytes, false);
+        out["byte_array_le"] = byte_array(value, display_bytes, true);
+        out["byte_array_be"] = byte_array(value, display_bytes, false);
+        out["ascii"] = ascii_for(value, display_bytes, true);
+        out["ascii_le"] = out["ascii"];
+        out["ascii_be"] = ascii_for(value, display_bytes, false);
+
+        json integers;
+        for (int bits : {8, 16, 32, 64}) {
+            const uint64_t masked = value & mask_bits(bits);
+            json view;
+            view["unsigned"] = masked;
+            view["unsigned_hex"] = hex_width(masked, bits / 4);
+            view["signed"] = signed_value(bits);
+            view["bytes_le"] = bytes_hex(masked, bits / 8, true);
+            view["bytes_be"] = bytes_hex(masked, bits / 8, false);
+            integers["u" + std::to_string(bits)] = view;
+        }
+        out["integer_views"] = integers;
+        out["u8"] = integers["u8"]["unsigned"];
+        out["i8"] = integers["u8"]["signed"];
+        out["u16"] = integers["u16"]["unsigned"];
+        out["i16"] = integers["u16"]["signed"];
+        out["u32"] = integers["u32"]["unsigned"];
+        out["i32"] = integers["u32"]["signed"];
+        out["u64"] = integers["u64"]["unsigned"];
+        out["i64"] = integers["u64"]["signed"];
+
+        json bits;
+        bits["low8"] = value & 0xFFULL;
+        bits["high8"] = (value >> 56) & 0xFFULL;
+        bits["low16"] = value & 0xFFFFULL;
+        bits["high16"] = (value >> 48) & 0xFFFFULL;
+        bits["low32"] = value & 0xFFFFFFFFULL;
+        bits["high32"] = (value >> 32) & 0xFFFFFFFFULL;
+        bits["popcount"] = bit_count(value);
+        bits["parity"] = bit_count(value) & 1;
+        bits["lowest_set_bit"] = low_bit_index(value);
+        bits["highest_set_bit"] = high_bit_index(value);
+        bits["bit_length"] = value ? high_bit_index(value) + 1 : 0;
+        bits["is_power_of_two"] = value != 0 && (value & (value - 1ULL)) == 0;
+        bits["not"] = hex_addr(~value);
+        out["bit_fields"] = bits;
+
+        json floats;
+        const uint32_t f_bits = static_cast<uint32_t>(value & 0xFFFFFFFFULL);
+        float f = 0.0f;
+        std::memcpy(&f, &f_bits, sizeof(f));
+        if (std::isfinite(f))
+            floats["float32"] = f;
+        double d = 0.0;
+        std::memcpy(&d, &value, sizeof(d));
+        if (std::isfinite(d))
+            floats["float64"] = d;
+        out["floating_point"] = floats;
+
+        json alignment;
+        for (uint64_t a : {2ULL, 4ULL, 8ULL, 16ULL, 32ULL, 64ULL, 256ULL, 4096ULL}) {
+            json view;
+            view["down"] = hex_addr(align_down(value, a));
+            view["up"] = hex_addr(align_up(value, a));
+            view["offset"] = value % a;
+            alignment[std::to_string(a)] = view;
+        }
+        out["alignment"] = alignment;
+
+        auto parse_optional_value = [&](const char* key) -> std::optional<uint64_t> {
+            if (!params.contains(key))
+                return std::nullopt;
+            const auto text = value_text(params[key]);
+            if (!text)
+                return std::nullopt;
+            const auto parsed_value = parse_number(*text, 0);
+            if (!parsed_value)
+                return std::nullopt;
+            return parsed_value->value;
+        };
+
+        std::optional<uint64_t> module_base = parse_optional_value("module_base");
+        if (!module_base)
+            module_base = parse_optional_value("image_base");
+        std::optional<uint64_t> module_size = parse_optional_value("module_size");
+        std::string module_name;
+        if (params.contains("module_name") && params["module_name"].is_string()) {
+            module_name = params["module_name"].get<std::string>();
+            const auto target = to_lower(module_name);
+            for (const auto& mod : driver_bridge::enumerate_modules()) {
+                const auto name = to_lower(mod.name);
+                const auto path = to_lower(mod.path);
+                if (name == target || path.find(target) != std::string::npos) {
+                    module_base = mod.base;
+                    module_size = mod.size;
+                    module_name = mod.name;
+                    break;
+                }
+            }
+        }
+
+        json address;
+        if (module_base) {
+            address["module_base"] = hex_addr(*module_base);
+            if (module_size)
+                address["module_size"] = *module_size;
+            if (!module_name.empty())
+                address["module_name"] = module_name;
+
+            json as_va;
+            as_va["va"] = hex_addr(value);
+            if (value >= *module_base) {
+                const uint64_t rva = value - *module_base;
+                as_va["rva"] = hex_addr(rva);
+                as_va["rva_decimal"] = rva;
+                if (module_size)
+                    as_va["inside_module"] = rva < *module_size;
+                as_va["module_expr"] = (!module_name.empty() ? module_name : std::string("module")) + "+" + hex_addr(rva);
+            } else {
+                as_va["inside_module"] = false;
+            }
+            address["assuming_value_is_va"] = as_va;
+
+            json as_rva;
+            as_rva["rva"] = hex_addr(value);
+            if (value <= std::numeric_limits<uint64_t>::max() - *module_base) {
+                const uint64_t va = *module_base + value;
+                as_rva["va"] = hex_addr(va);
+                as_rva["va_decimal"] = va;
+                if (module_size)
+                    as_rva["inside_module"] = value < *module_size;
+                as_rva["module_expr"] = (!module_name.empty() ? module_name : std::string("module")) + "+" + hex_addr(value);
+            }
+            address["assuming_value_is_rva"] = as_rva;
+
+            const auto kind = !inferred_kind.empty()
+                ? inferred_kind
+                : params.contains("kind") && params["kind"].is_string()
+                ? to_lower(trim(params["kind"].get<std::string>()))
+                : params.contains("type") && params["type"].is_string()
+                    ? to_lower(trim(params["type"].get<std::string>()))
+                    : std::string();
+            if (kind == "rva") {
+                address["selected_kind"] = "rva";
+                address["va"] = as_rva.value("va", "");
+                address["rva"] = hex_addr(value);
+            } else if (kind == "va") {
+                address["selected_kind"] = "va";
+                address["va"] = hex_addr(value);
+                if (value >= *module_base)
+                    address["rva"] = hex_addr(value - *module_base);
+            }
+        }
+
+        const auto section_rva = parse_optional_value("section_rva").value_or(
+            parse_optional_value("section_virtual_address").value_or(0));
+        const auto section_va = parse_optional_value("section_va");
+        const auto section_raw = parse_optional_value("section_raw").value_or(
+            parse_optional_value("section_raw_offset").value_or(
+                parse_optional_value("section_file_offset").value_or(0)));
+        const auto section_virtual_size = parse_optional_value("section_virtual_size").value_or(0);
+        const auto section_raw_size = parse_optional_value("section_raw_size").value_or(0);
+        const uint64_t section_span = std::max<uint64_t>(section_virtual_size, section_raw_size);
+        if ((section_rva || section_va) && section_span) {
+            uint64_t base_rva = section_rva;
+            if (section_va && module_base && *section_va >= *module_base)
+                base_rva = *section_va - *module_base;
+
+            auto in_range = [](uint64_t v, uint64_t start, uint64_t size) -> bool {
+                return v >= start && v - start < size;
+            };
+
+            json pe;
+            pe["section_rva"] = hex_addr(base_rva);
+            pe["section_raw_offset"] = hex_addr(section_raw);
+            pe["section_span"] = section_span;
+            if (in_range(value, base_rva, section_span)) {
+                const uint64_t file_offset = section_raw + (value - base_rva);
+                pe["assuming_value_is_rva"] = json{{"file_offset", hex_addr(file_offset)}, {"file_offset_decimal", file_offset}};
+            }
+            if (module_base && value >= *module_base) {
+                const uint64_t rva = value - *module_base;
+                if (in_range(rva, base_rva, section_span)) {
+                    const uint64_t file_offset = section_raw + (rva - base_rva);
+                    pe["assuming_value_is_va"] = json{{"rva", hex_addr(rva)}, {"file_offset", hex_addr(file_offset)}, {"file_offset_decimal", file_offset}};
+                }
+            }
+            if (in_range(value, section_raw, section_span)) {
+                const uint64_t rva = base_rva + (value - section_raw);
+                json foa{{"rva", hex_addr(rva)}, {"rva_decimal", rva}};
+                if (module_base)
+                    foa["va"] = hex_addr(*module_base + rva);
+                pe["assuming_value_is_file_offset"] = foa;
+            }
+            out["pe_address_conversion"] = pe;
+        }
+
+        if (!address.empty())
+            out["address_conversion"] = address;
+
         return tool_result_t::ok("Converted number.", out);
     }
 
@@ -1678,11 +2189,7 @@ namespace mcp_standalone
             true,
             [&srv](const json& params) { return srv.describe_tools(params); }});
 
-        srv.register_tool({"driver_status", "Return the host kernel driver status. Use guest_lab_status for the active Windows Sandbox VM.", {}, true, handle_driver_status});
         srv.register_tool({"driver_load", "Load and connect the host kernel driver backend for host live analysis.", {}, false, handle_driver_load});
-        srv.register_tool({"driver_attach", "Attach to a process. If a Windows Sandbox guest lab is active this attaches inside the VM by default; pass target='host' for host attach.",
-            {{"pid", "number", "Process id", false}, {"process", "string", "Process image name", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "Guest bridge timeout", false}},
-            false, handle_driver_attach});
         srv.register_tool({"driver_detach", "Detach from the current process. If a Windows Sandbox guest lab is active this detaches the guest active process by default; pass target='host' for host detach.",
             {{"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "Guest bridge timeout", false}},
             false, handle_driver_detach});
@@ -1744,20 +2251,29 @@ namespace mcp_standalone
              {"timeout_ms", "number", "Execution timeout in milliseconds", false},
              {"capture_stdout", "boolean", "Capture stdout", false}, {"capture_stderr", "boolean", "Capture stderr", false}},
             false, handle_sandbox_execute});
-        srv.register_tool({"convert_number", "Convert a number between common representations.",
-            {{"value", "string", "Hex, decimal, octal, or binary input", true}},
+        srv.register_tool({"convert_number", "Convert a number across integer, endian, ASCII, IEEE-754, alignment, VA, RVA, and PE file-offset representations.",
+            {{"value", "string", "Numeric literal or integer value: decimal, 0x hex, hex h suffix, 0b binary, 0o/0 octal, or negative", false},
+             {"input_base", "string", "Optional input radix: auto, hex, decimal, binary, octal, or 2/8/10/16", false},
+             {"from", "string", "Alias for input_base", false},
+             {"size", "number", "Optional display byte width: 1, 2, 4, or 8", false},
+             {"bits", "number", "Optional display bit width: 8, 16, 32, or 64", false},
+             {"va", "string", "Virtual address input alias; infers kind=va", false},
+             {"rva", "string", "Relative virtual address input alias; infers kind=rva", false},
+             {"file_offset", "string", "Raw file offset input alias; infers kind=file_offset", false},
+             {"foa", "string", "Alias for file_offset", false},
+             {"module_base", "string", "Optional module/image base for VA/RVA conversion", false},
+             {"image_base", "string", "Alias for module_base", false},
+             {"module_size", "string", "Optional module size for inside-module checks", false},
+             {"module_name", "string", "Optional attached-process module name to resolve base and size", false},
+             {"kind", "string", "Optional selected address kind: va, rva, file_offset, or foa", false},
+             {"section_rva", "string", "Optional PE section RVA for RVA/FOA conversion", false},
+             {"section_va", "string", "Optional PE section VA for VA/FOA conversion", false},
+             {"section_raw_offset", "string", "Optional PE section raw file offset", false},
+             {"section_raw_size", "string", "Optional PE section raw size", false},
+             {"section_virtual_size", "string", "Optional PE section virtual size", false}},
             true, handle_convert_number});
-        srv.register_tool({"read_file", "Read a text file from disk.", {{"path", "string", "Target path", true}}, true, handle_read_file, mcp_standalone::tool_visibility_t::internal_only});
-        srv.register_tool({"write_file", "Overwrite a file on disk.",
-            {{"path", "string", "Target path", true}, {"content", "string", "New file contents", true}},
-            false, handle_write_file, mcp_standalone::tool_visibility_t::internal_only});
-        srv.register_tool({"edit_file", "Replace text in an existing file.",
-            {{"path", "string", "Target path", true}, {"find_text", "string", "Text to replace", true},
-             {"replace_text", "string", "Replacement text", true}, {"replace_all", "boolean", "Replace every occurrence", false}},
-            false, handle_edit_file, mcp_standalone::tool_visibility_t::internal_only});
         srv.register_tool({"delete_file", "Delete a file on disk.", {{"path", "string", "Target path", true}}, false, handle_delete_file, mcp_standalone::tool_visibility_t::internal_only});
         srv.register_tool({"create_directory", "Create a directory tree on disk.", {{"path", "string", "Target path", true}}, false, handle_create_directory, mcp_standalone::tool_visibility_t::internal_only});
-        srv.register_tool({"list_directory", "List the contents of a directory.", {{"path", "string", "Directory path", false}}, true, handle_list_directory, mcp_standalone::tool_visibility_t::internal_only});
         srv.register_tool({"search_files", "Search for file names under a root directory.",
             {{"root", "string", "Root directory", true}, {"pattern", "string", "Substring to search for", true}, {"limit", "number", "Maximum matches", false}},
             true, handle_search_files, mcp_standalone::tool_visibility_t::internal_only});

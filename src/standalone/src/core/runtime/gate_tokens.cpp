@@ -251,6 +251,7 @@ namespace aida::gate_tokens
     {
         if (slot_index >= slot_count) return false;
         if (!aida::license_state::is_valid_or_degraded()) return false;
+        if (!aida::license_state::is_arc_loaded()) return false;
         return true;
     }
 

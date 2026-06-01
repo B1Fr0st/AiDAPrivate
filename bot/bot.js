@@ -175,6 +175,15 @@ function serverActionFailure(result) {
     return parts.length ? parts.join(' / ') : 'unknown';
 }
 
+function discordUsernameForPayload(user) {
+    if (!user) return '';
+    const username = typeof user.username === 'string' ? user.username : '';
+    const globalName = typeof user.globalName === 'string' ? user.globalName : '';
+    const tag = typeof user.tag === 'string' ? user.tag : '';
+    if (globalName && username && globalName !== username) return `${globalName} (${username})`;
+    return tag || username || globalName;
+}
+
 function embedPayloadLength(embed) {
     const data = typeof embed.toJSON === 'function' ? embed.toJSON() : (embed || {});
     let total = 0;
@@ -956,6 +965,18 @@ const commands = [
             opt.setName('reason')
                .setDescription('Reason')
                .setRequired(false)),
+
+    new SlashCommandBuilder()
+        .setName('version-kill')
+        .setDescription('☠️ Kill a specific AiDA version permanently — all clients running it will be denied')
+        .addStringOption(opt =>
+            opt.setName('version')
+               .setDescription('Plugin version string to kill (e.g. "aida-standalone")')
+               .setRequired(true))
+        .addStringOption(opt =>
+            opt.setName('reason')
+               .setDescription('Reason for killing this version')
+               .setRequired(false)),
 ];
 
 // ─── Register Commands on Ready ───────────────────────────────────────────────
@@ -994,7 +1015,7 @@ client.on('interactionCreate', async (interaction) => {
     const { commandName } = interaction;
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
-    const KILL_COMMANDS = new Set(['aida-kill', 'aida-kill-hwid', 'aida-killswitch-global']);
+    const KILL_COMMANDS = new Set(['aida-kill', 'aida-kill-hwid', 'aida-killswitch-global', 'version-kill']);
     if (KILL_COMMANDS.has(commandName)) {
         if (!isAdminInteraction(interaction)) {
             return interaction.editReply('❌ Only the bot owner or an admin role can use this command.');
@@ -1025,6 +1046,7 @@ client.on('interactionCreate', async (interaction) => {
                 created_by: interaction.user.tag,
                 expires,
                 discord_id: interaction.user.id,
+                discord_username: discordUsernameForPayload(interaction.user),
             });
             if (!result.ok) {
                 return interaction.editReply(`❌ Server refused: \`${serverActionFailure(result)}\``);
@@ -1068,6 +1090,7 @@ client.on('interactionCreate', async (interaction) => {
                 created_by: interaction.user.tag,
                 expires,
                 discord_id: interaction.user.id,
+                discord_username: discordUsernameForPayload(interaction.user),
             });
             if (!result.ok || !result.body || !Array.isArray(result.body.keys)) {
                 return interaction.editReply(`❌ Server refused bulk_create: \`${serverActionFailure(result)}\``);
@@ -2092,6 +2115,38 @@ client.on('interactionCreate', async (interaction) => {
                     .setColor(mode === 'on' ? 0xFF0000 : 0x00FF88)
                     .setDescription(mode === 'on' ? 'ALL traffic will be denied at the edge.' : 'Global kill cleared.')
                     .addFields({ name: 'Reason', value: reason, inline: false })
+                    .setFooter({ text: `By ${interaction.user.tag}` })
+                    .setTimestamp(),
+            ]});
+        }
+
+        else if (commandName === 'version-kill') {
+            const version = interaction.options.getString('version').trim();
+            const reason = interaction.options.getString('reason') || 'version_compromised';
+            if (!version || version.length > 128) {
+                return interaction.editReply('❌ Version string must be 1-128 characters.');
+            }
+            const result = await callServerAction('kill', {
+                target_version: version,
+                reason,
+                discord_id: interaction.user.id,
+            });
+            if (!result.ok) {
+                return interaction.editReply(`❌ Server refused version kill: \`${serverActionFailure(result)}\``);
+            }
+            await logAudit(interaction, 'kill_switch.plugin_version', version, { reason });
+            await callServerAuditLog('bot.kill_switch.plugin_version', version, interaction.user.id, reason, {});
+            await interaction.editReply({ embeds: [
+                new EmbedBuilder()
+                    .setTitle('☠️ Version Kill Switch Activated')
+                    .setColor(0xFF0000)
+                    .setDescription(`Version \`${version}\` is now permanently killed.\nAny client reporting this version will be denied at the edge.`)
+                    .addFields(
+                        { name: 'Version', value: version, inline: true },
+                        { name: 'Switches Added', value: String((result.body && result.body.switches_added) || 0), inline: true },
+                        { name: 'Sessions Killed', value: String((result.body && result.body.killed) || 0), inline: true },
+                        { name: 'Reason', value: reason, inline: false },
+                    )
                     .setFooter({ text: `By ${interaction.user.tag}` })
                     .setTimestamp(),
             ]});

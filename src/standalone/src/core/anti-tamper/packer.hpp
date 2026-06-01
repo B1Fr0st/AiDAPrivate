@@ -6,6 +6,8 @@
 #include <wmmintrin.h>
 
 #include <atomic>
+#include <algorithm>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -118,6 +120,76 @@ namespace detail {
     {
         static std::atomic<uint64_t> v{0};
         return v;
+    }
+
+    inline uint64_t fnv1a_bytes(const void* data, size_t len)
+    {
+        uint64_t h = 14695981039346656037ULL;
+        const auto* p = static_cast<const uint8_t*>(data);
+        for (size_t i = 0; i < len; ++i)
+        {
+            h ^= p[i];
+            h *= 1099511628211ULL;
+        }
+        return h;
+    }
+
+    inline uint64_t fnv1a_wstr(const wchar_t* s)
+    {
+        if (!s) return 0;
+        uint64_t h = 14695981039346656037ULL;
+        for (size_t i = 0; s[i]; ++i)
+        {
+            wchar_t c = s[i];
+            h ^= static_cast<uint8_t>(c & 0xFF);
+            h *= 1099511628211ULL;
+            h ^= static_cast<uint8_t>((c >> 8) & 0xFF);
+            h *= 1099511628211ULL;
+        }
+        return h;
+    }
+
+    inline void log_verify_event(const char* message)
+    {
+        char line[768];
+        SYSTEMTIME st{};
+        GetLocalTime(&st);
+        _snprintf_s(line, sizeof(line), _TRUNCATE,
+            "[%02u:%02u:%02u.%03u] [packer_verify] %s\r\n",
+            static_cast<unsigned>(st.wHour),
+            static_cast<unsigned>(st.wMinute),
+            static_cast<unsigned>(st.wSecond),
+            static_cast<unsigned>(st.wMilliseconds),
+            message ? message : "event=<null>");
+
+        char path[MAX_PATH];
+        DWORD n = GetModuleFileNameA(nullptr, path, MAX_PATH);
+        if (n != 0 && n < MAX_PATH)
+        {
+            char* slash = strrchr(path, '\\');
+            if (slash)
+            {
+                slash[1] = '\0';
+                strncat_s(path, MAX_PATH, "aida_debug.log", _TRUNCATE);
+                HANDLE h = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (h != INVALID_HANDLE_VALUE)
+                {
+                    DWORD wr = 0;
+                    WriteFile(h, line, static_cast<DWORD>(strlen(line)), &wr, nullptr);
+                    CloseHandle(h);
+                }
+            }
+        }
+        OutputDebugStringA(line);
+    }
+
+    template <typename... Args>
+    inline void log_verify_event_fmt(const char* fmt, Args... args)
+    {
+        char buf[640];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, args...);
+        log_verify_event(buf);
     }
 
     inline uint64_t derive_section_key(uint64_t section_base, uint32_t section_size, uint64_t master_seed)
@@ -620,6 +692,644 @@ inline bool verify_unpack_timing()
 
 
     return elapsed < 150'000'000ULL;
+}
+
+struct build_protection_status_t
+{
+    bool packed_found = false;
+    bool packed_version_ok = false;
+    bool packed_has_imports = false;
+    bool aux_found = false;
+    bool dseal_found = false;
+    bool dthunk_found = false;
+    uint32_t section_count = 0;
+    uint32_t import_count = 0;
+    uint32_t string_fixup_count = 0;
+    uint32_t resource_fixup_count = 0;
+    uint32_t phase_flags = 0;
+    uint32_t stolen_block_count = 0;
+    uint32_t packed_header_offset = 0;
+    uint32_t packed_section_rva = 0;
+    uint32_t packed_section_size = 0;
+    uint32_t header_scan_size = 0;
+    uint32_t aux_offset = 0;
+    uint32_t aux_size = 0;
+    uint32_t aux_probe_error = 0;
+    bool disk_backed = false;
+    uint32_t failure_stage = 0;
+    uint32_t last_error = 0;
+    uint32_t exception_code = 0;
+    uint32_t live_dos_magic = 0;
+    uint32_t live_e_lfanew = 0;
+    uint32_t live_nt_signature = 0;
+    uint32_t live_section_count = 0;
+    uint32_t live_image_size = 0;
+    uint32_t live_sections_scanned = 0;
+    uint32_t disk_dos_magic = 0;
+    uint32_t disk_e_lfanew = 0;
+    uint32_t disk_nt_signature = 0;
+    uint32_t disk_section_count = 0;
+    uint32_t disk_image_size = 0;
+    uint64_t disk_path_hash = 0;
+    uint32_t disk_path_len = 0;
+    uint64_t disk_file_size = 0;
+    uint32_t disk_candidate_count = 0;
+    uint32_t disk_sections_scanned = 0;
+    uint32_t last_section_index = 0;
+    uint32_t last_raw_ptr = 0;
+    uint32_t last_raw_size = 0;
+    uint32_t last_scan_offset = 0;
+    bool verifier_module_is_process_image = false;
+};
+
+inline bool verify_build_protection(build_protection_status_t& out)
+{
+    out = {};
+    detail::log_verify_event("entry");
+    HMODULE hMod = nullptr;
+    MEMORY_BASIC_INFORMATION mbi = {};
+    if (VirtualQuery(reinterpret_cast<const void*>(&verify_build_protection), &mbi, sizeof(mbi)) == 0)
+    {
+        out.failure_stage = 1;
+        out.last_error = GetLastError();
+        detail::log_verify_event_fmt("fail=virtualquery gle=%lu", static_cast<unsigned long>(out.last_error));
+        return false;
+    }
+    HMODULE verifier_mod = static_cast<HMODULE>(mbi.AllocationBase);
+    HMODULE process_mod = GetModuleHandleW(nullptr);
+    out.verifier_module_is_process_image = verifier_mod != nullptr && verifier_mod == process_mod;
+    hMod = process_mod;
+    if (!verifier_mod || !hMod)
+    {
+        out.failure_stage = 2;
+        out.last_error = GetLastError();
+        detail::log_verify_event_fmt("fail=null_module verifier_base=%p process_base=%p protect=0x%lX state=0x%lX type=0x%lX",
+            mbi.AllocationBase,
+            process_mod,
+            static_cast<unsigned long>(mbi.Protect),
+            static_cast<unsigned long>(mbi.State),
+            static_cast<unsigned long>(mbi.Type));
+        return false;
+    }
+    detail::log_verify_event_fmt("module verifier_base=%p process_base=%p same=%d protect=0x%lX state=0x%lX type=0x%lX",
+        verifier_mod,
+        hMod,
+        out.verifier_module_is_process_image ? 1 : 0,
+        static_cast<unsigned long>(mbi.Protect),
+        static_cast<unsigned long>(mbi.State),
+        static_cast<unsigned long>(mbi.Type));
+
+    const auto* base = reinterpret_cast<const uint8_t*>(hMod);
+    const IMAGE_NT_HEADERS* nt = nullptr;
+    bool live_headers_ok = false;
+    uint16_t live_dos_magic = 0;
+    int32_t live_e_lfanew = 0;
+    uint32_t live_nt_sig = 0;
+    uint16_t live_sections = 0;
+    uint32_t live_image_size = 0;
+    __try
+    {
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+        live_dos_magic = dos->e_magic;
+        live_e_lfanew = dos->e_lfanew;
+        if (live_dos_magic == IMAGE_DOS_SIGNATURE &&
+            live_e_lfanew >= 64 &&
+            live_e_lfanew <= 0x10000)
+        {
+            nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + live_e_lfanew);
+            live_nt_sig = nt->Signature;
+            if (live_nt_sig == IMAGE_NT_SIGNATURE)
+            {
+                live_headers_ok = true;
+                live_sections = nt->FileHeader.NumberOfSections;
+                live_image_size = nt->OptionalHeader.SizeOfImage;
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        nt = nullptr;
+        live_headers_ok = false;
+        out.exception_code = GetExceptionCode();
+        detail::log_verify_event_fmt("live_header_exception code=0x%08lX", static_cast<unsigned long>(out.exception_code));
+    }
+    out.live_dos_magic = live_dos_magic;
+    out.live_e_lfanew = static_cast<uint32_t>(live_e_lfanew);
+    out.live_nt_signature = live_nt_sig;
+    out.live_section_count = live_sections;
+    out.live_image_size = live_image_size;
+    detail::log_verify_event_fmt("live_header ok=%d dos=0x%04X e_lfanew=0x%08X nt=0x%08X sections=%u image=0x%X",
+        live_headers_ok ? 1 : 0,
+        static_cast<unsigned>(live_dos_magic),
+        static_cast<unsigned>(live_e_lfanew),
+        live_nt_sig,
+        static_cast<unsigned>(live_sections),
+        live_image_size);
+
+    constexpr uint32_t kPackedMagic = 0x41504B44u;
+    constexpr uint32_t kPackedVersion = 0x00030000u;
+    constexpr uint32_t kAuxMagic = 0x4D585541u;
+    constexpr uint32_t kAuxVersion = 0x00030000u;
+
+    struct packed_header_probe_t
+    {
+        uint32_t magic;
+        uint32_t version;
+        uint32_t section_count;
+        uint32_t import_count;
+        uint32_t string_fixup_count;
+        uint32_t resource_fixup_count;
+        uint32_t section_table_offset;
+        uint32_t import_table_offset;
+        uint32_t string_table_offset;
+        uint32_t resource_table_offset;
+        uint32_t master_key_offset;
+        uint32_t stub_code_offset;
+        uint32_t master_key_pe_timestamp;
+        uint32_t master_key_pe_size_of_code;
+        uint32_t bind_flags;
+        uint32_t aux_offset;
+        uint32_t aux_size;
+        uint8_t bind_salt[16];
+        uint32_t reserved[3];
+    };
+
+    struct aux_probe_t
+    {
+        uint32_t magic;
+        uint32_t version;
+        uint32_t spread_seed;
+        uint32_t tamper_response_level;
+        uint32_t bind_flags;
+        uint32_t reserved0;
+        uint8_t  watermark[16];
+        uint8_t  watermark_hash[32];
+        uint8_t  fingerprint_hash[32];
+        uint8_t  bind_salt[16];
+        uint32_t phase_flags;
+        uint32_t stolen_block_count;
+    };
+
+    if (live_headers_ok && nt != nullptr)
+    {
+        const auto* sec = IMAGE_FIRST_SECTION(nt);
+        for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i)
+        {
+            out.live_sections_scanned = static_cast<uint32_t>(i) + 1u;
+            out.last_section_index = static_cast<uint32_t>(i);
+            char name[9] = {};
+            std::memcpy(name, sec[i].Name, 8);
+            if (std::strcmp(name, ".dseal") == 0) out.dseal_found = true;
+            if (std::strcmp(name, ".dthunk") == 0) out.dthunk_found = true;
+
+            const uint32_t image_size = nt->OptionalHeader.SizeOfImage;
+            detail::log_verify_event_fmt("live_section i=%u name_hash=0x%016llX va=0x%X vsize=0x%X raw_size=0x%X raw_ptr=0x%X chars=0x%X",
+                static_cast<unsigned>(i),
+                static_cast<unsigned long long>(detail::fnv1a_bytes(name, strlen(name))),
+                sec[i].VirtualAddress,
+                sec[i].Misc.VirtualSize,
+                sec[i].SizeOfRawData,
+                sec[i].PointerToRawData,
+                sec[i].Characteristics);
+            if (sec[i].VirtualAddress >= image_size)
+            {
+                detail::log_verify_event_fmt("live_section_skip i=%u reason=va_out_of_image image=0x%X",
+                    static_cast<unsigned>(i), image_size);
+                continue;
+            }
+            const uint32_t max_mapped = image_size - sec[i].VirtualAddress;
+            uint32_t vsize = sec[i].Misc.VirtualSize;
+            if (vsize == 0 || vsize > max_mapped)
+                vsize = max_mapped;
+            const uint32_t header_scan_size = vsize < 0x20000u ? vsize : 0x20000u;
+            if (header_scan_size < sizeof(packed_header_probe_t))
+            {
+                detail::log_verify_event_fmt("live_section_skip i=%u reason=scan_too_small scan=0x%X need=0x%zX",
+                    static_cast<unsigned>(i), header_scan_size, sizeof(packed_header_probe_t));
+                continue;
+            }
+
+            const uint8_t* sbase = base + sec[i].VirtualAddress;
+            out.packed_section_rva = sec[i].VirtualAddress;
+            out.packed_section_size = vsize;
+            out.header_scan_size = header_scan_size;
+            for (uint32_t off = 0; off + sizeof(packed_header_probe_t) <= header_scan_size; off += 8)
+            {
+                out.last_scan_offset = off;
+                packed_header_probe_t hdr{};
+                __try
+                {
+                    std::memcpy(&hdr, sbase + off, sizeof(hdr));
+                }
+                __except (EXCEPTION_EXECUTE_HANDLER)
+                {
+                    detail::log_verify_event_fmt("live_scan_exception i=%u off=0x%X code=0x%08lX",
+                        static_cast<unsigned>(i), off, GetExceptionCode());
+                    break;
+                }
+
+                if (hdr.magic != kPackedMagic)
+                    continue;
+
+                ++out.disk_candidate_count;
+                detail::log_verify_event_fmt("live_packed_candidate i=%u off=0x%X version=0x%X sections=%u imports=%u strings=%u resources=%u aux_off=0x%X aux_size=0x%X",
+                    static_cast<unsigned>(i),
+                    off,
+                    hdr.version,
+                    hdr.section_count,
+                    hdr.import_count,
+                    hdr.string_fixup_count,
+                    hdr.resource_fixup_count,
+                    hdr.aux_offset,
+                    hdr.aux_size);
+                out.packed_found = true;
+                out.packed_version_ok = hdr.version == kPackedVersion;
+                out.section_count = hdr.section_count;
+                out.import_count = hdr.import_count;
+                out.packed_has_imports = hdr.import_count != 0;
+                out.string_fixup_count = hdr.string_fixup_count;
+                out.resource_fixup_count = hdr.resource_fixup_count;
+                out.packed_header_offset = off;
+                out.aux_offset = hdr.aux_offset;
+                out.aux_size = hdr.aux_size;
+
+                const uint64_t aux_rva_in_section = static_cast<uint64_t>(off) + hdr.aux_offset;
+                if (hdr.aux_offset != 0 &&
+                    hdr.aux_size >= sizeof(aux_probe_t) &&
+                    aux_rva_in_section + sizeof(aux_probe_t) <= vsize)
+                {
+                    aux_probe_t aux{};
+                    __try
+                    {
+                        std::memcpy(&aux, sbase + off + hdr.aux_offset, sizeof(aux));
+                    }
+                    __except (EXCEPTION_EXECUTE_HANDLER)
+                    {
+                        aux = {};
+                        out.aux_probe_error = 4;
+                        detail::log_verify_event_fmt("live_aux_exception i=%u off=0x%X aux_off=0x%X code=0x%08lX",
+                            static_cast<unsigned>(i), off, hdr.aux_offset, GetExceptionCode());
+                    }
+                    out.aux_found = aux.magic == kAuxMagic && aux.version == kAuxVersion;
+                    if (out.aux_found)
+                    {
+                        out.phase_flags = aux.phase_flags;
+                        out.stolen_block_count = aux.stolen_block_count;
+                        detail::log_verify_event_fmt("live_aux_ok phase=0x%X stolen=%u",
+                            out.phase_flags, out.stolen_block_count);
+                    }
+                    else
+                    {
+                        out.aux_probe_error = 5;
+                        detail::log_verify_event_fmt("live_aux_bad magic=0x%08X version=0x%08X",
+                            aux.magic, aux.version);
+                    }
+                }
+                else if (hdr.aux_offset == 0)
+                {
+                    out.aux_probe_error = 1;
+                    detail::log_verify_event("live_aux_missing reason=zero_offset");
+                }
+                else if (hdr.aux_size < sizeof(aux_probe_t))
+                {
+                    out.aux_probe_error = 2;
+                    detail::log_verify_event_fmt("live_aux_missing reason=size_small aux_size=0x%X need=0x%zX",
+                        hdr.aux_size, sizeof(aux_probe_t));
+                }
+                else
+                {
+                    out.aux_probe_error = 3;
+                    detail::log_verify_event_fmt("live_aux_missing reason=out_of_range off=0x%X aux_off=0x%X aux_size=0x%X vsize=0x%X",
+                        off, hdr.aux_offset, hdr.aux_size, vsize);
+                }
+
+                const bool has_payload_tables =
+                    out.packed_has_imports ||
+                    out.string_fixup_count != 0 ||
+                    out.resource_fixup_count != 0;
+                const bool has_phase_protection = (out.phase_flags & 0x7Fu) != 0;
+                const bool deep_declared = (out.phase_flags & 0x8u) != 0;
+                const bool deep_materialized =
+                    !deep_declared ||
+                    (out.stolen_block_count != 0 && out.dseal_found && out.dthunk_found);
+                const bool memory_ok = out.packed_version_ok &&
+                    out.section_count != 0 &&
+                    out.aux_found &&
+                    (has_payload_tables || has_phase_protection) &&
+                    deep_materialized;
+                detail::log_verify_event_fmt("live_decision ok=%d version=%d sections=%u aux=%d payload=%d phase=%d deep_declared=%d deep_materialized=%d dseal=%d dthunk=%d",
+                    memory_ok ? 1 : 0,
+                    out.packed_version_ok ? 1 : 0,
+                    out.section_count,
+                    out.aux_found ? 1 : 0,
+                    has_payload_tables ? 1 : 0,
+                    has_phase_protection ? 1 : 0,
+                    deep_declared ? 1 : 0,
+                    deep_materialized ? 1 : 0,
+                    out.dseal_found ? 1 : 0,
+                    out.dthunk_found ? 1 : 0);
+                if (memory_ok)
+                {
+                    detail::log_verify_event("success=live");
+                    return true;
+                }
+                break;
+            }
+        }
+    }
+
+    constexpr DWORD kPathCapacity = 32768;
+    wchar_t path[kPathCapacity] = {};
+    DWORD path_len = GetModuleFileNameW(nullptr, path, kPathCapacity);
+    if (path_len == 0 || path_len >= kPathCapacity)
+    {
+        out.last_error = GetLastError();
+        DWORD query_len = kPathCapacity;
+        std::memset(path, 0, sizeof(path));
+        if (!QueryFullProcessImageNameW(GetCurrentProcess(), 0, path, &query_len) ||
+            query_len == 0 ||
+            query_len >= kPathCapacity)
+        {
+            out.failure_stage = 3;
+            if (out.last_error == 0)
+                out.last_error = GetLastError();
+            detail::log_verify_event_fmt("fail=get_process_filename gle=%lu",
+                static_cast<unsigned long>(out.last_error));
+            return false;
+        }
+        path_len = query_len;
+        path[path_len] = L'\0';
+    }
+    if (path_len == 0)
+    {
+        out.failure_stage = 3;
+        out.last_error = GetLastError();
+        detail::log_verify_event_fmt("fail=get_process_filename_empty gle=%lu", static_cast<unsigned long>(out.last_error));
+        return false;
+    }
+    out.disk_path_len = static_cast<uint32_t>(path_len);
+    out.disk_path_hash = detail::fnv1a_wstr(path);
+    detail::log_verify_event_fmt("disk_path len=%lu hash=0x%016llX",
+        static_cast<unsigned long>(out.disk_path_len),
+        static_cast<unsigned long long>(out.disk_path_hash));
+
+    HANDLE file = CreateFileW(path, GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        out.failure_stage = 4;
+        out.last_error = GetLastError();
+        detail::log_verify_event_fmt("fail=open_disk gle=%lu", static_cast<unsigned long>(out.last_error));
+        return false;
+    }
+    LARGE_INTEGER file_size{};
+    if (GetFileSizeEx(file, &file_size))
+    {
+        out.disk_file_size = static_cast<uint64_t>(file_size.QuadPart);
+        detail::log_verify_event_fmt("disk_file_open size_high=0x%lX size_low=0x%08lX",
+            static_cast<unsigned long>(file_size.HighPart),
+            static_cast<unsigned long>(file_size.LowPart));
+    }
+    else
+    {
+        out.last_error = GetLastError();
+        detail::log_verify_event_fmt("disk_file_size_failed gle=%lu", static_cast<unsigned long>(out.last_error));
+    }
+
+    HANDLE mapping = CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    if (!mapping)
+    {
+        out.failure_stage = 5;
+        out.last_error = GetLastError();
+        detail::log_verify_event_fmt("fail=create_mapping gle=%lu", static_cast<unsigned long>(out.last_error));
+        CloseHandle(file);
+        return false;
+    }
+
+    const auto* disk_base = static_cast<const uint8_t*>(
+        MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0));
+    if (!disk_base)
+    {
+        out.failure_stage = 6;
+        out.last_error = GetLastError();
+        detail::log_verify_event_fmt("fail=map_view gle=%lu", static_cast<unsigned long>(out.last_error));
+        CloseHandle(mapping);
+        CloseHandle(file);
+        return false;
+    }
+
+    bool disk_ok = false;
+    build_protection_status_t disk_last = out;
+    disk_last.disk_backed = true;
+    __try
+    {
+        const auto* disk_dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(disk_base);
+        disk_last.disk_dos_magic = static_cast<uint32_t>(disk_dos->e_magic);
+        disk_last.disk_e_lfanew = static_cast<uint32_t>(disk_dos->e_lfanew);
+        detail::log_verify_event_fmt("disk_dos magic=0x%04X e_lfanew=0x%08X",
+            static_cast<unsigned>(disk_dos->e_magic),
+            static_cast<unsigned>(disk_dos->e_lfanew));
+        if (disk_dos->e_magic == IMAGE_DOS_SIGNATURE)
+        {
+            const auto* disk_nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(disk_base + disk_dos->e_lfanew);
+            disk_last.disk_nt_signature = disk_nt->Signature;
+            disk_last.disk_section_count = disk_nt->FileHeader.NumberOfSections;
+            disk_last.disk_image_size = disk_nt->OptionalHeader.SizeOfImage;
+            detail::log_verify_event_fmt("disk_nt sig=0x%08X sections=%u image=0x%X opt=0x%X",
+                disk_nt->Signature,
+                static_cast<unsigned>(disk_nt->FileHeader.NumberOfSections),
+                disk_nt->OptionalHeader.SizeOfImage,
+                static_cast<unsigned>(disk_nt->OptionalHeader.Magic));
+            if (disk_nt->Signature == IMAGE_NT_SIGNATURE)
+            {
+                build_protection_status_t disk_status = disk_last;
+                disk_status.disk_backed = true;
+                const auto* disk_sec = IMAGE_FIRST_SECTION(disk_nt);
+                for (WORD i = 0; i < disk_nt->FileHeader.NumberOfSections; ++i)
+                {
+                    disk_status.disk_sections_scanned = static_cast<uint32_t>(i) + 1u;
+                    disk_status.last_section_index = static_cast<uint32_t>(i);
+                    char name[9] = {};
+                    std::memcpy(name, disk_sec[i].Name, 8);
+                    if (std::strcmp(name, ".dseal") == 0) disk_status.dseal_found = true;
+                    if (std::strcmp(name, ".dthunk") == 0) disk_status.dthunk_found = true;
+                    detail::log_verify_event_fmt("disk_section i=%u name_hash=0x%016llX va=0x%X vsize=0x%X raw=0x%X ptr=0x%X chars=0x%X",
+                        static_cast<unsigned>(i),
+                        static_cast<unsigned long long>(detail::fnv1a_bytes(name, strlen(name))),
+                        disk_sec[i].VirtualAddress,
+                        disk_sec[i].Misc.VirtualSize,
+                        disk_sec[i].SizeOfRawData,
+                        disk_sec[i].PointerToRawData,
+                        disk_sec[i].Characteristics);
+                }
+                disk_last = disk_status;
+
+                for (WORD i = 0; i < disk_nt->FileHeader.NumberOfSections && !disk_ok; ++i)
+                {
+                    disk_status.disk_sections_scanned = static_cast<uint32_t>(i) + 1u;
+                    disk_status.last_section_index = static_cast<uint32_t>(i);
+                    const uint32_t raw_ptr = disk_sec[i].PointerToRawData;
+                    const uint32_t raw_size = disk_sec[i].SizeOfRawData;
+                    disk_status.last_raw_ptr = raw_ptr;
+                    disk_status.last_raw_size = raw_size;
+                    disk_last = disk_status;
+                    if (raw_ptr == 0 || raw_size < sizeof(packed_header_probe_t))
+                    {
+                        detail::log_verify_event_fmt("disk_section_skip i=%u reason=raw_too_small raw_ptr=0x%X raw_size=0x%X need=0x%zX",
+                            static_cast<unsigned>(i), raw_ptr, raw_size, sizeof(packed_header_probe_t));
+                        continue;
+                    }
+                    const uint32_t scan_size = (std::min)(raw_size, 0x40000u);
+                    const uint8_t* sbase = disk_base + raw_ptr;
+                    detail::log_verify_event_fmt("disk_scan_begin i=%u raw_ptr=0x%X raw_size=0x%X scan=0x%X",
+                        static_cast<unsigned>(i), raw_ptr, raw_size, scan_size);
+                    for (uint32_t off = 0; off + sizeof(packed_header_probe_t) <= scan_size; off += 8)
+                    {
+                        disk_status.last_scan_offset = off;
+                        disk_last = disk_status;
+                        packed_header_probe_t hdr{};
+                        std::memcpy(&hdr, sbase + off, sizeof(hdr));
+                        if (hdr.magic != kPackedMagic)
+                            continue;
+
+                        ++disk_status.disk_candidate_count;
+                        detail::log_verify_event_fmt("disk_packed_candidate i=%u raw_off=0x%X abs=0x%X version=0x%X sections=%u imports=%u strings=%u resources=%u aux_off=0x%X aux_size=0x%X",
+                            static_cast<unsigned>(i),
+                            off,
+                            raw_ptr + off,
+                            hdr.version,
+                            hdr.section_count,
+                            hdr.import_count,
+                            hdr.string_fixup_count,
+                            hdr.resource_fixup_count,
+                            hdr.aux_offset,
+                            hdr.aux_size);
+                        disk_status.packed_found = true;
+                        disk_status.packed_version_ok = hdr.version == kPackedVersion;
+                        disk_status.section_count = hdr.section_count;
+                        disk_status.import_count = hdr.import_count;
+                        disk_status.packed_has_imports = hdr.import_count != 0;
+                        disk_status.string_fixup_count = hdr.string_fixup_count;
+                        disk_status.resource_fixup_count = hdr.resource_fixup_count;
+                        disk_status.packed_header_offset = raw_ptr + off;
+                        disk_status.packed_section_rva = disk_sec[i].VirtualAddress;
+                        disk_status.packed_section_size = raw_size;
+                        disk_status.header_scan_size = scan_size;
+                        disk_status.aux_offset = hdr.aux_offset;
+                        disk_status.aux_size = hdr.aux_size;
+
+                        if (hdr.aux_offset != 0 &&
+                            hdr.aux_size >= sizeof(aux_probe_t) &&
+                            off + hdr.aux_offset + sizeof(aux_probe_t) <= raw_size)
+                        {
+                            aux_probe_t aux{};
+                            std::memcpy(&aux, sbase + off + hdr.aux_offset, sizeof(aux));
+                            disk_status.aux_found = aux.magic == kAuxMagic && aux.version == kAuxVersion;
+                            if (disk_status.aux_found)
+                            {
+                                disk_status.phase_flags = aux.phase_flags;
+                                disk_status.stolen_block_count = aux.stolen_block_count;
+                                detail::log_verify_event_fmt("disk_aux_ok phase=0x%X stolen=%u aux_abs=0x%X",
+                                    disk_status.phase_flags,
+                                    disk_status.stolen_block_count,
+                                    raw_ptr + off + hdr.aux_offset);
+                            }
+                            else
+                            {
+                                disk_status.aux_probe_error = 5;
+                                detail::log_verify_event_fmt("disk_aux_bad magic=0x%08X version=0x%08X aux_abs=0x%X",
+                                    aux.magic, aux.version, raw_ptr + off + hdr.aux_offset);
+                            }
+                        }
+                        else if (hdr.aux_offset == 0)
+                        {
+                            disk_status.aux_probe_error = 1;
+                            detail::log_verify_event("disk_aux_missing reason=zero_offset");
+                        }
+                        else if (hdr.aux_size < sizeof(aux_probe_t))
+                        {
+                            disk_status.aux_probe_error = 2;
+                            detail::log_verify_event_fmt("disk_aux_missing reason=size_small aux_size=0x%X need=0x%zX",
+                                hdr.aux_size, sizeof(aux_probe_t));
+                        }
+                        else
+                        {
+                            disk_status.aux_probe_error = 3;
+                            detail::log_verify_event_fmt("disk_aux_missing reason=out_of_range off=0x%X aux_off=0x%X aux_size=0x%X raw_size=0x%X",
+                                off, hdr.aux_offset, hdr.aux_size, raw_size);
+                        }
+
+                        const bool has_payload_tables =
+                            disk_status.packed_has_imports ||
+                            disk_status.string_fixup_count != 0 ||
+                            disk_status.resource_fixup_count != 0;
+                        const bool has_phase_protection = (disk_status.phase_flags & 0x7Fu) != 0;
+                        const bool deep_declared = (disk_status.phase_flags & 0x8u) != 0;
+                        const bool deep_materialized =
+                            !deep_declared ||
+                            (disk_status.stolen_block_count != 0 &&
+                             disk_status.dseal_found &&
+                             disk_status.dthunk_found);
+                        disk_ok = disk_status.packed_version_ok &&
+                            disk_status.section_count != 0 &&
+                            disk_status.aux_found &&
+                            (has_payload_tables || has_phase_protection) &&
+                            deep_materialized;
+                        disk_last = disk_status;
+                        detail::log_verify_event_fmt("disk_decision ok=%d version=%d sections=%u aux=%d payload=%d phase=%d deep_declared=%d deep_materialized=%d dseal=%d dthunk=%d phase_flags=0x%X stolen=%u",
+                            disk_ok ? 1 : 0,
+                            disk_status.packed_version_ok ? 1 : 0,
+                            disk_status.section_count,
+                            disk_status.aux_found ? 1 : 0,
+                            has_payload_tables ? 1 : 0,
+                            has_phase_protection ? 1 : 0,
+                            deep_declared ? 1 : 0,
+                            deep_materialized ? 1 : 0,
+                            disk_status.dseal_found ? 1 : 0,
+                            disk_status.dthunk_found ? 1 : 0,
+                            disk_status.phase_flags,
+                            disk_status.stolen_block_count);
+                        if (disk_ok)
+                            out = disk_status;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        disk_last.failure_stage = 7;
+        disk_last.exception_code = GetExceptionCode();
+        detail::log_verify_event_fmt("disk_exception code=0x%08lX", static_cast<unsigned long>(disk_last.exception_code));
+        disk_ok = false;
+    }
+
+    UnmapViewOfFile(disk_base);
+    CloseHandle(mapping);
+    CloseHandle(file);
+    if (disk_ok)
+    {
+        detail::log_verify_event("success=disk");
+        return true;
+    }
+
+    out = disk_last;
+    out.failure_stage = out.failure_stage != 0 ? out.failure_stage : 8;
+    detail::log_verify_event_fmt("fail=no_valid_protection_status packed=%d version=%d sections=%u aux=%d payload_counts=%u/%u/%u dseal=%d dthunk=%d disk=%d aux_err=%u",
+        out.packed_found ? 1 : 0,
+        out.packed_version_ok ? 1 : 0,
+        out.section_count,
+        out.aux_found ? 1 : 0,
+        out.import_count,
+        out.string_fixup_count,
+        out.resource_fixup_count,
+        out.dseal_found ? 1 : 0,
+        out.dthunk_found ? 1 : 0,
+        out.disk_backed ? 1 : 0,
+        out.aux_probe_error);
+    return false;
 }
 
 inline uint32_t get_packed_section_count()

@@ -4,8 +4,31 @@
 
 namespace debug_port_trap {
 
-    constexpr ULONG_PTR DEBUG_PORT_OFFSET = 0x400;
-    constexpr ULONG_PTR DEBUG_OBJECT_OFFSET = 0x408;
+    __forceinline bool resolve_offsets(ULONG_PTR* debug_port_offset, ULONG_PTR* debug_object_offset)
+    {
+        *debug_port_offset = 0;
+        *debug_object_offset = 0;
+
+        RTL_OSVERSIONINFOW ver = {};
+        ver.dwOSVersionInfoSize = sizeof(ver);
+        if (!_RtlGetVersion || !NT_SUCCESS(_RtlGetVersion(&ver)))
+            return false;
+
+        if (ver.dwBuildNumber >= 19041) {
+            *debug_port_offset = 0x578;
+            return true;
+        }
+        if (ver.dwBuildNumber >= 17763) {
+            *debug_port_offset = 0x550;
+            return true;
+        }
+        return false;
+    }
+
+    __forceinline bool is_kernel_pointer(ULONG_PTR value)
+    {
+        return value >= 0xFFFF800000000000ull;
+    }
 
     __forceinline ULONG_PTR read_eprocess_ptr(PEPROCESS proc, ULONG_PTR offset)
     {
@@ -22,6 +45,8 @@ namespace debug_port_trap {
 
     __forceinline void check(HANDLE client_pid)
     {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+            return;
         if (!client_pid)
             return;
 
@@ -31,10 +56,18 @@ namespace debug_port_trap {
             return;
 
         __try {
-            ULONG_PTR debug_port   = read_eprocess_ptr(proc, DEBUG_PORT_OFFSET);
-            ULONG_PTR debug_object = read_eprocess_ptr(proc, DEBUG_OBJECT_OFFSET);
+            ULONG_PTR debug_port_offset = 0;
+            ULONG_PTR debug_object_offset = 0;
+            if (!resolve_offsets(&debug_port_offset, &debug_object_offset)) {
+                _ObfDereferenceObject(proc);
+                return;
+            }
 
-            if (debug_port != 0 || debug_object != 0) {
+            ULONG_PTR debug_port = debug_port_offset ? read_eprocess_ptr(proc, debug_port_offset) : 0;
+            ULONG_PTR debug_object = debug_object_offset ? read_eprocess_ptr(proc, debug_object_offset) : 0;
+
+            if ((debug_port != 0 && is_kernel_pointer(debug_port)) ||
+                (debug_object != 0 && is_kernel_pointer(debug_object))) {
                 UINT64 pid_val = (UINT64)(ULONG_PTR)client_pid;
                 UINT64 port_hash = debug_port ^ (debug_port >> 17);
                 targeting_latch::latch_targeting(

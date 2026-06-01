@@ -43,6 +43,13 @@ struct emulation_report_t
 
 namespace detail {
 
+    inline thread_local LONG g_expected_privileged_instruction_probe = 0;
+
+    inline bool expected_privileged_instruction_probe_active()
+    {
+        return g_expected_privileged_instruction_probe > 0;
+    }
+
     inline bool fill_secure_random(void* buf, size_t bytes)
     {
         return BCryptGenRandom(nullptr,
@@ -237,39 +244,12 @@ inline bool check_partial_register_zero_extension()
 
 inline bool check_rdpmc_supported()
 {
-    int regs[4] = {};
-    __cpuid(regs, 0x0A);
-    int version_id = regs[0] & 0xFFu;
-    int num_counters = (regs[0] >> 8) & 0xFFu;
-
-    if (version_id == 0 || num_counters == 0)
-        return false;
-
-    __try
-    {
-        volatile uint64_t a = __readpmc(0);
-        volatile uint64_t b = __readpmc(0);
-
-        if (a == 0 && b == 0)
-            return true;
-
-        if (a == b)
-        {
-            volatile uint64_t spin = 0;
-            for (volatile uint32_t i = 0; i < 50000; ++i)
-                spin += i;
-            volatile uint64_t c = __readpmc(0);
-            if (c == a)
-                return true;
-        }
-    }
-    __except (GetExceptionCode() == EXCEPTION_PRIV_INSTRUCTION
-              || GetExceptionCode() == EXCEPTION_ILLEGAL_INSTRUCTION
-              ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
-    {
-        return false;
-    }
     return false;
+}
+
+inline bool expected_privileged_instruction_probe_active()
+{
+    return detail::expected_privileged_instruction_probe_active();
 }
 
 inline bool check_symbolic_lookup_via_guard_page()
@@ -382,19 +362,35 @@ inline bool check_smc_race_between_threads()
     std::atomic<bool> stop{false};
     std::atomic<bool> writer_started{false};
 
-    std::thread writer([&]() {
-        writer_started.store(true);
-        uint8_t toggle = 0;
-        while (!stop.load(std::memory_order_acquire))
-        {
-            uint32_t imm = (toggle & 1) ? 0xCCCCCCCC : 0xDDDDDDDD;
-            *reinterpret_cast<volatile uint32_t*>(code + 1) = imm;
-            FlushInstructionCache(GetCurrentProcess(), code_pg, 8);
-            ++toggle;
-            if ((toggle & 0x3F) == 0)
-                std::this_thread::yield();
-        }
-    });
+    std::thread writer;
+    try
+    {
+        writer = std::thread([&]() {
+            writer_started.store(true);
+            uint8_t toggle = 0;
+            while (!stop.load(std::memory_order_acquire))
+            {
+                uint32_t imm = (toggle & 1) ? 0xCCCCCCCC : 0xDDDDDDDD;
+                *reinterpret_cast<volatile uint32_t*>(code + 1) = imm;
+                FlushInstructionCache(GetCurrentProcess(), code_pg, 8);
+                ++toggle;
+                if ((toggle & 0x3F) == 0)
+                    std::this_thread::yield();
+            }
+        });
+    }
+    catch (const std::exception& ex)
+    {
+        webhook::send_debug_log("emu_smc_race", std::string("worker_unavailable: ") + ex.what(), false);
+        VirtualFree(code_pg, 0, MEM_RELEASE);
+        return false;
+    }
+    catch (...)
+    {
+        webhook::send_debug_log("emu_smc_race", "worker_unavailable_unknown", false);
+        VirtualFree(code_pg, 0, MEM_RELEASE);
+        return false;
+    }
 
     while (!writer_started.load(std::memory_order_acquire))
         std::this_thread::yield();

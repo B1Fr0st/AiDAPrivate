@@ -57,10 +57,10 @@ bool register_module(module_t mod)
         mod.probes ? "yes" : "no",
         mod.detect ? "yes" : "no",
         mod.custom_run ? "yes" : "no");
-    if (mod.id.empty() || !mod.probes || (!mod.detect && !mod.custom_run)) {
+    if (mod.id.empty() || (!mod.custom_run && (!mod.probes || !mod.detect))) {
         diag::log_tagged_fmt("scanner", "register_module rejected id=%s reason=%s",
             mod.id.c_str(),
-            mod.id.empty() ? "empty_id" : (!mod.probes ? "no_probes" : "no_detect_and_no_custom_run"));
+            mod.id.empty() ? "empty_id" : (!mod.probes ? "no_probes" : "no_detect"));
         return false;
     }
     auto& r = reg();

@@ -149,6 +149,45 @@ void trans_log_fmt(const char* fmt, ...)
     trans_log(buf);
 }
 
+bool openssl_ed25519_verify(const std::vector<uint8_t>& payload_bytes,
+                            const std::vector<uint8_t>& sig_bytes,
+                            const uint8_t pubkey[32],
+                            const char* phase,
+                            std::string& last_error)
+{
+    bool ok = false;
+    std::lock_guard<std::mutex> openssl_lk(g_openssl_mtx);
+    EVP_PKEY* pkey = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, nullptr, pubkey, 32);
+    if (!pkey) {
+        last_error = "sig_invalid_pkey";
+        trans_log_fmt("sig_verify_%s pkey_failed", phase ? phase : "openssl");
+        return false;
+    }
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (!ctx) {
+        EVP_PKEY_free(pkey);
+        last_error = "sig_invalid_ctx";
+        trans_log_fmt("sig_verify_%s ctx_failed", phase ? phase : "openssl");
+        return false;
+    }
+    if (EVP_DigestVerifyInit(ctx, nullptr, nullptr, nullptr, pkey) == 1) {
+        int rc = EVP_DigestVerify(
+            ctx,
+            sig_bytes.data(), sig_bytes.size(),
+            payload_bytes.data(), payload_bytes.size());
+        ok = (rc == 1);
+        if (!ok) {
+            trans_log_fmt("sig_verify_%s verify_rc=%d", phase ? phase : "openssl", rc);
+        }
+    } else {
+        last_error = "sig_invalid_init";
+        trans_log_fmt("sig_verify_%s init_failed", phase ? phase : "openssl");
+    }
+    EVP_MD_CTX_free(ctx);
+    EVP_PKEY_free(pkey);
+    return ok;
+}
+
 bool resolve_winhttp(winhttp_api_t& api)
 {
     api.module = LoadLibraryW(L"winhttp.dll");
@@ -874,32 +913,20 @@ bool verify_response_signature(
     bool b_ok = false;
 
     if (got_a) {
-        std::lock_guard<std::mutex> openssl_lk(g_openssl_mtx);
-        EVP_PKEY* pkey = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, nullptr, pubkey_a, 32);
-        if (pkey) {
-            EVP_MD_CTX* ctx = EVP_MD_CTX_new();
-            if (ctx) {
-                if (EVP_DigestVerifyInit(ctx, nullptr, nullptr, nullptr, pkey) == 1) {
-                    int rc = EVP_DigestVerify(
-                        ctx,
-                        sig_bytes.data(), sig_bytes.size(),
-                        payload_bytes.data(), payload_bytes.size());
-                    a_ok = (rc == 1);
-                }
-                EVP_MD_CTX_free(ctx);
-            } else {
-                last_error = "sig_invalid_ctx";
-            }
-            EVP_PKEY_free(pkey);
-        } else {
-            last_error = "sig_invalid_pkey";
-        }
+        a_ok = openssl_ed25519_verify(payload_bytes, sig_bytes, pubkey_a, "primary", last_error);
     }
 
+    bool wb_self_test_ok = aida::wb_ed25519::self_test_ok();
     if (got_b) {
-        b_ok = aida::wb_ed25519::verify(
-            payload_bytes.data(), payload_bytes.size(),
-            sig_bytes.data(), pubkey_b);
+        if (wb_self_test_ok) {
+            b_ok = aida::wb_ed25519::verify(
+                payload_bytes.data(), payload_bytes.size(),
+                sig_bytes.data(), pubkey_b);
+        } else {
+            trans_log_fmt("sig_dualverify_wb_unavailable wb_err=%s",
+                aida::wb_ed25519::last_error());
+            b_ok = false;
+        }
     }
 
     uint8_t pk_diff = 0;
@@ -915,15 +942,7 @@ bool verify_response_signature(
     bool both_loaded = got_a && got_b;
     bool both_passed = a_ok && b_ok;
     bool pks_match = (pk_diff == 0);
-    bool wb_self_test_ok = aida::wb_ed25519::self_test_ok();
     bool accept = both_loaded && both_passed && pks_match;
-
-    if (!accept && a_ok && got_a && got_b && pks_match && !wb_self_test_ok)
-    {
-        trans_log_fmt("sig_dualverify_degraded_openssl_only wb_self_test_failed wb_err=%s kid=%u",
-            aida::wb_ed25519::last_error(), static_cast<unsigned>(kid));
-        accept = true;
-    }
 
     if (!accept) {
         if (!got_a || !got_b) {
@@ -932,8 +951,12 @@ bool verify_response_signature(
         } else if (!pks_match) {
             trans_log("sig_dualverify_pubkey_share_mismatch");
         } else if (a_ok && !b_ok) {
-            trans_log_fmt("sig_dualverify_wb_failed wb_err=%s",
-                aida::wb_ed25519::last_error());
+            if (wb_self_test_ok) {
+                trans_log_fmt("sig_dualverify_wb_failed wb_err=%s",
+                    aida::wb_ed25519::last_error());
+            } else {
+                trans_log("sig_dualverify_wb_unavailable_rejected");
+            }
         } else if (!a_ok && b_ok) {
             trans_log("sig_dualverify_openssl_failed");
         } else {

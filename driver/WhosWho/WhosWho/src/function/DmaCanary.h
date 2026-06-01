@@ -11,9 +11,12 @@ namespace anti_dma_canary {
 
     constexpr ULONG POOL_TAG       = 'aCiA';
     constexpr ULONG MAX_CANARIES   = 32;
-    constexpr ULONG SCAN_BATCH     = 512;
+    constexpr ULONG SCAN_BATCH     = 16;
+    constexpr ULONG READ_BUDGET_PER_PROCESS = 1024;
+    constexpr ULONG READ_BUDGET_PER_BATCH = 4096;
     constexpr ULONG PERSIST_STRIKE = 2;
-    constexpr LONG64 PERIOD_MS     = 2000;
+    constexpr LONG64 PERIOD_MS     = 5000;
+    constexpr LONG64 STARTUP_WARMUP_100NS = 30LL * 1000LL * 1000LL * 10LL;
     constexpr ULONG PROCESS_NAME_CHARS = 15;
 
     struct canary_t {
@@ -54,6 +57,8 @@ namespace anti_dma_canary {
     inline volatile LONG  g_strike_pid = 0;
     inline volatile LONG  g_strike_count = 0;
     inline volatile LONG64 g_scan_batch_id = 0;
+    inline volatile LONG64 g_first_canary_time = 0;
+    inline volatile LONG g_warmup_logged = 0;
 
     __forceinline void capture_process_name(PEPROCESS proc, scan_hit_t* out_hit) {
         if (!out_hit) return;
@@ -219,6 +224,47 @@ namespace anti_dma_canary {
         return ((current_pa & ~0xFFFULL) == (canary_pa & ~0xFFFULL));
     }
 
+    __forceinline ULONG snapshot_canaries(canary_t* snapshot, ULONG capacity) {
+        if (!snapshot || capacity == 0) return 0;
+        ensure_lock();
+        KIRQL old;
+        KeAcquireSpinLock(&g_canary_lock, &old);
+        ULONG copied = 0;
+        for (ULONG i = 0; i < g_canary_count && i < MAX_CANARIES && copied < capacity; i++) {
+            if (!g_canaries[i].active) continue;
+            snapshot[copied++] = g_canaries[i];
+        }
+        KeReleaseSpinLock(&g_canary_lock, old);
+        return copied;
+    }
+
+    __forceinline BOOLEAN snapshot_matches_pa(const canary_t* snapshot, ULONG snapshot_count,
+                                              UINT64 pa_page, UINT32* out_owner_pid,
+                                              UINT64* out_va, UINT64* out_canary_pa) {
+        if (!snapshot || snapshot_count == 0) return FALSE;
+        pa_page &= ~0xFFFULL;
+        for (ULONG i = 0; i < snapshot_count && i < MAX_CANARIES; i++) {
+            if (!snapshot[i].active) continue;
+            UINT64 start = snapshot[i].pa;
+            UINT64 end = start + ((snapshot[i].size + 0xFFF) & ~0xFFFULL);
+            if (pa_page >= start && pa_page < end) {
+                if (out_owner_pid) *out_owner_pid = snapshot[i].owner_pid;
+                if (out_va) *out_va = snapshot[i].va;
+                if (out_canary_pa) *out_canary_pa = snapshot[i].pa;
+                return TRUE;
+            }
+        }
+        return FALSE;
+    }
+
+    __forceinline BOOLEAN read_phys_qword_budgeted(UINT64 pa, UINT64* value, ULONG* budget) {
+        if (!value || !budget || *budget == 0) return FALSE;
+        *value = 0;
+        (*budget)--;
+        SIZE_T br = 0;
+        return NT_SUCCESS(strong::read_physical(pa, value, sizeof(*value), &br)) && br == sizeof(*value);
+    }
+
     __forceinline BOOLEAN register_canary(UINT64 va, UINT64 size, ULONG owner_pid) {
         if (!va || !size || !owner_pid) {
             WW_LOG("dma_canary::register_reject invalid_input va=0x%llx size=0x%llx owner=%lu",
@@ -276,6 +322,8 @@ namespace anti_dma_canary {
         KeReleaseSpinLock(&g_canary_lock, old);
 
         if (ok) {
+            LONG64 now = static_cast<LONG64>(KeQueryInterruptTime());
+            _InterlockedCompareExchange64(&g_first_canary_time, now, 0);
             WW_LOG("dma_canary::register_ok slot=%lu owner=%lu va=0x%llx size=0x%llx pa=0x%llx page_pa=0x%llx count=%lu",
                 slot,
                 owner_pid,
@@ -317,8 +365,12 @@ namespace anti_dma_canary {
         return found;
     }
 
-    __forceinline BOOLEAN scan_one_process(ULONG pid, scan_hit_t* out_hit) {
+    __forceinline BOOLEAN scan_one_process(ULONG pid, const canary_t* snapshot,
+                                           ULONG snapshot_count, ULONG* batch_budget,
+                                           scan_hit_t* out_hit, BOOLEAN* out_budget_exhausted) {
+        if (out_budget_exhausted) *out_budget_exhausted = FALSE;
         if (pid == 0 || pid == 4) return FALSE;
+        if (!snapshot || snapshot_count == 0 || !batch_budget || *batch_budget == 0) return FALSE;
 
         ULONG own_pid = static_cast<ULONG>(reinterpret_cast<ULONG_PTR>(
             caller_validation::g_registered_client_pid));
@@ -343,30 +395,31 @@ namespace anti_dma_canary {
         dtb &= 0x000FFFFFFFFFF000ULL;
 
         BOOLEAN hit = FALSE;
+        ULONG local_budget = (*batch_budget < READ_BUDGET_PER_PROCESS) ? *batch_budget : READ_BUDGET_PER_PROCESS;
+        ULONG starting_budget = local_budget;
 
-        for (ULONG pml4i = 0; pml4i < 256 && !hit; pml4i++) {
+        for (ULONG pml4i = 0; pml4i < 256 && !hit && local_budget > 0; pml4i++) {
             UINT64 pml4e = 0;
-            SIZE_T br = 0;
-            if (!NT_SUCCESS(strong::read_physical(dtb + pml4i * 8, &pml4e, 8, &br)) || br != 8)
+            if (!read_phys_qword_budgeted(dtb + pml4i * 8, &pml4e, &local_budget))
                 continue;
             if (!(pml4e & 1)) continue;
 
             UINT64 pdpt_pa = pml4e & 0x000FFFFFFFFFF000ULL;
 
-            for (ULONG pdpti = 0; pdpti < 512 && !hit; pdpti++) {
+            for (ULONG pdpti = 0; pdpti < 512 && !hit && local_budget > 0; pdpti++) {
                 UINT64 pdpte = 0;
-                if (!NT_SUCCESS(strong::read_physical(pdpt_pa + pdpti * 8, &pdpte, 8, &br)) || br != 8)
+                if (!read_phys_qword_budgeted(pdpt_pa + pdpti * 8, &pdpte, &local_budget))
                     continue;
                 if (!(pdpte & 1)) continue;
 
                 if (pdpte & 0x80) {
                     UINT64 start_pa = pdpte & 0x000FFFFFC0000000ULL;
-                    for (ULONG i = 0; i < MAX_CANARIES; i++) {
-                        if (!g_canaries[i].active) continue;
-                        UINT64 cp = g_canaries[i].pa;
+                    for (ULONG i = 0; i < snapshot_count && i < MAX_CANARIES; i++) {
+                        if (!snapshot[i].active) continue;
+                        UINT64 cp = snapshot[i].pa;
                         if (cp >= start_pa && cp < start_pa + (1ULL << 30)) {
-                            fill_scan_hit(out_hit, pid, proc, g_canaries[i].owner_pid,
-                                g_canaries[i].va, cp, start_pa, dtb, pdpte,
+                            fill_scan_hit(out_hit, pid, proc, snapshot[i].owner_pid,
+                                snapshot[i].va, cp, start_pa, dtb, pdpte,
                                 pml4i, pdpti, 0xFFFFFFFFul, 0xFFFFFFFFul,
                                 static_cast<ULONG>(1ULL << 30));
                             hit = TRUE;
@@ -377,20 +430,20 @@ namespace anti_dma_canary {
                 }
 
                 UINT64 pd_pa = pdpte & 0x000FFFFFFFFFF000ULL;
-                for (ULONG pdi = 0; pdi < 512 && !hit; pdi++) {
+                for (ULONG pdi = 0; pdi < 512 && !hit && local_budget > 0; pdi++) {
                     UINT64 pde = 0;
-                    if (!NT_SUCCESS(strong::read_physical(pd_pa + pdi * 8, &pde, 8, &br)) || br != 8)
+                    if (!read_phys_qword_budgeted(pd_pa + pdi * 8, &pde, &local_budget))
                         continue;
                     if (!(pde & 1)) continue;
 
                     if (pde & 0x80) {
                         UINT64 start_pa = pde & 0x000FFFFFFFE00000ULL;
-                        for (ULONG i = 0; i < MAX_CANARIES; i++) {
-                            if (!g_canaries[i].active) continue;
-                            UINT64 cp = g_canaries[i].pa;
+                        for (ULONG i = 0; i < snapshot_count && i < MAX_CANARIES; i++) {
+                            if (!snapshot[i].active) continue;
+                            UINT64 cp = snapshot[i].pa;
                             if (cp >= start_pa && cp < start_pa + (2ULL * 1024 * 1024)) {
-                                fill_scan_hit(out_hit, pid, proc, g_canaries[i].owner_pid,
-                                    g_canaries[i].va, cp, start_pa, dtb, pde,
+                                fill_scan_hit(out_hit, pid, proc, snapshot[i].owner_pid,
+                                    snapshot[i].va, cp, start_pa, dtb, pde,
                                     pml4i, pdpti, pdi, 0xFFFFFFFFul,
                                     static_cast<ULONG>(2ULL * 1024 * 1024));
                                 hit = TRUE;
@@ -401,16 +454,16 @@ namespace anti_dma_canary {
                     }
 
                     UINT64 pt_pa = pde & 0x000FFFFFFFFFF000ULL;
-                    for (ULONG pti = 0; pti < 512 && !hit; pti++) {
+                    for (ULONG pti = 0; pti < 512 && !hit && local_budget > 0; pti++) {
                         UINT64 pte = 0;
-                        if (!NT_SUCCESS(strong::read_physical(pt_pa + pti * 8, &pte, 8, &br)) || br != 8)
+                        if (!read_phys_qword_budgeted(pt_pa + pti * 8, &pte, &local_budget))
                             continue;
                         if (!(pte & 1)) continue;
                         UINT64 phys = pte & 0x000FFFFFFFFFF000ULL;
                         UINT32 owner = 0;
                         UINT64 va    = 0;
                         UINT64 canary_pa = 0;
-                        if (any_canary_matches_pa(phys, &owner, &va, &canary_pa)) {
+                        if (snapshot_matches_pa(snapshot, snapshot_count, phys, &owner, &va, &canary_pa)) {
                             fill_scan_hit(out_hit, pid, proc, owner, va, canary_pa,
                                 phys, dtb, pte, pml4i, pdpti, pdi, pti, 0x1000ul);
                             hit = TRUE;
@@ -421,6 +474,14 @@ namespace anti_dma_canary {
             }
         }
 
+        ULONG consumed = starting_budget - local_budget;
+        if (*batch_budget >= consumed)
+            *batch_budget -= consumed;
+        else
+            *batch_budget = 0;
+        if (!hit && local_budget == 0 && out_budget_exhausted)
+            *out_budget_exhausted = TRUE;
+
         ObDereferenceObject(proc);
         return hit;
     }
@@ -428,11 +489,29 @@ namespace anti_dma_canary {
     __forceinline void do_scan_batch() {
         if (!caller_validation::g_registered_client_pid) return;
 
+        LONG64 first_canary_time = _InterlockedCompareExchange64(&g_first_canary_time, 0, 0);
+        if (first_canary_time != 0) {
+            LONG64 now = static_cast<LONG64>(KeQueryInterruptTime());
+            LONG64 elapsed = now - first_canary_time;
+            if (elapsed >= 0 && elapsed < STARTUP_WARMUP_100NS) {
+                if (_InterlockedCompareExchange(&g_warmup_logged, 1, 0) == 0) {
+                    WW_LOG("dma_canary::batch_deferred warmup_remaining_100ns=%lld",
+                        STARTUP_WARMUP_100NS - elapsed);
+                }
+                return;
+            }
+        }
+
         cleanup_dead_owners();
 
         if (g_canary_count == 0) return;
 
+        canary_t snapshot[MAX_CANARIES] = {};
+        ULONG snapshot_count = snapshot_canaries(snapshot, MAX_CANARIES);
+        if (snapshot_count == 0) return;
+
         LONG64 batch_id = _InterlockedIncrement64(&g_scan_batch_id);
+        ULONG batch_budget = READ_BUDGET_PER_BATCH;
 
         ULONG own_pid = static_cast<ULONG>(reinterpret_cast<ULONG_PTR>(
             caller_validation::g_registered_client_pid));
@@ -455,7 +534,9 @@ namespace anti_dma_canary {
         if (pending_strike_pid > 4 &&
             static_cast<ULONG>(pending_strike_pid) != own_pid) {
             scan_hit_t confirm_info = {};
-            if (scan_one_process(static_cast<ULONG>(pending_strike_pid), &confirm_info)) {
+            BOOLEAN exhausted = FALSE;
+            if (scan_one_process(static_cast<ULONG>(pending_strike_pid), snapshot,
+                                 snapshot_count, &batch_budget, &confirm_info, &exhausted)) {
                 hit_pid   = static_cast<ULONG>(pending_strike_pid);
                 hit_info  = confirm_info;
                 WW_LOG("dma_canary::pending_confirmed id=%lld pid=%lu name=%.15s owner=%u va=0x%llx canary_pa=0x%llx mapped_pa=0x%llx page=0x%lx",
@@ -468,11 +549,18 @@ namespace anti_dma_canary {
                     static_cast<unsigned long long>(hit_info.mapped_pa),
                     hit_info.page_size);
             } else {
-                _InterlockedExchange(&g_strike_pid, 0);
-                _InterlockedExchange(&g_strike_count, 0);
-                WW_LOG("dma_canary::pending_cleared id=%lld pid=%ld reason=rescan_no_hit",
-                    batch_id,
-                    pending_strike_pid);
+                if (exhausted) {
+                    WW_LOG("dma_canary::pending_rescan_budget_exhausted id=%lld pid=%ld budget_left=%lu",
+                        batch_id,
+                        pending_strike_pid,
+                        batch_budget);
+                } else {
+                    _InterlockedExchange(&g_strike_pid, 0);
+                    _InterlockedExchange(&g_strike_count, 0);
+                    WW_LOG("dma_canary::pending_cleared id=%lld pid=%ld reason=rescan_no_hit",
+                        batch_id,
+                        pending_strike_pid);
+                }
             }
         }
 
@@ -486,10 +574,12 @@ namespace anti_dma_canary {
 
             pid = pid_start;
 
-            while (scanned < SCAN_BATCH) {
+            while (scanned < SCAN_BATCH && batch_budget > 0) {
                 if (pid != own_pid && pid != 0 && pid != 4 &&
                     pid != static_cast<ULONG>(pending_strike_pid)) {
-                    if (scan_one_process(pid, &hit_info)) {
+                    BOOLEAN exhausted = FALSE;
+                    if (scan_one_process(pid, snapshot, snapshot_count, &batch_budget,
+                                         &hit_info, &exhausted)) {
                         hit_pid = pid;
                         WW_LOG("dma_canary::cursor_hit id=%lld scanned=%lu cursor_start=%lu pid=%lu name=%.15s owner=%u va=0x%llx canary_pa=0x%llx mapped_pa=0x%llx page=0x%lx",
                             batch_id,
@@ -504,6 +594,8 @@ namespace anti_dma_canary {
                             hit_info.page_size);
                         break;
                     }
+                    if (exhausted && batch_budget == 0)
+                        break;
                 }
                 pid += 4;
                 if (pid > 0x20000) pid = 4;
@@ -514,12 +606,13 @@ namespace anti_dma_canary {
         }
 
         if (hit_pid == 0) {
-            WW_LOG("dma_canary::batch_no_hit id=%lld scanned=%lu cursor_start=%lu cursor_next=%ld canaries=%lu",
+            WW_LOG("dma_canary::batch_no_hit id=%lld scanned=%lu cursor_start=%lu cursor_next=%ld canaries=%lu budget_left=%lu",
                 batch_id,
                 scanned,
                 pid_start,
                 _InterlockedCompareExchange(&g_scan_cursor_pid, 0, 0),
-                g_canary_count);
+                snapshot_count,
+                batch_budget);
         }
 
         if (hit_pid != 0) {
@@ -677,6 +770,8 @@ namespace anti_dma_canary {
         g_strike_pid = 0;
         g_strike_count = 0;
         g_scan_batch_id = 0;
+        g_first_canary_time = 0;
+        g_warmup_logged = 0;
         RtlZeroMemory(&g_timer, sizeof(g_timer));
         RtlZeroMemory(&g_dpc, sizeof(g_dpc));
         RtlZeroMemory(&g_work, sizeof(g_work));

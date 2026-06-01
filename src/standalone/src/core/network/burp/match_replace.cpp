@@ -624,8 +624,8 @@ bool load_from_disk()
     const std::string path = storage_path();
     std::ifstream in(path, std::ios::binary);
     if (!in) {
-        diag::log_tagged_fmt("match_replace", "load_from_disk file_not_found path=%s", path.c_str());
-        return false;
+        diag::log_tagged_fmt("match_replace", "load_from_disk new_store path=%s", path.c_str());
+        return save_to_disk();
     }
     std::stringstream ss;
     ss << in.rdbuf();

@@ -1,6 +1,7 @@
 ﻿#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <bcrypt.h>
+#include <intrin.h>
 #pragma comment(lib, "bcrypt.lib")
 #include <shlobj.h>
 #include <shlwapi.h>
@@ -25,14 +26,105 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <exception>
 #include <memory>
 
 namespace mcp_standalone
 {
+namespace
+{
+    std::atomic<bool> g_ide_lifecycle_ready{false};
+
+    class work_queue_task_queue_t final : public httplib::TaskQueue
+    {
+    public:
+        bool enqueue(std::function<void()> fn) override
+        {
+            if (_shutdown.load(std::memory_order_acquire))
+                return false;
+            return work_queue::post([this, job = std::move(fn)]() mutable {
+                if (_shutdown.load(std::memory_order_acquire))
+                    return;
+                job();
+            });
+        }
+
+        void shutdown() override
+        {
+            _shutdown.store(true, std::memory_order_release);
+        }
+
+    private:
+        std::atomic<bool> _shutdown{false};
+    };
+}
+
 static std::string json_dump_safe(const json& j, int indent = -1)
 {
     try { return j.dump(indent); }
     catch (...) { return "{}"; }
+}
+
+[[noreturn]] static void mcp_auth_fastfail(const char* where)
+{
+    std::string missing_exports;
+    const bool exports_ok = standalone_license::is_arc_loaded()
+        && standalone_license::validate_arc_required_exports(missing_exports);
+    diag::log_tagged_fmt("mcp_srv",
+        "auth_fastfail where=%s ide=%d valid=%d arc=%d loading=%d exports=%d missing='%.160s'",
+        where ? where : "<null>",
+        g_ide_lifecycle_ready.load(std::memory_order_acquire) ? 1 : 0,
+        standalone_license::is_valid() ? 1 : 0,
+        standalone_license::is_arc_loaded() ? 1 : 0,
+        standalone_license::is_arc_download_in_progress() ? 1 : 0,
+        exports_ok ? 1 : 0,
+        missing_exports.c_str());
+    __fastfail(0xA1DA4D43u);
+}
+
+static bool mcp_runtime_authorized()
+{
+    if (!g_ide_lifecycle_ready.load(std::memory_order_acquire))
+        return false;
+    if (!standalone_license::is_valid() || !standalone_license::is_arc_loaded())
+        return false;
+    std::string missing_exports;
+    return standalone_license::validate_arc_required_exports(missing_exports);
+}
+
+static void require_mcp_runtime_authorized(const char* where)
+{
+    if (!mcp_runtime_authorized())
+        mcp_auth_fastfail(where);
+}
+
+void set_ide_lifecycle_ready(bool ready) noexcept
+{
+    g_ide_lifecycle_ready.store(ready, std::memory_order_release);
+}
+
+bool lifecycle_authorized(std::string* reason)
+{
+    if (!g_ide_lifecycle_ready.load(std::memory_order_acquire)) {
+        if (reason) *reason = "ide_not_ready";
+        return false;
+    }
+    if (!standalone_license::is_valid()) {
+        if (reason) *reason = "license_invalid";
+        return false;
+    }
+    if (!standalone_license::is_arc_loaded()) {
+        if (reason)
+            *reason = standalone_license::is_arc_download_in_progress() ? "arc_loading" : "arc_not_loaded";
+        return false;
+    }
+    std::string missing_exports;
+    if (!standalone_license::validate_arc_required_exports(missing_exports)) {
+        if (reason) *reason = missing_exports.empty() ? "arc_exports_missing" : ("arc_exports_missing:" + missing_exports);
+        return false;
+    }
+    if (reason) *reason = "authorized";
+    return true;
 }
 
 static std::string generate_session_id()
@@ -345,15 +437,48 @@ static bool is_camoufox_reverse_tool_name(const std::string& name)
     return false;
 }
 
+static bool is_camoufox_browser_tool_name(const std::string& name)
+{
+    return is_camoufox_reverse_tool_name(name) ||
+           name == "camoufox_open_url" ||
+           name.rfind("burp_headless_", 0) == 0;
+}
+
+static bool is_standalone_internal_only_tool_name(const std::string& name)
+{
+    static const char* const names[] = {
+        "switch_agent", "plan_enter", "plan_exit", "list_agents", "ask_followup_question",
+        "attempt_completion", "update_todo_list", "apply_diff", "apply_patch", "codebase_search",
+        "read_command_output", "save_checkpoint", "restore_checkpoint", "list_checkpoints",
+        "checkpoint_list", "skill", "run_slash_command", "get_context", "workflow_status", "task",
+        "search_workspace", "run_command", "cancel_command", "list_commands"
+    };
+    for (const char* n : names)
+    {
+        if (name == n)
+            return true;
+    }
+    return false;
+}
+
+static bool is_external_mcp_tool(const tool_def_t& tool)
+{
+    return tool.visibility == tool_visibility_t::external_visible &&
+           !is_standalone_internal_only_tool_name(tool.name);
+}
+
 bool server_t::register_tool(tool_def_t tool)
 {
+    if (is_standalone_internal_only_tool_name(tool.name))
+        tool.visibility = tool_visibility_t::internal_only;
+
     bool already_has_binary_id = false;
     for (const auto& p : tool.params) {
         if (p.name == "binary_id") { already_has_binary_id = true; break; }
     }
     bool is_targetless_tool = tool.name.rfind("sessions_", 0) == 0 ||
                               tool.name == "get_tool_descriptions" ||
-                              is_camoufox_reverse_tool_name(tool.name);
+                              is_camoufox_browser_tool_name(tool.name);
     if (!already_has_binary_id && !is_targetless_tool) {
         tool.params.push_back(tool_param_t{
             "binary_id",
@@ -371,7 +496,7 @@ bool server_t::register_tool(tool_def_t tool)
             dup->visibility == tool_visibility_t::external_visible &&
             tool.visibility == tool_visibility_t::external_visible) {
             diag::log_tagged_fmt("mcp_srv",
-                "register_tool duplicate replaced name='%s' visibility=%d",
+                "register_tool updated name='%s' visibility=%d",
                 tool.name.c_str(), static_cast<int>(tool.visibility));
             *dup = std::move(tool);
             return true;
@@ -409,6 +534,7 @@ json server_t::tool_schema(const tool_def_t& tool, bool compact) const
     if (compact && tool.name != "get_tool_descriptions") {
         return json{
             {"name", tool.name},
+            {"description", tool.description},
             {"inputSchema", json{{"type", "object"}}}
         };
     }
@@ -482,7 +608,7 @@ tool_result_t server_t::describe_tools(const json& params)
         if (!names.empty()) {
             for (const auto& wanted : names) {
                 for (const auto& tool : _tools) {
-                    if (tool.visibility != tool_visibility_t::external_visible)
+                    if (!is_external_mcp_tool(tool))
                         continue;
                     if (tool.name == wanted) {
                         auto dup = std::find_if(matches.begin(), matches.end(),
@@ -497,7 +623,7 @@ tool_result_t server_t::describe_tools(const json& params)
             const std::string prefix_l = lower_ascii(prefix);
             const std::string query_l = lower_ascii(query);
             for (const auto& tool : _tools) {
-                if (tool.visibility != tool_visibility_t::external_visible)
+                if (!is_external_mcp_tool(tool))
                     continue;
                 const std::string name_l = lower_ascii(tool.name);
                 const std::string desc_l = lower_ascii(tool.description);
@@ -568,24 +694,43 @@ json server_t::handle_initialize(const json& id, const json&)
     server_info["version"] = SERVER_VERSION;
 
     static const char* instructions =
-        "You are connected to AiDA Standalone - a reverse-engineering assistant "
-        "that operates through a kernel-backed live inspection bridge, "
-        "Zydis for disassembly, and Windows Sandbox for safe sample execution.\n\n"
+        "AiDAStandalone MCP is self-describing. Do not expect external markdown files such as TOOLS.md; shipped users normally receive only AiDAStandalone.exe and AiDA.dll. Learn the available surface from this initialize response, `tools/list`, and targeted `get_tool_descriptions` calls.\n\n"
+        "You are connected to AiDAStandalone, a reverse-engineering assistant "
+        "for standalone static binary sessions, live process/runtime inspection, "
+        "kernel-backed debugger/memory workflows, Windows Sandbox sample execution, "
+        "and browser/network reversing through bundled Camoufox MCP tools.\n\n"
         "## Capabilities\n"
+        "- Open and analyze PE/ELF/Mach-O/SYS files as standalone static sessions\n"
         "- Read live process memory from an attached process\n"
-        "- Disassemble x64 code at any address or from PE files\n"
-        "- Attach to / detach from running processes\n"
-        "- Execute untrusted binaries in Windows Sandbox\n"
-        "- Convert numbers between bases (hex, decimal, binary, ASCII)\n"
-        "- Use bundled Camoufox reverse-engineering browser tools such as launch_browser, navigate, evaluate_js, network_capture, and hook_function\n\n"
-        "## Tool usage guidelines\n"
-        "- Always call `driver_status` first to check backend state\n"
+        "- Disassemble x64 code at live addresses or from files\n"
+        "- Attach to or detach from running processes when runtime access is required\n"
+        "- Execute untrusted binaries in Windows Sandbox when explicitly requested\n"
+        "- Convert integers, endian bytes, ASCII, signed/unsigned views, IEEE-754 values, alignment, VA, RVA, module-relative, and PE file-offset references\n"
+        "- Use bundled Camoufox reverse-engineering browser tools such as camoufox_open_url, launch_browser, navigate, evaluate_js, network_capture, and hook_function\n\n"
+        "## First-use workflow\n"
+        "- Use `get_tool_descriptions` with `names`, `prefix`, or `query` for only the tools you plan to call; do not spam broad discovery calls\n"
+        "- For standalone static binaries, use `sessions_open_file`, then `analysis_get_binary_map_overview` or `disasm_get_section_info`, `disasm_list_functions`, and targeted disassembly/decompilation tools\n"
+        "- For live runtime work, use `sessions_attach_pid` when a session workflow is appropriate, or `driver_status`, `driver_load`, and `driver_attach` for direct driver-backed flows\n"
+        "- When Windows Sandbox guest lab is active, pass `target: \"guest\"` or `target: \"host\"` explicitly whenever host/guest memory matters\n"
+        "- Cache session IDs, binary IDs, module bases, function bounds, xrefs, scan state, and decompiler output; avoid duplicate calls with identical parameters\n"
+        "- Prefer batch or paginated tools over repeated one-off calls; set limits before large scans\n\n"
+        "## Address and conversion rules\n"
+        "- Prefer hex strings such as `0x140001000`\n"
+        "- Live/debugger addresses are process VAs; stable references should include module+RVA when module context is known\n"
+        "- Static file tools may return image base, section RVA, and raw file-offset context; carry that context forward\n"
+        "- Use `convert_number` for all number, byte, signedness, float, VA/RVA, module-base, and PE file-offset conversions; never hand-convert offsets or byte values\n\n"
+        "## Safety and mutation rules\n"
+        "- `read_only=true` tools inspect state; `read_only=false` tools may mutate process memory, debugger state, files, browser state, proxy state, sandbox state, or analysis/session state\n"
+        "- Only call mutating tools when the user asked for that action and the target is clear\n"
+        "- Runtime, debugger, sandbox, browser interception, and filesystem tools are local trust-boundary tools even though the server binds to localhost\n\n"
+        "## Browser/runtime shortcuts\n"
+        "- For simple browser tasks, call `camoufox_open_url` with a fully-qualified URL; it starts visible Camoufox, navigates, and recovers one stale browser context automatically\n"
+        "- Do not call `driver_status`, `check_environment`, `launch_browser`, or separate `navigate` before `camoufox_open_url` unless the user asks for diagnostics or advanced browser instrumentation\n"
+        "- Call `driver_status` first only for kernel driver, live process memory, debugger, or driver-backed disassembly tasks\n"
         "- Call `driver_load` when kernel backend is not active and deep runtime access is required\n"
         "- Call `driver_attach` with a PID or process name before memory operations\n"
         "- Use `disassemble_address` for live memory; `disassemble_file` for PE files\n"
-        "- Use `sandbox_execute` for running untrusted binaries safely\n"
-        "- For number conversions, ALWAYS use `convert_number` - never convert manually\n"
-        "- Tool discovery is compact: call `get_tool_descriptions` with selected tool names before using unfamiliar tools\n";
+        "- Use `sandbox_execute` for running untrusted binaries safely when the user requests execution\n";
 
     json result;
     result["protocolVersion"] = PROTOCOL_VERSION;
@@ -607,10 +752,12 @@ json server_t::handle_tools_list(const json& id, const json& params)
     {
         std::lock_guard<std::mutex> lk(_tools_mtx);
         for (const auto& t : _tools) {
-            if (t.visibility != tool_visibility_t::external_visible) continue;
+            if (!is_external_mcp_tool(t)) continue;
             tools_arr.push_back(tool_schema(t, compact));
         }
     }
+    diag::log_tagged_fmt("mcp_srv", "handle_tools_list compact=%d count=%zu",
+        compact ? 1 : 0, tools_arr.size());
     json result;
     result["tools"] = tools_arr;
     result["_meta"] = {
@@ -628,14 +775,24 @@ json server_t::handle_tools_call(const json& id, const json& params)
     const std::string early_name = params["name"].get<std::string>();
     diag::log_tagged_fmt("mcp_srv", "handle_tools_call tool='%s'", early_name.c_str());
 
+    require_mcp_runtime_authorized("tools_call");
+
     {
         uint64_t gt = standalone_license::inline_gate_check(
             standalone_license::gate_mcp_tool_exec);
         if (!standalone_license::verify_tool_runtime(
                 standalone_license::gate_mcp_tool_exec, gt, early_name)) {
-            return make_error(id, -32000,
-                standalone_license::decode_status_string(
-                    standalone_license::str_session_revoked));
+            std::string error_text = standalone_license::decode_status_string(
+                standalone_license::str_session_revoked);
+            if (standalone_license::is_valid() && !standalone_license::is_arc_loaded()) {
+                error_text = standalone_license::is_arc_download_in_progress()
+                    ? "AiDA protected runtime is still loading. Try the tool again after activation finishes."
+                    : "AiDA protected runtime is not loaded. Open AiDAStandalone.exe, activate the license, and wait for ARC initialization to complete.";
+                const std::string last = standalone_license::last_error();
+                if (!last.empty())
+                    error_text += " Last license status: " + last;
+            }
+            return make_error(id, -32000, error_text);
         }
     }
 
@@ -643,13 +800,16 @@ json server_t::handle_tools_call(const json& id, const json& params)
     json arguments = params.contains("arguments") && params["arguments"].is_object()
                    ? params["arguments"] : json::object();
 
+    if (is_standalone_internal_only_tool_name(tool_name))
+        return make_error(id, JSONRPC_INVALID_PARAMS, "Unknown tool: " + tool_name);
+
     const tool_def_t* found = nullptr;
     std::function<tool_result_t(const json&)> handler_copy;
     {
         std::lock_guard<std::mutex> lk(_tools_mtx);
         for (const auto& t : _tools) {
             if (t.name == tool_name) {
-                if (t.visibility != tool_visibility_t::external_visible) {
+                if (!is_external_mcp_tool(t)) {
                     return make_error(id, JSONRPC_INVALID_PARAMS, "Unknown tool: " + tool_name);
                 }
                 found = &t;
@@ -878,6 +1038,8 @@ json server_t::handle_prompts_get(const json& id, const json& params)
 
 json server_t::route_request(const json& msg)
 {
+    require_mcp_runtime_authorized("route_request");
+
     if (!msg.is_object())
         return make_error(nullptr, JSONRPC_INVALID_REQUEST, "Request must be a JSON object");
 
@@ -940,6 +1102,21 @@ std::string handle_body(server_t* self, const std::string& body)
 bool server_t::start(int port)
 {
     diag::log_tagged_fmt("mcp_srv", "start entry port=%d", port);
+    if (!mcp_runtime_authorized())
+    {
+        std::string missing_exports;
+        const bool exports_ok = standalone_license::is_arc_loaded()
+            && standalone_license::validate_arc_required_exports(missing_exports);
+        diag::log_tagged_fmt("mcp_srv",
+            "start_blocked_unauthorized ide=%d valid=%d arc=%d loading=%d exports=%d missing='%.160s'",
+            g_ide_lifecycle_ready.load(std::memory_order_acquire) ? 1 : 0,
+            standalone_license::is_valid() ? 1 : 0,
+            standalone_license::is_arc_loaded() ? 1 : 0,
+            standalone_license::is_arc_download_in_progress() ? 1 : 0,
+            exports_ok ? 1 : 0,
+            missing_exports.c_str());
+        return false;
+    }
     if (_running.load())
     {
         diag::log_tagged_fmt("mcp_srv", "start already running port=%d", port);
@@ -963,8 +1140,8 @@ bool server_t::start(int port)
     }
 
 
-    for (int i = 0; i < 20 && !_running.load() && !_stop_requested.load(); ++i)
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    for (int i = 0; i < 500 && !_running.load() && !_server_done.load(std::memory_order_acquire) && !_stop_requested.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
     diag::log_tagged_fmt("mcp_srv", "start result running=%d port=%d",
         (int)_running.load(), _port);
@@ -994,6 +1171,9 @@ void server_t::server_thread_func(int port)
 {
     diag::log_tagged_fmt("mcp_srv", "server_thread_func entry port=%d", port);
     httplib::Server svr;
+    svr.new_task_queue = [] {
+        return new work_queue_task_queue_t();
+    };
     {
         std::lock_guard<std::mutex> lk(_server_mtx);
         _active_server = &svr;
@@ -1005,18 +1185,31 @@ void server_t::server_thread_func(int port)
     svr.set_default_headers({
         {"Access-Control-Allow-Origin",  "*"},
         {"Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS"},
-        {"Access-Control-Allow-Headers", "Content-Type, Mcp-Session-Id, Accept"},
-        {"Access-Control-Expose-Headers", "Mcp-Session-Id"}
+        {"Access-Control-Allow-Headers", "Content-Type, Mcp-Session-Id, MCP-Protocol-Version, Accept, Authorization, Last-Event-ID"},
+        {"Access-Control-Expose-Headers", "Mcp-Session-Id, MCP-Protocol-Version"}
     });
 
-    svr.Options(".*", [](const httplib::Request&, httplib::Response& res) {
+    svr.Options(".*", [](const httplib::Request& req, httplib::Response& res) {
+        diag::log_tagged_fmt("mcp_srv",
+            "OPTIONS path=%s acrm=%s acrh=%s",
+            req.path.c_str(),
+            req.get_header_value("Access-Control-Request-Method").c_str(),
+            req.get_header_value("Access-Control-Request-Headers").c_str());
         res.status = 204;
     });
 
     svr.Post("/mcp", [this, &session_id](const httplib::Request& req, httplib::Response& res) {
-        diag::log_tagged_fmt("mcp_srv", "POST /mcp body_len=%zu", req.body.size());
+        require_mcp_runtime_authorized("http_post_mcp");
+        diag::log_tagged_fmt("mcp_srv",
+            "POST /mcp body_len=%zu accept=%s content_type=%s protocol=%s session=%s",
+            req.body.size(),
+            req.get_header_value("Accept").c_str(),
+            req.get_header_value("Content-Type").c_str(),
+            req.get_header_value("MCP-Protocol-Version").c_str(),
+            req.get_header_value("Mcp-Session-Id").c_str());
         std::string response_body = handle_body(this, req.body);
         res.set_header("Mcp-Session-Id", session_id);
+        res.set_header("MCP-Protocol-Version", PROTOCOL_VERSION);
         if (response_body.empty())
             res.status = 202;
         else
@@ -1024,7 +1217,14 @@ void server_t::server_thread_func(int port)
     });
 
     svr.Get("/mcp", [this, &session_id](const httplib::Request& req, httplib::Response& res) {
+        require_mcp_runtime_authorized("http_get_mcp");
+        diag::log_tagged_fmt("mcp_srv",
+            "GET /mcp accept=%s protocol=%s session=%s",
+            req.get_header_value("Accept").c_str(),
+            req.get_header_value("MCP-Protocol-Version").c_str(),
+            req.get_header_value("Mcp-Session-Id").c_str());
         res.set_header("Mcp-Session-Id", session_id);
+        res.set_header("MCP-Protocol-Version", PROTOCOL_VERSION);
         std::string accept = req.get_header_value("Accept");
         bool wants_sse = accept.find("text/event-stream") != std::string::npos;
 
@@ -1054,7 +1254,9 @@ void server_t::server_thread_func(int port)
     });
 
     svr.Delete("/mcp", [&session_id](const httplib::Request&, httplib::Response& res) {
+        require_mcp_runtime_authorized("http_delete_mcp");
         res.set_header("Mcp-Session-Id", session_id);
+        res.set_header("MCP-Protocol-Version", PROTOCOL_VERSION);
         res.status = 200;
         res.set_content("{}", "application/json");
     });
@@ -1067,24 +1269,41 @@ void server_t::server_thread_func(int port)
         size_t tool_count = 0;
         { std::lock_guard<std::mutex> lk(_tools_mtx);
           for (const auto& t : _tools)
-              if (t.visibility == tool_visibility_t::external_visible) ++tool_count; }
+              if (is_external_mcp_tool(t)) ++tool_count; }
         health["tools_count"] = tool_count;
         health["driver"]      = driver_bridge::is_loaded();
         health["attached"]    = driver_bridge::attached_pid();
         res.set_content(json_dump_safe(health), "application/json");
     });
 
+    svr.Get("/", [this](const httplib::Request&, httplib::Response& res) {
+        json health;
+        health["status"] = "ok";
+        health["server"] = SERVER_NAME;
+        health["mcp"] = "/mcp";
+        health["sse"] = "/sse";
+        health["health"] = "/health";
+        size_t external_tools = 0;
+        { std::lock_guard<std::mutex> lk(_tools_mtx);
+          for (const auto& t : _tools)
+              if (is_external_mcp_tool(t)) ++external_tools; }
+        health["tools_count"] = external_tools;
+        res.set_content(json_dump_safe(health), "application/json");
+    });
+
     svr.Get("/api/tools", [this](const httplib::Request&, httplib::Response& res) {
+        require_mcp_runtime_authorized("api_tools_list");
         json tools_arr = json::array();
         { std::lock_guard<std::mutex> lk(_tools_mtx);
           for (const auto& t : _tools) {
-              if (t.visibility != tool_visibility_t::external_visible) continue;
+              if (!is_external_mcp_tool(t)) continue;
               tools_arr.push_back(tool_schema(t, false));
           } }
         res.set_content(json_dump_safe(tools_arr, 2), "application/json");
     });
 
     svr.Post("/api/tools/call", [this](const httplib::Request& req, httplib::Response& res) {
+        require_mcp_runtime_authorized("api_tools_call");
         diag::log_tagged_fmt("mcp_srv", "POST /api/tools/call body_len=%zu", req.body.size());
         json body;
         try { body = json::parse(req.body); }
@@ -1107,7 +1326,7 @@ void server_t::server_thread_func(int port)
         { std::lock_guard<std::mutex> lk(_tools_mtx);
           for (const auto& t : _tools) {
               if (t.name == tool_name) {
-                  if (t.visibility != tool_visibility_t::external_visible) {
+                  if (!is_external_mcp_tool(t)) {
                       res.status = 404;
                       res.set_content(json_dump_safe({{"error", "Unknown tool: " + tool_name}}), "application/json");
                       return;
@@ -1138,6 +1357,7 @@ void server_t::server_thread_func(int port)
     std::mutex sse_mtx;
 
     svr.Get("/sse", [this, &sse_sessions, &sse_mtx](const httplib::Request&, httplib::Response& res) {
+        require_mcp_runtime_authorized("http_get_sse");
         auto session = std::make_shared<sse_session_t>();
         session->id = generate_session_id();
         { std::lock_guard<std::mutex> lk(sse_mtx); sse_sessions[session->id] = session; }
@@ -1166,6 +1386,7 @@ void server_t::server_thread_func(int port)
     });
 
     svr.Post("/message", [this, &sse_sessions, &sse_mtx](const httplib::Request& req, httplib::Response& res) {
+        require_mcp_runtime_authorized("http_post_message");
         std::string sid = req.get_param_value("sessionId");
         if (sid.empty()) {
             res.status = 400;
@@ -1196,14 +1417,24 @@ void server_t::server_thread_func(int port)
     });
 
     svr.Post("/sse", [this, &session_id](const httplib::Request& req, httplib::Response& res) {
+        require_mcp_runtime_authorized("http_post_sse");
+        diag::log_tagged_fmt("mcp_srv",
+            "POST /sse body_len=%zu accept=%s protocol=%s session=%s",
+            req.body.size(),
+            req.get_header_value("Accept").c_str(),
+            req.get_header_value("MCP-Protocol-Version").c_str(),
+            req.get_header_value("Mcp-Session-Id").c_str());
         std::string response_body = handle_body(this, req.body);
         res.set_header("Mcp-Session-Id", session_id);
+        res.set_header("MCP-Protocol-Version", PROTOCOL_VERSION);
         if (response_body.empty()) res.status = 202;
         else res.set_content(response_body, "application/json");
     });
 
     svr.Delete("/sse", [&session_id](const httplib::Request&, httplib::Response& res) {
+        require_mcp_runtime_authorized("http_delete_sse");
         res.set_header("Mcp-Session-Id", session_id);
+        res.set_header("MCP-Protocol-Version", PROTOCOL_VERSION);
         res.status = 200;
         res.set_content("{}", "application/json");
     });
@@ -1230,7 +1461,13 @@ void server_t::server_thread_func(int port)
 
     _port = bound_port;
     _running = true;
-    diag::log_tagged_fmt("mcp_srv", "server_thread_func listening bound_port=%d", bound_port);
+    size_t external_tools = 0;
+    { std::lock_guard<std::mutex> lk(_tools_mtx);
+      for (const auto& t : _tools)
+          if (is_external_mcp_tool(t)) ++external_tools; }
+    diag::log_tagged_fmt("mcp_srv",
+        "server_thread_func listening bound_port=%d endpoints=/mcp,/sse,/health external_tools=%zu",
+        bound_port, external_tools);
 
     svr.listen_after_bind();
 
@@ -1241,18 +1478,24 @@ void server_t::server_thread_func(int port)
 
 static std::string get_home_dir()
 {
+    std::string env_home = read_env_var("USERPROFILE");
+    if (!env_home.empty())
+        return env_home;
     char buf[MAX_PATH] = {};
     if (SUCCEEDED(SHGetFolderPathA(nullptr, CSIDL_PROFILE, nullptr, 0, buf)))
         return buf;
-    return read_env_var("USERPROFILE");
+    return "";
 }
 
 static std::string get_appdata_dir()
 {
+    std::string env_appdata = read_env_var("APPDATA");
+    if (!env_appdata.empty())
+        return env_appdata;
     char buf[MAX_PATH] = {};
     if (SUCCEEDED(SHGetFolderPathA(nullptr, CSIDL_APPDATA, nullptr, 0, buf)))
         return buf;
-    return read_env_var("APPDATA");
+    return "";
 }
 
 static std::string expand_path(const char* tmpl)
@@ -1355,7 +1598,7 @@ static bool write_json_file(const std::string& path, const json& data)
     return write_string_to_file(path, json_dump_safe(data, 2) + "\n");
 }
 
-static const char* MCP_NAME = "aida-pro-mcp";
+static const char* MCP_NAME = "aida-standalone-mcp";
 
 struct client_cfg_t {
     const char* name;
@@ -1384,7 +1627,8 @@ static const client_cfg_t g_clients[] = {
     { "Warp",            client_cfg_t::URL,          "~/.warp/mcp_config.json" },
     { "Amazon Q",        client_cfg_t::URL,          "~/.aws/amazonq/mcp_config.json" },
     { "Opencode",        client_cfg_t::OPENCODE,     "~/.config/opencode/opencode.json" },
-    { "Kiro",            client_cfg_t::URL,          "~/.kiro/mcp_config.json" },
+    { "Kiro",            client_cfg_t::URL,          "~/.kiro/settings/mcp.json" },
+    { "Kiro Legacy",     client_cfg_t::URL,          "~/.kiro/mcp_config.json" },
     { "Trae",            client_cfg_t::URL,          "~/.trae/mcp_config.json" },
     { "VS Code",         client_cfg_t::VSCODE,       "%APPDATA%/Code/User/settings.json" },
     { "VS Code Insiders",client_cfg_t::VSCODE,       "%APPDATA%/Code - Insiders/User/settings.json" },
@@ -1396,6 +1640,7 @@ static bool is_managed_key(const std::string& key)
 {
     return key == MCP_NAME ||
            key == "AiDA-Pro-MCP" ||
+           key == "aida-pro-mcp" ||
            key == "aida-standalone-mcp" ||
            key == "camoufox-reverse-mcp" ||
            key == "camoufox_reverse_mcp" ||
@@ -1534,41 +1779,88 @@ static bool write_claude_code(const std::string& path, const std::string& url)
 
 void server_t::write_client_configs() const
 {
-    if (!_running.load()) return;
+    if (!mcp_runtime_authorized())
+    {
+        std::string missing_exports;
+        const bool exports_ok = standalone_license::is_arc_loaded()
+            && standalone_license::validate_arc_required_exports(missing_exports);
+        diag::log_tagged_fmt("mcp_config",
+            "write_client_configs_blocked_unauthorized ide=%d valid=%d arc=%d exports=%d missing='%.160s'",
+            g_ide_lifecycle_ready.load(std::memory_order_acquire) ? 1 : 0,
+            standalone_license::is_valid() ? 1 : 0,
+            standalone_license::is_arc_loaded() ? 1 : 0,
+            exports_ok ? 1 : 0,
+            missing_exports.c_str());
+        return;
+    }
+    if (!_running.load()) {
+        diag::log_tagged("mcp_config", "write_client_configs_skipped_not_running");
+        return;
+    }
 
     std::string port_str = std::to_string(_port);
     std::string http_url = "http://127.0.0.1:" + port_str + "/mcp";
+    std::string sse_url = "http://127.0.0.1:" + port_str + "/sse";
+    diag::log_tagged_fmt("mcp_config", "write_client_configs_start url='%s' sse='%s'", http_url.c_str(), sse_url.c_str());
 
     std::set<std::string> written;
     int ok = 0, skip = 0, fail = 0;
 
     for (const auto& def : g_clients) {
-        std::string path = expand_path(def.win_path);
-        if (path.empty()) { ++skip; continue; }
-        if (written.count(path)) continue;
+        try {
+            std::string path = expand_path(def.win_path);
+            if (path.empty()) {
+                diag::log_tagged_fmt("mcp_config", "client_skip_empty name='%s'", def.name);
+                ++skip;
+                continue;
+            }
+            if (written.count(path)) {
+                diag::log_tagged_fmt("mcp_config", "client_skip_duplicate name='%s' path='%s'", def.name, path.c_str());
+                continue;
+            }
 
-        if (path.find("globalStorage") != std::string::npos) {
-            auto parent = std::filesystem::path(path).parent_path();
-            std::error_code ec;
-            if (!std::filesystem::is_directory(parent, ec)) { ++skip; continue; }
+            if (path.find("globalStorage") != std::string::npos) {
+                auto parent = std::filesystem::path(path).parent_path();
+                std::error_code ec;
+                if (!std::filesystem::is_directory(parent, ec)) {
+                    diag::log_tagged_fmt("mcp_config", "client_optional_storage_absent name='%s' path='%s'", def.name, path.c_str());
+                    ++skip;
+                    continue;
+                }
+            }
+
+            diag::log_tagged_fmt("mcp_config", "client_write_start name='%s' path='%s'", def.name, path.c_str());
+            bool success = false;
+            switch (def.format) {
+            case client_cfg_t::URL:          success = write_mcpservers(path, http_url, "url"); break;
+            case client_cfg_t::SERVERURL:    success = write_mcpservers(path, http_url, "serverUrl"); break;
+            case client_cfg_t::OPENCODE:     success = write_opencode(path, http_url); break;
+            case client_cfg_t::VSCODE:       success = write_vscode(path, http_url); break;
+            case client_cfg_t::VSCODE_JSON:  success = write_vscode_json(path, http_url); break;
+            case client_cfg_t::CLINE:        success = write_cline(path, http_url); break;
+            case client_cfg_t::ZED:          success = write_zed(path, http_url); break;
+            case client_cfg_t::CODEX:        success = write_codex(path, http_url); break;
+            case client_cfg_t::CLAUDE_CODE:  success = write_claude_code(path, http_url); break;
+            }
+
+            if (success) {
+                diag::log_tagged_fmt("mcp_config", "client_write_ok name='%s' path='%s'", def.name, path.c_str());
+                written.insert(path);
+                ++ok;
+            }
+            else {
+                diag::log_tagged_fmt("mcp_config", "client_write_fail name='%s' path='%s'", def.name, path.c_str());
+                ++fail;
+            }
+        } catch (const std::exception& e) {
+            diag::log_tagged_fmt("mcp_config", "client_write_exception name='%s' what='%.180s'", def.name, e.what());
+            ++fail;
+        } catch (...) {
+            diag::log_tagged_fmt("mcp_config", "client_write_exception name='%s' what='<unknown>'", def.name);
+            ++fail;
         }
-
-        bool success = false;
-        switch (def.format) {
-        case client_cfg_t::URL:          success = write_mcpservers(path, http_url, "url"); break;
-        case client_cfg_t::SERVERURL:    success = write_mcpservers(path, http_url, "serverUrl"); break;
-        case client_cfg_t::OPENCODE:     success = write_opencode(path, http_url); break;
-        case client_cfg_t::VSCODE:       success = write_vscode(path, http_url); break;
-        case client_cfg_t::VSCODE_JSON:  success = write_vscode_json(path, http_url); break;
-        case client_cfg_t::CLINE:        success = write_cline(path, http_url); break;
-        case client_cfg_t::ZED:          success = write_zed(path, http_url); break;
-        case client_cfg_t::CODEX:        success = write_codex(path, http_url); break;
-        case client_cfg_t::CLAUDE_CODE:  success = write_claude_code(path, http_url); break;
-        }
-
-        if (success) { written.insert(path); ++ok; }
-        else ++fail;
     }
+    diag::log_tagged_fmt("mcp_config", "write_client_configs_done ok=%d skip=%d fail=%d", ok, skip, fail);
 }
 
 

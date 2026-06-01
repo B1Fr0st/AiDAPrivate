@@ -190,6 +190,12 @@ namespace dispatcher {
     inline volatile ULONG g_heartbeat_counter = 0;
     inline volatile ULONG g_session_key = 0;
     inline volatile LONG g_driver_activated = 0;
+    inline volatile LONG g_heartbeat_inflight = 0;
+    inline volatile LONG64 g_last_heartbeat_log_time = 0;
+    inline volatile ULONG g_heartbeat_log_suppressed = 0;
+    inline volatile ULONG g_heartbeat_fast_intervals = 0;
+    inline volatile ULONG g_heartbeat_reentrant = 0;
+    inline volatile LONG64 g_hvdt_dispatch_trace_id = 0;
 
     inline volatile LONG64 g_server_token_time = 0;
     inline volatile ULONG g_server_token_hash = 0;
@@ -200,9 +206,143 @@ namespace dispatcher {
     constexpr UINT64 INTEGRITY_CHECK_INTERVAL = 500000000ULL;
 
     constexpr LONG64 HEARTBEAT_TIMEOUT = 300000000LL;
+    constexpr LONG64 HEARTBEAT_LOG_INTERVAL = 10000000LL;
+
+    __forceinline UINT64 handle_to_u64(HANDLE value) {
+        return static_cast<UINT64>(reinterpret_cast<ULONG_PTR>(value));
+    }
+
+    __forceinline LONG64 next_hvdt_trace_id() {
+        return _InterlockedIncrement64(&g_hvdt_dispatch_trace_id);
+    }
+
+    __forceinline UINT64 elapsed_us_from_qpc(const LARGE_INTEGER& start, const LARGE_INTEGER& freq) {
+        LARGE_INTEGER now = KeQueryPerformanceCounter(nullptr);
+        if (freq.QuadPart <= 0 || now.QuadPart < start.QuadPart)
+            return 0;
+        return static_cast<UINT64>(((now.QuadPart - start.QuadPart) * 1000000ULL) / static_cast<UINT64>(freq.QuadPart));
+    }
+
+    __forceinline BOOLEAN is_hvdt_trace_candidate(ULONG code, ULONG input_size, ULONG output_size) {
+        if (code == ioctl_codes::HVDT())
+            return TRUE;
+
+        if (input_size == sizeof(hv_detect_result_k) && output_size == sizeof(hv_detect_result_k))
+            return TRUE;
+
+        const ULONG secure_in = static_cast<ULONG>(secure_comm::SECURE_WIRE_PREFIX + sizeof(hv_detect_request_k));
+        const ULONG secure_out = static_cast<ULONG>(secure_comm::SECURE_WIRE_PREFIX + sizeof(hv_detect_result_k));
+        return input_size == secure_in && output_size == secure_out;
+    }
+
+    __forceinline void complete_hvdt_trace_irp(
+        PIRP irp,
+        NTSTATUS status,
+        ULONG_PTR information,
+        LONG64 trace_id,
+        const char* phase,
+        const LARGE_INTEGER& start,
+        const LARGE_INTEGER& freq)
+    {
+        HVD_LOG_IMMEDIATE("dispatch_complete_early trace=%lld phase=%s status=0x%08lx bytes=%llu elapsed_us=%llu cpu=%lu irql=%lu pid=%llu tid=%llu requestor_pid=%lu",
+            trace_id,
+            phase ? phase : "unknown",
+            status,
+            static_cast<UINT64>(information),
+            elapsed_us_from_qpc(start, freq),
+            KeGetCurrentProcessorNumber(),
+            (ULONG)KeGetCurrentIrql(),
+            handle_to_u64(PsGetCurrentProcessId()),
+            handle_to_u64(PsGetCurrentThreadId()),
+            irp ? IoGetRequestorProcessId(irp) : 0);
+    }
 
     __forceinline ULONG get_heartbeat_magic() {
         return 0xDEADBEEFu ^ dynamic_key::get();
+    }
+
+    __forceinline BOOLEAN should_log_heartbeat(LONG64 now, ULONG* suppressed) {
+        if (suppressed) *suppressed = 0;
+        LONG64 last = _InterlockedCompareExchange64(&g_last_heartbeat_log_time, 0, 0);
+        if (last != 0 && now - last < HEARTBEAT_LOG_INTERVAL) {
+            _InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_heartbeat_log_suppressed));
+            return FALSE;
+        }
+        if (_InterlockedCompareExchange64(&g_last_heartbeat_log_time, now, last) == last) {
+            if (suppressed) {
+                *suppressed = static_cast<ULONG>(
+                    _InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_heartbeat_log_suppressed), 0));
+            }
+            return TRUE;
+        }
+        _InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_heartbeat_log_suppressed));
+        return FALSE;
+    }
+
+    __forceinline void activate_server_seed_state(UINT64 server_nonce, UINT32 token_hash, UINT32 session_key) {
+        dynamic_key::set_server_seed(server_nonce, token_hash, session_key);
+        UINT32 nonce_lo = static_cast<UINT32>(server_nonce);
+        UINT32 nonce_hi = static_cast<UINT32>(server_nonce >> 32);
+        UINT32 ioctl_seed = hash_build_key(nonce_lo ^ _rotl(nonce_hi, 7) ^ token_hash ^ _rotl(session_key, 13));
+        ioctl_seed ^= secondary_hash(token_hash ^ session_key ^ 0xA17A5EEDu);
+        if (ioctl_seed == 0) ioctl_seed = 1;
+        _InterlockedExchange(reinterpret_cast<volatile LONG*>(&ioctl_codes::g_server_ioctl_seed), static_cast<LONG>(ioctl_seed));
+    }
+
+    __forceinline void reset_dynamic_session_state(const char* reason, HANDLE prev_client, ULONG cleared_canaries, BOOLEAN cleanup_client) {
+        LONG64 last_hb = _InterlockedCompareExchange64(&g_last_heartbeat_time, 0, 0);
+        LONG64 server_token_time = _InterlockedCompareExchange64(&g_server_token_time, 0, 0);
+        ULONG session_key = static_cast<ULONG>(_InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(&g_session_key), 0, 0));
+        ULONG heartbeat_counter = static_cast<ULONG>(_InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(&g_heartbeat_counter), 0, 0));
+        ULONG server_seed = dynamic_key::g_server_seed;
+        ULONG ioctl_seed = ioctl_codes::g_server_ioctl_seed;
+        LONG activated = _InterlockedCompareExchange(&g_driver_activated, 0, 0);
+        HANDLE caller_pid = PsGetCurrentProcessId();
+
+        WW_LOG("SESSION_RESET: reason=%s prev_client=%lu caller_pid=%lu cleared_canaries=%lu had_session=%u heartbeat_counter=%lu activated=%ld last_hb=%lld server_token_time=%lld server_seed_set=%u ioctl_seed_set=%u cleanup_client=%u",
+            reason ? reason : "unknown",
+            static_cast<ULONG>(reinterpret_cast<ULONG_PTR>(prev_client)),
+            static_cast<ULONG>(reinterpret_cast<ULONG_PTR>(caller_pid)),
+            cleared_canaries,
+            session_key != 0 ? 1u : 0u,
+            heartbeat_counter,
+            activated,
+            last_hb,
+            server_token_time,
+            server_seed != 0 ? 1u : 0u,
+            ioctl_seed != 0 ? 1u : 0u,
+            cleanup_client ? 1u : 0u);
+
+        if (activated != 0 && (server_seed == 0 || ioctl_seed == 0)) {
+            WW_LOG("SESSION_RESET: SECURITY_FAILURE activated_without_seed reason=%s had_server_seed=%u had_ioctl_seed=%u heartbeat_counter=%lu",
+                reason ? reason : "unknown",
+                server_seed != 0 ? 1u : 0u,
+                ioctl_seed != 0 ? 1u : 0u,
+                heartbeat_counter);
+        }
+
+        _InterlockedExchange(reinterpret_cast<volatile LONG*>(&dynamic_key::g_server_seed), 0);
+        _InterlockedExchange(reinterpret_cast<volatile LONG*>(&dynamic_key::g_cached_key), 0);
+        _InterlockedExchange(reinterpret_cast<volatile LONG*>(&ioctl_codes::g_server_ioctl_seed), 0);
+        _InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_session_key), 0);
+        _InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_heartbeat_counter), 0);
+        _InterlockedExchange(&g_driver_activated, 0);
+        _InterlockedExchange64(&g_last_heartbeat_time, 0);
+        _InterlockedExchange64(&g_server_token_time, 0);
+        _InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_server_token_hash), 0);
+        caller_validation::unregister_client();
+        secure_comm::reset();
+
+        if (cleanup_client && prev_client) {
+            UINT32 prev_pid = static_cast<UINT32>(reinterpret_cast<ULONG_PTR>(prev_client));
+            ULONG cleanup_cleared = anti_dma_canary::cleanup_for_pid(prev_pid);
+            continuous_anti_debug::stop();
+            continuous_anti_dump::stop();
+            WW_LOG("SESSION_RESET: cleanup_done reason=%s prev_pid=%u canaries_cleared=%lu",
+                reason ? reason : "unknown",
+                prev_pid,
+                cleanup_cleared);
+        }
     }
 
     __forceinline BOOLEAN verify_dispatch_integrity(PDRIVER_OBJECT driver_obj) {
@@ -249,8 +389,7 @@ namespace dispatcher {
 
         LONG64 elapsed = current_time.QuadPart - last_hb;
         if (elapsed > HEARTBEAT_TIMEOUT) {
-            _InterlockedExchange(&g_driver_activated, 0);
-            caller_validation::unregister_client();
+            reset_dynamic_session_state("is_session_valid_timeout", caller_validation::g_registered_client_pid, 0, TRUE);
             return FALSE;
         }
 
@@ -258,9 +397,7 @@ namespace dispatcher {
         if (srv_time != 0) {
             LONG64 srv_elapsed = current_time.QuadPart - srv_time;
             if (srv_elapsed > SERVER_TOKEN_TIMEOUT) {
-                _InterlockedExchange64(&g_server_token_time, 0);
-                _InterlockedExchange(&g_driver_activated, 0);
-                caller_validation::unregister_client();
+                reset_dynamic_session_state("server_token_timeout", caller_validation::g_registered_client_pid, 0, TRUE);
                 return FALSE;
             }
         }
@@ -362,26 +499,108 @@ namespace dispatcher {
     __forceinline NTSTATUS Controller(PDEVICE_OBJECT device_object, PIRP irp) {
         UNREFERENCED_PARAMETER(device_object);
 
+        PIO_STACK_LOCATION early_stack = irp ? IoGetCurrentIrpStackLocation(irp) : nullptr;
+        const ULONG early_code = early_stack ? early_stack->Parameters.DeviceIoControl.IoControlCode : 0;
+        const ULONG early_input_size = early_stack ? early_stack->Parameters.DeviceIoControl.InputBufferLength : 0;
+        const ULONG early_output_size = early_stack ? early_stack->Parameters.DeviceIoControl.OutputBufferLength : 0;
+        const BOOLEAN hvdt_trace = is_hvdt_trace_candidate(early_code, early_input_size, early_output_size);
+        const LONG64 hvdt_trace_id = hvdt_trace ? next_hvdt_trace_id() : 0;
+        LARGE_INTEGER hvdt_dispatch_freq{};
+        LARGE_INTEGER hvdt_dispatch_start = KeQueryPerformanceCounter(&hvdt_dispatch_freq);
+        if (hvdt_trace) {
+            HVD_LOG_IMMEDIATE("dispatch_enter trace=%lld step=%lu code=0x%08lx hvdt_code=0x%08lx input_size=%lu output_size=%lu requestor=%u requestor_pid=%lu current_pid=%llu current_tid=%llu cpu=%lu irql=%lu buffer_present=%u device_present=%u",
+                hvdt_trace_id,
+                1u,
+                early_code,
+                ioctl_codes::HVDT(),
+                early_input_size,
+                early_output_size,
+                irp ? static_cast<ULONG>(irp->RequestorMode) : 0xffffffffu,
+                irp ? IoGetRequestorProcessId(irp) : 0,
+                handle_to_u64(PsGetCurrentProcessId()),
+                handle_to_u64(PsGetCurrentThreadId()),
+                KeGetCurrentProcessorNumber(),
+                (ULONG)KeGetCurrentIrql(),
+                (irp && irp->AssociatedIrp.SystemBuffer) ? 1u : 0u,
+                device_object ? 1u : 0u);
+            HVD_LOG_IMMEDIATE("dispatch_timing_noise_pre trace=%lld step=%lu elapsed_us=%llu cpu=%lu irql=%lu",
+                hvdt_trace_id, 2u, elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql());
+        }
         add_timing_noise();
+        if (hvdt_trace) {
+            HVD_LOG_IMMEDIATE("dispatch_timing_noise_post trace=%lld step=%lu elapsed_us=%llu cpu=%lu irql=%lu",
+                hvdt_trace_id, 3u, elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql());
+            HVD_LOG_IMMEDIATE("dispatch_scatter_pre trace=%lld step=%lu elapsed_us=%llu cpu=%lu irql=%lu",
+                hvdt_trace_id, 4u, elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql());
+        }
         scatter_kernel();
+        if (hvdt_trace) {
+            HVD_LOG_IMMEDIATE("dispatch_scatter_post trace=%lld step=%lu elapsed_us=%llu cpu=%lu irql=%lu",
+                hvdt_trace_id, 5u, elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql());
+            HVD_LOG_IMMEDIATE("dispatch_integrity_pre trace=%lld step=%lu device_present=%u driver_present=%u elapsed_us=%llu cpu=%lu irql=%lu",
+                hvdt_trace_id, 6u, device_object ? 1u : 0u,
+                (device_object && device_object->DriverObject) ? 1u : 0u,
+                elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql());
+        }
 
         if (device_object && !verify_dispatch_integrity(device_object->DriverObject)) {
+            if (hvdt_trace) {
+                HVD_LOG_IMMEDIATE("dispatch_integrity_post trace=%lld step=%lu ok=0 status=0x%08lx elapsed_us=%llu cpu=%lu irql=%lu",
+                    hvdt_trace_id, 7u, STATUS_ACCESS_DENIED,
+                    elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                    KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql());
+            }
             _InterlockedExchange(&g_driver_activated, 0);
             caller_validation::unregister_client();
             irp->IoStatus.Status = STATUS_ACCESS_DENIED;
             irp->IoStatus.Information = 0;
+            if (hvdt_trace)
+                complete_hvdt_trace_irp(irp, STATUS_ACCESS_DENIED, 0, hvdt_trace_id, "integrity_reject", hvdt_dispatch_start, hvdt_dispatch_freq);
             _IofCompleteRequest(irp, IO_NO_INCREMENT);
             return STATUS_ACCESS_DENIED;
         }
+        if (hvdt_trace) {
+            HVD_LOG_IMMEDIATE("dispatch_integrity_post trace=%lld step=%lu ok=1 elapsed_us=%llu cpu=%lu irql=%lu",
+                hvdt_trace_id, 7u, elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql());
+            HVD_LOG_IMMEDIATE("dispatch_rate_limit_pre trace=%lld step=%lu elapsed_us=%llu cpu=%lu irql=%lu",
+                hvdt_trace_id, 8u, elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql());
+        }
 
         if (!check_rate_limit()) {
+            if (hvdt_trace) {
+                HVD_LOG_IMMEDIATE("dispatch_rate_limit_post trace=%lld step=%lu ok=0 status=0x%08lx elapsed_us=%llu cpu=%lu irql=%lu",
+                    hvdt_trace_id, 9u, STATUS_DEVICE_BUSY,
+                    elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                    KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql());
+            }
             irp->IoStatus.Status = STATUS_DEVICE_BUSY;
             irp->IoStatus.Information = 0;
+            if (hvdt_trace)
+                complete_hvdt_trace_irp(irp, STATUS_DEVICE_BUSY, 0, hvdt_trace_id, "rate_limit_reject", hvdt_dispatch_start, hvdt_dispatch_freq);
             _IofCompleteRequest(irp, IO_NO_INCREMENT);
             return STATUS_DEVICE_BUSY;
         }
+        if (hvdt_trace) {
+            HVD_LOG_IMMEDIATE("dispatch_rate_limit_post trace=%lld step=%lu ok=1 elapsed_us=%llu cpu=%lu irql=%lu",
+                hvdt_trace_id, 9u, elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql());
+        }
 
+        if (hvdt_trace) {
+            HVD_LOG_IMMEDIATE("dispatch_sandbox_gate_pre trace=%lld step=%lu elapsed_us=%llu cpu=%lu irql=%lu",
+                hvdt_trace_id, 10u, elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql());
+        }
+        BOOLEAN hvdt_sandbox_checked = FALSE;
         if (malware_safe::any_sandboxed()) {
+            hvdt_sandbox_checked = TRUE;
             HANDLE caller_pid = PsGetCurrentProcessId();
             HANDLE client_pid = caller_validation::g_registered_client_pid;
             if (caller_pid != client_pid) {
@@ -393,6 +612,8 @@ namespace dispatcher {
                         (ULONG)(ULONG_PTR)caller_pid, sbx_flags, STATUS_ACCESS_DENIED);
                     irp->IoStatus.Status = STATUS_ACCESS_DENIED;
                     irp->IoStatus.Information = 0;
+                    if (hvdt_trace)
+                        complete_hvdt_trace_irp(irp, STATUS_ACCESS_DENIED, 0, hvdt_trace_id, "sandbox_reject", hvdt_dispatch_start, hvdt_dispatch_freq);
                     _IofCompleteRequest(irp, IO_NO_INCREMENT);
                     return STATUS_ACCESS_DENIED;
                 }
@@ -404,6 +625,15 @@ namespace dispatcher {
                         (ULONG)(ULONG_PTR)caller_pid, sbx_flags_self);
                 }
             }
+        }
+        if (hvdt_trace) {
+            HVD_LOG_IMMEDIATE("dispatch_sandbox_gate_post trace=%lld step=%lu sandbox_present=%u elapsed_us=%llu cpu=%lu irql=%lu",
+                hvdt_trace_id, 11u, hvdt_sandbox_checked ? 1u : 0u,
+                elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql());
+            HVD_LOG_IMMEDIATE("dispatch_heartbeat_timeout_pre trace=%lld step=%lu elapsed_us=%llu cpu=%lu irql=%lu",
+                hvdt_trace_id, 12u, elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql());
         }
 
 
@@ -417,23 +647,21 @@ namespace dispatcher {
                     WW_LOG("Controller: session timed out (elapsed=%lld > %lld), resetting dynamic state for reconnection",
                         elapsed, (LONG64)HEARTBEAT_TIMEOUT);
                     HANDLE prev_client = caller_validation::g_registered_client_pid;
-                    _InterlockedExchange(reinterpret_cast<volatile LONG*>(&dynamic_key::g_server_seed), 0);
-                    _InterlockedExchange(reinterpret_cast<volatile LONG*>(&dynamic_key::g_cached_key), 0);
-                    _InterlockedExchange(reinterpret_cast<volatile LONG*>(&ioctl_codes::g_server_ioctl_seed), 0);
-                    _InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_session_key), 0);
-                    _InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_heartbeat_counter), 0);
-                    _InterlockedExchange(&g_driver_activated, 0);
-                    _InterlockedExchange64(&g_last_heartbeat_time, 0);
-                    caller_validation::unregister_client();
-                    secure_comm::reset();
-                    if (prev_client) {
-                        UINT32 prev_pid = static_cast<UINT32>(reinterpret_cast<ULONG_PTR>(prev_client));
-                        anti_dma_canary::cleanup_for_pid(prev_pid);
-                        continuous_anti_debug::stop();
-                        continuous_anti_dump::stop();
-                    }
+                    reset_dynamic_session_state("controller_timeout", prev_client, 0, TRUE);
                 }
             }
+        }
+        if (hvdt_trace) {
+            HVD_LOG_IMMEDIATE("dispatch_heartbeat_timeout_post trace=%lld step=%lu activated=%ld last_hb_set=%u server_seed_set=%u ioctl_seed_set=%u elapsed_us=%llu cpu=%lu irql=%lu",
+                hvdt_trace_id,
+                13u,
+                _InterlockedCompareExchange(&g_driver_activated, 0, 0),
+                _InterlockedCompareExchange64(&g_last_heartbeat_time, 0, 0) != 0 ? 1u : 0u,
+                dynamic_key::g_server_seed != 0 ? 1u : 0u,
+                ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u,
+                elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                KeGetCurrentProcessorNumber(),
+                (ULONG)KeGetCurrentIrql());
         }
 
         NTSTATUS status = STATUS_INVALID_DEVICE_REQUEST;
@@ -450,6 +678,21 @@ namespace dispatcher {
         BOOLEAN secure_wrapped = FALSE;
         UINT64 secure_request_entropy = 0;
         UINT64 secure_request_id = 0;
+        if (hvdt_trace) {
+            HVD_LOG_IMMEDIATE("dispatch_stack_loaded trace=%lld step=%lu code=0x%08lx hvdt_match=%u input_size=%lu output_size=%lu buffer_present=%u requestor=%u requestor_pid=%lu elapsed_us=%llu cpu=%lu irql=%lu",
+                hvdt_trace_id,
+                14u,
+                code,
+                code == ioctl_codes::HVDT() ? 1u : 0u,
+                input_size,
+                output_size,
+                buffer ? 1u : 0u,
+                static_cast<ULONG>(irp->RequestorMode),
+                IoGetRequestorProcessId(irp),
+                elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                KeGetCurrentProcessorNumber(),
+                (ULONG)KeGetCurrentIrql());
+        }
 
         if (!buffer) {
             if (code == ioctl_codes::STRM() || code == ioctl_codes::CKIL()) {
@@ -458,6 +701,8 @@ namespace dispatcher {
             }
             irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
             irp->IoStatus.Information = 0;
+            if (hvdt_trace)
+                complete_hvdt_trace_irp(irp, STATUS_INVALID_PARAMETER, 0, hvdt_trace_id, "null_buffer", hvdt_dispatch_start, hvdt_dispatch_freq);
             _IofCompleteRequest(irp, IO_NO_INCREMENT);
             return STATUS_INVALID_PARAMETER;
         }
@@ -467,11 +712,37 @@ namespace dispatcher {
             ULONG hwid_bytes = static_cast<ULONG>(irp->IoStatus.Information);
             irp->IoStatus.Status = hwid_status;
             irp->IoStatus.Information = hwid_bytes;
+            if (hvdt_trace)
+                complete_hvdt_trace_irp(irp, hwid_status, hwid_bytes, hvdt_trace_id, "hwid_passthrough", hvdt_dispatch_start, hvdt_dispatch_freq);
             _IofCompleteRequest(irp, IO_NO_INCREMENT);
             return hwid_status;
         }
 
+        if (hvdt_trace) {
+            HVD_LOG_IMMEDIATE("dispatch_secure_gate trace=%lld step=%lu needs_secure=%u comm_initialized=%ld master_key_valid=%ld input_size=%lu output_size=%lu elapsed_us=%llu cpu=%lu irql=%lu",
+                hvdt_trace_id,
+                15u,
+                code != ioctl_codes::HB() ? 1u : 0u,
+                _InterlockedCompareExchange(&secure_comm::g_comm_initialized, 0, 0),
+                _InterlockedCompareExchange(&secure_comm::g_master_key_valid, 0, 0),
+                input_size,
+                output_size,
+                elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                KeGetCurrentProcessorNumber(),
+                (ULONG)KeGetCurrentIrql());
+        }
+
         if (code != ioctl_codes::HB() && secure_comm::g_comm_initialized != 0) {
+            if (hvdt_trace) {
+                HVD_LOG_IMMEDIATE("dispatch_secure_header_pre trace=%lld step=%lu input_size=%lu required=%lu elapsed_us=%llu cpu=%lu irql=%lu",
+                    hvdt_trace_id,
+                    16u,
+                    input_size,
+                    (ULONG)sizeof(secure_comm::SECURE_HEADER),
+                    elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                    KeGetCurrentProcessorNumber(),
+                    (ULONG)KeGetCurrentIrql());
+            }
             if (input_size < sizeof(secure_comm::SECURE_HEADER)) {
                 if (code == ioctl_codes::STRM() || code == ioctl_codes::CKIL()) {
                     WW_LOG("netaction::DISPATCH secure_header_too_small code=0x%08X input_size=%lu required=%lu",
@@ -479,6 +750,8 @@ namespace dispatcher {
                 }
                 irp->IoStatus.Status = STATUS_ACCESS_DENIED;
                 irp->IoStatus.Information = 0;
+                if (hvdt_trace)
+                    complete_hvdt_trace_irp(irp, STATUS_ACCESS_DENIED, 0, hvdt_trace_id, "secure_header_too_small", hvdt_dispatch_start, hvdt_dispatch_freq);
                 _IofCompleteRequest(irp, IO_NO_INCREMENT);
                 return STATUS_ACCESS_DENIED;
             }
@@ -487,11 +760,31 @@ namespace dispatcher {
             RtlCopyMemory(&sec_hdr, buffer, sizeof(sec_hdr));
             secure_request_entropy = sec_hdr.entropy;
             secure_request_id = sec_hdr.request_id;
+            if (hvdt_trace) {
+                HVD_LOG_IMMEDIATE("dispatch_secure_header_post trace=%lld step=%lu payload_size=%lu entropy_present=%u request_id_present=%u elapsed_us=%llu cpu=%lu irql=%lu",
+                    hvdt_trace_id,
+                    17u,
+                    sec_hdr.payload_size,
+                    secure_request_entropy != 0 ? 1u : 0u,
+                    secure_request_id != 0 ? 1u : 0u,
+                    elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                    KeGetCurrentProcessorNumber(),
+                    (ULONG)KeGetCurrentIrql());
+            }
 
             SIZE_T work_size = output_size > input_size ? output_size : input_size;
             if (work_size < sizeof(secure_comm::SECURE_HEADER))
                 work_size = sizeof(secure_comm::SECURE_HEADER);
 
+            if (hvdt_trace) {
+                HVD_LOG_IMMEDIATE("dispatch_secure_alloc_pre trace=%lld step=%lu work_size=%llu elapsed_us=%llu cpu=%lu irql=%lu",
+                    hvdt_trace_id,
+                    18u,
+                    static_cast<UINT64>(work_size),
+                    elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                    KeGetCurrentProcessorNumber(),
+                    (ULONG)KeGetCurrentIrql());
+            }
             secure_work_buffer = ExAllocatePool2(POOL_FLAG_NON_PAGED, work_size, 'mocS');
             if (!secure_work_buffer) {
                 if (code == ioctl_codes::STRM() || code == ioctl_codes::CKIL()) {
@@ -500,29 +793,95 @@ namespace dispatcher {
                 }
                 irp->IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
                 irp->IoStatus.Information = 0;
+                if (hvdt_trace)
+                    complete_hvdt_trace_irp(irp, STATUS_INSUFFICIENT_RESOURCES, 0, hvdt_trace_id, "secure_alloc_failed", hvdt_dispatch_start, hvdt_dispatch_freq);
                 _IofCompleteRequest(irp, IO_NO_INCREMENT);
                 return STATUS_INSUFFICIENT_RESOURCES;
             }
+            if (hvdt_trace) {
+                HVD_LOG_IMMEDIATE("dispatch_secure_alloc_post trace=%lld step=%lu ok=1 work_size=%llu elapsed_us=%llu cpu=%lu irql=%lu",
+                    hvdt_trace_id,
+                    19u,
+                    static_cast<UINT64>(work_size),
+                    elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                    KeGetCurrentProcessorNumber(),
+                    (ULONG)KeGetCurrentIrql());
+            }
 
             SIZE_T plain_size = 0;
+            if (hvdt_trace) {
+                HVD_LOG_IMMEDIATE("dispatch_secure_decrypt_pre trace=%lld step=%lu input_size=%lu work_size=%llu elapsed_us=%llu cpu=%lu irql=%lu",
+                    hvdt_trace_id,
+                    20u,
+                    input_size,
+                    static_cast<UINT64>(work_size),
+                    elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                    KeGetCurrentProcessorNumber(),
+                    (ULONG)KeGetCurrentIrql());
+            }
             if (!secure_comm::decrypt_request(buffer, input_size,
                 secure_work_buffer, work_size, &plain_size)) {
                 if (code == ioctl_codes::STRM() || code == ioctl_codes::CKIL()) {
                     WW_LOG("netaction::DISPATCH secure_decrypt_failed code=0x%08X input_size=%lu work_size=%llu",
                         code, input_size, (ULONG64)work_size);
                 }
+                if (hvdt_trace) {
+                    HVD_LOG_IMMEDIATE("dispatch_secure_decrypt_post trace=%lld step=%lu ok=0 status=0x%08lx plain_size=%llu elapsed_us=%llu cpu=%lu irql=%lu",
+                        hvdt_trace_id,
+                        21u,
+                        STATUS_ACCESS_DENIED,
+                        static_cast<UINT64>(plain_size),
+                        elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                        KeGetCurrentProcessorNumber(),
+                        (ULONG)KeGetCurrentIrql());
+                }
                 ExFreePoolWithTag(secure_work_buffer, 'mocS');
                 irp->IoStatus.Status = STATUS_ACCESS_DENIED;
                 irp->IoStatus.Information = 0;
+                if (hvdt_trace)
+                    complete_hvdt_trace_irp(irp, STATUS_ACCESS_DENIED, 0, hvdt_trace_id, "secure_decrypt_failed", hvdt_dispatch_start, hvdt_dispatch_freq);
                 _IofCompleteRequest(irp, IO_NO_INCREMENT);
                 return STATUS_ACCESS_DENIED;
+            }
+            if (hvdt_trace) {
+                HVD_LOG_IMMEDIATE("dispatch_secure_decrypt_post trace=%lld step=%lu ok=1 plain_size=%llu elapsed_us=%llu cpu=%lu irql=%lu",
+                    hvdt_trace_id,
+                    21u,
+                    static_cast<UINT64>(plain_size),
+                    elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                    KeGetCurrentProcessorNumber(),
+                    (ULONG)KeGetCurrentIrql());
             }
 
             buffer = secure_work_buffer;
             secure_wrapped = TRUE;
         }
+        else if (hvdt_trace) {
+            HVD_LOG_IMMEDIATE("dispatch_secure_skip trace=%lld step=%lu secure_wrapped=0 comm_initialized=%ld elapsed_us=%llu cpu=%lu irql=%lu",
+                hvdt_trace_id,
+                22u,
+                _InterlockedCompareExchange(&secure_comm::g_comm_initialized, 0, 0),
+                elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                KeGetCurrentProcessorNumber(),
+                (ULONG)KeGetCurrentIrql());
+        }
 
-        if (code != ioctl_codes::HB() && code != ioctl_codes::SRVT() && code != ioctl_codes::SRV2() && !is_session_valid()) {
+        if (hvdt_trace) {
+            HVD_LOG_IMMEDIATE("dispatch_session_validate_pre trace=%lld step=%lu code=0x%08lx activated=%ld registered_pid=%llu secure_wrapped=%u elapsed_us=%llu cpu=%lu irql=%lu",
+                hvdt_trace_id,
+                23u,
+                code,
+                _InterlockedCompareExchange(&g_driver_activated, 0, 0),
+                handle_to_u64(caller_validation::g_registered_client_pid),
+                secure_wrapped ? 1u : 0u,
+                elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                KeGetCurrentProcessorNumber(),
+                (ULONG)KeGetCurrentIrql());
+        }
+        BOOLEAN hvdt_session_ok = TRUE;
+        if (code != ioctl_codes::HB() && code != ioctl_codes::SRVT() && code != ioctl_codes::SRV2())
+            hvdt_session_ok = is_session_valid();
+        if (code != ioctl_codes::HB() && code != ioctl_codes::SRVT() && code != ioctl_codes::SRV2() && !hvdt_session_ok) {
             if (code == ioctl_codes::STRM() || code == ioctl_codes::CKIL()) {
                 WW_LOG("netaction::DISPATCH session_invalid code=0x%08X g_driver_activated=%ld",
                     code, _InterlockedCompareExchange(&g_driver_activated, 0, 0));
@@ -531,11 +890,44 @@ namespace dispatcher {
                 ExFreePoolWithTag(secure_work_buffer, 'mocS');
             irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
             irp->IoStatus.Information = 0;
+            if (hvdt_trace) {
+                HVD_LOG_IMMEDIATE("dispatch_session_validate_post trace=%lld step=%lu ok=0 status=0x%08lx elapsed_us=%llu cpu=%lu irql=%lu",
+                    hvdt_trace_id,
+                    24u,
+                    STATUS_INVALID_DEVICE_REQUEST,
+                    elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                    KeGetCurrentProcessorNumber(),
+                    (ULONG)KeGetCurrentIrql());
+                complete_hvdt_trace_irp(irp, STATUS_INVALID_DEVICE_REQUEST, 0, hvdt_trace_id, "session_invalid", hvdt_dispatch_start, hvdt_dispatch_freq);
+            }
             _IofCompleteRequest(irp, IO_NO_INCREMENT);
             return STATUS_INVALID_DEVICE_REQUEST;
         }
+        if (hvdt_trace) {
+            HVD_LOG_IMMEDIATE("dispatch_session_validate_post trace=%lld step=%lu ok=%u elapsed_us=%llu cpu=%lu irql=%lu",
+                hvdt_trace_id,
+                24u,
+                hvdt_session_ok ? 1u : 0u,
+                elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                KeGetCurrentProcessorNumber(),
+                (ULONG)KeGetCurrentIrql());
+            HVD_LOG_IMMEDIATE("dispatch_post_session_timing_pre trace=%lld step=%lu elapsed_us=%llu cpu=%lu irql=%lu",
+                hvdt_trace_id,
+                25u,
+                elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                KeGetCurrentProcessorNumber(),
+                (ULONG)KeGetCurrentIrql());
+        }
 
         add_timing_noise();
+        if (hvdt_trace) {
+            HVD_LOG_IMMEDIATE("dispatch_post_session_timing_post trace=%lld step=%lu elapsed_us=%llu cpu=%lu irql=%lu",
+                hvdt_trace_id,
+                26u,
+                elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                KeGetCurrentProcessorNumber(),
+                (ULONG)KeGetCurrentIrql());
+        }
 
         if (code == ioctl_codes::PRW()) {
             if (input_size >= sizeof(_PRW) && output_size >= sizeof(_PRW)) {
@@ -1041,10 +1433,14 @@ namespace dispatcher {
                     ULONG expected_hash = srvt->token_hash ^ dynamic_key::get() ^ (ULONG)(srvt->server_nonce & 0xFFFFFFFFu);
                     _InterlockedExchange((volatile LONG*)&g_server_token_hash, (LONG)expected_hash);
                     _InterlockedExchange64(&g_server_token_time, current_time.QuadPart);
+                    activate_server_seed_state(srvt->server_nonce, srvt->token_hash, srvt->session_key);
                     _InterlockedExchange(&g_driver_activated, 1);
                     _InterlockedExchange64(&g_last_heartbeat_time, current_time.QuadPart);
 
                     srvt->result = 1;
+                    WW_LOG("SRVT: activation accepted server_seed_set=%u ioctl_seed_set=%u",
+                        dynamic_key::g_server_seed != 0 ? 1u : 0u,
+                        ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u);
                     status = STATUS_SUCCESS;
                 } else {
                     srvt->result = 0;
@@ -1057,32 +1453,57 @@ namespace dispatcher {
         else if (code == ioctl_codes::HB()) {
             if (input_size >= sizeof(_HB) && output_size >= sizeof(_HB)) {
                 p_heartbeat hb = (p_heartbeat)buffer;
+                LARGE_INTEGER current_time;
+                KeQuerySystemTime(&current_time);
 
                 ULONG expectedMagic = get_heartbeat_magic();
+                LONG in_flight = _InterlockedIncrement(&g_heartbeat_inflight);
+                if (in_flight > 1) {
+                    _InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_heartbeat_reentrant));
+                }
 
-                WW_LOG("HB: received magic=0x%lx expected=0x%lx session_key=0x%lx",
-                    hb->magic, expectedMagic, hb->session_key);
+                LONG64 previous_hb = _InterlockedCompareExchange64(&g_last_heartbeat_time, 0, 0);
+                LONG64 hb_interval = previous_hb != 0 ? current_time.QuadPart - previous_hb : -1;
+                ULONG fast_intervals = static_cast<ULONG>(
+                    _InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(&g_heartbeat_fast_intervals), 0, 0));
+                if (hb_interval >= 0 && hb_interval < HEARTBEAT_LOG_INTERVAL) {
+                    fast_intervals = static_cast<ULONG>(
+                        _InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_heartbeat_fast_intervals)));
+                }
+                ULONG suppressed_hb_logs = 0;
+                BOOLEAN log_hb = should_log_heartbeat(current_time.QuadPart, &suppressed_hb_logs);
+
+                if (log_hb) {
+                    WW_LOG("HB: received magic_match=%u session_present=%u in_flight=%ld suppressed=%lu interval_100ns=%lld fast_intervals=%lu reentrant=%lu activated=%ld server_seed_set=%u ioctl_seed_set=%u",
+                        hb->magic == expectedMagic ? 1u : 0u,
+                        hb->session_key != 0 ? 1u : 0u,
+                        in_flight,
+                        suppressed_hb_logs,
+                        hb_interval,
+                        fast_intervals,
+                        static_cast<ULONG>(_InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(&g_heartbeat_reentrant), 0, 0)),
+                        _InterlockedCompareExchange(&g_driver_activated, 0, 0),
+                        dynamic_key::g_server_seed != 0 ? 1u : 0u,
+                        ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u);
+                }
 
                 if (hb->magic == expectedMagic) {
                     {
-                        LARGE_INTEGER current_time;
-                        KeQuerySystemTime(&current_time);
-
                         LONG existing_key = _InterlockedCompareExchange((volatile LONG*)&g_session_key, (LONG)hb->session_key, 0);
                         if (existing_key != 0 && (ULONG)existing_key != hb->session_key) {
-                            WW_LOG("HB: session key mismatch existing=0x%lx new=0x%lx, resetting",
-                                (ULONG)existing_key, hb->session_key);
+                            WW_LOG("HB: session key mismatch, resetting");
                             HANDLE prev_client = caller_validation::g_registered_client_pid;
-                            caller_validation::unregister_client();
-                            _InterlockedExchange((volatile LONG*)&g_session_key, 0);
-                            _InterlockedExchange((volatile LONG*)&g_heartbeat_counter, 0);
-                            _InterlockedExchange(&g_driver_activated, 0);
-                            if (prev_client) {
-                                UINT32 prev_pid = static_cast<UINT32>(reinterpret_cast<ULONG_PTR>(prev_client));
-                                anti_dma_canary::cleanup_for_pid(prev_pid);
-                                continuous_anti_debug::stop();
-                                continuous_anti_dump::stop();
-                            }
+                            LONG64 last_hb_snapshot = _InterlockedCompareExchange64(&g_last_heartbeat_time, 0, 0);
+                            LONG64 mismatch_elapsed = current_time.QuadPart - last_hb_snapshot;
+                            HANDLE caller_pid = PsGetCurrentProcessId();
+                            WW_LOG("HB: mismatch_context caller_pid=%lu registered_pid=%lu elapsed_since_last_hb=%lld heartbeat_counter=%lu activated=%ld validation_enabled=%ld",
+                                static_cast<ULONG>(reinterpret_cast<ULONG_PTR>(caller_pid)),
+                                static_cast<ULONG>(reinterpret_cast<ULONG_PTR>(prev_client)),
+                                last_hb_snapshot != 0 ? mismatch_elapsed : -1,
+                                g_heartbeat_counter,
+                                g_driver_activated,
+                                caller_validation::g_validation_enabled);
+                            reset_dynamic_session_state("heartbeat_key_mismatch", prev_client, 0, TRUE);
                             existing_key = _InterlockedCompareExchange((volatile LONG*)&g_session_key, (LONG)hb->session_key, 0);
                         }
 
@@ -1090,7 +1511,6 @@ namespace dispatcher {
                             _InterlockedExchange64(&g_last_heartbeat_time, current_time.QuadPart);
                             _InterlockedIncrement((volatile LONG*)&g_heartbeat_counter);
                             sentinel_bridge::tick();
-                            _InterlockedExchange(&g_driver_activated, 1);
                             hb->whoswho_tsc = (UINT64)sentinel_bridge::g_bridge.whoswho_tsc;
                             hb->sentinel_tsc = (UINT64)sentinel_bridge::g_bridge.sentinel_tsc;
 
@@ -1111,14 +1531,18 @@ namespace dispatcher {
                             hb->response = (UINT64)g_heartbeat_counter ^ dynamic_key::get();
 
 
-                            WW_LOG("HB: OK counter=%ld activated=%ld bridge_whoswho_tsc=%lld bridge_sentinel_tsc=%lld",
-                                g_heartbeat_counter, g_driver_activated,
-                                sentinel_bridge::g_bridge.whoswho_tsc,
-                                sentinel_bridge::g_bridge.sentinel_tsc);
+                            if (log_hb) {
+                                WW_LOG("HB: OK counter=%ld activated=%ld bridge_whoswho_seen=%u bridge_sentinel_seen=%u",
+                                    g_heartbeat_counter,
+                                    _InterlockedCompareExchange(&g_driver_activated, 0, 0),
+                                    sentinel_bridge::g_bridge.whoswho_tsc != 0 ? 1u : 0u,
+                                    sentinel_bridge::g_bridge.sentinel_tsc != 0 ? 1u : 0u);
+                            }
                             status = STATUS_SUCCESS;
                         } else {
-                            WW_LOG("HB: ACCESS_DENIED existing_key=0x%lx hb_key=0x%lx",
-                                (ULONG)existing_key, hb->session_key);
+                            if (log_hb) {
+                                WW_LOG("HB: ACCESS_DENIED session_mismatch=1");
+                            }
                             hb->response = 0;
                             hb->whoswho_tsc = 0;
                             hb->sentinel_tsc = 0;
@@ -1126,12 +1550,15 @@ namespace dispatcher {
                         }
                     }
                 } else {
-                    WW_LOG("HB: INVALID_PARAMETER magic mismatch");
+                    if (log_hb) {
+                        WW_LOG("HB: INVALID_PARAMETER magic mismatch");
+                    }
                     hb->response = 0;
                     hb->whoswho_tsc = 0;
                     hb->sentinel_tsc = 0;
                     status = STATUS_INVALID_PARAMETER;
                 }
+                _InterlockedDecrement(&g_heartbeat_inflight);
                 bytes = sizeof(_HB);
             }
             else {
@@ -1148,7 +1575,16 @@ namespace dispatcher {
         }
         else if (code == ioctl_codes::SRV2()) {
             if (input_size >= sizeof(server_token_relay_v2) && output_size >= sizeof(server_token_relay_v2)) {
-                status = functions::handle_server_token_v2((p_server_token_relay_v2)buffer);
+                auto* srvt2 = (p_server_token_relay_v2)buffer;
+                status = functions::handle_server_token_v2(srvt2);
+                if (NT_SUCCESS(status) && srvt2->result == 1) {
+                    activate_server_seed_state(srvt2->server_nonce, srvt2->token_hash, srvt2->session_key);
+                    _InterlockedExchange(&g_driver_activated, 1);
+                    WW_LOG("SRVT2: activation accepted server_seed_set=%u ioctl_seed_set=%u proof_set=%u",
+                        dynamic_key::g_server_seed != 0 ? 1u : 0u,
+                        ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u,
+                        srvt2->driver_proof != 0 ? 1u : 0u);
+                }
 
 
                 bytes = sizeof(server_token_relay_v2);
@@ -1170,20 +1606,6 @@ namespace dispatcher {
                     UINT32 flags = 0;
                     BOOLEAN kd_now = anti_debug::kd_transitioned_to_enabled();
                     if (kd_now) flags |= 0x1;
-
-                    PEPROCESS proc = nullptr;
-                    if (pid != 0 &&
-                        NT_SUCCESS(PsLookupProcessByProcessId(
-                            reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(pid)), &proc)) &&
-                        proc) {
-                        PVOID debug_port = nullptr;
-                        __try {
-                            debug_port = *reinterpret_cast<PVOID*>(
-                                reinterpret_cast<UCHAR*>(proc) + 0x578);
-                        } __except (EXCEPTION_EXECUTE_HANDLER) { debug_port = nullptr; }
-                        if (debug_port) flags |= 0x2;
-                        ObDereferenceObject(proc);
-                    }
 
                     if (flags != 0) {
                         sentinel_bridge::populate_evidence_blob(
@@ -1218,9 +1640,7 @@ namespace dispatcher {
                 output_size >= sizeof(phase3_msg::canary_register_request_k)) {
                 auto* req = reinterpret_cast<phase3_msg::canary_register_request_k*>(buffer);
                 if (req->session_key != g_session_key) {
-                    WW_LOG("CANR: ACCESS_DENIED session_key=0x%lx expected=0x%lx va=0x%llx size=0x%llx pid=%u",
-                        req->session_key,
-                        g_session_key,
+                    WW_LOG("CANR: ACCESS_DENIED session_match=0 va=0x%llx size=0x%llx pid=%u",
                         static_cast<unsigned long long>(req->va),
                         static_cast<unsigned long long>(req->size),
                         req->pid);
@@ -1239,12 +1659,11 @@ namespace dispatcher {
                         req->result = 0;
                         status = STATUS_ACCESS_DENIED;
                     } else {
-                        WW_LOG("CANR: request va=0x%llx size=0x%llx requested_pid=%u resolved_pid=%lu session=0x%lx count_before=%lu",
+                        WW_LOG("CANR: request va=0x%llx size=0x%llx requested_pid=%u resolved_pid=%lu session_match=1 count_before=%lu",
                             static_cast<unsigned long long>(req->va),
                             static_cast<unsigned long long>(req->size),
                             req->pid,
                             pid,
-                            req->session_key,
                             anti_dma_canary::g_canary_count);
                         req->result = anti_dma_canary::register_canary(req->va, req->size, pid) ? 1u : 0u;
                         WW_LOG("CANR: result=%u resolved_pid=%lu count_after=%lu",
@@ -1324,17 +1743,180 @@ namespace dispatcher {
             } else { status = STATUS_INFO_LENGTH_MISMATCH; }
         }
         else if (code == ioctl_codes::HVDT()) {
+            LARGE_INTEGER hvdt_start;
+            LARGE_INTEGER hvdt_freq;
+            hvdt_start = KeQueryPerformanceCounter(&hvdt_freq);
+            UINT64 hvdt_tsc = __rdtsc();
+            HANDLE hvdt_pid = PsGetCurrentProcessId();
+            HANDLE hvdt_tid = PsGetCurrentThreadId();
+            KPROCESSOR_MODE hvdt_requestor = irp->RequestorMode;
+            HVD_LOG_IMMEDIATE("branch_enter trace=%lld step=%lu input_size=%lu output_size=%lu requestor=%u requestor_pid=%lu caller_pid=%llu caller_tid=%llu qpc=%lld tsc=%llu cpu=%lu irql=%lu secure_wrapped=%u elapsed_us=%llu",
+                hvdt_trace_id,
+                27u,
+                input_size,
+                output_size,
+                static_cast<ULONG>(hvdt_requestor),
+                IoGetRequestorProcessId(irp),
+                handle_to_u64(hvdt_pid),
+                handle_to_u64(hvdt_tid),
+                hvdt_start.QuadPart,
+                hvdt_tsc,
+                KeGetCurrentProcessorNumber(),
+                (ULONG)KeGetCurrentIrql(),
+                secure_wrapped ? 1u : 0u,
+                elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq));
+            HVD_LOG_IMMEDIATE("branch_size_gate_pre trace=%lld step=%lu input_size=%lu output_size=%lu required_in=%lu required_out=%lu elapsed_us=%llu cpu=%lu irql=%lu",
+                hvdt_trace_id,
+                28u,
+                input_size,
+                output_size,
+                (ULONG)sizeof(hv_detect_request_k),
+                (ULONG)sizeof(hv_detect_result_k),
+                elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                KeGetCurrentProcessorNumber(),
+                (ULONG)KeGetCurrentIrql());
             if (input_size >= sizeof(hv_detect_request_k) &&
                 output_size >= sizeof(hv_detect_result_k)) {
                 auto* req = reinterpret_cast<hv_detect_request_k*>(buffer);
-                UNREFERENCED_PARAMETER(req);
                 hv_detect_result_k result_buf{};
-                status = hv_detect::handle_request(req, &result_buf);
-                if (NT_SUCCESS(status)) {
-                    RtlCopyMemory(buffer, &result_buf, sizeof(hv_detect_result_k));
+                const ULONG hvdt_irql = (ULONG)KeGetCurrentIrql();
+                const UINT64 hvdt_rflags = __readeflags();
+                HVD_LOG_IMMEDIATE("branch_precondition trace=%lld step=%lu flags=0x%llx passive=%u interrupts_enabled=%u requestor_pid=%lu secure_wrapped=%u elapsed_us=%llu cpu=%lu irql=%lu",
+                    hvdt_trace_id,
+                    29u,
+                    req->flags,
+                    hvdt_irql == PASSIVE_LEVEL ? 1u : 0u,
+                    (hvdt_rflags & 0x200ULL) != 0 ? 1u : 0u,
+                    IoGetRequestorProcessId(irp),
+                    secure_wrapped ? 1u : 0u,
+                    elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                    KeGetCurrentProcessorNumber(),
+                    hvdt_irql);
+                if (hvdt_irql != PASSIVE_LEVEL || (hvdt_rflags & 0x200ULL) == 0) {
+                    status = STATUS_INVALID_DEVICE_STATE;
+                    bytes = 0;
+                    HVD_LOG_IMMEDIATE("branch_precondition_reject trace=%lld step=%lu status=0x%08lx flags=0x%llx passive=%u interrupts_enabled=%u elapsed_us=%llu cpu=%lu irql=%lu",
+                        hvdt_trace_id,
+                        30u,
+                        status,
+                        req->flags,
+                        hvdt_irql == PASSIVE_LEVEL ? 1u : 0u,
+                        (hvdt_rflags & 0x200ULL) != 0 ? 1u : 0u,
+                        elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                        KeGetCurrentProcessorNumber(),
+                        hvdt_irql);
+                } else {
+                    HVD_LOG_IMMEDIATE("handle_request_pre trace=%lld step=%lu flags=0x%llx elapsed_us=%llu cpu=%lu irql=%lu",
+                        hvdt_trace_id,
+                        31u,
+                        req->flags,
+                        elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                        KeGetCurrentProcessorNumber(),
+                        (ULONG)KeGetCurrentIrql());
+                    status = hv_detect::handle_request(req, &result_buf);
+                    HVD_LOG_IMMEDIATE("handle_request_post trace=%lld step=%lu status=0x%08lx total_run=%u total_failed=%u is_vm=%u ms_hv_root=%u elapsed_us=%llu cpu=%lu irql=%lu",
+                        hvdt_trace_id,
+                        32u,
+                        status,
+                        result_buf.total_run,
+                        result_buf.total_failed,
+                        result_buf.is_virtual_machine,
+                        result_buf.ms_hv_root,
+                        elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                        KeGetCurrentProcessorNumber(),
+                        (ULONG)KeGetCurrentIrql());
+                    if (NT_SUCCESS(status)) {
+                        HVD_LOG_IMMEDIATE("branch_copy_result_pre trace=%lld step=%lu bytes=%lu elapsed_us=%llu cpu=%lu irql=%lu",
+                            hvdt_trace_id,
+                            33u,
+                            (ULONG)sizeof(hv_detect_result_k),
+                            elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                            KeGetCurrentProcessorNumber(),
+                            (ULONG)KeGetCurrentIrql());
+                        RtlCopyMemory(buffer, &result_buf, sizeof(hv_detect_result_k));
+                        bytes = sizeof(hv_detect_result_k);
+                        HVD_LOG_IMMEDIATE("branch_copy_result_post trace=%lld step=%lu bytes=%lu elapsed_us=%llu cpu=%lu irql=%lu",
+                            hvdt_trace_id,
+                            34u,
+                            bytes,
+                            elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                            KeGetCurrentProcessorNumber(),
+                            (ULONG)KeGetCurrentIrql());
+                    } else {
+                        bytes = 0;
+                    }
                 }
-                bytes = sizeof(hv_detect_result_k);
-            } else { status = STATUS_INFO_LENGTH_MISMATCH; }
+                LARGE_INTEGER hvdt_end = KeQueryPerformanceCounter(nullptr);
+                UINT64 hvdt_elapsed_us = 0;
+                if (hvdt_freq.QuadPart > 0 && hvdt_end.QuadPart >= hvdt_start.QuadPart) {
+                    hvdt_elapsed_us = static_cast<UINT64>(((hvdt_end.QuadPart - hvdt_start.QuadPart) * 1000000ULL) / static_cast<UINT64>(hvdt_freq.QuadPart));
+                }
+                HVD_LOG_IMMEDIATE("branch_exit trace=%lld step=%lu status=0x%08lx bytes=%lu flags=0x%llx total_run=%u total_failed=%u is_vm=%u ms_hv_root=%u sidt=%u%u%u%u%u%u%u%u%u lidt=%u%u%u%u%u%u%u ve=%u%u%u%u vmf=%u%u%u%u%u%u%u%u elapsed_us=%llu dispatch_elapsed_us=%llu qpc=%lld tsc=%llu cpu=%lu irql=%lu",
+                    hvdt_trace_id,
+                    35u,
+                    status,
+                    bytes,
+                    req->flags,
+                    result_buf.total_run,
+                    result_buf.total_failed,
+                    result_buf.is_virtual_machine,
+                    result_buf.ms_hv_root,
+                    result_buf.sidt_lock_prefix,
+                    result_buf.sidt_invalid_pf,
+                    result_buf.sidt_tlb_only,
+                    result_buf.sidt_timing,
+                    result_buf.sidt_compat_mode,
+                    result_buf.sidt_noncanonical_gp,
+                    result_buf.sidt_noncanonical_ss,
+                    result_buf.sidt_cpl3_umip_off,
+                    result_buf.sidt_cpl3_umip_on,
+                    result_buf.lidt_lock_prefix,
+                    result_buf.lidt_invalid_pf,
+                    result_buf.lidt_tlb_only,
+                    result_buf.lidt_timing,
+                    result_buf.lidt_noncanonical_gp,
+                    result_buf.lidt_noncanonical_ss,
+                    result_buf.lidt_cpl3_gp,
+                    result_buf.ve_trigger,
+                    result_buf.ve_lbr_stack,
+                    result_buf.ve_xsetbv_gp,
+                    result_buf.ve_cr4_vmxe,
+                    result_buf.vmf_cpuid_vendor,
+                    result_buf.vmf_hyperv_guest,
+                    result_buf.vmf_smbios_vm,
+                    result_buf.vmf_acpi_vm,
+                    result_buf.vmf_pci_vm,
+                    result_buf.vmf_disk_vm,
+                    result_buf.vmf_mac_vm,
+                    result_buf.vmf_registry_vm,
+                    hvdt_elapsed_us,
+                    elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                    hvdt_end.QuadPart,
+                    __rdtsc(),
+                    KeGetCurrentProcessorNumber(),
+                    (ULONG)KeGetCurrentIrql());
+            } else {
+                status = STATUS_INFO_LENGTH_MISMATCH;
+                LARGE_INTEGER hvdt_end = KeQueryPerformanceCounter(nullptr);
+                UINT64 hvdt_elapsed_us = 0;
+                if (hvdt_freq.QuadPart > 0 && hvdt_end.QuadPart >= hvdt_start.QuadPart) {
+                    hvdt_elapsed_us = static_cast<UINT64>(((hvdt_end.QuadPart - hvdt_start.QuadPart) * 1000000ULL) / static_cast<UINT64>(hvdt_freq.QuadPart));
+                }
+                HVD_LOG_IMMEDIATE("branch_reject trace=%lld step=%lu status=0x%08lx input_size=%lu output_size=%lu required_in=%lu required_out=%lu elapsed_us=%llu dispatch_elapsed_us=%llu qpc=%lld tsc=%llu cpu=%lu irql=%lu",
+                    hvdt_trace_id,
+                    36u,
+                    status,
+                    input_size,
+                    output_size,
+                    (ULONG)sizeof(hv_detect_request_k),
+                    (ULONG)sizeof(hv_detect_result_k),
+                    hvdt_elapsed_us,
+                    elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                    hvdt_end.QuadPart,
+                    __rdtsc(),
+                    KeGetCurrentProcessorNumber(),
+                    (ULONG)KeGetCurrentIrql());
+            }
         }
         else if (code == ioctl_codes::RELA()) {
             if (input_size >= sizeof(phase3_msg::latch_targeting_request_k)) {
@@ -1371,8 +1953,8 @@ namespace dispatcher {
                 output_size >= sizeof(protect_sandbox_request_k)) {
                 auto* req = reinterpret_cast<protect_sandbox_request_k*>(buffer);
                 ULONG expected_magic = g_session_key ^ dynamic_key::get() ^ 0x5A4E0B01u;
-                WW_MALSAFE_LOG_INFO("ioctl PSBX req pid=%lu flags=0x%08X magic=0x%lX expected=0x%lX session=0x%lX g_session=0x%lX",
-                    req->pid, req->flags, req->magic, expected_magic, req->session_key, g_session_key);
+                WW_MALSAFE_LOG_INFO("ioctl PSBX req pid=%lu flags=0x%08X magic_match=%u session_match=%u",
+                    req->pid, req->flags, req->magic == expected_magic ? 1u : 0u, req->session_key == g_session_key ? 1u : 0u);
                 if (req->magic == expected_magic && req->session_key == g_session_key) {
                     LONG64 denials = 0;
                     bool ok = malware_safe::protect_pid(req->pid, req->flags, &denials);
@@ -1382,8 +1964,8 @@ namespace dispatcher {
                     WW_MALSAFE_LOG_INFO("ioctl PSBX EXIT pid=%lu flags=0x%08X result=%d denials=%llu status=0x%08X",
                         req->pid, req->flags, ok ? 1 : 0, (unsigned long long)req->denials_so_far, (ULONG)status);
                 } else {
-                    WW_MALSAFE_LOG_WARN("ioctl PSBX REJECTED auth_fail caller=%lu req_pid=%lu magic=0x%lX expected=0x%lX session=0x%lX g_session=0x%lX",
-                        psbx_caller_pid, req->pid, req->magic, expected_magic, req->session_key, g_session_key);
+                    WW_MALSAFE_LOG_WARN("ioctl PSBX REJECTED auth_fail caller=%lu req_pid=%lu magic_match=%u session_match=%u",
+                        psbx_caller_pid, req->pid, req->magic == expected_magic ? 1u : 0u, req->session_key == g_session_key ? 1u : 0u);
                     status = STATUS_ACCESS_DENIED;
                 }
                 bytes = sizeof(protect_sandbox_request_k);
@@ -1410,8 +1992,8 @@ namespace dispatcher {
                 output_size >= sizeof(protect_sandbox_request_k)) {
                 auto* req = reinterpret_cast<protect_sandbox_request_k*>(buffer);
                 ULONG expected_magic = g_session_key ^ dynamic_key::get() ^ 0x5A4E0B02u;
-                WW_MALSAFE_LOG_INFO("ioctl USBX req pid=%lu magic=0x%lX expected=0x%lX session=0x%lX g_session=0x%lX",
-                    req->pid, req->magic, expected_magic, req->session_key, g_session_key);
+                WW_MALSAFE_LOG_INFO("ioctl USBX req pid=%lu magic_match=%u session_match=%u",
+                    req->pid, req->magic == expected_magic ? 1u : 0u, req->session_key == g_session_key ? 1u : 0u);
                 if (req->magic == expected_magic && req->session_key == g_session_key) {
                     LONG64 denials = 0;
                     bool ok = malware_safe::unprotect_pid(req->pid, &denials);
@@ -1421,8 +2003,8 @@ namespace dispatcher {
                     WW_MALSAFE_LOG_INFO("ioctl USBX EXIT pid=%lu result=%d denials=%llu status=0x%08X",
                         req->pid, ok ? 1 : 0, (unsigned long long)req->denials_so_far, (ULONG)status);
                 } else {
-                    WW_MALSAFE_LOG_WARN("ioctl USBX REJECTED auth_fail caller=%lu req_pid=%lu magic=0x%lX expected=0x%lX session=0x%lX g_session=0x%lX",
-                        usbx_caller_pid, req->pid, req->magic, expected_magic, req->session_key, g_session_key);
+                    WW_MALSAFE_LOG_WARN("ioctl USBX REJECTED auth_fail caller=%lu req_pid=%lu magic_match=%u session_match=%u",
+                        usbx_caller_pid, req->pid, req->magic == expected_magic ? 1u : 0u, req->session_key == g_session_key ? 1u : 0u);
                     status = STATUS_ACCESS_DENIED;
                 }
                 bytes = sizeof(protect_sandbox_request_k);
@@ -1449,8 +2031,8 @@ namespace dispatcher {
                 output_size >= sizeof(net_log_register_request_k)) {
                 auto* req = reinterpret_cast<net_log_register_request_k*>(buffer);
                 ULONG expected_magic = g_session_key ^ dynamic_key::get() ^ 0x5A4E0B03u;
-                WW_MALSAFE_LOG_INFO("ioctl NLOG req pid=%lu op=%lu magic=0x%lX expected=0x%lX session=0x%lX g_session=0x%lX",
-                    req->pid, req->operation, req->magic, expected_magic, req->session_key, g_session_key);
+                WW_MALSAFE_LOG_INFO("ioctl NLOG req pid=%lu op=%lu magic_match=%u session_match=%u",
+                    req->pid, req->operation, req->magic == expected_magic ? 1u : 0u, req->session_key == g_session_key ? 1u : 0u);
                 if (req->magic == expected_magic && req->session_key == g_session_key) {
                     bool ok = malware_safe::set_net_log(req->pid, req->operation != 0);
                     req->result = ok ? 1u : 0u;
@@ -1459,8 +2041,8 @@ namespace dispatcher {
                         req->pid, req->operation, ok ? 1 : 0, (ULONG)status);
                 } else {
                     status = STATUS_ACCESS_DENIED;
-                    WW_MALSAFE_LOG_WARN("ioctl NLOG REJECTED auth_fail caller=%lu req_pid=%lu magic=0x%lX expected=0x%lX session=0x%lX g_session=0x%lX",
-                        nlog_caller_pid, req->pid, req->magic, expected_magic, req->session_key, g_session_key);
+                    WW_MALSAFE_LOG_WARN("ioctl NLOG REJECTED auth_fail caller=%lu req_pid=%lu magic_match=%u session_match=%u",
+                        nlog_caller_pid, req->pid, req->magic == expected_magic ? 1u : 0u, req->session_key == g_session_key ? 1u : 0u);
                 }
                 bytes = sizeof(net_log_register_request_k);
             } else {
@@ -1514,8 +2096,8 @@ namespace dispatcher {
                     resp->record_count = 0;
                     resp->dropped_since_last_pull = 0;
                     bytes = sizeof(net_packet_pull_response_k);
-                    WW_MALSAFE_LOG_WARN("ioctl NPKT REJECTED magic=0x%lX expected=0x%lX session=0x%lX",
-                        req_magic_value, expected_magic, req_session_key_value);
+                    WW_MALSAFE_LOG_WARN("ioctl NPKT REJECTED magic_match=%u session_match=%u",
+                        req_magic_value == expected_magic ? 1u : 0u, req_session_key_value == g_session_key ? 1u : 0u);
                 } else {
                     ULONG records_capacity_bytes = (output_size > sizeof(net_packet_pull_response_k))
                         ? (output_size - (ULONG)sizeof(net_packet_pull_response_k)) : 0;
@@ -1593,60 +2175,100 @@ namespace dispatcher {
                 UINT32 base_key_clean = dynamic_key::compute();
                 ULONG base_ioctl_base = ((hash_build_key(base_key_clean) ^ secondary_hash(base_key_clean >> 3)) & 0x7FF) | 0x800;
                 ULONG base_hb_code = 0x00220000u | ((base_ioctl_base + 8) << 2);
+                ULONG base_tira_code = 0x00220000u | ((base_ioctl_base + 48) << 2);
 
                 if (code == base_hb_code && input_size >= sizeof(_HB) && output_size >= sizeof(_HB)) {
                     WW_LOG("HB-RECONNECT: detected fresh client using base IOCTL code 0x%lx (seeded was 0x%lx)",
                         base_hb_code, ioctl_codes::HB());
 
                     HANDLE prev_client = caller_validation::g_registered_client_pid;
-                    _InterlockedExchange(reinterpret_cast<volatile LONG*>(&ioctl_codes::g_server_ioctl_seed), 0);
-                    _InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_session_key), 0);
-                    _InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_heartbeat_counter), 0);
-                    _InterlockedExchange(&g_driver_activated, 0);
-                    _InterlockedExchange64(&g_last_heartbeat_time, 0);
-                    caller_validation::unregister_client();
-                    secure_comm::reset();
-                    if (prev_client) {
-                        UINT32 prev_pid = static_cast<UINT32>(reinterpret_cast<ULONG_PTR>(prev_client));
-                        anti_dma_canary::cleanup_for_pid(prev_pid);
-                        continuous_anti_debug::stop();
-                        continuous_anti_dump::stop();
+                    HANDLE caller_pid = PsGetCurrentProcessId();
+                    if (prev_client != NULL && prev_client == caller_pid) {
+                        p_heartbeat hb = (p_heartbeat)buffer;
+                        ULONG expectedMagic = 0xDEADBEEFu ^ base_key_clean;
+                        _InterlockedExchange(reinterpret_cast<volatile LONG*>(&dynamic_key::g_server_seed),
+                            static_cast<LONG>(orig_server_seed));
+                        _InterlockedExchange(reinterpret_cast<volatile LONG*>(&dynamic_key::g_cached_key), 0);
+                        if (hb->magic == expectedMagic && hb->session_key == g_session_key) {
+                            LARGE_INTEGER current_time;
+                            KeQuerySystemTime(&current_time);
+                            _InterlockedExchange64(&g_last_heartbeat_time, current_time.QuadPart);
+                            _InterlockedIncrement((volatile LONG*)&g_heartbeat_counter);
+                            sentinel_bridge::tick();
+                            hb->response = (UINT64)g_heartbeat_counter ^ dynamic_key::get();
+                            WW_LOG("HB-RECONNECT: accepted stale base heartbeat from active client pid=%llu without session reset",
+                                (unsigned long long)(ULONG_PTR)caller_pid);
+                            status = STATUS_SUCCESS;
+                            bytes = sizeof(_HB);
+                        } else {
+                            WW_LOG("HB-RECONNECT: rejected stale base heartbeat from active client pid=%llu magic_match=%u session_match=%u",
+                                (unsigned long long)(ULONG_PTR)caller_pid,
+                                hb->magic == expectedMagic ? 1u : 0u,
+                                hb->session_key == g_session_key ? 1u : 0u);
+                            hb->response = 0;
+                            status = STATUS_ACCESS_DENIED;
+                            bytes = sizeof(_HB);
+                        }
+                    } else {
+                        reset_dynamic_session_state("heartbeat_reconnect_base_ioctl", prev_client, 0, TRUE);
+
+
+                        p_heartbeat hb = (p_heartbeat)buffer;
+                        ULONG expectedMagic = 0xDEADBEEFu ^ base_key_clean;
+                        WW_LOG("HB-RECONNECT: magic check match=%u session_present=%u",
+                            hb->magic == expectedMagic ? 1u : 0u,
+                            hb->session_key != 0 ? 1u : 0u);
+
+                        if (hb->magic == expectedMagic) {
+                            LARGE_INTEGER current_time;
+                            KeQuerySystemTime(&current_time);
+
+                            _InterlockedExchange((volatile LONG*)&g_session_key, (LONG)hb->session_key);
+                            _InterlockedExchange64(&g_last_heartbeat_time, current_time.QuadPart);
+                            _InterlockedIncrement((volatile LONG*)&g_heartbeat_counter);
+                            sentinel_bridge::tick();
+
+                            WW_LOG("HB-RECONNECT: registering new client");
+                            caller_validation::register_client();
+
+                            UINT32 client_pid = (UINT32)(ULONG_PTR)caller_pid;
+                            continuous_anti_debug::start(client_pid);
+
+                            hb->response = (UINT64)g_heartbeat_counter ^ dynamic_key::get();
+
+
+                            WW_LOG("HB-RECONNECT: SUCCESS, session re-established (anti-dump deferred until user-mode finalize_after_activation)");
+                            status = STATUS_SUCCESS;
+                        } else {
+                            WW_LOG("HB-RECONNECT: magic mismatch, rejecting");
+                            hb->response = 0;
+                            status = STATUS_INVALID_PARAMETER;
+                        }
+                        bytes = sizeof(_HB);
                     }
-
-
-                    p_heartbeat hb = (p_heartbeat)buffer;
-                    ULONG expectedMagic = 0xDEADBEEFu ^ base_key_clean;
-                    WW_LOG("HB-RECONNECT: magic check received=0x%lx expected=0x%lx",
-                        hb->magic, expectedMagic);
-
-                    if (hb->magic == expectedMagic) {
-                        LARGE_INTEGER current_time;
-                        KeQuerySystemTime(&current_time);
-
-                        _InterlockedExchange((volatile LONG*)&g_session_key, (LONG)hb->session_key);
-                        _InterlockedExchange64(&g_last_heartbeat_time, current_time.QuadPart);
-                        _InterlockedIncrement((volatile LONG*)&g_heartbeat_counter);
-                        sentinel_bridge::tick();
-                        _InterlockedExchange(&g_driver_activated, 1);
-
-                        WW_LOG("HB-RECONNECT: registering new client");
-                        caller_validation::register_client();
-
-                        HANDLE caller_pid = PsGetCurrentProcessId();
-                        UINT32 client_pid = (UINT32)(ULONG_PTR)caller_pid;
-                        continuous_anti_debug::start(client_pid);
-
-                        hb->response = (UINT64)g_heartbeat_counter ^ dynamic_key::get();
-
-
-                        WW_LOG("HB-RECONNECT: SUCCESS, session re-established (anti-dump deferred until user-mode finalize_after_activation)");
+                } else if (code == base_tira_code && input_size >= sizeof(phase3_msg::tier_a_query_request_k) &&
+                    output_size >= sizeof(phase3_msg::tier_a_query_request_k)) {
+                    HANDLE prev_client = caller_validation::g_registered_client_pid;
+                    HANDLE caller_pid = PsGetCurrentProcessId();
+                    auto* req = reinterpret_cast<phase3_msg::tier_a_query_request_k*>(buffer);
+                    _InterlockedExchange(reinterpret_cast<volatile LONG*>(&dynamic_key::g_server_seed),
+                        static_cast<LONG>(orig_server_seed));
+                    _InterlockedExchange(reinterpret_cast<volatile LONG*>(&dynamic_key::g_cached_key), 0);
+                    if (prev_client != NULL && prev_client == caller_pid && req->session_key == g_session_key) {
+                        req->present_flag      = anti_dma_canary::query_tier_a_preloaded() ? 1u : 0u;
+                        req->tier_mask         = req->present_flag;
+                        req->first_driver_base = 0;
+                        WW_LOG("TIRA: accepted stale base query from active client pid=%llu while seeded",
+                            (unsigned long long)(ULONG_PTR)caller_pid);
                         status = STATUS_SUCCESS;
                     } else {
-                        WW_LOG("HB-RECONNECT: magic mismatch, rejecting");
-                        hb->response = 0;
-                        status = STATUS_INVALID_PARAMETER;
+                        WW_LOG("TIRA: rejected stale base query pid=%llu active_match=%u session_match=%u",
+                            (unsigned long long)(ULONG_PTR)caller_pid,
+                            (prev_client != NULL && prev_client == caller_pid) ? 1u : 0u,
+                            req->session_key == g_session_key ? 1u : 0u);
+                        status = STATUS_ACCESS_DENIED;
                     }
-                    bytes = sizeof(_HB);
+                    bytes = sizeof(phase3_msg::tier_a_query_request_k);
                 } else {
 
                     _InterlockedExchange(reinterpret_cast<volatile LONG*>(&dynamic_key::g_server_seed),
@@ -1661,9 +2283,40 @@ namespace dispatcher {
             }
         }
 
+        if (hvdt_trace) {
+            HVD_LOG_IMMEDIATE("dispatch_final_timing_pre trace=%lld step=%lu status=0x%08lx bytes=%lu secure_wrapped=%u elapsed_us=%llu cpu=%lu irql=%lu",
+                hvdt_trace_id,
+                37u,
+                status,
+                bytes,
+                secure_wrapped ? 1u : 0u,
+                elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                KeGetCurrentProcessorNumber(),
+                (ULONG)KeGetCurrentIrql());
+        }
         add_timing_noise();
+        if (hvdt_trace) {
+            HVD_LOG_IMMEDIATE("dispatch_final_timing_post trace=%lld step=%lu status=0x%08lx bytes=%lu elapsed_us=%llu cpu=%lu irql=%lu",
+                hvdt_trace_id,
+                38u,
+                status,
+                bytes,
+                elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                KeGetCurrentProcessorNumber(),
+                (ULONG)KeGetCurrentIrql());
+        }
 
         if (secure_wrapped && NT_SUCCESS(status) && bytes > 0) {
+            if (hvdt_trace) {
+                HVD_LOG_IMMEDIATE("dispatch_secure_response_pre trace=%lld step=%lu plain_bytes=%lu output_size=%lu elapsed_us=%llu cpu=%lu irql=%lu",
+                    hvdt_trace_id,
+                    39u,
+                    bytes,
+                    output_size,
+                    elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                    KeGetCurrentProcessorNumber(),
+                    (ULONG)KeGetCurrentIrql());
+            }
             if (!secure_comm::encrypt_response(
                 buffer,
                 bytes,
@@ -1673,13 +2326,59 @@ namespace dispatcher {
                 secure_request_id)) {
                 status = STATUS_ACCESS_DENIED;
                 bytes = 0;
+                if (hvdt_trace) {
+                    HVD_LOG_IMMEDIATE("dispatch_secure_response_post trace=%lld step=%lu ok=0 status=0x%08lx bytes=%lu elapsed_us=%llu cpu=%lu irql=%lu",
+                        hvdt_trace_id,
+                        40u,
+                        status,
+                        bytes,
+                        elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                        KeGetCurrentProcessorNumber(),
+                        (ULONG)KeGetCurrentIrql());
+                }
             } else {
                 bytes += sizeof(secure_comm::SECURE_HEADER);
+                if (hvdt_trace) {
+                    HVD_LOG_IMMEDIATE("dispatch_secure_response_post trace=%lld step=%lu ok=1 final_bytes=%lu elapsed_us=%llu cpu=%lu irql=%lu",
+                        hvdt_trace_id,
+                        40u,
+                        bytes,
+                        elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                        KeGetCurrentProcessorNumber(),
+                        (ULONG)KeGetCurrentIrql());
+                }
             }
+        } else if (hvdt_trace) {
+            HVD_LOG_IMMEDIATE("dispatch_secure_response_skip trace=%lld step=%lu secure_wrapped=%u status=0x%08lx bytes=%lu elapsed_us=%llu cpu=%lu irql=%lu",
+                hvdt_trace_id,
+                39u,
+                secure_wrapped ? 1u : 0u,
+                status,
+                bytes,
+                elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                KeGetCurrentProcessorNumber(),
+                (ULONG)KeGetCurrentIrql());
         }
 
-        if (secure_work_buffer)
+        if (secure_work_buffer) {
+            if (hvdt_trace) {
+                HVD_LOG_IMMEDIATE("dispatch_secure_free_pre trace=%lld step=%lu elapsed_us=%llu cpu=%lu irql=%lu",
+                    hvdt_trace_id,
+                    41u,
+                    elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                    KeGetCurrentProcessorNumber(),
+                    (ULONG)KeGetCurrentIrql());
+            }
             ExFreePoolWithTag(secure_work_buffer, 'mocS');
+            if (hvdt_trace) {
+                HVD_LOG_IMMEDIATE("dispatch_secure_free_post trace=%lld step=%lu elapsed_us=%llu cpu=%lu irql=%lu",
+                    hvdt_trace_id,
+                    42u,
+                    elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                    KeGetCurrentProcessorNumber(),
+                    (ULONG)KeGetCurrentIrql());
+            }
+        }
 
         if (code == ioctl_codes::STRM() || code == ioctl_codes::CKIL()) {
             WW_LOG("netaction::DISPATCH COMPLETE code=0x%08X final_status=0x%08X final_bytes=%lu secure_wrapped=%d",
@@ -1688,6 +2387,19 @@ namespace dispatcher {
 
         irp->IoStatus.Status = status;
         irp->IoStatus.Information = bytes;
+        if (hvdt_trace) {
+            HVD_LOG_IMMEDIATE("dispatch_complete trace=%lld step=%lu code=0x%08lx final_status=0x%08lx final_bytes=%lu secure_wrapped=%u elapsed_us=%llu cpu=%lu irql=%lu requestor_pid=%lu",
+                hvdt_trace_id,
+                43u,
+                code,
+                status,
+                bytes,
+                secure_wrapped ? 1u : 0u,
+                elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                KeGetCurrentProcessorNumber(),
+                (ULONG)KeGetCurrentIrql(),
+                IoGetRequestorProcessId(irp));
+        }
         _IofCompleteRequest(irp, IO_NO_INCREMENT);
 
         return status;

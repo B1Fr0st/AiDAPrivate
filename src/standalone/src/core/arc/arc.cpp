@@ -90,6 +90,81 @@ static void arc_log(const char* tag, const char* msg)
     OutputDebugStringA(line);
 }
 
+enum arc_runtime_state_code_t : uint32_t
+{
+    arc_state_cold = 0,
+    arc_state_bound = 1,
+    arc_state_init_started = 2,
+    arc_state_session_ready = 3,
+    arc_state_driver_verified = 4,
+    arc_state_ready = 5,
+    arc_state_cleanup = 6,
+    arc_state_violation = 7
+};
+
+static std::atomic<uint32_t> g_arc_runtime_state{arc_state_cold};
+
+const char* arc_runtime_state_name(uint32_t state)
+{
+    switch (state)
+    {
+    case arc_state_cold: return "cold";
+    case arc_state_bound: return "bound";
+    case arc_state_init_started: return "init_started";
+    case arc_state_session_ready: return "session_ready";
+    case arc_state_driver_verified: return "driver_verified";
+    case arc_state_ready: return "ready";
+    case arc_state_cleanup: return "cleanup";
+    case arc_state_violation: return "violation";
+    default: return "unknown";
+    }
+}
+
+void arc_publish_state(uint32_t next, const char* phase, const char* detail)
+{
+    uint32_t previous = g_arc_runtime_state.exchange(next, std::memory_order_acq_rel);
+    char line[256];
+    _snprintf_s(line, sizeof(line), _TRUNCATE,
+        "transition phase=%s previous=%s/%u next=%s/%u detail=%s tid=%lu",
+        phase ? phase : "",
+        arc_runtime_state_name(previous),
+        previous,
+        arc_runtime_state_name(next),
+        next,
+        detail ? detail : "",
+        GetCurrentThreadId());
+    arc_log("state", line);
+}
+
+void arc_log_export_denied(const char* export_name, const char* reason)
+{
+    uint32_t state = g_arc_runtime_state.load(std::memory_order_acquire);
+    char line[192];
+    _snprintf_s(line, sizeof(line), _TRUNCATE,
+        "export_denied name=%s reason=%s state=%s/%u tid=%lu",
+        export_name ? export_name : "",
+        reason ? reason : "",
+        arc_runtime_state_name(state),
+        state,
+        GetCurrentThreadId());
+    arc_log("export", line);
+}
+
+bool arc_runtime_requires_live_session(uint32_t state)
+{
+    return state == arc_state_session_ready ||
+           state == arc_state_driver_verified ||
+           state == arc_state_ready;
+}
+
+bool arc_ct_memeq(const uint8_t* left, const uint8_t* right, size_t len)
+{
+    uint8_t diff = 0;
+    for (size_t i = 0; i < len; ++i)
+        diff |= static_cast<uint8_t>(left[i] ^ right[i]);
+    return diff == 0;
+}
+
 __forceinline uint64_t siphash_2_4(const uint8_t* data, size_t len, uint64_t k0, uint64_t k1)
 {
     uint64_t v0 = k0 ^ 0x736F6D6570736575ULL;
@@ -1231,6 +1306,7 @@ __declspec(noreturn) __forceinline void enforce_violation(const char* reason, co
 {
     const char* r = reason ? reason : "arc_unknown";
     const char* x = extra ? extra : "";
+    arc_publish_state(arc_state_violation, "enforce_violation", r);
 
     {
         char log_line[384];
@@ -1314,6 +1390,11 @@ __declspec(noreturn) __forceinline void enforce_violation(const char* reason, co
             GetModuleFileNameA(arc_mod, arc_mod_name, MAX_PATH);
         arc_log("violation", "step08_arc_module_resolved");
 
+        const uint64_t hwid_hash = fnv1a_str(hwid_buf);
+        const uint64_t sess_hash = fnv1a_str(sess_buf);
+        const size_t hwid_len = strnlen_s(hwid_buf, sizeof(hwid_buf));
+        const size_t sess_len = strnlen_s(sess_buf, sizeof(sess_buf));
+
         char crash_buf[2048];
         int n = _snprintf_s(crash_buf, sizeof(crash_buf), _TRUNCATE,
             "[%02d:%02d:%02d.%03d] [arc/violation] FAST_FAIL\r\n"
@@ -1323,8 +1404,8 @@ __declspec(noreturn) __forceinline void enforce_violation(const char* reason, co
             "Tid=%lu Pid=%lu\r\n"
             "ReturnAddress=0x%016llX\r\n"
             "ArcModule=%s\r\n"
-            "Hwid=%s\r\n"
-            "Session=%s\r\n"
+            "HwidHash=0x%016llX HwidLen=%zu\r\n"
+            "SessionHash=0x%016llX SessionLen=%zu\r\n"
             "EpochTs=%lld\r\n"
             "StackBackTrace: %s\r\n",
             st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
@@ -1332,8 +1413,10 @@ __declspec(noreturn) __forceinline void enforce_violation(const char* reason, co
             GetCurrentThreadId(), GetCurrentProcessId(),
             static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(return_addr)),
             arc_mod_name,
-            hwid_buf,
-            sess_buf,
+            static_cast<unsigned long long>(hwid_hash),
+            hwid_len,
+            static_cast<unsigned long long>(sess_hash),
+            sess_len,
             static_cast<long long>(time(nullptr)),
             stack_str);
 
@@ -1392,8 +1475,8 @@ __declspec(noreturn) __forceinline void enforce_violation(const char* reason, co
         auto k_reason = OBFSTR("reason");
         auto k_extra  = OBFSTR("extra");
         auto k_ts     = OBFSTR("ts");
-        auto k_hwid   = OBFSTR("hwid");
-        auto k_sess   = OBFSTR("session");
+        auto k_hwid   = OBFSTR("hwid_hash");
+        auto k_sess   = OBFSTR("session_hash");
 
         char ts_str[32];
         _snprintf_s(ts_str, sizeof(ts_str), _TRUNCATE,
@@ -1404,8 +1487,14 @@ __declspec(noreturn) __forceinline void enforce_violation(const char* reason, co
         body += k_reason; body += "\":\""; body += r;        body += "\",\"";
         body += k_extra;  body += "\":\""; body += x;        body += "\",\"";
         body += k_ts;     body += "\":";   body += ts_str;   body += ",\"";
-        body += k_hwid;   body += "\":\""; body += hwid_buf; body += "\",\"";
-        body += k_sess;   body += "\":\""; body += sess_buf; body += "\"}";
+        char hwid_hash_hex[32] = {};
+        char sess_hash_hex[32] = {};
+        _snprintf_s(hwid_hash_hex, sizeof(hwid_hash_hex), _TRUNCATE,
+            "%016llx", static_cast<unsigned long long>(fnv1a_str(hwid_buf)));
+        _snprintf_s(sess_hash_hex, sizeof(sess_hash_hex), _TRUNCATE,
+            "%016llx", static_cast<unsigned long long>(fnv1a_str(sess_buf)));
+        body += k_hwid;   body += "\":\""; body += hwid_hash_hex; body += "\",\"";
+        body += k_sess;   body += "\":\""; body += sess_hash_hex; body += "\"}";
 
         arc_log("violation", "step18_pre_http_post");
         http_post_json(url.c_str(), body.c_str());
@@ -1616,21 +1705,61 @@ bool check_debugger()
     return false;
 }
 
-std::string recompute_hwid()
+struct recomputed_hwid_t
 {
-    std::array<uint8_t, 32> hwid_hash{};
+    std::string hwid;
+    bool tpm_present = false;
+    uint32_t factor_present_mask = 0;
+};
+
+recomputed_hwid_t recompute_hwid()
+{
+    recomputed_hwid_t result{};
+    aida::hardware_id::v2::collection_t collection{};
     std::string err;
-    if (!aida::hardware_id::v2::hash_only(hwid_hash, err)) {
+    if (!aida::hardware_id::v2::collect(collection, err)) {
         char dbg[160];
         _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
             "recompute_hwid_v2_failed err=%.96s", err.c_str());
         arc_log("init", dbg);
-        SecureZeroMemory(hwid_hash.data(), hwid_hash.size());
-        return "unavailable";
+        SecureZeroMemory(collection.hwid_hash.data(), collection.hwid_hash.size());
+        for (auto& f : collection.factors)
+        {
+            SecureZeroMemory(f.factor_hash.data(), f.factor_hash.size());
+            if (!f.bytes.empty()) SecureZeroMemory(f.bytes.data(), f.bytes.size());
+        }
+        result.hwid = "unavailable";
+        return result;
     }
-    std::string out = aida::hardware_id::v2::hash_to_hex(hwid_hash);
-    SecureZeroMemory(hwid_hash.data(), hwid_hash.size());
-    return out;
+    uint32_t collected = 0;
+    for (std::size_t i = 0; i < aida::hardware_id::v2::kFactorCount; ++i)
+    {
+        const auto& f = collection.factors[i];
+        if (f.collected)
+        {
+            ++collected;
+        }
+    }
+    std::string out = aida::hardware_id::v2::hash_to_hex(collection.hwid_hash);
+    result.hwid = out;
+    result.tpm_present = collection.tpm_present;
+    result.factor_present_mask = collection.factor_present_mask;
+    char dbg[192];
+    _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+        "recompute_hwid_v2_ok mask=0x%08X collected=%u tpm=%d hwid_len=%zu",
+        collection.factor_present_mask,
+        collected,
+        collection.tpm_present ? 1 : 0,
+        out.size());
+    arc_log("init", dbg);
+    arc_log("init", "recompute_hwid_v2_tpm_policy disabled factor9=no_tpm");
+    SecureZeroMemory(collection.hwid_hash.data(), collection.hwid_hash.size());
+    for (auto& f : collection.factors)
+    {
+        SecureZeroMemory(f.factor_hash.data(), f.factor_hash.size());
+        if (!f.bytes.empty()) SecureZeroMemory(f.bytes.data(), f.bytes.size());
+    }
+    return result;
 }
 
 uint64_t compute_own_code_hash()
@@ -2263,9 +2392,23 @@ ARC_API bool arc_bind_driver_device(void* driver_device, uint32_t interface_vers
 {
     using namespace arc_internal;
     if (interface_version != ARC_INTERFACE_VERSION || !driver_device)
+    {
+        char detail[128];
+        _snprintf_s(detail, sizeof(detail), _TRUNCATE,
+            "bind_rejected iv=%u expected=%u device_set=%d",
+            interface_version,
+            static_cast<unsigned>(ARC_INTERFACE_VERSION),
+            driver_device ? 1 : 0);
+        arc_log("bind", detail);
         return false;
+    }
     bind_prebound_device(reinterpret_cast<voyager::device_t*>(driver_device));
-    return get_prebound_device() != nullptr;
+    const bool ok = get_prebound_device() != nullptr;
+    if (ok)
+        arc_publish_state(arc_state_bound, "arc_bind_driver_device", "prebound_device_set");
+    else
+        arc_log("bind", "bind_failed_prebound_decode_null");
+    return ok;
 }
 
 ARC_API bool arc_init(
@@ -2288,6 +2431,7 @@ ARC_API bool arc_init(
             static_cast<const void*>(bind_proof));
         arc_log("init", dbg);
     }
+    arc_publish_state(arc_state_init_started, "arc_init", "entry");
 
     bool result = false;
     uint64_t local_hwid_hash_capture = 0;
@@ -2356,22 +2500,42 @@ ARC_API bool arc_init(
 
     arc_log("init", "arc_init_step3_hwid_recompute");
     {
-        std::string local_hwid = recompute_hwid();
+        recomputed_hwid_t local_hwid_state = recompute_hwid();
+        std::string& local_hwid = local_hwid_state.hwid;
         uint64_t local_hash = fnv1a_str(local_hwid.c_str());
         uint64_t provided_hash = fnv1a_str(hwid);
         local_hwid_hash_capture = local_hash;
+        size_t provided_len = strlen(hwid);
+        size_t local_len = local_hwid.size();
         {
-            char dbg[160];
+            char dbg[256];
             _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                "arc_init_hwid local=%s provided=%s local_hash=0x%016llX provided_hash=0x%016llX",
-                local_hwid.c_str(), hwid,
+                "arc_init_hwid local_len=%zu provided_len=%zu local_hash=0x%016llX provided_hash=0x%016llX mask=0x%08X tpm=%d",
+                local_len, provided_len,
+                static_cast<unsigned long long>(local_hash),
+                static_cast<unsigned long long>(provided_hash),
+                local_hwid_state.factor_present_mask,
+                local_hwid_state.tpm_present ? 1 : 0);
+            arc_log("init", dbg);
+        }
+        uint8_t hwid_diff = local_len == provided_len ? 0u : 1u;
+        size_t cmp_len = local_len < provided_len ? local_len : provided_len;
+        for (size_t i = 0; i < cmp_len; ++i)
+        {
+            hwid_diff |= static_cast<uint8_t>(local_hwid[i] ^ hwid[i]);
+        }
+        if (hwid_diff != 0)
+        {
+            char dbg[192];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "arc_init_hwid_mismatch_rejected mask=0x%08X tpm=%d local_hash=0x%016llX provided_hash=0x%016llX",
+                local_hwid_state.factor_present_mask,
+                local_hwid_state.tpm_present ? 1 : 0,
                 static_cast<unsigned long long>(local_hash),
                 static_cast<unsigned long long>(provided_hash));
             arc_log("init", dbg);
-        }
-        if (local_hash != provided_hash)
-        {
             enforce_violation_id(aida::reason_ids::reason_id_arc_hwid_mismatch, "");
+            return false;
         }
     }
 
@@ -2443,15 +2607,20 @@ ARC_API bool arc_init(
             enforce_violation_id(aida::reason_ids::reason_id_arc_bind_proof_hmac_failed, "");
         }
 
-        if (memcmp(expected, bind_proof, 32) != 0)
+        if (!arc_ct_memeq(expected, bind_proof, 32))
         {
+            uint32_t diff_count = 0;
+            for (uint32_t i = 0; i < 32; ++i)
+            {
+                if (expected[i] != bind_proof[i])
+                    ++diff_count;
+            }
             char dbg[200];
             _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                "arc_init_bind_proof_mismatch expected[0..7]=%02X%02X%02X%02X%02X%02X%02X%02X got[0..7]=%02X%02X%02X%02X%02X%02X%02X%02X",
-                expected[0], expected[1], expected[2], expected[3],
-                expected[4], expected[5], expected[6], expected[7],
-                bind_proof[0], bind_proof[1], bind_proof[2], bind_proof[3],
-                bind_proof[4], bind_proof[5], bind_proof[6], bind_proof[7]);
+                "arc_init_bind_proof_mismatch diff=%u expected_hash=0x%016llX got_hash=0x%016llX",
+                diff_count,
+                static_cast<unsigned long long>(fnv1a(expected, sizeof(expected))),
+                static_cast<unsigned long long>(fnv1a(bind_proof, 32)));
             arc_log("init", dbg);
             SecureZeroMemory(expected, sizeof(expected));
             enforce_violation_id(aida::reason_ids::reason_id_arc_bind_proof_mismatch, "");
@@ -2502,11 +2671,13 @@ ARC_API bool arc_init(
         if (!capture_self_integrity())
         {
             arc_log("init", "self_integrity_capture_failed");
+            enforce_violation_id(aida::reason_ids::reason_id_arc_self_hash_mismatch, "capture_failed");
         }
         sess.initialized = true;
 
         store_session(sess);
         init_vtable(sess.vtable_crypt_key);
+        arc_publish_state(arc_state_session_ready, "arc_init", "session_vtable_stored");
         SecureZeroMemory(&sess, sizeof(sess));
 
         result = true;
@@ -2527,8 +2698,41 @@ ARC_API bool arc_init(
             enforce_violation_id(aida::reason_ids::reason_id_arc_no_driver, "device_disconnected");
         }
 
+        dev->sync_dynamic_security_state();
+        arc_log("driver", "dynamic_security_state_synced");
+        {
+            char sec_buf[256];
+            _snprintf_s(sec_buf, sizeof(sec_buf), _TRUNCATE,
+                "device_security_snapshot stage=post_sync base=0x%04X key_hash=0x%08X ioctl_seed_hash=0x%08X inst_seed=%u/%u global_seed=%u/%u hb_ioctl=0x%08X hb_err=%lu hb_bytes=%lu hb_resp=0x%016llX",
+                dev->compute_ioctl_base_snapshot(),
+                dev->get_last_heartbeat_key_hash(),
+                dev->get_last_heartbeat_ioctl_seed_hash(),
+                dev->get_last_heartbeat_server_seed_present(),
+                dev->get_last_heartbeat_ioctl_seed_present(),
+                dev->get_last_heartbeat_global_server_seed_present(),
+                dev->get_last_heartbeat_global_ioctl_seed_present(),
+                dev->get_last_heartbeat_ioctl_code(),
+                static_cast<unsigned long>(dev->get_last_heartbeat_error()),
+                static_cast<unsigned long>(dev->get_last_heartbeat_bytes_returned()),
+                static_cast<unsigned long long>(dev->get_last_heartbeat_response()));
+            arc_log("driver", sec_buf);
+        }
+
         if (!dev->refresh_heartbeat())
         {
+            char hb_buf[256];
+            _snprintf_s(hb_buf, sizeof(hb_buf), _TRUNCATE,
+                "heartbeat_failed err=%lu bytes=%lu ioctl=0x%08X base=0x%04X key_hash=0x%08X inst_seed=%u/%u global_seed=%u/%u",
+                static_cast<unsigned long>(dev->get_last_heartbeat_error()),
+                static_cast<unsigned long>(dev->get_last_heartbeat_bytes_returned()),
+                dev->get_last_heartbeat_ioctl_code(),
+                dev->get_last_heartbeat_base(),
+                dev->get_last_heartbeat_key_hash(),
+                dev->get_last_heartbeat_server_seed_present(),
+                dev->get_last_heartbeat_ioctl_seed_present(),
+                dev->get_last_heartbeat_global_server_seed_present(),
+                dev->get_last_heartbeat_global_ioctl_seed_present());
+            arc_log("driver", hb_buf);
             arc_log("driver", "heartbeat_failed");
             enforce_violation_id(aida::reason_ids::reason_id_arc_no_driver, "heartbeat_failed");
         }
@@ -2570,6 +2774,20 @@ ARC_API bool arc_init(
                 }
                 if (!dev->refresh_heartbeat())
                 {
+                    char hb_buf[256];
+                    _snprintf_s(hb_buf, sizeof(hb_buf), _TRUNCATE,
+                        "heartbeat_failed_during_bridge_wait err=%lu bytes=%lu ioctl=0x%08X base=0x%04X key_hash=0x%08X inst_seed=%u/%u global_seed=%u/%u waited_ms=%lu",
+                        static_cast<unsigned long>(dev->get_last_heartbeat_error()),
+                        static_cast<unsigned long>(dev->get_last_heartbeat_bytes_returned()),
+                        dev->get_last_heartbeat_ioctl_code(),
+                        dev->get_last_heartbeat_base(),
+                        dev->get_last_heartbeat_key_hash(),
+                        dev->get_last_heartbeat_server_seed_present(),
+                        dev->get_last_heartbeat_ioctl_seed_present(),
+                        dev->get_last_heartbeat_global_server_seed_present(),
+                        dev->get_last_heartbeat_global_ioctl_seed_present(),
+                        static_cast<unsigned long>(waited_ms));
+                    arc_log("driver", hb_buf);
                     arc_log("driver", "heartbeat_failed_during_bridge_wait");
                     enforce_violation_id(aida::reason_ids::reason_id_arc_no_driver, "heartbeat_failed");
                 }
@@ -2587,9 +2805,22 @@ ARC_API bool arc_init(
         bool tier_a_present = false;
         uint32_t tier_a_mask = 0;
         uint64_t tier_a_first_base = 0;
-        if (!dev->tier_a_driver_present_query(tier_a_present, &tier_a_mask, &tier_a_first_base))
+        const bool tier_a_connected_before = dev->is_connected();
+        const uint64_t tier_a_query_start = GetTickCount64();
+        const bool tier_a_query_ok = dev->tier_a_driver_present_query(tier_a_present, &tier_a_mask, &tier_a_first_base);
+        const DWORD tier_a_query_gle = tier_a_query_ok ? ERROR_SUCCESS : GetLastError();
+        const uint64_t tier_a_query_elapsed = GetTickCount64() - tier_a_query_start;
+        if (!tier_a_query_ok)
         {
-            arc_log("driver", "tier_a_query_failed");
+            const bool tier_a_connected_after = dev->is_connected();
+            char detail[160];
+            _snprintf_s(detail, sizeof(detail), _TRUNCATE,
+                "tier_a_query_failed gle=%lu connected_before=%d connected_after=%d elapsed_ms=%llu",
+                static_cast<unsigned long>(tier_a_query_gle),
+                tier_a_connected_before ? 1 : 0,
+                tier_a_connected_after ? 1 : 0,
+                static_cast<unsigned long long>(tier_a_query_elapsed));
+            arc_log("driver", detail);
             enforce_violation_id(aida::reason_ids::reason_id_arc_no_driver, "tier_a_query_failed");
         }
 
@@ -2667,20 +2898,29 @@ ARC_API bool arc_init(
             if (!driver_hash_ok || driver_expected_hash == 0 || text_size > 0xFFFFFFFFULL)
             {
                 arc_log("driver", "register_dll_protection_hash_unavailable");
+                enforce_violation_id(aida::reason_ids::reason_id_arc_no_driver, "register_dll_protection_hash_unavailable");
             }
             else if (!dev->register_dll_protection(image_base, text_va,
                     static_cast<uint32_t>(text_size), driver_expected_hash, 2000))
             {
                 DWORD gle = GetLastError();
-                char detail[224];
-                _snprintf_s(detail, sizeof(detail), _TRUNCATE,
-                    "register_dll_protection_failed gle=%lu image=0x%016llX text=0x%016llX text_size=0x%016llX expected=0x%016llX",
-                    static_cast<unsigned long>(gle),
-                    static_cast<unsigned long long>(image_base),
-                    static_cast<unsigned long long>(text_va),
-                    static_cast<unsigned long long>(text_size),
-                    static_cast<unsigned long long>(driver_expected_hash));
-                arc_log("driver", detail);
+                if (gle == ERROR_ALREADY_EXISTS || gle == 183ul)
+                {
+                    arc_log("driver", "register_dll_protection_ok already_registered");
+                }
+                else
+                {
+                    char detail[224];
+                    _snprintf_s(detail, sizeof(detail), _TRUNCATE,
+                        "register_dll_protection_failed gle=%lu image=0x%016llX text=0x%016llX text_size=0x%016llX expected=0x%016llX",
+                        static_cast<unsigned long>(gle),
+                        static_cast<unsigned long long>(image_base),
+                        static_cast<unsigned long long>(text_va),
+                        static_cast<unsigned long long>(text_size),
+                        static_cast<unsigned long long>(driver_expected_hash));
+                    arc_log("driver", detail);
+                    enforce_violation_id(aida::reason_ids::reason_id_arc_no_driver, "register_dll_protection_failed");
+                }
             }
             else
             {
@@ -2690,9 +2930,13 @@ ARC_API bool arc_init(
         else
         {
             arc_log("driver", "image_layout_unavailable");
+            enforce_violation_id(aida::reason_ids::reason_id_arc_no_driver, "image_layout_unavailable");
         }
+        arc_publish_state(arc_state_driver_verified, "arc_init", "driver_bridge_and_dll_protection_verified");
     }
 
+    if (result)
+        arc_publish_state(arc_state_ready, "arc_init", "ready");
     {
         char dbg[96];
         _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
@@ -2707,9 +2951,24 @@ static thread_local arc_comm_vtable_t g_vtable_decrypted = {};
 ARC_API const arc_comm_vtable_t* arc_get_comm_bridge()
 {
     using namespace arc_internal;
-    if (!is_session_valid()) return nullptr;
-    if (!g_vtable_ready.load(std::memory_order_acquire)) return nullptr;
+    if (!is_session_valid())
+    {
+        arc_log_export_denied("arc_get_comm_bridge", "session_invalid");
+        if (arc_runtime_requires_live_session(g_arc_runtime_state.load(std::memory_order_acquire)))
+            enforce_violation_id(aida::reason_ids::reason_id_arc_required, "get_comm_bridge_session_invalid");
+        return nullptr;
+    }
+    if (!g_vtable_ready.load(std::memory_order_acquire))
+    {
+        arc_log_export_denied("arc_get_comm_bridge", "vtable_not_ready");
+        return nullptr;
+    }
+    if (!verify_vtable())
+    {
+        enforce_violation_id(aida::reason_ids::reason_id_arc_vtable_tampered, "get_comm_bridge");
+    }
     decrypt_vtable_into(&g_vtable_decrypted);
+    arc_log("export", "arc_get_comm_bridge_ok");
     return &g_vtable_decrypted;
 }
 
@@ -2717,9 +2976,16 @@ ARC_API uint64_t arc_validate_tool_exec(
     uint64_t tool_name_hash,
     uint64_t gate_token)
 {
-    (void)tool_name_hash;
-    (void)gate_token;
-    return 0xDEADBEEFCAFEBABEULL;
+    if (tool_name_hash == 0 || gate_token == 0)
+    {
+        arc_internal::arc_log_export_denied("arc_validate_tool_exec", "bad_args");
+        return 0;
+    }
+    const uint64_t caller_nonce =
+        static_cast<uint64_t>(__rdtsc()) ^
+        _rotl64(gate_token, 17) ^
+        0xA1DA7E5700010002ULL;
+    return arc_validate_tool_exec_v2(caller_nonce, tool_name_hash, gate_token);
 }
 
 ARC_API uint64_t arc_validate_tool_exec_v2(
@@ -2735,6 +3001,7 @@ ARC_API uint64_t arc_validate_tool_exec_v2(
     {
         if (tool_name_hash == 0 || caller_nonce == 0)
         {
+            arc_log_export_denied("arc_validate_tool_exec_v2", "bad_args");
             CFF_EXIT(validate_v2_cff);
         }
         CFF_GOTO(validate_v2_cff, 1);
@@ -2743,6 +3010,9 @@ ARC_API uint64_t arc_validate_tool_exec_v2(
     {
         if (!is_session_valid())
         {
+            arc_log_export_denied("arc_validate_tool_exec_v2", "session_invalid");
+            if (arc_runtime_requires_live_session(g_arc_runtime_state.load(std::memory_order_acquire)))
+                enforce_violation_id(aida::reason_ids::reason_id_arc_required, "validate_tool_session_invalid");
             CFF_EXIT(validate_v2_cff);
         }
         CFF_GOTO(validate_v2_cff, 2);
@@ -2767,6 +3037,9 @@ ARC_API uint64_t arc_validate_tool_exec_v2(
             std::lock_guard<std::mutex> lk(g_session_mtx);
             if (!load_session(sess))
             {
+                arc_log_export_denied("arc_validate_tool_exec_v2", "load_session_failed");
+                if (arc_runtime_requires_live_session(g_arc_runtime_state.load(std::memory_order_acquire)))
+                    enforce_violation_id(aida::reason_ids::reason_id_arc_required, "validate_tool_load_session_failed");
                 CFF_EXIT(validate_v2_cff);
             }
         }
@@ -2794,6 +3067,7 @@ ARC_API uint64_t arc_validate_tool_exec_v2(
         {
             SecureZeroMemory(call_key, sizeof(call_key));
             SecureZeroMemory(&sess, sizeof(sess));
+            arc_log_export_denied("arc_validate_tool_exec_v2", "hkdf_failed");
             CFF_EXIT(validate_v2_cff);
         }
 
@@ -2810,10 +3084,12 @@ ARC_API uint64_t arc_validate_tool_exec_v2(
         if (!hmac_ok)
         {
             SecureZeroMemory(mac, sizeof(mac));
+            arc_log_export_denied("arc_validate_tool_exec_v2", "hmac_failed");
             CFF_EXIT(validate_v2_cff);
         }
         memcpy(&out, mac, 8);
         SecureZeroMemory(mac, sizeof(mac));
+        arc_log("export", "arc_validate_tool_exec_v2_ok");
         CFF_EXIT(validate_v2_cff);
     }
     CFF_END(validate_v2_cff)
@@ -2834,6 +3110,9 @@ ARC_API arc_heartbeat_result_t arc_heartbeat()
     {
         if (!is_session_valid())
         {
+            arc_log_export_denied("arc_heartbeat", "session_invalid");
+            if (arc_runtime_requires_live_session(g_arc_runtime_state.load(std::memory_order_acquire)))
+                enforce_violation_id(aida::reason_ids::reason_id_arc_required, "heartbeat_session_invalid");
             CFF_EXIT(hb_cff);
         }
         CFF_GOTO(hb_cff, 1);
@@ -2847,6 +3126,8 @@ ARC_API arc_heartbeat_result_t arc_heartbeat()
         if (!load_session(sess))
         {
             arc_log("heartbeat", "state=1 load_session_failed");
+            if (arc_runtime_requires_live_session(g_arc_runtime_state.load(std::memory_order_acquire)))
+                enforce_violation_id(aida::reason_ids::reason_id_arc_required, "heartbeat_load_session_failed");
             CFF_EXIT(hb_cff);
         }
 
@@ -2902,6 +3183,9 @@ ARC_API arc_heartbeat_result_t arc_heartbeat()
         session_data_t sess = {};
         if (!load_session(sess))
         {
+            arc_log("heartbeat", "state=3 load_session_failed");
+            if (arc_runtime_requires_live_session(g_arc_runtime_state.load(std::memory_order_acquire)))
+                enforce_violation_id(aida::reason_ids::reason_id_arc_required, "heartbeat_load_session_failed");
             CFF_EXIT(hb_cff);
         }
 
@@ -2973,6 +3257,13 @@ ARC_API arc_heartbeat_result_t arc_heartbeat()
 
         hb_result.timestamp = static_cast<uint64_t>(time(nullptr));
         hb_result.valid = true;
+        {
+            char dbg[96];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "result valid=1 proof_token_set=%d",
+                hb_result.proof_token != 0 ? 1 : 0);
+            arc_log("heartbeat", dbg);
+        }
 
         store_session(sess);
         SecureZeroMemory(&sess, sizeof(sess));
@@ -3021,6 +3312,9 @@ ARC_API arc_heartbeat_result_t arc_heartbeat_ex(uint64_t hb_count, const char* c
         if (!is_session_valid())
         {
             arc_log("heartbeat_ex", "state=0 session_invalid");
+            arc_log_export_denied("arc_heartbeat_ex", "session_invalid");
+            if (arc_runtime_requires_live_session(g_arc_runtime_state.load(std::memory_order_acquire)))
+                enforce_violation_id(aida::reason_ids::reason_id_arc_required, "heartbeat_ex_session_invalid");
             CFF_EXIT(hbex_cff);
         }
         CFF_GOTO(hbex_cff, 1);
@@ -3034,7 +3328,22 @@ ARC_API arc_heartbeat_result_t arc_heartbeat_ex(uint64_t hb_count, const char* c
         if (!load_session(sess))
         {
             arc_log("heartbeat_ex", "state=1 load_session_failed");
+            if (arc_runtime_requires_live_session(g_arc_runtime_state.load(std::memory_order_acquire)))
+                enforce_violation_id(aida::reason_ids::reason_id_arc_required, "heartbeat_ex_load_session_failed");
             CFF_EXIT(hbex_cff);
+        }
+        {
+            char dbg[192];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "state=1 code_hash_stored=0x%016llX code_hash_current=0x%016llX exec=%u included=%u mutable=%u guarded=%u read_fail=%u",
+                static_cast<unsigned long long>(sess.code_hash),
+                static_cast<unsigned long long>(current_hash),
+                current_scan.exec_regions,
+                current_scan.included_regions,
+                current_scan.mutable_exec_regions,
+                current_scan.guarded_exec_regions,
+                current_scan.read_failures);
+            arc_log("heartbeat_ex", dbg);
         }
         if (sess.code_hash != 0 && current_hash != sess.code_hash)
         {
@@ -3075,6 +3384,8 @@ ARC_API arc_heartbeat_result_t arc_heartbeat_ex(uint64_t hb_count, const char* c
         if (!load_session(sess))
         {
             arc_log("heartbeat_ex", "state=3 load_session_failed");
+            if (arc_runtime_requires_live_session(g_arc_runtime_state.load(std::memory_order_acquire)))
+                enforce_violation_id(aida::reason_ids::reason_id_arc_required, "heartbeat_ex_load_session_failed");
             CFF_EXIT(hbex_cff);
         }
 
@@ -3118,11 +3429,12 @@ ARC_API arc_heartbeat_result_t arc_heartbeat_ex(uint64_t hb_count, const char* c
         {
             char dbg[320];
             _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                "compose internal_counter=%llu hb_count=%llu code_hash=%s msg=%.200s",
+                "compose internal_counter=%llu hb_count=%llu code_hash_hash=0x%016llX msg_hash=0x%016llX msg_len=%zu",
                 static_cast<unsigned long long>(sess.heartbeat_counter),
                 static_cast<unsigned long long>(hb_count),
-                code_hash_norm,
-                msg.c_str());
+                static_cast<unsigned long long>(fnv1a_str(code_hash_norm)),
+                static_cast<unsigned long long>(fnv1a(msg.data(), msg.size())),
+                msg.size());
             arc_log("heartbeat_ex", dbg);
         }
 
@@ -3154,8 +3466,8 @@ ARC_API arc_heartbeat_result_t arc_heartbeat_ex(uint64_t hb_count, const char* c
         {
             char dbg[160];
             _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                "ok proof_token=0x%016llX",
-                static_cast<unsigned long long>(hb_result.proof_token));
+                "ok proof_token_set=%d",
+                hb_result.proof_token != 0 ? 1 : 0);
             arc_log("heartbeat_ex", dbg);
         }
 
@@ -3177,8 +3489,21 @@ ARC_API bool arc_verify_watermark_trailer(const uint8_t* blob, uint64_t blob_siz
 {
     using namespace arc_internal;
     constexpr uint64_t kTrailerSize = 256ULL;
-    if (!blob || blob_size <= kTrailerSize) return false;
-    if (blob_size > 0x40000000ULL) return false;
+    if (!blob || blob_size <= kTrailerSize)
+    {
+        char dbg[96];
+        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+            "watermark_rejected reason=bad_args blob_set=%d size=%llu",
+            blob ? 1 : 0,
+            static_cast<unsigned long long>(blob_size));
+        arc_log("watermark", dbg);
+        return false;
+    }
+    if (blob_size > 0x40000000ULL)
+    {
+        arc_log("watermark", "watermark_rejected reason=size_too_large");
+        return false;
+    }
 
     const uint8_t* trailer = blob + (blob_size - kTrailerSize);
 
@@ -3189,7 +3514,11 @@ ARC_API bool arc_verify_watermark_trailer(const uint8_t* blob, uint64_t blob_siz
         if (trailer[i] != 0x00u) saw_zero = 0;
         if (trailer[i] != 0xFFu) saw_ff   = 0;
     }
-    if (saw_zero || saw_ff) return false;
+    if (saw_zero || saw_ff)
+    {
+        arc_log("watermark", "watermark_rejected reason=uniform_trailer");
+        return false;
+    }
 
     uint32_t mismatch_with_prev = 0;
     if (blob_size >= 2ULL * kTrailerSize)
@@ -3199,7 +3528,15 @@ ARC_API bool arc_verify_watermark_trailer(const uint8_t* blob, uint64_t blob_siz
         {
             if (trailer[i] != prev[i]) ++mismatch_with_prev;
         }
-        if (mismatch_with_prev < 16u) return false;
+        if (mismatch_with_prev < 16u)
+        {
+            char dbg[96];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "watermark_rejected reason=low_mismatch mismatch=%u",
+                mismatch_with_prev);
+            arc_log("watermark", dbg);
+            return false;
+        }
     }
     else
     {
@@ -3226,8 +3563,24 @@ ARC_API bool arc_verify_watermark_trailer(const uint8_t* blob, uint64_t blob_siz
             entropy_sum_sq += static_cast<uint64_t>(hist[i]) * static_cast<uint64_t>(hist[i]);
         }
     }
-    if (distinct < 24u) return false;
-    if (entropy_sum_sq > 4096ULL) return false;
+    if (distinct < 24u)
+    {
+        char dbg[96];
+        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+            "watermark_rejected reason=low_distinct distinct=%u",
+            distinct);
+        arc_log("watermark", dbg);
+        return false;
+    }
+    if (entropy_sum_sq > 4096ULL)
+    {
+        char dbg[96];
+        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+            "watermark_rejected reason=histogram_skew sq=%llu",
+            static_cast<unsigned long long>(entropy_sum_sq));
+        arc_log("watermark", dbg);
+        return false;
+    }
     (void)entropy_acc;
     (void)entropy_sum;
 
@@ -3236,6 +3589,7 @@ ARC_API bool arc_verify_watermark_trailer(const uint8_t* blob, uint64_t blob_siz
     if (!sha256_block(blob, static_cast<size_t>(payload_size), payload_digest))
     {
         SecureZeroMemory(payload_digest, sizeof(payload_digest));
+        arc_log("watermark", "watermark_rejected reason=payload_hash_failed");
         return false;
     }
 
@@ -3245,8 +3599,21 @@ ARC_API bool arc_verify_watermark_trailer(const uint8_t* blob, uint64_t blob_siz
         if (payload_digest[i] == 0) ++digest_zero_run;
     }
     SecureZeroMemory(payload_digest, sizeof(payload_digest));
-    if (digest_zero_run >= 16) return false;
+    if (digest_zero_run >= 16)
+    {
+        arc_log("watermark", "watermark_rejected reason=digest_zero_run");
+        return false;
+    }
 
+    {
+        char dbg[128];
+        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+            "watermark_ok size=%llu distinct=%u mismatch=%u payload_hash_set=1",
+            static_cast<unsigned long long>(blob_size),
+            distinct,
+            mismatch_with_prev);
+        arc_log("watermark", dbg);
+    }
     return true;
 }
 
@@ -3265,6 +3632,7 @@ __declspec(noinline) static void arc_cleanup_unregister_protection_seh()
 ARC_API void arc_cleanup()
 {
     using namespace arc_internal;
+    arc_publish_state(arc_state_cleanup, "arc_cleanup", "entry");
     g_vtable_ready.store(false, std::memory_order_release);
     arc_cleanup_unregister_protection_seh();
     std::lock_guard<std::mutex> lk(g_session_mtx);
@@ -3276,15 +3644,26 @@ ARC_API void arc_cleanup()
     g_device_enc = 0;
     g_prebound_device_enc = 0;
     g_prebound_device_key = 0;
+    arc_publish_state(arc_state_cold, "arc_cleanup", "complete");
 }
 
 ARC_API void arc_set_key_seed(const uint8_t* key_seed, uint32_t len)
 {
     using namespace arc_internal;
-    if (!key_seed || len != 32) return;
+    if (!key_seed || len != 32)
+    {
+        char dbg[96];
+        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+            "arc_set_key_seed_rejected ptr=%d len=%u",
+            key_seed ? 1 : 0,
+            len);
+        arc_log("seed", dbg);
+        return;
+    }
     std::lock_guard<std::mutex> lk(g_key_seed_mtx);
     memcpy(g_key_seed, key_seed, 32);
     g_key_seed_valid = true;
+    arc_log("seed", "arc_set_key_seed_ok len=32");
 }
 
 ARC_API uint32_t arc_copy_last_status(char* out, uint32_t cap)
@@ -3451,11 +3830,8 @@ ARC_API bool arc_unseal_feature(
         unsigned long long slot_addr = static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(&g_license_bind_slot[0]));
         char dbg[224];
         _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-            "diag_slot first8=%02X%02X%02X%02X%02X%02X%02X%02X last8=%02X%02X%02X%02X%02X%02X%02X%02X sentinel_count=%d slot_addr=0x%016llX",
-            raw_slot[0], raw_slot[1], raw_slot[2], raw_slot[3],
-            raw_slot[4], raw_slot[5], raw_slot[6], raw_slot[7],
-            raw_slot[24], raw_slot[25], raw_slot[26], raw_slot[27],
-            raw_slot[28], raw_slot[29], raw_slot[30], raw_slot[31],
+            "diag_slot hash=0x%016llX sentinel_count=%d slot_addr=0x%016llX",
+            static_cast<unsigned long long>(fnv1a(raw_slot, sizeof(raw_slot))),
             sentinel_count,
             slot_addr);
         arc_log("unseal", dbg);
@@ -3467,11 +3843,9 @@ ARC_API bool arc_unseal_feature(
         unsigned long long feat_addr = static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(&g_feature_blob[0]));
         char dbg[224];
         _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-            "diag_feat hdr=%02X%02X%02X%02X|%02X%02X%02X%02X|%02X%02X%02X%02X|%02X%02X%02X%02X entries=%u total=%u feat_addr=0x%016llX",
-            feat_bytes[0], feat_bytes[1], feat_bytes[2], feat_bytes[3],
-            feat_bytes[4], feat_bytes[5], feat_bytes[6], feat_bytes[7],
-            feat_bytes[8], feat_bytes[9], feat_bytes[10], feat_bytes[11],
-            feat_bytes[12], feat_bytes[13], feat_bytes[14], feat_bytes[15],
+            "diag_feat hdr_hash=0x%016llX blob_hash=0x%016llX entries=%u total=%u feat_addr=0x%016llX",
+            static_cast<unsigned long long>(fnv1a(feat_bytes, 16)),
+            static_cast<unsigned long long>(fnv1a(feat_bytes, hdr->total_size)),
             hdr->entry_count, hdr->total_size,
             feat_addr);
         arc_log("unseal", dbg);
@@ -3480,15 +3854,10 @@ ARC_API bool arc_unseal_feature(
     {
         char dbg[256];
         _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-            "diag_entry id=%u entry_size=%u ct_off=%u ct_len=%u iv=%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X tag_first8=%02X%02X%02X%02X%02X%02X%02X%02X tag_last8=%02X%02X%02X%02X%02X%02X%02X%02X",
+            "diag_entry id=%u entry_size=%u ct_off=%u ct_len=%u iv_hash=0x%016llX tag_hash=0x%016llX",
             match->feature_id, match->entry_size, match->ciphertext_offset, match->ciphertext_len,
-            match->iv[0], match->iv[1], match->iv[2], match->iv[3],
-            match->iv[4], match->iv[5], match->iv[6], match->iv[7],
-            match->iv[8], match->iv[9], match->iv[10], match->iv[11],
-            match->tag[0], match->tag[1], match->tag[2], match->tag[3],
-            match->tag[4], match->tag[5], match->tag[6], match->tag[7],
-            match->tag[8], match->tag[9], match->tag[10], match->tag[11],
-            match->tag[12], match->tag[13], match->tag[14], match->tag[15]);
+            static_cast<unsigned long long>(fnv1a(match->iv, sizeof(match->iv))),
+            static_cast<unsigned long long>(fnv1a(match->tag, sizeof(match->tag))));
         arc_log("unseal", dbg);
     }
 
@@ -3496,19 +3865,10 @@ ARC_API bool arc_unseal_feature(
         const uint8_t* ct = feature_blob + match->ciphertext_offset;
         char dbg[224];
         _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-            "diag_nonce len=%u first8=%02X%02X%02X%02X%02X%02X%02X%02X last8=%02X%02X%02X%02X%02X%02X%02X%02X ct_first8=%02X%02X%02X%02X%02X%02X%02X%02X info=%.*s",
+            "diag_nonce len=%u nonce_hash=0x%016llX ct_hash=0x%016llX info=%.*s",
             nonce_len,
-            nonce[0], nonce[1], nonce[2], nonce[3],
-            nonce[4], nonce[5], nonce[6], nonce[7],
-            nonce[(nonce_len >= 8) ? (nonce_len - 8) : 0],
-            nonce[(nonce_len >= 7) ? (nonce_len - 7) : 0],
-            nonce[(nonce_len >= 6) ? (nonce_len - 6) : 0],
-            nonce[(nonce_len >= 5) ? (nonce_len - 5) : 0],
-            nonce[(nonce_len >= 4) ? (nonce_len - 4) : 0],
-            nonce[(nonce_len >= 3) ? (nonce_len - 3) : 0],
-            nonce[(nonce_len >= 2) ? (nonce_len - 2) : 0],
-            nonce[(nonce_len >= 1) ? (nonce_len - 1) : 0],
-            ct[0], ct[1], ct[2], ct[3], ct[4], ct[5], ct[6], ct[7],
+            static_cast<unsigned long long>(fnv1a(nonce, nonce_len)),
+            static_cast<unsigned long long>(fnv1a(ct, match->ciphertext_len)),
             info_len, info);
         arc_log("unseal", dbg);
     }
@@ -3532,11 +3892,8 @@ ARC_API bool arc_unseal_feature(
     {
         char dbg[160];
         _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-            "diag_bs first8=%02X%02X%02X%02X%02X%02X%02X%02X last8=%02X%02X%02X%02X%02X%02X%02X%02X",
-            local_secret[0], local_secret[1], local_secret[2], local_secret[3],
-            local_secret[4], local_secret[5], local_secret[6], local_secret[7],
-            local_secret[24], local_secret[25], local_secret[26], local_secret[27],
-            local_secret[28], local_secret[29], local_secret[30], local_secret[31]);
+            "diag_bs hash=0x%016llX",
+            static_cast<unsigned long long>(fnv1a(local_secret, sizeof(local_secret))));
         arc_log("unseal", dbg);
     }
     const bool hkdf_ok = hkdf_sha256(local_secret, 32,
@@ -3553,11 +3910,8 @@ ARC_API bool arc_unseal_feature(
     {
         char dbg[160];
         _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-            "diag_fk first8=%02X%02X%02X%02X%02X%02X%02X%02X last8=%02X%02X%02X%02X%02X%02X%02X%02X",
-            feature_key[0], feature_key[1], feature_key[2], feature_key[3],
-            feature_key[4], feature_key[5], feature_key[6], feature_key[7],
-            feature_key[24], feature_key[25], feature_key[26], feature_key[27],
-            feature_key[28], feature_key[29], feature_key[30], feature_key[31]);
+            "diag_fk hash=0x%016llX",
+            static_cast<unsigned long long>(fnv1a(feature_key, sizeof(feature_key))));
         arc_log("unseal", dbg);
     }
 

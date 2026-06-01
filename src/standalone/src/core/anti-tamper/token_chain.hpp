@@ -183,7 +183,8 @@ namespace token_chain {
             auto* kuser = reinterpret_cast<const volatile uint8_t*>(
                 reinterpret_cast<void*>(static_cast<uintptr_t>(0x7FFE0000)));
             uint8_t kd_active = kuser[0x2D4];
-            if (kd_active != 0)
+            uint8_t kd_not_present = kuser[0x2D5];
+            if (kd_active != 0 && kd_not_present == 0)
                 result |= 8ULL;
 
             bool hw_bp = false;

@@ -1,6 +1,7 @@
 #include "wb_ed25519.hpp"
 
 #include "../anti-tamper/dr_check.hpp"
+#include "../../helpers/diag_log.hpp"
 
 #include <atomic>
 #include <cstring>
@@ -14,6 +15,13 @@ namespace
     void set_err(const char* e) noexcept
     {
         s_last_error.store(e, std::memory_order_release);
+        diag::log_tagged_fmt("wb_ed25519", "error=%s", e ? e : "");
+    }
+
+    const char* current_err() noexcept
+    {
+        const char* e = s_last_error.load(std::memory_order_acquire);
+        return e ? e : "";
     }
 
     using u8  = uint8_t;
@@ -26,6 +34,18 @@ namespace
     static __forceinline u64 rotr64(u64 x, unsigned n) noexcept
     {
         return (x >> n) | (x << (64 - n));
+    }
+
+    static __forceinline u64 fnv1a64_bytes(const u8* data, size_t len) noexcept
+    {
+        u64 h = 14695981039346656037ULL;
+        if (!data) return h;
+        for (size_t i = 0; i < len; ++i)
+        {
+            h ^= static_cast<u64>(data[i]);
+            h *= 1099511628211ULL;
+        }
+        return h;
     }
 
     static __forceinline u64 load_be64(const u8* p) noexcept
@@ -494,8 +514,8 @@ namespace
     static const u8 k_d_bytes[32] = {
         0xa3,0x78,0x59,0x13,0xca,0x4d,0xeb,0x75,
         0xab,0xd8,0x41,0x41,0x4d,0x0a,0x70,0x00,
-        0x98,0xe8,0x79,0x77,0x94,0x0c,0x78,0xc7,
-        0x3f,0xe6,0xf2,0xbb,0xcb,0x77,0x60,0x52
+        0x98,0xe8,0x79,0x77,0x79,0x40,0xc7,0x8c,
+        0x73,0xfe,0x6f,0x2b,0xee,0x6c,0x03,0x52
     };
     static const u8 k_sqrtm1_bytes[32] = {
         0xb0,0xa0,0x0e,0x4a,0x27,0x1b,0xee,0xc4,
@@ -1306,13 +1326,26 @@ namespace
         auto& st = self_test_state();
         if (st.attempted.load(std::memory_order_acquire))
         {
-            return st.ok.load(std::memory_order_acquire);
+            bool cached = st.ok.load(std::memory_order_acquire);
+            diag::log_tagged_fmt("wb_ed25519",
+                "self_test cached=%d err=%s",
+                cached ? 1 : 0,
+                current_err());
+            return cached;
         }
+        diag::log_tagged_fmt("wb_ed25519",
+            "self_test begin kat_msg_len=0 sig_hash=0x%016llX pk_hash=0x%016llX",
+            static_cast<unsigned long long>(fnv1a64_bytes(k_kat_sig, sizeof(k_kat_sig))),
+            static_cast<unsigned long long>(fnv1a64_bytes(k_kat_pk, sizeof(k_kat_pk))));
         init_base_tables_locked();
         bool r = verify_inner(nullptr, 0, k_kat_sig, k_kat_pk);
         st.ok.store(r, std::memory_order_release);
         st.attempted.store(true, std::memory_order_release);
         if (!r) set_err("wb_ed25519_self_test_failed");
+        diag::log_tagged_fmt("wb_ed25519",
+            "self_test result=%d err=%s",
+            r ? 1 : 0,
+            current_err());
         return r;
     }
 
@@ -1338,26 +1371,41 @@ namespace aida::wb_ed25519
                 const uint8_t* sig_64bytes,
                 const uint8_t* pubkey_32bytes) noexcept
     {
+        diag::log_tagged_fmt("wb_ed25519",
+            "verify enter msg_len=%zu msg_hash=0x%016llX sig_hash=0x%016llX pk_hash=0x%016llX",
+            msg_len,
+            static_cast<unsigned long long>(fnv1a64_bytes(msg, msg_len)),
+            static_cast<unsigned long long>(fnv1a64_bytes(sig_64bytes, sig_64bytes ? 64 : 0)),
+            static_cast<unsigned long long>(fnv1a64_bytes(pubkey_32bytes, pubkey_32bytes ? 32 : 0)));
         if (anti_tamper::dr_check::any_hw_breakpoint_set())
         {
             set_err("hw_breakpoint_at_verify");
+            diag::log_tagged("wb_ed25519", "verify rejected reason=hw_breakpoint");
             return false;
         }
         if ((void)k_aida_v_anchor[0], sig_64bytes == nullptr || pubkey_32bytes == nullptr)
         {
             set_err("wb_ed25519_null_input");
+            diag::log_tagged("wb_ed25519", "verify rejected reason=null_input");
             return false;
         }
         if (msg == nullptr && msg_len != 0)
         {
             set_err("wb_ed25519_null_msg_with_len");
+            diag::log_tagged("wb_ed25519", "verify rejected reason=null_msg_with_len");
             return false;
         }
         if (!run_self_test_once())
         {
+            diag::log_tagged_fmt("wb_ed25519", "verify rejected reason=self_test err=%s",
+                current_err());
             return false;
         }
-        return verify_inner(msg, msg_len, sig_64bytes, pubkey_32bytes);
+        bool ok = verify_inner(msg, msg_len, sig_64bytes, pubkey_32bytes);
+        diag::log_tagged_fmt("wb_ed25519", "verify result=%d err=%s",
+            ok ? 1 : 0,
+            ok ? "" : current_err());
+        return ok;
     }
 
     const char* last_error() noexcept
@@ -1368,6 +1416,10 @@ namespace aida::wb_ed25519
 
     bool self_test_ok() noexcept
     {
-        return run_self_test_once();
+        bool ok = run_self_test_once();
+        diag::log_tagged_fmt("wb_ed25519", "self_test_ok return=%d err=%s",
+            ok ? 1 : 0,
+            ok ? "" : last_error());
+        return ok;
     }
 }
