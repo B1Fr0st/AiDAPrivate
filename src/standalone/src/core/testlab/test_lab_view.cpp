@@ -15,6 +15,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <exception>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -72,17 +73,6 @@ namespace test_lab_view {
 
 		const char* run_all_log_path() {
 			return "C:\\Users\\Public\\Desktop\\aida_test_results.log";
-		}
-
-		bool is_destructive_feature(const char* category, const char* name) {
-			if (category == nullptr || name == nullptr) return false;
-			return
-				(std::strcmp(category, "tamper") == 0 && std::strcmp(name, "ABRT") == 0) ||
-				(std::strcmp(category, "evidence") == 0 && std::strcmp(name, "RECU") == 0) ||
-				(std::strcmp(category, "remote-call") == 0 && std::strcmp(name, "RC") == 0) ||
-				(std::strcmp(category, "thread") == 0 && std::strcmp(name, "TSR") == 0) ||
-				(std::strcmp(category, "module") == 0 && std::strcmp(name, "PINJ") == 0) ||
-				(std::strcmp(category, "anti-debug") == 0 && std::strcmp(name, "DBGA") == 0);
 		}
 
 		void populate_safe_defaults(test_lab::state_t& s) {
@@ -418,7 +408,9 @@ namespace test_lab_view {
 				g_run_all_current_name.clear();
 			}
 
-			work_queue::post([]() {
+			bool posted = false;
+			try {
+				posted = work_queue::post([]() {
 				const auto& features = test_lab::all_features();
 				g_run_all_total.store(static_cast<int>(features.size()));
 
@@ -446,10 +438,12 @@ namespace test_lab_view {
 						g_run_all_current_name = (f.name != nullptr ? f.name : "?");
 					}
 
-					if (is_destructive_feature(f.category, f.name)) {
+					const char* destructive_reason = test_lab::destructive_guard_reason(f.category, f.name);
+					if (destructive_reason != nullptr) {
 						g_run_all_skipped.fetch_add(1);
-						append_log_skip(hFile, f, "destructive (BSOD/kill)");
-						test_lab_format::testlab_diag_log_skip(f, "destructive (BSOD/kill)");
+						std::string reason = std::string("destructive guard: ") + destructive_reason;
+						append_log_skip(hFile, f, reason.c_str());
+						test_lab_format::testlab_diag_log_skip(f, reason.c_str());
 						continue;
 					}
 					if (f.run == nullptr) {
@@ -507,7 +501,21 @@ namespace test_lab_view {
 					g_run_all_current_name.clear();
 				}
 				g_run_all_active.store(false);
-			});
+				});
+			} catch (const std::exception& ex) {
+				diag::log_tagged_fmt("test_lab", "run_all_safe work_queue post exception: %s", ex.what());
+			} catch (...) {
+				diag::log_tagged("test_lab", "run_all_safe work_queue post unknown exception");
+			}
+			if (!posted) {
+				g_run_all_active.store(false, std::memory_order_release);
+				{
+					std::lock_guard<std::mutex> lk(g_run_all_status_mtx);
+					g_run_all_status_line = "start failed: work queue unavailable";
+					g_run_all_current_name.clear();
+				}
+				diag::log_tagged("test_lab", "run_all_safe work_queue post failed");
+			}
 		}
 
 		struct grouped_row_t {

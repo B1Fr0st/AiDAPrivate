@@ -1565,43 +1565,62 @@ namespace handle_strip
             return false;
         }
 
+        auto wait_for_worker = [&](HANDLE thread, const char* path) -> bool
+        {
+            DWORD wait = WaitForSingleObject(state->done_event, timeout_ms);
+            if (wait == WAIT_OBJECT_0)
+            {
+                bool ok = state->ok.load(std::memory_order_acquire);
+                DWORD seh = state->seh_code.load(std::memory_order_acquire);
+                if (thread)
+                    CloseHandle(thread);
+                CloseHandle(state->done_event);
+                delete state;
+                if (seh != 0)
+                {
+                    char buf[128];
+                    _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                        "seal_dacl_worker_seh path=%s code=0x%08lX",
+                        path ? path : "unknown", seh);
+                    webhook::write_log("anti_dump", buf);
+                    return false;
+                }
+                return ok;
+            }
+
+            char buf[160];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "seal_dacl_worker_timeout path=%s wait=0x%08lX timeout_ms=%lu",
+                path ? path : "unknown", wait, timeout_ms);
+            webhook::write_log("anti_dump", buf);
+            if (thread)
+                CloseHandle(thread);
+            return false;
+        };
+
+        SetLastError(ERROR_SUCCESS);
         HANDLE thread = CreateThread(nullptr, 0, dacl_seal_worker_proc, state, 0, nullptr);
         if (!thread)
         {
+            DWORD create_gle = GetLastError();
             char buf[96];
             _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                "seal_dacl_worker_create_failed gle=%lu", GetLastError());
+                "seal_dacl_worker_create_failed gle=%lu", create_gle);
             webhook::write_log("anti_dump", buf);
-            CloseHandle(state->done_event);
-            delete state;
-            return false;
-        }
-
-        DWORD wait = WaitForSingleObject(state->done_event, timeout_ms);
-        if (wait == WAIT_OBJECT_0)
-        {
-            bool ok = state->ok.load(std::memory_order_acquire);
-            DWORD seh = state->seh_code.load(std::memory_order_acquire);
-            CloseHandle(thread);
-            CloseHandle(state->done_event);
-            delete state;
-            if (seh != 0)
+            bool posted = work_queue::post([state]() {
+                dacl_seal_worker_proc(state);
+            });
+            if (!posted)
             {
-                char buf[96];
-                _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                    "seal_dacl_worker_seh code=0x%08lX", seh);
-                webhook::write_log("anti_dump", buf);
+                webhook::write_log("anti_dump", "seal_dacl_worker_work_queue_post_failed");
+                CloseHandle(state->done_event);
+                delete state;
                 return false;
             }
-            return ok;
+            return wait_for_worker(nullptr, "work_queue");
         }
 
-        char buf[128];
-        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-            "seal_dacl_worker_timeout wait=0x%08lX timeout_ms=%lu", wait, timeout_ms);
-        webhook::write_log("anti_dump", buf);
-        CloseHandle(thread);
-        return false;
+        return wait_for_worker(thread, "thread");
     }
 
     inline void revoke_debug_privileges()

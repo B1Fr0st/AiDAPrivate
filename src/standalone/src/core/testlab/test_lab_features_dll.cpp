@@ -1,12 +1,16 @@
 #include "test_lab.hpp"
 #include "test_lab_format.hpp"
 #include "../../../../driver/comm.h"
+#include "../runtime/standalone_driver.hpp"
 #include "imgui/imgui.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <intrin.h>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -39,6 +43,57 @@ namespace {
 		char b[40];
 		std::snprintf(b, sizeof(b), "0x%016llX", static_cast<unsigned long long>(v));
 		r.parsed.push_back({ label, b });
+	}
+
+	void push_bool(test_lab::result_t& r, const char* label, bool v) {
+		r.parsed.push_back({ label, v ? "1" : "0" });
+	}
+
+	bool parse_u64_hex_strict(const std::string& text, std::uint64_t& out) {
+		out = 0;
+		if (text.empty())
+			return false;
+		const char* p = text.c_str();
+		if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X'))
+			p += 2;
+		if (*p == '\0')
+			return false;
+		std::uint64_t acc = 0;
+		std::uint32_t digits = 0;
+		while (*p) {
+			const char c = *p++;
+			std::uint64_t d = 0;
+			if (c >= '0' && c <= '9')
+				d = static_cast<std::uint64_t>(c - '0');
+			else if (c >= 'a' && c <= 'f')
+				d = static_cast<std::uint64_t>(10 + (c - 'a'));
+			else if (c >= 'A' && c <= 'F')
+				d = static_cast<std::uint64_t>(10 + (c - 'A'));
+			else
+				return false;
+			if (++digits > 16)
+				return false;
+			acc = (acc << 4) | d;
+		}
+		out = acc;
+		return digits > 0;
+	}
+
+	std::uint64_t compute_dprt_hash(const std::vector<std::uint8_t>& bytes) {
+		std::uint64_t h1 = 0xFFFFFFFFULL;
+		std::uint64_t h2 = 0x85EBCA6BULL;
+		const std::size_t aligned_end = bytes.size() & ~static_cast<std::size_t>(7);
+		for (std::size_t i = 0; i < aligned_end; i += 8) {
+			std::uint64_t block = 0;
+			std::memcpy(&block, bytes.data() + i, sizeof(block));
+			h1 = _mm_crc32_u64(h1, block);
+			h2 = _mm_crc32_u64(h2, block ^ 0xA5A5A5A5A5A5A5A5ULL);
+		}
+		for (std::size_t i = aligned_end; i < bytes.size(); ++i) {
+			h1 = _mm_crc32_u8(static_cast<unsigned int>(h1), bytes[i]);
+			h2 = _mm_crc32_u8(static_cast<unsigned int>(h2), bytes[i] ^ 0xA5u);
+		}
+		return (h1 & 0xFFFFFFFFULL) | ((h2 & 0xFFFFFFFFULL) << 32);
 	}
 
 	void render_inputs_dprt(test_lab::state_t& s) {
@@ -84,28 +139,14 @@ namespace {
 		}
 
 		std::uint64_t expected_hash = 0;
-		if (!s.text_b.empty()) {
-			const char* p = s.text_b.c_str();
-			if ((p[0] == '0') && (p[1] == 'x' || p[1] == 'X')) p += 2;
-			std::uint64_t acc = 0;
-			bool any = false;
-			while (*p) {
-				char c = *p++;
-				std::uint64_t d = 0;
-				if (c >= '0' && c <= '9') d = static_cast<std::uint64_t>(c - '0');
-				else if (c >= 'a' && c <= 'f') d = static_cast<std::uint64_t>(10 + (c - 'a'));
-				else if (c >= 'A' && c <= 'F') d = static_cast<std::uint64_t>(10 + (c - 'A'));
-				else continue;
-				acc = (acc << 4) | d;
-				any = true;
-			}
-			if (any) expected_hash = acc;
-		}
+		const bool supplied_hash = parse_u64_hex_strict(s.text_b, expected_hash);
+
+		const std::uint64_t module_key = (s.u64_a != 0) ? s.u64_a : s.addr;
 
 		voyager::detail::dll_protect_request req{};
 		req.operation         = s.u32_a;
 		req.pid               = s.pid;
-		req.module_base       = s.u64_a;
+		req.module_base       = module_key;
 		req.text_section_va   = s.addr;
 		req.text_section_size = s.size;
 		req.expected_hash     = expected_hash;
@@ -117,11 +158,52 @@ namespace {
 				r.error = "REGISTER requires a non-zero PID";
 				return;
 			}
-			if (s.addr == 0 || s.size == 0 || expected_hash == 0) {
+			if (s.addr == 0 || s.size == 0) {
 				r.ok = false;
-				r.error = "REGISTER requires text_section_va, text size and expected_hash to be non-zero";
+				r.error = "REGISTER requires text_section_va and text size to be non-zero";
 				return;
 			}
+			if (s.size > 0x100000u) {
+				r.ok = false;
+				r.error = "REGISTER text size exceeds safe Test Lab cap";
+				r.ntstatus = static_cast<std::int32_t>(0xC0000206u);
+				return;
+			}
+			if (s.u64_a == 0)
+				r.parsed.push_back({ "module_base_source", "text_section_va_fallback" });
+
+			std::vector<std::uint8_t> baseline;
+			const bool read_ok = driver_bridge::read_memory_for(s.pid, s.addr, s.size, baseline);
+			push_bool(r, "baseline_read_ok", read_ok);
+			push_u32_hex(r, "baseline_requested_size", s.size);
+			push_u32_hex(r, "baseline_bytes_read", static_cast<std::uint32_t>(baseline.size()));
+			if (!read_ok || baseline.size() != s.size) {
+				r.ok = false;
+				r.error = "failed to read exact DPRT baseline bytes from target";
+				r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
+				return;
+			}
+
+			const std::uint64_t live_hash = compute_dprt_hash(baseline);
+			push_bool(r, "expected_hash_supplied", supplied_hash);
+			push_u64_hex(r, "live_baseline_hash", live_hash);
+			if (!supplied_hash || expected_hash == 0) {
+				expected_hash = live_hash;
+				req.expected_hash = expected_hash;
+				r.parsed.push_back({ "expected_hash_source", "computed_live_baseline" });
+			} else if (expected_hash != live_hash) {
+				r.ok = false;
+				r.error = "provided expected_hash does not match live target bytes; refusing to arm bugcheckable DPRT slot";
+				r.ntstatus = static_cast<std::int32_t>(0xC0000022u);
+				return;
+			} else {
+				r.parsed.push_back({ "expected_hash_source", "provided_verified" });
+			}
+			if (req.check_interval == 0)
+				req.check_interval = 30000u;
+			push_u32_hex(r, "effective_check_interval_ms", req.check_interval);
+		} else if (!s.text_b.empty() && !supplied_hash) {
+			r.parsed.push_back({ "expected_hash_input", "ignored_non_hex" });
 		}
 
 		std::uint32_t bytes_returned = 0;
@@ -135,6 +217,68 @@ namespace {
 			r.error = "send_ioctl_raw returned false";
 			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
 			return;
+		}
+
+		if (s.u32_a == voyager::detail::DPRT_OP_REGISTER) {
+			r.parsed.push_back({ "register_status", dprt_status_label(req.status) });
+			push_u32_hex(r, "register_bytes_returned", bytes_returned);
+			if (req.status != voyager::detail::DPRT_STATUS_ACTIVE || req.current_hash != req.expected_hash) {
+				voyager::detail::dll_protect_request cleanup{};
+				cleanup.operation = voyager::detail::DPRT_OP_UNREGISTER;
+				cleanup.pid = s.pid;
+				cleanup.module_base = req.module_base;
+				std::uint32_t cleanup_bytes = 0;
+				device->send_ioctl_raw(ioctl_codes::DPRT(), &cleanup, static_cast<std::uint32_t>(sizeof(cleanup)), cleanup_bytes);
+				r.ok = false;
+				r.error = "DPRT register did not return active matching status";
+				r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
+				return;
+			}
+
+			voyager::detail::dll_protect_request query{};
+			query.operation = voyager::detail::DPRT_OP_QUERY;
+			query.pid = s.pid;
+			query.module_base = req.module_base;
+			std::uint32_t query_bytes = 0;
+			const bool query_ok = device->send_ioctl_raw(ioctl_codes::DPRT(), &query,
+				static_cast<std::uint32_t>(sizeof(query)), query_bytes);
+			push_bool(r, "query_after_register_ok", query_ok);
+			push_u32_hex(r, "query_after_register_bytes", query_bytes);
+			r.parsed.push_back({ "query_after_register_status", dprt_status_label(query.status) });
+			push_u64_hex(r, "query_after_register_current_hash", query.current_hash);
+
+			voyager::detail::dll_protect_request unreg{};
+			unreg.operation = voyager::detail::DPRT_OP_UNREGISTER;
+			unreg.pid = s.pid;
+			unreg.module_base = req.module_base;
+			std::uint32_t unreg_bytes = 0;
+			const bool unreg_ok = device->send_ioctl_raw(ioctl_codes::DPRT(), &unreg,
+				static_cast<std::uint32_t>(sizeof(unreg)), unreg_bytes);
+			push_bool(r, "unregister_ok", unreg_ok);
+			push_u32_hex(r, "unregister_bytes", unreg_bytes);
+			r.parsed.push_back({ "unregister_status", dprt_status_label(unreg.status) });
+
+			voyager::detail::dll_protect_request post{};
+			post.operation = voyager::detail::DPRT_OP_QUERY;
+			post.pid = s.pid;
+			post.module_base = req.module_base;
+			std::uint32_t post_bytes = 0;
+			const bool post_ok = device->send_ioctl_raw(ioctl_codes::DPRT(), &post,
+				static_cast<std::uint32_t>(sizeof(post)), post_bytes);
+			push_bool(r, "query_after_unregister_ok", post_ok);
+			push_u32_hex(r, "query_after_unregister_bytes", post_bytes);
+			r.parsed.push_back({ "query_after_unregister_status", dprt_status_label(post.status) });
+			r.ok = query_ok &&
+				unreg_ok &&
+				post_ok &&
+				query.status == voyager::detail::DPRT_STATUS_ACTIVE &&
+				query.current_hash == expected_hash &&
+				post.status == voyager::detail::DPRT_STATUS_INACTIVE;
+			if (!r.ok) {
+				r.error = "DPRT register/query/unregister round-trip did not verify all expected states";
+				r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
+				return;
+			}
 		}
 
 		r.parsed.push_back({ "operation", dprt_op_label(req.operation) });

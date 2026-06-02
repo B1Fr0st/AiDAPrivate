@@ -7,6 +7,7 @@
 #include <d3d11.h>
 #include <tchar.h>
 #include <windowsx.h>
+#include <psapi.h>
 #include <algorithm>
 #include "helpers/helpers.h"
 #include "helpers/blur.h"
@@ -492,6 +493,24 @@ namespace aida_tracer {
     inline std::atomic<uint64_t> g_dispatch_enter_count{0};
     inline std::atomic<uint64_t> g_dispatch_exit_count{0};
     inline std::atomic<uint64_t> g_last_thread_snapshot_ms{0};
+    inline std::atomic<uint64_t> g_dx11_frame{0};
+    inline std::atomic<uint64_t> g_dx11_enter_tick_ms{0};
+    inline std::atomic<UINT_PTR> g_dx11_draw_data{0};
+    inline std::atomic<UINT_PTR> g_dx11_device{0};
+    inline std::atomic<UINT_PTR> g_dx11_context{0};
+    inline std::atomic<UINT_PTR> g_dx11_rtv{0};
+    inline std::atomic<uint64_t> g_dx11_cmd_lists{0};
+    inline std::atomic<uint64_t> g_dx11_vtx_count{0};
+    inline std::atomic<uint64_t> g_dx11_idx_count{0};
+    inline std::atomic<int> g_dx11_display_w1000{0};
+    inline std::atomic<int> g_dx11_display_h1000{0};
+    inline std::atomic<int> g_dx11_fb_scale_w1000{0};
+    inline std::atomic<int> g_dx11_fb_scale_h1000{0};
+    inline std::atomic<long> g_dx11_device_removed{S_OK};
+    inline std::atomic<uint64_t> g_present_frame{0};
+    inline std::atomic<uint64_t> g_present_enter_tick_ms{0};
+    inline std::atomic<UINT_PTR> g_present_swapchain{0};
+    inline std::atomic<long> g_present_hr{S_OK};
     inline std::atomic<bool> g_stop{false};
 
     inline const char* message_name(UINT msg) {
@@ -625,19 +644,33 @@ namespace aida_tracer {
         g_wndproc_exit_count.fetch_add(1, std::memory_order_acq_rel);
     }
 
+    inline int scaled_1000(float v) {
+        return static_cast<int>(v * 1000.0f);
+    }
+
     inline void describe_address(uint64_t va, char* out, size_t out_size) {
         if (!out || out_size == 0) return;
         out[0] = 0;
         MEMORY_BASIC_INFORMATION mbi{};
         HMODULE mod = nullptr;
-        char module_path[MAX_PATH] = {};
+        char module_path[MAX_PATH * 4] = {};
+        char mapped_path[MAX_PATH * 4] = {};
         const bool have_mbi = VirtualQuery(reinterpret_cast<LPCVOID>(va), &mbi, sizeof(mbi)) != 0;
+        DWORD module_len = 0;
+        DWORD module_gle = 0;
+        DWORD mapped_len = 0;
+        DWORD mapped_gle = 0;
         if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                 reinterpret_cast<LPCSTR>(va), &mod) && mod) {
-            GetModuleFileNameA(mod, module_path, static_cast<DWORD>(sizeof(module_path)));
+            module_len = GetModuleFileNameA(mod, module_path, static_cast<DWORD>(sizeof(module_path)));
+            module_gle = module_len ? 0 : GetLastError();
         }
+        mapped_len = GetMappedFileNameA(GetCurrentProcess(), reinterpret_cast<LPVOID>(va), mapped_path, static_cast<DWORD>(sizeof(mapped_path)));
+        mapped_gle = mapped_len ? 0 : GetLastError();
+        uint64_t mod_base = static_cast<uint64_t>(reinterpret_cast<UINT_PTR>(mod));
+        uint64_t mod_off = (mod_base != 0 && va >= mod_base) ? (va - mod_base) : 0;
         _snprintf_s(out, out_size, _TRUNCATE,
-            "addr=0x%016llX mbi=%d base=0x%016llX alloc=0x%016llX protect=0x%lX state=0x%lX type=0x%lX module=0x%016llX path=%s",
+            "addr=0x%016llX mbi=%d base=0x%016llX alloc=0x%016llX protect=0x%lX state=0x%lX type=0x%lX module=0x%016llX mod_off=0x%llX path='%s' path_len=%lu path_gle=%lu mapped='%s' mapped_len=%lu mapped_gle=%lu",
             static_cast<unsigned long long>(va),
             have_mbi ? 1 : 0,
             have_mbi ? static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(mbi.BaseAddress)) : 0ull,
@@ -646,7 +679,13 @@ namespace aida_tracer {
             have_mbi ? static_cast<unsigned long>(mbi.State) : 0ul,
             have_mbi ? static_cast<unsigned long>(mbi.Type) : 0ul,
             static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(mod)),
-            module_path[0] ? module_path : "<none>");
+            static_cast<unsigned long long>(mod_off),
+            module_path[0] ? module_path : "<none>",
+            static_cast<unsigned long>(module_len),
+            static_cast<unsigned long>(module_gle),
+            mapped_path[0] ? mapped_path : "<none>",
+            static_cast<unsigned long>(mapped_len),
+            static_cast<unsigned long>(mapped_gle));
     }
 
     inline void capture_render_thread_snapshot(DWORD render_tid, uint64_t age_ms) {
@@ -694,7 +733,7 @@ namespace aida_tracer {
         uint64_t r8 = 0;
         uint64_t r9 = 0;
 #endif
-        char rip_desc[512] = {};
+        char rip_desc[1024] = {};
         describe_address(rip, rip_desc, sizeof(rip_desc));
 
         uint64_t stack_values[12] = {};
@@ -741,6 +780,17 @@ namespace aida_tracer {
             static_cast<unsigned long long>(stack_values[9]),
             static_cast<unsigned long long>(stack_values[10]),
             static_cast<unsigned long long>(stack_values[11]));
+        for (size_t i = 0; i < 12; ++i) {
+            if (stack_values[i] == 0)
+                continue;
+            char slot_desc[1024] = {};
+            describe_address(stack_values[i], slot_desc, sizeof(slot_desc));
+            diag::log_tagged_critical_fmt("tracer",
+                "render_thread_stack_slot idx=%llu value=0x%016llX %s",
+                static_cast<unsigned long long>(i),
+                static_cast<unsigned long long>(stack_values[i]),
+                slot_desc);
+        }
     }
 
     inline void mark_render_phase(const char* name) {
@@ -756,6 +806,38 @@ namespace aida_tracer {
         g_render_thread_id.store(GetCurrentThreadId(), std::memory_order_release);
         g_render_frame.store(frame, std::memory_order_release);
         g_render_last_tick_ms.store(static_cast<uint64_t>(GetTickCount64()), std::memory_order_release);
+    }
+
+    inline void set_dx11_draw_state(const char* stage,
+                                    uint64_t frame,
+                                    ImDrawData* dd,
+                                    ID3D11Device* device,
+                                    ID3D11DeviceContext* context,
+                                    ID3D11RenderTargetView* rtv,
+                                    HRESULT device_removed) {
+        g_dx11_frame.store(frame, std::memory_order_release);
+        g_dx11_enter_tick_ms.store(static_cast<uint64_t>(GetTickCount64()), std::memory_order_release);
+        g_dx11_draw_data.store(reinterpret_cast<UINT_PTR>(dd), std::memory_order_release);
+        g_dx11_device.store(reinterpret_cast<UINT_PTR>(device), std::memory_order_release);
+        g_dx11_context.store(reinterpret_cast<UINT_PTR>(context), std::memory_order_release);
+        g_dx11_rtv.store(reinterpret_cast<UINT_PTR>(rtv), std::memory_order_release);
+        g_dx11_cmd_lists.store(dd ? static_cast<uint64_t>(dd->CmdListsCount) : 0, std::memory_order_release);
+        g_dx11_vtx_count.store(dd ? static_cast<uint64_t>(dd->TotalVtxCount) : 0, std::memory_order_release);
+        g_dx11_idx_count.store(dd ? static_cast<uint64_t>(dd->TotalIdxCount) : 0, std::memory_order_release);
+        g_dx11_display_w1000.store(dd ? scaled_1000(dd->DisplaySize.x) : 0, std::memory_order_release);
+        g_dx11_display_h1000.store(dd ? scaled_1000(dd->DisplaySize.y) : 0, std::memory_order_release);
+        g_dx11_fb_scale_w1000.store(dd ? scaled_1000(dd->FramebufferScale.x) : 0, std::memory_order_release);
+        g_dx11_fb_scale_h1000.store(dd ? scaled_1000(dd->FramebufferScale.y) : 0, std::memory_order_release);
+        g_dx11_device_removed.store(static_cast<long>(device_removed), std::memory_order_release);
+        mark_render_phase(stage);
+    }
+
+    inline void set_present_state(const char* stage, uint64_t frame, IDXGISwapChain* sc, HRESULT hr) {
+        g_present_frame.store(frame, std::memory_order_release);
+        g_present_enter_tick_ms.store(static_cast<uint64_t>(GetTickCount64()), std::memory_order_release);
+        g_present_swapchain.store(reinterpret_cast<UINT_PTR>(sc), std::memory_order_release);
+        g_present_hr.store(static_cast<long>(hr), std::memory_order_release);
+        mark_render_phase(stage);
     }
 
     inline void run_tracer_thread() {
@@ -786,6 +868,10 @@ namespace aida_tracer {
             UINT_PTR wndproc_hwnd = g_wndproc_hwnd.load(std::memory_order_acquire);
             UINT_PTR wndproc_wparam = g_wndproc_wparam.load(std::memory_order_acquire);
             LONG_PTR wndproc_lparam = g_wndproc_lparam.load(std::memory_order_acquire);
+            uint64_t dx11_enter = g_dx11_enter_tick_ms.load(std::memory_order_acquire);
+            uint64_t present_enter = g_present_enter_tick_ms.load(std::memory_order_acquire);
+            uint64_t dx11_age = (dx11_enter > 0 && now >= dx11_enter) ? (now - dx11_enter) : 0;
+            uint64_t present_age = (present_enter > 0 && now >= present_enter) ? (now - present_enter) : 0;
 
             uint64_t age_ms = (last_tick > 0 && now >= last_tick) ? (now - last_tick) : 0;
             bool render_stalled = (last_tick > 0 && age_ms > kStallThresholdMs && frame == prev_frame
@@ -795,7 +881,7 @@ namespace aida_tracer {
                 stall_streak++;
                 if (stall_streak == 1 || (stall_streak % 20ULL) == 0ULL) {
                     diag::log_tagged_critical_fmt("tracer",
-                        "RENDER_STALL streak=%llu frame=%llu age_ms=%llu phase=%s phase_id=%llu render_tid=%lu attach=%s attach_id=%llu peek_qs=0x%08lX peek_gle=%lu dispatch=%s msg=%s(0x%04X) hwnd=0x%llX wp=0x%llX lp=0x%llX wndproc=%s msg=%s(0x%04X) hwnd=0x%llX wp=0x%llX lp=0x%llX tracer_tid=%lu",
+                        "RENDER_STALL streak=%llu frame=%llu age_ms=%llu phase=%s phase_id=%llu render_tid=%lu attach=%s attach_id=%llu peek_qs=0x%08lX peek_gle=%lu dispatch=%s msg=%s(0x%04X) hwnd=0x%llX wp=0x%llX lp=0x%llX wndproc=%s msg=%s(0x%04X) hwnd=0x%llX wp=0x%llX lp=0x%llX dx_frame=%llu dx_age_ms=%llu dx_dd=0x%llX dx_dev=0x%llX dx_ctx=0x%llX dx_rtv=0x%llX dx_cmd=%llu dx_vtx=%llu dx_idx=%llu dx_disp1000=%d,%d dx_fb1000=%d,%d dx_removed=0x%08lX present_frame=%llu present_age_ms=%llu present_sc=0x%llX present_hr=0x%08lX tracer_tid=%lu",
                         (unsigned long long)stall_streak,
                         (unsigned long long)frame,
                         (unsigned long long)age_ms,
@@ -818,6 +904,24 @@ namespace aida_tracer {
                         (unsigned long long)wndproc_hwnd,
                         (unsigned long long)wndproc_wparam,
                         (unsigned long long)wndproc_lparam,
+                        static_cast<unsigned long long>(g_dx11_frame.load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(dx11_age),
+                        static_cast<unsigned long long>(g_dx11_draw_data.load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(g_dx11_device.load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(g_dx11_context.load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(g_dx11_rtv.load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(g_dx11_cmd_lists.load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(g_dx11_vtx_count.load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(g_dx11_idx_count.load(std::memory_order_acquire)),
+                        g_dx11_display_w1000.load(std::memory_order_acquire),
+                        g_dx11_display_h1000.load(std::memory_order_acquire),
+                        g_dx11_fb_scale_w1000.load(std::memory_order_acquire),
+                        g_dx11_fb_scale_h1000.load(std::memory_order_acquire),
+                        static_cast<unsigned long>(g_dx11_device_removed.load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(g_present_frame.load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(present_age),
+                        static_cast<unsigned long long>(g_present_swapchain.load(std::memory_order_acquire)),
+                        static_cast<unsigned long>(g_present_hr.load(std::memory_order_acquire)),
                         GetCurrentThreadId());
                     capture_render_thread_snapshot(render_tid, age_ms);
                 }
@@ -1165,11 +1269,43 @@ __declspec(noinline) static DWORD seh_imgui_render()
     return 0;
 }
 
-__declspec(noinline) static DWORD seh_imgui_dx11_render(ImDrawData* dd)
+__declspec(noinline) static DWORD seh_imgui_dx11_render(ImDrawData* dd, uint64_t frame_number)
 {
+    HRESULT removed = g_pd3dDevice ? g_pd3dDevice->GetDeviceRemovedReason() : E_POINTER;
+    aida_tracer::set_dx11_draw_state("imgui_dx11_render_enter",
+        frame_number,
+        dd,
+        g_pd3dDevice,
+        g_pd3dDeviceContext,
+        g_mainRenderTargetView,
+        removed);
     __try {
+        removed = g_pd3dDevice ? g_pd3dDevice->GetDeviceRemovedReason() : E_POINTER;
+        aida_tracer::set_dx11_draw_state("imgui_dx11_render_call",
+            frame_number,
+            dd,
+            g_pd3dDevice,
+            g_pd3dDeviceContext,
+            g_mainRenderTargetView,
+            removed);
         ImGui_ImplDX11_RenderDrawData(dd);
+        removed = g_pd3dDevice ? g_pd3dDevice->GetDeviceRemovedReason() : E_POINTER;
+        aida_tracer::set_dx11_draw_state("imgui_dx11_render_returned",
+            frame_number,
+            dd,
+            g_pd3dDevice,
+            g_pd3dDeviceContext,
+            g_mainRenderTargetView,
+            removed);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
+        removed = g_pd3dDevice ? g_pd3dDevice->GetDeviceRemovedReason() : E_POINTER;
+        aida_tracer::set_dx11_draw_state("imgui_dx11_render_seh",
+            frame_number,
+            dd,
+            g_pd3dDevice,
+            g_pd3dDeviceContext,
+            g_mainRenderTargetView,
+            removed);
         return GetExceptionCode();
     }
     return 0;
@@ -1205,11 +1341,15 @@ __declspec(noinline) static DWORD seh_win32_new_frame()
     return 0;
 }
 
-__declspec(noinline) static DWORD seh_swapchain_present(IDXGISwapChain* sc, HRESULT* hr_out)
+__declspec(noinline) static DWORD seh_swapchain_present(IDXGISwapChain* sc, HRESULT* hr_out, uint64_t frame_number)
 {
+    aida_tracer::set_present_state("present_enter", frame_number, sc, hr_out ? *hr_out : E_POINTER);
     __try {
+        aida_tracer::set_present_state("present_call", frame_number, sc, hr_out ? *hr_out : E_POINTER);
         *hr_out = sc->Present(1, 0);
+        aida_tracer::set_present_state("present_returned", frame_number, sc, *hr_out);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
+        aida_tracer::set_present_state("present_seh", frame_number, sc, hr_out ? *hr_out : E_POINTER);
         return GetExceptionCode();
     }
     return 0;
@@ -2466,6 +2606,28 @@ int main(int, char**)
             if (!has_message)
                 break;
 
+            bool close_related_msg = msg.message == WM_CLOSE || msg.message == WM_DESTROY ||
+                msg.message == WM_NCDESTROY || msg.message == WM_QUIT ||
+                msg.message == WM_SYSCOMMAND || msg.message == WM_LBUTTONDOWN ||
+                msg.message == WM_LBUTTONUP || msg.message == WM_NCLBUTTONDOWN ||
+                msg.message == WM_NCLBUTTONUP || msg.message == WM_MOUSEACTIVATE;
+            if (close_related_msg) {
+                POINT cursor{};
+                GetCursorPos(&cursor);
+                diag::log_tagged_critical_fmt("msgpump",
+                    "dequeued frame=%llu msg=%s(0x%04X) hwnd=0x%llX wp=0x%llX lp=0x%llX cursor=%ld,%ld fg=0x%llX active=0x%llX",
+                    (unsigned long long)frame_number,
+                    aida_tracer::message_name(msg.message),
+                    msg.message,
+                    (unsigned long long)reinterpret_cast<UINT_PTR>(msg.hwnd),
+                    (unsigned long long)static_cast<UINT_PTR>(msg.wParam),
+                    (unsigned long long)static_cast<LONG_PTR>(msg.lParam),
+                    cursor.x,
+                    cursor.y,
+                    (unsigned long long)reinterpret_cast<UINT_PTR>(GetForegroundWindow()),
+                    (unsigned long long)reinterpret_cast<UINT_PTR>(GetActiveWindow()));
+            }
+
             aida_tracer::mark_render_phase("peek_message_got");
             aida_tracer::set_dispatch_state("translate_enter", msg);
             ::TranslateMessage(&msg);
@@ -2475,7 +2637,7 @@ int main(int, char**)
             LRESULT dispatch_result = ::DispatchMessage(&msg);
             aida_tracer::g_dispatch_exit_count.fetch_add(1, std::memory_order_acq_rel);
             uint64_t dispatch_elapsed = static_cast<uint64_t>(GetTickCount64()) - dispatch_start;
-            if (dispatch_elapsed >= 50 || msg.message == WM_QUIT) {
+            if (dispatch_elapsed >= 50 || close_related_msg) {
                 diag::log_tagged_critical_fmt("msgpump",
                     "dispatch_slow frame=%llu elapsed_ms=%llu result=0x%llX msg=%s(0x%04X) hwnd=0x%llX wp=0x%llX lp=0x%llX",
                     (unsigned long long)frame_number,
@@ -2797,7 +2959,7 @@ int main(int, char**)
         if ((frame_number >= 270ULL && frame_number <= 320ULL))
             diag::log_tagged_critical_fmt("render", "phase=pre_imgui_dx11 frame=%llu", (unsigned long long)frame_number);
         aida_tracer::mark_render_phase("imgui_dx11_render");
-        DWORD seh_idr = seh_imgui_dx11_render(ImGui::GetDrawData());
+        DWORD seh_idr = seh_imgui_dx11_render(ImGui::GetDrawData(), frame_number);
         if (seh_idr != 0)
             diag::log_tagged_critical_fmt("render", "SEH_in_imgui_dx11_render code=0x%08X frame=%llu",
                 seh_idr, (unsigned long long)frame_number);
@@ -2807,7 +2969,7 @@ int main(int, char**)
             diag::log_tagged_critical_fmt("render", "phase=pre_present frame=%llu", (unsigned long long)frame_number);
         aida_tracer::mark_render_phase("present");
         HRESULT hr = S_OK;
-        DWORD seh_present = seh_swapchain_present(g_pSwapChain, &hr);
+        DWORD seh_present = seh_swapchain_present(g_pSwapChain, &hr, frame_number);
         if (seh_present != 0)
             diag::log_tagged_critical_fmt("render", "SEH_in_present code=0x%08X frame=%llu",
                 seh_present, (unsigned long long)frame_number);
@@ -2872,25 +3034,48 @@ int main(int, char**)
     }
 
 
+    diag::log_tagged_critical_fmt("main",
+        "shutdown_sequence_begin frame=%llu done=%d hwnd=0x%llX tid=%lu",
+        (unsigned long long)frame_number,
+        done ? 1 : 0,
+        (unsigned long long)reinterpret_cast<UINT_PTR>(hwnd),
+        GetCurrentThreadId());
+    aida_tracer::mark_render_phase("shutdown_sequence_begin");
     aida_focus_monitor::stop();
+    diag::log_tagged_critical("main", "shutdown_focus_monitor_done");
     anti_tamper::shutdown();
+    diag::log_tagged_critical("main", "shutdown_anti_tamper_done");
     globals::terminal_mgr.shutdown();
+    diag::log_tagged_critical("main", "shutdown_terminal_done");
 
     network_view::shutdown();
+    diag::log_tagged_critical("main", "shutdown_network_done");
     script_engine::shutdown();
+    diag::log_tagged_critical("main", "shutdown_script_engine_done");
     workflow_tools::shutdown_services();
+    diag::log_tagged_critical("main", "shutdown_workflow_tools_done");
     shutdown_standalone_chat();
+    diag::log_tagged_critical("main", "shutdown_chat_done");
     aida::auth::http::cleanup();
+    diag::log_tagged_critical("main", "shutdown_auth_http_done");
     Blur::Shutdown();
+    diag::log_tagged_critical("main", "shutdown_blur_done");
     ImGui_ImplDX11_Shutdown();
+    diag::log_tagged_critical("main", "shutdown_imgui_dx11_done");
 
     ImGui_ImplWin32_Shutdown();
+    diag::log_tagged_critical("main", "shutdown_imgui_win32_done");
     ImGui::DestroyContext();
+    diag::log_tagged_critical("main", "shutdown_imgui_context_done");
 
     CleanupDeviceD3D();
+    diag::log_tagged_critical("main", "shutdown_d3d_done");
     ::DestroyWindow(hwnd);
+    diag::log_tagged_critical("main", "shutdown_destroy_window_done");
     ::UnregisterClassW(wc.lpszClassName, wc.hInstance);
+    diag::log_tagged_critical("main", "shutdown_unregister_done");
 
+    diag::log_tagged_critical("main", "shutdown_exit_process_pre");
     ExitProcess(0);
     return 0;
 }
@@ -2967,9 +3152,14 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
     uint64_t wnd_start = static_cast<uint64_t>(GetTickCount64());
     auto finish = [&](const char* path, LRESULT result) -> LRESULT {
         uint64_t elapsed = static_cast<uint64_t>(GetTickCount64()) - wnd_start;
-        if (elapsed >= 50 || msg == WM_DESTROY || msg == WM_DPICHANGED || msg == WM_SETTINGCHANGE) {
+        if (elapsed >= 50 || msg == WM_CLOSE || msg == WM_DESTROY || msg == WM_NCDESTROY ||
+            msg == WM_SYSCOMMAND || msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP ||
+            msg == WM_NCLBUTTONDOWN || msg == WM_NCLBUTTONUP || msg == WM_MOUSEACTIVATE ||
+            msg == WM_DPICHANGED || msg == WM_SETTINGCHANGE) {
+            POINT cursor{};
+            GetCursorPos(&cursor);
             diag::log_tagged_critical_fmt("wndproc",
-                "exit path=%s elapsed_ms=%llu result=0x%llX msg=%s(0x%04X) hwnd=0x%llX wp=0x%llX lp=0x%llX",
+                "exit path=%s elapsed_ms=%llu result=0x%llX msg=%s(0x%04X) hwnd=0x%llX wp=0x%llX lp=0x%llX cursor=%ld,%ld fg=0x%llX active=0x%llX",
                 path,
                 (unsigned long long)elapsed,
                 (unsigned long long)result,
@@ -2977,7 +3167,11 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 msg,
                 (unsigned long long)reinterpret_cast<UINT_PTR>(hWnd),
                 (unsigned long long)static_cast<UINT_PTR>(wParam),
-                (unsigned long long)static_cast<LONG_PTR>(lParam));
+                (unsigned long long)static_cast<LONG_PTR>(lParam),
+                cursor.x,
+                cursor.y,
+                (unsigned long long)reinterpret_cast<UINT_PTR>(GetForegroundWindow()),
+                (unsigned long long)reinterpret_cast<UINT_PTR>(GetActiveWindow()));
         }
         aida_tracer::clear_wndproc_state();
         return result;
@@ -3143,6 +3337,10 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         return finish("dropfiles", 0);
     }
     case WM_DESTROY:
+        diag::log_tagged_critical_fmt("wndproc",
+            "destroy_post_quit hwnd=0x%llX tid=%lu",
+            (unsigned long long)reinterpret_cast<UINT_PTR>(hWnd),
+            GetCurrentThreadId());
         ::PostQuitMessage(0);
         return finish("destroy", 0);
     }

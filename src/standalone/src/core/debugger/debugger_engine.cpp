@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -2546,27 +2547,92 @@ void request_dump_refresh(uint64_t addr, size_t bytes, uint32_t max_age_ms) {
 	});
 }
 
+bool refresh_disasm_window_now(uint64_t rip, const char* source) {
+	auto& s = g_state;
+	uint64_t base = (rip > 0x100) ? rip - 0x100 : 0;
+	std::vector<uint8_t> buf;
+	SetLastError(ERROR_SUCCESS);
+	const uint64_t start = now_ms();
+	bool read_ok = driver_bridge::read_memory(base, 0x400, buf);
+	DWORD gle = read_ok ? ERROR_SUCCESS : GetLastError();
+	const uint64_t elapsed = now_ms() - start;
+	{
+		std::lock_guard<std::mutex> lk(s.cache_mtx);
+		s.cached_disasm_base = base;
+		s.cached_disasm_bytes = std::move(buf);
+	}
+	size_t cached_size = 0;
+	{
+		std::lock_guard<std::mutex> lk(s.cache_mtx);
+		cached_size = s.cached_disasm_bytes.size();
+	}
+	s.last_disasm_refresh_ms.store(now_ms());
+	s.disasm_refresh_in_flight.store(false);
+	diag::log_tagged_fmt("debugger_engine",
+		"disasm_refresh source=%s pid=%u target_pid=%u rip=0x%llX base=0x%llX size=%u read_ok=%d bytes=%zu gle=%lu elapsed_ms=%llu driver_status=%s driver_error=%s",
+		source ? source : "unknown",
+		driver_bridge::attached_pid(),
+		s.target_pid,
+		static_cast<unsigned long long>(rip),
+		static_cast<unsigned long long>(base),
+		0x400u,
+		read_ok ? 1 : 0,
+		cached_size,
+		static_cast<unsigned long>(gle),
+		static_cast<unsigned long long>(elapsed),
+		driver_bridge::status().c_str(),
+		driver_bridge::last_error().c_str());
+	return read_ok && cached_size != 0;
+}
+
 void request_disasm_refresh(uint64_t rip, uint32_t max_age_ms) {
 	auto& st = g_state;
 	if (rip == 0) return;
 	uint64_t now = now_ms();
 	if (now - st.last_disasm_refresh_ms.load() < max_age_ms) return;
 	bool expected = false;
-	if (!st.disasm_refresh_in_flight.compare_exchange_strong(expected, true)) return;
-
-	work_queue::post([rip]() {
-		auto& s = g_state;
-		uint64_t base = (rip > 0x100) ? rip - 0x100 : 0;
-		std::vector<uint8_t> buf;
-		driver_bridge::read_memory(base, 0x400, buf);
-		{
-			std::lock_guard<std::mutex> lk(s.cache_mtx);
-			s.cached_disasm_base = base;
-			s.cached_disasm_bytes = std::move(buf);
+	if (!st.disasm_refresh_in_flight.compare_exchange_strong(expected, true)) {
+		if (max_age_ms == 0) {
+			diag::log_tagged_fmt("debugger_engine",
+				"disasm_refresh forced_sync_recover_inflight rip=0x%llX pid=%u target_pid=%u",
+				static_cast<unsigned long long>(rip),
+				driver_bridge::attached_pid(),
+				st.target_pid);
+			st.disasm_refresh_in_flight.store(true);
+			(void)refresh_disasm_window_now(rip, "forced_sync_recover_inflight");
 		}
-		s.last_disasm_refresh_ms.store(now_ms());
-		s.disasm_refresh_in_flight.store(false);
+		return;
+	}
+
+	if (max_age_ms == 0) {
+		(void)refresh_disasm_window_now(rip, "forced_sync");
+		return;
+	}
+
+	const bool posted = work_queue::post([rip]() {
+		try {
+			(void)refresh_disasm_window_now(rip, "work_queue");
+		} catch (const std::exception& ex) {
+			g_state.disasm_refresh_in_flight.store(false);
+			set_last_error(std::string("request_disasm_refresh worker exception: ") + ex.what());
+			diag::log_tagged_fmt("debugger_engine", "disasm_refresh worker_exception rip=0x%llX error=%s",
+				static_cast<unsigned long long>(rip), ex.what());
+		} catch (...) {
+			g_state.disasm_refresh_in_flight.store(false);
+			set_last_error("request_disasm_refresh worker unknown exception");
+			diag::log_tagged_fmt("debugger_engine", "disasm_refresh worker_unknown_exception rip=0x%llX",
+				static_cast<unsigned long long>(rip));
+		}
 	});
+	if (!posted) {
+		set_last_error("request_disasm_refresh work_queue post failed");
+		diag::log_tagged_fmt("debugger_engine",
+			"disasm_refresh post_failed rip=0x%llX pid=%u target_pid=%u",
+			static_cast<unsigned long long>(rip),
+			driver_bridge::attached_pid(),
+			st.target_pid);
+		(void)refresh_disasm_window_now(rip, "post_failed_sync");
+	}
 }
 
 void invalidate_cache() {
@@ -2576,6 +2642,7 @@ void invalidate_cache() {
 	st.last_stack_refresh_ms.store(0);
 	st.last_dump_refresh_ms.store(0);
 	st.last_disasm_refresh_ms.store(0);
+	st.disasm_refresh_in_flight.store(false);
 }
 
 void signal_trap(uint64_t address) {

@@ -12,6 +12,9 @@ namespace dll_protection {
 
 
     static constexpr UINT32 MAX_PROTECT_SLOTS = 4;
+    static constexpr UINT32 BASELINE_PREFIX_MAX = 64;
+    static constexpr UINT32 DPRT_POLICY_HARD_BUGCHECK = 0x00000001u;
+    static constexpr UINT32 DPRT_MISMATCH_UNKNOWN = 0xFFFFFFFFu;
 
     struct protection_entry_t {
         volatile LONG active;
@@ -24,6 +27,10 @@ namespace dll_protection {
         UINT32 status;
         UINT32 check_interval_ms;
         UINT64 last_check_tsc;
+        UINT64 check_count;
+        UINT32 baseline_prefix_size;
+        UINT32 policy_flags;
+        UINT8 baseline_prefix[BASELINE_PREFIX_MAX];
     };
 
     static protection_entry_t g_slots[MAX_PROTECT_SLOTS] = {};
@@ -40,6 +47,314 @@ namespace dll_protection {
 
     static UINT64 compute_code_hash_physical(UINT32 pid, UINT64 va, UINT32 size);
     static BOOLEAN check_peb_debugger_physical(UINT32 pid);
+
+    struct memory_snapshot_t {
+        NTSTATUS lookup_status;
+        NTSTATUS query_status;
+        UINT64 base;
+        UINT64 allocation_base;
+        UINT64 region_size;
+        ULONG state;
+        ULONG protect;
+        ULONG allocation_protect;
+        ULONG type;
+        SIZE_T returned_length;
+        BOOLEAN valid;
+    };
+
+    static UINT64 cached_dtb_for_pid(UINT32 pid)
+    {
+        if (pid == 0)
+            return 0;
+        for (int i = 0; i < DTB_CACHE_SIZE; i++) {
+            if (g_dtb_cache[i].valid && g_dtb_cache[i].pid == pid)
+                return g_dtb_cache[i].dtb;
+        }
+        return 0;
+    }
+
+    static BOOLEAN slot_hard_bugcheck_enabled(const protection_entry_t& slot)
+    {
+        return (slot.policy_flags & DPRT_POLICY_HARD_BUGCHECK) != 0;
+    }
+
+    static const char* slot_policy_name(const protection_entry_t& slot)
+    {
+        return slot_hard_bugcheck_enabled(slot) ? "module_hard_bugcheck" : "diagnostic_fail_closed";
+    }
+
+    static NTSTATUS read_process_bytes_physical(UINT32 pid, UINT64 va, UINT8* out, UINT32 size, UINT32* bytes_read)
+    {
+        if (bytes_read)
+            *bytes_read = 0;
+        if (pid == 0 || va == 0 || !out || size == 0)
+            return STATUS_INVALID_PARAMETER;
+
+        UINT64 dtb = cached_dtb_for_pid(pid);
+        if (dtb == 0)
+            return STATUS_NOT_FOUND;
+
+        UINT64 cursor = va;
+        UINT32 remaining = size;
+        UINT32 total = 0;
+
+        while (remaining > 0) {
+            UINT32 page_offset = (UINT32)(cursor & 0xFFF);
+            UINT32 to_read = 0x1000 - page_offset;
+            if (to_read > remaining)
+                to_read = remaining;
+
+            UINT64 phys = strong::translate_virtual_address(dtb, cursor);
+            if (phys == 0) {
+                if (bytes_read)
+                    *bytes_read = total;
+                return STATUS_UNSUCCESSFUL;
+            }
+
+            SIZE_T got = 0;
+            NTSTATUS st = strong::read_physical(phys, out + total, to_read, &got);
+            if (!NT_SUCCESS(st) || got != to_read) {
+                if (bytes_read)
+                    *bytes_read = total + (UINT32)got;
+                return NT_SUCCESS(st) ? STATUS_UNSUCCESSFUL : st;
+            }
+
+            cursor += to_read;
+            remaining -= to_read;
+            total += to_read;
+        }
+
+        if (bytes_read)
+            *bytes_read = total;
+        return STATUS_SUCCESS;
+    }
+
+    static UINT32 capture_baseline_prefix(protection_entry_t& slot)
+    {
+        slot.baseline_prefix_size = 0;
+        RtlZeroMemory(slot.baseline_prefix, sizeof(slot.baseline_prefix));
+
+        UINT32 wanted = slot.text_size;
+        if (wanted > BASELINE_PREFIX_MAX)
+            wanted = BASELINE_PREFIX_MAX;
+        if (wanted == 0)
+            return 0;
+
+        UINT32 got = 0;
+        NTSTATUS st = read_process_bytes_physical(slot.pid, slot.text_va, slot.baseline_prefix, wanted, &got);
+        if (!NT_SUCCESS(st) || got == 0)
+            return 0;
+
+        if (got > wanted)
+            got = wanted;
+        slot.baseline_prefix_size = got;
+        return got;
+    }
+
+    static UINT32 first_mismatch_offset(const protection_entry_t& slot)
+    {
+        if (slot.baseline_prefix_size == 0 || slot.baseline_prefix_size > BASELINE_PREFIX_MAX)
+            return DPRT_MISMATCH_UNKNOWN;
+
+        UINT8 now[BASELINE_PREFIX_MAX];
+        RtlZeroMemory(now, sizeof(now));
+        UINT32 got = 0;
+        NTSTATUS st = read_process_bytes_physical(slot.pid, slot.text_va, now, slot.baseline_prefix_size, &got);
+        if (!NT_SUCCESS(st) || got == 0)
+            return DPRT_MISMATCH_UNKNOWN;
+
+        UINT32 limit = got;
+        if (limit > slot.baseline_prefix_size)
+            limit = slot.baseline_prefix_size;
+        for (UINT32 i = 0; i < limit; ++i) {
+            if (now[i] != slot.baseline_prefix[i])
+                return i;
+        }
+        if (got < slot.baseline_prefix_size)
+            return got;
+        return DPRT_MISMATCH_UNKNOWN;
+    }
+
+    static void publish_text_integrity_evidence(const protection_entry_t& slot)
+    {
+        UNREFERENCED_PARAMETER(slot);
+        sentinel_bridge::g_bridge.sentinel_cmd = sentinel_bridge::BRIDGE_CMD_RE_EVIDENCE;
+        sentinel_bridge::g_bridge.sentinel_cmd_param = sentinel_bridge::RE_REASON_TEXT_WRITABLE;
+    }
+
+    static void reset_slot(protection_entry_t& slot)
+    {
+        _InterlockedExchange(&slot.active, 0);
+        slot.pid = 0;
+        slot.module_base = 0;
+        slot.text_va = 0;
+        slot.text_size = 0;
+        slot.expected_hash = 0;
+        slot.current_hash = 0;
+        slot.status = DPRT_STATUS_INACTIVE;
+        slot.check_interval_ms = 0;
+        slot.last_check_tsc = 0;
+        slot.check_count = 0;
+        slot.baseline_prefix_size = 0;
+        slot.policy_flags = 0;
+        RtlZeroMemory(slot.baseline_prefix, sizeof(slot.baseline_prefix));
+    }
+
+    static UINT32 active_slot_count()
+    {
+        UINT32 count = 0;
+        for (int i = 0; i < (int)MAX_PROTECT_SLOTS; i++) {
+            if (_InterlockedCompareExchange(&g_slots[i].active, 1, 1) == 1)
+                ++count;
+        }
+        return count;
+    }
+
+    static void copy_process_image_name(UINT32 pid, char* out, SIZE_T cap)
+    {
+        if (!out || cap == 0)
+            return;
+        RtlZeroMemory(out, cap);
+        out[0] = '?';
+        if (pid == 0 || KeGetCurrentIrql() != PASSIVE_LEVEL)
+            return;
+        PEPROCESS process = nullptr;
+        NTSTATUS st = PsLookupProcessByProcessId((HANDLE)(UINT_PTR)pid, &process);
+        if (!NT_SUCCESS(st) || !process)
+            return;
+        UCHAR* image = PsGetProcessImageFileName(process);
+        if (image) {
+            RtlZeroMemory(out, cap);
+            SIZE_T limit = cap - 1;
+            if (limit > 15)
+                limit = 15;
+            for (SIZE_T i = 0; i < limit && image[i] != 0; ++i)
+                out[i] = (char)image[i];
+        }
+        ObDereferenceObject(process);
+    }
+
+    static memory_snapshot_t query_memory_snapshot(UINT32 pid, UINT64 va)
+    {
+        memory_snapshot_t snap = {};
+        snap.lookup_status = STATUS_UNSUCCESSFUL;
+        snap.query_status = STATUS_UNSUCCESSFUL;
+
+        if (pid == 0 || va == 0) {
+            snap.lookup_status = STATUS_INVALID_PARAMETER;
+            snap.query_status = STATUS_INVALID_PARAMETER;
+            return snap;
+        }
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+            snap.lookup_status = STATUS_INVALID_DEVICE_STATE;
+            snap.query_status = STATUS_INVALID_DEVICE_STATE;
+            return snap;
+        }
+        if (!_KeStackAttachProcess || !_KeUnstackDetachProcess || !_ZwQueryVirtualMemory) {
+            snap.lookup_status = STATUS_PROCEDURE_NOT_FOUND;
+            snap.query_status = STATUS_PROCEDURE_NOT_FOUND;
+            return snap;
+        }
+
+        PEPROCESS process = nullptr;
+        snap.lookup_status = PsLookupProcessByProcessId((HANDLE)(UINT_PTR)pid, &process);
+        if (!NT_SUCCESS(snap.lookup_status) || !process)
+            return snap;
+
+        KAPC_STATE apc_state;
+        _KeStackAttachProcess(process, &apc_state);
+
+        MEMORY_BASIC_INFORMATION mbi;
+        RtlZeroMemory(&mbi, sizeof(mbi));
+        SIZE_T returned = 0;
+        snap.query_status = _ZwQueryVirtualMemory(
+            (HANDLE)-1,
+            (PVOID)va,
+            MemoryBasicInformation,
+            &mbi,
+            sizeof(mbi),
+            &returned);
+
+        _KeUnstackDetachProcess(&apc_state);
+        ObDereferenceObject(process);
+
+        snap.returned_length = returned;
+        if (NT_SUCCESS(snap.query_status)) {
+            snap.base = (UINT64)mbi.BaseAddress;
+            snap.allocation_base = (UINT64)mbi.AllocationBase;
+            snap.region_size = (UINT64)mbi.RegionSize;
+            snap.state = mbi.State;
+            snap.protect = mbi.Protect;
+            snap.allocation_protect = mbi.AllocationProtect;
+            snap.type = mbi.Type;
+            snap.valid = TRUE;
+        }
+        return snap;
+    }
+
+    static void log_slot_state(const char* tag, int idx, protection_entry_t& slot,
+                               UINT64 observed_hash, const memory_snapshot_t* snap,
+                               UINT32 first_mismatch = DPRT_MISMATCH_UNKNOWN,
+                               const char* policy_override = nullptr,
+                               LONG previous_active = 0x7FFFFFFFL,
+                               UINT32 previous_status = 0xFFFFFFFFu)
+    {
+        char image[16];
+        copy_process_image_name(slot.pid, image, sizeof(image));
+        LARGE_INTEGER system_time;
+        KeQuerySystemTime(&system_time);
+        UINT64 interrupt_time = KeQueryInterruptTime();
+        KPROCESSOR_MODE previous_mode = ExGetPreviousMode();
+        const char* policy = policy_override ? policy_override : slot_policy_name(slot);
+        WW_LOG("[DLL-PROTECT] %s idx=%d pid=%u image=%.15s prev_active=%ld active=%ld prev_status=%u status=%u policy=%s module=0x%llX text=0x%llX size=0x%X expected=0x%llX current=0x%llX observed=0x%llX mismatch=0x%X prefix=%u interval=%u checks=%llu last_tsc=%llu system_time=%lld interrupt_time=%llu dtb=0x%llX irql=%lu mode=%u current_pid=0x%llX tid=0x%llX slots=%u running=%ld queued=%ld work=%ld",
+            tag ? tag : "slot",
+            idx,
+            slot.pid,
+            image,
+            previous_active,
+            _InterlockedCompareExchange(&slot.active, 1, 1),
+            previous_status,
+            slot.status,
+            policy,
+            slot.module_base,
+            slot.text_va,
+            slot.text_size,
+            slot.expected_hash,
+            slot.current_hash,
+            observed_hash,
+            first_mismatch,
+            slot.baseline_prefix_size,
+            slot.check_interval_ms,
+            slot.check_count,
+            slot.last_check_tsc,
+            system_time.QuadPart,
+            interrupt_time,
+            cached_dtb_for_pid(slot.pid),
+            KeGetCurrentIrql(),
+            (UINT32)previous_mode,
+            (UINT64)(ULONG_PTR)PsGetCurrentProcessId(),
+            (UINT64)(ULONG_PTR)PsGetCurrentThreadId(),
+            active_slot_count(),
+            _InterlockedCompareExchange(&g_timer_running, 1, 1),
+            _InterlockedCompareExchange(&g_timer_work_item_queued, 1, 1),
+            _InterlockedCompareExchange(&g_timer_work_item_running, 1, 1));
+        if (snap) {
+            WW_LOG("[DLL-PROTECT] %s memory idx=%d lookup=0x%08X query=0x%08X valid=%u base=0x%llX alloc=0x%llX region=0x%llX state=0x%lX protect=0x%lX alloc_protect=0x%lX type=0x%lX returned=0x%llX",
+                tag ? tag : "slot",
+                idx,
+                snap->lookup_status,
+                snap->query_status,
+                snap->valid ? 1u : 0u,
+                snap->base,
+                snap->allocation_base,
+                snap->region_size,
+                snap->state,
+                snap->protect,
+                snap->allocation_protect,
+                snap->type,
+                (UINT64)snap->returned_length);
+        }
+    }
 
     static void ensure_timer_work_sync_initialized()
     {
@@ -391,13 +706,21 @@ namespace dll_protection {
                 continue;
 
             auto& slot = g_slots[i];
+            slot.check_count++;
 
 
             if (check_peb_debugger_physical(slot.pid)) {
+                LONG previous_active = _InterlockedCompareExchange(&slot.active, 1, 1);
+                UINT32 previous_status = slot.status;
                 slot.status = DPRT_STATUS_DEBUGGER;
                 _InterlockedExchange(&slot.active, 0);
 
-
+                memory_snapshot_t snap = query_memory_snapshot(slot.pid, slot.text_va);
+                log_slot_state("timer_peb_debugger_bugcheck", i, slot, 0, &snap,
+                    DPRT_MISMATCH_UNKNOWN, "peb_debugger_hard_bugcheck",
+                    previous_active, previous_status);
+                WW_LOG("[DLL-PROTECT] bugcheck policy=peb_debugger code=0xDEAD0ADA pid=%u text=0x%llX p3=0x%llX p4=0x%llX",
+                    slot.pid, slot.text_va, 0xDB6ULL, (UINT64)i);
                 KeBugCheckEx(0xDEAD0ADAu, (ULONG_PTR)slot.pid,
                              (ULONG_PTR)slot.text_va, 0xDB6u, (ULONG_PTR)i);
                 return;
@@ -419,8 +742,16 @@ namespace dll_protection {
                 UINT64 dr_val = 0;
                 if (scan_thread_drs(slot.pid, slot.text_va, slot.text_size,
                                     &bad_tid, &dr_idx, &dr_val)) {
+                    LONG previous_active = _InterlockedCompareExchange(&slot.active, 1, 1);
+                    UINT32 previous_status = slot.status;
                     slot.status = DPRT_STATUS_DEBUGGER;
                     _InterlockedExchange(&slot.active, 0);
+                    memory_snapshot_t snap = query_memory_snapshot(slot.pid, slot.text_va);
+                    log_slot_state("timer_thread_dr_bugcheck", i, slot, 0, &snap,
+                        DPRT_MISMATCH_UNKNOWN, "thread_dr_hard_bugcheck",
+                        previous_active, previous_status);
+                    WW_LOG("[DLL-PROTECT] bugcheck policy=thread_dr pid=%u bad_tid=%u dr=0x%llX dr_idx=%d p4=0x%llX",
+                        slot.pid, bad_tid, dr_val, dr_idx, (UINT64)(0xD7D70000u | (UINT32)dr_idx));
                     KeBugCheckEx(0xDEAD0ADAu, (ULONG_PTR)slot.pid,
                                  (ULONG_PTR)bad_tid,
                                  (ULONG_PTR)dr_val,
@@ -449,25 +780,64 @@ namespace dll_protection {
 
             if (hash == 0) {
 
+                LONG previous_active = _InterlockedCompareExchange(&slot.active, 1, 1);
+                UINT32 previous_status = slot.status;
+                slot.current_hash = 0;
                 slot.status = DPRT_STATUS_INACTIVE;
                 _InterlockedExchange(&slot.active, 0);
+                memory_snapshot_t snap = query_memory_snapshot(slot.pid, slot.text_va);
+                log_slot_state("timer_hash_unavailable_deactivate", i, slot, hash, &snap,
+                    DPRT_MISMATCH_UNKNOWN, "hash_unavailable_fail_closed",
+                    previous_active, previous_status);
                 continue;
             }
 
             slot.current_hash = hash;
 
             if (hash != slot.expected_hash) {
+                LONG previous_active = _InterlockedCompareExchange(&slot.active, 1, 1);
+                UINT32 previous_status = slot.status;
+                UINT32 mismatch_offset = first_mismatch_offset(slot);
                 slot.status = DPRT_STATUS_TAMPERED;
                 _InterlockedExchange(&slot.active, 0);
 
-                KeBugCheckEx(0xDEAD0ADAu, (ULONG_PTR)slot.pid,
-                             (ULONG_PTR)slot.text_va,
-                             (ULONG_PTR)(slot.expected_hash >> 32),
-                             (ULONG_PTR)(hash >> 32));
-                return;
+                memory_snapshot_t snap = query_memory_snapshot(slot.pid, slot.text_va);
+                if (slot_hard_bugcheck_enabled(slot)) {
+                    publish_text_integrity_evidence(slot);
+                    log_slot_state("timer_hash_mismatch_bugcheck", i, slot, hash, &snap,
+                        mismatch_offset, "hash_mismatch_hard_bugcheck",
+                        previous_active, previous_status);
+                    WW_LOG("[DLL-PROTECT] bugcheck policy=hash_mismatch code=0xDEAD0ADA pid=%u text=0x%llX expected=0x%llX actual=0x%llX mismatch=0x%X p3=0x%llX p4=0x%llX",
+                        slot.pid,
+                        slot.text_va,
+                        slot.expected_hash,
+                        hash,
+                        mismatch_offset,
+                        (slot.expected_hash >> 32),
+                        (hash >> 32));
+                    KeBugCheckEx(0xDEAD0ADAu, (ULONG_PTR)slot.pid,
+                                 (ULONG_PTR)slot.text_va,
+                                 (ULONG_PTR)(slot.expected_hash >> 32),
+                                 (ULONG_PTR)(hash >> 32));
+                    return;
+                }
+
+                log_slot_state("timer_hash_mismatch_fail_closed", i, slot, hash, &snap,
+                    mismatch_offset, "hash_mismatch_diagnostic_fail_closed",
+                    previous_active, previous_status);
+                WW_LOG("[DLL-PROTECT] no_bugcheck policy=hash_mismatch_diagnostic_fail_closed pid=%u module=0x%llX text=0x%llX expected=0x%llX actual=0x%llX mismatch=0x%X evidence=dllprotect_status_log",
+                    slot.pid,
+                    slot.module_base,
+                    slot.text_va,
+                    slot.expected_hash,
+                    hash,
+                    mismatch_offset);
+                continue;
             }
 
             slot.status = DPRT_STATUS_ACTIVE;
+            if (slot.check_count <= 2 || (slot.check_count & 0x3FULL) == 0)
+                log_slot_state("timer_hash_ok", i, slot, hash, nullptr);
         }
 
 
@@ -631,39 +1001,134 @@ NTSTATUS functions::handle_dll_protect(p_dll_protect request) {
         case DPRT_OP_REGISTER:
         {
             if (request->pid == 0 || request->text_section_va == 0 ||
-                request->text_section_size == 0 || request->expected_hash == 0)
+                request->text_section_size == 0 || request->expected_hash == 0) {
+                WW_LOG("[DLL-PROTECT] register_reject invalid pid=%u module=0x%llX text=0x%llX size=0x%X expected=0x%llX irql=%lu tid=0x%llX",
+                    request->pid,
+                    request->module_base,
+                    request->text_section_va,
+                    request->text_section_size,
+                    request->expected_hash,
+                    KeGetCurrentIrql(),
+                    (UINT64)(ULONG_PTR)PsGetCurrentThreadId());
                 return STATUS_INVALID_PARAMETER;
+            }
 
 
             int idx = dll_protection::find_slot(request->pid, request->module_base);
             if (idx < 0)
                 idx = dll_protection::find_free_slot();
-            if (idx < 0)
+            if (idx < 0) {
+                WW_LOG("[DLL-PROTECT] register_reject no_slot pid=%u module=0x%llX text=0x%llX size=0x%X expected=0x%llX active_slots=%u",
+                    request->pid,
+                    request->module_base,
+                    request->text_section_va,
+                    request->text_section_size,
+                    request->expected_hash,
+                    dll_protection::active_slot_count());
                 return STATUS_INSUFFICIENT_RESOURCES;
+            }
+
+            UINT32 interval = 10000;
+            if (request->check_interval > 0 && request->check_interval <= 30000)
+                interval = request->check_interval;
 
             auto& slot = dll_protection::g_slots[idx];
+            LONG previous_active = _InterlockedCompareExchange(&slot.active, 1, 1);
+            UINT32 previous_status = slot.status;
+
+            dll_protection::protection_entry_t preview = {};
+            preview.pid = request->pid;
+            preview.module_base = request->module_base;
+            preview.text_va = request->text_section_va;
+            preview.text_size = request->text_section_size;
+            preview.expected_hash = request->expected_hash;
+            preview.check_interval_ms = interval;
+            preview.last_check_tsc = __rdtsc();
+            preview.policy_flags = (request->module_base != 0) ? dll_protection::DPRT_POLICY_HARD_BUGCHECK : 0;
+            preview.current_hash = dll_protection::compute_code_hash_physical(
+                request->pid,
+                request->text_section_va,
+                request->text_section_size);
+            preview.status = preview.current_hash == 0 ? DPRT_STATUS_INACTIVE : DPRT_STATUS_TAMPERED;
+
+            dll_protection::memory_snapshot_t snap = dll_protection::query_memory_snapshot(
+                request->pid,
+                request->text_section_va);
+
+            if (preview.current_hash == 0) {
+                request->status = DPRT_STATUS_INACTIVE;
+                request->current_hash = 0;
+                request->check_interval = interval;
+                request->last_check_tsc = preview.last_check_tsc;
+                dll_protection::log_slot_state("register_reject_hash_unavailable", idx, preview, 0, &snap,
+                    dll_protection::DPRT_MISMATCH_UNKNOWN, "register_hash_unavailable_fail_closed",
+                    previous_active, previous_status);
+                return STATUS_SUCCESS;
+            }
+
+            if (preview.current_hash != request->expected_hash) {
+                request->status = DPRT_STATUS_TAMPERED;
+                request->current_hash = preview.current_hash;
+                request->check_interval = interval;
+                request->last_check_tsc = preview.last_check_tsc;
+                if (dll_protection::slot_hard_bugcheck_enabled(preview)) {
+                    dll_protection::publish_text_integrity_evidence(preview);
+                    dll_protection::log_slot_state("register_hash_mismatch_bugcheck", idx, preview, preview.current_hash, &snap,
+                        dll_protection::DPRT_MISMATCH_UNKNOWN, "register_hash_mismatch_hard_bugcheck",
+                        previous_active, previous_status);
+                    WW_LOG("[DLL-PROTECT] bugcheck policy=register_hash_mismatch code=0xDEAD0ADA pid=%u module=0x%llX text=0x%llX size=0x%X expected=0x%llX actual=0x%llX p3=0x%llX p4=0x%llX",
+                        request->pid,
+                        request->module_base,
+                        request->text_section_va,
+                        request->text_section_size,
+                        request->expected_hash,
+                        preview.current_hash,
+                        (request->expected_hash >> 32),
+                        (preview.current_hash >> 32));
+                    KeBugCheckEx(0xDEAD0ADAu, (ULONG_PTR)request->pid,
+                                 (ULONG_PTR)request->text_section_va,
+                                 (ULONG_PTR)(request->expected_hash >> 32),
+                                 (ULONG_PTR)(preview.current_hash >> 32));
+                    return STATUS_SUCCESS;
+                }
+                dll_protection::log_slot_state("register_reject_hash_mismatch", idx, preview, preview.current_hash, &snap,
+                    dll_protection::DPRT_MISMATCH_UNKNOWN, "register_hash_mismatch_fail_closed",
+                    previous_active, previous_status);
+                WW_LOG("[DLL-PROTECT] register_reject_hash_mismatch pid=%u module=0x%llX text=0x%llX size=0x%X expected=0x%llX actual=0x%llX evidence=dllprotect_status_log",
+                    request->pid,
+                    request->module_base,
+                    request->text_section_va,
+                    request->text_section_size,
+                    request->expected_hash,
+                    preview.current_hash);
+                return STATUS_SUCCESS;
+            }
+
+            _InterlockedExchange(&slot.active, 0);
             slot.pid = request->pid;
             slot.module_base = request->module_base;
             slot.text_va = request->text_section_va;
             slot.text_size = request->text_section_size;
             slot.expected_hash = request->expected_hash;
-            slot.current_hash = request->expected_hash;
-
-
-            if (request->check_interval > 0 && request->check_interval <= 30000)
-                slot.check_interval_ms = request->check_interval;
-            else
-                slot.check_interval_ms = 10000;
+            slot.current_hash = preview.current_hash;
+            slot.check_interval_ms = interval;
             slot.status = DPRT_STATUS_ACTIVE;
-            slot.last_check_tsc = __rdtsc();
+            slot.last_check_tsc = preview.last_check_tsc;
+            slot.check_count = 0;
+            slot.policy_flags = preview.policy_flags;
+            dll_protection::capture_baseline_prefix(slot);
 
             _InterlockedExchange(&slot.active, 1);
 
             dll_protection::start_or_restart_timer();
 
             request->status = DPRT_STATUS_ACTIVE;
-            request->current_hash = request->expected_hash;
+            request->current_hash = slot.current_hash;
+            request->check_interval = slot.check_interval_ms;
             request->last_check_tsc = slot.last_check_tsc;
+            dll_protection::log_slot_state("register_ok", idx, slot, slot.current_hash, &snap,
+                dll_protection::DPRT_MISMATCH_UNKNOWN, nullptr,
+                previous_active, previous_status);
             return STATUS_SUCCESS;
         }
 
@@ -688,6 +1153,12 @@ NTSTATUS functions::handle_dll_protect(p_dll_protect request) {
 
             if (idx < 0) {
 
+                WW_LOG("[DLL-PROTECT] query_inactive pid=%u module=0x%llX active_slots=%u irql=%lu tid=0x%llX",
+                    request->pid,
+                    request->module_base,
+                    dll_protection::active_slot_count(),
+                    KeGetCurrentIrql(),
+                    (UINT64)(ULONG_PTR)PsGetCurrentThreadId());
                 request->pid = 0;
                 request->module_base = 0;
                 request->text_section_va = 0;
@@ -710,6 +1181,7 @@ NTSTATUS functions::handle_dll_protect(p_dll_protect request) {
             request->status = slot.status;
             request->check_interval = slot.check_interval_ms;
             request->last_check_tsc = slot.last_check_tsc;
+            dll_protection::log_slot_state("query_ok", idx, slot, slot.current_hash, nullptr);
             return STATUS_SUCCESS;
         }
 
@@ -720,40 +1192,26 @@ NTSTATUS functions::handle_dll_protect(p_dll_protect request) {
             if (request->pid != 0 && request->module_base != 0) {
                 int idx = dll_protection::find_slot(request->pid, request->module_base);
                 if (idx >= 0) {
-                    _InterlockedExchange(&dll_protection::g_slots[idx].active, 0);
-                    dll_protection::g_slots[idx].status = DPRT_STATUS_INACTIVE;
-                    dll_protection::g_slots[idx].pid = 0;
-                    dll_protection::g_slots[idx].module_base = 0;
-                    dll_protection::g_slots[idx].text_va = 0;
-                    dll_protection::g_slots[idx].text_size = 0;
-                    dll_protection::g_slots[idx].expected_hash = 0;
-                    dll_protection::g_slots[idx].current_hash = 0;
+                    dll_protection::log_slot_state("unregister_one", idx, dll_protection::g_slots[idx],
+                        dll_protection::g_slots[idx].current_hash, nullptr);
+                    dll_protection::reset_slot(dll_protection::g_slots[idx]);
                 }
             } else if (request->pid != 0) {
                 for (int i = 0; i < (int)dll_protection::MAX_PROTECT_SLOTS; i++) {
                     if (_InterlockedCompareExchange(&dll_protection::g_slots[i].active, 1, 1) == 1 &&
                         dll_protection::g_slots[i].pid == request->pid) {
-                        _InterlockedExchange(&dll_protection::g_slots[i].active, 0);
-                        dll_protection::g_slots[i].status = DPRT_STATUS_INACTIVE;
-                        dll_protection::g_slots[i].pid = 0;
-                        dll_protection::g_slots[i].module_base = 0;
-                        dll_protection::g_slots[i].text_va = 0;
-                        dll_protection::g_slots[i].text_size = 0;
-                        dll_protection::g_slots[i].expected_hash = 0;
-                        dll_protection::g_slots[i].current_hash = 0;
+                        dll_protection::log_slot_state("unregister_pid", i, dll_protection::g_slots[i],
+                            dll_protection::g_slots[i].current_hash, nullptr);
+                        dll_protection::reset_slot(dll_protection::g_slots[i]);
                     }
                 }
             } else {
 
                 for (int i = 0; i < (int)dll_protection::MAX_PROTECT_SLOTS; i++) {
-                    _InterlockedExchange(&dll_protection::g_slots[i].active, 0);
-                    dll_protection::g_slots[i].status = DPRT_STATUS_INACTIVE;
-                    dll_protection::g_slots[i].pid = 0;
-                    dll_protection::g_slots[i].module_base = 0;
-                    dll_protection::g_slots[i].text_va = 0;
-                    dll_protection::g_slots[i].text_size = 0;
-                    dll_protection::g_slots[i].expected_hash = 0;
-                    dll_protection::g_slots[i].current_hash = 0;
+                    if (_InterlockedCompareExchange(&dll_protection::g_slots[i].active, 1, 1) == 1)
+                        dll_protection::log_slot_state("unregister_all", i, dll_protection::g_slots[i],
+                            dll_protection::g_slots[i].current_hash, nullptr);
+                    dll_protection::reset_slot(dll_protection::g_slots[i]);
                 }
             }
 
@@ -764,6 +1222,11 @@ NTSTATUS functions::handle_dll_protect(p_dll_protect request) {
                 dll_protection::stop_timer();
 
             request->status = DPRT_STATUS_INACTIVE;
+            WW_LOG("[DLL-PROTECT] unregister_done request_pid=%u request_module=0x%llX active_slots=%u timer_running=%ld",
+                request->pid,
+                request->module_base,
+                dll_protection::active_slot_count(),
+                _InterlockedCompareExchange(&dll_protection::g_timer_running, 1, 1));
             return STATUS_SUCCESS;
         }
 

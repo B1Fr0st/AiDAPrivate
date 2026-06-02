@@ -24,15 +24,19 @@
 #include "../disasm/decompiler_engine.hpp"
 #include "../disasm/pseudocode_view.hpp"
 #include "../disasm/zydis_disasm.hpp"
+#include "../infra/work_queue.hpp"
 #include "../../helpers/diag_log.hpp"
 #include "../../helpers/globals.h"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <Windows.h>
+#include <TlHelp32.h>
+#include <Psapi.h>
 #include "../../../../../driver/comm.h"
 
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "psapi.lib")
 
 #include <atomic>
 #include <algorithm>
@@ -44,6 +48,7 @@
 #include <ctime>
 #include <deque>
 #include <exception>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -231,6 +236,87 @@ namespace test_all_features {
 			format_debug_snapshot_impl(snap, sizeof(snap));
 			log_msg(hf, tag ? tag : "snapshot", "%s%s%s",
 				prefix ? prefix : "snapshot",
+				(prefix && *prefix) ? " | " : "",
+				snap);
+		}
+
+		DWORD process_thread_count(DWORD pid, DWORD* err_out) {
+			if (err_out) *err_out = 0;
+			HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+			if (snap == INVALID_HANDLE_VALUE) {
+				if (err_out) *err_out = GetLastError();
+				return 0;
+			}
+			THREADENTRY32 te = {};
+			te.dwSize = sizeof(te);
+			DWORD count = 0;
+			if (Thread32First(snap, &te)) {
+				do {
+					if (te.th32OwnerProcessID == pid)
+						++count;
+					te.dwSize = sizeof(te);
+				} while (Thread32Next(snap, &te));
+			} else if (err_out) {
+				*err_out = GetLastError();
+			}
+			CloseHandle(snap);
+			return count;
+		}
+
+		void format_resource_snapshot_impl(char* out, std::size_t cap, DWORD captured_last_error) {
+			if (out == nullptr || cap == 0) return;
+
+			const DWORD pid = GetCurrentProcessId();
+			const DWORD tid = GetCurrentThreadId();
+			DWORD thread_err = 0;
+			const DWORD threads = process_thread_count(pid, &thread_err);
+			DWORD handles = 0;
+			const BOOL handle_ok = GetProcessHandleCount(GetCurrentProcess(), &handles);
+			const DWORD handle_err = handle_ok ? 0UL : GetLastError();
+
+			PROCESS_MEMORY_COUNTERS_EX pmc = {};
+			pmc.cb = sizeof(pmc);
+			const BOOL mem_ok = GetProcessMemoryInfo(
+				GetCurrentProcess(),
+				reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc),
+				sizeof(pmc));
+			const DWORD mem_err = mem_ok ? 0UL : GetLastError();
+
+			char debug[1200] = {};
+			format_debug_snapshot_impl(debug, sizeof(debug));
+			const std::uint64_t now = now_ms_tick();
+			const std::uint64_t run_start = g_run_start_tick.load(std::memory_order_acquire);
+			const std::uint64_t elapsed = (run_start != 0 && now >= run_start) ? (now - run_start) : 0;
+
+			_snprintf_s(out, cap, _TRUNCATE,
+				"pid=%lu tid=%lu tick_ms=%llu run_elapsed_ms=%llu last_error=%lu "
+				"threads=%lu thread_err=%lu handles=%lu handle_ok=%d handle_err=%lu "
+				"mem_ok=%d mem_err=%lu working_set=%llu peak_working_set=%llu "
+				"pagefile_usage=%llu private_usage=%llu debug_snapshot={%s}",
+				static_cast<unsigned long>(pid),
+				static_cast<unsigned long>(tid),
+				static_cast<unsigned long long>(now),
+				static_cast<unsigned long long>(elapsed),
+				static_cast<unsigned long>(captured_last_error),
+				static_cast<unsigned long>(threads),
+				static_cast<unsigned long>(thread_err),
+				static_cast<unsigned long>(handles),
+				handle_ok ? 1 : 0,
+				static_cast<unsigned long>(handle_err),
+				mem_ok ? 1 : 0,
+				static_cast<unsigned long>(mem_err),
+				static_cast<unsigned long long>(mem_ok ? pmc.WorkingSetSize : 0),
+				static_cast<unsigned long long>(mem_ok ? pmc.PeakWorkingSetSize : 0),
+				static_cast<unsigned long long>(mem_ok ? pmc.PagefileUsage : 0),
+				static_cast<unsigned long long>(mem_ok ? pmc.PrivateUsage : 0),
+				debug);
+		}
+
+		void log_resource_snapshot(HANDLE hf, const char* tag, const char* prefix, DWORD captured_last_error) {
+			char snap[1800] = {};
+			format_resource_snapshot_impl(snap, sizeof(snap), captured_last_error);
+			log_msg(hf, tag ? tag : "resource", "%s%s%s",
+				prefix ? prefix : "resource snapshot",
 				(prefix && *prefix) ? " | " : "",
 				snap);
 		}
@@ -479,35 +565,12 @@ namespace test_all_features {
 
 
 		bool is_destructive(const char* category, const char* name) {
-			if (category == nullptr || name == nullptr) return false;
-			struct destructive_feature_t {
-				const char* category;
-				const char* name;
-				const char* reason;
-			};
-			static const destructive_feature_t kSkip[] = {
-				{ "tamper", "ABRT", "kernel tamper abort can bugcheck" },
-				{ "evidence", "RECU", "kernel evidence recovery can bugcheck" },
-				{ "remote-call", "RC", "executes a target-process remote call" },
-				{ "thread", "TSR", "suspends or resumes a target thread" },
-				{ "module", "PINJ", "injects a transport-layer packet" },
-				{ "anti-debug", "DBGA", "debug-attach evidence path may bugcheck on positive detection" }
-			};
-			for (const auto& s : kSkip) {
-				if (std::strcmp(category, s.category) == 0 && std::strcmp(name, s.name) == 0) return true;
-			}
-			return false;
+			return test_lab::is_destructive_guarded_feature(category, name);
 		}
 
 		const char* destructive_reason(const char* category, const char* name) {
-			if (category == nullptr || name == nullptr) return "unknown destructive guard";
-			if (std::strcmp(category, "tamper") == 0 && std::strcmp(name, "ABRT") == 0) return "kernel tamper abort can bugcheck";
-			if (std::strcmp(category, "evidence") == 0 && std::strcmp(name, "RECU") == 0) return "kernel evidence recovery can bugcheck";
-			if (std::strcmp(category, "remote-call") == 0 && std::strcmp(name, "RC") == 0) return "executes a target-process remote call";
-			if (std::strcmp(category, "thread") == 0 && std::strcmp(name, "TSR") == 0) return "suspends or resumes a target thread";
-			if (std::strcmp(category, "module") == 0 && std::strcmp(name, "PINJ") == 0) return "injects a transport-layer packet";
-			if (std::strcmp(category, "anti-debug") == 0 && std::strcmp(name, "DBGA") == 0) return "debug-attach evidence path may bugcheck on positive detection";
-			return "unknown destructive guard";
+			const char* reason = test_lab::destructive_guard_reason(category, name);
+			return reason ? reason : "unknown destructive guard";
 		}
 
 		bool name_starts_with(const char* name, const char* prefix) {
@@ -790,9 +853,17 @@ namespace test_all_features {
 			auto t0 = std::chrono::steady_clock::now();
 
 
-			std::wstring work_dir = exe;
-			auto slash = work_dir.find_last_of(L"\\/");
-			if (slash != std::wstring::npos) work_dir.resize(slash);
+			std::wstring work_dir;
+			auto slash = exe.find_last_of(L"\\/");
+			if (slash != std::wstring::npos) {
+				std::size_t len = slash;
+				if (slash == 0 || (slash == 2 && exe.size() > 1 && exe[1] == L':'))
+					len = slash + 1;
+				work_dir = exe.substr(0, len);
+			}
+			char work_dir_narrow[MAX_PATH] = {};
+			WideCharToMultiByte(CP_UTF8, 0, work_dir.c_str(), -1, work_dir_narrow, MAX_PATH, nullptr, nullptr);
+			log_msg(hf, "launch", "resolved working_dir=%s", work_dir.empty() ? "<inherit>" : work_dir_narrow);
 
 			std::uint32_t pid = 0;
 			set_step("launch: spawn_and_attach_target");
@@ -897,8 +968,21 @@ namespace test_all_features {
 			int total = static_cast<int>(features.size());
 			log_msg(hf, "testlab", "running %d registered features against target pid=%u ...", total, target_pid);
 
-			if (target_pid == 0) {
-				log_msg(hf, "testlab", "WARN -- no attached target pid; testlab features run with pid=0 and are expected to fail/skip");
+			const std::uint32_t attached_pid = driver_bridge::attached_pid();
+			const bool target_verified = target_pid != 0
+				&& g_driver_attached.load(std::memory_order_acquire)
+				&& attached_pid == target_pid;
+			if (!target_verified) {
+				mark_target_unavailable(hf, "testlab", "testlab skipped because there is no verified attached target", target_pid, attached_pid, 0);
+				if (total > 0)
+					g_skipped.fetch_add(total);
+				log_msg(hf, "testlab", "SKIP -- %d registered Test Lab features require a verified target; target_pid=%u driver_attached=%d driver_pid=%u",
+					total,
+					target_pid,
+					g_driver_attached.load(std::memory_order_acquire) ? 1 : 0,
+					attached_pid);
+				log_phase_end(hf, "testlab features");
+				return;
 			}
 
 			for (int i = 0; i < total; ++i) {
@@ -969,6 +1053,9 @@ namespace test_all_features {
 				} else if (name_starts_with(name, "SRV2")) {
 					s.text_a = "00112233445566778899AABBCCDDEEFF";
 					s.u32_a = 1;
+				} else if (name_starts_with(name, "DPRT")) {
+					s.text_b.clear();
+					s.u32_b = 30000;
 				} else if (name_starts_with(name, "CANR")) {
 					static std::uint8_t canary_scratch[0x1000];
 					s.addr = reinterpret_cast<std::uint64_t>(&canary_scratch[0]);
@@ -1192,16 +1279,24 @@ namespace test_all_features {
 				return;
 			}
 
-			log_msg(hf, tag, "requesting disasm refresh at target 0x%016llX (pid=%u)",
-				static_cast<unsigned long long>(addr), pid);
-
 			std::uint64_t expected_base = (addr > 0x100) ? addr - 0x100 : 0;
+			const std::uint32_t attached_pid = driver_bridge::attached_pid();
+			log_msg(hf, tag, "requesting disasm refresh at target 0x%016llX (pid=%u attached_pid=%u expected_base=0x%016llX size=0x%X driver_status=\"%s\" driver_error=\"%s\")",
+				static_cast<unsigned long long>(addr),
+				pid,
+				attached_pid,
+				static_cast<unsigned long long>(expected_base),
+				0x400u,
+				driver_bridge::status().c_str(),
+				driver_bridge::last_error().c_str());
 			debugger_engine::request_disasm_refresh(addr, 0);
 
 			std::vector<std::uint8_t> bytes;
 			std::uint64_t base_out = 0;
+			int attempts = 0;
 			for (int i = 0; i < 60; ++i) {
 				if (cancelled()) break;
+				++attempts;
 				Sleep(50);
 				bytes = debugger_engine::cached_disasm_window(base_out);
 				if (!bytes.empty() && base_out == expected_base) break;
@@ -1211,10 +1306,22 @@ namespace test_all_features {
 			auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 				std::chrono::steady_clock::now() - t0).count();
 
+			log_msg(hf, tag, "cache poll result attempts=%d bytes=%zu base=0x%016llX expected=0x%016llX debugger_error=\"%s\" elapsed=%lld ms",
+				attempts,
+				bytes.size(),
+				static_cast<unsigned long long>(base_out),
+				static_cast<unsigned long long>(expected_base),
+				debugger_engine::last_error().c_str(),
+				(long long)ms);
+
 			if (bytes.empty() || base_out != expected_base) {
-				log_msg(hf, tag, "FAIL -- disasm window not populated for target (bytes=%zu base=0x%016llX expected=0x%016llX) (elapsed %lld ms)",
+				log_msg(hf, tag, "FAIL -- disasm window not populated for target (bytes=%zu base=0x%016llX expected=0x%016llX attached_pid=%u size=0x%X debugger_error=\"%s\") (elapsed %lld ms)",
 					bytes.size(), static_cast<unsigned long long>(base_out),
-					static_cast<unsigned long long>(expected_base), (long long)ms);
+					static_cast<unsigned long long>(expected_base),
+					driver_bridge::attached_pid(),
+					0x400u,
+					debugger_engine::last_error().c_str(),
+					(long long)ms);
 				g_failed.fetch_add(1);
 				return;
 			}
@@ -1238,7 +1345,7 @@ namespace test_all_features {
 			}
 
 			if (non_db > 0) {
-				log_msg(hf, tag, "PASS -- disasm window %zu bytes at base 0x%016llX, decoded %d instrs (%d real, first=\"%s\") (elapsed %lld ms)",
+				log_msg(hf, tag, "PASS -- disasm window %zu bytes at base 0x%016llX, decoded %d instrs (%d real, first=\"%s\", pass_path=\"forced_sync_cache\") (elapsed %lld ms)",
 					bytes.size(), static_cast<unsigned long long>(base_out),
 					decoded, non_db, first_mnem, (long long)ms);
 				g_passed.fetch_add(1);
@@ -1800,15 +1907,16 @@ namespace test_all_features {
 		};
 
 		struct run_heartbeat_t {
-			std::atomic<bool> stop{ false };
-			std::thread worker;
+			std::shared_ptr<std::atomic<bool>> stop;
 
 			void start(HANDLE hf) {
 				try {
-					worker = std::thread([this]() {
-						while (!stop.load(std::memory_order_acquire)) {
+					auto stop_token = std::make_shared<std::atomic<bool>>(false);
+					stop = stop_token;
+					const bool posted = work_queue::post([stop_token]() {
+						while (!stop_token->load(std::memory_order_acquire)) {
 							for (int i = 0; i < 50; ++i) {
-								if (stop.load(std::memory_order_acquire)) return;
+								if (stop_token->load(std::memory_order_acquire)) return;
 								Sleep(100);
 							}
 							HANDLE hh = open_log_file();
@@ -1816,20 +1924,34 @@ namespace test_all_features {
 							if (hh != INVALID_HANDLE_VALUE) CloseHandle(hh);
 						}
 					});
+					if (!posted) {
+						DWORD err = GetLastError();
+						log_msg(hf, "heartbeat", "disabled live heartbeat worker: work_queue post failed");
+						log_resource_snapshot(hf, "heartbeat", "work_queue post failed", err);
+						stop_token->store(true, std::memory_order_release);
+					}
 				} catch (const std::exception& ex) {
+					DWORD err = GetLastError();
 					log_msg(hf, "heartbeat", "disabled live heartbeat worker: %s", ex.what());
+					log_resource_snapshot(hf, "heartbeat", "heartbeat start exception", err);
+					if (stop)
+						stop->store(true, std::memory_order_release);
 				} catch (...) {
+					DWORD err = GetLastError();
 					log_msg(hf, "heartbeat", "disabled live heartbeat worker: unknown exception");
+					log_resource_snapshot(hf, "heartbeat", "heartbeat start unknown exception", err);
+					if (stop)
+						stop->store(true, std::memory_order_release);
 				}
 			}
 
-			void stop_and_join() {
-				stop.store(true, std::memory_order_release);
-				if (worker.joinable()) worker.join();
+			void stop_and_signal() {
+				if (stop)
+					stop->store(true, std::memory_order_release);
 			}
 
 			~run_heartbeat_t() {
-				stop_and_join();
+				stop_and_signal();
 			}
 		};
 
@@ -1908,11 +2030,16 @@ namespace test_all_features {
 			cleanup_network_runtime(hf, "pre-run reset");
 
 			if (!cancelled()) {
-				set_step("phase call: testlab features");
-				log_debug_snapshot(hf, "checkpoint", "BEFORE phase_testlab_features");
-				phase_testlab_features(hf, target_pid);
-				log_debug_snapshot(hf, "checkpoint", "AFTER phase_testlab_features");
-				verify_target_liveness(hf, "after testlab features");
+				if (target_unavailable()) {
+					skip_phase_target_unavailable(hf, "testlab features", testlab_count);
+				} else {
+					set_step("phase call: testlab features");
+					log_debug_snapshot(hf, "checkpoint", "BEFORE phase_testlab_features");
+					phase_testlab_features(hf, target_pid);
+					log_debug_snapshot(hf, "checkpoint", "AFTER phase_testlab_features");
+					if (!target_unavailable())
+						verify_target_liveness(hf, "after testlab features");
+				}
 			}
 
 			cleanup_network_runtime(hf, "after testlab features");
@@ -2153,28 +2280,55 @@ namespace test_all_features {
 
 			diag::log_tagged_fmt("test_all", "user triggered Test All Features");
 
-			try {
-				std::thread([]() {
-					(void)run_all_seh_guarded();
-				}).detach();
-			} catch (const std::exception& ex) {
+			{
 				HANDLE hf = open_log_file();
-				log_msg(hf, "start", "FAIL -- full-test worker thread could not start: %s", ex.what());
+				log_resource_snapshot(hf, "start", "BEFORE work_queue post", GetLastError());
+				if (hf != INVALID_HANDLE_VALUE) CloseHandle(hf);
+			}
+
+			try {
+				const bool posted = work_queue::post([]() {
+					(void)run_all_seh_guarded();
+				});
+				if (!posted) {
+					DWORD err = GetLastError();
+					HANDLE hf = open_log_file();
+					log_msg(hf, "start", "FAIL -- work_queue post failed");
+					log_resource_snapshot(hf, "start", "work_queue post failed", err);
+					g_failed.fetch_add(1);
+					g_running.store(false, std::memory_order_release);
+					set_phase("Idle");
+					set_step("work_queue post failed");
+					if (hf != INVALID_HANDLE_VALUE) CloseHandle(hf);
+					diag::log_tagged_fmt("test_all", "full-test work_queue post failed err=%lu", static_cast<unsigned long>(err));
+					return false;
+				}
+			} catch (const std::exception& ex) {
+				DWORD err = GetLastError();
+				HANDLE hf = open_log_file();
+				log_msg(hf, "start", "FAIL -- full-test worker could not start: %s", ex.what());
+				log_resource_snapshot(hf, "start", "worker start exception", err);
 				g_failed.fetch_add(1);
 				g_running.store(false, std::memory_order_release);
+				set_phase("Idle");
+				set_step("worker start exception");
 				if (hf != INVALID_HANDLE_VALUE) CloseHandle(hf);
-				diag::log_tagged_fmt("test_all", "full-test worker thread start failed: %s", ex.what());
+				diag::log_tagged_fmt("test_all", "full-test worker start failed: %s err=%lu", ex.what(), static_cast<unsigned long>(err));
 				return false;
 			} catch (...) {
+				DWORD err = GetLastError();
 				HANDLE hf = open_log_file();
-				log_msg(hf, "start", "FAIL -- full-test worker thread could not start: unknown exception");
+				log_msg(hf, "start", "FAIL -- full-test worker could not start: unknown exception");
+				log_resource_snapshot(hf, "start", "worker start unknown exception", err);
 				g_failed.fetch_add(1);
 				g_running.store(false, std::memory_order_release);
+				set_phase("Idle");
+				set_step("worker start unknown exception");
 				if (hf != INVALID_HANDLE_VALUE) CloseHandle(hf);
-				diag::log_tagged("test_all", "full-test worker thread start failed: unknown exception");
+				diag::log_tagged_fmt("test_all", "full-test worker start failed: unknown exception err=%lu", static_cast<unsigned long>(err));
 				return false;
 			}
-			diag::log_tagged("test_all", "dedicated full test worker thread started");
+			diag::log_tagged("test_all", "full test work_queue worker posted");
 			return true;
 		}
 

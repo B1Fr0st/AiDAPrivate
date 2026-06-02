@@ -2897,10 +2897,27 @@ void helpers::render_title()
 		dl->AddLine(ImVec2(xc.x + xr, xc.y - xr), ImVec2(xc.x - xr, xc.y + xr),
 			aida::ui::with_alpha(xcol, a), xth);
 		if (close_hov && !ui_input_gate::chrome_input_blocked() && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-			diag::log_tagged("chrome", "close_button_clicked");
+			POINT cursor{};
+			GetCursorPos(&cursor);
+			ImVec2 mouse = ImGui::GetIO().MousePos;
+			diag::log_tagged_critical_fmt("chrome",
+				"close_button_clicked hwnd=0x%llX cursor=%ld,%ld mouse=%.1f,%.1f rect=%.1f,%.1f,%.1f,%.1f blocked=%d",
+				(unsigned long long)reinterpret_cast<UINT_PTR>(g_hwnd),
+				cursor.x,
+				cursor.y,
+				mouse.x,
+				mouse.y,
+				close_a.x,
+				close_a.y,
+				close_b.x,
+				close_b.y,
+				ui_input_gate::chrome_input_blocked() ? 1 : 0);
 			file_tabs::write_hot_exit_snapshot_all();
+			diag::log_tagged_critical("chrome", "close_button_destroy_window_pre");
 			DestroyWindow(g_hwnd);
+			diag::log_tagged_critical("chrome", "close_button_post_quit_pre");
 			PostQuitMessage(0);
+			diag::log_tagged_critical("chrome", "close_button_exit_process_pre");
 			ExitProcess(0);
 		}
 		ctl_off += 22.f + 6.f;
@@ -3653,9 +3670,19 @@ void helpers::render_title()
 						}
 						menu_sep();
 						if (menu_item("Exit", "Alt+F4")) {
+							POINT cursor{};
+							GetCursorPos(&cursor);
+							diag::log_tagged_critical_fmt("chrome",
+								"file_menu_exit_clicked hwnd=0x%llX cursor=%ld,%ld",
+								(unsigned long long)reinterpret_cast<UINT_PTR>(g_hwnd),
+								cursor.x,
+								cursor.y);
 							file_tabs::write_hot_exit_snapshot_all();
+							diag::log_tagged_critical("chrome", "file_menu_exit_destroy_window_pre");
 							DestroyWindow(g_hwnd);
+							diag::log_tagged_critical("chrome", "file_menu_exit_post_quit_pre");
 							PostQuitMessage(0);
+							diag::log_tagged_critical("chrome", "file_menu_exit_exit_process_pre");
 							ExitProcess(0);
 						}
 						break;

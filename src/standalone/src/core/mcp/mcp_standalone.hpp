@@ -103,6 +103,7 @@ namespace mcp_standalone
         std::atomic<bool> _stop_requested{false};
         void* _active_server = nullptr;
         std::mutex _server_mtx;
+        std::thread _server_thread;
         int _port = 0;
     };
 

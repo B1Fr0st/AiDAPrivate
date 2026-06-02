@@ -25,6 +25,7 @@
 #include <filesystem>
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <cstdlib>
 #include <exception>
 #include <memory>
@@ -34,29 +35,145 @@ namespace mcp_standalone
 namespace
 {
     std::atomic<bool> g_ide_lifecycle_ready{false};
+    constexpr size_t kMcpHttpWorkerThreads = 32;
+    constexpr size_t kMcpHttpMaxQueuedRequests = 512;
+    constexpr int kMcpMaxConcurrentStreams = 24;
+    constexpr DWORD kSseSessionMaxAgeMs = 60u * 60u * 1000u;
+    std::atomic<std::uint64_t> g_http_request_seq{0};
+    std::atomic<int> g_active_http_requests{0};
+    std::atomic<std::uint64_t> g_stream_seq{0};
+    std::atomic<int> g_active_streams{0};
+    std::atomic<size_t> g_cached_external_tool_count{0};
+    std::atomic<bool> g_cached_health_ready{false};
+    thread_local std::uint64_t tls_http_request_id = 0;
+    thread_local std::uint64_t tls_http_request_start_tick = 0;
 
-    class work_queue_task_queue_t final : public httplib::TaskQueue
+    static std::uint64_t mcp_now_ms()
     {
-    public:
-        bool enqueue(std::function<void()> fn) override
-        {
-            if (_shutdown.load(std::memory_order_acquire))
-                return false;
-            return work_queue::post([this, job = std::move(fn)]() mutable {
-                if (_shutdown.load(std::memory_order_acquire))
-                    return;
-                job();
-            });
-        }
+        return static_cast<std::uint64_t>(GetTickCount64());
+    }
 
-        void shutdown() override
-        {
-            _shutdown.store(true, std::memory_order_release);
-        }
+    static std::string remote_endpoint(const httplib::Request& req)
+    {
+        std::string endpoint = req.remote_addr.empty() ? "<unknown>" : req.remote_addr;
+        endpoint += ":";
+        endpoint += std::to_string(req.remote_port);
+        return endpoint;
+    }
 
-    private:
-        std::atomic<bool> _shutdown{false};
+    static bool request_connection_closed(const httplib::Request& req)
+    {
+        try {
+            return req.is_connection_closed ? req.is_connection_closed() : false;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    static bool connection_closed_now(const std::function<bool()>& fn)
+    {
+        try {
+            return fn ? fn() : false;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    struct mcp_stream_state_t
+    {
+        std::uint64_t id = 0;
+        const char* route = "";
+        std::string remote;
+        std::uint64_t opened_tick = 0;
+        std::atomic<bool> released{false};
+        std::atomic<bool> done_called{false};
     };
+
+    static std::shared_ptr<mcp_stream_state_t> acquire_stream_slot(const char* route, const httplib::Request& req, httplib::Response& res)
+    {
+        int cur = g_active_streams.load(std::memory_order_acquire);
+        while (cur < kMcpMaxConcurrentStreams) {
+            if (g_active_streams.compare_exchange_weak(cur, cur + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+                auto state = std::make_shared<mcp_stream_state_t>();
+                state->id = g_stream_seq.fetch_add(1, std::memory_order_acq_rel) + 1;
+                state->route = route ? route : "<unknown>";
+                state->remote = remote_endpoint(req);
+                state->opened_tick = mcp_now_ms();
+                diag::log_tagged_fmt("mcp_srv",
+                    "stream_open id=%llu route=%s remote=%s pid=%lu tid=%lu active_streams=%d active_requests=%d",
+                    static_cast<unsigned long long>(state->id),
+                    state->route,
+                    state->remote.c_str(),
+                    static_cast<unsigned long>(GetCurrentProcessId()),
+                    static_cast<unsigned long>(GetCurrentThreadId()),
+                    cur + 1,
+                    g_active_http_requests.load(std::memory_order_acquire));
+                return state;
+            }
+        }
+
+        diag::log_tagged_fmt("mcp_srv",
+            "stream_reject route=%s remote=%s pid=%lu tid=%lu active_streams=%d max_streams=%d active_requests=%d",
+            route ? route : "<unknown>",
+            remote_endpoint(req).c_str(),
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            cur,
+            kMcpMaxConcurrentStreams,
+            g_active_http_requests.load(std::memory_order_acquire));
+        res.status = 503;
+        res.set_header("Retry-After", "2");
+        res.set_content("{\"error\":\"mcp stream capacity exhausted\"}", "application/json");
+        return {};
+    }
+
+    static void release_stream_slot(const std::shared_ptr<mcp_stream_state_t>& state, bool success, const char* reason)
+    {
+        if (!state)
+            return;
+        if (state->released.exchange(true, std::memory_order_acq_rel))
+            return;
+        const std::uint64_t now = mcp_now_ms();
+        const std::uint64_t elapsed = now >= state->opened_tick ? now - state->opened_tick : 0;
+        int active_after = g_active_streams.fetch_sub(1, std::memory_order_acq_rel) - 1;
+        if (active_after < 0) {
+            g_active_streams.store(0, std::memory_order_release);
+            active_after = 0;
+        }
+        diag::log_tagged_fmt("mcp_srv",
+            "stream_close id=%llu route=%s remote=%s success=%d reason=%s elapsed_ms=%llu pid=%lu tid=%lu active_streams=%d active_requests=%d",
+            static_cast<unsigned long long>(state->id),
+            state->route ? state->route : "<unknown>",
+            state->remote.c_str(),
+            success ? 1 : 0,
+            reason ? reason : "",
+            static_cast<unsigned long long>(elapsed),
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            active_after,
+            g_active_http_requests.load(std::memory_order_acquire));
+    }
+
+    static void finish_stream_cleanly(mcp_stream_state_t* state, httplib::DataSink& sink, const char* reason)
+    {
+        if (!state || state->done_called.exchange(true, std::memory_order_acq_rel))
+            return;
+        diag::log_tagged_fmt("mcp_srv",
+            "stream_done id=%llu route=%s reason=%s remote=%s pid=%lu tid=%lu",
+            static_cast<unsigned long long>(state->id),
+            state->route ? state->route : "<unknown>",
+            reason ? reason : "",
+            state->remote.c_str(),
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        if (sink.done)
+            sink.done();
+    }
+
+    static void finish_stream_cleanly(const std::shared_ptr<mcp_stream_state_t>& state, httplib::DataSink& sink, const char* reason)
+    {
+        finish_stream_cleanly(state.get(), sink, reason);
+    }
 }
 
 static std::string json_dump_safe(const json& j, int indent = -1)
@@ -259,9 +376,12 @@ struct sse_session_t
     std::mutex  mtx;
     std::queue<std::string> events;
     std::atomic<bool> closed{false};
+    std::uint64_t opened_tick = mcp_now_ms();
+    std::atomic<std::uint64_t> last_activity_tick{0};
 
     void push_event(const std::string& event)
     {
+        last_activity_tick.store(mcp_now_ms(), std::memory_order_release);
         std::lock_guard<std::mutex> lk(mtx);
         events.push(event);
     }
@@ -279,6 +399,7 @@ struct sse_session_t
                 if (!events.empty()) {
                     out = std::move(events.front());
                     events.pop();
+                    last_activity_tick.store(mcp_now_ms(), std::memory_order_release);
                     return true;
                 }
             }
@@ -297,24 +418,58 @@ static bool sse_provider_step_impl(
     sse_session_t* session,
     httplib::DataSink* sink,
     size_t offset,
-    std::atomic<bool>* stop_requested)
+    std::atomic<bool>* stop_requested,
+    mcp_stream_state_t* stream_state,
+    const std::function<bool()>& connection_closed)
 {
     if (offset == 0) {
         std::string evt = format_sse_event("endpoint",
             "/message?sessionId=" + session->id);
-        if (!sink->write(evt.c_str(), evt.size())) { session->close(); return false; }
+        if (!sink->write(evt.c_str(), evt.size())) {
+            diag::log_tagged_fmt("mcp_srv", "stream_write_fail id=%llu route=%s phase=endpoint",
+                stream_state ? static_cast<unsigned long long>(stream_state->id) : 0ULL,
+                stream_state && stream_state->route ? stream_state->route : "<unknown>");
+            session->close();
+            return false;
+        }
+    }
+    if (connection_closed_now(connection_closed)) {
+        session->close();
+        finish_stream_cleanly(stream_state, *sink, "connection_closed");
+        return true;
     }
     std::string event;
     if (session->wait_event(event, 2000)) {
-        if (!sink->write(event.c_str(), event.size())) { session->close(); return false; }
+        if (!sink->write(event.c_str(), event.size())) {
+            diag::log_tagged_fmt("mcp_srv", "stream_write_fail id=%llu route=%s phase=event",
+                stream_state ? static_cast<unsigned long long>(stream_state->id) : 0ULL,
+                stream_state && stream_state->route ? stream_state->route : "<unknown>");
+            session->close();
+            return false;
+        }
     } else if (session->closed.load(std::memory_order_acquire)) {
-        return false;
+        finish_stream_cleanly(stream_state, *sink, "session_closed");
+        return true;
     } else if (stop_requested && stop_requested->load(std::memory_order_acquire)) {
         session->close();
-        return false;
+        finish_stream_cleanly(stream_state, *sink, "server_stop");
+        return true;
     } else {
         const char ka[] = ": keepalive\n\n";
-        if (!sink->write(ka, sizeof(ka) - 1u)) { session->close(); return false; }
+        if (sink->is_writable && !sink->is_writable()) {
+            diag::log_tagged_fmt("mcp_srv", "stream_write_fail id=%llu route=%s phase=writable",
+                stream_state ? static_cast<unsigned long long>(stream_state->id) : 0ULL,
+                stream_state && stream_state->route ? stream_state->route : "<unknown>");
+            session->close();
+            return false;
+        }
+        if (!sink->write(ka, sizeof(ka) - 1u)) {
+            diag::log_tagged_fmt("mcp_srv", "stream_write_fail id=%llu route=%s phase=keepalive",
+                stream_state ? static_cast<unsigned long long>(stream_state->id) : 0ULL,
+                stream_state && stream_state->route ? stream_state->route : "<unknown>");
+            session->close();
+            return false;
+        }
     }
     return !session->closed.load(std::memory_order_acquire);
 }
@@ -324,11 +479,13 @@ __declspec(noinline) static DWORD seh_sse_provider_step(
     httplib::DataSink* sink,
     size_t offset,
     std::atomic<bool>* stop_requested,
+    mcp_stream_state_t* stream_state,
+    const std::function<bool()>& connection_closed,
     bool* out_continue)
 {
     *out_continue = false;
     __try {
-        *out_continue = sse_provider_step_impl(session, sink, offset, stop_requested);
+        *out_continue = sse_provider_step_impl(session, sink, offset, stop_requested, stream_state, connection_closed);
         return 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return GetExceptionCode();
@@ -1126,15 +1283,37 @@ bool server_t::start(int port)
     _stop_requested = false;
     _port = 0;
 
+    if (_server_thread.joinable()) {
+        if (_server_done.load(std::memory_order_acquire)) {
+            _server_thread.join();
+        } else {
+            diag::log_tagged_fmt("mcp_srv", "start rejected server_thread already starting port=%d", port);
+            return false;
+        }
+    }
+
     _server_done.store(false, std::memory_order_release);
-    if (!work_queue::post([this, port]() {
-            diag::log_tagged_fmt("mcp_srv", "server_thread starting port=%d", port);
-            server_thread_func(port);
-            diag::log_tagged_fmt("mcp_srv", "server_thread exited port=%d", port);
+    try {
+        _server_thread = std::thread([this, port]() {
+            diag::log_tagged_fmt("mcp_srv", "server_thread starting port=%d tid=%lu", port, static_cast<unsigned long>(GetCurrentThreadId()));
+            try {
+                server_thread_func(port);
+            } catch (const std::exception& ex) {
+                diag::log_tagged_fmt("mcp_srv", "server_thread exception port=%d err='%s'", port, ex.what());
+                _running.store(false, std::memory_order_release);
+            } catch (...) {
+                diag::log_tagged_fmt("mcp_srv", "server_thread exception port=%d err='<unknown>'", port);
+                _running.store(false, std::memory_order_release);
+            }
+            diag::log_tagged_fmt("mcp_srv", "server_thread exited port=%d tid=%lu", port, static_cast<unsigned long>(GetCurrentThreadId()));
             _server_done.store(true, std::memory_order_release);
-        }))
-    {
-        diag::log_tagged_fmt("mcp_srv", "start work_queue post fail");
+        });
+    } catch (const std::exception& ex) {
+        diag::log_tagged_fmt("mcp_srv", "start dedicated_thread fail err='%s'", ex.what());
+        _server_done.store(true, std::memory_order_release);
+        return false;
+    } catch (...) {
+        diag::log_tagged_fmt("mcp_srv", "start dedicated_thread fail err='<unknown>'");
         _server_done.store(true, std::memory_order_release);
         return false;
     }
@@ -1151,8 +1330,15 @@ bool server_t::start(int port)
 void server_t::stop()
 {
     diag::log_tagged_fmt("mcp_srv", "stop entry running=%d", (int)_running.load());
+    const bool on_server_thread = _server_thread.joinable() && _server_thread.get_id() == std::this_thread::get_id();
     if (!_running.load() && _server_done.load(std::memory_order_acquire))
     {
+        if (_server_thread.joinable()) {
+            if (on_server_thread)
+                _server_thread.detach();
+            else
+                _server_thread.join();
+        }
         diag::log_tagged_fmt("mcp_srv", "stop already stopped");
         return;
     }
@@ -1162,18 +1348,40 @@ void server_t::stop()
         if (_active_server)
             static_cast<httplib::Server*>(_active_server)->stop();
     }
-    while (!_server_done.load(std::memory_order_acquire))
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    if (!on_server_thread) {
+        while (!_server_done.load(std::memory_order_acquire))
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (_server_thread.joinable()) {
+        if (on_server_thread)
+            _server_thread.detach();
+        else
+            _server_thread.join();
+    }
     diag::log_tagged_fmt("mcp_srv", "stop done");
 }
 
 void server_t::server_thread_func(int port)
 {
     diag::log_tagged_fmt("mcp_srv", "server_thread_func entry port=%d", port);
+    g_cached_health_ready.store(false, std::memory_order_release);
+    g_cached_external_tool_count.store(0, std::memory_order_release);
     httplib::Server svr;
     svr.new_task_queue = [] {
-        return new work_queue_task_queue_t();
+        return new httplib::ThreadPool(kMcpHttpWorkerThreads, kMcpHttpMaxQueuedRequests);
     };
+    diag::log_tagged_fmt("mcp_srv",
+        "server_thread_func dedicated_http_pool threads=%zu max_queue=%zu",
+        kMcpHttpWorkerThreads,
+        kMcpHttpMaxQueuedRequests);
+    svr.set_keep_alive_max_count(8);
+    svr.set_keep_alive_timeout(2);
+    svr.set_read_timeout(5, 0);
+    svr.set_write_timeout(10, 0);
+    svr.set_idle_interval(0, 100000);
+    diag::log_tagged_fmt("mcp_srv",
+        "server_thread_func http_limits keep_alive_max=8 keep_alive_timeout_sec=2 read_timeout_sec=5 write_timeout_sec=10 idle_interval_us=100000 max_streams=%d",
+        kMcpMaxConcurrentStreams);
     {
         std::lock_guard<std::mutex> lk(_server_mtx);
         _active_server = &svr;
@@ -1187,6 +1395,53 @@ void server_t::server_thread_func(int port)
         {"Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS"},
         {"Access-Control-Allow-Headers", "Content-Type, Mcp-Session-Id, MCP-Protocol-Version, Accept, Authorization, Last-Event-ID"},
         {"Access-Control-Expose-Headers", "Mcp-Session-Id, MCP-Protocol-Version"}
+    });
+
+    svr.set_pre_routing_handler([](const httplib::Request& req, httplib::Response&) {
+        tls_http_request_id = g_http_request_seq.fetch_add(1, std::memory_order_acq_rel) + 1;
+        tls_http_request_start_tick = mcp_now_ms();
+        const int active = g_active_http_requests.fetch_add(1, std::memory_order_acq_rel) + 1;
+        diag::log_tagged_fmt("mcp_srv",
+            "request_entry id=%llu method=%s path=%s matched=%s remote=%s pid=%lu tid=%lu active_requests=%d active_streams=%d body_len=%zu conn_closed=%d",
+            static_cast<unsigned long long>(tls_http_request_id),
+            req.method.c_str(),
+            req.path.c_str(),
+            req.matched_route.c_str(),
+            remote_endpoint(req).c_str(),
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            active,
+            g_active_streams.load(std::memory_order_acquire),
+            req.body.size(),
+            request_connection_closed(req) ? 1 : 0);
+        return httplib::Server::HandlerResponse::Unhandled;
+    });
+
+    svr.set_logger([](const httplib::Request& req, const httplib::Response& res) {
+        const std::uint64_t now = mcp_now_ms();
+        const std::uint64_t elapsed = (tls_http_request_start_tick != 0 && now >= tls_http_request_start_tick) ? (now - tls_http_request_start_tick) : 0;
+        int active_after = g_active_http_requests.fetch_sub(1, std::memory_order_acq_rel) - 1;
+        if (active_after < 0) {
+            g_active_http_requests.store(0, std::memory_order_release);
+            active_after = 0;
+        }
+        diag::log_tagged_fmt("mcp_srv",
+            "request_exit id=%llu method=%s path=%s matched=%s status=%d elapsed_ms=%llu remote=%s pid=%lu tid=%lu active_requests=%d active_streams=%d body_len=%zu conn_closed=%d",
+            static_cast<unsigned long long>(tls_http_request_id),
+            req.method.c_str(),
+            req.path.c_str(),
+            req.matched_route.c_str(),
+            res.status,
+            static_cast<unsigned long long>(elapsed),
+            remote_endpoint(req).c_str(),
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            active_after,
+            g_active_streams.load(std::memory_order_acquire),
+            req.body.size(),
+            request_connection_closed(req) ? 1 : 0);
+        tls_http_request_id = 0;
+        tls_http_request_start_tick = 0;
     });
 
     svr.Options(".*", [](const httplib::Request& req, httplib::Response& res) {
@@ -1229,25 +1484,66 @@ void server_t::server_thread_func(int port)
         bool wants_sse = accept.find("text/event-stream") != std::string::npos;
 
         if (wants_sse) {
+            auto stream_state = acquire_stream_slot("GET /mcp", req, res);
+            if (!stream_state)
+                return;
+            auto connection_closed = req.is_connection_closed;
             res.set_header("Cache-Control", "no-cache");
             res.set_chunked_content_provider(
                 "text/event-stream",
-                [this](size_t offset, httplib::DataSink& sink) -> bool {
+                [this, stream_state, connection_closed](size_t offset, httplib::DataSink& sink) -> bool {
+                    if (connection_closed_now(connection_closed)) {
+                        finish_stream_cleanly(stream_state, sink, "connection_closed");
+                        return true;
+                    }
                     if (offset == 0) {
                         const char connected[] = ": connected\n\n";
-                        if (!sink.write(connected, sizeof(connected) - 1u)) return false;
+                        if (!sink.write(connected, sizeof(connected) - 1u)) {
+                            diag::log_tagged_fmt("mcp_srv", "stream_write_fail id=%llu route=%s phase=connected",
+                                static_cast<unsigned long long>(stream_state->id),
+                                stream_state->route ? stream_state->route : "<unknown>");
+                            return false;
+                        }
                     }
                     const char ka[] = ": keepalive\n\n";
                     for (int i = 0; i < 6; ++i) {
                         for (int slice = 0; slice < 50; ++slice) {
-                            if (_stop_requested.load(std::memory_order_acquire)) return false;
+                            if (_stop_requested.load(std::memory_order_acquire)) {
+                                finish_stream_cleanly(stream_state, sink, "server_stop");
+                                return true;
+                            }
+                            if (connection_closed_now(connection_closed)) {
+                                finish_stream_cleanly(stream_state, sink, "connection_closed");
+                                return true;
+                            }
                             std::this_thread::sleep_for(std::chrono::milliseconds(100));
                         }
-                        if (_stop_requested.load(std::memory_order_acquire)) return false;
-                        if (!sink.write(ka, sizeof(ka) - 1u)) return false;
+                        if (_stop_requested.load(std::memory_order_acquire)) {
+                            finish_stream_cleanly(stream_state, sink, "server_stop");
+                            return true;
+                        }
+                        if (connection_closed_now(connection_closed)) {
+                            finish_stream_cleanly(stream_state, sink, "connection_closed");
+                            return true;
+                        }
+                        if (sink.is_writable && !sink.is_writable()) {
+                            diag::log_tagged_fmt("mcp_srv", "stream_write_fail id=%llu route=%s phase=writable",
+                                static_cast<unsigned long long>(stream_state->id),
+                                stream_state->route ? stream_state->route : "<unknown>");
+                            return false;
+                        }
+                        if (!sink.write(ka, sizeof(ka) - 1u)) {
+                            diag::log_tagged_fmt("mcp_srv", "stream_write_fail id=%llu route=%s phase=keepalive",
+                                static_cast<unsigned long long>(stream_state->id),
+                                stream_state->route ? stream_state->route : "<unknown>");
+                            return false;
+                        }
                     }
                     return true;
-                }, nullptr);
+                },
+                [stream_state](bool success) {
+                    release_stream_slot(stream_state, success, success ? "provider_complete" : "provider_failed");
+                });
         } else {
             res.set_content("event: endpoint\ndata: /mcp\n\n", "text/event-stream");
         }
@@ -1261,19 +1557,35 @@ void server_t::server_thread_func(int port)
         res.set_content("{}", "application/json");
     });
 
-    svr.Get("/health", [this](const httplib::Request&, httplib::Response& res) {
+    svr.Get("/health", [this](const httplib::Request& req, httplib::Response& res) {
+        const std::uint64_t t0 = mcp_now_ms();
+        diag::log_tagged_fmt("mcp_srv",
+            "health_entry remote=%s pid=%lu tid=%lu active_requests=%d active_streams=%d",
+            remote_endpoint(req).c_str(),
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            g_active_http_requests.load(std::memory_order_acquire),
+            g_active_streams.load(std::memory_order_acquire));
         json health;
         health["status"]      = "ok";
         health["server"]      = SERVER_NAME;
         health["version"]     = SERVER_VERSION;
-        size_t tool_count = 0;
-        { std::lock_guard<std::mutex> lk(_tools_mtx);
-          for (const auto& t : _tools)
-              if (is_external_mcp_tool(t)) ++tool_count; }
-        health["tools_count"] = tool_count;
-        health["driver"]      = driver_bridge::is_loaded();
-        health["attached"]    = driver_bridge::attached_pid();
+        health["port"]        = _port;
+        health["tools_count"] = g_cached_external_tool_count.load(std::memory_order_acquire);
+        health["cache_ready"] = g_cached_health_ready.load(std::memory_order_acquire);
+        health["active_requests"] = g_active_http_requests.load(std::memory_order_acquire);
+        health["active_streams"] = g_active_streams.load(std::memory_order_acquire);
+        health["stream_limit"] = kMcpMaxConcurrentStreams;
+        res.status = 200;
         res.set_content(json_dump_safe(health), "application/json");
+        const std::uint64_t elapsed = mcp_now_ms() - t0;
+        diag::log_tagged_fmt("mcp_srv",
+            "health_exit status=%d elapsed_ms=%llu remote=%s active_requests=%d active_streams=%d",
+            res.status,
+            static_cast<unsigned long long>(elapsed),
+            remote_endpoint(req).c_str(),
+            g_active_http_requests.load(std::memory_order_acquire),
+            g_active_streams.load(std::memory_order_acquire));
     });
 
     svr.Get("/", [this](const httplib::Request&, httplib::Response& res) {
@@ -1356,11 +1668,55 @@ void server_t::server_thread_func(int port)
     std::map<std::string, std::shared_ptr<sse_session_t>> sse_sessions;
     std::mutex sse_mtx;
 
-    svr.Get("/sse", [this, &sse_sessions, &sse_mtx](const httplib::Request&, httplib::Response& res) {
+    auto cleanup_sse_sessions = [&sse_sessions, &sse_mtx](const char* reason) {
+        const std::uint64_t now = mcp_now_ms();
+        size_t removed = 0;
+        {
+            std::lock_guard<std::mutex> lk(sse_mtx);
+            for (auto it = sse_sessions.begin(); it != sse_sessions.end(); ) {
+                const auto& session = it->second;
+                const bool aged = session && now >= session->opened_tick && (now - session->opened_tick) > kSseSessionMaxAgeMs;
+                if (!session || session->closed.load(std::memory_order_acquire) || aged) {
+                    if (session)
+                        session->close();
+                    it = sse_sessions.erase(it);
+                    ++removed;
+                } else {
+                    ++it;
+                }
+            }
+        }
+        if (removed != 0) {
+            diag::log_tagged_fmt("mcp_srv",
+                "sse_session_cleanup reason=%s removed=%zu active_streams=%d active_requests=%d",
+                reason ? reason : "",
+                removed,
+                g_active_streams.load(std::memory_order_acquire),
+                g_active_http_requests.load(std::memory_order_acquire));
+        }
+    };
+
+    svr.Get("/sse", [this, &sse_sessions, &sse_mtx, &cleanup_sse_sessions](const httplib::Request& req, httplib::Response& res) {
         require_mcp_runtime_authorized("http_get_sse");
+        cleanup_sse_sessions("before_open");
         auto session = std::make_shared<sse_session_t>();
         session->id = generate_session_id();
-        { std::lock_guard<std::mutex> lk(sse_mtx); sse_sessions[session->id] = session; }
+        auto stream_state = acquire_stream_slot("GET /sse", req, res);
+        if (!stream_state)
+            return;
+        auto connection_closed = req.is_connection_closed;
+        size_t session_count = 0;
+        {
+            std::lock_guard<std::mutex> lk(sse_mtx);
+            sse_sessions[session->id] = session;
+            session_count = sse_sessions.size();
+        }
+        diag::log_tagged_fmt("mcp_srv",
+            "sse_session_open session=%s stream_id=%llu remote=%s sessions=%zu",
+            session->id.c_str(),
+            static_cast<unsigned long long>(stream_state->id),
+            stream_state->remote.c_str(),
+            session_count);
 
         res.set_header("Cache-Control", "no-cache");
         res.set_header("Connection", "keep-alive");
@@ -1369,24 +1725,41 @@ void server_t::server_thread_func(int port)
         std::atomic<bool>* stop_ptr = &_stop_requested;
         res.set_chunked_content_provider(
             "text/event-stream",
-            [session, stop_ptr](size_t offset, httplib::DataSink& sink) -> bool {
+            [session, stop_ptr, stream_state, connection_closed](size_t offset, httplib::DataSink& sink) -> bool {
                 bool cont = false;
-                DWORD seh = seh_sse_provider_step(session.get(), &sink, offset, stop_ptr, &cont);
+                DWORD seh = seh_sse_provider_step(session.get(), &sink, offset, stop_ptr, stream_state.get(), connection_closed, &cont);
                 if (seh != 0) {
+                    diag::log_tagged_fmt("mcp_srv",
+                        "stream_provider_seh id=%llu route=%s code=0x%08lX",
+                        static_cast<unsigned long long>(stream_state->id),
+                        stream_state->route ? stream_state->route : "<unknown>",
+                        static_cast<unsigned long>(seh));
                     session->close();
                     return false;
                 }
                 return cont;
             },
-            [session, &sse_sessions, &sse_mtx](bool) {
+            [session, &sse_sessions, &sse_mtx, stream_state](bool success) {
                 session->close();
-                std::lock_guard<std::mutex> lk(sse_mtx);
-                sse_sessions.erase(session->id);
+                size_t remaining = 0;
+                {
+                    std::lock_guard<std::mutex> lk(sse_mtx);
+                    sse_sessions.erase(session->id);
+                    remaining = sse_sessions.size();
+                }
+                diag::log_tagged_fmt("mcp_srv",
+                    "sse_session_close session=%s stream_id=%llu success=%d remaining=%zu",
+                    session->id.c_str(),
+                    static_cast<unsigned long long>(stream_state->id),
+                    success ? 1 : 0,
+                    remaining);
+                release_stream_slot(stream_state, success, success ? "provider_complete" : "provider_failed");
             });
     });
 
-    svr.Post("/message", [this, &sse_sessions, &sse_mtx](const httplib::Request& req, httplib::Response& res) {
+    svr.Post("/message", [this, &sse_sessions, &sse_mtx, &cleanup_sse_sessions](const httplib::Request& req, httplib::Response& res) {
         require_mcp_runtime_authorized("http_post_message");
+        cleanup_sse_sessions("before_message");
         std::string sid = req.get_param_value("sessionId");
         if (sid.empty()) {
             res.status = 400;
@@ -1398,7 +1771,9 @@ void server_t::server_thread_func(int port)
         std::shared_ptr<sse_session_t> session;
         { std::lock_guard<std::mutex> lk(sse_mtx);
           auto it = sse_sessions.find(sid);
-          if (it == sse_sessions.end()) {
+          if (it == sse_sessions.end() || !it->second || it->second->closed.load(std::memory_order_acquire)) {
+              if (it != sse_sessions.end())
+                  sse_sessions.erase(it);
               res.status = 404;
               res.set_content(json_dump_safe(make_error(nullptr,
                   JSONRPC_INVALID_REQUEST, "Unknown or expired session: " + sid)), "application/json");
@@ -1465,13 +1840,22 @@ void server_t::server_thread_func(int port)
     { std::lock_guard<std::mutex> lk(_tools_mtx);
       for (const auto& t : _tools)
           if (is_external_mcp_tool(t)) ++external_tools; }
+    g_cached_external_tool_count.store(external_tools, std::memory_order_release);
+    g_cached_health_ready.store(true, std::memory_order_release);
     diag::log_tagged_fmt("mcp_srv",
         "server_thread_func listening bound_port=%d endpoints=/mcp,/sse,/health external_tools=%zu",
         bound_port, external_tools);
 
+    diag::log_tagged_fmt("mcp_srv",
+        "server_thread_func listen_after_bind_enter port=%d pid=%lu tid=%lu",
+        bound_port,
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        static_cast<unsigned long>(GetCurrentThreadId()));
+
     svr.listen_after_bind();
 
     diag::log_tagged_fmt("mcp_srv", "server_thread_func listen_after_bind returned port=%d", bound_port);
+    g_cached_health_ready.store(false, std::memory_order_release);
     _running = false;
     { std::lock_guard<std::mutex> lk(_server_mtx); _active_server = nullptr; }
 }

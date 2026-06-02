@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -63,6 +64,32 @@ namespace test_lab {
 	bool register_feature(const feature_t& f);
 	const std::vector<feature_t>& all_features();
 	const std::string& last_error();
+
+	inline const char* destructive_guard_reason(const char* category, const char* name) noexcept {
+		if (category == nullptr || name == nullptr) return nullptr;
+		struct guarded_feature_t {
+			const char* category;
+			const char* name;
+			const char* reason;
+		};
+		static constexpr guarded_feature_t guarded[] = {
+			{ "tamper", "ABRT", "kernel tamper abort can bugcheck" },
+			{ "evidence", "RECU", "kernel evidence recovery can bugcheck" },
+			{ "remote-call", "RC", "executes a target-process remote call" },
+			{ "thread", "TSR", "suspends or resumes a target thread" },
+			{ "module", "PINJ", "injects a transport-layer packet" },
+			{ "anti-debug", "DBGA", "debug-attach evidence path may bugcheck on positive detection" }
+		};
+		for (const auto& f : guarded) {
+			if (std::strcmp(category, f.category) == 0 && std::strcmp(name, f.name) == 0)
+				return f.reason;
+		}
+		return nullptr;
+	}
+
+	inline bool is_destructive_guarded_feature(const char* category, const char* name) noexcept {
+		return destructive_guard_reason(category, name) != nullptr;
+	}
 
 	struct registrar_t {
 		registrar_t(const feature_t& f) noexcept;

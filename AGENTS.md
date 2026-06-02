@@ -18,6 +18,8 @@ AiDA uses CMake 3.25+ with Ninja generator and MSVC (Visual Studio 2022 Professi
 
 **For very massive tasks (large refactors, multi-file redesigns, UI overhauls, cross-module implementations), the host AI MUST dispatch GPT-5.5 implementer/designer subagents.** Solo inline-editing on big jobs is wrong; parallel implementer/designer subagents with surgical briefs is the default.
 
+For serious crash, hang, Test Lab, MCP startup, Runtime Integrity Lock, anti-tamper, or driver-backed debugging tasks, use a dedicated GPT-5.5 xhigh subagent when the investigation spans multiple files or needs heavy instrumentation. The most valuable subagent pattern for this repo is a tightly scoped logging/instrumentation implementer: give it the exact evidence window from logs, tell it to add comprehensive breadcrumbs across that path, and forbid it from diagnosing beyond evidence or building.
+
 **SUBAGENTS ARE FORBIDDEN FROM BUILDING. NEVER. UNDER ANY CIRCUMSTANCE.**
 
 - A full clean protected build takes around 40 minutes. A subagent that builds wastes time on a process the host cannot observe in real time.
@@ -41,6 +43,24 @@ AiDA uses CMake 3.25+ with Ninja generator and MSVC (Visual Studio 2022 Professi
 - For crashes, BSODs, hangs, startup stalls, loader stalls, Runtime Integrity Lock failures, and any other not-working report, do not diagnose from code structure, intuition, or PDB/symbol guesses alone. Treat logs, dumps, and explicit breadcrumbs as the source of truth. If the existing logs do not identify the exact failing call and state, first add narrow, extremely comprehensive debug logging around the confirmed evidence window, rebuild, and ask the user to reproduce with the rebuilt binary.
 - Crash logging must capture entry/exit, PID, TID, timestamps, elapsed durations, phase/step names, module base/end, VA/RVA/size/protection/state for memory operations, Win32 last-error/NTSTATUS values, IOCTL inputs/results, and before/after state for guard pages, `VirtualProtect`/`NtProtectVirtualMemory`, driver calls, anti-tamper gates, and background work items.
 - Do not claim root cause for crashes unless the logs or dump prove it. Use "first confirmed failure marker" or "current evidence window" when the evidence is not yet conclusive, and keep adding breadcrumbs until the failing call is proven.
+
+## User Operating Preferences
+
+- The user strongly prefers evidence-driven work over theories. Do not speculate, even with symbols/PDBs, when logs can be made better.
+- Do not add only a few debug logs, build, ask for a run, then repeat the same cycle. For confirmed crash/hang windows, instrument the whole narrow subsystem deeply enough to identify entry, exit, state, timing, and failing call in one reproduction whenever possible.
+- When the problem is broad or high-stakes, dispatch a GPT-5.5 xhigh subagent specifically for comprehensive debug logging or implementation, then the host reviews, patches if needed, and builds.
+- Creating small local test apps, focused repro harnesses, or API-behavior probes is encouraged when it can safely validate a low-level change before touching the protected app. Keep these tests focused, do not weaken protections, and do not run driver/anti-tamper paths casually.
+- The user wants AiDA to be extremely stable and secure at the same time. Never trade anti-tamper, license, ARC, driver, or protector strength for convenience or to make tests pass.
+
+## Confirmed Diagnostics Lessons
+
+- `aida_debug.log` is the canonical app/runtime log; `C:\Users\Public\Desktop\aida_kernel.log` is the kernel-side companion; `C:\Users\Public\Desktop\aida_full_test.log` is the Test Lab full-run evidence source. Read all relevant logs before code diagnosis.
+- Test Lab failures can cascade from a single bad target launch. If full-test logs show `target_unavailable=1`, `target_pid=0`, invalid PID/DTB, failed memory allocation, or driver attach mismatch, verify `AiDA_TestTarget.exe` launch and attach first before chasing downstream feature failures.
+- A confirmed full-test launch failure was `CreateProcessW` with `gle=267` because `cwd='AiDA_TestTarget.exe'`. When launch fails, log requested/effective executable path, requested/effective working directory, command line, PID/TID, elapsed time, Win32 error, and driver attach state.
+- TCP/network tests can appear stuck when tracker shutdown is not bounded. TCP tracker tests must log before/after start, before/after stop, worker enter/exit, cancellation state, timeout length, elapsed time, and whether `driver_bridge::get_captured_packets` returned.
+- MCP may bind a port while still failing clients. If a client times out awaiting `tools/list`, verify live `/health`, `/mcp`, and `tools/list`, inspect `netstat` state, and check for `mcp_srv` `request_entry`, route-specific handler logs, and `request_exit`. A listener plus no `request_entry` narrows the evidence window to accept/thread-pool/pre-routing rather than tool registration.
+- Standalone MCP exposes mutating tools through localhost. Keep the server responsive without using the shared app work queue for long-lived HTTP/SSE server work; preserve request/stream limits, cancellation, and shutdown diagnostics.
+- Before building when `AiDAStandalone.exe` is running, try to close it gracefully. If Windows denies termination, attempt the canonical build anyway and let the build/protector logs prove whether the binary lock matters.
 
 Useful files:
 1. `C:\Users\ruar1337\AiDAPrivate\sys_to_hex.py`

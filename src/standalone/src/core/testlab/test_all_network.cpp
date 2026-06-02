@@ -109,6 +109,32 @@ namespace {
     static void call_test_s(void(*fn)(HANDLE, std::atomic<int>&, std::atomic<int>&, std::atomic<int>&), HANDLE hf, std::atomic<int>& p, std::atomic<int>& f, std::atomic<int>& s) {
         __try { fn(hf, p, f, s); } __except(EXCEPTION_EXECUTE_HANDLER) { f.fetch_add(1); }
     }
+    static bool is_cancelled(bool(*cancelled)()) {
+        return cancelled && cancelled();
+    }
+    static void call_test_tracker(void(*fn)(HANDLE, std::atomic<int>&, std::atomic<int>&, std::atomic<int>&, bool(*)()), HANDLE hf, std::atomic<int>& p, std::atomic<int>& f, std::atomic<int>& s, bool(*cancelled)()) {
+        __try { fn(hf, p, f, s, cancelled); } __except(EXCEPTION_EXECUTE_HANDLER) { f.fetch_add(1); }
+    }
+    static bool stop_tracker_logged(network_view::tcp_stream_tracker_t& tracker, HANDLE hf, const char* tag, bool(*cancelled)()) {
+        const bool cancel_before = is_cancelled(cancelled);
+        const uint32_t timeout_ms = cancel_before ? 250u : 2000u;
+        const auto t0 = std::chrono::steady_clock::now();
+        log_msg(hf, tag, "before stop pid=%lu tid=%lu cancel=%d timeout_ms=%u is_running=%s",
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            cancel_before ? 1 : 0,
+            static_cast<unsigned>(timeout_ms),
+            tracker.is_running() ? "true" : "false");
+        const bool stopped = tracker.stop(timeout_ms);
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        log_msg(hf, tag, "after stop stopped=%d elapsed_ms=%lld cancel_before=%d cancel_after=%d is_running=%s",
+            stopped ? 1 : 0,
+            static_cast<long long>(elapsed),
+            cancel_before ? 1 : 0,
+            is_cancelled(cancelled) ? 1 : 0,
+            tracker.is_running() ? "true" : "false");
+        return stopped;
+    }
 
     void test_network_view_init(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "net_view_init";
@@ -413,15 +439,21 @@ namespace {
         }
     }
 
-    void test_tcp_stream_tracker(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    void test_tcp_stream_tracker(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped, bool(*cancelled)()) {
         const char* tag = "tcp_tracker";
         log_msg(hf, tag, "START -- tcp_stream_tracker create/start/stop");
+        if (is_cancelled(cancelled)) {
+            log_msg(hf, tag, "SKIP -- cancelled before tracker start");
+            skipped.fetch_add(1);
+            return;
+        }
         network_view::tcp_stream_tracker_t tracker;
         log_msg(hf, tag, "created tracker, is_running=%s", tracker.is_running() ? "true" : "false");
 
+        log_msg(hf, tag, "before start pid=%lu tid=%lu cancel=%d", static_cast<unsigned long>(GetCurrentProcessId()), static_cast<unsigned long>(GetCurrentThreadId()), is_cancelled(cancelled) ? 1 : 0);
         tracker.start(0);
         bool started = tracker.is_running();
-        log_msg(hf, tag, "after start: is_running=%s", started ? "true" : "false");
+        log_msg(hf, tag, "after start: is_running=%s cancel=%d", started ? "true" : "false", is_cancelled(cancelled) ? 1 : 0);
 
         size_t count = tracker.stream_count();
         log_msg(hf, tag, "stream_count=%zu", count);
@@ -432,36 +464,63 @@ namespace {
         tracker.clear();
         log_msg(hf, tag, "clear() called, stream_count=%zu", tracker.stream_count());
 
-        tracker.stop();
-        bool stopped = !tracker.is_running();
-        log_msg(hf, tag, "after stop: is_running=%s", tracker.is_running() ? "true" : "false");
+        const bool stop_ok = stop_tracker_logged(tracker, hf, tag, cancelled);
+        bool stopped = stop_ok && !tracker.is_running();
+        log_msg(hf, tag, "after stop: is_running=%s stop_ok=%d", tracker.is_running() ? "true" : "false", stop_ok ? 1 : 0);
 
         if (started && stopped) {
             log_msg(hf, tag, "PASS -- tracker start/stop lifecycle correct");
             passed.fetch_add(1);
+        } else if (!stop_ok && is_cancelled(cancelled)) {
+            log_msg(hf, tag, "SKIP -- tracker stop timed out while cancellation was requested");
+            skipped.fetch_add(1);
         } else {
             log_msg(hf, tag, "FAIL -- start=%s stop=%s", started ? "true" : "false", stopped ? "true" : "false");
             failed.fetch_add(1);
         }
     }
 
-    void test_tcp_tracker_evict(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    void test_tcp_tracker_evict(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped, bool(*cancelled)()) {
         const char* tag = "tcp_trk_evict";
         log_msg(hf, tag, "START -- tcp_stream_tracker::evict_stale()");
+        if (is_cancelled(cancelled)) {
+            log_msg(hf, tag, "SKIP -- cancelled before tracker start");
+            skipped.fetch_add(1);
+            return;
+        }
         network_view::tcp_stream_tracker_t tracker;
+        log_msg(hf, tag, "before start pid=%lu tid=%lu cancel=%d", static_cast<unsigned long>(GetCurrentProcessId()), static_cast<unsigned long>(GetCurrentThreadId()), is_cancelled(cancelled) ? 1 : 0);
         tracker.start(0);
+        log_msg(hf, tag, "after start is_running=%s cancel=%d", tracker.is_running() ? "true" : "false", is_cancelled(cancelled) ? 1 : 0);
         tracker.evict_stale(1);
         size_t count = tracker.stream_count();
-        tracker.stop();
+        const bool stop_ok = stop_tracker_logged(tracker, hf, tag, cancelled);
+        if (!stop_ok && is_cancelled(cancelled)) {
+            log_msg(hf, tag, "SKIP -- evict_stale completed but tracker stop timed out during cancellation");
+            skipped.fetch_add(1);
+            return;
+        }
+        if (!stop_ok) {
+            log_msg(hf, tag, "FAIL -- tracker stop timed out after evict_stale, stream_count=%zu", count);
+            failed.fetch_add(1);
+            return;
+        }
         log_msg(hf, tag, "PASS -- evict_stale called, stream_count=%zu", count);
         passed.fetch_add(1);
     }
 
-    void test_tcp_tracker_get_stream(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    void test_tcp_tracker_get_stream(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped, bool(*cancelled)()) {
         const char* tag = "tcp_trk_get";
         log_msg(hf, tag, "START -- tcp_stream_tracker::get_stream() for nonexistent key");
+        if (is_cancelled(cancelled)) {
+            log_msg(hf, tag, "SKIP -- cancelled before tracker start");
+            skipped.fetch_add(1);
+            return;
+        }
         network_view::tcp_stream_tracker_t tracker;
+        log_msg(hf, tag, "before start pid=%lu tid=%lu cancel=%d", static_cast<unsigned long>(GetCurrentProcessId()), static_cast<unsigned long>(GetCurrentThreadId()), is_cancelled(cancelled) ? 1 : 0);
         tracker.start(0);
+        log_msg(hf, tag, "after start is_running=%s cancel=%d", tracker.is_running() ? "true" : "false", is_cancelled(cancelled) ? 1 : 0);
         network_view::stream_key_t key{};
         key.src_ip4 = 0x7F000001;
         key.dst_ip4 = 0x7F000001;
@@ -469,7 +528,17 @@ namespace {
         key.dst_port = 80;
         key.proto = 6;
         auto snap = tracker.get_stream(key);
-        tracker.stop();
+        const bool stop_ok = stop_tracker_logged(tracker, hf, tag, cancelled);
+        if (!stop_ok && is_cancelled(cancelled)) {
+            log_msg(hf, tag, "SKIP -- get_stream completed but tracker stop timed out during cancellation");
+            skipped.fetch_add(1);
+            return;
+        }
+        if (!stop_ok) {
+            log_msg(hf, tag, "FAIL -- tracker stop timed out after get_stream");
+            failed.fetch_add(1);
+            return;
+        }
         if (!snap.has_value()) {
             log_msg(hf, tag, "PASS -- get_stream returned nullopt for nonexistent key");
         } else {
@@ -478,18 +547,30 @@ namespace {
         passed.fetch_add(1);
     }
 
-    void test_tcp_tracker_filtered(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    void test_tcp_tracker_filtered(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped, bool(*cancelled)()) {
         const char* tag = "tcp_trk_filt";
         log_msg(hf, tag, "START -- tcp_stream_tracker with PID filter");
+        if (is_cancelled(cancelled)) {
+            log_msg(hf, tag, "SKIP -- cancelled before tracker start");
+            skipped.fetch_add(1);
+            return;
+        }
         network_view::tcp_stream_tracker_t tracker;
+        log_msg(hf, tag, "before start pid=%lu tid=%lu cancel=%d filter_pid=%lu", static_cast<unsigned long>(GetCurrentProcessId()), static_cast<unsigned long>(GetCurrentThreadId()), is_cancelled(cancelled) ? 1 : 0, static_cast<unsigned long>(GetCurrentProcessId()));
         tracker.start(GetCurrentProcessId());
         bool started = tracker.is_running();
-        tracker.stop();
-        if (started) {
+        log_msg(hf, tag, "after start is_running=%s cancel=%d", started ? "true" : "false", is_cancelled(cancelled) ? 1 : 0);
+        const bool stop_ok = stop_tracker_logged(tracker, hf, tag, cancelled);
+        if (!stop_ok && is_cancelled(cancelled)) {
+            log_msg(hf, tag, "SKIP -- filtered tracker stop timed out during cancellation");
+            skipped.fetch_add(1);
+            return;
+        }
+        if (started && stop_ok) {
             log_msg(hf, tag, "PASS -- tracker started with PID filter=%u", (unsigned)GetCurrentProcessId());
             passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "FAIL -- tracker did not start with PID filter");
+            log_msg(hf, tag, "FAIL -- tracker did not start/stop with PID filter start=%d stop=%d", started ? 1 : 0, stop_ok ? 1 : 0);
             failed.fetch_add(1);
         }
     }
@@ -2594,16 +2675,16 @@ void phase_network_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& 
     call_test(test_mitm_stop, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
-    call_test(test_tcp_stream_tracker, hf, passed, failed);
+    call_test_tracker(test_tcp_stream_tracker, hf, passed, failed, skipped, cancelled);
 
     if (cancelled && cancelled()) return;
-    call_test(test_tcp_tracker_evict, hf, passed, failed);
+    call_test_tracker(test_tcp_tracker_evict, hf, passed, failed, skipped, cancelled);
 
     if (cancelled && cancelled()) return;
-    call_test(test_tcp_tracker_get_stream, hf, passed, failed);
+    call_test_tracker(test_tcp_tracker_get_stream, hf, passed, failed, skipped, cancelled);
 
     if (cancelled && cancelled()) return;
-    call_test(test_tcp_tracker_filtered, hf, passed, failed);
+    call_test_tracker(test_tcp_tracker_filtered, hf, passed, failed, skipped, cancelled);
 
     if (cancelled && cancelled()) return;
     call_test(test_dns_resolution, hf, passed, failed);

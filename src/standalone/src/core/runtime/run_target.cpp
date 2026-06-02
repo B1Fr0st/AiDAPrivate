@@ -222,6 +222,79 @@ bool file_exists_w(const std::wstring& path) {
 	return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+bool directory_exists_w(const std::wstring& path, DWORD* err_out = nullptr) {
+	if (err_out) *err_out = 0;
+	if (path.empty()) {
+		if (err_out) *err_out = ERROR_PATH_NOT_FOUND;
+		return false;
+	}
+	DWORD attrs = GetFileAttributesW(path.c_str());
+	if (attrs == INVALID_FILE_ATTRIBUTES) {
+		if (err_out) *err_out = GetLastError();
+		return false;
+	}
+	if ((attrs & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+		if (err_out) *err_out = ERROR_DIRECTORY;
+		return false;
+	}
+	return true;
+}
+
+std::wstring valid_executable_parent_dir(const std::wstring& exe_path) {
+	std::filesystem::path p(exe_path);
+	std::filesystem::path parent = p.parent_path();
+	if (parent.empty())
+		return {};
+	std::wstring parent_w = parent.wstring();
+	DWORD err = 0;
+	if (directory_exists_w(parent_w, &err))
+		return parent_w;
+	diag::log_tagged_critical_fmt("run_target",
+		"launch exe_parent_unavailable exe='%s' parent='%s' gle=%lu",
+		narrow_utf8(exe_path).c_str(),
+		narrow_utf8(parent_w).c_str(),
+		static_cast<unsigned long>(err));
+	return {};
+}
+
+bool normalize_launch_working_dir(const launch_options_t& requested, launch_options_t& effective, launch_result_t& out) {
+	effective = requested;
+	const std::wstring parent = valid_executable_parent_dir(requested.exe_path);
+	if (requested.working_dir.empty()) {
+		if (!parent.empty()) {
+			effective.working_dir = parent;
+			diag::log_tagged_critical_fmt("run_target",
+				"launch cwd_defaulted_to_exe_parent exe='%s' cwd='%s'",
+				narrow_utf8(requested.exe_path).c_str(),
+				narrow_utf8(effective.working_dir).c_str());
+		}
+		return true;
+	}
+
+	DWORD cwd_err = 0;
+	if (directory_exists_w(requested.working_dir, &cwd_err))
+		return true;
+
+	if (!parent.empty()) {
+		effective.working_dir = parent;
+		diag::log_tagged_critical_fmt("run_target",
+			"launch cwd_normalized requested='%s' effective='%s' gle=%lu exe='%s'",
+			narrow_utf8(requested.working_dir).c_str(),
+			narrow_utf8(effective.working_dir).c_str(),
+			static_cast<unsigned long>(cwd_err),
+			narrow_utf8(requested.exe_path).c_str());
+		return true;
+	}
+
+	out.error = format_error("Working directory validation", cwd_err == 0 ? ERROR_DIRECTORY : cwd_err);
+	diag::log_tagged_critical_fmt("run_target",
+		"launch_REJECTED invalid_working_dir requested='%s' gle=%lu exe='%s'",
+		narrow_utf8(requested.working_dir).c_str(),
+		static_cast<unsigned long>(cwd_err),
+		narrow_utf8(requested.exe_path).c_str());
+	return false;
+}
+
 std::wstring resolve_windows_sandbox_exe() {
 	wchar_t sysroot[MAX_PATH] = {};
 	UINT n = GetSystemDirectoryW(sysroot, MAX_PATH);
@@ -1957,23 +2030,29 @@ bool launch(const launch_options_t& opts, launch_result_t& out) {
 		return false;
 	}
 
-	std::string exe_utf8 = narrow_utf8(opts.exe_path);
-	std::string cwd_utf8 = narrow_utf8(opts.working_dir);
-	diag::log_tagged_critical_fmt("run_target",
-		"launch entry exe='%s' args_len=%zu iso=%d block_net=%d kill_on_exit=%d mem_cap=%u auto_term=%u cwd='%s'",
-		exe_utf8.c_str(),
-		opts.args.size(),
-		static_cast<int>(opts.isolation),
-		opts.block_network ? 1 : 0,
-		opts.kill_on_host_exit ? 1 : 0,
-		static_cast<unsigned>(opts.memory_cap_mb),
-		static_cast<unsigned>(opts.auto_terminate_sec),
-		cwd_utf8.empty() ? "<inherit>" : cwd_utf8.c_str());
+	launch_options_t effective_opts;
+	if (!normalize_launch_working_dir(opts, effective_opts, out))
+		return false;
 
-	if (opts.isolation == isolation_t::same_desktop_jobbed
-	    || opts.isolation == isolation_t::appcontainer
-	    || opts.isolation == isolation_t::malware_safe_desktop) {
-		DWORD attrs = GetFileAttributesW(opts.exe_path.c_str());
+	std::string exe_utf8 = narrow_utf8(effective_opts.exe_path);
+	std::string cwd_utf8 = narrow_utf8(effective_opts.working_dir);
+	std::string requested_cwd_utf8 = narrow_utf8(opts.working_dir);
+	diag::log_tagged_critical_fmt("run_target",
+		"launch entry exe='%s' args_len=%zu iso=%d block_net=%d kill_on_exit=%d mem_cap=%u auto_term=%u cwd='%s' requested_cwd='%s'",
+		exe_utf8.c_str(),
+		effective_opts.args.size(),
+		static_cast<int>(effective_opts.isolation),
+		effective_opts.block_network ? 1 : 0,
+		effective_opts.kill_on_host_exit ? 1 : 0,
+		static_cast<unsigned>(effective_opts.memory_cap_mb),
+		static_cast<unsigned>(effective_opts.auto_terminate_sec),
+		cwd_utf8.empty() ? "<inherit>" : cwd_utf8.c_str(),
+		requested_cwd_utf8.empty() ? "<inherit>" : requested_cwd_utf8.c_str());
+
+	if (effective_opts.isolation == isolation_t::same_desktop_jobbed
+	    || effective_opts.isolation == isolation_t::appcontainer
+	    || effective_opts.isolation == isolation_t::malware_safe_desktop) {
+		DWORD attrs = GetFileAttributesW(effective_opts.exe_path.c_str());
 		if (attrs == INVALID_FILE_ATTRIBUTES) {
 			DWORD gle = GetLastError();
 			out.error = "Target executable does not exist.";
@@ -1989,22 +2068,22 @@ bool launch(const launch_options_t& opts, launch_result_t& out) {
 	}
 
 	bool ok = false;
-	switch (opts.isolation) {
+	switch (effective_opts.isolation) {
 		case isolation_t::same_desktop_jobbed:
-			if (opts.malware_safe_mode) {
-				ok = launch_malware_safe_desktop(opts, out);
+			if (effective_opts.malware_safe_mode) {
+				ok = launch_malware_safe_desktop(effective_opts, out);
 			} else {
-				ok = launch_same_desktop(opts, out);
+				ok = launch_same_desktop(effective_opts, out);
 			}
 			break;
 		case isolation_t::malware_safe_desktop:
-			ok = launch_malware_safe_desktop(opts, out);
+			ok = launch_malware_safe_desktop(effective_opts, out);
 			break;
 		case isolation_t::appcontainer:
-			ok = launch_appcontainer(opts, out);
+			ok = launch_appcontainer(effective_opts, out);
 			break;
 		case isolation_t::windows_sandbox:
-			ok = launch_windows_sandbox(opts, out);
+			ok = launch_windows_sandbox(effective_opts, out);
 			break;
 		default:
 			out.error = "Unknown isolation mode.";
@@ -2014,14 +2093,14 @@ bool launch(const launch_options_t& opts, launch_result_t& out) {
 	if (ok) {
 		diag::log_tagged_critical_fmt("run_target",
 			"launch ok iso=%d pid=%u job=%p firewall_rule='%s'",
-			static_cast<int>(opts.isolation),
+			static_cast<int>(effective_opts.isolation),
 			out.pid,
 			reinterpret_cast<void*>(out.job_handle),
 			out.firewall_rule_name.c_str());
 	} else {
 		diag::log_tagged_critical_fmt("run_target",
 			"launch FAILED iso=%d error='%s'",
-			static_cast<int>(opts.isolation),
+			static_cast<int>(effective_opts.isolation),
 			out.error.c_str());
 	}
 	return ok;

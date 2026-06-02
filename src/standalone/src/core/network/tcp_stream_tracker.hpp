@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -91,61 +92,175 @@ struct stream_snapshot_t {
 
 
 class tcp_stream_tracker_t {
+    struct worker_state_t {
+        mutable std::mutex streams_mutex;
+        std::unordered_map<stream_key_t, stream_state_t, stream_key_hash_t> streams;
+        std::atomic<bool> running{false};
+        uint32_t filter_pid = 0;
+        uint32_t evict_counter = 0;
+        std::mutex worker_mutex;
+        std::condition_variable worker_cv;
+        bool worker_active = false;
+        std::atomic<bool> worker_entered{false};
+        std::atomic<bool> stop_timed_out{false};
+    };
+
 public:
-    tcp_stream_tracker_t() = default;
+    tcp_stream_tracker_t()
+        : state_(std::make_shared<worker_state_t>()) {}
     ~tcp_stream_tracker_t() { stop(); }
 
     tcp_stream_tracker_t(const tcp_stream_tracker_t&)            = delete;
     tcp_stream_tracker_t& operator=(const tcp_stream_tracker_t&) = delete;
 
     void start(uint32_t filter_pid = 0) {
-        bool expected = false;
-        if (!running_.compare_exchange_strong(expected, true)) return;
-        filter_pid_ = filter_pid;
+        auto state = std::make_shared<worker_state_t>();
+        state->filter_pid = filter_pid;
+        state->running.store(true, std::memory_order_release);
         {
-            std::lock_guard<std::mutex> lk(streams_mutex_);
-            streams_.clear();
+            std::lock_guard<std::mutex> lk(state->worker_mutex);
+            state->worker_active = true;
         }
         {
-            std::lock_guard<std::mutex> lk(worker_mutex_);
-            worker_active_ = true;
+            std::lock_guard<std::mutex> lk(state_mutex_);
+            if (state_ && state_->running.load(std::memory_order_acquire))
+                return;
+            state_ = state;
         }
-        diag::log_tagged_fmt("tcp_tracker", "start this=%p filter_pid=%u", this, filter_pid_);
-        if (!work_queue::post([this]() {
-            diag::log_tagged_fmt("tcp_tracker", "worker_enter this=%p tid=%lu", this, static_cast<unsigned long>(GetCurrentThreadId()));
-            poll_loop();
+        diag::log_tagged_fmt("tcp_tracker", "start this=%p state=%p filter_pid=%u", this, state.get(), filter_pid);
+        if (!work_queue::post([state]() {
+            state->worker_entered.store(true, std::memory_order_release);
+            diag::log_tagged_fmt("tcp_tracker", "worker_enter state=%p tid=%lu", state.get(), static_cast<unsigned long>(GetCurrentThreadId()));
+            poll_loop(state);
             {
-                std::lock_guard<std::mutex> lk(worker_mutex_);
-                worker_active_ = false;
+                std::lock_guard<std::mutex> lk(state->worker_mutex);
+                state->worker_active = false;
             }
-            worker_cv_.notify_all();
-            diag::log_tagged_fmt("tcp_tracker", "worker_exit this=%p tid=%lu", this, static_cast<unsigned long>(GetCurrentThreadId()));
+            state->worker_cv.notify_all();
+            diag::log_tagged_fmt("tcp_tracker", "worker_exit state=%p tid=%lu timed_out=%d", state.get(), static_cast<unsigned long>(GetCurrentThreadId()),
+                state->stop_timed_out.load(std::memory_order_acquire) ? 1 : 0);
         })) {
-            running_.store(false);
+            state->running.store(false, std::memory_order_release);
             {
-                std::lock_guard<std::mutex> lk(worker_mutex_);
-                worker_active_ = false;
+                std::lock_guard<std::mutex> lk(state->worker_mutex);
+                state->worker_active = false;
             }
-            worker_cv_.notify_all();
-            diag::log_tagged_fmt("tcp_tracker", "start_post_failed this=%p", this);
+            state->worker_cv.notify_all();
+            diag::log_tagged_fmt("tcp_tracker", "start_post_failed this=%p state=%p", this, state.get());
         }
     }
 
-    void stop() {
-        running_.store(false);
-        std::unique_lock<std::mutex> lk(worker_mutex_);
-        worker_cv_.wait(lk, [this]() { return !worker_active_; });
-        diag::log_tagged_fmt("tcp_tracker", "stop this=%p worker_active=%d",
-            this, worker_active_ ? 1 : 0);
+    bool stop(uint32_t timeout_ms = 2000) {
+        auto state = current_state();
+        if (!state)
+            return true;
+        state->running.store(false, std::memory_order_release);
+        const uint64_t t0 = static_cast<uint64_t>(GetTickCount64());
+        std::unique_lock<std::mutex> lk(state->worker_mutex);
+        const bool stopped = state->worker_cv.wait_for(lk, std::chrono::milliseconds(timeout_ms), [state]() { return !state->worker_active; });
+        const uint64_t elapsed = static_cast<uint64_t>(GetTickCount64()) - t0;
+        if (!stopped) {
+            state->stop_timed_out.store(true, std::memory_order_release);
+            diag::log_tagged_fmt("tcp_tracker",
+                "stop_timeout this=%p state=%p timeout_ms=%u elapsed_ms=%llu worker_active=%d worker_entered=%d",
+                this,
+                state.get(),
+                timeout_ms,
+                static_cast<unsigned long long>(elapsed),
+                state->worker_active ? 1 : 0,
+                state->worker_entered.load(std::memory_order_acquire) ? 1 : 0);
+            return false;
+        }
+        diag::log_tagged_fmt("tcp_tracker", "stop this=%p state=%p elapsed_ms=%llu worker_active=%d worker_entered=%d",
+            this,
+            state.get(),
+            static_cast<unsigned long long>(elapsed),
+            state->worker_active ? 1 : 0,
+            state->worker_entered.load(std::memory_order_acquire) ? 1 : 0);
+        return true;
     }
 
-    bool is_running() const noexcept { return running_.load(); }
+    bool is_running() const noexcept {
+        auto state = current_state();
+        return state && state->running.load(std::memory_order_acquire);
+    }
 
 
     void feed(const driver_bridge::captured_packet_t& pkt) {
-        if (pkt.protocol != 6) return;
-        if (pkt.payload.empty())        return;
+        auto state = current_state();
+        if (state)
+            feed_packet(*state, pkt);
+    }
 
+
+    std::optional<stream_snapshot_t> get_stream(const stream_key_t& key) const {
+        auto state = current_state();
+        if (!state)
+            return std::nullopt;
+        std::lock_guard<std::mutex> lk(state->streams_mutex);
+        auto it = state->streams.find(key);
+        if (it == state->streams.end()) return std::nullopt;
+        return make_snapshot(key, it->second);
+    }
+
+
+    std::vector<stream_snapshot_t> get_all() const {
+        auto state = current_state();
+        if (!state)
+            return {};
+        std::lock_guard<std::mutex> lk(state->streams_mutex);
+        std::vector<stream_snapshot_t> out;
+        out.reserve(state->streams.size());
+        for (auto& [k, v] : state->streams)
+            out.push_back(make_snapshot(k, v));
+        return out;
+    }
+
+
+    void evict_stale(uint64_t age_ns = 30'000'000'000ULL) {
+        auto state = current_state();
+        if (state)
+            evict_stale_state(*state, age_ns);
+    }
+
+    void clear() {
+        auto state = current_state();
+        if (!state)
+            return;
+        std::lock_guard<std::mutex> lk(state->streams_mutex);
+        state->streams.clear();
+    }
+
+    size_t stream_count() const {
+        auto state = current_state();
+        if (!state)
+            return 0;
+        std::lock_guard<std::mutex> lk(state->streams_mutex);
+        return state->streams.size();
+    }
+
+private:
+    std::shared_ptr<worker_state_t> current_state() const noexcept {
+        std::lock_guard<std::mutex> lk(state_mutex_);
+        return state_;
+    }
+
+    static stream_snapshot_t make_snapshot(const stream_key_t& key,
+                                            const stream_state_t& st) {
+        stream_snapshot_t snap;
+        snap.key              = key;
+        snap.assembled        = st.assembled;
+        snap.total_bytes      = st.total_bytes;
+        snap.total_packets    = st.total_packets;
+        snap.last_activity_ns = st.last_activity_ns;
+        snap.syn_seen         = st.syn_seen;
+        snap.fin_seen         = st.fin_seen;
+        return snap;
+    }
+
+    static void feed_packet(worker_state_t& state, const driver_bridge::captured_packet_t& pkt) {
+        if (pkt.protocol != 6) return;
+        if (pkt.payload.empty()) return;
 
         stream_key_t key;
 
@@ -166,9 +281,9 @@ public:
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count());
 
-        std::lock_guard<std::mutex> lk(streams_mutex_);
+        std::lock_guard<std::mutex> lk(state.streams_mutex);
 
-        auto& st = streams_[key];
+        auto& st = state.streams[key];
         st.last_activity_ns = now_ns;
         st.total_packets++;
         st.total_bytes += pkt.payload.size();
@@ -182,93 +297,44 @@ public:
         st.assembled.insert(st.assembled.end(), pkt.payload.begin(), pkt.payload.end());
     }
 
-
-    std::optional<stream_snapshot_t> get_stream(const stream_key_t& key) const {
-        std::lock_guard<std::mutex> lk(streams_mutex_);
-        auto it = streams_.find(key);
-        if (it == streams_.end()) return std::nullopt;
-        return make_snapshot(key, it->second);
-    }
-
-
-    std::vector<stream_snapshot_t> get_all() const {
-        std::lock_guard<std::mutex> lk(streams_mutex_);
-        std::vector<stream_snapshot_t> out;
-        out.reserve(streams_.size());
-        for (auto& [k, v] : streams_)
-            out.push_back(make_snapshot(k, v));
-        return out;
-    }
-
-
-    void evict_stale(uint64_t age_ns = 30'000'000'000ULL) {
+    static void evict_stale_state(worker_state_t& state, uint64_t age_ns) {
         uint64_t now_ns = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count());
 
-        std::lock_guard<std::mutex> lk(streams_mutex_);
-        for (auto it = streams_.begin(); it != streams_.end(); ) {
+        std::lock_guard<std::mutex> lk(state.streams_mutex);
+        for (auto it = state.streams.begin(); it != state.streams.end(); ) {
             if (now_ns - it->second.last_activity_ns > age_ns)
-                it = streams_.erase(it);
+                it = state.streams.erase(it);
             else
                 ++it;
         }
     }
 
-    void clear() {
-        std::lock_guard<std::mutex> lk(streams_mutex_);
-        streams_.clear();
-    }
-
-    size_t stream_count() const {
-        std::lock_guard<std::mutex> lk(streams_mutex_);
-        return streams_.size();
-    }
-
-private:
-    static stream_snapshot_t make_snapshot(const stream_key_t& key,
-                                            const stream_state_t& st) {
-        stream_snapshot_t snap;
-        snap.key              = key;
-        snap.assembled        = st.assembled;
-        snap.total_bytes      = st.total_bytes;
-        snap.total_packets    = st.total_packets;
-        snap.last_activity_ns = st.last_activity_ns;
-        snap.syn_seen         = st.syn_seen;
-        snap.fin_seen         = st.fin_seen;
-        return snap;
-    }
-
-    void poll_loop() {
-        while (running_.load()) {
+    static void poll_loop(const std::shared_ptr<worker_state_t>& state) {
+        while (state->running.load(std::memory_order_acquire)) {
             if (driver_bridge::using_kernel_driver()) {
                 auto packets = driver_bridge::get_captured_packets(32);
                 for (auto& pkt : packets) {
-                    if (filter_pid_ == 0 || pkt.pid == filter_pid_)
-                        feed(pkt);
+                    if (state->filter_pid == 0 || pkt.pid == state->filter_pid)
+                        feed_packet(*state, pkt);
                 }
             }
 
-            evict_counter_++;
-            if (evict_counter_ >= 12000) {
-                evict_stale(30'000'000'000ULL);
-                evict_counter_ = 0;
+            state->evict_counter++;
+            if (state->evict_counter >= 12000) {
+                evict_stale_state(*state, 30'000'000'000ULL);
+                state->evict_counter = 0;
             }
 
 
-            if (running_.load())
+            if (state->running.load(std::memory_order_acquire))
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
     }
 
-    mutable std::mutex streams_mutex_;
-    std::unordered_map<stream_key_t, stream_state_t, stream_key_hash_t> streams_;
-    std::atomic<bool>     running_{false};
-    uint32_t              filter_pid_     = 0;
-    uint32_t              evict_counter_  = 0;
-    std::mutex            worker_mutex_;
-    std::condition_variable worker_cv_;
-    bool                  worker_active_ = false;
+    mutable std::mutex state_mutex_;
+    std::shared_ptr<worker_state_t> state_;
 };
 
 inline tcp_stream_tracker_t g_stream_tracker;
