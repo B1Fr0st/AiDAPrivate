@@ -4,6 +4,7 @@
 #include "../runtime/standalone_driver.hpp"
 #include "imgui/imgui.h"
 
+#include <Windows.h>
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -141,12 +142,10 @@ namespace {
 		std::uint64_t expected_hash = 0;
 		const bool supplied_hash = parse_u64_hex_strict(s.text_b, expected_hash);
 
-		const std::uint64_t module_key = (s.u64_a != 0) ? s.u64_a : s.addr;
-
 		voyager::detail::dll_protect_request req{};
 		req.operation         = s.u32_a;
 		req.pid               = s.pid;
-		req.module_base       = module_key;
+		req.module_base       = s.u64_a;
 		req.text_section_va   = s.addr;
 		req.text_section_size = s.size;
 		req.expected_hash     = expected_hash;
@@ -169,8 +168,13 @@ namespace {
 				r.ntstatus = static_cast<std::int32_t>(0xC0000206u);
 				return;
 			}
-			if (s.u64_a == 0)
-				r.parsed.push_back({ "module_base_source", "text_section_va_fallback" });
+			if (s.u64_a == 0 && s.pid == GetCurrentProcessId()) {
+				r.ok = false;
+				r.error = "diagnostic module_base=0 DPRT registration is not allowed for the AiDA process";
+				r.ntstatus = static_cast<std::int32_t>(0xC0000022u);
+				return;
+			}
+			r.parsed.push_back({ "module_base_policy", s.u64_a == 0 ? "diagnostic_fail_closed" : "module_hard_bugcheck" });
 
 			std::vector<std::uint8_t> baseline;
 			const bool read_ok = driver_bridge::read_memory_for(s.pid, s.addr, s.size, baseline);
