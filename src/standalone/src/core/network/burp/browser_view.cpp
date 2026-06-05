@@ -1,5 +1,6 @@
 #include "browser_view.hpp"
 #include "browser_launch.hpp"
+#include "camoufox_bridge.hpp"
 #include "../mitm_proxy.hpp"
 #include "../cert_generator.hpp"
 
@@ -102,6 +103,17 @@ void refresh_cert_status(view_state_t& st)
     }
 }
 
+const char* bridge_state_label(aida::burp::camoufox::bridge_state_t state)
+{
+    switch (state) {
+    case aida::burp::camoufox::bridge_state_t::stopped: return "stopped";
+    case aida::burp::camoufox::bridge_state_t::starting: return "starting";
+    case aida::burp::camoufox::bridge_state_t::ready: return "ready";
+    case aida::burp::camoufox::bridge_state_t::error: return "error";
+    default: return "unknown";
+    }
+}
+
 }
 
 void render(float pos_x, float pos_y, float width, float height,
@@ -121,21 +133,23 @@ void render(float pos_x, float pos_y, float width, float height,
                       aida::ui::with_alpha(th.panel_header, alpha));
     dl->AddText(ImVec2(org.x + 8.f, org.y + 6.f),
                 aida::ui::with_alpha(th.text_primary, alpha),
-                "Embedded browser launcher");
+                "Camoufox browser launcher");
 
     ImGui::SetCursorPos(ImVec2(pos_x + 6.f, pos_y + 40.f));
     ImGui::PushID("burp_browser_form");
 
-    bool edge_ok = false, chrome_ok = false;
-    std::string edge_path, chrome_path;
-    edge_ok = detect_edge_path(edge_path);
-    chrome_ok = detect_chrome_path(chrome_path);
+    auto bridge_status = aida::burp::camoufox::get_status();
+    const bool bridge_ready = bridge_status.state == aida::burp::camoufox::bridge_state_t::ready &&
+        bridge_status.child_alive && bridge_status.browser_open && bridge_status.page_verified && !bridge_status.cleanup_pending;
     refresh_cert_status(st);
 
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
-                       "Detected: Edge %s   Chrome %s",
-                       edge_ok ? "yes" : "no",
-                       chrome_ok ? "yes" : "no");
+                       "Camoufox %s   PID %u   open %s   verified %s   cleanup %s",
+                       bridge_ready ? "ready" : bridge_state_label(bridge_status.state),
+                       static_cast<unsigned>(bridge_status.child_pid),
+                       bridge_status.browser_open ? "yes" : "no",
+                       bridge_status.page_verified ? "yes" : "no",
+                       bridge_status.cleanup_pending ? "yes" : "no");
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
                        "CA ready %s   Installed %s   SPKI %s",
                        st.ca_ready ? "yes" : "no",
@@ -156,8 +170,6 @@ void render(float pos_x, float pos_y, float width, float height,
     ImGui::SetNextItemWidth(220.f);
     ImGui::InputTextWithHint("##bb_profile", "BurpBrowser", st.profile_subdir, sizeof(st.profile_subdir));
 
-    ImGui::Checkbox("Prefer Chrome", &st.prefer_chrome);
-    ImGui::SameLine();
     const char* strategy_names[] = {
         "trust_store_only",
         "chromium_spki_allowlist",
@@ -196,11 +208,11 @@ void render(float pos_x, float pos_y, float width, float height,
 
     bool busy = st.launching.load();
     if (busy) ImGui::BeginDisabled();
-    if (ImGui::Button("Open Burp browser", ImVec2(180.f, 28.f))) {
+    if (ImGui::Button("Open Camoufox", ImVec2(180.f, 28.f))) {
         browser_launch_config_t cfg;
         cfg.initial_url = std::string(st.initial_url);
         cfg.profile_subdir = std::string(st.profile_subdir);
-        cfg.prefer_chrome = st.prefer_chrome;
+        cfg.prefer_chrome = false;
         cfg.certificate_strategy = selected_certificate_strategy(st);
         cfg.clear_profile_first = st.clear_profile_first;
         cfg.proxy_host = "127.0.0.1";
@@ -216,7 +228,7 @@ void render(float pos_x, float pos_y, float width, float height,
         st.launching.store(false);
         char buf[256];
         if (ok) {
-            _snprintf_s(buf, sizeof(buf), _TRUNCATE, "Launched pid=%u proxy=127.0.0.1:%u strategy=%s",
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE, "Launched Camoufox bridge pid=%u proxy=127.0.0.1:%u strategy=%s",
                         pid, static_cast<unsigned>(cfg.proxy_port),
                         certificate_strategy_name(cfg.certificate_strategy));
         } else {
@@ -227,10 +239,10 @@ void render(float pos_x, float pos_y, float width, float height,
     }
     if (busy) ImGui::EndDisabled();
     ImGui::SameLine();
-    if (ImGui::Button("Kill all browsers", ImVec2(160.f, 28.f))) {
+    if (ImGui::Button("Stop Camoufox", ImVec2(160.f, 28.f))) {
         kill_all();
         std::lock_guard<std::mutex> lk(st.status_mtx);
-        st.last_launch_status = "all_killed";
+        st.last_launch_status = "camoufox_stopped";
     }
 
     {

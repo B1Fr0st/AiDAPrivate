@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <map>
 #include <mutex>
 #include <string>
@@ -355,7 +356,8 @@ inline void start_scan()
 	g_state.scan_cancel.store(false);
 	g_state.scan_progress.store(0.f);
 
-	work_queue::post([]() {
+	if (!work_queue::post([]() {
+		try {
 		auto t_start = std::chrono::steady_clock::now();
 		std::vector<pointer_chain_t> results;
 		std::mutex results_mutex;
@@ -392,7 +394,20 @@ inline void start_scan()
 			static_cast<int>(g_state.scan_cancel.load()));
 
 		g_state.scanning.store(false);
-	});
+		} catch (const std::exception& ex) {
+			diag::log_tagged_fmt("pointer_scan", "start_scan worker exception err='%s'", ex.what());
+			g_state.scan_progress.store(1.f);
+			g_state.scanning.store(false);
+		} catch (...) {
+			diag::log_tagged("pointer_scan", "start_scan worker exception err='<unknown>'");
+			g_state.scan_progress.store(1.f);
+			g_state.scanning.store(false);
+		}
+	})) {
+		diag::log_tagged("pointer_scan", "start_scan worker_queue_rejected");
+		g_state.scan_progress.store(1.f);
+		g_state.scanning.store(false);
+	}
 }
 
 inline bool validate_chain(const pointer_chain_t& chain)

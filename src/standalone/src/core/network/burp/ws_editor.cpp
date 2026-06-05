@@ -61,6 +61,22 @@ uint64_t now_steady_ms()
     return static_cast<uint64_t>(duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count());
 }
 
+std::string lower_ascii(const std::string& s)
+{
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s)
+        out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    return out;
+}
+
+bool is_loopback_host(const std::string& host)
+{
+    std::string h = lower_ascii(host);
+    if (h == "localhost" || h == "::1" || h == "[::1]") return true;
+    return h.rfind("127.", 0) == 0;
+}
+
 struct wsa_guard_t
 {
     bool ok = false;
@@ -209,16 +225,43 @@ bool resolve_target(const std::string& host, uint16_t port, sockaddr_storage& sa
     return true;
 }
 
-bool tcp_connect_with_timeout(SOCKET s, const sockaddr* sa, int sa_len, int timeout_ms)
+bool tcp_connect_with_timeout(SOCKET s, const sockaddr* sa, int sa_len, int timeout_ms, int& connect_err, int& poll_rc, short& revents, int& poll_wsa)
 {
-    if (!set_nonblocking(s, true)) return false;
+    connect_err = 0;
+    poll_rc = 0;
+    revents = 0;
+    poll_wsa = 0;
+    if (!set_nonblocking(s, true)) {
+        connect_err = WSAGetLastError();
+        return false;
+    }
     int rc = ::connect(s, sa, sa_len);
     if (rc == 0) return true;
     int err = WSAGetLastError();
-    if (err != WSAEWOULDBLOCK && err != WSAEINPROGRESS) return false;
-    if (!wait_socket(s, timeout_ms, true)) return false;
+    if (err != WSAEWOULDBLOCK && err != WSAEINPROGRESS) {
+        connect_err = err;
+        return false;
+    }
+    if (timeout_ms <= 0) {
+        connect_err = WSAETIMEDOUT;
+        return false;
+    }
+    WSAPOLLFD pfd{};
+    pfd.fd = s;
+    pfd.events = POLLOUT;
+    poll_rc = WSAPoll(&pfd, 1, timeout_ms);
+    revents = pfd.revents;
+    if (poll_rc <= 0 || (pfd.revents & POLLNVAL) != 0) {
+        poll_wsa = poll_rc < 0 ? WSAGetLastError() : 0;
+        connect_err = poll_rc == 0 ? WSAETIMEDOUT : poll_wsa;
+        return false;
+    }
     int so_err = 0; int len = sizeof(so_err);
-    if (getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&so_err), &len) != 0) return false;
+    if (getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&so_err), &len) != 0) {
+        connect_err = WSAGetLastError();
+        return false;
+    }
+    connect_err = so_err;
     return so_err == 0;
 }
 
@@ -576,23 +619,68 @@ uint64_t connect(const ws_connection_config_t& cfg)
         set_err("ws_editor: DNS failed");
         return 0;
     }
-    SOCKET s = socket(sa.ss_family, SOCK_STREAM, IPPROTO_TCP);
-    if (s == INVALID_SOCKET) {
-        diag::log_tagged_fmt("ws_edit", "connect socket_create_failed");
-        set_err("ws_editor: socket() failed");
-        return 0;
-    }
-    BOOL nodelay = TRUE;
-    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
+    SOCKET s = INVALID_SOCKET;
+    const bool loopback = is_loopback_host(cfg.host);
+    const int effective_timeout_ms = std::max(cfg.connect_timeout_ms, 1);
+    const int max_attempts = loopback ? 16 : 1;
+    const uint64_t connect_started = now_steady_ms();
+    int last_connect_err = 0;
+    int last_poll_rc = 0;
+    short last_revents = 0;
+    int last_poll_wsa = 0;
 
-    diag::log_tagged_fmt("ws_edit", "connect tcp_connecting timeout_ms=%d", cfg.connect_timeout_ms);
-    if (!tcp_connect_with_timeout(s, reinterpret_cast<const sockaddr*>(&sa), sa_len, cfg.connect_timeout_ms)) {
-        ::shutdown(s, SD_BOTH); closesocket(s);
-        diag::log_tagged_fmt("ws_edit", "connect tcp_failed host=%s port=%u", cfg.host.c_str(), static_cast<unsigned>(cfg.port));
+    diag::log_tagged_fmt("ws_edit", "connect tcp_connecting timeout_ms=%d loopback=%d attempts=%d",
+        cfg.connect_timeout_ms, loopback ? 1 : 0, max_attempts);
+    for (int attempt = 1; attempt <= max_attempts; ++attempt) {
+        const uint64_t now = now_steady_ms();
+        const uint64_t elapsed = now > connect_started ? now - connect_started : 0;
+        if (elapsed >= static_cast<uint64_t>(effective_timeout_ms)) break;
+        const int remaining_ms = effective_timeout_ms - static_cast<int>(elapsed);
+        const int attempt_timeout_ms = loopback ? std::min(remaining_ms, 250) : remaining_ms;
+
+        SOCKET candidate = socket(sa.ss_family, SOCK_STREAM, IPPROTO_TCP);
+        if (candidate == INVALID_SOCKET) {
+            last_connect_err = WSAGetLastError();
+            diag::log_tagged_fmt("ws_edit", "connect socket_create_failed host=%s port=%u attempt=%d err=%d",
+                cfg.host.c_str(), static_cast<unsigned>(cfg.port), attempt, last_connect_err);
+            break;
+        }
+        BOOL nodelay = TRUE;
+        setsockopt(candidate, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
+
+        int connect_err = 0;
+        int poll_rc = 0;
+        short revents = 0;
+        int poll_wsa = 0;
+        if (tcp_connect_with_timeout(candidate, reinterpret_cast<const sockaddr*>(&sa), sa_len, attempt_timeout_ms, connect_err, poll_rc, revents, poll_wsa)) {
+            s = candidate;
+            diag::log_tagged_fmt("ws_edit", "connect tcp_ok host=%s port=%u attempts=%d loopback=%d",
+                cfg.host.c_str(), static_cast<unsigned>(cfg.port), attempt, loopback ? 1 : 0);
+            break;
+        }
+
+        last_connect_err = connect_err;
+        last_poll_rc = poll_rc;
+        last_revents = revents;
+        last_poll_wsa = poll_wsa;
+        diag::log_tagged_fmt("ws_edit", "connect tcp_failed host=%s port=%u attempt=%d/%d timeout_ms=%d connect_err=%d poll_rc=%d revents=0x%04X poll_wsa=%d elapsed_ms=%llu",
+            cfg.host.c_str(), static_cast<unsigned>(cfg.port), attempt, max_attempts, attempt_timeout_ms,
+            connect_err, poll_rc, static_cast<unsigned>(revents), poll_wsa,
+            static_cast<unsigned long long>(now_steady_ms() - connect_started));
+        ::shutdown(candidate, SD_BOTH);
+        closesocket(candidate);
+        if (!loopback || attempt == max_attempts) break;
+        Sleep(static_cast<DWORD>(std::min(100, 10 * attempt)));
+    }
+
+    if (s == INVALID_SOCKET) {
+        diag::log_tagged_fmt("ws_edit", "connect tcp_exhausted host=%s port=%u attempts=%d loopback=%d last_connect_err=%d last_poll_rc=%d last_revents=0x%04X last_poll_wsa=%d elapsed_ms=%llu",
+            cfg.host.c_str(), static_cast<unsigned>(cfg.port), max_attempts, loopback ? 1 : 0,
+            last_connect_err, last_poll_rc, static_cast<unsigned>(last_revents), last_poll_wsa,
+            static_cast<unsigned long long>(now_steady_ms() - connect_started));
         set_err("ws_editor: TCP connect failed");
         return 0;
     }
-    diag::log_tagged_fmt("ws_edit", "connect tcp_ok host=%s port=%u", cfg.host.c_str(), static_cast<unsigned>(cfg.port));
 
     SSL_CTX* ctx = nullptr;
     SSL* ssl = nullptr;

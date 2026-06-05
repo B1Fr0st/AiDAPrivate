@@ -602,8 +602,17 @@ static tool_result_t tool_search_workspace(const json& params)
             std::string lower_inc = include_pattern;
             std::transform(lower_inc.begin(), lower_inc.end(), lower_inc.begin(),
                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-            if (lower_fname.find(lower_inc) == std::string::npos &&
-                ext.find(lower_inc) == std::string::npos)
+            std::string lower_ext = ext;
+            std::transform(lower_ext.begin(), lower_ext.end(), lower_ext.begin(),
+                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            bool include_match = lower_fname.find(lower_inc) != std::string::npos ||
+                                 lower_ext.find(lower_inc) != std::string::npos;
+            if (!include_match && lower_inc.size() > 1 && lower_inc[0] == '*') {
+                std::string suffix = lower_inc.substr(1);
+                include_match = lower_fname.size() >= suffix.size() &&
+                    lower_fname.compare(lower_fname.size() - suffix.size(), suffix.size(), suffix) == 0;
+            }
+            if (!include_match)
                 continue;
         }
 

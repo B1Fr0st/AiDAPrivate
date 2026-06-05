@@ -42,10 +42,11 @@ namespace test_lab_format {
 	{
 		std::uint32_t last_err = GetLastError();
 		diag::log_tagged_fmt("testlab",
-			"%s/%s: exit ok=%d ntstatus=0x%08X bytes=%u elapsed_us=%llu last_err=%lu parsed_fields=%zu raw_size=%zu error=\"%.256s\"",
+			"%s/%s: exit ok=%d skipped=%d ntstatus=0x%08X bytes=%u elapsed_us=%llu last_err=%lu parsed_fields=%zu raw_size=%zu error=\"%.256s\"",
 			testlab_driver_name(f.driver),
 			(f.name != nullptr ? f.name : "?"),
 			r.ok ? 1 : 0,
+			r.skipped ? 1 : 0,
 			static_cast<unsigned>(static_cast<std::uint32_t>(r.ntstatus)),
 			static_cast<unsigned>(r.bytes_returned),
 			static_cast<unsigned long long>(elapsed_us),

@@ -370,8 +370,15 @@ void brute_one(std::shared_ptr<enum_t> ctx, const std::string& word)
 {
     ctx->in_flight.fetch_add(1);
     ctx->brute_attempts.fetch_add(1);
-    std::string fqdn = word + "." + ctx->config.domain;
-    diag::log_tagged_fmt("subdomain_enum", "brute_one id=%llu fqdn=%s", static_cast<unsigned long long>(ctx->id), fqdn.c_str());
+    std::string fqdn;
+    if (word == "@" || word == ".") {
+        fqdn = ctx->config.domain;
+    } else if (!word.empty() && word.back() == '.') {
+        fqdn = word.substr(0, word.size() - 1);
+    } else {
+        fqdn = word + "." + ctx->config.domain;
+    }
+    diag::log_tagged_fmt("subdomain_enum", "brute_one id=%llu word=%s fqdn=%s", static_cast<unsigned long long>(ctx->id), word.c_str(), fqdn.c_str());
     if (!ctx->stop_flag.load())
     {
         std::vector<std::string> ips;

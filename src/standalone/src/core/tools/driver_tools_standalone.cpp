@@ -11,7 +11,10 @@
 #include "obfuscation.hpp"
 #include "pro.h"
 #include "../infra/work_queue.hpp"
+#include "../infra/win_thread.hpp"
 #include "../runtime/standalone_driver.hpp"
+#include "../analysis/stealth_engine.hpp"
+#include "../anti-tamper/state.hpp"
 #include "../../helpers/diag_log.hpp"
 
 #include <Zydis/Zydis.h>
@@ -20,13 +23,16 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iomanip>
+#include <limits>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
@@ -34,6 +40,7 @@
 #include <regex>
 #include <unordered_map>
 #include <vector>
+#include <process.h>
 
 #ifndef _NTDEF_
 typedef LONG NTSTATUS;
@@ -49,6 +56,75 @@ static std::string to_lower_ascii_copy(std::string value)
     std::transform(value.begin(), value.end(), value.begin(),
         [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
     return value;
+}
+
+static bool full_test_mode_active()
+{
+    if (anti_tamper::state::get().full_test_running.load(std::memory_order_acquire))
+        return true;
+    char buf[8] = {};
+    DWORD n = GetEnvironmentVariableA("AIDA_FULL_TEST_RUNNING", buf, static_cast<DWORD>(sizeof(buf)));
+    return n > 0 && (buf[0] == '1' || buf[0] == 't' || buf[0] == 'T' || buf[0] == 'y' || buf[0] == 'Y');
+}
+
+static bool ranges_overlap(std::uint64_t a_start, std::uint64_t a_size, std::uint64_t b_start, std::uint64_t b_size)
+{
+    if (a_size == 0 || b_size == 0)
+        return false;
+    std::uint64_t a_end = a_start + a_size - 1;
+    std::uint64_t b_end = b_start + b_size - 1;
+    if (a_end < a_start)
+        a_end = std::numeric_limits<std::uint64_t>::max();
+    if (b_end < b_start)
+        b_end = std::numeric_limits<std::uint64_t>::max();
+    return a_start <= b_end && b_start <= a_end;
+}
+
+static bool range_intersects_system_module(std::uint64_t address, std::uint64_t size, std::string& module_name, std::string& module_path)
+{
+    const std::uint32_t pid = driver_bridge::attached_pid();
+    if (pid == 0)
+        return false;
+    for (const auto& mod : driver_bridge::enumerate_modules_for(pid))
+    {
+        const std::uint64_t start = mod.base;
+        const std::uint64_t mod_size = static_cast<std::uint64_t>(mod.size);
+        if (start == 0 || mod_size == 0 || !ranges_overlap(address, size, start, mod_size))
+            continue;
+        module_name = mod.name;
+        module_path = mod.path;
+        const std::string name = to_lower_ascii_copy(mod.name);
+        const std::string path = to_lower_ascii_copy(mod.path);
+        if (path.find("\\windows\\") != std::string::npos ||
+            path.find("/windows/") != std::string::npos ||
+            name == "ntdll.dll" ||
+            name == "kernel32.dll" ||
+            name == "kernelbase.dll" ||
+            name == "apphelp.dll" ||
+            name == "win32u.dll")
+            return true;
+        return false;
+    }
+    return false;
+}
+
+static std::optional<tool_result_t> reject_full_test_system_mutation(std::uint64_t address, std::uint64_t size, const char* tool_name)
+{
+    if (!full_test_mode_active())
+        return std::nullopt;
+    std::string module_name;
+    std::string module_path;
+    if (!range_intersects_system_module(address, size, module_name, module_path))
+        return std::nullopt;
+    diag::log_tagged_fmt("drv_tools",
+        "%s rejected full-test system module mutation addr=0x%llX size=%llu module=%s path=%s",
+        tool_name ? tool_name : "driver_tool",
+        static_cast<unsigned long long>(address),
+        static_cast<unsigned long long>(size),
+        module_name.c_str(),
+        module_path.c_str());
+    return tool_result_t::error(
+        OBFSTR("Full Test Lab refuses to mutate system module memory. Use a private target fixture address instead."));
 }
 
 static bool is_ida_host_process_name(const std::string& process_name)
@@ -371,9 +447,18 @@ static std::optional<tool_result_t> ensure_attached_process_context(const json& 
             }
         }
 
+        if (current_pid != 0)
+            stealth_engine::disable_for_detach(current_pid, "driver_tools.ensure_attached_context.replace");
+
         if (!driver_bridge::set_active_pid(requested_pid))
+        {
+            if (current_pid != 0 && driver_bridge::attached_pid() == current_pid)
+                (void)stealth_engine::ensure_default_enabled(current_pid, "driver_tools.ensure_attached_context.restore_failed_switch");
             return tool_result_t::error(OBFSTR("set_active_pid failed for target_pid ") + std::to_string(requested_pid) +
                                         OBFSTR(": ") + driver_bridge::last_error());
+        }
+
+        (void)stealth_engine::ensure_default_enabled(requested_pid, "driver_tools.ensure_attached_context");
 
         if (device->get_dtb() == 0)
         {
@@ -569,6 +654,24 @@ static bool resolve_teb_address_for_thread(std::uint32_t tid,
 
     if (ctx.kernel_gs_base != 0 && is_probably_kernel_address(ctx.kernel_gs_base))
         error = OBFSTR("thread context reported a kernel GS base instead of a user TEB and ") + error;
+    return false;
+}
+
+static bool resolve_teb_address_for_thread(std::uint32_t tid,
+                                           const driver_bridge::thread_context_t& ctx,
+                                           std::uint64_t& out_teb,
+                                           std::string& source,
+                                           std::string& error)
+{
+    out_teb = 0;
+    if (query_thread_teb_address(tid, out_teb, error))
+    {
+        source = OBFSTR("NtQueryInformationThread.ThreadBasicInformation.TebBaseAddress");
+        return true;
+    }
+    source = OBFSTR("bridge_thread_context");
+    if (ctx.rip == 0 || ctx.rsp == 0)
+        error = OBFSTR("bridge context did not contain a valid RIP/RSP and ") + error;
     return false;
 }
 
@@ -791,10 +894,20 @@ tool_result_t driver_attach(const json& params)
     if (is_self_target_pid(pid))
         return tool_result_t::error(OBFSTR("Cannot attach to AiDA's own process."));
 
+    const std::uint32_t previous_pid = driver_bridge::attached_pid();
+    if (previous_pid != 0 && previous_pid != pid)
+        stealth_engine::disable_for_detach(previous_pid, "driver_tools.driver_attach.replace");
+
     if (!driver_bridge::attach(pid))
+    {
+        if (previous_pid != 0 && driver_bridge::attached_pid() == previous_pid)
+            (void)stealth_engine::ensure_default_enabled(previous_pid, "driver_tools.driver_attach.restore_failed_switch");
         return tool_result_t::error(
             OBFSTR("Failed to attach to process: ") + process_name +
             OBFSTR(". ") + driver_bridge::last_error());
+    }
+
+    const bool stealth_ok = stealth_engine::ensure_default_enabled(pid, "driver_tools.driver_attach");
 
     std::uint64_t base = device->get_base_address();
     if (base == 0)
@@ -815,8 +928,10 @@ tool_result_t driver_attach(const json& params)
     result["process_id"]   = pid;
     result["base_address"] = sa_format_address(base);
     result["dtb"]          = sa_format_address(device->get_dtb());
-    diag::log_tagged_fmt("drv_tools", "driver_attach ok process='%s' pid=%u base=%s",
-        process_name.c_str(), pid, sa_format_address(base).c_str());
+    result["stealth_default_enabled"] = stealth_ok;
+    result["stealth_auto_state"] = stealth_engine::get_status();
+    diag::log_tagged_fmt("drv_tools", "driver_attach ok process='%s' pid=%u base=%s stealth_ok=%d",
+        process_name.c_str(), pid, sa_format_address(base).c_str(), stealth_ok ? 1 : 0);
     return tool_result_t::ok(OBFSTR("Attached to process: ") + process_name, result);
 }
 
@@ -833,6 +948,8 @@ tool_result_t driver_unattach(const json&)
     const std::uint32_t previous_pid = bridge_pid != 0 ? bridge_pid : device->get_process_id();
     const std::uint64_t previous_base = device->get_base_address();
     const std::uint64_t previous_dtb = device->get_dtb();
+
+    stealth_engine::disable_for_detach(previous_pid, "driver_tools.driver_unattach");
 
     const bool bridge_cleared = driver_bridge::clear_active_pid();
     if (!bridge_cleared)
@@ -944,6 +1061,11 @@ tool_result_t driver_write_memory(const json& params)
             OBFSTR("Invalid bytes format. Use one of: 'DE AD BE EF', 'DEADBEEF', [222,173,190,239], ['DE','AD',...]. Detail: ") +
             parse_error);
     }
+    if (bytes.empty())
+        return tool_result_t::error(OBFSTR("Byte sequence is empty"));
+
+    if (auto reject = reject_full_test_system_mutation(*ea_opt, static_cast<std::uint64_t>(bytes.size()), "driver_write_memory"))
+        return *reject;
 
     std::size_t written = device->write_raw(*ea_opt, bytes.data(), bytes.size());
     if (written == 0)
@@ -4747,11 +4869,11 @@ tool_result_t driver_dump_module(const json& params)
         (header_wiped || !has_valid_pe
             ? OBFSTR("The in-memory image does not currently expose a clean PE header. "
                      "Open the saved file with manual load and set the image base to ") + sa_format_address(base) + OBFSTR(".")
-            : OBFSTR("Open the saved file in a new IDA Pro instance. If needed, use manual load with image base ") + sa_format_address(base) + OBFSTR("."));
+            : OBFSTR("Open the saved file in a clean disassembler session. If needed, use manual load with image base ") + sa_format_address(base) + OBFSTR("."));
 
     return tool_result_t::ok(OBFSTR("Module dumped: ") + std::to_string(total_read) + "/" +
                              std::to_string(module_size) + " bytes -> " + output_path +
-                             OBFSTR(". Open this file in a NEW IDA Pro instance for proper analysis."), result);
+                             OBFSTR(". Open this file in a clean disassembler session for proper analysis."), result);
 }
 
 tool_result_t driver_scan_pattern(const json& params)
@@ -5401,16 +5523,13 @@ tool_result_t driver_read_kernel_memory(const json& params)
 
 tool_result_t driver_write_kernel_memory(const json& params)
 {
-    diag::log_tagged_fmt("drv_tools", "driver_write_kernel_memory entry");
-    if (!device || !device->is_connected())
-        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
+    const bool validate_only = params.contains("validate_only") &&
+        params["validate_only"].is_boolean() &&
+        params["validate_only"].get<bool>();
+    diag::log_tagged_fmt("drv_tools", "driver_write_kernel_memory entry validate_only=%d", validate_only ? 1 : 0);
 
-    if (device->get_kernel_dtb() == 0)
-    {
-        device->solve_kernel_dtb();
-        if (device->get_kernel_dtb() == 0)
-            return tool_result_t::error(OBFSTR("Failed to solve kernel DTB."));
-    }
+    if (!params.contains("address") || !params["address"].is_string())
+        return tool_result_t::error(OBFSTR("'address' is required and must be a string."));
 
     std::string addr_str = params["address"].get<std::string>();
     auto addr_opt = sa_parse_address(addr_str);
@@ -5422,13 +5541,41 @@ tool_result_t driver_write_kernel_memory(const json& params)
     if (!is_probably_kernel_address(address))
         return tool_result_t::error(OBFSTR("Address is not a canonical kernel virtual address. Use driver_write_memory for user-mode addresses."));
 
+    if (!params.contains("bytes"))
+        return tool_result_t::error(OBFSTR("'bytes' is required."));
+
     std::vector<std::uint8_t> data;
     std::string parse_error;
     if (!parse_byte_sequence(params["bytes"], data, parse_error))
         return tool_result_t::error(OBFSTR("Invalid bytes format. ") + parse_error);
 
+    if (data.empty())
+        return tool_result_t::error(OBFSTR("Write payload is empty."));
+
     if (data.size() > 4096)
         return tool_result_t::error(OBFSTR("Write size exceeds 4096 byte limit."));
+
+    if (validate_only)
+    {
+        json result;
+        result["address"]       = sa_format_address(static_cast<uint64_t>(address));
+        result["bytes_written"] = 0;
+        result["requested"]     = data.size();
+        result["source"]        = "kernel_memory";
+        result["validate_only"] = true;
+        return tool_result_t::ok(
+            OBFSTR("Validated kernel memory write request without writing memory."), result);
+    }
+
+    if (!device || !device->is_connected())
+        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
+
+    if (device->get_kernel_dtb() == 0)
+    {
+        device->solve_kernel_dtb();
+        if (device->get_kernel_dtb() == 0)
+            return tool_result_t::error(OBFSTR("Failed to solve kernel DTB."));
+    }
 
     std::size_t written = device->write_kernel_raw(address, data.data(), data.size());
 
@@ -5607,8 +5754,8 @@ tool_result_t driver_get_thread_context(const json& params)
         return tool_result_t::error(OBFSTR("Thread ID (tid) is required and must be a decimal integer or 0x-prefixed hex."));
     const std::uint32_t tid = *tid_opt;
 
-    voyager::device_t::thread_context ctx{};
-    if (!device->get_thread_context(tid, ctx))
+    driver_bridge::thread_context_t ctx{};
+    if (!driver_bridge::get_thread_context(tid, ctx))
         return tool_result_t::error(OBFSTR("Failed to get thread context for TID ") + std::to_string(tid));
 
     json result;
@@ -5730,7 +5877,7 @@ tool_result_t driver_suspend_thread(const json& params)
     const std::uint32_t tid = *tid_opt;
 
     std::uint32_t prev = 0;
-    if (!device->suspend_thread(tid, &prev))
+    if (!driver_bridge::suspend_thread(tid, &prev))
         return tool_result_t::error(OBFSTR("Failed to suspend thread ") + std::to_string(tid));
 
     json result;
@@ -5751,7 +5898,7 @@ tool_result_t driver_resume_thread(const json& params)
     const std::uint32_t tid = *tid_opt;
 
     std::uint32_t prev = 0;
-    if (!device->resume_thread(tid, &prev))
+    if (!driver_bridge::resume_thread(tid, &prev))
         return tool_result_t::error(OBFSTR("Failed to resume thread ") + std::to_string(tid));
 
     json result;
@@ -5830,6 +5977,8 @@ tool_result_t driver_protect_memory(const json& params)
         else
             size = params["size"].get<std::uint64_t>();
     }
+    if (size == 0)
+        return tool_result_t::error(OBFSTR("Size is required"));
 
 
     std::uint32_t new_protect = 0x40;
@@ -5839,6 +5988,9 @@ tool_result_t driver_protect_memory(const json& params)
         else
             new_protect = params["protect"].get<std::uint32_t>();
     }
+
+    if (auto reject = reject_full_test_system_mutation(address, size, "driver_protect_memory"))
+        return *reject;
 
     std::uint32_t old_protect = 0;
     if (!device->protect_memory(address, size, new_protect, &old_protect))
@@ -5984,7 +6136,7 @@ tool_result_t driver_set_hw_breakpoint(const json& params)
         else size = 0;
     }
 
-    if (!device->set_hardware_breakpoint(tid, index, address, type, size))
+    if (!driver_bridge::set_hardware_breakpoint(tid, index, address, type, size))
         return tool_result_t::error(OBFSTR("Failed to set hardware breakpoint"));
 
     json result;
@@ -6009,7 +6161,7 @@ tool_result_t driver_clear_hw_breakpoint(const json& params)
     int index = 0;
     if (params.contains("index")) index = params["index"].get<int>();
 
-    if (!device->clear_hardware_breakpoint(tid, index))
+    if (!driver_bridge::clear_hardware_breakpoint(tid, index))
         return tool_result_t::error(OBFSTR("Failed to clear hardware breakpoint"));
 
     json result;
@@ -6183,6 +6335,19 @@ struct deferred_action_t
     std::string                             error;
 };
 
+struct deferred_action_snapshot_t
+{
+    int                                     id = 0;
+    std::string                             condition_type;
+    std::string                             target_name;
+    int                                     timeout_seconds = 0;
+    std::vector<deferred_action_t::queued_tool_call_t> tool_calls;
+    std::vector<deferred_action_result_t>   results;
+    deferred_status                         status = deferred_status::pending;
+    std::string                             trigger_info;
+    std::string                             error;
+};
+
 class DeferredActionManager
 {
 public:
@@ -6190,10 +6355,10 @@ public:
     ~DeferredActionManager();
 
     void shutdown();
-    int  register_action(std::unique_ptr<deferred_action_t> action);
+    int  register_action(std::unique_ptr<deferred_action_t> action, bool& watcher_started, std::string* watcher_error = nullptr);
     bool cancel_action(int id);
-    const deferred_action_t*                get_action(int id) const;
-    std::vector<const deferred_action_t*>   get_all_actions() const;
+    bool get_action_snapshot(int id, deferred_action_snapshot_t& out) const;
+    std::vector<deferred_action_snapshot_t> get_all_action_snapshots() const;
 
     bool poll_kernel_module_load(const std::string& target,
                                  std::uint64_t& out_base,
@@ -6267,24 +6432,68 @@ void DeferredActionManager::shutdown()
     }
 }
 
-int DeferredActionManager::register_action(std::unique_ptr<deferred_action_t> action)
+int DeferredActionManager::register_action(std::unique_ptr<deferred_action_t> action, bool& watcher_started, std::string* watcher_error)
 {
-    std::lock_guard<std::mutex> lock(_mutex);
-    int id = _next_id++;
+    watcher_started = false;
+    if (watcher_error)
+        watcher_error->clear();
+    int id = 0;
     action->id = id;
     action->created = std::chrono::steady_clock::now();
     action->status.store(deferred_status::pending);
+    action->watcher_done.store(false, std::memory_order_release);
 
     deferred_action_t* action_ptr = action.get();
-    _actions[id] = std::move(action);
-
-    action_ptr->watcher_done.store(false, std::memory_order_release);
-    if (!work_queue::post([this, id, action_ptr]() {
-            watcher_thread_func(id);
-            action_ptr->watcher_done.store(true, std::memory_order_release);
-        }))
     {
+        std::lock_guard<std::mutex> lock(_mutex);
+        id = _next_id++;
+        action_ptr->id = id;
+        _actions[id] = std::move(action);
+    }
+
+    std::string thread_err;
+    if (aida::infra::win_thread::start_detached([this, id, action_ptr]() {
+            try
+            {
+                watcher_thread_func(id);
+            }
+            catch (const std::exception& ex)
+            {
+                std::lock_guard<std::mutex> lock(_mutex);
+                action_ptr->status.store(deferred_status::failed);
+                action_ptr->error = std::string("Deferred watcher escaped exception: ") + ex.what();
+            }
+            catch (...)
+            {
+                std::lock_guard<std::mutex> lock(_mutex);
+                action_ptr->status.store(deferred_status::failed);
+                action_ptr->error = "Deferred watcher escaped unknown exception";
+            }
+            action_ptr->watcher_done.store(true, std::memory_order_release);
+        }, &thread_err, aida::infra::win_thread::default_stack_reserve))
+    {
+        watcher_started = true;
+        diag::log_tagged_fmt("drv_tools", "deferred_watcher_thread_started id=%d", id);
+    }
+    else
+    {
+        {
+            std::lock_guard<std::mutex> lock(_mutex);
+            action_ptr->status.store(deferred_status::failed);
+            action_ptr->error = std::string("Deferred watcher thread start failed: ") + thread_err;
+        }
         action_ptr->watcher_done.store(true, std::memory_order_release);
+        diag::log_tagged_fmt("drv_tools", "deferred_watcher_thread_start_failed id=%d err='%s'", id, thread_err.c_str());
+    }
+
+    if (!watcher_started)
+    {
+        if (watcher_error)
+            *watcher_error = action_ptr->error.empty() ? std::string("Deferred watcher thread start failed") : action_ptr->error;
+        std::lock_guard<std::mutex> lock(_mutex);
+        _actions.erase(id);
+        diag::log_tagged_fmt("drv_tools", "deferred_watcher_registration_removed_after_start_failure id=%d", id);
+        return 0;
     }
 
     return id;
@@ -6310,19 +6519,38 @@ bool DeferredActionManager::cancel_action(int id)
     return false;
 }
 
-const deferred_action_t* DeferredActionManager::get_action(int id) const
+static deferred_action_snapshot_t make_deferred_action_snapshot(const deferred_action_t& action)
+{
+    deferred_action_snapshot_t snapshot;
+    snapshot.id = action.id;
+    snapshot.condition_type = action.condition_type;
+    snapshot.target_name = action.target_name;
+    snapshot.timeout_seconds = action.timeout_seconds;
+    snapshot.tool_calls = action.tool_calls;
+    snapshot.results = action.results;
+    snapshot.status = action.status.load();
+    snapshot.trigger_info = action.trigger_info;
+    snapshot.error = action.error;
+    return snapshot;
+}
+
+bool DeferredActionManager::get_action_snapshot(int id, deferred_action_snapshot_t& out) const
 {
     std::lock_guard<std::mutex> lock(_mutex);
     auto it = _actions.find(id);
-    return (it != _actions.end()) ? it->second.get() : nullptr;
+    if (it == _actions.end())
+        return false;
+    out = make_deferred_action_snapshot(*it->second);
+    return true;
 }
 
-std::vector<const deferred_action_t*> DeferredActionManager::get_all_actions() const
+std::vector<deferred_action_snapshot_t> DeferredActionManager::get_all_action_snapshots() const
 {
     std::lock_guard<std::mutex> lock(_mutex);
-    std::vector<const deferred_action_t*> result;
+    std::vector<deferred_action_snapshot_t> result;
+    result.reserve(_actions.size());
     for (const auto& [id, action] : _actions)
-        result.push_back(action.get());
+        result.push_back(make_deferred_action_snapshot(*action));
     return result;
 }
 
@@ -6483,6 +6711,12 @@ json DeferredActionManager::resolve_params(const json& params, const json& conte
 
 void DeferredActionManager::execute_deferred_tools(deferred_action_t& action, const json& context)
 {
+    std::vector<deferred_action_t::queued_tool_call_t> tool_calls;
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        tool_calls = action.tool_calls;
+    }
+    std::vector<deferred_action_result_t> results;
 
 
     struct deferred_exec_request_t : public exec_request_t
@@ -6498,7 +6732,7 @@ void DeferredActionManager::execute_deferred_tools(deferred_action_t& action, co
         }
     };
 
-    for (const auto& tc : action.tool_calls)
+    for (const auto& tc : tool_calls)
     {
         json resolved_params = resolve_params(tc.params, context);
         deferred_action_result_t result;
@@ -6526,7 +6760,12 @@ void DeferredActionManager::execute_deferred_tools(deferred_action_t& action, co
             result.message = std::string("Exception: ") + e.what();
         }
 
-        action.results.push_back(std::move(result));
+        results.push_back(std::move(result));
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        action.results = std::move(results);
     }
 }
 
@@ -6565,9 +6804,12 @@ void DeferredActionManager::watcher_thread_func(int action_id)
         auto elapsed = std::chrono::steady_clock::now() - start_time;
         if (elapsed >= timeout)
         {
-            action->status.store(deferred_status::timed_out);
-            action->error = OBFSTR("Timed out waiting for ") + action->condition_type +
-                OBFSTR(": ") + action->target_name;
+            {
+                std::lock_guard<std::mutex> lock(_mutex);
+                action->status.store(deferred_status::timed_out);
+                action->error = OBFSTR("Timed out waiting for ") + action->condition_type +
+                    OBFSTR(": ") + action->target_name;
+            }
             msg(OBFSTR_C("AiDA: Deferred action #%d timed out after %ds\n"),
                 action->id, action->timeout_seconds);
             return;
@@ -6592,7 +6834,10 @@ void DeferredActionManager::watcher_thread_func(int action_id)
                 trigger_context["module_name"] = name;
                 trigger_context["module_path"] = path;
 
-                action->trigger_info = trigger_context.dump();
+                {
+                    std::lock_guard<std::mutex> lock(_mutex);
+                    action->trigger_info = trigger_context.dump();
+                }
             }
         }
         else if (action->condition_type == "process_start")
@@ -6620,7 +6865,10 @@ void DeferredActionManager::watcher_thread_func(int action_id)
                     trigger_context["pid"] = std::to_string(device->get_process_id());
                 }
 
-                action->trigger_info = trigger_context.dump();
+                {
+                    std::lock_guard<std::mutex> lock(_mutex);
+                    action->trigger_info = trigger_context.dump();
+                }
             }
         }
 
@@ -6640,7 +6888,12 @@ void DeferredActionManager::watcher_thread_func(int action_id)
             execute_deferred_tools(*action, trigger_context);
 
             bool any_failed = false;
-            for (const auto& r : action->results)
+            std::vector<deferred_action_result_t> results_snapshot;
+            {
+                std::lock_guard<std::mutex> lock(_mutex);
+                results_snapshot = action->results;
+            }
+            for (const auto& r : results_snapshot)
             {
                 msg(OBFSTR_C("AiDA: Deferred action #%d - %s: %s - %s\n"),
                     action->id, r.action_type.c_str(),
@@ -6653,9 +6906,9 @@ void DeferredActionManager::watcher_thread_func(int action_id)
             msg(OBFSTR_C("AiDA: Deferred action #%d %s. %zu/%zu actions succeeded.\n"),
                 action->id,
                 any_failed ? "completed with failures" : "completed successfully",
-                std::count_if(action->results.begin(), action->results.end(),
+                std::count_if(results_snapshot.begin(), results_snapshot.end(),
                     [](const deferred_action_result_t& r) { return r.success; }),
-                action->results.size());
+                results_snapshot.size());
 
             return;
         }
@@ -6775,7 +7028,18 @@ tool_result_t driver_defer_action(const json& params)
     }
 
     const std::size_t queued_actions = action->tool_calls.size();
-    int action_id = DeferredActionManager::instance().register_action(std::move(action));
+    bool watcher_started = false;
+    std::string watcher_error;
+    int action_id = DeferredActionManager::instance().register_action(std::move(action), watcher_started, &watcher_error);
+    if (action_id == 0 || !watcher_started)
+    {
+        if (watcher_error.empty())
+            watcher_error = "Deferred watcher thread start failed";
+        diag::log_tagged_fmt("drv_tools", "driver_defer_action watcher_start_unavailable target='%s' err='%s'", target.c_str(), watcher_error.c_str());
+        return tool_result_t::error(watcher_error);
+    }
+    deferred_action_snapshot_t registered_action;
+    const bool have_registered_action = DeferredActionManager::instance().get_action_snapshot(action_id, registered_action);
 
     json result;
     result["action_id"] = action_id;
@@ -6784,6 +7048,14 @@ tool_result_t driver_defer_action(const json& params)
     result["timeout_seconds"] = timeout;
     result["poll_interval_ms"] = poll_interval;
     result["num_queued_actions"] = queued_actions;
+    result["watcher_started"] = watcher_started;
+    if (have_registered_action && registered_action.status == deferred_status::failed)
+    {
+        result["status"] = "failed";
+        result["error"] = registered_action.error;
+        return tool_result_t::error(OBFSTR("Deferred action #") + std::to_string(action_id) +
+            OBFSTR(" watcher failed to start: ") + registered_action.error);
+    }
     result["status"] = already_met ? "target_already_loaded_executing_now" : "watching";
     result["note"] = already_met
         ? OBFSTR("Target '") + target + OBFSTR("' is ALREADY loaded! Actions are being executed immediately.")
@@ -6801,34 +7073,34 @@ tool_result_t driver_defer_action(const json& params)
 tool_result_t driver_list_deferred_actions(const json&)
 {
     diag::log_tagged_fmt("drv_tools", "driver_list_deferred_actions entry");
-    auto actions = DeferredActionManager::instance().get_all_actions();
+    auto actions = DeferredActionManager::instance().get_all_action_snapshots();
 
     json arr = json::array();
-    for (const auto* action : actions)
+    for (const auto& action : actions)
     {
         json entry;
-        entry["id"] = action->id;
-        entry["condition"] = action->condition_type;
-        entry["target"] = action->target_name;
-        entry["status"] = deferred_status_to_string(action->status.load());
-        entry["num_actions"] = action->tool_calls.size();
-        entry["timeout_seconds"] = action->timeout_seconds;
+        entry["id"] = action.id;
+        entry["condition"] = action.condition_type;
+        entry["target"] = action.target_name;
+        entry["status"] = deferred_status_to_string(action.status);
+        entry["num_actions"] = action.tool_calls.size();
+        entry["timeout_seconds"] = action.timeout_seconds;
 
-        if (!action->trigger_info.empty())
+        if (!action.trigger_info.empty())
         {
-            try { entry["trigger_info"] = json::parse(action->trigger_info); }
-            catch (...) { entry["trigger_info"] = action->trigger_info; }
+            try { entry["trigger_info"] = json::parse(action.trigger_info); }
+            catch (...) { entry["trigger_info"] = action.trigger_info; }
         }
 
-        if (!action->error.empty())
-            entry["error"] = action->error;
+        if (!action.error.empty())
+            entry["error"] = action.error;
 
-        entry["num_results"] = action->results.size();
+        entry["num_results"] = action.results.size();
         int succeeded = 0;
-        for (const auto& r : action->results)
+        for (const auto& r : action.results)
             if (r.success) succeeded++;
         entry["succeeded"] = succeeded;
-        entry["failed"] = static_cast<int>(action->results.size()) - succeeded;
+        entry["failed"] = static_cast<int>(action.results.size()) - succeeded;
 
         arr.push_back(entry);
     }
@@ -6880,27 +7152,27 @@ tool_result_t driver_get_deferred_results(const json& params)
     if (id == 0)
         return tool_result_t::error(OBFSTR("'action_id' is required"));
 
-    const auto* action = DeferredActionManager::instance().get_action(id);
-    if (!action)
+    deferred_action_snapshot_t action;
+    if (!DeferredActionManager::instance().get_action_snapshot(id, action))
         return tool_result_t::error(OBFSTR("Action #") + std::to_string(id) + OBFSTR(" not found"));
 
     json result;
-    result["action_id"] = action->id;
-    result["condition"] = action->condition_type;
-    result["target"] = action->target_name;
-    result["status"] = deferred_status_to_string(action->status.load());
+    result["action_id"] = action.id;
+    result["condition"] = action.condition_type;
+    result["target"] = action.target_name;
+    result["status"] = deferred_status_to_string(action.status);
 
-    if (!action->trigger_info.empty())
+    if (!action.trigger_info.empty())
     {
-        try { result["trigger_info"] = json::parse(action->trigger_info); }
-        catch (...) { result["trigger_info"] = action->trigger_info; }
+        try { result["trigger_info"] = json::parse(action.trigger_info); }
+        catch (...) { result["trigger_info"] = action.trigger_info; }
     }
 
-    if (!action->error.empty())
-        result["error"] = action->error;
+    if (!action.error.empty())
+        result["error"] = action.error;
 
     json results_arr = json::array();
-    for (const auto& r : action->results)
+    for (const auto& r : action.results)
     {
         json rj;
         rj["tool"] = r.action_type;
@@ -6913,13 +7185,13 @@ tool_result_t driver_get_deferred_results(const json& params)
     result["results"] = results_arr;
 
     int succeeded = 0;
-    for (const auto& r : action->results)
+    for (const auto& r : action.results)
         if (r.success) succeeded++;
     result["succeeded"] = succeeded;
-    result["failed"] = static_cast<int>(action->results.size()) - succeeded;
-    result["total_actions"] = action->tool_calls.size();
+    result["failed"] = static_cast<int>(action.results.size()) - succeeded;
+    result["total_actions"] = action.tool_calls.size();
 
-    std::string status_str = deferred_status_to_string(action->status.load());
+    std::string status_str = deferred_status_to_string(action.status);
     return tool_result_t::ok(
         OBFSTR("Deferred action #") + std::to_string(id) + OBFSTR(": ") + status_str, result);
 }
@@ -7049,6 +7321,8 @@ tool_result_t driver_sniff_network_buffers(const json& params)
         if (op == "get" || op == "results") {
             bool active = false;
             auto captures = device->sniff_net_buffers_get(active);
+            diag::log_tagged_fmt("drv_tools", "driver_sniff_network_buffers get active=%d captures=%zu",
+                active ? 1 : 0, captures.size());
 
             json result;
             result["active"] = active;
@@ -7132,6 +7406,9 @@ tool_result_t driver_sniff_network_buffers(const json& params)
 
     if (!device->sniff_net_buffers_start(address, buf_reg, size_reg, max_packets, tid, bp_index))
         return tool_result_t::error(OBFSTR("Failed to start sniff session"));
+    diag::log_tagged_fmt("drv_tools",
+        "driver_sniff_network_buffers start address=0x%llX buf_reg=%u size_reg=%u max_packets=%u tid=%u bp_index=%u",
+        static_cast<unsigned long long>(address), buf_reg, size_reg, max_packets, tid, bp_index);
 
     json result;
     result["status"] = "started";
@@ -7476,20 +7753,27 @@ tool_result_t driver_reassemble_stream(const json& params)
     std::uint8_t src_addr[16] = {}, dst_addr[16] = {};
     if (params.contains("src_addr")) parse_ip_string(params["src_addr"].get<std::string>(), src_addr, nullptr);
     if (params.contains("dst_addr")) parse_ip_string(params["dst_addr"].get<std::string>(), dst_addr, nullptr);
+    diag::log_tagged_fmt("drv_tools",
+        "driver_reassemble_stream request operation=%s op_code=%u src_port=%u dst_port=%u pid=%u has_src_addr=%d has_dst_addr=%d",
+        operation.c_str(), op_code, src_port, dst_port, pid,
+        params.contains("src_addr") ? 1 : 0, params.contains("dst_addr") ? 1 : 0);
 
     std::vector<std::uint8_t> data;
     std::uint32_t packets = 0, truncated = 0;
     bool ok = device->stream_reassemble_op(op_code, src_port, dst_port, pid,
                                             src_addr, dst_addr, &data, &packets, &truncated);
+    diag::log_tagged_fmt("drv_tools",
+        "driver_reassemble_stream result ok=%d operation=%s bytes=%zu packets=%u truncated=%u",
+        ok ? 1 : 0, operation.c_str(), data.size(), packets, truncated);
     if (!ok) return tool_result_t::error(OBFSTR("Stream operation failed"));
 
     json result;
     result["operation"] = operation;
     result["total_packets"] = packets;
+    result["stream_size"] = data.size();
+    result["empty_evidence"] = data.empty() && packets == 0;
     if (truncated) result["truncated"] = true;
     if (!data.empty()) {
-        result["stream_size"] = data.size();
-
         std::string hex;
         size_t preview = (data.size() > 256) ? 256 : data.size();
         for (size_t i = 0; i < preview; i++) {
@@ -7919,22 +8203,24 @@ tool_result_t driver_network_fingerprint(const json& params)
 
     if (operation == "enable") {
         bool ok = device->fingerprint_op(0);
+        diag::log_tagged_fmt("drv_tools", "driver_network_fingerprint enable ok=%d", ok ? 1 : 0);
         return ok ? tool_result_t::ok(OBFSTR("Fingerprinting enabled"), json::object())
                   : tool_result_t::error(OBFSTR("Failed to enable fingerprinting"));
     }
     if (operation == "disable") {
         bool ok = device->fingerprint_op(1);
+        diag::log_tagged_fmt("drv_tools", "driver_network_fingerprint disable ok=%d", ok ? 1 : 0);
         return ok ? tool_result_t::ok(OBFSTR("Fingerprinting disabled"), json::object())
                   : tool_result_t::error(OBFSTR("Failed to disable fingerprinting"));
     }
 
 
     auto fps = device->get_fingerprints();
-    if (fps.empty())
-        return tool_result_t::ok(OBFSTR("No fingerprint results"), json::object());
+    diag::log_tagged_fmt("drv_tools", "driver_network_fingerprint get count=%zu", fps.size());
 
     json result;
     result["count"] = fps.size();
+    result["empty_evidence"] = fps.empty();
     json arr = json::array();
     for (const auto& f : fps) {
         json e;
@@ -7949,6 +8235,9 @@ tool_result_t driver_network_fingerprint(const json& params)
         arr.push_back(std::move(e));
     }
     result["fingerprints"] = std::move(arr);
+
+    if (fps.empty())
+        return tool_result_t::ok(OBFSTR("No fingerprint results"), result);
 
     return tool_result_t::ok(OBFSTR("Network fingerprints: ") + std::to_string(fps.size()) + OBFSTR(" hosts"), result);
 }
@@ -9390,8 +9679,8 @@ tool_result_t driver_walk_seh_chain(const json& params)
     const std::uint32_t tid = *tid_opt;
 
 
-    voyager::device_t::thread_context ctx{};
-    if (!device->get_thread_context(tid, ctx))
+    driver_bridge::thread_context_t ctx{};
+    if (!driver_bridge::get_thread_context(tid, ctx))
         return tool_result_t::error(OBFSTR("Failed to get thread context for TID ") + std::to_string(tid));
 
 
@@ -10241,8 +10530,8 @@ tool_result_t driver_walk_stack(const json& params)
     const std::uint32_t tid = *tid_opt;
     const int max_frames = std::min(params.value("max_frames", 64), 256);
 
-    voyager::device_t::thread_context ctx{};
-    if (!device->get_thread_context(tid, ctx))
+    driver_bridge::thread_context_t ctx{};
+    if (!driver_bridge::get_thread_context(tid, ctx))
         return tool_result_t::error(OBFSTR("Failed to get thread context for TID ") + std::to_string(tid));
 
 
@@ -10929,8 +11218,8 @@ tool_result_t driver_read_teb(const json& params)
 
     const std::uint32_t tid = *tid_opt;
 
-    voyager::device_t::thread_context ctx{};
-    if (!device->get_thread_context(tid, ctx))
+    driver_bridge::thread_context_t ctx{};
+    if (!driver_bridge::get_thread_context(tid, ctx))
         return tool_result_t::error(OBFSTR("Failed to get thread context for TID ") + std::to_string(tid));
 
     std::uint64_t teb_addr = 0;
@@ -11369,7 +11658,9 @@ void register_driver_tools(mcp_standalone::server_t& srv)
         {{OBFSTR("address"), OBFSTR("string"),
           OBFSTR("Kernel virtual address to write (e.g. 'FFFFF80012345000')"), true},
          {OBFSTR("bytes"), OBFSTR("string"),
-                    OBFSTR("Bytes payload in hex string or JSON array."), true}},
+                    OBFSTR("Bytes payload in hex string or JSON array."), true},
+         {OBFSTR("validate_only"), OBFSTR("boolean"),
+                    OBFSTR("Validate address and byte payload without writing memory."), false}},
         driver_write_kernel_memory, false});
 
 
@@ -11887,7 +12178,7 @@ void register_driver_tools(mcp_standalone::server_t& srv)
                "Runs entirely in the kernel WFP layer. Operations: enable, disable, get."),
         {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("'enable', 'disable', 'get' (default get)"), false,
           {OBFSTR("enable"), OBFSTR("disable"), OBFSTR("get")}}},
-        driver_network_fingerprint, true});
+        driver_network_fingerprint, false});
 
     register_compat(srv, {
         OBFSTR("driver_enum_kernel_callbacks"), OBFSTR("driver"),

@@ -148,6 +148,10 @@ static bool wait_for_pointer_idle(int wait_ms) {
 	return !memory_scanner::g_state.pointer_scanning.load();
 }
 
+static bool wait_budget_active(int wait_ms) {
+	return wait_ms > 0;
+}
+
 static void apply_region_filter(memory_scanner::scan_config_t& cfg, const std::string& filter) {
 	const std::string v = lower_copy(filter);
 	if (v.empty() || v == "default" || v == "writable") {
@@ -236,6 +240,7 @@ static json pointer_results_json(size_t limit) {
 	json result;
 	result["session_id"] = g_active_pointer_session.load(std::memory_order_relaxed);
 	result["scanning"] = st.pointer_scanning.load();
+	result["completed"] = !st.pointer_scanning.load();
 	result["progress"] = st.pointer_progress.load();
 	result["total"] = st.pointer_results.size();
 	result["returned"] = arr.size();
@@ -682,6 +687,16 @@ static tool_result_t handle_first_scan(const json& params) {
 		memory_scanner::g_state.total_found,
 		memory_scanner::g_state.scan_count,
 		memory_scanner::g_state.scanning.load() ? 1 : 0);
+	if (memory_scanner::g_state.scanning.load()) {
+		json result = scan_summary_json(100);
+		result["completed"] = false;
+		result["timeout_ms"] = 30000;
+		diag::log_tagged_fmt("scanner", "mcp first_scan timeout total=%zu scan_count=%d",
+			memory_scanner::g_state.total_found,
+			memory_scanner::g_state.scan_count);
+		memory_scanner::reset_scan();
+		return tool_result_t{false, OBFSTR("Memory scan did not complete within the wait budget."), result};
+	}
 
 	return tool_result_t::ok(results_to_json());
 }
@@ -712,6 +727,16 @@ static tool_result_t handle_next_scan(const json& params) {
 
 	diag::log_tagged_fmt("scanner", "mcp next_scan completed total=%zu",
 		memory_scanner::g_state.total_found);
+	if (memory_scanner::g_state.scanning.load()) {
+		json result = scan_summary_json(100);
+		result["completed"] = false;
+		result["timeout_ms"] = 30000;
+		diag::log_tagged_fmt("scanner", "mcp next_scan timeout total=%zu scan_count=%d",
+			memory_scanner::g_state.total_found,
+			memory_scanner::g_state.scan_count);
+		memory_scanner::reset_scan();
+		return tool_result_t{false, OBFSTR("Next memory scan did not complete within the wait budget."), result};
+	}
 
 	return tool_result_t::ok(results_to_json());
 }
@@ -757,14 +782,29 @@ static tool_result_t handle_scan_mem_start(const json& params) {
 	parse_u64_param(params, "range_base", cfg.range_base);
 	parse_u64_param(params, "range_size", cfg.range_size);
 
+	const int wait_ms = clamp_wait_ms(params, 30000);
 	const uint64_t session_id = next_scan_session_id();
 	if (!memory_scanner::first_scan(cfg))
 		return tool_result_t::error(OBFSTR("Scanner busy or not attached to a process."));
 	g_active_scan_session.store(session_id, std::memory_order_relaxed);
-	const bool completed = wait_for_scan_idle(clamp_wait_ms(params, 30000));
+	const bool completed = wait_for_scan_idle(wait_ms);
 	json result = scan_summary_json(limit_param(params, 100, 10000));
 	result["session_id"] = session_id;
 	result["completed"] = completed;
+	result["wait_ms"] = wait_ms;
+	if (!completed && wait_budget_active(wait_ms)) {
+		diag::log_tagged_fmt("scanner",
+			"mcp scan_mem_start timeout session=%llu total=%zu scan_count=%d scanning=%d wait_ms=%d",
+			static_cast<unsigned long long>(session_id),
+			memory_scanner::g_state.total_found,
+			memory_scanner::g_state.scan_count,
+			memory_scanner::g_state.scanning.load() ? 1 : 0,
+			wait_ms);
+		memory_scanner::reset_scan();
+		g_active_scan_session.store(0, std::memory_order_relaxed);
+		result["scanning"] = false;
+		return tool_result_t{false, OBFSTR("Memory scan did not complete within the wait budget."), result};
+	}
 	return tool_result_t::ok(result);
 }
 
@@ -783,15 +823,47 @@ static tool_result_t handle_scan_mem_next(const json& params) {
 		return tool_result_t::error(OBFSTR("'value' is required for this compare_type."));
 	if (!memory_scanner::next_scan(mode, value))
 		return tool_result_t::error(OBFSTR("Scanner busy or no initial scan performed."));
-	const bool completed = wait_for_scan_idle(clamp_wait_ms(params, 30000));
+	const int wait_ms = clamp_wait_ms(params, 30000);
+	const bool completed = wait_for_scan_idle(wait_ms);
 	json result = scan_summary_json(limit_param(params, 100, 10000));
 	result["completed"] = completed;
 	result["compare_type"] = compare_type;
+	result["wait_ms"] = wait_ms;
+	if (!completed && wait_budget_active(wait_ms)) {
+		diag::log_tagged_fmt("scanner",
+			"mcp scan_mem_next timeout session=%llu total=%zu scan_count=%d scanning=%d wait_ms=%d",
+			static_cast<unsigned long long>(g_active_scan_session.load(std::memory_order_relaxed)),
+			memory_scanner::g_state.total_found,
+			memory_scanner::g_state.scan_count,
+			memory_scanner::g_state.scanning.load() ? 1 : 0,
+			wait_ms);
+		memory_scanner::reset_scan();
+		g_active_scan_session.store(0, std::memory_order_relaxed);
+		result["scanning"] = false;
+		return tool_result_t{false, OBFSTR("Next memory scan did not complete within the wait budget."), result};
+	}
 	return tool_result_t::ok(result);
 }
 
 static tool_result_t handle_scan_mem_results(const json& params) {
 	const size_t limit = limit_param(params, 100, 10000);
+	const int wait_ms = clamp_wait_ms(params, params.value("wait", false) ? 30000 : 0);
+	if (params.value("wait", false) || wait_ms > 0) {
+		const bool completed = wait_for_scan_idle(wait_ms);
+		if (!completed && wait_budget_active(wait_ms)) {
+			json result = scan_summary_json(limit);
+			result["completed"] = false;
+			result["wait_ms"] = wait_ms;
+			diag::log_tagged_fmt("scanner",
+				"mcp scan_mem_results timeout session=%llu total=%zu scan_count=%d scanning=%d wait_ms=%d",
+				static_cast<unsigned long long>(g_active_scan_session.load(std::memory_order_relaxed)),
+				memory_scanner::g_state.total_found,
+				memory_scanner::g_state.scan_count,
+				memory_scanner::g_state.scanning.load() ? 1 : 0,
+				wait_ms);
+			return tool_result_t{false, OBFSTR("Memory scan did not complete within the wait budget."), result};
+		}
+	}
 	return tool_result_t::ok(scan_summary_json(limit));
 }
 
@@ -941,12 +1013,20 @@ static tool_result_t handle_pointer_scan(const json& params) {
 		if (timeout_ms < 100) timeout_ms = 100;
 		if (timeout_ms > 30000) timeout_ms = 30000;
 	}
+	uint64_t scan_base = 0;
+	uint64_t scan_size = 0;
+	parse_u64_param(params, "range_base", scan_base);
+	parse_u64_param(params, "range_size", scan_size);
 	const bool allow_partial = params.value("allow_partial", false);
 
-	diag::log_tagged_fmt("scanner", "mcp pointer_scan request addr=0x%llX depth=%d offset=0x%X timeout_ms=%d",
-		static_cast<unsigned long long>(addr), max_depth, max_offset, timeout_ms);
+	diag::log_tagged_fmt("scanner", "mcp pointer_scan request addr=0x%llX depth=%d offset=0x%X timeout_ms=%d range=0x%llX+0x%llX",
+		static_cast<unsigned long long>(addr), max_depth, max_offset, timeout_ms,
+		static_cast<unsigned long long>(scan_base),
+		static_cast<unsigned long long>(scan_size));
 
-	memory_scanner::start_pointer_scan(addr, max_depth, max_offset);
+	const bool started = memory_scanner::start_pointer_scan(addr, max_depth, max_offset, scan_base, scan_size);
+	if (!started)
+		return tool_result_t::error(OBFSTR("Pointer scan did not start. Ensure the driver is loaded and a process is attached."));
 	{
 		std::lock_guard<std::mutex> lk(memory_scanner::g_state.pointer_mutex);
 		diag::log_tagged_fmt("scanner", "mcp pointer_scan started scanning=%d current_results=%zu",
@@ -1006,6 +1086,8 @@ static tool_result_t handle_pointer_scan(const json& params) {
 	result["timed_out"] = timed_out && !allow_partial;
 	result["partial"] = timed_out;
 	result["results"] = std::move(arr);
+	if (timed_out && !allow_partial)
+		return tool_result_t{false, OBFSTR("Pointer scan did not complete within the timeout."), result};
 	return tool_result_t::ok(result.dump(2));
 }
 
@@ -1023,10 +1105,14 @@ static tool_result_t handle_pointer_scan_start(const json& params) {
 	if (max_depth > 7) max_depth = 7;
 	if (max_offset < 0x10) max_offset = 0x10;
 	if (max_offset > 0x100000) max_offset = 0x100000;
+	uint64_t scan_base = 0;
+	uint64_t scan_size = 0;
+	parse_u64_param(params, "range_base", scan_base);
+	parse_u64_param(params, "range_size", scan_size);
 	const uint64_t session_id = next_pointer_session_id();
 	g_active_pointer_session.store(session_id, std::memory_order_relaxed);
-	memory_scanner::start_pointer_scan(*target, max_depth, max_offset);
-	if (!memory_scanner::g_state.pointer_scanning.load()) {
+	const bool started = memory_scanner::start_pointer_scan(*target, max_depth, max_offset, scan_base, scan_size);
+	if (!started) {
 		g_active_pointer_session.store(0, std::memory_order_relaxed);
 		return tool_result_t::error(OBFSTR("Pointer scan did not start. Ensure the driver is loaded and a process is attached."));
 	}
@@ -1035,14 +1121,35 @@ static tool_result_t handle_pointer_scan_start(const json& params) {
 	result["target_address"] = sa_format_address(*target);
 	result["max_depth"] = max_depth;
 	result["max_offset"] = max_offset;
-	result["scanning"] = true;
+	result["range_base"] = sa_format_address(scan_base);
+	result["range_size"] = scan_size;
+	result["scanning"] = memory_scanner::g_state.pointer_scanning.load();
+	result["completed"] = !memory_scanner::g_state.pointer_scanning.load();
+	{
+		std::lock_guard<std::mutex> lk(memory_scanner::g_state.pointer_mutex);
+		result["current_total"] = memory_scanner::g_state.pointer_results.size();
+	}
 	return tool_result_t::ok(result);
 }
 
 static tool_result_t handle_pointer_scan_results(const json& params) {
 	const size_t limit = limit_param(params, 100, 10000);
-	if (params.value("wait", false))
-		wait_for_pointer_idle(clamp_wait_ms(params, 30000));
+	const int wait_ms = clamp_wait_ms(params, 30000);
+	if (params.value("wait", false)) {
+		const bool completed = wait_for_pointer_idle(wait_ms);
+		if (!completed && wait_budget_active(wait_ms)) {
+			json result = pointer_results_json(limit);
+			result["wait_ms"] = wait_ms;
+			diag::log_tagged_fmt("scanner",
+				"mcp pointer_scan_results timeout session=%llu total=%zu scanning=%d wait_ms=%d",
+				static_cast<unsigned long long>(g_active_pointer_session.load(std::memory_order_relaxed)),
+				memory_scanner::g_state.pointer_results.size(),
+				memory_scanner::g_state.pointer_scanning.load() ? 1 : 0,
+				wait_ms);
+			memory_scanner::cancel_pointer_scan();
+			return tool_result_t{false, OBFSTR("Pointer scan did not complete within the wait budget."), result};
+		}
+	}
 	return tool_result_t::ok(pointer_results_json(limit));
 }
 
@@ -1402,7 +1509,9 @@ void register_scanner_tools(mcp_standalone::server_t& srv) {
 		OBFSTR("Start a background pointer scan for static module pointer paths to a dynamic address. Use pointer_scan_results to poll discovered paths."),
 		{{OBFSTR("target_address"), OBFSTR("string"), OBFSTR("Dynamic address to resolve to stable pointer paths"), true},
 		 {OBFSTR("max_depth"), OBFSTR("number"), OBFSTR("Maximum pointer chain depth, 1-7, default 4"), false},
-		 {OBFSTR("max_offset"), OBFSTR("number"), OBFSTR("Maximum pointer offset, default 0x1000"), false}},
+		 {OBFSTR("max_offset"), OBFSTR("number"), OBFSTR("Maximum pointer offset, default 0x1000"), false},
+		 {OBFSTR("range_base"), OBFSTR("string"), OBFSTR("Optional pointer-slot scan range base address"), false},
+		 {OBFSTR("range_size"), OBFSTR("number"), OBFSTR("Optional pointer-slot scan range size in bytes"), false}},
 		handle_pointer_scan_start, false});
 
 	register_compat(srv, {OBFSTR("pointer_scan_results"), OBFSTR("memory_scanner"),
@@ -1515,6 +1624,8 @@ void register_scanner_tools(mcp_standalone::server_t& srv) {
 		{{OBFSTR("address"), OBFSTR("string"), OBFSTR("Target address to find pointers to"), true},
 		 {OBFSTR("max_depth"), OBFSTR("number"), OBFSTR("Maximum pointer chain depth (1-7, default 4)"), false},
 		 {OBFSTR("max_offset"), OBFSTR("number"), OBFSTR("Maximum offset from pointer base (default 0x1000)"), false},
+		 {OBFSTR("range_base"), OBFSTR("string"), OBFSTR("Optional pointer-slot scan range base address"), false},
+		 {OBFSTR("range_size"), OBFSTR("number"), OBFSTR("Optional pointer-slot scan range size in bytes"), false},
 		 {OBFSTR("timeout_ms"), OBFSTR("number"), OBFSTR("Maximum wait time, capped at 30000 ms"), false},
 		 {OBFSTR("allow_partial"), OBFSTR("boolean"), OBFSTR("Return partial results without marking the payload as timed out"), false}},
 		handle_pointer_scan, true});

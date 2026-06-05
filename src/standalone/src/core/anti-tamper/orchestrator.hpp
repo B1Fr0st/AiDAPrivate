@@ -1,11 +1,15 @@
 #pragma once
 
+#include "../runtime/standalone_anti_ai.hpp"
+
 #include <windows.h>
 #include <psapi.h>
 #include <bcrypt.h>
+#include <nmmintrin.h>
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -51,6 +55,7 @@
 #include "standalone_license.hpp"
 #include "../infra/work_queue.hpp"
 #include "../arc/arc.h"
+#include "../runtime/loader_header_invariant.hpp"
 #include "../runtime/reason_ids.hpp"
 #include "dr_check.hpp"
 
@@ -229,6 +234,38 @@ inline uint64_t guard_now_ms()
     return static_cast<uint64_t>(GetTickCount64());
 }
 
+inline uint64_t driver_crc_text_hash_seh(const void* data, size_t len, bool& ok)
+{
+    ok = false;
+    uint64_t h1 = 0xFFFFFFFFULL;
+    uint64_t h2 = 0x85EBCA6BULL;
+    const auto* p = static_cast<const uint8_t*>(data);
+    __try
+    {
+        size_t aligned_end = len & ~7ULL;
+        for (size_t i = 0; i < aligned_end; i += 8)
+        {
+            uint64_t block = 0;
+            memcpy(&block, p + i, sizeof(block));
+            h1 = _mm_crc32_u64(h1, block);
+            h2 = _mm_crc32_u64(h2, block ^ 0xA5A5A5A5A5A5A5A5ULL);
+        }
+        for (size_t i = aligned_end; i < len; ++i)
+        {
+            h1 = _mm_crc32_u8(static_cast<uint32_t>(h1), p[i]);
+            h2 = _mm_crc32_u8(static_cast<uint32_t>(h2), p[i] ^ 0xA5u);
+        }
+        ok = true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        ok = false;
+        h1 = 0;
+        h2 = 0;
+    }
+    return (h1 & 0xFFFFFFFFULL) | ((h2 & 0xFFFFFFFFULL) << 32);
+}
+
 inline bool kernel_adbg_thread_walk_optional_error(DWORD err)
 {
     return err == ERROR_NOT_SUPPORTED || err == ERROR_INVALID_FUNCTION;
@@ -270,6 +307,431 @@ inline bool vm_protect_function(void* func, size_t func_len)
 inline bool start_monitors();
 inline bool verify_integrity_clean_after_worker_degrade(const char* phase);
 
+inline const char* ai_tool_posture_reason(const standalone_anti_ai::combined::threat_report_t& report)
+{
+    using namespace standalone_anti_ai;
+    if ((report.high_risk_mask & (category_foreign_write_handle | category_foreign_vm_operation | category_foreign_create_thread)) != 0)
+        return "ai_tool_posture_foreign_handle";
+    if ((report.high_risk_mask & category_targets_aida) != 0)
+        return "ai_tool_posture_targeting_aida";
+    if ((report.high_risk_mask & (category_re_tool | category_debugger_tool | category_dump_tool)) != 0)
+        return "ai_tool_posture_re_tool";
+    if ((report.high_risk_mask & category_memory_scanner) != 0)
+        return "ai_tool_posture_memory_scanner";
+    if ((report.high_risk_mask & category_offensive_mcp_tool) != 0)
+        return "ai_tool_posture_mcp_offensive_tools";
+    if ((report.high_risk_mask & (category_mcp_pipe | category_mcp_process | category_mcp_port | category_mcp_command_server)) != 0)
+        return "ai_tool_posture_mcp_bridge";
+    return "ai_tool_posture_untrusted";
+}
+
+inline bool ai_tool_posture_full_test_observed_only(uint32_t high_risk_mask)
+{
+    using namespace standalone_anti_ai;
+    constexpr uint32_t observed_mask =
+        category_mcp_pipe |
+        category_mcp_process |
+        category_mcp_port |
+        category_mcp_command_server |
+        category_local_llm |
+        category_ai_coding_tool |
+        category_clipboard_monitor;
+    return high_risk_mask != 0 && (high_risk_mask & ~observed_mask) == 0;
+}
+
+inline bool enforce_ai_tool_posture(const char* phase, bool runtime)
+{
+    auto& rt = state::get();
+    const char* phase_name = phase ? phase : "unknown";
+    const char* log_tag = runtime ? "guard" : "init";
+    static std::atomic<uint64_t> s_last_runtime_scan_ms{0};
+    if (runtime)
+    {
+        uint64_t now_ms = static_cast<uint64_t>(GetTickCount64());
+        uint64_t last_ms = s_last_runtime_scan_ms.load(std::memory_order_relaxed);
+        if (last_ms != 0 && now_ms - last_ms < 5000ULL)
+            return true;
+        s_last_runtime_scan_ms.store(now_ms, std::memory_order_relaxed);
+    }
+    uint64_t scan_tick = GetTickCount64();
+    webhook::write_log_critical_fmt(log_tag,
+        "ai_tool_posture_scan_pre phase=%s pid=%lu tid=%lu tick=%llu runtime=%d full_test=%u",
+        phase_name,
+        GetCurrentProcessId(),
+        GetCurrentThreadId(),
+        static_cast<unsigned long long>(scan_tick),
+        runtime ? 1 : 0,
+        rt.full_test_running.load(std::memory_order_acquire) ? 1u : 0u);
+    auto report = standalone_anti_ai::full_scan();
+    webhook::write_log_critical_fmt(log_tag,
+        "ai_tool_posture_scan_post phase=%s category_mask=0x%08X high_risk_mask=0x%08X high_risk_count=%u evidence_count=%u evidence_hash=0x%016llX summary_hash=0x%016llX elapsed_ms=%llu summary=%s",
+        phase_name,
+        report.category_mask,
+        report.high_risk_mask,
+        report.high_risk_count,
+        report.evidence_count,
+        static_cast<unsigned long long>(report.evidence_hash),
+        static_cast<unsigned long long>(report.summary_hash),
+        static_cast<unsigned long long>(GetTickCount64() - scan_tick),
+        report.summary.c_str());
+    if (!report.confirmed_high_risk())
+        return true;
+    if (rt.full_test_running.load(std::memory_order_acquire) &&
+        ai_tool_posture_full_test_observed_only(report.high_risk_mask))
+    {
+        webhook::write_log_critical_fmt(log_tag,
+            "ai_tool_posture_full_test_observed phase=%s category_mask=0x%08X high_risk_mask=0x%08X high_risk_count=%u summary_hash=0x%016llX",
+            phase_name,
+            report.category_mask,
+            report.high_risk_mask,
+            report.high_risk_count,
+            static_cast<unsigned long long>(report.summary_hash));
+        return true;
+    }
+    char detail[640];
+    _snprintf_s(detail, sizeof(detail), _TRUNCATE,
+        "phase=%s category_mask=0x%08X high_risk_mask=0x%08X high_risk_count=%u evidence_count=%u evidence_hash=0x%016llX summary_hash=0x%016llX summary=%s",
+        phase_name,
+        report.category_mask,
+        report.high_risk_mask,
+        report.high_risk_count,
+        report.evidence_count,
+        static_cast<unsigned long long>(report.evidence_hash),
+        static_cast<unsigned long long>(report.summary_hash),
+        report.summary.c_str());
+    const char* reason = ai_tool_posture_reason(report);
+    webhook::send_debug_log(log_tag, detail, true);
+    enforce_violation_id(aida::reason_ids::reason_id_from_string(reason), detail);
+    return false;
+}
+
+inline bool ensure_driver_hardening(const char* phase)
+{
+    auto& rt = state::get();
+    const char* phase_name = phase ? phase : "unknown";
+    if (rt.driver_hardening_done.load(std::memory_order_acquire))
+    {
+        webhook::write_log_critical_fmt("init",
+            "driver_hardening_already_done phase=%s",
+            phase_name);
+        return true;
+    }
+    if (!driver_bridge::is_loaded() || !driver_bridge::using_kernel_driver())
+    {
+        webhook::write_log_critical_fmt("init",
+            "driver_hardening_driver_unavailable phase=%s loaded=%d kernel=%d",
+            phase_name,
+            driver_bridge::is_loaded() ? 1 : 0,
+            driver_bridge::using_kernel_driver() ? 1 : 0);
+        return false;
+    }
+    driver_bridge::dynamic_ioctl_state_t dyn = driver_bridge::dynamic_ioctl_state();
+    if (!dyn.ready)
+    {
+        const bool runtime_authorized = standalone_license::is_valid() || standalone_license::is_arc_loaded();
+        webhook::write_log_critical_fmt("init",
+            "driver_hardening_deferred_dynamic_ioctl_not_ready phase=%s runtime_authorized=%d loaded=%d kernel=%d connected=%d inst_seed=%u/%u global_seed=%u/%u ioctl_seed_hash=0x%08X hb_ioctl_seed_hash=0x%08X",
+            phase_name,
+            runtime_authorized ? 1 : 0,
+            dyn.loaded ? 1 : 0,
+            dyn.kernel ? 1 : 0,
+            dyn.connected ? 1 : 0,
+            dyn.instance_server_seed,
+            dyn.instance_ioctl_seed,
+            dyn.global_server_seed,
+            dyn.global_ioctl_seed,
+            dyn.ioctl_seed_hash,
+            dyn.heartbeat_ioctl_seed_hash);
+        if (!runtime_authorized)
+            return true;
+        webhook::send_debug_log("init", "driver_hardening_dynamic_ioctl_not_ready_after_auth", true);
+        enforce_violation_id(aida::reason_ids::reason_id_from_string("driver_hardening_dynamic_ioctl_not_ready_after_auth"), "driver_hardening_dynamic_ioctl_not_ready_after_auth");
+        return false;
+    }
+    if (rt.code_snap.module_base == 0 || rt.code_snap.text_base == 0 ||
+        rt.code_snap.text_size == 0 || rt.code_snap.text_hash == 0)
+    {
+        uint64_t snap_tick = GetTickCount64();
+        webhook::write_log_critical_fmt("init",
+            "driver_hardening_snapshot_pre phase=%s pid=%lu tid=%lu tick=%llu",
+            phase_name,
+            GetCurrentProcessId(),
+            GetCurrentThreadId(),
+            static_cast<unsigned long long>(snap_tick));
+        bool snap_ok = integrity::snapshot_code(rt.code_snap);
+        webhook::write_log_critical_fmt("init",
+            "driver_hardening_snapshot_post phase=%s ok=%d elapsed_ms=%llu base=0x%llX text=0x%llX size=0x%X hash=0x%016llX",
+            phase_name,
+            snap_ok ? 1 : 0,
+            static_cast<unsigned long long>(GetTickCount64() - snap_tick),
+            static_cast<unsigned long long>(rt.code_snap.module_base),
+            static_cast<unsigned long long>(rt.code_snap.text_base),
+            rt.code_snap.text_size,
+            static_cast<unsigned long long>(rt.code_snap.text_hash));
+        if (!snap_ok || rt.code_snap.module_base == 0 || rt.code_snap.text_base == 0 ||
+            rt.code_snap.text_size == 0 || rt.code_snap.text_hash == 0)
+        {
+            webhook::send_debug_log("init", "driver_hardening_snapshot_failed", true);
+            enforce_violation_id(aida::reason_ids::reason_id_from_string("driver_hardening_snapshot_failed"), "driver_hardening_snapshot_failed");
+            return false;
+        }
+    }
+
+    {
+        uint64_t snap_tick = GetTickCount64();
+        uint64_t prior_base = rt.code_snap.text_base;
+        uint32_t prior_size = rt.code_snap.text_size;
+        uint64_t prior_hash = rt.code_snap.text_hash;
+        webhook::write_log_critical_fmt("init",
+            "driver_hardening_preregister_snapshot_pre phase=%s pid=%lu tid=%lu tick=%llu prior_hash=0x%016llX",
+            phase_name,
+            GetCurrentProcessId(),
+            GetCurrentThreadId(),
+            static_cast<unsigned long long>(snap_tick),
+            static_cast<unsigned long long>(prior_hash));
+        state::code_snapshot_t refreshed_snap = rt.code_snap;
+        bool snap_ok = integrity::snapshot_code(refreshed_snap);
+        const bool snap_changed =
+            refreshed_snap.text_base != prior_base ||
+            refreshed_snap.text_size != prior_size ||
+            refreshed_snap.text_hash != prior_hash;
+        webhook::write_log_critical_fmt("init",
+            "driver_hardening_preregister_snapshot_post phase=%s ok=%d elapsed_ms=%llu base=0x%llX text=0x%llX size=0x%X app_hash=0x%016llX prior_hash=0x%016llX changed=%d",
+            phase_name,
+            snap_ok ? 1 : 0,
+            static_cast<unsigned long long>(GetTickCount64() - snap_tick),
+            static_cast<unsigned long long>(refreshed_snap.module_base),
+            static_cast<unsigned long long>(refreshed_snap.text_base),
+            refreshed_snap.text_size,
+            static_cast<unsigned long long>(refreshed_snap.text_hash),
+            static_cast<unsigned long long>(prior_hash),
+            snap_changed ? 1 : 0);
+        if (!snap_ok || refreshed_snap.module_base == 0 || refreshed_snap.text_base == 0 ||
+            refreshed_snap.text_size == 0 || refreshed_snap.text_hash == 0)
+        {
+            webhook::send_debug_log("init", "driver_hardening_preregister_snapshot_failed", true);
+            enforce_violation_id(aida::reason_ids::reason_id_from_string("driver_hardening_preregister_snapshot_failed"), "driver_hardening_preregister_snapshot_failed");
+            return false;
+        }
+        if (snap_changed || rt.block_chain.empty())
+        {
+            uint64_t chain_tick = GetTickCount64();
+            std::vector<state::block_hash_t> refreshed_chain;
+            bool chain_ok = integrity::build_block_chain(refreshed_snap, refreshed_chain);
+            webhook::write_log_critical_fmt("init",
+                "driver_hardening_preregister_block_chain_refresh_post phase=%s ok=%d changed=%d blocks=%zu elapsed_ms=%llu",
+                phase_name,
+                chain_ok ? 1 : 0,
+                snap_changed ? 1 : 0,
+                refreshed_chain.size(),
+                static_cast<unsigned long long>(GetTickCount64() - chain_tick));
+            if (!chain_ok)
+            {
+                webhook::send_debug_log("init", "driver_hardening_preregister_block_chain_refresh_failed", true);
+                enforce_violation_id(aida::reason_ids::reason_id_from_string("driver_hardening_preregister_block_chain_refresh_failed"), "driver_hardening_preregister_block_chain_refresh_failed");
+                return false;
+            }
+            std::lock_guard<std::mutex> lk(rt.mtx);
+            rt.code_snap = refreshed_snap;
+            rt.block_chain.swap(refreshed_chain);
+        }
+        else
+        {
+            std::lock_guard<std::mutex> lk(rt.mtx);
+            rt.code_snap = refreshed_snap;
+        }
+    }
+
+    bool driver_hash_ok = false;
+    uint64_t driver_expected_hash = driver_crc_text_hash_seh(
+        reinterpret_cast<const void*>(rt.code_snap.text_base),
+        rt.code_snap.text_size,
+        driver_hash_ok);
+    webhook::write_log_critical_fmt("init",
+        "driver_hardening_driver_hash phase=%s ok=%d app_hash=0x%016llX driver_hash=0x%016llX text=0x%llX size=0x%X",
+        phase_name,
+        driver_hash_ok ? 1 : 0,
+        static_cast<unsigned long long>(rt.code_snap.text_hash),
+        static_cast<unsigned long long>(driver_expected_hash),
+        static_cast<unsigned long long>(rt.code_snap.text_base),
+        rt.code_snap.text_size);
+    if (!driver_hash_ok || driver_expected_hash == 0)
+    {
+        webhook::send_debug_log("init", "driver_hardening_driver_hash_failed", true);
+        enforce_violation_id(aida::reason_ids::reason_id_from_string("driver_hardening_driver_hash_failed"), "driver_hardening_driver_hash_failed");
+        return false;
+    }
+
+    webhook::write_log_critical_fmt("init",
+        "driver_bridge_register_self_dll_protection_pre phase=%s pid=%lu tid=%lu base=0x%llX text=0x%llX size=0x%X hash=0x%016llX app_hash=0x%016llX hash_algo=driver_crc32c",
+        phase_name,
+        GetCurrentProcessId(),
+        GetCurrentThreadId(),
+        static_cast<unsigned long long>(rt.code_snap.module_base),
+        static_cast<unsigned long long>(rt.code_snap.text_base),
+        rt.code_snap.text_size,
+        static_cast<unsigned long long>(driver_expected_hash),
+        static_cast<unsigned long long>(rt.code_snap.text_hash));
+    SetLastError(ERROR_SUCCESS);
+    uint64_t dll_protect_tick = GetTickCount64();
+    bool dll_protect_ok = driver_bridge::register_self_dll_protection(
+        rt.code_snap.module_base,
+        rt.code_snap.text_base,
+        rt.code_snap.text_size,
+        driver_expected_hash,
+        2000
+    );
+    DWORD dll_protect_err = dll_protect_ok ? ERROR_SUCCESS : GetLastError();
+    webhook::write_log_critical_fmt("init",
+        "driver_bridge_register_self_dll_protection_post phase=%s ok=%d err=%lu elapsed_ms=%llu",
+        phase_name,
+        dll_protect_ok ? 1 : 0,
+        static_cast<unsigned long>(dll_protect_err),
+        static_cast<unsigned long long>(GetTickCount64() - dll_protect_tick));
+    if (!dll_protect_ok && dll_protect_err != ERROR_ALREADY_EXISTS && dll_protect_err != 183ul)
+    {
+        char detail[256];
+        _snprintf_s(detail, sizeof(detail), _TRUNCATE,
+            "driver_bridge_register_self_dll_protection_failed phase=%s err=%lu base=0x%llX text=0x%llX size=0x%X hash=0x%016llX app_hash=0x%016llX",
+            phase_name,
+            static_cast<unsigned long>(dll_protect_err),
+            static_cast<unsigned long long>(rt.code_snap.module_base),
+            static_cast<unsigned long long>(rt.code_snap.text_base),
+            rt.code_snap.text_size,
+            static_cast<unsigned long long>(driver_expected_hash),
+            static_cast<unsigned long long>(rt.code_snap.text_hash));
+        webhook::send_debug_log("init", detail, true);
+        enforce_violation_id(aida::reason_ids::reason_id_from_string("driver_bridge_register_dll_protection_failed"), detail);
+        return false;
+    }
+    if (!dll_protect_ok)
+        webhook::write_log("init", "driver_bridge_register_self_dll_protection_already_registered");
+    webhook::write_log("init", "driver_bridge_ok");
+
+    uint32_t self_pid = GetCurrentProcessId();
+
+    SetLastError(ERROR_SUCCESS);
+    uint64_t clear_dr_tick = GetTickCount64();
+    webhook::write_log_critical_fmt("init", "kernel_clear_dr_pre phase=%s pid=%lu tid=%lu tick=%llu", phase_name, static_cast<unsigned long>(self_pid), GetCurrentThreadId(), static_cast<unsigned long long>(clear_dr_tick));
+    bool clear_dr_ok = driver_bridge::kernel_anti_debug_clear_dr();
+    DWORD clear_dr_err = clear_dr_ok ? ERROR_SUCCESS : GetLastError();
+    webhook::write_log_critical_fmt("init",
+        "kernel_clear_dr_post phase=%s ok=%d err=%lu elapsed_ms=%llu",
+        phase_name,
+        clear_dr_ok ? 1 : 0,
+        static_cast<unsigned long>(clear_dr_err),
+        static_cast<unsigned long long>(GetTickCount64() - clear_dr_tick));
+    SetLastError(ERROR_SUCCESS);
+    uint64_t clear_proc_tick = GetTickCount64();
+    webhook::write_log_critical_fmt("init", "kernel_clear_process_dr_pre phase=%s pid=%lu tid=%lu tick=%llu", phase_name, static_cast<unsigned long>(self_pid), GetCurrentThreadId(), static_cast<unsigned long long>(clear_proc_tick));
+    bool clear_proc_ok = driver_bridge::kernel_anti_debug_clear_process_dr(self_pid);
+    DWORD clear_proc_err = clear_proc_ok ? ERROR_SUCCESS : GetLastError();
+    webhook::write_log_critical_fmt("init",
+        "kernel_clear_process_dr_post phase=%s ok=%d err=%lu elapsed_ms=%llu",
+        phase_name,
+        clear_proc_ok ? 1 : 0,
+        static_cast<unsigned long>(clear_proc_err),
+        static_cast<unsigned long long>(GetTickCount64() - clear_proc_tick));
+    bool clear_proc_required = clear_proc_ok || !kernel_adbg_thread_walk_optional_error(clear_proc_err);
+    SetLastError(ERROR_SUCCESS);
+    uint64_t hide_threads_tick = GetTickCount64();
+    webhook::write_log_critical_fmt("init", "kernel_hide_all_threads_pre phase=%s pid=%lu tid=%lu tick=%llu", phase_name, static_cast<unsigned long>(self_pid), GetCurrentThreadId(), static_cast<unsigned long long>(hide_threads_tick));
+    bool hide_threads_ok = driver_bridge::kernel_anti_debug_hide_all_threads(self_pid);
+    DWORD hide_threads_err = hide_threads_ok ? ERROR_SUCCESS : GetLastError();
+    webhook::write_log_critical_fmt("init",
+        "kernel_hide_all_threads_post phase=%s ok=%d err=%lu elapsed_ms=%llu",
+        phase_name,
+        hide_threads_ok ? 1 : 0,
+        static_cast<unsigned long>(hide_threads_err),
+        static_cast<unsigned long long>(GetTickCount64() - hide_threads_tick));
+    bool hide_threads_required = hide_threads_ok || !kernel_adbg_thread_walk_optional_error(hide_threads_err);
+    if (!clear_proc_ok && !clear_proc_required)
+    {
+        webhook::write_log_critical_fmt("init",
+            "kernel_clear_process_dr_optional_unsupported phase=%s err=%lu pid=%lu",
+            phase_name,
+            static_cast<unsigned long>(clear_proc_err),
+            static_cast<unsigned long>(self_pid));
+    }
+    if (!hide_threads_ok && !hide_threads_required)
+    {
+        webhook::write_log_critical_fmt("init",
+            "kernel_hide_all_threads_optional_unsupported phase=%s err=%lu pid=%lu",
+            phase_name,
+            static_cast<unsigned long>(hide_threads_err),
+            static_cast<unsigned long>(self_pid));
+    }
+    bool kernel_adbg_ok = clear_dr_ok && (clear_proc_ok || !clear_proc_required) &&
+        (hide_threads_ok || !hide_threads_required);
+    {
+        char dbg[384];
+        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+            "kernel_anti_debug_ops phase=%s clear_dr=%d err=%lu clear_process_dr=%d err=%lu clear_process_required=%d hide_all_threads=%d err=%lu hide_required=%d pid=%lu",
+            phase_name,
+            clear_dr_ok ? 1 : 0,
+            static_cast<unsigned long>(clear_dr_err),
+            clear_proc_ok ? 1 : 0,
+            static_cast<unsigned long>(clear_proc_err),
+            clear_proc_required ? 1 : 0,
+            hide_threads_ok ? 1 : 0,
+            static_cast<unsigned long>(hide_threads_err),
+            hide_threads_required ? 1 : 0,
+            static_cast<unsigned long>(self_pid));
+        webhook::write_log("init", dbg);
+    }
+    if (!kernel_adbg_ok)
+    {
+        webhook::send_debug_log("init", "kernel_anti_debug_required_op_failed", true);
+        enforce_violation_id(aida::reason_ids::reason_id_kernel_debugger_at_startup, "kernel_anti_debug_required_op_failed");
+        return false;
+    }
+    webhook::write_log("init", "kernel_anti_debug_ok");
+
+    uint64_t debugger_pid = 0;
+    SetLastError(ERROR_SUCCESS);
+    uint64_t scan_tick = GetTickCount64();
+    webhook::write_log_critical_fmt("init", "kernel_debugger_scan_pre phase=%s pid=%lu tid=%lu tick=%llu", phase_name, static_cast<unsigned long>(self_pid), GetCurrentThreadId(), static_cast<unsigned long long>(scan_tick));
+    bool scan_ok = driver_bridge::kernel_anti_debug_scan_debuggers(&debugger_pid);
+    DWORD scan_err = scan_ok ? ERROR_SUCCESS : GetLastError();
+    webhook::write_log_critical_fmt("init",
+        "kernel_debugger_scan_post phase=%s ok=%d err=%lu debugger_pid=%llu elapsed_ms=%llu",
+        phase_name,
+        scan_ok ? 1 : 0,
+        static_cast<unsigned long>(scan_err),
+        static_cast<unsigned long long>(debugger_pid),
+        static_cast<unsigned long long>(GetTickCount64() - scan_tick));
+    {
+        char dbg[160];
+        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+            "kernel_debugger_scan_result phase=%s ok=%d err=%lu debugger_pid=%llu",
+            phase_name,
+            scan_ok ? 1 : 0,
+            static_cast<unsigned long>(scan_err),
+            static_cast<unsigned long long>(debugger_pid));
+        webhook::write_log("init", dbg);
+    }
+    if (!scan_ok)
+    {
+        webhook::send_debug_log("init", "kernel_debugger_scan_required_op_failed", true);
+        enforce_violation_id(aida::reason_ids::reason_id_kernel_debugger_at_startup, "kernel_debugger_scan_required_op_failed");
+        return false;
+    }
+    if (debugger_pid != 0)
+    {
+        webhook::send_debug_log("init", "kernel_debugger_detected_pid_" + std::to_string(debugger_pid), true);
+        enforce_violation_id(aida::reason_ids::reason_id_kernel_debugger_at_startup);
+        return false;
+    }
+    webhook::write_log("init", "kernel_debugger_scan_ok");
+
+    rt.driver_hardening_done.store(true, std::memory_order_release);
+    webhook::write_log_critical_fmt("init",
+        "driver_hardening_done phase=%s pid=%lu",
+        phase_name,
+        static_cast<unsigned long>(self_pid));
+    return true;
+}
+
 inline bool initialize()
 {
     webhook::write_log("init", "initialize_ENTRY before state::get");
@@ -278,7 +740,13 @@ inline bool initialize()
     auto& rt = state::get();
     webhook::write_log("init", "initialize_state_get_OK");
 
-    if (rt.initialized.load()) {
+    if (rt.initialized.load(std::memory_order_acquire)) {
+        if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver() &&
+            !rt.driver_hardening_done.load(std::memory_order_acquire))
+        {
+            webhook::write_log("init", "initialize_already_initialized_driver_hardening_retry");
+            return ensure_driver_hardening("initialize_retry");
+        }
         webhook::write_log("init", "initialize_already_initialized_returning_true");
         return true;
     }
@@ -310,10 +778,17 @@ inline bool initialize()
         GetCurrentProcessId(),
         GetCurrentThreadId(),
         static_cast<unsigned long long>(syscall_tick));
-    syscall::initialize();
+    bool syscall_ok = syscall::initialize();
     webhook::write_log_critical_fmt("init",
-        "syscall_initialize_post elapsed_ms=%llu",
+        "syscall_initialize_post ok=%d elapsed_ms=%llu",
+        syscall_ok ? 1 : 0,
         static_cast<unsigned long long>(GetTickCount64() - syscall_tick));
+    if (!syscall_ok)
+    {
+        webhook::send_debug_log("init", "syscall_initialize_failed", true);
+        enforce_violation_id(aida::reason_ids::reason_id_from_string("syscall_initialize_failed"), "syscall_initialize_failed");
+        return false;
+    }
     webhook::write_log("init", "syscall_ok");
 
     if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver())
@@ -684,6 +1159,12 @@ inline bool initialize()
     webhook::write_log_critical("init", "anti_hook_ok_log_pre");
     webhook::write_log("init", "anti_hook_ok");
     webhook::write_log_critical("init", "anti_hook_ok_log_post");
+
+    if (!enforce_ai_tool_posture("startup", false))
+        return false;
+    webhook::write_log_critical("init", "ai_tool_posture_ok_log_pre");
+    webhook::write_log("init", "ai_tool_posture_ok");
+    webhook::write_log_critical("init", "ai_tool_posture_ok_log_post");
 
     {
         uint64_t anti_vm_tick = GetTickCount64();
@@ -1092,139 +1573,8 @@ inline bool initialize()
 
     if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver())
     {
-        webhook::write_log_critical_fmt("init",
-            "driver_bridge_registering pid=%lu tid=%lu base=0x%llX text=0x%llX size=0x%X hash=0x%016llX",
-            GetCurrentProcessId(),
-            GetCurrentThreadId(),
-            static_cast<unsigned long long>(rt.code_snap.module_base),
-            static_cast<unsigned long long>(rt.code_snap.text_base),
-            rt.code_snap.text_size,
-            static_cast<unsigned long long>(rt.code_snap.text_hash));
-        SetLastError(ERROR_SUCCESS);
-        uint64_t dll_protect_tick = GetTickCount64();
-        bool dll_protect_ok = driver_bridge::register_dll_protection(
-            rt.code_snap.module_base,
-            rt.code_snap.text_base,
-            rt.code_snap.text_size,
-            rt.code_snap.text_hash,
-            2000
-        );
-        DWORD dll_protect_err = dll_protect_ok ? ERROR_SUCCESS : GetLastError();
-        webhook::write_log_critical_fmt("init",
-            "driver_bridge_register_dll_protection_post ok=%d err=%lu elapsed_ms=%llu",
-            dll_protect_ok ? 1 : 0,
-            static_cast<unsigned long>(dll_protect_err),
-            static_cast<unsigned long long>(GetTickCount64() - dll_protect_tick));
-        webhook::write_log("init", "driver_bridge_ok");
-
-        uint32_t self_pid = GetCurrentProcessId();
-
-        SetLastError(ERROR_SUCCESS);
-        uint64_t clear_dr_tick = GetTickCount64();
-        webhook::write_log_critical_fmt("init", "kernel_clear_dr_pre pid=%lu tid=%lu tick=%llu", self_pid, GetCurrentThreadId(), static_cast<unsigned long long>(clear_dr_tick));
-        bool clear_dr_ok = driver_bridge::kernel_anti_debug_clear_dr();
-        DWORD clear_dr_err = clear_dr_ok ? ERROR_SUCCESS : GetLastError();
-        webhook::write_log_critical_fmt("init",
-            "kernel_clear_dr_post ok=%d err=%lu elapsed_ms=%llu",
-            clear_dr_ok ? 1 : 0,
-            static_cast<unsigned long>(clear_dr_err),
-            static_cast<unsigned long long>(GetTickCount64() - clear_dr_tick));
-        SetLastError(ERROR_SUCCESS);
-        uint64_t clear_proc_tick = GetTickCount64();
-        webhook::write_log_critical_fmt("init", "kernel_clear_process_dr_pre pid=%lu tid=%lu tick=%llu", self_pid, GetCurrentThreadId(), static_cast<unsigned long long>(clear_proc_tick));
-        bool clear_proc_ok = driver_bridge::kernel_anti_debug_clear_process_dr(self_pid);
-        DWORD clear_proc_err = clear_proc_ok ? ERROR_SUCCESS : GetLastError();
-        webhook::write_log_critical_fmt("init",
-            "kernel_clear_process_dr_post ok=%d err=%lu elapsed_ms=%llu",
-            clear_proc_ok ? 1 : 0,
-            static_cast<unsigned long>(clear_proc_err),
-            static_cast<unsigned long long>(GetTickCount64() - clear_proc_tick));
-        bool clear_proc_required = clear_proc_ok || !kernel_adbg_thread_walk_optional_error(clear_proc_err);
-        SetLastError(ERROR_SUCCESS);
-        uint64_t hide_threads_tick = GetTickCount64();
-        webhook::write_log_critical_fmt("init", "kernel_hide_all_threads_pre pid=%lu tid=%lu tick=%llu", self_pid, GetCurrentThreadId(), static_cast<unsigned long long>(hide_threads_tick));
-        bool hide_threads_ok = driver_bridge::kernel_anti_debug_hide_all_threads(self_pid);
-        DWORD hide_threads_err = hide_threads_ok ? ERROR_SUCCESS : GetLastError();
-        webhook::write_log_critical_fmt("init",
-            "kernel_hide_all_threads_post ok=%d err=%lu elapsed_ms=%llu",
-            hide_threads_ok ? 1 : 0,
-            static_cast<unsigned long>(hide_threads_err),
-            static_cast<unsigned long long>(GetTickCount64() - hide_threads_tick));
-        bool hide_threads_required = hide_threads_ok || !kernel_adbg_thread_walk_optional_error(hide_threads_err);
-        if (!clear_proc_ok && !clear_proc_required)
-        {
-            webhook::write_log_critical_fmt("init",
-                "kernel_clear_process_dr_optional_unsupported err=%lu pid=%lu",
-                static_cast<unsigned long>(clear_proc_err),
-                static_cast<unsigned long>(self_pid));
-        }
-        if (!hide_threads_ok && !hide_threads_required)
-        {
-            webhook::write_log_critical_fmt("init",
-                "kernel_hide_all_threads_optional_unsupported err=%lu pid=%lu",
-                static_cast<unsigned long>(hide_threads_err),
-                static_cast<unsigned long>(self_pid));
-        }
-        bool kernel_adbg_ok = clear_dr_ok && (clear_proc_ok || !clear_proc_required) &&
-            (hide_threads_ok || !hide_threads_required);
-        {
-            char dbg[320];
-            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                "kernel_anti_debug_ops clear_dr=%d err=%lu clear_process_dr=%d err=%lu clear_process_required=%d hide_all_threads=%d err=%lu hide_required=%d pid=%lu",
-                clear_dr_ok ? 1 : 0,
-                static_cast<unsigned long>(clear_dr_err),
-                clear_proc_ok ? 1 : 0,
-                static_cast<unsigned long>(clear_proc_err),
-                clear_proc_required ? 1 : 0,
-                hide_threads_ok ? 1 : 0,
-                static_cast<unsigned long>(hide_threads_err),
-                hide_threads_required ? 1 : 0,
-                static_cast<unsigned long>(self_pid));
-            webhook::write_log("init", dbg);
-        }
-        if (!kernel_adbg_ok)
-        {
-            webhook::send_debug_log("init", "kernel_anti_debug_required_op_failed", true);
-            enforce_violation_id(aida::reason_ids::reason_id_kernel_debugger_at_startup, "kernel_anti_debug_required_op_failed");
+        if (!ensure_driver_hardening("initialize"))
             return false;
-        }
-        webhook::write_log("init", "kernel_anti_debug_ok");
-
-
-        uint64_t debugger_pid = 0;
-        SetLastError(ERROR_SUCCESS);
-        uint64_t scan_tick = GetTickCount64();
-        webhook::write_log_critical_fmt("init", "kernel_debugger_scan_pre pid=%lu tid=%lu tick=%llu", self_pid, GetCurrentThreadId(), static_cast<unsigned long long>(scan_tick));
-        bool scan_ok = driver_bridge::kernel_anti_debug_scan_debuggers(&debugger_pid);
-        DWORD scan_err = scan_ok ? ERROR_SUCCESS : GetLastError();
-        webhook::write_log_critical_fmt("init",
-            "kernel_debugger_scan_post ok=%d err=%lu debugger_pid=%llu elapsed_ms=%llu",
-            scan_ok ? 1 : 0,
-            static_cast<unsigned long>(scan_err),
-            static_cast<unsigned long long>(debugger_pid),
-            static_cast<unsigned long long>(GetTickCount64() - scan_tick));
-        {
-            char dbg[128];
-            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                "kernel_debugger_scan_result ok=%d err=%lu debugger_pid=%llu",
-                scan_ok ? 1 : 0,
-                static_cast<unsigned long>(scan_err),
-                static_cast<unsigned long long>(debugger_pid));
-            webhook::write_log("init", dbg);
-        }
-        if (!scan_ok)
-        {
-            webhook::send_debug_log("init", "kernel_debugger_scan_required_op_failed", true);
-            enforce_violation_id(aida::reason_ids::reason_id_kernel_debugger_at_startup, "kernel_debugger_scan_required_op_failed");
-            return false;
-        }
-        if (debugger_pid != 0)
-        {
-            webhook::send_debug_log("init", "kernel_debugger_detected_pid_" + std::to_string(debugger_pid), true);
-            enforce_violation_id(aida::reason_ids::reason_id_kernel_debugger_at_startup);
-            return false;
-        }
-        webhook::write_log("init", "kernel_debugger_scan_ok");
     }
     else
     {
@@ -1238,11 +1588,6 @@ inline bool initialize()
     anti_debug::hide_thread_from_debugger(GetCurrentThread());
     webhook::write_log_critical("init", "hide_thread_post");
     webhook::write_log("init", "hide_thread_ok");
-
-    webhook::write_log_critical("init", "initialized_store_pre");
-    rt.initialized.store(true);
-    webhook::write_log_critical("init", "initialized_store_post");
-    webhook::write_log("init", "initialized_ok");
 
     webhook::write_log_critical("init", "tpm_attest_state_pre");
     if (anti_tamper::tpm_attest::is_available())
@@ -1418,6 +1763,11 @@ inline bool initialize()
         return false;
     }
 
+
+    webhook::write_log_critical("init", "initialized_store_pre");
+    rt.initialized.store(true, std::memory_order_release);
+    webhook::write_log_critical("init", "initialized_store_post");
+    webhook::write_log("init", "initialized_ok");
 
     webhook::write_log("init", "deferred_anti_dump_until_arc_loaded");
 
@@ -1900,6 +2250,7 @@ inline bool finalize_after_activation()
     }
 
     webhook::write_log_critical("init", "finalize_after_activation_entering");
+    auto loader_header_snapshot = aida::runtime::loader_header_invariant::capture("finalize_after_activation_entering", "init");
 
     {
         std::string missing_exports;
@@ -1928,6 +2279,7 @@ inline bool finalize_after_activation()
             enforce_violation_id(aida::reason_ids::reason_id_from_string("anti_dump_init_failed"), "anti_dump_init_failed");
             return false;
         }
+        aida::runtime::loader_header_invariant::ensure("post_anti_dump_init", "init");
         webhook::write_log_critical("init", "anti_dump_ok");
     }
     catch (const std::exception& ex)
@@ -1952,6 +2304,7 @@ inline bool finalize_after_activation()
             enforce_violation_id(aida::reason_ids::reason_id_from_string("standalone_anti_dump_init_failed"), "standalone_anti_dump_init_failed");
             return false;
         }
+        aida::runtime::loader_header_invariant::ensure("post_standalone_anti_dump_init", "init");
         webhook::write_log_critical("init", "standalone_anti_dump_ok");
     }
     catch (const std::exception& ex)
@@ -1977,6 +2330,7 @@ inline bool finalize_after_activation()
             enforce_violation_id(aida::reason_ids::reason_id_from_string("kernel_anti_dump_failed"), "kernel_anti_dump_failed");
             return false;
         }
+        aida::runtime::loader_header_invariant::ensure("post_kernel_anti_dump_full", "init");
         webhook::write_log_critical("init", "kernel_anti_dump_ok");
 
         webhook::write_log_critical("init", "kernel_anti_dump_start_continuous_entering");
@@ -1986,6 +2340,7 @@ inline bool finalize_after_activation()
             enforce_violation_id(aida::reason_ids::reason_id_from_string("kernel_anti_dump_start_continuous_failed"), "kernel_anti_dump_start_continuous_failed");
             return false;
         }
+        aida::runtime::loader_header_invariant::ensure("post_kernel_anti_dump_continuous", "init");
         webhook::write_log_critical("init", "kernel_anti_dump_start_continuous_ok");
     }
 
@@ -2054,6 +2409,7 @@ inline bool finalize_after_activation()
         return false;
     }
     webhook::write_log_critical("init", "hide_peb_ok");
+    aida::runtime::loader_header_invariant::ensure("post_hide_module", "init");
 
     webhook::write_log_critical("init", "post_finalize_integrity_resnap_entering");
     if (!finalize_post_resnap_seh())
@@ -2064,6 +2420,8 @@ inline bool finalize_after_activation()
     }
 
     rt.activation_hardening_done.store(true, std::memory_order_release);
+    aida::runtime::loader_header_invariant::ensure("finalize_after_activation_done", "init");
+    (void)loader_header_snapshot;
     webhook::write_log_critical("init", "finalize_after_activation_done");
     return true;
 }
@@ -2125,13 +2483,66 @@ inline bool guard()
             enforce_violation_id(aida::reason_ids::reason_id_debugger_runtime, dbg.summary);
             CFF_EXIT(guard_cff);
         }
+        if (!enforce_ai_tool_posture("runtime", true))
+        {
+            CFF_EXIT(guard_cff);
+        }
         CFF_GOTO(guard_cff, 4);
     }
     CFF_STATE(guard_cff, 4)
     {
+        uint64_t anti_hook_tick = GetTickCount64();
+        webhook::write_log_critical_fmt("guard",
+            "anti_hook_runtime_pre verify_counter=%u iat_entries=%zu full_test=%u",
+            rt.verify_counter,
+            rt.iat_snap.size(),
+            rt.full_test_running.load(std::memory_order_acquire) ? 1u : 0u);
         auto hook = anti_hook::full_scan(rt.iat_snap);
+        webhook::write_log_critical_fmt("guard",
+            "anti_hook_runtime_post detected=%d elapsed_ms=%llu iat=%d ntdll=%d k32=%d syscall=%d eat=%d prologue=%d disk=%d veh=%d dr=%d redir=%d summary=%s",
+            hook.any_detected() ? 1 : 0,
+            static_cast<unsigned long long>(GetTickCount64() - anti_hook_tick),
+            hook.iat_modified ? 1 : 0,
+            hook.ntdll_inline_hooked ? 1 : 0,
+            hook.kernel32_inline_hooked ? 1 : 0,
+            hook.syscall_stubs_modified ? 1 : 0,
+            hook.eat_hooked ? 1 : 0,
+            hook.prologue_hash_mismatch ? 1 : 0,
+            hook.disk_image_mismatch ? 1 : 0,
+            hook.veh_chain_tampered ? 1 : 0,
+            hook.dr_in_text_range ? 1 : 0,
+            hook.dispatch_table_redirected ? 1 : 0,
+            hook.summary.c_str());
         if (hook.any_detected())
         {
+            const bool syscall_only =
+                hook.syscall_stubs_modified &&
+                !hook.iat_modified &&
+                !hook.ntdll_inline_hooked &&
+                !hook.kernel32_inline_hooked &&
+                !hook.eat_hooked &&
+                !hook.prologue_hash_mismatch &&
+                !hook.disk_image_mismatch &&
+                !hook.veh_chain_tampered &&
+                !hook.dr_in_text_range &&
+                !hook.dispatch_table_redirected;
+            if (rt.full_test_running.load(std::memory_order_acquire) && syscall_only)
+            {
+                webhook::write_log_critical_fmt("guard",
+                    "anti_hook_runtime_full_test_syscall_only_observed iat=%d ntdll=%d k32=%d syscall=%d eat=%d prologue=%d disk=%d veh=%d dr=%d redir=%d summary=%s",
+                    hook.iat_modified ? 1 : 0,
+                    hook.ntdll_inline_hooked ? 1 : 0,
+                    hook.kernel32_inline_hooked ? 1 : 0,
+                    hook.syscall_stubs_modified ? 1 : 0,
+                    hook.eat_hooked ? 1 : 0,
+                    hook.prologue_hash_mismatch ? 1 : 0,
+                    hook.disk_image_mismatch ? 1 : 0,
+                    hook.veh_chain_tampered ? 1 : 0,
+                    hook.dr_in_text_range ? 1 : 0,
+                    hook.dispatch_table_redirected ? 1 : 0,
+                    hook.summary.c_str());
+                CFF_GOTO(guard_cff, 5);
+            }
             webhook::send_debug_log("guard", "hook_detected: " + hook.summary, true);
             enforce_violation_id(aida::reason_ids::reason_id_hook_runtime, hook.summary);
             CFF_EXIT(guard_cff);
@@ -2252,7 +2663,11 @@ inline bool guard()
     CFF_STATE(guard_cff, 6)
     {
         integrity::block_chain_verify_result_t bc_detail{};
-        bool bc_ok = integrity::verify_block_chain(rt.code_snap, rt.block_chain, &bc_detail);
+        bool bc_ok = false;
+        {
+            std::lock_guard<std::mutex> lk(rt.mtx);
+            bc_ok = integrity::verify_block_chain(rt.code_snap, rt.block_chain, &bc_detail);
+        }
         if (!bc_ok)
         {
             char detail[256];
@@ -2272,7 +2687,12 @@ inline bool guard()
             {
                 Sleep(50);
                 integrity::block_chain_verify_result_t retry_detail{};
-                if (integrity::verify_block_chain(rt.code_snap, rt.block_chain, &retry_detail))
+                bool retry_ok = false;
+                {
+                    std::lock_guard<std::mutex> lk(rt.mtx);
+                    retry_ok = integrity::verify_block_chain(rt.code_snap, rt.block_chain, &retry_detail);
+                }
+                if (retry_ok)
                 {
                     webhook::write_log_critical_fmt("guard", "block_chain_retry_recovered idx=%u", bc_detail.block_index);
                     CFF_GOTO(guard_cff, 7);
@@ -2280,7 +2700,13 @@ inline bool guard()
                 uint32_t eager_page = 0;
                 const bool self_ok = integrity::verify_self_hash();
                 const bool eager_ok = integrity::verify_full_text_eager(&eager_page);
-                if (self_ok && eager_ok && integrity::build_block_chain(rt.code_snap, rt.block_chain))
+                bool rebuild_ok = false;
+                if (self_ok && eager_ok)
+                {
+                    std::lock_guard<std::mutex> lk(rt.mtx);
+                    rebuild_ok = integrity::build_block_chain(rt.code_snap, rt.block_chain);
+                }
+                if (rebuild_ok)
                 {
                     webhook::write_log_critical_fmt("guard",
                         "block_chain_full_test_resnap idx=%u page=%u",
@@ -2342,46 +2768,99 @@ inline bool guard()
         bool drv_kernel = drv_loaded && driver_bridge::using_kernel_driver();
         if (drv_kernel)
         {
-            if (!driver_bridge::kernel_anti_debug_clear_dr())
+            driver_bridge::dynamic_ioctl_state_t dyn = driver_bridge::dynamic_ioctl_state();
+            if (!dyn.ready)
             {
-                webhook::send_debug_log("guard", "kernel_clear_dr_runtime_failed", true);
-                enforce_violation_id(aida::reason_ids::reason_id_kernel_debugger_runtime, "kernel_clear_dr_runtime_failed");
-                CFF_EXIT(guard_cff);
+                const bool runtime_authorized = standalone_license::is_valid() || standalone_license::is_arc_loaded();
+                webhook::write_log_critical_fmt("guard",
+                    "kernel_anti_debug_runtime_deferred_dynamic_ioctl_not_ready runtime_authorized=%d loaded=%d kernel=%d connected=%d inst_seed=%u/%u global_seed=%u/%u ioctl_seed_hash=0x%08X hb_ioctl_seed_hash=0x%08X",
+                    runtime_authorized ? 1 : 0,
+                    dyn.loaded ? 1 : 0,
+                    dyn.kernel ? 1 : 0,
+                    dyn.connected ? 1 : 0,
+                    dyn.instance_server_seed,
+                    dyn.instance_ioctl_seed,
+                    dyn.global_server_seed,
+                    dyn.global_ioctl_seed,
+                    dyn.ioctl_seed_hash,
+                    dyn.heartbeat_ioctl_seed_hash);
+                if (runtime_authorized)
+                {
+                    webhook::send_debug_log("guard", "kernel_anti_debug_dynamic_ioctl_not_ready_after_auth", true);
+                    enforce_violation_id(aida::reason_ids::reason_id_kernel_debugger_runtime, "kernel_anti_debug_dynamic_ioctl_not_ready_after_auth");
+                    CFF_EXIT(guard_cff);
+                }
             }
+            else
+            {
+                const bool runtime_authorized = standalone_license::is_valid() || standalone_license::is_arc_loaded();
+                const bool activation_pending = rt.license_pending_activation.load(std::memory_order_acquire);
 
-            uint64_t debugger_pid = 0;
-            if (!driver_bridge::kernel_anti_debug_scan_debuggers(&debugger_pid))
-            {
-                webhook::send_debug_log("guard", "kernel_debugger_scan_runtime_failed", true);
-                enforce_violation_id(aida::reason_ids::reason_id_kernel_debugger_runtime, "kernel_debugger_scan_runtime_failed");
-                CFF_EXIT(guard_cff);
-            }
-            if (debugger_pid != 0)
-            {
-                webhook::send_debug_log("guard", "kernel_debugger_runtime_" + std::to_string(debugger_pid), true);
-                enforce_violation_id(aida::reason_ids::reason_id_kernel_debugger_runtime);
-                CFF_EXIT(guard_cff);
-            }
+                SetLastError(ERROR_SUCCESS);
+                if (!driver_bridge::kernel_anti_debug_clear_dr())
+                {
+                    DWORD clear_dr_err = GetLastError();
+                    webhook::write_log_critical_fmt("guard",
+                        "kernel_clear_dr_runtime_result ok=0 err=%lu activation_pending=%d runtime_authorized=%d",
+                        static_cast<unsigned long>(clear_dr_err),
+                        activation_pending ? 1 : 0,
+                        runtime_authorized ? 1 : 0);
+                    if (activation_pending && !runtime_authorized)
+                    {
+                        webhook::write_log("guard", "kernel_clear_dr_runtime_deferred_activation_pending");
+                        CFF_GOTO(guard_cff, 9);
+                    }
+                    webhook::send_debug_log("guard", "kernel_clear_dr_runtime_failed", true);
+                    enforce_violation_id(aida::reason_ids::reason_id_kernel_debugger_runtime, "kernel_clear_dr_runtime_failed");
+                    CFF_EXIT(guard_cff);
+                }
 
-            SetLastError(ERROR_SUCCESS);
-            bool clear_proc_runtime_ok = driver_bridge::kernel_anti_debug_clear_process_dr(GetCurrentProcessId());
-            DWORD clear_proc_runtime_err = clear_proc_runtime_ok ? ERROR_SUCCESS : GetLastError();
-            bool clear_proc_runtime_required = clear_proc_runtime_ok || !kernel_adbg_thread_walk_optional_error(clear_proc_runtime_err);
-            webhook::write_log_critical_fmt("guard",
-                "kernel_clear_process_dr_runtime_result ok=%d err=%lu required=%d pid=%lu",
-                clear_proc_runtime_ok ? 1 : 0,
-                static_cast<unsigned long>(clear_proc_runtime_err),
-                clear_proc_runtime_required ? 1 : 0,
-                static_cast<unsigned long>(GetCurrentProcessId()));
-            if (!clear_proc_runtime_ok && clear_proc_runtime_required)
-            {
-                webhook::send_debug_log("guard", "kernel_clear_process_dr_runtime_failed", true);
-                enforce_violation_id(aida::reason_ids::reason_id_kernel_debugger_runtime, "kernel_clear_process_dr_runtime_failed");
-                CFF_EXIT(guard_cff);
-            }
-            if (!clear_proc_runtime_ok)
-            {
-                webhook::write_log("guard", "kernel_clear_process_dr_runtime_degraded_unsupported");
+                uint64_t debugger_pid = 0;
+                SetLastError(ERROR_SUCCESS);
+                if (!driver_bridge::kernel_anti_debug_scan_debuggers(&debugger_pid))
+                {
+                    DWORD scan_err = GetLastError();
+                    webhook::write_log_critical_fmt("guard",
+                        "kernel_debugger_scan_runtime_result ok=0 err=%lu activation_pending=%d runtime_authorized=%d",
+                        static_cast<unsigned long>(scan_err),
+                        activation_pending ? 1 : 0,
+                        runtime_authorized ? 1 : 0);
+                    if (activation_pending && !runtime_authorized)
+                    {
+                        webhook::write_log("guard", "kernel_debugger_scan_runtime_deferred_activation_pending");
+                        CFF_GOTO(guard_cff, 9);
+                    }
+                    webhook::send_debug_log("guard", "kernel_debugger_scan_runtime_failed", true);
+                    enforce_violation_id(aida::reason_ids::reason_id_kernel_debugger_runtime, "kernel_debugger_scan_runtime_failed");
+                    CFF_EXIT(guard_cff);
+                }
+                if (debugger_pid != 0)
+                {
+                    webhook::send_debug_log("guard", "kernel_debugger_runtime_" + std::to_string(debugger_pid), true);
+                    enforce_violation_id(aida::reason_ids::reason_id_kernel_debugger_runtime);
+                    CFF_EXIT(guard_cff);
+                }
+
+                SetLastError(ERROR_SUCCESS);
+                bool clear_proc_runtime_ok = driver_bridge::kernel_anti_debug_clear_process_dr(GetCurrentProcessId());
+                DWORD clear_proc_runtime_err = clear_proc_runtime_ok ? ERROR_SUCCESS : GetLastError();
+                bool clear_proc_runtime_required = clear_proc_runtime_ok || !kernel_adbg_thread_walk_optional_error(clear_proc_runtime_err);
+                webhook::write_log_critical_fmt("guard",
+                    "kernel_clear_process_dr_runtime_result ok=%d err=%lu required=%d pid=%lu",
+                    clear_proc_runtime_ok ? 1 : 0,
+                    static_cast<unsigned long>(clear_proc_runtime_err),
+                    clear_proc_runtime_required ? 1 : 0,
+                    static_cast<unsigned long>(GetCurrentProcessId()));
+                if (!clear_proc_runtime_ok && clear_proc_runtime_required)
+                {
+                    webhook::send_debug_log("guard", "kernel_clear_process_dr_runtime_failed", true);
+                    enforce_violation_id(aida::reason_ids::reason_id_kernel_debugger_runtime, "kernel_clear_process_dr_runtime_failed");
+                    CFF_EXIT(guard_cff);
+                }
+                if (!clear_proc_runtime_ok)
+                {
+                    webhook::write_log("guard", "kernel_clear_process_dr_runtime_degraded_unsupported");
+                }
             }
         }
 
@@ -2434,91 +2913,112 @@ inline bool guard()
 
         if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver())
         {
-            driver_bridge::anti_debug_result_t adbg_result{};
-            if (driver_bridge::kernel_anti_debug_query(adbg_result) &&
-                adbg_result.result_flags != 0)
+            driver_bridge::dynamic_ioctl_state_t dyn = driver_bridge::dynamic_ioctl_state();
+            if (!dyn.ready)
             {
-                auto& rt = state::get();
-                char kflag_buf[32];
-                _snprintf_s(kflag_buf, sizeof(kflag_buf), _TRUNCATE,
-                    "kernel_detection_flags_0x%x", adbg_result.result_flags);
-                webhook::send_debug_log("guard", kflag_buf, true);
-
-                char flag_dbg[128];
-                _snprintf_s(flag_dbg, sizeof(flag_dbg), _TRUNCATE,
-                    "guard_kernel_flags flags=0x%x last=0x%x persist=%u",
-                    adbg_result.result_flags, rt.last_kernel_flags, rt.kernel_flag_persist_count);
-                webhook::write_log("guard", flag_dbg);
-
-                constexpr uint32_t kHardFlags =
-                    0x00000001u |
-                    0x00000008u;
-
-                constexpr uint32_t kSoftFlags =
-                    0x00000002u |
-                    0x00000010u |
-                    0x00000040u;
-
-                constexpr uint64_t kKernelDetectionSettleGraceMs = 3000;
-
-                const uint32_t flags = adbg_result.result_flags;
-                const bool hard_hit  = (flags & kHardFlags) != 0;
-                const bool two_soft  = (flags & kSoftFlags) != 0 &&
-                                       ((flags & kSoftFlags) & ((flags & kSoftFlags) - 1)) != 0;
-
-                uint64_t sentinel_ready_since_tsc = driver_bridge::sentinel_ready_since_tsc();
-                uint64_t now_ms = guard_now_ms();
-                if (sentinel_ready_since_tsc != 0 &&
-                    sentinel_ready_since_tsc != rt.last_sentinel_ready_since_tsc)
-                {
-                    rt.last_sentinel_ready_since_tsc = sentinel_ready_since_tsc;
-                    rt.kernel_flags_settle_start_ms = now_ms;
-                    rt.last_kernel_flags = 0;
-                    rt.kernel_flag_persist_count = 0;
-                    webhook::write_log("guard", "kernel_flag_settle_started");
-                }
-
-                const bool settle_active =
-                    driver_bridge::sentinel_bridge_ready() &&
-                    rt.last_sentinel_ready_since_tsc != 0 &&
-                    (now_ms - rt.kernel_flags_settle_start_ms) < kKernelDetectionSettleGraceMs;
-
-                if (flags == rt.last_kernel_flags && flags != 0) {
-                    rt.kernel_flag_persist_count++;
-                } else {
-                    rt.last_kernel_flags = flags;
-                    rt.kernel_flag_persist_count = 1;
-                }
-
-                const bool persist_hit = (rt.kernel_flag_persist_count >= 3);
-
-                if (settle_active)
-                {
-                    char settle_flag_buf[32];
-                    _snprintf_s(settle_flag_buf, sizeof(settle_flag_buf), _TRUNCATE,
-                        "0x%x", flags);
-                    webhook::send_debug_log("sentinel_settle_flags", settle_flag_buf, true);
-                    char settle_dbg[128];
-                    _snprintf_s(settle_dbg, sizeof(settle_dbg), _TRUNCATE,
-                        "kernel_flag_settle_active flags=0x%x persist=%u",
-                        flags, rt.kernel_flag_persist_count);
-                    webhook::write_log("guard", settle_dbg);
-                    CFF_GOTO(guard_cff, 10);
-                }
-
-                if (hard_hit || two_soft || persist_hit)
-                {
-                    char extra_buf[16];
-                    _snprintf_s(extra_buf, sizeof(extra_buf), _TRUNCATE, "0x%x", flags);
-                    enforce_violation_id(aida::reason_ids::reason_id_kernel_detection_active, extra_buf);
-                    CFF_EXIT(guard_cff);
-                }
+                webhook::write_log_critical_fmt("guard",
+                    "kernel_anti_debug_query_dynamic_ioctl_not_ready_after_auth loaded=%d kernel=%d connected=%d inst_seed=%u/%u global_seed=%u/%u ioctl_seed_hash=0x%08X hb_ioctl_seed_hash=0x%08X",
+                    dyn.loaded ? 1 : 0,
+                    dyn.kernel ? 1 : 0,
+                    dyn.connected ? 1 : 0,
+                    dyn.instance_server_seed,
+                    dyn.instance_ioctl_seed,
+                    dyn.global_server_seed,
+                    dyn.global_ioctl_seed,
+                    dyn.ioctl_seed_hash,
+                    dyn.heartbeat_ioctl_seed_hash);
+                webhook::send_debug_log("guard", "kernel_anti_debug_query_dynamic_ioctl_not_ready_after_auth", true);
+                enforce_violation_id(aida::reason_ids::reason_id_kernel_debugger_runtime, "kernel_anti_debug_query_dynamic_ioctl_not_ready_after_auth");
+                CFF_EXIT(guard_cff);
             }
             else
             {
-                auto& rt = state::get();
-                rt.last_kernel_flags = 0;
-                rt.kernel_flag_persist_count = 0;
+                driver_bridge::anti_debug_result_t adbg_result{};
+                if (driver_bridge::kernel_anti_debug_query(adbg_result) &&
+                    adbg_result.result_flags != 0)
+                {
+                    auto& rt = state::get();
+                    char kflag_buf[32];
+                    _snprintf_s(kflag_buf, sizeof(kflag_buf), _TRUNCATE,
+                        "kernel_detection_flags_0x%x", adbg_result.result_flags);
+                    webhook::send_debug_log("guard", kflag_buf, true);
+
+                    char flag_dbg[128];
+                    _snprintf_s(flag_dbg, sizeof(flag_dbg), _TRUNCATE,
+                        "guard_kernel_flags flags=0x%x last=0x%x persist=%u",
+                        adbg_result.result_flags, rt.last_kernel_flags, rt.kernel_flag_persist_count);
+                    webhook::write_log("guard", flag_dbg);
+
+                    constexpr uint32_t kHardFlags =
+                        0x00000001u |
+                        0x00000008u;
+
+                    constexpr uint32_t kSoftFlags =
+                        0x00000002u |
+                        0x00000010u |
+                        0x00000040u;
+
+                    constexpr uint64_t kKernelDetectionSettleGraceMs = 3000;
+
+                    const uint32_t flags = adbg_result.result_flags;
+                    const bool hard_hit  = (flags & kHardFlags) != 0;
+                    const bool two_soft  = (flags & kSoftFlags) != 0 &&
+                                           ((flags & kSoftFlags) & ((flags & kSoftFlags) - 1)) != 0;
+
+                    uint64_t sentinel_ready_since_tsc = driver_bridge::sentinel_ready_since_tsc();
+                    uint64_t now_ms = guard_now_ms();
+                    if (sentinel_ready_since_tsc != 0 &&
+                        sentinel_ready_since_tsc != rt.last_sentinel_ready_since_tsc)
+                    {
+                        rt.last_sentinel_ready_since_tsc = sentinel_ready_since_tsc;
+                        rt.kernel_flags_settle_start_ms = now_ms;
+                        rt.last_kernel_flags = 0;
+                        rt.kernel_flag_persist_count = 0;
+                        webhook::write_log("guard", "kernel_flag_settle_started");
+                    }
+
+                    const bool settle_active =
+                        driver_bridge::sentinel_bridge_ready() &&
+                        rt.last_sentinel_ready_since_tsc != 0 &&
+                        (now_ms - rt.kernel_flags_settle_start_ms) < kKernelDetectionSettleGraceMs;
+
+                    if (flags == rt.last_kernel_flags && flags != 0) {
+                        rt.kernel_flag_persist_count++;
+                    } else {
+                        rt.last_kernel_flags = flags;
+                        rt.kernel_flag_persist_count = 1;
+                    }
+
+                    const bool persist_hit = (rt.kernel_flag_persist_count >= 3);
+
+                    if (settle_active)
+                    {
+                        char settle_flag_buf[32];
+                        _snprintf_s(settle_flag_buf, sizeof(settle_flag_buf), _TRUNCATE,
+                            "0x%x", flags);
+                        webhook::send_debug_log("sentinel_settle_flags", settle_flag_buf, true);
+                        char settle_dbg[128];
+                        _snprintf_s(settle_dbg, sizeof(settle_dbg), _TRUNCATE,
+                            "kernel_flag_settle_active flags=0x%x persist=%u",
+                            flags, rt.kernel_flag_persist_count);
+                        webhook::write_log("guard", settle_dbg);
+                        CFF_GOTO(guard_cff, 10);
+                    }
+
+                    if (hard_hit || two_soft || persist_hit)
+                    {
+                        char extra_buf[16];
+                        _snprintf_s(extra_buf, sizeof(extra_buf), _TRUNCATE, "0x%x", flags);
+                        enforce_violation_id(aida::reason_ids::reason_id_kernel_detection_active, extra_buf);
+                        CFF_EXIT(guard_cff);
+                    }
+                }
+                else
+                {
+                    auto& rt = state::get();
+                    rt.last_kernel_flags = 0;
+                    rt.kernel_flag_persist_count = 0;
+                }
             }
         }
         CFF_GOTO(guard_cff, 10);
@@ -3065,6 +3565,7 @@ inline void shutdown()
     auto& rt = state::get();
     rt.monitors_running.store(false);
     integrity::periodic::stop();
+    re_detect::shutdown();
     standalone_anti_dump::shutdown();
     server_pages::shutdown();
     nanomites::shutdown();

@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -71,6 +72,32 @@ struct batch_entry_t {
 	ghidra_result_t result;
 };
 
+struct preload_diagnostics_t {
+	uint64_t base = 0;
+	size_t requested_size = 0;
+	size_t first_attempt_bytes = 0;
+	size_t total_read = 0;
+	size_t chunks_ok = 0;
+	size_t chunks_failed = 0;
+	size_t chunks_skipped = 0;
+	size_t query_ok = 0;
+	size_t query_failed = 0;
+	size_t skipped_uncommitted = 0;
+	size_t skipped_guard = 0;
+	size_t skipped_noaccess = 0;
+	uint32_t pe_signature = 0;
+	uint16_t pe_machine = 0;
+	uint16_t pe_sections = 0;
+	uint16_t pe_optional_magic = 0;
+	uint32_t pe_size_of_image = 0;
+	bool whole_read_ok = false;
+	bool whole_read_zero_padding = false;
+	bool chunked_read = false;
+	bool zero_padding = false;
+	bool mz = false;
+	bool pe_header_ok = false;
+};
+
 struct state_t {
 	std::mutex init_mtx;
 	std::atomic<bool> initialized{false};
@@ -99,6 +126,55 @@ inline bool buffer_is_zero_padding(const std::vector<uint8_t>& bytes)
 		}
 	}
 	return longest >= 256 || (bytes.size() >= 256 && zero_count * 100 >= bytes.size() * 90);
+}
+
+inline bool profile_pe_image_header(const std::vector<uint8_t>& bytes, preload_diagnostics_t& diag)
+{
+	diag.mz = bytes.size() >= 2 && bytes[0] == 'M' && bytes[1] == 'Z';
+	diag.pe_header_ok = false;
+	diag.pe_signature = 0;
+	diag.pe_machine = 0;
+	diag.pe_sections = 0;
+	diag.pe_optional_magic = 0;
+	diag.pe_size_of_image = 0;
+	if (bytes.size() < sizeof(IMAGE_DOS_HEADER))
+		return false;
+
+	IMAGE_DOS_HEADER dos{};
+	std::memcpy(&dos, bytes.data(), sizeof(dos));
+	if (dos.e_magic != IMAGE_DOS_SIGNATURE)
+		return false;
+	if (dos.e_lfanew < static_cast<LONG>(sizeof(IMAGE_DOS_HEADER)))
+		return false;
+
+	const size_t nt_off = static_cast<size_t>(dos.e_lfanew);
+	if (nt_off > bytes.size() || bytes.size() - nt_off < sizeof(uint32_t) + sizeof(IMAGE_FILE_HEADER))
+		return false;
+
+	std::memcpy(&diag.pe_signature, bytes.data() + nt_off, sizeof(diag.pe_signature));
+	if (diag.pe_signature != IMAGE_NT_SIGNATURE)
+		return false;
+
+	IMAGE_FILE_HEADER file_header{};
+	std::memcpy(&file_header, bytes.data() + nt_off + sizeof(uint32_t), sizeof(file_header));
+	diag.pe_machine = file_header.Machine;
+	diag.pe_sections = file_header.NumberOfSections;
+
+	const size_t optional_off = nt_off + sizeof(uint32_t) + sizeof(IMAGE_FILE_HEADER);
+	if (optional_off + sizeof(uint16_t) <= bytes.size())
+		std::memcpy(&diag.pe_optional_magic, bytes.data() + optional_off, sizeof(diag.pe_optional_magic));
+
+	if (file_header.SizeOfOptionalHeader >= offsetof(IMAGE_OPTIONAL_HEADER64, SizeOfImage) + sizeof(uint32_t) &&
+		optional_off + offsetof(IMAGE_OPTIONAL_HEADER64, SizeOfImage) + sizeof(uint32_t) <= bytes.size()) {
+		std::memcpy(&diag.pe_size_of_image,
+			bytes.data() + optional_off + offsetof(IMAGE_OPTIONAL_HEADER64, SizeOfImage),
+			sizeof(diag.pe_size_of_image));
+	}
+
+	diag.pe_header_ok = diag.pe_sections != 0 &&
+		(diag.pe_optional_magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC ||
+		 diag.pe_optional_magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC);
+	return diag.pe_header_ok;
 }
 
 enum class wd_state_t : uint32_t {
@@ -821,15 +897,117 @@ inline ghidra_result_t decompile_buffer(const uint8_t* data, size_t size,
 	return result;
 }
 
-inline bool preload_module(uint64_t base, size_t size, std::vector<uint8_t>& out) {
+inline bool preload_module(uint64_t base, size_t size, std::vector<uint8_t>& out, preload_diagnostics_t* diagnostics = nullptr) {
+	preload_diagnostics_t local_diag{};
+	preload_diagnostics_t& profile = diagnostics ? *diagnostics : local_diag;
+	profile = {};
+	profile.base = base;
+	profile.requested_size = size;
 	out.clear();
-	if (size == 0 || size > 0x10000000) return false;
-	driver_bridge::read_memory(base, size, out);
-	if (buffer_is_zero_padding(out)) {
+	if (size == 0 || size > 0x10000000) {
+		diag::log_tagged_fmt("ghidra", "preload_module_reject base=0x%llX size=%zu reason=invalid_size",
+			static_cast<unsigned long long>(base), size);
+		return false;
+	}
+	profile.whole_read_ok = driver_bridge::read_memory(base, size, out);
+	profile.first_attempt_bytes = out.size();
+	if (profile.whole_read_ok && !out.empty()) {
+		profile.whole_read_zero_padding = buffer_is_zero_padding(out);
+		profile.total_read = out.size();
+		const bool pe_ok = profile_pe_image_header(out, profile);
+		if (!profile.whole_read_zero_padding || pe_ok) {
+			diag::log_tagged_fmt("ghidra",
+				"preload_module_whole_ok base=0x%llX requested=%zu bytes=%zu zero=%d mz=%d pe=%d sections=%u image_size=%u",
+				static_cast<unsigned long long>(base),
+				size,
+				out.size(),
+				profile.whole_read_zero_padding ? 1 : 0,
+				profile.mz ? 1 : 0,
+				pe_ok ? 1 : 0,
+				static_cast<unsigned>(profile.pe_sections),
+				static_cast<unsigned>(profile.pe_size_of_image));
+			return true;
+		}
+	}
+
+	out.assign(size, 0);
+	profile.chunked_read = true;
+	profile.total_read = 0;
+	const uint64_t end = base + static_cast<uint64_t>(size);
+
+	for (size_t offset = 0; offset < size;) {
+		const uint64_t addr = base + static_cast<uint64_t>(offset);
+		size_t chunk = (std::min)(static_cast<size_t>(0x10000), size - offset);
+
+		driver_bridge::memory_region_t region{};
+		if (driver_bridge::query_memory(addr, region)) {
+			++profile.query_ok;
+			const uint64_t region_end = region.base + region.size;
+			if (region.base <= addr && region_end > addr) {
+				const uint64_t clipped_end = (std::min)(region_end, end);
+				chunk = static_cast<size_t>((std::min<uint64_t>)(clipped_end - addr, static_cast<uint64_t>(chunk)));
+				if (chunk == 0)
+					chunk = (std::min)(static_cast<size_t>(0x1000), size - offset);
+			}
+			const bool committed = region.state == MEM_COMMIT;
+			const bool guarded = (region.protect & PAGE_GUARD) != 0;
+			const bool noaccess = (region.protect & PAGE_NOACCESS) != 0;
+			if (!committed || guarded || noaccess) {
+				++profile.chunks_skipped;
+				if (!committed)
+					++profile.skipped_uncommitted;
+				if (guarded)
+					++profile.skipped_guard;
+				if (noaccess)
+					++profile.skipped_noaccess;
+				offset += chunk;
+				continue;
+			}
+		} else {
+			++profile.query_failed;
+		}
+
+		std::vector<uint8_t> chunk_data;
+		if (driver_bridge::read_memory(addr, chunk, chunk_data) && !chunk_data.empty()) {
+			const size_t copied = (std::min)(chunk_data.size(), size - offset);
+			std::memcpy(out.data() + offset, chunk_data.data(), copied);
+			profile.total_read += copied;
+			++profile.chunks_ok;
+		} else {
+			++profile.chunks_failed;
+		}
+		offset += chunk;
+	}
+
+	profile.zero_padding = buffer_is_zero_padding(out);
+	const bool pe_ok = profile_pe_image_header(out, profile);
+	const bool accept = profile.total_read != 0 && (!profile.zero_padding || pe_ok);
+	diag::log_tagged_fmt("ghidra",
+		"preload_module_chunked base=0x%llX size=%zu first_attempt_bytes=%zu total_read=%zu chunks_ok=%zu chunks_failed=%zu chunks_skipped=%zu query_ok=%zu query_failed=%zu skipped_uncommitted=%zu skipped_guard=%zu skipped_noaccess=%zu zero=%d mz=%d pe=%d sections=%u image_size=%u accept=%d",
+		static_cast<unsigned long long>(base),
+		size,
+		profile.first_attempt_bytes,
+		profile.total_read,
+		profile.chunks_ok,
+		profile.chunks_failed,
+		profile.chunks_skipped,
+		profile.query_ok,
+		profile.query_failed,
+		profile.skipped_uncommitted,
+		profile.skipped_guard,
+		profile.skipped_noaccess,
+		profile.zero_padding ? 1 : 0,
+		profile.mz ? 1 : 0,
+		pe_ok ? 1 : 0,
+		static_cast<unsigned>(profile.pe_sections),
+		static_cast<unsigned>(profile.pe_size_of_image),
+		accept ? 1 : 0);
+
+	if (!accept) {
 		out.clear();
 		return false;
 	}
-	return !out.empty();
+	return true;
 }
 
 inline void batch_decompile(const uint8_t* buffer, size_t buf_size, uint64_t base,

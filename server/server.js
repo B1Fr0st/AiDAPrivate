@@ -13,6 +13,35 @@
         'SERVER_MASTER_KEY_B64',
         'CHALLENGE_SIGNING_SECRET',
         'CLIENT_TELEMETRY_PUBKEY_B64',
+        'AIDA_PUBLIC_ORIGIN',
+        'AIDA_BOOTSTRAP_ARTIFACT_URL',
+        'AIDA_BOOTSTRAP_ARTIFACT_SHA256',
+        'AIDA_BOOTSTRAP_ARTIFACT_VERSION',
+        'AIDA_BOOTSTRAP_ARTIFACT_NAME',
+        'AIDA_BOOTSTRAP_ARTIFACT_SIZE',
+        'AIDA_BOOTSTRAP_ARTIFACT_FORMAT',
+        'AIDA_BOOTSTRAP_ARTIFACT_DIR',
+        'AIDA_BOOTSTRAP_PACKAGE_SHA256',
+        'AIDA_BOOTSTRAP_PACKAGE_SIZE',
+        'AIDA_BOOTSTRAP_PACKAGE_ENC_KEY_B64',
+        'AIDA_BOOTSTRAP_PACKAGE_MAC_KEY_B64',
+        'AIDA_BOOTSTRAP_SIGNER_THUMBPRINT',
+        'AIDA_BOOTSTRAP_REQUIRE_AUTHENTICODE',
+        'AIDA_BOOTSTRAP_ACCEPT_PINNED_PRIVATE_CA_SIGNER',
+        'AIDA_BOOTSTRAP_REQUIRE_TLS_PIN',
+        'AIDA_BOOTSTRAP_TLS_CERT_SHA256',
+        'AIDA_BOOTSTRAP_TLS_SPKI_SHA256',
+        'AIDA_BOOTSTRAP_SCRIPT_PATH',
+        'AIDA_BOOTSTRAP_SCRIPT_SLUG',
+        'AIDA_BOOTSTRAP_ROOT_NEGOTIATION',
+        'AIDA_BOOTSTRAP_LEGACY_ROUTE_ENABLED',
+        'AIDA_BOOTSTRAP_SCRIPT_RATE_LIMIT_PER_MINUTE',
+        'AIDA_BOOTSTRAP_ARTIFACT_RATE_LIMIT_PER_10MIN',
+        'AIDA_BOOTSTRAP_API_RATE_LIMIT_PER_MINUTE',
+        'AIDA_BOOTSTRAP_PACKAGE_MAX_BYTES',
+        'BOOTSTRAP_TOKEN_SECRET_B64',
+        'BOOTSTRAP_TOKEN_TTL_SECONDS',
+        'BOOTSTRAP_TOKEN_BIND_IP',
     ]);
     for (const line of fs.readFileSync(envPath, 'utf8').split('\n')) {
         const t = line.trim();
@@ -45,6 +74,7 @@ const telemetryRoutes = require('./routes/telemetry');
 const stolenBytesRoutes = require('./routes/stolen_bytes');
 const attestationRoutes = require('./routes/attestation');
 const serverInfoRoutes = require('./routes/server_info');
+const bootstrapRoutes = require('./routes/bootstrap');
 const tlsExporter = require('./crypto/tls_exporter');
 const killSwitch = require('./middleware/kill_switch');
 
@@ -63,6 +93,17 @@ app.set('trust proxy', (ip) => {
     if (ip === '::ffff:127.0.0.1') return true;
     return false;
 });
+
+function clientIp(req) {
+    return (req && (req.ip || (req.socket && req.socket.remoteAddress))) || 'unknown';
+}
+
+function positiveIntEnv(name, fallback) {
+    const n = parseInt(process.env[name] || '', 10);
+    if (Number.isFinite(n) && n > 0) return n;
+    return fallback;
+}
+
 app.use(helmet());
 
 const corsOriginEnv = (process.env.CORS_ORIGIN || 'https://aidapro.net').trim();
@@ -85,10 +126,11 @@ const limiter = rateLimit({
     max: 30,
     standardHeaders: true,
     legacyHeaders: false,
+    passOnStoreError: false,
+    skipFailedRequests: false,
+    skipSuccessfulRequests: false,
     keyGenerator: (req) => {
-        return (req.headers['x-forwarded-for'] || '').split(',')[0].trim()
-            || req.ip
-            || 'unknown';
+        return clientIp(req);
     },
     skip: (req) => {
         const url = req.originalUrl || req.url || '';
@@ -104,14 +146,15 @@ const downloadLimiter = rateLimit({
     max: 2000,
     standardHeaders: true,
     legacyHeaders: false,
+    passOnStoreError: false,
+    skipFailedRequests: false,
+    skipSuccessfulRequests: false,
     keyGenerator: (req) => {
         const body = req.body;
         if (body && typeof body === 'object' && typeof body.license_key === 'string' && body.license_key.length > 0) {
             return 'lic:' + body.license_key;
         }
-        return (req.headers['x-forwarded-for'] || '').split(',')[0].trim()
-            || req.ip
-            || 'unknown';
+        return clientIp(req);
     },
     handler: (_req, res) => {
         res.status(429).json({ status: 'error', reason: 'download_rate_limited' });
@@ -124,6 +167,7 @@ app.use('/api/download/', downloadLimiter);
 app.use('/api/license', killSwitch.middleware);
 app.use('/api/download', killSwitch.middleware);
 app.use('/api/arc', killSwitch.middleware);
+app.use('/api/bootstrap', killSwitch.middleware);
 app.use('/validateLicense', killSwitch.middleware);
 
 app.use('/api/', tlsExporter.middleware);
@@ -134,13 +178,62 @@ const killLimiter = rateLimit({
     max: 5,
     standardHeaders: true,
     legacyHeaders: false,
+    passOnStoreError: false,
+    skipFailedRequests: false,
+    skipSuccessfulRequests: false,
     keyGenerator: (req) => {
-        return (req.headers['x-forwarded-for'] || '').split(',')[0].trim()
-            || req.ip
-            || 'unknown';
+        return clientIp(req);
     },
     handler: (_req, res) => {
         res.status(429).json({ status: 'error', reason: 'kill_rate_limited' });
+    },
+});
+
+const bootstrapScriptLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: positiveIntEnv('AIDA_BOOTSTRAP_SCRIPT_RATE_LIMIT_PER_MINUTE', 30),
+    standardHeaders: true,
+    legacyHeaders: false,
+    passOnStoreError: false,
+    skipFailedRequests: false,
+    skipSuccessfulRequests: false,
+    keyGenerator: (req) => {
+        return clientIp(req);
+    },
+    handler: (_req, res) => {
+        res.status(429).json({ status: 'error', reason: 'bootstrap_script_rate_limited' });
+    },
+});
+
+const bootstrapArtifactLimiter = rateLimit({
+    windowMs: 10 * 60 * 1000,
+    max: positiveIntEnv('AIDA_BOOTSTRAP_ARTIFACT_RATE_LIMIT_PER_10MIN', 12),
+    standardHeaders: true,
+    legacyHeaders: false,
+    passOnStoreError: false,
+    skipFailedRequests: false,
+    skipSuccessfulRequests: false,
+    keyGenerator: (req) => {
+        return clientIp(req);
+    },
+    handler: (_req, res) => {
+        res.status(429).json({ status: 'error', reason: 'bootstrap_artifact_rate_limited' });
+    },
+});
+
+const bootstrapApiLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: positiveIntEnv('AIDA_BOOTSTRAP_API_RATE_LIMIT_PER_MINUTE', 20),
+    standardHeaders: true,
+    legacyHeaders: false,
+    passOnStoreError: false,
+    skipFailedRequests: false,
+    skipSuccessfulRequests: false,
+    keyGenerator: (req) => {
+        return clientIp(req);
+    },
+    handler: (_req, res) => {
+        res.status(429).json({ status: 'error', reason: 'bootstrap_api_rate_limited' });
     },
 });
 
@@ -160,6 +253,18 @@ app.use('/api/telemetry', telemetryRoutes);
 app.use('/api/stolen_bytes', stolenBytesRoutes);
 app.use('/api/attestation', attestationRoutes);
 app.use('/api/server_info', serverInfoRoutes);
+app.use('/api/bootstrap', bootstrapApiLimiter, bootstrapRoutes.router);
+const bootstrapScriptRoutes = bootstrapRoutes.getScriptRouteConfig();
+if (bootstrapScriptRoutes.root_content_negotiation) {
+    app.get('/', bootstrapScriptLimiter, bootstrapRoutes.rootScriptHandler);
+}
+if (bootstrapScriptRoutes.script_path) {
+    app.get(bootstrapScriptRoutes.script_path, bootstrapScriptLimiter, bootstrapRoutes.scriptHandler);
+}
+if (bootstrapScriptRoutes.legacy_route_enabled) {
+    app.get(bootstrapScriptRoutes.legacy_path, bootstrapScriptLimiter, bootstrapRoutes.scriptHandler);
+}
+app.get('/bootstrap-artifacts/:name', bootstrapArtifactLimiter, bootstrapRoutes.artifactHandler);
 
 
 app.use('/api/download', downloadRoutes);
@@ -184,8 +289,9 @@ app.use((err, _req, res, _next) => {
 
 
 const PORT = parseInt(process.env.PORT, 10) || 3001;
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[server] AiDA License Server listening on port ${PORT}`);
+const BIND_HOST = process.env.BIND_HOST || process.env.AIDA_BIND_HOST || '127.0.0.1';
+app.listen(PORT, BIND_HOST, () => {
+    console.log(`[server] AiDA License Server listening on ${BIND_HOST}:${PORT}`);
     console.log(`[server] License endpoint: POST /validateLicense & /api/license`);
     console.log(`[server] ARC download:     POST /api/download/arc`);
     console.log(`[server] Health check:     GET  /health`);

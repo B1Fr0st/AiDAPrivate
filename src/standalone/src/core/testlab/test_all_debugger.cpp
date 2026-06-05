@@ -33,10 +33,7 @@ static void format_timestamp(char* out, std::size_t cap) {
 }
 
 static void write_log_file(HANDLE hf, const std::string& line) {
-    if (hf == INVALID_HANDLE_VALUE) return;
-    DWORD wrote = 0;
-    WriteFile(hf, line.data(), static_cast<DWORD>(line.size()), &wrote, nullptr);
-    FlushFileBuffers(hf);
+    test_all_features::write_full_test_log_line(hf, line.data(), line.size());
 }
 
 static void log_msg(HANDLE hf, const char* tag, const char* fmt, ...) {
@@ -54,8 +51,7 @@ static void log_msg(HANDLE hf, const char* tag, const char* fmt, ...) {
     std::string s(line);
 
     write_log_file(hf, s);
-    diag::log_tagged_fmt("test_dbg", "%s: %s", tag, detail);
-    OutputDebugStringA(s.c_str());
+    test_all_features::mirror_full_test_log_line(tag, detail, s.c_str());
 }
 
 static uint64_t get_ntdll_fn(const char* name) {
@@ -971,7 +967,6 @@ static void test_enumerate_handles(HANDLE hf, std::atomic<int>& passed, std::ato
         (int)driver_bridge::is_loaded(), (unsigned)driver_bridge::attached_pid());
 
     debugger_engine::enumerate_handles();
-    Sleep(500);
 
     auto& state = debugger_engine::g_state;
     size_t count = 0;
@@ -2151,12 +2146,17 @@ static void test_handle_type_distribution(HANDLE hf, std::atomic<int>& passed, s
     log_msg(hf, "dbg_htyp", "START -- enumerate handles and check type distribution");
     auto t0 = std::chrono::steady_clock::now();
 
-    diag::log_tagged_fmt("test_dbg_detail", "dbg_htyp inputs: enumerate_handles() attached_pid=%u", (unsigned)driver_bridge::attached_pid());
-
-    debugger_engine::enumerate_handles();
-    Sleep(500);
-
     auto& state = debugger_engine::g_state;
+    size_t pre_total = 0;
+    {
+        std::lock_guard<std::mutex> lk(state.handle_mutex);
+        pre_total = state.handles.size();
+    }
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_htyp inputs: cached_handles=%zu attached_pid=%u", pre_total, (unsigned)driver_bridge::attached_pid());
+    if (pre_total == 0) {
+        debugger_engine::enumerate_handles();
+    }
+
     size_t total = 0;
     size_t unique_types = 0;
     {
@@ -2492,15 +2492,25 @@ static void test_module_view_entries(HANDLE hf, std::atomic<int>& passed, std::a
 static void select_debugger_tab(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed,
                                 const char* tag, debugger_view::sub_tab_t value) {
     diag::log_tagged_fmt("test_dbg_detail", "%s inputs: set active_tab=%d", tag, static_cast<int>(value));
+    const bool visible = debugger_view::is_visible_sub_tab(value);
     debugger_view::g_ui.active_tab = value;
     auto read_back = debugger_view::g_ui.active_tab;
-    diag::log_tagged_fmt("test_dbg_detail", "%s result: active_tab read_back=%d", tag, static_cast<int>(read_back));
-    if (read_back == value) {
-        log_msg(hf, tag, "PASS -- active_tab selected (%d)", static_cast<int>(value));
+    diag::log_tagged_fmt("test_dbg_detail", "%s result: active_tab read_back=%d visible=%d visible_count=%d enum_count=%d",
+        tag,
+        static_cast<int>(read_back),
+        visible ? 1 : 0,
+        debugger_view::visible_sub_tab_count(),
+        static_cast<int>(debugger_view::sub_tab_t::COUNT));
+    if (read_back == value && visible && debugger_view::visible_sub_tab_count() == static_cast<int>(debugger_view::sub_tab_t::COUNT)) {
+        log_msg(hf, tag, "PASS -- active_tab selected and visible (%d)", static_cast<int>(value));
         passed.fetch_add(1);
     } else {
-        log_msg(hf, tag, "FAIL -- active_tab not selected: set %d, read back %d",
-            static_cast<int>(value), static_cast<int>(read_back));
+        log_msg(hf, tag, "FAIL -- active_tab visibility contract failed: set %d, read back %d, visible=%d, visible_count=%d, enum_count=%d",
+            static_cast<int>(value),
+            static_cast<int>(read_back),
+            visible ? 1 : 0,
+            debugger_view::visible_sub_tab_count(),
+            static_cast<int>(debugger_view::sub_tab_t::COUNT));
         failed.fetch_add(1);
     }
 }

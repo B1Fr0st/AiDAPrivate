@@ -51,6 +51,7 @@ void                          register_browser_pid(uint32_t pid);
 
 bool        detect_edge_path(std::string& out_path);
 bool        detect_chrome_path(std::string& out_path);
+bool        detect_camoufox_path(std::string& out_path);
 std::string profile_root();
 std::string compute_profile_path(const std::string& subdir);
 std::wstring build_command_line_for_test(const std::string& browser_path,

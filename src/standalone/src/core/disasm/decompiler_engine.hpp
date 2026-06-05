@@ -25,6 +25,7 @@
 #include "function_index.hpp"
 #include "../analysis/pdb_events.hpp"
 #include "../infra/event_bus.hpp"
+#include "../infra/critical_work_queue.hpp"
 #include "../../helpers/diag_log.hpp"
 
 #include <nlohmann/json.hpp>
@@ -825,7 +826,7 @@ inline void decompile_function_native(uint64_t func_addr, const DisasmFile* file
 		}
 	};
 
-	if (!work_queue::post(std::move(worker_with_drain))) {
+	if (!critical_work_queue::post(worker_with_drain) && !work_queue::post(std::move(worker_with_drain))) {
 		diag::log_tagged_critical_fmt("dec",
 			"decompile_function_native_dispatch_failed addr=0x%llX reason=work_queue_unavailable",
 			static_cast<unsigned long long>(func_addr));

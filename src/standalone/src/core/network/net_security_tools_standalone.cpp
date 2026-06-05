@@ -3,6 +3,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <wincrypt.h>
 
 #include "standalone_compat.hpp"
 #include "comm.h"
@@ -66,6 +67,80 @@ static std::vector<std::uint8_t> ns_hex_to_bytes(const std::string& hex) {
         if (h >= 0 && l >= 0) out.push_back(static_cast<std::uint8_t>((h << 4) | l));
     }
     return out;
+}
+
+static bool ns_hex_to_bytes_strict(const std::string& hex, std::vector<std::uint8_t>& out) {
+    out.clear();
+    std::string clean;
+    for (char c : hex) {
+        if (c != ' ' && c != ':' && c != '-')
+            clean += c;
+    }
+    if (clean.empty() || (clean.size() % 2) != 0)
+        return false;
+    out.reserve(clean.size() / 2);
+    for (std::size_t i = 0; i + 1 < clean.size(); i += 2) {
+        auto nib = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return 10 + c - 'a';
+            if (c >= 'A' && c <= 'F') return 10 + c - 'A';
+            return -1;
+        };
+        const int h = nib(clean[i]);
+        const int l = nib(clean[i + 1]);
+        if (h < 0 || l < 0) {
+            out.clear();
+            return false;
+        }
+        out.push_back(static_cast<std::uint8_t>((h << 4) | l));
+    }
+    return true;
+}
+
+static bool ns_decode_pem_certificate_der(const std::string& pem, std::vector<std::uint8_t>& out) {
+    out.clear();
+    if (pem.empty())
+        return false;
+    DWORD needed = 0;
+    if (!CryptStringToBinaryA(pem.c_str(), static_cast<DWORD>(pem.size()), CRYPT_STRING_BASE64HEADER, nullptr, &needed, nullptr, nullptr) || needed == 0)
+        return false;
+    out.resize(needed);
+    if (!CryptStringToBinaryA(pem.c_str(), static_cast<DWORD>(pem.size()), CRYPT_STRING_BASE64HEADER, out.data(), &needed, nullptr, nullptr)) {
+        out.clear();
+        return false;
+    }
+    out.resize(needed);
+    return true;
+}
+
+static bool ns_is_valid_certificate_der(const std::vector<std::uint8_t>& der, std::string& subject) {
+    subject.clear();
+    if (der.empty() || der.size() > 0x100000)
+        return false;
+    PCCERT_CONTEXT ctx = CertCreateCertificateContext(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+        der.data(), static_cast<DWORD>(der.size()));
+    if (!ctx)
+        return false;
+    char name[512] = {};
+    CertGetNameStringA(ctx, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr, name, static_cast<DWORD>(sizeof(name)));
+    subject = name;
+    CertFreeCertificateContext(ctx);
+    return true;
+}
+
+static bool ns_valid_sha1_thumbprint_text(const std::string& thumbprint) {
+    std::size_t n = 0;
+    for (char c : thumbprint) {
+        if (c == ' ' || c == ':' || c == '-')
+            continue;
+        const bool hex = (c >= '0' && c <= '9') ||
+            (c >= 'a' && c <= 'f') ||
+            (c >= 'A' && c <= 'F');
+        if (!hex)
+            return false;
+        ++n;
+    }
+    return n == 40;
 }
 
 static json ns_module_to_json(const cert_intercept::module_summary_t& module) {
@@ -369,11 +444,15 @@ tool_result_t tls_get_extracted_keys(const json&) {
 }
 
 tool_result_t cert_inject(const json& params) {
-    diag::log_tagged_fmt("net_sec", "cert_inject entry store_name=%s system_wide=%d has_pem=%d has_der_hex=%d",
+    const bool validate_only = params.contains("validate_only") &&
+        params["validate_only"].is_boolean() &&
+        params["validate_only"].get<bool>();
+    diag::log_tagged_fmt("net_sec", "cert_inject entry store_name=%s system_wide=%d has_pem=%d has_der_hex=%d validate_only=%d",
         params.value("store_name", "ROOT").c_str(),
         (int)params.value("system_wide", false),
         (int)params.contains("cert_pem"),
-        (int)params.contains("cert_der_hex"));
+        (int)params.contains("cert_der_hex"),
+        validate_only ? 1 : 0);
     net_security::cert_injection_config_t config;
     config.cert_pem = params.value("cert_pem", "");
     config.store_name = params.value("store_name", "ROOT");
@@ -383,6 +462,38 @@ tool_result_t cert_inject(const json& params) {
         auto hex = params["cert_der_hex"].get<std::string>();
         config.cert_der = ns_hex_to_bytes(hex);
         diag::log_tagged_fmt("net_sec", "cert_inject der_hex len=%zu bytes=%zu", hex.size(), config.cert_der.size());
+    }
+
+    if (validate_only) {
+        std::vector<std::uint8_t> der;
+        std::string format;
+        if (params.contains("cert_der_hex")) {
+            if (!params["cert_der_hex"].is_string())
+                return tool_result_t::error(OBFSTR("cert_der_hex must be a string"));
+            if (!ns_hex_to_bytes_strict(params["cert_der_hex"].get<std::string>(), der))
+                return tool_result_t::error(OBFSTR("cert_der_hex is not valid hex DER data"));
+            format = OBFSTR("der_hex");
+        } else if (params.contains("cert_pem")) {
+            if (!params["cert_pem"].is_string())
+                return tool_result_t::error(OBFSTR("cert_pem must be a string"));
+            if (!ns_decode_pem_certificate_der(params["cert_pem"].get<std::string>(), der))
+                return tool_result_t::error(OBFSTR("cert_pem is not a valid PEM certificate"));
+            format = OBFSTR("pem");
+        } else {
+            return tool_result_t::error(OBFSTR("cert_pem or cert_der_hex is required"));
+        }
+        std::string subject;
+        if (!ns_is_valid_certificate_der(der, subject))
+            return tool_result_t::error(OBFSTR("certificate data is not a valid X.509 certificate"));
+        json r;
+        r["success"] = true;
+        r["validate_only"] = true;
+        r["format"] = format;
+        r["cert_size"] = der.size();
+        r["subject_cn"] = subject;
+        r["store_name"] = config.store_name;
+        r["system_wide"] = config.system_wide;
+        return tool_result_t::ok(OBFSTR("Validated certificate injection request without modifying the certificate store."), r);
     }
 
     auto result = net_security::CertificateInjector::instance().inject_certificate(config);
@@ -402,10 +513,24 @@ tool_result_t cert_inject(const json& params) {
 tool_result_t cert_remove(const json& params) {
     std::string thumbprint = params.value("thumbprint", "");
     std::string store_name = params.value("store_name", "ROOT");
-    diag::log_tagged_fmt("net_sec", "cert_remove entry thumbprint=%s store_name=%s", thumbprint.c_str(), store_name.c_str());
+    const bool validate_only = params.contains("validate_only") &&
+        params["validate_only"].is_boolean() &&
+        params["validate_only"].get<bool>();
+    diag::log_tagged_fmt("net_sec", "cert_remove entry thumbprint=%s store_name=%s validate_only=%d", thumbprint.c_str(), store_name.c_str(), validate_only ? 1 : 0);
     if (thumbprint.empty()) {
         diag::log_tagged("net_sec", "cert_remove thumbprint empty -> error");
         return tool_result_t::error(OBFSTR("thumbprint is required"));
+    }
+
+    if (validate_only) {
+        if (!ns_valid_sha1_thumbprint_text(thumbprint))
+            return tool_result_t::error(OBFSTR("thumbprint must be a 40-hex-character SHA-1 certificate thumbprint"));
+        json r;
+        r["removed"] = false;
+        r["validate_only"] = true;
+        r["thumbprint"] = thumbprint;
+        r["store_name"] = store_name;
+        return tool_result_t::ok(OBFSTR("Validated certificate removal request without modifying the certificate store."), r);
     }
 
     bool removed = net_security::CertificateInjector::instance().remove_certificate(thumbprint, store_name);
@@ -1035,14 +1160,16 @@ void register_net_security_tools(mcp_standalone::server_t& srv) {
         {{OBFSTR("cert_pem"), OBFSTR("string"), OBFSTR("PEM-encoded certificate string"), false},
          {OBFSTR("cert_der_hex"), OBFSTR("string"), OBFSTR("DER-encoded certificate as hex string"), false},
          {OBFSTR("store_name"), OBFSTR("string"), OBFSTR("Certificate store name (default: ROOT)"), false},
-         {OBFSTR("system_wide"), OBFSTR("boolean"), OBFSTR("Install system-wide vs current user (default: false)"), false}},
+         {OBFSTR("system_wide"), OBFSTR("boolean"), OBFSTR("Install system-wide vs current user (default: false)"), false},
+         {OBFSTR("validate_only"), OBFSTR("boolean"), OBFSTR("Validate certificate payload without modifying the certificate store"), false}},
         cert_inject, false});
 
     register_compat(srv, {
         OBFSTR("cert_remove"), OBFSTR("network_security"),
         OBFSTR("Remove a certificate from the Windows certificate store by its SHA-1 thumbprint."),
         {{OBFSTR("thumbprint"), OBFSTR("string"), OBFSTR("SHA-1 thumbprint of the certificate to remove"), true},
-         {OBFSTR("store_name"), OBFSTR("string"), OBFSTR("Certificate store name (default: ROOT)"), false}},
+         {OBFSTR("store_name"), OBFSTR("string"), OBFSTR("Certificate store name (default: ROOT)"), false},
+         {OBFSTR("validate_only"), OBFSTR("boolean"), OBFSTR("Validate request without modifying the certificate store"), false}},
         cert_remove, false});
 
     register_compat(srv, {

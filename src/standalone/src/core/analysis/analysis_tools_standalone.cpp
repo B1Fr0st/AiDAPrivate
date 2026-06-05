@@ -92,6 +92,8 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			{"max_regions", "integer", "Maximum committed readable regions to scan (default 4096)", false},
 			{"max_bytes", "integer", "Maximum bytes to scan before stopping (0 = unlimited)", false},
 			{"max_hits", "integer", "Maximum hits before stopping (0 = unlimited)", false},
+			{"range_base", "string", "Optional hex base address limiting the scan to a target range", false},
+			{"range_size", "integer", "Optional byte size for range_base-limited scans", false},
 			{"timeout_ms", "integer", "Maximum scan time before cancellation (default 4500, max 60000)", false}
 		},
 		true,
@@ -102,13 +104,23 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			cfg.max_bytes = params.value("max_bytes", static_cast<uint64_t>(0));
 			cfg.max_hits = params.value("max_hits", static_cast<size_t>(0));
 			cfg.timeout_ms = bounded_u32_param(params, "timeout_ms", 4500, 100, 60000);
+			std::string range_base_str = params.value("range_base", std::string());
+			if (!range_base_str.empty())
+				cfg.range_base = std::strtoull(range_base_str.c_str(), nullptr, 16);
+			cfg.range_size = static_cast<uint64_t>(bounded_size_param(params, "range_size", 0, 0, 64ULL * 1024ULL * 1024ULL));
+			if ((!range_base_str.empty() && cfg.range_base == 0) || (cfg.range_size != 0 && cfg.range_base == 0))
+				return tool_result_t::error("invalid range_base");
+			if (cfg.range_base != 0 && cfg.range_size == 0)
+				return tool_result_t::error("range_size must be non-zero when range_base is provided");
 			cfg.label_references = false;
-			diag::log_tagged_fmt("analysis", "scan_crypto_constants entry module_filter='%s' max_regions=%zu max_bytes=%llu max_hits=%zu timeout_ms=%u",
+			diag::log_tagged_fmt("analysis", "scan_crypto_constants entry module_filter='%s' max_regions=%zu max_bytes=%llu max_hits=%zu timeout_ms=%u range=0x%llX+0x%llX",
 				cfg.module_filter.c_str(),
 				cfg.max_regions,
 				static_cast<unsigned long long>(cfg.max_bytes),
 				cfg.max_hits,
-				cfg.timeout_ms);
+				cfg.timeout_ms,
+				static_cast<unsigned long long>(cfg.range_base),
+				static_cast<unsigned long long>(cfg.range_size));
 			if (crypto_scanner::g_state.scanning.load()) {
 				diag::log_tagged("analysis", "scan_crypto_constants refused already_scanning");
 				return tool_result_t::error("A crypto scan is already in progress.");
@@ -155,6 +167,8 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			result["results"] = arr;
 			result["status"] = crypto_scanner::g_state.scanning.load() ? "cancel_requested" : (timed_out ? "cancelled_by_timeout" : "complete");
 			result["timed_out"] = timed_out;
+			if (timed_out)
+				return tool_result_t{false, "Crypto scan did not complete within the timeout.", result};
 			return tool_result_t::ok(result);
 		}
 	});
@@ -328,10 +342,8 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			{"input_size", "integer", "Size of input buffer in bytes (default: 256)", false},
 			{"max_iterations", "integer", "Maximum fuzzing iterations (default: 10000)", false}
 		},
-		true,
+		false,
 		[](const json& params) -> tool_result_t {
-			auto& cfg = fuzzer_engine::g_state.config;
-
 			std::string target = params.value("target_address", "");
 			std::string end = params.value("end_address", "");
 			std::string input = params.value("input_address", "");
@@ -343,11 +355,28 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 				return tool_result_t::error("target_address is required");
 			}
 
+			fuzzer_engine::fuzz_config_t cfg;
 			cfg.target_address = std::strtoull(target.c_str(), nullptr, 16);
-			if (!end.empty()) cfg.end_address = std::strtoull(end.c_str(), nullptr, 16);
-			if (!input.empty()) cfg.input_address = std::strtoull(input.c_str(), nullptr, 16);
-			cfg.input_size = params.value("input_size", 256);
-			cfg.max_iterations = params.value("max_iterations", 10000);
+			if (cfg.target_address == 0) {
+				diag::log_tagged("analysis", "start_fuzz refused invalid_target_address");
+				return tool_result_t::error("invalid target_address");
+			}
+			if (!end.empty()) {
+				cfg.end_address = std::strtoull(end.c_str(), nullptr, 16);
+				if (cfg.end_address <= cfg.target_address) {
+					diag::log_tagged_fmt("analysis", "start_fuzz refused invalid_end target=0x%llX end=0x%llX",
+						static_cast<unsigned long long>(cfg.target_address),
+						static_cast<unsigned long long>(cfg.end_address));
+					return tool_result_t::error("end_address must be greater than target_address");
+				}
+			} else {
+				cfg.end_address = cfg.target_address + 1;
+			}
+			if (!input.empty())
+				cfg.input_address = std::strtoull(input.c_str(), nullptr, 16);
+			const uint32_t input_size = bounded_u32_param(params, "input_size", 256, 1, 1024 * 1024);
+			cfg.input_size = static_cast<int>(input_size);
+			cfg.max_iterations = bounded_u32_param(params, "max_iterations", 10000, 1, 1000000);
 
 			cfg.pid = driver_bridge::attached_pid();
 			auto threads_snap = driver_bridge::enumerate_threads();
@@ -365,9 +394,33 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 				static_cast<unsigned long long>(cfg.end_address),
 				static_cast<unsigned long long>(cfg.input_address),
 				cfg.input_size, cfg.max_iterations);
-			fuzzer_engine::start_fuzzing();
+			{
+				std::lock_guard<std::mutex> lk(fuzzer_engine::g_state.mutex);
+				fuzzer_engine::g_state.config = cfg;
+			}
+			if (!fuzzer_engine::start_fuzzing()) {
+				diag::log_tagged("analysis", "start_fuzz refused worker_unavailable");
+				return tool_result_t::error("fuzzer is already running or worker queue is unavailable");
+			}
 
-			return tool_result_t::ok("Fuzzing started. Use get_fuzz_results to check progress.");
+			char end_buf[32];
+			char input_buf[32];
+			std::snprintf(end_buf, sizeof(end_buf), "0x%llX", static_cast<unsigned long long>(cfg.end_address));
+			std::snprintf(input_buf, sizeof(input_buf), "0x%llX", static_cast<unsigned long long>(cfg.input_address));
+			json result;
+			result["status"] = "started";
+			result["worker_posted"] = true;
+			result["pid"] = cfg.pid;
+			result["tid"] = cfg.tid;
+			result["thread_count"] = threads_snap.size();
+			result["target_address"] = target;
+			result["end_address"] = end_buf;
+			result["input_address"] = input_buf;
+			result["input_size"] = cfg.input_size;
+			result["max_iterations"] = cfg.max_iterations;
+			result["setup_complete"] = fuzzer_engine::g_state.setup_complete.load();
+			result["setup_success"] = fuzzer_engine::g_state.setup_success.load();
+			return tool_result_t::ok(result);
 		}
 	});
 
@@ -411,6 +464,9 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			result["corpus_size"] = stats.corpus_size;
 			result["elapsed_seconds"] = stats.elapsed_seconds;
 			result["setup_error"] = fuzzer_engine::g_state.setup_error;
+			result["worker_active"] = fuzzer_engine::g_state.worker_active.load();
+			result["setup_complete"] = fuzzer_engine::g_state.setup_complete.load();
+			result["setup_success"] = fuzzer_engine::g_state.setup_success.load();
 
 			json crashes_arr = json::array();
 			for (auto& c : fuzzer_engine::g_state.unique_crashes) {
@@ -438,7 +494,7 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			{"search_start", "string", "Optional hex address limiting xref search to a specific range", false},
 			{"search_size", "integer", "Optional xref search range size in bytes", false}
 		},
-		true,
+		false,
 		[](const json& params) -> tool_result_t {
 			std::string addr_str = params.value("region_address", "");
 			uint64_t size = params.value("region_size", 4096);
@@ -490,7 +546,12 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 
 			std::lock_guard<std::mutex> lk(decrypt_oracle::g_state.mutex);
 			auto& results = decrypt_oracle::g_state.results;
-			diag::log_tagged_fmt("analysis", "auto_decrypt_strings complete count=%zu", results.size());
+			diag::log_tagged_fmt("analysis", "auto_decrypt_strings complete count=%zu total_xrefs=%d processed_xrefs=%d timed_out=%d status=%s",
+				results.size(),
+				decrypt_oracle::g_state.total_xrefs.load(std::memory_order_acquire),
+				decrypt_oracle::g_state.processed_xrefs.load(std::memory_order_acquire),
+				timed_out ? 1 : 0,
+				decrypt_oracle::g_state.status_text.c_str());
 
 			json arr = json::array();
 			for (auto& r : results) {
@@ -512,11 +573,14 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			result["count"] = results.size();
 			result["results"] = arr;
 			result["timed_out"] = timed_out;
+			result["total_xrefs"] = decrypt_oracle::g_state.total_xrefs.load(std::memory_order_acquire);
+			result["processed_xrefs"] = decrypt_oracle::g_state.processed_xrefs.load(std::memory_order_acquire);
+			result["status_text"] = decrypt_oracle::g_state.status_text;
 			if (timed_out) {
 				result["status"] = "timeout";
 				result["cancelled"] = true;
 				result["message"] = "auto_decrypt_strings timed out and cancellation was requested";
-				return tool_result_t::ok(result);
+				return tool_result_t{false, "auto_decrypt_strings timed out and cancellation was requested", result};
 			}
 			return tool_result_t::ok(result);
 		}
@@ -530,10 +594,10 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			{"target_size", "integer", "Size of the region to monitor (default: 4096)", false},
 			{"duration_ms", "integer", "How long to monitor in milliseconds (default: 1000, max 4500)", false}
 		},
-		true,
+		false,
 		[](const json& params) -> tool_result_t {
 			std::string addr_str = params.value("target_address", "");
-			uint64_t size = params.value("target_size", 4096);
+			uint64_t size = bounded_u32_param(params, "target_size", 4096, 1, 1024 * 1024);
 			int duration = static_cast<int>(bounded_u32_param(params, "duration_ms", 1000, 100, 4500));
 
 			if (addr_str.empty()) {
@@ -550,21 +614,64 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 				static_cast<unsigned long long>(addr),
 				static_cast<unsigned long long>(size), duration);
 
-			integrity_hunter::start_hunt(addr, size);
+			if (!integrity_hunter::start_hunt(addr, size)) {
+				diag::log_tagged("integrity_hunter", "mcp_hunt_start_failed");
+				return tool_result_t::error("integrity hunter could not start");
+			}
 
-			int wait = 0;
-			int max_wait = (duration + 49) / 50;
-			while (integrity_hunter::g_state.hunting.load() && wait < max_wait) {
+			const auto install_start = std::chrono::steady_clock::now();
+			while (!integrity_hunter::g_state.install_complete.load() &&
+			       (integrity_hunter::g_state.hunting.load() || integrity_hunter::g_state.worker_active.load())) {
+				const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+					std::chrono::steady_clock::now() - install_start).count();
+				if (elapsed >= 6500) {
+					diag::log_tagged_fmt("integrity_hunter",
+						"mcp_hunt_install_timeout addr=0x%llX size=%llu elapsed_ms=%lld hunting=%d worker=%d",
+						static_cast<unsigned long long>(addr),
+						static_cast<unsigned long long>(size),
+						static_cast<long long>(elapsed),
+						integrity_hunter::g_state.hunting.load() ? 1 : 0,
+						integrity_hunter::g_state.worker_active.load() ? 1 : 0);
+					integrity_hunter::stop_hunt();
+					const bool idle = integrity_hunter::wait_until_idle(12000);
+					diag::log_tagged_fmt("integrity_hunter", "mcp_hunt_install_timeout_idle idle=%d", idle ? 1 : 0);
+					return tool_result_t::error(idle ? "integrity hunter page guard install timed out" : "integrity hunter worker did not stop after install timeout");
+				}
+				Sleep(25);
+			}
+
+			if (!integrity_hunter::g_state.install_success.load()) {
+				diag::log_tagged_fmt("integrity_hunter",
+					"mcp_hunt_install_failed addr=0x%llX size=%llu install_complete=%d",
+					static_cast<unsigned long long>(addr),
+					static_cast<unsigned long long>(size),
+					integrity_hunter::g_state.install_complete.load() ? 1 : 0);
+				integrity_hunter::stop_hunt();
+				const bool idle = integrity_hunter::wait_until_idle(12000);
+				diag::log_tagged_fmt("integrity_hunter", "mcp_hunt_install_failed_idle idle=%d", idle ? 1 : 0);
+				return tool_result_t::error(idle ? "integrity hunter page guard install failed" : "integrity hunter worker did not stop after install failure");
+			}
+
+			const auto monitor_start = std::chrono::steady_clock::now();
+			while (integrity_hunter::g_state.hunting.load()) {
+				const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+					std::chrono::steady_clock::now() - monitor_start).count();
+				if (elapsed >= duration)
+					break;
 				Sleep(50);
-				++wait;
 			}
 
 			integrity_hunter::stop_hunt();
-
-			int stop_wait = 0;
-			while (integrity_hunter::g_state.hunting.load() && stop_wait < 10) {
-				Sleep(50);
-				++stop_wait;
+			const bool idle = integrity_hunter::wait_until_idle(12000);
+			if (!idle) {
+				diag::log_tagged_fmt("integrity_hunter",
+					"mcp_hunt_stop_timeout addr=0x%llX size=%llu hunting=%d worker=%d session=%u",
+					static_cast<unsigned long long>(addr),
+					static_cast<unsigned long long>(size),
+					integrity_hunter::g_state.hunting.load() ? 1 : 0,
+					integrity_hunter::g_state.worker_active.load() ? 1 : 0,
+					integrity_hunter::g_state.pg_session_id.load());
+				return tool_result_t::error("integrity hunter worker did not stop cleanly");
 			}
 
 			std::lock_guard<std::mutex> lk(integrity_hunter::g_state.mutex);
@@ -594,6 +701,12 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			json result;
 			result["count"] = nodes.size();
 			result["total_reads"] = integrity_hunter::g_state.total_reads.load();
+			result["install_complete"] = integrity_hunter::g_state.install_complete.load();
+			result["install_success"] = integrity_hunter::g_state.install_success.load();
+			result["worker_idle"] = idle;
+			result["target_address"] = addr_str;
+			result["target_size"] = size;
+			result["duration_ms"] = duration;
 			result["nodes"] = arr;
 			return tool_result_t::ok(result);
 		}
@@ -647,7 +760,7 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			{"backend", "string", "Backend preference: auto, page_guard, polling, hardware_breakpoint", false},
 			{"timeout_ms", "integer", "Maximum backend startup wait in milliseconds (default: 3000, max 3500)", false}
 		},
-		true,
+		false,
 		[](const json& params) -> tool_result_t {
 			std::string addr_str = params.value("address", "");
 			int size = params.value("size", 256);
@@ -740,7 +853,7 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 		"stop_live_monitor",
 		"Stop the active live struct monitoring session and return accumulated access data.",
 		{{"require_captures", "boolean", "Return an error if no accesses were captured", false}},
-		true,
+		false,
 		[](const json& params) -> tool_result_t {
 			diag::log_tagged_fmt("analysis", "stop_live_monitor entry active=%d captures=%llu require=%d",
 				struct_monitor::g_state.active.load() ? 1 : 0,
@@ -1095,7 +1208,7 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 		 {"spoof_peb", "boolean", "Patch PEB BeingDebugged / NtGlobalFlag (default: true)", false},
 		 {"hook_rdtsc", "boolean", "Install RDTSC trampoline hooks for timing-based detection (default: true)", false},
 		 {"scrub_context", "boolean", "Zero DR0-DR7 on all target threads (default: false)", false}},
-		true,
+		false,
 		[](const json& params) -> tool_result_t {
 			uint32_t pid = 0;
 			std::string pid_str = params.value("pid", "");
@@ -1108,8 +1221,16 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 				return tool_result_t::error("no target PID: attach driver first or provide pid parameter");
 			}
 
-			if (stealth_engine::is_active())
+			if (stealth_engine::is_active_for_pid(pid))
 				return tool_result_t::ok(json{{"status", stealth_engine::get_status()}, {"already_active", true}});
+			if (stealth_engine::is_active()) {
+				auto active = stealth_engine::get_session_info();
+				json out;
+				out["requested_pid"] = pid;
+				out["active_pid"] = active.pid;
+				out["status"] = stealth_engine::get_status();
+				return tool_result_t{false, "stealth context is already active for a different PID", out};
+			}
 
 			stealth_engine::stealth_options_t opts;
 			opts.spoof_peb = params.value("spoof_peb", true);
@@ -1119,19 +1240,20 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 				"mcp_enable_request pid=%u peb=%d rdtsc=%d ctx=%d",
 				pid, opts.spoof_peb ? 1 : 0,
 				opts.hook_rdtsc ? 1 : 0, opts.scrub_context ? 1 : 0);
-			stealth_engine::enable_stealth(pid, opts);
+			const bool enabled = stealth_engine::enable_stealth(pid, opts);
 
 			json out;
 			out["pid"] = pid;
 			out["status"] = stealth_engine::get_status();
 			out["active"] = stealth_engine::is_active();
+			out["enabled"] = enabled;
 			{
 				std::lock_guard<std::mutex> lk(stealth_engine::g_state.mutex);
 				out["peb_spoofed"] = stealth_engine::g_state.session.peb_spoofed;
 				out["rdtsc_hooks"] = static_cast<int>(stealth_engine::g_state.session.hooks.size());
 				out["context_scrubbed"] = stealth_engine::g_state.session.context_hooked;
 			}
-			return tool_result_t::ok(out);
+			return enabled ? tool_result_t::ok(out) : tool_result_t{false, "stealth context could not be fully enabled", out};
 		}
 	});
 
@@ -1139,8 +1261,8 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 		"disable_stealth_context",
 		"Remove all stealth hooks installed by enable_stealth_context and restore original bytes. Safe to call even if stealth is not active.",
 		{},
-		true,
-		[](const json& params) -> tool_result_t {
+		false,
+		[](const json&) -> tool_result_t {
 			diag::log_tagged("analysis", "disable_stealth_context entry");
 			if (!stealth_engine::is_active()) {
 				diag::log_tagged("analysis", "disable_stealth_context skipped not_active");
@@ -1159,7 +1281,9 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			json out;
 			out["status"] = stealth_engine::get_status();
 			out["hooks_removed"] = hook_count;
-			diag::log_tagged_fmt("analysis", "disable_stealth_context complete hooks_removed=%d", hook_count);
+			out["active"] = stealth_engine::is_active();
+			diag::log_tagged_fmt("analysis", "disable_stealth_context complete hooks_removed=%d active=%d",
+				hook_count, stealth_engine::is_active() ? 1 : 0);
 			return tool_result_t::ok(out);
 		}
 	});
@@ -1825,6 +1949,8 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 				still_running ? "still_running" : "complete",
 				crypto_scanner::g_state.results.size(),
 				timed_out ? 1 : 0);
+			if (timed_out || still_running)
+				return tool_result_t{false, "Crypto scanner did not complete within the timeout.", result};
 			return tool_result_t::ok(result);
 		}
 	});

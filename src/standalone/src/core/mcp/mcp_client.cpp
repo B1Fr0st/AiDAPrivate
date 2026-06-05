@@ -14,6 +14,7 @@
 #include "auth_store.hpp"
 #include "event_bus.hpp"
 #include "anti-tamper/webhook.hpp"
+#include "../anti-tamper/mcp_posture.hpp"
 #include "../infra/work_queue.hpp"
 #include "../../helpers/diag_log.hpp"
 
@@ -63,6 +64,16 @@ static void set_global_last_error(const std::string& text)
         const std::string line = std::string("[mcp.oauth] ") + text;
         anti_tamper::webhook::write_log("mcp.oauth", line.c_str());
     }
+}
+
+static std::uint64_t mcp_log_hash(const std::string& text)
+{
+    std::uint64_t h = 14695981039346656037ULL;
+    for (unsigned char c : text) {
+        h ^= static_cast<std::uint64_t>(c);
+        h *= 1099511628211ULL;
+    }
+    return h;
 }
 
 const std::string& last_error()
@@ -1081,6 +1092,19 @@ client_t& client_t::operator=(client_t&& o) noexcept
 
 bool client_t::connect(const server_config_t& cfg)
 {
+    if (!anti_tamper::mcp_posture::is_runtime_trusted_server(cfg, true)) {
+        std::lock_guard<std::mutex> lk(_mtx);
+        _cfg = cfg;
+        _state = connection_state_t::error;
+        _last_error = "MCP posture blocked this server";
+        diag::log_tagged_fmt("mcp",
+            "connect_blocked_mcp_posture name_hash=0x%016llX name_len=%zu transport=%d",
+            static_cast<unsigned long long>(mcp_log_hash(cfg.name)),
+            cfg.name.size(),
+            static_cast<int>(cfg.transport));
+        return false;
+    }
+
     bool need_disconnect = false;
     {
         std::lock_guard<std::mutex> peek(_mtx);
@@ -1342,7 +1366,7 @@ std::vector<remote_tool_t> client_t::list_tools()
         return _cached_tools;
     }
 
-    _cached_tools.clear();
+    std::vector<remote_tool_t> next_tools;
     if (response.contains("result") && response["result"].contains("tools")) {
         const std::string server_label = _server_name_str.empty() ? _cfg.name : _server_name_str;
         for (const auto& t : response["result"]["tools"]) {
@@ -1352,14 +1376,20 @@ std::vector<remote_tool_t> client_t::list_tools()
             if (tool.original_name.empty()) continue;
             tool.name         = make_qualified_tool_name(server_label, tool.original_name);
             tool.description  = t.value("description", "");
+            if (!anti_tamper::mcp_posture::is_remote_tool_metadata_trusted(server_label, tool.original_name, tool.description)) {
+                _last_error = "tools/list blocked by MCP tool metadata posture";
+                _cached_tools.clear();
+                return _cached_tools;
+            }
             if (t.contains("inputSchema"))
                 tool.input_schema = t["inputSchema"];
             if (t.contains("annotations"))
                 tool.annotations = t["annotations"];
-            _cached_tools.push_back(std::move(tool));
+            next_tools.push_back(std::move(tool));
         }
     }
 
+    _cached_tools = std::move(next_tools);
     return _cached_tools;
 }
 
@@ -2017,7 +2047,7 @@ void client_t::process_notification(const json& notif)
                 return;
             }
             if (response.contains("result") && response["result"].contains("tools")) {
-                _cached_tools.clear();
+                std::vector<remote_tool_t> next_tools;
                 const std::string server_label = _server_name_str.empty() ? _cfg.name : _server_name_str;
                 for (const auto& t : response["result"]["tools"]) {
                     remote_tool_t tool;
@@ -2026,10 +2056,16 @@ void client_t::process_notification(const json& notif)
                     if (tool.original_name.empty()) continue;
                     tool.name          = make_qualified_tool_name(server_label, tool.original_name);
                     tool.description   = t.value("description", "");
+                    if (!anti_tamper::mcp_posture::is_remote_tool_metadata_trusted(server_label, tool.original_name, tool.description)) {
+                        _last_error = "tools/list refresh blocked by MCP tool metadata posture";
+                        _cached_tools.clear();
+                        return;
+                    }
                     if (t.contains("inputSchema")) tool.input_schema = t["inputSchema"];
                     if (t.contains("annotations")) tool.annotations = t["annotations"];
-                    _cached_tools.push_back(std::move(tool));
+                    next_tools.push_back(std::move(tool));
                 }
+                _cached_tools = std::move(next_tools);
             }
         }
 
@@ -2078,6 +2114,15 @@ bool client_t::launch_stdio_process()
 
     if (_cfg.command.empty()) {
         _last_error = "No command specified for stdio transport";
+        return false;
+    }
+
+    if (!anti_tamper::mcp_posture::is_runtime_trusted_server(_cfg, true)) {
+        _last_error = "MCP posture blocked stdio launch";
+        diag::log_tagged_fmt("mcp_stdio",
+            "launch_blocked_mcp_posture server_hash=0x%016llX name_len=%zu",
+            static_cast<unsigned long long>(mcp_log_hash(_cfg.name)),
+            _cfg.name.size());
         return false;
     }
 
@@ -2353,8 +2398,21 @@ manager_t::~manager_t() { disconnect_all(); }
 
 void manager_t::add_server(const server_config_t& cfg)
 {
-    diag::log_tagged_fmt("mcp", "add_server name='%s' url='%s' enabled=%d auto_connect=%d",
-        cfg.name.c_str(), cfg.url.c_str(), static_cast<int>(cfg.enabled),
+    if (!anti_tamper::mcp_posture::is_runtime_trusted_server(cfg, false)) {
+        diag::log_tagged_fmt("mcp",
+            "add_server_blocked_mcp_posture name_hash=0x%016llX name_len=%zu enabled=%d transport=%d",
+            static_cast<unsigned long long>(mcp_log_hash(cfg.name)),
+            cfg.name.size(),
+            static_cast<int>(cfg.enabled),
+            static_cast<int>(cfg.transport));
+        return;
+    }
+
+    diag::log_tagged_fmt("mcp", "add_server name_hash=0x%016llX name_len=%zu url_hash=0x%016llX enabled=%d auto_connect=%d",
+        static_cast<unsigned long long>(mcp_log_hash(cfg.name)),
+        cfg.name.size(),
+        static_cast<unsigned long long>(mcp_log_hash(cfg.url)),
+        static_cast<int>(cfg.enabled),
         static_cast<int>(cfg.auto_connect));
     std::lock_guard<std::mutex> lk(_mtx);
 
@@ -2362,7 +2420,9 @@ void manager_t::add_server(const server_config_t& cfg)
     for (auto& ep : _entries) {
         if (ep->cfg.name == cfg.name) {
             ep->cfg = cfg;
-            diag::log_tagged_fmt("mcp", "add_server updated_existing name='%s'", cfg.name.c_str());
+            diag::log_tagged_fmt("mcp", "add_server updated_existing name_hash=0x%016llX name_len=%zu",
+                static_cast<unsigned long long>(mcp_log_hash(cfg.name)),
+                cfg.name.size());
             return;
         }
     }
@@ -2370,8 +2430,10 @@ void manager_t::add_server(const server_config_t& cfg)
     auto ep = std::make_shared<entry_t>();
     ep->cfg = cfg;
     _entries.push_back(std::move(ep));
-    diag::log_tagged_fmt("mcp", "add_server added_new name='%s' total_servers=%zu",
-        cfg.name.c_str(), _entries.size());
+    diag::log_tagged_fmt("mcp", "add_server added_new name_hash=0x%016llX name_len=%zu total_servers=%zu",
+        static_cast<unsigned long long>(mcp_log_hash(cfg.name)),
+        cfg.name.size(),
+        _entries.size());
 }
 
 void manager_t::remove_server(const std::string& name)
@@ -2444,7 +2506,10 @@ void manager_t::connect_all()
 
         client_t tmp_client;
         bool ok = tmp_client.connect(cfg);
-        if (ok) tmp_client.list_tools();
+        if (ok) {
+            tmp_client.list_tools();
+            ok = tmp_client.state() == connection_state_t::connected;
+        }
 
         std::lock_guard<std::mutex> lk(_mtx);
         _in_flight_connects.erase(
@@ -2494,7 +2559,10 @@ bool manager_t::connect_server(const std::string& name)
 
     client_t tmp_client;
     bool ok = tmp_client.connect(cfg);
-    if (ok) tmp_client.list_tools();
+    if (ok) {
+        tmp_client.list_tools();
+        ok = tmp_client.state() == connection_state_t::connected;
+    }
 
     std::lock_guard<std::mutex> lk(_mtx);
     _in_flight_connects.erase(
@@ -2764,6 +2832,7 @@ bool manager_t::refresh_tools(const std::string& name)
     if (!target) return false;
     if (!target->client.is_connected()) return false;
     auto tools = target->client.list_tools();
+    if (!target->client.is_connected()) return false;
     aida::events::mcp_tools_changed_t payload;
     payload.server_name = name;
     payload.tool_count = static_cast<int>(tools.size());

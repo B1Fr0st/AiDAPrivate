@@ -2900,7 +2900,7 @@ ARC_API bool arc_init(
                 arc_log("driver", "register_dll_protection_hash_unavailable");
                 enforce_violation_id(aida::reason_ids::reason_id_arc_no_driver, "register_dll_protection_hash_unavailable");
             }
-            else if (!dev->register_dll_protection(image_base, text_va,
+            else if (!dev->register_dll_protection_for_pid(GetCurrentProcessId(), image_base, text_va,
                     static_cast<uint32_t>(text_size), driver_expected_hash, 2000))
             {
                 DWORD gle = GetLastError();
@@ -3622,8 +3622,20 @@ __declspec(noinline) static void arc_cleanup_unregister_protection_seh()
     voyager::device_t* dev = arc_internal::get_prebound_device();
     if (!dev)
         return;
+    MEMORY_BASIC_INFORMATION mbi{};
+    uint64_t module_base = 0;
+    if (VirtualQuery(reinterpret_cast<const void*>(&arc_cleanup_unregister_protection_seh), &mbi, sizeof(mbi)) &&
+        mbi.AllocationBase)
+    {
+        module_base = reinterpret_cast<uint64_t>(mbi.AllocationBase);
+    }
+    if (module_base == 0)
+    {
+        arc_internal::arc_log("driver", "cleanup_unregister_module_base_unavailable");
+        return;
+    }
     __try {
-        dev->unregister_dll_protection();
+        dev->unregister_dll_protection_for_pid(GetCurrentProcessId(), module_base);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
     }

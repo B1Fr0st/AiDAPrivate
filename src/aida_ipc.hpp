@@ -1,14 +1,14 @@
 #pragma once
 
-#include <cstdint>
-
-#include "aida_manual_map_proof.hpp"
+#include <string>
 
 namespace aida_ipc
 {
-    bool start_if_manual_mapped(const aida_manual_map::proof_buffer_t& proof);
+    bool verify_standalone_runtime(std::string* failure = nullptr);
+
+    bool start_standalone_watchdog();
 
     void shutdown();
 
-    bool is_pipe_alive();
+    bool is_standalone_alive();
 }

@@ -103,7 +103,7 @@ tool_result_t handle_add_slot(const json& p)
     diag::log_tagged_fmt("mcp_burp", "comparer_add_slot ok slot_id=%llu bytes=%zu", static_cast<unsigned long long>(id), data.size());
     json out;
     out["slot_id"] = id;
-    return tool_result_t::ok("slot added", out);
+    return tool_result_t::ok("slot added id=" + std::to_string(id) + " bytes=" + std::to_string(data.size()), out);
 }
 
 tool_result_t handle_list(const json&)
@@ -123,7 +123,7 @@ tool_result_t handle_list(const json&)
     diag::log_tagged_fmt("mcp_burp", "comparer_list ok count=%zu", v.size());
     json out;
     out["slots"] = std::move(arr);
-    return tool_result_t::ok("slots", out);
+    return tool_result_t::ok("slots count=" + std::to_string(v.size()), out);
 }
 
 tool_result_t handle_remove(const json& p)
@@ -212,7 +212,7 @@ tool_result_t handle_diff(const json& p)
     json out;
     out["blocks"] = std::move(arr);
     out["stats"]  = std::move(st);
-    return tool_result_t::ok("diff computed", out);
+    return tool_result_t::ok("diff computed blocks=" + std::to_string(blocks.size()), out);
 }
 
 }

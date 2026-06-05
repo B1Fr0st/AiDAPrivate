@@ -31,12 +31,10 @@ const PfnDliHook __pfnDliNotifyHook2 = aida_plugin_delay_load_hook;
 
 #ifdef __NT__
 #include "driver_loader.hpp"
-#include "aida_manual_map_proof.hpp"
 #include "aida_ipc.hpp"
 #include <atomic>
 #include <exception>
 #include <thread>
-#include <tlhelp32.h>
 #include <bcrypt.h>
 #include <vector>
 
@@ -44,10 +42,6 @@ const PfnDliHook __pfnDliNotifyHook2 = aida_plugin_delay_load_hook;
 #endif
 
 #ifdef __NT__
-
-extern "C" __declspec(dllexport) volatile uint64_t aida_manual_map_marker = 0ULL;
-extern "C" __declspec(dllexport) volatile uint8_t  aida_proof_buffer[aida_manual_map::kProofBufferLen] = {0};
-extern "C" __declspec(dllexport) const uint32_t    aida_proof_buffer_len = aida_manual_map::kProofBufferLen;
 
 namespace {
 
@@ -71,31 +65,6 @@ bool destructive_plugin_action_suppressed()
 {
     return env_flag_enabled("AIDA_FULL_TEST_RUNNING") ||
            env_flag_enabled("AIDA_DISABLE_DESTRUCTIVE_ENFORCEMENT");
-}
-
-bool is_manual_mapped()
-{
-    return aida_manual_map_marker == aida_manual_map::kMarkerValue;
-}
-
-bool consume_manual_map_proof(aida_manual_map::proof_buffer_t& out_proof)
-{
-    if (!is_manual_mapped())
-        return false;
-    aida_manual_map::proof_buffer_t snap{};
-    uint8_t* dst = reinterpret_cast<uint8_t*>(&snap);
-    for (size_t i = 0; i < sizeof(snap); ++i)
-        dst[i] = aida_proof_buffer[i];
-    if (snap.magic != aida_manual_map::kProofMagic)
-        return false;
-    if (snap.version != aida_manual_map::kProofVersion)
-        return false;
-    if (snap.parent_pid == 0 || snap.ida_pid == 0)
-        return false;
-    if (snap.runtime_nonce_seed == 0)
-        return false;
-    out_proof = snap;
-    return true;
 }
 
 bool ascii_iequal_w(const wchar_t* a, const wchar_t* b)
@@ -213,8 +182,6 @@ void plugin_validate_load_context(HINSTANCE self_module)
         plugin_dispatch_kill(kDllMainBadHostFastFailCode);
         return;
     }
-    if (is_manual_mapped())
-        return;
     if (!plugin_own_filename_is_canonical(self_module))
     {
         plugin_dispatch_kill(kDllMainBadNameFastFailCode);
@@ -235,11 +202,6 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE hinstDLL,
 }
 
 namespace {
-
-constexpr int    kStandaloneWatchdogPeriodMs      = 5000;
-constexpr int    kStandaloneWatchdogFailThreshold = 3;
-constexpr int    kStandaloneWatchdogGraceTicks    = 6;
-constexpr DWORD  kStandaloneAbsentFastFailCode    = 0xA1DA1DA1u;
 
 constexpr DWORD  kSelfReverseEngineerBsodCode     = 0xA1DA0DEAu;
 
@@ -302,14 +264,6 @@ bool sha256_file_path_w(const wchar_t* path, uint8_t out_hash[32])
     if (alg) BCryptCloseAlgorithmProvider(alg, 0);
     CloseHandle(hf);
     return ok;
-}
-
-void load_forbidden_hashes_from_proof(const aida_manual_map::proof_buffer_t& proof)
-{
-    std::memcpy(g_self_re_forbidden_hash_standalone, proof.forbidden_hash_standalone, 32);
-    std::memcpy(g_self_re_forbidden_hash_plugin,     proof.forbidden_hash_plugin,     32);
-    std::memcpy(g_self_re_forbidden_hash_arc,        proof.forbidden_hash_arc,        32);
-    g_self_re_hashes_ready.store(true, std::memory_order_release);
 }
 
 bool hashes_equal(const uint8_t a[32], const uint8_t b[32])
@@ -383,91 +337,11 @@ void check_input_for_self_target()
     trigger_self_re_bsod(path_a, matched);
 }
 
-std::atomic<bool> g_standalone_watchdog_started{false};
-std::atomic<bool> g_standalone_watchdog_stop{false};
-
-bool is_standalone_running()
-{
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap == INVALID_HANDLE_VALUE)
-        return true;
-    PROCESSENTRY32W pe{};
-    pe.dwSize = sizeof(pe);
-    bool found = false;
-    if (Process32FirstW(snap, &pe))
-    {
-        do
-        {
-            if (_wcsicmp(pe.szExeFile, L"AiDAStandalone.exe") == 0)
-            {
-                found = true;
-                break;
-            }
-        } while (Process32NextW(snap, &pe));
-    }
-    CloseHandle(snap);
-    return found;
-}
-
 bool plugin_cpuid_vm_vendor_match();
 bool plugin_hyperv_guest_partition();
 bool plugin_smbios_vm_string();
 void plugin_vm_guard();
 void plugin_kd_test_signing_guard();
-
-void standalone_watchdog_thread()
-{
-    int consecutive_fail = 0;
-    int grace_ticks = kStandaloneWatchdogGraceTicks;
-    while (!g_standalone_watchdog_stop.load(std::memory_order_acquire))
-    {
-        Sleep(kStandaloneWatchdogPeriodMs);
-        if (g_standalone_watchdog_stop.load(std::memory_order_acquire))
-            break;
-
-        plugin_vm_guard();
-        plugin_kd_test_signing_guard();
-
-        bool present = is_standalone_running();
-        if (present)
-        {
-            consecutive_fail = 0;
-            grace_ticks = 0;
-            continue;
-        }
-        if (grace_ticks > 0)
-        {
-            --grace_ticks;
-            continue;
-        }
-        ++consecutive_fail;
-        if (consecutive_fail >= kStandaloneWatchdogFailThreshold)
-        {
-            __fastfail(kStandaloneAbsentFastFailCode);
-        }
-    }
-}
-
-void start_standalone_watchdog()
-{
-    bool expected = false;
-    if (!g_standalone_watchdog_started.compare_exchange_strong(expected, true))
-        return;
-    try
-    {
-        std::thread(standalone_watchdog_thread).detach();
-    }
-    catch (const std::exception& ex)
-    {
-        g_standalone_watchdog_started.store(false, std::memory_order_release);
-        msg(OBFSTR_C("AiDA standalone watchdog worker unavailable: %s\n"), ex.what());
-    }
-    catch (...)
-    {
-        g_standalone_watchdog_started.store(false, std::memory_order_release);
-        msg(OBFSTR_C("AiDA standalone watchdog worker unavailable.\n"));
-    }
-}
 
 constexpr DWORD kVirtualMachineFastFailCode = 0xA1DAB10Cu;
 constexpr DWORD kKernelDebugFastFailCode    = 0xA1DAB10Du;
@@ -653,9 +527,6 @@ void plugin_kd_test_signing_guard()
 #ifdef __NT__
 static bool has_expected_plugin_filename()
 {
-    if (aida_manual_map_marker == aida_manual_map::kMarkerValue)
-        return true;
-
     HMODULE module = nullptr;
     if (!GetModuleHandleExW(
             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
@@ -805,7 +676,8 @@ aida_plugin_t::aida_plugin_t()
 #ifdef __NT__
     if (!driver_loader::is_driver_loaded())
         msg(OBFSTR_C("AiDA Driver: Warning - kernel driver trust state was lost after initialization.\n"));
-    start_standalone_watchdog();
+    if (!aida_ipc::start_standalone_watchdog())
+        msg(OBFSTR_C("AiDA standalone watchdog worker unavailable.\n"));
 #endif
 
     g_settings.load(this);
@@ -844,7 +716,6 @@ aida_plugin_t::aida_plugin_t()
 aida_plugin_t::~aida_plugin_t()
 {
 #ifdef __NT__
-    g_standalone_watchdog_stop.store(true, std::memory_order_release);
     aida_ipc::shutdown();
 #endif
 
@@ -976,10 +847,7 @@ void aida_plugin_t::unregister_actions()
 static plugmod_t* idaapi init()
 {
 #ifdef __NT__
-    aida_manual_map::proof_buffer_t manual_proof{};
-    bool manual_mapped = consume_manual_map_proof(manual_proof);
-
-    if (!manual_mapped && !has_expected_plugin_filename())
+    if (!has_expected_plugin_filename())
     {
         msg(OBFSTR_C("AiDA: plugin filename mismatch. Expected exact name: AiDA.dll\n"));
         return PLUGIN_SKIP;
@@ -987,6 +855,15 @@ static plugmod_t* idaapi init()
 
     plugin_vm_guard();
     plugin_kd_test_signing_guard();
+
+    std::string standalone_failure;
+    if (!aida_ipc::verify_standalone_runtime(&standalone_failure))
+    {
+        msg(OBFSTR_C("AiDA: AiDAStandalone.exe must be running, authenticated, and ARC-verified before AiDA.dll can load. detail=%s\n"),
+            standalone_failure.empty() ? "verification failed" : standalone_failure.c_str());
+        __fastfail(0xA1DA1DA1u);
+        return PLUGIN_SKIP;
+    }
 #endif
 
     g_settings.load_from_file();
@@ -1003,11 +880,7 @@ static plugmod_t* idaapi init()
     }
 
 #ifdef __NT__
-    if (manual_mapped)
-    {
-        driver_loader::mark_already_loaded();
-    }
-    else if (!driver_loader::initialize_and_load())
+    if (!driver_loader::initialize_and_load())
     {
         msg(OBFSTR_C("AiDA: kernel driver attestation is required and could not be initialized.\n"));
         return PLUGIN_SKIP;
@@ -1074,13 +947,7 @@ static plugmod_t* idaapi init()
     license.snapshot_function_prologues();
 
 #ifdef __NT__
-    if (manual_mapped)
-    {
-        load_forbidden_hashes_from_proof(manual_proof);
-        check_input_for_self_target();
-        aida_ipc::start_if_manual_mapped(manual_proof);
-        std::memset(&manual_proof, 0, sizeof(manual_proof));
-    }
+    check_input_for_self_target();
     anti_re::start_pipe_monitor();
     {
         uint8_t self_sha[32] = {};

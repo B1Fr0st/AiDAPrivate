@@ -152,7 +152,7 @@ void write_value(uint64_t address, value_type_t type, const std::string& value_t
 std::string read_value_string(uint64_t address, value_type_t type);
 void refresh_address_list();
 
-void start_pointer_scan(uint64_t target_address, int max_depth, int max_offset);
+bool start_pointer_scan(uint64_t target_address, int max_depth, int max_offset, uint64_t scan_base = 0, uint64_t scan_size = 0);
 void cancel_pointer_scan();
 
 std::string format_value(const std::vector<uint8_t>& bytes, value_type_t type);

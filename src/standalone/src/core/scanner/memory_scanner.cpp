@@ -4,12 +4,14 @@
 #include "memory_scanner.hpp"
 #include "work_queue.hpp"
 #include "standalone_driver.hpp"
+#include "../anti-tamper/state.hpp"
 #include "../helpers/diag_log.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <map>
 #include <sstream>
 #include <iomanip>
@@ -473,30 +475,54 @@ static void first_scan_thread(scan_config_t config) {
 	};
 
 
-	const int worker_count = []() {
+	const bool full_test_running = anti_tamper::state::get().full_test_running.load(std::memory_order_acquire);
+	const int worker_count = full_test_running ? 0 : []() {
 		unsigned int hc = std::thread::hardware_concurrency();
 		if (hc < 2u) return 1;
 		if (hc > 8u) return 4;
 		return static_cast<int>(hc / 2u);
 	}();
+	if (full_test_running) {
+		diag::log_tagged_fmt("mem_scanner",
+			"first_scan_thread full_test_inline_workers regions=%zu bytes=%zu",
+			scan_regions.size(),
+			total_bytes);
+	}
 	std::atomic<size_t> next_region{0};
-	std::atomic<int> remaining_workers{worker_count};
-
-	for (int w = 0; w < worker_count; ++w) {
-		if (!work_queue::post([&]() {
-				size_t idx;
-				while ((idx = next_region.fetch_add(1)) < scan_regions.size()) {
+	std::vector<std::thread> workers;
+	const int actual_workers = static_cast<int>((std::min<size_t>)(static_cast<size_t>(worker_count), scan_regions.size()));
+	try {
+		workers.reserve(static_cast<size_t>(actual_workers));
+		for (int w = 0; w < actual_workers; ++w) {
+			workers.emplace_back([&]() {
+				for (;;) {
+					size_t idx = next_region.fetch_add(1);
+					if (idx >= scan_regions.size()) break;
 					if (!st.scanning.load()) break;
-					scan_region(scan_regions[idx]);
+					try {
+						scan_region(scan_regions[idx]);
+					} catch (...) {
+						read_failures.fetch_add(1, std::memory_order_acq_rel);
+					}
 				}
-				remaining_workers.fetch_sub(1, std::memory_order_acq_rel);
-			}))
-		{
-			remaining_workers.fetch_sub(1, std::memory_order_acq_rel);
+			});
+		}
+	} catch (const std::exception& ex) {
+		diag::log_tagged_fmt("mem_scanner", "first_scan_thread local_worker_create_failed err='%s'", ex.what());
+	} catch (...) {
+		diag::log_tagged("mem_scanner", "first_scan_thread local_worker_create_failed err='<unknown>'");
+	}
+	if (workers.empty()) {
+		for (size_t idx = 0; idx < scan_regions.size(); ++idx) {
+			if (!st.scanning.load()) break;
+			scan_region(scan_regions[idx]);
+		}
+	} else {
+		for (auto& worker : workers) {
+			if (worker.joinable())
+				worker.join();
 		}
 	}
-	while (remaining_workers.load(std::memory_order_acquire) > 0)
-		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
 
 	std::sort(all_results.begin(), all_results.end(),
@@ -747,6 +773,51 @@ static void next_scan_thread(scan_mode_t mode, std::string value_text, std::stri
 }
 
 
+static bool wait_scan_worker_ready(const char* op) {
+	auto& st = g_state;
+	const ULONGLONG start = GetTickCount64();
+	for (;;) {
+		if (st.scan_thread_done.load(std::memory_order_acquire))
+			return true;
+		if (!st.scanning.load(std::memory_order_acquire)) {
+			st.scan_thread_done.store(true, std::memory_order_release);
+			diag::log_tagged_fmt("mem_scanner",
+				"%s recovered stale scan_thread_done=0 scanning=0 elapsed_ms=%llu",
+				op ? op : "scan",
+				static_cast<unsigned long long>(GetTickCount64() - start));
+			return true;
+		}
+		if (GetTickCount64() - start >= 5000) {
+			diag::log_tagged_fmt("mem_scanner",
+				"%s refused previous_worker_busy elapsed_ms=%llu progress=%.3f",
+				op ? op : "scan",
+				static_cast<unsigned long long>(GetTickCount64() - start),
+				static_cast<double>(st.scan_progress.load(std::memory_order_acquire)));
+			return false;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+}
+
+static bool should_run_first_scan_inline(const scan_config_t& config)
+{
+	constexpr uint64_t kMaxInlineRange = 16ull * 1024ull * 1024ull;
+	return config.range_base != 0 && config.range_size != 0 && config.range_size <= kMaxInlineRange;
+}
+
+static bool should_run_next_scan_inline()
+{
+	std::lock_guard<std::mutex> lk(g_state.results_mutex);
+	return g_state.results.size() <= 250000;
+}
+
+static bool should_run_pointer_scan_inline(uint64_t scan_base, uint64_t scan_size, int max_depth)
+{
+	constexpr uint64_t kMaxInlineRange = 16ull * 1024ull * 1024ull;
+	return scan_base != 0 && scan_size != 0 && scan_size <= kMaxInlineRange && max_depth <= 3;
+}
+
+
 static void freeze_loop() {
 	auto& st = g_state;
 	diag::log_tagged("mem_scanner", "freeze_loop start");
@@ -877,7 +948,7 @@ static void pointer_dfs(const std::multimap<uint64_t, pointer_entry_t>& reverse_
 	visited.pop_back();
 }
 
-static void pointer_scan_thread(uint64_t target_address, int max_depth, int max_offset) {
+static void pointer_scan_thread(uint64_t target_address, int max_depth, int max_offset, uint64_t scan_base, uint64_t scan_size) {
 	auto& st = g_state;
 	st.pointer_progress.store(0.f);
 	auto t_start = std::chrono::steady_clock::now();
@@ -885,8 +956,10 @@ static void pointer_scan_thread(uint64_t target_address, int max_depth, int max_
 	auto modules = driver_bridge::enumerate_modules();
 	auto regions = driver_bridge::enumerate_memory_regions(4096);
 
-	diag::log_tagged_fmt("pointer_scan", "pointer_scan_thread enter target=0x%llX max_depth=%d max_offset=0x%X modules=%zu regions=%zu",
+	diag::log_tagged_fmt("pointer_scan", "pointer_scan_thread enter target=0x%llX max_depth=%d max_offset=0x%X scan_range=0x%llX+0x%llX modules=%zu regions=%zu",
 		static_cast<unsigned long long>(target_address), max_depth, max_offset,
+		static_cast<unsigned long long>(scan_base),
+		static_cast<unsigned long long>(scan_size),
 		modules.size(), regions.size());
 
 	if (max_depth < 1) max_depth = 4;
@@ -894,15 +967,42 @@ static void pointer_scan_thread(uint64_t target_address, int max_depth, int max_
 	if (max_offset < 0) max_offset = 0x1000;
 	if (max_offset > 0x10000) max_offset = 0x10000;
 
+	const bool has_scan_range = scan_base != 0 && scan_size != 0;
+	const uint64_t max_u64 = (std::numeric_limits<uint64_t>::max)();
+	const uint64_t scan_end = has_scan_range
+		? (max_u64 - scan_base < scan_size ? max_u64 : scan_base + scan_size)
+		: 0;
+	size_t skipped_state = 0;
+	size_t skipped_guard = 0;
+	size_t skipped_protect = 0;
+	size_t skipped_size = 0;
+	size_t skipped_range = 0;
 	std::vector<driver_bridge::memory_region_t> scan_regions;
 	for (const auto& r : regions) {
-		if (r.state != 0x1000) continue;
-		if (r.protect & 0x100) continue;
+		if (r.state != 0x1000) { ++skipped_state; continue; }
+		if (r.protect & 0x100) { ++skipped_guard; continue; }
 		uint32_t protect_flags = r.protect & 0xFF;
-		if (protect_flags == 0x01 || protect_flags == 0x00) continue;
-		if (r.size > 0x10000000) continue;
-		scan_regions.push_back(r);
+		if (protect_flags == 0x01 || protect_flags == 0x00) { ++skipped_protect; continue; }
+		if (r.size > 0x10000000) { ++skipped_size; continue; }
+		driver_bridge::memory_region_t selected = r;
+		if (has_scan_range) {
+			const uint64_t region_end = max_u64 - r.base < r.size ? max_u64 : r.base + r.size;
+			const uint64_t clipped_start = (std::max)(r.base, scan_base);
+			const uint64_t clipped_end = (std::min)(region_end, scan_end);
+			if (clipped_start >= clipped_end) { ++skipped_range; continue; }
+			selected.base = clipped_start;
+			selected.size = clipped_end - clipped_start;
+		}
+		scan_regions.push_back(selected);
 	}
+	diag::log_tagged_fmt("pointer_scan", "pointer_scan_thread region_filter raw=%zu selected=%zu skipped_state=%zu skipped_guard=%zu skipped_protect=%zu skipped_size=%zu skipped_range=%zu",
+		regions.size(),
+		scan_regions.size(),
+		skipped_state,
+		skipped_guard,
+		skipped_protect,
+		skipped_size,
+		skipped_range);
 
 	const int ptr_worker_count = []() {
 		unsigned int hc = std::thread::hardware_concurrency();
@@ -917,9 +1017,7 @@ static void pointer_scan_thread(uint64_t target_address, int max_depth, int max_
 	for (const auto& r : scan_regions) total_bytes += r.size;
 	if (total_bytes == 0) total_bytes = 1;
 
-	std::atomic<int> ptr_workers_remaining{ptr_worker_count};
-	for (int w = 0; w < ptr_worker_count; ++w) {
-		if (!work_queue::post([&, w]() {
+	auto scan_pointer_worker = [&](int w) {
 			auto& local_map = partial_maps[static_cast<size_t>(w)];
 			size_t idx;
 			while ((idx = region_idx.fetch_add(1)) < scan_regions.size()) {
@@ -953,6 +1051,13 @@ static void pointer_scan_thread(uint64_t target_address, int max_depth, int max_
 								break;
 							}
 						}
+						if (!valid) {
+							const uint64_t lo = (target_address > static_cast<uint64_t>(max_offset))
+								? (target_address - static_cast<uint64_t>(max_offset)) : 0;
+							const uint64_t hi = max_u64 - target_address < static_cast<uint64_t>(max_offset)
+								? max_u64 : target_address + static_cast<uint64_t>(max_offset);
+							valid = value >= lo && value <= hi;
+						}
 						if (!valid) continue;
 
 						pointer_entry_t pe;
@@ -963,18 +1068,30 @@ static void pointer_scan_thread(uint64_t target_address, int max_depth, int max_
 					}
 
 					bytes_scanned.fetch_add(read_sz);
-					st.pointer_progress.store(
-						static_cast<float>(bytes_scanned.load()) / static_cast<float>(total_bytes) * 0.5f);
-				}
+				st.pointer_progress.store(
+					static_cast<float>(bytes_scanned.load()) / static_cast<float>(total_bytes) * 0.5f);
 			}
-			ptr_workers_remaining.fetch_sub(1, std::memory_order_acq_rel);
-		}))
-		{
-			ptr_workers_remaining.fetch_sub(1, std::memory_order_acq_rel);
+		}
+	};
+	std::vector<std::thread> ptr_workers;
+	try {
+		ptr_workers.reserve(static_cast<size_t>(ptr_worker_count));
+		for (int w = 0; w < ptr_worker_count; ++w)
+			ptr_workers.emplace_back(scan_pointer_worker, w);
+	} catch (const std::exception& ex) {
+		diag::log_tagged_fmt("pointer_scan", "pointer_scan_thread map_worker_create_failed err='%s'", ex.what());
+	} catch (...) {
+		diag::log_tagged("pointer_scan", "pointer_scan_thread map_worker_create_failed err='<unknown>'");
+	}
+	if (ptr_workers.empty()) {
+		for (int w = 0; w < ptr_worker_count; ++w)
+			scan_pointer_worker(w);
+	} else {
+		for (auto& worker : ptr_workers) {
+			if (worker.joinable())
+				worker.join();
 		}
 	}
-	while (ptr_workers_remaining.load(std::memory_order_acquire) > 0)
-		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
 	if (!st.pointer_scanning.load()) {
 		st.pointer_progress.store(1.f);
@@ -1025,9 +1142,7 @@ static void pointer_scan_thread(uint64_t target_address, int max_depth, int max_
 	std::atomic<size_t> seed_idx{0};
 	std::atomic<bool> dfs_cancel{false};
 
-	std::atomic<int> dfs_workers_remaining{ptr_worker_count};
-	for (int w = 0; w < ptr_worker_count; ++w) {
-		if (!work_queue::post([&]() {
+	auto dfs_worker = [&]() {
 			std::vector<int64_t> current_offsets;
 			std::vector<uint64_t> visited;
 			visited.push_back(target_address);
@@ -1084,17 +1199,28 @@ static void pointer_scan_thread(uint64_t target_address, int max_depth, int max_
 					}
 				}
 
-				st.pointer_progress.store(
-					0.5f + (static_cast<float>(idx + 1) / static_cast<float>(seed_values.size())) * 0.5f);
-			}
-			dfs_workers_remaining.fetch_sub(1, std::memory_order_acq_rel);
-		}))
-		{
-			dfs_workers_remaining.fetch_sub(1, std::memory_order_acq_rel);
+			st.pointer_progress.store(
+				0.5f + (static_cast<float>(idx + 1) / static_cast<float>(seed_values.size())) * 0.5f);
+		}
+	};
+	std::vector<std::thread> dfs_workers;
+	try {
+		dfs_workers.reserve(static_cast<size_t>(ptr_worker_count));
+		for (int w = 0; w < ptr_worker_count; ++w)
+			dfs_workers.emplace_back(dfs_worker);
+	} catch (const std::exception& ex) {
+		diag::log_tagged_fmt("pointer_scan", "pointer_scan_thread dfs_worker_create_failed err='%s'", ex.what());
+	} catch (...) {
+		diag::log_tagged("pointer_scan", "pointer_scan_thread dfs_worker_create_failed err='<unknown>'");
+	}
+	if (dfs_workers.empty()) {
+		dfs_worker();
+	} else {
+		for (auto& worker : dfs_workers) {
+			if (worker.joinable())
+				worker.join();
 		}
 	}
-	while (dfs_workers_remaining.load(std::memory_order_acquire) > 0)
-		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
 	std::sort(results.begin(), results.end(),
 		[](const pointer_result_t& a, const pointer_result_t& b) {
@@ -1208,15 +1334,58 @@ bool first_scan(const scan_config_t& config) {
 		st.config = config;
 	}
 
+	if (!wait_scan_worker_ready("first_scan"))
+		return false;
+
 	st.scanning.store(true);
-	while (!st.scan_thread_done.load(std::memory_order_acquire))
-		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 	st.scan_thread_done.store(false, std::memory_order_release);
-	if (!work_queue::post([config]() {
+	if (should_run_first_scan_inline(config)) {
+		diag::log_tagged_fmt("mem_scanner",
+			"first_scan inline_dispatch pid=%u range=0x%llX+0x%llX",
+			driver_bridge::attached_pid(),
+			static_cast<unsigned long long>(config.range_base),
+			static_cast<unsigned long long>(config.range_size));
+		try {
 			first_scan_thread(config);
+		} catch (const std::exception& ex) {
+			diag::log_tagged_fmt("mem_scanner", "first_scan inline exception err='%s'", ex.what());
+			st.scanning.store(false, std::memory_order_release);
+			st.scan_progress.store(1.f, std::memory_order_release);
+		} catch (...) {
+			diag::log_tagged("mem_scanner", "first_scan inline exception err='<unknown>'");
+			st.scanning.store(false, std::memory_order_release);
+			st.scan_progress.store(1.f, std::memory_order_release);
+		}
+		st.scan_thread_done.store(true, std::memory_order_release);
+		return true;
+	}
+	try {
+		if (!work_queue::post([config]() {
+			try {
+				first_scan_thread(config);
+			} catch (const std::exception& ex) {
+				diag::log_tagged_fmt("mem_scanner", "first_scan worker exception err='%s'", ex.what());
+				g_state.scanning.store(false, std::memory_order_release);
+				g_state.scan_progress.store(1.f, std::memory_order_release);
+			} catch (...) {
+				diag::log_tagged("mem_scanner", "first_scan worker exception err='<unknown>'");
+				g_state.scanning.store(false, std::memory_order_release);
+				g_state.scan_progress.store(1.f, std::memory_order_release);
+			}
 			g_state.scan_thread_done.store(true, std::memory_order_release);
-		}))
-	{
+		})) {
+			diag::log_tagged("mem_scanner", "first_scan worker_post_failed");
+			st.scan_thread_done.store(true, std::memory_order_release);
+			st.scanning.store(false);
+			return false;
+		}
+	} catch (const std::exception& ex) {
+		diag::log_tagged_fmt("mem_scanner", "first_scan worker_create_failed err='%s'", ex.what());
+		st.scan_thread_done.store(true, std::memory_order_release);
+		st.scanning.store(false);
+		return false;
+	} catch (...) {
+		diag::log_tagged("mem_scanner", "first_scan worker_create_failed err='<unknown>'");
 		st.scan_thread_done.store(true, std::memory_order_release);
 		st.scanning.store(false);
 		return false;
@@ -1242,15 +1411,56 @@ bool next_scan(scan_mode_t mode, const std::string& value_text, const std::strin
 	diag::log_tagged_fmt("mem_scanner", "next_scan start mode=%s val='%s' val2='%s'",
 		scan_mode_name(mode), value_text.c_str(), value_text2.c_str());
 
+	if (!wait_scan_worker_ready("next_scan"))
+		return false;
+
 	st.scanning.store(true);
-	while (!st.scan_thread_done.load(std::memory_order_acquire))
-		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 	st.scan_thread_done.store(false, std::memory_order_release);
-	if (!work_queue::post([mode, value_text, value_text2]() {
+	if (should_run_next_scan_inline()) {
+		diag::log_tagged_fmt("mem_scanner",
+			"next_scan inline_dispatch mode=%s",
+			scan_mode_name(mode));
+		try {
 			next_scan_thread(mode, value_text, value_text2);
+		} catch (const std::exception& ex) {
+			diag::log_tagged_fmt("mem_scanner", "next_scan inline exception err='%s'", ex.what());
+			st.scanning.store(false, std::memory_order_release);
+			st.scan_progress.store(1.f, std::memory_order_release);
+		} catch (...) {
+			diag::log_tagged("mem_scanner", "next_scan inline exception err='<unknown>'");
+			st.scanning.store(false, std::memory_order_release);
+			st.scan_progress.store(1.f, std::memory_order_release);
+		}
+		st.scan_thread_done.store(true, std::memory_order_release);
+		return true;
+	}
+	try {
+		if (!work_queue::post([mode, value_text, value_text2]() {
+			try {
+				next_scan_thread(mode, value_text, value_text2);
+			} catch (const std::exception& ex) {
+				diag::log_tagged_fmt("mem_scanner", "next_scan worker exception err='%s'", ex.what());
+				g_state.scanning.store(false, std::memory_order_release);
+				g_state.scan_progress.store(1.f, std::memory_order_release);
+			} catch (...) {
+				diag::log_tagged("mem_scanner", "next_scan worker exception err='<unknown>'");
+				g_state.scanning.store(false, std::memory_order_release);
+				g_state.scan_progress.store(1.f, std::memory_order_release);
+			}
 			g_state.scan_thread_done.store(true, std::memory_order_release);
-		}))
-	{
+		})) {
+			diag::log_tagged("mem_scanner", "next_scan worker_post_failed");
+			st.scan_thread_done.store(true, std::memory_order_release);
+			st.scanning.store(false);
+			return false;
+		}
+	} catch (const std::exception& ex) {
+		diag::log_tagged_fmt("mem_scanner", "next_scan worker_create_failed err='%s'", ex.what());
+		st.scan_thread_done.store(true, std::memory_order_release);
+		st.scanning.store(false);
+		return false;
+	} catch (...) {
+		diag::log_tagged("mem_scanner", "next_scan worker_create_failed err='<unknown>'");
 		st.scan_thread_done.store(true, std::memory_order_release);
 		st.scanning.store(false);
 		return false;
@@ -1281,8 +1491,17 @@ void undo_scan() {
 void reset_scan() {
 	auto& st = g_state;
 	if (st.scanning.load()) {
-		diag::log_tagged("mem_scanner", "reset_scan refused scanning_in_progress");
-		return;
+		diag::log_tagged_fmt("mem_scanner",
+			"reset_scan cancelling active scan progress=%.3f",
+			static_cast<double>(st.scan_progress.load(std::memory_order_acquire)));
+		st.scanning.store(false, std::memory_order_release);
+		if (!wait_scan_worker_ready("reset_scan")) {
+			diag::log_tagged("mem_scanner", "reset_scan refused worker_still_busy");
+			return;
+		}
+	} else if (!st.scan_thread_done.load(std::memory_order_acquire)) {
+		st.scan_thread_done.store(true, std::memory_order_release);
+		diag::log_tagged("mem_scanner", "reset_scan recovered stale scan_thread_done=0");
 	}
 	std::lock_guard<std::mutex> lk(st.results_mutex);
 	size_t had = st.results.size();
@@ -1291,6 +1510,7 @@ void reset_scan() {
 	st.total_found = 0;
 	st.has_initial_scan = false;
 	st.scan_count = 0;
+	st.scan_progress.store(1.f, std::memory_order_release);
 	diag::log_tagged_fmt("mem_scanner", "reset_scan cleared=%zu", had);
 }
 
@@ -1389,19 +1609,21 @@ void refresh_address_list() {
 	}
 }
 
-void start_pointer_scan(uint64_t target_address, int max_depth, int max_offset) {
+bool start_pointer_scan(uint64_t target_address, int max_depth, int max_offset, uint64_t scan_base, uint64_t scan_size) {
 	auto& st = g_state;
 	if (st.pointer_scanning.load()) {
 		diag::log_tagged("pointer_scan", "start_pointer_scan refused already_scanning");
-		return;
+		return false;
 	}
 	if (!driver_bridge::is_loaded() || driver_bridge::attached_pid() == 0) {
 		diag::log_tagged_fmt("pointer_scan", "start_pointer_scan refused not_attached driver_loaded=%d pid=%u",
 			static_cast<int>(driver_bridge::is_loaded()), driver_bridge::attached_pid());
-		return;
+		return false;
 	}
-	diag::log_tagged_fmt("pointer_scan", "start_pointer_scan target=0x%llX depth=%d offset=0x%X",
-		static_cast<unsigned long long>(target_address), max_depth, max_offset);
+	diag::log_tagged_fmt("pointer_scan", "start_pointer_scan target=0x%llX depth=%d offset=0x%X scan_range=0x%llX+0x%llX",
+		static_cast<unsigned long long>(target_address), max_depth, max_offset,
+		static_cast<unsigned long long>(scan_base),
+		static_cast<unsigned long long>(scan_size));
 	st.pointer_scanning.store(true);
 	{
 		std::lock_guard<std::mutex> lk(st.pointer_mutex);
@@ -1410,14 +1632,36 @@ void start_pointer_scan(uint64_t target_address, int max_depth, int max_offset) 
 	while (!st.pointer_thread_done.load(std::memory_order_acquire))
 		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 	st.pointer_thread_done.store(false, std::memory_order_release);
-	if (!work_queue::post([target_address, max_depth, max_offset]() {
-			pointer_scan_thread(target_address, max_depth, max_offset);
+	if (should_run_pointer_scan_inline(scan_base, scan_size, max_depth)) {
+		diag::log_tagged_fmt("pointer_scan",
+			"start_pointer_scan inline_dispatch target=0x%llX range=0x%llX+0x%llX",
+			static_cast<unsigned long long>(target_address),
+			static_cast<unsigned long long>(scan_base),
+			static_cast<unsigned long long>(scan_size));
+		try {
+			pointer_scan_thread(target_address, max_depth, max_offset, scan_base, scan_size);
+		} catch (const std::exception& ex) {
+			diag::log_tagged_fmt("pointer_scan", "inline worker_exception err='%s'", ex.what());
+			st.pointer_progress.store(1.f, std::memory_order_release);
+			st.pointer_scanning.store(false, std::memory_order_release);
+		} catch (...) {
+			diag::log_tagged("pointer_scan", "inline worker_exception err='<unknown>'");
+			st.pointer_progress.store(1.f, std::memory_order_release);
+			st.pointer_scanning.store(false, std::memory_order_release);
+		}
+		st.pointer_thread_done.store(true, std::memory_order_release);
+		return true;
+	}
+	if (!work_queue::post([target_address, max_depth, max_offset, scan_base, scan_size]() {
+			pointer_scan_thread(target_address, max_depth, max_offset, scan_base, scan_size);
 			g_state.pointer_thread_done.store(true, std::memory_order_release);
 		}))
 	{
 		st.pointer_thread_done.store(true, std::memory_order_release);
 		st.pointer_scanning.store(false);
+		return false;
 	}
+	return true;
 }
 
 void cancel_pointer_scan() {

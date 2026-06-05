@@ -1,6 +1,5 @@
 #pragma once
 #include <string>
-#include <thread>
 #include <atomic>
 #include <mutex>
 #include <cstdint>
@@ -103,7 +102,7 @@ namespace mcp_standalone
         std::atomic<bool> _stop_requested{false};
         void* _active_server = nullptr;
         std::mutex _server_mtx;
-        std::thread _server_thread;
+        std::atomic<std::uint32_t> _server_worker_tid{0};
         int _port = 0;
     };
 

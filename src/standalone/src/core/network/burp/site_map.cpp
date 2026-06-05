@@ -244,7 +244,7 @@ std::vector<exchange_observed_t> list_exchanges_for(const std::string& host, uin
     std::vector<exchange_observed_t> out;
     std::lock_guard<std::mutex> lk(st.mtx);
     for (const auto& kv : st.hosts) {
-        if (kv.first.host != host || kv.first.port != port) continue;
+        if (kv.first.host != host || (port != 0 && kv.first.port != port)) continue;
         std::vector<std::string> segs;
         split_path_segments(path, segs);
         auto cur = kv.second->root;
@@ -295,7 +295,7 @@ std::vector<std::string> list_paths(const std::string& host, uint16_t port)
     std::vector<std::string> out;
     std::lock_guard<std::mutex> lk(st.mtx);
     for (const auto& kv : st.hosts) {
-        if (kv.first.host != host || kv.first.port != port) continue;
+        if (kv.first.host != host || (port != 0 && kv.first.port != port)) continue;
         collect_paths_rec(kv.second->root, std::string(), out);
     }
     std::sort(out.begin(), out.end());

@@ -74,6 +74,7 @@ compile_commands.json
 *.pem
 *.p12
 server/keys/
+server/bootstrap_artifacts/
 firebase/functions/.local-secrets/
 
 # Aider and local cache

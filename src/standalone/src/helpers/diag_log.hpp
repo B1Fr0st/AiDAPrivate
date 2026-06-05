@@ -8,9 +8,12 @@
 #endif
 
 #include <windows.h>
+#include <atomic>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <cstdint>
+#include <mutex>
 
 namespace diag {
 
@@ -92,9 +95,59 @@ inline HANDLE open_log_handle(const char* file_name, DWORD desired_access, DWORD
     return CreateFileA(file_name, desired_access, share, nullptr, creation, flags, nullptr);
 }
 
-inline void write_tagged_line(HANDLE hf, const char* tag, const char* msg, bool flush)
+inline std::mutex& log_file_mutex()
 {
-    if (hf == INVALID_HANDLE_VALUE) return;
+    static std::mutex m;
+    return m;
+}
+
+inline HANDLE& cached_log_handle()
+{
+    static HANDLE hf = INVALID_HANDLE_VALUE;
+    return hf;
+}
+
+inline std::uint64_t& cached_log_last_flush_ms()
+{
+    static std::uint64_t v = 0;
+    return v;
+}
+
+inline std::uint32_t& cached_log_bytes_since_flush()
+{
+    static std::uint32_t v = 0;
+    return v;
+}
+
+inline HANDLE get_cached_log_handle()
+{
+    HANDLE& hf = cached_log_handle();
+    if (hf == INVALID_HANDLE_VALUE) {
+        hf = open_log_handle("aida_debug.log", FILE_APPEND_DATA | SYNCHRONIZE,
+            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL);
+    }
+    return hf;
+}
+
+inline void coalesced_flush_log(HANDLE hf, DWORD bytes_written, bool force)
+{
+    if (hf == INVALID_HANDLE_VALUE)
+        return;
+
+    auto& last_flush = cached_log_last_flush_ms();
+    auto& bytes_pending = cached_log_bytes_since_flush();
+    const std::uint64_t now = static_cast<std::uint64_t>(GetTickCount64());
+    bytes_pending += bytes_written;
+    if (force || bytes_pending >= 65536u || last_flush == 0 || now - last_flush >= 1000u) {
+        FlushFileBuffers(hf);
+        last_flush = now;
+        bytes_pending = 0;
+    }
+}
+
+inline DWORD write_tagged_line(HANDLE hf, const char* tag, const char* msg)
+{
+    if (hf == INVALID_HANDLE_VALUE) return 0;
     SYSTEMTIME st{};
     GetLocalTime(&st);
     char line[4096];
@@ -105,17 +158,18 @@ inline void write_tagged_line(HANDLE hf, const char* tag, const char* msg, bool 
     if (len > 0) {
         DWORD written = 0;
         WriteFile(hf, line, static_cast<DWORD>(len), &written, nullptr);
-        if (flush) FlushFileBuffers(hf);
+        return written;
     }
+    return 0;
 }
 
 inline void log_tagged(const char* tag, const char* msg)
 {
-    HANDLE hf = open_log_handle("aida_debug.log", FILE_APPEND_DATA | SYNCHRONIZE,
-        OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL);
+    std::lock_guard<std::mutex> lk(log_file_mutex());
+    HANDLE hf = get_cached_log_handle();
     if (hf == INVALID_HANDLE_VALUE) return;
-    write_tagged_line(hf, tag, msg, false);
-    CloseHandle(hf);
+    DWORD written = write_tagged_line(hf, tag, msg);
+    coalesced_flush_log(hf, written, false);
 }
 
 inline void log_tagged_fmt(const char* tag, const char* fmt, ...)
@@ -130,11 +184,11 @@ inline void log_tagged_fmt(const char* tag, const char* fmt, ...)
 
 inline void log_tagged_critical(const char* tag, const char* msg)
 {
-    HANDLE hf = open_log_handle("aida_debug.log", FILE_APPEND_DATA | SYNCHRONIZE,
-        OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH);
+    std::lock_guard<std::mutex> lk(log_file_mutex());
+    HANDLE hf = get_cached_log_handle();
     if (hf == INVALID_HANDLE_VALUE) return;
-    write_tagged_line(hf, tag, msg, true);
-    CloseHandle(hf);
+    DWORD written = write_tagged_line(hf, tag, msg);
+    coalesced_flush_log(hf, written, true);
 }
 
 inline void log_tagged_critical_fmt(const char* tag, const char* fmt, ...)

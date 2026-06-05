@@ -79,6 +79,17 @@ namespace {
 		req.dr6 = ctx.dr6; req.dr7 = ctx.dr7;
 	}
 
+	void copy_context_to_request(voyager::detail::thread_ctx_request& req, const driver_bridge::thread_context_t& ctx) {
+		req.rax = ctx.rax; req.rbx = ctx.rbx; req.rcx = ctx.rcx; req.rdx = ctx.rdx;
+		req.rsi = ctx.rsi; req.rdi = ctx.rdi; req.rbp = ctx.rbp; req.rsp = ctx.rsp;
+		req.r8 = ctx.r8; req.r9 = ctx.r9; req.r10 = ctx.r10; req.r11 = ctx.r11;
+		req.r12 = ctx.r12; req.r13 = ctx.r13; req.r14 = ctx.r14; req.r15 = ctx.r15;
+		req.rip = ctx.rip; req.rflags = ctx.rflags;
+		req.cs = ctx.cs; req.ss = ctx.ss;
+		req.dr0 = ctx.dr0; req.dr1 = ctx.dr1; req.dr2 = ctx.dr2; req.dr3 = ctx.dr3;
+		req.dr6 = ctx.dr6; req.dr7 = ctx.dr7;
+	}
+
 	void push_context_fields(test_lab::result_t& r, const voyager::detail::thread_ctx_request& req) {
 		push_u32_field(r, "PID", req.pid);
 		push_u32_field(r, "TID", req.tid);
@@ -209,6 +220,43 @@ namespace {
 					r.raw.resize(sizeof(req));
 					std::memcpy(r.raw.data(), &req, sizeof(req));
 					push_text_field(r, "tctx_pass_path", "device_get_thread_context_retry");
+					push_context_fields(r, req);
+					const bool after_found = find_thread_snapshot(s.pid, s.tid, after);
+					push_thread_snapshot(r, "thread_after", after_found, after);
+					r.ntstatus = 0;
+					r.ok = true;
+					return;
+				}
+				driver_bridge::thread_context_t bridge_ctx{};
+				SetLastError(ERROR_SUCCESS);
+				const std::uint64_t bridge_start = static_cast<std::uint64_t>(GetTickCount64());
+				const bool bridge_ok = driver_bridge::get_thread_context(s.tid, bridge_ctx);
+				const DWORD bridge_error = bridge_ok ? ERROR_SUCCESS : GetLastError();
+				const std::uint64_t bridge_elapsed = static_cast<std::uint64_t>(GetTickCount64()) - bridge_start;
+				const bool bridge_valid = bridge_ok && bridge_ctx.rip != 0 && bridge_ctx.rsp != 0;
+				push_bool_field(r, "fallback_bridge_ok", bridge_ok);
+				push_u32_field(r, "fallback_bridge_last_error", bridge_error);
+				push_u64_dec_field(r, "fallback_bridge_elapsed_ms", bridge_elapsed);
+				push_bool_field(r, "fallback_bridge_context_valid", bridge_valid);
+				::diag::log_tagged_fmt("testlab_tctx",
+					"BRIDGE_FALLBACK pid=%u tid=%u bridge_ok=%d gle=%lu elapsed_ms=%llu rip=0x%llX rsp=0x%llX",
+					s.pid,
+					s.tid,
+					bridge_ok ? 1 : 0,
+					static_cast<unsigned long>(bridge_error),
+					static_cast<unsigned long long>(bridge_elapsed),
+					static_cast<unsigned long long>(bridge_ctx.rip),
+					static_cast<unsigned long long>(bridge_ctx.rsp));
+				if (bridge_valid) {
+					copy_context_to_request(req, bridge_ctx);
+					req.pid = s.pid;
+					req.tid = s.tid;
+					req.should_set = 0;
+					req.register_mask = 0xFFFFFFFFFFFFFFFFull;
+					r.bytes_returned = static_cast<std::uint32_t>(sizeof(req));
+					r.raw.resize(sizeof(req));
+					std::memcpy(r.raw.data(), &req, sizeof(req));
+					push_text_field(r, "tctx_pass_path", "driver_bridge_get_thread_context_retry");
 					push_context_fields(r, req);
 					const bool after_found = find_thread_snapshot(s.pid, s.tid, after);
 					push_thread_snapshot(r, "thread_after", after_found, after);

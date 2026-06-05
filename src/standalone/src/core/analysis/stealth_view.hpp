@@ -11,7 +11,6 @@
 #include "ui/skeleton.hpp"
 #include "ui/fonts.hpp"
 #include "ui/hub_strip.hpp"
-#include "ui/toast_notification.hpp"
 #include "imgui/imgui.h"
 #include "../helpers/globals.h"
 #include "../../helpers/diag_log.hpp"
@@ -32,10 +31,6 @@ struct local_state_t {
 	int   selected_finding = -1;
 	int   category_filter = -1;
 	int   severity_filter = -1;
-	char  pid_input[16] = {};
-	bool  opt_peb = true;
-	bool  opt_rdtsc = true;
-	bool  opt_context = false;
 	float anim_t = 0.f;
 	aida::ui::hub_strip::state_t strip;
 };
@@ -69,7 +64,7 @@ inline ImU32 severity_token(stealth_engine::finding_severity_t s, float alpha)
 
 inline constexpr aida::ui::hub_strip::tab_t s_subtabs[] = {
 	{ "Protection Scan", "scan attached process", "Scan" },
-	{ "Stealth Controls", "anti-debug hook controls", "Ctrl" },
+	{ "Stealth Status", "automatic anti-debug state", "Auto" },
 };
 
 inline int sub_tab_count()
@@ -423,7 +418,6 @@ inline void render_protection_scan(float pos_x, float pos_y, float w, float h,
 inline void render_stealth_controls(float pos_x, float pos_y, float w, float h,
                                      float alpha, ImDrawList* dl, ImVec2 wp)
 {
-	auto& st = s_state;
 	const auto& th = aida::ui::resolved();
 	float ox = wp.x;
 	float oy = wp.y;
@@ -432,7 +426,7 @@ inline void render_stealth_controls(float pos_x, float pos_y, float w, float h,
 	float cy = oy + pos_y + 6.f;
 	float cx = ox + pos_x + pad;
 
-	const float toolbar_h = 86.f;
+	const float toolbar_h = 70.f;
 	ImU32 bar_top = aida::ui::with_alpha(th.panel_header, alpha * 0.85f);
 	ImU32 bar_bot = aida::ui::with_alpha(th.panel_bg, alpha * 0.85f);
 	dl->AddRectFilledMultiColor(ImVec2(ox + pos_x, cy), ImVec2(ox + pos_x + w, cy + toolbar_h),
@@ -440,84 +434,33 @@ inline void render_stealth_controls(float pos_x, float pos_y, float w, float h,
 	dl->AddLine(ImVec2(ox + pos_x, cy + toolbar_h - 1.f), ImVec2(ox + pos_x + w, cy + toolbar_h - 1.f),
 		aida::ui::with_alpha(th.border_subtle, alpha));
 
-	float ty = cy + 8.f;
-	ImGui::SetCursorScreenPos(ImVec2(cx, ty));
-	ImGui::PushStyleColor(ImGuiCol_FrameBg, ImGui::ColorConvertU32ToFloat4(
-		aida::ui::with_alpha(th.panel_header, alpha)));
-	ImGui::PushStyleColor(ImGuiCol_Border, ImGui::ColorConvertU32ToFloat4(
-		aida::ui::with_alpha(th.border_subtle, alpha)));
-	ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
-		aida::ui::with_alpha(th.text_primary, alpha)));
-	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
-	ImGui::PushItemWidth(150.f);
-	ImGui::InputTextWithHint("##stealth_pid", "Target PID", st.pid_input, sizeof(st.pid_input),
-		ImGuiInputTextFlags_CharsDecimal);
-	ImGui::PopItemWidth();
-	ImGui::PopStyleVar();
-	ImGui::PopStyleColor(3);
-
-	ImGui::SameLine();
 	bool stealth_active = stealth_engine::is_active();
+	const uint32_t attached_pid = driver_bridge::attached_pid();
+	const std::string status_str = stealth_engine::get_status();
 
-	if (!stealth_active) {
-		if (aida::ui::button("Start Stealth", aida::ui::button_kind_t::primary,
-			aida::ui::size_t_::sm, ImVec2(120.f, 28.f))) {
-			uint32_t pid = 0;
-			if (st.pid_input[0])
-				pid = static_cast<uint32_t>(std::strtoul(st.pid_input, nullptr, 10));
-			if (pid == 0) pid = driver_bridge::attached_pid();
-			if (pid == 0) {
-				diag::log_tagged("stealth", "view_enable_reject reason=no_pid");
-				toast_notification::push("Attach to a process or enter a PID first",
-					toast_notification::toast_type_t::warning, 3.0f);
-			} else {
-				stealth_engine::stealth_options_t opts;
-				opts.spoof_peb = st.opt_peb;
-				opts.hook_rdtsc = st.opt_rdtsc;
-				opts.scrub_context = st.opt_context;
-				diag::log_tagged_fmt("stealth",
-					"view_enable_request pid=%u peb=%d rdtsc=%d ctx=%d",
-					pid, st.opt_peb ? 1 : 0, st.opt_rdtsc ? 1 : 0,
-					st.opt_context ? 1 : 0);
-				bool ok = stealth_engine::enable_stealth(pid, opts);
-				if (!ok) {
-					toast_notification::push("Failed to start stealth (see aida_debug.log)",
-						toast_notification::toast_type_t::error, 3.0f);
-				}
-			}
-		}
+	ImFont* status_font = aida::ui::fonts::body_em();
+	if (!status_font) status_font = ImGui::GetFont();
+	ImU32 status_col = stealth_active
+		? aida::ui::with_alpha(th.success, alpha)
+		: aida::ui::with_alpha(th.text_dim, alpha);
+	const char* state_text = stealth_active ? "Automatic stealth active" : "Automatic stealth idle";
+	dl->AddText(status_font, 14.f, ImVec2(cx, cy + 10.f), status_col, state_text);
+
+	ImFont* body_font = aida::ui::fonts::body();
+	if (!body_font) body_font = ImGui::GetFont();
+	char target_buf[96];
+	if (attached_pid != 0) {
+		std::snprintf(target_buf, sizeof(target_buf), "Attached PID %u", attached_pid);
 	} else {
-		if (aida::ui::button("Stop Stealth", aida::ui::button_kind_t::destructive,
-			aida::ui::size_t_::sm, ImVec2(120.f, 28.f))) {
-			diag::log_tagged("stealth", "view_disable_request");
-			stealth_engine::disable_stealth();
-		}
+		std::snprintf(target_buf, sizeof(target_buf), "Attach a process to arm stealth automatically");
 	}
+	dl->AddText(body_font, 12.f, ImVec2(cx, cy + 30.f),
+		aida::ui::with_alpha(th.text_secondary, alpha), target_buf);
 
-	ty += 26.f;
-	{
-		std::string status_str = stealth_engine::get_status();
-		if (!status_str.empty()) {
-			ImU32 sc = stealth_active
-				? aida::ui::with_alpha(th.success, alpha)
-				: aida::ui::with_alpha(th.text_dim, alpha);
-			dl->AddText(aida::ui::fonts::body() ? aida::ui::fonts::body() : ImGui::GetFont(),
-				11.f, ImVec2(cx, ty), sc, status_str.c_str());
-		}
+	if (!status_str.empty()) {
+		dl->AddText(body_font, 12.f, ImVec2(cx, cy + 48.f),
+			aida::ui::with_alpha(th.text_dim, alpha), status_str.c_str());
 	}
-
-	ty += 18.f;
-	ImGui::SetCursorScreenPos(ImVec2(cx, ty));
-	ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
-		aida::ui::with_alpha(th.text_primary, alpha)));
-	ImGui::PushStyleColor(ImGuiCol_CheckMark, ImGui::ColorConvertU32ToFloat4(
-		aida::ui::with_alpha(th.accent_u32, alpha)));
-	ImGui::Checkbox("Spoof PEB Flags##stealth", &st.opt_peb);
-	ImGui::SameLine();
-	ImGui::Checkbox("Hook RDTSC##stealth", &st.opt_rdtsc);
-	ImGui::SameLine();
-	ImGui::Checkbox("Scrub Debug Context##stealth", &st.opt_context);
-	ImGui::PopStyleColor(2);
 
 	cy += toolbar_h + 6.f;
 	float hy = cy;
@@ -649,8 +592,8 @@ inline void render_stealth_controls(float pos_x, float pos_y, float w, float h,
 		ImVec2 e_sz = ImVec2(w, oy + pos_y + h - hy - 14.f);
 		aida::ui::empty_state::config_t cfg;
 		cfg.glyph = aida::ui::empty_state::glyph_t::shield;
-		cfg.title = "Stealth idle";
-		cfg.body = "Attach a process and press Start Stealth to install anti-debug hooks.";
+		cfg.title = "Stealth auto-armed";
+		cfg.body = "Attach a process to install default anti-debug protection automatically.";
 		cfg.max_width = 360.f;
 		aida::ui::empty_state::render(e_pos, e_sz, cfg);
 	}

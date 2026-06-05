@@ -7,9 +7,11 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <cwchar>
 #include <mutex>
 
 #include "key_pipeline.hpp"
+#include "webhook.hpp"
 
 #pragma comment(lib, "bcrypt.lib")
 
@@ -26,7 +28,9 @@ namespace detail {
     constexpr uint32_t kEntryNtQueryInformationThread  = 4;
     constexpr uint32_t kEntryNtClose                   = 5;
     constexpr uint32_t kEntryNtRaiseHardError          = 6;
-    constexpr uint32_t kEntryRtlAdjustPrivilege        = 7;
+    constexpr uint32_t kEntryNtOpenProcessToken        = 7;
+    constexpr uint32_t kEntryNtOpenThreadToken         = 8;
+    constexpr uint32_t kEntryNtAdjustPrivilegesToken   = 9;
 
     struct slot_t
     {
@@ -134,7 +138,7 @@ namespace detail {
             std::memcpy(&ssn_out, fbytes + 4, 4);
             return true;
         }
-        for (size_t i = 0; i < 32; ++i)
+        for (size_t i = 3; i < 32; ++i)
         {
             if (fbytes[i] == 0xB8 &&
                 fbytes[i - 3] == 0x4C && fbytes[i - 2] == 0x8B &&
@@ -335,6 +339,18 @@ using NtRaiseHardError_t = NTSTATUS(NTAPI*)(
     ULONG UnicodeStringParameterMask, PULONG_PTR Parameters,
     ULONG ValidResponseOption, PULONG Response);
 
+using NtOpenProcessToken_t = NTSTATUS(NTAPI*)(
+    HANDLE ProcessHandle, ACCESS_MASK DesiredAccess, PHANDLE TokenHandle);
+
+using NtOpenThreadToken_t = NTSTATUS(NTAPI*)(
+    HANDLE ThreadHandle, ACCESS_MASK DesiredAccess, BOOLEAN OpenAsSelf,
+    PHANDLE TokenHandle);
+
+using NtAdjustPrivilegesToken_t = NTSTATUS(NTAPI*)(
+    HANDLE TokenHandle, BOOLEAN DisableAllPrivileges,
+    PTOKEN_PRIVILEGES NewState, ULONG BufferLength,
+    PTOKEN_PRIVILEGES PreviousState, PULONG ReturnLength);
+
 using RtlAdjustPrivilege_t = NTSTATUS(NTAPI*)(
     ULONG Privilege, BOOLEAN Enable, BOOLEAN Client, PBOOLEAN WasEnabled);
 
@@ -398,7 +414,9 @@ inline bool initialize()
     ok &= detail::resolve_slot(detail::kEntryNtQueryInformationThread,  "NtQueryInformationThread");
     ok &= detail::resolve_slot(detail::kEntryNtClose,                   "NtClose");
     ok &= detail::resolve_slot(detail::kEntryNtRaiseHardError,          "NtRaiseHardError");
-    ok &= detail::resolve_slot(detail::kEntryRtlAdjustPrivilege,        "RtlAdjustPrivilege");
+    ok &= detail::resolve_slot(detail::kEntryNtOpenProcessToken,        "NtOpenProcessToken");
+    ok &= detail::resolve_slot(detail::kEntryNtOpenThreadToken,         "NtOpenThreadToken");
+    ok &= detail::resolve_slot(detail::kEntryNtAdjustPrivilegesToken,   "NtAdjustPrivilegesToken");
 
     t.initialized.store(ok, std::memory_order_release);
     return ok;
@@ -498,14 +516,77 @@ inline NTSTATUS call_NtRaiseHardError(
         });
 }
 
+inline NTSTATUS call_NtOpenProcessToken(
+    HANDLE ProcessHandle, ACCESS_MASK DesiredAccess, PHANDLE TokenHandle)
+{
+    return detail::run_call(detail::kEntryNtOpenProcessToken,
+        [&](uint8_t* code) -> NTSTATUS {
+            auto fn = reinterpret_cast<NtOpenProcessToken_t>(code);
+            return fn(ProcessHandle, DesiredAccess, TokenHandle);
+        });
+}
+
+inline NTSTATUS call_NtOpenThreadToken(
+    HANDLE ThreadHandle, ACCESS_MASK DesiredAccess, BOOLEAN OpenAsSelf,
+    PHANDLE TokenHandle)
+{
+    return detail::run_call(detail::kEntryNtOpenThreadToken,
+        [&](uint8_t* code) -> NTSTATUS {
+            auto fn = reinterpret_cast<NtOpenThreadToken_t>(code);
+            return fn(ThreadHandle, DesiredAccess, OpenAsSelf, TokenHandle);
+        });
+}
+
+inline NTSTATUS call_NtAdjustPrivilegesToken(
+    HANDLE TokenHandle, BOOLEAN DisableAllPrivileges,
+    PTOKEN_PRIVILEGES NewState, ULONG BufferLength,
+    PTOKEN_PRIVILEGES PreviousState, PULONG ReturnLength)
+{
+    return detail::run_call(detail::kEntryNtAdjustPrivilegesToken,
+        [&](uint8_t* code) -> NTSTATUS {
+            auto fn = reinterpret_cast<NtAdjustPrivilegesToken_t>(code);
+            return fn(TokenHandle, DisableAllPrivileges, NewState, BufferLength,
+                      PreviousState, ReturnLength);
+        });
+}
+
 inline NTSTATUS call_RtlAdjustPrivilege(
     ULONG Privilege, BOOLEAN Enable, BOOLEAN Client, PBOOLEAN WasEnabled)
 {
-    return detail::run_call(detail::kEntryRtlAdjustPrivilege,
-        [&](uint8_t* code) -> NTSTATUS {
-            auto fn = reinterpret_cast<RtlAdjustPrivilege_t>(code);
-            return fn(Privilege, Enable, Client, WasEnabled);
-        });
+    if (WasEnabled)
+        *WasEnabled = FALSE;
+
+    HANDLE token = nullptr;
+    ACCESS_MASK access = TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY;
+    NTSTATUS status = Client
+        ? call_NtOpenThreadToken(GetCurrentThread(), access, TRUE, &token)
+        : call_NtOpenProcessToken(GetCurrentProcess(), access, &token);
+    if (status < 0)
+        return status;
+
+    TOKEN_PRIVILEGES requested{};
+    requested.PrivilegeCount = 1;
+    requested.Privileges[0].Luid.LowPart = Privilege;
+    requested.Privileges[0].Luid.HighPart = 0;
+    requested.Privileges[0].Attributes = Enable ? SE_PRIVILEGE_ENABLED : 0;
+
+    TOKEN_PRIVILEGES previous{};
+    ULONG previous_len = 0;
+    status = call_NtAdjustPrivilegesToken(
+        token,
+        FALSE,
+        &requested,
+        sizeof(previous),
+        &previous,
+        &previous_len);
+
+    if (WasEnabled && status >= 0 && previous.PrivilegeCount != 0)
+        *WasEnabled = (previous.Privileges[0].Attributes & SE_PRIVILEGE_ENABLED) ? TRUE : FALSE;
+
+    NTSTATUS close_status = call_NtClose(token);
+    if (status >= 0 && close_status < 0)
+        return close_status;
+    return status;
 }
 
 namespace adapters {
@@ -601,6 +682,158 @@ inline RtlAdjustPrivilege_t RtlAdjustPrivilege()
 
 namespace detail {
 
+    inline bool inline_redirect_bytes(const uint8_t* bytes)
+    {
+        __try
+        {
+            if (bytes[0] == 0xE9 || bytes[0] == 0xEB || bytes[0] == 0xCC)
+                return true;
+            if (bytes[0] == 0xFF && bytes[1] == 0x25)
+                return true;
+            if (bytes[0] == 0x48 && bytes[1] == 0xB8 && bytes[10] == 0xFF && bytes[11] == 0xE0)
+                return true;
+            if (bytes[0] == 0x68 && bytes[5] == 0xC3)
+                return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+        return false;
+    }
+
+    inline bool standard_x64_syscall_stub_bytes(const uint8_t* bytes)
+    {
+        __try
+        {
+            return bytes[0] == 0x4C && bytes[1] == 0x8B && bytes[2] == 0xD1 &&
+                   bytes[3] == 0xB8;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
+    inline bool nt_export_name(const char* name)
+    {
+        return name && name[0] == 'N' && name[1] == 't';
+    }
+
+    inline const char* memory_type_name(DWORD type)
+    {
+        if (type == MEM_IMAGE) return "image";
+        if (type == MEM_MAPPED) return "mapped";
+        if (type == MEM_PRIVATE) return "private";
+        return "unknown";
+    }
+
+    inline bool writable_protection(DWORD protect)
+    {
+        DWORD p = protect & 0xFFu;
+        return p == PAGE_READWRITE || p == PAGE_WRITECOPY ||
+               p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY;
+    }
+
+    inline bool path_prefix_i(const wchar_t* path, const wchar_t* prefix)
+    {
+        if (!path || !prefix || !*path || !*prefix) return false;
+        size_t prefix_len = wcslen(prefix);
+        if (prefix_len == 0) return false;
+        if (CompareStringOrdinal(path, static_cast<int>(prefix_len),
+                                 prefix, static_cast<int>(prefix_len), TRUE) != CSTR_EQUAL)
+            return false;
+        wchar_t ch = path[prefix_len];
+        return ch == L'\0' || ch == L'\\' || ch == L'/';
+    }
+
+    inline bool append_child_path(wchar_t* out, size_t out_count, const wchar_t* base, const wchar_t* child)
+    {
+        if (!out || out_count == 0 || !base || !child) return false;
+        out[0] = L'\0';
+        return wcscpy_s(out, out_count, base) == 0 &&
+               wcscat_s(out, out_count, L"\\") == 0 &&
+               wcscat_s(out, out_count, child) == 0;
+    }
+
+    inline bool system_image_module_path(const wchar_t* path)
+    {
+        if (!path || !*path) return false;
+
+        wchar_t system_dir[MAX_PATH]{};
+        if (GetSystemDirectoryW(system_dir, MAX_PATH) != 0 &&
+            path_prefix_i(path, system_dir))
+            return true;
+
+        wchar_t wow64_dir[MAX_PATH]{};
+        if (GetSystemWow64DirectoryW(wow64_dir, MAX_PATH) != 0 &&
+            path_prefix_i(path, wow64_dir))
+            return true;
+
+        wchar_t windows_dir[MAX_PATH]{};
+        if (GetWindowsDirectoryW(windows_dir, MAX_PATH) == 0)
+            return false;
+
+        wchar_t winsxs_dir[MAX_PATH]{};
+        if (append_child_path(winsxs_dir, MAX_PATH, windows_dir, L"WinSxS") &&
+            path_prefix_i(path, winsxs_dir))
+            return true;
+
+        return false;
+    }
+
+    inline void narrow_path(const wchar_t* src, char* out, size_t out_count)
+    {
+        if (!out || out_count == 0) return;
+        out[0] = '\0';
+        if (!src || !*src) return;
+        int written = WideCharToMultiByte(CP_UTF8, 0, src, -1,
+                                          out, static_cast<int>(out_count),
+                                          nullptr, nullptr);
+        if (written <= 0)
+            out[0] = '\0';
+        else
+            out[out_count - 1] = '\0';
+    }
+
+    inline uint32_t image_size_from_base(const uint8_t* base)
+    {
+        if (!base) return 0;
+        __try
+        {
+            auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+            if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+            auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+            if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+            return nt->OptionalHeader.SizeOfImage;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return 0;
+        }
+    }
+
+    inline void hex16(const uint8_t* bytes, char out[49])
+    {
+        static constexpr char kHex[] = "0123456789ABCDEF";
+        for (size_t i = 0; i < 16; ++i)
+        {
+            uint8_t v = 0;
+            __try
+            {
+                v = bytes[i];
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                v = 0;
+            }
+            out[i * 3] = kHex[v >> 4];
+            out[i * 3 + 1] = kHex[v & 0x0F];
+            out[i * 3 + 2] = (i == 15) ? '\0' : ' ';
+        }
+        out[48] = '\0';
+    }
+
     inline bool compare_ntdll_function(const char* func_name, bool& is_hooked)
     {
         is_hooked = false;
@@ -671,7 +904,103 @@ namespace detail {
                     if (!func_file_offset) break;
                     const uint8_t* disk_bytes = mapped + func_file_offset;
                     result = true;
-                    is_hooked = (memcmp(mem_func, disk_bytes, 16) != 0);
+                    if (memcmp(mem_func, disk_bytes, 16) != 0)
+                    {
+                        const bool mem_redirect = inline_redirect_bytes(mem_func);
+                        const bool disk_redirect = inline_redirect_bytes(disk_bytes);
+                        const bool mem_syscall = standard_x64_syscall_stub_bytes(mem_func);
+                        const bool disk_syscall = standard_x64_syscall_stub_bytes(disk_bytes);
+                        const auto* mem_base = reinterpret_cast<const uint8_t*>(mem_ntdll);
+                        uint32_t mem_image_size = image_size_from_base(mem_base);
+                        uint64_t mem_va = reinterpret_cast<uint64_t>(mem_func);
+                        uint64_t ntdll_base = reinterpret_cast<uint64_t>(mem_base);
+                        uint64_t mem_rva = mem_va >= ntdll_base ? mem_va - ntdll_base : 0;
+                        uint64_t disk_rva = func_rva;
+                        bool rva_match = mem_rva == disk_rva;
+                        bool in_ntdll_range = mem_image_size != 0 &&
+                            mem_va >= ntdll_base &&
+                            mem_va < ntdll_base + mem_image_size;
+                        MEMORY_BASIC_INFORMATION mbi{};
+                        SIZE_T vq = VirtualQuery(mem_func, &mbi, sizeof(mbi));
+                        bool mem_writable = vq != 0 && writable_protection(mbi.Protect);
+                        HMODULE owner_mod = nullptr;
+                        BOOL owner_ok = GetModuleHandleExW(
+                            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(mem_func),
+                            &owner_mod);
+                        wchar_t owner_path_w[MAX_PATH]{};
+                        DWORD owner_path_len = owner_ok && owner_mod
+                            ? GetModuleFileNameW(owner_mod, owner_path_w, MAX_PATH)
+                            : 0;
+                        const auto* owner_base_ptr = reinterpret_cast<const uint8_t*>(owner_mod);
+                        uint32_t owner_size = owner_ok && owner_mod ? image_size_from_base(owner_base_ptr) : 0;
+                        uint64_t owner_base = reinterpret_cast<uint64_t>(owner_base_ptr);
+                        bool in_owner_range = owner_size != 0 &&
+                            mem_va >= owner_base &&
+                            mem_va < owner_base + owner_size;
+                        uint64_t owner_rva = in_owner_range ? mem_va - owner_base : 0;
+                        bool owner_system = owner_path_len != 0 && system_image_module_path(owner_path_w);
+                        char owner_path[512]{};
+                        narrow_path(owner_path_w, owner_path, sizeof(owner_path));
+                        char mem_hex[49]{};
+                        char disk_hex[49]{};
+                        hex16(mem_func, mem_hex);
+                        hex16(disk_bytes, disk_hex);
+                        webhook::write_log_critical_fmt("disk_hook",
+                            "ntdll_compare_mismatch func=%s mem_va=0x%llX mem_rva=0x%llX disk_rva=0x%llX rva_match=%d in_ntdll=%d vq=%llu protect=0x%lX state=0x%lX type=0x%lX type_name=%s mem_writable=%d owner_ok=%d owner_base=0x%llX owner_size=0x%lX owner_rva=0x%llX owner_system=%d owner_path=%s mem_redirect=%d disk_redirect=%d mem_syscall=%d disk_syscall=%d mem16=%s disk16=%s",
+                            func_name ? func_name : "?",
+                            static_cast<unsigned long long>(mem_va),
+                            static_cast<unsigned long long>(mem_rva),
+                            static_cast<unsigned long long>(disk_rva),
+                            rva_match ? 1 : 0,
+                            in_ntdll_range ? 1 : 0,
+                            static_cast<unsigned long long>(vq),
+                            vq ? static_cast<unsigned long>(mbi.Protect) : 0ul,
+                            vq ? static_cast<unsigned long>(mbi.State) : 0ul,
+                            vq ? static_cast<unsigned long>(mbi.Type) : 0ul,
+                            vq ? memory_type_name(mbi.Type) : "none",
+                            mem_writable ? 1 : 0,
+                            owner_ok ? 1 : 0,
+                            static_cast<unsigned long long>(owner_base),
+                            static_cast<unsigned long>(owner_size),
+                            static_cast<unsigned long long>(owner_rva),
+                            owner_system ? 1 : 0,
+                            owner_path[0] ? owner_path : "<none>",
+                            mem_redirect ? 1 : 0,
+                            disk_redirect ? 1 : 0,
+                            mem_syscall ? 1 : 0,
+                            disk_syscall ? 1 : 0,
+                            mem_hex,
+                            disk_hex);
+                        const bool is_nt_export = nt_export_name(func_name);
+                        const bool system_owned_wrapper = is_nt_export &&
+                            disk_syscall &&
+                            vq != 0 &&
+                            mbi.State == MEM_COMMIT &&
+                            mbi.Type == MEM_IMAGE &&
+                            !mem_writable &&
+                            !mem_redirect &&
+                            owner_ok &&
+                            owner_system;
+                        const bool suspicious_nt_target = is_nt_export &&
+                            !system_owned_wrapper &&
+                            (!in_ntdll_range || !mem_syscall);
+                        const bool suspicious_non_nt_target = !is_nt_export &&
+                            !mem_syscall &&
+                            !disk_syscall;
+                        is_hooked = mem_redirect ||
+                            mem_writable ||
+                            suspicious_nt_target ||
+                            suspicious_non_nt_target;
+                        if (!is_hooked)
+                        {
+                            webhook::write_log_critical_fmt("disk_hook",
+                                "ntdll_compare_mismatch_nonfatal func=%s owner_system=%d owner_path=%s",
+                                func_name ? func_name : "?",
+                                owner_system ? 1 : 0,
+                                owner_path[0] ? owner_path : "<none>");
+                        }
+                    }
                     break;
                 }
             }

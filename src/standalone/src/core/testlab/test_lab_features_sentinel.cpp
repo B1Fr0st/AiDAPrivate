@@ -48,6 +48,18 @@ namespace {
 		return out;
 	}
 
+	std::string make_hv_vendor_string(const char (&buf)[16]) {
+		char tmp[17];
+		std::size_t n = 0;
+		for (; n < sizeof(buf); ++n) {
+			unsigned char c = static_cast<unsigned char>(buf[n]);
+			if (c == 0) break;
+			tmp[n] = (c >= 0x20u && c < 0x7Fu) ? static_cast<char>(c) : '?';
+		}
+		tmp[n] = '\0';
+		return std::string(tmp);
+	}
+
 	void render_inputs_sentinel_hb(test_lab::state_t& s) {
 		(void)s;
 		ImGui::TextDisabled("Sends one heartbeat to WhosWho and reads back the SentinelBridge state (sentinel_tsc / whoswho_tsc).");
@@ -200,21 +212,67 @@ namespace {
 			r.error = "driver not connected";
 			return;
 		}
-		voyager::detail::hv_detect_result hv{};
-		bool ok = device->run_hv_detect(hv);
+
+		union {
+			voyager::detail::hv_detect_request req;
+			voyager::detail::hv_detect_result  result;
+		} buf{};
+		buf.req.flags = voyager::detail::HV_DETECT_FLAG_TESTLAB_SAFE;
+
+		std::uint32_t bytes_returned = 0;
+		test_lab_format::testlab_diag_log_step("sentinel", "Sentinel HV Detect", "request_pre",
+			"flags=0x%016llX mode=testlab_safe_fingerprint_only",
+			static_cast<unsigned long long>(buf.req.flags));
+		bool ok = device->send_ioctl_raw(
+			ioctl_codes::HVDT(),
+			&buf,
+			static_cast<std::uint32_t>(sizeof(buf)),
+			bytes_returned);
+		test_lab_format::testlab_diag_log_step("sentinel", "Sentinel HV Detect", "request_post",
+			"ok=%d bytes_returned=%u total_run=%u total_failed=%u is_vm=%u ms_hv_root=%u vendor=\"%.16s\"",
+			ok ? 1 : 0,
+			bytes_returned,
+			static_cast<unsigned>(buf.result.total_run),
+			static_cast<unsigned>(buf.result.total_failed),
+			static_cast<unsigned>(buf.result.is_virtual_machine),
+			static_cast<unsigned>(buf.result.ms_hv_root),
+			buf.result.vm_vendor_name);
+
+		r.bytes_returned = bytes_returned;
+		r.raw.resize(sizeof(buf));
+		std::memcpy(r.raw.data(), &buf, sizeof(buf));
+
 		if (!ok) {
+			DWORD le = GetLastError();
+			char err[128];
+			std::snprintf(err, sizeof(err),
+				"send_ioctl_raw returned false (GetLastError=%lu)", le);
 			r.ok = false;
-			r.error = "run_hv_detect failed";
+			r.error = err;
+			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
 			return;
 		}
+		if (bytes_returned != sizeof(voyager::detail::hv_detect_result)) {
+			char err[160];
+			std::snprintf(err, sizeof(err),
+				"HVDT returned %u bytes, expected %zu",
+				bytes_returned,
+				sizeof(voyager::detail::hv_detect_result));
+			r.ok = false;
+			r.error = err;
+			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
+			return;
+		}
+
+		const voyager::detail::hv_detect_result& hv = buf.result;
+		r.parsed.push_back({ "mode", "testlab_safe_fingerprint_only" });
+		r.parsed.push_back({ "request_flags", "0x0000000000000001" });
+		r.parsed.push_back({ "kernel_probe_set", "skipped_by_testlab_safe_flag" });
 		push_u32(r, "total_run", hv.total_run);
 		push_u32(r, "total_failed", hv.total_failed);
 		r.parsed.push_back({ "is_virtual_machine", hv.is_virtual_machine ? "1" : "0" });
 		r.parsed.push_back({ "ms_hv_root", hv.ms_hv_root ? "1" : "0" });
-		char vendor[17];
-		std::memcpy(vendor, hv.vm_vendor_name, 16);
-		vendor[16] = '\0';
-		r.parsed.push_back({ "vm_vendor_name", vendor });
+		r.parsed.push_back({ "vm_vendor_name", make_hv_vendor_string(hv.vm_vendor_name) });
 		push_u32(r, "sidt_lock_prefix", hv.sidt_lock_prefix);
 		push_u32(r, "sidt_invalid_pf", hv.sidt_invalid_pf);
 		push_u32(r, "sidt_tlb_only", hv.sidt_tlb_only);
@@ -243,6 +301,7 @@ namespace {
 		push_u32(r, "vmf_disk_vm", hv.vmf_disk_vm);
 		push_u32(r, "vmf_mac_vm", hv.vmf_mac_vm);
 		push_u32(r, "vmf_registry_vm", hv.vmf_registry_vm);
+		r.ntstatus = 0;
 		r.ok = true;
 	}
 

@@ -40,8 +40,8 @@ for (const [filename, content] of Object.entries(files)) {
 
 console.log('\n── Ed25519 Key Pair Generated ──────────────────────────────');
 console.log(`  Output directory: ${outputDir}`);
-console.log(`\n  For server .env, paste this as ED25519_PRIVATE_KEY_B64:`);
-console.log(`  ${privateB64}`);
+console.log(`  Private key material written to ed25519_private.pem and ed25519_private_b64.txt`);
+console.log(`  Set ED25519_PRIVATE_KEY_B64 from the protected private_b64 file on the server`);
 console.log(`\n  Public key (PEM) for client verification:`);
 console.log(publicPem);
 

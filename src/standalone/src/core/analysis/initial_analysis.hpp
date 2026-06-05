@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -1017,21 +1018,62 @@ inline void reset_state()
 
 inline void run_initial_analysis(const std::string& path, const std::string& filename)
 {
+	detail::push_log_fmt("run_initial_analysis entry path=%s filename=%s running=%d finished=%d",
+		path.c_str(),
+		filename.c_str(),
+		g_state.running.load(std::memory_order_acquire) ? 1 : 0,
+		g_state.finished.load(std::memory_order_acquire) ? 1 : 0);
 	if (g_state.running.load(std::memory_order_acquire)) {
+		detail::push_log_fmt("run_initial_analysis cancel_existing_begin path=%s", path.c_str());
 		cancel_active();
 		uint64_t start = detail::now_ns();
 		while (g_state.running.load(std::memory_order_acquire)) {
 			if (detail::now_ns() - start > 5ull * 1000000000ull) break;
 			std::this_thread::sleep_for(std::chrono::milliseconds(10));
 		}
+		detail::push_log_fmt("run_initial_analysis cancel_existing_end still_running=%d elapsed_ns=%llu",
+			g_state.running.load(std::memory_order_acquire) ? 1 : 0,
+			static_cast<unsigned long long>(detail::now_ns() - start));
 	}
 	reset_state();
 	g_state.running.store(true, std::memory_order_release);
 	std::string p = path;
 	std::string n = filename;
-	work_queue::post([p, n]() {
-		detail::run_pipeline(p, n);
+	bool posted = work_queue::post([p, n]() {
+		detail::push_log_fmt("run_pipeline_worker_begin path=%s filename=%s", p.c_str(), n.c_str());
+		try {
+			detail::run_pipeline(p, n);
+			detail::push_log_fmt("run_pipeline_worker_end running=%d finished=%d active_step=%d",
+				g_state.running.load(std::memory_order_acquire) ? 1 : 0,
+				g_state.finished.load(std::memory_order_acquire) ? 1 : 0,
+				g_state.active_step_index.load(std::memory_order_acquire));
+		} catch (const std::exception& ex) {
+			g_state.active_step_index.store(-1, std::memory_order_release);
+			g_state.running.store(false, std::memory_order_release);
+			g_state.finished.store(true, std::memory_order_release);
+			g_state.finish_time_ns.store(detail::now_ns(), std::memory_order_release);
+			detail::push_log_fmt("run_pipeline_exception path=%s filename=%s what=%s",
+				p.c_str(), n.c_str(), ex.what());
+		} catch (...) {
+			g_state.active_step_index.store(-1, std::memory_order_release);
+			g_state.running.store(false, std::memory_order_release);
+			g_state.finished.store(true, std::memory_order_release);
+			g_state.finish_time_ns.store(detail::now_ns(), std::memory_order_release);
+			detail::push_log_fmt("run_pipeline_exception path=%s filename=%s what=unknown",
+				p.c_str(), n.c_str());
+		}
 	});
+	detail::push_log_fmt("run_initial_analysis_post path=%s filename=%s posted=%d",
+		path.c_str(),
+		filename.c_str(),
+		posted ? 1 : 0);
+	if (!posted) {
+		g_state.active_step_index.store(-1, std::memory_order_release);
+		g_state.running.store(false, std::memory_order_release);
+		g_state.finished.store(true, std::memory_order_release);
+		g_state.finish_time_ns.store(detail::now_ns(), std::memory_order_release);
+		detail::push_log_fmt("run_initial_analysis_post_failed path=%s filename=%s", path.c_str(), filename.c_str());
+	}
 }
 
 inline void run_initial_analysis_for_loaded_file()

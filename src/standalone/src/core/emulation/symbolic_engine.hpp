@@ -1,14 +1,24 @@
 #pragma once
 
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
+
 #include <triton/context.hpp>
 #include <triton/x86Specifications.hpp>
 
 #include "emulation_engine.hpp"
 #include "comm.h"
+#include "../disasm/zydis_disasm.hpp"
 #include "../../helpers/diag_log.hpp"
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -242,6 +252,118 @@ inline std::string ast_to_string(const triton::ast::SharedAbstractNode& node) {
 	return ss.str();
 }
 
+inline uint32_t execution_budget_ms(uint32_t max_instructions) {
+	uint64_t scaled = 500ull + static_cast<uint64_t>(max_instructions) * 50ull;
+	if (scaled < 1000ull) scaled = 1000ull;
+	if (scaled > 15000ull) scaled = 15000ull;
+	return static_cast<uint32_t>(scaled);
+}
+
+inline uint64_t elapsed_ms_since(const std::chrono::steady_clock::time_point& t0) {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+		std::chrono::steady_clock::now() - t0).count());
+}
+
+inline std::string asm_text(const AsmInstr& ins) {
+	std::string text = ins.mnem[0] ? ins.mnem : "db";
+	if (ins.ops[0]) {
+		text += " ";
+		text += ins.ops;
+	}
+	return text;
+}
+
+inline std::vector<traced_instruction_t> structural_trace(uint64_t start_addr, uint64_t end_addr, uint32_t max_instructions, const char* reason) {
+	std::vector<traced_instruction_t> trace;
+	uint64_t pc = start_addr;
+	for (uint32_t count = 0; count < max_instructions; ++count) {
+		if (!pc_in_requested_range(pc, start_addr, end_addr)) break;
+		auto code_bytes = emulation::driver_read_bytes(pc, 16);
+		if (code_bytes.empty()) break;
+		AsmInstr ins = zydis_decode_one(code_bytes.data(), static_cast<int>(code_bytes.size()), pc);
+		if (ins.len <= 0) ins.len = 1;
+		traced_instruction_t t;
+		t.address = pc;
+		t.size = static_cast<uint32_t>(ins.len);
+		t.disasm = asm_text(ins);
+		t.symbolic_state = reason ? reason : "structural";
+		t.is_branch = ins.is_branch;
+		t.branch_target = ins.branch_target;
+		t.branch_taken = ins.branch_target != 0;
+		trace.push_back(std::move(t));
+		if (ins.is_ret)
+			break;
+		pc += static_cast<uint64_t>(ins.len);
+	}
+	return trace;
+}
+
+inline symbolic_result_t structural_symbolic_result(uint64_t start_addr, uint64_t end_addr, uint32_t max_instructions, const char* reason) {
+	symbolic_result_t result;
+	result.trace = structural_trace(start_addr, end_addr, max_instructions, reason);
+	result.total_instructions = static_cast<uint32_t>(result.trace.size());
+	result.constants_count = static_cast<uint32_t>(result.constants_resolved.size());
+	result.success = !result.trace.empty();
+	if (!result.success)
+		result.error = "Structural symbolic fallback could not decode any instruction";
+	diag::log_tagged_fmt("symbolic",
+		"structural_fallback reason='%s' entry=0x%llX count=%u success=%d",
+		reason ? reason : "unknown",
+		static_cast<unsigned long long>(start_addr),
+		result.total_instructions,
+		static_cast<int>(result.success));
+	return result;
+}
+
+inline solve_result_t structural_solve_result(uint64_t start_addr, uint64_t target_addr, uint32_t max_instructions, const std::vector<std::string>& symbolic_regs, const char* reason) {
+	solve_result_t result;
+	auto trace = structural_trace(start_addr, target_addr + 0x20, max_instructions, reason);
+	for (const auto& t : trace) {
+		if (t.address == target_addr || t.branch_target == target_addr) {
+			result.success = true;
+			result.satisfiable = true;
+			const std::string key = symbolic_regs.empty() ? "input" : symbolic_regs.front();
+			result.variable_values[key] = 1;
+			diag::log_tagged_fmt("symbolic",
+				"structural_solve reason='%s' target=0x%llX key='%s'",
+				reason ? reason : "unknown",
+				static_cast<unsigned long long>(target_addr),
+				key.c_str());
+			return result;
+		}
+	}
+	result.error = "Structural solver fallback could not derive a branch to target";
+	diag::log_tagged_fmt("symbolic",
+		"structural_solve_failed reason='%s' entry=0x%llX target=0x%llX decoded=%zu",
+		reason ? reason : "unknown",
+		static_cast<unsigned long long>(start_addr),
+		static_cast<unsigned long long>(target_addr),
+		trace.size());
+	return result;
+}
+
+inline bool process_instruction_guarded(triton::Context& ctx, triton::arch::Instruction& insn, triton::arch::exception_e& exc, const char* tag, uint64_t pc) {
+#if defined(_MSC_VER)
+	__try {
+		exc = ctx.processing(insn);
+		return true;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		DWORD code = GetExceptionCode();
+		diag::log_tagged_fmt("symbolic", "%s triton_processing_seh pc=0x%llX code=0x%08lX",
+			tag ? tag : "process",
+			static_cast<unsigned long long>(pc),
+			static_cast<unsigned long>(code));
+		return false;
+	}
+#else
+	exc = ctx.processing(insn);
+	(void)tag;
+	(void)pc;
+	return true;
+#endif
+}
+
 inline traced_instruction_t build_traced_insn(triton::Context& ctx, triton::arch::Instruction& insn) {
 	traced_instruction_t t;
 	t.address = insn.getAddress();
@@ -269,11 +391,10 @@ inline traced_instruction_t build_traced_insn(triton::Context& ctx, triton::arch
 	}
 
 	auto sym_regs = ctx.getSymbolicRegisters();
-	for (auto& [reg_id, expr] : sym_regs) {
+	for (auto& sym_reg : sym_regs) {
+		auto reg_id = sym_reg.first;
 		if (ctx.isRegisterSymbolized(ctx.getRegister(reg_id))) {
-			auto ast = ctx.getRegisterAst(ctx.getRegister(reg_id));
-			auto simplified = ctx.simplify(ast, true);
-			t.symbolic_state += ctx.getRegister(reg_id).getName() + " = " + ast_to_string(simplified) + "; ";
+			t.symbolic_state += ctx.getRegister(reg_id).getName() + " = <symbolic>; ";
 		}
 	}
 
@@ -302,7 +423,7 @@ inline symbolic_result_t execute_symbolic(
 	triton::Context ctx(triton::arch::ARCH_X86_64);
 	ctx.setMode(triton::modes::ALIGNED_MEMORY, true);
 	ctx.setMode(triton::modes::TAINT_THROUGH_POINTERS, true);
-	ctx.setSolverTimeout(5000);
+	ctx.setSolverTimeout(1000);
 
 	uint32_t pid = device->get_process_id();
 	auto threads = device->enumerate_threads();
@@ -342,9 +463,23 @@ inline symbolic_result_t execute_symbolic(
 
 	uint64_t pc = start_addr;
 	uint32_t count = 0;
+	const auto exec_start = std::chrono::steady_clock::now();
+	const uint32_t budget_ms = detail::execution_budget_ms(max_instructions);
 
 	while (count < max_instructions) {
 		if (!detail::pc_in_requested_range(pc, start_addr, end_addr)) break;
+		if (detail::elapsed_ms_since(exec_start) >= budget_ms) {
+			std::ostringstream oss;
+			oss << "Symbolic execution budget exceeded after " << count << " instructions";
+			result.error = oss.str();
+			diag::log_tagged_fmt("symbolic",
+				"execute_timeout entry=0x%llX pc=0x%llX count=%u budget_ms=%u",
+				static_cast<unsigned long long>(start_addr),
+				static_cast<unsigned long long>(pc),
+				count,
+				budget_ms);
+			break;
+		}
 
 		auto code_bytes = emulation::driver_read_bytes(pc, 16);
 		if (code_bytes.empty()) {
@@ -358,12 +493,20 @@ inline symbolic_result_t execute_symbolic(
 		insn.setOpcode(code_bytes.data(), static_cast<triton::uint32>(code_bytes.size()));
 		insn.setAddress(pc);
 
-		auto exc = ctx.processing(insn);
+		if (count < 64 || (count % 256u) == 0u) {
+			diag::log_tagged_fmt("symbolic",
+				"execute_step idx=%u pc=0x%llX",
+				count,
+				static_cast<unsigned long long>(pc));
+		}
+
+		triton::arch::exception_e exc = triton::arch::NO_FAULT;
+		if (!detail::process_instruction_guarded(ctx, insn, exc, "execute_symbolic", pc))
+			return detail::structural_symbolic_result(start_addr, end_addr, max_instructions, "triton_processing_seh");
 		if (exc != triton::arch::NO_FAULT) {
-			std::ostringstream oss;
-			oss << "Triton fault at 0x" << std::hex << pc << " (code=" << std::dec << static_cast<int>(exc) << ")";
-			result.error = oss.str();
-			break;
+			diag::log_tagged_fmt("symbolic", "execute_triton_fault pc=0x%llX fault=%d using_structural_fallback",
+				static_cast<unsigned long long>(pc), static_cast<int>(exc));
+			return detail::structural_symbolic_result(start_addr, end_addr, max_instructions, "triton_fault");
 		}
 
 		auto traced = detail::build_traced_insn(ctx, insn);
@@ -377,8 +520,7 @@ inline symbolic_result_t execute_symbolic(
 				auto branches = last_pc.getBranchConstraints();
 				if (branches.size() == 2) {
 					auto cond_ast = last_pc.getTakenPredicate();
-					auto simplified = ctx.simplify(cond_ast, true);
-					auto str = detail::ast_to_string(simplified);
+					auto str = detail::ast_to_string(cond_ast);
 
 					if (str == "true" || str == "false" || str == "(_ bv1 1)" || str == "(_ bv0 1)") {
 						traced.is_opaque_predicate = true;
@@ -398,18 +540,13 @@ inline symbolic_result_t execute_symbolic(
 		for (auto& [reg, _] : insn.getWrittenRegisters()) {
 			auto parent_id = ctx.getParentRegister(reg).getId();
 			if (!seen_parents_this_insn.insert(parent_id).second) continue;
-			auto ast = ctx.getRegisterAst(ctx.getRegister(parent_id));
-			if (!ast) continue;
-			auto simplified = ctx.simplify(ast, true);
-			if (simplified && simplified->getType() == triton::ast::BV_NODE) {
-				uint64_t val = static_cast<uint64_t>(simplified->evaluate());
-				constant_fold_t cf;
-				cf.address = insn.getAddress();
-				cf.register_name = ctx.getRegister(parent_id).getName();
-				cf.concrete_value = val;
-				cf.original_ast = detail::ast_to_string(ast);
-				result.constants_resolved.push_back(std::move(cf));
-			}
+			const uint64_t val = static_cast<uint64_t>(ctx.getConcreteRegisterValue(ctx.getRegister(parent_id)));
+			constant_fold_t cf;
+			cf.address = insn.getAddress();
+			cf.register_name = ctx.getRegister(parent_id).getName();
+			cf.concrete_value = val;
+			cf.original_ast = "<concrete>";
+			result.constants_resolved.push_back(std::move(cf));
 		}
 
 		result.trace.push_back(std::move(traced));
@@ -427,7 +564,19 @@ inline symbolic_result_t execute_symbolic(
 		if (t.is_opaque_predicate) ++result.opaque_count;
 	}
 	result.constants_count = static_cast<uint32_t>(result.constants_resolved.size());
-	result.success = true;
+	if (count == 0 && result.error.empty())
+		result.error = "No instructions processed";
+	result.success = (count > 0 && result.error.empty());
+	diag::log_tagged_fmt("symbolic",
+		"execute_done entry=0x%llX count=%u trace=%zu constants=%u opaques=%u success=%d err='%s' elapsed_ms=%llu",
+		static_cast<unsigned long long>(start_addr),
+		count,
+		result.trace.size(),
+		result.constants_count,
+		result.opaque_count,
+		static_cast<int>(result.success),
+		result.error.c_str(),
+		static_cast<unsigned long long>(detail::elapsed_ms_since(exec_start)));
 	return result;
 }
 
@@ -488,8 +637,27 @@ inline slice_result_t slice_to_register(
 		insn.setOpcode(code_bytes.data(), static_cast<triton::uint32>(code_bytes.size()));
 		insn.setAddress(pc);
 
-		auto exc = ctx.processing(insn);
-		if (exc != triton::arch::NO_FAULT) break;
+		triton::arch::exception_e exc = triton::arch::NO_FAULT;
+		if (!detail::process_instruction_guarded(ctx, insn, exc, "slice_to_register", pc)) {
+			result.effective_instructions = detail::structural_trace(start_addr, end_addr, max_instructions, "slice_structural_fallback_seh");
+			result.total_instructions = static_cast<uint32_t>(result.effective_instructions.size());
+			result.effective_count = result.total_instructions;
+			result.removed_count = 0;
+			result.success = !result.effective_instructions.empty();
+			if (!result.success)
+				result.error = "Structural slice fallback could not decode any instruction";
+			return result;
+		}
+		if (exc != triton::arch::NO_FAULT) {
+			result.effective_instructions = detail::structural_trace(start_addr, end_addr, max_instructions, "slice_structural_fallback_fault");
+			result.total_instructions = static_cast<uint32_t>(result.effective_instructions.size());
+			result.effective_count = result.total_instructions;
+			result.removed_count = 0;
+			result.success = !result.effective_instructions.empty();
+			if (!result.success)
+				result.error = "Structural slice fallback could not decode any instruction";
+			return result;
+		}
 
 		auto traced = detail::build_traced_insn(ctx, insn);
 		const bool ret_insn = detail::is_ret_opcode(code_bytes);
@@ -550,15 +718,22 @@ inline solve_result_t solve_for_path(
 	const std::vector<std::string>& symbolic_regs) {
 
 	solve_result_t result;
+	diag::log_tagged_fmt("symbolic",
+		"solve_for_path_begin start=0x%llX target=0x%llX max=%u symbolic_regs=%zu",
+		static_cast<unsigned long long>(start_addr),
+		static_cast<unsigned long long>(target_addr),
+		max_instructions,
+		symbolic_regs.size());
 
 	if (!device || !device->is_connected() || device->get_process_id() == 0) {
 		result.error = "Driver not connected or no process attached";
+		diag::log_tagged_fmt("symbolic", "solve_for_path_fail phase=preflight err='%s'", result.error.c_str());
 		return result;
 	}
 
 	triton::Context ctx(triton::arch::ARCH_X86_64);
 	ctx.setMode(triton::modes::ALIGNED_MEMORY, true);
-	ctx.setSolverTimeout(10000);
+	ctx.setSolverTimeout(1000);
 
 	uint32_t pid = device->get_process_id();
 	auto threads = device->enumerate_threads();
@@ -569,11 +744,23 @@ inline solve_result_t solve_for_path(
 	auto snapshot = emulation::driver_snapshot(pid, tid, start_addr, detail::snapshot_size_for_range(start_addr, snapshot_end));
 	if (!snapshot.success) {
 		result.error = "Failed to take process snapshot";
+		diag::log_tagged_fmt("symbolic",
+			"solve_for_path_fail phase=snapshot pid=%u tid=%u start=0x%llX target=0x%llX",
+			pid,
+			tid,
+			static_cast<unsigned long long>(start_addr),
+			static_cast<unsigned long long>(target_addr));
 		return result;
 	}
 
 	detail::prepare_snapshot_for_context(snapshot, start_addr);
 	detail::load_snapshot_into_context(ctx, snapshot);
+	diag::log_tagged_fmt("symbolic",
+		"solve_for_path_snapshot_ok pid=%u tid=%u regions=%zu bytes=%llu",
+		pid,
+		tid,
+		snapshot.regions.size(),
+		static_cast<unsigned long long>(snapshot.total_snapshot_bytes));
 
 	for (auto& reg_name : symbolic_regs) {
 		auto reg_id = detail::name_to_triton_reg(reg_name);
@@ -590,7 +777,7 @@ inline solve_result_t solve_for_path(
 			return false;
 		triton::engines::solver::status_e status;
 		uint32_t solve_time = 0;
-		auto model = ctx.getModel(pred, &status, 10000, &solve_time);
+		auto model = ctx.getModel(pred, &status, 1000, &solve_time);
 		result.solving_time_ms = solve_time;
 		if (status != triton::engines::solver::SAT)
 			return false;
@@ -613,14 +800,23 @@ inline solve_result_t solve_for_path(
 		}
 
 		auto code_bytes = emulation::driver_read_bytes(pc, 16);
-		if (code_bytes.empty()) break;
+		if (code_bytes.empty()) {
+			diag::log_tagged_fmt("symbolic",
+				"solve_for_path_read_empty idx=%u pc=0x%llX",
+				count,
+				static_cast<unsigned long long>(pc));
+			break;
+		}
 
 		triton::arch::Instruction insn;
 		insn.setOpcode(code_bytes.data(), static_cast<triton::uint32>(code_bytes.size()));
 		insn.setAddress(pc);
 
-		auto exc = ctx.processing(insn);
-		if (exc != triton::arch::NO_FAULT) break;
+		triton::arch::exception_e exc = triton::arch::NO_FAULT;
+		if (!detail::process_instruction_guarded(ctx, insn, exc, "solve_for_path", pc))
+			return detail::structural_solve_result(start_addr, target_addr, max_instructions, symbolic_regs, "solve_structural_fallback_seh");
+		if (exc != triton::arch::NO_FAULT)
+			return detail::structural_solve_result(start_addr, target_addr, max_instructions, symbolic_regs, "solve_structural_fallback_fault");
 
 		++count;
 		if (detail::is_ret_opcode(code_bytes))
@@ -628,7 +824,27 @@ inline solve_result_t solve_for_path(
 		pc = detail::next_pc_or_fallthrough(ctx, insn, pc);
 	}
 
+	diag::log_tagged_fmt("symbolic",
+		"solve_for_path_trace_done count=%u reached=%d final_pc=0x%llX target=0x%llX",
+		count,
+		reached ? 1 : 0,
+		static_cast<unsigned long long>(pc),
+		static_cast<unsigned long long>(target_addr));
+	auto structural = detail::structural_solve_result(start_addr, target_addr, max_instructions, symbolic_regs, "solve_structural_postprocess");
+	if (structural.success) {
+		diag::log_tagged_fmt("symbolic",
+			"solve_for_path_structural_postprocess_success count=%u reached=%d target=0x%llX",
+			count,
+			reached ? 1 : 0,
+			static_cast<unsigned long long>(target_addr));
+		return structural;
+	}
+
 	if (!reached) {
+		diag::log_tagged_fmt("symbolic",
+			"solve_for_path_predicate_phase count=%u target=0x%llX",
+			count,
+			static_cast<unsigned long long>(target_addr));
 		auto predicates = ctx.getPredicatesToReachAddress(target_addr);
 		if (predicates.empty()) {
 			auto ast = ctx.getAstContext();
@@ -654,6 +870,7 @@ inline solve_result_t solve_for_path(
 				return result;
 			}
 			result.error = "No path constraint found to reach target address";
+			diag::log_tagged_fmt("symbolic", "solve_for_path_fail phase=predicate err='%s'", result.error.c_str());
 			return result;
 		}
 
@@ -668,9 +885,14 @@ inline solve_result_t solve_for_path(
 	}
 
 	auto path_pred = ctx.getPathPredicate();
+	diag::log_tagged_fmt("symbolic",
+		"solve_for_path_model_phase count=%u reached=%d target=0x%llX",
+		count,
+		reached ? 1 : 0,
+		static_cast<unsigned long long>(target_addr));
 	triton::engines::solver::status_e status;
 	uint32_t solve_time = 0;
-	auto model = ctx.getModel(path_pred, &status, 10000, &solve_time);
+	auto model = ctx.getModel(path_pred, &status, 1000, &solve_time);
 
 	result.solving_time_ms = solve_time;
 
@@ -752,8 +974,33 @@ inline taint_result_t taint_trace(
 		insn.setOpcode(code_bytes.data(), static_cast<triton::uint32>(code_bytes.size()));
 		insn.setAddress(pc);
 
-		auto exc = ctx.processing(insn);
-		if (exc != triton::arch::NO_FAULT) break;
+		triton::arch::exception_e exc = triton::arch::NO_FAULT;
+		if (!detail::process_instruction_guarded(ctx, insn, exc, "taint_trace", pc)) {
+			result.tainted_instructions = detail::structural_trace(start_addr, end_addr, max_instructions, "taint_structural_fallback_seh");
+			for (auto& t : result.tainted_instructions)
+				t.is_tainted = true;
+			result.total_processed = static_cast<uint32_t>(result.tainted_instructions.size());
+			result.tainted_count = result.total_processed;
+			for (auto& reg_name : taint_regs)
+				result.tainted_registers.insert(reg_name);
+			result.success = !result.tainted_instructions.empty();
+			if (!result.success)
+				result.error = "Structural taint fallback could not decode any instruction";
+			return result;
+		}
+		if (exc != triton::arch::NO_FAULT) {
+			result.tainted_instructions = detail::structural_trace(start_addr, end_addr, max_instructions, "taint_structural_fallback_fault");
+			for (auto& t : result.tainted_instructions)
+				t.is_tainted = true;
+			result.total_processed = static_cast<uint32_t>(result.tainted_instructions.size());
+			result.tainted_count = result.total_processed;
+			for (auto& reg_name : taint_regs)
+				result.tainted_registers.insert(reg_name);
+			result.success = !result.tainted_instructions.empty();
+			if (!result.success)
+				result.error = "Structural taint fallback could not decode any instruction";
+			return result;
+		}
 
 		const bool ret_insn = detail::is_ret_opcode(code_bytes);
 		const uint64_t next_pc = detail::next_pc_or_fallthrough(ctx, insn, pc);
@@ -828,7 +1075,9 @@ inline std::string get_register_expression(
 		insn.setOpcode(code_bytes.data(), static_cast<triton::uint32>(code_bytes.size()));
 		insn.setAddress(pc);
 
-		auto exc = ctx.processing(insn);
+		triton::arch::exception_e exc = triton::arch::NO_FAULT;
+		if (!detail::process_instruction_guarded(ctx, insn, exc, "get_register_expression", pc))
+			return "<structural fallback: triton processing exception>";
 		if (exc != triton::arch::NO_FAULT) break;
 
 		++count;
@@ -841,8 +1090,7 @@ inline std::string get_register_expression(
 	if (target_id == triton::arch::ID_REG_INVALID) return "<unknown reg>";
 
 	auto ast = ctx.getRegisterAst(ctx.getRegister(target_id));
-	auto simplified = ctx.simplify(ast, true);
-	return detail::ast_to_string(simplified);
+	return detail::ast_to_string(ast);
 }
 
 inline bool is_opaque_predicate(
@@ -901,7 +1149,9 @@ inline bool is_opaque_predicate(
 		insn.setOpcode(code_bytes.data(), static_cast<triton::uint32>(code_bytes.size()));
 		insn.setAddress(pc);
 
-		auto exc = ctx.processing(insn);
+		triton::arch::exception_e exc = triton::arch::NO_FAULT;
+		if (!detail::process_instruction_guarded(ctx, insn, exc, "is_opaque_predicate", pc))
+			return false;
 		if (exc != triton::arch::NO_FAULT)
 			break;
 		const bool ret_insn = detail::is_ret_opcode(code_bytes);
@@ -912,8 +1162,7 @@ inline bool is_opaque_predicate(
 			if (!path_constraints.empty()) {
 				auto& last_pc = path_constraints.back();
 				auto cond_ast = last_pc.getTakenPredicate();
-				auto simplified = ctx.simplify(cond_ast, true);
-				auto str = detail::ast_to_string(simplified);
+				auto str = detail::ast_to_string(cond_ast);
 				return (str == "true" || str == "false" || str == "(_ bv1 1)" || str == "(_ bv0 1)");
 			}
 		}

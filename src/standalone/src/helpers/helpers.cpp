@@ -58,6 +58,7 @@
 #include "binary_map_view.hpp"
 #include "../core/testlab/test_lab_view.hpp"
 #include "../core/testlab/test_all_features.hpp"
+#include "../core/testlab/test_all_ui.h"
 #include "ui_anim.hpp"
 #include "agent_picker_view.hpp"
 #include "mcp_marketplace_view.hpp"
@@ -1551,8 +1552,13 @@ void helpers::render_title()
 			test_all_features::format_debug_snapshot(snap_before, sizeof(snap_before));
 			diag::log_tagged_fmt("ui", "test_all_start hotkey=Ctrl+Shift+T before={%s}", snap_before);
 			diag::log_tagged_fmt("parser_proof", "Ctrl+Shift+T pressed; starting full Test Lab before={%s}", snap_before);
+			const bool guard_started = !test_all_features::is_running();
+			if (guard_started)
+				test_all_features::begin_test_guard("ctrl_shift_t prestart");
 			test_all_features::run_parser_proof_smoke();
 			bool accepted = test_all_features::start_tests();
+			if (!accepted && guard_started)
+				test_all_features::end_test_guard("ctrl_shift_t rejected", true);
 			char snap_after[1200] = {};
 			test_all_features::format_debug_snapshot(snap_after, sizeof(snap_after));
 			diag::log_tagged_fmt("ui", "test_all_start accepted=%d after={%s}", accepted ? 1 : 0, snap_after);
@@ -6103,6 +6109,7 @@ void helpers::render_title()
 
 
 	g_render_section = "center_view_dispatch";
+	test_all_features::pump_ui_thread_jobs();
 	auto cv = globals::ui::active_center_view;
 
 	bool overlay_blocking = loading_binary_overlay::is_blocking_views();

@@ -2705,22 +2705,38 @@ bool voyager::device_t::get_capture_status(bool& active, std::uint32_t& captured
 
 std::vector<voyager::device_t::captured_packet> voyager::device_t::get_captured_packets(std::uint32_t max_packets) noexcept {
     std::vector<captured_packet> result;
+    const DWORD ioctl_code = ioctl_codes::NCPG();
     if (!is_connected()) {
+        diag::log_tagged_fmt("driver_comm_net", "get_captured_packets ABORT not_connected max=%u ioctl=0x%08X",
+            max_packets, ioctl_code);
         return result;
     }
 
     auto* req = static_cast<voyager::detail::net_cap_get_request*>(
         VirtualAlloc(nullptr, sizeof(voyager::detail::net_cap_get_request),
             MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-    if (!req) return result;
+    if (!req) {
+        const DWORD err = GetLastError();
+        diag::log_tagged_fmt("driver_comm_net", "get_captured_packets ABORT alloc_failed max=%u bytes=%zu gle=%lu",
+            max_packets, sizeof(voyager::detail::net_cap_get_request), err);
+        return result;
+    }
 
     std::memset(req, 0, sizeof(*req));
-    req->max_packets = max_packets;
+    req->max_packets = std::min<std::uint32_t>(max_packets, static_cast<std::uint32_t>(voyager::detail::NET_CAP_GET_MAX));
 
-    if (send_request(ioctl_codes::NCPG(), req, static_cast<DWORD>(sizeof(*req)))) {
+    SetLastError(0);
+    const bool ok = send_request(ioctl_code, req, static_cast<DWORD>(sizeof(*req)));
+    const DWORD gle = GetLastError();
+    const std::uint32_t raw_count = req->packet_count;
+    const std::uint32_t count = std::min<std::uint32_t>(raw_count, static_cast<std::uint32_t>(voyager::detail::NET_CAP_GET_MAX));
+    diag::log_tagged_fmt("driver_comm_net",
+        "get_captured_packets EXIT ok=%d gle=%lu requested=%u sent_max=%u raw_count=%u used_count=%u ioctl=0x%08X",
+        ok ? 1 : 0, gle, max_packets, req->max_packets, raw_count, count, ioctl_code);
+    if (ok) {
         RC_UM_DBG("get_captured_packets: ioctl OK, packet_count=%u", req->packet_count);
-        result.reserve(req->packet_count);
-        for (std::uint32_t i = 0; i < req->packet_count; i++) {
+        result.reserve(count);
+        for (std::uint32_t i = 0; i < count; i++) {
             captured_packet pkt{};
             const auto& src = req->packets[i];
             pkt.timestamp = src.timestamp;
@@ -3124,13 +3140,22 @@ bool voyager::device_t::packet_mod_rule_op(std::uint32_t operation, std::uint32_
                                             const std::uint8_t* pattern, std::uint32_t pattern_size,
                                             const std::uint8_t* replacement, std::uint32_t replace_size,
                                             std::uint32_t* out_rule_id) noexcept {
+    const DWORD ioctl_code = ioctl_codes::PMOD();
     if (!is_connected()) {
+        diag::log_tagged_fmt("driver_comm_net",
+            "packet_mod_rule_op ABORT not_connected op=%u rule_id=%u direction=%u protocol=%u port=%u pid=%u ioctl=0x%08X",
+            operation, rule_id, direction, protocol, port, pid, ioctl_code);
         return false;
     }
 
     auto* req = static_cast<detail::packet_mod_rule*>(
         VirtualAlloc(nullptr, sizeof(detail::packet_mod_rule), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-    if (!req) return false;
+    if (!req) {
+        const DWORD err = GetLastError();
+        diag::log_tagged_fmt("driver_comm_net", "packet_mod_rule_op ABORT alloc_failed op=%u bytes=%zu gle=%lu",
+            operation, sizeof(detail::packet_mod_rule), err);
+        return false;
+    }
 
     std::memset(req, 0, sizeof(*req));
     req->operation = operation;
@@ -3148,7 +3173,13 @@ bool voyager::device_t::packet_mod_rule_op(std::uint32_t operation, std::uint32_
         std::memcpy(req->replacement, replacement, req->replace_size);
     }
 
-    bool ok = send_request(ioctl_codes::PMOD(), req, static_cast<DWORD>(sizeof(*req)));
+    SetLastError(0);
+    bool ok = send_request(ioctl_code, req, static_cast<DWORD>(sizeof(*req)));
+    const DWORD gle = GetLastError();
+    diag::log_tagged_fmt("driver_comm_net",
+        "packet_mod_rule_op EXIT ok=%d gle=%lu op=%u in_rule_id=%u out_rule_id=%u direction=%u protocol=%u port=%u pid=%u pattern_size=%u replace_size=%u ioctl=0x%08X",
+        ok ? 1 : 0, gle, operation, rule_id, req->rule_id, direction, protocol, port, pid,
+        req->pattern_size, req->replace_size, ioctl_code);
     if (ok && out_rule_id) *out_rule_id = req->rule_id;
     VirtualFree(req, 0, MEM_RELEASE);
     return ok;
@@ -3156,19 +3187,32 @@ bool voyager::device_t::packet_mod_rule_op(std::uint32_t operation, std::uint32_
 
 std::vector<voyager::device_t::mod_rule_info> voyager::device_t::list_packet_mod_rules() noexcept {
     std::vector<mod_rule_info> result;
+    const DWORD ioctl_code = ioctl_codes::PMOD();
     if (!is_connected()) {
+        diag::log_tagged_fmt("driver_comm_net", "list_packet_mod_rules ABORT not_connected ioctl=0x%08X", ioctl_code);
         return result;
     }
 
     auto* req = static_cast<detail::packet_mod_rule_list*>(
         VirtualAlloc(nullptr, sizeof(detail::packet_mod_rule_list), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-    if (!req) return result;
+    if (!req) {
+        const DWORD err = GetLastError();
+        diag::log_tagged_fmt("driver_comm_net", "list_packet_mod_rules ABORT alloc_failed bytes=%zu gle=%lu",
+            sizeof(detail::packet_mod_rule_list), err);
+        return result;
+    }
 
     std::memset(req, 0, sizeof(*req));
     req->operation = 2;
 
-    if (send_request(ioctl_codes::PMOD(), req, static_cast<DWORD>(sizeof(*req)))) {
-        for (std::uint32_t i = 0; i < req->rule_count && i < detail::MOD_MAX_RULES; i++) {
+    SetLastError(0);
+    const bool ok = send_request(ioctl_code, req, static_cast<DWORD>(sizeof(*req)));
+    const DWORD gle = GetLastError();
+    const std::uint32_t count = std::min<std::uint32_t>(req->rule_count, detail::MOD_MAX_RULES);
+    diag::log_tagged_fmt("driver_comm_net", "list_packet_mod_rules EXIT ok=%d gle=%lu raw_count=%u used_count=%u ioctl=0x%08X",
+        ok ? 1 : 0, gle, req->rule_count, count, ioctl_code);
+    if (ok) {
+        for (std::uint32_t i = 0; i < count; i++) {
             const auto& r = req->rules[i];
             mod_rule_info info{};
             info.rule_id = r.rule_id;
@@ -3192,13 +3236,22 @@ bool voyager::device_t::traffic_redirect_op(std::uint32_t operation, std::uint32
                                              std::uint32_t redirect_port, const std::uint8_t* redirect_addr,
                                              std::uint32_t af, std::uint32_t* out_rule_id,
                                              std::uint32_t exclude_pid) noexcept {
+    const DWORD ioctl_code = ioctl_codes::PRED();
     if (!is_connected()) {
+        diag::log_tagged_fmt("driver_comm_net",
+            "traffic_redirect_op ABORT not_connected op=%u rule_id=%u protocol=%u match_port=%u redirect_port=%u af=%u exclude_pid=%u ioctl=0x%08X",
+            operation, rule_id, protocol, match_port, redirect_port, af, exclude_pid, ioctl_code);
         return false;
     }
 
     auto* req = static_cast<detail::traffic_redirect_rule*>(
         VirtualAlloc(nullptr, sizeof(detail::traffic_redirect_rule), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-    if (!req) return false;
+    if (!req) {
+        const DWORD err = GetLastError();
+        diag::log_tagged_fmt("driver_comm_net", "traffic_redirect_op ABORT alloc_failed op=%u bytes=%zu gle=%lu",
+            operation, sizeof(detail::traffic_redirect_rule), err);
+        return false;
+    }
 
     std::memset(req, 0, sizeof(*req));
     req->operation = operation;
@@ -3211,7 +3264,13 @@ bool voyager::device_t::traffic_redirect_op(std::uint32_t operation, std::uint32
     if (redirect_addr) std::memcpy(req->redirect_addr, redirect_addr, 16);
     req->exclude_pid = exclude_pid;
 
-    bool ok = send_request(ioctl_codes::PRED(), req, static_cast<DWORD>(sizeof(*req)));
+    SetLastError(0);
+    bool ok = send_request(ioctl_code, req, static_cast<DWORD>(sizeof(*req)));
+    const DWORD gle = GetLastError();
+    diag::log_tagged_fmt("driver_comm_net",
+        "traffic_redirect_op EXIT ok=%d gle=%lu op=%u in_rule_id=%u out_rule_id=%u protocol=%u match_port=%u redirect_port=%u af=%u exclude_pid=%u match_count=%u active=%u ioctl=0x%08X",
+        ok ? 1 : 0, gle, operation, rule_id, req->rule_id, protocol, match_port, redirect_port,
+        af, exclude_pid, req->match_count, req->active, ioctl_code);
     if (ok && out_rule_id) *out_rule_id = req->rule_id;
     VirtualFree(req, 0, MEM_RELEASE);
     return ok;
@@ -3219,19 +3278,32 @@ bool voyager::device_t::traffic_redirect_op(std::uint32_t operation, std::uint32
 
 std::vector<voyager::device_t::redirect_rule_info> voyager::device_t::list_redirect_rules() noexcept {
     std::vector<redirect_rule_info> result;
+    const DWORD ioctl_code = ioctl_codes::PRED();
     if (!is_connected()) {
+        diag::log_tagged_fmt("driver_comm_net", "list_redirect_rules ABORT not_connected ioctl=0x%08X", ioctl_code);
         return result;
     }
 
     auto* req = static_cast<detail::traffic_redirect_list*>(
         VirtualAlloc(nullptr, sizeof(detail::traffic_redirect_list), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-    if (!req) return result;
+    if (!req) {
+        const DWORD err = GetLastError();
+        diag::log_tagged_fmt("driver_comm_net", "list_redirect_rules ABORT alloc_failed bytes=%zu gle=%lu",
+            sizeof(detail::traffic_redirect_list), err);
+        return result;
+    }
 
     std::memset(req, 0, sizeof(*req));
     req->operation = 2;
 
-    if (send_request(ioctl_codes::PRED(), req, static_cast<DWORD>(sizeof(*req)))) {
-        for (std::uint32_t i = 0; i < req->rule_count && i < detail::REDIR_MAX_RULES; i++) {
+    SetLastError(0);
+    const bool ok = send_request(ioctl_code, req, static_cast<DWORD>(sizeof(*req)));
+    const DWORD gle = GetLastError();
+    const std::uint32_t count = std::min<std::uint32_t>(req->rule_count, detail::REDIR_MAX_RULES);
+    diag::log_tagged_fmt("driver_comm_net", "list_redirect_rules EXIT ok=%d gle=%lu raw_count=%u used_count=%u ioctl=0x%08X",
+        ok ? 1 : 0, gle, req->rule_count, count, ioctl_code);
+    if (ok) {
+        for (std::uint32_t i = 0; i < count; i++) {
             const auto& r = req->rules[i];
             redirect_rule_info info{};
             info.rule_id = r.rule_id;
@@ -3311,13 +3383,22 @@ std::vector<voyager::device_t::dpi_result> voyager::device_t::get_dpi_results(
     std::uint32_t filter_pid, std::uint32_t filter_protocol,
     std::uint32_t filter_port, std::uint32_t flags) noexcept {
     std::vector<dpi_result> result;
+    const DWORD ioctl_code = ioctl_codes::DPIN();
     if (!is_connected()) {
+        diag::log_tagged_fmt("driver_comm_net",
+            "get_dpi_results ABORT not_connected filter_pid=%u filter_protocol=%u filter_port=%u flags=0x%08X ioctl=0x%08X",
+            filter_pid, filter_protocol, filter_port, flags, ioctl_code);
         return result;
     }
 
     auto* req = static_cast<detail::dpi_request*>(
         VirtualAlloc(nullptr, sizeof(detail::dpi_request), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-    if (!req) return result;
+    if (!req) {
+        const DWORD err = GetLastError();
+        diag::log_tagged_fmt("driver_comm_net", "get_dpi_results ABORT alloc_failed bytes=%zu gle=%lu",
+            sizeof(detail::dpi_request), err);
+        return result;
+    }
 
     std::memset(req, 0, sizeof(*req));
     req->filter_pid = filter_pid;
@@ -3325,8 +3406,15 @@ std::vector<voyager::device_t::dpi_result> voyager::device_t::get_dpi_results(
     req->filter_port = filter_port;
     req->flags = flags;
 
-    if (send_request(ioctl_codes::DPIN(), req, static_cast<DWORD>(sizeof(*req)))) {
-        for (std::uint32_t i = 0; i < req->result_count && i < detail::DPI_MAX_RESULTS; i++) {
+    SetLastError(0);
+    const bool ok = send_request(ioctl_code, req, static_cast<DWORD>(sizeof(*req)));
+    const DWORD gle = GetLastError();
+    const std::uint32_t count = std::min<std::uint32_t>(req->result_count, detail::DPI_MAX_RESULTS);
+    diag::log_tagged_fmt("driver_comm_net",
+        "get_dpi_results IOCTL ok=%d gle=%lu filter_pid=%u filter_protocol=%u filter_port=%u flags=0x%08X raw_count=%u used_count=%u ioctl=0x%08X",
+        ok ? 1 : 0, gle, filter_pid, filter_protocol, filter_port, flags, req->result_count, count, ioctl_code);
+    if (ok) {
+        for (std::uint32_t i = 0; i < count; i++) {
             const auto& h = req->results[i];
             dpi_result d{};
             d.timestamp = h.timestamp;
@@ -3357,6 +3445,7 @@ std::vector<voyager::device_t::dpi_result> voyager::device_t::get_dpi_results(
     VirtualFree(req, 0, MEM_RELEASE);
     if (result.empty()) {
         const auto captured = get_captured_packets(detail::DPI_MAX_RESULTS);
+        std::size_t fallback_added = 0;
         result.reserve(captured.size());
         for (const auto& pkt : captured) {
             dpi_result d{};
@@ -3365,8 +3454,13 @@ std::vector<voyager::device_t::dpi_result> voyager::device_t::get_dpi_results(
             if (!dpi_result_matches_filters(d, filter_pid, filter_protocol, filter_port, flags))
                 continue;
             result.push_back(std::move(d));
+            ++fallback_added;
         }
+        diag::log_tagged_fmt("driver_comm_net",
+            "get_dpi_results FALLBACK captured=%zu added=%zu filter_pid=%u filter_protocol=%u filter_port=%u flags=0x%08X",
+            captured.size(), fallback_added, filter_pid, filter_protocol, filter_port, flags);
     }
+    diag::log_tagged_fmt("driver_comm_net", "get_dpi_results EXIT result_count=%zu", result.size());
     return result;
 }
 
@@ -3374,13 +3468,22 @@ bool voyager::device_t::intercept_op(std::uint32_t operation, std::uint32_t filt
                                       std::uint32_t filter_protocol, std::uint64_t hold_id,
                                       const std::uint8_t* modify_payload, std::uint32_t modify_size,
                                       std::uint32_t* out_held_count, bool* out_active) noexcept {
+    const DWORD ioctl_code = ioctl_codes::IHLD();
     if (!is_connected()) {
+        diag::log_tagged_fmt("driver_comm_net",
+            "intercept_op ABORT not_connected op=%u pid=%u port=%u protocol=%u hold_id=%llu ioctl=0x%08X",
+            operation, filter_pid, filter_port, filter_protocol, static_cast<unsigned long long>(hold_id), ioctl_code);
         return false;
     }
 
     auto* req = static_cast<detail::intercept_request*>(
         VirtualAlloc(nullptr, sizeof(detail::intercept_request), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-    if (!req) return false;
+    if (!req) {
+        const DWORD err = GetLastError();
+        diag::log_tagged_fmt("driver_comm_net", "intercept_op ABORT alloc_failed op=%u bytes=%zu gle=%lu",
+            operation, sizeof(detail::intercept_request), err);
+        return false;
+    }
 
     std::memset(req, 0, sizeof(*req));
     req->operation = operation;
@@ -3393,7 +3496,14 @@ bool voyager::device_t::intercept_op(std::uint32_t operation, std::uint32_t filt
         std::memcpy(req->modify_payload, modify_payload, req->modify_payload_size);
     }
 
-    bool ok = send_request(ioctl_codes::IHLD(), req, static_cast<DWORD>(sizeof(*req)));
+    SetLastError(0);
+    bool ok = send_request(ioctl_code, req, static_cast<DWORD>(sizeof(*req)));
+    const DWORD gle = GetLastError();
+    diag::log_tagged_fmt("driver_comm_net",
+        "intercept_op EXIT ok=%d gle=%lu op=%u pid=%u port=%u protocol=%u hold_id=%llu held_count=%u active=%u modify_size=%u ioctl=0x%08X",
+        ok ? 1 : 0, gle, operation, filter_pid, filter_port, filter_protocol,
+        static_cast<unsigned long long>(hold_id), req->held_count, req->intercepting,
+        req->modify_payload_size, ioctl_code);
     if (ok) {
         if (out_held_count) *out_held_count = req->held_count;
         if (out_active) *out_active = (req->intercepting != 0);
@@ -3405,19 +3515,32 @@ bool voyager::device_t::intercept_op(std::uint32_t operation, std::uint32_t filt
 
 std::vector<voyager::device_t::held_packet_info> voyager::device_t::get_held_packets() noexcept {
     std::vector<held_packet_info> result;
+    const DWORD ioctl_code = ioctl_codes::IHLD();
     if (!is_connected()) {
+        diag::log_tagged_fmt("driver_comm_net", "get_held_packets ABORT not_connected ioctl=0x%08X", ioctl_code);
         return result;
     }
 
     auto* req = static_cast<detail::intercept_request*>(
         VirtualAlloc(nullptr, sizeof(detail::intercept_request), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-    if (!req) return result;
+    if (!req) {
+        const DWORD err = GetLastError();
+        diag::log_tagged_fmt("driver_comm_net", "get_held_packets ABORT alloc_failed bytes=%zu gle=%lu",
+            sizeof(detail::intercept_request), err);
+        return result;
+    }
 
     std::memset(req, 0, sizeof(*req));
     req->operation = 2;
 
-    if (send_request(ioctl_codes::IHLD(), req, static_cast<DWORD>(sizeof(*req)))) {
-        for (std::uint32_t i = 0; i < req->held_count && i < detail::INTERCEPT_MAX_HELD; i++) {
+    SetLastError(0);
+    const bool ok = send_request(ioctl_code, req, static_cast<DWORD>(sizeof(*req)));
+    const DWORD gle = GetLastError();
+    const std::uint32_t count = std::min<std::uint32_t>(req->held_count, detail::INTERCEPT_MAX_HELD);
+    diag::log_tagged_fmt("driver_comm_net", "get_held_packets EXIT ok=%d gle=%lu raw_count=%u used_count=%u active=%u ioctl=0x%08X",
+        ok ? 1 : 0, gle, req->held_count, count, req->intercepting, ioctl_code);
+    if (ok) {
+        for (std::uint32_t i = 0; i < count; i++) {
             const auto& h = req->held_packets[i];
             held_packet_info info{};
             info.hold_id = h.hold_id;
@@ -3510,13 +3633,22 @@ bool voyager::device_t::dns_spoof_op(std::uint32_t operation, std::uint32_t rule
                                       const char* domain,
                                       const std::uint8_t* spoof_addr, std::uint32_t af,
                                       std::uint32_t ttl, std::uint32_t* out_rule_id) noexcept {
+    const DWORD ioctl_code = ioctl_codes::DNSS();
     if (!is_connected()) {
+        diag::log_tagged_fmt("driver_comm_net",
+            "dns_spoof_op ABORT not_connected op=%u rule_id=%u af=%u ttl=%u ioctl=0x%08X",
+            operation, rule_id, af, ttl, ioctl_code);
         return false;
     }
 
     auto* req = static_cast<detail::dns_spoof_rule*>(
         VirtualAlloc(nullptr, sizeof(detail::dns_spoof_rule), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-    if (!req) return false;
+    if (!req) {
+        const DWORD err = GetLastError();
+        diag::log_tagged_fmt("driver_comm_net", "dns_spoof_op ABORT alloc_failed op=%u bytes=%zu gle=%lu",
+            operation, sizeof(detail::dns_spoof_rule), err);
+        return false;
+    }
 
     std::memset(req, 0, sizeof(*req));
     req->operation = operation;
@@ -3530,7 +3662,13 @@ bool voyager::device_t::dns_spoof_op(std::uint32_t operation, std::uint32_t rule
     }
     if (spoof_addr) std::memcpy(req->spoof_addr, spoof_addr, 16);
 
-    bool ok = send_request(ioctl_codes::DNSS(), req, static_cast<DWORD>(sizeof(*req)));
+    SetLastError(0);
+    bool ok = send_request(ioctl_code, req, static_cast<DWORD>(sizeof(*req)));
+    const DWORD gle = GetLastError();
+    diag::log_tagged_fmt("driver_comm_net",
+        "dns_spoof_op EXIT ok=%d gle=%lu op=%u in_rule_id=%u out_rule_id=%u af=%u ttl=%u match_count=%u active=%u has_domain=%u ioctl=0x%08X",
+        ok ? 1 : 0, gle, operation, rule_id, req->rule_id, af, ttl, req->match_count,
+        req->active, req->domain[0] ? 1u : 0u, ioctl_code);
     if (ok && out_rule_id) *out_rule_id = req->rule_id;
     VirtualFree(req, 0, MEM_RELEASE);
     return ok;
@@ -3538,19 +3676,32 @@ bool voyager::device_t::dns_spoof_op(std::uint32_t operation, std::uint32_t rule
 
 std::vector<voyager::device_t::dns_spoof_info> voyager::device_t::list_dns_spoof_rules() noexcept {
     std::vector<dns_spoof_info> result;
+    const DWORD ioctl_code = ioctl_codes::DNSS();
     if (!is_connected()) {
+        diag::log_tagged_fmt("driver_comm_net", "list_dns_spoof_rules ABORT not_connected ioctl=0x%08X", ioctl_code);
         return result;
     }
 
     auto* req = static_cast<detail::dns_spoof_list*>(
         VirtualAlloc(nullptr, sizeof(detail::dns_spoof_list), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-    if (!req) return result;
+    if (!req) {
+        const DWORD err = GetLastError();
+        diag::log_tagged_fmt("driver_comm_net", "list_dns_spoof_rules ABORT alloc_failed bytes=%zu gle=%lu",
+            sizeof(detail::dns_spoof_list), err);
+        return result;
+    }
 
     std::memset(req, 0, sizeof(*req));
     req->operation = 2;
 
-    if (send_request(ioctl_codes::DNSS(), req, static_cast<DWORD>(sizeof(*req)))) {
-        for (std::uint32_t i = 0; i < req->rule_count && i < detail::DNS_SPOOF_MAX_RULES; i++) {
+    SetLastError(0);
+    const bool ok = send_request(ioctl_code, req, static_cast<DWORD>(sizeof(*req)));
+    const DWORD gle = GetLastError();
+    const std::uint32_t count = std::min<std::uint32_t>(req->rule_count, detail::DNS_SPOOF_MAX_RULES);
+    diag::log_tagged_fmt("driver_comm_net", "list_dns_spoof_rules EXIT ok=%d gle=%lu raw_count=%u used_count=%u ioctl=0x%08X",
+        ok ? 1 : 0, gle, req->rule_count, count, ioctl_code);
+    if (ok) {
+        for (std::uint32_t i = 0; i < count; i++) {
             const auto& r = req->rules[i];
             dns_spoof_info info{};
             info.rule_id = r.rule_id;
@@ -3569,19 +3720,39 @@ std::vector<voyager::device_t::dns_spoof_info> voyager::device_t::list_dns_spoof
 
 bool voyager::device_t::bw_monitor_op(std::uint32_t operation, std::uint32_t filter_pid,
                                        bw_stats* out_stats) noexcept {
+    const DWORD ioctl_code = ioctl_codes::BWMN();
     if (!is_connected()) {
+        diag::log_tagged_fmt("driver_comm_net", "bw_monitor_op ABORT not_connected op=%u filter_pid=%u ioctl=0x%08X",
+            operation, filter_pid, ioctl_code);
         return false;
     }
 
     auto* req = static_cast<detail::bw_monitor_request*>(
         VirtualAlloc(nullptr, sizeof(detail::bw_monitor_request), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-    if (!req) return false;
+    if (!req) {
+        const DWORD err = GetLastError();
+        diag::log_tagged_fmt("driver_comm_net", "bw_monitor_op ABORT alloc_failed op=%u bytes=%zu gle=%lu",
+            operation, sizeof(detail::bw_monitor_request), err);
+        return false;
+    }
 
     std::memset(req, 0, sizeof(*req));
     req->operation = operation;
     req->filter_pid = filter_pid;
 
-    bool ok = send_request(ioctl_codes::BWMN(), req, static_cast<DWORD>(sizeof(*req)));
+    SetLastError(0);
+    bool ok = send_request(ioctl_code, req, static_cast<DWORD>(sizeof(*req)));
+    const DWORD gle = GetLastError();
+    diag::log_tagged_fmt("driver_comm_net",
+        "bw_monitor_op EXIT ok=%d gle=%lu op=%u filter_pid=%u active=%u sent_bytes=%llu recv_bytes=%llu sent_pkts=%llu recv_pkts=%llu bps_in=%llu bps_out=%llu process_count=%u ioctl=0x%08X",
+        ok ? 1 : 0, gle, operation, filter_pid, req->monitoring_active,
+        static_cast<unsigned long long>(req->total_bytes_sent),
+        static_cast<unsigned long long>(req->total_bytes_recv),
+        static_cast<unsigned long long>(req->total_packets_sent),
+        static_cast<unsigned long long>(req->total_packets_recv),
+        static_cast<unsigned long long>(req->bytes_per_second_in),
+        static_cast<unsigned long long>(req->bytes_per_second_out),
+        req->process_count, ioctl_code);
     if (ok && out_stats) {
         out_stats->total_bytes_sent = req->total_bytes_sent;
         out_stats->total_bytes_recv = req->total_bytes_recv;
@@ -3598,20 +3769,40 @@ bool voyager::device_t::bw_monitor_op(std::uint32_t operation, std::uint32_t fil
 
 std::vector<voyager::device_t::bw_process_info> voyager::device_t::get_bw_per_process(std::uint32_t filter_pid) noexcept {
     std::vector<bw_process_info> result;
+    const DWORD ioctl_code = ioctl_codes::BWMN();
     if (!is_connected()) {
+        diag::log_tagged_fmt("driver_comm_net", "get_bw_per_process ABORT not_connected filter_pid=%u ioctl=0x%08X",
+            filter_pid, ioctl_code);
         return result;
     }
 
     auto* req = static_cast<detail::bw_monitor_request*>(
         VirtualAlloc(nullptr, sizeof(detail::bw_monitor_request), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-    if (!req) return result;
+    if (!req) {
+        const DWORD err = GetLastError();
+        diag::log_tagged_fmt("driver_comm_net", "get_bw_per_process ABORT alloc_failed filter_pid=%u bytes=%zu gle=%lu",
+            filter_pid, sizeof(detail::bw_monitor_request), err);
+        return result;
+    }
 
     std::memset(req, 0, sizeof(*req));
     req->operation = 4;
     req->filter_pid = filter_pid;
 
-    if (send_request(ioctl_codes::BWMN(), req, static_cast<DWORD>(sizeof(*req)))) {
-        for (std::uint32_t i = 0; i < req->process_count && i < detail::BW_MAX_PROCESSES; i++) {
+    SetLastError(0);
+    const bool ok = send_request(ioctl_code, req, static_cast<DWORD>(sizeof(*req)));
+    const DWORD gle = GetLastError();
+    const std::uint32_t count = std::min<std::uint32_t>(req->process_count, detail::BW_MAX_PROCESSES);
+    diag::log_tagged_fmt("driver_comm_net",
+        "get_bw_per_process EXIT ok=%d gle=%lu filter_pid=%u raw_count=%u used_count=%u active=%u sent_bytes=%llu recv_bytes=%llu sent_pkts=%llu recv_pkts=%llu ioctl=0x%08X",
+        ok ? 1 : 0, gle, filter_pid, req->process_count, count, req->monitoring_active,
+        static_cast<unsigned long long>(req->total_bytes_sent),
+        static_cast<unsigned long long>(req->total_bytes_recv),
+        static_cast<unsigned long long>(req->total_packets_sent),
+        static_cast<unsigned long long>(req->total_packets_recv),
+        ioctl_code);
+    if (ok) {
+        for (std::uint32_t i = 0; i < count; i++) {
             const auto& p = req->processes[i];
             bw_process_info info{};
             info.pid = p.pid;
@@ -3702,37 +3893,62 @@ bool voyager::device_t::export_pcap(std::uint32_t filter_pid, std::uint32_t filt
 }
 
 bool voyager::device_t::fingerprint_op(std::uint32_t operation) noexcept {
+    const DWORD ioctl_code = ioctl_codes::NFPR();
     if (!is_connected()) {
+        diag::log_tagged_fmt("driver_comm_net", "fingerprint_op ABORT not_connected op=%u ioctl=0x%08X",
+            operation, ioctl_code);
         return false;
     }
 
     auto* req = static_cast<detail::net_fingerprint_request*>(
         VirtualAlloc(nullptr, sizeof(detail::net_fingerprint_request), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-    if (!req) return false;
+    if (!req) {
+        const DWORD err = GetLastError();
+        diag::log_tagged_fmt("driver_comm_net", "fingerprint_op ABORT alloc_failed op=%u bytes=%zu gle=%lu",
+            operation, sizeof(detail::net_fingerprint_request), err);
+        return false;
+    }
 
     std::memset(req, 0, sizeof(*req));
     req->operation = operation;
 
-    bool ok = send_request(ioctl_codes::NFPR(), req, static_cast<DWORD>(sizeof(*req)));
+    SetLastError(0);
+    bool ok = send_request(ioctl_code, req, static_cast<DWORD>(sizeof(*req)));
+    const DWORD gle = GetLastError();
+    diag::log_tagged_fmt("driver_comm_net", "fingerprint_op EXIT ok=%d gle=%lu op=%u raw_count=%u ioctl=0x%08X",
+        ok ? 1 : 0, gle, operation, req->result_count, ioctl_code);
     VirtualFree(req, 0, MEM_RELEASE);
     return ok;
 }
 
 std::vector<voyager::device_t::fingerprint_info> voyager::device_t::get_fingerprints() noexcept {
     std::vector<fingerprint_info> result;
+    const DWORD ioctl_code = ioctl_codes::NFPR();
     if (!is_connected()) {
+        diag::log_tagged_fmt("driver_comm_net", "get_fingerprints ABORT not_connected ioctl=0x%08X", ioctl_code);
         return result;
     }
 
     auto* req = static_cast<detail::net_fingerprint_request*>(
         VirtualAlloc(nullptr, sizeof(detail::net_fingerprint_request), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-    if (!req) return result;
+    if (!req) {
+        const DWORD err = GetLastError();
+        diag::log_tagged_fmt("driver_comm_net", "get_fingerprints ABORT alloc_failed bytes=%zu gle=%lu",
+            sizeof(detail::net_fingerprint_request), err);
+        return result;
+    }
 
     std::memset(req, 0, sizeof(*req));
     req->operation = 2;
 
-    if (send_request(ioctl_codes::NFPR(), req, static_cast<DWORD>(sizeof(*req)))) {
-        for (std::uint32_t i = 0; i < req->result_count && i < detail::FINGERPRINT_MAX; i++) {
+    SetLastError(0);
+    const bool ok = send_request(ioctl_code, req, static_cast<DWORD>(sizeof(*req)));
+    const DWORD gle = GetLastError();
+    const std::uint32_t count = std::min<std::uint32_t>(req->result_count, detail::FINGERPRINT_MAX);
+    diag::log_tagged_fmt("driver_comm_net", "get_fingerprints EXIT ok=%d gle=%lu raw_count=%u used_count=%u ioctl=0x%08X",
+        ok ? 1 : 0, gle, req->result_count, count, ioctl_code);
+    if (ok) {
+        for (std::uint32_t i = 0; i < count; i++) {
             const auto& e = req->entries[i];
             fingerprint_info info{};
             std::memcpy(info.remote_addr, e.remote_addr, 16);

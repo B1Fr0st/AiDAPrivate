@@ -7,6 +7,7 @@ namespace process_notify {
 
     inline volatile LONG g_registered = 0;
     inline volatile LONG g_image_registered = 0;
+    inline volatile LONG g_registered_ex = 0;
 
     inline volatile HANDLE g_protected_pid = nullptr;
 
@@ -28,10 +29,22 @@ namespace process_notify {
         PEPROCESS process, HANDLE pid, PPS_CREATE_NOTIFY_INFO create_info)
     {
         UNREFERENCED_PARAMETER(process);
-        UNREFERENCED_PARAMETER(pid);
 
-        if (!create_info)
+        if (!create_info) {
+            HANDLE prot_pid = reinterpret_cast<HANDLE>(
+                _InterlockedCompareExchange64(
+                    reinterpret_cast<volatile LONG64*>(&g_protected_pid), 0, 0));
+            if (prot_pid && pid == prot_pid) {
+                LONG64 previous = _InterlockedCompareExchange64(
+                    reinterpret_cast<volatile LONG64*>(&g_protected_pid), 0,
+                    reinterpret_cast<LONG64>(prot_pid));
+                if (previous == reinterpret_cast<LONG64>(prot_pid)) {
+                    object_guard::set_protected_pid(nullptr);
+                    SN_LOG("process_notify: protected_pid exited and cleared pid=%llu", (UINT64)(ULONG_PTR)pid);
+                }
+            }
             return;
+        }
 
         HANDLE prot_pid = reinterpret_cast<HANDLE>(
             _InterlockedCompareExchange64(
@@ -64,8 +77,21 @@ namespace process_notify {
     }
 
     static VOID process_create_callback(HANDLE, HANDLE pid, BOOLEAN create) {
-        if (!create)
+        if (!create) {
+            HANDLE prot_pid = reinterpret_cast<HANDLE>(
+                _InterlockedCompareExchange64(
+                    reinterpret_cast<volatile LONG64*>(&g_protected_pid), 0, 0));
+            if (prot_pid && pid == prot_pid) {
+                LONG64 previous = _InterlockedCompareExchange64(
+                    reinterpret_cast<volatile LONG64*>(&g_protected_pid), 0,
+                    reinterpret_cast<LONG64>(prot_pid));
+                if (previous == reinterpret_cast<LONG64>(prot_pid)) {
+                    object_guard::set_protected_pid(nullptr);
+                    SN_LOG("process_notify: protected_pid legacy exit cleared pid=%llu", (UINT64)(ULONG_PTR)pid);
+                }
+            }
             return;
+        }
 
         HANDLE prot_pid = reinterpret_cast<HANDLE>(
             _InterlockedCompareExchange64(
@@ -172,6 +198,7 @@ namespace process_notify {
             st = _PsSetCreateProcessNotifyRoutineEx(process_create_callback_ex, FALSE);
             if (NT_SUCCESS(st)) {
                 _InterlockedExchange(&g_registered, 1);
+                _InterlockedExchange(&g_registered_ex, 1);
                 SN_LOG("process_notify::init: registered Ex callback (pre-create blocking)");
             } else {
                 SN_LOG("process_notify::init: Ex FAILED 0x%lx, falling back", st);
@@ -215,8 +242,13 @@ fallback:
             PsRemoveCreateThreadNotifyRoutine(thread_create_callback);
         }
         if (_InterlockedCompareExchange(&g_registered, 0, 1) == 1) {
-            if (_PsSetCreateProcessNotifyRoutine)
+            if (_InterlockedCompareExchange(&g_registered_ex, 0, 0) == 1) {
+                _InterlockedExchange(&g_registered_ex, 0);
+                if (_PsSetCreateProcessNotifyRoutineEx)
+                    _PsSetCreateProcessNotifyRoutineEx(process_create_callback_ex, TRUE);
+            } else if (_PsSetCreateProcessNotifyRoutine) {
                 _PsSetCreateProcessNotifyRoutine(process_create_callback, TRUE);
+            }
         }
         if (_InterlockedCompareExchange(&g_image_registered, 0, 1) == 1) {
             if (_PsRemoveLoadImageNotifyRoutine)

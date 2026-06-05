@@ -21,6 +21,7 @@
 #include "license_state.hpp"
 #include "gate_tokens.hpp"
 #include "reason_ids.hpp"
+#include "loader_header_invariant.hpp"
 #include "hardware_id/hardware_id_v2.hpp"
 #include "plaintext_window.hpp"
 #include "../testlab/test_all_features.hpp"
@@ -136,6 +137,7 @@ namespace lic_diag {
 
     static void thread_canary(const char* phase)
     {
+        aida::runtime::loader_header_invariant::ensure(phase, "license");
         volatile LONG done = 0;
         DWORD tid = 0;
         SetLastError(0);
@@ -151,6 +153,7 @@ namespace lic_diag {
 
     static void dump_pe_self(const char* phase)
     {
+        aida::runtime::loader_header_invariant::ensure(phase, "license");
         HMODULE mod = GetModuleHandleW(nullptr);
         if (!mod) {
             lic_log_fmt("DIAG_LIC_PE phase=%s mod=NULL gle=%lu", phase, GetLastError());
@@ -5791,6 +5794,50 @@ namespace
                 return false;
         }
 
+        auto& at_rt = anti_tamper::state::get();
+        const bool driver_live_for_at = driver_bridge::is_loaded() && driver_bridge::using_kernel_driver();
+        const bool anti_tamper_initialized = at_rt.initialized.load(std::memory_order_acquire);
+        const bool driver_hardening_done = at_rt.driver_hardening_done.load(std::memory_order_acquire);
+        if (!anti_tamper_initialized || (driver_live_for_at && !driver_hardening_done))
+        {
+            lic_log_fmt("pre_arc_anti_tamper_initialize_pre attempt=%u loaded=%d kernel=%d initialized=%d driver_hardening=%d",
+                attempt_number,
+                driver_bridge::is_loaded() ? 1 : 0,
+                driver_bridge::using_kernel_driver() ? 1 : 0,
+                anti_tamper_initialized ? 1 : 0,
+                driver_hardening_done ? 1 : 0);
+            bool at_ok = false;
+            try
+            {
+                at_ok = anti_tamper::initialize();
+            }
+            catch (const std::exception& ex)
+            {
+                lic_log_fmt("pre_arc_anti_tamper_initialize_exception what=%.160s", ex.what());
+                anti_tamper::enforce_violation_id(
+                    aida::reason_ids::reason_id_from_string("pre_arc_anti_tamper_initialize_exception"),
+                    ex.what());
+                return false;
+            }
+            catch (...)
+            {
+                lic_log("pre_arc_anti_tamper_initialize_unknown_exception");
+                anti_tamper::enforce_violation_id(
+                    aida::reason_ids::reason_id_from_string("pre_arc_anti_tamper_initialize_exception"),
+                    "unknown");
+                return false;
+            }
+            if (!at_ok)
+            {
+                lic_log("pre_arc_anti_tamper_initialize_failed");
+                anti_tamper::enforce_violation_id(
+                    aida::reason_ids::reason_id_from_string("pre_arc_anti_tamper_initialize_failed"),
+                    "pre_arc_anti_tamper_initialize_failed");
+                return false;
+            }
+            lic_log("pre_arc_anti_tamper_initialize_ok");
+        }
+
         std::unique_lock<std::mutex> lk(s_arc_mtx);
 
 
@@ -5984,6 +6031,16 @@ namespace
                 static_cast<unsigned long long>(http_elapsed_ms),
                 bulk_resp.body.size());
 
+            if (!ensure_driver_server_token_relay(settings, "arc_bulk_response_keepalive"))
+            {
+                SecureZeroMemory(key_seed.data(), key_seed.size());
+                lic_log_fmt("[arc-bulk] response_driver_relay_failed elapsed_ms=%llu body_size=%zu",
+                    static_cast<unsigned long long>(http_elapsed_ms),
+                    bulk_resp.body.size());
+                log_arc_status("arc_bulk_response_driver_relay_failed");
+                return false;
+            }
+
             auto envelope_json = json::parse(bulk_resp.body, nullptr, false);
             if (envelope_json.is_discarded() || !envelope_json.is_object()) {
                 SecureZeroMemory(key_seed.data(), key_seed.size());
@@ -6100,9 +6157,23 @@ namespace
             std::string          chain_tag_hex;
 
             const ULONGLONG page_loop_start_ms = GetTickCount64();
+            ULONGLONG driver_relay_refresh_ms = page_loop_start_ms;
             bool bulk_loaded = true;
 
             for (uint32_t page_index = 0; page_index < total_pages; ++page_index) {
+                ULONGLONG loop_now_ms = GetTickCount64();
+                if (loop_now_ms - driver_relay_refresh_ms >= 15000ull) {
+                    if (!ensure_driver_server_token_relay(settings, "arc_page_loop_keepalive")) {
+                        lic_log_fmt("[arc-bulk] page_loop_driver_relay_failed page=%u elapsed_ms=%llu",
+                            page_index,
+                            static_cast<unsigned long long>(loop_now_ms - page_loop_start_ms));
+                        log_arc_status("arc_page_loop_driver_relay_failed");
+                        bulk_loaded = false;
+                        break;
+                    }
+                    driver_relay_refresh_ms = GetTickCount64();
+                }
+
                 const json& page_json = pages_json[page_index];
                 if (!page_json.is_object()) {
                     lic_log_fmt("[arc-bulk] page_invalid_json page=%u", page_index);
@@ -6349,6 +6420,15 @@ namespace
                 return false;
             }
             lic_log_fmt("[arc-bulk] plaintext_window_streamed bytes=%zu", loader_buffer.size());
+
+            if (!ensure_driver_server_token_relay(settings, "arc_loader_handoff"))
+            {
+                SecureZeroMemory(loader_buffer.data(), loader_buffer.size());
+                loader_buffer.clear();
+                lic_log("[arc-bulk] arc_loader_handoff_driver_relay_failed");
+                log_arc_status("arc_loader_handoff_driver_relay_failed");
+                return false;
+            }
 
             lic_log_fmt("[arc-bulk] arc_loader_handoff size=%zu", loader_buffer.size());
             s_arc_module = arc_loader::load(loader_buffer.data(), loader_buffer.size());

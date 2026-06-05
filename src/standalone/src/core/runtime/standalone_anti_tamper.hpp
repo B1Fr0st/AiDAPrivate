@@ -23,6 +23,7 @@
 #include "standalone_settings.hpp"
 #include "toast_notification.hpp"
 #include "standalone_anti_dump.hpp"
+#include "anti-tamper/state.hpp"
 #include "anti-tamper/virtualizer.hpp"
 #include "anti-tamper/vm_compiler.hpp"
 #include "standalone_anti_ai.hpp"
@@ -73,6 +74,10 @@ namespace runtime_enforcement_detail
 
     inline bool destructive_enforcement_suppressed()
     {
+        if (anti_tamper::state::get().full_test_running.load(std::memory_order_acquire))
+            return true;
+        if (anti_tamper::state::full_test_suppression_active())
+            return true;
 #ifdef NDEBUG
         return false;
 #else
@@ -83,10 +88,14 @@ namespace runtime_enforcement_detail
 
     inline void log_suppressed(const char* reason)
     {
+        uint64_t full_test_suppression_remaining = 0;
+        anti_tamper::state::full_test_suppression_active(&full_test_suppression_remaining);
         char msg[192];
         _snprintf_s(msg, sizeof(msg), _TRUNCATE,
-            "runtime_destructive_enforcement_suppressed reason=%s env_full_test=%d env_disable=%d",
+            "runtime_destructive_enforcement_suppressed reason=%s full_test_latch=%d post_full_test_ms=%llu env_full_test=%d env_disable=%d",
             reason ? reason : "standalone_tamper",
+            anti_tamper::state::get().full_test_running.load(std::memory_order_acquire) ? 1 : 0,
+            static_cast<unsigned long long>(full_test_suppression_remaining),
             env_flag_enabled("AIDA_FULL_TEST_RUNNING") ? 1 : 0,
             env_flag_enabled("AIDA_DISABLE_DESTRUCTIVE_ENFORCEMENT") ? 1 : 0);
         diag::log_tagged_critical("standalone_anti_tamper", msg);
@@ -495,6 +504,12 @@ inline void enforce_violation(const char* reason, const std::string& extra = "")
 {
     auto& rt = state::get();
 
+    if (runtime_enforcement_detail::destructive_enforcement_suppressed())
+    {
+        runtime_enforcement_detail::log_suppressed(reason);
+        return;
+    }
+
     if (rt.violation_latched.exchange(true))
         return;
 
@@ -517,12 +532,6 @@ inline void enforce_violation(const char* reason, const std::string& extra = "")
     }
 
     webhook::send_violation_alert(reason ? reason : "standalone_tamper", extra);
-
-    if (runtime_enforcement_detail::destructive_enforcement_suppressed())
-    {
-        runtime_enforcement_detail::log_suppressed(reason);
-        return;
-    }
 
     standalone_license::shutdown();
 

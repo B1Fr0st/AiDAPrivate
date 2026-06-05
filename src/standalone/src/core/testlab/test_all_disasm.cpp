@@ -37,10 +37,7 @@ namespace {
             (unsigned)st.wHour, (unsigned)st.wMinute, (unsigned)st.wSecond, (unsigned)st.wMilliseconds);
     }
     void write_log_file(HANDLE hf, const std::string& line) {
-        if (hf == INVALID_HANDLE_VALUE) return;
-        DWORD wrote = 0;
-        WriteFile(hf, line.data(), (DWORD)line.size(), &wrote, nullptr);
-        FlushFileBuffers(hf);
+        test_all_features::write_full_test_log_line(hf, line.data(), line.size());
     }
     void log_msg(HANDLE hf, const char* tag, const char* fmt, ...) {
         char ts[40]; format_timestamp(ts, sizeof(ts));
@@ -50,8 +47,7 @@ namespace {
         _snprintf_s(line, sizeof(line), _TRUNCATE, "[%s] [%s] %s\n", ts, tag, detail);
         std::string s(line);
         write_log_file(hf, s);
-        diag::log_tagged_fmt("test_all", "%s: %s", tag, detail);
-        OutputDebugStringA(s.c_str());
+        test_all_features::mirror_full_test_log_line(tag, detail, s.c_str());
     }
 
     uint64_t resolve_remote_module_base(const char* module_name) {

@@ -545,6 +545,39 @@ static SOCKET try_connect_address(const sockaddr* addr, int addr_len, int family
     return s;
 }
 
+static SOCKET try_connect_address_blocking(const sockaddr* addr, int addr_len, int family, int socktype, int proto,
+                                           DWORD io_timeout_ms, int* last_error) {
+    const ULONGLONG t0 = GetTickCount64();
+    diag::log_tagged_fmt("mitm",
+        "try_connect_address_blocking ENTER family=%d socktype=%d proto=%d io_timeout_ms=%lu",
+        family, socktype, proto, static_cast<unsigned long>(io_timeout_ms));
+    if (last_error)
+        *last_error = 0;
+    SOCKET s = socket(family, socktype, proto);
+    if (s == INVALID_SOCKET) {
+        int err = WSAGetLastError();
+        if (last_error)
+            *last_error = err;
+        diag::log_tagged_fmt("mitm", "try_connect_address_blocking socket_failed family=%d wsa=%d", family, err);
+        return INVALID_SOCKET;
+    }
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&io_timeout_ms), sizeof(io_timeout_ms));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&io_timeout_ms), sizeof(io_timeout_ms));
+    int cr = connect(s, addr, addr_len);
+    if (cr != 0) {
+        int err = WSAGetLastError();
+        if (last_error)
+            *last_error = err;
+        diag::log_tagged_fmt("mitm", "try_connect_address_blocking connect_failed family=%d wsa=%d elapsed_ms=%llu",
+            family, err, static_cast<unsigned long long>(GetTickCount64() - t0));
+        closesocket(s);
+        return INVALID_SOCKET;
+    }
+    diag::log_tagged_fmt("mitm", "try_connect_address_blocking CONNECTED family=%d elapsed_ms=%llu",
+        family, static_cast<unsigned long long>(GetTickCount64() - t0));
+    return s;
+}
+
 static bool is_loopback_host(const std::string& host) {
     if (host.empty()) return false;
 
@@ -574,12 +607,22 @@ static SOCKET connect_loopback(uint16_t port, int connect_timeout_ms, DWORD io_t
     sin.sin_port = htons(port);
     inet_pton(AF_INET, "127.0.0.1", &sin.sin_addr);
 
-    SOCKET s = try_connect_address(reinterpret_cast<const sockaddr*>(&sin), sizeof(sin),
-                                   AF_INET, SOCK_STREAM, IPPROTO_TCP,
-                                   connect_timeout_ms, io_timeout_ms);
-    if (s != INVALID_SOCKET) {
-        diag::log_tagged_fmt("mitm", "connect_loopback ipv4_ok port=%u", port);
-        return s;
+    const int attempts = std::clamp(connect_timeout_ms / 100, 3, 12);
+    int last_err = 0;
+    for (int attempt = 1; attempt <= attempts; ++attempt) {
+        SOCKET s = try_connect_address_blocking(reinterpret_cast<const sockaddr*>(&sin), sizeof(sin),
+                                                AF_INET, SOCK_STREAM, IPPROTO_TCP,
+                                                io_timeout_ms, &last_err);
+        if (s != INVALID_SOCKET) {
+            diag::log_tagged_fmt("mitm", "connect_loopback ipv4_ok port=%u attempt=%d", port, attempt);
+            return s;
+        }
+        diag::log_tagged_fmt("mitm", "connect_loopback ipv4_retry port=%u attempt=%d err=%d",
+            port, attempt, last_err);
+        if (last_err != WSAENOBUFS && last_err != WSAEMFILE && last_err != WSAECONNREFUSED &&
+            last_err != WSAETIMEDOUT && last_err != WSAEADDRNOTAVAIL && last_err != WSAEADDRINUSE)
+            break;
+        Sleep(static_cast<DWORD>(25 * attempt));
     }
     diag::log_tagged_fmt("mitm", "connect_loopback ipv4_failed_try_ipv6 port=%u", port);
 
@@ -587,9 +630,22 @@ static SOCKET connect_loopback(uint16_t port, int connect_timeout_ms, DWORD io_t
     sin6.sin6_family = AF_INET6;
     sin6.sin6_port = htons(port);
     inet_pton(AF_INET6, "::1", &sin6.sin6_addr);
-    return try_connect_address(reinterpret_cast<const sockaddr*>(&sin6), sizeof(sin6),
-                               AF_INET6, SOCK_STREAM, IPPROTO_TCP,
-                               connect_timeout_ms, io_timeout_ms);
+    for (int attempt = 1; attempt <= attempts; ++attempt) {
+        SOCKET s = try_connect_address_blocking(reinterpret_cast<const sockaddr*>(&sin6), sizeof(sin6),
+                                                AF_INET6, SOCK_STREAM, IPPROTO_TCP,
+                                                io_timeout_ms, &last_err);
+        if (s != INVALID_SOCKET) {
+            diag::log_tagged_fmt("mitm", "connect_loopback ipv6_ok port=%u attempt=%d", port, attempt);
+            return s;
+        }
+        diag::log_tagged_fmt("mitm", "connect_loopback ipv6_retry port=%u attempt=%d err=%d",
+            port, attempt, last_err);
+        if (last_err != WSAENOBUFS && last_err != WSAEMFILE && last_err != WSAECONNREFUSED &&
+            last_err != WSAETIMEDOUT && last_err != WSAEADDRNOTAVAIL && last_err != WSAEADDRINUSE)
+            break;
+        Sleep(static_cast<DWORD>(25 * attempt));
+    }
+    return INVALID_SOCKET;
 }
 
 static SOCKET connect_tcp(const std::string& host, uint16_t port) {
@@ -2520,7 +2576,30 @@ repeat_result repeat_request(const std::string& host, uint16_t port, bool use_tl
     }
 
     close_socket(sock);
-    diag::log_tagged_fmt("mitm", "repeat_request complete host=%s success=%d", host.c_str(), (int)result.success);
+    if (result.success) {
+        result.exchange.id = g_state.next_id.fetch_add(1);
+        result.exchange.timestamp = result.exchange.request_time;
+        result.exchange.client_addr = "repeater";
+        {
+            std::lock_guard<std::mutex> lock(g_state.history_mutex);
+            g_state.history.push_back(std::make_shared<http_exchange>(result.exchange));
+            while (g_state.history.size() > g_state.config.max_history) {
+                g_state.history.pop_front();
+            }
+            diag::log_tagged_fmt("mitm", "repeat_request history_recorded id=%llu history_size=%zu status=%d req=%zu resp=%zu latency_ms=%llu",
+                static_cast<unsigned long long>(result.exchange.id),
+                g_state.history.size(),
+                result.exchange.response.status_code,
+                result.exchange.request_size,
+                result.exchange.response_size,
+                static_cast<unsigned long long>(result.exchange.latency_ms));
+        }
+        g_state.total_requests.fetch_add(1);
+        g_state.total_bytes_in.fetch_add(static_cast<uint64_t>(result.exchange.request_size));
+        g_state.total_bytes_out.fetch_add(static_cast<uint64_t>(result.exchange.response_size));
+        publish_exchange_event(result.exchange);
+    }
+    diag::log_tagged_fmt("mitm", "repeat_request complete host=%s success=%d err=%s", host.c_str(), (int)result.success, result.error.c_str());
     return result;
 }
 

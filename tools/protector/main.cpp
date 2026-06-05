@@ -581,29 +581,204 @@ static bool validate_import_table_range(const uint8_t* base,
     return true;
 }
 
-inline bool detect_already_protected(const pe_file::pe_image_t& pe, std::string& detail_out) {
-    for (const auto& sec : pe.sections) {
-        if (sec.data.size() < sizeof(uint32_t)) continue;
-        const size_t scan_limit = (std::min<size_t>)(sec.data.size(), 0x20000u);
-        for (size_t off = 0; off + sizeof(uint32_t) <= scan_limit; ++off) {
-            uint32_t magic = 0;
-            std::memcpy(&magic, sec.data.data() + off, sizeof(magic));
-            if (magic == kPackedMagic) {
-                char name_buf[16] = {};
-                std::memcpy(name_buf, sec.name, sizeof(sec.name));
-                name_buf[8] = '\0';
-                char buf[160];
-                std::snprintf(buf, sizeof(buf),
-                    "kPackedMagic in section '%s' rva=0x%X offset=0x%zX size=%zu",
-                    name_buf,
-                    static_cast<unsigned>(sec.virtual_address + static_cast<uint32_t>(off)),
-                    off,
-                    sec.data.size());
-                detail_out = buf;
-                return true;
-            }
+inline bool validate_existing_packed_candidate(const pe_file::pe_image_t& pe,
+                                               const pe_file::section_t& sec,
+                                               size_t packed_off,
+                                               std::string& detail_out) {
+    if (pe.dos_header.e_magic != IMAGE_DOS_SIGNATURE ||
+        pe.pe_signature != IMAGE_NT_SIGNATURE ||
+        pe.optional_header.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
+        pe.optional_header.SizeOfImage == 0u) {
+        detail_out = "PE headers are not a valid protected PE32+ image";
+        return false;
+    }
+    if (packed_off + sizeof(protector::packed_header_t) > sec.data.size()) {
+        detail_out = "packed candidate header exceeds section data";
+        return false;
+    }
+    if (sec.virtual_address == 0u ||
+        sec.virtual_size < sizeof(protector::packed_header_t) ||
+        !packed_range_within(sec.virtual_address, sec.virtual_size, pe.optional_header.SizeOfImage)) {
+        detail_out = "packed candidate section range exceeds image";
+        return false;
+    }
+    if (sec.virtual_size <= packed_off) {
+        detail_out = "packed candidate header is outside virtual section range";
+        return false;
+    }
+    const size_t packed_virtual_size = static_cast<size_t>(sec.virtual_size) - packed_off;
+    const size_t packed_payload_size = (std::min<size_t>)(sec.data.size() - packed_off, packed_virtual_size);
+    if (packed_payload_size < sizeof(protector::packed_header_t)) {
+        detail_out = "packed candidate virtual payload is too small";
+        return false;
+    }
+    const uint8_t* packed_base = sec.data.data() + packed_off;
+    protector::packed_header_t hdr{};
+    std::memcpy(&hdr, packed_base, sizeof(hdr));
+    if (hdr.magic != protector::kPackedMagic ||
+        (hdr.version != protector::kPackedVersion &&
+         hdr.version != protector::kPackedVersionLegacy)) {
+        detail_out = "packed candidate magic/version mismatch";
+        return false;
+    }
+    if (hdr.section_count > 512u) {
+        detail_out = "packed candidate section count exceeds runtime cap";
+        return false;
+    }
+    const uint64_t section_table_bytes = static_cast<uint64_t>(hdr.section_count)
+        * static_cast<uint64_t>(sizeof(protector::section_descriptor_t));
+    if (!packed_range_within(hdr.section_table_offset, section_table_bytes, packed_payload_size)) {
+        detail_out = "packed candidate section table exceeds packed data";
+        return false;
+    }
+    for (uint32_t i = 0; i < hdr.section_count; ++i) {
+        protector::section_descriptor_t desc{};
+        const size_t desc_off = static_cast<size_t>(hdr.section_table_offset)
+            + static_cast<size_t>(i) * sizeof(desc);
+        std::memcpy(&desc, packed_base + desc_off, sizeof(desc));
+        if (desc.original_rva == 0u || desc.original_virtual_size == 0u) {
+            detail_out = "packed candidate section descriptor has empty target range";
+            return false;
+        }
+        if (desc.encrypted_size == 0u || desc.compressed_size == 0u ||
+            desc.compressed_size > desc.encrypted_size) {
+            detail_out = "packed candidate section descriptor has invalid sizes";
+            return false;
+        }
+        if (!packed_range_within(desc.blob_offset, desc.encrypted_size, packed_payload_size)) {
+            detail_out = "packed candidate encrypted blob exceeds packed data";
+            return false;
+        }
+        if (desc.layers_applied != 1u && desc.layers_applied != 3u) {
+            detail_out = "packed candidate section descriptor has unsupported layer count";
+            return false;
+        }
+        if (!packed_range_within(desc.original_rva,
+                                 desc.original_virtual_size,
+                                 pe.optional_header.SizeOfImage)) {
+            detail_out = "packed candidate section descriptor target exceeds image";
+            return false;
         }
     }
+    if (!validate_import_table_range(packed_base,
+                                     packed_payload_size,
+                                     hdr.import_table_offset,
+                                     hdr.import_count,
+                                     pe.optional_header.SizeOfImage,
+                                     detail_out)) {
+        return false;
+    }
+    constexpr uint32_t kMaxExistingFixups = 262144u;
+    if (!validate_counted_table_range(packed_base,
+                                      packed_payload_size,
+                                      hdr.string_table_offset,
+                                      hdr.string_fixup_count,
+                                      sizeof(protector::string_fixup_t),
+                                      kMaxExistingFixups,
+                                      pe.optional_header.SizeOfImage,
+                                      "string fixup",
+                                      detail_out)) {
+        return false;
+    }
+    if (!validate_counted_table_range(packed_base,
+                                      packed_payload_size,
+                                      hdr.resource_table_offset,
+                                      hdr.resource_fixup_count,
+                                      sizeof(protector::resource_fixup_t),
+                                      kMaxExistingFixups,
+                                      pe.optional_header.SizeOfImage,
+                                      "resource fixup",
+                                      detail_out)) {
+        return false;
+    }
+    if (!packed_range_within(hdr.master_key_offset, 64u, packed_payload_size)) {
+        detail_out = "packed candidate master key exceeds packed data";
+        return false;
+    }
+    if (count_zero_bytes(packed_base + hdr.master_key_offset, 64u) == 64u) {
+        detail_out = "packed candidate master key material is all zero";
+        return false;
+    }
+    if (hdr.stub_code_offset == 0u ||
+        !packed_range_within(hdr.stub_code_offset, 1u, packed_payload_size)) {
+        detail_out = "packed candidate stub offset is invalid";
+        return false;
+    }
+    const size_t stub_scan = (std::min<size_t>)(256u, packed_payload_size - hdr.stub_code_offset);
+    if (stub_scan == 0u ||
+        count_zero_bytes(packed_base + hdr.stub_code_offset, stub_scan) == stub_scan) {
+        detail_out = "packed candidate stub bytes are empty";
+        return false;
+    }
+    if (hdr.version == protector::kPackedVersion) {
+        if (hdr.aux_offset == 0u || hdr.aux_size != sizeof(protector::aux_block_t) ||
+            !packed_range_within(hdr.aux_offset, hdr.aux_size, packed_payload_size)) {
+            detail_out = "packed candidate aux block offset/size mismatch";
+            return false;
+        }
+        protector::aux_block_t aux{};
+        std::memcpy(&aux, packed_base + hdr.aux_offset, sizeof(aux));
+        if (aux.magic != protector::kAuxMagic || aux.version != protector::kAuxVersion) {
+            detail_out = "packed candidate aux block magic/version mismatch";
+            return false;
+        }
+    } else if (hdr.aux_size != 0u &&
+               !packed_range_within(hdr.aux_offset, hdr.aux_size, packed_payload_size)) {
+        detail_out = "legacy packed candidate aux block exceeds packed data";
+        return false;
+    }
+    const uint32_t packed_rva = sec.virtual_address + static_cast<uint32_t>(packed_off);
+    const uint32_t ep = pe.optional_header.AddressOfEntryPoint;
+    if (ep < packed_rva || ep >= packed_rva + static_cast<uint32_t>(packed_virtual_size)) {
+        detail_out = "entry point is outside packed candidate section";
+        return false;
+    }
+    const uint32_t ep_rel = ep - packed_rva;
+    if (ep_rel < hdr.stub_code_offset || ep_rel >= packed_payload_size) {
+        detail_out = "entry point is outside packed candidate stub region";
+        return false;
+    }
+    char name_buf[16] = {};
+    std::memcpy(name_buf, sec.name, sizeof(sec.name));
+    name_buf[8] = '\0';
+    char buf[224];
+    std::snprintf(buf, sizeof(buf),
+        "validated packed layout in section '%s' rva=0x%X offset=0x%zX version=0x%08X size=%zu sections=%u ep_rel=0x%X",
+        name_buf,
+        static_cast<unsigned>(packed_rva),
+        packed_off,
+        hdr.version,
+        packed_payload_size,
+        hdr.section_count,
+        ep_rel);
+    detail_out = buf;
+    return true;
+}
+
+inline bool detect_already_protected(const pe_file::pe_image_t& pe, std::string& detail_out) {
+    std::string rejected_detail;
+    for (const auto& sec : pe.sections) {
+        const size_t scan_limit = (std::min<size_t>)(sec.data.size(), sec.virtual_size);
+        if (scan_limit < sizeof(protector::packed_header_t)) continue;
+        for (size_t off = 0; off + sizeof(protector::packed_header_t) <= scan_limit; off += 8) {
+            protector::packed_header_t hdr{};
+            std::memcpy(&hdr, sec.data.data() + off, sizeof(hdr));
+            if (hdr.magic != protector::kPackedMagic ||
+                (hdr.version != protector::kPackedVersion &&
+                 hdr.version != protector::kPackedVersionLegacy)) {
+                continue;
+            }
+            std::string candidate_detail;
+            if (validate_existing_packed_candidate(pe, sec, off, candidate_detail)) {
+                detail_out = candidate_detail;
+                return true;
+            }
+            if (rejected_detail.empty())
+                rejected_detail = candidate_detail;
+        }
+    }
+    if (!rejected_detail.empty())
+        detail_out = rejected_detail;
     return false;
 }
 

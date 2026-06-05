@@ -96,6 +96,26 @@ struct block_range_t {
 	bool is_entry = false;
 };
 
+inline clean_instruction_t clean_from_decoded(const emulation::decoded_insn_t& insn) {
+	clean_instruction_t ci;
+	ci.address = insn.address;
+	ci.size = insn.length;
+	ci.disasm = insn.mnemonic;
+	if (!insn.operands_text.empty()) {
+		ci.disasm += " ";
+		ci.disasm += insn.operands_text;
+	}
+	return ci;
+}
+
+inline std::vector<clean_instruction_t> keep_decoded_block(const block_range_t& block) {
+	std::vector<clean_instruction_t> kept;
+	kept.reserve(block.insns.size());
+	for (const auto& insn : block.insns)
+		kept.push_back(clean_from_decoded(insn));
+	return kept;
+}
+
 inline std::vector<block_range_t> recover_cfg_blocks(uint64_t entry_addr, uint32_t max_blocks = 256) {
 	std::vector<block_range_t> blocks;
 	std::unordered_map<uint64_t, int> addr_to_idx;
@@ -280,7 +300,9 @@ inline void resolve_state_targets(triton::Context& ctx_template,
 			insn.setOpcode(code.data(), static_cast<triton::uint32>(code.size()));
 			insn.setAddress(pc);
 
-			auto exc = ctx.processing(insn);
+			triton::arch::exception_e exc = triton::arch::NO_FAULT;
+			if (!symbolic_engine::detail::process_instruction_guarded(ctx, insn, exc, "deobf_resolve_state", pc))
+				break;
 			if (exc != triton::arch::NO_FAULT) break;
 
 			pc = static_cast<uint64_t>(ctx.getConcreteRegisterValue(ctx.getRegister("rip")));
@@ -323,12 +345,13 @@ inline std::vector<clean_instruction_t> strip_junk_from_block(
 		insn.setOpcode(code.data(), static_cast<triton::uint32>(code.size()));
 		insn.setAddress(raw_insn.address);
 
-		ctx.processing(insn);
+		triton::arch::exception_e exc = triton::arch::NO_FAULT;
+		if (!symbolic_engine::detail::process_instruction_guarded(ctx, insn, exc, "deobf_strip_junk", raw_insn.address))
+			return keep_decoded_block(block);
+		if (exc != triton::arch::NO_FAULT)
+			return keep_decoded_block(block);
 
-		clean_instruction_t ci;
-		ci.address = raw_insn.address;
-		ci.size = raw_insn.length;
-		ci.disasm = raw_insn.mnemonic + " " + raw_insn.operands_text;
+		clean_instruction_t ci = clean_from_decoded(raw_insn);
 		processed.push_back({insn, ci});
 	}
 
@@ -441,7 +464,7 @@ inline deobfuscated_result_t deobfuscate_function(uint64_t entry_addr, uint32_t 
 	triton::Context ctx(triton::arch::ARCH_X86_64);
 	ctx.setMode(triton::modes::ALIGNED_MEMORY, true);
 	ctx.setMode(triton::modes::TAINT_THROUGH_POINTERS, true);
-	ctx.setSolverTimeout(5000);
+	ctx.setSolverTimeout(1000);
 
 	uint32_t pid = device->get_process_id();
 	auto threads = device->enumerate_threads();

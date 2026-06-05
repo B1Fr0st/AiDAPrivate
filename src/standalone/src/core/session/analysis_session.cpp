@@ -12,6 +12,7 @@
 
 #include "../ui/loading_binary_overlay.hpp"
 #include "../runtime/standalone_driver.hpp"
+#include "../analysis/stealth_engine.hpp"
 #include "../../helpers/diag_log.hpp"
 
 extern DisasmState g_disasm;
@@ -112,12 +113,23 @@ inline void restore_session_into_live_locked(analysis_session_t& src) {
 	crypto_scanner::attach_snapshot(std::move(src.crypto_snap));
 	xref_db::attach_snapshot(std::move(src.xref_db_snap));
 
+	const uint32_t previous_pid = driver_bridge::attached_pid();
 	if (src.attached_pid != 0) {
-		if (!driver_bridge::set_active_pid(src.attached_pid)) {
+		if (previous_pid != 0 && previous_pid != src.attached_pid)
+			stealth_engine::disable_for_detach(previous_pid, "analysis_session.restore.replace");
+		bool active_ok = driver_bridge::set_active_pid(src.attached_pid);
+		if (!active_ok) {
 			(void)driver_bridge::attach_additional(src.attached_pid);
-			(void)driver_bridge::set_active_pid(src.attached_pid);
+			active_ok = driver_bridge::set_active_pid(src.attached_pid);
+		}
+		if (active_ok && driver_bridge::attached_pid() == src.attached_pid) {
+			(void)stealth_engine::ensure_default_enabled(src.attached_pid, "analysis_session.restore");
+		} else if (previous_pid != 0 && driver_bridge::attached_pid() == previous_pid) {
+			(void)stealth_engine::ensure_default_enabled(previous_pid, "analysis_session.restore_failed_switch");
 		}
 	} else {
+		if (previous_pid != 0)
+			stealth_engine::disable_for_detach(previous_pid, "analysis_session.restore.clear");
 		(void)driver_bridge::clear_active_pid();
 	}
 
@@ -132,6 +144,15 @@ inline void restore_session_into_live_locked(analysis_session_t& src) {
 }
 
 inline void reset_live_to_default_locked() {
+	const uint32_t pid_before = driver_bridge::attached_pid();
+	const std::string name_before = driver_bridge::attached_process_name();
+	diag::log_tagged_fmt("analysis_session",
+		"reset_live_to_default_begin pid_before=%u name='%s' active_idx=%d sessions=%llu path='%s'",
+		pid_before,
+		name_before.c_str(),
+		state().active_idx,
+		static_cast<unsigned long long>(state().sessions.size()),
+		g_disasm.file.path.c_str());
 	g_disasm.file = DisasmFile{};
 	function_index::attach_snapshot(nullptr);
 	xref_index::attach_snapshot(nullptr);
@@ -142,7 +163,14 @@ inline void reset_live_to_default_locked() {
 	crypto_scanner::attach_snapshot(nullptr);
 	xref_db::attach_snapshot(nullptr);
 	debugger_engine::clear_breakpoints_and_watches();
-	(void)driver_bridge::clear_active_pid();
+	stealth_engine::disable_for_detach(pid_before, "analysis_session.reset_live");
+	const bool clear_ok = driver_bridge::clear_active_pid();
+	diag::log_tagged_fmt("analysis_session",
+		"reset_live_to_default_end pid_before=%u clear_ok=%d pid_after=%u last_error='%s'",
+		pid_before,
+		clear_ok ? 1 : 0,
+		driver_bridge::attached_pid(),
+		driver_bridge::last_error().c_str());
 }
 
 inline void evict_lru_if_needed_locked() {
@@ -274,9 +302,13 @@ bool open_attach_session(uint32_t pid, std::string* out_err) {
 	if (prev_active == pid) {
 		attach_ok = true;
 	} else {
+		if (prev_active != 0)
+			stealth_engine::disable_for_detach(prev_active, "analysis_session.open_attach.replace");
 		attach_ok = driver_bridge::attach(pid);
 	}
 	if (!attach_ok) {
+		if (prev_active != 0 && driver_bridge::attached_pid() == prev_active)
+			(void)stealth_engine::ensure_default_enabled(prev_active, "analysis_session.open_attach.restore_failed_switch");
 		state().last_error = std::string("attach_failed: ") + driver_bridge::last_error();
 		if (out_err) *out_err = state().last_error;
 		diag::log_tagged_fmt("analysis_session",
@@ -284,9 +316,10 @@ bool open_attach_session(uint32_t pid, std::string* out_err) {
 			pid, state().last_error.c_str());
 		return false;
 	}
+	const bool stealth_ok = stealth_engine::ensure_default_enabled(pid, "analysis_session.open_attach");
 	diag::log_tagged_fmt("analysis_session",
-		"open_attach_session pid=%u attach_ok name='%s'",
-		pid, driver_bridge::attached_process_name().c_str());
+		"open_attach_session pid=%u attach_ok stealth_ok=%d name='%s'",
+		pid, stealth_ok ? 1 : 0, driver_bridge::attached_process_name().c_str());
 
 	int cur = state().active_idx;
 	if (cur >= 0 && cur < static_cast<int>(state().sessions.size())) {

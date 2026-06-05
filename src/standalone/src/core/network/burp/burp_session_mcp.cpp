@@ -26,6 +26,11 @@ namespace {
 using json = nlohmann::json;
 using tool_result_t = mcp_standalone::tool_result_t;
 
+tool_result_t error_with_data(const std::string& text, const json& data)
+{
+    return tool_result_t{false, text, data};
+}
+
 json step_to_json(const session_handler::macro_step_t& s_in)
 {
     json j;
@@ -130,6 +135,12 @@ tool_result_t handle_macro_run(const json& params)
     json vj = json::object();
     for (const auto& kv : values) vj[kv.first] = kv.second;
     out["values"] = vj;
+    if (!ok) {
+        out["error"] = "macro_run_failed";
+        out["macro_id"] = id;
+        out["status"] = "failed";
+        return error_with_data("macro run failed", out);
+    }
     return tool_result_t::ok(out);
 }
 

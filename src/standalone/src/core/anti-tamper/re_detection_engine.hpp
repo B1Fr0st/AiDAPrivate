@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -111,6 +112,8 @@ struct engine_state_t
     std::atomic<uint32_t> persist_count{ 0 };
     std::atomic<uint64_t> verify_counter{ 0 };
     std::atomic<uint64_t> last_tick_tsc{ 0 };
+    std::atomic<DWORD> worker_tid{ 0 };
+    std::atomic<DWORD> watchdog_tid{ 0 };
     std::thread worker;
     std::thread watchdog;
     std::mutex mtx;
@@ -139,6 +142,192 @@ namespace detail {
         if (st != ERROR_SUCCESS || type != REG_DWORD)
             return false;
         return value == 1;
+    }
+
+    struct foreign_handle_observation_t
+    {
+        bool valid = false;
+        DWORD self_pid = 0;
+        DWORD owner_pid = 0;
+        ULONG_PTR handle_value = 0;
+        ACCESS_MASK access = 0;
+        bool high_risk = false;
+        uint32_t ordinal = 0;
+        uint64_t tsc = 0;
+        std::string owner_image;
+        std::string owner_path;
+    };
+
+    inline std::mutex& foreign_handle_observation_mutex()
+    {
+        static std::mutex m;
+        return m;
+    }
+
+    inline foreign_handle_observation_t& foreign_handle_observation_ref()
+    {
+        static foreign_handle_observation_t o;
+        return o;
+    }
+
+    inline std::string basename_from_path(const std::string& path)
+    {
+        const char* slash = std::strrchr(path.c_str(), '\\');
+        if (slash && slash[1])
+            return std::string(slash + 1);
+        const char* fslash = std::strrchr(path.c_str(), '/');
+        return fslash && fslash[1] ? std::string(fslash + 1) : path;
+    }
+
+    inline std::string process_image_path_for_log(DWORD pid)
+    {
+        char path[MAX_PATH] = {};
+        HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (!hp)
+            return "?";
+        DWORD len = static_cast<DWORD>(sizeof(path));
+        BOOL ok = QueryFullProcessImageNameA(hp, 0, path, &len);
+        CloseHandle(hp);
+        if (!ok || len == 0)
+            return "?";
+        return std::string(path);
+    }
+
+    inline std::string process_image_for_log(DWORD pid)
+    {
+        std::string path = process_image_path_for_log(pid);
+        return path == "?" ? path : basename_from_path(path);
+    }
+
+    inline void store_foreign_handle_observation(DWORD owner_pid,
+                                                 ULONG_PTR handle_value,
+                                                 ACCESS_MASK access,
+                                                 bool high_risk,
+                                                 uint32_t ordinal,
+                                                 const std::string& owner_path,
+                                                 const std::string& owner_image)
+    {
+        std::lock_guard<std::mutex> lock(foreign_handle_observation_mutex());
+        auto& obs = foreign_handle_observation_ref();
+        obs.valid = true;
+        obs.self_pid = GetCurrentProcessId();
+        obs.owner_pid = owner_pid;
+        obs.handle_value = handle_value;
+        obs.access = access;
+        obs.high_risk = high_risk;
+        obs.ordinal = ordinal;
+        obs.tsc = __rdtsc();
+        obs.owner_path = owner_path;
+        obs.owner_image = owner_image;
+    }
+
+    inline foreign_handle_observation_t last_foreign_handle_observation()
+    {
+        std::lock_guard<std::mutex> lock(foreign_handle_observation_mutex());
+        return foreign_handle_observation_ref();
+    }
+
+    inline bool streq_ci(const char* a, const char* b)
+    {
+        return a && b && _stricmp(a, b) == 0;
+    }
+
+    inline bool path_has_dir_prefix_ci(const std::string& path, const std::string& dir)
+    {
+        if (path.empty() || path == "?" || dir.empty())
+            return false;
+        size_t n = dir.size();
+        while (n > 0 && (dir[n - 1] == '\\' || dir[n - 1] == '/'))
+            --n;
+        if (path.size() <= n)
+            return false;
+        if (_strnicmp(path.c_str(), dir.c_str(), n) != 0)
+            return false;
+        return path[n] == '\\' || path[n] == '/';
+    }
+
+    inline bool trusted_windows_system_owner(const foreign_handle_observation_t& obs)
+    {
+        if (!obs.valid || obs.owner_path.empty() || obs.owner_path == "?")
+            return false;
+        const char* image = obs.owner_image.c_str();
+        const bool core_image =
+            streq_ci(image, "lsass.exe") ||
+            streq_ci(image, "csrss.exe") ||
+            streq_ci(image, "wininit.exe") ||
+            streq_ci(image, "services.exe") ||
+            streq_ci(image, "winlogon.exe") ||
+            streq_ci(image, "smss.exe");
+        if (!core_image)
+            return false;
+
+        char system_dir[MAX_PATH] = {};
+        const UINT system_len = GetSystemDirectoryA(system_dir, MAX_PATH);
+        if (system_len > 0 && system_len < MAX_PATH &&
+            path_has_dir_prefix_ci(obs.owner_path, std::string(system_dir)))
+            return true;
+        return false;
+    }
+
+    inline bool passive_system_handle_access(ACCESS_MASK access)
+    {
+        constexpr ACCESS_MASK ACTIVE_MUTATION =
+            PROCESS_TERMINATE |
+            PROCESS_CREATE_THREAD |
+            PROCESS_SET_INFORMATION |
+            PROCESS_SUSPEND_RESUME;
+        return (access & ACTIVE_MUTATION) == 0;
+    }
+
+    inline std::string format_handle_access_flags(ACCESS_MASK access)
+    {
+        std::string flags;
+        auto add = [&flags](const char* name) {
+            if (!flags.empty())
+                flags += "|";
+            flags += name;
+        };
+        if (access & PROCESS_TERMINATE) add("terminate");
+        if (access & PROCESS_CREATE_THREAD) add("create_thread");
+        if (access & PROCESS_VM_OPERATION) add("vm_operation");
+        if (access & PROCESS_VM_READ) add("vm_read");
+        if (access & PROCESS_VM_WRITE) add("vm_write");
+        if (access & PROCESS_DUP_HANDLE) add("dup_handle");
+        if (access & PROCESS_SET_INFORMATION) add("set_information");
+        if (access & PROCESS_QUERY_INFORMATION) add("query_information");
+        if (access & PROCESS_SUSPEND_RESUME) add("suspend_resume");
+        if (access & PROCESS_QUERY_LIMITED_INFORMATION) add("query_limited");
+        return flags.empty() ? "none" : flags;
+    }
+
+    inline void log_foreign_handle_observation(DWORD owner_pid,
+                                               ULONG_PTR handle_value,
+                                               ACCESS_MASK access,
+                                               bool high_risk)
+    {
+        static std::atomic<uint32_t> s_log_count{0};
+        uint32_t n = s_log_count.fetch_add(1, std::memory_order_acq_rel);
+        if (!high_risk && n >= 32 && (n % 256) != 0)
+            return;
+        std::string path = process_image_path_for_log(owner_pid);
+        std::string image = path == "?" ? "?" : basename_from_path(path);
+        uint32_t ordinal = n + 1;
+        store_foreign_handle_observation(owner_pid, handle_value, access,
+            high_risk, ordinal, path, image);
+        const std::string flags = format_handle_access_flags(access);
+        char buf[768];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "foreign_handle_observed self_pid=%lu owner_pid=%lu owner=%s owner_path='%s' handle=0x%llX access=0x%08lX access_flags=%s high_risk=%d ordinal=%u",
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(owner_pid),
+            image.c_str(),
+            path.c_str(),
+            static_cast<unsigned long long>(handle_value),
+            static_cast<unsigned long>(access),
+            flags.c_str(),
+            high_risk ? 1 : 0,
+            ordinal);
+        webhook::write_log("re_handle_probe", buf);
     }
 
     inline bool detect_foreign_vm_write_handle()
@@ -178,15 +367,18 @@ namespace detail {
         };
 
         auto* info = reinterpret_cast<handle_info_ex_t*>(buf.data());
-        constexpr ACCESS_MASK DEBUG_GRADE =
+        constexpr ACCESS_MASK HIGH_RISK =
             PROCESS_VM_WRITE | PROCESS_CREATE_THREAD |
             PROCESS_SUSPEND_RESUME | PROCESS_SET_INFORMATION |
-            PROCESS_VM_READ | PROCESS_VM_OPERATION | PROCESS_DUP_HANDLE;
+            PROCESS_VM_OPERATION;
+        constexpr ACCESS_MASK OBSERVE_ONLY =
+            PROCESS_VM_READ | PROCESS_DUP_HANDLE;
+        constexpr ACCESS_MASK INTERESTING = HIGH_RISK | OBSERVE_ONLY;
 
         for (ULONG_PTR i = 0; i < info->NumberOfHandles; ++i) {
             const auto& h = info->Handles[i];
             if (static_cast<DWORD>(h.UniqueProcessId) == my_pid) continue;
-            if ((h.GrantedAccess & DEBUG_GRADE) == 0) continue;
+            if ((h.GrantedAccess & INTERESTING) == 0) continue;
 
             HANDLE src_proc = OpenProcess(PROCESS_DUP_HANDLE, FALSE,
                 static_cast<DWORD>(h.UniqueProcessId));
@@ -207,7 +399,14 @@ namespace detail {
             DWORD target_pid = GetProcessId(dup);
             CloseHandle(dup);
             if (target_pid == my_pid) {
-                return true;
+                const bool high_risk = (h.GrantedAccess & HIGH_RISK) != 0;
+                log_foreign_handle_observation(
+                    static_cast<DWORD>(h.UniqueProcessId),
+                    h.HandleValue,
+                    h.GrantedAccess,
+                    high_risk);
+                if (high_risk)
+                    return true;
             }
         }
         return false;
@@ -400,14 +599,54 @@ namespace detail {
 
     inline bool detect_thread_suspended()
     {
+        if (anti_tamper::state::get().full_test_running.load(std::memory_order_acquire)) {
+            static std::atomic<uint32_t> s_skip_logs{0};
+            const uint32_t n = s_skip_logs.fetch_add(1, std::memory_order_acq_rel);
+            if (n < 8 || (n % 128) == 0)
+                webhook::write_log("re_thread_probe", "thread_suspended_probe_skipped_full_test");
+            return false;
+        }
+        uint64_t suppression_remaining = 0;
+        if (anti_tamper::state::full_test_suppression_active(&suppression_remaining)) {
+            static std::atomic<uint32_t> s_post_skip_logs{0};
+            const uint32_t n = s_post_skip_logs.fetch_add(1, std::memory_order_acq_rel);
+            if (n < 8 || (n % 128) == 0) {
+                char sb[128];
+                _snprintf_s(sb, sizeof(sb), _TRUNCATE,
+                    "thread_suspended_probe_skipped_post_full_test remaining_ms=%llu",
+                    static_cast<unsigned long long>(suppression_remaining));
+                webhook::write_log("re_thread_probe", sb);
+            }
+            return false;
+        }
+
+        static std::atomic_flag s_probe_active = ATOMIC_FLAG_INIT;
+        if (s_probe_active.test_and_set(std::memory_order_acq_rel)) {
+            static std::atomic<uint32_t> s_concurrent_logs{0};
+            const uint32_t n = s_concurrent_logs.fetch_add(1, std::memory_order_acq_rel);
+            if (n < 8 || (n % 128) == 0)
+                webhook::write_log("re_thread_probe", "thread_suspended_probe_skipped_concurrent_probe");
+            return false;
+        }
+        struct probe_guard_t {
+            std::atomic_flag& flag;
+            ~probe_guard_t() { flag.clear(std::memory_order_release); }
+        } guard{ s_probe_active };
+
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         if (snap == INVALID_HANDLE_VALUE)
             return false;
 
         DWORD pid = GetCurrentProcessId();
         DWORD main_tid = GetCurrentThreadId();
+        auto& eng = state_ref();
+        const DWORD worker_tid = eng.worker_tid.load(std::memory_order_acquire);
+        const DWORD watchdog_tid = eng.watchdog_tid.load(std::memory_order_acquire);
         int suspended_count = 0;
         int total_threads = 0;
+        int critical_suspended = 0;
+        char sample[512] = {};
+        size_t sample_len = 0;
 
         THREADENTRY32 te{};
         te.dwSize = sizeof(te);
@@ -429,8 +668,34 @@ namespace detail {
                 if (prev != (DWORD)-1)
                 {
                     ResumeThread(th);
-                    if (prev > 0)
+                    if (prev > 0) {
                         ++suspended_count;
+                        const bool critical =
+                            (worker_tid != 0 && te.th32ThreadID == worker_tid) ||
+                            (watchdog_tid != 0 && te.th32ThreadID == watchdog_tid);
+                        if (critical)
+                            ++critical_suspended;
+                        if (sample_len < sizeof(sample) - 1) {
+                            const char* role =
+                                te.th32ThreadID == worker_tid ? "re_worker" :
+                                (te.th32ThreadID == watchdog_tid ? "re_watchdog" : "app");
+                            char one[96];
+                            _snprintf_s(one, sizeof(one), _TRUNCATE,
+                                "%s%lu:%lu:%s",
+                                sample_len == 0 ? "" : ",",
+                                static_cast<unsigned long>(te.th32ThreadID),
+                                static_cast<unsigned long>(prev),
+                                role);
+                            const size_t one_len = strlen(one);
+                            const size_t room = sizeof(sample) - sample_len - 1;
+                            const size_t copy_len = one_len < room ? one_len : room;
+                            if (copy_len != 0) {
+                                memcpy(sample + sample_len, one, copy_len);
+                                sample_len += copy_len;
+                                sample[sample_len] = '\0';
+                            }
+                        }
+                    }
                 }
                 CloseHandle(th);
             } while (Thread32Next(snap, &te));
@@ -440,8 +705,49 @@ namespace detail {
         if (total_threads < 2)
             return false;
 
-        return suspended_count >= 2
-            || (total_threads > 0 && suspended_count * 2 >= total_threads);
+        if (suspended_count == 0)
+            return false;
+
+        const bool high_ratio = total_threads >= 4 && suspended_count * 4 >= total_threads * 3;
+        const bool high_count = suspended_count >= 6;
+        const bool critical = critical_suspended > 0;
+        const bool candidate = critical || high_ratio || high_count;
+        static std::atomic<uint32_t> s_candidate_hits{0};
+        static std::atomic<uint64_t> s_candidate_until{0};
+        const uint64_t now = static_cast<uint64_t>(GetTickCount64());
+        uint32_t hits = 0;
+        const uint64_t until = s_candidate_until.load(std::memory_order_acquire);
+        if (candidate) {
+            if (now >= until) {
+                s_candidate_hits.store(1, std::memory_order_release);
+                s_candidate_until.store(now + 3000, std::memory_order_release);
+                hits = 1;
+            } else {
+                hits = s_candidate_hits.fetch_add(1, std::memory_order_acq_rel) + 1;
+                s_candidate_until.store(now + 3000, std::memory_order_release);
+            }
+        } else {
+            s_candidate_hits.store(0, std::memory_order_release);
+            s_candidate_until.store(0, std::memory_order_release);
+        }
+
+        char buf[896];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "thread_suspended_probe_sample total=%d suspended=%d critical=%d high_ratio=%d high_count=%d candidate=%d hits=%u enforce=%d worker_tid=%lu watchdog_tid=%lu sample=%s",
+            total_threads,
+            suspended_count,
+            critical_suspended,
+            high_ratio ? 1 : 0,
+            high_count ? 1 : 0,
+            candidate ? 1 : 0,
+            hits,
+            (critical || hits >= 2) ? 1 : 0,
+            static_cast<unsigned long>(worker_tid),
+            static_cast<unsigned long>(watchdog_tid),
+            sample_len != 0 ? sample : "none");
+        webhook::write_log("re_thread_probe", buf);
+
+        return critical || hits >= 2;
     }
 
     inline bool detect_veh_tampered()
@@ -631,7 +937,7 @@ namespace detail {
         if (detect_injected_module())
             mask |= SIGNAL_INJECTED_MODULE;
 
-        if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver()) {
+        if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver() && driver_bridge::dynamic_ioctls_ready()) {
             driver_bridge::anti_debug_result_t ar{};
             if (driver_bridge::kernel_anti_debug_query(ar)) {
                 if ((ar.result_flags & 0x1u) != 0)
@@ -720,16 +1026,107 @@ namespace detail {
         h *= 0x100000001B3ULL;
         return h;
     }
+
+    inline bool foreign_handle_only(uint32_t mask)
+    {
+        return (mask & SIGNAL_FOREIGN_HANDLE) != 0 &&
+            (mask & ~SIGNAL_FOREIGN_HANDLE) == 0;
+    }
+
+    inline bool foreign_handle_only_should_enforce(uint32_t mask,
+                                                   const char* path,
+                                                   const std::string& detail_str)
+    {
+        if (!foreign_handle_only(mask))
+            return true;
+
+        const foreign_handle_observation_t obs = last_foreign_handle_observation();
+        const bool trusted_system = trusted_windows_system_owner(obs);
+        const bool passive_system_access =
+            obs.valid && trusted_system && passive_system_handle_access(obs.access);
+        const bool kernel_ready =
+            driver_bridge::is_loaded() &&
+            driver_bridge::using_kernel_driver() &&
+            driver_bridge::dynamic_ioctls_ready();
+        driver_bridge::anti_debug_result_t query{};
+        bool query_ok = false;
+        uint64_t scan_pid = 0;
+        bool scan_ok = false;
+        bool confirmed = false;
+        if (kernel_ready) {
+            query_ok = driver_bridge::kernel_anti_debug_query(query);
+            scan_ok = driver_bridge::kernel_anti_debug_scan_debuggers(&scan_pid);
+            confirmed =
+                (query_ok && ((query.result_flags & 0x1u) != 0 || query.detected_debugger_pid != 0)) ||
+                (scan_ok && scan_pid != 0);
+        }
+
+        const bool suppress_unconfirmed_system =
+            !confirmed && trusted_system && passive_system_access;
+        const bool enforce = confirmed || !suppress_unconfirmed_system;
+        const char* decision = confirmed ? "enforce_confirmed_kernel_evidence" :
+            (suppress_unconfirmed_system ? "suppress_unconfirmed_trusted_system_handle" :
+             (kernel_ready ? "enforce_unconfirmed_non_system_handle" :
+              "enforce_no_kernel_confirmation_path"));
+        const std::string flags = obs.valid ? format_handle_access_flags(obs.access) : "none";
+
+        char buf[1152];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "foreign_handle_decision path=%s decision=%s should_bsod=%d kernel_ready=%d confirmed=%d query_ok=%d query_flags=0x%08X query_pid=%llu scan_ok=%d scan_pid=%llu owner_valid=%d self_pid=%lu owner_pid=%lu owner=%s owner_path='%s' handle=0x%llX access=0x%08lX access_flags=%s high_risk=%d trusted_system_owner=%d passive_system_access=%d ordinal=%u %s",
+            path ? path : "re_detect",
+            decision,
+            enforce ? 1 : 0,
+            kernel_ready ? 1 : 0,
+            confirmed ? 1 : 0,
+            query_ok ? 1 : 0,
+            query.result_flags,
+            static_cast<unsigned long long>(query.detected_debugger_pid),
+            scan_ok ? 1 : 0,
+            static_cast<unsigned long long>(scan_pid),
+            obs.valid ? 1 : 0,
+            static_cast<unsigned long>(obs.valid ? obs.self_pid : GetCurrentProcessId()),
+            static_cast<unsigned long>(obs.valid ? obs.owner_pid : 0),
+            obs.valid ? obs.owner_image.c_str() : "?",
+            obs.valid ? obs.owner_path.c_str() : "?",
+            static_cast<unsigned long long>(obs.valid ? obs.handle_value : 0),
+            static_cast<unsigned long>(obs.valid ? obs.access : 0),
+            flags.c_str(),
+            obs.valid && obs.high_risk ? 1 : 0,
+            trusted_system ? 1 : 0,
+            passive_system_access ? 1 : 0,
+            obs.valid ? obs.ordinal : 0,
+            detail_str.c_str());
+        webhook::write_log(path ? path : "re_detect", buf);
+        if (!kernel_ready) {
+            char legacy[512];
+            _snprintf_s(legacy, sizeof(legacy), _TRUNCATE,
+                "foreign_handle_no_kernel_confirmation_path path=%s kernel_ready=0 decision=%s should_bsod=%d %s",
+                path ? path : "re_detect",
+                decision,
+                enforce ? 1 : 0,
+                detail_str.c_str());
+            webhook::write_log(path ? path : "re_detect", legacy);
+        } else {
+            char legacy[768];
+            _snprintf_s(legacy, sizeof(legacy), _TRUNCATE,
+                "foreign_handle_kernel_confirmation path=%s confirmed=%d query_ok=%d query_flags=0x%08X query_pid=%llu scan_ok=%d scan_pid=%llu decision=%s should_bsod=%d %s",
+                path ? path : "re_detect",
+                confirmed ? 1 : 0,
+                query_ok ? 1 : 0,
+                query.result_flags,
+                static_cast<unsigned long long>(query.detected_debugger_pid),
+                scan_ok ? 1 : 0,
+                static_cast<unsigned long long>(scan_pid),
+                decision,
+                enforce ? 1 : 0,
+                detail_str.c_str());
+            webhook::write_log(path ? path : "re_detect", legacy);
+        }
+        return enforce;
+    }
 }
 
 inline void tick();
-
-inline bool should_bsod(uint32_t mask)
-{
-    if (detail::is_devmode_hwid_allowlisted())
-        return false;
-    return detail::has_confirmed_signal(mask);
-}
 
 inline void tick()
 {
@@ -742,17 +1139,57 @@ inline void tick()
 
     static std::atomic<uint32_t> s_tick_num{0};
     s_tick_num.fetch_add(1);
-    if (should_bsod(mask)) {
+    if (detail::has_confirmed_signal(mask)) {
+        uint64_t evidence = detail::hash_evidence(mask);
+        std::string detail_str = detail::format_signal_detail(mask, evidence);
+        if (detail::is_devmode_hwid_allowlisted()) {
+            char db[256];
+            _snprintf_s(db, sizeof(db), _TRUNCATE,
+                "re_signal mask=0x%08X should_bsod=0 decision=devmode_allowlist %s",
+                mask,
+                detail_str.c_str());
+            webhook::write_log("re_tick", db);
+            s.persist_count.store(0);
+            s.persist_mask.store(mask);
+            return;
+        }
+        uint64_t suppression_remaining = 0;
+        const bool full_test_active =
+            anti_tamper::state::get().full_test_running.load(std::memory_order_acquire);
+        const bool post_full_test_suppressed =
+            anti_tamper::state::full_test_suppression_active(&suppression_remaining);
+        if (full_test_active || post_full_test_suppressed) {
+            char sb[96];
+            _snprintf_s(sb, sizeof(sb), _TRUNCATE,
+                "full_test_signal_suppressed latch=%d post_full_test_ms=%llu decision=full_test_suppressed should_bsod=0 ",
+                full_test_active ? 1 : 0,
+                static_cast<unsigned long long>(suppression_remaining));
+            std::string msg = std::string(sb) + detail_str;
+            webhook::write_log("re_tick", msg.c_str());
+            s.persist_count.store(0);
+            s.persist_mask.store(mask);
+            return;
+        }
+        if (!detail::foreign_handle_only_should_enforce(mask, "re_tick", detail_str)) {
+            char rb[256];
+            _snprintf_s(rb, sizeof(rb), _TRUNCATE,
+                "re_signal mask=0x%08X should_bsod=0 decision=suppressed_foreign_handle %s",
+                mask,
+                detail_str.c_str());
+            webhook::write_log("re_tick", rb);
+            s.persist_count.store(0);
+            s.persist_mask.store(mask);
+            return;
+        }
         {
-            char pb[128];
+            char pb[256];
             _snprintf_s(pb, sizeof(pb), _TRUNCATE,
-                "re_signal mask=0x%08X should_bsod=1",
-                mask);
+                "re_signal mask=0x%08X should_bsod=1 decision=enforce %s",
+                mask,
+                detail_str.c_str());
             webhook::write_log("re_tick", pb);
         }
-        uint64_t evidence = detail::hash_evidence(mask);
         standalone_license::fold_integrity_token(evidence);
-        std::string detail_str = detail::format_signal_detail(mask, evidence);
         webhook::send_debug_log("re_detect", detail_str, true);
         webhook::post_critical_then_enforce("re_detected", detail_str, mask);
         if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver()) {
@@ -788,8 +1225,9 @@ inline int __declspec(noinline) seh_tick_wrapper()
 
 inline void worker_loop()
 {
-    Sleep(2000);
     auto& s = state_ref();
+    s.worker_tid.store(GetCurrentThreadId(), std::memory_order_release);
+    Sleep(2000);
     while (s.running.load()) {
         int rc = seh_tick_wrapper();
         if (rc != 0) {
@@ -826,6 +1264,7 @@ inline void watchdog_loop()
 {
     auto& s = state_ref();
     auto& rt = state::get();
+    s.watchdog_tid.store(GetCurrentThreadId(), std::memory_order_release);
     uint64_t last_counter = 0;
     while (s.running.load()) {
         Sleep(2000);
@@ -837,8 +1276,25 @@ inline void watchdog_loop()
         } else if (rc > 0) {
             uint32_t mask = static_cast<uint32_t>(rc);
             uint64_t evidence = detail::hash_evidence(mask);
-            standalone_license::fold_integrity_token(evidence);
             std::string detail_str = "watchdog_stall " + detail::format_signal_detail(mask, evidence);
+            uint64_t suppression_remaining = 0;
+            const bool full_test_active =
+                anti_tamper::state::get().full_test_running.load(std::memory_order_acquire);
+            const bool post_full_test_suppressed =
+                anti_tamper::state::full_test_suppression_active(&suppression_remaining);
+            if (full_test_active || post_full_test_suppressed) {
+                char sb[112];
+                _snprintf_s(sb, sizeof(sb), _TRUNCATE,
+                    "watchdog_signal_suppressed latch=%d post_full_test_ms=%llu decision=full_test_suppressed should_bsod=0 ",
+                    full_test_active ? 1 : 0,
+                    static_cast<unsigned long long>(suppression_remaining));
+                std::string msg = std::string(sb) + detail_str;
+                webhook::write_log("re_watchdog", msg.c_str());
+                continue;
+            }
+            if (!detail::foreign_handle_only_should_enforce(mask, "re_watchdog", detail_str))
+                continue;
+            standalone_license::fold_integrity_token(evidence);
             webhook::send_debug_log("re_watchdog", detail_str, true);
             webhook::post_critical_then_enforce("re_watchdog_stall",
                 detail_str, mask);

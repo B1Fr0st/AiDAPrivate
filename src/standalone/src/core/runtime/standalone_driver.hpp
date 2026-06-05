@@ -398,6 +398,22 @@ namespace driver_bridge
     bool sentinel_bridge_ready();
     uint64_t sentinel_ready_since_tsc();
 
+    struct dynamic_ioctl_state_t {
+        bool loaded = false;
+        bool kernel = false;
+        bool connected = false;
+        bool ready = false;
+        uint32_t instance_server_seed = 0;
+        uint32_t instance_ioctl_seed = 0;
+        uint32_t global_server_seed = 0;
+        uint32_t global_ioctl_seed = 0;
+        uint32_t ioctl_seed_hash = 0;
+        uint32_t heartbeat_ioctl_seed_hash = 0;
+    };
+
+    dynamic_ioctl_state_t dynamic_ioctl_state();
+    bool dynamic_ioctls_ready();
+
     bool register_dll_protection(uint64_t module_base, uint64_t text_va, uint32_t text_size, uint64_t expected_hash, uint32_t check_interval_ms = 2000);
     bool register_self_dll_protection(uint64_t module_base, uint64_t text_va, uint32_t text_size, uint64_t expected_hash, uint32_t check_interval_ms = 2000);
     bool query_dll_protection(dll_protect_status_t& out);

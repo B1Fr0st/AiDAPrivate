@@ -27,9 +27,10 @@ struct launch_config_t
     bool                     block_webrtc       = false;
     bool                     enable_trace       = false;
     std::string              python_executable;
+    std::string              browser_executable;
     std::string              server_module      = "camoufox_reverse_mcp";
     std::vector<std::string> extra_args;
-    int                      launch_timeout_ms  = 180000;
+    int                      launch_timeout_ms  = 35000;
     int                      window_width       = 1280;
     int                      window_height      = 900;
 };
@@ -54,6 +55,15 @@ struct bridge_status_t
     uint64_t       total_errors     = 0;
     bool           browser_open     = false;
     std::string    active_page_url;
+    std::string    active_page_title;
+    bool           page_verified    = false;
+    bool           child_alive      = false;
+    bool           cleanup_pending  = false;
+    uint64_t       generation       = 0;
+    uint64_t       last_launch_ms   = 0;
+    uint64_t       last_nav_ms      = 0;
+    uint64_t       last_cleanup_ms  = 0;
+    uint64_t       last_verified_ms = 0;
 };
 
 struct call_result_t

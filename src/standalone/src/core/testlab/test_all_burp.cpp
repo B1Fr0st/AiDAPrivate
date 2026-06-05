@@ -1,5 +1,16 @@
-#include "test_all_burp.h"
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <Windows.h>
 
+#include "test_all_burp.h"
+#include "test_all_features.hpp"
+#include "../infra/event_bus.hpp"
 #include "../network/burp/scope.hpp"
 #include "../network/burp/cookie_jar.hpp"
 #include "../network/burp/match_replace.hpp"
@@ -38,17 +49,29 @@
 #include "../network/burp/audit_http.hpp"
 #include "../network/burp/headless_view.hpp"
 #include "../network/network_view.hpp"
+#include "../infra/win_thread.hpp"
 #include "../../helpers/diag_log.hpp"
+#include "test_lab_bounded_runner.hpp"
 
-#include <Windows.h>
+#include <openssl/sha.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <memory>
+#include <mutex>
+#include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
+
+#pragma comment(lib, "Ws2_32.lib")
 
 namespace test_all_features {
 
@@ -61,10 +84,7 @@ namespace {
         (unsigned)st.wHour, (unsigned)st.wMinute, (unsigned)st.wSecond, (unsigned)st.wMilliseconds);
     }
     void write_log_file(HANDLE hf, const std::string& line) {
-        if (hf == INVALID_HANDLE_VALUE) return;
-        DWORD wrote = 0;
-        WriteFile(hf, line.data(), (DWORD)line.size(), &wrote, nullptr);
-        FlushFileBuffers(hf);
+        test_all_features::write_full_test_log_line(hf, line.data(), line.size());
     }
     void log_msg(HANDLE hf, const char* tag, const char* fmt, ...) {
         char ts[40]; format_timestamp(ts, sizeof(ts));
@@ -74,8 +94,829 @@ namespace {
         _snprintf_s(line, sizeof(line), _TRUNCATE, "[%s] [%s] %s\n", ts, tag, detail);
         std::string s(line);
         write_log_file(hf, s);
-        diag::log_tagged_fmt("test_all", "%s: %s", tag, detail);
-        OutputDebugStringA(s.c_str());
+        test_all_features::mirror_full_test_log_line(tag, detail, s.c_str());
+    }
+
+    void fail_empty_evidence(HANDLE hf, const char* tag, std::atomic<int>& failed, const char* fmt, ...) {
+        char detail[1024]; va_list ap; va_start(ap, fmt);
+        _vsnprintf_s(detail, sizeof(detail), _TRUNCATE, fmt, ap); va_end(ap);
+        log_msg(hf, tag, "FAIL -- %s", detail);
+        failed.fetch_add(1);
+    }
+
+    const char* camoufox_install_state_name(aida::burp::camoufox::install::install_state_t state) {
+        using state_t = aida::burp::camoufox::install::install_state_t;
+        switch (state) {
+            case state_t::unknown: return "unknown";
+            case state_t::checking: return "checking";
+            case state_t::available: return "available";
+            case state_t::missing_python: return "missing_python";
+            case state_t::missing_module: return "missing_module";
+            case state_t::missing_browser: return "missing_browser";
+            case state_t::installing: return "installing";
+            case state_t::install_failed: return "install_failed";
+            case state_t::ok: return "ok";
+        }
+        return "unknown";
+    }
+
+    const char* camoufox_bridge_state_name(aida::burp::camoufox::bridge_state_t state) {
+        using state_t = aida::burp::camoufox::bridge_state_t;
+        switch (state) {
+            case state_t::stopped: return "stopped";
+            case state_t::starting: return "starting";
+            case state_t::ready: return "ready";
+            case state_t::error: return "error";
+        }
+        return "unknown";
+    }
+
+    std::string compact_burp_text(std::string out, std::size_t cap) {
+        for (char& c : out) {
+            if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+        }
+        if (out.size() > cap)
+            out = out.substr(0, cap) + "...(truncated)";
+        return out;
+    }
+
+    bool camoufox_install_status_ready(const aida::burp::camoufox::install::status_t& st) {
+        return st.state == aida::burp::camoufox::install::install_state_t::ok &&
+               !st.python_path.empty() &&
+               !st.module_version.empty() &&
+               !st.browser_path.empty();
+    }
+
+    aida::burp::camoufox::install::status_t bounded_burp_camoufox_probe(HANDLE hf, const char* tag, DWORD timeout_ms, bool& completed) {
+        static test_lab::bounded_runner_t runner(1);
+        auto state = std::make_shared<aida::burp::camoufox::install::status_t>();
+        const uint64_t t0 = GetTickCount64();
+        log_msg(hf, tag, "CAMOUFOX-PROBE -- begin timeout_ms=%lu setup_disabled=1", static_cast<unsigned long>(timeout_ms));
+        const auto result = runner.run(static_cast<std::uint32_t>(timeout_ms), [state]() {
+            *state = aida::burp::camoufox::install::probe();
+        });
+        const uint64_t elapsed = GetTickCount64() - t0;
+        completed = result.status == test_lab::bounded_run_status_t::completed;
+        if (completed) {
+            log_msg(hf, tag, "CAMOUFOX-PROBE -- completed elapsed_ms=%llu state=%s python=%s module=%s browser=%s message=%s",
+                static_cast<unsigned long long>(elapsed),
+                camoufox_install_state_name(state->state),
+                state->python_path.empty() ? "<empty>" : state->python_path.c_str(),
+                state->module_version.empty() ? "<empty>" : state->module_version.c_str(),
+                state->browser_path.empty() ? "<empty>" : state->browser_path.c_str(),
+                state->last_message.empty() ? "<empty>" : compact_burp_text(state->last_message, 600).c_str());
+            return *state;
+        }
+        log_msg(hf, tag, "CAMOUFOX-PROBE -- failed elapsed_ms=%llu status=%d error=%s",
+            static_cast<unsigned long long>(elapsed),
+            static_cast<int>(result.status),
+            result.error.empty() ? "<empty>" : result.error.c_str());
+        return aida::burp::camoufox::install::get_status();
+    }
+
+    bool ensure_burp_camoufox_dependencies(HANDLE hf, const char* tag, std::string& reason, aida::burp::camoufox::install::status_t* out_status = nullptr) {
+        bool probe_completed = false;
+        constexpr DWORD probe_timeout_ms = 9000;
+        auto st = bounded_burp_camoufox_probe(hf, tag, probe_timeout_ms, probe_completed);
+        log_msg(hf, tag, "CAMOUFOX-SNAPSHOT -- probe_completed=%d state=%s python=%s module=%s browser=%s message=%s",
+            probe_completed ? 1 : 0,
+            camoufox_install_state_name(st.state),
+            st.python_path.empty() ? "<empty>" : st.python_path.c_str(),
+            st.module_version.empty() ? "<empty>" : st.module_version.c_str(),
+            st.browser_path.empty() ? "<empty>" : st.browser_path.c_str(),
+            st.last_message.empty() ? "<empty>" : compact_burp_text(st.last_message, 600).c_str());
+        if (out_status) *out_status = st;
+        if (camoufox_install_status_ready(st)) {
+            reason.clear();
+            return true;
+        }
+        reason = probe_completed
+            ? std::string("Camoufox bundled runtime is not ready; Test Lab setup/download is disabled state=") + camoufox_install_state_name(st.state) +
+                " message=" + (st.last_message.empty() ? "<empty>" : st.last_message)
+            : std::string("Camoufox dependency probe exceeded ") + std::to_string(probe_timeout_ms) + "ms; Test Lab setup/download is disabled";
+        log_msg(hf, tag, "CAMOUFOX-FAST-FAIL -- setup_disabled=1 reason=%s", compact_burp_text(reason, 700).c_str());
+        return false;
+    }
+
+    uint64_t fixture_now_ms() {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    }
+
+    std::string fixture_lower(std::string s) {
+        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return s;
+    }
+
+    std::string fixture_b64(const uint8_t* data, size_t len) {
+        static const char* alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        std::string out;
+        out.reserve(((len + 2) / 3) * 4);
+        for (size_t i = 0; i < len; i += 3) {
+            uint32_t a = data[i];
+            uint32_t b = (i + 1 < len) ? data[i + 1] : 0;
+            uint32_t c = (i + 2 < len) ? data[i + 2] : 0;
+            uint32_t triple = (a << 16) | (b << 8) | c;
+            out.push_back(alpha[(triple >> 18) & 0x3F]);
+            out.push_back(alpha[(triple >> 12) & 0x3F]);
+            out.push_back((i + 1 < len) ? alpha[(triple >> 6) & 0x3F] : '=');
+            out.push_back((i + 2 < len) ? alpha[triple & 0x3F] : '=');
+        }
+        return out;
+    }
+
+    std::string websocket_accept_for_key(const std::string& key) {
+        std::string joined = key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+        uint8_t digest[SHA_DIGEST_LENGTH] = {};
+        SHA1(reinterpret_cast<const unsigned char*>(joined.data()), joined.size(), digest);
+        return fixture_b64(digest, sizeof(digest));
+    }
+
+    bool ensure_burp_fixture_wsa() {
+        static std::atomic<int> rc{-1};
+        int cached = rc.load();
+        if (cached >= 0) return cached == 0;
+        WSADATA data{};
+        int r = WSAStartup(MAKEWORD(2, 2), &data);
+        int expected = -1;
+        if (!rc.compare_exchange_strong(expected, r)) return rc.load() == 0;
+        return r == 0;
+    }
+
+    bool send_all_fixture(SOCKET s, const std::string& data) {
+        size_t off = 0;
+        while (off < data.size()) {
+            int n = send(s, data.data() + off, static_cast<int>(data.size() - off), 0);
+            if (n <= 0) return false;
+            off += static_cast<size_t>(n);
+        }
+        return true;
+    }
+
+    std::string header_value_ci(const std::string& request, const std::string& name) {
+        std::string lower_req = fixture_lower(request);
+        std::string needle = fixture_lower(name) + ":";
+        size_t pos = lower_req.find(needle);
+        if (pos == std::string::npos) return {};
+        size_t value_start = pos + needle.size();
+        while (value_start < request.size() && (request[value_start] == ' ' || request[value_start] == '\t')) ++value_start;
+        size_t value_end = request.find("\r\n", value_start);
+        if (value_end == std::string::npos) value_end = request.size();
+        return request.substr(value_start, value_end - value_start);
+    }
+
+    std::string request_target_from_raw(const std::string& request) {
+        size_t first_space = request.find(' ');
+        if (first_space == std::string::npos) return "/";
+        size_t second_space = request.find(' ', first_space + 1);
+        if (second_space == std::string::npos || second_space <= first_space + 1) return "/";
+        return request.substr(first_space + 1, second_space - first_space - 1);
+    }
+
+    std::string fixture_temp_path(const char* name) {
+        char tmp[MAX_PATH] = {};
+        DWORD n = GetTempPathA(static_cast<DWORD>(sizeof(tmp)), tmp);
+        std::filesystem::path p = (n > 0 && n < sizeof(tmp)) ? std::filesystem::path(tmp) : std::filesystem::temp_directory_path();
+        p /= name;
+        return p.string();
+    }
+
+    bool write_fixture_text_file(const std::string& path, const std::string& body) {
+        std::ofstream f(path, std::ios::binary | std::ios::trunc);
+        if (!f) return false;
+        f.write(body.data(), static_cast<std::streamsize>(body.size()));
+        return static_cast<bool>(f);
+    }
+
+    struct burp_loopback_fixture_t {
+        SOCKET listen_socket = INVALID_SOCKET;
+        uint16_t port = 0;
+        std::atomic<bool> stopping{false};
+        aida::infra::win_thread::joinable_thread_t worker;
+
+        bool start(HANDLE hf, const char* tag) {
+            if (!ensure_burp_fixture_wsa()) {
+                log_msg(hf, tag, "fixture_start FAIL -- WSAStartup failed gle=%lu", GetLastError());
+                return false;
+            }
+            listen_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (listen_socket == INVALID_SOCKET) {
+                log_msg(hf, tag, "fixture_start FAIL -- socket failed wsa=%d", WSAGetLastError());
+                return false;
+            }
+            BOOL reuse = TRUE;
+            setsockopt(listen_socket, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+            sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            addr.sin_port = htons(0);
+            if (bind(listen_socket, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR) {
+                int err = WSAGetLastError();
+                closesocket(listen_socket);
+                listen_socket = INVALID_SOCKET;
+                log_msg(hf, tag, "fixture_start FAIL -- bind failed wsa=%d", err);
+                return false;
+            }
+            if (listen(listen_socket, SOMAXCONN) == SOCKET_ERROR) {
+                int err = WSAGetLastError();
+                closesocket(listen_socket);
+                listen_socket = INVALID_SOCKET;
+                log_msg(hf, tag, "fixture_start FAIL -- listen failed wsa=%d", err);
+                return false;
+            }
+            sockaddr_in bound{};
+            int len = sizeof(bound);
+            if (getsockname(listen_socket, reinterpret_cast<sockaddr*>(&bound), &len) == SOCKET_ERROR) {
+                int err = WSAGetLastError();
+                closesocket(listen_socket);
+                listen_socket = INVALID_SOCKET;
+                log_msg(hf, tag, "fixture_start FAIL -- getsockname failed wsa=%d", err);
+                return false;
+            }
+            port = ntohs(bound.sin_port);
+            stopping.store(false);
+            std::string thread_err;
+            DWORD thread_start_tick = GetTickCount();
+            log_msg(hf, tag, "fixture_start INFO -- thread start requested port=%u listener=%llu host_pid=%lu host_tid=%lu",
+                static_cast<unsigned>(port),
+                static_cast<unsigned long long>(listen_socket),
+                static_cast<unsigned long>(GetCurrentProcessId()),
+                static_cast<unsigned long>(GetCurrentThreadId()));
+            if (!worker.start([this]() { accept_loop(); }, &thread_err, aida::infra::win_thread::fixture_stack_reserve, "test_all_burp.loopback_fixture")) {
+                DWORD elapsed = GetTickCount() - thread_start_tick;
+                closesocket(listen_socket);
+                listen_socket = INVALID_SOCKET;
+                port = 0;
+                log_msg(hf, tag, "fixture_start FAIL -- thread start failed err=%s elapsed_ms=%lu host_pid=%lu host_tid=%lu",
+                    thread_err.c_str(),
+                    static_cast<unsigned long>(elapsed),
+                    static_cast<unsigned long>(GetCurrentProcessId()),
+                    static_cast<unsigned long>(GetCurrentThreadId()));
+                return false;
+            }
+            log_msg(hf, tag, "fixture_start PASS -- loopback_http_ws port=%u worker_tid=%u elapsed_ms=%lu",
+                static_cast<unsigned>(port),
+                worker.id(),
+                static_cast<unsigned long>(GetTickCount() - thread_start_tick));
+            return true;
+        }
+
+        void stop() {
+            stopping.store(true);
+            if (listen_socket != INVALID_SOCKET) {
+                shutdown(listen_socket, SD_BOTH);
+                closesocket(listen_socket);
+                listen_socket = INVALID_SOCKET;
+            }
+            if (worker.joinable()) worker.join();
+        }
+
+        ~burp_loopback_fixture_t() {
+            stop();
+        }
+
+        void accept_loop() {
+            while (!stopping.load()) {
+                fd_set rfds;
+                FD_ZERO(&rfds);
+                FD_SET(listen_socket, &rfds);
+                timeval tv{};
+                tv.tv_usec = 100000;
+                int rc = select(0, &rfds, nullptr, nullptr, &tv);
+                if (rc <= 0) continue;
+                SOCKET s = accept(listen_socket, nullptr, nullptr);
+                if (s == INVALID_SOCKET) continue;
+                DWORD timeout = 4000;
+                setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+                setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+                if (!aida::infra::win_thread::start_detached([s]() { handle_client(s); }, nullptr, aida::infra::win_thread::fixture_stack_reserve, "test_all_burp.loopback_client"))
+                    handle_client(s);
+            }
+        }
+
+        static void handle_client(SOCKET s) {
+            std::string request;
+            char buf[4096];
+            while (request.find("\r\n\r\n") == std::string::npos && request.size() < 65536) {
+                int n = recv(s, buf, sizeof(buf), 0);
+                if (n <= 0) break;
+                request.append(buf, buf + n);
+            }
+            if (request.empty()) {
+                closesocket(s);
+                return;
+            }
+            std::string upgrade = fixture_lower(header_value_ci(request, "Upgrade"));
+            if (upgrade == "websocket") {
+                handle_websocket(s, request);
+                return;
+            }
+            handle_http(s, request);
+        }
+
+        static void handle_websocket(SOCKET s, const std::string& request) {
+            std::string key = header_value_ci(request, "Sec-WebSocket-Key");
+            std::string accept = websocket_accept_for_key(key);
+            std::string resp = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n";
+            if (!send_all_fixture(s, resp)) {
+                closesocket(s);
+                return;
+            }
+            uint64_t end_ms = GetTickCount64() + 8000;
+            uint8_t hdr[2] = {};
+            while (GetTickCount64() < end_ms) {
+                int n = recv(s, reinterpret_cast<char*>(hdr), 2, 0);
+                if (n <= 0) break;
+                if (n < 2) continue;
+                size_t len = hdr[1] & 0x7F;
+                if (len == 126) {
+                    uint8_t ext[2] = {};
+                    if (recv(s, reinterpret_cast<char*>(ext), 2, 0) != 2) break;
+                    len = (static_cast<size_t>(ext[0]) << 8) | ext[1];
+                } else if (len == 127) {
+                    uint8_t ext[8] = {};
+                    if (recv(s, reinterpret_cast<char*>(ext), 8, 0) != 8) break;
+                    len = 0;
+                    for (uint8_t b : ext) len = (len << 8) | b;
+                    if (len > 4096) break;
+                }
+                uint8_t mask[4] = {};
+                bool masked = (hdr[1] & 0x80) != 0;
+                if (masked && recv(s, reinterpret_cast<char*>(mask), 4, 0) != 4) break;
+                std::vector<uint8_t> payload(len);
+                size_t got = 0;
+                while (got < len) {
+                    int r = recv(s, reinterpret_cast<char*>(payload.data() + got), static_cast<int>(len - got), 0);
+                    if (r <= 0) break;
+                    got += static_cast<size_t>(r);
+                }
+                if (got != len) break;
+                if (masked) {
+                    for (size_t i = 0; i < payload.size(); ++i) payload[i] ^= mask[i % 4];
+                }
+                uint8_t opcode = hdr[0] & 0x0F;
+                if (opcode == 0x8) break;
+                if (opcode == 0x1 || opcode == 0x2) {
+                    std::string frame;
+                    frame.push_back(static_cast<char>(0x80 | opcode));
+                    if (payload.size() < 126) {
+                        frame.push_back(static_cast<char>(payload.size()));
+                    } else {
+                        frame.push_back(static_cast<char>(126));
+                        frame.push_back(static_cast<char>((payload.size() >> 8) & 0xFF));
+                        frame.push_back(static_cast<char>(payload.size() & 0xFF));
+                    }
+                    frame.append(reinterpret_cast<const char*>(payload.data()), payload.size());
+                    send_all_fixture(s, frame);
+                }
+            }
+            closesocket(s);
+        }
+
+        static void handle_http(SOCKET s, const std::string& request) {
+            std::string target = request_target_from_raw(request);
+            std::string path = target;
+            std::string query;
+            size_t q = path.find('?');
+            if (q != std::string::npos) {
+                query = path.substr(q + 1);
+                path = path.substr(0, q);
+            }
+            std::string body;
+            std::string content_type = "text/html";
+            if (path == "/token") {
+                content_type = "application/json";
+                body = "{\"access_token\":\"aida-local-access\",\"refresh_token\":\"aida-local-refresh\",\"token_type\":\"Bearer\",\"expires_in\":3600}";
+            } else if (path == "/graphql") {
+                content_type = "application/json";
+                body = "{\"data\":{\"viewer\":{\"login\":\"aida-fixture\"}},\"extensions\":{\"fixture\":\"graphql\"}}";
+            } else if (path == "/aida-fixture.js") {
+                content_type = "application/javascript";
+                body = "window.aidaFixtureLoaded=true;console.log('aida-fixture-js');";
+            } else {
+                std::ostringstream os;
+                os << "<!doctype html><html><head><meta name=\"generator\" content=\"WordPress 6.4\">"
+                   << "<title>AiDA Burp Fixture</title><script src=\"/aida-fixture.js\"></script></head><body>"
+                   << "<h1>AiDA local Burp fixture</h1><a href=\"/aida-mcp-test\">aida-mcp-test</a>"
+                   << "<form action=\"/login\" method=\"post\"><input name=\"csrf\" value=\"AIDASEQ1234\"></form>"
+                   << "<div id=\"token\">AIDASEQ1234</div><div id=\"path\">" << path << "</div>"
+                   << "<div id=\"query\">" << query << "</div>"
+                   << "<div id=\"marker\">aida_mcp_param aida-mcp-test FUZZ</div>"
+                   << "</body></html>";
+                body = os.str();
+            }
+            std::ostringstream resp;
+            resp << "HTTP/1.1 200 OK\r\n"
+                 << "Server: nginx/1.24.0\r\n"
+                 << "X-Powered-By: PHP/8.2\r\n"
+                 << "Content-Type: " << content_type << "\r\n"
+                 << "Content-Security-Policy: default-src *; script-src * 'unsafe-inline'\r\n"
+                 << "Set-Cookie: aida_fixture=1; Path=/\r\n"
+                 << "X-AiDA-Fixture: local-burp\r\n"
+                 << "X-Query-Echo: " << query << "\r\n"
+                 << "Content-Length: " << body.size() << "\r\n"
+                 << "Connection: close\r\n\r\n"
+                 << body;
+            send_all_fixture(s, resp.str());
+            shutdown(s, SD_BOTH);
+            closesocket(s);
+        }
+    };
+
+    std::unique_ptr<burp_loopback_fixture_t> g_burp_fixture;
+    std::string g_burp_wordlist_path;
+    std::string g_subdomain_wordlist_path;
+
+    bool ensure_burp_loopback_fixture(HANDLE hf, const char* tag) {
+        if (g_burp_fixture && g_burp_fixture->port != 0) {
+            log_msg(hf, tag, "fixture_reuse -- loopback_http_ws port=%u", static_cast<unsigned>(g_burp_fixture->port));
+            return true;
+        }
+        auto fixture = std::make_unique<burp_loopback_fixture_t>();
+        if (!fixture->start(hf, tag)) {
+            return false;
+        }
+        g_burp_fixture = std::move(fixture);
+        return true;
+    }
+
+    uint16_t burp_fixture_port() {
+        return g_burp_fixture ? g_burp_fixture->port : 0;
+    }
+
+    std::string burp_fixture_url(const std::string& path = "/") {
+        uint16_t port = burp_fixture_port();
+        return "http://127.0.0.1:" + std::to_string(static_cast<unsigned>(port)) + path;
+    }
+
+    const std::string& ensure_burp_wordlist(HANDLE hf, const char* tag) {
+        if (g_burp_wordlist_path.empty()) {
+            g_burp_wordlist_path = fixture_temp_path("aida_burp_fixture_words.txt");
+            bool ok = write_fixture_text_file(g_burp_wordlist_path, "aida-mcp-test\n");
+            log_msg(hf, tag, "fixture_wordlist path=%s ok=%d", g_burp_wordlist_path.c_str(), ok ? 1 : 0);
+        }
+        return g_burp_wordlist_path;
+    }
+
+    const std::string& ensure_subdomain_wordlist(HANDLE hf, const char* tag) {
+        if (g_subdomain_wordlist_path.empty()) {
+            g_subdomain_wordlist_path = fixture_temp_path("aida_burp_subdomain_words.txt");
+            bool ok = write_fixture_text_file(g_subdomain_wordlist_path, "@\n");
+            log_msg(hf, tag, "fixture_subdomain_wordlist path=%s ok=%d", g_subdomain_wordlist_path.c_str(), ok ? 1 : 0);
+        }
+        return g_subdomain_wordlist_path;
+    }
+
+    aida::burp::exchange_observed_t make_fixture_exchange(uint64_t id) {
+        aida::burp::exchange_observed_t e;
+        e.id = id;
+        e.timestamp_ms = fixture_now_ms();
+        e.method = "GET";
+        e.scheme = "http";
+        e.host = "127.0.0.1";
+        e.port = burp_fixture_port() ? burp_fixture_port() : 18888;
+        e.path = "/aida-mcp-test";
+        e.query = "q=AIDASEQ1234&aida_mcp_param=fixture";
+        e.req_headers = {{"Host", "127.0.0.1"}, {"User-Agent", "AiDA-TestLab/1.0"}};
+        std::string body = "<html><head><meta name=\"generator\" content=\"WordPress 6.4\"></head><body>AIDASEQ1234 aida_mcp_param fixture</body></html>";
+        e.status_code = 200;
+        e.reason_phrase = "OK";
+        e.resp_headers = {
+            {"Server", "nginx/1.24.0"},
+            {"X-Powered-By", "PHP/8.2"},
+            {"Content-Type", "text/html"},
+            {"Content-Security-Policy", "default-src *; script-src * 'unsafe-inline'"},
+            {"Set-Cookie", "aida_fixture=1; Path=/"}
+        };
+        e.resp_body.assign(body.begin(), body.end());
+        e.latency_ms = 7;
+        e.client_addr = "127.0.0.1";
+        e.client_port = 53000;
+        return e;
+    }
+
+    void publish_fixture_exchange(HANDLE hf, const char* tag) {
+        aida::burp::passive_scanner::initialize();
+        aida::burp::passive_scanner::set_enabled(true);
+        aida::burp::sitemap::initialize();
+        aida::burp::logger::initialize();
+        aida::burp::tech::initialize();
+        auto before_stats = aida::burp::passive_scanner::get_stats();
+        size_t before_hosts = aida::burp::sitemap::list_hosts(false).size();
+        size_t before_rows = aida::burp::logger::total_rows();
+        size_t before_inv = aida::burp::tech::inventory().size();
+        auto ex = make_fixture_exchange(900000 + before_rows + before_hosts + before_inv);
+        log_msg(hf, tag, "fixture_exchange publish id=%llu host=%s port=%u path=%s before_scanned=%llu before_hosts=%zu before_rows=%zu before_inv=%zu",
+            static_cast<unsigned long long>(ex.id), ex.host.c_str(), static_cast<unsigned>(ex.port), ex.path.c_str(),
+            static_cast<unsigned long long>(before_stats.exchanges_scanned), before_hosts, before_rows, before_inv);
+        aida::burp::sitemap::ingest_exchange(ex);
+        aida::events::publish(aida::burp::kExchangeObservedEvent, ex);
+        Sleep(250);
+        auto after_stats = aida::burp::passive_scanner::get_stats();
+        size_t after_hosts = aida::burp::sitemap::list_hosts(false).size();
+        size_t after_rows = aida::burp::logger::total_rows();
+        size_t after_inv = aida::burp::tech::inventory().size();
+        log_msg(hf, tag, "fixture_exchange result scanned=%llu issues=%llu hosts=%zu rows=%zu inventory=%zu",
+            static_cast<unsigned long long>(after_stats.exchanges_scanned),
+            static_cast<unsigned long long>(after_stats.issues_found),
+            after_hosts, after_rows, after_inv);
+    }
+
+    void wait_briefly_for_async_state() {
+        Sleep(500);
+    }
+
+    void ensure_sequencer_fixture(HANDLE hf, const char* tag) {
+        auto cols = aida::burp::sequencer::list_collections();
+        if (!cols.empty()) return;
+        if (!ensure_burp_loopback_fixture(hf, tag)) return;
+        aida::burp::sequencer::collection_config_t cfg;
+        cfg.url = burp_fixture_url("/?q=AIDASEQ1234");
+        cfg.host = "127.0.0.1";
+        cfg.port = burp_fixture_port();
+        cfg.use_tls = false;
+        cfg.extract_regex = "(AIDASEQ[0-9]{4})";
+        cfg.capture_group = 1;
+        cfg.target_count = 3;
+        cfg.concurrency = 1;
+        cfg.throttle_ms = 1;
+        cfg.name = "TestLab local sequencer fixture";
+        uint64_t id = aida::burp::sequencer::start_collection(cfg);
+        log_msg(hf, tag, "fixture_sequencer start id=%llu url=%s port=%u err=%s",
+            static_cast<unsigned long long>(id), cfg.url.c_str(), static_cast<unsigned>(cfg.port),
+            aida::burp::sequencer::last_error().c_str());
+        for (int i = 0; i < 20; ++i) {
+            auto st = aida::burp::sequencer::status(id);
+            log_msg(hf, tag, "fixture_sequencer poll=%d id=%llu collected=%zu target=%zu running=%d error=%d err=%s",
+                i, static_cast<unsigned long long>(id), st.collected, st.target, st.running ? 1 : 0, st.error ? 1 : 0, st.error_message.c_str());
+            if (st.collected > 0 || (!st.running && st.id != 0)) break;
+            Sleep(150);
+        }
+    }
+
+    void ensure_intruder_fixture(HANDLE hf, const char* tag) {
+        auto jobs = aida::burp::intruder::list_jobs();
+        if (!jobs.empty()) return;
+        if (!ensure_burp_loopback_fixture(hf, tag)) return;
+        std::string raw = "GET /?q=FUZZ HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+        size_t pos = raw.find("FUZZ");
+        aida::burp::intruder::config_t cfg;
+        cfg.scheme = "http";
+        cfg.host = "127.0.0.1";
+        cfg.port = burp_fixture_port();
+        cfg.base_request.assign(raw.begin(), raw.end());
+        cfg.attack_mode = aida::burp::intruder::attack_mode_t::sniper;
+        cfg.engine_mode = aida::burp::intruder::engine_mode_t::http1_serial;
+        cfg.positions.push_back({pos == std::string::npos ? 0 : pos, 4});
+        cfg.payload_sets.push_back({"aida"});
+        cfg.concurrency = 1;
+        cfg.total_requests_cap = 1;
+        cfg.timeout_ms = 1500;
+        uint64_t id = aida::burp::intruder::start(cfg);
+        log_msg(hf, tag, "fixture_intruder start id=%llu port=%u pos=%zu err=%s",
+            static_cast<unsigned long long>(id), static_cast<unsigned>(cfg.port), pos,
+            aida::burp::intruder::last_error().c_str());
+        wait_briefly_for_async_state();
+        auto st = aida::burp::intruder::status(id);
+        log_msg(hf, tag, "fixture_intruder status id=%llu total=%zu sent=%zu errors=%zu running=%d",
+            static_cast<unsigned long long>(id), st.total, st.sent, st.errors, st.running ? 1 : 0);
+    }
+
+    void ensure_active_scanner_fixture(HANDLE hf, const char* tag) {
+        auto audits = aida::burp::active_scanner::list_audits();
+        if (!audits.empty()) return;
+        if (!ensure_burp_loopback_fixture(hf, tag)) return;
+        aida::burp::active_scanner::initialize();
+        std::string raw = "GET /?q=AIDASEQ1234 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+        aida::burp::active_scanner::audit_config_t cfg;
+        cfg.scope_only = false;
+        cfg.max_concurrent_requests = 1;
+        cfg.per_module_request_cap = 1;
+        cfg.timeout_ms = 1500;
+        uint64_t id = aida::burp::active_scanner::enqueue_target(
+            std::vector<uint8_t>(raw.begin(), raw.end()), burp_fixture_url("/?q=AIDASEQ1234"), cfg);
+        log_msg(hf, tag, "fixture_active_scanner enqueue id=%llu audits_before=%zu err=%s",
+            static_cast<unsigned long long>(id), audits.size(), aida::burp::active_scanner::last_error().c_str());
+        wait_briefly_for_async_state();
+    }
+
+    void ensure_crawler_fixture(HANDLE hf, const char* tag) {
+        auto crawls = aida::burp::crawler::list();
+        if (!crawls.empty()) return;
+        if (!ensure_burp_loopback_fixture(hf, tag)) return;
+        aida::burp::crawler::initialize();
+        aida::burp::crawler::crawl_config_t cfg;
+        cfg.start_urls = {burp_fixture_url("/")};
+        cfg.max_depth = 1;
+        cfg.max_pages = 4;
+        cfg.concurrency = 1;
+        cfg.respect_robots_txt = false;
+        cfg.parse_js = false;
+        cfg.request_timeout_ms = 1500;
+        uint64_t id = aida::burp::crawler::start(cfg);
+        log_msg(hf, tag, "fixture_crawler start id=%llu url=%s err=%s",
+            static_cast<unsigned long long>(id), cfg.start_urls[0].c_str(), aida::burp::crawler::last_error().c_str());
+        wait_briefly_for_async_state();
+    }
+
+    void ensure_report_fixture(HANDLE hf, const char* tag) {
+        auto reports = aida::burp::report::list_reports();
+        if (!reports.empty()) return;
+        aida::burp::issue_store::initialize();
+        aida::burp::issue_t issue;
+        issue.type_key = "testlab.fixture.csp";
+        issue.name = "TestLab fixture issue";
+        issue.description = "Local deterministic fixture issue for report generation.";
+        issue.remediation = "Use deterministic local fixtures for report tests.";
+        issue.severity = aida::burp::severity_t::low;
+        issue.confidence = aida::burp::confidence_t::firm;
+        issue.scheme = "http";
+        issue.host = "127.0.0.1";
+        issue.port = burp_fixture_port() ? burp_fixture_port() : 80;
+        issue.path = "/aida-mcp-test";
+        issue.seen_ms = fixture_now_ms();
+        uint64_t issue_id = aida::burp::issue_store::add(issue);
+        aida::burp::report::report_config_t cfg;
+        cfg.title = "AiDA TestLab Burp Fixture Report";
+        cfg.client = "AiDA TestLab";
+        cfg.scope_summary = "Loopback fixture";
+        cfg.output_path = fixture_temp_path("aida_burp_fixture_report.html");
+        cfg.format = aida::burp::report::report_format_t::html;
+        std::string out;
+        bool ok = aida::burp::report::generate(cfg, out);
+        log_msg(hf, tag, "fixture_report generate ok=%d issue_id=%llu path=%s reports_before=%zu err=%s",
+            ok ? 1 : 0, static_cast<unsigned long long>(issue_id), out.c_str(), reports.size(), aida::burp::report::last_error().c_str());
+    }
+
+    uint16_t reserve_loopback_port_for_fixture(HANDLE hf, const char* tag) {
+        if (!ensure_burp_fixture_wsa()) return 0;
+        SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (s == INVALID_SOCKET) return 0;
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = htons(0);
+        uint16_t out = 0;
+        if (bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != SOCKET_ERROR) {
+            sockaddr_in bound{};
+            int len = sizeof(bound);
+            if (getsockname(s, reinterpret_cast<sockaddr*>(&bound), &len) != SOCKET_ERROR) {
+                out = ntohs(bound.sin_port);
+            }
+        }
+        closesocket(s);
+        log_msg(hf, tag, "fixture_port_reserve port=%u", static_cast<unsigned>(out));
+        return out;
+    }
+
+    bool collaborator_probe_fixture(HANDLE hf, const char* tag, const std::string& token) {
+        auto cfg = aida::burp::collaborator::current_config();
+        if (token.empty() || cfg.http_port == 0) {
+            log_msg(hf, tag, "fixture_collab_probe skipped token_len=%zu port=%u", token.size(), static_cast<unsigned>(cfg.http_port));
+            return false;
+        }
+        if (!ensure_burp_fixture_wsa()) return false;
+        SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (s == INVALID_SOCKET) return false;
+        DWORD timeout = 1500;
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = htons(cfg.http_port);
+        bool ok = connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != SOCKET_ERROR;
+        if (ok) {
+            std::string req = "GET /" + token + " HTTP/1.1\r\nHost: " + token + "." + cfg.public_host + "\r\nConnection: close\r\n\r\n";
+            ok = send_all_fixture(s, req);
+            char buf[512];
+            int n = recv(s, buf, sizeof(buf), 0);
+            log_msg(hf, tag, "fixture_collab_probe recv=%d token_len=%zu port=%u", n, token.size(), static_cast<unsigned>(cfg.http_port));
+        } else {
+            log_msg(hf, tag, "fixture_collab_probe connect_failed wsa=%d port=%u", WSAGetLastError(), static_cast<unsigned>(cfg.http_port));
+        }
+        closesocket(s);
+        Sleep(150);
+        return ok;
+    }
+
+    void ensure_collaborator_fixture(HANDLE hf, const char* tag) {
+        auto existing = aida::burp::collaborator::snapshot_all(10);
+        if (!existing.empty()) return;
+        if (!aida::burp::collaborator::is_running()) {
+            aida::burp::collaborator::collaborator_config_t cfg;
+            cfg.bind_ip = "127.0.0.1";
+            cfg.http_port = reserve_loopback_port_for_fixture(hf, tag);
+            if (cfg.http_port == 0) cfg.http_port = 28444;
+            cfg.enable_http = true;
+            cfg.enable_dns = false;
+            cfg.enable_smtp = false;
+            cfg.dns_port = 0;
+            cfg.smtp_port = 0;
+            cfg.public_host = "aidacollab.local";
+            cfg.public_ip = "127.0.0.1";
+            cfg.canned_body = "aida collaborator fixture";
+            bool ok = aida::burp::collaborator::start(cfg);
+            log_msg(hf, tag, "fixture_collab_start ok=%d bind=%s http_port=%u err=%s",
+                ok ? 1 : 0, cfg.bind_ip.c_str(), static_cast<unsigned>(cfg.http_port), aida::burp::collaborator::last_error().c_str());
+        }
+        std::string token = aida::burp::collaborator::generate_token();
+        log_msg(hf, tag, "fixture_collab_token len=%zu running=%d", token.size(), aida::burp::collaborator::is_running() ? 1 : 0);
+        collaborator_probe_fixture(hf, tag, token);
+        auto after = aida::burp::collaborator::snapshot_all(100);
+        log_msg(hf, tag, "fixture_collab_result interactions=%zu tokens=%zu", after.size(), aida::burp::collaborator::list_tokens().size());
+    }
+
+    void ensure_ws_fixture(HANDLE hf, const char* tag) {
+        auto conns = aida::burp::ws_editor::list_connections();
+        if (!conns.empty()) return;
+        if (!ensure_burp_loopback_fixture(hf, tag)) return;
+        aida::burp::ws_editor::initialize();
+        aida::burp::ws_editor::ws_connection_config_t cfg;
+        cfg.scheme = "ws";
+        cfg.host = "127.0.0.1";
+        cfg.port = burp_fixture_port();
+        cfg.path = "/ws";
+        cfg.verify_tls = false;
+        cfg.connect_timeout_ms = 1500;
+        cfg.read_timeout_ms = 4000;
+        uint64_t id = aida::burp::ws_editor::connect(cfg);
+        bool sent = id != 0 && aida::burp::ws_editor::send_text(id, "aida-ws-fixture");
+        log_msg(hf, tag, "fixture_ws connect id=%llu sent=%d port=%u err=%s",
+            static_cast<unsigned long long>(id), sent ? 1 : 0, static_cast<unsigned>(cfg.port), aida::burp::ws_editor::last_error().c_str());
+        Sleep(250);
+    }
+
+    void ensure_content_discovery_fixture(HANDLE hf, const char* tag) {
+        auto jobs = aida::burp::content_discovery::list();
+        if (!jobs.empty()) return;
+        if (!ensure_burp_loopback_fixture(hf, tag)) return;
+        aida::burp::content_discovery::initialize();
+        aida::burp::content_discovery::config_t cfg;
+        cfg.target_url = burp_fixture_url("/FUZZ");
+        cfg.wordlist_file = ensure_burp_wordlist(hf, tag);
+        cfg.concurrency = 1;
+        cfg.request_timeout_ms = 1500;
+        cfg.auto_calibrate = false;
+        cfg.match_status = {200};
+        uint64_t id = aida::burp::content_discovery::start(cfg);
+        log_msg(hf, tag, "fixture_content_discovery start id=%llu target=%s wordlist=%s err=%s",
+            static_cast<unsigned long long>(id), cfg.target_url.c_str(), cfg.wordlist_file.c_str(),
+            aida::burp::content_discovery::last_error().c_str());
+        wait_briefly_for_async_state();
+        auto st = aida::burp::content_discovery::status(id);
+        log_msg(hf, tag, "fixture_content_discovery status id=%llu attempts=%d total=%d hits=%d errors=%d",
+            static_cast<unsigned long long>(id), st.attempts, st.total, st.hits, st.errors);
+    }
+
+    void ensure_subdomain_fixture(HANDLE hf, const char* tag) {
+        auto jobs = aida::burp::subdomain_enum::list();
+        if (!jobs.empty()) return;
+        aida::burp::subdomain_enum::initialize();
+        aida::burp::subdomain_enum::config_t cfg;
+        cfg.domain = "localhost";
+        cfg.brute_wordlist_file = ensure_subdomain_wordlist(hf, tag);
+        cfg.resolver_concurrency = 1;
+        cfg.request_timeout_ms = 1000;
+        cfg.run_passive = false;
+        cfg.run_brute = true;
+        cfg.bypass_dns_cache = false;
+        uint64_t id = aida::burp::subdomain_enum::start(cfg);
+        log_msg(hf, tag, "fixture_subdomain start id=%llu domain=%s wordlist=%s err=%s",
+            static_cast<unsigned long long>(id), cfg.domain.c_str(), cfg.brute_wordlist_file.c_str(),
+            aida::burp::subdomain_enum::last_error().c_str());
+        for (int i = 0; i < 20; ++i) {
+            auto st = aida::burp::subdomain_enum::status(id);
+            log_msg(hf, tag, "fixture_subdomain poll=%d id=%llu phase=%d attempts=%d resolved=%d results=%zu",
+                i, static_cast<unsigned long long>(id), static_cast<int>(st.phase), st.brute_attempts, st.brute_resolved, st.results.size());
+            if (st.phase == aida::burp::subdomain_enum::enum_phase_t::complete || !st.results.empty()) break;
+            Sleep(100);
+        }
+    }
+
+    void ensure_param_miner_fixture(HANDLE hf, const char* tag) {
+        auto jobs = aida::burp::param_miner::list_jobs();
+        if (!jobs.empty()) return;
+        if (!ensure_burp_loopback_fixture(hf, tag)) return;
+        aida::burp::param_miner::config_t cfg;
+        cfg.target_url = burp_fixture_url("/");
+        cfg.location = aida::burp::param_miner::location_t::query;
+        cfg.custom_words = {"aida_mcp_param"};
+        cfg.concurrency = 1;
+        cfg.timeout_ms = 1500;
+        cfg.baseline_count = 1;
+        cfg.diff_sigma_threshold = 1.0;
+        cfg.report_as_issues = false;
+        uint64_t id = aida::burp::param_miner::start(cfg);
+        log_msg(hf, tag, "fixture_param_miner start id=%llu target=%s err=%s",
+            static_cast<unsigned long long>(id), cfg.target_url.c_str(), aida::burp::param_miner::last_error().c_str());
+        for (int i = 0; i < 20; ++i) {
+            auto st = aida::burp::param_miner::status(id);
+            log_msg(hf, tag, "fixture_param_miner poll=%d id=%llu total=%zu tried=%zu hits=%zu running=%d",
+                i, static_cast<unsigned long long>(id), st.total, st.tried, st.hits, st.running ? 1 : 0);
+            if (!st.running && st.tried > 0) break;
+            Sleep(100);
+        }
     }
 
     void test_scope_init(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -714,8 +1555,13 @@ namespace {
     void test_sequencer_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "seq_list";
         log_msg(hf, tag, "START -- sequencer::list_collections()");
+        ensure_sequencer_fixture(hf, tag);
         auto cols = aida::burp::sequencer::list_collections();
         log_msg(hf, tag, "collection count = %zu", cols.size());
+        if (cols.empty()) {
+            fail_empty_evidence(hf, tag, failed, "sequencer list returned zero collections after sequencer fixture/action should have created collection state");
+            return;
+        }
         log_msg(hf, tag, "PASS -- list_collections returned %zu entries", cols.size());
         passed.fetch_add(1);
     }
@@ -732,8 +1578,13 @@ namespace {
     void test_intruder_list_jobs(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "intruder_list";
         log_msg(hf, tag, "START -- intruder::list_jobs()");
+        ensure_intruder_fixture(hf, tag);
         auto jobs = aida::burp::intruder::list_jobs();
         log_msg(hf, tag, "job count = %zu", jobs.size());
+        if (jobs.empty()) {
+            fail_empty_evidence(hf, tag, failed, "intruder list returned zero jobs after intruder fixture/action should have created a job");
+            return;
+        }
         log_msg(hf, tag, "PASS -- list_jobs returned %zu entries", jobs.size());
         passed.fetch_add(1);
     }
@@ -844,11 +1695,16 @@ namespace {
     void test_passive_scanner_stats(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "pscan_stats";
         log_msg(hf, tag, "START -- passive_scanner::get_stats()");
+        publish_fixture_exchange(hf, tag);
         auto stats = aida::burp::passive_scanner::get_stats();
         log_msg(hf, tag, "exchanges_scanned=%llu issues_found=%llu last_scan_ms=%llu",
             (unsigned long long)stats.exchanges_scanned,
             (unsigned long long)stats.issues_found,
             (unsigned long long)stats.last_scan_ms);
+        if (stats.exchanges_scanned == 0 && stats.issues_found == 0) {
+            fail_empty_evidence(hf, tag, failed, "passive scanner stats show zero scanned exchanges and zero issues after scanner fixture/action should have fed an exchange");
+            return;
+        }
         log_msg(hf, tag, "PASS -- get_stats returned successfully");
         passed.fetch_add(1);
     }
@@ -856,8 +1712,13 @@ namespace {
     void test_active_scanner_list_audits(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "ascan_list";
         log_msg(hf, tag, "START -- active_scanner::list_audits()");
+        ensure_active_scanner_fixture(hf, tag);
         auto audits = aida::burp::active_scanner::list_audits();
         log_msg(hf, tag, "audit count = %zu", audits.size());
+        if (audits.empty()) {
+            fail_empty_evidence(hf, tag, failed, "active scanner list returned zero audits after audit fixture/action should have created an audit");
+            return;
+        }
         log_msg(hf, tag, "PASS -- list_audits returned %zu entries", audits.size());
         passed.fetch_add(1);
     }
@@ -879,8 +1740,13 @@ namespace {
     void test_crawler_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "crawler_list";
         log_msg(hf, tag, "START -- crawler::list()");
+        ensure_crawler_fixture(hf, tag);
         auto crawls = aida::burp::crawler::list();
         log_msg(hf, tag, "crawl count = %zu", crawls.size());
+        if (crawls.empty()) {
+            fail_empty_evidence(hf, tag, failed, "crawler list returned zero crawls after crawler fixture/action should have started a crawl");
+            return;
+        }
         log_msg(hf, tag, "PASS -- list returned %zu entries", crawls.size());
         passed.fetch_add(1);
     }
@@ -902,12 +1768,17 @@ namespace {
     void test_sitemap_list_hosts(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "sitemap_hosts";
         log_msg(hf, tag, "START -- sitemap::list_hosts(false)");
+        publish_fixture_exchange(hf, tag);
         auto hosts = aida::burp::sitemap::list_hosts(false);
         log_msg(hf, tag, "host count = %zu", hosts.size());
         for (size_t i = 0; i < hosts.size() && i < 10; ++i) {
             log_msg(hf, tag, "  [%zu] %s:%u tls=%s requests=%zu",
                 i, hosts[i].host.c_str(), (unsigned)hosts[i].port,
                 hosts[i].tls ? "true" : "false", hosts[i].total_requests);
+        }
+        if (hosts.empty()) {
+            fail_empty_evidence(hf, tag, failed, "sitemap host list is empty after sitemap/proxy fixture should have recorded hosts");
+            return;
         }
         log_msg(hf, tag, "PASS -- list_hosts returned %zu entries", hosts.size());
         passed.fetch_add(1);
@@ -925,8 +1796,13 @@ namespace {
     void test_report_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "report_list";
         log_msg(hf, tag, "START -- report::list_reports()");
+        ensure_report_fixture(hf, tag);
         auto reports = aida::burp::report::list_reports();
         log_msg(hf, tag, "report count = %zu", reports.size());
+        if (reports.empty()) {
+            fail_empty_evidence(hf, tag, failed, "report list returned zero reports after report generation fixture/action should have created a report");
+            return;
+        }
         log_msg(hf, tag, "PASS -- list_reports returned %zu entries", reports.size());
         passed.fetch_add(1);
     }
@@ -1042,6 +1918,7 @@ namespace {
     void test_collaborator_generate_token(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "collab_token";
         log_msg(hf, tag, "START -- collaborator::generate_token()");
+        ensure_collaborator_fixture(hf, tag);
         std::string token = aida::burp::collaborator::generate_token();
         log_msg(hf, tag, "token = \"%s\" (len=%zu)", token.c_str(), token.size());
         if (!token.empty()) {
@@ -1049,9 +1926,9 @@ namespace {
             passed.fetch_add(1);
         } else {
             std::string err = aida::burp::collaborator::last_error();
-            log_msg(hf, tag, "PASS -- generate_token returned empty (collaborator not started): %s",
+            log_msg(hf, tag, "FAIL -- generate_token returned empty after collaborator fixture: %s",
                 err.c_str());
-            passed.fetch_add(1);
+            failed.fetch_add(1);
         }
     }
 
@@ -1072,11 +1949,16 @@ namespace {
     void test_collaborator_list_tokens(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "collab_tokens";
         log_msg(hf, tag, "START -- collaborator::list_tokens()");
+        ensure_collaborator_fixture(hf, tag);
         auto tokens = aida::burp::collaborator::list_tokens();
         log_msg(hf, tag, "token count = %zu", tokens.size());
         for (size_t i = 0; i < tokens.size() && i < 5; ++i) {
             log_msg(hf, tag, "  [%zu] token=%s interactions=%zu",
                 i, tokens[i].token.c_str(), tokens[i].interaction_count);
+        }
+        if (tokens.empty()) {
+            fail_empty_evidence(hf, tag, failed, "collaborator token list is empty after collaborator fixture/action should have generated a token");
+            return;
         }
         log_msg(hf, tag, "PASS -- list_tokens returned %zu entries", tokens.size());
         passed.fetch_add(1);
@@ -1085,8 +1967,13 @@ namespace {
     void test_collaborator_poll_since(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "collab_poll";
         log_msg(hf, tag, "START -- collaborator::poll_since(0)");
+        ensure_collaborator_fixture(hf, tag);
         auto interactions = aida::burp::collaborator::poll_since(0);
         log_msg(hf, tag, "interactions = %zu", interactions.size());
+        if (interactions.empty()) {
+            fail_empty_evidence(hf, tag, failed, "collaborator poll_since returned zero interactions after collaborator fixture/action should have produced interaction evidence");
+            return;
+        }
         log_msg(hf, tag, "PASS -- poll_since returned %zu entries", interactions.size());
         passed.fetch_add(1);
     }
@@ -1094,9 +1981,17 @@ namespace {
     void test_collaborator_snapshot_all(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "collab_snap";
         log_msg(hf, tag, "START -- collaborator::snapshot_all()");
+        ensure_collaborator_fixture(hf, tag);
         auto all = aida::burp::collaborator::snapshot_all(100);
         log_msg(hf, tag, "snapshot size = %zu", all.size());
+        if (all.empty()) {
+            aida::burp::collaborator::stop();
+            fail_empty_evidence(hf, tag, failed, "collaborator snapshot returned zero interactions after collaborator fixture/action should have produced interaction evidence");
+            return;
+        }
         log_msg(hf, tag, "PASS -- snapshot_all returned %zu entries", all.size());
+        aida::burp::collaborator::stop();
+        log_msg(hf, tag, "fixture_collab_cleanup -- stopped collaborator after snapshot coverage");
         passed.fetch_add(1);
     }
 
@@ -1117,6 +2012,7 @@ namespace {
     void test_ws_list_connections(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "ws_list";
         log_msg(hf, tag, "START -- ws_editor::list_connections()");
+        ensure_ws_fixture(hf, tag);
         auto conns = aida::burp::ws_editor::list_connections();
         log_msg(hf, tag, "connection count = %zu", conns.size());
         for (size_t i = 0; i < conns.size() && i < 5; ++i) {
@@ -1124,6 +2020,10 @@ namespace {
                 i, (unsigned long long)conns[i].id, conns[i].url.c_str(),
                 conns[i].connected ? "true" : "false",
                 conns[i].frames_sent, conns[i].frames_received);
+        }
+        if (conns.empty()) {
+            fail_empty_evidence(hf, tag, failed, "websocket connection list is empty after websocket fixture/action should have opened a connection");
+            return;
         }
         log_msg(hf, tag, "PASS -- list_connections returned %zu entries", conns.size());
         passed.fetch_add(1);
@@ -1252,6 +2152,7 @@ namespace {
     void test_logger_query_empty(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "logger_query";
         log_msg(hf, tag, "START -- logger::query with empty filter");
+        publish_fixture_exchange(hf, tag);
         aida::burp::logger::log_filter_t f;
         auto rows = aida::burp::logger::query(f, 50);
         log_msg(hf, tag, "query returned %zu rows", rows.size());
@@ -1259,6 +2160,10 @@ namespace {
             log_msg(hf, tag, "  [%zu] %s %s status=%d latency=%llums",
                 i, rows[i].method.c_str(), rows[i].url.c_str(),
                 rows[i].status, (unsigned long long)rows[i].latency_ms);
+        }
+        if (rows.empty()) {
+            fail_empty_evidence(hf, tag, failed, "logger query returned zero rows after proxy/repeater/scanner fixtures should have logged HTTP evidence");
+            return;
         }
         log_msg(hf, tag, "PASS -- query returned %zu rows", rows.size());
         passed.fetch_add(1);
@@ -1455,13 +2360,29 @@ namespace {
 
     void test_camoufox_install_probe(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "cfox_probe";
-        log_msg(hf, tag, "START -- camoufox::install::probe()");
-        auto st = aida::burp::camoufox::install::probe();
-        log_msg(hf, tag, "state=%d python=%s module_ver=%s browser=%s",
-            (int)st.state, st.python_path.c_str(),
-            st.module_version.c_str(), st.browser_path.c_str());
-        log_msg(hf, tag, "PASS -- probe returned state=%d", (int)st.state);
-        passed.fetch_add(1);
+        log_msg(hf, tag, "START -- camoufox::install readiness probe with Test Lab setup disabled");
+        aida::burp::camoufox::install::status_t st;
+        std::string reason;
+        const bool ready = ensure_burp_camoufox_dependencies(hf, tag, reason, &st);
+        log_msg(hf, tag, "state=%s python=%s module_ver=%s browser=%s message=%s",
+            camoufox_install_state_name(st.state),
+            st.python_path.empty() ? "<empty>" : st.python_path.c_str(),
+            st.module_version.empty() ? "<empty>" : st.module_version.c_str(),
+            st.browser_path.empty() ? "<empty>" : st.browser_path.c_str(),
+            st.last_message.empty() ? "<empty>" : st.last_message.c_str());
+        if (ready) {
+            log_msg(hf, tag, "PASS -- Camoufox dependencies ready");
+            passed.fetch_add(1);
+        } else {
+            fail_empty_evidence(hf, tag, failed,
+                "Camoufox dependency setup failed-closed state=%s python=%s module=%s browser=%s message=%s reason=%s",
+                camoufox_install_state_name(st.state),
+                st.python_path.empty() ? "<empty>" : st.python_path.c_str(),
+                st.module_version.empty() ? "<empty>" : st.module_version.c_str(),
+                st.browser_path.empty() ? "<empty>" : st.browser_path.c_str(),
+                st.last_message.empty() ? "<empty>" : st.last_message.c_str(),
+                reason.empty() ? "<empty>" : compact_burp_text(reason, 700).c_str());
+        }
     }
 
     void test_dom_xss_init(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -1926,8 +2847,13 @@ namespace {
     void test_content_discovery_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "cd_list";
         log_msg(hf, tag, "START -- content_discovery::list()");
+        ensure_content_discovery_fixture(hf, tag);
         auto jobs = aida::burp::content_discovery::list();
         log_msg(hf, tag, "job count = %zu", jobs.size());
+        if (jobs.empty()) {
+            fail_empty_evidence(hf, tag, failed, "content discovery list returned zero jobs after discovery fixture/action should have created a job");
+            return;
+        }
         log_msg(hf, tag, "PASS -- list returned %zu entries", jobs.size());
         passed.fetch_add(1);
     }
@@ -1949,8 +2875,13 @@ namespace {
     void test_subdomain_enum_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "sd_list";
         log_msg(hf, tag, "START -- subdomain_enum::list()");
+        ensure_subdomain_fixture(hf, tag);
         auto jobs = aida::burp::subdomain_enum::list();
         log_msg(hf, tag, "enum job count = %zu", jobs.size());
+        if (jobs.empty()) {
+            fail_empty_evidence(hf, tag, failed, "subdomain enumeration list returned zero jobs after enum fixture/action should have created a job");
+            return;
+        }
         log_msg(hf, tag, "PASS -- list returned %zu entries", jobs.size());
         passed.fetch_add(1);
     }
@@ -1992,11 +2923,16 @@ namespace {
     void test_tech_inventory(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "tech_inv";
         log_msg(hf, tag, "START -- tech::inventory()");
+        publish_fixture_exchange(hf, tag);
         auto inv = aida::burp::tech::inventory();
         log_msg(hf, tag, "inventory hosts = %zu", inv.size());
         for (size_t i = 0; i < inv.size() && i < 5; ++i) {
             log_msg(hf, tag, "  [%zu] host=%s techs=%zu",
                 i, inv[i].host.c_str(), inv[i].technologies.size());
+        }
+        if (inv.empty()) {
+            fail_empty_evidence(hf, tag, failed, "technology inventory is empty after fingerprint fixture/action should have stored host technology evidence");
+            return;
         }
         log_msg(hf, tag, "PASS -- inventory returned %zu hosts", inv.size());
         passed.fetch_add(1);
@@ -2115,8 +3051,13 @@ namespace {
     void test_param_miner_list_jobs(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "pm_list";
         log_msg(hf, tag, "START -- param_miner::list_jobs()");
+        ensure_param_miner_fixture(hf, tag);
         auto jobs = aida::burp::param_miner::list_jobs();
         log_msg(hf, tag, "job count = %zu", jobs.size());
+        if (jobs.empty()) {
+            fail_empty_evidence(hf, tag, failed, "param miner list returned zero jobs after param miner fixture/action should have created a job");
+            return;
+        }
         log_msg(hf, tag, "PASS -- list_jobs returned %zu entries", jobs.size());
         passed.fetch_add(1);
     }
@@ -2402,21 +3343,25 @@ namespace {
 
     void test_browser_detect_edge(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "browser_edge";
-        log_msg(hf, tag, "START -- browser::detect_edge_path()");
+        (void)failed;
+        log_msg(hf, tag, "START -- browser::detect_edge_path() non-launching legacy discovery audit");
         std::string path;
         bool found = aida::burp::browser::detect_edge_path(path);
-        log_msg(hf, tag, "found=%s path=%s", found ? "true" : "false", path.c_str());
-        log_msg(hf, tag, "PASS -- detect_edge_path completed (found=%s)", found ? "true" : "false");
+        std::string err = aida::burp::browser::last_error();
+        log_msg(hf, tag, "found=%s path=%s last_error=%s", found ? "true" : "false", path.c_str(), err.c_str());
+        log_msg(hf, tag, "PASS -- detect_edge_path completed without launch; Camoufox remains the only Test Lab browser launch backend");
         passed.fetch_add(1);
     }
 
     void test_browser_detect_chrome(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "browser_chrome";
-        log_msg(hf, tag, "START -- browser::detect_chrome_path()");
+        (void)failed;
+        log_msg(hf, tag, "START -- browser::detect_chrome_path() non-launching legacy discovery audit");
         std::string path;
         bool found = aida::burp::browser::detect_chrome_path(path);
-        log_msg(hf, tag, "found=%s path=%s", found ? "true" : "false", path.c_str());
-        log_msg(hf, tag, "PASS -- detect_chrome_path completed (found=%s)", found ? "true" : "false");
+        std::string err = aida::burp::browser::last_error();
+        log_msg(hf, tag, "found=%s path=%s last_error=%s", found ? "true" : "false", path.c_str(), err.c_str());
+        log_msg(hf, tag, "PASS -- detect_chrome_path completed without launch; Camoufox remains the only Test Lab browser launch backend");
         passed.fetch_add(1);
     }
 
@@ -2467,14 +3412,104 @@ namespace {
 
     void test_browser_list_running(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "browser_running";
-        log_msg(hf, tag, "START -- browser::list_running()");
-        auto running = aida::burp::browser::list_running();
-        log_msg(hf, tag, "running browsers = %zu", running.size());
-        for (size_t i = 0; i < running.size(); ++i) {
-            log_msg(hf, tag, "  [%zu] pid=%u proxy_port=%u",
-                i, (unsigned)running[i].pid, (unsigned)running[i].proxy_port);
+        log_msg(hf, tag, "START -- Camoufox-only bridge launch/ready/cleanup validation");
+        const uint64_t t0 = GetTickCount64();
+
+        std::string edge_path;
+        std::string chrome_path;
+        bool edge_found = aida::burp::browser::detect_edge_path(edge_path);
+        std::string edge_err = aida::burp::browser::last_error();
+        bool chrome_found = aida::burp::browser::detect_chrome_path(chrome_path);
+        std::string chrome_err = aida::burp::browser::last_error();
+        log_msg(hf, tag, "legacy_discovery edge_found=%d edge_path=%s edge_error=%s chrome_found=%d chrome_path=%s chrome_error=%s",
+            edge_found ? 1 : 0,
+            edge_path.empty() ? "<empty>" : edge_path.c_str(),
+            edge_err.empty() ? "<empty>" : edge_err.c_str(),
+            chrome_found ? 1 : 0,
+            chrome_path.empty() ? "<empty>" : chrome_path.c_str(),
+            chrome_err.empty() ? "<empty>" : chrome_err.c_str());
+
+        aida::burp::camoufox::install::status_t install_before;
+        std::string dependency_reason;
+        if (!ensure_burp_camoufox_dependencies(hf, tag, dependency_reason, &install_before)) {
+            auto bridge_before = aida::burp::camoufox::get_status();
+            log_msg(hf, tag, "dependency_fail install_state=%s message=%s python=%s module=%s browser=%s bridge_state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d reason=%s elapsed_ms=%llu",
+                camoufox_install_state_name(install_before.state),
+                install_before.last_message.empty() ? "<empty>" : install_before.last_message.c_str(),
+                install_before.python_path.empty() ? "<empty>" : install_before.python_path.c_str(),
+                install_before.module_version.empty() ? "<empty>" : install_before.module_version.c_str(),
+                install_before.browser_path.empty() ? "<empty>" : install_before.browser_path.c_str(),
+                camoufox_bridge_state_name(bridge_before.state),
+                bridge_before.child_pid,
+                bridge_before.child_alive ? 1 : 0,
+                bridge_before.browser_open ? 1 : 0,
+                bridge_before.page_verified ? 1 : 0,
+                dependency_reason.empty() ? "<empty>" : compact_burp_text(dependency_reason, 700).c_str(),
+                static_cast<unsigned long long>(GetTickCount64() - t0));
+            fail_empty_evidence(hf, tag, failed, "Camoufox bundled runtime is not ready; refusing launch to avoid Test Lab setup/download");
+            return;
         }
-        log_msg(hf, tag, "PASS -- list_running returned %zu entries", running.size());
+        auto bridge_before = aida::burp::camoufox::get_status();
+        log_msg(hf, tag, "before install_state=%s message=%s python=%s module=%s browser=%s bridge_state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d",
+            camoufox_install_state_name(install_before.state),
+            install_before.last_message.empty() ? "<empty>" : install_before.last_message.c_str(),
+            install_before.python_path.empty() ? "<empty>" : install_before.python_path.c_str(),
+            install_before.module_version.empty() ? "<empty>" : install_before.module_version.c_str(),
+            install_before.browser_path.empty() ? "<empty>" : install_before.browser_path.c_str(),
+            camoufox_bridge_state_name(bridge_before.state),
+            bridge_before.child_pid,
+            bridge_before.child_alive ? 1 : 0,
+            bridge_before.browser_open ? 1 : 0,
+            bridge_before.page_verified ? 1 : 0);
+
+        aida::burp::camoufox::launch_config_t cfg;
+        cfg.headless = false;
+        cfg.proxy = "http://127.0.0.1:18888";
+        cfg.launch_timeout_ms = 35000;
+        cfg.window_width = 1280;
+        cfg.window_height = 900;
+        bool launched = aida::burp::camoufox::start_bridge(cfg);
+        auto bridge_after = aida::burp::camoufox::get_status();
+        const bool ready = bridge_after.state == aida::burp::camoufox::bridge_state_t::ready &&
+            bridge_after.child_pid != 0 &&
+            bridge_after.child_alive &&
+            bridge_after.browser_open &&
+            bridge_after.page_verified &&
+            !bridge_after.cleanup_pending;
+        log_msg(hf, tag, "after launched=%d ready=%d bridge_state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d launched_ms=%llu last_error=%s elapsed_ms=%llu",
+            launched ? 1 : 0,
+            ready ? 1 : 0,
+            camoufox_bridge_state_name(bridge_after.state),
+            bridge_after.child_pid,
+            bridge_after.child_alive ? 1 : 0,
+            bridge_after.browser_open ? 1 : 0,
+            bridge_after.page_verified ? 1 : 0,
+            bridge_after.cleanup_pending ? 1 : 0,
+            static_cast<unsigned long long>(bridge_after.launched_ms),
+            bridge_after.last_error.empty() ? "<empty>" : bridge_after.last_error.c_str(),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        if (!launched || !ready) {
+            fail_empty_evidence(hf, tag, failed, "Camoufox browser did not launch into a ready live state; Edge/Chrome fallback is not allowed");
+            aida::burp::camoufox::close_browser();
+            return;
+        }
+
+        const bool closed = aida::burp::camoufox::close_browser();
+        auto bridge_closed = aida::burp::camoufox::get_status();
+        log_msg(hf, tag, "cleanup closed=%d bridge_state=%s child_pid=%u child_alive=%d browser_open=%d cleanup_pending=%d last_error=%s elapsed_ms=%llu",
+            closed ? 1 : 0,
+            camoufox_bridge_state_name(bridge_closed.state),
+            bridge_closed.child_pid,
+            bridge_closed.child_alive ? 1 : 0,
+            bridge_closed.browser_open ? 1 : 0,
+            bridge_closed.cleanup_pending ? 1 : 0,
+            bridge_closed.last_error.empty() ? "<empty>" : bridge_closed.last_error.c_str(),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        if (!closed) {
+            fail_empty_evidence(hf, tag, failed, "Camoufox browser launched but close_browser failed child_pid=%u", bridge_after.child_pid);
+            return;
+        }
+        log_msg(hf, tag, "PASS -- Camoufox-only browser launch produced child_pid=%u and cleanup completed", bridge_after.child_pid);
         passed.fetch_add(1);
     }
 

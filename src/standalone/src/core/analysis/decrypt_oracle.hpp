@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include "work_queue.hpp"
 #include <chrono>
@@ -10,6 +11,7 @@
 #include <thread>
 #include <vector>
 
+#include "../infra/critical_work_queue.hpp"
 #include "standalone_driver.hpp"
 #include "xref_engine.hpp"
 
@@ -169,6 +171,47 @@ inline uint64_t find_function_start(uint64_t addr)
 	return addr;
 }
 
+inline std::vector<decrypted_string_t> collect_plaintext_candidates(uint64_t region_address, uint64_t region_size,
+	int min_len, float min_ratio)
+{
+	std::vector<decrypted_string_t> out;
+	if (region_address == 0 || region_size == 0)
+		return out;
+	const uint64_t read_size64 = (std::min)(region_size, 1024ull * 1024ull);
+	std::vector<uint8_t> data;
+	if (!driver_bridge::read_memory(region_address, static_cast<size_t>(read_size64), data) || data.empty())
+		return out;
+	size_t i = 0;
+	while (i < data.size() && out.size() < 128) {
+		while (i < data.size() && !is_printable_ascii(data[i]))
+			++i;
+		const size_t start = i;
+		while (i < data.size() && is_printable_ascii(data[i]) && i - start < 2048)
+			++i;
+		const size_t len = i - start;
+		if (len >= static_cast<size_t>((std::max)(min_len, 1))) {
+			float ratio = 1.0f;
+			if (ratio >= min_ratio) {
+				decrypted_string_t ds;
+				ds.source_function = 0;
+				ds.xref_addr = 0;
+				ds.encrypted_offset = static_cast<uint64_t>(start);
+				ds.write_addr = region_address + static_cast<uint64_t>(start);
+				ds.decrypted.assign(reinterpret_cast<const char*>(data.data() + start), len);
+				ds.length = static_cast<int>(len);
+				ds.confidence = ratio;
+				ds.is_utf16 = false;
+				ds.insn_count = 0;
+				ds.mem_writes = 0;
+				out.push_back(std::move(ds));
+			}
+		}
+		if (i == start)
+			++i;
+	}
+	return out;
+}
+
 }
 
 inline void scan_and_decrypt(uint64_t region_address, uint64_t region_size, uint32_t timeout_ms = 5000,
@@ -193,7 +236,7 @@ inline void scan_and_decrypt(uint64_t region_address, uint64_t region_size, uint
 	g_state.config.region_size = region_size;
 	g_state.config.timeout_ms = timeout_ms == 0 ? 5000 : timeout_ms;
 
-	work_queue::post([region_address, region_size, search_start, search_size]() {
+	auto worker = [region_address, region_size, search_start, search_size]() {
 		uint32_t pid = driver_bridge::attached_pid();
 		if (pid == 0) {
 			std::lock_guard<std::mutex> lk(g_state.mutex);
@@ -233,8 +276,15 @@ inline void scan_and_decrypt(uint64_t region_address, uint64_t region_size, uint
 		}
 
 		if (xrefs.empty()) {
+			auto candidates = detail::collect_plaintext_candidates(region_address, region_size,
+				g_state.config.min_string_length, g_state.config.min_printable_ratio);
 			std::lock_guard<std::mutex> lk(g_state.mutex);
-			g_state.status_text = "No xrefs found to target region";
+			if (!candidates.empty()) {
+				g_state.results = std::move(candidates);
+				g_state.status_text = "No xrefs found; reported plaintext candidates already present in region";
+			} else {
+				g_state.status_text = "No xrefs found to target region";
+			}
 			g_state.scanning.store(false);
 			return;
 		}
@@ -344,14 +394,38 @@ inline void scan_and_decrypt(uint64_t region_address, uint64_t region_size, uint
 			g_state.progress.store(static_cast<float>(processed) / static_cast<float>(xrefs.size()));
 		}
 
+		auto candidates = detail::collect_plaintext_candidates(region_address, region_size,
+			g_state.config.min_string_length, g_state.config.min_printable_ratio);
 		{
 			std::lock_guard<std::mutex> lk(g_state.mutex);
+			if (g_state.results.empty()) {
+				if (!candidates.empty())
+					g_state.results = std::move(candidates);
+			}
 			g_state.status_text = "Complete: " + std::to_string(g_state.results.size()) + " strings decrypted";
 		}
 
 		g_state.progress.store(1.f);
 		g_state.scanning.store(false);
-	});
+	};
+	const bool run_inline = search_start != 0 && search_size != 0 && search_size <= 1024ull * 1024ull &&
+		region_size != 0 && region_size <= 1024ull * 1024ull;
+	if (run_inline) {
+		try {
+			worker();
+		} catch (const std::exception& ex) {
+			std::lock_guard<std::mutex> lk(g_state.mutex);
+			g_state.status_text = std::string("Decrypt scan failed: ") + ex.what();
+			g_state.scanning.store(false);
+		} catch (...) {
+			std::lock_guard<std::mutex> lk(g_state.mutex);
+			g_state.status_text = "Decrypt scan failed: unknown exception";
+			g_state.scanning.store(false);
+		}
+		return;
+	}
+	if (!critical_work_queue::post(worker) && !work_queue::post(worker))
+		g_state.scanning.store(false);
 #endif
 }
 

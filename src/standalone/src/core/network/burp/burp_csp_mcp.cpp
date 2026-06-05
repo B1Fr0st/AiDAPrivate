@@ -19,6 +19,11 @@ using mcp_standalone::tool_def_t;
 using mcp_standalone::tool_result_t;
 using nlohmann::json;
 
+tool_result_t error_with_data(const std::string& text, const json& data)
+{
+    return tool_result_t{false, text, data};
+}
+
 nlohmann::json result_to_json(const csp_result_t& r)
 {
     json j;
@@ -90,7 +95,11 @@ tool_result_t tool_analyze_url(const json& params)
     if (!audit_http::parse_url(url, scheme, host, port, path))
     {
         diag::log_tagged_fmt("mcp_burp", "csp_analyze_url invalid_url url=%s", url.c_str());
-        return tool_result_t::error("invalid_url");
+        json data;
+        data["error"] = "invalid_url";
+        data["url"] = url;
+        data["status"] = "parse_failed";
+        return error_with_data("invalid_url", data);
     }
     bool tls = (scheme == "https");
     diag::log_tagged_fmt("mcp_burp", "csp_analyze_url sending host=%s port=%d tls=%d", host.c_str(), (int)port, (int)tls);
@@ -106,7 +115,16 @@ tool_result_t tool_analyze_url(const json& params)
     {
         std::string err = audit_http::last_error();
         diag::log_tagged_fmt("mcp_burp", "csp_analyze_url send_failed err=%s", err.c_str());
-        return tool_result_t::error(std::string("send_failed: ") + err);
+        json data;
+        data["error"] = err;
+        data["url"] = url;
+        data["scheme"] = scheme;
+        data["host"] = host;
+        data["port"] = port;
+        data["path"] = path;
+        data["tls"] = tls;
+        data["status"] = "send_failed";
+        return error_with_data(std::string("send_failed: ") + err, data);
     }
     auto res = analyze_for_response(resp->resp_headers);
     diag::log_tagged_fmt("mcp_burp", "csp_analyze_url ok status=%d score=%d findings=%zu", resp->status_code, res.score, res.findings.size());

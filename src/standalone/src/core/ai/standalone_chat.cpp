@@ -3,6 +3,7 @@
 #include <intrin.h>
 
 #include "work_queue.hpp"
+#include "critical_work_queue.hpp"
 #include "theme.hpp"
 #include "mcp_standalone.hpp"
 #include "mcp_client.hpp"
@@ -39,6 +40,8 @@
 #include "file_context_tracker.hpp"
 #include "standalone_context.hpp"
 #include "skills.hpp"
+#include "../analysis/stealth_engine.hpp"
+#include "../anti-tamper/mcp_posture.hpp"
 #include "../anti-tamper/state.hpp"
 #include "../ui/components.hpp"
 #include "../ui/fonts.hpp"
@@ -1619,6 +1622,11 @@ void register_standalone_protection() {
     if (!driver_bridge::refresh_heartbeat())
         return;
 
+    if (!driver_bridge::dynamic_ioctls_ready()) {
+        diag::log_tagged_fmt("init_chat", "register_standalone_protection_deferred dynamic_ioctl_ready=0");
+        return;
+    }
+
     HMODULE exe_module = GetModuleHandleW(nullptr);
     if (!exe_module)
         return;
@@ -1874,6 +1882,22 @@ void start_authorized_mcp_services()
     if (!s_initialized)
         return;
 
+    if (!anti_tamper::mcp_posture::is_current_posture_trusted())
+    {
+        mcp_standalone::set_ide_lifecycle_ready(false);
+        static auto s_last_posture_block_log = std::chrono::steady_clock::time_point{};
+        auto now = std::chrono::steady_clock::now();
+        if (s_last_posture_block_log == std::chrono::steady_clock::time_point{} ||
+            std::chrono::duration_cast<std::chrono::seconds>(now - s_last_posture_block_log).count() >= 2)
+        {
+            diag::log_tagged_fmt("init_chat",
+                "authorized_mcp_services_blocked_mcp_posture summary_hash=0x%016llX",
+                static_cast<unsigned long long>(anti_tamper::mcp_posture::cached_summary_hash()));
+            s_last_posture_block_log = now;
+        }
+        return;
+    }
+
     std::string missing_exports;
     const bool ide_ready = s_ide_ready_for_mcp_services.load(std::memory_order_acquire);
     const bool valid = license::validated && standalone_license::is_valid();
@@ -1931,7 +1955,7 @@ void start_authorized_mcp_services()
         if (s_mcp_server.start(g_sa_settings.mcp_port))
         {
             s_server_started = true;
-            bool posted = work_queue::post([] {
+            bool posted = critical_work_queue::post([] {
                 try {
                     diag::log_tagged("init_chat", "authorized_mcp_write_client_configs_start");
                     s_mcp_server.write_client_configs();
@@ -1943,7 +1967,7 @@ void start_authorized_mcp_services()
                 }
             });
             if (!posted)
-                diag::log_tagged("init_chat", "authorized_mcp_write_client_configs_post_failed");
+                diag::log_tagged("init_chat", "authorized_mcp_write_client_configs_critical_post_failed");
         }
         diag::log_tagged_fmt("init_chat", "authorized_mcp_server_start_done started=%d", s_server_started ? 1 : 0);
     }
@@ -1983,11 +2007,8 @@ void shutdown_standalone_chat()
             s_ai_task_done_cv.wait(lk2, []() { return s_ai_task_done.load(); });
         }
     }
-    if (s_server_started)
-    {
-        s_mcp_server.stop();
-        s_server_started = false;
-    }
+    s_mcp_server.stop();
+    s_server_started = false;
     mcp_standalone::set_ide_lifecycle_ready(false);
     s_ide_ready_for_mcp_services.store(false, std::memory_order_release);
 
@@ -2012,6 +2033,7 @@ void shutdown_standalone_chat()
 
     (void)aida::session::shutdown();
     aida::events::shutdown();
+    critical_work_queue::shutdown();
     work_queue::shutdown();
 
     persist_workspace_state();
@@ -2517,10 +2539,17 @@ void do_process_attach(unsigned long pid)
 {
     diag::log_tagged_fmt("chat", "do_process_attach pid=%lu driver_loaded=%d",
         pid, static_cast<int>(driver_bridge::is_loaded()));
+    const uint32_t target_pid = static_cast<uint32_t>(pid);
+    const uint32_t previous_pid = driver_bridge::attached_pid();
+    if (previous_pid != 0 && previous_pid != target_pid)
+        stealth_engine::disable_for_detach(previous_pid, "chat.process_attach.replace");
     if (driver_bridge::attach(pid)) {
+        const bool stealth_ok = stealth_engine::ensure_default_enabled(target_pid, "chat.process_attach");
         output_log::push(bottom_tab_t::driver_log, "[driver] Attached to PID " + std::to_string(pid));
-        diag::log_tagged_fmt("chat", "do_process_attach SUCCESS pid=%lu", pid);
+        diag::log_tagged_fmt("chat", "do_process_attach SUCCESS pid=%lu stealth_ok=%d", pid, stealth_ok ? 1 : 0);
     } else {
+        if (previous_pid != 0 && driver_bridge::attached_pid() == previous_pid)
+            (void)stealth_engine::ensure_default_enabled(previous_pid, "chat.process_attach.restore_failed_switch");
         output_log::push(bottom_tab_t::driver_log, "[driver] Failed to attach to PID " + std::to_string(pid) +
                          ": " + driver_bridge::last_error());
         diag::log_tagged_fmt("chat", "do_process_attach FAILED pid=%lu error='%s'",
@@ -2532,6 +2561,7 @@ void do_process_detach()
 {
     diag::log_tagged_fmt("chat", "do_process_detach pid=%u",
         driver_bridge::attached_pid());
+    stealth_engine::disable_for_detach(driver_bridge::attached_pid(), "chat.process_detach");
     driver_bridge::detach();
     output_log::push(bottom_tab_t::driver_log, "[driver] Detached from process");
     diag::log_tagged("chat", "do_process_detach done");

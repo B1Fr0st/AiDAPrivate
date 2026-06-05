@@ -21,14 +21,47 @@
 namespace anti_tamper {
 namespace anti_vm {
 
+constexpr uint32_t kPolicyVersion = 0x20260605u;
+constexpr uint32_t kFamilyCpuid = 1u << 0;
+constexpr uint32_t kFamilyTiming = 1u << 1;
+constexpr uint32_t kFamilyFirmware = 1u << 2;
+constexpr uint32_t kFamilyDevice = 1u << 3;
+constexpr uint32_t kFamilyOsArtifact = 1u << 4;
+constexpr uint32_t kFamilyKernelHvdt = 1u << 5;
+constexpr uint32_t kContradictionHiddenHv = 1u << 0;
+constexpr uint32_t kContradictionCpuidLeaf = 1u << 1;
+constexpr uint32_t kContradictionTscQpc = 1u << 2;
+constexpr uint32_t kContradictionSyntheticHv = 1u << 3;
+constexpr uint32_t kContradictionHvInterface = 1u << 4;
+constexpr uint32_t kContradictionHvGuest = 1u << 5;
+constexpr uint32_t kContradictionKernelSideChannel = 1u << 6;
+
+inline uint32_t vm_popcount32(uint32_t v)
+{
+    uint32_t n = 0;
+    while (v)
+    {
+        v &= v - 1;
+        ++n;
+    }
+    return n;
+}
+
 struct vm_report_t
 {
     bool cpuid_hypervisor_bit = false;
     bool cpuid_vendor_vm = false;
     bool cpuid_hyperv_guest = false;
+    bool untrusted_hypervisor = false;
     bool ms_hv_approved = false;
     bool hvci_enabled = false;
     bool vbs_enabled = false;
+    bool hidden_hypervisor_suspected = false;
+    bool cpuid_leaf_inconsistent = false;
+    bool tsc_qpc_unstable = false;
+    bool synthetic_hv_behavior = false;
+    bool hypervisor_hijack_contradiction = false;
+    bool kernel_hv_quarantine_deny = false;
     bool registry_vm_services = false;
     bool registry_vm_services_present = false;
     bool registry_vm_services_active = false;
@@ -72,12 +105,19 @@ struct vm_report_t
     uint8_t kernel_ms_hv_root = 0;
     uint8_t kernel_hard_count = 0;
     uint8_t kernel_soft_count = 0;
+    uint32_t signal_family_mask = 0;
+    uint32_t medium_family_mask = 0;
+    uint32_t contradiction_mask = 0;
+    uint32_t hard_signal_total = 0;
+    uint32_t medium_signal_total = 0;
+    uint32_t medium_family_total = 0;
     std::string vendor_name;
     std::string summary;
 
     int hard_signal_count() const
     {
-        return (cpuid_vendor_vm ? 1 : 0)
+        return (untrusted_hypervisor ? 1 : 0)
+             + (cpuid_vendor_vm ? 1 : 0)
              + (cpuid_hyperv_guest ? 1 : 0)
              + (firmware_vm_string ? 1 : 0)
              + (kernel_zero_fp_vm ? 1 : 0)
@@ -85,7 +125,8 @@ struct vm_report_t
              + (disk_vm_hardware ? 1 : 0)
              + (acpi_vm_oem ? 1 : 0)
              + (hyperv_interface_mismatch ? 1 : 0)
-             + (edid_vm_manufacturer ? 1 : 0);
+             + (edid_vm_manufacturer ? 1 : 0)
+             + (hypervisor_hijack_contradiction && !hyperv_interface_mismatch ? 1 : 0);
     }
 
     bool any_zero_fp_signal() const
@@ -107,18 +148,40 @@ struct vm_report_t
         return low_fp_count() > 0;
     }
 
+    uint32_t independent_medium_family_count() const
+    {
+        return vm_popcount32(medium_family_mask);
+    }
+
     bool any_detected() const
     {
+        if (kernel_hv_trust_failure())
+            return true;
+        if (kernel_hv_quarantine_deny)
+            return true;
         if (any_zero_fp_signal())
             return true;
-        if (cpuid_hypervisor_bit && !ms_hv_approved && low_fp_count() >= 2)
+        if (hypervisor_hijack_contradiction)
             return true;
-        return low_fp_count() >= 3;
+        return independent_medium_family_count() >= 2;
     }
 
     bool kernel_hv_trust_failure() const
     {
         return kernel_hv_untrusted;
+    }
+
+    const char* action_name() const
+    {
+        if (kernel_hv_trust_failure())
+            return "fail_closed";
+        if (any_zero_fp_signal() || hypervisor_hijack_contradiction)
+            return "block";
+        if (kernel_hv_quarantine_deny)
+            return "quarantine";
+        if (independent_medium_family_count() >= 2)
+            return "block";
+        return "allow";
     }
 };
 
@@ -1556,6 +1619,124 @@ inline bool synthetic_vm_trip_active()
     return buf[0] == '1';
 }
 
+inline bool vm_report_has_vm_artifact(const vm_report_t& report)
+{
+    return report.registry_vm_services_active
+        || report.registry_vm_hardware
+        || report.vm_mac_prefix_active
+        || report.firmware_vm_string
+        || report.disk_vm_hardware
+        || report.acpi_vm_oem
+        || report.acpi_waet_table
+        || report.edid_vm_manufacturer
+        || report.kernel_zero_fp_vm
+        || report.kernel_low_fp_vm
+        || report.kernel_registry_vm
+        || report.kernel_mac_vm
+        || report.kernel_pci_vm;
+}
+
+inline bool vm_report_user_suspicion_above_threshold(const vm_report_t& report)
+{
+    if (report.any_zero_fp_signal())
+        return true;
+    if (report.hypervisor_hijack_contradiction)
+        return true;
+    if (report.untrusted_hypervisor)
+        return true;
+    if (report.independent_medium_family_count() >= 2)
+        return true;
+    return report.hidden_hypervisor_suspected && vm_report_has_vm_artifact(report);
+}
+
+inline void finalize_signal_policy(vm_report_t& report)
+{
+    report.untrusted_hypervisor = report.cpuid_hypervisor_bit
+        && !report.ms_hv_approved
+        && !report.cpuid_vendor_vm
+        && !report.cpuid_hyperv_guest;
+
+    report.signal_family_mask = 0;
+    report.medium_family_mask = 0;
+    report.contradiction_mask = 0;
+
+    if (report.cpuid_hypervisor_bit || report.cpuid_vendor_vm || report.cpuid_hyperv_guest ||
+        report.untrusted_hypervisor || report.hyperv_interface_mismatch ||
+        report.cpuid_leaf_inconsistent || report.synthetic_hv_behavior)
+    {
+        report.signal_family_mask |= kFamilyCpuid;
+    }
+    if (report.hidden_hypervisor_suspected || report.tsc_qpc_unstable || report.kernel_hv_failed_majority)
+        report.signal_family_mask |= kFamilyTiming;
+    if (report.firmware_vm_string || report.acpi_vm_oem || report.acpi_waet_table || report.edid_vm_manufacturer)
+        report.signal_family_mask |= kFamilyFirmware;
+    if (report.registry_vm_hardware || report.vm_mac_prefix || report.disk_vm_hardware ||
+        report.kernel_pci_vm || report.kernel_mac_vm || report.kernel_registry_vm)
+    {
+        report.signal_family_mask |= kFamilyDevice;
+    }
+    if (report.registry_vm_services_present)
+        report.signal_family_mask |= kFamilyOsArtifact;
+    if (report.kernel_query_ok || report.kernel_hv_deferred || report.kernel_hv_trust_failure() ||
+        report.kernel_zero_fp_vm || report.kernel_low_fp_vm)
+    {
+        report.signal_family_mask |= kFamilyKernelHvdt;
+    }
+
+    if (report.tsc_qpc_unstable || report.hidden_hypervisor_suspected)
+        report.medium_family_mask |= kFamilyTiming;
+    if (report.registry_vm_hardware || report.vm_mac_prefix_active)
+        report.medium_family_mask |= kFamilyDevice;
+    if (report.registry_vm_services_active)
+        report.medium_family_mask |= kFamilyOsArtifact;
+    if (report.kernel_low_fp_vm)
+        report.medium_family_mask |= kFamilyKernelHvdt;
+    if (report.acpi_waet_table && !report.ms_hv_approved)
+        report.medium_family_mask |= kFamilyFirmware;
+
+    if (report.hidden_hypervisor_suspected)
+        report.contradiction_mask |= kContradictionHiddenHv;
+    if (report.cpuid_leaf_inconsistent)
+        report.contradiction_mask |= kContradictionCpuidLeaf;
+    if (report.tsc_qpc_unstable)
+        report.contradiction_mask |= kContradictionTscQpc;
+    if (report.synthetic_hv_behavior && !report.cpuid_hypervisor_bit)
+        report.contradiction_mask |= kContradictionSyntheticHv;
+    if (report.hyperv_interface_mismatch)
+        report.contradiction_mask |= kContradictionHvInterface;
+    if (report.cpuid_hyperv_guest)
+        report.contradiction_mask |= kContradictionHvGuest;
+    if (report.kernel_hv_failed_majority)
+        report.contradiction_mask |= kContradictionKernelSideChannel;
+
+    const bool hidden_with_artifact = report.hidden_hypervisor_suspected && vm_report_has_vm_artifact(report);
+    const bool synthetic_without_windows_security = report.synthetic_hv_behavior
+        && !report.cpuid_hypervisor_bit
+        && !report.hvci_enabled
+        && !report.vbs_enabled;
+    report.hypervisor_hijack_contradiction =
+        report.hyperv_interface_mismatch ||
+        hidden_with_artifact ||
+        (report.cpuid_leaf_inconsistent && synthetic_without_windows_security);
+
+    if (report.hypervisor_hijack_contradiction)
+        report.contradiction_mask |= kContradictionHiddenHv;
+
+    report.medium_family_total = report.independent_medium_family_count();
+    report.medium_signal_total = static_cast<uint32_t>(report.low_fp_count())
+        + (report.tsc_qpc_unstable ? 1u : 0u)
+        + (report.hidden_hypervisor_suspected ? 1u : 0u);
+
+    const bool kernel_deferred_problem = report.kernel_hv_deferred &&
+        (report.kernel_hv_marker_io_failed || report.kernel_hv_heartbeat_failed ||
+         report.kernel_hv_query_failed || report.kernel_hv_previous_incomplete ||
+         report.kernel_hv_suppressed_previous_incomplete);
+    if (kernel_deferred_problem && vm_report_user_suspicion_above_threshold(report))
+        report.kernel_hv_quarantine_deny = true;
+
+    report.hard_signal_total = static_cast<uint32_t>(report.hard_signal_count());
+}
+
 inline vm_report_t full_scan()
 {
     const uint64_t scan_started = vm_tick_ms();
@@ -1591,15 +1772,27 @@ inline vm_report_t full_scan()
     report.ms_hv_approved = ms_hv_approved;
     report.hvci_enabled = hv_preflight::g_hvci_enabled;
     report.vbs_enabled = hv_preflight::g_vbs_enabled;
+    report.hidden_hypervisor_suspected = hv_preflight::g_hidden_hypervisor_suspected;
+    report.cpuid_leaf_inconsistent = hv_preflight::g_cpuid_leaf_inconsistent;
+    report.tsc_qpc_unstable = hv_preflight::g_tsc_qpc_unstable;
+    report.synthetic_hv_behavior = hv_preflight::g_synthetic_hv_behavior;
+    report.hyperv_interface_mismatch = hv_preflight::g_hv_interface_signature_mismatch;
+    report.cpuid_hyperv_guest = hv_preflight::g_hyperv_guest_partition;
     if (ms_hv_approved) {
         report.summary = "ms_hv_approved_by_preflight ";
     }
 
     webhook::write_log_critical_fmt("anti_vm",
-        "full_scan_preflight ms_hv=%d hvci=%d vbs=%d elapsed_ms=%llu",
+        "full_scan_preflight ms_hv=%d hvci=%d vbs=%d hidden_hv=%d cpuid_leaf=%d tsc_qpc=%d synthetic=%d hv_iface=%d hv_guest=%d elapsed_ms=%llu",
         report.ms_hv_approved ? 1 : 0,
         report.hvci_enabled ? 1 : 0,
         report.vbs_enabled ? 1 : 0,
+        report.hidden_hypervisor_suspected ? 1 : 0,
+        report.cpuid_leaf_inconsistent ? 1 : 0,
+        report.tsc_qpc_unstable ? 1 : 0,
+        report.synthetic_hv_behavior ? 1 : 0,
+        report.hyperv_interface_mismatch ? 1 : 0,
+        report.cpuid_hyperv_guest ? 1 : 0,
         static_cast<unsigned long long>(vm_tick_ms() - scan_started));
 
     uint64_t step_started = step_pre("cpuid_hypervisor_bit");
@@ -1619,14 +1812,14 @@ inline vm_report_t full_scan()
         static_cast<unsigned long long>(vm_tick_ms() - scan_started));
 
     step_started = step_pre("hyperv_guest_partition");
-    report.cpuid_hyperv_guest = is_microsoft_hyperv_guest_partition();
+    report.cpuid_hyperv_guest = report.cpuid_hyperv_guest || is_microsoft_hyperv_guest_partition();
     if (report.cpuid_hyperv_guest && report.vendor_name.empty()) {
         report.vendor_name = "HyperV-Guest";
     }
     step_post("hyperv_guest_partition", step_started, report.cpuid_hyperv_guest ? 1 : 0);
 
     step_started = step_pre("hyperv_interface_mismatch");
-    report.hyperv_interface_mismatch = check_hyperv_interface_mismatch();
+    report.hyperv_interface_mismatch = report.hyperv_interface_mismatch || check_hyperv_interface_mismatch();
     step_post("hyperv_interface_mismatch", step_started, report.hyperv_interface_mismatch ? 1 : 0);
 
     {
@@ -1963,10 +2156,17 @@ inline vm_report_t full_scan()
     }
     step_post("synthetic_vm_trip", step_started, report.firmware_vm_string ? 1 : 0);
 
+    finalize_signal_policy(report);
+
     if (report.cpuid_hypervisor_bit) report.summary += "cpuid_hv ";
+    if (report.untrusted_hypervisor) report.summary += "untrusted_hv ";
     if (report.cpuid_vendor_vm) report.summary += "vendor:" + report.vendor_name + " ";
     if (report.cpuid_hyperv_guest) report.summary += "hyperv_guest ";
     if (report.hyperv_interface_mismatch) report.summary += "hv_iface_mismatch ";
+    if (report.hidden_hypervisor_suspected) report.summary += "hidden_hv_suspected ";
+    if (report.cpuid_leaf_inconsistent) report.summary += "cpuid_leaf_inconsistent ";
+    if (report.tsc_qpc_unstable) report.summary += "tsc_qpc_unstable ";
+    if (report.synthetic_hv_behavior) report.summary += "synthetic_hv_behavior ";
     if (report.hvci_enabled) report.summary += "hvci_allowed ";
     if (report.vbs_enabled) report.summary += "vbs_allowed ";
     if (report.registry_vm_services_present) {
@@ -2012,13 +2212,20 @@ inline vm_report_t full_scan()
         report.summary += std::to_string(report.kernel_total_run);
         report.summary += ") ";
     }
+    if (report.kernel_hv_quarantine_deny) report.summary += "kernel_hv_quarantine ";
     {
-        char decision[512];
+        char decision[1024];
         _snprintf_s(decision, sizeof(decision), _TRUNCATE,
-            "vm_detect_decision action=%s hard=%d low=%d reg_present=%u reg_active=%u reg_disabled=%u mac_candidate=%u mac_active=%u kernel_ok=%d kernel_trust_failure=%d kernel_deferred=%d kernel_err=%lu kernel_hard=%u kernel_soft=%u kernel_hv_failed=%u/%u ms_hv=%d hvci=%d vbs=%d summary_hash=0x%016llX",
-            report.kernel_hv_trust_failure() ? "fail_closed" : (report.any_detected() ? "block" : "allow"),
-            report.hard_signal_count(),
+            "vm_detect_decision version=0x%08X action=%s hard=%u low=%d medium_signals=%u medium_families=%u family_mask=0x%08X medium_mask=0x%08X contradiction_mask=0x%08X reg_present=%u reg_active=%u reg_disabled=%u mac_candidate=%u mac_active=%u kernel_ok=%d kernel_trust_failure=%d kernel_deferred=%d kernel_marker_io=%d kernel_heartbeat=%d kernel_query=%d kernel_previous=%d kernel_err=%lu kernel_hard=%u kernel_soft=%u kernel_hv_failed=%u/%u ms_hv=%d hvci=%d vbs=%d summary_hash=0x%016llX",
+            kPolicyVersion,
+            report.action_name(),
+            report.hard_signal_total,
             report.low_fp_count(),
+            report.medium_signal_total,
+            report.medium_family_total,
+            report.signal_family_mask,
+            report.medium_family_mask,
+            report.contradiction_mask,
             report.registry_vm_service_present_count,
             report.registry_vm_service_active_count,
             report.registry_vm_service_disabled_count,
@@ -2027,6 +2234,10 @@ inline vm_report_t full_scan()
             report.kernel_query_ok ? 1 : 0,
             report.kernel_hv_trust_failure() ? 1 : 0,
             report.kernel_hv_deferred ? 1 : 0,
+            report.kernel_hv_marker_io_failed ? 1 : 0,
+            report.kernel_hv_heartbeat_failed ? 1 : 0,
+            report.kernel_hv_query_failed ? 1 : 0,
+            report.kernel_hv_previous_incomplete ? 1 : 0,
             static_cast<unsigned long>(report.kernel_hv_error),
             static_cast<unsigned>(report.kernel_hard_count),
             static_cast<unsigned>(report.kernel_soft_count),
@@ -2040,13 +2251,21 @@ inline vm_report_t full_scan()
     }
 
     webhook::write_log_critical_fmt("anti_vm",
-        "full_scan_exit action=%s hard=%d low=%d kernel_trust_failure=%d kernel_deferred=%d kernel_err=%lu summary_hash=0x%016llX elapsed_ms=%llu",
-        report.kernel_hv_trust_failure() ? "fail_closed" : (report.any_detected() ? "block" : "allow"),
-        report.hard_signal_count(),
+        "full_scan_exit version=0x%08X action=%s hard=%u low=%d medium_families=%u family_mask=0x%08X contradiction_mask=0x%08X kernel_trust_failure=%d kernel_deferred=%d kernel_quarantine=%d kernel_err=%lu ms_hv=%d hvci=%d vbs=%d summary_hash=0x%016llX elapsed_ms=%llu",
+        kPolicyVersion,
+        report.action_name(),
+        report.hard_signal_total,
         report.low_fp_count(),
+        report.medium_family_total,
+        report.signal_family_mask,
+        report.contradiction_mask,
         report.kernel_hv_trust_failure() ? 1 : 0,
         report.kernel_hv_deferred ? 1 : 0,
+        report.kernel_hv_quarantine_deny ? 1 : 0,
         static_cast<unsigned long>(report.kernel_hv_error),
+        report.ms_hv_approved ? 1 : 0,
+        report.hvci_enabled ? 1 : 0,
+        report.vbs_enabled ? 1 : 0,
         static_cast<unsigned long long>(vm_fnv1a_bytes(report.summary.data(), report.summary.size())),
         static_cast<unsigned long long>(vm_tick_ms() - scan_started));
 

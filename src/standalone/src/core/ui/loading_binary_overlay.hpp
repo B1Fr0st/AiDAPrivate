@@ -32,6 +32,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -156,6 +157,7 @@ inline void worker_load(std::string path, completion_action_t action)
 	state_t& s = state();
 
 	const uint64_t t_total_start = monotonic_ms_now();
+	try {
 
 	diag::log_tagged_fmt("pe_load",
 		"phase=worker_load_start path=%s action=%u",
@@ -263,6 +265,7 @@ inline void worker_load(std::string path, completion_action_t action)
 	}
 
 	{
+		emit_phase_log("event_binary_loaded_publish_begin", monotonic_ms_now() - t_total_start, "");
 		aida::events::binary_loaded_t payload;
 		payload.binary_path = path;
 		payload.image_base = g_disasm.file.image_base;
@@ -272,11 +275,14 @@ inline void worker_load(std::string path, completion_action_t action)
 		}
 		payload.image_size = (total > 0xFFFFFFFFull) ? 0xFFFFFFFFu : static_cast<uint32_t>(total);
 		aida::events::publish(aida::events::event_binary_loaded, payload);
+		emit_phase_log("event_binary_loaded_publish_end", monotonic_ms_now() - t_total_start, "");
 	}
 
+	emit_phase_log("worker_load_store_success_begin", monotonic_ms_now() - t_total_start, "");
 	s.load_succeeded.store(true, std::memory_order_release);
 	s.completion_action.store(static_cast<unsigned int>(action), std::memory_order_release);
 	s.worker_finished.store(true, std::memory_order_release);
+	emit_phase_log("worker_load_finished_flag_set", monotonic_ms_now() - t_total_start, "");
 
 	{
 		char extra[160];
@@ -286,6 +292,30 @@ inline void worker_load(std::string path, completion_action_t action)
 			g_disasm.file.sections.size(),
 			live_path ? 1 : 0);
 		emit_phase_log("worker_load_complete", monotonic_ms_now() - t_total_start, extra);
+	}
+	} catch (const std::exception& ex) {
+		char extra[512];
+		std::snprintf(extra, sizeof(extra),
+			"path=%s action=%u what=%.360s",
+			path.c_str(),
+			static_cast<unsigned int>(action),
+			ex.what());
+		emit_phase_log("worker_load_exception", monotonic_ms_now() - t_total_start, extra);
+		s.load_succeeded.store(false, std::memory_order_release);
+		s.completion_action.store(static_cast<unsigned int>(completion_action_t::none), std::memory_order_release);
+		s.worker_finished.store(true, std::memory_order_release);
+		emit_phase_log("worker_load_exception_finished_flag_set", monotonic_ms_now() - t_total_start, "");
+	} catch (...) {
+		char extra[256];
+		std::snprintf(extra, sizeof(extra),
+			"path=%s action=%u what=unknown",
+			path.c_str(),
+			static_cast<unsigned int>(action));
+		emit_phase_log("worker_load_exception", monotonic_ms_now() - t_total_start, extra);
+		s.load_succeeded.store(false, std::memory_order_release);
+		s.completion_action.store(static_cast<unsigned int>(completion_action_t::none), std::memory_order_release);
+		s.worker_finished.store(true, std::memory_order_release);
+		emit_phase_log("worker_load_exception_finished_flag_set", monotonic_ms_now() - t_total_start, "");
 	}
 }
 
@@ -543,7 +573,17 @@ inline void poll_completion()
 				static_cast<int>(globals::ui::active_center_view));
 			return;
 		}
+		diag::log_tagged_fmt("loading_binary_overlay",
+			"poll_completion ia_schedule_begin static_pe_active=%d active_center_view=%d action=%u",
+			function_index::detail::static_pe_active() ? 1 : 0,
+			static_cast<int>(globals::ui::active_center_view),
+			act);
 		initial_analysis::run_initial_analysis_for_loaded_file();
+		diag::log_tagged_fmt("loading_binary_overlay",
+			"poll_completion ia_schedule_end running=%d finished=%d active_step=%d",
+			initial_analysis::g_state.running.load(std::memory_order_acquire) ? 1 : 0,
+			initial_analysis::g_state.finished.load(std::memory_order_acquire) ? 1 : 0,
+			initial_analysis::g_state.active_step_index.load(std::memory_order_acquire));
 		if (!initial_analysis::g_state.running.load(std::memory_order_acquire) &&
 		    !initial_analysis::g_state.finished.load(std::memory_order_acquire)) {
 			s.completion_applied.store(true, std::memory_order_release);

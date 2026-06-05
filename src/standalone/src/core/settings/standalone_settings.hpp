@@ -516,8 +516,6 @@ struct settings_sa_t
     bool        symbol_auto_download = false;
     std::string symbol_server_url = "https://msdl.microsoft.com/download/symbols";
 
-    std::string ida_pro_path;
-
     static std::filesystem::path config_path()
     {
         wchar_t* appdata = nullptr;
@@ -527,17 +525,6 @@ struct settings_sa_t
             return path;
         }
         return std::filesystem::current_path() / "aida_standalone_settings.json";
-    }
-
-    static std::filesystem::path legacy_config_path()
-    {
-        wchar_t* appdata = nullptr;
-        if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appdata))) {
-            auto path = std::filesystem::path(appdata) / L"Hex-Rays" / L"IDA Pro" / L"ai_assistant.cfg";
-            CoTaskMemFree(appdata);
-            return path;
-        }
-        return {};
     }
 
     static const std::vector<std::string>& provider_kinds()
@@ -1266,17 +1253,11 @@ struct settings_sa_t
 
         nlohmann::json root;
         auto source = config_path();
-        bool imported_legacy = false;
 
         if (!sa_settings_detail::read_json_file(source, root)) {
-            const auto legacy = legacy_config_path();
-            if (!legacy.empty() && sa_settings_detail::read_json_file(legacy, root)) {
-                imported_legacy = true;
-            } else {
-                ensure_default_profiles();
-                sa_settings_detail::last_error_ref() = "no settings file present; using defaults";
-                return false;
-            }
+            ensure_default_profiles();
+            sa_settings_detail::last_error_ref() = "no settings file present; using defaults";
+            return false;
         }
 
         auto str = [&](const char* key, std::string& dst) {
@@ -1326,8 +1307,6 @@ struct settings_sa_t
         str("symbol_cache_dir", symbol_cache_dir);
         boolean("symbol_auto_download", symbol_auto_download);
         str("symbol_server_url", symbol_server_url);
-        str("ida_pro_path", ida_pro_path);
-
         if (root.contains("temperature") && root["temperature"].is_number())
             temperature = root["temperature"].get<double>();
         integer("mcp_port", mcp_port);
@@ -1559,8 +1538,6 @@ struct settings_sa_t
         migrate_legacy_fields_into_profiles();
         sync_legacy_fields_from_active_profile();
 
-        if (imported_legacy)
-            save();
         return true;
     }
 
@@ -1613,8 +1590,6 @@ struct settings_sa_t
         root["symbol_cache_dir"] = symbol_cache_dir;
         root["symbol_auto_download"] = symbol_auto_download;
         root["symbol_server_url"] = symbol_server_url;
-        root["ida_pro_path"] = ida_pro_path;
-
         root["temperature"] = temperature;
         root["mcp_port"] = mcp_port;
         root["mcp_enabled"] = mcp_enabled;

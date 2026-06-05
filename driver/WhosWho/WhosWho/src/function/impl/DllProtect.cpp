@@ -15,6 +15,9 @@ namespace dll_protection {
     static constexpr UINT32 BASELINE_PREFIX_MAX = 64;
     static constexpr UINT32 DPRT_POLICY_HARD_BUGCHECK = 0x00000001u;
     static constexpr UINT32 DPRT_MISMATCH_UNKNOWN = 0xFFFFFFFFu;
+    static constexpr UINT64 DTB_ADDRESS_MASK = 0x000FFFFFFFFFF000ULL;
+    static constexpr UINT64 DTB_MAX_PFN = 0x1000000ULL;
+    static constexpr UINT32 EPROCESS_DIRECTORY_TABLE_BASE_OFFSET = 0x28;
 
     struct protection_entry_t {
         volatile LONG active;
@@ -30,6 +33,7 @@ namespace dll_protection {
         UINT64 check_count;
         UINT32 baseline_prefix_size;
         UINT32 policy_flags;
+        UINT32 owner_pid;
         UINT8 baseline_prefix[BASELINE_PREFIX_MAX];
     };
 
@@ -66,11 +70,119 @@ namespace dll_protection {
     {
         if (pid == 0)
             return 0;
-        for (int i = 0; i < DTB_CACHE_SIZE; i++) {
-            if (g_dtb_cache[i].valid && g_dtb_cache[i].pid == pid)
-                return g_dtb_cache[i].dtb;
-        }
+        UINT64 cached = 0;
+        if (LookupDTBCache(pid, &cached))
+            return cached;
         return 0;
+    }
+
+    static BOOLEAN is_valid_dtb_value(UINT64 dtb)
+    {
+        UINT64 masked = dtb & DTB_ADDRESS_MASK;
+        UINT64 pfn = (masked >> 12) & 0xFFFFFFFFFULL;
+        if (masked == 0 || pfn == 0)
+            return FALSE;
+        if (pfn > DTB_MAX_PFN)
+            return FALSE;
+        return TRUE;
+    }
+
+    static UINT64 resolve_dtb_for_pid(UINT32 pid, const char* tag, BOOLEAN force_refresh = FALSE)
+    {
+        if (pid == 0)
+            return 0;
+
+        if (!force_refresh) {
+            UINT64 cached = cached_dtb_for_pid(pid);
+            if (is_valid_dtb_value(cached))
+                return cached;
+        }
+
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+            WW_LOG("[DLL-PROTECT] dtb_resolve_defer_irql tag=%s pid=%u irql=%lu",
+                tag ? tag : "unknown",
+                pid,
+                KeGetCurrentIrql());
+            return 0;
+        }
+
+        PEPROCESS process = nullptr;
+        NTSTATUS st = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &process);
+        if (!NT_SUCCESS(st) || !process) {
+            WW_LOG("[DLL-PROTECT] dtb_resolve_lookup_failed tag=%s pid=%u status=0x%08X",
+                tag ? tag : "unknown",
+                pid,
+                st);
+            return 0;
+        }
+
+        UINT64 dir_base = 0;
+        __try {
+            dir_base = *reinterpret_cast<UINT64*>(reinterpret_cast<UCHAR*>(process) + EPROCESS_DIRECTORY_TABLE_BASE_OFFSET);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            ObDereferenceObject(process);
+            WW_LOG("[DLL-PROTECT] dtb_resolve_exception tag=%s pid=%u code=0x%08X",
+                tag ? tag : "unknown",
+                pid,
+                GetExceptionCode());
+            return 0;
+        }
+
+        ObDereferenceObject(process);
+
+        UINT64 dtb = dir_base & DTB_ADDRESS_MASK;
+        if (!is_valid_dtb_value(dtb)) {
+            WW_LOG("[DLL-PROTECT] dtb_resolve_invalid tag=%s pid=%u dir_base=0x%llX masked=0x%llX",
+                tag ? tag : "unknown",
+                pid,
+                dir_base,
+                dtb);
+            return 0;
+        }
+
+        InsertDTBCache(pid, dtb);
+        WW_LOG("[DLL-PROTECT] dtb_resolve_ok tag=%s pid=%u dtb=0x%llX forced=%u",
+            tag ? tag : "unknown",
+            pid,
+            dtb,
+            force_refresh ? 1u : 0u);
+        return dtb;
+    }
+
+    static UINT64 translate_virtual_with_dtb_retry(UINT32 pid, UINT64 va, UINT64* inout_dtb, const char* tag)
+    {
+        if (pid == 0 || va == 0 || !inout_dtb || *inout_dtb == 0)
+            return 0;
+
+        UINT64 phys = strong::translate_virtual_address(*inout_dtb, va);
+        if (phys != 0)
+            return phys;
+
+        UINT64 stale_dtb = *inout_dtb;
+        InvalidateDTBCache(pid);
+        UINT64 refreshed = resolve_dtb_for_pid(pid, tag, TRUE);
+        if (refreshed == 0) {
+            *inout_dtb = 0;
+            WW_LOG("[DLL-PROTECT] translate_retry_no_dtb tag=%s pid=%u va=0x%llX stale_dtb=0x%llX",
+                tag ? tag : "unknown",
+                pid,
+                va,
+                stale_dtb);
+            return 0;
+        }
+
+        *inout_dtb = refreshed;
+        phys = strong::translate_virtual_address(refreshed, va);
+        if (phys == 0) {
+            WW_LOG("[DLL-PROTECT] translate_failed tag=%s pid=%u va=0x%llX stale_dtb=0x%llX refreshed_dtb=0x%llX",
+                tag ? tag : "unknown",
+                pid,
+                va,
+                stale_dtb,
+                refreshed);
+        }
+        return phys;
     }
 
     static BOOLEAN slot_hard_bugcheck_enabled(const protection_entry_t& slot)
@@ -90,7 +202,7 @@ namespace dll_protection {
         if (pid == 0 || va == 0 || !out || size == 0)
             return STATUS_INVALID_PARAMETER;
 
-        UINT64 dtb = cached_dtb_for_pid(pid);
+        UINT64 dtb = resolve_dtb_for_pid(pid, "read");
         if (dtb == 0)
             return STATUS_NOT_FOUND;
 
@@ -104,7 +216,7 @@ namespace dll_protection {
             if (to_read > remaining)
                 to_read = remaining;
 
-            UINT64 phys = strong::translate_virtual_address(dtb, cursor);
+            UINT64 phys = translate_virtual_with_dtb_retry(pid, cursor, &dtb, "read");
             if (phys == 0) {
                 if (bytes_read)
                     *bytes_read = total;
@@ -197,6 +309,7 @@ namespace dll_protection {
         slot.check_count = 0;
         slot.baseline_prefix_size = 0;
         slot.policy_flags = 0;
+        slot.owner_pid = 0;
         RtlZeroMemory(slot.baseline_prefix, sizeof(slot.baseline_prefix));
     }
 
@@ -306,10 +419,11 @@ namespace dll_protection {
         UINT64 interrupt_time = KeQueryInterruptTime();
         KPROCESSOR_MODE previous_mode = ExGetPreviousMode();
         const char* policy = policy_override ? policy_override : slot_policy_name(slot);
-        WW_LOG("[DLL-PROTECT] %s idx=%d pid=%u image=%.15s prev_active=%ld active=%ld prev_status=%u status=%u policy=%s module=0x%llX text=0x%llX size=0x%X expected=0x%llX current=0x%llX observed=0x%llX mismatch=0x%X prefix=%u interval=%u checks=%llu last_tsc=%llu system_time=%lld interrupt_time=%llu dtb=0x%llX irql=%lu mode=%u current_pid=0x%llX tid=0x%llX slots=%u running=%ld queued=%ld work=%ld",
+        WW_LOG("[DLL-PROTECT] %s idx=%d pid=%u owner_pid=%u image=%.15s prev_active=%ld active=%ld prev_status=%u status=%u policy=%s module=0x%llX text=0x%llX size=0x%X expected=0x%llX current=0x%llX observed=0x%llX mismatch=0x%X prefix=%u interval=%u checks=%llu last_tsc=%llu system_time=%lld interrupt_time=%llu dtb=0x%llX irql=%lu mode=%u current_pid=0x%llX tid=0x%llX slots=%u running=%ld queued=%ld work=%ld",
             tag ? tag : "slot",
             idx,
             slot.pid,
+            slot.owner_pid,
             image,
             previous_active,
             _InterlockedCompareExchange(&slot.active, 1, 1),
@@ -381,13 +495,7 @@ namespace dll_protection {
         if (pid == 0 || va == 0 || size == 0)
             return 0;
 
-        UINT64 dtb = 0;
-        for (int i = 0; i < DTB_CACHE_SIZE; i++) {
-            if (g_dtb_cache[i].valid && g_dtb_cache[i].pid == pid) {
-                dtb = g_dtb_cache[i].dtb;
-                break;
-            }
-        }
+        UINT64 dtb = resolve_dtb_for_pid(pid, "hash");
         if (dtb == 0)
             return 0;
 
@@ -404,7 +512,7 @@ namespace dll_protection {
             if (to_read > remaining)
                 to_read = remaining;
 
-            UINT64 phys = strong::translate_virtual_address(dtb, cursor);
+            UINT64 phys = translate_virtual_with_dtb_retry(pid, cursor, &dtb, "hash");
             if (phys == 0)
                 return 0;
 
@@ -437,13 +545,7 @@ namespace dll_protection {
         if (pid == 0)
             return FALSE;
 
-        UINT64 dtb = 0;
-        for (int i = 0; i < DTB_CACHE_SIZE; i++) {
-            if (g_dtb_cache[i].valid && g_dtb_cache[i].pid == pid) {
-                dtb = g_dtb_cache[i].dtb;
-                break;
-            }
-        }
+        UINT64 dtb = resolve_dtb_for_pid(pid, "peb");
         if (dtb == 0)
             return FALSE;
 
@@ -463,7 +565,7 @@ namespace dll_protection {
         UINT32 nt_global_flag = 0;
 
         auto read_byte_physical = [&](UINT64 va) -> UINT8 {
-            UINT64 phys = strong::translate_virtual_address(dtb, va);
+            UINT64 phys = translate_virtual_with_dtb_retry(pid, va, &dtb, "peb");
             if (phys == 0)
                 return 0;
             UINT8 val = 0;
@@ -698,6 +800,146 @@ namespace dll_protection {
 
     static void start_or_restart_timer();
 
+    static UINT32 pid_from_handle(HANDLE pid)
+    {
+        return static_cast<UINT32>(reinterpret_cast<ULONG_PTR>(pid));
+    }
+
+    static UINT32 current_owner_pid()
+    {
+        HANDLE registered = caller_validation::g_registered_client_pid;
+        if (registered)
+            return pid_from_handle(registered);
+        return 0;
+    }
+
+    static BOOLEAN slot_owner_authenticated(const protection_entry_t& slot)
+    {
+        UINT32 owner_pid = slot.owner_pid != 0 ? slot.owner_pid : slot.pid;
+        if (owner_pid == 0)
+            return FALSE;
+
+        if (_InterlockedCompareExchange(&caller_validation::g_validation_enabled, 0, 0) == 0)
+            return FALSE;
+
+        HANDLE registered = caller_validation::g_registered_client_pid;
+        if (!registered)
+            return FALSE;
+
+        return pid_from_handle(registered) == owner_pid;
+    }
+
+    static BOOLEAN lock_slot_owner_for_hard_bugcheck(const protection_entry_t& slot)
+    {
+        UINT32 owner_pid = slot.owner_pid != 0 ? slot.owner_pid : slot.pid;
+        if (owner_pid == 0)
+            return FALSE;
+
+        caller_validation::acquire_lock();
+        BOOLEAN ok = FALSE;
+        if (_InterlockedCompareExchange(&caller_validation::g_validation_enabled, 0, 0) != 0) {
+            HANDLE registered = caller_validation::g_registered_client_pid;
+            ok = registered && pid_from_handle(registered) == owner_pid;
+        }
+        if (!ok)
+            caller_validation::release_lock();
+        return ok;
+    }
+
+    static BOOLEAN slot_matches_cleanup_pid(const protection_entry_t& slot, UINT32 pid)
+    {
+        if (pid == 0)
+            return FALSE;
+        if (slot.pid == pid)
+            return TRUE;
+        if (slot.owner_pid != 0 && slot.owner_pid == pid)
+            return TRUE;
+        return FALSE;
+    }
+
+    static void disarm_stale_slot(int idx, protection_entry_t& slot)
+    {
+        LONG previous_active = _InterlockedCompareExchange(&slot.active, 1, 1);
+        UINT32 previous_status = slot.status;
+        UINT32 registered_pid = current_owner_pid();
+        LONG validation_enabled = _InterlockedCompareExchange(&caller_validation::g_validation_enabled, 0, 0);
+        log_slot_state("timer_stale_session_disarm", idx, slot, slot.current_hash, nullptr,
+            DPRT_MISMATCH_UNKNOWN, "owner_session_invalid_disarm",
+            previous_active, previous_status);
+        UINT32 target_pid = slot.pid;
+        UINT32 owner_pid = slot.owner_pid;
+        reset_slot(slot);
+        WW_LOG("[DLL-PROTECT] timer_stale_session_disarmed idx=%d pid=%u owner_pid=%u registered_pid=%u validation_enabled=%ld active_slots=%u timer_running=%ld",
+            idx,
+            target_pid,
+            owner_pid,
+            registered_pid,
+            validation_enabled,
+            active_slot_count(),
+            _InterlockedCompareExchange(&g_timer_running, 1, 1));
+    }
+
+    static ULONG cleanup_for_pid_internal(UINT32 pid, const char* reason, const char* slot_tag, const char* summary_tag)
+    {
+        if (pid == 0)
+            return 0;
+
+        ULONG cleared = 0;
+        bool matched = false;
+        for (int i = 0; i < (int)MAX_PROTECT_SLOTS; i++) {
+            if (_InterlockedCompareExchange(&g_slots[i].active, 1, 1) == 1 &&
+                slot_matches_cleanup_pid(g_slots[i], pid)) {
+                matched = true;
+                break;
+            }
+        }
+        if (!matched)
+            return 0;
+
+        stop_timer();
+        for (int i = 0; i < (int)MAX_PROTECT_SLOTS; i++) {
+            if (_InterlockedCompareExchange(&g_slots[i].active, 1, 1) == 1 &&
+                slot_matches_cleanup_pid(g_slots[i], pid)) {
+                log_slot_state(slot_tag ? slot_tag : "cleanup_unregister_pid", i, g_slots[i],
+                    g_slots[i].current_hash, nullptr);
+                reset_slot(g_slots[i]);
+                ++cleared;
+            }
+        }
+
+        if (cleared != 0) {
+            if (any_active())
+                start_or_restart_timer();
+            else
+                stop_timer();
+            WW_LOG("[DLL-PROTECT] %s reason=%s pid=%u cleared=%lu active_slots=%u timer_running=%ld",
+                summary_tag ? summary_tag : "cleanup_for_pid",
+                reason ? reason : "unknown",
+                pid,
+                cleared,
+                active_slot_count(),
+                _InterlockedCompareExchange(&g_timer_running, 1, 1));
+        }
+        return cleared;
+    }
+
+    ULONG cleanup_for_pid(UINT32 pid)
+    {
+        return cleanup_for_pid_internal(pid, "process_exit", "process_exit_unregister_pid", "process_exit_cleanup");
+    }
+
+    ULONG cleanup_for_session_reset(UINT32 pid, const char* reason)
+    {
+        ULONG cleared = cleanup_for_pid_internal(pid, reason, "session_reset_unregister_pid", "session_reset_cleanup");
+        if (pid != 0 && cleared == 0) {
+            WW_LOG("[DLL-PROTECT] session_reset_cleanup_no_slots reason=%s pid=%u active_slots=%u timer_running=%ld",
+                reason ? reason : "unknown",
+                pid,
+                active_slot_count(),
+                _InterlockedCompareExchange(&g_timer_running, 1, 1));
+        }
+        return cleared;
+    }
 
     static void protection_timer_body()
     {
@@ -706,10 +948,19 @@ namespace dll_protection {
                 continue;
 
             auto& slot = g_slots[i];
+            if (!slot_owner_authenticated(slot)) {
+                disarm_stale_slot(i, slot);
+                continue;
+            }
+
             slot.check_count++;
 
 
             if (check_peb_debugger_physical(slot.pid)) {
+                if (!slot_owner_authenticated(slot)) {
+                    disarm_stale_slot(i, slot);
+                    continue;
+                }
                 LONG previous_active = _InterlockedCompareExchange(&slot.active, 1, 1);
                 UINT32 previous_status = slot.status;
                 slot.status = DPRT_STATUS_DEBUGGER;
@@ -719,6 +970,10 @@ namespace dll_protection {
                 log_slot_state("timer_peb_debugger_bugcheck", i, slot, 0, &snap,
                     DPRT_MISMATCH_UNKNOWN, "peb_debugger_hard_bugcheck",
                     previous_active, previous_status);
+                if (!lock_slot_owner_for_hard_bugcheck(slot)) {
+                    disarm_stale_slot(i, slot);
+                    continue;
+                }
                 WW_LOG("[DLL-PROTECT] bugcheck policy=peb_debugger code=0xDEAD0ADA pid=%u text=0x%llX p3=0x%llX p4=0x%llX",
                     slot.pid, slot.text_va, 0xDB6ULL, (UINT64)i);
                 KeBugCheckEx(0xDEAD0ADAu, (ULONG_PTR)slot.pid,
@@ -742,6 +997,10 @@ namespace dll_protection {
                 UINT64 dr_val = 0;
                 if (scan_thread_drs(slot.pid, slot.text_va, slot.text_size,
                                     &bad_tid, &dr_idx, &dr_val)) {
+                    if (!slot_owner_authenticated(slot)) {
+                        disarm_stale_slot(i, slot);
+                        continue;
+                    }
                     LONG previous_active = _InterlockedCompareExchange(&slot.active, 1, 1);
                     UINT32 previous_status = slot.status;
                     slot.status = DPRT_STATUS_DEBUGGER;
@@ -750,6 +1009,10 @@ namespace dll_protection {
                     log_slot_state("timer_thread_dr_bugcheck", i, slot, 0, &snap,
                         DPRT_MISMATCH_UNKNOWN, "thread_dr_hard_bugcheck",
                         previous_active, previous_status);
+                    if (!lock_slot_owner_for_hard_bugcheck(slot)) {
+                        disarm_stale_slot(i, slot);
+                        continue;
+                    }
                     WW_LOG("[DLL-PROTECT] bugcheck policy=thread_dr pid=%u bad_tid=%u dr=0x%llX dr_idx=%d p4=0x%llX",
                         slot.pid, bad_tid, dr_val, dr_idx, (UINT64)(0xD7D70000u | (UINT32)dr_idx));
                     KeBugCheckEx(0xDEAD0ADAu, (ULONG_PTR)slot.pid,
@@ -795,6 +1058,10 @@ namespace dll_protection {
             slot.current_hash = hash;
 
             if (hash != slot.expected_hash) {
+                if (!slot_owner_authenticated(slot)) {
+                    disarm_stale_slot(i, slot);
+                    continue;
+                }
                 LONG previous_active = _InterlockedCompareExchange(&slot.active, 1, 1);
                 UINT32 previous_status = slot.status;
                 UINT32 mismatch_offset = first_mismatch_offset(slot);
@@ -803,6 +1070,10 @@ namespace dll_protection {
 
                 memory_snapshot_t snap = query_memory_snapshot(slot.pid, slot.text_va);
                 if (slot_hard_bugcheck_enabled(slot)) {
+                    if (!lock_slot_owner_for_hard_bugcheck(slot)) {
+                        disarm_stale_slot(i, slot);
+                        continue;
+                    }
                     publish_text_integrity_evidence(slot);
                     log_slot_state("timer_hash_mismatch_bugcheck", i, slot, hash, &snap,
                         mismatch_offset, "hash_mismatch_hard_bugcheck",
@@ -1044,7 +1315,17 @@ NTSTATUS functions::handle_dll_protect(p_dll_protect request) {
             preview.expected_hash = request->expected_hash;
             preview.check_interval_ms = interval;
             preview.last_check_tsc = __rdtsc();
-            preview.policy_flags = (request->module_base != 0) ? dll_protection::DPRT_POLICY_HARD_BUGCHECK : 0;
+            preview.owner_pid = dll_protection::current_owner_pid();
+            if (preview.owner_pid == 0) {
+                WW_LOG("[DLL-PROTECT] register_reject no_owner pid=%u module=0x%llX text=0x%llX size=0x%X validation_enabled=%ld",
+                    request->pid,
+                    request->module_base,
+                    request->text_section_va,
+                    request->text_section_size,
+                    _InterlockedCompareExchange(&caller_validation::g_validation_enabled, 0, 0));
+                return STATUS_ACCESS_DENIED;
+            }
+            preview.policy_flags = 0;
             preview.current_hash = dll_protection::compute_code_hash_physical(
                 request->pid,
                 request->text_section_va,
@@ -1071,28 +1352,8 @@ NTSTATUS functions::handle_dll_protect(p_dll_protect request) {
                 request->current_hash = preview.current_hash;
                 request->check_interval = interval;
                 request->last_check_tsc = preview.last_check_tsc;
-                if (dll_protection::slot_hard_bugcheck_enabled(preview)) {
-                    dll_protection::publish_text_integrity_evidence(preview);
-                    dll_protection::log_slot_state("register_hash_mismatch_bugcheck", idx, preview, preview.current_hash, &snap,
-                        dll_protection::DPRT_MISMATCH_UNKNOWN, "register_hash_mismatch_hard_bugcheck",
-                        previous_active, previous_status);
-                    WW_LOG("[DLL-PROTECT] bugcheck policy=register_hash_mismatch code=0xDEAD0ADA pid=%u module=0x%llX text=0x%llX size=0x%X expected=0x%llX actual=0x%llX p3=0x%llX p4=0x%llX",
-                        request->pid,
-                        request->module_base,
-                        request->text_section_va,
-                        request->text_section_size,
-                        request->expected_hash,
-                        preview.current_hash,
-                        (request->expected_hash >> 32),
-                        (preview.current_hash >> 32));
-                    KeBugCheckEx(0xDEAD0ADAu, (ULONG_PTR)request->pid,
-                                 (ULONG_PTR)request->text_section_va,
-                                 (ULONG_PTR)(request->expected_hash >> 32),
-                                 (ULONG_PTR)(preview.current_hash >> 32));
-                    return STATUS_SUCCESS;
-                }
                 dll_protection::log_slot_state("register_reject_hash_mismatch", idx, preview, preview.current_hash, &snap,
-                    dll_protection::DPRT_MISMATCH_UNKNOWN, "register_hash_mismatch_fail_closed",
+                    dll_protection::DPRT_MISMATCH_UNKNOWN, "register_hash_mismatch_fail_closed_no_baseline",
                     previous_active, previous_status);
                 WW_LOG("[DLL-PROTECT] register_reject_hash_mismatch pid=%u module=0x%llX text=0x%llX size=0x%X expected=0x%llX actual=0x%llX evidence=dllprotect_status_log",
                     request->pid,
@@ -1115,7 +1376,8 @@ NTSTATUS functions::handle_dll_protect(p_dll_protect request) {
             slot.status = DPRT_STATUS_ACTIVE;
             slot.last_check_tsc = preview.last_check_tsc;
             slot.check_count = 0;
-            slot.policy_flags = preview.policy_flags;
+            slot.policy_flags = (request->module_base != 0) ? dll_protection::DPRT_POLICY_HARD_BUGCHECK : 0;
+            slot.owner_pid = preview.owner_pid;
             dll_protection::capture_baseline_prefix(slot);
 
             _InterlockedExchange(&slot.active, 1);
@@ -1188,6 +1450,7 @@ NTSTATUS functions::handle_dll_protect(p_dll_protect request) {
         case DPRT_OP_UNREGISTER:
         {
 
+            dll_protection::stop_timer();
 
             if (request->pid != 0 && request->module_base != 0) {
                 int idx = dll_protection::find_slot(request->pid, request->module_base);

@@ -7312,13 +7312,11 @@ namespace net_kill {
         }
 
         if (request->src_port != 0 && request->dst_port != 0) {
+            if (socket_info->local_port == 0 || socket_info->remote_port == 0)
+                return FALSE;
+
             if (src_match && dst_match)
                 return TRUE;
-
-            if ((src_match || dst_match) &&
-                (socket_info->local_port == 0 || socket_info->remote_port == 0)) {
-                return TRUE;
-            }
 
             return FALSE;
         }
@@ -7477,10 +7475,26 @@ namespace net_kill {
                 if (!ok)
                     continue;
 
-                if (!socket_matches_kill_request(&socket_info, request))
+                BOOLEAN match = socket_matches_kill_request(&socket_info, request);
+                WW_LOG("netaction::net_kill::close_matching_socket candidate pid=%u handle=0x%llX proto=%u state=%u local_port=%u remote_port=%u req_src=%u req_dst=%u match=%u",
+                    owner_pid,
+                    static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(h)),
+                    socket_info.protocol,
+                    socket_info.state,
+                    socket_info.local_port,
+                    socket_info.remote_port,
+                    request->src_port,
+                    request->dst_port,
+                    match ? 1u : 0u);
+
+                if (!match)
                     continue;
 
                 close_status = ZwClose(h);
+                WW_LOG("netaction::net_kill::close_matching_socket close pid=%u handle=0x%llX status=0x%08X",
+                    owner_pid,
+                    static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(h)),
+                    close_status);
                 if (NT_SUCCESS(close_status))
                     break;
             }

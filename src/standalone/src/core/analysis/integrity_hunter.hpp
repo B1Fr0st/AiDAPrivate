@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <string>
@@ -14,6 +15,7 @@
 #include "page_guard_engine.hpp"
 #include "standalone_driver.hpp"
 #include "zydis_disasm.hpp"
+#include "../infra/critical_work_queue.hpp"
 #include "../../helpers/diag_log.hpp"
 
 namespace integrity_hunter {
@@ -46,8 +48,12 @@ struct state_t {
 	std::mutex mutex;
 	std::atomic<bool> hunting{false};
 	std::atomic<bool> cancel{false};
+	std::atomic<bool> worker_active{false};
+	std::atomic<bool> install_complete{false};
+	std::atomic<bool> install_success{false};
 	std::atomic<uint64_t> total_reads{0};
-	uint32_t pg_session_id = 0;
+	std::atomic<uint64_t> generation{0};
+	std::atomic<uint32_t> pg_session_id{0};
 	uint64_t target_address = 0;
 	uint64_t target_size = 0;
 	char address_input[32] = {};
@@ -207,11 +213,24 @@ inline std::vector<uint64_t> walk_callstack(uint64_t rbp, int max_depth)
 
 }
 
-inline void start_hunt(uint64_t target_address, uint64_t target_size)
+inline bool start_hunt(uint64_t target_address, uint64_t target_size)
 {
-	if (g_state.hunting.load()) {
+	bool expected = false;
+	if (!g_state.hunting.compare_exchange_strong(expected, true)) {
 		diag::log_tagged("integrity_hunter", "start_skip reason=already_hunting");
-		return;
+		return false;
+	}
+
+	if (target_address == 0 || target_size == 0 ||
+	    target_size > (std::numeric_limits<uint64_t>::max() - target_address)) {
+		diag::log_tagged_fmt("integrity_hunter",
+			"start_reject reason=invalid_range target=0x%llX size=0x%llX",
+			static_cast<unsigned long long>(target_address),
+			static_cast<unsigned long long>(target_size));
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		g_state.status_text = "Invalid integrity hunter target range";
+		g_state.hunting.store(false);
+		return false;
 	}
 
 	uint32_t pid = driver_bridge::attached_pid();
@@ -219,56 +238,82 @@ inline void start_hunt(uint64_t target_address, uint64_t target_size)
 		diag::log_tagged("integrity_hunter", "start_reject reason=no_attached_pid");
 		std::lock_guard<std::mutex> lk(g_state.mutex);
 		g_state.status_text = "Attach to a process first";
-		return;
+		g_state.hunting.store(false);
+		return false;
 	}
 
-	g_state.hunting.store(true);
 	g_state.cancel.store(false);
+	g_state.worker_active.store(true);
+	g_state.install_complete.store(false);
+	g_state.install_success.store(false);
 	g_state.total_reads.store(0);
 	g_state.target_address = target_address;
 	g_state.target_size = target_size;
+	const uint64_t generation = g_state.generation.fetch_add(1, std::memory_order_acq_rel) + 1;
 
 	{
 		std::lock_guard<std::mutex> lk(g_state.mutex);
 		g_state.nodes.clear();
 		g_state.event_log.clear();
+		g_state.pg_session_id.store(0);
 		g_state.status_text = "Installing page guard...";
 	}
 
 	diag::log_tagged_fmt("integrity_hunter",
-		"start_hunt pid=%u target=0x%llX size=0x%llX",
+		"start_hunt pid=%u target=0x%llX size=0x%llX gen=%llu",
 		pid, static_cast<unsigned long long>(target_address),
-		static_cast<unsigned long long>(target_size));
+		static_cast<unsigned long long>(target_size),
+		static_cast<unsigned long long>(generation));
 
-	work_queue::post([target_address, target_size, pid]() {
+	auto worker = [target_address, target_size, pid, generation]() {
 		uint64_t page_base = target_address & ~0xFFFULL;
 		uint64_t page_end = (target_address + target_size + 0xFFF) & ~0xFFFULL;
 		uint64_t region_size = page_end - page_base;
 
+		if (g_state.cancel.load()) {
+			diag::log_tagged_fmt("integrity_hunter",
+				"worker_cancelled_before_install gen=%llu target=0x%llX",
+				static_cast<unsigned long long>(generation),
+				static_cast<unsigned long long>(target_address));
+			std::lock_guard<std::mutex> lk(g_state.mutex);
+			g_state.status_text = "Cancelled before installing page guard";
+			g_state.install_complete.store(true);
+			g_state.install_success.store(false);
+			g_state.worker_active.store(false);
+			g_state.hunting.store(false);
+			return;
+		}
+
 		uint32_t pg_session = page_guard_engine::g_pg_engine.install(pid, page_base, region_size);
 		if (pg_session == 0) {
 			diag::log_tagged_fmt("integrity_hunter",
-				"page_guard_install_fail target=0x%llX page_base=0x%llX size=0x%llX",
+				"page_guard_install_fail gen=%llu target=0x%llX page_base=0x%llX size=0x%llX cancelled=%d",
+				static_cast<unsigned long long>(generation),
 				static_cast<unsigned long long>(target_address),
 				static_cast<unsigned long long>(page_base),
-				static_cast<unsigned long long>(region_size));
+				static_cast<unsigned long long>(region_size),
+				g_state.cancel.load() ? 1 : 0);
 			std::lock_guard<std::mutex> lk(g_state.mutex);
 			g_state.status_text = "Failed to install page guard";
+			g_state.install_complete.store(true);
+			g_state.install_success.store(false);
+			g_state.worker_active.store(false);
 			g_state.hunting.store(false);
 			return;
 		}
 
 		diag::log_tagged_fmt("integrity_hunter",
-			"page_guard_installed session=%u page_base=0x%llX size=0x%llX",
-			pg_session, static_cast<unsigned long long>(page_base),
+			"page_guard_installed gen=%llu session=%u page_base=0x%llX size=0x%llX",
+			static_cast<unsigned long long>(generation), pg_session, static_cast<unsigned long long>(page_base),
 			static_cast<unsigned long long>(region_size));
-
-		g_state.pg_session_id = pg_session;
 
 		{
 			std::lock_guard<std::mutex> lk(g_state.mutex);
+			g_state.pg_session_id.store(pg_session);
 			g_state.status_text = "Monitoring for integrity checkers...";
 		}
+		g_state.install_complete.store(true);
+		g_state.install_success.store(true);
 
 		std::map<uint64_t, detail::rip_stats_t> rip_stats;
 		uint64_t total = 0;
@@ -366,28 +411,103 @@ inline void start_hunt(uint64_t target_address, uint64_t target_size)
 		}
 
 		page_guard_engine::g_pg_engine.uninstall(pg_session);
-		g_state.pg_session_id = 0;
 
 		size_t final_nodes = 0;
 		uint64_t final_reads = g_state.total_reads.load();
 		{
 			std::lock_guard<std::mutex> lk(g_state.mutex);
+			g_state.pg_session_id.store(0);
 			final_nodes = g_state.nodes.size();
 			g_state.status_text = "Stopped. Found " + std::to_string(final_nodes) + " integrity checkers.";
 		}
 
 		diag::log_tagged_fmt("integrity_hunter",
-			"hunt_done nodes=%zu total_reads=%llu",
+			"hunt_done gen=%llu nodes=%zu total_reads=%llu",
+			static_cast<unsigned long long>(generation),
 			final_nodes, static_cast<unsigned long long>(final_reads));
 
+		g_state.worker_active.store(false);
 		g_state.hunting.store(false);
-	});
+	};
+	const bool run_install_inline = target_size <= 4096;
+	if (run_install_inline) {
+		diag::log_tagged_fmt("integrity_hunter",
+			"start_inline_worker target=0x%llX size=0x%llX gen=%llu",
+			static_cast<unsigned long long>(target_address),
+			static_cast<unsigned long long>(target_size),
+			static_cast<unsigned long long>(generation));
+		try {
+			std::thread(std::move(worker)).detach();
+			return true;
+		} catch (const std::exception& ex) {
+			diag::log_tagged_fmt("integrity_hunter",
+				"start_reject reason=thread_start_failed gen=%llu err=%s",
+				static_cast<unsigned long long>(generation),
+				ex.what());
+			std::lock_guard<std::mutex> lk(g_state.mutex);
+			g_state.status_text = "Failed to start integrity hunter worker";
+			g_state.worker_active.store(false);
+			g_state.install_complete.store(true);
+			g_state.install_success.store(false);
+			g_state.hunting.store(false);
+			return false;
+		} catch (...) {
+			diag::log_tagged_fmt("integrity_hunter",
+				"start_reject reason=thread_start_failed gen=%llu err='<unknown>'",
+				static_cast<unsigned long long>(generation));
+			std::lock_guard<std::mutex> lk(g_state.mutex);
+			g_state.status_text = "Failed to start integrity hunter worker";
+			g_state.worker_active.store(false);
+			g_state.install_complete.store(true);
+			g_state.install_success.store(false);
+			g_state.hunting.store(false);
+			return false;
+		}
+	}
+	const bool posted = critical_work_queue::post(worker) || work_queue::post(std::move(worker));
+	if (!posted) {
+		diag::log_tagged_fmt("integrity_hunter",
+			"start_reject reason=worker_post_failed gen=%llu",
+			static_cast<unsigned long long>(generation));
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		g_state.status_text = "Failed to queue integrity hunter worker";
+		g_state.worker_active.store(false);
+		g_state.install_complete.store(true);
+		g_state.install_success.store(false);
+		g_state.hunting.store(false);
+		return false;
+	}
+	return true;
 }
 
 inline void stop_hunt()
 {
 	diag::log_tagged("integrity_hunter", "stop_hunt_requested");
 	g_state.cancel.store(true);
+}
+
+inline bool wait_until_idle(uint32_t timeout_ms)
+{
+	const auto start = std::chrono::steady_clock::now();
+	while (g_state.hunting.load() || g_state.worker_active.load()) {
+		if (timeout_ms != 0) {
+			const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+				std::chrono::steady_clock::now() - start).count();
+			if (elapsed >= timeout_ms) {
+				diag::log_tagged_fmt("integrity_hunter",
+					"wait_idle_timeout timeout_ms=%u hunting=%d worker_active=%d install_complete=%d install_success=%d session=%u",
+					timeout_ms,
+					g_state.hunting.load() ? 1 : 0,
+					g_state.worker_active.load() ? 1 : 0,
+					g_state.install_complete.load() ? 1 : 0,
+					g_state.install_success.load() ? 1 : 0,
+					g_state.pg_session_id.load());
+				return false;
+			}
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(25));
+	}
+	return true;
 }
 
 inline bool neutralize(int node_index)

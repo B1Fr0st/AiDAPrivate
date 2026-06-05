@@ -1,6 +1,7 @@
 #include "net_security.hpp"
 
 #ifdef __NT__
+#include "standalone/src/helpers/diag_log.hpp"
 #include "../driver/comm.h"
 #include <nlohmann/json.hpp>
 #include <exception>
@@ -1603,20 +1604,43 @@ bool TlsKeyExtractor::write_keylog_file(const std::string& path,
 }
 
 bool TlsKeyExtractor::start_keylog(const keylog_config_t& config) {
-    if (_keylog_active.load()) return false;
+    diag::log_tagged_fmt("net_sec", "TlsKeyExtractor::start_keylog entry active=%d pid=%u output_file=%s poll_interval_ms=%u append=%d tid=%lu",
+        _keylog_active.load() ? 1 : 0,
+        config.pid,
+        config.output_file.c_str(),
+        config.poll_interval_ms,
+        config.append ? 1 : 0,
+        static_cast<unsigned long>(GetCurrentThreadId()));
+    if (_keylog_active.load()) {
+        diag::log_tagged("net_sec", "TlsKeyExtractor::start_keylog rejected active=1");
+        return false;
+    }
 
     _keylog_config = config;
     _keylog_active.store(true);
 
-    try {
-        _keylog_thread = std::thread([this]() {
+    auto worker = [this]() {
+            diag::log_tagged_fmt("net_sec", "TlsKeyExtractor::worker enter pid=%u output_file=%s poll_interval_ms=%u tid=%lu",
+                _keylog_config.pid,
+                _keylog_config.output_file.c_str(),
+                _keylog_config.poll_interval_ms,
+                static_cast<unsigned long>(GetCurrentThreadId()));
             while (_keylog_active.load()) {
                 tls_key_scan_config_t scan_cfg;
                 scan_cfg.pid = _keylog_config.pid;
 
+                const ULONGLONG t0 = GetTickCount64();
                 auto keys = extract_keys(scan_cfg);
+                diag::log_tagged_fmt("net_sec", "TlsKeyExtractor::worker scan_done pid=%u keys=%zu elapsed_ms=%llu",
+                    scan_cfg.pid,
+                    keys.size(),
+                    static_cast<unsigned long long>(GetTickCount64() - t0));
                 if (!keys.empty()) {
-                    write_keylog_file(_keylog_config.output_file, keys, _keylog_config.append);
+                    const bool wrote = write_keylog_file(_keylog_config.output_file, keys, _keylog_config.append);
+                    diag::log_tagged_fmt("net_sec", "TlsKeyExtractor::worker write_keylog wrote=%d path=%s keys=%zu",
+                        wrote ? 1 : 0,
+                        _keylog_config.output_file.c_str(),
+                        keys.size());
                 }
 
                 for (std::uint32_t elapsed = 0;
@@ -1625,20 +1649,52 @@ bool TlsKeyExtractor::start_keylog(const keylog_config_t& config) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 }
             }
-        });
-    } catch (...) {
+            diag::log_tagged_fmt("net_sec", "TlsKeyExtractor::worker exit tid=%lu",
+                static_cast<unsigned long>(GetCurrentThreadId()));
+    };
+
+    bool created = false;
+    for (int attempt = 1; attempt <= 3; ++attempt) {
+        try {
+            _keylog_thread = std::thread(worker);
+            created = true;
+            diag::log_tagged_fmt("net_sec", "TlsKeyExtractor::start_keylog thread_created attempt=%d", attempt);
+            break;
+        } catch (const std::exception& ex) {
+            diag::log_tagged_fmt("net_sec", "TlsKeyExtractor::start_keylog thread_create_failed attempt=%d err=%s",
+                attempt, ex.what());
+        } catch (...) {
+            diag::log_tagged_fmt("net_sec", "TlsKeyExtractor::start_keylog thread_create_failed attempt=%d err=<unknown>",
+                attempt);
+        }
+        Sleep(static_cast<DWORD>(50 * attempt));
+    }
+    if (!created) {
         _keylog_active.store(false);
+        diag::log_tagged("net_sec", "TlsKeyExtractor::start_keylog thread_create_exhausted");
         return false;
     }
 
+    diag::log_tagged("net_sec", "TlsKeyExtractor::start_keylog started");
     return true;
 }
 
 bool TlsKeyExtractor::stop_keylog() {
-    if (!_keylog_active.load()) return false;
+    diag::log_tagged_fmt("net_sec", "TlsKeyExtractor::stop_keylog entry active=%d joinable=%d tid=%lu",
+        _keylog_active.load() ? 1 : 0,
+        _keylog_thread.joinable() ? 1 : 0,
+        static_cast<unsigned long>(GetCurrentThreadId()));
+    if (!_keylog_active.load()) {
+        diag::log_tagged("net_sec", "TlsKeyExtractor::stop_keylog rejected active=0");
+        return false;
+    }
     _keylog_active.store(false);
-    if (_keylog_thread.joinable())
+    if (_keylog_thread.joinable()) {
+        const ULONGLONG t0 = GetTickCount64();
         _keylog_thread.join();
+        diag::log_tagged_fmt("net_sec", "TlsKeyExtractor::stop_keylog joined elapsed_ms=%llu",
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+    }
     return true;
 }
 
@@ -1649,8 +1705,14 @@ CertificateInjector& CertificateInjector::instance() {
 }
 
 cert_injection_result_t CertificateInjector::inject_certificate(const cert_injection_config_t& config) {
-    std::lock_guard<std::mutex> lock(_mutex);
+    const ULONGLONG t0 = GetTickCount64();
     cert_injection_result_t result;
+    diag::log_tagged_fmt("net_sec", "inject_certificate entry store=%s system_wide=%d der_size=%zu pem_len=%zu tid=%lu",
+        config.store_name.c_str(),
+        config.system_wide ? 1 : 0,
+        config.cert_der.size(),
+        config.cert_pem.size(),
+        static_cast<unsigned long>(GetCurrentThreadId()));
 
     std::vector<std::uint8_t> cert_data;
     if (!config.cert_der.empty()) {
@@ -1658,28 +1720,46 @@ cert_injection_result_t CertificateInjector::inject_certificate(const cert_injec
     } else if (!config.cert_pem.empty()) {
 
         DWORD der_size = 0;
+        diag::log_tagged_fmt("net_sec", "inject_certificate CryptStringToBinary size enter elapsed_ms=%llu",
+            static_cast<unsigned long long>(GetTickCount64() - t0));
         if (!CryptStringToBinaryA(config.cert_pem.c_str(), static_cast<DWORD>(config.cert_pem.size()),
                                   CRYPT_STRING_BASE64HEADER, nullptr, &der_size, nullptr, nullptr) || der_size == 0) {
+            diag::log_tagged_fmt("net_sec", "inject_certificate CryptStringToBinary size failed gle=%lu elapsed_ms=%llu",
+                static_cast<unsigned long>(GetLastError()),
+                static_cast<unsigned long long>(GetTickCount64() - t0));
             result.success = false;
             return result;
         }
         cert_data.resize(der_size);
+        diag::log_tagged_fmt("net_sec", "inject_certificate CryptStringToBinary data enter der_size=%lu elapsed_ms=%llu",
+            static_cast<unsigned long>(der_size),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
         if (!CryptStringToBinaryA(config.cert_pem.c_str(), static_cast<DWORD>(config.cert_pem.size()),
                                   CRYPT_STRING_BASE64HEADER, cert_data.data(), &der_size, nullptr, nullptr)) {
+            diag::log_tagged_fmt("net_sec", "inject_certificate CryptStringToBinary data failed gle=%lu elapsed_ms=%llu",
+                static_cast<unsigned long>(GetLastError()),
+                static_cast<unsigned long long>(GetTickCount64() - t0));
             result.success = false;
             return result;
         }
         cert_data.resize(der_size);
     } else {
+        diag::log_tagged("net_sec", "inject_certificate rejected empty certificate data");
         result.success = false;
         return result;
     }
 
 
+    diag::log_tagged_fmt("net_sec", "inject_certificate CertCreateCertificateContext enter der_size=%zu elapsed_ms=%llu",
+        cert_data.size(),
+        static_cast<unsigned long long>(GetTickCount64() - t0));
     PCCERT_CONTEXT cert_ctx = CertCreateCertificateContext(
         X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
         cert_data.data(), static_cast<DWORD>(cert_data.size()));
     if (!cert_ctx) {
+        diag::log_tagged_fmt("net_sec", "inject_certificate CertCreateCertificateContext failed gle=%lu elapsed_ms=%llu",
+            static_cast<unsigned long>(GetLastError()),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
         result.success = false;
         return result;
     }
@@ -1687,8 +1767,16 @@ cert_injection_result_t CertificateInjector::inject_certificate(const cert_injec
 
     BYTE thumb[20] = {};
     DWORD thumb_size = 20;
-    CryptHashCertificate(0, CALG_SHA1, 0, cert_ctx->pbCertEncoded,
-                         cert_ctx->cbCertEncoded, thumb, &thumb_size);
+    diag::log_tagged_fmt("net_sec", "inject_certificate CryptHashCertificate enter elapsed_ms=%llu",
+        static_cast<unsigned long long>(GetTickCount64() - t0));
+    if (!CryptHashCertificate(0, CALG_SHA1, 0, cert_ctx->pbCertEncoded,
+                              cert_ctx->cbCertEncoded, thumb, &thumb_size)) {
+        diag::log_tagged_fmt("net_sec", "inject_certificate CryptHashCertificate failed gle=%lu elapsed_ms=%llu",
+            static_cast<unsigned long>(GetLastError()),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        CertFreeCertificateContext(cert_ctx);
+        return result;
+    }
     result.thumbprint = bytes_to_hex_upper(thumb, thumb_size);
 
 
@@ -1706,16 +1794,32 @@ cert_injection_result_t CertificateInjector::inject_certificate(const cert_injec
     DWORD store_flags = config.system_wide ?
         CERT_SYSTEM_STORE_LOCAL_MACHINE : CERT_SYSTEM_STORE_CURRENT_USER;
 
+    diag::log_tagged_fmt("net_sec", "inject_certificate CertOpenStore existing enter store=%s flags=0x%08lX elapsed_ms=%llu",
+        store_name.c_str(),
+        static_cast<unsigned long>(store_flags | CERT_STORE_OPEN_EXISTING_FLAG),
+        static_cast<unsigned long long>(GetTickCount64() - t0));
     HCERTSTORE hStore = CertOpenStore(
         CERT_STORE_PROV_SYSTEM_W, 0, 0,
         store_flags | CERT_STORE_OPEN_EXISTING_FLAG,
         store_name_w.c_str());
+    diag::log_tagged_fmt("net_sec", "inject_certificate CertOpenStore existing result store=%p gle=%lu elapsed_ms=%llu",
+        hStore,
+        static_cast<unsigned long>(hStore ? 0 : GetLastError()),
+        static_cast<unsigned long long>(GetTickCount64() - t0));
 
     if (!hStore) {
 
+        diag::log_tagged_fmt("net_sec", "inject_certificate CertOpenStore create enter store=%s flags=0x%08lX elapsed_ms=%llu",
+            store_name.c_str(),
+            static_cast<unsigned long>(store_flags),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
         hStore = CertOpenStore(
             CERT_STORE_PROV_SYSTEM_W, 0, 0,
             store_flags, store_name_w.c_str());
+        diag::log_tagged_fmt("net_sec", "inject_certificate CertOpenStore create result store=%p gle=%lu elapsed_ms=%llu",
+            hStore,
+            static_cast<unsigned long>(hStore ? 0 : GetLastError()),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
     }
 
     if (!hStore) {
@@ -1725,29 +1829,56 @@ cert_injection_result_t CertificateInjector::inject_certificate(const cert_injec
     }
 
 
+    diag::log_tagged_fmt("net_sec", "inject_certificate CertAddCertificateContextToStore enter store=%s elapsed_ms=%llu",
+        store_name.c_str(),
+        static_cast<unsigned long long>(GetTickCount64() - t0));
     if (CertAddCertificateContextToStore(hStore, cert_ctx,
                                          CERT_STORE_ADD_REPLACE_EXISTING, nullptr)) {
         result.success = true;
         result.method = config.system_wide ? "SystemStore" : "UserStore";
-        _injected.push_back(result.thumbprint);
+        {
+            std::lock_guard<std::mutex> lock(_mutex);
+            _injected.push_back(result.thumbprint);
+        }
+        diag::log_tagged_fmt("net_sec", "inject_certificate CertAddCertificateContextToStore ok thumbprint_len=%zu elapsed_ms=%llu",
+            result.thumbprint.size(),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+    } else {
+        diag::log_tagged_fmt("net_sec", "inject_certificate CertAddCertificateContextToStore failed gle=%lu elapsed_ms=%llu",
+            static_cast<unsigned long>(GetLastError()),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
     }
 
+    diag::log_tagged_fmt("net_sec", "inject_certificate CertCloseStore enter elapsed_ms=%llu",
+        static_cast<unsigned long long>(GetTickCount64() - t0));
     CertCloseStore(hStore, 0);
     CertFreeCertificateContext(cert_ctx);
+    diag::log_tagged_fmt("net_sec", "inject_certificate exit success=%d elapsed_ms=%llu",
+        result.success ? 1 : 0,
+        static_cast<unsigned long long>(GetTickCount64() - t0));
     return result;
 }
 
 bool CertificateInjector::remove_certificate(const std::string& thumbprint, const std::string& store_name) {
-    std::lock_guard<std::mutex> lock(_mutex);
+    const ULONGLONG t0 = GetTickCount64();
+    diag::log_tagged_fmt("net_sec", "remove_certificate entry thumbprint_len=%zu store=%s tid=%lu",
+        thumbprint.size(), store_name.c_str(), static_cast<unsigned long>(GetCurrentThreadId()));
 
     std::string sn = store_name.empty() ? "ROOT" : store_name;
     std::wstring store_name_w(sn.begin(), sn.end());
 
+    diag::log_tagged_fmt("net_sec", "remove_certificate CertOpenStore enter elapsed_ms=%llu",
+        static_cast<unsigned long long>(GetTickCount64() - t0));
     HCERTSTORE hStore = CertOpenStore(
         CERT_STORE_PROV_SYSTEM_W, 0, 0,
         CERT_SYSTEM_STORE_CURRENT_USER | CERT_STORE_OPEN_EXISTING_FLAG,
         store_name_w.c_str());
-    if (!hStore) return false;
+    if (!hStore) {
+        diag::log_tagged_fmt("net_sec", "remove_certificate CertOpenStore failed gle=%lu elapsed_ms=%llu",
+            static_cast<unsigned long>(GetLastError()),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        return false;
+    }
 
     auto thumb_bytes = hex_to_bytes(thumbprint);
     CRYPT_HASH_BLOB hash_blob;
@@ -1767,10 +1898,14 @@ bool CertificateInjector::remove_certificate(const std::string& thumbprint, cons
     CertCloseStore(hStore, 0);
 
     if (removed) {
+        std::lock_guard<std::mutex> lock(_mutex);
         _injected.erase(
             std::remove(_injected.begin(), _injected.end(), thumbprint),
             _injected.end());
     }
+    diag::log_tagged_fmt("net_sec", "remove_certificate exit removed=%d elapsed_ms=%llu",
+        removed ? 1 : 0,
+        static_cast<unsigned long long>(GetTickCount64() - t0));
     return removed;
 }
 
@@ -1778,33 +1913,76 @@ bool CertificateInjector::generate_ca_certificate(const std::string& cn, std::ui
                                                     std::vector<std::uint8_t>& out_cert_der,
                                                     std::vector<std::uint8_t>& out_key_der,
                                                     bool export_private_key) {
-    std::lock_guard<std::mutex> lock(_mutex);
+    const ULONGLONG t0 = GetTickCount64();
+    out_cert_der.clear();
+    out_key_der.clear();
 
     HCRYPTPROV hProv = 0;
     HCRYPTKEY hKey = 0;
 
+    diag::log_tagged_fmt("net_sec", "generate_ca_certificate entry cn_len=%zu validity_days=%u export_private_key=%d tid=%lu",
+        cn.size(), validity_days, export_private_key ? 1 : 0, static_cast<unsigned long>(GetCurrentThreadId()));
 
-    std::string container_name = "AiDA_CA_" + std::to_string(GetTickCount64());
-    if (!CryptAcquireContextA(&hProv, container_name.c_str(), nullptr,
-                               PROV_RSA_FULL, CRYPT_NEWKEYSET)) {
+    diag::log_tagged_fmt("net_sec", "generate_ca_certificate CryptAcquireContext enter elapsed_ms=%llu",
+        static_cast<unsigned long long>(GetTickCount64() - t0));
+    if (!CryptAcquireContextA(&hProv, nullptr, nullptr,
+                               PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
+        DWORD gle = GetLastError();
+        diag::log_tagged_fmt("net_sec", "generate_ca_certificate CryptAcquireContext failed gle=%lu elapsed_ms=%llu",
+            static_cast<unsigned long>(gle),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
         return false;
     }
+    diag::log_tagged_fmt("net_sec", "generate_ca_certificate CryptAcquireContext ok elapsed_ms=%llu",
+        static_cast<unsigned long long>(GetTickCount64() - t0));
 
 
+    diag::log_tagged_fmt("net_sec", "generate_ca_certificate CryptGenKey enter elapsed_ms=%llu",
+        static_cast<unsigned long long>(GetTickCount64() - t0));
     if (!CryptGenKey(hProv, AT_SIGNATURE, (2048u << 16) | CRYPT_EXPORTABLE, &hKey)) {
+        DWORD gle = GetLastError();
+        diag::log_tagged_fmt("net_sec", "generate_ca_certificate CryptGenKey failed gle=%lu elapsed_ms=%llu",
+            static_cast<unsigned long>(gle),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
         CryptReleaseContext(hProv, 0);
-        CryptAcquireContextA(&hProv, container_name.c_str(), nullptr, PROV_RSA_FULL, CRYPT_DELETEKEYSET);
         return false;
     }
+    diag::log_tagged_fmt("net_sec", "generate_ca_certificate CryptGenKey ok elapsed_ms=%llu",
+        static_cast<unsigned long long>(GetTickCount64() - t0));
 
 
     std::string subject = "CN=" + cn;
     DWORD encoded_size = 0;
-    CertStrToNameA(X509_ASN_ENCODING, subject.c_str(), CERT_X500_NAME_STR,
-                   nullptr, nullptr, &encoded_size, nullptr);
+    diag::log_tagged_fmt("net_sec", "generate_ca_certificate CertStrToName size enter subject_len=%zu elapsed_ms=%llu",
+        subject.size(),
+        static_cast<unsigned long long>(GetTickCount64() - t0));
+    if (!CertStrToNameA(X509_ASN_ENCODING, subject.c_str(), CERT_X500_NAME_STR,
+                   nullptr, nullptr, &encoded_size, nullptr) || encoded_size == 0) {
+        DWORD gle = GetLastError();
+        diag::log_tagged_fmt("net_sec", "generate_ca_certificate CertStrToName size failed gle=%lu subject_len=%zu elapsed_ms=%llu",
+            static_cast<unsigned long>(gle), subject.size(),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        CryptDestroyKey(hKey);
+        CryptReleaseContext(hProv, 0);
+        return false;
+    }
     std::vector<BYTE> encoded_name(encoded_size);
-    CertStrToNameA(X509_ASN_ENCODING, subject.c_str(), CERT_X500_NAME_STR,
-                   nullptr, encoded_name.data(), &encoded_size, nullptr);
+    diag::log_tagged_fmt("net_sec", "generate_ca_certificate CertStrToName encode enter encoded_size=%lu elapsed_ms=%llu",
+        static_cast<unsigned long>(encoded_size),
+        static_cast<unsigned long long>(GetTickCount64() - t0));
+    if (!CertStrToNameA(X509_ASN_ENCODING, subject.c_str(), CERT_X500_NAME_STR,
+                   nullptr, encoded_name.data(), &encoded_size, nullptr)) {
+        DWORD gle = GetLastError();
+        diag::log_tagged_fmt("net_sec", "generate_ca_certificate CertStrToName encode failed gle=%lu encoded_size=%lu elapsed_ms=%llu",
+            static_cast<unsigned long>(gle), static_cast<unsigned long>(encoded_size),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        CryptDestroyKey(hKey);
+        CryptReleaseContext(hProv, 0);
+        return false;
+    }
+    diag::log_tagged_fmt("net_sec", "generate_ca_certificate CertStrToName ok encoded_size=%lu elapsed_ms=%llu",
+        static_cast<unsigned long>(encoded_size),
+        static_cast<unsigned long long>(GetTickCount64() - t0));
 
     CERT_NAME_BLOB name_blob;
     name_blob.cbData = encoded_size;
@@ -1825,8 +2003,7 @@ bool CertificateInjector::generate_ca_certificate(const std::string& cn, std::ui
 
 
     CRYPT_KEY_PROV_INFO kpi = {};
-    std::wstring container_w(container_name.begin(), container_name.end());
-    kpi.pwszContainerName = const_cast<wchar_t*>(container_w.c_str());
+    kpi.pwszContainerName = nullptr;
     kpi.dwProvType = PROV_RSA_FULL;
     kpi.dwKeySpec = AT_SIGNATURE;
 
@@ -1840,8 +2017,18 @@ bool CertificateInjector::generate_ca_certificate(const std::string& cn, std::ui
 
     BYTE bc_encoded[32] = {};
     DWORD bc_encoded_size = sizeof(bc_encoded);
-    CryptEncodeObject(X509_ASN_ENCODING, X509_BASIC_CONSTRAINTS2,
-                      &bc, bc_encoded, &bc_encoded_size);
+    diag::log_tagged_fmt("net_sec", "generate_ca_certificate CryptEncodeObject enter elapsed_ms=%llu",
+        static_cast<unsigned long long>(GetTickCount64() - t0));
+    if (!CryptEncodeObject(X509_ASN_ENCODING, X509_BASIC_CONSTRAINTS2,
+                      &bc, bc_encoded, &bc_encoded_size)) {
+        DWORD gle = GetLastError();
+        diag::log_tagged_fmt("net_sec", "generate_ca_certificate CryptEncodeObject failed gle=%lu elapsed_ms=%llu",
+            static_cast<unsigned long>(gle),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        CryptDestroyKey(hKey);
+        CryptReleaseContext(hProv, 0);
+        return false;
+    }
 
     CERT_EXTENSION ext = {};
     ext.pszObjId = const_cast<char*>(szOID_BASIC_CONSTRAINTS2);
@@ -1853,9 +2040,15 @@ bool CertificateInjector::generate_ca_certificate(const std::string& cn, std::ui
     exts.cExtension = 1;
     exts.rgExtension = &ext;
 
+    diag::log_tagged_fmt("net_sec", "generate_ca_certificate CertCreateSelfSignCertificate enter elapsed_ms=%llu",
+        static_cast<unsigned long long>(GetTickCount64() - t0));
     PCCERT_CONTEXT cert = CertCreateSelfSignCertificate(
         hProv, &name_blob, 0, &kpi, &algo,
         &now_sys, &expiry_sys, &exts);
+    diag::log_tagged_fmt("net_sec", "generate_ca_certificate CertCreateSelfSignCertificate cert=%p gle=%lu elapsed_ms=%llu",
+        cert,
+        static_cast<unsigned long>(cert ? 0 : GetLastError()),
+        static_cast<unsigned long long>(GetTickCount64() - t0));
 
     if (cert) {
         out_cert_der.assign(cert->pbCertEncoded, cert->pbCertEncoded + cert->cbCertEncoded);
@@ -1864,10 +2057,28 @@ bool CertificateInjector::generate_ca_certificate(const std::string& cn, std::ui
         out_key_der.clear();
         if (export_private_key) {
             DWORD key_blob_size = 0;
+            diag::log_tagged_fmt("net_sec", "generate_ca_certificate CryptExportKey size enter elapsed_ms=%llu",
+                static_cast<unsigned long long>(GetTickCount64() - t0));
             if (CryptExportKey(hKey, 0, PRIVATEKEYBLOB, 0, nullptr, &key_blob_size)) {
                 out_key_der.resize(key_blob_size);
-                CryptExportKey(hKey, 0, PRIVATEKEYBLOB, 0, out_key_der.data(), &key_blob_size);
-                out_key_der.resize(key_blob_size);
+                diag::log_tagged_fmt("net_sec", "generate_ca_certificate CryptExportKey data enter key_blob_size=%lu elapsed_ms=%llu",
+                    static_cast<unsigned long>(key_blob_size),
+                    static_cast<unsigned long long>(GetTickCount64() - t0));
+                if (CryptExportKey(hKey, 0, PRIVATEKEYBLOB, 0, out_key_der.data(), &key_blob_size)) {
+                    out_key_der.resize(key_blob_size);
+                } else {
+                    DWORD gle = GetLastError();
+                    diag::log_tagged_fmt("net_sec", "generate_ca_certificate CryptExportKey data failed gle=%lu elapsed_ms=%llu",
+                        static_cast<unsigned long>(gle),
+                        static_cast<unsigned long long>(GetTickCount64() - t0));
+                    SecureZeroMemory(out_key_der.data(), out_key_der.size());
+                    out_key_der.clear();
+                }
+            } else {
+                DWORD gle = GetLastError();
+                diag::log_tagged_fmt("net_sec", "generate_ca_certificate CryptExportKey size failed gle=%lu elapsed_ms=%llu",
+                    static_cast<unsigned long>(gle),
+                    static_cast<unsigned long long>(GetTickCount64() - t0));
             }
         }
 
@@ -1876,7 +2087,12 @@ bool CertificateInjector::generate_ca_certificate(const std::string& cn, std::ui
 
     CryptDestroyKey(hKey);
     CryptReleaseContext(hProv, 0);
-    CryptAcquireContextA(&hProv, container_name.c_str(), nullptr, PROV_RSA_FULL, CRYPT_DELETEKEYSET);
+    diag::log_tagged_fmt("net_sec", "generate_ca_certificate exit ok=%d cert_size=%zu key_exported=%d key_size=%zu elapsed_ms=%llu",
+        out_cert_der.empty() ? 0 : 1,
+        out_cert_der.size(),
+        out_key_der.empty() ? 0 : 1,
+        out_key_der.size(),
+        static_cast<unsigned long long>(GetTickCount64() - t0));
 
     return !out_cert_der.empty();
 }
@@ -2822,22 +3038,46 @@ AutoResponder::match_result_t AutoResponder::match_request(
 }
 
 bool AutoResponder::start() {
-    if (_active.load()) return true;
+    diag::log_tagged_fmt("net_sec", "AutoResponder::start entry active=%d device=%p connected=%d tid=%lu",
+        _active.load() ? 1 : 0,
+        device.get(),
+        device && device->is_connected() ? 1 : 0,
+        static_cast<unsigned long>(GetCurrentThreadId()));
+    if (_active.load()) {
+        diag::log_tagged("net_sec", "AutoResponder::start already_active");
+        return true;
+    }
 
-    if (!device || !device->is_connected()) return false;
+    if (!device || !device->is_connected()) {
+        diag::log_tagged("net_sec", "AutoResponder::start rejected driver_unavailable");
+        return false;
+    }
 
     bool cap_active = false;
     std::uint32_t cap_count = 0, cap_drop = 0;
     device->get_capture_status(cap_active, cap_count, cap_drop);
-    if (!cap_active)
-        device->start_capture(0, 0, 0);
+    diag::log_tagged_fmt("net_sec", "AutoResponder::start capture_status active=%d count=%u drop=%u",
+        cap_active ? 1 : 0, cap_count, cap_drop);
+    if (!cap_active) {
+        bool capture_started = device->start_capture(0, 0, 0);
+        diag::log_tagged_fmt("net_sec", "AutoResponder::start start_capture result=%d",
+            capture_started ? 1 : 0);
+        if (!capture_started)
+            return false;
+    }
 
-    device->intercept_op(1, 0, 0, 6);
+    bool intercept_started = device->intercept_op(1, 0, 0, 6);
+    diag::log_tagged_fmt("net_sec", "AutoResponder::start intercept_start result=%d",
+        intercept_started ? 1 : 0);
+    if (!intercept_started)
+        return false;
 
     _active.store(true);
 
     try {
         _responder_thread = std::thread([this]() {
+            diag::log_tagged_fmt("net_sec", "AutoResponder::worker enter tid=%lu",
+                static_cast<unsigned long>(GetCurrentThreadId()));
             while (_active.load()) {
                 if (!device || !device->is_connected()) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -2969,25 +3209,51 @@ bool AutoResponder::start() {
 
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
+            diag::log_tagged_fmt("net_sec", "AutoResponder::worker exit tid=%lu",
+                static_cast<unsigned long>(GetCurrentThreadId()));
         });
+        diag::log_tagged("net_sec", "AutoResponder::start worker_created");
+    } catch (const std::exception& ex) {
+        _active.store(false);
+        if (device && device->is_connected())
+            device->intercept_op(2, 0, 0, 0);
+        diag::log_tagged_fmt("net_sec", "AutoResponder::start worker_create_failed err=%s", ex.what());
+        return false;
     } catch (...) {
         _active.store(false);
         if (device && device->is_connected())
             device->intercept_op(2, 0, 0, 0);
+        diag::log_tagged("net_sec", "AutoResponder::start worker_create_failed err=<unknown>");
         return false;
     }
 
+    diag::log_tagged("net_sec", "AutoResponder::start ok");
     return true;
 }
 
 bool AutoResponder::stop() {
-    if (!_active.load()) return false;
+    diag::log_tagged_fmt("net_sec", "AutoResponder::stop entry active=%d joinable=%d device=%p connected=%d tid=%lu",
+        _active.load() ? 1 : 0,
+        _responder_thread.joinable() ? 1 : 0,
+        device.get(),
+        device && device->is_connected() ? 1 : 0,
+        static_cast<unsigned long>(GetCurrentThreadId()));
+    if (!_active.load()) {
+        diag::log_tagged("net_sec", "AutoResponder::stop rejected inactive");
+        return false;
+    }
     _active.store(false);
-    if (_responder_thread.joinable())
+    if (_responder_thread.joinable()) {
+        const ULONGLONG t0 = GetTickCount64();
         _responder_thread.join();
+        diag::log_tagged_fmt("net_sec", "AutoResponder::stop worker_joined elapsed_ms=%llu",
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+    }
 
-    if (device && device->is_connected())
-        device->intercept_op(2, 0, 0, 0);
+    if (device && device->is_connected()) {
+        bool stopped = device->intercept_op(2, 0, 0, 0);
+        diag::log_tagged_fmt("net_sec", "AutoResponder::stop intercept_stop result=%d", stopped ? 1 : 0);
+    }
 
     return true;
 }

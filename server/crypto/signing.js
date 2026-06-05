@@ -4,6 +4,7 @@ const crypto = require('crypto');
 
 let cachedPrivateKey = null;
 let cachedNextPrivateKey = null;
+let cachedBootstrapP256 = null;
 let s_loggedPubFp = false;
 
 const PRIMARY_KID = parseInt(process.env.ED25519_PRIMARY_KID || '1', 10) || 1;
@@ -29,11 +30,10 @@ function getSigningPrivateKey() {
 
     if (!s_loggedPubFp) {
         try {
-            const pubSpkiHex = crypto.createPublicKey(cachedPrivateKey)
+            const pubSpki = crypto.createPublicKey(cachedPrivateKey)
                 .export({ format: 'der', type: 'spki' })
-                .toString('hex');
-            const fpShort = pubSpkiHex.slice(-16);
-            console.log(`[signing] loaded ED25519 private key, derived public SPKI(hex)=${pubSpkiHex} fp_tail=${fpShort} src_b64_tail=${b64.slice(-12)} src_b64_len=${b64.length}`);
+            const fpShort = crypto.createHash('sha256').update(pubSpki).digest('hex').slice(-16);
+            console.log(`[signing] loaded ED25519 signing key public_spki_sha256_tail=${fpShort}`);
             s_loggedPubFp = true;
         } catch (err) {
             console.warn('[signing] failed to log pub fingerprint:', err && err.message ? err.message : err);
@@ -70,6 +70,62 @@ function sortObjectKeys(obj) {
         sorted[key] = obj[key];
         return sorted;
     }, {});
+}
+
+function base64Url(buf) {
+    return Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+function fixed32FromBigInt(value) {
+    let hex = value.toString(16);
+    if (hex.length > 64) hex = hex.slice(-64);
+    while (hex.length < 64) hex = '0' + hex;
+    return Buffer.from(hex, 'hex');
+}
+
+function getBootstrapP256KeyInfo() {
+    if (cachedBootstrapP256) return cachedBootstrapP256;
+    const privateDer = Buffer.from(process.env.ED25519_PRIVATE_KEY_B64 || '', 'base64');
+    if (privateDer.length < 32) {
+        throw new Error('bootstrap p256 signing key unavailable');
+    }
+    const seed = crypto.createHmac('sha256', privateDer)
+        .update('aida/bootstrap/manifest-p256/v1', 'utf8')
+        .digest();
+    const n = BigInt('0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551');
+    const scalar = (BigInt('0x' + seed.toString('hex')) % (n - 1n)) + 1n;
+    const d = fixed32FromBigInt(scalar);
+    const ecdh = crypto.createECDH('prime256v1');
+    ecdh.setPrivateKey(d);
+    const pub = ecdh.getPublicKey(null, 'uncompressed');
+    const x = pub.subarray(1, 33);
+    const y = pub.subarray(33, 65);
+    const jwk = {
+        kty: 'EC',
+        crv: 'P-256',
+        x: base64Url(x),
+        y: base64Url(y),
+        d: base64Url(d),
+    };
+    cachedBootstrapP256 = {
+        privateKey: crypto.createPrivateKey({ key: jwk, format: 'jwk' }),
+        publicJwk: { kty: 'EC', crv: 'P-256', x: base64Url(x), y: base64Url(y) },
+        x_hex: x.toString('hex'),
+        y_hex: y.toString('hex'),
+    };
+    return cachedBootstrapP256;
+}
+
+function signBootstrapP256String(value) {
+    return crypto.sign('sha256', Buffer.from(String(value || ''), 'utf8'), {
+        key: getBootstrapP256KeyInfo().privateKey,
+        dsaEncoding: 'ieee-p1363',
+    }).toString('hex');
+}
+
+function getBootstrapP256PublicHex() {
+    const key = getBootstrapP256KeyInfo();
+    return { x: key.x_hex, y: key.y_hex };
 }
 
 
@@ -143,6 +199,7 @@ function getActiveKidInfo() {
 function clearKeyCache() {
     cachedPrivateKey = null;
     cachedNextPrivateKey = null;
+    cachedBootstrapP256 = null;
 }
 
 module.exports = {
@@ -153,6 +210,8 @@ module.exports = {
     getActiveKidInfo,
     getSigningPrivateKey,
     getNextSigningPrivateKey,
+    getBootstrapP256PublicHex,
+    signBootstrapP256String,
     sortObjectKeys,
     clearKeyCache,
 };

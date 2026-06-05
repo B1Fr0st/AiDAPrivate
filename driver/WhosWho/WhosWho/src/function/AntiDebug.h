@@ -46,6 +46,68 @@ namespace anti_debug {
     inline volatile UCHAR g_kd_baseline = 0;
     inline volatile LONG  g_kd_baseline_captured = 0;
 
+    typedef struct _ADBG_SYSTEM_PROCESS_INFORMATION {
+        ULONG NextEntryOffset;
+        ULONG NumberOfThreads;
+        UCHAR Reserved1[48];
+        UNICODE_STRING ImageName;
+        KPRIORITY BasePriority;
+        HANDLE UniqueProcessId;
+        PVOID Reserved2;
+        ULONG HandleCount;
+        ULONG SessionId;
+        PVOID Reserved3;
+        SIZE_T PeakVirtualSize;
+        SIZE_T VirtualSize;
+        ULONG Reserved4;
+        SIZE_T PeakWorkingSetSize;
+        SIZE_T WorkingSetSize;
+        PVOID Reserved5;
+        SIZE_T QuotaPagedPoolUsage;
+        PVOID Reserved6;
+        SIZE_T QuotaNonPagedPoolUsage;
+        SIZE_T PagefileUsage;
+        SIZE_T PeakPagefileUsage;
+        SIZE_T PrivatePageCount;
+        LARGE_INTEGER Reserved7[6];
+    } ADBG_SYSTEM_PROCESS_INFORMATION, *PADBG_SYSTEM_PROCESS_INFORMATION;
+    static_assert(sizeof(ADBG_SYSTEM_PROCESS_INFORMATION) == 256, "ADBG_SYSTEM_PROCESS_INFORMATION size must be 256 bytes");
+
+    constexpr SYSTEM_INFORMATION_CLASS_INTERNAL ADBG_SYSTEM_PROCESS_INFORMATION_CLASS =
+        static_cast<SYSTEM_INFORMATION_CLASS_INTERNAL>(5);
+    constexpr ULONG ADBG_PROCESS_SCAN_TAG = 'pDaW';
+
+    __forceinline char lowercase_ascii_char(char ch)
+    {
+        if (ch >= 'A' && ch <= 'Z')
+            return static_cast<char>(ch + ('a' - 'A'));
+        return ch;
+    }
+
+    __forceinline bool image_file_name_matches_ascii_prefix(const UCHAR* image_name, const char* target)
+    {
+        if (!image_name || !target)
+            return false;
+
+        ULONG index = 0;
+        __try {
+            for (; target[index] != '\0'; ++index) {
+                if (index >= 15)
+                    return false;
+                char lhs = lowercase_ascii_char(static_cast<char>(image_name[index]));
+                char rhs = lowercase_ascii_char(target[index]);
+                if (lhs == '\0')
+                    return false;
+                if (lhs != rhs)
+                    return false;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+
+        return index != 0;
+    }
+
     __forceinline NTSTATUS hide_thread_object_from_debugger(PETHREAD thread)
     {
         if (!thread || !_ObOpenObjectByPointer || !_ZwSetInformationThread ||
@@ -426,52 +488,128 @@ namespace anti_debug {
 
     inline NTSTATUS scan_for_debugger_processes(UINT64* out_debugger_pid)
     {
+        if (!out_debugger_pid)
+            return STATUS_INVALID_PARAMETER;
         *out_debugger_pid = 0;
 
-        __try {
-            PEPROCESS proc = nullptr;
-            PEPROCESS initial = PsInitialSystemProcess;
-            if (!initial) return STATUS_UNSUCCESSFUL;
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+            WW_LOG("[ADBG] scan_debuggers_exit status=0x%08X reason=bad_irql irql=%u", STATUS_INVALID_DEVICE_STATE, KeGetCurrentIrql());
+            return STATUS_INVALID_DEVICE_STATE;
+        }
 
-            PLIST_ENTRY list_head = (PLIST_ENTRY)((UINT8*)initial + 0x448);
-            PLIST_ENTRY entry = list_head->Flink;
+        const char* debugger_names[] = {
+            "x64dbg.exe", "x32dbg.exe", "windbg.exe",
+            "ollydbg.exe", "ida.exe", "ida64.exe",
+            "idaq.exe", "idaq64.exe", "dnspy.exe",
+            "cheatengine", "ce.exe", "processhacker",
+            "apimonitor", "scylla", "titanhide",
+            "hyperdbg.exe", "radare2.exe"
+        };
+        constexpr int num_names = sizeof(debugger_names) / sizeof(debugger_names[0]);
 
-            const char* debugger_names[] = {
-                "x64dbg.exe", "x32dbg.exe", "windbg.exe",
-                "ollydbg.exe", "ida.exe", "ida64.exe",
-                "idaq.exe", "idaq64.exe", "dnspy.exe",
-                "cheatengine", "ce.exe", "processhacker",
-                "apimonitor", "scylla", "titanhide",
-                "hyperdbg.exe", "radare2.exe"
-            };
-            constexpr int num_names = sizeof(debugger_names) / sizeof(debugger_names[0]);
+        ULONG required_length = 0;
+        NTSTATUS status = ZwQuerySystemInformation(
+            ADBG_SYSTEM_PROCESS_INFORMATION_CLASS,
+            nullptr,
+            0,
+            &required_length);
+        WW_LOG("[ADBG] scan_debuggers_probe status=0x%08X required=%lu", status, required_length);
 
-            for (int iter = 0; iter < 1024 && entry != list_head; ++iter, entry = entry->Flink)
-            {
-                PEPROCESS current = (PEPROCESS)((UINT8*)entry - 0x448);
-                if (!_MmIsAddressValid(current)) continue;
+        ULONG buffer_length = required_length;
+        if (buffer_length < 0x100000)
+            buffer_length = 0x100000;
+        else
+            buffer_length += 0x10000;
 
-                UCHAR* image_name = PsGetProcessImageFileName(current);
-                if (!image_name || !_MmIsAddressValid(image_name)) continue;
+        PVOID buffer = nullptr;
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            buffer = ExAllocatePool2(POOL_FLAG_NON_PAGED, buffer_length, ADBG_PROCESS_SCAN_TAG);
+            if (!buffer) {
+                WW_LOG("[ADBG] scan_debuggers_exit status=0x%08X reason=alloc_failed attempt=%d size=%lu", STATUS_INSUFFICIENT_RESOURCES, attempt, buffer_length);
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
 
-                for (int n = 0; n < num_names; ++n) {
-                    const char* target = debugger_names[n];
-                    BOOLEAN match = TRUE;
-                    for (int c = 0; target[c] != '\0'; ++c) {
-                        char a = (char)(image_name[c] | 0x20);
-                        char b = (char)(target[c] | 0x20);
-                        if (a != b) { match = FALSE; break; }
+            status = ZwQuerySystemInformation(
+                ADBG_SYSTEM_PROCESS_INFORMATION_CLASS,
+                buffer,
+                buffer_length,
+                &required_length);
+            WW_LOG("[ADBG] scan_debuggers_query attempt=%d status=0x%08X size=%lu required=%lu", attempt, status, buffer_length, required_length);
+
+            if (status != STATUS_INFO_LENGTH_MISMATCH && status != STATUS_BUFFER_TOO_SMALL && status != STATUS_BUFFER_OVERFLOW)
+                break;
+
+            ExFreePoolWithTag(buffer, ADBG_PROCESS_SCAN_TAG);
+            buffer = nullptr;
+
+            ULONG next_length = required_length;
+            if (next_length <= buffer_length)
+                next_length = buffer_length * 2;
+            if (next_length < buffer_length)
+                return STATUS_INTEGER_OVERFLOW;
+            buffer_length = next_length + 0x10000;
+            if (buffer_length < next_length)
+                return STATUS_INTEGER_OVERFLOW;
+        }
+
+        if (!buffer)
+            return STATUS_UNSUCCESSFUL;
+
+        if (!NT_SUCCESS(status)) {
+            ExFreePoolWithTag(buffer, ADBG_PROCESS_SCAN_TAG);
+            WW_LOG("[ADBG] scan_debuggers_exit status=0x%08X reason=query_failed", status);
+            return status;
+        }
+
+        PUCHAR cursor = static_cast<PUCHAR>(buffer);
+        PUCHAR end = cursor + buffer_length;
+        ULONG scanned = 0;
+        ULONG lookup_misses = 0;
+
+        while (cursor + sizeof(ADBG_SYSTEM_PROCESS_INFORMATION) <= end && scanned < 131072) {
+            auto info = reinterpret_cast<PADBG_SYSTEM_PROCESS_INFORMATION>(cursor);
+            ++scanned;
+
+            if (info->UniqueProcessId != nullptr) {
+                PEPROCESS process = nullptr;
+                NTSTATUS lookup_status = PsLookupProcessByProcessId(info->UniqueProcessId, &process);
+                if (NT_SUCCESS(lookup_status) && process) {
+                    bool matched = false;
+                    UCHAR* image_name = PsGetProcessImageFileName(process);
+                    if (image_name) {
+                        for (int n = 0; n < num_names; ++n) {
+                            if (image_file_name_matches_ascii_prefix(image_name, debugger_names[n])) {
+                                *out_debugger_pid = (UINT64)(ULONG_PTR)info->UniqueProcessId;
+                                matched = true;
+                                break;
+                            }
+                        }
                     }
-                    if (match) {
-                        HANDLE pid_handle = PsGetProcessId(current);
-                        *out_debugger_pid = (UINT64)(ULONG_PTR)pid_handle;
+                    ObDereferenceObject(process);
+                    if (matched) {
+                        ExFreePoolWithTag(buffer, ADBG_PROCESS_SCAN_TAG);
+                        WW_LOG("[ADBG] scan_debuggers_exit status=0x%08X result=hit scanned=%lu lookup_misses=%lu pid=%llu", STATUS_SUCCESS, scanned, lookup_misses, *out_debugger_pid);
                         return STATUS_SUCCESS;
                     }
+                } else {
+                    ++lookup_misses;
                 }
             }
-        } __except(EXCEPTION_EXECUTE_HANDLER) {
-            return STATUS_UNSUCCESSFUL;
+
+            if (info->NextEntryOffset == 0)
+                break;
+            if (info->NextEntryOffset < sizeof(ADBG_SYSTEM_PROCESS_INFORMATION) ||
+                cursor + info->NextEntryOffset <= cursor ||
+                cursor + info->NextEntryOffset > end) {
+                ExFreePoolWithTag(buffer, ADBG_PROCESS_SCAN_TAG);
+                WW_LOG("[ADBG] scan_debuggers_exit status=0x%08X reason=bad_next offset=%lu scanned=%lu", STATUS_DATA_ERROR, info->NextEntryOffset, scanned);
+                return STATUS_DATA_ERROR;
+            }
+            cursor += info->NextEntryOffset;
         }
+
+        ExFreePoolWithTag(buffer, ADBG_PROCESS_SCAN_TAG);
+        WW_LOG("[ADBG] scan_debuggers_exit status=0x%08X result=none scanned=%lu lookup_misses=%lu", STATUS_NOT_FOUND, scanned, lookup_misses);
 
         return STATUS_NOT_FOUND;
     }

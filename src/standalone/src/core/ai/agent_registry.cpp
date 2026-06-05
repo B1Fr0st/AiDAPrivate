@@ -215,7 +215,6 @@ You are running inside the AiDA standalone IDE — an IDA-Pro-class reverse-engi
 - disassemble_address — disassemble live memory via Zydis.
 - disassemble_file — disassemble a PE file from disk via Zydis.
 - read_memory / read_string — read bytes or strings from the attached process.
-- reconstruct_source / reconstruct_status / reconstruct_cancel — invoke the source-reconstructor pipeline.
 - get_imports / get_exports / get_sections / get_pe_header — PE introspection.
 - hex_dump / hex_dump_file — hex view of memory or file regions.
 

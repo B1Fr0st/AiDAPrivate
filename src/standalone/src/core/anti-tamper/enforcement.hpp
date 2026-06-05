@@ -115,6 +115,10 @@ namespace enforcement_detail {
 
     inline bool destructive_enforcement_suppressed()
     {
+        if (anti_tamper::state::get().full_test_running.load(std::memory_order_acquire))
+            return true;
+        if (anti_tamper::state::full_test_suppression_active())
+            return true;
 #ifdef NDEBUG
         return false;
 #else
@@ -125,11 +129,15 @@ namespace enforcement_detail {
 
     inline void log_destructive_enforcement_suppressed(const char* path, uint64_t reason_id = 0)
     {
+        uint64_t full_test_suppression_remaining = 0;
+        anti_tamper::state::full_test_suppression_active(&full_test_suppression_remaining);
         char msg[192];
         _snprintf_s(msg, sizeof(msg), _TRUNCATE,
-            "DESTRUCTIVE_ENFORCEMENT_SUPPRESSED path=%s reason_id=0x%016llX env_full_test=%d env_disable=%d",
+            "DESTRUCTIVE_ENFORCEMENT_SUPPRESSED path=%s reason_id=0x%016llX full_test_latch=%d post_full_test_ms=%llu env_full_test=%d env_disable=%d",
             path ? path : "?",
             static_cast<unsigned long long>(reason_id),
+            anti_tamper::state::get().full_test_running.load(std::memory_order_acquire) ? 1 : 0,
+            static_cast<unsigned long long>(full_test_suppression_remaining),
             env_flag_enabled("AIDA_FULL_TEST_RUNNING") ? 1 : 0,
             env_flag_enabled("AIDA_DISABLE_DESTRUCTIVE_ENFORCEMENT") ? 1 : 0);
         diag::log_tagged_critical("enforce", msg);
@@ -540,11 +548,6 @@ inline void enforce_violation_id(uint64_t reason_id, const std::string& extra = 
 
     OBFUSCATE_JUNK(ev_pre);
 
-    if (rt.violation_latched.exchange(true)) {
-        diag::log_tagged_critical("enforce", "already_latched_returning");
-        return;
-    }
-
     if (enforcement_detail::destructive_enforcement_suppressed()) {
         {
             std::lock_guard<std::mutex> lk(rt.mtx);
@@ -554,6 +557,11 @@ inline void enforce_violation_id(uint64_t reason_id, const std::string& extra = 
             extra.empty() ? "enforce_violation_id" : extra.c_str(),
             reason_id);
         diag::log_tagged_critical("enforce", "enforce_violation_id_suppressed_returning_before_alert_shutdown");
+        return;
+    }
+
+    if (rt.violation_latched.exchange(true)) {
+        diag::log_tagged_critical("enforce", "already_latched_returning");
         return;
     }
 

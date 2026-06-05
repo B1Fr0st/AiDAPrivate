@@ -889,6 +889,8 @@ add_custom_target(ghidra_specs ALL DEPENDS
 # regenerates the legacy .c hex dump from the binary directly so the
 # manual HxD round-trip is no longer required.
 find_package(Python3 COMPONENTS Interpreter QUIET)
+option(AIDA_DISABLE_LEGACY_DRIVER_MAPPER "Disable the embedded legacy WindMapper driver mapper fallback" OFF)
+option(AIDA_REGENERATE_LEGACY_DRIVER_MAPPER_FROM_BINARY "Regenerate WindMapper embedding from build-ninja/Release/WindMapper.exe instead of WindMapper.c" OFF)
 if(Python3_FOUND)
     # The driver/mapper .vcxproj files hardcode <OutDir> to
     # ${CMAKE_SOURCE_DIR}/build-ninja/Release/, so the built binaries
@@ -900,16 +902,22 @@ if(Python3_FOUND)
         CACHE FILEPATH "Path to the built WhosWho.sys")
     set(SENTINEL_BINARY   "${AIDA_DRIVER_OUTPUT_DIR}/Sentinel.sys"
         CACHE FILEPATH "Path to the built Sentinel.sys")
-    set(WINDMAPPER_BINARY "${AIDA_DRIVER_OUTPUT_DIR}/WindMapper.exe"
-        CACHE FILEPATH "Path to the built WindMapper.exe")
+    if(NOT AIDA_DISABLE_LEGACY_DRIVER_MAPPER AND AIDA_REGENERATE_LEGACY_DRIVER_MAPPER_FROM_BINARY)
+        set(WINDMAPPER_BINARY "${AIDA_DRIVER_OUTPUT_DIR}/WindMapper.exe"
+            CACHE FILEPATH "Path to the built WindMapper.exe")
+    endif()
 
     set(WHOSWHO_HEX    "${CMAKE_CURRENT_SOURCE_DIR}/WhosWho.c")
     set(SENTINEL_HEX   "${CMAKE_CURRENT_SOURCE_DIR}/Sentinel.c")
-    set(WINDMAPPER_HEX "${CMAKE_CURRENT_SOURCE_DIR}/WindMapper.c")
+    if(NOT AIDA_DISABLE_LEGACY_DRIVER_MAPPER)
+        set(WINDMAPPER_HEX "${CMAKE_CURRENT_SOURCE_DIR}/WindMapper.c")
+    endif()
 
     set(WHOSWHO_SCRIPT    "${CMAKE_CURRENT_SOURCE_DIR}/src/encrypt_whoswho.py")
     set(SENTINEL_SCRIPT   "${CMAKE_CURRENT_SOURCE_DIR}/src/encrypt_sentinel.py")
-    set(WINDMAPPER_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/src/encrypt_windmapper.py")
+    if(NOT AIDA_DISABLE_LEGACY_DRIVER_MAPPER)
+        set(WINDMAPPER_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/src/encrypt_windmapper.py")
+    endif()
 
     set(ENCRYPT_DRIVERS_STAMPS "")
 
@@ -956,10 +964,12 @@ if(Python3_FOUND)
         "${SENTINEL_BINARY}" "${SENTINEL_HEX}" "${SENTINEL_SCRIPT}"
         "${CMAKE_BINARY_DIR}/sentinel_encrypted.stamp"
         "Encrypting Sentinel -> sentinel_encrypted.h")
-    _aida_emit_encrypt_rule("WindMapper"
-        "${WINDMAPPER_BINARY}" "${WINDMAPPER_HEX}" "${WINDMAPPER_SCRIPT}"
-        "${CMAKE_BINARY_DIR}/windmapper_encrypted.stamp"
-        "Encrypting WindMapper -> windmapper_data.inc")
+    if(NOT AIDA_DISABLE_LEGACY_DRIVER_MAPPER)
+        _aida_emit_encrypt_rule("WindMapper"
+            "${WINDMAPPER_BINARY}" "${WINDMAPPER_HEX}" "${WINDMAPPER_SCRIPT}"
+            "${CMAKE_BINARY_DIR}/windmapper_encrypted.stamp"
+            "Encrypting WindMapper -> windmapper_data.inc")
+    endif()
     if(ENCRYPT_DRIVERS_STAMPS)
         add_custom_target(encrypt_drivers DEPENDS ${ENCRYPT_DRIVERS_STAMPS})
         add_custom_target(reencrypt_drivers
@@ -984,9 +994,13 @@ endif()
 set(ENCRYPTED_DRIVER_HEADERS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/whoswho_encrypted.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/sentinel_encrypted.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/windmapper_embedded.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/windmapper_data.inc"
 )
+if(NOT AIDA_DISABLE_LEGACY_DRIVER_MAPPER)
+    list(APPEND ENCRYPTED_DRIVER_HEADERS
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/windmapper_embedded.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/windmapper_data.inc"
+    )
+endif()
 set_source_files_properties(
     src/driver_loader.cpp
     PROPERTIES OBJECT_DEPENDS "${ENCRYPTED_DRIVER_HEADERS}"
@@ -1465,6 +1479,7 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/testlab/test_all_burp.cpp"
             "${STANDALONE_ROOT}/core/testlab/test_all_disasm.cpp"
             "${STANDALONE_ROOT}/core/testlab/test_all_mcp.cpp"
+            "${STANDALONE_ROOT}/core/testlab/test_all_ui.cpp"
             "${DEPS_DIR}/sqlite-amalgamation-3530000/sqlite3.c"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/shared/hardware_id/hardware_id_v2.cpp"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/shared/telemetry/telemetry_client.cpp"
@@ -1696,6 +1711,9 @@ if(WIN32)
             AIDA_DEEP_STEAL=1
             AIDA_STANDALONE
         )
+        if(NOT AIDA_DISABLE_LEGACY_DRIVER_MAPPER)
+            target_compile_definitions(AiDAStandalone PRIVATE AIDA_LEGACY_DRIVER_MAPPER_AVAILABLE)
+        endif()
 
         target_compile_options(AiDAStandalone PRIVATE
             /W3
@@ -1987,20 +2005,74 @@ if(WIN32)
             )
         endif()
 
-        set(AIDA_BUNDLED_PYTHON_DIR "${CMAKE_CURRENT_SOURCE_DIR}/python-3.12")
-        if(EXISTS "${AIDA_BUNDLED_PYTHON_DIR}/python.exe")
+        set(AIDA_BUNDLED_PYTHON_CANDIDATES
+            "${CMAKE_CURRENT_SOURCE_DIR}/camoufox-runtime"
+            "${CMAKE_CURRENT_SOURCE_DIR}/camoufox-python"
+            "${CMAKE_CURRENT_SOURCE_DIR}/python-3.12"
+            "${CMAKE_CURRENT_SOURCE_DIR}/python-3.12.10-x64"
+            "${CMAKE_CURRENT_SOURCE_DIR}/Python312"
+            "${CMAKE_CURRENT_SOURCE_DIR}/Python312-3.12.10-x64"
+            "${CMAKE_CURRENT_SOURCE_DIR}/runtime/python"
+            "${CMAKE_CURRENT_SOURCE_DIR}/runtime/python/Python312-3.12.10-x64"
+            "${CMAKE_CURRENT_SOURCE_DIR}/runtimes/python/Python312-3.12.10-x64"
+            "${CMAKE_CURRENT_SOURCE_DIR}/.deps/camoufox-runtime"
+            "${CMAKE_CURRENT_SOURCE_DIR}/.deps/camoufox-python"
+            "${CMAKE_CURRENT_SOURCE_DIR}/.deps/python-3.12"
+            "${CMAKE_CURRENT_SOURCE_DIR}/.deps/python-3.12.10-x64"
+            "${CMAKE_CURRENT_SOURCE_DIR}/.deps/Python312"
+            "${CMAKE_CURRENT_SOURCE_DIR}/.deps/Python312-3.12.10-x64"
+        )
+        set(AIDA_BUNDLED_PYTHON_DIR "")
+        foreach(AIDA_BUNDLED_PYTHON_CANDIDATE IN LISTS AIDA_BUNDLED_PYTHON_CANDIDATES)
+            if(NOT AIDA_BUNDLED_PYTHON_DIR AND EXISTS "${AIDA_BUNDLED_PYTHON_CANDIDATE}/python.exe")
+                set(AIDA_BUNDLED_PYTHON_DIR "${AIDA_BUNDLED_PYTHON_CANDIDATE}")
+            endif()
+        endforeach()
+        if(AIDA_BUNDLED_PYTHON_DIR)
             add_custom_command(TARGET AiDAStandalone POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:AiDAStandalone>/deps"
                 COMMAND ${CMAKE_COMMAND} -E copy_directory
                     "${AIDA_BUNDLED_PYTHON_DIR}"
-                    "$<TARGET_FILE_DIR:AiDAStandalone>/deps/python-3.12"
+                    "$<TARGET_FILE_DIR:AiDAStandalone>/deps/camoufox-runtime"
                 COMMENT "Staging bundled Python runtime beside AiDAStandalone.exe..."
                 VERBATIM
             )
+            message(STATUS "AiDA Camoufox bundled Python runtime: ${AIDA_BUNDLED_PYTHON_DIR}")
+        else()
+            message(STATUS "AiDA Camoufox bundled Python runtime not found; Camoufox launch will fail fast unless AIDA_CAMOUFOX_ALLOW_SETUP_BOOTSTRAP=1 is set for developer recovery")
         endif()
 
-        set(AIDA_PYTHON_INSTALLER "${CMAKE_CURRENT_SOURCE_DIR}/python-3.12.10-amd64.exe")
-        if(EXISTS "${AIDA_PYTHON_INSTALLER}")
+        add_custom_command(TARGET AiDAStandalone POST_BUILD
+            COMMAND ${CMAKE_COMMAND}
+                "-DAIDA_CAMOUFOX_STAGE_ROOT=$<TARGET_FILE_DIR:AiDAStandalone>"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/aida_patch_camoufox_reverse_mcp.cmake"
+            COMMENT "Patching staged camoufox-reverse-mcp launcher..."
+            VERBATIM
+        )
+
+        set(AIDA_PYTHON_INSTALLER_CANDIDATES
+            "${CMAKE_CURRENT_SOURCE_DIR}/python-3.12.10-amd64.exe"
+            "${CMAKE_CURRENT_SOURCE_DIR}/camoufox-runtime/python-3.12.10-amd64.exe"
+            "${CMAKE_CURRENT_SOURCE_DIR}/camoufox-python/python-3.12.10-amd64.exe"
+            "${CMAKE_CURRENT_SOURCE_DIR}/python-3.12/python-3.12.10-amd64.exe"
+            "${CMAKE_CURRENT_SOURCE_DIR}/python-3.12.10-x64/python-3.12.10-amd64.exe"
+            "${CMAKE_CURRENT_SOURCE_DIR}/Python312/python-3.12.10-amd64.exe"
+            "${CMAKE_CURRENT_SOURCE_DIR}/Python312-3.12.10-x64/python-3.12.10-amd64.exe"
+            "${CMAKE_CURRENT_SOURCE_DIR}/.deps/camoufox-runtime/python-3.12.10-amd64.exe"
+            "${CMAKE_CURRENT_SOURCE_DIR}/.deps/camoufox-python/python-3.12.10-amd64.exe"
+            "${CMAKE_CURRENT_SOURCE_DIR}/.deps/python-3.12.10-amd64.exe"
+            "${CMAKE_CURRENT_SOURCE_DIR}/.deps/python-3.12/python-3.12.10-amd64.exe"
+            "${CMAKE_CURRENT_SOURCE_DIR}/.deps/python-3.12.10-x64/python-3.12.10-amd64.exe"
+            "${CMAKE_CURRENT_SOURCE_DIR}/.deps/Python312/python-3.12.10-amd64.exe"
+            "${CMAKE_CURRENT_SOURCE_DIR}/.deps/Python312-3.12.10-x64/python-3.12.10-amd64.exe"
+        )
+        set(AIDA_PYTHON_INSTALLER "")
+        foreach(AIDA_PYTHON_INSTALLER_CANDIDATE IN LISTS AIDA_PYTHON_INSTALLER_CANDIDATES)
+            if(NOT AIDA_PYTHON_INSTALLER AND EXISTS "${AIDA_PYTHON_INSTALLER_CANDIDATE}")
+                set(AIDA_PYTHON_INSTALLER "${AIDA_PYTHON_INSTALLER_CANDIDATE}")
+            endif()
+        endforeach()
+        if(AIDA_PYTHON_INSTALLER AND EXISTS "${AIDA_PYTHON_INSTALLER}")
             add_custom_command(TARGET AiDAStandalone POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:AiDAStandalone>/deps"
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -2009,6 +2081,33 @@ if(WIN32)
                 COMMENT "Staging Python installer beside AiDAStandalone.exe..."
                 VERBATIM
             )
+            message(STATUS "AiDA Camoufox bundled Python installer: ${AIDA_PYTHON_INSTALLER}")
+        endif()
+
+        set(AIDA_CAMOUFOX_WHEELHOUSE_CANDIDATES
+            "${CMAKE_CURRENT_SOURCE_DIR}/camoufox-wheelhouse"
+            "${CMAKE_CURRENT_SOURCE_DIR}/wheelhouse"
+            "${CMAKE_CURRENT_SOURCE_DIR}/wheels"
+            "${CMAKE_CURRENT_SOURCE_DIR}/.deps/camoufox-wheelhouse"
+            "${CMAKE_CURRENT_SOURCE_DIR}/.deps/wheelhouse"
+            "${CMAKE_CURRENT_SOURCE_DIR}/.deps/wheels"
+        )
+        set(AIDA_CAMOUFOX_WHEELHOUSE_DIR "")
+        foreach(AIDA_CAMOUFOX_WHEELHOUSE_CANDIDATE IN LISTS AIDA_CAMOUFOX_WHEELHOUSE_CANDIDATES)
+            if(NOT AIDA_CAMOUFOX_WHEELHOUSE_DIR AND EXISTS "${AIDA_CAMOUFOX_WHEELHOUSE_CANDIDATE}")
+                set(AIDA_CAMOUFOX_WHEELHOUSE_DIR "${AIDA_CAMOUFOX_WHEELHOUSE_CANDIDATE}")
+            endif()
+        endforeach()
+        if(AIDA_CAMOUFOX_WHEELHOUSE_DIR)
+            add_custom_command(TARGET AiDAStandalone POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:AiDAStandalone>/deps"
+                COMMAND ${CMAKE_COMMAND} -E copy_directory
+                    "${AIDA_CAMOUFOX_WHEELHOUSE_DIR}"
+                    "$<TARGET_FILE_DIR:AiDAStandalone>/deps/camoufox-wheelhouse"
+                COMMENT "Staging bundled Camoufox Python wheelhouse beside AiDAStandalone.exe..."
+                VERBATIM
+            )
+            message(STATUS "AiDA Camoufox bundled wheelhouse: ${AIDA_CAMOUFOX_WHEELHOUSE_DIR}")
         endif()
 
         # Post-build copies removed — libz3.dll and ghidra_specs are now
@@ -2185,7 +2284,6 @@ set(AIDA_HEADERS
     src/agent_tools.hpp
     src/aida.hpp
     src/aida_ipc.hpp
-    src/aida_manual_map_proof.hpp
     src/aida_pro.hpp
     src/analysis_db.hpp
     src/anti_re.hpp
@@ -2209,8 +2307,12 @@ set(AIDA_HEADERS
     src/vuln/embedded_libz3.hpp
     src/whoswho_encrypted.h
     src/sentinel_encrypted.h
-    src/windmapper_embedded.h
 )
+if(NOT AIDA_DISABLE_LEGACY_DRIVER_MAPPER)
+    list(APPEND AIDA_HEADERS
+        src/windmapper_embedded.h
+    )
+endif()
 
 if(WIN32)
     set(Z3_DLL_PATH_FORWARD "${Z3_INSTALL_DIR}/bin/libz3.dll")
@@ -2284,6 +2386,9 @@ target_compile_definitions(AiDA PRIVATE
     ATP_JIT_DISABLED=1
     TRITON_Z3_INTERFACE
 )
+if(NOT AIDA_DISABLE_LEGACY_DRIVER_MAPPER)
+    target_compile_definitions(AiDA PRIVATE AIDA_LEGACY_DRIVER_MAPPER_AVAILABLE)
+endif()
 
 
 
@@ -2824,31 +2929,6 @@ if(BUILD_PROTECTOR)
         endif()
         add_dependencies(AiDA AiDAProtector)
     endif()
-endif()
-
-if(WIN32 AND TARGET AiDA AND TARGET AiDAStandalone AND Python3_FOUND)
-    set(AIDA_PLUGIN_HEADER "${CMAKE_CURRENT_SOURCE_DIR}/src/aida_plugin_encrypted.h")
-    add_custom_command(
-        OUTPUT "${AIDA_PLUGIN_HEADER}"
-        COMMAND ${Python3_EXECUTABLE}
-                "${CMAKE_CURRENT_SOURCE_DIR}/src/encrypt_aida_plugin.py"
-                --input  "$<TARGET_FILE:AiDA>"
-                --output "${AIDA_PLUGIN_HEADER}"
-        DEPENDS AiDA
-                "${CMAKE_CURRENT_SOURCE_DIR}/src/encrypt_aida_plugin.py"
-        COMMENT "Encrypting protected AiDA.dll -> aida_plugin_encrypted.h"
-        VERBATIM
-    )
-    add_custom_target(encrypt_aida_plugin DEPENDS "${AIDA_PLUGIN_HEADER}")
-    add_dependencies(encrypt_aida_plugin AiDA)
-    add_dependencies(AiDAStandalone encrypt_aida_plugin)
-    target_sources(AiDAStandalone PRIVATE
-        "${STANDALONE_ROOT}/core/runtime/ida_injector.cpp"
-    )
-    set_source_files_properties(
-        "${STANDALONE_ROOT}/core/runtime/ida_injector.cpp"
-        PROPERTIES OBJECT_DEPENDS "${AIDA_PLUGIN_HEADER}"
-    )
 endif()
 
 if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/nanomite_drx_test/CMakeLists.txt")

@@ -23,6 +23,7 @@
 #include "zydis_disasm.hpp"
 #include "standalone_ai_client.hpp"
 #include "standalone_settings.hpp"
+#include "../infra/critical_work_queue.hpp"
 #include "imgui/imgui.h"
 
 #include <nlohmann/json.hpp>
@@ -848,7 +849,7 @@ inline void reconstruct_from_snapshot(uint64_t base_address, int struct_size, co
 	g_state.cancel.store(false);
 	g_state.progress.store(0.f);
 
-	work_queue::post([base_address, struct_size, name]() {
+	auto worker = [base_address, struct_size, name]() {
 		reconstructed_struct_t result;
 		result.base_address = base_address;
 		result.total_size = struct_size;
@@ -940,7 +941,15 @@ inline void reconstruct_from_snapshot(uint64_t base_address, int struct_size, co
 
 		g_state.progress.store(1.f);
 		g_state.monitoring.store(false);
-	});
+	};
+	if (struct_size > 0 && struct_size <= 4096) {
+		worker();
+		return;
+	}
+	if (!critical_work_queue::post(worker) && !work_queue::post(worker)) {
+		g_state.progress.store(1.f);
+		g_state.monitoring.store(false);
+	}
 }
 
 namespace insn_analysis {

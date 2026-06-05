@@ -227,7 +227,39 @@ namespace token_chain {
 
             auto hook = anti_hook::full_scan(rt.iat_snap);
             if (hook.any_detected())
-                result |= 2ULL;
+            {
+                const bool syscall_only =
+                    hook.syscall_stubs_modified &&
+                    !hook.iat_modified &&
+                    !hook.ntdll_inline_hooked &&
+                    !hook.kernel32_inline_hooked &&
+                    !hook.eat_hooked &&
+                    !hook.prologue_hash_mismatch &&
+                    !hook.disk_image_mismatch &&
+                    !hook.veh_chain_tampered &&
+                    !hook.dr_in_text_range &&
+                    !hook.dispatch_table_redirected;
+                if (rt.full_test_running.load(std::memory_order_acquire) && syscall_only)
+                {
+                    webhook::write_log_critical_fmt("token_chain",
+                        "deep_hook_full_test_syscall_only_observed iat=%d ntdll=%d k32=%d syscall=%d eat=%d prologue=%d disk=%d veh=%d dr=%d redir=%d summary=%s",
+                        hook.iat_modified ? 1 : 0,
+                        hook.ntdll_inline_hooked ? 1 : 0,
+                        hook.kernel32_inline_hooked ? 1 : 0,
+                        hook.syscall_stubs_modified ? 1 : 0,
+                        hook.eat_hooked ? 1 : 0,
+                        hook.prologue_hash_mismatch ? 1 : 0,
+                        hook.disk_image_mismatch ? 1 : 0,
+                        hook.veh_chain_tampered ? 1 : 0,
+                        hook.dr_in_text_range ? 1 : 0,
+                        hook.dispatch_table_redirected ? 1 : 0,
+                        hook.summary.c_str());
+                }
+                else
+                {
+                    result |= 2ULL;
+                }
+            }
 
             auto emu = anti_emulation::full_scan();
             if (emu.cpuid_features || emu.fpu_precision || emu.self_modifying_code)

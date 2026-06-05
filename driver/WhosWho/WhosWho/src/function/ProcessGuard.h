@@ -5,9 +5,14 @@
 #include "CoreSecurity.h"
 #include "SentinelBridge.h"
 #include "TargetingLatch.h"
+#include "Struct.h"
 #include "DmaCanary.h"
 #include "AntiDebug.h"
 #include "impl/AntiDumpKernel.h"
+
+namespace dll_protection {
+    ULONG cleanup_for_pid(UINT32 pid);
+}
 
 namespace process_guard {
 
@@ -94,6 +99,111 @@ namespace process_guard {
 
         _ObfDereferenceObject(proc);
         return got_image;
+    }
+
+    __forceinline void copy_unicode_for_log(PCUNICODE_STRING text, char* out, SIZE_T out_size) {
+        if (!out || out_size == 0)
+            return;
+        out[0] = 0;
+        if (!text || !text->Buffer || text->Length == 0) {
+            const char none[] = "<none>";
+            SIZE_T n = sizeof(none) - 1;
+            if (n >= out_size) n = out_size - 1;
+            for (SIZE_T i = 0; i < n; ++i) out[i] = none[i];
+            out[n] = 0;
+            return;
+        }
+        __try {
+            USHORT chars = text->Length / sizeof(WCHAR);
+            SIZE_T limit = out_size - 1;
+            SIZE_T count = chars < limit ? chars : limit;
+            for (SIZE_T i = 0; i < count; ++i) {
+                WCHAR wc = text->Buffer[i];
+                out[i] = (wc >= 32 && wc < 127) ? static_cast<char>(wc) : '?';
+            }
+            out[count] = 0;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            const char bad[] = "<except>";
+            SIZE_T n = sizeof(bad) - 1;
+            if (n >= out_size) n = out_size - 1;
+            for (SIZE_T i = 0; i < n; ++i) out[i] = bad[i];
+            out[n] = 0;
+        }
+    }
+
+    __forceinline void copy_process_image_for_log(HANDLE pid, char* out, SIZE_T out_size) {
+        if (!out || out_size == 0)
+            return;
+        out[0] = 0;
+        PEPROCESS proc = nullptr;
+        NTSTATUS st = PsLookupProcessByProcessId(pid, &proc);
+        if (!NT_SUCCESS(st) || !proc) {
+            const char unknown[] = "<lookup_failed>";
+            SIZE_T n = sizeof(unknown) - 1;
+            if (n >= out_size) n = out_size - 1;
+            for (SIZE_T i = 0; i < n; ++i) out[i] = unknown[i];
+            out[n] = 0;
+            return;
+        }
+        __try {
+            UCHAR* img = PsGetProcessImageFileName(proc);
+            if (img && _MmIsAddressValid(img)) {
+                SIZE_T i = 0;
+                for (; i + 1 < out_size && i < 15 && img[i] != 0; ++i)
+                    out[i] = static_cast<char>(img[i]);
+                out[i] = 0;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            const char bad[] = "<except>";
+            SIZE_T n = sizeof(bad) - 1;
+            if (n >= out_size) n = out_size - 1;
+            for (SIZE_T i = 0; i < n; ++i) out[i] = bad[i];
+            out[n] = 0;
+        }
+        if (out[0] == 0) {
+            const char none[] = "<none>";
+            SIZE_T n = sizeof(none) - 1;
+            if (n >= out_size) n = out_size - 1;
+            for (SIZE_T i = 0; i < n; ++i) out[i] = none[i];
+            out[n] = 0;
+        }
+        _ObfDereferenceObject(proc);
+    }
+
+    __forceinline void copy_process_object_image_for_log(PEPROCESS proc, char* out, SIZE_T out_size) {
+        if (!out || out_size == 0)
+            return;
+        out[0] = 0;
+        if (!proc) {
+            const char none[] = "<none>";
+            SIZE_T n = sizeof(none) - 1;
+            if (n >= out_size) n = out_size - 1;
+            for (SIZE_T i = 0; i < n; ++i) out[i] = none[i];
+            out[n] = 0;
+            return;
+        }
+        __try {
+            UCHAR* img = PsGetProcessImageFileName(proc);
+            if (img && _MmIsAddressValid(img)) {
+                SIZE_T i = 0;
+                for (; i + 1 < out_size && i < 15 && img[i] != 0; ++i)
+                    out[i] = static_cast<char>(img[i]);
+                out[i] = 0;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            const char bad[] = "<except>";
+            SIZE_T n = sizeof(bad) - 1;
+            if (n >= out_size) n = out_size - 1;
+            for (SIZE_T i = 0; i < n; ++i) out[i] = bad[i];
+            out[n] = 0;
+        }
+        if (out[0] == 0) {
+            const char unknown[] = "<unknown>";
+            SIZE_T n = sizeof(unknown) - 1;
+            if (n >= out_size) n = out_size - 1;
+            for (SIZE_T i = 0; i < n; ++i) out[i] = unknown[i];
+            out[n] = 0;
+        }
     }
 
     __forceinline void query_caller_attrs(HANDLE caller_pid, bool* out_is_werfault, bool* out_is_allowlisted) {
@@ -396,19 +506,29 @@ namespace process_guard {
         HANDLE ProcessId,
         PPS_CREATE_NOTIFY_INFO CreateInfo)
     {
-        UNREFERENCED_PARAMETER(Process);
-
         if (!CreateInfo) {
             UINT32 dying_pid = static_cast<UINT32>(reinterpret_cast<ULONG_PTR>(ProcessId));
             if (dying_pid != 0 && dying_pid != 4) {
+                char dying_image[32] = {};
+                copy_process_object_image_for_log(Process, dying_image, sizeof(dying_image));
                 ULONG cleared = anti_dma_canary::cleanup_for_pid(dying_pid);
+                ULONG dprt_cleared = dll_protection::cleanup_for_pid(dying_pid);
+                InvalidateDTBCache(dying_pid);
                 continuous_anti_debug::stop_if_target(dying_pid);
                 continuous_anti_dump::stop_if_target(dying_pid);
-                if (anti_dump_kernel::remove_permitted_pid(dying_pid)) {
-                    WW_LOG("create_process_notify: pid=%u exited, evicted from permitted_pids list",
-                        dying_pid);
-                }
+                BOOLEAN permitted_evicted = anti_dump_kernel::remove_permitted_pid(dying_pid) ? TRUE : FALSE;
                 HANDLE registered = caller_validation::g_registered_client_pid;
+                const bool registered_client = registered &&
+                    reinterpret_cast<UINT64>(registered) == static_cast<UINT64>(dying_pid);
+                WW_LOG("create_process_notify: pid=%u exited image='%s' current_pid=%llu irql=%lu canaries_cleared=%lu dprt_slots_cleared=%lu permitted_evict=%lu registered_client=%lu",
+                    dying_pid,
+                    dying_image,
+                    reinterpret_cast<UINT64>(PsGetCurrentProcessId()),
+                    static_cast<ULONG>(KeGetCurrentIrql()),
+                    cleared,
+                    dprt_cleared,
+                    static_cast<ULONG>(permitted_evicted ? 1 : 0),
+                    static_cast<ULONG>(registered_client ? 1 : 0));
                 if (registered &&
                     reinterpret_cast<UINT64>(registered) == static_cast<UINT64>(dying_pid)) {
                     dispatcher::reset_dynamic_session_state("registered_client_exit", registered, cleared, FALSE);
@@ -417,6 +537,10 @@ namespace process_guard {
                 } else if (cleared) {
                     WW_LOG("create_process_notify: pid=%u exited, canaries_cleared=%lu",
                         dying_pid, cleared);
+                }
+                if (dprt_cleared) {
+                    WW_LOG("create_process_notify: pid=%u exited, dprt_slots_cleared=%lu",
+                        dying_pid, dprt_cleared);
                 }
             }
             return;
@@ -428,19 +552,38 @@ namespace process_guard {
 
 
         HANDLE parent_pid = CreateInfo->ParentProcessId;
+        HANDLE creator_pid = CreateInfo->CreatingThreadId.UniqueProcess;
+        HANDLE creator_tid = CreateInfo->CreatingThreadId.UniqueThread;
+        HANDLE current_pid = PsGetCurrentProcessId();
+        char image_path[192] = {};
+        char command_line[192] = {};
+        char parent_image[32] = {};
+        char creator_image[32] = {};
+        copy_unicode_for_log(CreateInfo->ImageFileName, image_path, sizeof(image_path));
+        copy_unicode_for_log(CreateInfo->CommandLine, command_line, sizeof(command_line));
+        copy_process_image_for_log(parent_pid, parent_image, sizeof(parent_image));
+        copy_process_image_for_log(creator_pid, creator_image, sizeof(creator_image));
 
+        WW_LOG("create_process_notify: pid=%llu parent=%llu creator_pid=%llu creator_tid=%llu current_pid=%llu irql=%lu status=0x%08X parent_is_client=%lu parent_is_system=%lu image='%s' parent_image='%s' creator_image='%s' cmd='%s'",
+            reinterpret_cast<UINT64>(ProcessId),
+            reinterpret_cast<UINT64>(parent_pid),
+            reinterpret_cast<UINT64>(creator_pid),
+            reinterpret_cast<UINT64>(creator_tid),
+            reinterpret_cast<UINT64>(current_pid),
+            static_cast<ULONG>(KeGetCurrentIrql()),
+            static_cast<ULONG>(CreateInfo->CreationStatus),
+            static_cast<ULONG>(parent_pid == client_pid ? 1 : 0),
+            static_cast<ULONG>(reinterpret_cast<UINT64>(parent_pid) == 4 ? 1 : 0),
+            image_path,
+            parent_image,
+            creator_image,
+            command_line);
 
         if (parent_pid == client_pid)
             return;
 
-
         if (reinterpret_cast<UINT64>(parent_pid) == 4)
             return;
-
-
-        WW_LOG("create_process_notify: pid=%llu parent=%llu creating process near client",
-            reinterpret_cast<UINT64>(ProcessId),
-            reinterpret_cast<UINT64>(parent_pid));
     }
 
     inline NTSTATUS init()
@@ -522,7 +665,12 @@ namespace process_guard {
                 WW_LOG("process_guard::init: PsSetCreateProcessNotifyRoutineEx OK");
             } else {
                 WW_LOG("process_guard::init: PsSetCreateProcessNotifyRoutineEx FAILED 0x%08lx", notify_st);
+                status = notify_st;
             }
+        }
+        else if (NT_SUCCESS(status)) {
+            WW_LOG("process_guard::init: PsSetCreateProcessNotifyRoutineEx missing");
+            status = STATUS_PROCEDURE_NOT_FOUND;
         }
 
         if (NT_SUCCESS(status)) {

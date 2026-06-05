@@ -1,11 +1,14 @@
 #include "burp_tech_mcp.hpp"
 #include "tech_fingerprint.hpp"
 #include "audit_http.hpp"
+#include "burp_events.hpp"
+#include "../../infra/event_bus.hpp"
 
 #include "../../../helpers/diag_log.hpp"
 
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <string>
 #include <vector>
 
@@ -18,6 +21,11 @@ namespace {
 using mcp_standalone::tool_def_t;
 using mcp_standalone::tool_result_t;
 using nlohmann::json;
+
+tool_result_t error_with_data(const std::string& text, const json& data)
+{
+    return tool_result_t{false, text, data};
+}
 
 std::vector<uint8_t> build_get_request(const std::string& host, const std::string& path)
 {
@@ -50,12 +58,17 @@ tool_result_t tool_fingerprint(const json& params)
     }
     std::string url = params["url"].get<std::string>();
     diag::log_tagged_fmt("mcp_burp", "tech_fingerprint url=%s", url.c_str());
+    initialize();
     std::string scheme, host, path;
     uint16_t port = 0;
     if (!audit_http::parse_url(url, scheme, host, port, path))
     {
         diag::log_tagged_fmt("mcp_burp", "tech_fingerprint invalid_url url=%s", url.c_str());
-        return tool_result_t::error("invalid_url");
+        json data;
+        data["error"] = "invalid_url";
+        data["url"] = url;
+        data["status"] = "parse_failed";
+        return error_with_data("invalid_url", data);
     }
     bool tls = (scheme == "https");
     audit_http::send_options_t opt;
@@ -68,10 +81,37 @@ tool_result_t tool_fingerprint(const json& params)
     {
         std::string err = audit_http::last_error();
         diag::log_tagged_fmt("mcp_burp", "tech_fingerprint send_failed err=%s", err.c_str());
-        return tool_result_t::error(std::string("send_failed: ") + err);
+        json data;
+        data["error"] = err;
+        data["url"] = url;
+        data["scheme"] = scheme;
+        data["host"] = host;
+        data["port"] = port;
+        data["path"] = path;
+        data["tls"] = tls;
+        data["status"] = "send_failed";
+        return error_with_data(std::string("send_failed: ") + err, data);
     }
     auto items = fingerprint(resp->resp_headers, resp->resp_body, url);
     diag::log_tagged_fmt("mcp_burp", "tech_fingerprint ok url=%s status=%d techs=%zu", url.c_str(), resp->status_code, items.size());
+    exchange_observed_t ex;
+    ex.id = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+    ex.timestamp_ms = ex.id;
+    ex.method = "GET";
+    ex.scheme = scheme;
+    ex.host = host;
+    ex.port = port;
+    ex.path = path.empty() ? std::string("/") : path;
+    ex.req_headers = {{"Host", host}, {"User-Agent", "AiDA-Burp/1.0"}};
+    ex.status_code = resp->status_code;
+    ex.reason_phrase = "OK";
+    ex.resp_headers = resp->resp_headers;
+    ex.resp_body = resp->resp_body;
+    ex.latency_ms = resp->latency_ms;
+    aida::events::publish(kExchangeObservedEvent, ex);
+    diag::log_tagged_fmt("mcp_burp", "tech_fingerprint published_exchange id=%llu host=%s path=%s headers=%zu body=%zu",
+        static_cast<unsigned long long>(ex.id), ex.host.c_str(), ex.path.c_str(), ex.resp_headers.size(), ex.resp_body.size());
     json arr = json::array();
     for (const auto& t : items) arr.push_back(tech_to_json(t));
     json out;
@@ -99,6 +139,10 @@ tool_result_t tool_inventory(const json& params)
     json out;
     out["host_count"] = arr.size();
     out["hosts"]      = arr;
+    if (items.empty()) {
+        out["status"] = "empty";
+        out["error"] = "no_technology_fingerprints_recorded";
+    }
     return tool_result_t::ok(out);
 }
 

@@ -2779,7 +2779,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 return tool_result_t::ok(std::to_string(entries.size()) + " callstack entries", arr);
             }
             return tool_result_t::error("Unknown operation '" + op + "'. Use enable|disable|get|recent|clear");
-        }, true});
+        }, false});
 
     register_compat(srv, {
         OBFSTR("api_monitor_start"), OBFSTR("network"),
@@ -3565,7 +3565,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
 
             diag::log_tagged_fmt("net_tools", "network_websocket unknown_op op=%s", op.c_str());
             return tool_result_t::error(OBFSTR("Unknown operation. Use list_frames|inject_frame|clear"));
-        }, true});
+        }, false});
 
     register_compat(srv, {
         OBFSTR("network_proxy"), OBFSTR("network"),

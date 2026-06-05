@@ -42,6 +42,16 @@ json bridge_status_to_json(const aida::burp::camoufox::bridge_status_t& s)
     j["total_errors"]    = s.total_errors;
     j["browser_open"]    = s.browser_open;
     j["active_page_url"] = s.active_page_url;
+    j["active_page_title"] = s.active_page_title;
+    j["page_verified"]  = s.page_verified;
+    j["child_alive"]    = s.child_alive;
+    j["cleanup_pending"] = s.cleanup_pending;
+    j["generation"]     = s.generation;
+    j["last_launch_ms"] = s.last_launch_ms;
+    j["last_nav_ms"]    = s.last_nav_ms;
+    j["last_cleanup_ms"] = s.last_cleanup_ms;
+    j["last_verified_ms"] = s.last_verified_ms;
+    j["ready"]          = s.state == aida::burp::camoufox::bridge_state_t::ready && s.browser_open && s.page_verified && s.child_alive && !s.cleanup_pending;
     return j;
 }
 
@@ -156,8 +166,8 @@ tool_result_t tool_quick_navigate(const json& params)
         if (page.data.is_object() && page.data.contains("title") && page.data["title"].is_string())
             out["title"] = page.data["title"].get<std::string>();
     } else {
-        out["page"] = nullptr;
-        out["page_error"] = page.error;
+        diag::log_tagged_fmt("mcp_burp", "headless_view_quick_navigate page_info_failed err=%s", page.error.c_str());
+        return tool_result_t::error(page.error.empty() ? std::string("quick_navigate page verification failed") : page.error);
     }
 
     if (!eval_after.empty()) {

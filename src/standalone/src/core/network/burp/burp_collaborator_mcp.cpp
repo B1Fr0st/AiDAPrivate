@@ -25,6 +25,11 @@ using tool_result_t = mcp_standalone::tool_result_t;
 
 namespace {
 
+tool_result_t error_with_data(const std::string& text, const json& data)
+{
+    return tool_result_t{false, text, data};
+}
+
 json interaction_to_json(const aida::burp::collaborator::interaction_t& it)
 {
     json out;
@@ -66,7 +71,7 @@ tool_result_t handle_status(const json&)
     diag::log_tagged_fmt("mcp_burp", "collaborator_status entry");
     auto s = aida::burp::collaborator::status();
     diag::log_tagged_fmt("mcp_burp", "collaborator_status ok running=%d interactions=%llu", (int)s.running, static_cast<unsigned long long>(s.interaction_count));
-    return tool_result_t::ok("collaborator status", status_to_json(s));
+    return tool_result_t::ok("collaborator status running=" + std::to_string(s.running ? 1 : 0) + " interactions=" + std::to_string(s.interaction_count) + " tokens=" + std::to_string(s.token_count), status_to_json(s));
 }
 
 tool_result_t handle_start(const json& p)
@@ -89,11 +94,22 @@ tool_result_t handle_start(const json& p)
     bool ok = aida::burp::collaborator::start(cfg);
     if (!ok)
     {
-        diag::log_tagged_fmt("mcp_burp", "collaborator_start failed err=%s", aida::burp::collaborator::last_error().c_str());
-        return tool_result_t::error("collaborator start failed: " + aida::burp::collaborator::last_error());
+        std::string err = aida::burp::collaborator::last_error();
+        diag::log_tagged_fmt("mcp_burp", "collaborator_start failed err=%s", err.c_str());
+        json data = status_to_json(aida::burp::collaborator::status());
+        data["error"] = err;
+        data["requested_enable_http"] = cfg.enable_http;
+        data["requested_enable_dns"] = cfg.enable_dns;
+        data["requested_enable_smtp"] = cfg.enable_smtp;
+        data["requested_http_port"] = cfg.http_port;
+        data["requested_dns_port"] = cfg.dns_port;
+        data["requested_smtp_port"] = cfg.smtp_port;
+        data["status"] = "start_failed";
+        return error_with_data("collaborator start failed: " + err, data);
     }
     diag::log_tagged_fmt("mcp_burp", "collaborator_start ok");
-    return tool_result_t::ok("collaborator started", status_to_json(aida::burp::collaborator::status()));
+    auto s = aida::burp::collaborator::status();
+    return tool_result_t::ok("collaborator started http_port=" + std::to_string(s.http_port), status_to_json(s));
 }
 
 tool_result_t handle_stop(const json&)
@@ -101,7 +117,8 @@ tool_result_t handle_stop(const json&)
     diag::log_tagged_fmt("mcp_burp", "collaborator_stop entry");
     aida::burp::collaborator::stop();
     diag::log_tagged_fmt("mcp_burp", "collaborator_stop ok");
-    return tool_result_t::ok("collaborator stopped", status_to_json(aida::burp::collaborator::status()));
+    auto s = aida::burp::collaborator::status();
+    return tool_result_t::ok("collaborator stopped running=" + std::to_string(s.running ? 1 : 0), status_to_json(s));
 }
 
 tool_result_t handle_generate_token(const json&)
@@ -119,7 +136,7 @@ tool_result_t handle_generate_token(const json&)
     out["token"] = tok;
     out["full_domain"] = tok + "." + cfg.public_host;
     out["public_host"] = cfg.public_host;
-    return tool_result_t::ok("token generated", out);
+    return tool_result_t::ok("token generated len=" + std::to_string(tok.size()), out);
 }
 
 tool_result_t handle_poll(const json& p)
@@ -144,7 +161,7 @@ tool_result_t handle_poll(const json& p)
     diag::log_tagged_fmt("mcp_burp", "collaborator_poll ok count=%zu", count);
     json result;
     result["interactions"] = std::move(out);
-    return tool_result_t::ok("collaborator interactions", result);
+    return tool_result_t::ok("collaborator interactions count=" + std::to_string(count), result);
 }
 
 tool_result_t handle_get_interaction(const json& p)
@@ -192,7 +209,7 @@ tool_result_t handle_list_tokens(const json&)
     diag::log_tagged_fmt("mcp_burp", "collaborator_list_tokens ok count=%zu", toks.size());
     json r;
     r["tokens"] = std::move(arr);
-    return tool_result_t::ok("tokens", r);
+    return tool_result_t::ok("tokens count=" + std::to_string(toks.size()), r);
 }
 
 }

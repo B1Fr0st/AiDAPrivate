@@ -59,6 +59,7 @@ struct runtime_t
     std::atomic<bool> violation_latched{false};
     std::atomic<bool> monitors_running{false};
     std::atomic<bool> full_test_running{false};
+    std::atomic<uint64_t> full_test_suppression_until_ms{0};
 
     code_snapshot_t code_snap{};
     std::vector<block_hash_t> block_chain;
@@ -82,6 +83,7 @@ struct runtime_t
     uint32_t kernel_flag_persist_count = 0;
     std::atomic<bool> license_pending_activation{true};
     std::atomic<bool> activation_hardening_done{false};
+    std::atomic<bool> driver_hardening_done{false};
 
     std::vector<uint32_t> vm_nested_rvas;
     std::unordered_map<uint32_t, uint32_t> atp_flags;
@@ -108,6 +110,39 @@ inline runtime_t& get()
 {
     static runtime_t inst;
     return inst;
+}
+
+inline uint64_t monotonic_ms()
+{
+    return static_cast<uint64_t>(GetTickCount64());
+}
+
+inline void arm_full_test_suppression(uint64_t duration_ms)
+{
+    if (duration_ms == 0)
+        return;
+    const uint64_t now = monotonic_ms();
+    const uint64_t max_u64 = ~uint64_t{0};
+    const uint64_t until = duration_ms > max_u64 - now ? max_u64 : now + duration_ms;
+    auto& slot = get().full_test_suppression_until_ms;
+    uint64_t cur = slot.load(std::memory_order_acquire);
+    while (cur < until &&
+           !slot.compare_exchange_weak(cur, until, std::memory_order_acq_rel, std::memory_order_acquire)) {
+    }
+}
+
+inline bool full_test_suppression_active(uint64_t* remaining_ms = nullptr)
+{
+    const uint64_t until = get().full_test_suppression_until_ms.load(std::memory_order_acquire);
+    const uint64_t now = monotonic_ms();
+    if (until == 0 || now >= until) {
+        if (remaining_ms)
+            *remaining_ms = 0;
+        return false;
+    }
+    if (remaining_ms)
+        *remaining_ms = until - now;
+    return true;
 }
 
 namespace detail_master_key {

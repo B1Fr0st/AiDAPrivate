@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <map>
 #include <mutex>
 #include <string>
@@ -487,7 +488,9 @@ inline void build_cfg(uint64_t entry_address)
 		g_state.rebuild_anim = 0.f;
 	}
 
-	work_queue::post([entry_address]() {
+	try {
+		if (!work_queue::post([entry_address]() {
+		try {
 		struct build_guard_t {
 			~build_guard_t()
 			{
@@ -813,7 +816,29 @@ inline void build_cfg(uint64_t entry_address)
 			node_count,
 			edge_count,
 			static_cast<unsigned long long>(dur_ms));
-	});
+		} catch (const std::exception& ex) {
+			diag::log_tagged_fmt("cfg", "build_cfg exception entry=0x%llX err='%s'",
+				static_cast<unsigned long long>(entry_address), ex.what());
+			g_state.building.store(false);
+		} catch (...) {
+			diag::log_tagged_fmt("cfg", "build_cfg exception entry=0x%llX err='<unknown>'",
+				static_cast<unsigned long long>(entry_address));
+			g_state.building.store(false);
+		}
+	})) {
+			diag::log_tagged_fmt("cfg", "build_cfg worker_post_failed entry=0x%llX",
+				static_cast<unsigned long long>(entry_address));
+			g_state.building.store(false);
+		}
+	} catch (const std::exception& ex) {
+		diag::log_tagged_fmt("cfg", "build_cfg worker_create_failed entry=0x%llX err='%s'",
+			static_cast<unsigned long long>(entry_address), ex.what());
+		g_state.building.store(false);
+	} catch (...) {
+		diag::log_tagged_fmt("cfg", "build_cfg worker_create_failed entry=0x%llX err='<unknown>'",
+			static_cast<unsigned long long>(entry_address));
+		g_state.building.store(false);
+	}
 }
 
 inline bool handle_view_keys(float view_width, float view_height)

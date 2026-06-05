@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -70,7 +71,9 @@ inline void refresh()
 	diag::log_tagged_fmt("modules",
 		"modules_refresh_request attached_pid=%u",
 		static_cast<unsigned>(driver_bridge::attached_pid()));
-	work_queue::post([]() {
+	try {
+		if (!work_queue::post([]() {
+		try {
 		auto mods = driver_bridge::enumerate_modules();
 		size_t n = mods.size();
 		{
@@ -80,7 +83,24 @@ inline void refresh()
 		diag::log_tagged_fmt("modules",
 			"modules_refresh_done count=%zu", n);
 		g_ui.loading.store(false);
-	});
+		} catch (const std::exception& ex) {
+			diag::log_tagged_fmt("modules", "modules_refresh_worker_exception err='%s'", ex.what());
+			g_ui.loading.store(false);
+		} catch (...) {
+			diag::log_tagged("modules", "modules_refresh_worker_exception err='<unknown>'");
+			g_ui.loading.store(false);
+		}
+	})) {
+			diag::log_tagged("modules", "modules_refresh_worker_post_failed");
+			g_ui.loading.store(false);
+		}
+	} catch (const std::exception& ex) {
+		diag::log_tagged_fmt("modules", "modules_refresh_worker_create_failed err='%s'", ex.what());
+		g_ui.loading.store(false);
+	} catch (...) {
+		diag::log_tagged("modules", "modules_refresh_worker_create_failed err='<unknown>'");
+		g_ui.loading.store(false);
+	}
 }
 
 inline void ensure_subscriptions()
@@ -125,7 +145,9 @@ inline void load_module_details_by_base(uint64_t base)
 	diag::log_tagged_fmt("modules",
 		"module_details_request base=0x%llx",
 		static_cast<unsigned long long>(base));
-	work_queue::post([base]() {
+	try {
+		if (!work_queue::post([base]() {
+		try {
 		pe_parser::pe_info_t pe;
 		pe_parser::parse(base, pe);
 		size_t exp_n = pe.exports.size();
@@ -142,7 +164,29 @@ inline void load_module_details_by_base(uint64_t base)
 			"module_details_loaded base=0x%llx exports=%zu imports=%zu",
 			static_cast<unsigned long long>(base), exp_n, imp_n);
 		g_ui.loading.store(false);
-	});
+		} catch (const std::exception& ex) {
+			diag::log_tagged_fmt("modules", "module_details_worker_exception base=0x%llx err='%s'",
+				static_cast<unsigned long long>(base), ex.what());
+			g_ui.loading.store(false);
+		} catch (...) {
+			diag::log_tagged_fmt("modules", "module_details_worker_exception base=0x%llx err='<unknown>'",
+				static_cast<unsigned long long>(base));
+			g_ui.loading.store(false);
+		}
+	})) {
+			diag::log_tagged_fmt("modules", "module_details_worker_post_failed base=0x%llx",
+				static_cast<unsigned long long>(base));
+			g_ui.loading.store(false);
+		}
+	} catch (const std::exception& ex) {
+		diag::log_tagged_fmt("modules", "module_details_worker_create_failed base=0x%llx err='%s'",
+			static_cast<unsigned long long>(base), ex.what());
+		g_ui.loading.store(false);
+	} catch (...) {
+		diag::log_tagged_fmt("modules", "module_details_worker_create_failed base=0x%llx err='<unknown>'",
+			static_cast<unsigned long long>(base));
+		g_ui.loading.store(false);
+	}
 }
 
 inline void load_module_details(int index)

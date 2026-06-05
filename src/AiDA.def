@@ -9,6 +9,3 @@
 
 EXPORTS
     PLUGIN DATA
-    aida_manual_map_marker DATA
-    aida_proof_buffer DATA
-    aida_proof_buffer_len DATA

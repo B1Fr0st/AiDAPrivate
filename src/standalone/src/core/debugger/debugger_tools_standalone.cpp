@@ -18,9 +18,11 @@
 #include "code_patcher.hpp"
 #include "stealth_engine.hpp"
 #include "../editor/expression_eval.hpp"
+#include "../anti-tamper/state.hpp"
 #include "../../helpers/diag_log.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <chrono>
 #include <cctype>
@@ -106,12 +108,19 @@ static std::optional<tool_result_t> ensure_attached(const json& params)
             }
         }
 
+        if (current_pid != 0)
+            stealth_engine::disable_for_detach(current_pid, "debugger_tools.ensure_attached.replace");
+
         if (!driver_bridge::set_active_pid(requested_pid)) {
+            if (current_pid != 0 && driver_bridge::attached_pid() == current_pid)
+                (void)stealth_engine::ensure_default_enabled(current_pid, "debugger_tools.ensure_attached.restore_failed_switch");
             diag::log_tagged_fmt("dbg_tools", "ensure_attached: set_active_pid failed for pid %u", requested_pid);
             return tool_result_t::error(
                 OBFSTR("set_active_pid failed for target_pid ") + std::to_string(requested_pid) +
                 OBFSTR(": ") + driver_bridge::last_error());
         }
+
+        (void)stealth_engine::ensure_default_enabled(requested_pid, "debugger_tools.ensure_attached");
 
         if (device->get_dtb() == 0)
         {
@@ -313,6 +322,75 @@ static std::string lower_ascii(std::string s)
     for (char& c : s)
         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     return s;
+}
+
+static bool full_test_mode_active()
+{
+    if (anti_tamper::state::get().full_test_running.load(std::memory_order_acquire))
+        return true;
+    char buf[8]{};
+    DWORD n = GetEnvironmentVariableA("AIDA_FULL_TEST_RUNNING", buf, static_cast<DWORD>(sizeof(buf)));
+    return n > 0 && (buf[0] == '1' || buf[0] == 't' || buf[0] == 'T' || buf[0] == 'y' || buf[0] == 'Y');
+}
+
+static bool ranges_overlap(std::uint64_t a_start, std::uint64_t a_size, std::uint64_t b_start, std::uint64_t b_size)
+{
+    if (a_size == 0 || b_size == 0)
+        return false;
+    std::uint64_t a_end = a_start + a_size - 1;
+    std::uint64_t b_end = b_start + b_size - 1;
+    if (a_end < a_start)
+        a_end = std::numeric_limits<std::uint64_t>::max();
+    if (b_end < b_start)
+        b_end = std::numeric_limits<std::uint64_t>::max();
+    return a_start <= b_end && b_start <= a_end;
+}
+
+static bool range_intersects_system_module(std::uint64_t address, std::uint64_t size, std::string& module_name, std::string& module_path)
+{
+    const std::uint32_t pid = driver_bridge::attached_pid();
+    if (pid == 0)
+        return false;
+    for (const auto& mod : driver_bridge::enumerate_modules_for(pid))
+    {
+        const std::uint64_t start = mod.base;
+        const std::uint64_t mod_size = static_cast<std::uint64_t>(mod.size);
+        if (start == 0 || mod_size == 0 || !ranges_overlap(address, size, start, mod_size))
+            continue;
+        module_name = mod.name;
+        module_path = mod.path;
+        const std::string name = lower_ascii(mod.name);
+        const std::string path = lower_ascii(mod.path);
+        if (path.find("\\windows\\") != std::string::npos ||
+            path.find("/windows/") != std::string::npos ||
+            name == "ntdll.dll" ||
+            name == "kernel32.dll" ||
+            name == "kernelbase.dll" ||
+            name == "apphelp.dll" ||
+            name == "win32u.dll")
+            return true;
+        return false;
+    }
+    return false;
+}
+
+static std::optional<tool_result_t> reject_full_test_system_mutation(std::uint64_t address, std::uint64_t size, const char* tool_name)
+{
+    if (!full_test_mode_active())
+        return std::nullopt;
+    std::string module_name;
+    std::string module_path;
+    if (!range_intersects_system_module(address, size, module_name, module_path))
+        return std::nullopt;
+    diag::log_tagged_fmt("dbg_tools",
+        "%s: rejected full-test system module mutation addr=0x%llX size=%llu module=%s path=%s",
+        tool_name ? tool_name : "patch_tool",
+        static_cast<unsigned long long>(address),
+        static_cast<unsigned long long>(size),
+        module_name.c_str(),
+        module_path.c_str());
+    return tool_result_t::error(
+        OBFSTR("Full Test Lab refuses to mutate system module memory. Use a private target fixture address instead."));
 }
 
 static std::string trim_ascii(std::string s)
@@ -857,11 +935,10 @@ static tool_result_t handle_debugger_allocate_memory(const json& params)
 
 static tool_result_t handle_debugger_call_function(const json& params)
 {
-    diag::log_tagged_fmt("dbg_tools", "debugger_call_function: entry");
-    if (auto err = ensure_attached(params))
-        return *err;
-    if (!driver_bridge::using_kernel_driver())
-        return tool_result_t::error(OBFSTR("Remote function calls require the kernel driver backend."));
+    const bool validate_only = params.contains("validate_only") &&
+        params["validate_only"].is_boolean() &&
+        params["validate_only"].get<bool>();
+    diag::log_tagged_fmt("dbg_tools", "debugger_call_function: entry validate_only=%d", validate_only ? 1 : 0);
 
     auto address = parse_u64_param(params, "address");
     if (!address || *address == 0)
@@ -891,6 +968,25 @@ static tool_result_t handle_debugger_call_function(const json& params)
             args[arg_count++] = *parsed;
         }
     }
+
+    if (validate_only) {
+        json arg_json = json::array();
+        for (std::size_t i = 0; i < arg_count; ++i)
+            arg_json.push_back(sa_format_address(args[i]));
+
+        json result;
+        result["address"] = sa_format_address(*address);
+        result["calling_convention"] = cc.empty() ? OBFSTR("win64") : cc;
+        result["args"] = std::move(arg_json);
+        result["validate_only"] = true;
+        result["pid"] = driver_bridge::attached_pid();
+        return tool_result_t::ok(OBFSTR("Validated remote function call request without executing it."), result);
+    }
+
+    if (auto err = ensure_attached(params))
+        return *err;
+    if (!driver_bridge::using_kernel_driver())
+        return tool_result_t::error(OBFSTR("Remote function calls require the kernel driver backend."));
 
     diag::log_tagged_fmt("dbg_tools", "debugger_call_function: address=0x%llX argc=%zu",
         static_cast<unsigned long long>(*address), arg_count);
@@ -936,6 +1032,13 @@ static tool_result_t handle_debugger_start_trace(const json& params)
     }
 
     debugger_engine::g_state.active_tid = *tid;
+    diag::log_tagged_fmt("dbg_tools",
+        "debugger_start_trace: begin pid=%u tid=%u max_instructions=%d timeout_ms=%u condition_len=%zu",
+        static_cast<unsigned>(driver_bridge::attached_pid()),
+        static_cast<unsigned>(*tid),
+        max_instructions,
+        static_cast<unsigned>(timeout_ms),
+        condition.size());
     bool initial_matched = false;
     std::string condition_error;
     if (!condition.empty()) {
@@ -962,32 +1065,60 @@ static tool_result_t handle_debugger_start_trace(const json& params)
         session.completed = true;
         session.condition_met = true;
         session.stop_reason = OBFSTR("condition");
+        diag::log_tagged_fmt("dbg_tools",
+            "debugger_start_trace: initial_condition_matched tid=%u",
+            static_cast<unsigned>(*tid));
     } else {
         for (int i = 0; i < max_instructions; ++i) {
             if (mcp_standalone::current_call_cancelled()) {
                 session.cancelled = true;
                 session.stop_reason = OBFSTR("cancelled");
+                diag::log_tagged_fmt("dbg_tools",
+                    "debugger_start_trace: cancelled tid=%u step=%d executed=%d",
+                    static_cast<unsigned>(*tid), i, session.executed_instructions);
                 break;
             }
             if (std::chrono::steady_clock::now() >= deadline) {
                 session.timed_out = true;
                 session.stop_reason = OBFSTR("timeout");
+                diag::log_tagged_fmt("dbg_tools",
+                    "debugger_start_trace: timeout_before_step tid=%u step=%d executed=%d",
+                    static_cast<unsigned>(*tid), i, session.executed_instructions);
                 break;
             }
 
+            const auto step_started = std::chrono::steady_clock::now();
+            diag::log_tagged_fmt("dbg_tools",
+                "debugger_start_trace: step_begin tid=%u step=%d max=%d executed=%d",
+                static_cast<unsigned>(*tid), i + 1, max_instructions, session.executed_instructions);
             if (!debugger_engine::step_into()) {
                 session.error = debugger_engine::last_error().empty()
                     ? OBFSTR("step_into failed.")
                     : debugger_engine::last_error();
                 session.stop_reason = OBFSTR("step_failed");
+                const auto step_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - step_started).count();
+                diag::log_tagged_fmt("dbg_tools",
+                    "debugger_start_trace: step_failed tid=%u step=%d executed=%d elapsed_ms=%lld error=%s",
+                    static_cast<unsigned>(*tid), i + 1, session.executed_instructions,
+                    static_cast<long long>(step_elapsed_ms), session.error.c_str());
                 break;
             }
 
             ++session.executed_instructions;
+            const auto step_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - step_started).count();
+            diag::log_tagged_fmt("dbg_tools",
+                "debugger_start_trace: step_ok tid=%u step=%d executed=%d elapsed_ms=%lld",
+                static_cast<unsigned>(*tid), i + 1, session.executed_instructions,
+                static_cast<long long>(step_elapsed_ms));
 
             if (std::chrono::steady_clock::now() >= deadline) {
                 session.timed_out = true;
                 session.stop_reason = OBFSTR("timeout");
+                diag::log_tagged_fmt("dbg_tools",
+                    "debugger_start_trace: timeout_after_step tid=%u step=%d executed=%d",
+                    static_cast<unsigned>(*tid), i + 1, session.executed_instructions);
                 break;
             }
 
@@ -997,12 +1128,18 @@ static tool_result_t handle_debugger_start_trace(const json& params)
                 if (!evaluate_trace_condition(condition, regs, matched, condition_error)) {
                     session.error = OBFSTR("Trace condition evaluation failed: ") + condition_error;
                     session.stop_reason = OBFSTR("condition_error");
+                    diag::log_tagged_fmt("dbg_tools",
+                        "debugger_start_trace: condition_error tid=%u step=%d error=%s",
+                        static_cast<unsigned>(*tid), i + 1, session.error.c_str());
                     break;
                 }
                 if (matched) {
                     session.condition_met = true;
                     session.completed = true;
                     session.stop_reason = OBFSTR("condition");
+                    diag::log_tagged_fmt("dbg_tools",
+                        "debugger_start_trace: condition_matched tid=%u step=%d executed=%d",
+                        static_cast<unsigned>(*tid), i + 1, session.executed_instructions);
                     break;
                 }
             }
@@ -1050,6 +1187,23 @@ static tool_result_t handle_debugger_start_trace(const json& params)
         result["condition"] = stored.condition;
     if (!stored.error.empty())
         result["error"] = stored.error;
+    const bool failed = !stored.error.empty() || stored.timed_out || stored.cancelled || !stored.completed;
+    if (failed) {
+        std::string detail = stored.error.empty()
+            ? (OBFSTR("Trace stopped before completion: ") + stored.stop_reason)
+            : stored.error;
+        diag::log_tagged_fmt("dbg_tools",
+            "debugger_start_trace: failed id=%s tid=%u reason=%s entries=%zu executed=%d completed=%d timed_out=%d cancelled=%d",
+            trace_id.c_str(),
+            static_cast<unsigned>(*tid),
+            stored.stop_reason.c_str(),
+            stored.entries.size(),
+            stored.executed_instructions,
+            stored.completed ? 1 : 0,
+            stored.timed_out ? 1 : 0,
+            stored.cancelled ? 1 : 0);
+        return tool_result_t{false, detail, result};
+    }
     return tool_result_t::ok(OBFSTR("Trace recorded."), result);
 }
 
@@ -2301,7 +2455,8 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address to call"), true},
          {OBFSTR("calling_convention"), OBFSTR("string"), OBFSTR("Calling convention, currently Windows x64 only"), false},
          {OBFSTR("args"), OBFSTR("array"), OBFSTR("Array of up to four integer or pointer arguments"), false},
-         {OBFSTR("target_pid"), OBFSTR("number"), OBFSTR("Optional PID override. Switches the active attach context for this call."), false}},
+         {OBFSTR("target_pid"), OBFSTR("number"), OBFSTR("Optional PID override. Switches the active attach context for this call."), false},
+         {OBFSTR("validate_only"), OBFSTR("boolean"), OBFSTR("Validate address, calling convention, and arguments without executing the remote call."), false}},
         handle_debugger_call_function, false});
 
     register_compat(srv, {
@@ -2852,6 +3007,8 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 return tool_result_t::error("Decoded byte sequence is empty.");
             if (bytes.size() > 65536)
                 return tool_result_t::error("Write exceeds 64 KiB cap.");
+            if (auto reject = reject_full_test_system_mutation(*a, static_cast<std::uint64_t>(bytes.size()), "debugger_write_memory"))
+                return *reject;
             diag::log_tagged_fmt("dbg_tools", "debugger_write_memory: addr=0x%llX bytes=%zu", (unsigned long long)*a, bytes.size());
             if (!driver_bridge::write_memory(*a, bytes)) {
                 diag::log_tagged_fmt("dbg_tools", "debugger_write_memory: write_memory failed at 0x%llX", (unsigned long long)*a);
@@ -2885,6 +3042,8 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 return tool_result_t::error("'new_protect' is required (PAGE_* constant).");
             uint64_t size = params["size"].get<uint64_t>();
             uint32_t new_prot = static_cast<uint32_t>(params["new_protect"].get<int>());
+            if (auto reject = reject_full_test_system_mutation(*a, size, "debugger_protect_memory"))
+                return *reject;
             diag::log_tagged_fmt("dbg_tools", "debugger_protect_memory: addr=0x%llX size=%llu new_prot=0x%X", (unsigned long long)*a, (unsigned long long)size, new_prot);
             uint32_t old_prot = 0;
             if (!driver_bridge::protect_memory(*a, size, new_prot, &old_prot)) {
@@ -2928,18 +3087,26 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 return tool_result_t::error("Provide 'pid' or 'name'.");
             }
             diag::log_tagged_fmt("dbg_tools", "debugger_attach_to_process: attaching to pid=%u", pid);
+            const uint32_t previous_pid = driver_bridge::attached_pid();
+            if (previous_pid != 0 && previous_pid != pid)
+                stealth_engine::disable_for_detach(previous_pid, "debugger_tools.attach_to_process.replace");
             if (!driver_bridge::attach(pid)) {
+                if (previous_pid != 0 && driver_bridge::attached_pid() == previous_pid)
+                    (void)stealth_engine::ensure_default_enabled(previous_pid, "debugger_tools.attach_to_process.restore_failed_switch");
                 diag::log_tagged_fmt("dbg_tools", "debugger_attach_to_process: attach failed for pid=%u: %s", pid, driver_bridge::last_error().c_str());
                 return tool_result_t::error("driver_bridge::attach failed: " +
                                             driver_bridge::last_error());
             }
+            const bool stealth_ok = stealth_engine::ensure_default_enabled(pid, "debugger_tools.attach_to_process");
             uint64_t base = device->find_image();
             device->solve_dtb();
-            diag::log_tagged_fmt("dbg_tools", "debugger_attach_to_process: attached pid=%u base=0x%llX", pid, (unsigned long long)base);
+            diag::log_tagged_fmt("dbg_tools", "debugger_attach_to_process: attached pid=%u base=0x%llX stealth_ok=%d", pid, (unsigned long long)base, stealth_ok ? 1 : 0);
             json result;
             result["pid"]          = pid;
             result["base_address"] = sa_format_address(base);
             result["name"]         = driver_bridge::attached_process_name();
+            result["stealth_default_enabled"] = stealth_ok;
+            result["stealth_auto_state"] = stealth_engine::get_status();
             return tool_result_t::ok(result);
         }
     });
@@ -2951,6 +3118,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         false,
         [](const json&) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "debugger_detach: entry");
+            stealth_engine::disable_for_detach(driver_bridge::attached_pid(), "debugger_tools.debugger_detach");
             driver_bridge::detach();
             diag::log_tagged_fmt("dbg_tools", "debugger_detach: detached");
             return tool_result_t::ok("Detached.");
@@ -3137,10 +3305,16 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             json result;
             result["total"] = st.trace_log.size();
             result["returned"] = arr.size();
+            const bool expected_empty = st.trace_log.empty() && !st.tracing.load(std::memory_order_acquire);
+            result["expected_empty"] = expected_empty;
+            if (expected_empty)
+                result["empty_reason"] = OBFSTR("trace_not_active_or_no_steps_recorded");
             result["entries"] = arr;
             diag::log_tagged_fmt("dbg_tools", "dbg_get_trace: total=%zu returned=%zu", st.trace_log.size(), arr.size());
-            return tool_result_t::ok(
-                std::to_string(arr.size()) + OBFSTR(" trace entries."), result);
+            const std::string message = expected_empty
+                ? OBFSTR("Trace is empty because no traced step has been recorded.")
+                : std::to_string(arr.size()) + OBFSTR(" trace entries.");
+            return tool_result_t::ok(message, result);
         }, true});
 
     register_compat(srv, {
@@ -3402,7 +3576,8 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 search_start = (*addr > 0x10000) ? *addr - 0x10000 : 0;
                 search_size = 0x20000;
             }
-            xref_engine::find_xrefs_to(*addr, search_start, search_size);
+            if (!xref_engine::find_xrefs_to(*addr, search_start, search_size))
+                return tool_result_t::error(OBFSTR("xref scan is still busy after cancellation."));
             for (int i = 0; i < 300; ++i) {
                 if (!xref_engine::g_state.scanning.load()) break;
                 Sleep(10);
@@ -3488,24 +3663,43 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             uint64_t size = params.value("size", 0x10000);
             if (size == 0) size = 0x10000;
             if (size > 0x1000000) size = 0x1000000;
-            xref_engine::find_xrefs_to(*target, *start, size);
+            if (!xref_engine::find_xrefs_to(*target, *start, size))
+                return tool_result_t::error(OBFSTR("xref scan is still busy after cancellation."));
             for (int i = 0; i < 300; ++i) {
                 if (!xref_engine::g_state.scanning.load()) break;
                 Sleep(10);
             }
+            bool timed_out = false;
             if (xref_engine::g_state.scanning.load()) {
                 diag::log_tagged_fmt("dbg_tools", "dbg_scan_xrefs: scan timeout, cancelling");
+                timed_out = true;
                 xref_engine::cancel_scan();
             }
             std::lock_guard<std::mutex> lk(xref_engine::g_state.mutex);
+            json arr = json::array();
+            for (const auto& x : xref_engine::g_state.results) {
+                json xj;
+                xj["from"] = sa_format_address(x.from_addr);
+                xj["to"] = sa_format_address(x.to_addr);
+                xj["type"] = xref_engine::xref_type_name(x.type);
+                xj["disasm"] = x.disasm_text;
+                if (!x.module_name.empty()) xj["module"] = x.module_name;
+                arr.push_back(std::move(xj));
+            }
+            const std::size_t found_count = arr.size();
             json result;
-            result["total_found"] = xref_engine::g_state.results.size();
+            result["count"] = found_count;
+            result["total_found"] = found_count;
             result["target"] = sa_format_address(*target);
             result["range_start"] = sa_format_address(*start);
             result["range_size"] = size;
-            diag::log_tagged_fmt("dbg_tools", "dbg_scan_xrefs: target=0x%llX start=0x%llX size=0x%llX results=%zu", (unsigned long long)*target, (unsigned long long)*start, (unsigned long long)size, xref_engine::g_state.results.size());
+            result["timed_out"] = timed_out;
+            result["xrefs"] = std::move(arr);
+            diag::log_tagged_fmt("dbg_tools", "dbg_scan_xrefs: target=0x%llX start=0x%llX size=0x%llX results=%zu timed_out=%d", (unsigned long long)*target, (unsigned long long)*start, (unsigned long long)size, found_count, timed_out ? 1 : 0);
+            if (timed_out)
+                return tool_result_t{false, OBFSTR("Xref scan did not complete within the timeout."), result};
             return tool_result_t::ok(
-                OBFSTR("Scan complete. ") + std::to_string(xref_engine::g_state.results.size()) + OBFSTR(" xref(s) found."), result);
+                OBFSTR("Scan complete. ") + std::to_string(found_count) + OBFSTR(" xref(s) found."), result);
         }, true});
 
     register_compat(srv, {
@@ -3606,11 +3800,12 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 arr.push_back(std::move(ej));
             }
             json result;
-            result["count"] = arr.size();
+            const std::size_t count = arr.size();
+            result["count"] = count;
             result["entries"] = std::move(arr);
-            diag::log_tagged_fmt("dbg_tools", "dbg_get_seh_chain: returning %zu SEH handlers", arr.size());
+            diag::log_tagged_fmt("dbg_tools", "dbg_get_seh_chain: returning %zu SEH handlers", count);
             return tool_result_t::ok(
-                std::to_string(arr.size()) + OBFSTR(" SEH handler(s)."), result);
+                std::to_string(count) + OBFSTR(" SEH handler(s)."), result);
         }, true});
 
     register_compat(srv, {
@@ -3628,7 +3823,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             diag::log_tagged_fmt("dbg_tools", "dbg_get_modules_detail: calling module_view::refresh");
             module_view::refresh();
             const int timeout_ms = int_param_clamped(params, "timeout_ms", 5000, 500, 60000);
-            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+            auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
             while (module_view::g_ui.loading.load(std::memory_order_acquire) && !deadline_expired(deadline))
                 Sleep(25);
             std::string filter;
@@ -3644,6 +3839,20 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 std::lock_guard<std::mutex> lk(module_view::g_ui.modules_mutex);
                 mods = module_view::g_ui.modules;
             }
+            if (mods.empty() || module_view::g_ui.loading.load(std::memory_order_acquire)) {
+                auto direct = driver_bridge::enumerate_modules();
+                if (!direct.empty()) {
+                    diag::log_tagged_fmt("dbg_tools",
+                        "dbg_get_modules_detail: using direct module enumeration cached=%zu direct=%zu loading=%d",
+                        mods.size(),
+                        direct.size(),
+                        module_view::g_ui.loading.load(std::memory_order_acquire) ? 1 : 0);
+                    mods = std::move(direct);
+                    deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+                }
+            }
+            if (!mods.empty() && deadline_expired(deadline))
+                deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::min(timeout_ms, 3000));
             json arr = json::array();
             bool truncated = false;
             bool timed_out = false;
@@ -3683,45 +3892,56 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                         sections.push_back(std::move(sj));
                     }
                     mj["sections"] = std::move(sections);
-                    std::vector<pe_parser::export_entry_t> exports;
-                    bool exports_truncated = false;
-                    pe_parser::parse_exports(m.base, pe, exports, static_cast<size_t>(max_exports), &deadline, &exports_truncated);
-                    if (exports_truncated) truncated = true;
-                    mj["export_count"] = exports.size();
-                    mj["exports_truncated"] = exports_truncated;
                     json exp_arr = json::array();
-                    size_t exp_limit = std::min<size_t>(exports.size(), static_cast<size_t>(max_exports));
-                    for (size_t ei = 0; ei < exp_limit; ++ei) {
-                        json ej;
-                        ej["ordinal"] = exports[ei].ordinal;
-                        ej["name"] = exports[ei].name;
-                        ej["address"] = sa_format_address(exports[ei].address);
-                        if (exports[ei].is_forwarded) ej["forward"] = exports[ei].forward_name;
-                        exp_arr.push_back(std::move(ej));
+                    if (max_exports > 0) {
+                        std::vector<pe_parser::export_entry_t> exports;
+                        bool exports_truncated = false;
+                        pe_parser::parse_exports(m.base, pe, exports, static_cast<size_t>(max_exports), &deadline, &exports_truncated);
+                        if (exports_truncated) truncated = true;
+                        mj["export_count"] = exports.size();
+                        mj["exports_truncated"] = exports_truncated;
+                        size_t exp_limit = std::min<size_t>(exports.size(), static_cast<size_t>(max_exports));
+                        for (size_t ei = 0; ei < exp_limit; ++ei) {
+                            json ej;
+                            ej["ordinal"] = exports[ei].ordinal;
+                            ej["name"] = exports[ei].name;
+                            ej["address"] = sa_format_address(exports[ei].address);
+                            if (exports[ei].is_forwarded) ej["forward"] = exports[ei].forward_name;
+                            exp_arr.push_back(std::move(ej));
+                        }
+                    } else {
+                        mj["export_count"] = 0;
+                        mj["exports_truncated"] = false;
                     }
                     mj["exports"] = std::move(exp_arr);
-                    std::vector<pe_parser::import_entry_t> imports;
-                    bool imports_truncated = false;
-                    pe_parser::parse_imports(m.base, pe, imports, static_cast<size_t>(max_imports), &deadline, &imports_truncated);
-                    if (imports_truncated) truncated = true;
-                    if (deadline_expired(deadline)) timed_out = true;
-                    mj["import_count"] = imports.size();
-                    mj["imports_truncated"] = imports_truncated;
                     json imp_arr = json::array();
-                    size_t imp_limit = std::min<size_t>(imports.size(), static_cast<size_t>(max_imports));
-                    for (size_t ii = 0; ii < imp_limit; ++ii) {
-                        json ij;
-                        ij["module"] = imports[ii].module_name;
-                        ij["function"] = imports[ii].function_name;
-                        ij["iat_address"] = sa_format_address(imports[ii].iat_address);
-                        imp_arr.push_back(std::move(ij));
+                    if (max_imports > 0) {
+                        std::vector<pe_parser::import_entry_t> imports;
+                        bool imports_truncated = false;
+                        pe_parser::parse_imports(m.base, pe, imports, static_cast<size_t>(max_imports), &deadline, &imports_truncated);
+                        if (imports_truncated) truncated = true;
+                        if (deadline_expired(deadline)) timed_out = true;
+                        mj["import_count"] = imports.size();
+                        mj["imports_truncated"] = imports_truncated;
+                        size_t imp_limit = std::min<size_t>(imports.size(), static_cast<size_t>(max_imports));
+                        for (size_t ii = 0; ii < imp_limit; ++ii) {
+                            json ij;
+                            ij["module"] = imports[ii].module_name;
+                            ij["function"] = imports[ii].function_name;
+                            ij["iat_address"] = sa_format_address(imports[ii].iat_address);
+                            imp_arr.push_back(std::move(ij));
+                        }
+                    } else {
+                        mj["import_count"] = 0;
+                        mj["imports_truncated"] = false;
                     }
                     mj["imports"] = std::move(imp_arr);
                 }
                 arr.push_back(std::move(mj));
             }
             json result;
-            result["count"] = arr.size();
+            const std::size_t count = arr.size();
+            result["count"] = count;
             result["truncated"] = truncated;
             result["timed_out"] = timed_out && !allow_partial;
             result["partial"] = timed_out;
@@ -3731,7 +3951,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             result["timeout_ms"] = timeout_ms;
             result["modules"] = std::move(arr);
             diag::log_tagged_fmt("dbg_tools", "dbg_get_modules_detail: returning %zu modules truncated=%d timed_out=%d",
-                arr.size(), truncated ? 1 : 0, timed_out ? 1 : 0);
+                count, truncated ? 1 : 0, timed_out ? 1 : 0);
             return tool_result_t::ok(
                 std::to_string(result["count"].get<size_t>()) + OBFSTR(" module(s)."), result);
         }, true});
@@ -3759,6 +3979,8 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             std::string label;
             if (params.contains("label") && params["label"].is_string())
                 label = params["label"].get<std::string>();
+            if (auto reject = reject_full_test_system_mutation(*addr, static_cast<std::uint64_t>(patched.size()), "dbg_add_patch"))
+                return *reject;
             diag::log_tagged_fmt("dbg_tools", "dbg_add_patch: addr=0x%llX size=%zu label=%s", (unsigned long long)*addr, patched.size(), label.c_str());
             int idx = code_patcher::create_patch(*addr, patched, label);
             if (idx < 0) {
@@ -3821,11 +4043,12 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 arr.push_back(std::move(pj));
             }
             json result;
-            result["count"] = arr.size();
+            const std::size_t count = arr.size();
+            result["count"] = count;
             result["patches"] = std::move(arr);
-            diag::log_tagged_fmt("dbg_tools", "dbg_list_patches: returning %zu patches", arr.size());
+            diag::log_tagged_fmt("dbg_tools", "dbg_list_patches: returning %zu patches", count);
             return tool_result_t::ok(
-                std::to_string(arr.size()) + OBFSTR(" patch(es)."), result);
+                std::to_string(count) + OBFSTR(" patch(es)."), result);
         }, true});
 
     register_compat(srv, {
@@ -3845,6 +4068,8 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             int size = params["size"].get<int>();
             if (size <= 0 || size > 4096)
                 return tool_result_t::error(OBFSTR("Size must be between 1 and 4096."));
+            if (auto reject = reject_full_test_system_mutation(*addr, static_cast<std::uint64_t>(size), "dbg_nop_fill"))
+                return *reject;
             diag::log_tagged_fmt("dbg_tools", "dbg_nop_fill: addr=0x%llX size=%d", (unsigned long long)*addr, size);
             if (!code_patcher::nop_region(*addr, static_cast<size_t>(size), OBFSTR("NOP fill"))) {
                 diag::log_tagged_fmt("dbg_tools", "dbg_nop_fill: nop_region failed at 0x%llX", (unsigned long long)*addr);
@@ -3854,6 +4079,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             if (!code_patcher::apply_patch(idx))
                 return tool_result_t::error(OBFSTR("NOP patch created but failed to apply."));
             json result;
+            result["index"] = idx;
             result["address"] = sa_format_address(*addr);
             result["size"] = size;
             diag::log_tagged_fmt("dbg_tools", "dbg_nop_fill: NOP-filled %d bytes at 0x%llX", size, (unsigned long long)*addr);
@@ -3900,11 +4126,12 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 arr.push_back(std::move(cj));
             }
             json result;
-            result["count"] = arr.size();
+            const std::size_t count = arr.size();
+            result["count"] = count;
             result["caves"] = std::move(arr);
             diag::log_tagged_fmt("dbg_tools", "dbg_find_code_caves: found %zu caves", caves.size());
             return tool_result_t::ok(
-                std::to_string(arr.size()) + OBFSTR(" code cave(s) found."), result);
+                std::to_string(count) + OBFSTR(" code cave(s) found."), result);
         }, true});
 
     register_compat(srv, {
@@ -3937,103 +4164,6 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 OBFSTR("Conditional breakpoint set at ") + sa_format_address(*addr) + OBFSTR(" [condition: ") + cond + OBFSTR("]"), result);
         }, false});
 
-	srv.register_tool({
-		"enable_stealth",
-		"Enable anti-anti-debug stealth mode for the attached process. Spoofs PEB debug flags, hooks RDTSC to return fake timestamps, and patches known anti-debug checks.",
-		{
-			{"process_id", "integer", "PID to enable stealth on (uses attached if omitted)", false}
-		},
-		true,
-		[](const json& params) -> tool_result_t {
-			diag::log_tagged_fmt("dbg_tools", "enable_stealth: entry");
-			if (auto err = ensure_attached(params)) return *err;
-
-			uint32_t pid = device->get_process_id();
-			if (pid == 0) {
-				diag::log_tagged_fmt("dbg_tools", "enable_stealth: not attached to any process");
-				return tool_result_t::error("Not attached to a process.");
-			}
-
-			if (stealth_engine::is_active()) {
-				diag::log_tagged_fmt("dbg_tools", "enable_stealth: already active");
-				return tool_result_t::error("Stealth mode is already active.");
-			}
-
-			diag::log_tagged_fmt("dbg_tools", "enable_stealth: enabling for pid=%u", pid);
-			bool ok = stealth_engine::enable_stealth(pid);
-			if (!ok) {
-				diag::log_tagged_fmt("dbg_tools", "enable_stealth: enable_stealth failed for pid=%u", pid);
-				return tool_result_t::error("Failed to enable stealth mode.");
-			}
-
-			auto status = stealth_engine::get_session_info();
-			diag::log_tagged_fmt("dbg_tools", "enable_stealth: active pid=%u peb_spoofed=%d hooks=%zu", pid, (int)status.peb_spoofed, status.hooks.size());
-			json result;
-			result["status"] = "active";
-			result["pid"] = pid;
-			result["peb_spoofed"] = status.peb_spoofed;
-			result["rdtsc_hooks"] = static_cast<int>(status.hooks.size());
-			return tool_result_t::ok(result);
-		}
-	});
-
-	srv.register_tool({
-		"disable_stealth",
-		"Disable anti-anti-debug stealth mode and restore all patches and hooks.",
-		{},
-		true,
-		[](const json&) -> tool_result_t {
-			diag::log_tagged_fmt("dbg_tools", "disable_stealth: entry");
-			if (!stealth_engine::is_active()) {
-				diag::log_tagged_fmt("dbg_tools", "disable_stealth: stealth not active");
-				return tool_result_t::error("Stealth mode is not active.");
-			}
-
-			diag::log_tagged_fmt("dbg_tools", "disable_stealth: disabling stealth");
-			stealth_engine::disable_stealth();
-
-			diag::log_tagged_fmt("dbg_tools", "disable_stealth: stealth disabled");
-			json result;
-			result["status"] = "disabled";
-			return tool_result_t::ok(result);
-		}
-	});
-
-	srv.register_tool({
-		"stealth_status",
-		"Get current stealth engine status including active hooks and PEB spoofing state.",
-		{},
-		true,
-		[](const json&) -> tool_result_t {
-			diag::log_tagged_fmt("dbg_tools", "stealth_status: entry");
-			json result;
-			result["active"] = stealth_engine::is_active();
-			diag::log_tagged_fmt("dbg_tools", "stealth_status: active=%d", (int)stealth_engine::is_active());
-
-			if (stealth_engine::is_active()) {
-				auto status = stealth_engine::get_session_info();
-				result["pid"] = status.pid;
-				result["peb_spoofed"] = status.peb_spoofed;
-				result["rdtsc_hooks"] = static_cast<int>(status.hooks.size());
-
-				json hooks_arr = json::array();
-				for (auto& h : status.hooks) {
-					json hobj;
-					char abuf[32];
-					std::snprintf(abuf, sizeof(abuf), "0x%llX", static_cast<unsigned long long>(h.target_addr));
-					hobj["address"] = abuf;
-					char tbuf[32];
-					std::snprintf(tbuf, sizeof(tbuf), "0x%llX", static_cast<unsigned long long>(h.trampoline_addr));
-					hobj["trampoline"] = tbuf;
-					hobj["active"] = h.active;
-					hooks_arr.push_back(hobj);
-				}
-				result["hooks"] = hooks_arr;
-			}
-
-			return tool_result_t::ok(result);
-		}
-	});
 }
 
 }

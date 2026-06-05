@@ -1,5 +1,6 @@
 #include "test_all_scanner.h"
 
+#include "test_all_features.hpp"
 #include "../scanner/memory_scanner.hpp"
 #include "../scanner/crypto_scanner.hpp"
 #include "../scanner/pointer_scanner.hpp"
@@ -36,10 +37,7 @@ static void format_timestamp(char* out, std::size_t cap) {
 }
 
 static void write_log_file(HANDLE hf, const std::string& line) {
-    if (hf == INVALID_HANDLE_VALUE) return;
-    DWORD wrote = 0;
-    WriteFile(hf, line.data(), static_cast<DWORD>(line.size()), &wrote, nullptr);
-    FlushFileBuffers(hf);
+    test_all_features::write_full_test_log_line(hf, line.data(), line.size());
 }
 
 static void log_msg(HANDLE hf, const char* tag, const char* fmt, ...) {
@@ -57,8 +55,7 @@ static void log_msg(HANDLE hf, const char* tag, const char* fmt, ...) {
     std::string s(line);
 
     write_log_file(hf, s);
-    diag::log_tagged_fmt("test_scan", "%s: %s", tag, detail);
-    OutputDebugStringA(s.c_str());
+    test_all_features::mirror_full_test_log_line(tag, detail, s.c_str());
 }
 
 static constexpr uint64_t k_marker_u64 = 0xCAFEBABE00000001ULL;
@@ -86,6 +83,8 @@ struct target_anchor_t {
     uint64_t addr_flt = 0;
     uint64_t addr_dbl = 0;
     uint64_t addr_aob = 0;
+    uint64_t addr_aes_sbox = 0;
+    uint64_t addr_sha256_k = 0;
     uint64_t addr_entropy = 0;
     uint64_t addr_scratch = 0;
     uint64_t ptr_target = 0;
@@ -109,6 +108,8 @@ static constexpr size_t k_anchor_off_target  = 0x200;
 static constexpr size_t k_anchor_off_level1  = 0x210;
 static constexpr size_t k_anchor_off_level0  = 0x220;
 static constexpr size_t k_anchor_off_entropy = 0x300;
+static constexpr size_t k_anchor_off_aes     = 0x500;
+static constexpr size_t k_anchor_off_sha256  = 0x700;
 static constexpr size_t k_anchor_entropy_len = 0x100;
 static constexpr size_t k_anchor_page        = 0x1000;
 
@@ -143,6 +144,8 @@ static bool plant_anchor(HANDLE hf) {
     std::memcpy(page.data() + k_anchor_off_dbl, &k_marker_dbl, sizeof(k_marker_dbl));
     std::memcpy(page.data() + k_anchor_off_bytes, k_marker_bytes, sizeof(k_marker_bytes));
     std::memcpy(page.data() + k_anchor_off_aob, k_marker_aob, sizeof(k_marker_aob));
+    std::memcpy(page.data() + k_anchor_off_aes, crypto_scanner::constants::aes_sbox, sizeof(crypto_scanner::constants::aes_sbox));
+    std::memcpy(page.data() + k_anchor_off_sha256, crypto_scanner::constants::sha256_k, sizeof(crypto_scanner::constants::sha256_k));
 
     size_t ascii_len = std::strlen(k_marker_ascii);
     std::memcpy(page.data() + k_anchor_off_ascii, k_marker_ascii, ascii_len + 1);
@@ -189,6 +192,8 @@ static bool plant_anchor(HANDLE hf) {
     g_anchor.addr_dbl = base + k_anchor_off_dbl;
     g_anchor.addr_bytes = base + k_anchor_off_bytes;
     g_anchor.addr_aob = base + k_anchor_off_aob;
+    g_anchor.addr_aes_sbox = base + k_anchor_off_aes;
+    g_anchor.addr_sha256_k = base + k_anchor_off_sha256;
     g_anchor.addr_entropy = base + k_anchor_off_entropy;
     g_anchor.addr_ascii = base + k_anchor_off_ascii;
     g_anchor.addr_wide = base + k_anchor_off_wide;
@@ -197,10 +202,11 @@ static bool plant_anchor(HANDLE hf) {
     g_anchor.ptr_level1 = base + k_anchor_off_level1;
     g_anchor.ptr_level0 = base + k_anchor_off_level0;
 
-    log_msg(hf, "anchor", "plant OK -- pid=%u base=0x%llX u64=0x%llX bytes=0x%llX ascii=0x%llX wide=0x%llX entropy=0x%llX ptr_target=0x%llX ptr_l1=0x%llX ptr_l0=0x%llX",
+    log_msg(hf, "anchor", "plant OK -- pid=%u base=0x%llX u64=0x%llX bytes=0x%llX ascii=0x%llX wide=0x%llX aes=0x%llX sha256=0x%llX entropy=0x%llX ptr_target=0x%llX ptr_l1=0x%llX ptr_l0=0x%llX",
         pid, (unsigned long long)base,
         (unsigned long long)g_anchor.addr_u64, (unsigned long long)g_anchor.addr_bytes,
         (unsigned long long)g_anchor.addr_ascii, (unsigned long long)g_anchor.addr_wide,
+        (unsigned long long)g_anchor.addr_aes_sbox, (unsigned long long)g_anchor.addr_sha256_k,
         (unsigned long long)g_anchor.addr_entropy,
         (unsigned long long)g_anchor.ptr_target, (unsigned long long)g_anchor.ptr_level1,
         (unsigned long long)g_anchor.ptr_level0);
@@ -263,12 +269,52 @@ static void unplant_anchor(HANDLE hf) {
     g_anchor = target_anchor_t{};
 }
 
-static bool wait_scan_idle(int max_iters = 100) {
+static bool wait_scan_idle(int max_iters = 100, HANDLE hf = INVALID_HANDLE_VALUE, const char* tag = "scan_wait") {
+    constexpr int wait_step_ms = 25;
     for (int i = 0; i < max_iters; ++i) {
-        if (!memory_scanner::g_state.scanning.load()) return true;
-        Sleep(100);
+        bool scanning = memory_scanner::g_state.scanning.load(std::memory_order_acquire);
+        bool done = memory_scanner::g_state.scan_thread_done.load(std::memory_order_acquire);
+        if (!scanning && done) return true;
+        if (!scanning && !done) {
+            memory_scanner::g_state.scan_thread_done.store(true, std::memory_order_release);
+            diag::log_tagged_fmt("test_scan", "%s wait_scan_idle recovered stale done flag", tag ? tag : "scan_wait");
+            return true;
+        }
+        Sleep(wait_step_ms);
     }
-    return !memory_scanner::g_state.scanning.load();
+    bool idle = !memory_scanner::g_state.scanning.load();
+    if (!idle) {
+        size_t result_count = 0;
+        {
+            std::lock_guard<std::mutex> lk(memory_scanner::g_state.results_mutex);
+            result_count = memory_scanner::g_state.results.size();
+        }
+        float progress = memory_scanner::g_state.scan_progress.load(std::memory_order_acquire);
+        bool done = memory_scanner::g_state.scan_thread_done.load(std::memory_order_acquire);
+        if (hf != INVALID_HANDLE_VALUE) {
+            log_msg(hf, tag ? tag : "scan_wait",
+                "TIMEOUT -- scan still active after %d ms progress=%.3f scan_done=%d results=%zu forcing cancellation",
+                max_iters * wait_step_ms,
+                static_cast<double>(progress),
+                static_cast<int>(done),
+                result_count);
+        }
+        diag::log_tagged_fmt("test_scan",
+            "%s wait_scan_idle timeout max_ms=%d progress=%.3f scan_done=%d results=%zu",
+            tag ? tag : "scan_wait",
+            max_iters * wait_step_ms,
+            static_cast<double>(progress),
+            static_cast<int>(done),
+            result_count);
+        memory_scanner::g_state.scanning.store(false, std::memory_order_release);
+        for (int i = 0; i < 20; ++i) {
+            if (memory_scanner::g_state.scan_thread_done.load(std::memory_order_acquire))
+                break;
+            Sleep(50);
+        }
+        idle = !memory_scanner::g_state.scanning.load();
+    }
+    return idle;
 }
 
 static size_t snapshot_results(std::vector<memory_scanner::scan_result_t>& out) {
@@ -334,6 +380,7 @@ static bool seed_fixture_scan(const memory_scanner::scan_config_t& cfg,
     memory_scanner::g_state.config = cfg;
     memory_scanner::g_state.scan_progress.store(1.f);
     memory_scanner::g_state.scanning.store(false);
+    memory_scanner::g_state.scan_thread_done.store(true, std::memory_order_release);
     return true;
 }
 
@@ -632,7 +679,7 @@ static void test_next_scan_unchanged(HANDLE hf, std::atomic<int>& passed, std::a
     size_t before_n = snapshot_results(before);
 
     bool ok = memory_scanner::next_scan(memory_scanner::scan_mode_t::unchanged, "", "");
-    bool idle = wait_scan_idle();
+    bool idle = wait_scan_idle(100, hf, "scan_unc");
 
     std::vector<memory_scanner::scan_result_t> after;
     size_t after_n = snapshot_results(after);
@@ -719,7 +766,7 @@ static void test_next_scan_changed(HANDLE hf, std::atomic<int>& passed, std::ato
     bool mutated = driver_bridge::write_memory(g_anchor.addr_scratch, new_bytes);
 
     bool ok = memory_scanner::next_scan(memory_scanner::scan_mode_t::changed, "", "");
-    bool idle = wait_scan_idle();
+    bool idle = wait_scan_idle(100, hf, "scan_chg");
 
     std::vector<memory_scanner::scan_result_t> after;
     size_t after_n = snapshot_results(after);
@@ -791,7 +838,7 @@ static void test_undo_scan(HANDLE hf, std::atomic<int>& passed, std::atomic<int>
     size_t first_n = snapshot_results(first);
 
     bool refine_ok = memory_scanner::next_scan(memory_scanner::scan_mode_t::unchanged, "", "");
-    wait_scan_idle();
+    wait_scan_idle(100, hf, "scan_undo");
     std::vector<memory_scanner::scan_result_t> refined;
     size_t refined_n = snapshot_results(refined);
 
@@ -1092,23 +1139,36 @@ static void test_crypto_get_signatures(HANDLE hf, std::atomic<int>& passed, std:
 }
 
 static void test_crypto_scan_process(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-    log_msg(hf, "crypto_sp", "START -- crypto scanner scan_process (target embeds AES/SHA constants)");
+    log_msg(hf, "crypto_sp", "START -- crypto scanner scan_process (planted AES/SHA constants)");
     auto t0 = std::chrono::steady_clock::now();
+
+    if (!g_anchor.planted && !plant_anchor(hf)) {
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        log_msg(hf, "crypto_sp", "FAIL -- could not plant deterministic AES/SHA fixture in attached target (elapsed %lld ms)",
+            (long long)ms);
+        failed.fetch_add(1);
+        return;
+    }
 
     uint32_t pid = driver_bridge::attached_pid();
     crypto_scanner::process_scan_config_t cfg;
-    cfg.max_regions = 16;
-    cfg.max_bytes = 512ull * 1024ull;
+    cfg.max_regions = 4;
+    cfg.max_bytes = k_anchor_page;
     cfg.max_hits = 16;
     cfg.timeout_ms = 4500;
-    for (const auto& mod : driver_bridge::enumerate_modules()) {
-        if (mod.name.find(".exe") != std::string::npos || mod.name.find(".EXE") != std::string::npos) {
-            cfg.module_filter = mod.name;
-            break;
-        }
-    }
-    log_msg(hf, "crypto_sp", "INPUT scan_process pid=%u max_regions=%zu max_bytes=%llu max_hits=%zu timeout_ms=%u module_filter='%s'",
-        pid, cfg.max_regions, (unsigned long long)cfg.max_bytes, cfg.max_hits, cfg.timeout_ms, cfg.module_filter.c_str());
+    cfg.range_base = g_anchor.region_base;
+    cfg.range_size = k_anchor_page;
+    log_msg(hf, "crypto_sp", "INPUT scan_process pid=%u fixture=0x%llX range=0x%llX+0x%llX aes=0x%llX sha256=0x%llX max_regions=%zu max_bytes=%llu max_hits=%zu timeout_ms=%u",
+        pid,
+        (unsigned long long)g_anchor.region_base,
+        (unsigned long long)cfg.range_base,
+        (unsigned long long)cfg.range_size,
+        (unsigned long long)g_anchor.addr_aes_sbox,
+        (unsigned long long)g_anchor.addr_sha256_k,
+        cfg.max_regions,
+        (unsigned long long)cfg.max_bytes,
+        cfg.max_hits,
+        cfg.timeout_ms);
     crypto_scanner::scan_process(cfg);
 
     bool idle = false;
@@ -1121,6 +1181,8 @@ static void test_crypto_scan_process(HANDLE hf, std::atomic<int>& passed, std::a
     size_t hits = 0;
     std::string first_name, first_algo;
     uint64_t first_addr = 0;
+    bool found_planted_aes = false;
+    bool found_planted_sha = false;
     {
         std::lock_guard<std::mutex> lk(crypto_scanner::g_state.mutex);
         hits = crypto_scanner::g_state.results.size();
@@ -1129,21 +1191,35 @@ static void test_crypto_scan_process(HANDLE hf, std::atomic<int>& passed, std::a
             first_algo = crypto_scanner::g_state.results.front().algorithm;
             first_addr = crypto_scanner::g_state.results.front().address;
         }
+        for (const auto& h : crypto_scanner::g_state.results) {
+            if (h.address == g_anchor.addr_aes_sbox && h.signature_name.find("AES S-Box") != std::string::npos)
+                found_planted_aes = true;
+            if (h.address == g_anchor.addr_sha256_k && h.signature_name.find("SHA-256 K") != std::string::npos)
+                found_planted_sha = true;
+        }
     }
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "crypto_sp", "RESULT idle=%d hits=%zu first='%s'/%s@0x%llX",
+    log_msg(hf, "crypto_sp", "RESULT idle=%d hits=%zu first='%s'/%s@0x%llX planted_aes=%d planted_sha=%d",
         static_cast<int>(idle), hits, first_name.c_str(), first_algo.c_str(),
-        (unsigned long long)first_addr);
+        (unsigned long long)first_addr,
+        static_cast<int>(found_planted_aes),
+        static_cast<int>(found_planted_sha));
 
-    if (hits == 0) {
-        log_msg(hf, "crypto_sp", "FAIL -- 0 crypto-constant hits in target that embeds AES S-box and SHA-256 K (elapsed %lld ms)",
-            (long long)ms);
+    if (!idle) {
+        log_msg(hf, "crypto_sp", "FAIL -- bounded crypto scan did not finish within budget (hits=%zu elapsed %lld ms)",
+            hits, (long long)ms);
+        failed.fetch_add(1);
+        return;
+    }
+    if (hits == 0 || !found_planted_aes || !found_planted_sha) {
+        log_msg(hf, "crypto_sp", "FAIL -- planted crypto constants not recovered (hits=%zu aes=%d sha=%d elapsed %lld ms)",
+            hits, static_cast<int>(found_planted_aes), static_cast<int>(found_planted_sha), (long long)ms);
         failed.fetch_add(1);
         return;
     }
 
-    log_msg(hf, "crypto_sp", "PASS -- scan_process found %zu crypto hits (first '%s'/%s @0x%llX) (elapsed %lld ms)",
+    log_msg(hf, "crypto_sp", "PASS -- scan_process found planted AES/SHA constants among %zu hits (first '%s'/%s @0x%llX) (elapsed %lld ms)",
         hits, first_name.c_str(), first_algo.c_str(), (unsigned long long)first_addr, (long long)ms);
     passed.fetch_add(1);
 }
@@ -1880,7 +1956,7 @@ static void test_scan_mode_bigger_than(HANDLE hf, std::atomic<int>& passed, std:
     int32_t expected = k_marker_i32;
     bool seed_ok = seed_fixture_scan_value(cfg, g_anchor.addr_i32, expected);
     bool ok = seed_ok && memory_scanner::next_scan(memory_scanner::scan_mode_t::bigger_than, text);
-    bool idle = wait_scan_idle();
+    bool idle = wait_scan_idle(100, hf, "scan_gt");
 
     std::vector<memory_scanner::scan_result_t> results;
     size_t found = snapshot_results(results);
@@ -1935,7 +2011,7 @@ static void test_scan_mode_smaller_than(HANDLE hf, std::atomic<int>& passed, std
 
     bool seed_ok = seed_fixture_scan_value(cfg, g_anchor.addr_scratch, probe);
     bool ok = seed_ok && memory_scanner::next_scan(memory_scanner::scan_mode_t::smaller_than, text);
-    bool idle = wait_scan_idle();
+    bool idle = wait_scan_idle(100, hf, "scan_lt");
 
     std::vector<memory_scanner::scan_result_t> results;
     size_t found = snapshot_results(results);
@@ -1988,7 +2064,7 @@ static void test_scan_mode_between(HANDLE hf, std::atomic<int>& passed, std::ato
     int32_t expected = k_marker_i32;
     bool seed_ok = seed_fixture_scan_value(cfg, g_anchor.addr_i32, expected);
     bool ok = seed_ok && memory_scanner::next_scan(memory_scanner::scan_mode_t::value_between, t_lo, t_hi);
-    bool idle = wait_scan_idle();
+    bool idle = wait_scan_idle(100, hf, "scan_btw");
 
     std::vector<memory_scanner::scan_result_t> results;
     size_t found = snapshot_results(results);
@@ -2086,7 +2162,7 @@ static void test_next_scan_increased(HANDLE hf, std::atomic<int>& passed, std::a
     bool mutated = driver_bridge::write_memory(g_anchor.addr_scratch, b1);
 
     bool ok = memory_scanner::next_scan(memory_scanner::scan_mode_t::increased, "", "");
-    bool idle = wait_scan_idle();
+    bool idle = wait_scan_idle(100, hf, "scan_inc");
 
     std::vector<memory_scanner::scan_result_t> after;
     size_t after_n = snapshot_results(after);
@@ -2153,7 +2229,7 @@ static void test_next_scan_decreased(HANDLE hf, std::atomic<int>& passed, std::a
     bool mutated = driver_bridge::write_memory(g_anchor.addr_scratch, b1);
 
     bool ok = memory_scanner::next_scan(memory_scanner::scan_mode_t::decreased, "", "");
-    bool idle = wait_scan_idle();
+    bool idle = wait_scan_idle(100, hf, "scan_dec");
 
     std::vector<memory_scanner::scan_result_t> after;
     size_t after_n = snapshot_results(after);
@@ -2922,15 +2998,14 @@ static void test_scan_hub_tab_integrity(HANDLE hf, std::atomic<int>& passed, std
     select_scan_hub_tab(hf, passed, failed, "scan_hub_tab.integrity", scan_hub_view::sub_tab_t::integrity);
 }
 
+static size_t scanner_result_count_for_log() {
+    std::lock_guard<std::mutex> lk(memory_scanner::g_state.results_mutex);
+    return memory_scanner::g_state.results.size();
+}
+
 }
 
 void phase_scanner_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped, bool(*cancelled)()) {
-    log_msg(hf, "scanner", "=== BEGIN scanner tests (63 tests) ===");
-
-    bool planted = plant_anchor(hf);
-    log_msg(hf, "scanner", "anchor planted=%d pid=%u (value/snapshot/pointer tests key off resident markers)",
-        static_cast<int>(planted), driver_bridge::attached_pid());
-
     struct test_entry_t {
         const char* name;
         void (*fn)(HANDLE, std::atomic<int>&, std::atomic<int>&);
@@ -3006,6 +3081,12 @@ void phase_scanner_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& 
     };
 
     int total = static_cast<int>(sizeof(tests) / sizeof(tests[0]));
+    log_msg(hf, "scanner", "=== BEGIN scanner tests (%d tests) ===", total);
+
+    bool planted = plant_anchor(hf);
+    log_msg(hf, "scanner", "anchor planted=%d pid=%u (value/snapshot/pointer tests key off resident markers)",
+        static_cast<int>(planted), driver_bridge::attached_pid());
+
     for (int i = 0; i < total; ++i) {
         if (cancelled && cancelled()) {
             int remaining = total - i;
@@ -3015,6 +3096,10 @@ void phase_scanner_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& 
         }
 
         log_msg(hf, "scanner", "[%d/%d] %s", i + 1, total, tests[i].name);
+        int pass_before = passed.load(std::memory_order_acquire);
+        int fail_before = failed.load(std::memory_order_acquire);
+        int skip_before = skipped.load(std::memory_order_acquire);
+        ULONGLONG test_t0 = GetTickCount64();
         __try {
             tests[i].fn(hf, passed, failed);
         }
@@ -3023,6 +3108,21 @@ void phase_scanner_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& 
                 tests[i].name, GetExceptionCode());
             failed.fetch_add(1);
         }
+        ULONGLONG test_ms = GetTickCount64() - test_t0;
+        size_t result_count = scanner_result_count_for_log();
+        log_msg(hf, "scanner",
+            "[%d/%d] END %s elapsed_ms=%lld pass_delta=%d fail_delta=%d skip_delta=%d scanning=%d scan_done=%d progress=%.3f results=%zu",
+            i + 1,
+            total,
+            tests[i].name,
+            static_cast<long long>(test_ms),
+            passed.load(std::memory_order_acquire) - pass_before,
+            failed.load(std::memory_order_acquire) - fail_before,
+            skipped.load(std::memory_order_acquire) - skip_before,
+            static_cast<int>(memory_scanner::g_state.scanning.load(std::memory_order_acquire)),
+            static_cast<int>(memory_scanner::g_state.scan_thread_done.load(std::memory_order_acquire)),
+            static_cast<double>(memory_scanner::g_state.scan_progress.load(std::memory_order_acquire)),
+            result_count);
     }
 
     memory_scanner::reset_scan();

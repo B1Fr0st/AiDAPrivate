@@ -94,8 +94,8 @@ if [ ! -f /opt/aida/keys/ed25519_private.pem ]; then
     ok "Ed25519 keys generated in /opt/aida/keys/"
     echo ""
     echo "=========================================="
-    echo "  IMPORTANT: Save the private key B64 value above"
-    echo "  and paste it into /opt/aida/api/.env as ED25519_PRIVATE_KEY_B64"
+    echo "  IMPORTANT: ED25519 private key material was written under /opt/aida/keys"
+    echo "  Keep those files protected and set ED25519_PRIVATE_KEY_B64 from the server-side b64 file"
     echo "=========================================="
     echo ""
 else

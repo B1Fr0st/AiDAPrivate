@@ -1,5 +1,6 @@
 #include "camoufox_bridge_mcp.hpp"
 #include "camoufox_bridge.hpp"
+#include "camoufox_install.hpp"
 #include "../../settings/standalone_compat.hpp"
 
 #ifdef small
@@ -35,6 +36,35 @@ const char* state_label(camoufox::bridge_state_t s)
     return "unknown";
 }
 
+const char* install_state_label(camoufox::install::install_state_t s)
+{
+    switch (s)
+    {
+        case camoufox::install::install_state_t::unknown:         return "unknown";
+        case camoufox::install::install_state_t::checking:        return "checking";
+        case camoufox::install::install_state_t::available:       return "available";
+        case camoufox::install::install_state_t::missing_python:  return "missing_python";
+        case camoufox::install::install_state_t::missing_module:  return "missing_module";
+        case camoufox::install::install_state_t::missing_browser: return "missing_browser";
+        case camoufox::install::install_state_t::installing:      return "installing";
+        case camoufox::install::install_state_t::install_failed:  return "install_failed";
+        case camoufox::install::install_state_t::ok:              return "ok";
+    }
+    return "unknown";
+}
+
+json install_status_to_json(const camoufox::install::status_t& s)
+{
+    json j;
+    j["state"] = install_state_label(s.state);
+    j["python_path"] = s.python_path;
+    j["module_version"] = s.module_version;
+    j["browser_path"] = s.browser_path;
+    j["last_message"] = s.last_message;
+    j["ready"] = s.state == camoufox::install::install_state_t::ok;
+    return j;
+}
+
 json status_to_json(const camoufox::bridge_status_t& s)
 {
     json j;
@@ -48,7 +78,16 @@ json status_to_json(const camoufox::bridge_status_t& s)
     j["total_errors"]     = s.total_errors;
     j["browser_open"]     = s.browser_open;
     j["active_page_url"]  = s.active_page_url;
-    j["ready"]            = s.state == camoufox::bridge_state_t::ready;
+    j["active_page_title"] = s.active_page_title;
+    j["page_verified"]    = s.page_verified;
+    j["child_alive"]      = s.child_alive;
+    j["cleanup_pending"]  = s.cleanup_pending;
+    j["generation"]       = s.generation;
+    j["last_launch_ms"]   = s.last_launch_ms;
+    j["last_nav_ms"]      = s.last_nav_ms;
+    j["last_cleanup_ms"]  = s.last_cleanup_ms;
+    j["last_verified_ms"] = s.last_verified_ms;
+    j["ready"]            = s.state == camoufox::bridge_state_t::ready && s.browser_open && s.page_verified && s.child_alive && !s.cleanup_pending;
     return j;
 }
 
@@ -309,6 +348,31 @@ tool_result_t tool_close_browser(const json&)
 
 tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json& params, int default_timeout_ms)
 {
+    if (tool_name == "check_environment")
+    {
+        (void)params;
+        auto install_status = camoufox::install::probe();
+        auto bridge_status = camoufox::get_status();
+        json data;
+        data["install"] = install_status_to_json(install_status);
+        data["bridge"] = status_to_json(bridge_status);
+        data["dependencies_ready"] = install_status.state == camoufox::install::install_state_t::ok;
+        data["bridge_ready"] = bridge_status.state == camoufox::bridge_state_t::ready &&
+            bridge_status.browser_open && bridge_status.page_verified && bridge_status.child_alive &&
+            !bridge_status.cleanup_pending;
+        data["ready"] = data["dependencies_ready"].get<bool>();
+        std::string text = data["dependencies_ready"].get<bool>()
+            ? std::string("Camoufox dependencies are ready.")
+            : std::string("Camoufox dependencies are not ready: ") + install_status.last_message;
+        diag::log_tagged_fmt("mcp_burp", "camoufox_check_environment deps_ready=%d install_state=%s bridge_state=%s message=%s",
+            data["dependencies_ready"].get<bool>() ? 1 : 0,
+            install_state_label(install_status.state),
+            state_label(bridge_status.state),
+            install_status.last_message.c_str());
+        if (!data["dependencies_ready"].get<bool>())
+            return {false, text, data};
+        return tool_result_t::ok(text, data);
+    }
     json args = camoufox_args(params);
     int timeout_ms = camoufox_timeout_ms(params, default_timeout_ms);
     diag::log_tagged_fmt("mcp_burp", "camoufox_passthrough tool=%s timeout_ms=%d args_shape=%s",
@@ -340,9 +404,9 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"enable_trace", "boolean", "Enable engine-level property access tracing", false},
              {"python_executable", "string", "Override Python interpreter path", false},
              {"server_module", "string", "Override Python module name", false},
-             {"launch_timeout_ms", "number", "Launch timeout in milliseconds", false},
+             {"launch_timeout_ms", "number", "Requested launch timeout in milliseconds; AiDA bounds the readiness handshake internally", false},
              {"window_width", "number", "Initial outer browser window width in pixels", false},
-             {"window_height", "number", "Initial outer browser window height in pixels", false}}, false, 240000},
+             {"window_height", "number", "Initial outer browser window height in pixels", false}}, false, 60000},
         {"close_browser", "Close Camoufox and stop the hidden bundled Python bridge.", {}, false, 30000},
         {"navigate", "Navigate the active Camoufox page with optional hook pre-injection and redirect tracing.",
             {{"url", "string", "Target URL", true},
@@ -476,7 +540,7 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"filter_object_names", "array", "Object-name allowlist", false},
              {"max_file_size", "number", "Maximum script size to rewrite", false},
              {"on_oversized", "string", "Oversized script policy", false}}, false, 60000},
-        {"check_environment", "Check Camoufox MCP dependencies and browser state.", {}, true, 30000},
+        {"check_environment", "Check Camoufox MCP dependencies and browser state.", {}, true, 5000},
         {"verify_signer_offline", "Verify a candidate JavaScript signing function against captured samples offline.",
             {{"signer_code", "string", "Candidate signer source", true},
              {"samples", "array", "Request/signature samples", true},
@@ -593,8 +657,8 @@ tool_result_t tool_headless_navigate(const json& params)
         diag::log_tagged_fmt("mcp_burp", "headless_navigate page_info ok response_shape=%s", json_shape(page.data).c_str());
         return tool_result_t::ok(page.data);
     }
-    diag::log_tagged_fmt("mcp_burp", "headless_navigate page_info unavailable error_len=%zu", page.error.size());
-    return tool_result_t::ok(json{{"status", "navigated"}, {"url", url}});
+    diag::log_tagged_fmt("mcp_burp", "headless_navigate page_info failed error_len=%zu err=%s", page.error.size(), page.error.c_str());
+    return tool_result_t::error(page.error.empty() ? std::string("headless_navigate page verification failed") : page.error);
 }
 
 tool_result_t tool_headless_reload(const json& params)
@@ -612,7 +676,8 @@ tool_result_t tool_headless_reload(const json& params)
     diag::log_tagged_fmt("mcp_burp", "headless_reload ok");
     auto page = camoufox::get_page_info();
     if (page.ok) return tool_result_t::ok(page.data);
-    return tool_result_t::ok(json{{"status", "reloaded"}});
+    diag::log_tagged_fmt("mcp_burp", "headless_reload page_info failed err=%s", page.error.c_str());
+    return tool_result_t::error(page.error.empty() ? std::string("headless_reload page verification failed") : page.error);
 }
 
 tool_result_t tool_headless_evaluate(const json& params)
@@ -871,7 +936,7 @@ void register_camoufox_tools(mcp_standalone::server_t& srv)
             {"enable_trace",      "boolean", "Enable engine-level property access tracing", false},
             {"python_executable", "string",  "Override python interpreter path", false},
             {"server_module",     "string",  "MCP server module name (default camoufox_reverse_mcp)", false},
-            {"launch_timeout_ms", "number",  "Launch handshake timeout in ms (default 180000, max 240000)", false},
+            {"launch_timeout_ms", "number",  "Requested launch timeout in ms; readiness is internally bounded before caller timeout", false},
             {"window_width",      "number",  "Initial outer browser window width in pixels", false},
             {"window_height",     "number",  "Initial outer browser window height in pixels", false},
         },

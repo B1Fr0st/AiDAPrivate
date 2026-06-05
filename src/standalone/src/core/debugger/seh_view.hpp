@@ -8,6 +8,7 @@
 #include "work_queue.hpp"
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -76,7 +77,9 @@ inline void refresh()
 		"seh_refresh_request attached_pid=%u active_tid=%u",
 		static_cast<unsigned>(driver_bridge::attached_pid()),
 		static_cast<unsigned>(debugger_engine::g_state.active_tid));
-	work_queue::post([]() {
+	try {
+		if (!work_queue::post([]() {
+		try {
 		std::vector<seh_entry_t> entries;
 
 		auto modules = driver_bridge::enumerate_modules();
@@ -168,7 +171,24 @@ inline void refresh()
 		diag::log_tagged_fmt("seh",
 			"seh_refresh_done chain_depth=%zu", n);
 		g_ui.refreshing.store(false);
-	});
+		} catch (const std::exception& ex) {
+			diag::log_tagged_fmt("seh", "seh_refresh_worker_exception err='%s'", ex.what());
+			g_ui.refreshing.store(false);
+		} catch (...) {
+			diag::log_tagged("seh", "seh_refresh_worker_exception err='<unknown>'");
+			g_ui.refreshing.store(false);
+		}
+	})) {
+			diag::log_tagged("seh", "seh_refresh_worker_post_failed");
+			g_ui.refreshing.store(false);
+		}
+	} catch (const std::exception& ex) {
+		diag::log_tagged_fmt("seh", "seh_refresh_worker_create_failed err='%s'", ex.what());
+		g_ui.refreshing.store(false);
+	} catch (...) {
+		diag::log_tagged("seh", "seh_refresh_worker_create_failed err='<unknown>'");
+		g_ui.refreshing.store(false);
+	}
 }
 
 inline void render(float pos_x, float pos_y, float width, float height,

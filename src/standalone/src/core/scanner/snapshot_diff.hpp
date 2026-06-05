@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -509,7 +510,8 @@ inline void compare_snapshots(uint64_t id_a, uint64_t id_b)
 	g_state.compare_cursor_active = true;
 	g_state.compare_cursor_t = 0.f;
 
-	work_queue::post([id_a, id_b]() {
+	if (!work_queue::post([id_a, id_b]() {
+		try {
 		auto t_start = std::chrono::steady_clock::now();
 		diff_result_t result;
 
@@ -618,7 +620,27 @@ inline void compare_snapshots(uint64_t id_a, uint64_t id_b)
 
 		g_state.progress.store(1.f);
 		g_state.comparing.store(false);
-	});
+		g_state.compare_cursor_active = false;
+		} catch (const std::exception& ex) {
+			diag::log_tagged_fmt("snapshot_diff", "compare_snapshots worker_exception err='%s'", ex.what());
+			g_state.last_error = ex.what();
+			g_state.progress.store(1.f);
+			g_state.comparing.store(false);
+			g_state.compare_cursor_active = false;
+		} catch (...) {
+			diag::log_tagged("snapshot_diff", "compare_snapshots worker_exception err='<unknown>'");
+			g_state.last_error = "compare_snapshots: worker threw an unknown exception";
+			g_state.progress.store(1.f);
+			g_state.comparing.store(false);
+			g_state.compare_cursor_active = false;
+		}
+	})) {
+		diag::log_tagged("snapshot_diff", "compare_snapshots worker_queue_rejected");
+		g_state.last_error = "compare_snapshots: worker queue rejected the task";
+		g_state.progress.store(1.f);
+		g_state.comparing.store(false);
+		g_state.compare_cursor_active = false;
+	}
 }
 
 inline void clear_snapshots()

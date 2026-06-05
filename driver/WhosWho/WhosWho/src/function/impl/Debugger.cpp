@@ -1297,8 +1297,12 @@ NTSTATUS functions::handle_anti_debug(p_anti_debug_request request) {
     {
         UINT64 dbg_pid = 0;
         NTSTATUS status = anti_debug::scan_for_debugger_processes(&dbg_pid);
+        NTSTATUS raw_status = status;
+        if (status == STATUS_NOT_FOUND && dbg_pid == 0)
+            status = STATUS_SUCCESS;
         request->detected_debugger_pid = dbg_pid;
         request->result_flags = (dbg_pid != 0) ? 1 : 0;
+        WW_LOG("[ADBG] handle_scan_debuggers raw_status=0x%08X return_status=0x%08X dbg_pid=%llu flags=0x%08X", raw_status, status, dbg_pid, request->result_flags);
         return status;
     }
 

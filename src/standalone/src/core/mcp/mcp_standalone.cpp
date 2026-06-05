@@ -10,10 +10,11 @@
 #include "mcp_standalone.hpp"
 #include "standalone_driver.hpp"
 #include "standalone_license.hpp"
+#include "../anti-tamper/mcp_posture.hpp"
 #include "arc/arc.h"
 #include "zydis_disasm.hpp"
 #include "sandbox.hpp"
-#include "../infra/work_queue.hpp"
+#include "../infra/critical_work_queue.hpp"
 #include "../session/analysis_session.hpp"
 #include "../../helpers/diag_log.hpp"
 #include <httplib.h>
@@ -25,19 +26,21 @@
 #include <filesystem>
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
 #include <memory>
+#include <thread>
 
 namespace mcp_standalone
 {
 namespace
 {
     std::atomic<bool> g_ide_lifecycle_ready{false};
-    constexpr size_t kMcpHttpWorkerThreads = 32;
-    constexpr size_t kMcpHttpMaxQueuedRequests = 512;
-    constexpr int kMcpMaxConcurrentStreams = 24;
+    constexpr size_t kMcpHttpMaxQueuedRequests = 256;
+    constexpr int kMcpMaxConcurrentStreams = 8;
     constexpr DWORD kSseSessionMaxAgeMs = 60u * 60u * 1000u;
     std::atomic<std::uint64_t> g_http_request_seq{0};
     std::atomic<int> g_active_http_requests{0};
@@ -52,6 +55,121 @@ namespace
     {
         return static_cast<std::uint64_t>(GetTickCount64());
     }
+
+    static void log_work_queue_stats(const char* context)
+    {
+        const auto st = critical_work_queue::stats();
+        diag::log_tagged_fmt("mcp_srv",
+            "%s critical_queue alive=%d shutting_down=%d pool_size=%d workers=%zu pending=%zu active=%u post_attempts=%llu posted=%llu rejected=%llu started=%llu finished=%llu",
+            context ? context : "critical_queue",
+            st.alive ? 1 : 0,
+            st.shutting_down ? 1 : 0,
+            st.pool_size,
+            st.workers,
+            st.pending,
+            static_cast<unsigned>(st.active),
+            static_cast<unsigned long long>(st.post_attempts),
+            static_cast<unsigned long long>(st.posted),
+            static_cast<unsigned long long>(st.rejected),
+            static_cast<unsigned long long>(st.started),
+            static_cast<unsigned long long>(st.finished));
+    }
+
+    class work_queue_task_queue final : public httplib::TaskQueue
+    {
+    public:
+        explicit work_queue_task_queue(std::size_t max_queued_requests)
+            : _max_queued_requests(max_queued_requests)
+            , _state(std::make_shared<state_t>())
+        {
+            log_work_queue_stats("http_task_queue create");
+        }
+
+        bool enqueue(std::function<void()> fn) override
+        {
+            auto state = _state;
+            if (!fn || state->shutdown.load(std::memory_order_acquire))
+                return false;
+
+            std::size_t observed = state->pending.load(std::memory_order_acquire);
+            for (;;) {
+                if (_max_queued_requests > 0 && observed >= _max_queued_requests) {
+                    diag::log_tagged_fmt("mcp_srv", "http_task_queue enqueue rejected pending=%zu max=%zu",
+                        observed, _max_queued_requests);
+                    return false;
+                }
+                if (state->pending.compare_exchange_weak(
+                    observed,
+                    observed + 1,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                    break;
+                }
+            }
+
+            const std::uint64_t queued_at = mcp_now_ms();
+            bool posted = critical_work_queue::post([state, queued_at, task = std::move(fn)]() mutable {
+                const std::uint64_t entered_at = mcp_now_ms();
+                const std::uint64_t delay = entered_at >= queued_at ? (entered_at - queued_at) : 0;
+                if (delay > 100) {
+                    diag::log_tagged_fmt("mcp_srv", "http_task_queue dispatch delay_ms=%llu pending=%zu tid=%lu",
+                        static_cast<unsigned long long>(delay),
+                        state->pending.load(std::memory_order_acquire),
+                        static_cast<unsigned long>(GetCurrentThreadId()));
+                }
+                try {
+                    task();
+                } catch (const std::exception& ex) {
+                    diag::log_tagged_fmt("mcp_srv", "http_task_queue task exception err='%s'", ex.what());
+                } catch (...) {
+                    diag::log_tagged("mcp_srv", "http_task_queue task exception err='<unknown>'");
+                }
+                const std::size_t left = state->pending.fetch_sub(1, std::memory_order_acq_rel) - 1;
+                if (state->shutdown.load(std::memory_order_acquire) && left == 0) {
+                    std::lock_guard<std::mutex> lk(state->mtx);
+                    state->cv.notify_all();
+                }
+            });
+            if (!posted) {
+                state->pending.fetch_sub(1, std::memory_order_acq_rel);
+                diag::log_tagged_fmt("mcp_srv", "http_task_queue critical_queue post failed pending=%zu",
+                    state->pending.load(std::memory_order_acquire));
+                log_work_queue_stats("http_task_queue post_failed");
+                return false;
+            }
+            return true;
+        }
+
+        void shutdown() override
+        {
+            auto state = _state;
+            state->shutdown.store(true, std::memory_order_release);
+            std::unique_lock<std::mutex> lk(state->mtx);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            while (state->pending.load(std::memory_order_acquire) != 0) {
+                if (state->cv.wait_until(lk, deadline, [state]() {
+                    return state->pending.load(std::memory_order_acquire) == 0;
+                })) {
+                    break;
+                }
+                diag::log_tagged_fmt("mcp_srv", "http_task_queue shutdown timeout pending=%zu",
+                    state->pending.load(std::memory_order_acquire));
+                break;
+            }
+            log_work_queue_stats("http_task_queue shutdown");
+        }
+
+    private:
+        struct state_t {
+            std::atomic<bool> shutdown{false};
+            std::atomic<std::size_t> pending{0};
+            std::mutex mtx;
+            std::condition_variable cv;
+        };
+
+        const std::size_t _max_queued_requests;
+        std::shared_ptr<state_t> _state;
+    };
 
     static std::string remote_endpoint(const httplib::Request& req)
     {
@@ -202,6 +320,8 @@ static std::string json_dump_safe(const json& j, int indent = -1)
 static bool mcp_runtime_authorized()
 {
     if (!g_ide_lifecycle_ready.load(std::memory_order_acquire))
+        return false;
+    if (!anti_tamper::mcp_posture::is_current_posture_trusted())
         return false;
     if (!standalone_license::is_valid() || !standalone_license::is_arc_loaded())
         return false;
@@ -1283,41 +1403,39 @@ bool server_t::start(int port)
     _stop_requested = false;
     _port = 0;
 
-    if (_server_thread.joinable()) {
-        if (_server_done.load(std::memory_order_acquire)) {
-            _server_thread.join();
-        } else {
-            diag::log_tagged_fmt("mcp_srv", "start rejected server_thread already starting port=%d", port);
-            return false;
-        }
+    if (!_server_done.load(std::memory_order_acquire)) {
+        diag::log_tagged_fmt("mcp_srv", "start rejected server worker already starting port=%d", port);
+        log_work_queue_stats("start rejected");
+        return false;
     }
 
     _server_done.store(false, std::memory_order_release);
-    try {
-        _server_thread = std::thread([this, port]() {
-            diag::log_tagged_fmt("mcp_srv", "server_thread starting port=%d tid=%lu", port, static_cast<unsigned long>(GetCurrentThreadId()));
-            try {
-                server_thread_func(port);
-            } catch (const std::exception& ex) {
-                diag::log_tagged_fmt("mcp_srv", "server_thread exception port=%d err='%s'", port, ex.what());
-                _running.store(false, std::memory_order_release);
-            } catch (...) {
-                diag::log_tagged_fmt("mcp_srv", "server_thread exception port=%d err='<unknown>'", port);
-                _running.store(false, std::memory_order_release);
-            }
-            diag::log_tagged_fmt("mcp_srv", "server_thread exited port=%d tid=%lu", port, static_cast<unsigned long>(GetCurrentThreadId()));
-            _server_done.store(true, std::memory_order_release);
-        });
-    } catch (const std::exception& ex) {
-        diag::log_tagged_fmt("mcp_srv", "start dedicated_thread fail err='%s'", ex.what());
+    log_work_queue_stats("start before post");
+    const bool posted = critical_work_queue::post([this, port]() {
+        const DWORD tid = GetCurrentThreadId();
+        _server_worker_tid.store(static_cast<std::uint32_t>(tid), std::memory_order_release);
+        diag::log_tagged_fmt("mcp_srv", "server_worker starting port=%d tid=%lu", port, static_cast<unsigned long>(tid));
+        log_work_queue_stats("server_worker entry");
+        try {
+            server_thread_func(port);
+        } catch (const std::exception& ex) {
+            diag::log_tagged_fmt("mcp_srv", "server_worker exception port=%d err='%s'", port, ex.what());
+            _running.store(false, std::memory_order_release);
+        } catch (...) {
+            diag::log_tagged_fmt("mcp_srv", "server_worker exception port=%d err='<unknown>'", port);
+            _running.store(false, std::memory_order_release);
+        }
+        diag::log_tagged_fmt("mcp_srv", "server_worker exited port=%d tid=%lu", port, static_cast<unsigned long>(GetCurrentThreadId()));
+        _server_worker_tid.store(0, std::memory_order_release);
         _server_done.store(true, std::memory_order_release);
-        return false;
-    } catch (...) {
-        diag::log_tagged_fmt("mcp_srv", "start dedicated_thread fail err='<unknown>'");
+    });
+    if (!posted) {
+        diag::log_tagged("mcp_srv", "start critical_queue post failed");
+        log_work_queue_stats("start post_failed");
         _server_done.store(true, std::memory_order_release);
         return false;
     }
-
+    diag::log_tagged_fmt("mcp_srv", "start critical_queue post ok port=%d", port);
 
     for (int i = 0; i < 500 && !_running.load() && !_server_done.load(std::memory_order_acquire) && !_stop_requested.load(); ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -1330,15 +1448,9 @@ bool server_t::start(int port)
 void server_t::stop()
 {
     diag::log_tagged_fmt("mcp_srv", "stop entry running=%d", (int)_running.load());
-    const bool on_server_thread = _server_thread.joinable() && _server_thread.get_id() == std::this_thread::get_id();
+    const bool on_server_worker = _server_worker_tid.load(std::memory_order_acquire) == static_cast<std::uint32_t>(GetCurrentThreadId());
     if (!_running.load() && _server_done.load(std::memory_order_acquire))
     {
-        if (_server_thread.joinable()) {
-            if (on_server_thread)
-                _server_thread.detach();
-            else
-                _server_thread.join();
-        }
         diag::log_tagged_fmt("mcp_srv", "stop already stopped");
         return;
     }
@@ -1348,15 +1460,22 @@ void server_t::stop()
         if (_active_server)
             static_cast<httplib::Server*>(_active_server)->stop();
     }
-    if (!on_server_thread) {
-        while (!_server_done.load(std::memory_order_acquire))
+    if (!on_server_worker) {
+        const std::uint64_t wait_start = mcp_now_ms();
+        while (!_server_done.load(std::memory_order_acquire)) {
+            const std::uint64_t elapsed = mcp_now_ms() - wait_start;
+            if (elapsed > 10000) {
+                diag::log_tagged_fmt("mcp_srv", "stop wait timeout elapsed_ms=%llu worker_tid=%u running=%d",
+                    static_cast<unsigned long long>(elapsed),
+                    static_cast<unsigned>(_server_worker_tid.load(std::memory_order_acquire)),
+                    _running.load(std::memory_order_acquire) ? 1 : 0);
+                log_work_queue_stats("stop wait timeout");
+                break;
+            }
+            if (elapsed == 1000 || elapsed == 3000 || elapsed == 5000)
+                log_work_queue_stats("stop waiting");
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    if (_server_thread.joinable()) {
-        if (on_server_thread)
-            _server_thread.detach();
-        else
-            _server_thread.join();
+        }
     }
     diag::log_tagged_fmt("mcp_srv", "stop done");
 }
@@ -1368,11 +1487,10 @@ void server_t::server_thread_func(int port)
     g_cached_external_tool_count.store(0, std::memory_order_release);
     httplib::Server svr;
     svr.new_task_queue = [] {
-        return new httplib::ThreadPool(kMcpHttpWorkerThreads, kMcpHttpMaxQueuedRequests);
+        return new work_queue_task_queue(kMcpHttpMaxQueuedRequests);
     };
     diag::log_tagged_fmt("mcp_srv",
-        "server_thread_func dedicated_http_pool threads=%zu max_queue=%zu",
-        kMcpHttpWorkerThreads,
+        "server_thread_func critical_queue_http_dispatch max_queue=%zu",
         kMcpHttpMaxQueuedRequests);
     svr.set_keep_alive_max_count(8);
     svr.set_keep_alive_timeout(2);
@@ -1567,10 +1685,23 @@ void server_t::server_thread_func(int port)
             g_active_http_requests.load(std::memory_order_acquire),
             g_active_streams.load(std::memory_order_acquire));
         json health;
+        std::string missing_exports;
+        const bool exports_ok = standalone_license::is_arc_loaded()
+            && standalone_license::validate_arc_required_exports(missing_exports);
+        const bool runtime_ok = g_ide_lifecycle_ready.load(std::memory_order_acquire)
+            && standalone_license::is_valid()
+            && standalone_license::is_arc_loaded()
+            && exports_ok;
         health["status"]      = "ok";
         health["server"]      = SERVER_NAME;
         health["version"]     = SERVER_VERSION;
+        health["pid"]         = static_cast<std::uint32_t>(GetCurrentProcessId());
         health["port"]        = _port;
+        health["authenticated"] = runtime_ok;
+        health["validated"] = standalone_license::is_valid();
+        health["arc_loaded"] = standalone_license::is_arc_loaded();
+        health["lifecycle_ready"] = g_ide_lifecycle_ready.load(std::memory_order_acquire);
+        health["exports_verified"] = exports_ok;
         health["tools_count"] = g_cached_external_tool_count.load(std::memory_order_acquire);
         health["cache_ready"] = g_cached_health_ready.load(std::memory_order_acquire);
         health["active_requests"] = g_active_http_requests.load(std::memory_order_acquire);

@@ -17,15 +17,20 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
+#include "../infra/critical_work_queue.hpp"
 #include "standalone_driver.hpp"
 #include "standalone_ai_client.hpp"
 #include "standalone_settings.hpp"
@@ -468,6 +473,31 @@ inline bool read_target_region(uint32_t pid, uint64_t address, size_t size, std:
 	return driver_bridge::read_memory(address, size, out) && !out.empty();
 }
 
+template <typename Fn>
+inline void launch_scan_worker(const char* name, Fn fn)
+{
+	const std::string worker_name = name ? name : "scan";
+	auto task = std::make_shared<std::function<void()>>([worker_name, fn = std::move(fn)]() mutable {
+		try {
+			fn();
+		} catch (const std::exception& ex) {
+			diag::log_tagged_fmt("crypto_scan", "%s worker_exception err='%s'", worker_name.c_str(), ex.what());
+			g_state.progress.store(1.f);
+			g_state.scanning.store(false);
+		} catch (...) {
+			diag::log_tagged_fmt("crypto_scan", "%s worker_exception err='<unknown>'", worker_name.c_str());
+			g_state.progress.store(1.f);
+			g_state.scanning.store(false);
+		}
+	});
+	if (!critical_work_queue::post([task]() { (*task)(); }) &&
+		!work_queue::post([task]() { (*task)(); })) {
+		diag::log_tagged_fmt("crypto_scan", "%s worker_queue_rejected", worker_name.c_str());
+		g_state.progress.store(1.f);
+		g_state.scanning.store(false);
+	}
+}
+
 }
 
 inline std::vector<crypto_signature_t> get_signatures()
@@ -600,6 +630,8 @@ struct process_scan_config_t {
 	uint64_t    max_bytes = 0;
 	size_t      max_hits = 0;
 	uint32_t    timeout_ms = 0;
+	uint64_t    range_base = 0;
+	uint64_t    range_size = 0;
 	std::string module_filter;
 	bool        label_references = true;
 };
@@ -615,12 +647,14 @@ inline void scan_process(const process_scan_config_t& cfg)
 			static_cast<int>(driver_bridge::is_loaded()), driver_bridge::attached_pid());
 		return;
 	}
-	diag::log_tagged_fmt("crypto_scan", "scan_process start pid=%u max_regions=%zu max_bytes=%llu max_hits=%zu timeout_ms=%u module_filter='%s'",
+	diag::log_tagged_fmt("crypto_scan", "scan_process start pid=%u max_regions=%zu max_bytes=%llu max_hits=%zu timeout_ms=%u range=0x%llX+0x%llX module_filter='%s'",
 		driver_bridge::attached_pid(),
 		cfg.max_regions,
 		static_cast<unsigned long long>(cfg.max_bytes),
 		cfg.max_hits,
 		cfg.timeout_ms,
+		static_cast<unsigned long long>(cfg.range_base),
+		static_cast<unsigned long long>(cfg.range_size),
 		cfg.module_filter.c_str());
 
 	g_state.scanning.store(true);
@@ -632,7 +666,7 @@ inline void scan_process(const process_scan_config_t& cfg)
 		g_state.active = true;
 	}
 
-	work_queue::post([cfg]() {
+	auto worker = [cfg]() {
 		auto t_start = std::chrono::steady_clock::now();
 		auto signatures = get_signatures();
 		std::string module_filter = cfg.module_filter;
@@ -657,6 +691,8 @@ inline void scan_process(const process_scan_config_t& cfg)
 		}
 
 		uint32_t pid = driver_bridge::attached_pid();
+		diag::log_tagged_fmt("crypto_scan", "scan_process worker_enter pid=%u builtins_plus_custom=%zu",
+			pid, signatures.size());
 		auto regions = driver_bridge::enumerate_memory_regions(4096);
 		auto modules = driver_bridge::enumerate_modules();
 
@@ -668,6 +704,12 @@ inline void scan_process(const process_scan_config_t& cfg)
 			return {"<unknown>", addr};
 		};
 
+		const bool has_range = cfg.range_base != 0 && cfg.range_size != 0;
+		const uint64_t max_u64 = (std::numeric_limits<uint64_t>::max)();
+		const uint64_t range_end = has_range
+			? (max_u64 - cfg.range_base < cfg.range_size ? max_u64 : cfg.range_base + cfg.range_size)
+			: 0;
+		size_t skipped_range = 0;
 		std::vector<driver_bridge::memory_region_t> scan_regions;
 		for (auto& r : regions) {
 			if (cfg.max_regions != 0 && scan_regions.size() >= cfg.max_regions) break;
@@ -676,16 +718,27 @@ inline void scan_process(const process_scan_config_t& cfg)
 			uint32_t prot = r.protect & 0xFF;
 			if (prot == 0x01 || prot == 0x00) continue;
 			if (r.size > 0x10000000) continue;
+			driver_bridge::memory_region_t selected = r;
+			if (has_range) {
+				const uint64_t region_end = max_u64 - r.base < r.size ? max_u64 : r.base + r.size;
+				const uint64_t clipped_start = (std::max)(r.base, cfg.range_base);
+				const uint64_t clipped_end = (std::min)(region_end, range_end);
+				if (clipped_start >= clipped_end) { ++skipped_range; continue; }
+				selected.base = clipped_start;
+				selected.size = clipped_end - clipped_start;
+			}
 			if (!module_filter.empty()) {
-				auto mod = find_module(r.base);
+				auto mod = find_module(selected.base);
 				std::string mod_name = mod.first;
 				for (char& c : mod_name)
 					c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
 				if (mod_name.find(module_filter) == std::string::npos)
 					continue;
 			}
-			scan_regions.push_back(r);
+			scan_regions.push_back(selected);
 		}
+		diag::log_tagged_fmt("crypto_scan", "scan_process region_select raw_regions=%zu modules=%zu selected=%zu skipped_range=%zu module_filter='%s'",
+			regions.size(), modules.size(), scan_regions.size(), skipped_range, module_filter.c_str());
 
 		uint64_t total_bytes = 0;
 		for (auto& r : scan_regions) {
@@ -782,7 +835,23 @@ inline void scan_process(const process_scan_config_t& cfg)
 			static_cast<int>(g_state.cancel.load()));
 
 		g_state.scanning.store(false);
-	});
+	};
+	const bool run_inline = cfg.range_base != 0 && cfg.range_size != 0 && cfg.range_size <= 16ull * 1024ull * 1024ull;
+	if (run_inline) {
+		try {
+			worker();
+		} catch (const std::exception& ex) {
+			diag::log_tagged_fmt("crypto_scan", "scan_process inline_exception err='%s'", ex.what());
+			g_state.progress.store(1.f);
+			g_state.scanning.store(false);
+		} catch (...) {
+			diag::log_tagged("crypto_scan", "scan_process inline_exception err='<unknown>'");
+			g_state.progress.store(1.f);
+			g_state.scanning.store(false);
+		}
+		return;
+	}
+	detail::launch_scan_worker("scan_process", std::move(worker));
 }
 
 inline void scan_process()
@@ -813,7 +882,7 @@ inline void scan_file(const DisasmFile& file)
 		g_state.active = true;
 	}
 
-	work_queue::post([file]() {
+	detail::launch_scan_worker("scan_file", [file]() {
 		auto t_start = std::chrono::steady_clock::now();
 		auto signatures = get_signatures();
 
@@ -1030,7 +1099,7 @@ inline void scan_entropy()
 		g_state.active = true;
 	}
 
-	work_queue::post([]() {
+	detail::launch_scan_worker("scan_entropy", []() {
 		auto t_start = std::chrono::steady_clock::now();
 		auto regions = driver_bridge::enumerate_memory_regions(4096);
 		auto modules = driver_bridge::enumerate_modules();

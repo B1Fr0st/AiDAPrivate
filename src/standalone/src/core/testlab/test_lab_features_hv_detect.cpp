@@ -24,8 +24,8 @@ namespace {
 
 	void render_inputs_hvdt(test_lab::state_t& s) {
 		(void)s;
-		ImGui::TextDisabled("Run the kernel hypervisor-detection probe.");
-		ImGui::TextDisabled("Combines CPUID/SIDT/LIDT/timing/VMF heuristics into a single result.");
+		ImGui::TextDisabled("Run the kernel hypervisor-detection Test Lab probe.");
+		ImGui::TextDisabled("Exercises the HVDT IOCTL and passive VM fingerprint result path.");
 	}
 
 	void run_hvdt(test_lab::state_t& s, test_lab::result_t& r) {
@@ -40,12 +40,24 @@ namespace {
 			voyager::detail::hv_detect_request req;
 			voyager::detail::hv_detect_result  result;
 		} buf{};
-		buf.req.flags = 0;
+		buf.req.flags = voyager::detail::HV_DETECT_FLAG_TESTLAB_SAFE;
 
 		std::uint32_t bytes_returned = 0;
+		test_lab_format::testlab_diag_log_step("hv-detect", "HVDT", "request_pre",
+			"flags=0x%016llX mode=testlab_safe_fingerprint_only",
+			static_cast<unsigned long long>(buf.req.flags));
 		bool ok = device->send_ioctl_raw(
 			ioctl_codes::HVDT(), &buf,
 			static_cast<std::uint32_t>(sizeof(buf)), bytes_returned);
+		test_lab_format::testlab_diag_log_step("hv-detect", "HVDT", "request_post",
+			"ok=%d bytes_returned=%u total_run=%u total_failed=%u is_vm=%u ms_hv_root=%u vendor=\"%.16s\"",
+			ok ? 1 : 0,
+			bytes_returned,
+			static_cast<unsigned>(buf.result.total_run),
+			static_cast<unsigned>(buf.result.total_failed),
+			static_cast<unsigned>(buf.result.is_virtual_machine),
+			static_cast<unsigned>(buf.result.ms_hv_root),
+			buf.result.vm_vendor_name);
 
 		r.bytes_returned = bytes_returned;
 		r.raw.resize(sizeof(buf));
@@ -61,11 +73,24 @@ namespace {
 			r.ok = false;
 			return;
 		}
+		if (bytes_returned != sizeof(voyager::detail::hv_detect_result)) {
+			char err[160];
+			std::snprintf(err, sizeof(err),
+				"HVDT returned %u bytes, expected %zu", bytes_returned,
+				sizeof(voyager::detail::hv_detect_result));
+			r.error = err;
+			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
+			r.ok = false;
+			return;
+		}
 
 		r.ntstatus = 0;
 		r.ok = true;
 
 		const voyager::detail::hv_detect_result& d = buf.result;
+		r.parsed.push_back({ "mode", "testlab_safe_fingerprint_only" });
+		r.parsed.push_back({ "request_flags", "0x0000000000000001" });
+		r.parsed.push_back({ "kernel_probe_set", "skipped_by_testlab_safe_flag" });
 		r.parsed.push_back({ "is_virtual_machine", d.is_virtual_machine ? "true" : "false" });
 		r.parsed.push_back({ "ms_hv_root", d.ms_hv_root ? "true" : "false" });
 		r.parsed.push_back({ "vm_vendor_name", make_vendor_string(d.vm_vendor_name) });

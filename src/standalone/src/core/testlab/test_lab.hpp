@@ -41,6 +41,7 @@ namespace test_lab {
 	struct result_t {
 		std::atomic<run_state_e>     state{ run_state_e::idle };
 		bool                         ok = false;
+		bool                         skipped = false;
 		std::int32_t                 ntstatus = 0;
 		std::uint32_t                bytes_returned = 0;
 		std::uint64_t                elapsed_us = 0;

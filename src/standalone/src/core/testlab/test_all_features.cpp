@@ -8,6 +8,7 @@
 #include "test_all_burp.h"
 #include "test_all_disasm.h"
 #include "test_all_mcp.h"
+#include "test_all_ui.h"
 
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
@@ -24,7 +25,7 @@
 #include "../disasm/decompiler_engine.hpp"
 #include "../disasm/pseudocode_view.hpp"
 #include "../disasm/zydis_disasm.hpp"
-#include "../infra/work_queue.hpp"
+#include "../infra/critical_work_queue.hpp"
 #include "../../helpers/diag_log.hpp"
 #include "../../helpers/globals.h"
 
@@ -55,6 +56,73 @@
 #include <vector>
 
 namespace test_all_features {
+
+	void flush_full_test_log(void* hf) {
+		HANDLE handle = static_cast<HANDLE>(hf);
+		if (handle != INVALID_HANDLE_VALUE)
+			FlushFileBuffers(handle);
+	}
+
+	void write_full_test_log_line(void* hf, const char* data, std::size_t size, bool force_flush) {
+		HANDLE handle = static_cast<HANDLE>(hf);
+		if (handle == INVALID_HANDLE_VALUE || data == nullptr || size == 0)
+			return;
+
+		static std::mutex s_write_mtx;
+		static std::uint64_t s_last_flush_ms = 0;
+		static std::uint32_t s_bytes_since_flush = 0;
+
+		const bool force_by_text =
+			std::strstr(data, "FAIL --") != nullptr ||
+			std::strstr(data, "SUSPECT --") != nullptr ||
+			std::strstr(data, "INCOMPLETE") != nullptr ||
+			std::strstr(data, "FATAL") != nullptr ||
+			std::strstr(data, "CRASH") != nullptr ||
+			std::strstr(data, "BSOD") != nullptr ||
+			std::strstr(data, "SUMMARY") != nullptr;
+
+		std::lock_guard<std::mutex> lk(s_write_mtx);
+		DWORD wrote = 0;
+		WriteFile(handle, data, static_cast<DWORD>(size), &wrote, nullptr);
+		s_bytes_since_flush += wrote;
+		const std::uint64_t now = static_cast<std::uint64_t>(GetTickCount64());
+		if (force_flush || force_by_text || s_last_flush_ms == 0 || s_bytes_since_flush >= 65536u || now - s_last_flush_ms >= 1000u) {
+			FlushFileBuffers(handle);
+			s_last_flush_ms = now;
+			s_bytes_since_flush = 0;
+		}
+	}
+
+	void mirror_full_test_log_line(const char* tag, const char* detail, const char* line) {
+		const char* safe_tag = tag ? tag : "test";
+		const char* safe_detail = detail ? detail : "";
+		const bool important =
+			std::strstr(safe_detail, "FAIL --") != nullptr ||
+			std::strstr(safe_detail, "SUSPECT --") != nullptr ||
+			std::strstr(safe_detail, "SKIP --") != nullptr ||
+			std::strstr(safe_detail, "INCOMPLETE") != nullptr ||
+			std::strstr(safe_detail, "FATAL") != nullptr ||
+			std::strstr(safe_detail, "CRASH") != nullptr ||
+			std::strstr(safe_detail, "BSOD") != nullptr ||
+			std::strstr(safe_detail, "SUMMARY") != nullptr;
+		const bool milestone =
+			std::strcmp(safe_tag, "start") == 0 ||
+			std::strcmp(safe_tag, "run") == 0 ||
+			std::strcmp(safe_tag, "phase") == 0 ||
+			std::strcmp(safe_tag, "summary") == 0 ||
+			std::strcmp(safe_tag, "checkpoint") == 0 ||
+			std::strcmp(safe_tag, "heartbeat") == 0 ||
+			std::strcmp(safe_tag, "launch") == 0 ||
+			std::strcmp(safe_tag, "attach") == 0 ||
+			std::strcmp(safe_tag, "cancel") == 0 ||
+			std::strcmp(safe_tag, "env") == 0 ||
+			std::strcmp(safe_tag, "net-cleanup") == 0;
+
+		if (important || milestone)
+			diag::log_tagged_fmt("test_all", "%s: %s", safe_tag, safe_detail);
+		if (important && line)
+			OutputDebugStringA(line);
+	}
 
 	namespace {
 
@@ -107,6 +175,8 @@ namespace test_all_features {
 		constexpr int kBurpFeatureTests = 184;
 		constexpr int kDisasmFeatureTests = 110;
 		constexpr int kMcpFeatureTests = 521;
+		constexpr int kUiFeatureTests = 10;
+		constexpr std::uint64_t kPostFullTestSuppressionMs = 30000;
 
 
 		void format_timestamp(char* out, std::size_t cap) {
@@ -134,10 +204,7 @@ namespace test_all_features {
 		}
 
 		void write_log_file(HANDLE hf, const std::string& line) {
-			if (hf == INVALID_HANDLE_VALUE) return;
-			DWORD wrote = 0;
-			WriteFile(hf, line.data(), static_cast<DWORD>(line.size()), &wrote, nullptr);
-			FlushFileBuffers(hf);
+			write_full_test_log_line(hf, line.data(), line.size());
 		}
 
 		void push_log(const std::string& line) {
@@ -165,9 +232,7 @@ namespace test_all_features {
 
 			write_log_file(hf, s);
 
-
-			diag::log_tagged_fmt("test_all", "%s: %s", tag, detail);
-			OutputDebugStringA(s.c_str());
+			mirror_full_test_log_line(tag, detail, s.c_str());
 
 
 			push_log(s);
@@ -321,6 +386,25 @@ namespace test_all_features {
 				snap);
 		}
 
+		void log_work_queue_snapshot(HANDLE hf, const char* tag, const char* prefix) {
+			const auto st = critical_work_queue::stats();
+			log_msg(hf, tag ? tag : "critical_queue",
+				"%s%scritical_alive=%d critical_shutting_down=%d critical_pool_size=%d critical_workers=%zu critical_pending=%zu critical_active=%u critical_post_attempts=%llu critical_posted=%llu critical_rejected=%llu critical_started=%llu critical_finished=%llu",
+				prefix ? prefix : "critical_queue snapshot",
+				(prefix && *prefix) ? " | " : "",
+				st.alive ? 1 : 0,
+				st.shutting_down ? 1 : 0,
+				st.pool_size,
+				st.workers,
+				st.pending,
+				static_cast<unsigned>(st.active),
+				static_cast<unsigned long long>(st.post_attempts),
+				static_cast<unsigned long long>(st.posted),
+				static_cast<unsigned long long>(st.rejected),
+				static_cast<unsigned long long>(st.started),
+				static_cast<unsigned long long>(st.finished));
+		}
+
 		void set_full_test_env(HANDLE hf, bool enabled, const char* reason) {
 			BOOL ok = SetEnvironmentVariableA(kFullTestEnvName, enabled ? "1" : nullptr);
 			DWORD err = ok ? 0UL : GetLastError();
@@ -335,6 +419,31 @@ namespace test_all_features {
 				reason ? reason : "",
 				ok ? 1 : 0,
 				static_cast<unsigned long>(err));
+		}
+
+		void begin_test_guard_impl(const char* source, HANDLE hf = INVALID_HANDLE_VALUE) {
+			anti_tamper::state::get().full_test_running.store(true, std::memory_order_release);
+			log_msg(hf, "env", "full_test_guard_enter source=%s pid=%lu tid=%lu",
+				source ? source : "unspecified",
+				static_cast<unsigned long>(GetCurrentProcessId()),
+				static_cast<unsigned long>(GetCurrentThreadId()));
+			set_full_test_env(hf, true, source ? source : "full_test_guard_enter");
+		}
+
+		void end_test_guard_impl(const char* source, bool arm_post_suppression, HANDLE hf = INVALID_HANDLE_VALUE) {
+			uint64_t remaining = 0;
+			if (arm_post_suppression) {
+				anti_tamper::state::arm_full_test_suppression(kPostFullTestSuppressionMs);
+				anti_tamper::state::full_test_suppression_active(&remaining);
+			}
+			log_msg(hf, "env", "full_test_guard_exit source=%s arm_post=%d remaining_ms=%llu pid=%lu tid=%lu",
+				source ? source : "unspecified",
+				arm_post_suppression ? 1 : 0,
+				static_cast<unsigned long long>(remaining),
+				static_cast<unsigned long>(GetCurrentProcessId()),
+				static_cast<unsigned long>(GetCurrentThreadId()));
+			set_full_test_env(hf, false, source ? source : "full_test_guard_exit");
+			anti_tamper::state::get().full_test_running.store(false, std::memory_order_release);
 		}
 
 		void set_step(const char* label) {
@@ -431,7 +540,18 @@ namespace test_all_features {
 		}
 
 		bool cancelled() {
-			return g_cancel_requested.load(std::memory_order_acquire);
+			if (g_cancel_requested.load(std::memory_order_acquire))
+				return true;
+			auto& rt = anti_tamper::state::get();
+			if (rt.full_test_running.load(std::memory_order_acquire) &&
+				rt.violation_latched.load(std::memory_order_acquire)) {
+				bool expected = false;
+				if (g_cancel_requested.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+					diag::log_tagged("test_all", "full_test_cancelled_due_to_integrity_latch");
+				}
+				return true;
+			}
+			return false;
 		}
 
 		int running_done() {
@@ -556,8 +676,8 @@ namespace test_all_features {
 			set_stepf("skip phase: %s", label);
 			log_phase_begin(hf, label);
 			if (tests > 0)
-				g_skipped.fetch_add(tests);
-			log_msg(hf, "phase", "SKIP -- %s requires a live attached target; target unavailable; skipped=%d",
+				g_failed.fetch_add(tests);
+			log_msg(hf, "phase", "FAIL -- %s requires a live attached target; target unavailable; failed=%d",
 				label,
 				tests);
 			log_phase_end(hf, label);
@@ -671,13 +791,130 @@ namespace test_all_features {
 			return exists;
 		}
 
+		std::string wide_to_log_string(const std::wstring& text) {
+			if (text.empty())
+				return {};
+			int needed = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), -1, nullptr, 0, nullptr, nullptr);
+			if (needed <= 1)
+				return {};
+			std::string out(static_cast<std::size_t>(needed), '\0');
+			int written = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), -1, out.data(), needed, nullptr, nullptr);
+			if (written <= 1)
+				return {};
+			out.resize(static_cast<std::size_t>(written - 1));
+			return out;
+		}
+
+		bool is_absolute_path_for_launch(const std::wstring& path) {
+			if (path.size() >= 3 && path[1] == L':' && (path[2] == L'\\' || path[2] == L'/'))
+				return true;
+			if (path.size() >= 2 && (path[0] == L'\\' || path[0] == L'/') && (path[1] == L'\\' || path[1] == L'/'))
+				return true;
+			return false;
+		}
+
+		std::wstring full_path_for_log(const std::wstring& path) {
+			if (path.empty())
+				return {};
+			if (is_absolute_path_for_launch(path))
+				return path;
+			wchar_t cwd_buf[MAX_PATH] = {};
+			DWORD cwd_len = GetCurrentDirectoryW(MAX_PATH, cwd_buf);
+			if (cwd_len == 0 || cwd_len >= MAX_PATH)
+				return path;
+			std::wstring base(cwd_buf, cwd_len);
+			if (!base.empty() && base.back() != L'\\' && base.back() != L'/')
+				base.push_back(L'\\');
+			return base + path;
+		}
+
+		std::wstring parent_directory_for_path(const std::wstring& path) {
+			auto slash = path.find_last_of(L"\\/");
+			if (slash == std::wstring::npos)
+				return {};
+			return path.substr(0, slash + 1);
+		}
+
+		std::wstring current_directory_for_launch() {
+			wchar_t cwd[MAX_PATH] = {};
+			DWORD cwd_len = GetCurrentDirectoryW(MAX_PATH, cwd);
+			if (cwd_len == 0 || cwd_len >= MAX_PATH)
+				return {};
+			return std::wstring(cwd, cwd_len);
+		}
+
+		std::wstring normalize_launch_path(const std::wstring& path) {
+			std::wstring full = full_path_for_log(path);
+			return full.empty() ? path : full;
+		}
+
+		std::wstring normalize_found_target(const std::wstring& path) {
+			std::wstring full = normalize_launch_path(path);
+			if (GetFileAttributesW(full.c_str()) != INVALID_FILE_ATTRIBUTES)
+				return full;
+			return path;
+		}
+
+		void log_target_launch_context(HANDLE hf, const std::wstring& exe, const std::wstring& work_dir) {
+			const std::wstring exe_full = full_path_for_log(exe);
+			const std::wstring work_dir_full = full_path_for_log(work_dir);
+			const std::wstring command_line = L"\"" + exe_full + L"\"" + kTargetArgsWide;
+			const std::string exe_req = wide_to_log_string(exe);
+			const std::string exe_eff = wide_to_log_string(exe_full);
+			const std::string work_req = work_dir.empty() ? std::string("<inherit>") : wide_to_log_string(work_dir);
+			const std::string work_eff = work_dir_full.empty() ? std::string("<inherit>") : wide_to_log_string(work_dir_full);
+			std::string command = wide_to_log_string(command_line);
+			SetLastError(0);
+			DWORD exe_attrs = exe_full.empty() ? INVALID_FILE_ATTRIBUTES : GetFileAttributesW(exe_full.c_str());
+			DWORD exe_attr_err = (exe_attrs == INVALID_FILE_ATTRIBUTES && !exe_full.empty()) ? GetLastError() : 0;
+			SetLastError(0);
+			DWORD work_attrs = work_dir_full.empty() ? INVALID_FILE_ATTRIBUTES : GetFileAttributesW(work_dir_full.c_str());
+			DWORD work_err = (work_attrs == INVALID_FILE_ATTRIBUTES && !work_dir_full.empty()) ? GetLastError() : 0;
+			std::wstring cwd = current_directory_for_launch();
+			const std::string cwd_log = cwd.empty() ? std::string("<unavailable>") : wide_to_log_string(cwd);
+			log_msg(hf, "launch", "target launch context requested_exe=%s effective_exe=%s requested_work_dir=%s effective_work_dir=%s current_dir=%s command_line=%s host_pid=%lu host_tid=%lu",
+				exe_req.c_str(),
+				exe_eff.c_str(),
+				work_req.c_str(),
+				work_eff.c_str(),
+				cwd_log.c_str(),
+				command.c_str(),
+				static_cast<unsigned long>(GetCurrentProcessId()),
+				static_cast<unsigned long>(GetCurrentThreadId()));
+			log_msg(hf, "launch", "target executable probe attr_ok=%d attr_err=%lu attrs=0x%08lX work_dir_attrs=0x%08lX work_dir_err=%lu work_dir_is_dir=%d",
+				exe_attrs != INVALID_FILE_ATTRIBUTES ? 1 : 0,
+				static_cast<unsigned long>(exe_attr_err),
+				exe_attrs == INVALID_FILE_ATTRIBUTES ? 0UL : static_cast<unsigned long>(exe_attrs),
+				work_attrs == INVALID_FILE_ATTRIBUTES ? 0UL : static_cast<unsigned long>(work_attrs),
+				static_cast<unsigned long>(work_err),
+				(work_attrs != INVALID_FILE_ATTRIBUTES && (work_attrs & FILE_ATTRIBUTE_DIRECTORY)) ? 1 : 0);
+		}
+
+		DWORD log_target_launch_context_seh(HANDLE hf, const std::wstring& exe, const std::wstring& work_dir) {
+			__try {
+				log_target_launch_context(hf, exe, work_dir);
+				return 0;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return GetExceptionCode();
+			}
+		}
+
 
 		std::wstring find_test_target(HANDLE hf) {
 			wchar_t self[MAX_PATH] = {};
-			GetModuleFileNameW(nullptr, self, MAX_PATH);
-			std::wstring module_dir(self);
-			auto pos = module_dir.find_last_of(L"\\/");
-			if (pos != std::wstring::npos) module_dir.resize(pos + 1);
+			DWORD self_len = GetModuleFileNameW(nullptr, self, MAX_PATH);
+			DWORD self_err = self_len == 0 ? GetLastError() : 0;
+			std::wstring self_path = (self_len > 0 && self_len < MAX_PATH) ? std::wstring(self, self_len) : std::wstring();
+			if (!self_path.empty())
+				self_path = normalize_launch_path(self_path);
+			std::wstring module_dir = parent_directory_for_path(self_path);
+			const std::string self_path_log = self_path.empty() ? std::string("<unavailable>") : wide_to_log_string(self_path);
+			const std::string module_dir_log = module_dir.empty() ? std::string("<unavailable>") : wide_to_log_string(module_dir);
+			log_msg(hf, "find_target", "module path len=%lu err=%lu path=%s dir=%s",
+				static_cast<unsigned long>(self_len),
+				static_cast<unsigned long>(self_err),
+				self_path_log.c_str(),
+				module_dir_log.c_str());
 
 			wchar_t cwd[MAX_PATH] = {};
 			DWORD cwd_len = GetCurrentDirectoryW(MAX_PATH, cwd);
@@ -693,30 +930,34 @@ namespace test_all_features {
 			if (env_len > 0 && env_len < MAX_PATH) {
 				std::wstring env_path(env_buf, env_len);
 				if (probe_candidate(hf, env_path, "AIDA_TEST_TARGET"))
-					return env_path;
+					return normalize_found_target(env_path);
 			} else {
 				log_msg(hf, "find_target", "probe[AIDA_TEST_TARGET] env var not set");
 			}
 
-			const std::wstring module_candidate = module_dir + L"AiDA_TestTarget.exe";
-			if (probe_candidate(hf, module_candidate, "module_dir"))
-				return module_candidate;
+			if (!module_dir.empty()) {
+				const std::wstring module_candidate = module_dir + L"AiDA_TestTarget.exe";
+				if (probe_candidate(hf, module_candidate, "module_dir"))
+					return normalize_found_target(module_candidate);
 
-			const std::wstring module_subdir_candidate = module_dir + L"test_target\\AiDA_TestTarget.exe";
-			if (probe_candidate(hf, module_subdir_candidate, "module_dir/test_target"))
-				return module_subdir_candidate;
+				const std::wstring module_subdir_candidate = module_dir + L"test_target\\AiDA_TestTarget.exe";
+				if (probe_candidate(hf, module_subdir_candidate, "module_dir/test_target"))
+					return normalize_found_target(module_subdir_candidate);
+			} else {
+				log_msg(hf, "find_target", "probe[module_dir] skipped because module directory is unavailable");
+			}
 
 			if (!cwd_dir.empty()) {
 				const std::wstring cwd_candidate = cwd_dir + L"AiDA_TestTarget.exe";
 				if (probe_candidate(hf, cwd_candidate, "cwd"))
-					return cwd_candidate;
+					return normalize_found_target(cwd_candidate);
 			} else {
 				log_msg(hf, "find_target", "probe[cwd] working directory unavailable");
 			}
 
 			const std::wstring fallback = L"C:\\Users\\ruar1337\\AiDAPrivate\\build-ninja\\Release\\AiDA_TestTarget.exe";
 			if (probe_candidate(hf, fallback, "fallback"))
-				return fallback;
+				return normalize_found_target(fallback);
 
 			log_msg(hf, "find_target", "FAIL -- AiDA_TestTarget.exe not found in any candidate path");
 			return {};
@@ -845,25 +1086,30 @@ namespace test_all_features {
 				log_phase_end(hf, "launch target");
 				return false;
 			}
+			std::wstring normalized_exe = normalize_found_target(exe);
+			if (!normalized_exe.empty())
+				exe = normalized_exe;
 
-			char narrow[MAX_PATH] = {};
-			WideCharToMultiByte(CP_UTF8, 0, exe.c_str(), -1, narrow, MAX_PATH, nullptr, nullptr);
-			log_msg(hf, "launch", "found: %s", narrow);
+			std::string exe_log = wide_to_log_string(exe);
+			log_msg(hf, "launch", "found: %s", exe_log.empty() ? "<unavailable>" : exe_log.c_str());
 
 			auto t0 = std::chrono::steady_clock::now();
 
 
-			std::wstring work_dir;
-			auto slash = exe.find_last_of(L"\\/");
-			if (slash != std::wstring::npos) {
-				std::size_t len = slash;
-				if (slash == 0 || (slash == 2 && exe.size() > 1 && exe[1] == L':'))
-					len = slash + 1;
-				work_dir = exe.substr(0, len);
+			std::wstring work_dir = parent_directory_for_path(exe);
+			if (work_dir.empty())
+				work_dir = current_directory_for_launch();
+			std::string work_dir_log = wide_to_log_string(work_dir);
+			log_msg(hf, "launch", "resolved working_dir=%s", work_dir.empty() ? "<inherit>" : work_dir_log.c_str());
+			set_step("launch: log_target_launch_context");
+			log_msg(hf, "launch", "BEFORE target launch context probe");
+			DWORD context_seh = log_target_launch_context_seh(hf, exe, work_dir);
+			if (context_seh != 0) {
+				log_msg(hf, "launch", "target launch context probe SEH=0x%08lX; continuing to spawn",
+					static_cast<unsigned long>(context_seh));
+			} else {
+				log_msg(hf, "launch", "AFTER target launch context probe");
 			}
-			char work_dir_narrow[MAX_PATH] = {};
-			WideCharToMultiByte(CP_UTF8, 0, work_dir.c_str(), -1, work_dir_narrow, MAX_PATH, nullptr, nullptr);
-			log_msg(hf, "launch", "resolved working_dir=%s", work_dir.empty() ? "<inherit>" : work_dir_narrow);
 
 			std::uint32_t pid = 0;
 			set_step("launch: spawn_and_attach_target");
@@ -874,6 +1120,9 @@ namespace test_all_features {
 				env_ok ? 0UL : static_cast<unsigned long>(GetLastError()),
 				log_path());
 			log_msg(hf, "launch", "target args: %s", kTargetArgsText);
+			log_msg(hf, "launch", "CALL spawn_and_attach_target exe=%s work_dir=%s",
+				exe_log.empty() ? "<unavailable>" : exe_log.c_str(),
+				work_dir.empty() ? "<inherit>" : work_dir_log.c_str());
 			bool ok = debugger_engine::spawn_and_attach_target(exe, kTargetArgsWide, work_dir, &pid);
 			DWORD spawn_gle = GetLastError();
 			SetEnvironmentVariableA("AIDA_TARGET_LOG_PATH", nullptr);
@@ -936,8 +1185,16 @@ namespace test_all_features {
 						static_cast<unsigned long>(hp_err));
 				}
 			} else {
-				log_msg(hf, "launch", "could not open READY event handle, sleeping 3s");
-				Sleep(3000);
+				log_msg(hf, "launch", "could not open READY event handle, polling child liveness up to 750ms");
+				for (int i = 0; i < 15; ++i) {
+					DWORD exit_code = STILL_ACTIVE;
+					HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+					BOOL alive = hp ? GetExitCodeProcess(hp, &exit_code) : FALSE;
+					if (hp) CloseHandle(hp);
+					if (alive && exit_code == STILL_ACTIVE)
+						break;
+					Sleep(50);
+				}
 			}
 
 			bool attach_ok = verify_driver_attach(hf, pid);
@@ -975,8 +1232,8 @@ namespace test_all_features {
 			if (!target_verified) {
 				mark_target_unavailable(hf, "testlab", "testlab skipped because there is no verified attached target", target_pid, attached_pid, 0);
 				if (total > 0)
-					g_skipped.fetch_add(total);
-				log_msg(hf, "testlab", "SKIP -- %d registered Test Lab features require a verified target; target_pid=%u driver_attached=%d driver_pid=%u",
+					g_failed.fetch_add(total);
+				log_msg(hf, "testlab", "FAIL -- %d registered Test Lab features require a verified target; target_pid=%u driver_attached=%d driver_pid=%u",
 					total,
 					target_pid,
 					g_driver_attached.load(std::memory_order_acquire) ? 1 : 0,
@@ -1017,7 +1274,7 @@ namespace test_all_features {
 				if (name_starts_with(name, "PMOD")) {
 					s.u32_a = 2;
 				} else if (name_starts_with(name, "PRED")) {
-					s.u32_a = 1;
+					s.u32_a = 3;
 				} else if (name_starts_with(name, "NLOG")) {
 					s.u32_a = 1;
 				} else if (name_starts_with(name, "NCAP")) {
@@ -1031,9 +1288,9 @@ namespace test_all_features {
 				} else if (name_starts_with(name, "NFPR")) {
 					s.u32_b = 2;
 				} else if (name_starts_with(name, "DNSS")) {
-					s.u32_a = 1;
+					s.u32_a = 3;
 				} else if (name_starts_with(name, "BWMN")) {
-					s.u32_a = 2;
+					s.u32_a = 3;
 				} else if (name_starts_with(name, "REGISTER_PID") || name_starts_with(name, "UNREGISTER_PID")) {
 					char tmp[MAX_PATH];
 					GetTempPathA(MAX_PATH, tmp);
@@ -1137,13 +1394,14 @@ namespace test_all_features {
 				auto t1 = std::chrono::steady_clock::now();
 				auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
 				if (r.elapsed_us == 0) r.elapsed_us = static_cast<std::uint64_t>(us);
-				log_msg(hf, "testlab", "[%d/%d] END-RUN %s/%s seh=0x%08lX cpp_exception=%d elapsed=%llu us state=%d ok=%d bytes=%u fields=%zu raw=%zu",
+				log_msg(hf, "testlab", "[%d/%d] END-RUN %s/%s seh=0x%08lX cpp_exception=%d elapsed=%llu us state=%d ok=%d skipped=%d bytes=%u fields=%zu raw=%zu",
 					i + 1, total, cat, name,
 					static_cast<unsigned long>(seh_code),
 					cpp_exception ? 1 : 0,
 					static_cast<unsigned long long>(r.elapsed_us),
 					static_cast<int>(r.state.load()),
 					r.ok ? 1 : 0,
+					r.skipped ? 1 : 0,
 					r.bytes_returned,
 					r.parsed.size(),
 					r.raw.size());
@@ -1205,7 +1463,14 @@ namespace test_all_features {
 						i + 1, total, cat, name, r.raw.size(), hex_preview);
 				}
 
-				if (r.ok) {
+				if (r.skipped) {
+					g_failed.fetch_add(1);
+					log_msg(hf, "testlab", "[%d/%d] FAIL %s/%s reported a non-destructive skip ntstatus=%s reason=\"%s\" elapsed=%llu us",
+						i + 1, total, cat, name,
+						test_lab_format::ntstatus_to_string(r.ntstatus),
+						r.error.c_str(),
+						static_cast<unsigned long long>(r.elapsed_us));
+				} else if (r.ok) {
 					g_passed.fetch_add(1);
 					bool target_verified = g_driver_attached.load(std::memory_order_acquire) && target_pid != 0;
 					if (!target_verified) {
@@ -1399,19 +1664,19 @@ namespace test_all_features {
 				}
 
 				bool idle = false;
-				for (int i = 0; i < 100; ++i) {
+				for (int i = 0; i < 50; ++i) {
 					if (cancelled()) break;
 					if (memory_scanner_scan_idle()) {
 						idle = true;
 						break;
 					}
-					Sleep(100);
+					Sleep(20);
 				}
 				if (!idle)
-					idle = wait_memory_scanner_scan_idle(5000);
+					idle = wait_memory_scanner_scan_idle(500);
 				if (!idle) {
 					request_memory_scanner_stop();
-					wait_memory_scanner_scan_idle(3000);
+					wait_memory_scanner_scan_idle(500);
 					auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 						std::chrono::steady_clock::now() - t0).count();
 					auto& st = memory_scanner::g_state;
@@ -1543,10 +1808,10 @@ namespace test_all_features {
 				ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 					std::chrono::steady_clock::now() - t0).count();
 				if (!all_conns.empty()) {
-					log_msg(hf, tag, "SKIP -- target had 0 live endpoints after %u attempts while driver enumerated %zu system-wide; target not network-active at sample time (elapsed %lld ms)",
+					log_msg(hf, tag, "FAIL -- target had 0 live endpoints after %u attempts while driver enumerated %zu system-wide; target not network-active at sample time (elapsed %lld ms)",
 						attempts,
 						all_conns.size(), (long long)ms);
-					g_skipped.fetch_add(1);
+					g_failed.fetch_add(1);
 				} else {
 					log_msg(hf, tag, "FAIL -- driver returned 0 connections target-scoped and system-wide (elapsed %lld ms)", (long long)ms);
 					g_failed.fetch_add(1);
@@ -1628,10 +1893,10 @@ namespace test_all_features {
 			aob_generator::generate_from_address(addr, 8, true);
 
 			bool done = false;
-			for (int i = 0; i < 80; ++i) {
+			for (int i = 0; i < 50; ++i) {
 				if (cancelled()) break;
 				if (!aob_generator::g_state.generating.load()) { done = true; break; }
-				Sleep(50);
+				Sleep(40);
 			}
 
 			std::size_t byte_count = 0;
@@ -1686,7 +1951,7 @@ namespace test_all_features {
 			cfg_view::build_cfg(addr);
 
 			bool finished = false;
-			for (int i = 0; i < 120; ++i) {
+			for (int i = 0; i < 60; ++i) {
 				if (cancelled()) break;
 				if (!cfg_view::g_state.building.load()) { finished = true; break; }
 				Sleep(50);
@@ -1888,16 +2153,21 @@ namespace test_all_features {
 		struct full_test_env_guard_t {
 			HANDLE* hf = nullptr;
 			bool active = false;
+			bool owns_entry = false;
 
 			explicit full_test_env_guard_t(HANDLE* handle) : hf(handle), active(true) {
-				anti_tamper::state::get().full_test_running.store(true, std::memory_order_release);
-				set_full_test_env(hf ? *hf : INVALID_HANDLE_VALUE, true, "run_all begin");
+				owns_entry = !anti_tamper::state::get().full_test_running.load(std::memory_order_acquire);
+				if (owns_entry)
+					begin_test_guard_impl("run_all begin", hf ? *hf : INVALID_HANDLE_VALUE);
+				else
+					log_msg(hf ? *hf : INVALID_HANDLE_VALUE, "env", "full_test_guard_reuse source=run_all begin pid=%lu tid=%lu",
+						static_cast<unsigned long>(GetCurrentProcessId()),
+						static_cast<unsigned long>(GetCurrentThreadId()));
 			}
 
 			void clear(const char* reason) {
 				if (!active) return;
-				set_full_test_env(hf ? *hf : INVALID_HANDLE_VALUE, false, reason ? reason : "run_all end");
-				anti_tamper::state::get().full_test_running.store(false, std::memory_order_release);
+				end_test_guard_impl(reason ? reason : "run_all end", true, hf ? *hf : INVALID_HANDLE_VALUE);
 				active = false;
 			}
 
@@ -1913,7 +2183,7 @@ namespace test_all_features {
 				try {
 					auto stop_token = std::make_shared<std::atomic<bool>>(false);
 					stop = stop_token;
-					const bool posted = work_queue::post([stop_token]() {
+					const bool posted = critical_work_queue::post([stop_token]() {
 						while (!stop_token->load(std::memory_order_acquire)) {
 							for (int i = 0; i < 50; ++i) {
 								if (stop_token->load(std::memory_order_acquire)) return;
@@ -1926,8 +2196,8 @@ namespace test_all_features {
 					});
 					if (!posted) {
 						DWORD err = GetLastError();
-						log_msg(hf, "heartbeat", "disabled live heartbeat worker: work_queue post failed");
-						log_resource_snapshot(hf, "heartbeat", "work_queue post failed", err);
+						log_msg(hf, "heartbeat", "disabled live heartbeat worker: critical_queue post failed");
+						log_resource_snapshot(hf, "heartbeat", "critical_queue post failed", err);
 						stop_token->store(true, std::memory_order_release);
 					}
 				} catch (const std::exception& ex) {
@@ -1998,9 +2268,10 @@ namespace test_all_features {
 				kNetworkFeatureTests +
 				kBurpFeatureTests +
 				kDisasmFeatureTests +
-				kMcpFeatureTests;
+				kMcpFeatureTests +
+				kUiFeatureTests;
 			g_total.store(total_estimate);
-			log_msg(hf, "run", "progress total estimate=%d launch=%d testlab=%d extended=%d debugger=%d scanner=%d analysis=%d network=%d burp=%d disasm=%d mcp=%d",
+			log_msg(hf, "run", "progress total estimate=%d launch=%d testlab=%d extended=%d debugger=%d scanner=%d analysis=%d network=%d burp=%d disasm=%d mcp=%d ui=%d",
 				total_estimate,
 				kLaunchFeatureTests,
 				testlab_count,
@@ -2011,7 +2282,8 @@ namespace test_all_features {
 				kNetworkFeatureTests,
 				kBurpFeatureTests,
 				kDisasmFeatureTests,
-				kMcpFeatureTests);
+				kMcpFeatureTests,
+				kUiFeatureTests);
 
 			bool attach_ok = false;
 			if (!cancelled()) {
@@ -2028,6 +2300,14 @@ namespace test_all_features {
 				static_cast<int>(attach_ok));
 
 			cleanup_network_runtime(hf, "pre-run reset");
+
+			if (!cancelled()) {
+				set_phase("Standalone UI tests");
+				set_step("phase call: standalone UI tests");
+				log_phase_begin(hf, "standalone UI tests");
+				phase_ui_tests(hf, g_passed, g_failed, g_skipped, cancelled);
+				log_phase_end(hf, "standalone UI tests");
+			}
 
 			if (!cancelled()) {
 				if (target_unavailable()) {
@@ -2143,6 +2423,14 @@ namespace test_all_features {
 			phase_stop_target(hf, target_pid);
 
 			set_phase("Complete");
+			constexpr int kExpectedDestructiveSkips = 6;
+			const int raw_skips = g_skipped.load(std::memory_order_acquire);
+			if (raw_skips > kExpectedDestructiveSkips) {
+				const int converted = raw_skips - kExpectedDestructiveSkips;
+				g_skipped.fetch_sub(converted, std::memory_order_acq_rel);
+				g_failed.fetch_add(converted, std::memory_order_acq_rel);
+				log_msg(hf, "summary", "FAIL -- converted %d non-destructive skip(s) into failures; only the six destructive guards may remain skipped", converted);
+			}
 			int p = g_passed.load();
 			int f = g_failed.load();
 			int s = g_skipped.load();
@@ -2193,8 +2481,10 @@ namespace test_all_features {
 
 			full_test_env_guard.clear("run_all normal completion");
 
-			if (hf != INVALID_HANDLE_VALUE)
+			if (hf != INVALID_HANDLE_VALUE) {
+				flush_full_test_log(hf);
 				CloseHandle(hf);
+			}
 			hf = INVALID_HANDLE_VALUE;
 
 			g_running.store(false, std::memory_order_release);
@@ -2211,7 +2501,7 @@ namespace test_all_features {
 				static_cast<unsigned long>(code),
 				message ? message : "",
 				snap);
-			set_full_test_env(hf, false, "worker exception escape");
+			end_test_guard_impl("worker exception escape", true, hf);
 			try {
 				cleanup_memory_scanner_runtime(hf, "worker exception escape", 5000);
 			} catch (...) {
@@ -2221,7 +2511,10 @@ namespace test_all_features {
 			if (pid != 0)
 				phase_stop_target(hf, pid);
 			g_running.store(false, std::memory_order_release);
-			if (hf != INVALID_HANDLE_VALUE) CloseHandle(hf);
+			if (hf != INVALID_HANDLE_VALUE) {
+				flush_full_test_log(hf);
+				CloseHandle(hf);
+			}
 		}
 
 		void run_all_cpp_guarded() {
@@ -2245,6 +2538,41 @@ namespace test_all_features {
 			return 0;
 		}
 
+		bool start_full_test_worker(HANDLE hf) {
+			const std::uint64_t queued_at = now_ms_tick();
+			log_work_queue_snapshot(hf, "start", "BEFORE full-test critical_queue post");
+			const bool posted = critical_work_queue::post([queued_at]() {
+				const std::uint64_t entered_at = now_ms_tick();
+				const std::uint64_t queue_delay = entered_at >= queued_at ? (entered_at - queued_at) : 0;
+				HANDLE entry_hf = open_log_file();
+				log_msg(entry_hf, "start", "full-test critical_queue worker entry tid=%lu queue_delay_ms=%llu",
+					static_cast<unsigned long>(GetCurrentThreadId()),
+					static_cast<unsigned long long>(queue_delay));
+				log_work_queue_snapshot(entry_hf, "start", "full-test critical_queue worker entry");
+				if (entry_hf != INVALID_HANDLE_VALUE) {
+					flush_full_test_log(entry_hf);
+					CloseHandle(entry_hf);
+				}
+				diag::log_tagged_fmt("test_all", "full-test critical_queue worker entry tid=%lu queue_delay_ms=%llu",
+					static_cast<unsigned long>(GetCurrentThreadId()),
+					static_cast<unsigned long long>(queue_delay));
+				(void)run_all_seh_guarded();
+			});
+			if (!posted) {
+				DWORD err = GetLastError();
+				log_msg(hf, "start", "FAIL -- full-test critical_queue post failed err=%lu",
+					static_cast<unsigned long>(err));
+				log_work_queue_snapshot(hf, "start", "full-test critical_queue post failed");
+				log_resource_snapshot(hf, "start", "full-test critical_queue post failed", err);
+				diag::log_tagged_fmt("test_all", "full-test critical_queue post failed err=%lu",
+					static_cast<unsigned long>(err));
+				return false;
+			}
+			log_work_queue_snapshot(hf, "start", "full-test critical_queue post ok");
+			diag::log_tagged("test_all", "full-test critical_queue worker posted");
+			return true;
+		}
+
 		bool start_tests_impl() {
 			bool expected = false;
 			if (!g_running.compare_exchange_strong(expected, true)) {
@@ -2253,7 +2581,10 @@ namespace test_all_features {
 				diag::log_tagged_fmt("test_all", "start_tests rejected: run already active | %s", snap);
 				HANDLE hf = open_log_file();
 				log_msg(hf, "start", "REJECTED -- run already active | %s", snap);
-				if (hf != INVALID_HANDLE_VALUE) CloseHandle(hf);
+				if (hf != INVALID_HANDLE_VALUE) {
+					flush_full_test_log(hf);
+					CloseHandle(hf);
+				}
 				return false;
 			}
 
@@ -2279,28 +2610,42 @@ namespace test_all_features {
 			set_step("start_tests_impl queued");
 
 			diag::log_tagged_fmt("test_all", "user triggered Test All Features");
+			{
+				HANDLE hf = open_log_file();
+				begin_test_guard_impl("start_tests_impl queued", hf);
+				if (hf != INVALID_HANDLE_VALUE) {
+					flush_full_test_log(hf);
+					CloseHandle(hf);
+				}
+			}
 
 			{
 				HANDLE hf = open_log_file();
-				log_resource_snapshot(hf, "start", "BEFORE work_queue post", GetLastError());
-				if (hf != INVALID_HANDLE_VALUE) CloseHandle(hf);
+				log_resource_snapshot(hf, "start", "BEFORE full-test worker start", GetLastError());
+				if (hf != INVALID_HANDLE_VALUE) {
+					flush_full_test_log(hf);
+					CloseHandle(hf);
+				}
 			}
 
 			try {
-				const bool posted = work_queue::post([]() {
-					(void)run_all_seh_guarded();
-				});
-				if (!posted) {
-					DWORD err = GetLastError();
+				HANDLE launch_hf = open_log_file();
+				const bool started = start_full_test_worker(launch_hf);
+				if (launch_hf != INVALID_HANDLE_VALUE) {
+					flush_full_test_log(launch_hf);
+					CloseHandle(launch_hf);
+				}
+				if (!started) {
 					HANDLE hf = open_log_file();
-					log_msg(hf, "start", "FAIL -- work_queue post failed");
-					log_resource_snapshot(hf, "start", "work_queue post failed", err);
 					g_failed.fetch_add(1);
 					g_running.store(false, std::memory_order_release);
+					end_test_guard_impl("critical_queue post failed", true, hf);
 					set_phase("Idle");
-					set_step("work_queue post failed");
-					if (hf != INVALID_HANDLE_VALUE) CloseHandle(hf);
-					diag::log_tagged_fmt("test_all", "full-test work_queue post failed err=%lu", static_cast<unsigned long>(err));
+					set_step("critical_queue post failed");
+					if (hf != INVALID_HANDLE_VALUE) {
+						flush_full_test_log(hf);
+						CloseHandle(hf);
+					}
 					return false;
 				}
 			} catch (const std::exception& ex) {
@@ -2310,9 +2655,13 @@ namespace test_all_features {
 				log_resource_snapshot(hf, "start", "worker start exception", err);
 				g_failed.fetch_add(1);
 				g_running.store(false, std::memory_order_release);
+				end_test_guard_impl("worker start exception", true, hf);
 				set_phase("Idle");
 				set_step("worker start exception");
-				if (hf != INVALID_HANDLE_VALUE) CloseHandle(hf);
+				if (hf != INVALID_HANDLE_VALUE) {
+					flush_full_test_log(hf);
+					CloseHandle(hf);
+				}
 				diag::log_tagged_fmt("test_all", "full-test worker start failed: %s err=%lu", ex.what(), static_cast<unsigned long>(err));
 				return false;
 			} catch (...) {
@@ -2322,17 +2671,21 @@ namespace test_all_features {
 				log_resource_snapshot(hf, "start", "worker start unknown exception", err);
 				g_failed.fetch_add(1);
 				g_running.store(false, std::memory_order_release);
+				end_test_guard_impl("worker start unknown exception", true, hf);
 				set_phase("Idle");
 				set_step("worker start unknown exception");
-				if (hf != INVALID_HANDLE_VALUE) CloseHandle(hf);
+				if (hf != INVALID_HANDLE_VALUE) {
+					flush_full_test_log(hf);
+					CloseHandle(hf);
+				}
 				diag::log_tagged_fmt("test_all", "full-test worker start failed: unknown exception err=%lu", static_cast<unsigned long>(err));
 				return false;
 			}
-			diag::log_tagged("test_all", "full test work_queue worker posted");
+			diag::log_tagged("test_all", "full test critical_queue worker posted");
 			return true;
 		}
 
-		void cancel_tests() {
+		void cancel_tests_impl() {
 			g_cancel_requested.store(true, std::memory_order_release);
 			diag::log_tagged_fmt("test_all", "user cancelled Test All Features");
 		}
@@ -2342,6 +2695,28 @@ namespace test_all_features {
 
 	bool start_tests() {
 		return start_tests_impl();
+	}
+
+	void begin_test_guard(const char* source) {
+		HANDLE hf = open_log_file();
+		begin_test_guard_impl(source ? source : "external begin_test_guard", hf);
+		if (hf != INVALID_HANDLE_VALUE) {
+			flush_full_test_log(hf);
+			CloseHandle(hf);
+		}
+	}
+
+	void end_test_guard(const char* source, bool arm_post_suppression) {
+		HANDLE hf = open_log_file();
+		end_test_guard_impl(source ? source : "external end_test_guard", arm_post_suppression, hf);
+		if (hf != INVALID_HANDLE_VALUE) {
+			flush_full_test_log(hf);
+			CloseHandle(hf);
+		}
+	}
+
+	void cancel_tests() {
+		cancel_tests_impl();
 	}
 
 	bool is_running() {
@@ -2396,7 +2771,7 @@ namespace test_all_features {
 
 			if (!running) ImGui::BeginDisabled();
 			if (ImGui::Button("Cancel", ImVec2(100.f, 30.f))) {
-				cancel_tests();
+				cancel_tests_impl();
 			}
 			if (!running) ImGui::EndDisabled();
 

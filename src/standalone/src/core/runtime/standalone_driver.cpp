@@ -70,6 +70,10 @@ namespace
 
     bool destructive_driver_action_suppressed()
     {
+        if (anti_tamper::state::get().full_test_running.load(std::memory_order_acquire))
+            return true;
+        if (anti_tamper::state::full_test_suppression_active())
+            return true;
         return env_flag_enabled("AIDA_FULL_TEST_RUNNING") ||
                env_flag_enabled("AIDA_DISABLE_DESTRUCTIVE_ENFORCEMENT");
     }
@@ -134,6 +138,318 @@ namespace
         anti_tamper::webhook::write_log_critical("driver", buf);
     }
 
+    void copy_native_context(CONTEXT& dst, const driver_bridge::thread_context_t& src, uint64_t register_mask)
+    {
+        bool all = register_mask == ~0ULL;
+        if (all) {
+            dst.Rax = src.rax; dst.Rbx = src.rbx; dst.Rcx = src.rcx; dst.Rdx = src.rdx;
+            dst.Rsi = src.rsi; dst.Rdi = src.rdi; dst.Rbp = src.rbp; dst.Rsp = src.rsp;
+            dst.R8 = src.r8; dst.R9 = src.r9; dst.R10 = src.r10; dst.R11 = src.r11;
+            dst.R12 = src.r12; dst.R13 = src.r13; dst.R14 = src.r14; dst.R15 = src.r15;
+            dst.Rip = src.rip; dst.EFlags = static_cast<DWORD>(src.rflags);
+            dst.SegCs = static_cast<WORD>(src.cs); dst.SegSs = static_cast<WORD>(src.ss);
+            dst.Dr0 = src.dr0; dst.Dr1 = src.dr1; dst.Dr2 = src.dr2; dst.Dr3 = src.dr3;
+            dst.Dr6 = src.dr6; dst.Dr7 = src.dr7;
+            return;
+        }
+        if (register_mask & (1ULL << 18)) dst.Dr0 = src.dr0;
+        if (register_mask & (1ULL << 19)) dst.Dr1 = src.dr1;
+        if (register_mask & (1ULL << 20)) dst.Dr2 = src.dr2;
+        if (register_mask & (1ULL << 21)) dst.Dr3 = src.dr3;
+        if (register_mask & (1ULL << 22)) dst.Dr6 = src.dr6;
+        if (register_mask & (1ULL << 23)) dst.Dr7 = src.dr7;
+    }
+
+    void copy_bridge_context(driver_bridge::thread_context_t& dst, const CONTEXT& src)
+    {
+        dst.rax = src.Rax; dst.rbx = src.Rbx; dst.rcx = src.Rcx; dst.rdx = src.Rdx;
+        dst.rsi = src.Rsi; dst.rdi = src.Rdi; dst.rbp = src.Rbp; dst.rsp = src.Rsp;
+        dst.r8 = src.R8; dst.r9 = src.R9; dst.r10 = src.R10; dst.r11 = src.R11;
+        dst.r12 = src.R12; dst.r13 = src.R13; dst.r14 = src.R14; dst.r15 = src.R15;
+        dst.rip = src.Rip; dst.rflags = src.EFlags;
+        dst.cs = src.SegCs; dst.ss = src.SegSs;
+        dst.dr0 = src.Dr0; dst.dr1 = src.Dr1; dst.dr2 = src.Dr2; dst.dr3 = src.Dr3;
+        dst.dr6 = src.Dr6; dst.dr7 = src.Dr7;
+    }
+
+    bool usermode_suspend_thread(uint32_t tid, uint32_t* prev_count, const char* source)
+    {
+        unique_handle thread(make_handle(OpenThread(THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(tid))));
+        if (!thread) {
+            DWORD gle = GetLastError();
+            diag::log_tagged_fmt("driver",
+                "%s user_suspend_open_failed tid=%u gle=%lu",
+                source ? source : "thread",
+                tid,
+                gle);
+            SetLastError(gle);
+            return false;
+        }
+        DWORD prev = SuspendThread(thread.get());
+        if (prev == static_cast<DWORD>(-1)) {
+            DWORD gle = GetLastError();
+            diag::log_tagged_fmt("driver",
+                "%s user_suspend_failed tid=%u gle=%lu",
+                source ? source : "thread",
+                tid,
+                gle);
+            SetLastError(gle);
+            return false;
+        }
+        if (prev_count)
+            *prev_count = prev;
+        diag::log_tagged_fmt("driver",
+            "%s user_suspend_ok tid=%u prev=%lu",
+            source ? source : "thread",
+            tid,
+            prev);
+        return true;
+    }
+
+    bool usermode_resume_thread(uint32_t tid, uint32_t* prev_count, const char* source)
+    {
+        unique_handle thread(make_handle(OpenThread(THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(tid))));
+        if (!thread) {
+            DWORD gle = GetLastError();
+            diag::log_tagged_fmt("driver",
+                "%s user_resume_open_failed tid=%u gle=%lu",
+                source ? source : "thread",
+                tid,
+                gle);
+            SetLastError(gle);
+            return false;
+        }
+        DWORD prev = ResumeThread(thread.get());
+        if (prev == static_cast<DWORD>(-1)) {
+            DWORD gle = GetLastError();
+            diag::log_tagged_fmt("driver",
+                "%s user_resume_failed tid=%u gle=%lu",
+                source ? source : "thread",
+                tid,
+                gle);
+            SetLastError(gle);
+            return false;
+        }
+        if (prev_count)
+            *prev_count = prev;
+        diag::log_tagged_fmt("driver",
+            "%s user_resume_ok tid=%u prev=%lu",
+            source ? source : "thread",
+            tid,
+            prev);
+        return true;
+    }
+
+    bool usermode_get_thread_context(uint32_t tid, driver_bridge::thread_context_t& ctx, const char* source)
+    {
+        unique_handle thread(make_handle(OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(tid))));
+        if (!thread) {
+            DWORD gle = GetLastError();
+            diag::log_tagged_fmt("driver",
+                "%s user_getctx_open_failed tid=%u gle=%lu",
+                source ? source : "thread",
+                tid,
+                gle);
+            SetLastError(gle);
+            return false;
+        }
+        DWORD prev = SuspendThread(thread.get());
+        if (prev == static_cast<DWORD>(-1)) {
+            DWORD gle = GetLastError();
+            diag::log_tagged_fmt("driver",
+                "%s user_getctx_suspend_failed tid=%u gle=%lu",
+                source ? source : "thread",
+                tid,
+                gle);
+            SetLastError(gle);
+            return false;
+        }
+        CONTEXT native{};
+        native.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS | CONTEXT_DEBUG_REGISTERS;
+        BOOL ok = GetThreadContext(thread.get(), &native);
+        DWORD gle = ok ? ERROR_SUCCESS : GetLastError();
+        DWORD resume_prev = ResumeThread(thread.get());
+        if (!ok) {
+            diag::log_tagged_fmt("driver",
+                "%s user_getctx_failed tid=%u gle=%lu suspend_prev=%lu resume_prev=%lu",
+                source ? source : "thread",
+                tid,
+                gle,
+                prev,
+                resume_prev);
+            SetLastError(gle);
+            return false;
+        }
+        copy_bridge_context(ctx, native);
+        bool sane = ctx.rip != 0 && ctx.rsp != 0;
+        diag::log_tagged_fmt("driver",
+            "%s user_getctx_ok tid=%u rip=0x%llX rsp=0x%llX dr7=0x%llX suspend_prev=%lu resume_prev=%lu sane=%d",
+            source ? source : "thread",
+            tid,
+            static_cast<unsigned long long>(ctx.rip),
+            static_cast<unsigned long long>(ctx.rsp),
+            static_cast<unsigned long long>(ctx.dr7),
+            prev,
+            resume_prev,
+            sane ? 1 : 0);
+        return sane;
+    }
+
+    bool usermode_set_thread_context(uint32_t tid, const driver_bridge::thread_context_t& ctx, uint64_t register_mask, const char* source)
+    {
+        unique_handle thread(make_handle(OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(tid))));
+        if (!thread) {
+            DWORD gle = GetLastError();
+            diag::log_tagged_fmt("driver",
+                "%s user_setctx_open_failed tid=%u mask=0x%llX gle=%lu",
+                source ? source : "thread",
+                tid,
+                static_cast<unsigned long long>(register_mask),
+                gle);
+            SetLastError(gle);
+            return false;
+        }
+        DWORD prev = SuspendThread(thread.get());
+        if (prev == static_cast<DWORD>(-1)) {
+            DWORD gle = GetLastError();
+            diag::log_tagged_fmt("driver",
+                "%s user_setctx_suspend_failed tid=%u mask=0x%llX gle=%lu",
+                source ? source : "thread",
+                tid,
+                static_cast<unsigned long long>(register_mask),
+                gle);
+            SetLastError(gle);
+            return false;
+        }
+        CONTEXT native{};
+        native.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS | CONTEXT_DEBUG_REGISTERS;
+        BOOL got = GetThreadContext(thread.get(), &native);
+        DWORD get_gle = got ? ERROR_SUCCESS : GetLastError();
+        BOOL set_ok = FALSE;
+        DWORD set_gle = ERROR_SUCCESS;
+        if (got) {
+            copy_native_context(native, ctx, register_mask);
+            native.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS | CONTEXT_DEBUG_REGISTERS;
+            set_ok = SetThreadContext(thread.get(), &native);
+            set_gle = set_ok ? ERROR_SUCCESS : GetLastError();
+        }
+        DWORD resume_prev = ResumeThread(thread.get());
+        if (!got || !set_ok) {
+            DWORD gle = got ? set_gle : get_gle;
+            diag::log_tagged_fmt("driver",
+                "%s user_setctx_failed tid=%u mask=0x%llX get_ok=%d set_ok=%d gle=%lu suspend_prev=%lu resume_prev=%lu",
+                source ? source : "thread",
+                tid,
+                static_cast<unsigned long long>(register_mask),
+                got ? 1 : 0,
+                set_ok ? 1 : 0,
+                gle,
+                prev,
+                resume_prev);
+            SetLastError(gle);
+            return false;
+        }
+        diag::log_tagged_fmt("driver",
+            "%s user_setctx_ok tid=%u mask=0x%llX rip=0x%llX rsp=0x%llX dr7=0x%llX suspend_prev=%lu resume_prev=%lu",
+            source ? source : "thread",
+            tid,
+            static_cast<unsigned long long>(register_mask),
+            static_cast<unsigned long long>(ctx.rip),
+            static_cast<unsigned long long>(ctx.rsp),
+            static_cast<unsigned long long>(ctx.dr7),
+            prev,
+            resume_prev);
+        return true;
+    }
+
+    bool usermode_set_hardware_breakpoint(uint32_t tid, int index, uint64_t address, int type, int size)
+    {
+        if (tid == 0 || index < 0 || index > 3)
+            return false;
+        driver_bridge::thread_context_t ctx{};
+        if (!usermode_get_thread_context(tid, ctx, "set_hw_breakpoint"))
+            return false;
+        switch (index) {
+            case 0: ctx.dr0 = address; break;
+            case 1: ctx.dr1 = address; break;
+            case 2: ctx.dr2 = address; break;
+            case 3: ctx.dr3 = address; break;
+        }
+        ctx.dr6 = 0;
+        uint64_t dr7 = ctx.dr7;
+        constexpr uint64_t kDr7UserMask = 0xFFFF0355ULL;
+        constexpr uint64_t kDr7GlobalEnableMask = 0xAAULL;
+        dr7 &= kDr7UserMask;
+        dr7 &= ~kDr7GlobalEnableMask;
+        int rw_shift = 16 + index * 4;
+        int len_shift = 18 + index * 4;
+        dr7 &= ~(3ULL << (index * 2));
+        dr7 &= ~(3ULL << rw_shift);
+        dr7 &= ~(3ULL << len_shift);
+        dr7 |= (1ULL << (index * 2));
+        dr7 |= ((static_cast<uint64_t>(type) & 3ULL) << rw_shift);
+        dr7 |= ((static_cast<uint64_t>(size) & 3ULL) << len_shift);
+        ctx.dr7 = dr7;
+        uint64_t mask = (1ULL << 22) | (1ULL << 23) | (1ULL << (18 + index));
+        return usermode_set_thread_context(tid, ctx, mask, "set_hw_breakpoint");
+    }
+
+    bool usermode_clear_hardware_breakpoint(uint32_t tid, int index)
+    {
+        if (tid == 0 || index < 0 || index > 3)
+            return false;
+        driver_bridge::thread_context_t ctx{};
+        if (!usermode_get_thread_context(tid, ctx, "clear_hw_breakpoint"))
+            return false;
+        switch (index) {
+            case 0: ctx.dr0 = 0; break;
+            case 1: ctx.dr1 = 0; break;
+            case 2: ctx.dr2 = 0; break;
+            case 3: ctx.dr3 = 0; break;
+        }
+        uint64_t dr7 = ctx.dr7;
+        constexpr uint64_t kDr7UserMask = 0xFFFF0355ULL;
+        constexpr uint64_t kDr7GlobalEnableMask = 0xAAULL;
+        dr7 &= kDr7UserMask;
+        dr7 &= ~kDr7GlobalEnableMask;
+        dr7 &= ~(3ULL << (index * 2));
+        dr7 &= ~(3ULL << (16 + index * 4));
+        dr7 &= ~(3ULL << (18 + index * 4));
+        ctx.dr6 = 0;
+        ctx.dr7 = dr7;
+        uint64_t mask = (1ULL << (18 + index)) | (1ULL << 22) | (1ULL << 23);
+        return usermode_set_thread_context(tid, ctx, mask, "clear_hw_breakpoint");
+    }
+
+    std::vector<driver_bridge::thread_info_t> enumerate_threads_usermode_snapshot(uint32_t pid)
+    {
+        std::vector<driver_bridge::thread_info_t> result;
+        if (pid == 0)
+            return result;
+        auto snapshot = make_handle(CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0));
+        if (!snapshot)
+            return result;
+        THREADENTRY32 te = {};
+        te.dwSize = sizeof(te);
+        if (Thread32First(snapshot.get(), &te)) {
+            do {
+                if (te.th32OwnerProcessID == pid) {
+                    driver_bridge::thread_info_t t;
+                    t.tid = te.th32ThreadID;
+                    t.owner_pid = pid;
+                    t.priority = te.tpBasePri;
+                    t.state = 0;
+                    t.rip = 0;
+                    result.push_back(t);
+                }
+            } while (Thread32Next(snapshot.get(), &te));
+        }
+        std::sort(result.begin(), result.end(), [](const driver_bridge::thread_info_t& a, const driver_bridge::thread_info_t& b) {
+            return a.tid < b.tid;
+        });
+        return result;
+    }
+
     uint64_t driver_fnv1a64(const void* data, size_t len)
     {
         if (!data)
@@ -165,6 +481,7 @@ namespace
 
     std::atomic<bool> g_driver_watchdog_started{false};
     std::atomic<bool> g_driver_watchdog_stop{false};
+    std::atomic<uint64_t> g_driver_watchdog_epoch{0};
     std::atomic<int>  g_driver_consecutive_fail{0};
     std::atomic<uint64_t> g_driver_watchdog_last_ok_tick{0};
 
@@ -329,13 +646,15 @@ namespace
         return false;
     }
 
-    void driver_watchdog_thread()
+    void driver_watchdog_thread(uint64_t epoch)
     {
         diag::log_tagged_critical("driver", "watchdog_thread_entry");
         uint64_t hb_iter = 0;
-        while (!g_driver_watchdog_stop.load(std::memory_order_acquire)) {
+        while (!g_driver_watchdog_stop.load(std::memory_order_acquire) &&
+               g_driver_watchdog_epoch.load(std::memory_order_acquire) == epoch) {
             Sleep(kDriverWatchdogPeriodMs);
-            if (g_driver_watchdog_stop.load(std::memory_order_acquire)) {
+            if (g_driver_watchdog_stop.load(std::memory_order_acquire) ||
+                g_driver_watchdog_epoch.load(std::memory_order_acquire) != epoch) {
                 break;
             }
             ++hb_iter;
@@ -381,7 +700,7 @@ namespace
                 const uint64_t last_ok = g_driver_watchdog_last_ok_tick.load(std::memory_order_acquire);
                 if (connected && last_ok != 0) {
                     diag::log_tagged_critical_fmt("driver",
-                        "watchdog_degraded_no_fastfail consecutive=%d last_ok_age_ms=%llu hb_err=%lu hb_ioctl=0x%08X hb_base=0x%04X key_hash=0x%08X inst_seed=%u/%u global_seed=%u/%u",
+                        "watchdog_stale_session_invalidate consecutive=%d last_ok_age_ms=%llu hb_err=%lu hb_ioctl=0x%08X hb_base=0x%04X key_hash=0x%08X inst_seed=%u/%u global_seed=%u/%u",
                         n,
                         static_cast<unsigned long long>(GetTickCount64() - last_ok),
                         device ? (unsigned long)device->get_last_heartbeat_error() : 0ul,
@@ -393,11 +712,14 @@ namespace
                         device ? (unsigned int)device->get_last_heartbeat_global_server_seed_present() : 0u,
                         device ? (unsigned int)device->get_last_heartbeat_global_ioctl_seed_present() : 0u);
                     g_driver_consecutive_fail.store(kDriverWatchdogFailThreshold, std::memory_order_release);
-                    continue;
+                    driver_bridge::invalidate_kernel_session("watchdog_heartbeat_fail");
+                    break;
                 }
                 driver_fast_fail("watchdog", 0xBEA70000u | (device ? device->get_last_heartbeat_error() & 0xFFFFu : 0u));
             }
         }
+        if (g_driver_watchdog_epoch.load(std::memory_order_acquire) == epoch)
+            g_driver_watchdog_started.store(false, std::memory_order_release);
         diag::log_tagged_critical("driver", "watchdog_thread_exit");
     }
 
@@ -408,18 +730,20 @@ namespace
             GetCurrentProcessId(),
             GetCurrentThreadId(),
             static_cast<unsigned long long>(started));
+        g_driver_watchdog_stop.store(false, std::memory_order_release);
+        const uint64_t epoch = g_driver_watchdog_epoch.load(std::memory_order_acquire);
         bool expected = false;
         if (!g_driver_watchdog_started.compare_exchange_strong(expected, true)) {
             driver_critical_fmt("driver_watchdog_post_skip reason=already_started elapsed_ms=%llu",
                 static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
             return;
         }
-        bool posted = work_queue::post([]() {
+        bool posted = work_queue::post([epoch]() {
             driver_critical_fmt("driver_watchdog_thread_entry pid=%lu tid=%lu tick=%llu",
                 GetCurrentProcessId(),
                 GetCurrentThreadId(),
                 static_cast<unsigned long long>(GetTickCount64()));
-            driver_watchdog_thread();
+            driver_watchdog_thread(epoch);
             driver_critical_fmt("driver_watchdog_thread_exit pid=%lu tid=%lu tick=%llu",
                 GetCurrentProcessId(),
                 GetCurrentThreadId(),
@@ -436,6 +760,7 @@ namespace
 
     std::atomic<bool> g_event_poller_started{false};
     std::atomic<bool> g_event_poller_stop{false};
+    std::atomic<uint64_t> g_event_poller_epoch{0};
     constexpr int kEventPollerPeriodMs = 250;
     constexpr size_t kEventPollerDrainBatch = 64;
 
@@ -497,12 +822,14 @@ namespace
         }
     }
 
-    void event_poller_thread()
+    void event_poller_thread(uint64_t epoch)
     {
         diag::log_tagged("driver", "event_poller_thread_entry");
-        while (!g_event_poller_stop.load(std::memory_order_acquire)) {
+        while (!g_event_poller_stop.load(std::memory_order_acquire) &&
+               g_event_poller_epoch.load(std::memory_order_acquire) == epoch) {
             Sleep(kEventPollerPeriodMs);
-            if (g_event_poller_stop.load(std::memory_order_acquire))
+            if (g_event_poller_stop.load(std::memory_order_acquire) ||
+                g_event_poller_epoch.load(std::memory_order_acquire) != epoch)
                 break;
 
             bool kernel_active = false;
@@ -536,6 +863,8 @@ namespace
                 publish_drained_event(evt);
             }
         }
+        if (g_event_poller_epoch.load(std::memory_order_acquire) == epoch)
+            g_event_poller_started.store(false, std::memory_order_release);
         diag::log_tagged("driver", "event_poller_thread_exit");
     }
 
@@ -546,18 +875,20 @@ namespace
             GetCurrentProcessId(),
             GetCurrentThreadId(),
             static_cast<unsigned long long>(started));
+        g_event_poller_stop.store(false, std::memory_order_release);
+        const uint64_t epoch = g_event_poller_epoch.load(std::memory_order_acquire);
         bool expected = false;
         if (!g_event_poller_started.compare_exchange_strong(expected, true)) {
             driver_critical_fmt("event_poller_post_skip reason=already_started elapsed_ms=%llu",
                 static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
             return;
         }
-        bool posted = work_queue::post([]() {
+        bool posted = work_queue::post([epoch]() {
             driver_critical_fmt("event_poller_thread_entry pid=%lu tid=%lu tick=%llu",
                 GetCurrentProcessId(),
                 GetCurrentThreadId(),
                 static_cast<unsigned long long>(GetTickCount64()));
-            event_poller_thread();
+            event_poller_thread(epoch);
             driver_critical_fmt("event_poller_thread_exit pid=%lu tid=%lu tick=%llu",
                 GetCurrentProcessId(),
                 GetCurrentThreadId(),
@@ -673,6 +1004,8 @@ namespace driver_bridge
             g_initialized ? 1 : 0,
             g_kernel_mode ? 1 : 0,
             (device && device->is_connected()) ? 1 : 0);
+        anti_tamper::state::get().driver_hardening_done.store(false, std::memory_order_release);
+        anti_tamper::state::get().activation_hardening_done.store(false, std::memory_order_release);
         g_kernel_mode = false;
         g_initialized = false;
         g_has_vm_read = false;
@@ -681,7 +1014,12 @@ namespace driver_bridge
         g_process_name.clear();
         g_driver_watchdog_stop.store(true, std::memory_order_release);
         g_event_poller_stop.store(true, std::memory_order_release);
+        g_driver_watchdog_epoch.fetch_add(1, std::memory_order_acq_rel);
+        g_event_poller_epoch.fetch_add(1, std::memory_order_acq_rel);
+        g_driver_watchdog_started.store(false, std::memory_order_release);
+        g_event_poller_started.store(false, std::memory_order_release);
         g_driver_consecutive_fail.store(0, std::memory_order_release);
+        g_driver_watchdog_last_ok_tick.store(0, std::memory_order_release);
         close_process_handle_locked();
         if (device)
             device->disconnect();
@@ -709,8 +1047,11 @@ namespace driver_bridge
         }
 
         g_kernel_mode = false;
+        anti_tamper::state::get().driver_hardening_done.store(false, std::memory_order_release);
+        anti_tamper::state::get().activation_hardening_done.store(false, std::memory_order_release);
         g_adbg_clear_process_dr_supported.store(true, std::memory_order_release);
         g_adbg_hide_all_threads_supported.store(true, std::memory_order_release);
+        g_driver_watchdog_last_ok_tick.store(0, std::memory_order_release);
         set_last_error_locked({});
 
         driver_critical_fmt("initialize_connect_existing_pre device=%d elapsed_ms=%llu",
@@ -816,9 +1157,15 @@ namespace driver_bridge
 
         if (device && device->connect()) {
             driver_loader::mark_already_loaded();
+            anti_tamper::state::get().driver_hardening_done.store(false, std::memory_order_release);
+            anti_tamper::state::get().activation_hardening_done.store(false, std::memory_order_release);
             g_kernel_mode = true;
+            g_initialized = true;
             g_adbg_clear_process_dr_supported.store(true, std::memory_order_release);
             g_adbg_hide_all_threads_supported.store(true, std::memory_order_release);
+            g_driver_watchdog_last_ok_tick.store(0, std::memory_order_release);
+            start_driver_watchdog_locked();
+            start_event_poller_locked();
             return true;
         }
 
@@ -859,10 +1206,13 @@ namespace driver_bridge
             return false;
         }
 
+        anti_tamper::state::get().driver_hardening_done.store(false, std::memory_order_release);
+        anti_tamper::state::get().activation_hardening_done.store(false, std::memory_order_release);
         g_kernel_mode = true;
         g_initialized = true;
         g_adbg_clear_process_dr_supported.store(true, std::memory_order_release);
         g_adbg_hide_all_threads_supported.store(true, std::memory_order_release);
+        g_driver_watchdog_last_ok_tick.store(0, std::memory_order_release);
         set_last_error_locked({});
         logf("AiDA Standalone: Kernel driver backend is active.\n");
         start_driver_watchdog_locked();
@@ -1685,28 +2035,8 @@ namespace driver_bridge
         }
 
         if (!kernel_mode) {
-            auto snapshot = make_handle(CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0));
-            if (snapshot) {
-                THREADENTRY32 te = {};
-                te.dwSize = sizeof(te);
-                if (Thread32First(snapshot.get(), &te)) {
-                    do {
-                        if (te.th32OwnerProcessID == pid) {
-                            thread_info_t t;
-                            t.tid = te.th32ThreadID;
-                            t.owner_pid = pid;
-                            t.priority = te.tpBasePri;
-                            t.state = 0;
-                            t.rip = 0;
-                            result.push_back(t);
-                        }
-                    } while (Thread32Next(snapshot.get(), &te));
-                }
-            }
-            std::sort(result.begin(), result.end(), [](const thread_info_t& a, const thread_info_t& b) {
-                return a.tid < b.tid;
-            });
-        logf("AiDA Standalone: enumerate_threads: resolved %zu threads via user-mode snapshot for PID %u.\n",
+            result = enumerate_threads_usermode_snapshot(pid);
+            logf("AiDA Standalone: enumerate_threads: resolved %zu threads via user-mode snapshot for PID %u.\n",
                  result.size(), pid);
             if (result.empty()) {
                 uint32_t exit_code = 0;
@@ -1756,6 +2086,13 @@ namespace driver_bridge
 
         logf("AiDA Standalone: enumerate_threads: resolved %zu threads via kernel IOCTL for PID %u.\n",
              result.size(), pid);
+        if (result.empty()) {
+            result = enumerate_threads_usermode_snapshot(pid);
+            diag::log_tagged_fmt("driver",
+                "enumerate_threads_kernel_empty_usermode_fallback pid=%u count=%zu",
+                pid,
+                result.size());
+        }
         if (result.empty()) {
             uint32_t exit_code = 0;
             if (!attached_process_alive(&exit_code)) {
@@ -2458,12 +2795,22 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            return false;
+            return usermode_get_thread_context(tid, ctx, "get_thread_context.no_kernel");
         }
 
         voyager::device_t::thread_context kctx{};
-        if (!device->get_thread_context(tid, kctx))
+        if (!device->get_thread_context(tid, kctx)) {
+            DWORD gle = GetLastError();
+            diag::log_tagged_fmt("driver",
+                "get_thread_context_kernel_failed tid=%u gle=%lu attached_pid=%u fallback=user",
+                tid,
+                gle,
+                attached_pid());
+            if (usermode_get_thread_context(tid, ctx, "get_thread_context.kernel_failed"))
+                return true;
+            SetLastError(gle);
             return false;
+        }
 
         ctx.rax = kctx.rax;  ctx.rbx = kctx.rbx;  ctx.rcx = kctx.rcx;  ctx.rdx = kctx.rdx;
         ctx.rsi = kctx.rsi;  ctx.rdi = kctx.rdi;  ctx.rbp = kctx.rbp;  ctx.rsp = kctx.rsp;
@@ -2475,12 +2822,20 @@ namespace driver_bridge
         ctx.dr6 = kctx.dr6;  ctx.dr7 = kctx.dr7;
         if (ctx.rip == 0 || ctx.rsp == 0) {
             diag::log_tagged_fmt("driver",
-                "get_thread_context_REJECTED_ZERO tid=%u rip=0x%llX rsp=0x%llX",
+                "get_thread_context_REJECTED_ZERO tid=%u rip=0x%llX rsp=0x%llX fallback=user",
                 tid,
                 static_cast<unsigned long long>(ctx.rip),
                 static_cast<unsigned long long>(ctx.rsp));
+            if (usermode_get_thread_context(tid, ctx, "get_thread_context.zero_kernel"))
+                return true;
             return false;
         }
+        diag::log_tagged_fmt("driver",
+            "get_thread_context_kernel_ok tid=%u rip=0x%llX rsp=0x%llX dr7=0x%llX",
+            tid,
+            static_cast<unsigned long long>(ctx.rip),
+            static_cast<unsigned long long>(ctx.rsp),
+            static_cast<unsigned long long>(ctx.dr7));
         return true;
     }
 
@@ -2492,7 +2847,7 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            return false;
+            return usermode_set_thread_context(tid, ctx, register_mask, "set_thread_context.no_kernel");
         }
 
         voyager::device_t::thread_context kctx{};
@@ -2506,14 +2861,27 @@ namespace driver_bridge
         kctx.dr6 = ctx.dr6;  kctx.dr7 = ctx.dr7;
         bool ok = device->set_thread_context(tid, kctx, register_mask);
         if (!ok) {
+            DWORD gle = GetLastError();
             diag::log_tagged_fmt("driver",
-                "set_thread_context_FAILED tid=%u mask=0x%llX rip=0x%llX rsp=0x%llX attached_pid=%u kernel_mode=%d",
+                "set_thread_context_KERNEL_FAILED tid=%u mask=0x%llX rip=0x%llX rsp=0x%llX attached_pid=%u kernel_mode=%d gle=%lu fallback=user",
                 tid,
                 static_cast<unsigned long long>(register_mask),
                 static_cast<unsigned long long>(ctx.rip),
                 static_cast<unsigned long long>(ctx.rsp),
                 attached_pid(),
-                kernel_mode ? 1 : 0);
+                kernel_mode ? 1 : 0,
+                gle);
+            if (usermode_set_thread_context(tid, ctx, register_mask, "set_thread_context.kernel_failed"))
+                return true;
+            SetLastError(gle);
+        } else {
+            diag::log_tagged_fmt("driver",
+                "set_thread_context_kernel_ok tid=%u mask=0x%llX rip=0x%llX rsp=0x%llX dr7=0x%llX",
+                tid,
+                static_cast<unsigned long long>(register_mask),
+                static_cast<unsigned long long>(ctx.rip),
+                static_cast<unsigned long long>(ctx.rsp),
+                static_cast<unsigned long long>(ctx.dr7));
         }
         return ok;
     }
@@ -2526,10 +2894,21 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            return false;
+            return usermode_suspend_thread(tid, prev_count, "suspend_thread.no_kernel");
         }
 
-        return device->suspend_thread(tid, prev_count);
+        bool ok = device->suspend_thread(tid, prev_count);
+        if (!ok) {
+            DWORD gle = GetLastError();
+            diag::log_tagged_fmt("driver",
+                "suspend_thread_kernel_failed tid=%u gle=%lu fallback=user",
+                tid,
+                gle);
+            if (usermode_suspend_thread(tid, prev_count, "suspend_thread.kernel_failed"))
+                return true;
+            SetLastError(gle);
+        }
+        return ok;
     }
 
     bool resume_thread(uint32_t tid, uint32_t* prev_count)
@@ -2540,10 +2919,21 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            return false;
+            return usermode_resume_thread(tid, prev_count, "resume_thread.no_kernel");
         }
 
-        return device->resume_thread(tid, prev_count);
+        bool ok = device->resume_thread(tid, prev_count);
+        if (!ok) {
+            DWORD gle = GetLastError();
+            diag::log_tagged_fmt("driver",
+                "resume_thread_kernel_failed tid=%u gle=%lu fallback=user",
+                tid,
+                gle);
+            if (usermode_resume_thread(tid, prev_count, "resume_thread.kernel_failed"))
+                return true;
+            SetLastError(gle);
+        }
+        return ok;
     }
 
     bool query_thread_information(uint32_t tid, uint32_t info_class, void* buffer, uint32_t buffer_size, uint32_t* return_length)
@@ -2699,6 +3089,7 @@ namespace driver_bridge
 
     bool stop_capture()
     {
+        const ULONGLONG t0 = GetTickCount64();
         bool kernel_mode = false;
         {
             std::lock_guard<std::mutex> lk(g_state_mtx);
@@ -2709,20 +3100,40 @@ namespace driver_bridge
             return false;
         }
 
-        return device->stop_capture();
+        bool ok = device->stop_capture();
+        DWORD gle = ok ? 0 : GetLastError();
+        diag::log_tagged_fmt("driver_bridge_net",
+            "stop_capture EXIT ok=%d gle=%lu elapsed_ms=%llu",
+            ok ? 1 : 0,
+            static_cast<unsigned long>(gle),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        return ok;
     }
 
     bool get_capture_status(bool& active, uint32_t& captured, uint32_t& dropped)
     {
+        const ULONGLONG t0 = GetTickCount64();
         bool kernel_mode = false;
         {
             std::lock_guard<std::mutex> lk(g_state_mtx);
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
-        if (!kernel_mode)
+        if (!kernel_mode) {
+            diag::log_tagged("driver_bridge_net", "get_capture_status ABORT kernel_mode=false");
             return false;
+        }
 
-        return device->get_capture_status(active, captured, dropped);
+        bool ok = device->get_capture_status(active, captured, dropped);
+        DWORD gle = ok ? 0 : GetLastError();
+        diag::log_tagged_fmt("driver_bridge_net",
+            "get_capture_status EXIT ok=%d active=%d captured=%u dropped=%u gle=%lu elapsed_ms=%llu",
+            ok ? 1 : 0,
+            active ? 1 : 0,
+            captured,
+            dropped,
+            static_cast<unsigned long>(gle),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        return ok;
     }
 
     std::vector<captured_packet_t> get_captured_packets(uint32_t max_packets)
@@ -2740,9 +3151,11 @@ namespace driver_bridge
         }
 
         auto raw = device->get_captured_packets(max_packets);
-        if (!raw.empty()) {
-            logf("get_captured_packets: got %zu raw packets\n", raw.size());
-        }
+        logf("get_captured_packets: got %zu raw packets\n", raw.size());
+        diag::log_tagged_fmt("driver_bridge_net",
+            "get_captured_packets EXIT max=%u raw=%zu kernel_mode=1",
+            max_packets,
+            raw.size());
         result.reserve(raw.size());
         for (auto& src : raw) {
             captured_packet_t pkt;
@@ -2870,6 +3283,7 @@ namespace driver_bridge
 
     bool bw_monitor_op(uint32_t operation, uint32_t filter_pid, bw_stats_t* out_stats)
     {
+        const ULONGLONG t0 = GetTickCount64();
         bool kernel_mode = false;
         {
             std::lock_guard<std::mutex> lk(g_state_mtx);
@@ -2882,6 +3296,7 @@ namespace driver_bridge
 
         voyager::device_t::bw_stats raw{};
         bool ok = device->bw_monitor_op(operation, filter_pid, out_stats ? &raw : nullptr);
+        DWORD gle = ok ? 0 : GetLastError();
         if (ok && out_stats) {
             out_stats->total_bytes_sent    = raw.total_bytes_sent;
             out_stats->total_bytes_recv    = raw.total_bytes_recv;
@@ -2891,6 +3306,18 @@ namespace driver_bridge
             out_stats->bps_out             = raw.bps_out;
             out_stats->active              = raw.active;
         }
+        diag::log_tagged_fmt("driver_bridge_net",
+            "bw_monitor_op EXIT op=%u filter_pid=%u ok=%d active=%d sent=%llu recv=%llu pkts_sent=%llu pkts_recv=%llu gle=%lu elapsed_ms=%llu",
+            operation,
+            filter_pid,
+            ok ? 1 : 0,
+            raw.active ? 1 : 0,
+            static_cast<unsigned long long>(raw.total_bytes_sent),
+            static_cast<unsigned long long>(raw.total_bytes_recv),
+            static_cast<unsigned long long>(raw.total_packets_sent),
+            static_cast<unsigned long long>(raw.total_packets_recv),
+            static_cast<unsigned long>(gle),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
         return ok;
     }
 
@@ -2907,6 +3334,10 @@ namespace driver_bridge
             return result;
 
         auto raw = device->get_bw_per_process(filter_pid);
+        diag::log_tagged_fmt("driver_bridge_net",
+            "get_bw_per_process EXIT filter_pid=%u raw=%zu",
+            filter_pid,
+            raw.size());
         result.reserve(raw.size());
         for (const auto& src : raw) {
             bw_process_info_t bw;
@@ -2970,11 +3401,25 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            require_kernel_fail("set_hardware_breakpoint");
-            return false;
+            return usermode_set_hardware_breakpoint(tid, index, address, type, size);
         }
 
-        return device->set_hardware_breakpoint(tid, index, address, type, size);
+        bool ok = device->set_hardware_breakpoint(tid, index, address, type, size);
+        if (!ok) {
+            DWORD gle = GetLastError();
+            diag::log_tagged_fmt("driver",
+                "set_hardware_breakpoint_kernel_failed tid=%u index=%d addr=0x%llX type=%d size=%d gle=%lu fallback=user",
+                tid,
+                index,
+                static_cast<unsigned long long>(address),
+                type,
+                size,
+                gle);
+            if (usermode_set_hardware_breakpoint(tid, index, address, type, size))
+                return true;
+            SetLastError(gle);
+        }
+        return ok;
     }
 
     bool clear_hardware_breakpoint(uint32_t tid, int index)
@@ -2985,11 +3430,22 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            require_kernel_fail("clear_hardware_breakpoint");
-            return false;
+            return usermode_clear_hardware_breakpoint(tid, index);
         }
 
-        return device->clear_hardware_breakpoint(tid, index);
+        bool ok = device->clear_hardware_breakpoint(tid, index);
+        if (!ok) {
+            DWORD gle = GetLastError();
+            diag::log_tagged_fmt("driver",
+                "clear_hardware_breakpoint_kernel_failed tid=%u index=%d gle=%lu fallback=user",
+                tid,
+                index,
+                gle);
+            if (usermode_clear_hardware_breakpoint(tid, index))
+                return true;
+            SetLastError(gle);
+        }
+        return ok;
     }
 
     bool spoof_debug_flags(uint32_t* result_flags)
@@ -3048,6 +3504,36 @@ namespace driver_bridge
         return device->sentinel_ready_since_tsc();
     }
 
+    dynamic_ioctl_state_t dynamic_ioctl_state()
+    {
+        dynamic_ioctl_state_t out{};
+        std::lock_guard<std::mutex> lk(g_state_mtx);
+        out.loaded = g_initialized;
+        out.kernel = g_kernel_mode;
+        out.connected = device && device->is_connected();
+        if (device)
+        {
+            device->sync_dynamic_security_state();
+            out.instance_server_seed = device->has_server_seed() ? 1u : 0u;
+            out.instance_ioctl_seed = device->has_server_ioctl_seed() ? 1u : 0u;
+            out.global_server_seed = dynamic_key::g_server_seed != 0 ? 1u : 0u;
+            out.global_ioctl_seed = ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u;
+            out.ioctl_seed_hash = device->get_server_ioctl_seed_hash();
+            out.heartbeat_ioctl_seed_hash = device->get_last_heartbeat_ioctl_seed_hash();
+        }
+        out.ready = out.connected && out.kernel &&
+            out.instance_server_seed != 0 &&
+            out.instance_ioctl_seed != 0 &&
+            out.global_server_seed != 0 &&
+            out.global_ioctl_seed != 0;
+        return out;
+    }
+
+    bool dynamic_ioctls_ready()
+    {
+        return dynamic_ioctl_state().ready;
+    }
+
     bool register_dll_protection(uint64_t module_base, uint64_t text_va, uint32_t text_size,
                                  uint64_t expected_hash, uint32_t check_interval_ms)
     {
@@ -3090,19 +3576,50 @@ namespace driver_bridge
     bool register_self_dll_protection(uint64_t module_base, uint64_t text_va, uint32_t text_size,
                                       uint64_t expected_hash, uint32_t check_interval_ms)
     {
-        bool kernel_mode = false;
-        {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
-        }
+        const uint32_t self_pid = static_cast<uint32_t>(GetCurrentProcessId());
+        const uint64_t started = static_cast<uint64_t>(GetTickCount64());
+        std::lock_guard<std::mutex> lk(g_state_mtx);
+        bool kernel_mode = g_kernel_mode && device && device->is_connected();
         if (!kernel_mode) {
             require_kernel_fail("register_self_dll_protection");
+            driver_critical_fmt("register_self_dll_protection_post ok=0 err=%lu reason=no_kernel elapsed_ms=%llu",
+                static_cast<unsigned long>(GetLastError()),
+                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
             return false;
         }
 
-        return device->register_dll_protection_for_pid(static_cast<uint32_t>(GetCurrentProcessId()),
-                                                       module_base, text_va, text_size,
-                                                       expected_hash, check_interval_ms);
+        const uint32_t saved_pid = device->get_process_id();
+        const uint64_t saved_base = device->get_base_address();
+        const uint64_t saved_dtb = device->get_dtb();
+
+        device->set_process_id(self_pid);
+        device->solve_dtb();
+        uint64_t self_dtb = device->get_dtb();
+        driver_critical_fmt(
+            "register_self_dll_protection_dtb pid=%u dtb=0x%llX saved_pid=%u saved_dtb=0x%llX elapsed_ms=%llu",
+            self_pid,
+            static_cast<unsigned long long>(self_dtb),
+            saved_pid,
+            static_cast<unsigned long long>(saved_dtb),
+            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
+
+        SetLastError(ERROR_SUCCESS);
+        bool ok = device->register_dll_protection_for_pid(self_pid,
+                                                          module_base, text_va, text_size,
+                                                          expected_hash, check_interval_ms);
+        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
+
+        device->set_process_id(saved_pid);
+        device->set_base_address(saved_base);
+        device->set_dtb(saved_dtb);
+
+        SetLastError(err);
+        driver_critical_fmt("register_self_dll_protection_post ok=%d err=%lu dtb=0x%llX elapsed_ms=%llu",
+            ok ? 1 : 0,
+            static_cast<unsigned long>(err),
+            static_cast<unsigned long long>(self_dtb),
+            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
+        return ok;
     }
 
     bool query_dll_protection(dll_protect_status_t& out)
@@ -3161,10 +3678,14 @@ namespace driver_bridge
     bool trigger_kernel_bsod(uint32_t reason_code, uint64_t evidence_hash)
     {
         if (destructive_driver_action_suppressed()) {
+            uint64_t full_test_suppression_remaining = 0;
+            anti_tamper::state::full_test_suppression_active(&full_test_suppression_remaining);
             diag::log_tagged_critical_fmt("driver",
-                "trigger_kernel_bsod_SUPPRESSED reason=0x%08X evidence=0x%016llX env_full_test=%d env_disable=%d",
+                "trigger_kernel_bsod_SUPPRESSED reason=0x%08X evidence=0x%016llX full_test_latch=%d post_full_test_ms=%llu env_full_test=%d env_disable=%d",
                 reason_code,
                 static_cast<unsigned long long>(evidence_hash),
+                anti_tamper::state::get().full_test_running.load(std::memory_order_acquire) ? 1 : 0,
+                static_cast<unsigned long long>(full_test_suppression_remaining),
                 env_flag_enabled("AIDA_FULL_TEST_RUNNING") ? 1 : 0,
                 env_flag_enabled("AIDA_DISABLE_DESTRUCTIVE_ENFORCEMENT") ? 1 : 0);
             return false;
@@ -3930,6 +4451,7 @@ namespace driver_bridge
                       const uint8_t* modify_payload, uint32_t modify_size,
                       uint32_t* out_held_count, bool* out_active)
     {
+        const ULONGLONG t0 = GetTickCount64();
         bool kernel_mode = false;
         {
             std::lock_guard<std::mutex> lk(g_state_mtx);
@@ -3940,9 +4462,20 @@ namespace driver_bridge
             return false;
         }
 
-        return device->intercept_op(operation, filter_pid, filter_port, filter_protocol,
-                                    hold_id, modify_payload, modify_size,
-                                    out_held_count, out_active);
+        diag::log_tagged_fmt("driver_bridge_net",
+            "intercept_op ENTER op=%u pid=%u port=%u proto=%u hold_id=%llu modify_size=%u",
+            operation, filter_pid, filter_port, filter_protocol,
+            static_cast<unsigned long long>(hold_id), modify_size);
+        bool ok = device->intercept_op(operation, filter_pid, filter_port, filter_protocol,
+                                       hold_id, modify_payload, modify_size,
+                                       out_held_count, out_active);
+        DWORD gle = ok ? 0 : GetLastError();
+        diag::log_tagged_fmt("driver_bridge_net",
+            "intercept_op EXIT op=%u ok=%d held_count=%u active=%d gle=%lu elapsed_ms=%llu",
+            operation, ok ? 1 : 0, out_held_count ? *out_held_count : 0,
+            out_active && *out_active ? 1 : 0, static_cast<unsigned long>(gle),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        return ok;
     }
 
     bool dns_spoof_op(uint32_t operation, uint32_t rule_id, const char* domain,
@@ -4109,9 +4642,17 @@ namespace driver_bridge
             std::lock_guard<std::mutex> lk(g_state_mtx);
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
-        if (!kernel_mode) return result;
+        if (!kernel_mode) {
+            diag::log_tagged_fmt("driver_bridge_net",
+                "get_dpi_results ABORT kernel_mode=false filter_pid=%u proto=%u port=%u flags=0x%X",
+                filter_pid, filter_protocol, filter_port, flags);
+            return result;
+        }
 
         auto raw = device->get_dpi_results(filter_pid, filter_protocol, filter_port, flags);
+        diag::log_tagged_fmt("driver_bridge_net",
+            "get_dpi_results EXIT filter_pid=%u proto=%u port=%u flags=0x%X raw=%zu",
+            filter_pid, filter_protocol, filter_port, flags, raw.size());
         result.reserve(raw.size());
         for (const auto& src : raw) {
             dpi_result_t d;
@@ -4271,9 +4812,15 @@ namespace driver_bridge
             std::lock_guard<std::mutex> lk(g_state_mtx);
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
-        if (!kernel_mode) return result;
+        if (!kernel_mode) {
+            diag::log_tagged("driver_bridge_net", "get_held_packets ABORT kernel_mode=false");
+            return result;
+        }
 
         auto raw = device->get_held_packets();
+        diag::log_tagged_fmt("driver_bridge_net",
+            "get_held_packets EXIT raw=%zu",
+            raw.size());
         result.reserve(raw.size());
         for (auto& src : raw) {
             held_packet_info_t h;
@@ -4302,9 +4849,15 @@ namespace driver_bridge
             std::lock_guard<std::mutex> lk(g_state_mtx);
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
-        if (!kernel_mode) return result;
+        if (!kernel_mode) {
+            diag::log_tagged("driver_bridge_net", "list_packet_mod_rules ABORT kernel_mode=false");
+            return result;
+        }
 
         auto raw = device->list_packet_mod_rules();
+        diag::log_tagged_fmt("driver_bridge_net",
+            "list_packet_mod_rules EXIT raw=%zu",
+            raw.size());
         result.reserve(raw.size());
         for (const auto& src : raw) {
             mod_rule_info_t r;
@@ -4328,9 +4881,15 @@ namespace driver_bridge
             std::lock_guard<std::mutex> lk(g_state_mtx);
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
-        if (!kernel_mode) return result;
+        if (!kernel_mode) {
+            diag::log_tagged("driver_bridge_net", "list_redirect_rules ABORT kernel_mode=false");
+            return result;
+        }
 
         auto raw = device->list_redirect_rules();
+        diag::log_tagged_fmt("driver_bridge_net",
+            "list_redirect_rules EXIT raw=%zu",
+            raw.size());
         result.reserve(raw.size());
         for (const auto& src : raw) {
             redirect_rule_info_t r;
@@ -4354,9 +4913,15 @@ namespace driver_bridge
             std::lock_guard<std::mutex> lk(g_state_mtx);
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
-        if (!kernel_mode) return result;
+        if (!kernel_mode) {
+            diag::log_tagged("driver_bridge_net", "list_dns_spoof_rules ABORT kernel_mode=false");
+            return result;
+        }
 
         auto raw = device->list_dns_spoof_rules();
+        diag::log_tagged_fmt("driver_bridge_net",
+            "list_dns_spoof_rules EXIT raw=%zu",
+            raw.size());
         result.reserve(raw.size());
         for (const auto& src : raw) {
             dns_spoof_info_t r;
@@ -4373,6 +4938,7 @@ namespace driver_bridge
 
     bool fingerprint_op(uint32_t operation)
     {
+        const ULONGLONG t0 = GetTickCount64();
         bool kernel_mode = false;
         {
             std::lock_guard<std::mutex> lk(g_state_mtx);
@@ -4382,7 +4948,15 @@ namespace driver_bridge
             require_kernel_fail("fingerprint_op");
             return false;
         }
-        return device->fingerprint_op(operation);
+        bool ok = device->fingerprint_op(operation);
+        DWORD gle = ok ? 0 : GetLastError();
+        diag::log_tagged_fmt("driver_bridge_net",
+            "fingerprint_op EXIT op=%u ok=%d gle=%lu elapsed_ms=%llu",
+            operation,
+            ok ? 1 : 0,
+            static_cast<unsigned long>(gle),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        return ok;
     }
 
     std::vector<fingerprint_info_t> get_fingerprints()
@@ -4393,9 +4967,15 @@ namespace driver_bridge
             std::lock_guard<std::mutex> lk(g_state_mtx);
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
-        if (!kernel_mode) return result;
+        if (!kernel_mode) {
+            diag::log_tagged("driver_bridge_net", "get_fingerprints ABORT kernel_mode=false");
+            return result;
+        }
 
         auto raw = device->get_fingerprints();
+        diag::log_tagged_fmt("driver_bridge_net",
+            "get_fingerprints EXIT raw=%zu",
+            raw.size());
         result.reserve(raw.size());
         for (const auto& src : raw) {
             fingerprint_info_t f;

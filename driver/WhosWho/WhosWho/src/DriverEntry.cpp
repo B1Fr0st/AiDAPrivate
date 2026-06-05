@@ -498,6 +498,16 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
         _IoDeleteDevice(deviceObject);
         return STATUS_ACCESS_DENIED;
     }
+    NTSTATUS ob_status = process_guard::init();
+    WW_LOG("DriverEntry: process_guard::init returned 0x%08lx", ob_status);
+    if (!NT_SUCCESS(ob_status)) {
+        WW_LOG("DriverEntry: process_guard::init FAILED before watchdog start");
+        process_guard::cleanup();
+        _IoDeleteSymbolicLink(&symLink);
+        _IoDeleteDevice(deviceObject);
+        return ob_status;
+    }
+
     sentinel_bridge::start_watchdog();
 
     sentinel_bridge::allocate_evidence_blob();
@@ -505,9 +515,6 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     debug_attach_monitor::start();
     anti_dma_canary::init_timer();
     file_handle_scanner::start(30);
-
-    NTSTATUS ob_status = process_guard::init();
-    WW_LOG("DriverEntry: process_guard::init returned 0x%08lx", ob_status);
 
     NTSTATUS dbe_status = debug_events::initialize();
     WW_LOG("DriverEntry: debug_events::initialize returned 0x%08lx", dbe_status);

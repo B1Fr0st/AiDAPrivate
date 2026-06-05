@@ -1,5 +1,7 @@
 #include "test_all_analysis.h"
 
+#include "test_all_features.hpp"
+#include "test_lab_bounded_runner.hpp"
 #include "../emulation/symbolic_engine.hpp"
 #include "../emulation/deobfuscation_engine.hpp"
 #include "../analysis/code_patcher.hpp"
@@ -25,6 +27,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <exception>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -47,10 +51,7 @@ static void format_timestamp(char* out, std::size_t cap) {
 }
 
 static void write_log_file(HANDLE hf, const std::string& line) {
-    if (hf == INVALID_HANDLE_VALUE) return;
-    DWORD wrote = 0;
-    WriteFile(hf, line.data(), static_cast<DWORD>(line.size()), &wrote, nullptr);
-    FlushFileBuffers(hf);
+    test_all_features::write_full_test_log_line(hf, line.data(), line.size());
 }
 
 static void log_msg(HANDLE hf, const char* tag, const char* fmt, ...) {
@@ -68,8 +69,7 @@ static void log_msg(HANDLE hf, const char* tag, const char* fmt, ...) {
     std::string s(line);
 
     write_log_file(hf, s);
-    diag::log_tagged_fmt("test_analysis", "%s: %s", tag, detail);
-    OutputDebugStringA(s.c_str());
+    test_all_features::mirror_full_test_log_line(tag, detail, s.c_str());
 }
 
 struct symbolic_fixture_t {
@@ -925,17 +925,30 @@ static void test_integrity_hunter_start_stop(HANDLE hf, std::atomic<int>& passed
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     uint64_t addr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(ntdll));
 
-    integrity_hunter::start_hunt(addr, 4096);
+    bool started = integrity_hunter::start_hunt(addr, 4096);
 
     Sleep(200);
 
     integrity_hunter::stop_hunt();
 
+    bool idle = integrity_hunter::wait_until_idle(12000);
     bool hunting = integrity_hunter::g_state.hunting.load();
+    bool worker = integrity_hunter::g_state.worker_active.load();
+    bool install_complete = integrity_hunter::g_state.install_complete.load();
+    bool install_success = integrity_hunter::g_state.install_success.load();
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "integ_ss", "PASS -- hunting_after_stop=%d (elapsed %lld ms)", hunting, (long long)ms);
-    passed.fetch_add(1);
+    if (started && idle && !hunting && !worker) {
+        log_msg(hf, "integ_ss", "PASS -- started=%d idle=%d hunting_after_stop=%d worker=%d install_complete=%d install_success=%d (elapsed %lld ms)",
+            started ? 1 : 0, idle ? 1 : 0, hunting ? 1 : 0, worker ? 1 : 0,
+            install_complete ? 1 : 0, install_success ? 1 : 0, (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "integ_ss", "FAIL -- started=%d idle=%d hunting_after_stop=%d worker=%d install_complete=%d install_success=%d (elapsed %lld ms)",
+            started ? 1 : 0, idle ? 1 : 0, hunting ? 1 : 0, worker ? 1 : 0,
+            install_complete ? 1 : 0, install_success ? 1 : 0, (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_integrity_hunter_nodes(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -1304,10 +1317,24 @@ static void test_stealth_state(HANDLE hf, std::atomic<int>& passed, std::atomic<
     auto t0 = std::chrono::steady_clock::now();
 
     bool active = stealth_engine::g_state.active.load();
+    uint32_t attached_pid = driver_bridge::attached_pid();
+    bool active_for_attached = attached_pid != 0 && stealth_engine::is_active_for_pid(attached_pid);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "stealth_st", "PASS -- active=%d (elapsed %lld ms)", active, (long long)ms);
-    passed.fetch_add(1);
+    if (attached_pid == 0 || active_for_attached) {
+        log_msg(hf, "stealth_st", "PASS -- active=%d attached_pid=%u active_for_attached=%d (elapsed %lld ms)",
+            active ? 1 : 0, attached_pid, active_for_attached ? 1 : 0, (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        auto session = stealth_engine::get_session_info();
+        log_msg(hf, "stealth_st", "FAIL -- attached_pid=%u stealth_active=%d session_pid=%u status=\"%s\" (elapsed %lld ms)",
+            attached_pid,
+            active ? 1 : 0,
+            session.pid,
+            stealth_engine::get_status().c_str(),
+            (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_stealth_options_default(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -1598,18 +1625,109 @@ static void test_protection_inner_scan(HANDLE hf, std::atomic<int>& passed, std:
     select_protection_inner_tab(hf, passed, failed, "protection_inner.scan", 0, "Protection Scan");
 }
 static void test_protection_inner_controls(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-    select_protection_inner_tab(hf, passed, failed, "protection_inner.controls", 1, "Stealth Controls");
+    select_protection_inner_tab(hf, passed, failed, "protection_inner.controls", 1, "Stealth Status");
+}
+
+using analysis_test_fn_t = void (*)(HANDLE, std::atomic<int>&, std::atomic<int>&);
+
+struct analysis_test_entry_t {
+    const char* name;
+    analysis_test_fn_t fn;
+};
+
+static void run_analysis_test_seh(HANDLE hf, const analysis_test_entry_t& test, std::atomic<int>& passed, std::atomic<int>& failed) {
+    __try {
+        test.fn(hf, passed, failed);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        log_msg(hf, "analysis", "FAIL -- %s threw SEH exception 0x%08X",
+            test.name, GetExceptionCode());
+        failed.fetch_add(1);
+    }
+}
+
+struct analysis_worker_state_t {
+    std::atomic<int> passed{0};
+    std::atomic<int> failed{0};
+};
+
+struct analysis_log_handle_t {
+    HANDLE handle = nullptr;
+    explicit analysis_log_handle_t(HANDLE h) : handle(h) {}
+    ~analysis_log_handle_t() {
+        if (handle && handle != INVALID_HANDLE_VALUE)
+            CloseHandle(handle);
+    }
+    HANDLE get() const {
+        return handle;
+    }
+};
+
+static HANDLE duplicate_analysis_log_handle(HANDLE hf) {
+    if (!hf || hf == INVALID_HANDLE_VALUE)
+        return INVALID_HANDLE_VALUE;
+    HANDLE dup = nullptr;
+    if (!DuplicateHandle(GetCurrentProcess(), hf, GetCurrentProcess(), &dup, 0, FALSE, DUPLICATE_SAME_ACCESS))
+        return INVALID_HANDLE_VALUE;
+    return dup;
+}
+
+static bool run_analysis_test_bounded(HANDLE hf, const analysis_test_entry_t& test, std::atomic<int>& passed, std::atomic<int>& failed, DWORD timeout_ms) {
+    static test_lab::bounded_runner_t runner(4);
+    auto state = std::make_shared<analysis_worker_state_t>();
+
+    auto worker_log = std::make_shared<analysis_log_handle_t>(duplicate_analysis_log_handle(hf));
+    const auto result = runner.run(static_cast<std::uint32_t>(timeout_ms), [worker_log, test, state]() {
+        HANDLE log_hf = worker_log->get();
+        try {
+            run_analysis_test_seh(log_hf, test, state->passed, state->failed);
+        } catch (const std::exception& ex) {
+            log_msg(log_hf, "analysis", "FAIL -- %s threw C++ exception: %s", test.name, ex.what());
+            state->failed.fetch_add(1);
+        } catch (...) {
+            log_msg(log_hf, "analysis", "FAIL -- %s threw unknown C++ exception", test.name);
+            state->failed.fetch_add(1);
+        }
+    });
+
+    if (result.status == test_lab::bounded_run_status_t::completed) {
+        passed.fetch_add(state->passed.load(std::memory_order_acquire));
+        failed.fetch_add(state->failed.load(std::memory_order_acquire));
+        return true;
+    }
+
+    if (result.status == test_lab::bounded_run_status_t::timed_out) {
+        log_msg(hf, "analysis", "FAIL -- %s exceeded %lu ms watchdog; bounded worker still draining",
+            test.name, static_cast<unsigned long>(timeout_ms));
+        failed.fetch_add(1);
+        return false;
+    }
+
+    if (result.status == test_lab::bounded_run_status_t::saturated) {
+        log_msg(hf, "analysis", "FAIL -- %s bounded runner saturated; previous timed-out workers still draining", test.name);
+        failed.fetch_add(1);
+        return false;
+    }
+
+    if (result.status == test_lab::bounded_run_status_t::exception) {
+        log_msg(hf, "analysis", "FAIL -- %s bounded worker escaped exception: %s",
+            test.name, result.error.empty() ? "<unknown>" : result.error.c_str());
+        failed.fetch_add(1);
+        return false;
+    }
+
+    log_msg(hf, "analysis", "FAIL -- %s worker post failed%s%s",
+        test.name,
+        result.error.empty() ? "" : ": ",
+        result.error.empty() ? "" : result.error.c_str());
+    failed.fetch_add(1);
+    return false;
 }
 
 }
 
 void phase_analysis_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped, bool(*cancelled)()) {
-    struct test_entry_t {
-        const char* name;
-        void (*fn)(HANDLE, std::atomic<int>&, std::atomic<int>&);
-    };
-
-    static const test_entry_t tests[] = {
+    static const analysis_test_entry_t tests[] = {
         { "symbolic_execute",            test_symbolic_execute            },
         { "symbolic_execute_larger",     test_symbolic_execute_larger     },
         { "symbolic_slice",              test_symbolic_slice              },
@@ -1701,14 +1819,15 @@ void phase_analysis_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>&
         }
 
         log_msg(hf, "analysis", "[%d/%d] %s", i + 1, total, tests[i].name);
-        __try {
-            tests[i].fn(hf, passed, failed);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            log_msg(hf, "analysis", "FAIL -- %s threw SEH exception 0x%08X",
-                tests[i].name, GetExceptionCode());
-            failed.fetch_add(1);
-        }
+        const ULONGLONG t0 = GetTickCount64();
+        const int pass_before = passed.load(std::memory_order_acquire);
+        const int fail_before = failed.load(std::memory_order_acquire);
+        run_analysis_test_bounded(hf, tests[i], passed, failed, 5000);
+        log_msg(hf, "analysis", "[%d/%d] END %s elapsed_ms=%llu pass_delta=%d fail_delta=%d",
+            i + 1, total, tests[i].name,
+            static_cast<unsigned long long>(GetTickCount64() - t0),
+            passed.load(std::memory_order_acquire) - pass_before,
+            failed.load(std::memory_order_acquire) - fail_before);
     }
 
     log_msg(hf, "analysis", "=== END analysis tests ===");

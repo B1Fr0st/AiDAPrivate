@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include "work_queue.hpp"
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -9,6 +10,7 @@
 #include <thread>
 #include <vector>
 
+#include "../infra/critical_work_queue.hpp"
 #include "standalone_driver.hpp"
 #include "zydis_disasm.hpp"
 
@@ -50,6 +52,20 @@ inline std::string xref_type_name(xref_type_t t)
 	case xref_type_t::data_ref:         return "DATA";
 	}
 	return "???";
+}
+
+inline bool wait_until_idle(uint32_t timeout_ms)
+{
+	const auto start = std::chrono::steady_clock::now();
+	for (;;) {
+		if (!g_state.scanning.load(std::memory_order_acquire))
+			return true;
+		const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::steady_clock::now() - start).count();
+		if (elapsed >= static_cast<int64_t>(timeout_ms))
+			return false;
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
 }
 
 namespace detail {
@@ -94,14 +110,17 @@ inline bool extract_target(const uint8_t* code, int code_len, uint64_t ins_addr,
 
 }
 
-inline void find_xrefs_to(uint64_t target_addr, uint64_t search_start, uint64_t search_size)
+inline bool find_xrefs_to(uint64_t target_addr, uint64_t search_start, uint64_t search_size)
 {
-	if (g_state.scanning.load())
-		return;
+	if (g_state.scanning.load(std::memory_order_acquire)) {
+		g_state.cancel.store(true, std::memory_order_release);
+		if (!wait_until_idle(1000))
+			return false;
+	}
 
-	g_state.scanning.store(true);
-	g_state.cancel.store(false);
-	g_state.progress.store(0.f);
+	g_state.scanning.store(true, std::memory_order_release);
+	g_state.cancel.store(false, std::memory_order_release);
+	g_state.progress.store(0.f, std::memory_order_release);
 	{
 		std::lock_guard<std::mutex> lk(g_state.mutex);
 		g_state.results.clear();
@@ -116,7 +135,7 @@ inline void find_xrefs_to(uint64_t target_addr, uint64_t search_start, uint64_t 
 		}
 	}
 
-	if (!work_queue::post([target_addr, search_start, search_size, module_name]() {
+	auto worker = [target_addr, search_start, search_size, module_name]() {
 		struct scan_finish_t {
 			~scan_finish_t() { g_state.scanning.store(false); }
 		} scan_finish;
@@ -172,9 +191,16 @@ inline void find_xrefs_to(uint64_t target_addr, uint64_t search_start, uint64_t 
 			g_state.progress.store(static_cast<float>(scanned) / static_cast<float>(total));
 		}
 
-	})) {
-		g_state.scanning.store(false);
+	};
+	if (search_size <= 0x100000) {
+		worker();
+		return true;
 	}
+	if (!critical_work_queue::post(worker) && !work_queue::post(worker)) {
+		g_state.scanning.store(false, std::memory_order_release);
+		return false;
+	}
+	return true;
 }
 
 inline void find_xrefs_from(uint64_t source_addr, size_t max_instructions, std::vector<xref_t>& out)
@@ -242,18 +268,18 @@ inline bool is_scanning()
 	return g_state.scanning.load();
 }
 
-inline void find_xrefs_to(uint64_t target_addr)
+inline bool find_xrefs_to(uint64_t target_addr)
 {
 	auto modules = driver_bridge::enumerate_modules();
 	for (auto& m : modules) {
 		if (target_addr >= m.base && target_addr < m.base + m.size) {
-			find_xrefs_to(target_addr, m.base, m.size);
-			return;
+			return find_xrefs_to(target_addr, m.base, m.size);
 		}
 	}
 	if (!modules.empty()) {
-		find_xrefs_to(target_addr, modules[0].base, modules[0].size);
+		return find_xrefs_to(target_addr, modules[0].base, modules[0].size);
 	}
+	return false;
 }
 
 }

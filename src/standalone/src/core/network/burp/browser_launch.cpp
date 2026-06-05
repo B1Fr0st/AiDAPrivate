@@ -9,6 +9,8 @@
 #endif
 
 #include "browser_launch.hpp"
+#include "camoufox_bridge.hpp"
+#include "camoufox_install.hpp"
 
 #include "../cert_generator.hpp"
 #include "../../../helpers/diag_log.hpp"
@@ -17,6 +19,7 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -66,6 +69,67 @@ uint64_t now_ms()
     return static_cast<uint64_t>(duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count());
 }
 
+const char* install_state_name(camoufox::install::install_state_t state)
+{
+    using install_state_t = camoufox::install::install_state_t;
+    switch (state) {
+    case install_state_t::unknown: return "unknown";
+    case install_state_t::checking: return "checking";
+    case install_state_t::available: return "available";
+    case install_state_t::missing_python: return "missing_python";
+    case install_state_t::missing_module: return "missing_module";
+    case install_state_t::missing_browser: return "missing_browser";
+    case install_state_t::installing: return "installing";
+    case install_state_t::install_failed: return "install_failed";
+    case install_state_t::ok: return "ok";
+    default: return "unknown";
+    }
+}
+
+const char* bridge_state_name(camoufox::bridge_state_t state)
+{
+    using bridge_state_t = camoufox::bridge_state_t;
+    switch (state) {
+    case bridge_state_t::stopped: return "stopped";
+    case bridge_state_t::starting: return "starting";
+    case bridge_state_t::ready: return "ready";
+    case bridge_state_t::error: return "error";
+    default: return "unknown";
+    }
+}
+
+std::string dependency_summary(const camoufox::install::status_t& st)
+{
+    std::string msg = "camoufox_dependency_unavailable state=";
+    msg += install_state_name(st.state);
+    msg += " message=";
+    msg += st.last_message.empty() ? "<empty>" : st.last_message;
+    msg += " python=";
+    msg += st.python_path.empty() ? "<empty>" : st.python_path;
+    msg += " module=";
+    msg += st.module_version.empty() ? "<empty>" : st.module_version;
+    msg += " browser=";
+    msg += st.browser_path.empty() ? "<empty>" : st.browser_path;
+    return msg;
+}
+
+bool camoufox_install_ready(const camoufox::install::status_t& st)
+{
+    return st.state == camoufox::install::install_state_t::ok &&
+           !st.python_path.empty() &&
+           !st.module_version.empty() &&
+           !st.browser_path.empty();
+}
+
+std::string proxy_url(const browser_launch_config_t& cfg)
+{
+    char buf[256];
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE, "http://%s:%u",
+                cfg.proxy_host.empty() ? "127.0.0.1" : cfg.proxy_host.c_str(),
+                static_cast<unsigned>(cfg.proxy_port));
+    return std::string(buf);
+}
+
 std::string wide_to_utf8(const wchar_t* w)
 {
     if (!w) return std::string();
@@ -86,27 +150,6 @@ std::wstring utf8_to_wide(const std::string& s)
     return out;
 }
 
-bool file_exists(const std::string& p)
-{
-    if (p.empty()) return false;
-    std::wstring wp = utf8_to_wide(p);
-    DWORD attrs = GetFileAttributesW(wp.c_str());
-    return attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
-}
-
-bool is_process_alive(uint32_t pid)
-{
-    if (pid == 0) return false;
-    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(pid));
-    if (!h) return false;
-    DWORD code = 0;
-    bool alive = false;
-    if (GetExitCodeProcess(h, &code))
-        alive = (code == STILL_ACTIVE);
-    CloseHandle(h);
-    return alive;
-}
-
 std::string local_appdata_dir()
 {
     PWSTR known = nullptr;
@@ -122,37 +165,6 @@ std::string local_appdata_dir()
     }
     if (out.empty()) out = "C:\\Users\\Public";
     return out;
-}
-
-std::string program_files()
-{
-    char buf[MAX_PATH] = {};
-    DWORD len = GetEnvironmentVariableA("ProgramFiles", buf, MAX_PATH);
-    if (len > 0 && len < MAX_PATH) return std::string(buf, len);
-    return "C:\\Program Files";
-}
-
-std::string program_files_x86()
-{
-    char buf[MAX_PATH] = {};
-    DWORD len = GetEnvironmentVariableA("ProgramFiles(x86)", buf, MAX_PATH);
-    if (len > 0 && len < MAX_PATH) return std::string(buf, len);
-    return "C:\\Program Files (x86)";
-}
-
-std::string registry_string_hkcu(const char* subkey, const char* value)
-{
-    HKEY k = nullptr;
-    if (RegOpenKeyExA(HKEY_CURRENT_USER, subkey, 0, KEY_READ, &k) != ERROR_SUCCESS) return std::string();
-    char buf[1024] = {};
-    DWORD sz = sizeof(buf);
-    DWORD type = 0;
-    LONG rc = RegQueryValueExA(k, value, nullptr, &type, reinterpret_cast<LPBYTE>(buf), &sz);
-    RegCloseKey(k);
-    if (rc != ERROR_SUCCESS) return std::string();
-    if (type != REG_SZ && type != REG_EXPAND_SZ) return std::string();
-    if (sz > 0 && buf[sz - 1] == '\0') sz--;
-    return std::string(buf, sz);
 }
 
 bool quote_path(const std::string& in, std::wstring& out)
@@ -238,79 +250,38 @@ void shutdown()
 
 bool detect_edge_path(std::string& out_path)
 {
-    diag::log_tagged_fmt("browser", "detect_edge_path entry");
-    std::string candidates[4];
-    candidates[0] = program_files_x86() + "\\Microsoft\\Edge\\Application\\msedge.exe";
-    candidates[1] = program_files() + "\\Microsoft\\Edge\\Application\\msedge.exe";
-    candidates[2] = local_appdata_dir() + "\\Microsoft\\Edge\\Application\\msedge.exe";
-    candidates[3] = registry_string_hkcu("SOFTWARE\\Microsoft\\Edge\\BLBeacon", "InstallLocation");
-    for (auto& p : candidates) {
-        if (!p.empty() && file_exists(p)) {
-            diag::log_tagged_fmt("browser", "detect_edge_path found path=%s", p.c_str());
-            out_path = p;
-            return true;
-        }
-    }
-    HKEY k = nullptr;
-    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
-                      "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\msedge.exe",
-                      0, KEY_READ, &k) == ERROR_SUCCESS) {
-        char buf[1024] = {};
-        DWORD sz = sizeof(buf);
-        DWORD type = 0;
-        LONG rc = RegQueryValueExA(k, nullptr, nullptr, &type, reinterpret_cast<LPBYTE>(buf), &sz);
-        RegCloseKey(k);
-        if (rc == ERROR_SUCCESS && (type == REG_SZ || type == REG_EXPAND_SZ)) {
-            if (sz > 0 && buf[sz - 1] == '\0') sz--;
-            std::string p(buf, sz);
-            if (file_exists(p)) {
-                diag::log_tagged_fmt("browser", "detect_edge_path found_via_registry path=%s", p.c_str());
-                out_path = p;
-                return true;
-            }
-        }
-    }
-    diag::log_tagged_fmt("browser", "detect_edge_path not_found");
-    set_err("edge_not_detected");
+    out_path.clear();
+    diag::log_tagged_fmt("browser", "detect_edge_path disabled policy=camoufox_only");
+    set_err("edge_disabled_camoufox_only");
     return false;
 }
 
 bool detect_chrome_path(std::string& out_path)
 {
-    diag::log_tagged_fmt("browser", "detect_chrome_path entry");
-    std::string candidates[3];
-    candidates[0] = program_files() + "\\Google\\Chrome\\Application\\chrome.exe";
-    candidates[1] = program_files_x86() + "\\Google\\Chrome\\Application\\chrome.exe";
-    candidates[2] = local_appdata_dir() + "\\Google\\Chrome\\Application\\chrome.exe";
-    for (auto& p : candidates) {
-        if (!p.empty() && file_exists(p)) {
-            diag::log_tagged_fmt("browser", "detect_chrome_path found path=%s", p.c_str());
-            out_path = p;
-            return true;
-        }
-    }
-    HKEY k = nullptr;
-    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
-                      "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\chrome.exe",
-                      0, KEY_READ, &k) == ERROR_SUCCESS) {
-        char buf[1024] = {};
-        DWORD sz = sizeof(buf);
-        DWORD type = 0;
-        LONG rc = RegQueryValueExA(k, nullptr, nullptr, &type, reinterpret_cast<LPBYTE>(buf), &sz);
-        RegCloseKey(k);
-        if (rc == ERROR_SUCCESS && (type == REG_SZ || type == REG_EXPAND_SZ)) {
-            if (sz > 0 && buf[sz - 1] == '\0') sz--;
-            std::string p(buf, sz);
-            if (file_exists(p)) {
-                diag::log_tagged_fmt("browser", "detect_chrome_path found_via_registry path=%s", p.c_str());
-                out_path = p;
-                return true;
-            }
-        }
-    }
-    diag::log_tagged_fmt("browser", "detect_chrome_path not_found");
-    set_err("chrome_not_detected");
+    out_path.clear();
+    diag::log_tagged_fmt("browser", "detect_chrome_path disabled policy=camoufox_only");
+    set_err("chrome_disabled_camoufox_only");
     return false;
+}
+
+bool detect_camoufox_path(std::string& out_path)
+{
+    diag::log_tagged_fmt("browser", "detect_camoufox_path entry");
+    auto st = camoufox::install::probe();
+    out_path = st.browser_path;
+    const bool ok = camoufox_install_ready(st);
+    diag::log_tagged_fmt("browser", "detect_camoufox_path result=%d state=%s python=%s module=%s browser=%s message=%s",
+        ok ? 1 : 0,
+        install_state_name(st.state),
+        st.python_path.empty() ? "<empty>" : st.python_path.c_str(),
+        st.module_version.empty() ? "<empty>" : st.module_version.c_str(),
+        st.browser_path.empty() ? "<empty>" : st.browser_path.c_str(),
+        st.last_message.empty() ? "<empty>" : st.last_message.c_str());
+    if (!ok)
+        set_err(dependency_summary(st));
+    else
+        set_err(std::string());
+    return ok;
 }
 
 std::string profile_root()
@@ -474,162 +445,217 @@ std::wstring build_command_line_for_test(const std::string& browser_path,
 
 bool launch(const browser_launch_config_t& cfg, uint32_t& out_pid)
 {
+    const uint64_t launch_start_ms = now_ms();
     browser_launch_config_t effective = effective_config(cfg);
-    diag::log_tagged_fmt("browser", "launch entry prefer_chrome=%d proxy=%s:%u url=%s cert_strategy=%s spki_prefix=%s",
+    diag::log_tagged_fmt("browser", "launch entry policy=camoufox_only prefer_chrome_ignored=%d proxy=%s:%u url=%s cert_strategy=%s spki_prefix=%s clear_profile=%d profile_subdir=%s",
         static_cast<int>(cfg.prefer_chrome), cfg.proxy_host.c_str(),
         static_cast<unsigned>(cfg.proxy_port), cfg.initial_url.c_str(),
         certificate_strategy_name(effective.certificate_strategy),
-        spki_hash_prefix(effective.spki_allowlist).c_str());
+        spki_hash_prefix(effective.spki_allowlist).c_str(),
+        static_cast<int>(cfg.clear_profile_first), cfg.profile_subdir.c_str());
     out_pid = 0;
     auto& st = s();
     if (!st.initialized.load()) initialize();
 
-    std::string browser_path;
-    if (cfg.prefer_chrome) {
-        diag::log_tagged_fmt("browser", "launch prefer_chrome=true trying_chrome_first");
-        if (!detect_chrome_path(browser_path)) {
-            diag::log_tagged_fmt("browser", "launch chrome_not_found trying_edge");
-            if (!detect_edge_path(browser_path)) {
-                diag::log_tagged_fmt("browser", "launch no_chromium_browser_detected");
-                set_err("no_chromium_browser_detected");
-                return false;
-            }
-        }
-    } else {
-        diag::log_tagged_fmt("browser", "launch prefer_edge=true trying_edge_first");
-        if (!detect_edge_path(browser_path)) {
-            diag::log_tagged_fmt("browser", "launch edge_not_found trying_chrome");
-            if (!detect_chrome_path(browser_path)) {
-                diag::log_tagged_fmt("browser", "launch no_chromium_browser_detected");
-                set_err("no_chromium_browser_detected");
-                return false;
-            }
-        }
-    }
-    diag::log_tagged_fmt("browser", "launch browser_path=%s", browser_path.c_str());
-
     std::string profile_path = compute_profile_path(cfg.profile_subdir);
     if (cfg.clear_profile_first) {
-        diag::log_tagged_fmt("browser", "launch clearing_profile profile=%s", profile_path.c_str());
+        diag::log_tagged_fmt("browser", "launch clearing_profile profile=%s policy=camoufox_only", profile_path.c_str());
         remove_directory_recursive(profile_path);
         std::error_code ec;
         std::filesystem::create_directories(profile_path, ec);
+        diag::log_tagged_fmt("browser", "launch profile_clear_result profile=%s ec=%d", profile_path.c_str(), ec.value());
     }
 
-    std::wstring cmdline = build_command_line(browser_path, effective, profile_path);
-    if (cmdline.empty()) {
-        diag::log_tagged_fmt("browser", "launch build_cmdline_failed");
-        set_err("build_cmdline_failed");
-        return false;
-    }
-    diag::log_tagged_fmt("browser", "launch cmdline_built launching process");
-
-    std::vector<wchar_t> cmd_mutable(cmdline.begin(), cmdline.end());
-    cmd_mutable.push_back(L'\0');
-
-    STARTUPINFOW si{};
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_SHOWNORMAL;
-
-    PROCESS_INFORMATION pi{};
-    DWORD flags = CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT;
-    BOOL ok = CreateProcessW(nullptr,
-                             cmd_mutable.data(),
-                             nullptr,
-                             nullptr,
-                             FALSE,
-                             flags,
-                             nullptr,
-                             nullptr,
-                             &si,
-                             &pi);
-    if (!ok) {
-        DWORD err = GetLastError();
-        char msg[128];
-        _snprintf_s(msg, sizeof(msg), _TRUNCATE, "createprocess_failed code=%lu", err);
-        diag::log_tagged_fmt("browser", "launch createprocess_failed code=%lu", err);
-        set_err(msg);
+    const uint64_t probe_start_ms = now_ms();
+    diag::log_tagged_fmt("browser", "launch camoufox_probe_begin profile=%s proxy=%s", profile_path.c_str(), proxy_url(effective).c_str());
+    camoufox::install::status_t install_status = camoufox::install::probe();
+    diag::log_tagged_fmt("browser", "launch camoufox_probe_done elapsed_ms=%llu state=%s python=%s module=%s browser=%s message=%s",
+        static_cast<unsigned long long>(now_ms() - probe_start_ms),
+        install_state_name(install_status.state),
+        install_status.python_path.empty() ? "<empty>" : install_status.python_path.c_str(),
+        install_status.module_version.empty() ? "<empty>" : install_status.module_version.c_str(),
+        install_status.browser_path.empty() ? "<empty>" : install_status.browser_path.c_str(),
+        install_status.last_message.empty() ? "<empty>" : install_status.last_message.c_str());
+    if (!camoufox_install_ready(install_status)) {
+        std::string err = dependency_summary(install_status);
+        set_err(err);
+        diag::log_tagged_fmt("browser", "launch fail_closed dependency_missing elapsed_ms=%llu reason=%s",
+            static_cast<unsigned long long>(now_ms() - launch_start_ms), err.c_str());
         return false;
     }
 
-    out_pid = static_cast<uint32_t>(pi.dwProcessId);
-    diag::log_tagged_fmt("browser", "launch createprocess_ok pid=%u", out_pid);
+    camoufox::launch_config_t bridge_cfg;
+    bridge_cfg.headless = false;
+    bridge_cfg.proxy = proxy_url(effective);
+    bridge_cfg.python_executable = install_status.python_path;
+    bridge_cfg.launch_timeout_ms = 35000;
+    bridge_cfg.window_width = 1280;
+    bridge_cfg.window_height = 900;
 
+    diag::log_tagged_fmt("browser", "launch camoufox_start_bridge args headless=%d proxy=%s python=%s module=%s timeout_ms=%d window=%dx%d resolved_browser=%s profile=%s",
+        static_cast<int>(bridge_cfg.headless), bridge_cfg.proxy.c_str(),
+        bridge_cfg.python_executable.c_str(), bridge_cfg.server_module.c_str(),
+        bridge_cfg.launch_timeout_ms, bridge_cfg.window_width, bridge_cfg.window_height,
+        install_status.browser_path.c_str(), profile_path.c_str());
+    bool started = camoufox::start_bridge(bridge_cfg);
+    camoufox::bridge_status_t bridge_status = camoufox::get_status();
+    diag::log_tagged_fmt("browser", "launch camoufox_start_bridge_done ok=%d elapsed_ms=%llu state=%s child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d active_url_len=%zu last_error=%s",
+        static_cast<int>(started), static_cast<unsigned long long>(now_ms() - launch_start_ms),
+        bridge_state_name(bridge_status.state), static_cast<unsigned long>(bridge_status.child_pid),
+        static_cast<int>(bridge_status.child_alive), static_cast<int>(bridge_status.browser_open),
+        static_cast<int>(bridge_status.page_verified), static_cast<int>(bridge_status.cleanup_pending),
+        bridge_status.active_page_url.size(),
+        bridge_status.last_error.empty() ? "<empty>" : bridge_status.last_error.c_str());
+    if (!started || bridge_status.child_pid == 0 || !bridge_status.child_alive || !bridge_status.browser_open || !bridge_status.page_verified) {
+        std::string err = bridge_status.last_error.empty() ? std::string("camoufox bridge did not become ready") : bridge_status.last_error;
+        set_err(err);
+        diag::log_tagged_fmt("browser", "launch fail_closed bridge_not_ready state=%s child_pid=%lu child_alive=%d browser_open=%d page_verified=%d err=%s",
+            bridge_state_name(bridge_status.state), static_cast<unsigned long>(bridge_status.child_pid),
+            static_cast<int>(bridge_status.child_alive), static_cast<int>(bridge_status.browser_open),
+            static_cast<int>(bridge_status.page_verified), err.c_str());
+        return false;
+    }
+
+    if (!effective.initial_url.empty() && effective.initial_url != "about:blank") {
+        diag::log_tagged_fmt("browser", "launch initial_navigation_begin child_pid=%lu url_len=%zu",
+            static_cast<unsigned long>(bridge_status.child_pid), effective.initial_url.size());
+        bool nav_ok = camoufox::navigate(effective.initial_url, std::string("load"), 30000);
+        bridge_status = camoufox::get_status();
+        diag::log_tagged_fmt("browser", "launch initial_navigation_done ok=%d state=%s child_pid=%lu child_alive=%d browser_open=%d page_verified=%d active_url_len=%zu nav_ms=%llu err=%s",
+            static_cast<int>(nav_ok), bridge_state_name(bridge_status.state),
+            static_cast<unsigned long>(bridge_status.child_pid), static_cast<int>(bridge_status.child_alive),
+            static_cast<int>(bridge_status.browser_open), static_cast<int>(bridge_status.page_verified),
+            bridge_status.active_page_url.size(), static_cast<unsigned long long>(bridge_status.last_nav_ms),
+            bridge_status.last_error.empty() ? "<empty>" : bridge_status.last_error.c_str());
+        if (!nav_ok || !bridge_status.child_alive || !bridge_status.browser_open || !bridge_status.page_verified) {
+            std::string err = bridge_status.last_error.empty() ? std::string("camoufox initial navigation failed") : bridge_status.last_error;
+            set_err(err);
+            return false;
+        }
+    }
+
+    out_pid = bridge_status.child_pid;
     tracked_pid_t rec;
     rec.pid = out_pid;
-    rec.browser_path = browser_path;
+    rec.browser_path = install_status.browser_path.empty() ? std::string("Camoufox") : install_status.browser_path;
     rec.profile_path = profile_path;
     rec.proxy_port = effective.proxy_port;
-    rec.launched_ms = now_ms();
+    rec.launched_ms = bridge_status.launched_ms != 0 ? bridge_status.launched_ms : now_ms();
     rec.certificate_strategy = effective.certificate_strategy;
     rec.spki_hash_prefix = spki_hash_prefix(effective.spki_allowlist);
 
     {
         std::lock_guard<std::mutex> lk(st.mtx);
+        st.tracked.erase(std::remove_if(st.tracked.begin(), st.tracked.end(),
+                                        [out_pid](const tracked_pid_t& r) { return r.pid == out_pid; }),
+                         st.tracked.end());
         st.tracked.push_back(rec);
     }
 
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-
-    diag::log_tagged("burp_browser", "launched");
-    diag::log_tagged_fmt("browser", "launch ok pid=%u browser=%s", out_pid, browser_path.c_str());
+    set_err(std::string());
+    diag::log_tagged("burp_browser", "camoufox launched");
+    diag::log_tagged_fmt("browser", "launch ok policy=camoufox_only bridge_pid=%u profile=%s proxy_port=%u elapsed_ms=%llu active_url_len=%zu title_len=%zu",
+        out_pid, profile_path.c_str(), static_cast<unsigned>(effective.proxy_port),
+        static_cast<unsigned long long>(now_ms() - launch_start_ms),
+        bridge_status.active_page_url.size(), bridge_status.active_page_title.size());
     return true;
 }
 
 bool kill(uint32_t pid)
 {
-    diag::log_tagged_fmt("browser", "kill entry pid=%u", pid);
+    diag::log_tagged_fmt("browser", "kill entry policy=camoufox_only pid=%u", pid);
     if (pid == 0) {
         diag::log_tagged_fmt("browser", "kill pid_zero rejected");
+        set_err("kill_pid_zero");
         return false;
     }
-    HANDLE h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, static_cast<DWORD>(pid));
-    if (!h) {
-        diag::log_tagged_fmt("browser", "kill open_process_failed pid=%u", pid);
-        set_err("kill_open_failed");
-        return false;
-    }
-    BOOL ok = TerminateProcess(h, 0);
-    if (ok) WaitForSingleObject(h, 2000);
-    CloseHandle(h);
-    diag::log_tagged_fmt("browser", "kill terminate_result=%d pid=%u", static_cast<int>(ok != 0), pid);
 
-    auto& st = s();
+    camoufox::bridge_status_t bridge_status = camoufox::get_status();
+    diag::log_tagged_fmt("browser", "kill camoufox_snapshot state=%s child_pid=%lu child_alive=%d browser_open=%d cleanup_pending=%d requested_pid=%u",
+        bridge_state_name(bridge_status.state), static_cast<unsigned long>(bridge_status.child_pid),
+        static_cast<int>(bridge_status.child_alive), static_cast<int>(bridge_status.browser_open),
+        static_cast<int>(bridge_status.cleanup_pending), pid);
+    if (bridge_status.child_pid != pid) {
+        auto& st = s();
+        {
+            std::lock_guard<std::mutex> lk(st.mtx);
+            st.tracked.erase(std::remove_if(st.tracked.begin(), st.tracked.end(),
+                                            [pid](const tracked_pid_t& r) { return r.pid == pid; }),
+                             st.tracked.end());
+        }
+        set_err("camoufox_pid_not_active");
+        diag::log_tagged_fmt("browser", "kill rejected pid_not_active requested_pid=%u active_child_pid=%lu",
+            pid, static_cast<unsigned long>(bridge_status.child_pid));
+        return false;
+    }
+
+    bool ok = camoufox::stop_bridge();
+    auto after = camoufox::get_status();
     {
+        auto& st = s();
         std::lock_guard<std::mutex> lk(st.mtx);
         st.tracked.erase(std::remove_if(st.tracked.begin(), st.tracked.end(),
                                         [pid](const tracked_pid_t& r) { return r.pid == pid; }),
-                        st.tracked.end());
+                         st.tracked.end());
     }
-    return ok != 0;
+    if (!ok) {
+        std::string err = after.last_error.empty() ? camoufox::last_error() : after.last_error;
+        if (err.empty()) err = "camoufox_stop_failed";
+        set_err(err);
+    } else {
+        set_err(std::string());
+    }
+    diag::log_tagged_fmt("browser", "kill camoufox_stop_result ok=%d requested_pid=%u after_state=%s after_child_pid=%lu cleanup_pending=%d err=%s",
+        static_cast<int>(ok), pid, bridge_state_name(after.state), static_cast<unsigned long>(after.child_pid),
+        static_cast<int>(after.cleanup_pending), after.last_error.empty() ? "<empty>" : after.last_error.c_str());
+    return ok;
 }
 
 bool kill_all()
 {
-    diag::log_tagged_fmt("browser", "kill_all entry");
+    diag::log_tagged_fmt("browser", "kill_all entry policy=camoufox_only");
+    camoufox::bridge_status_t before = camoufox::get_status();
+    diag::log_tagged_fmt("browser", "kill_all camoufox_snapshot state=%s child_pid=%lu child_alive=%d browser_open=%d cleanup_pending=%d",
+        bridge_state_name(before.state), static_cast<unsigned long>(before.child_pid),
+        static_cast<int>(before.child_alive), static_cast<int>(before.browser_open),
+        static_cast<int>(before.cleanup_pending));
+
+    bool ok = true;
+    if (before.child_pid != 0 || before.state != camoufox::bridge_state_t::stopped || before.cleanup_pending)
+        ok = camoufox::stop_bridge();
+
     auto& st = s();
-    std::vector<uint32_t> pids;
+    size_t cleared = 0;
     {
         std::lock_guard<std::mutex> lk(st.mtx);
-        pids.reserve(st.tracked.size());
-        for (const auto& r : st.tracked) pids.push_back(r.pid);
+        cleared = st.tracked.size();
+        st.tracked.clear();
     }
-    diag::log_tagged_fmt("browser", "kill_all killing count=%zu", pids.size());
-    bool all_ok = true;
-    for (uint32_t pid : pids) {
-        if (!kill(pid)) all_ok = false;
+    camoufox::bridge_status_t after = camoufox::get_status();
+    if (!ok) {
+        std::string err = after.last_error.empty() ? camoufox::last_error() : after.last_error;
+        if (err.empty()) err = "camoufox_stop_failed";
+        set_err(err);
+    } else {
+        set_err(std::string());
     }
-    diag::log_tagged_fmt("browser", "kill_all done all_ok=%d", static_cast<int>(all_ok));
-    return all_ok;
+    diag::log_tagged_fmt("browser", "kill_all done ok=%d cleared_tracked=%zu after_state=%s after_child_pid=%lu cleanup_pending=%d err=%s",
+        static_cast<int>(ok), cleared, bridge_state_name(after.state), static_cast<unsigned long>(after.child_pid),
+        static_cast<int>(after.cleanup_pending), after.last_error.empty() ? "<empty>" : after.last_error.c_str());
+    return ok;
 }
 
 void register_browser_pid(uint32_t pid)
 {
-    diag::log_tagged_fmt("browser", "register_browser_pid entry pid=%u", pid);
+    diag::log_tagged_fmt("browser", "register_browser_pid entry policy=camoufox_only pid=%u", pid);
     if (pid == 0) {
         diag::log_tagged_fmt("browser", "register_browser_pid pid_zero rejected");
+        return;
+    }
+    camoufox::bridge_status_t bridge_status = camoufox::get_status();
+    if (bridge_status.child_pid != pid || !bridge_status.child_alive) {
+        diag::log_tagged_fmt("browser", "register_browser_pid rejected non_camoufox pid=%u active_child_pid=%lu child_alive=%d",
+            pid, static_cast<unsigned long>(bridge_status.child_pid), static_cast<int>(bridge_status.child_alive));
         return;
     }
     auto& st = s();
@@ -642,52 +668,83 @@ void register_browser_pid(uint32_t pid)
     }
     tracked_pid_t rec;
     rec.pid = pid;
-    rec.launched_ms = now_ms();
+    rec.browser_path = "Camoufox";
+    rec.profile_path = compute_profile_path("BurpBrowser");
+    rec.launched_ms = bridge_status.launched_ms != 0 ? bridge_status.launched_ms : now_ms();
     st.tracked.push_back(rec);
-    diag::log_tagged_fmt("browser", "register_browser_pid registered pid=%u total=%zu", pid, st.tracked.size());
+    diag::log_tagged_fmt("browser", "register_browser_pid registered_camoufox pid=%u total=%zu", pid, st.tracked.size());
 }
 
 std::vector<browser_status_t> list_running()
 {
-    diag::log_tagged_fmt("browser", "list_running entry");
+    diag::log_tagged_fmt("browser", "list_running entry policy=camoufox_only");
     auto& st = s();
     std::vector<tracked_pid_t> snapshot;
     {
         std::lock_guard<std::mutex> lk(st.mtx);
         snapshot = st.tracked;
     }
+
+    camoufox::bridge_status_t bridge_status = camoufox::get_status();
+    diag::log_tagged_fmt("browser", "list_running camoufox_snapshot state=%s child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d tracked=%zu err=%s",
+        bridge_state_name(bridge_status.state), static_cast<unsigned long>(bridge_status.child_pid),
+        static_cast<int>(bridge_status.child_alive), static_cast<int>(bridge_status.browser_open),
+        static_cast<int>(bridge_status.page_verified), static_cast<int>(bridge_status.cleanup_pending),
+        snapshot.size(), bridge_status.last_error.empty() ? "<empty>" : bridge_status.last_error.c_str());
+
     std::vector<browser_status_t> out;
-    out.reserve(snapshot.size());
-    std::vector<uint32_t> to_remove;
-    for (const auto& r : snapshot) {
-        browser_status_t s;
-        s.pid = r.pid;
-        s.browser_path = r.browser_path;
-        s.profile_path = r.profile_path;
-        s.proxy_port = r.proxy_port;
-        s.launched_ms = r.launched_ms;
-        s.certificate_strategy = r.certificate_strategy;
-        s.spki_hash_prefix = r.spki_hash_prefix;
-        s.running = is_process_alive(r.pid);
-        if (!s.running) {
-            diag::log_tagged_fmt("browser", "list_running dead_process pid=%u removing", r.pid);
-            to_remove.push_back(r.pid);
-        } else {
-            diag::log_tagged_fmt("browser", "list_running alive pid=%u", r.pid);
+    if (bridge_status.child_pid == 0 || !bridge_status.child_alive || bridge_status.cleanup_pending) {
+        size_t removed = 0;
+        {
+            std::lock_guard<std::mutex> lk(st.mtx);
+            removed = st.tracked.size();
+            st.tracked.clear();
         }
-        out.push_back(s);
+        diag::log_tagged_fmt("browser", "list_running no_live_camoufox removed_tracked=%zu result_count=0", removed);
+        return out;
     }
-    if (!to_remove.empty()) {
+
+    tracked_pid_t tracked;
+    bool have_tracked = false;
+    for (const auto& r : snapshot) {
+        if (r.pid == bridge_status.child_pid) {
+            tracked = r;
+            have_tracked = true;
+            break;
+        }
+    }
+
+    browser_status_t item;
+    item.running = true;
+    item.pid = bridge_status.child_pid;
+    item.browser_path = have_tracked && !tracked.browser_path.empty() ? tracked.browser_path : std::string("Camoufox");
+    item.profile_path = have_tracked && !tracked.profile_path.empty() ? tracked.profile_path : compute_profile_path("BurpBrowser");
+    item.proxy_port = have_tracked ? tracked.proxy_port : 0;
+    item.launched_ms = bridge_status.launched_ms != 0 ? bridge_status.launched_ms : tracked.launched_ms;
+    item.certificate_strategy = have_tracked ? tracked.certificate_strategy : certificate_strategy_t::chromium_spki_allowlist;
+    item.spki_hash_prefix = have_tracked ? tracked.spki_hash_prefix : std::string();
+    out.push_back(item);
+
+    {
         std::lock_guard<std::mutex> lk(st.mtx);
         st.tracked.erase(std::remove_if(st.tracked.begin(), st.tracked.end(),
-                                        [&to_remove](const tracked_pid_t& r) {
-                                            for (uint32_t p : to_remove) if (p == r.pid) return true;
-                                            return false;
-                                        }),
+                                        [&bridge_status](const tracked_pid_t& r) { return r.pid != bridge_status.child_pid; }),
                          st.tracked.end());
+        if (!have_tracked) {
+            tracked_pid_t rec;
+            rec.pid = item.pid;
+            rec.browser_path = item.browser_path;
+            rec.profile_path = item.profile_path;
+            rec.proxy_port = item.proxy_port;
+            rec.launched_ms = item.launched_ms;
+            rec.certificate_strategy = item.certificate_strategy;
+            rec.spki_hash_prefix = item.spki_hash_prefix;
+            st.tracked.push_back(rec);
+        }
     }
-    diag::log_tagged_fmt("browser", "list_running result count=%zu dead_removed=%zu",
-        out.size(), to_remove.size());
+
+    diag::log_tagged_fmt("browser", "list_running result count=%zu bridge_pid=%u profile=%s proxy_port=%u",
+        out.size(), static_cast<unsigned>(item.pid), item.profile_path.c_str(), static_cast<unsigned>(item.proxy_port));
     return out;
 }
 

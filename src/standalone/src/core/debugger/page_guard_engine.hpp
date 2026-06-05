@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -75,6 +76,31 @@ struct remote_call_state_t {
 
 static_assert(sizeof(remote_call_state_t) == 48, "remote_call_state_t layout mismatch");
 
+static inline void log_remote_region(HANDLE process,
+                                     const char* label,
+                                     uint32_t pid,
+                                     const char* phase,
+                                     const void* address)
+{
+    MEMORY_BASIC_INFORMATION mbi{};
+    SIZE_T got = VirtualQueryEx(process, address, &mbi, sizeof(mbi));
+    DWORD err = got == sizeof(mbi) ? 0 : GetLastError();
+    diag::log_tagged_fmt("pg_sniff",
+        "remote_thread_call_region label=%s pid=%u phase=%s addr=%p query=%llu base=%p alloc_base=%p size=0x%llX state=0x%08lX protect=0x%08lX type=0x%08lX err=%lu",
+        label ? label : "",
+        pid,
+        phase ? phase : "",
+        address,
+        static_cast<unsigned long long>(got),
+        got == sizeof(mbi) ? mbi.BaseAddress : nullptr,
+        got == sizeof(mbi) ? mbi.AllocationBase : nullptr,
+        got == sizeof(mbi) ? static_cast<unsigned long long>(mbi.RegionSize) : 0ULL,
+        got == sizeof(mbi) ? static_cast<unsigned long>(mbi.State) : 0UL,
+        got == sizeof(mbi) ? static_cast<unsigned long>(mbi.Protect) : 0UL,
+        got == sizeof(mbi) ? static_cast<unsigned long>(mbi.Type) : 0UL,
+        static_cast<unsigned long>(err));
+}
+
 static inline uint64_t remote_thread_call(uint32_t pid,
                                           uint64_t function_address,
                                           uint64_t arg1,
@@ -84,8 +110,27 @@ static inline uint64_t remote_thread_call(uint32_t pid,
                                           DWORD timeout_ms = 5000,
                                           const char* label = "remote_call")
 {
-    if (pid == 0 || function_address == 0)
+    const ULONGLONG call_start = GetTickCount64();
+    diag::log_tagged_fmt("pg_sniff",
+        "remote_thread_call_entry label=%s pid=%u fn=0x%llX arg1=0x%llX arg2=0x%llX arg3=0x%llX arg4=0x%llX timeout_ms=%lu caller_tid=%lu tick=%llu",
+        label ? label : "",
+        pid,
+        static_cast<unsigned long long>(function_address),
+        static_cast<unsigned long long>(arg1),
+        static_cast<unsigned long long>(arg2),
+        static_cast<unsigned long long>(arg3),
+        static_cast<unsigned long long>(arg4),
+        static_cast<unsigned long>(timeout_ms),
+        static_cast<unsigned long>(GetCurrentThreadId()),
+        static_cast<unsigned long long>(call_start));
+    if (pid == 0 || function_address == 0) {
+        diag::log_tagged_fmt("pg_sniff",
+            "remote_thread_call_reject label=%s pid=%u fn=0x%llX",
+            label ? label : "",
+            pid,
+            static_cast<unsigned long long>(function_address));
         return 0;
+    }
 
     HANDLE process = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_LIMITED_INFORMATION |
                                  PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ,
@@ -95,6 +140,16 @@ static inline uint64_t remote_thread_call(uint32_t pid,
             label ? label : "", pid, static_cast<unsigned long>(GetLastError()));
         return 0;
     }
+    DWORD process_exit = STILL_ACTIVE;
+    BOOL process_exit_ok = GetExitCodeProcess(process, &process_exit);
+    diag::log_tagged_fmt("pg_sniff",
+        "remote_thread_call_open_ok label=%s pid=%u process=%p exit_ok=%d exit=0x%08lX elapsed_ms=%llu",
+        label ? label : "",
+        pid,
+        process,
+        process_exit_ok ? 1 : 0,
+        static_cast<unsigned long>(process_exit),
+        static_cast<unsigned long long>(GetTickCount64() - call_start));
 
     static const uint8_t kStub[] = {
         0x53,
@@ -121,6 +176,15 @@ static inline uint64_t remote_thread_call(uint32_t pid,
 
     LPVOID remote_state = VirtualAllocEx(process, nullptr, sizeof(state), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     LPVOID remote_code = VirtualAllocEx(process, nullptr, sizeof(kStub), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    diag::log_tagged_fmt("pg_sniff",
+        "remote_thread_call_alloc_result label=%s pid=%u state=%p state_size=%llu code=%p code_size=%llu elapsed_ms=%llu",
+        label ? label : "",
+        pid,
+        remote_state,
+        static_cast<unsigned long long>(sizeof(state)),
+        remote_code,
+        static_cast<unsigned long long>(sizeof(kStub)),
+        static_cast<unsigned long long>(GetTickCount64() - call_start));
     if (!remote_state || !remote_code) {
         diag::log_tagged_fmt("pg_sniff", "remote_thread_call_alloc_failed label=%s pid=%u state=%p code=%p err=%lu",
             label ? label : "", pid, remote_state, remote_code, static_cast<unsigned long>(GetLastError()));
@@ -131,30 +195,61 @@ static inline uint64_t remote_thread_call(uint32_t pid,
         CloseHandle(process);
         return 0;
     }
+    log_remote_region(process, label, pid, "state_after_alloc", remote_state);
+    log_remote_region(process, label, pid, "code_after_alloc", remote_code);
 
     SIZE_T wrote_state = 0;
     SIZE_T wrote_code = 0;
-    BOOL wrote_ok = WriteProcessMemory(process, remote_state, &state, sizeof(state), &wrote_state) &&
-                    WriteProcessMemory(process, remote_code, kStub, sizeof(kStub), &wrote_code);
+    SetLastError(0);
+    BOOL wrote_state_ok = WriteProcessMemory(process, remote_state, &state, sizeof(state), &wrote_state);
+    DWORD wrote_state_err = wrote_state_ok ? 0 : GetLastError();
+    SetLastError(0);
+    BOOL wrote_code_ok = WriteProcessMemory(process, remote_code, kStub, sizeof(kStub), &wrote_code);
+    DWORD wrote_code_err = wrote_code_ok ? 0 : GetLastError();
+    BOOL wrote_ok = wrote_state_ok && wrote_code_ok;
     DWORD old_protect = 0;
+    SetLastError(0);
     BOOL protect_ok = wrote_ok && VirtualProtectEx(process, remote_code, sizeof(kStub), PAGE_EXECUTE_READ, &old_protect);
+    DWORD protect_err = protect_ok ? 0 : GetLastError();
+    diag::log_tagged_fmt("pg_sniff",
+        "remote_thread_call_write_protect label=%s pid=%u wrote_state_ok=%d wrote_state=%llu wrote_state_err=%lu wrote_code_ok=%d wrote_code=%llu wrote_code_err=%lu protect_ok=%d old_protect=0x%08lX protect_err=%lu elapsed_ms=%llu",
+        label ? label : "",
+        pid,
+        wrote_state_ok ? 1 : 0,
+        static_cast<unsigned long long>(wrote_state),
+        static_cast<unsigned long>(wrote_state_err),
+        wrote_code_ok ? 1 : 0,
+        static_cast<unsigned long long>(wrote_code),
+        static_cast<unsigned long>(wrote_code_err),
+        protect_ok ? 1 : 0,
+        static_cast<unsigned long>(old_protect),
+        static_cast<unsigned long>(protect_err),
+        static_cast<unsigned long long>(GetTickCount64() - call_start));
+    log_remote_region(process, label, pid, "code_after_protect", remote_code);
     if (!wrote_ok || !protect_ok || wrote_state != sizeof(state) || wrote_code != sizeof(kStub)) {
         diag::log_tagged_fmt("pg_sniff", "remote_thread_call_write_failed label=%s pid=%u wrote_state=%llu wrote_code=%llu protect_ok=%d err=%lu",
             label ? label : "", pid,
             static_cast<unsigned long long>(wrote_state),
             static_cast<unsigned long long>(wrote_code),
             protect_ok ? 1 : 0,
-            static_cast<unsigned long>(GetLastError()));
+            static_cast<unsigned long>(protect_err != 0 ? protect_err : (wrote_state_err != 0 ? wrote_state_err : wrote_code_err)));
         VirtualFreeEx(process, remote_code, 0, MEM_RELEASE);
         VirtualFreeEx(process, remote_state, 0, MEM_RELEASE);
         CloseHandle(process);
         return 0;
     }
 
-    FlushInstructionCache(process, remote_code, sizeof(kStub));
+    BOOL flush_ok = FlushInstructionCache(process, remote_code, sizeof(kStub));
+    diag::log_tagged_fmt("pg_sniff",
+        "remote_thread_call_flush label=%s pid=%u ok=%d elapsed_ms=%llu",
+        label ? label : "",
+        pid,
+        flush_ok ? 1 : 0,
+        static_cast<unsigned long long>(GetTickCount64() - call_start));
+    DWORD remote_tid = 0;
     HANDLE thread = CreateRemoteThread(process, nullptr, 0,
         reinterpret_cast<LPTHREAD_START_ROUTINE>(remote_code),
-        remote_state, 0, nullptr);
+        remote_state, 0, &remote_tid);
     if (!thread) {
         diag::log_tagged_fmt("pg_sniff", "remote_thread_call_create_failed label=%s pid=%u err=%lu",
             label ? label : "", pid, static_cast<unsigned long>(GetLastError()));
@@ -163,40 +258,105 @@ static inline uint64_t remote_thread_call(uint32_t pid,
         CloseHandle(process);
         return 0;
     }
+    diag::log_tagged_fmt("pg_sniff",
+        "remote_thread_call_thread_created label=%s pid=%u remote_tid=%lu thread=%p elapsed_ms=%llu",
+        label ? label : "",
+        pid,
+        static_cast<unsigned long>(remote_tid),
+        thread,
+        static_cast<unsigned long long>(GetTickCount64() - call_start));
 
+    const ULONGLONG wait_start = GetTickCount64();
+    diag::log_tagged_fmt("pg_sniff",
+        "remote_thread_call_wait_begin label=%s pid=%u remote_tid=%lu timeout_ms=%lu elapsed_ms=%llu",
+        label ? label : "",
+        pid,
+        static_cast<unsigned long>(remote_tid),
+        static_cast<unsigned long>(timeout_ms),
+        static_cast<unsigned long long>(wait_start - call_start));
     DWORD wait = WaitForSingleObject(thread, timeout_ms);
+    const ULONGLONG wait_elapsed = GetTickCount64() - wait_start;
     if (wait != WAIT_OBJECT_0) {
-        diag::log_tagged_fmt("pg_sniff", "remote_thread_call_timeout label=%s pid=%u wait=0x%08lX",
-            label ? label : "", pid, static_cast<unsigned long>(wait));
+        DWORD thread_exit = STILL_ACTIVE;
+        GetExitCodeThread(thread, &thread_exit);
+        DWORD after_exit = STILL_ACTIVE;
+        BOOL after_exit_ok = GetExitCodeProcess(process, &after_exit);
+        diag::log_tagged_fmt("pg_sniff", "remote_thread_call_timeout label=%s pid=%u remote_tid=%lu wait=0x%08lX wait_elapsed_ms=%llu thread_exit=0x%08lX process_exit_ok=%d process_exit=0x%08lX total_elapsed_ms=%llu",
+            label ? label : "",
+            pid,
+            static_cast<unsigned long>(remote_tid),
+            static_cast<unsigned long>(wait),
+            static_cast<unsigned long long>(wait_elapsed),
+            static_cast<unsigned long>(thread_exit),
+            after_exit_ok ? 1 : 0,
+            static_cast<unsigned long>(after_exit),
+            static_cast<unsigned long long>(GetTickCount64() - call_start));
         CloseHandle(thread);
         CloseHandle(process);
         return 0;
     }
+    diag::log_tagged_fmt("pg_sniff",
+        "remote_thread_call_wait_done label=%s pid=%u remote_tid=%lu wait_elapsed_ms=%llu total_elapsed_ms=%llu",
+        label ? label : "",
+        pid,
+        static_cast<unsigned long>(remote_tid),
+        static_cast<unsigned long long>(wait_elapsed),
+        static_cast<unsigned long long>(GetTickCount64() - call_start));
 
     SIZE_T read = 0;
     remote_call_state_t out_state{};
+    SetLastError(0);
     BOOL read_ok = ReadProcessMemory(process, remote_state, &out_state, sizeof(out_state), &read);
+    DWORD read_err = read_ok ? 0 : GetLastError();
     DWORD exit_code = 0;
-    GetExitCodeThread(thread, &exit_code);
+    BOOL exit_ok = GetExitCodeThread(thread, &exit_code);
+    diag::log_tagged_fmt("pg_sniff",
+        "remote_thread_call_read_exit label=%s pid=%u remote_tid=%lu read_ok=%d read=%llu read_err=%lu exit_ok=%d exit=0x%08lX result=0x%llX elapsed_ms=%llu",
+        label ? label : "",
+        pid,
+        static_cast<unsigned long>(remote_tid),
+        read_ok ? 1 : 0,
+        static_cast<unsigned long long>(read),
+        static_cast<unsigned long>(read_err),
+        exit_ok ? 1 : 0,
+        static_cast<unsigned long>(exit_code),
+        static_cast<unsigned long long>(out_state.result),
+        static_cast<unsigned long long>(GetTickCount64() - call_start));
     CloseHandle(thread);
-    VirtualFreeEx(process, remote_code, 0, MEM_RELEASE);
-    VirtualFreeEx(process, remote_state, 0, MEM_RELEASE);
+    SetLastError(0);
+    BOOL free_code_ok = VirtualFreeEx(process, remote_code, 0, MEM_RELEASE);
+    DWORD free_code_err = free_code_ok ? 0 : GetLastError();
+    SetLastError(0);
+    BOOL free_state_ok = VirtualFreeEx(process, remote_state, 0, MEM_RELEASE);
+    DWORD free_state_err = free_state_ok ? 0 : GetLastError();
+    diag::log_tagged_fmt("pg_sniff",
+        "remote_thread_call_free label=%s pid=%u code=%p free_code_ok=%d free_code_err=%lu state=%p free_state_ok=%d free_state_err=%lu elapsed_ms=%llu",
+        label ? label : "",
+        pid,
+        remote_code,
+        free_code_ok ? 1 : 0,
+        static_cast<unsigned long>(free_code_err),
+        remote_state,
+        free_state_ok ? 1 : 0,
+        static_cast<unsigned long>(free_state_err),
+        static_cast<unsigned long long>(GetTickCount64() - call_start));
     CloseHandle(process);
 
     if (!read_ok || read != sizeof(out_state)) {
         diag::log_tagged_fmt("pg_sniff", "remote_thread_call_read_failed label=%s pid=%u read=%llu err=%lu",
             label ? label : "", pid,
             static_cast<unsigned long long>(read),
-            static_cast<unsigned long>(GetLastError()));
+            static_cast<unsigned long>(read_err));
         return 0;
     }
 
-    diag::log_tagged_fmt("pg_sniff", "remote_thread_call_done label=%s pid=%u fn=0x%llX result=0x%llX exit=0x%08lX",
+    diag::log_tagged_fmt("pg_sniff", "remote_thread_call_done label=%s pid=%u fn=0x%llX result=0x%llX exit=0x%08lX total_elapsed_ms=%llu",
         label ? label : "",
         pid,
         static_cast<unsigned long long>(function_address),
         static_cast<unsigned long long>(out_state.result),
-        static_cast<unsigned long>(exit_code));
+        static_cast<unsigned long>(exit_code),
+        static_cast<unsigned long long>(GetTickCount64() - call_start));
     return out_state.result;
 }
 

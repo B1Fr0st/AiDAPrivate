@@ -52,6 +52,11 @@ struct report_t
     bool disk_vm_string_hit;
     bool edid_vm_manufacturer_hit;
     bool hv_interface_signature_mismatch;
+    bool hidden_hypervisor_suspected;
+    bool cpuid_leaf_inconsistent;
+    bool tsc_qpc_unstable;
+    bool synthetic_hv_behavior;
+    bool hyperv_guest_partition;
 };
 
 namespace detail {
@@ -91,6 +96,18 @@ constexpr ULONG kSystemIsolatedUserModeInformation = 165;
 constexpr ULONG kCodeIntegrityEnabled = 0x01;
 constexpr ULONG kCodeIntegrityTestSign = 0x02;
 constexpr ULONG kCodeIntegrityHvciKmciEnabled = 0x400;
+constexpr uint32_t kPolicyVersion = 0x20260605u;
+constexpr uint32_t kArtifactFirmware = 1u << 0;
+constexpr uint32_t kArtifactProcess = 1u << 1;
+constexpr uint32_t kArtifactNvram = 1u << 2;
+constexpr uint32_t kArtifactDisk = 1u << 3;
+constexpr uint32_t kArtifactEdid = 1u << 4;
+constexpr uint32_t kContradictionHiddenHv = 1u << 0;
+constexpr uint32_t kContradictionCpuidLeaf = 1u << 1;
+constexpr uint32_t kContradictionTscQpc = 1u << 2;
+constexpr uint32_t kContradictionSyntheticHv = 1u << 3;
+constexpr uint32_t kContradictionHvInterface = 1u << 4;
+constexpr uint32_t kContradictionHvGuest = 1u << 5;
 
 inline NtQuerySystemInformation_t resolve_nt_query()
 {
@@ -250,14 +267,61 @@ inline bool devmode_bypass_set()
 inline bool read_cpuid_hv_bit()
 {
     int regs[4] = {};
-    __cpuid(regs, 1);
+    __try
+    {
+        __cpuid(regs, 1);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
     return (regs[2] & (1 << 31)) != 0;
+}
+
+inline bool safe_cpuidex(int regs[4], int leaf, int subleaf)
+{
+    std::memset(regs, 0, sizeof(int) * 4);
+    __try
+    {
+        __cpuidex(regs, leaf, subleaf);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        std::memset(regs, 0, sizeof(int) * 4);
+        return false;
+    }
+}
+
+inline bool safe_rdtscp(unsigned long long& value, unsigned int& aux)
+{
+    value = 0;
+    aux = 0;
+    __try
+    {
+        value = __rdtscp(&aux);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        value = 0;
+        aux = 0;
+        return false;
+    }
 }
 
 inline void read_hv_vendor(char out12[12])
 {
     int regs[4] = {};
-    __cpuid(regs, 0x40000000);
+    std::memset(out12, 0, 12);
+    __try
+    {
+        __cpuid(regs, 0x40000000);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return;
+    }
     std::memcpy(out12 + 0, &regs[1], 4);
     std::memcpy(out12 + 4, &regs[2], 4);
     std::memcpy(out12 + 8, &regs[3], 4);
@@ -284,6 +348,98 @@ inline bool is_known_non_ms_hv(const char v[12])
     for (const char* k : known)
         if (std::memcmp(v, k, 12) == 0) return true;
     return false;
+}
+
+inline bool hypervisor_leaf_present(char out12[12], uint32_t& max_leaf)
+{
+    if (out12)
+        std::memset(out12, 0, 12);
+    max_leaf = 0;
+    int regs[4] = {};
+    if (!safe_cpuidex(regs, 0x40000000, 0))
+        return false;
+    max_leaf = static_cast<uint32_t>(regs[0]);
+    char vendor[12] = {};
+    std::memcpy(vendor + 0, &regs[1], 4);
+    std::memcpy(vendor + 4, &regs[2], 4);
+    std::memcpy(vendor + 8, &regs[3], 4);
+    bool vendor_nonzero = false;
+    bool vendor_printable = true;
+    for (int i = 0; i < 12; ++i)
+    {
+        vendor_nonzero = vendor_nonzero || vendor[i] != 0;
+        unsigned char c = static_cast<unsigned char>(vendor[i]);
+        if (c != 0 && (c < 0x20 || c > 0x7E))
+            vendor_printable = false;
+    }
+    if (out12)
+        std::memcpy(out12, vendor, 12);
+    return max_leaf >= 0x40000000u && max_leaf <= 0x4000FFFFu && vendor_nonzero && vendor_printable;
+}
+
+inline bool cpuid_leaf_inconsistent_probe(bool hv_bit_set)
+{
+    char vendor[12] = {};
+    uint32_t max_leaf = 0;
+    const bool leaf_present = hypervisor_leaf_present(vendor, max_leaf);
+    if (!hv_bit_set)
+        return leaf_present;
+    if (!leaf_present)
+        return true;
+    bool vendor_nonzero = false;
+    for (int i = 0; i < 12; ++i)
+        vendor_nonzero = vendor_nonzero || vendor[i] != 0;
+    return !vendor_nonzero || max_leaf < 0x40000001u;
+}
+
+inline bool synthetic_hv_behavior_probe()
+{
+    char vendor[12] = {};
+    uint32_t max_leaf = 0;
+    if (!hypervisor_leaf_present(vendor, max_leaf))
+        return false;
+    int regs[4] = {};
+    if (max_leaf >= 0x40000001u && safe_cpuidex(regs, 0x40000001, 0))
+    {
+        if (static_cast<uint32_t>(regs[0]) == 0x31237648u)
+            return true;
+    }
+    if (max_leaf >= 0x40000003u && safe_cpuidex(regs, 0x40000003, 0))
+    {
+        uint32_t feature_union = static_cast<uint32_t>(regs[0]) |
+            static_cast<uint32_t>(regs[1]) |
+            static_cast<uint32_t>(regs[2]) |
+            static_cast<uint32_t>(regs[3]);
+        if (feature_union != 0)
+            return true;
+    }
+    return false;
+}
+
+inline bool hyperv_guest_partition_probe()
+{
+    int regs[4] = {};
+    if (!safe_cpuidex(regs, 1, 0))
+        return false;
+    if ((regs[2] & (1 << 31)) == 0)
+        return false;
+    if (!safe_cpuidex(regs, 0x40000000, 0))
+        return false;
+    char vendor[12];
+    std::memcpy(vendor + 0, &regs[1], 4);
+    std::memcpy(vendor + 4, &regs[2], 4);
+    std::memcpy(vendor + 8, &regs[3], 4);
+    if (!is_microsoft_hv(vendor))
+        return false;
+    if (!safe_cpuidex(regs, 0x40000001, 0))
+        return false;
+    if (static_cast<uint32_t>(regs[0]) != 0x31237648u)
+        return false;
+    if (!safe_cpuidex(regs, 0x40000003, 0))
+        return false;
+    uint32_t partition_caps = static_cast<uint32_t>(regs[1]);
+    constexpr uint32_t root_bits = (1u << 0) | (1u << 5);
+    return (partition_caps & root_bits) == 0;
 }
 
 inline bool query_code_integrity(ULONG& options_out)
@@ -410,7 +566,14 @@ inline bool scan_vm_processes()
 inline bool cpu_supports_xsave()
 {
     int regs[4] = {};
-    __cpuid(regs, 1);
+    __try
+    {
+        __cpuid(regs, 1);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
     return (regs[2] & (1 << 26)) != 0 && (regs[2] & (1 << 27)) != 0;
 }
 
@@ -419,7 +582,15 @@ inline bool xsetbv_probe()
     if (!cpu_supports_xsave())
         return false;
 
-    unsigned long long xcr0 = _xgetbv(0);
+    unsigned long long xcr0 = 0;
+    __try
+    {
+        xcr0 = _xgetbv(0);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
     if ((xcr0 & 1ULL) == 0)
         return false;
     return false;
@@ -475,10 +646,100 @@ inline uint32_t timing_probe_median()
     return samples[static_cast<size_t>(kSamples / 2)];
 }
 
+inline bool tsc_qpc_stability_probe()
+{
+    LARGE_INTEGER freq{};
+    if (!QueryPerformanceFrequency(&freq) || freq.QuadPart < 1000 || freq.QuadPart > 1000000000LL)
+        return true;
+
+    HANDLE thread = GetCurrentThread();
+    DWORD_PTR previous_mask = 0;
+    DWORD_PTR active_processors = 0;
+    DWORD_PTR system_processors = 0;
+    bool affinity_set = false;
+    if (GetProcessAffinityMask(GetCurrentProcess(), &active_processors, &system_processors) && active_processors != 0)
+    {
+        DWORD_PTR target_mask = active_processors & (~active_processors + 1);
+        DWORD_PTR prev = SetThreadAffinityMask(thread, target_mask);
+        if (prev != 0)
+        {
+            previous_mask = prev;
+            affinity_set = true;
+        }
+    }
+
+    bool probe_failed = false;
+    uint32_t backwards = 0;
+    uint32_t zero_qpc_spans = 0;
+    uint32_t excessive = 0;
+    unsigned long long deltas[128] = {};
+    uint32_t count = 0;
+
+    for (uint32_t i = 0; i < 128; ++i)
+    {
+        LARGE_INTEGER q0{};
+        LARGE_INTEGER q1{};
+        unsigned long long t0 = 0;
+        unsigned long long t1 = 0;
+        unsigned int aux0 = 0;
+        unsigned int aux1 = 0;
+        int regs[4] = {};
+        if (!QueryPerformanceCounter(&q0))
+        {
+            probe_failed = true;
+            break;
+        }
+        if (!safe_rdtscp(t0, aux0))
+        {
+            probe_failed = true;
+            break;
+        }
+        __cpuid(regs, 0);
+        if (!safe_rdtscp(t1, aux1))
+        {
+            probe_failed = true;
+            break;
+        }
+        if (!QueryPerformanceCounter(&q1))
+        {
+            probe_failed = true;
+            break;
+        }
+        if (q1.QuadPart < q0.QuadPart || t1 < t0)
+            ++backwards;
+        if (q1.QuadPart == q0.QuadPart)
+            ++zero_qpc_spans;
+        if (count < 128)
+            deltas[count++] = t1 >= t0 ? t1 - t0 : 0;
+    }
+
+    if (affinity_set)
+        SetThreadAffinityMask(thread, previous_mask);
+
+    if (probe_failed)
+        return true;
+    if (backwards != 0)
+        return true;
+    if (count == 0)
+        return false;
+    std::sort(deltas, deltas + count);
+    unsigned long long median = deltas[count / 2];
+    if (median == 0)
+        return zero_qpc_spans > 96;
+    unsigned long long limit = median * 64ULL + 50000ULL;
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        if (deltas[i] > limit)
+            ++excessive;
+    }
+    return excessive >= 8 || zero_qpc_spans > 120;
+}
+
 inline bool validate_ms_hv_features()
 {
     int regs[4] = {};
-    __cpuid(regs, 0x40000003);
+    if (!safe_cpuidex(regs, 0x40000003, 0))
+        return false;
     constexpr uint32_t kAccessVpRuntime    = 1u << 0;
     constexpr uint32_t kAccessPartRefCount = 1u << 1;
     constexpr uint32_t kAccessSyntheticTimers = 1u << 3;
@@ -823,7 +1084,8 @@ inline bool scan_edid_manufacturer()
 inline bool hv_interface_signature_is_hv1()
 {
     int regs[4] = {};
-    __cpuid(regs, 0x40000001);
+    if (!safe_cpuidex(regs, 0x40000001, 0))
+        return false;
     return static_cast<uint32_t>(regs[0]) == 0x31237648u;
 }
 
@@ -832,19 +1094,103 @@ inline bool hv_interface_signature_is_hv1()
 inline bool g_ms_hv_approved = false;
 inline bool g_hvci_enabled = false;
 inline bool g_vbs_enabled = false;
+inline bool g_hidden_hypervisor_suspected = false;
+inline bool g_cpuid_leaf_inconsistent = false;
+inline bool g_tsc_qpc_unstable = false;
+inline bool g_synthetic_hv_behavior = false;
+inline bool g_hv_interface_signature_mismatch = false;
+inline bool g_hyperv_guest_partition = false;
 
 inline report_t run()
 {
     report_t r{};
     r.result = result_t::allow;
     r.vendor[0] = L'\0';
+    g_ms_hv_approved = false;
+    g_hidden_hypervisor_suspected = false;
+    g_cpuid_leaf_inconsistent = false;
+    g_tsc_qpc_unstable = false;
+    g_synthetic_hv_behavior = false;
+    g_hv_interface_signature_mismatch = false;
+    g_hyperv_guest_partition = false;
+
+    char vendor12[12] = {};
+    bool ms_hv_vendor = false;
+    bool known_non_ms = false;
+    bool genuine_ms = false;
+    uint32_t artifact_mask = 0;
+    uint32_t contradiction_mask = 0;
+
+    auto refresh_masks = [&]() {
+        artifact_mask = 0;
+        if (r.firmware_hit) artifact_mask |= detail::kArtifactFirmware;
+        if (r.process_hit) artifact_mask |= detail::kArtifactProcess;
+        if (r.nvram_vm_string_hit) artifact_mask |= detail::kArtifactNvram;
+        if (r.disk_vm_string_hit) artifact_mask |= detail::kArtifactDisk;
+        if (r.edid_vm_manufacturer_hit) artifact_mask |= detail::kArtifactEdid;
+        contradiction_mask = 0;
+        if (r.hidden_hypervisor_suspected) contradiction_mask |= detail::kContradictionHiddenHv;
+        if (r.cpuid_leaf_inconsistent) contradiction_mask |= detail::kContradictionCpuidLeaf;
+        if (r.tsc_qpc_unstable) contradiction_mask |= detail::kContradictionTscQpc;
+        if (r.synthetic_hv_behavior && !r.hv_bit_set) contradiction_mask |= detail::kContradictionSyntheticHv;
+        if (r.hv_interface_signature_mismatch) contradiction_mask |= detail::kContradictionHvInterface;
+        if (r.hyperv_guest_partition) contradiction_mask |= detail::kContradictionHvGuest;
+    };
+
+    auto finish = [&](result_t result, const char* decision) -> report_t {
+        r.result = result;
+        refresh_masks();
+        g_hvci_enabled = r.hvci_enabled;
+        g_vbs_enabled = r.vbs_enabled;
+        g_hidden_hypervisor_suspected = r.hidden_hypervisor_suspected;
+        g_cpuid_leaf_inconsistent = r.cpuid_leaf_inconsistent;
+        g_tsc_qpc_unstable = r.tsc_qpc_unstable;
+        g_synthetic_hv_behavior = r.synthetic_hv_behavior;
+        g_hv_interface_signature_mismatch = r.hv_interface_signature_mismatch;
+        g_hyperv_guest_partition = r.hyperv_guest_partition;
+        uint64_t summary_hash = 14695981039346656037ULL;
+        auto mix = [&](uint64_t value) {
+            for (int i = 0; i < 8; ++i)
+            {
+                summary_hash ^= static_cast<uint8_t>((value >> (i * 8)) & 0xFFu);
+                summary_hash *= 1099511628211ULL;
+            }
+        };
+        mix(static_cast<uint64_t>(detail::kPolicyVersion));
+        mix(static_cast<uint64_t>(artifact_mask));
+        mix(static_cast<uint64_t>(contradiction_mask));
+        mix(static_cast<uint64_t>(r.hv_bit_set ? 1 : 0));
+        mix(static_cast<uint64_t>(ms_hv_vendor ? 1 : 0));
+        mix(static_cast<uint64_t>(known_non_ms ? 1 : 0));
+        mix(static_cast<uint64_t>(genuine_ms ? 1 : 0));
+        mix(static_cast<uint64_t>(r.hvci_enabled ? 1 : 0));
+        mix(static_cast<uint64_t>(r.vbs_enabled ? 1 : 0));
+        mix(static_cast<uint64_t>(r.timing_median));
+        diag::log_tagged_fmt("hv_pf",
+            "policy_decision version=0x%08X decision=%s hv_bit=%d ms_hv=%d known_non_ms=%d genuine_ms=%d hvci=%d vbs=%d guest=%d artifacts=0x%08X contradictions=0x%08X timing_median=%u summary_hash=0x%016llX",
+            detail::kPolicyVersion,
+            decision ? decision : "unknown",
+            r.hv_bit_set ? 1 : 0,
+            ms_hv_vendor ? 1 : 0,
+            known_non_ms ? 1 : 0,
+            genuine_ms ? 1 : 0,
+            r.hvci_enabled ? 1 : 0,
+            r.vbs_enabled ? 1 : 0,
+            r.hyperv_guest_partition ? 1 : 0,
+            artifact_mask,
+            contradiction_mask,
+            r.timing_median,
+            static_cast<unsigned long long>(summary_hash));
+        diag::log_tagged_fmt("hv_pf", "decision=%s", decision ? decision : "unknown");
+        return r;
+    };
 
     diag::log_tagged("hv_pf", "enter");
 
     if (detail::devmode_bypass_set())
     {
         diag::log_tagged("hv_pf", "devmode_bypass_return_tpm_receipt_validated");
-        return r;
+        return finish(result_t::allow, "allow_devmode_receipt");
     }
 
     diag::log_tagged("hv_pf", "query_kernel_debugger_start");
@@ -878,7 +1224,6 @@ inline report_t run()
     r.hv_bit_set = detail::read_cpuid_hv_bit();
     diag::log_tagged_fmt("hv_pf", "read_cpuid_hv_bit_done set=%d", r.hv_bit_set ? 1 : 0);
 
-    char vendor12[12] = {};
     if (r.hv_bit_set)
     {
         diag::log_tagged("hv_pf", "read_hv_vendor_start");
@@ -888,6 +1233,18 @@ inline report_t run()
         r.vendor[12] = L'\0';
         diag::log_tagged("hv_pf", "read_hv_vendor_done");
     }
+
+    diag::log_tagged("hv_pf", "cpuid_leaf_consistency_start");
+    r.cpuid_leaf_inconsistent = detail::cpuid_leaf_inconsistent_probe(r.hv_bit_set);
+    diag::log_tagged_fmt("hv_pf", "cpuid_leaf_consistency_done inconsistent=%d", r.cpuid_leaf_inconsistent ? 1 : 0);
+
+    diag::log_tagged("hv_pf", "synthetic_hv_behavior_start");
+    r.synthetic_hv_behavior = detail::synthetic_hv_behavior_probe();
+    diag::log_tagged_fmt("hv_pf", "synthetic_hv_behavior_done present=%d", r.synthetic_hv_behavior ? 1 : 0);
+
+    diag::log_tagged("hv_pf", "hyperv_guest_partition_start");
+    r.hyperv_guest_partition = detail::hyperv_guest_partition_probe();
+    diag::log_tagged_fmt("hv_pf", "hyperv_guest_partition_done guest=%d", r.hyperv_guest_partition ? 1 : 0);
 
     diag::log_tagged("hv_pf", "scan_firmware_rsmb_start");
     r.firmware_hit = detail::scan_firmware_rsmb();
@@ -917,21 +1274,30 @@ inline report_t run()
     r.timing_median = detail::timing_probe_median();
     diag::log_tagged_fmt("hv_pf", "timing_probe_done median=%u", r.timing_median);
 
+    diag::log_tagged("hv_pf", "tsc_qpc_stability_start");
+    r.tsc_qpc_unstable = detail::tsc_qpc_stability_probe();
+    diag::log_tagged_fmt("hv_pf", "tsc_qpc_stability_done unstable=%d", r.tsc_qpc_unstable ? 1 : 0);
+
+    r.hidden_hypervisor_suspected = !r.hv_bit_set &&
+        (r.cpuid_leaf_inconsistent || r.synthetic_hv_behavior || r.tsc_qpc_unstable);
+    diag::log_tagged_fmt("hv_pf",
+        "hidden_hypervisor_assessment hidden=%d cpuid_leaf=%d synthetic=%d tsc_qpc=%d",
+        r.hidden_hypervisor_suspected ? 1 : 0,
+        r.cpuid_leaf_inconsistent ? 1 : 0,
+        r.synthetic_hv_behavior ? 1 : 0,
+        r.tsc_qpc_unstable ? 1 : 0);
+
     if (r.kd_enabled)
     {
-        r.result = result_t::refuse_kernel_debug;
-        diag::log_tagged("hv_pf", "decision=refuse_kernel_debug");
-        return r;
+        return finish(result_t::refuse_kernel_debug, "refuse_kernel_debug");
     }
     if (r.test_signing)
     {
-        r.result = result_t::refuse_test_signing;
-        diag::log_tagged("hv_pf", "decision=refuse_test_signing");
-        return r;
+        return finish(result_t::refuse_test_signing, "refuse_test_signing");
     }
 
-    const bool ms_hv_vendor = r.hv_bit_set && detail::is_microsoft_hv(vendor12);
-    const bool known_non_ms = r.hv_bit_set && detail::is_known_non_ms_hv(vendor12);
+    ms_hv_vendor = r.hv_bit_set && detail::is_microsoft_hv(vendor12);
+    known_non_ms = r.hv_bit_set && detail::is_known_non_ms_hv(vendor12);
 
     if (ms_hv_vendor)
     {
@@ -939,71 +1305,69 @@ inline report_t run()
         r.hv_interface_signature_mismatch = !hv1_signature;
         if (!hv1_signature)
         {
-            r.result = result_t::refuse_hv;
-            diag::log_tagged("hv_pf", "decision=refuse_hv_interface_signature_mismatch");
-            return r;
+            return finish(result_t::refuse_hv, "refuse_hv_interface_signature_mismatch");
         }
 
-        bool genuine_ms = detail::validate_ms_hv_features();
+        if (r.hyperv_guest_partition)
+        {
+            return finish(result_t::refuse_hv_nested, "refuse_hv_guest_partition");
+        }
+
+        genuine_ms = detail::validate_ms_hv_features();
 
         if (!genuine_ms)
         {
-            r.result = result_t::refuse_hv;
-            diag::log_tagged("hv_pf", "decision=refuse_hv_ms_not_genuine");
-            return r;
+            return finish(result_t::refuse_hv, "refuse_hv_ms_not_genuine");
+        }
+
+        refresh_masks();
+        if ((artifact_mask & (detail::kArtifactFirmware | detail::kArtifactNvram |
+                              detail::kArtifactDisk | detail::kArtifactEdid)) != 0)
+        {
+            return finish(result_t::refuse_hv, "refuse_ms_hv_with_vm_artifact");
         }
 
         g_ms_hv_approved = true;
-        r.result = result_t::allow;
-        diag::log_tagged("hv_pf", "decision=allow_ms_hv");
-        return r;
+        return finish(result_t::allow, "allow_ms_hv");
     }
 
     if (known_non_ms)
     {
-        r.result = result_t::refuse_hv;
-        diag::log_tagged("hv_pf", "decision=refuse_hv_known_non_ms");
-        return r;
+        return finish(result_t::refuse_hv, "refuse_hv_known_non_ms");
     }
 
     if (r.hv_bit_set)
     {
-        r.result = result_t::refuse_hv;
-        diag::log_tagged("hv_pf", "decision=refuse_hv_bit_set");
-        return r;
+        return finish(result_t::refuse_hv, "refuse_hv_bit_set");
+    }
+
+    refresh_masks();
+    if (r.hidden_hypervisor_suspected && artifact_mask != 0)
+    {
+        return finish(result_t::refuse_hv, "refuse_hidden_hv_with_vm_artifact");
     }
 
     if (r.firmware_hit)
     {
-        r.result = result_t::refuse_hv;
-        diag::log_tagged("hv_pf", "decision=refuse_hv_firmware_hit");
-        return r;
+        return finish(result_t::refuse_hv, "refuse_hv_firmware_hit");
     }
 
     if (r.nvram_vm_string_hit)
     {
-        r.result = result_t::refuse_hv;
-        diag::log_tagged("hv_pf", "decision=refuse_hv_nvram_hit");
-        return r;
+        return finish(result_t::refuse_hv, "refuse_hv_nvram_hit");
     }
 
     if (r.disk_vm_string_hit)
     {
-        r.result = result_t::refuse_hv;
-        diag::log_tagged("hv_pf", "decision=refuse_hv_disk_hit");
-        return r;
+        return finish(result_t::refuse_hv, "refuse_hv_disk_hit");
     }
 
     if (r.edid_vm_manufacturer_hit)
     {
-        r.result = result_t::refuse_hv;
-        diag::log_tagged("hv_pf", "decision=refuse_hv_edid_manufacturer_hit");
-        return r;
+        return finish(result_t::refuse_hv, "refuse_hv_edid_manufacturer_hit");
     }
 
-    r.result = result_t::allow;
-    diag::log_tagged("hv_pf", "decision=allow");
-    return r;
+    return finish(result_t::allow, "allow");
 }
 
 inline void show_refuse_ui_and_exit(const report_t& r)
@@ -1017,8 +1381,12 @@ inline void show_refuse_ui_and_exit(const report_t& r)
     case result_t::refuse_test_signing:
         message = WOBFSTR(L"AiDA cannot start while test-signing mode is enabled. Disable test-signing and reboot.");
         break;
-    case result_t::refuse_hv:
     case result_t::refuse_hv_nested:
+        message = L"AiDA cannot start: the system is running inside a Hyper-V guest partition. Run AiDA only on trusted bare metal or an approved Windows security root.";
+        if (r.hv_interface_signature_mismatch)
+            message += L"\n\nAdditional: the Hyper-V interface signature did not validate.";
+        break;
+    case result_t::refuse_hv:
     default:
     {
         std::wstring vendor_str(r.vendor);

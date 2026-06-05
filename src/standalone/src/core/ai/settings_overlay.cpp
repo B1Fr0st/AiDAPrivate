@@ -9,7 +9,6 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
-#include <filesystem>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -42,8 +41,6 @@
 #include "../helpers/globals.h"
 #include "../helpers/helpers.h"
 #include "../helpers/diag_log.hpp"
-#include "../runtime/ida_injector.hpp"
-#include "work_queue.hpp"
 
 
 extern settings_sa_t g_sa_settings;
@@ -207,15 +204,6 @@ namespace settings_overlay {
 				dl->AddLine(ImVec2(c.x - r * 0.55f, c.y), ImVec2(c.x + r * 0.20f, c.y), col, th_w);
 				dl->AddLine(ImVec2(c.x - r * 0.55f, c.y + r * 0.40f),
 					ImVec2(c.x + r * 0.40f, c.y + r * 0.40f), col, th_w);
-				break;
-			}
-			case tab_ida_pro: {
-				dl->AddRect(ImVec2(c.x - r * 0.50f, c.y - r * 0.50f),
-					ImVec2(c.x + r * 0.50f, c.y + r * 0.50f), col, 4.f, 0, th_w);
-				ImFont* f = ImGui::GetFont();
-				float fs = r * 0.85f;
-				ImVec2 sz = f->CalcTextSizeA(fs, FLT_MAX, 0.f, "I");
-				dl->AddText(f, fs, ImVec2(c.x - sz.x * 0.5f, c.y - sz.y * 0.5f), col, "I");
 				break;
 			}
 			default: break;
@@ -764,203 +752,6 @@ namespace settings_overlay {
 		}
 
 
-		inline std::mutex& ida_status_mutex()
-		{
-			static std::mutex m;
-			return m;
-		}
-
-		inline std::string& ida_status_string()
-		{
-			static std::string s;
-			return s;
-		}
-
-		inline std::atomic<bool>& ida_busy_flag()
-		{
-			static std::atomic<bool> b{false};
-			return b;
-		}
-
-		inline void set_ida_status(const std::string& s)
-		{
-			std::lock_guard<std::mutex> lk(ida_status_mutex());
-			ida_status_string() = s;
-		}
-
-		inline std::string snapshot_ida_status()
-		{
-			std::lock_guard<std::mutex> lk(ida_status_mutex());
-			return ida_status_string();
-		}
-
-		inline void render_tab_ida_pro(float content_w, float content_h)
-		{
-			(void)content_h;
-			const auto& th = aida::ui::resolved();
-			static char s_path_buf[1024] = {};
-			static bool s_path_loaded = false;
-
-			if (!s_path_loaded)
-			{
-				std::snprintf(s_path_buf, sizeof(s_path_buf), "%s",
-					g_sa_settings.ida_pro_path.c_str());
-				s_path_loaded = true;
-			}
-
-			ImGui::PushID("##ida_pro_tab");
-			ImGui::PushFont(aida::ui::fonts::lg());
-			ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10.f, 10.f));
-			ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.f, 7.f));
-
-			ImDrawList* dl = ImGui::GetWindowDrawList();
-			ImVec2 hp = ImGui::GetCursorScreenPos();
-			dl->AddText(aida::ui::fonts::h1(), 22.f, hp, th.text_primary,
-				"IDA Pro Integration");
-			ImGui::Dummy(ImVec2(0.f, 32.f));
-
-			ImGui::TextWrapped("Press Launch to open a fresh IDA instance and manual-map "
-				"the AiDA plugin into it. The AiDA plugin DLL is never written to disk.");
-			ImGui::Dummy(ImVec2(0.f, 6.f));
-
-			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "IDA executable path");
-			float ida_row_avail = ImGui::GetContentRegionAvail().x;
-			bool ida_path_wrap_browse = (ida_row_avail < (220.f + 10.f + 126.f));
-			float ida_input_w = ida_path_wrap_browse
-				? (std::max)(ida_row_avail - 12.f, 120.f)
-				: (std::max)(ida_row_avail - 136.f, 200.f);
-			if (aida::ui::input_text("##ida_pro_path",
-					s_path_buf, sizeof(s_path_buf),
-					"C:\\Program Files\\IDA Pro\\ida.exe", false,
-					ImVec2(ida_input_w, 36.f)))
-			{
-				g_sa_settings.ida_pro_path = s_path_buf;
-			}
-			if (!ida_path_wrap_browse) ImGui::SameLine(0.f, 10.f);
-			if (aida::ui::button("Browse...##ida_browse",
-					aida::ui::button_kind_t::secondary,
-					aida::ui::size_t_::md,
-					ImVec2(126.f, 36.f)))
-			{
-				std::string picked;
-				if (ida_injector::prompt_and_persist_ida_path(::g_hwnd, picked))
-				{
-					std::snprintf(s_path_buf, sizeof(s_path_buf), "%s", picked.c_str());
-					set_ida_status("Saved IDA path: " + picked);
-				}
-			}
-
-			ImGui::Dummy(ImVec2(0.f, 4.f));
-			float ida_btn_avail = ImGui::GetContentRegionAvail().x;
-			bool ida_btn_wrap = (ida_btn_avail < (112.f + 10.f + 140.f));
-			if (aida::ui::button("Save##ida_save",
-					aida::ui::button_kind_t::secondary,
-					aida::ui::size_t_::md,
-					ImVec2(112.f, 32.f)))
-			{
-				g_sa_settings.ida_pro_path = s_path_buf;
-				if (g_sa_settings.save())
-					set_ida_status("Saved.");
-				else
-					set_ida_status("Failed to write settings file.");
-			}
-			if (!ida_btn_wrap) ImGui::SameLine(0.f, 10.f);
-			if (aida::ui::button("Auto-detect##ida_detect",
-					aida::ui::button_kind_t::secondary,
-					aida::ui::size_t_::md,
-					ImVec2(140.f, 32.f)))
-			{
-				std::string discovered = ida_injector::discover_ida_path();
-				if (!discovered.empty())
-				{
-					std::snprintf(s_path_buf, sizeof(s_path_buf), "%s", discovered.c_str());
-					g_sa_settings.ida_pro_path = discovered;
-					g_sa_settings.save();
-					set_ida_status("Auto-detected: " + discovered);
-				}
-				else
-				{
-					set_ida_status("No IDA installation found via registry or Program Files.");
-				}
-			}
-
-			ImGui::Dummy(ImVec2(0.f, 6.f));
-			ImGui::Separator();
-			ImGui::Dummy(ImVec2(0.f, 6.f));
-
-			bool busy = ida_busy_flag().load(std::memory_order_acquire);
-			bool can_launch = !busy && ida_injector::validate_ida_path(g_sa_settings.ida_pro_path);
-			if (!can_launch)
-				ImGui::BeginDisabled();
-			float launch_avail = ImGui::GetContentRegionAvail().x;
-			float launch_w = (launch_avail < 280.f) ? (std::max)(launch_avail - 12.f, 160.f) : 280.f;
-			const char* launch_label = (launch_w < 220.f) ? "Launch IDA" : "Launch IDA Pro with AiDA";
-			if (aida::ui::button(launch_label,
-					aida::ui::button_kind_t::accent_gradient,
-					aida::ui::size_t_::lg,
-					ImVec2(launch_w, 44.f),
-					false, nullptr, busy))
-			{
-				::diag::log_tagged_critical("ida_launch", "click_received");
-				ida_busy_flag().store(true, std::memory_order_release);
-				std::filesystem::path ida_p(g_sa_settings.ida_pro_path);
-				std::string ida_name = ida_p.filename().string();
-				if (ida_name.empty()) ida_name = "IDA";
-				::diag::log_tagged_fmt("ida_launch", "configured_ida_path=%s", g_sa_settings.ida_pro_path.c_str());
-				set_ida_status(std::string("Launching ") + ida_name
-					+ " and manual-mapping AiDA...");
-				::diag::log_tagged("ida_launch", "posting_to_work_queue");
-				work_queue::post([ida_name]{
-					::diag::log_tagged_critical_fmt("ida_launch", "lambda_enter tid=%lu", GetCurrentThreadId());
-					struct busy_guard_t {
-						~busy_guard_t() {
-							ida_busy_flag().store(false, std::memory_order_release);
-							::diag::log_tagged_critical("ida_launch", "busy_guard_cleared");
-						}
-					} guard;
-					std::string err;
-					bool ok = false;
-					::diag::log_tagged("ida_launch", "calling_launch_ida_with_aida");
-					try {
-						ok = ida_injector::launch_ida_with_aida(std::string(), err);
-					} catch (const std::exception& ex) {
-						ok = false;
-						err = std::string("internal exception: ") + ex.what();
-					} catch (...) {
-						ok = false;
-						err = "unknown internal exception";
-					}
-					::diag::log_tagged_critical_fmt("ida_launch", "launch_ida_with_aida_returned ok=%d err=%s",
-						ok ? 1 : 0,
-						err.empty() ? "(none)" : err.c_str());
-					if (ok)
-						set_ida_status("AiDA mapped into " + ida_name + " successfully.");
-					else
-						set_ida_status(std::string("Launch failed: ") + (err.empty() ? "(no detail)" : err));
-				});
-				::diag::log_tagged("ida_launch", "post_returned");
-			}
-			if (!can_launch)
-				ImGui::EndDisabled();
-
-			if (busy)
-			{
-				ImGui::SameLine(0.f, 12.f);
-				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.warning), "Working...");
-			}
-
-			std::string status_snap = snapshot_ida_status();
-			if (!status_snap.empty())
-			{
-				ImGui::Dummy(ImVec2(0.f, 6.f));
-				ImGui::TextWrapped("%s", status_snap.c_str());
-			}
-
-			ImGui::PopStyleVar(2);
-			ImGui::PopFont();
-			ImGui::PopID();
-		}
-
 		inline void render_tab_editor_theme(float content_w, float content_h)
 		{
 			(void)content_w; (void)content_h;
@@ -1200,8 +991,7 @@ namespace settings_overlay {
 					"Agents",
 					"Skills",
 					"MCP Servers",
-					"Editor",
-					"IDA Pro"
+					"Editor"
 				};
 				const float row_h = 44.f;
 				ImGui::Dummy(ImVec2(0, 8.f));
@@ -1239,7 +1029,6 @@ namespace settings_overlay {
 				case tab_skills:          detail::render_tab_skills(content_w, content_h); break;
 				case tab_mcp_servers:     detail::render_tab_mcp_servers(content_w, content_h); break;
 				case tab_editor_theme:    detail::render_tab_editor_theme(content_w, content_h); break;
-				case tab_ida_pro:         detail::render_tab_ida_pro(content_w, content_h); break;
 				default:                  detail::render_tab_accounts(content_w, content_h); break;
 				}
 			};

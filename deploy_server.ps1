@@ -10,14 +10,14 @@ $REMOTE  = "ruarr@23.88.62.199"
 $SRC     = (Join-Path $PSScriptRoot "server") + "\"
 $DST     = "/home/ruarr/aida-server/"
 $AIDA_KEY = Join-Path $env:USERPROFILE ".ssh\aida_server"
-$SSH_OPTS = @('-o', 'StrictHostKeyChecking=no', '-o', 'IdentitiesOnly=yes', '-o', 'PasswordAuthentication=no', '-i', $AIDA_KEY)
-$ADMIN_KEY = "08497b90b9a76d7be929674519ce5d870a5d51185806ea2a6da732f3430f00b1"
+$SSH_OPTS = @('-o', 'StrictHostKeyChecking=yes', '-o', 'IdentitiesOnly=yes', '-o', 'PasswordAuthentication=no', '-i', $AIDA_KEY)
 
 Write-Host "`n=== Deploying server/ to $REMOTE ===" -ForegroundColor Cyan
 
 # --- 1. Upload source files ---
 Write-Host "`n[1/3] Uploading files..." -ForegroundColor Yellow
 $files = @(
+    ".env.example",
     "server.js",
     "routes\license.js",
     "routes\download.js",
@@ -27,6 +27,8 @@ $files = @(
     "routes\attestation.js",
     "routes\stolen_bytes.js",
     "routes\server_info.js",
+    "routes\bootstrap.js",
+    "nginx\aida-api.conf",
     "crypto\signing.js",
     "crypto\arc-encrypt.js",
     "crypto\arc-license-bind.js",
@@ -58,9 +60,11 @@ $files = @(
     "db\migrations\0001_auth_redesign.sql",
     "db\migrations\0002_strict_replay_ratchet.sql",
     "db\migrations\0003_peer_attestation_ratchet.sql",
-    "db\migrations\0004_oracle_audit_killswitch.sql"
+    "db\migrations\0004_oracle_audit_killswitch.sql",
+    "db\migrations\0006_bootstrap_delivery.sql",
+    "scripts\create_bootstrap_package.js"
 )
-$remoteDirs = @("routes", "crypto", "middleware", "anomaly", "db", "db/migrations") | ForEach-Object { "$DST$_" }
+$remoteDirs = @("routes", "crypto", "middleware", "anomaly", "db", "db/migrations", "nginx", "scripts", "bootstrap_artifacts") | ForEach-Object { "$DST$_" }
 $mkdirCmd = "mkdir -p " + ($remoteDirs -join " ")
 & ssh @SSH_OPTS $REMOTE $mkdirCmd | Out-Null
 foreach ($f in $files) {
@@ -73,62 +77,20 @@ foreach ($f in $files) {
         Write-Host "  [WARN] missing local file: $local" -ForegroundColor Yellow
     }
 }
+$artifactDir = Join-Path $SRC "bootstrap_artifacts"
+if (Test-Path $artifactDir) {
+    $artifactFiles = Get-ChildItem -LiteralPath $artifactDir -Filter "*.pkg" -File -ErrorAction SilentlyContinue
+    foreach ($artifact in $artifactFiles) {
+        & scp @SSH_OPTS $artifact.FullName "${REMOTE}:${DST}bootstrap_artifacts/$($artifact.Name)"
+        if ($LASTEXITCODE -ne 0) { Write-Host "SCP failed for bootstrap artifact $($artifact.Name)" -ForegroundColor Red; exit 1 }
+    }
+    if ($artifactFiles.Count -gt 0) {
+        Write-Host "      Uploaded $($artifactFiles.Count) encrypted bootstrap artifact(s)." -ForegroundColor Green
+    }
+}
 Write-Host "      Done." -ForegroundColor Green
 
-# --- 1b. Align signing keys with the repo so client signature verification works ---
-# The client (standalone_license.cpp::get_arc_signing_public_key_der_hex) hard-codes the
-# Ed25519 SPKI public key derived from server/keys/ed25519_private_b64.txt. If the server's
-# .env was created by deploy.sh (which generates a fresh random key on first deploy), every
-# signed page hits arc_paged_signature_invalid on the client. We push the repo's key here so
-# the production server signs with the matching private key.
-$privKeyPath = Join-Path $SRC "keys\ed25519_private_b64.txt"
-$pubKeyPath  = Join-Path $SRC "keys\ed25519_public_b64.txt"
-if ((Test-Path $privKeyPath) -and (Test-Path $pubKeyPath)) {
-    $repoPriv = (Get-Content $privKeyPath -Raw).Trim()
-    $repoPub  = (Get-Content $pubKeyPath  -Raw).Trim()
-    if ($repoPriv -and $repoPub) {
-        Write-Host "`n[1b] Aligning ED25519_PRIVATE_KEY_B64 in remote .env with repo key..." -ForegroundColor Yellow
-        $alignScript = "#!/bin/bash`n"
-        $alignScript += "set -e`n"
-        $alignScript += "cd /home/ruarr/aida-server`n"
-        $alignScript += "if [ ! -f .env ]; then`n"
-        $alignScript += "  echo 'no_env_file_found'`n"
-        $alignScript += "  exit 0`n"
-        $alignScript += "fi`n"
-        $alignScript += "DESIRED_PRIV='$repoPriv'`n"
-        $alignScript += "DESIRED_PUB='$repoPub'`n"
-        $alignScript += "if grep -q '^ED25519_PRIVATE_KEY_B64=' .env; then`n"
-        $alignScript += "  sed -i.bak `"s|^ED25519_PRIVATE_KEY_B64=.*|ED25519_PRIVATE_KEY_B64=`$DESIRED_PRIV|`" .env`n"
-        $alignScript += "  echo 'priv_replaced'`n"
-        $alignScript += "else`n"
-        $alignScript += "  echo `"ED25519_PRIVATE_KEY_B64=`$DESIRED_PRIV`" >> .env`n"
-        $alignScript += "  echo 'priv_added'`n"
-        $alignScript += "fi`n"
-        $alignScript += "if grep -q '^ED25519_PUBLIC_KEY_B64=' .env; then`n"
-        $alignScript += "  sed -i.bak `"s|^ED25519_PUBLIC_KEY_B64=.*|ED25519_PUBLIC_KEY_B64=`$DESIRED_PUB|`" .env`n"
-        $alignScript += "  echo 'pub_replaced'`n"
-        $alignScript += "else`n"
-        $alignScript += "  echo `"ED25519_PUBLIC_KEY_B64=`$DESIRED_PUB`" >> .env`n"
-        $alignScript += "  echo 'pub_added'`n"
-        $alignScript += "fi`n"
-        $alignScript += "if grep -q '^AIDA_SIGN_DEBUG=' .env; then`n"
-        $alignScript += "  sed -i.bak 's|^AIDA_SIGN_DEBUG=.*|AIDA_SIGN_DEBUG=0|' .env`n"
-        $alignScript += "else`n"
-        $alignScript += "  echo 'AIDA_SIGN_DEBUG=0' >> .env`n"
-        $alignScript += "fi`n"
-        $alignScript += "rm -f .env.bak`n"
-        $alignScript += "chmod 600 .env`n"
-        $alignLocal = "$env:TEMP\aida_align_keys.sh"
-        [System.IO.File]::WriteAllText($alignLocal, $alignScript, [System.Text.UTF8Encoding]::new($false))
-        & scp @SSH_OPTS "$alignLocal" "${REMOTE}:/tmp/aida_align_keys.sh"
-        $alignOut = & ssh @SSH_OPTS $REMOTE "bash /tmp/aida_align_keys.sh"
-        Write-Host "      $alignOut" -ForegroundColor Green
-    } else {
-        Write-Host "[1b] Skipped key alignment (key files empty)" -ForegroundColor Yellow
-    }
-} else {
-    Write-Host "[1b] Skipped key alignment (server/keys/ed25519_*_b64.txt not found)" -ForegroundColor Yellow
-}
+Write-Host "`n[1b] Skipping signing-key alignment; production signing keys are managed on the server." -ForegroundColor DarkGray
 
 # --- 1c. Provision pg_hba.conf for the operator's IP (so the Discord bot can connect) ---
 # pg_hba.conf is owned by the postgres group (mode 0640); editing it requires sudo on
@@ -231,8 +193,13 @@ $script += "  echo '[pm2 logs - last 60]'$nl"
 $script += "  pm2 logs aida-api --lines 60 --nostream$nl"
 $script += "  exit 0$nl"
 $script += "fi$nl"
-$script += "echo '[keygen]'$nl"
-$script += "curl -s -X POST http://localhost:3001/api/license/create -H 'Content-Type: application/json' -d '{""admin_key"":""$ADMIN_KEY"",""plan"":""pro"",""note"":""deploy_test"",""expires"":""2099-01-01""}'$nl"
+$script += "echo '[bootstrap]'$nl"
+$script += "BOOT_PATH=`$(awk -F= '/^AIDA_BOOTSTRAP_SCRIPT_PATH=/{print `$2}' .env 2>/dev/null | tail -1)$nl"
+$script += "if [ -n `"`$BOOT_PATH`" ]; then$nl"
+$script += "  curl -s -o /dev/null -w 'bootstrap_script_http=%{http_code}\n' `"http://localhost:3001`${BOOT_PATH}`" || echo 'bootstrap_script_http=000'$nl"
+$script += "else$nl"
+$script += "  curl -s -H 'Accept: application/vnd.aida.bootstrap' -o /dev/null -w 'bootstrap_script_http=%{http_code}\n' http://localhost:3001/ || echo 'bootstrap_script_http=000'$nl"
+$script += "fi$nl"
 $script += "echo$nl"
 
 $localScript = "$env:TEMP\aida_deploy.sh"
@@ -240,7 +207,9 @@ $localScript = "$env:TEMP\aida_deploy.sh"
 
 & scp @SSH_OPTS "$localScript" "${REMOTE}:/tmp/aida_deploy.sh"
 $output = & ssh @SSH_OPTS $REMOTE "bash /tmp/aida_deploy.sh"
-Write-Host $output
+$licenseKeyRegex = [regex]::new('AIDA-[A-Z0-9][A-Z0-9-]*')
+$safeOutput = $output | ForEach-Object { $licenseKeyRegex.Replace(('' + $_), 'AIDA-[REDACTED]') }
+Write-Host $safeOutput
 
 if ($output -like '*"status":"ok"*') {
     Write-Host "`nDeploy complete." -ForegroundColor Green

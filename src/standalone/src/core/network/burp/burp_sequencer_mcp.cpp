@@ -143,7 +143,7 @@ tool_result_t handle_start(const json& p)
     diag::log_tagged_fmt("mcp_burp", "sequencer_start ok collection_id=%llu target=%zu", static_cast<unsigned long long>(id), cfg.target_count);
     json out;
     out["collection_id"] = id;
-    return tool_result_t::ok("collection started", out);
+    return tool_result_t::ok("collection started id=" + std::to_string(id), out);
 }
 
 tool_result_t handle_status(const json& p)
@@ -162,7 +162,7 @@ tool_result_t handle_status(const json& p)
         return tool_result_t::error("collection not found");
     }
     diag::log_tagged_fmt("mcp_burp", "sequencer_status ok id=%llu collected=%zu running=%d", static_cast<unsigned long long>(cid), s.collected, (int)s.running);
-    return tool_result_t::ok("collection status", status_to_json(s));
+    return tool_result_t::ok("collection status id=" + std::to_string(cid) + " collected=" + std::to_string(s.collected) + " target=" + std::to_string(s.target), status_to_json(s));
 }
 
 tool_result_t handle_stop(const json& p)
@@ -204,7 +204,7 @@ tool_result_t handle_samples(const json& p)
     json out;
     out["samples"] = std::move(arr);
     out["count"]   = static_cast<uint64_t>(v.size());
-    return tool_result_t::ok("samples", out);
+    return tool_result_t::ok("samples count=" + std::to_string(v.size()), out);
 }
 
 tool_result_t handle_analyze(const json& p)
@@ -219,7 +219,7 @@ tool_result_t handle_analyze(const json& p)
     diag::log_tagged_fmt("mcp_burp", "sequencer_analyze collection_id=%llu", static_cast<unsigned long long>(cid));
     auto a = aida::burp::sequencer::analyze(cid);
     diag::log_tagged_fmt("mcp_burp", "sequencer_analyze ok id=%llu samples=%llu verdict=%s", static_cast<unsigned long long>(cid), static_cast<unsigned long long>(a.samples_count), a.verdict.c_str());
-    return tool_result_t::ok("analysis", analysis_to_json(a));
+    return tool_result_t::ok("analysis samples=" + std::to_string(a.samples_count) + " verdict=" + a.verdict, analysis_to_json(a));
 }
 
 tool_result_t handle_list(const json&)
@@ -231,7 +231,7 @@ tool_result_t handle_list(const json&)
     diag::log_tagged_fmt("mcp_burp", "sequencer_list ok count=%zu", v.size());
     json out;
     out["collections"] = std::move(arr);
-    return tool_result_t::ok("collections", out);
+    return tool_result_t::ok("collections count=" + std::to_string(v.size()), out);
 }
 
 tool_result_t handle_delete(const json& p)

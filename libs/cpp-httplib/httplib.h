@@ -3183,7 +3183,7 @@ inline Error wait_until_socket_is_ready(socket_t sock, time_t sec,
 
   if (poll_res == 0) { return Error::ConnectionTimeout; }
 
-  if (poll_res > 0 && pfd_read.revents & (POLLIN | POLLOUT)) {
+  if (poll_res > 0 && !(pfd_read.revents & POLLNVAL)) {
     auto error = 0;
     socklen_t len = sizeof(error);
     auto res = getsockopt(sock, SOL_SOCKET, SO_ERROR,

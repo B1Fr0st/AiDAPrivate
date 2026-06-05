@@ -36,6 +36,7 @@
 #include "work_queue.hpp"
 #include "toast_notification.hpp"
 #include "../session/analysis_session.hpp"
+#include "../analysis/stealth_engine.hpp"
 #include "../helpers/win32_dialog.hpp"
 #include <fstream>
 
@@ -524,6 +525,7 @@ inline void draw_run_toolbar(ImDrawList* dl, float ox, float oy, float w,
 							p != nullptr ? 1 : 0,
 							terminated ? 1 : 0,
 							static_cast<unsigned long>(GetLastError()));
+						stealth_engine::disable_for_detach(cur_pid, "debugger_view.toolbar_stop");
 						driver_bridge::detach();
 						debugger_engine::g_state.status.store(
 							debugger_engine::dbg_status_t::terminated);
@@ -545,6 +547,7 @@ inline void draw_run_toolbar(ImDrawList* dl, float ox, float oy, float w,
 							TerminateProcess(p, 0xDEADu);
 							CloseHandle(p);
 						}
+						stealth_engine::disable_for_detach(cur_pid, "debugger_view.toolbar_restart");
 						driver_bridge::detach();
 						debugger_engine::g_state.status.store(
 							debugger_engine::dbg_status_t::terminated);
@@ -564,6 +567,7 @@ inline void draw_run_toolbar(ImDrawList* dl, float ox, float oy, float w,
 						"toolbar_detach_clicked attached_pid=%u",
 						static_cast<unsigned>(cur_pid));
 					if (cur_pid != 0) {
+						stealth_engine::disable_for_detach(cur_pid, "debugger_view.toolbar_detach");
 						driver_bridge::detach();
 						debugger_engine::g_state.status.store(
 							debugger_engine::dbg_status_t::idle);
@@ -750,6 +754,7 @@ static void render_tab_bar(ImDrawList* dl, float ox, float oy, float w, float a)
 	static const visible_tab_entry_t visible_tabs[] = {
 		{ "CPU",         "CPU", sub_tab_t::cpu },
 		{ "Breakpoints", "BP",  sub_tab_t::breakpoints },
+		{ "Memory Map",  "Mem", sub_tab_t::memory_map },
 		{ "Call Stack",  "CS",  sub_tab_t::call_stack },
 		{ "Threads",     "Thr", sub_tab_t::threads },
 		{ "Watches",     "Wch", sub_tab_t::watches },
@@ -759,7 +764,8 @@ static void render_tab_bar(ImDrawList* dl, float ox, float oy, float w, float a)
 		{ "Bookmarks",   "Bm",  sub_tab_t::bookmarks },
 		{ "Modules",     "Mod", sub_tab_t::modules },
 		{ "Patches",     "Pat", sub_tab_t::patches },
-		{ "SEH",         "SEH", sub_tab_t::seh_chain }
+		{ "SEH",         "SEH", sub_tab_t::seh_chain },
+		{ "CFG",         "CFG", sub_tab_t::cfg }
 	};
 	static const int visible_tab_count = static_cast<int>(sizeof(visible_tabs) / sizeof(visible_tabs[0]));
 
@@ -774,10 +780,6 @@ static void render_tab_bar(ImDrawList* dl, float ox, float oy, float w, float a)
 			s_dbg_strip_logged = true;
 			anti_tamper::webhook::write_log("dbg_strip", "[dbg_strip] applied solid_line");
 		}
-	}
-
-	if (ui.active_tab == sub_tab_t::memory_map || ui.active_tab == sub_tab_t::cfg) {
-		ui.active_tab = sub_tab_t::cpu;
 	}
 
 	int count = visible_tab_count;
@@ -1005,6 +1007,33 @@ static void render_tab_bar(ImDrawList* dl, float ox, float oy, float w, float a)
 			anti_tamper::webhook::write_log("stealth_remove", "[stealth_remove] pill_removed=1");
 		}
 	}
+}
+
+bool is_visible_sub_tab(sub_tab_t tab) {
+	switch (tab) {
+		case sub_tab_t::cpu:
+		case sub_tab_t::breakpoints:
+		case sub_tab_t::memory_map:
+		case sub_tab_t::call_stack:
+		case sub_tab_t::threads:
+		case sub_tab_t::watches:
+		case sub_tab_t::handles:
+		case sub_tab_t::trace_log:
+		case sub_tab_t::strings:
+		case sub_tab_t::bookmarks:
+		case sub_tab_t::modules:
+		case sub_tab_t::patches:
+		case sub_tab_t::seh_chain:
+		case sub_tab_t::cfg:
+			return true;
+		case sub_tab_t::COUNT:
+			return false;
+	}
+	return false;
+}
+
+int visible_sub_tab_count() {
+	return static_cast<int>(sub_tab_t::COUNT);
 }
 
 
@@ -4468,6 +4497,7 @@ void render(float pos_x, float pos_y, float width, float height,
 					term = TerminateProcess(p, 0xDEADu) != FALSE;
 					CloseHandle(p);
 				}
+				stealth_engine::disable_for_detach(cur_pid, "debugger_view.hotkey_stop");
 				driver_bridge::detach();
 				debugger_engine::g_state.status.store(
 					debugger_engine::dbg_status_t::terminated);
@@ -4488,6 +4518,7 @@ void render(float pos_x, float pos_y, float width, float height,
 					TerminateProcess(p, 0xDEADu);
 					CloseHandle(p);
 				}
+				stealth_engine::disable_for_detach(cur_pid, "debugger_view.hotkey_restart");
 				driver_bridge::detach();
 			}
 			if (!spawn_target_dialog::is_open())
@@ -4549,6 +4580,7 @@ void render(float pos_x, float pos_y, float width, float height,
 			diag::log_tagged_critical_fmt("debugger",
 				"hotkey_ctrl_f2_detach attached_pid=%u",
 				static_cast<unsigned>(cur_pid));
+			stealth_engine::disable_for_detach(cur_pid, "debugger_view.hotkey_detach");
 			driver_bridge::detach();
 			debugger_engine::g_state.status.store(
 				debugger_engine::dbg_status_t::idle);

@@ -197,15 +197,26 @@ tool_result_t tool_status(const json& params)
     (void)params;
     diag::log_tagged_fmt("mcp_burp", "dom_xss_status entry");
     json data;
-    data["camoufox_ready"]  = camoufox::is_ready();
+    const bool ready = camoufox::is_ready();
     auto st = camoufox::get_status();
+    data["camoufox_ready"]  = ready;
     data["bridge_state"]    = static_cast<int>(st.state);
     data["browser_open"]    = st.browser_open;
+    data["page_verified"]   = st.page_verified;
+    data["child_alive"]     = st.child_alive;
+    data["cleanup_pending"] = st.cleanup_pending;
+    data["child_pid"]       = st.child_pid;
+    data["generation"]      = st.generation;
     data["active_page_url"] = st.active_page_url;
+    data["active_page_title"] = st.active_page_title;
+    data["last_error"]      = st.last_error;
     data["last_scan_ms"]    = last_scan_ms_slot().load();
     data["total_payloads_fired"] = total_payloads_slot().load();
     data["total_scans"]     = total_scans_slot().load();
-    diag::log_tagged_fmt("mcp_burp", "dom_xss_status ok ready=%d total_scans=%llu", (int)camoufox::is_ready(), static_cast<unsigned long long>(total_scans_slot().load()));
+    diag::log_tagged_fmt("mcp_burp", "dom_xss_status ok ready=%d state=%d browser_open=%d page_verified=%d child_alive=%d cleanup_pending=%d child_pid=%lu total_scans=%llu",
+        static_cast<int>(ready), static_cast<int>(st.state), static_cast<int>(st.browser_open),
+        static_cast<int>(st.page_verified), static_cast<int>(st.child_alive), static_cast<int>(st.cleanup_pending),
+        static_cast<unsigned long>(st.child_pid), static_cast<unsigned long long>(total_scans_slot().load()));
     return tool_result_t::ok(data);
 }
 

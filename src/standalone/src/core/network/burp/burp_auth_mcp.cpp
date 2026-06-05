@@ -24,6 +24,11 @@ namespace {
 using json = nlohmann::json;
 using tool_result_t = mcp_standalone::tool_result_t;
 
+tool_result_t error_with_data(const std::string& text, const json& data)
+{
+    return tool_result_t{false, text, data};
+}
+
 struct url_log_t
 {
     std::string host;
@@ -221,7 +226,21 @@ tool_result_t handle_exchange_code(const json& params)
     if (te.empty() || cid.empty() || code.empty()) return tool_result_t::error("missing required field");
     std::string at, rt;
     int exp = 0;
-    if (!auth_lab::oauth2_exchange_code(te, cid, code, ru, ver, at, rt, exp)) { diag::log_tagged_fmt("mcp_burp", "auth_oauth2_exchange_code failed err=%s", auth_lab::last_error().c_str()); return tool_result_t::error(std::string("exchange failed: ") + auth_lab::last_error()); }
+    if (!auth_lab::oauth2_exchange_code(te, cid, code, ru, ver, at, rt, exp)) {
+        std::string err = auth_lab::last_error();
+        diag::log_tagged_fmt("mcp_burp", "auth_oauth2_exchange_code failed err=%s", err.c_str());
+        json data;
+        data["error"] = err;
+        data["token_endpoint_host"] = endpoint_log.host;
+        data["token_endpoint_path"] = endpoint_log.path;
+        data["token_endpoint_len"] = endpoint_log.length;
+        data["client_id_len"] = cid.size();
+        data["code_len"] = code.size();
+        data["redirect_uri_len"] = ru.size();
+        data["has_code_verifier"] = !ver.empty();
+        data["status"] = "exchange_failed";
+        return error_with_data(std::string("exchange failed: ") + err, data);
+    }
     diag::log_tagged_fmt("mcp_burp", "auth_oauth2_exchange_code ok host=%s path=%s access_token_len=%zu refresh_token_len=%zu expires_in=%d",
         endpoint_log.host.c_str(), endpoint_log.path.c_str(), at.size(), rt.size(), exp);
     json out;
@@ -243,7 +262,19 @@ tool_result_t handle_refresh(const json& params)
     if (te.empty() || cid.empty() || rt.empty()) return tool_result_t::error("missing required field");
     std::string at;
     int exp = 0;
-    if (!auth_lab::oauth2_refresh(te, cid, rt, at, exp)) { diag::log_tagged_fmt("mcp_burp", "auth_oauth2_refresh failed err=%s", auth_lab::last_error().c_str()); return tool_result_t::error(std::string("refresh failed: ") + auth_lab::last_error()); }
+    if (!auth_lab::oauth2_refresh(te, cid, rt, at, exp)) {
+        std::string err = auth_lab::last_error();
+        diag::log_tagged_fmt("mcp_burp", "auth_oauth2_refresh failed err=%s", err.c_str());
+        json data;
+        data["error"] = err;
+        data["token_endpoint_host"] = endpoint_log.host;
+        data["token_endpoint_path"] = endpoint_log.path;
+        data["token_endpoint_len"] = endpoint_log.length;
+        data["client_id_len"] = cid.size();
+        data["refresh_token_len"] = rt.size();
+        data["status"] = "refresh_failed";
+        return error_with_data(std::string("refresh failed: ") + err, data);
+    }
     diag::log_tagged_fmt("mcp_burp", "auth_oauth2_refresh ok host=%s path=%s access_token_len=%zu expires_in=%d",
         endpoint_log.host.c_str(), endpoint_log.path.c_str(), at.size(), exp);
     json out;

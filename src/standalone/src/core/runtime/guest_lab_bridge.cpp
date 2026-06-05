@@ -49,6 +49,114 @@ uint64_t now_ms() {
 	return static_cast<uint64_t>(GetTickCount64());
 }
 
+std::string path_utf8(const fs::path& path) {
+	return narrow_utf8(path.wstring());
+}
+
+bool exists_clean(const fs::path& path, std::string* error_out = nullptr) {
+	std::error_code ec;
+	const bool exists = fs::exists(path, ec);
+	if (error_out) *error_out = ec ? ec.message() : std::string();
+	return !ec && exists;
+}
+
+uint32_t count_json_files(const fs::path& dir, std::string* error_out = nullptr) {
+	std::error_code ec;
+	if (!fs::exists(dir, ec)) {
+		if (error_out) *error_out = ec ? ec.message() : "missing";
+		return 0;
+	}
+	uint32_t count = 0;
+	for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+		std::error_code type_ec;
+		if (it->is_regular_file(type_ec) && it->path().extension() == L".json")
+			++count;
+	}
+	if (error_out) *error_out = ec ? ec.message() : std::string();
+	return count;
+}
+
+bool json_bool_field(const nlohmann::json& value, const char* key, bool fallback) {
+	if (!value.is_object())
+		return fallback;
+	auto it = value.find(key);
+	if (it == value.end())
+		return fallback;
+	if (it->is_boolean())
+		return it->get<bool>();
+	if (it->is_number_unsigned())
+		return it->get<uint64_t>() != 0;
+	if (it->is_number_integer())
+		return it->get<int64_t>() != 0;
+	return fallback;
+}
+
+std::string json_string_field(const nlohmann::json& value, const char* key, const std::string& fallback) {
+	if (!value.is_object())
+		return fallback;
+	auto it = value.find(key);
+	if (it == value.end() || !it->is_string())
+		return fallback;
+	return it->get<std::string>();
+}
+
+void log_request_state(const char* phase,
+                       const active_session_t& session,
+                       const std::string& command,
+                       const std::string& id,
+                       const fs::path& request_path,
+                       const fs::path& response_path,
+                       uint32_t timeout_ms,
+                       uint64_t elapsed_ms,
+                       const std::string& detail) {
+	const fs::path bridge = session.bridge_dir;
+	const fs::path requests = bridge / L"requests";
+	const fs::path responses = bridge / L"responses";
+	std::string bridge_error;
+	std::string requests_error;
+	std::string responses_error;
+	std::string request_file_error;
+	std::string response_file_error;
+	const bool bridge_exists = exists_clean(bridge, &bridge_error);
+	const bool requests_exists = exists_clean(requests, &requests_error);
+	const bool responses_exists = exists_clean(responses, &responses_error);
+	const bool request_file_exists = exists_clean(request_path, &request_file_error);
+	const bool response_file_exists = exists_clean(response_path, &response_file_error);
+	std::string pending_requests_error;
+	std::string pending_responses_error;
+	const uint32_t pending_requests = count_json_files(requests, &pending_requests_error);
+	const uint32_t pending_responses = count_json_files(responses, &pending_responses_error);
+	const uint64_t age_ms = session.started_ms != 0 && now_ms() >= session.started_ms ? now_ms() - session.started_ms : 0;
+	diag::log_tagged_fmt("guest_lab",
+		"%s id='%s' command='%s' timeout_ms=%u elapsed_ms=%llu session_age_ms=%llu bridge='%s' requests='%s' responses='%s' request_path='%s' response_path='%s' bridge_exists=%d requests_exists=%d responses_exists=%d request_file_exists=%d response_file_exists=%d pending_requests=%u pending_responses=%u bridge_error='%s' requests_error='%s' responses_error='%s' request_file_error='%s' response_file_error='%s' pending_requests_error='%s' pending_responses_error='%s' detail='%s'",
+		phase ? phase : "request_state",
+		id.c_str(),
+		command.c_str(),
+		static_cast<unsigned>(timeout_ms),
+		static_cast<unsigned long long>(elapsed_ms),
+		static_cast<unsigned long long>(age_ms),
+		path_utf8(bridge).c_str(),
+		path_utf8(requests).c_str(),
+		path_utf8(responses).c_str(),
+		path_utf8(request_path).c_str(),
+		path_utf8(response_path).c_str(),
+		bridge_exists ? 1 : 0,
+		requests_exists ? 1 : 0,
+		responses_exists ? 1 : 0,
+		request_file_exists ? 1 : 0,
+		response_file_exists ? 1 : 0,
+		static_cast<unsigned>(pending_requests),
+		static_cast<unsigned>(pending_responses),
+		bridge_error.c_str(),
+		requests_error.c_str(),
+		responses_error.c_str(),
+		request_file_error.c_str(),
+		response_file_error.c_str(),
+		pending_requests_error.c_str(),
+		pending_responses_error.c_str(),
+		detail.c_str());
+}
+
 bool write_text_file(const fs::path& path, const std::string& text) {
 	std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
 	if (!ofs.is_open()) return false;
@@ -169,10 +277,10 @@ nlohmann::json request(const std::string& command,
 	fs::path bridge = session.bridge_dir;
 	fs::path requests = bridge / L"requests";
 	fs::path responses = bridge / L"responses";
-	std::error_code ec;
-	fs::create_directories(requests, ec);
-	ec.clear();
-	fs::create_directories(responses, ec);
+	std::error_code requests_ec;
+	fs::create_directories(requests, requests_ec);
+	std::error_code responses_ec;
+	fs::create_directories(responses, responses_ec);
 	std::string id = make_request_id();
 	nlohmann::json req;
 	req["id"] = id;
@@ -181,30 +289,83 @@ nlohmann::json request(const std::string& command,
 	req["created_host_ms"] = now_ms();
 	fs::path request_path = requests / (widen_utf8(id) + L".json");
 	fs::path response_path = responses / (widen_utf8(id) + L".json");
+	const uint64_t request_started_ms = now_ms();
+	if (requests_ec || responses_ec) {
+		std::string detail = "create_directories requests_error='" + requests_ec.message() +
+			"' responses_error='" + responses_ec.message() + "'";
+		log_request_state("request_dir_create_error", session, command, id, request_path,
+			response_path, timeout_ms, 0, detail);
+	}
 	if (!write_json_atomic(request_path, req)) {
-		if (error_out) *error_out = "failed to write guest request";
+		log_request_state("request_write_failed", session, command, id, request_path,
+			response_path, timeout_ms, now_ms() - request_started_ms, "write_json_atomic_failed");
+		if (error_out) *error_out = "failed to write guest request id=" + id +
+			" path=" + path_utf8(request_path);
 		return {};
 	}
 	diag::log_tagged_fmt("guest_lab",
-		"request id='%s' command='%s' timeout_ms=%u",
-		id.c_str(), command.c_str(), static_cast<unsigned>(timeout_ms));
+		"request_written id='%s' command='%s' timeout_ms=%u request_path='%s' response_path='%s'",
+		id.c_str(), command.c_str(), static_cast<unsigned>(timeout_ms),
+		path_utf8(request_path).c_str(), path_utf8(response_path).c_str());
 	auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+	std::string last_exists_error;
+	bool logged_exists_error = false;
 	while (std::chrono::steady_clock::now() < deadline) {
-		if (fs::exists(response_path, ec)) {
+		std::error_code exists_ec;
+		if (fs::exists(response_path, exists_ec)) {
 			nlohmann::json response;
-			if (!read_json_limited(response_path, response, error_out)) return {};
-			ec.clear();
-			fs::remove(response_path, ec);
-			bool ok = response.value("ok", false);
+			if (!read_json_limited(response_path, response, error_out)) {
+				const std::string detail = error_out ? *error_out : "read_json_limited_failed";
+				log_request_state("response_read_failed", session, command, id, request_path,
+					response_path, timeout_ms, now_ms() - request_started_ms, detail);
+				return {};
+			}
+			std::error_code remove_ec;
+			fs::remove(response_path, remove_ec);
+			if (!response.is_object()) {
+				const std::string type_name = response.type_name();
+				const std::string detail = "response_type=" + type_name;
+				log_request_state("response_invalid_type", session, command, id, request_path,
+					response_path, timeout_ms, now_ms() - request_started_ms, detail);
+				if (error_out) *error_out = "guest response was not a JSON object: " + type_name;
+				return {};
+			}
+			bool ok = json_bool_field(response, "ok", false);
 			if (!ok) {
-				if (error_out) *error_out = response.value("error", std::string("guest command failed"));
+				const std::string guest_error = json_string_field(response, "error", "guest command failed");
+				const std::string detail = "guest_error='" + guest_error + "' remove_error='" + remove_ec.message() + "'";
+				log_request_state("response_guest_failed", session, command, id, request_path,
+					response_path, timeout_ms, now_ms() - request_started_ms, detail);
+				if (error_out) *error_out = guest_error;
 				return response;
 			}
+			const std::string detail = "remove_error='" + remove_ec.message() +
+				"' data_type='" + (response.contains("data") ? response["data"].type_name() : "missing") + "'";
+			log_request_state("response_ok", session, command, id, request_path,
+				response_path, timeout_ms, now_ms() - request_started_ms, detail);
 			return response;
+		}
+		if (exists_ec && !logged_exists_error) {
+			last_exists_error = exists_ec.message();
+			log_request_state("response_exists_error", session, command, id, request_path,
+				response_path, timeout_ms, now_ms() - request_started_ms, last_exists_error);
+			logged_exists_error = true;
 		}
 		std::this_thread::sleep_for(std::chrono::milliseconds(50));
 	}
-	if (error_out) *error_out = "guest agent timed out waiting for command: " + command;
+	const uint64_t elapsed_ms = now_ms() - request_started_ms;
+	const std::string detail = last_exists_error.empty()
+		? "deadline_expired"
+		: "deadline_expired last_exists_error='" + last_exists_error + "'";
+	log_request_state("request_timeout", session, command, id, request_path,
+		response_path, timeout_ms, elapsed_ms, detail);
+	if (error_out) *error_out = "guest agent timed out waiting for command: " + command +
+		" id=" + id +
+		" elapsed_ms=" + std::to_string(elapsed_ms) +
+		" timeout_ms=" + std::to_string(timeout_ms) +
+		" bridge_dir=" + path_utf8(bridge) +
+		" request_path=" + path_utf8(request_path) +
+		" response_path=" + path_utf8(response_path);
 	return {};
 }
 

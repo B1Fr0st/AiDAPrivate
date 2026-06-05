@@ -1,425 +1,395 @@
-#include "aida_ipc.hpp"
-
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+
+#include "aida_ipc.hpp"
+
+#include "aida_pro.hpp"
+
 #include <windows.h>
-#include <bcrypt.h>
 
 #include <atomic>
 #include <chrono>
-#include <cstdio>
-#include <cstring>
-#include <exception>
+#include <cstdint>
+#include <cstdlib>
+#include <fstream>
+#include <iterator>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
-#include <openssl/hmac.h>
-#include <openssl/evp.h>
-
-#pragma comment(lib, "bcrypt.lib")
-
 namespace
 {
-    using namespace aida_manual_map;
+    constexpr int   kDefaultStandaloneMcpPort      = 29117;
+    constexpr int   kVerifyConnectionTimeoutSec    = 1;
+    constexpr int   kVerifyReadTimeoutSec          = 2;
+    constexpr DWORD kWatchdogIntervalMs            = 5000;
+    constexpr int   kWatchdogFailThreshold         = 3;
+    constexpr DWORD kStandaloneAuthFastFailCode    = 0xA1DA1DA1u;
 
-    constexpr DWORD kConnectAttemptTimeoutMs   = 5000;
-    constexpr DWORD kConnectRetryBackoffMs     = 250;
-    constexpr DWORD kHeartbeatIntervalMs       = 2000;
-    constexpr DWORD kReadTimeoutMs             = 6000;
-    constexpr int   kMaxConsecutiveFailures    = 5;
-    constexpr DWORD kKillFastFailCode          = 0xA1DAB1FFu;
+    std::atomic<bool> g_watchdog_running{false};
+    std::atomic<bool> g_watchdog_started{false};
+    std::atomic<bool> g_standalone_authenticated{false};
+    std::atomic<int>  g_verified_port{0};
+    std::mutex        g_state_mutex;
+    std::string       g_last_failure;
 
-    std::mutex                         g_mutex;
-    HANDLE                             g_pipe = INVALID_HANDLE_VALUE;
-    std::atomic<bool>                  g_running{false};
-    std::atomic<bool>                  g_authenticated{false};
-    std::atomic<bool>                  g_thread_started{false};
-    std::atomic<uint64_t>              g_last_heartbeat_ack_tick{0};
-    std::vector<uint8_t>               g_pipe_secret;
-    proof_buffer_t                     g_proof{};
-
-    bool compute_hmac_sha256(const uint8_t* key, size_t key_len,
-                              const uint8_t* data, size_t data_len,
-                              uint8_t out_mac[32])
+    bool valid_port(int port)
     {
-        unsigned int mac_len = 0;
-        unsigned char mac_buf[EVP_MAX_MD_SIZE] = {};
-        if (HMAC(EVP_sha256(), key, static_cast<int>(key_len),
-                 data, data_len, mac_buf, &mac_len) == nullptr)
+        return port > 0 && port <= 65535;
+    }
+
+    void set_failure(const std::string& failure)
+    {
+        std::lock_guard<std::mutex> lk(g_state_mutex);
+        g_last_failure = failure;
+    }
+
+    bool parse_port_text(const char* text, int& out_port)
+    {
+        if (text == nullptr || *text == '\0')
             return false;
-        if (mac_len != 32)
+        char* end = nullptr;
+        long value = std::strtol(text, &end, 10);
+        if (end == text || (end != nullptr && *end != '\0'))
             return false;
-        std::memcpy(out_mac, mac_buf, 32);
+        if (!valid_port(static_cast<int>(value)))
+            return false;
+        out_port = static_cast<int>(value);
         return true;
     }
 
-    bool constant_time_eq(const uint8_t* a, const uint8_t* b, size_t n)
+    bool read_env_port(int& out_port)
     {
-        uint8_t diff = 0;
-        for (size_t i = 0; i < n; ++i)
-            diff |= static_cast<uint8_t>(a[i] ^ b[i]);
-        return diff == 0;
+        char value[32] = {};
+        DWORD n = GetEnvironmentVariableA("AIDA_STANDALONE_MCP_PORT", value, static_cast<DWORD>(sizeof(value)));
+        if (n == 0 || n >= sizeof(value))
+            return false;
+        return parse_port_text(value, out_port);
     }
 
-    bool write_all(HANDLE pipe, const void* data, size_t n)
+    std::string standalone_settings_path()
     {
-        const uint8_t* p = static_cast<const uint8_t*>(data);
-        size_t total = 0;
-        while (total < n)
-        {
-            DWORD wrote = 0;
-            if (!WriteFile(pipe, p + total,
-                           static_cast<DWORD>(n - total), &wrote, nullptr))
-                return false;
-            if (wrote == 0)
-                return false;
-            total += wrote;
-        }
+        char appdata[MAX_PATH] = {};
+        DWORD n = GetEnvironmentVariableA("APPDATA", appdata, static_cast<DWORD>(sizeof(appdata)));
+        if (n == 0 || n >= sizeof(appdata))
+            return {};
+        std::string path(appdata);
+        if (!path.empty() && path.back() != '\\' && path.back() != '/')
+            path.push_back('\\');
+        path += "AiDA\\Standalone\\settings.json";
+        return path;
+    }
+
+    bool read_settings_port(int& out_port)
+    {
+        const std::string path = standalone_settings_path();
+        if (path.empty())
+            return false;
+        std::ifstream in(path, std::ios::binary);
+        if (!in)
+            return false;
+        std::string data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        if (data.empty())
+            return false;
+        nlohmann::json j = nlohmann::json::parse(data, nullptr, false);
+        if (j.is_discarded() || !j.is_object())
+            return false;
+        if (j.contains("mcp_enabled") && j["mcp_enabled"].is_boolean() && !j["mcp_enabled"].get<bool>())
+            return false;
+        if (!j.contains("mcp_port") || !j["mcp_port"].is_number_integer())
+            return false;
+        int port = j["mcp_port"].get<int>();
+        if (!valid_port(port))
+            return false;
+        out_port = port;
         return true;
     }
 
-    bool read_all_with_timeout(HANDLE pipe, void* data, size_t n, DWORD timeout_ms)
+    void add_unique_port(std::vector<int>& ports, int port)
     {
-        uint8_t* p = static_cast<uint8_t*>(data);
-        size_t total = 0;
-        ULONGLONG deadline = GetTickCount64() + timeout_ms;
-        while (total < n)
-        {
-            DWORD avail = 0;
-            if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &avail, nullptr))
-                return false;
-            if (avail == 0)
-            {
-                if (GetTickCount64() >= deadline)
-                    return false;
-                Sleep(20);
-                continue;
-            }
-            DWORD got = 0;
-            DWORD want = static_cast<DWORD>(n - total);
-            if (avail < want)
-                want = avail;
-            if (!ReadFile(pipe, p + total, want, &got, nullptr))
-                return false;
-            if (got == 0)
-                return false;
-            total += got;
-        }
-        return true;
-    }
-
-    bool send_frame(HANDLE pipe, uint32_t verb,
-                    const uint8_t* payload, size_t payload_len)
-    {
-        if (payload_len > kFrameMaxPayload)
-            return false;
-        frame_header_t header{};
-        header.verb = verb;
-        header.payload_len = static_cast<uint32_t>(payload_len);
-        if (!write_all(pipe, &header, sizeof(header)))
-            return false;
-        if (payload_len > 0)
-            if (!write_all(pipe, payload, payload_len))
-                return false;
-        return true;
-    }
-
-    bool recv_frame(HANDLE pipe, uint32_t& out_verb,
-                    std::vector<uint8_t>& out_payload, DWORD timeout_ms)
-    {
-        frame_header_t header{};
-        if (!read_all_with_timeout(pipe, &header, sizeof(header), timeout_ms))
-            return false;
-        if (header.payload_len > kFrameMaxPayload)
-            return false;
-        out_verb = header.verb;
-        out_payload.resize(header.payload_len);
-        if (header.payload_len > 0)
-            if (!read_all_with_timeout(pipe, out_payload.data(),
-                                        header.payload_len, timeout_ms))
-                return false;
-        return true;
-    }
-
-    HANDLE open_pipe_with_timeout(const std::wstring& pipe_path, DWORD timeout_ms)
-    {
-        ULONGLONG deadline = GetTickCount64() + timeout_ms;
-        for (;;)
-        {
-            HANDLE h = CreateFileW(pipe_path.c_str(),
-                                    GENERIC_READ | GENERIC_WRITE,
-                                    0, nullptr, OPEN_EXISTING,
-                                    FILE_FLAG_OVERLAPPED == 0 ? 0 : 0, nullptr);
-            if (h != INVALID_HANDLE_VALUE)
-            {
-                DWORD mode = PIPE_READMODE_BYTE;
-                SetNamedPipeHandleState(h, &mode, nullptr, nullptr);
-                return h;
-            }
-            DWORD err = GetLastError();
-            if (err != ERROR_PIPE_BUSY && err != ERROR_FILE_NOT_FOUND)
-                return INVALID_HANDLE_VALUE;
-            ULONGLONG now = GetTickCount64();
-            if (now >= deadline)
-                return INVALID_HANDLE_VALUE;
-            DWORD remaining = static_cast<DWORD>(deadline - now);
-            if (remaining > 1000)
-                remaining = 1000;
-            if (err == ERROR_PIPE_BUSY)
-            {
-                if (!WaitNamedPipeW(pipe_path.c_str(), remaining))
-                    Sleep(kConnectRetryBackoffMs);
-            }
-            else
-            {
-                Sleep(kConnectRetryBackoffMs);
-            }
-        }
-    }
-
-    bool perform_handshake(HANDLE pipe)
-    {
-        uint8_t hello_payload[16 + 32] = {};
-        if (BCryptGenRandom(nullptr, hello_payload, 16,
-                             BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0)
-            return false;
-        uint8_t auth_input[5 + 16] = { 'H','E','L','L','O' };
-        std::memcpy(auth_input + 5, hello_payload, 16);
-        if (!compute_hmac_sha256(g_pipe_secret.data(), g_pipe_secret.size(),
-                                  auth_input, sizeof(auth_input),
-                                  hello_payload + 16))
-            return false;
-
-        if (!send_frame(pipe, verb_hello, hello_payload, sizeof(hello_payload)))
-            return false;
-
-        uint32_t verb = 0;
-        std::vector<uint8_t> payload;
-        if (!recv_frame(pipe, verb, payload, kReadTimeoutMs))
-            return false;
-        if (verb != verb_hello_ack || payload.size() != 32)
-            return false;
-
-        uint8_t ack_input[9 + 16] = { 'H','E','L','L','O','_','A','C','K' };
-        std::memcpy(ack_input + 9, hello_payload, 16);
-        uint8_t expected_mac[32] = {};
-        if (!compute_hmac_sha256(g_pipe_secret.data(), g_pipe_secret.size(),
-                                  ack_input, sizeof(ack_input), expected_mac))
-            return false;
-        if (!constant_time_eq(payload.data(), expected_mac, 32))
-            return false;
-
-        return true;
-    }
-
-    bool send_status(HANDLE pipe, uint32_t code, const char* msg)
-    {
-        std::vector<uint8_t> payload;
-        size_t msg_len = msg ? std::strlen(msg) : 0;
-        if (msg_len > kFrameMaxPayload - 4 - 32)
-            msg_len = kFrameMaxPayload - 4 - 32;
-        payload.resize(4 + msg_len + 32);
-        std::memcpy(payload.data(), &code, 4);
-        if (msg_len > 0)
-            std::memcpy(payload.data() + 4, msg, msg_len);
-        std::vector<uint8_t> hmac_in;
-        hmac_in.resize(6 + 4 + msg_len);
-        std::memcpy(hmac_in.data(), "STATUS", 6);
-        std::memcpy(hmac_in.data() + 6, &code, 4);
-        if (msg_len > 0)
-            std::memcpy(hmac_in.data() + 10, msg, msg_len);
-        uint8_t mac[32] = {};
-        if (!compute_hmac_sha256(g_pipe_secret.data(), g_pipe_secret.size(),
-                                  hmac_in.data(), hmac_in.size(), mac))
-            return false;
-        std::memcpy(payload.data() + 4 + msg_len, mac, 32);
-        return send_frame(pipe, verb_status, payload.data(), payload.size());
-    }
-
-    bool send_heartbeat(HANDLE pipe)
-    {
-        uint8_t payload[8 + 32] = {};
-        uint64_t ts = static_cast<uint64_t>(GetTickCount64());
-        std::memcpy(payload, &ts, 8);
-        uint8_t hmac_in[9 + 8] = { 'H','E','A','R','T','B','E','A','T' };
-        std::memcpy(hmac_in + 9, &ts, 8);
-        if (!compute_hmac_sha256(g_pipe_secret.data(), g_pipe_secret.size(),
-                                  hmac_in, sizeof(hmac_in), payload + 8))
-            return false;
-        return send_frame(pipe, verb_heartbeat, payload, sizeof(payload));
-    }
-
-    bool verify_kill(const std::vector<uint8_t>& payload)
-    {
-        if (payload.size() != 32)
-            return false;
-        uint8_t mac[32] = {};
-        if (!compute_hmac_sha256(g_pipe_secret.data(), g_pipe_secret.size(),
-                                  reinterpret_cast<const uint8_t*>("KILL"), 4,
-                                  mac))
-            return false;
-        return constant_time_eq(payload.data(), mac, 32);
-    }
-
-    void close_pipe_locked()
-    {
-        if (g_pipe != INVALID_HANDLE_VALUE)
-        {
-            CloseHandle(g_pipe);
-            g_pipe = INVALID_HANDLE_VALUE;
-        }
-    }
-
-    void worker_thread()
-    {
-        wchar_t pipe_path[64] = {};
-        std::swprintf(pipe_path, 64, L"%s%llu",
-                      kPipePrefix,
-                      static_cast<unsigned long long>(GetCurrentProcessId()));
-
-        HANDLE pipe = open_pipe_with_timeout(pipe_path, kConnectAttemptTimeoutMs);
-        if (pipe == INVALID_HANDLE_VALUE)
-        {
-            g_running.store(false, std::memory_order_release);
+        if (!valid_port(port))
             return;
-        }
+        for (int existing : ports)
+            if (existing == port)
+                return;
+        ports.push_back(port);
+    }
 
-        if (!perform_handshake(pipe))
+    std::vector<int> candidate_ports()
+    {
+        std::vector<int> ports;
+        int port = 0;
+        if (read_env_port(port))
+            add_unique_port(ports, port);
+        if (read_settings_port(port))
+            add_unique_port(ports, port);
+        add_unique_port(ports, kDefaultStandaloneMcpPort);
+        return ports;
+    }
+
+    bool process_basename_is_standalone(uint32_t pid)
+    {
+        if (pid == 0 || pid == GetCurrentProcessId())
+            return false;
+        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (!process)
+            return false;
+        wchar_t image[MAX_PATH * 2] = {};
+        DWORD size = static_cast<DWORD>(sizeof(image) / sizeof(image[0]));
+        BOOL ok = QueryFullProcessImageNameW(process, 0, image, &size);
+        CloseHandle(process);
+        if (!ok || size == 0)
+            return false;
+        const wchar_t* base = image;
+        for (const wchar_t* p = image; *p != L'\0'; ++p)
+            if (*p == L'\\' || *p == L'/')
+                base = p + 1;
+        return _wcsicmp(base, L"AiDAStandalone.exe") == 0;
+    }
+
+    bool verify_health_payload(const nlohmann::json& health, std::string& failure)
+    {
+        if (!health.is_object())
         {
-            CloseHandle(pipe);
-            g_running.store(false, std::memory_order_release);
-            return;
+            failure = "health response was not JSON object";
+            return false;
         }
-
+        if (health.value("status", std::string()) != "ok")
         {
-            std::lock_guard<std::mutex> lk(g_mutex);
-            g_pipe = pipe;
+            failure = "health status was not ok";
+            return false;
         }
-        g_authenticated.store(true, std::memory_order_release);
-        g_last_heartbeat_ack_tick.store(GetTickCount64(),
-                                         std::memory_order_release);
+        if (health.value("server", std::string()) != "aida-pro-mcp")
+        {
+            failure = "health server identity mismatch";
+            return false;
+        }
+        if (!health.value("authenticated", false) ||
+            !health.value("validated", false) ||
+            !health.value("arc_loaded", false) ||
+            !health.value("lifecycle_ready", false))
+        {
+            failure = "standalone runtime is not authenticated";
+            return false;
+        }
+        uint32_t pid = 0;
+        if (health.contains("pid") && health["pid"].is_number_unsigned())
+            pid = health["pid"].get<uint32_t>();
+        else if (health.contains("pid") && health["pid"].is_number_integer())
+        {
+            int64_t signed_pid = health["pid"].get<int64_t>();
+            if (signed_pid > 0 && signed_pid <= 0xFFFFFFFFll)
+                pid = static_cast<uint32_t>(signed_pid);
+        }
+        if (!process_basename_is_standalone(pid))
+        {
+            failure = "standalone process identity mismatch";
+            return false;
+        }
+        return true;
+    }
 
-        send_status(pipe, 0, "init_ok");
+    bool verify_initialize_payload(const nlohmann::json& response, std::string& failure)
+    {
+        if (!response.is_object())
+        {
+            failure = "initialize response was not JSON object";
+            return false;
+        }
+        if (response.contains("error"))
+        {
+            failure = "standalone initialize returned error";
+            return false;
+        }
+        if (!response.contains("result") || !response["result"].is_object())
+        {
+            failure = "initialize result missing";
+            return false;
+        }
+        const auto& result = response["result"];
+        if (result.value("protocolVersion", std::string()) != "2025-06-18")
+        {
+            failure = "standalone protocol mismatch";
+            return false;
+        }
+        if (!result.contains("serverInfo") || !result["serverInfo"].is_object())
+        {
+            failure = "standalone serverInfo missing";
+            return false;
+        }
+        const auto& server_info = result["serverInfo"];
+        if (server_info.value("name", std::string()) != "aida-pro-mcp")
+        {
+            failure = "standalone MCP identity mismatch";
+            return false;
+        }
+        return true;
+    }
 
+    bool verify_port(int port, std::string& failure)
+    {
+        try
+        {
+            httplib::Client client("127.0.0.1", port);
+            client.set_connection_timeout(kVerifyConnectionTimeoutSec);
+            client.set_read_timeout(kVerifyReadTimeoutSec);
+            client.set_write_timeout(kVerifyReadTimeoutSec);
+            client.set_keep_alive(false);
+
+            auto health_res = client.Get("/health");
+            if (!health_res)
+            {
+                failure = "no health response on port " + std::to_string(port);
+                return false;
+            }
+            if (health_res->status != 200)
+            {
+                failure = "health returned HTTP " + std::to_string(health_res->status);
+                return false;
+            }
+            nlohmann::json health = nlohmann::json::parse(health_res->body, nullptr, false);
+            if (!verify_health_payload(health, failure))
+                return false;
+
+            nlohmann::json init_req;
+            init_req["jsonrpc"] = "2.0";
+            init_req["id"] = "aida-plugin-auth";
+            init_req["method"] = "initialize";
+            init_req["params"] = {
+                {"protocolVersion", "2025-06-18"},
+                {"capabilities", nlohmann::json::object()},
+                {"clientInfo", {{"name", "aida-plugin"}, {"version", AIDA_VERSION}}}
+            };
+
+            httplib::Headers headers = {
+                {"Content-Type", "application/json"},
+                {"Accept", "application/json"},
+                {"MCP-Protocol-Version", "2025-06-18"}
+            };
+            auto init_res = client.Post("/mcp", headers, json_dump_safe(init_req), "application/json");
+            if (!init_res)
+            {
+                failure = "no initialize response on port " + std::to_string(port);
+                return false;
+            }
+            if (init_res->status < 200 || init_res->status >= 300)
+            {
+                failure = "initialize returned HTTP " + std::to_string(init_res->status);
+                return false;
+            }
+            nlohmann::json init_json = nlohmann::json::parse(init_res->body, nullptr, false);
+            if (!verify_initialize_payload(init_json, failure))
+                return false;
+            return true;
+        }
+        catch (const std::exception& ex)
+        {
+            failure = ex.what();
+            return false;
+        }
+        catch (...)
+        {
+            failure = "unknown verification exception";
+            return false;
+        }
+    }
+
+    bool verify_any_candidate(std::string* failure)
+    {
+        std::string last;
+        for (int port : candidate_ports())
+        {
+            std::string port_failure;
+            if (verify_port(port, port_failure))
+            {
+                g_verified_port.store(port, std::memory_order_release);
+                g_standalone_authenticated.store(true, std::memory_order_release);
+                set_failure({});
+                return true;
+            }
+            last = port_failure;
+        }
+        if (last.empty())
+            last = "no standalone MCP candidate port responded";
+        g_standalone_authenticated.store(false, std::memory_order_release);
+        set_failure(last);
+        if (failure)
+            *failure = last;
+        return false;
+    }
+
+    void watchdog_thread()
+    {
         int consecutive_failures = 0;
-        while (g_running.load(std::memory_order_acquire))
+        while (g_watchdog_running.load(std::memory_order_acquire))
         {
-            DWORD avail = 0;
-            BOOL peek_ok = PeekNamedPipe(pipe, nullptr, 0, nullptr, &avail, nullptr);
-            if (!peek_ok)
+            Sleep(kWatchdogIntervalMs);
+            if (!g_watchdog_running.load(std::memory_order_acquire))
+                break;
+
+            std::string failure;
+            bool ok = false;
+            int port = g_verified_port.load(std::memory_order_acquire);
+            if (valid_port(port))
+                ok = verify_port(port, failure);
+            if (!ok)
+                ok = verify_any_candidate(&failure);
+
+            if (ok)
             {
-                ++consecutive_failures;
-                if (consecutive_failures >= kMaxConsecutiveFailures)
-                    break;
-                Sleep(100);
+                consecutive_failures = 0;
                 continue;
             }
 
-            if (avail >= sizeof(frame_header_t))
-            {
-                uint32_t verb = 0;
-                std::vector<uint8_t> payload;
-                if (!recv_frame(pipe, verb, payload, kReadTimeoutMs))
-                {
-                    ++consecutive_failures;
-                    if (consecutive_failures >= kMaxConsecutiveFailures)
-                        break;
-                    continue;
-                }
-                consecutive_failures = 0;
-                switch (verb)
-                {
-                    case verb_kill:
-                        if (verify_kill(payload))
-                        {
-                            send_frame(pipe,
-                                       verb_bye, nullptr, 0);
-                            close_pipe_locked();
-                            ExitProcess(kKillFastFailCode);
-                        }
-                        break;
-                    case verb_heartbeat:
-                        g_last_heartbeat_ack_tick.store(GetTickCount64(),
-                                                         std::memory_order_release);
-                        break;
-                    default:
-                        break;
-                }
-            }
-
-            ULONGLONG now = GetTickCount64();
-            static ULONGLONG last_hb_sent = 0;
-            if (now - last_hb_sent >= kHeartbeatIntervalMs)
-            {
-                if (!send_heartbeat(pipe))
-                {
-                    ++consecutive_failures;
-                    if (consecutive_failures >= kMaxConsecutiveFailures)
-                        break;
-                }
-                last_hb_sent = now;
-            }
-            Sleep(50);
+            ++consecutive_failures;
+            if (consecutive_failures >= kWatchdogFailThreshold)
+                __fastfail(kStandaloneAuthFastFailCode);
         }
-
-        {
-            std::lock_guard<std::mutex> lk(g_mutex);
-            close_pipe_locked();
-        }
-        g_running.store(false, std::memory_order_release);
-        g_authenticated.store(false, std::memory_order_release);
+        g_standalone_authenticated.store(false, std::memory_order_release);
+        g_watchdog_started.store(false, std::memory_order_release);
     }
 }
 
 namespace aida_ipc
 {
-    bool start_if_manual_mapped(const aida_manual_map::proof_buffer_t& proof)
+    bool verify_standalone_runtime(std::string* failure)
+    {
+        return verify_any_candidate(failure);
+    }
+
+    bool start_standalone_watchdog()
     {
         bool expected = false;
-        if (!g_thread_started.compare_exchange_strong(expected, true))
-            return g_running.load(std::memory_order_acquire);
-
-        g_proof = proof;
-        g_pipe_secret.assign(proof.pipe_secret,
-                              proof.pipe_secret + aida_manual_map::kPipeSecretLen);
-        g_running.store(true, std::memory_order_release);
+        if (!g_watchdog_started.compare_exchange_strong(expected, true))
+            return g_watchdog_running.load(std::memory_order_acquire);
+        g_watchdog_running.store(true, std::memory_order_release);
         try
         {
-            std::thread(worker_thread).detach();
+            std::thread(watchdog_thread).detach();
+            return true;
         }
         catch (...)
         {
-            g_running.store(false, std::memory_order_release);
-            g_authenticated.store(false, std::memory_order_release);
-            g_thread_started.store(false, std::memory_order_release);
-            SecureZeroMemory(g_pipe_secret.data(), g_pipe_secret.size());
-            g_pipe_secret.clear();
+            g_watchdog_running.store(false, std::memory_order_release);
+            g_watchdog_started.store(false, std::memory_order_release);
+            g_standalone_authenticated.store(false, std::memory_order_release);
             return false;
         }
-        return true;
     }
 
     void shutdown()
     {
-        g_running.store(false, std::memory_order_release);
-        std::lock_guard<std::mutex> lk(g_mutex);
-        if (g_pipe != INVALID_HANDLE_VALUE)
-        {
-            send_frame(g_pipe, verb_bye, nullptr, 0);
-            CloseHandle(g_pipe);
-            g_pipe = INVALID_HANDLE_VALUE;
-        }
+        g_watchdog_running.store(false, std::memory_order_release);
+        g_standalone_authenticated.store(false, std::memory_order_release);
     }
 
-    bool is_pipe_alive()
+    bool is_standalone_alive()
     {
-        return g_running.load(std::memory_order_acquire)
-            && g_authenticated.load(std::memory_order_acquire);
+        return g_standalone_authenticated.load(std::memory_order_acquire);
     }
 }

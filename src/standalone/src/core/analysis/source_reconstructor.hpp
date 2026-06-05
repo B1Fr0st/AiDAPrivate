@@ -55,11 +55,15 @@ struct reconstruction_config_t {
 struct reconstruction_result_t {
 	bool        success = false;
 	std::string error;
+	std::string module_name;
+	uint64_t    module_base = 0;
+	uint32_t    module_size = 0;
 	int         total_functions = 0;
 	int         decompiled_functions = 0;
 	int         modules_created = 0;
 	std::vector<std::string> files_created;
 	std::string output_dir;
+	ghidra_decompiler::preload_diagnostics_t preload;
 };
 
 struct function_info_t {
@@ -696,11 +700,17 @@ inline void reconstruct(const reconstruction_config_t& config) {
 		g_state.status_text = "Starting reconstruction...";
 		g_state.last_result = {};
 		g_state.last_result.output_dir = config.output_dir;
+		g_state.last_result.module_name = config.module_name;
+		g_state.last_result.module_base = config.module_base;
+		g_state.last_result.module_size = config.module_size;
 	}
 
 	work_queue::post([config]() {
 		reconstruction_result_t result;
 		result.output_dir = config.output_dir;
+		result.module_name = config.module_name;
+		result.module_base = config.module_base;
+		result.module_size = config.module_size;
 
 		auto finish = [&](bool success, const std::string& err = "") {
 			result.success = success;
@@ -783,11 +793,29 @@ inline void reconstruct(const reconstruction_config_t& config) {
 		g_state.progress.store(0.06f);
 
 		std::vector<uint8_t> module_mem;
+		ghidra_decompiler::preload_diagnostics_t preload_diag{};
 		bool preloaded = ghidra_decompiler::preload_module(
-			config.module_base, config.module_size, module_mem);
+			config.module_base, config.module_size, module_mem, &preload_diag);
+		result.preload = preload_diag;
+		{
+			std::lock_guard<std::mutex> lk(g_state.mutex);
+			g_state.last_result.preload = preload_diag;
+		}
 
 		if (!preloaded) {
-			finish(false, "Failed to preload module memory.");
+			char preload_msg[512];
+			snprintf(preload_msg, sizeof(preload_msg),
+				"Failed to preload module memory base=%s size=%u total_read=%zu chunks_ok=%zu chunks_failed=%zu query_failed=%zu mz=%d pe=%d zero=%d",
+				detail::to_hex(config.module_base).c_str(),
+				static_cast<unsigned>(config.module_size),
+				preload_diag.total_read,
+				preload_diag.chunks_ok,
+				preload_diag.chunks_failed,
+				preload_diag.query_failed,
+				preload_diag.mz ? 1 : 0,
+				preload_diag.pe_header_ok ? 1 : 0,
+				(preload_diag.chunked_read ? preload_diag.zero_padding : preload_diag.whole_read_zero_padding) ? 1 : 0);
+			finish(false, preload_msg);
 			return;
 		}
 

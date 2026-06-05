@@ -43,6 +43,13 @@ namespace {
 		r.parsed.push_back({ std::string(label), value });
 	}
 
+	void fail_result(test_lab::result_t& r, const std::string& error, std::uint32_t status = 0xC0000001u) {
+		r.error = error;
+		r.ntstatus = static_cast<std::int32_t>(status);
+		r.ok = false;
+		r.skipped = false;
+	}
+
 	void copy_into_string_buf(char* dst, std::size_t cap, const std::string& src) {
 		if (cap == 0) return;
 		std::size_t n = src.size();
@@ -270,20 +277,43 @@ namespace {
 		std::uint8_t server_addr[16] = { 0 };
 
 		void close_all() {
-			if (accepted != INVALID_SOCKET) { closesocket(accepted); accepted = INVALID_SOCKET; }
-			if (client != INVALID_SOCKET) { closesocket(client); client = INVALID_SOCKET; }
+			if (accepted != INVALID_SOCKET) { shutdown(accepted, SD_BOTH); closesocket(accepted); accepted = INVALID_SOCKET; }
+			if (client != INVALID_SOCKET) { shutdown(client, SD_BOTH); closesocket(client); client = INVALID_SOCKET; }
 			if (listener != INVALID_SOCKET) { closesocket(listener); listener = INVALID_SOCKET; }
 		}
 
 		~tcp_pair_t() { close_all(); }
 	};
 
-	bool establish_local_tcp_pair(tcp_pair_t& p, std::string& err) {
+	void configure_fixture_socket(SOCKET s) {
+		if (s == INVALID_SOCKET) return;
+		int buf = 4096;
+		setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&buf), sizeof(buf));
+		setsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&buf), sizeof(buf));
+		int nodelay = 1;
+		setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
+		LINGER lin{};
+		lin.l_onoff = 1;
+		lin.l_linger = 0;
+		setsockopt(s, SOL_SOCKET, SO_LINGER, reinterpret_cast<const char*>(&lin), sizeof(lin));
+	}
+
+	bool loopback_resource_precondition(const std::string& err) {
+		return err.find("err=10055") != std::string::npos ||
+			err.find("so_error=10055") != std::string::npos ||
+			err.find("WSAENOBUFS") != std::string::npos;
+	}
+
+	bool bwmn_drive_udp_fixture(std::string& err, std::uint32_t& sent_packets);
+
+	bool establish_local_tcp_pair_once(tcp_pair_t& p, std::string& err) {
+		p.close_all();
 		p.listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 		if (p.listener == INVALID_SOCKET) {
-			err = "socket(listener) failed";
+			err = "socket(listener) failed err=" + std::to_string(WSAGetLastError());
 			return false;
 		}
+		configure_fixture_socket(p.listener);
 		BOOL reuse = TRUE;
 		setsockopt(p.listener, SOL_SOCKET, SO_REUSEADDR,
 			reinterpret_cast<const char*>(&reuse), sizeof(reuse));
@@ -309,44 +339,22 @@ namespace {
 
 		p.client = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 		if (p.client == INVALID_SOCKET) {
-			err = "socket(client) failed";
+			err = "socket(client) failed err=" + std::to_string(WSAGetLastError());
 			return false;
 		}
-		u_long nb = 1;
-		ioctlsocket(p.client, FIONBIO, &nb);
+		DWORD io_timeout_ms = 5000;
+		setsockopt(p.client, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&io_timeout_ms), sizeof(io_timeout_ms));
+		setsockopt(p.client, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&io_timeout_ms), sizeof(io_timeout_ms));
 		sockaddr_in ra{};
 		ra.sin_family = AF_INET;
 		ra.sin_port = htons(p.listen_port);
 		ra.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 		int cr = connect(p.client, reinterpret_cast<const sockaddr*>(&ra), sizeof(ra));
 		if (cr != 0) {
-			int werr = WSAGetLastError();
-			if (werr != WSAEWOULDBLOCK) {
-				err = "connect(client) failed err=" + std::to_string(werr);
-				return false;
-			}
-		}
-		fd_set wfds, efds;
-		FD_ZERO(&wfds); FD_ZERO(&efds);
-		FD_SET(p.client, &wfds);
-		FD_SET(p.client, &efds);
-		timeval tv;
-		tv.tv_sec = 5;
-		tv.tv_usec = 0;
-		int wret = select(0, nullptr, &wfds, &efds, &tv);
-		if (wret <= 0) {
-			err = "connect(client) select timeout/err=" + std::to_string(WSAGetLastError());
+			err = "connect(client) failed err=" + std::to_string(WSAGetLastError());
 			return false;
 		}
-		int so_err = 0;
-		int so_len = static_cast<int>(sizeof(so_err));
-		getsockopt(p.client, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&so_err), &so_len);
-		if (FD_ISSET(p.client, &efds) || so_err != 0) {
-			err = "connect(client) failed so_error=" + std::to_string(so_err);
-			return false;
-		}
-		u_long nb_off = 0;
-		ioctlsocket(p.client, FIONBIO, &nb_off);
+		configure_fixture_socket(p.client);
 
 		sockaddr_in laddr{};
 		int laddr_len = static_cast<int>(sizeof(laddr));
@@ -382,6 +390,335 @@ namespace {
 			err = "accept failed err=" + std::to_string(WSAGetLastError());
 			return false;
 		}
+		configure_fixture_socket(p.accepted);
+		return true;
+	}
+
+	bool establish_local_tcp_pair(tcp_pair_t& p, std::string& err, const char* log_code = nullptr) {
+		const DWORD start_tick = GetTickCount();
+		const int max_attempts = 18;
+		const int max_resource_attempts = 12;
+		int resource_attempts = 0;
+		err.clear();
+		for (int attempt = 1; attempt <= max_attempts; ++attempt) {
+			std::string attempt_err;
+			if (establish_local_tcp_pair_once(p, attempt_err)) {
+				if (log_code != nullptr) {
+					test_lab_format::testlab_diag_log_step("network-action", log_code, "tcp_pair_attempt",
+						"attempt=%d ok=1 elapsed_ms=%lu client_port=%u listen_port=%u",
+						attempt,
+						static_cast<unsigned long>(GetTickCount() - start_tick),
+						p.client_port,
+						p.listen_port);
+				}
+				return true;
+			}
+			p.close_all();
+			err = attempt_err;
+			if (log_code != nullptr) {
+				test_lab_format::testlab_diag_log_step("network-action", log_code, "tcp_pair_attempt",
+					"attempt=%d ok=0 elapsed_ms=%lu err=\"%s\"",
+					attempt,
+					static_cast<unsigned long>(GetTickCount() - start_tick),
+					attempt_err.c_str());
+			}
+			if (loopback_resource_precondition(attempt_err)) {
+				++resource_attempts;
+				if (resource_attempts >= max_resource_attempts) {
+					if (log_code != nullptr) {
+						test_lab_format::testlab_diag_log_step("network-action", log_code, "tcp_pair_resource_fast_fail",
+							"attempt=%d resource_attempts=%d elapsed_ms=%lu err=\"%s\"",
+							attempt,
+							resource_attempts,
+							static_cast<unsigned long>(GetTickCount() - start_tick),
+							attempt_err.c_str());
+					}
+					return false;
+				}
+			}
+			else {
+				resource_attempts = 0;
+			}
+			if (attempt < max_attempts) {
+				DWORD delay_ms = loopback_resource_precondition(attempt_err)
+					? static_cast<DWORD>(40 + attempt * 20)
+					: static_cast<DWORD>(100 + attempt * 25);
+				Sleep(delay_ms);
+			}
+		}
+		return false;
+	}
+
+	struct teardown_probe_t {
+		bool observed = false;
+		std::uint32_t iterations = 0;
+		std::uint32_t successful_sends = 0;
+		int client_recv_rc = SOCKET_ERROR;
+		int client_recv_err = 0;
+		int accepted_recv_rc = SOCKET_ERROR;
+		int accepted_recv_err = 0;
+		int client_send_rc = SOCKET_ERROR;
+		int client_send_err = 0;
+		int client_so_error = 0;
+		int accepted_so_error = 0;
+	};
+
+	bool socket_has_so_error(SOCKET s, int& out_err) {
+		out_err = 0;
+		int value = 0;
+		int len = static_cast<int>(sizeof(value));
+		if (getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&value), &len) == 0) {
+			out_err = value;
+			return value != 0;
+		}
+		out_err = WSAGetLastError();
+		return out_err != 0;
+	}
+
+	bool recv_observes_teardown(SOCKET s, int& out_rc, int& out_err) {
+		out_err = 0;
+		char buf[16];
+		out_rc = recv(s, buf, static_cast<int>(sizeof(buf)), 0);
+		if (out_rc == 0)
+			return true;
+		if (out_rc == SOCKET_ERROR) {
+			out_err = WSAGetLastError();
+			return out_err != WSAEWOULDBLOCK && out_err != WSAEINPROGRESS;
+		}
+		return false;
+	}
+
+	bool wait_for_tcp_teardown(tcp_pair_t& pair, DWORD budget_ms, teardown_probe_t& probe) {
+		u_long nonblocking = 1;
+		(void)ioctlsocket(pair.client, FIONBIO, &nonblocking);
+		(void)ioctlsocket(pair.accepted, FIONBIO, &nonblocking);
+		const DWORD start = GetTickCount();
+		bool sent_probe = false;
+		for (;;) {
+			++probe.iterations;
+			if (socket_has_so_error(pair.client, probe.client_so_error) ||
+				socket_has_so_error(pair.accepted, probe.accepted_so_error)) {
+				probe.observed = true;
+				return true;
+			}
+			if (recv_observes_teardown(pair.client, probe.client_recv_rc, probe.client_recv_err) ||
+				recv_observes_teardown(pair.accepted, probe.accepted_recv_rc, probe.accepted_recv_err)) {
+				probe.observed = true;
+				return true;
+			}
+			if (!sent_probe && GetTickCount() - start >= 75u) {
+				const char poke = 'x';
+				probe.client_send_rc = send(pair.client, &poke, 1, 0);
+				if (probe.client_send_rc == SOCKET_ERROR) {
+					probe.client_send_err = WSAGetLastError();
+					if (probe.client_send_err != WSAEWOULDBLOCK && probe.client_send_err != WSAEINPROGRESS) {
+						probe.observed = true;
+						return true;
+					}
+				}
+				else if (probe.client_send_rc > 0) {
+					++probe.successful_sends;
+				}
+				sent_probe = true;
+			}
+			if (GetTickCount() - start >= budget_ms)
+				break;
+			Sleep(35);
+		}
+		probe.observed = false;
+		return false;
+	}
+
+	bool drive_pcap_capture_fixture(std::string& err, std::uint32_t& tcp_bytes, std::uint32_t& udp_packets) {
+		tcp_bytes = 0u;
+		udp_packets = 0u;
+		tcp_pair_t pair;
+		std::string pair_err;
+		if (!establish_local_tcp_pair(pair, pair_err, "PCEX")) {
+			err = "tcp pair failed: " + pair_err;
+			return false;
+		}
+		const char* request = "GET /aida-pcex-fixture HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+		int sent = send(pair.client, request, static_cast<int>(std::strlen(request)), 0);
+		if (sent <= 0) {
+			err = "tcp client send failed err=" + std::to_string(WSAGetLastError());
+			return false;
+		}
+		tcp_bytes += static_cast<std::uint32_t>(sent);
+		char buf[256];
+		int got = recv(pair.accepted, buf, static_cast<int>(sizeof(buf)), 0);
+		if (got > 0)
+			tcp_bytes += static_cast<std::uint32_t>(got);
+		const char* response = "HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\nAIDA-PCEX-OK-000";
+		sent = send(pair.accepted, response, static_cast<int>(std::strlen(response)), 0);
+		if (sent <= 0) {
+			err = "tcp accepted send failed err=" + std::to_string(WSAGetLastError());
+			return false;
+		}
+		tcp_bytes += static_cast<std::uint32_t>(sent);
+		got = recv(pair.client, buf, static_cast<int>(sizeof(buf)), 0);
+		if (got > 0)
+			tcp_bytes += static_cast<std::uint32_t>(got);
+		std::string udp_err;
+		if (!bwmn_drive_udp_fixture(udp_err, udp_packets)) {
+			test_lab_format::testlab_diag_log_step("network-action", "PCEX", "udp_seed",
+				"ok=0 err=\"%s\"", udp_err.c_str());
+		}
+		return true;
+	}
+
+	bool pred_send_rule(const char* step,
+		voyager::detail::traffic_redirect_rule& req,
+		std::uint32_t& bytes_returned)
+	{
+		bytes_returned = 0;
+		bool ok = device->send_ioctl_raw(ioctl_codes::PRED(),
+			&req,
+			static_cast<std::uint32_t>(sizeof(req)),
+			bytes_returned);
+		test_lab_format::testlab_diag_log_step("network-action", "PRED", step,
+			"ok=%d bytes_returned=%u op=%u rule_id=%u proto=%u match_port=%u redirect_port=%u af=%u active=%u match_count=%u exclude_pid=%u",
+			ok ? 1 : 0,
+			bytes_returned,
+			req.operation,
+			req.rule_id,
+			req.protocol,
+			req.match_port,
+			req.redirect_port,
+			req.address_family,
+			req.active,
+			req.match_count,
+			req.exclude_pid);
+		return ok;
+	}
+
+	bool pred_send_list(const char* step,
+		voyager::detail::traffic_redirect_list& req,
+		std::uint32_t& bytes_returned)
+	{
+		req.operation = 2u;
+		req.rule_count = 0u;
+		bytes_returned = 0;
+		bool ok = device->send_ioctl_raw(ioctl_codes::PRED(),
+			&req,
+			static_cast<std::uint32_t>(sizeof(req)),
+			bytes_returned);
+		test_lab_format::testlab_diag_log_step("network-action", "PRED", step,
+			"ok=%d bytes_returned=%u rule_count=%u max_rules=%u",
+			ok ? 1 : 0,
+			bytes_returned,
+			req.rule_count,
+			voyager::detail::REDIR_MAX_RULES);
+		return ok;
+	}
+
+	bool dnss_send_rule(const char* step,
+		voyager::detail::dns_spoof_rule& req,
+		std::uint32_t& bytes_returned)
+	{
+		bytes_returned = 0;
+		bool ok = device->send_ioctl_raw(ioctl_codes::DNSS(),
+			&req,
+			static_cast<std::uint32_t>(sizeof(req)),
+			bytes_returned);
+		char domain_safe[voyager::detail::DNS_SPOOF_MAX_DOMAIN + 1];
+		std::memcpy(domain_safe, req.domain, voyager::detail::DNS_SPOOF_MAX_DOMAIN);
+		domain_safe[voyager::detail::DNS_SPOOF_MAX_DOMAIN] = '\0';
+		test_lab_format::testlab_diag_log_step("network-action", "DNSS", step,
+			"ok=%d bytes_returned=%u op=%u rule_id=%u domain=\"%s\" af=%u active=%u ttl=%u match_count=%u",
+			ok ? 1 : 0,
+			bytes_returned,
+			req.operation,
+			req.rule_id,
+			domain_safe,
+			req.address_family,
+			req.active,
+			req.ttl,
+			req.match_count);
+		return ok;
+	}
+
+	bool dnss_send_list(const char* step,
+		voyager::detail::dns_spoof_list& req,
+		std::uint32_t& bytes_returned)
+	{
+		req.operation = 2u;
+		req.rule_count = 0u;
+		bytes_returned = 0;
+		bool ok = device->send_ioctl_raw(ioctl_codes::DNSS(),
+			&req,
+			static_cast<std::uint32_t>(sizeof(req)),
+			bytes_returned);
+		test_lab_format::testlab_diag_log_step("network-action", "DNSS", step,
+			"ok=%d bytes_returned=%u rule_count=%u max_rules=%u",
+			ok ? 1 : 0,
+			bytes_returned,
+			req.rule_count,
+			voyager::detail::DNS_SPOOF_MAX_RULES);
+		return ok;
+	}
+
+	bool bwmn_send(const char* step,
+		voyager::detail::bw_monitor_request& req,
+		std::uint32_t& bytes_returned)
+	{
+		bytes_returned = 0;
+		bool ok = device->send_ioctl_raw(ioctl_codes::BWMN(),
+			&req,
+			static_cast<std::uint32_t>(sizeof(req)),
+			bytes_returned);
+		test_lab_format::testlab_diag_log_step("network-action", "BWMN", step,
+			"ok=%d bytes_returned=%u op=%u active=%u filter_pid=%u total_sent=%llu total_recv=%llu packets_sent=%llu packets_recv=%llu process_count=%u",
+			ok ? 1 : 0,
+			bytes_returned,
+			req.operation,
+			req.monitoring_active,
+			req.filter_pid,
+			static_cast<unsigned long long>(req.total_bytes_sent),
+			static_cast<unsigned long long>(req.total_bytes_recv),
+			static_cast<unsigned long long>(req.total_packets_sent),
+			static_cast<unsigned long long>(req.total_packets_recv),
+			req.process_count);
+		return ok;
+	}
+
+	bool bwmn_drive_udp_fixture(std::string& err, std::uint32_t& sent_packets) {
+		sent_packets = 0u;
+		SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+		if (s == INVALID_SOCKET) {
+			err = "socket(udp) failed err=" + std::to_string(WSAGetLastError());
+			return false;
+		}
+		DWORD timeout = 250;
+		setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+		sockaddr_in dst{};
+		dst.sin_family = AF_INET;
+		dst.sin_port = htons(53535);
+		dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		char payload[160];
+		std::memset(payload, 'B', sizeof(payload));
+		bool any = false;
+		int last_err = 0;
+		for (int i = 0; i < 24; ++i) {
+			int rc = sendto(s,
+				payload,
+				static_cast<int>(sizeof(payload)),
+				0,
+				reinterpret_cast<const sockaddr*>(&dst),
+				sizeof(dst));
+			if (rc == SOCKET_ERROR) {
+				last_err = WSAGetLastError();
+			}
+			else {
+				any = true;
+				++sent_packets;
+			}
+		}
+		closesocket(s);
+		if (!any) {
+			err = "sendto(udp) failed err=" + std::to_string(last_err);
+			return false;
+		}
 		return true;
 	}
 
@@ -409,14 +746,78 @@ namespace {
 		if (!ensure_driver(r)) return;
 		std::uint32_t ui_op = s.u32_a;
 		std::uint32_t bytes_returned = 0;
+		if (ui_op == 3u) {
+			voyager::detail::traffic_redirect_rule add{};
+			add.operation = 0u;
+			add.protocol = 6u;
+			add.match_port = 65000u;
+			add.redirect_port = 65001u;
+			add.address_family = 2u;
+			add.match_addr[0] = 127u;
+			add.match_addr[3] = 1u;
+			add.redirect_addr[0] = 127u;
+			add.redirect_addr[3] = 1u;
+			add.exclude_pid = static_cast<std::uint32_t>(GetCurrentProcessId());
+			if (!pred_send_rule("lifecycle_add", add, bytes_returned)) {
+				r.bytes_returned = bytes_returned;
+				r.raw.resize(sizeof(add));
+				std::memcpy(r.raw.data(), &add, sizeof(add));
+				fail_result(r, "PRED lifecycle add send_ioctl_raw returned false");
+				return;
+			}
+			voyager::detail::traffic_redirect_list list{};
+			if (!pred_send_list("lifecycle_list_after_add", list, bytes_returned)) {
+				r.bytes_returned = bytes_returned;
+				r.raw.resize(sizeof(list));
+				std::memcpy(r.raw.data(), &list, sizeof(list));
+				fail_result(r, "PRED lifecycle list send_ioctl_raw returned false");
+				return;
+			}
+			bool found = false;
+			for (std::uint32_t i = 0; i < list.rule_count && i < voyager::detail::REDIR_MAX_RULES; ++i) {
+				const auto& rule = list.rules[i];
+				if (rule.rule_id == add.rule_id &&
+					rule.protocol == add.protocol &&
+					rule.match_port == add.match_port &&
+					rule.redirect_port == add.redirect_port &&
+					rule.active == 1u) {
+					found = true;
+					break;
+				}
+			}
+			voyager::detail::traffic_redirect_rule remove{};
+			remove.operation = 1u;
+			remove.rule_id = add.rule_id;
+			remove.address_family = 2u;
+			const bool removed = pred_send_rule("lifecycle_remove", remove, bytes_returned);
+			r.bytes_returned = bytes_returned;
+			r.raw.resize(sizeof(list));
+			std::memcpy(r.raw.data(), &list, sizeof(list));
+			push_text(r, "Operation", "Lifecycle add/list/remove");
+			push_u32(r, "Added Rule ID", add.rule_id);
+			push_u32(r, "List Rule Count", list.rule_count);
+			push_u32(r, "Lifecycle rule found", found ? 1u : 0u);
+			push_u32(r, "Remove IOCTL ok", removed ? 1u : 0u);
+			push_text(r, "Match addr", format_addr(add.match_addr, add.address_family));
+			push_text(r, "Redirect addr", format_addr(add.redirect_addr, add.address_family));
+			if (add.rule_id == 0u) {
+				fail_result(r, "PRED lifecycle add did not return a rule id");
+				return;
+			}
+			if (!found) {
+				fail_result(r, "PRED lifecycle list did not return the rule that was just added");
+				return;
+			}
+			if (!removed) {
+				fail_result(r, "PRED lifecycle remove send_ioctl_raw returned false");
+				return;
+			}
+			r.ok = true;
+			return;
+		}
 		if (ui_op == 1u) {
 			voyager::detail::traffic_redirect_list req{};
-			req.operation = 2u;
-			req.rule_count = 0u;
-			bool ok = device->send_ioctl_raw(ioctl_codes::PRED(),
-				&req,
-				static_cast<std::uint32_t>(sizeof(req)),
-				bytes_returned);
+			bool ok = pred_send_list("list_result", req, bytes_returned);
 			r.bytes_returned = bytes_returned;
 			r.raw.resize(sizeof(req));
 			std::memcpy(r.raw.data(), &req, sizeof(req));
@@ -448,6 +849,10 @@ namespace {
 					redir_addr.c_str(), rule.redirect_port,
 					rule.match_count, rule.active);
 				r.parsed.push_back({ std::string(label), std::string(value) });
+			}
+			if (req.rule_count == 0u) {
+				fail_result(r, "PRED list returned zero rules after the traffic redirect fixture/action expected a populated rule set");
+				return;
 			}
 			r.ok = true;
 			return;
@@ -570,11 +975,12 @@ namespace {
 		std::string pair_err;
 		test_lab_format::testlab_diag_log_step("network-action", "STRM", "tcp_pair_open",
 			"establishing localhost TCP pair");
-		if (!establish_local_tcp_pair(pair, pair_err)) {
+		if (!establish_local_tcp_pair(pair, pair_err, "STRM")) {
 			test_lab_format::testlab_diag_log_step("network-action", "STRM", "tcp_pair_open",
 				"failed err=\"%s\" (WFP callout may be intercepting loopback TCP)", pair_err.c_str());
-			r.ntstatus = 0;
-			r.ok = true;
+			r.ntstatus = static_cast<std::int32_t>(loopback_resource_precondition(pair_err) ? 0xC000009Au : 0xC0000001u);
+			r.ok = false;
+			r.skipped = false;
 			r.error = "loopback TCP unavailable (WFP callout intercept): " + pair_err;
 			return;
 		}
@@ -695,6 +1101,12 @@ namespace {
 			r.ok = false;
 			return;
 		}
+		if (!got_assembled) {
+			r.error = "STRM did not observe reassembled stream data within poll budget";
+			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
+			r.ok = false;
+			return;
+		}
 		r.ok = true;
 	}
 
@@ -722,11 +1134,12 @@ namespace {
 		std::string pair_err;
 		test_lab_format::testlab_diag_log_step("network-action", "CKIL", "tcp_pair_open",
 			"establishing localhost TCP pair");
-		if (!establish_local_tcp_pair(pair, pair_err)) {
+		if (!establish_local_tcp_pair(pair, pair_err, "CKIL")) {
 			test_lab_format::testlab_diag_log_step("network-action", "CKIL", "tcp_pair_open",
 				"failed err=\"%s\" (WFP callout may be intercepting loopback TCP)", pair_err.c_str());
-			r.ntstatus = 0;
-			r.ok = true;
+			r.ntstatus = static_cast<std::int32_t>(loopback_resource_precondition(pair_err) ? 0xC000009Au : 0xC0000001u);
+			r.ok = false;
+			r.skipped = false;
 			r.error = "loopback TCP unavailable (WFP callout intercept): " + pair_err;
 			return;
 		}
@@ -760,18 +1173,22 @@ namespace {
 			"ok=%d bytes_returned=%u driver_status=%u",
 			ok ? 1 : 0, bytes_returned, req.status);
 
-		bool post_send_failed = false;
-		int post_send_err = 0;
+		teardown_probe_t teardown_probe{};
 		if (ok) {
-			const char* poke = "x";
-			Sleep(50);
-			int rc = send(pair.client, poke, 1, 0);
-			if (rc == SOCKET_ERROR) {
-				post_send_failed = true;
-				post_send_err = WSAGetLastError();
-			}
-			test_lab_format::testlab_diag_log_step("network-action", "CKIL", "post_send_probe",
-				"send_rc=%d wsa_err=%d", rc, post_send_err);
+			wait_for_tcp_teardown(pair, 2000, teardown_probe);
+			test_lab_format::testlab_diag_log_step("network-action", "CKIL", "teardown_probe",
+				"observed=%d iterations=%u successful_sends=%u client_recv_rc=%d client_recv_err=%d accepted_recv_rc=%d accepted_recv_err=%d client_send_rc=%d client_send_err=%d client_so_error=%d accepted_so_error=%d",
+				teardown_probe.observed ? 1 : 0,
+				teardown_probe.iterations,
+				teardown_probe.successful_sends,
+				teardown_probe.client_recv_rc,
+				teardown_probe.client_recv_err,
+				teardown_probe.accepted_recv_rc,
+				teardown_probe.accepted_recv_err,
+				teardown_probe.client_send_rc,
+				teardown_probe.client_send_err,
+				teardown_probe.client_so_error,
+				teardown_probe.accepted_so_error);
 		}
 
 		push_u32(r, "Step1 Protocol", req.protocol);
@@ -783,8 +1200,11 @@ namespace {
 		push_u32(r, "Step1 PID filter", req.pid);
 		push_u32(r, "Step2 IOCTL ok", ok ? 1u : 0u);
 		push_u32(r, "Step2 Driver status (0=success)", req.status);
-		push_u32(r, "Step3 Post-kill send failed", post_send_failed ? 1u : 0u);
-		push_u32(r, "Step3 Post-kill send WSA err", static_cast<std::uint32_t>(post_send_err));
+		push_u32(r, "Step3 Teardown observed", teardown_probe.observed ? 1u : 0u);
+		push_u32(r, "Step3 Teardown iterations", teardown_probe.iterations);
+		push_u32(r, "Step3 Probe sends accepted", teardown_probe.successful_sends);
+		push_u32(r, "Step3 Client recv WSA err", static_cast<std::uint32_t>(teardown_probe.client_recv_err));
+		push_u32(r, "Step3 Accepted recv WSA err", static_cast<std::uint32_t>(teardown_probe.accepted_recv_err));
 
 		if (!ok) {
 			r.error = "CKIL send_ioctl_raw returned false";
@@ -797,6 +1217,12 @@ namespace {
 			std::snprintf(buf, sizeof(buf),
 				"CKIL driver reported status=%u (non-zero means kill failed)", req.status);
 			r.error = std::string(buf);
+			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
+			r.ok = false;
+			return;
+		}
+		if (!teardown_probe.observed) {
+			r.error = "CKIL did not produce observable TCP teardown within the 2000ms probe window";
 			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
 			r.ok = false;
 			return;
@@ -829,14 +1255,77 @@ namespace {
 		if (!ensure_driver(r)) return;
 		std::uint32_t ui_op = s.u32_a;
 		std::uint32_t bytes_returned = 0;
+		if (ui_op == 3u) {
+			const char* domain = "aida-test.local";
+			voyager::detail::dns_spoof_rule add{};
+			add.operation = 0u;
+			std::memcpy(add.domain, domain, std::strlen(domain));
+			add.spoof_addr[0] = 127u;
+			add.spoof_addr[3] = 2u;
+			add.address_family = 2u;
+			add.ttl = 300u;
+			if (!dnss_send_rule("lifecycle_add", add, bytes_returned)) {
+				r.bytes_returned = bytes_returned;
+				r.raw.resize(sizeof(add));
+				std::memcpy(r.raw.data(), &add, sizeof(add));
+				fail_result(r, "DNSS lifecycle add send_ioctl_raw returned false");
+				return;
+			}
+			voyager::detail::dns_spoof_list list{};
+			if (!dnss_send_list("lifecycle_list_after_add", list, bytes_returned)) {
+				r.bytes_returned = bytes_returned;
+				r.raw.resize(sizeof(list));
+				std::memcpy(r.raw.data(), &list, sizeof(list));
+				fail_result(r, "DNSS lifecycle list send_ioctl_raw returned false");
+				return;
+			}
+			bool found = false;
+			for (std::uint32_t i = 0; i < list.rule_count && i < voyager::detail::DNS_SPOOF_MAX_RULES; ++i) {
+				const auto& rule = list.rules[i];
+				char domain_safe[voyager::detail::DNS_SPOOF_MAX_DOMAIN + 1];
+				std::memcpy(domain_safe, rule.domain, voyager::detail::DNS_SPOOF_MAX_DOMAIN);
+				domain_safe[voyager::detail::DNS_SPOOF_MAX_DOMAIN] = '\0';
+				if (rule.rule_id == add.rule_id &&
+					std::strcmp(domain_safe, domain) == 0 &&
+					rule.address_family == add.address_family &&
+					rule.active == 1u) {
+					found = true;
+					break;
+				}
+			}
+			voyager::detail::dns_spoof_rule remove{};
+			remove.operation = 1u;
+			remove.rule_id = add.rule_id;
+			remove.address_family = 2u;
+			const bool removed = dnss_send_rule("lifecycle_remove", remove, bytes_returned);
+			r.bytes_returned = bytes_returned;
+			r.raw.resize(sizeof(list));
+			std::memcpy(r.raw.data(), &list, sizeof(list));
+			push_text(r, "Operation", "Lifecycle add/list/remove");
+			push_u32(r, "Added Rule ID", add.rule_id);
+			push_text(r, "Domain", domain);
+			push_text(r, "Spoof addr", format_addr(add.spoof_addr, add.address_family));
+			push_u32(r, "List Rule Count", list.rule_count);
+			push_u32(r, "Lifecycle rule found", found ? 1u : 0u);
+			push_u32(r, "Remove IOCTL ok", removed ? 1u : 0u);
+			if (add.rule_id == 0u) {
+				fail_result(r, "DNSS lifecycle add did not return a rule id");
+				return;
+			}
+			if (!found) {
+				fail_result(r, "DNSS lifecycle list did not return the rule that was just added");
+				return;
+			}
+			if (!removed) {
+				fail_result(r, "DNSS lifecycle remove send_ioctl_raw returned false");
+				return;
+			}
+			r.ok = true;
+			return;
+		}
 		if (ui_op == 1u) {
 			voyager::detail::dns_spoof_list req{};
-			req.operation = 2u;
-			req.rule_count = 0u;
-			bool ok = device->send_ioctl_raw(ioctl_codes::DNSS(),
-				&req,
-				static_cast<std::uint32_t>(sizeof(req)),
-				bytes_returned);
+			bool ok = dnss_send_list("list_result", req, bytes_returned);
 			r.bytes_returned = bytes_returned;
 			r.raw.resize(sizeof(req));
 			std::memcpy(r.raw.data(), &req, sizeof(req));
@@ -868,6 +1357,10 @@ namespace {
 					af_to_string(rule.address_family),
 					rule.ttl, rule.match_count, rule.active);
 				r.parsed.push_back({ std::string(label), std::string(value) });
+			}
+			if (req.rule_count == 0u) {
+				fail_result(r, "DNSS list returned zero rules after the DNS spoof fixture/action expected a populated rule set");
+				return;
 			}
 			r.ok = true;
 			return;
@@ -974,6 +1467,89 @@ namespace {
 
 	void run_bwmn(test_lab::state_t& s, test_lab::result_t& r) {
 		if (!ensure_driver(r)) return;
+		if (s.u32_a == 3u) {
+			wsa_guard_t wsa;
+			if (!wsa.ok) {
+				r.error = "WSAStartup failed";
+				r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
+				r.ok = false;
+				test_lab_format::testlab_diag_log_step("network-action", "BWMN", "wsa_init",
+					"failed err=%lu", static_cast<unsigned long>(GetLastError()));
+				return;
+			}
+			std::uint32_t bytes_returned = 0;
+			voyager::detail::bw_monitor_request reset{};
+			reset.operation = 3u;
+			(void)bwmn_send("lifecycle_reset_before", reset, bytes_returned);
+			voyager::detail::bw_monitor_request start{};
+			start.operation = 0u;
+			if (!bwmn_send("lifecycle_start", start, bytes_returned)) {
+				r.bytes_returned = bytes_returned;
+				r.raw.resize(sizeof(start));
+				std::memcpy(r.raw.data(), &start, sizeof(start));
+				fail_result(r, "BWMN lifecycle start send_ioctl_raw returned false");
+				return;
+			}
+			std::string fixture_err;
+			std::uint32_t fixture_packets = 0u;
+			const bool fixture_ok = bwmn_drive_udp_fixture(fixture_err, fixture_packets);
+			test_lab_format::testlab_diag_log_step("network-action", "BWMN", "udp_fixture",
+				"ok=%d packets=%u err=\"%s\"",
+				fixture_ok ? 1 : 0,
+				fixture_packets,
+				fixture_err.c_str());
+			Sleep(250);
+			voyager::detail::bw_monitor_request query{};
+			query.operation = 2u;
+			query.filter_pid = 0u;
+			const bool query_ok = bwmn_send("lifecycle_query", query, bytes_returned);
+			voyager::detail::bw_monitor_request stop{};
+			stop.operation = 1u;
+			const bool stop_ok = bwmn_send("lifecycle_stop", stop, bytes_returned);
+			voyager::detail::bw_monitor_request cleanup{};
+			cleanup.operation = 3u;
+			(void)bwmn_send("lifecycle_reset_after", cleanup, bytes_returned);
+			r.bytes_returned = bytes_returned;
+			r.raw.resize(sizeof(query));
+			std::memcpy(r.raw.data(), &query, sizeof(query));
+			push_text(r, "Operation", "Lifecycle reset/start/traffic/query/stop/reset");
+			push_u32(r, "Start active", start.monitoring_active);
+			push_u32(r, "Fixture UDP ok", fixture_ok ? 1u : 0u);
+			push_u32(r, "Fixture UDP packets", fixture_packets);
+			push_u32(r, "Query IOCTL ok", query_ok ? 1u : 0u);
+			push_u32(r, "Stop IOCTL ok", stop_ok ? 1u : 0u);
+			push_u32(r, "Monitoring active at query", query.monitoring_active);
+			push_hex64(r, "Total bytes sent", query.total_bytes_sent);
+			push_hex64(r, "Total bytes recv", query.total_bytes_recv);
+			push_hex64(r, "Total packets sent", query.total_packets_sent);
+			push_hex64(r, "Total packets recv", query.total_packets_recv);
+			push_u32(r, "Process count", query.process_count);
+			if (!query_ok) {
+				fail_result(r, "BWMN lifecycle query send_ioctl_raw returned false");
+				return;
+			}
+			if (!stop_ok) {
+				fail_result(r, "BWMN lifecycle stop send_ioctl_raw returned false");
+				return;
+			}
+			if (!fixture_ok) {
+				fail_result(r, "BWMN lifecycle UDP fixture failed: " + fixture_err,
+					loopback_resource_precondition(fixture_err) ? 0xC000009Au : 0xC0000001u);
+				return;
+			}
+			if (query.monitoring_active == 0u) {
+				fail_result(r, "BWMN lifecycle query reported monitoring inactive after start");
+				return;
+			}
+			if (query.total_bytes_sent == 0u && query.total_bytes_recv == 0u &&
+				query.total_packets_sent == 0u && query.total_packets_recv == 0u &&
+				query.process_count == 0u) {
+				fail_result(r, "BWMN lifecycle query returned zero counters after UDP fixture traffic");
+				return;
+			}
+			r.ok = true;
+			return;
+		}
 		voyager::detail::bw_monitor_request req{};
 		req.operation = 2u;
 		req.filter_pid = (s.u32_a == 0u)
@@ -981,10 +1557,7 @@ namespace {
 			: 0u;
 		req.process_count = 0u;
 		std::uint32_t bytes_returned = 0;
-		bool ok = device->send_ioctl_raw(ioctl_codes::BWMN(),
-			&req,
-			static_cast<std::uint32_t>(sizeof(req)),
-			bytes_returned);
+		bool ok = bwmn_send("query_result", req, bytes_returned);
 		r.bytes_returned = bytes_returned;
 		r.raw.resize(sizeof(req));
 		std::memcpy(r.raw.data(), &req, sizeof(req));
@@ -1022,6 +1595,11 @@ namespace {
 				static_cast<unsigned long long>(p.packets_recv),
 				static_cast<unsigned long long>(p.last_activity_time));
 			r.parsed.push_back({ std::string(label), std::string(value) });
+		}
+		if (req.total_bytes_sent == 0u && req.total_bytes_recv == 0u &&
+			req.total_packets_sent == 0u && req.total_packets_recv == 0u && cap == 0u) {
+			fail_result(r, "BWMN query returned zero totals and zero per-process entries after the network fixture/action expected bandwidth evidence");
+			return;
 		}
 		r.ok = true;
 	}
@@ -1095,6 +1673,49 @@ namespace {
 			return;
 		}
 		voyager::detail::pcap_export_request req{};
+		std::string fixture_err;
+		std::uint32_t fixture_tcp_bytes = 0u;
+		std::uint32_t fixture_udp_packets = 0u;
+		const std::uint32_t self_pid = static_cast<std::uint32_t>(GetCurrentProcessId());
+		(void)device->stop_capture();
+		const bool capture_started = device->start_capture(self_pid, 0u, 0u, nullptr, 1500u);
+		test_lab_format::testlab_diag_log_step("network-action", "PCEX", "capture_start",
+			"ok=%d pid=%u proto=0 max_payload=1500",
+			capture_started ? 1 : 0,
+			self_pid);
+		if (!capture_started) {
+			fail_result(r, "PCEX failed to start kernel capture before fixture traffic");
+			return;
+		}
+		const bool fixture_ok = drive_pcap_capture_fixture(fixture_err, fixture_tcp_bytes, fixture_udp_packets);
+		test_lab_format::testlab_diag_log_step("network-action", "PCEX", "capture_seed",
+			"ok=%d tcp_bytes=%u udp_packets=%u err=\"%s\"",
+			fixture_ok ? 1 : 0,
+			fixture_tcp_bytes,
+			fixture_udp_packets,
+			fixture_err.c_str());
+		bool capture_active = false;
+		std::uint32_t captured_before_stop = 0u;
+		std::uint32_t dropped_before_stop = 0u;
+		for (int i = 0; i < 10; ++i) {
+			bool status_ok = device->get_capture_status(capture_active, captured_before_stop, dropped_before_stop);
+			test_lab_format::testlab_diag_log_step("network-action", "PCEX", "capture_poll",
+				"iter=%d ok=%d active=%d captured=%u dropped=%u",
+				i,
+				status_ok ? 1 : 0,
+				capture_active ? 1 : 0,
+				captured_before_stop,
+				dropped_before_stop);
+			if (captured_before_stop > 0u)
+				break;
+			Sleep(75);
+		}
+		const bool capture_stopped = device->stop_capture();
+		test_lab_format::testlab_diag_log_step("network-action", "PCEX", "capture_stop",
+			"ok=%d captured=%u dropped=%u",
+			capture_stopped ? 1 : 0,
+			captured_before_stop,
+			dropped_before_stop);
 		req.operation = 0u;
 		req.filter_pid = 0u;
 		req.filter_protocol = 0u;
@@ -1124,6 +1745,12 @@ namespace {
 			return;
 		}
 		push_text(r, "Output path", path);
+		push_u32(r, "Fixture TCP bytes", fixture_tcp_bytes);
+		push_u32(r, "Fixture UDP packets", fixture_udp_packets);
+		push_u32(r, "Capture start ok", capture_started ? 1u : 0u);
+		push_u32(r, "Capture stop ok", capture_stopped ? 1u : 0u);
+		push_u32(r, "Captured before stop", captured_before_stop);
+		push_u32(r, "Dropped before stop", dropped_before_stop);
 		push_u32(r, "Packet count", req.packet_count);
 		push_hex64(r, "Header magic", req.header.magic_number);
 		push_u32(r, "PCAP version major", req.header.version_major);
@@ -1132,6 +1759,27 @@ namespace {
 		push_u32(r, "Link type", req.header.network);
 		push_hex64(r, "Bytes written", written);
 		push_hex64(r, "Kernel data size", req.data_size);
+		test_lab_format::testlab_diag_log_step("network-action", "PCEX", "export_result",
+			"ok=1 bytes_returned=%u output=\"%s\" packet_count=%u data_size=%llu bytes_written=%llu magic=0x%08X",
+			bytes_returned,
+			path.c_str(),
+			req.packet_count,
+			static_cast<unsigned long long>(req.data_size),
+			static_cast<unsigned long long>(written),
+			req.header.magic_number);
+		if (!fixture_ok) {
+			fail_result(r, "PCEX capture fixture failed before export: " + fixture_err,
+				loopback_resource_precondition(fixture_err) ? 0xC000009Au : 0xC0000001u);
+			return;
+		}
+		if (!capture_stopped) {
+			fail_result(r, "PCEX failed to stop kernel capture before export");
+			return;
+		}
+		if (req.packet_count == 0u || req.data_size <= sizeof(req.header) || written <= sizeof(req.header)) {
+			fail_result(r, "PCEX exported only the pcap header and no packet records after the capture fixture/action expected packet data");
+			return;
+		}
 		r.ok = true;
 	}
 

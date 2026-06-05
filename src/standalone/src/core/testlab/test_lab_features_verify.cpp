@@ -1,5 +1,6 @@
 #include "test_lab.hpp"
 #include "test_lab_format.hpp"
+#include "../infra/critical_work_queue.hpp"
 #include "../../../../driver/comm.h"
 #include "imgui/imgui.h"
 
@@ -346,48 +347,97 @@ namespace {
 			diag = "WSAStartup failed";
 			return false;
 		}
-		SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-		if (s == INVALID_SOCKET) {
-			diag = "socket() failed";
-			return false;
-		}
-		u_long nb = 1;
-		ioctlsocket(s, FIONBIO, &nb);
-		sockaddr_in dst{};
-		dst.sin_family = AF_INET;
-		dst.sin_port = htons(80);
-		dst.sin_addr.s_addr = htonl(0x01010101u);
-		int rc = connect(s, reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
-		bool initiated = false;
-		if (rc == 0) {
-			initiated = true;
-		} else {
-			int err = WSAGetLastError();
-			if (err == WSAEWOULDBLOCK) {
+		const DWORD start_tick = GetTickCount();
+		std::string last_diag;
+		for (int attempt = 1; attempt <= 16; ++attempt) {
+			SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+			if (s == INVALID_SOCKET) {
+				int err = WSAGetLastError();
+				char b[96];
+				std::snprintf(b, sizeof(b), "socket() failed err=%d attempt=%d", err, attempt);
+				last_diag = b;
+				test_lab_format::testlab_diag_log_step("verify", "Network stats sanity", "tcp_probe_attempt",
+					"attempt=%d ok=0 elapsed_ms=%lu err=\"%s\"",
+					attempt,
+					static_cast<unsigned long>(GetTickCount() - start_tick),
+					last_diag.c_str());
+				if (attempt < 16) Sleep(200);
+				continue;
+			}
+			u_long nb = 1;
+			ioctlsocket(s, FIONBIO, &nb);
+			sockaddr_in dst{};
+			dst.sin_family = AF_INET;
+			dst.sin_port = htons(80);
+			dst.sin_addr.s_addr = htonl(0x01010101u);
+			int rc = connect(s, reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
+			bool initiated = false;
+			if (rc == 0) {
 				initiated = true;
 			} else {
-				char b[64];
-				std::snprintf(b, sizeof(b), "connect() err=%d", err);
+				int err = WSAGetLastError();
+				if (err == WSAEWOULDBLOCK) {
+					initiated = true;
+				} else {
+					char b[96];
+					std::snprintf(b, sizeof(b), "connect() err=%d attempt=%d", err, attempt);
+					last_diag = b;
+				}
+			}
+			if (initiated) {
+				fd_set wf;
+				FD_ZERO(&wf);
+				FD_SET(s, &wf);
+				timeval tv{};
+				tv.tv_sec = 1;
+				tv.tv_usec = 0;
+				int sel = select(0, nullptr, &wf, nullptr, &tv);
+				int sent = 0;
+				int recvd = 0;
+				int send_err = 0;
+				if (sel > 0) {
+					const char* req = "HEAD / HTTP/1.0\r\n\r\n";
+					sent = send(s, req, static_cast<int>(std::strlen(req)), 0);
+					if (sent == SOCKET_ERROR) {
+						send_err = WSAGetLastError();
+						sent = 0;
+					} else {
+						char recv_buf[64];
+						recvd = recv(s, recv_buf, sizeof(recv_buf), 0);
+						if (recvd == SOCKET_ERROR) recvd = 0;
+					}
+				}
+				closesocket(s);
+				char b[160];
+				std::snprintf(b, sizeof(b),
+					"external 1.1.1.1:80 connect initiated attempt=%d elapsed_ms=%lu select=%d sent=%d recv=%d send_err=%d",
+					attempt,
+					static_cast<unsigned long>(GetTickCount() - start_tick),
+					sel,
+					sent,
+					recvd,
+					send_err);
 				diag = b;
+				test_lab_format::testlab_diag_log_step("verify", "Network stats sanity", "tcp_probe_attempt",
+					"attempt=%d ok=1 elapsed_ms=%lu select=%d sent=%d recv=%d send_err=%d",
+					attempt,
+					static_cast<unsigned long>(GetTickCount() - start_tick),
+					sel,
+					sent,
+					recvd,
+					send_err);
+				return true;
 			}
+			closesocket(s);
+			test_lab_format::testlab_diag_log_step("verify", "Network stats sanity", "tcp_probe_attempt",
+				"attempt=%d ok=0 elapsed_ms=%lu err=\"%s\"",
+				attempt,
+				static_cast<unsigned long>(GetTickCount() - start_tick),
+				last_diag.c_str());
+			if (attempt < 16) Sleep(200);
 		}
-		if (initiated) {
-			fd_set wf;
-			FD_ZERO(&wf);
-			FD_SET(s, &wf);
-			timeval tv{};
-			tv.tv_sec = 1;
-			tv.tv_usec = 0;
-			int sel = select(0, nullptr, &wf, nullptr, &tv);
-			if (sel > 0) {
-				const char* req = "HEAD / HTTP/1.0\r\n\r\n";
-				send(s, req, static_cast<int>(std::strlen(req)), 0);
-				char recv_buf[64];
-				recv(s, recv_buf, sizeof(recv_buf), 0);
-			}
-		}
-		closesocket(s);
-		return initiated;
+		diag = last_diag.empty() ? "connect() did not initiate after retry budget" : last_diag;
+		return false;
 	}
 
 	bool build_dns_query_packet(const char* host, std::vector<unsigned char>& packet, std::uint16_t& qid, std::string& diag) {
@@ -719,6 +769,7 @@ namespace {
 		test_lab::result_t result;
 		std::atomic<bool> cancel{ false };
 		std::atomic<bool> capture_started{ false };
+		std::atomic<bool> done{ false };
 		std::atomic<long> stage{ static_cast<long>(dns_log_stage_e::not_started) };
 		std::atomic<std::uint64_t> stage_tick_ms{ 0 };
 	};
@@ -762,40 +813,30 @@ namespace {
 		auto stopped = std::make_shared<std::atomic<bool>>(false);
 		auto ok = std::make_shared<std::atomic<bool>>(false);
 		auto bytes = std::make_shared<std::atomic<std::uint32_t>>(0u);
-		std::thread stop_thread;
-		try {
-			stop_thread = std::thread([stopped, ok, bytes]() {
-				voyager::detail::net_cap_ctrl_request stop_req{};
-				stop_req.operation = 1u;
-				std::uint32_t br = 0;
-				bool stop_ok = false;
-				if (device && device->is_connected())
-					stop_ok = device->send_ioctl_raw(ioctl_codes::NCAP(), &stop_req, sizeof(stop_req), br);
-				bytes->store(br, std::memory_order_release);
-				ok->store(stop_ok, std::memory_order_release);
-				stopped->store(true, std::memory_order_release);
-			});
-		} catch (...) {
+		const bool posted = critical_work_queue::post([stopped, ok, bytes]() {
+			voyager::detail::net_cap_ctrl_request stop_req{};
+			stop_req.operation = 1u;
+			std::uint32_t br = 0;
+			bool stop_ok = false;
+			if (device && device->is_connected())
+				stop_ok = device->send_ioctl_raw(ioctl_codes::NCAP(), &stop_req, sizeof(stop_req), br);
+			bytes->store(br, std::memory_order_release);
+			ok->store(stop_ok, std::memory_order_release);
+			stopped->store(true, std::memory_order_release);
+		});
+		if (!posted) {
 			r.parsed.push_back({ "dns_capture_timeout_stop_ok", "0" });
-			r.parsed.push_back({ "dns_capture_timeout_stop_error", "thread_create_failed" });
+			r.parsed.push_back({ "dns_capture_timeout_stop_error", "critical_queue_post_failed" });
 			return false;
 		}
-		DWORD wait_rc = WaitForSingleObject(stop_thread.native_handle(), timeout_ms);
-		if (wait_rc == WAIT_OBJECT_0) {
-			stop_thread.join();
+		const DWORD start = GetTickCount();
+		while (!stopped->load(std::memory_order_acquire) && GetTickCount() - start < timeout_ms)
+			Sleep(10);
+		if (stopped->load(std::memory_order_acquire)) {
 			r.parsed.push_back({ "dns_capture_timeout_stop_ok", ok->load(std::memory_order_acquire) ? "1" : "0" });
 			r.parsed.push_back({ "dns_capture_timeout_stop_bytes", fmt_u32(bytes->load(std::memory_order_acquire)) });
 			return ok->load(std::memory_order_acquire);
 		}
-		CancelSynchronousIo(stop_thread.native_handle());
-		wait_rc = WaitForSingleObject(stop_thread.native_handle(), 500);
-		if (wait_rc == WAIT_OBJECT_0) {
-			stop_thread.join();
-			r.parsed.push_back({ "dns_capture_timeout_stop_ok", ok->load(std::memory_order_acquire) ? "1" : "0" });
-			r.parsed.push_back({ "dns_capture_timeout_stop_bytes", fmt_u32(bytes->load(std::memory_order_acquire)) });
-			return ok->load(std::memory_order_acquire);
-		}
-		stop_thread.detach();
 		r.parsed.push_back({ "dns_capture_timeout_stop_ok", "0" });
 		r.parsed.push_back({ "dns_capture_timeout_stop_error", "timed_out" });
 		return false;
@@ -1488,77 +1529,50 @@ namespace {
 		const DWORD cancel_grace_ms = 3000;
 		auto ctx = std::make_shared<dns_log_ctx_t>();
 		dns_mark_stage(ctx, dns_log_stage_e::not_started);
-		std::thread worker;
-		try {
-			worker = std::thread([ctx]() {
-				try {
-					dns_log_thread_proc(ctx);
-				} catch (const std::exception& e) {
-					dns_mark_stage(ctx, dns_log_stage_e::exception);
-					if (ctx->capture_started.load(std::memory_order_acquire))
-						dns_stop_capture_best_effort(ctx->result, 2000);
-					ctx->result.ok = false;
-					ctx->result.error = std::string("DNS verifier threw exception: ") + e.what();
-					ctx->result.ntstatus = static_cast<std::int32_t>(0xC0000001u);
-				} catch (...) {
-					dns_mark_stage(ctx, dns_log_stage_e::exception);
-					if (ctx->capture_started.load(std::memory_order_acquire))
-						dns_stop_capture_best_effort(ctx->result, 2000);
-					ctx->result.ok = false;
-					ctx->result.error = "DNS verifier threw an unknown exception";
-					ctx->result.ntstatus = static_cast<std::int32_t>(0xC0000001u);
-				}
-			});
-		} catch (const std::exception& e) {
-			std::string fallback_reason = e.what();
+		const bool posted = critical_work_queue::post([ctx]() {
 			try {
 				dns_log_thread_proc(ctx);
-				dns_copy_result(r, ctx->result);
-				r.parsed.push_back({ "dns_thread_fallback", fallback_reason });
-			} catch (const std::exception& run_e) {
-				r.ok = false;
-				r.error = std::string("DNS verifier fallback threw exception: ") + run_e.what();
-				r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
+			} catch (const std::exception& e) {
+				dns_mark_stage(ctx, dns_log_stage_e::exception);
+				if (ctx->capture_started.load(std::memory_order_acquire))
+					dns_stop_capture_best_effort(ctx->result, 2000);
+				ctx->result.ok = false;
+				ctx->result.error = std::string("DNS verifier threw exception: ") + e.what();
+				ctx->result.ntstatus = static_cast<std::int32_t>(0xC0000001u);
 			} catch (...) {
-				r.ok = false;
-				r.error = "DNS verifier fallback threw an unknown exception";
-				r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
+				dns_mark_stage(ctx, dns_log_stage_e::exception);
+				if (ctx->capture_started.load(std::memory_order_acquire))
+					dns_stop_capture_best_effort(ctx->result, 2000);
+				ctx->result.ok = false;
+				ctx->result.error = "DNS verifier threw an unknown exception";
+				ctx->result.ntstatus = static_cast<std::int32_t>(0xC0000001u);
 			}
-			return;
-		} catch (...) {
-			std::string fallback_reason = "unknown";
-			try {
-				dns_log_thread_proc(ctx);
-				dns_copy_result(r, ctx->result);
-				r.parsed.push_back({ "dns_thread_fallback", fallback_reason });
-			} catch (const std::exception& run_e) {
-				r.ok = false;
-				r.error = std::string("DNS verifier fallback threw exception: ") + run_e.what();
-				r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
-			} catch (...) {
-				r.ok = false;
-				r.error = "DNS verifier fallback threw an unknown exception";
-				r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
-			}
+			ctx->done.store(true, std::memory_order_release);
+		});
+		if (!posted) {
+			r.ok = false;
+			r.ntstatus = static_cast<std::int32_t>(0xC000009Au);
+			r.error = "DNS verifier critical_queue post failed";
 			return;
 		}
 
-		DWORD wait_rc = WaitForSingleObject(worker.native_handle(), timeout_ms);
-		if (wait_rc == WAIT_OBJECT_0) {
-			worker.join();
+		const DWORD start = GetTickCount();
+		while (!ctx->done.load(std::memory_order_acquire) && GetTickCount() - start < timeout_ms)
+			Sleep(25);
+		if (ctx->done.load(std::memory_order_acquire)) {
 			dns_copy_result(r, ctx->result);
 			return;
 		}
 
 		ctx->cancel.store(true, std::memory_order_release);
-		CancelSynchronousIo(worker.native_handle());
-		DWORD cancel_wait_rc = WaitForSingleObject(worker.native_handle(), cancel_grace_ms);
+		const DWORD cancel_start = GetTickCount();
+		while (!ctx->done.load(std::memory_order_acquire) && GetTickCount() - cancel_start < cancel_grace_ms)
+			Sleep(25);
 		const long stage = ctx->stage.load(std::memory_order_acquire);
 		const std::uint64_t now_ms = static_cast<std::uint64_t>(GetTickCount64());
 		const std::uint64_t stage_tick = ctx->stage_tick_ms.load(std::memory_order_acquire);
 		const std::uint64_t stage_elapsed = stage_tick == 0u ? 0u : now_ms - stage_tick;
-		if (cancel_wait_rc == WAIT_OBJECT_0) {
-			worker.join();
+		if (ctx->done.load(std::memory_order_acquire)) {
 			dns_copy_result(r, ctx->result);
 			r.ok = false;
 			r.ntstatus = static_cast<std::int32_t>(0xC00000B5u);
@@ -1580,7 +1594,6 @@ namespace {
 		r.parsed.push_back({ "dns_timeout_capture_started", ctx->capture_started.load(std::memory_order_acquire) ? "1" : "0" });
 		if (ctx->capture_started.load(std::memory_order_acquire))
 			dns_stop_capture_best_effort(r, 2000);
-		worker.detach();
 	}
 
 	void run_verify_net_stats(test_lab::state_t& s, test_lab::result_t& r) {

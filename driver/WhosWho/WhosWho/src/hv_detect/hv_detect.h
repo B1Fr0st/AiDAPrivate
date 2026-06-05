@@ -15,6 +15,7 @@ typedef struct _HV_DETECT_REQUEST_K {
     UINT64 flags;
 } hv_detect_request_k, *p_hv_detect_request_k;
 static_assert(sizeof(hv_detect_request_k) == 8, "hv_detect_request_k must be 8 bytes");
+static constexpr UINT64 HV_DETECT_FLAG_TESTLAB_SAFE_K = 0x0000000000000001ULL;
 
 typedef struct _HV_DETECT_RESULT_K {
     UINT8 sidt_lock_prefix;
@@ -377,13 +378,17 @@ namespace hv_detect {
         const bool ms_hv_root = run_plain_bool_probe("microsoft_hyperv_root", flags, is_microsoft_hyperv_root, false);
         result->ms_hv_root = ms_hv_root ? 1 : 0;
 
-        const bool kernel_probe_allowed = KeGetCurrentIrql() == PASSIVE_LEVEL;
-        const bool physmem_supported = physmem::support::is_physmem_supported();
+        const bool testlab_safe = (flags & HV_DETECT_FLAG_TESTLAB_SAFE_K) != 0;
+        const bool passive_level = KeGetCurrentIrql() == PASSIVE_LEVEL;
+        const bool kernel_probe_allowed = passive_level && !testlab_safe;
+        const bool physmem_supported = !testlab_safe && physmem::support::is_physmem_supported();
 
         bool kernel_path_completed = false;
 
-        HVD_LOG_IMMEDIATE("kernel_path_gate flags=0x%llx passive=%u physmem_supported=%u ms_hv_root=%u cpu=%lu irql=%lu pid=%llu tid=%llu",
+        HVD_LOG_IMMEDIATE("kernel_path_gate flags=0x%llx safe_mode=%u passive=%u kernel_allowed=%u physmem_supported=%u ms_hv_root=%u cpu=%lu irql=%lu pid=%llu tid=%llu",
             flags,
+            testlab_safe ? 1u : 0u,
+            passive_level ? 1u : 0u,
             kernel_probe_allowed ? 1u : 0u,
             physmem_supported ? 1u : 0u,
             ms_hv_root ? 1u : 0u,
@@ -391,6 +396,14 @@ namespace hv_detect {
             (ULONG)KeGetCurrentIrql(),
             current_pid(),
             current_tid());
+        if (testlab_safe) {
+            HVD_LOG_IMMEDIATE("kernel_path_skip flags=0x%llx reason=testlab_safe_fingerprint_only cpu=%lu irql=%lu pid=%llu tid=%llu",
+                flags,
+                current_cpu(),
+                (ULONG)KeGetCurrentIrql(),
+                current_pid(),
+                current_tid());
+        }
 
         bool physmem_initialized = false;
         if (kernel_probe_allowed && physmem_supported) {
@@ -602,8 +615,9 @@ namespace hv_detect {
             }
         }
 
-        HVD_LOG_IMMEDIATE("kernel_path_post flags=0x%llx completed=%u physmem_initialized=%u cpu=%lu irql=%lu pid=%llu tid=%llu",
+        HVD_LOG_IMMEDIATE("kernel_path_post flags=0x%llx safe_mode=%u completed=%u physmem_initialized=%u cpu=%lu irql=%lu pid=%llu tid=%llu",
             flags,
+            testlab_safe ? 1u : 0u,
             kernel_path_completed ? 1u : 0u,
             physmem_initialized ? 1u : 0u,
             current_cpu(),
@@ -675,7 +689,7 @@ namespace hv_detect {
                 copy_vendor_name(result, vm_fingerprint::VM_VENDOR_QEMU_KVM);
         }
 
-        UINT8 hv_total_run = 16;
+        UINT8 hv_total_run = testlab_safe ? 0 : 16;
         UINT8 hv_total_failed = 0;
 
         hv_total_failed += result->sidt_lock_prefix;
@@ -695,7 +709,7 @@ namespace hv_detect {
         hv_total_failed += result->lidt_noncanonical_ss;
         hv_total_failed += result->lidt_cpl3_gp;
 
-        if (!ms_hv_root) {
+        if (!ms_hv_root && !testlab_safe) {
             hv_total_run += 4;
             hv_total_failed += result->ve_trigger;
             hv_total_failed += result->ve_lbr_stack;

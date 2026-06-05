@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -19,6 +20,7 @@
 #include "standalone_ai_client.hpp"
 #include "standalone_driver.hpp"
 #include "standalone_settings.hpp"
+#include "../infra/critical_work_queue.hpp"
 #include "../../helpers/diag_log.hpp"
 
 #include <nlohmann/json.hpp>
@@ -143,6 +145,9 @@ struct state_t {
 	std::atomic<bool> cancel{false};
 	std::atomic<bool> minimizing{false};
 	std::atomic<bool> analyzing_crash{false};
+	std::atomic<bool> worker_active{false};
+	std::atomic<bool> setup_complete{false};
+	std::atomic<bool> setup_success{false};
 	bool            active = false;
 
 	char addr_input[32] = {};
@@ -524,15 +529,23 @@ inline const char* exploit_score_name(exploit_score_t s)
 	}
 }
 
-inline void start_fuzzing()
+inline bool start_fuzzing()
 {
 #ifdef __NT__
-	if (g_state.running.load()) return;
-	g_state.running.store(true);
+	bool expected = false;
+	if (!g_state.running.compare_exchange_strong(expected, true)) {
+		diag::log_tagged("fuzzer", "start_skip reason=already_running");
+		return false;
+	}
 	g_state.cancel.store(false);
+	g_state.worker_active.store(true);
+	g_state.setup_complete.store(false);
+	g_state.setup_success.store(false);
 
+	fuzz_config_t cfg_snapshot{};
 	{
 		std::lock_guard<std::mutex> lk(g_state.mutex);
+		cfg_snapshot = g_state.config;
 		g_state.stats = {};
 		g_state.crashes.clear();
 		g_state.unique_crashes.clear();
@@ -544,9 +557,33 @@ inline void start_fuzzing()
 		g_state.active = true;
 	}
 
-	work_queue::post([]() {
-		auto& cfg = g_state.config;
+	if (cfg_snapshot.target_address == 0 ||
+	    cfg_snapshot.end_address <= cfg_snapshot.target_address ||
+	    cfg_snapshot.input_size <= 0 ||
+	    cfg_snapshot.input_size > 1024 * 1024 ||
+	    cfg_snapshot.max_iterations == 0) {
+		{
+			std::lock_guard<std::mutex> lk(g_state.mutex);
+			g_state.setup_error = "invalid fuzzer configuration";
+			g_state.active = false;
+		}
+		g_state.setup_complete.store(true);
+		g_state.setup_success.store(false);
+		g_state.worker_active.store(false);
+		g_state.running.store(false);
+		diag::log_tagged_fmt("fuzzer",
+			"start_reject reason=invalid_config target=0x%llX end=0x%llX input_size=%d max_iterations=%u",
+			static_cast<unsigned long long>(cfg_snapshot.target_address),
+			static_cast<unsigned long long>(cfg_snapshot.end_address),
+			cfg_snapshot.input_size,
+			cfg_snapshot.max_iterations);
+		return false;
+	}
+
+	auto worker = [cfg_snapshot]() {
+		const auto cfg = cfg_snapshot;
 		auto& stats = g_state.stats;
+		try {
 
 		diag::log_tagged_fmt("fuzzer",
 			"worker_begin pid=%u tid=%u target=0x%llX input=0x%llX size=%d iters=%u",
@@ -582,7 +619,19 @@ inline void start_fuzzing()
 			std::uint64_t snapshot_size = 0x20000ULL;
 			if (cfg.end_address > cfg.target_address && cfg.end_address - snapshot_base < 0x400000ULL)
 				snapshot_size = std::max<std::uint64_t>(snapshot_size, (cfg.end_address - snapshot_base + 0xFFFULL) & ~0xFFFULL);
+			diag::log_tagged_fmt("fuzzer",
+				"snapshot_begin pid=%u tid=%u base=0x%llX size=0x%llX target=0x%llX end=0x%llX",
+				cfg.pid, cfg.tid,
+				static_cast<unsigned long long>(snapshot_base),
+				static_cast<unsigned long long>(snapshot_size),
+				static_cast<unsigned long long>(cfg.target_address),
+				static_cast<unsigned long long>(cfg.end_address));
 			snapshot = emulation::driver_snapshot(cfg.pid, cfg.tid, snapshot_base, snapshot_size);
+			diag::log_tagged_fmt("fuzzer",
+				"snapshot_done success=%d regions=%zu err=%s",
+				snapshot.success ? 1 : 0,
+				snapshot.regions.size(),
+				snapshot.error.c_str());
 		}
 		if (!snapshot.success || snapshot.regions.empty()) {
 			std::string err = !snapshot.error.empty() ? snapshot.error : "snapshot has no memory regions";
@@ -595,9 +644,19 @@ inline void start_fuzzing()
 				cfg.pid, cfg.tid,
 				static_cast<unsigned long long>(cfg.target_address),
 				err.c_str());
+			g_state.setup_complete.store(true);
+			g_state.setup_success.store(false);
+			g_state.worker_active.store(false);
 			g_state.running.store(false);
 			return;
 		}
+		g_state.setup_success.store(true);
+		g_state.setup_complete.store(true);
+		diag::log_tagged_fmt("fuzzer",
+			"setup_complete pid=%u tid=%u regions=%zu target=0x%llX",
+			cfg.pid, cfg.tid,
+			snapshot.regions.size(),
+			static_cast<unsigned long long>(cfg.target_address));
 
 		auto start_time = std::chrono::high_resolution_clock::now();
 		auto last_rate_update = start_time;
@@ -647,7 +706,25 @@ inline void start_fuzzing()
 				}
 			}
 
+			if (iter < 8 || (iter % 1000) == 0) {
+				diag::log_tagged_fmt("fuzzer",
+					"emulate_begin iter=%llu target=0x%llX stop=0x%llX input=0x%llX input_size=%zu",
+					static_cast<unsigned long long>(iter),
+					static_cast<unsigned long long>(emu_cfg.start_address),
+					static_cast<unsigned long long>(emu_cfg.stop_address),
+					static_cast<unsigned long long>(cfg.input_address),
+					input.size());
+			}
 			auto result = emulation::emulate_from_snapshot(custom_snapshot, emu_cfg);
+			if (iter < 8 || (iter % 1000) == 0) {
+				diag::log_tagged_fmt("fuzzer",
+					"emulate_done iter=%llu success=%d end=0x%llX trace=%zu err=%s",
+					static_cast<unsigned long long>(iter),
+					result.success ? 1 : 0,
+					static_cast<unsigned long long>(result.end_address),
+					result.trace.size(),
+					result.error.c_str());
+			}
 
 			{
 				std::lock_guard<std::mutex> lk(g_state.mutex);
@@ -805,14 +882,92 @@ inline void start_fuzzing()
 			static_cast<unsigned long long>(final_unique),
 			final_elapsed, g_state.cancel.load() ? 1 : 0);
 
+		g_state.worker_active.store(false);
 		g_state.running.store(false);
-	});
+		} catch (const std::exception& ex) {
+			{
+				std::lock_guard<std::mutex> lk(g_state.mutex);
+				g_state.setup_error = ex.what();
+				g_state.active = false;
+			}
+			g_state.setup_complete.store(true);
+			g_state.setup_success.store(false);
+			g_state.worker_active.store(false);
+			g_state.running.store(false);
+			diag::log_tagged_fmt("fuzzer", "worker_exception type=std err=%s", ex.what());
+		} catch (...) {
+			{
+				std::lock_guard<std::mutex> lk(g_state.mutex);
+				g_state.setup_error = "unknown fuzzer worker exception";
+				g_state.active = false;
+			}
+			g_state.setup_complete.store(true);
+			g_state.setup_success.store(false);
+			g_state.worker_active.store(false);
+			g_state.running.store(false);
+			diag::log_tagged("fuzzer", "worker_exception type=unknown");
+		}
+	};
+	const bool run_inline = cfg_snapshot.max_iterations <= 32 &&
+		cfg_snapshot.input_size <= 4096 &&
+		cfg_snapshot.end_address > cfg_snapshot.target_address &&
+		(cfg_snapshot.end_address - cfg_snapshot.target_address) <= 0x1000;
+	if (run_inline) {
+		diag::log_tagged_fmt("fuzzer",
+			"start_inline_worker target=0x%llX end=0x%llX input_size=%d max_iterations=%u",
+			static_cast<unsigned long long>(cfg_snapshot.target_address),
+			static_cast<unsigned long long>(cfg_snapshot.end_address),
+			cfg_snapshot.input_size,
+			cfg_snapshot.max_iterations);
+		worker();
+		return true;
+	}
+	const bool posted = critical_work_queue::post(worker) || work_queue::post(worker);
+	if (!posted) {
+		{
+			std::lock_guard<std::mutex> lk(g_state.mutex);
+			g_state.setup_error = "fuzzer worker queue post failed";
+			g_state.active = false;
+		}
+		g_state.setup_complete.store(true);
+		g_state.setup_success.store(false);
+		g_state.worker_active.store(false);
+		g_state.running.store(false);
+		diag::log_tagged("fuzzer", "worker_post_failed");
+		return false;
+	}
+	return true;
+#else
+	return false;
 #endif
 }
 
 inline void stop_fuzzing()
 {
 	g_state.cancel.store(true);
+}
+
+inline bool wait_until_idle(uint32_t timeout_ms)
+{
+	const auto start = std::chrono::steady_clock::now();
+	while (g_state.running.load() || g_state.worker_active.load()) {
+		if (timeout_ms != 0) {
+			const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+				std::chrono::steady_clock::now() - start).count();
+			if (elapsed >= timeout_ms) {
+				diag::log_tagged_fmt("fuzzer",
+					"wait_idle_timeout timeout_ms=%u running=%d worker_active=%d setup_complete=%d setup_success=%d",
+					timeout_ms,
+					g_state.running.load() ? 1 : 0,
+					g_state.worker_active.load() ? 1 : 0,
+					g_state.setup_complete.load() ? 1 : 0,
+					g_state.setup_success.load() ? 1 : 0);
+				return false;
+			}
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(25));
+	}
+	return true;
 }
 
 inline bool reset_state()

@@ -15,6 +15,10 @@
 #include <hv_detect/hv_detect.h>
 #include <core/HardwareId.h>
 
+namespace dll_protection {
+    ULONG cleanup_for_session_reset(UINT32 pid, const char* reason);
+}
+
 __forceinline ULONG hash_build_key(ULONG key) {
     key ^= key >> 16;
     key *= 0x85ebca6bu;
@@ -279,6 +283,40 @@ namespace dispatcher {
         return FALSE;
     }
 
+    __forceinline BOOLEAN is_re_abort_reason(ULONG reason) {
+        if (reason >= 0xAE00u && reason <= 0xAEFFu)
+            return TRUE;
+
+        switch (reason) {
+        case sentinel_bridge::RE_REASON_GENERIC:
+        case sentinel_bridge::RE_REASON_DEBUG_ATTACH:
+        case sentinel_bridge::RE_REASON_DR_SET:
+        case sentinel_bridge::RE_REASON_FOREIGN_HND:
+        case sentinel_bridge::RE_REASON_INJECTED_DLL:
+        case sentinel_bridge::RE_REASON_WATCHDOG_STALL:
+        case sentinel_bridge::RE_REASON_PARENT_RE_TOOL:
+        case sentinel_bridge::RE_REASON_VAD_MAPPED_IN_RE:
+        case sentinel_bridge::RE_REASON_TEXT_WRITABLE:
+        case sentinel_bridge::RE_REASON_HOSTILE_DRIVER:
+        case sentinel_bridge::RE_REASON_HOSTILE_DEVICE:
+        case sentinel_bridge::RE_REASON_KD_ENABLED:
+        case sentinel_bridge::RE_REASON_DMA_CANARY:
+        case sentinel_bridge::RE_REASON_TARGET_FILE_OPENED:
+        case sentinel_bridge::RE_REASON_TARGET_SECTION_MAPPED:
+        case sentinel_bridge::RE_REASON_DEBUG_BY_RE_TOOL:
+        case sentinel_bridge::RE_REASON_KD_TARGETING_US:
+        case sentinel_bridge::RE_REASON_OB_WRITE:
+        case sentinel_bridge::RE_REASON_OB_CREATE_THREAD:
+        case sentinel_bridge::RE_REASON_OB_SUSPEND:
+        case sentinel_bridge::RE_REASON_DEBUG_PORT_TRAP:
+        case sentinel_bridge::RE_REASON_SIDECHANNEL_CORROBORATED:
+        case 0x0002u:
+            return TRUE;
+        default:
+            return FALSE;
+        }
+    }
+
     __forceinline void activate_server_seed_state(UINT64 server_nonce, UINT32 token_hash, UINT32 session_key) {
         dynamic_key::set_server_seed(server_nonce, token_hash, session_key);
         UINT32 nonce_lo = static_cast<UINT32>(server_nonce);
@@ -336,12 +374,14 @@ namespace dispatcher {
         if (cleanup_client && prev_client) {
             UINT32 prev_pid = static_cast<UINT32>(reinterpret_cast<ULONG_PTR>(prev_client));
             ULONG cleanup_cleared = anti_dma_canary::cleanup_for_pid(prev_pid);
+            ULONG dprt_cleared = dll_protection::cleanup_for_session_reset(prev_pid, reason);
             continuous_anti_debug::stop();
             continuous_anti_dump::stop();
-            WW_LOG("SESSION_RESET: cleanup_done reason=%s prev_pid=%u canaries_cleared=%lu",
+            WW_LOG("SESSION_RESET: cleanup_done reason=%s prev_pid=%u canaries_cleared=%lu dprt_slots_cleared=%lu",
                 reason ? reason : "unknown",
                 prev_pid,
-                cleanup_cleared);
+                cleanup_cleared,
+                dprt_cleared);
         }
     }
 
@@ -1341,33 +1381,62 @@ namespace dispatcher {
             else { status = STATUS_INFO_LENGTH_MISMATCH; }
         }
         else if (code == ioctl_codes::ABRT()) {
-
-
+            LARGE_INTEGER abrt_freq{};
+            LARGE_INTEGER abrt_start = KeQueryPerformanceCounter(&abrt_freq);
+            const ULONG abrt_requestor = static_cast<ULONG>(irp->RequestorMode);
+            const ULONG abrt_requestor_pid = IoGetRequestorProcessId(irp);
+            const UINT64 abrt_current_pid = handle_to_u64(PsGetCurrentProcessId());
+            const UINT64 abrt_current_tid = handle_to_u64(PsGetCurrentThreadId());
+            const ULONG abrt_irql = (ULONG)KeGetCurrentIrql();
             if (input_size >= sizeof(abort_request)) {
                 p_abort_request abrt = (p_abort_request)buffer;
-                ULONG expected_magic = g_session_key ^ dynamic_key::get() ^ 0xABCD1234u;
-                if (abrt->magic == expected_magic && g_driver_activated != 0) {
-                    WW_LOG("ABRT: Tamper enforcement triggered reason=0x%lx evidence=0x%llx",
-                        abrt->reason_code, abrt->evidence_hash);
+                const ULONG expected_magic = g_session_key ^ dynamic_key::get() ^ 0xABCD1234u;
+                const LONG activated_snapshot = _InterlockedCompareExchange(&g_driver_activated, 0, 0);
+                const BOOLEAN magic_match = (abrt->magic == expected_magic) ? TRUE : FALSE;
+                const BOOLEAN session_present = g_session_key != 0 ? TRUE : FALSE;
+                const BOOLEAN server_seed_set = dynamic_key::g_server_seed != 0 ? TRUE : FALSE;
+                const BOOLEAN ioctl_seed_set = ioctl_codes::g_server_ioctl_seed != 0 ? TRUE : FALSE;
+                const ULONG reason = abrt->reason_code;
+                const BOOLEAN re_reason = is_re_abort_reason(reason);
+                const ULONG re_family = static_cast<ULONG>(sentinel_bridge::evidence_accumulator::classify_family(reason));
+
+                WW_LOG("ABRT: ENTRY reason=0x%lx evidence=0x%llx request_tsc=0x%llx input_size=%lu output_size=%lu requestor=%lu requestor_pid=%lu current_pid=%llu current_tid=%llu irql=%lu activated=%ld magic_match=%u session_present=%u server_seed_set=%u ioctl_seed_set=%u re_reason=%u family=0x%lx elapsed_us=%llu",
+                    reason,
+                    static_cast<unsigned long long>(abrt->evidence_hash),
+                    static_cast<unsigned long long>(abrt->timestamp),
+                    input_size,
+                    output_size,
+                    abrt_requestor,
+                    abrt_requestor_pid,
+                    abrt_current_pid,
+                    abrt_current_tid,
+                    abrt_irql,
+                    activated_snapshot,
+                    magic_match ? 1u : 0u,
+                    session_present ? 1u : 0u,
+                    server_seed_set ? 1u : 0u,
+                    ioctl_seed_set ? 1u : 0u,
+                    re_reason ? 1u : 0u,
+                    re_family,
+                    elapsed_us_from_qpc(abrt_start, abrt_freq));
+
+                if (magic_match && activated_snapshot != 0) {
 
                     BOOLEAN should_bsod = TRUE;
-                    ULONG reason = abrt->reason_code;
-                    bool is_re_reason =
-                        (reason == sentinel_bridge::RE_REASON_GENERIC) ||
-                        (reason == sentinel_bridge::RE_REASON_DEBUG_ATTACH) ||
-                        (reason == sentinel_bridge::RE_REASON_DR_SET) ||
-                        (reason == sentinel_bridge::RE_REASON_FOREIGN_HND) ||
-                        (reason == sentinel_bridge::RE_REASON_INJECTED_DLL) ||
-                        (reason == sentinel_bridge::RE_REASON_WATCHDOG_STALL) ||
-                        (reason == 0x0002u);
+                    UINT32 det_flags = 0;
+                    UINT64 dbg_pid = 0;
+                    NTSTATUS scan_st = STATUS_NOT_SUPPORTED;
+                    BOOLEAN scan_hit = FALSE;
+                    BOOLEAN kernel_confirmed = FALSE;
+                    LONG spurious_count = 0;
 
-                    if (is_re_reason) {
-                        UINT32 det_flags = anti_debug::run_all_checks();
-                        UINT64 dbg_pid = 0;
-                        NTSTATUS scan_st = anti_debug::scan_for_debugger_processes(&dbg_pid);
-                        BOOLEAN scan_hit = NT_SUCCESS(scan_st) && dbg_pid != 0;
+                    if (re_reason) {
+                        det_flags = anti_debug::run_all_checks();
+                        scan_st = anti_debug::scan_for_debugger_processes(&dbg_pid);
+                        scan_hit = NT_SUCCESS(scan_st) && dbg_pid != 0;
+                        kernel_confirmed = (det_flags != 0 || scan_hit) ? TRUE : FALSE;
 
-                        if (det_flags == 0 && !scan_hit) {
+                        if (!kernel_confirmed) {
                             static volatile LONG g_spurious_count = 0;
                             static volatile LONG64 g_spurious_window_tsc = 0;
                             LONG64 now_tsc = static_cast<LONG64>(__rdtsc());
@@ -1377,22 +1446,66 @@ namespace dispatcher {
                             if (window == 0 || (now_tsc - window) > WINDOW_TSC) {
                                 _InterlockedExchange64(&g_spurious_window_tsc, now_tsc);
                                 _InterlockedExchange(&g_spurious_count, 1);
-                                should_bsod = FALSE;
+                                spurious_count = 1;
                             } else {
-                                LONG c = _InterlockedIncrement(&g_spurious_count);
-                                if (c < 3) {
-                                    should_bsod = FALSE;
-                                }
+                                spurious_count = _InterlockedIncrement(&g_spurious_count);
                             }
-                            WW_LOG("ABRT: RE reason but no kernel confirmation, spurious=%ld should_bsod=%d",
-                                g_spurious_count, (int)should_bsod);
+                            should_bsod = FALSE;
+                            WW_LOG("ABRT: RE reason without kernel confirmation observed reason=0x%lx evidence=0x%llx family=0x%lx det_flags=0x%lx scan_status=0x%08lx scan_hit=%u dbg_pid=%llu spurious=%ld window_tsc=%lld now_tsc=%lld requestor_pid=%lu current_pid=%llu elapsed_us=%llu should_bsod=0",
+                                reason,
+                                static_cast<unsigned long long>(abrt->evidence_hash),
+                                re_family,
+                                det_flags,
+                                scan_st,
+                                scan_hit ? 1u : 0u,
+                                dbg_pid,
+                                spurious_count,
+                                window,
+                                now_tsc,
+                                abrt_requestor_pid,
+                                abrt_current_pid,
+                                elapsed_us_from_qpc(abrt_start, abrt_freq));
                         } else {
-                            WW_LOG("ABRT: RE reason confirmed by kernel det=0x%lx dbg_pid=%llu",
-                                det_flags, dbg_pid);
+                            WW_LOG("ABRT: RE reason confirmed by kernel reason=0x%lx evidence=0x%llx family=0x%lx det_flags=0x%lx scan_status=0x%08lx scan_hit=%u dbg_pid=%llu requestor_pid=%lu current_pid=%llu elapsed_us=%llu should_bsod=1",
+                                reason,
+                                static_cast<unsigned long long>(abrt->evidence_hash),
+                                re_family,
+                                det_flags,
+                                scan_st,
+                                scan_hit ? 1u : 0u,
+                                dbg_pid,
+                                abrt_requestor_pid,
+                                abrt_current_pid,
+                                elapsed_us_from_qpc(abrt_start, abrt_freq));
                         }
+                    } else {
+                        WW_LOG("ABRT: non-RE destructive request accepted reason=0x%lx evidence=0x%llx requestor_pid=%lu current_pid=%llu elapsed_us=%llu should_bsod=1",
+                            reason,
+                            static_cast<unsigned long long>(abrt->evidence_hash),
+                            abrt_requestor_pid,
+                            abrt_current_pid,
+                            elapsed_us_from_qpc(abrt_start, abrt_freq));
                     }
 
                     if (should_bsod && _KeBugCheckEx) {
+                        WW_LOG("ABRT: PRE_BUGCHECK code=0xDEAD0001 reason=0x%lx evidence=0x%llx request_tsc=0x%llx requestor=%lu requestor_pid=%lu current_pid=%llu current_tid=%llu irql=%lu re_reason=%u family=0x%lx kernel_confirmed=%u det_flags=0x%lx scan_status=0x%08lx scan_hit=%u dbg_pid=%llu spurious=%ld elapsed_us=%llu",
+                            reason,
+                            static_cast<unsigned long long>(abrt->evidence_hash),
+                            static_cast<unsigned long long>(abrt->timestamp),
+                            abrt_requestor,
+                            abrt_requestor_pid,
+                            abrt_current_pid,
+                            abrt_current_tid,
+                            abrt_irql,
+                            re_reason ? 1u : 0u,
+                            re_family,
+                            kernel_confirmed ? 1u : 0u,
+                            det_flags,
+                            scan_st,
+                            scan_hit ? 1u : 0u,
+                            dbg_pid,
+                            spurious_count,
+                            elapsed_us_from_qpc(abrt_start, abrt_freq));
                         sentinel_bridge::g_bridge.sentinel_cmd = sentinel_bridge::BRIDGE_CMD_PRE_BSOD_INTENT;
                         sentinel_bridge::g_bridge.sentinel_cmd_param = reason;
 
@@ -1403,17 +1516,61 @@ namespace dispatcher {
                             (ULONG_PTR)abrt->timestamp,
                             (ULONG_PTR)g_session_key
                         );
+                    } else if (should_bsod && !_KeBugCheckEx) {
+                        WW_LOG("ABRT: BUGCHECK_UNAVAILABLE reason=0x%lx evidence=0x%llx request_tsc=0x%llx re_reason=%u kernel_confirmed=%u requestor_pid=%lu current_pid=%llu elapsed_us=%llu",
+                            reason,
+                            static_cast<unsigned long long>(abrt->evidence_hash),
+                            static_cast<unsigned long long>(abrt->timestamp),
+                            re_reason ? 1u : 0u,
+                            kernel_confirmed ? 1u : 0u,
+                            abrt_requestor_pid,
+                            abrt_current_pid,
+                            elapsed_us_from_qpc(abrt_start, abrt_freq));
                     }
 
+                    WW_LOG("ABRT: EXIT status=0x%08lx reason=0x%lx should_bsod=%u re_reason=%u kernel_confirmed=%u spurious=%ld bytes=%lu elapsed_us=%llu",
+                        STATUS_SUCCESS,
+                        reason,
+                        should_bsod ? 1u : 0u,
+                        re_reason ? 1u : 0u,
+                        kernel_confirmed ? 1u : 0u,
+                        spurious_count,
+                        static_cast<ULONG>(sizeof(abort_request)),
+                        elapsed_us_from_qpc(abrt_start, abrt_freq));
                     status = STATUS_SUCCESS;
                 } else {
-                    WW_LOG("ABRT: REJECTED magic=0x%lx expected=0x%lx activated=%ld",
-                        abrt->magic, expected_magic, g_driver_activated);
+                    WW_LOG("ABRT: REJECTED reason=0x%lx magic_match=%u activated=%ld session_present=%u server_seed_set=%u ioctl_seed_set=%u input_size=%lu output_size=%lu requestor=%lu requestor_pid=%lu current_pid=%llu current_tid=%llu irql=%lu elapsed_us=%llu",
+                        reason,
+                        magic_match ? 1u : 0u,
+                        activated_snapshot,
+                        session_present ? 1u : 0u,
+                        server_seed_set ? 1u : 0u,
+                        ioctl_seed_set ? 1u : 0u,
+                        input_size,
+                        output_size,
+                        abrt_requestor,
+                        abrt_requestor_pid,
+                        abrt_current_pid,
+                        abrt_current_tid,
+                        abrt_irql,
+                        elapsed_us_from_qpc(abrt_start, abrt_freq));
                     status = STATUS_ACCESS_DENIED;
                 }
                 bytes = sizeof(abort_request);
             }
-            else { status = STATUS_INFO_LENGTH_MISMATCH; }
+            else {
+                WW_LOG("ABRT: BAD_SIZE input_size=%lu output_size=%lu required=%llu requestor=%lu requestor_pid=%lu current_pid=%llu current_tid=%llu irql=%lu elapsed_us=%llu",
+                    input_size,
+                    output_size,
+                    static_cast<UINT64>(sizeof(abort_request)),
+                    abrt_requestor,
+                    abrt_requestor_pid,
+                    abrt_current_pid,
+                    abrt_current_tid,
+                    abrt_irql,
+                    elapsed_us_from_qpc(abrt_start, abrt_freq));
+                status = STATUS_INFO_LENGTH_MISMATCH;
+            }
         }
         else if (code == ioctl_codes::ADBG()) {
             if (input_size >= sizeof(anti_debug_request) && output_size >= sizeof(anti_debug_request)) {

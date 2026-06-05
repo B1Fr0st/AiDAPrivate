@@ -323,30 +323,8 @@ void rebuild_lines(tab_t& t)
 		static_cast<unsigned long long>(t.addr), t.lines.size());
 }
 
-bool sync_tab_from_cache(tab_t& t)
+bool apply_decompile_result(tab_t& t, const decompiler_engine::decompile_result_t& r)
 {
-	diag::log_tagged_fmt("pcode_view", "sync_tab_from_cache addr=0x%llX pending=%d",
-		static_cast<unsigned long long>(t.addr), t.pending ? 1 : 0);
-	auto& st = decompiler_engine::g_state;
-	std::lock_guard<std::mutex> lk(st.mutex);
-	auto it = st.cache.find(t.addr);
-	if (it == st.cache.end()) {
-		if (!st.decompiling.load() && st.current.function_addr == t.addr && st.current.is_error) {
-			diag::log_tagged_fmt("pcode_view", "sync_tab_cache_miss_error addr=0x%llX error=%s",
-				static_cast<unsigned long long>(t.addr), st.current.error_text.c_str());
-			t.is_error = true;
-			t.error_text = st.current.error_text;
-			t.loaded = false;
-			t.pending = false;
-			t.decompiling = false;
-			return true;
-		}
-		diag::log_tagged_fmt("pcode_view", "sync_tab_cache_miss addr=0x%llX not_ready",
-			static_cast<unsigned long long>(t.addr));
-		return false;
-	}
-	auto& r = it->second;
-	if (!r.complete) return false;
 	t.function_name = r.function_name;
 	t.pseudocode = r.pseudocode;
 	t.parameters = r.parameters;
@@ -360,10 +338,35 @@ bool sync_tab_from_cache(tab_t& t)
 	t.loaded = !r.is_error;
 	t.pending = false;
 	t.decompiling = false;
-	diag::log_tagged_fmt("pcode_view", "sync_tab_cache_hit addr=0x%llX func=%s is_error=%d lines_before_rebuild=0",
-		static_cast<unsigned long long>(t.addr), t.function_name.c_str(), t.is_error ? 1 : 0);
 	rebuild_lines(t);
 	return true;
+}
+
+bool sync_tab_from_cache(tab_t& t)
+{
+	diag::log_tagged_fmt("pcode_view", "sync_tab_from_cache addr=0x%llX pending=%d",
+		static_cast<unsigned long long>(t.addr), t.pending ? 1 : 0);
+	auto& st = decompiler_engine::g_state;
+	std::lock_guard<std::mutex> lk(st.mutex);
+	auto it = st.cache.find(t.addr);
+	if (it == st.cache.end()) {
+		if (!st.decompiling.load() && st.current.function_addr == t.addr && st.current.complete) {
+			diag::log_tagged_fmt("pcode_view", "sync_tab_current_terminal addr=0x%llX is_error=%d error=%s",
+				static_cast<unsigned long long>(t.addr),
+				st.current.is_error ? 1 : 0,
+				st.current.error_text.c_str());
+			apply_decompile_result(t, st.current);
+			return true;
+		}
+		diag::log_tagged_fmt("pcode_view", "sync_tab_cache_miss addr=0x%llX not_ready",
+			static_cast<unsigned long long>(t.addr));
+		return false;
+	}
+	auto& r = it->second;
+	if (!r.complete) return false;
+	diag::log_tagged_fmt("pcode_view", "sync_tab_cache_hit addr=0x%llX func=%s is_error=%d lines_before_rebuild=0",
+		static_cast<unsigned long long>(t.addr), r.function_name.c_str(), r.is_error ? 1 : 0);
+	return apply_decompile_result(t, r);
 }
 
 inline bool error_text_is_cancellation(const std::string& msg)
@@ -382,7 +385,7 @@ void poll_pending_tabs()
 {
 	auto& s = state();
 	for (auto& t : s.tabs) {
-		if (!t->pending) continue;
+		if (!t->pending && !t->decompiling) continue;
 		diag::log_tagged_fmt("pcode_view", "poll_pending_tab addr=0x%llX label=%s",
 			static_cast<unsigned long long>(t->addr), t->label.c_str());
 		bool was_pending = t->pending;
@@ -1266,6 +1269,19 @@ void close_all_tabs()
 
 void cancel_active_decompile()
 {
+	{
+		std::lock_guard<std::mutex> guard(state_mutex());
+		auto at = active_tab_locked();
+		if (at && (at->pending || at->decompiling)) {
+			diag::log_tagged_fmt("pcode_view", "cancel_active_tab addr=0x%llX",
+				static_cast<unsigned long long>(at->addr));
+			at->pending = false;
+			at->decompiling = false;
+			at->loaded = false;
+			at->is_error = true;
+			at->error_text = "decompilation cancelled";
+		}
+	}
 	decompiler_engine::cancel_decompile();
 	globals::ui::decompile_popup_active.store(false, std::memory_order_release);
 }
@@ -1356,6 +1372,7 @@ std::vector<tab_info_t> snapshot_tabs()
 {
 	std::vector<tab_info_t> out;
 	std::lock_guard<std::mutex> guard(state_mutex());
+	poll_pending_tabs();
 	auto& s = state();
 	out.reserve(s.tabs.size());
 	for (auto& t : s.tabs) {

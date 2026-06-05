@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <string>
 
 namespace session_tools {
@@ -87,21 +88,71 @@ bool wait_for_binary_load_quiescent(uint32_t timeout_ms)
 {
 	const ULONGLONG start = GetTickCount64();
 	ULONGLONG last_log = 0;
+	ULONGLONG last_poll_log = 0;
+	uint32_t poll_count = 0;
+	bool first_poll = true;
 	loading_binary_overlay::log_state("session_wait_begin");
 	for (;;) {
-		loading_binary_overlay::poll_completion();
+		const ULONGLONG before_tick = GetTickCount64();
+		const ULONGLONG before_elapsed = before_tick - start;
+		const char* phase_before = loading_binary_overlay::current_phase_name();
+		const bool log_poll = first_poll || before_elapsed - last_poll_log >= 250;
+		if (log_poll) {
+			last_poll_log = before_elapsed;
+			diag::log_tagged_fmt("sess_tools",
+				"session_wait_poll_pre poll=%u elapsed_ms=%llu timeout_ms=%u phase=%s active=%d",
+				poll_count,
+				static_cast<unsigned long long>(before_elapsed),
+				timeout_ms,
+				phase_before,
+				loading_binary_overlay::is_active() ? 1 : 0);
+		}
+		try {
+			loading_binary_overlay::poll_completion();
+		} catch (const std::exception& ex) {
+			diag::log_tagged_fmt("sess_tools",
+				"session_wait_poll_exception poll=%u elapsed_ms=%llu phase_before=%s what=%s",
+				poll_count,
+				static_cast<unsigned long long>(GetTickCount64() - start),
+				phase_before,
+				ex.what());
+			loading_binary_overlay::log_state("session_wait_poll_exception");
+			return false;
+		} catch (...) {
+			diag::log_tagged_fmt("sess_tools",
+				"session_wait_poll_exception poll=%u elapsed_ms=%llu phase_before=%s what=unknown",
+				poll_count,
+				static_cast<unsigned long long>(GetTickCount64() - start),
+				phase_before);
+			loading_binary_overlay::log_state("session_wait_poll_exception");
+			return false;
+		}
+		++poll_count;
+		first_poll = false;
+		if (log_poll) {
+			diag::log_tagged_fmt("sess_tools",
+				"session_wait_poll_post poll=%u elapsed_ms=%llu phase_before=%s phase_after=%s active=%d waiting_decision=%d",
+				poll_count,
+				static_cast<unsigned long long>(GetTickCount64() - start),
+				phase_before,
+				loading_binary_overlay::current_phase_name(),
+				loading_binary_overlay::is_active() ? 1 : 0,
+				loading_binary_overlay::is_waiting_for_user_decision() ? 1 : 0);
+		}
 		if (!loading_binary_overlay::is_active()) {
 			diag::log_tagged_fmt("sess_tools",
-				"session_wait_done elapsed_ms=%llu phase=%s",
+				"session_wait_done elapsed_ms=%llu phase=%s polls=%u",
 				static_cast<unsigned long long>(GetTickCount64() - start),
-				loading_binary_overlay::current_phase_name());
+				loading_binary_overlay::current_phase_name(),
+				poll_count);
 			return true;
 		}
 		if (loading_binary_overlay::is_waiting_for_user_decision()) {
 			diag::log_tagged_fmt("sess_tools",
-				"session_wait_quiescent_user_decision elapsed_ms=%llu phase=%s",
+				"session_wait_quiescent_user_decision elapsed_ms=%llu phase=%s polls=%u",
 				static_cast<unsigned long long>(GetTickCount64() - start),
-				loading_binary_overlay::current_phase_name());
+				loading_binary_overlay::current_phase_name(),
+				poll_count);
 			return true;
 		}
 		const ULONGLONG elapsed = GetTickCount64() - start;
@@ -115,6 +166,12 @@ bool wait_for_binary_load_quiescent(uint32_t timeout_ms)
 		}
 		if (elapsed >= timeout_ms) {
 			loading_binary_overlay::log_state("session_wait_timeout");
+			diag::log_tagged_fmt("sess_tools",
+				"session_wait_timeout elapsed_ms=%llu timeout_ms=%u phase=%s polls=%u",
+				static_cast<unsigned long long>(elapsed),
+				timeout_ms,
+				loading_binary_overlay::current_phase_name(),
+				poll_count);
 			return false;
 		}
 		Sleep(25);
@@ -220,11 +277,44 @@ static tool_result_t sessions_open_file(const json& params)
 	if (path.empty()) {
 		return tool_result_t::error("path must be non-empty");
 	}
-	if (!analysis_session::open_session(path)) {
+	const size_t before_count = analysis_session::list_session_summaries().size();
+	const size_t before_active = analysis_session::active_session_idx();
+	const uint32_t attached_before = driver_bridge::attached_pid();
+	diag::log_tagged_fmt("sess_tools",
+		"sessions_open_file open_begin path='%s' sessions_before=%llu active_before=%llu attached_pid=%u phase=%s",
+		path.c_str(),
+		static_cast<unsigned long long>(before_count),
+		static_cast<unsigned long long>(before_active),
+		attached_before,
+		loading_binary_overlay::current_phase_name());
+	const bool opened = analysis_session::open_session(path);
+	const size_t after_count = analysis_session::list_session_summaries().size();
+	const size_t after_active = analysis_session::active_session_idx();
+	diag::log_tagged_fmt("sess_tools",
+		"sessions_open_file open_return path='%s' opened=%d sessions_after=%llu active_after=%llu attached_pid=%u phase=%s",
+		path.c_str(),
+		opened ? 1 : 0,
+		static_cast<unsigned long long>(after_count),
+		static_cast<unsigned long long>(after_active),
+		driver_bridge::attached_pid(),
+		loading_binary_overlay::current_phase_name());
+	if (!opened) {
 		std::string err = analysis_session::last_error();
 		size_t idx = 0;
 		if (analysis_session::find_session_by_path(path, &idx)) {
-			if (!wait_for_binary_load_quiescent(30000)) {
+			diag::log_tagged_fmt("sess_tools",
+				"sessions_open_file existing_session_found path='%s' idx=%llu err='%s'",
+				path.c_str(),
+				static_cast<unsigned long long>(idx),
+				err.c_str());
+			const bool wait_ok = wait_for_binary_load_quiescent(30000);
+			diag::log_tagged_fmt("sess_tools",
+				"sessions_open_file existing_wait_done path='%s' idx=%llu wait_ok=%d phase=%s",
+				path.c_str(),
+				static_cast<unsigned long long>(idx),
+				wait_ok ? 1 : 0,
+				loading_binary_overlay::current_phase_name());
+			if (!wait_ok) {
 				return tool_result_t::error("open failed: load timeout");
 			}
 			auto sum = analysis_session::summarize_session_at(idx);
@@ -241,11 +331,28 @@ static tool_result_t sessions_open_file(const json& params)
 			path.c_str(), err.c_str());
 		return tool_result_t::error(std::string("open failed: ") + err);
 	}
-	if (!wait_for_binary_load_quiescent(30000)) {
+	diag::log_tagged_fmt("sess_tools",
+		"sessions_open_file wait_begin path='%s' phase=%s attached_pid=%u",
+		path.c_str(),
+		loading_binary_overlay::current_phase_name(),
+		driver_bridge::attached_pid());
+	const bool wait_ok = wait_for_binary_load_quiescent(30000);
+	diag::log_tagged_fmt("sess_tools",
+		"sessions_open_file wait_done path='%s' wait_ok=%d phase=%s attached_pid=%u",
+		path.c_str(),
+		wait_ok ? 1 : 0,
+		loading_binary_overlay::current_phase_name(),
+		driver_bridge::attached_pid());
+	if (!wait_ok) {
 		return tool_result_t::error("open failed: load timeout");
 	}
 	size_t idx = 0;
 	if (!analysis_session::find_session_by_path(path, &idx)) {
+		diag::log_tagged_fmt("sess_tools",
+			"sessions_open_file lookup_failed path='%s' sessions_after_wait=%llu active=%llu",
+			path.c_str(),
+			static_cast<unsigned long long>(analysis_session::list_session_summaries().size()),
+			static_cast<unsigned long long>(analysis_session::active_session_idx()));
 		return tool_result_t::error("session created but lookup failed");
 	}
 	auto sum = analysis_session::summarize_session_at(idx);
@@ -253,8 +360,12 @@ static tool_result_t sessions_open_file(const json& params)
 	root["opened"] = summary_to_json(sum);
 	root["already_open"] = false;
 	diag::log_tagged_fmt("sess_tools",
-		"sessions_open_file path='%s' opened id='%s'",
-		path.c_str(), sum.id.c_str());
+		"sessions_open_file path='%s' opened id='%s' idx=%llu active=%d attached_pid=%u",
+		path.c_str(),
+		sum.id.c_str(),
+		static_cast<unsigned long long>(idx),
+		sum.is_active ? 1 : 0,
+		driver_bridge::attached_pid());
 	return tool_result_t::ok(root);
 }
 

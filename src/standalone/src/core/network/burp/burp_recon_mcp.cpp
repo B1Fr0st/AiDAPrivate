@@ -159,7 +159,7 @@ tool_result_t crawler_start(const json& p)
     diag::log_tagged_fmt("mcp_burp", "crawler_start ok crawl_id=%llu", static_cast<unsigned long long>(id));
     json r;
     r["crawl_id"] = id;
-    return tool_result_t::ok("crawl started", r);
+    return tool_result_t::ok("crawl started id=" + std::to_string(id), r);
 }
 
 tool_result_t crawler_status_(const json& p)
@@ -186,7 +186,7 @@ tool_result_t crawler_status_(const json& p)
     }
     j["urls"] = urls;
     diag::log_tagged_fmt("mcp_burp", "crawler_status ok id=%llu urls=%d", static_cast<unsigned long long>(id), n);
-    return tool_result_t::ok("status", j);
+    return tool_result_t::ok("crawler status id=" + std::to_string(id) + " urls=" + std::to_string(urls.size()), j);
 }
 
 tool_result_t crawler_stop_(const json& p)
@@ -208,7 +208,7 @@ tool_result_t crawler_list_(const json&)
     json out;
     out["crawls"] = arr;
     diag::log_tagged_fmt("mcp_burp", "crawler_list ok count=%zu", v.size());
-    return tool_result_t::ok("list", out);
+    return tool_result_t::ok("crawler list count=" + std::to_string(v.size()), out);
 }
 
 tool_result_t cd_start(const json& p)
@@ -219,6 +219,10 @@ tool_result_t cd_start(const json& p)
     if (cfg.target_url.empty()) return tool_result_t::error("target_url required");
     cfg.wordlist_id       = get_or<std::string>(p, "wordlist_id", std::string());
     cfg.wordlist_file     = get_or<std::string>(p, "wordlist_file", std::string());
+    if (cfg.wordlist_id.empty() && cfg.wordlist_file.empty()) {
+        cfg.wordlist_id = "dirs/common-100";
+        diag::log_tagged_fmt("mcp_burp", "content_discovery_start default_wordlist id=%s", cfg.wordlist_id.c_str());
+    }
     cfg.extensions        = get_string_array(p, "extensions");
     cfg.concurrency       = get_or<int>(p, "concurrency", 25);
     cfg.delay_ms          = get_or<int>(p, "delay_ms", 0);
@@ -246,7 +250,7 @@ tool_result_t cd_start(const json& p)
     diag::log_tagged_fmt("mcp_burp", "content_discovery_start ok disc_id=%llu", static_cast<unsigned long long>(id));
     json r;
     r["disc_id"] = id;
-    return tool_result_t::ok("discovery started", r);
+    return tool_result_t::ok("discovery started id=" + std::to_string(id), r);
 }
 
 tool_result_t cd_status_(const json& p)
@@ -257,7 +261,7 @@ tool_result_t cd_status_(const json& p)
     auto s = content_discovery::status(id);
     if (s.id == 0) { diag::log_tagged_fmt("mcp_burp", "content_discovery_status not_found id=%llu", static_cast<unsigned long long>(id)); return tool_result_t::error("not found"); }
     diag::log_tagged_fmt("mcp_burp", "content_discovery_status ok id=%llu hits=%zu", static_cast<unsigned long long>(id), s.hits);
-    return tool_result_t::ok("status", disc_status_to_json(s));
+    return tool_result_t::ok("discovery status id=" + std::to_string(id) + " hits=" + std::to_string(s.hits) + " attempts=" + std::to_string(s.attempts), disc_status_to_json(s));
 }
 
 tool_result_t cd_results_(const json& p)
@@ -288,7 +292,7 @@ tool_result_t cd_results_(const json& p)
     out["total"] = static_cast<int>(hits.size());
     out["returned"] = n;
     diag::log_tagged_fmt("mcp_burp", "content_discovery_results ok id=%llu returned=%d", static_cast<unsigned long long>(id), n);
-    return tool_result_t::ok("results", out);
+    return tool_result_t::ok("discovery results returned=" + std::to_string(n) + " total=" + std::to_string(hits.size()), out);
 }
 
 tool_result_t cd_stop_(const json& p)
@@ -321,7 +325,7 @@ tool_result_t sub_start(const json& p)
     diag::log_tagged_fmt("mcp_burp", "subdomain_enum_start ok sub_id=%llu", static_cast<unsigned long long>(id));
     json r;
     r["sub_id"] = id;
-    return tool_result_t::ok("enum started", r);
+    return tool_result_t::ok("enum started id=" + std::to_string(id), r);
 }
 
 tool_result_t sub_status_(const json& p)
@@ -332,7 +336,7 @@ tool_result_t sub_status_(const json& p)
     auto s = subdomain_enum::status(id);
     if (s.id == 0) { diag::log_tagged_fmt("mcp_burp", "subdomain_enum_status not_found id=%llu", static_cast<unsigned long long>(id)); return tool_result_t::error("not found"); }
     diag::log_tagged_fmt("mcp_burp", "subdomain_enum_status ok id=%llu passive=%zu brute_resolved=%zu", static_cast<unsigned long long>(id), s.passive_count, s.brute_resolved);
-    return tool_result_t::ok("status", sub_status_to_json(s));
+    return tool_result_t::ok("subdomain status id=" + std::to_string(id) + " results=" + std::to_string(s.results.size()) + " resolved=" + std::to_string(s.brute_resolved), sub_status_to_json(s));
 }
 
 tool_result_t sub_results_(const json& p)
@@ -359,7 +363,7 @@ tool_result_t sub_results_(const json& p)
     out["total"] = static_cast<int>(v.size());
     out["returned"] = n;
     diag::log_tagged_fmt("mcp_burp", "subdomain_enum_results ok id=%llu returned=%d", static_cast<unsigned long long>(id), n);
-    return tool_result_t::ok("results", out);
+    return tool_result_t::ok("subdomain results returned=" + std::to_string(n) + " total=" + std::to_string(v.size()), out);
 }
 
 tool_result_t payloads_list(const json&)
@@ -382,7 +386,7 @@ tool_result_t payloads_list(const json&)
     json out;
     out["sets"] = arr;
     diag::log_tagged_fmt("mcp_burp", "payloads_list ok count=%zu", v.size());
-    return tool_result_t::ok("payload sets", out);
+    return tool_result_t::ok("payload sets count=" + std::to_string(v.size()), out);
 }
 
 tool_result_t payloads_get_(const json& p)
@@ -400,7 +404,7 @@ tool_result_t payloads_get_(const json& p)
     out["returned"] = static_cast<int>(v.size());
     out["entries"] = v;
     diag::log_tagged_fmt("mcp_burp", "payloads_get ok set_id=%s returned=%zu", id.c_str(), v.size());
-    return tool_result_t::ok("entries", out);
+    return tool_result_t::ok("payload entries count=" + std::to_string(v.size()), out);
 }
 
 tool_result_t payloads_search_(const json& p)
@@ -416,7 +420,7 @@ tool_result_t payloads_search_(const json& p)
     out["matches"] = v;
     out["returned"] = static_cast<int>(v.size());
     diag::log_tagged_fmt("mcp_burp", "payloads_search ok query=%s returned=%zu", q.c_str(), v.size());
-    return tool_result_t::ok("search results", out);
+    return tool_result_t::ok("payload search results count=" + std::to_string(v.size()), out);
 }
 
 tool_result_t payloads_add_(const json& p)
@@ -496,7 +500,7 @@ void register_recon_tools(mcp_standalone::server_t& srv)
         "wordlist entry and reports hits.",
         {
             {"target_url", "string", "URL with FUZZ marker (path, query, header).", true},
-            {"wordlist_id", "string", "Payload library set id (e.g. dirs/common-100).", false},
+            {"wordlist_id", "string", "Payload library set id (default dirs/common-100).", false},
             {"wordlist_file", "string", "Path to wordlist file (newline-separated).", false},
             {"extensions", "array", "Extensions to append (.php, .bak, ...).", false},
             {"concurrency", "number", "Parallel requests (default 25).", false},

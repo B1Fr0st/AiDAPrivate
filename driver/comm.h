@@ -1116,6 +1116,7 @@ namespace voyager {
             std::uint64_t flags;
         };
         static_assert(sizeof(hv_detect_request) == 8, "hv_detect_request must match kernel struct");
+        static constexpr std::uint64_t HV_DETECT_FLAG_TESTLAB_SAFE = 0x0000000000000001ull;
 
         static constexpr std::uint32_t DEBUG_EVENT_TYPE_INVALID         = 0;
         static constexpr std::uint32_t DEBUG_EVENT_TYPE_IMAGE_LOADED    = 1;
@@ -1861,6 +1862,9 @@ namespace voyager {
         [[nodiscard]] std::uint32_t get_last_heartbeat_global_server_seed_present() const noexcept { return last_heartbeat_global_server_seed_present_; }
         [[nodiscard]] std::uint32_t get_last_heartbeat_global_ioctl_seed_present() const noexcept { return last_heartbeat_global_ioctl_seed_present_; }
         [[nodiscard]] std::uint32_t get_last_heartbeat_offset() const noexcept { return last_heartbeat_offset_; }
+        [[nodiscard]] bool has_server_seed() const noexcept { return server_seed_ != 0; }
+        [[nodiscard]] bool has_server_ioctl_seed() const noexcept { return server_ioctl_seed_ != 0; }
+        [[nodiscard]] std::uint32_t get_server_ioctl_seed_hash() const noexcept { return server_ioctl_seed_ != 0 ? hash_build_key(server_ioctl_seed_) : 0; }
 
         void set_process_id(std::uint32_t pid) noexcept { process_id_ = pid; }
         void set_base_address(std::uint64_t base) noexcept { base_address_ = base; }

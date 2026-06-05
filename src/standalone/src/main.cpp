@@ -29,6 +29,9 @@
 #include "core/runtime/arc_loader.hpp"
 #include "core/anti-tamper/orchestrator.hpp"
 #include "core/anti-tamper/hv_preflight.hpp"
+#include "core/anti-tamper/mcp_posture.hpp"
+#include "core/anti-tamper/enforcement.hpp"
+#include "core/runtime/reason_ids.hpp"
 #include "network_view.hpp"
 #include "memory_scanner.hpp"
 #include "mitm_proxy.hpp"
@@ -39,6 +42,7 @@
 #include "agent_picker_view.hpp"
 #include "settings_overlay.hpp"
 #include "work_queue.hpp"
+#include "critical_work_queue.hpp"
 #include "core/session/session_health.hpp"
 #include "core/testlab/test_all_features.hpp"
 #include "helpers/stb_image.h"
@@ -1197,6 +1201,31 @@ static void show_ban_refuse_ui_and_exit(const std::string& reason, const std::st
     ExitProcess(1);
 }
 
+static void show_mcp_posture_refuse_ui_and_exit(const anti_tamper::mcp_posture::report_t& report)
+{
+    char summary[64] = {};
+    _snprintf_s(summary, sizeof(summary), _TRUNCATE, "0x%016llX",
+        static_cast<unsigned long long>(report.summary_hash));
+    startup_log_critical_fmt("mcp_posture_refuse_ui_enter trusted=%d denied=%d latched=%d summary_hash=%s reason_hash=0x%016llX",
+        report.trusted ? 1 : 0,
+        report.denied ? 1 : 0,
+        report.latched ? 1 : 0,
+        summary,
+        static_cast<unsigned long long>(diag_fnv1a64(report.reason.data(), report.reason.size())));
+    crash_log_fmt("mcp_posture_refuse summary_hash=%s", summary);
+    std::wstring final_message = L"AiDA cannot start because untrusted or suspicious MCP tooling is configured on this system.";
+    final_message += L"\n\nCode: mcp_posture_untrusted";
+    final_message += L"\nSummary: ";
+    final_message += widen_message_text(summary);
+    MessageBoxW(nullptr, final_message.c_str(), L"AiDA",
+        MB_OK | MB_ICONERROR | MB_SYSTEMMODAL | MB_TOPMOST);
+    std::string extra = std::string("mcp_posture_untrusted summary_hash=") + summary;
+    anti_tamper::enforce_violation_id(
+        aida::reason_ids::reason_id_from_string("mcp_posture_untrusted"),
+        extra);
+    ExitProcess(1);
+}
+
 __declspec(noinline) static DWORD cpp_render_title(helpers* h, uint64_t frame_number, ImGuiErrorRecoveryState* imgui_state_backup)
 {
     try {
@@ -1858,6 +1887,19 @@ int main(int, char**)
         work_queue::POOL_SIZE);
     crash_log_write("work_queue_init_ok");
 
+    startup_log_critical_fmt("critical_work_queue_initialize_pre pid=%lu tid=%lu tick=%llu pool_size=%d",
+        GetCurrentProcessId(),
+        GetCurrentThreadId(),
+        static_cast<unsigned long long>(GetTickCount64()),
+        critical_work_queue::POOL_SIZE);
+    critical_work_queue::initialize();
+    startup_log_critical_fmt("critical_work_queue_initialize_post pid=%lu tid=%lu tick=%llu pool_size=%d",
+        GetCurrentProcessId(),
+        GetCurrentThreadId(),
+        static_cast<unsigned long long>(GetTickCount64()),
+        critical_work_queue::POOL_SIZE);
+    crash_log_write("critical_work_queue_init_ok");
+
     startup_log_critical_fmt("tracer_start_pre pid=%lu tid=%lu tick=%llu",
         GetCurrentProcessId(),
         GetCurrentThreadId(),
@@ -2058,6 +2100,41 @@ int main(int, char**)
         g_sa_settings.ghost_text_enabled    = true;
         g_sa_settings.auto_save_enabled     = true;
         crash_log_fmt("startup_settings_loaded=%d", settings_loaded ? 1 : 0);
+        try {
+            auto mcp_report = anti_tamper::mcp_posture::scan_startup_posture(g_sa_settings);
+            startup_log_critical_fmt("mcp_posture_scan_post trusted=%d denied=%d latched=%d files=%zu servers=%zu suspicious=%zu summary_hash=0x%016llX elapsed_ms=%llu",
+                mcp_report.trusted ? 1 : 0,
+                mcp_report.denied ? 1 : 0,
+                mcp_report.latched ? 1 : 0,
+                mcp_report.files_seen,
+                mcp_report.servers_seen,
+                mcp_report.suspicious,
+                static_cast<unsigned long long>(mcp_report.summary_hash),
+                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - settings_tick));
+            if (!mcp_report.trusted)
+                show_mcp_posture_refuse_ui_and_exit(mcp_report);
+        } catch (const std::exception& e) {
+            anti_tamper::mcp_posture::report_t mcp_report;
+            mcp_report.scanned = true;
+            mcp_report.trusted = false;
+            mcp_report.denied = true;
+            mcp_report.reason = "scan_exception";
+            mcp_report.summary_hash = anti_tamper::mcp_posture::sanitized_summary_hash(mcp_report);
+            startup_log_critical_fmt("mcp_posture_scan_exception elapsed_ms=%llu what_hash=0x%016llX",
+                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - settings_tick),
+                static_cast<unsigned long long>(diag_fnv1a64(e.what(), std::strlen(e.what()))));
+            show_mcp_posture_refuse_ui_and_exit(mcp_report);
+        } catch (...) {
+            anti_tamper::mcp_posture::report_t mcp_report;
+            mcp_report.scanned = true;
+            mcp_report.trusted = false;
+            mcp_report.denied = true;
+            mcp_report.reason = "scan_exception";
+            mcp_report.summary_hash = anti_tamper::mcp_posture::sanitized_summary_hash(mcp_report);
+            startup_log_critical_fmt("mcp_posture_scan_unknown_exception elapsed_ms=%llu",
+                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - settings_tick));
+            show_mcp_posture_refuse_ui_and_exit(mcp_report);
+        }
         std::string ban_reason;
         std::string ban_message;
         if (standalone_license::startup_ban_check(g_sa_settings, ban_reason, ban_message)) {
@@ -2292,11 +2369,11 @@ int main(int, char**)
         GetCurrentProcessId(),
         GetCurrentThreadId(),
         static_cast<unsigned long long>(GetTickCount64()));
-    startup_log_critical_fmt("bg_init_post_pre pid=%lu tid=%lu tick=%llu",
+    startup_log_critical_fmt("bg_init_critical_post_pre pid=%lu tid=%lu tick=%llu",
         GetCurrentProcessId(),
         GetCurrentThreadId(),
         static_cast<unsigned long long>(GetTickCount64()));
-    bool bg_posted = work_queue::post([]() {
+    bool bg_posted = critical_work_queue::post([]() {
         const uint64_t thread_tick = static_cast<uint64_t>(GetTickCount64());
         startup_log_critical_fmt("bg_init_thread_entry pid=%lu tid=%lu tick=%llu",
             GetCurrentProcessId(),
@@ -2391,17 +2468,28 @@ int main(int, char**)
         {
             run_step("code_hashes_snapshot_start", "code_hashes_snapshot", "code_hashes_snapshot_ok", 6,
                 []() { return seh_snapshot_code_hashes(); });
-
-            startup_store_bg_step(7, "bg_init_worker", "anti_tamper_initialize_entering");
-            const uint64_t anti_tamper_tick = static_cast<uint64_t>(GetTickCount64());
-            startup_log_critical_fmt("anti_tamper_initialize_call_pre pid=%lu tid=%lu tick=%llu validated=%d valid=%d arc=%d",
-                GetCurrentProcessId(),
-                GetCurrentThreadId(),
-                static_cast<unsigned long long>(anti_tamper_tick),
+        }
+        else
+        {
+            diag::log_tagged_fmt("bg_init",
+                "code_hashes_snapshot_waiting_for_arc_authorized validated=%d valid=%d arc=%d",
                 license::validated ? 1 : 0,
                 standalone_license::is_valid() ? 1 : 0,
                 standalone_license::is_arc_loaded() ? 1 : 0);
-            diag::log_tagged("bg_init", "anti_tamper_initialize_entering");
+        }
+
+        {
+            startup_store_bg_step(7, "bg_init_worker", "pre_activation_anti_tamper_initialize_entering");
+            const uint64_t anti_tamper_tick = static_cast<uint64_t>(GetTickCount64());
+            startup_log_critical_fmt("anti_tamper_initialize_call_pre pid=%lu tid=%lu tick=%llu runtime_authorized=%d validated=%d valid=%d arc=%d",
+                GetCurrentProcessId(),
+                GetCurrentThreadId(),
+                static_cast<unsigned long long>(anti_tamper_tick),
+                runtime_authorized ? 1 : 0,
+                license::validated ? 1 : 0,
+                standalone_license::is_valid() ? 1 : 0,
+                standalone_license::is_arc_loaded() ? 1 : 0);
+            diag::log_tagged("bg_init", "pre_activation_anti_tamper_initialize_entering");
             bool at_result = false;
             DWORD seh_at = 0;
             try {
@@ -2427,7 +2515,7 @@ int main(int, char**)
             diag::log_tagged_fmt("bg_init", "anti_tamper_initialize_result=%d", at_result ? 1 : 0);
             if (!at_result) {
                 diag::log_tagged_critical_fmt("bg_init",
-                    "anti_tamper_initialize_failed_fail_closed runtime_authorized=%d validated=%d valid=%d arc=%d seh=0x%08X violation=%d",
+                    "pre_activation_anti_tamper_initialize_failed_fail_closed runtime_authorized=%d validated=%d valid=%d arc=%d seh=0x%08X violation=%d",
                     runtime_authorized ? 1 : 0,
                     license::validated ? 1 : 0,
                     standalone_license::is_valid() ? 1 : 0,
@@ -2436,17 +2524,8 @@ int main(int, char**)
                     anti_tamper::state::get().violation_latched.load(std::memory_order_acquire) ? 1 : 0);
                 anti_tamper::enforce_violation_id(
                     aida::reason_ids::reason_id_from_string("anti_tamper_initialize_failed"),
-                    "anti_tamper_initialize_failed_after_authorization");
+                    "anti_tamper_initialize_failed_pre_activation");
             }
-        }
-        else
-        {
-            diag::log_tagged_fmt("bg_init",
-                "anti_tamper_initialize_deferred_until_arc_authorized validated=%d valid=%d arc=%d",
-                license::validated ? 1 : 0,
-                standalone_license::is_valid() ? 1 : 0,
-                standalone_license::is_arc_loaded() ? 1 : 0);
-            startup_store_bg_step(6, "bg_init_worker", "anti_tamper_initialize_deferred_until_arc_authorized");
         }
         startup_store_bg_step(7, "bg_init_worker", "bg_init_all_steps_done");
 
@@ -2482,7 +2561,7 @@ int main(int, char**)
             static_cast<unsigned long long>(GetTickCount64()));
         diag::log_tagged("bg_init", "thread_exit");
     });
-    startup_log_critical_fmt("bg_init_post_post posted=%d pid=%lu tid=%lu tick=%llu",
+    startup_log_critical_fmt("bg_init_critical_post_post posted=%d pid=%lu tid=%lu tick=%llu",
         bg_posted ? 1 : 0,
         GetCurrentProcessId(),
         GetCurrentThreadId(),
@@ -2498,11 +2577,11 @@ int main(int, char**)
         static_cast<unsigned long long>(GetTickCount64()));
 
 
-    startup_log_critical_fmt("driver_bridge_init_post_pre pid=%lu tid=%lu tick=%llu",
+    startup_log_critical_fmt("driver_bridge_init_critical_post_pre pid=%lu tid=%lu tick=%llu",
         GetCurrentProcessId(),
         GetCurrentThreadId(),
         static_cast<unsigned long long>(GetTickCount64()));
-    bool driver_posted = work_queue::post([] {
+    bool driver_posted = critical_work_queue::post([] {
         const uint64_t driver_tick = static_cast<uint64_t>(GetTickCount64());
         startup_log_critical_fmt("driver_bridge_init_thread_entry pid=%lu tid=%lu tick=%llu",
             GetCurrentProcessId(),
@@ -2512,6 +2591,50 @@ int main(int, char**)
         DWORD seh_dbi = seh_driver_bridge_initialize();
         if (seh_dbi != 0)
             diag::log_tagged_fmt("drv_init", "driver_bridge_initialize_seh code=0x%08X last_err=%lu", seh_dbi, GetLastError());
+        if (seh_dbi == 0 && driver_bridge::is_loaded() && driver_bridge::using_kernel_driver())
+        {
+            auto& at_rt = anti_tamper::state::get();
+            if (at_rt.initialized.load(std::memory_order_acquire) &&
+                !at_rt.driver_hardening_done.load(std::memory_order_acquire))
+            {
+                startup_log_critical_fmt("driver_bridge_init_anti_tamper_retry_pre pid=%lu tid=%lu tick=%llu",
+                    GetCurrentProcessId(),
+                    GetCurrentThreadId(),
+                    static_cast<unsigned long long>(GetTickCount64()));
+                bool at_ok = false;
+                DWORD at_seh = seh_anti_tamper_initialize(at_ok);
+                startup_log_critical_fmt("driver_bridge_init_anti_tamper_retry_post seh=0x%08X ok=%d driver_hardening=%d elapsed_anchor_tick=%llu last_err=%lu",
+                    at_seh,
+                    at_ok ? 1 : 0,
+                    at_rt.driver_hardening_done.load(std::memory_order_acquire) ? 1 : 0,
+                    static_cast<unsigned long long>(GetTickCount64()),
+                    static_cast<unsigned long>(GetLastError()));
+                if (at_seh != 0 || !at_ok)
+                {
+                    diag::log_tagged_critical_fmt("drv_init",
+                        "driver_bridge_init_anti_tamper_retry_failed seh=0x%08X ok=%d driver_hardening=%d violation=%d",
+                        at_seh,
+                        at_ok ? 1 : 0,
+                        at_rt.driver_hardening_done.load(std::memory_order_acquire) ? 1 : 0,
+                        at_rt.violation_latched.load(std::memory_order_acquire) ? 1 : 0);
+                    anti_tamper::enforce_violation_id(
+                        aida::reason_ids::reason_id_from_string("driver_bridge_init_anti_tamper_retry_failed"),
+                        "driver_bridge_init_anti_tamper_retry_failed");
+                }
+                else if (!at_rt.driver_hardening_done.load(std::memory_order_acquire))
+                {
+                    auto dyn = driver_bridge::dynamic_ioctl_state();
+                    diag::log_tagged_critical_fmt("drv_init",
+                        "driver_bridge_init_anti_tamper_retry_deferred driver_hardening=0 ready=%d inst_seed=%u/%u global_seed=%u/%u ioctl_seed_hash=0x%08X",
+                        dyn.ready ? 1 : 0,
+                        dyn.instance_server_seed,
+                        dyn.instance_ioctl_seed,
+                        dyn.global_server_seed,
+                        dyn.global_ioctl_seed,
+                        dyn.ioctl_seed_hash);
+                }
+            }
+        }
         startup_log_critical_fmt("driver_bridge_init_thread_exit seh=0x%08X loaded=%d kernel=%d status=%.160s elapsed_ms=%llu last_err=%lu",
             seh_dbi,
             driver_bridge::is_loaded() ? 1 : 0,
@@ -2521,7 +2644,7 @@ int main(int, char**)
             static_cast<unsigned long>(GetLastError()));
         diag::log_tagged("drv_init", "thread_exit");
     });
-    startup_log_critical_fmt("driver_bridge_init_post_post posted=%d pid=%lu tid=%lu tick=%llu",
+    startup_log_critical_fmt("driver_bridge_init_critical_post_post posted=%d pid=%lu tid=%lu tick=%llu",
         driver_posted ? 1 : 0,
         GetCurrentProcessId(),
         GetCurrentThreadId(),
@@ -2748,12 +2871,12 @@ int main(int, char**)
             if (!g_authorized_features_initialized.load(std::memory_order_acquire) &&
                 !g_authorized_features_posted.exchange(true, std::memory_order_acq_rel))
             {
-                startup_log_critical_fmt("render_authorized_feature_post_pre frame=%llu pid=%lu tid=%lu tick=%llu",
+                startup_log_critical_fmt("render_authorized_feature_critical_post_pre frame=%llu pid=%lu tid=%lu tick=%llu",
                     static_cast<unsigned long long>(frame_number),
                     GetCurrentProcessId(),
                     GetCurrentThreadId(),
                     static_cast<unsigned long long>(GetTickCount64()));
-                bool posted = work_queue::post([] {
+                bool posted = critical_work_queue::post([] {
                     startup_log_critical_fmt("render_authorized_feature_worker_enter pid=%lu tid=%lu tick=%llu",
                         GetCurrentProcessId(),
                         GetCurrentThreadId(),
@@ -2764,13 +2887,13 @@ int main(int, char**)
                         GetCurrentThreadId(),
                         static_cast<unsigned long long>(GetTickCount64()));
                 });
-                startup_log_critical_fmt("render_authorized_feature_post_post posted=%d frame=%llu",
+                startup_log_critical_fmt("render_authorized_feature_critical_post_post posted=%d frame=%llu",
                     posted ? 1 : 0,
                     static_cast<unsigned long long>(frame_number));
                 if (!posted)
                 {
                     g_authorized_features_posted.store(false, std::memory_order_release);
-                    diag::log_tagged("bg_init", "authorized_feature_initializers_post_failed");
+                    diag::log_tagged("bg_init", "authorized_feature_initializers_critical_post_failed");
                 }
             }
             mark_ide_ready_for_mcp_services();
@@ -3041,6 +3164,8 @@ int main(int, char**)
         (unsigned long long)reinterpret_cast<UINT_PTR>(hwnd),
         GetCurrentThreadId());
     aida_tracer::mark_render_phase("shutdown_sequence_begin");
+    test_all_features::cancel_tests();
+    diag::log_tagged_critical("main", "shutdown_testlab_cancel_done");
     aida_focus_monitor::stop();
     diag::log_tagged_critical("main", "shutdown_focus_monitor_done");
     anti_tamper::shutdown();

@@ -5,6 +5,7 @@
 #include "debugger_engine.hpp"
 #include "standalone_driver.hpp"
 #include "zydis_disasm.hpp"
+#include "stealth_engine.hpp"
 #include "../editor/expression_eval.hpp"
 #include "../runtime/run_target.hpp"
 #include "work_queue.hpp"
@@ -157,40 +158,81 @@ bool resume_thread_for_controlled_run(uint32_t tid, uint32_t previous_suspend_co
 	uint32_t resumes = previous_suspend_count + 1;
 	if (resumes == 0 || resumes > 64)
 		resumes = 64;
+	diag::log_tagged_fmt("debugger",
+		"resume_thread_for_controlled_run_begin tid=%u previous_suspend=%u attempts=%u",
+		static_cast<unsigned>(tid),
+		static_cast<unsigned>(previous_suspend_count),
+		static_cast<unsigned>(resumes));
+	uint32_t last_prev = 0;
 	for (uint32_t i = 0; i < resumes; ++i) {
 		uint32_t prev = 0;
-		if (!driver_bridge::resume_thread(tid, &prev))
+		if (!driver_bridge::resume_thread(tid, &prev)) {
+			diag::log_tagged_fmt("debugger",
+				"resume_thread_for_controlled_run_failed tid=%u attempt=%u previous_suspend=%u last_prev=%u",
+				static_cast<unsigned>(tid),
+				static_cast<unsigned>(i + 1),
+				static_cast<unsigned>(previous_suspend_count),
+				static_cast<unsigned>(last_prev));
 			return false;
+		}
+		last_prev = prev;
 		if (prev == 0)
 			break;
 	}
+	diag::log_tagged_fmt("debugger",
+		"resume_thread_for_controlled_run_done tid=%u previous_suspend=%u attempts=%u last_prev=%u",
+		static_cast<unsigned>(tid),
+		static_cast<unsigned>(previous_suspend_count),
+		static_cast<unsigned>(resumes),
+		static_cast<unsigned>(last_prev));
 	return true;
 }
 
 bool suspend_contextable_thread(state_t& st, driver_bridge::thread_context_t& ctx, uint32_t& previous_suspend_count) {
-	auto try_thread = [&](uint32_t tid) -> bool {
+	auto try_thread = [&](uint32_t tid, const char* source) -> bool {
 		if (tid == 0)
 			return false;
 		uint32_t saved = 0;
-		if (!driver_bridge::suspend_thread(tid, &saved))
+		if (!driver_bridge::suspend_thread(tid, &saved)) {
+			diag::log_tagged_fmt("debugger",
+				"suspend_contextable_thread_suspend_failed pid=%u tid=%u source=%s",
+				static_cast<unsigned>(st.target_pid),
+				static_cast<unsigned>(tid),
+				source ? source : "unknown");
 			return false;
+		}
 		if (driver_bridge::get_thread_context(tid, ctx)) {
 			st.active_tid = tid;
 			previous_suspend_count = saved;
+			diag::log_tagged_fmt("debugger",
+				"suspend_contextable_thread_selected pid=%u tid=%u source=%s rip=0x%llx rsp=0x%llx rflags=0x%llx previous_suspend=%u",
+				static_cast<unsigned>(st.target_pid),
+				static_cast<unsigned>(tid),
+				source ? source : "unknown",
+				static_cast<unsigned long long>(ctx.rip),
+				static_cast<unsigned long long>(ctx.rsp),
+				static_cast<unsigned long long>(ctx.rflags),
+				static_cast<unsigned>(saved));
 			return true;
 		}
 		driver_bridge::resume_thread(tid);
+		diag::log_tagged_fmt("debugger",
+			"suspend_contextable_thread_context_failed pid=%u tid=%u source=%s previous_suspend=%u",
+			static_cast<unsigned>(st.target_pid),
+			static_cast<unsigned>(tid),
+			source ? source : "unknown",
+			static_cast<unsigned>(saved));
 		return false;
 	};
 
-	if (try_thread(st.active_tid))
+	if (try_thread(st.active_tid, "active"))
 		return true;
 
 	auto threads = driver_bridge::enumerate_threads();
 	for (const auto& th : threads) {
 		if (th.owner_pid != st.target_pid || th.tid == st.active_tid)
 			continue;
-		if (try_thread(th.tid))
+		if (try_thread(th.tid, "enumerated"))
 			return true;
 	}
 	return false;
@@ -215,8 +257,16 @@ register_set_t capture_registers_from_context(const driver_bridge::thread_contex
 }
 
 void release_step_suspend_if_previously_suspended(uint32_t tid, uint32_t previous_suspend_count) {
-	if (tid != 0 && previous_suspend_count > 0)
-		driver_bridge::resume_thread(tid);
+	if (tid != 0 && previous_suspend_count > 0) {
+		uint32_t prev = 0;
+		const bool ok = driver_bridge::resume_thread(tid, &prev);
+		diag::log_tagged_fmt("debugger",
+			"release_step_suspend tid=%u previous_suspend=%u resume_ok=%d resume_prev=%u",
+			static_cast<unsigned>(tid),
+			static_cast<unsigned>(previous_suspend_count),
+			ok ? 1 : 0,
+			static_cast<unsigned>(prev));
+	}
 }
 
 }
@@ -744,11 +794,20 @@ bool spawn_and_attach_target(const run_target::launch_options_t& opts,
 			"spawn_pre_driver_attach pid=%u driver_status='%s'",
 			static_cast<unsigned>(lr.pid),
 			driver_bridge::status().c_str());
+		const uint32_t previous_pid = driver_bridge::attached_pid();
+		if (previous_pid != 0 && previous_pid != lr.pid)
+			stealth_engine::disable_for_detach(previous_pid, "debugger_engine.spawn_attach.replace");
 		driver_ok = driver_bridge::attach(lr.pid);
+		if (!driver_ok && previous_pid != 0 && driver_bridge::attached_pid() == previous_pid)
+			(void)stealth_engine::ensure_default_enabled(previous_pid, "debugger_engine.spawn_attach.restore_failed_switch");
+		const bool stealth_ok = driver_ok
+			? stealth_engine::ensure_default_enabled(lr.pid, "debugger_engine.spawn_attach")
+			: false;
 		diag::log_tagged_critical_fmt("spawn",
-			"spawn_post_driver_attach pid=%u ok=%d elapsed_ms=%llu driver_pid=%u driver_status='%s' last_error='%s'",
+			"spawn_post_driver_attach pid=%u ok=%d stealth_ok=%d elapsed_ms=%llu driver_pid=%u driver_status='%s' last_error='%s'",
 			static_cast<unsigned>(lr.pid),
 			driver_ok ? 1 : 0,
+			stealth_ok ? 1 : 0,
 			static_cast<unsigned long long>(GetTickCount64() - attach_t0),
 			driver_bridge::attached_pid(),
 			driver_bridge::status().c_str(),
@@ -1010,6 +1069,14 @@ bool step_into() {
 		return false;
 	}
 	driver_bridge::thread_context_t original_step_ctx = kctx;
+	diag::log_tagged_fmt("debugger",
+		"step_into_context_acquired pid=%u tid=%u rip=0x%llx rsp=0x%llx rflags=0x%llx previous_suspend=%u",
+		static_cast<unsigned>(st.target_pid),
+		static_cast<unsigned>(st.active_tid),
+		static_cast<unsigned long long>(kctx.rip),
+		static_cast<unsigned long long>(kctx.rsp),
+		static_cast<unsigned long long>(kctx.rflags),
+		static_cast<unsigned>(previous_suspend_count));
 
 	std::vector<uint8_t> step_code;
 	if (driver_bridge::read_memory(kctx.rip, 16, step_code) && !step_code.empty()) {
@@ -1054,6 +1121,15 @@ bool step_into() {
 	}
 
 	kctx.rflags |= 0x100ULL;
+	diag::log_tagged_fmt("debugger",
+		"step_into_trap_arm pid=%u tid=%u rip=0x%llx rsp=0x%llx original_rflags=0x%llx armed_rflags=0x%llx previous_suspend=%u",
+		static_cast<unsigned>(st.target_pid),
+		static_cast<unsigned>(st.active_tid),
+		static_cast<unsigned long long>(kctx.rip),
+		static_cast<unsigned long long>(kctx.rsp),
+		static_cast<unsigned long long>(original_step_ctx.rflags),
+		static_cast<unsigned long long>(kctx.rflags),
+		static_cast<unsigned>(previous_suspend_count));
 
 	if (!driver_bridge::set_thread_context(st.active_tid, kctx, ~0ULL)) {
 		driver_bridge::set_thread_context(st.active_tid, original_step_ctx, ~0ULL);
@@ -1074,17 +1150,31 @@ bool step_into() {
 		st.status.store(dbg_status_t::paused);
 		return false;
 	}
+	diag::log_tagged_fmt("debugger",
+		"step_into_thread_released pid=%u tid=%u pre_rip=0x%llx previous_suspend=%u",
+		static_cast<unsigned>(st.target_pid),
+		static_cast<unsigned>(st.active_tid),
+		static_cast<unsigned long long>(pre_step_rip),
+		static_cast<unsigned>(previous_suspend_count));
 
 	const uint32_t step_timeout_ms = 1500;
 	auto deadline = std::chrono::steady_clock::now() +
 		std::chrono::milliseconds(step_timeout_ms);
 	register_set_t post_regs{};
 	bool advanced = false;
+	uint64_t last_probe_rip = 0;
+	uint64_t last_probe_rsp = 0;
+	uint64_t last_probe_rflags = 0;
+	uint32_t probe_count = 0;
 	while (std::chrono::steady_clock::now() < deadline) {
 		std::this_thread::sleep_for(std::chrono::milliseconds(5));
 		driver_bridge::thread_context_t probe{};
 		if (!driver_bridge::get_thread_context(st.active_tid, probe))
 			continue;
+		++probe_count;
+		last_probe_rip = probe.rip;
+		last_probe_rsp = probe.rsp;
+		last_probe_rflags = probe.rflags;
 		if (probe.rip != pre_step_rip) {
 			if (!driver_bridge::suspend_thread(st.active_tid)) {
 				diag::log_tagged_fmt("debugger",
@@ -1100,6 +1190,15 @@ bool step_into() {
 				driver_bridge::set_thread_context(st.active_tid, stable, ~0ULL);
 				post_regs = capture_registers_from_context(stable);
 				advanced = true;
+				diag::log_tagged_fmt("debugger",
+					"step_into_probe_advanced_stable pid=%u tid=%u pre_rip=0x%llx stable_rip=0x%llx stable_rsp=0x%llx stable_rflags=0x%llx probes=%u",
+					static_cast<unsigned>(st.target_pid),
+					static_cast<unsigned>(st.active_tid),
+					static_cast<unsigned long long>(pre_step_rip),
+					static_cast<unsigned long long>(stable.rip),
+					static_cast<unsigned long long>(stable.rsp),
+					static_cast<unsigned long long>(stable.rflags),
+					static_cast<unsigned>(probe_count));
 				break;
 			}
 			probe.rflags &= ~0x100ULL;
@@ -1124,6 +1223,20 @@ bool step_into() {
 		}
 		st.status.store(dbg_status_t::paused);
 		set_last_error("step_into: thread did not advance within timeout");
+		uint32_t exit_code = 0;
+		const bool alive = driver_bridge::attached_process_alive(&exit_code);
+		diag::log_tagged_fmt("debugger",
+			"step_into_TIMEOUT pid=%u tid=%u pre_rip=0x%llx last_probe_rip=0x%llx last_probe_rsp=0x%llx last_probe_rflags=0x%llx probes=%u timeout_ms=%u alive=%d exit_code=0x%08X",
+			static_cast<unsigned>(st.target_pid),
+			static_cast<unsigned>(st.active_tid),
+			static_cast<unsigned long long>(pre_step_rip),
+			static_cast<unsigned long long>(last_probe_rip),
+			static_cast<unsigned long long>(last_probe_rsp),
+			static_cast<unsigned long long>(last_probe_rflags),
+			static_cast<unsigned>(probe_count),
+			static_cast<unsigned>(step_timeout_ms),
+			alive ? 1 : 0,
+			static_cast<unsigned>(exit_code));
 		invalidate_cache();
 		return false;
 	}
@@ -1835,6 +1948,7 @@ void enumerate_handles() {
 		return;
 	}
 
+	const auto started = std::chrono::steady_clock::now();
 	diag::log_tagged_fmt("handles",
 		"enumerate_handles_begin pid=%u",
 		static_cast<unsigned>(st.target_pid));
@@ -1870,6 +1984,13 @@ void enumerate_handles() {
 
 	HANDLE proc = OpenProcess(PROCESS_DUP_HANDLE, FALSE, st.target_pid);
 	HANDLE current_proc = GetCurrentProcess();
+	const auto metadata_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(750);
+	size_t metadata_attempted = 0;
+	size_t metadata_named = 0;
+	size_t metadata_typed = 0;
+	size_t metadata_abandoned = 0;
+	size_t metadata_skipped_budget = 0;
+	size_t duplicate_failed = 0;
 
 	for (ULONG i = 0; i < info->number_of_handles; ++i) {
 		auto& entry = info->handles[i];
@@ -1880,11 +2001,14 @@ void enumerate_handles() {
 		hi.type_index = entry.object_type_index;
 		hi.access = entry.granted_access;
 
-		if (proc != nullptr && nt_query_object != nullptr) {
+		bool metadata_budget = metadata_attempted < 64 &&
+			std::chrono::steady_clock::now() < metadata_deadline;
+		if (proc != nullptr && nt_query_object != nullptr && metadata_budget) {
 			HANDLE dup = nullptr;
 			if (DuplicateHandle(proc,
 								reinterpret_cast<HANDLE>(static_cast<uintptr_t>(entry.handle_value)),
 								current_proc, &dup, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+				++metadata_attempted;
 				struct query_ctx_t {
 					std::mutex              mtx;
 					std::condition_variable cv;
@@ -1937,7 +2061,7 @@ void enumerate_handles() {
 					}
 
 					std::unique_lock<std::mutex> lk(ctx->mtx);
-					if (!ctx->cv.wait_for(lk, std::chrono::milliseconds(200),
+					if (!ctx->cv.wait_for(lk, std::chrono::milliseconds(35),
 										   [&ctx]() { return ctx->done; })) {
 						ctx->handle_owned = false;
 						abandoned = true;
@@ -1954,6 +2078,8 @@ void enumerate_handles() {
 					type_buf.size() >= sizeof(ng_object_type_information_t)) {
 					auto* tinfo = reinterpret_cast<ng_object_type_information_t*>(type_buf.data());
 					hi.type_name = utf8_from_unicode_string(tinfo->type_name);
+					if (!hi.type_name.empty())
+						++metadata_typed;
 				}
 
 				if (!abandoned) {
@@ -1962,12 +2088,20 @@ void enumerate_handles() {
 						name_buf.size() >= sizeof(ng_object_name_information_t)) {
 						auto* ninfo = reinterpret_cast<ng_object_name_information_t*>(name_buf.data());
 						hi.name = utf8_from_unicode_string(ninfo->name);
+						if (!hi.name.empty())
+							++metadata_named;
 					}
 				}
 
+				if (abandoned)
+					++metadata_abandoned;
 				if (!abandoned)
 					CloseHandle(dup);
+			} else {
+				++duplicate_failed;
 			}
+		} else if (proc != nullptr && nt_query_object != nullptr) {
+			++metadata_skipped_budget;
 		}
 
 		result.push_back(std::move(hi));
@@ -1977,6 +2111,19 @@ void enumerate_handles() {
 
 	std::lock_guard<std::mutex> lk(st.handle_mutex);
 	st.handles = std::move(result);
+	const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+		std::chrono::steady_clock::now() - started).count();
+	diag::log_tagged_fmt("handles",
+		"enumerate_handles_done pid=%u handles=%zu metadata_attempted=%zu typed=%zu named=%zu abandoned=%zu duplicate_failed=%zu skipped_budget=%zu elapsed_ms=%lld",
+		static_cast<unsigned>(st.target_pid),
+		st.handles.size(),
+		metadata_attempted,
+		metadata_typed,
+		metadata_named,
+		metadata_abandoned,
+		duplicate_failed,
+		metadata_skipped_budget,
+		static_cast<long long>(elapsed));
 }
 
 
@@ -2127,10 +2274,15 @@ void find_strings_async(size_t min_length) {
 		min_length,
 		static_cast<unsigned>(st.target_pid));
 
-	bool posted = work_queue::post([min_length]() {
+	try {
+		const bool posted = work_queue::post([min_length]() {
 		try {
 			find_strings(min_length);
-		} catch (...) {}
+		} catch (const std::exception& ex) {
+			diag::log_tagged_fmt("strings", "find_strings_async_exception err='%s'", ex.what());
+		} catch (...) {
+			diag::log_tagged("strings", "find_strings_async_exception err='<unknown>'");
+		}
 		auto& s = g_state;
 		size_t found = 0;
 		{
@@ -2145,13 +2297,21 @@ void find_strings_async(size_t min_length) {
 			static_cast<unsigned long long>(s.strings_pages_scanned.load()));
 		s.strings_cancel.store(false, std::memory_order_release);
 		s.strings_scanning.store(false, std::memory_order_release);
-	});
-
-	if (!posted) {
+		});
+		if (!posted) {
+			st.strings_scanning.store(false, std::memory_order_release);
+			st.strings_cancel.store(false, std::memory_order_release);
+			diag::log_tagged_fmt("strings",
+				"find_strings_async_POST_FAILED");
+		}
+	} catch (const std::exception& ex) {
+		diag::log_tagged_fmt("strings", "find_strings_async_worker_create_failed err='%s'", ex.what());
 		st.strings_scanning.store(false, std::memory_order_release);
 		st.strings_cancel.store(false, std::memory_order_release);
-		diag::log_tagged_fmt("strings",
-			"find_strings_async_POST_FAILED");
+	} catch (...) {
+		diag::log_tagged("strings", "find_strings_async_worker_create_failed err='<unknown>'");
+		st.strings_scanning.store(false, std::memory_order_release);
+		st.strings_cancel.store(false, std::memory_order_release);
 	}
 }
 
@@ -2445,25 +2605,42 @@ void request_refresh(uint32_t max_age_ms) {
 	bool expected = false;
 	if (!st.refresh_in_flight.compare_exchange_strong(expected, true)) return;
 
-	work_queue::post([]() {
-		auto& s = g_state;
-		if (s.active_tid == 0 && s.target_pid != 0) {
-			auto threads = driver_bridge::enumerate_threads();
-			for (const auto& th : threads) {
-				if (th.owner_pid == s.target_pid && th.tid != 0) {
-					s.active_tid = th.tid;
-					break;
+	try {
+		if (!work_queue::post([]() {
+			auto& s = g_state;
+			try {
+				if (s.active_tid == 0 && s.target_pid != 0) {
+					auto threads = driver_bridge::enumerate_threads();
+					for (const auto& th : threads) {
+						if (th.owner_pid == s.target_pid && th.tid != 0) {
+							s.active_tid = th.tid;
+							break;
+						}
+					}
 				}
+				register_set_t fresh = get_registers();
+				{
+					std::lock_guard<std::mutex> lk(s.cache_mtx);
+					s.cached_regs = fresh;
+				}
+				s.last_refresh_ms.store(now_ms());
+			} catch (const std::exception& ex) {
+				diag::log_tagged_fmt("debugger", "request_refresh_worker_exception err='%s'", ex.what());
+			} catch (...) {
+				diag::log_tagged("debugger", "request_refresh_worker_exception err='<unknown>'");
 			}
+			s.refresh_in_flight.store(false);
+		})) {
+			diag::log_tagged("debugger", "request_refresh_worker_post_failed");
+			st.refresh_in_flight.store(false);
 		}
-		register_set_t fresh = get_registers();
-		{
-			std::lock_guard<std::mutex> lk(s.cache_mtx);
-			s.cached_regs = fresh;
-		}
-		s.last_refresh_ms.store(now_ms());
-		s.refresh_in_flight.store(false);
-	});
+	} catch (const std::exception& ex) {
+		diag::log_tagged_fmt("debugger", "request_refresh_worker_create_failed err='%s'", ex.what());
+		st.refresh_in_flight.store(false);
+	} catch (...) {
+		diag::log_tagged("debugger", "request_refresh_worker_create_failed err='<unknown>'");
+		st.refresh_in_flight.store(false);
+	}
 }
 
 void request_thread_refresh(uint32_t max_age_ms) {
@@ -2475,31 +2652,48 @@ void request_thread_refresh(uint32_t max_age_ms) {
 	bool expected = false;
 	if (!st.thread_refresh_in_flight.compare_exchange_strong(expected, true)) return;
 
-	work_queue::post([]() {
-		auto& s = g_state;
-		auto raw = driver_bridge::enumerate_threads();
-		std::vector<cached_thread_t> entries;
-		entries.reserve(raw.size());
-		uint32_t pid_filter = s.target_pid;
-		for (auto& t : raw) {
-			if (pid_filter != 0 && t.owner_pid != pid_filter) continue;
-			cached_thread_t e;
-			e.tid = t.tid;
-			e.owner_pid = t.owner_pid;
-			e.priority = t.priority;
-			e.state = t.state;
-			e.rip = t.rip;
-			entries.push_back(e);
+	try {
+		if (!work_queue::post([]() {
+			auto& s = g_state;
+			try {
+				auto raw = driver_bridge::enumerate_threads();
+				std::vector<cached_thread_t> entries;
+				entries.reserve(raw.size());
+				uint32_t pid_filter = s.target_pid;
+				for (auto& t : raw) {
+					if (pid_filter != 0 && t.owner_pid != pid_filter) continue;
+					cached_thread_t e;
+					e.tid = t.tid;
+					e.owner_pid = t.owner_pid;
+					e.priority = t.priority;
+					e.state = t.state;
+					e.rip = t.rip;
+					entries.push_back(e);
+				}
+				if (s.active_tid == 0 && !entries.empty())
+					s.active_tid = entries.front().tid;
+				{
+					std::lock_guard<std::mutex> lk(s.cache_mtx);
+					s.cached_threads = std::move(entries);
+				}
+				s.last_thread_refresh_ms.store(now_ms());
+			} catch (const std::exception& ex) {
+				diag::log_tagged_fmt("debugger", "request_thread_refresh_worker_exception err='%s'", ex.what());
+			} catch (...) {
+				diag::log_tagged("debugger", "request_thread_refresh_worker_exception err='<unknown>'");
+			}
+			s.thread_refresh_in_flight.store(false);
+		})) {
+			diag::log_tagged("debugger", "request_thread_refresh_worker_post_failed");
+			st.thread_refresh_in_flight.store(false);
 		}
-		if (s.active_tid == 0 && !entries.empty())
-			s.active_tid = entries.front().tid;
-		{
-			std::lock_guard<std::mutex> lk(s.cache_mtx);
-			s.cached_threads = std::move(entries);
-		}
-		s.last_thread_refresh_ms.store(now_ms());
-		s.thread_refresh_in_flight.store(false);
-	});
+	} catch (const std::exception& ex) {
+		diag::log_tagged_fmt("debugger", "request_thread_refresh_worker_create_failed err='%s'", ex.what());
+		st.thread_refresh_in_flight.store(false);
+	} catch (...) {
+		diag::log_tagged("debugger", "request_thread_refresh_worker_create_failed err='<unknown>'");
+		st.thread_refresh_in_flight.store(false);
+	}
 }
 
 void request_stack_refresh(uint64_t rsp, size_t bytes, uint32_t max_age_ms) {
@@ -2510,18 +2704,35 @@ void request_stack_refresh(uint64_t rsp, size_t bytes, uint32_t max_age_ms) {
 	bool expected = false;
 	if (!st.stack_refresh_in_flight.compare_exchange_strong(expected, true)) return;
 
-	work_queue::post([rsp, bytes]() {
-		auto& s = g_state;
-		std::vector<uint8_t> buf;
-		driver_bridge::read_memory(rsp, bytes, buf);
-		{
-			std::lock_guard<std::mutex> lk(s.cache_mtx);
-			s.cached_stack_addr = rsp;
-			s.cached_stack = std::move(buf);
+	try {
+		if (!work_queue::post([rsp, bytes]() {
+			auto& s = g_state;
+			try {
+				std::vector<uint8_t> buf;
+				driver_bridge::read_memory(rsp, bytes, buf);
+				{
+					std::lock_guard<std::mutex> lk(s.cache_mtx);
+					s.cached_stack_addr = rsp;
+					s.cached_stack = std::move(buf);
+				}
+				s.last_stack_refresh_ms.store(now_ms());
+			} catch (const std::exception& ex) {
+				diag::log_tagged_fmt("debugger", "request_stack_refresh_worker_exception err='%s'", ex.what());
+			} catch (...) {
+				diag::log_tagged("debugger", "request_stack_refresh_worker_exception err='<unknown>'");
+			}
+			s.stack_refresh_in_flight.store(false);
+		})) {
+			diag::log_tagged("debugger", "request_stack_refresh_worker_post_failed");
+			st.stack_refresh_in_flight.store(false);
 		}
-		s.last_stack_refresh_ms.store(now_ms());
-		s.stack_refresh_in_flight.store(false);
-	});
+	} catch (const std::exception& ex) {
+		diag::log_tagged_fmt("debugger", "request_stack_refresh_worker_create_failed err='%s'", ex.what());
+		st.stack_refresh_in_flight.store(false);
+	} catch (...) {
+		diag::log_tagged("debugger", "request_stack_refresh_worker_create_failed err='<unknown>'");
+		st.stack_refresh_in_flight.store(false);
+	}
 }
 
 void request_dump_refresh(uint64_t addr, size_t bytes, uint32_t max_age_ms) {
@@ -2532,19 +2743,36 @@ void request_dump_refresh(uint64_t addr, size_t bytes, uint32_t max_age_ms) {
 	bool expected = false;
 	if (!st.dump_refresh_in_flight.compare_exchange_strong(expected, true)) return;
 
-	work_queue::post([addr, bytes]() {
-		auto& s = g_state;
-		std::vector<uint8_t> buf;
-		driver_bridge::read_memory(addr, bytes, buf);
-		{
-			std::lock_guard<std::mutex> lk(s.cache_mtx);
-			s.cached_dump_addr = addr;
-			s.cached_dump_size = bytes;
-			s.cached_dump = std::move(buf);
+	try {
+		if (!work_queue::post([addr, bytes]() {
+			auto& s = g_state;
+			try {
+				std::vector<uint8_t> buf;
+				driver_bridge::read_memory(addr, bytes, buf);
+				{
+					std::lock_guard<std::mutex> lk(s.cache_mtx);
+					s.cached_dump_addr = addr;
+					s.cached_dump_size = bytes;
+					s.cached_dump = std::move(buf);
+				}
+				s.last_dump_refresh_ms.store(now_ms());
+			} catch (const std::exception& ex) {
+				diag::log_tagged_fmt("debugger", "request_dump_refresh_worker_exception err='%s'", ex.what());
+			} catch (...) {
+				diag::log_tagged("debugger", "request_dump_refresh_worker_exception err='<unknown>'");
+			}
+			s.dump_refresh_in_flight.store(false);
+		})) {
+			diag::log_tagged("debugger", "request_dump_refresh_worker_post_failed");
+			st.dump_refresh_in_flight.store(false);
 		}
-		s.last_dump_refresh_ms.store(now_ms());
-		s.dump_refresh_in_flight.store(false);
-	});
+	} catch (const std::exception& ex) {
+		diag::log_tagged_fmt("debugger", "request_dump_refresh_worker_create_failed err='%s'", ex.what());
+		st.dump_refresh_in_flight.store(false);
+	} catch (...) {
+		diag::log_tagged("debugger", "request_dump_refresh_worker_create_failed err='<unknown>'");
+		st.dump_refresh_in_flight.store(false);
+	}
 }
 
 bool refresh_disasm_window_now(uint64_t rip, const char* source) {
@@ -2609,29 +2837,47 @@ void request_disasm_refresh(uint64_t rip, uint32_t max_age_ms) {
 		return;
 	}
 
-	const bool posted = work_queue::post([rip]() {
-		try {
-			(void)refresh_disasm_window_now(rip, "work_queue");
-		} catch (const std::exception& ex) {
-			g_state.disasm_refresh_in_flight.store(false);
-			set_last_error(std::string("request_disasm_refresh worker exception: ") + ex.what());
-			diag::log_tagged_fmt("debugger_engine", "disasm_refresh worker_exception rip=0x%llX error=%s",
-				static_cast<unsigned long long>(rip), ex.what());
-		} catch (...) {
-			g_state.disasm_refresh_in_flight.store(false);
-			set_last_error("request_disasm_refresh worker unknown exception");
-			diag::log_tagged_fmt("debugger_engine", "disasm_refresh worker_unknown_exception rip=0x%llX",
-				static_cast<unsigned long long>(rip));
+	try {
+		if (!work_queue::post([rip]() {
+			try {
+				(void)refresh_disasm_window_now(rip, "work_queue");
+			} catch (const std::exception& ex) {
+				g_state.disasm_refresh_in_flight.store(false);
+				set_last_error(std::string("request_disasm_refresh worker exception: ") + ex.what());
+				diag::log_tagged_fmt("debugger_engine", "disasm_refresh worker_exception rip=0x%llX error=%s",
+					static_cast<unsigned long long>(rip), ex.what());
+			} catch (...) {
+				g_state.disasm_refresh_in_flight.store(false);
+				set_last_error("request_disasm_refresh worker unknown exception");
+				diag::log_tagged_fmt("debugger_engine", "disasm_refresh worker_unknown_exception rip=0x%llX",
+					static_cast<unsigned long long>(rip));
+			}
+		})) {
+			set_last_error("request_disasm_refresh worker post failed");
+			diag::log_tagged_fmt("debugger_engine",
+				"disasm_refresh worker_post_failed rip=0x%llX pid=%u target_pid=%u",
+				static_cast<unsigned long long>(rip),
+				driver_bridge::attached_pid(),
+				st.target_pid);
+			(void)refresh_disasm_window_now(rip, "worker_post_failed_sync");
 		}
-	});
-	if (!posted) {
-		set_last_error("request_disasm_refresh work_queue post failed");
+	} catch (const std::exception& ex) {
+		set_last_error(std::string("request_disasm_refresh worker create failed: ") + ex.what());
 		diag::log_tagged_fmt("debugger_engine",
-			"disasm_refresh post_failed rip=0x%llX pid=%u target_pid=%u",
+			"disasm_refresh worker_create_failed rip=0x%llX pid=%u target_pid=%u err=%s",
+			static_cast<unsigned long long>(rip),
+			driver_bridge::attached_pid(),
+			st.target_pid,
+			ex.what());
+		(void)refresh_disasm_window_now(rip, "thread_create_failed_sync");
+	} catch (...) {
+		set_last_error("request_disasm_refresh worker create failed");
+		diag::log_tagged_fmt("debugger_engine",
+			"disasm_refresh worker_create_failed rip=0x%llX pid=%u target_pid=%u err=<unknown>",
 			static_cast<unsigned long long>(rip),
 			driver_bridge::attached_pid(),
 			st.target_pid);
-		(void)refresh_disasm_window_now(rip, "post_failed_sync");
+		(void)refresh_disasm_window_now(rip, "thread_create_failed_sync");
 	}
 }
 

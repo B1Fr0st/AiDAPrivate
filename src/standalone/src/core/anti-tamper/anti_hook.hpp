@@ -140,6 +140,22 @@ namespace detail {
         }
     }
 
+    inline void bytes16_hex(const uint8_t* addr, char out[33])
+    {
+        static constexpr char kHex[] = "0123456789ABCDEF";
+        for (size_t i = 0; i < 16; ++i) {
+            uint8_t b = 0;
+            __try {
+                b = addr ? addr[i] : 0;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                b = 0;
+            }
+            out[i * 2] = kHex[(b >> 4) & 0xF];
+            out[i * 2 + 1] = kHex[b & 0xF];
+        }
+        out[32] = '\0';
+    }
+
     struct module_range_t
     {
         uint64_t base;
@@ -351,6 +367,69 @@ namespace detail {
                 return img.bytes.data() + kv.second;
         }
         return nullptr;
+    }
+
+    inline bool system_owned_nt_export_wrapper(const char* name, const uint8_t* addr)
+    {
+        if (!name || !addr || !anti_tamper::syscall::detail::nt_export_name(name))
+            return false;
+
+        if (!ntdll_disk_image().valid)
+            load_disk_image_ntdll();
+
+        const uint8_t* disk_bytes = disk_export_bytes(name);
+        if (!disk_bytes || !anti_tamper::syscall::detail::standard_x64_syscall_stub_bytes(disk_bytes))
+            return false;
+
+        MEMORY_BASIC_INFORMATION mbi{};
+        SIZE_T vq = VirtualQuery(addr, &mbi, sizeof(mbi));
+        bool mem_writable = vq != 0 && anti_tamper::syscall::detail::writable_protection(mbi.Protect);
+        bool mem_redirect = anti_tamper::syscall::detail::inline_redirect_bytes(addr);
+
+        HMODULE owner_mod = nullptr;
+        BOOL owner_ok = GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(addr),
+            &owner_mod);
+
+        wchar_t owner_path_w[MAX_PATH]{};
+        DWORD owner_path_len = owner_ok && owner_mod
+            ? GetModuleFileNameW(owner_mod, owner_path_w, MAX_PATH)
+            : 0;
+
+        bool owner_system = owner_path_len != 0 &&
+            anti_tamper::syscall::detail::system_image_module_path(owner_path_w);
+
+        char owner_path[512]{};
+        anti_tamper::syscall::detail::narrow_path(owner_path_w, owner_path, sizeof(owner_path));
+
+        const bool ok =
+            vq != 0 &&
+            mbi.State == MEM_COMMIT &&
+            mbi.Type == MEM_IMAGE &&
+            !mem_writable &&
+            !mem_redirect &&
+            owner_ok &&
+            owner_system;
+
+        webhook::write_log_critical_fmt("prologue_hash",
+            "prologue_mismatch_system_wrapper func=%s ok=%d va=0x%llX vq=%llu protect=0x%lX state=0x%lX type=0x%lX type_name=%s mem_writable=%d mem_redirect=%d owner_ok=%d owner=0x%llX owner_system=%d owner_path=%s",
+            name,
+            ok ? 1 : 0,
+            static_cast<unsigned long long>(reinterpret_cast<uint64_t>(addr)),
+            static_cast<unsigned long long>(vq),
+            vq ? static_cast<unsigned long>(mbi.Protect) : 0ul,
+            vq ? static_cast<unsigned long>(mbi.State) : 0ul,
+            vq ? static_cast<unsigned long>(mbi.Type) : 0ul,
+            vq ? anti_tamper::syscall::detail::memory_type_name(mbi.Type) : "none",
+            mem_writable ? 1 : 0,
+            mem_redirect ? 1 : 0,
+            owner_ok ? 1 : 0,
+            static_cast<unsigned long long>(reinterpret_cast<uint64_t>(owner_mod)),
+            owner_system ? 1 : 0,
+            owner_path[0] ? owner_path : "<none>");
+
+        return ok;
     }
 
 }
@@ -872,6 +951,8 @@ inline bool verify_prologue_hashes(std::string& mismatched_name)
 
             if (memcmp(hash, b.hash, 32) != 0)
             {
+                if (s == 0 && detail::system_owned_nt_export_wrapper(b.name.c_str(), addr))
+                    continue;
                 mismatched_name = b.name;
                 return false;
             }
@@ -983,7 +1064,10 @@ inline bool scan_inline_hooks_kernel32(std::string& hooked_name)
 inline bool verify_syscall_stubs()
 {
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-    if (!ntdll) return true;
+    if (!ntdll) {
+        webhook::write_log_critical("syscall_hook", "verify_syscall_stubs no_ntdll_module");
+        return true;
+    }
 
     const char* syscall_funcs[] = {
         "NtQueryInformationProcess",
@@ -996,13 +1080,68 @@ inline bool verify_syscall_stubs()
         "NtOpenProcess",
     };
 
+    if (!detail::ntdll_disk_image().valid)
+        detail::load_disk_image_ntdll();
+
     for (const auto& name : syscall_funcs)
     {
         auto* addr = reinterpret_cast<const uint8_t*>(GetProcAddress(ntdll, name));
-        if (!addr) continue;
+        if (!addr) {
+            webhook::write_log_critical_fmt("syscall_hook", "verify_syscall_stub export_missing func=%s", name);
+            continue;
+        }
 
-        if (!detail::verify_syscall_stub(addr))
+        const bool ok = detail::verify_syscall_stub(addr);
+        if (!ok)
+        {
+            MEMORY_BASIC_INFORMATION mbi{};
+            SIZE_T vq = VirtualQuery(addr, &mbi, sizeof(mbi));
+            HMODULE owner_mod = nullptr;
+            BOOL owner_ok = GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<LPCWSTR>(addr),
+                &owner_mod);
+            wchar_t owner_path_w[MAX_PATH]{};
+            DWORD owner_path_len = owner_ok && owner_mod
+                ? GetModuleFileNameW(owner_mod, owner_path_w, MAX_PATH)
+                : 0;
+            char owner_path[512]{};
+            anti_tamper::syscall::detail::narrow_path(owner_path_w, owner_path, sizeof(owner_path));
+            MODULEINFO owner_info{};
+            DWORD owner_size = 0;
+            uint64_t owner_base = 0;
+            uint64_t owner_rva = 0;
+            if (owner_mod && GetModuleInformation(GetCurrentProcess(), owner_mod, &owner_info, sizeof(owner_info))) {
+                owner_base = reinterpret_cast<uint64_t>(owner_info.lpBaseOfDll);
+                owner_size = owner_info.SizeOfImage;
+                owner_rva = reinterpret_cast<uint64_t>(addr) - owner_base;
+            }
+            char mem16[33]{};
+            char disk16[33]{};
+            detail::bytes16_hex(addr, mem16);
+            const uint8_t* disk_bytes = detail::disk_export_bytes(name);
+            detail::bytes16_hex(disk_bytes, disk16);
+            bool owner_system = owner_path_len != 0 &&
+                anti_tamper::syscall::detail::system_image_module_path(owner_path_w);
+            webhook::write_log_critical_fmt("syscall_hook",
+                "verify_syscall_stub_failed func=%s va=0x%llX vq=%llu protect=0x%lX state=0x%lX type=0x%lX type_name=%s owner_ok=%d owner_base=0x%llX owner_size=0x%lX owner_rva=0x%llX owner_system=%d owner_path=%s mem16=%s disk16=%s",
+                name,
+                static_cast<unsigned long long>(reinterpret_cast<uint64_t>(addr)),
+                static_cast<unsigned long long>(vq),
+                vq ? static_cast<unsigned long>(mbi.Protect) : 0ul,
+                vq ? static_cast<unsigned long>(mbi.State) : 0ul,
+                vq ? static_cast<unsigned long>(mbi.Type) : 0ul,
+                vq ? anti_tamper::syscall::detail::memory_type_name(mbi.Type) : "none",
+                owner_ok ? 1 : 0,
+                static_cast<unsigned long long>(owner_base),
+                static_cast<unsigned long>(owner_size),
+                static_cast<unsigned long long>(owner_rva),
+                owner_system ? 1 : 0,
+                owner_path[0] ? owner_path : "<none>",
+                mem16,
+                disk16);
             return false;
+        }
     }
     return true;
 }
@@ -1087,7 +1226,13 @@ inline hook_report_t full_scan(const std::vector<state::iat_entry_t>& iat_snap)
 
     report.syscall_stubs_modified = !verify_syscall_stubs();
     if (report.syscall_stubs_modified)
+    {
+        webhook::write_log_critical_fmt("syscall_hook",
+            "full_scan_syscall_stubs_modified pid=%lu tid=%lu",
+            GetCurrentProcessId(),
+            GetCurrentThreadId());
         webhook::send_debug_log("syscall_hook", "syscall_stub_modified", true);
+    }
 
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     report.eat_hooked = !verify_export_addresses(ntdll);
@@ -1141,13 +1286,14 @@ inline hook_report_t full_scan(const std::vector<state::iat_entry_t>& iat_snap)
             {
                 report.ntdll_inline_hooked = true;
                 report.hooked_function = disk_hooked;
+                ntdll_hooked = disk_hooked;
             }
             webhook::send_debug_log("disk_hook", "disk_mismatch: " + disk_hooked, true);
         }
     }
 
     if (report.iat_modified) report.summary += "iat ";
-    if (report.ntdll_inline_hooked) report.summary += "ntdll:" + ntdll_hooked + " ";
+    if (report.ntdll_inline_hooked) report.summary += "ntdll:" + (!ntdll_hooked.empty() ? ntdll_hooked : report.hooked_function) + " ";
     if (report.kernel32_inline_hooked) report.summary += "k32:" + k32_hooked + " ";
     if (report.syscall_stubs_modified) report.summary += "syscall ";
     if (report.eat_hooked) report.summary += "eat ";

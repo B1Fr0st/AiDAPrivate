@@ -1838,22 +1838,28 @@ static void job_main(std::shared_ptr<job_t> job)
             size_t pool = job->cfg.concurrency > 0 ? job->cfg.concurrency : 16;
             if (pool > 128) pool = 128;
             diag::log_tagged_fmt("intruder", "job_main dispatching http1_pooled pool=%zu job_id=%llu", pool, static_cast<unsigned long long>(job->id));
-            std::vector<std::thread> ws;
-            try {
-                ws.reserve(pool);
-                for (size_t i = 0; i < pool; ++i) {
-                    ws.emplace_back([job]() { worker_pooled_h1(job); });
+            if (pool <= 1) {
+                worker_pooled_h1(job);
+            } else {
+                std::vector<std::thread> ws;
+                try {
+                    ws.reserve(pool);
+                    for (size_t i = 0; i < pool; ++i) {
+                        ws.emplace_back([job]() { worker_pooled_h1(job); });
+                    }
+                } catch (const std::exception& ex) {
+                    set_err(std::string("intruder: pooled worker start failed: ") + ex.what());
+                    diag::log_tagged_fmt("intruder", "pooled_worker_start_failed job_id=%llu started=%zu err=%s",
+                        static_cast<unsigned long long>(job->id), ws.size(), ex.what());
+                    job->running.store(false);
+                } catch (...) {
+                    set_err("intruder: pooled worker start failed");
+                    diag::log_tagged_fmt("intruder", "pooled_worker_start_failed job_id=%llu started=%zu",
+                        static_cast<unsigned long long>(job->id), ws.size());
+                    job->running.store(false);
                 }
-            } catch (const std::exception& ex) {
-                diag::log_tagged_fmt("intruder", "pooled_worker_start_failed job_id=%llu started=%zu err=%s",
-                    static_cast<unsigned long long>(job->id), ws.size(), ex.what());
-                job->running.store(false);
-            } catch (...) {
-                diag::log_tagged_fmt("intruder", "pooled_worker_start_failed job_id=%llu started=%zu",
-                    static_cast<unsigned long long>(job->id), ws.size());
-                job->running.store(false);
+                for (auto& t : ws) if (t.joinable()) t.join();
             }
-            for (auto& t : ws) if (t.joinable()) t.join();
             break;
         }
         case engine_mode_t::http2_multiplexed: {
@@ -1923,18 +1929,25 @@ uint64_t start(config_t cfg)
     diag::log_tagged_fmt("intruder", "start job_id=%llu concurrency=%zu timeout_ms=%d max_resp_bytes=%zu",
         static_cast<unsigned long long>(job->id), job->cfg.concurrency,
         job->cfg.timeout_ms, job->cfg.max_response_body_bytes);
-    try {
-        std::thread([job]() { job_main(job); }).detach();
-    } catch (const std::exception& ex) {
-        diag::log_tagged_fmt("intruder", "start_thread_failed job_id=%llu err=%s",
-            static_cast<unsigned long long>(job->id), ex.what());
-        job->running.store(false);
-        std::lock_guard<std::mutex> lk(reg().mtx);
-        reg().jobs.erase(job->id);
-        return 0;
-    } catch (...) {
-        diag::log_tagged_fmt("intruder", "start_thread_failed job_id=%llu",
+    const bool posted = work_queue::post([job]() {
+        try {
+            job_main(job);
+        } catch (const std::exception& ex) {
+            set_err(std::string("intruder: job worker exception: ") + ex.what());
+            diag::log_tagged_fmt("intruder", "job_worker_exception job_id=%llu err=%s",
+                static_cast<unsigned long long>(job->id), ex.what());
+            job->running.store(false);
+        } catch (...) {
+            set_err("intruder: job worker exception");
+            diag::log_tagged_fmt("intruder", "job_worker_exception job_id=%llu",
+                static_cast<unsigned long long>(job->id));
+            job->running.store(false);
+        }
+    });
+    if (!posted) {
+        diag::log_tagged_fmt("intruder", "start_work_queue_rejected job_id=%llu",
             static_cast<unsigned long long>(job->id));
+        set_err("intruder: work queue rejected job start");
         job->running.store(false);
         std::lock_guard<std::mutex> lk(reg().mtx);
         reg().jobs.erase(job->id);

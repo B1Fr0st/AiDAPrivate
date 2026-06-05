@@ -155,6 +155,9 @@ struct ui_state_t {
 
 inline ui_state_t g_ui;
 
+bool is_visible_sub_tab(sub_tab_t tab);
+int visible_sub_tab_count();
+
 void render(float pos_x, float pos_y, float width, float height,
 			float alpha, float accent_r, float accent_g, float accent_b);
 

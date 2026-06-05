@@ -411,10 +411,26 @@ static void miner_main(std::shared_ptr<job_t> job)
         }
     };
 
-    std::vector<std::thread> threads;
-    threads.reserve(concurrency);
-    for (size_t i = 0; i < concurrency; ++i) threads.emplace_back(worker);
-    for (auto& t : threads) if (t.joinable()) t.join();
+    if (concurrency <= 1) {
+        worker();
+    } else {
+        std::vector<std::thread> threads;
+        try {
+            threads.reserve(concurrency);
+            for (size_t i = 0; i < concurrency; ++i) threads.emplace_back(worker);
+        } catch (const std::exception& ex) {
+            set_err(std::string("param_miner: worker thread start failed: ") + ex.what());
+            diag::log_tagged_fmt("param_miner", "worker_thread_start_failed job_id=%llu started=%zu err=%s",
+                static_cast<unsigned long long>(job->id), threads.size(), ex.what());
+            job->cancel.store(true);
+        } catch (...) {
+            set_err("param_miner: worker thread start failed");
+            diag::log_tagged_fmt("param_miner", "worker_thread_start_failed job_id=%llu started=%zu",
+                static_cast<unsigned long long>(job->id), threads.size());
+            job->cancel.store(true);
+        }
+        for (auto& t : threads) if (t.joinable()) t.join();
+    }
 
     job->running.store(false);
     diag::log_tagged_fmt("param_miner", "miner_main done job_id=%llu tried=%zu hits=%zu",
@@ -447,18 +463,25 @@ uint64_t start(config_t cfg)
     }
     diag::log_tagged_fmt("param_miner", "start job_id=%llu concurrency=%zu timeout_ms=%d sigma=%.1f",
         static_cast<unsigned long long>(job->id), job->cfg.concurrency, job->cfg.timeout_ms, job->cfg.diff_sigma_threshold);
-    try {
-        std::thread([job]() { miner_main(job); }).detach();
-    } catch (const std::exception& ex) {
-        diag::log_tagged_fmt("param_miner", "start_thread_failed job_id=%llu err=%s",
-            static_cast<unsigned long long>(job->id), ex.what());
-        job->running.store(false);
-        std::lock_guard<std::mutex> lk(reg().mtx);
-        reg().jobs.erase(job->id);
-        return 0;
-    } catch (...) {
-        diag::log_tagged_fmt("param_miner", "start_thread_failed job_id=%llu",
+    const bool posted = work_queue::post([job]() {
+        try {
+            miner_main(job);
+        } catch (const std::exception& ex) {
+            set_err(std::string("param_miner: job worker exception: ") + ex.what());
+            diag::log_tagged_fmt("param_miner", "job_worker_exception job_id=%llu err=%s",
+                static_cast<unsigned long long>(job->id), ex.what());
+            job->running.store(false);
+        } catch (...) {
+            set_err("param_miner: job worker exception");
+            diag::log_tagged_fmt("param_miner", "job_worker_exception job_id=%llu",
+                static_cast<unsigned long long>(job->id));
+            job->running.store(false);
+        }
+    });
+    if (!posted) {
+        diag::log_tagged_fmt("param_miner", "start_work_queue_rejected job_id=%llu",
             static_cast<unsigned long long>(job->id));
+        set_err("param_miner: work queue rejected job start");
         job->running.store(false);
         std::lock_guard<std::mutex> lk(reg().mtx);
         reg().jobs.erase(job->id);

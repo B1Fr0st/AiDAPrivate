@@ -16,8 +16,7 @@ namespace settings_overlay {
 		tab_skills            = 2,
 		tab_mcp_servers       = 3,
 		tab_editor_theme      = 4,
-		tab_ida_pro           = 5,
-		tab_count             = 6
+		tab_count             = 5
 	};
 
 

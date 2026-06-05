@@ -156,11 +156,6 @@ inline void remove_hook(hook_entry_t& hook)
 
 inline bool enable_stealth(uint32_t pid, const stealth_options_t& opts)
 {
-	if (g_state.active.load()) {
-		diag::log_tagged_fmt("stealth", "enable_skip reason=already_active pid=%u", pid);
-		return true;
-	}
-
 	if (pid == 0) {
 		diag::log_tagged("stealth", "enable_reject reason=zero_pid");
 		std::lock_guard<std::mutex> lk(g_state.mutex);
@@ -175,6 +170,19 @@ inline bool enable_stealth(uint32_t pid, const stealth_options_t& opts)
 		opts.scrub_context ? 1 : 0);
 
 	std::lock_guard<std::mutex> lk(g_state.mutex);
+
+	if (g_state.active.load()) {
+		const uint32_t active_pid = g_state.session.pid;
+		if (active_pid == pid) {
+			diag::log_tagged_fmt("stealth", "enable_skip reason=already_active pid=%u", pid);
+			return true;
+		}
+		diag::log_tagged_fmt("stealth",
+			"enable_reject reason=active_other_pid requested=%u active=%u",
+			pid, active_pid);
+		g_state.status = "Stealth already active for PID " + std::to_string(active_pid);
+		return false;
+	}
 
 	g_state.session = {};
 	g_state.session.pid = pid;
@@ -271,6 +279,12 @@ inline bool enable_stealth(uint32_t pid)
 	return enable_stealth(pid, opts);
 }
 
+inline bool is_active_for_pid(uint32_t pid)
+{
+	std::lock_guard<std::mutex> lk(g_state.mutex);
+	return g_state.active.load() && g_state.session.pid == pid;
+}
+
 inline void disable_stealth()
 {
 	if (!g_state.active.load()) {
@@ -279,6 +293,15 @@ inline void disable_stealth()
 	}
 
 	std::lock_guard<std::mutex> lk(g_state.mutex);
+
+	const uint32_t attached_pid = driver_bridge::attached_pid();
+	if (attached_pid != 0 && g_state.session.pid != 0 && attached_pid != g_state.session.pid) {
+		diag::log_tagged_fmt("stealth",
+			"disable_reject reason=attached_pid_mismatch active_pid=%u attached_pid=%u hooks=%zu",
+			g_state.session.pid, attached_pid, g_state.session.hooks.size());
+		g_state.status = "Stealth restore deferred: active target mismatch";
+		return;
+	}
 
 	size_t hooks = g_state.session.hooks.size();
 	for (auto& hook : g_state.session.hooks) {
@@ -292,6 +315,97 @@ inline void disable_stealth()
 	g_state.session = {};
 	g_state.status = "Stealth disabled";
 	g_state.active.store(false);
+}
+
+inline bool ensure_default_enabled(uint32_t pid, const char* source)
+{
+	if (pid == 0) {
+		diag::log_tagged_fmt("stealth", "default_enable_reject source=%s reason=zero_pid",
+			source ? source : "");
+		return false;
+	}
+
+	{
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		if (g_state.active.load() && g_state.session.pid == pid) {
+			diag::log_tagged_fmt("stealth",
+				"default_enable_skip source=%s reason=already_active pid=%u",
+				source ? source : "", pid);
+			return true;
+		}
+	}
+
+	stealth_session_t previous_session;
+	{
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		if (g_state.active.load())
+			previous_session = g_state.session;
+	}
+	if (previous_session.pid != 0 && previous_session.pid != pid) {
+		const uint32_t restore_pid = driver_bridge::attached_pid();
+		bool previous_known = restore_pid == previous_session.pid;
+		if (!previous_known) {
+			for (uint32_t attached : driver_bridge::attached_pids()) {
+				if (attached == previous_session.pid) {
+					previous_known = true;
+					break;
+				}
+			}
+		}
+
+		bool restored_previous = false;
+		if (previous_known) {
+			if (restore_pid == previous_session.pid || driver_bridge::set_active_pid(previous_session.pid)) {
+				disable_stealth();
+				restored_previous = !is_active_for_pid(previous_session.pid);
+			}
+		}
+
+		if (restore_pid != 0 && restore_pid != previous_session.pid)
+			(void)driver_bridge::set_active_pid(restore_pid);
+
+		diag::log_tagged_fmt("stealth",
+			"default_enable_previous_session_cleanup source=%s requested=%u previous=%u known=%d restored=%d restore_pid=%u",
+			source ? source : "",
+			pid,
+			previous_session.pid,
+			previous_known ? 1 : 0,
+			restored_previous ? 1 : 0,
+			restore_pid);
+	}
+
+	stealth_options_t opts;
+	const bool ok = enable_stealth(pid, opts);
+	std::string status_snapshot;
+	{
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		status_snapshot = g_state.status;
+	}
+	diag::log_tagged_fmt("stealth",
+		"default_enable_result source=%s pid=%u ok=%d status='%s'",
+		source ? source : "",
+		pid,
+		ok ? 1 : 0,
+		status_snapshot.c_str());
+	return ok;
+}
+
+inline void disable_for_detach(uint32_t pid, const char* source)
+{
+	if (pid == 0) {
+		diag::log_tagged_fmt("stealth", "detach_disable_skip source=%s reason=zero_pid",
+			source ? source : "");
+		return;
+	}
+	if (!is_active_for_pid(pid)) {
+		diag::log_tagged_fmt("stealth",
+			"detach_disable_skip source=%s reason=not_active_for_pid pid=%u",
+			source ? source : "", pid);
+		return;
+	}
+	diag::log_tagged_fmt("stealth", "detach_disable_start source=%s pid=%u",
+		source ? source : "", pid);
+	disable_stealth();
 }
 
 inline bool is_active()

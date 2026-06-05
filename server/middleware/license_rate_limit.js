@@ -96,6 +96,9 @@ async function check(licenseKey, options) {
         return { ok: true, minute: minute.current, hour: hour.current, day: day.current };
     } catch (err) {
         console.warn('[license_rate_limit] check failed:', err && err.message ? err.message : err);
+        if (opts.fail_closed) {
+            return { ok: false, reason: 'rate_limit_unavailable', soft_fail: true };
+        }
         return { ok: true, soft_fail: true };
     }
 }

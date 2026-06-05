@@ -1,11 +1,12 @@
 #include "test_lab_view.hpp"
 #include "test_lab.hpp"
 #include "test_lab_format.hpp"
+#include "test_all_features.hpp"
 
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
 
-#include "../infra/work_queue.hpp"
+#include "../infra/critical_work_queue.hpp"
 #include "../ui/theme.hpp"
 #include "../ui/ui_anim.hpp"
 #include "../../../../driver/comm.h"
@@ -51,12 +52,12 @@ namespace test_lab_view {
 			return aida::ui::with_alpha(t.text_dim, alpha);
 		}
 
-		ImU32 status_dot_color(test_lab::run_state_e s, bool ok, float alpha) {
+		ImU32 status_dot_color(test_lab::run_state_e s, bool ok, bool skipped, float alpha) {
 			const auto& t = aida::ui::resolved();
 			switch (s) {
 				case test_lab::run_state_e::idle:     return aida::ui::with_alpha(t.text_dim, alpha);
 				case test_lab::run_state_e::running:  return aida::ui::with_alpha(t.accent_u32, alpha);
-				case test_lab::run_state_e::complete: return aida::ui::with_alpha(ok ? t.success : t.error, alpha);
+				case test_lab::run_state_e::complete: return aida::ui::with_alpha(skipped ? t.warning : (ok ? t.success : t.error), alpha);
 			}
 			return aida::ui::with_alpha(t.text_dim, alpha);
 		}
@@ -70,6 +71,23 @@ namespace test_lab_view {
 		std::mutex        g_run_all_status_mtx;
 		std::string       g_run_all_status_line;
 		std::string       g_run_all_current_name;
+
+		struct full_test_scope_t {
+			const char* source = nullptr;
+			bool active = false;
+
+			explicit full_test_scope_t(const char* s) : source(s), active(true) {
+				test_all_features::begin_test_guard(source);
+			}
+
+			~full_test_scope_t() {
+				if (active)
+					test_all_features::end_test_guard(source, true);
+			}
+
+			full_test_scope_t(const full_test_scope_t&) = delete;
+			full_test_scope_t& operator=(const full_test_scope_t&) = delete;
+		};
 
 		const char* run_all_log_path() {
 			return "C:\\Users\\Public\\Desktop\\aida_test_results.log";
@@ -110,11 +128,32 @@ namespace test_lab_view {
 			return "unknown";
 		}
 
-		void append_log_line(HANDLE hFile, const std::string& line) {
+		void flush_run_all_log(HANDLE hFile) {
+			if (hFile != INVALID_HANDLE_VALUE)
+				FlushFileBuffers(hFile);
+		}
+
+		void append_log_line(HANDLE hFile, const std::string& line, bool force_flush = false) {
 			if (hFile == INVALID_HANDLE_VALUE) return;
+			static std::mutex s_log_mtx;
+			static std::uint64_t s_last_flush_ms = 0;
+			static std::uint32_t s_bytes_since_flush = 0;
+			const bool important =
+				line.find(" -- FAIL") != std::string::npos ||
+				line.find("FATAL") != std::string::npos ||
+				line.find("CRASH") != std::string::npos ||
+				line.find("BSOD") != std::string::npos ||
+				line.find("Run All complete") != std::string::npos;
+			std::lock_guard<std::mutex> lk(s_log_mtx);
 			DWORD wrote = 0;
 			WriteFile(hFile, line.data(), static_cast<DWORD>(line.size()), &wrote, nullptr);
-			FlushFileBuffers(hFile);
+			s_bytes_since_flush += wrote;
+			const std::uint64_t now = static_cast<std::uint64_t>(GetTickCount64());
+			if (force_flush || important || s_last_flush_ms == 0 || s_bytes_since_flush >= 65536u || now - s_last_flush_ms >= 1000u) {
+				FlushFileBuffers(hFile);
+				s_last_flush_ms = now;
+				s_bytes_since_flush = 0;
+			}
 		}
 
 		void append_log_starting(HANDLE hFile,
@@ -165,7 +204,7 @@ namespace test_lab_view {
 			line.append("[").append(ts).append("] [").append(driver_name(f.driver)).append("] ");
 			line.append(f.category != nullptr ? f.category : "?").append("/");
 			line.append(f.name != nullptr ? f.name : "?");
-			line.append(r.ok ? " -- OK" : " -- FAIL");
+			line.append(r.skipped ? " -- SKIPPED" : (r.ok ? " -- OK" : " -- FAIL"));
 			char tmp[64];
 			std::snprintf(tmp, sizeof(tmp), " ntstatus=%s bytes=%u elapsed_us=%llu\n",
 				test_lab_format::ntstatus_to_string(r.ntstatus),
@@ -181,7 +220,7 @@ namespace test_lab_view {
 				static_cast<unsigned>(s.u32_a));
 			line.append(tmp);
 
-			if (!r.ok && !r.error.empty()) {
+			if ((!r.ok || r.skipped) && !r.error.empty()) {
 				line.append("    error: ").append(r.error).append("\n");
 			}
 			for (const auto& p : r.parsed) {
@@ -410,7 +449,8 @@ namespace test_lab_view {
 
 			bool posted = false;
 			try {
-				posted = work_queue::post([]() {
+				posted = critical_work_queue::post([]() {
+				full_test_scope_t full_test_scope("test_lab_view_run_all");
 				const auto& features = test_lab::all_features();
 				g_run_all_total.store(static_cast<int>(features.size()));
 
@@ -424,7 +464,7 @@ namespace test_lab_view {
 						"[%s] Run All Safe Tests started (total=%d)\n"
 						"========================================\n",
 						ts, static_cast<int>(features.size()));
-					append_log_line(hFile, std::string(header));
+					append_log_line(hFile, std::string(header), true);
 				}
 
 				run_all_cache_t cache;
@@ -466,8 +506,9 @@ namespace test_lab_view {
 						std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
 					if (r.elapsed_us == 0) r.elapsed_us = elapsed_us;
 
-					if (r.ok) g_run_all_ok.fetch_add(1);
-					else      g_run_all_fail.fetch_add(1);
+					if (r.skipped) g_run_all_skipped.fetch_add(1);
+					else if (r.ok) g_run_all_ok.fetch_add(1);
+					else           g_run_all_fail.fetch_add(1);
 
 					append_log_result(hFile, f, s, r, r.elapsed_us);
 					test_lab_format::testlab_diag_log_exit(f, r, r.elapsed_us);
@@ -485,7 +526,8 @@ namespace test_lab_view {
 						g_run_all_fail.load(),
 						g_run_all_skipped.load(),
 						g_run_all_total.load());
-					append_log_line(hFile, std::string(footer));
+					append_log_line(hFile, std::string(footer), true);
+					flush_run_all_log(hFile);
 					CloseHandle(hFile);
 				}
 
@@ -503,18 +545,18 @@ namespace test_lab_view {
 				g_run_all_active.store(false);
 				});
 			} catch (const std::exception& ex) {
-				diag::log_tagged_fmt("test_lab", "run_all_safe work_queue post exception: %s", ex.what());
+				diag::log_tagged_fmt("test_lab", "run_all_safe critical_queue post exception: %s", ex.what());
 			} catch (...) {
-				diag::log_tagged("test_lab", "run_all_safe work_queue post unknown exception");
+				diag::log_tagged("test_lab", "run_all_safe critical_queue post unknown exception");
 			}
 			if (!posted) {
 				g_run_all_active.store(false, std::memory_order_release);
 				{
 					std::lock_guard<std::mutex> lk(g_run_all_status_mtx);
-					g_run_all_status_line = "start failed: work queue unavailable";
+					g_run_all_status_line = "start failed: critical queue unavailable";
 					g_run_all_current_name.clear();
 				}
-				diag::log_tagged("test_lab", "run_all_safe work_queue post failed");
+				diag::log_tagged("test_lab", "run_all_safe critical_queue post failed");
 			}
 		}
 
@@ -617,6 +659,7 @@ namespace test_lab_view {
 				ImVec2 dot_p(row_start.x + 10.f, row_start.y + row_h * 0.5f);
 				test_lab::run_state_e rs = test_lab::run_state_e::idle;
 				bool rok = false;
+				bool rskipped = false;
 				if (is_selected) {
 					std::shared_ptr<test_lab::result_t> snap;
 					{
@@ -625,8 +668,9 @@ namespace test_lab_view {
 					}
 					rs = snap->state.load(std::memory_order_acquire);
 					rok = snap->ok;
+					rskipped = snap->skipped;
 				}
-				rdl->AddCircleFilled(dot_p, dot_r, status_dot_color(rs, rok, ent));
+				rdl->AddCircleFilled(dot_p, dot_r, status_dot_color(rs, rok, rskipped, ent));
 
 				float badge_w = 34.f;
 				float badge_h = 16.f;
@@ -738,7 +782,8 @@ namespace test_lab_view {
 				g_result = new_result;
 			}
 			test_lab::feature_t feature_copy = f;
-			work_queue::post([feature_copy, snapshot, new_result]() mutable {
+			if (!critical_work_queue::post([feature_copy, snapshot, new_result]() mutable {
+				full_test_scope_t full_test_scope("test_lab_view_single_feature");
 				if (feature_copy.run == nullptr) {
 					new_result->ok = false;
 					new_result->error = "no run function";
@@ -759,6 +804,7 @@ namespace test_lab_view {
 				{
 					std::lock_guard<std::mutex> lk(g_result_mtx);
 					new_result->ok = local.ok;
+					new_result->skipped = local.skipped;
 					new_result->ntstatus = local.ntstatus;
 					new_result->bytes_returned = local.bytes_returned;
 					new_result->elapsed_us = local.elapsed_us;
@@ -767,7 +813,13 @@ namespace test_lab_view {
 					new_result->parsed = std::move(local.parsed);
 				}
 				new_result->state.store(test_lab::run_state_e::complete, std::memory_order_release);
-			});
+			})) {
+				new_result->ok = false;
+				new_result->error = "critical queue unavailable";
+				new_result->state.store(test_lab::run_state_e::complete, std::memory_order_release);
+				diag::log_tagged_fmt("test_lab", "single_feature critical_queue post failed name=%s",
+					feature_copy.name ? feature_copy.name : "?");
+			}
 		}
 
 		void render_result_section() {
@@ -801,6 +853,7 @@ namespace test_lab_view {
 			{
 				std::lock_guard<std::mutex> lk(g_result_mtx);
 				local_copy.ok = snap->ok;
+				local_copy.skipped = snap->skipped;
 				local_copy.ntstatus = snap->ntstatus;
 				local_copy.bytes_returned = snap->bytes_returned;
 				local_copy.elapsed_us = snap->elapsed_us;
@@ -809,7 +862,7 @@ namespace test_lab_view {
 				local_copy.parsed = snap->parsed;
 			}
 
-			ImU32 status_col = local_copy.ok ? t.success : t.error;
+			ImU32 status_col = local_copy.skipped ? t.warning : (local_copy.ok ? t.success : t.error);
 			ImGui::PushStyleColor(ImGuiCol_Text, status_col);
 			ImGui::Text("%s  (0x%08X)",
 				test_lab_format::ntstatus_to_string(local_copy.ntstatus),

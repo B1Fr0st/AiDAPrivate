@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -15,6 +16,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "../infra/critical_work_queue.hpp"
 #include "standalone_driver.hpp"
 #include "zydis_disasm.hpp"
 #include "../helpers/diag_log.hpp"
@@ -407,7 +409,8 @@ inline void generate_from_address(uint64_t address, int num_instructions, bool a
 
 	g_state.generating.store(true);
 
-	bool posted = work_queue::post([address, num_instructions, auto_wildcard, driver_attached, static_pe_available]() {
+	auto task = [address, num_instructions, auto_wildcard, driver_attached, static_pe_available]() {
+		try {
 		auto t_start = std::chrono::steady_clock::now();
 		char lbuf[256];
 		std::snprintf(lbuf, sizeof(lbuf),
@@ -627,17 +630,33 @@ inline void generate_from_address(uint64_t address, int num_instructions, bool a
 		}
 
 		g_state.generating.store(false);
-	});
+		} catch (const std::exception& ex) {
+			diag::log_tagged_fmt("aob", "worker exception err='%s'", ex.what());
+			{
+				std::lock_guard<std::mutex> lk(g_state.mutex);
+				g_state.last_error = ex.what();
+			}
+			g_state.generating.store(false);
+		} catch (...) {
+			diag::log_tagged("aob", "worker exception err='<unknown>'");
+			{
+				std::lock_guard<std::mutex> lk(g_state.mutex);
+				g_state.last_error = "AOB worker threw an unknown exception.";
+			}
+			g_state.generating.store(false);
+		}
+	};
 
+	const bool posted = critical_work_queue::post(task) || work_queue::post(task);
 	if (!posted) {
-		diag::log_tagged("aob", "work_queue::post failed clearing_generating_flag");
-		anti_tamper::webhook::write_log("aob", "work_queue post failed");
+		diag::log_tagged("aob", "worker_queue_rejected clearing_generating_flag");
+		anti_tamper::webhook::write_log("aob", "worker queue rejected");
 		g_state.generating.store(false);
 		{
 			std::lock_guard<std::mutex> lk(g_state.mutex);
-			g_state.last_error = "Background work queue refused the task. Try again.";
+			g_state.last_error = "Background worker queue rejected the task. Try again.";
 		}
-		toast_notification::push("AOB: Background queue refused. Try again.",
+		toast_notification::push("AOB: Background worker queue rejected the task. Try again.",
 			toast_notification::toast_type_t::error, 5.0f);
 	}
 #else

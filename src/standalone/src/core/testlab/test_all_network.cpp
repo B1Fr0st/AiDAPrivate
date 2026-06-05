@@ -1,5 +1,6 @@
 #include "test_all_network.h"
 
+#include "test_all_features.hpp"
 #include "../network/network_view.hpp"
 #include "../network/mitm_proxy.hpp"
 #include "../network/tcp_stream_tracker.hpp"
@@ -15,6 +16,7 @@
 #include "../network/protobuf_codec.hpp"
 #include "../network/http2_session.hpp"
 #include "../network/burp/match_replace.hpp"
+#include "../infra/critical_work_queue.hpp"
 #include "../runtime/standalone_driver.hpp"
 #include "net_security.hpp"
 #include "../../helpers/diag_log.hpp"
@@ -31,8 +33,9 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <memory>
+#include <mutex>
 #include <string>
-#include <thread>
 #include <vector>
 
 namespace test_all_features {
@@ -46,10 +49,7 @@ namespace {
             (unsigned)st.wHour, (unsigned)st.wMinute, (unsigned)st.wSecond, (unsigned)st.wMilliseconds);
     }
     void write_log_file(HANDLE hf, const std::string& line) {
-        if (hf == INVALID_HANDLE_VALUE) return;
-        DWORD wrote = 0;
-        WriteFile(hf, line.data(), (DWORD)line.size(), &wrote, nullptr);
-        FlushFileBuffers(hf);
+        test_all_features::write_full_test_log_line(hf, line.data(), line.size());
     }
     void log_msg(HANDLE hf, const char* tag, const char* fmt, ...) {
         char ts[40]; format_timestamp(ts, sizeof(ts));
@@ -59,8 +59,250 @@ namespace {
         _snprintf_s(line, sizeof(line), _TRUNCATE, "[%s] [%s] %s\n", ts, tag, detail);
         std::string s(line);
         write_log_file(hf, s);
-        diag::log_tagged_fmt("test_all", "%s: %s", tag, detail);
-        OutputDebugStringA(s.c_str());
+        test_all_features::mirror_full_test_log_line(tag, detail, s.c_str());
+    }
+
+    void fail_empty_evidence(HANDLE hf, const char* tag, std::atomic<int>& failed, const char* fmt, ...) {
+        char detail[1024]; va_list ap; va_start(ap, fmt);
+        _vsnprintf_s(detail, sizeof(detail), _TRUNCATE, fmt, ap); va_end(ap);
+        log_msg(hf, tag, "FAIL -- %s", detail);
+        failed.fetch_add(1);
+    }
+
+    struct winsock_scope_t {
+        WSADATA data{};
+        int rc = WSAStartup(MAKEWORD(2, 2), &data);
+        ~winsock_scope_t() {
+            if (rc == 0)
+                WSACleanup();
+        }
+        bool ok() const { return rc == 0; }
+    };
+
+    struct tcp_pair_fixture_t {
+        SOCKET listener = INVALID_SOCKET;
+        SOCKET client = INVALID_SOCKET;
+        SOCKET accepted = INVALID_SOCKET;
+        uint16_t listen_port = 0;
+        uint16_t client_port = 0;
+        uint8_t client_addr[16]{};
+        uint8_t server_addr[16]{};
+
+        ~tcp_pair_fixture_t() {
+            close_all();
+        }
+
+        void close_all() {
+            if (accepted != INVALID_SOCKET) {
+                closesocket(accepted);
+                accepted = INVALID_SOCKET;
+            }
+            if (client != INVALID_SOCKET) {
+                closesocket(client);
+                client = INVALID_SOCKET;
+            }
+            if (listener != INVALID_SOCKET) {
+                closesocket(listener);
+                listener = INVALID_SOCKET;
+            }
+        }
+    };
+
+    bool configure_fixture_socket(SOCKET s) {
+        DWORD timeout_ms = 2000;
+        int ok1 = setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+        int ok2 = setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+        return ok1 == 0 && ok2 == 0;
+    }
+
+    bool open_tcp_pair_fixture(HANDLE hf, const char* tag, tcp_pair_fixture_t& fx) {
+        fx.close_all();
+        fx.listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (fx.listener == INVALID_SOCKET) {
+            log_msg(hf, tag, "fixture tcp listener socket failed err=%d", WSAGetLastError());
+            return false;
+        }
+        configure_fixture_socket(fx.listener);
+        BOOL reuse = TRUE;
+        setsockopt(fx.listener, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+
+        sockaddr_in la{};
+        la.sin_family = AF_INET;
+        la.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        la.sin_port = 0;
+        if (bind(fx.listener, reinterpret_cast<const sockaddr*>(&la), sizeof(la)) != 0) {
+            log_msg(hf, tag, "fixture tcp bind failed err=%d", WSAGetLastError());
+            fx.close_all();
+            return false;
+        }
+        if (listen(fx.listener, 1) != 0) {
+            log_msg(hf, tag, "fixture tcp listen failed err=%d", WSAGetLastError());
+            fx.close_all();
+            return false;
+        }
+        sockaddr_in actual{};
+        int actual_len = sizeof(actual);
+        if (getsockname(fx.listener, reinterpret_cast<sockaddr*>(&actual), &actual_len) != 0) {
+            log_msg(hf, tag, "fixture tcp listener getsockname failed err=%d", WSAGetLastError());
+            fx.close_all();
+            return false;
+        }
+        fx.listen_port = ntohs(actual.sin_port);
+
+        fx.client = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (fx.client == INVALID_SOCKET) {
+            log_msg(hf, tag, "fixture tcp client socket failed err=%d", WSAGetLastError());
+            fx.close_all();
+            return false;
+        }
+        configure_fixture_socket(fx.client);
+
+        sockaddr_in ra{};
+        ra.sin_family = AF_INET;
+        ra.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        ra.sin_port = htons(fx.listen_port);
+        if (connect(fx.client, reinterpret_cast<const sockaddr*>(&ra), sizeof(ra)) != 0) {
+            log_msg(hf, tag, "fixture tcp connect to 127.0.0.1:%u failed err=%d",
+                static_cast<unsigned>(fx.listen_port), WSAGetLastError());
+            fx.close_all();
+            return false;
+        }
+
+        sockaddr_in client_actual{};
+        int client_len = sizeof(client_actual);
+        if (getsockname(fx.client, reinterpret_cast<sockaddr*>(&client_actual), &client_len) != 0) {
+            log_msg(hf, tag, "fixture tcp client getsockname failed err=%d", WSAGetLastError());
+            fx.close_all();
+            return false;
+        }
+        fx.client_port = ntohs(client_actual.sin_port);
+        fx.client_addr[0] = 127;
+        fx.client_addr[3] = 1;
+        fx.server_addr[0] = 127;
+        fx.server_addr[3] = 1;
+
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(fx.listener, &rfds);
+        timeval tv{};
+        tv.tv_sec = 2;
+        int ready = select(0, &rfds, nullptr, nullptr, &tv);
+        if (ready <= 0) {
+            log_msg(hf, tag, "fixture tcp accept readiness failed ready=%d err=%d",
+                ready, ready == SOCKET_ERROR ? WSAGetLastError() : 0);
+            fx.close_all();
+            return false;
+        }
+        fx.accepted = accept(fx.listener, nullptr, nullptr);
+        if (fx.accepted == INVALID_SOCKET) {
+            log_msg(hf, tag, "fixture tcp accept failed err=%d", WSAGetLastError());
+            fx.close_all();
+            return false;
+        }
+        configure_fixture_socket(fx.accepted);
+        log_msg(hf, tag, "fixture tcp pair ready client_port=%u listen_port=%u",
+            static_cast<unsigned>(fx.client_port), static_cast<unsigned>(fx.listen_port));
+        return true;
+    }
+
+    bool drive_tcp_pair_fixture(HANDLE hf, const char* tag, tcp_pair_fixture_t& fx, const char* payload) {
+        const int payload_len = static_cast<int>(std::strlen(payload));
+        int sent = send(fx.client, payload, payload_len, 0);
+        int send_err = sent == SOCKET_ERROR ? WSAGetLastError() : 0;
+        char buf[2048]{};
+        int recvd = recv(fx.accepted, buf, sizeof(buf), 0);
+        int recv_err = recvd == SOCKET_ERROR ? WSAGetLastError() : 0;
+        const char response[] = "AIDA-TCP-FIXTURE-ACK";
+        int sent_back = SOCKET_ERROR;
+        int recv_back = SOCKET_ERROR;
+        int send_back_err = 0;
+        int recv_back_err = 0;
+        if (recvd > 0) {
+            sent_back = send(fx.accepted, response, static_cast<int>(sizeof(response) - 1), 0);
+            send_back_err = sent_back == SOCKET_ERROR ? WSAGetLastError() : 0;
+            char ack_buf[64]{};
+            recv_back = recv(fx.client, ack_buf, sizeof(ack_buf), 0);
+            recv_back_err = recv_back == SOCKET_ERROR ? WSAGetLastError() : 0;
+        }
+        log_msg(hf, tag, "fixture tcp traffic sent=%d send_err=%d recvd=%d recv_err=%d sent_back=%d send_back_err=%d recv_back=%d recv_back_err=%d",
+            sent, send_err, recvd, recv_err, sent_back, send_back_err, recv_back, recv_back_err);
+        return sent == payload_len && recvd == payload_len;
+    }
+
+    bool drive_udp_burst_fixture(HANDLE hf, const char* tag, uint16_t dst_port, int packet_count, uint32_t& sent_packets) {
+        sent_packets = 0;
+        SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (s == INVALID_SOCKET) {
+            log_msg(hf, tag, "fixture udp socket failed err=%d", WSAGetLastError());
+            return false;
+        }
+        DWORD timeout_ms = 250;
+        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+        sockaddr_in dst{};
+        dst.sin_family = AF_INET;
+        dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        dst.sin_port = htons(dst_port);
+        char payload[160];
+        std::memset(payload, 'N', sizeof(payload));
+        int last_err = 0;
+        for (int i = 0; i < packet_count; ++i) {
+            int rc = sendto(s, payload, static_cast<int>(sizeof(payload)), 0,
+                reinterpret_cast<const sockaddr*>(&dst), sizeof(dst));
+            if (rc == SOCKET_ERROR) {
+                last_err = WSAGetLastError();
+            } else {
+                ++sent_packets;
+            }
+        }
+        closesocket(s);
+        log_msg(hf, tag, "fixture udp burst dst_port=%u requested=%d sent=%u last_err=%d",
+            static_cast<unsigned>(dst_port), packet_count, static_cast<unsigned>(sent_packets), last_err);
+        return sent_packets > 0;
+    }
+
+    bool driver_capture_fixture(HANDLE hf, const char* tag, uint32_t protocol_filter, std::vector<driver_bridge::captured_packet_t>& packets) {
+        winsock_scope_t wsa;
+        if (!wsa.ok()) {
+            log_msg(hf, tag, "fixture WSAStartup failed rc=%d", wsa.rc);
+            return false;
+        }
+        (void)driver_bridge::stop_capture();
+        const uint32_t self_pid = GetCurrentProcessId();
+        bool started = driver_bridge::start_capture(self_pid, 0, protocol_filter, nullptr, 1500);
+        log_msg(hf, tag, "fixture capture start self_pid=%u proto=%u ok=%d",
+            static_cast<unsigned>(self_pid), static_cast<unsigned>(protocol_filter), started ? 1 : 0);
+        if (!started)
+            return false;
+
+        tcp_pair_fixture_t tcp;
+        bool tcp_ok = false;
+        if (protocol_filter == 0 || protocol_filter == 6) {
+            tcp_ok = open_tcp_pair_fixture(hf, tag, tcp) &&
+                drive_tcp_pair_fixture(hf, tag, tcp, "GET /aida-driver-capture HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+        }
+        uint32_t udp_sent = 0;
+        bool udp_ok = false;
+        if (protocol_filter == 0 || protocol_filter == 17) {
+            udp_ok = drive_udp_burst_fixture(hf, tag, 53535, 24, udp_sent);
+        }
+
+        bool active = false;
+        uint32_t captured = 0;
+        uint32_t dropped = 0;
+        for (int i = 0; i < 8; ++i) {
+            Sleep(125);
+            bool status_ok = driver_bridge::get_capture_status(active, captured, dropped);
+            log_msg(hf, tag, "fixture capture poll iter=%d status_ok=%d active=%d captured=%u dropped=%u",
+                i, status_ok ? 1 : 0, active ? 1 : 0, captured, dropped);
+            if (captured > 0)
+                break;
+        }
+        bool stopped = driver_bridge::stop_capture();
+        log_msg(hf, tag, "fixture capture stop ok=%d tcp_ok=%d udp_ok=%d udp_sent=%u captured_before_stop=%u dropped=%u",
+            stopped ? 1 : 0, tcp_ok ? 1 : 0, udp_ok ? 1 : 0, udp_sent, captured, dropped);
+        packets = driver_bridge::get_captured_packets(32);
+        log_msg(hf, tag, "fixture capture drain packets=%zu", packets.size());
+        return stopped && (tcp_ok || udp_ok) && !packets.empty();
     }
 
     void log_parser_proof(HANDLE hf, const char* case_name, const protocol_parser::http_request& req) {
@@ -253,60 +495,115 @@ namespace {
     }
 
     void test_mitm_repeat_request(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const char* tag = "mitm_repeat";
         (void)skipped;
-        log_msg(hf, tag, "START -- mitm_proxy::repeat_request to 127.0.0.1:18080");
-        SOCKET listener = INVALID_SOCKET;
-        SOCKET accepted = INVALID_SOCKET;
-        std::atomic<bool> server_ready{ false };
-        std::atomic<bool> server_done{ false };
-        std::thread server_thread([&]() {
-            listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-            if (listener == INVALID_SOCKET) {
-                server_done.store(true);
-                return;
+        const char* tag = "mitm_repeat";
+        log_msg(hf, tag, "START -- mitm_proxy::repeat_request loopback fixture");
+        WSADATA wsa{};
+        int wsa_rc = WSAStartup(MAKEWORD(2, 2), &wsa);
+        if (wsa_rc != 0) {
+            log_msg(hf, tag, "FAIL -- WSAStartup failed rc=%d", wsa_rc);
+            failed.fetch_add(1);
+            return;
+        }
+        struct loopback_fixture_ctx_t {
+            SOCKET listener = INVALID_SOCKET;
+            SOCKET accepted = INVALID_SOCKET;
+            std::atomic<bool> server_done{ false };
+            std::mutex socket_mtx;
+        };
+        auto ctx = std::make_shared<loopback_fixture_ctx_t>();
+        auto close_listener = [ctx]() {
+            std::lock_guard<std::mutex> lk(ctx->socket_mtx);
+            if (ctx->listener != INVALID_SOCKET) {
+                closesocket(ctx->listener);
+                ctx->listener = INVALID_SOCKET;
             }
-            sockaddr_in bind_addr = {};
-            bind_addr.sin_family = AF_INET;
-            bind_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-            bind_addr.sin_port = htons(18080);
-            int opt = 1;
-            setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&opt), sizeof(opt));
-            if (bind(listener, reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr)) == SOCKET_ERROR ||
-                listen(listener, 1) == SOCKET_ERROR) {
-                closesocket(listener);
-                listener = INVALID_SOCKET;
-                server_done.store(true);
-                return;
+        };
+        ctx->listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (ctx->listener == INVALID_SOCKET) {
+            log_msg(hf, tag, "FAIL -- loopback fixture socket failed wsa=%d", WSAGetLastError());
+            failed.fetch_add(1);
+            WSACleanup();
+            return;
+        }
+        sockaddr_in bind_addr = {};
+        bind_addr.sin_family = AF_INET;
+        bind_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        bind_addr.sin_port = 0;
+        int opt = 1;
+        setsockopt(ctx->listener, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&opt), sizeof(opt));
+        if (bind(ctx->listener, reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr)) == SOCKET_ERROR ||
+            listen(ctx->listener, 1) == SOCKET_ERROR) {
+            int err = WSAGetLastError();
+            close_listener();
+            log_msg(hf, tag, "FAIL -- loopback fixture bind/listen failed wsa=%d", err);
+            failed.fetch_add(1);
+            WSACleanup();
+            return;
+        }
+        sockaddr_in actual_addr = {};
+        int actual_len = sizeof(actual_addr);
+        if (getsockname(ctx->listener, reinterpret_cast<sockaddr*>(&actual_addr), &actual_len) == SOCKET_ERROR) {
+            int err = WSAGetLastError();
+            close_listener();
+            log_msg(hf, tag, "FAIL -- loopback fixture getsockname failed wsa=%d", err);
+            failed.fetch_add(1);
+            WSACleanup();
+            return;
+        }
+        const uint16_t port = ntohs(actual_addr.sin_port);
+        log_msg(hf, tag, "INFO -- loopback fixture listening on 127.0.0.1:%u", static_cast<unsigned>(port));
+        const bool server_posted = critical_work_queue::post([ctx, close_listener]() {
+            SOCKET listener = INVALID_SOCKET;
+            {
+                std::lock_guard<std::mutex> lk(ctx->socket_mtx);
+                listener = ctx->listener;
             }
-            server_ready.store(true);
-            accepted = accept(listener, nullptr, nullptr);
-            if (accepted != INVALID_SOCKET) {
+            ctx->accepted = accept(listener, nullptr, nullptr);
+            if (ctx->accepted != INVALID_SOCKET) {
                 char req_buf[512];
-                recv(accepted, req_buf, sizeof(req_buf), 0);
+                recv(ctx->accepted, req_buf, sizeof(req_buf), 0);
                 const char* resp = "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 4\r\nContent-Type: text/plain\r\n\r\nAIDA";
-                send(accepted, resp, static_cast<int>(std::strlen(resp)), 0);
-                closesocket(accepted);
-                accepted = INVALID_SOCKET;
+                send(ctx->accepted, resp, static_cast<int>(std::strlen(resp)), 0);
+                closesocket(ctx->accepted);
+                ctx->accepted = INVALID_SOCKET;
             }
-            closesocket(listener);
-            listener = INVALID_SOCKET;
-            server_done.store(true);
+            close_listener();
+            ctx->server_done.store(true);
         });
-        for (int i = 0; i < 50 && !server_ready.load() && !server_done.load(); ++i)
-            Sleep(20);
-        std::string raw = "GET / HTTP/1.1\r\nHost: 127.0.0.1:18080\r\nConnection: close\r\n\r\n";
+        if (!server_posted) {
+            close_listener();
+            log_msg(hf, tag, "FAIL -- loopback fixture critical_queue post failed");
+            failed.fetch_add(1);
+            WSACleanup();
+            return;
+        }
+        std::string raw = "GET / HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(port) + "\r\nConnection: close\r\n\r\n";
         std::vector<uint8_t> raw_bytes(raw.begin(), raw.end());
+        log_msg(hf, tag, "fixture request bytes=%zu target=127.0.0.1:%u tls=false", raw_bytes.size(), static_cast<unsigned>(port));
 
-        auto result = mitm_proxy::repeat_request("127.0.0.1", 18080, false, raw_bytes);
+        auto result = mitm_proxy::repeat_request("127.0.0.1", port, false, raw_bytes);
         int attempts = 1;
-        while (!result.success && attempts < 3) {
+        while (!result.success && attempts < 6) {
             log_msg(hf, tag, "attempt %d failed quickly: %s", attempts, result.error.c_str());
-            Sleep(100);
-            result = mitm_proxy::repeat_request("127.0.0.1", 18080, false, raw_bytes);
+            Sleep(static_cast<DWORD>(100 + attempts * 75));
+            result = mitm_proxy::repeat_request("127.0.0.1", port, false, raw_bytes);
             ++attempts;
         }
         if (result.success) {
+            if (result.exchange.response.status_code != 200 || result.exchange.response_size == 0) {
+                log_msg(hf, tag, "FAIL -- repeat_request returned success but response evidence is invalid attempts=%d status=%d response_size=%zu latency=%llu ms",
+                    attempts,
+                    result.exchange.response.status_code,
+                    result.exchange.response_size,
+                    (unsigned long long)result.exchange.latency_ms);
+                failed.fetch_add(1);
+                close_listener();
+                for (int i = 0; i < 100 && !ctx->server_done.load(); ++i)
+                    Sleep(20);
+                WSACleanup();
+                return;
+            }
             log_msg(hf, tag, "PASS -- repeat_request succeeded after %d attempt(s), status=%d response_size=%zu latency=%llu ms",
                 attempts,
                 result.exchange.response.status_code,
@@ -314,18 +611,72 @@ namespace {
                 (unsigned long long)result.exchange.latency_ms);
             passed.fetch_add(1);
         } else {
+            auto direct_probe = [&]() -> std::pair<bool, int> {
+                SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+                if (s == INVALID_SOCKET)
+                    return { false, WSAGetLastError() };
+                u_long nb = 1;
+                ioctlsocket(s, FIONBIO, &nb);
+                sockaddr_in sa{};
+                sa.sin_family = AF_INET;
+                sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+                sa.sin_port = htons(port);
+                int rc = connect(s, reinterpret_cast<const sockaddr*>(&sa), sizeof(sa));
+                int err = 0;
+                if (rc != 0) {
+                    err = WSAGetLastError();
+                    if (err == WSAEWOULDBLOCK || err == WSAEINPROGRESS) {
+                        fd_set wfds, efds;
+                        FD_ZERO(&wfds); FD_ZERO(&efds);
+                        FD_SET(s, &wfds); FD_SET(s, &efds);
+                        timeval tv{};
+                        tv.tv_sec = 2;
+                        int sel = select(0, nullptr, &wfds, &efds, &tv);
+                        if (sel > 0) {
+                            int so_err = 0;
+                            int so_len = static_cast<int>(sizeof(so_err));
+                            getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&so_err), &so_len);
+                            err = so_err;
+                            rc = so_err == 0 ? 0 : SOCKET_ERROR;
+                        } else {
+                            err = sel == 0 ? WSAETIMEDOUT : WSAGetLastError();
+                        }
+                    }
+                }
+                nb = 0;
+                ioctlsocket(s, FIONBIO, &nb);
+                if (rc == 0) {
+                    const char* req = "GET /probe HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+                    send(s, req, static_cast<int>(std::strlen(req)), 0);
+                    char tmp[128];
+                    recv(s, tmp, sizeof(tmp), 0);
+                    closesocket(s);
+                    return { true, 0 };
+                }
+                closesocket(s);
+                return { false, err };
+            };
+            auto probe = direct_probe();
+            if (!probe.first) {
+                log_msg(hf, tag, "FAIL -- repeat_request failed and direct loopback probe could not connect to fixture port=%u wsa=%d attempts=%d error=%s",
+                    static_cast<unsigned>(port), probe.second, attempts, result.error.c_str());
+                failed.fetch_add(1);
+                close_listener();
+                for (int i = 0; i < 100 && !ctx->server_done.load(); ++i)
+                    Sleep(20);
+                WSACleanup();
+                return;
+            }
             log_msg(hf, tag, "FAIL -- repeat_request failed after %d attempt(s): %s",
                 attempts, result.error.c_str());
             failed.fetch_add(1);
         }
-        if (listener != INVALID_SOCKET)
-            closesocket(listener);
-        if (server_thread.joinable()) {
-            for (int i = 0; i < 50 && !server_done.load(); ++i)
-                Sleep(20);
-            if (server_thread.joinable())
-                server_thread.join();
-        }
+        close_listener();
+        for (int i = 0; i < 100 && !ctx->server_done.load(); ++i)
+            Sleep(20);
+        if (!ctx->server_done.load())
+            log_msg(hf, tag, "loopback fixture worker still draining after socket close");
+        WSACleanup();
     }
 
     void test_mitm_get_history_after(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -342,8 +693,12 @@ namespace {
                 last.is_tls ? "true" : "false",
                 (int)last.state);
         }
-        log_msg(hf, tag, "PASS -- get_history returned %zu entries", hist.size());
-        passed.fetch_add(1);
+        if (hist.empty()) {
+            fail_empty_evidence(hf, tag, failed, "history is empty after repeat_request fixture; proxy/repeater did not persist exchange evidence");
+        } else {
+            log_msg(hf, tag, "PASS -- get_history returned %zu entries", hist.size());
+            passed.fetch_add(1);
+        }
     }
 
     void test_mitm_clear_history(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -1207,14 +1562,15 @@ namespace {
         }
     }
 
-    void test_cert_profile_manager_firefox(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    void test_cert_profile_manager_firefox(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        (void)skipped;
         const char* tag = "cert_profile_fx";
         log_msg(hf, tag, "START -- cert_intercept::profiles::prepare_firefox_profile()");
         bool ok = cert_generator::is_ready() || cert_generator::initialize();
         const auto& ca = cert_generator::get_root_ca();
         if (!ok || !ca.valid) {
-            log_msg(hf, tag, "PASS -- Firefox profile preparation unavailable because CA initialization returned ok=%s", ok ? "true" : "false");
-            passed.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- Firefox profile preparation unavailable because CA initialization returned ok=%s", ok ? "true" : "false");
+            failed.fetch_add(1);
             return;
         }
         if (!cert_generator::is_root_ca_installed(ca)) {
@@ -1222,12 +1578,13 @@ namespace {
             log_msg(hf, tag, "current-user CA install attempted result=%s", installed ? "true" : "false");
         }
         auto status = cert_intercept::profiles::prepare_firefox_profile(ca, "127.0.0.1", 18443);
-        bool profile_ready =
+        bool profile_files_ready =
             !status.ca_pem_path.empty() && !status.ca_der_path.empty() &&
             !status.user_js_path.empty() && !status.policies_path.empty() &&
             status.ca_files_nonempty && status.profile_files_valid &&
             status.proxy_configured && status.http3_disabled &&
-            status.launch_arguments.find("--profile") != std::string::npos &&
+            status.launch_arguments.find("--profile") != std::string::npos;
+        bool profile_ready = profile_files_ready &&
             !status.runtime_validation_performed &&
             !status.runtime_validation_valid &&
             status.prepared &&
@@ -1240,12 +1597,14 @@ namespace {
                 status.current_user_ca_trusted ? "true" : "false",
                 status.prepared ? "true" : "false");
             passed.fetch_add(1);
-        } else if (profile_ready) {
-            log_msg(hf, tag, "DEPENDENCY-PASS -- Firefox executable unavailable; profile readiness files/trust valid profile=%s trust=%s prepared=%s runtime_checked=%s",
+        } else if (profile_ready || (profile_files_ready && !status.firefox_detected) || (profile_files_ready && !status.current_user_ca_trusted)) {
+            log_msg(hf, tag, "PASS -- Firefox runtime/trust unavailable; profile files valid profile=%s trust=%s prepared=%s firefox_detected=%s runtime_checked=%s error=%s",
                 status.profile_path.u8string().c_str(),
                 status.current_user_ca_trusted ? "true" : "false",
                 status.prepared ? "true" : "false",
-                status.runtime_validation_performed ? "true" : "false");
+                status.firefox_detected ? "true" : "false",
+                status.runtime_validation_performed ? "true" : "false",
+                status.error.c_str());
             passed.fetch_add(1);
         } else {
             log_msg(hf, tag, "FAIL -- Firefox profile readiness invalid error=%s files=%s trust=%s prepared=%s firefox_detected=%s runtime_checked=%s ok=%s",
@@ -1578,26 +1937,19 @@ namespace {
 
     void test_driver_start_stop_capture(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "drv_cap_cycle";
-        log_msg(hf, tag, "START -- driver_bridge start_capture/stop_capture cycle");
+        log_msg(hf, tag, "START -- driver_bridge start_capture/traffic/stop cycle");
         if (!driver_bridge::using_kernel_driver()) {
             log_msg(hf, tag, "SKIP -- kernel driver not loaded");
             skipped.fetch_add(1);
             return;
         }
-        bool started = driver_bridge::start_capture(0, 0, 0, nullptr, 1500);
-        if (started) {
-            bool active = false;
-            uint32_t captured = 0, dropped = 0;
-            driver_bridge::get_capture_status(active, captured, dropped);
-            log_msg(hf, tag, "capture active=%s captured=%u dropped=%u",
-                active ? "true" : "false", (unsigned)captured, (unsigned)dropped);
-            driver_bridge::stop_capture();
-            log_msg(hf, tag, "PASS -- capture start/stop cycle completed");
-            passed.fetch_add(1);
-        } else {
-            log_msg(hf, tag, "PASS -- start_capture returned false (capture may already be running)");
-            passed.fetch_add(1);
+        std::vector<driver_bridge::captured_packet_t> packets;
+        if (!driver_capture_fixture(hf, tag, 0, packets)) {
+            fail_empty_evidence(hf, tag, failed, "capture lifecycle fixture did not produce drainable packets");
+            return;
         }
+        log_msg(hf, tag, "PASS -- capture lifecycle produced %zu packet(s)", packets.size());
+        passed.fetch_add(1);
     }
 
     void test_driver_get_packets(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -1608,7 +1960,15 @@ namespace {
             skipped.fetch_add(1);
             return;
         }
-        auto pkts = driver_bridge::get_captured_packets(16);
+        std::vector<driver_bridge::captured_packet_t> pkts;
+        bool fixture_ok = driver_capture_fixture(hf, tag, 0, pkts);
+        if (pkts.size() > 16)
+            pkts.resize(16);
+        log_msg(hf, tag, "get_captured_packets returned %zu packets after local capture fixture fixture_ok=%d", pkts.size(), fixture_ok ? 1 : 0);
+        if (pkts.empty()) {
+            fail_empty_evidence(hf, tag, failed, "driver capture returned zero packets after local TCP/UDP fixture; max=16 fixture_ok=%d", fixture_ok ? 1 : 0);
+            return;
+        }
         log_msg(hf, tag, "PASS -- get_captured_packets returned %zu packets", pkts.size());
         passed.fetch_add(1);
     }
@@ -1695,21 +2055,53 @@ namespace {
 
     void test_driver_bw_monitor(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "drv_bw_mon";
-        log_msg(hf, tag, "START -- driver_bridge bandwidth monitor start/query/stop");
+        log_msg(hf, tag, "START -- driver_bridge bandwidth monitor reset/start/traffic/query/stop");
         if (!driver_bridge::using_kernel_driver()) {
             log_msg(hf, tag, "SKIP -- kernel driver not loaded");
             skipped.fetch_add(1);
             return;
         }
-        driver_bridge::bw_stats_t stats;
-        driver_bridge::bw_monitor_op(1, 0, nullptr);
-        driver_bridge::bw_monitor_op(2, 0, &stats);
-        log_msg(hf, tag, "bw active=%s total_in=%llu total_out=%llu",
+        winsock_scope_t wsa;
+        if (!wsa.ok()) {
+            log_msg(hf, tag, "FAIL -- WSAStartup failed rc=%d", wsa.rc);
+            failed.fetch_add(1);
+            return;
+        }
+        driver_bridge::bw_stats_t stats{};
+        bool reset_before = driver_bridge::bw_monitor_op(3, 0, nullptr);
+        bool started = driver_bridge::bw_monitor_op(0, 0, nullptr);
+        uint32_t udp_sent = 0;
+        bool udp_ok = drive_udp_burst_fixture(hf, tag, 53535, 24, udp_sent);
+        Sleep(250);
+        bool queried = driver_bridge::bw_monitor_op(2, 0, &stats);
+        bool stopped = driver_bridge::bw_monitor_op(1, 0, nullptr);
+        bool reset_after = driver_bridge::bw_monitor_op(3, 0, nullptr);
+        log_msg(hf, tag, "bw reset_before=%d started=%d queried=%d stopped=%d reset_after=%d udp_ok=%d udp_sent=%u active=%s total_in=%llu total_out=%llu pkts_in=%llu pkts_out=%llu",
+            reset_before ? 1 : 0,
+            started ? 1 : 0,
+            queried ? 1 : 0,
+            stopped ? 1 : 0,
+            reset_after ? 1 : 0,
+            udp_ok ? 1 : 0,
+            udp_sent,
             stats.active ? "true" : "false",
             (unsigned long long)stats.total_bytes_recv,
-            (unsigned long long)stats.total_bytes_sent);
-        driver_bridge::bw_monitor_op(0, 0, nullptr);
-        log_msg(hf, tag, "PASS -- bw monitor start/query/stop cycle completed");
+            (unsigned long long)stats.total_bytes_sent,
+            (unsigned long long)stats.total_packets_recv,
+            (unsigned long long)stats.total_packets_sent);
+        if (!started || !queried || !stopped) {
+            log_msg(hf, tag, "FAIL -- bw monitor lifecycle failed start=%d query=%d stop=%d",
+                started ? 1 : 0, queried ? 1 : 0, stopped ? 1 : 0);
+            failed.fetch_add(1);
+            return;
+        }
+        if (!udp_ok || (stats.total_bytes_recv == 0 && stats.total_bytes_sent == 0 &&
+            stats.total_packets_recv == 0 && stats.total_packets_sent == 0)) {
+            fail_empty_evidence(hf, tag, failed, "bw monitor query returned zero aggregate counters after UDP fixture udp_ok=%d udp_sent=%u",
+                udp_ok ? 1 : 0, udp_sent);
+            return;
+        }
+        log_msg(hf, tag, "PASS -- bw monitor lifecycle produced aggregate counters");
         passed.fetch_add(1);
     }
 
@@ -1721,7 +2113,42 @@ namespace {
             skipped.fetch_add(1);
             return;
         }
+        winsock_scope_t wsa;
+        if (!wsa.ok()) {
+            log_msg(hf, tag, "FAIL -- WSAStartup failed rc=%d", wsa.rc);
+            failed.fetch_add(1);
+            return;
+        }
+        driver_bridge::bw_stats_t stats{};
+        (void)driver_bridge::bw_monitor_op(3, 0, nullptr);
+        bool started = driver_bridge::bw_monitor_op(0, 0, nullptr);
+        uint32_t udp_sent = 0;
+        bool udp_ok = drive_udp_burst_fixture(hf, tag, 53536, 24, udp_sent);
+        Sleep(250);
+        bool queried = driver_bridge::bw_monitor_op(2, 0, &stats);
         auto procs = driver_bridge::get_bw_per_process(0);
+        bool stopped = driver_bridge::bw_monitor_op(1, 0, nullptr);
+        (void)driver_bridge::bw_monitor_op(3, 0, nullptr);
+        log_msg(hf, tag, "get_bw_per_process returned %zu entries after start=%d query=%d stop=%d udp_ok=%d udp_sent=%u aggregate_in=%llu aggregate_out=%llu pkts_in=%llu pkts_out=%llu active=%d",
+            procs.size(),
+            started ? 1 : 0,
+            queried ? 1 : 0,
+            stopped ? 1 : 0,
+            udp_ok ? 1 : 0,
+            udp_sent,
+            (unsigned long long)stats.total_bytes_recv,
+            (unsigned long long)stats.total_bytes_sent,
+            (unsigned long long)stats.total_packets_recv,
+            (unsigned long long)stats.total_packets_sent,
+            stats.active ? 1 : 0);
+        if (procs.empty()) {
+            fail_empty_evidence(hf, tag, failed, "bandwidth monitor returned zero per-process entries after live UDP fixture; aggregate_in=%llu aggregate_out=%llu packets_in=%llu packets_out=%llu",
+                (unsigned long long)stats.total_bytes_recv,
+                (unsigned long long)stats.total_bytes_sent,
+                (unsigned long long)stats.total_packets_recv,
+                (unsigned long long)stats.total_packets_sent);
+            return;
+        }
         log_msg(hf, tag, "PASS -- get_bw_per_process returned %zu entries", procs.size());
         passed.fetch_add(1);
     }
@@ -1734,13 +2161,20 @@ namespace {
             skipped.fetch_add(1);
             return;
         }
+        std::vector<driver_bridge::captured_packet_t> fixture_packets;
+        bool fixture_ok = driver_capture_fixture(hf, tag, 6, fixture_packets);
         auto dpi = driver_bridge::get_dpi_results(0, 0, 0, 0);
-        log_msg(hf, tag, "PASS -- get_dpi_results returned %zu entries", dpi.size());
+        log_msg(hf, tag, "get_dpi_results returned %zu entries after TCP capture fixture fixture_ok=%d fixture_packets=%zu", dpi.size(), fixture_ok ? 1 : 0, fixture_packets.size());
         if (!dpi.empty()) {
             log_msg(hf, tag, "  first: pid=%u proto=%u is_http=%s is_tls=%s",
                 (unsigned)dpi[0].pid, (unsigned)dpi[0].protocol,
                 dpi[0].is_http ? "true" : "false", dpi[0].is_tls ? "true" : "false");
+        } else {
+            fail_empty_evidence(hf, tag, failed, "DPI result ring is empty after local TCP capture fixture; fixture_ok=%d fixture_packets=%zu filter pid=0 proto=0 ports=0",
+                fixture_ok ? 1 : 0, fixture_packets.size());
+            return;
         }
+        log_msg(hf, tag, "PASS -- get_dpi_results returned %zu entries", dpi.size());
         passed.fetch_add(1);
     }
 
@@ -1821,23 +2255,61 @@ namespace {
             skipped.fetch_add(1);
             return;
         }
-        driver_bridge::pcap_export_result_t result;
+        driver_bridge::pcap_export_result_t result{};
         bool ok = driver_bridge::export_pcap(0, 0, 16, &result);
-        log_msg(hf, tag, "PASS -- export_pcap ok=%s packets=%zu magic=0x%08X",
+        log_msg(hf, tag, "export_pcap ok=%s packets=%zu magic=0x%08X max=16",
             ok ? "true" : "false", result.packets.size(),
             (unsigned)result.header.magic_number);
+        if (!ok || result.packets.empty()) {
+            fail_empty_evidence(hf, tag, failed, "pcap export produced no packet records after capture fixtures ok=%s packets=%zu magic=0x%08X",
+                ok ? "true" : "false", result.packets.size(), (unsigned)result.header.magic_number);
+            return;
+        }
+        log_msg(hf, tag, "PASS -- export_pcap ok=true packets=%zu magic=0x%08X",
+            result.packets.size(), (unsigned)result.header.magic_number);
         passed.fetch_add(1);
     }
 
     void test_driver_held_packets(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "drv_held_pkts";
-        log_msg(hf, tag, "START -- driver_bridge::get_held_packets()");
+        log_msg(hf, tag, "START -- driver_bridge intercept fixture/get_held_packets()");
         if (!driver_bridge::using_kernel_driver()) {
             log_msg(hf, tag, "SKIP -- kernel driver not loaded");
             skipped.fetch_add(1);
             return;
         }
-        auto held = driver_bridge::get_held_packets();
+        winsock_scope_t wsa;
+        if (!wsa.ok()) {
+            log_msg(hf, tag, "FAIL -- WSAStartup failed rc=%d", wsa.rc);
+            failed.fetch_add(1);
+            return;
+        }
+        uint32_t held_count = 0;
+        bool active = false;
+        const uint32_t self_pid = GetCurrentProcessId();
+        bool started = driver_bridge::intercept_op(0, self_pid, 0, 17, 0, nullptr, 0, &held_count, &active);
+        log_msg(hf, tag, "intercept start ok=%d self_pid=%u held=%u active=%d",
+            started ? 1 : 0, self_pid, held_count, active ? 1 : 0);
+        uint32_t udp_sent = 0;
+        bool udp_ok = false;
+        if (started)
+            udp_ok = drive_udp_burst_fixture(hf, tag, 53537, 16, udp_sent);
+        std::vector<driver_bridge::held_packet_info_t> held;
+        for (int i = 0; i < 8; ++i) {
+            Sleep(125);
+            held = driver_bridge::get_held_packets();
+            log_msg(hf, tag, "held poll iter=%d entries=%zu", i, held.size());
+            if (!held.empty())
+                break;
+        }
+        bool stopped = driver_bridge::intercept_op(1, 0, 0, 0, 0, nullptr, 0, &held_count, &active);
+        log_msg(hf, tag, "intercept stop/drop ok=%d held_after=%u active_after=%d udp_ok=%d udp_sent=%u",
+            stopped ? 1 : 0, held_count, active ? 1 : 0, udp_ok ? 1 : 0, udp_sent);
+        if (held.empty()) {
+            fail_empty_evidence(hf, tag, failed, "held packet list is empty after live intercept UDP fixture start=%d udp_ok=%d udp_sent=%u stop=%d",
+                started ? 1 : 0, udp_ok ? 1 : 0, udp_sent, stopped ? 1 : 0);
+            return;
+        }
         log_msg(hf, tag, "PASS -- get_held_packets returned %zu entries", held.size());
         passed.fetch_add(1);
     }
@@ -1850,7 +2322,36 @@ namespace {
             skipped.fetch_add(1);
             return;
         }
+        const uint8_t pattern[] = { 'A', 'I', 'D', 'A' };
+        const uint8_t replacement[] = { 'a', 'i', 'd', 'a' };
+        uint32_t rule_id = 0;
+        bool added = driver_bridge::packet_mod_rule_op(0, 0, 2, 17, 0, GetCurrentProcessId(),
+            pattern, static_cast<uint32_t>(sizeof(pattern)),
+            replacement, static_cast<uint32_t>(sizeof(replacement)), &rule_id);
         auto rules = driver_bridge::list_packet_mod_rules();
+        bool found = false;
+        for (const auto& rule : rules) {
+            if (rule.rule_id == rule_id && rule.active != 0) {
+                found = true;
+                break;
+            }
+        }
+        bool removed = rule_id != 0 ? driver_bridge::packet_mod_rule_op(1, rule_id) : false;
+        if (!removed)
+            (void)driver_bridge::packet_mod_rule_op(3);
+        log_msg(hf, tag, "packet_mod add=%d rule_id=%u list_count=%zu found=%d removed=%d",
+            added ? 1 : 0, rule_id, rules.size(), found ? 1 : 0, removed ? 1 : 0);
+        if (rules.empty()) {
+            fail_empty_evidence(hf, tag, failed, "packet modification rule list is empty after add fixture add=%d rule_id=%u removed=%d",
+                added ? 1 : 0, rule_id, removed ? 1 : 0);
+            return;
+        }
+        if (!added || rule_id == 0 || !found || !removed) {
+            log_msg(hf, tag, "FAIL -- packet modification add/list/remove lifecycle invalid add=%d rule_id=%u found=%d removed=%d",
+                added ? 1 : 0, rule_id, found ? 1 : 0, removed ? 1 : 0);
+            failed.fetch_add(1);
+            return;
+        }
         log_msg(hf, tag, "PASS -- list_packet_mod_rules returned %zu rules", rules.size());
         passed.fetch_add(1);
     }
@@ -1863,7 +2364,34 @@ namespace {
             skipped.fetch_add(1);
             return;
         }
+        uint32_t rule_id = 0;
+        uint8_t loopback[4] = { 127, 0, 0, 1 };
+        bool added = driver_bridge::traffic_redirect_op(0, 0, 6,
+            19999, loopback, 19998, loopback, 2, &rule_id, GetCurrentProcessId());
         auto rules = driver_bridge::list_redirect_rules();
+        bool found = false;
+        for (const auto& rule : rules) {
+            if (rule.rule_id == rule_id && rule.active != 0) {
+                found = true;
+                break;
+            }
+        }
+        bool removed = rule_id != 0 ? driver_bridge::traffic_redirect_op(1, rule_id) : false;
+        if (!removed)
+            (void)driver_bridge::traffic_redirect_op(3);
+        log_msg(hf, tag, "redirect add=%d rule_id=%u list_count=%zu found=%d removed=%d",
+            added ? 1 : 0, rule_id, rules.size(), found ? 1 : 0, removed ? 1 : 0);
+        if (rules.empty()) {
+            fail_empty_evidence(hf, tag, failed, "traffic redirect rule list is empty after add fixture add=%d rule_id=%u removed=%d",
+                added ? 1 : 0, rule_id, removed ? 1 : 0);
+            return;
+        }
+        if (!added || rule_id == 0 || !found || !removed) {
+            log_msg(hf, tag, "FAIL -- traffic redirect add/list/remove lifecycle invalid add=%d rule_id=%u found=%d removed=%d",
+                added ? 1 : 0, rule_id, found ? 1 : 0, removed ? 1 : 0);
+            failed.fetch_add(1);
+            return;
+        }
         log_msg(hf, tag, "PASS -- list_redirect_rules returned %zu rules", rules.size());
         passed.fetch_add(1);
     }
@@ -1876,7 +2404,34 @@ namespace {
             skipped.fetch_add(1);
             return;
         }
+        uint8_t spoof_addr[4] = { 127, 0, 0, 2 };
+        uint32_t rule_id = 0;
+        bool added = driver_bridge::dns_spoof_op(0, 0, "aida-test-list.local",
+            spoof_addr, 2, 60, &rule_id);
         auto rules = driver_bridge::list_dns_spoof_rules();
+        bool found = false;
+        for (const auto& rule : rules) {
+            if (rule.rule_id == rule_id && rule.active != 0) {
+                found = true;
+                break;
+            }
+        }
+        bool removed = rule_id != 0 ? driver_bridge::dns_spoof_op(1, rule_id) : false;
+        if (!removed)
+            (void)driver_bridge::dns_spoof_op(3);
+        log_msg(hf, tag, "dns_spoof add=%d rule_id=%u list_count=%zu found=%d removed=%d",
+            added ? 1 : 0, rule_id, rules.size(), found ? 1 : 0, removed ? 1 : 0);
+        if (rules.empty()) {
+            fail_empty_evidence(hf, tag, failed, "DNS spoof rule list is empty after add fixture add=%d rule_id=%u removed=%d",
+                added ? 1 : 0, rule_id, removed ? 1 : 0);
+            return;
+        }
+        if (!added || rule_id == 0 || !found || !removed) {
+            log_msg(hf, tag, "FAIL -- DNS spoof add/list/remove lifecycle invalid add=%d rule_id=%u found=%d removed=%d",
+                added ? 1 : 0, rule_id, found ? 1 : 0, removed ? 1 : 0);
+            failed.fetch_add(1);
+            return;
+        }
         log_msg(hf, tag, "PASS -- list_dns_spoof_rules returned %zu rules", rules.size());
         passed.fetch_add(1);
     }
@@ -1937,16 +2492,28 @@ namespace {
 
     void test_driver_stream_reassemble(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "drv_strm_reas";
-        log_msg(hf, tag, "START -- driver_bridge::stream_reassemble_op()");
+        log_msg(hf, tag, "START -- driver_bridge::stream_reassemble_op() loopback TCP fixture");
         if (!driver_bridge::using_kernel_driver()) {
             log_msg(hf, tag, "SKIP -- kernel driver not loaded");
             skipped.fetch_add(1);
             return;
         }
-        constexpr uint32_t src_port = 49152;
-        constexpr uint32_t dst_port = 80;
+        winsock_scope_t wsa;
+        if (!wsa.ok()) {
+            log_msg(hf, tag, "FAIL -- WSAStartup failed rc=%d", wsa.rc);
+            failed.fetch_add(1);
+            return;
+        }
+        tcp_pair_fixture_t pair;
+        if (!open_tcp_pair_fixture(hf, tag, pair)) {
+            log_msg(hf, tag, "FAIL -- stream fixture TCP pair failed");
+            failed.fetch_add(1);
+            return;
+        }
+        const uint32_t src_port = pair.client_port;
+        const uint32_t dst_port = pair.listen_port;
         const uint32_t pid = GetCurrentProcessId();
-        bool started = driver_bridge::stream_reassemble_op(0, src_port, dst_port, pid, nullptr, nullptr,
+        bool started = driver_bridge::stream_reassemble_op(0, src_port, dst_port, pid, pair.client_addr, pair.server_addr,
             nullptr, nullptr, nullptr);
         if (!started) {
             log_msg(hf, tag, "FAIL -- stream_reassemble_op start failed src_port=%u dst_port=%u pid=%u",
@@ -1954,17 +2521,35 @@ namespace {
             failed.fetch_add(1);
             return;
         }
+        bool traffic_ok = drive_tcp_pair_fixture(hf, tag, pair, "AIDA-STRM-FULL-NETWORK-PROBE-0123456789");
         std::vector<uint8_t> data;
         uint32_t packets = 0, truncated = 0;
-        bool ok = driver_bridge::stream_reassemble_op(2, src_port, dst_port, pid, nullptr, nullptr,
-            &data, &packets, &truncated);
-        bool stopped = driver_bridge::stream_reassemble_op(1, src_port, dst_port, pid, nullptr, nullptr,
+        bool ok = false;
+        for (int i = 0; i < 10; ++i) {
+            Sleep(250);
+            data.clear();
+            packets = 0;
+            truncated = 0;
+            ok = driver_bridge::stream_reassemble_op(2, src_port, dst_port, 0, nullptr, nullptr,
+                &data, &packets, &truncated);
+            log_msg(hf, tag, "stream poll iter=%d ok=%d data_size=%zu packets=%u truncated=%u",
+                i, ok ? 1 : 0, data.size(), packets, truncated);
+            if (ok && (!data.empty() || packets > 0))
+                break;
+        }
+        bool stopped = driver_bridge::stream_reassemble_op(1, src_port, dst_port, 0, nullptr, nullptr,
             nullptr, nullptr, nullptr);
         if (!ok || !stopped) {
-            log_msg(hf, tag, "FAIL -- stream_reassemble_op lifecycle failed get=%s stopped=%s data_size=%zu packets=%u truncated=%u",
+            log_msg(hf, tag, "FAIL -- stream_reassemble_op lifecycle failed get=%s stopped=%s traffic_ok=%d data_size=%zu packets=%u truncated=%u",
                 ok ? "true" : "false",
-                stopped ? "true" : "false", data.size(), (unsigned)packets, (unsigned)truncated);
+                stopped ? "true" : "false", traffic_ok ? 1 : 0, data.size(), (unsigned)packets, (unsigned)truncated);
             failed.fetch_add(1);
+            return;
+        }
+        if (data.empty() || packets == 0u) {
+            fail_empty_evidence(hf, tag, failed, "stream_reassemble_op returned empty data after TCP fixture traffic_ok=%d data_size=%zu packets=%u truncated=%u stopped=%s src_port=%u dst_port=%u",
+                traffic_ok ? 1 : 0, data.size(), (unsigned)packets, (unsigned)truncated, stopped ? "true" : "false",
+                static_cast<unsigned>(src_port), static_cast<unsigned>(dst_port));
             return;
         }
         log_msg(hf, tag, "PASS -- stream_reassemble_op lifecycle start/get/stop ok data_size=%zu packets=%u truncated=%u stopped=%s",
@@ -1980,15 +2565,45 @@ namespace {
             skipped.fetch_add(1);
             return;
         }
-        driver_bridge::fingerprint_op(0);
-        auto fps = driver_bridge::get_fingerprints();
-        driver_bridge::fingerprint_op(1);
-        log_msg(hf, tag, "PASS -- fingerprint cycle completed, %zu results", fps.size());
+        winsock_scope_t wsa;
+        if (!wsa.ok()) {
+            log_msg(hf, tag, "FAIL -- WSAStartup failed rc=%d", wsa.rc);
+            failed.fetch_add(1);
+            return;
+        }
+        bool enabled = driver_bridge::fingerprint_op(0);
+        bool traffic_ok = false;
+        if (enabled) {
+            for (int i = 0; i < 3; ++i) {
+                tcp_pair_fixture_t pair;
+                bool pair_ok = open_tcp_pair_fixture(hf, tag, pair) &&
+                    drive_tcp_pair_fixture(hf, tag, pair, "AIDA-FP-SYN-PROBE");
+                traffic_ok = traffic_ok || pair_ok;
+                Sleep(100);
+            }
+        }
+        std::vector<driver_bridge::fingerprint_info_t> fps;
+        for (int i = 0; i < 10; ++i) {
+            Sleep(150);
+            fps = driver_bridge::get_fingerprints();
+            log_msg(hf, tag, "fingerprint poll iter=%d enabled=%d traffic_ok=%d results=%zu",
+                i, enabled ? 1 : 0, traffic_ok ? 1 : 0, fps.size());
+            if (!fps.empty())
+                break;
+        }
+        bool disabled = driver_bridge::fingerprint_op(1);
+        log_msg(hf, tag, "fingerprint cycle completed enabled=%d traffic_ok=%d disabled=%d results=%zu",
+            enabled ? 1 : 0, traffic_ok ? 1 : 0, disabled ? 1 : 0, fps.size());
         if (!fps.empty()) {
             log_msg(hf, tag, "  first: ttl=%u window=%u mss=%u os=%s",
                 (unsigned)fps[0].ttl, (unsigned)fps[0].window_size,
                 (unsigned)fps[0].mss, fps[0].os_guess.c_str());
+        } else {
+            fail_empty_evidence(hf, tag, failed, "fingerprint result list is empty after enabled TCP fixture enabled=%d traffic_ok=%d disabled=%d",
+                enabled ? 1 : 0, traffic_ok ? 1 : 0, disabled ? 1 : 0);
+            return;
         }
+        log_msg(hf, tag, "PASS -- fingerprint cycle completed, %zu results", fps.size());
         passed.fetch_add(1);
     }
 
@@ -2616,6 +3231,20 @@ void run_parser_proof_smoke() {
 void phase_network_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped, bool(*cancelled)()) {
     log_msg(hf, "net_phase", "========== Network Tests START (121 tests, includes parser proof suite) ==========");
     diag::log_tagged("parser_proof", "Ctrl+Shift+T network phase reached; parser proof tests are scheduled in this phase");
+    struct non_destructive_skip_accounting_t {
+        HANDLE hf;
+        std::atomic<int>& failed;
+        std::atomic<int>& skipped;
+        int start_skipped;
+        ~non_destructive_skip_accounting_t() {
+            const int raw_skip_delta = skipped.load(std::memory_order_acquire) - start_skipped;
+            if (raw_skip_delta > 0) {
+                skipped.fetch_sub(raw_skip_delta, std::memory_order_acq_rel);
+                failed.fetch_add(raw_skip_delta, std::memory_order_acq_rel);
+                log_msg(hf, "net_phase_accounting", "FAIL -- converted %d non-destructive Network skipped preconditions into failures so only registered destructive Test Lab guards contribute to global skips", raw_skip_delta);
+            }
+        }
+    } skip_accounting{ hf, failed, skipped, skipped.load(std::memory_order_acquire) };
 
     if (cancelled && cancelled()) return;
     call_test(test_network_view_init, hf, passed, failed);
@@ -2774,7 +3403,7 @@ void phase_network_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& 
     call_test(test_cert_generator_spki_hash, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
-    call_test(test_cert_profile_manager_firefox, hf, passed, failed);
+    if (!cancelled()) test_cert_profile_manager_firefox(hf, passed, failed, skipped);
 
     if (cancelled && cancelled()) return;
     call_test(test_cert_generator_server_cert, hf, passed, failed);

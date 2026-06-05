@@ -9,7 +9,6 @@ class license_manager_t
 public:
     static license_manager_t& instance();
     bool validate();
-    bool accept_manual_map_proof();
     bool is_valid() const;
     void invalidate_runtime();
     bool show_activation_dialog();

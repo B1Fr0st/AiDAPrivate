@@ -405,6 +405,9 @@ inline bool check_thread_hidden()
 
 inline bool check_branch_miss_flat()
 {
+    if (!driver_bridge::dynamic_ioctls_ready())
+        return false;
+
     driver_bridge::anti_debug_result_t kernel{};
     if (!driver_bridge::kernel_anti_debug_query(kernel))
         return false;

@@ -34,6 +34,11 @@ namespace {
 using tool_result_t = mcp_standalone::tool_result_t;
 using json = nlohmann::json;
 
+tool_result_t error_with_data(const std::string& text, json data)
+{
+    return tool_result_t{false, text, std::move(data)};
+}
+
 struct url_log_t
 {
     std::string host;
@@ -272,7 +277,12 @@ tool_result_t tool_api_send(const json& params)
     if (!audit_http::parse_url(tpl->base_url, scheme, host, port, path))
     {
         diag::log_tagged_fmt("mcp_burp", "api_send url_parse_failed url=%s", tpl->base_url.c_str());
-        return tool_result_t::error("base_url parse failed");
+        json err;
+        err["error"] = "base_url parse failed";
+        err["collection_id"] = cid;
+        err["request_id"] = rid;
+        err["base_url"] = tpl->base_url;
+        return error_with_data("base_url parse failed", err);
     }
     bool tls = (scheme == "https");
     diag::log_tagged_fmt("mcp_burp", "api_send sending host=%s port=%d tls=%d", host.c_str(), (int)port, (int)tls);
@@ -285,7 +295,18 @@ tool_result_t tool_api_send(const json& params)
     {
         std::string err = audit_http::last_error();
         diag::log_tagged_fmt("mcp_burp", "api_send send_failed err=%s", err.c_str());
-        return tool_result_t::error(err);
+        json data;
+        data["error"] = err;
+        data["collection_id"] = cid;
+        data["request_id"] = rid;
+        data["scheme"] = scheme;
+        data["host"] = host;
+        data["port"] = port;
+        data["path"] = path;
+        data["tls"] = tls;
+        data["base_url"] = tpl->base_url;
+        data["status"] = "transport_failed";
+        return error_with_data(err, data);
     }
 
     burp::logger::record(burp::logger::source_t::api, *ex);
@@ -326,6 +347,14 @@ tool_result_t tool_api_audit(const json& params)
     out["requests_failed"] = res.requests_failed;
     out["issues_raised"]   = res.issues_raised;
     out["status"]          = res.status;
+    if (res.requests_sent == 0)
+    {
+        out["ok"] = false;
+        out["error"] = "api_audit_sent_no_requests";
+        diag::log_tagged_fmt("mcp_burp", "api_audit no_requests_sent audit_id=%llu requests_failed=%zu status=%s",
+            static_cast<unsigned long long>(res.audit_id), res.requests_failed, res.status.c_str());
+        return error_with_data("api audit sent no requests", out);
+    }
     return tool_result_t::ok(out.dump(2), out);
 }
 
@@ -348,7 +377,13 @@ tool_result_t tool_gql_introspect(const json& params)
     {
         std::string err = graphql::last_error();
         diag::log_tagged_fmt("mcp_burp", "gql_introspect failed err=%s", err.c_str());
-        return tool_result_t::error(err);
+        json data;
+        data["error"] = err;
+        data["endpoint"] = ep;
+        data["host"] = endpoint_log.host;
+        data["path"] = endpoint_log.path;
+        data["status"] = "transport_or_parse_failed";
+        return error_with_data(err, data);
     }
     diag::log_tagged_fmt("mcp_burp", "gql_introspect ok host=%s path=%s raw_len=%zu types=%zu",
         endpoint_log.host.c_str(), endpoint_log.path.c_str(), raw.size(), sch.types.size());
@@ -379,7 +414,14 @@ tool_result_t tool_gql_example(const json& params)
         {
             std::string err = graphql::last_error();
             diag::log_tagged_fmt("mcp_burp", "gql_example introspect_failed err=%s", err.c_str());
-            return tool_result_t::error(err);
+            json data;
+            data["error"] = err;
+            data["endpoint"] = ep;
+            data["host"] = endpoint_log.host;
+            data["path"] = endpoint_log.path;
+            data["field_name"] = field;
+            data["status"] = "introspection_failed";
+            return error_with_data(err, data);
         }
     }
     std::string q = graphql::build_example_query(sch, field, depth);
@@ -416,7 +458,14 @@ tool_result_t tool_gql_send(const json& params)
     {
         std::string err = graphql::last_error();
         diag::log_tagged_fmt("mcp_burp", "gql_send failed err=%s", err.c_str());
-        return tool_result_t::error(err);
+        json data;
+        data["error"] = err;
+        data["endpoint"] = ep;
+        data["host"] = endpoint_log.host;
+        data["path"] = endpoint_log.path;
+        data["query_length"] = q.size();
+        data["status"] = "send_failed";
+        return error_with_data(err, data);
     }
     diag::log_tagged_fmt("mcp_burp", "gql_send ok host=%s path=%s raw_len=%zu response_type=%s",
         endpoint_log.host.c_str(), endpoint_log.path.c_str(), raw.size(), resp.type_name());
@@ -445,7 +494,14 @@ tool_result_t tool_ws_connect(const json& params)
     {
         std::string err = ws_editor::last_error();
         diag::log_tagged_fmt("mcp_burp", "ws_connect failed err=%s", err.c_str());
-        return tool_result_t::error(err);
+        json data;
+        data["error"] = err;
+        data["scheme"] = cfg.scheme;
+        data["host"] = cfg.host;
+        data["port"] = cfg.port;
+        data["path"] = cfg.path;
+        data["status"] = "connect_failed";
+        return error_with_data(err, data);
     }
     diag::log_tagged_fmt("mcp_burp", "ws_connect ok conn_id=%llu", static_cast<unsigned long long>(id));
     json out;

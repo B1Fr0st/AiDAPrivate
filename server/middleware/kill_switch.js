@@ -2,6 +2,7 @@
 
 const crypto = require('crypto');
 const pool = require('../db/pool');
+const keyFormat = require('../crypto/key_format');
 
 const CACHE_TTL_MS = parseInt(process.env.KILL_SWITCH_CACHE_TTL_MS || '5000', 10) || 5000;
 const HMAC_INFO = 'aida/kill-switch/v1';
@@ -37,10 +38,32 @@ function getHmacKey() {
 }
 
 function hashLicenseKey(licenseKey) {
-    if (!licenseKey) return '';
+    const normalized = normalizeLicenseKey(licenseKey) || String(licenseKey || '').trim();
+    if (!normalized) return '';
     return crypto.createHmac('sha256', getHmacKey())
-        .update(String(licenseKey), 'utf8')
+        .update(normalized, 'utf8')
         .digest('hex');
+}
+
+function normalizeLicenseKey(licenseKey) {
+    try {
+        return keyFormat.normalizeForLookup(String(licenseKey || '').trim());
+    } catch (_) {
+        return '';
+    }
+}
+
+function licenseKeyCandidates(licenseKey) {
+    const raw = String(licenseKey || '').trim();
+    const normalized = normalizeLicenseKey(raw);
+    const lower = raw.toLowerCase();
+    const out = new Set();
+    if (raw) out.add(raw);
+    if (lower) out.add(lower);
+    if (normalized) out.add(normalized);
+    const h = hashLicenseKey(normalized || raw);
+    if (h) out.add(h);
+    return out;
 }
 
 function hashHwid(hwid) {
@@ -76,7 +99,9 @@ async function reloadCache() {
                 const v = String(r.target_value || '');
                 if (t === 'global') { global = true; continue; }
                 if (!v) continue;
-                if (t === 'license_key') newKeys.add(v);
+                if (t === 'license_key') {
+                    for (const c of licenseKeyCandidates(v)) newKeys.add(c);
+                }
                 else if (t === 'hwid_hash') newHwids.add(v);
                 else if (t === 'session_id') newSessions.add(v);
                 else if (t === 'plugin_version') newVersions.add(v.toLowerCase());
@@ -153,8 +178,12 @@ async function isDropped(req) {
         return { dropped: true, reason: 'global' };
     }
     const lk = bodyLicenseKey(req);
-    if (lk && s_cache_keys.has(lk)) {
-        return { dropped: true, reason: 'license_key' };
+    if (lk) {
+        for (const c of licenseKeyCandidates(lk)) {
+            if (s_cache_keys.has(c)) {
+                return { dropped: true, reason: 'license_key' };
+            }
+        }
     }
     const hw = bodyHwid(req);
     if (hw) {
@@ -173,6 +202,19 @@ async function isDropped(req) {
     const pv = bodyPluginVersion(req);
     if (pv && s_cache_versions.has(pv.toLowerCase())) {
         return { dropped: true, reason: 'plugin_version' };
+    }
+    return { dropped: false };
+}
+
+async function isLicenseKeyDropped(licenseKey) {
+    await ensureFresh();
+    if (s_cache_global) {
+        return { dropped: true, reason: 'global' };
+    }
+    for (const c of licenseKeyCandidates(licenseKey)) {
+        if (s_cache_keys.has(c)) {
+            return { dropped: true, reason: 'license_key' };
+        }
     }
     return { dropped: false };
 }
@@ -214,12 +256,17 @@ async function addKill(targetType, targetValue, reason, createdBy, expiresAt) {
     if (!validTypes.includes(targetType)) {
         return { ok: false, reason: 'invalid_target_type' };
     }
+    let storedTarget = targetValue || null;
+    if (targetType === 'license_key') {
+        storedTarget = normalizeLicenseKey(targetValue);
+        if (!storedTarget) return { ok: false, reason: 'invalid_target_value' };
+    }
     try {
         const expiresParam = expiresAt ? new Date(expiresAt * 1000).toISOString() : null;
         await pool.query(
             `INSERT INTO kill_switch (target_type, target_value, reason, created_by, expires_at)
              VALUES ($1, $2, $3, $4, $5::TIMESTAMPTZ)`,
-            [targetType, targetValue || null, String(reason || ''), String(createdBy || ''), expiresParam]
+            [targetType, storedTarget, String(reason || ''), String(createdBy || ''), expiresParam]
         );
         s_cache_loaded_at = 0;
         return { ok: true };
@@ -230,11 +277,13 @@ async function addKill(targetType, targetValue, reason, createdBy, expiresAt) {
 
 async function removeKill(targetType, targetValue) {
     try {
+        const normalizedTarget = targetType === 'license_key' ? normalizeLicenseKey(targetValue) : (targetValue || null);
         const { rowCount } = await pool.query(
             `DELETE FROM kill_switch
               WHERE target_type = $1
-                AND COALESCE(target_value, '') = COALESCE($2, '')`,
-            [targetType, targetValue || null]
+                AND (COALESCE(target_value, '') = COALESCE($2, '')
+                     OR COALESCE(target_value, '') = COALESCE($3, ''))`,
+            [targetType, targetValue || null, normalizedTarget || null]
         );
         s_cache_loaded_at = 0;
         return { ok: true, removed: rowCount || 0 };
@@ -264,11 +313,13 @@ function invalidateCache() {
 module.exports = {
     middleware,
     isDropped,
+    isLicenseKeyDropped,
     addKill,
     removeKill,
     listActive,
     invalidateCache,
     hashLicenseKey,
+    normalizeLicenseKey,
     hashHwid,
     hashSessionId,
 };

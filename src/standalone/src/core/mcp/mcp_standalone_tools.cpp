@@ -9,7 +9,7 @@
 #include "guest_lab_bridge.hpp"
 #include "standalone_settings.hpp"
 #include "zydis_disasm.hpp"
-#include "source_reconstructor.hpp"
+#include "../analysis/stealth_engine.hpp"
 #include "../../helpers/diag_log.hpp"
 
 #include <httplib.h>
@@ -92,6 +92,13 @@ namespace
         return text;
     }
 
+    bool is_loopback_host(const std::string& host)
+    {
+        const std::string h = to_lower(host);
+        if (h == "localhost" || h == "::1" || h == "[::1]") return true;
+        return h.rfind("127.", 0) == 0;
+    }
+
     std::string wide_to_utf8_lossy(const std::wstring& text)
     {
         if (text.empty())
@@ -165,6 +172,40 @@ namespace
             return false;
         const std::string target = requested_target(params);
         return target != "host";
+    }
+
+    uint32_t json_u32_param(const json& params, const char* key, uint32_t fallback, uint32_t cap)
+    {
+        if (!params.is_object() || !params.contains(key))
+            return fallback;
+        const auto& value = params[key];
+        uint64_t raw = 0;
+        bool have_value = false;
+        if (value.is_number_unsigned()) {
+            raw = value.get<uint64_t>();
+            have_value = true;
+        } else if (value.is_number_integer()) {
+            const int64_t signed_raw = value.get<int64_t>();
+            if (signed_raw >= 0) {
+                raw = static_cast<uint64_t>(signed_raw);
+                have_value = true;
+            }
+        }
+        if (!have_value)
+            return fallback;
+        if (raw > cap)
+            raw = cap;
+        return static_cast<uint32_t>(raw);
+    }
+
+    bool json_bool_param(const json& params, const char* key, bool fallback)
+    {
+        if (!params.is_object() || !params.contains(key))
+            return fallback;
+        const auto& value = params[key];
+        if (value.is_boolean())
+            return value.get<bool>();
+        return fallback;
     }
 
     uint32_t guest_timeout_ms(const json& params)
@@ -421,8 +462,15 @@ namespace
             uint32_t pid = params["pid"].get<uint32_t>();
             if (pid == static_cast<uint32_t>(GetCurrentProcessId()))
                 return error("Cannot attach to AiDA's own process.");
-            if (driver_bridge::attach(pid))
+            const uint32_t previous_pid = driver_bridge::attached_pid();
+            if (previous_pid != 0 && previous_pid != pid)
+                stealth_engine::disable_for_detach(previous_pid, "mcp.driver_attach.pid.replace");
+            if (driver_bridge::attach(pid)) {
+                (void)stealth_engine::ensure_default_enabled(pid, "mcp.driver_attach.pid");
                 return handle_driver_status({});
+            }
+            if (previous_pid != 0 && driver_bridge::attached_pid() == previous_pid)
+                (void)stealth_engine::ensure_default_enabled(previous_pid, "mcp.driver_attach.pid.restore_failed_switch");
             return error(driver_bridge::last_error());
         }
         if (params.contains("process") && params["process"].is_string()) {
@@ -432,8 +480,15 @@ namespace
                 || lower.find("aida_stan") != std::string::npos
                 || lower == "aida.exe")
                 return error("Cannot attach to AiDA's own process.");
-            if (driver_bridge::attach_by_name(name))
+            const uint32_t previous_pid = driver_bridge::attached_pid();
+            if (previous_pid != 0)
+                stealth_engine::disable_for_detach(previous_pid, "mcp.driver_attach.name.replace");
+            if (driver_bridge::attach_by_name(name)) {
+                (void)stealth_engine::ensure_default_enabled(driver_bridge::attached_pid(), "mcp.driver_attach.name");
                 return handle_driver_status({});
+            }
+            if (previous_pid != 0 && driver_bridge::attached_pid() == previous_pid)
+                (void)stealth_engine::ensure_default_enabled(previous_pid, "mcp.driver_attach.name.restore_failed_switch");
             return error(driver_bridge::last_error());
         }
         return error("Provide either a numeric pid or a process name.");
@@ -444,6 +499,7 @@ namespace
         diag::log_tagged_fmt("mcp_tools", "handle_driver_detach entry");
         if (wants_guest_target(params))
             return handle_guest_lab_detach(params);
+        stealth_engine::disable_for_detach(driver_bridge::attached_pid(), "mcp.driver_detach");
         driver_bridge::detach();
         return tool_result_t::ok("Detached from the live process.");
     }
@@ -738,11 +794,11 @@ namespace
             const auto work_dir = params["working_dir"].get<std::string>();
             cfg.working_dir = std::wstring(work_dir.begin(), work_dir.end());
         }
-        cfg.timeout_ms = static_cast<uint32_t>(params.value("timeout_ms", g_sa_settings.sandbox.timeout_ms));
+        cfg.timeout_ms = json_u32_param(params, "timeout_ms", g_sa_settings.sandbox.timeout_ms, 300000u);
         cfg.max_memory = static_cast<uint64_t>(g_sa_settings.sandbox.memory_limit_mb) * 1024ULL * 1024ULL;
         cfg.max_memory_mb = static_cast<uint32_t>(g_sa_settings.sandbox.memory_limit_mb);
-        cfg.capture_stdout = params.value("capture_stdout", true);
-        cfg.capture_stderr = params.value("capture_stderr", true);
+        cfg.capture_stdout = json_bool_param(params, "capture_stdout", true);
+        cfg.capture_stderr = json_bool_param(params, "capture_stderr", true);
         cfg.allow_network = g_sa_settings.sandbox.network_mode == "default";
         cfg.cancel_token = mcp_standalone::current_cancel_token();
 
@@ -1512,6 +1568,7 @@ namespace
 
         const std::string query = params["query"].get<std::string>();
         const int max_results = params.value("max_results", 5);
+        const int timeout_seconds = std::clamp(params.value("timeout", 4), 1, 15);
 
 
         std::string encoded_query;
@@ -1532,8 +1589,8 @@ namespace
         std::string transport_error;
         try {
             httplib::SSLClient client("api.duckduckgo.com");
-            client.set_connection_timeout(10);
-            client.set_read_timeout(15);
+            client.set_connection_timeout(timeout_seconds);
+            client.set_read_timeout(timeout_seconds);
             client.set_follow_location(true);
             client.set_default_headers({
                 {"Accept", "application/json"},
@@ -1584,8 +1641,8 @@ namespace
         if (results.empty()) {
             try {
                 httplib::SSLClient wiki("en.wikipedia.org");
-                wiki.set_connection_timeout(10);
-                wiki.set_read_timeout(15);
+                wiki.set_connection_timeout(timeout_seconds);
+                wiki.set_read_timeout(timeout_seconds);
                 wiki.set_follow_location(true);
                 wiki.set_default_headers({
                     {"Accept", "application/json"},
@@ -2024,11 +2081,27 @@ namespace
             { "Accept-Language", "en-US,en;q=0.9" }
         };
 
-        auto res = cli.Get(path, headers);
+        httplib::Result res;
+        const bool loopback = is_loopback_host(host);
+        const int max_attempts = loopback ? 12 : 1;
+        httplib::Error last_error = httplib::Error::Success;
+        for (int attempt = 1; attempt <= max_attempts; ++attempt) {
+            res = cli.Get(path, headers);
+            if (res) {
+                diag::log_tagged_fmt("mcp_tools", "handle_webfetch request_ok host=%s port=%d path=%s attempt=%d loopback=%d status=%d",
+                    host.c_str(), port, path.c_str(), attempt, loopback ? 1 : 0, res->status);
+                break;
+            }
+            last_error = res.error();
+            diag::log_tagged_fmt("mcp_tools", "handle_webfetch request_failed host=%s port=%d path=%s attempt=%d/%d loopback=%d error=%s",
+                host.c_str(), port, path.c_str(), attempt, max_attempts, loopback ? 1 : 0, httplib::to_string(last_error).c_str());
+            if (!loopback || attempt == max_attempts || mcp_standalone::current_call_cancelled()) break;
+            Sleep(static_cast<DWORD>(std::min(100, 10 * attempt)));
+        }
         if (mcp_standalone::current_call_cancelled())
             return error("webfetch cancelled by client request.");
         if (!res)
-            return error("HTTP request failed: " + httplib::to_string(res.error()) + " for " + url);
+            return error("HTTP request failed: " + httplib::to_string(last_error) + " for " + url);
         if (res->status < 200 || res->status >= 300)
             return error("HTTP status " + std::to_string(res->status) + " for " + url);
 
@@ -2084,92 +2157,6 @@ namespace
         return tool_result_t::ok(text, data);
     }
 
-    tool_result_t handle_reconstruct_source(const json& params)
-    {
-        diag::log_tagged_fmt("mcp_tools", "handle_reconstruct_source entry");
-        if (source_reconstructor::is_running())
-            return error("Source reconstruction is already running.");
-
-        if (!driver_bridge::is_loaded())
-            return error("Kernel driver not loaded. Call driver_load first.");
-
-        source_reconstructor::reconstruction_config_t config;
-        config.project_name = params.value("project_name", "reconstructed");
-        config.output_dir = params.value("output_dir", "");
-        config.module_name = params.value("module_name", "");
-        config.include_imports = params.value("include_imports", true);
-        config.include_exports = params.value("include_exports", true);
-        config.generate_cmake = params.value("generate_cmake", true);
-        config.use_ai_refinement = params.value("use_ai", true);
-        config.max_functions = params.value("max_functions", 0);
-
-        if (config.output_dir.empty())
-            return error("Missing required parameter: output_dir");
-
-
-        if (!config.module_name.empty()) {
-            for (auto& mod : driver_bridge::enumerate_modules()) {
-                if (to_lower(mod.name) == to_lower(config.module_name)) {
-                    config.module_base = mod.base;
-                    config.module_size = mod.size;
-                    break;
-                }
-            }
-            if (config.module_base == 0)
-                return error("Module not found: " + config.module_name);
-        } else {
-
-            auto base_opt = parse_addr_opt(params, "module_base");
-            if (!base_opt.has_value())
-                return error("Provide either module_name or module_base.");
-            config.module_base = base_opt.value();
-            config.module_size = params.value("module_size", 0u);
-            if (config.module_size == 0)
-                return error("module_size is required when using module_base.");
-        }
-
-        source_reconstructor::reconstruct(config);
-
-        return tool_result_t::ok("Source reconstruction started for " +
-            config.module_name + " → " + config.output_dir,
-            json{{"status", "started"}, {"module_base", hex_addr(config.module_base)},
-                 {"module_size", config.module_size}, {"output_dir", config.output_dir}});
-    }
-
-    tool_result_t handle_reconstruct_status(const json&)
-    {
-        diag::log_tagged_fmt("mcp_tools", "handle_reconstruct_status entry");
-        json result;
-        result["running"] = source_reconstructor::is_running();
-        result["progress"] = source_reconstructor::get_progress();
-        result["status"] = source_reconstructor::get_status();
-
-        if (!source_reconstructor::is_running()) {
-            auto& last = source_reconstructor::get_last_result();
-            bool has_last_run = !last.output_dir.empty() || last.total_functions != 0 ||
-                last.decompiled_functions != 0 || last.modules_created != 0 ||
-                !last.files_created.empty() || !last.error.empty();
-            result["has_last_run"] = has_last_run;
-            result["last_success"] = has_last_run ? last.success : false;
-            result["last_error"] = last.error;
-            result["total_functions"] = last.total_functions;
-            result["decompiled_functions"] = last.decompiled_functions;
-            result["modules_created"] = last.modules_created;
-            result["files_created"] = static_cast<int>(last.files_created.size());
-            result["output_dir"] = last.output_dir;
-        }
-
-        return tool_result_t::ok(result);
-    }
-
-    tool_result_t handle_reconstruct_cancel(const json&)
-    {
-        diag::log_tagged_fmt("mcp_tools", "handle_reconstruct_cancel entry");
-        if (!source_reconstructor::is_running())
-            return tool_result_t::ok("No reconstruction is running.", json{{"running", false}, {"cancelled", false}});
-        source_reconstructor::cancel();
-        return tool_result_t::ok("Reconstruction cancellation requested.", json{{"running", true}, {"cancelled", true}});
-    }
 }
 
 namespace mcp_standalone
@@ -2281,7 +2268,7 @@ namespace mcp_standalone
             {{"root", "string", "Root directory", true}, {"pattern", "string", "Regex pattern", true}, {"limit", "number", "Maximum matches", false}},
             true, handle_grep_in_files, mcp_standalone::tool_visibility_t::internal_only});
         srv.register_tool({"web_search", "Search the web using DuckDuckGo Instant Answer API.",
-            {{"query", "string", "Search query text", true}, {"max_results", "number", "Maximum results to return (default 5)", false}},
+            {{"query", "string", "Search query text", true}, {"max_results", "number", "Maximum results to return (default 5)", false}, {"timeout", "number", "Per-upstream timeout in seconds (1-15, default 4)", false}},
             true, handle_web_search, mcp_standalone::tool_visibility_t::internal_only});
         srv.register_tool({"webfetch",
             "Fetch the contents of a URL via HTTPS and return them as markdown, plain text, or raw HTML. "
@@ -2306,27 +2293,6 @@ namespace mcp_standalone
         decompile_tools::register_decompile_tools(srv);
         session_tools_ext::register_tools(srv);
 
-
-        srv.register_tool({"reconstruct_source",
-            "Reconstruct a compilable C project from a loaded module. "
-            "Discovers functions, decompiles them, groups into modules, and generates headers, source files, and CMakeLists.txt.",
-            {{"output_dir", "string", "Directory to write the reconstructed project", true},
-             {"module_name", "string", "Name of the module to reconstruct (e.g., 'game.exe')", false},
-             {"module_base", "string", "Base address of the module (hex). Use if module_name is not provided.", false},
-             {"module_size", "number", "Size of the module in bytes. Required with module_base.", false},
-             {"project_name", "string", "Name for the reconstructed project (default: 'reconstructed')", false},
-             {"include_imports", "boolean", "Include import declarations (default: true)", false},
-             {"include_exports", "boolean", "Include export declarations (default: true)", false},
-             {"generate_cmake", "boolean", "Generate CMakeLists.txt (default: true)", false},
-             {"use_ai", "boolean", "Use AI refinement during decompilation (default: true)", false},
-             {"max_functions", "number", "Maximum functions to decompile (0 = all, default: 0)", false}},
-            false, handle_reconstruct_source});
-        srv.register_tool({"reconstruct_status",
-            "Check the progress and results of an in-flight source reconstruction.",
-            {}, true, handle_reconstruct_status});
-        srv.register_tool({"reconstruct_cancel",
-            "Cancel a running source reconstruction.",
-            {}, false, handle_reconstruct_cancel});
         diag::log_tagged_fmt("mcp_tools", "register_standalone_tools done");
     }
 }
