@@ -1,7 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
-#include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>
 #include <bcrypt.h>
 
 #include "collaborator.hpp"
@@ -14,9 +14,11 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <memory>
+#include <sstream>
 #include <unordered_map>
 
 #pragma comment(lib, "ws2_32.lib")
@@ -56,6 +58,7 @@ struct state_t
     std::unordered_map<std::string, token_info_t>           tokens;
 
     std::shared_ptr<httplib::Server>                        http_server;
+    SOCKET                                                  http_socket = INVALID_SOCKET;
     aida::infra::win_thread::joinable_thread_t              http_thread;
     std::atomic<bool>                                       http_thread_alive{false};
 
@@ -83,58 +86,6 @@ static uint64_t now_ms()
 {
     using namespace std::chrono;
     return static_cast<uint64_t>(duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count());
-}
-
-static bool probe_tcp_listener(const std::string& bind_ip, uint16_t port, DWORD timeout_ms)
-{
-    addrinfo hints{};
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_protocol = IPPROTO_TCP;
-
-    addrinfo* addrs = nullptr;
-    std::string host = bind_ip.empty() ? std::string("127.0.0.1") : bind_ip;
-    if (host == "0.0.0.0")
-        host = "127.0.0.1";
-    else if (host == "::")
-        host = "::1";
-    const std::string port_s = std::to_string(static_cast<unsigned>(port));
-    if (getaddrinfo(host.c_str(), port_s.c_str(), &hints, &addrs) != 0)
-        return false;
-
-    bool ok = false;
-    for (addrinfo* ai = addrs; ai && !ok; ai = ai->ai_next) {
-        SOCKET s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (s == INVALID_SOCKET)
-            continue;
-
-        u_long nb = 1;
-        ioctlsocket(s, FIONBIO, &nb);
-        const int rc = connect(s, ai->ai_addr, static_cast<int>(ai->ai_addrlen));
-        if (rc == 0) {
-            ok = true;
-        } else {
-            const int err = WSAGetLastError();
-            if (err == WSAEWOULDBLOCK || err == WSAEINPROGRESS || err == WSAEINVAL) {
-                fd_set wfds;
-                FD_ZERO(&wfds);
-                FD_SET(s, &wfds);
-                timeval tv{};
-                tv.tv_sec = static_cast<long>(timeout_ms / 1000);
-                tv.tv_usec = static_cast<long>((timeout_ms % 1000) * 1000);
-                if (select(0, nullptr, &wfds, nullptr, &tv) > 0) {
-                    int so_error = 0;
-                    int opt_len = sizeof(so_error);
-                    if (getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&so_error), &opt_len) == 0 && so_error == 0)
-                        ok = true;
-                }
-            }
-        }
-        closesocket(s);
-    }
-
-    freeaddrinfo(addrs);
-    return ok;
 }
 
 static std::string lower_ascii(const std::string& s)
@@ -339,8 +290,181 @@ static void on_http_request(const httplib::Request& req, httplib::Response& res)
     res.set_header("Server", "AiDA-Collaborator/1.0");
 }
 
+static bool parse_http_content_length(const std::string& headers, size_t& content_length)
+{
+    content_length = 0;
+    size_t pos = 0;
+    while (pos < headers.size()) {
+        size_t eol = headers.find("\r\n", pos);
+        if (eol == std::string::npos)
+            eol = headers.size();
+        std::string line = headers.substr(pos, eol - pos);
+        size_t colon = line.find(':');
+        if (colon != std::string::npos) {
+            std::string key = lower_ascii(trim_ascii(line.substr(0, colon)));
+            if (key == "content-length") {
+                std::string val = trim_ascii(line.substr(colon + 1));
+                char* end = nullptr;
+                unsigned long long parsed = std::strtoull(val.c_str(), &end, 10);
+                if (end && *end == '\0') {
+                    content_length = static_cast<size_t>(parsed);
+                    return true;
+                }
+            }
+        }
+        if (eol == headers.size())
+            break;
+        pos = eol + 2;
+    }
+    return false;
+}
+
+static void send_http_response(SOCKET s, const std::string& body, const std::string& content_type)
+{
+    std::string response;
+    response.reserve(body.size() + 256);
+    response += "HTTP/1.1 200 OK\r\n";
+    response += "Server: AiDA-Collaborator/1.0\r\n";
+    response += "Content-Type: ";
+    response += content_type.empty() ? "text/plain" : content_type;
+    response += "\r\nContent-Length: ";
+    response += std::to_string(body.size());
+    response += "\r\nConnection: close\r\n\r\n";
+    response += body;
+    const char* data = response.data();
+    size_t left = response.size();
+    while (left != 0) {
+        int n = send(s, data, static_cast<int>(std::min<size_t>(left, 16384)), 0);
+        if (n <= 0)
+            break;
+        data += n;
+        left -= static_cast<size_t>(n);
+    }
+}
+
+static void on_raw_http_request(const std::string& raw, const std::string& client_ip, uint16_t client_port, SOCKET client_sock)
+{
+    collaborator_config_t cfg_snapshot;
+    {
+        std::lock_guard<std::mutex> lk(g_state.mtx);
+        cfg_snapshot = g_state.config;
+    }
+
+    const size_t header_end = raw.find("\r\n\r\n");
+    const std::string header_block = header_end == std::string::npos ? raw : raw.substr(0, header_end);
+    const std::string body = header_end == std::string::npos ? std::string() : raw.substr(header_end + 4);
+
+    std::istringstream stream(header_block);
+    std::string request_line;
+    std::getline(stream, request_line);
+    if (!request_line.empty() && request_line.back() == '\r')
+        request_line.pop_back();
+
+    std::istringstream request_line_stream(request_line);
+    std::string method;
+    std::string target;
+    std::string version;
+    request_line_stream >> method >> target >> version;
+
+    std::unordered_map<std::string, std::string> headers;
+    std::string line;
+    while (std::getline(stream, line)) {
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        if (line.empty())
+            break;
+        size_t colon = line.find(':');
+        if (colon == std::string::npos)
+            continue;
+        headers[lower_ascii(trim_ascii(line.substr(0, colon)))] = trim_ascii(line.substr(colon + 1));
+    }
+
+    std::string path = target.empty() ? "/" : target;
+    std::string query;
+    size_t qpos = path.find('?');
+    if (qpos != std::string::npos) {
+        query = path.substr(qpos + 1);
+        path = path.substr(0, qpos);
+    }
+
+    std::string host_hdr;
+    auto host_it = headers.find("host");
+    if (host_it != headers.end())
+        host_hdr = host_it->second;
+
+    interaction_t it;
+    it.kind = "http";
+    it.client_ip = client_ip;
+    it.client_port = client_port;
+    it.timestamp_ms = now_ms();
+    it.subdomain = strip_port_from_host(host_hdr);
+    std::string token = extract_token_from_host(host_hdr, cfg_snapshot.public_host);
+    if (token.empty())
+        token = extract_token_from_path(path);
+    it.payload_token = token;
+    it.raw = raw;
+    it.details["method"] = method;
+    it.details["path"] = path;
+    it.details["body"] = body;
+    it.details["host"] = host_hdr;
+    if (!query.empty())
+        it.details["query"] = query;
+    auto ua_it = headers.find("user-agent");
+    if (ua_it != headers.end())
+        it.details["user_agent"] = ua_it->second;
+    auto ref_it = headers.find("referer");
+    if (ref_it != headers.end())
+        it.details["referer"] = ref_it->second;
+    auto auth_it = headers.find("authorization");
+    if (auth_it != headers.end())
+        it.details["authorization"] = auth_it->second;
+
+    ::diag::log_tagged_fmt("collaborator",
+        "raw_http_interaction client=%s:%u host='%s' method='%s' path='%s' token='%s' body_size=%zu",
+        it.client_ip.c_str(), it.client_port, host_hdr.c_str(), method.c_str(), path.c_str(),
+        it.payload_token.c_str(), body.size());
+
+    append_interaction(std::move(it));
+
+    send_http_response(client_sock, cfg_snapshot.canned_body, cfg_snapshot.canned_content_type);
+}
+
+static void raw_http_session(SOCKET client_sock, std::string client_ip, uint16_t client_port)
+{
+    DWORD timeout = 1500;
+    setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+    setsockopt(client_sock, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+
+    std::string request;
+    request.reserve(4096);
+    size_t content_length = 0;
+    bool have_content_length = false;
+    constexpr size_t max_request_bytes = 64u * 1024u * 1024u;
+    char buf[4096];
+    while (request.size() < max_request_bytes) {
+        int n = recv(client_sock, buf, sizeof(buf), 0);
+        if (n <= 0)
+            break;
+        request.append(buf, buf + n);
+        size_t header_end = request.find("\r\n\r\n");
+        if (header_end != std::string::npos) {
+            if (!have_content_length) {
+                have_content_length = parse_http_content_length(request.substr(0, header_end), content_length);
+            }
+            const size_t body_have = request.size() - (header_end + 4);
+            if (!have_content_length || body_have >= content_length)
+                break;
+        }
+    }
+    if (!request.empty()) {
+        on_raw_http_request(request, client_ip, client_port, client_sock);
+    }
+    closesocket(client_sock);
+}
+
 static void http_thread_main(std::shared_ptr<httplib::Server> server, std::string bind_ip, uint16_t port)
 {
+    (void)server;
     const uint64_t start_ms = now_ms();
     g_state.http_thread_alive.store(true);
     g_state.http_alive.store(false);
@@ -350,47 +474,101 @@ static void http_thread_main(std::shared_ptr<httplib::Server> server, std::strin
         static_cast<unsigned long>(GetCurrentProcessId()),
         static_cast<unsigned long>(GetCurrentThreadId()));
 
-    bool bound = false;
-    bool listen_ok = false;
-    bool caught = false;
-    DWORD gle = 0;
-    try {
-        if (server) {
-            bound = server->bind_to_port(bind_ip.c_str(), static_cast<int>(port));
-            gle = GetLastError();
-            const int bind_wsa = WSAGetLastError();
-            ::diag::log_tagged_fmt("collaborator",
-                "http_bind_result bind=%s:%u bound=%d server_running=%d gle=%lu wsa_err=%d elapsed_ms=%llu",
-                bind_ip.c_str(),
-                static_cast<unsigned>(port),
-                bound ? 1 : 0,
-                server->is_running() ? 1 : 0,
-                static_cast<unsigned long>(gle),
-                bind_wsa,
-                static_cast<unsigned long long>(now_ms() - start_ms));
-            if (bound) {
-                g_state.http_alive.store(true);
-                listen_ok = server->listen_after_bind();
-            }
-        }
-    } catch (...) {
-        caught = true;
-        listen_ok = false;
-        gle = GetLastError();
+    SOCKET listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listen_sock == INVALID_SOCKET) {
+        ::diag::log_tagged_fmt("collaborator", "http_socket_create_failed err=%d", WSAGetLastError());
+        g_state.http_thread_alive.store(false);
+        return;
     }
-    const int wsa_err = WSAGetLastError();
 
+    int opt = 1;
+    setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&opt), sizeof(opt));
+
+    sockaddr_in bind_addr{};
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_port = htons(port);
+    if (inet_pton(AF_INET, bind_ip.c_str(), &bind_addr.sin_addr) != 1)
+        bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    bool bound = bind(listen_sock, reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr)) != SOCKET_ERROR;
+    const int bind_err = bound ? 0 : WSAGetLastError();
+    if (!bound) {
+        ::diag::log_tagged_fmt("collaborator", "http_bind_failed bind=%s:%u err=%d elapsed_ms=%llu",
+            bind_ip.c_str(), static_cast<unsigned>(port), bind_err,
+            static_cast<unsigned long long>(now_ms() - start_ms));
+        closesocket(listen_sock);
+        g_state.http_thread_alive.store(false);
+        return;
+    }
+
+    bool listen_ok = listen(listen_sock, 32) != SOCKET_ERROR;
+    const int listen_err = listen_ok ? 0 : WSAGetLastError();
+    if (!listen_ok) {
+        ::diag::log_tagged_fmt("collaborator", "http_listen_failed bind=%s:%u err=%d elapsed_ms=%llu",
+            bind_ip.c_str(), static_cast<unsigned>(port), listen_err,
+            static_cast<unsigned long long>(now_ms() - start_ms));
+        closesocket(listen_sock);
+        g_state.http_thread_alive.store(false);
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(g_state.mtx);
+        g_state.http_socket = listen_sock;
+    }
+    g_state.http_alive.store(true);
+    ::diag::log_tagged_fmt("collaborator", "http_listener_ready bind=%s:%u elapsed_ms=%llu",
+        bind_ip.c_str(), static_cast<unsigned>(port),
+        static_cast<unsigned long long>(now_ms() - start_ms));
+
+    while (!g_state.stop_request.load(std::memory_order_acquire)) {
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(listen_sock, &fds);
+        timeval tv{};
+        tv.tv_sec = 0;
+        tv.tv_usec = 500000;
+        int sel = select(0, &fds, nullptr, nullptr, &tv);
+        if (sel <= 0)
+            continue;
+
+        sockaddr_in client_addr{};
+        int addr_len = sizeof(client_addr);
+        SOCKET client_sock = accept(listen_sock, reinterpret_cast<sockaddr*>(&client_addr), &addr_len);
+        if (client_sock == INVALID_SOCKET)
+            continue;
+
+        std::string client_ip = client_ip_to_string(client_addr.sin_addr.s_addr);
+        uint16_t client_port = ntohs(client_addr.sin_port);
+        auto task = [client_sock, client_ip, client_port]() {
+            raw_http_session(client_sock, client_ip, client_port);
+        };
+        std::string session_thread_err;
+        if (!aida::infra::win_thread::start_detached(task, &session_thread_err,
+                aida::infra::win_thread::fixture_stack_reserve, "collaborator.http.session")) {
+            ::diag::log_tagged_fmt("collaborator", "http_session_thread_failed client=%s:%u err=%s",
+                client_ip.c_str(), static_cast<unsigned>(client_port), session_thread_err.c_str());
+            task();
+        }
+    }
+
+    bool close_listen_sock = true;
+    {
+        std::lock_guard<std::mutex> lk(g_state.mtx);
+        if (g_state.http_socket == listen_sock) {
+            g_state.http_socket = INVALID_SOCKET;
+        } else {
+            close_listen_sock = false;
+        }
+    }
+    if (close_listen_sock)
+        closesocket(listen_sock);
     g_state.http_alive.store(false);
     g_state.http_thread_alive.store(false);
     ::diag::log_tagged_fmt("collaborator",
-        "http_thread_exit bind=%s:%u bound=%d listen_ok=%d caught=%d gle=%lu wsa_err=%d elapsed_ms=%llu stop_request=%d",
+        "http_thread_exit bind=%s:%u listen_ok=1 elapsed_ms=%llu stop_request=%d",
         bind_ip.c_str(),
         static_cast<unsigned>(port),
-        bound ? 1 : 0,
-        listen_ok ? 1 : 0,
-        caught ? 1 : 0,
-        static_cast<unsigned long>(gle),
-        wsa_err,
         static_cast<unsigned long long>(now_ms() - start_ms),
         g_state.stop_request.load() ? 1 : 0);
 }
@@ -929,12 +1107,12 @@ bool start(const collaborator_config_t& cfg)
         DWORD wait_iter = 0;
         bool http_ready = false;
         while (wait_iter < 60) {
-            if (!g_state.http_thread_alive.load() && !g_state.http_alive.load())
-                break;
-            if (probe_tcp_listener(bind_ip, port, 50)) {
+            if (g_state.http_alive.load()) {
                 http_ready = true;
                 break;
             }
+            if (!g_state.http_thread_alive.load())
+                break;
             Sleep(50);
             ++wait_iter;
         }
@@ -943,7 +1121,7 @@ bool start(const collaborator_config_t& cfg)
             http_ready ? 1 : 0,
             g_state.http_alive.load() ? 1 : 0,
             g_state.http_thread_alive.load() ? 1 : 0,
-            static_cast<unsigned long>(wait_iter * 100));
+            static_cast<unsigned long>(wait_iter * 50));
         if (!http_ready) {
             set_last_error(g_state.http_thread_alive.load() ? "http_listener_not_ready" : "http_thread_exited_before_ready");
             stop();
@@ -1077,6 +1255,10 @@ void stop()
 
     {
         std::lock_guard<std::mutex> lk(g_state.mtx);
+        if (g_state.http_socket != INVALID_SOCKET) {
+            closesocket(g_state.http_socket);
+            g_state.http_socket = INVALID_SOCKET;
+        }
         if (g_state.dns_socket != INVALID_SOCKET) {
             closesocket(g_state.dns_socket);
             g_state.dns_socket = INVALID_SOCKET;

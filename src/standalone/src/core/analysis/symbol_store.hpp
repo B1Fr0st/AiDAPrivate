@@ -18,6 +18,8 @@
 #include "pdb_downloader.hpp"
 #include "standalone_driver.hpp"
 #include "standalone_settings.hpp"
+#include "../infra/critical_work_queue.hpp"
+#include "../../helpers/diag_log.hpp"
 
 extern settings_sa_t g_settings;
 
@@ -433,10 +435,15 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 	std::string mod_copy = module_name;
 	std::string path_copy = pdb_path;
 
-	work_queue::post([mod_copy, path_copy]() {
+	auto parse_job = [mod_copy, path_copy]() {
+		diag::log_tagged_fmt("symbol_store", "explicit_pdb_parse_start module=%s path=%s",
+			mod_copy.c_str(), path_copy.c_str());
 		pdb_parser::pdb_info_t info;
 		std::atomic<float> parse_progress{0.f};
 		bool parse_ok = pdb_parser::parse_pdb(path_copy, "", info, &parse_progress);
+		diag::log_tagged_fmt("symbol_store", "explicit_pdb_parse_done module=%s ok=%d symbols=%zu structs=%zu enums=%zu progress=%.3f",
+			mod_copy.c_str(), parse_ok ? 1 : 0, info.symbols.size(), info.structs.size(),
+			info.enums.size(), static_cast<double>(parse_progress.load()));
 
 		aida::events::event_pdb_loaded ev_payload;
 		{
@@ -477,7 +484,24 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 		}
 
 		aida::events::publish(aida::events::event_pdb_loaded_def, ev_payload);
-	});
+	};
+	if (!(critical_work_queue::post(parse_job) || work_queue::post(parse_job))) {
+		diag::log_tagged_fmt("symbol_store", "explicit_pdb_parse_post_failed module=%s path=%s",
+			mod_copy.c_str(), path_copy.c_str());
+		aida::events::event_pdb_loaded ev_payload;
+		{
+			std::lock_guard<std::mutex> lk(g_state.mutex);
+			auto& ms = g_state.modules[mod_copy];
+			ms.loading = false;
+			ms.failed = true;
+			ms.status_text = "Failed to queue user-supplied PDB parse";
+			ev_payload.module_name = ms.module_name;
+			ev_payload.base = ms.base;
+			ev_payload.size = ms.size;
+			ev_payload.success = false;
+		}
+		aida::events::publish(aida::events::event_pdb_loaded_def, ev_payload);
+	}
 }
 
 inline void auto_load_attached_modules()

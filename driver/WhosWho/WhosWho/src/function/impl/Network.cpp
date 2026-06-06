@@ -7312,13 +7312,13 @@ namespace net_kill {
         }
 
         if (request->src_port != 0 && request->dst_port != 0) {
-            if (socket_info->local_port == 0 || socket_info->remote_port == 0)
+            if (socket_info->local_port == 0)
                 return FALSE;
 
-            if (src_match && dst_match)
-                return TRUE;
+            if (socket_info->remote_port != 0)
+                return (src_match && dst_match) ? TRUE : FALSE;
 
-            return FALSE;
+            return socket_info->local_port == request->src_port ? TRUE : FALSE;
         }
 
         if (request->src_port != 0)

@@ -4,8 +4,10 @@
 #define NOMINMAX
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -126,6 +128,7 @@ inline bool remove_session(const std::string& id)
 		std::lock_guard<std::mutex> lk(reg.mtx);
 		auto it = reg.sessions.find(id);
 		if (it == reg.sessions.end()) return false;
+		if (!it->second->reader_done.load(std::memory_order_acquire)) return false;
 		victim = std::move(it->second);
 		reg.sessions.erase(it);
 	}
@@ -153,7 +156,8 @@ inline void prune_finished(size_t keep_max = 32)
 		if (reg.sessions.size() <= keep_max) return;
 		std::vector<std::pair<std::chrono::steady_clock::time_point, std::string>> finished;
 		for (const auto& kv : reg.sessions) {
-			if (!kv.second->alive.load())
+			if (!kv.second->alive.load(std::memory_order_acquire) &&
+				kv.second->reader_done.load(std::memory_order_acquire))
 				finished.emplace_back(kv.second->finished_at, kv.first);
 		}
 		std::sort(finished.begin(), finished.end(),

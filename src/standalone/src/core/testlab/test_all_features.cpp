@@ -268,13 +268,17 @@ namespace test_all_features {
 			const std::uint64_t run_age = (run_start != 0 && now >= run_start) ? (now - run_start) : 0;
 			const std::uint64_t phase_age = (phase_start != 0 && now >= phase_start) ? (now - phase_start) : 0;
 			const std::uint64_t step_age = (step_start != 0 && now >= step_start) ? (now - step_start) : 0;
+			const auto cq = critical_work_queue::stats();
 
 			_snprintf_s(out, cap, _TRUNCATE,
-				"run_id=%llu running=%d cancel=%d target_unavailable=%d phase=\"%.160s\" phase_age_ms=%llu "
+				"run_id=%llu host_pid=%lu host_tid=%lu running=%d cancel=%d target_unavailable=%d phase=\"%.160s\" phase_age_ms=%llu "
 				"step=\"%.220s\" step_age_ms=%llu run_age_ms=%llu total=%d current=%d "
-				"pass=%d fail=%d skip=%d suspect=%d target_pid=%u driver_attached=%d "
+				"pass=%d fail=%d skip=%d suspect=%d cq_alive=%d cq_shutdown=%d cq_workers=%zu cq_pending=%zu cq_active=%u cq_started=%llu cq_finished=%llu "
+				"target_pid=%u driver_attached=%d "
 				"image_base=0x%016llX target_addr=0x%016llX saved_dtb=0x%016llX",
 				static_cast<unsigned long long>(g_run_id.load(std::memory_order_acquire)),
+				static_cast<unsigned long>(GetCurrentProcessId()),
+				static_cast<unsigned long>(GetCurrentThreadId()),
 				g_running.load(std::memory_order_acquire) ? 1 : 0,
 				g_cancel_requested.load(std::memory_order_acquire) ? 1 : 0,
 				g_target_unavailable.load(std::memory_order_acquire) ? 1 : 0,
@@ -289,6 +293,13 @@ namespace test_all_features {
 				g_failed.load(std::memory_order_acquire),
 				g_skipped.load(std::memory_order_acquire),
 				g_suspect.load(std::memory_order_acquire),
+				cq.alive ? 1 : 0,
+				cq.shutting_down ? 1 : 0,
+				cq.workers,
+				cq.pending,
+				static_cast<unsigned>(cq.active),
+				static_cast<unsigned long long>(cq.started),
+				static_cast<unsigned long long>(cq.finished),
 				g_target_pid.load(std::memory_order_acquire),
 				g_driver_attached.load(std::memory_order_acquire) ? 1 : 0,
 				static_cast<unsigned long long>(g_target_image_base.load(std::memory_order_acquire)),

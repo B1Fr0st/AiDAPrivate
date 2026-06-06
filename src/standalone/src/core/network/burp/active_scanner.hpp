@@ -49,6 +49,7 @@ uint64_t  enqueue_target(const std::vector<uint8_t>& raw_request,
                          const audit_config_t& cfg);
 
 bool      cancel_audit(uint64_t audit_id);
+bool      wait_for_audit_idle(uint64_t audit_id, uint32_t timeout_ms);
 
 std::vector<audit_status_t> list_audits();
 bool      get_status(uint64_t audit_id, audit_status_t& out);

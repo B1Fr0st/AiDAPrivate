@@ -72,6 +72,11 @@ static void log_msg(HANDLE hf, const char* tag, const char* fmt, ...) {
     test_all_features::mirror_full_test_log_line(tag, detail, s.c_str());
 }
 
+static long long elapsed_us_since(std::chrono::steady_clock::time_point t0) {
+    return static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - t0).count());
+}
+
 struct symbolic_fixture_t {
     uint64_t address = 0;
     size_t size = 0;
@@ -1500,9 +1505,24 @@ static void test_comment_store_overwrite(HANDLE hf, std::atomic<int>& passed, st
 
 static void select_analysis_hub_tab(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed,
                                      const char* tag, analysis_hub_view::sub_tab_t value) {
+    auto t0 = std::chrono::steady_clock::now();
+    analysis_hub_view::sub_tab_t before = analysis_hub_view::active_sub_tab();
+    const char* before_label = analysis_hub_view::sub_tab_label(before);
+    const char* target_label = analysis_hub_view::sub_tab_label(value);
+    log_msg(hf, tag, "STATE -- before=%d label=%s target=%d target_label=%s tid=%lu",
+        static_cast<int>(before),
+        before_label,
+        static_cast<int>(value),
+        target_label,
+        (unsigned long)GetCurrentThreadId());
     analysis_hub_view::set_sub_tab(value);
     analysis_hub_view::sub_tab_t got = analysis_hub_view::active_sub_tab();
     const char* label = analysis_hub_view::sub_tab_label(value);
+    log_msg(hf, tag, "STATE -- after=%d label=%s changed=%d elapsed_us=%lld",
+        static_cast<int>(got),
+        analysis_hub_view::sub_tab_label(got),
+        (before != got) ? 1 : 0,
+        elapsed_us_since(t0));
     if (got == value && label[0] != '\0') {
         log_msg(hf, tag, "PASS -- analysis_hub sub_tab selected and read back (%d label=%s)",
             static_cast<int>(value), label);
@@ -1516,10 +1536,28 @@ static void select_analysis_hub_tab(HANDLE hf, std::atomic<int>& passed, std::at
 
 static void select_symbolic_inner_tab(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed,
                                       const char* tag, int value, const char* expected_label) {
+    auto t0 = std::chrono::steady_clock::now();
+    analysis_hub_view::sub_tab_t parent_before = analysis_hub_view::active_sub_tab();
+    int before = symbolic_view::active_tab();
+    log_msg(hf, tag, "STATE -- parent_before=%d parent_label=%s inner_before=%d inner_label=%s target=%d expected_label=%s tid=%lu",
+        static_cast<int>(parent_before),
+        analysis_hub_view::sub_tab_label(parent_before),
+        before,
+        symbolic_view::tab_label(before),
+        value,
+        expected_label,
+        (unsigned long)GetCurrentThreadId());
     analysis_hub_view::set_sub_tab(analysis_hub_view::sub_tab_t::symbolic);
     symbolic_view::set_active_tab(value);
     int got = symbolic_view::active_tab();
     const char* label = symbolic_view::tab_label(value);
+    log_msg(hf, tag, "STATE -- parent_after=%d parent_label=%s inner_after=%d readback_label=%s changed=%d elapsed_us=%lld",
+        static_cast<int>(analysis_hub_view::active_sub_tab()),
+        analysis_hub_view::sub_tab_label(analysis_hub_view::active_sub_tab()),
+        got,
+        symbolic_view::tab_label(got),
+        (before != got) ? 1 : 0,
+        elapsed_us_since(t0));
     if (got == value && std::strcmp(label, expected_label) == 0) {
         log_msg(hf, tag, "PASS -- symbolic inner tab selected and read back (%d label=%s)",
             value, label);
@@ -1533,10 +1571,28 @@ static void select_symbolic_inner_tab(HANDLE hf, std::atomic<int>& passed, std::
 
 static void select_protection_inner_tab(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed,
                                         const char* tag, int value, const char* expected_label) {
+    auto t0 = std::chrono::steady_clock::now();
+    analysis_hub_view::sub_tab_t parent_before = analysis_hub_view::active_sub_tab();
+    int before = stealth_view::active_sub_tab();
+    log_msg(hf, tag, "STATE -- parent_before=%d parent_label=%s inner_before=%d inner_label=%s target=%d expected_label=%s tid=%lu",
+        static_cast<int>(parent_before),
+        analysis_hub_view::sub_tab_label(parent_before),
+        before,
+        stealth_view::sub_tab_label(before),
+        value,
+        expected_label,
+        (unsigned long)GetCurrentThreadId());
     analysis_hub_view::set_sub_tab(analysis_hub_view::sub_tab_t::stealth);
     stealth_view::set_sub_tab(value);
     int got = stealth_view::active_sub_tab();
     const char* label = stealth_view::sub_tab_label(value);
+    log_msg(hf, tag, "STATE -- parent_after=%d parent_label=%s inner_after=%d readback_label=%s changed=%d elapsed_us=%lld",
+        static_cast<int>(analysis_hub_view::active_sub_tab()),
+        analysis_hub_view::sub_tab_label(analysis_hub_view::active_sub_tab()),
+        got,
+        stealth_view::sub_tab_label(got),
+        (before != got) ? 1 : 0,
+        elapsed_us_since(t0));
     if (got == value && std::strcmp(label, expected_label) == 0) {
         log_msg(hf, tag, "PASS -- protection inner tab selected and read back (%d label=%s)",
             value, label);
@@ -1566,9 +1622,24 @@ static void test_analysis_hub_tab_protection(HANDLE hf, std::atomic<int>& passed
 
 static void select_types_hub_tab(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed,
                                  const char* tag, types_hub_view::sub_tab_t value) {
+    auto t0 = std::chrono::steady_clock::now();
+    types_hub_view::sub_tab_t before = types_hub_view::active_sub_tab();
+    const char* before_label = types_hub_view::sub_tab_label(before);
+    const char* target_label = types_hub_view::sub_tab_label(value);
+    log_msg(hf, tag, "STATE -- before=%d label=%s target=%d target_label=%s tid=%lu",
+        static_cast<int>(before),
+        before_label,
+        static_cast<int>(value),
+        target_label,
+        (unsigned long)GetCurrentThreadId());
     types_hub_view::set_sub_tab(value);
     types_hub_view::sub_tab_t got = types_hub_view::active_sub_tab();
     const char* label = types_hub_view::sub_tab_label(value);
+    log_msg(hf, tag, "STATE -- after=%d label=%s changed=%d elapsed_us=%lld",
+        static_cast<int>(got),
+        types_hub_view::sub_tab_label(got),
+        (before != got) ? 1 : 0,
+        elapsed_us_since(t0));
     if (got == value && label[0] != '\0') {
         log_msg(hf, tag, "PASS -- types_hub sub_tab selected and read back (%d label=%s)",
             static_cast<int>(value), label);

@@ -21,6 +21,7 @@
 #include "../disasm/xref_index.hpp"
 #include "../editor/hex_view.hpp"
 #include "../infra/work_queue.hpp"
+#include "../infra/win_thread.hpp"
 #include "../infra/event_bus.hpp"
 #include "../analysis/initial_analysis.hpp"
 #include "../analysis/symbol_store.hpp"
@@ -68,6 +69,8 @@ struct state_t {
 	std::atomic<unsigned int>  milestone_id{0};
 	std::atomic<unsigned int>  completion_action{0};
 	std::atomic<bool>          load_succeeded{false};
+	std::atomic<unsigned int>  worker_state{0};
+	std::atomic<uint64_t>      load_generation{0};
 	std::mutex                 text_mtx;
 	std::string                path;
 	std::string                filename;
@@ -152,9 +155,22 @@ inline void emit_phase_log(const char* phase, uint64_t elapsed_ms, const char* e
 	anti_tamper::webhook::write_log("pe_load", buf);
 }
 
-inline void worker_load(std::string path, completion_action_t action)
+inline void worker_load(std::string path, completion_action_t action, uint64_t generation)
 {
 	state_t& s = state();
+	const uint64_t active_generation = s.load_generation.load(std::memory_order_acquire);
+	unsigned int expected_state = 0;
+	if (generation != active_generation ||
+		!s.worker_state.compare_exchange_strong(expected_state, 1u, std::memory_order_acq_rel)) {
+		diag::log_tagged_fmt("pe_load",
+			"phase=worker_load_stale path=%s action=%u generation=%llu active_generation=%llu worker_state=%u",
+			path.c_str(),
+			static_cast<unsigned int>(action),
+			static_cast<unsigned long long>(generation),
+			static_cast<unsigned long long>(active_generation),
+			expected_state);
+		return;
+	}
 
 	const uint64_t t_total_start = monotonic_ms_now();
 	try {
@@ -204,6 +220,7 @@ inline void worker_load(std::string path, completion_action_t action)
 				std::memory_order_release);
 		}
 		s.worker_finished.store(true, std::memory_order_release);
+		s.worker_state.store(2u, std::memory_order_release);
 		emit_phase_log("worker_load_failed", monotonic_ms_now() - t_total_start,
 			hex_fallback ? "hex_fallback=1" : "hex_fallback=0");
 		return;
@@ -282,6 +299,7 @@ inline void worker_load(std::string path, completion_action_t action)
 	s.load_succeeded.store(true, std::memory_order_release);
 	s.completion_action.store(static_cast<unsigned int>(action), std::memory_order_release);
 	s.worker_finished.store(true, std::memory_order_release);
+	s.worker_state.store(2u, std::memory_order_release);
 	emit_phase_log("worker_load_finished_flag_set", monotonic_ms_now() - t_total_start, "");
 
 	{
@@ -304,6 +322,7 @@ inline void worker_load(std::string path, completion_action_t action)
 		s.load_succeeded.store(false, std::memory_order_release);
 		s.completion_action.store(static_cast<unsigned int>(completion_action_t::none), std::memory_order_release);
 		s.worker_finished.store(true, std::memory_order_release);
+		s.worker_state.store(2u, std::memory_order_release);
 		emit_phase_log("worker_load_exception_finished_flag_set", monotonic_ms_now() - t_total_start, "");
 	} catch (...) {
 		char extra[256];
@@ -315,6 +334,7 @@ inline void worker_load(std::string path, completion_action_t action)
 		s.load_succeeded.store(false, std::memory_order_release);
 		s.completion_action.store(static_cast<unsigned int>(completion_action_t::none), std::memory_order_release);
 		s.worker_finished.store(true, std::memory_order_release);
+		s.worker_state.store(2u, std::memory_order_release);
 		emit_phase_log("worker_load_exception_finished_flag_set", monotonic_ms_now() - t_total_start, "");
 	}
 }
@@ -464,7 +484,7 @@ inline void log_state(const char* tag)
 		milestone = s.milestone_label;
 	}
 	diag::log_tagged_fmt("loading_binary_overlay",
-		"%s phase=%u phase_name=%s active=%d worker_finished=%d completion_applied=%d load_succeeded=%d action=%u progress=%.3f ia_running=%d ia_finished=%d ia_step=%d path=%s filename=%s milestone=%s",
+		"%s phase=%u phase_name=%s active=%d worker_finished=%d completion_applied=%d load_succeeded=%d action=%u worker_state=%u generation=%llu progress=%.3f ia_running=%d ia_finished=%d ia_step=%d path=%s filename=%s milestone=%s",
 		tag ? tag : "state",
 		static_cast<unsigned int>(current_phase()),
 		current_phase_name(),
@@ -473,6 +493,8 @@ inline void log_state(const char* tag)
 		s.completion_applied.load(std::memory_order_acquire) ? 1 : 0,
 		s.load_succeeded.load(std::memory_order_acquire) ? 1 : 0,
 		s.completion_action.load(std::memory_order_acquire),
+		s.worker_state.load(std::memory_order_acquire),
+		static_cast<unsigned long long>(s.load_generation.load(std::memory_order_acquire)),
 		s.progress.load(std::memory_order_acquire),
 		initial_analysis::g_state.running.load(std::memory_order_acquire) ? 1 : 0,
 		initial_analysis::g_state.finished.load(std::memory_order_acquire) ? 1 : 0,
@@ -482,9 +504,72 @@ inline void log_state(const char* tag)
 		milestone.c_str());
 }
 
+inline bool cancel_queued_load(const char* reason)
+{
+	detail::state_t& s = detail::state();
+	if (detail::get_phase() != phase_t::loading) {
+		diag::log_tagged_fmt("loading_binary_overlay",
+			"cancel_queued_load skipped reason=%s phase=%s worker_state=%u",
+			reason ? reason : "",
+			current_phase_name(),
+			s.worker_state.load(std::memory_order_acquire));
+		return false;
+	}
+	unsigned int expected_state = 0;
+	if (!s.worker_state.compare_exchange_strong(expected_state, 3u, std::memory_order_acq_rel)) {
+		diag::log_tagged_fmt("loading_binary_overlay",
+			"cancel_queued_load skipped reason=%s phase=%s worker_state=%u",
+			reason ? reason : "",
+			current_phase_name(),
+			expected_state);
+		return false;
+	}
+	s.load_generation.fetch_add(1u, std::memory_order_acq_rel);
+	s.load_succeeded.store(false, std::memory_order_release);
+	s.completion_action.store(static_cast<unsigned int>(completion_action_t::none), std::memory_order_release);
+	s.worker_finished.store(true, std::memory_order_release);
+	s.completion_applied.store(true, std::memory_order_release);
+	s.progress.store(1.f, std::memory_order_release);
+	s.visual_progress.store(1.f, std::memory_order_release);
+	{
+		std::lock_guard<std::mutex> lk(s.text_mtx);
+		s.milestone_label = "Load cancelled";
+		s.dynamic_label = "Load cancelled";
+	}
+	detail::set_phase(phase_t::complete);
+	diag::log_tagged_fmt("loading_binary_overlay",
+		"cancel_queued_load applied reason=%s generation=%llu",
+		reason ? reason : "",
+		static_cast<unsigned long long>(s.load_generation.load(std::memory_order_acquire)));
+	return true;
+}
+
+inline bool is_load_ready_for_tools()
+{
+	detail::state_t& s = detail::state();
+	if (!s.worker_finished.load(std::memory_order_acquire))
+		return false;
+	if (!s.load_succeeded.load(std::memory_order_acquire))
+		return false;
+	unsigned int ws = s.worker_state.load(std::memory_order_acquire);
+	if (ws != 2u)
+		return false;
+	phase_t ph = detail::get_phase();
+	return ph == phase_t::awaiting_analysis ||
+		ph == phase_t::awaiting_pdb_decision ||
+		ph == phase_t::loading_pdb ||
+		ph == phase_t::finalizing ||
+		ph == phase_t::complete;
+}
+
 inline bool is_blocking_views()
 {
-	return is_active();
+	phase_t ph = detail::get_phase();
+	if (ph == phase_t::idle || ph == phase_t::complete)
+		return false;
+	if (ph == phase_t::loading || ph == phase_t::awaiting_pdb_decision || ph == phase_t::loading_pdb)
+		return true;
+	return !is_load_ready_for_tools();
 }
 
 inline void begin_load(const std::string& path, completion_action_t action = completion_action_t::switch_to_disassembly)
@@ -518,6 +603,8 @@ inline void begin_load(const std::string& path, completion_action_t action = com
 	s.completion_applied.store(false, std::memory_order_release);
 	s.load_succeeded.store(false, std::memory_order_release);
 	s.completion_action.store(static_cast<unsigned int>(action), std::memory_order_release);
+	s.worker_state.store(0u, std::memory_order_release);
+	const uint64_t generation = s.load_generation.fetch_add(1u, std::memory_order_acq_rel) + 1u;
 	{
 		std::lock_guard<std::mutex> lk(s.text_mtx);
 		s.path = path;
@@ -528,17 +615,35 @@ inline void begin_load(const std::string& path, completion_action_t action = com
 	}
 	std::string captured_path = path;
 	completion_action_t captured_action = action;
-	bool queued = work_queue::post([captured_path, captured_action]() {
-		detail::worker_load(captured_path, captured_action);
-	});
+	std::string thread_err;
+	bool queued = aida::infra::win_thread::start_detached([captured_path, captured_action, generation]() {
+		detail::worker_load(captured_path, captured_action, generation);
+	}, &thread_err, aida::infra::win_thread::default_stack_reserve, "loading_binary_overlay.worker");
+	if (!queued) {
+		const auto qs = work_queue::stats();
+		diag::log_tagged_fmt("loading_binary_overlay",
+			"begin_load dedicated_worker_failed path=%s err=%s queue_alive=%d queue_pending=%llu queue_active=%u queue_started=%llu queue_finished=%llu",
+			path.c_str(),
+			thread_err.c_str(),
+			qs.alive ? 1 : 0,
+			static_cast<unsigned long long>(qs.pending),
+			qs.active,
+			static_cast<unsigned long long>(qs.started),
+			static_cast<unsigned long long>(qs.finished));
+		queued = work_queue::post([captured_path, captured_action, generation]() {
+			detail::worker_load(captured_path, captured_action, generation);
+		});
+	}
 	diag::log_tagged_fmt("loading_binary_overlay",
-		"begin_load accepted path=%s action=%u queued=%d",
+		"begin_load accepted path=%s action=%u queued=%d generation=%llu",
 		path.c_str(),
 		static_cast<unsigned int>(action),
-		queued ? 1 : 0);
+		queued ? 1 : 0,
+		static_cast<unsigned long long>(generation));
 	if (!queued) {
 		s.worker_finished.store(true, std::memory_order_release);
 		s.load_succeeded.store(false, std::memory_order_release);
+		s.worker_state.store(2u, std::memory_order_release);
 	}
 }
 

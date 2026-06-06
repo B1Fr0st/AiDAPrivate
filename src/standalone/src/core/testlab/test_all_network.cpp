@@ -1598,14 +1598,14 @@ namespace {
                 status.prepared ? "true" : "false");
             passed.fetch_add(1);
         } else if (profile_ready || (profile_files_ready && !status.firefox_detected) || (profile_files_ready && !status.current_user_ca_trusted)) {
-            log_msg(hf, tag, "PASS -- Firefox runtime/trust unavailable; profile files valid profile=%s trust=%s prepared=%s firefox_detected=%s runtime_checked=%s error=%s",
+            log_msg(hf, tag, "FAIL -- Firefox runtime/trust unavailable; profile files valid but full Firefox profile readiness was not proven profile=%s trust=%s prepared=%s firefox_detected=%s runtime_checked=%s error=%s",
                 status.profile_path.u8string().c_str(),
                 status.current_user_ca_trusted ? "true" : "false",
                 status.prepared ? "true" : "false",
                 status.firefox_detected ? "true" : "false",
                 status.runtime_validation_performed ? "true" : "false",
                 status.error.c_str());
-            passed.fetch_add(1);
+            failed.fetch_add(1);
         } else {
             log_msg(hf, tag, "FAIL -- Firefox profile readiness invalid error=%s files=%s trust=%s prepared=%s firefox_detected=%s runtime_checked=%s ok=%s",
                 status.error.c_str(),

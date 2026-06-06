@@ -6,7 +6,7 @@
 #include <windows.h>
 
 #include "standalone_driver.hpp"
-#include "../infra/work_queue.hpp"
+#include "../infra/win_thread.hpp"
 #include "helpers/diag_log.hpp"
 
 #include <nlohmann/json.hpp>
@@ -145,8 +145,14 @@ struct state_t {
     std::atomic<bool> polling{false};
     std::atomic<bool> debug_attached{false};
     std::atomic<bool> debug_loop_running{false};
+    std::atomic<bool> cleanup_running{false};
     std::atomic<DWORD> debugger_error{0};
     std::atomic<uint64_t> total_hits{0};
+    std::atomic<uint64_t> cleanup_attempts{0};
+    std::atomic<uint64_t> cleanup_last_elapsed_ms{0};
+    std::atomic<uint32_t> cleanup_last_requests{0};
+    std::atomic<uint32_t> cleanup_last_succeeded{0};
+    std::atomic<uint32_t> cleanup_last_failed{0};
     uint32_t pid = 0;
     bool capture_buffer = true;
     bool log_callstack = false;
@@ -971,6 +977,20 @@ inline bool arm_breakpoints_for_thread(uint32_t tid) {
         if (driver_bridge::set_hardware_breakpoint(tid, static_cast<int>(target.bp_index), target.address, 0, 0)) {
             mark_thread_armed(target.address, tid);
             armed = true;
+            diag::log_tagged_fmt("api_monitor",
+                "arm_thread tid=%u slot=%u api=%s addr=%s ok=1",
+                tid,
+                target.bp_index,
+                target.request.original.c_str(),
+                hex_addr(target.address).c_str());
+        } else {
+            diag::log_tagged_fmt("api_monitor",
+                "arm_thread tid=%u slot=%u api=%s addr=%s ok=0 gle=%lu",
+                tid,
+                target.bp_index,
+                target.request.original.c_str(),
+                hex_addr(target.address).c_str(),
+                GetLastError());
         }
     }
     return armed;
@@ -981,19 +1001,113 @@ inline uint32_t arm_existing_threads() {
     if (pid == 0)
         return 0;
     const auto threads = driver_bridge::enumerate_threads_for(pid);
+    diag::log_tagged_fmt("api_monitor",
+        "arm_existing_threads pid=%u thread_count=%llu",
+        pid,
+        static_cast<unsigned long long>(threads.size()));
     uint32_t armed = 0;
     for (const auto& thread : threads) {
         if (thread.owner_pid == pid && arm_breakpoints_for_thread(thread.tid))
             ++armed;
     }
+    diag::log_tagged_fmt("api_monitor",
+        "arm_existing_threads_done pid=%u armed_threads=%u",
+        pid,
+        armed);
     return armed;
 }
 
-inline void clear_armed_breakpoints() {
+struct clear_result_t {
+    DWORD gle = ERROR_SUCCESS;
+    DWORD suspend_prev = static_cast<DWORD>(-1);
+    DWORD resume_prev = static_cast<DWORD>(-1);
+    uint64_t before_dr7 = 0;
+    uint64_t after_dr7 = 0;
+    uint64_t elapsed_ms = 0;
+};
+
+inline bool clear_hardware_breakpoint_usermode(uint32_t tid, uint32_t slot, clear_result_t& result) {
+    const uint64_t start = GetTickCount64();
+    auto finish = [&result, start](DWORD gle, bool ok) {
+        result.gle = gle;
+        result.elapsed_ms = GetTickCount64() - start;
+        SetLastError(gle);
+        return ok;
+    };
+
+    if (tid == 0 || slot > 3)
+        return finish(ERROR_INVALID_PARAMETER, false);
+    if (tid == GetCurrentThreadId())
+        return finish(ERROR_INVALID_PARAMETER, false);
+
+    HANDLE thread_handle = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION,
+                                      FALSE,
+                                      static_cast<DWORD>(tid));
+    if (!thread_handle)
+        return finish(GetLastError(), false);
+
+    result.suspend_prev = SuspendThread(thread_handle);
+    if (result.suspend_prev == static_cast<DWORD>(-1)) {
+        const DWORD gle = GetLastError();
+        CloseHandle(thread_handle);
+        return finish(gle, false);
+    }
+
+    CONTEXT ctx{};
+    ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS | CONTEXT_DEBUG_REGISTERS;
+    const BOOL got_context = GetThreadContext(thread_handle, &ctx);
+    DWORD gle = got_context ? ERROR_SUCCESS : GetLastError();
+    BOOL set_context = FALSE;
+    if (got_context) {
+        result.before_dr7 = static_cast<uint64_t>(ctx.Dr7);
+        switch (slot) {
+        case 0: ctx.Dr0 = 0; break;
+        case 1: ctx.Dr1 = 0; break;
+        case 2: ctx.Dr2 = 0; break;
+        case 3: ctx.Dr3 = 0; break;
+        default: break;
+        }
+        uint64_t dr7 = static_cast<uint64_t>(ctx.Dr7);
+        constexpr uint64_t kDr7UserMask = 0xFFFF0355ULL;
+        constexpr uint64_t kDr7GlobalEnableMask = 0xAAULL;
+        dr7 &= kDr7UserMask;
+        dr7 &= ~kDr7GlobalEnableMask;
+        dr7 &= ~(3ULL << (slot * 2));
+        dr7 &= ~(3ULL << (16 + slot * 4));
+        dr7 &= ~(3ULL << (18 + slot * 4));
+        ctx.Dr6 = 0;
+        ctx.Dr7 = static_cast<DWORD64>(dr7);
+        result.after_dr7 = dr7;
+        ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS | CONTEXT_DEBUG_REGISTERS;
+        set_context = SetThreadContext(thread_handle, &ctx);
+        gle = set_context ? ERROR_SUCCESS : GetLastError();
+    }
+
+    result.resume_prev = ResumeThread(thread_handle);
+    const DWORD resume_gle = result.resume_prev == static_cast<DWORD>(-1) ? GetLastError() : ERROR_SUCCESS;
+    CloseHandle(thread_handle);
+    if (!got_context || !set_context)
+        return finish(gle, false);
+    if (resume_gle != ERROR_SUCCESS)
+        return finish(resume_gle, false);
+    return finish(ERROR_SUCCESS, true);
+}
+
+inline void clear_armed_breakpoints(const char* source) {
     struct clear_request_t {
         uint32_t tid;
         uint32_t slot;
     };
+    const char* origin = source && *source ? source : "unknown";
+    if (g_state.cleanup_running.exchange(true)) {
+        diag::log_tagged_fmt("api_monitor",
+            "clear_armed_breakpoints_busy source=%s",
+            origin);
+        return;
+    }
+
+    const uint64_t cleanup_start = GetTickCount64();
+    g_state.cleanup_attempts.fetch_add(1, std::memory_order_relaxed);
     std::vector<clear_request_t> requests;
     {
         std::lock_guard<std::mutex> lock(g_state.mutex);
@@ -1003,10 +1117,58 @@ inline void clear_armed_breakpoints() {
             target.armed_tids.clear();
         }
     }
-    if (!driver_bridge::using_kernel_driver())
-        return;
-    for (const auto& req : requests)
-        driver_bridge::clear_hardware_breakpoint(req.tid, static_cast<int>(req.slot));
+    g_state.cleanup_last_requests.store(static_cast<uint32_t>(requests.size()), std::memory_order_relaxed);
+    diag::log_tagged_fmt("api_monitor",
+        "clear_armed_breakpoints source=%s requests=%llu kernel=%d attached=%d",
+        origin,
+        static_cast<unsigned long long>(requests.size()),
+        driver_bridge::using_kernel_driver() ? 1 : 0,
+        g_state.debug_attached.load() ? 1 : 0);
+    uint32_t succeeded = 0;
+    uint32_t failed = 0;
+    uint32_t index = 0;
+    for (const auto& req : requests) {
+        ++index;
+        diag::log_tagged_fmt("api_monitor",
+            "clear_breakpoint_begin source=%s index=%u total=%llu tid=%u slot=%u",
+            origin,
+            index,
+            static_cast<unsigned long long>(requests.size()),
+            req.tid,
+            req.slot);
+        clear_result_t clear_result;
+        const bool ok = clear_hardware_breakpoint_usermode(req.tid, req.slot, clear_result);
+        if (ok)
+            ++succeeded;
+        else
+            ++failed;
+        diag::log_tagged_fmt("api_monitor",
+            "clear_breakpoint_end source=%s index=%u total=%llu tid=%u slot=%u ok=%d gle=%lu before_dr7=0x%llX after_dr7=0x%llX suspend_prev=%lu resume_prev=%lu elapsed_ms=%llu",
+            origin,
+            index,
+            static_cast<unsigned long long>(requests.size()),
+            req.tid,
+            req.slot,
+            ok ? 1 : 0,
+            clear_result.gle,
+            static_cast<unsigned long long>(clear_result.before_dr7),
+            static_cast<unsigned long long>(clear_result.after_dr7),
+            clear_result.suspend_prev,
+            clear_result.resume_prev,
+            static_cast<unsigned long long>(clear_result.elapsed_ms));
+    }
+    const uint64_t elapsed = GetTickCount64() - cleanup_start;
+    g_state.cleanup_last_succeeded.store(succeeded, std::memory_order_relaxed);
+    g_state.cleanup_last_failed.store(failed, std::memory_order_relaxed);
+    g_state.cleanup_last_elapsed_ms.store(elapsed, std::memory_order_relaxed);
+    g_state.cleanup_running.store(false);
+    diag::log_tagged_fmt("api_monitor",
+        "clear_armed_breakpoints_done source=%s requests=%llu succeeded=%u failed=%u elapsed_ms=%llu",
+        origin,
+        static_cast<unsigned long long>(requests.size()),
+        succeeded,
+        failed,
+        static_cast<unsigned long long>(elapsed));
 }
 
 inline void update_module_cache(uint32_t pid) {
@@ -1249,20 +1411,35 @@ inline void close_debug_event_handles(const DEBUG_EVENT& evt) {
 
 inline void debug_event_loop() {
     const uint32_t pid = pid_snapshot();
+    diag::log_tagged_fmt("api_monitor",
+        "debug_loop_enter pid=%u host_tid=%lu kernel=%d",
+        pid,
+        GetCurrentThreadId(),
+        driver_bridge::using_kernel_driver() ? 1 : 0);
     if (pid == 0 || !driver_bridge::using_kernel_driver()) {
         g_state.polling.store(false);
         g_state.debug_loop_running.store(false);
         g_state.active.store(false);
         g_state.debugger_error.store(ERROR_INVALID_PARAMETER);
+        diag::log_tagged_fmt("api_monitor",
+            "debug_loop_invalid pid=%u kernel=%d",
+            pid,
+            driver_bridge::using_kernel_driver() ? 1 : 0);
         return;
     }
 
     enable_debug_privilege();
+    diag::log_tagged_fmt("api_monitor", "debug_attach_begin pid=%u", pid);
     if (!DebugActiveProcess(pid)) {
-        g_state.debugger_error.store(GetLastError());
+        const DWORD gle = GetLastError();
+        g_state.debugger_error.store(gle);
         g_state.polling.store(false);
         g_state.debug_loop_running.store(false);
         g_state.active.store(false);
+        diag::log_tagged_fmt("api_monitor",
+            "debug_attach_failed pid=%u gle=%lu",
+            pid,
+            gle);
         return;
     }
 
@@ -1270,17 +1447,33 @@ inline void debug_event_loop() {
     g_state.debug_attached.store(true);
     g_state.debugger_error.store(0);
     update_module_cache(pid);
-    arm_existing_threads();
+    const uint32_t initial_armed = arm_existing_threads();
+    diag::log_tagged_fmt("api_monitor",
+        "debug_attach_ok pid=%u initial_armed=%u",
+        pid,
+        initial_armed);
 
     bool initial_break_pending = true;
+    uint64_t event_count = 0;
     while (g_state.polling.load()) {
         DEBUG_EVENT evt{};
         if (!WaitForDebugEvent(&evt, 100))
             continue;
 
+        ++event_count;
         DWORD continue_status = DBG_CONTINUE;
         if (evt.dwDebugEventCode == EXCEPTION_DEBUG_EVENT) {
             const DWORD code = evt.u.Exception.ExceptionRecord.ExceptionCode;
+            if (event_count <= 32 || code == EXCEPTION_SINGLE_STEP) {
+                diag::log_tagged_fmt("api_monitor",
+                    "debug_event_exception pid=%lu tid=%lu code=0x%08lX first=%lu addr=%p count=%llu",
+                    evt.dwProcessId,
+                    evt.dwThreadId,
+                    code,
+                    evt.u.Exception.dwFirstChance,
+                    evt.u.Exception.ExceptionRecord.ExceptionAddress,
+                    static_cast<unsigned long long>(event_count));
+            }
             if (code == EXCEPTION_SINGLE_STEP) {
                 if (!capture_breakpoint_hit(evt))
                     continue_status = DBG_EXCEPTION_NOT_HANDLED;
@@ -1291,12 +1484,29 @@ inline void debug_event_loop() {
                 continue_status = DBG_EXCEPTION_NOT_HANDLED;
             }
         } else if (evt.dwDebugEventCode == CREATE_THREAD_DEBUG_EVENT) {
+            diag::log_tagged_fmt("api_monitor",
+                "debug_event_create_thread pid=%lu tid=%lu",
+                evt.dwProcessId,
+                evt.dwThreadId);
             arm_breakpoints_for_thread(evt.dwThreadId);
         } else if (evt.dwDebugEventCode == EXIT_THREAD_DEBUG_EVENT) {
+            diag::log_tagged_fmt("api_monitor",
+                "debug_event_exit_thread pid=%lu tid=%lu",
+                evt.dwProcessId,
+                evt.dwThreadId);
             remove_thread_armed(evt.dwThreadId);
         } else if (evt.dwDebugEventCode == LOAD_DLL_DEBUG_EVENT || evt.dwDebugEventCode == UNLOAD_DLL_DEBUG_EVENT) {
+            diag::log_tagged_fmt("api_monitor",
+                "debug_event_module pid=%lu tid=%lu code=%lu",
+                evt.dwProcessId,
+                evt.dwThreadId,
+                evt.dwDebugEventCode);
             update_module_cache(pid);
         } else if (evt.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT) {
+            diag::log_tagged_fmt("api_monitor",
+                "debug_event_exit_process pid=%lu tid=%lu",
+                evt.dwProcessId,
+                evt.dwThreadId);
             g_state.active.store(false);
             g_state.polling.store(false);
         }
@@ -1305,17 +1515,58 @@ inline void debug_event_loop() {
         ContinueDebugEvent(evt.dwProcessId, evt.dwThreadId, continue_status);
     }
 
-    clear_armed_breakpoints();
-    if (g_state.debug_attached.exchange(false))
-        DebugActiveProcessStop(pid);
+    clear_armed_breakpoints("debug_loop");
+    if (g_state.debug_attached.exchange(false)) {
+        const BOOL stopped = DebugActiveProcessStop(pid);
+        diag::log_tagged_fmt("api_monitor",
+            "debug_detach pid=%u ok=%d gle=%lu events=%llu",
+            pid,
+            stopped ? 1 : 0,
+            GetLastError(),
+            static_cast<unsigned long long>(event_count));
+    }
     g_state.debug_loop_running.store(false);
+    diag::log_tagged_fmt("api_monitor",
+        "debug_loop_exit pid=%u events=%llu",
+        pid,
+        static_cast<unsigned long long>(event_count));
 }
 
 inline void stop() {
+    diag::log_tagged_fmt("api_monitor",
+        "stop_enter active=%d polling=%d debug_loop=%d attached=%d pid=%u",
+        g_state.active.load() ? 1 : 0,
+        g_state.polling.load() ? 1 : 0,
+        g_state.debug_loop_running.load() ? 1 : 0,
+        g_state.debug_attached.load() ? 1 : 0,
+        pid_snapshot());
+    const uint64_t stop_start = GetTickCount64();
+    const uint32_t pid = pid_snapshot();
     g_state.polling.store(false);
-    for (int i = 0; i < 60 && g_state.debug_loop_running.load(); ++i)
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    clear_armed_breakpoints();
+    int waited = 0;
+    for (; waited < 60 && g_state.debug_loop_running.load(); ++waited)
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    diag::log_tagged_fmt("api_monitor",
+        "stop_wait_done pid=%u waited_ms=%llu iterations=%d debug_loop=%d attached=%d",
+        pid,
+        static_cast<unsigned long long>(GetTickCount64() - stop_start),
+        waited,
+        g_state.debug_loop_running.load() ? 1 : 0,
+        g_state.debug_attached.load() ? 1 : 0);
+    if (pid != 0 && g_state.debug_loop_running.load() && g_state.debug_attached.exchange(false)) {
+        const BOOL stopped = DebugActiveProcessStop(pid);
+        diag::log_tagged_fmt("api_monitor",
+            "stop_detach_slow_debug_loop pid=%u ok=%d gle=%lu waited_ms=%llu",
+            pid,
+            stopped ? 1 : 0,
+            GetLastError(),
+            static_cast<unsigned long long>(GetTickCount64() - stop_start));
+    } else if (pid == 0 && g_state.debug_loop_running.load() && g_state.debug_attached.load()) {
+        diag::log_tagged_fmt("api_monitor",
+            "stop_detach_slow_debug_loop_skipped pid=0 waited_ms=%llu",
+            static_cast<unsigned long long>(GetTickCount64() - stop_start));
+    }
+    clear_armed_breakpoints("stop");
     {
         std::lock_guard<std::mutex> lock(g_state.mutex);
         for (auto& target : g_state.targets)
@@ -1327,6 +1578,16 @@ inline void stop() {
         g_state.pid = 0;
     }
     g_state.active.store(false);
+    diag::log_tagged_fmt("api_monitor",
+        "stop_exit active=%d polling=%d debug_loop=%d attached=%d elapsed_ms=%llu cleanup_requests=%u cleanup_ok=%u cleanup_failed=%u",
+        g_state.active.load() ? 1 : 0,
+        g_state.polling.load() ? 1 : 0,
+        g_state.debug_loop_running.load() ? 1 : 0,
+        g_state.debug_attached.load() ? 1 : 0,
+        static_cast<unsigned long long>(GetTickCount64() - stop_start),
+        g_state.cleanup_last_requests.load(std::memory_order_relaxed),
+        g_state.cleanup_last_succeeded.load(std::memory_order_relaxed),
+        g_state.cleanup_last_failed.load(std::memory_order_relaxed));
 }
 
 inline bool start_polling(std::string& error) {
@@ -1344,12 +1605,20 @@ inline bool start_polling(std::string& error) {
     }
 
     g_state.polling.store(true);
-    if (!work_queue::post([]() { debug_event_loop(); })) {
+    std::string thread_err;
+    if (!aida::infra::win_thread::start_detached([]() { debug_event_loop(); },
+        &thread_err,
+        aida::infra::win_thread::default_stack_reserve,
+        "api_monitor.debug_loop")) {
         g_state.polling.store(false);
         g_state.debug_loop_running.store(false);
-        error = "Failed to schedule API monitor worker.";
+        error = "Failed to schedule API monitor worker: " + thread_err;
+        diag::log_tagged_fmt("api_monitor",
+            "start_polling_thread_failed err=%s",
+            thread_err.c_str());
         return false;
     }
+    diag::log_tagged_fmt("api_monitor", "start_polling_thread_started");
 
     for (int i = 0; i < 60; ++i) {
         if (g_state.debug_attached.load())
@@ -1588,9 +1857,15 @@ inline nlohmann::json status_json() {
     j["active"] = g_state.active.load();
     j["debug_attached"] = g_state.debug_attached.load();
     j["debug_loop_running"] = g_state.debug_loop_running.load();
+    j["cleanup_running"] = g_state.cleanup_running.load();
     j["debugger_error"] = static_cast<unsigned long>(g_state.debugger_error.load());
     j["total_hits"] = g_state.total_hits.load(std::memory_order_relaxed);
     j["armed_thread_breakpoints"] = armed;
+    j["cleanup_attempts"] = g_state.cleanup_attempts.load(std::memory_order_relaxed);
+    j["cleanup_last_elapsed_ms"] = g_state.cleanup_last_elapsed_ms.load(std::memory_order_relaxed);
+    j["cleanup_last_requests"] = g_state.cleanup_last_requests.load(std::memory_order_relaxed);
+    j["cleanup_last_succeeded"] = g_state.cleanup_last_succeeded.load(std::memory_order_relaxed);
+    j["cleanup_last_failed"] = g_state.cleanup_last_failed.load(std::memory_order_relaxed);
     return j;
 }
 

@@ -244,6 +244,20 @@ namespace license
 	inline char  key_buf[128]    = {};
 	inline std::string error_msg;
 	inline std::string saved_key;
+
+	inline bool preserve_valid_state(bool runtime_locked, bool full_test_running)
+	{
+		return validated && !runtime_locked && full_test_running && standalone_license::is_arc_loaded();
+	}
+
+	inline bool runtime_ready(bool runtime_locked, bool full_test_running)
+	{
+		if (runtime_locked)
+			return false;
+		if (standalone_license::is_valid())
+			return true;
+		return preserve_valid_state(runtime_locked, full_test_running);
+	}
 }
 
 

@@ -511,6 +511,17 @@ namespace aida_tracer {
     inline std::atomic<int> g_dx11_fb_scale_w1000{0};
     inline std::atomic<int> g_dx11_fb_scale_h1000{0};
     inline std::atomic<long> g_dx11_device_removed{S_OK};
+    inline std::atomic<uint64_t> g_dx11_draw_cmd_count{0};
+    inline std::atomic<uint64_t> g_dx11_user_callback_count{0};
+    inline std::atomic<uint64_t> g_dx11_reset_callback_count{0};
+    inline std::atomic<UINT_PTR> g_dx11_first_callback{0};
+    inline std::atomic<UINT_PTR> g_dx11_first_callback_data{0};
+    inline std::atomic<UINT_PTR> g_dx11_first_texture{0};
+    inline std::atomic<uint64_t> g_dx11_texture_hash{0};
+    inline std::atomic<uint64_t> g_dx11_max_elem_count{0};
+    inline std::atomic<uint32_t> g_dx11_bad_flags{0};
+    inline std::atomic<int> g_dx11_bad_list{ -1 };
+    inline std::atomic<int> g_dx11_bad_cmd{ -1 };
     inline std::atomic<uint64_t> g_present_frame{0};
     inline std::atomic<uint64_t> g_present_enter_tick_ms{0};
     inline std::atomic<UINT_PTR> g_present_swapchain{0};
@@ -652,6 +663,15 @@ namespace aida_tracer {
         return static_cast<int>(v * 1000.0f);
     }
 
+    inline bool sane_float(float v) {
+        return v == v && v > -10000000.0f && v < 10000000.0f;
+    }
+
+    inline uint64_t mix_u64(uint64_t h, uint64_t v) {
+        h ^= v + 0x9E3779B97F4A7C15ULL + (h << 6) + (h >> 2);
+        return h;
+    }
+
     inline void describe_address(uint64_t va, char* out, size_t out_size) {
         if (!out || out_size == 0) return;
         out[0] = 0;
@@ -740,7 +760,7 @@ namespace aida_tracer {
         char rip_desc[1024] = {};
         describe_address(rip, rip_desc, sizeof(rip_desc));
 
-        uint64_t stack_values[12] = {};
+        uint64_t stack_values[64] = {};
         SIZE_T copied = 0;
         if (rsp != 0)
             ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(rsp), stack_values, sizeof(stack_values), &copied);
@@ -784,7 +804,7 @@ namespace aida_tracer {
             static_cast<unsigned long long>(stack_values[9]),
             static_cast<unsigned long long>(stack_values[10]),
             static_cast<unsigned long long>(stack_values[11]));
-        for (size_t i = 0; i < 12; ++i) {
+        for (size_t i = 0; i < 64; ++i) {
             if (stack_values[i] == 0)
                 continue;
             char slot_desc[1024] = {};
@@ -836,6 +856,141 @@ namespace aida_tracer {
         mark_render_phase(stage);
     }
 
+    inline uint32_t inspect_dx11_draw_data(ImDrawData* dd, uint64_t frame) {
+        uint64_t draw_cmds = 0;
+        uint64_t user_callbacks = 0;
+        uint64_t reset_callbacks = 0;
+        UINT_PTR first_callback = 0;
+        UINT_PTR first_callback_data = 0;
+        UINT_PTR first_texture = 0;
+        uint64_t texture_hash = 14695981039346656037ULL;
+        uint64_t max_elem_count = 0;
+        uint32_t bad_flags = 0;
+        int bad_list = -1;
+        int bad_cmd = -1;
+
+        if (!dd) {
+            bad_flags |= 0x00000001u;
+        } else {
+            if (!sane_float(dd->DisplaySize.x) || !sane_float(dd->DisplaySize.y) ||
+                !sane_float(dd->FramebufferScale.x) || !sane_float(dd->FramebufferScale.y) ||
+                dd->DisplaySize.x < 0.0f || dd->DisplaySize.y < 0.0f ||
+                dd->FramebufferScale.x <= 0.0f || dd->FramebufferScale.y <= 0.0f) {
+                bad_flags |= 0x00000002u;
+            }
+            if (dd->CmdListsCount < 0 || dd->CmdListsCount > 4096 ||
+                dd->TotalVtxCount < 0 || dd->TotalVtxCount > 4000000 ||
+                dd->TotalIdxCount < 0 || dd->TotalIdxCount > 8000000) {
+                bad_flags |= 0x00000004u;
+            }
+            if (dd->CmdListsCount > 0 && !dd->CmdLists.Data) {
+                bad_flags |= 0x00000008u;
+            }
+            if (dd->CmdLists.Size != dd->CmdListsCount) {
+                bad_flags |= 0x00000100u;
+            }
+            int list_count = dd->CmdListsCount;
+            if (list_count < 0) list_count = 0;
+            if (list_count > 4096) list_count = 4096;
+            if (list_count > dd->CmdLists.Size)
+                list_count = dd->CmdLists.Size;
+            for (int i = 0; i < list_count; ++i) {
+                ImDrawList* list = dd->CmdLists.Data ? dd->CmdLists[i] : nullptr;
+                if (!list) {
+                    bad_flags |= 0x00000010u;
+                    if (bad_list < 0) bad_list = i;
+                    continue;
+                }
+                if (list->CmdBuffer.Size < 0 || list->CmdBuffer.Size > 200000 ||
+                    list->VtxBuffer.Size < 0 || list->VtxBuffer.Size > 4000000 ||
+                    list->IdxBuffer.Size < 0 || list->IdxBuffer.Size > 8000000) {
+                    bad_flags |= 0x00000020u;
+                    if (bad_list < 0) bad_list = i;
+                }
+                int cmd_count = list->CmdBuffer.Size;
+                if (cmd_count < 0) cmd_count = 0;
+                if (cmd_count > 200000) cmd_count = 200000;
+                for (int j = 0; j < cmd_count; ++j) {
+                    ImDrawCmd& cmd = list->CmdBuffer[j];
+                    ++draw_cmds;
+                    ImTextureID tex_id = cmd.GetTexID();
+                    UINT_PTR tex = 0;
+                    std::memcpy(&tex, &tex_id, std::min(sizeof(tex), sizeof(tex_id)));
+                    if (first_texture == 0 && tex != 0)
+                        first_texture = tex;
+                    texture_hash = mix_u64(texture_hash, static_cast<uint64_t>(tex));
+                    texture_hash = mix_u64(texture_hash, static_cast<uint64_t>(cmd.ElemCount));
+                    if (cmd.ElemCount > max_elem_count)
+                        max_elem_count = cmd.ElemCount;
+                    if (!sane_float(cmd.ClipRect.x) || !sane_float(cmd.ClipRect.y) ||
+                        !sane_float(cmd.ClipRect.z) || !sane_float(cmd.ClipRect.w) ||
+                        cmd.ClipRect.z < cmd.ClipRect.x || cmd.ClipRect.w < cmd.ClipRect.y) {
+                        bad_flags |= 0x00000040u;
+                        if (bad_list < 0) bad_list = i;
+                        if (bad_cmd < 0) bad_cmd = j;
+                    }
+                    uint64_t idx_size = static_cast<uint64_t>(list->IdxBuffer.Size);
+                    uint64_t vtx_size = static_cast<uint64_t>(list->VtxBuffer.Size);
+                    uint64_t idx_offset = static_cast<uint64_t>(cmd.IdxOffset);
+                    uint64_t elem_count = static_cast<uint64_t>(cmd.ElemCount);
+                    if (idx_offset > idx_size ||
+                        static_cast<uint64_t>(cmd.VtxOffset) > vtx_size ||
+                        elem_count > idx_size ||
+                        idx_offset + elem_count > idx_size) {
+                        bad_flags |= 0x00000080u;
+                        if (bad_list < 0) bad_list = i;
+                        if (bad_cmd < 0) bad_cmd = j;
+                    }
+                    if (cmd.UserCallback) {
+                        if (cmd.UserCallback == ImDrawCallback_ResetRenderState) {
+                            ++reset_callbacks;
+                        } else {
+                            ++user_callbacks;
+                            if (first_callback == 0) {
+                                first_callback = reinterpret_cast<UINT_PTR>(cmd.UserCallback);
+                                first_callback_data = reinterpret_cast<UINT_PTR>(cmd.UserCallbackData);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        g_dx11_draw_cmd_count.store(draw_cmds, std::memory_order_release);
+        g_dx11_user_callback_count.store(user_callbacks, std::memory_order_release);
+        g_dx11_reset_callback_count.store(reset_callbacks, std::memory_order_release);
+        g_dx11_first_callback.store(first_callback, std::memory_order_release);
+        g_dx11_first_callback_data.store(first_callback_data, std::memory_order_release);
+        g_dx11_first_texture.store(first_texture, std::memory_order_release);
+        g_dx11_texture_hash.store(texture_hash, std::memory_order_release);
+        g_dx11_max_elem_count.store(max_elem_count, std::memory_order_release);
+        g_dx11_bad_flags.store(bad_flags, std::memory_order_release);
+        g_dx11_bad_list.store(bad_list, std::memory_order_release);
+        g_dx11_bad_cmd.store(bad_cmd, std::memory_order_release);
+
+        if (bad_flags != 0 || user_callbacks != 0) {
+            diag::log_tagged_critical_fmt("render",
+                "dx11_drawdata_inspect frame=%llu bad=0x%08lX bad_list=%d bad_cmd=%d lists=%d total_vtx=%d total_idx=%d draw_cmds=%llu callbacks=%llu reset_callbacks=%llu first_cb=0x%llX cb_data=0x%llX first_tex=0x%llX tex_hash=0x%016llX max_elem=%llu full_test=%d",
+                static_cast<unsigned long long>(frame),
+                static_cast<unsigned long>(bad_flags),
+                bad_list,
+                bad_cmd,
+                dd ? dd->CmdListsCount : -1,
+                dd ? dd->TotalVtxCount : -1,
+                dd ? dd->TotalIdxCount : -1,
+                static_cast<unsigned long long>(draw_cmds),
+                static_cast<unsigned long long>(user_callbacks),
+                static_cast<unsigned long long>(reset_callbacks),
+                static_cast<unsigned long long>(first_callback),
+                static_cast<unsigned long long>(first_callback_data),
+                static_cast<unsigned long long>(first_texture),
+                static_cast<unsigned long long>(texture_hash),
+                static_cast<unsigned long long>(max_elem_count),
+                test_all_features::is_running() ? 1 : 0);
+        }
+        return bad_flags;
+    }
+
     inline void set_present_state(const char* stage, uint64_t frame, IDXGISwapChain* sc, HRESULT hr) {
         g_present_frame.store(frame, std::memory_order_release);
         g_present_enter_tick_ms.store(static_cast<uint64_t>(GetTickCount64()), std::memory_order_release);
@@ -857,6 +1012,7 @@ namespace aida_tracer {
             uint64_t last_tick = g_render_last_tick_ms.load(std::memory_order_acquire);
             uint64_t phase_id = g_render_phase_id.load(std::memory_order_acquire);
             const char* phase_name = g_render_phase_name.load(std::memory_order_acquire);
+            const char* render_section = g_render_section;
             uint64_t attach_phase_id = g_attach_phase_id.load(std::memory_order_acquire);
             const char* attach_phase = g_attach_phase_name.load(std::memory_order_acquire);
             DWORD render_tid = g_render_thread_id.load(std::memory_order_acquire);
@@ -885,11 +1041,12 @@ namespace aida_tracer {
                 stall_streak++;
                 if (stall_streak == 1 || (stall_streak % 20ULL) == 0ULL) {
                     diag::log_tagged_critical_fmt("tracer",
-                        "RENDER_STALL streak=%llu frame=%llu age_ms=%llu phase=%s phase_id=%llu render_tid=%lu attach=%s attach_id=%llu peek_qs=0x%08lX peek_gle=%lu dispatch=%s msg=%s(0x%04X) hwnd=0x%llX wp=0x%llX lp=0x%llX wndproc=%s msg=%s(0x%04X) hwnd=0x%llX wp=0x%llX lp=0x%llX dx_frame=%llu dx_age_ms=%llu dx_dd=0x%llX dx_dev=0x%llX dx_ctx=0x%llX dx_rtv=0x%llX dx_cmd=%llu dx_vtx=%llu dx_idx=%llu dx_disp1000=%d,%d dx_fb1000=%d,%d dx_removed=0x%08lX present_frame=%llu present_age_ms=%llu present_sc=0x%llX present_hr=0x%08lX tracer_tid=%lu",
+                        "RENDER_STALL streak=%llu frame=%llu age_ms=%llu phase=%s section=%s phase_id=%llu render_tid=%lu attach=%s attach_id=%llu peek_qs=0x%08lX peek_gle=%lu dispatch=%s msg=%s(0x%04X) hwnd=0x%llX wp=0x%llX lp=0x%llX wndproc=%s msg=%s(0x%04X) hwnd=0x%llX wp=0x%llX lp=0x%llX dx_frame=%llu dx_age_ms=%llu dx_dd=0x%llX dx_dev=0x%llX dx_ctx=0x%llX dx_rtv=0x%llX dx_lists=%llu dx_draw_cmds=%llu dx_vtx=%llu dx_idx=%llu dx_callbacks=%llu dx_reset_callbacks=%llu dx_first_cb=0x%llX dx_cb_data=0x%llX dx_first_tex=0x%llX dx_tex_hash=0x%016llX dx_max_elem=%llu dx_bad=0x%08lX dx_bad_at=%d,%d dx_disp1000=%d,%d dx_fb1000=%d,%d dx_removed=0x%08lX present_frame=%llu present_age_ms=%llu present_sc=0x%llX present_hr=0x%08lX tracer_tid=%lu",
                         (unsigned long long)stall_streak,
                         (unsigned long long)frame,
                         (unsigned long long)age_ms,
                         phase_name ? phase_name : "<null>",
+                        render_section ? render_section : "<null>",
                         (unsigned long long)phase_id,
                         render_tid,
                         attach_phase ? attach_phase : "<null>",
@@ -915,8 +1072,19 @@ namespace aida_tracer {
                         static_cast<unsigned long long>(g_dx11_context.load(std::memory_order_acquire)),
                         static_cast<unsigned long long>(g_dx11_rtv.load(std::memory_order_acquire)),
                         static_cast<unsigned long long>(g_dx11_cmd_lists.load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(g_dx11_draw_cmd_count.load(std::memory_order_acquire)),
                         static_cast<unsigned long long>(g_dx11_vtx_count.load(std::memory_order_acquire)),
                         static_cast<unsigned long long>(g_dx11_idx_count.load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(g_dx11_user_callback_count.load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(g_dx11_reset_callback_count.load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(g_dx11_first_callback.load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(g_dx11_first_callback_data.load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(g_dx11_first_texture.load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(g_dx11_texture_hash.load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(g_dx11_max_elem_count.load(std::memory_order_acquire)),
+                        static_cast<unsigned long>(g_dx11_bad_flags.load(std::memory_order_acquire)),
+                        g_dx11_bad_list.load(std::memory_order_acquire),
+                        g_dx11_bad_cmd.load(std::memory_order_acquire),
                         g_dx11_display_w1000.load(std::memory_order_acquire),
                         g_dx11_display_h1000.load(std::memory_order_acquire),
                         g_dx11_fb_scale_w1000.load(std::memory_order_acquire),
@@ -1317,6 +1485,21 @@ __declspec(noinline) static DWORD seh_imgui_dx11_render(ImDrawData* dd, uint64_t
             g_pd3dDeviceContext,
             g_mainRenderTargetView,
             removed);
+        uint32_t draw_bad = aida_tracer::inspect_dx11_draw_data(dd, frame_number);
+        if (draw_bad != 0) {
+            diag::log_tagged_critical_fmt("render",
+                "imgui_dx11_render_skipped_invalid_draw_data frame=%llu bad=0x%08lX",
+                static_cast<unsigned long long>(frame_number),
+                static_cast<unsigned long>(draw_bad));
+            aida_tracer::set_dx11_draw_state("imgui_dx11_render_invalid_skip",
+                frame_number,
+                dd,
+                g_pd3dDevice,
+                g_pd3dDeviceContext,
+                g_mainRenderTargetView,
+                removed);
+            return 0;
+        }
         ImGui_ImplDX11_RenderDrawData(dd);
         removed = g_pd3dDevice ? g_pd3dDevice->GetDeviceRemovedReason() : E_POINTER;
         aida_tracer::set_dx11_draw_state("imgui_dx11_render_returned",
@@ -2821,7 +3004,7 @@ int main(int, char**)
 
         int cur_state = 0;
         const bool runtime_locked = anti_tamper::state::get().violation_latched.load(std::memory_order_acquire);
-        const bool license_ready = license::validated && standalone_license::is_valid() && !runtime_locked;
+        const bool license_ready = license::runtime_ready(runtime_locked, test_all_features::is_running());
         if (globals::ui::load_timer >= 3.0f) cur_state = 1;
         if (globals::ui::welcome_done && !license_ready) cur_state = 2;
         if (globals::ui::welcome_done && license_ready) cur_state = 3;
@@ -3345,8 +3528,9 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         bool bottom = pt.y > rc.bottom - border;
 
 
-        if (globals::ui::welcome_done && license::validated && standalone_license::is_valid() &&
-            !anti_tamper::state::get().violation_latched.load(std::memory_order_acquire) &&
+        if (globals::ui::welcome_done &&
+            license::runtime_ready(anti_tamper::state::get().violation_latched.load(std::memory_order_acquire),
+                test_all_features::is_running()) &&
             !globals::ui::maximized) {
             if (top    && left)  return finish("nchittest_top_left", HTTOPLEFT);
             if (top    && right) return finish("nchittest_top_right", HTTOPRIGHT);

@@ -46,6 +46,131 @@ namespace
     {
         return standalone_license::get_arc_comm_bridge();
     }
+
+    using arc_set_process_id_fn = void (*)(uint32_t);
+    using arc_solve_dtb_fn = uint64_t (*)();
+    using arc_get_dtb_fn = uint64_t (*)();
+    using arc_find_image_fn = uint64_t (*)();
+    using arc_set_base_address_fn = void (*)(uint64_t);
+
+    struct guarded_arc_vtable_t
+    {
+        const arc_comm_vtable_t* table = nullptr;
+        DWORD exception_code = 0;
+    };
+
+    struct arc_vtable_slots_t
+    {
+        arc_set_process_id_fn set_process_id = nullptr;
+        arc_solve_dtb_fn solve_dtb = nullptr;
+        arc_get_dtb_fn get_dtb = nullptr;
+        arc_find_image_fn find_image = nullptr;
+        arc_set_base_address_fn set_base_address = nullptr;
+        DWORD exception_code = 0;
+    };
+
+    __declspec(noinline) guarded_arc_vtable_t get_arc_vtable_guarded()
+    {
+        guarded_arc_vtable_t result{};
+        __try {
+            result.table = get_arc_vtable();
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            result.table = nullptr;
+            result.exception_code = GetExceptionCode();
+        }
+        return result;
+    }
+
+    __declspec(noinline) arc_vtable_slots_t read_arc_vtable_slots_guarded(const arc_comm_vtable_t* table)
+    {
+        arc_vtable_slots_t slots{};
+        if (!table)
+            return slots;
+        __try {
+            slots.set_process_id = table->set_process_id;
+            slots.solve_dtb = table->solve_dtb;
+            slots.get_dtb = table->get_dtb;
+            slots.find_image = table->find_image;
+            slots.set_base_address = table->set_base_address;
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            slots = {};
+            slots.exception_code = GetExceptionCode();
+        }
+        return slots;
+    }
+
+    __declspec(noinline) DWORD call_arc_set_process_id_guarded(arc_set_process_id_fn fn, uint32_t pid)
+    {
+        DWORD seh_code = 0;
+        __try {
+            fn(pid);
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            seh_code = GetExceptionCode();
+        }
+        return seh_code;
+    }
+
+    __declspec(noinline) uint64_t call_arc_u64_guarded(arc_solve_dtb_fn fn, DWORD* out_seh_code)
+    {
+        if (out_seh_code)
+            *out_seh_code = 0;
+        uint64_t result = 0;
+        __try {
+            result = fn();
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            if (out_seh_code)
+                *out_seh_code = GetExceptionCode();
+            result = 0;
+        }
+        return result;
+    }
+
+    __declspec(noinline) uint64_t call_arc_get_dtb_guarded(arc_get_dtb_fn fn, DWORD* out_seh_code)
+    {
+        if (out_seh_code)
+            *out_seh_code = 0;
+        uint64_t result = 0;
+        __try {
+            result = fn();
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            if (out_seh_code)
+                *out_seh_code = GetExceptionCode();
+            result = 0;
+        }
+        return result;
+    }
+
+    __declspec(noinline) uint64_t call_arc_find_image_guarded(arc_find_image_fn fn, DWORD* out_seh_code)
+    {
+        if (out_seh_code)
+            *out_seh_code = 0;
+        uint64_t result = 0;
+        __try {
+            result = fn();
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            if (out_seh_code)
+                *out_seh_code = GetExceptionCode();
+            result = 0;
+        }
+        return result;
+    }
+
+    __declspec(noinline) DWORD call_arc_set_base_address_guarded(arc_set_base_address_fn fn, uint64_t base)
+    {
+        DWORD seh_code = 0;
+        __try {
+            fn(base);
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            seh_code = GetExceptionCode();
+        }
+        return seh_code;
+    }
+
+    template <typename Fn>
+    unsigned long long fn_bits(Fn fn)
+    {
+        return static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(fn));
+    }
     uint32_t        g_pid = 0;
     std::string     g_process_name;
     std::string     g_last_error;
@@ -1318,29 +1443,71 @@ namespace driver_bridge
             device->set_process_id(pid);
             diag::log_tagged_critical("driver", "attach_post_set_process_id");
 
-            const auto* vtable = get_arc_vtable();
-            diag::log_tagged_critical_fmt("driver", "attach_arc_vtable=%p", vtable);
+            const ULONGLONG arc_bridge_t0 = GetTickCount64();
+            diag::log_tagged_critical("driver", "attach_pre_get_arc_vtable");
+            const guarded_arc_vtable_t arc_bridge = get_arc_vtable_guarded();
+            const auto* vtable = arc_bridge.table;
+            diag::log_tagged_critical_fmt("driver",
+                "attach_post_get_arc_vtable vtable=%p exc=0x%08lX elapsed_ms=%llu",
+                vtable,
+                static_cast<unsigned long>(arc_bridge.exception_code),
+                static_cast<unsigned long long>(GetTickCount64() - arc_bridge_t0));
+            const arc_vtable_slots_t arc_slots = read_arc_vtable_slots_guarded(vtable);
+            diag::log_tagged_critical_fmt("driver",
+                "attach_arc_vtable_slots exc=0x%08lX set=0x%llX solve=0x%llX get=0x%llX image=0x%llX base=0x%llX",
+                static_cast<unsigned long>(arc_slots.exception_code),
+                fn_bits(arc_slots.set_process_id),
+                fn_bits(arc_slots.solve_dtb),
+                fn_bits(arc_slots.get_dtb),
+                fn_bits(arc_slots.find_image),
+                fn_bits(arc_slots.set_base_address));
             bool vtable_solved = false;
-            if (vtable && vtable->set_process_id && vtable->solve_dtb &&
-                vtable->get_dtb && vtable->find_image && vtable->set_base_address) {
+            if (vtable && arc_slots.exception_code == 0 && arc_slots.set_process_id &&
+                arc_slots.solve_dtb && arc_slots.get_dtb && arc_slots.find_image &&
+                arc_slots.set_base_address) {
                 diag::log_tagged_critical("driver", "attach_arc_vtable_pre_set_process_id");
-                vtable->set_process_id(pid);
+                const DWORD set_pid_exc = call_arc_set_process_id_guarded(arc_slots.set_process_id, pid);
+                diag::log_tagged_critical_fmt("driver",
+                    "attach_arc_vtable_post_set_process_id exc=0x%08lX",
+                    static_cast<unsigned long>(set_pid_exc));
                 diag::log_tagged_critical("driver", "attach_arc_vtable_pre_solve_dtb");
-                uint64_t dtb = vtable->solve_dtb();
-                diag::log_tagged_critical_fmt("driver", "attach_arc_vtable_post_solve_dtb dtb=0x%llX",
-                    (unsigned long long)dtb);
-                if (dtb != 0) {
+                DWORD solve_exc = 0;
+                uint64_t dtb = (set_pid_exc == 0)
+                    ? call_arc_u64_guarded(arc_slots.solve_dtb, &solve_exc)
+                    : 0;
+                diag::log_tagged_critical_fmt("driver",
+                    "attach_arc_vtable_post_solve_dtb dtb=0x%llX exc=0x%08lX",
+                    (unsigned long long)dtb,
+                    static_cast<unsigned long>(solve_exc));
+                if (dtb == 0 && set_pid_exc == 0 && solve_exc == 0) {
+                    DWORD get_exc = 0;
+                    diag::log_tagged_critical("driver", "attach_arc_vtable_pre_get_dtb");
+                    dtb = call_arc_get_dtb_guarded(arc_slots.get_dtb, &get_exc);
+                    diag::log_tagged_critical_fmt("driver",
+                        "attach_arc_vtable_post_get_dtb dtb=0x%llX exc=0x%08lX",
+                        (unsigned long long)dtb,
+                        static_cast<unsigned long>(get_exc));
+                }
+                if (dtb != 0 && set_pid_exc == 0 && solve_exc == 0) {
                     vtable_solved = true;
                     diag::log_tagged_critical("driver", "attach_arc_vtable_pre_find_image");
-                    const auto image_base = vtable->find_image();
-                    diag::log_tagged_critical_fmt("driver", "attach_arc_vtable_post_find_image base=0x%llX",
-                        (unsigned long long)image_base);
-                    if (image_base != 0)
-                        vtable->set_base_address(image_base);
+                    DWORD find_exc = 0;
+                    const auto image_base = call_arc_find_image_guarded(arc_slots.find_image, &find_exc);
+                    diag::log_tagged_critical_fmt("driver",
+                        "attach_arc_vtable_post_find_image base=0x%llX exc=0x%08lX",
+                        (unsigned long long)image_base,
+                        static_cast<unsigned long>(find_exc));
+                    if (image_base != 0 && find_exc == 0) {
+                        const DWORD base_exc = call_arc_set_base_address_guarded(arc_slots.set_base_address, image_base);
+                        diag::log_tagged_critical_fmt("driver",
+                            "attach_arc_vtable_post_set_base_address base=0x%llX exc=0x%08lX",
+                            (unsigned long long)image_base,
+                            static_cast<unsigned long>(base_exc));
+                    }
                     diag::log_tagged_critical("driver", "attach_pre_device_solve_dtb_after_vtable");
                     device->solve_dtb();
                     diag::log_tagged_critical("driver", "attach_post_device_solve_dtb_after_vtable");
-                    if (image_base != 0)
+                    if (image_base != 0 && find_exc == 0)
                         device->set_base_address(image_base);
                 }
             }

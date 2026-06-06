@@ -7,6 +7,7 @@
 #include "function_index.hpp"
 #include "rename_store.hpp"
 #include "work_queue.hpp"
+#include "../infra/critical_work_queue.hpp"
 #include "../helpers/diag_log.hpp"
 
 #include <atomic>
@@ -73,10 +74,15 @@ static tool_result_t handle_decompile_function(const json& params)
         bool                                    done = false;
         ghidra_decompiler::ghidra_result_t      result;
         std::atomic<bool>                       cancel{false};
+        std::atomic<bool>                       claimed{false};
+        std::atomic<bool>                       started{false};
     };
     auto slot = std::make_shared<slot_t>();
 
-    bool posted = work_queue::post([slot, addr]() {
+    auto run_decompile = [slot, addr]() {
+        if (slot->claimed.exchange(true, std::memory_order_acq_rel))
+            return;
+        slot->started.store(true, std::memory_order_release);
         diag::log_tagged_fmt("decomp_tools", "decompile_function_work_start addr=0x%llX",
             static_cast<unsigned long long>(addr));
         ghidra_decompiler::ghidra_result_t r =
@@ -87,15 +93,28 @@ static tool_result_t handle_decompile_function(const json& params)
         std::lock_guard<std::mutex> lk(slot->mtx);
         slot->result = std::move(r);
         slot->done = true;
-    });
+    };
+    bool posted = critical_work_queue::post(run_decompile) || work_queue::post(run_decompile);
     if (!posted) {
-        diag::log_tagged_fmt("decomp_tools", "decompile_function_post_failed addr=0x%llX",
+        diag::log_tagged_fmt("decomp_tools", "decompile_function_post_failed_running_inline addr=0x%llX",
             static_cast<unsigned long long>(addr));
-        slot->cancel.store(true);
-        return tool_result_t::error("Failed to schedule decompilation work item.");
+        run_decompile();
     }
     diag::log_tagged_fmt("decomp_tools", "decompile_function_posted addr=0x%llX waiting_timeout=%d",
         static_cast<unsigned long long>(addr), timeout_sec);
+
+    if (posted) {
+        auto start_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+        while (!slot->started.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < start_deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        if (!slot->started.load(std::memory_order_acquire)) {
+            diag::log_tagged_fmt("decomp_tools", "decompile_function_queue_stalled_inline addr=0x%llX",
+                static_cast<unsigned long long>(addr));
+            run_decompile();
+        }
+    }
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_sec);
     while (std::chrono::steady_clock::now() < deadline) {

@@ -432,10 +432,12 @@ inline bool start_hunt(uint64_t target_address, uint64_t target_size)
 	const bool run_install_inline = target_size <= 4096;
 	if (run_install_inline) {
 		diag::log_tagged_fmt("integrity_hunter",
-			"start_inline_worker target=0x%llX size=0x%llX gen=%llu",
+			"start_queue_worker target=0x%llX size=0x%llX gen=%llu",
 			static_cast<unsigned long long>(target_address),
 			static_cast<unsigned long long>(target_size),
 			static_cast<unsigned long long>(generation));
+		if (critical_work_queue::post(worker) || work_queue::post(worker))
+			return true;
 		try {
 			std::thread(std::move(worker)).detach();
 			return true;

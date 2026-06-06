@@ -1252,11 +1252,13 @@ void helpers::render_title()
 
 	g_render_section = "inline_checks";
 	{
+		g_render_section = "inline_checks_cross_validation";
 		static uint64_t s_frame_ctr = 0;
 		standalone_license::cross_validation_sweep(static_cast<int>(s_frame_ctr++));
 	}
 
 	{
+		g_render_section = "inline_checks_anti_tamper_fast";
 		uint64_t tok = anti_tamper::run_inline_check(anti_tamper::CHECK_FAST);
 		standalone_license::fold_integrity_token(tok);
 		static uint64_t s_inline_log_ctr = 0;
@@ -1273,6 +1275,7 @@ void helpers::render_title()
 	}
 
 	{
+		g_render_section = "inline_checks_gate_ui_render_loop";
 		uint64_t gt = standalone_license::inline_gate_check(
 			standalone_license::gate_ui_render_loop);
 		(void)standalone_license::verify_gate_token(
@@ -1280,13 +1283,18 @@ void helpers::render_title()
 	}
 
 	{
+		g_render_section = "inline_checks_runtime_lock_state";
 		const bool runtime_locked = anti_tamper::state::get().violation_latched.load(std::memory_order_acquire);
+		const bool full_test_running = test_all_features::is_running();
+		const bool canonical_valid = standalone_license::is_valid();
 		static bool s_runtime_lock_logged = false;
+		static bool s_full_test_validity_bridge_logged = false;
 		if (runtime_locked) {
 			license::validated = false;
 			license::checking = false;
 			license::check_failed = false;
 			license::error_msg = "Runtime integrity check failed. Restart AiDAStandalone.exe.";
+			s_full_test_validity_bridge_logged = false;
 			if (!s_runtime_lock_logged) {
 				std::string reason;
 				{
@@ -1299,17 +1307,35 @@ void helpers::render_title()
 					reason.c_str());
 				s_runtime_lock_logged = true;
 			}
-		} else if (!license::validated && standalone_license::is_valid()) {
+		} else if (canonical_valid) {
+			const bool recovered = !license::validated || license::check_failed || license::checking;
 			license::validated = true;
 			license::checking = false;
 			license::check_failed = false;
 			license::error_msg.clear();
 			s_runtime_lock_logged = false;
-			diag::log_tagged("license", "DIAG_DIALOG_RECOVERED_RUNTIME_VALIDITY");
+			s_full_test_validity_bridge_logged = false;
+			if (recovered)
+				diag::log_tagged("license", "DIAG_DIALOG_RECOVERED_RUNTIME_VALIDITY");
+		} else if (license::preserve_valid_state(runtime_locked, full_test_running)) {
+			license::checking = false;
+			license::check_failed = false;
+			license::error_msg.clear();
+			s_runtime_lock_logged = false;
+			if (!s_full_test_validity_bridge_logged) {
+				diag::log_tagged_fmt("license",
+					"DIAG_DIALOG_SUPPRESSED_TRANSIENT_INVALID source=render_title full_test=1 arc=%d frame=%d",
+					standalone_license::is_arc_loaded() ? 1 : 0,
+					ImGui::GetFrameCount());
+				s_full_test_validity_bridge_logged = true;
+			}
+		} else {
+			s_full_test_validity_bridge_logged = false;
 		}
 	}
 
-	const bool runtime_ready = license::validated && standalone_license::is_valid();
+	const bool runtime_locked_for_ready = anti_tamper::state::get().violation_latched.load(std::memory_order_acquire);
+	const bool runtime_ready = license::runtime_ready(runtime_locked_for_ready, test_all_features::is_running());
 
 	g_render_section = "theme_resolve";
 	if (custom_themes::active_custom >= 0 &&
@@ -2552,6 +2578,19 @@ void helpers::render_title()
 
 		if ((enter || btn_clicked) && !license::checking && strlen(license::key_buf) > 0)
 		{
+			const bool submit_runtime_locked = anti_tamper::state::get().violation_latched.load(std::memory_order_acquire);
+			if (license::runtime_ready(submit_runtime_locked, test_all_features::is_running())) {
+				license::checking = false;
+				license::check_failed = false;
+				license::error_msg.clear();
+				diag::log_tagged_fmt("license",
+					"DIAG_DIALOG_SUBMIT_IGNORED_RUNTIME_READY enter=%d click=%d key_len=%llu frame=%d",
+					enter ? 1 : 0, btn_clicked ? 1 : 0,
+					static_cast<unsigned long long>(strlen(license::key_buf)),
+					ImGui::GetFrameCount());
+				ImGui::End();
+				return;
+			}
 			license::checking    = true;
 			license::check_failed = false;
 			license::error_msg.clear();
@@ -8061,16 +8100,26 @@ void helpers::render_title()
 			s_lic_check_counter = 0;
 			if (license::validated && !standalone_license::is_valid()) {
 				const bool runtime_locked = anti_tamper::state::get().violation_latched.load(std::memory_order_acquire);
-				license::validated = false;
-				license::error_msg = runtime_locked
-					? std::string("Runtime integrity check failed. Restart AiDAStandalone.exe.")
-					: standalone_license::last_error();
-				output_log::push(bottom_tab_t::output, runtime_locked
-					? std::string("[license] Runtime integrity lock, activation screen suppressed")
-					: std::string("[license] Session invalidated: " + license::error_msg));
-				diag::log_tagged_fmt("license",
-					"DIAG_DIALOG_TRIGGER source=periodic_check_120f frame=%d runtime_locked=%d err=%.200s",
-					ImGui::GetFrameCount(), runtime_locked ? 1 : 0, license::error_msg.c_str());
+				if (license::preserve_valid_state(runtime_locked, test_all_features::is_running())) {
+					license::checking = false;
+					license::check_failed = false;
+					license::error_msg.clear();
+					diag::log_tagged_fmt("license",
+						"DIAG_DIALOG_TRIGGER_SUPPRESSED source=periodic_check_120f frame=%d full_test=1 arc=%d",
+						ImGui::GetFrameCount(),
+						standalone_license::is_arc_loaded() ? 1 : 0);
+				} else {
+					license::validated = false;
+					license::error_msg = runtime_locked
+						? std::string("Runtime integrity check failed. Restart AiDAStandalone.exe.")
+						: standalone_license::last_error();
+					output_log::push(bottom_tab_t::output, runtime_locked
+						? std::string("[license] Runtime integrity lock, activation screen suppressed")
+						: std::string("[license] Session invalidated: " + license::error_msg));
+					diag::log_tagged_fmt("license",
+						"DIAG_DIALOG_TRIGGER source=periodic_check_120f frame=%d runtime_locked=%d err=%.200s",
+						ImGui::GetFrameCount(), runtime_locked ? 1 : 0, license::error_msg.c_str());
+				}
 			}
 		}
 	}

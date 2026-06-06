@@ -291,7 +291,7 @@ void run_audit(std::shared_ptr<audit_runtime_t> rt_ptr)
             insertion_point_t ip_copy = ip;
             rt_ptr->queued_workers.fetch_add(1, std::memory_order_relaxed);
             rt_ptr->active_workers.fetch_add(1, std::memory_order_relaxed);
-            work_queue::post([captured, mod_copy, ip_copy]() {
+            const bool posted = work_queue::post([captured, mod_copy, ip_copy]() {
                 struct worker_guard_t
                 {
                     std::shared_ptr<audit_runtime_t> rt;
@@ -303,6 +303,20 @@ void run_audit(std::shared_ptr<audit_runtime_t> rt_ptr)
                 } guard{captured};
                 run_module_for_point(captured, mod_copy, ip_copy);
             });
+            if (!posted) {
+                rt_ptr->active_workers.fetch_sub(1, std::memory_order_acq_rel);
+                rt_ptr->cancel_cv.notify_all();
+                diag::log_tagged_fmt("burp", "active_scanner worker_post_failed id=%llu module=%s ip=%s/%s",
+                    static_cast<unsigned long long>(rt_ptr->status.id),
+                    mod.id.c_str(),
+                    ip.kind.c_str(),
+                    ip.name.c_str());
+                {
+                    std::lock_guard<std::mutex> lk(rt_ptr->status_mtx);
+                    if (rt_ptr->status.completed_probes < rt_ptr->status.total_probes)
+                        rt_ptr->status.completed_probes++;
+                }
+            }
         }
     }
 
@@ -329,6 +343,7 @@ void run_audit(std::shared_ptr<audit_runtime_t> rt_ptr)
         rt_ptr->status.cancelled = rt_ptr->cancel_flag.load();
         rt_ptr->status.ended_ms = now_ms();
     }
+    rt_ptr->cancel_cv.notify_all();
     diag::log_tagged_fmt("burp", "active_scanner audit_end id=%llu issues=%zu cancelled=%d",
         static_cast<unsigned long long>(rt_ptr->status.id),
         rt_ptr->status.issues_found,
@@ -451,6 +466,51 @@ bool cancel_audit(uint64_t audit_id)
     rt->cancel_cv.notify_all();
     diag::log_tagged_fmt("scanner", "cancel_audit id=%llu cancel_flag_set", static_cast<unsigned long long>(audit_id));
     return true;
+}
+
+bool wait_for_audit_idle(uint64_t audit_id, uint32_t timeout_ms)
+{
+    diag::log_tagged_fmt("scanner", "wait_for_audit_idle id=%llu timeout_ms=%u",
+        static_cast<unsigned long long>(audit_id),
+        timeout_ms);
+    auto& s = state();
+    std::shared_ptr<audit_runtime_t> rt;
+    {
+        std::lock_guard<std::mutex> lk(s.audits_mtx);
+        auto it = s.audits.find(audit_id);
+        if (it == s.audits.end()) {
+            diag::log_tagged_fmt("scanner", "wait_for_audit_idle id=%llu not_found",
+                static_cast<unsigned long long>(audit_id));
+            return false;
+        }
+        rt = it->second;
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (true) {
+        const size_t active_workers = rt->active_workers.load(std::memory_order_acquire);
+        const size_t in_flight = rt->in_flight.load(std::memory_order_acquire);
+        bool running = false;
+        {
+            std::lock_guard<std::mutex> lk(rt->status_mtx);
+            running = rt->status.running;
+        }
+        if (!running && active_workers == 0 && in_flight == 0) {
+            diag::log_tagged_fmt("scanner", "wait_for_audit_idle id=%llu idle",
+                static_cast<unsigned long long>(audit_id));
+            return true;
+        }
+        if (timeout_ms == 0 || std::chrono::steady_clock::now() >= deadline) {
+            diag::log_tagged_fmt("scanner", "wait_for_audit_idle id=%llu timeout running=%d active_workers=%zu in_flight=%zu",
+                static_cast<unsigned long long>(audit_id),
+                running ? 1 : 0,
+                active_workers,
+                in_flight);
+            return false;
+        }
+        std::unique_lock<std::mutex> lk(rt->status_mtx);
+        rt->cancel_cv.wait_for(lk, std::chrono::milliseconds(50));
+    }
 }
 
 std::vector<audit_status_t> list_audits()

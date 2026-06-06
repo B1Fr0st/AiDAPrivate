@@ -2,6 +2,7 @@
 
 #include <string>
 #include "work_queue.hpp"
+#include "../infra/win_thread.hpp"
 #include <vector>
 #include <map>
 #include <unordered_map>
@@ -18,6 +19,7 @@
 #include <regex>
 #include <functional>
 #include <system_error>
+#include <utility>
 
 
 namespace code_index {
@@ -293,14 +295,22 @@ public:
         _stop = false;
         _running = true;
 
-        work_queue::post([this]() {
+        auto index_task = [this]() {
             index_workspace();
             {
                 std::lock_guard<std::mutex> lk(_done_mtx);
                 _running = false;
             }
             _done_cv.notify_all();
-        });
+        };
+        std::string thread_error;
+        if (!aida::infra::win_thread::start_detached(index_task, &thread_error, aida::infra::win_thread::default_stack_reserve, "code-index.worker")) {
+            if (!work_queue::post(std::move(index_task))) {
+                _state = index_state_t::error;
+                _running = false;
+                _done_cv.notify_all();
+            }
+        }
     }
 
     void stop_indexing()

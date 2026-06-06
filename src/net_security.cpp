@@ -1603,6 +1603,70 @@ bool TlsKeyExtractor::write_keylog_file(const std::string& path,
     return file.good();
 }
 
+void TlsKeyExtractor::keylog_worker_loop(const char* mode) {
+    _keylog_worker_done.store(false, std::memory_order_release);
+    diag::log_tagged_fmt("net_sec", "TlsKeyExtractor::worker enter mode=%s pid=%u output_file=%s poll_interval_ms=%u tid=%lu",
+        mode ? mode : "",
+        _keylog_config.pid,
+        _keylog_config.output_file.c_str(),
+        _keylog_config.poll_interval_ms,
+        static_cast<unsigned long>(GetCurrentThreadId()));
+    try {
+        while (_keylog_active.load()) {
+            tls_key_scan_config_t scan_cfg;
+            scan_cfg.pid = _keylog_config.pid;
+
+            const ULONGLONG t0 = GetTickCount64();
+            auto keys = extract_keys(scan_cfg);
+            diag::log_tagged_fmt("net_sec", "TlsKeyExtractor::worker scan_done mode=%s pid=%u keys=%zu elapsed_ms=%llu",
+                mode ? mode : "",
+                scan_cfg.pid,
+                keys.size(),
+                static_cast<unsigned long long>(GetTickCount64() - t0));
+            if (!keys.empty()) {
+                const bool wrote = write_keylog_file(_keylog_config.output_file, keys, _keylog_config.append);
+                diag::log_tagged_fmt("net_sec", "TlsKeyExtractor::worker write_keylog mode=%s wrote=%d path=%s keys=%zu",
+                    mode ? mode : "",
+                    wrote ? 1 : 0,
+                    _keylog_config.output_file.c_str(),
+                    keys.size());
+            }
+
+            for (std::uint32_t elapsed = 0;
+                 elapsed < _keylog_config.poll_interval_ms && _keylog_active.load();
+                 elapsed += 50) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+        }
+    } catch (const std::exception& ex) {
+        diag::log_tagged_fmt("net_sec", "TlsKeyExtractor::worker exception mode=%s err=%s",
+            mode ? mode : "", ex.what());
+    } catch (...) {
+        diag::log_tagged_fmt("net_sec", "TlsKeyExtractor::worker exception mode=%s err=unknown",
+            mode ? mode : "");
+    }
+    diag::log_tagged_fmt("net_sec", "TlsKeyExtractor::worker exit mode=%s tid=%lu",
+        mode ? mode : "",
+        static_cast<unsigned long>(GetCurrentThreadId()));
+    _keylog_worker_done.store(true, std::memory_order_release);
+}
+
+void CALLBACK TlsKeyExtractor::keylog_threadpool_entry(PTP_CALLBACK_INSTANCE, void* context) {
+    auto* self = static_cast<TlsKeyExtractor*>(context);
+    if (self)
+        self->keylog_worker_loop("threadpool");
+}
+
+bool TlsKeyExtractor::wait_keylog_worker_done(DWORD timeout_ms) {
+    const DWORD start = GetTickCount();
+    while (!_keylog_worker_done.load(std::memory_order_acquire)) {
+        if (GetTickCount() - start >= timeout_ms)
+            return false;
+        Sleep(20);
+    }
+    return true;
+}
+
 bool TlsKeyExtractor::start_keylog(const keylog_config_t& config) {
     diag::log_tagged_fmt("net_sec", "TlsKeyExtractor::start_keylog entry active=%d pid=%u output_file=%s poll_interval_ms=%u append=%d tid=%lu",
         _keylog_active.load() ? 1 : 0,
@@ -1619,59 +1683,30 @@ bool TlsKeyExtractor::start_keylog(const keylog_config_t& config) {
     _keylog_config = config;
     _keylog_active.store(true);
 
+    _keylog_worker_done.store(false, std::memory_order_release);
+    _keylog_threadpool_worker.store(false, std::memory_order_release);
     auto worker = [this]() {
-            diag::log_tagged_fmt("net_sec", "TlsKeyExtractor::worker enter pid=%u output_file=%s poll_interval_ms=%u tid=%lu",
-                _keylog_config.pid,
-                _keylog_config.output_file.c_str(),
-                _keylog_config.poll_interval_ms,
-                static_cast<unsigned long>(GetCurrentThreadId()));
-            while (_keylog_active.load()) {
-                tls_key_scan_config_t scan_cfg;
-                scan_cfg.pid = _keylog_config.pid;
-
-                const ULONGLONG t0 = GetTickCount64();
-                auto keys = extract_keys(scan_cfg);
-                diag::log_tagged_fmt("net_sec", "TlsKeyExtractor::worker scan_done pid=%u keys=%zu elapsed_ms=%llu",
-                    scan_cfg.pid,
-                    keys.size(),
-                    static_cast<unsigned long long>(GetTickCount64() - t0));
-                if (!keys.empty()) {
-                    const bool wrote = write_keylog_file(_keylog_config.output_file, keys, _keylog_config.append);
-                    diag::log_tagged_fmt("net_sec", "TlsKeyExtractor::worker write_keylog wrote=%d path=%s keys=%zu",
-                        wrote ? 1 : 0,
-                        _keylog_config.output_file.c_str(),
-                        keys.size());
-                }
-
-                for (std::uint32_t elapsed = 0;
-                     elapsed < _keylog_config.poll_interval_ms && _keylog_active.load();
-                     elapsed += 50) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                }
-            }
-            diag::log_tagged_fmt("net_sec", "TlsKeyExtractor::worker exit tid=%lu",
-                static_cast<unsigned long>(GetCurrentThreadId()));
+        keylog_worker_loop("thread");
     };
 
-    bool created = false;
-    for (int attempt = 1; attempt <= 3; ++attempt) {
-        try {
-            _keylog_thread = std::thread(worker);
-            created = true;
-            diag::log_tagged_fmt("net_sec", "TlsKeyExtractor::start_keylog thread_created attempt=%d", attempt);
-            break;
-        } catch (const std::exception& ex) {
-            diag::log_tagged_fmt("net_sec", "TlsKeyExtractor::start_keylog thread_create_failed attempt=%d err=%s",
-                attempt, ex.what());
-        } catch (...) {
-            diag::log_tagged_fmt("net_sec", "TlsKeyExtractor::start_keylog thread_create_failed attempt=%d err=<unknown>",
-                attempt);
-        }
-        Sleep(static_cast<DWORD>(50 * attempt));
-    }
+    std::string thread_error;
+    const bool created = _keylog_thread.start(worker,
+        &thread_error,
+        aida::infra::win_thread::fixture_stack_reserve,
+        "TlsKeyExtractor::keylog_worker");
     if (!created) {
+        diag::log_tagged_fmt("net_sec", "TlsKeyExtractor::start_keylog thread_create_failed err=%s",
+            thread_error.empty() ? "<empty>" : thread_error.c_str());
+        if (TrySubmitThreadpoolCallback(&TlsKeyExtractor::keylog_threadpool_entry, this, nullptr)) {
+            _keylog_threadpool_worker.store(true, std::memory_order_release);
+            diag::log_tagged("net_sec", "TlsKeyExtractor::start_keylog threadpool_created");
+            return true;
+        }
+        DWORD tp_err = GetLastError();
         _keylog_active.store(false);
-        diag::log_tagged("net_sec", "TlsKeyExtractor::start_keylog thread_create_exhausted");
+        _keylog_worker_done.store(true, std::memory_order_release);
+        diag::log_tagged_fmt("net_sec", "TlsKeyExtractor::start_keylog threadpool_failed gle=%lu",
+            static_cast<unsigned long>(tp_err));
         return false;
     }
 
@@ -1694,6 +1729,13 @@ bool TlsKeyExtractor::stop_keylog() {
         _keylog_thread.join();
         diag::log_tagged_fmt("net_sec", "TlsKeyExtractor::stop_keylog joined elapsed_ms=%llu",
             static_cast<unsigned long long>(GetTickCount64() - t0));
+    } else if (_keylog_threadpool_worker.load(std::memory_order_acquire)) {
+        const ULONGLONG t0 = GetTickCount64();
+        const bool done = wait_keylog_worker_done(5000);
+        diag::log_tagged_fmt("net_sec", "TlsKeyExtractor::stop_keylog threadpool_worker_done=%d elapsed_ms=%llu",
+            done ? 1 : 0,
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        _keylog_threadpool_worker.store(false, std::memory_order_release);
     }
     return true;
 }
@@ -2342,8 +2384,34 @@ std::vector<quic_connection_info_t> QuicAnalyzer::detect_quic_connections(std::u
         if (pkt.payload.size() < 5) continue;
 
         quic_header_t hdr;
-        if (!parse_quic_header(pkt.payload.data(), pkt.payload.size(), hdr)) continue;
+        std::size_t quic_offset = 0;
+        bool parsed = parse_quic_header(pkt.payload.data(), pkt.payload.size(), hdr);
+        if (!parsed || !hdr.is_long_header) {
+            const std::size_t scan_limit = std::min<std::size_t>(pkt.payload.size(), 96);
+            for (std::size_t off = 1; off + 5 < scan_limit; ++off) {
+                if ((pkt.payload[off] & 0xC0) != 0xC0)
+                    continue;
+                quic_header_t candidate;
+                if (!parse_quic_header(pkt.payload.data() + off, pkt.payload.size() - off, candidate))
+                    continue;
+                if (!candidate.is_long_header || candidate.version == 0 || candidate.dcid.empty())
+                    continue;
+                hdr = std::move(candidate);
+                quic_offset = off;
+                parsed = true;
+                break;
+            }
+        }
+        if (!parsed) continue;
         if (!hdr.is_long_header && hdr.dcid.empty()) continue;
+        diag::log_tagged_fmt("net_sec", "quic_detect packet pid=%u payload=%zu offset=%zu long=%d version=0x%08X dcid=%zu scid=%zu",
+            pkt.pid,
+            pkt.payload.size(),
+            quic_offset,
+            hdr.is_long_header ? 1 : 0,
+            hdr.version,
+            hdr.dcid.size(),
+            hdr.scid.size());
 
 
         std::string key = bytes_to_hex(pkt.local_addr, 4) + ":" +
@@ -2724,7 +2792,31 @@ std::vector<dtls_session_info_t> DtlsAnalyzer::detect_dtls_sessions(std::uint32_
         if (filter_pid != 0 && pkt.pid != filter_pid) continue;
 
         dtls_record_t rec;
-        if (!parse_dtls_record(pkt.payload.data(), pkt.payload.size(), rec)) continue;
+        std::size_t dtls_offset = 0;
+        bool parsed = parse_dtls_record(pkt.payload.data(), pkt.payload.size(), rec);
+        if (!parsed) {
+            const std::size_t scan_limit = std::min<std::size_t>(pkt.payload.size(), 96);
+            for (std::size_t off = 1; off + 13 <= scan_limit; ++off) {
+                if (pkt.payload[off] < 20 || pkt.payload[off] > 25)
+                    continue;
+                if (pkt.payload[off + 1] != 0xFE && pkt.payload[off + 1] != 0x01)
+                    continue;
+                dtls_record_t candidate;
+                if (!parse_dtls_record(pkt.payload.data() + off, pkt.payload.size() - off, candidate))
+                    continue;
+                rec = candidate;
+                dtls_offset = off;
+                parsed = true;
+                break;
+            }
+        }
+        if (!parsed) continue;
+        diag::log_tagged_fmt("net_sec", "dtls_detect packet pid=%u payload=%zu offset=%zu version=0x%04X content_type=%u",
+            pkt.pid,
+            pkt.payload.size(),
+            dtls_offset,
+            rec.version,
+            rec.content_type);
 
         dtls_session_info_t session;
         session.pid = pkt.pid;
@@ -3037,59 +3129,24 @@ AutoResponder::match_result_t AutoResponder::match_request(
     return result;
 }
 
-bool AutoResponder::start() {
-    diag::log_tagged_fmt("net_sec", "AutoResponder::start entry active=%d device=%p connected=%d tid=%lu",
-        _active.load() ? 1 : 0,
-        device.get(),
-        device && device->is_connected() ? 1 : 0,
+void AutoResponder::worker_loop(const char* mode) {
+    _worker_done.store(false, std::memory_order_release);
+    diag::log_tagged_fmt("net_sec", "AutoResponder::worker enter mode=%s tid=%lu",
+        mode ? mode : "",
         static_cast<unsigned long>(GetCurrentThreadId()));
-    if (_active.load()) {
-        diag::log_tagged("net_sec", "AutoResponder::start already_active");
-        return true;
-    }
-
-    if (!device || !device->is_connected()) {
-        diag::log_tagged("net_sec", "AutoResponder::start rejected driver_unavailable");
-        return false;
-    }
-
-    bool cap_active = false;
-    std::uint32_t cap_count = 0, cap_drop = 0;
-    device->get_capture_status(cap_active, cap_count, cap_drop);
-    diag::log_tagged_fmt("net_sec", "AutoResponder::start capture_status active=%d count=%u drop=%u",
-        cap_active ? 1 : 0, cap_count, cap_drop);
-    if (!cap_active) {
-        bool capture_started = device->start_capture(0, 0, 0);
-        diag::log_tagged_fmt("net_sec", "AutoResponder::start start_capture result=%d",
-            capture_started ? 1 : 0);
-        if (!capture_started)
-            return false;
-    }
-
-    bool intercept_started = device->intercept_op(1, 0, 0, 6);
-    diag::log_tagged_fmt("net_sec", "AutoResponder::start intercept_start result=%d",
-        intercept_started ? 1 : 0);
-    if (!intercept_started)
-        return false;
-
-    _active.store(true);
-
     try {
-        _responder_thread = std::thread([this]() {
-            diag::log_tagged_fmt("net_sec", "AutoResponder::worker enter tid=%lu",
-                static_cast<unsigned long>(GetCurrentThreadId()));
-            while (_active.load()) {
-                if (!device || !device->is_connected()) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        while (_active.load()) {
+            if (!device || !device->is_connected()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
+
+            auto held = device->get_held_packets();
+            for (const auto& pkt : held) {
+                if (pkt.payload.empty()) {
+                    device->intercept_op(3, 0, 0, 0, pkt.hold_id, nullptr, 0, nullptr, nullptr);
                     continue;
                 }
-
-                auto held = device->get_held_packets();
-                for (const auto& pkt : held) {
-                    if (pkt.payload.empty()) {
-                        device->intercept_op(3, 0, 0, 0, pkt.hold_id, nullptr, 0, nullptr, nullptr);
-                        continue;
-                    }
 
                 if (pkt.payload.size() > 5 && pkt.payload[0] == 0x16) {
                     std::string sni = extract_tls_sni(pkt.payload.data(), pkt.payload.size());
@@ -3163,7 +3220,7 @@ bool AutoResponder::start() {
                         while (!value.empty() && value[0] == ' ') value.erase(0, 1);
                         headers[name] = value;
 
-                        if (name == "Host" && url[0] == '/') {
+                        if (name == "Host" && !url.empty() && url[0] == '/') {
                             url = "http://" + value + url;
                         }
                     }
@@ -3207,25 +3264,110 @@ bool AutoResponder::start() {
                 }
             }
 
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            }
-            diag::log_tagged_fmt("net_sec", "AutoResponder::worker exit tid=%lu",
-                static_cast<unsigned long>(GetCurrentThreadId()));
-        });
-        diag::log_tagged("net_sec", "AutoResponder::start worker_created");
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
     } catch (const std::exception& ex) {
-        _active.store(false);
-        if (device && device->is_connected())
-            device->intercept_op(2, 0, 0, 0);
-        diag::log_tagged_fmt("net_sec", "AutoResponder::start worker_create_failed err=%s", ex.what());
-        return false;
+        diag::log_tagged_fmt("net_sec", "AutoResponder::worker exception mode=%s err=%s",
+            mode ? mode : "", ex.what());
     } catch (...) {
-        _active.store(false);
-        if (device && device->is_connected())
-            device->intercept_op(2, 0, 0, 0);
-        diag::log_tagged("net_sec", "AutoResponder::start worker_create_failed err=<unknown>");
+        diag::log_tagged_fmt("net_sec", "AutoResponder::worker exception mode=%s err=unknown",
+            mode ? mode : "");
+    }
+    diag::log_tagged_fmt("net_sec", "AutoResponder::worker exit mode=%s tid=%lu",
+        mode ? mode : "",
+        static_cast<unsigned long>(GetCurrentThreadId()));
+    _worker_done.store(true, std::memory_order_release);
+}
+
+void CALLBACK AutoResponder::threadpool_entry(PTP_CALLBACK_INSTANCE, void* context) {
+    auto* self = static_cast<AutoResponder*>(context);
+    if (self)
+        self->worker_loop("threadpool");
+}
+
+bool AutoResponder::wait_worker_done(DWORD timeout_ms) {
+    const DWORD start = GetTickCount();
+    while (!_worker_done.load(std::memory_order_acquire)) {
+        if (GetTickCount() - start >= timeout_ms)
+            return false;
+        Sleep(20);
+    }
+    return true;
+}
+
+bool AutoResponder::start() {
+    diag::log_tagged_fmt("net_sec", "AutoResponder::start entry active=%d device=%p connected=%d tid=%lu",
+        _active.load() ? 1 : 0,
+        device.get(),
+        device && device->is_connected() ? 1 : 0,
+        static_cast<unsigned long>(GetCurrentThreadId()));
+    if (_active.load()) {
+        diag::log_tagged("net_sec", "AutoResponder::start already_active");
+        return true;
+    }
+
+    if (!device || !device->is_connected()) {
+        diag::log_tagged("net_sec", "AutoResponder::start rejected driver_unavailable");
         return false;
     }
+
+    bool cap_active = false;
+    std::uint32_t cap_count = 0, cap_drop = 0;
+    device->get_capture_status(cap_active, cap_count, cap_drop);
+    diag::log_tagged_fmt("net_sec", "AutoResponder::start capture_status active=%d count=%u drop=%u",
+        cap_active ? 1 : 0, cap_count, cap_drop);
+    bool started_capture = false;
+    if (!cap_active) {
+        bool capture_started = device->start_capture(0, 0, 0);
+        diag::log_tagged_fmt("net_sec", "AutoResponder::start start_capture result=%d",
+            capture_started ? 1 : 0);
+        if (!capture_started)
+            return false;
+        started_capture = true;
+    }
+
+    bool intercept_started = device->intercept_op(1, 0, 0, 6);
+    diag::log_tagged_fmt("net_sec", "AutoResponder::start intercept_start result=%d",
+        intercept_started ? 1 : 0);
+    if (!intercept_started) {
+        if (started_capture)
+            device->stop_capture();
+        return false;
+    }
+
+    _active.store(true);
+    _worker_done.store(false, std::memory_order_release);
+    _threadpool_worker.store(false, std::memory_order_release);
+
+    std::string thread_error;
+    const bool worker_started = _responder_thread.start([this]() {
+            worker_loop("thread");
+        },
+        &thread_error,
+        aida::infra::win_thread::fixture_stack_reserve,
+        "AutoResponder::worker");
+    if (!worker_started) {
+        diag::log_tagged_fmt("net_sec", "AutoResponder::start worker_create_failed err=%s",
+            thread_error.empty() ? "<empty>" : thread_error.c_str());
+        if (TrySubmitThreadpoolCallback(&AutoResponder::threadpool_entry, this, nullptr)) {
+            _threadpool_worker.store(true, std::memory_order_release);
+            diag::log_tagged("net_sec", "AutoResponder::start worker_threadpool_created");
+            return true;
+        }
+        DWORD tp_err = GetLastError();
+        _active.store(false);
+        _worker_done.store(true, std::memory_order_release);
+        if (device && device->is_connected()) {
+            bool stopped = device->intercept_op(2, 0, 0, 0);
+            bool capture_stopped = !started_capture || device->stop_capture();
+            diag::log_tagged_fmt("net_sec", "AutoResponder::start rollback intercept_stop=%d capture_stop=%d",
+                stopped ? 1 : 0, capture_stopped ? 1 : 0);
+        }
+        diag::log_tagged_fmt("net_sec", "AutoResponder::start worker_threadpool_failed gle=%lu",
+            static_cast<unsigned long>(tp_err));
+        return false;
+    }
+    diag::log_tagged("net_sec", "AutoResponder::start worker_created");
 
     diag::log_tagged("net_sec", "AutoResponder::start ok");
     return true;
@@ -3248,6 +3390,13 @@ bool AutoResponder::stop() {
         _responder_thread.join();
         diag::log_tagged_fmt("net_sec", "AutoResponder::stop worker_joined elapsed_ms=%llu",
             static_cast<unsigned long long>(GetTickCount64() - t0));
+    } else if (_threadpool_worker.load(std::memory_order_acquire)) {
+        const ULONGLONG t0 = GetTickCount64();
+        const bool done = wait_worker_done(5000);
+        diag::log_tagged_fmt("net_sec", "AutoResponder::stop threadpool_worker_done=%d elapsed_ms=%llu",
+            done ? 1 : 0,
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        _threadpool_worker.store(false, std::memory_order_release);
     }
 
     if (device && device->is_connected()) {

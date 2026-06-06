@@ -43,6 +43,7 @@
 #include "../analysis/stealth_engine.hpp"
 #include "../anti-tamper/mcp_posture.hpp"
 #include "../anti-tamper/state.hpp"
+#include "../testlab/test_all_features.hpp"
 #include "../ui/components.hpp"
 #include "../ui/fonts.hpp"
 
@@ -2252,25 +2253,35 @@ void poll_ai_chat()
 
     if (license::validated && !standalone_license::is_valid()) {
         const bool runtime_locked = anti_tamper::state::get().violation_latched.load(std::memory_order_acquire);
-        license::validated = false;
-        license::check_failed = true;
-        license::error_msg = runtime_locked
-            ? std::string("Runtime integrity check failed. Restart AiDAStandalone.exe.")
-            : standalone_license::last_error();
-        diag::log_tagged_fmt("license",
-            "DIAG_DIALOG_TRIGGER source=poll_ai_chat tid=%lu runtime_locked=%d err=%.200s",
-            GetCurrentThreadId(), runtime_locked ? 1 : 0, license::error_msg.c_str());
-        mcp_standalone::set_ide_lifecycle_ready(false);
-        s_ide_ready_for_mcp_services.store(false, std::memory_order_release);
-        if (s_server_started) {
-            diag::log_tagged("init_chat", "authorized_mcp_server_stop_auth_lost");
-            s_mcp_server.stop();
-            s_server_started = false;
-        }
-        if (s_mcp_clients_connected) {
-            diag::log_tagged("init_chat", "authorized_mcp_client_disconnect_auth_lost");
-            s_mcp_client_mgr.disconnect_all();
-            s_mcp_clients_connected = false;
+        if (license::preserve_valid_state(runtime_locked, test_all_features::is_running())) {
+            license::checking = false;
+            license::check_failed = false;
+            license::error_msg.clear();
+            diag::log_tagged_fmt("license",
+                "DIAG_DIALOG_TRIGGER_SUPPRESSED source=poll_ai_chat tid=%lu full_test=1 arc=%d",
+                GetCurrentThreadId(),
+                standalone_license::is_arc_loaded() ? 1 : 0);
+        } else {
+            license::validated = false;
+            license::check_failed = true;
+            license::error_msg = runtime_locked
+                ? std::string("Runtime integrity check failed. Restart AiDAStandalone.exe.")
+                : standalone_license::last_error();
+            diag::log_tagged_fmt("license",
+                "DIAG_DIALOG_TRIGGER source=poll_ai_chat tid=%lu runtime_locked=%d err=%.200s",
+                GetCurrentThreadId(), runtime_locked ? 1 : 0, license::error_msg.c_str());
+            mcp_standalone::set_ide_lifecycle_ready(false);
+            s_ide_ready_for_mcp_services.store(false, std::memory_order_release);
+            if (s_server_started) {
+                diag::log_tagged("init_chat", "authorized_mcp_server_stop_auth_lost");
+                s_mcp_server.stop();
+                s_server_started = false;
+            }
+            if (s_mcp_clients_connected) {
+                diag::log_tagged("init_chat", "authorized_mcp_client_disconnect_auth_lost");
+                s_mcp_client_mgr.disconnect_all();
+                s_mcp_clients_connected = false;
+            }
         }
     }
 

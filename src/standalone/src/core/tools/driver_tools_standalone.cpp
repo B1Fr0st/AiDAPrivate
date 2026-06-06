@@ -7971,13 +7971,22 @@ tool_result_t driver_kill_connection(const json& params)
         return tool_result_t::error(OBFSTR("Refusing to kill connection without explicit non-zero src_port and dst_port"));
     }
 
+    bool retried_without_pid = false;
     bool ok = device->kill_connection(proto, af, src_port, dst_port, src_addr, dst_addr, pid);
+    if (!ok && pid != 0) {
+        retried_without_pid = true;
+        diag::log_tagged_fmt("drv_tools",
+            "driver_kill_connection retry_tuple_resolver proto=%u af=%u src_port=%u dst_port=%u pid=%u",
+            proto, af, src_port, dst_port, pid);
+        ok = device->kill_connection(proto, af, src_port, dst_port, src_addr, dst_addr, 0);
+    }
     if (!ok) return tool_result_t::error(OBFSTR("Connection kill failed"));
 
     json result;
     result["killed"] = true;
     result["src_port"] = src_port;
     result["dst_port"] = dst_port;
+    result["pid_retry"] = retried_without_pid;
     return tool_result_t::ok(OBFSTR("TCP connection killed via RST injection"), result);
 }
 

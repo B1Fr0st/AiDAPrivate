@@ -14,7 +14,7 @@
 #include "standalone_chat.hpp"
 #include "command_sessions.hpp"
 #include "../helpers/globals.h"
-#include "../infra/work_queue.hpp"
+#include "../infra/win_thread.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -27,6 +27,7 @@
 #include <regex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -810,14 +811,15 @@ static tool_result_t tool_run_command(const json& params)
         sess->process_info = pi;
         sess->stdout_read = h_stdout_rd;
         sess->stderr_read = h_stderr_rd;
-        sess->timeout_ms = wait ? timeout_ms : 0;
+        sess->timeout_ms = timeout_ms;
         sess->alive.store(true);
 
         std::string session_id_copy = sess->id;
         command_sessions::command_session_t* raw = command_sessions::register_session(std::move(sess));
 
         raw->reader_done.store(false, std::memory_order_release);
-        if (!work_queue::post([raw, timeout_ms, wait]() {
+        std::string reader_err;
+        if (!aida::infra::win_thread::start_detached([raw, timeout_ms]() {
             auto start = std::chrono::steady_clock::now();
             auto drain_pipe = [&](HANDLE h, std::string& dest) -> bool {
                 DWORD avail = 0;
@@ -844,7 +846,7 @@ static tool_result_t tool_run_command(const json& params)
             };
 
             while (raw->alive.load()) {
-                if (wait && timeout_ms > 0) {
+                if (timeout_ms > 0) {
                     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - start).count();
                     if (elapsed >= timeout_ms) {
@@ -876,10 +878,22 @@ static tool_result_t tool_run_command(const json& params)
                 "[run_command:" + raw->id + "] exit=" + std::to_string(exit_code) +
                 (raw->timed_out.load() ? " (TIMED OUT)" : ""));
             raw->reader_done.store(true, std::memory_order_release);
-        }))
+        }, &reader_err, aida::infra::win_thread::default_stack_reserve, "coding.run_command.reader"))
         {
+            diag::log_tagged_fmt("coding",
+                "run_command reader_start_failed session_id='%s' pid=%lu err=%s",
+                session_id_copy.c_str(),
+                static_cast<unsigned long>(pi.dwProcessId),
+                reader_err.c_str());
+            raw->alive.store(false, std::memory_order_release);
+            if (raw->process_info.hProcess) {
+                DWORD code = 0;
+                if (GetExitCodeProcess(raw->process_info.hProcess, &code) && code == STILL_ACTIVE)
+                    TerminateProcess(raw->process_info.hProcess, 1);
+            }
             raw->reader_done.store(true, std::memory_order_release);
-            raw->alive.store(false);
+            command_sessions::remove_session(session_id_copy);
+            return tool_result_t::error("Failed to start command reader: " + reader_err);
         }
 
         if (wait) {
@@ -1053,14 +1067,37 @@ static tool_result_t tool_cancel_command(const json& params)
     }
 
     bool was_running = false;
+    bool reader_done = false;
+    bool terminate_attempted = false;
+    bool terminate_ok = false;
+    DWORD terminate_error = 0;
     bool found = command_sessions::with_session(session_id,
         [&](command_sessions::command_session_t& sess) {
             was_running = sess.alive.load();
-            sess.alive.store(false);
+            reader_done = sess.reader_done.load(std::memory_order_acquire);
+            sess.alive.store(false, std::memory_order_release);
+            if (was_running) {
+                sess.finished_at = std::chrono::steady_clock::now();
+                int64_t prior_exit = sess.exit_code.load(std::memory_order_acquire);
+                if (prior_exit < 0)
+                    sess.exit_code.store(1, std::memory_order_release);
+            }
             if (sess.process_info.hProcess) {
                 DWORD code = 0;
-                if (GetExitCodeProcess(sess.process_info.hProcess, &code) && code == STILL_ACTIVE)
-                    TerminateProcess(sess.process_info.hProcess, 1);
+                if (GetExitCodeProcess(sess.process_info.hProcess, &code)) {
+                    if (code == STILL_ACTIVE) {
+                        terminate_attempted = true;
+                        if (TerminateProcess(sess.process_info.hProcess, 1)) {
+                            terminate_ok = true;
+                        } else {
+                            terminate_error = GetLastError();
+                        }
+                    } else if (sess.exit_code.load(std::memory_order_acquire) < 0) {
+                        sess.exit_code.store(static_cast<int64_t>(code), std::memory_order_release);
+                    }
+                } else {
+                    terminate_error = GetLastError();
+                }
             }
         });
 
@@ -1070,22 +1107,45 @@ static tool_result_t tool_cancel_command(const json& params)
         return tool_result_t::error("Session not found: " + session_id);
     }
 
-    if (!command_sessions::remove_session(session_id))
-    {
-        diag::log_tagged_fmt("coding", "cancel_command remove fail session_id='%s'", session_id.c_str());
-        return tool_result_t::error("Failed to remove session: " + session_id);
+    const ULONGLONG cleanup_start = GetTickCount64();
+    uint32_t cleanup_polls = 0;
+    while (!reader_done && GetTickCount64() - cleanup_start < 1500) {
+        Sleep(10);
+        ++cleanup_polls;
+        command_sessions::with_session(session_id,
+            [&](command_sessions::command_session_t& sess) {
+                reader_done = sess.reader_done.load(std::memory_order_acquire);
+            });
     }
 
-    diag::log_tagged_fmt("coding", "cancel_command ok session_id='%s' was_running=%d",
-        session_id.c_str(), (int)was_running);
+    bool removed = false;
+    if (reader_done)
+        removed = command_sessions::remove_session(session_id);
+
+    diag::log_tagged_fmt("coding",
+        "cancel_command ok session_id='%s' was_running=%d reader_done=%d removed=%d terminate_attempted=%d terminate_ok=%d terminate_error=%lu cleanup_wait_ms=%llu cleanup_polls=%u",
+        session_id.c_str(),
+        (int)was_running,
+        reader_done ? 1 : 0,
+        removed ? 1 : 0,
+        terminate_attempted ? 1 : 0,
+        terminate_ok ? 1 : 0,
+        static_cast<unsigned long>(terminate_error),
+        static_cast<unsigned long long>(GetTickCount64() - cleanup_start),
+        cleanup_polls);
     output_log::push(bottom_tab_t::sandbox_log,
         "[cancel_command] session=" + session_id +
-        (was_running ? " (terminated)" : " (already finished)"));
+        (was_running ? " (terminated)" : " (already finished)") +
+        (removed ? "" : " (cleanup pending)"));
 
     json data;
     data["cancelled"] = true;
     data["session_id"] = session_id;
     data["was_running"] = was_running;
+    data["reader_done"] = reader_done;
+    data["removed"] = removed;
+    data["terminate_attempted"] = terminate_attempted;
+    data["terminate_error"] = terminate_error;
     return tool_result_t::ok("Cancelled session " + session_id, data);
 }
 

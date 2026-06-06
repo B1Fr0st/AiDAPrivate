@@ -1,6 +1,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <tlhelp32.h>
 
 #include "standalone_compat.hpp"
 #include "../disasm/ghidra_decompiler.hpp"
@@ -80,6 +81,49 @@ static uint32_t bounded_u32_param(const json& params, const char* name, uint32_t
 	if (value > maximum)
 		return maximum;
 	return value;
+}
+
+static std::string wide_to_utf8_lossy(const wchar_t* text)
+{
+	if (!text || !*text)
+		return {};
+	const int len = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
+	if (len <= 1)
+		return {};
+	std::string out(static_cast<size_t>(len), '\0');
+	const int written = WideCharToMultiByte(CP_UTF8, 0, text, -1, out.data(), len, nullptr, nullptr);
+	if (written <= 1)
+		return {};
+	out.resize(static_cast<size_t>(written - 1));
+	return out;
+}
+
+static std::vector<driver_bridge::module_info_t> enumerate_modules_toolhelp(uint32_t pid)
+{
+	std::vector<driver_bridge::module_info_t> result;
+	if (pid == 0)
+		return result;
+	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+	if (snapshot == INVALID_HANDLE_VALUE)
+		return result;
+	MODULEENTRY32W me{};
+	me.dwSize = sizeof(me);
+	if (Module32FirstW(snapshot, &me)) {
+		do {
+			driver_bridge::module_info_t mod;
+			mod.base = reinterpret_cast<uint64_t>(me.modBaseAddr);
+			mod.size = me.modBaseSize;
+			mod.name = wide_to_utf8_lossy(me.szModule);
+			mod.path = wide_to_utf8_lossy(me.szExePath);
+			result.push_back(std::move(mod));
+			me.dwSize = sizeof(me);
+		} while (Module32NextW(snapshot, &me));
+	}
+	CloseHandle(snapshot);
+	std::sort(result.begin(), result.end(), [](const auto& a, const auto& b) {
+		return a.base < b.base;
+	});
+	return result;
 }
 
 void register_analysis_tools(mcp_standalone::server_t& srv)
@@ -1661,7 +1705,16 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			if (params.contains("include_xrefs") && params["include_xrefs"].is_boolean())
 				opts.include_xrefs = params["include_xrefs"].get<bool>();
 			if (params.value("fast_summary", false)) {
-				auto modules = driver_bridge::enumerate_modules();
+				const uint32_t attached_pid = driver_bridge::attached_pid();
+				diag::log_tagged_fmt("analysis", "analysis_get_binary_map_overview fast_summary_modules_begin pid=%u", attached_pid);
+				auto modules = enumerate_modules_toolhelp(attached_pid);
+				diag::log_tagged_fmt("analysis", "analysis_get_binary_map_overview fast_summary_toolhelp_modules count=%zu pid=%u",
+					modules.size(), attached_pid);
+				if (modules.empty()) {
+					diag::log_tagged("analysis", "analysis_get_binary_map_overview fast_summary_driver_modules_begin");
+					modules = driver_bridge::enumerate_modules();
+					diag::log_tagged_fmt("analysis", "analysis_get_binary_map_overview fast_summary_driver_modules count=%zu", modules.size());
+				}
 				if (modules.empty())
 					return tool_result_t::error("no modules available for binary map summary");
 				std::string process_name = driver_bridge::attached_process_name();
@@ -1682,7 +1735,13 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 				char buf[32];
 				json sections = json::array();
 				pe_parser::pe_info_t pe;
+				diag::log_tagged_fmt("analysis", "analysis_get_binary_map_overview fast_summary_parse_begin module=%s base=0x%llX size=0x%X",
+					selected->name.c_str(),
+					static_cast<unsigned long long>(selected->base),
+					selected->size);
 				bool parsed = pe_parser::parse(selected->base, pe, false);
+				diag::log_tagged_fmt("analysis", "analysis_get_binary_map_overview fast_summary_parse_done parsed=%d sections=%zu module=%s",
+					parsed ? 1 : 0, pe.sections.size(), selected->name.c_str());
 				if (parsed) {
 					for (const auto& s : pe.sections) {
 						json o;
@@ -1722,10 +1781,8 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 							static_cast<unsigned long long>(g_disasm.file.image_base),
 							rebuild ? 1 : 0);
 					}
-					if (rebuild) {
-						std::string name = g_disasm.file.filename.empty() ? g_disasm.file.path : g_disasm.file.filename;
-						function_index::detail::rebuild_bounds_index_static(name);
-					}
+					if (rebuild)
+						diag::log_tagged("analysis", "binary_map_fast function_cache_rebuild_skipped");
 					auto& c = function_index::detail::cache();
 					std::shared_lock<std::shared_mutex> lk(c.mutex);
 					int emitted = 0;

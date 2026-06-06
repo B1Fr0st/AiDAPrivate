@@ -547,7 +547,29 @@ tool_result_t cert_remove(const json& params) {
 tool_result_t cert_generate_ca(const json& params) {
     std::string cn = params.value("cn", "AiDA Proxy CA");
     std::uint32_t days = params.value("validity_days", 3650u);
-    diag::log_tagged_fmt("net_sec", "cert_generate_ca entry cn=%s days=%u", cn.c_str(), days);
+    const bool validate_only = params.contains("validate_only") &&
+        params["validate_only"].is_boolean() &&
+        params["validate_only"].get<bool>();
+    diag::log_tagged_fmt("net_sec", "cert_generate_ca entry cn=%s days=%u validate_only=%d", cn.c_str(), days, validate_only ? 1 : 0);
+
+    if (validate_only) {
+        if (!cert_generator::is_ready() && !cert_generator::initialize())
+            return tool_result_t::error(OBFSTR("AiDA CA is not ready"));
+        std::vector<std::uint8_t> cert_der;
+        if (!cert_generator::export_ca_certificate_der(cert_generator::get_root_ca(), cert_der) || cert_der.empty())
+            return tool_result_t::error(OBFSTR("Failed to export AiDA public CA certificate"));
+        std::string subject;
+        if (!ns_is_valid_certificate_der(cert_der, subject))
+            return tool_result_t::error(OBFSTR("Generated CA certificate did not validate as X.509"));
+        json r;
+        r["success"] = true;
+        r["validate_only"] = true;
+        r["private_key_exported"] = false;
+        r["cert_size"] = cert_der.size();
+        r["subject_cn"] = subject.empty() ? cn : subject;
+        r["validity_days"] = days;
+        return tool_result_t::ok(OBFSTR("Validated public CA certificate generation path without exporting private key material"), r);
+    }
 
     std::vector<std::uint8_t> cert_der, key_der;
     bool ok = net_security::CertificateInjector::instance().generate_ca_certificate(cn, days, cert_der, key_der, false);
@@ -1177,7 +1199,8 @@ void register_net_security_tools(mcp_standalone::server_t& srv) {
         OBFSTR("Generate a self-signed CA certificate with a 2048-bit RSA key pair. "
                "Returns only the public certificate DER in hex form; private key material is never returned."),
         {{OBFSTR("cn"), OBFSTR("string"), OBFSTR("Common Name for the CA (default: 'AiDA Proxy CA')"), false},
-         {OBFSTR("validity_days"), OBFSTR("number"), OBFSTR("Validity period in days (default: 3650)"), false}},
+         {OBFSTR("validity_days"), OBFSTR("number"), OBFSTR("Validity period in days (default: 3650)"), false},
+         {OBFSTR("validate_only"), OBFSTR("boolean"), OBFSTR("Validate the public CA generation path without exporting private material"), false}},
         cert_generate_ca, false});
 
     register_compat(srv, {

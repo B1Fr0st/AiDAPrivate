@@ -50,6 +50,68 @@ namespace {
         test_all_features::mirror_full_test_log_line(tag, detail, s.c_str());
     }
 
+    long long elapsed_us_since(std::chrono::steady_clock::time_point t0) {
+        return static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t0).count());
+    }
+
+    const char* addr_format_name(disasm_view::addr_format_t value) {
+        switch (value) {
+        case disasm_view::addr_format_t::va: return "va";
+        case disasm_view::addr_format_t::rva: return "rva";
+        case disasm_view::addr_format_t::file_offset: return "file_offset";
+        default: return "unknown";
+        }
+    }
+
+    const char* center_view_name(center_view_t value) {
+        switch (value) {
+        case center_view_t::code_editor: return "code_editor";
+        case center_view_t::disassembly: return "disassembly";
+        case center_view_t::hex_view: return "hex_view";
+        case center_view_t::welcome: return "welcome";
+        case center_view_t::settings_view: return "settings_view";
+        case center_view_t::network_view: return "network_view";
+        case center_view_t::memory_scanner: return "memory_scanner";
+        case center_view_t::debugger_view: return "debugger_view";
+        case center_view_t::pseudocode: return "pseudocode";
+        case center_view_t::struct_recon: return "struct_recon";
+        case center_view_t::crypto_scanner: return "crypto_scanner";
+        case center_view_t::aob_generator: return "aob_generator";
+        case center_view_t::fuzzer_view: return "fuzzer_view";
+        case center_view_t::xref_browser: return "xref_browser";
+        case center_view_t::snapshot_diff: return "snapshot_diff";
+        case center_view_t::pointer_scanner: return "pointer_scanner";
+        case center_view_t::decrypt_oracle: return "decrypt_oracle";
+        case center_view_t::integrity_hunter: return "integrity_hunter";
+        case center_view_t::symbolic_view: return "symbolic_view";
+        case center_view_t::taint_view: return "taint_view";
+        case center_view_t::deobfuscation_view: return "deobfuscation_view";
+        case center_view_t::stealth_view: return "stealth_view";
+        case center_view_t::scan_hub: return "scan_hub";
+        case center_view_t::types_hub: return "types_hub";
+        case center_view_t::analysis_hub: return "analysis_hub";
+        case center_view_t::binary_map: return "binary_map";
+        case center_view_t::graph_view: return "graph_view";
+        case center_view_t::image_view: return "image_view";
+        case center_view_t::test_lab: return "test_lab";
+        default: return "unknown";
+        }
+    }
+
+    void log_nav_snapshot(HANDLE hf, const char* tag, const char* phase) {
+        std::lock_guard<std::mutex> lk(nav_history::mutex_ref());
+        const auto& s = nav_history::stack_ref();
+        const uint64_t first = s.empty() ? 0 : s.front();
+        const uint64_t last = s.empty() ? 0 : s.back();
+        log_msg(hf, tag, "STATE -- %s size=%zu max=%zu first=0x%llX last=0x%llX",
+            phase,
+            s.size(),
+            nav_history::kMaxEntries,
+            (unsigned long long)first,
+            (unsigned long long)last);
+    }
+
     uint64_t resolve_remote_module_base(const char* module_name) {
         const uint32_t pid = driver_bridge::attached_pid();
         if (pid == 0)
@@ -1027,11 +1089,16 @@ namespace {
 
     void test_nav_history_push_pop(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "nav.push_pop";
+        auto t0 = std::chrono::steady_clock::now();
+        log_nav_snapshot(hf, tag, "entry");
         nav_history::clear();
+        log_nav_snapshot(hf, tag, "after clear");
 
+        log_msg(hf, tag, "INPUT -- push sequence [0x1000, 0x2000, 0x3000]");
         nav_history::push(0x1000);
         nav_history::push(0x2000);
         nav_history::push(0x3000);
+        log_nav_snapshot(hf, tag, "after pushes");
 
         if (nav_history::size() != 3) {
             log_msg(hf, tag, "FAIL -- expected size 3, got %zu", nav_history::size());
@@ -1041,6 +1108,8 @@ namespace {
 
         uint64_t addr = 0;
         bool ok1 = nav_history::pop(&addr);
+        log_msg(hf, tag, "OUTPUT -- pop #1 ok=%d addr=0x%llX", (int)ok1, (unsigned long long)addr);
+        log_nav_snapshot(hf, tag, "after pop #1");
         if (!ok1 || addr != 0x3000) {
             log_msg(hf, tag, "FAIL -- pop expected 0x3000, got 0x%llX ok=%d",
                 (unsigned long long)addr, (int)ok1);
@@ -1050,6 +1119,8 @@ namespace {
         }
 
         bool ok2 = nav_history::pop(&addr);
+        log_msg(hf, tag, "OUTPUT -- pop #2 ok=%d addr=0x%llX", (int)ok2, (unsigned long long)addr);
+        log_nav_snapshot(hf, tag, "after pop #2");
         if (!ok2 || addr != 0x2000) {
             log_msg(hf, tag, "FAIL -- pop expected 0x2000, got 0x%llX ok=%d",
                 (unsigned long long)addr, (int)ok2);
@@ -1058,28 +1129,34 @@ namespace {
             return;
         }
 
-        log_msg(hf, tag, "PASS -- push/pop LIFO order verified (3000 -> 2000)");
+        log_msg(hf, tag, "PASS -- push/pop LIFO order verified (3000 -> 2000) elapsed_us=%lld", elapsed_us_since(t0));
         passed.fetch_add(1);
         nav_history::clear();
+        log_nav_snapshot(hf, tag, "after cleanup");
     }
 
     void test_nav_history_dedup(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "nav.dedup";
+        auto t0 = std::chrono::steady_clock::now();
         nav_history::clear();
+        log_nav_snapshot(hf, tag, "after clear");
 
+        log_msg(hf, tag, "INPUT -- push duplicate sequence [0x5000, 0x5000, 0x5000]");
         nav_history::push(0x5000);
         nav_history::push(0x5000);
         nav_history::push(0x5000);
+        log_nav_snapshot(hf, tag, "after duplicate pushes");
 
         size_t sz = nav_history::size();
         if (sz == 1) {
-            log_msg(hf, tag, "PASS -- consecutive duplicate addresses deduplicated (size=%zu)", sz);
+            log_msg(hf, tag, "PASS -- consecutive duplicate addresses deduplicated (size=%zu) elapsed_us=%lld", sz, elapsed_us_since(t0));
             passed.fetch_add(1);
         } else {
             log_msg(hf, tag, "FAIL -- expected size 1 after dedup, got %zu", sz);
             failed.fetch_add(1);
         }
         nav_history::clear();
+        log_nav_snapshot(hf, tag, "after cleanup");
     }
 
     uint64_t resolve_ntdll_fn(const char* name) {
@@ -1800,7 +1877,11 @@ namespace {
     void test_expr_parentheses(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "expr.parens";
         expression_eval::context_t ctx{};
+        auto t0 = std::chrono::steady_clock::now();
+        log_msg(hf, tag, "INPUT -- evaluate(\"(0x10 + 0x20) * 0x2\") expected=0x60");
         auto r = expression_eval::evaluate("(0x10 + 0x20) * 0x2", ctx);
+        log_msg(hf, tag, "OUTPUT -- ok=%d value=0x%llX err=\"%s\" elapsed_us=%lld",
+            (int)r.ok, (unsigned long long)r.value, r.error.c_str(), elapsed_us_since(t0));
         if (r.ok && r.value == 0x60) {
             log_msg(hf, tag, "PASS -- (0x10 + 0x20) * 0x2 = 0x%llX", (unsigned long long)r.value);
             passed.fetch_add(1);
@@ -1814,7 +1895,11 @@ namespace {
     void test_expr_negation(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "expr.negate";
         expression_eval::context_t ctx{};
+        auto t0 = std::chrono::steady_clock::now();
+        log_msg(hf, tag, "INPUT -- evaluate(\"~0x0\") expected=0xFFFFFFFFFFFFFFFF");
         auto r = expression_eval::evaluate("~0x0", ctx);
+        log_msg(hf, tag, "OUTPUT -- ok=%d value=0x%llX err=\"%s\" elapsed_us=%lld",
+            (int)r.ok, (unsigned long long)r.value, r.error.c_str(), elapsed_us_since(t0));
         if (r.ok && r.value == 0xFFFFFFFFFFFFFFFFULL) {
             log_msg(hf, tag, "PASS -- ~0x0 = 0x%llX", (unsigned long long)r.value);
             passed.fetch_add(1);
@@ -1832,7 +1917,15 @@ namespace {
         ctx.rbx = 0x200;
         ctx.rcx = 0x30;
         ctx.rdx = 0x4;
+        auto t0 = std::chrono::steady_clock::now();
+        log_msg(hf, tag, "INPUT -- evaluate(\"rax + rbx + rcx + rdx\") rax=0x%llX rbx=0x%llX rcx=0x%llX rdx=0x%llX expected=0x1234",
+            (unsigned long long)ctx.rax,
+            (unsigned long long)ctx.rbx,
+            (unsigned long long)ctx.rcx,
+            (unsigned long long)ctx.rdx);
         auto r = expression_eval::evaluate("rax + rbx + rcx + rdx", ctx);
+        log_msg(hf, tag, "OUTPUT -- ok=%d value=0x%llX err=\"%s\" elapsed_us=%lld",
+            (int)r.ok, (unsigned long long)r.value, r.error.c_str(), elapsed_us_since(t0));
         if (r.ok && r.value == 0x1234) {
             log_msg(hf, tag, "PASS -- rax+rbx+rcx+rdx = 0x%llX", (unsigned long long)r.value);
             passed.fetch_add(1);
@@ -1846,7 +1939,11 @@ namespace {
     void test_expr_division_by_zero(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "expr.div_zero";
         expression_eval::context_t ctx{};
+        auto t0 = std::chrono::steady_clock::now();
+        log_msg(hf, tag, "INPUT -- evaluate(\"0x100 / 0\") expected_error=division_by_zero");
         auto r = expression_eval::evaluate("0x100 / 0", ctx);
+        log_msg(hf, tag, "OUTPUT -- ok=%d value=0x%llX err=\"%s\" elapsed_us=%lld",
+            (int)r.ok, (unsigned long long)r.value, r.error.c_str(), elapsed_us_since(t0));
         if (!r.ok && !r.error.empty()) {
             log_msg(hf, tag, "PASS -- division by zero caught: \"%s\"", r.error.c_str());
             passed.fetch_add(1);
@@ -1859,7 +1956,11 @@ namespace {
     void test_expr_unknown_register(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "expr.unknown_reg";
         expression_eval::context_t ctx{};
+        auto t0 = std::chrono::steady_clock::now();
+        log_msg(hf, tag, "INPUT -- evaluate(\"zzz\") expected_error=unknown_register");
         auto r = expression_eval::evaluate("zzz", ctx);
+        log_msg(hf, tag, "OUTPUT -- ok=%d value=0x%llX err=\"%s\" elapsed_us=%lld",
+            (int)r.ok, (unsigned long long)r.value, r.error.c_str(), elapsed_us_since(t0));
         if (!r.ok && !r.error.empty()) {
             log_msg(hf, tag, "PASS -- unknown register caught: \"%s\"", r.error.c_str());
             passed.fetch_add(1);
@@ -1871,24 +1972,32 @@ namespace {
 
     void test_nav_history_stress(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "nav.stress";
+        auto t0 = std::chrono::steady_clock::now();
         nav_history::clear();
+        log_nav_snapshot(hf, tag, "after clear");
 
+        log_msg(hf, tag, "INPUT -- push 300 monotonically increasing addresses step=0x1000 cap=%zu", nav_history::kMaxEntries);
         for (uint64_t i = 1; i <= 300; ++i) {
             nav_history::push(i * 0x1000);
         }
+        log_nav_snapshot(hf, tag, "after 300 pushes");
 
         size_t sz = nav_history::size();
 
         uint64_t last_addr = 0;
         bool pop_ok = nav_history::pop(&last_addr);
+        log_msg(hf, tag, "OUTPUT -- stress pop ok=%d addr=0x%llX expected=0x%llX",
+            (int)pop_ok, (unsigned long long)last_addr, (unsigned long long)(300 * 0x1000));
+        log_nav_snapshot(hf, tag, "after stress pop");
 
         bool lifo = pop_ok && (last_addr == 300 * 0x1000);
 
         nav_history::clear();
+        log_nav_snapshot(hf, tag, "after cleanup");
 
         if (sz <= nav_history::kMaxEntries && lifo) {
-            log_msg(hf, tag, "PASS -- pushed 300, size=%zu (max=%zu), LIFO order verified (last=0x%llX)",
-                sz, nav_history::kMaxEntries, (unsigned long long)last_addr);
+            log_msg(hf, tag, "PASS -- pushed 300, size=%zu (max=%zu), LIFO order verified (last=0x%llX) elapsed_us=%lld",
+                sz, nav_history::kMaxEntries, (unsigned long long)last_addr, elapsed_us_since(t0));
             passed.fetch_add(1);
         } else {
             log_msg(hf, tag, "FAIL -- size=%zu lifo=%d last_addr=0x%llX",
@@ -1899,14 +2008,19 @@ namespace {
 
     void test_nav_history_clear(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "nav.clear";
+        auto t0 = std::chrono::steady_clock::now();
         nav_history::clear();
+        log_nav_snapshot(hf, tag, "after initial clear");
+        log_msg(hf, tag, "INPUT -- push [0x1000, 0x2000] then clear");
         nav_history::push(0x1000);
         nav_history::push(0x2000);
+        log_nav_snapshot(hf, tag, "after pushes");
         nav_history::clear();
+        log_nav_snapshot(hf, tag, "after tested clear");
 
         size_t sz = nav_history::size();
         if (sz == 0) {
-            log_msg(hf, tag, "PASS -- clear empties history");
+            log_msg(hf, tag, "PASS -- clear empties history elapsed_us=%lld", elapsed_us_since(t0));
             passed.fetch_add(1);
         } else {
             log_msg(hf, tag, "FAIL -- size=%zu after clear", sz);
@@ -1916,12 +2030,16 @@ namespace {
 
     void test_nav_history_pop_empty(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "nav.pop_empty";
+        auto t0 = std::chrono::steady_clock::now();
         nav_history::clear();
+        log_nav_snapshot(hf, tag, "after clear");
 
         uint64_t addr = 0;
         bool ok = nav_history::pop(&addr);
+        log_msg(hf, tag, "OUTPUT -- pop empty ok=%d addr=0x%llX", (int)ok, (unsigned long long)addr);
+        log_nav_snapshot(hf, tag, "after pop attempt");
         if (!ok) {
-            log_msg(hf, tag, "PASS -- pop from empty returns false");
+            log_msg(hf, tag, "PASS -- pop from empty returns false elapsed_us=%lld", elapsed_us_since(t0));
             passed.fetch_add(1);
         } else {
             log_msg(hf, tag, "FAIL -- pop from empty returned true addr=0x%llX",
@@ -1932,12 +2050,16 @@ namespace {
 
     void test_nav_history_push_zero(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "nav.push_zero";
+        auto t0 = std::chrono::steady_clock::now();
         nav_history::clear();
+        log_nav_snapshot(hf, tag, "after clear");
+        log_msg(hf, tag, "INPUT -- push 0x0 should be ignored");
         nav_history::push(0);
+        log_nav_snapshot(hf, tag, "after push zero");
 
         size_t sz = nav_history::size();
         if (sz == 0) {
-            log_msg(hf, tag, "PASS -- push(0) is ignored");
+            log_msg(hf, tag, "PASS -- push(0) is ignored elapsed_us=%lld", elapsed_us_since(t0));
             passed.fetch_add(1);
         } else {
             log_msg(hf, tag, "FAIL -- push(0) added entry, size=%zu", sz);
@@ -1949,7 +2071,12 @@ namespace {
     void test_disasm_view_bookmarks(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "disasm.bookmarks";
         try {
+            auto t0 = std::chrono::steady_clock::now();
             size_t before = disasm_view::g_state.bookmarks.size();
+            log_msg(hf, tag, "STATE -- before bookmarks=%zu selected_row=%d nav_history=%zu",
+                before,
+                disasm_view::g_state.selected_row,
+                disasm_view::g_state.nav_history.size());
 
             disasm_view::bookmark_t bm1;
             bm1.addr = 0xDEAD0001;
@@ -1963,25 +2090,37 @@ namespace {
             bm3.addr = 0xDEAD0003;
             bm3.label = "bm_test_3";
 
+            log_msg(hf, tag, "INPUT -- add bookmarks [0x%llX:%s, 0x%llX:%s, 0x%llX:%s]",
+                (unsigned long long)bm1.addr, bm1.label.c_str(),
+                (unsigned long long)bm2.addr, bm2.label.c_str(),
+                (unsigned long long)bm3.addr, bm3.label.c_str());
             disasm_view::g_state.bookmarks.push_back(bm1);
             disasm_view::g_state.bookmarks.push_back(bm2);
             disasm_view::g_state.bookmarks.push_back(bm3);
 
             size_t after = disasm_view::g_state.bookmarks.size();
+            const bool tail_ok = after >= 3 &&
+                disasm_view::g_state.bookmarks[after - 3].addr == bm1.addr &&
+                disasm_view::g_state.bookmarks[after - 2].addr == bm2.addr &&
+                disasm_view::g_state.bookmarks[after - 1].addr == bm3.addr;
+            log_msg(hf, tag, "STATE -- after add bookmarks=%zu expected=%zu tail_ok=%d",
+                after, before + 3, tail_ok ? 1 : 0);
 
             while (disasm_view::g_state.bookmarks.size() > before) {
                 disasm_view::g_state.bookmarks.pop_back();
             }
+            log_msg(hf, tag, "STATE -- after cleanup bookmarks=%zu", disasm_view::g_state.bookmarks.size());
 
-            if (after == before + 3) {
-                log_msg(hf, tag, "PASS -- added 3 bookmarks (before=%zu, after=%zu)", before, after);
+            if (after == before + 3 && tail_ok && disasm_view::g_state.bookmarks.size() == before) {
+                log_msg(hf, tag, "PASS -- added 3 bookmarks (before=%zu, after=%zu) elapsed_us=%lld", before, after, elapsed_us_since(t0));
                 passed.fetch_add(1);
             } else {
-                log_msg(hf, tag, "FAIL -- expected %zu, got %zu", before + 3, after);
+                log_msg(hf, tag, "FAIL -- expected %zu, got %zu tail_ok=%d cleanup_size=%zu",
+                    before + 3, after, tail_ok ? 1 : 0, disasm_view::g_state.bookmarks.size());
                 failed.fetch_add(1);
             }
         } catch (...) {
-            log_msg(hf, tag, "FAIL -- exception");
+            log_msg(hf, tag, "FAIL -- exception gle=0x%08lX", (unsigned long)GetLastError());
             failed.fetch_add(1);
         }
     }
@@ -1989,28 +2128,46 @@ namespace {
     void test_disasm_view_addr_format(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "disasm.addr_format";
         try {
+            auto t0 = std::chrono::steady_clock::now();
             auto original = disasm_view::g_state.addr_format;
+            log_msg(hf, tag, "STATE -- original format=%s(%d)",
+                addr_format_name(original), static_cast<int>(original));
 
             disasm_view::g_state.addr_format = disasm_view::addr_format_t::va;
             bool va_ok = (disasm_view::g_state.addr_format == disasm_view::addr_format_t::va);
+            log_msg(hf, tag, "STATE -- set va readback=%s(%d) ok=%d",
+                addr_format_name(disasm_view::g_state.addr_format),
+                static_cast<int>(disasm_view::g_state.addr_format),
+                va_ok ? 1 : 0);
 
             disasm_view::g_state.addr_format = disasm_view::addr_format_t::rva;
             bool rva_ok = (disasm_view::g_state.addr_format == disasm_view::addr_format_t::rva);
+            log_msg(hf, tag, "STATE -- set rva readback=%s(%d) ok=%d",
+                addr_format_name(disasm_view::g_state.addr_format),
+                static_cast<int>(disasm_view::g_state.addr_format),
+                rva_ok ? 1 : 0);
 
             disasm_view::g_state.addr_format = disasm_view::addr_format_t::file_offset;
             bool fo_ok = (disasm_view::g_state.addr_format == disasm_view::addr_format_t::file_offset);
+            log_msg(hf, tag, "STATE -- set file_offset readback=%s(%d) ok=%d",
+                addr_format_name(disasm_view::g_state.addr_format),
+                static_cast<int>(disasm_view::g_state.addr_format),
+                fo_ok ? 1 : 0);
 
             disasm_view::g_state.addr_format = original;
+            log_msg(hf, tag, "STATE -- restored format=%s(%d)",
+                addr_format_name(disasm_view::g_state.addr_format),
+                static_cast<int>(disasm_view::g_state.addr_format));
 
             if (va_ok && rva_ok && fo_ok) {
-                log_msg(hf, tag, "PASS -- all address formats settable");
+                log_msg(hf, tag, "PASS -- all address formats settable elapsed_us=%lld", elapsed_us_since(t0));
                 passed.fetch_add(1);
             } else {
                 log_msg(hf, tag, "FAIL -- format switch mismatch");
                 failed.fetch_add(1);
             }
         } catch (...) {
-            log_msg(hf, tag, "FAIL -- exception");
+            log_msg(hf, tag, "FAIL -- exception gle=0x%08lX", (unsigned long)GetLastError());
             failed.fetch_add(1);
         }
     }
@@ -2018,21 +2175,31 @@ namespace {
     void test_disasm_view_show_bytes_toggle(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "disasm.show_bytes";
         try {
+            auto t0 = std::chrono::steady_clock::now();
             bool original = disasm_view::g_state.show_bytes;
+            log_msg(hf, tag, "STATE -- original show_bytes=%d", original ? 1 : 0);
 
             disasm_view::g_state.show_bytes = !original;
             bool toggled = (disasm_view::g_state.show_bytes == !original);
+            log_msg(hf, tag, "STATE -- toggled show_bytes=%d expected=%d ok=%d",
+                disasm_view::g_state.show_bytes ? 1 : 0,
+                (!original) ? 1 : 0,
+                toggled ? 1 : 0);
             disasm_view::g_state.show_bytes = original;
+            log_msg(hf, tag, "STATE -- restored show_bytes=%d",
+                disasm_view::g_state.show_bytes ? 1 : 0);
 
-            if (toggled) {
-                log_msg(hf, tag, "PASS -- show_bytes toggle works");
+            if (toggled && disasm_view::g_state.show_bytes == original) {
+                log_msg(hf, tag, "PASS -- show_bytes toggle works elapsed_us=%lld", elapsed_us_since(t0));
                 passed.fetch_add(1);
             } else {
-                log_msg(hf, tag, "FAIL -- show_bytes toggle failed");
+                log_msg(hf, tag, "FAIL -- show_bytes toggle failed toggled=%d restored=%d",
+                    toggled ? 1 : 0,
+                    (disasm_view::g_state.show_bytes == original) ? 1 : 0);
                 failed.fetch_add(1);
             }
         } catch (...) {
-            log_msg(hf, tag, "FAIL -- exception");
+            log_msg(hf, tag, "FAIL -- exception gle=0x%08lX", (unsigned long)GetLastError());
             failed.fetch_add(1);
         }
     }
@@ -2040,19 +2207,54 @@ namespace {
     void test_disasm_view_detach_attach_snapshot(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "disasm.snapshot_detach_attach";
         try {
+            auto t0 = std::chrono::steady_clock::now();
+            log_msg(hf, tag, "STATE -- before detach nav=%zu nav_pos=%d bookmarks=%zu selected_row=%d show_bytes=%d format=%s(%d) layout_sig=0x%llX layout_n=%d",
+                disasm_view::g_state.nav_history.size(),
+                disasm_view::g_state.nav_pos,
+                disasm_view::g_state.bookmarks.size(),
+                disasm_view::g_state.selected_row,
+                disasm_view::g_state.show_bytes ? 1 : 0,
+                addr_format_name(disasm_view::g_state.addr_format),
+                static_cast<int>(disasm_view::g_state.addr_format),
+                (unsigned long long)disasm_view::g_state.layout_signature,
+                disasm_view::g_state.layout_n);
             auto snap = disasm_view::detach_snapshot();
             bool detached = (snap != nullptr);
+            if (snap) {
+                log_msg(hf, tag, "STATE -- detached snapshot nav=%zu nav_pos=%d bookmarks=%zu selected_row=%d show_bytes=%d format=%s(%d) layout_sig=0x%llX layout_n=%d",
+                    snap->nav_history.size(),
+                    snap->nav_pos,
+                    snap->bookmarks.size(),
+                    snap->selected_row,
+                    snap->show_bytes ? 1 : 0,
+                    addr_format_name(snap->addr_format),
+                    static_cast<int>(snap->addr_format),
+                    (unsigned long long)snap->layout_signature,
+                    snap->layout_n);
+            } else {
+                log_msg(hf, tag, "STATE -- detach returned null snapshot");
+            }
             disasm_view::attach_snapshot(std::move(snap));
+            log_msg(hf, tag, "STATE -- after attach nav=%zu nav_pos=%d bookmarks=%zu selected_row=%d show_bytes=%d format=%s(%d) layout_sig=0x%llX layout_n=%d",
+                disasm_view::g_state.nav_history.size(),
+                disasm_view::g_state.nav_pos,
+                disasm_view::g_state.bookmarks.size(),
+                disasm_view::g_state.selected_row,
+                disasm_view::g_state.show_bytes ? 1 : 0,
+                addr_format_name(disasm_view::g_state.addr_format),
+                static_cast<int>(disasm_view::g_state.addr_format),
+                (unsigned long long)disasm_view::g_state.layout_signature,
+                disasm_view::g_state.layout_n);
 
             if (detached) {
-                log_msg(hf, tag, "PASS -- detach_snapshot/attach_snapshot round-trip");
+                log_msg(hf, tag, "PASS -- detach_snapshot/attach_snapshot round-trip elapsed_us=%lld", elapsed_us_since(t0));
                 passed.fetch_add(1);
             } else {
                 log_msg(hf, tag, "FAIL -- detach_snapshot returned nullptr");
                 failed.fetch_add(1);
             }
         } catch (...) {
-            log_msg(hf, tag, "FAIL -- exception");
+            log_msg(hf, tag, "FAIL -- exception gle=0x%08lX", (unsigned long)GetLastError());
             failed.fetch_add(1);
         }
     }
@@ -2130,10 +2332,20 @@ namespace {
         ctx.rax = 0xCAFE;
         ctx.rbx = 0xBEEF;
 
+        auto t0 = std::chrono::steady_clock::now();
+        log_msg(hf, tag, "INPUT -- format_log_text template=\"rax={rax} rbx={rbx}\" rax=0x%llX rbx=0x%llX",
+            (unsigned long long)ctx.rax,
+            (unsigned long long)ctx.rbx);
         std::string result = expression_eval::format_log_text("rax={rax} rbx={rbx}", ctx);
 
         bool has_cafe = (result.find("0xCAFE") != std::string::npos);
         bool has_beef = (result.find("0xBEEF") != std::string::npos);
+        log_msg(hf, tag, "OUTPUT -- result=\"%s\" len=%zu has_cafe=%d has_beef=%d elapsed_us=%lld",
+            result.c_str(),
+            result.size(),
+            has_cafe ? 1 : 0,
+            has_beef ? 1 : 0,
+            elapsed_us_since(t0));
 
         if (has_cafe && has_beef) {
             log_msg(hf, tag, "PASS -- format_log_text: \"%s\"", result.c_str());
@@ -2146,12 +2358,30 @@ namespace {
 
     void select_center_view(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped,
                             const char* tag, center_view_t value) {
+        auto t0 = std::chrono::steady_clock::now();
+        const center_view_t before = globals::ui::active_center_view;
+        log_msg(hf, tag, "STATE -- before active_center_view=%s(%d) target=%s(%d) tid=%lu",
+            center_view_name(before),
+            static_cast<int>(before),
+            center_view_name(value),
+            static_cast<int>(value),
+            (unsigned long)GetCurrentThreadId());
         globals::ui::active_center_view = value;
-        if (globals::ui::active_center_view == value) {
-            log_msg(hf, tag, "PASS -- active_center_view selected (%d)", static_cast<int>(value));
+        const center_view_t got = globals::ui::active_center_view;
+        log_msg(hf, tag, "STATE -- after active_center_view=%s(%d) changed=%d elapsed_us=%lld",
+            center_view_name(got),
+            static_cast<int>(got),
+            (before != got) ? 1 : 0,
+            elapsed_us_since(t0));
+        if (got == value) {
+            log_msg(hf, tag, "PASS -- active_center_view selected %s(%d)", center_view_name(value), static_cast<int>(value));
             passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "FAIL -- active_center_view not selected (%d)", static_cast<int>(value));
+            log_msg(hf, tag, "FAIL -- active_center_view target=%s(%d) got=%s(%d)",
+                center_view_name(value),
+                static_cast<int>(value),
+                center_view_name(got),
+                static_cast<int>(got));
             failed.fetch_add(1);
         }
     }

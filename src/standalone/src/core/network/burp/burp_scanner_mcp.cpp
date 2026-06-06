@@ -177,8 +177,9 @@ tool_result_t tool_cancel(const json& p)
         return tool_result_t::error("missing 'audit_id'");
     uint64_t id = p["audit_id"].get<uint64_t>();
     if (!active_scanner::cancel_audit(id)) { diag::log_tagged_fmt("mcp_burp", "tool_cancel not_found id=%llu", static_cast<unsigned long long>(id)); return tool_result_t::error("audit not found"); }
-    diag::log_tagged_fmt("mcp_burp", "tool_cancel ok id=%llu", static_cast<unsigned long long>(id));
-    json data; data["audit_id"] = id; data["cancelled"] = true;
+    const bool drained = active_scanner::wait_for_audit_idle(id, 20000);
+    diag::log_tagged_fmt("mcp_burp", "tool_cancel ok id=%llu drained=%d", static_cast<unsigned long long>(id), drained ? 1 : 0);
+    json data; data["audit_id"] = id; data["cancelled"] = true; data["drained"] = drained;
     return tool_result_t::ok(std::string("Cancelled audit ") + std::to_string(id), data);
 }
 

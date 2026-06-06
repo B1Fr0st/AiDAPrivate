@@ -267,12 +267,21 @@ bool open_attach_session(uint32_t pid, std::string* out_err) {
 
 	if (loading_binary_overlay::is_active() &&
 		!loading_binary_overlay::is_waiting_for_user_decision()) {
-		state().last_error = "load_in_flight";
-		if (out_err) *out_err = "load_in_flight";
+		const uint32_t attached_now = driver_bridge::attached_pid();
+		const bool cancelled = (attached_now == pid)
+			? loading_binary_overlay::cancel_queued_load("analysis_session_open_attach_same_pid")
+			: false;
 		diag::log_tagged_fmt("analysis_session",
-			"open_attach_session_load_in_flight pid=%u phase=%s", pid,
-			loading_binary_overlay::current_phase_name());
-		return false;
+			"open_attach_session_load_in_flight pid=%u attached_pid=%u phase=%s cancelled=%d",
+			pid,
+			attached_now,
+			loading_binary_overlay::current_phase_name(),
+			cancelled ? 1 : 0);
+		if (!cancelled) {
+			state().last_error = "load_in_flight";
+			if (out_err) *out_err = "load_in_flight";
+			return false;
+		}
 	}
 
 	std::lock_guard<std::mutex> lk(state().mu);

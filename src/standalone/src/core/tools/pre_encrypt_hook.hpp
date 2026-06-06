@@ -14,7 +14,9 @@
 #include <cctype>
 #include <cstring>
 
+#include "helpers/diag_log.hpp"
 #include "standalone_driver.hpp"
+#include "../infra/win_thread.hpp"
 
 namespace pre_encrypt_hook {
 
@@ -55,6 +57,7 @@ struct state_t {
     std::atomic<bool> debug_attached{false};
     std::atomic<bool> debug_loop_running{false};
     std::atomic<DWORD> debugger_error{0};
+    aida::infra::win_thread::joinable_thread_t debug_thread;
     size_t max_captures = 4096;
     uint32_t attached_pid = 0;
     std::vector<driver_bridge::module_info_t> cached_modules;
@@ -502,6 +505,7 @@ inline void debug_event_loop() {
     clear_armed_breakpoints();
     if (g_state.debug_attached.exchange(false))
         DebugActiveProcessStop(pid);
+    g_state.polling.store(false);
     g_state.debug_loop_running.store(false);
 }
 
@@ -636,8 +640,15 @@ inline bool auto_hook(uint32_t pid) {
 
 inline void unhook_all() {
     g_state.polling.store(false);
-    for (int i = 0; i < 30 && g_state.debug_loop_running.load(); ++i)
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    if (g_state.debug_thread.joinable() && !g_state.debug_thread.join_for(3000)) {
+        diag::log_tagged_fmt("pre_encrypt_hook", "debug_loop_join_timeout pid=%u attached=%d running=%d error=%lu",
+            g_state.attached_pid,
+            g_state.debug_attached.load() ? 1 : 0,
+            g_state.debug_loop_running.load() ? 1 : 0,
+            static_cast<unsigned long>(g_state.debugger_error.load()));
+    }
+    for (int i = 0; i < 20 && g_state.debug_loop_running.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
     clear_armed_breakpoints();
 
     std::lock_guard<std::mutex> lock(g_state.mutex);
@@ -647,11 +658,16 @@ inline void unhook_all() {
     g_state.targets.clear();
     g_state.active.store(false);
     g_state.attached_pid = 0;
+    if (!g_state.polling.load() && !g_state.debug_attached.load())
+        g_state.debug_loop_running.store(false);
 }
 
 inline bool start_polling() {
     if (!g_state.active.load())
         return false;
+
+    if (g_state.debug_loop_running.load() && !g_state.debug_attached.load() && !g_state.polling.load())
+        g_state.debug_loop_running.store(false);
 
     if (g_state.debug_loop_running.exchange(true)) {
         if (g_state.debug_attached.load())
@@ -661,11 +677,18 @@ inline bool start_polling() {
 
     g_state.polling.store(true);
 
-    if (!work_queue::post([]() {
-        debug_event_loop();
-    })) {
+    if (g_state.debug_thread.joinable())
+        g_state.debug_thread.join_for(0);
+
+    std::string thread_error;
+    if (!g_state.debug_thread.start([]() { debug_event_loop(); },
+        &thread_error,
+        aida::infra::win_thread::fixture_stack_reserve,
+        "pre_encrypt_hook.debug_event_loop")) {
+        diag::log_tagged_fmt("pre_encrypt_hook", "debug_loop_thread_start_failed error=%s", thread_error.c_str());
         g_state.polling.store(false);
         g_state.debug_loop_running.store(false);
+        g_state.debugger_error.store(ERROR_NOT_ENOUGH_MEMORY);
         return false;
     }
 

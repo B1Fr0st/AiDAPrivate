@@ -12,8 +12,10 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace aida {
@@ -89,6 +91,29 @@ json status_to_json(const camoufox::bridge_status_t& s)
     j["last_verified_ms"] = s.last_verified_ms;
     j["ready"]            = s.state == camoufox::bridge_state_t::ready && s.browser_open && s.page_verified && s.child_alive && !s.cleanup_pending;
     return j;
+}
+
+bool bridge_ready(const camoufox::bridge_status_t& s)
+{
+    return s.state == camoufox::bridge_state_t::ready && s.browser_open && s.page_verified && s.child_alive && !s.cleanup_pending;
+}
+
+camoufox::bridge_status_t wait_for_ready_status(int timeout_ms)
+{
+    if (timeout_ms < 0)
+        timeout_ms = 0;
+    const auto start = std::chrono::steady_clock::now();
+    camoufox::bridge_status_t s = camoufox::get_status();
+    while (!bridge_ready(s))
+    {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count();
+        if (elapsed >= timeout_ms)
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        s = camoufox::get_status();
+    }
+    return s;
 }
 
 const char* json_type_name(const json& j)
@@ -203,7 +228,7 @@ tool_result_t tool_headless_start(const json& params)
         (int)cfg.humanize, (int)cfg.geoip, (int)cfg.block_images, (int)cfg.block_webrtc, (int)cfg.enable_trace,
         cfg.python_executable.c_str(), cfg.server_module.c_str(), cfg.launch_timeout_ms, cfg.window_width, cfg.window_height);
     bool ok = camoufox::start_bridge(cfg);
-    auto s = camoufox::get_status();
+    auto s = ok ? wait_for_ready_status(5000) : camoufox::get_status();
     json j = status_to_json(s);
     if (!ok)
     {
@@ -212,6 +237,18 @@ tool_result_t tool_headless_start(const json& params)
             state_label(s.state), (int)s.browser_open, static_cast<unsigned long long>(s.total_calls),
             static_cast<unsigned long long>(s.total_errors), err.size(), err.c_str());
         return tool_result_t::error(err.empty() ? std::string("camoufox start failed") : err);
+    }
+    if (!bridge_ready(s))
+    {
+        std::string err = s.last_error.empty() ? std::string("camoufox bridge did not become ready") : s.last_error;
+        diag::log_tagged_fmt("mcp_burp", "headless_start not_ready state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d err=%s",
+            state_label(s.state), s.child_pid, s.child_alive ? 1 : 0, s.browser_open ? 1 : 0,
+            s.page_verified ? 1 : 0, s.cleanup_pending ? 1 : 0, err.c_str());
+        tool_result_t out;
+        out.success = false;
+        out.text = err;
+        out.data = j;
+        return out;
     }
     diag::log_tagged_fmt("mcp_burp", "headless_start ok state=%s browser_open=%d calls=%llu errors=%llu response_shape=%s",
         state_label(s.state), (int)s.browser_open, static_cast<unsigned long long>(s.total_calls),
@@ -280,7 +317,7 @@ tool_result_t bridge_result_to_tool_result(const camoufox::call_result_t& r)
 {
     if (r.ok)
     {
-        if (!r.data.is_null() && !r.data.empty())
+        if (!r.data.is_null())
             return tool_result_t::ok(r.data);
         if (!r.text.empty())
             return tool_result_t::ok(r.text);
@@ -290,8 +327,110 @@ tool_result_t bridge_result_to_tool_result(const camoufox::call_result_t& r)
     tool_result_t out;
     out.success = false;
     out.text = r.error.empty() ? (r.text.empty() ? std::string("camoufox tool failed") : r.text) : r.error;
-    if (!r.data.is_null() && !r.data.empty())
+    if (!r.data.is_null())
         out.data = r.data;
+    return out;
+}
+
+tool_result_t tool_camoufox_click(const json& params)
+{
+    if (!params.is_object() || !params.contains("selector") || !params["selector"].is_string())
+        return tool_result_t::error("missing_selector");
+    const std::string selector = params["selector"].get<std::string>();
+    auto before = camoufox::get_status();
+    const auto start = std::chrono::steady_clock::now();
+    diag::log_tagged_fmt("mcp_burp", "camoufox_click_direct entry selector=%s state=%s child_pid=%lu ready=%d",
+        selector.c_str(),
+        state_label(before.state),
+        static_cast<unsigned long>(before.child_pid),
+        bridge_ready(before) ? 1 : 0);
+    json args;
+    args["selector"] = selector;
+    tool_result_t out = bridge_result_to_tool_result(camoufox::call_tool("click", args, 5000));
+    auto after = camoufox::get_status();
+    if (out.data.is_object())
+        out.data["bridge"] = status_to_json(after);
+    diag::log_tagged_fmt("mcp_burp", "camoufox_click_direct exit selector=%s success=%d elapsed_ms=%llu state=%s child_pid=%lu data_shape=%s text_len=%zu",
+        selector.c_str(),
+        static_cast<int>(out.success),
+        static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count()),
+        state_label(after.state),
+        static_cast<unsigned long>(after.child_pid),
+        json_shape(out.data).c_str(),
+        out.text.size());
+    return out;
+}
+
+tool_result_t tool_camoufox_type_text(const json& params)
+{
+    if (!params.is_object() || !params.contains("selector") || !params["selector"].is_string())
+        return tool_result_t::error("missing_selector");
+    if (!params.contains("text") || !params["text"].is_string())
+        return tool_result_t::error("missing_text");
+    const std::string selector = params["selector"].get<std::string>();
+    const std::string text = params["text"].get<std::string>();
+    const int delay = json_int_param(params, "delay", 0);
+    auto before = camoufox::get_status();
+    const auto start = std::chrono::steady_clock::now();
+    diag::log_tagged_fmt("mcp_burp", "camoufox_type_direct entry selector=%s text_len=%zu delay=%d state=%s child_pid=%lu ready=%d",
+        selector.c_str(),
+        text.size(),
+        delay,
+        state_label(before.state),
+        static_cast<unsigned long>(before.child_pid),
+        bridge_ready(before) ? 1 : 0);
+    json args;
+    args["selector"] = selector;
+    args["text"] = text;
+    args["delay"] = delay;
+    tool_result_t out = bridge_result_to_tool_result(camoufox::call_tool("type_text", args, 5000));
+    auto after = camoufox::get_status();
+    if (out.data.is_object())
+        out.data["bridge"] = status_to_json(after);
+    diag::log_tagged_fmt("mcp_burp", "camoufox_type_direct exit selector=%s success=%d text_len=%zu elapsed_ms=%llu state=%s child_pid=%lu data_shape=%s out_text_len=%zu",
+        selector.c_str(),
+        static_cast<int>(out.success),
+        text.size(),
+        static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count()),
+        state_label(after.state),
+        static_cast<unsigned long>(after.child_pid),
+        json_shape(out.data).c_str(),
+        out.text.size());
+    return out;
+}
+
+tool_result_t tool_camoufox_wait_for_selector(const json& params)
+{
+    if (!params.is_object() || !params.contains("selector") || !params["selector"].is_string())
+        return tool_result_t::error("missing_selector");
+    const std::string selector = params["selector"].get<std::string>();
+    int timeout_ms = json_int_param(params, "timeout", 5000);
+    if (timeout_ms < 1) timeout_ms = 5000;
+    if (timeout_ms > 60000) timeout_ms = 60000;
+    auto before = camoufox::get_status();
+    const auto start = std::chrono::steady_clock::now();
+    diag::log_tagged_fmt("mcp_burp", "camoufox_wait_direct entry selector=%s timeout_ms=%d state=%s child_pid=%lu ready=%d",
+        selector.c_str(),
+        timeout_ms,
+        state_label(before.state),
+        static_cast<unsigned long>(before.child_pid),
+        bridge_ready(before) ? 1 : 0);
+    json args;
+    args["selector"] = selector;
+    args["timeout"] = timeout_ms;
+    tool_result_t out = bridge_result_to_tool_result(camoufox::call_tool("wait_for", args, timeout_ms + 5000));
+    auto after = camoufox::get_status();
+    if (out.data.is_object())
+        out.data["bridge"] = status_to_json(after);
+    diag::log_tagged_fmt("mcp_burp", "camoufox_wait_direct exit selector=%s success=%d timeout_ms=%d elapsed_ms=%llu state=%s child_pid=%lu data_shape=%s text_len=%zu",
+        selector.c_str(),
+        static_cast<int>(out.success),
+        timeout_ms,
+        static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count()),
+        state_label(after.state),
+        static_cast<unsigned long>(after.child_pid),
+        json_shape(out.data).c_str(),
+        out.text.size());
     return out;
 }
 
@@ -319,12 +458,21 @@ tool_result_t tool_launch_browser(const json& params)
 {
     camoufox::launch_config_t cfg = launch_config_from_mcp_params(params);
     bool ok = camoufox::start_bridge(cfg);
-    json j = status_to_json(camoufox::get_status());
+    auto status = ok ? wait_for_ready_status(5000) : camoufox::get_status();
+    json j = status_to_json(status);
     if (!ok)
     {
         tool_result_t out;
         out.success = false;
         out.text = j.value("last_error", std::string("camoufox launch_browser failed"));
+        out.data = j;
+        return out;
+    }
+    if (!bridge_ready(status))
+    {
+        tool_result_t out;
+        out.success = false;
+        out.text = j.value("last_error", std::string("camoufox launch_browser did not become ready"));
         out.data = j;
         return out;
     }
@@ -375,9 +523,40 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
     }
     json args = camoufox_args(params);
     int timeout_ms = camoufox_timeout_ms(params, default_timeout_ms);
-    diag::log_tagged_fmt("mcp_burp", "camoufox_passthrough tool=%s timeout_ms=%d args_shape=%s",
-        tool_name.c_str(), timeout_ms, json_shape(args).c_str());
-    return bridge_result_to_tool_result(camoufox::call_tool(tool_name, args, timeout_ms));
+    auto before = camoufox::get_status();
+    const auto start = std::chrono::steady_clock::now();
+    diag::log_tagged_fmt("mcp_burp", "camoufox_passthrough entry tool=%s timeout_ms=%d args_shape=%s bridge_state=%s child_pid=%lu browser_open=%d page_verified=%d child_alive=%d cleanup_pending=%d",
+        tool_name.c_str(), timeout_ms, json_shape(args).c_str(), state_label(before.state),
+        static_cast<unsigned long>(before.child_pid), static_cast<int>(before.browser_open),
+        static_cast<int>(before.page_verified), static_cast<int>(before.child_alive), static_cast<int>(before.cleanup_pending));
+    if (tool_name == "click")
+        return tool_camoufox_click(params);
+    if (tool_name == "type_text")
+        return tool_camoufox_type_text(params);
+    if (tool_name == "wait_for" && params.is_object() && params.contains("selector") && params["selector"].is_string())
+        return tool_camoufox_wait_for_selector(params);
+    camoufox::call_result_t bridge_result = camoufox::call_tool(tool_name, args, timeout_ms);
+    tool_result_t out = bridge_result_to_tool_result(bridge_result);
+    auto after = camoufox::get_status();
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count();
+    std::string failure_phase;
+    try
+    {
+        if (!out.success && out.data.is_object())
+        {
+            auto it = out.data.find("phase");
+            if (it != out.data.end() && it->is_string())
+                failure_phase = it->get<std::string>();
+        }
+    }
+    catch (...) {}
+    diag::log_tagged_fmt("mcp_burp", "camoufox_passthrough exit tool=%s success=%d elapsed_ms=%lld data_shape=%s text_len=%zu failure_phase=%s bridge_state=%s child_pid=%lu browser_open=%d page_verified=%d child_alive=%d cleanup_pending=%d",
+        tool_name.c_str(), static_cast<int>(out.success), static_cast<long long>(elapsed_ms),
+        json_shape(out.data).c_str(), out.text.size(), failure_phase.c_str(), state_label(after.state),
+        static_cast<unsigned long>(after.child_pid), static_cast<int>(after.browser_open),
+        static_cast<int>(after.page_verified), static_cast<int>(after.child_alive), static_cast<int>(after.cleanup_pending));
+    return out;
 }
 
 struct camoufox_tool_spec_t

@@ -14,6 +14,7 @@
 
 #ifdef __NT__
 #include <windows.h>
+#include "standalone/src/core/infra/win_thread.hpp"
 #endif
 
 namespace net_security {
@@ -279,10 +280,15 @@ private:
 
     bool validate_client_random(const std::uint8_t* data, std::size_t len);
     bool validate_master_secret(const std::uint8_t* data, std::size_t len);
+    void keylog_worker_loop(const char* mode);
+    static void CALLBACK keylog_threadpool_entry(PTP_CALLBACK_INSTANCE instance, void* context);
+    bool wait_keylog_worker_done(DWORD timeout_ms);
 
     std::mutex _mutex;
     std::atomic<bool> _keylog_active{false};
-    std::thread _keylog_thread;
+    std::atomic<bool> _keylog_worker_done{true};
+    std::atomic<bool> _keylog_threadpool_worker{false};
+    aida::infra::win_thread::joinable_thread_t _keylog_thread;
     keylog_config_t _keylog_config;
     std::map<std::string, tls_session_key_t> _seen_keys;
 };
@@ -460,12 +466,17 @@ private:
                        const std::string& url, const std::map<std::string, std::string>& headers,
                        const std::string& body);
     std::string build_response(const autoresponder_rule_t& rule);
+    void worker_loop(const char* mode);
+    static void CALLBACK threadpool_entry(PTP_CALLBACK_INSTANCE instance, void* context);
+    bool wait_worker_done(DWORD timeout_ms);
 
     mutable std::mutex _mutex;
     std::map<std::uint32_t, autoresponder_rule_t> _rules;
     std::uint32_t _next_rule_id = 1;
     std::atomic<bool> _active{false};
-    std::thread _responder_thread;
+    std::atomic<bool> _worker_done{true};
+    std::atomic<bool> _threadpool_worker{false};
+    aida::infra::win_thread::joinable_thread_t _responder_thread;
 };
 
 }

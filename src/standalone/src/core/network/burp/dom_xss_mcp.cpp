@@ -23,6 +23,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <exception>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -296,11 +297,53 @@ tool_result_t tool_test_payload(const json& params)
     }
 
     auto s = dom_xss::make_sentinel();
-    auto r = dom_xss::fire_payload(*chosen, payload_tpl, s, capture, per_timeout, scheme, port);
+    dom_xss::fire_result_t r;
+    const auto bridge_before = camoufox::get_status();
+    const uint64_t fire_start_ms = GetTickCount64();
+    diag::log_tagged_fmt("mcp_burp", "dom_xss_test_payload fire_begin host=%s path=%s chosen_kind=%s chosen_name=%s state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu last_error_len=%zu timeout_ms=%d capture=%d",
+        host.c_str(), safe_path.c_str(), chosen->kind.c_str(), chosen->name.c_str(),
+        static_cast<int>(bridge_before.state), static_cast<unsigned long long>(bridge_before.generation),
+        static_cast<unsigned long>(bridge_before.child_pid), bridge_before.child_alive ? 1 : 0,
+        bridge_before.browser_open ? 1 : 0, bridge_before.page_verified ? 1 : 0,
+        bridge_before.cleanup_pending ? 1 : 0, static_cast<unsigned long long>(bridge_before.total_calls),
+        static_cast<unsigned long long>(bridge_before.total_errors), bridge_before.last_error.size(),
+        per_timeout, capture ? 1 : 0);
+    try {
+        r = dom_xss::fire_payload(*chosen, payload_tpl, s, capture, per_timeout, scheme, port);
+    } catch (const std::exception& ex) {
+        const auto bridge_after = camoufox::get_status();
+        diag::log_tagged_critical_fmt("mcp_burp", "dom_xss_test_payload exception host=%s path=%s chosen_kind=%s elapsed_ms=%llu state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu last_error_len=%zu err=%s",
+            host.c_str(), safe_path.c_str(), chosen->kind.c_str(),
+            static_cast<unsigned long long>(GetTickCount64() - fire_start_ms),
+            static_cast<int>(bridge_after.state), static_cast<unsigned long long>(bridge_after.generation),
+            static_cast<unsigned long>(bridge_after.child_pid), bridge_after.child_alive ? 1 : 0,
+            bridge_after.browser_open ? 1 : 0, bridge_after.page_verified ? 1 : 0,
+            bridge_after.cleanup_pending ? 1 : 0, static_cast<unsigned long long>(bridge_after.total_calls),
+            static_cast<unsigned long long>(bridge_after.total_errors), bridge_after.last_error.size(), ex.what());
+        return tool_result_t::error(std::string("DOM-XSS payload exception: ") + ex.what());
+    } catch (...) {
+        const auto bridge_after = camoufox::get_status();
+        diag::log_tagged_critical_fmt("mcp_burp", "dom_xss_test_payload exception host=%s path=%s chosen_kind=%s elapsed_ms=%llu state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu last_error_len=%zu err=unknown",
+            host.c_str(), safe_path.c_str(), chosen->kind.c_str(),
+            static_cast<unsigned long long>(GetTickCount64() - fire_start_ms),
+            static_cast<int>(bridge_after.state), static_cast<unsigned long long>(bridge_after.generation),
+            static_cast<unsigned long>(bridge_after.child_pid), bridge_after.child_alive ? 1 : 0,
+            bridge_after.browser_open ? 1 : 0, bridge_after.page_verified ? 1 : 0,
+            bridge_after.cleanup_pending ? 1 : 0, static_cast<unsigned long long>(bridge_after.total_calls),
+            static_cast<unsigned long long>(bridge_after.total_errors), bridge_after.last_error.size());
+        return tool_result_t::error("DOM-XSS payload exception: unknown");
+    }
     total_payloads_slot().fetch_add(1);
-    diag::log_tagged_fmt("mcp_burp", "dom_xss_test_payload result ok=%d canary_fired=%d host=%s path=%s chosen_kind=%s chosen_name=%s error_len=%zu sink_entries=%zu screenshot_len=%zu",
+    const auto bridge_after = camoufox::get_status();
+    diag::log_tagged_fmt("mcp_burp", "dom_xss_test_payload result ok=%d canary_fired=%d host=%s path=%s chosen_kind=%s chosen_name=%s error_len=%zu sink_entries=%zu screenshot_len=%zu elapsed_ms=%llu state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu last_error_len=%zu",
         (int)r.ok, (int)r.canary_fired, host.c_str(), safe_path.c_str(), chosen->kind.c_str(), chosen->name.c_str(),
-        r.error.size(), r.sink_log.size(), r.last_screenshot_path.size());
+        r.error.size(), r.sink_log.size(), r.last_screenshot_path.size(),
+        static_cast<unsigned long long>(GetTickCount64() - fire_start_ms),
+        static_cast<int>(bridge_after.state), static_cast<unsigned long long>(bridge_after.generation),
+        static_cast<unsigned long>(bridge_after.child_pid), bridge_after.child_alive ? 1 : 0,
+        bridge_after.browser_open ? 1 : 0, bridge_after.page_verified ? 1 : 0,
+        bridge_after.cleanup_pending ? 1 : 0, static_cast<unsigned long long>(bridge_after.total_calls),
+        static_cast<unsigned long long>(bridge_after.total_errors), bridge_after.last_error.size());
 
     json data;
     data["ok"] = r.ok;
@@ -419,7 +462,22 @@ tool_result_t tool_scan(const json& params)
         if (ip.kind != "query" && ip.kind != "path" &&
             ip.kind != "body_form" && ip.kind != "body_json" &&
             ip.kind != "header" && ip.kind != "cookie") continue;
-        size_t emitted = dom_xss::scan_insertion_point(ip, opts);
+        size_t emitted = 0;
+        try {
+            emitted = dom_xss::scan_insertion_point(ip, opts);
+        } catch (const std::exception& ex) {
+            last_scan_ms_slot().store(now_ms_wall());
+            total_scans_slot().fetch_add(1);
+            diag::log_tagged_critical_fmt("mcp_burp", "dom_xss_scan exception host=%s path=%s kind=%s param=%s err=%s",
+                host.c_str(), safe_path.c_str(), ip.kind.c_str(), ip.name.c_str(), ex.what());
+            return tool_result_t::error(std::string("DOM-XSS scan exception: ") + ex.what());
+        } catch (...) {
+            last_scan_ms_slot().store(now_ms_wall());
+            total_scans_slot().fetch_add(1);
+            diag::log_tagged_critical_fmt("mcp_burp", "dom_xss_scan exception host=%s path=%s kind=%s param=%s err=unknown",
+                host.c_str(), safe_path.c_str(), ip.kind.c_str(), ip.name.c_str());
+            return tool_result_t::error("DOM-XSS scan exception: unknown");
+        }
         total_emitted += emitted;
         total_payloads_slot().fetch_add(opts.max_payloads_per_point);
         std::string point_error = dom_xss::last_error();

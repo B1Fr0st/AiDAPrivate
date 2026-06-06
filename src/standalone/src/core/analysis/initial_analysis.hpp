@@ -20,6 +20,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "zydis_disasm.hpp"
@@ -30,6 +31,7 @@
 #include "function_index.hpp"
 #include "xref_index.hpp"
 #include "work_queue.hpp"
+#include "../infra/win_thread.hpp"
 #include "../../helpers/diag_log.hpp"
 #include "../../helpers/globals.h"
 #include "../anti-tamper/webhook.hpp"
@@ -1039,7 +1041,7 @@ inline void run_initial_analysis(const std::string& path, const std::string& fil
 	g_state.running.store(true, std::memory_order_release);
 	std::string p = path;
 	std::string n = filename;
-	bool posted = work_queue::post([p, n]() {
+	auto run_worker = [p, n]() {
 		detail::push_log_fmt("run_pipeline_worker_begin path=%s filename=%s", p.c_str(), n.c_str());
 		try {
 			detail::run_pipeline(p, n);
@@ -1062,7 +1064,13 @@ inline void run_initial_analysis(const std::string& path, const std::string& fil
 			detail::push_log_fmt("run_pipeline_exception path=%s filename=%s what=unknown",
 				p.c_str(), n.c_str());
 		}
-	});
+	};
+	std::string thread_error;
+	bool posted = aida::infra::win_thread::start_detached(run_worker, &thread_error, aida::infra::win_thread::default_stack_reserve, "aida-initial-analysis");
+	if (!posted) {
+		detail::push_log_fmt("run_initial_analysis_thread_failed path=%s filename=%s err=%s", path.c_str(), filename.c_str(), thread_error.c_str());
+		posted = work_queue::post(std::move(run_worker));
+	}
 	detail::push_log_fmt("run_initial_analysis_post path=%s filename=%s posted=%d",
 		path.c_str(),
 		filename.c_str(),

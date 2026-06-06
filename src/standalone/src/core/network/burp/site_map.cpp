@@ -163,16 +163,21 @@ void insert_into_tree(state_t& st, const exchange_observed_t& e)
     }
 }
 
+void store_exchange(exchange_observed_t e)
+{
+    auto& st = s();
+    std::lock_guard<std::mutex> lk(st.mtx);
+    if (e.id == 0) e.id = st.next_id.fetch_add(1);
+    if (e.timestamp_ms == 0) e.timestamp_ms = now_ms();
+    insert_into_tree(st, e);
+}
+
 void handle_exchange(const exchange_observed_t& evt)
 {
-    work_queue::post([evt]() {
-        auto& st = s();
-        std::lock_guard<std::mutex> lk(st.mtx);
-        exchange_observed_t e = evt;
-        if (e.id == 0) e.id = st.next_id.fetch_add(1);
-        if (e.timestamp_ms == 0) e.timestamp_ms = now_ms();
-        insert_into_tree(st, e);
-    });
+    if (!work_queue::post([evt]() { store_exchange(evt); })) {
+        diag::log_tagged("burp", "site_map_async_post_failed_sync_store");
+        store_exchange(evt);
+    }
 }
 
 std::string path_join(const std::string& parent, const std::string& seg)
@@ -204,7 +209,7 @@ void shutdown()
 
 void ingest_exchange(const exchange_observed_t& e)
 {
-    handle_exchange(e);
+    store_exchange(e);
 }
 
 uint64_t get_selected_exchange_id()

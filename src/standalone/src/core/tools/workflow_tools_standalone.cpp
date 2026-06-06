@@ -30,6 +30,7 @@
 #include <cctype>
 #include <chrono>
 #include <system_error>
+#include <utility>
 
 #include <nlohmann/json.hpp>
 
@@ -107,6 +108,121 @@ bool path_within_workspace(const std::string& canonical_path)
         [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
     return p_str.find(ws_str) == 0;
+}
+
+std::vector<code_index::search_result_t> direct_codebase_search(const std::string& query, const std::string& directory, int top_k)
+{
+    std::vector<code_index::search_result_t> results;
+    if (query.empty())
+        return results;
+    std::string root = g_sa_settings.workspace.root_path.empty() ? file_browser::current_dir : g_sa_settings.workspace.root_path;
+    if (root.empty())
+        return results;
+
+    std::error_code ec;
+    fs::path root_path = fs::weakly_canonical(fs::path(root), ec);
+    if (ec)
+        root_path = fs::path(root);
+
+    fs::path search_path = root_path;
+    if (!directory.empty()) {
+        fs::path dir_path(directory);
+        if (dir_path.is_relative())
+            dir_path = root_path / dir_path;
+        std::error_code dir_ec;
+        fs::path canonical_dir = fs::weakly_canonical(dir_path, dir_ec);
+        if (!dir_ec)
+            search_path = canonical_dir;
+    }
+
+    std::string root_lc = root_path.string();
+    std::string search_lc = search_path.string();
+    std::transform(root_lc.begin(), root_lc.end(), root_lc.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::transform(search_lc.begin(), search_lc.end(), search_lc.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (search_lc.find(root_lc) != 0)
+        return results;
+
+    std::string lower_query = query;
+    std::transform(lower_query.begin(), lower_query.end(), lower_query.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    constexpr int max_files = 5000;
+    int files_scanned = 0;
+    for (auto it = fs::recursive_directory_iterator(search_path, fs::directory_options::skip_permission_denied, ec);
+         it != fs::recursive_directory_iterator(); ++it)
+    {
+        if (ec)
+            break;
+        if (static_cast<int>(results.size()) >= top_k)
+            break;
+        if (files_scanned >= max_files)
+            break;
+        std::error_code entry_ec;
+        if (it->is_directory(entry_ec)) {
+            std::string name = it->path().filename().string();
+            if (name == ".git" || name == ".vs" || name == "node_modules" || name == "__pycache__")
+                it.disable_recursion_pending();
+            continue;
+        }
+        if (!it->is_regular_file(entry_ec))
+            continue;
+        std::string ext = it->path().extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (!code_index::is_indexable_extension(ext))
+            continue;
+        auto file_size = it->file_size(entry_ec);
+        if (entry_ec || file_size > 2 * 1024 * 1024)
+            continue;
+        ++files_scanned;
+        std::ifstream ifs(it->path(), std::ios::binary);
+        if (!ifs.is_open())
+            continue;
+        std::string line;
+        int line_number = 0;
+        while (std::getline(ifs, line)) {
+            ++line_number;
+            std::string lower_line = line;
+            std::transform(lower_line.begin(), lower_line.end(), lower_line.begin(),
+                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (lower_line.find(lower_query) == std::string::npos)
+                continue;
+            code_index::search_result_t result;
+            result.file_path = it->path().string();
+            result.line_number = line_number;
+            result.content = line.size() > 240 ? line.substr(0, 240) + "..." : line;
+            result.score = 0.01;
+            results.push_back(std::move(result));
+            if (static_cast<int>(results.size()) >= top_k)
+                break;
+        }
+    }
+    diag::log_tagged_fmt("workflow",
+        "codebase_search_direct root='%s' directory='%s' files=%d results=%zu query='%.80s'",
+        root_path.string().c_str(),
+        directory.c_str(),
+        files_scanned,
+        results.size(),
+        query.c_str());
+    return results;
+}
+
+tool_result_t codebase_results_response(const std::string& query, const std::vector<code_index::search_result_t>& results)
+{
+    json results_json = json::array();
+    for (const auto& r : results) {
+        results_json.push_back({
+            {"file", r.file_path},
+            {"line", r.line_number},
+            {"score", r.score},
+            {"content", r.content}
+        });
+    }
+    return tool_result_t::ok(
+        "Found " + std::to_string(results.size()) + " results for: " + query,
+        json{{"results", results_json}});
 }
 
 
@@ -597,40 +713,49 @@ tool_result_t handle_codebase_search(const json& params)
     if (params.contains("directory") && params["directory"].is_string())
         directory = params["directory"].get<std::string>();
 
-    std::lock_guard<std::mutex> lk(g_code_index_mtx);
+    if (query.empty())
+        return tool_result_t::error("Query cannot be empty.");
+
+    std::unique_lock<std::mutex> lk(g_code_index_mtx);
     if (!g_code_index) {
         if (g_sa_settings.workspace.root_path.empty())
             return tool_result_t::error("No workspace is open. Open a workspace first.");
 
         g_code_index = std::make_unique<code_index::manager_t>(g_sa_settings.workspace.root_path);
         g_code_index->start_indexing();
+        lk.unlock();
+        auto direct = direct_codebase_search(query, directory, 10);
+        if (!direct.empty())
+            return codebase_results_response(query, direct);
         return tool_result_t::ok("Code index is being built. Please retry in a moment.");
     }
 
-    if (g_code_index->state() == code_index::index_state_t::indexing)
+    if (g_code_index->state() == code_index::index_state_t::indexing) {
+        auto partial_results = g_code_index->search(query, directory, 10);
+        size_t indexed_count = g_code_index->indexed_count();
+        lk.unlock();
+        if (!partial_results.empty())
+            return codebase_results_response(query, partial_results);
+        auto direct = direct_codebase_search(query, directory, 10);
+        if (!direct.empty())
+            return codebase_results_response(query, direct);
         return tool_result_t::ok("Code index is still building. Please retry in a moment. " +
-                                std::to_string(g_code_index->indexed_count()) + " documents indexed so far.");
+                                std::to_string(indexed_count) + " documents indexed so far.");
+    }
 
     auto results = g_code_index->search(query, directory, 10);
+    lk.unlock();
     diag::log_tagged_fmt("workflow", "codebase_search results=%zu query='%.80s'",
         results.size(), query.c_str());
 
-    if (results.empty())
+    if (results.empty()) {
+        auto direct = direct_codebase_search(query, directory, 10);
+        if (!direct.empty())
+            return codebase_results_response(query, direct);
         return tool_result_t::ok("No results found for query: " + query);
-
-    json results_json = json::array();
-    for (const auto& r : results) {
-        results_json.push_back({
-            {"file", r.file_path},
-            {"line", r.line_number},
-            {"score", r.score},
-            {"content", r.content}
-        });
     }
 
-    return tool_result_t::ok(
-        "Found " + std::to_string(results.size()) + " results for: " + query,
-        json{{"results", results_json}});
+    return codebase_results_response(query, results);
 }
 
 
@@ -664,6 +789,7 @@ tool_result_t handle_read_command_output(const json& params)
     bool running = false;
     int64_t exit_code = 0;
     bool was_timeout = false;
+    bool reader_done = false;
     int64_t duration_ms = 0;
     std::string sess_id;
     std::string sess_cmd;
@@ -675,6 +801,7 @@ tool_result_t handle_read_command_output(const json& params)
             sess_id = sess.id;
             sess_cmd = sess.command;
             running = sess.alive.load();
+            reader_done = sess.reader_done.load(std::memory_order_acquire);
             exit_code = sess.exit_code.load();
             was_timeout = sess.timed_out.load();
             auto end = running ? std::chrono::steady_clock::now() : sess.finished_at;
@@ -703,6 +830,7 @@ tool_result_t handle_read_command_output(const json& params)
     status["session_id"] = sess_id;
     status["command"] = sess_cmd;
     status["running"] = running;
+    status["reader_done"] = reader_done;
     status["exit_code"] = running ? json(nullptr) : json(exit_code);
     status["timed_out"] = was_timeout;
     status["duration_ms"] = duration_ms;
@@ -728,7 +856,7 @@ tool_result_t handle_read_command_output(const json& params)
     if (out_copy.empty() && err_copy.empty())
         text += "(no output yet)";
 
-    if (drop_after && !running)
+    if (drop_after && !running && reader_done)
         command_sessions::remove_session(id);
 
     return tool_result_t::ok(text, status);

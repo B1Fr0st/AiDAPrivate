@@ -1,6 +1,9 @@
 #define WIN32_LEAN_AND_MEAN
 #define CPPHTTPLIB_OPENSSL_SUPPORT
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
+#include <winhttp.h>
 
 #include "mcp_standalone.hpp"
 #include "standalone_tools_fwd.hpp"
@@ -11,23 +14,29 @@
 #include "zydis_disasm.hpp"
 #include "../analysis/stealth_engine.hpp"
 #include "../../helpers/diag_log.hpp"
+#include "../../helpers/globals.h"
 
 #include <httplib.h>
 
 #include <algorithm>
 #include <cctype>
+#include <cwctype>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <regex>
 #include <sstream>
 #include <string>
 #include <vector>
+
+#pragma comment(lib, "Ws2_32.lib")
+#pragma comment(lib, "winhttp.lib")
 
 namespace fs = std::filesystem;
 
@@ -75,6 +84,39 @@ namespace
         return value;
     }
 
+    fs::path resolve_workspace_path(const std::string& raw)
+    {
+        fs::path p(raw);
+        if (!p.is_absolute() && !file_browser::current_dir.empty())
+            p = fs::path(file_browser::current_dir) / p;
+        std::error_code ec;
+        auto canonical = fs::weakly_canonical(p, ec);
+        if (!ec)
+            return canonical;
+        return p.lexically_normal();
+    }
+
+    bool path_within_current_workspace(const fs::path& p)
+    {
+        if (file_browser::current_dir.empty())
+            return true;
+        std::error_code ec;
+        auto ws = fs::weakly_canonical(fs::path(file_browser::current_dir), ec);
+        if (ec)
+            return false;
+        auto ws_str = ws.lexically_normal().wstring();
+        auto p_str = p.lexically_normal().wstring();
+        std::transform(ws_str.begin(), ws_str.end(), ws_str.begin(),
+            [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
+        std::transform(p_str.begin(), p_str.end(), p_str.begin(),
+            [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
+        if (ws_str == p_str)
+            return true;
+        if (!ws_str.empty() && ws_str.back() != L'\\' && ws_str.back() != L'/')
+            ws_str.push_back(L'\\');
+        return p_str.rfind(ws_str, 0) == 0;
+    }
+
     std::string trim(std::string text)
     {
         auto first = text.find_first_not_of(" \t\r\n");
@@ -99,6 +141,184 @@ namespace
         return h.rfind("127.", 0) == 0;
     }
 
+    bool webfetch_send_all(SOCKET s, const std::string& data)
+    {
+        const char* p = data.data();
+        size_t left = data.size();
+        while (left != 0) {
+            int n = send(s, p, static_cast<int>(std::min<size_t>(left, 16384)), 0);
+            if (n <= 0)
+                return false;
+            p += n;
+            left -= static_cast<size_t>(n);
+        }
+        return true;
+    }
+
+    std::string webfetch_header_value(const std::string& headers, const std::string& wanted_lc)
+    {
+        size_t pos = 0;
+        while (pos < headers.size()) {
+            size_t eol = headers.find("\r\n", pos);
+            if (eol == std::string::npos)
+                eol = headers.size();
+            std::string line = headers.substr(pos, eol - pos);
+            size_t colon = line.find(':');
+            if (colon != std::string::npos) {
+                std::string key = to_lower(trim(line.substr(0, colon)));
+                if (key == wanted_lc)
+                    return trim(line.substr(colon + 1));
+            }
+            if (eol == headers.size())
+                break;
+            pos = eol + 2;
+        }
+        return {};
+    }
+
+    bool webfetch_raw_loopback_get(const std::string& host,
+                                   int port,
+                                   const std::string& path,
+                                   const std::string& accept_header,
+                                   int timeout_sec,
+                                   int& status,
+                                   std::string& content_type,
+                                   std::string& body,
+                                   std::string& error_text)
+    {
+        status = 0;
+        content_type.clear();
+        body.clear();
+        error_text.clear();
+
+        WSADATA wsa{};
+        const int wsa_rc = WSAStartup(MAKEWORD(2, 2), &wsa);
+        if (wsa_rc != 0) {
+            error_text = "WSAStartup failed: " + std::to_string(wsa_rc);
+            return false;
+        }
+
+        std::string lookup_host = host;
+        const std::string host_lc = to_lower(host);
+        if (host_lc == "localhost")
+            lookup_host = "127.0.0.1";
+        else if (host_lc == "[::1]")
+            lookup_host = "::1";
+
+        addrinfo hints{};
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_protocol = IPPROTO_TCP;
+        std::string port_s = std::to_string(port);
+        addrinfo* addrs = nullptr;
+        if (getaddrinfo(lookup_host.c_str(), port_s.c_str(), &hints, &addrs) != 0) {
+            error_text = "getaddrinfo failed for " + lookup_host + ":" + port_s;
+            WSACleanup();
+            return false;
+        }
+
+        const DWORD timeout_ms = static_cast<DWORD>(std::max(1, timeout_sec) * 1000);
+        SOCKET sock = INVALID_SOCKET;
+        int last_err = 0;
+        for (addrinfo* ai = addrs; ai; ai = ai->ai_next) {
+            SOCKET candidate = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+            if (candidate == INVALID_SOCKET) {
+                last_err = WSAGetLastError();
+                continue;
+            }
+            setsockopt(candidate, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+            setsockopt(candidate, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+            if (connect(candidate, ai->ai_addr, static_cast<int>(ai->ai_addrlen)) == 0) {
+                sock = candidate;
+                break;
+            }
+            last_err = WSAGetLastError();
+            closesocket(candidate);
+        }
+        freeaddrinfo(addrs);
+
+        if (sock == INVALID_SOCKET) {
+            error_text = "connect failed: " + std::to_string(last_err);
+            WSACleanup();
+            return false;
+        }
+
+        std::string host_header = host;
+        if (host_header.find(':') != std::string::npos && host_header.front() != '[')
+            host_header = "[" + host_header + "]";
+        host_header += ":";
+        host_header += std::to_string(port);
+
+        std::string request;
+        request.reserve(path.size() + accept_header.size() + 512);
+        request += "GET ";
+        request += path.empty() ? "/" : path;
+        request += " HTTP/1.1\r\nHost: ";
+        request += host_header;
+        request += "\r\nUser-Agent: AiDA-Webfetch/1.0\r\nAccept: ";
+        request += accept_header.empty() ? "*/*" : accept_header;
+        request += "\r\nAccept-Language: en-US,en;q=0.9\r\nConnection: close\r\n\r\n";
+
+        if (!webfetch_send_all(sock, request)) {
+            last_err = WSAGetLastError();
+            closesocket(sock);
+            error_text = "send failed: " + std::to_string(last_err);
+            WSACleanup();
+            return false;
+        }
+
+        constexpr size_t max_raw_bytes = 5u * 1024u * 1024u + 65536u;
+        std::string raw;
+        raw.reserve(8192);
+        char buf[8192];
+        while (raw.size() < max_raw_bytes) {
+            int n = recv(sock, buf, sizeof(buf), 0);
+            if (n > 0) {
+                raw.append(buf, buf + n);
+                continue;
+            }
+            if (n == 0)
+                break;
+            last_err = WSAGetLastError();
+            if (!raw.empty() && (last_err == WSAETIMEDOUT || last_err == WSAEWOULDBLOCK))
+                break;
+            closesocket(sock);
+            error_text = "recv failed: " + std::to_string(last_err);
+            WSACleanup();
+            return false;
+        }
+        closesocket(sock);
+        WSACleanup();
+
+        const size_t header_end = raw.find("\r\n\r\n");
+        if (header_end == std::string::npos) {
+            error_text = "response missing headers";
+            return false;
+        }
+        std::string header_block = raw.substr(0, header_end);
+        body = raw.substr(header_end + 4);
+        size_t first_line_end = header_block.find("\r\n");
+        std::string status_line = first_line_end == std::string::npos ? header_block : header_block.substr(0, first_line_end);
+        std::istringstream status_stream(status_line);
+        std::string version;
+        status_stream >> version >> status;
+        if (status == 0) {
+            error_text = "response missing status";
+            return false;
+        }
+        content_type = webfetch_header_value(header_block, "content-type");
+        std::string content_length_s = webfetch_header_value(header_block, "content-length");
+        if (!content_length_s.empty()) {
+            try {
+                const size_t content_length = static_cast<size_t>(std::stoull(content_length_s));
+                if (body.size() > content_length)
+                    body.resize(content_length);
+            } catch (...) {
+            }
+        }
+        return true;
+    }
+
     std::string wide_to_utf8_lossy(const std::wstring& text)
     {
         if (text.empty())
@@ -113,6 +333,146 @@ namespace
         std::string out(static_cast<size_t>(len), '\0');
         WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), out.data(), len, nullptr, nullptr);
         return out;
+    }
+
+    std::wstring utf8_to_wide_lossy(const std::string& text)
+    {
+        if (text.empty())
+            return {};
+        int len = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), nullptr, 0);
+        if (len <= 0) {
+            const DWORD err = GetLastError();
+            diag::log_tagged_fmt("mcp_tools", "utf8_to_wide failed len=%zu err=%lu",
+                text.size(), static_cast<unsigned long>(err));
+            return {};
+        }
+        std::wstring out(static_cast<size_t>(len), L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), out.data(), len);
+        return out;
+    }
+
+    struct winhttp_handle_t
+    {
+        HINTERNET h = nullptr;
+        winhttp_handle_t() = default;
+        explicit winhttp_handle_t(HINTERNET v) : h(v) {}
+        ~winhttp_handle_t() { if (h) WinHttpCloseHandle(h); }
+        winhttp_handle_t(const winhttp_handle_t&) = delete;
+        winhttp_handle_t& operator=(const winhttp_handle_t&) = delete;
+        explicit operator bool() const { return h != nullptr; }
+    };
+
+    bool winhttp_https_get(const std::wstring& host,
+                           const std::wstring& path,
+                           int timeout_seconds,
+                           std::string& body,
+                           int& status,
+                           std::string& error)
+    {
+        body.clear();
+        status = 0;
+        error.clear();
+
+        HINTERNET raw_session = WinHttpOpen(L"AiDAStandalone/1.0",
+            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+            WINHTTP_NO_PROXY_NAME,
+            WINHTTP_NO_PROXY_BYPASS,
+            0);
+        if (!raw_session) {
+            raw_session = WinHttpOpen(L"AiDAStandalone/1.0",
+                WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                WINHTTP_NO_PROXY_NAME,
+                WINHTTP_NO_PROXY_BYPASS,
+                0);
+        }
+        winhttp_handle_t session(raw_session);
+        if (!session) {
+            error = "WinHttpOpen err=" + std::to_string(GetLastError());
+            return false;
+        }
+
+        const int timeout_ms = std::max(1000, timeout_seconds * 1000);
+        WinHttpSetTimeouts(session.h, timeout_ms, timeout_ms, timeout_ms, timeout_ms);
+
+        DWORD secure_protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
+#ifdef WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3
+        secure_protocols |= WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
+#endif
+        WinHttpSetOption(session.h, WINHTTP_OPTION_SECURE_PROTOCOLS,
+            &secure_protocols, sizeof(secure_protocols));
+
+        winhttp_handle_t connection(WinHttpConnect(session.h, host.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0));
+        if (!connection) {
+            error = "WinHttpConnect err=" + std::to_string(GetLastError());
+            return false;
+        }
+
+        winhttp_handle_t request(WinHttpOpenRequest(connection.h,
+            L"GET",
+            path.c_str(),
+            nullptr,
+            WINHTTP_NO_REFERER,
+            WINHTTP_DEFAULT_ACCEPT_TYPES,
+            WINHTTP_FLAG_SECURE));
+        if (!request) {
+            error = "WinHttpOpenRequest err=" + std::to_string(GetLastError());
+            return false;
+        }
+
+        const wchar_t* headers =
+            L"Accept: application/json\r\n"
+            L"User-Agent: AiDAStandalone/1.0\r\n";
+        if (!WinHttpSendRequest(request.h, headers, static_cast<DWORD>(-1), nullptr, 0, 0, 0)) {
+            error = "WinHttpSendRequest err=" + std::to_string(GetLastError());
+            return false;
+        }
+        if (!WinHttpReceiveResponse(request.h, nullptr)) {
+            error = "WinHttpReceiveResponse err=" + std::to_string(GetLastError());
+            return false;
+        }
+
+        DWORD status_code = 0;
+        DWORD status_size = sizeof(status_code);
+        if (!WinHttpQueryHeaders(request.h,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX,
+            &status_code,
+            &status_size,
+            WINHTTP_NO_HEADER_INDEX)) {
+            error = "WinHttpQueryHeaders err=" + std::to_string(GetLastError());
+            return false;
+        }
+        status = static_cast<int>(status_code);
+        if (status != 200) {
+            error = "HTTP status " + std::to_string(status);
+            return false;
+        }
+
+        constexpr size_t max_body = 4u * 1024u * 1024u;
+        for (;;) {
+            DWORD available = 0;
+            if (!WinHttpQueryDataAvailable(request.h, &available)) {
+                error = "WinHttpQueryDataAvailable err=" + std::to_string(GetLastError());
+                return false;
+            }
+            if (available == 0)
+                break;
+            if (body.size() + available > max_body) {
+                error = "response too large";
+                return false;
+            }
+            const size_t old = body.size();
+            body.resize(old + available);
+            DWORD read = 0;
+            if (!WinHttpReadData(request.h, body.data() + old, available, &read)) {
+                error = "WinHttpReadData err=" + std::to_string(GetLastError());
+                return false;
+            }
+            body.resize(old + read);
+            if (read == 0)
+                break;
+        }
+        return true;
     }
 
     std::string path_to_utf8(const fs::path& path)
@@ -1428,10 +1788,17 @@ namespace
         if (!params.contains("path") || !params["path"].is_string())
             return error("Missing required parameter: path");
         std::error_code ec;
-        const auto removed = fs::remove(params["path"].get<std::string>(), ec);
+        const fs::path path = resolve_workspace_path(params["path"].get<std::string>());
+        diag::log_tagged_fmt("mcp_tools", "handle_delete_file resolved=%s", path.string().c_str());
+        if (!path_within_current_workspace(path))
+            return error("Path is outside the workspace.");
+        if (fs::is_directory(path, ec))
+            return error("Path is a directory, not a file.");
+        ec.clear();
+        const auto removed = fs::remove(path, ec);
         if (!removed || ec)
             return error("Could not delete the requested file.");
-        return tool_result_t::ok("Deleted file.");
+        return tool_result_t::ok("Deleted file.", json{{"path", path.string()}});
     }
 
     tool_result_t handle_create_directory(const json& params)
@@ -1567,9 +1934,10 @@ namespace
             return error("Provide a search query.");
 
         const std::string query = params["query"].get<std::string>();
-        const int max_results = params.value("max_results", 5);
+        if (query.empty())
+            return error("Provide a non-empty search query.");
+        const int max_results = std::clamp(params.value("max_results", 5), 1, 20);
         const int timeout_seconds = std::clamp(params.value("timeout", 4), 1, 15);
-
 
         std::string encoded_query;
         for (unsigned char c : query) {
@@ -1586,7 +1954,77 @@ namespace
 
         json results = json::array();
 
-        std::string transport_error;
+        auto append_duckduckgo = [&](const std::string& body, std::string& parse_error) -> bool {
+            parse_error.clear();
+            const size_t before = results.size();
+            auto j = json::parse(body, nullptr, false);
+            if (j.is_discarded() || !j.is_object()) {
+                parse_error = "invalid JSON in DuckDuckGo response body";
+                return false;
+            }
+            if (j.contains("Abstract") && j["Abstract"].is_string() && !j["Abstract"].get<std::string>().empty()) {
+                results.push_back({
+                    {"title", j.value("Heading", "Answer")},
+                    {"snippet", j["Abstract"].get<std::string>()},
+                    {"url", j.value("AbstractURL", "")}
+                });
+            }
+            if (j.contains("RelatedTopics") && j["RelatedTopics"].is_array()) {
+                for (auto& topic : j["RelatedTopics"]) {
+                    if ((int)results.size() >= max_results) break;
+                    if (topic.contains("Text") && topic["Text"].is_string()) {
+                        results.push_back({
+                            {"title", topic.value("Text", "").substr(0, 120)},
+                            {"snippet", topic.value("Text", "")},
+                            {"url", topic.value("FirstURL", "")}
+                        });
+                    } else if (topic.contains("Topics") && topic["Topics"].is_array()) {
+                        for (auto& nested : topic["Topics"]) {
+                            if ((int)results.size() >= max_results) break;
+                            if (!nested.contains("Text") || !nested["Text"].is_string())
+                                continue;
+                            results.push_back({
+                                {"title", nested.value("Text", "").substr(0, 120)},
+                                {"snippet", nested.value("Text", "")},
+                                {"url", nested.value("FirstURL", "")}
+                            });
+                        }
+                    }
+                }
+            }
+            return results.size() > before;
+        };
+
+        auto append_wikipedia = [&](const std::string& body, std::string& parse_error) -> bool {
+            parse_error.clear();
+            const size_t before = results.size();
+            auto j = json::parse(body, nullptr, false);
+            if (j.is_discarded() || !j.is_array() || j.size() < 4 ||
+                !j[1].is_array() || !j[2].is_array() || !j[3].is_array()) {
+                parse_error = "invalid JSON in Wikipedia opensearch response";
+                return false;
+            }
+            const size_t take = std::min<size_t>(
+                static_cast<size_t>(max_results), j[1].size());
+            for (size_t i = 0; i < take; ++i) {
+                if (!j[1][i].is_string())
+                    continue;
+                const std::string title = j[1][i].get<std::string>();
+                const std::string snippet =
+                    i < j[2].size() && j[2][i].is_string() ? j[2][i].get<std::string>() : std::string();
+                const std::string url =
+                    i < j[3].size() && j[3][i].is_string() ? j[3][i].get<std::string>() : std::string();
+                results.push_back({
+                    {"title", title},
+                    {"snippet", snippet.empty() ? title : snippet},
+                    {"url", url}
+                });
+            }
+            return results.size() > before;
+        };
+
+        const std::string duck_path = "/?q=" + encoded_query + "&format=json&no_redirect=1&no_html=1";
+        std::string duck_error;
         try {
             httplib::SSLClient client("api.duckduckgo.com");
             client.set_connection_timeout(timeout_seconds);
@@ -1598,47 +2036,49 @@ namespace
             });
             client.enable_server_certificate_verification(false);
 
-            std::string path = "/?q=" + encoded_query + "&format=json&no_redirect=1&no_html=1";
-            auto res = client.Get(path.c_str());
+            auto res = client.Get(duck_path.c_str());
 
             if (!res) {
-                transport_error = "no response from api.duckduckgo.com";
+                duck_error = "cpp-httplib no response";
             } else if (res->status != 200) {
-                transport_error = "HTTP status " + std::to_string(res->status);
+                duck_error = "cpp-httplib HTTP status " + std::to_string(res->status);
             } else {
-                auto j = json::parse(res->body, nullptr, false);
-                if (j.is_discarded() || !j.is_object()) {
-                    transport_error = "invalid JSON in response body";
-                } else {
-                    if (j.contains("Abstract") && !j["Abstract"].get<std::string>().empty()) {
-                        results.push_back({
-                            {"title", j.value("Heading", "Answer")},
-                            {"snippet", j["Abstract"].get<std::string>()},
-                            {"url", j.value("AbstractURL", "")}
-                        });
-                    }
-                    if (j.contains("RelatedTopics") && j["RelatedTopics"].is_array()) {
-                        for (auto& topic : j["RelatedTopics"]) {
-                            if ((int)results.size() >= max_results) break;
-                            if (topic.contains("Text") && topic["Text"].is_string()) {
-                                results.push_back({
-                                    {"title", topic.value("Text", "").substr(0, 120)},
-                                    {"snippet", topic.value("Text", "")},
-                                    {"url", topic.value("FirstURL", "")}
-                                });
-                            }
-                        }
-                    }
-                }
+                std::string parse_error;
+                append_duckduckgo(res->body, parse_error);
+                if (!parse_error.empty())
+                    duck_error = "cpp-httplib " + parse_error;
             }
         } catch (const std::exception& e) {
-            transport_error = e.what();
+            duck_error = std::string("cpp-httplib ") + e.what();
         } catch (...) {
-            transport_error = "unknown network error";
+            duck_error = "cpp-httplib unknown network error";
+        }
+
+        if (results.empty()) {
+            std::string body;
+            std::string err;
+            int status = 0;
+            const std::wstring path_w = utf8_to_wide_lossy(duck_path);
+            if (!path_w.empty() && winhttp_https_get(L"api.duckduckgo.com", path_w, timeout_seconds, body, status, err)) {
+                std::string parse_error;
+                append_duckduckgo(body, parse_error);
+                diag::log_tagged_fmt("mcp_tools", "handle_web_search duckduckgo_winhttp ok status=%d bytes=%zu results=%zu parse_error=%s",
+                    status, body.size(), results.size(), parse_error.c_str());
+                if (!parse_error.empty())
+                    duck_error = duck_error.empty() ? ("winhttp " + parse_error) : (duck_error + "; winhttp " + parse_error);
+            } else {
+                std::string winhttp_error = err.empty() ? "WinHTTP path conversion failed" : err;
+                diag::log_tagged_fmt("mcp_tools", "handle_web_search duckduckgo_winhttp failed status=%d err=%s",
+                    status, winhttp_error.c_str());
+                duck_error = duck_error.empty() ? ("winhttp " + winhttp_error) : (duck_error + "; winhttp " + winhttp_error);
+            }
         }
 
         std::string wikipedia_error;
         if (results.empty()) {
+            const std::string wiki_path = "/w/api.php?action=opensearch&search=" + encoded_query +
+                                          "&limit=" + std::to_string(max_results) +
+                                          "&namespace=0&format=json";
             try {
                 httplib::SSLClient wiki("en.wikipedia.org");
                 wiki.set_connection_timeout(timeout_seconds);
@@ -1649,47 +2089,48 @@ namespace
                     {"User-Agent", "AiDAStandalone/1.0"}
                 });
                 wiki.enable_server_certificate_verification(false);
-                std::string path = "/w/api.php?action=opensearch&search=" + encoded_query +
-                                   "&limit=" + std::to_string(std::max(1, max_results)) +
-                                   "&namespace=0&format=json";
-                auto res = wiki.Get(path.c_str());
+                auto res = wiki.Get(wiki_path.c_str());
                 if (!res) {
-                    wikipedia_error = "no response from en.wikipedia.org";
+                    wikipedia_error = "cpp-httplib no response";
                 } else if (res->status != 200) {
-                    wikipedia_error = "HTTP status " + std::to_string(res->status);
+                    wikipedia_error = "cpp-httplib HTTP status " + std::to_string(res->status);
                 } else {
-                    auto j = json::parse(res->body, nullptr, false);
-                    if (j.is_discarded() || !j.is_array() || j.size() < 4 ||
-                        !j[1].is_array() || !j[2].is_array() || !j[3].is_array()) {
-                        wikipedia_error = "invalid JSON in Wikipedia opensearch response";
-                    } else {
-                        const size_t take = std::min<size_t>(
-                            static_cast<size_t>(std::max(1, max_results)), j[1].size());
-                        for (size_t i = 0; i < take; ++i) {
-                            if (!j[1][i].is_string())
-                                continue;
-                            const std::string title = j[1][i].get<std::string>();
-                            const std::string snippet =
-                                i < j[2].size() && j[2][i].is_string() ? j[2][i].get<std::string>() : std::string();
-                            const std::string url =
-                                i < j[3].size() && j[3][i].is_string() ? j[3][i].get<std::string>() : std::string();
-                            results.push_back({
-                                {"title", title},
-                                {"snippet", snippet.empty() ? title : snippet},
-                                {"url", url}
-                            });
-                        }
-                    }
+                    std::string parse_error;
+                    append_wikipedia(res->body, parse_error);
+                    if (!parse_error.empty())
+                        wikipedia_error = "cpp-httplib " + parse_error;
                 }
             } catch (const std::exception& e) {
-                wikipedia_error = e.what();
+                wikipedia_error = std::string("cpp-httplib ") + e.what();
             } catch (...) {
-                wikipedia_error = "unknown Wikipedia network error";
+                wikipedia_error = "cpp-httplib unknown Wikipedia network error";
+            }
+
+            if (results.empty()) {
+                std::string body;
+                std::string err;
+                int status = 0;
+                const std::wstring path_w = utf8_to_wide_lossy(wiki_path);
+                if (!path_w.empty() && winhttp_https_get(L"en.wikipedia.org", path_w, timeout_seconds, body, status, err)) {
+                    std::string parse_error;
+                    append_wikipedia(body, parse_error);
+                    diag::log_tagged_fmt("mcp_tools", "handle_web_search wikipedia_winhttp ok status=%d bytes=%zu results=%zu parse_error=%s",
+                        status, body.size(), results.size(), parse_error.c_str());
+                    if (!parse_error.empty())
+                        wikipedia_error = wikipedia_error.empty() ? ("winhttp " + parse_error) : (wikipedia_error + "; winhttp " + parse_error);
+                } else {
+                    std::string winhttp_error = err.empty() ? "WinHTTP path conversion failed" : err;
+                    diag::log_tagged_fmt("mcp_tools", "handle_web_search wikipedia_winhttp failed status=%d err=%s",
+                        status, winhttp_error.c_str());
+                    wikipedia_error = wikipedia_error.empty() ? ("winhttp " + winhttp_error) : (wikipedia_error + "; winhttp " + winhttp_error);
+                }
             }
         }
 
-        if (!transport_error.empty() && results.empty()) {
-            std::string msg = "web_search: " + transport_error;
+        if ((!duck_error.empty() || !wikipedia_error.empty()) && results.empty()) {
+            std::string msg = "web_search:";
+            if (!duck_error.empty())
+                msg += " duckduckgo: " + duck_error;
             if (!wikipedia_error.empty())
                 msg += "; wikipedia: " + wikipedia_error;
             set_last_web_error(msg);
@@ -2060,13 +2501,6 @@ namespace
         base += ":";
         base += std::to_string(port);
 
-        httplib::Client cli(base);
-        cli.set_connection_timeout(timeout_sec, 0);
-        cli.set_read_timeout(timeout_sec, 0);
-        cli.set_write_timeout(timeout_sec, 0);
-        cli.set_follow_location(true);
-        cli.enable_server_certificate_verification(true);
-
         std::string accept_header;
         if (format == "markdown")
             accept_header = "text/markdown;q=1.0, text/x-markdown;q=0.9, text/plain;q=0.8, text/html;q=0.7, */*;q=0.1";
@@ -2086,7 +2520,20 @@ namespace
         const int max_attempts = loopback ? 12 : 1;
         httplib::Error last_error = httplib::Error::Success;
         for (int attempt = 1; attempt <= max_attempts; ++attempt) {
-            res = cli.Get(path, headers);
+            std::unique_ptr<httplib::Client> cli;
+            if (loopback && !is_https)
+                cli = std::make_unique<httplib::Client>(host, port);
+            else
+                cli = std::make_unique<httplib::Client>(base);
+            cli->set_connection_timeout(timeout_sec, 0);
+            cli->set_read_timeout(timeout_sec, 0);
+            cli->set_write_timeout(timeout_sec, 0);
+            cli->set_follow_location(true);
+            cli->enable_server_certificate_verification(true);
+            diag::log_tagged_fmt("mcp_tools", "handle_webfetch request_begin host=%s port=%d path=%s attempt=%d/%d loopback=%d explicit_host_port=%d valid=%d",
+                host.c_str(), port, path.c_str(), attempt, max_attempts, loopback ? 1 : 0,
+                (loopback && !is_https) ? 1 : 0, cli->is_valid() ? 1 : 0);
+            res = cli->Get(path, headers);
             if (res) {
                 diag::log_tagged_fmt("mcp_tools", "handle_webfetch request_ok host=%s port=%d path=%s attempt=%d loopback=%d status=%d",
                     host.c_str(), port, path.c_str(), attempt, loopback ? 1 : 0, res->status);
@@ -2100,19 +2547,38 @@ namespace
         }
         if (mcp_standalone::current_call_cancelled())
             return error("webfetch cancelled by client request.");
-        if (!res)
+
+        int response_status = 0;
+        std::string response_body;
+        std::string content_type;
+        bool raw_loopback_fallback = false;
+        if (!res && loopback && !is_https) {
+            std::string raw_error;
+            raw_loopback_fallback = webfetch_raw_loopback_get(host, port, path, accept_header, timeout_sec,
+                response_status, content_type, response_body, raw_error);
+            diag::log_tagged_fmt("mcp_tools", "handle_webfetch raw_loopback_fallback ok=%d host=%s port=%d path=%s err=%s status=%d bytes=%zu",
+                raw_loopback_fallback ? 1 : 0, host.c_str(), port, path.c_str(),
+                raw_error.c_str(), response_status, response_body.size());
+            if (!raw_loopback_fallback && !raw_error.empty()) {
+                return error("HTTP request failed: " + httplib::to_string(last_error) + "; raw loopback fallback failed: " + raw_error + " for " + url);
+            }
+        }
+        if (!res && !raw_loopback_fallback)
             return error("HTTP request failed: " + httplib::to_string(last_error) + " for " + url);
-        if (res->status < 200 || res->status >= 300)
-            return error("HTTP status " + std::to_string(res->status) + " for " + url);
+        if (res) {
+            response_status = res->status;
+            response_body = res->body;
+            auto ct_iter = res->headers.find("Content-Type");
+            if (ct_iter != res->headers.end()) content_type = ct_iter->second;
+        }
+        if (response_status < 200 || response_status >= 300)
+            return error("HTTP status " + std::to_string(response_status) + " for " + url);
 
         constexpr size_t MAX_RAW_BYTES = 5u * 1024u * 1024u;
-        std::string body = res->body;
+        std::string body = std::move(response_body);
         if (body.size() > MAX_RAW_BYTES)
             body.resize(MAX_RAW_BYTES);
 
-        std::string content_type;
-        auto ct_iter = res->headers.find("Content-Type");
-        if (ct_iter != res->headers.end()) content_type = ct_iter->second;
         std::string ct_lower = to_lower(content_type);
         const bool is_html = ct_lower.find("text/html") != std::string::npos
                           || ct_lower.find("application/xhtml") != std::string::npos;
@@ -2135,18 +2601,19 @@ namespace
 
         json data;
         data["url"] = url;
-        data["status"] = res->status;
+        data["status"] = response_status;
         data["format"] = format;
         data["content_type"] = content_type;
         data["bytes"] = static_cast<int64_t>(output.size());
         data["truncated"] = truncated;
+        data["loopback_fallback"] = raw_loopback_fallback;
 
         std::string text;
         text.reserve(output.size() + 128);
         text += "Fetched ";
         text += url;
         text += " (";
-        text += std::to_string(res->status);
+        text += std::to_string(response_status);
         text += ", ";
         text += content_type.empty() ? std::string("application/octet-stream") : content_type;
         text += ")\n\n";

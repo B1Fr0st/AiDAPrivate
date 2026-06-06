@@ -147,6 +147,15 @@ bool wait_for_binary_load_quiescent(uint32_t timeout_ms)
 				poll_count);
 			return true;
 		}
+		if (loading_binary_overlay::is_load_ready_for_tools()) {
+			diag::log_tagged_fmt("sess_tools",
+				"session_wait_loaded elapsed_ms=%llu phase=%s polls=%u",
+				static_cast<unsigned long long>(GetTickCount64() - start),
+				loading_binary_overlay::current_phase_name(),
+				poll_count);
+			loading_binary_overlay::log_state("session_wait_loaded");
+			return true;
+		}
 		if (loading_binary_overlay::is_waiting_for_user_decision()) {
 			diag::log_tagged_fmt("sess_tools",
 				"session_wait_quiescent_user_decision elapsed_ms=%llu phase=%s polls=%u",
@@ -166,12 +175,14 @@ bool wait_for_binary_load_quiescent(uint32_t timeout_ms)
 		}
 		if (elapsed >= timeout_ms) {
 			loading_binary_overlay::log_state("session_wait_timeout");
+			const bool cancelled = loading_binary_overlay::cancel_queued_load("session_wait_timeout");
 			diag::log_tagged_fmt("sess_tools",
-				"session_wait_timeout elapsed_ms=%llu timeout_ms=%u phase=%s polls=%u",
+				"session_wait_timeout elapsed_ms=%llu timeout_ms=%u phase=%s polls=%u cancelled_queued_load=%d",
 				static_cast<unsigned long long>(elapsed),
 				timeout_ms,
 				loading_binary_overlay::current_phase_name(),
-				poll_count);
+				poll_count,
+				cancelled ? 1 : 0);
 			return false;
 		}
 		Sleep(25);
@@ -396,6 +407,44 @@ static tool_result_t sessions_attach_pid(const json& params)
 			static_cast<unsigned long long>(existing_idx),
 			sum.id.c_str());
 		return tool_result_t::ok(root);
+	}
+	const uint32_t already_active_pid = driver_bridge::attached_pid();
+	if (already_active_pid == pid && session_health::is_alive(pid)) {
+		bool cleared_stale_load = false;
+		if (loading_binary_overlay::is_active() &&
+			!loading_binary_overlay::is_waiting_for_user_decision()) {
+			cleared_stale_load = loading_binary_overlay::cancel_queued_load("sessions_attach_pid_same_pid");
+			diag::log_tagged_fmt("sess_tools",
+				"sessions_attach_pid same_active_pid pid=%u phase=%s cleared_stale_load=%d",
+				pid,
+				loading_binary_overlay::current_phase_name(),
+				cleared_stale_load ? 1 : 0);
+		}
+		std::string adopt_err;
+		if (analysis_session::open_attach_session(pid, &adopt_err) &&
+			analysis_session::find_session_by_pid(pid, &existing_idx)) {
+			auto sum = analysis_session::summarize_session_at(existing_idx);
+			json root;
+			root["attached"] = summary_to_json(sum);
+			root["already_attached"] = true;
+			root["cleared_stale_load"] = cleared_stale_load;
+			diag::log_tagged_fmt("sess_tools",
+				"sessions_attach_pid pid=%u adopted_active_driver_session idx=%llu id='%s' cleared_stale_load=%d",
+				pid,
+				static_cast<unsigned long long>(existing_idx),
+				sum.id.c_str(),
+				cleared_stale_load ? 1 : 0);
+			return tool_result_t::ok(root);
+		}
+		diag::log_tagged_fmt("sess_tools",
+			"sessions_attach_pid pid=%u same_active_pid_adopt_deferred err='%s' phase=%s cleared_stale_load=%d",
+			pid,
+			adopt_err.c_str(),
+			loading_binary_overlay::current_phase_name(),
+			cleared_stale_load ? 1 : 0);
+		if (cleared_stale_load) {
+			return tool_result_t::error(std::string("attach failed: ") + adopt_err);
+		}
 	}
 	if (!wait_for_binary_load_quiescent(30000)) {
 		return tool_result_t::error("attach failed: load timeout");

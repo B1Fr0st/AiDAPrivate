@@ -9,6 +9,7 @@
 #include <httplib.h>
 
 #include "content_discovery.hpp"
+#include "audit_http.hpp"
 #include "payload_library.hpp"
 #include "burp_events.hpp"
 #include "site_map.hpp"
@@ -19,6 +20,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <fstream>
 #include <memory>
@@ -130,6 +132,101 @@ parsed_t parse_url(const std::string& url)
     return p;
 }
 
+bool is_loopback_host(const std::string& host)
+{
+    std::string h = to_lower(host);
+    return h == "localhost" || h == "127.0.0.1" || h == "::1" || h == "[::1]";
+}
+
+std::string header_safe(std::string s)
+{
+    for (char& c : s) {
+        unsigned char uc = static_cast<unsigned char>(c);
+        if (uc < 0x20 || uc == 0x7F)
+            c = '_';
+    }
+    return s;
+}
+
+std::string upper_method(std::string method)
+{
+    if (method.empty())
+        method = "GET";
+    std::transform(method.begin(), method.end(), method.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+    return method;
+}
+
+bool audit_http_fallback(const parsed_t& p, const config_t& cfg, const std::string& path_with_query,
+                         int& out_status, size_t& out_body_bytes, std::string& out_body,
+                         std::string& out_content_type, std::string& out_redirect,
+                         std::vector<std::pair<std::string,std::string>>& out_resp_headers,
+                         uint64_t& out_latency_ms, std::string& out_err)
+{
+    const std::string method = upper_method(cfg.method);
+    std::string req;
+    req.reserve(1024);
+    req += method;
+    req += " ";
+    req += path_with_query.empty() ? "/" : path_with_query;
+    req += " HTTP/1.1\r\nHost: ";
+    req += header_safe(p.host);
+    req += ":";
+    req += std::to_string(p.port);
+    req += "\r\nUser-Agent: ";
+    req += header_safe(cfg.user_agent);
+    req += "\r\nAccept: */*\r\nAccept-Encoding: identity\r\n";
+    if (!cfg.cookie_header.empty()) {
+        req += "Cookie: ";
+        req += header_safe(cfg.cookie_header);
+        req += "\r\n";
+    }
+    for (const auto& h : cfg.extra_headers) {
+        if (!h.first.empty()) {
+            req += header_safe(h.first);
+            req += ": ";
+            req += header_safe(h.second);
+            req += "\r\n";
+        }
+    }
+    if (method == "POST") {
+        req += "Content-Type: application/x-www-form-urlencoded\r\nContent-Length: 0\r\n";
+    } else if (method == "PUT") {
+        req += "Content-Type: application/octet-stream\r\nContent-Length: 0\r\n";
+    }
+    req += "Connection: close\r\n\r\n";
+    std::vector<uint8_t> raw(req.begin(), req.end());
+    audit_http::send_options_t opts;
+    opts.timeout_ms = cfg.request_timeout_ms;
+    opts.follow_redirects = cfg.follow_redirects;
+    opts.enforce_scope = false;
+    auto ex = audit_http::send(raw, p.host, p.port, p.scheme == "https", opts);
+    if (!ex) {
+        out_err = "transport error; audit_http fallback=" + audit_http::last_error();
+        return false;
+    }
+    out_status = ex->status_code;
+    out_body.assign(reinterpret_cast<const char*>(ex->resp_body.data()), ex->resp_body.size());
+    out_body_bytes = ex->resp_body.size();
+    out_resp_headers = ex->resp_headers;
+    out_content_type.clear();
+    out_redirect.clear();
+    for (auto& h : out_resp_headers)
+    {
+        std::string ln = to_lower(h.first);
+        if (ln == "content-type") out_content_type = h.second;
+        else if (ln == "location") out_redirect = h.second;
+    }
+    out_latency_ms = ex->latency_ms;
+    diag::log_tagged_fmt("content_discovery", "audit_http_fallback ok host=%s port=%u method=%s status=%d body=%zu latency_ms=%llu",
+        p.host.c_str(),
+        static_cast<unsigned>(p.port),
+        method.c_str(),
+        out_status,
+        out_body_bytes,
+        static_cast<unsigned long long>(out_latency_ms));
+    return true;
+}
+
 std::vector<std::string> load_wordlist(const config_t& cfg, std::string& err)
 {
     std::vector<std::string> out;
@@ -194,6 +291,9 @@ bool perform_request(const std::string& url, const config_t& cfg,
     parsed_t p = parse_url(url);
     if (!p.valid) { out_err = "invalid url"; return false; }
 
+    std::string path_with_query = p.path;
+    if (!p.query.empty()) path_with_query += "?" + p.query;
+
     const std::string base = p.scheme + "://" + p.host + ":" + std::to_string(p.port);
     httplib::Client cli(base);
     cli.set_connection_timeout(std::chrono::milliseconds(cfg.request_timeout_ms));
@@ -209,9 +309,6 @@ bool perform_request(const std::string& url, const config_t& cfg,
     if (!cfg.cookie_header.empty()) headers.emplace("Cookie", cfg.cookie_header);
     for (auto& h : cfg.extra_headers) headers.emplace(h.first, h.second);
 
-    std::string path_with_query = p.path;
-    if (!p.query.empty()) path_with_query += "?" + p.query;
-
     auto t0 = std::chrono::steady_clock::now();
     httplib::Result res;
     const std::string method = to_lower(cfg.method);
@@ -224,7 +321,23 @@ bool perform_request(const std::string& url, const config_t& cfg,
     auto t1 = std::chrono::steady_clock::now();
     out_latency_ms = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
 
-    if (!res) { out_err = "transport error"; return false; }
+    if (!res) {
+        const std::string httplib_err = httplib::to_string(res.error());
+        diag::log_tagged_fmt("content_discovery", "perform_request transport_error url=%s host=%s port=%u method=%s err=%s loopback=%d elapsed_ms=%llu",
+            url.c_str(),
+            p.host.c_str(),
+            static_cast<unsigned>(p.port),
+            method.c_str(),
+            httplib_err.c_str(),
+            is_loopback_host(p.host) ? 1 : 0,
+            static_cast<unsigned long long>(out_latency_ms));
+        if (is_loopback_host(p.host) &&
+            audit_http_fallback(p, cfg, path_with_query, out_status, out_body_bytes, out_body, out_content_type, out_redirect, out_resp_headers, out_latency_ms, out_err)) {
+            return true;
+        }
+        out_err = "transport error (" + httplib_err + ")";
+        return false;
+    }
     out_status = res->status;
     out_body = res->body;
     out_body_bytes = res->body.size();

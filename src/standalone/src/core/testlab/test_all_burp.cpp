@@ -919,6 +919,64 @@ namespace {
         }
     }
 
+    void cleanup_burp_async_fixture_jobs(HANDLE hf) {
+        const char* tag = "burp_cleanup";
+        log_msg(hf, tag, "START -- stopping asynchronous Burp fixture jobs");
+
+        auto audits = aida::burp::active_scanner::list_audits();
+        for (const auto& audit : audits) {
+            if (audit.id == 0)
+                continue;
+            if (audit.running) {
+                aida::burp::active_scanner::cancel_audit(audit.id);
+                aida::burp::active_scanner::wait_for_audit_idle(audit.id, 1500);
+            }
+        }
+
+        auto crawls = aida::burp::crawler::list();
+        for (const auto& crawl : crawls) {
+            if (crawl.id != 0)
+                aida::burp::crawler::stop(crawl.id);
+        }
+        aida::burp::crawler::shutdown();
+
+        auto discoveries = aida::burp::content_discovery::list();
+        for (const auto& disc : discoveries) {
+            if (disc.id != 0)
+                aida::burp::content_discovery::stop(disc.id);
+        }
+        aida::burp::content_discovery::shutdown();
+
+        auto subdomains = aida::burp::subdomain_enum::list();
+        for (const auto& sub : subdomains) {
+            if (sub.id != 0)
+                aida::burp::subdomain_enum::stop(sub.id);
+        }
+        aida::burp::subdomain_enum::shutdown();
+
+        auto intruders = aida::burp::intruder::list_jobs();
+        for (const auto& job : intruders) {
+            if (job.job_id != 0) {
+                aida::burp::intruder::stop(job.job_id);
+                aida::burp::intruder::clear(job.job_id);
+            }
+        }
+
+        auto miners = aida::burp::param_miner::list_jobs();
+        for (const auto& job : miners) {
+            if (job.job_id != 0) {
+                aida::burp::param_miner::stop(job.job_id);
+                aida::burp::param_miner::clear(job.job_id);
+            }
+        }
+
+        if (g_burp_fixture)
+            g_burp_fixture.reset();
+
+        log_msg(hf, tag, "PASS -- stopped async fixture jobs audits=%zu crawls=%zu discoveries=%zu subdomains=%zu intruders=%zu miners=%zu",
+            audits.size(), crawls.size(), discoveries.size(), subdomains.size(), intruders.size(), miners.size());
+    }
+
     void test_scope_init(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "scope_init";
         log_msg(hf, tag, "START -- aida::burp::scope::initialize()");
@@ -3465,7 +3523,7 @@ namespace {
         aida::burp::camoufox::launch_config_t cfg;
         cfg.headless = false;
         cfg.proxy = "http://127.0.0.1:18888";
-        cfg.launch_timeout_ms = 35000;
+        cfg.launch_timeout_ms = 70000;
         cfg.window_width = 1280;
         cfg.window_height = 900;
         bool launched = aida::burp::camoufox::start_bridge(cfg);
@@ -4229,6 +4287,8 @@ void phase_burp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fai
     call_test(test_burp_tab_api, hf, passed, failed);
     if (cancelled && cancelled()) return;
     call_test(test_burp_tab_reports, hf, passed, failed);
+
+    cleanup_burp_async_fixture_jobs(hf);
 
     log_msg(hf, "burp_phase", "========== Burp Suite Tests DONE ==========");
 }

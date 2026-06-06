@@ -202,6 +202,20 @@ bool tcp_connect(SOCKET s, const sockaddr* sa, int sa_len, int timeout_ms, int& 
     return so_err == 0;
 }
 
+bool tcp_connect_loopback(SOCKET s, const sockaddr* sa, int sa_len, int& connect_err)
+{
+    connect_err = 0;
+    set_nonblocking(s, false);
+    int rc = connect(s, sa, sa_len);
+    if (rc == 0) {
+        set_nonblocking(s, true);
+        return true;
+    }
+    connect_err = WSAGetLastError();
+    set_nonblocking(s, true);
+    return false;
+}
+
 bool send_all(SOCKET s, const uint8_t* data, size_t len, int timeout_ms)
 {
     uint64_t deadline = now_steady_ms() + static_cast<uint64_t>(timeout_ms);
@@ -582,10 +596,13 @@ std::optional<exchange_observed_t> send(const std::vector<uint8_t>& raw_request,
         int poll_rc = 0;
         short revents = 0;
         int poll_wsa = 0;
-        if (tcp_connect(candidate, reinterpret_cast<sockaddr*>(&sa), sa_len, attempt_timeout_ms, connect_err, poll_rc, revents, poll_wsa)) {
+        const bool connected = loopback
+            ? tcp_connect_loopback(candidate, reinterpret_cast<sockaddr*>(&sa), sa_len, connect_err)
+            : tcp_connect(candidate, reinterpret_cast<sockaddr*>(&sa), sa_len, attempt_timeout_ms, connect_err, poll_rc, revents, poll_wsa);
+        if (connected) {
             sh.sock = candidate;
-            diag::log_tagged_fmt("audit_http", "send tcp_connected host=%s port=%u tls=%d attempts=%d loopback=%d",
-                host.c_str(), static_cast<unsigned>(port), tls ? 1 : 0, attempt, loopback ? 1 : 0);
+            diag::log_tagged_fmt("audit_http", "send tcp_connected host=%s port=%u tls=%d attempts=%d loopback=%d mode=%s",
+                host.c_str(), static_cast<unsigned>(port), tls ? 1 : 0, attempt, loopback ? 1 : 0, loopback ? "blocking_loopback" : "poll");
             break;
         }
 

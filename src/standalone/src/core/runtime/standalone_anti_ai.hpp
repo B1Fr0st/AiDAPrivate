@@ -416,6 +416,25 @@ namespace detail
         return probe_contains_any(probe, needles, N);
     }
 
+    inline bool probe_identity_contains_any(const process_probe_t& probe, const wchar_t* const* needles, size_t count)
+    {
+        for (size_t i = 0; i < count; ++i)
+        {
+            if (contains_w(probe.exe_lower, needles[i]) ||
+                contains_w(probe.image_lower, needles[i]))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    template <size_t N>
+    inline bool probe_identity_contains_any(const process_probe_t& probe, const wchar_t* const (&needles)[N])
+    {
+        return probe_identity_contains_any(probe, needles, N);
+    }
+
     template <size_t N>
     inline bool basename_equals_any(const process_probe_t& probe, const wchar_t* const (&needles)[N])
     {
@@ -553,13 +572,33 @@ namespace detail
         };
         if (basename_equals_any(probe, exact_names))
             return true;
-        static const wchar_t* const tokens[] = {
+        static const wchar_t* const identity_tokens[] = {
             L"scylla", L"importrec", L"pe-sieve", L"pebear", L"pe-bear",
             L"hollowshunter", L"hollows_hunter", L"procdump", L"minidump",
-            L"dump process", L"process dump", L"lordpe", L"cff explorer",
+            L"processdump", L"memdump", L"lordpe", L"cff explorer",
             L"detect it easy", L"die64", L"petools", L"reshacker"
         };
-        return probe_contains_any(probe, tokens);
+        if (probe_identity_contains_any(probe, identity_tokens))
+            return true;
+        static const wchar_t* const command_tokens[] = {
+            L" procdump ", L" procdump.exe ", L" procdump64 ", L" procdump64.exe ",
+            L" pe-sieve ", L" pe-sieve.exe ", L" scylla.exe ", L" importrec.exe ",
+            L" dumpbin.exe ", L" lordpe.exe ", L" pebear.exe "
+        };
+        std::wstring padded_command;
+        if (!probe.command_lower.empty())
+        {
+            padded_command.reserve(probe.command_lower.size() + 2);
+            padded_command.push_back(L' ');
+            padded_command.append(probe.command_lower);
+            padded_command.push_back(L' ');
+            for (const wchar_t* token : command_tokens)
+            {
+                if (contains_w(padded_command, token))
+                    return true;
+            }
+        }
+        return false;
     }
 
     struct process_evidence_t
@@ -576,12 +615,18 @@ namespace detail
         bool targets_aida = false;
         uint32_t evidence_count = 0;
         uint64_t evidence_hash = 1469598103934665603ull;
+        uint64_t dump_tool_hash = 0;
     };
 
     inline void add_process_evidence(process_evidence_t& out, const process_probe_t& probe)
     {
         ++out.evidence_count;
-        out.evidence_hash = mix_hash(out.evidence_hash, probe.basename_hash);
+        uint64_t h = probe.basename_hash;
+        if (!probe.image_lower.empty())
+            h = mix_hash(h, hash_wide_lower(probe.image_lower.c_str()));
+        if (!probe.command_lower.empty())
+            h = mix_hash(h, hash_wide_lower(probe.command_lower.c_str()));
+        out.evidence_hash = mix_hash(out.evidence_hash, h);
     }
 
     inline process_evidence_t classify_processes(const std::vector<process_probe_t>& probes)
@@ -637,6 +682,12 @@ namespace detail
             if (dump_tool)
             {
                 out.dump_tool = true;
+                uint64_t h = probe.basename_hash;
+                if (!probe.image_lower.empty())
+                    h = mix_hash(h, hash_wide_lower(probe.image_lower.c_str()));
+                if (!probe.command_lower.empty())
+                    h = mix_hash(h, hash_wide_lower(probe.command_lower.c_str()));
+                out.dump_tool_hash = out.dump_tool_hash ? mix_hash(out.dump_tool_hash, h) : h;
                 counted = true;
             }
             if (high_value_tool && has_aida_target_evidence(probe))
@@ -1255,6 +1306,7 @@ namespace combined
         uint32_t high_risk_count = 0;
         uint32_t evidence_count = 0;
         uint64_t evidence_hash = 0;
+        uint64_t dump_tool_hash = 0;
         uint64_t summary_hash = 0;
         std::string summary;
 
@@ -1304,6 +1356,7 @@ namespace combined
         report.re_tool_detected = process_evidence.re_tool;
         report.debugger_tool_detected = process_evidence.debugger_tool;
         report.dump_tool_detected = process_evidence.dump_tool;
+        report.dump_tool_hash = process_evidence.dump_tool_hash;
         report.offensive_mcp_tool_detected = process_evidence.offensive_mcp_tool;
         auto handle_report = self_analysis::detect_handle_to_us_report(&processes);
         report.handle_to_us_detected = handle_report.any;
@@ -1382,6 +1435,8 @@ namespace combined
         report.high_risk_count = detail::popcount32(report.high_risk_mask);
         if (report.evidence_hash)
             detail::append_hex_token(report.summary, "evidence_hash", report.evidence_hash);
+        if (report.dump_tool_hash)
+            detail::append_hex_token(report.summary, "dump_hash", report.dump_tool_hash);
         char mask_buf[96];
         _snprintf_s(mask_buf, sizeof(mask_buf), _TRUNCATE,
             "cat=0x%08X high=0x%08X count=%u",

@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -105,6 +106,26 @@ bool tcp_connect_timeout(SOCKET sock, const sockaddr* sa, int sa_len, int timeou
     int len = sizeof(so_err);
     if (getsockopt(sock, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&so_err), &len) != 0) return false;
     return so_err == 0;
+}
+
+bool is_loopback_host(std::string host)
+{
+    std::transform(host.begin(), host.end(), host.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]";
+}
+
+bool tcp_connect_blocking_loopback(SOCKET sock, const sockaddr* sa, int sa_len, int& connect_err)
+{
+    connect_err = 0;
+    set_nonblocking(sock, false);
+    int rc = connect(sock, sa, sa_len);
+    if (rc == 0) {
+        set_nonblocking(sock, true);
+        return true;
+    }
+    connect_err = WSAGetLastError();
+    set_nonblocking(sock, true);
+    return false;
 }
 
 bool send_all_timeout(SOCKET sock, const uint8_t* data, size_t len, int timeout_ms)
@@ -515,23 +536,54 @@ SOCKET connect_first_hop(const upstream_hop_t& hop, int timeout_ms, std::string&
         return INVALID_SOCKET;
     }
     diag::log_tagged_fmt("upstream", "connect_first_hop resolved host=%s family=%d", hop.host.c_str(), static_cast<int>(addr.ss_family));
-    SOCKET sock = socket(addr.ss_family, SOCK_STREAM, IPPROTO_TCP);
-    if (sock == INVALID_SOCKET) {
-        diag::log_tagged_fmt("upstream", "connect_first_hop socket_create_failed wsa_err=%d", WSAGetLastError());
-        err_out = "first_hop_socket_failed";
-        return INVALID_SOCKET;
-    }
-    diag::log_tagged_fmt("upstream", "connect_first_hop connecting timeout_ms=%d", timeout_ms);
-    if (!tcp_connect_timeout(sock, reinterpret_cast<sockaddr*>(&addr), len, timeout_ms)) {
-        diag::log_tagged_fmt("upstream", "connect_first_hop connect_failed host=%s port=%u",
-            hop.host.c_str(), static_cast<unsigned>(hop.port));
+    const bool loopback = is_loopback_host(hop.host);
+    const int max_attempts = loopback ? 16 : 1;
+    int last_connect_err = 0;
+    for (int attempt = 1; attempt <= max_attempts; ++attempt) {
+        SOCKET sock = socket(addr.ss_family, SOCK_STREAM, IPPROTO_TCP);
+        if (sock == INVALID_SOCKET) {
+            diag::log_tagged_fmt("upstream", "connect_first_hop socket_create_failed attempt=%d/%d wsa_err=%d",
+                attempt,
+                max_attempts,
+                WSAGetLastError());
+            err_out = "first_hop_socket_failed";
+            return INVALID_SOCKET;
+        }
+        diag::log_tagged_fmt("upstream", "connect_first_hop connecting attempt=%d/%d timeout_ms=%d loopback=%d",
+            attempt,
+            max_attempts,
+            timeout_ms,
+            loopback ? 1 : 0);
+        bool connected = false;
+        if (loopback) {
+            connected = tcp_connect_blocking_loopback(sock, reinterpret_cast<sockaddr*>(&addr), len, last_connect_err);
+        } else {
+            connected = tcp_connect_timeout(sock, reinterpret_cast<sockaddr*>(&addr), len, timeout_ms);
+            if (!connected)
+                last_connect_err = WSAGetLastError();
+        }
+        if (connected) {
+            diag::log_tagged_fmt("upstream", "connect_first_hop ok host=%s port=%u attempt=%d loopback=%d",
+                hop.host.c_str(),
+                static_cast<unsigned>(hop.port),
+                attempt,
+                loopback ? 1 : 0);
+            return sock;
+        }
+        diag::log_tagged_fmt("upstream", "connect_first_hop connect_failed host=%s port=%u attempt=%d/%d loopback=%d wsa_err=%d",
+            hop.host.c_str(),
+            static_cast<unsigned>(hop.port),
+            attempt,
+            max_attempts,
+            loopback ? 1 : 0,
+            last_connect_err);
         closesocket(sock);
-        err_out = "first_hop_connect_failed";
-        return INVALID_SOCKET;
+        if (!loopback || attempt == max_attempts)
+            break;
+        Sleep(20);
     }
-    diag::log_tagged_fmt("upstream", "connect_first_hop ok host=%s port=%u",
-        hop.host.c_str(), static_cast<unsigned>(hop.port));
-    return sock;
+    err_out = "first_hop_connect_failed";
+    return INVALID_SOCKET;
 }
 
 uintptr_t open_chain_internal(const upstream_chain_t& chain,

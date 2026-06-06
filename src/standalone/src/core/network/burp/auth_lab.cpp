@@ -8,6 +8,7 @@
 #endif
 
 #include "auth_lab.hpp"
+#include "audit_http.hpp"
 
 #include "../../../helpers/diag_log.hpp"
 
@@ -478,6 +479,75 @@ url_log_t summarize_url_for_log(const std::string& url)
     return out;
 }
 
+bool is_loopback_host(const std::string& host)
+{
+    std::string h = ascii_lower(host);
+    return h == "localhost" || h == "127.0.0.1" || h == "::1" || h == "[::1]";
+}
+
+std::string header_safe(std::string s)
+{
+    for (char& c : s)
+    {
+        unsigned char uc = static_cast<unsigned char>(c);
+        if (uc < 0x20 || uc == 0x7F)
+            c = '_';
+    }
+    return s;
+}
+
+bool http_post_form_audit_fallback(const std::string& host,
+                                   uint16_t port,
+                                   const std::string& path,
+                                   bool is_https,
+                                   const std::string& body,
+                                   std::string& body_out,
+                                   std::string& transport_error)
+{
+    std::string req;
+    req.reserve(512 + body.size());
+    req += "POST ";
+    req += path.empty() ? "/" : path;
+    req += " HTTP/1.1\r\nHost: ";
+    req += header_safe(host);
+    req += ":";
+    req += std::to_string(port);
+    req += "\r\nContent-Type: application/x-www-form-urlencoded\r\nAccept: application/json\r\nUser-Agent: AiDA-AuthLab/1.0\r\nAccept-Encoding: identity\r\nConnection: close\r\nContent-Length: ";
+    req += std::to_string(body.size());
+    req += "\r\n\r\n";
+    req += body;
+    std::vector<uint8_t> raw(req.begin(), req.end());
+    audit_http::send_options_t opts;
+    opts.timeout_ms = 15000;
+    opts.follow_redirects = false;
+    opts.enforce_scope = false;
+    auto ex = audit_http::send(raw, host, port, is_https, opts);
+    if (!ex)
+    {
+        transport_error = audit_http::last_error();
+        diag::log_tagged_fmt("auth_lab", "http_post_form fallback_no_response host=%s port=%u path=%s tls=%d err=%s",
+            host.c_str(),
+            static_cast<unsigned>(port),
+            path.c_str(),
+            is_https ? 1 : 0,
+            transport_error.c_str());
+        return false;
+    }
+    body_out.assign(reinterpret_cast<const char*>(ex->resp_body.data()), ex->resp_body.size());
+    diag::log_tagged_fmt("auth_lab", "http_post_form fallback_response status=%d response_len=%zu host=%s port=%u path=%s",
+        ex->status_code,
+        body_out.size(),
+        host.c_str(),
+        static_cast<unsigned>(port),
+        path.c_str());
+    if (ex->status_code < 200 || ex->status_code >= 300)
+    {
+        transport_error = "HTTP " + std::to_string(ex->status_code);
+        return false;
+    }
+    return true;
+}
+
 bool http_post_form(const std::string& token_endpoint,
                     const std::vector<std::pair<std::string, std::string>>& form,
                     std::string& body_out)
@@ -568,6 +638,13 @@ bool http_post_form(const std::string& token_endpoint,
         last_transport_error = httplib::to_string(res.error());
         diag::log_tagged_fmt("auth_lab", "http_post_form no_response attempt=%d host=%s port=%u path=%s body_len=%zu err=%s",
             attempt, host.c_str(), static_cast<unsigned>(port), endpoint_log.path.c_str(), body.size(), last_transport_error.c_str());
+        if (is_loopback_host(host)) {
+            std::string fallback_error;
+            if (http_post_form_audit_fallback(host, port, path, is_https, body, body_out, fallback_error))
+                return true;
+            if (!fallback_error.empty())
+                last_transport_error += "; audit_http=" + fallback_error;
+        }
         Sleep(static_cast<DWORD>(25 * attempt));
     }
     set_err(last_transport_error.empty() ? "http_post_form: no response" : ("http_post_form: no response (" + last_transport_error + ")"));

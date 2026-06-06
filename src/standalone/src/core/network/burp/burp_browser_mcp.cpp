@@ -168,6 +168,27 @@ tool_result_t tool_launch(const json& params)
         cfg.python_executable.c_str(), cfg.launch_timeout_ms, cfg.window_width, cfg.window_height,
         cfg.extra_args.size());
 
+    auto pre = camoufox::get_status();
+    const bool pre_busy_or_stale = pre.state == camoufox::bridge_state_t::starting ||
+        pre.cleanup_pending ||
+        (pre.state == camoufox::bridge_state_t::error && (pre.child_pid != 0 || pre.child_alive || pre.browser_open));
+    if (pre_busy_or_stale) {
+        diag::log_tagged_fmt("mcp_burp", "browser_launch_camoufox preflight_stop state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d err=%s",
+            camoufox_bridge_state_label(pre.state), pre.child_pid, pre.child_alive ? 1 : 0,
+            pre.browser_open ? 1 : 0, pre.page_verified ? 1 : 0, pre.cleanup_pending ? 1 : 0,
+            pre.last_error.empty() ? "<empty>" : pre.last_error.c_str());
+        const bool stopped = camoufox::stop_bridge();
+        auto post = camoufox::get_status();
+        diag::log_tagged_fmt("mcp_burp", "browser_launch_camoufox preflight_stop_done stopped=%d state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d err=%s",
+            stopped ? 1 : 0, camoufox_bridge_state_label(post.state), post.child_pid, post.child_alive ? 1 : 0,
+            post.browser_open ? 1 : 0, post.page_verified ? 1 : 0, post.cleanup_pending ? 1 : 0,
+            post.last_error.empty() ? "<empty>" : post.last_error.c_str());
+        if (!stopped && post.cleanup_pending) {
+            const std::string err = post.last_error.empty() ? std::string("camoufox bridge cleanup still pending before launch") : post.last_error;
+            return tool_result_t::error(err);
+        }
+    }
+
     if (!camoufox::start_bridge(cfg)) {
         auto st = camoufox::get_status();
         const std::string err = st.last_error.empty() ? camoufox::last_error() : st.last_error;

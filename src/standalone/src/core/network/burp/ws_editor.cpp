@@ -11,6 +11,7 @@
 
 #include "ws_editor.hpp"
 
+#include "../../infra/win_thread.hpp"
 #include "../../../helpers/diag_log.hpp"
 
 #include <openssl/ssl.h>
@@ -28,7 +29,6 @@
 #include <memory>
 #include <mutex>
 #include <sstream>
-#include <thread>
 #include <unordered_map>
 
 #pragma comment(lib, "Ws2_32.lib")
@@ -148,7 +148,7 @@ struct connection_t
     std::deque<ws_frame_log_t>       frames;
     size_t                           frames_max = 4096;
     std::string                      last_error;
-    std::thread                      recv_thread;
+    aida::infra::win_thread::joinable_thread_t recv_thread;
     std::mutex                       err_mtx;
 };
 
@@ -263,6 +263,28 @@ bool tcp_connect_with_timeout(SOCKET s, const sockaddr* sa, int sa_len, int time
     }
     connect_err = so_err;
     return so_err == 0;
+}
+
+bool tcp_connect_blocking_loopback(SOCKET s, const sockaddr* sa, int sa_len, int timeout_ms, int& connect_err)
+{
+    connect_err = 0;
+    if (!set_nonblocking(s, false)) {
+        connect_err = WSAGetLastError();
+        return false;
+    }
+    DWORD tv = static_cast<DWORD>(std::max(timeout_ms, 1));
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
+    int rc = ::connect(s, sa, sa_len);
+    if (rc != 0) {
+        connect_err = WSAGetLastError();
+        return false;
+    }
+    if (!set_nonblocking(s, true)) {
+        connect_err = WSAGetLastError();
+        return false;
+    }
+    return true;
 }
 
 bool sock_send_all(SOCKET s, const uint8_t* data, size_t len, int timeout_ms)
@@ -648,6 +670,26 @@ uint64_t connect(const ws_connection_config_t& cfg)
         BOOL nodelay = TRUE;
         setsockopt(candidate, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
 
+        if (loopback) {
+            int blocking_err = 0;
+            if (tcp_connect_blocking_loopback(candidate, reinterpret_cast<const sockaddr*>(&sa), sa_len, attempt_timeout_ms, blocking_err)) {
+                s = candidate;
+                diag::log_tagged_fmt("ws_edit", "connect tcp_ok_blocking host=%s port=%u attempts=%d",
+                    cfg.host.c_str(), static_cast<unsigned>(cfg.port), attempt);
+                break;
+            }
+            last_connect_err = blocking_err;
+            diag::log_tagged_fmt("ws_edit", "connect tcp_blocking_failed host=%s port=%u attempt=%d/%d timeout_ms=%d err=%d elapsed_ms=%llu",
+                cfg.host.c_str(), static_cast<unsigned>(cfg.port), attempt, max_attempts,
+                attempt_timeout_ms, blocking_err,
+                static_cast<unsigned long long>(now_steady_ms() - connect_started));
+            ::shutdown(candidate, SD_BOTH);
+            closesocket(candidate);
+            if (attempt == max_attempts) break;
+            Sleep(static_cast<DWORD>(std::min(100, 10 * attempt)));
+            continue;
+        }
+
         int connect_err = 0;
         int poll_rc = 0;
         short revents = 0;
@@ -763,24 +805,11 @@ uint64_t connect(const ws_connection_config_t& cfg)
         cptr->id = r.next_id.fetch_add(1);
         r.by_id.emplace(cptr->id, cptr);
     }
-    try {
-        cptr->recv_thread = std::thread([cptr]() { receive_loop(cptr); });
-    } catch (const std::exception& ex) {
+    std::string recv_thread_err;
+    if (!cptr->recv_thread.start([cptr]() { receive_loop(cptr); }, &recv_thread_err,
+            aida::infra::win_thread::default_stack_reserve, "ws_editor.recv")) {
         diag::log_tagged_fmt("ws_edit", "recv_thread_failed id=%llu err=%s",
-            static_cast<unsigned long long>(cptr->id), ex.what());
-        cptr->running.store(false);
-        cptr->connected.store(false);
-        cleanup_connection(*cptr);
-        {
-            auto& r = registry();
-            std::lock_guard<std::mutex> lk(r.mtx);
-            r.by_id.erase(cptr->id);
-        }
-        set_err("ws_editor: receive worker unavailable");
-        return 0;
-    } catch (...) {
-        diag::log_tagged_fmt("ws_edit", "recv_thread_failed id=%llu",
-            static_cast<unsigned long long>(cptr->id));
+            static_cast<unsigned long long>(cptr->id), recv_thread_err.c_str());
         cptr->running.store(false);
         cptr->connected.store(false);
         cleanup_connection(*cptr);
