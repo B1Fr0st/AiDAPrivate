@@ -1926,13 +1926,29 @@ static void test_request_dump_refresh(HANDLE hf, std::atomic<int>& passed, std::
         (unsigned long long)addr, (unsigned)driver_bridge::attached_pid());
 
     debugger_engine::request_dump_refresh(addr, 128, 0);
-    Sleep(300);
 
     uint64_t addr_out = 0;
     size_t size_out = 0;
-    auto bytes = debugger_engine::cached_dump_bytes(addr_out, size_out);
-    diag::log_tagged_fmt("test_dbg_detail", "dbg_dump result: byte_count=%zu addr=0x%llX requested_size=%zu",
-        bytes.size(), (unsigned long long)addr_out, size_out);
+    std::vector<uint8_t> bytes;
+    bool in_flight = false;
+    for (int poll = 0; poll < 60; ++poll) {
+        bytes = debugger_engine::cached_dump_bytes(addr_out, size_out);
+        in_flight = debugger_engine::dump_refresh_in_flight();
+        diag::log_tagged_fmt("test_dbg_detail", "dbg_dump poll=%d byte_count=%zu addr=0x%llX requested_size=%zu in_flight=%d attached_pid=%u driver_status=%s driver_error=%s",
+            poll,
+            bytes.size(),
+            (unsigned long long)addr_out,
+            size_out,
+            in_flight ? 1 : 0,
+            (unsigned)driver_bridge::attached_pid(),
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str());
+        if (!bytes.empty() && addr_out != 0)
+            break;
+        if (!in_flight && poll > 0)
+            break;
+        Sleep(50);
+    }
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (!bytes.empty() && addr_out != 0) {
@@ -1940,8 +1956,8 @@ static void test_request_dump_refresh(HANDLE hf, std::atomic<int>& passed, std::
             bytes.size(), (unsigned long long)addr_out, size_out, (long long)ms);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "dbg_dump", "FAIL -- dump read empty: bytes=%zu addr=0x%llX (target memory read returned no data) (elapsed %lld ms)",
-            bytes.size(), (unsigned long long)addr_out, (long long)ms);
+        log_msg(hf, "dbg_dump", "FAIL -- dump read empty: bytes=%zu addr=0x%llX in_flight=%d status=%s last_error=%s (target memory read returned no data) (elapsed %lld ms)",
+            bytes.size(), (unsigned long long)addr_out, in_flight ? 1 : 0, driver_bridge::status().c_str(), driver_bridge::last_error().c_str(), (long long)ms);
         failed.fetch_add(1);
     }
 }

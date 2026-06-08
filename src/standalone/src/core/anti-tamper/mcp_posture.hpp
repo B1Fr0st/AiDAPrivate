@@ -182,13 +182,37 @@ namespace anti_tamper::mcp_posture
             return text;
         }
 
-        inline bool is_managed_name(const std::string& name)
+        inline bool is_dynamic_camoufox_reverse_name_key(const std::string& n)
+        {
+            constexpr const char* prefix = "camoufox-reverse-";
+            constexpr size_t prefix_len = 17;
+            if (n.rfind(prefix, 0) != 0)
+                return false;
+            const size_t suffix_len = n.size() - prefix_len;
+            if (suffix_len == 0 || suffix_len > 96)
+                return false;
+            for (size_t i = prefix_len; i < n.size(); ++i) {
+                const unsigned char c = static_cast<unsigned char>(n[i]);
+                if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '.' || c == ':'))
+                    return false;
+            }
+            return true;
+        }
+
+        inline bool is_aida_managed_name(const std::string& name)
         {
             const std::string n = normalized_name_key(name);
             return n == "aida-standalone-mcp" ||
-                   n == "aida-pro-mcp" ||
+                   n == "aida-pro-mcp";
+        }
+
+        inline bool is_managed_name(const std::string& name)
+        {
+            const std::string n = normalized_name_key(name);
+            return is_aida_managed_name(n) ||
                    n == "camoufox-reverse-mcp" ||
-                   n == "camoufox-reverse";
+                   n == "camoufox-reverse" ||
+                   is_dynamic_camoufox_reverse_name_key(n);
         }
 
         inline const char* transport_name(transport_t t)
@@ -1104,45 +1128,246 @@ namespace anti_tamper::mcp_posture
         inline bool is_camoufox_managed_name(const std::string& name)
         {
             const std::string n = normalized_name_key(name);
-            return n == "camoufox-reverse-mcp" || n == "camoufox-reverse";
+            return n == "camoufox-reverse-mcp" ||
+                   n == "camoufox-reverse" ||
+                   is_dynamic_camoufox_reverse_name_key(n);
         }
 
-        inline bool is_internal_camoufox_runtime_server(const mcp_client::server_config_t& cfg)
+        inline std::string parent_path_string(const std::string& path)
         {
-            if (!is_camoufox_managed_name(cfg.name))
-                return false;
-            if (cfg.transport != mcp_client::transport_type_t::stdio)
-                return false;
-            if (!cfg.enabled || cfg.command.empty() || !cfg.url.empty() || !cfg.api_key.empty())
-                return false;
-            if (cfg.auto_connect || cfg.oauth_enabled || !cfg.oauth_client_id.empty() || !cfg.oauth_client_secret.empty() ||
-                !cfg.oauth_scope.empty() || !cfg.oauth_redirect_uri.empty())
-                return false;
-            if (cfg.args.size() < 2)
-                return false;
-            if (trim(cfg.args[0]) != "-m" || lower_ascii(trim(cfg.args[1])) != "camoufox_reverse_mcp")
-                return false;
+            if (path.empty())
+                return {};
+            std::error_code ec;
+            std::filesystem::path p(path);
+            p = p.parent_path();
+            if (p.empty())
+                return {};
+            if (p.is_relative())
+                p = std::filesystem::absolute(p, ec);
+            if (!ec) {
+                std::filesystem::path canonical = std::filesystem::weakly_canonical(p, ec);
+                if (!ec)
+                    p = canonical;
+            }
+            return p.lexically_normal().string();
+        }
+
+        inline std::string join_path_string(const std::string& base, const char* leaf)
+        {
+            if (base.empty() || !leaf || !*leaf)
+                return {};
+            std::filesystem::path p(base);
+            p /= leaf;
+            return p.lexically_normal().string();
+        }
+
+        inline std::vector<std::string> camoufox_trusted_runtime_roots()
+        {
+            std::vector<std::string> roots;
+            auto add_root = [&](const std::string& path) {
+                const std::string canonical = canonical_lower_path(path);
+                if (canonical.empty())
+                    return;
+                for (const auto& existing : roots) {
+                    if (canonical_lower_path(existing) == canonical)
+                        return;
+                }
+                roots.push_back(path);
+            };
             const std::string exe_dir = executable_dir();
-            if (exe_dir.empty())
-                return false;
-            const std::string command_path = unquote_path_token(cfg.command);
+            add_root(exe_dir);
+            add_root(current_dir());
+            add_root(parent_path_string(exe_dir));
+            return roots;
+        }
+
+        inline bool is_trusted_camoufox_runtime_python(const std::string& command)
+        {
+            const std::string command_path = unquote_path_token(command);
             const std::string command_base = basename_for_hash(command_path);
             if (command_base != "python.exe" && command_base != "pythonw.exe")
                 return false;
             std::error_code ec;
             if (!std::filesystem::is_regular_file(command_path, ec) || ec)
                 return false;
-            if (!path_under_or_equal(command_path, exe_dir))
+            static const char* runtime_dirs[] = {
+                "deps\\camoufox-runtime",
+                "camoufox-runtime",
+                "deps\\camoufox-python",
+                "camoufox-python"
+            };
+            for (const auto& root : camoufox_trusted_runtime_roots()) {
+                for (const char* rel : runtime_dirs) {
+                    const std::string runtime_dir = join_path_string(root, rel);
+                    if (!runtime_dir.empty() && path_under_or_equal(command_path, runtime_dir))
+                        return true;
+                }
+            }
+            return false;
+        }
+
+        inline bool is_trusted_camoufox_browser_path(const std::string& path)
+        {
+            const std::string browser_path = unquote_path_token(path);
+            if (basename_for_hash(browser_path) != "camoufox.exe")
                 return false;
-            auto browser_it = cfg.env.find("AIDA_CAMOUFOX_EXECUTABLE");
-            if (browser_it == cfg.env.end() || trim(browser_it->second).empty())
-                return false;
-            const std::string browser_path = unquote_path_token(browser_it->second);
-            ec.clear();
+            std::error_code ec;
             if (!std::filesystem::is_regular_file(browser_path, ec) || ec)
                 return false;
-            if (!path_under_or_equal(browser_path, exe_dir))
+            const std::string canonical = canonical_lower_path(browser_path);
+            if (canonical.find("\\camoufox-") == std::string::npos)
                 return false;
+            for (const auto& root : camoufox_trusted_runtime_roots()) {
+                const std::string deps_dir = join_path_string(root, "deps");
+                if ((!deps_dir.empty() && path_under_or_equal(browser_path, deps_dir)) ||
+                    path_under_or_equal(browser_path, root))
+                    return true;
+            }
+            return false;
+        }
+
+        inline std::string local_appdata_aida_dir()
+        {
+            const std::string local = read_env("LOCALAPPDATA");
+            if (local.empty())
+                return {};
+            return join_path_string(local, "AiDA");
+        }
+
+        inline bool is_trusted_camoufox_working_dir(const std::string& path)
+        {
+            const std::string work_dir = unquote_path_token(path);
+            if (work_dir.empty())
+                return false;
+            std::error_code ec;
+            if (!std::filesystem::is_directory(work_dir, ec) || ec)
+                return false;
+            const std::string canonical = canonical_lower_path(work_dir);
+            if (canonical.empty())
+                return false;
+            for (const auto& root : camoufox_trusted_runtime_roots()) {
+                if (canonical == canonical_lower_path(root))
+                    return true;
+            }
+            return false;
+        }
+
+        inline bool is_trusted_camoufox_profile_root(const std::string& path)
+        {
+            const std::string profile_root = unquote_path_token(path);
+            if (profile_root.empty())
+                return false;
+            std::vector<std::string> roots;
+            const std::string local_root = local_appdata_aida_dir();
+            if (!local_root.empty())
+                roots.push_back(join_path_string(local_root, "camoufox-profiles"));
+            for (const auto& runtime_root : camoufox_trusted_runtime_roots())
+                roots.push_back(join_path_string(runtime_root, "camoufox-profiles"));
+            for (const auto& root : roots) {
+                if (!root.empty() && path_under_or_equal(profile_root, root))
+                    return true;
+            }
+            return false;
+        }
+
+        inline bool camoufox_args_trusted(const std::vector<std::string>& args, std::string& reason)
+        {
+            if (args.size() < 2) {
+                reason = "args_missing_module";
+                return false;
+            }
+            if (trim(args[0]) != "-m") {
+                reason = "args_missing_module_switch";
+                return false;
+            }
+            if (lower_ascii(trim(args[1])) != "camoufox_reverse_mcp") {
+                reason = "args_module_mismatch";
+                return false;
+            }
+            for (std::size_t i = 2; i < args.size(); ++i) {
+                const std::string arg = lower_ascii(trim(args[i]));
+                if (arg.empty())
+                    continue;
+                if (arg.find("://") != std::string::npos ||
+                    arg.find("url") != std::string::npos ||
+                    arg.find("uri") != std::string::npos ||
+                    arg.find("host") != std::string::npos ||
+                    arg.find("port") != std::string::npos ||
+                    arg.find("api") != std::string::npos ||
+                    arg.find("key") != std::string::npos ||
+                    arg.find("token") != std::string::npos ||
+                    arg.find("oauth") != std::string::npos) {
+                    reason = "args_external_shape";
+                    return false;
+                }
+                if (contains_high_risk_token(arg)) {
+                    reason = "args_high_risk";
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        inline const std::string* env_value(const mcp_client::server_config_t& cfg, const char* key)
+        {
+            if (!key || !*key)
+                return nullptr;
+            auto it = cfg.env.find(key);
+            return it == cfg.env.end() ? nullptr : &it->second;
+        }
+
+        inline bool camoufox_session_name_matches_env(const std::string& name, const std::string& session_id)
+        {
+            const std::string n = normalized_name_key(name);
+            const std::string s = normalized_name_key(session_id.empty() ? std::string("default") : session_id);
+            if (s.empty() || s.size() > 96)
+                return false;
+            if (n == "camoufox-reverse" || n == "camoufox-reverse-mcp")
+                return true;
+            constexpr const char* prefix = "camoufox-reverse-";
+            constexpr size_t prefix_len = 17;
+            return n.rfind(prefix, 0) == 0 && n.substr(prefix_len) == s;
+        }
+
+        inline bool is_internal_camoufox_runtime_server(const mcp_client::server_config_t& cfg, std::string* deny_reason = nullptr)
+        {
+            auto fail = [&](const char* reason) {
+                if (deny_reason)
+                    *deny_reason = reason ? reason : "camoufox_predicate_failed";
+                return false;
+            };
+            if (!is_camoufox_managed_name(cfg.name))
+                return fail("name_not_camoufox_managed");
+            if (cfg.transport != mcp_client::transport_type_t::stdio)
+                return fail("transport_not_stdio");
+            if (!cfg.enabled || cfg.command.empty() || !cfg.url.empty() || !cfg.api_key.empty())
+                return fail("external_server_shape");
+            if (cfg.auto_connect || cfg.oauth_enabled || !cfg.oauth_client_id.empty() || !cfg.oauth_client_secret.empty() ||
+                !cfg.oauth_scope.empty() || !cfg.oauth_redirect_uri.empty())
+                return fail("oauth_shape");
+            std::string args_reason;
+            if (!camoufox_args_trusted(cfg.args, args_reason))
+                return fail(args_reason.c_str());
+            if (!is_trusted_camoufox_runtime_python(cfg.command))
+                return fail("python_not_bundled_runtime");
+            const std::string* browser = env_value(cfg, "AIDA_CAMOUFOX_EXECUTABLE");
+            if (!browser || trim(*browser).empty())
+                return fail("browser_env_missing");
+            if (!is_trusted_camoufox_browser_path(*browser))
+                return fail("browser_not_bundled");
+            const std::string* session_id = env_value(cfg, "AIDA_CAMOUFOX_SESSION_ID");
+            if (!session_id || trim(*session_id).empty())
+                return fail("session_env_missing");
+            if (!camoufox_session_name_matches_env(cfg.name, *session_id))
+                return fail("session_name_mismatch");
+            const std::string* work_dir = env_value(cfg, "AIDA_CAMOUFOX_WORKING_DIR");
+            if (!work_dir || !is_trusted_camoufox_working_dir(*work_dir))
+                return fail("working_dir_untrusted");
+            const std::string* profile_root = env_value(cfg, "AIDA_CAMOUFOX_PROFILE_ROOT");
+            if (!profile_root || !is_trusted_camoufox_profile_root(*profile_root))
+                return fail("profile_root_untrusted");
+            if (deny_reason)
+                *deny_reason = "trusted";
             return true;
         }
 
@@ -1202,6 +1427,47 @@ namespace anti_tamper::mcp_posture
             return trim(url) == exact_mcp || trim(url) == exact_sse;
         }
 
+        inline bool is_aida_managed_endpoint_path(const std::string& path)
+        {
+            return path == "/mcp" || path == "/sse";
+        }
+
+        inline bool is_stale_aida_managed_local_url(const server_entry_t& e, const url_info_t& u, int configured_port)
+        {
+            const std::string url = trim(e.url);
+            constexpr const char* prefix = "http://127.0.0.1:";
+            constexpr std::size_t prefix_len = 17;
+            if (url.rfind(prefix, 0) != 0)
+                return false;
+            const auto path_pos = url.find('/', prefix_len);
+            if (path_pos == std::string::npos)
+                return false;
+            const std::string port_text = url.substr(prefix_len, path_pos - prefix_len);
+            if (port_text.empty())
+                return false;
+            int parsed_port = 0;
+            for (const char c : port_text) {
+                if (c < '0' || c > '9')
+                    return false;
+                parsed_port = parsed_port * 10 + (c - '0');
+                if (parsed_port > 65535)
+                    return false;
+            }
+            const std::string path = url.substr(path_pos);
+            return is_aida_managed_name(e.name) &&
+                   e.transport == transport_t::http_sse &&
+                   e.command.empty() &&
+                   e.args.empty() &&
+                   u.valid &&
+                   !u.userinfo &&
+                   u.scheme == "http" &&
+                   u.host == "127.0.0.1" &&
+                   u.port == parsed_port &&
+                   parsed_port >= 1024 &&
+                   u.port != configured_port &&
+                   is_aida_managed_endpoint_path(path);
+        }
+
         inline bool url_is_high_risk(const std::string& url)
         {
             if (trim(url).empty())
@@ -1251,7 +1517,7 @@ namespace anti_tamper::mcp_posture
                 finding.reason.c_str());
         }
 
-        inline finding_t evaluate_entry(const server_entry_t& e, int configured_port, bool force_enabled, bool deny_enabled_unknown)
+        inline finding_t evaluate_entry(const server_entry_t& e, int configured_port, bool force_enabled, bool deny_enabled_unknown, bool allow_stale_aida_local)
         {
             finding_t f;
             f.source = e.source;
@@ -1274,11 +1540,22 @@ namespace anti_tamper::mcp_posture
             if (f.managed_name) {
                 if (is_internal_camoufox_stdio(e)) {
                     f.reason = "managed_internal_camoufox_stdio";
-                } else if (e.transport == transport_t::stdio || !e.command.empty() || !is_exact_managed_url(e.url, configured_port)) {
+                } else if (!is_aida_managed_name(e.name)) {
                     f.deny = true;
                     f.reason = "managed_name_spoof";
-                } else {
+                } else if (f.offensive_tool_metadata || f.metadata_count != 0) {
+                    f.deny = true;
+                    f.reason = f.offensive_tool_metadata ? "offensive_tool_metadata" : "managed_name_spoof";
+                } else if (e.transport != transport_t::http_sse || !e.command.empty() || !e.args.empty()) {
+                    f.deny = true;
+                    f.reason = "managed_name_spoof";
+                } else if (is_exact_managed_url(e.url, configured_port)) {
                     f.reason = "managed_aida_local";
+                } else if (allow_stale_aida_local && is_stale_aida_managed_local_url(e, u, configured_port)) {
+                    f.reason = "managed_aida_local_stale_port";
+                } else {
+                    f.deny = true;
+                    f.reason = "managed_name_spoof";
                 }
                 return f;
             }
@@ -1475,7 +1752,7 @@ namespace anti_tamper::mcp_posture
                 ++report.files_with_mcp;
             for (const auto& entry : entries) {
                 ++report.servers_seen;
-                finding_t f = detail::evaluate_entry(entry, configured_port, false, false);
+                finding_t f = detail::evaluate_entry(entry, configured_port, false, false, true);
                 if (f.managed_name && !f.deny)
                     ++report.managed_allowed;
                 else if (f.enabled && !f.managed_name)
@@ -1522,25 +1799,59 @@ namespace anti_tamper::mcp_posture
             ? detail::g_configured_port.load(std::memory_order_acquire)
             : 29117;
         report_t cached = cached_report();
-        finding_t f = detail::evaluate_entry(e, configured_port, force_enabled, true);
-        if (f.deny) {
-            if (detail::is_internal_camoufox_runtime_server(cfg)) {
-                if (!is_current_posture_trusted()) {
-                    f.reason = "posture_not_trusted";
-                    detail::latch_runtime_denial(f);
-                    return false;
-                }
+        finding_t f = detail::evaluate_entry(e, configured_port, force_enabled, true, false);
+        std::string camoufox_predicate;
+        const bool camoufox_named = detail::is_camoufox_managed_name(cfg.name);
+        if (camoufox_named) {
+            const std::string source_reason = f.reason.empty() ? std::string("none") : f.reason;
+            if (!detail::is_internal_camoufox_runtime_server(cfg, &camoufox_predicate)) {
+                f.deny = true;
+                f.reason = camoufox_predicate.empty() ? "camoufox_internal_predicate_failed" : camoufox_predicate;
                 const auto browser_it = cfg.env.find("AIDA_CAMOUFOX_EXECUTABLE");
+                const auto work_it = cfg.env.find("AIDA_CAMOUFOX_WORKING_DIR");
+                const auto profile_it = cfg.env.find("AIDA_CAMOUFOX_PROFILE_ROOT");
                 diag::log_tagged_fmt("mcp_posture",
-                    "runtime_camoufox_internal_allow server_hash=0x%016llX name_len=%zu command_hash=0x%016llX browser_hash=0x%016llX args=%zu summary_hash=0x%016llX",
+                    "runtime_camoufox_internal_reject server_hash=0x%016llX name_len=%zu source_reason=%s predicate=%s command_hash=0x%016llX browser_hash=0x%016llX work_hash=0x%016llX profile_hash=0x%016llX args=%zu env=%zu summary_hash=0x%016llX",
                     static_cast<unsigned long long>(f.server_hash),
                     f.name_len,
+                    source_reason.c_str(),
+                    f.reason.c_str(),
                     static_cast<unsigned long long>(detail::fnv1a_string(detail::canonical_lower_path(cfg.command))),
                     static_cast<unsigned long long>(browser_it == cfg.env.end() ? 0 : detail::fnv1a_string(detail::canonical_lower_path(browser_it->second))),
+                    static_cast<unsigned long long>(work_it == cfg.env.end() ? 0 : detail::fnv1a_string(detail::canonical_lower_path(work_it->second))),
+                    static_cast<unsigned long long>(profile_it == cfg.env.end() ? 0 : detail::fnv1a_string(detail::canonical_lower_path(profile_it->second))),
                     cfg.args.size(),
+                    cfg.env.size(),
                     static_cast<unsigned long long>(cached_summary_hash()));
-                return true;
+                detail::apply_decision(cached, f);
+                detail::latch_runtime_denial(f);
+                return false;
             }
+            if (!is_current_posture_trusted()) {
+                f.deny = true;
+                f.reason = "posture_not_trusted";
+                detail::latch_runtime_denial(f);
+                return false;
+            }
+            const auto browser_it = cfg.env.find("AIDA_CAMOUFOX_EXECUTABLE");
+            const auto work_it = cfg.env.find("AIDA_CAMOUFOX_WORKING_DIR");
+            const auto profile_it = cfg.env.find("AIDA_CAMOUFOX_PROFILE_ROOT");
+            diag::log_tagged_fmt("mcp_posture",
+                "runtime_camoufox_internal_allow server_hash=0x%016llX name_len=%zu source_reason=%s predicate=%s command_hash=0x%016llX browser_hash=0x%016llX work_hash=0x%016llX profile_hash=0x%016llX args=%zu env=%zu summary_hash=0x%016llX",
+                static_cast<unsigned long long>(f.server_hash),
+                f.name_len,
+                source_reason.c_str(),
+                camoufox_predicate.empty() ? "trusted" : camoufox_predicate.c_str(),
+                static_cast<unsigned long long>(detail::fnv1a_string(detail::canonical_lower_path(cfg.command))),
+                static_cast<unsigned long long>(browser_it == cfg.env.end() ? 0 : detail::fnv1a_string(detail::canonical_lower_path(browser_it->second))),
+                static_cast<unsigned long long>(work_it == cfg.env.end() ? 0 : detail::fnv1a_string(detail::canonical_lower_path(work_it->second))),
+                static_cast<unsigned long long>(profile_it == cfg.env.end() ? 0 : detail::fnv1a_string(detail::canonical_lower_path(profile_it->second))),
+                cfg.args.size(),
+                cfg.env.size(),
+                static_cast<unsigned long long>(cached_summary_hash()));
+            return true;
+        }
+        if (f.deny) {
             detail::apply_decision(cached, f);
             detail::latch_runtime_denial(f);
             return false;
@@ -1577,7 +1888,7 @@ namespace anti_tamper::mcp_posture
                 static_cast<unsigned long long>(detail::fnv1a_string(tool_name)));
             return false;
         }
-        if (detail::is_managed_name(server_name)) {
+        if (detail::is_managed_name(server_name) || detail::is_camoufox_managed_name(server_name)) {
             diag::log_tagged_fmt("mcp_posture",
                 "runtime_tool_metadata_allow_managed server_hash=0x%016llX name_len=%zu tool_hash=0x%016llX desc_len=%zu summary_hash=0x%016llX",
                 static_cast<unsigned long long>(detail::fnv1a_string(detail::normalized_name_key(server_name))),

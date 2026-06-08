@@ -7,9 +7,22 @@ extern ID3D11Device* g_pd3dDevice;
 
 bool icon_loader::load(const unsigned char* data, int size, ID3D11ShaderResourceView** out_srv, int* out_w, int* out_h, bool force_white)
 {
-    int w, h, channels;
+    if (!out_srv || !out_w || !out_h)
+        return false;
+    *out_srv = nullptr;
+    *out_w = 0;
+    *out_h = 0;
+    if (!data || size <= 0 || !g_pd3dDevice)
+        return false;
+
+    int w = 0, h = 0, channels = 0;
     unsigned char* pixels = stbi_load_from_memory(data, size, &w, &h, &channels, 4);
     if (!pixels) return false;
+    if (w <= 0 || h <= 0)
+    {
+        stbi_image_free(pixels);
+        return false;
+    }
 
     if (force_white)
         for (int i = 0; i < w * h * 4; i += 4)
@@ -34,10 +47,17 @@ bool icon_loader::load(const unsigned char* data, int size, ID3D11ShaderResource
     sd.SysMemPitch = w * 4;
 
     ID3D11Texture2D* tex = nullptr;
-    g_pd3dDevice->CreateTexture2D(&desc, &sd, &tex);
-    g_pd3dDevice->CreateShaderResourceView(tex, nullptr, out_srv);
+    HRESULT hr = g_pd3dDevice->CreateTexture2D(&desc, &sd, &tex);
+    if (FAILED(hr) || !tex)
+    {
+        stbi_image_free(pixels);
+        return false;
+    }
+    hr = g_pd3dDevice->CreateShaderResourceView(tex, nullptr, out_srv);
     tex->Release();
     stbi_image_free(pixels);
+    if (FAILED(hr) || !*out_srv)
+        return false;
 
     *out_w = w;
     *out_h = h;
@@ -48,11 +68,21 @@ bool icon_loader::load_file(const char* path, ID3D11ShaderResourceView** out_srv
 {
     if (!path || !*path || !out_srv || !out_w || !out_h)
         return false;
+    *out_srv = nullptr;
+    *out_w = 0;
+    *out_h = 0;
+    if (!g_pd3dDevice)
+        return false;
 
     int w = 0, h = 0, channels = 0;
     unsigned char* pixels = stbi_load(path, &w, &h, &channels, 4);
     if (!pixels)
         return false;
+    if (w <= 0 || h <= 0)
+    {
+        stbi_image_free(pixels);
+        return false;
+    }
 
     if (force_white) {
         for (int i = 0; i < w * h * 4; i += 4) {
@@ -77,14 +107,14 @@ bool icon_loader::load_file(const char* path, ID3D11ShaderResourceView** out_srv
     sd.SysMemPitch = w * 4;
 
     ID3D11Texture2D* tex = nullptr;
-    if (FAILED(g_pd3dDevice->CreateTexture2D(&desc, &sd, &tex))) {
+    if (FAILED(g_pd3dDevice->CreateTexture2D(&desc, &sd, &tex)) || !tex) {
         stbi_image_free(pixels);
         return false;
     }
     const HRESULT hr = g_pd3dDevice->CreateShaderResourceView(tex, nullptr, out_srv);
     tex->Release();
     stbi_image_free(pixels);
-    if (FAILED(hr))
+    if (FAILED(hr) || !*out_srv)
         return false;
 
     *out_w = w;

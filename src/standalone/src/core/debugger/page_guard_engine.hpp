@@ -1082,7 +1082,16 @@ private:
     }
 
     void drain_ring(pg_session_t* sess) {
-        std::lock_guard<std::mutex> drain_lk(sess->drain_mutex);
+        const ULONGLONG t0 = GetTickCount64();
+        std::unique_lock<std::mutex> drain_lk(sess->drain_mutex, std::try_to_lock);
+        if (!drain_lk.owns_lock()) {
+            diag::log_tagged_fmt("pg_sniff", "drain_skip_busy sid=%u pid=%u ring=0x%llX elapsed_ms=%llu",
+                sess->session_id,
+                sess->pid,
+                static_cast<unsigned long long>(sess->ring_addr),
+                static_cast<unsigned long long>(GetTickCount64() - t0));
+            return;
+        }
 
         pg_ring_header_t hdr{};
         std::vector<uint8_t> hdr_buf;
@@ -1169,7 +1178,7 @@ private:
         }
         sess->total_captured += drained;
         if (drained > 0 || entry_failures > 0) {
-            diag::log_tagged_fmt("pg_sniff", "drain sid=%u pid=%u raw_w=%u raw_r=%u w=%u r0=%u r1=%u drained=%llu entry_failures=%llu total=%llu drops=%llu rearm=%llu/%llu payloads=%d max_drain=%u",
+            diag::log_tagged_fmt("pg_sniff", "drain sid=%u pid=%u raw_w=%u raw_r=%u w=%u r0=%u r1=%u drained=%llu entry_failures=%llu total=%llu drops=%llu rearm=%llu/%llu payloads=%d max_drain=%u elapsed_ms=%llu",
                 sess->session_id,
                 sess->pid,
                 raw_w,
@@ -1184,7 +1193,8 @@ private:
                 static_cast<unsigned long long>(sess->rearm_attempts),
                 static_cast<unsigned long long>(sess->rearm_failures),
                 capture_payloads ? 1 : 0,
-                max_records);
+                max_records,
+                static_cast<unsigned long long>(GetTickCount64() - t0));
         }
 
         if (drained > 0 || r != initial_r) {

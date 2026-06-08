@@ -149,9 +149,15 @@ tool_result_t handle_remove(const json& p)
 tool_result_t handle_clear(const json&)
 {
     diag::log_tagged_fmt("mcp_burp", "comparer_clear entry");
+    const auto before = aida::burp::comparer::list_slots();
     aida::burp::comparer::clear_slots();
-    diag::log_tagged_fmt("mcp_burp", "comparer_clear ok");
-    return tool_result_t::ok("cleared");
+    const auto after = aida::burp::comparer::list_slots();
+    diag::log_tagged_fmt("mcp_burp", "comparer_clear ok before=%zu after=%zu", before.size(), after.size());
+    json result;
+    result["before_count"] = static_cast<uint64_t>(before.size());
+    result["after_count"] = static_cast<uint64_t>(after.size());
+    result["cleared_count"] = static_cast<uint64_t>(before.size() >= after.size() ? before.size() - after.size() : 0);
+    return tool_result_t::ok("cleared slots=" + std::to_string(before.size()) + " after=" + std::to_string(after.size()), result);
 }
 
 tool_result_t handle_diff(const json& p)

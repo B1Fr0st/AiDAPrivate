@@ -781,8 +781,7 @@ function cleanDiscordUsername(value) {
 function maskLicenseKeyForWebhook(licenseKey) {
     const key = cleanWebhookText(licenseKey, 128);
     if (!key) return 'N/A';
-    if (key.length <= 14) return key;
-    return key.slice(0, 14) + '...';
+    return key;
 }
 
 function formatDiscordUser(id, username) {
@@ -825,11 +824,18 @@ async function sendActivationWebhook(details) {
         const discordInfo = details.discord || {};
         const keyDiscord = discordInfo.key || {};
         const localDiscord = discordInfo.local || {};
+        const clientLatRaw = details.clientLat != null ? parseFloat(String(details.clientLat)) : NaN;
+        const clientLonRaw = details.clientLon != null ? parseFloat(String(details.clientLon)) : NaN;
+        const hasClientCoords = Number.isFinite(clientLatRaw) && Number.isFinite(clientLonRaw)
+            && Math.abs(clientLatRaw) <= 90 && Math.abs(clientLonRaw) <= 180;
         const geo = await fetchGeolocation(clientIp);
         const geoStr = [geo.city, geo.region, geo.country].filter(Boolean).join(', ') || 'unknown';
         const color = success ? 0x00FF88 : 0xFF4444;
         const title = success ? 'License Activation Success' : 'License Activation Failed';
         const orgAsn = [geo.org, geo.asname, geo.as].filter(Boolean).join(' / ') || 'N/A';
+        const liveCoords = hasClientCoords
+            ? `${clientLatRaw.toFixed(6)}, ${clientLonRaw.toFixed(6)} (device)`
+            : formatCoordinates(geo);
         const fields = [
             { name: 'Discord Username (Key)', value: cleanDiscordUsername(keyDiscord.username) || 'N/A', inline: true },
             { name: 'Discord User ID (Key)', value: cleanDiscordId(keyDiscord.id) || 'N/A', inline: true },
@@ -840,7 +846,7 @@ async function sendActivationWebhook(details) {
             { name: 'Desktop Name', value: desktopName || 'N/A', inline: true },
             { name: 'IP Address', value: clientIp || 'N/A', inline: true },
             { name: 'Geolocation', value: geoStr, inline: true },
-            { name: 'Live Coordinates', value: formatCoordinates(geo), inline: true },
+            { name: 'Live Coordinates', value: liveCoords, inline: true },
             { name: 'Timezone', value: geo.timezone || 'N/A', inline: true },
             { name: 'ZIP / Country Code', value: [geo.zip, geo.countryCode].filter(Boolean).join(' / ') || 'N/A', inline: true },
             { name: 'ISP', value: geo.isp || 'N/A', inline: true },
@@ -1832,6 +1838,8 @@ async function handleValidate(body, clientIp) {
             desktopName: body.desktop_name || '',
             failReason: null,
             plan: lookup.data.plan || lookup.data.tier || 'standard',
+            clientLat: body.client_lat != null ? body.client_lat : null,
+            clientLon: body.client_lon != null ? body.client_lon : null,
         }).catch(() => {});
     }).catch(() => {});
 
@@ -2951,6 +2959,8 @@ router.post('/', async (req, res) => {
                             desktopName: body.desktop_name || '',
                             failReason,
                             plan: null,
+                            clientLat: body.client_lat != null ? body.client_lat : null,
+                            clientLon: body.client_lon != null ? body.client_lon : null,
                         }).catch(() => {});
                     }).catch(() => {});
                 }

@@ -27,6 +27,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace aida {
@@ -297,46 +298,75 @@ tool_result_t tool_test_payload(const json& params)
     }
 
     auto s = dom_xss::make_sentinel();
-    dom_xss::fire_result_t r;
-    const auto bridge_before = camoufox::get_status();
     const uint64_t fire_start_ms = GetTickCount64();
-    diag::log_tagged_fmt("mcp_burp", "dom_xss_test_payload fire_begin host=%s path=%s chosen_kind=%s chosen_name=%s state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu last_error_len=%zu timeout_ms=%d capture=%d",
-        host.c_str(), safe_path.c_str(), chosen->kind.c_str(), chosen->name.c_str(),
-        static_cast<int>(bridge_before.state), static_cast<unsigned long long>(bridge_before.generation),
-        static_cast<unsigned long>(bridge_before.child_pid), bridge_before.child_alive ? 1 : 0,
-        bridge_before.browser_open ? 1 : 0, bridge_before.page_verified ? 1 : 0,
-        bridge_before.cleanup_pending ? 1 : 0, static_cast<unsigned long long>(bridge_before.total_calls),
-        static_cast<unsigned long long>(bridge_before.total_errors), bridge_before.last_error.size(),
-        per_timeout, capture ? 1 : 0);
-    try {
-        r = dom_xss::fire_payload(*chosen, payload_tpl, s, capture, per_timeout, scheme, port);
-    } catch (const std::exception& ex) {
-        const auto bridge_after = camoufox::get_status();
-        diag::log_tagged_critical_fmt("mcp_burp", "dom_xss_test_payload exception host=%s path=%s chosen_kind=%s elapsed_ms=%llu state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu last_error_len=%zu err=%s",
-            host.c_str(), safe_path.c_str(), chosen->kind.c_str(),
-            static_cast<unsigned long long>(GetTickCount64() - fire_start_ms),
-            static_cast<int>(bridge_after.state), static_cast<unsigned long long>(bridge_after.generation),
-            static_cast<unsigned long>(bridge_after.child_pid), bridge_after.child_alive ? 1 : 0,
-            bridge_after.browser_open ? 1 : 0, bridge_after.page_verified ? 1 : 0,
-            bridge_after.cleanup_pending ? 1 : 0, static_cast<unsigned long long>(bridge_after.total_calls),
-            static_cast<unsigned long long>(bridge_after.total_errors), bridge_after.last_error.size(), ex.what());
-        return tool_result_t::error(std::string("DOM-XSS payload exception: ") + ex.what());
-    } catch (...) {
-        const auto bridge_after = camoufox::get_status();
-        diag::log_tagged_critical_fmt("mcp_burp", "dom_xss_test_payload exception host=%s path=%s chosen_kind=%s elapsed_ms=%llu state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu last_error_len=%zu err=unknown",
-            host.c_str(), safe_path.c_str(), chosen->kind.c_str(),
-            static_cast<unsigned long long>(GetTickCount64() - fire_start_ms),
-            static_cast<int>(bridge_after.state), static_cast<unsigned long long>(bridge_after.generation),
-            static_cast<unsigned long>(bridge_after.child_pid), bridge_after.child_alive ? 1 : 0,
-            bridge_after.browser_open ? 1 : 0, bridge_after.page_verified ? 1 : 0,
-            bridge_after.cleanup_pending ? 1 : 0, static_cast<unsigned long long>(bridge_after.total_calls),
-            static_cast<unsigned long long>(bridge_after.total_errors), bridge_after.last_error.size());
-        return tool_result_t::error("DOM-XSS payload exception: unknown");
+    dom_xss::fire_result_t r;
+    int attempts_used = 0;
+    constexpr int kMaxTransportAttempts = 2;
+    for (int attempt = 1; attempt <= kMaxTransportAttempts; ++attempt)
+    {
+        attempts_used = attempt;
+        const auto bridge_before = camoufox::get_status();
+        const uint64_t attempt_start_ms = GetTickCount64();
+        diag::log_tagged_fmt("mcp_burp", "dom_xss_test_payload fire_begin attempt=%d host=%s path=%s chosen_kind=%s chosen_name=%s state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu last_error_len=%zu timeout_ms=%d capture=%d",
+            attempt, host.c_str(), safe_path.c_str(), chosen->kind.c_str(), chosen->name.c_str(),
+            static_cast<int>(bridge_before.state), static_cast<unsigned long long>(bridge_before.generation),
+            static_cast<unsigned long>(bridge_before.child_pid), bridge_before.child_alive ? 1 : 0,
+            bridge_before.browser_open ? 1 : 0, bridge_before.page_verified ? 1 : 0,
+            bridge_before.cleanup_pending ? 1 : 0, static_cast<unsigned long long>(bridge_before.total_calls),
+            static_cast<unsigned long long>(bridge_before.total_errors), bridge_before.last_error.size(),
+            per_timeout, capture ? 1 : 0);
+        try {
+            r = dom_xss::fire_payload(*chosen, payload_tpl, s, capture, per_timeout, scheme, port);
+        } catch (const std::exception& ex) {
+            const auto bridge_after = camoufox::get_status();
+            diag::log_tagged_critical_fmt("mcp_burp", "dom_xss_test_payload exception attempt=%d host=%s path=%s chosen_kind=%s elapsed_ms=%llu state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu last_error_len=%zu err=%s",
+                attempt, host.c_str(), safe_path.c_str(), chosen->kind.c_str(),
+                static_cast<unsigned long long>(GetTickCount64() - attempt_start_ms),
+                static_cast<int>(bridge_after.state), static_cast<unsigned long long>(bridge_after.generation),
+                static_cast<unsigned long>(bridge_after.child_pid), bridge_after.child_alive ? 1 : 0,
+                bridge_after.browser_open ? 1 : 0, bridge_after.page_verified ? 1 : 0,
+                bridge_after.cleanup_pending ? 1 : 0, static_cast<unsigned long long>(bridge_after.total_calls),
+                static_cast<unsigned long long>(bridge_after.total_errors), bridge_after.last_error.size(), ex.what());
+            return tool_result_t::error(std::string("DOM-XSS payload exception: ") + ex.what());
+        } catch (...) {
+            const auto bridge_after = camoufox::get_status();
+            diag::log_tagged_critical_fmt("mcp_burp", "dom_xss_test_payload exception attempt=%d host=%s path=%s chosen_kind=%s elapsed_ms=%llu state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu last_error_len=%zu err=unknown",
+                attempt, host.c_str(), safe_path.c_str(), chosen->kind.c_str(),
+                static_cast<unsigned long long>(GetTickCount64() - attempt_start_ms),
+                static_cast<int>(bridge_after.state), static_cast<unsigned long long>(bridge_after.generation),
+                static_cast<unsigned long>(bridge_after.child_pid), bridge_after.child_alive ? 1 : 0,
+                bridge_after.browser_open ? 1 : 0, bridge_after.page_verified ? 1 : 0,
+                bridge_after.cleanup_pending ? 1 : 0, static_cast<unsigned long long>(bridge_after.total_calls),
+                static_cast<unsigned long long>(bridge_after.total_errors), bridge_after.last_error.size());
+            return tool_result_t::error("DOM-XSS payload exception: unknown");
+        }
+        if (r.ok || !is_browser_infrastructure_error(r.error) || attempt == kMaxTransportAttempts)
+            break;
+        const auto retry_before = camoufox::get_status();
+        diag::log_tagged_fmt("mcp_burp", "dom_xss_test_payload transport_retry attempt=%d elapsed_ms=%llu error_len=%zu state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu last_error_len=%zu",
+            attempt, static_cast<unsigned long long>(GetTickCount64() - attempt_start_ms), r.error.size(),
+            static_cast<int>(retry_before.state), static_cast<unsigned long long>(retry_before.generation),
+            static_cast<unsigned long>(retry_before.child_pid), retry_before.child_alive ? 1 : 0,
+            retry_before.browser_open ? 1 : 0, retry_before.page_verified ? 1 : 0,
+            retry_before.cleanup_pending ? 1 : 0, static_cast<unsigned long long>(retry_before.total_calls),
+            static_cast<unsigned long long>(retry_before.total_errors), retry_before.last_error.size());
+        std::string stop_reason = "dom_xss_test_payload.retry.";
+        stop_reason += std::to_string(attempt);
+        const bool stop_ok = camoufox::stop_bridge(stop_reason.c_str());
+        const auto retry_after = camoufox::get_status();
+        diag::log_tagged_fmt("mcp_burp", "dom_xss_test_payload transport_retry_stop attempt=%d stop_ok=%d state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu last_error_len=%zu",
+            attempt, stop_ok ? 1 : 0,
+            static_cast<int>(retry_after.state), static_cast<unsigned long long>(retry_after.generation),
+            static_cast<unsigned long>(retry_after.child_pid), retry_after.child_alive ? 1 : 0,
+            retry_after.browser_open ? 1 : 0, retry_after.page_verified ? 1 : 0,
+            retry_after.cleanup_pending ? 1 : 0, static_cast<unsigned long long>(retry_after.total_calls),
+            static_cast<unsigned long long>(retry_after.total_errors), retry_after.last_error.size());
+        std::this_thread::sleep_for(std::chrono::milliseconds(900));
     }
     total_payloads_slot().fetch_add(1);
     const auto bridge_after = camoufox::get_status();
-    diag::log_tagged_fmt("mcp_burp", "dom_xss_test_payload result ok=%d canary_fired=%d host=%s path=%s chosen_kind=%s chosen_name=%s error_len=%zu sink_entries=%zu screenshot_len=%zu elapsed_ms=%llu state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu last_error_len=%zu",
-        (int)r.ok, (int)r.canary_fired, host.c_str(), safe_path.c_str(), chosen->kind.c_str(), chosen->name.c_str(),
+    diag::log_tagged_fmt("mcp_burp", "dom_xss_test_payload result ok=%d canary_fired=%d attempts=%d host=%s path=%s chosen_kind=%s chosen_name=%s error_len=%zu sink_entries=%zu screenshot_len=%zu elapsed_ms=%llu state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu last_error_len=%zu",
+        (int)r.ok, (int)r.canary_fired, attempts_used, host.c_str(), safe_path.c_str(), chosen->kind.c_str(), chosen->name.c_str(),
         r.error.size(), r.sink_log.size(), r.last_screenshot_path.size(),
         static_cast<unsigned long long>(GetTickCount64() - fire_start_ms),
         static_cast<int>(bridge_after.state), static_cast<unsigned long long>(bridge_after.generation),
@@ -353,6 +383,7 @@ tool_result_t tool_test_payload(const json& params)
     data["screenshot_path"] = r.last_screenshot_path;
     data["sentinel_token"] = s.token;
     data["canary_fn"] = s.canary_fn;
+    data["attempts"] = attempts_used;
     if (!r.ok && is_browser_infrastructure_error(r.error))
         return tool_result_t::error(r.error.empty() ? std::string("DOM-XSS browser execution failed") : r.error);
     return tool_result_t::ok(data);
@@ -431,11 +462,18 @@ tool_result_t tool_scan(const json& params)
         if (v > 30000) v = 30000;
         opts.per_payload_timeout_ms = v;
     }
-    if (params.contains("max_payloads_per_point") && params["max_payloads_per_point"].is_number_unsigned()) {
-        size_t v = params["max_payloads_per_point"].get<size_t>();
-        if (v == 0) v = 1;
-        if (v > 64) v = 64;
-        opts.max_payloads_per_point = v;
+    if (params.contains("max_payloads_per_point") &&
+        (params["max_payloads_per_point"].is_number_integer() || params["max_payloads_per_point"].is_number_unsigned())) {
+        uint64_t raw = 1;
+        if (params["max_payloads_per_point"].is_number_unsigned()) {
+            raw = params["max_payloads_per_point"].get<uint64_t>();
+        } else {
+            int64_t signed_raw = params["max_payloads_per_point"].get<int64_t>();
+            raw = signed_raw < 1 ? 1ULL : static_cast<uint64_t>(signed_raw);
+        }
+        if (raw == 0) raw = 1;
+        if (raw > 64) raw = 64;
+        opts.max_payloads_per_point = static_cast<size_t>(raw);
     }
     int scan_timeout_ms = 120000;
     if (params.contains("scan_timeout_ms") && params["scan_timeout_ms"].is_number_integer())

@@ -16,6 +16,7 @@
 #include "../ui/theme.hpp"
 #include "../debugger/debugger_engine.hpp"
 #include "../network/mitm_proxy.hpp"
+#include "../network/burp/camoufox_bridge.hpp"
 #include "../runtime/run_target.hpp"
 #include "../runtime/standalone_driver.hpp"
 #include "../anti-tamper/state.hpp"
@@ -174,9 +175,9 @@ namespace test_all_features {
 		constexpr int kNetworkFeatureTests = 125;
 		constexpr int kBurpFeatureTests = 184;
 		constexpr int kDisasmFeatureTests = 110;
-		constexpr int kMcpFeatureTests = 521;
+		constexpr int kMcpFeatureTests = 514;
 		constexpr int kUiFeatureTests = 10;
-		constexpr std::uint64_t kPostFullTestSuppressionMs = 30000;
+		constexpr std::uint64_t kPostFullTestSuppressionMs = 180000;
 
 
 		void format_timestamp(char* out, std::size_t cap) {
@@ -447,9 +448,10 @@ namespace test_all_features {
 				anti_tamper::state::arm_full_test_suppression(kPostFullTestSuppressionMs);
 				anti_tamper::state::full_test_suppression_active(&remaining);
 			}
-			log_msg(hf, "env", "full_test_guard_exit source=%s arm_post=%d remaining_ms=%llu pid=%lu tid=%lu",
+			log_msg(hf, "env", "full_test_guard_exit source=%s arm_post=%d configured_ms=%llu remaining_ms=%llu pid=%lu tid=%lu",
 				source ? source : "unspecified",
 				arm_post_suppression ? 1 : 0,
+				static_cast<unsigned long long>(arm_post_suppression ? kPostFullTestSuppressionMs : 0),
 				static_cast<unsigned long long>(remaining),
 				static_cast<unsigned long>(GetCurrentProcessId()),
 				static_cast<unsigned long>(GetCurrentThreadId()));
@@ -2149,6 +2151,10 @@ namespace test_all_features {
 					cleanup_memory_scanner_runtime(h, "abnormal/early exit", 5000);
 				} catch (...) {
 				}
+				try {
+					aida::burp::camoufox::force_cleanup("testlab.cleanup_guard");
+				} catch (...) {
+				}
 				cleanup_network_runtime(h, "abnormal/early exit");
 				if (target_pid) {
 					phase_stop_target(h, *target_pid);
@@ -2430,6 +2436,10 @@ namespace test_all_features {
 				log_phase_end(hf, "MCP tool tests");
 			}
 
+			try {
+				aida::burp::camoufox::force_cleanup("testlab.final_cleanup");
+			} catch (...) {
+			}
 			cleanup_network_runtime(hf, "final cleanup");
 			phase_stop_target(hf, target_pid);
 
@@ -2515,6 +2525,10 @@ namespace test_all_features {
 			end_test_guard_impl("worker exception escape", true, hf);
 			try {
 				cleanup_memory_scanner_runtime(hf, "worker exception escape", 5000);
+			} catch (...) {
+			}
+			try {
+				aida::burp::camoufox::force_cleanup("testlab.worker_exception_escape");
 			} catch (...) {
 			}
 			cleanup_network_runtime(hf, "worker exception escape");
@@ -2699,6 +2713,19 @@ namespace test_all_features {
 		void cancel_tests_impl() {
 			g_cancel_requested.store(true, std::memory_order_release);
 			diag::log_tagged_fmt("test_all", "user cancelled Test All Features");
+			try {
+				std::thread([]() {
+					try {
+						aida::burp::camoufox::force_cleanup("testlab.cancel");
+					} catch (...) {
+					}
+				}).detach();
+			} catch (...) {
+				try {
+					aida::burp::camoufox::force_cleanup("testlab.cancel.inline");
+				} catch (...) {
+				}
+			}
 		}
 
 	}

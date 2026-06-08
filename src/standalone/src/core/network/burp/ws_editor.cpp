@@ -177,17 +177,48 @@ std::string get_conn_err(connection_t& c)
     return c.last_error;
 }
 
-void cleanup_connection(connection_t& c)
+void close_transport_for_stop(connection_t& c)
 {
+    diag::log_tagged_fmt("ws_edit", "close_transport begin sock=0x%llX ssl=%p connected=%d running=%d",
+        static_cast<unsigned long long>(c.sock),
+        c.ssl,
+        c.connected.load() ? 1 : 0,
+        c.running.load() ? 1 : 0);
     c.running.store(false);
     c.connected.store(false);
-    if (c.ssl) { SSL_shutdown(c.ssl); SSL_free(c.ssl); c.ssl = nullptr; }
-    if (c.ssl_ctx) { SSL_CTX_free(c.ssl_ctx); c.ssl_ctx = nullptr; }
     if (c.sock != INVALID_SOCKET) {
+        DWORD timeout = 250;
+        setsockopt(c.sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+        setsockopt(c.sock, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+        u_long mode = 1;
+        ioctlsocket(c.sock, FIONBIO, &mode);
         ::shutdown(c.sock, SD_BOTH);
         closesocket(c.sock);
         c.sock = INVALID_SOCKET;
     }
+    if (c.ssl) {
+        SSL_set_shutdown(c.ssl, SSL_SENT_SHUTDOWN | SSL_RECEIVED_SHUTDOWN);
+        SSL_set_quiet_shutdown(c.ssl, 1);
+    }
+    diag::log_tagged("ws_edit", "close_transport end");
+}
+
+void cleanup_connection(connection_t& c)
+{
+    const uint64_t t0 = now_steady_ms();
+    diag::log_tagged_fmt("ws_edit", "cleanup_connection begin sock=0x%llX ssl=%p connected=%d running=%d",
+        static_cast<unsigned long long>(c.sock),
+        c.ssl,
+        c.connected.load() ? 1 : 0,
+        c.running.load() ? 1 : 0);
+    close_transport_for_stop(c);
+    if (c.ssl) {
+        SSL_free(c.ssl);
+        c.ssl = nullptr;
+    }
+    if (c.ssl_ctx) { SSL_CTX_free(c.ssl_ctx); c.ssl_ctx = nullptr; }
+    diag::log_tagged_fmt("ws_edit", "cleanup_connection end elapsed_ms=%llu",
+        static_cast<unsigned long long>(now_steady_ms() - t0));
 }
 
 bool set_nonblocking(SOCKET s, bool nb)
@@ -515,6 +546,12 @@ bool send_frame_internal(connection_t& c, uint8_t opcode, bool fin, bool masked,
 void receive_loop(std::shared_ptr<connection_t> cptr)
 {
     auto& c = *cptr;
+    const uint64_t t0 = now_steady_ms();
+    diag::log_tagged_fmt("ws_edit", "receive_loop entry conn_id=%llu sock=0x%llX ssl=%p tid=%lu",
+        static_cast<unsigned long long>(c.id),
+        static_cast<unsigned long long>(c.sock),
+        c.ssl,
+        static_cast<unsigned long>(GetCurrentThreadId()));
     std::vector<uint8_t> buf;
     buf.reserve(65536);
     uint8_t tmp[16384];
@@ -589,6 +626,14 @@ void receive_loop(std::shared_ptr<connection_t> cptr)
         }
     }
     c.connected.store(false);
+    diag::log_tagged_fmt("ws_edit", "receive_loop exit conn_id=%llu running=%d connected=%d sent=%zu received=%zu elapsed_ms=%llu tid=%lu",
+        static_cast<unsigned long long>(c.id),
+        c.running.load() ? 1 : 0,
+        c.connected.load() ? 1 : 0,
+        c.frames_sent.load(),
+        c.frames_received.load(),
+        static_cast<unsigned long long>(now_steady_ms() - t0),
+        static_cast<unsigned long>(GetCurrentThreadId()));
 }
 
 std::shared_ptr<connection_t> find_conn(uint64_t id)
@@ -830,6 +875,7 @@ uint64_t connect(const ws_connection_config_t& cfg)
 
 bool disconnect(uint64_t conn_id)
 {
+    const uint64_t t0 = now_steady_ms();
     diag::log_tagged_fmt("ws_edit", "disconnect entry conn_id=%llu",
         static_cast<unsigned long long>(conn_id));
     auto cptr = find_conn(conn_id);
@@ -840,19 +886,40 @@ bool disconnect(uint64_t conn_id)
         return false;
     }
     cptr->running.store(false);
-    if (cptr->connected.load()) {
-        diag::log_tagged_fmt("ws_edit", "disconnect sending_close_frame conn_id=%llu",
-            static_cast<unsigned long long>(conn_id));
-        std::vector<uint8_t> close_payload = { 0x03, 0xE8 };
-        send_frame_internal(*cptr, 0x8, true, true, close_payload);
+    const bool was_connected = cptr->connected.exchange(false);
+    diag::log_tagged_fmt("ws_edit", "disconnect closing_transport conn_id=%llu was_connected=%d sock=0x%llX ssl=%p elapsed_ms=%llu",
+        static_cast<unsigned long long>(conn_id),
+        was_connected ? 1 : 0,
+        static_cast<unsigned long long>(cptr->sock),
+        cptr->ssl,
+        static_cast<unsigned long long>(now_steady_ms() - t0));
+    close_transport_for_stop(*cptr);
+    bool joined = true;
+    if (cptr->recv_thread.joinable()) {
+        diag::log_tagged_fmt("ws_edit", "disconnect recv_join_begin conn_id=%llu elapsed_ms=%llu",
+            static_cast<unsigned long long>(conn_id),
+            static_cast<unsigned long long>(now_steady_ms() - t0));
+        joined = cptr->recv_thread.join_for(1000);
+        if (joined) {
+            diag::log_tagged_fmt("ws_edit", "disconnect recv_join_done conn_id=%llu elapsed_ms=%llu",
+                static_cast<unsigned long long>(conn_id),
+                static_cast<unsigned long long>(now_steady_ms() - t0));
+        } else {
+            set_conn_err(*cptr, "ws_editor.disconnect: receive worker did not stop within timeout");
+            diag::log_tagged_fmt("ws_edit", "disconnect recv_join_timeout conn_id=%llu elapsed_ms=%llu",
+                static_cast<unsigned long long>(conn_id),
+                static_cast<unsigned long long>(now_steady_ms() - t0));
+            cptr->recv_thread.detach();
+        }
     }
-    cleanup_connection(*cptr);
-    if (cptr->recv_thread.joinable()) cptr->recv_thread.join();
+    if (joined)
+        cleanup_connection(*cptr);
     auto& r = registry();
     std::lock_guard<std::mutex> lk(r.mtx);
     r.by_id.erase(conn_id);
-    diag::log_tagged_fmt("ws_edit", "disconnect ok conn_id=%llu remaining=%zu",
-        static_cast<unsigned long long>(conn_id), r.by_id.size());
+    diag::log_tagged_fmt("ws_edit", "disconnect ok conn_id=%llu remaining=%zu elapsed_ms=%llu",
+        static_cast<unsigned long long>(conn_id), r.by_id.size(),
+        static_cast<unsigned long long>(now_steady_ms() - t0));
     return true;
 }
 

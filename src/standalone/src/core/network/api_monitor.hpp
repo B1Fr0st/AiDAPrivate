@@ -884,7 +884,7 @@ inline bool target_is_x64(uint32_t pid) {
 
 inline bool ensure_driver_attached(uint32_t pid, std::string& error) {
     if (!driver_bridge::using_kernel_driver()) {
-        error = "Driver not connected. Call driver_connect first.";
+        error = "Driver not connected. Call driver_load first.";
         return false;
     }
     if (driver_bridge::attached_pid() == pid)

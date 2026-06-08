@@ -62,7 +62,7 @@ static std::optional<tool_result_t> ensure_attached(const json& params)
     diag::log_tagged_fmt("dbg_tools", "ensure_attached: entry");
     if (!device->is_connected()) {
         diag::log_tagged_fmt("dbg_tools", "ensure_attached: driver not connected");
-        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
+        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_load first."));
     }
 
     std::uint32_t requested_pid = 0;
@@ -2340,6 +2340,8 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         OBFSTR("dbg_run_to_address"), OBFSTR("debugger"),
         OBFSTR("Run until execution reaches a specific address."),
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Target address (hex)"), true},
+         {OBFSTR("wait_for_completion"), OBFSTR("boolean"), OBFSTR("Wait until the address is reached before returning."), false},
+         {OBFSTR("timeout_ms"), OBFSTR("number"), OBFSTR("Maximum wait time in milliseconds when wait_for_completion is true."), false},
          {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         [](const json& params) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "dbg_run_to_address: entry");
@@ -2348,15 +2350,24 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 return tool_result_t::error(OBFSTR("'address' is required."));
             auto addr = sa_parse_address(params["address"].get<std::string>());
             if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
-            diag::log_tagged_fmt("dbg_tools", "dbg_run_to_address: running to 0x%llX", (unsigned long long)*addr);
             bool wait = false;
             if (params.contains("wait_for_completion") && params["wait_for_completion"].is_boolean())
                 wait = params["wait_for_completion"].get<bool>();
             else if (params.contains("wait") && params["wait"].is_boolean())
                 wait = params["wait"].get<bool>();
             uint32_t timeout_ms = static_cast<uint32_t>(int_param_clamped(params, "timeout_ms", 30000, 1, 300000));
+            diag::log_tagged_fmt("dbg_tools", "dbg_run_to_address: running to 0x%llX wait=%d timeout_ms=%u attached_pid=%u active_tid=%u",
+                (unsigned long long)*addr,
+                wait ? 1 : 0,
+                static_cast<unsigned>(timeout_ms),
+                static_cast<unsigned>(driver_bridge::attached_pid()),
+                static_cast<unsigned>(debugger_engine::g_state.active_tid));
             bool ok = debugger_engine::run_to_address(*addr, wait, timeout_ms);
-            diag::log_tagged_fmt("dbg_tools", "dbg_run_to_address: run_to_address returned ok=%d", (int)ok);
+            diag::log_tagged_fmt("dbg_tools", "dbg_run_to_address: run_to_address returned ok=%d attached_pid=%u active_tid=%u last_error=%s",
+                (int)ok,
+                static_cast<unsigned>(driver_bridge::attached_pid()),
+                static_cast<unsigned>(debugger_engine::g_state.active_tid),
+                debugger_engine::last_error().empty() ? "(empty)" : debugger_engine::last_error().c_str());
             if (!ok)
                 return tool_result_t::error(debugger_engine::last_error().empty() ? OBFSTR("run_to_address failed.") : debugger_engine::last_error());
             return tool_result_t::ok(OBFSTR("Running to ") + sa_format_address(*addr));

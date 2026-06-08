@@ -482,7 +482,7 @@ json cmd_detach(state_t& state) {
 
 json cmd_modules(const json& params, const state_t& state) {
 	uint32_t pid = requested_pid(params, state);
-	if (pid == 0) throw std::runtime_error("no active guest process; call guest_lab_attach first");
+	if (pid == 0) throw std::runtime_error("no active VM process; attach to a VM process first");
 	auto snap = make_handle(CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid));
 	if (!snap) throw std::runtime_error("CreateToolhelp32Snapshot(modules) failed: " + win_error(GetLastError()));
 	json arr = json::array();
@@ -503,7 +503,7 @@ json cmd_modules(const json& params, const state_t& state) {
 
 json cmd_threads(const json& params, const state_t& state) {
 	uint32_t pid = requested_pid(params, state);
-	if (pid == 0) throw std::runtime_error("no active guest process; call guest_lab_attach first");
+	if (pid == 0) throw std::runtime_error("no active VM process; attach to a VM process first");
 	auto snap = make_handle(CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0));
 	if (!snap) throw std::runtime_error("CreateToolhelp32Snapshot(threads) failed: " + win_error(GetLastError()));
 	json arr = json::array();
@@ -525,7 +525,7 @@ json cmd_threads(const json& params, const state_t& state) {
 
 json cmd_memory_map(const json& params, const state_t& state) {
 	uint32_t pid = requested_pid(params, state);
-	if (pid == 0) throw std::runtime_error("no active guest process; call guest_lab_attach first");
+	if (pid == 0) throw std::runtime_error("no active VM process; attach to a VM process first");
 	std::string err;
 	auto h = open_target_process(pid, PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, err);
 	if (!h) throw std::runtime_error(err);
@@ -552,7 +552,7 @@ json cmd_memory_map(const json& params, const state_t& state) {
 
 json cmd_query_memory(const json& params, const state_t& state) {
 	uint32_t pid = requested_pid(params, state);
-	if (pid == 0) throw std::runtime_error("no active guest process; call guest_lab_attach first");
+	if (pid == 0) throw std::runtime_error("no active VM process; attach to a VM process first");
 	if (!params.contains("address")) throw std::runtime_error("address is required");
 	uint64_t address = 0;
 	if (!parse_u64(params["address"], address)) throw std::runtime_error("invalid address");
@@ -568,7 +568,7 @@ json cmd_query_memory(const json& params, const state_t& state) {
 
 json cmd_read_memory(const json& params, const state_t& state) {
 	uint32_t pid = requested_pid(params, state);
-	if (pid == 0) throw std::runtime_error("no active guest process; call guest_lab_attach first");
+	if (pid == 0) throw std::runtime_error("no active VM process; attach to a VM process first");
 	if (!params.contains("address")) throw std::runtime_error("address is required");
 	uint64_t address = 0;
 	if (!parse_u64(params["address"], address)) throw std::runtime_error("invalid address");
@@ -583,7 +583,7 @@ json cmd_read_memory(const json& params, const state_t& state) {
 
 json cmd_read_string(const json& params, const state_t& state) {
 	uint32_t pid = requested_pid(params, state);
-	if (pid == 0) throw std::runtime_error("no active guest process; call guest_lab_attach first");
+	if (pid == 0) throw std::runtime_error("no active VM process; attach to a VM process first");
 	if (!params.contains("address")) throw std::runtime_error("address is required");
 	uint64_t address = 0;
 	if (!parse_u64(params["address"], address)) throw std::runtime_error("invalid address");
@@ -616,7 +616,7 @@ json cmd_read_string(const json& params, const state_t& state) {
 
 json cmd_dump_region(const json& params, const state_t& state) {
 	uint32_t pid = requested_pid(params, state);
-	if (pid == 0) throw std::runtime_error("no active guest process; call guest_lab_attach first");
+	if (pid == 0) throw std::runtime_error("no active VM process; attach to a VM process first");
 	if (!params.contains("address")) throw std::runtime_error("address is required");
 	uint64_t address = 0;
 	if (!parse_u64(params["address"], address)) throw std::runtime_error("invalid address");
@@ -654,7 +654,7 @@ json cmd_dump_region(const json& params, const state_t& state) {
 
 json cmd_search_memory(const json& params, const state_t& state) {
 	uint32_t pid = requested_pid(params, state);
-	if (pid == 0) throw std::runtime_error("no active guest process; call guest_lab_attach first");
+	if (pid == 0) throw std::runtime_error("no active VM process; attach to a VM process first");
 	std::string pattern_text = params.value("pattern", std::string());
 	std::vector<int> pattern;
 	std::string err;

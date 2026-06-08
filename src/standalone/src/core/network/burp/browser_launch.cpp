@@ -589,7 +589,7 @@ bool kill(uint32_t pid)
         return false;
     }
 
-    bool ok = camoufox::stop_bridge();
+    bool ok = camoufox::stop_bridge("browser_launch.stop");
     auto after = camoufox::get_status();
     {
         auto& st = s();
@@ -622,7 +622,7 @@ bool kill_all()
 
     bool ok = true;
     if (before.child_pid != 0 || before.state != camoufox::bridge_state_t::stopped || before.cleanup_pending)
-        ok = camoufox::stop_bridge();
+        ok = camoufox::stop_bridge("browser_launch.restart");
 
     auto& st = s();
     size_t cleared = 0;

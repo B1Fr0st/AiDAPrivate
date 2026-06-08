@@ -222,21 +222,39 @@ namespace voyager {
         }
         __forceinline void debug_ioctl_raw_log(const char* phase,
                                                std::uint32_t ioctl_code,
+                                               std::uint32_t effective_ioctl_code,
+                                               std::uint32_t decoded_offset,
+                                               std::uint32_t decoded_offset_valid,
                                                std::uint32_t buffer_size,
                                                DWORD bytes_returned,
                                                DWORD gle,
                                                HANDLE handle,
-                                               std::uint32_t pid) noexcept {
-            char buf[512];
+                                               std::uint32_t pid,
+                                               std::uint32_t req_pid,
+                                               std::uint32_t req_tid,
+                                               std::uint32_t server_seed_present,
+                                               std::uint32_t ioctl_seed_present,
+                                               std::uint32_t ioctl_seed_hash,
+                                               DWORD elapsed_ms) noexcept {
+            char buf[1024];
             _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                "[AIDA-IOCTL-RAW] %s ioctl=0x%08X size=%u bytes=%lu gle=%lu handle=0x%llX pid=%u\n",
+                "[AIDA-IOCTL-RAW] %s requested=0x%08X effective=0x%08X offset=%u offset_valid=%u size=%u bytes=%lu gle=%lu handle=0x%llX attached_pid=%u req_pid=%u req_tid=%u server_seed=%u ioctl_seed=%u ioctl_seed_hash=0x%08X elapsed_ms=%lu\n",
                 phase ? phase : "?",
                 ioctl_code,
+                effective_ioctl_code,
+                decoded_offset,
+                decoded_offset_valid,
                 buffer_size,
                 static_cast<unsigned long>(bytes_returned),
                 static_cast<unsigned long>(gle),
                 reinterpret_cast<unsigned long long>(handle),
-                pid);
+                pid,
+                req_pid,
+                req_tid,
+                server_seed_present,
+                ioctl_seed_present,
+                ioctl_seed_hash,
+                static_cast<unsigned long>(elapsed_ms));
             OutputDebugStringA(buf);
         }
         constexpr std::uint64_t HEARTBEAT_REFRESH_INTERVAL = 200000000ULL;
@@ -1817,15 +1835,44 @@ namespace voyager {
                             std::uint32_t buffer_size,
                             std::uint32_t& bytes_returned) const noexcept {
             bytes_returned = 0;
+            std::uint32_t req_pid = 0;
+            std::uint32_t req_tid = 0;
+            if (in_out_buffer != nullptr && buffer_size >= sizeof(std::uint32_t)) {
+                std::memcpy(&req_pid, in_out_buffer, sizeof(req_pid));
+            }
+            if (in_out_buffer != nullptr && buffer_size >= sizeof(std::uint32_t) * 2u) {
+                std::memcpy(&req_tid, static_cast<const std::uint8_t*>(in_out_buffer) + sizeof(std::uint32_t), sizeof(req_tid));
+            }
+            sync_dynamic_security_state();
+            std::uint32_t decoded_offset = 0;
+            const bool decoded_offset_valid = decode_ioctl_offset_snapshot(static_cast<DWORD>(ioctl_code), decoded_offset);
+            const DWORD effective_ioctl_code = decoded_offset_valid
+                ? make_ioctl_snapshot(decoded_offset)
+                : static_cast<DWORD>(ioctl_code);
             if (!is_connected() || in_out_buffer == nullptr || buffer_size == 0) {
-                detail::debug_ioctl_raw_log("REJECT", ioctl_code, buffer_size, 0, GetLastError(), driver_handle_, process_id_);
+                detail::debug_ioctl_raw_log("REJECT",
+                    ioctl_code,
+                    effective_ioctl_code,
+                    decoded_offset,
+                    decoded_offset_valid ? 1u : 0u,
+                    buffer_size,
+                    0,
+                    GetLastError(),
+                    driver_handle_,
+                    process_id_,
+                    req_pid,
+                    req_tid,
+                    server_seed_ != 0 ? 1u : 0u,
+                    server_ioctl_seed_ != 0 ? 1u : 0u,
+                    server_ioctl_seed_ != 0 ? hash_build_key(server_ioctl_seed_) : 0u,
+                    0);
                 return false;
             }
             DWORD br = 0;
             const DWORD start_tick = GetTickCount();
             BOOL ok = DeviceIoControl(
                 driver_handle_,
-                static_cast<DWORD>(ioctl_code),
+                effective_ioctl_code,
                 in_out_buffer,
                 static_cast<DWORD>(buffer_size),
                 in_out_buffer,
@@ -1838,7 +1885,21 @@ namespace voyager {
             DWORD elapsed = GetTickCount() - start_tick;
             if (!ok || br == 0 || elapsed > 250) {
                 detail::debug_ioctl_raw_log(ok ? "OK_SUSPICIOUS" : "FAILED",
-                    ioctl_code, buffer_size, br, gle, driver_handle_, process_id_);
+                    ioctl_code,
+                    effective_ioctl_code,
+                    decoded_offset,
+                    decoded_offset_valid ? 1u : 0u,
+                    buffer_size,
+                    br,
+                    gle,
+                    driver_handle_,
+                    process_id_,
+                    req_pid,
+                    req_tid,
+                    server_seed_ != 0 ? 1u : 0u,
+                    server_ioctl_seed_ != 0 ? 1u : 0u,
+                    server_ioctl_seed_ != 0 ? hash_build_key(server_ioctl_seed_) : 0u,
+                    elapsed);
             }
             return ok != FALSE;
         }

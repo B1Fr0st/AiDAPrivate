@@ -5,7 +5,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace guest_lab {
+namespace vm_guest_bridge {
 
 struct active_session_t {
 	bool active = false;

@@ -59,6 +59,7 @@
 #include "../core/testlab/test_lab_view.hpp"
 #include "../core/testlab/test_all_features.hpp"
 #include "../core/testlab/test_all_ui.h"
+#include "../core/network/burp/camoufox_bridge.hpp"
 #include "ui_anim.hpp"
 #include "agent_picker_view.hpp"
 #include "mcp_marketplace_view.hpp"
@@ -72,7 +73,6 @@
 #include <mutex>
 #include <shared_mutex>
 
-static ID3D11ShaderResourceView* g_send_icon_srv    = nullptr;
 static ID3D11ShaderResourceView* g_loader_icon_srv  = nullptr;
 static int                        g_loader_icon_w    = 0;
 static int                        g_loader_icon_h    = 0;
@@ -116,6 +116,70 @@ namespace {
 			}
 		}
 		g_settings_cv.notify_one();
+	}
+
+	const char* center_view_name(center_view_t view)
+	{
+		switch (view) {
+			case center_view_t::code_editor: return "code_editor";
+			case center_view_t::disassembly: return "disassembly";
+			case center_view_t::hex_view: return "hex_view";
+			case center_view_t::welcome: return "welcome";
+			case center_view_t::settings_view: return "settings_view";
+			case center_view_t::network_view: return "network_view";
+			case center_view_t::memory_scanner: return "memory_scanner";
+			case center_view_t::debugger_view: return "debugger_view";
+			case center_view_t::pseudocode: return "pseudocode";
+			case center_view_t::struct_recon: return "struct_recon";
+			case center_view_t::crypto_scanner: return "crypto_scanner";
+			case center_view_t::aob_generator: return "aob_generator";
+			case center_view_t::fuzzer_view: return "fuzzer_view";
+			case center_view_t::xref_browser: return "xref_browser";
+			case center_view_t::snapshot_diff: return "snapshot_diff";
+			case center_view_t::pointer_scanner: return "pointer_scanner";
+			case center_view_t::decrypt_oracle: return "decrypt_oracle";
+			case center_view_t::integrity_hunter: return "integrity_hunter";
+			case center_view_t::symbolic_view: return "symbolic_view";
+			case center_view_t::taint_view: return "taint_view";
+			case center_view_t::deobfuscation_view: return "deobfuscation_view";
+			case center_view_t::stealth_view: return "stealth_view";
+			case center_view_t::scan_hub: return "scan_hub";
+			case center_view_t::types_hub: return "types_hub";
+			case center_view_t::analysis_hub: return "analysis_hub";
+			case center_view_t::binary_map: return "binary_map";
+			case center_view_t::graph_view: return "graph_view";
+			case center_view_t::image_view: return "image_view";
+			case center_view_t::test_lab: return "test_lab";
+		}
+		return "unknown";
+	}
+
+	void mark_center_render_section(const char* section, center_view_t view, bool overlay_blocking, float vw, float vh)
+	{
+		g_render_section = section;
+		static std::atomic<unsigned long long> s_last_log_ms{0};
+		static std::atomic<int> s_last_view{-1000000};
+		static std::atomic<int> s_last_full_test{-1};
+		const unsigned long long now = GetTickCount64();
+		const int view_raw = static_cast<int>(view);
+		const bool full_test = test_all_features::is_running();
+		const bool view_changed = s_last_view.exchange(view_raw, std::memory_order_acq_rel) != view_raw;
+		const bool full_changed = s_last_full_test.exchange(full_test ? 1 : 0, std::memory_order_acq_rel) != (full_test ? 1 : 0);
+		unsigned long long last = s_last_log_ms.load(std::memory_order_acquire);
+		const bool due = view_changed || full_changed || now - last >= 1000ULL;
+		if (due && s_last_log_ms.compare_exchange_strong(last, now, std::memory_order_acq_rel)) {
+			diag::log_tagged_critical_fmt("render_center",
+				"section=%s view=%s view_id=%d overlay=%d full_test=%d frame=%d vw=%.1f vh=%.1f tid=%lu",
+				section ? section : "<null>",
+				center_view_name(view),
+				view_raw,
+				overlay_blocking ? 1 : 0,
+				full_test ? 1 : 0,
+				ImGui::GetFrameCount(),
+				vw,
+				vh,
+				static_cast<unsigned long>(GetCurrentThreadId()));
+		}
 	}
 }
 
@@ -2958,6 +3022,12 @@ void helpers::render_title()
 				close_b.y,
 				ui_input_gate::chrome_input_blocked() ? 1 : 0);
 			file_tabs::write_hot_exit_snapshot_all();
+			try {
+				test_all_features::cancel_tests();
+				aida::burp::camoufox::force_cleanup("chrome.close_button");
+			} catch (...) {
+				diag::log_tagged_critical("chrome", "close_button_camoufox_cleanup_exception");
+			}
 			diag::log_tagged_critical("chrome", "close_button_destroy_window_pre");
 			DestroyWindow(g_hwnd);
 			diag::log_tagged_critical("chrome", "close_button_post_quit_pre");
@@ -3723,6 +3793,12 @@ void helpers::render_title()
 								cursor.x,
 								cursor.y);
 							file_tabs::write_hot_exit_snapshot_all();
+							try {
+								test_all_features::cancel_tests();
+								aida::burp::camoufox::force_cleanup("chrome.file_menu_exit");
+							} catch (...) {
+								diag::log_tagged_critical("chrome", "file_menu_exit_camoufox_cleanup_exception");
+							}
 							diag::log_tagged_critical("chrome", "file_menu_exit_destroy_window_pre");
 							DestroyWindow(g_hwnd);
 							diag::log_tagged_critical("chrome", "file_menu_exit_post_quit_pre");
@@ -6147,8 +6223,9 @@ void helpers::render_title()
 	{
 
 
-	g_render_section = "center_view_dispatch";
+	mark_center_render_section("center_pump_ui_thread_jobs", globals::ui::active_center_view, false, 0.f, 0.f);
 	test_all_features::pump_ui_thread_jobs();
+	g_render_section = "center_resolve_view";
 	auto cv = globals::ui::active_center_view;
 
 	bool overlay_blocking = loading_binary_overlay::is_blocking_views();
@@ -6167,48 +6244,80 @@ void helpers::render_title()
 
 	float vw = center_w - di_pad * 2.f;
 	float vh = disasm_child_h - di_pad * 2.f - session_tabs_h;
+	const unsigned long long center_dispatch_start_ms = GetTickCount64();
+	auto log_center_dispatch_exit = [&](const char* section) {
+		const unsigned long long now_ms = GetTickCount64();
+		const unsigned long long elapsed_ms = now_ms >= center_dispatch_start_ms ? now_ms - center_dispatch_start_ms : 0ULL;
+		if (elapsed_ms >= 250ULL) {
+			diag::log_tagged_critical_fmt("render_center",
+				"slow_exit section=%s view=%s view_id=%d elapsed_ms=%llu overlay=%d full_test=%d frame=%d",
+				section ? section : "<null>",
+				center_view_name(cv),
+				static_cast<int>(cv),
+				elapsed_ms,
+				overlay_blocking ? 1 : 0,
+				test_all_features::is_running() ? 1 : 0,
+				ImGui::GetFrameCount());
+		}
+	};
 
 	if (cv == center_view_t::code_editor && code_editor::active && !code_editor::buffer.empty())
 	{
+		mark_center_render_section("center_view_code_editor", cv, overlay_blocking, vw, vh);
 		ImGui::SetCursorPos(ImVec2(0.f, 0.f));
 		code_editor_widget::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
+		log_center_dispatch_exit("center_view_code_editor");
 	}
 
 
 	else if (cv == center_view_t::hex_view && hex_view::g_state.active)
 	{
+		mark_center_render_section("center_view_hex_view", cv, overlay_blocking, vw, vh);
 		hex_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
+		log_center_dispatch_exit("center_view_hex_view");
 	}
 
 	else if (cv == center_view_t::image_view && image_view::g_state().active.load(std::memory_order_acquire))
 	{
+		mark_center_render_section("center_view_image_view", cv, overlay_blocking, vw, vh);
 		image_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
+		log_center_dispatch_exit("center_view_image_view");
 	}
 
 	else if (cv == center_view_t::disassembly && g_disasm.file.loaded && (g_disasm.live_mode || g_disasm.file.decoding || !g_disasm.file.instrs.empty()))
 	{
+		mark_center_render_section("center_view_disassembly", cv, overlay_blocking, vw, vh);
 		disasm_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3, g_disasm, dt);
+		log_center_dispatch_exit("center_view_disassembly");
 	}
 
 	else if (cv == center_view_t::graph_view)
 	{
+		mark_center_render_section("center_view_graph_view", cv, overlay_blocking, vw, vh);
 		ImVec2 wp = ImGui::GetWindowPos();
 		cfg_view::render(wp.x, wp.y, vw, vh, a, ax3, ay3, az3);
+		log_center_dispatch_exit("center_view_graph_view");
 	}
 
 	else if (cv == center_view_t::network_view)
 	{
+		mark_center_render_section("center_view_network_view", cv, overlay_blocking, vw, vh);
 		network_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
+		log_center_dispatch_exit("center_view_network_view");
 	}
 
 	else if (cv == center_view_t::debugger_view)
 	{
+		mark_center_render_section("center_view_debugger_view", cv, overlay_blocking, vw, vh);
 		debugger_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
+		log_center_dispatch_exit("center_view_debugger_view");
 	}
 
 	else if (cv == center_view_t::pseudocode)
 	{
+		mark_center_render_section("center_view_pseudocode", cv, overlay_blocking, vw, vh);
 		pseudocode_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
+		log_center_dispatch_exit("center_view_pseudocode");
 	}
 
 	else if (cv == center_view_t::scan_hub || cv == center_view_t::memory_scanner
@@ -6217,35 +6326,46 @@ void helpers::render_title()
 		|| cv == center_view_t::pointer_scanner || cv == center_view_t::decrypt_oracle
 		|| cv == center_view_t::integrity_hunter)
 	{
+		mark_center_render_section("center_view_scan_hub", cv, overlay_blocking, vw, vh);
 		scan_hub_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
+		log_center_dispatch_exit("center_view_scan_hub");
 	}
 
 	else if (cv == center_view_t::types_hub || cv == center_view_t::struct_recon)
 	{
+		mark_center_render_section("center_view_types_hub", cv, overlay_blocking, vw, vh);
 		types_hub_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
+		log_center_dispatch_exit("center_view_types_hub");
 	}
 
 	else if (cv == center_view_t::analysis_hub || cv == center_view_t::symbolic_view
 		|| cv == center_view_t::taint_view || cv == center_view_t::deobfuscation_view
 		|| cv == center_view_t::stealth_view || cv == center_view_t::fuzzer_view)
 	{
+		mark_center_render_section("center_view_analysis_hub", cv, overlay_blocking, vw, vh);
 		analysis_hub_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
+		log_center_dispatch_exit("center_view_analysis_hub");
 	}
 
 	else if (cv == center_view_t::binary_map)
 	{
+		mark_center_render_section("center_view_binary_map", cv, overlay_blocking, vw, vh);
 		aida::binary_map_view::render(0, 0, vw, vh, a, ax3, ay3, az3);
+		log_center_dispatch_exit("center_view_binary_map");
 	}
 
 	else if (cv == center_view_t::test_lab)
 	{
+		mark_center_render_section("center_view_test_lab", cv, overlay_blocking, vw, vh);
 		static float s_test_lab_anim_time = 0.f;
 		s_test_lab_anim_time += ImGui::GetIO().DeltaTime;
 		test_lab_view::render(vw, vh, s_test_lab_anim_time);
+		log_center_dispatch_exit("center_view_test_lab");
 	}
 
 	else
 	{
+		mark_center_render_section("center_view_empty_state", cv, overlay_blocking, vw, vh);
 
 		ImDrawList* cdl  = ImGui::GetWindowDrawList();
 		ImVec2      orig = ImGui::GetWindowPos();
@@ -6259,6 +6379,7 @@ void helpers::render_title()
 			cdl->AddText(ImVec2(orig.x + vw*0.5f - ht2.x*0.5f, orig.y + window_h * 0.5f - ht2.y*0.5f),
 				aida::ui::with_alpha(th_lp.text_dim, 0.7f*a), hint);
 		}
+		log_center_dispatch_exit("center_view_empty_state");
 	}
 
 	}
@@ -6409,7 +6530,10 @@ void helpers::render_title()
 
 	g_render_section = "right_panel";
 	if (right_w > 1.f) {
+	const unsigned long long right_panel_start_ms = GetTickCount64();
+	g_render_section = "right_panel_begin_child";
 	begin_child("##chat", ImVec2(pad + left_gap + center_w + gap, content_top), ImVec2(right_w, right_total_h), a);
+	g_render_section = "right_panel_layout";
 
 
 	static float s_settings_slide = 0.f;
@@ -6423,6 +6547,7 @@ void helpers::render_title()
 
 
 	{
+		g_render_section = "right_panel_metrics";
 		float ax = globals::ui::accent.x * 255.f;
 		float ay = globals::ui::accent.y * 255.f;
 		float az = globals::ui::accent.z * 255.f;
@@ -6459,6 +6584,7 @@ void helpers::render_title()
 
 
 		{
+			g_render_section = "right_panel_header";
 			const auto& th_ch = aida::ui::resolved();
 			ImDrawList* hdr_dl = ImGui::GetWindowDrawList();
 			ImVec2 wpos_ch = ImGui::GetWindowPos();
@@ -6571,6 +6697,7 @@ void helpers::render_title()
 		}
 
 
+		g_render_section = conversations::browser_open ? "right_panel_history" : "right_panel_messages";
 		if (conversations::browser_open) {
 			static float history_appear = 0.f;
 			static float history_appear_v = 0.f;
@@ -6771,6 +6898,7 @@ void helpers::render_title()
 			ImGui::PopStyleVar();
 		} else {
 
+		g_render_section = "right_panel_messages_begin";
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
 		ImGui::BeginChild("##chat_msgs", ImVec2(cw, msg_area_h), false,
 			ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar);
@@ -6783,8 +6911,10 @@ void helpers::render_title()
 
 		float cursor_y = 6.f;
 
+		g_render_section = "right_panel_messages_loop";
 		for (int mi = 0; mi < (int)g_chat_messages.size(); mi++)
 		{
+			g_render_section = "right_panel_message_dispatch";
 			auto& msg = g_chat_messages[mi];
 
 
@@ -7261,6 +7391,7 @@ void helpers::render_title()
 					float by = cursor_y;
 
 
+					g_render_section = "right_panel_message_parse";
 					auto spans = chat_render::parse_markdown(msg.text);
 					bool has_code_blocks = false;
 					for (auto& sp : spans)
@@ -7287,10 +7418,12 @@ void helpers::render_title()
 					ImVec2 bmin = ImVec2(wp2.x + bx, wp2.y + by);
 
 
+					g_render_section = "right_panel_message_render";
 					auto rr = chat_render::render_rich_message(
 						dl, bmin, bw, msg.text,
 						falpha * a, ax, ay, az,
 						mi, ImGui::GetIO().DeltaTime, !msg.streaming);
+					g_render_section = "right_panel_messages_loop";
 
 					float real_h = std::max(rr.height, ImGui::GetFontSize() + 10.f);
 
@@ -7379,6 +7512,7 @@ void helpers::render_title()
 
 		ImGui::EndChild();
 		ImGui::PopStyleVar();
+		g_render_section = "right_panel_messages_post";
 
 		{
 			float fade_h  = 22.f;
@@ -7416,6 +7550,7 @@ void helpers::render_title()
 		ImDrawList* dl = ImGui::GetWindowDrawList();
 
 		{
+			g_render_section = "right_panel_separator";
 			ImVec2 wp3  = ImGui::GetWindowPos();
 			float  sy   = wp3.y + chat_sep_y;
 			float  lx0  = wp3.x - 6.f;
@@ -7449,11 +7584,7 @@ void helpers::render_title()
 		}
 
 		{
-			if (!g_send_icon_srv)
-			{
-				int _w = 0, _h = 0;
-				icon_loader::load(send_icon, sizeof(send_icon), &g_send_icon_srv, &_w, &_h, true);
-			}
+			g_render_section = "right_panel_input";
 
 			float btn_sz = frame_h;
 			float igap   = 4.f;
@@ -7466,12 +7597,16 @@ void helpers::render_title()
 			ImVec2 chat_wp = ImGui::GetWindowPos();
 
 			{
+				g_render_section = "right_panel_model_pill_width";
 				float w_model = chat_model_pill_width();
+				g_render_section = "right_panel_model_pill_render";
 				chat_render_model_pill(chat_wp.x + pill_cursor_x, chat_wp.y + pill_strip_y, a);
 				pill_cursor_x += w_model + pill_strip_gap;
 			}
 			{
+				g_render_section = "right_panel_agent_pill_width";
 				float w_agent = chat_agent_pill_width();
+				g_render_section = "right_panel_agent_pill_render";
 				chat_render_agent_pill(chat_wp.x + pill_cursor_x, chat_wp.y + pill_strip_y, a);
 				pill_cursor_x += w_agent + pill_strip_gap;
 			}
@@ -7502,7 +7637,9 @@ void helpers::render_title()
 				return 0;
 			};
 
+			g_render_section = "right_panel_ai_busy";
 			bool ai_busy = is_ai_busy();
+			g_render_section = "right_panel_stop_transition";
 			static aida::ui::transition_t stop_slide;
 			static bool stop_shown_prev = false;
 			if (ai_busy && !stop_shown_prev) { stop_slide.start(0.180f, aida::motion::ease::out_back); stop_shown_prev = true; }
@@ -7515,6 +7652,7 @@ void helpers::render_title()
 			float input_w = cw - btn_sz - igap - stop_reserved;
 			ImGui::SetNextItemAllowOverlap();
 			ImGui::SetNextItemWidth(input_w);
+			g_render_section = "right_panel_input_text";
 			ImGui::InputTextMultiline("##chatinput", g_chat_buf, sizeof(g_chat_buf),
 				ImVec2(input_w, input_h),
 				ImGuiInputTextFlags_CallbackAlways | ImGuiInputTextFlags_CtrlEnterForNewLine | ImGuiInputTextFlags_NoHorizontalScroll,
@@ -7530,6 +7668,7 @@ void helpers::render_title()
 			ImGui::PopStyleVar(2);
 			ImGui::PopStyleColor(3);
 
+			g_render_section = "right_panel_agent_picker_bridge";
 			aida::agent_picker::notify_chat_buffer_changed(g_chat_buf);
 			aida::agent_picker::apply_pending_inject_to_buffer(g_chat_buf, sizeof(g_chat_buf));
 
@@ -7546,6 +7685,7 @@ void helpers::render_title()
 			float btn_y = input_y + input_h - btn_sz;
 			float send_x = cw - btn_sz;
 
+			g_render_section = "right_panel_send_button";
 			ImGui::SetCursorPos(ImVec2(send_x, btn_y));
 			ImVec2 btn_min = ImGui::GetCursorScreenPos();
 			ImVec2 btn_max = ImVec2(btn_min.x + btn_sz, btn_min.y + btn_sz);
@@ -7578,16 +7718,16 @@ void helpers::render_title()
 					aida::ui::with_alpha(IM_COL32(255,255,255,255), sf_v * 0.25f), 8.f);
 			}
 
-			if (g_send_icon_srv)
-			{
-				float icon_sz = btn_sz * 0.50f;
-				float ix = btn_ctr.x - icon_sz * 0.5f;
-				float iy = btn_ctr.y - icon_sz * 0.5f;
-				dl->AddImage((ImTextureID)g_send_icon_srv,
-					ImVec2(ix, iy), ImVec2(ix + icon_sz, iy + icon_sz),
-					ImVec2(0, 0), ImVec2(1, 1),
-					aida::ui::with_alpha(IM_COL32(255, 255, 255, 245), a));
-			}
+			const float icon_sz = btn_sz * 0.48f;
+			const ImU32 icon_col = aida::ui::with_alpha(IM_COL32(255, 255, 255, 245), a);
+			const ImU32 icon_line_col = aida::ui::with_alpha(IM_COL32(255, 255, 255, 155), a);
+			ImVec2 tip(btn_ctr.x + icon_sz * 0.48f, btn_ctr.y - icon_sz * 0.02f);
+			ImVec2 tail_top(btn_ctr.x - icon_sz * 0.42f, btn_ctr.y - icon_sz * 0.34f);
+			ImVec2 tail_bottom(btn_ctr.x - icon_sz * 0.24f, btn_ctr.y + icon_sz * 0.40f);
+			ImVec2 notch(btn_ctr.x - icon_sz * 0.06f, btn_ctr.y + icon_sz * 0.08f);
+			dl->AddTriangleFilled(tail_top, tip, tail_bottom, icon_col);
+			dl->AddLine(tail_top, notch, icon_line_col, 1.4f);
+			dl->AddLine(notch, tail_bottom, icon_line_col, 1.4f);
 
 			if (stop_e > 0.005f) {
 				float stop_x = send_x - stop_w - 6.f;
@@ -7754,6 +7894,7 @@ void helpers::render_title()
 
 
 	if (settings_visible) {
+		g_render_section = "right_panel_settings";
 		ImVec2 parent_sz = ImGui::GetWindowSize();
 		ImVec2 parent_pos_screen = ImGui::GetWindowPos();
 		float offset_x = (1.f - s_settings_slide) * parent_sz.x;
@@ -7785,7 +7926,21 @@ void helpers::render_title()
 		ImGui::EndChild();
 	}
 
+	g_render_section = "right_panel_end_child";
 	end_child();
+	const unsigned long long right_panel_end_ms = GetTickCount64();
+	const unsigned long long right_panel_elapsed_ms = right_panel_end_ms >= right_panel_start_ms ? right_panel_end_ms - right_panel_start_ms : 0ULL;
+	if (right_panel_elapsed_ms >= 250ULL) {
+		diag::log_tagged_critical_fmt("render_right",
+			"slow_exit elapsed_ms=%llu messages=%zu history=%zu browser_open=%d settings=%d frame=%d tid=%lu",
+			right_panel_elapsed_ms,
+			g_chat_messages.size(),
+			conversations::history.size(),
+			conversations::browser_open ? 1 : 0,
+			settings_visible ? 1 : 0,
+			ImGui::GetFrameCount(),
+			static_cast<unsigned long>(GetCurrentThreadId()));
+	}
 	}
 
 	g_render_section = "bottom_panel";

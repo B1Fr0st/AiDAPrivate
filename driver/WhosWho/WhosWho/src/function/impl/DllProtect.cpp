@@ -15,6 +15,9 @@ namespace dll_protection {
     static constexpr UINT32 BASELINE_PREFIX_MAX = 64;
     static constexpr UINT32 DPRT_POLICY_HARD_BUGCHECK = 0x00000001u;
     static constexpr UINT32 DPRT_MISMATCH_UNKNOWN = 0xFFFFFFFFu;
+    static constexpr UINT32 DPRT_HARD_BUGCHECK_MIN_MISMATCHES = 3;
+    static constexpr UINT32 DPRT_HARD_BUGCHECK_ARM_DELAY_MS = 15000;
+    static constexpr UINT32 DPRT_HARD_BUGCHECK_MIN_SPAN_MS = 4000;
     static constexpr UINT64 DTB_ADDRESS_MASK = 0x000FFFFFFFFFF000ULL;
     static constexpr UINT64 DTB_MAX_PFN = 0x1000000ULL;
     static constexpr UINT32 EPROCESS_DIRECTORY_TABLE_BASE_OFFSET = 0x28;
@@ -34,6 +37,12 @@ namespace dll_protection {
         UINT32 baseline_prefix_size;
         UINT32 policy_flags;
         UINT32 owner_pid;
+        UINT64 register_interrupt_time;
+        UINT64 first_mismatch_interrupt_time;
+        UINT64 last_mismatch_interrupt_time;
+        UINT64 first_mismatch_hash;
+        UINT32 first_mismatch_offset;
+        UINT32 mismatch_count;
         UINT8 baseline_prefix[BASELINE_PREFIX_MAX];
     };
 
@@ -190,6 +199,22 @@ namespace dll_protection {
         return (slot.policy_flags & DPRT_POLICY_HARD_BUGCHECK) != 0;
     }
 
+    static UINT64 interrupt_elapsed_ms(UINT64 now, UINT64 then)
+    {
+        if (then == 0 || now < then)
+            return 0;
+        return (now - then) / 10000ULL;
+    }
+
+    static void clear_mismatch_tracking(protection_entry_t& slot)
+    {
+        slot.first_mismatch_interrupt_time = 0;
+        slot.last_mismatch_interrupt_time = 0;
+        slot.first_mismatch_hash = 0;
+        slot.first_mismatch_offset = DPRT_MISMATCH_UNKNOWN;
+        slot.mismatch_count = 0;
+    }
+
     static const char* slot_policy_name(const protection_entry_t& slot)
     {
         return slot_hard_bugcheck_enabled(slot) ? "module_hard_bugcheck" : "diagnostic_fail_closed";
@@ -310,6 +335,8 @@ namespace dll_protection {
         slot.baseline_prefix_size = 0;
         slot.policy_flags = 0;
         slot.owner_pid = 0;
+        slot.register_interrupt_time = 0;
+        clear_mismatch_tracking(slot);
         RtlZeroMemory(slot.baseline_prefix, sizeof(slot.baseline_prefix));
     }
 
@@ -417,9 +444,11 @@ namespace dll_protection {
         LARGE_INTEGER system_time;
         KeQuerySystemTime(&system_time);
         UINT64 interrupt_time = KeQueryInterruptTime();
+        UINT64 slot_age_ms = interrupt_elapsed_ms(interrupt_time, slot.register_interrupt_time);
+        UINT64 mismatch_span_ms = interrupt_elapsed_ms(interrupt_time, slot.first_mismatch_interrupt_time);
         KPROCESSOR_MODE previous_mode = ExGetPreviousMode();
         const char* policy = policy_override ? policy_override : slot_policy_name(slot);
-        WW_LOG("[DLL-PROTECT] %s idx=%d pid=%u owner_pid=%u image=%.15s prev_active=%ld active=%ld prev_status=%u status=%u policy=%s module=0x%llX text=0x%llX size=0x%X expected=0x%llX current=0x%llX observed=0x%llX mismatch=0x%X prefix=%u interval=%u checks=%llu last_tsc=%llu system_time=%lld interrupt_time=%llu dtb=0x%llX irql=%lu mode=%u current_pid=0x%llX tid=0x%llX slots=%u running=%ld queued=%ld work=%ld",
+        WW_LOG("[DLL-PROTECT] %s idx=%d pid=%u owner_pid=%u image=%.15s prev_active=%ld active=%ld prev_status=%u status=%u policy=%s module=0x%llX text=0x%llX size=0x%X expected=0x%llX current=0x%llX observed=0x%llX mismatch=0x%X prefix=%u interval=%u checks=%llu last_tsc=%llu system_time=%lld interrupt_time=%llu age_ms=%llu mismatch_count=%u mismatch_span_ms=%llu first_mismatch=0x%llX first_mismatch_offset=0x%X dtb=0x%llX irql=%lu mode=%u current_pid=0x%llX tid=0x%llX slots=%u running=%ld queued=%ld work=%ld",
             tag ? tag : "slot",
             idx,
             slot.pid,
@@ -443,6 +472,11 @@ namespace dll_protection {
             slot.last_check_tsc,
             system_time.QuadPart,
             interrupt_time,
+            slot_age_ms,
+            slot.mismatch_count,
+            mismatch_span_ms,
+            slot.first_mismatch_hash,
+            slot.first_mismatch_offset,
             cached_dtb_for_pid(slot.pid),
             KeGetCurrentIrql(),
             (UINT32)previous_mode,
@@ -1066,24 +1100,61 @@ namespace dll_protection {
                 UINT32 previous_status = slot.status;
                 UINT32 mismatch_offset = first_mismatch_offset(slot);
                 slot.status = DPRT_STATUS_TAMPERED;
-                _InterlockedExchange(&slot.active, 0);
 
                 memory_snapshot_t snap = query_memory_snapshot(slot.pid, slot.text_va);
                 if (slot_hard_bugcheck_enabled(slot)) {
+                    UINT64 now_interrupt = KeQueryInterruptTime();
+                    if (slot.mismatch_count == 0) {
+                        slot.first_mismatch_interrupt_time = now_interrupt;
+                        slot.first_mismatch_hash = hash;
+                        slot.first_mismatch_offset = mismatch_offset;
+                        slot.mismatch_count = 1;
+                    } else if (slot.mismatch_count < 0xFFFFFFFFu) {
+                        ++slot.mismatch_count;
+                    }
+                    slot.last_mismatch_interrupt_time = now_interrupt;
+                    UINT64 slot_age_ms = interrupt_elapsed_ms(now_interrupt, slot.register_interrupt_time);
+                    UINT64 mismatch_span_ms = interrupt_elapsed_ms(now_interrupt, slot.first_mismatch_interrupt_time);
+                    BOOLEAN confirmed = slot.mismatch_count >= DPRT_HARD_BUGCHECK_MIN_MISMATCHES &&
+                        slot_age_ms >= DPRT_HARD_BUGCHECK_ARM_DELAY_MS &&
+                        mismatch_span_ms >= DPRT_HARD_BUGCHECK_MIN_SPAN_MS;
+                    publish_text_integrity_evidence(slot);
+                    if (!confirmed) {
+                        log_slot_state("timer_hash_mismatch_deferred", i, slot, hash, &snap,
+                            mismatch_offset, "hash_mismatch_hard_bugcheck_deferred",
+                            previous_active, previous_status);
+                        WW_LOG("[DLL-PROTECT] no_bugcheck policy=hash_mismatch_deferred pid=%u module=0x%llX text=0x%llX expected=0x%llX actual=0x%llX mismatch=0x%X count=%u required=%u age_ms=%llu arm_delay_ms=%u span_ms=%llu required_span_ms=%u evidence=dllprotect_status_log",
+                            slot.pid,
+                            slot.module_base,
+                            slot.text_va,
+                            slot.expected_hash,
+                            hash,
+                            mismatch_offset,
+                            slot.mismatch_count,
+                            DPRT_HARD_BUGCHECK_MIN_MISMATCHES,
+                            slot_age_ms,
+                            DPRT_HARD_BUGCHECK_ARM_DELAY_MS,
+                            mismatch_span_ms,
+                            DPRT_HARD_BUGCHECK_MIN_SPAN_MS);
+                        continue;
+                    }
+                    _InterlockedExchange(&slot.active, 0);
                     if (!lock_slot_owner_for_hard_bugcheck(slot)) {
                         disarm_stale_slot(i, slot);
                         continue;
                     }
-                    publish_text_integrity_evidence(slot);
                     log_slot_state("timer_hash_mismatch_bugcheck", i, slot, hash, &snap,
                         mismatch_offset, "hash_mismatch_hard_bugcheck",
                         previous_active, previous_status);
-                    WW_LOG("[DLL-PROTECT] bugcheck policy=hash_mismatch code=0xDEAD0ADA pid=%u text=0x%llX expected=0x%llX actual=0x%llX mismatch=0x%X p3=0x%llX p4=0x%llX",
+                    WW_LOG("[DLL-PROTECT] bugcheck policy=hash_mismatch code=0xDEAD0ADA pid=%u text=0x%llX expected=0x%llX actual=0x%llX mismatch=0x%X count=%u age_ms=%llu span_ms=%llu p3=0x%llX p4=0x%llX",
                         slot.pid,
                         slot.text_va,
                         slot.expected_hash,
                         hash,
                         mismatch_offset,
+                        slot.mismatch_count,
+                        slot_age_ms,
+                        mismatch_span_ms,
                         (slot.expected_hash >> 32),
                         (hash >> 32));
                     KeBugCheckEx(0xDEAD0ADAu, (ULONG_PTR)slot.pid,
@@ -1093,6 +1164,7 @@ namespace dll_protection {
                     return;
                 }
 
+                _InterlockedExchange(&slot.active, 0);
                 log_slot_state("timer_hash_mismatch_fail_closed", i, slot, hash, &snap,
                     mismatch_offset, "hash_mismatch_diagnostic_fail_closed",
                     previous_active, previous_status);
@@ -1106,6 +1178,10 @@ namespace dll_protection {
                 continue;
             }
 
+            if (slot.mismatch_count != 0) {
+                log_slot_state("timer_hash_recovered", i, slot, hash, nullptr);
+                clear_mismatch_tracking(slot);
+            }
             slot.status = DPRT_STATUS_ACTIVE;
             if (slot.check_count <= 2 || (slot.check_count & 0x3FULL) == 0)
                 log_slot_state("timer_hash_ok", i, slot, hash, nullptr);
@@ -1316,6 +1392,8 @@ NTSTATUS functions::handle_dll_protect(p_dll_protect request) {
             preview.check_interval_ms = interval;
             preview.last_check_tsc = __rdtsc();
             preview.owner_pid = dll_protection::current_owner_pid();
+            preview.register_interrupt_time = KeQueryInterruptTime();
+            preview.first_mismatch_offset = dll_protection::DPRT_MISMATCH_UNKNOWN;
             if (preview.owner_pid == 0) {
                 WW_LOG("[DLL-PROTECT] register_reject no_owner pid=%u module=0x%llX text=0x%llX size=0x%X validation_enabled=%ld",
                     request->pid,
@@ -1378,6 +1456,8 @@ NTSTATUS functions::handle_dll_protect(p_dll_protect request) {
             slot.check_count = 0;
             slot.policy_flags = (request->module_base != 0) ? dll_protection::DPRT_POLICY_HARD_BUGCHECK : 0;
             slot.owner_pid = preview.owner_pid;
+            slot.register_interrupt_time = preview.register_interrupt_time;
+            dll_protection::clear_mismatch_tracking(slot);
             dll_protection::capture_baseline_prefix(slot);
 
             _InterlockedExchange(&slot.active, 1);

@@ -76,6 +76,26 @@ static std::uint64_t mcp_log_hash(const std::string& text)
     return h;
 }
 
+static std::wstring utf8_to_wide_string(const std::string& text)
+{
+    if (text.empty())
+        return {};
+    const int wlen = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), nullptr, 0);
+    if (wlen <= 0)
+        return {};
+    std::wstring out(static_cast<size_t>(wlen), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), out.data(), wlen);
+    return out;
+}
+
+static bool directory_exists_w(const std::wstring& path)
+{
+    if (path.empty())
+        return false;
+    DWORD attr = GetFileAttributesW(path.c_str());
+    return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
 const std::string& last_error()
 {
     std::lock_guard<std::mutex> lk(global_mutex());
@@ -2131,6 +2151,21 @@ bool client_t::launch_stdio_process()
     for (const auto& arg : _cfg.args)
         cmdline += " " + arg;
 
+    std::wstring current_directory;
+    auto cwd_it = _cfg.env.find("AIDA_CAMOUFOX_WORKING_DIR");
+    if (cwd_it != _cfg.env.end() && !cwd_it->second.empty()) {
+        current_directory = utf8_to_wide_string(cwd_it->second);
+        if (!directory_exists_w(current_directory)) {
+            _last_error = "Invalid MCP stdio working directory";
+            diag::log_tagged_fmt("mcp_stdio",
+                "launch_invalid_working_dir server_hash=0x%016llX name_len=%zu cwd_hash=0x%016llX cwd_len=%zu",
+                static_cast<unsigned long long>(mcp_log_hash(_cfg.name)),
+                _cfg.name.size(),
+                static_cast<unsigned long long>(mcp_log_hash(cwd_it->second)),
+                cwd_it->second.size());
+            return false;
+        }
+    }
 
     std::vector<wchar_t> env_block;
     if (!_cfg.env.empty()) {
@@ -2218,7 +2253,7 @@ bool client_t::launch_stdio_process()
         TRUE,
         CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
         env_block.empty() ? nullptr : env_block.data(),
-        nullptr,
+        current_directory.empty() ? nullptr : current_directory.c_str(),
         &si, &pi
     );
 

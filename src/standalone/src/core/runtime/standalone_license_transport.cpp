@@ -574,6 +574,11 @@ bool send_once(const winhttp_api_t& api,
                response_t& resp,
                std::string& last_error)
 {
+    const ULONGLONG t0 = GetTickCount64();
+    trans_log_fmt("send_once_begin method_len=%zu path_len=%zu body=%zu headers=%zu timeout_ms=%lu override=%d",
+        req.method.size(), req.path.size(), req.body.size(), req.headers.size(),
+        static_cast<unsigned long>(req.timeout_ms), host_override.empty() ? 0 : 1);
+    trans_log("send_once_phase=open_session");
     HINTERNET h_session = api.p_open(L"AiDAStandalone-Auth/1.0",
                                      WINHTTP_ACCESS_TYPE_NO_PROXY,
                                      WINHTTP_NO_PROXY_NAME,
@@ -581,8 +586,13 @@ bool send_once(const winhttp_api_t& api,
                                      0);
     if (!h_session) {
         last_error = "winhttp_open_failed";
+        trans_log_fmt("send_once_open_session_failed gle=%lu elapsed_ms=%llu",
+            static_cast<unsigned long>(GetLastError()),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
         return false;
     }
+    trans_log_fmt("send_once_phase=session_opened elapsed_ms=%llu",
+        static_cast<unsigned long long>(GetTickCount64() - t0));
 
     DWORD timeout_ms = req.timeout_ms > 0u ? req.timeout_ms : kDefaultTimeoutMs;
     int tmo = static_cast<int>(timeout_ms);
@@ -602,15 +612,24 @@ bool send_once(const winhttp_api_t& api,
     api.p_set_option(h_session, WINHTTP_OPTION_RESOLVER_CACHE_CONFIG, &cache_cfg, sizeof(cache_cfg));
 
     const std::wstring& wired_host = host_override.empty() ? req.host : host_override;
+    trans_log_fmt("send_once_phase=connect host_len=%zu elapsed_ms=%llu",
+        wired_host.size(), static_cast<unsigned long long>(GetTickCount64() - t0));
     HINTERNET h_connect = api.p_connect(h_session, wired_host.c_str(),
                                         INTERNET_DEFAULT_HTTPS_PORT, 0);
     if (!h_connect) {
         last_error = "winhttp_connect_failed";
+        trans_log_fmt("send_once_connect_failed gle=%lu elapsed_ms=%llu",
+            static_cast<unsigned long>(GetLastError()),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
         api.p_close_handle(h_session);
         return false;
     }
+    trans_log_fmt("send_once_phase=connected elapsed_ms=%llu",
+        static_cast<unsigned long long>(GetTickCount64() - t0));
 
     std::wstring wverb = utf8_to_utf16(req.method.empty() ? std::string("GET") : req.method);
+    trans_log_fmt("send_once_phase=open_request method_len=%zu path_len=%zu elapsed_ms=%llu",
+        wverb.size(), req.path.size(), static_cast<unsigned long long>(GetTickCount64() - t0));
     HINTERNET h_req = api.p_open_request(h_connect, wverb.c_str(),
                                          req.path.empty() ? L"/" : req.path.c_str(),
                                          nullptr,
@@ -619,10 +638,15 @@ bool send_once(const winhttp_api_t& api,
                                          WINHTTP_FLAG_SECURE);
     if (!h_req) {
         last_error = "winhttp_open_request_failed";
+        trans_log_fmt("send_once_open_request_failed gle=%lu elapsed_ms=%llu",
+            static_cast<unsigned long>(GetLastError()),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
         api.p_close_handle(h_connect);
         api.p_close_handle(h_session);
         return false;
     }
+    trans_log_fmt("send_once_phase=request_opened elapsed_ms=%llu",
+        static_cast<unsigned long long>(GetTickCount64() - t0));
 
     api.p_set_timeouts(h_req, tmo, tmo, tmo, tmo);
 
@@ -652,10 +676,16 @@ bool send_once(const winhttp_api_t& api,
     DWORD watchdog_deadline = timeout_ms + kWatchdogGraceMs;
 
     watchdog_t wd_send;
+    trans_log_fmt("send_once_phase=send_request hdr_len=%lu body_len=%lu elapsed_ms=%llu",
+        static_cast<unsigned long>(hdr_len), static_cast<unsigned long>(body_len),
+        static_cast<unsigned long long>(GetTickCount64() - t0));
     HANDLE wd_send_thread = start_watchdog(wd_send, h_req, api.p_close_handle, watchdog_deadline);
     BOOL send_ok = api.p_send_request(h_req, hdr_ptr, hdr_len, body_ptr, body_len, body_len, 0);
     DWORD send_gle = GetLastError();
     stop_watchdog(wd_send, wd_send_thread);
+    trans_log_fmt("send_once_phase=send_request_done ok=%d gle=%lu elapsed_ms=%llu",
+        send_ok ? 1 : 0, static_cast<unsigned long>(send_gle),
+        static_cast<unsigned long long>(GetTickCount64() - t0));
 
     if (!send_ok) {
         trans_log_fmt("send_failed gle=%lu", static_cast<unsigned long>(send_gle));
@@ -667,10 +697,15 @@ bool send_once(const winhttp_api_t& api,
     }
 
     watchdog_t wd_recv;
+    trans_log_fmt("send_once_phase=receive_response elapsed_ms=%llu",
+        static_cast<unsigned long long>(GetTickCount64() - t0));
     HANDLE wd_recv_thread = start_watchdog(wd_recv, h_req, api.p_close_handle, watchdog_deadline);
     BOOL recv_ok = api.p_recv_response(h_req, nullptr);
     DWORD recv_gle = GetLastError();
     stop_watchdog(wd_recv, wd_recv_thread);
+    trans_log_fmt("send_once_phase=receive_response_done ok=%d gle=%lu elapsed_ms=%llu",
+        recv_ok ? 1 : 0, static_cast<unsigned long>(recv_gle),
+        static_cast<unsigned long long>(GetTickCount64() - t0));
 
     if (!recv_ok) {
         trans_log_fmt("recv_failed gle=%lu", static_cast<unsigned long>(recv_gle));
@@ -683,8 +718,13 @@ bool send_once(const winhttp_api_t& api,
 
     PCCERT_CONTEXT leaf_cert = nullptr;
     DWORD cert_size = sizeof(leaf_cert);
+    trans_log_fmt("send_once_phase=query_cert elapsed_ms=%llu",
+        static_cast<unsigned long long>(GetTickCount64() - t0));
     if (!api.p_query_option(h_req, WINHTTP_OPTION_SERVER_CERT_CONTEXT, &leaf_cert, &cert_size) || !leaf_cert) {
         last_error = "winhttp_cert_query_failed";
+        trans_log_fmt("send_once_cert_query_failed gle=%lu cert_size=%lu elapsed_ms=%llu",
+            static_cast<unsigned long>(GetLastError()), static_cast<unsigned long>(cert_size),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
         api.p_close_handle(h_req);
         api.p_close_handle(h_connect);
         api.p_close_handle(h_session);
@@ -692,6 +732,8 @@ bool send_once(const winhttp_api_t& api,
     }
 
     std::string pin_detail;
+    trans_log_fmt("send_once_phase=pin_check elapsed_ms=%llu",
+        static_cast<unsigned long long>(GetTickCount64() - t0));
     bool pinned_ok = match_pin_against_chain(leaf_cert, pins, resp.server_spki_hash, pin_detail);
     CertFreeCertificateContext(leaf_cert);
     if (!pinned_ok) {
@@ -704,6 +746,8 @@ bool send_once(const winhttp_api_t& api,
     }
 
     std::string exporter_detail;
+    trans_log_fmt("send_once_phase=exporter_query elapsed_ms=%llu",
+        static_cast<unsigned long long>(GetTickCount64() - t0));
     if (!query_cbt_or_exporter(api, h_req, resp.tls_exporter, exporter_detail)) {
         last_error = "exporter_unavailable";
         trans_log_fmt("exporter_unavailable detail=%s", exporter_detail.c_str());
@@ -715,6 +759,8 @@ bool send_once(const winhttp_api_t& api,
 
     DWORD status_code = 0;
     DWORD scode_size = sizeof(status_code);
+    trans_log_fmt("send_once_phase=query_status elapsed_ms=%llu",
+        static_cast<unsigned long long>(GetTickCount64() - t0));
     if (!api.p_query_headers(h_req,
                              WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
                              WINHTTP_HEADER_NAME_BY_INDEX,
@@ -726,6 +772,9 @@ bool send_once(const winhttp_api_t& api,
         return false;
     }
     resp.http_status = status_code;
+    trans_log_fmt("send_once_phase=status_ok status=%lu elapsed_ms=%llu",
+        static_cast<unsigned long>(status_code),
+        static_cast<unsigned long long>(GetTickCount64() - t0));
 
     {
         wchar_t hdr_name[] = L"X-Debug-Reason";
@@ -751,6 +800,8 @@ bool send_once(const winhttp_api_t& api,
     resp.body.clear();
     resp.body.reserve(4096u);
     uint8_t chunk[8192];
+    trans_log_fmt("send_once_phase=read_body_begin elapsed_ms=%llu",
+        static_cast<unsigned long long>(GetTickCount64() - t0));
     for (;;) {
         DWORD avail = 0u;
         if (!api.p_query_avail(h_req, &avail)) { break; }
@@ -772,6 +823,9 @@ bool send_once(const winhttp_api_t& api,
     api.p_close_handle(h_req);
     api.p_close_handle(h_connect);
     api.p_close_handle(h_session);
+    trans_log_fmt("send_once_success status=%lu body=%zu elapsed_ms=%llu",
+        static_cast<unsigned long>(resp.http_status), resp.body.size(),
+        static_cast<unsigned long long>(GetTickCount64() - t0));
     return true;
 }
 
@@ -849,8 +903,12 @@ bool send(const request_t& req, response_t& resp, std::string& last_error)
         }
         std::string err;
         response_t local_resp;
+        trans_log_fmt("transport_send_attempt_begin attempt=%d host_len=%zu path_len=%zu",
+            attempt + 1, req.host.size(), req.path.size());
         if (send_once(api_local, pins_local, req, std::wstring(), local_resp, err)) {
             resp = std::move(local_resp);
+            trans_log_fmt("transport_send_attempt_ok attempt=%d status=%lu body=%zu",
+                attempt + 1, static_cast<unsigned long>(resp.http_status), resp.body.size());
             return true;
         }
         last_error = err;

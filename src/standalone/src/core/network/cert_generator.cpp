@@ -14,12 +14,19 @@
 #include <openssl/rand.h>
 #include <openssl/x509v3.h>
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <climits>
+#include <cctype>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <mutex>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #pragma comment(lib, "crypt32.lib")
@@ -36,6 +43,119 @@ static std::mutex g_ctx_mutex;
 
 static constexpr char kProtectedKeyPrefix[] = "AIDA-DPAPI-CAKEY-v1\n";
 static constexpr char kPrivateKeyEntropy[] = "AiDA:standalone:proxy:ca-key:v1";
+static constexpr DWORD kCertStoreQueryTimeoutMs = 3000;
+static constexpr DWORD kCertStoreMutationTimeoutMs = 5000;
+static constexpr long kCertStoreMaxDetachedWorkers = 4;
+static std::atomic<long> g_cert_store_workers{0};
+
+struct cert_store_result_t {
+    bool ok = false;
+    DWORD gle = ERROR_SUCCESS;
+    DWORD detail = 0;
+};
+
+struct cert_store_async_state_t {
+    std::atomic<bool> done{false};
+    std::atomic<int> ok{0};
+    std::atomic<DWORD> gle{ERROR_TIMEOUT};
+    std::atomic<DWORD> detail{0};
+    std::atomic<unsigned long long> elapsed_ms{0};
+};
+
+template <typename Fn>
+static bool run_cert_store_operation_bounded(const char* op_name,
+                                             DWORD timeout_ms,
+                                             Fn fn,
+                                             DWORD* gle_out = nullptr,
+                                             DWORD* detail_out = nullptr) {
+    const long active = g_cert_store_workers.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (active > kCertStoreMaxDetachedWorkers) {
+        g_cert_store_workers.fetch_sub(1, std::memory_order_acq_rel);
+        diag::log_tagged_fmt("cert", "%s refused active_workers=%ld limit=%ld",
+            op_name, active, kCertStoreMaxDetachedWorkers);
+        if (gle_out) *gle_out = ERROR_BUSY;
+        if (detail_out) *detail_out = static_cast<DWORD>(active);
+        return false;
+    }
+
+    auto state = std::make_shared<cert_store_async_state_t>();
+    std::string op = op_name ? op_name : "cert_store_operation";
+    std::thread worker;
+    try {
+        worker = std::thread([state, op, fn = std::move(fn)]() mutable {
+            const ULONGLONG t0 = GetTickCount64();
+            diag::log_tagged_fmt("cert", "%s worker_entry tid=%lu active_workers=%ld",
+                op.c_str(),
+                static_cast<unsigned long>(GetCurrentThreadId()),
+                g_cert_store_workers.load(std::memory_order_acquire));
+            cert_store_result_t result;
+            try {
+                result = fn();
+            } catch (...) {
+                result.ok = false;
+                result.gle = ERROR_OPERATION_ABORTED;
+                result.detail = 0;
+                diag::log_tagged_fmt("cert", "%s worker_exception tid=%lu",
+                    op.c_str(), static_cast<unsigned long>(GetCurrentThreadId()));
+            }
+            const ULONGLONG elapsed = GetTickCount64() - t0;
+            state->ok.store(result.ok ? 1 : 0, std::memory_order_release);
+            state->gle.store(result.gle, std::memory_order_release);
+            state->detail.store(result.detail, std::memory_order_release);
+            state->elapsed_ms.store(static_cast<unsigned long long>(elapsed), std::memory_order_release);
+            state->done.store(true, std::memory_order_release);
+            diag::log_tagged_fmt("cert", "%s worker_exit ok=%d gle=%lu detail=%lu elapsed_ms=%llu",
+                op.c_str(),
+                result.ok ? 1 : 0,
+                static_cast<unsigned long>(result.gle),
+                static_cast<unsigned long>(result.detail),
+                static_cast<unsigned long long>(elapsed));
+            g_cert_store_workers.fetch_sub(1, std::memory_order_acq_rel);
+        });
+    } catch (...) {
+        g_cert_store_workers.fetch_sub(1, std::memory_order_acq_rel);
+        diag::log_tagged_fmt("cert", "%s worker_start_failed", op.c_str());
+        if (gle_out) *gle_out = ERROR_NOT_ENOUGH_MEMORY;
+        if (detail_out) *detail_out = 0;
+        return false;
+    }
+
+    const ULONGLONG wait_start = GetTickCount64();
+    for (;;) {
+        if (state->done.load(std::memory_order_acquire)) {
+            if (worker.joinable())
+                worker.join();
+            const DWORD gle = state->gle.load(std::memory_order_acquire);
+            const DWORD detail = state->detail.load(std::memory_order_acquire);
+            const bool ok = state->ok.load(std::memory_order_acquire) != 0;
+            if (gle_out) *gle_out = gle;
+            if (detail_out) *detail_out = detail;
+            diag::log_tagged_fmt("cert", "%s completed ok=%d gle=%lu detail=%lu wait_ms=%llu worker_ms=%llu",
+                op.c_str(),
+                ok ? 1 : 0,
+                static_cast<unsigned long>(gle),
+                static_cast<unsigned long>(detail),
+                static_cast<unsigned long long>(GetTickCount64() - wait_start),
+                state->elapsed_ms.load(std::memory_order_acquire));
+            return ok;
+        }
+        const ULONGLONG elapsed = GetTickCount64() - wait_start;
+        if (elapsed >= timeout_ms) {
+            if (worker.joinable())
+                worker.detach();
+            if (gle_out) *gle_out = ERROR_TIMEOUT;
+            if (detail_out) *detail_out = static_cast<DWORD>(elapsed > 0xFFFFFFFFULL ? 0xFFFFFFFFUL : elapsed);
+            diag::log_tagged_fmt("cert", "%s timeout timeout_ms=%lu waited_ms=%llu active_workers=%ld",
+                op.c_str(),
+                static_cast<unsigned long>(timeout_ms),
+                static_cast<unsigned long long>(elapsed),
+                g_cert_store_workers.load(std::memory_order_acquire));
+            return false;
+        }
+        const DWORD remaining = static_cast<DWORD>(timeout_ms - static_cast<DWORD>(elapsed));
+        Sleep(std::min<DWORD>(remaining, 25));
+    }
+}
 
 
 static bool add_ext(X509* cert, int nid, const char* value) {
@@ -137,6 +257,124 @@ bool generate_root_ca(root_ca_t& ca) {
 
     ca.valid = true;
     diag::log_tagged("cert", "generate_root_ca success");
+    return true;
+}
+
+static bool valid_common_name(const std::string& cn) {
+    if (cn.empty() || cn.size() > 128)
+        return false;
+    for (unsigned char c : cn) {
+        if (c < 0x20 || c > 0x7E)
+            return false;
+    }
+    return true;
+}
+
+bool generate_public_ca_certificate_der(const std::string& common_name, std::uint32_t validity_days,
+                                        std::vector<uint8_t>& out, std::string& subject_cn) {
+    const ULONGLONG t0 = GetTickCount64();
+    out.clear();
+    subject_cn.clear();
+    std::string cn = common_name.empty() ? "AiDA Generated CA" : common_name;
+    if (!valid_common_name(cn)) {
+        diag::log_tagged_fmt("cert", "generate_public_ca_certificate_der rejected cn_len=%zu elapsed_ms=%llu",
+            cn.size(),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        return false;
+    }
+    const std::uint32_t days = validity_days == 0 ? 3650u : std::min<std::uint32_t>(validity_days, 3650u);
+    diag::log_tagged_fmt("cert", "generate_public_ca_certificate_der entry cn_len=%zu days=%u",
+        cn.size(), days);
+
+    EVP_PKEY_CTX* pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, nullptr);
+    if (!pctx) {
+        diag::log_tagged_fmt("cert", "generate_public_ca_certificate_der EVP_PKEY_CTX_new_id failed elapsed_ms=%llu",
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        return false;
+    }
+
+    EVP_PKEY* raw_key = nullptr;
+    bool ok = (EVP_PKEY_keygen_init(pctx) > 0) &&
+              (EVP_PKEY_CTX_set_rsa_keygen_bits(pctx, 2048) > 0) &&
+              (EVP_PKEY_keygen(pctx, &raw_key) > 0);
+    EVP_PKEY_CTX_free(pctx);
+    evp_pkey_ptr key(raw_key);
+    diag::log_tagged_fmt("cert", "generate_public_ca_certificate_der keygen ok=%d elapsed_ms=%llu",
+        ok ? 1 : 0,
+        static_cast<unsigned long long>(GetTickCount64() - t0));
+    if (!ok || !key)
+        return false;
+
+    x509_ptr cert(X509_new());
+    if (!cert) {
+        diag::log_tagged_fmt("cert", "generate_public_ca_certificate_der X509_new failed elapsed_ms=%llu",
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        return false;
+    }
+
+    X509_set_version(cert.get(), 2);
+    if (!set_serial_random(cert.get())) {
+        diag::log_tagged_fmt("cert", "generate_public_ca_certificate_der serial failed elapsed_ms=%llu",
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        return false;
+    }
+    X509_gmtime_adj(X509_getm_notBefore(cert.get()), 0);
+    X509_gmtime_adj(X509_getm_notAfter(cert.get()), static_cast<long>(days) * 24L * 3600L);
+    if (X509_set_pubkey(cert.get(), key.get()) != 1) {
+        diag::log_tagged_fmt("cert", "generate_public_ca_certificate_der pubkey failed elapsed_ms=%llu",
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        return false;
+    }
+
+    X509_NAME* name = const_cast<X509_NAME*>(X509_get_subject_name(cert.get()));
+    if (!name ||
+        X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+            reinterpret_cast<const unsigned char*>(cn.c_str()), -1, -1, 0) != 1 ||
+        X509_NAME_add_entry_by_txt(name, "O", MBSTRING_ASC,
+            reinterpret_cast<const unsigned char*>("AiDA"), -1, -1, 0) != 1 ||
+        X509_set_issuer_name(cert.get(), name) != 1) {
+        diag::log_tagged_fmt("cert", "generate_public_ca_certificate_der subject failed elapsed_ms=%llu",
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        return false;
+    }
+
+    if (!add_ext(cert.get(), NID_basic_constraints, "critical,CA:TRUE") ||
+        !add_ext(cert.get(), NID_key_usage, "critical,keyCertSign,cRLSign") ||
+        !add_ext(cert.get(), NID_subject_key_identifier, "hash") ||
+        !add_ext(cert.get(), NID_authority_key_identifier, "keyid:always")) {
+        diag::log_tagged_fmt("cert", "generate_public_ca_certificate_der extension failed elapsed_ms=%llu",
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        return false;
+    }
+
+    const int sign_rc = X509_sign(cert.get(), key.get(), EVP_sha256());
+    diag::log_tagged_fmt("cert", "generate_public_ca_certificate_der sign rc=%d elapsed_ms=%llu",
+        sign_rc,
+        static_cast<unsigned long long>(GetTickCount64() - t0));
+    if (sign_rc <= 0)
+        return false;
+
+    const int der_len = i2d_X509(cert.get(), nullptr);
+    if (der_len <= 0) {
+        diag::log_tagged_fmt("cert", "generate_public_ca_certificate_der der_size failed elapsed_ms=%llu",
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        return false;
+    }
+    out.resize(static_cast<size_t>(der_len));
+    unsigned char* p = out.data();
+    const int wrote = i2d_X509(cert.get(), &p);
+    if (wrote != der_len) {
+        out.clear();
+        diag::log_tagged_fmt("cert", "generate_public_ca_certificate_der der_write failed wrote=%d expected=%d elapsed_ms=%llu",
+            wrote,
+            der_len,
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        return false;
+    }
+    subject_cn = cn;
+    diag::log_tagged_fmt("cert", "generate_public_ca_certificate_der success der_len=%d elapsed_ms=%llu",
+        der_len,
+        static_cast<unsigned long long>(GetTickCount64() - t0));
     return true;
 }
 
@@ -560,6 +798,7 @@ bool export_ca_certificate_pem(const root_ca_t& ca, std::string& out) {
 
 
 bool install_root_ca(const root_ca_t& ca) {
+    const ULONGLONG t0 = GetTickCount64();
     diag::log_tagged_fmt("cert", "install_root_ca entry ca_valid=%d ca_cert=%p", (int)ca.valid, ca.cert.get());
     if (!ca.valid || !ca.cert) {
         diag::log_tagged("cert", "install_root_ca ca not valid or cert null");
@@ -573,22 +812,60 @@ bool install_root_ca(const root_ca_t& ca) {
     }
     diag::log_tagged_fmt("cert", "install_root_ca DER encode len=%zu", der.size());
 
-    HCERTSTORE store = CertOpenStore(CERT_STORE_PROV_SYSTEM, 0, 0,
-        CERT_SYSTEM_STORE_CURRENT_USER, L"ROOT");
-    diag::log_tagged_fmt("cert", "install_root_ca CertOpenStore store=%p", store);
-    if (!store) {
-        diag::log_tagged("cert", "install_root_ca CertOpenStore failed");
-        return false;
-    }
+    DWORD op_gle = ERROR_SUCCESS;
+    DWORD op_detail = 0;
+    bool ok = run_cert_store_operation_bounded("install_root_ca",
+        kCertStoreMutationTimeoutMs,
+        [der]() -> cert_store_result_t {
+            cert_store_result_t result;
+            SetLastError(ERROR_SUCCESS);
+            HCERTSTORE store = CertOpenStore(CERT_STORE_PROV_SYSTEM, 0, 0,
+                CERT_SYSTEM_STORE_CURRENT_USER, L"ROOT");
+            const DWORD open_gle = GetLastError();
+            diag::log_tagged_fmt("cert", "install_root_ca CertOpenStore store=%p gle=%lu tid=%lu",
+                store,
+                static_cast<unsigned long>(open_gle),
+                static_cast<unsigned long>(GetCurrentThreadId()));
+            if (!store) {
+                result.gle = open_gle;
+                return result;
+            }
 
-    BOOL ok = CertAddEncodedCertificateToStore(store, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
-        der.data(), static_cast<DWORD>(der.size()), CERT_STORE_ADD_REPLACE_EXISTING, nullptr);
-    CertCloseStore(store, 0);
-    diag::log_tagged_fmt("cert", "install_root_ca CertAddEncodedCertificateToStore ok=%d", (int)ok);
-    return ok != FALSE;
+            SetLastError(ERROR_SUCCESS);
+            diag::log_tagged_fmt("cert", "install_root_ca CertAddEncodedCertificateToStore enter der_len=%zu tid=%lu",
+                der.size(),
+                static_cast<unsigned long>(GetCurrentThreadId()));
+            BOOL add_ok = CertAddEncodedCertificateToStore(store, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+                der.data(), static_cast<DWORD>(der.size()), CERT_STORE_ADD_REPLACE_EXISTING, nullptr);
+            const DWORD add_gle = GetLastError();
+            diag::log_tagged_fmt("cert", "install_root_ca CertAddEncodedCertificateToStore exit ok=%d gle=%lu tid=%lu",
+                static_cast<int>(add_ok),
+                static_cast<unsigned long>(add_gle),
+                static_cast<unsigned long>(GetCurrentThreadId()));
+            SetLastError(ERROR_SUCCESS);
+            const BOOL close_ok = CertCloseStore(store, 0);
+            const DWORD close_gle = GetLastError();
+            diag::log_tagged_fmt("cert", "install_root_ca CertCloseStore ok=%d gle=%lu tid=%lu",
+                static_cast<int>(close_ok),
+                static_cast<unsigned long>(close_gle),
+                static_cast<unsigned long>(GetCurrentThreadId()));
+            result.ok = add_ok != FALSE && close_ok != FALSE;
+            result.gle = add_ok != FALSE ? close_gle : add_gle;
+            result.detail = static_cast<DWORD>(der.size());
+            return result;
+        },
+        &op_gle,
+        &op_detail);
+    diag::log_tagged_fmt("cert", "install_root_ca result=%d gle=%lu detail=%lu elapsed_ms=%llu",
+        ok ? 1 : 0,
+        static_cast<unsigned long>(op_gle),
+        static_cast<unsigned long>(op_detail),
+        static_cast<unsigned long long>(GetTickCount64() - t0));
+    return ok;
 }
 
 bool remove_root_ca(const root_ca_t& ca) {
+    const ULONGLONG t0 = GetTickCount64();
     diag::log_tagged_fmt("cert", "remove_root_ca entry ca_valid=%d ca_cert=%p", (int)ca.valid, ca.cert.get());
     if (!ca.valid || !ca.cert) {
         diag::log_tagged("cert", "remove_root_ca ca not valid or cert null");
@@ -602,37 +879,80 @@ bool remove_root_ca(const root_ca_t& ca) {
     }
     diag::log_tagged_fmt("cert", "remove_root_ca DER encode len=%zu", der.size());
 
-    HCERTSTORE store = CertOpenStore(CERT_STORE_PROV_SYSTEM, 0, 0,
-        CERT_SYSTEM_STORE_CURRENT_USER, L"ROOT");
-    diag::log_tagged_fmt("cert", "remove_root_ca CertOpenStore store=%p", store);
-    if (!store) {
-        diag::log_tagged("cert", "remove_root_ca CertOpenStore failed");
-        return false;
-    }
+    DWORD op_gle = ERROR_SUCCESS;
+    DWORD op_detail = 0;
+    bool ok = run_cert_store_operation_bounded("remove_root_ca",
+        kCertStoreMutationTimeoutMs,
+        [der]() -> cert_store_result_t {
+            cert_store_result_t result;
+            SetLastError(ERROR_SUCCESS);
+            HCERTSTORE store = CertOpenStore(CERT_STORE_PROV_SYSTEM, 0, 0,
+                CERT_SYSTEM_STORE_CURRENT_USER, L"ROOT");
+            const DWORD open_gle = GetLastError();
+            diag::log_tagged_fmt("cert", "remove_root_ca CertOpenStore store=%p gle=%lu tid=%lu",
+                store,
+                static_cast<unsigned long>(open_gle),
+                static_cast<unsigned long>(GetCurrentThreadId()));
+            if (!store) {
+                result.gle = open_gle;
+                return result;
+            }
 
-    CERT_BLOB blob;
-    blob.cbData = static_cast<DWORD>(der.size());
-    blob.pbData = der.data();
+            CERT_BLOB blob;
+            blob.cbData = static_cast<DWORD>(der.size());
+            blob.pbData = const_cast<BYTE*>(der.data());
 
-    bool deleted = false;
-    PCCERT_CONTEXT found = nullptr;
-    while ((found = CertEnumCertificatesInStore(store, found)) != nullptr) {
-        if (found->cbCertEncoded == blob.cbData &&
-            memcmp(found->pbCertEncoded, blob.pbData, blob.cbData) == 0) {
-            diag::log_tagged("cert", "remove_root_ca found matching cert deleting");
-            CertDeleteCertificateFromStore(CertDuplicateCertificateContext(found));
-            CertFreeCertificateContext(found);
-            deleted = true;
-            break;
-        }
-    }
-
-    CertCloseStore(store, 0);
-    diag::log_tagged_fmt("cert", "remove_root_ca done deleted=%d", (int)deleted);
-    return true;
+            bool deleted = false;
+            DWORD enumerated = 0;
+            PCCERT_CONTEXT found = nullptr;
+            while ((found = CertEnumCertificatesInStore(store, found)) != nullptr) {
+                ++enumerated;
+                if (found->cbCertEncoded == blob.cbData &&
+                    memcmp(found->pbCertEncoded, blob.pbData, blob.cbData) == 0) {
+                    diag::log_tagged_fmt("cert", "remove_root_ca found matching cert enumerated=%lu tid=%lu",
+                        static_cast<unsigned long>(enumerated),
+                        static_cast<unsigned long>(GetCurrentThreadId()));
+                    SetLastError(ERROR_SUCCESS);
+                    PCCERT_CONTEXT duplicate = CertDuplicateCertificateContext(found);
+                    const BOOL delete_ok = duplicate ? CertDeleteCertificateFromStore(duplicate) : FALSE;
+                    const DWORD delete_gle = duplicate ? GetLastError() : ERROR_INVALID_HANDLE;
+                    diag::log_tagged_fmt("cert", "remove_root_ca CertDeleteCertificateFromStore ok=%d gle=%lu tid=%lu",
+                        static_cast<int>(delete_ok),
+                        static_cast<unsigned long>(delete_gle),
+                        static_cast<unsigned long>(GetCurrentThreadId()));
+                    CertFreeCertificateContext(found);
+                    deleted = delete_ok != FALSE;
+                    result.gle = delete_gle;
+                    break;
+                }
+            }
+            SetLastError(ERROR_SUCCESS);
+            const BOOL close_ok = CertCloseStore(store, 0);
+            const DWORD close_gle = GetLastError();
+            diag::log_tagged_fmt("cert", "remove_root_ca CertCloseStore ok=%d gle=%lu deleted=%d enumerated=%lu tid=%lu",
+                static_cast<int>(close_ok),
+                static_cast<unsigned long>(close_gle),
+                deleted ? 1 : 0,
+                static_cast<unsigned long>(enumerated),
+                static_cast<unsigned long>(GetCurrentThreadId()));
+            result.ok = close_ok != FALSE;
+            if (result.gle == ERROR_SUCCESS)
+                result.gle = close_gle;
+            result.detail = enumerated;
+            return result;
+        },
+        &op_gle,
+        &op_detail);
+    diag::log_tagged_fmt("cert", "remove_root_ca result=%d gle=%lu enumerated=%lu elapsed_ms=%llu",
+        ok ? 1 : 0,
+        static_cast<unsigned long>(op_gle),
+        static_cast<unsigned long>(op_detail),
+        static_cast<unsigned long long>(GetTickCount64() - t0));
+    return ok;
 }
 
 bool is_root_ca_installed(const root_ca_t& ca) {
+    const ULONGLONG t0 = GetTickCount64();
     diag::log_tagged_fmt("cert", "is_root_ca_installed entry ca_valid=%d ca_cert=%p", (int)ca.valid, ca.cert.get());
     if (!ca.valid || !ca.cert) {
         diag::log_tagged("cert", "is_root_ca_installed ca not valid or cert null returning false");
@@ -646,27 +966,58 @@ bool is_root_ca_installed(const root_ca_t& ca) {
     }
     diag::log_tagged_fmt("cert", "is_root_ca_installed DER encode len=%zu", der.size());
 
-    HCERTSTORE store = CertOpenStore(CERT_STORE_PROV_SYSTEM, 0, 0,
-        CERT_SYSTEM_STORE_CURRENT_USER, L"ROOT");
-    diag::log_tagged_fmt("cert", "is_root_ca_installed CertOpenStore store=%p", store);
-    if (!store) {
-        diag::log_tagged("cert", "is_root_ca_installed CertOpenStore failed");
-        return false;
-    }
+    DWORD op_gle = ERROR_SUCCESS;
+    DWORD op_detail = 0;
+    bool found_it = run_cert_store_operation_bounded("is_root_ca_installed",
+        kCertStoreQueryTimeoutMs,
+        [der]() -> cert_store_result_t {
+            cert_store_result_t result;
+            SetLastError(ERROR_SUCCESS);
+            HCERTSTORE store = CertOpenStore(CERT_STORE_PROV_SYSTEM, 0, 0,
+                CERT_SYSTEM_STORE_CURRENT_USER, L"ROOT");
+            const DWORD open_gle = GetLastError();
+            diag::log_tagged_fmt("cert", "is_root_ca_installed CertOpenStore store=%p gle=%lu tid=%lu",
+                store,
+                static_cast<unsigned long>(open_gle),
+                static_cast<unsigned long>(GetCurrentThreadId()));
+            if (!store) {
+                result.gle = open_gle;
+                return result;
+            }
 
-    bool found_it = false;
-    PCCERT_CONTEXT found = nullptr;
-    while ((found = CertEnumCertificatesInStore(store, found)) != nullptr) {
-        if (found->cbCertEncoded == static_cast<DWORD>(der.size()) &&
-            memcmp(found->pbCertEncoded, der.data(), der.size()) == 0) {
-            found_it = true;
-            CertFreeCertificateContext(found);
-            break;
-        }
-    }
-
-    CertCloseStore(store, 0);
-    diag::log_tagged_fmt("cert", "is_root_ca_installed result=%d", (int)found_it);
+            bool found_match = false;
+            DWORD enumerated = 0;
+            PCCERT_CONTEXT found = nullptr;
+            while ((found = CertEnumCertificatesInStore(store, found)) != nullptr) {
+                ++enumerated;
+                if (found->cbCertEncoded == static_cast<DWORD>(der.size()) &&
+                    memcmp(found->pbCertEncoded, der.data(), der.size()) == 0) {
+                    found_match = true;
+                    CertFreeCertificateContext(found);
+                    break;
+                }
+            }
+            SetLastError(ERROR_SUCCESS);
+            const BOOL close_ok = CertCloseStore(store, 0);
+            const DWORD close_gle = GetLastError();
+            diag::log_tagged_fmt("cert", "is_root_ca_installed CertCloseStore ok=%d gle=%lu found=%d enumerated=%lu tid=%lu",
+                static_cast<int>(close_ok),
+                static_cast<unsigned long>(close_gle),
+                found_match ? 1 : 0,
+                static_cast<unsigned long>(enumerated),
+                static_cast<unsigned long>(GetCurrentThreadId()));
+            result.ok = found_match && close_ok != FALSE;
+            result.gle = close_gle;
+            result.detail = enumerated;
+            return result;
+        },
+        &op_gle,
+        &op_detail);
+    diag::log_tagged_fmt("cert", "is_root_ca_installed result=%d gle=%lu enumerated=%lu elapsed_ms=%llu",
+        found_it ? 1 : 0,
+        static_cast<unsigned long>(op_gle),
+        static_cast<unsigned long>(op_detail),
+        static_cast<unsigned long long>(GetTickCount64() - t0));
     return found_it;
 }
 

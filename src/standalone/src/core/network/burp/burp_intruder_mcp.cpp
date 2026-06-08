@@ -220,6 +220,8 @@ static tool_result_t burp_intruder_results(const json& params)
     size_t max_count = params.value("max", static_cast<size_t>(100));
     auto rows = intruder::results(id, start_idx, max_count);
     json arr = json::array();
+    size_t error_count = 0;
+    size_t successful_count = 0;
     for (auto& r : rows) {
         json e;
         e["index"] = r.index;
@@ -231,13 +233,20 @@ static tool_result_t burp_intruder_results(const json& params)
         e["error_msg"] = r.error_msg;
         e["preview"] = r.response_preview.substr(0, 1024);
         e["raw_b64"] = b64_encode(r.response_raw);
+        if (r.error)
+            ++error_count;
+        else
+            ++successful_count;
         arr.push_back(e);
     }
     json out;
     out["job_id"] = id;
     out["count"] = rows.size();
+    out["error_count"] = static_cast<uint64_t>(error_count);
+    out["successful_count"] = static_cast<uint64_t>(successful_count);
     out["results"] = std::move(arr);
-    diag::log_tagged_fmt("mcp_burp", "intruder_results ok id=%llu count=%zu", static_cast<unsigned long long>(id), rows.size());
+    diag::log_tagged_fmt("mcp_burp", "intruder_results ok id=%llu count=%zu errors=%zu successful=%zu",
+        static_cast<unsigned long long>(id), rows.size(), error_count, successful_count);
     return tool_result_t::ok(out);
 }
 

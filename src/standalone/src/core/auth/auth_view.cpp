@@ -240,6 +240,99 @@ namespace auth_view {
 			return static_cast<int64_t>(std::time(nullptr));
 		}
 
+		static std::string canonical_provider_key(const std::string& provider_id)
+		{
+			std::string out;
+			out.reserve(provider_id.size());
+			for (unsigned char ch : provider_id) {
+				if (ch == '\\') out.push_back('/');
+				else out.push_back(static_cast<char>(std::tolower(ch)));
+			}
+			while (!out.empty() && out.back() == '/')
+				out.pop_back();
+			return out;
+		}
+
+		static bool auth_info_authenticated(const aida::auth::auth_info_t& info, int64_t now)
+		{
+			if (info.kind == aida::auth::auth_kind_t::none) return false;
+			if (info.kind == aida::auth::auth_kind_t::oauth) {
+				if (info.expires_unix > 0 && info.expires_unix <= now) return false;
+				return !info.access.empty();
+			}
+			if (info.kind == aida::auth::auth_kind_t::api) return !info.api_key.empty();
+			if (info.kind == aida::auth::auth_kind_t::wellknown) return !info.wellknown_token.empty();
+			return false;
+		}
+
+		static std::shared_ptr<const std::unordered_map<std::string, bool>>& auth_snapshot_ref()
+		{
+			static std::shared_ptr<const std::unordered_map<std::string, bool>> s;
+			return s;
+		}
+
+		static std::atomic<bool>& auth_snapshot_refreshing()
+		{
+			static std::atomic<bool> b{ false };
+			return b;
+		}
+
+		static std::atomic<int64_t>& auth_snapshot_last_unix()
+		{
+			static std::atomic<int64_t> v{ 0 };
+			return v;
+		}
+
+		static void publish_auth_snapshot(const std::vector<std::pair<std::string, aida::auth::auth_info_t>>& entries)
+		{
+			auto snapshot = std::make_shared<std::unordered_map<std::string, bool>>();
+			snapshot->reserve(entries.size() * 2 + 8);
+			const int64_t now = now_unix();
+			for (const auto& kv : entries) {
+				const bool authed = auth_info_authenticated(kv.second, now);
+				(*snapshot)[kv.first] = authed;
+				(*snapshot)[canonical_provider_key(kv.first)] = authed;
+			}
+			std::atomic_store_explicit(&auth_snapshot_ref(),
+				std::static_pointer_cast<const std::unordered_map<std::string, bool>>(snapshot),
+				std::memory_order_release);
+			auth_snapshot_last_unix().store(now, std::memory_order_release);
+		}
+
+		static void schedule_auth_snapshot_refresh(bool force = false)
+		{
+			if (g_state.shutdown_flag.load(std::memory_order_acquire)) return;
+			const int64_t now = now_unix();
+			const int64_t last = auth_snapshot_last_unix().load(std::memory_order_acquire);
+			if (!force && last > 0 && now >= last && now - last < 5) return;
+			bool expected = false;
+			if (!auth_snapshot_refreshing().compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+				return;
+			const uint64_t start_ms = GetTickCount64();
+			if (!work_queue::post([start_ms]() {
+					bool success = false;
+					size_t provider_count = 0;
+					try {
+						auto entries = aida::auth::store::all();
+						provider_count = entries.size();
+						publish_auth_snapshot(entries);
+						success = true;
+					} catch (...) {
+					}
+					auth_snapshot_refreshing().store(false, std::memory_order_release);
+					const uint64_t elapsed_ms = GetTickCount64() - start_ms;
+					if (!success || elapsed_ms >= 250) {
+						diag::log_tagged_fmt("auth",
+							"auth_snapshot_refresh_done ok=%d providers=%zu elapsed_ms=%llu",
+							success ? 1 : 0,
+							provider_count,
+							static_cast<unsigned long long>(elapsed_ms));
+					}
+				})) {
+				auth_snapshot_refreshing().store(false, std::memory_order_release);
+			}
+		}
+
 		static std::string format_relative_time(int64_t expires_unix)
 		{
 			int64_t now = now_unix();
@@ -944,6 +1037,7 @@ namespace auth_view {
 					toast_notification::toast_type_t::error, 5.0f);
 				return;
 			}
+			schedule_auth_snapshot_refresh(true);
 			if (revoke_oauth) {
 				work_queue::post([provider_id, access, refresh]() {
 					if (provider_id == "anthropic")
@@ -1219,6 +1313,7 @@ namespace auth_view {
 						result.message = std::string("Connected, but failed to persist key: ")
 							+ aida::auth::store::last_error();
 					} else {
+						schedule_auth_snapshot_refresh(true);
 						const std::string mid = preferred_model_id(captured_id);
 						if (!mid.empty()) {
 							g_sa_settings.set_selection(captured_id, mid);
@@ -2616,33 +2711,39 @@ namespace auth_view {
 	void initialize()
 	{
 		g_state.shutdown_flag.store(false);
-		std::lock_guard<std::mutex> lk(g_state.mtx);
+		{
+			std::lock_guard<std::mutex> lk(g_state.mtx);
 
-		if (g_state.sub_completed.valid())
-			aida::events::unsubscribe(g_state.sub_completed);
-		if (g_state.sub_failed.valid())
-			aida::events::unsubscribe(g_state.sub_failed);
+			if (g_state.sub_completed.valid())
+				aida::events::unsubscribe(g_state.sub_completed);
+			if (g_state.sub_failed.valid())
+				aida::events::unsubscribe(g_state.sub_failed);
 
-		g_state.sub_completed = aida::events::subscribe(
-			aida::events::event_oauth_completed,
-			std::function<void(const aida::events::oauth_completed_t&)>(
-				[](const aida::events::oauth_completed_t& ev) {
-					std::lock_guard<std::mutex> lk2(g_state.mtx);
-					g_state.last_completed_provider = ev.provider_id;
-					g_state.last_completed_email = ev.email;
-					g_state.have_completed_event.store(true);
-				}));
+			g_state.sub_completed = aida::events::subscribe(
+				aida::events::event_oauth_completed,
+				std::function<void(const aida::events::oauth_completed_t&)>(
+					[](const aida::events::oauth_completed_t& ev) {
+						{
+							std::lock_guard<std::mutex> lk2(g_state.mtx);
+							g_state.last_completed_provider = ev.provider_id;
+							g_state.last_completed_email = ev.email;
+							g_state.have_completed_event.store(true);
+						}
+						schedule_auth_snapshot_refresh(true);
+					}));
 
-		g_state.sub_failed = aida::events::subscribe(
-			aida::events::event_oauth_failed,
-			std::function<void(const aida::events::oauth_failed_t&)>(
-				[](const aida::events::oauth_failed_t& ev) {
-					std::lock_guard<std::mutex> lk2(g_state.mtx);
-					g_state.last_failed_provider = ev.provider_id;
-					g_state.last_failed_error = ev.error;
-					g_state.have_failed_event.store(true);
-					set_err_locked(ev.error);
-				}));
+			g_state.sub_failed = aida::events::subscribe(
+				aida::events::event_oauth_failed,
+				std::function<void(const aida::events::oauth_failed_t&)>(
+					[](const aida::events::oauth_failed_t& ev) {
+						std::lock_guard<std::mutex> lk2(g_state.mtx);
+						g_state.last_failed_provider = ev.provider_id;
+						g_state.last_failed_error = ev.error;
+						g_state.have_failed_event.store(true);
+						set_err_locked(ev.error);
+					}));
+		}
+		schedule_auth_snapshot_refresh(true);
 	}
 
 	void shutdown()
@@ -2736,15 +2837,16 @@ namespace auth_view {
 
 	bool is_provider_authenticated(const std::string& provider_id)
 	{
-		aida::auth::auth_info_t info;
-		if (!aida::auth::store::get(provider_id, info)) return false;
-		if (info.kind == aida::auth::auth_kind_t::none) return false;
-		if (info.kind == aida::auth::auth_kind_t::oauth) {
-			if (info.expires_unix > 0 && info.expires_unix <= now_unix()) return false;
-			return !info.access.empty();
-		}
-		if (info.kind == aida::auth::auth_kind_t::api) return !info.api_key.empty();
-		if (info.kind == aida::auth::auth_kind_t::wellknown) return !info.wellknown_token.empty();
+		if (provider_id.empty()) return false;
+		const int64_t last = auth_snapshot_last_unix().load(std::memory_order_acquire);
+		if (last == 0 || now_unix() - last >= 5)
+			schedule_auth_snapshot_refresh(false);
+		auto snapshot = std::atomic_load_explicit(&auth_snapshot_ref(), std::memory_order_acquire);
+		if (!snapshot) return false;
+		auto it = snapshot->find(canonical_provider_key(provider_id));
+		if (it != snapshot->end()) return it->second;
+		it = snapshot->find(provider_id);
+		if (it != snapshot->end()) return it->second;
 		return false;
 	}
 

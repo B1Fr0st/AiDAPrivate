@@ -5,6 +5,9 @@
 #include "../driver/comm.h"
 #include <nlohmann/json.hpp>
 #include <exception>
+#include <filesystem>
+#include <fstream>
+#include <limits>
 #include <wincrypt.h>
 #include <shlobj.h>
 #include <bcrypt.h>
@@ -63,6 +66,192 @@ static std::uint64_t get_timestamp_ms() {
     return static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
+static bool valid_cert_store_name_text(const std::string& name) {
+    if (name.empty() || name.size() > 64)
+        return false;
+    for (unsigned char c : name) {
+        const bool ok = (c >= 'A' && c <= 'Z') ||
+                        (c >= 'a' && c <= 'z') ||
+                        (c >= '0' && c <= '9') ||
+                        c == '_' || c == '-';
+        if (!ok)
+            return false;
+    }
+    return true;
+}
+
+static std::wstring widen_ascii_text(const std::string& s) {
+    std::wstring out;
+    out.reserve(s.size());
+    for (unsigned char c : s)
+        out.push_back(static_cast<wchar_t>(c));
+    return out;
+}
+
+static std::wstring quote_windows_arg_text(const std::wstring& arg) {
+    std::wstring out;
+    out.push_back(L'"');
+    size_t slash_count = 0;
+    for (wchar_t ch : arg) {
+        if (ch == L'\\') {
+            ++slash_count;
+            continue;
+        }
+        if (ch == L'"') {
+            out.append(slash_count * 2 + 1, L'\\');
+            out.push_back(ch);
+            slash_count = 0;
+            continue;
+        }
+        if (slash_count != 0) {
+            out.append(slash_count, L'\\');
+            slash_count = 0;
+        }
+        out.push_back(ch);
+    }
+    if (slash_count != 0)
+        out.append(slash_count * 2, L'\\');
+    out.push_back(L'"');
+    return out;
+}
+
+static std::wstring certutil_exe_path_text() {
+    wchar_t sys_dir[MAX_PATH] = {};
+    UINT len = GetSystemDirectoryW(sys_dir, MAX_PATH);
+    if (len > 0 && len < MAX_PATH) {
+        std::wstring path(sys_dir, sys_dir + len);
+        if (!path.empty() && path.back() != L'\\')
+            path.push_back(L'\\');
+        path += L"certutil.exe";
+        return path;
+    }
+    return L"certutil.exe";
+}
+
+static bool write_temp_cert_der_file_text(const std::uint8_t* data, std::size_t len, std::wstring& out_path, DWORD& gle) {
+    out_path.clear();
+    gle = ERROR_SUCCESS;
+    if (!data || len == 0 || len > static_cast<std::size_t>((std::numeric_limits<DWORD>::max)())) {
+        gle = ERROR_INVALID_PARAMETER;
+        return false;
+    }
+    wchar_t temp_dir[MAX_PATH] = {};
+    DWORD dir_len = GetTempPathW(MAX_PATH, temp_dir);
+    if (dir_len == 0 || dir_len >= MAX_PATH) {
+        gle = GetLastError();
+        return false;
+    }
+    wchar_t temp_file[MAX_PATH] = {};
+    if (GetTempFileNameW(temp_dir, L"AID", 0, temp_file) == 0) {
+        gle = GetLastError();
+        return false;
+    }
+    HANDLE h = CreateFileW(temp_file, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+        FILE_ATTRIBUTE_TEMPORARY | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        gle = GetLastError();
+        DeleteFileW(temp_file);
+        return false;
+    }
+    DWORD written = 0;
+    BOOL ok = WriteFile(h, data, static_cast<DWORD>(len), &written, nullptr);
+    DWORD write_gle = ok ? ERROR_SUCCESS : GetLastError();
+    CloseHandle(h);
+    if (!ok || written != static_cast<DWORD>(len)) {
+        gle = ok ? ERROR_WRITE_FAULT : write_gle;
+        DeleteFileW(temp_file);
+        return false;
+    }
+    out_path = temp_file;
+    return true;
+}
+
+static bool run_certutil_args_text(const std::vector<std::wstring>& args, DWORD timeout_ms,
+                                   DWORD& exit_code, DWORD& gle, DWORD& elapsed_ms) {
+    exit_code = 0xFFFFFFFFu;
+    gle = ERROR_SUCCESS;
+    elapsed_ms = 0;
+    std::wstring cmd = quote_windows_arg_text(certutil_exe_path_text());
+    for (const auto& arg : args) {
+        cmd.push_back(L' ');
+        cmd += quote_windows_arg_text(arg);
+    }
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    DWORD start = GetTickCount();
+    std::vector<wchar_t> cmd_buf(cmd.begin(), cmd.end());
+    cmd_buf.push_back(L'\0');
+    BOOL created = CreateProcessW(nullptr, cmd_buf.data(), nullptr, nullptr, FALSE,
+        CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT, nullptr, nullptr, &si, &pi);
+    if (!created) {
+        gle = GetLastError();
+        elapsed_ms = GetTickCount() - start;
+        return false;
+    }
+    DWORD wait = WaitForSingleObject(pi.hProcess, timeout_ms);
+    elapsed_ms = GetTickCount() - start;
+    if (wait == WAIT_TIMEOUT) {
+        TerminateProcess(pi.hProcess, ERROR_TIMEOUT);
+        WaitForSingleObject(pi.hProcess, 2000);
+        gle = ERROR_TIMEOUT;
+        GetExitCodeProcess(pi.hProcess, &exit_code);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        return false;
+    }
+    if (wait != WAIT_OBJECT_0) {
+        gle = GetLastError();
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        return false;
+    }
+    if (!GetExitCodeProcess(pi.hProcess, &exit_code)) {
+        gle = GetLastError();
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        return false;
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return exit_code == 0;
+}
+
+static bool run_certutil_store_add_text(bool system_wide, const std::string& store_name, const std::wstring& cert_path,
+                                        DWORD& exit_code, DWORD& gle, DWORD& elapsed_ms) {
+    std::vector<std::wstring> args;
+    args.push_back(L"-f");
+    if (!system_wide)
+        args.push_back(L"-user");
+    args.push_back(L"-addstore");
+    args.push_back(widen_ascii_text(store_name));
+    args.push_back(cert_path);
+    return run_certutil_args_text(args, 15000, exit_code, gle, elapsed_ms);
+}
+
+static bool run_certutil_store_delete_text(bool system_wide, const std::string& store_name, const std::string& thumbprint,
+                                           DWORD& exit_code, DWORD& gle, DWORD& elapsed_ms) {
+    std::vector<std::wstring> args;
+    args.push_back(L"-f");
+    if (!system_wide)
+        args.push_back(L"-user");
+    args.push_back(L"-delstore");
+    args.push_back(widen_ascii_text(store_name));
+    args.push_back(widen_ascii_text(thumbprint));
+    return run_certutil_args_text(args, 15000, exit_code, gle, elapsed_ms);
+}
+
+static bool run_certutil_store_probe_text(bool system_wide, const std::string& store_name, const std::string& thumbprint,
+                                          DWORD& exit_code, DWORD& gle, DWORD& elapsed_ms) {
+    std::vector<std::wstring> args;
+    if (!system_wide)
+        args.push_back(L"-user");
+    args.push_back(L"-store");
+    args.push_back(widen_ascii_text(store_name));
+    args.push_back(widen_ascii_text(thumbprint));
+    return run_certutil_args_text(args, 10000, exit_code, gle, elapsed_ms);
 }
 
 static bool is_plausible_pointer(std::uint64_t val) {
@@ -1829,71 +2018,78 @@ cert_injection_result_t CertificateInjector::inject_certificate(const cert_injec
 
 
     std::string store_name = config.store_name.empty() ? "ROOT" : config.store_name;
-    std::wstring store_name_w(store_name.begin(), store_name.end());
     result.store_name = store_name;
 
 
-    DWORD store_flags = config.system_wide ?
-        CERT_SYSTEM_STORE_LOCAL_MACHINE : CERT_SYSTEM_STORE_CURRENT_USER;
-
-    diag::log_tagged_fmt("net_sec", "inject_certificate CertOpenStore existing enter store=%s flags=0x%08lX elapsed_ms=%llu",
-        store_name.c_str(),
-        static_cast<unsigned long>(store_flags | CERT_STORE_OPEN_EXISTING_FLAG),
-        static_cast<unsigned long long>(GetTickCount64() - t0));
-    HCERTSTORE hStore = CertOpenStore(
-        CERT_STORE_PROV_SYSTEM_W, 0, 0,
-        store_flags | CERT_STORE_OPEN_EXISTING_FLAG,
-        store_name_w.c_str());
-    diag::log_tagged_fmt("net_sec", "inject_certificate CertOpenStore existing result store=%p gle=%lu elapsed_ms=%llu",
-        hStore,
-        static_cast<unsigned long>(hStore ? 0 : GetLastError()),
-        static_cast<unsigned long long>(GetTickCount64() - t0));
-
-    if (!hStore) {
-
-        diag::log_tagged_fmt("net_sec", "inject_certificate CertOpenStore create enter store=%s flags=0x%08lX elapsed_ms=%llu",
+    if (!valid_cert_store_name_text(store_name)) {
+        diag::log_tagged_fmt("net_sec", "inject_certificate invalid_store store=%s elapsed_ms=%llu",
             store_name.c_str(),
-            static_cast<unsigned long>(store_flags),
             static_cast<unsigned long long>(GetTickCount64() - t0));
-        hStore = CertOpenStore(
-            CERT_STORE_PROV_SYSTEM_W, 0, 0,
-            store_flags, store_name_w.c_str());
-        diag::log_tagged_fmt("net_sec", "inject_certificate CertOpenStore create result store=%p gle=%lu elapsed_ms=%llu",
-            hStore,
-            static_cast<unsigned long>(hStore ? 0 : GetLastError()),
-            static_cast<unsigned long long>(GetTickCount64() - t0));
-    }
-
-    if (!hStore) {
         CertFreeCertificateContext(cert_ctx);
         result.success = false;
         return result;
     }
 
-
-    diag::log_tagged_fmt("net_sec", "inject_certificate CertAddCertificateContextToStore enter store=%s elapsed_ms=%llu",
+    std::wstring temp_cert_path;
+    DWORD temp_gle = ERROR_SUCCESS;
+    diag::log_tagged_fmt("net_sec", "inject_certificate temp_write enter store=%s der_size=%zu elapsed_ms=%llu",
         store_name.c_str(),
+        cert_data.size(),
         static_cast<unsigned long long>(GetTickCount64() - t0));
-    if (CertAddCertificateContextToStore(hStore, cert_ctx,
-                                         CERT_STORE_ADD_REPLACE_EXISTING, nullptr)) {
+    if (!write_temp_cert_der_file_text(cert_ctx->pbCertEncoded, cert_ctx->cbCertEncoded, temp_cert_path, temp_gle)) {
+        diag::log_tagged_fmt("net_sec", "inject_certificate temp_write failed gle=%lu elapsed_ms=%llu",
+            static_cast<unsigned long>(temp_gle),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        CertFreeCertificateContext(cert_ctx);
+        result.success = false;
+        return result;
+    }
+
+    DWORD add_exit = 0;
+    DWORD add_gle = ERROR_SUCCESS;
+    DWORD add_elapsed = 0;
+    diag::log_tagged_fmt("net_sec", "inject_certificate certutil_add enter store=%s system_wide=%d elapsed_ms=%llu",
+        store_name.c_str(),
+        config.system_wide ? 1 : 0,
+        static_cast<unsigned long long>(GetTickCount64() - t0));
+    const bool add_ok = run_certutil_store_add_text(config.system_wide, store_name, temp_cert_path, add_exit, add_gle, add_elapsed);
+    diag::log_tagged_fmt("net_sec", "inject_certificate certutil_add result ok=%d exit=%lu gle=%lu child_elapsed_ms=%lu elapsed_ms=%llu",
+        add_ok ? 1 : 0,
+        static_cast<unsigned long>(add_exit),
+        static_cast<unsigned long>(add_gle),
+        static_cast<unsigned long>(add_elapsed),
+        static_cast<unsigned long long>(GetTickCount64() - t0));
+    DeleteFileW(temp_cert_path.c_str());
+
+    DWORD probe_exit = 0;
+    DWORD probe_gle = ERROR_SUCCESS;
+    DWORD probe_elapsed = 0;
+    const bool probe_ok = add_ok &&
+        run_certutil_store_probe_text(config.system_wide, store_name, result.thumbprint, probe_exit, probe_gle, probe_elapsed);
+    diag::log_tagged_fmt("net_sec", "inject_certificate certutil_probe result ok=%d exit=%lu gle=%lu child_elapsed_ms=%lu elapsed_ms=%llu",
+        probe_ok ? 1 : 0,
+        static_cast<unsigned long>(probe_exit),
+        static_cast<unsigned long>(probe_gle),
+        static_cast<unsigned long>(probe_elapsed),
+        static_cast<unsigned long long>(GetTickCount64() - t0));
+
+    if (add_ok && probe_ok) {
         result.success = true;
-        result.method = config.system_wide ? "SystemStore" : "UserStore";
+        result.method = config.system_wide ? "CertUtilSystemStore" : "CertUtilUserStore";
         {
             std::lock_guard<std::mutex> lock(_mutex);
             _injected.push_back(result.thumbprint);
         }
-        diag::log_tagged_fmt("net_sec", "inject_certificate CertAddCertificateContextToStore ok thumbprint_len=%zu elapsed_ms=%llu",
+        diag::log_tagged_fmt("net_sec", "inject_certificate certutil ok thumbprint_len=%zu elapsed_ms=%llu",
             result.thumbprint.size(),
             static_cast<unsigned long long>(GetTickCount64() - t0));
     } else {
-        diag::log_tagged_fmt("net_sec", "inject_certificate CertAddCertificateContextToStore failed gle=%lu elapsed_ms=%llu",
-            static_cast<unsigned long>(GetLastError()),
+        diag::log_tagged_fmt("net_sec", "inject_certificate certutil failed add_ok=%d probe_ok=%d elapsed_ms=%llu",
+            add_ok ? 1 : 0,
+            probe_ok ? 1 : 0,
             static_cast<unsigned long long>(GetTickCount64() - t0));
     }
 
-    diag::log_tagged_fmt("net_sec", "inject_certificate CertCloseStore enter elapsed_ms=%llu",
-        static_cast<unsigned long long>(GetTickCount64() - t0));
-    CertCloseStore(hStore, 0);
     CertFreeCertificateContext(cert_ctx);
     diag::log_tagged_fmt("net_sec", "inject_certificate exit success=%d elapsed_ms=%llu",
         result.success ? 1 : 0,
@@ -1907,37 +2103,27 @@ bool CertificateInjector::remove_certificate(const std::string& thumbprint, cons
         thumbprint.size(), store_name.c_str(), static_cast<unsigned long>(GetCurrentThreadId()));
 
     std::string sn = store_name.empty() ? "ROOT" : store_name;
-    std::wstring store_name_w(sn.begin(), sn.end());
-
-    diag::log_tagged_fmt("net_sec", "remove_certificate CertOpenStore enter elapsed_ms=%llu",
-        static_cast<unsigned long long>(GetTickCount64() - t0));
-    HCERTSTORE hStore = CertOpenStore(
-        CERT_STORE_PROV_SYSTEM_W, 0, 0,
-        CERT_SYSTEM_STORE_CURRENT_USER | CERT_STORE_OPEN_EXISTING_FLAG,
-        store_name_w.c_str());
-    if (!hStore) {
-        diag::log_tagged_fmt("net_sec", "remove_certificate CertOpenStore failed gle=%lu elapsed_ms=%llu",
-            static_cast<unsigned long>(GetLastError()),
+    if (!valid_cert_store_name_text(sn) || thumbprint.empty()) {
+        diag::log_tagged_fmt("net_sec", "remove_certificate invalid_input store=%s thumbprint_len=%zu elapsed_ms=%llu",
+            sn.c_str(),
+            thumbprint.size(),
             static_cast<unsigned long long>(GetTickCount64() - t0));
         return false;
     }
 
-    auto thumb_bytes = hex_to_bytes(thumbprint);
-    CRYPT_HASH_BLOB hash_blob;
-    hash_blob.cbData = static_cast<DWORD>(thumb_bytes.size());
-    hash_blob.pbData = thumb_bytes.data();
-
-    PCCERT_CONTEXT found = CertFindCertificateInStore(
-        hStore, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0,
-        CERT_FIND_HASH, &hash_blob, nullptr);
-
-    bool removed = false;
-    if (found) {
-        removed = CertDeleteCertificateFromStore(found) != 0;
-
-    }
-
-    CertCloseStore(hStore, 0);
+    DWORD del_exit = 0;
+    DWORD del_gle = ERROR_SUCCESS;
+    DWORD del_elapsed = 0;
+    diag::log_tagged_fmt("net_sec", "remove_certificate certutil_delete enter store=%s elapsed_ms=%llu",
+        sn.c_str(),
+        static_cast<unsigned long long>(GetTickCount64() - t0));
+    bool removed = run_certutil_store_delete_text(false, sn, thumbprint, del_exit, del_gle, del_elapsed);
+    diag::log_tagged_fmt("net_sec", "remove_certificate certutil_delete result ok=%d exit=%lu gle=%lu child_elapsed_ms=%lu elapsed_ms=%llu",
+        removed ? 1 : 0,
+        static_cast<unsigned long>(del_exit),
+        static_cast<unsigned long>(del_gle),
+        static_cast<unsigned long>(del_elapsed),
+        static_cast<unsigned long long>(GetTickCount64() - t0));
 
     if (removed) {
         std::lock_guard<std::mutex> lock(_mutex);
@@ -3374,6 +3560,7 @@ bool AutoResponder::start() {
 }
 
 bool AutoResponder::stop() {
+    const ULONGLONG t0 = GetTickCount64();
     diag::log_tagged_fmt("net_sec", "AutoResponder::stop entry active=%d joinable=%d device=%p connected=%d tid=%lu",
         _active.load() ? 1 : 0,
         _responder_thread.joinable() ? 1 : 0,
@@ -3381,29 +3568,39 @@ bool AutoResponder::stop() {
         device && device->is_connected() ? 1 : 0,
         static_cast<unsigned long>(GetCurrentThreadId()));
     if (!_active.load()) {
-        diag::log_tagged("net_sec", "AutoResponder::stop rejected inactive");
-        return false;
+        diag::log_tagged("net_sec", "AutoResponder::stop inactive_noop");
+        return true;
     }
     _active.store(false);
-    if (_responder_thread.joinable()) {
-        const ULONGLONG t0 = GetTickCount64();
-        _responder_thread.join();
-        diag::log_tagged_fmt("net_sec", "AutoResponder::stop worker_joined elapsed_ms=%llu",
+    if (device && device->is_connected()) {
+        bool stopped = device->intercept_op(2, 0, 0, 0);
+        diag::log_tagged_fmt("net_sec", "AutoResponder::stop intercept_stop result=%d elapsed_ms=%llu",
+            stopped ? 1 : 0,
             static_cast<unsigned long long>(GetTickCount64() - t0));
+    }
+    if (_responder_thread.joinable()) {
+        diag::log_tagged_fmt("net_sec", "AutoResponder::stop worker_join_begin elapsed_ms=%llu",
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        if (_responder_thread.join_for(1000)) {
+            diag::log_tagged_fmt("net_sec", "AutoResponder::stop worker_joined elapsed_ms=%llu",
+                static_cast<unsigned long long>(GetTickCount64() - t0));
+        } else {
+            diag::log_tagged_fmt("net_sec", "AutoResponder::stop worker_join_timeout detach elapsed_ms=%llu",
+                static_cast<unsigned long long>(GetTickCount64() - t0));
+            _responder_thread.detach();
+        }
     } else if (_threadpool_worker.load(std::memory_order_acquire)) {
-        const ULONGLONG t0 = GetTickCount64();
-        const bool done = wait_worker_done(5000);
+        const bool done = wait_worker_done(1000);
         diag::log_tagged_fmt("net_sec", "AutoResponder::stop threadpool_worker_done=%d elapsed_ms=%llu",
             done ? 1 : 0,
             static_cast<unsigned long long>(GetTickCount64() - t0));
         _threadpool_worker.store(false, std::memory_order_release);
     }
 
-    if (device && device->is_connected()) {
-        bool stopped = device->intercept_op(2, 0, 0, 0);
-        diag::log_tagged_fmt("net_sec", "AutoResponder::stop intercept_stop result=%d", stopped ? 1 : 0);
-    }
-
+    diag::log_tagged_fmt("net_sec", "AutoResponder::stop exit active=%d worker_done=%d elapsed_ms=%llu",
+        _active.load() ? 1 : 0,
+        _worker_done.load(std::memory_order_acquire) ? 1 : 0,
+        static_cast<unsigned long long>(GetTickCount64() - t0));
     return true;
 }
 

@@ -35,7 +35,11 @@ struct firefox_profile_status_t {
     bool runtime_validation_valid = false;
     bool post_launch_profile_validated = false;
     bool launched = false;
+    bool timed_out = false;
     uint32_t launched_pid = 0;
+    uint32_t timeout_ms = 0;
+    uint32_t last_win32_error = 0;
+    uint64_t elapsed_ms = 0;
     std::string firefox_path;
     std::filesystem::path profile_path;
     std::filesystem::path user_js_path;
@@ -45,6 +49,7 @@ struct firefox_profile_status_t {
     std::string proxy_endpoint;
     std::string launch_arguments;
     std::string error;
+    std::string last_operation;
     std::vector<std::string> notes;
 };
 

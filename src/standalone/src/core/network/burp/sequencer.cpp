@@ -6,13 +6,9 @@
 #endif
 
 #include "sequencer.hpp"
+#include "audit_http.hpp"
 #include "../../infra/work_queue.hpp"
 #include "helpers/diag_log.hpp"
-
-#ifndef CPPHTTPLIB_OPENSSL_SUPPORT
-#define CPPHTTPLIB_OPENSSL_SUPPORT
-#endif
-#include "httplib.h"
 
 #include <algorithm>
 #include <atomic>
@@ -75,22 +71,6 @@ static uint64_t now_ms()
     return static_cast<uint64_t>(duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count());
 }
 
-static std::string make_origin(const std::string& url_or_origin, const std::string& host, uint16_t port, bool use_tls)
-{
-    if (!url_or_origin.empty()) {
-        if (url_or_origin.rfind("http://", 0) == 0 || url_or_origin.rfind("https://", 0) == 0) {
-            size_t scheme_end = url_or_origin.find("://");
-            size_t path_start = url_or_origin.find('/', scheme_end + 3);
-            if (path_start == std::string::npos) return url_or_origin;
-            return url_or_origin.substr(0, path_start);
-        }
-    }
-    std::string origin = (use_tls ? "https://" : "http://") + host;
-    bool default_port = (use_tls && port == 443) || (!use_tls && port == 80);
-    if (!default_port) origin += ":" + std::to_string(static_cast<int>(port));
-    return origin;
-}
-
 static std::string extract_path(const std::string& url)
 {
     if (url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0) {
@@ -103,71 +83,70 @@ static std::string extract_path(const std::string& url)
     return "/" + url;
 }
 
+static std::vector<uint8_t> build_default_request(const std::string& host, uint16_t port, bool tls, const std::string& path)
+{
+    std::string authority = host;
+    const bool default_port = (tls && port == 443) || (!tls && port == 80);
+    if (!default_port) {
+        authority += ":";
+        authority += std::to_string(static_cast<unsigned>(port));
+    }
+    std::string req;
+    req.reserve(path.size() + authority.size() + 96);
+    req += "GET ";
+    req += path.empty() ? "/" : path;
+    req += " HTTP/1.1\r\nHost: ";
+    req += authority;
+    req += "\r\nUser-Agent: AiDA-Sequencer\r\nConnection: close\r\n\r\n";
+    return std::vector<uint8_t>(req.begin(), req.end());
+}
+
 static bool perform_one_request(const collection_config_t& cfg, const std::regex& re, std::string& out_token, std::string& out_err)
 {
     diag::log_tagged_fmt("sequencer", "perform_one_request entry host=%s port=%u tls=%d url=%s",
         cfg.host.c_str(), (unsigned)cfg.port, (int)cfg.use_tls, cfg.url.c_str());
-    std::string origin = make_origin(cfg.url, cfg.host, cfg.port, cfg.use_tls);
+    std::string scheme;
+    std::string host = cfg.host;
+    uint16_t port = cfg.port;
+    bool tls = cfg.use_tls;
     std::string path = cfg.url.empty() ? "/" : extract_path(cfg.url);
-
-    httplib::Client cli(origin);
-    cli.set_connection_timeout(10);
-    cli.set_read_timeout(20);
-    cli.set_write_timeout(10);
-    cli.enable_server_certificate_verification(false);
-    cli.set_follow_location(true);
-
-    httplib::Result res;
-    if (!cfg.raw_request.empty()) {
-        std::string method = "GET";
-        for (size_t i = 0; i < cfg.raw_request.size() && i < 16; ++i) {
-            char c = static_cast<char>(cfg.raw_request[i]);
-            if (c == ' ') {
-                method.assign(cfg.raw_request.begin(), cfg.raw_request.begin() + static_cast<ptrdiff_t>(i));
-                break;
-            }
+    if (!cfg.url.empty() && (cfg.url.rfind("http://", 0) == 0 || cfg.url.rfind("https://", 0) == 0)) {
+        if (!aida::burp::audit_http::parse_url(cfg.url, scheme, host, port, path)) {
+            out_err = "url_parse_failed";
+            diag::log_tagged_fmt("sequencer", "perform_one_request error url_parse_failed url=%s", cfg.url.c_str());
+            return false;
         }
-        std::string upper = method;
-        for (auto& c : upper) c = static_cast<char>(::toupper(static_cast<unsigned char>(c)));
-
-        std::string raw_body;
-        size_t hdr_end = 0;
-        for (size_t i = 0; i + 3 < cfg.raw_request.size(); ++i) {
-            if (cfg.raw_request[i] == '\r' && cfg.raw_request[i + 1] == '\n' &&
-                cfg.raw_request[i + 2] == '\r' && cfg.raw_request[i + 3] == '\n') {
-                hdr_end = i + 4;
-                break;
-            }
-        }
-        if (hdr_end > 0 && hdr_end < cfg.raw_request.size()) {
-            raw_body.assign(reinterpret_cast<const char*>(cfg.raw_request.data() + hdr_end),
-                            cfg.raw_request.size() - hdr_end);
-        }
-
-        if (upper == "POST") {
-            res = cli.Post(path.c_str(), raw_body, "application/octet-stream");
-        } else if (upper == "PUT") {
-            res = cli.Put(path.c_str(), raw_body, "application/octet-stream");
-        } else if (upper == "DELETE") {
-            res = cli.Delete(path.c_str());
-        } else {
-            res = cli.Get(path.c_str());
-        }
-    } else {
-        res = cli.Get(path.c_str());
+        tls = (scheme == "https");
     }
-
-    if (!res) {
-        diag::log_tagged_fmt("sequencer", "perform_one_request error transport_error url=%s", cfg.url.c_str());
-        out_err = "transport_error";
+    if (host.empty()) {
+        out_err = "host_empty";
+        diag::log_tagged_fmt("sequencer", "perform_one_request error host_empty url=%s", cfg.url.c_str());
         return false;
     }
-    diag::log_tagged_fmt("sequencer", "perform_one_request http_ok status=%d body_len=%zu", res->status, res->body.size());
+    std::vector<uint8_t> request = cfg.raw_request.empty() ? build_default_request(host, port, tls, path) : cfg.raw_request;
+    aida::burp::audit_http::send_options_t options;
+    options.timeout_ms = 3000;
+    options.follow_redirects = true;
+    options.max_redirects = 3;
+    options.enforce_scope = false;
+    auto exchange = aida::burp::audit_http::send(request, host, port, tls, options);
+    if (!exchange) {
+        const std::string detail = aida::burp::audit_http::last_error();
+        out_err = detail.empty() ? "transport_error" : "transport_error:" + detail;
+        diag::log_tagged_fmt("sequencer", "perform_one_request error transport_error host=%s port=%u tls=%d path=%s detail=%s",
+            host.c_str(), static_cast<unsigned>(port), tls ? 1 : 0, path.c_str(), detail.c_str());
+        return false;
+    }
+
+    std::string body(exchange->resp_body.begin(), exchange->resp_body.end());
+    diag::log_tagged_fmt("sequencer", "perform_one_request http_ok host=%s port=%u tls=%d status=%d body_len=%zu latency_ms=%llu",
+        host.c_str(), static_cast<unsigned>(port), tls ? 1 : 0, exchange->status_code, body.size(),
+        static_cast<unsigned long long>(exchange->latency_ms));
 
     std::smatch m;
-    if (!std::regex_search(res->body, m, re)) {
+    if (!std::regex_search(body, m, re)) {
         std::string composite;
-        for (const auto& h : res->headers) {
+        for (const auto& h : exchange->resp_headers) {
             composite += h.first;
             composite += ": ";
             composite += h.second;
@@ -176,7 +155,8 @@ static bool perform_one_request(const collection_config_t& cfg, const std::regex
         if (std::regex_search(composite, m, re)) {
             diag::log_tagged_fmt("sequencer", "perform_one_request extracted_from_headers");
         } else {
-            diag::log_tagged_fmt("sequencer", "perform_one_request error extraction_miss url=%s", cfg.url.c_str());
+            diag::log_tagged_fmt("sequencer", "perform_one_request error extraction_miss host=%s port=%u path=%s status=%d",
+                host.c_str(), static_cast<unsigned>(port), path.c_str(), exchange->status_code);
             out_err = "extraction_miss";
             return false;
         }
@@ -187,9 +167,11 @@ static bool perform_one_request(const collection_config_t& cfg, const std::regex
     if (m.size() > 1) {
         if (static_cast<size_t>(group) < m.size()) {
             out_token = m[group].str();
+            diag::log_tagged_fmt("sequencer", "perform_one_request extracted token_len=%zu group=%d", out_token.size(), group);
             return true;
         }
         out_token = m[0].str();
+        diag::log_tagged_fmt("sequencer", "perform_one_request extracted token_len=%zu fallback_group=0", out_token.size());
         return true;
     }
     out_token = m[0].str();

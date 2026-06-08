@@ -133,26 +133,40 @@ namespace {
 			r.ok = false;
 			return;
 		}
+		device->sync_dynamic_security_state();
 		const std::uint32_t attached_pid = driver_bridge::attached_pid();
 		const std::uint32_t device_pid = device->get_process_id();
 		driver_bridge::thread_info_t before{};
 		driver_bridge::thread_info_t after{};
 		const bool before_found = find_thread_snapshot(s.pid, s.tid, before);
+		const DWORD thread_access = THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION;
+		SetLastError(ERROR_SUCCESS);
+		HANDLE access_probe = OpenThread(thread_access, FALSE, s.tid);
+		const DWORD access_error = access_probe ? ERROR_SUCCESS : GetLastError();
+		if (access_probe) {
+			CloseHandle(access_probe);
+		}
 		push_u32_field(r, "input_pid", s.pid);
 		push_u32_field(r, "input_tid", s.tid);
 		push_u32_field(r, "attached_pid", attached_pid);
 		push_u32_field(r, "device_pid", device_pid);
 		push_hex_field(r, "ioctl_code", ioctl_codes::TCTX());
 		push_u64_dec_field(r, "request_size", sizeof(voyager::detail::thread_ctx_request));
+		push_hex_field(r, "thread_access_mask", thread_access);
+		push_bool_field(r, "thread_access_open_ok", access_probe != nullptr);
+		push_u32_field(r, "thread_access_last_error", access_error);
 		push_thread_snapshot(r, "thread_before", before_found, before);
 		::diag::log_tagged_fmt("testlab_tctx",
-			"START pid=%u tid=%u attached_pid=%u device_pid=%u ioctl=0x%08X request_size=%zu before_found=%d before_state=%u before_rip=0x%llX",
+			"START pid=%u tid=%u attached_pid=%u device_pid=%u ioctl=0x%08X request_size=%zu thread_access=0x%08lX access_open=%d access_gle=%lu before_found=%d before_state=%u before_rip=0x%llX",
 			s.pid,
 			s.tid,
 			attached_pid,
 			device_pid,
 			ioctl_codes::TCTX(),
 			sizeof(voyager::detail::thread_ctx_request),
+			static_cast<unsigned long>(thread_access),
+			access_probe != nullptr ? 1 : 0,
+			static_cast<unsigned long>(access_error),
 			before_found ? 1 : 0,
 			before.state,
 			static_cast<unsigned long long>(before.rip));
@@ -161,7 +175,7 @@ namespace {
 		req.tid = s.tid;
 		req.should_set = 0;
 		req.padding = 0;
-		req.register_mask = 0xFFFFFFFFFFFFFFFFull;
+		req.register_mask = 0;
 		std::uint32_t bytes_returned = 0;
 		SetLastError(ERROR_SUCCESS);
 		const std::uint64_t raw_start = static_cast<std::uint64_t>(GetTickCount64());
@@ -171,6 +185,7 @@ namespace {
 		r.bytes_returned = bytes_returned;
 		r.raw.resize(sizeof(req));
 		std::memcpy(r.raw.data(), &req, sizeof(req));
+		const voyager::detail::thread_ctx_request raw_req = req;
 		const bool raw_context_valid = req.rip != 0 && req.rsp != 0;
 		push_bool_field(r, "raw_ioctl_ok", ok);
 		push_u32_field(r, "raw_ioctl_last_error", raw_error);
@@ -201,15 +216,21 @@ namespace {
 				push_u32_field(r, "fallback_helper_last_error", helper_error);
 				push_u64_dec_field(r, "fallback_helper_elapsed_ms", helper_elapsed);
 				push_bool_field(r, "fallback_context_valid", helper_valid);
+				push_bool_field(r, "fallback_helper_matches_raw_rip", raw_req.rip != 0 && raw_req.rip == ctx.rip);
+				push_bool_field(r, "fallback_helper_matches_raw_rsp", raw_req.rsp != 0 && raw_req.rsp == ctx.rsp);
 				::diag::log_tagged_fmt("testlab_tctx",
-					"FALLBACK pid=%u tid=%u helper_ok=%d gle=%lu elapsed_ms=%llu rip=0x%llX rsp=0x%llX",
+					"FALLBACK pid=%u tid=%u helper_ok=%d gle=%lu elapsed_ms=%llu rip=0x%llX rsp=0x%llX raw_rip=0x%llX raw_rsp=0x%llX rip_match=%d rsp_match=%d",
 					s.pid,
 					s.tid,
 					helper_ok ? 1 : 0,
 					static_cast<unsigned long>(helper_error),
 					static_cast<unsigned long long>(helper_elapsed),
 					static_cast<unsigned long long>(ctx.rip),
-					static_cast<unsigned long long>(ctx.rsp));
+					static_cast<unsigned long long>(ctx.rsp),
+					static_cast<unsigned long long>(raw_req.rip),
+					static_cast<unsigned long long>(raw_req.rsp),
+					(raw_req.rip != 0 && raw_req.rip == ctx.rip) ? 1 : 0,
+					(raw_req.rsp != 0 && raw_req.rsp == ctx.rsp) ? 1 : 0);
 				if (helper_valid) {
 					copy_context_to_request(req, ctx);
 					req.pid = s.pid;
@@ -220,10 +241,13 @@ namespace {
 					r.raw.resize(sizeof(req));
 					std::memcpy(r.raw.data(), &req, sizeof(req));
 					push_text_field(r, "tctx_pass_path", "device_get_thread_context_retry");
+					push_bool_field(r, "raw_ioctl_degraded", true);
+					push_text_field(r, "raw_ioctl_result", "raw TCTX IOCTL failed but device_t public fallback returned a valid context");
 					push_context_fields(r, req);
 					const bool after_found = find_thread_snapshot(s.pid, s.tid, after);
 					push_thread_snapshot(r, "thread_after", after_found, after);
 					r.ntstatus = 0;
+					r.error.clear();
 					r.ok = true;
 					return;
 				}
@@ -238,15 +262,21 @@ namespace {
 				push_u32_field(r, "fallback_bridge_last_error", bridge_error);
 				push_u64_dec_field(r, "fallback_bridge_elapsed_ms", bridge_elapsed);
 				push_bool_field(r, "fallback_bridge_context_valid", bridge_valid);
+				push_bool_field(r, "fallback_bridge_matches_raw_rip", raw_req.rip != 0 && raw_req.rip == bridge_ctx.rip);
+				push_bool_field(r, "fallback_bridge_matches_raw_rsp", raw_req.rsp != 0 && raw_req.rsp == bridge_ctx.rsp);
 				::diag::log_tagged_fmt("testlab_tctx",
-					"BRIDGE_FALLBACK pid=%u tid=%u bridge_ok=%d gle=%lu elapsed_ms=%llu rip=0x%llX rsp=0x%llX",
+					"BRIDGE_FALLBACK pid=%u tid=%u bridge_ok=%d gle=%lu elapsed_ms=%llu rip=0x%llX rsp=0x%llX raw_rip=0x%llX raw_rsp=0x%llX rip_match=%d rsp_match=%d",
 					s.pid,
 					s.tid,
 					bridge_ok ? 1 : 0,
 					static_cast<unsigned long>(bridge_error),
 					static_cast<unsigned long long>(bridge_elapsed),
 					static_cast<unsigned long long>(bridge_ctx.rip),
-					static_cast<unsigned long long>(bridge_ctx.rsp));
+					static_cast<unsigned long long>(bridge_ctx.rsp),
+					static_cast<unsigned long long>(raw_req.rip),
+					static_cast<unsigned long long>(raw_req.rsp),
+					(raw_req.rip != 0 && raw_req.rip == bridge_ctx.rip) ? 1 : 0,
+					(raw_req.rsp != 0 && raw_req.rsp == bridge_ctx.rsp) ? 1 : 0);
 				if (bridge_valid) {
 					copy_context_to_request(req, bridge_ctx);
 					req.pid = s.pid;
@@ -257,10 +287,13 @@ namespace {
 					r.raw.resize(sizeof(req));
 					std::memcpy(r.raw.data(), &req, sizeof(req));
 					push_text_field(r, "tctx_pass_path", "driver_bridge_get_thread_context_retry");
+					push_bool_field(r, "raw_ioctl_degraded", true);
+					push_text_field(r, "raw_ioctl_result", "raw TCTX IOCTL failed but driver_bridge public fallback returned a valid context");
 					push_context_fields(r, req);
 					const bool after_found = find_thread_snapshot(s.pid, s.tid, after);
 					push_thread_snapshot(r, "thread_after", after_found, after);
 					r.ntstatus = 0;
+					r.error.clear();
 					r.ok = true;
 					return;
 				}

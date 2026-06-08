@@ -4,7 +4,7 @@
 #endif
 #include <windows.h>
 
-#include "guest_lab_bridge.hpp"
+#include "vm_guest_bridge.hpp"
 #include "../../helpers/diag_log.hpp"
 
 #include <atomic>
@@ -20,7 +20,7 @@
 
 namespace fs = std::filesystem;
 
-namespace guest_lab {
+namespace vm_guest_bridge {
 namespace {
 
 std::mutex g_mtx;
@@ -127,7 +127,7 @@ void log_request_state(const char* phase,
 	const uint32_t pending_requests = count_json_files(requests, &pending_requests_error);
 	const uint32_t pending_responses = count_json_files(responses, &pending_responses_error);
 	const uint64_t age_ms = session.started_ms != 0 && now_ms() >= session.started_ms ? now_ms() - session.started_ms : 0;
-	diag::log_tagged_fmt("guest_lab",
+	diag::log_tagged_fmt("vm_guest_bridge",
 		"%s id='%s' command='%s' timeout_ms=%u elapsed_ms=%llu session_age_ms=%llu bridge='%s' requests='%s' responses='%s' request_path='%s' response_path='%s' bridge_exists=%d requests_exists=%d responses_exists=%d request_file_exists=%d response_file_exists=%d pending_requests=%u pending_responses=%u bridge_error='%s' requests_error='%s' responses_error='%s' request_file_error='%s' response_file_error='%s' pending_requests_error='%s' pending_responses_error='%s' detail='%s'",
 		phase ? phase : "request_state",
 		id.c_str(),
@@ -232,7 +232,7 @@ void activate(const std::wstring& session_dir, const std::wstring& sample_path) 
 	ec.clear();
 	fs::create_directories(fs::path(next.bridge_dir) / L"artifacts", ec);
 	g_session = std::move(next);
-	diag::log_tagged_fmt("guest_lab",
+	diag::log_tagged_fmt("vm_guest_bridge",
 		"activated session_dir='%s' bridge_dir='%s' sample='%s'",
 		narrow_utf8(g_session.session_dir).c_str(),
 		narrow_utf8(g_session.bridge_dir).c_str(),
@@ -242,7 +242,7 @@ void activate(const std::wstring& session_dir, const std::wstring& sample_path) 
 void deactivate() {
 	std::lock_guard<std::mutex> lk(g_mtx);
 	if (g_session.active) {
-		diag::log_tagged_fmt("guest_lab",
+		diag::log_tagged_fmt("vm_guest_bridge",
 			"deactivated session_dir='%s'",
 			narrow_utf8(g_session.session_dir).c_str());
 	}
@@ -269,7 +269,7 @@ nlohmann::json request(const std::string& command,
 		session = g_session;
 	}
 	if (!session.active) {
-		if (error_out) *error_out = "no active Windows Sandbox guest lab";
+		if (error_out) *error_out = "no active Windows Sandbox VM bridge";
 		return {};
 	}
 	if (timeout_ms == 0) timeout_ms = 5000;
@@ -303,7 +303,7 @@ nlohmann::json request(const std::string& command,
 			" path=" + path_utf8(request_path);
 		return {};
 	}
-	diag::log_tagged_fmt("guest_lab",
+	diag::log_tagged_fmt("vm_guest_bridge",
 		"request_written id='%s' command='%s' timeout_ms=%u request_path='%s' response_path='%s'",
 		id.c_str(), command.c_str(), static_cast<unsigned>(timeout_ms),
 		path_utf8(request_path).c_str(), path_utf8(response_path).c_str());

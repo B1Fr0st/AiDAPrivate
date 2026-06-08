@@ -978,7 +978,7 @@ static tool_result_t handle_search_bytes(const json& params)
     result["returned"]   = arr.size();
     result["matches"]    = std::move(arr);
     if (total_hits == 0)
-        result["note"] = "Searched executable sections only. For .rdata/.data scans attach to a process and use debugger_read_memory ranges.";
+        result["note"] = "Searched executable sections only. For .rdata/.data scans attach to a process and use read_memory ranges.";
     return tool_result_t::ok(result);
 }
 

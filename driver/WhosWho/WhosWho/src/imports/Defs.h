@@ -232,6 +232,8 @@ inline PETHREAD           (NTAPI* _PsGetNextProcessThread)         (PEPROCESS, P
 inline HANDLE             (NTAPI* _PsGetThreadId)                  (PETHREAD);
 inline NTSTATUS           (NTAPI* _PsGetContextThread)             (PETHREAD, PCONTEXT, KPROCESSOR_MODE);
 inline NTSTATUS           (NTAPI* _PsSetContextThread)             (PETHREAD, PCONTEXT, KPROCESSOR_MODE);
+inline NTSTATUS           (NTAPI* _ZwGetContextThread)             (HANDLE, PCONTEXT);
+inline NTSTATUS           (NTAPI* _ZwSetContextThread)             (HANDLE, PCONTEXT);
 inline NTSTATUS           (NTAPI* _PsSuspendThread)                (PETHREAD, PULONG);
 inline NTSTATUS           (NTAPI* _PsResumeThread)                 (PETHREAD, PULONG);
 inline PVOID              (NTAPI* _PsGetProcessPeb)                (PEPROCESS);
@@ -508,19 +510,27 @@ namespace ssdt_resolver {
 
 
     __forceinline NTSTATUS call_NtSuspendThread(HANDLE thread_handle, PULONG prev_count) {
-        if (!g_NtSuspendThread) return STATUS_PROCEDURE_NOT_FOUND;
         if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
-        UNREFERENCED_PARAMETER(thread_handle);
-        UNREFERENCED_PARAMETER(prev_count);
-        return STATUS_NOT_SUPPORTED;
+        if (!thread_handle) return STATUS_INVALID_PARAMETER;
+        if (_ZwSuspendThread) return _ZwSuspendThread(thread_handle, prev_count);
+        if (!g_NtSuspendThread) {
+            find_ssdt();
+            resolve_suspend_resume();
+        }
+        if (!g_NtSuspendThread) return STATUS_PROCEDURE_NOT_FOUND;
+        return g_NtSuspendThread(thread_handle, prev_count);
     }
 
     __forceinline NTSTATUS call_NtResumeThread(HANDLE thread_handle, PULONG prev_count) {
-        if (!g_NtResumeThread) return STATUS_PROCEDURE_NOT_FOUND;
         if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
-        UNREFERENCED_PARAMETER(thread_handle);
-        UNREFERENCED_PARAMETER(prev_count);
-        return STATUS_NOT_SUPPORTED;
+        if (!thread_handle) return STATUS_INVALID_PARAMETER;
+        if (_ZwResumeThread) return _ZwResumeThread(thread_handle, prev_count);
+        if (!g_NtResumeThread) {
+            find_ssdt();
+            resolve_suspend_resume();
+        }
+        if (!g_NtResumeThread) return STATUS_PROCEDURE_NOT_FOUND;
+        return g_NtResumeThread(thread_handle, prev_count);
     }
 
     __forceinline BOOLEAN resolve_thread_context() {
@@ -606,19 +616,27 @@ namespace ssdt_resolver {
     }
 
     __forceinline NTSTATUS call_NtGetContextThread(HANDLE thread_handle, PCONTEXT context) {
-        if (!g_NtGetContextThread) return STATUS_PROCEDURE_NOT_FOUND;
         if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
-        UNREFERENCED_PARAMETER(thread_handle);
-        UNREFERENCED_PARAMETER(context);
-        return STATUS_NOT_SUPPORTED;
+        if (!thread_handle || !context) return STATUS_INVALID_PARAMETER;
+        if (_ZwGetContextThread) return _ZwGetContextThread(thread_handle, context);
+        if (!g_NtGetContextThread) {
+            find_ssdt();
+            resolve_thread_context();
+        }
+        if (!g_NtGetContextThread) return STATUS_PROCEDURE_NOT_FOUND;
+        return g_NtGetContextThread(thread_handle, context);
     }
 
     __forceinline NTSTATUS call_NtSetContextThread(HANDLE thread_handle, PCONTEXT context) {
-        if (!g_NtSetContextThread) return STATUS_PROCEDURE_NOT_FOUND;
         if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
-        UNREFERENCED_PARAMETER(thread_handle);
-        UNREFERENCED_PARAMETER(context);
-        return STATUS_NOT_SUPPORTED;
+        if (!thread_handle || !context) return STATUS_INVALID_PARAMETER;
+        if (_ZwSetContextThread) return _ZwSetContextThread(thread_handle, context);
+        if (!g_NtSetContextThread) {
+            find_ssdt();
+            resolve_thread_context();
+        }
+        if (!g_NtSetContextThread) return STATUS_PROCEDURE_NOT_FOUND;
+        return g_NtSetContextThread(thread_handle, context);
     }
 }
 
@@ -675,6 +693,8 @@ inline bool SetupFunctions() {
     *(PVOID*)&_PsGetThreadId = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsGetThreadId"));
     *(PVOID*)&_PsGetContextThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsGetContextThread"));
     *(PVOID*)&_PsSetContextThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsSetContextThread"));
+    *(PVOID*)&_ZwGetContextThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwGetContextThread"));
+    *(PVOID*)&_ZwSetContextThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwSetContextThread"));
     *(PVOID*)&_PsSuspendThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsSuspendThread"));
     *(PVOID*)&_PsResumeThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsResumeThread"));
     *(PVOID*)&_PsGetProcessPeb = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsGetProcessPeb"));
@@ -731,6 +751,7 @@ inline bool SetupFunctions() {
     WW_LOG("SetupFunctions: _IoDeleteDevice=%p _IoDeleteSymbolicLink=%p", _IoDeleteDevice, _IoDeleteSymbolicLink);
     WW_LOG("SetupFunctions: _PsLookupThreadByThreadId=%p _PsGetNextProcessThread=%p _PsGetThreadId=%p", _PsLookupThreadByThreadId, _PsGetNextProcessThread, _PsGetThreadId);
     WW_LOG("SetupFunctions: _PsGetContextThread=%p _PsSetContextThread=%p _PsSuspendThread=%p _PsResumeThread=%p", _PsGetContextThread, _PsSetContextThread, _PsSuspendThread, _PsResumeThread);
+    WW_LOG("SetupFunctions: _ZwGetContextThread=%p _ZwSetContextThread=%p", _ZwGetContextThread, _ZwSetContextThread);
     WW_LOG("SetupFunctions: _PsGetProcessPeb=%p _ZwQueryVirtualMemory=%p _ZwProtectVirtualMemory=%p", _PsGetProcessPeb, _ZwQueryVirtualMemory, _ZwProtectVirtualMemory);
     WW_LOG("SetupFunctions: _ObOpenObjectByPointer=%p _ZwSuspendThread=%p _ZwResumeThread=%p _ZwSetInformationThread=%p", _ObOpenObjectByPointer, _ZwSuspendThread, _ZwResumeThread, _ZwSetInformationThread);
     WW_LOG("SetupFunctions: _IoFileObjectType=%p _ObGetObjectType=%p _ObReferenceObjectSafe=%p", _IoFileObjectType, _ObGetObjectType, _ObReferenceObjectSafe);

@@ -21,6 +21,7 @@
 #include "standalone_driver.hpp"
 #include "standalone_settings.hpp"
 #include "../infra/critical_work_queue.hpp"
+#include "../runtime/diagnostic_exception_scope.hpp"
 #include "../../helpers/diag_log.hpp"
 
 #include <nlohmann/json.hpp>
@@ -715,6 +716,7 @@ inline bool start_fuzzing()
 					static_cast<unsigned long long>(cfg.input_address),
 					input.size());
 			}
+			aida::diagnostic_exception_scope::scope_t exception_scope("fuzzer.emulate_from_snapshot");
 			auto result = emulation::emulate_from_snapshot(custom_snapshot, emu_cfg);
 			if (iter < 8 || (iter % 1000) == 0) {
 				diag::log_tagged_fmt("fuzzer",
@@ -1165,6 +1167,7 @@ inline void minimize_crash(int crash_index)
 				}
 			}
 
+			aida::diagnostic_exception_scope::scope_t exception_scope("fuzzer.minimize.emulate_from_snapshot");
 			auto result = emulation::emulate_from_snapshot(snap_copy, emu_cfg);
 			if (!result.success && !result.error.empty()) {
 				uint64_t crash_hash = detail::compute_crash_hash(result.end_address, target_crash.type);

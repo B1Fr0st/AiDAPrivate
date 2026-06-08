@@ -12,6 +12,32 @@
 
 namespace {
 
+	struct sdf_probe_t {
+		HANDLE process = nullptr;
+		std::uint64_t peb = 0;
+		std::uint8_t before_being_debugged = 0;
+		std::uint32_t before_nt_global_flag = 0;
+		std::uint8_t after_being_debugged = 0;
+		std::uint32_t after_nt_global_flag = 0;
+		bool opened = false;
+		bool queried = false;
+		bool read_before = false;
+		bool wrote_seed = false;
+		bool read_after = false;
+		bool restored = false;
+		DWORD error = ERROR_SUCCESS;
+	};
+
+	struct sdf_process_basic_info_t {
+		PVOID reserved1 = nullptr;
+		PVOID peb_base_address = nullptr;
+		PVOID reserved2[2]{};
+		ULONG_PTR unique_process_id = 0;
+		PVOID reserved3 = nullptr;
+	};
+
+	using nt_query_information_process_t = LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+
 	bool ensure_driver(test_lab::result_t& r) {
 		if (!device || !device->is_connected()) {
 			r.ok = false;
@@ -43,6 +69,81 @@ namespace {
 		char buf[16];
 		std::snprintf(buf, sizeof(buf), "0x%08X", v);
 		return std::string(buf);
+	}
+
+	bool seed_sdf_probe(std::uint32_t pid, sdf_probe_t& probe) {
+		probe.process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION, FALSE, pid);
+		if (!probe.process) {
+			probe.error = GetLastError();
+			return false;
+		}
+		probe.opened = true;
+		HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+		auto query = ntdll ? reinterpret_cast<nt_query_information_process_t>(GetProcAddress(ntdll, "NtQueryInformationProcess")) : nullptr;
+		if (!query) {
+			probe.error = GetLastError();
+			return false;
+		}
+		sdf_process_basic_info_t pbi{};
+		LONG status = query(probe.process, 0, &pbi, static_cast<ULONG>(sizeof(pbi)), nullptr);
+		if (status < 0 || !pbi.peb_base_address) {
+			probe.error = static_cast<DWORD>(status);
+			return false;
+		}
+		probe.queried = true;
+		probe.peb = reinterpret_cast<std::uint64_t>(pbi.peb_base_address);
+		SIZE_T read_a = 0;
+		SIZE_T read_b = 0;
+		if (!ReadProcessMemory(probe.process, reinterpret_cast<LPCVOID>(probe.peb + 0x02), &probe.before_being_debugged, sizeof(probe.before_being_debugged), &read_a) ||
+			read_a != sizeof(probe.before_being_debugged) ||
+			!ReadProcessMemory(probe.process, reinterpret_cast<LPCVOID>(probe.peb + 0xBC), &probe.before_nt_global_flag, sizeof(probe.before_nt_global_flag), &read_b) ||
+			read_b != sizeof(probe.before_nt_global_flag)) {
+			probe.error = GetLastError();
+			return false;
+		}
+		probe.read_before = true;
+		const std::uint8_t seeded_debugged = static_cast<std::uint8_t>(probe.before_being_debugged | 0x1u);
+		const std::uint32_t seeded_global = probe.before_nt_global_flag | 0x70u;
+		SIZE_T wrote_a = 0;
+		SIZE_T wrote_b = 0;
+		if (!WriteProcessMemory(probe.process, reinterpret_cast<LPVOID>(probe.peb + 0x02), &seeded_debugged, sizeof(seeded_debugged), &wrote_a) ||
+			wrote_a != sizeof(seeded_debugged) ||
+			!WriteProcessMemory(probe.process, reinterpret_cast<LPVOID>(probe.peb + 0xBC), &seeded_global, sizeof(seeded_global), &wrote_b) ||
+			wrote_b != sizeof(seeded_global)) {
+			probe.error = GetLastError();
+			return false;
+		}
+		probe.wrote_seed = true;
+		return true;
+	}
+
+	void finish_sdf_probe(sdf_probe_t& probe) {
+		if (!probe.process)
+			return;
+		if (probe.peb != 0) {
+			SIZE_T read_a = 0;
+			SIZE_T read_b = 0;
+			probe.read_after =
+				ReadProcessMemory(probe.process, reinterpret_cast<LPCVOID>(probe.peb + 0x02), &probe.after_being_debugged, sizeof(probe.after_being_debugged), &read_a) &&
+				read_a == sizeof(probe.after_being_debugged) &&
+				ReadProcessMemory(probe.process, reinterpret_cast<LPCVOID>(probe.peb + 0xBC), &probe.after_nt_global_flag, sizeof(probe.after_nt_global_flag), &read_b) &&
+				read_b == sizeof(probe.after_nt_global_flag);
+			if (!probe.read_after && probe.error == ERROR_SUCCESS)
+				probe.error = GetLastError();
+			if (probe.read_before) {
+				SIZE_T wrote_a = 0;
+				SIZE_T wrote_b = 0;
+				probe.restored =
+					WriteProcessMemory(probe.process, reinterpret_cast<LPVOID>(probe.peb + 0x02), &probe.before_being_debugged, sizeof(probe.before_being_debugged), &wrote_a) &&
+					wrote_a == sizeof(probe.before_being_debugged) &&
+					WriteProcessMemory(probe.process, reinterpret_cast<LPVOID>(probe.peb + 0xBC), &probe.before_nt_global_flag, sizeof(probe.before_nt_global_flag), &wrote_b) &&
+					wrote_b == sizeof(probe.before_nt_global_flag);
+				if (!probe.restored && probe.error == ERROR_SUCCESS)
+					probe.error = GetLastError();
+			}
+		}
+		CloseHandle(probe.process);
+		probe.process = nullptr;
 	}
 
 	std::string format_dec_u64(std::uint64_t v) {
@@ -431,13 +532,15 @@ namespace {
 
 	void render_inputs_sdf(test_lab::state_t& s) {
 		ImGui::InputScalar("PID", ImGuiDataType_U32, &s.pid, nullptr, nullptr, "%u");
-		ImGui::InputScalar("Requested mask (informational, u32_a)", ImGuiDataType_U32, &s.u32_a, nullptr, nullptr, "0x%08X", ImGuiInputTextFlags_CharsHexadecimal);
+		ImGui::InputScalar("Expected clear mask (u32_a, 0 = PEB bits)", ImGuiDataType_U32, &s.u32_a, nullptr, nullptr, "0x%08X", ImGuiInputTextFlags_CharsHexadecimal);
 		ImGui::TextDisabled("Clears EPROCESS.DebugPort, PEB.BeingDebugged, and the heap-debug bits in PEB.NtGlobalFlag. Kernel reports which fields it actually cleared.");
 	}
 
 	void run_sdf(test_lab::state_t& s, test_lab::result_t& r) {
 		if (!ensure_driver(r)) return;
 		if (s.pid == 0) { r.error = "pid must be non-zero"; r.ntstatus = static_cast<std::int32_t>(0xC000000Du); r.ok = false; return; }
+		sdf_probe_t probe{};
+		const bool seeded = seed_sdf_probe(s.pid, probe);
 		voyager::detail::spoof_debug_request req{};
 		req.pid = s.pid;
 		req.result_flags = 0;
@@ -445,9 +548,22 @@ namespace {
 		bool ok = device->send_ioctl_raw(ioctl_codes::SDF(), &req, sizeof(req), bytes_returned);
 		capture_raw_struct(r, &req, sizeof(req));
 		r.bytes_returned = bytes_returned;
-		if (!ok) { set_fail_from_ioctl(r, bytes_returned); return; }
+		finish_sdf_probe(probe);
 		r.parsed.push_back({ "PID", format_dec_u64(s.pid) });
-		r.parsed.push_back({ "Requested mask", format_hex_u32(s.u32_a) });
+		r.parsed.push_back({ "PEB address", format_hex_u64(probe.peb) });
+		r.parsed.push_back({ "Seed opened", seeded && probe.opened ? "1" : "0" });
+		r.parsed.push_back({ "Seed queried", probe.queried ? "1" : "0" });
+		r.parsed.push_back({ "Seed wrote debug bits", probe.wrote_seed ? "1" : "0" });
+		r.parsed.push_back({ "Seed before BeingDebugged", format_hex_u32(probe.before_being_debugged) });
+		r.parsed.push_back({ "Seed before NtGlobalFlag", format_hex_u32(probe.before_nt_global_flag) });
+		r.parsed.push_back({ "Read after", probe.read_after ? "1" : "0" });
+		r.parsed.push_back({ "After BeingDebugged", format_hex_u32(probe.after_being_debugged) });
+		r.parsed.push_back({ "After NtGlobalFlag", format_hex_u32(probe.after_nt_global_flag) });
+		r.parsed.push_back({ "Restored", probe.restored ? "1" : "0" });
+		r.parsed.push_back({ "Probe error", format_hex_u32(probe.error) });
+		if (!ok) { set_fail_from_ioctl(r, bytes_returned); return; }
+		const std::uint32_t expected = s.u32_a != 0 ? s.u32_a : 0x6u;
+		r.parsed.push_back({ "Expected clear mask", format_hex_u32(expected) });
 		r.parsed.push_back({ "Result flags", format_hex_u32(req.result_flags) });
 		std::string cleared;
 		if (req.result_flags & 0x1u) cleared += "DebugPort ";
@@ -456,7 +572,15 @@ namespace {
 		if (cleared.empty()) cleared = "(none)";
 		r.parsed.push_back({ "Cleared fields", cleared });
 		r.ntstatus = 0;
-		r.ok = true;
+		const bool expected_cleared = (req.result_flags & expected) == expected;
+		const bool readback_cleared = probe.read_after &&
+			((probe.after_being_debugged & 0x1u) == 0) &&
+			((probe.after_nt_global_flag & 0x70u) == 0);
+		r.ok = seeded && probe.wrote_seed && expected_cleared && readback_cleared && probe.restored;
+		if (!r.ok) {
+			r.error = "SDF did not prove seeded PEB debug bits were cleared and restored";
+			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
+		}
 	}
 
 	void render_inputs_mex(test_lab::state_t& s) {

@@ -724,10 +724,7 @@ static bool is_camoufox_browser_tool_name(const std::string& name)
 static bool is_standalone_internal_only_tool_name(const std::string& name)
 {
     static const char* const names[] = {
-        "switch_agent", "plan_enter", "plan_exit", "list_agents", "ask_followup_question",
-        "attempt_completion", "update_todo_list", "apply_diff", "apply_patch", "codebase_search",
-        "read_command_output", "save_checkpoint", "restore_checkpoint", "list_checkpoints",
-        "checkpoint_list", "skill", "run_slash_command", "get_context", "workflow_status", "task",
+        "apply_diff", "apply_patch", "codebase_search", "read_command_output",
         "search_workspace", "run_command", "cancel_command", "list_commands"
     };
     for (const char* n : names)
@@ -738,15 +735,99 @@ static bool is_standalone_internal_only_tool_name(const std::string& name)
     return false;
 }
 
+static bool is_standalone_ide_chat_only_tool_name(const std::string& name)
+{
+    static const char* const names[] = {
+        "switch_agent", "plan_enter", "plan_exit", "list_agents", "ask_followup_question",
+        "attempt_completion", "update_todo_list", "save_checkpoint", "restore_checkpoint",
+        "list_checkpoints", "checkpoint_list", "skill", "run_slash_command", "get_context",
+        "workflow_status", "task"
+    };
+    for (const char* n : names)
+    {
+        if (name == n)
+            return true;
+    }
+    return false;
+}
+
+static bool is_standalone_redundant_tool_name(const std::string& name)
+{
+    static const char* const names[] = {
+        "driver_connect",
+        "driver_unattach",
+        "driver_read_memory",
+        "driver_read_string",
+        "driver_enumerate_modules",
+        "driver_enumerate_threads",
+        "driver_query_memory",
+        "debugger_read_memory",
+        "debugger_write_memory",
+        "debugger_protect_memory",
+        "debugger_allocate_memory",
+        "debugger_call_function",
+        "debugger_attach_to_process",
+        "debugger_detach",
+        "debugger_get_threads",
+        "debugger_get_modules",
+        "dbg_set_breakpoint",
+        "dbg_remove_breakpoint",
+        "dbg_list_breakpoints",
+        "dbg_get_callstack",
+        "dbg_run",
+        "dbg_pause",
+        "dbg_step_into",
+        "dbg_step_over",
+        "dbg_step_out",
+        "dbg_get_registers",
+        "dbg_set_register",
+        "dbg_get_memory_map",
+        "dbg_enumerate_handles",
+        "dbg_get_seh_chain",
+        "dbg_list_patches",
+        "driver_enumerate_wfp_callouts",
+        "driver_get_socket_handles",
+        "driver_dump_tcpip_connections",
+        "driver_inject_packet",
+        "driver_modify_packet_rule",
+        "driver_redirect_traffic",
+        "driver_deep_inspect",
+        "driver_intercept_hold",
+        "driver_kill_connection",
+        "driver_spoof_dns",
+        "driver_bandwidth_monitor",
+        "driver_list_interfaces",
+        "driver_export_pcap",
+        "driver_network_fingerprint"
+    };
+    for (const char* n : names)
+    {
+        if (name == n)
+            return true;
+    }
+    if (name.rfind("burp_browser_", 0) == 0 ||
+        name.rfind("burp_headless_", 0) == 0)
+        return true;
+    return false;
+}
+
 static bool is_external_mcp_tool(const tool_def_t& tool)
 {
     return tool.visibility == tool_visibility_t::external_visible &&
+           !is_standalone_ide_chat_only_tool_name(tool.name) &&
            !is_standalone_internal_only_tool_name(tool.name);
 }
 
 bool server_t::register_tool(tool_def_t tool)
 {
-    if (is_standalone_internal_only_tool_name(tool.name))
+    if (is_standalone_redundant_tool_name(tool.name)) {
+        diag::log_tagged_fmt("mcp_srv", "register_tool redundant skipped name='%s'", tool.name.c_str());
+        return false;
+    }
+
+    if (is_standalone_ide_chat_only_tool_name(tool.name))
+        tool.visibility = tool_visibility_t::ide_chat_only;
+    else if (is_standalone_internal_only_tool_name(tool.name))
         tool.visibility = tool_visibility_t::internal_only;
 
     bool already_has_binary_id = false;
@@ -988,7 +1069,9 @@ json server_t::handle_initialize(const json& id, const json&)
         "- Use `get_tool_descriptions` with `names`, `prefix`, or `query` for only the tools you plan to call; do not spam broad discovery calls\n"
         "- For standalone static binaries, use `sessions_open_file`, then `analysis_get_binary_map_overview` or `disasm_get_section_info`, `disasm_list_functions`, and targeted disassembly/decompilation tools\n"
         "- For live runtime work, use `sessions_attach_pid` when a session workflow is appropriate, or `driver_status`, `driver_load`, and `driver_attach` for direct driver-backed flows\n"
-        "- When Windows Sandbox guest lab is active, pass `target: \"guest\"` or `target: \"host\"` explicitly whenever host/guest memory matters\n"
+        "- When a VM bridge is active, pass `target: \"guest\"` or `target: \"host\"` explicitly whenever host/VM memory matters\n"
+        "- Custom QEMU, VirtualBox, VMware, and Windows Sandbox workflows use the normal AiDA MCP tools such as `list_processes`, `driver_attach`, `read_memory`, `read_string`, `query_memory`, `enumerate_modules`, `enumerate_threads`, and `disassemble_address`\n"
+        "- For custom VM workflows, keep AiDAStandalone.exe on the host and run only the sample plus MCP client or guest agent in the VM through an authenticated host bridge or tunnel that terminates at AiDA's localhost MCP endpoint\n"
         "- Cache session IDs, binary IDs, module bases, function bounds, xrefs, scan state, and decompiler output; avoid duplicate calls with identical parameters\n"
         "- Prefer batch or paginated tools over repeated one-off calls; set limits before large scans\n\n"
         "## Address and conversion rules\n"
@@ -1077,7 +1160,7 @@ json server_t::handle_tools_call(const json& id, const json& params)
     json arguments = params.contains("arguments") && params["arguments"].is_object()
                    ? params["arguments"] : json::object();
 
-    if (is_standalone_internal_only_tool_name(tool_name))
+    if (is_standalone_ide_chat_only_tool_name(tool_name) || is_standalone_internal_only_tool_name(tool_name))
         return make_error(id, JSONRPC_INVALID_PARAMS, "Unknown tool: " + tool_name);
 
     const tool_def_t* found = nullptr;

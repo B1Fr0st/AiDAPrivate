@@ -1,22 +1,17 @@
 #define WIN32_LEAN_AND_MEAN
-#define CPPHTTPLIB_OPENSSL_SUPPORT
-#include <winsock2.h>
-#include <ws2tcpip.h>
 #include <windows.h>
-#include <winhttp.h>
 
 #include "mcp_standalone.hpp"
 #include "standalone_tools_fwd.hpp"
 #include "sandbox.hpp"
 #include "standalone_driver.hpp"
-#include "guest_lab_bridge.hpp"
+#include "vm_guest_bridge.hpp"
 #include "standalone_settings.hpp"
 #include "zydis_disasm.hpp"
 #include "../analysis/stealth_engine.hpp"
+#include "../network/burp/camoufox_bridge.hpp"
 #include "../../helpers/diag_log.hpp"
 #include "../../helpers/globals.h"
-
-#include <httplib.h>
 
 #include <algorithm>
 #include <cctype>
@@ -34,9 +29,6 @@
 #include <sstream>
 #include <string>
 #include <vector>
-
-#pragma comment(lib, "Ws2_32.lib")
-#pragma comment(lib, "winhttp.lib")
 
 namespace fs = std::filesystem;
 
@@ -134,189 +126,48 @@ namespace
         return text;
     }
 
-    bool is_loopback_host(const std::string& host)
+    std::string web_tool_url_encode(const std::string& text)
     {
-        const std::string h = to_lower(host);
-        if (h == "localhost" || h == "::1" || h == "[::1]") return true;
-        return h.rfind("127.", 0) == 0;
+        std::string out;
+        out.reserve(text.size() * 3);
+        for (unsigned char c : text) {
+            if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+                out += static_cast<char>(c);
+            } else if (c == ' ') {
+                out += '+';
+            } else {
+                char hex[4];
+                snprintf(hex, sizeof(hex), "%%%02X", c);
+                out += hex;
+            }
+        }
+        return out;
     }
 
-    bool webfetch_send_all(SOCKET s, const std::string& data)
+    json camoufox_value_json(const aida::burp::camoufox::call_result_t& result)
     {
-        const char* p = data.data();
-        size_t left = data.size();
-        while (left != 0) {
-            int n = send(s, p, static_cast<int>(std::min<size_t>(left, 16384)), 0);
-            if (n <= 0)
-                return false;
-            p += n;
-            left -= static_cast<size_t>(n);
+        if (result.data.is_object()) {
+            auto value = result.data.find("value");
+            if (value != result.data.end())
+                return *value;
+            auto raw = result.data.find("value_raw");
+            if (raw != result.data.end() && raw->is_string()) {
+                auto parsed = json::parse(raw->get<std::string>(), nullptr, false);
+                if (!parsed.is_discarded())
+                    return parsed;
+            }
         }
-        return true;
+        return result.data;
     }
 
-    std::string webfetch_header_value(const std::string& headers, const std::string& wanted_lc)
+    std::string json_string_field(const json& value, const char* key)
     {
-        size_t pos = 0;
-        while (pos < headers.size()) {
-            size_t eol = headers.find("\r\n", pos);
-            if (eol == std::string::npos)
-                eol = headers.size();
-            std::string line = headers.substr(pos, eol - pos);
-            size_t colon = line.find(':');
-            if (colon != std::string::npos) {
-                std::string key = to_lower(trim(line.substr(0, colon)));
-                if (key == wanted_lc)
-                    return trim(line.substr(colon + 1));
-            }
-            if (eol == headers.size())
-                break;
-            pos = eol + 2;
-        }
-        return {};
-    }
-
-    bool webfetch_raw_loopback_get(const std::string& host,
-                                   int port,
-                                   const std::string& path,
-                                   const std::string& accept_header,
-                                   int timeout_sec,
-                                   int& status,
-                                   std::string& content_type,
-                                   std::string& body,
-                                   std::string& error_text)
-    {
-        status = 0;
-        content_type.clear();
-        body.clear();
-        error_text.clear();
-
-        WSADATA wsa{};
-        const int wsa_rc = WSAStartup(MAKEWORD(2, 2), &wsa);
-        if (wsa_rc != 0) {
-            error_text = "WSAStartup failed: " + std::to_string(wsa_rc);
-            return false;
-        }
-
-        std::string lookup_host = host;
-        const std::string host_lc = to_lower(host);
-        if (host_lc == "localhost")
-            lookup_host = "127.0.0.1";
-        else if (host_lc == "[::1]")
-            lookup_host = "::1";
-
-        addrinfo hints{};
-        hints.ai_family = AF_UNSPEC;
-        hints.ai_socktype = SOCK_STREAM;
-        hints.ai_protocol = IPPROTO_TCP;
-        std::string port_s = std::to_string(port);
-        addrinfo* addrs = nullptr;
-        if (getaddrinfo(lookup_host.c_str(), port_s.c_str(), &hints, &addrs) != 0) {
-            error_text = "getaddrinfo failed for " + lookup_host + ":" + port_s;
-            WSACleanup();
-            return false;
-        }
-
-        const DWORD timeout_ms = static_cast<DWORD>(std::max(1, timeout_sec) * 1000);
-        SOCKET sock = INVALID_SOCKET;
-        int last_err = 0;
-        for (addrinfo* ai = addrs; ai; ai = ai->ai_next) {
-            SOCKET candidate = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-            if (candidate == INVALID_SOCKET) {
-                last_err = WSAGetLastError();
-                continue;
-            }
-            setsockopt(candidate, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
-            setsockopt(candidate, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
-            if (connect(candidate, ai->ai_addr, static_cast<int>(ai->ai_addrlen)) == 0) {
-                sock = candidate;
-                break;
-            }
-            last_err = WSAGetLastError();
-            closesocket(candidate);
-        }
-        freeaddrinfo(addrs);
-
-        if (sock == INVALID_SOCKET) {
-            error_text = "connect failed: " + std::to_string(last_err);
-            WSACleanup();
-            return false;
-        }
-
-        std::string host_header = host;
-        if (host_header.find(':') != std::string::npos && host_header.front() != '[')
-            host_header = "[" + host_header + "]";
-        host_header += ":";
-        host_header += std::to_string(port);
-
-        std::string request;
-        request.reserve(path.size() + accept_header.size() + 512);
-        request += "GET ";
-        request += path.empty() ? "/" : path;
-        request += " HTTP/1.1\r\nHost: ";
-        request += host_header;
-        request += "\r\nUser-Agent: AiDA-Webfetch/1.0\r\nAccept: ";
-        request += accept_header.empty() ? "*/*" : accept_header;
-        request += "\r\nAccept-Language: en-US,en;q=0.9\r\nConnection: close\r\n\r\n";
-
-        if (!webfetch_send_all(sock, request)) {
-            last_err = WSAGetLastError();
-            closesocket(sock);
-            error_text = "send failed: " + std::to_string(last_err);
-            WSACleanup();
-            return false;
-        }
-
-        constexpr size_t max_raw_bytes = 5u * 1024u * 1024u + 65536u;
-        std::string raw;
-        raw.reserve(8192);
-        char buf[8192];
-        while (raw.size() < max_raw_bytes) {
-            int n = recv(sock, buf, sizeof(buf), 0);
-            if (n > 0) {
-                raw.append(buf, buf + n);
-                continue;
-            }
-            if (n == 0)
-                break;
-            last_err = WSAGetLastError();
-            if (!raw.empty() && (last_err == WSAETIMEDOUT || last_err == WSAEWOULDBLOCK))
-                break;
-            closesocket(sock);
-            error_text = "recv failed: " + std::to_string(last_err);
-            WSACleanup();
-            return false;
-        }
-        closesocket(sock);
-        WSACleanup();
-
-        const size_t header_end = raw.find("\r\n\r\n");
-        if (header_end == std::string::npos) {
-            error_text = "response missing headers";
-            return false;
-        }
-        std::string header_block = raw.substr(0, header_end);
-        body = raw.substr(header_end + 4);
-        size_t first_line_end = header_block.find("\r\n");
-        std::string status_line = first_line_end == std::string::npos ? header_block : header_block.substr(0, first_line_end);
-        std::istringstream status_stream(status_line);
-        std::string version;
-        status_stream >> version >> status;
-        if (status == 0) {
-            error_text = "response missing status";
-            return false;
-        }
-        content_type = webfetch_header_value(header_block, "content-type");
-        std::string content_length_s = webfetch_header_value(header_block, "content-length");
-        if (!content_length_s.empty()) {
-            try {
-                const size_t content_length = static_cast<size_t>(std::stoull(content_length_s));
-                if (body.size() > content_length)
-                    body.resize(content_length);
-            } catch (...) {
-            }
-        }
-        return true;
+        if (!value.is_object())
+            return {};
+        auto it = value.find(key);
+        if (it == value.end() || !it->is_string())
+            return {};
+        return it->get<std::string>();
     }
 
     std::string wide_to_utf8_lossy(const std::wstring& text)
@@ -333,146 +184,6 @@ namespace
         std::string out(static_cast<size_t>(len), '\0');
         WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), out.data(), len, nullptr, nullptr);
         return out;
-    }
-
-    std::wstring utf8_to_wide_lossy(const std::string& text)
-    {
-        if (text.empty())
-            return {};
-        int len = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), nullptr, 0);
-        if (len <= 0) {
-            const DWORD err = GetLastError();
-            diag::log_tagged_fmt("mcp_tools", "utf8_to_wide failed len=%zu err=%lu",
-                text.size(), static_cast<unsigned long>(err));
-            return {};
-        }
-        std::wstring out(static_cast<size_t>(len), L'\0');
-        MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), out.data(), len);
-        return out;
-    }
-
-    struct winhttp_handle_t
-    {
-        HINTERNET h = nullptr;
-        winhttp_handle_t() = default;
-        explicit winhttp_handle_t(HINTERNET v) : h(v) {}
-        ~winhttp_handle_t() { if (h) WinHttpCloseHandle(h); }
-        winhttp_handle_t(const winhttp_handle_t&) = delete;
-        winhttp_handle_t& operator=(const winhttp_handle_t&) = delete;
-        explicit operator bool() const { return h != nullptr; }
-    };
-
-    bool winhttp_https_get(const std::wstring& host,
-                           const std::wstring& path,
-                           int timeout_seconds,
-                           std::string& body,
-                           int& status,
-                           std::string& error)
-    {
-        body.clear();
-        status = 0;
-        error.clear();
-
-        HINTERNET raw_session = WinHttpOpen(L"AiDAStandalone/1.0",
-            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-            WINHTTP_NO_PROXY_NAME,
-            WINHTTP_NO_PROXY_BYPASS,
-            0);
-        if (!raw_session) {
-            raw_session = WinHttpOpen(L"AiDAStandalone/1.0",
-                WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                WINHTTP_NO_PROXY_NAME,
-                WINHTTP_NO_PROXY_BYPASS,
-                0);
-        }
-        winhttp_handle_t session(raw_session);
-        if (!session) {
-            error = "WinHttpOpen err=" + std::to_string(GetLastError());
-            return false;
-        }
-
-        const int timeout_ms = std::max(1000, timeout_seconds * 1000);
-        WinHttpSetTimeouts(session.h, timeout_ms, timeout_ms, timeout_ms, timeout_ms);
-
-        DWORD secure_protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
-#ifdef WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3
-        secure_protocols |= WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
-#endif
-        WinHttpSetOption(session.h, WINHTTP_OPTION_SECURE_PROTOCOLS,
-            &secure_protocols, sizeof(secure_protocols));
-
-        winhttp_handle_t connection(WinHttpConnect(session.h, host.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0));
-        if (!connection) {
-            error = "WinHttpConnect err=" + std::to_string(GetLastError());
-            return false;
-        }
-
-        winhttp_handle_t request(WinHttpOpenRequest(connection.h,
-            L"GET",
-            path.c_str(),
-            nullptr,
-            WINHTTP_NO_REFERER,
-            WINHTTP_DEFAULT_ACCEPT_TYPES,
-            WINHTTP_FLAG_SECURE));
-        if (!request) {
-            error = "WinHttpOpenRequest err=" + std::to_string(GetLastError());
-            return false;
-        }
-
-        const wchar_t* headers =
-            L"Accept: application/json\r\n"
-            L"User-Agent: AiDAStandalone/1.0\r\n";
-        if (!WinHttpSendRequest(request.h, headers, static_cast<DWORD>(-1), nullptr, 0, 0, 0)) {
-            error = "WinHttpSendRequest err=" + std::to_string(GetLastError());
-            return false;
-        }
-        if (!WinHttpReceiveResponse(request.h, nullptr)) {
-            error = "WinHttpReceiveResponse err=" + std::to_string(GetLastError());
-            return false;
-        }
-
-        DWORD status_code = 0;
-        DWORD status_size = sizeof(status_code);
-        if (!WinHttpQueryHeaders(request.h,
-            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-            WINHTTP_HEADER_NAME_BY_INDEX,
-            &status_code,
-            &status_size,
-            WINHTTP_NO_HEADER_INDEX)) {
-            error = "WinHttpQueryHeaders err=" + std::to_string(GetLastError());
-            return false;
-        }
-        status = static_cast<int>(status_code);
-        if (status != 200) {
-            error = "HTTP status " + std::to_string(status);
-            return false;
-        }
-
-        constexpr size_t max_body = 4u * 1024u * 1024u;
-        for (;;) {
-            DWORD available = 0;
-            if (!WinHttpQueryDataAvailable(request.h, &available)) {
-                error = "WinHttpQueryDataAvailable err=" + std::to_string(GetLastError());
-                return false;
-            }
-            if (available == 0)
-                break;
-            if (body.size() + available > max_body) {
-                error = "response too large";
-                return false;
-            }
-            const size_t old = body.size();
-            body.resize(old + available);
-            DWORD read = 0;
-            if (!WinHttpReadData(request.h, body.data() + old, available, &read)) {
-                error = "WinHttpReadData err=" + std::to_string(GetLastError());
-                return false;
-            }
-            body.resize(old + read);
-            if (read == 0)
-                break;
-        }
-        return true;
     }
 
     std::string path_to_utf8(const fs::path& path)
@@ -526,9 +237,9 @@ namespace
         return "auto";
     }
 
-    bool wants_guest_target(const json& params)
+    bool wants_vm_target(const json& params)
     {
-        if (!guest_lab::is_active())
+        if (!vm_guest_bridge::is_active())
             return false;
         const std::string target = requested_target(params);
         return target != "host";
@@ -568,7 +279,7 @@ namespace
         return fallback;
     }
 
-    uint32_t guest_timeout_ms(const json& params)
+    uint32_t vm_bridge_timeout_ms(const json& params)
     {
         uint32_t timeout = 5000;
         if (params.contains("timeout_ms")) {
@@ -587,7 +298,7 @@ namespace
         return timeout;
     }
 
-    json guest_params_from(const json& params)
+    json vm_bridge_params_from(const json& params)
     {
         json p = params.is_object() ? params : json::object();
         p.erase("target");
@@ -595,27 +306,27 @@ namespace
         return p;
     }
 
-    void enrich_guest_data(json& data)
+    void enrich_vm_bridge_data(json& data)
     {
-        data["backend"] = "windows_sandbox_guest";
-        auto session = guest_lab::current();
+        data["backend"] = "vm_bridge";
+        auto session = vm_guest_bridge::current();
         data["sandbox_dir"] = wide_to_utf8_lossy(session.session_dir);
-        data["guest_bridge_dir"] = wide_to_utf8_lossy(session.bridge_dir);
+        data["vm_bridge_dir"] = wide_to_utf8_lossy(session.bridge_dir);
         if (data.contains("artifact_name") && data["artifact_name"].is_string()) {
-            std::string host_path = guest_lab::artifact_host_path(data["artifact_name"].get<std::string>());
+            std::string host_path = vm_guest_bridge::artifact_host_path(data["artifact_name"].get<std::string>());
             if (!host_path.empty())
                 data["host_artifact_path"] = host_path;
         }
     }
 
-    tool_result_t guest_call(const std::string& command, const json& params, const std::string& message)
+    tool_result_t vm_bridge_call(const std::string& command, const json& params, const std::string& message)
     {
         std::string err;
-        json response = guest_lab::request(command, guest_params_from(params), guest_timeout_ms(params), &err);
+        json response = vm_guest_bridge::request(command, vm_bridge_params_from(params), vm_bridge_timeout_ms(params), &err);
         if (!err.empty())
             return error(err);
         json data = response.value("data", json::object());
-        enrich_guest_data(data);
+        enrich_vm_bridge_data(data);
         return tool_result_t::ok(message, data);
     }
 
@@ -681,113 +392,52 @@ namespace
         return tool_result_t::ok(driver_bridge::status(), out);
     }
 
-    tool_result_t handle_guest_lab_status(const json& params)
+    tool_result_t handle_vm_bridge_attach(const json& params)
     {
-        diag::log_tagged_fmt("mcp_tools", "handle_guest_lab_status entry");
-        auto session = guest_lab::current();
-        json out;
-        out["active"] = session.active;
-        out["sandbox_dir"] = wide_to_utf8_lossy(session.session_dir);
-        out["guest_bridge_dir"] = wide_to_utf8_lossy(session.bridge_dir);
-        out["sample_path"] = wide_to_utf8_lossy(session.sample_path);
-        out["started_ms"] = session.started_ms;
-        out["backend"] = "windows_sandbox_guest";
-        if (!session.active)
-            return tool_result_t::ok("No active Windows Sandbox guest lab.", out);
-        std::string err;
-        json response = guest_lab::request("status", json::object(), guest_timeout_ms(params), &err);
-        if (!err.empty()) {
-            out["agent_ready"] = false;
-            out["agent_error"] = err;
-            return tool_result_t::ok("Windows Sandbox guest lab is active, but the agent is not ready.", out);
-        }
-        json data = response.value("data", json::object());
-        enrich_guest_data(data);
-        out["agent_ready"] = true;
-        out["agent"] = data;
-        const char* keys[] = {
-            "agent_pid",
-            "active_pid",
-            "sample_pid",
-            "sample_path",
-            "sample_args",
-            "sample_alive",
-            "sample_exit_code",
-            "process_alive",
-            "attached_pid",
-            "launch_error"
-        };
-        for (const char* key : keys) {
-            if (data.contains(key))
-                out[key] = data[key];
-        }
-        return tool_result_t::ok("Windows Sandbox guest lab is active.", out);
+        diag::log_tagged_fmt("mcp_tools", "handle_vm_bridge_attach entry");
+        return vm_bridge_call("attach", params, "Attached to VM process.");
     }
 
-    tool_result_t handle_guest_lab_attach(const json& params)
+    tool_result_t handle_vm_bridge_detach(const json& params)
     {
-        diag::log_tagged_fmt("mcp_tools", "handle_guest_lab_attach entry");
-        return guest_call("attach", params, "Attached to guest process.");
+        diag::log_tagged_fmt("mcp_tools", "handle_vm_bridge_detach entry");
+        return vm_bridge_call("detach", params, "Detached from VM process.");
     }
 
-    tool_result_t handle_guest_lab_detach(const json& params)
+    tool_result_t handle_vm_bridge_list_processes(const json& params)
     {
-        diag::log_tagged_fmt("mcp_tools", "handle_guest_lab_detach entry");
-        return guest_call("detach", params, "Detached from guest process.");
+        diag::log_tagged_fmt("mcp_tools", "handle_vm_bridge_list_processes entry");
+        return vm_bridge_call("list_processes", params, "Enumerated VM processes.");
     }
 
-    tool_result_t handle_guest_lab_list_processes(const json& params)
+    tool_result_t handle_vm_bridge_query_memory(const json& params)
     {
-        diag::log_tagged_fmt("mcp_tools", "handle_guest_lab_list_processes entry");
-        return guest_call("list_processes", params, "Enumerated guest processes.");
+        diag::log_tagged_fmt("mcp_tools", "handle_vm_bridge_query_memory entry");
+        return vm_bridge_call("query_memory", params, "Queried VM memory region.");
     }
 
-    tool_result_t handle_guest_lab_memory_map(const json& params)
+    tool_result_t handle_vm_bridge_read_memory(const json& params)
     {
-        diag::log_tagged_fmt("mcp_tools", "handle_guest_lab_memory_map entry");
-        return guest_call("memory_map", params, "Enumerated guest memory map.");
+        diag::log_tagged_fmt("mcp_tools", "handle_vm_bridge_read_memory entry");
+        return vm_bridge_call("read_memory", params, "Read VM process memory.");
     }
 
-    tool_result_t handle_guest_lab_query_memory(const json& params)
+    tool_result_t handle_vm_bridge_read_string(const json& params)
     {
-        diag::log_tagged_fmt("mcp_tools", "handle_guest_lab_query_memory entry");
-        return guest_call("query_memory", params, "Queried guest memory region.");
+        diag::log_tagged_fmt("mcp_tools", "handle_vm_bridge_read_string entry");
+        return vm_bridge_call("read_string", params, "Read VM process string.");
     }
 
-    tool_result_t handle_guest_lab_read_memory(const json& params)
+    tool_result_t handle_vm_bridge_enumerate_modules(const json& params)
     {
-        diag::log_tagged_fmt("mcp_tools", "handle_guest_lab_read_memory entry");
-        return guest_call("read_memory", params, "Read guest process memory.");
+        diag::log_tagged_fmt("mcp_tools", "handle_vm_bridge_enumerate_modules entry");
+        return vm_bridge_call("modules", params, "Enumerated VM modules.");
     }
 
-    tool_result_t handle_guest_lab_read_string(const json& params)
+    tool_result_t handle_vm_bridge_enumerate_threads(const json& params)
     {
-        diag::log_tagged_fmt("mcp_tools", "handle_guest_lab_read_string entry");
-        return guest_call("read_string", params, "Read guest process string.");
-    }
-
-    tool_result_t handle_guest_lab_enumerate_modules(const json& params)
-    {
-        diag::log_tagged_fmt("mcp_tools", "handle_guest_lab_enumerate_modules entry");
-        return guest_call("modules", params, "Enumerated guest modules.");
-    }
-
-    tool_result_t handle_guest_lab_enumerate_threads(const json& params)
-    {
-        diag::log_tagged_fmt("mcp_tools", "handle_guest_lab_enumerate_threads entry");
-        return guest_call("threads", params, "Enumerated guest threads.");
-    }
-
-    tool_result_t handle_guest_lab_dump_region(const json& params)
-    {
-        diag::log_tagged_fmt("mcp_tools", "handle_guest_lab_dump_region entry");
-        return guest_call("dump_region", params, "Dumped guest memory region.");
-    }
-
-    tool_result_t handle_guest_lab_search_memory(const json& params)
-    {
-        diag::log_tagged_fmt("mcp_tools", "handle_guest_lab_search_memory entry");
-        return guest_call("search_memory", params, "Searched guest process memory.");
+        diag::log_tagged_fmt("mcp_tools", "handle_vm_bridge_enumerate_threads entry");
+        return vm_bridge_call("threads", params, "Enumerated VM threads.");
     }
 
     tool_result_t handle_driver_load(const json&)
@@ -801,8 +451,8 @@ namespace
     tool_result_t handle_list_processes(const json& params)
     {
         diag::log_tagged_fmt("mcp_tools", "handle_list_processes entry");
-        if (wants_guest_target(params))
-            return handle_guest_lab_list_processes(params);
+        if (wants_vm_target(params))
+            return handle_vm_bridge_list_processes(params);
         const std::string filter = to_lower(params.value("filter", std::string()));
         json items = json::array();
         for (const auto& proc : driver_bridge::enumerate_processes()) {
@@ -816,8 +466,8 @@ namespace
     tool_result_t handle_driver_attach(const json& params)
     {
         diag::log_tagged_fmt("mcp_tools", "handle_driver_attach entry");
-        if (wants_guest_target(params))
-            return handle_guest_lab_attach(params);
+        if (wants_vm_target(params))
+            return handle_vm_bridge_attach(params);
         if (params.contains("pid") && params["pid"].is_number_integer()) {
             uint32_t pid = params["pid"].get<uint32_t>();
             if (pid == static_cast<uint32_t>(GetCurrentProcessId()))
@@ -857,8 +507,8 @@ namespace
     tool_result_t handle_driver_detach(const json& params)
     {
         diag::log_tagged_fmt("mcp_tools", "handle_driver_detach entry");
-        if (wants_guest_target(params))
-            return handle_guest_lab_detach(params);
+        if (wants_vm_target(params))
+            return handle_vm_bridge_detach(params);
         stealth_engine::disable_for_detach(driver_bridge::attached_pid(), "mcp.driver_detach");
         driver_bridge::detach();
         return tool_result_t::ok("Detached from the live process.");
@@ -874,8 +524,8 @@ namespace
     tool_result_t handle_read_memory(const json& params)
     {
         diag::log_tagged_fmt("mcp_tools", "handle_read_memory entry");
-        if (wants_guest_target(params))
-            return handle_guest_lab_read_memory(params);
+        if (wants_vm_target(params))
+            return handle_vm_bridge_read_memory(params);
         auto chk = ensure_attached();
         if (!chk.success)
             return chk;
@@ -912,8 +562,8 @@ namespace
     tool_result_t handle_read_string(const json& params)
     {
         diag::log_tagged_fmt("mcp_tools", "handle_read_string entry");
-        if (wants_guest_target(params))
-            return handle_guest_lab_read_string(params);
+        if (wants_vm_target(params))
+            return handle_vm_bridge_read_string(params);
         auto chk = ensure_attached();
         if (!chk.success)
             return chk;
@@ -932,8 +582,8 @@ namespace
     tool_result_t handle_query_memory(const json& params)
     {
         diag::log_tagged_fmt("mcp_tools", "handle_query_memory entry");
-        if (wants_guest_target(params))
-            return handle_guest_lab_query_memory(params);
+        if (wants_vm_target(params))
+            return handle_vm_bridge_query_memory(params);
         auto chk = ensure_attached();
         if (!chk.success)
             return chk;
@@ -958,8 +608,8 @@ namespace
     tool_result_t handle_enumerate_modules(const json& params)
     {
         diag::log_tagged_fmt("mcp_tools", "handle_enumerate_modules entry");
-        if (wants_guest_target(params))
-            return handle_guest_lab_enumerate_modules(params);
+        if (wants_vm_target(params))
+            return handle_vm_bridge_enumerate_modules(params);
         auto chk = ensure_attached();
         if (!chk.success)
             return chk;
@@ -979,8 +629,8 @@ namespace
     tool_result_t handle_enumerate_threads(const json& params)
     {
         diag::log_tagged_fmt("mcp_tools", "handle_enumerate_threads entry");
-        if (wants_guest_target(params))
-            return handle_guest_lab_enumerate_threads(params);
+        if (wants_vm_target(params))
+            return handle_vm_bridge_enumerate_threads(params);
         auto chk = ensure_attached();
         if (!chk.success)
             return chk;
@@ -999,16 +649,16 @@ namespace
     tool_result_t handle_disassemble_address(const json& params)
     {
         diag::log_tagged_fmt("mcp_tools", "handle_disassemble_address entry");
-        if (wants_guest_target(params)) {
+        if (wants_vm_target(params)) {
             const auto address = parse_addr_opt(params, "address");
             if (!address)
                 return error("Missing or invalid address.");
             const size_t bytes_to_read = static_cast<size_t>(params.value("size", 128));
             const size_t max_count = static_cast<size_t>(params.value("count", 32));
-            json read_params = guest_params_from(params);
+            json read_params = vm_bridge_params_from(params);
             read_params["size"] = bytes_to_read;
             std::string err;
-            json response = guest_lab::request("read_memory", read_params, guest_timeout_ms(params), &err);
+            json response = vm_guest_bridge::request("read_memory", read_params, vm_bridge_timeout_ms(params), &err);
             if (!err.empty())
                 return error(err);
             json data = response.value("data", json::object());
@@ -1036,8 +686,8 @@ namespace
             out["address"] = hex_addr(*address);
             out["instructions"] = instructions;
             out["bytes_read"] = bytes.size();
-            enrich_guest_data(out);
-            return tool_result_t::ok("Disassembled guest process memory.", out);
+            enrich_vm_bridge_data(out);
+            return tool_result_t::ok("Disassembled VM process memory.", out);
         }
         auto chk = ensure_attached();
         if (!chk.success)
@@ -1929,275 +1579,151 @@ namespace
 
     tool_result_t handle_web_search(const json& params)
     {
-        diag::log_tagged_fmt("mcp_tools", "handle_web_search entry");
+        diag::log_tagged_fmt("mcp_tools", "handle_web_search entry transport=camoufox");
         if (!params.contains("query") || !params["query"].is_string())
             return error("Provide a search query.");
 
-        const std::string query = params["query"].get<std::string>();
+        const std::string query = trim(params["query"].get<std::string>());
         if (query.empty())
             return error("Provide a non-empty search query.");
         const int max_results = std::clamp(params.value("max_results", 5), 1, 20);
-        const int timeout_seconds = std::clamp(params.value("timeout", 4), 1, 15);
+        const int timeout_seconds = std::clamp(params.value("timeout", 8), 1, 60);
+        const int timeout_ms = std::clamp(timeout_seconds * 1000 + 10000, 15000, 90000);
+        const std::string encoded_query = web_tool_url_encode(query);
 
-        std::string encoded_query;
-        for (unsigned char c : query) {
-            if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
-                encoded_query += static_cast<char>(c);
-            } else if (c == ' ') {
-                encoded_query += '+';
-            } else {
-                char hex[4];
-                snprintf(hex, sizeof(hex), "%%%02X", c);
-                encoded_query += hex;
-            }
-        }
-
-        json results = json::array();
-
-        auto append_duckduckgo = [&](const std::string& body, std::string& parse_error) -> bool {
-            parse_error.clear();
-            const size_t before = results.size();
-            auto j = json::parse(body, nullptr, false);
-            if (j.is_discarded() || !j.is_object()) {
-                parse_error = "invalid JSON in DuckDuckGo response body";
-                return false;
-            }
-            if (j.contains("Abstract") && j["Abstract"].is_string() && !j["Abstract"].get<std::string>().empty()) {
-                results.push_back({
-                    {"title", j.value("Heading", "Answer")},
-                    {"snippet", j["Abstract"].get<std::string>()},
-                    {"url", j.value("AbstractURL", "")}
-                });
-            }
-            if (j.contains("RelatedTopics") && j["RelatedTopics"].is_array()) {
-                for (auto& topic : j["RelatedTopics"]) {
-                    if ((int)results.size() >= max_results) break;
-                    if (topic.contains("Text") && topic["Text"].is_string()) {
-                        results.push_back({
-                            {"title", topic.value("Text", "").substr(0, 120)},
-                            {"snippet", topic.value("Text", "")},
-                            {"url", topic.value("FirstURL", "")}
-                        });
-                    } else if (topic.contains("Topics") && topic["Topics"].is_array()) {
-                        for (auto& nested : topic["Topics"]) {
-                            if ((int)results.size() >= max_results) break;
-                            if (!nested.contains("Text") || !nested["Text"].is_string())
-                                continue;
-                            results.push_back({
-                                {"title", nested.value("Text", "").substr(0, 120)},
-                                {"snippet", nested.value("Text", "")},
-                                {"url", nested.value("FirstURL", "")}
-                            });
-                        }
-                    }
-                }
-            }
-            return results.size() > before;
-        };
-
-        auto append_wikipedia = [&](const std::string& body, std::string& parse_error) -> bool {
-            parse_error.clear();
-            const size_t before = results.size();
-            auto j = json::parse(body, nullptr, false);
-            if (j.is_discarded() || !j.is_array() || j.size() < 4 ||
-                !j[1].is_array() || !j[2].is_array() || !j[3].is_array()) {
-                parse_error = "invalid JSON in Wikipedia opensearch response";
-                return false;
-            }
-            const size_t take = std::min<size_t>(
-                static_cast<size_t>(max_results), j[1].size());
-            for (size_t i = 0; i < take; ++i) {
-                if (!j[1][i].is_string())
-                    continue;
-                const std::string title = j[1][i].get<std::string>();
-                const std::string snippet =
-                    i < j[2].size() && j[2][i].is_string() ? j[2][i].get<std::string>() : std::string();
-                const std::string url =
-                    i < j[3].size() && j[3][i].is_string() ? j[3][i].get<std::string>() : std::string();
-                results.push_back({
-                    {"title", title},
-                    {"snippet", snippet.empty() ? title : snippet},
-                    {"url", url}
-                });
-            }
-            return results.size() > before;
-        };
-
-        const std::string duck_path = "/?q=" + encoded_query + "&format=json&no_redirect=1&no_html=1";
-        std::string duck_error;
-        try {
-            httplib::SSLClient client("api.duckduckgo.com");
-            client.set_connection_timeout(timeout_seconds);
-            client.set_read_timeout(timeout_seconds);
-            client.set_follow_location(true);
-            client.set_default_headers({
-                {"Accept", "application/json"},
-                {"User-Agent", "AiDAStandalone/1.0"}
-            });
-            client.enable_server_certificate_verification(false);
-
-            auto res = client.Get(duck_path.c_str());
-
-            if (!res) {
-                duck_error = "cpp-httplib no response";
-            } else if (res->status != 200) {
-                duck_error = "cpp-httplib HTTP status " + std::to_string(res->status);
-            } else {
-                std::string parse_error;
-                append_duckduckgo(res->body, parse_error);
-                if (!parse_error.empty())
-                    duck_error = "cpp-httplib " + parse_error;
-            }
-        } catch (const std::exception& e) {
-            duck_error = std::string("cpp-httplib ") + e.what();
-        } catch (...) {
-            duck_error = "cpp-httplib unknown network error";
-        }
-
-        if (results.empty()) {
-            std::string body;
-            std::string err;
-            int status = 0;
-            const std::wstring path_w = utf8_to_wide_lossy(duck_path);
-            if (!path_w.empty() && winhttp_https_get(L"api.duckduckgo.com", path_w, timeout_seconds, body, status, err)) {
-                std::string parse_error;
-                append_duckduckgo(body, parse_error);
-                diag::log_tagged_fmt("mcp_tools", "handle_web_search duckduckgo_winhttp ok status=%d bytes=%zu results=%zu parse_error=%s",
-                    status, body.size(), results.size(), parse_error.c_str());
-                if (!parse_error.empty())
-                    duck_error = duck_error.empty() ? ("winhttp " + parse_error) : (duck_error + "; winhttp " + parse_error);
-            } else {
-                std::string winhttp_error = err.empty() ? "WinHTTP path conversion failed" : err;
-                diag::log_tagged_fmt("mcp_tools", "handle_web_search duckduckgo_winhttp failed status=%d err=%s",
-                    status, winhttp_error.c_str());
-                duck_error = duck_error.empty() ? ("winhttp " + winhttp_error) : (duck_error + "; winhttp " + winhttp_error);
-            }
-        }
-
-        std::string wikipedia_error;
-        if (results.empty()) {
-            const std::string wiki_path = "/w/api.php?action=opensearch&search=" + encoded_query +
-                                          "&limit=" + std::to_string(max_results) +
-                                          "&namespace=0&format=json";
-            try {
-                httplib::SSLClient wiki("en.wikipedia.org");
-                wiki.set_connection_timeout(timeout_seconds);
-                wiki.set_read_timeout(timeout_seconds);
-                wiki.set_follow_location(true);
-                wiki.set_default_headers({
-                    {"Accept", "application/json"},
-                    {"User-Agent", "AiDAStandalone/1.0"}
-                });
-                wiki.enable_server_certificate_verification(false);
-                auto res = wiki.Get(wiki_path.c_str());
-                if (!res) {
-                    wikipedia_error = "cpp-httplib no response";
-                } else if (res->status != 200) {
-                    wikipedia_error = "cpp-httplib HTTP status " + std::to_string(res->status);
-                } else {
-                    std::string parse_error;
-                    append_wikipedia(res->body, parse_error);
-                    if (!parse_error.empty())
-                        wikipedia_error = "cpp-httplib " + parse_error;
-                }
-            } catch (const std::exception& e) {
-                wikipedia_error = std::string("cpp-httplib ") + e.what();
-            } catch (...) {
-                wikipedia_error = "cpp-httplib unknown Wikipedia network error";
-            }
-
-            if (results.empty()) {
-                std::string body;
-                std::string err;
-                int status = 0;
-                const std::wstring path_w = utf8_to_wide_lossy(wiki_path);
-                if (!path_w.empty() && winhttp_https_get(L"en.wikipedia.org", path_w, timeout_seconds, body, status, err)) {
-                    std::string parse_error;
-                    append_wikipedia(body, parse_error);
-                    diag::log_tagged_fmt("mcp_tools", "handle_web_search wikipedia_winhttp ok status=%d bytes=%zu results=%zu parse_error=%s",
-                        status, body.size(), results.size(), parse_error.c_str());
-                    if (!parse_error.empty())
-                        wikipedia_error = wikipedia_error.empty() ? ("winhttp " + parse_error) : (wikipedia_error + "; winhttp " + parse_error);
-                } else {
-                    std::string winhttp_error = err.empty() ? "WinHTTP path conversion failed" : err;
-                    diag::log_tagged_fmt("mcp_tools", "handle_web_search wikipedia_winhttp failed status=%d err=%s",
-                        status, winhttp_error.c_str());
-                    wikipedia_error = wikipedia_error.empty() ? ("winhttp " + winhttp_error) : (wikipedia_error + "; winhttp " + winhttp_error);
-                }
-            }
-        }
-
-        if ((!duck_error.empty() || !wikipedia_error.empty()) && results.empty()) {
-            std::string msg = "web_search:";
-            if (!duck_error.empty())
-                msg += " duckduckgo: " + duck_error;
-            if (!wikipedia_error.empty())
-                msg += "; wikipedia: " + wikipedia_error;
+        if (!aida::burp::camoufox::ensure_ready()) {
+            std::string msg = aida::burp::camoufox::last_error();
+            if (msg.empty())
+                msg = "Camoufox browser is not ready for web_search.";
+            diag::log_tagged_fmt("mcp_tools", "handle_web_search camoufox_not_ready err=%s", msg.c_str());
             set_last_web_error(msg);
             return tool_result_t::error(msg);
         }
 
-        if (results.empty()) {
-            return tool_result_t::ok(
-                "Web search returned no results for: " + query +
-                "\nNote: Web search uses the DuckDuckGo Instant Answer API.",
-                json{{"results", results}});
-        }
-
-        return tool_result_t::ok(
-            "Found " + std::to_string(results.size()) + " results for: " + query,
-            json{{"results", results}});
+        const std::string extract_js = R"JS((() => {
+const maxResults = )JS" + std::to_string(max_results) + R"JS(;
+const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+const absolutize = (href) => { try { return new URL(href || '', location.href).href; } catch (_) { return ''; } };
+const unwrapDuckDuckGo = (href) => {
+  let url = absolutize(href);
+  try {
+    const parsed = new URL(url);
+    if (parsed.hostname.endsWith('duckduckgo.com') && parsed.pathname.indexOf('/l/') === 0) {
+      const target = parsed.searchParams.get('uddg');
+      if (target) url = decodeURIComponent(target);
     }
+  } catch (_) {}
+  return url;
+};
+const blockedHost = (href) => {
+  try {
+    const host = new URL(href).hostname.toLowerCase();
+    return host === location.hostname.toLowerCase() || host.endsWith('.duckduckgo.com') || host.endsWith('.bing.com') || host.endsWith('.microsoft.com/images');
+  } catch (_) { return true; }
+};
+const resultContainer = (a) => a.closest('.result, .web-result, article, li.b_algo, li, div') || a.parentElement;
+const readSnippet = (container, title) => {
+  if (!container) return '';
+  const selectors = ['.result__snippet', '.result__body', '.b_caption p', '[data-result="snippet"]', 'p', '.snippet'];
+  for (const selector of selectors) {
+    const node = container.querySelector(selector);
+    const text = clean(node && node.innerText);
+    if (text && text !== title) return text;
+  }
+  const text = clean(container.innerText);
+  if (!text) return '';
+  if (text.indexOf(title) === 0) return clean(text.slice(title.length));
+  return text;
+};
+const anchors = Array.from(document.querySelectorAll('a.result__a, li.b_algo h2 a, article h2 a, [data-testid="result-title-a"], h2 a, a[href]'));
+const results = [];
+const seen = new Set();
+for (const a of anchors) {
+  if (results.length >= maxResults) break;
+  const title = clean(a.innerText || a.textContent || a.getAttribute('aria-label'));
+  let url = unwrapDuckDuckGo(a.getAttribute('href') || a.href || '');
+  if (!title || !url || url.indexOf('javascript:') === 0 || url.indexOf('mailto:') === 0 || blockedHost(url)) continue;
+  const key = url.replace(/#.*$/, '');
+  if (seen.has(key)) continue;
+  seen.add(key);
+  const container = resultContainer(a);
+  let snippet = readSnippet(container, title);
+  if (!snippet) snippet = title;
+  results.push({ title, snippet, url });
+}
+return { browser: 'camoufox', engine_url: location.href, page_title: document.title || '', candidates: anchors.length, results };
+})())JS";
 
-    bool webfetch_split_url(const std::string& full,
-                            std::string& scheme,
-                            std::string& host,
-                            int& port,
-                            std::string& path_out,
-                            bool& is_https)
-    {
-        scheme.clear();
-        host.clear();
-        path_out = "/";
-        port = 0;
-        is_https = false;
-        const auto sp = full.find("://");
-        if (sp == std::string::npos)
-            return false;
-        scheme = full.substr(0, sp);
-        std::string rest = full.substr(sp + 3);
-        const auto slash = rest.find('/');
-        std::string host_port;
-        if (slash == std::string::npos) {
-            host_port = rest;
-            path_out = "/";
-        } else {
-            host_port = rest.substr(0, slash);
-            path_out = rest.substr(slash);
-        }
-        const auto colon = host_port.find(':');
-        if (colon == std::string::npos) {
-            host = host_port;
-        } else {
-            host = host_port.substr(0, colon);
-            try {
-                port = std::stoi(host_port.substr(colon + 1));
-            } catch (...) {
-                return false;
+        struct provider_t { const char* name; std::string url; };
+        const provider_t providers[] = {
+            {"duckduckgo_html", "https://duckduckgo.com/html/?q=" + encoded_query},
+            {"bing", "https://www.bing.com/search?q=" + encoded_query}
+        };
+
+        std::string failures;
+        for (const auto& provider : providers) {
+            if (mcp_standalone::current_call_cancelled())
+                return tool_result_t::error("web_search cancelled by client request.");
+            diag::log_tagged_fmt("mcp_tools", "handle_web_search camoufox_provider_begin provider=%s timeout_ms=%d query_len=%zu", provider.name, timeout_ms, query.size());
+            json nav_args;
+            nav_args["url"] = provider.url;
+            nav_args["wait_until"] = "domcontentloaded";
+            nav_args["collect_response_chain"] = true;
+            nav_args["clear_network_capture"] = true;
+            nav_args["include_title"] = true;
+            auto nav = aida::burp::camoufox::call_tool("navigate", nav_args, timeout_ms);
+            if (!nav.ok) {
+                std::string err = nav.error.empty() ? nav.text : nav.error;
+                if (err.empty()) err = "navigate failed";
+                diag::log_tagged_fmt("mcp_tools", "handle_web_search camoufox_provider_nav_failed provider=%s err=%s", provider.name, err.c_str());
+                if (!failures.empty()) failures += "; ";
+                failures += std::string(provider.name) + ": " + err;
+                continue;
             }
+            auto eval = aida::burp::camoufox::evaluate_js(extract_js, true);
+            if (!eval.ok) {
+                std::string err = eval.error.empty() ? eval.text : eval.error;
+                if (err.empty()) err = "evaluate_js failed";
+                diag::log_tagged_fmt("mcp_tools", "handle_web_search camoufox_provider_eval_failed provider=%s err=%s", provider.name, err.c_str());
+                if (!failures.empty()) failures += "; ";
+                failures += std::string(provider.name) + ": " + err;
+                continue;
+            }
+            json payload = camoufox_value_json(eval);
+            json results = json::array();
+            if (payload.is_object() && payload.contains("results") && payload["results"].is_array())
+                results = payload["results"];
+            const size_t count = results.is_array() ? results.size() : 0;
+            diag::log_tagged_fmt("mcp_tools", "handle_web_search camoufox_provider_result provider=%s results=%zu payload_object=%d final_url_len=%zu title_len=%zu",
+                provider.name,
+                count,
+                payload.is_object() ? 1 : 0,
+                json_string_field(payload, "engine_url").size(),
+                json_string_field(payload, "page_title").size());
+            if (count == 0) {
+                if (!failures.empty()) failures += "; ";
+                failures += std::string(provider.name) + ": browser returned zero parseable results";
+                continue;
+            }
+            if (results.size() > static_cast<size_t>(max_results))
+                results.erase(results.begin() + max_results, results.end());
+            json data;
+            data["results"] = std::move(results);
+            data["transport"] = "camoufox";
+            data["browser"] = "camoufox";
+            data["provider"] = provider.name;
+            data["query"] = query;
+            data["final_url"] = json_string_field(payload, "engine_url");
+            data["page_title"] = json_string_field(payload, "page_title");
+            data["candidate_links"] = payload.is_object() && payload.contains("candidates") ? payload["candidates"] : json(0);
+            return tool_result_t::ok("Found " + std::to_string(data["results"].size()) + " Camoufox browser result(s) for: " + query, data);
         }
-        if (scheme == "https") {
-            is_https = true;
-            if (port == 0) port = 443;
-        } else if (scheme == "http") {
-            is_https = false;
-            if (port == 0) port = 80;
-        } else {
-            return false;
-        }
-        if (host.empty())
-            return false;
-        return true;
+
+        std::string msg = "Camoufox browser web_search returned no results for: " + query;
+        if (!failures.empty())
+            msg += " (" + failures + ")";
+        set_last_web_error(msg);
+        return tool_result_t::error(msg);
     }
 
     std::string webfetch_strip_blocks(const std::string& html)
@@ -2303,16 +1829,6 @@ namespace
         }
         while (!out.empty() && (out.back() == ' ' || out.back() == '\n')) out.pop_back();
         return out;
-    }
-
-    std::string webfetch_html_to_text(const std::string& html_in)
-    {
-        std::string s = webfetch_strip_blocks(html_in);
-        static const std::regex tag_rx("<[^>]+>", std::regex::ECMAScript);
-        s = std::regex_replace(s, tag_rx, " ");
-        s = webfetch_decode_entities(s);
-        s = webfetch_collapse_whitespace(s);
-        return s;
     }
 
     std::string webfetch_html_to_markdown(const std::string& html_in)
@@ -2457,14 +1973,14 @@ namespace
 
     tool_result_t handle_webfetch(const json& params)
     {
-        diag::log_tagged_fmt("mcp_tools", "handle_webfetch entry");
+        diag::log_tagged_fmt("mcp_tools", "handle_webfetch entry transport=camoufox");
         if (!params.contains("url") || !params["url"].is_string())
             return error("Missing required parameter: url");
 
         if (mcp_standalone::current_call_cancelled())
             return error("webfetch cancelled by client request.");
 
-        const std::string url = params["url"].get<std::string>();
+        const std::string url = trim(params["url"].get<std::string>());
         if (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0)
             return error("URL must start with http:// or https://");
 
@@ -2484,112 +2000,86 @@ namespace
             else if (params["timeout"].is_number())
                 timeout_sec = static_cast<int>(params["timeout"].get<double>());
         }
-        if (timeout_sec < 1) timeout_sec = 1;
-        if (timeout_sec > 120) timeout_sec = 120;
+        timeout_sec = std::clamp(timeout_sec, 1, 120);
+        const int timeout_ms = std::clamp(timeout_sec * 1000 + 10000, 15000, 130000);
 
-        std::string scheme;
-        std::string host;
-        int port = 0;
-        std::string path;
-        bool is_https = false;
-        if (!webfetch_split_url(url, scheme, host, port, path, is_https))
-            return error("Invalid URL: " + url);
-
-        std::string base;
-        if (is_https) base = "https://"; else base = "http://";
-        base += host;
-        base += ":";
-        base += std::to_string(port);
-
-        std::string accept_header;
-        if (format == "markdown")
-            accept_header = "text/markdown;q=1.0, text/x-markdown;q=0.9, text/plain;q=0.8, text/html;q=0.7, */*;q=0.1";
-        else if (format == "text")
-            accept_header = "text/plain;q=1.0, text/markdown;q=0.9, text/html;q=0.8, */*;q=0.1";
-        else
-            accept_header = "text/html;q=1.0, application/xhtml+xml;q=0.9, text/plain;q=0.8, text/markdown;q=0.7, */*;q=0.1";
-
-        httplib::Headers headers = {
-            { "User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36" },
-            { "Accept", accept_header },
-            { "Accept-Language", "en-US,en;q=0.9" }
-        };
-
-        httplib::Result res;
-        const bool loopback = is_loopback_host(host);
-        const int max_attempts = loopback ? 12 : 1;
-        httplib::Error last_error = httplib::Error::Success;
-        for (int attempt = 1; attempt <= max_attempts; ++attempt) {
-            std::unique_ptr<httplib::Client> cli;
-            if (loopback && !is_https)
-                cli = std::make_unique<httplib::Client>(host, port);
-            else
-                cli = std::make_unique<httplib::Client>(base);
-            cli->set_connection_timeout(timeout_sec, 0);
-            cli->set_read_timeout(timeout_sec, 0);
-            cli->set_write_timeout(timeout_sec, 0);
-            cli->set_follow_location(true);
-            cli->enable_server_certificate_verification(true);
-            diag::log_tagged_fmt("mcp_tools", "handle_webfetch request_begin host=%s port=%d path=%s attempt=%d/%d loopback=%d explicit_host_port=%d valid=%d",
-                host.c_str(), port, path.c_str(), attempt, max_attempts, loopback ? 1 : 0,
-                (loopback && !is_https) ? 1 : 0, cli->is_valid() ? 1 : 0);
-            res = cli->Get(path, headers);
-            if (res) {
-                diag::log_tagged_fmt("mcp_tools", "handle_webfetch request_ok host=%s port=%d path=%s attempt=%d loopback=%d status=%d",
-                    host.c_str(), port, path.c_str(), attempt, loopback ? 1 : 0, res->status);
-                break;
-            }
-            last_error = res.error();
-            diag::log_tagged_fmt("mcp_tools", "handle_webfetch request_failed host=%s port=%d path=%s attempt=%d/%d loopback=%d error=%s",
-                host.c_str(), port, path.c_str(), attempt, max_attempts, loopback ? 1 : 0, httplib::to_string(last_error).c_str());
-            if (!loopback || attempt == max_attempts || mcp_standalone::current_call_cancelled()) break;
-            Sleep(static_cast<DWORD>(std::min(100, 10 * attempt)));
+        if (!aida::burp::camoufox::ensure_ready()) {
+            std::string msg = aida::burp::camoufox::last_error();
+            if (msg.empty())
+                msg = "Camoufox browser is not ready for webfetch.";
+            diag::log_tagged_fmt("mcp_tools", "handle_webfetch camoufox_not_ready err=%s", msg.c_str());
+            return tool_result_t::error(msg);
         }
-        if (mcp_standalone::current_call_cancelled())
-            return error("webfetch cancelled by client request.");
 
-        int response_status = 0;
-        std::string response_body;
-        std::string content_type;
-        bool raw_loopback_fallback = false;
-        if (!res && loopback && !is_https) {
-            std::string raw_error;
-            raw_loopback_fallback = webfetch_raw_loopback_get(host, port, path, accept_header, timeout_sec,
-                response_status, content_type, response_body, raw_error);
-            diag::log_tagged_fmt("mcp_tools", "handle_webfetch raw_loopback_fallback ok=%d host=%s port=%d path=%s err=%s status=%d bytes=%zu",
-                raw_loopback_fallback ? 1 : 0, host.c_str(), port, path.c_str(),
-                raw_error.c_str(), response_status, response_body.size());
-            if (!raw_loopback_fallback && !raw_error.empty()) {
-                return error("HTTP request failed: " + httplib::to_string(last_error) + "; raw loopback fallback failed: " + raw_error + " for " + url);
-            }
+        diag::log_tagged_fmt("mcp_tools", "handle_webfetch camoufox_navigate_begin url_len=%zu format=%s timeout_ms=%d", url.size(), format.c_str(), timeout_ms);
+        json nav_args;
+        nav_args["url"] = url;
+        nav_args["wait_until"] = "domcontentloaded";
+        nav_args["collect_response_chain"] = true;
+        nav_args["clear_network_capture"] = true;
+        nav_args["include_title"] = true;
+        auto nav = aida::burp::camoufox::call_tool("navigate", nav_args, timeout_ms);
+        if (!nav.ok) {
+            std::string msg = nav.error.empty() ? nav.text : nav.error;
+            if (msg.empty()) msg = "Camoufox navigation failed for webfetch.";
+            diag::log_tagged_fmt("mcp_tools", "handle_webfetch camoufox_navigate_failed err=%s", msg.c_str());
+            return tool_result_t::error(msg);
         }
-        if (!res && !raw_loopback_fallback)
-            return error("HTTP request failed: " + httplib::to_string(last_error) + " for " + url);
-        if (res) {
-            response_status = res->status;
-            response_body = res->body;
-            auto ct_iter = res->headers.find("Content-Type");
-            if (ct_iter != res->headers.end()) content_type = ct_iter->second;
+
+        const size_t max_browser_chars = 5u * 1024u * 1024u;
+        const std::string extract_js = R"JS((() => {
+const maxChars = )JS" + std::to_string(max_browser_chars) + R"JS(;
+const root = document.documentElement;
+const body = document.body;
+let html = root ? root.outerHTML : '';
+let text = body ? body.innerText : (root ? root.textContent : '');
+let htmlTruncated = false;
+let textTruncated = false;
+if (html.length > maxChars) { html = html.slice(0, maxChars); htmlTruncated = true; }
+if (text.length > maxChars) { text = text.slice(0, maxChars); textTruncated = true; }
+return {
+  browser: 'camoufox',
+  url: location.href,
+  title: document.title || '',
+  content_type: document.contentType || '',
+  charset: document.characterSet || '',
+  ready_state: document.readyState || '',
+  html,
+  text,
+  html_truncated: htmlTruncated,
+  text_truncated: textTruncated
+};
+})())JS";
+
+        auto extracted = aida::burp::camoufox::evaluate_js(extract_js, true);
+        if (!extracted.ok) {
+            std::string msg = extracted.error.empty() ? extracted.text : extracted.error;
+            if (msg.empty()) msg = "Camoufox page extraction failed for webfetch.";
+            diag::log_tagged_fmt("mcp_tools", "handle_webfetch camoufox_extract_failed err=%s", msg.c_str());
+            return tool_result_t::error(msg);
         }
-        if (response_status < 200 || response_status >= 300)
-            return error("HTTP status " + std::to_string(response_status) + " for " + url);
 
-        constexpr size_t MAX_RAW_BYTES = 5u * 1024u * 1024u;
-        std::string body = std::move(response_body);
-        if (body.size() > MAX_RAW_BYTES)
-            body.resize(MAX_RAW_BYTES);
+        json payload = camoufox_value_json(extracted);
+        if (!payload.is_object()) {
+            diag::log_tagged_fmt("mcp_tools", "handle_webfetch camoufox_extract_unexpected payload_object=0");
+            return tool_result_t::error("Camoufox page extraction returned an unexpected payload.");
+        }
 
-        std::string ct_lower = to_lower(content_type);
-        const bool is_html = ct_lower.find("text/html") != std::string::npos
-                          || ct_lower.find("application/xhtml") != std::string::npos;
+        std::string html = json_string_field(payload, "html");
+        std::string page_text = json_string_field(payload, "text");
+        const std::string final_url = json_string_field(payload, "url");
+        const std::string title = json_string_field(payload, "title");
+        const std::string content_type = json_string_field(payload, "content_type");
+        if (html.empty() && page_text.empty())
+            return tool_result_t::error("Camoufox webfetch extracted an empty page.");
 
         std::string output;
         if (format == "html") {
-            output = std::move(body);
+            output = std::move(html);
         } else if (format == "text") {
-            output = is_html ? webfetch_html_to_text(body) : body;
+            output = std::move(page_text);
         } else {
-            output = is_html ? webfetch_html_to_markdown(body) : body;
+            output = html.empty() ? page_text : webfetch_html_to_markdown(html);
         }
 
         constexpr size_t MAX_OUTPUT_BYTES = 200000u;
@@ -2599,23 +2089,51 @@ namespace
             truncated = true;
         }
 
+        json nav_payload = camoufox_value_json(nav);
         json data;
-        data["url"] = url;
-        data["status"] = response_status;
+        data["url"] = final_url.empty() ? url : final_url;
+        data["requested_url"] = url;
+        data["title"] = title;
         data["format"] = format;
         data["content_type"] = content_type;
+        data["charset"] = json_string_field(payload, "charset");
+        data["ready_state"] = json_string_field(payload, "ready_state");
         data["bytes"] = static_cast<int64_t>(output.size());
         data["truncated"] = truncated;
-        data["loopback_fallback"] = raw_loopback_fallback;
+        data["transport"] = "camoufox";
+        data["browser"] = "camoufox";
+        data["status_source"] = "camoufox_response_chain";
+        data["status"] = 0;
+        if (nav_payload.is_object()) {
+            if (nav_payload.contains("final_status") && nav_payload["final_status"].is_number_integer())
+                data["status"] = nav_payload["final_status"];
+            else if (nav_payload.contains("status") && nav_payload["status"].is_number_integer())
+                data["status"] = nav_payload["status"];
+            else
+                data["status_source"] = "not_reported";
+            if (nav_payload.contains("response_chain"))
+                data["response_chain"] = nav_payload["response_chain"];
+        } else {
+            data["status_source"] = "not_reported";
+        }
+        data["html_truncated_in_browser"] = payload.contains("html_truncated") && payload["html_truncated"].is_boolean() ? payload["html_truncated"] : json(false);
+        data["text_truncated_in_browser"] = payload.contains("text_truncated") && payload["text_truncated"].is_boolean() ? payload["text_truncated"] : json(false);
+
+        diag::log_tagged_fmt("mcp_tools", "handle_webfetch camoufox_ok final_url_len=%zu title_len=%zu format=%s bytes=%zu status=%lld status_source=%s truncated=%d",
+            data["url"].is_string() ? data["url"].get<std::string>().size() : 0,
+            title.size(),
+            format.c_str(),
+            output.size(),
+            data["status"].is_number_integer() ? static_cast<long long>(data["status"].get<int64_t>()) : 0LL,
+            json_string_field(data, "status_source").c_str(),
+            truncated ? 1 : 0);
 
         std::string text;
-        text.reserve(output.size() + 128);
-        text += "Fetched ";
-        text += url;
+        text.reserve(output.size() + 160);
+        text += "Fetched via Camoufox ";
+        text += final_url.empty() ? url : final_url;
         text += " (";
-        text += std::to_string(response_status);
-        text += ", ";
-        text += content_type.empty() ? std::string("application/octet-stream") : content_type;
+        text += content_type.empty() ? std::string("browser-rendered") : content_type;
         text += ")\n\n";
         text += output;
         if (truncated)
@@ -2644,57 +2162,25 @@ namespace mcp_standalone
             [&srv](const json& params) { return srv.describe_tools(params); }});
 
         srv.register_tool({"driver_load", "Load and connect the host kernel driver backend for host live analysis.", {}, false, handle_driver_load});
-        srv.register_tool({"driver_detach", "Detach from the current process. If a Windows Sandbox guest lab is active this detaches the guest active process by default; pass target='host' for host detach.",
-            {{"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "Guest bridge timeout", false}},
+        srv.register_tool({"driver_detach", "Detach from the current process. If a VM bridge is active this detaches the VM active process by default; pass target='host' for host detach.",
+            {{"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "VM bridge timeout", false}},
             false, handle_driver_detach});
-        srv.register_tool({"guest_lab_status", "Return the active interactive Windows Sandbox malware lab and guest agent status.", {{"timeout_ms", "number", "Guest bridge timeout", false}}, true, handle_guest_lab_status});
-        srv.register_tool({"guest_lab_attach", "Attach the guest agent to a process inside the Windows Sandbox VM by pid or process name.",
-            {{"pid", "number", "Guest process id", false}, {"process", "string", "Guest process image name", false}, {"timeout_ms", "number", "Guest bridge timeout", false}},
-            false, handle_guest_lab_attach});
-        srv.register_tool({"guest_lab_detach", "Detach the guest agent from the active guest process.", {{"timeout_ms", "number", "Guest bridge timeout", false}}, false, handle_guest_lab_detach});
-        srv.register_tool({"guest_lab_list_processes", "Enumerate processes inside the active Windows Sandbox VM.",
-            {{"filter", "string", "Optional substring filter", false}, {"timeout_ms", "number", "Guest bridge timeout", false}},
-            true, handle_guest_lab_list_processes});
-        srv.register_tool({"guest_lab_memory_map", "Enumerate the memory map of the active or supplied guest process.",
-            {{"pid", "number", "Guest process id; defaults to active guest attach", false}, {"limit", "number", "Maximum regions", false}, {"readable_only", "boolean", "Only readable committed regions", false}, {"timeout_ms", "number", "Guest bridge timeout", false}},
-            true, handle_guest_lab_memory_map});
-        srv.register_tool({"guest_lab_query_memory", "Query a guest memory region containing an address.",
-            {{"address", "string", "Guest virtual address", true}, {"pid", "number", "Guest process id; defaults to active guest attach", false}, {"timeout_ms", "number", "Guest bridge timeout", false}},
-            true, handle_guest_lab_query_memory});
-        srv.register_tool({"guest_lab_read_memory", "Read bytes from a guest process inside the Windows Sandbox VM.",
-            {{"address", "string", "Guest virtual address", true}, {"size", "number", "Bytes to read, capped in the guest", false}, {"pid", "number", "Guest process id; defaults to active guest attach", false}, {"timeout_ms", "number", "Guest bridge timeout", false}},
-            true, handle_guest_lab_read_memory});
-        srv.register_tool({"guest_lab_read_string", "Read an ASCII or UTF-16 string from a guest process inside the Windows Sandbox VM.",
-            {{"address", "string", "Guest virtual address", true}, {"max_length", "number", "Maximum characters", false}, {"encoding", "string", "ascii|utf16", false}, {"pid", "number", "Guest process id; defaults to active guest attach", false}, {"timeout_ms", "number", "Guest bridge timeout", false}},
-            true, handle_guest_lab_read_string});
-        srv.register_tool({"guest_lab_enumerate_modules", "List modules for the active or supplied guest process.",
-            {{"pid", "number", "Guest process id; defaults to active guest attach", false}, {"timeout_ms", "number", "Guest bridge timeout", false}},
-            true, handle_guest_lab_enumerate_modules});
-        srv.register_tool({"guest_lab_enumerate_threads", "List threads for the active or supplied guest process.",
-            {{"pid", "number", "Guest process id; defaults to active guest attach", false}, {"timeout_ms", "number", "Guest bridge timeout", false}},
-            true, handle_guest_lab_enumerate_threads});
-        srv.register_tool({"guest_lab_dump_region", "Dump guest process memory to the sandbox output artifacts folder and return the host artifact path.",
-            {{"address", "string", "Guest virtual address", true}, {"size", "number", "Bytes to dump; 0 dumps the containing region up to the cap", false}, {"pid", "number", "Guest process id; defaults to active guest attach", false}, {"timeout_ms", "number", "Guest bridge timeout", false}},
-            true, handle_guest_lab_dump_region});
-        srv.register_tool({"guest_lab_search_memory", "Search readable guest process memory for a hex pattern; use ?? for wildcard bytes.",
-            {{"pattern", "string", "Hex pattern such as 48 8B ?? ??", true}, {"pid", "number", "Guest process id; defaults to active guest attach", false}, {"max_hits", "number", "Maximum hits", false}, {"max_scan_mb", "number", "Maximum readable memory to scan", false}, {"timeout_ms", "number", "Guest bridge timeout", false}},
-            true, handle_guest_lab_search_memory});
-        srv.register_tool({"list_processes", "Enumerate processes. If a Windows Sandbox guest lab is active this lists guest processes by default; pass target='host' for host processes.",
-            {{"filter", "string", "Optional substring filter", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "Guest bridge timeout", false}}, true, handle_list_processes});
-        srv.register_tool({"read_memory", "Read bytes from the attached process. If a Windows Sandbox guest lab is active this reads guest memory by default; pass target='host' for host memory.",
-            {{"address", "string", "Target address", true}, {"size", "number", "Bytes to read", false}, {"pid", "number", "Guest process id when target is guest", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "Guest bridge timeout", false}},
+        srv.register_tool({"list_processes", "Enumerate processes. If a VM bridge is active this lists VM processes by default; pass target='host' for host processes.",
+            {{"filter", "string", "Optional substring filter", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "VM bridge timeout", false}}, true, handle_list_processes});
+        srv.register_tool({"read_memory", "Read bytes from the attached process. If a VM bridge is active this reads VM memory by default; pass target='host' for host memory.",
+            {{"address", "string", "Target address", true}, {"size", "number", "Bytes to read", false}, {"pid", "number", "VM process id when target is guest", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "VM bridge timeout", false}},
             true, handle_read_memory});
-        srv.register_tool({"read_string", "Read a UTF-8/ASCII string from the attached process. If a Windows Sandbox guest lab is active this reads guest memory by default; pass target='host' for host memory.",
-            {{"address", "string", "Target address", true}, {"max_length", "number", "Maximum bytes to inspect", false}, {"encoding", "string", "ascii|utf16 for guest reads", false}, {"pid", "number", "Guest process id when target is guest", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "Guest bridge timeout", false}},
+        srv.register_tool({"read_string", "Read a UTF-8/ASCII string from the attached process. If a VM bridge is active this reads VM memory by default; pass target='host' for host memory.",
+            {{"address", "string", "Target address", true}, {"max_length", "number", "Maximum bytes to inspect", false}, {"encoding", "string", "ascii|utf16 for VM reads", false}, {"pid", "number", "VM process id when target is guest", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "VM bridge timeout", false}},
             true, handle_read_string});
-        srv.register_tool({"query_memory", "Query the memory region containing an address. If a Windows Sandbox guest lab is active this queries guest memory by default; pass target='host' for host memory.",
-            {{"address", "string", "Target address", true}, {"pid", "number", "Guest process id when target is guest", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "Guest bridge timeout", false}}, true, handle_query_memory});
-        srv.register_tool({"enumerate_modules", "List modules for the attached process. If a Windows Sandbox guest lab is active this lists guest modules by default; pass target='host' for host modules.",
-            {{"pid", "number", "Guest process id when target is guest", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "Guest bridge timeout", false}}, true, handle_enumerate_modules});
-        srv.register_tool({"enumerate_threads", "List threads for the attached process. If a Windows Sandbox guest lab is active this lists guest threads by default; pass target='host' for host threads.",
-            {{"pid", "number", "Guest process id when target is guest", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "Guest bridge timeout", false}}, true, handle_enumerate_threads});
-        srv.register_tool({"disassemble_address", "Disassemble bytes from the attached process using Zydis. If a Windows Sandbox guest lab is active this reads guest memory by default; pass target='host' for host memory.",
-            {{"address", "string", "Start address", true}, {"size", "number", "Bytes to read", false}, {"count", "number", "Maximum instructions", false}, {"pid", "number", "Guest process id when target is guest", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "Guest bridge timeout", false}},
+        srv.register_tool({"query_memory", "Query the memory region containing an address. If a VM bridge is active this queries VM memory by default; pass target='host' for host memory.",
+            {{"address", "string", "Target address", true}, {"pid", "number", "VM process id when target is guest", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "VM bridge timeout", false}}, true, handle_query_memory});
+        srv.register_tool({"enumerate_modules", "List modules for the attached process. If a VM bridge is active this lists VM modules by default; pass target='host' for host modules.",
+            {{"pid", "number", "VM process id when target is guest", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "VM bridge timeout", false}}, true, handle_enumerate_modules});
+        srv.register_tool({"enumerate_threads", "List threads for the attached process. If a VM bridge is active this lists VM threads by default; pass target='host' for host threads.",
+            {{"pid", "number", "VM process id when target is guest", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "VM bridge timeout", false}}, true, handle_enumerate_threads});
+        srv.register_tool({"disassemble_address", "Disassemble bytes from the attached process using Zydis. If a VM bridge is active this reads VM memory by default; pass target='host' for host memory.",
+            {{"address", "string", "Start address", true}, {"size", "number", "Bytes to read", false}, {"count", "number", "Maximum instructions", false}, {"pid", "number", "VM process id when target is guest", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "VM bridge timeout", false}},
             true, handle_disassemble_address});
         srv.register_tool({"disassemble_file", "Disassemble a PE file from disk using Zydis.",
             {{"path", "string", "Path to an EXE/DLL/SYS file", true}, {"count", "number", "Maximum instructions", false}},
@@ -2734,16 +2220,16 @@ namespace mcp_standalone
         srv.register_tool({"grep_in_files", "Search file contents with a regular expression.",
             {{"root", "string", "Root directory", true}, {"pattern", "string", "Regex pattern", true}, {"limit", "number", "Maximum matches", false}},
             true, handle_grep_in_files, mcp_standalone::tool_visibility_t::internal_only});
-        srv.register_tool({"web_search", "Search the web using DuckDuckGo Instant Answer API.",
-            {{"query", "string", "Search query text", true}, {"max_results", "number", "Maximum results to return (default 5)", false}, {"timeout", "number", "Per-upstream timeout in seconds (1-15, default 4)", false}},
+        srv.register_tool({"web_search", "Search the web through the bundled Camoufox browser and extract visible result links from rendered search pages.",
+            {{"query", "string", "Search query text", true}, {"max_results", "number", "Maximum results to return (default 5)", false}, {"timeout", "number", "Browser navigation timeout in seconds (1-60, default 8)", false}},
             true, handle_web_search, mcp_standalone::tool_visibility_t::internal_only});
         srv.register_tool({"webfetch",
-            "Fetch the contents of a URL via HTTPS and return them as markdown, plain text, or raw HTML. "
-            "Follows redirects, verifies certificates, strips script/style/noscript/iframe blocks before HTML conversion. "
+            "Open a URL in the bundled Camoufox browser and return rendered markdown, plain text, or raw HTML. "
+            "Uses browser navigation, redirects, cookies, scripts, and TLS behavior; strips script/style/noscript/iframe blocks before HTML conversion. "
             "Output capped at ~200 KB; max timeout 120 seconds.",
             {{"url", "string", "Absolute http:// or https:// URL", true},
              {"format", "string", "Output format: markdown (default), text, or html", false},
-             {"timeout", "number", "Request timeout in seconds (1-120, default 30)", false}},
+             {"timeout", "number", "Browser navigation timeout in seconds (1-120, default 30)", false}},
             true, handle_webfetch, mcp_standalone::tool_visibility_t::internal_only});
 
 

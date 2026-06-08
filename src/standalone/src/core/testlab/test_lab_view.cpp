@@ -72,6 +72,99 @@ namespace test_lab_view {
 		std::string       g_run_all_status_line;
 		std::string       g_run_all_current_name;
 
+		void log_render_lock_busy(const char* site, const char* lock_name) {
+			static std::atomic<unsigned long long> s_last_busy_log_ms{0};
+			const unsigned long long now = GetTickCount64();
+			unsigned long long last = s_last_busy_log_ms.load(std::memory_order_acquire);
+			if (now - last >= 1000ULL && s_last_busy_log_ms.compare_exchange_strong(last, now, std::memory_order_acq_rel)) {
+				diag::log_tagged_critical_fmt("test_lab_render",
+					"lock_busy site=%s lock=%s frame=%d tid=%lu safe_run_active=%d current=%d total=%d ok=%d fail=%d skipped=%d full_test=%d",
+					site ? site : "<null>",
+					lock_name ? lock_name : "<null>",
+					ImGui::GetFrameCount(),
+					static_cast<unsigned long>(GetCurrentThreadId()),
+					g_run_all_active.load(std::memory_order_acquire) ? 1 : 0,
+					g_run_all_current.load(std::memory_order_acquire),
+					g_run_all_total.load(std::memory_order_acquire),
+					g_run_all_ok.load(std::memory_order_acquire),
+					g_run_all_fail.load(std::memory_order_acquire),
+					g_run_all_skipped.load(std::memory_order_acquire),
+					test_all_features::is_running() ? 1 : 0);
+			}
+		}
+
+		bool try_copy_result_summary(const char* site, test_lab::run_state_e& state, bool& ok, bool& skipped) {
+			std::unique_lock<std::mutex> lk(g_result_mtx, std::try_to_lock);
+			if (!lk.owns_lock()) {
+				log_render_lock_busy(site, "g_result_mtx");
+				state = test_lab::run_state_e::idle;
+				ok = false;
+				skipped = false;
+				return false;
+			}
+			std::shared_ptr<test_lab::result_t> snap = g_result;
+			if (!snap) {
+				state = test_lab::run_state_e::idle;
+				ok = false;
+				skipped = false;
+				return true;
+			}
+			state = snap->state.load(std::memory_order_acquire);
+			ok = snap->ok;
+			skipped = snap->skipped;
+			return true;
+		}
+
+		bool try_copy_result_full(const char* site, test_lab::result_t& out) {
+			std::unique_lock<std::mutex> lk(g_result_mtx, std::try_to_lock);
+			if (!lk.owns_lock()) {
+				log_render_lock_busy(site, "g_result_mtx");
+				out.state.store(test_lab::run_state_e::idle, std::memory_order_release);
+				out.ok = false;
+				out.skipped = false;
+				out.ntstatus = 0;
+				out.bytes_returned = 0;
+				out.elapsed_us = 0;
+				out.error.clear();
+				out.raw.clear();
+				out.parsed.clear();
+				return false;
+			}
+			std::shared_ptr<test_lab::result_t> snap = g_result;
+			if (!snap) {
+				out.state.store(test_lab::run_state_e::idle, std::memory_order_release);
+				out.ok = false;
+				out.skipped = false;
+				out.ntstatus = 0;
+				out.bytes_returned = 0;
+				out.elapsed_us = 0;
+				out.error.clear();
+				out.raw.clear();
+				out.parsed.clear();
+				return true;
+			}
+			out.state.store(snap->state.load(std::memory_order_acquire), std::memory_order_release);
+			out.ok = snap->ok;
+			out.skipped = snap->skipped;
+			out.ntstatus = snap->ntstatus;
+			out.bytes_returned = snap->bytes_returned;
+			out.elapsed_us = snap->elapsed_us;
+			out.error = snap->error;
+			out.raw = snap->raw;
+			out.parsed = snap->parsed;
+			return true;
+		}
+
+		bool try_replace_result(const char* site, const std::shared_ptr<test_lab::result_t>& result) {
+			std::unique_lock<std::mutex> lk(g_result_mtx, std::try_to_lock);
+			if (!lk.owns_lock()) {
+				log_render_lock_busy(site, "g_result_mtx");
+				return false;
+			}
+			g_result = result;
+			return true;
+		}
+
 		struct full_test_scope_t {
 			const char* source = nullptr;
 			bool active = false;
@@ -442,9 +535,13 @@ namespace test_lab_view {
 			g_run_all_fail.store(0);
 			g_run_all_skipped.store(0);
 			{
-				std::lock_guard<std::mutex> lk(g_run_all_status_mtx);
-				g_run_all_status_line = "starting...";
-				g_run_all_current_name.clear();
+				std::unique_lock<std::mutex> lk(g_run_all_status_mtx, std::try_to_lock);
+				if (lk.owns_lock()) {
+					g_run_all_status_line = "starting...";
+					g_run_all_current_name.clear();
+				} else {
+					log_render_lock_busy("start_run_all_safe_status", "g_run_all_status_mtx");
+				}
 			}
 
 			bool posted = false;
@@ -552,9 +649,13 @@ namespace test_lab_view {
 			if (!posted) {
 				g_run_all_active.store(false, std::memory_order_release);
 				{
-					std::lock_guard<std::mutex> lk(g_run_all_status_mtx);
-					g_run_all_status_line = "start failed: critical queue unavailable";
-					g_run_all_current_name.clear();
+					std::unique_lock<std::mutex> lk(g_run_all_status_mtx, std::try_to_lock);
+					if (lk.owns_lock()) {
+						g_run_all_status_line = "start failed: critical queue unavailable";
+						g_run_all_current_name.clear();
+					} else {
+						log_render_lock_busy("start_run_all_safe_post_failed_status", "g_run_all_status_mtx");
+					}
 				}
 				diag::log_tagged("test_lab", "run_all_safe critical_queue post failed");
 			}
@@ -661,14 +762,7 @@ namespace test_lab_view {
 				bool rok = false;
 				bool rskipped = false;
 				if (is_selected) {
-					std::shared_ptr<test_lab::result_t> snap;
-					{
-						std::lock_guard<std::mutex> lk(g_result_mtx);
-						snap = g_result;
-					}
-					rs = snap->state.load(std::memory_order_acquire);
-					rok = snap->ok;
-					rskipped = snap->skipped;
+					try_copy_result_summary("left_pane_selected_row", rs, rok, rskipped);
 				}
 				rdl->AddCircleFilled(dot_p, dot_r, status_dot_color(rs, rok, rskipped, ent));
 
@@ -691,8 +785,7 @@ namespace test_lab_view {
 
 				if (clicked && fidx != g_selected_idx) {
 					g_selected_idx = fidx;
-					std::lock_guard<std::mutex> lk(g_result_mtx);
-					g_result = std::make_shared<test_lab::result_t>();
+					try_replace_result("left_pane_select_reset", std::make_shared<test_lab::result_t>());
 				}
 				ImGui::PopID();
 			}
@@ -722,12 +815,9 @@ namespace test_lab_view {
 		void run_fn_post_with_feature(const test_lab::feature_t& f);
 
 		void render_action_row(const test_lab::feature_t& f) {
-			std::shared_ptr<test_lab::result_t> snap;
-			{
-				std::lock_guard<std::mutex> lk(g_result_mtx);
-				snap = g_result;
-			}
-			test_lab::run_state_e rs = snap->state.load(std::memory_order_acquire);
+			test_lab::result_t action_copy;
+			const bool action_snapshot_ok = try_copy_result_full("action_row_snapshot", action_copy);
+			test_lab::run_state_e rs = action_copy.state.load(std::memory_order_acquire);
 			bool running = (rs == test_lab::run_state_e::running);
 
 			ImGui::Dummy(ImVec2(0.f, 4.f));
@@ -739,17 +829,15 @@ namespace test_lab_view {
 			if (running) ImGui::EndDisabled();
 			ImGui::SameLine();
 
-			bool has_result = (snap->state.load(std::memory_order_acquire) ==
-				test_lab::run_state_e::complete);
+			bool has_result = action_snapshot_ok && (rs == test_lab::run_state_e::complete);
 
 			if (!has_result) ImGui::BeginDisabled();
 			if (ImGui::Button("Copy raw", ImVec2(110.f, 28.f))) {
-				const auto& raw = snap->raw;
 				std::string out;
-				out.reserve(raw.size() * 3);
+				out.reserve(action_copy.raw.size() * 3);
 				char tmp[8];
-				for (std::size_t i = 0; i < raw.size(); ++i) {
-					std::snprintf(tmp, sizeof(tmp), "%02X ", static_cast<unsigned>(raw[i]));
+				for (std::size_t i = 0; i < action_copy.raw.size(); ++i) {
+					std::snprintf(tmp, sizeof(tmp), "%02X ", static_cast<unsigned>(action_copy.raw[i]));
 					out.append(tmp);
 				}
 				ImGui::SetClipboardText(out.c_str());
@@ -757,7 +845,7 @@ namespace test_lab_view {
 			ImGui::SameLine();
 			if (ImGui::Button("Copy parsed", ImVec2(110.f, 28.f))) {
 				std::string out;
-				for (const auto& p : snap->parsed) {
+				for (const auto& p : action_copy.parsed) {
 					out.append(p.label);
 					out.append(": ");
 					out.append(p.value);
@@ -768,8 +856,7 @@ namespace test_lab_view {
 			if (!has_result) ImGui::EndDisabled();
 			ImGui::SameLine();
 			if (ImGui::Button("Clear", ImVec2(110.f, 28.f))) {
-				std::lock_guard<std::mutex> lk(g_result_mtx);
-				g_result = std::make_shared<test_lab::result_t>();
+				try_replace_result("action_row_clear", std::make_shared<test_lab::result_t>());
 			}
 		}
 
@@ -777,9 +864,11 @@ namespace test_lab_view {
 			test_lab::state_t snapshot = g_state;
 			std::shared_ptr<test_lab::result_t> new_result = std::make_shared<test_lab::result_t>();
 			new_result->state.store(test_lab::run_state_e::running, std::memory_order_release);
-			{
-				std::lock_guard<std::mutex> lk(g_result_mtx);
-				g_result = new_result;
+			if (!try_replace_result("single_feature_start", new_result)) {
+				new_result->ok = false;
+				new_result->error = "result lock busy";
+				new_result->state.store(test_lab::run_state_e::complete, std::memory_order_release);
+				return;
 			}
 			test_lab::feature_t feature_copy = f;
 			if (!critical_work_queue::post([feature_copy, snapshot, new_result]() mutable {
@@ -825,18 +914,22 @@ namespace test_lab_view {
 		void render_result_section() {
 			const auto& t = aida::ui::resolved();
 
-			std::shared_ptr<test_lab::result_t> snap;
-			{
-				std::lock_guard<std::mutex> lk(g_result_mtx);
-				snap = g_result;
-			}
-			test_lab::run_state_e rs = snap->state.load(std::memory_order_acquire);
+			test_lab::result_t local_copy;
+			const bool result_snapshot_ok = try_copy_result_full("result_section_snapshot", local_copy);
+			test_lab::run_state_e rs = local_copy.state.load(std::memory_order_acquire);
 
 			ImGui::PushStyleColor(ImGuiCol_Text, t.text_secondary);
 			ImGui::TextUnformatted("RESULT");
 			ImGui::PopStyleColor();
 			ImGui::Separator();
 			ImGui::Dummy(ImVec2(0.f, 4.f));
+
+			if (!result_snapshot_ok) {
+				ImGui::PushStyleColor(ImGuiCol_Text, t.warning);
+				ImGui::TextUnformatted("Result snapshot busy");
+				ImGui::PopStyleColor();
+				return;
+			}
 
 			if (rs == test_lab::run_state_e::idle) {
 				ImGui::TextDisabled("No execution yet.");
@@ -847,19 +940,6 @@ namespace test_lab_view {
 				ImGui::TextUnformatted("Running...");
 				ImGui::PopStyleColor();
 				return;
-			}
-
-			test_lab::result_t local_copy;
-			{
-				std::lock_guard<std::mutex> lk(g_result_mtx);
-				local_copy.ok = snap->ok;
-				local_copy.skipped = snap->skipped;
-				local_copy.ntstatus = snap->ntstatus;
-				local_copy.bytes_returned = snap->bytes_returned;
-				local_copy.elapsed_us = snap->elapsed_us;
-				local_copy.error = snap->error;
-				local_copy.raw = snap->raw;
-				local_copy.parsed = snap->parsed;
 			}
 
 			ImU32 status_col = local_copy.skipped ? t.warning : (local_copy.ok ? t.success : t.error);
@@ -991,9 +1071,19 @@ namespace test_lab_view {
 		std::string status_copy;
 		std::string current_name_copy;
 		{
-			std::lock_guard<std::mutex> lk(g_run_all_status_mtx);
-			status_copy = g_run_all_status_line;
-			current_name_copy = g_run_all_current_name;
+			static std::string s_last_status_copy;
+			static std::string s_last_current_name_copy;
+			std::unique_lock<std::mutex> lk(g_run_all_status_mtx, std::try_to_lock);
+			if (lk.owns_lock()) {
+				status_copy = g_run_all_status_line;
+				current_name_copy = g_run_all_current_name;
+				s_last_status_copy = status_copy;
+				s_last_current_name_copy = current_name_copy;
+			} else {
+				log_render_lock_busy("top_status", "g_run_all_status_mtx");
+				status_copy = s_last_status_copy;
+				current_name_copy = s_last_current_name_copy;
+			}
 		}
 
 		ImGui::PushStyleColor(ImGuiCol_Text, t.text_dim);

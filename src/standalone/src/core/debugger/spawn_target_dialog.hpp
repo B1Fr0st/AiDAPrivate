@@ -496,11 +496,15 @@ inline void render() {
 			if (caption) ImGui::PushFont(caption);
 			ImGui::TextWrapped("First-time setup for Run in VM");
 			ImGui::BulletText("Windows edition: Pro, Enterprise, or Education. Windows Home users need a full VM such as VMware Workstation Pro or VirtualBox.");
+			ImGui::BulletText("For QEMU, VirtualBox, or VMware, keep AiDAStandalone.exe on the host. Do not copy AiDAStandalone.exe into the guest VM.");
+			ImGui::BulletText("Run only the target sample and your MCP client or guest agent in the guest VM. Route that client through an authenticated host bridge or tunnel that terminates at AiDA's localhost MCP endpoint.");
+			ImGui::BulletText("Do not bind AiDA's MCP endpoint directly to a guest, LAN, or untrusted adapter. MCP tools can mutate host files, sessions, debugger state, and process memory.");
+			ImGui::BulletText("Custom VM workflows use the normal AiDA MCP tools with explicit target selection, including list_processes, driver_attach, read_memory, query_memory, enumerate_modules, enumerate_threads, and disassemble_address.");
 			ImGui::BulletText("Download for full VM fallback: VMware Workstation Pro or Oracle VirtualBox, then a Windows evaluation ISO.");
 			ImGui::BulletText("BIOS/UEFI: enable Intel VT-x or AMD-V/SVM, then boot back into Windows.");
 			ImGui::BulletText("Admin PowerShell: Enable-WindowsOptionalFeature -Online -FeatureName Containers-DisposableClientVM -All");
 			ImGui::BulletText("Reboot, reopen AiDA, press Run, select Run in VM, then Open VM.");
-			ImGui::BulletText("The sample window opens inside Windows Sandbox. AiDA's guest MCP tools inspect memory through the VM bridge.");
+			ImGui::BulletText("The built-in Open VM flow opens the sample inside Windows Sandbox and stages only the sandbox guest bridge, not AiDAStandalone.exe.");
 			const auto& caps = detail::cached_capabilities();
 			if (!caps.has_windows_sandbox) {
 				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(tk.warning),
@@ -613,7 +617,7 @@ inline void render() {
 			const char* warn_title = host_mode ? "Host execution warning" : "Interactive VM sandbox";
 			const char* warn_body  = host_mode
 				? "Run in Host starts the selected binary on this Windows installation and may attach AiDA's host driver. Do not use this for malware, cheat loaders, BYOVD samples, unknown drivers, or anything you do not fully trust."
-				: "Run in VM copies the sample into a disposable Windows Sandbox workspace, disables clipboard and device redirection, optionally disables networking, and starts the sample in the sandbox window. AiDA does not attach the host driver to this process because the process is not running in the host OS.";
+				: "Run in VM copies the sample into a disposable Windows Sandbox workspace, disables clipboard and device redirection, optionally disables networking, and starts the sample in the sandbox window. AiDAStandalone.exe remains on the host; the sandbox receives only the staged sample and guest bridge.";
 
 			ImVec2 ts_title = warn_font->CalcTextSizeA(fs_title, FLT_MAX, w - pad_x * 2.f, warn_title);
 			ImVec2 ts_body = base->CalcTextSizeA(fs_body, FLT_MAX, w - pad_x * 2.f, warn_body);

@@ -218,6 +218,11 @@ static json ns_firefox_status_to_json(const cert_intercept::profiles::firefox_pr
     out["runtime_validation_performed"] = status.runtime_validation_performed;
     out["runtime_validation_valid"] = status.runtime_validation_valid;
     out["post_launch_profile_validated"] = status.post_launch_profile_validated;
+    out["timed_out"] = status.timed_out;
+    out["timeout_ms"] = status.timeout_ms;
+    out["last_win32_error"] = status.last_win32_error;
+    out["elapsed_ms"] = status.elapsed_ms;
+    out["last_operation"] = status.last_operation;
     out["firefox_path"] = status.firefox_path;
     out["profile_path"] = status.profile_path.u8string();
     out["user_js_path"] = status.user_js_path.u8string();
@@ -507,7 +512,7 @@ tool_result_t cert_inject(const json& params) {
     r["method"] = result.method;
     if (result.success)
         return tool_result_t::ok(OBFSTR("Certificate injected: ") + result.subject_cn, r);
-    return tool_result_t::error(OBFSTR("Certificate injection failed"));
+    return tool_result_t::error(OBFSTR("Certificate injection failed"), r);
 }
 
 tool_result_t cert_remove(const json& params) {
@@ -571,28 +576,23 @@ tool_result_t cert_generate_ca(const json& params) {
         return tool_result_t::ok(OBFSTR("Validated public CA certificate generation path without exporting private key material"), r);
     }
 
-    std::vector<std::uint8_t> cert_der, key_der;
-    bool ok = net_security::CertificateInjector::instance().generate_ca_certificate(cn, days, cert_der, key_der, false);
-    diag::log_tagged_fmt("net_sec", "cert_generate_ca ok=%d cert_size=%zu cn=%s", (int)ok, cert_der.size(), cn.c_str());
+    std::vector<std::uint8_t> cert_der;
+    std::string subject_cn;
+    bool ok = cert_generator::generate_public_ca_certificate_der(cn, days, cert_der, subject_cn);
+    diag::log_tagged_fmt("net_sec", "cert_generate_ca ok=%d cert_size=%zu cn=%s subject=%s",
+        (int)ok, cert_der.size(), cn.c_str(), subject_cn.c_str());
+    json r;
+    r["success"] = ok;
+    r["backend"] = "openssl_public_der";
+    r["private_key_exported"] = false;
+    r["cert_size"] = cert_der.size();
+    r["subject_cn"] = subject_cn.empty() ? cn : subject_cn;
+    r["validity_days"] = days;
     if (ok) {
-        json r;
-        r["success"] = true;
         r["cert_der_hex"] = ns_bytes_to_hex(cert_der.data(), cert_der.size());
-        if (!key_der.empty()) {
-            SecureZeroMemory(key_der.data(), key_der.size());
-            key_der.clear();
-        }
-        r["private_key_exported"] = false;
-        r["cert_size"] = cert_der.size();
-        r["subject_cn"] = cn;
-        r["validity_days"] = days;
         return tool_result_t::ok(OBFSTR("Generated public CA certificate: ") + cn, r);
     }
-    if (!key_der.empty()) {
-        SecureZeroMemory(key_der.data(), key_der.size());
-        key_der.clear();
-    }
-    return tool_result_t::error(OBFSTR("Failed to generate CA certificate"));
+    return tool_result_t::error(OBFSTR("Failed to generate CA certificate"), r);
 }
 
 tool_result_t cert_list(const json& params) {
@@ -674,6 +674,8 @@ tool_result_t pin_bypass_revert(const json& params) {
     json r;
     r["reverted"] = false;
     r["pid"] = pid;
+    r["active_after"] = false;
+    r["idempotent_noop"] = true;
     r["target_process_modified"] = false;
     return tool_result_t::ok(OBFSTR("No active bypass to revert for this PID"), r);
 }
@@ -711,7 +713,7 @@ tool_result_t firefox_profile_prepare(const json& params) {
     auto status = cert_intercept::profiles::prepare_firefox_profile(
         cert_generator::get_root_ca(), proxy_host, proxy_port);
     if (!status.ok)
-        return tool_result_t::error(OBFSTR("Firefox profile preparation failed: ") + status.error);
+        return tool_result_t::error(OBFSTR("Firefox profile preparation failed: ") + status.error, ns_firefox_status_to_json(status));
     return tool_result_t::ok(OBFSTR("Firefox interception profile prepared"), ns_firefox_status_to_json(status));
 }
 
@@ -732,11 +734,11 @@ tool_result_t firefox_profile_launch(const json& params) {
         return tool_result_t::ok(OBFSTR("Firefox launch readiness validated without starting a browser"), ns_firefox_status_to_json(status));
     }
     if (!status.ok)
-        return tool_result_t::error(OBFSTR("Firefox profile preparation failed: ") + status.error);
+        return tool_result_t::error(OBFSTR("Firefox profile preparation failed: ") + status.error, ns_firefox_status_to_json(status));
 
     status = cert_intercept::profiles::launch_firefox_profile(status);
     if (!status.ok)
-        return tool_result_t::error(OBFSTR("Firefox launch failed: ") + status.error);
+        return tool_result_t::error(OBFSTR("Firefox launch failed: ") + status.error, ns_firefox_status_to_json(status));
     return tool_result_t::ok(OBFSTR("Firefox launched with the AiDA interception profile"), ns_firefox_status_to_json(status));
 }
 
@@ -906,7 +908,24 @@ tool_result_t network_decrypt_capture(const json& params) {
         return tool_result_t::error(OBFSTR("keylog_path is required (or set SSLKEYLOGFILE environment variable)"));
     }
 
-    diag::log_tagged_fmt("net_sec", "network_decrypt_capture calling tshark pcap=%s keylog=%s filter=%s", pcap_path.c_str(), keylog_path.c_str(), display_filter.c_str());
+    std::string tshark_path = net_security::TlsKeyExtractor::instance().find_tshark_path();
+    if (tshark_path.empty()) {
+        json r;
+        r["success"] = false;
+        r["backend"] = "tshark";
+        r["dependency_available"] = false;
+        r["pcap_file"] = pcap_path;
+        r["keylog_file"] = keylog_path;
+        r["display_filter"] = display_filter;
+        r["total_packets"] = 0;
+        r["decrypted_packets"] = 0;
+        r["error"] = "tshark not found. Install Wireshark to enable PCAP decryption.";
+        diag::log_tagged_fmt("net_sec", "network_decrypt_capture dependency_unavailable backend=tshark pcap=%s keylog=%s filter=%s",
+            pcap_path.c_str(), keylog_path.c_str(), display_filter.c_str());
+        return tool_result_t::error(OBFSTR("tshark not found. Install Wireshark to enable PCAP decryption."), r);
+    }
+
+    diag::log_tagged_fmt("net_sec", "network_decrypt_capture calling tshark pcap=%s keylog=%s filter=%s tshark=%s", pcap_path.c_str(), keylog_path.c_str(), display_filter.c_str(), tshark_path.c_str());
     auto decrypt_result = net_security::TlsKeyExtractor::instance().decrypt_pcap_with_tshark(
         pcap_path, keylog_path, display_filter);
     diag::log_tagged_fmt("net_sec", "network_decrypt_capture result success=%d total_packets=%u decrypted=%u http2_frames=%zu",
@@ -914,6 +933,9 @@ tool_result_t network_decrypt_capture(const json& params) {
 
     json r;
     r["success"] = decrypt_result.success;
+    r["backend"] = "tshark";
+    r["dependency_available"] = true;
+    r["tshark_path"] = tshark_path;
     r["pcap_file"] = decrypt_result.pcap_file_used;
     r["keylog_file"] = decrypt_result.keylog_file_used;
     r["total_packets"] = decrypt_result.total_packets;
@@ -949,7 +971,7 @@ tool_result_t network_decrypt_capture(const json& params) {
             OBFSTR(" HTTP/2 frames"), r);
 
     return tool_result_t::error(decrypt_result.error_message.empty() ?
-        OBFSTR("Decryption failed - no matching packets found") : decrypt_result.error_message);
+        OBFSTR("Decryption failed - no matching packets found") : decrypt_result.error_message, r);
 }
 
 tool_result_t tls_ensure_keylogfile(const json& params) {
@@ -1094,12 +1116,49 @@ tool_result_t autoresponder_import_rules(const json& params) {
     return tool_result_t::error(OBFSTR("Failed to import rules - invalid JSON"));
 }
 
-tool_result_t autoresponder_export_rules(const json&) {
+tool_result_t autoresponder_export_rules(const json& params) {
     diag::log_tagged("net_sec", "autoresponder_export_rules entry");
     std::string exported = net_security::AutoResponder::instance().export_rules();
-    diag::log_tagged_fmt("net_sec", "autoresponder_export_rules exported_len=%zu", exported.size());
+    const auto count = net_security::AutoResponder::instance().list_rules().size();
+    const std::string path = params.value("path", std::string());
+    bool wrote_file = false;
+    uint64_t file_size = 0;
+    std::error_code fs_ec;
+    if (!path.empty()) {
+        std::filesystem::path out_path(path);
+        if (!out_path.parent_path().empty())
+            std::filesystem::create_directories(out_path.parent_path(), fs_ec);
+        if (!fs_ec) {
+            std::ofstream ofs(out_path, std::ios::binary | std::ios::trunc);
+            if (ofs) {
+                ofs.write(exported.data(), static_cast<std::streamsize>(exported.size()));
+                ofs.flush();
+                wrote_file = !ofs.fail();
+            }
+        }
+        if (wrote_file) {
+            std::error_code size_ec;
+            file_size = static_cast<uint64_t>(std::filesystem::file_size(out_path, size_ec));
+            if (size_ec)
+                file_size = 0;
+        }
+    }
+    diag::log_tagged_fmt("net_sec", "autoresponder_export_rules exported_len=%zu count=%zu path=%s wrote=%d file_size=%llu ec=%lu",
+        exported.size(), count, path.c_str(), wrote_file ? 1 : 0,
+        static_cast<unsigned long long>(file_size), static_cast<unsigned long>(fs_ec.value()));
     json r;
     r["rules_json"] = exported;
+    r["rule_count"] = count;
+    r["path"] = path;
+    r["wrote_file"] = wrote_file;
+    r["file_size"] = file_size;
+    r["fs_error"] = fs_ec.value();
+    if (!path.empty() && (!wrote_file || file_size == 0)) {
+        diag::log_tagged_fmt("net_sec", "autoresponder_export_rules write_failed path=%s wrote=%d file_size=%llu ec=%lu",
+            path.c_str(), wrote_file ? 1 : 0,
+            static_cast<unsigned long long>(file_size), static_cast<unsigned long>(fs_ec.value()));
+        return tool_result_t::error(OBFSTR("AutoResponder rules export file write failed"), r);
+    }
     return tool_result_t::ok(OBFSTR("AutoResponder rules exported"), r);
 }
 
@@ -1345,7 +1404,7 @@ void register_net_security_tools(mcp_standalone::server_t& srv) {
     register_compat(srv, {
         OBFSTR("autoresponder_export_rules"), OBFSTR("network_security"),
         OBFSTR("Export all AutoResponder rules as a JSON array string. Can be saved and re-imported later."),
-        {},
+        {{OBFSTR("path"), OBFSTR("string"), OBFSTR("Optional output file path for the exported rules JSON"), false}},
         autoresponder_export_rules, true});
 
     register_compat(srv, {

@@ -19,7 +19,7 @@
 #include <shlobj.h>
 
 #include "run_target.hpp"
-#include "guest_lab_bridge.hpp"
+#include "vm_guest_bridge.hpp"
 #include "standalone_driver.hpp"
 #include "../../helpers/diag_log.hpp"
 
@@ -1989,7 +1989,7 @@ bool launch_windows_sandbox(const launch_options_t& opts, launch_result_t& out) 
 	out.thread_handle = 0;
 	out.job_handle = 0;
 	out.sandbox_dir = session_dir.wstring();
-	guest_lab::activate(out.sandbox_dir, opts.exe_path);
+	vm_guest_bridge::activate(out.sandbox_dir, opts.exe_path);
 
 	if (opts.auto_terminate_sec > 0) {
 		spawn_watchdog_kill(pi.hProcess, nullptr, opts.auto_terminate_sec, pi.dwProcessId);

@@ -1264,7 +1264,7 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/mcp/mcp_standalone_tools.cpp"
             "${STANDALONE_ROOT}/core/runtime/standalone_driver.cpp"
             "${STANDALONE_ROOT}/core/runtime/run_target.cpp"
-            "${STANDALONE_ROOT}/core/runtime/guest_lab_bridge.cpp"
+            "${STANDALONE_ROOT}/core/runtime/vm_guest_bridge.cpp"
             "${STANDALONE_ROOT}/core/ai/standalone_ai_client.cpp"
             "${STANDALONE_ROOT}/core/ai/standalone_chat.cpp"
             "${STANDALONE_ROOT}/core/runtime/standalone_license.cpp"

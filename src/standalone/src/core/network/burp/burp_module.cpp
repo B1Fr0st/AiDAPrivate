@@ -29,6 +29,7 @@
 #include "tech_fingerprint.hpp"
 
 #include "camoufox_install.hpp"
+#include "camoufox_bridge.hpp"
 #include "headless_view.hpp"
 
 #include "../../../helpers/diag_log.hpp"
@@ -154,6 +155,14 @@ void shutdown()
 {
     if (!initialized_flag().exchange(false)) return;
 
+    try
+    {
+        camoufox::force_cleanup("burp_module.shutdown");
+    }
+    catch (...)
+    {
+        diag::log_tagged("burp_module", "camoufox_force_cleanup_exception");
+    }
     headless_view::shutdown();
     camoufox::install::shutdown();
 

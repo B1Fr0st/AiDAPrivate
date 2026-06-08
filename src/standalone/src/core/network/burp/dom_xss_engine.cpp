@@ -22,6 +22,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <mutex>
 #include <random>
@@ -75,8 +76,12 @@ uint64_t now_ms_wall()
 std::atomic<bool>&     initialized_flag() { static std::atomic<bool> f{false}; return f; }
 std::atomic<uint64_t>& last_scan_ms()     { static std::atomic<uint64_t> v{0}; return v; }
 std::atomic<uint64_t>& sentinel_counter() { static std::atomic<uint64_t> v{0}; return v; }
+std::atomic<uint64_t>& dom_page_counter() { static std::atomic<uint64_t> v{0}; return v; }
 std::recursive_mutex&  browser_global_mtx() { static std::recursive_mutex m; return m; }
 constexpr uint64_t kVisibleBrowserRelaunchBudgetMs = 70000;
+
+std::string json_shape_local(const nlohmann::json& j);
+constexpr const char* kConsoleCanaryPrefix = "AIDA_DOM_XSS_CANARY:";
 
 std::string bytes_to_hex(const uint8_t* b, size_t n)
 {
@@ -89,6 +94,113 @@ std::string bytes_to_hex(const uint8_t* b, size_t n)
     }
     return out;
 }
+
+std::string stable_hash64(const std::string& s)
+{
+    uint64_t h = 1469598103934665603ull;
+    for (unsigned char c : s)
+    {
+        h ^= static_cast<uint64_t>(c);
+        h *= 1099511628211ull;
+    }
+    uint8_t b[8];
+    for (size_t i = 0; i < sizeof(b); ++i)
+        b[i] = static_cast<uint8_t>((h >> ((7 - i) * 8)) & 0xFFu);
+    return bytes_to_hex(b, sizeof(b));
+}
+
+std::string page_id_from_result(const camoufox::call_result_t& r, const std::string& fallback)
+{
+    try {
+        if (r.data.is_object()) {
+            auto it = r.data.find("page_id");
+            if (it != r.data.end() && it->is_string() && !it->get<std::string>().empty())
+                return it->get<std::string>();
+            auto page = r.data.find("page");
+            if (page != r.data.end() && page->is_object()) {
+                auto pit = page->find("page_id");
+                if (pit != page->end() && pit->is_string() && !pit->get<std::string>().empty())
+                    return pit->get<std::string>();
+            }
+        }
+    } catch (...) {}
+    return fallback;
+}
+
+std::string make_dom_page_id(const char* phase, const sentinel_t& s)
+{
+    const uint64_t n = dom_page_counter().fetch_add(1, std::memory_order_acq_rel) + 1;
+    std::string token = s.token;
+    if (token.size() > 16)
+        token.resize(16);
+    std::string out = "dom_xss_";
+    out += phase ? phase : "page";
+    out += "_";
+    out += token.empty() ? std::to_string(static_cast<unsigned long long>(now_ms_steady())) : token;
+    out += "_";
+    out += std::to_string(static_cast<unsigned long long>(n));
+    for (char& c : out) {
+        const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-';
+        if (!ok) c = '_';
+    }
+    return out;
+}
+
+struct browser_page_scope_t
+{
+    std::string page_id;
+    std::string previous_page_id;
+    bool created = false;
+
+    browser_page_scope_t(const char* phase, const sentinel_t& s)
+    {
+        try {
+            previous_page_id = camoufox::get_status().active_page_id;
+        } catch (...) {
+            previous_page_id.clear();
+        }
+        const std::string requested = make_dom_page_id(phase, s);
+        camoufox::call_result_t r;
+        try {
+            r = camoufox::new_page("default", requested, "about:blank", true);
+        } catch (...) {
+            r.ok = false;
+            r.error = "new_page threw";
+        }
+        if (r.ok) {
+            page_id = page_id_from_result(r, requested);
+            created = !page_id.empty();
+            diag::log_tagged_fmt("dom_xss", "page_scope_create phase=%s requested_page_id=%s page_id=%s previous_page_id=%s data_shape=%s",
+                phase ? phase : "", requested.c_str(), page_id.c_str(), previous_page_id.c_str(), json_shape_local(r.data).c_str());
+        } else {
+            diag::log_tagged_fmt("dom_xss", "page_scope_create_failed phase=%s requested_page_id=%s previous_page_id=%s err=%s data_shape=%s",
+                phase ? phase : "", requested.c_str(), previous_page_id.c_str(), r.error.c_str(), json_shape_local(r.data).c_str());
+        }
+    }
+
+    ~browser_page_scope_t()
+    {
+        if (created && !page_id.empty()) {
+            camoufox::call_result_t closed;
+            try { closed = camoufox::close_page("default", page_id); }
+            catch (...) { closed.ok = false; closed.error = "close_page threw"; }
+            diag::log_tagged_fmt("dom_xss", "page_scope_close page_id=%s ok=%d err=%s data_shape=%s",
+                page_id.c_str(), closed.ok ? 1 : 0, closed.error.c_str(), json_shape_local(closed.data).c_str());
+        }
+        if (!previous_page_id.empty()) {
+            camoufox::call_result_t selected;
+            try { selected = camoufox::select_page("default", previous_page_id); }
+            catch (...) { selected.ok = false; selected.error = "select_page threw"; }
+            diag::log_tagged_fmt("dom_xss", "page_scope_restore previous_page_id=%s ok=%d err=%s data_shape=%s",
+                previous_page_id.c_str(), selected.ok ? 1 : 0, selected.error.c_str(), json_shape_local(selected.data).c_str());
+        }
+    }
+
+    bool ok() const
+    {
+        return created && !page_id.empty();
+    }
+};
 
 bool random_bytes(uint8_t* out, size_t n)
 {
@@ -192,7 +304,9 @@ void recover_browser_transport(const char* phase, int attempt, const std::string
         static_cast<unsigned long long>(before.generation), static_cast<unsigned long>(before.child_pid),
         before.child_alive ? 1 : 0, before.browser_open ? 1 : 0, before.page_verified ? 1 : 0,
         before.cleanup_pending ? 1 : 0, static_cast<unsigned long long>(before.total_errors), err.c_str());
-    const bool stopped = camoufox::stop_bridge();
+    std::string stop_reason = "dom_xss.recover.";
+    stop_reason += phase ? phase : "browser";
+    const bool stopped = camoufox::stop_bridge(stop_reason.c_str());
     const auto after = camoufox::get_status();
     diag::log_tagged_fmt("dom_xss", "browser_transport_recover_stop phase=%s attempt=%d stop_ok=%d elapsed_ms=%llu state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d errors=%llu sleep_ms=%d err=%s",
         phase ? phase : "", attempt, stopped ? 1 : 0,
@@ -203,6 +317,25 @@ void recover_browser_transport(const char* phase, int attempt, const std::string
         err.c_str());
     std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
 }
+
+struct bridge_activity_scope_t
+{
+    const char* owner = nullptr;
+    uint64_t token = 0;
+
+    explicit bridge_activity_scope_t(const char* activity_owner)
+        : owner(activity_owner), token(camoufox::begin_activity(activity_owner))
+    {
+    }
+
+    ~bridge_activity_scope_t()
+    {
+        camoufox::end_activity(token, owner);
+    }
+
+    bridge_activity_scope_t(const bridge_activity_scope_t&) = delete;
+    bridge_activity_scope_t& operator=(const bridge_activity_scope_t&) = delete;
+};
 
 std::string js_string_literal(const std::string& s)
 {
@@ -400,6 +533,98 @@ std::string build_results_read_js(const sentinel_t& s)
     return os.str();
 }
 
+std::string build_canary_probe_js(const sentinel_t& s)
+{
+    std::ostringstream os;
+    os << "(function(){";
+    os << "var RG=" << js_string_literal(s.results_global) << ";";
+    os << "var CF=" << js_string_literal(s.canary_fn) << ";";
+    os << "var TOK=" << js_string_literal(s.token) << ";";
+    os << "var html='';try{html=document.documentElement?document.documentElement.outerHTML:'';}catch(e){}";
+    os << "var arr=window[RG];";
+    os << "var DG='__aida_dom_xss_diag_'+TOK;";
+    os << "var diag=null;try{diag=window[DG]||null;}catch(e){}";
+    os << "var fixture=window.aidaDomXssFixtureLog;";
+    os << "var reflect='';try{var de=document.getElementById('dom-reflect');reflect=de?de.innerHTML:'';}catch(e){}";
+    os << "var setterText='';try{var d=Object.getOwnPropertyDescriptor(Element.prototype,'innerHTML');if(d&&d.set)setterText=String(d.set).slice(0,240);}catch(e){}";
+    os << "var evs={total:0,withToken:0,withFn:0,withConsole:0,sample:''};try{var ns=document.querySelectorAll('*');for(var i=0;i<ns.length&&i<4096;i++){var as=ns[i].attributes||[];for(var j=0;j<as.length&&evs.total<8192;j++){var n=String(as[j].name||'').toLowerCase();var v=String(as[j].value||'');if(n.indexOf('on')===0||n==='href'||n==='src'||n==='xlink:href'||n==='formaction'||n==='action'||n==='srcdoc'){evs.total++;var ht=v.indexOf(TOK)>=0;var hf=v.indexOf(CF)>=0;var hc=v.indexOf('AIDA_DOM_XSS_CANARY')>=0;if(ht)evs.withToken++;if(hf)evs.withFn++;if(hc)evs.withConsole++;if(!evs.sample&&(ht||hf||hc))evs.sample=(n+'='+v).slice(0,240);}}}}catch(e){evs.error=String(e&&e.message?e.message:e).slice(0,160);}";
+    os << "return JSON.stringify({";
+    os << "fnType:typeof window[CF],";
+    os << "resultsIsArray:Array.isArray(arr),";
+    os << "resultsLen:Array.isArray(arr)?arr.length:-1,";
+    os << "resultsTail:Array.isArray(arr)?arr.slice(Math.max(0,arr.length-3)):[],";
+    os << "diag:diag,";
+    os << "fixtureLogLen:Array.isArray(fixture)?fixture.length:-1,";
+    os << "fixtureLast:Array.isArray(fixture)&&fixture.length?fixture[fixture.length-1]:null,";
+    os << "domReflectLen:reflect.length,";
+    os << "domReflectHasToken:reflect.indexOf(TOK)>=0,";
+    os << "domReflectHasFn:reflect.indexOf(CF)>=0,";
+    os << "eventAttrStats:evs,";
+    os << "innerHTMLSetterLooksAida:setterText.indexOf('innerHTML:')>=0||setterText.indexOf('push')>=0,";
+    os << "innerHTMLSetterHead:setterText,";
+    os << "readyState:String(document.readyState||''),";
+    os << "url:String(location.href||'').slice(0,512),";
+    os << "title:String(document.title||'').slice(0,240),";
+    os << "htmlLen:html.length,";
+    os << "htmlHasToken:html.indexOf(TOK)>=0,";
+    os << "htmlHasFn:html.indexOf(CF)>=0,";
+    os << "htmlHead:html.slice(0,700)";
+    os << "});";
+    os << "})()";
+    return os.str();
+}
+
+std::string build_active_dom_replay_js(const sentinel_t& s)
+{
+    std::ostringstream os;
+    os << "(function(){";
+    os << "var RG=" << js_string_literal(s.results_global) << ";";
+    os << "var CF=" << js_string_literal(s.canary_fn) << ";";
+    os << "var TOK=" << js_string_literal(s.token) << ";";
+    os << "var PREF=" << js_string_literal(std::string(kConsoleCanaryPrefix)) << ";";
+    os << "var out={url:String(location.href||'').slice(0,512),readyState:String(document.readyState||''),nodes:0,attrs:0,candidates:0,eventAttrs:0,urlAttrs:0,srcdocAttrs:0,dispatches:0,fnCalls:0,pushes:0,resultsLen:-1,errors:[],samples:[]};";
+    os << "var sample=function(k,v){try{if(out.samples.length<8)out.samples.push({k:String(k||'').slice(0,80),v:String(v||'').slice(0,240)});}catch(e){}};";
+    os << "var arr=null;try{arr=window[RG];if(!Array.isArray(arr)){arr=[];try{Object.defineProperty(window,RG,{value:arr,writable:false,configurable:false,enumerable:false});}catch(e){try{window[RG]=arr;}catch(e2){out.errors.push('arr:'+String(e2&&e2.message?e2.message:e2).slice(0,120));}}}}catch(e){out.errors.push('arr_outer:'+String(e&&e.message?e.message:e).slice(0,120));}";
+    os << "var emit=function(entry){try{console.log(PREF+JSON.stringify(entry));}catch(e){}};";
+    os << "var push=function(id,src,tag){try{var entry={id:String(id||'dom-replay:'+TOK).slice(0,160),src:String(src||'').slice(0,400),tag:String(tag||'').slice(0,64),t:Date.now(),token:TOK,replay:true};var a=window[RG];if(Array.isArray(a)){a.push(entry);out.pushes++;}emit(entry);return true;}catch(e){out.errors.push('push:'+String(e&&e.message?e.message:e).slice(0,120));return false;}};";
+    os << "var callCanary=function(label,src,tag){var ok=false;try{if(typeof window[CF]==='function'){window[CF](label);out.fnCalls++;ok=true;}}catch(e){out.errors.push('fn:'+String(e&&e.message?e.message:e).slice(0,120));}if(!ok)ok=push(label,src,tag);return ok;};";
+    os << "var invokeRefs=function(text,src,tag){var made=0;try{var re=/(__aida_xss_canary_[A-Za-z0-9]+__)\\s*\\(\\s*(['\\\"])(.*?)\\2\\s*\\)/g;var s=String(text||'');var m;while((m=re.exec(s))){if(m[1]===CF){out.candidates++;sample(tag,s);if(callCanary('dom-replay-call:'+TOK,String(m[3]||src||'').slice(0,160),tag))made++;}}}catch(e){out.errors.push('invoke:'+String(e&&e.message?e.message:e).slice(0,120));}return made;};";
+    os << "var executable=function(v){var s=String(v||'');return s.indexOf(CF)>=0||s.indexOf('AIDA_DOM_XSS_CANARY')>=0;};";
+    os << "try{var nodes=document.querySelectorAll('*');out.nodes=nodes.length;var max=Math.min(nodes.length,4096);for(var i=0;i<max;i++){var el=nodes[i];var tag=(el&&el.tagName?String(el.tagName).toLowerCase():'node');var attrs=el&&el.attributes?el.attributes:[];for(var j=0;j<attrs.length&&out.attrs<8192;j++){out.attrs++;var n=String(attrs[j].name||'');var ln=n.toLowerCase();var v=String(attrs[j].value||'');if(v.indexOf(TOK)<0&&v.indexOf(CF)<0&&v.indexOf('AIDA_DOM_XSS_CANARY')<0)continue;if(ln.indexOf('on')===0&&ln.length>2&&executable(v)){out.eventAttrs++;out.candidates++;sample(tag+'.'+ln,v);try{el.dispatchEvent(new Event(ln.slice(2),{bubbles:true,cancelable:true}));out.dispatches++;}catch(e){out.errors.push('dispatch:'+ln+':'+String(e&&e.message?e.message:e).slice(0,80));}invokeRefs(v,v,tag+'.'+ln);continue;}var lv=v.toLowerCase();if((ln==='href'||ln==='src'||ln==='xlink:href'||ln==='formaction'||ln==='action')&&lv.indexOf('javascript:')>=0&&executable(v)){out.urlAttrs++;out.candidates++;sample(tag+'.'+ln,v);invokeRefs(v,v,tag+'.'+ln);continue;}if(ln==='srcdoc'&&executable(v)){out.srcdocAttrs++;out.candidates++;sample(tag+'.srcdoc',v);invokeRefs(v,v,tag+'.srcdoc');}}}}catch(e){out.errors.push('scan:'+String(e&&e.message?e.message:e).slice(0,160));}";
+    os << "try{out.resultsLen=Array.isArray(window[RG])?window[RG].length:-1;}catch(e){out.resultsLen=-2;out.errors.push('len:'+String(e&&e.message?e.message:e).slice(0,120));}";
+    os << "return JSON.stringify(out);";
+    os << "})()";
+    return os.str();
+}
+
+int result_read_timeout_ms(uint64_t deadline_ms)
+{
+    const long long remaining_ms = remaining_until_deadline_ms(deadline_ms);
+    if (remaining_ms <= 0)
+        return 1000;
+    const long long bounded = std::min<long long>(std::max<long long>(remaining_ms, 1000), 5000);
+    return static_cast<int>(bounded);
+}
+
+std::string json_shape_local(const nlohmann::json& j)
+{
+    if (j.is_null()) return "null";
+    if (j.is_boolean()) return "boolean";
+    if (j.is_number()) return "number";
+    if (j.is_string()) return "string";
+    if (j.is_array()) return std::string("array[") + std::to_string(j.size()) + "]";
+    if (!j.is_object()) return "unknown";
+    std::string out = "object{";
+    size_t n = 0;
+    for (auto it = j.begin(); it != j.end() && n < 12; ++it, ++n) {
+        if (n) out += ",";
+        out += it.key();
+    }
+    if (j.size() > n) out += ",...";
+    out += "}";
+    return out;
+}
+
 std::string trim_payload(const std::string& s, size_t max_chars)
 {
     if (s.size() <= max_chars) return s;
@@ -419,6 +644,165 @@ std::string normalize_sink_log_entry(const nlohmann::json& e)
     out += " (";
     out += src;
     out += ")";
+    return out;
+}
+
+bool canary_entry_matches(const nlohmann::json& e, const sentinel_t& s)
+{
+    if (!e.is_object())
+        return false;
+    if (e.contains("token") && e["token"].is_string() && e["token"].get<std::string>() == s.token)
+        return true;
+    if (e.contains("id") && e["id"].is_string() && e["id"].get<std::string>().find(s.token) != std::string::npos)
+        return true;
+    return false;
+}
+
+void append_unique_sink(std::vector<std::string>& out, const std::string& value)
+{
+    if (value.empty())
+        return;
+    if (std::find(out.begin(), out.end(), value) == out.end())
+        out.push_back(value);
+}
+
+bool parse_console_json_text(const std::string& text, nlohmann::json& out)
+{
+    if (text.empty())
+        return false;
+    try
+    {
+        out = nlohmann::json::parse(text);
+        return true;
+    }
+    catch (...) {}
+    size_t first = std::string::npos;
+    const size_t arr = text.find('[');
+    const size_t obj = text.find('{');
+    if (arr != std::string::npos && obj != std::string::npos)
+        first = std::min(arr, obj);
+    else if (arr != std::string::npos)
+        first = arr;
+    else
+        first = obj;
+    if (first == std::string::npos)
+        return false;
+    const char close_ch = text[first] == '[' ? ']' : '}';
+    const size_t last = text.rfind(close_ch);
+    if (last == std::string::npos || last <= first)
+        return false;
+    try
+    {
+        out = nlohmann::json::parse(text.substr(first, last - first + 1));
+        return true;
+    }
+    catch (...) {}
+    return false;
+}
+
+nlohmann::json console_log_array_from_json(const nlohmann::json& data)
+{
+    if (data.is_array())
+        return data;
+    if (data.is_string())
+    {
+        const std::string text = data.get<std::string>();
+        nlohmann::json parsed;
+        if (parse_console_json_text(text, parsed))
+            return console_log_array_from_json(parsed);
+        nlohmann::json entry = nlohmann::json::object();
+        entry["text"] = text;
+        return nlohmann::json::array({entry});
+    }
+    if (data.is_object())
+    {
+        if (data.contains("text") && data["text"].is_string())
+            return nlohmann::json::array({data});
+        if (data.contains("value"))
+        {
+            nlohmann::json nested = console_log_array_from_json(data["value"]);
+            if (!nested.empty())
+                return nested;
+        }
+        if (data.contains("result"))
+        {
+            nlohmann::json nested = console_log_array_from_json(data["result"]);
+            if (!nested.empty())
+                return nested;
+        }
+        if (data.contains("logs"))
+        {
+            nlohmann::json nested = console_log_array_from_json(data["logs"]);
+            if (!nested.empty())
+                return nested;
+        }
+        if (data.contains("records"))
+        {
+            nlohmann::json nested = console_log_array_from_json(data["records"]);
+            if (!nested.empty())
+                return nested;
+        }
+        if (data.contains("items"))
+        {
+            nlohmann::json nested = console_log_array_from_json(data["items"]);
+            if (!nested.empty())
+                return nested;
+        }
+        if (data.contains("raw_text") && data["raw_text"].is_string())
+        {
+            const std::string text = data["raw_text"].get<std::string>();
+            nlohmann::json parsed;
+            if (parse_console_json_text(text, parsed))
+                return console_log_array_from_json(parsed);
+            nlohmann::json entry = nlohmann::json::object();
+            entry["text"] = text;
+            return nlohmann::json::array({entry});
+        }
+    }
+    return nlohmann::json::array();
+}
+
+nlohmann::json console_log_array_from_result(const camoufox::call_result_t& r)
+{
+    return console_log_array_from_json(r.data);
+}
+
+std::vector<std::string> read_results_from_console(const sentinel_t& s, const char* phase, size_t max_records, const std::string& page_id)
+{
+    std::vector<std::string> out;
+    camoufox::call_result_t r = camoufox::get_console_logs(max_records, "default", page_id);
+    nlohmann::json logs = console_log_array_from_result(r);
+    size_t inspected = 0;
+    size_t prefix_hits = 0;
+    size_t parse_errors = 0;
+    if (r.ok)
+    {
+        for (const auto& e : logs)
+        {
+            ++inspected;
+            if (!e.is_object() || !e.contains("text") || !e["text"].is_string())
+                continue;
+            const std::string text = e["text"].get<std::string>();
+            const size_t p = text.find(kConsoleCanaryPrefix);
+            if (p == std::string::npos)
+                continue;
+            ++prefix_hits;
+            const std::string payload = text.substr(p + std::strlen(kConsoleCanaryPrefix));
+            try
+            {
+                nlohmann::json entry = nlohmann::json::parse(payload);
+                if (canary_entry_matches(entry, s))
+                    append_unique_sink(out, normalize_sink_log_entry(entry));
+            }
+            catch (...)
+            {
+                ++parse_errors;
+            }
+        }
+    }
+    diag::log_tagged_fmt("dom_xss", "results_console_read token=%s page_id=%s phase=%s ok=%d logs_shape=%s inspected=%zu prefix_hits=%zu matches=%zu parse_errors=%zu err_len=%zu",
+        s.token.c_str(), page_id.c_str(), phase ? phase : "", r.ok ? 1 : 0, json_shape_local(logs).c_str(),
+        inspected, prefix_hits, out.size(), parse_errors, r.error.size());
     return out;
 }
 
@@ -479,7 +863,8 @@ issue_t make_browser_certain_issue(const std::string&        type_key,
 bool navigate_with_init_script(const std::string& abs_url,
                                const sentinel_t&  s,
                                int                timeout_ms,
-                               uint64_t           deadline_ms)
+                               uint64_t           deadline_ms,
+                               const std::string& page_id)
 {
     std::string pre = build_pre_injection_script(s);
     constexpr int kMaxAttempts = 3;
@@ -505,7 +890,15 @@ bool navigate_with_init_script(const std::string& abs_url,
             recover_browser_transport("add_init_script", attempt, e);
             continue;
         }
-        if (camoufox::navigate(abs_url, "load", timeout_ms)) {
+        diag::log_tagged_fmt("dom_xss", "add_init_script ok attempt=%d token=%s page_id=%s pre_len=%zu remaining_ms=%lld",
+            attempt, s.token.c_str(), page_id.c_str(), pre.size(), remaining_until_deadline_ms(deadline_ms));
+        if (camoufox::navigate(abs_url, "load", timeout_ms, "default", page_id)) {
+            camoufox::call_result_t probe = camoufox::evaluate_js(build_canary_probe_js(s), true, "default", page_id);
+            std::string data_tail = probe.data.is_discarded() ? std::string() : trim_payload(probe.data.dump(), 1400);
+            std::string text_tail = trim_payload(probe.text, 1400);
+            diag::log_tagged_fmt("dom_xss", "navigate_with_init_script post_nav_probe attempt=%d token=%s page_id=%s ok=%d data_shape=%s text_len=%zu data_tail=%s text_tail=%s",
+                attempt, s.token.c_str(), page_id.c_str(), probe.ok ? 1 : 0, json_shape_local(probe.data).c_str(),
+                probe.text.size(), data_tail.c_str(), text_tail.c_str());
             return true;
         }
         std::string e = camoufox::last_error();
@@ -525,7 +918,8 @@ bool drive_fetch_harness(const std::string& abs_url,
                          const std::vector<uint8_t>& built_req,
                          const sentinel_t& s,
                          int timeout_ms,
-                         uint64_t deadline_ms)
+                         uint64_t deadline_ms,
+                         const std::string& page_id)
 {
     std::string method;
     std::string uri;
@@ -559,7 +953,7 @@ bool drive_fetch_harness(const std::string& abs_url,
             recover_browser_transport("harness_add_init_script", attempt, e);
             continue;
         }
-        if (!camoufox::navigate("about:blank", "load", timeout_ms)) {
+        if (!camoufox::navigate("about:blank", "load", timeout_ms, "default", page_id)) {
             std::string e = camoufox::last_error();
             diag::log_tagged_fmt("dom_xss", "harness navigate(about:blank) failed attempt=%d err=%s", attempt, e.c_str());
             if (!browser_transport_retry_allowed("harness_navigate", attempt, kMaxAttempts, deadline_ms, e)) {
@@ -571,7 +965,7 @@ bool drive_fetch_harness(const std::string& abs_url,
             continue;
         }
         std::string js = build_fetch_harness_js(method, abs_url, headers, body);
-        auto r = camoufox::evaluate_js(js, true);
+        auto r = camoufox::evaluate_js(js, true, "default", page_id);
         if (r.ok) {
             return true;
         }
@@ -587,17 +981,8 @@ bool drive_fetch_harness(const std::string& abs_url,
     return false;
 }
 
-std::vector<std::string> read_results(const sentinel_t& s)
+bool extract_results_array(const camoufox::call_result_t& r, nlohmann::json& arr)
 {
-    std::vector<std::string> out;
-    std::string js = build_results_read_js(s);
-    auto r = camoufox::evaluate_js(js, true);
-    if (!r.ok) {
-        diag::log_tagged_fmt("dom_xss", "results read failed: %s", r.error.c_str());
-        set_err(std::string("results read failed: ") + r.error);
-        return out;
-    }
-    nlohmann::json arr;
     bool parsed = false;
     if (r.data.is_array()) {
         arr = r.data;
@@ -622,14 +1007,185 @@ std::vector<std::string> read_results(const sentinel_t& s)
     if (!parsed && !r.text.empty()) {
         try { arr = nlohmann::json::parse(r.text); parsed = true; } catch (...) {}
     }
-    if (!parsed) {
+    return parsed;
+}
+
+std::vector<std::string> normalize_results_array(const nlohmann::json& arr)
+{
+    std::vector<std::string> out;
+    if (!arr.is_array())
+        return out;
+    out.reserve(arr.size());
+    for (const auto& e : arr)
+        out.push_back(normalize_sink_log_entry(e));
+    return out;
+}
+
+std::vector<std::string> read_results(const sentinel_t& s, uint64_t deadline_ms, const std::string& page_id)
+{
+    std::vector<std::string> out;
+    std::string js = build_results_read_js(s);
+    const auto before = camoufox::get_status();
+    const int eval_timeout_ms = result_read_timeout_ms(deadline_ms);
+    diag::log_tagged_fmt("dom_xss", "results_read_begin token=%s page_id=%s expr_len=%zu remaining_ms=%lld eval_timeout_ms=%d state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu last_error_len=%zu",
+        s.token.c_str(), page_id.c_str(), js.size(), remaining_until_deadline_ms(deadline_ms), eval_timeout_ms,
+        static_cast<int>(before.state), static_cast<unsigned long long>(before.generation),
+        static_cast<unsigned long>(before.child_pid), before.child_alive ? 1 : 0,
+        before.browser_open ? 1 : 0, before.page_verified ? 1 : 0,
+        before.cleanup_pending ? 1 : 0, static_cast<unsigned long long>(before.total_calls),
+        static_cast<unsigned long long>(before.total_errors), before.last_error.size());
+    out = read_results_from_console(s, "pre_evaluate", 200, page_id);
+    if (!out.empty()) {
+        const auto console_after = camoufox::get_status();
+        diag::log_tagged_fmt("dom_xss", "results_read_done token=%s sinks=%zu source=console_pre state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu last_error_len=%zu",
+            s.token.c_str(), out.size(), static_cast<int>(console_after.state),
+            static_cast<unsigned long long>(console_after.generation), static_cast<unsigned long>(console_after.child_pid),
+            console_after.child_alive ? 1 : 0, console_after.browser_open ? 1 : 0, console_after.page_verified ? 1 : 0,
+            console_after.cleanup_pending ? 1 : 0, static_cast<unsigned long long>(console_after.total_calls),
+            static_cast<unsigned long long>(console_after.total_errors), console_after.last_error.size());
         return out;
     }
-    if (!arr.is_array()) return out;
-    out.reserve(arr.size());
-    for (const auto& e : arr) {
-        out.push_back(normalize_sink_log_entry(e));
+    nlohmann::json args;
+    args["expression"] = js;
+    args["await_promise"] = true;
+    if (!page_id.empty()) args["page_id"] = page_id;
+    const uint64_t now = now_ms_steady();
+    uint64_t poll_until = now + 2000ULL;
+    if (deadline_ms != 0 && deadline_ms < poll_until)
+        poll_until = deadline_ms;
+    camoufox::call_result_t r;
+    for (int attempt = 1; attempt <= 12; ++attempt) {
+        r = camoufox::call_tool("evaluate_js", args, eval_timeout_ms);
+        if (r.ok) {
+            nlohmann::json arr;
+            const bool parsed = extract_results_array(r, arr);
+            if (!parsed) {
+                diag::log_tagged_fmt("dom_xss", "results_read_unparsed token=%s attempt=%d data_shape=%s text_len=%zu",
+                    s.token.c_str(), attempt, json_shape_local(r.data).c_str(), r.text.size());
+            } else if (!arr.is_array()) {
+                diag::log_tagged_fmt("dom_xss", "results_read_not_array token=%s attempt=%d parsed_shape=%s",
+                    s.token.c_str(), attempt, json_shape_local(arr).c_str());
+            } else {
+                out = normalize_results_array(arr);
+                if (!out.empty()) {
+                    const auto after = camoufox::get_status();
+                    diag::log_tagged_fmt("dom_xss", "results_read_done token=%s sinks=%zu source=evaluate attempt=%d state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu last_error_len=%zu",
+                        s.token.c_str(), out.size(), attempt, static_cast<int>(after.state),
+                        static_cast<unsigned long long>(after.generation), static_cast<unsigned long>(after.child_pid),
+                        after.child_alive ? 1 : 0, after.browser_open ? 1 : 0, after.page_verified ? 1 : 0,
+                        after.cleanup_pending ? 1 : 0, static_cast<unsigned long long>(after.total_calls),
+                        static_cast<unsigned long long>(after.total_errors), after.last_error.size());
+                    return out;
+                }
+            }
+            std::vector<std::string> console_out = read_results_from_console(s, "evaluate_empty", 300, page_id);
+            if (!console_out.empty()) {
+                const auto console_after = camoufox::get_status();
+                diag::log_tagged_fmt("dom_xss", "results_read_done token=%s sinks=%zu source=console_after_empty attempt=%d state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu last_error_len=%zu",
+                    s.token.c_str(), console_out.size(), attempt, static_cast<int>(console_after.state),
+                    static_cast<unsigned long long>(console_after.generation), static_cast<unsigned long>(console_after.child_pid),
+                    console_after.child_alive ? 1 : 0, console_after.browser_open ? 1 : 0, console_after.page_verified ? 1 : 0,
+                    console_after.cleanup_pending ? 1 : 0, static_cast<unsigned long long>(console_after.total_calls),
+                    static_cast<unsigned long long>(console_after.total_errors), console_after.last_error.size());
+                return console_out;
+            }
+            camoufox::call_result_t replay = camoufox::evaluate_js(build_active_dom_replay_js(s), true, "default", page_id);
+            std::string replay_data = replay.data.is_discarded() ? std::string() : trim_payload(replay.data.dump(), 1400);
+            std::string replay_text = trim_payload(replay.text, 1400);
+            diag::log_tagged_fmt("dom_xss", "results_read_dom_replay token=%s attempt=%d ok=%d data_shape=%s text_len=%zu data=%s text=%s",
+                s.token.c_str(), attempt, replay.ok ? 1 : 0, json_shape_local(replay.data).c_str(), replay.text.size(),
+                replay_data.c_str(), replay_text.c_str());
+            if (replay.ok) {
+                camoufox::call_result_t replay_read = camoufox::call_tool("evaluate_js", args, eval_timeout_ms);
+                if (replay_read.ok) {
+                    nlohmann::json replay_arr;
+                    const bool replay_parsed = extract_results_array(replay_read, replay_arr);
+                    if (replay_parsed && replay_arr.is_array()) {
+                        out = normalize_results_array(replay_arr);
+                        if (!out.empty()) {
+                            const auto replay_after = camoufox::get_status();
+                            diag::log_tagged_fmt("dom_xss", "results_read_done token=%s sinks=%zu source=dom_replay attempt=%d state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu last_error_len=%zu",
+                                s.token.c_str(), out.size(), attempt, static_cast<int>(replay_after.state),
+                                static_cast<unsigned long long>(replay_after.generation), static_cast<unsigned long>(replay_after.child_pid),
+                                replay_after.child_alive ? 1 : 0, replay_after.browser_open ? 1 : 0, replay_after.page_verified ? 1 : 0,
+                                replay_after.cleanup_pending ? 1 : 0, static_cast<unsigned long long>(replay_after.total_calls),
+                                static_cast<unsigned long long>(replay_after.total_errors), replay_after.last_error.size());
+                            return out;
+                        }
+                    }
+                    diag::log_tagged_fmt("dom_xss", "results_read_dom_replay_empty token=%s attempt=%d parsed=%d shape=%s text_len=%zu",
+                        s.token.c_str(), attempt, replay_parsed ? 1 : 0, json_shape_local(replay_read.data).c_str(),
+                        replay_read.text.size());
+                } else {
+                    diag::log_tagged_fmt("dom_xss", "results_read_dom_replay_read_failed token=%s attempt=%d err=%s data_shape=%s text_len=%zu",
+                        s.token.c_str(), attempt, replay_read.error.c_str(), json_shape_local(replay_read.data).c_str(),
+                        replay_read.text.size());
+                }
+                std::vector<std::string> replay_console_out = read_results_from_console(s, "dom_replay", 300, page_id);
+                if (!replay_console_out.empty()) {
+                    const auto replay_console_after = camoufox::get_status();
+                    diag::log_tagged_fmt("dom_xss", "results_read_done token=%s sinks=%zu source=console_after_dom_replay attempt=%d state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu last_error_len=%zu",
+                        s.token.c_str(), replay_console_out.size(), attempt, static_cast<int>(replay_console_after.state),
+                        static_cast<unsigned long long>(replay_console_after.generation), static_cast<unsigned long>(replay_console_after.child_pid),
+                        replay_console_after.child_alive ? 1 : 0, replay_console_after.browser_open ? 1 : 0, replay_console_after.page_verified ? 1 : 0,
+                        replay_console_after.cleanup_pending ? 1 : 0, static_cast<unsigned long long>(replay_console_after.total_calls),
+                        static_cast<unsigned long long>(replay_console_after.total_errors), replay_console_after.last_error.size());
+                    return replay_console_out;
+                }
+            }
+            camoufox::call_result_t probe = camoufox::evaluate_js(build_canary_probe_js(s), true, "default", page_id);
+            std::string data_tail = probe.data.is_discarded() ? std::string() : trim_payload(probe.data.dump(), 1400);
+            std::string text_tail = trim_payload(probe.text, 1400);
+            diag::log_tagged_fmt("dom_xss", "results_read_zero_sinks token=%s attempt=%d probe_ok=%d probe_shape=%s probe_text_len=%zu probe_data=%s probe_text=%s",
+                s.token.c_str(), attempt, probe.ok ? 1 : 0, json_shape_local(probe.data).c_str(), probe.text.size(),
+                data_tail.c_str(), text_tail.c_str());
+        } else {
+            const auto after = camoufox::get_status();
+            diag::log_tagged_fmt("dom_xss", "results_read_failed token=%s attempt=%d timeout_ms=%d err=%s data_shape=%s text_len=%zu state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu last_error_len=%zu",
+                s.token.c_str(), attempt, eval_timeout_ms, r.error.c_str(), json_shape_local(r.data).c_str(), r.text.size(),
+                static_cast<int>(after.state), static_cast<unsigned long long>(after.generation),
+                static_cast<unsigned long>(after.child_pid), after.child_alive ? 1 : 0,
+                after.browser_open ? 1 : 0, after.page_verified ? 1 : 0,
+                after.cleanup_pending ? 1 : 0, static_cast<unsigned long long>(after.total_calls),
+                static_cast<unsigned long long>(after.total_errors), after.last_error.size());
+        }
+        if (!r.ok && is_browser_transport_error(r.error)) {
+            out = read_results_from_console(s, attempt == 1 ? "evaluate_transport_failure_1" : "evaluate_transport_failure_n", 300, page_id);
+            if (!out.empty()) {
+                const auto console_after = camoufox::get_status();
+                diag::log_tagged_fmt("dom_xss", "results_read_done token=%s sinks=%zu source=console_after_transport_failure attempt=%d state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu last_error_len=%zu",
+                    s.token.c_str(), out.size(), attempt, static_cast<int>(console_after.state),
+                    static_cast<unsigned long long>(console_after.generation), static_cast<unsigned long>(console_after.child_pid),
+                    console_after.child_alive ? 1 : 0, console_after.browser_open ? 1 : 0, console_after.page_verified ? 1 : 0,
+                    console_after.cleanup_pending ? 1 : 0, static_cast<unsigned long long>(console_after.total_calls),
+                    static_cast<unsigned long long>(console_after.total_errors), console_after.last_error.size());
+                return out;
+            }
+            set_err(std::string("results read failed: ") + r.error);
+            return out;
+        }
+        if (remaining_until_deadline_ms(deadline_ms) <= 250 || now_ms_steady() >= poll_until)
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
     }
+    if (!r.ok && !r.error.empty())
+        set_err(std::string("results read failed: ") + r.error);
+    if (out.empty())
+    {
+        camoufox::call_result_t probe = camoufox::evaluate_js(build_canary_probe_js(s), true, "default", page_id);
+        std::string data_tail = probe.data.is_discarded() ? std::string() : trim_payload(probe.data.dump(), 1400);
+        std::string text_tail = trim_payload(probe.text, 1400);
+        diag::log_tagged_fmt("dom_xss", "results_read_final_empty token=%s probe_ok=%d probe_shape=%s probe_text_len=%zu probe_data=%s probe_text=%s",
+            s.token.c_str(), probe.ok ? 1 : 0, json_shape_local(probe.data).c_str(), probe.text.size(),
+            data_tail.c_str(), text_tail.c_str());
+    }
+    const auto after = camoufox::get_status();
+    diag::log_tagged_fmt("dom_xss", "results_read_done token=%s sinks=%zu source=empty state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu last_error_len=%zu",
+        s.token.c_str(), out.size(), static_cast<int>(after.state),
+        static_cast<unsigned long long>(after.generation), static_cast<unsigned long>(after.child_pid),
+        after.child_alive ? 1 : 0, after.browser_open ? 1 : 0, after.page_verified ? 1 : 0,
+        after.cleanup_pending ? 1 : 0, static_cast<unsigned long long>(after.total_calls),
+        static_cast<unsigned long long>(after.total_errors), after.last_error.size());
     return out;
 }
 
@@ -661,13 +1217,19 @@ std::string build_pre_injection_script(const sentinel_t& s)
     os << "var RG=" << js_string_literal(s.results_global) << ";";
     os << "var CF=" << js_string_literal(s.canary_fn) << ";";
     os << "var TOK=" << js_string_literal(s.token) << ";";
+    os << "var DG='__aida_dom_xss_diag_'+TOK;";
+    os << "var mark=function(k,v){try{var d=window[DG];if(!d){d={token:TOK,initAt:Date.now(),events:[]};Object.defineProperty(window,DG,{value:d,writable:false,configurable:false,enumerable:false});}d[k]=v;d.lastAt=Date.now();if(d.events&&d.events.length<64)d.events.push({k:k,v:v,t:Date.now(),rs:String(document.readyState||'')});}catch(e){}};";
+    os << "mark('initReadyState',String(document.readyState||''));";
     os << "if(!window[RG]){";
     os <<   "Object.defineProperty(window,RG,{value:[],writable:false,configurable:false,enumerable:false});";
     os << "}";
-    os << "var push=function(id,src){try{window[RG].push({id:id,src:String(src||'inline').slice(0,400),t:Date.now()});}catch(e){}};";
+    os << "var emit=function(entry){try{console.log(" << js_string_literal(std::string(kConsoleCanaryPrefix)) << "+JSON.stringify(entry));}catch(e){}};";
+    os << "var push=function(id,src){try{var entry={id:id,src:String(src||'inline').slice(0,400),t:Date.now(),token:TOK};window[RG].push(entry);mark('lastPushId',String(id||'').slice(0,120));mark('pushCount',window[RG].length);emit(entry);}catch(e){mark('pushError',String(e&&e.message?e.message:e).slice(0,160));}};";
     os << "if(!window[CF]){";
     os <<   "Object.defineProperty(window,CF,{value:push,writable:false,configurable:false,enumerable:false});";
     os << "}";
+    os << "mark('resultsIsArray',Array.isArray(window[RG]));";
+    os << "mark('canaryType',typeof window[CF]);";
 
     os << "var stub=function(label){return function(){try{var a=arguments;var s=(a.length>0)?String(a[0]).slice(0,200):'';push(label+':'+TOK,s);}catch(e){}};};";
 
@@ -713,7 +1275,8 @@ std::string build_pre_injection_script(const sentinel_t& s)
     os <<       "get:orig.get,";
     os <<       "set:function(v){push('innerHTML:'+TOK,String(v).slice(0,200));return oSet.call(this,v);}";
     os <<     "});";
-    os <<   "}";
+    os <<     "mark('innerHTMLHook','installed');";
+    os <<   "}else{mark('innerHTMLHook','missing_descriptor');}";
     os <<   "var origOuter=Object.getOwnPropertyDescriptor(EP,'outerHTML');";
     os <<   "if(origOuter&&origOuter.set){";
     os <<     "var oSetO=origOuter.set;";
@@ -797,6 +1360,7 @@ std::vector<payload_set_t> default_payload_sets()
     payload_set_t standard;
     standard.name = "standard";
     standard.templates = {
+        R"(<img src=x onerror="try{{CANARY_FN}('s0')}catch(e){};try{console.log('AIDA_DOM_XSS_CANARY:'+JSON.stringify({id:'img:{CANARY}',src:'standard',token:'{CANARY}'}))}catch(e){}">)",
         "<script>{CANARY_FN}('s1')</script>",
         "<img src=x onerror={CANARY_FN}('s2')>",
         "<svg onload={CANARY_FN}('s3')>",
@@ -838,6 +1402,7 @@ fire_result_t fire_payload(const insertion_point_t& ip,
                            uint16_t                 port_hint)
 {
     std::lock_guard<std::recursive_mutex> global_lk(browser_global_mtx());
+    bridge_activity_scope_t bridge_activity("dom_xss.fire_payload");
     fire_result_t out;
     clear_err();
 
@@ -856,6 +1421,10 @@ fire_result_t fire_payload(const insertion_point_t& ip,
     std::string payload = replace_all(payload_template, "{CANARY_FN_LIT}", canary_fn_literal);
     payload = replace_all(payload, "{CANARY_FN}", s.canary_fn);
     payload = replace_all(payload, "{CANARY}",     s.token);
+    const std::string payload_hash = stable_hash64(payload);
+    diag::log_tagged_fmt("dom_xss", "fire_payload build_begin kind=%s param=%s token=%s template_len=%zu payload_len=%zu payload_hash=%s template_preview=%s",
+        ip.kind.c_str(), ip.name.c_str(), s.token.c_str(), payload_template.size(), payload.size(),
+        payload_hash.c_str(), trim_payload(payload_template, 220).c_str());
 
     auto built = ip.build(payload);
     if (built.empty()) {
@@ -867,14 +1436,20 @@ fire_result_t fire_payload(const insertion_point_t& ip,
     std::string scheme = scheme_hint;
     std::string host;
     uint16_t    port = port_hint;
+    std::string request_method;
+    std::string request_uri;
+    std::string request_hash;
     {
         std::string raw(reinterpret_cast<const char*>(built.data()), built.size());
+        request_hash = stable_hash64(raw);
         auto rl = parse_request_line_local(raw);
         if (!rl.valid) {
             out.error = "failed to parse built request line";
             set_err(out.error);
             return out;
         }
+        request_method = rl.method;
+        request_uri = rl.uri;
         std::string host_header;
         extract_host_header(raw, rl.headers_offset, host_header);
         if (!host_header.empty()) {
@@ -889,6 +1464,10 @@ fire_result_t fire_payload(const insertion_point_t& ip,
         }
         if (scheme.empty()) scheme = "http";
         if (port == 0) port = (scheme == "https") ? 443 : 80;
+        diag::log_tagged_fmt("dom_xss", "fire_payload request_built kind=%s param=%s token=%s method=%s uri_len=%zu uri_hash=%s host_header_len=%zu host=%s scheme=%s port=%u raw_len=%zu raw_hash=%s",
+            ip.kind.c_str(), ip.name.c_str(), s.token.c_str(), request_method.c_str(), request_uri.size(),
+            stable_hash64(request_uri).c_str(), host_header.size(), host.c_str(), scheme.c_str(),
+            static_cast<unsigned>(port), raw.size(), request_hash.c_str());
     }
 
     {
@@ -931,25 +1510,45 @@ fire_result_t fire_payload(const insertion_point_t& ip,
 
     uint64_t t0 = now_ms_steady();
     const uint64_t deadline_ms = t0 + static_cast<uint64_t>(bounded_payload_timeout_ms(per_payload_timeout_ms)) + 5000ULL;
-    diag::log_tagged_fmt("dom_xss", "fire_payload browser_start kind=%s param=%s mode=%s url_len=%zu timeout_ms=%d bounded_timeout_ms=%d deadline_remaining_ms=%lld",
+    browser_page_scope_t page_scope("fire", s);
+    if (!page_scope.ok()) {
+        out.error = "new_page failed";
+        set_err(out.error);
+        return out;
+    }
+    diag::log_tagged_fmt("dom_xss", "fire_payload browser_start kind=%s param=%s page_id=%s mode=%s url_len=%zu timeout_ms=%d bounded_timeout_ms=%d deadline_remaining_ms=%lld",
         ip.kind.c_str(), ip.name.c_str(),
+        page_scope.page_id.c_str(),
         (ip.kind == "query" || ip.kind == "path") ? "navigate" : "fetch_harness",
         abs_url.size(), per_payload_timeout_ms, bounded_payload_timeout_ms(per_payload_timeout_ms),
         remaining_until_deadline_ms(deadline_ms));
     bool ok = false;
     if (ip.kind == "query" || ip.kind == "path") {
-        ok = navigate_with_init_script(abs_url, s, per_payload_timeout_ms, deadline_ms);
+        ok = navigate_with_init_script(abs_url, s, per_payload_timeout_ms, deadline_ms, page_scope.page_id);
     } else {
-        ok = drive_fetch_harness(abs_url, built, s, per_payload_timeout_ms, deadline_ms);
+        ok = drive_fetch_harness(abs_url, built, s, per_payload_timeout_ms, deadline_ms, page_scope.page_id);
     }
     if (!ok) {
         out.error = current_err();
         return out;
     }
 
+    {
+        camoufox::call_result_t probe = camoufox::evaluate_js(build_canary_probe_js(s), true, "default", page_scope.page_id);
+        std::string data_tail = probe.data.is_discarded() ? std::string() : trim_payload(probe.data.dump(), 1200);
+        std::string text_tail = trim_payload(probe.text, 1200);
+        const auto st = camoufox::get_status();
+        diag::log_tagged_fmt("dom_xss", "fire_payload canary_probe token=%s ok=%d data_shape=%s text_len=%zu data_tail=%s text_tail=%s state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d errors=%llu",
+            s.token.c_str(), probe.ok ? 1 : 0, json_shape_local(probe.data).c_str(), probe.text.size(),
+            data_tail.c_str(), text_tail.c_str(), static_cast<int>(st.state),
+            static_cast<unsigned long long>(st.generation), static_cast<unsigned long>(st.child_pid),
+            st.child_alive ? 1 : 0, st.browser_open ? 1 : 0, st.page_verified ? 1 : 0,
+            st.cleanup_pending ? 1 : 0, static_cast<unsigned long long>(st.total_errors));
+    }
+
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
 
-    out.sink_log = read_results(s);
+    out.sink_log = read_results(s, deadline_ms, page_scope.page_id);
     if (out.sink_log.empty()) {
         std::string e = current_err();
         if (is_browser_transport_error(e)) {
@@ -963,7 +1562,7 @@ fire_result_t fire_payload(const insertion_point_t& ip,
 
     if (out.canary_fired && capture_screenshot) {
         std::string sp = make_screenshot_path(s.token.substr(0, 8));
-        if (camoufox::take_screenshot(sp, true)) {
+        if (camoufox::take_screenshot(sp, true, "default", page_scope.page_id)) {
             out.last_screenshot_path = sp;
         }
     }
@@ -1031,6 +1630,7 @@ size_t scan_insertion_point(const insertion_point_t& ip, const scan_options_t& o
 
     for (const auto* set : active) {
         if (fired >= budget) break;
+        size_t set_index = 0;
         for (const auto& tpl : set->templates) {
             if (fired >= budget) break;
             if (opts.cancelled && opts.cancelled()) {
@@ -1046,10 +1646,17 @@ size_t scan_insertion_point(const insertion_point_t& ip, const scan_options_t& o
                 return issued;
             }
             ++fired;
+            ++set_index;
+            diag::log_tagged_fmt("dom_xss", "scan_insertion_point firing kind=%s param=%s set=%s set_index=%zu global_index=%zu budget=%zu template_len=%zu template_hash=%s",
+                ip.kind.c_str(), ip.name.c_str(), set->name.c_str(), set_index, fired, budget,
+                tpl.size(), stable_hash64(tpl).c_str());
             auto r = fire_payload(ip, tpl, s, opts.capture_screenshots, opts.per_payload_timeout_ms,
                                   opts.scheme, opts.port);
             if (!r.ok) {
                 std::string e = r.error.empty() ? current_err() : r.error;
+                diag::log_tagged_fmt("dom_xss", "scan_insertion_point payload_failed kind=%s param=%s set=%s set_index=%zu global_index=%zu error_len=%zu error=%s",
+                    ip.kind.c_str(), ip.name.c_str(), set->name.c_str(), set_index, fired,
+                    e.size(), e.c_str());
                 if (is_browser_transport_error(e)) {
                     ++browser_failures;
                     if (e.empty()) e = "DOM-XSS browser execution failed";
@@ -1060,7 +1667,13 @@ size_t scan_insertion_point(const insertion_point_t& ip, const scan_options_t& o
                 }
                 continue;
             }
-            if (!r.canary_fired) continue;
+            if (!r.canary_fired)
+            {
+                diag::log_tagged_fmt("dom_xss", "scan_insertion_point no_sink kind=%s param=%s set=%s set_index=%zu global_index=%zu sink_entries=%zu error_len=%zu",
+                    ip.kind.c_str(), ip.name.c_str(), set->name.c_str(), set_index, fired,
+                    r.sink_log.size(), r.error.size());
+                continue;
+            }
             std::string type_key = (set->name == "dom_only") ? "xss.dom_browser_confirmed"
                                                               : "xss.reflected_browser_confirmed";
             std::string title = (set->name == "dom_only")
@@ -1089,6 +1702,7 @@ bool confirm_reflected_in_browser(const std::string&        url,
     diag::log_tagged_fmt("dom_xss", "confirm_reflected_in_browser entry url=%s canary=%s timeout_ms=%d",
         url.c_str(), canary_marker.c_str(), per_payload_timeout_ms);
     std::lock_guard<std::recursive_mutex> global_lk(browser_global_mtx());
+    bridge_activity_scope_t bridge_activity("dom_xss.confirm_reflected_in_browser");
     out_sink_log.clear();
     if (!camoufox::ensure_ready()) {
         diag::log_tagged_fmt("dom_xss", "confirm_reflected_in_browser camoufox_not_ready");
@@ -1113,12 +1727,18 @@ bool confirm_reflected_in_browser(const std::string&        url,
         return false;
     }
     const uint64_t deadline_ms = payload_deadline_ms(per_payload_timeout_ms);
-    if (!navigate_with_init_script(url, s, per_payload_timeout_ms, deadline_ms)) {
+    browser_page_scope_t page_scope("confirm", s);
+    if (!page_scope.ok()) {
+        set_err("new_page failed");
+        diag::log_tagged_fmt("dom_xss", "confirm_reflected_in_browser new_page_failed url=%s", url.c_str());
+        return false;
+    }
+    if (!navigate_with_init_script(url, s, per_payload_timeout_ms, deadline_ms, page_scope.page_id)) {
         diag::log_tagged_fmt("dom_xss", "confirm_reflected_in_browser navigate_failed url=%s", url.c_str());
         return false;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(250));
-    out_sink_log = read_results(s);
+    out_sink_log = read_results(s, deadline_ms, page_scope.page_id);
     diag::log_tagged_fmt("dom_xss", "confirm_reflected_in_browser done url=%s fired=%d sinks=%zu",
         url.c_str(), !out_sink_log.empty() ? 1 : 0, out_sink_log.size());
     return !out_sink_log.empty();

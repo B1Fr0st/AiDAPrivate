@@ -27,6 +27,7 @@
 #include "standalone_driver.hpp"
 #include "standalone_tools_fwd.hpp"
 #include "core/runtime/arc_loader.hpp"
+#include "core/runtime/diagnostic_exception_scope.hpp"
 #include "core/anti-tamper/orchestrator.hpp"
 #include "core/anti-tamper/hv_preflight.hpp"
 #include "core/anti-tamper/mcp_posture.hpp"
@@ -45,6 +46,7 @@
 #include "critical_work_queue.hpp"
 #include "core/session/session_health.hpp"
 #include "core/testlab/test_all_features.hpp"
+#include "core/network/burp/camoufox_bridge.hpp"
 #include "helpers/stb_image.h"
 
 #include "embedded_resources.hpp"
@@ -424,6 +426,70 @@ static void startup_log_critical_fmt(const char* fmt, ...)
     startup_log_critical(buf);
 }
 
+static HANDLE& single_instance_mutex_handle()
+{
+    static HANDLE h = nullptr;
+    return h;
+}
+
+static void focus_existing_aida_window()
+{
+    HWND existing = FindWindowW(L"AiDAStandaloneWindow", kAidaWindowTitle);
+    if (!existing) {
+        startup_log_critical_fmt("single_instance_existing_window_missing pid=%lu tid=%lu gle=%lu",
+            GetCurrentProcessId(), GetCurrentThreadId(), GetLastError());
+        return;
+    }
+    BOOL iconic = IsIconic(existing);
+    ShowWindow(existing, iconic ? SW_RESTORE : SW_SHOW);
+    SetForegroundWindow(existing);
+    PostMessageW(existing, WM_APP + 0x1DA, 0, 0);
+    startup_log_critical_fmt("single_instance_existing_window_focused hwnd=0x%llX iconic=%d pid=%lu tid=%lu",
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(existing)),
+        iconic ? 1 : 0,
+        GetCurrentProcessId(),
+        GetCurrentThreadId());
+}
+
+static bool acquire_single_instance_gate()
+{
+    HANDLE h = CreateMutexW(nullptr, TRUE, L"Local\\AiDAStandalone_8E9F73D8_SingleInstance");
+    DWORD gle = GetLastError();
+    if (!h) {
+        startup_log_critical_fmt("single_instance_mutex_create_failed gle=%lu pid=%lu tid=%lu",
+            gle, GetCurrentProcessId(), GetCurrentThreadId());
+        crash_log_fmt("single_instance_mutex_create_failed gle=%lu", gle);
+        return false;
+    }
+    if (gle == ERROR_ALREADY_EXISTS) {
+        startup_log_critical_fmt("single_instance_duplicate_exit pid=%lu tid=%lu mutex=0x%llX",
+            GetCurrentProcessId(),
+            GetCurrentThreadId(),
+            static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(h)));
+        focus_existing_aida_window();
+        CloseHandle(h);
+        crash_log_write("single_instance_duplicate_exit");
+        return false;
+    }
+    single_instance_mutex_handle() = h;
+    startup_log_critical_fmt("single_instance_acquired pid=%lu tid=%lu mutex=0x%llX",
+        GetCurrentProcessId(),
+        GetCurrentThreadId(),
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(h)));
+    return true;
+}
+
+static void release_single_instance_gate()
+{
+    HANDLE& h = single_instance_mutex_handle();
+    if (!h) return;
+    ReleaseMutex(h);
+    CloseHandle(h);
+    diag::log_tagged_critical_fmt("main", "single_instance_released pid=%lu tid=%lu",
+        GetCurrentProcessId(), GetCurrentThreadId());
+    h = nullptr;
+}
+
 static const char* startup_bg_phase_label(int step)
 {
     switch (step)
@@ -765,14 +831,34 @@ namespace aida_tracer {
         if (rsp != 0)
             ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(rsp), stack_values, sizeof(stack_values), &copied);
 
-        ResumeThread(th);
+        DWORD resume_prev = ResumeThread(th);
+        DWORD resume_gle = resume_prev == static_cast<DWORD>(-1) ? GetLastError() : 0;
+        DWORD rescue_resumes = 0;
+        DWORD rescue_last_prev = resume_prev;
+        DWORD rescue_gle = 0;
+        if (resume_prev != static_cast<DWORD>(-1) && suspend_count > 0) {
+            while (rescue_last_prev > 1 && rescue_resumes < 8) {
+                DWORD extra_prev = ResumeThread(th);
+                if (extra_prev == static_cast<DWORD>(-1)) {
+                    rescue_gle = GetLastError();
+                    break;
+                }
+                rescue_last_prev = extra_prev;
+                ++rescue_resumes;
+            }
+        }
         CloseHandle(th);
 
         diag::log_tagged_critical_fmt("tracer",
-            "render_thread_snapshot tid=%lu age_ms=%llu suspend_count=%lu ctx=%d rip=0x%016llX rsp=0x%016llX rbp=0x%016llX rax=0x%016llX rcx=0x%016llX rdx=0x%016llX r8=0x%016llX r9=0x%016llX peek_calls=%llu peek_returns=%llu dispatch_enter=%llu dispatch_exit=%llu wnd_enter=%llu wnd_exit=%llu %s",
+            "render_thread_snapshot tid=%lu age_ms=%llu suspend_count=%lu resume_prev=%lu resume_gle=%lu rescue_resumes=%lu rescue_last_prev=%lu rescue_gle=%lu ctx=%d rip=0x%016llX rsp=0x%016llX rbp=0x%016llX rax=0x%016llX rcx=0x%016llX rdx=0x%016llX r8=0x%016llX r9=0x%016llX peek_calls=%llu peek_returns=%llu dispatch_enter=%llu dispatch_exit=%llu wnd_enter=%llu wnd_exit=%llu %s",
             render_tid,
             static_cast<unsigned long long>(age_ms),
             static_cast<unsigned long>(suspend_count),
+            static_cast<unsigned long>(resume_prev),
+            static_cast<unsigned long>(resume_gle),
+            static_cast<unsigned long>(rescue_resumes),
+            static_cast<unsigned long>(rescue_last_prev),
+            static_cast<unsigned long>(rescue_gle),
             got_ctx ? 1 : 0,
             static_cast<unsigned long long>(rip),
             static_cast<unsigned long long>(rsp),
@@ -1720,6 +1806,7 @@ __declspec(noinline) static DWORD seh_script_engine_initialize()
 
 static std::atomic<bool> g_authorized_features_initialized{false};
 static std::atomic<bool> g_authorized_features_posted{false};
+static std::atomic<bool> g_camoufox_prewarm_posted{false};
 
 static void run_authorized_feature_initializers(const char* source)
 {
@@ -2016,6 +2103,26 @@ static LONG CALLBACK aida_diagnostic_veh(EXCEPTION_POINTERS* ep)
     {
         return EXCEPTION_CONTINUE_SEARCH;
     }
+    if (aida::diagnostic_exception_scope::active())
+    {
+        unsigned long long p0 = ep->ExceptionRecord->NumberParameters > 0
+            ? static_cast<unsigned long long>(ep->ExceptionRecord->ExceptionInformation[0])
+            : 0ULL;
+        unsigned long long p1 = ep->ExceptionRecord->NumberParameters > 1
+            ? static_cast<unsigned long long>(ep->ExceptionRecord->ExceptionInformation[1])
+            : 0ULL;
+        diag::log_tagged_critical_fmt("veh",
+            "scoped_first_chance scope=%s code=0x%08X addr=0x%016llX tid=%lu flags=0x%08X params=%lu p0=0x%016llX p1=0x%016llX",
+            aida::diagnostic_exception_scope::label(),
+            code,
+            (unsigned long long)reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress),
+            GetCurrentThreadId(),
+            ep->ExceptionRecord->ExceptionFlags,
+            (unsigned long)ep->ExceptionRecord->NumberParameters,
+            p0,
+            p1);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
     aida_write_first_chance_crash_log(ep);
     if (!ep->ContextRecord) return EXCEPTION_CONTINUE_SEARCH;
     HMODULE crash_mod = nullptr;
@@ -2051,6 +2158,10 @@ int main(int, char**)
 {
     AddVectoredExceptionHandler(1, aida_diagnostic_veh);
     diag::log_tagged_critical("main", "diagnostic_veh_installed");
+    if (!acquire_single_instance_gate()) {
+        diag::log_tagged_critical("main", "single_instance_gate_refused");
+        return 0;
+    }
     startup_log_critical_fmt("main_enter pid=%lu tid=%lu tick=%llu",
         GetCurrentProcessId(),
         GetCurrentThreadId(),
@@ -3081,6 +3192,18 @@ int main(int, char**)
             }
             mark_ide_ready_for_mcp_services();
             start_authorized_mcp_services();
+            if (!g_camoufox_prewarm_posted.exchange(true, std::memory_order_acq_rel))
+            {
+                bool prewarm_posted = aida::burp::camoufox::prewarm_default_async("render_authorized");
+                startup_log_critical_fmt("camoufox_prewarm_request posted=%d frame=%llu pid=%lu tid=%lu tick=%llu",
+                    prewarm_posted ? 1 : 0,
+                    static_cast<unsigned long long>(frame_number),
+                    GetCurrentProcessId(),
+                    GetCurrentThreadId(),
+                    static_cast<unsigned long long>(GetTickCount64()));
+                if (!prewarm_posted)
+                    g_camoufox_prewarm_posted.store(false, std::memory_order_release);
+            }
         }
 
 
@@ -3349,6 +3472,12 @@ int main(int, char**)
     aida_tracer::mark_render_phase("shutdown_sequence_begin");
     test_all_features::cancel_tests();
     diag::log_tagged_critical("main", "shutdown_testlab_cancel_done");
+    try {
+        aida::burp::camoufox::force_cleanup("main.shutdown_sequence");
+        diag::log_tagged_critical("main", "shutdown_camoufox_force_cleanup_done");
+    } catch (...) {
+        diag::log_tagged_critical("main", "shutdown_camoufox_force_cleanup_exception");
+    }
     aida_focus_monitor::stop();
     diag::log_tagged_critical("main", "shutdown_focus_monitor_done");
     anti_tamper::shutdown();
@@ -3384,6 +3513,7 @@ int main(int, char**)
     diag::log_tagged_critical("main", "shutdown_unregister_done");
 
     diag::log_tagged_critical("main", "shutdown_exit_process_pre");
+    release_single_instance_gate();
     ExitProcess(0);
     return 0;
 }

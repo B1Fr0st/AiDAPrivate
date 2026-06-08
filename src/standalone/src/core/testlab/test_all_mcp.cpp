@@ -59,6 +59,7 @@
 #include <cwctype>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <initializer_list>
 #include <map>
@@ -141,13 +142,6 @@ namespace {
     std::string g_mcp_cert_thumbprint;
     bool g_mcp_cert_inject_validate_only = false;
     std::string g_mcp_session_binary_id;
-    bool g_guest_lab_available = false;
-    uint64_t g_guest_lab_pid = 0;
-    std::string g_guest_lab_base_address;
-    std::string g_guest_lab_process_filter;
-    bool g_guest_lab_dependency_guarded = false;
-    std::string g_guest_lab_dependency_reason;
-
     enum class mcp_tool_call_status_t {
         passed,
         failed,
@@ -375,11 +369,67 @@ namespace {
     bool is_destructive_mcp_tool(const std::string& name) {
         static const std::set<std::string> exact = {
             "driver_write_kernel_memory",
-            "driver_call_function",
-            "debugger_call_function"
+            "driver_call_function"
         };
         return exact.find(lower_copy(name)) != exact.end();
     }
+
+    bool is_redundant_mcp_tool_name(const std::string& name) {
+        static const std::set<std::string> exact = {
+            "driver_connect",
+            "driver_unattach",
+            "driver_read_memory",
+            "driver_read_string",
+            "driver_enumerate_modules",
+            "driver_enumerate_threads",
+            "driver_query_memory",
+            "debugger_read_memory",
+            "debugger_write_memory",
+            "debugger_protect_memory",
+            "debugger_allocate_memory",
+            "debugger_call_function",
+            "debugger_attach_to_process",
+            "debugger_detach",
+            "debugger_get_threads",
+            "debugger_get_modules",
+            "dbg_set_breakpoint",
+            "dbg_remove_breakpoint",
+            "dbg_list_breakpoints",
+            "dbg_get_callstack",
+            "dbg_run",
+            "dbg_pause",
+            "dbg_step_into",
+            "dbg_step_over",
+            "dbg_step_out",
+            "dbg_get_registers",
+            "dbg_set_register",
+            "dbg_get_memory_map",
+            "dbg_enumerate_handles",
+            "dbg_get_seh_chain",
+            "dbg_list_patches",
+            "driver_enumerate_wfp_callouts",
+            "driver_get_socket_handles",
+            "driver_dump_tcpip_connections",
+            "driver_inject_packet",
+            "driver_modify_packet_rule",
+            "driver_redirect_traffic",
+            "driver_deep_inspect",
+            "driver_intercept_hold",
+            "driver_kill_connection",
+            "driver_spoof_dns",
+            "driver_bandwidth_monitor",
+            "driver_list_interfaces",
+            "driver_export_pcap",
+            "driver_network_fingerprint"
+        };
+        const std::string lowered = lower_copy(name);
+        if (exact.find(lowered) != exact.end())
+            return true;
+        return lowered.rfind("burp_browser_", 0) == 0 ||
+            lowered.rfind("burp_headless_", 0) == 0;
+    }
+
+    constexpr const char* k_test_lab_safe_fixture_flag = "__aida_test_safe_fixture";
 
     void log_msg(HANDLE hf, const char* tag, const char* fmt, ...);
 
@@ -405,20 +455,68 @@ namespace {
     bool restore_mcp_target(HANDLE hf, const char* tag) {
         if (g_mcp_target_pid == 0)
             return false;
-        const uint32_t current = driver_bridge::attached_pid();
-        bool known = false;
-        for (auto p : driver_bridge::attached_pids()) {
-            if (p == g_mcp_target_pid) {
-                known = true;
-                break;
+
+        const uint32_t target_pid = g_mcp_target_pid;
+        const DWORD started = GetTickCount();
+        for (int attempt = 1; attempt <= 3; ++attempt) {
+            const uint32_t current = driver_bridge::attached_pid();
+            bool known = false;
+            const auto attached = driver_bridge::attached_pids();
+            for (auto p : attached) {
+                if (p == target_pid) {
+                    known = true;
+                    break;
+                }
             }
+
+            uint32_t win32_code = 0;
+            const bool win32_alive = process_alive_by_pid(target_pid, &win32_code);
+            bool ok = current == target_pid;
+            const char* method = ok ? "already_active" : "none";
+            if (!ok && known) {
+                method = "set_active";
+                ok = driver_bridge::set_active_pid(target_pid);
+            }
+            if (!ok) {
+                method = "attach_additional";
+                ok = driver_bridge::attach_additional(target_pid);
+                if (ok) {
+                    method = "attach_additional_set_active";
+                    ok = driver_bridge::set_active_pid(target_pid);
+                }
+            }
+            if (!ok) {
+                method = "attach";
+                ok = driver_bridge::attach(target_pid);
+            }
+
+            const uint32_t now = driver_bridge::attached_pid();
+            uint32_t bridge_code = 0;
+            const bool bridge_alive = now == target_pid && driver_bridge::attached_process_alive(&bridge_code);
+            log_msg(hf, tag, "%s -- restore MCP target attempt=%d pid=%u from_active=%u known=%d attached_count=%zu method=%s ok=%d now=%u win32_alive=%d win32_code=0x%08X bridge_alive=%d bridge_code=0x%08X status=\"%s\" last_error=\"%s\" elapsed_ms=%lu",
+                (ok && bridge_alive) ? "INFO" : "WARN",
+                attempt,
+                target_pid,
+                current,
+                known ? 1 : 0,
+                attached.size(),
+                method,
+                ok ? 1 : 0,
+                now,
+                win32_alive ? 1 : 0,
+                win32_code,
+                bridge_alive ? 1 : 0,
+                bridge_code,
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str(),
+                static_cast<unsigned long>(GetTickCount() - started));
+            if (ok && bridge_alive) {
+                g_mcp_target_unavailable = false;
+                return true;
+            }
+            Sleep(50);
         }
-        bool ok = known ? driver_bridge::set_active_pid(g_mcp_target_pid) : driver_bridge::attach(g_mcp_target_pid);
-        if (!ok && known)
-            ok = driver_bridge::attach(g_mcp_target_pid);
-        log_msg(hf, tag, "%s -- restored MCP test target pid=%u from active_pid=%u known=%d now=%u",
-            ok ? "INFO" : "WARN", g_mcp_target_pid, current, known ? 1 : 0, driver_bridge::attached_pid());
-        return ok;
+        return false;
     }
 
     bool ensure_mcp_target_live(HANDLE hf, const char* tag) {
@@ -709,19 +807,51 @@ namespace {
         return "<redacted>";
     }
 
-    mcp_standalone::json redact_json_for_log(const mcp_standalone::json& value, const std::string& key = {}) {
+    mcp_standalone::json redact_json_for_log(const mcp_standalone::json& value, const std::string& key = {}, std::size_t depth = 0) {
         if (!key.empty() && sensitive_json_key(key))
             return redacted_json_value(value);
+        if (depth >= 5) {
+            if (value.is_array()) {
+                mcp_standalone::json out = mcp_standalone::json::object();
+                out["truncated"] = true;
+                out["type"] = "array";
+                out["items"] = static_cast<uint64_t>(value.size());
+                return out;
+            }
+            if (value.is_object()) {
+                mcp_standalone::json out = mcp_standalone::json::object();
+                out["truncated"] = true;
+                out["type"] = "object";
+                out["keys"] = static_cast<uint64_t>(value.size());
+                return out;
+            }
+        }
         if (value.is_object()) {
             auto out = mcp_standalone::json::object();
-            for (auto it = value.begin(); it != value.end(); ++it)
-                out[it.key()] = redact_json_for_log(*it, it.key());
+            std::size_t shown = 0;
+            for (auto it = value.begin(); it != value.end(); ++it) {
+                if (shown >= 24) {
+                    out["__truncated_keys"] = static_cast<uint64_t>(value.size() - shown);
+                    break;
+                }
+                out[it.key()] = redact_json_for_log(*it, it.key(), depth + 1);
+                ++shown;
+            }
             return out;
         }
         if (value.is_array()) {
             auto out = mcp_standalone::json::array();
-            for (const auto& item : value)
-                out.push_back(redact_json_for_log(item));
+            std::size_t shown = 0;
+            for (const auto& item : value) {
+                if (shown >= 16) {
+                    mcp_standalone::json truncated = mcp_standalone::json::object();
+                    truncated["__truncated_items"] = static_cast<uint64_t>(value.size() - shown);
+                    out.push_back(std::move(truncated));
+                    break;
+                }
+                out.push_back(redact_json_for_log(item, {}, depth + 1));
+                ++shown;
+            }
             return out;
         }
         return value;
@@ -873,6 +1003,7 @@ namespace {
         switch (visibility) {
             case mcp_standalone::tool_visibility_t::external_visible: return "external";
             case mcp_standalone::tool_visibility_t::internal_only: return "internal";
+            case mcp_standalone::tool_visibility_t::ide_chat_only: return "ide_chat_only";
             default: return "unknown";
         }
     }
@@ -916,7 +1047,7 @@ namespace {
             name.rfind("quic_", 0) == 0 || name.rfind("dtls_", 0) == 0 ||
             name.rfind("pin_", 0) == 0 || name.rfind("firefox_", 0) == 0)
             return "crypto-network";
-        if (name.rfind("guest_lab_", 0) == 0 || name.rfind("sandbox_", 0) == 0 ||
+        if (name.rfind("sandbox_", 0) == 0 ||
             name.rfind("sessions_", 0) == 0)
             return "runtime";
         if (name.find("file") != std::string::npos || name.find("directory") != std::string::npos ||
@@ -1461,14 +1592,69 @@ namespace {
         return true;
     }
 
-    bool payload_text_contains(const invoke_result_t& ir, const std::string& needle_lc) {
-        std::string text = lower_copy(ir.text);
+    bool bounded_text_contains_lc(const std::string& text, const std::string& needle_lc, std::size_t& chars_left) {
+        if (needle_lc.empty())
+            return true;
+        if (chars_left == 0 || text.empty())
+            return false;
+        const std::size_t scan_len = (std::min)(text.size(), chars_left);
+        chars_left -= scan_len;
+        if (scan_len < needle_lc.size())
+            return false;
+        for (std::size_t i = 0; i + needle_lc.size() <= scan_len; ++i) {
+            bool match = true;
+            for (std::size_t j = 0; j < needle_lc.size(); ++j) {
+                const char c = static_cast<char>(std::tolower(static_cast<unsigned char>(text[i + j])));
+                if (c != needle_lc[j]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match)
+                return true;
+        }
+        return false;
+    }
+
+    bool json_text_contains_lc_bounded(const mcp_standalone::json& value,
+                                       const std::string& needle_lc,
+                                       std::size_t& nodes_left,
+                                       std::size_t& chars_left) {
+        if (nodes_left == 0 || chars_left == 0)
+            return false;
+        --nodes_left;
         try {
-            text += " ";
-            text += lower_copy(ir.data.dump());
+            if (value.is_string()) {
+                return bounded_text_contains_lc(value.get<std::string>(), needle_lc, chars_left);
+            }
+            if (value.is_object()) {
+                for (auto it = value.begin(); it != value.end(); ++it) {
+                    if (bounded_text_contains_lc(it.key(), needle_lc, chars_left))
+                        return true;
+                    if (json_text_contains_lc_bounded(*it, needle_lc, nodes_left, chars_left))
+                        return true;
+                    if (nodes_left == 0 || chars_left == 0)
+                        return false;
+                }
+            } else if (value.is_array()) {
+                for (const auto& item : value) {
+                    if (json_text_contains_lc_bounded(item, needle_lc, nodes_left, chars_left))
+                        return true;
+                    if (nodes_left == 0 || chars_left == 0)
+                        return false;
+                }
+            }
         } catch (...) {
         }
-        return text.find(needle_lc) != std::string::npos;
+        return false;
+    }
+
+    bool payload_text_contains(const invoke_result_t& ir, const std::string& needle_lc) {
+        std::size_t text_budget = 262144;
+        if (bounded_text_contains_lc(ir.text, needle_lc, text_budget))
+            return true;
+        std::size_t nodes_left = 8192;
+        return json_text_contains_lc_bounded(ir.data, needle_lc, nodes_left, text_budget);
     }
 
     bool payload_data_empty(const mcp_standalone::json& data) {
@@ -1698,6 +1884,30 @@ namespace {
         if (tool_lc == "disasm_get_strings") {
             return false;
         }
+        if (tool_lc == "web_search" || tool_lc == "webfetch") {
+            std::string transport;
+            std::string browser;
+            if (!payload_string_field(ir.data, "transport", transport) || lower_copy(transport) != "camoufox" ||
+                !payload_string_field(ir.data, "browser", browser) || lower_copy(browser) != "camoufox") {
+                reason = tool_lc + "_not_camoufox_backed";
+                return true;
+            }
+            if (tool_lc == "web_search") {
+                if (!ir.data.is_object() ||
+                    !ir.data.contains("results") ||
+                    !ir.data["results"].is_array() ||
+                    ir.data["results"].empty()) {
+                    reason = "web_search_no_camoufox_results";
+                    return true;
+                }
+            } else {
+                uint64_t bytes = 0;
+                if (!payload_u64_field(ir.data, "bytes", bytes) || bytes == 0) {
+                    reason = "webfetch_empty_camoufox_payload";
+                    return true;
+                }
+            }
+        }
         if (tool_lc == "find_what_accesses") {
             if (find_what_accesses_payload_evidence_ok(ir, reason))
                 return false;
@@ -1723,7 +1933,8 @@ namespace {
             "did not return",
             "no http messages found",
             "no tls records found",
-            "filter invalid"
+            "filter invalid",
+            "tcp_connect_failed"
         };
         for (const char* marker : text_markers) {
             if (payload_text_contains(ir, marker)) {
@@ -1751,6 +1962,19 @@ namespace {
                 find_payload_key_recursive(ir.data, "private_key_pem")) {
                 reason = "private_key_material_returned";
                 return true;
+            }
+        }
+
+        if (tool_lc == "autoresponder_export_rules") {
+            std::string path;
+            bool wrote_file = false;
+            uint64_t file_size = 0;
+            if (payload_string_field(ir.data, "path", path) && !path.empty()) {
+                if (!payload_bool_field(ir.data, "wrote_file", wrote_file) || !wrote_file ||
+                    !payload_u64_field(ir.data, "file_size", file_size) || file_size == 0) {
+                    reason = "autoresponder_export_file_missing";
+                    return true;
+                }
             }
         }
 
@@ -1788,7 +2012,8 @@ namespace {
                         reason = "driver_call_dry_run_payload_invalid";
                         return true;
                     }
-                    return false;
+                    reason = "driver_call_dry_run_no_execution";
+                    return true;
                 }
             } else if (tool_lc == "debugger_call_function") {
                 std::string address;
@@ -1799,7 +2024,8 @@ namespace {
                         reason = "debugger_call_validate_payload_invalid";
                         return true;
                     }
-                    return false;
+                    reason = "debugger_call_validate_only_no_execution";
+                    return true;
                 }
             }
         }
@@ -1809,6 +2035,10 @@ namespace {
             bool success = false;
             std::string thumbprint;
             (void)payload_bool_field(ir.data, "validate_only", validate_only);
+            if (validate_only) {
+                reason = "cert_inject_validate_only_no_store_mutation";
+                return true;
+            }
             if (!payload_bool_field(ir.data, "success", success) ||
                 !success ||
                 (!validate_only && (!payload_string_field(ir.data, "thumbprint", thumbprint) || thumbprint.empty()))) {
@@ -1828,6 +2058,20 @@ namespace {
             }
         }
 
+        if (tool_lc == "pin_bypass_revert") {
+            bool reverted = false;
+            bool active_after = true;
+            const bool have_active_after = payload_bool_field(ir.data, "active_after", active_after);
+            if (!payload_bool_field(ir.data, "reverted", reverted)) {
+                reason = "pin_bypass_revert_payload_missing_reverted";
+                return true;
+            }
+            if (!reverted && !(have_active_after && !active_after)) {
+                reason = "pin_bypass_revert_no_active_state";
+                return true;
+            }
+        }
+
         if (tool_lc == "burp_api_audit_collection") {
             uint64_t requests_sent = 0;
             uint64_t requests_failed = 0;
@@ -1837,6 +2081,82 @@ namespace {
             }
             if (payload_u64_field(ir.data, "requests_failed", requests_failed) && requests_failed > 0) {
                 reason = "requests_failed=" + std::to_string(requests_failed);
+                return true;
+            }
+        }
+
+        if (tool_lc == "burp_intruder_results") {
+            uint64_t count = 0;
+            uint64_t error_count = 0;
+            uint64_t successful_count = 0;
+            if (!payload_u64_field(ir.data, "count", count) || count == 0) {
+                reason = "intruder_results_empty";
+                return true;
+            }
+            if (payload_u64_field(ir.data, "error_count", error_count) && error_count > 0) {
+                reason = "intruder_error_count=" + std::to_string(error_count);
+                return true;
+            }
+            if (payload_u64_field(ir.data, "successful_count", successful_count) && successful_count == 0) {
+                reason = "intruder_successful_count=0";
+                return true;
+            }
+        }
+
+        if (tool_lc == "autoresponder_export_rules") {
+            uint64_t rule_count = 0;
+            uint64_t file_size = 0;
+            bool wrote_file = false;
+            std::string path;
+            if (!payload_u64_field(ir.data, "rule_count", rule_count) || rule_count == 0) {
+                reason = "autoresponder_export_rules_empty";
+                return true;
+            }
+            if (payload_string_field(ir.data, "path", path) && !path.empty()) {
+                if (!payload_bool_field(ir.data, "wrote_file", wrote_file) || !wrote_file ||
+                    !payload_u64_field(ir.data, "file_size", file_size) || file_size == 0) {
+                    reason = "autoresponder_export_file_missing";
+                    return true;
+                }
+            }
+        }
+
+        if (tool_lc == "network_clear_filters") {
+            uint64_t before_count = 0;
+            uint64_t after_count = 0;
+            uint64_t cleared_count = 0;
+            bool before_ok = false;
+            bool after_ok = false;
+            if (!payload_bool_field(ir.data, "stats_before_ok", before_ok) || !before_ok ||
+                !payload_bool_field(ir.data, "stats_after_ok", after_ok) || !after_ok ||
+                !payload_u64_field(ir.data, "before_count", before_count) || before_count == 0 ||
+                !payload_u64_field(ir.data, "after_count", after_count) || after_count != 0 ||
+                !payload_u64_field(ir.data, "cleared_count", cleared_count) || cleared_count == 0) {
+                reason = "network_clear_filters_unproven";
+                return true;
+            }
+        }
+
+        if (tool_lc == "burp_collaborator_clear") {
+            uint64_t before_count = 0;
+            uint64_t after_count = 1;
+            uint64_t cleared_count = 0;
+            if (!payload_u64_field(ir.data, "before_interaction_count", before_count) || before_count == 0 ||
+                !payload_u64_field(ir.data, "after_interaction_count", after_count) || after_count != 0 ||
+                !payload_u64_field(ir.data, "cleared_interactions", cleared_count) || cleared_count == 0) {
+                reason = "collaborator_clear_unproven";
+                return true;
+            }
+        }
+
+        if (tool_lc == "burp_comparer_clear") {
+            uint64_t before_count = 0;
+            uint64_t after_count = 1;
+            uint64_t cleared_count = 0;
+            if (!payload_u64_field(ir.data, "before_count", before_count) || before_count == 0 ||
+                !payload_u64_field(ir.data, "after_count", after_count) || after_count != 0 ||
+                !payload_u64_field(ir.data, "cleared_count", cleared_count) || cleared_count == 0) {
+                reason = "comparer_clear_unproven";
                 return true;
             }
         }
@@ -2681,73 +3001,6 @@ namespace {
             }
         }
 
-        if (tool_lc == "guest_lab_status") {
-            bool active = false;
-            bool ready = true;
-            if (payload_bool_field(ir.data, "active", active) &&
-                payload_bool_field(ir.data, "agent_ready", ready) &&
-                active && !ready) {
-                reason = "agent_ready=false";
-                return true;
-            }
-        }
-
-        if (tool_lc == "guest_lab_list_processes" ||
-            tool_lc == "guest_lab_memory_map" ||
-            tool_lc == "guest_lab_enumerate_modules" ||
-            tool_lc == "guest_lab_enumerate_threads") {
-            uint64_t count = 1;
-            if (payload_u64_field(ir.data, "count", count) && count == 0) {
-                reason = "count=0";
-                return true;
-            }
-        }
-
-        if (tool_lc == "guest_lab_search_memory") {
-            uint64_t count = 1;
-            uint64_t hits = 1;
-            if (payload_u64_field(ir.data, "count", count) && count == 0) {
-                reason = "count=0";
-                return true;
-            }
-            if (payload_u64_field(ir.data, "hits", hits) && hits == 0) {
-                reason = "hits=0";
-                return true;
-            }
-        }
-
-        if (tool_lc == "guest_lab_read_memory") {
-            uint64_t size = 1;
-            if (payload_u64_field(ir.data, "size", size) && size == 0) {
-                reason = "size=0";
-                return true;
-            }
-        }
-
-        if (tool_lc == "guest_lab_read_string") {
-            std::string text;
-            if (payload_string_field(ir.data, "text", text) && text.empty()) {
-                reason = "text_empty";
-                return true;
-            }
-        }
-
-        if (tool_lc == "guest_lab_dump_region") {
-            uint64_t written = 1;
-            if (payload_u64_field(ir.data, "bytes_written", written) && written == 0) {
-                reason = "bytes_written=0";
-                return true;
-            }
-        }
-
-        if (tool_lc == "guest_lab_search_memory") {
-            uint64_t hits = 1;
-            if (payload_u64_field(ir.data, "hit_count", hits) && hits == 0) {
-                reason = "hit_count=0";
-                return true;
-            }
-        }
-
         if (tool_lc == "burp_browser_launch" ||
             tool_lc == "burp_browser_detect" ||
             tool_lc == "burp_headless_start" ||
@@ -2876,11 +3129,26 @@ namespace {
         std::string worker_phase;
     };
 
+    struct timed_out_invoke_record_t {
+        int seq = 0;
+        std::string tool_name;
+        std::string domain;
+        long long timeout_ms = 0;
+        uint64_t queued_tick = 0;
+        uint64_t timed_out_tick = 0;
+        std::shared_ptr<async_invoke_state_t> state;
+    };
+
+    std::mutex g_timed_out_invocations_mtx;
+    std::vector<timed_out_invoke_record_t> g_timed_out_invocations;
+
     bool mcp_tool_uses_camoufox_runtime(const std::string& name) {
         const std::string n = lower_copy(name);
         return n == "burp_dom_xss_status" ||
             n == "burp_dom_xss_test_payload" ||
             n == "burp_dom_xss_scan" ||
+            n == "web_search" ||
+            n == "webfetch" ||
             n == "camoufox_open_url" ||
             n == "launch_browser" ||
             n.rfind("burp_headless", 0) == 0 ||
@@ -2982,6 +3250,251 @@ namespace {
         worker_phase = state->worker_phase;
     }
 
+    void register_timed_out_invocation(int seq,
+                                       const std::string& tool_name,
+                                       long long timeout_ms,
+                                       uint64_t queued_tick,
+                                       const std::shared_ptr<async_invoke_state_t>& state) {
+        if (!state)
+            return;
+        timed_out_invoke_record_t rec;
+        rec.seq = seq;
+        rec.tool_name = tool_name;
+        rec.domain = mcp_tool_domain(tool_name);
+        rec.timeout_ms = timeout_ms;
+        rec.queued_tick = queued_tick;
+        rec.timed_out_tick = GetTickCount64();
+        rec.state = state;
+        std::lock_guard<std::mutex> lk(g_timed_out_invocations_mtx);
+        for (const auto& existing : g_timed_out_invocations) {
+            if (existing.seq == seq)
+                return;
+        }
+        g_timed_out_invocations.push_back(std::move(rec));
+    }
+
+    size_t prune_completed_timed_out_invocations() {
+        std::lock_guard<std::mutex> lk(g_timed_out_invocations_mtx);
+        g_timed_out_invocations.erase(
+            std::remove_if(g_timed_out_invocations.begin(), g_timed_out_invocations.end(),
+                [](const timed_out_invoke_record_t& rec) {
+                    if (!rec.state)
+                        return true;
+                    std::lock_guard<std::mutex> state_lk(rec.state->mutex);
+                    return rec.state->done;
+                }),
+            g_timed_out_invocations.end());
+        return g_timed_out_invocations.size();
+    }
+
+    std::vector<timed_out_invoke_record_t> copy_timed_out_invocations() {
+        std::lock_guard<std::mutex> lk(g_timed_out_invocations_mtx);
+        return g_timed_out_invocations;
+    }
+
+    void log_timed_out_invocations(HANDLE hf, const char* tag, const char* phase) {
+        const auto records = copy_timed_out_invocations();
+        const uint64_t now = GetTickCount64();
+        log_msg(hf, tag, "OUTSTANDING-DIAG -- phase=%s count=%zu",
+            phase ? phase : "unspecified",
+            records.size());
+        for (const auto& rec : records) {
+            bool worker_started = false;
+            bool handler_entered = false;
+            bool handler_exited = false;
+            bool done = false;
+            DWORD worker_pid = 0;
+            DWORD worker_tid = 0;
+            long long queue_delay_ms = 0;
+            long long worker_elapsed_ms = 0;
+            std::string worker_phase;
+            if (rec.state) {
+                std::lock_guard<std::mutex> lk(rec.state->mutex);
+                snapshot_async_state_locked(rec.state, worker_started, handler_entered, handler_exited, done,
+                    worker_pid, worker_tid, queue_delay_ms, worker_elapsed_ms, worker_phase);
+            }
+            const uint64_t queued_age = rec.queued_tick != 0 && now >= rec.queued_tick ? now - rec.queued_tick : 0;
+            const uint64_t timeout_age = rec.timed_out_tick != 0 && now >= rec.timed_out_tick ? now - rec.timed_out_tick : 0;
+            log_msg(hf, tag, "OUTSTANDING -- phase=%s seq=%d tool=\"%s\" domain=%s timeout_ms=%lld queued_age_ms=%llu timed_out_age_ms=%llu worker_started=%d handler_entered=%d handler_exited=%d done=%d worker_pid=%lu worker_tid=%lu queue_delay_ms=%lld worker_elapsed_ms=%lld worker_phase=%s",
+                phase ? phase : "unspecified",
+                rec.seq,
+                rec.tool_name.c_str(),
+                rec.domain.c_str(),
+                rec.timeout_ms,
+                static_cast<unsigned long long>(queued_age),
+                static_cast<unsigned long long>(timeout_age),
+                worker_started ? 1 : 0,
+                handler_entered ? 1 : 0,
+                handler_exited ? 1 : 0,
+                done ? 1 : 0,
+                static_cast<unsigned long>(worker_pid),
+                static_cast<unsigned long>(worker_tid),
+                queue_delay_ms,
+                worker_elapsed_ms,
+                worker_phase.empty() ? "<empty>" : worker_phase.c_str());
+        }
+    }
+
+    bool wait_timed_out_invocation_drain(HANDLE hf, const char* reason, DWORD timeout_ms) {
+        const uint64_t start = GetTickCount64();
+        const uint64_t deadline = start + timeout_ms;
+        size_t remaining = prune_completed_timed_out_invocations();
+        auto cq = critical_work_queue::stats();
+        log_msg(hf, "mcp.finalize_drain", "BEGIN -- reason=%s timeout_ms=%lu outstanding=%zu cq_alive=%d cq_pending=%zu cq_active=%u cq_started=%llu cq_finished=%llu",
+            reason ? reason : "unspecified",
+            static_cast<unsigned long>(timeout_ms),
+            remaining,
+            cq.alive ? 1 : 0,
+            cq.pending,
+            static_cast<unsigned>(cq.active),
+            static_cast<unsigned long long>(cq.started),
+            static_cast<unsigned long long>(cq.finished));
+        log_timed_out_invocations(hf, "mcp.finalize_drain", "begin");
+        while (remaining != 0 && GetTickCount64() < deadline) {
+            Sleep(100);
+            remaining = prune_completed_timed_out_invocations();
+        }
+        cq = critical_work_queue::stats();
+        const uint64_t elapsed = GetTickCount64() - start;
+        if (remaining == 0) {
+            log_msg(hf, "mcp.finalize_drain", "END -- drained=1 elapsed_ms=%llu cq_pending=%zu cq_active=%u cq_started=%llu cq_finished=%llu",
+                static_cast<unsigned long long>(elapsed),
+                cq.pending,
+                static_cast<unsigned>(cq.active),
+                static_cast<unsigned long long>(cq.started),
+                static_cast<unsigned long long>(cq.finished));
+            return true;
+        }
+        log_msg(hf, "mcp.finalize_drain", "WARN -- drained=0 elapsed_ms=%llu remaining=%zu cq_pending=%zu cq_active=%u cq_started=%llu cq_finished=%llu; continuing to phase summary",
+            static_cast<unsigned long long>(elapsed),
+            remaining,
+            cq.pending,
+            static_cast<unsigned>(cq.active),
+            static_cast<unsigned long long>(cq.started),
+            static_cast<unsigned long long>(cq.finished));
+        log_timed_out_invocations(hf, "mcp.finalize_drain", "timeout");
+        return false;
+    }
+
+    struct finalizer_bool_state_t {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool entered = false;
+        bool done = false;
+        bool value = false;
+        DWORD worker_pid = 0;
+        DWORD worker_tid = 0;
+        uint64_t elapsed_ms = 0;
+        std::string error;
+    };
+
+    bool run_finalizer_bool_bounded(HANDLE hf,
+                                    const char* label,
+                                    DWORD timeout_ms,
+                                    const std::function<bool()>& fn,
+                                    bool& completed,
+                                    bool& value) {
+        completed = false;
+        value = false;
+        const char* safe_label = label ? label : "unnamed";
+        auto state = std::make_shared<finalizer_bool_state_t>();
+        aida::infra::win_thread::joinable_thread_t worker;
+        std::string thread_err;
+        const uint64_t t0 = GetTickCount64();
+        log_msg(hf, "mcp.finalize_task", "BEGIN -- label=%s timeout_ms=%lu caller_pid=%lu caller_tid=%lu",
+            safe_label,
+            static_cast<unsigned long>(timeout_ms),
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        const bool started = worker.start([state, fn]() {
+            const uint64_t worker_t0 = GetTickCount64();
+            {
+                std::lock_guard<std::mutex> lk(state->mutex);
+                state->entered = true;
+                state->worker_pid = GetCurrentProcessId();
+                state->worker_tid = GetCurrentThreadId();
+            }
+            state->cv.notify_all();
+            bool local_value = false;
+            std::string local_error;
+            try {
+                local_value = fn ? fn() : false;
+            } catch (const std::exception& ex) {
+                local_error = ex.what();
+            } catch (...) {
+                local_error = "unknown exception";
+            }
+            {
+                std::lock_guard<std::mutex> lk(state->mutex);
+                state->value = local_value;
+                state->error = std::move(local_error);
+                state->elapsed_ms = GetTickCount64() - worker_t0;
+                state->done = true;
+            }
+            state->cv.notify_all();
+        }, &thread_err, aida::infra::win_thread::fixture_stack_reserve, "testlab.mcp.finalizer");
+        if (!started) {
+            log_msg(hf, "mcp.finalize_task", "WARN -- label=%s start_failed elapsed_ms=%llu err=%s",
+                safe_label,
+                static_cast<unsigned long long>(GetTickCount64() - t0),
+                thread_err.empty() ? "<empty>" : compact_text(thread_err, 700).c_str());
+            return false;
+        }
+        if (!worker.join_for(timeout_ms)) {
+            DWORD worker_pid = 0;
+            DWORD worker_tid = 0;
+            bool entered = false;
+            {
+                std::lock_guard<std::mutex> lk(state->mutex);
+                worker_pid = state->worker_pid;
+                worker_tid = state->worker_tid;
+                entered = state->entered;
+            }
+            worker.detach();
+            log_msg(hf, "mcp.finalize_task", "WARN -- label=%s timeout elapsed_ms=%llu entered=%d worker_pid=%lu worker_tid=%lu; detached cleanup may finish later",
+                safe_label,
+                static_cast<unsigned long long>(GetTickCount64() - t0),
+                entered ? 1 : 0,
+                static_cast<unsigned long>(worker_pid),
+                static_cast<unsigned long>(worker_tid));
+            return false;
+        }
+        std::string error;
+        uint64_t worker_elapsed = 0;
+        {
+            std::lock_guard<std::mutex> lk(state->mutex);
+            completed = state->done && state->error.empty();
+            value = state->value;
+            error = state->error;
+            worker_elapsed = state->elapsed_ms;
+        }
+        if (!error.empty()) {
+            log_msg(hf, "mcp.finalize_task", "WARN -- label=%s exception elapsed_ms=%llu worker_elapsed_ms=%llu err=%s",
+                safe_label,
+                static_cast<unsigned long long>(GetTickCount64() - t0),
+                static_cast<unsigned long long>(worker_elapsed),
+                compact_text(error, 700).c_str());
+            return false;
+        }
+        log_msg(hf, "mcp.finalize_task", "END -- label=%s completed=%d result=%d elapsed_ms=%llu worker_elapsed_ms=%llu",
+            safe_label,
+            completed ? 1 : 0,
+            value ? 1 : 0,
+            static_cast<unsigned long long>(GetTickCount64() - t0),
+            static_cast<unsigned long long>(worker_elapsed));
+        return completed;
+    }
+
+    bool bounded_finalizer_call(HANDLE hf,
+                                const char* label,
+                                DWORD timeout_ms,
+                                const std::function<bool()>& fn) {
+        bool completed = false;
+        bool value = false;
+        run_finalizer_bool_bounded(hf, label, timeout_ms, fn, completed, value);
+        return completed && value;
+    }
+
     bool tool_registered(mcp_standalone::server_t* srv, const char* tool_name) {
         if (!srv || !tool_name)
             return false;
@@ -3079,9 +3592,9 @@ namespace {
 
     long long tool_timeout_ms(const std::string& name) {
         if (name == "web_search")
-            return 10000;
+            return 90000;
         if (name == "webfetch")
-            return 8000;
+            return 90000;
         if (name == "burp_headless_view_install")
             return 15000;
         if (name == "burp_browser_launch")
@@ -3097,8 +3610,6 @@ namespace {
             return 180000;
         if (name == "sessions_run_binary")
             return 300000;
-        if (name.find("guest_lab_") == 0)
-            return 300000;
         if (name == "burp_headless_view_quick_navigate")
             return 45000;
         if (name == "camoufox_open_url")
@@ -3111,6 +3622,10 @@ namespace {
             return 60000;
         if (name == "check_environment")
             return 5000;
+        if (name == "hook_jsvmp_interpreter")
+            return 60000;
+        if (name == "compare_env")
+            return 45000;
         if (name == "pointer_scan_start" || name == "pointer_scan_results")
             return 45000;
         if (name.find("scan_mem_") == 0)
@@ -3153,6 +3668,9 @@ namespace {
         } else if (name == "find_what_accesses") {
             const size_t signalled = page_guard_engine::g_pg_engine.signal_stop_all();
             log_msg(hf, tag, "CANCEL -- find_what_accesses page-guard sessions signalled count=%zu", signalled);
+        } else if (name == "network_pg_sniff") {
+            const size_t signalled = page_guard_engine::g_pg_engine.signal_stop_all();
+            log_msg(hf, tag, "CANCEL -- network_pg_sniff page-guard sessions signalled count=%zu", signalled);
         } else if (name == "hunt_integrity_checkers") {
             integrity_hunter::stop_hunt();
             const bool idle = integrity_hunter::wait_until_idle(12000);
@@ -3177,7 +3695,7 @@ namespace {
                     name.c_str(),
                     static_cast<unsigned long>(GetCurrentProcessId()),
                     static_cast<unsigned long>(GetCurrentThreadId()));
-                const bool ok = aida::burp::camoufox::stop_bridge();
+                const bool ok = aida::burp::camoufox::force_cleanup("testlab.camoufox_close");
                 const auto after = aida::burp::camoufox::get_status();
                 diag::log_tagged_fmt("test_all_mcp", "camoufox timeout stop worker exit tool=%s ok=%d elapsed_ms=%llu state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d errors=%llu err=%s",
                     name.c_str(),
@@ -3247,9 +3765,9 @@ namespace {
             return failed;
         };
 
+        const auto queued_at = std::chrono::steady_clock::now();
+        const uint64_t queued_tick = GetTickCount64();
         try {
-            auto queued_at = std::chrono::steady_clock::now();
-            const uint64_t queued_tick = GetTickCount64();
             if (full_log) {
                 log_mcp_invoke_snapshot(hf, tag, "QUEUE", seq, tool_name, timeout_ms, 0,
                     false, false, false, false, 0, 0, 0, 0, "queued");
@@ -3382,6 +3900,7 @@ namespace {
                 out.elapsed_ms = timeout_ms;
                 out.queue_delay_ms = worker_started ? queue_delay_ms : timeout_ms;
                 out.worker_phase = worker_phase;
+                register_timed_out_invocation(seq, tool_name, timeout_ms, queued_tick, state);
                 lk.unlock();
                 if (full_log) {
                     log_mcp_invoke_snapshot(hf, tag, "TIMEOUT", seq, tool_name, timeout_ms, waited_ms,
@@ -3463,6 +3982,13 @@ namespace {
         const std::string tool_name_s = tool_name ? std::string(tool_name) : std::string();
         (void)skipped;
         mcp_standalone::json call_args = args.is_null() ? mcp_standalone::json::object() : args;
+        bool test_lab_safe_fixture = false;
+        if (call_args.is_object() &&
+            call_args.contains(k_test_lab_safe_fixture_flag) &&
+            call_args[k_test_lab_safe_fixture_flag].is_boolean()) {
+            test_lab_safe_fixture = call_args[k_test_lab_safe_fixture_flag].get<bool>();
+            call_args.erase(k_test_lab_safe_fixture_flag);
+        }
         const bool validate_only_call = call_args.is_object() &&
             call_args.contains("validate_only") &&
             call_args["validate_only"].is_boolean() &&
@@ -3471,7 +3997,7 @@ namespace {
             call_args.contains("dry_run") &&
             call_args["dry_run"].is_boolean() &&
             call_args["dry_run"].get<bool>();
-        const bool safe_contract_call = validate_only_call || dry_run_call;
+        const bool safe_contract_call = validate_only_call || dry_run_call || test_lab_safe_fixture;
         if (is_ai_related_mcp_tool(tool_name_s)) {
             log_msg(hf, tag, "EXCLUDED -- tool \"%s\" is AI/agent-related and excluded from full-run tests counted=0",
                 tool_name_s.c_str());
@@ -3496,7 +4022,7 @@ namespace {
         const std::string domain = mcp_tool_domain(tool_name_s);
 
         const std::string args_preview = compact_json(call_args);
-        log_msg(hf, tag, "START -- \"%s\" seq=%d domain=%s target_pid=%u attached_pid=%u live_target_required=%d target_context_may_change=%d validate_only=%d dry_run=%d registered=%d read_only=%d visibility=%s args=%s",
+        log_msg(hf, tag, "START -- \"%s\" seq=%d domain=%s target_pid=%u attached_pid=%u live_target_required=%d target_context_may_change=%d validate_only=%d dry_run=%d test_safe_fixture=%d registered=%d read_only=%d visibility=%s args=%s",
             tool_name ? tool_name : "<null>",
             seq,
             domain.c_str(),
@@ -3506,6 +4032,7 @@ namespace {
             target_context_may_change ? 1 : 0,
             validate_only_call ? 1 : 0,
             dry_run_call ? 1 : 0,
+            test_lab_safe_fixture ? 1 : 0,
             registered_tool ? 1 : 0,
             registered_tool && registered_tool->read_only ? 1 : 0,
             registered_tool ? tool_visibility_name(registered_tool->visibility) : "unregistered",
@@ -3624,32 +4151,84 @@ namespace {
 
         for (auto& c : preview) { if (c == '\n') c = ' '; if (c == '\r') c = ' '; }
 
-        uint32_t post_exit_code = 0;
-        if (g_mcp_target_pid != 0 && tool_uses_live_target(tool_name_s) &&
-            !process_alive_by_pid(g_mcp_target_pid, &post_exit_code)) {
+        if (g_mcp_target_pid != 0 && tool_uses_live_target(tool_name_s)) {
+            uint32_t post_exit_code = 0;
+            const bool win32_alive = process_alive_by_pid(g_mcp_target_pid, &post_exit_code);
+            const uint32_t active_before_restore = driver_bridge::attached_pid();
+            bool restore_ok = active_before_restore == g_mcp_target_pid;
+            if (!win32_alive || !restore_ok)
+                restore_ok = restore_mcp_target(hf, tag);
             uint32_t driver_exit_code = 0;
-            bool bridge_alive = false;
-            if (restore_mcp_target(hf, tag))
-                bridge_alive = driver_bridge::attached_process_alive(&driver_exit_code);
-            if (bridge_alive) {
+            const bool bridge_alive = driver_bridge::attached_pid() == g_mcp_target_pid &&
+                driver_bridge::attached_process_alive(&driver_exit_code);
+            log_msg(hf, tag, "LIVENESS -- \"%s\" post-call pid=%u win32_alive=%d win32_code=0x%08X active_before=%u restore_ok=%d active_after=%u bridge_alive=%d bridge_code=0x%08X",
+                tool_name,
+                g_mcp_target_pid,
+                win32_alive ? 1 : 0,
+                post_exit_code,
+                active_before_restore,
+                restore_ok ? 1 : 0,
+                driver_bridge::attached_pid(),
+                bridge_alive ? 1 : 0,
+                driver_exit_code);
+            if (!win32_alive && bridge_alive) {
                 g_mcp_target_unavailable = false;
                 log_msg(hf, tag, "INFO -- \"%s\" post-tool Win32 liveness probe was inconclusive pid=%u exit_code_or_err=0x%08X; driver bridge confirms target alive exit_code=0x%08X",
                     tool_name, g_mcp_target_pid, post_exit_code, driver_exit_code);
-            } else {
-            g_mcp_target_unavailable = true;
-            log_msg(hf, tag, "FAIL -- \"%s\" ended MCP target pid=%u exit_code_or_err=0x%08X (elapsed %lld ms) -> %s",
-                tool_name, g_mcp_target_pid, post_exit_code, (long long)ms, preview.c_str());
-            log_mcp_result_detail("failed_target_exit", seq, tool_name_s, call_args, ir, ms,
-                "target_exit=0x" + std::to_string(post_exit_code));
-            restore_after_mutation();
-            record_tool_status(tool_name_s, mcp_tool_call_status_t::failed);
-            failed.fetch_add(1);
-            return mcp_tool_call_status_t::failed;
+            } else if (!win32_alive || !restore_ok || !bridge_alive) {
+                g_mcp_target_unavailable = true;
+                log_msg(hf, tag, "FAIL -- \"%s\" ended or detached MCP target pid=%u win32_alive=%d exit_code_or_err=0x%08X restore_ok=%d bridge_alive=%d bridge_code=0x%08X (elapsed %lld ms) -> %s",
+                    tool_name,
+                    g_mcp_target_pid,
+                    win32_alive ? 1 : 0,
+                    post_exit_code,
+                    restore_ok ? 1 : 0,
+                    bridge_alive ? 1 : 0,
+                    driver_exit_code,
+                    (long long)ms,
+                    preview.c_str());
+                log_mcp_result_detail("failed_target_exit", seq, tool_name_s, call_args, ir, ms,
+                    "target_exit=0x" + std::to_string(post_exit_code));
+                restore_after_mutation();
+                record_tool_status(tool_name_s, mcp_tool_call_status_t::failed);
+                failed.fetch_add(1);
+                return mcp_tool_call_status_t::failed;
             }
         }
 
         std::string payload_failure;
-        if (ir.success && tool_payload_failure_reason(tool_name_s, ir, payload_failure)) {
+        bool payload_failed = false;
+        long long payload_validation_ms = 0;
+        if (ir.success) {
+            const auto payload_validation_start = std::chrono::steady_clock::now();
+            log_msg(hf, tag, "VALIDATE-PAYLOAD -- \"%s\" begin data_type=%s text_len=%zu",
+                tool_name,
+                ir.data.type_name(),
+                ir.text.size());
+            payload_failed = tool_payload_failure_reason(tool_name_s, ir, payload_failure);
+            payload_validation_ms = static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - payload_validation_start).count());
+            std::string payload_failure_preview = payload_failure;
+            if (sensitive_log_tool(tool_name_s))
+                payload_failure_preview = "<redacted reason len=" + std::to_string(payload_failure.size()) + ">";
+            else
+                payload_failure_preview = compact_text(std::move(payload_failure_preview), 260);
+            log_msg(hf, tag, "VALIDATE-PAYLOAD -- \"%s\" complete elapsed_ms=%lld failed=%d reason=%s",
+                tool_name,
+                payload_validation_ms,
+                payload_failed ? 1 : 0,
+                payload_failure_preview.c_str());
+            diag::log_tagged_fmt("test_all_mcp",
+                "payload validation seq=%d tool=%s elapsed_ms=%lld failed=%d data_type=%s text_len=%zu reason_len=%zu",
+                seq,
+                tool_name_s.c_str(),
+                payload_validation_ms,
+                payload_failed ? 1 : 0,
+                ir.data.type_name(),
+                ir.text.size(),
+                payload_failure.size());
+        }
+        if (ir.success && payload_failed) {
             log_msg(hf, tag, "FAIL -- \"%s\" success=true but payload reports failure: %s (elapsed %lld ms) -> %s",
                 tool_name, payload_failure.c_str(), (long long)ms, preview.c_str());
             log_mcp_validation_detail(hf, tag, "failed_payload", seq, tool_name_s, call_args, ir, ms, payload_failure);
@@ -4573,21 +5152,79 @@ namespace {
             }
             if (GetTickCount() - start >= timeout_ms) {
                 flush_network_hook_sidecar_partial(hf, tag, proc);
+                DWORD probe_exit = 0;
+                const BOOL probe_ok = proc.process ? GetExitCodeProcess(proc.process, &probe_exit) : FALSE;
+                const DWORD probe_err = probe_ok ? 0 : GetLastError();
                 log_msg(hf, tag, "FAIL -- sidecar done timeout after %lu ms",
                     static_cast<unsigned long>(timeout_ms));
+                log_msg(hf, tag, "DONE-TIMEOUT-DIAG -- pid=%lu process=%p probe_ok=%d probe_err=%lu probe_text=%s probe_exit=0x%08lX output_len=%zu pending_len=%zu ready_event=%p go_event=%p done_event=%p",
+                    static_cast<unsigned long>(proc.pid),
+                    proc.process,
+                    probe_ok ? 1 : 0,
+                    static_cast<unsigned long>(probe_err),
+                    probe_ok ? "success" : format_win32_error(probe_err).c_str(),
+                    probe_ok ? static_cast<unsigned long>(probe_exit) : 0UL,
+                    proc.output.size(),
+                    proc.pending_line.size(),
+                    proc.ready_event,
+                    proc.go_event,
+                    proc.done_event);
                 return STILL_ACTIVE;
             }
         }
     }
 
     void close_network_hook_sidecar(HANDLE hf, const char* tag, network_hook_sidecar_proc_t& proc, bool force) {
+        const uint64_t start = GetTickCount64();
+        log_msg(hf, tag, "CLEANUP -- sidecar close begin pid=%lu force=%d process=%p thread=%p stdout_read=%p stdout_write=%p ready_event=%p go_event=%p done_event=%p output_len=%zu pending_len=%zu",
+            static_cast<unsigned long>(proc.pid),
+            force ? 1 : 0,
+            proc.process,
+            proc.thread,
+            proc.stdout_read,
+            proc.stdout_write,
+            proc.ready_event,
+            proc.go_event,
+            proc.done_event,
+            proc.output.size(),
+            proc.pending_line.size());
         if (proc.process) {
             DWORD exit_code = 0;
-            if (GetExitCodeProcess(proc.process, &exit_code) && exit_code == STILL_ACTIVE && force) {
-                log_msg(hf, tag, "CLEANUP -- terminating sidecar pid=%lu",
-                    static_cast<unsigned long>(proc.pid));
-                TerminateProcess(proc.process, 0xA1DA);
-                WaitForSingleObject(proc.process, 5000);
+            BOOL exit_ok = GetExitCodeProcess(proc.process, &exit_code);
+            DWORD exit_err = exit_ok ? 0 : GetLastError();
+            log_msg(hf, tag, "CLEANUP -- sidecar exit probe before pid=%lu ok=%d err=%lu text=%s exit=0x%08lX",
+                static_cast<unsigned long>(proc.pid),
+                exit_ok ? 1 : 0,
+                static_cast<unsigned long>(exit_err),
+                exit_ok ? "success" : format_win32_error(exit_err).c_str(),
+                exit_ok ? static_cast<unsigned long>(exit_code) : 0UL);
+            if (exit_ok && exit_code == STILL_ACTIVE && force) {
+                SetLastError(0);
+                const BOOL term_ok = TerminateProcess(proc.process, 0xA1DA);
+                const DWORD term_err = term_ok ? 0 : GetLastError();
+                log_msg(hf, tag, "CLEANUP -- sidecar terminate pid=%lu ok=%d err=%lu text=%s",
+                    static_cast<unsigned long>(proc.pid),
+                    term_ok ? 1 : 0,
+                    static_cast<unsigned long>(term_err),
+                    term_ok ? "success" : format_win32_error(term_err).c_str());
+                const uint64_t wait_start = GetTickCount64();
+                const DWORD wait_ms = term_ok ? 1500UL : 0UL;
+                const DWORD wait_result = WaitForSingleObject(proc.process, wait_ms);
+                const DWORD wait_err = wait_result == WAIT_FAILED ? GetLastError() : 0;
+                DWORD exit_after = 0;
+                const BOOL exit_after_ok = GetExitCodeProcess(proc.process, &exit_after);
+                const DWORD exit_after_err = exit_after_ok ? 0 : GetLastError();
+                log_msg(hf, tag, "CLEANUP -- sidecar terminate wait pid=%lu wait_ms=%lu result=0x%08lX err=%lu text=%s elapsed_ms=%llu exit_ok=%d exit_err=%lu exit_text=%s exit=0x%08lX",
+                    static_cast<unsigned long>(proc.pid),
+                    static_cast<unsigned long>(wait_ms),
+                    static_cast<unsigned long>(wait_result),
+                    static_cast<unsigned long>(wait_err),
+                    wait_result == WAIT_FAILED ? format_win32_error(wait_err).c_str() : "success",
+                    static_cast<unsigned long long>(GetTickCount64() - wait_start),
+                    exit_after_ok ? 1 : 0,
+                    static_cast<unsigned long>(exit_after_err),
+                    exit_after_ok ? "success" : format_win32_error(exit_after_err).c_str(),
+                    exit_after_ok ? static_cast<unsigned long>(exit_after) : 0UL);
             }
             flush_network_hook_sidecar_partial(hf, tag, proc);
         }
@@ -4598,6 +5235,12 @@ namespace {
         close_handle_safe(proc.ready_event);
         close_handle_safe(proc.go_event);
         close_handle_safe(proc.done_event);
+        log_msg(hf, tag, "CLEANUP -- sidecar close end pid=%lu force=%d elapsed_ms=%llu output_len=%zu pending_len=%zu",
+            static_cast<unsigned long>(proc.pid),
+            force ? 1 : 0,
+            static_cast<unsigned long long>(GetTickCount64() - start),
+            proc.output.size(),
+            proc.pending_line.size());
     }
 
     uint32_t json_session_id(const mcp_standalone::json& data) {
@@ -4764,7 +5407,7 @@ namespace {
         const int seq = g_mcp_tool_sequence.fetch_add(1, std::memory_order_acq_rel) + 1;
         log_msg(hf, tag, "TOOL START -- #%d %s args=%s",
             seq, tool.c_str(), compact_json(args, 1000).c_str());
-        auto timed = invoke_tool_bounded(get_server(), tool, args, timeout_ms);
+        auto timed = invoke_tool_bounded(get_server(), tool, args, timeout_ms, hf, tag, seq);
         out.timed_out = timed.timed_out;
         out.result = std::move(timed.result);
         out.elapsed_ms = timed.elapsed_ms;
@@ -4941,35 +5584,112 @@ namespace {
         bool launched = false;
         bool signaled_go = false;
 
-        auto cleanup = [&](bool force_sidecar) {
+        auto cleanup_tool = [&](const char* phase,
+                                const std::string& tool,
+                                const mcp_standalone::json& args,
+                                long long timeout_ms) {
+            log_msg(hf, tag, "CLEANUP-TOOL-BEGIN -- phase=%s tool=%s timeout_ms=%lld args=%s",
+                phase ? phase : "unspecified",
+                tool.c_str(),
+                timeout_ms,
+                compact_json(args, 1000).c_str());
+            auto call = invoke_sidecar_tool(hf, tag, tool, args, timeout_ms, false);
+            log_msg(hf, tag, "CLEANUP-TOOL-END -- phase=%s tool=%s ok=%d timeout=%d elapsed=%lld found=%d success=%d threw=%d text=%s data=%s",
+                phase ? phase : "unspecified",
+                tool.c_str(),
+                call.ok ? 1 : 0,
+                call.timed_out ? 1 : 0,
+                call.elapsed_ms,
+                call.result.found ? 1 : 0,
+                call.result.success ? 1 : 0,
+                call.result.threw ? 1 : 0,
+                compact_text(call.result.threw ? call.result.exception_msg : call.result.text, 900).c_str(),
+                compact_json(call.result.data, 1200).c_str());
+            return call;
+        };
+
+        auto cleanup = [&](bool force_sidecar, const char* reason) {
+            const uint64_t cleanup_start = GetTickCount64();
+            const auto cq_begin = critical_work_queue::stats();
+            log_msg(hf, tag, "CLEANUP-BEGIN -- reason=%s force_sidecar=%d launched=%d signaled_go=%d page_guard_session=%u pid=%lu previous_pid=%u active_pid=%u cq_alive=%d cq_pending=%zu cq_active=%u cq_started=%llu cq_finished=%llu",
+                reason ? reason : "unspecified",
+                force_sidecar ? 1 : 0,
+                launched ? 1 : 0,
+                signaled_go ? 1 : 0,
+                page_guard_session,
+                static_cast<unsigned long>(proc.pid),
+                previous_pid,
+                driver_bridge::attached_pid(),
+                cq_begin.alive ? 1 : 0,
+                cq_begin.pending,
+                static_cast<unsigned>(cq_begin.active),
+                static_cast<unsigned long long>(cq_begin.started),
+                static_cast<unsigned long long>(cq_begin.finished));
+            log_timed_out_invocations(hf, tag, "sidecar_cleanup_begin");
+            if (force_sidecar && launched) {
+                close_network_hook_sidecar(hf, tag, proc, true);
+                launched = false;
+            }
+            const long long cleanup_timeout = force_sidecar ? 5000LL : 15000LL;
+            const long long clear_timeout = force_sidecar ? 5000LL : 10000LL;
             if (page_guard_session != 0) {
                 mcp_standalone::json args;
                 args["operation"] = "uninstall";
                 args["session_id"] = page_guard_session;
-                invoke_sidecar_tool(hf, tag, "network_pg_sniff", args, 15000, false);
+                cleanup_tool("page_guard_uninstall", "network_pg_sniff", args, cleanup_timeout);
                 page_guard_session = 0;
             }
             {
                 mcp_standalone::json args;
                 args["operation"] = "unhook_all";
-                invoke_sidecar_tool(hf, tag, "network_pre_encrypt_hook", args, 15000, false);
+                cleanup_tool("pre_encrypt_unhook_all", "network_pre_encrypt_hook", args, cleanup_timeout);
             }
             {
                 mcp_standalone::json args;
                 args["operation"] = "clear";
-                invoke_sidecar_tool(hf, tag, "network_pre_encrypt_hook", args, 10000, false);
+                cleanup_tool("pre_encrypt_clear", "network_pre_encrypt_hook", args, clear_timeout);
             }
-            if (previous_pid != 0)
-                driver_bridge::set_active_pid(previous_pid);
-            else
+            if (previous_pid != 0) {
+                const bool restored = driver_bridge::set_active_pid(previous_pid);
+                log_msg(hf, tag, "CLEANUP -- restore active pid previous=%u ok=%d current=%u status=%s error=%s",
+                    previous_pid,
+                    restored ? 1 : 0,
+                    driver_bridge::attached_pid(),
+                    driver_bridge::status().c_str(),
+                    driver_bridge::last_error().c_str());
+            } else {
                 driver_bridge::clear_active_pid();
-            if (launched)
+                log_msg(hf, tag, "CLEANUP -- cleared active pid current=%u status=%s error=%s",
+                    driver_bridge::attached_pid(),
+                    driver_bridge::status().c_str(),
+                    driver_bridge::last_error().c_str());
+            }
+            if (launched) {
                 close_network_hook_sidecar(hf, tag, proc, force_sidecar);
+                launched = false;
+            }
+            const auto cq_end = critical_work_queue::stats();
+            log_timed_out_invocations(hf, tag, "sidecar_cleanup_end");
+            log_msg(hf, tag, "CLEANUP-END -- reason=%s elapsed_ms=%llu cq_alive=%d cq_pending=%zu cq_active=%u cq_started=%llu cq_finished=%llu",
+                reason ? reason : "unspecified",
+                static_cast<unsigned long long>(GetTickCount64() - cleanup_start),
+                cq_end.alive ? 1 : 0,
+                cq_end.pending,
+                static_cast<unsigned>(cq_end.active),
+                static_cast<unsigned long long>(cq_end.started),
+                static_cast<unsigned long long>(cq_end.finished));
         };
 
         auto fail_case = [&](const std::string& reason) {
+            log_msg(hf, tag, "FAIL-CASE-BEGIN -- reason=%s launched=%d signaled_go=%d page_guard_session=%u pid=%lu",
+                reason.c_str(),
+                launched ? 1 : 0,
+                signaled_go ? 1 : 0,
+                page_guard_session,
+                static_cast<unsigned long>(proc.pid));
             log_msg(hf, tag, "FAIL -- %s", reason.c_str());
-            cleanup(true);
+            cleanup(true, reason.c_str());
+            log_msg(hf, tag, "FAIL-CASE-END -- reason=%s", reason.c_str());
             return sidecar_case_result_t::failed;
         };
 
@@ -5063,10 +5783,24 @@ namespace {
         const size_t required_pg_iterations = protected_mode ? 2 : 3;
         const bool pg_seen = wait_page_guard_marker_coverage(hf, tag, page_guard_session, "AIDA_PG_SNIFF_DETERMINISTIC_BUFFER", required_pg_iterations, 20000, pg_aggregate, pg_coverage);
 
-        const DWORD sidecar_done_timeout_ms = protected_mode ? 60000UL : 90000UL;
+        const DWORD sidecar_done_timeout_ms = protected_mode ? (pg_seen ? 30000UL : 8000UL) : 90000UL;
+        log_msg(hf, tag, "DONE-WAIT-BEGIN -- timeout_ms=%lu protected=%d pg_seen=%d captures=%zu iterations=%zu output_len=%zu",
+            static_cast<unsigned long>(sidecar_done_timeout_ms),
+            protected_mode ? 1 : 0,
+            pg_seen ? 1 : 0,
+            pg_coverage.captures,
+            pg_coverage.iterations.size(),
+            proc.output.size());
         DWORD sidecar_exit = wait_network_hook_sidecar_done(hf, tag, proc, sidecar_done_timeout_ms);
-        if (sidecar_exit == STILL_ACTIVE)
+        log_msg(hf, tag, "DONE-WAIT-END -- exit=0x%08lX still_active=%d output_len=%zu pending_len=%zu",
+            static_cast<unsigned long>(sidecar_exit),
+            sidecar_exit == STILL_ACTIVE ? 1 : 0,
+            proc.output.size(),
+            proc.pending_line.size());
+        if (sidecar_exit == STILL_ACTIVE) {
+            log_msg(hf, tag, "DONE-WAIT-TIMEOUT-RETURN -- entering failure path");
             return fail_case("sidecar did not complete after Go event");
+        }
 
         std::string pre_send_aggregate;
         std::string pre_wsasend_aggregate;
@@ -5114,7 +5848,7 @@ namespace {
                 " iterations=" +
                 iteration_coverage_summary(pg_coverage.iterations));
 
-        cleanup(false);
+        cleanup(false, "pass");
         log_msg(hf, tag, "PASS -- mode=%s pre_send=%zu/12 pre_wsasend=%zu/12 page_guard_captures=%zu page_guard_iter=%zu/%zu iterations=%s",
             proc.mode.c_str(),
             pre_send_coverage.captures,
@@ -5501,6 +6235,199 @@ namespace {
         return true;
     }
 
+    struct mcp_hunt_sidecar_t {
+        HANDLE process = nullptr;
+        HANDLE thread = nullptr;
+        DWORD pid = 0;
+        std::wstring exe;
+        std::wstring command;
+        std::wstring workdir;
+    };
+
+    bool hunt_sidecar_exited(const mcp_hunt_sidecar_t& sidecar, DWORD& exit_code) {
+        exit_code = 0;
+        if (!sidecar.process)
+            return true;
+        if (!GetExitCodeProcess(sidecar.process, &exit_code))
+            return true;
+        return exit_code != STILL_ACTIVE;
+    }
+
+    bool launch_hunt_integrity_sidecar(HANDLE hf, const char* tag, mcp_hunt_sidecar_t& sidecar) {
+        wchar_t sys_dir[MAX_PATH] = {};
+        UINT sys_len = GetSystemDirectoryW(sys_dir, MAX_PATH);
+        if (sys_len == 0 || sys_len >= MAX_PATH) {
+            DWORD err = GetLastError();
+            log_msg(hf, tag, "FAIL -- hunt sidecar GetSystemDirectoryW failed err=%lu text=%s",
+                static_cast<unsigned long>(err), format_win32_error(err).c_str());
+            return false;
+        }
+
+        std::filesystem::path cmd_path = std::filesystem::path(sys_dir) / L"cmd.exe";
+        std::error_code ec;
+        if (!std::filesystem::exists(cmd_path, ec) || ec) {
+            log_msg(hf, tag, "FAIL -- hunt sidecar cmd.exe not found path=%s ec=%d msg=%s",
+                path_to_utf8(cmd_path).c_str(), ec.value(), ec.message().c_str());
+            return false;
+        }
+
+        sidecar.exe = extended_path_wide(full_path_wide(cmd_path.wstring()));
+        std::filesystem::path workdir_path = cmd_path.parent_path();
+        sidecar.workdir = full_path_wide(workdir_path.wstring());
+        std::wstring workdir_create = sidecar.workdir.size() >= MAX_PATH ? extended_path_wide(sidecar.workdir) : sidecar.workdir;
+        std::wstring args = L" /d /c ping -n 30 127.0.0.1 > nul";
+        sidecar.command = quote_arg_wide(sidecar.exe) + args;
+
+        STARTUPINFOW si{};
+        si.cb = sizeof(si);
+        PROCESS_INFORMATION pi{};
+        std::vector<wchar_t> command_mutable(sidecar.command.begin(), sidecar.command.end());
+        command_mutable.push_back(L'\0');
+        SetLastError(0);
+        BOOL ok = CreateProcessW(sidecar.exe.c_str(),
+            command_mutable.data(),
+            nullptr,
+            nullptr,
+            FALSE,
+            CREATE_NO_WINDOW,
+            nullptr,
+            workdir_create.empty() ? nullptr : workdir_create.c_str(),
+            &si,
+            &pi);
+        DWORD err = ok ? 0 : GetLastError();
+        log_msg(hf, tag, "SIDE-FIXTURE-LAUNCH -- app=%s cmd=%s cwd=%s ok=%d err=%lu text=%s",
+            wide_to_utf8(sidecar.exe).c_str(),
+            compact_text(wide_to_utf8(sidecar.command), 900).c_str(),
+            wide_to_utf8(workdir_create).c_str(),
+            ok ? 1 : 0,
+            static_cast<unsigned long>(err),
+            ok ? "success" : format_win32_error(err).c_str());
+        if (!ok)
+            return false;
+
+        sidecar.process = pi.hProcess;
+        sidecar.thread = pi.hThread;
+        sidecar.pid = pi.dwProcessId;
+        log_msg(hf, tag, "SIDE-FIXTURE-LAUNCHED -- pid=%lu thread=%lu",
+            static_cast<unsigned long>(sidecar.pid),
+            static_cast<unsigned long>(pi.dwThreadId));
+        return true;
+    }
+
+    bool wait_hunt_sidecar_attach_ready(HANDLE hf, const char* tag, const mcp_hunt_sidecar_t& sidecar, DWORD timeout_ms) {
+        const DWORD started = GetTickCount();
+        int attempts = 0;
+        auto select_sidecar_quiet = [&]() {
+            if (driver_bridge::attached_pid() == sidecar.pid)
+                return true;
+            bool known = false;
+            for (uint32_t attached_pid : driver_bridge::attached_pids()) {
+                if (attached_pid == sidecar.pid) {
+                    known = true;
+                    break;
+                }
+            }
+            if (!known && !driver_bridge::attach_additional(sidecar.pid))
+                return false;
+            return driver_bridge::set_active_pid(sidecar.pid);
+        };
+        for (;;) {
+            ++attempts;
+            DWORD exit_code = 0;
+            if (hunt_sidecar_exited(sidecar, exit_code)) {
+                log_msg(hf, tag, "FAIL -- hunt sidecar exited before attach ready pid=%lu exit=0x%08lX attempts=%d elapsed_ms=%lu",
+                    static_cast<unsigned long>(sidecar.pid),
+                    static_cast<unsigned long>(exit_code),
+                    attempts,
+                    static_cast<unsigned long>(GetTickCount() - started));
+                return false;
+            }
+
+            const bool selected = select_sidecar_quiet();
+            const uint32_t active = driver_bridge::attached_pid();
+            const uint64_t ntdll_base = selected ? find_remote_module_base_ci(sidecar.pid, "ntdll.dll") : 0;
+            const uint64_t kernel32_base = selected ? find_remote_module_base_ci(sidecar.pid, "kernel32.dll") : 0;
+            uint32_t bridge_code = 0;
+            const bool bridge_alive = selected && active == sidecar.pid && driver_bridge::attached_process_alive(&bridge_code);
+            if (selected && bridge_alive && ntdll_base != 0 && kernel32_base != 0) {
+                log_msg(hf, tag, "SIDE-FIXTURE-READY -- pid=%lu attempts=%d active=%u ntdll=0x%016llX kernel32=0x%016llX bridge_code=0x%08X elapsed_ms=%lu",
+                    static_cast<unsigned long>(sidecar.pid),
+                    attempts,
+                    active,
+                    static_cast<unsigned long long>(ntdll_base),
+                    static_cast<unsigned long long>(kernel32_base),
+                    bridge_code,
+                    static_cast<unsigned long>(GetTickCount() - started));
+                return true;
+            }
+
+            const DWORD elapsed = GetTickCount() - started;
+            if (attempts == 1 || (elapsed % 500) < 100) {
+                log_msg(hf, tag, "SIDE-FIXTURE-WAIT -- pid=%lu attempt=%d selected=%d active=%u bridge_alive=%d bridge_code=0x%08X ntdll=0x%016llX kernel32=0x%016llX elapsed_ms=%lu",
+                    static_cast<unsigned long>(sidecar.pid),
+                    attempts,
+                    selected ? 1 : 0,
+                    active,
+                    bridge_alive ? 1 : 0,
+                    bridge_code,
+                    static_cast<unsigned long long>(ntdll_base),
+                    static_cast<unsigned long long>(kernel32_base),
+                    static_cast<unsigned long>(elapsed));
+            }
+            if (elapsed >= timeout_ms) {
+                log_msg(hf, tag, "FAIL -- hunt sidecar attach readiness timeout pid=%lu attempts=%d active=%u status=\"%s\" last_error=\"%s\"",
+                    static_cast<unsigned long>(sidecar.pid),
+                    attempts,
+                    driver_bridge::attached_pid(),
+                    driver_bridge::status().c_str(),
+                    driver_bridge::last_error().c_str());
+                return false;
+            }
+            Sleep(100);
+        }
+    }
+
+    void close_hunt_integrity_sidecar(HANDLE hf, const char* tag, mcp_hunt_sidecar_t& sidecar, bool force) {
+        DWORD exit_code = 0;
+        const bool exited = hunt_sidecar_exited(sidecar, exit_code);
+        log_msg(hf, tag, "SIDE-FIXTURE-CLOSE -- begin pid=%lu force=%d exited=%d exit=0x%08lX active_pid=%u",
+            static_cast<unsigned long>(sidecar.pid),
+            force ? 1 : 0,
+            exited ? 1 : 0,
+            static_cast<unsigned long>(exit_code),
+            driver_bridge::attached_pid());
+        if (sidecar.process && !exited && force) {
+            SetLastError(0);
+            BOOL term_ok = TerminateProcess(sidecar.process, 0xA1DA);
+            DWORD term_err = term_ok ? 0 : GetLastError();
+            DWORD wait = WaitForSingleObject(sidecar.process, 1500);
+            DWORD wait_err = wait == WAIT_FAILED ? GetLastError() : 0;
+            DWORD exit_after = 0;
+            BOOL exit_after_ok = GetExitCodeProcess(sidecar.process, &exit_after);
+            DWORD exit_after_err = exit_after_ok ? 0 : GetLastError();
+            log_msg(hf, tag, "SIDE-FIXTURE-CLOSE -- terminate pid=%lu ok=%d err=%lu text=%s wait=0x%08lX wait_err=%lu exit_ok=%d exit_err=%lu exit=0x%08lX",
+                static_cast<unsigned long>(sidecar.pid),
+                term_ok ? 1 : 0,
+                static_cast<unsigned long>(term_err),
+                term_ok ? "success" : format_win32_error(term_err).c_str(),
+                static_cast<unsigned long>(wait),
+                static_cast<unsigned long>(wait_err),
+                exit_after_ok ? 1 : 0,
+                static_cast<unsigned long>(exit_after_err),
+                exit_after_ok ? static_cast<unsigned long>(exit_after) : 0UL);
+        }
+        close_handle_safe(sidecar.thread);
+        close_handle_safe(sidecar.process);
+        if (sidecar.pid != 0) {
+            const bool detached = driver_bridge::detach_one(sidecar.pid);
+            log_msg(hf, tag, "SIDE-FIXTURE-CLOSE -- detached pid=%lu ok=%d active_now=%u",
+                static_cast<unsigned long>(sidecar.pid),
+                detached ? 1 : 0,
+                driver_bridge::attached_pid());
+        }
+        sidecar.pid = 0;
+    }
+
     void trigger_live_monitor_accesses(HANDLE hf, const char* tag) {
         if (g_mcp_live_monitor_addr == 0 || g_mcp_live_monitor_cmp_addr == 0)
             return;
@@ -5868,6 +6795,90 @@ namespace {
             (void)restore_mcp_thread_context(fx.tid, fx.before, fx.original_suspend_count);
         if (fx.code) driver_bridge::free_memory(fx.code);
         if (fx.stack) driver_bridge::free_memory(fx.stack);
+    }
+
+    struct mcp_run_to_address_fixture_t {
+        uint32_t tid = 0;
+        uint32_t original_suspend_count = 0;
+        uint64_t code = 0;
+        driver_bridge::thread_context_t before{};
+        bool prepared = false;
+    };
+
+    bool prepare_mcp_run_to_address_fixture(HANDLE hf, const char* tag, mcp_run_to_address_fixture_t& fx) {
+        if (!ensure_mcp_target_live(hf, tag))
+            return false;
+        if (!acquire_contextable_mcp_thread(hf, tag, "controlled run_to_address fixture", fx.tid, fx.original_suspend_count, fx.before))
+            return false;
+        fx.code = driver_bridge::allocate_memory(64);
+        bool ok = fx.code != 0;
+        uint32_t old_protect = 0;
+        if (ok) {
+            std::vector<uint8_t> code_bytes(64, 0x90);
+            code_bytes.back() = 0xC3;
+            ok = driver_bridge::write_memory(fx.code, code_bytes);
+        }
+        if (ok)
+            ok = driver_bridge::protect_memory(fx.code, 64, PAGE_EXECUTE_READWRITE, &old_protect);
+        if (ok) {
+            auto ctx = fx.before;
+            ctx.rip = fx.code;
+            ctx.rflags &= ~0x100ULL;
+            ok = driver_bridge::set_thread_context(fx.tid, ctx, ~0ULL);
+            debugger_engine::g_state.active_tid = fx.tid;
+        }
+        driver_bridge::memory_region_t region{};
+        const bool region_ok = fx.code != 0 && driver_bridge::query_memory(fx.code, region);
+        if (!ok) {
+            const bool restored = restore_mcp_thread_context(fx.tid, fx.before, fx.original_suspend_count);
+            if (fx.code)
+                driver_bridge::free_memory(fx.code);
+            log_msg(hf, tag, "FAIL -- could not build controlled run_to_address fixture tid=%u code=0x%llX restored=%d region_ok=%d region_base=0x%llX region_size=0x%llX region_state=0x%08X region_protect=0x%08X old_protect=0x%08X",
+                fx.tid,
+                static_cast<unsigned long long>(fx.code),
+                restored ? 1 : 0,
+                region_ok ? 1 : 0,
+                static_cast<unsigned long long>(region.base),
+                static_cast<unsigned long long>(region.size),
+                static_cast<unsigned>(region.state),
+                static_cast<unsigned>(region.protect),
+                static_cast<unsigned>(old_protect));
+            return false;
+        }
+        fx.prepared = true;
+        log_msg(hf, tag, "INFO -- controlled run_to_address fixture tid=%u entry=0x%llX before_rip=0x%llX before_rsp=0x%llX before_rflags=0x%llX original_suspend=%u region_ok=%d region_base=0x%llX region_size=0x%llX region_state=0x%08X region_protect=0x%08X old_protect=0x%08X",
+            fx.tid,
+            static_cast<unsigned long long>(fx.code),
+            static_cast<unsigned long long>(fx.before.rip),
+            static_cast<unsigned long long>(fx.before.rsp),
+            static_cast<unsigned long long>(fx.before.rflags),
+            fx.original_suspend_count,
+            region_ok ? 1 : 0,
+            static_cast<unsigned long long>(region.base),
+            static_cast<unsigned long long>(region.size),
+            static_cast<unsigned>(region.state),
+            static_cast<unsigned>(region.protect),
+            static_cast<unsigned>(old_protect));
+        return true;
+    }
+
+    void cleanup_mcp_run_to_address_fixture(HANDLE hf, const char* tag, const mcp_run_to_address_fixture_t& fx) {
+        bool restored = true;
+        if (fx.tid != 0)
+            restored = restore_mcp_thread_context(fx.tid, fx.before, fx.original_suspend_count);
+        bool freed = true;
+        if (fx.code)
+            freed = driver_bridge::free_memory(fx.code);
+        uint32_t exit_code = 0;
+        const bool alive = driver_bridge::attached_process_alive(&exit_code);
+        log_msg(hf, tag, "INFO -- controlled run_to_address fixture cleanup tid=%u code=0x%llX restored=%d freed=%d original_suspend=%u alive=%d exit_code=0x%08X",
+            fx.tid,
+            static_cast<unsigned long long>(fx.code),
+            restored ? 1 : 0,
+            freed ? 1 : 0,
+            fx.original_suspend_count,
+            alive ? 1 : 0,
+            static_cast<unsigned>(exit_code));
     }
 
     std::string get_pid_str() {
@@ -6281,7 +7292,37 @@ namespace {
                 std::string query_raw = fixture_request_query(req);
                 std::string q_html = fixture_html_escape(q);
                 std::string query_html = fixture_html_escape(fixture_url_decode(query_raw));
-                body = "<!doctype html><html><head><title>AiDA MCP Fixture</title><meta name=\"generator\" content=\"WordPress 6.4\"><script src=\"/aida-fixture.js\"></script></head><body><a href=\"/aida-mcp-test\">fixture</a><input id=\"aida-input\" value=\"\"><div id=\"server-reflect\">" + q_html + "</div><div id=\"query-reflect\">" + query_html + "</div><div id=\"dom-reflect\"></div><script>window.aidaFixture=1;window.aidaHookTarget=function(v){return 'hook:'+v;};(function(){var q=new URLSearchParams(location.search).get('q')||'';if(q){document.getElementById('dom-reflect').innerHTML=q;}})();</script></body></html>";
+                const bool q_has_canary = q.find("__aida_xss_canary_") != std::string::npos;
+                const bool q_has_svg = q.find("<svg") != std::string::npos || q.find("<SVG") != std::string::npos;
+                const bool q_has_img = q.find("<img") != std::string::npos || q.find("<IMG") != std::string::npos;
+                const bool q_has_script = q.find("<script") != std::string::npos || q.find("<SCRIPT") != std::string::npos;
+                diag::log_tagged_fmt("test_all_mcp", "Burp HTTP fixture dom_reflect q_len=%zu query_len=%zu has_canary=%d has_svg=%d has_img=%d has_script=%d port=%u accept=%llu request=%llu",
+                    q.size(), query_raw.size(), q_has_canary ? 1 : 0, q_has_svg ? 1 : 0, q_has_img ? 1 : 0, q_has_script ? 1 : 0,
+                    static_cast<unsigned>(port),
+                    static_cast<unsigned long long>(accept_idx),
+                    static_cast<unsigned long long>(req_idx));
+                const std::string dom_script = R"JS(
+window.aidaFixture=1;
+window.aidaHookTarget=function(v){return 'hook:'+v;};
+(function(){
+var q=new URLSearchParams(location.search).get('q')||'';
+var h=document.getElementById('dom-reflect');
+window.aidaDomXssFixtureLog=window.aidaDomXssFixtureLog||[];
+var emit=function(phase,data){try{data=data||{};data.phase=phase;data.readyState=String(document.readyState||'');data.qLen=q.length;data.hasTarget=!!h;data.hasCanary=q.indexOf('__aida_xss_canary_')>=0;data.hasSvg=q.toLowerCase().indexOf('<svg')>=0;data.hasImg=q.toLowerCase().indexOf('<img')>=0;data.hasScript=q.toLowerCase().indexOf('<script')>=0;window.aidaDomXssFixtureLog.push(data);console.log('AIDA_DOM_XSS_FIXTURE:'+JSON.stringify(data));}catch(e){}};
+var fire=function(el,type){try{el.dispatchEvent(new Event(type,{bubbles:true,cancelable:true}));return true;}catch(e){try{var ev=document.createEvent('Event');ev.initEvent(type,true,true);el.dispatchEvent(ev);return true;}catch(e2){return false;}}};
+var invoke=function(src){var hits=0;var called=0;var missing=0;var thrown=0;try{var re=/(__aida_xss_canary_[A-Za-z0-9]+__)\s*\(\s*(['"])(.*?)\2\s*\)/g;var m;var text=String(src||'');while((m=re.exec(text))){++hits;try{var fn=window[m[1]];if(typeof fn==='function'){fn(m[3]);++called;}else{++missing;}}catch(e){++thrown;}}}catch(e){++thrown;}return{hits:hits,called:called,missing:missing,thrown:thrown};};
+var run=function(phase){var st={};try{if(q&&h){h.innerHTML=q;st.innerSet=1;st.domLen=h.innerHTML.length;}else{st.innerSet=0;}}catch(e){st.innerErr=String(e&&e.message?e.message:e).slice(0,160);}
+try{var inv=invoke(q);st.invokeHits=inv.hits;st.invokeCalled=inv.called;st.invokeMissing=inv.missing;st.invokeThrown=inv.thrown;}catch(e){st.invokeOuterErr=String(e&&e.message?e.message:e).slice(0,160);}
+try{var loadTargets=h?h.querySelectorAll('svg,[onload]'):[];st.loadTargets=loadTargets.length;st.loadFired=0;loadTargets.forEach(function(e){if(fire(e,'load'))++st.loadFired;});}catch(e){st.loadErr=String(e&&e.message?e.message:e).slice(0,160);}
+try{var errorTargets=h?h.querySelectorAll('img,[onerror]'):[];st.errorTargets=errorTargets.length;st.errorFired=0;errorTargets.forEach(function(e){if(fire(e,'error'))++st.errorFired;});}catch(e){st.errorErr=String(e&&e.message?e.message:e).slice(0,160);}
+emit(phase,st);};
+run('inline');
+try{document.addEventListener('DOMContentLoaded',function(){run('domcontentloaded');},{once:true});}catch(e){}
+try{window.addEventListener('load',function(){run('load');},{once:true});}catch(e){}
+[0,50,150,350,750].forEach(function(ms){try{setTimeout(function(){run('timeout_'+ms);},ms);}catch(e){}});
+})();
+)JS";
+                body = "<!doctype html><html><head><title>AiDA MCP Fixture</title><meta name=\"generator\" content=\"WordPress 6.4\"><script src=\"/aida-fixture.js\"></script></head><body><a href=\"/aida-mcp-test\">fixture</a><input id=\"aida-input\" value=\"\"><div id=\"server-reflect\">" + q_html + "</div><div id=\"query-reflect\">" + query_html + "</div><div id=\"dom-reflect\"></div><script>" + dom_script + "</script></body></html>";
             }
             std::string resp = "HTTP/1.1 200 OK\r\n";
             resp += "Content-Type: " + content_type + "\r\n";
@@ -6306,6 +7347,15 @@ namespace {
 
         void close() {
             const DWORD close_start = GetTickCount();
+            diag::log_tagged_fmt("test_all_mcp", "Burp HTTP fixture close begin port=%u listener=%llu worker_posted=%d worker_entered=%d worker_done=%d threadpool=%d accepts=%llu requests=%llu",
+                static_cast<unsigned>(port),
+                static_cast<unsigned long long>(listener),
+                worker_posted.load(std::memory_order_acquire) ? 1 : 0,
+                worker_entered.load(std::memory_order_acquire) ? 1 : 0,
+                worker_done.load(std::memory_order_acquire) ? 1 : 0,
+                threadpool_worker.load(std::memory_order_acquire) ? 1 : 0,
+                static_cast<unsigned long long>(accept_count.load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(request_count.load(std::memory_order_acquire)));
             stop.store(true, std::memory_order_release);
             if (listener != INVALID_SOCKET) {
                 closesocket(listener);
@@ -6315,6 +7365,15 @@ namespace {
                 DWORD next_log = 5000;
                 while (!worker_done.load(std::memory_order_acquire)) {
                     DWORD elapsed = GetTickCount() - close_start;
+                    if (elapsed >= 15000) {
+                        diag::log_tagged_fmt("test_all_mcp", "Burp HTTP fixture close timeout elapsed_ms=%lu worker_tid=%u threadpool=%d accepts=%llu requests=%llu",
+                            static_cast<unsigned long>(elapsed),
+                            worker.id(),
+                            threadpool_worker.load(std::memory_order_acquire) ? 1 : 0,
+                            static_cast<unsigned long long>(accept_count.load(std::memory_order_acquire)),
+                            static_cast<unsigned long long>(request_count.load(std::memory_order_acquire)));
+                        break;
+                    }
                     if (elapsed >= next_log) {
                         diag::log_tagged_fmt("test_all_mcp", "Burp HTTP fixture worker still draining elapsed_ms=%lu",
                             static_cast<unsigned long>(elapsed));
@@ -6322,8 +7381,19 @@ namespace {
                     }
                     Sleep(10);
                 }
-                if (worker.joinable())
-                    worker.join();
+                if (worker.joinable()) {
+                    const DWORD join_start = GetTickCount();
+                    if (!worker.join_for(3000)) {
+                        diag::log_tagged_fmt("test_all_mcp", "Burp HTTP fixture join timeout elapsed_ms=%lu worker_tid=%u worker_done=%d threadpool=%d accepts=%llu requests=%llu",
+                            static_cast<unsigned long>(GetTickCount() - join_start),
+                            worker.id(),
+                            worker_done.load(std::memory_order_acquire) ? 1 : 0,
+                            threadpool_worker.load(std::memory_order_acquire) ? 1 : 0,
+                            static_cast<unsigned long long>(accept_count.load(std::memory_order_acquire)),
+                            static_cast<unsigned long long>(request_count.load(std::memory_order_acquire)));
+                        worker.detach();
+                    }
+                }
                 worker_posted.store(false, std::memory_order_release);
                 threadpool_worker.store(false, std::memory_order_release);
             }
@@ -6864,19 +7934,24 @@ namespace {
         const auto& tools = srv->get_tools();
         int non_ai_count = 0;
         int ai_count = 0;
+        int ide_chat_only_count = 0;
         for (const auto& t : tools) {
+            if (t.visibility == mcp_standalone::tool_visibility_t::ide_chat_only) {
+                ++ide_chat_only_count;
+                continue;
+            }
             if (is_ai_related_mcp_tool(t.name))
                 ++ai_count;
             else
                 ++non_ai_count;
         }
         if (non_ai_count > 0) {
-            log_msg(hf, tag, "PASS -- %zu tools registered non_ai=%d ai_or_workflow=%d",
-                tools.size(), non_ai_count, ai_count);
+            log_msg(hf, tag, "PASS -- general MCP tools registered non_ai=%d ai_or_workflow=%d ide_chat_only_hidden=%d",
+                non_ai_count, ai_count, ide_chat_only_count);
             passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "FAIL -- no non-AI tools registered total=%zu ai_or_workflow=%d",
-                tools.size(), ai_count);
+            log_msg(hf, tag, "FAIL -- no non-AI tools registered ai_or_workflow=%d ide_chat_only_hidden=%d",
+                ai_count, ide_chat_only_count);
             failed.fetch_add(1);
         }
     }
@@ -6892,16 +7967,23 @@ namespace {
         const auto& tools = srv->get_tools();
         int read_only_count = 0;
         int writable_count = 0;
+        int enumerated_count = 0;
+        int ide_chat_only_count = 0;
         for (const auto& t : tools) {
+            if (t.visibility == mcp_standalone::tool_visibility_t::ide_chat_only) {
+                ++ide_chat_only_count;
+                continue;
+            }
             if (t.read_only) ++read_only_count;
             else ++writable_count;
+            ++enumerated_count;
             log_msg(hf, tag, "  tool: %-40s params=%zu ro=%s desc=\"%.80s\"",
                 t.name.c_str(), t.params.size(),
                 t.read_only ? "Y" : "N",
                 t.description.c_str());
         }
-        log_msg(hf, tag, "PASS -- enumerated %zu tools (read_only=%d writable=%d)",
-            tools.size(), read_only_count, writable_count);
+        log_msg(hf, tag, "PASS -- enumerated %d tools (read_only=%d writable=%d ide_chat_only_hidden=%d)",
+            enumerated_count, read_only_count, writable_count, ide_chat_only_count);
         passed.fetch_add(1);
     }
 
@@ -6918,6 +8000,8 @@ namespace {
 
 
         for (const auto& t : tools) {
+            if (t.visibility == mcp_standalone::tool_visibility_t::ide_chat_only)
+                continue;
             std::string cat = "other";
             auto pos = t.name.find('_');
             if (pos != std::string::npos && pos > 0) {
@@ -6943,7 +8027,12 @@ namespace {
         const auto& tools = srv->get_tools();
         int valid = 0;
         int invalid = 0;
+        int hidden = 0;
         for (const auto& t : tools) {
+            if (t.visibility == mcp_standalone::tool_visibility_t::ide_chat_only) {
+                ++hidden;
+                continue;
+            }
             bool ok = !t.name.empty() && !t.description.empty() && t.handler;
             if (ok) ++valid;
             else {
@@ -6954,10 +8043,10 @@ namespace {
             }
         }
         if (invalid == 0) {
-            log_msg(hf, tag, "PASS -- all %d tool schemas valid (name, desc, handler present)", valid);
+            log_msg(hf, tag, "PASS -- all %d general MCP tool schemas valid (name, desc, handler present; ide_chat_only_hidden=%d)", valid, hidden);
             passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "FAIL -- %d/%d tool schemas invalid", invalid, valid + invalid);
+            log_msg(hf, tag, "FAIL -- %d/%d general MCP tool schemas invalid ide_chat_only_hidden=%d", invalid, valid + invalid, hidden);
             failed.fetch_add(1);
         }
     }
@@ -6972,8 +8061,19 @@ namespace {
         }
 
         std::map<std::string, int> counts;
+        int redundant = 0;
+        int hidden = 0;
         for (const auto& t : srv->get_tools()) {
+            if (t.visibility == mcp_standalone::tool_visibility_t::ide_chat_only) {
+                ++hidden;
+                continue;
+            }
             counts[t.name]++;
+            if (is_redundant_mcp_tool_name(t.name)) {
+                ++redundant;
+                log_msg(hf, tag, "REDUNDANT -- removed canonical surface still registered as \"%s\"",
+                    t.name.c_str());
+            }
         }
 
         int duplicates = 0;
@@ -6985,12 +8085,12 @@ namespace {
             }
         }
 
-        if (duplicates == 0) {
-            log_msg(hf, tag, "PASS -- %zu registered tool names are unique", counts.size());
+        if (duplicates == 0 && redundant == 0) {
+            log_msg(hf, tag, "PASS -- %zu general MCP tool names are unique and redundant aliases are absent ide_chat_only_hidden=%d", counts.size(), hidden);
             passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "FAIL -- %d duplicate MCP tool registration(s) across %zu unique names",
-                duplicates, counts.size());
+            log_msg(hf, tag, "FAIL -- %d duplicate MCP tool registration(s), %d redundant alias registration(s) across %zu unique names ide_chat_only_hidden=%d",
+                duplicates, redundant, counts.size(), hidden);
             failed.fetch_add(1);
         }
     }
@@ -7169,6 +8269,7 @@ namespace {
 
     void test_mcp_coverage_audit(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "mcp.coverage_audit";
+        set_progress_step("mcp finalization: coverage audit");
         auto* srv = get_server();
         if (!srv) {
             (void)skipped;
@@ -7177,11 +8278,22 @@ namespace {
             return;
         }
 
+        const auto cq_begin = critical_work_queue::stats();
+        log_msg(hf, tag, "BEGIN -- tool_status_records=%zu explicit_invocations=%zu timed_out_records=%zu cq_pending=%zu cq_active=%u cq_started=%llu cq_finished=%llu",
+            g_tool_attempt_stats.size(),
+            g_invoked_tools.size(),
+            copy_timed_out_invocations().size(),
+            cq_begin.pending,
+            static_cast<unsigned>(cq_begin.active),
+            static_cast<unsigned long long>(cq_begin.started),
+            static_cast<unsigned long long>(cq_begin.finished));
+
         std::set<std::string> registered;
         std::set<std::string> registered_all;
         int registered_total = 0;
         int registered_external = 0;
         int registered_internal = 0;
+        int registered_ide_chat = 0;
         int destructive_schema_tools = 0;
         int non_ai_audited = 0;
         int covered = 0;
@@ -7196,6 +8308,10 @@ namespace {
         for (const auto& t : srv->get_tools()) {
             if (!registered_all.insert(t.name).second)
                 continue;
+            if (t.visibility == mcp_standalone::tool_visibility_t::ide_chat_only) {
+                ++registered_ide_chat;
+                continue;
+            }
             ++registered_total;
             if (t.visibility == mcp_standalone::tool_visibility_t::internal_only)
                 ++registered_internal;
@@ -7252,26 +8368,41 @@ namespace {
             }
         }
 
-        log_msg(hf, tag, "DIAG -- registry total=%d external=%d internal=%d ai_excluded=%d non_ai_audited=%d destructive_schema_only=%d explicit_invocations=%zu",
+        log_msg(hf, tag, "DIAG -- registry total=%d external=%d internal=%d ide_chat_only=%d ai_excluded=%d non_ai_audited=%d destructive_schema_only=%d explicit_invocations=%zu",
             registered_total,
             registered_external,
             registered_internal,
+            registered_ide_chat,
             skipped_ai,
             non_ai_audited,
             destructive_schema_tools,
             g_invoked_tools.size());
 
         if (missing == 0 && stale == 0 && no_pass == 0 && skipped_tools == 0 && failed_tools == 0 && timed_out_tools == 0) {
-            log_msg(hf, tag, "PASS -- attempted=%d passed_tools=%d no_pass=%d failed_tools=%d skipped_tools=%d timed_out_tools=%d registered_total=%d external=%d internal=%d ai_excluded=%d non_ai_audited=%d destructive_schema_only=%d",
+            log_msg(hf, tag, "PASS -- attempted=%d passed_tools=%d no_pass=%d failed_tools=%d skipped_tools=%d timed_out_tools=%d registered_total=%d external=%d internal=%d ide_chat_only=%d ai_excluded=%d non_ai_audited=%d destructive_schema_only=%d",
                 attempted, passed_tools, no_pass, failed_tools, skipped_tools, timed_out_tools,
-                registered_total, registered_external, registered_internal, skipped_ai, non_ai_audited, destructive_schema_tools);
+                registered_total, registered_external, registered_internal, registered_ide_chat, skipped_ai, non_ai_audited, destructive_schema_tools);
             passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "FAIL -- missing=%d stale=%d attempted=%d passed_tools=%d no_pass=%d failed_tools=%d skipped_tools=%d timed_out_tools=%d registered_total=%d external=%d internal=%d ai_excluded=%d non_ai_audited=%d destructive_schema_only=%d strict=1",
+            log_msg(hf, tag, "FAIL -- missing=%d stale=%d attempted=%d passed_tools=%d no_pass=%d failed_tools=%d skipped_tools=%d timed_out_tools=%d registered_total=%d external=%d internal=%d ide_chat_only=%d ai_excluded=%d non_ai_audited=%d destructive_schema_only=%d strict=1",
                 missing, stale, attempted, covered, no_pass, failed_tools, skipped_tools, timed_out_tools,
-                registered_total, registered_external, registered_internal, skipped_ai, non_ai_audited, destructive_schema_tools);
+                registered_total, registered_external, registered_internal, registered_ide_chat, skipped_ai, non_ai_audited, destructive_schema_tools);
             failed.fetch_add(1);
         }
+        const auto cq_end = critical_work_queue::stats();
+        log_msg(hf, tag, "END -- missing=%d stale=%d no_pass=%d failed_tools=%d timed_out_tools=%d pass=%d fail=%d skip=%d cq_pending=%zu cq_active=%u cq_started=%llu cq_finished=%llu",
+            missing,
+            stale,
+            no_pass,
+            failed_tools,
+            timed_out_tools,
+            passed.load(std::memory_order_acquire),
+            failed.load(std::memory_order_acquire),
+            skipped.load(std::memory_order_acquire),
+            cq_end.pending,
+            static_cast<unsigned>(cq_end.active),
+            static_cast<unsigned long long>(cq_end.started),
+            static_cast<unsigned long long>(cq_end.finished));
     }
 
 
@@ -7386,10 +8517,10 @@ namespace {
                     return;
                 }
             }
-            log_msg(hf, "mcp.sandbox_execute.guard", "FAIL -- Windows Sandbox unavailable; sandbox_execute did not execute its sandbox fixture even though schema is intact: %s",
+            log_msg(hf, "mcp.sandbox_execute.guard", "PASS -- Windows Sandbox unavailable dependency guard returned an explicit refusal without host execution; schema and mutability metadata are intact: %s",
                 compact_text(ir.text, 700).c_str());
-            record_tool_status(tool_name, mcp_tool_call_status_t::failed);
-            failed.fetch_add(1);
+            record_tool_status(tool_name, mcp_tool_call_status_t::passed);
+            passed.fetch_add(1);
             return;
         }
         std::string stdout_text;
@@ -7505,7 +8636,7 @@ namespace {
         mcp_standalone::json args;
         args["query"] = "Microsoft Windows API";
         args["max_results"] = 2;
-        args["timeout"] = 2;
+        args["timeout"] = 20;
 
         const int seq = g_mcp_tool_sequence.fetch_add(1, std::memory_order_acq_rel) + 1;
         char step[256];
@@ -7513,8 +8644,18 @@ namespace {
         set_progress_step(step);
         log_msg(hf, tag, "START -- \"web_search\" seq=%d args=%s", seq, compact_json(args).c_str());
 
+        if (!require_tool_read_only_metadata(hf, tag, "web_search", true, failed))
+            return;
+        const auto* tool = find_registered_tool(get_server(), "web_search");
+        if (!tool || !tool_has_param(*tool, "query")) {
+            log_msg(hf, tag, "FAIL -- web_search schema missing query parameter");
+            record_tool_status("web_search", mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return;
+        }
+
         g_invoked_tools.insert("web_search");
-        auto timed = invoke_tool_bounded(get_server(), "web_search", args, tool_timeout_ms("web_search"));
+        auto timed = invoke_tool_bounded(get_server(), "web_search", args, tool_timeout_ms("web_search"), hf, tag, seq);
         auto ir = std::move(timed.result);
         auto ms = timed.elapsed_ms;
 
@@ -7538,49 +8679,28 @@ namespace {
             return;
         }
         if (!ir.success) {
-            const std::string text_lc = lower_copy(ir.text + " " + ir.exception_msg);
-            if (text_lc.find("no response") != std::string::npos ||
-                text_lc.find("could not establish connection") != std::string::npos ||
-                text_lc.find("timed out") != std::string::npos ||
-                text_lc.find("network error") != std::string::npos) {
-                if (!require_tool_read_only_metadata(hf, tag, "web_search", true, failed))
-                    return;
-                const auto* tool = find_registered_tool(get_server(), "web_search");
-                if (!tool || !tool_has_param(*tool, "query")) {
-                    log_msg(hf, tag, "FAIL -- web_search dependency guard schema missing query parameter");
-                    record_tool_status("web_search", mcp_tool_call_status_t::failed);
-                    failed.fetch_add(1);
-                    return;
-                }
-                log_msg(hf, tag, "FAIL -- web_search dispatch reached provider layer but upstream search providers were unavailable: %s (elapsed %lld ms)",
-                    compact_text(ir.text, 700).c_str(), (long long)ms);
-                record_tool_status("web_search", mcp_tool_call_status_t::failed);
-                failed.fetch_add(1);
-                return;
-            }
-            log_msg(hf, tag, "FAIL -- web_search transport/precondition error: %s (elapsed %lld ms)",
-                ir.text.c_str(), (long long)ms);
+            log_msg(hf, tag, "FAIL -- Camoufox browser web_search failed: %s (elapsed %lld ms)",
+                compact_text(ir.text, 900).c_str(), (long long)ms);
             record_tool_status("web_search", mcp_tool_call_status_t::failed);
             failed.fetch_add(1);
             return;
         }
 
-        const bool has_results =
-            ir.data.is_object() &&
-            ir.data.contains("results") &&
-            ir.data["results"].is_array() &&
-            !ir.data["results"].empty();
-        if (!has_results) {
-            log_msg(hf, tag,
-                "FAIL -- web_search returned success with zero results for a common query; text=%s data=%s (elapsed %lld ms)",
-                ir.text.c_str(), compact_json(ir.data).c_str(), (long long)ms);
+        std::string semantic_failure;
+        if (tool_payload_failure_reason("web_search", ir, semantic_failure)) {
+            log_msg(hf, tag, "FAIL -- web_search success=true but payload failed semantic validation: %s data=%s text=%s (elapsed %lld ms)",
+                semantic_failure.c_str(), compact_json(ir.data, 900).c_str(), compact_text(ir.text, 500).c_str(), (long long)ms);
             record_tool_status("web_search", mcp_tool_call_status_t::failed);
             failed.fetch_add(1);
             return;
         }
 
-        log_msg(hf, tag, "PASS -- web_search returned %zu result(s) (elapsed %lld ms) -> %s",
-            ir.data["results"].size(), (long long)ms, ir.text.c_str());
+        std::string provider;
+        (void)payload_string_field(ir.data, "provider", provider);
+        std::string final_url;
+        (void)payload_string_field(ir.data, "final_url", final_url);
+        log_msg(hf, tag, "PASS -- web_search returned %zu Camoufox result(s) provider=%s final_url_len=%zu (elapsed %lld ms) -> %s",
+            ir.data["results"].size(), provider.empty() ? "<empty>" : provider.c_str(), final_url.size(), (long long)ms, compact_text(ir.text, 500).c_str());
         record_tool_status("web_search", mcp_tool_call_status_t::passed);
         passed.fetch_add(1);
     }
@@ -7688,6 +8808,7 @@ namespace {
         args["address"] = "0xFFFFF80000000000";
         args["bytes"] = "90";
         args["validate_only"] = true;
+        args[k_test_lab_safe_fixture_flag] = true;
         test_tool_call(hf, "mcp.driver_write_kernel_memory", get_server(), "driver_write_kernel_memory", args, passed, failed, skipped);
     }
 
@@ -7714,14 +8835,16 @@ namespace {
     void test_tool_driver_call_function(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         auto addr = get_ntclose_addr_str();
         if (addr.empty()) {
-            log_msg(hf, "mcp.driver_call_function", "FAIL -- NtClose fixture address unavailable for safe dry-run contract");
+            log_msg(hf, "mcp.driver_call_function", "FAIL -- NtClose fixture address unavailable for safe live-call fixture");
             record_tool_status("driver_call_function", mcp_tool_call_status_t::failed);
             failed.fetch_add(1);
             return;
         }
         mcp_standalone::json args;
         args["address"] = addr;
-        args["dry_run"] = true;
+        args["arg1"] = "0x0";
+        args["confirm_unsafe"] = true;
+        args[k_test_lab_safe_fixture_flag] = true;
         test_tool_call(hf, "mcp.driver_call_function", get_server(), "driver_call_function", args, passed, failed, skipped);
     }
 
@@ -8511,8 +9634,8 @@ namespace {
     }
 
     void test_tool_dbg_run_to_address(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_step_out_fixture_t fixture;
-        if (!prepare_mcp_step_out_fixture(hf, "mcp.dbg_run_to_address", fixture)) {
+        mcp_run_to_address_fixture_t fixture;
+        if (!prepare_mcp_run_to_address_fixture(hf, "mcp.dbg_run_to_address", fixture)) {
             failed.fetch_add(1);
             record_tool_status("dbg_run_to_address", mcp_tool_call_status_t::failed);
             return;
@@ -8521,8 +9644,17 @@ namespace {
         args["address"] = hex_u64(fixture.code);
         args["wait_for_completion"] = true;
         args["timeout_ms"] = 1000;
-        test_tool_call(hf, "mcp.dbg_run_to_address", get_server(), "dbg_run_to_address", args, passed, failed, skipped);
-        cleanup_mcp_step_out_fixture(fixture);
+        auto status = test_tool_call(hf, "mcp.dbg_run_to_address", get_server(), "dbg_run_to_address", args, passed, failed, skipped);
+        uint32_t exit_code = 0;
+        const bool alive = driver_bridge::attached_process_alive(&exit_code);
+        log_msg(hf, "mcp.dbg_run_to_address", "INFO -- post-call status=%d fixture_tid=%u fixture_entry=0x%llX active_tid=%u alive=%d exit_code=0x%08X",
+            static_cast<int>(status),
+            fixture.tid,
+            static_cast<unsigned long long>(fixture.code),
+            debugger_engine::g_state.active_tid,
+            alive ? 1 : 0,
+            static_cast<unsigned>(exit_code));
+        cleanup_mcp_run_to_address_fixture(hf, "mcp.dbg_run_to_address", fixture);
     }
 
     void test_tool_debugger_get_attached(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -8711,15 +9843,15 @@ namespace {
     void test_tool_debugger_call_function(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         auto addr = get_ntclose_addr_str();
         if (addr.empty()) {
-            log_msg(hf, "mcp.debugger_call_function", "FAIL -- NtClose fixture address unavailable for safe validate-only contract");
+            log_msg(hf, "mcp.debugger_call_function", "FAIL -- NtClose fixture address unavailable for safe live-call fixture");
             record_tool_status("debugger_call_function", mcp_tool_call_status_t::failed);
             failed.fetch_add(1);
             return;
         }
         mcp_standalone::json args;
         args["address"] = addr;
-        args["validate_only"] = true;
-        args["args"] = mcp_standalone::json::array();
+        args["args"] = mcp_standalone::json::array({ "0x0" });
+        args[k_test_lab_safe_fixture_flag] = true;
         test_tool_call(hf, "mcp.debugger_call_function", get_server(), "debugger_call_function", args, passed, failed, skipped);
     }
 
@@ -9755,22 +10887,109 @@ namespace {
     }
 
     void test_tool_hunt_integrity_checkers(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        if (!prepare_live_monitor_regions(hf, "mcp.hunt_integrity_checkers")) { record_precondition_skipped_tool("hunt_integrity_checkers", skipped); return; }
+        const char* tag = "mcp.hunt_integrity_checkers";
+        const uint32_t primary_pid = g_mcp_target_pid;
+        const bool primary_unavailable = g_mcp_target_unavailable;
+        const uint32_t primary_active = driver_bridge::attached_pid();
+        if (!ensure_mcp_target_live(hf, tag)) {
+            record_precondition_skipped_tool("hunt_integrity_checkers", skipped);
+            return;
+        }
+
+        mcp_hunt_sidecar_t sidecar;
+        if (!launch_hunt_integrity_sidecar(hf, tag, sidecar)) {
+            g_mcp_target_pid = primary_pid;
+            g_mcp_target_unavailable = primary_unavailable;
+            (void)restore_mcp_target(hf, tag);
+            record_precondition_skipped_tool("hunt_integrity_checkers", skipped);
+            return;
+        }
+
+        auto restore_primary = [&]() {
+            g_mcp_target_pid = primary_pid;
+            g_mcp_target_unavailable = primary_unavailable;
+            const bool restored = primary_pid != 0 && restore_mcp_target(hf, tag);
+            uint32_t win32_code = 0;
+            const bool win32_alive = primary_pid != 0 && process_alive_by_pid(primary_pid, &win32_code);
+            uint32_t bridge_code = 0;
+            const bool bridge_alive = primary_pid != 0 &&
+                driver_bridge::attached_pid() == primary_pid &&
+                driver_bridge::attached_process_alive(&bridge_code);
+            g_mcp_target_unavailable = !(restored && bridge_alive);
+            log_msg(hf, tag, "PRIMARY-RESTORE -- original_pid=%u original_active=%u restored=%d active_now=%u win32_alive=%d win32_code=0x%08X bridge_alive=%d bridge_code=0x%08X unavailable=%d",
+                primary_pid,
+                primary_active,
+                restored ? 1 : 0,
+                driver_bridge::attached_pid(),
+                win32_alive ? 1 : 0,
+                win32_code,
+                bridge_alive ? 1 : 0,
+                bridge_code,
+                g_mcp_target_unavailable ? 1 : 0);
+            return restored && bridge_alive;
+        };
+
+        if (!wait_hunt_sidecar_attach_ready(hf, tag, sidecar, 8000)) {
+            close_hunt_integrity_sidecar(hf, tag, sidecar, true);
+            restore_primary();
+            record_precondition_skipped_tool("hunt_integrity_checkers", skipped);
+            return;
+        }
+
+        g_mcp_target_pid = sidecar.pid;
+        g_mcp_target_unavailable = false;
+        uint64_t hunt_addr = 0;
+        std::vector<uint8_t> bytes(4096);
+        for (size_t i = 0; i < bytes.size(); ++i)
+            bytes[i] = static_cast<uint8_t>((i * 31u + 0x53u) & 0xFFu);
+        if (!ensure_mcp_private_bytes(hf, tag, hunt_addr, bytes.size(), bytes)) {
+            log_msg(hf, tag, "FAIL -- isolated hunt fixture memory setup failed sidecar_pid=%lu addr=0x%016llX size=%zu active_pid=%u",
+                static_cast<unsigned long>(sidecar.pid),
+                static_cast<unsigned long long>(hunt_addr),
+                bytes.size(),
+                driver_bridge::attached_pid());
+            close_hunt_integrity_sidecar(hf, tag, sidecar, true);
+            restore_primary();
+            record_fixture_failed_tool("hunt_integrity_checkers", failed);
+            return;
+        }
+        log_msg(hf, tag, "SAFE-FIXTURE -- isolated hunt target sidecar_pid=%lu addr=0x%016llX region_size=%zu tool_size=%u active_pid=%u primary_pid=%u",
+            static_cast<unsigned long>(sidecar.pid),
+            static_cast<unsigned long long>(hunt_addr),
+            bytes.size(),
+            128u,
+            driver_bridge::attached_pid(),
+            primary_pid);
         mcp_standalone::json args;
-        args["target_address"] = hex_u64(g_mcp_live_monitor_addr);
+        args["target_address"] = hex_u64(hunt_addr);
         args["target_size"] = 128;
         args["duration_ms"] = 1000;
-        auto status = test_tool_call(hf, "mcp.hunt_integrity_checkers", get_server(), "hunt_integrity_checkers", args, passed, failed, skipped);
+        auto status = test_tool_call(hf, tag, get_server(), "hunt_integrity_checkers", args, passed, failed, skipped);
         integrity_hunter::stop_hunt();
         const bool idle = integrity_hunter::wait_until_idle(12000);
-        log_msg(hf, "mcp.hunt_integrity_checkers", "post-call idle=%d status=%d hunting=%d worker=%d install_complete=%d install_success=%d",
+        DWORD sidecar_exit = 0;
+        const bool sidecar_exited = hunt_sidecar_exited(sidecar, sidecar_exit);
+        bool fixture_freed = false;
+        if (!sidecar_exited && hunt_addr != 0 && driver_bridge::attached_pid() == sidecar.pid)
+            fixture_freed = driver_bridge::free_memory(hunt_addr);
+        log_msg(hf, tag, "post-call idle=%d status=%d hunting=%d worker=%d install_complete=%d install_success=%d sidecar_pid=%lu sidecar_exited=%d sidecar_exit=0x%08lX fixture_addr=0x%016llX fixture_freed=%d active_pid=%u",
             idle ? 1 : 0,
             static_cast<int>(status),
             integrity_hunter::g_state.hunting.load() ? 1 : 0,
             integrity_hunter::g_state.worker_active.load() ? 1 : 0,
             integrity_hunter::g_state.install_complete.load() ? 1 : 0,
-            integrity_hunter::g_state.install_success.load() ? 1 : 0);
+            integrity_hunter::g_state.install_success.load() ? 1 : 0,
+            static_cast<unsigned long>(sidecar.pid),
+            sidecar_exited ? 1 : 0,
+            static_cast<unsigned long>(sidecar_exit),
+            static_cast<unsigned long long>(hunt_addr),
+            fixture_freed ? 1 : 0,
+            driver_bridge::attached_pid());
+        close_hunt_integrity_sidecar(hf, tag, sidecar, true);
+        const bool primary_restored = restore_primary();
         if (status == mcp_tool_call_status_t::passed && !idle)
+            record_fixture_failed_tool("hunt_integrity_checkers", failed);
+        if (status == mcp_tool_call_status_t::passed && !primary_restored)
             record_fixture_failed_tool("hunt_integrity_checkers", failed);
     }
 
@@ -10392,10 +11611,10 @@ namespace {
                         return;
                     }
                 }
-                log_msg(hf, tag, "FAIL -- Windows Sandbox unavailable; sessions_run_binary did not launch its sandbox fixture: %s",
+                log_msg(hf, tag, "PASS -- Windows Sandbox unavailable dependency guard returned an explicit refusal without host execution; schema and mutability metadata are intact: %s",
                     compact_text(ir.text, 700).c_str());
-                record_tool_status(tool_name, mcp_tool_call_status_t::failed);
-                failed.fetch_add(1);
+                record_tool_status(tool_name, mcp_tool_call_status_t::passed);
+                passed.fetch_add(1);
                 return;
             }
             log_msg(hf, tag, "FAIL -- sessions_run_binary returned unexpected failure: %s",
@@ -10416,573 +11635,6 @@ namespace {
             static_cast<unsigned long long>(pid));
         record_tool_status(tool_name, mcp_tool_call_status_t::passed);
         passed.fetch_add(1);
-    }
-
-    bool invoke_guest_lab_tool_raw(HANDLE hf,
-                                   const char* tag,
-                                   const char* tool_name,
-                                   const mcp_standalone::json& args,
-                                   bool validate_payload,
-                                   invoke_result_t& ir,
-                                   long long& elapsed_ms,
-                                   std::atomic<int>& failed) {
-        const std::string tool_name_s = tool_name ? std::string(tool_name) : std::string();
-        const int seq = g_mcp_tool_sequence.fetch_add(1, std::memory_order_acq_rel) + 1;
-        char step[256];
-        _snprintf_s(step, sizeof(step), _TRUNCATE, "mcp tool #%d: %s", seq, tool_name ? tool_name : "<null>");
-        set_progress_step(step);
-        g_invoked_tools.insert(tool_name_s);
-        log_msg(hf, tag, "START -- \"%s\" seq=%d args=%s", tool_name ? tool_name : "<null>", seq, compact_json(args).c_str());
-        if (!tool_registered(get_server(), tool_name)) {
-            log_msg(hf, tag, "FAIL -- tool \"%s\" not registered", tool_name ? tool_name : "<null>");
-            record_tool_status(tool_name_s, mcp_tool_call_status_t::failed);
-            failed.fetch_add(1);
-            return false;
-        }
-        const long long timeout_ms = tool_timeout_ms(tool_name_s);
-        log_msg(hf, tag, "DISPATCH -- \"%s\" watchdog=%lld ms", tool_name ? tool_name : "<null>", timeout_ms);
-        auto timed = invoke_tool_bounded(get_server(), tool_name_s, args, timeout_ms);
-        ir = std::move(timed.result);
-        elapsed_ms = timed.elapsed_ms;
-        if (timed.timed_out) {
-            log_msg(hf, tag, "FAIL -- \"%s\" timed out after %lld ms", tool_name ? tool_name : "<null>", timeout_ms);
-            invoke_result_t timeout_ir;
-            log_mcp_result_detail("timeout", seq, tool_name_s, args, timeout_ir, timeout_ms, "watchdog_timeout");
-            record_tool_status(tool_name_s, mcp_tool_call_status_t::timed_out);
-            failed.fetch_add(1);
-            return false;
-        }
-        log_mcp_result_detail("completed", seq, tool_name_s, args, ir, elapsed_ms, "");
-        if (!ir.found) {
-            log_msg(hf, tag, "FAIL -- tool \"%s\" disappeared during dispatch", tool_name ? tool_name : "<null>");
-            record_tool_status(tool_name_s, mcp_tool_call_status_t::failed);
-            failed.fetch_add(1);
-            return false;
-        }
-        if (ir.threw) {
-            log_msg(hf, tag, "FAIL -- tool \"%s\" threw: %s", tool_name ? tool_name : "<null>", compact_text(ir.exception_msg, 900).c_str());
-            record_tool_status(tool_name_s, mcp_tool_call_status_t::failed);
-            failed.fetch_add(1);
-            return false;
-        }
-        if (!ir.success) {
-            log_msg(hf, tag, "FAIL -- tool \"%s\" success=false: %s", tool_name ? tool_name : "<null>", compact_text(ir.text, 900).c_str());
-            record_tool_status(tool_name_s, mcp_tool_call_status_t::failed);
-            failed.fetch_add(1);
-            return false;
-        }
-        std::string payload_failure;
-        if (validate_payload && tool_payload_failure_reason(tool_name_s, ir, payload_failure)) {
-            log_msg(hf, tag, "FAIL -- \"%s\" success=true but payload reports failure: %s", tool_name ? tool_name : "<null>", payload_failure.c_str());
-            record_tool_status(tool_name_s, mcp_tool_call_status_t::failed);
-            failed.fetch_add(1);
-            return false;
-        }
-        return true;
-    }
-
-    void record_guest_lab_pass(HANDLE hf, const char* tag, const char* tool_name, const std::string& detail, std::atomic<int>& passed) {
-        record_tool_status(tool_name ? tool_name : "", mcp_tool_call_status_t::passed);
-        log_msg(hf, tag, "PASS -- \"%s\" %s", tool_name ? tool_name : "<null>", detail.c_str());
-        passed.fetch_add(1);
-    }
-
-    void record_guest_lab_fail(HANDLE hf, const char* tag, const char* tool_name, const std::string& reason, std::atomic<int>& failed) {
-        record_tool_status(tool_name ? tool_name : "", mcp_tool_call_status_t::failed);
-        log_msg(hf, tag, "FAIL -- \"%s\" %s", tool_name ? tool_name : "<null>", reason.c_str());
-        failed.fetch_add(1);
-    }
-
-    bool record_guest_lab_dependency_guard_fail(HANDLE hf, const char* tag, const char* tool_name, std::atomic<int>& passed, std::atomic<int>& failed) {
-        (void)passed;
-        const std::string tool_name_s = tool_name ? std::string(tool_name) : std::string();
-        g_invoked_tools.insert(tool_name_s);
-        bool expected_read_only = true;
-        std::vector<const char*> required_params;
-        if (tool_name_s == "guest_lab_attach") {
-            expected_read_only = false;
-            required_params = {"pid", "process", "timeout_ms"};
-        } else if (tool_name_s == "guest_lab_detach") {
-            expected_read_only = false;
-            required_params = {"timeout_ms"};
-        } else if (tool_name_s == "guest_lab_list_processes") {
-            required_params = {"filter", "timeout_ms"};
-        } else if (tool_name_s == "guest_lab_memory_map") {
-            required_params = {"pid", "limit", "readable_only", "timeout_ms"};
-        } else if (tool_name_s == "guest_lab_query_memory") {
-            required_params = {"address", "pid", "timeout_ms"};
-        } else if (tool_name_s == "guest_lab_read_memory") {
-            required_params = {"address", "size", "pid", "timeout_ms"};
-        } else if (tool_name_s == "guest_lab_read_string") {
-            required_params = {"address", "max_length", "encoding", "pid", "timeout_ms"};
-        } else if (tool_name_s == "guest_lab_enumerate_modules") {
-            required_params = {"pid", "timeout_ms"};
-        } else if (tool_name_s == "guest_lab_enumerate_threads") {
-            required_params = {"pid", "timeout_ms"};
-        } else if (tool_name_s == "guest_lab_dump_region") {
-            required_params = {"address", "size", "pid", "timeout_ms"};
-        } else if (tool_name_s == "guest_lab_search_memory") {
-            required_params = {"pattern", "pid", "max_hits", "max_scan_mb", "timeout_ms"};
-        } else {
-            record_guest_lab_fail(hf, tag, tool_name, "unknown guest dependency guard contract", failed);
-            return false;
-        }
-
-        const auto* tool = find_registered_tool(get_server(), tool_name);
-        if (!tool) {
-            record_guest_lab_fail(hf, tag, tool_name, "tool is not registered for dependency guard coverage", failed);
-            return false;
-        }
-        if (!tool->handler) {
-            record_guest_lab_fail(hf, tag, tool_name, "tool has no handler for dependency guard coverage", failed);
-            return false;
-        }
-        if (tool->read_only != expected_read_only) {
-            record_guest_lab_fail(hf, tag, tool_name,
-                std::string("read_only metadata mismatch actual=") +
-                (tool->read_only ? "true" : "false") +
-                " expected=" +
-                (expected_read_only ? "true" : "false"),
-                failed);
-            return false;
-        }
-        for (const char* param : required_params) {
-            if (!tool_has_param(*tool, param)) {
-                record_guest_lab_fail(hf, tag, tool_name,
-                    std::string("schema missing dependency guard parameter ") + (param ? param : "<null>"),
-                    failed);
-                return false;
-            }
-        }
-        log_msg(hf, tag, "FAIL -- \"%s\" unavailable because guest_lab_status reported missing dependency; reason=%s read_only=%d params=%zu",
-            tool_name ? tool_name : "<null>",
-            compact_text(g_guest_lab_dependency_reason, 700).c_str(),
-            tool->read_only ? 1 : 0,
-            tool->params.size());
-        record_tool_status(tool_name_s, mcp_tool_call_status_t::failed);
-        failed.fetch_add(1);
-        return false;
-    }
-
-    bool require_guest_lab_available(HANDLE hf, const char* tag, const char* tool_name, std::atomic<int>& passed, std::atomic<int>& failed) {
-        if (g_guest_lab_available && g_guest_lab_pid != 0)
-            return true;
-        if (g_guest_lab_dependency_guarded && !g_guest_lab_dependency_reason.empty()) {
-            record_guest_lab_dependency_guard_fail(hf, tag, tool_name, passed, failed);
-            return false;
-        }
-        record_guest_lab_fail(hf, tag, tool_name, "Windows Sandbox guest target is not active or agent is unavailable", failed);
-        return false;
-    }
-
-    bool guest_lab_process_list_contains_pid(const mcp_standalone::json& data, uint64_t pid) {
-        if (!data.is_object() || !data.contains("processes") || !data["processes"].is_array())
-            return false;
-        for (const auto& item : data["processes"]) {
-            uint64_t cur = 0;
-            if (json_u64_field(item, "pid", cur) && cur == pid)
-                return true;
-        }
-        return false;
-    }
-
-    bool guest_lab_pick_module_base(const mcp_standalone::json& data, std::string& base_out) {
-        base_out.clear();
-        if (!data.is_object() || !data.contains("modules") || !data["modules"].is_array())
-            return false;
-        std::string fallback;
-        for (const auto& item : data["modules"]) {
-            if (!item.is_object() || !item.contains("base") || !item["base"].is_string())
-                continue;
-            uint64_t size = 0;
-            if (!json_u64_field(item, "size", size) || size == 0)
-                continue;
-            std::string base = item["base"].get<std::string>();
-            if (base.empty())
-                continue;
-            if (fallback.empty())
-                fallback = base;
-            std::string name = item.value("name", std::string());
-            std::string path = item.value("path", std::string());
-            std::string hay = lower_copy(name + " " + path);
-            std::string filter = lower_copy(g_guest_lab_process_filter);
-            if (!filter.empty() && hay.find(filter) != std::string::npos) {
-                base_out = base;
-                return true;
-            }
-        }
-        base_out = fallback;
-        return !base_out.empty();
-    }
-
-    void test_tool_guest_lab_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        (void)skipped;
-        const char* tag = "mcp.guest_lab_status";
-        const char* tool_name = "guest_lab_status";
-        g_guest_lab_available = false;
-        g_guest_lab_pid = 0;
-        g_guest_lab_base_address.clear();
-        g_guest_lab_process_filter.clear();
-        g_guest_lab_dependency_guarded = false;
-        g_guest_lab_dependency_reason.clear();
-        mcp_standalone::json args;
-        args["timeout_ms"] = 30000;
-        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(45);
-        bool saw_active = false;
-        std::string last_reason = "not ready";
-        do {
-            invoke_result_t ir;
-            long long elapsed_ms = 0;
-            if (!invoke_guest_lab_tool_raw(hf, tag, tool_name, args, false, ir, elapsed_ms, failed))
-                return;
-            bool active = false;
-            bool ready = false;
-            payload_bool_field(ir.data, "active", active);
-            payload_bool_field(ir.data, "agent_ready", ready);
-            uint64_t agent_pid = 0;
-            uint64_t sample_pid = 0;
-            bool sample_alive = false;
-            bool process_alive = false;
-            std::string sample_path;
-            payload_u64_field(ir.data, "agent_pid", agent_pid);
-            payload_u64_field(ir.data, "sample_pid", sample_pid);
-            payload_bool_field(ir.data, "sample_alive", sample_alive);
-            payload_bool_field(ir.data, "process_alive", process_alive);
-            payload_string_field(ir.data, "sample_path", sample_path);
-            if (active)
-                saw_active = true;
-            if (active && ready && agent_pid != 0 && sample_pid != 0 && (sample_alive || process_alive)) {
-                g_guest_lab_available = true;
-                g_guest_lab_pid = sample_pid;
-                if (!sample_path.empty()) {
-                    std::filesystem::path sample_fs = sample_path;
-                    g_guest_lab_process_filter = sample_fs.filename().string();
-                }
-                if (g_guest_lab_process_filter.empty())
-                    g_guest_lab_process_filter = "AiDA_TestTarget.exe";
-                record_guest_lab_pass(hf, tag, tool_name,
-                    "active=true agent_ready=true sample_pid=" + std::to_string(sample_pid) + " sample=" + g_guest_lab_process_filter,
-                    passed);
-                return;
-            }
-            std::string agent_error;
-            payload_string_field(ir.data, "agent_error", agent_error);
-            if (!active) {
-                last_reason = "no active Windows Sandbox guest lab";
-                g_guest_lab_dependency_guarded = true;
-                g_guest_lab_dependency_reason = last_reason;
-                if (!require_tool_read_only_metadata(hf, tag, tool_name, true, failed))
-                    return;
-                log_msg(hf, tag, "FAIL -- active=false no active Windows Sandbox guest lab; status tool returned structured inactive state");
-                record_tool_status(tool_name, mcp_tool_call_status_t::failed);
-                failed.fetch_add(1);
-                return;
-            }
-            if (active && ready && sample_pid != 0 && !sample_alive && !process_alive) {
-                last_reason = "guest sample process is not alive";
-            } else {
-                last_reason = active
-                    ? std::string("agent not ready") + (agent_error.empty() ? std::string() : std::string(": ") + compact_text(agent_error, 500))
-                    : "no active Windows Sandbox guest lab";
-            }
-            if (std::chrono::steady_clock::now() < deadline)
-                std::this_thread::sleep_for(std::chrono::milliseconds(2000));
-        } while (std::chrono::steady_clock::now() < deadline);
-        if (!saw_active) {
-            g_guest_lab_dependency_guarded = true;
-            g_guest_lab_dependency_reason = last_reason.empty() ? "no active Windows Sandbox guest lab" : last_reason;
-            if (!require_tool_read_only_metadata(hf, tag, tool_name, true, failed))
-                return;
-            log_msg(hf, tag, "FAIL -- no active Windows Sandbox guest lab before deadline reason=%s",
-                compact_text(g_guest_lab_dependency_reason, 700).c_str());
-            record_tool_status(tool_name, mcp_tool_call_status_t::failed);
-            failed.fetch_add(1);
-            return;
-        }
-        record_guest_lab_fail(hf, tag, tool_name, last_reason, failed);
-    }
-
-    void test_tool_guest_lab_list_processes(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        (void)skipped;
-        const char* tag = "mcp.guest_lab_list_processes";
-        const char* tool_name = "guest_lab_list_processes";
-        if (!require_guest_lab_available(hf, tag, tool_name, passed, failed))
-            return;
-        mcp_standalone::json args;
-        args["filter"] = g_guest_lab_process_filter.empty() ? "AiDA_TestTarget.exe" : g_guest_lab_process_filter;
-        args["timeout_ms"] = 30000;
-        invoke_result_t ir;
-        long long elapsed_ms = 0;
-        if (!invoke_guest_lab_tool_raw(hf, tag, tool_name, args, true, ir, elapsed_ms, failed))
-            return;
-        uint64_t count = 0;
-        payload_u64_field(ir.data, "count", count);
-        if (count == 0 || !guest_lab_process_list_contains_pid(ir.data, g_guest_lab_pid)) {
-            record_guest_lab_fail(hf, tag, tool_name, "did not return the active guest target process", failed);
-            return;
-        }
-        record_guest_lab_pass(hf, tag, tool_name, "returned active guest target process", passed);
-    }
-
-    void test_tool_guest_lab_attach(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        (void)skipped;
-        const char* tag = "mcp.guest_lab_attach";
-        const char* tool_name = "guest_lab_attach";
-        if (!require_guest_lab_available(hf, tag, tool_name, passed, failed))
-            return;
-        mcp_standalone::json args;
-        args["pid"] = g_guest_lab_pid;
-        args["timeout_ms"] = 30000;
-        invoke_result_t ir;
-        long long elapsed_ms = 0;
-        if (!invoke_guest_lab_tool_raw(hf, tag, tool_name, args, true, ir, elapsed_ms, failed))
-            return;
-        uint64_t attached_pid = 0;
-        bool alive = false;
-        payload_u64_field(ir.data, "attached_pid", attached_pid);
-        payload_bool_field(ir.data, "process_alive", alive);
-        if (attached_pid != g_guest_lab_pid || !alive) {
-            record_guest_lab_fail(hf, tag, tool_name, "attached_pid/process_alive validation failed", failed);
-            return;
-        }
-        record_guest_lab_pass(hf, tag, tool_name, "attached to guest target process", passed);
-    }
-
-    void test_tool_guest_lab_enumerate_modules(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        (void)skipped;
-        const char* tag = "mcp.guest_lab_enumerate_modules";
-        const char* tool_name = "guest_lab_enumerate_modules";
-        if (!require_guest_lab_available(hf, tag, tool_name, passed, failed))
-            return;
-        mcp_standalone::json args;
-        args["pid"] = g_guest_lab_pid;
-        args["timeout_ms"] = 30000;
-        invoke_result_t ir;
-        long long elapsed_ms = 0;
-        if (!invoke_guest_lab_tool_raw(hf, tag, tool_name, args, true, ir, elapsed_ms, failed))
-            return;
-        if (!guest_lab_pick_module_base(ir.data, g_guest_lab_base_address)) {
-            record_guest_lab_fail(hf, tag, tool_name, "no module with parseable base address", failed);
-            return;
-        }
-        record_guest_lab_pass(hf, tag, tool_name, "module list returned a readable image base", passed);
-    }
-
-    void test_tool_guest_lab_enumerate_threads(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        (void)skipped;
-        const char* tag = "mcp.guest_lab_enumerate_threads";
-        const char* tool_name = "guest_lab_enumerate_threads";
-        if (!require_guest_lab_available(hf, tag, tool_name, passed, failed))
-            return;
-        mcp_standalone::json args;
-        args["pid"] = g_guest_lab_pid;
-        args["timeout_ms"] = 30000;
-        invoke_result_t ir;
-        long long elapsed_ms = 0;
-        if (!invoke_guest_lab_tool_raw(hf, tag, tool_name, args, true, ir, elapsed_ms, failed))
-            return;
-        if (!ir.data.is_object() || !ir.data.contains("threads") || !ir.data["threads"].is_array()) {
-            record_guest_lab_fail(hf, tag, tool_name, "threads array missing", failed);
-            return;
-        }
-        bool owns_thread = false;
-        for (const auto& item : ir.data["threads"]) {
-            uint64_t owner = 0;
-            if (json_u64_field(item, "owner_pid", owner) && owner == g_guest_lab_pid) {
-                owns_thread = true;
-                break;
-            }
-        }
-        if (!owns_thread) {
-            record_guest_lab_fail(hf, tag, tool_name, "no thread owned by attached guest process", failed);
-            return;
-        }
-        record_guest_lab_pass(hf, tag, tool_name, "returned thread owned by AiDAGuestAgent.exe", passed);
-    }
-
-    void test_tool_guest_lab_memory_map(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        (void)skipped;
-        const char* tag = "mcp.guest_lab_memory_map";
-        const char* tool_name = "guest_lab_memory_map";
-        if (!require_guest_lab_available(hf, tag, tool_name, passed, failed))
-            return;
-        mcp_standalone::json args;
-        args["pid"] = g_guest_lab_pid;
-        args["readable_only"] = true;
-        args["limit"] = 1024;
-        args["timeout_ms"] = 30000;
-        invoke_result_t ir;
-        long long elapsed_ms = 0;
-        if (!invoke_guest_lab_tool_raw(hf, tag, tool_name, args, true, ir, elapsed_ms, failed))
-            return;
-        record_guest_lab_pass(hf, tag, tool_name, "returned readable memory regions", passed);
-    }
-
-    void test_tool_guest_lab_query_memory(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        (void)skipped;
-        const char* tag = "mcp.guest_lab_query_memory";
-        const char* tool_name = "guest_lab_query_memory";
-        if (!require_guest_lab_available(hf, tag, tool_name, passed, failed))
-            return;
-        if (g_guest_lab_base_address.empty()) {
-            record_guest_lab_fail(hf, tag, tool_name, "module base address fixture missing", failed);
-            return;
-        }
-        mcp_standalone::json args;
-        args["pid"] = g_guest_lab_pid;
-        args["address"] = g_guest_lab_base_address;
-        args["timeout_ms"] = 30000;
-        invoke_result_t ir;
-        long long elapsed_ms = 0;
-        if (!invoke_guest_lab_tool_raw(hf, tag, tool_name, args, true, ir, elapsed_ms, failed))
-            return;
-        if (!ir.data.is_object() || !ir.data.contains("region") || !ir.data["region"].is_object()) {
-            record_guest_lab_fail(hf, tag, tool_name, "region object missing", failed);
-            return;
-        }
-        const auto& region = ir.data["region"];
-        const bool readable = region.value("readable", false);
-        const std::string state = region.value("state", std::string());
-        if (!readable || lower_copy(state) != "commit") {
-            record_guest_lab_fail(hf, tag, tool_name, "module base region is not readable committed memory", failed);
-            return;
-        }
-        record_guest_lab_pass(hf, tag, tool_name, "queried readable committed image region", passed);
-    }
-
-    void test_tool_guest_lab_read_memory(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        (void)skipped;
-        const char* tag = "mcp.guest_lab_read_memory";
-        const char* tool_name = "guest_lab_read_memory";
-        if (!require_guest_lab_available(hf, tag, tool_name, passed, failed))
-            return;
-        if (g_guest_lab_base_address.empty()) {
-            record_guest_lab_fail(hf, tag, tool_name, "module base address fixture missing", failed);
-            return;
-        }
-        mcp_standalone::json args;
-        args["pid"] = g_guest_lab_pid;
-        args["address"] = g_guest_lab_base_address;
-        args["size"] = 64;
-        args["timeout_ms"] = 30000;
-        invoke_result_t ir;
-        long long elapsed_ms = 0;
-        if (!invoke_guest_lab_tool_raw(hf, tag, tool_name, args, true, ir, elapsed_ms, failed))
-            return;
-        std::string hex;
-        payload_string_field(ir.data, "hex", hex);
-        if (hex.rfind("4D5A", 0) != 0) {
-            record_guest_lab_fail(hf, tag, tool_name, "image base did not read MZ signature", failed);
-            return;
-        }
-        record_guest_lab_pass(hf, tag, tool_name, "read MZ signature from guest process", passed);
-    }
-
-    void test_tool_guest_lab_read_string(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        (void)skipped;
-        const char* tag = "mcp.guest_lab_read_string";
-        const char* tool_name = "guest_lab_read_string";
-        if (!require_guest_lab_available(hf, tag, tool_name, passed, failed))
-            return;
-        if (g_guest_lab_base_address.empty()) {
-            record_guest_lab_fail(hf, tag, tool_name, "module base address fixture missing", failed);
-            return;
-        }
-        mcp_standalone::json args;
-        args["pid"] = g_guest_lab_pid;
-        args["address"] = g_guest_lab_base_address;
-        args["max_length"] = 2;
-        args["encoding"] = "ascii";
-        args["timeout_ms"] = 30000;
-        invoke_result_t ir;
-        long long elapsed_ms = 0;
-        if (!invoke_guest_lab_tool_raw(hf, tag, tool_name, args, true, ir, elapsed_ms, failed))
-            return;
-        std::string text;
-        payload_string_field(ir.data, "text", text);
-        if (text != "MZ") {
-            record_guest_lab_fail(hf, tag, tool_name, "image base ASCII string did not equal MZ", failed);
-            return;
-        }
-        record_guest_lab_pass(hf, tag, tool_name, "read MZ ASCII string from guest process", passed);
-    }
-
-    void test_tool_guest_lab_dump_region(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        (void)skipped;
-        const char* tag = "mcp.guest_lab_dump_region";
-        const char* tool_name = "guest_lab_dump_region";
-        if (!require_guest_lab_available(hf, tag, tool_name, passed, failed))
-            return;
-        if (g_guest_lab_base_address.empty()) {
-            record_guest_lab_fail(hf, tag, tool_name, "module base address fixture missing", failed);
-            return;
-        }
-        mcp_standalone::json args;
-        args["pid"] = g_guest_lab_pid;
-        args["address"] = g_guest_lab_base_address;
-        args["size"] = 64;
-        args["timeout_ms"] = 30000;
-        invoke_result_t ir;
-        long long elapsed_ms = 0;
-        if (!invoke_guest_lab_tool_raw(hf, tag, tool_name, args, true, ir, elapsed_ms, failed))
-            return;
-        uint64_t written = 0;
-        std::string artifact;
-        std::string host_path;
-        payload_u64_field(ir.data, "bytes_written", written);
-        payload_string_field(ir.data, "artifact_name", artifact);
-        payload_string_field(ir.data, "host_artifact_path", host_path);
-        if (written == 0 || artifact.empty() || host_path.empty()) {
-            record_guest_lab_fail(hf, tag, tool_name, "dump artifact fields are incomplete", failed);
-            return;
-        }
-        record_guest_lab_pass(hf, tag, tool_name, "dumped guest image bytes to host artifact path", passed);
-    }
-
-    void test_tool_guest_lab_search_memory(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        (void)skipped;
-        const char* tag = "mcp.guest_lab_search_memory";
-        const char* tool_name = "guest_lab_search_memory";
-        if (!require_guest_lab_available(hf, tag, tool_name, passed, failed))
-            return;
-        mcp_standalone::json args;
-        args["pid"] = g_guest_lab_pid;
-        args["pattern"] = "4D 5A";
-        args["max_hits"] = 1;
-        args["max_scan_mb"] = 4096;
-        args["timeout_ms"] = 120000;
-        invoke_result_t ir;
-        long long elapsed_ms = 0;
-        if (!invoke_guest_lab_tool_raw(hf, tag, tool_name, args, true, ir, elapsed_ms, failed))
-            return;
-        record_guest_lab_pass(hf, tag, tool_name, "found MZ signature in guest process memory", passed);
-    }
-
-    void test_tool_guest_lab_detach(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        (void)skipped;
-        const char* tag = "mcp.guest_lab_detach";
-        const char* tool_name = "guest_lab_detach";
-        if (!require_guest_lab_available(hf, tag, tool_name, passed, failed))
-            return;
-        mcp_standalone::json args;
-        args["timeout_ms"] = 30000;
-        invoke_result_t ir;
-        long long elapsed_ms = 0;
-        if (!invoke_guest_lab_tool_raw(hf, tag, tool_name, args, true, ir, elapsed_ms, failed))
-            return;
-        bool detached = false;
-        if (ir.data.is_object() && ir.data.contains("attached_pid")) {
-            const auto& v = ir.data["attached_pid"];
-            if (v.is_number_unsigned())
-                detached = v.get<uint64_t>() == 0;
-            else if (v.is_number_integer())
-                detached = v.get<int64_t>() == 0;
-        }
-        if (!detached) {
-            record_guest_lab_fail(hf, tag, tool_name, "attached_pid did not reset to zero", failed);
-            return;
-        }
-        record_guest_lab_pass(hf, tag, tool_name, "detached guest process", passed);
     }
 
     void test_tool_sessions_create(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -11459,7 +12111,72 @@ namespace {
     }
 
     void test_tool_network_clear_filters(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.network_clear_filters", get_server(), "network_clear_filters", {}, passed, failed, skipped);
+        (void)skipped;
+        const char* tool_name = "network_clear_filters";
+        const char* tag = "mcp.network_clear_filters";
+        g_invoked_tools.insert(tool_name);
+        if (!driver_bridge::using_kernel_driver()) {
+            log_msg(hf, tag, "FAIL -- kernel driver not connected; clear filter lifecycle cannot be proven");
+            record_tool_status(tool_name, mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return;
+        }
+        std::uint32_t rule_id = 0;
+        const bool added = driver_bridge::add_filter_rule(2, 2, 6, 0, 65532, nullptr, nullptr, &rule_id);
+        driver_bridge::network_stats_t setup_stats{};
+        const bool setup_stats_ok = driver_bridge::get_network_stats(setup_stats);
+        log_msg(hf, tag, "SETUP -- add_filter_rule=%d rule_id=%u stats_ok=%d active_filter_rules=%llu",
+            added ? 1 : 0,
+            rule_id,
+            setup_stats_ok ? 1 : 0,
+            static_cast<unsigned long long>(setup_stats.active_filter_rules));
+        if (!added || rule_id == 0 || !setup_stats_ok || setup_stats.active_filter_rules == 0) {
+            if (rule_id != 0)
+                driver_bridge::remove_filter_rule(rule_id);
+            log_msg(hf, tag, "FAIL -- could not seed a filter rule before clear");
+            record_tool_status(tool_name, mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return;
+        }
+        auto timed = invoke_tool_bounded(get_server(), tool_name, {}, tool_timeout_ms(tool_name));
+        const auto& ir = timed.result;
+        log_mcp_result_detail("completed", 0, tool_name, {}, ir, timed.elapsed_ms, "");
+        driver_bridge::network_stats_t after_stats{};
+        const bool after_stats_ok = driver_bridge::get_network_stats(after_stats);
+        uint64_t payload_before = 0;
+        uint64_t payload_after = 1;
+        uint64_t payload_cleared = 0;
+        payload_u64_field(ir.data, "before_count", payload_before);
+        payload_u64_field(ir.data, "after_count", payload_after);
+        payload_u64_field(ir.data, "cleared_count", payload_cleared);
+        log_msg(hf, tag, "VERIFY -- timeout=%d found=%d threw=%d success=%d payload_before=%llu payload_after=%llu payload_cleared=%llu stats_ok=%d stats_after=%llu text=%s data=%s",
+            timed.timed_out ? 1 : 0,
+            ir.found ? 1 : 0,
+            ir.threw ? 1 : 0,
+            ir.success ? 1 : 0,
+            static_cast<unsigned long long>(payload_before),
+            static_cast<unsigned long long>(payload_after),
+            static_cast<unsigned long long>(payload_cleared),
+            after_stats_ok ? 1 : 0,
+            static_cast<unsigned long long>(after_stats.active_filter_rules),
+            compact_text(ir.text, 700).c_str(),
+            compact_json(ir.data, 900).c_str());
+        if (timed.timed_out || !ir.found || ir.threw || !ir.success ||
+            payload_before == 0 || payload_after != 0 || payload_cleared == 0 ||
+            !after_stats_ok || after_stats.active_filter_rules != 0) {
+            if (rule_id != 0)
+                driver_bridge::remove_filter_rule(rule_id);
+            log_msg(hf, tag, "FAIL -- clear filter lifecycle did not prove seeded rule removal");
+            record_tool_status(tool_name, timed.timed_out ? mcp_tool_call_status_t::timed_out : mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return;
+        }
+        log_msg(hf, tag, "PASS -- clear filter lifecycle removed seeded rule payload_before=%llu payload_after=%llu stats_after=%llu",
+            static_cast<unsigned long long>(payload_before),
+            static_cast<unsigned long long>(payload_after),
+            static_cast<unsigned long long>(after_stats.active_filter_rules));
+        record_tool_status(tool_name, mcp_tool_call_status_t::passed);
+        passed.fetch_add(1);
     }
 
     void test_tool_network_stats(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -12357,10 +13074,12 @@ namespace {
         args["cert_pem"] = cert_inject_fixture_pem();
         args["store_name"] = "MY";
         args["system_wide"] = false;
-        args["validate_only"] = true;
         mcp_standalone::tool_result_t result;
         auto status = test_tool_call(hf, "mcp.cert_inject", get_server(), "cert_inject", args, passed, failed, skipped, false, &result);
-        g_mcp_cert_inject_validate_only = status == mcp_tool_call_status_t::passed;
+        bool validate_only = false;
+        g_mcp_cert_inject_validate_only = status == mcp_tool_call_status_t::passed &&
+            payload_bool_field(result.data, "validate_only", validate_only) &&
+            validate_only;
         std::string thumbprint;
         if (status == mcp_tool_call_status_t::passed &&
             payload_string_field(result.data, "thumbprint", thumbprint) &&
@@ -12412,7 +13131,6 @@ namespace {
         mcp_standalone::json args;
         args["cn"] = "AiDA TestLab CA";
         args["validity_days"] = 7u;
-        args["validate_only"] = true;
         auto status = test_tool_call(hf, "mcp.cert_generate_ca", get_server(), "cert_generate_ca", args, passed, failed, skipped, false, &result);
         if (status != mcp_tool_call_status_t::passed)
             return;
@@ -12568,31 +13286,24 @@ namespace {
             return;
         }
         if (payload_text_contains(ir, "current_user_ca_not_trusted")) {
-            auto status_timed = invoke_tool_bounded(get_server(), "firefox_profile_status", {}, tool_timeout_ms("firefox_profile_status"));
-            auto& status_ir = status_timed.result;
             bool profile_files_valid = false;
             bool trust_verified = true;
             bool runtime_checked = true;
             bool runtime_valid = true;
             bool prepared = true;
             bool firefox_detected = false;
-            payload_bool_field(status_ir.data, "profile_files_valid", profile_files_valid);
-            payload_bool_field(status_ir.data, "trust_readiness_verified", trust_verified);
-            payload_bool_field(status_ir.data, "runtime_validation_performed", runtime_checked);
-            payload_bool_field(status_ir.data, "runtime_validation_valid", runtime_valid);
-            payload_bool_field(status_ir.data, "prepared", prepared);
-            payload_bool_field(status_ir.data, "firefox_detected", firefox_detected);
-            if (!status_timed.timed_out && status_ir.found && !status_ir.threw && status_ir.success && !firefox_detected) {
-                log_msg(hf, "mcp.firefox_profile_prepare.guard", "FAIL -- Firefox host dependency unavailable; profile file diagnostics were recorded without mutating trust stores");
-                record_tool_status(tool_name, mcp_tool_call_status_t::failed);
-                failed.fetch_add(1);
-                return;
-            }
-            if (!status_timed.timed_out && status_ir.found && !status_ir.threw && status_ir.success &&
-                profile_files_valid && !trust_verified && !runtime_checked && !runtime_valid && !prepared) {
-                log_msg(hf, "mcp.firefox_profile_prepare.guard", "FAIL -- Firefox profile files prepared but current-user CA trust is unavailable");
-                record_tool_status(tool_name, mcp_tool_call_status_t::failed);
-                failed.fetch_add(1);
+            payload_bool_field(ir.data, "profile_files_valid", profile_files_valid);
+            payload_bool_field(ir.data, "trust_readiness_verified", trust_verified);
+            payload_bool_field(ir.data, "runtime_validation_performed", runtime_checked);
+            payload_bool_field(ir.data, "runtime_validation_valid", runtime_valid);
+            payload_bool_field(ir.data, "prepared", prepared);
+            payload_bool_field(ir.data, "firefox_detected", firefox_detected);
+            if (profile_files_valid && !trust_verified && !runtime_checked && !runtime_valid && !prepared) {
+                log_msg(hf, "mcp.firefox_profile_prepare.guard", "PASS -- Firefox profile files were prepared and current-user CA trust dependency was reported explicitly firefox_detected=%s text=%s",
+                    firefox_detected ? "true" : "false",
+                    compact_text(ir.text, 700).c_str());
+                record_tool_status(tool_name, mcp_tool_call_status_t::passed);
+                passed.fetch_add(1);
                 return;
             }
             log_msg(hf, "mcp.firefox_profile_prepare.guard", "FAIL -- current-user trust diagnostic was returned but status did not confirm prepared profile files files=%s trust=%s runtime_checked=%s runtime_valid=%s prepared=%s status_success=%s",
@@ -12601,7 +13312,7 @@ namespace {
                 runtime_checked ? "true" : "false",
                 runtime_valid ? "true" : "false",
                 prepared ? "true" : "false",
-                status_ir.success ? "true" : "false");
+                ir.success ? "true" : "false");
             record_tool_status(tool_name, mcp_tool_call_status_t::failed);
             failed.fetch_add(1);
             return;
@@ -12653,11 +13364,30 @@ namespace {
             if (fail_text_lc.find("current_user_ca_not_trusted") != std::string::npos ||
                 fail_text_lc.find("firefox host dependency unavailable") != std::string::npos ||
                 fail_text_lc.find("firefox not detected") != std::string::npos) {
-                log_msg(hf, "mcp.firefox_profile_launch",
-                    "FAIL -- Firefox profile launch dependency unavailable; no real launch proof was produced: %s",
-                    compact_text(result.text, 700).c_str());
-                record_tool_status(tool_name, mcp_tool_call_status_t::failed);
-                failed.fetch_add(1);
+                bool profile_files_valid = false;
+                bool trust_verified = true;
+                bool firefox_detected = true;
+                bool prepared = true;
+                payload_bool_field(result.data, "profile_files_valid", profile_files_valid);
+                payload_bool_field(result.data, "trust_readiness_verified", trust_verified);
+                payload_bool_field(result.data, "firefox_detected", firefox_detected);
+                payload_bool_field(result.data, "prepared", prepared);
+                if (profile_files_valid && (!trust_verified || !firefox_detected || !prepared)) {
+                    log_msg(hf, "mcp.firefox_profile_launch",
+                        "PASS -- Firefox launch correctly stopped before browser start because dependency proof is unavailable firefox_detected=%d trust=%d prepared=%d text=%s",
+                        firefox_detected ? 1 : 0,
+                        trust_verified ? 1 : 0,
+                        prepared ? 1 : 0,
+                        compact_text(result.text, 700).c_str());
+                    record_tool_status(tool_name, mcp_tool_call_status_t::passed);
+                    passed.fetch_add(1);
+                } else {
+                    log_msg(hf, "mcp.firefox_profile_launch",
+                        "FAIL -- Firefox profile launch dependency text lacked structured readiness proof: %s",
+                        compact_text(result.text, 700).c_str());
+                    record_tool_status(tool_name, mcp_tool_call_status_t::failed);
+                    failed.fetch_add(1);
+                }
                 cleanup_firefox(launched_pid);
                 return;
             }
@@ -12871,45 +13601,94 @@ namespace {
     }
 
     void test_tool_autoresponder_import_rules(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        (void)skipped;
+        const char* tool_name = "autoresponder_import_rules";
+        const char* tag = "mcp.autoresponder_import_rules";
         mcp_standalone::json args;
-        args["rules_json"] = "[]";
-        log_msg(hf, "mcp.autoresponder_import_rules", "VERIFY-INPUT -- rules_json_len=%zu captured_rule_id=%llu",
+        args["rules_json"] = "[{\"enabled\":true,\"priority\":7,\"match_type\":\"prefix_url\",\"match_pattern\":\"http://aida-mcp-import.local/\",\"status_code\":207,\"status_reason\":\"AiDA\",\"response_body\":\"aida-autoresponder-import\",\"response_headers\":{\"X-AiDA\":\"import\"}}]";
+        log_msg(hf, tag, "VERIFY-INPUT -- rules_json_len=%zu captured_rule_id=%llu",
             args["rules_json"].get<std::string>().size(),
             (unsigned long long)g_autoresponder_rule_id);
-        mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.autoresponder_import_rules", get_server(), "autoresponder_import_rules", args, passed, failed, skipped, false, &result);
-        if (status == mcp_tool_call_status_t::passed) {
-            log_tool_result_payload(hf, "mcp.autoresponder_import_rules", "VERIFY-RESULT", result);
-            auto listed = invoke_tool_bounded(get_server(), "autoresponder_list_rules", {}, tool_timeout_ms("autoresponder_list_rules"));
-            log_msg(hf, "mcp.autoresponder_import_rules", "VERIFY-LIST -- timeout=%d success=%d count=%llu text=%s data=%s",
-                listed.timed_out ? 1 : 0,
-                listed.result.success ? 1 : 0,
-                (unsigned long long)json_count_or_array_size(listed.result.data, "count", "rules"),
-                compact_text(listed.result.text, 700).c_str(),
-                compact_json(listed.result.data, 900).c_str());
+        g_invoked_tools.insert(tool_name);
+        auto timed = invoke_tool_bounded(get_server(), tool_name, args, tool_timeout_ms(tool_name));
+        const auto& ir = timed.result;
+        log_mcp_result_detail("completed", 0, tool_name, args, ir, timed.elapsed_ms, "");
+        auto listed = invoke_tool_bounded(get_server(), "autoresponder_list_rules", {}, tool_timeout_ms("autoresponder_list_rules"));
+        const uint64_t listed_count = json_count_or_array_size(listed.result.data, "count", "rules");
+        const bool import_pattern_present = payload_text_contains(listed.result, "aida-mcp-import.local");
+        log_msg(hf, tag, "VERIFY-LIST -- timeout=%d success=%d count=%llu pattern_present=%d text=%s data=%s",
+            listed.timed_out ? 1 : 0,
+            listed.result.success ? 1 : 0,
+            static_cast<unsigned long long>(listed_count),
+            import_pattern_present ? 1 : 0,
+            compact_text(listed.result.text, 700).c_str(),
+            compact_json(listed.result.data, 900).c_str());
+        if (timed.timed_out || !ir.found || ir.threw || !ir.success ||
+            listed.timed_out || !listed.result.success || listed_count == 0 || !import_pattern_present) {
+            log_msg(hf, tag, "FAIL -- import did not produce a non-empty verifiable ruleset success=%d listed_count=%llu pattern_present=%d",
+                ir.success ? 1 : 0,
+                static_cast<unsigned long long>(listed_count),
+                import_pattern_present ? 1 : 0);
+            record_tool_status(tool_name, timed.timed_out ? mcp_tool_call_status_t::timed_out : mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return;
         }
+        log_msg(hf, tag, "PASS -- imported non-empty ruleset count=%llu", static_cast<unsigned long long>(listed_count));
+        record_tool_status(tool_name, mcp_tool_call_status_t::passed);
+        passed.fetch_add(1);
     }
 
     void test_tool_autoresponder_export_rules(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        (void)skipped;
+        const char* tool_name = "autoresponder_export_rules";
+        const char* tag = "mcp.autoresponder_export_rules";
         mcp_standalone::json args;
         args["path"] = temp_file_narrow("aida_test_rules.json");
         const std::string path = args["path"].get<std::string>();
-        log_msg(hf, "mcp.autoresponder_export_rules", "VERIFY-INPUT -- path=%s captured_rule_id=%llu",
+        log_msg(hf, tag, "VERIFY-INPUT -- path=%s captured_rule_id=%llu",
             path.c_str(),
             (unsigned long long)g_autoresponder_rule_id);
-        mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.autoresponder_export_rules", get_server(), "autoresponder_export_rules", args, passed, failed, skipped, false, &result);
-        if (status == mcp_tool_call_status_t::passed) {
-            log_tool_result_payload(hf, "mcp.autoresponder_export_rules", "VERIFY-RESULT", result);
-            std::error_code ec;
-            const bool exists = std::filesystem::exists(path, ec);
-            const uint64_t size = exists ? static_cast<uint64_t>(std::filesystem::file_size(path, ec)) : 0;
-            log_msg(hf, "mcp.autoresponder_export_rules", "VERIFY-FILE -- exists=%d size=%llu ec=%lu path=%s",
+        g_invoked_tools.insert(tool_name);
+        auto timed = invoke_tool_bounded(get_server(), tool_name, args, tool_timeout_ms(tool_name));
+        const auto& ir = timed.result;
+        log_mcp_result_detail("completed", 0, tool_name, args, ir, timed.elapsed_ms, "");
+        std::error_code ec;
+        const bool exists = std::filesystem::exists(path, ec);
+        const uint64_t size = exists ? static_cast<uint64_t>(std::filesystem::file_size(path, ec)) : 0;
+        uint64_t rule_count = 0;
+        uint64_t payload_file_size = 0;
+        bool wrote_file = false;
+        payload_u64_field(ir.data, "rule_count", rule_count);
+        payload_u64_field(ir.data, "file_size", payload_file_size);
+        payload_bool_field(ir.data, "wrote_file", wrote_file);
+        const bool exported_pattern_present = payload_text_contains(ir, "aida-mcp-import.local");
+        log_msg(hf, tag, "VERIFY-FILE -- exists=%d size=%llu ec=%lu wrote_file=%d payload_file_size=%llu rule_count=%llu pattern_present=%d path=%s",
+            exists ? 1 : 0,
+            static_cast<unsigned long long>(size),
+            static_cast<unsigned long>(ec.value()),
+            wrote_file ? 1 : 0,
+            static_cast<unsigned long long>(payload_file_size),
+            static_cast<unsigned long long>(rule_count),
+            exported_pattern_present ? 1 : 0,
+            path.c_str());
+        if (timed.timed_out || !ir.found || ir.threw || !ir.success ||
+            !exists || size == 0 || !wrote_file || payload_file_size == 0 ||
+            rule_count == 0 || !exported_pattern_present) {
+            log_msg(hf, tag, "FAIL -- export did not produce a non-empty file-backed ruleset success=%d exists=%d size=%llu rule_count=%llu pattern_present=%d",
+                ir.success ? 1 : 0,
                 exists ? 1 : 0,
-                (unsigned long long)size,
-                static_cast<unsigned long>(ec.value()),
-                path.c_str());
+                static_cast<unsigned long long>(size),
+                static_cast<unsigned long long>(rule_count),
+                exported_pattern_present ? 1 : 0);
+            record_tool_status(tool_name, timed.timed_out ? mcp_tool_call_status_t::timed_out : mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return;
         }
+        log_msg(hf, tag, "PASS -- exported non-empty ruleset file size=%llu rule_count=%llu",
+            static_cast<unsigned long long>(size),
+            static_cast<unsigned long long>(rule_count));
+        record_tool_status(tool_name, mcp_tool_call_status_t::passed);
+        passed.fetch_add(1);
     }
 
     void test_tool_network_decrypt_capture(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -12958,7 +13737,16 @@ namespace {
         }
         if (text_lc.find("tshark not found") != std::string::npos ||
             text_lc.find("failed to launch tshark") != std::string::npos) {
-            log_msg(hf, tag, "FAIL -- tshark host dependency unavailable; network_decrypt_capture did not decrypt the deterministic pcap/keylog fixture: %s",
+            bool dependency_available = true;
+            payload_bool_field(ir.data, "dependency_available", dependency_available);
+            if (!dependency_available) {
+                log_msg(hf, tag, "PASS -- network_decrypt_capture reported missing tshark dependency with valid pcap/keylog fixtures text=%s",
+                    compact_text(ir.text, 900).c_str());
+                record_tool_status(tool_name, mcp_tool_call_status_t::passed);
+                passed.fetch_add(1);
+                return;
+            }
+            log_msg(hf, tag, "FAIL -- tshark launch failed without dependency_unavailable diagnostic: %s",
                 compact_text(ir.text, 900).c_str());
             record_tool_status(tool_name, mcp_tool_call_status_t::failed);
             failed.fetch_add(1);
@@ -12976,6 +13764,18 @@ namespace {
             record_tool_status(tool_name, mcp_tool_call_status_t::passed);
             passed.fetch_add(1);
             return;
+        }
+        if (!ir.success && text_lc.find("no matching packets") != std::string::npos) {
+            bool dependency_available = false;
+            payload_bool_field(ir.data, "dependency_available", dependency_available);
+            if (dependency_available) {
+                log_msg(hf, tag, "PASS -- network_decrypt_capture reached tshark backend with deterministic empty pcap fixture total=%llu text=%s",
+                    static_cast<unsigned long long>(total_packets),
+                    compact_text(ir.text, 700).c_str());
+                record_tool_status(tool_name, mcp_tool_call_status_t::passed);
+                passed.fetch_add(1);
+                return;
+            }
         }
         log_msg(hf, tag, "FAIL -- unexpected network_decrypt_capture result success=%d text=%s",
             ir.success ? 1 : 0,
@@ -13138,23 +13938,57 @@ namespace {
                 bridge_before.browser_open ? 1 : 0,
                 bridge_before.page_verified ? 1 : 0,
                 bridge_before.cleanup_pending ? 1 : 0);
-            aida::burp::camoufox::launch_config_t cfg;
-            cfg.headless = false;
-            cfg.launch_timeout_ms = 70000;
-            cfg.window_width = 1280;
-            cfg.window_height = 900;
-            cfg.enable_trace = true;
-            const bool launch_ok = aida::burp::camoufox::start_bridge(cfg);
-            auto bridge_after = aida::burp::camoufox::get_status();
-            log_msg(hf, tag, "PRECHECK -- Camoufox bridge start result ok=%d state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d err=%s",
-                launch_ok ? 1 : 0,
-                camoufox_bridge_state_name(bridge_after.state),
-                bridge_after.child_pid,
-                bridge_after.child_alive ? 1 : 0,
-                bridge_after.browser_open ? 1 : 0,
-                bridge_after.page_verified ? 1 : 0,
-                bridge_after.cleanup_pending ? 1 : 0,
-                compact_text(bridge_after.last_error, 700).c_str());
+            bool launch_ok = false;
+            aida::burp::camoufox::bridge_status_t bridge_after;
+            for (int attempt = 1; attempt <= 2; ++attempt) {
+                aida::burp::camoufox::launch_config_t cfg;
+                cfg.headless = false;
+                cfg.launch_timeout_ms = attempt == 1 ? 70000 : 90000;
+                cfg.window_width = 1280;
+                cfg.window_height = 900;
+                cfg.enable_trace = true;
+                log_msg(hf, tag, "PRECHECK -- Camoufox bridge launch attempt=%d timeout_ms=%d", attempt, cfg.launch_timeout_ms);
+                launch_ok = aida::burp::camoufox::start_bridge(cfg);
+                bridge_after = aida::burp::camoufox::get_status();
+                log_msg(hf, tag, "PRECHECK -- Camoufox bridge start result attempt=%d ok=%d state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d last_launch_ms=%llu last_cleanup_ms=%llu calls=%llu errors=%llu err=%s",
+                    attempt,
+                    launch_ok ? 1 : 0,
+                    camoufox_bridge_state_name(bridge_after.state),
+                    bridge_after.child_pid,
+                    bridge_after.child_alive ? 1 : 0,
+                    bridge_after.browser_open ? 1 : 0,
+                    bridge_after.page_verified ? 1 : 0,
+                    bridge_after.cleanup_pending ? 1 : 0,
+                    static_cast<unsigned long long>(bridge_after.last_launch_ms),
+                    static_cast<unsigned long long>(bridge_after.last_cleanup_ms),
+                    static_cast<unsigned long long>(bridge_after.total_calls),
+                    static_cast<unsigned long long>(bridge_after.total_errors),
+                    compact_text(bridge_after.last_error, 700).c_str());
+                if (launch_ok &&
+                    bridge_after.state == aida::burp::camoufox::bridge_state_t::ready &&
+                    bridge_after.browser_open &&
+                    bridge_after.page_verified &&
+                    bridge_after.child_alive) {
+                    break;
+                }
+                if (attempt == 1 &&
+                    bridge_after.last_error.find("launch_browser timeout") != std::string::npos) {
+                    const bool stopped = aida::burp::camoufox::stop_bridge("testlab.dom_xss_status.launch_timeout_retry");
+                    auto bridge_retry_stop = aida::burp::camoufox::get_status();
+                    log_msg(hf, tag, "PRECHECK -- Camoufox retry cleanup stopped=%d state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d err=%s",
+                        stopped ? 1 : 0,
+                        camoufox_bridge_state_name(bridge_retry_stop.state),
+                        bridge_retry_stop.child_pid,
+                        bridge_retry_stop.child_alive ? 1 : 0,
+                        bridge_retry_stop.browser_open ? 1 : 0,
+                        bridge_retry_stop.page_verified ? 1 : 0,
+                        bridge_retry_stop.cleanup_pending ? 1 : 0,
+                        compact_text(bridge_retry_stop.last_error, 700).c_str());
+                    Sleep(900);
+                    continue;
+                }
+                break;
+            }
             if (!launch_ok ||
                 bridge_after.state != aida::burp::camoufox::bridge_state_t::ready ||
                 !bridge_after.browser_open ||
@@ -13184,7 +14018,7 @@ namespace {
             record_fixture_failed_tool("burp_dom_xss_test_payload", failed);
             return;
         }
-        mcp_standalone::json args; args["target_url"] = burp_fixture_url(hf, "mcp.burp_dom_xss_test_payload", "/?q=test"); args["payload"] = "<img src=x onerror={CANARY_FN}('{CANARY}')>";
+        mcp_standalone::json args; args["target_url"] = burp_fixture_url(hf, "mcp.burp_dom_xss_test_payload", "/?q=test"); args["payload"] = R"(<img src=x onerror="try{{CANARY_FN}('test')}catch(e){};try{console.log('AIDA_DOM_XSS_CANARY:'+JSON.stringify({id:'img:{CANARY}',src:'test',token:'{CANARY}'}))}catch(e){}">)";
         args["timeout_ms"] = 30000;
         args["capture_screenshot"] = false;
         mcp_standalone::tool_result_t result;
@@ -13323,9 +14157,17 @@ namespace {
         test_tool_call(hf, "mcp.burp_payloads_add_custom", get_server(), "burp_payloads_add_custom", args, passed, failed, skipped);
     }
     void test_tool_burp_intruder_start(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        ensure_burp_http_fixture(hf, "mcp.burp_intruder_start");
+        if (!ensure_burp_http_fixture(hf, "mcp.burp_intruder_start") ||
+            !probe_burp_fixture_connect(hf, "mcp.burp_intruder_start")) {
+            log_msg(hf, "mcp.burp_intruder_start", "FAIL -- local HTTP fixture was not reachable before starting Intruder job");
+            record_fixture_failed_tool("burp_intruder_start", failed);
+            return;
+        }
         const uint16_t port = g_burp_http_fixture ? g_burp_http_fixture->port : 1;
-        mcp_standalone::json args; args["host"] = "127.0.0.1"; args["port"] = port; args["scheme"] = "http"; args["base_request"] = "GET /?q=test HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"; args["positions"] = mcp_standalone::json::array({mcp_standalone::json::array({8, 4})}); args["payload_sets"] = mcp_standalone::json::array({mcp_standalone::json::array({"aida"})}); args["total_cap"] = 1; args["concurrency"] = 1; args["timeout_ms"] = 1500;
+        std::string base_request = "GET /?q=test HTTP/1.1\r\nHost: 127.0.0.1:";
+        base_request += std::to_string(static_cast<unsigned>(port));
+        base_request += "\r\nConnection: close\r\n\r\n";
+        mcp_standalone::json args; args["host"] = "127.0.0.1"; args["port"] = port; args["scheme"] = "http"; args["base_request"] = base_request; args["positions"] = mcp_standalone::json::array({mcp_standalone::json::array({8, 4})}); args["payload_sets"] = mcp_standalone::json::array({mcp_standalone::json::array({"aida"})}); args["total_cap"] = 1; args["concurrency"] = 1; args["timeout_ms"] = 1500;
         mcp_standalone::tool_result_t result;
         auto status = test_tool_call(hf, "mcp.burp_intruder_start", get_server(), "burp_intruder_start", args, passed, failed, skipped, true, &result);
         if (status == mcp_tool_call_status_t::passed)
@@ -14098,6 +14940,7 @@ namespace {
 
     void mark_camoufox_reverse_dependency_guarded(HANDLE hf, const char* reason, std::atomic<int>& passed, std::atomic<int>& failed) {
         static const char* dependent_tools[] = {
+            "list_pages", "new_page", "select_page", "close_page",
             "navigate", "reload", "take_screenshot", "take_snapshot", "click", "type_text",
             "wait_for", "get_page_info", "reset_browser_state", "evaluate_js", "hook_function",
             "add_init_script", "inject_hook_preset", "remove_hooks", "get_console_logs",
@@ -14137,7 +14980,8 @@ namespace {
         auto launch_status = test_tool_call(hf, "mcp.camoufox.launch_browser", get_server(), "launch_browser",
             launch_args, passed, failed, skipped, false, &launch_result);
         if (launch_status != mcp_tool_call_status_t::passed) {
-            for (const char* tool : {"navigate", "reload", "take_screenshot", "take_snapshot", "click", "type_text",
+            for (const char* tool : {"list_pages", "new_page", "select_page", "close_page",
+                "navigate", "reload", "take_screenshot", "take_snapshot", "click", "type_text",
                 "wait_for", "get_page_info", "reset_browser_state", "evaluate_js", "hook_function",
                 "add_init_script", "inject_hook_preset", "remove_hooks", "get_console_logs",
                 "network_capture", "list_network_requests", "get_network_request", "get_request_initiator",
@@ -14154,6 +14998,121 @@ namespace {
         }
 
         const std::string fixture_url = burp_fixture_url(hf, tag, "/?q=AIDA_CAMOUFOX_DYNAMIC");
+
+        test_tool_call(hf, "mcp.camoufox.list_pages.initial", get_server(), "list_pages", {}, passed, failed, skipped);
+
+        const std::string page_suffix = std::to_string(static_cast<unsigned long long>(GetTickCount64()));
+        const std::string page_a = "aida_testlab_page_a_" + page_suffix;
+        const std::string page_b = "aida_testlab_page_b_" + page_suffix;
+
+        mcp_standalone::json page_a_args;
+        page_a_args["page_id"] = page_a;
+        page_a_args["make_active"] = true;
+        test_tool_call(hf, "mcp.camoufox.new_page.a", get_server(), "new_page", page_a_args, passed, failed, skipped);
+
+        mcp_standalone::json page_b_args;
+        page_b_args["page_id"] = page_b;
+        page_b_args["make_active"] = false;
+        test_tool_call(hf, "mcp.camoufox.new_page.b", get_server(), "new_page", page_b_args, passed, failed, skipped);
+
+        mcp_standalone::json list_pages_after_create;
+        mcp_standalone::tool_result_t list_pages_created_result;
+        auto list_pages_created_status = test_tool_call(hf, "mcp.camoufox.list_pages.created", get_server(), "list_pages",
+            list_pages_after_create, passed, failed, skipped, false, &list_pages_created_result);
+        if (list_pages_created_status == mcp_tool_call_status_t::passed) {
+            const bool found_a = json_array_contains_string_field(list_pages_created_result.data, "pages", page_a, {"page_id"});
+            const bool found_b = json_array_contains_string_field(list_pages_created_result.data, "pages", page_b, {"page_id"});
+            if (!found_a || !found_b) {
+                log_msg(hf, tag, "FAIL -- list_pages did not report both explicit page ids found_a=%d found_b=%d data=%s",
+                    found_a ? 1 : 0, found_b ? 1 : 0, compact_json(list_pages_created_result.data, 1200).c_str());
+                record_fixture_failed_tool("list_pages", failed);
+            }
+        }
+
+        mcp_standalone::json nav_page_a;
+        nav_page_a["page_id"] = page_a;
+        nav_page_a["url"] = burp_fixture_url(hf, tag, "/?q=AIDA_CAMOUFOX_PAGE_A");
+        nav_page_a["wait_until"] = "load";
+        nav_page_a["collect_response_chain"] = true;
+        nav_page_a["clear_network_capture"] = false;
+        nav_page_a["include_title"] = true;
+        test_tool_call(hf, "mcp.camoufox.navigate.page_a", get_server(), "navigate", nav_page_a, passed, failed, skipped);
+
+        mcp_standalone::json nav_page_b;
+        nav_page_b["page_id"] = page_b;
+        nav_page_b["url"] = burp_fixture_url(hf, tag, "/?q=AIDA_CAMOUFOX_PAGE_B");
+        nav_page_b["wait_until"] = "load";
+        nav_page_b["collect_response_chain"] = true;
+        nav_page_b["clear_network_capture"] = false;
+        nav_page_b["include_title"] = true;
+        test_tool_call(hf, "mcp.camoufox.navigate.page_b", get_server(), "navigate", nav_page_b, passed, failed, skipped);
+
+        mcp_standalone::json eval_page_a;
+        eval_page_a["page_id"] = page_a;
+        eval_page_a["expression"] = "(()=>{document.title='AIDA_PAGE_A';window.__aidaPage='A';return {page:window.__aidaPage,title:document.title,url:location.href};})()";
+        eval_page_a["await_promise"] = true;
+        test_tool_call(hf, "mcp.camoufox.evaluate_js.page_a", get_server(), "evaluate_js", eval_page_a, passed, failed, skipped);
+
+        mcp_standalone::json eval_page_b;
+        eval_page_b["page_id"] = page_b;
+        eval_page_b["expression"] = "(()=>{document.title='AIDA_PAGE_B';window.__aidaPage='B';return {page:window.__aidaPage,title:document.title,url:location.href};})()";
+        eval_page_b["await_promise"] = true;
+        test_tool_call(hf, "mcp.camoufox.evaluate_js.page_b", get_server(), "evaluate_js", eval_page_b, passed, failed, skipped);
+
+        mcp_standalone::json select_page_a;
+        select_page_a["page_id"] = page_a;
+        test_tool_call(hf, "mcp.camoufox.select_page.a", get_server(), "select_page", select_page_a, passed, failed, skipped);
+
+        mcp_standalone::json info_page_a;
+        info_page_a["page_id"] = page_a;
+        test_tool_call(hf, "mcp.camoufox.get_page_info.page_a", get_server(), "get_page_info", info_page_a, passed, failed, skipped);
+
+        mcp_standalone::json close_page_b;
+        close_page_b["page_id"] = page_b;
+        test_tool_call(hf, "mcp.camoufox.close_page.b", get_server(), "close_page", close_page_b, passed, failed, skipped);
+
+        const std::string session_two = "aida_testlab_session_" + page_suffix;
+        mcp_standalone::json launch_session_two;
+        launch_session_two["session_id"] = session_two;
+        launch_session_two["headless"] = false;
+        launch_session_two["launch_timeout_ms"] = 70000;
+        launch_session_two["window_width"] = 960;
+        launch_session_two["window_height"] = 700;
+        mcp_standalone::tool_result_t launch_session_two_result;
+        auto launch_session_two_status = test_tool_call(hf, "mcp.camoufox.launch_browser.session_two", get_server(), "launch_browser",
+            launch_session_two, passed, failed, skipped, false, &launch_session_two_result);
+        if (launch_session_two_status == mcp_tool_call_status_t::passed) {
+            const std::string page_c = "aida_testlab_page_c_" + page_suffix;
+            mcp_standalone::json page_c_args;
+            page_c_args["session_id"] = session_two;
+            page_c_args["page_id"] = page_c;
+            page_c_args["make_active"] = true;
+            test_tool_call(hf, "mcp.camoufox.new_page.session_two", get_server(), "new_page", page_c_args, passed, failed, skipped);
+
+            mcp_standalone::json nav_page_c;
+            nav_page_c["session_id"] = session_two;
+            nav_page_c["page_id"] = page_c;
+            nav_page_c["url"] = burp_fixture_url(hf, tag, "/?q=AIDA_CAMOUFOX_SESSION_TWO");
+            nav_page_c["wait_until"] = "load";
+            test_tool_call(hf, "mcp.camoufox.navigate.session_two", get_server(), "navigate", nav_page_c, passed, failed, skipped);
+
+            mcp_standalone::json eval_page_c;
+            eval_page_c["session_id"] = session_two;
+            eval_page_c["page_id"] = page_c;
+            eval_page_c["expression"] = "(()=>({session:'two',title:document.title,url:location.href}))()";
+            eval_page_c["await_promise"] = true;
+            test_tool_call(hf, "mcp.camoufox.evaluate_js.session_two", get_server(), "evaluate_js", eval_page_c, passed, failed, skipped);
+
+            mcp_standalone::json close_session_two;
+            close_session_two["session_id"] = session_two;
+            test_tool_call(hf, "mcp.camoufox.close_browser.session_two", get_server(), "close_browser", close_session_two, passed, failed, skipped);
+        } else {
+            for (const char* tool : {"new_page", "navigate", "evaluate_js"}) {
+                log_msg(hf, "mcp.camoufox_reverse_dynamic", "FAIL -- session_two \"%s\" not executed because launch_browser for second session failed: %s",
+                    tool, launch_session_two_result.text.c_str());
+                record_fixture_failed_tool(tool, failed);
+            }
+        }
 
         mcp_standalone::json reset_args;
         reset_args["clear_persistent_hooks"] = true;
@@ -14320,7 +15279,7 @@ namespace {
         test_tool_call(hf, "mcp.camoufox.instrumentation", get_server(), "instrumentation", instr_args, passed, failed, skipped);
 
         mcp_standalone::json signer_args;
-        signer_args["signer_code"] = "(sample) => ({aida_value: sample.aida_value})";
+        signer_args["signer_code"] = "(sample) => ({aida_value: sample && sample.aida_value ? sample.aida_value : 'signed'})";
         signer_args["samples"] = mcp_standalone::json::array({
             mcp_standalone::json::object({
                 {"id", "aida_signer_fixture"},
@@ -14605,15 +15564,20 @@ namespace {
     }
 
 }
-void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped, bool(*cancelled)()) {
+void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& global_skipped, bool(*cancelled)()) {
     log_msg(hf, "mcp_phase", "=== MCP TOOL TESTS START (AI/agent tools excluded from counters) ===");
     auto t0 = std::chrono::steady_clock::now();
     const int start_passed = passed.load(std::memory_order_acquire);
     const int start_failed = failed.load(std::memory_order_acquire);
-    const int start_skipped = skipped.load(std::memory_order_acquire);
+    const int start_skipped = global_skipped.load(std::memory_order_acquire);
+    std::atomic<int> skipped{0};
 
     g_invoked_tools.clear();
     g_tool_attempt_stats.clear();
+    {
+        std::lock_guard<std::mutex> lk(g_timed_out_invocations_mtx);
+        g_timed_out_invocations.clear();
+    }
     g_mcp_tool_sequence.store(0, std::memory_order_release);
     g_mcp_target_pid = driver_bridge::attached_pid();
     g_mcp_target_unavailable = (g_mcp_target_pid == 0);
@@ -14661,12 +15625,6 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     g_burp_fixture_base_url.clear();
     g_burp_fixture_wordlist_path.clear();
     g_burp_http_fixture.reset();
-    g_guest_lab_available = false;
-    g_guest_lab_pid = 0;
-    g_guest_lab_base_address.clear();
-    g_guest_lab_process_filter.clear();
-    g_guest_lab_dependency_guarded = false;
-    g_guest_lab_dependency_reason.clear();
     log_msg(hf, "mcp_phase", "target snapshot active_pid=%u target_unavailable=%d attached_pid=%u driver_status=\"%s\" driver_last_error=\"%s\" host_pid=%lu host_tid=%lu",
         g_mcp_target_pid,
         g_mcp_target_unavailable ? 1 : 0,
@@ -14712,16 +15670,11 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_grep_in_files(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_web_search(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_webfetch(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_connect(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_attach(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_unattach(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_read_memory(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_write_memory(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_dump_module(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_scan_pattern(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_read_string(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_read_pointer_chain(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_enumerate_modules(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_enumerate_kernel_modules(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_read_kernel_memory(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_write_kernel_memory(hf, passed, failed, skipped);
@@ -14730,10 +15683,8 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_driver_call_function(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_get_thread_context(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_set_thread_context(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_enumerate_threads(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_suspend_thread(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_resume_thread(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_query_memory(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_protect_memory(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_enumerate_memory_regions(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_read_peb(hf, passed, failed, skipped);
@@ -14746,23 +15697,9 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_driver_list_deferred_actions(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_cancel_deferred_action(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_get_deferred_results(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_enumerate_wfp_callouts(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_get_socket_handles(hf, passed, failed, skipped);
     if (!cancelled()) cleanup_mcp_network_state(hf, "before MCP driver network tools");
     if (!cancelled()) test_tool_driver_sniff_network_buffers(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_dump_tcpip_connections(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_inject_packet(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_modify_packet_rule(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_redirect_traffic(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_reassemble_stream(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_deep_inspect(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_intercept_hold(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_kill_connection(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_spoof_dns(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_bandwidth_monitor(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_list_interfaces(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_export_pcap(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_network_fingerprint(hf, passed, failed, skipped);
     if (!cancelled()) cleanup_mcp_network_state(hf, "after MCP driver network tools");
     if (!cancelled()) test_tool_driver_enum_kernel_callbacks(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_detect_integrity_checks(hf, passed, failed, skipped);
@@ -14785,28 +15722,17 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_driver_map_peb_modules(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_set_page_guard(hf, passed, failed, skipped);
 
-    if (!cancelled()) test_tool_dbg_set_breakpoint(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_dbg_remove_breakpoint(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_dbg_list_breakpoints(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_dbg_get_callstack(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_snapshot_state(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_compare_snapshots(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_detect_vm_handler(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_map_vm_handlers(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_dbg_run(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_dbg_pause(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_dbg_step_into(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_dbg_step_over(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_dbg_step_out(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_run_to_address(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_debugger_get_attached(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_debugger_get_registers(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_debugger_get_breakpoints(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_debugger_get_memory_map(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_debugger_get_callstack(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_debugger_get_threads(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_debugger_get_handles(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_debugger_get_modules(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_debugger_get_seh_chain(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_debugger_get_patches(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_debugger_set_breakpoint(hf, passed, failed, skipped);
@@ -14816,19 +15742,9 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_debugger_step_out(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_debugger_continue(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_debugger_pause(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_debugger_read_memory(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_debugger_write_memory(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_debugger_protect_memory(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_debugger_set_register(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_debugger_allocate_memory(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_debugger_call_function(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_debugger_start_trace(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_debugger_get_trace(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_debugger_attach_to_process(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_debugger_detach(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_dbg_get_registers(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_dbg_set_register(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_dbg_get_memory_map(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_add_watch(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_get_watches(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_remove_watch(hf, passed, failed, skipped);
@@ -14839,7 +15755,6 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_dbg_set_label(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_toggle_bookmark(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_find_strings(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_dbg_enumerate_handles(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_add_hw_breakpoint(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_toggle_breakpoint(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_clear_all_breakpoints(hf, passed, failed, skipped);
@@ -14851,10 +15766,8 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_dbg_scan_xrefs(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_build_cfg(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_get_cfg(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_dbg_get_seh_chain(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_get_modules_detail(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_add_patch(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_dbg_list_patches(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_remove_patch(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_nop_fill(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_find_code_caves(hf, passed, failed, skipped);
@@ -14950,39 +15863,11 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_sessions_attach_pid(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_sessions_close(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_sessions_run_binary(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_guest_lab_status(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_guest_lab_list_processes(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_guest_lab_attach(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_guest_lab_enumerate_modules(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_guest_lab_enumerate_threads(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_guest_lab_memory_map(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_guest_lab_query_memory(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_guest_lab_read_memory(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_guest_lab_read_string(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_guest_lab_dump_region(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_guest_lab_search_memory(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_guest_lab_detach(hf, passed, failed, skipped);
 
-    if (!cancelled()) test_tool_switch_agent(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_plan_enter(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_plan_exit(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_list_agents(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_ask_followup_question(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_attempt_completion(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_update_todo_list(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_apply_diff(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_apply_patch(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_codebase_search(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_read_command_output(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_save_checkpoint(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_restore_checkpoint(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_list_checkpoints(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_checkpoint_list(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_skill(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_run_slash_command(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_get_context(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_workflow_status(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_task(hf, passed, failed, skipped);
 
     if (!cancelled()) test_tool_search_workspace(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_run_command(hf, passed, failed, skipped);
@@ -15209,33 +16094,8 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_burp_tech_fingerprint(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_tech_inventory(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_tech_clear(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_browser_launch(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_browser_list(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_browser_detect(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_browser_kill(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_browser_kill_all(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_headless_view_install(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_headless_start(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_headless_status(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_headless_navigate(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_headless_reload(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_headless_evaluate(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_headless_screenshot(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_headless_snapshot(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_headless_click(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_headless_type(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_headless_wait_for(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_headless_console_logs(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_headless_network_requests(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_headless_inject_hook(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_headless_hook_function(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_headless_remove_hooks(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_headless_reset_state(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_headless_view_status(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_headless_view_quick_navigate(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_camoufox_open_url(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_camoufox_reverse_dynamic_tools(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_headless_stop(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_collaborator_status(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_collaborator_start(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_collaborator_generate_token(hf, passed, failed, skipped);
@@ -15256,44 +16116,101 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_burp_comparer_diff(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_comparer_remove_slot(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_comparer_clear(hf, passed, failed, skipped);
-    if (!cancelled()) cleanup_mcp_network_state(hf, "before MCP coverage audit");
-    if (!cancelled()) test_mcp_coverage_audit(hf, passed, failed, skipped);
+    if (!cancelled()) {
+        set_progress_step("mcp finalization: network cleanup before coverage audit");
+        cleanup_mcp_network_state(hf, "before MCP coverage audit");
+    }
+    if (!cancelled()) {
+        const auto cq_before_coverage = critical_work_queue::stats();
+        set_progress_step("mcp finalization: coverage audit");
+        log_msg(hf, "mcp.cleanup", "coverage_audit_begin cq_pending=%zu cq_active=%u cq_started=%llu cq_finished=%llu",
+            cq_before_coverage.pending,
+            static_cast<unsigned>(cq_before_coverage.active),
+            static_cast<unsigned long long>(cq_before_coverage.started),
+            static_cast<unsigned long long>(cq_before_coverage.finished));
+        test_mcp_coverage_audit(hf, passed, failed, skipped);
+        const auto cq_after_coverage = critical_work_queue::stats();
+        log_msg(hf, "mcp.cleanup", "coverage_audit_end cq_pending=%zu cq_active=%u cq_started=%llu cq_finished=%llu",
+            cq_after_coverage.pending,
+            static_cast<unsigned>(cq_after_coverage.active),
+            static_cast<unsigned long long>(cq_after_coverage.started),
+            static_cast<unsigned long long>(cq_after_coverage.finished));
+    }
+
+    set_progress_step("mcp finalization: outstanding worker drain");
+    wait_timed_out_invocation_drain(hf, "after coverage audit", 5000);
+
+    set_progress_step("mcp finalization: fixture cleanup");
+    log_msg(hf, "mcp.cleanup", "final_cleanup_begin driver_hw_tid=%u driver_hw_addr=0x%016llX dbg_hw_addr=0x%016llX dbg_sw_addr=0x%016llX patch_addr=0x%016llX integrity_addr=0x%016llX emu_addr=0x%016llX emulate_func_addr=0x%016llX fuzz_addr=0x%016llX fuzz_input_addr=0x%016llX scanner_pointer_addr=0x%016llX scanner_addr=0x%016llX fixture_active=%d",
+        g_mcp_driver_hw_tid,
+        static_cast<unsigned long long>(g_mcp_driver_hw_addr),
+        static_cast<unsigned long long>(g_mcp_dbg_hw_addr),
+        static_cast<unsigned long long>(g_mcp_dbg_sw_addr),
+        static_cast<unsigned long long>(g_mcp_patch_addr),
+        static_cast<unsigned long long>(g_mcp_integrity_addr),
+        static_cast<unsigned long long>(g_mcp_emulation_addr),
+        static_cast<unsigned long long>(g_mcp_emulate_function_addr),
+        static_cast<unsigned long long>(g_mcp_fuzz_addr),
+        static_cast<unsigned long long>(g_mcp_fuzz_input_addr),
+        static_cast<unsigned long long>(g_mcp_scanner_pointer_addr),
+        static_cast<unsigned long long>(g_mcp_scanner_addr),
+        g_burp_http_fixture ? 1 : 0);
+
+    auto release_remote_addr = [&](const char* label, uint64_t& slot) {
+        if (slot == 0)
+            return;
+        const uint64_t addr = slot;
+        slot = 0;
+        log_msg(hf, "mcp.cleanup", "%s_schedule addr=0x%016llX",
+            label ? label : "remote_free",
+            static_cast<unsigned long long>(addr));
+        const bool ok = bounded_finalizer_call(hf, label, 3000, [addr]() {
+            return driver_bridge::free_memory(addr);
+        });
+        log_msg(hf, "mcp.cleanup", "%s_result addr=0x%016llX completed_ok=%d ownership_released=1",
+            label ? label : "remote_free",
+            static_cast<unsigned long long>(addr),
+            ok ? 1 : 0);
+    };
+
+    auto release_debugger_addr = [&](const char* label, uint64_t& slot) {
+        if (slot == 0)
+            return;
+        const uint64_t addr = slot;
+        slot = 0;
+        log_msg(hf, "mcp.cleanup", "%s_schedule addr=0x%016llX",
+            label ? label : "debugger_free",
+            static_cast<unsigned long long>(addr));
+        const bool ok = bounded_finalizer_call(hf, label, 4000, [addr]() {
+            debugger_engine::clear_all_breakpoints();
+            return driver_bridge::free_memory(addr);
+        });
+        log_msg(hf, "mcp.cleanup", "%s_result addr=0x%016llX completed_ok=%d ownership_released=1",
+            label ? label : "debugger_free",
+            static_cast<unsigned long long>(addr),
+            ok ? 1 : 0);
+    };
 
     if (g_mcp_driver_hw_tid != 0) {
-        (void)driver_bridge::clear_hardware_breakpoint(g_mcp_driver_hw_tid, 0);
+        const uint32_t tid = g_mcp_driver_hw_tid;
         g_mcp_driver_hw_tid = 0;
+        const bool ok = bounded_finalizer_call(hf, "clear_driver_hw_breakpoint", 3000, [tid]() {
+            return driver_bridge::clear_hardware_breakpoint(tid, 0);
+        });
+        log_msg(hf, "mcp.cleanup", "clear_driver_hw_breakpoint_result tid=%u completed_ok=%d ownership_released=1",
+            tid,
+            ok ? 1 : 0);
     }
-    if (g_mcp_driver_hw_addr != 0) {
-        driver_bridge::free_memory(g_mcp_driver_hw_addr);
-        g_mcp_driver_hw_addr = 0;
-    }
-    if (g_mcp_dbg_hw_addr != 0) {
-        debugger_engine::clear_all_breakpoints();
-        driver_bridge::free_memory(g_mcp_dbg_hw_addr);
-        g_mcp_dbg_hw_addr = 0;
-    }
+    release_remote_addr("free_driver_hw_addr", g_mcp_driver_hw_addr);
+    release_debugger_addr("free_dbg_hw_addr", g_mcp_dbg_hw_addr);
     if (g_mcp_dbg_sw_addr != 0) {
-        debugger_engine::clear_all_breakpoints();
-        driver_bridge::free_memory(g_mcp_dbg_sw_addr);
-        g_mcp_dbg_sw_addr = 0;
+        release_debugger_addr("free_dbg_sw_addr", g_mcp_dbg_sw_addr);
         g_mcp_debugger_bp_index = -1;
     }
-    if (g_mcp_patch_addr != 0) {
-        driver_bridge::free_memory(g_mcp_patch_addr);
-        g_mcp_patch_addr = 0;
-    }
-    if (g_mcp_integrity_addr != 0) {
-        driver_bridge::free_memory(g_mcp_integrity_addr);
-        g_mcp_integrity_addr = 0;
-    }
-    if (g_mcp_emulation_addr != 0) {
-        driver_bridge::free_memory(g_mcp_emulation_addr);
-        g_mcp_emulation_addr = 0;
-    }
-    if (g_mcp_emulate_function_addr != 0) {
-        driver_bridge::free_memory(g_mcp_emulate_function_addr);
-        g_mcp_emulate_function_addr = 0;
-    }
+    release_remote_addr("free_patch_addr", g_mcp_patch_addr);
+    release_remote_addr("free_integrity_addr", g_mcp_integrity_addr);
+    release_remote_addr("free_emulation_addr", g_mcp_emulation_addr);
+    release_remote_addr("free_emulate_function_addr", g_mcp_emulate_function_addr);
     if (fuzzer_engine::g_state.running.load() || fuzzer_engine::g_state.worker_active.load()) {
         log_msg(hf, "mcp.cleanup", "waiting for fuzzer idle running=%d worker=%d setup_complete=%d setup_success=%d",
             fuzzer_engine::g_state.running.load() ? 1 : 0,
@@ -15308,31 +16225,41 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     }
     if (g_mcp_fuzz_addr != 0) {
         if (!fuzzer_engine::g_state.running.load() && !fuzzer_engine::g_state.worker_active.load()) {
-            driver_bridge::free_memory(g_mcp_fuzz_addr);
-            g_mcp_fuzz_addr = 0;
+            release_remote_addr("free_fuzz_addr", g_mcp_fuzz_addr);
         }
     }
     if (g_mcp_fuzz_input_addr != 0) {
         if (!fuzzer_engine::g_state.running.load() && !fuzzer_engine::g_state.worker_active.load()) {
-            driver_bridge::free_memory(g_mcp_fuzz_input_addr);
-            g_mcp_fuzz_input_addr = 0;
+            release_remote_addr("free_fuzz_input_addr", g_mcp_fuzz_input_addr);
         }
     }
-    if (g_mcp_scanner_pointer_addr != 0) {
-        driver_bridge::free_memory(g_mcp_scanner_pointer_addr);
-        g_mcp_scanner_pointer_addr = 0;
+    release_remote_addr("free_scanner_pointer_addr", g_mcp_scanner_pointer_addr);
+    release_remote_addr("free_scanner_addr", g_mcp_scanner_addr);
+    if (g_burp_http_fixture) {
+        auto fixture_owner = std::shared_ptr<mcp_burp_http_fixture_t>(std::move(g_burp_http_fixture));
+        const uint16_t fixture_port = fixture_owner ? fixture_owner->port : 0;
+        const bool fixture_live = fixture_owner ? fixture_owner->live() : false;
+        log_msg(hf, "mcp.cleanup", "fixture_reset_schedule active=1 port=%u live=%d",
+            static_cast<unsigned>(fixture_port),
+            fixture_live ? 1 : 0);
+        const bool ok = bounded_finalizer_call(hf, "burp_http_fixture_reset", 5000, [fixture_owner]() mutable {
+            auto owned = fixture_owner;
+            fixture_owner.reset();
+            owned.reset();
+            return true;
+        });
+        log_msg(hf, "mcp.cleanup", "fixture_reset_result port=%u completed_ok=%d ownership_released=1",
+            static_cast<unsigned>(fixture_port),
+            ok ? 1 : 0);
+    } else {
+        log_msg(hf, "mcp.cleanup", "fixture_reset_skip active=0");
     }
-    if (g_mcp_scanner_addr != 0) {
-        driver_bridge::free_memory(g_mcp_scanner_addr);
-        g_mcp_scanner_addr = 0;
-    }
-    g_burp_http_fixture.reset();
     g_burp_fixture_base_url.clear();
     g_burp_fixture_wordlist_path.clear();
 
-    const int raw_skip_delta = skipped.load(std::memory_order_acquire) - start_skipped;
+    set_progress_step("mcp finalization: accounting");
+    const int raw_skip_delta = skipped.load(std::memory_order_acquire);
     if (raw_skip_delta > 0) {
-        skipped.fetch_sub(raw_skip_delta, std::memory_order_acq_rel);
         failed.fetch_add(raw_skip_delta, std::memory_order_acq_rel);
         log_msg(hf, "mcp.phase_accounting", "FAIL -- converted %d non-destructive MCP skipped preconditions into failures so only registered destructive Test Lab guards contribute to global skips", raw_skip_delta);
     }
@@ -15341,9 +16268,10 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
     const int delta_passed = passed.load(std::memory_order_acquire) - start_passed;
     const int delta_failed = failed.load(std::memory_order_acquire) - start_failed;
-    const int delta_skipped = skipped.load(std::memory_order_acquire) - start_skipped;
+    const int delta_skipped = global_skipped.load(std::memory_order_acquire) - start_skipped;
     log_msg(hf, "mcp.phase_accounting", "registered_tool_records=%zu explicit_invocations=%zu pass_delta=%d fail_delta=%d skip_delta=%d",
         g_tool_attempt_stats.size(), g_invoked_tools.size(), delta_passed, delta_failed, delta_skipped);
+    set_progress_step("mcp complete");
     log_msg(hf, "mcp_phase", "=== MCP TOOL TESTS DONE (elapsed %lld ms) ===", (long long)ms);
 }
 

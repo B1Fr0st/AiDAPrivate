@@ -288,6 +288,7 @@ register_set_t              cached_registers();
 std::vector<cached_thread_t> cached_thread_list();
 std::vector<uint8_t>        cached_stack_bytes(uint64_t& addr_out);
 std::vector<uint8_t>        cached_dump_bytes(uint64_t& addr_out, size_t& size_out);
+bool                        dump_refresh_in_flight();
 std::vector<uint8_t>        cached_disasm_window(uint64_t& base_out);
 
 void request_refresh(uint32_t max_age_ms = 100);

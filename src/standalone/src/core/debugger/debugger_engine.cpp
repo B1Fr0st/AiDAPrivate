@@ -1440,30 +1440,141 @@ bool run_to_address(uint64_t address, bool wait_for_completion, uint32_t timeout
 		return false;
 	}
 
+	const uint32_t target_pid = st.target_pid;
+	const uint32_t active_tid_at_entry = st.active_tid;
+	driver_bridge::memory_region_t region{};
+	const bool region_ok = driver_bridge::query_memory_for(target_pid, address, region);
+	uint32_t entry_exit_code = 0;
+	const bool alive_at_entry = driver_bridge::attached_process_alive(&entry_exit_code);
 	diag::log_tagged_fmt("debugger",
-		"run_to_address_begin addr=0x%llx wait=%d timeout_ms=%u",
+		"run_to_address_begin pid=%u active_tid=%u addr=0x%llx wait=%d timeout_ms=%u alive=%d exit_code=0x%08X region_ok=%d region_base=0x%llx region_size=0x%llx region_state=0x%08X region_protect=0x%08X region_type=0x%08X",
+		static_cast<unsigned>(target_pid),
+		static_cast<unsigned>(active_tid_at_entry),
 		static_cast<unsigned long long>(address),
 		wait_for_completion ? 1 : 0,
-		static_cast<unsigned>(timeout_ms));
+		static_cast<unsigned>(timeout_ms),
+		alive_at_entry ? 1 : 0,
+		static_cast<unsigned>(entry_exit_code),
+		region_ok ? 1 : 0,
+		static_cast<unsigned long long>(region.base),
+		static_cast<unsigned long long>(region.size),
+		static_cast<unsigned>(region.state),
+		static_cast<unsigned>(region.protect),
+		static_cast<unsigned>(region.type));
+
+	if (wait_for_completion && active_tid_at_entry != 0) {
+		uint32_t pre_previous_suspend = 0;
+		driver_bridge::thread_context_t pre_ctx{};
+		const bool pre_suspend_ok = driver_bridge::suspend_thread(active_tid_at_entry, &pre_previous_suspend);
+		const bool pre_context_ok = pre_suspend_ok && driver_bridge::get_thread_context(active_tid_at_entry, pre_ctx);
+		diag::log_tagged_fmt("debugger",
+			"run_to_address_precheck pid=%u tid=%u suspend_ok=%d previous_suspend=%u context_ok=%d rip=0x%llx rsp=0x%llx rflags=0x%llx target=0x%llx",
+			static_cast<unsigned>(target_pid),
+			static_cast<unsigned>(active_tid_at_entry),
+			pre_suspend_ok ? 1 : 0,
+			static_cast<unsigned>(pre_previous_suspend),
+			pre_context_ok ? 1 : 0,
+			static_cast<unsigned long long>(pre_ctx.rip),
+			static_cast<unsigned long long>(pre_ctx.rsp),
+			static_cast<unsigned long long>(pre_ctx.rflags),
+			static_cast<unsigned long long>(address));
+		if (pre_context_ok && (pre_ctx.rip == address || pre_ctx.rip == address + 1)) {
+			bool adjusted = false;
+			if (pre_ctx.rip == address + 1) {
+				pre_ctx.rip = address;
+				adjusted = driver_bridge::set_thread_context(active_tid_at_entry, pre_ctx, ~0ULL);
+			}
+			bool release_added_suspend = false;
+			uint32_t release_previous = 0;
+			if (pre_suspend_ok && pre_previous_suspend > 0) {
+				release_added_suspend = driver_bridge::resume_thread(active_tid_at_entry, &release_previous);
+			}
+			st.active_tid = active_tid_at_entry;
+			{
+				std::lock_guard<std::mutex> lk(st.reg_mutex);
+				st.registers = capture_registers_from_context(pre_ctx);
+			}
+			signal_trap(address);
+			st.status.store(dbg_status_t::paused);
+			invalidate_cache();
+			uint32_t exit_after = 0;
+			const bool alive_after = driver_bridge::attached_process_alive(&exit_after);
+			diag::log_tagged_fmt("debugger",
+				"run_to_address_ALREADY_REACHED pid=%u tid=%u addr=0x%llx previous_suspend=%u adjusted=%d release_added_suspend=%d release_previous=%u alive=%d exit_code=0x%08X",
+				static_cast<unsigned>(target_pid),
+				static_cast<unsigned>(active_tid_at_entry),
+				static_cast<unsigned long long>(address),
+				static_cast<unsigned>(pre_previous_suspend),
+				adjusted ? 1 : 0,
+				release_added_suspend ? 1 : 0,
+				static_cast<unsigned>(release_previous),
+				alive_after ? 1 : 0,
+				static_cast<unsigned>(exit_after));
+			return true;
+		}
+		if (pre_suspend_ok) {
+			uint32_t resume_previous = 0;
+			const bool resume_ok = driver_bridge::resume_thread(active_tid_at_entry, &resume_previous);
+			diag::log_tagged_fmt("debugger",
+				"run_to_address_precheck_release pid=%u tid=%u resume_ok=%d resume_previous=%u previous_suspend=%u",
+				static_cast<unsigned>(target_pid),
+				static_cast<unsigned>(active_tid_at_entry),
+				resume_ok ? 1 : 0,
+				static_cast<unsigned>(resume_previous),
+				static_cast<unsigned>(pre_previous_suspend));
+		}
+	}
 
 	std::vector<uint8_t> orig_buf;
-	if (!driver_bridge::read_memory(address, 1, orig_buf) || orig_buf.empty()) {
+	SetLastError(ERROR_SUCCESS);
+	const bool read_ok = driver_bridge::read_memory(address, 1, orig_buf);
+	const DWORD read_gle = read_ok ? ERROR_SUCCESS : GetLastError();
+	if (!read_ok || orig_buf.empty()) {
 		set_last_error("run_to_address: read_memory failed");
 		diag::log_tagged_fmt("debugger",
-			"run_to_address_read_FAILED addr=0x%llx",
-			static_cast<unsigned long long>(address));
+			"run_to_address_read_FAILED pid=%u active_tid=%u addr=0x%llx read_ok=%d bytes=%zu gle=%lu region_ok=%d region_base=0x%llx region_size=0x%llx region_state=0x%08X region_protect=0x%08X",
+			static_cast<unsigned>(target_pid),
+			static_cast<unsigned>(st.active_tid),
+			static_cast<unsigned long long>(address),
+			read_ok ? 1 : 0,
+			orig_buf.size(),
+			static_cast<unsigned long>(read_gle),
+			region_ok ? 1 : 0,
+			static_cast<unsigned long long>(region.base),
+			static_cast<unsigned long long>(region.size),
+			static_cast<unsigned>(region.state),
+			static_cast<unsigned>(region.protect));
 		return false;
 	}
 
 	const uint8_t cc_byte = 0xCC;
 	std::vector<uint8_t> cc_buf{cc_byte};
-	if (!driver_bridge::write_memory(address, cc_buf)) {
+	SetLastError(ERROR_SUCCESS);
+	const bool write_ok = driver_bridge::write_memory(address, cc_buf);
+	const DWORD write_gle = write_ok ? ERROR_SUCCESS : GetLastError();
+	if (!write_ok) {
 		set_last_error("run_to_address: write_memory failed");
 		diag::log_tagged_fmt("debugger",
-			"run_to_address_write_FAILED addr=0x%llx",
-			static_cast<unsigned long long>(address));
+			"run_to_address_write_FAILED pid=%u active_tid=%u addr=0x%llx original=0x%02X gle=%lu region_ok=%d region_base=0x%llx region_size=0x%llx region_state=0x%08X region_protect=0x%08X",
+			static_cast<unsigned>(target_pid),
+			static_cast<unsigned>(st.active_tid),
+			static_cast<unsigned long long>(address),
+			static_cast<unsigned>(orig_buf[0]),
+			static_cast<unsigned long>(write_gle),
+			region_ok ? 1 : 0,
+			static_cast<unsigned long long>(region.base),
+			static_cast<unsigned long long>(region.size),
+			static_cast<unsigned>(region.state),
+			static_cast<unsigned>(region.protect));
 		return false;
 	}
+	diag::log_tagged_fmt("debugger",
+		"run_to_address_breakpoint_written pid=%u active_tid=%u addr=0x%llx original=0x%02X replacement=0x%02X",
+		static_cast<unsigned>(target_pid),
+		static_cast<unsigned>(st.active_tid),
+		static_cast<unsigned long long>(address),
+		static_cast<unsigned>(orig_buf[0]),
+		static_cast<unsigned>(cc_byte));
 
 	{
 		std::lock_guard<std::mutex> lk(st.bp_mutex);
@@ -1501,28 +1612,78 @@ bool run_to_address(uint64_t address, bool wait_for_completion, uint32_t timeout
 	}
 
 	auto threads = driver_bridge::enumerate_threads();
+	int resume_attempted = 0;
+	int resume_succeeded = 0;
+	int resume_failed = 0;
 	for (const auto& t : threads) {
 		if (t.owner_pid != st.target_pid) continue;
-		driver_bridge::resume_thread(t.tid);
+		++resume_attempted;
+		uint32_t resume_previous = 0;
+		SetLastError(ERROR_SUCCESS);
+		const bool resume_ok = driver_bridge::resume_thread(t.tid, &resume_previous);
+		const DWORD resume_gle = resume_ok ? ERROR_SUCCESS : GetLastError();
+		if (resume_ok)
+			++resume_succeeded;
+		else
+			++resume_failed;
+		diag::log_tagged_fmt("debugger",
+			"run_to_address_resume_thread pid=%u tid=%u ok=%d previous_suspend=%u gle=%lu",
+			static_cast<unsigned>(target_pid),
+			static_cast<unsigned>(t.tid),
+			resume_ok ? 1 : 0,
+			static_cast<unsigned>(resume_previous),
+			static_cast<unsigned long>(resume_gle));
 	}
 
 	st.status.store(dbg_status_t::running);
+	diag::log_tagged_fmt("debugger",
+		"run_to_address_resume_summary pid=%u active_tid=%u addr=0x%llx attempted=%d succeeded=%d failed=%d wait=%d",
+		static_cast<unsigned>(target_pid),
+		static_cast<unsigned>(st.active_tid),
+		static_cast<unsigned long long>(address),
+		resume_attempted,
+		resume_succeeded,
+		resume_failed,
+		wait_for_completion ? 1 : 0);
 
-	if (!wait_for_completion)
+	if (!wait_for_completion) {
+		diag::log_tagged_fmt("debugger",
+			"run_to_address_armed pid=%u active_tid=%u addr=0x%llx original=0x%02X wait=0",
+			static_cast<unsigned>(target_pid),
+			static_cast<unsigned>(st.active_tid),
+			static_cast<unsigned long long>(address),
+			static_cast<unsigned>(orig_buf[0]));
 		return true;
+	}
 
+	const auto wait_start = std::chrono::steady_clock::now();
 	auto deadline = std::chrono::steady_clock::now() +
 		std::chrono::milliseconds(timeout_ms);
 	bool reached = false;
 	uint32_t hit_tid = 0;
+	uint64_t last_probe_rip = 0;
+	uint64_t last_probe_rsp = 0;
+	uint64_t last_probe_rflags = 0;
+	uint32_t last_probe_tid = 0;
+	uint32_t probe_count = 0;
+	uint32_t context_ok_count = 0;
+	uint32_t context_fail_count = 0;
 	while (std::chrono::steady_clock::now() < deadline) {
 		std::this_thread::sleep_for(std::chrono::milliseconds(10));
 		auto probe_threads = driver_bridge::enumerate_threads();
 		for (const auto& th : probe_threads) {
 			if (th.owner_pid != st.target_pid) continue;
+			++probe_count;
 			driver_bridge::thread_context_t kctx{};
-			if (!driver_bridge::get_thread_context(th.tid, kctx))
+			if (!driver_bridge::get_thread_context(th.tid, kctx)) {
+				++context_fail_count;
 				continue;
+			}
+			++context_ok_count;
+			last_probe_tid = th.tid;
+			last_probe_rip = kctx.rip;
+			last_probe_rsp = kctx.rsp;
+			last_probe_rflags = kctx.rflags;
 			if (kctx.rip == address || kctx.rip == address + 1) {
 				reached = true;
 				hit_tid = th.tid;
@@ -1536,13 +1697,113 @@ bool run_to_address(uint64_t address, bool wait_for_completion, uint32_t timeout
 		if (reached) break;
 	}
 
+	bool hit_suspend_ok = false;
+	bool hit_context_ok = false;
+	bool hit_adjusted = false;
+	uint32_t hit_previous_suspend = 0;
+	uint64_t hit_final_rip = 0;
+	uint64_t hit_final_rsp = 0;
+	uint64_t hit_final_rflags = 0;
+	if (reached && hit_tid != 0) {
+		SetLastError(ERROR_SUCCESS);
+		hit_suspend_ok = driver_bridge::suspend_thread(hit_tid, &hit_previous_suspend);
+		const DWORD hit_suspend_gle = hit_suspend_ok ? ERROR_SUCCESS : GetLastError();
+		driver_bridge::thread_context_t hit_ctx{};
+		if (hit_suspend_ok) {
+			hit_context_ok = driver_bridge::get_thread_context(hit_tid, hit_ctx);
+			hit_final_rip = hit_ctx.rip;
+			hit_final_rsp = hit_ctx.rsp;
+			hit_final_rflags = hit_ctx.rflags;
+			if (hit_context_ok && hit_ctx.rip == address + 1) {
+				hit_ctx.rip = address;
+				hit_adjusted = driver_bridge::set_thread_context(hit_tid, hit_ctx, ~0ULL);
+				hit_final_rip = hit_ctx.rip;
+			}
+			if (hit_context_ok) {
+				std::lock_guard<std::mutex> lk(st.reg_mutex);
+				st.registers = capture_registers_from_context(hit_ctx);
+			}
+		}
+		diag::log_tagged_fmt("debugger",
+			"run_to_address_hit_suspend pid=%u tid=%u suspend_ok=%d previous_suspend=%u gle=%lu context_ok=%d rip=0x%llx rsp=0x%llx rflags=0x%llx adjusted=%d target=0x%llx",
+			static_cast<unsigned>(target_pid),
+			static_cast<unsigned>(hit_tid),
+			hit_suspend_ok ? 1 : 0,
+			static_cast<unsigned>(hit_previous_suspend),
+			static_cast<unsigned long>(hit_suspend_gle),
+			hit_context_ok ? 1 : 0,
+			static_cast<unsigned long long>(hit_final_rip),
+			static_cast<unsigned long long>(hit_final_rsp),
+			static_cast<unsigned long long>(hit_final_rflags),
+			hit_adjusted ? 1 : 0,
+			static_cast<unsigned long long>(address));
+	}
+
+	struct suspended_cleanup_thread_t {
+		uint32_t tid = 0;
+		uint32_t previous_suspend = 0;
+		bool suspend_ok = false;
+		bool context_ok = false;
+		bool adjusted = false;
+		uint64_t rip = 0;
+		uint64_t rsp = 0;
+		uint64_t rflags = 0;
+	};
+	std::vector<suspended_cleanup_thread_t> cleanup_threads;
+	if (!reached) {
+		auto cleanup_probe_threads = driver_bridge::enumerate_threads();
+		for (const auto& th : cleanup_probe_threads) {
+			if (th.owner_pid != target_pid)
+				continue;
+			suspended_cleanup_thread_t item;
+			item.tid = th.tid;
+			SetLastError(ERROR_SUCCESS);
+			item.suspend_ok = driver_bridge::suspend_thread(th.tid, &item.previous_suspend);
+			const DWORD suspend_gle = item.suspend_ok ? ERROR_SUCCESS : GetLastError();
+			driver_bridge::thread_context_t kctx{};
+			if (item.suspend_ok) {
+				item.context_ok = driver_bridge::get_thread_context(th.tid, kctx);
+				item.rip = kctx.rip;
+				item.rsp = kctx.rsp;
+				item.rflags = kctx.rflags;
+				if (item.context_ok && kctx.rip == address + 1) {
+					kctx.rip = address;
+					item.adjusted = driver_bridge::set_thread_context(th.tid, kctx, ~0ULL);
+					item.rip = kctx.rip;
+				}
+			}
+			diag::log_tagged_fmt("debugger",
+				"run_to_address_timeout_suspend pid=%u tid=%u suspend_ok=%d previous_suspend=%u gle=%lu context_ok=%d rip=0x%llx rsp=0x%llx rflags=0x%llx adjusted=%d",
+				static_cast<unsigned>(target_pid),
+				static_cast<unsigned>(item.tid),
+				item.suspend_ok ? 1 : 0,
+				static_cast<unsigned>(item.previous_suspend),
+				static_cast<unsigned long>(suspend_gle),
+				item.context_ok ? 1 : 0,
+				static_cast<unsigned long long>(item.rip),
+				static_cast<unsigned long long>(item.rsp),
+				static_cast<unsigned long long>(item.rflags),
+				item.adjusted ? 1 : 0);
+			cleanup_threads.push_back(item);
+		}
+	}
+
+	bool restore_attempted = false;
+	bool restore_ok = false;
+	DWORD restore_gle = ERROR_SUCCESS;
+	int internal_removed = 0;
+	int public_removed = 0;
 	{
 		std::lock_guard<std::mutex> lk(st.bp_mutex);
 		for (auto it = st.internal_breakpoints.begin(); it != st.internal_breakpoints.end(); ) {
 			if (it->address == address && it->active) {
 				std::vector<uint8_t> restore{it->original_byte};
-				driver_bridge::write_memory(address, restore);
+				SetLastError(ERROR_SUCCESS);
+				restore_attempted = true;
+				restore_ok = driver_bridge::write_memory(address, restore);
+				restore_gle = restore_ok ? ERROR_SUCCESS : GetLastError();
 				it = st.internal_breakpoints.erase(it);
+				++internal_removed;
 			} else {
 				++it;
 			}
@@ -1551,20 +1812,49 @@ bool run_to_address(uint64_t address, bool wait_for_completion, uint32_t timeout
 			if (it->address == address && it->is_internal &&
 				it->state == bp_state_t::one_shot && it->byte_written) {
 				it = st.breakpoints.erase(it);
+				++public_removed;
 			} else {
 				++it;
 			}
 		}
 	}
+	diag::log_tagged_fmt("debugger",
+		"run_to_address_breakpoint_cleanup pid=%u active_tid=%u addr=0x%llx restore_attempted=%d restore_ok=%d restore_gle=%lu internal_removed=%d public_removed=%d",
+		static_cast<unsigned>(target_pid),
+		static_cast<unsigned>(st.active_tid),
+		static_cast<unsigned long long>(address),
+		restore_attempted ? 1 : 0,
+		restore_ok ? 1 : 0,
+		static_cast<unsigned long>(restore_gle),
+		internal_removed,
+		public_removed);
 
 	if (!reached) {
 		set_last_error("run_to_address: timed out waiting for trap");
 		st.status.store(dbg_status_t::paused);
 		invalidate_cache();
+		uint32_t exit_after = 0;
+		const bool alive_after = driver_bridge::attached_process_alive(&exit_after);
+		const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::steady_clock::now() - wait_start).count();
 		diag::log_tagged_fmt("debugger",
-			"run_to_address_TIMEOUT addr=0x%llx timeout_ms=%u",
+			"run_to_address_TIMEOUT pid=%u active_tid=%u addr=0x%llx timeout_ms=%u elapsed_ms=%lld probes=%u context_ok=%u context_fail=%u last_tid=%u last_rip=0x%llx last_rsp=0x%llx last_rflags=0x%llx cleanup_suspended=%zu restore_ok=%d alive=%d exit_code=0x%08X",
+			static_cast<unsigned>(target_pid),
+			static_cast<unsigned>(st.active_tid),
 			static_cast<unsigned long long>(address),
-			static_cast<unsigned>(timeout_ms));
+			static_cast<unsigned>(timeout_ms),
+			static_cast<long long>(elapsed_ms),
+			static_cast<unsigned>(probe_count),
+			static_cast<unsigned>(context_ok_count),
+			static_cast<unsigned>(context_fail_count),
+			static_cast<unsigned>(last_probe_tid),
+			static_cast<unsigned long long>(last_probe_rip),
+			static_cast<unsigned long long>(last_probe_rsp),
+			static_cast<unsigned long long>(last_probe_rflags),
+			cleanup_threads.size(),
+			restore_ok ? 1 : 0,
+			alive_after ? 1 : 0,
+			static_cast<unsigned>(exit_after));
 		return false;
 	}
 
@@ -1574,10 +1864,27 @@ bool run_to_address(uint64_t address, bool wait_for_completion, uint32_t timeout
 	}
 	st.status.store(dbg_status_t::paused);
 	invalidate_cache();
+	uint32_t exit_after = 0;
+	const bool alive_after = driver_bridge::attached_process_alive(&exit_after);
+	const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+		std::chrono::steady_clock::now() - wait_start).count();
 	diag::log_tagged_fmt("debugger",
-		"run_to_address_reached addr=0x%llx hit_tid=%u",
+		"run_to_address_reached pid=%u active_tid=%u addr=0x%llx hit_tid=%u elapsed_ms=%lld probes=%u context_ok=%u context_fail=%u hit_suspend_ok=%d hit_context_ok=%d hit_rip=0x%llx hit_rsp=0x%llx restore_ok=%d alive=%d exit_code=0x%08X",
+		static_cast<unsigned>(target_pid),
+		static_cast<unsigned>(st.active_tid),
 		static_cast<unsigned long long>(address),
-		static_cast<unsigned>(hit_tid));
+		static_cast<unsigned>(hit_tid),
+		static_cast<long long>(elapsed_ms),
+		static_cast<unsigned>(probe_count),
+		static_cast<unsigned>(context_ok_count),
+		static_cast<unsigned>(context_fail_count),
+		hit_suspend_ok ? 1 : 0,
+		hit_context_ok ? 1 : 0,
+		static_cast<unsigned long long>(hit_final_rip),
+		static_cast<unsigned long long>(hit_final_rsp),
+		restore_ok ? 1 : 0,
+		alive_after ? 1 : 0,
+		static_cast<unsigned>(exit_after));
 	return true;
 }
 
@@ -2561,6 +2868,10 @@ std::vector<uint8_t> cached_dump_bytes(uint64_t& addr_out, size_t& size_out) {
 	return st.cached_dump;
 }
 
+bool dump_refresh_in_flight() {
+	return g_state.dump_refresh_in_flight.load(std::memory_order_acquire);
+}
+
 std::vector<uint8_t> cached_disasm_window(uint64_t& base_out) {
 	auto& st = g_state;
 	std::lock_guard<std::mutex> lk(st.cache_mtx);
@@ -2737,18 +3048,48 @@ void request_stack_refresh(uint64_t rsp, size_t bytes, uint32_t max_age_ms) {
 
 void request_dump_refresh(uint64_t addr, size_t bytes, uint32_t max_age_ms) {
 	auto& st = g_state;
-	if (addr == 0 || bytes == 0) return;
 	uint64_t now = now_ms();
-	if (now - st.last_dump_refresh_ms.load() < max_age_ms) return;
+	const uint64_t last = st.last_dump_refresh_ms.load();
+	const uint64_t age = now >= last ? now - last : 0;
+	diag::log_tagged_fmt("debugger_engine", "dump_refresh_request addr=0x%llX bytes=%zu max_age_ms=%u attached_pid=%u last_ms=%llu age_ms=%llu in_flight=%d",
+		static_cast<unsigned long long>(addr),
+		bytes,
+		max_age_ms,
+		driver_bridge::attached_pid(),
+		static_cast<unsigned long long>(last),
+		static_cast<unsigned long long>(age),
+		st.dump_refresh_in_flight.load(std::memory_order_acquire) ? 1 : 0);
+	if (addr == 0 || bytes == 0) {
+		diag::log_tagged_fmt("debugger_engine", "dump_refresh_reject_invalid addr=0x%llX bytes=%zu", static_cast<unsigned long long>(addr), bytes);
+		return;
+	}
+	if (age < max_age_ms) {
+		diag::log_tagged_fmt("debugger_engine", "dump_refresh_throttled addr=0x%llX bytes=%zu age_ms=%llu max_age_ms=%u",
+			static_cast<unsigned long long>(addr), bytes, static_cast<unsigned long long>(age), max_age_ms);
+		return;
+	}
 	bool expected = false;
-	if (!st.dump_refresh_in_flight.compare_exchange_strong(expected, true)) return;
+	if (!st.dump_refresh_in_flight.compare_exchange_strong(expected, true)) {
+		diag::log_tagged_fmt("debugger_engine", "dump_refresh_busy addr=0x%llX bytes=%zu", static_cast<unsigned long long>(addr), bytes);
+		return;
+	}
 
 	try {
-		if (!work_queue::post([addr, bytes]() {
+		if (!work_queue::post([addr, bytes, now]() {
 			auto& s = g_state;
+			const uint64_t worker_start = now_ms();
+			diag::log_tagged_fmt("debugger_engine", "dump_refresh_worker_entry addr=0x%llX bytes=%zu request_age_ms=%llu attached_pid=%u",
+				static_cast<unsigned long long>(addr),
+				bytes,
+				static_cast<unsigned long long>(worker_start >= now ? worker_start - now : 0),
+				driver_bridge::attached_pid());
 			try {
 				std::vector<uint8_t> buf;
-				driver_bridge::read_memory(addr, bytes, buf);
+				SetLastError(ERROR_SUCCESS);
+				const bool read_ok = driver_bridge::read_memory(addr, bytes, buf);
+				const DWORD gle = read_ok ? ERROR_SUCCESS : GetLastError();
+				const std::string status = driver_bridge::status();
+				const std::string drv_err = driver_bridge::last_error();
 				{
 					std::lock_guard<std::mutex> lk(s.cache_mtx);
 					s.cached_dump_addr = addr;
@@ -2756,21 +3097,38 @@ void request_dump_refresh(uint64_t addr, size_t bytes, uint32_t max_age_ms) {
 					s.cached_dump = std::move(buf);
 				}
 				s.last_dump_refresh_ms.store(now_ms());
+				size_t cached_size = 0;
+				{
+					std::lock_guard<std::mutex> lk(s.cache_mtx);
+					cached_size = s.cached_dump.size();
+				}
+				diag::log_tagged_fmt("debugger_engine", "dump_refresh_worker_exit addr=0x%llX bytes=%zu read_ok=%d cached=%zu gle=%lu elapsed_ms=%llu attached_pid=%u driver_status=%s driver_error=%s",
+					static_cast<unsigned long long>(addr),
+					bytes,
+					read_ok ? 1 : 0,
+					cached_size,
+					static_cast<unsigned long>(gle),
+					static_cast<unsigned long long>(now_ms() - worker_start),
+					driver_bridge::attached_pid(),
+					status.c_str(),
+					drv_err.c_str());
 			} catch (const std::exception& ex) {
-				diag::log_tagged_fmt("debugger", "request_dump_refresh_worker_exception err='%s'", ex.what());
+				diag::log_tagged_fmt("debugger_engine", "dump_refresh_worker_exception addr=0x%llX bytes=%zu elapsed_ms=%llu err='%s'",
+					static_cast<unsigned long long>(addr), bytes, static_cast<unsigned long long>(now_ms() - worker_start), ex.what());
 			} catch (...) {
-				diag::log_tagged("debugger", "request_dump_refresh_worker_exception err='<unknown>'");
+				diag::log_tagged_fmt("debugger_engine", "dump_refresh_worker_exception addr=0x%llX bytes=%zu elapsed_ms=%llu err='<unknown>'",
+					static_cast<unsigned long long>(addr), bytes, static_cast<unsigned long long>(now_ms() - worker_start));
 			}
 			s.dump_refresh_in_flight.store(false);
 		})) {
-			diag::log_tagged("debugger", "request_dump_refresh_worker_post_failed");
+			diag::log_tagged_fmt("debugger_engine", "dump_refresh_worker_post_failed addr=0x%llX bytes=%zu", static_cast<unsigned long long>(addr), bytes);
 			st.dump_refresh_in_flight.store(false);
 		}
 	} catch (const std::exception& ex) {
-		diag::log_tagged_fmt("debugger", "request_dump_refresh_worker_create_failed err='%s'", ex.what());
+		diag::log_tagged_fmt("debugger_engine", "dump_refresh_worker_create_failed addr=0x%llX bytes=%zu err='%s'", static_cast<unsigned long long>(addr), bytes, ex.what());
 		st.dump_refresh_in_flight.store(false);
 	} catch (...) {
-		diag::log_tagged("debugger", "request_dump_refresh_worker_create_failed err='<unknown>'");
+		diag::log_tagged_fmt("debugger_engine", "dump_refresh_worker_create_failed addr=0x%llX bytes=%zu err='<unknown>'", static_cast<unsigned long long>(addr), bytes);
 		st.dump_refresh_in_flight.store(false);
 	}
 }

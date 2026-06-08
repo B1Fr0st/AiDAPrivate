@@ -6,7 +6,7 @@
 #include "../session/session_health.hpp"
 #include "../runtime/standalone_driver.hpp"
 #include "../runtime/run_target.hpp"
-#include "../runtime/guest_lab_bridge.hpp"
+#include "../runtime/vm_guest_bridge.hpp"
 #include "../ui/loading_binary_overlay.hpp"
 #include "../../helpers/diag_log.hpp"
 
@@ -583,8 +583,8 @@ static tool_result_t sessions_run_binary(const json& params)
 	root["pid"] = result.pid;
 	root["firewall_rule_name"] = result.firewall_rule_name;
 	root["sandbox_dir"] = narrow(result.sandbox_dir);
-	root["guest_lab_active"] = guest_lab::is_active();
-	root["guest_bridge_dir"] = narrow(guest_lab::current().bridge_dir);
+	root["vm_bridge_active"] = vm_guest_bridge::is_active();
+	root["vm_bridge_dir"] = narrow(vm_guest_bridge::current().bridge_dir);
 	root["attached"] = false;
 	diag::log_tagged_fmt("sess_tools",
 		"sessions_run_binary launched pid=%u",

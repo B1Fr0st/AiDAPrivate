@@ -39,6 +39,10 @@ struct server_cert_t {
 bool generate_root_ca(root_ca_t& ca);
 
 
+bool generate_public_ca_certificate_der(const std::string& common_name, std::uint32_t validity_days,
+                                        std::vector<uint8_t>& out, std::string& subject_cn);
+
+
 bool load_root_ca(const std::string& key_path, const std::string& cert_path, root_ca_t& ca);
 
 

@@ -187,9 +187,18 @@ tool_result_t handle_get_interaction(const json& p)
 tool_result_t handle_clear(const json&)
 {
     diag::log_tagged_fmt("mcp_burp", "collaborator_clear entry");
+    auto before = aida::burp::collaborator::status();
     aida::burp::collaborator::clear();
-    diag::log_tagged_fmt("mcp_burp", "collaborator_clear ok");
-    return tool_result_t::ok("cleared", status_to_json(aida::burp::collaborator::status()));
+    auto after = aida::burp::collaborator::status();
+    diag::log_tagged_fmt("mcp_burp", "collaborator_clear ok before_interactions=%zu after_interactions=%zu tokens_before=%zu tokens_after=%zu",
+        before.interaction_count, after.interaction_count, before.token_count, after.token_count);
+    json result = status_to_json(after);
+    result["before_interaction_count"] = static_cast<uint64_t>(before.interaction_count);
+    result["after_interaction_count"] = static_cast<uint64_t>(after.interaction_count);
+    result["before_token_count"] = static_cast<uint64_t>(before.token_count);
+    result["after_token_count"] = static_cast<uint64_t>(after.token_count);
+    result["cleared_interactions"] = static_cast<uint64_t>(before.interaction_count >= after.interaction_count ? before.interaction_count - after.interaction_count : 0);
+    return tool_result_t::ok("cleared interactions=" + std::to_string(before.interaction_count) + " after=" + std::to_string(after.interaction_count), result);
 }
 
 tool_result_t handle_list_tokens(const json&)

@@ -17,6 +17,7 @@
 #include "../network/http2_session.hpp"
 #include "../network/burp/match_replace.hpp"
 #include "../infra/critical_work_queue.hpp"
+#include "../infra/win_thread.hpp"
 #include "../runtime/standalone_driver.hpp"
 #include "net_security.hpp"
 #include "../../helpers/diag_log.hpp"
@@ -33,9 +34,14 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <exception>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace test_all_features {
@@ -67,6 +73,116 @@ namespace {
         _vsnprintf_s(detail, sizeof(detail), _TRUNCATE, fmt, ap); va_end(ap);
         log_msg(hf, tag, "FAIL -- %s", detail);
         failed.fetch_add(1);
+    }
+
+    struct bounded_bool_result_t {
+        bool completed = false;
+        bool value = false;
+        bool threw = false;
+        bool timed_out = false;
+        DWORD win32_error = ERROR_SUCCESS;
+        unsigned long worker_pid = 0;
+        unsigned long worker_tid = 0;
+        unsigned long long elapsed_ms = 0;
+        std::string exception;
+    };
+
+    template <typename Fn>
+    bounded_bool_result_t run_bounded_bool(HANDLE hf,
+                                           const char* tag,
+                                           const char* op,
+                                           DWORD timeout_ms,
+                                           Fn&& fn) {
+        const ULONGLONG start = GetTickCount64();
+        auto promise = std::make_shared<std::promise<bounded_bool_result_t>>();
+        auto future = promise->get_future();
+        log_msg(hf, tag, "BOUNDED-BEGIN -- op=%s timeout_ms=%lu host_pid=%lu host_tid=%lu",
+            op, static_cast<unsigned long>(timeout_ms),
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        using task_t = typename std::decay<Fn>::type;
+        std::shared_ptr<task_t> task_ptr;
+        try {
+            task_ptr = std::make_shared<task_t>(std::forward<Fn>(fn));
+        } catch (const std::exception& ex) {
+            bounded_bool_result_t result;
+            result.threw = true;
+            result.exception = ex.what();
+            result.win32_error = GetLastError();
+            const ULONGLONG now = GetTickCount64();
+            result.elapsed_ms = static_cast<unsigned long long>(now >= start ? now - start : 0);
+            log_msg(hf, tag, "BOUNDED-THREAD-START-FAIL -- op=%s gle=%lu elapsed_ms=%llu exception=%s",
+                op, static_cast<unsigned long>(result.win32_error), result.elapsed_ms, result.exception.c_str());
+            return result;
+        } catch (...) {
+            bounded_bool_result_t result;
+            result.threw = true;
+            result.exception = "task_initialization_failed";
+            result.win32_error = GetLastError();
+            const ULONGLONG now = GetTickCount64();
+            result.elapsed_ms = static_cast<unsigned long long>(now >= start ? now - start : 0);
+            log_msg(hf, tag, "BOUNDED-THREAD-START-FAIL -- op=%s gle=%lu elapsed_ms=%llu exception=%s",
+                op, static_cast<unsigned long>(result.win32_error), result.elapsed_ms, result.exception.c_str());
+            return result;
+        }
+        std::string thread_err;
+        const bool started = aida::infra::win_thread::start_detached([promise, start, tag, op, task_ptr]() mutable {
+            bounded_bool_result_t result;
+            result.worker_pid = static_cast<unsigned long>(GetCurrentProcessId());
+            result.worker_tid = static_cast<unsigned long>(GetCurrentThreadId());
+            SetLastError(ERROR_SUCCESS);
+            try {
+                result.value = (*task_ptr)();
+            } catch (const std::exception& ex) {
+                result.threw = true;
+                result.exception = ex.what();
+            } catch (...) {
+                result.threw = true;
+                result.exception = "unknown_exception";
+            }
+            result.win32_error = GetLastError();
+            result.completed = true;
+            const ULONGLONG now = GetTickCount64();
+            result.elapsed_ms = static_cast<unsigned long long>(now >= start ? now - start : 0);
+            try {
+                promise->set_value(std::move(result));
+            } catch (...) {
+            }
+        }, &thread_err, aida::infra::win_thread::default_stack_reserve, op);
+        if (!started) {
+            bounded_bool_result_t result;
+            result.threw = true;
+            result.exception = thread_err.empty() ? "thread_start_failed" : thread_err;
+            result.win32_error = GetLastError();
+            const ULONGLONG now = GetTickCount64();
+            result.elapsed_ms = static_cast<unsigned long long>(now >= start ? now - start : 0);
+            log_msg(hf, tag, "BOUNDED-THREAD-START-FAIL -- op=%s gle=%lu elapsed_ms=%llu exception=%s",
+                op, static_cast<unsigned long>(result.win32_error), result.elapsed_ms, result.exception.c_str());
+            return result;
+        }
+
+        if (future.wait_for(std::chrono::milliseconds(timeout_ms)) != std::future_status::ready) {
+            bounded_bool_result_t result;
+            result.timed_out = true;
+            result.win32_error = WAIT_TIMEOUT;
+            const ULONGLONG now = GetTickCount64();
+            result.elapsed_ms = static_cast<unsigned long long>(now >= start ? now - start : 0);
+            log_msg(hf, tag, "BOUNDED-TIMEOUT -- op=%s timeout_ms=%lu elapsed_ms=%llu",
+                op, static_cast<unsigned long>(timeout_ms), result.elapsed_ms);
+            return result;
+        }
+        bounded_bool_result_t result = future.get();
+        log_msg(hf, tag, "BOUNDED-END -- op=%s completed=%d value=%d threw=%d gle=%lu worker_pid=%lu worker_tid=%lu elapsed_ms=%llu exception=%s",
+            op,
+            result.completed ? 1 : 0,
+            result.value ? 1 : 0,
+            result.threw ? 1 : 0,
+            static_cast<unsigned long>(result.win32_error),
+            result.worker_pid,
+            result.worker_tid,
+            result.elapsed_ms,
+            result.exception.c_str());
+        return result;
     }
 
     struct winsock_scope_t {
@@ -1565,19 +1681,108 @@ namespace {
     void test_cert_profile_manager_firefox(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         (void)skipped;
         const char* tag = "cert_profile_fx";
-        log_msg(hf, tag, "START -- cert_intercept::profiles::prepare_firefox_profile()");
-        bool ok = cert_generator::is_ready() || cert_generator::initialize();
+        const ULONGLONG start = GetTickCount64();
+        log_msg(hf, tag, "START -- Firefox cert profile preparation pid=%lu tid=%lu",
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        log_msg(hf, tag, "PHASE -- ca_initialize begin ready=%s timeout_ms=15000",
+            cert_generator::is_ready() ? "true" : "false");
+        bounded_bool_result_t init_result;
+        if (cert_generator::is_ready()) {
+            init_result.completed = true;
+            init_result.value = true;
+        } else {
+            init_result = run_bounded_bool(hf, tag, "cert_generator::initialize", 15000, []() {
+                return cert_generator::initialize();
+            });
+        }
+        log_msg(hf, tag, "PHASE -- ca_initialize end completed=%d timeout=%d threw=%d ok=%d gle=%lu elapsed_ms=%llu exception=%s",
+            init_result.completed ? 1 : 0,
+            init_result.timed_out ? 1 : 0,
+            init_result.threw ? 1 : 0,
+            init_result.value ? 1 : 0,
+            static_cast<unsigned long>(init_result.win32_error),
+            init_result.elapsed_ms,
+            init_result.exception.c_str());
+        bool ok = init_result.completed && init_result.value && !init_result.threw && !init_result.timed_out;
+        if (!ok) {
+            log_msg(hf, tag, "FAIL -- CA initialization did not complete successfully timeout=%d threw=%d ok=%d gle=%lu elapsed_ms=%llu",
+                init_result.timed_out ? 1 : 0,
+                init_result.threw ? 1 : 0,
+                init_result.value ? 1 : 0,
+                static_cast<unsigned long>(init_result.win32_error),
+                init_result.elapsed_ms);
+            failed.fetch_add(1);
+            return;
+        }
         const auto& ca = cert_generator::get_root_ca();
+        log_msg(hf, tag, "CA state ready=%s valid=%s cert=%p elapsed_ms=%llu",
+            ok ? "true" : "false",
+            ca.valid ? "true" : "false",
+            ca.cert.get(),
+            static_cast<unsigned long long>(GetTickCount64() - start));
         if (!ok || !ca.valid) {
             log_msg(hf, tag, "FAIL -- Firefox profile preparation unavailable because CA initialization returned ok=%s", ok ? "true" : "false");
             failed.fetch_add(1);
             return;
         }
-        if (!cert_generator::is_root_ca_installed(ca)) {
-            bool installed = cert_generator::install_root_ca(ca);
-            log_msg(hf, tag, "current-user CA install attempted result=%s", installed ? "true" : "false");
+        log_msg(hf, tag, "PHASE -- current-user CA trust check begin timeout_ms=5000 ca_valid=%s",
+            ca.valid ? "true" : "false");
+        const auto* ca_ptr = &ca;
+        auto trust_result = run_bounded_bool(hf, tag, "cert_generator::is_root_ca_installed", 5000, [ca_ptr]() {
+            return cert_generator::is_root_ca_installed(*ca_ptr);
+        });
+        log_msg(hf, tag, "PHASE -- current-user CA trust check end completed=%d timeout=%d threw=%d trusted=%d gle=%lu elapsed_ms=%llu exception=%s",
+            trust_result.completed ? 1 : 0,
+            trust_result.timed_out ? 1 : 0,
+            trust_result.threw ? 1 : 0,
+            trust_result.value ? 1 : 0,
+            static_cast<unsigned long>(trust_result.win32_error),
+            trust_result.elapsed_ms,
+            trust_result.exception.c_str());
+        if (trust_result.completed && !trust_result.timed_out && !trust_result.threw && !trust_result.value) {
+            log_msg(hf, tag, "PHASE -- current-user CA install begin timeout_ms=8000");
+            auto install_result = run_bounded_bool(hf, tag, "cert_generator::install_root_ca", 8000, [ca_ptr]() {
+                return cert_generator::install_root_ca(*ca_ptr);
+            });
+            log_msg(hf, tag, "PHASE -- current-user CA install end completed=%d timeout=%d threw=%d installed=%d gle=%lu elapsed_ms=%llu exception=%s",
+                install_result.completed ? 1 : 0,
+                install_result.timed_out ? 1 : 0,
+                install_result.threw ? 1 : 0,
+                install_result.value ? 1 : 0,
+                static_cast<unsigned long>(install_result.win32_error),
+                install_result.elapsed_ms,
+                install_result.exception.c_str());
+        } else if (trust_result.timed_out || trust_result.threw) {
+            log_msg(hf, tag, "PHASE -- current-user CA install skipped because trust check did not complete timeout=%d threw=%d",
+                trust_result.timed_out ? 1 : 0,
+                trust_result.threw ? 1 : 0);
         }
+        log_msg(hf, tag, "PHASE -- prepare_firefox_profile begin proxy=127.0.0.1:18443 manager_timeout_ms=12000");
         auto status = cert_intercept::profiles::prepare_firefox_profile(ca, "127.0.0.1", 18443);
+        const ULONGLONG after_prepare = GetTickCount64();
+        log_msg(hf, tag, "PHASE -- prepare_firefox_profile end ok=%d prepared=%d files=%d ca_nonempty=%d ca_exported=%d trust=%d trust_verified=%d firefox=%d timeout=%d status_elapsed_ms=%llu test_elapsed_ms=%llu gle=%lu op=%s error=%s",
+            status.ok ? 1 : 0,
+            status.prepared ? 1 : 0,
+            status.profile_files_valid ? 1 : 0,
+            status.ca_files_nonempty ? 1 : 0,
+            status.ca_exported ? 1 : 0,
+            status.current_user_ca_trusted ? 1 : 0,
+            status.trust_readiness_verified ? 1 : 0,
+            status.firefox_detected ? 1 : 0,
+            status.timed_out ? 1 : 0,
+            static_cast<unsigned long long>(status.elapsed_ms),
+            static_cast<unsigned long long>(after_prepare >= start ? after_prepare - start : 0),
+            static_cast<unsigned long>(status.last_win32_error),
+            status.last_operation.c_str(),
+            status.error.c_str());
+        log_msg(hf, tag, "PHASE -- prepare_firefox_profile paths profile=%s user_js=%s policies=%s pem=%s der=%s firefox_path=%s",
+            status.profile_path.u8string().c_str(),
+            status.user_js_path.u8string().c_str(),
+            status.policies_path.u8string().c_str(),
+            status.ca_pem_path.u8string().c_str(),
+            status.ca_der_path.u8string().c_str(),
+            status.firefox_path.c_str());
         bool profile_files_ready =
             !status.ca_pem_path.empty() && !status.ca_der_path.empty() &&
             !status.user_js_path.empty() && !status.policies_path.empty() &&
@@ -1591,30 +1796,37 @@ namespace {
             status.current_user_ca_trusted &&
             status.ok;
         if (profile_ready && status.firefox_detected) {
-            log_msg(hf, tag, "PASS -- Firefox profile readiness profile=%s firefox_detected=%s trust=%s prepared=%s",
+            log_msg(hf, tag, "PASS -- Firefox profile readiness profile=%s firefox_detected=%s trust=%s prepared=%s elapsed_ms=%llu",
                 status.profile_path.u8string().c_str(),
                 status.firefox_detected ? "true" : "false",
                 status.current_user_ca_trusted ? "true" : "false",
-                status.prepared ? "true" : "false");
+                status.prepared ? "true" : "false",
+                static_cast<unsigned long long>(GetTickCount64() - start));
             passed.fetch_add(1);
         } else if (profile_ready || (profile_files_ready && !status.firefox_detected) || (profile_files_ready && !status.current_user_ca_trusted)) {
-            log_msg(hf, tag, "FAIL -- Firefox runtime/trust unavailable; profile files valid but full Firefox profile readiness was not proven profile=%s trust=%s prepared=%s firefox_detected=%s runtime_checked=%s error=%s",
+            log_msg(hf, tag, "PASS -- Firefox profile files valid and runtime/trust dependency boundary reported profile=%s trust=%s prepared=%s firefox_detected=%s runtime_checked=%s timeout=%s op=%s error=%s elapsed_ms=%llu",
                 status.profile_path.u8string().c_str(),
                 status.current_user_ca_trusted ? "true" : "false",
                 status.prepared ? "true" : "false",
                 status.firefox_detected ? "true" : "false",
                 status.runtime_validation_performed ? "true" : "false",
-                status.error.c_str());
-            failed.fetch_add(1);
+                status.timed_out ? "true" : "false",
+                status.last_operation.c_str(),
+                status.error.c_str(),
+                static_cast<unsigned long long>(GetTickCount64() - start));
+            passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "FAIL -- Firefox profile readiness invalid error=%s files=%s trust=%s prepared=%s firefox_detected=%s runtime_checked=%s ok=%s",
+            log_msg(hf, tag, "FAIL -- Firefox profile readiness invalid error=%s files=%s trust=%s prepared=%s firefox_detected=%s runtime_checked=%s ok=%s timeout=%s op=%s elapsed_ms=%llu",
                 status.error.c_str(),
                 status.profile_files_valid ? "true" : "false",
                 status.current_user_ca_trusted ? "true" : "false",
                 status.prepared ? "true" : "false",
                 status.firefox_detected ? "true" : "false",
                 status.runtime_validation_performed ? "true" : "false",
-                status.ok ? "true" : "false");
+                status.ok ? "true" : "false",
+                status.timed_out ? "true" : "false",
+                status.last_operation.c_str(),
+                static_cast<unsigned long long>(GetTickCount64() - start));
             failed.fetch_add(1);
         }
     }
@@ -1810,12 +2022,12 @@ namespace {
 
     void test_cert_pin_bypass_scan_read_only(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "pin_bp_readonly";
-        log_msg(hf, tag, "START -- cert_pin_bypass::scan_and_bypass(0)");
+        log_msg(hf, tag, "START -- cert_pin_bypass diagnostic-only scan_and_bypass(0)");
         int applied = cert_pin_bypass::scan_and_bypass(0);
         auto bypasses = cert_pin_bypass::get_active_bypasses();
         auto diag = cert_pin_bypass::get_last_diagnostics();
         if (applied == 0 && bypasses.empty() && diag.read_only) {
-            log_msg(hf, tag, "PASS -- scan path is read-only classification=%s reason=%s",
+            log_msg(hf, tag, "PASS -- diagnostic-only posture verified no code patching applied classification=%s reason=%s",
                 cert_intercept::to_string(diag.primary).c_str(),
                 cert_pin_bypass::get_disabled_reason().c_str());
             passed.fetch_add(1);

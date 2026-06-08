@@ -34,6 +34,7 @@ namespace mcp_standalone
         static tool_result_t ok(const json& j) { return {true, j.dump(2), j}; }
         static tool_result_t ok(const std::string& t, const json& d) { return {true, t, d}; }
         static tool_result_t error(const std::string& e) { return {false, e, {}}; }
+        static tool_result_t error(const std::string& e, const json& d) { return {false, e, d}; }
     };
 
     struct tool_param_t
@@ -47,7 +48,8 @@ namespace mcp_standalone
     enum class tool_visibility_t : int
     {
         external_visible = 0,
-        internal_only    = 1
+        internal_only    = 1,
+        ide_chat_only    = 2
     };
 
     std::atomic<bool>* current_cancel_token() noexcept;

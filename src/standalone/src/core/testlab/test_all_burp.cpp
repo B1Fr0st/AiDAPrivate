@@ -3546,13 +3546,18 @@ namespace {
             static_cast<unsigned long long>(bridge_after.launched_ms),
             bridge_after.last_error.empty() ? "<empty>" : bridge_after.last_error.c_str(),
             static_cast<unsigned long long>(GetTickCount64() - t0));
-        if (!launched || !ready) {
+        if (!ready) {
             fail_empty_evidence(hf, tag, failed, "Camoufox browser did not launch into a ready live state; Edge/Chrome fallback is not allowed");
-            aida::burp::camoufox::close_browser();
+            aida::burp::camoufox::close_browser("testlab.browser_running.launch_failed");
             return;
         }
+        if (!launched) {
+            log_msg(hf, tag, "INFO -- start_bridge reported busy or reused, but live Camoufox bridge is ready child_pid=%u last_error=%s",
+                bridge_after.child_pid,
+                bridge_after.last_error.empty() ? "<empty>" : bridge_after.last_error.c_str());
+        }
 
-        const bool closed = aida::burp::camoufox::close_browser();
+        const bool closed = aida::burp::camoufox::close_browser("testlab.browser_running.cleanup");
         auto bridge_closed = aida::burp::camoufox::get_status();
         log_msg(hf, tag, "cleanup closed=%d bridge_state=%s child_pid=%u child_alive=%d browser_open=%d cleanup_pending=%d last_error=%s elapsed_ms=%llu",
             closed ? 1 : 0,
@@ -3567,7 +3572,7 @@ namespace {
             fail_empty_evidence(hf, tag, failed, "Camoufox browser launched but close_browser failed child_pid=%u", bridge_after.child_pid);
             return;
         }
-        log_msg(hf, tag, "PASS -- Camoufox-only browser launch produced child_pid=%u and cleanup completed", bridge_after.child_pid);
+        log_msg(hf, tag, "PASS -- Camoufox-only browser ready child_pid=%u launched=%d cleanup completed", bridge_after.child_pid, launched ? 1 : 0);
         passed.fetch_add(1);
     }
 

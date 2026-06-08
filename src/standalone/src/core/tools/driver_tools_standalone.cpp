@@ -413,7 +413,7 @@ static bool is_process_alive(std::uint32_t pid)
 static std::optional<tool_result_t> ensure_attached_process_context(const json& params)
 {
     if (!device->is_connected())
-        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
+        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_load first."));
 
     std::uint32_t requested_pid = 0;
     for (const char* key : {"target_pid", "process_id", "pid"})
@@ -851,7 +851,7 @@ tool_result_t driver_status(const json&)
     result["is_self_target"] = self_target;
 
     if (self_target)
-        result["warning"] = "Driver target is AiDA's own process. Call driver_unattach and driver_attach <target>.exe.";
+        result["warning"] = "Driver target is AiDA's own process. Call driver_detach and driver_attach <target>.exe.";
 
     if (device->is_connected() && attached_pid != 0)
         result["heartbeat"] = device->send_heartbeat() ? "ok" : "failed";
@@ -941,7 +941,7 @@ tool_result_t driver_unattach(const json&)
     if (!device->is_connected())
     {
         diag::log_tagged_fmt("drv_tools", "driver_unattach not connected");
-        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
+        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_load first."));
     }
 
     const std::uint32_t bridge_pid = driver_bridge::attached_pid();
@@ -4880,7 +4880,7 @@ tool_result_t driver_scan_pattern(const json& params)
 {
     diag::log_tagged_fmt("drv_tools", "driver_scan_pattern entry");
     if (!device->is_connected() || device->get_process_id() == 0)
-        return tool_result_t::error(OBFSTR("Not attached. Call driver_connect then driver_attach first."));
+        return tool_result_t::error(OBFSTR("Not attached. Call driver_load then driver_attach first."));
 
     std::string pattern_str = params["pattern"].get<std::string>();
 
@@ -5147,7 +5147,7 @@ tool_result_t driver_enumerate_modules(const json&)
 {
     diag::log_tagged_fmt("drv_tools", "driver_enumerate_modules entry");
     if (!device->is_connected() || device->get_process_id() == 0)
-        return tool_result_t::error(OBFSTR("Not attached. Call driver_connect then driver_attach first."));
+        return tool_result_t::error(OBFSTR("Not attached. Call driver_load then driver_attach first."));
 
     if (device->get_dtb() == 0)
     {
@@ -5445,7 +5445,7 @@ tool_result_t driver_read_kernel_memory(const json& params)
 {
     diag::log_tagged_fmt("drv_tools", "driver_read_kernel_memory entry");
     if (!device || !device->is_connected())
-        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
+        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_load first."));
 
     if (device->get_kernel_dtb() == 0)
     {
@@ -5461,7 +5461,7 @@ tool_result_t driver_read_kernel_memory(const json& params)
 
     std::uint64_t address = static_cast<std::uint64_t>(addr_opt.value());
     if (!is_probably_kernel_address(address))
-        return tool_result_t::error(OBFSTR("Address is not a canonical kernel virtual address. Use driver_read_memory for user-mode addresses."));
+        return tool_result_t::error(OBFSTR("Address is not a canonical kernel virtual address. Use read_memory for user-mode addresses."));
 
     std::size_t size = params.value("size", 256);
     if (size > 65536) size = 65536;
@@ -5568,7 +5568,7 @@ tool_result_t driver_write_kernel_memory(const json& params)
     }
 
     if (!device || !device->is_connected())
-        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
+        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_load first."));
 
     if (device->get_kernel_dtb() == 0)
     {
@@ -6387,7 +6387,7 @@ static const mcp_standalone::tool_def_t* get_deferred_tool_def(const std::string
 {
     if (!s_deferred_tool_list) return nullptr;
     for (const auto& t : *s_deferred_tool_list)
-        if (t.name == name) return &t;
+        if (t.name == name && t.visibility != mcp_standalone::tool_visibility_t::ide_chat_only) return &t;
     return nullptr;
 }
 
@@ -6984,7 +6984,7 @@ tool_result_t driver_defer_action(const json& params)
     int poll_interval = normalized.value("poll_interval", 50);
 
     if (!normalized.contains("actions") || !normalized["actions"].is_array() || normalized["actions"].empty())
-        return tool_result_t::error(OBFSTR("'actions' array is required with at least one tool call. Format: [{\"tool\":\"driver_read_memory\",\"params\":{...}}]."));
+        return tool_result_t::error(OBFSTR("'actions' array is required with at least one tool call. Format: [{\"tool\":\"read_memory\",\"params\":{...}}]."));
 
     auto action = std::make_unique<deferred_action_t>();
     action->condition_type = wait_for;
@@ -6995,7 +6995,7 @@ tool_result_t driver_defer_action(const json& params)
     for (const auto& act : normalized["actions"])
     {
         if (!act.contains("tool") || !act["tool"].is_string())
-            return tool_result_t::error(OBFSTR("Each action must have a string 'tool' field (full tool name, e.g. 'driver_read_memory')."));
+            return tool_result_t::error(OBFSTR("Each action must have a string 'tool' field (full tool name, e.g. 'read_memory')."));
 
         deferred_action_t::queued_tool_call_t tc;
         tc.tool_name = act["tool"].get<std::string>();
@@ -7419,7 +7419,7 @@ tool_result_t driver_sniff_network_buffers(const json& params)
     result["bp_index"] = bp_index;
     result["note"] = OBFSTR("Sniff session initialized. The HW breakpoint must be set separately via "
         "driver_set_hw_breakpoint on the target address. Then poll with operation='get' to retrieve captures. "
-        "After each BP hit, read the buffer from memory using driver_read_memory at the register value, "
+        "After each BP hit, read the buffer from memory using read_memory at the register value, "
         "then call this tool with operation='store' to record it.");
 
     return tool_result_t::ok(OBFSTR("Sniff session started"), result);
@@ -8256,9 +8256,9 @@ tool_result_t driver_enum_kernel_callbacks(const json& params)
 {
     diag::log_tagged_fmt("drv_tools", "driver_enum_kernel_callbacks entry");
     if (!device->is_connected())
-        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
+        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_load first."));
     if (device->get_kernel_dtb() == 0)
-        return tool_result_t::error(OBFSTR("Kernel DTB not resolved. Call driver_connect first."));
+        return tool_result_t::error(OBFSTR("Kernel DTB not resolved. Call driver_load first."));
 
     std::vector<std::uint8_t> mod_buf;
     sys_module_info_t* info = nullptr;
@@ -8397,9 +8397,9 @@ tool_result_t driver_detect_integrity_checks(const json& params)
 {
     diag::log_tagged_fmt("drv_tools", "driver_detect_integrity_checks entry");
     if (!device->is_connected())
-        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
+        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_load first."));
     if (device->get_kernel_dtb() == 0)
-        return tool_result_t::error(OBFSTR("Kernel DTB not resolved. Call driver_connect first."));
+        return tool_result_t::error(OBFSTR("Kernel DTB not resolved. Call driver_load first."));
 
     std::vector<std::uint8_t> mod_buf;
     sys_module_info_t* info = nullptr;
@@ -8533,9 +8533,9 @@ tool_result_t driver_detect_ssdt_hooks(const json&)
 {
     diag::log_tagged_fmt("drv_tools", "driver_detect_ssdt_hooks entry");
     if (!device->is_connected())
-        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
+        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_load first."));
     if (device->get_kernel_dtb() == 0)
-        return tool_result_t::error(OBFSTR("Kernel DTB not resolved. Call driver_connect first."));
+        return tool_result_t::error(OBFSTR("Kernel DTB not resolved. Call driver_load first."));
 
     std::vector<uint8_t> buf;
     sys_module_info_t* info = nullptr;
@@ -8734,9 +8734,9 @@ tool_result_t driver_enum_minifilters(const json& params)
 {
     diag::log_tagged_fmt("drv_tools", "driver_enum_minifilters entry");
     if (!device->is_connected())
-        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
+        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_load first."));
     if (device->get_kernel_dtb() == 0)
-        return tool_result_t::error(OBFSTR("Kernel DTB not resolved. Call driver_connect first."));
+        return tool_result_t::error(OBFSTR("Kernel DTB not resolved. Call driver_load first."));
 
     std::vector<uint8_t> buf;
     sys_module_info_t* info = nullptr;
@@ -8937,9 +8937,9 @@ tool_result_t driver_detect_etw_monitors(const json& params)
 {
     diag::log_tagged_fmt("drv_tools", "driver_detect_etw_monitors entry");
     if (!device->is_connected())
-        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
+        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_load first."));
     if (device->get_kernel_dtb() == 0)
-        return tool_result_t::error(OBFSTR("Kernel DTB not resolved. Call driver_connect first."));
+        return tool_result_t::error(OBFSTR("Kernel DTB not resolved. Call driver_load first."));
 
     std::vector<uint8_t> buf;
     sys_module_info_t* info = nullptr;
@@ -9108,7 +9108,7 @@ tool_result_t driver_detect_hidden_modules(const json& params)
 {
     diag::log_tagged_fmt("drv_tools", "driver_detect_hidden_modules entry");
     if (!device->is_connected())
-        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
+        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_load first."));
     if (device->get_process_id() == 0)
         return tool_result_t::error(OBFSTR("No target process attached. Call driver_attach first."));
 
@@ -9563,7 +9563,7 @@ tool_result_t driver_enumerate_handles(const json& params)
 {
     diag::log_tagged_fmt("drv_tools", "driver_enumerate_handles entry");
     if (!device->is_connected())
-        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
+        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_load first."));
 
     const std::uint32_t filter_pid = params.value("pid", 0u);
     const std::string filter_type = params.value("type_filter", "");
@@ -10437,7 +10437,7 @@ tool_result_t driver_enumerate_windows(const json& params)
 {
     diag::log_tagged_fmt("drv_tools", "driver_enumerate_windows entry");
     if (!device->is_connected())
-        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
+        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_load first."));
 
     const std::uint32_t filter_pid = params.value("pid", device->get_process_id());
     const bool include_children = params.value("include_children", true);
@@ -11998,7 +11998,7 @@ void register_driver_tools(mcp_standalone::server_t& srv)
                "3. When BP fires, read thread context, read buffer from memory, call with operation='store'\n"
                "4. Call with operation='get' to retrieve all captured buffers\n"
                "5. Call with operation='stop' when done\n\n"
-               "This is a composite tool that coordinates with driver_set_hw_breakpoint and driver_read_memory."),
+               "This is a composite tool that coordinates with driver_set_hw_breakpoint and read_memory."),
         {{OBFSTR("address"), OBFSTR("string"),
           OBFSTR("Address of the send/recv/encrypt function (for 'start' operation)"), false},
          {OBFSTR("buffer_register"), OBFSTR("string"),
@@ -12402,7 +12402,7 @@ void register_driver_tools(mcp_standalone::server_t& srv)
                "Returns complete module details: base, entry point, size, name, full path, flags "
                "(static import, entry processed, process attach called, etc.), load count, TLS index. "
                "Order differences reveal manually mapped modules and load-order anomalies. "
-               "More detailed than driver_enumerate_modules - shows all three orderings and decoded flags."),
+               "More detailed than enumerate_modules - shows all three orderings and decoded flags."),
         {{OBFSTR("order"), OBFSTR("string"), OBFSTR("Which list: load, memory, init, or all (default all)"), false,
           {OBFSTR("load"), OBFSTR("memory"), OBFSTR("init"), OBFSTR("all")}},
          {OBFSTR("filter"), OBFSTR("string"), OBFSTR("Module name/path substring filter (case-insensitive)"), false},

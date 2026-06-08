@@ -124,10 +124,30 @@ static std::string ip_for_host(const std::string& host)
     return buf;
 }
 
+static bool is_loopback_endpoint(const std::string& host, const std::string& ip)
+{
+    return host == "127.0.0.1" || host == "localhost" || host == "::1" ||
+           ip == "127.0.0.1" || ip == "::1";
+}
+
+static void configure_connected_socket(SOCKET s, int timeout_ms)
+{
+    u_long nb = 0;
+    ioctlsocket(s, FIONBIO, &nb);
+    DWORD tmo = static_cast<DWORD>(std::max(timeout_ms, 1));
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tmo), sizeof(tmo));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tmo), sizeof(tmo));
+    BOOL nodelay = TRUE;
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
+}
+
 static SOCKET tcp_connect(const std::string& host, uint16_t port, int timeout_ms)
 {
     std::string ip = ip_for_host(host);
-    if (ip.empty()) return INVALID_SOCKET;
+    if (ip.empty()) {
+        diag::log_tagged_fmt("intruder", "tcp_connect resolve_failed host=%s port=%u", host.c_str(), static_cast<unsigned>(port));
+        return INVALID_SOCKET;
+    }
 
     addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
@@ -135,42 +155,92 @@ static SOCKET tcp_connect(const std::string& host, uint16_t port, int timeout_ms
     char ports[16];
     snprintf(ports, sizeof(ports), "%u", static_cast<unsigned>(port));
     addrinfo* res = nullptr;
-    if (getaddrinfo(ip.c_str(), ports, &hints, &res) != 0 || !res) return INVALID_SOCKET;
-
-    SOCKET s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (s == INVALID_SOCKET) { freeaddrinfo(res); return INVALID_SOCKET; }
-
-    u_long nb = 1;
-    ioctlsocket(s, FIONBIO, &nb);
-
-    int cr = connect(s, res->ai_addr, static_cast<int>(res->ai_addrlen));
-    if (cr == SOCKET_ERROR && WSAGetLastError() != WSAEWOULDBLOCK) {
-        closesocket(s); freeaddrinfo(res); return INVALID_SOCKET;
+    if (getaddrinfo(ip.c_str(), ports, &hints, &res) != 0 || !res) {
+        diag::log_tagged_fmt("intruder", "tcp_connect addrinfo_failed host=%s ip=%s port=%u", host.c_str(), ip.c_str(), static_cast<unsigned>(port));
+        return INVALID_SOCKET;
     }
 
-    WSAPOLLFD pfd{};
-    pfd.fd = s;
-    pfd.events = POLLOUT;
-    int pr = WSAPoll(&pfd, 1, timeout_ms);
-    if (pr <= 0) { closesocket(s); freeaddrinfo(res); return INVALID_SOCKET; }
+    const bool loopback = is_loopback_endpoint(host, ip);
+    const int max_attempts = loopback ? 16 : 1;
+    const uint64_t start_ms = GetTickCount64();
+    int last_error = 0;
+    int last_poll = 0;
+    short last_revents = 0;
+    for (int attempt = 1; attempt <= max_attempts; ++attempt) {
+        for (addrinfo* ai = res; ai; ai = ai->ai_next) {
+            SOCKET s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+            if (s == INVALID_SOCKET) {
+                last_error = WSAGetLastError();
+                continue;
+            }
+            BOOL nodelay = TRUE;
+            setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
+            LINGER lin{};
+            lin.l_onoff = 1;
+            lin.l_linger = 0;
+            setsockopt(s, SOL_SOCKET, SO_LINGER, reinterpret_cast<const char*>(&lin), sizeof(lin));
+            if (loopback) {
+                int cr = connect(s, ai->ai_addr, static_cast<int>(ai->ai_addrlen));
+                if (cr == 0) {
+                    configure_connected_socket(s, timeout_ms);
+                    diag::log_tagged_fmt("intruder", "tcp_connect ok host=%s ip=%s port=%u attempt=%d loopback=1 elapsed_ms=%llu",
+                        host.c_str(), ip.c_str(), static_cast<unsigned>(port), attempt,
+                        static_cast<unsigned long long>(GetTickCount64() - start_ms));
+                    freeaddrinfo(res);
+                    return s;
+                }
+                last_error = WSAGetLastError();
+                closesocket(s);
+                continue;
+            }
 
-    int err = 0;
-    int err_sz = sizeof(err);
-    getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &err_sz);
-    if (err != 0) { closesocket(s); freeaddrinfo(res); return INVALID_SOCKET; }
+            u_long nb = 1;
+            ioctlsocket(s, FIONBIO, &nb);
+            int cr = connect(s, ai->ai_addr, static_cast<int>(ai->ai_addrlen));
+            if (cr == SOCKET_ERROR && WSAGetLastError() != WSAEWOULDBLOCK) {
+                last_error = WSAGetLastError();
+                closesocket(s);
+                continue;
+            }
 
-    nb = 0;
-    ioctlsocket(s, FIONBIO, &nb);
-
-    DWORD tmo = static_cast<DWORD>(timeout_ms);
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tmo), sizeof(tmo));
-    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tmo), sizeof(tmo));
-
-    BOOL nodelay = TRUE;
-    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
-
+            WSAPOLLFD pfd{};
+            pfd.fd = s;
+            pfd.events = POLLOUT;
+            int pr = WSAPoll(&pfd, 1, timeout_ms);
+            last_poll = pr;
+            last_revents = pfd.revents;
+            if (pr > 0) {
+                int err = 0;
+                int err_sz = sizeof(err);
+                getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &err_sz);
+                if (err == 0) {
+                    configure_connected_socket(s, timeout_ms);
+                    diag::log_tagged_fmt("intruder", "tcp_connect ok host=%s ip=%s port=%u attempt=%d loopback=0 elapsed_ms=%llu",
+                        host.c_str(), ip.c_str(), static_cast<unsigned>(port), attempt,
+                        static_cast<unsigned long long>(GetTickCount64() - start_ms));
+                    freeaddrinfo(res);
+                    return s;
+                }
+                last_error = err;
+            } else {
+                last_error = pr == 0 ? WSAETIMEDOUT : WSAGetLastError();
+            }
+            closesocket(s);
+        }
+        diag::log_tagged_fmt("intruder", "tcp_connect attempt_failed host=%s ip=%s port=%u attempt=%d/%d loopback=%d err=%d poll=%d revents=0x%04X elapsed_ms=%llu",
+            host.c_str(), ip.c_str(), static_cast<unsigned>(port), attempt, max_attempts,
+            loopback ? 1 : 0, last_error, last_poll, static_cast<unsigned>(last_revents),
+            static_cast<unsigned long long>(GetTickCount64() - start_ms));
+        if (!loopback || attempt == max_attempts)
+            break;
+        Sleep(static_cast<DWORD>(std::min(100, 10 * attempt)));
+    }
+    diag::log_tagged_fmt("intruder", "tcp_connect exhausted host=%s ip=%s port=%u attempts=%d loopback=%d err=%d poll=%d revents=0x%04X elapsed_ms=%llu",
+        host.c_str(), ip.c_str(), static_cast<unsigned>(port), max_attempts,
+        loopback ? 1 : 0, last_error, last_poll, static_cast<unsigned>(last_revents),
+        static_cast<unsigned long long>(GetTickCount64() - start_ms));
     freeaddrinfo(res);
-    return s;
+    return INVALID_SOCKET;
 }
 
 struct ssl_conn_t

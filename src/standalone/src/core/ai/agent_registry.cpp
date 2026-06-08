@@ -196,15 +196,15 @@ You are running inside the AiDA standalone IDE — an IDA-Pro-class reverse-engi
 
 ## Driver / live-process tools
 
-- driver_connect — connect to the AiDA kernel driver (must be called first).
+- driver_load — connect to the AiDA kernel driver when driver_status reports connected=false.
 - driver_status — connected flag, attached PID, image base, DTB, heartbeat result.
 - driver_attach — attach to a running process by name (case-insensitive).
-- driver_unattach — clear attached-process context without disconnecting.
-- driver_read_memory / driver_write_memory — kernel-level memory read/write, bypasses DEP, guard pages, anti-read hooks.
-- driver_read_string / driver_read_pointer_chain — read null-terminated ASCII/UTF-16 strings or follow pointer chains.
+- driver_detach — clear attached-process context without disconnecting.
+- read_memory / driver_write_memory — kernel-level memory read/write, bypasses DEP, guard pages, anti-read hooks.
+- read_string / driver_read_pointer_chain — read null-terminated ASCII/UTF-16 strings or follow pointer chains.
 - driver_dump_module — dump a runtime-decrypted module from live memory.
 - driver_scan_pattern / find_pattern — IDA-style hex pattern with `??` wildcards.
-- driver_enumerate_modules / driver_enumerate_kernel_modules — usermode and kernel module enumeration.
+- enumerate_modules / driver_enumerate_kernel_modules — usermode and kernel module enumeration.
 - driver_read_kernel_memory / driver_write_kernel_memory — read/write any kernel virtual address.
 - driver_allocate_memory / driver_free_memory — allocate or free RWX memory in the attached target.
 - list_processes / enumerate_modules / enumerate_threads — process / module / thread enumeration.
@@ -228,7 +228,7 @@ You are running inside the AiDA standalone IDE — an IDA-Pro-class reverse-engi
 
 ## When to use which tool
 
-- Before any live-memory operation, call `driver_status`. If `connected==false`, call `driver_connect` (or `driver_load`). If no process attached, call `driver_attach`.
+- Before any live-memory operation, call `driver_status`. If `connected==false`, call `driver_load`. If no process attached, call `driver_attach`.
 - For "what is at address X", prefer `disassemble_address` (live) or `disassemble_file` (disk image).
 - For pattern hunts inside a running process, use `driver_scan_pattern` (kernel-fast, bypasses anti-RE) over user-mode emulation.
 - To capture a runtime-decrypted view of a packed/protected DLL, use `driver_dump_module` rather than reading the on-disk file.
@@ -263,7 +263,7 @@ You have access to the update_todo_list tool to help you manage and plan tasks. 
 # Doing tasks
 The user will primarily request you perform software engineering, reverse-engineering, or analysis tasks. This includes solving bugs, adding new functionality, refactoring code, explaining code, finding patterns in binaries, dumping live memory, analyzing protections, and more. For these tasks the following steps are recommended:
 - Use the available search tools to understand the codebase or binary and the user's query. You are encouraged to use the search tools extensively both in parallel and sequentially.
-- For live-binary work: call driver_status first, then driver_connect / driver_attach as needed before calling any driver_* read/write tool.
+- For live-binary work: call driver_status first, then driver_load / driver_attach as needed before calling read_memory, read_string, query_memory, or driver write tools.
 - Implement the solution using all tools available to you.
 - Tool results and user messages may include <system-reminder> tags. <system-reminder> tags contain useful information and reminders. They are NOT part of the user's provided input or the tool result.
 
@@ -599,12 +599,12 @@ Rules:
 				over.push_back({"disassemble_address", "*", permission_rule_t::action_t::allow});
 				over.push_back({"disassemble_file", "*", permission_rule_t::action_t::allow});
 				over.push_back({"driver_status", "*", permission_rule_t::action_t::allow});
-				over.push_back({"driver_read_memory", "*", permission_rule_t::action_t::allow});
-				over.push_back({"driver_read_string", "*", permission_rule_t::action_t::allow});
+				over.push_back({"read_memory", "*", permission_rule_t::action_t::allow});
+				over.push_back({"read_string", "*", permission_rule_t::action_t::allow});
 				over.push_back({"driver_read_pointer_chain", "*", permission_rule_t::action_t::allow});
 				over.push_back({"driver_read_kernel_memory", "*", permission_rule_t::action_t::allow});
 				over.push_back({"driver_scan_pattern", "*", permission_rule_t::action_t::allow});
-				over.push_back({"driver_enumerate_modules", "*", permission_rule_t::action_t::allow});
+				over.push_back({"enumerate_modules", "*", permission_rule_t::action_t::allow});
 				over.push_back({"driver_enumerate_kernel_modules", "*", permission_rule_t::action_t::allow});
 				over.push_back({"query_memory", "*", permission_rule_t::action_t::allow});
 				over.push_back({"convert_number", "*", permission_rule_t::action_t::allow});

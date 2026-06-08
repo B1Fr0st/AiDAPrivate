@@ -146,6 +146,7 @@ tool_result_t tool_launch(const json& params)
         if (params.contains("window_height") && params["window_height"].is_number_integer())
             cfg.window_height = params["window_height"].get<int>();
     }
+    cfg.block_webrtc = true;
     if (cfg.proxy.empty())
         cfg.proxy = proxy_url(proxy_host, proxy_port);
 
@@ -177,7 +178,7 @@ tool_result_t tool_launch(const json& params)
             camoufox_bridge_state_label(pre.state), pre.child_pid, pre.child_alive ? 1 : 0,
             pre.browser_open ? 1 : 0, pre.page_verified ? 1 : 0, pre.cleanup_pending ? 1 : 0,
             pre.last_error.empty() ? "<empty>" : pre.last_error.c_str());
-        const bool stopped = camoufox::stop_bridge();
+        const bool stopped = camoufox::stop_bridge("burp_browser_mcp.open_url.recover");
         auto post = camoufox::get_status();
         diag::log_tagged_fmt("mcp_burp", "browser_launch_camoufox preflight_stop_done stopped=%d state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d err=%s",
             stopped ? 1 : 0, camoufox_bridge_state_label(post.state), post.child_pid, post.child_alive ? 1 : 0,
@@ -258,7 +259,7 @@ tool_result_t tool_kill(const json& params)
             requested_pid, before.child_pid);
         return tool_result_t::error("pid_does_not_match_camoufox_child");
     }
-    bool ok = camoufox::close_browser();
+    bool ok = camoufox::close_browser("burp_browser_mcp.close_browser");
     auto after = camoufox::get_status();
     diag::log_tagged_fmt("mcp_burp", "browser_kill_camoufox result=%d requested_pid=%u before_pid=%u after_pid=%u after_state=%s",
         ok ? 1 : 0, requested_pid, before.child_pid, after.child_pid, camoufox_bridge_state_label(after.state));
@@ -276,7 +277,7 @@ tool_result_t tool_kill_all(const json& params)
 {
     (void)params;
     diag::log_tagged_fmt("mcp_burp", "browser_kill_all_camoufox entry");
-    bool ok = camoufox::close_browser();
+    bool ok = camoufox::close_browser("burp_browser_mcp.close");
     auto after = camoufox::get_status();
     diag::log_tagged_fmt("mcp_burp", "browser_kill_all_camoufox result=%d after_pid=%u state=%s",
         ok ? 1 : 0, after.child_pid, camoufox_bridge_state_label(after.state));
@@ -362,7 +363,7 @@ void register_browser_tools(mcp_standalone::server_t& srv)
             {"humanize", "boolean", "Enable Camoufox humanization options", false},
             {"geoip", "boolean", "Enable Camoufox GeoIP behavior", false},
             {"block_images", "boolean", "Block images in the Camoufox session", false},
-            {"block_webrtc", "boolean", "Block WebRTC leakage in the Camoufox session", false},
+            {"block_webrtc", "boolean", "Compatibility field; AiDA always blocks WebRTC before launch", false},
             {"enable_trace", "boolean", "Enable Camoufox trace capture", false},
             {"python_executable", "string", "Override Python interpreter path", false},
             {"server_module", "string", "Override Camoufox MCP server module", false},

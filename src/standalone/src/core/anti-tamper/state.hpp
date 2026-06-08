@@ -84,6 +84,8 @@ struct runtime_t
     std::atomic<bool> license_pending_activation{true};
     std::atomic<bool> activation_hardening_done{false};
     std::atomic<bool> driver_hardening_done{false};
+    std::atomic<bool> driver_hardening_active{false};
+    std::atomic<uint64_t> driver_hardening_started_ms{0};
 
     std::vector<uint32_t> vm_nested_rvas;
     std::unordered_map<uint32_t, uint32_t> atp_flags;

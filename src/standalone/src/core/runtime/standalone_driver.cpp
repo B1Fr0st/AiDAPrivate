@@ -203,6 +203,26 @@ namespace
                env_flag_enabled("AIDA_DISABLE_DESTRUCTIVE_ENFORCEMENT");
     }
 
+    bool driver_error_toast_suppressed()
+    {
+        if (anti_tamper::state::get().full_test_running.load(std::memory_order_acquire))
+            return true;
+        if (anti_tamper::state::full_test_suppression_active())
+            return true;
+        return env_flag_enabled("AIDA_FULL_TEST_RUNNING");
+    }
+
+    bool stale_session_error_toast_suppressed()
+    {
+        if (driver_error_toast_suppressed())
+            return true;
+        if (anti_tamper::state::get().violation_latched.load(std::memory_order_acquire))
+            return true;
+        if (anti_tamper::state::get().license_pending_activation.load(std::memory_order_acquire))
+            return true;
+        return !standalone_license::is_arc_loaded();
+    }
+
     struct process_ctx_t {
         HANDLE      h_process = nullptr;
         bool        kernel_attached = false;
@@ -588,20 +608,35 @@ namespace
         return h;
     }
 
-    void set_last_error_locked(const std::string& text)
+    void set_last_error_locked(const std::string& text, bool allow_toast = true)
     {
         g_last_error = text;
         if (!text.empty()) {
             logf("AiDA Standalone: %s\n", text.c_str());
-            toast_notification::push(text, toast_notification::toast_type_t::error);
+            if (!allow_toast || driver_error_toast_suppressed()) {
+                diag::log_tagged_critical_fmt("driver", "driver_error_toast_suppressed text_len=%zu allow_toast=%d full_test_latch=%d env_full_test=%d",
+                    text.size(),
+                    allow_toast ? 1 : 0,
+                    anti_tamper::state::get().full_test_running.load(std::memory_order_acquire) ? 1 : 0,
+                    env_flag_enabled("AIDA_FULL_TEST_RUNNING") ? 1 : 0);
+            } else {
+                toast_notification::push(text, toast_notification::toast_type_t::error);
+            }
         }
     }
 
     void require_kernel_fail(const char* func_name)
     {
         logf("AiDA Standalone: %s requires kernel driver.\n", func_name);
-        toast_notification::push(std::string(func_name) + " requires kernel driver",
-                                  toast_notification::toast_type_t::error);
+        if (driver_error_toast_suppressed()) {
+            diag::log_tagged_critical_fmt("driver", "driver_kernel_required_toast_suppressed func=%s full_test_latch=%d env_full_test=%d",
+                func_name ? func_name : "<null>",
+                anti_tamper::state::get().full_test_running.load(std::memory_order_acquire) ? 1 : 0,
+                env_flag_enabled("AIDA_FULL_TEST_RUNNING") ? 1 : 0);
+        } else {
+            toast_notification::push(std::string(func_name) + " requires kernel driver",
+                                      toast_notification::toast_type_t::error);
+        }
     }
 
     std::atomic<bool> g_driver_watchdog_started{false};
@@ -1148,7 +1183,15 @@ namespace driver_bridge
         close_process_handle_locked();
         if (device)
             device->disconnect();
-        set_last_error_locked("Kernel driver session became stale during activation; AiDA did not treat this as tampering.");
+        const bool suppress_toast = stale_session_error_toast_suppressed();
+        diag::log_tagged_critical_fmt("driver",
+            "stale_session_toast_policy reason=%s suppress=%d violation_latched=%d pending_activation=%d arc_loaded=%d",
+            reason ? reason : "<null>",
+            suppress_toast ? 1 : 0,
+            anti_tamper::state::get().violation_latched.load(std::memory_order_acquire) ? 1 : 0,
+            anti_tamper::state::get().license_pending_activation.load(std::memory_order_acquire) ? 1 : 0,
+            standalone_license::is_arc_loaded() ? 1 : 0);
+        set_last_error_locked("Kernel driver session became stale during activation; AiDA did not treat this as tampering.", !suppress_toast);
     }
 
     bool initialize()
@@ -3750,6 +3793,14 @@ namespace driver_bridge
         if (!kernel_mode) {
             require_kernel_fail("register_self_dll_protection");
             driver_critical_fmt("register_self_dll_protection_post ok=0 err=%lu reason=no_kernel elapsed_ms=%llu",
+                static_cast<unsigned long>(GetLastError()),
+                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
+            return false;
+        }
+
+        if (anti_tamper::state::get().violation_latched.load(std::memory_order_acquire)) {
+            SetLastError(ERROR_ACCESS_DENIED);
+            driver_critical_fmt("register_self_dll_protection_post ok=0 err=%lu reason=violation_latched elapsed_ms=%llu",
                 static_cast<unsigned long>(GetLastError()),
                 static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
             return false;

@@ -229,7 +229,7 @@ namespace {
 			static_cast<std::uint32_t>(sizeof(buf)),
 			bytes_returned);
 		test_lab_format::testlab_diag_log_step("sentinel", "Sentinel HV Detect", "request_post",
-			"ok=%d bytes_returned=%u total_run=%u total_failed=%u is_vm=%u ms_hv_root=%u vendor=\"%.16s\"",
+			"ok=%d bytes_returned=%u total_run=%u total_positive=%u is_vm=%u ms_hv_root=%u vendor=\"%.16s\"",
 			ok ? 1 : 0,
 			bytes_returned,
 			static_cast<unsigned>(buf.result.total_run),
@@ -268,11 +268,24 @@ namespace {
 		r.parsed.push_back({ "mode", "testlab_safe_fingerprint_only" });
 		r.parsed.push_back({ "request_flags", "0x0000000000000001" });
 		r.parsed.push_back({ "kernel_probe_set", "skipped_by_testlab_safe_flag" });
-		push_u32(r, "total_run", hv.total_run);
-		push_u32(r, "total_failed", hv.total_failed);
 		r.parsed.push_back({ "is_virtual_machine", hv.is_virtual_machine ? "1" : "0" });
 		r.parsed.push_back({ "ms_hv_root", hv.ms_hv_root ? "1" : "0" });
 		r.parsed.push_back({ "vm_vendor_name", make_hv_vendor_string(hv.vm_vendor_name) });
+		const std::uint32_t vm_hits =
+			static_cast<std::uint32_t>(hv.vmf_cpuid_vendor) +
+			static_cast<std::uint32_t>(hv.vmf_hyperv_guest) +
+			static_cast<std::uint32_t>(hv.vmf_smbios_vm) +
+			static_cast<std::uint32_t>(hv.vmf_acpi_vm) +
+			static_cast<std::uint32_t>(hv.vmf_pci_vm) +
+			static_cast<std::uint32_t>(hv.vmf_disk_vm) +
+			static_cast<std::uint32_t>(hv.vmf_mac_vm) +
+			static_cast<std::uint32_t>(hv.vmf_registry_vm);
+		const std::uint32_t total_positive = static_cast<std::uint32_t>(hv.total_failed);
+		const std::uint32_t hv_probe_positive = total_positive >= vm_hits ? total_positive - vm_hits : 0;
+		push_u32(r, "total_run", hv.total_run);
+		push_u32(r, "total_positive", total_positive);
+		push_u32(r, "vm_fingerprint_hits", vm_hits);
+		push_u32(r, "hv_probe_positive", hv_probe_positive);
 		push_u32(r, "sidt_lock_prefix", hv.sidt_lock_prefix);
 		push_u32(r, "sidt_invalid_pf", hv.sidt_invalid_pf);
 		push_u32(r, "sidt_tlb_only", hv.sidt_tlb_only);

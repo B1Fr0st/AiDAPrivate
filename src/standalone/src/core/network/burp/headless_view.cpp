@@ -52,7 +52,7 @@ struct state_t
     bool        cfg_headless        = false;
     bool        cfg_humanize        = false;
     bool        cfg_block_images    = false;
-    bool        cfg_block_webrtc    = false;
+    bool        cfg_block_webrtc    = true;
 
     bool        show_install_panel  = false;
     bool        install_panel_user_toggled = false;
@@ -342,7 +342,7 @@ aida::burp::camoufox::launch_config_t build_launch_config()
     cfg.headless     = g_state.cfg_headless;
     cfg.humanize     = g_state.cfg_humanize;
     cfg.block_images = g_state.cfg_block_images;
-    cfg.block_webrtc = g_state.cfg_block_webrtc;
+    cfg.block_webrtc = true;
     if (g_state.selected_os >= 0 && g_state.selected_os < kOsPresetCount) cfg.os = kOsPresets[g_state.selected_os];
     if (g_state.selected_locale >= 0 && g_state.selected_locale < kLocalePresetCount) cfg.locale = kLocalePresets[g_state.selected_locale];
     {
@@ -374,7 +374,7 @@ void run_stop_bridge()
 {
     work_queue::post([]() {
         bool ok = false;
-        try { ok = aida::burp::camoufox::stop_bridge(); } catch (...) { ok = false; }
+        try { ok = aida::burp::camoufox::stop_bridge("headless_view.stop"); } catch (...) { ok = false; }
         if (!ok) {
             std::string msg = aida::burp::camoufox::last_error();
             if (msg.empty()) msg = "stop_bridge returned false";
@@ -810,7 +810,10 @@ void render_bridge_controls(float pos_x, float pos_y, float width, float height,
     ImGui::SameLine();
     ImGui::Checkbox("Block Images", &g_state.cfg_block_images);
     ImGui::SameLine();
-    ImGui::Checkbox("Block WebRTC", &g_state.cfg_block_webrtc);
+    bool webrtc_locked = true;
+    ImGui::BeginDisabled();
+    ImGui::Checkbox("WebRTC Guard", &webrtc_locked);
+    ImGui::EndDisabled();
 
     ImGui::PopID();
 }

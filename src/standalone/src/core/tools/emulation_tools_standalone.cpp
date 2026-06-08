@@ -39,7 +39,7 @@ static constexpr std::uint64_t SYNTH_STACK_SIZE        = 0x20000ULL;
 static tool_result_t check_driver_for_address(std::uint64_t addr)
 {
     if (!driver_bridge::using_kernel_driver())
-        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
+        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_load first."));
 
     if (!is_kernel_address(addr) && driver_bridge::attached_pid() == 0)
         return tool_result_t::error(OBFSTR("Not attached to a process. Call driver_attach first (kernel addresses work without attachment)."));
@@ -210,7 +210,7 @@ tool_result_t driver_snapshot_and_emulate(const json& params)
     if (!driver_bridge::using_kernel_driver())
     {
         diag::log_tagged_fmt("emul_tools", "driver_snapshot_and_emulate driver not connected");
-        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
+        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_load first."));
     }
 
     if (driver_bridge::attached_pid() == 0)
@@ -1150,7 +1150,7 @@ void register_emulation_tools(mcp_standalone::server_t& srv)
         OBFSTR("Disassemble raw bytes from LIVE MEMORY using the Zydis engine via the kernel driver. "
                "Reads memory directly - completely independent of the IDA database. "
                "Works on both user-mode process addresses (requires driver_attach) and "
-               "kernel-mode addresses (requires only driver_connect). "
+               "kernel-mode addresses (requires only driver_load). "
                "Produces rich instruction metadata: branch/call/ret/nop/privileged "
                "classification, precise mnemonic parsing, and accurate instruction lengths. "
                "Use follow_jumps=true to automatically follow unconditional JMP trampolines (up to 16 hops) "
@@ -1172,7 +1172,7 @@ void register_emulation_tools(mcp_standalone::server_t& srv)
                "classification, and an execution trace. "
                "Use this to analyze VM handlers, unpacking stubs, and obfuscated code in protected "
                "processes where the debugger would be detected. "
-               "Requires: driver_connect + driver_attach first."),
+               "Requires: driver_load + driver_attach first."),
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Emulation start address (entry point of VM handler or code to trace)"), true},
          {OBFSTR("tid"), OBFSTR("number"), OBFSTR("Target thread ID (auto-selects first thread if omitted)"), false},
          {OBFSTR("max_instructions"), OBFSTR("number"), OBFSTR("Maximum instructions to emulate (default 50000)"), false},
@@ -1193,7 +1193,7 @@ void register_emulation_tools(mcp_standalone::server_t& srv)
         OBFSTR("Read raw code bytes from LIVE MEMORY via the kernel driver and emulate them "
                "offline in a Unicorn x86-64 engine with a synthetic stack. Completely independent of "
                "the IDA database. Works on both user-mode (requires driver_attach) and "
-               "kernel-mode addresses (requires only driver_connect). "
+               "kernel-mode addresses (requires only driver_load). "
                "Produces register deltas, memory writes, effective vs junk instruction classification, "
                "and an execution trace. "
                "Use additional_regions to map extra memory sections into the emulator (e.g. .be0 packed "
@@ -1221,7 +1221,7 @@ void register_emulation_tools(mcp_standalone::server_t& srv)
         OBFSTR("analyze_vm_handler"), OBFSTR("emulation"),
         OBFSTR("Combined disassembly + emulation analysis of a VM handler or obfuscated code block "
                "via the kernel driver. Works on user-mode (requires driver_attach) and "
-               "kernel-mode addresses (requires only driver_connect). "
+               "kernel-mode addresses (requires only driver_load). "
                "Step 1: Read raw bytes from live memory and disassemble with Zydis. "
                "Step 2: Emulate the same bytes offline in Unicorn to separate junk from effective operations. "
                "Produces: static instruction counts (nop/branch/call/privileged ratios), "
@@ -1246,7 +1246,7 @@ void register_emulation_tools(mcp_standalone::server_t& srv)
         OBFSTR("emulate_multi_trace"), OBFSTR("emulation"),
         OBFSTR("Read code from LIVE MEMORY via the kernel driver and run multiple Unicorn emulation "
                "traces with different register inputs for differential analysis. "
-               "Works on user-mode (requires driver_attach) and kernel-mode addresses (requires only driver_connect). "
+               "Works on user-mode (requires driver_attach) and kernel-mode addresses (requires only driver_load). "
                "Compare execution paths, register outputs, and memory writes across traces. "
                "Classifies behavior: constant_operation, register_transform_only, input_dependent_behavior, "
                "memory_behavior_varies. Use additional_regions for cross-section jumps."),
@@ -1263,7 +1263,7 @@ void register_emulation_tools(mcp_standalone::server_t& srv)
         OBFSTR("emulate_function"), OBFSTR("emulation"),
         OBFSTR("Read a function's code from LIVE MEMORY via the kernel driver and emulate it "
                "offline in Unicorn until it returns (RET). "
-               "Works on user-mode (requires driver_attach) and kernel-mode addresses (requires only driver_connect). "
+               "Works on user-mode (requires driver_attach) and kernel-mode addresses (requires only driver_load). "
                "Sets up a synthetic stack with a sentinel return address to detect normal function return. "
                "Reports: return value (RAX), register deltas, memory writes, effective operations, "
                "and whether the function returned normally. "

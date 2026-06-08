@@ -70,6 +70,8 @@ json install_status_to_json(const camoufox::install::status_t& s)
 json status_to_json(const camoufox::bridge_status_t& s)
 {
     json j;
+    j["session_id"]       = s.session_id;
+    j["active_session_id"] = s.active_session_id;
     j["state"]            = state_label(s.state);
     j["last_error"]       = s.last_error;
     j["server_command"]   = s.server_command;
@@ -79,8 +81,27 @@ json status_to_json(const camoufox::bridge_status_t& s)
     j["total_calls"]      = s.total_calls;
     j["total_errors"]     = s.total_errors;
     j["browser_open"]     = s.browser_open;
+    j["active_page_id"]   = s.active_page_id;
     j["active_page_url"]  = s.active_page_url;
     j["active_page_title"] = s.active_page_title;
+    j["page_count"]       = s.page_count;
+    j["session_count"]    = s.session_count;
+    j["pages"]            = json::array();
+    for (const auto& p : s.pages)
+    {
+        j["pages"].push_back({
+            {"page_id", p.page_id},
+            {"context_id", p.context_id},
+            {"url", p.url},
+            {"title", p.title},
+            {"guid", p.guid},
+            {"active", p.active},
+            {"closed", p.closed},
+            {"created_ms", p.created_ms},
+            {"last_used_ms", p.last_used_ms},
+        });
+    }
+    j["active_profile_dir"] = s.active_profile_dir;
     j["page_verified"]    = s.page_verified;
     j["child_alive"]      = s.child_alive;
     j["cleanup_pending"]  = s.cleanup_pending;
@@ -196,6 +217,8 @@ tool_result_t tool_headless_start(const json& params)
     {
         if (params.contains("headless") && params["headless"].is_boolean())
             cfg.headless = params["headless"].get<bool>();
+        if (params.contains("session_id") && params["session_id"].is_string())
+            cfg.session_id = params["session_id"].get<std::string>();
         if (params.contains("proxy") && params["proxy"].is_string())
             cfg.proxy = params["proxy"].get<std::string>();
         if (params.contains("os") && params["os"].is_string())
@@ -223,12 +246,13 @@ tool_result_t tool_headless_start(const json& params)
         if (params.contains("window_height") && params["window_height"].is_number_integer())
             cfg.window_height = params["window_height"].get<int>();
     }
+    cfg.block_webrtc = true;
     diag::log_tagged_fmt("mcp_burp", "headless_start config headless=%d has_proxy=%d proxy_len=%zu os=%s locale=%s humanize=%d geoip=%d block_images=%d block_webrtc=%d enable_trace=%d python=%s module=%s timeout_ms=%d window=%dx%d",
         (int)cfg.headless, (int)!cfg.proxy.empty(), cfg.proxy.size(), cfg.os.c_str(), cfg.locale.c_str(),
         (int)cfg.humanize, (int)cfg.geoip, (int)cfg.block_images, (int)cfg.block_webrtc, (int)cfg.enable_trace,
         cfg.python_executable.c_str(), cfg.server_module.c_str(), cfg.launch_timeout_ms, cfg.window_width, cfg.window_height);
     bool ok = camoufox::start_bridge(cfg);
-    auto s = ok ? wait_for_ready_status(5000) : camoufox::get_status();
+    auto s = ok ? camoufox::get_status(cfg.session_id) : camoufox::get_status(cfg.session_id);
     json j = status_to_json(s);
     if (!ok)
     {
@@ -290,6 +314,7 @@ json camoufox_args(const json& params)
 {
     json args = params.is_object() ? params : json::object();
     args.erase("binary_id");
+    args.erase("session_id");
     args.erase("call_timeout_ms");
     args.erase("launch_timeout_ms");
     args.erase("python_executable");
@@ -337,7 +362,9 @@ tool_result_t tool_camoufox_click(const json& params)
     if (!params.is_object() || !params.contains("selector") || !params["selector"].is_string())
         return tool_result_t::error("missing_selector");
     const std::string selector = params["selector"].get<std::string>();
-    auto before = camoufox::get_status();
+    const std::string session_id = json_string_param(params, "session_id", "default");
+    const std::string page_id = json_string_param(params, "page_id", std::string());
+    auto before = camoufox::get_status(session_id);
     const auto start = std::chrono::steady_clock::now();
     diag::log_tagged_fmt("mcp_burp", "camoufox_click_direct entry selector=%s state=%s child_pid=%lu ready=%d",
         selector.c_str(),
@@ -346,8 +373,9 @@ tool_result_t tool_camoufox_click(const json& params)
         bridge_ready(before) ? 1 : 0);
     json args;
     args["selector"] = selector;
-    tool_result_t out = bridge_result_to_tool_result(camoufox::call_tool("click", args, 5000));
-    auto after = camoufox::get_status();
+    if (!page_id.empty()) args["page_id"] = page_id;
+    tool_result_t out = bridge_result_to_tool_result(camoufox::call_tool("click", args, 5000, session_id));
+    auto after = camoufox::get_status(session_id);
     if (out.data.is_object())
         out.data["bridge"] = status_to_json(after);
     diag::log_tagged_fmt("mcp_burp", "camoufox_click_direct exit selector=%s success=%d elapsed_ms=%llu state=%s child_pid=%lu data_shape=%s text_len=%zu",
@@ -370,7 +398,9 @@ tool_result_t tool_camoufox_type_text(const json& params)
     const std::string selector = params["selector"].get<std::string>();
     const std::string text = params["text"].get<std::string>();
     const int delay = json_int_param(params, "delay", 0);
-    auto before = camoufox::get_status();
+    const std::string session_id = json_string_param(params, "session_id", "default");
+    const std::string page_id = json_string_param(params, "page_id", std::string());
+    auto before = camoufox::get_status(session_id);
     const auto start = std::chrono::steady_clock::now();
     diag::log_tagged_fmt("mcp_burp", "camoufox_type_direct entry selector=%s text_len=%zu delay=%d state=%s child_pid=%lu ready=%d",
         selector.c_str(),
@@ -383,8 +413,9 @@ tool_result_t tool_camoufox_type_text(const json& params)
     args["selector"] = selector;
     args["text"] = text;
     args["delay"] = delay;
-    tool_result_t out = bridge_result_to_tool_result(camoufox::call_tool("type_text", args, 5000));
-    auto after = camoufox::get_status();
+    if (!page_id.empty()) args["page_id"] = page_id;
+    tool_result_t out = bridge_result_to_tool_result(camoufox::call_tool("type_text", args, 5000, session_id));
+    auto after = camoufox::get_status(session_id);
     if (out.data.is_object())
         out.data["bridge"] = status_to_json(after);
     diag::log_tagged_fmt("mcp_burp", "camoufox_type_direct exit selector=%s success=%d text_len=%zu elapsed_ms=%llu state=%s child_pid=%lu data_shape=%s out_text_len=%zu",
@@ -407,7 +438,9 @@ tool_result_t tool_camoufox_wait_for_selector(const json& params)
     int timeout_ms = json_int_param(params, "timeout", 5000);
     if (timeout_ms < 1) timeout_ms = 5000;
     if (timeout_ms > 60000) timeout_ms = 60000;
-    auto before = camoufox::get_status();
+    const std::string session_id = json_string_param(params, "session_id", "default");
+    const std::string page_id = json_string_param(params, "page_id", std::string());
+    auto before = camoufox::get_status(session_id);
     const auto start = std::chrono::steady_clock::now();
     diag::log_tagged_fmt("mcp_burp", "camoufox_wait_direct entry selector=%s timeout_ms=%d state=%s child_pid=%lu ready=%d",
         selector.c_str(),
@@ -418,8 +451,9 @@ tool_result_t tool_camoufox_wait_for_selector(const json& params)
     json args;
     args["selector"] = selector;
     args["timeout"] = timeout_ms;
-    tool_result_t out = bridge_result_to_tool_result(camoufox::call_tool("wait_for", args, timeout_ms + 5000));
-    auto after = camoufox::get_status();
+    if (!page_id.empty()) args["page_id"] = page_id;
+    tool_result_t out = bridge_result_to_tool_result(camoufox::call_tool("wait_for", args, timeout_ms + 5000, session_id));
+    auto after = camoufox::get_status(session_id);
     if (out.data.is_object())
         out.data["bridge"] = status_to_json(after);
     diag::log_tagged_fmt("mcp_burp", "camoufox_wait_direct exit selector=%s success=%d timeout_ms=%d elapsed_ms=%llu state=%s child_pid=%lu data_shape=%s text_len=%zu",
@@ -437,6 +471,7 @@ tool_result_t tool_camoufox_wait_for_selector(const json& params)
 camoufox::launch_config_t launch_config_from_mcp_params(const json& params)
 {
     camoufox::launch_config_t cfg;
+    cfg.session_id = json_string_param(params, "session_id", cfg.session_id);
     cfg.headless = json_bool_param(params, "headless", cfg.headless);
     cfg.proxy = json_string_param(params, "proxy", cfg.proxy);
     cfg.os = json_string_param(params, "os_type", json_string_param(params, "os", cfg.os));
@@ -445,6 +480,7 @@ camoufox::launch_config_t launch_config_from_mcp_params(const json& params)
     cfg.geoip = json_bool_param(params, "geoip", cfg.geoip);
     cfg.block_images = json_bool_param(params, "block_images", cfg.block_images);
     cfg.block_webrtc = json_bool_param(params, "block_webrtc", cfg.block_webrtc);
+    cfg.block_webrtc = true;
     cfg.enable_trace = json_bool_param(params, "enable_trace", cfg.enable_trace);
     cfg.python_executable = json_string_param(params, "python_executable", cfg.python_executable);
     cfg.server_module = json_string_param(params, "server_module", cfg.server_module);
@@ -458,7 +494,7 @@ tool_result_t tool_launch_browser(const json& params)
 {
     camoufox::launch_config_t cfg = launch_config_from_mcp_params(params);
     bool ok = camoufox::start_bridge(cfg);
-    auto status = ok ? wait_for_ready_status(5000) : camoufox::get_status();
+    auto status = camoufox::get_status(cfg.session_id);
     json j = status_to_json(status);
     if (!ok)
     {
@@ -479,10 +515,11 @@ tool_result_t tool_launch_browser(const json& params)
     return tool_result_t::ok(j);
 }
 
-tool_result_t tool_close_browser(const json&)
+tool_result_t tool_close_browser(const json& params)
 {
-    bool ok = camoufox::stop_bridge();
-    json j = status_to_json(camoufox::get_status());
+    const std::string session_id = json_string_param(params, "session_id", "default");
+    bool ok = camoufox::stop_bridge(session_id, "camoufox_mcp.close_browser");
+    json j = status_to_json(camoufox::get_status(session_id));
     if (!ok)
     {
         tool_result_t out;
@@ -523,7 +560,8 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
     }
     json args = camoufox_args(params);
     int timeout_ms = camoufox_timeout_ms(params, default_timeout_ms);
-    auto before = camoufox::get_status();
+    const std::string session_id = json_string_param(params, "session_id", "default");
+    auto before = camoufox::get_status(session_id);
     const auto start = std::chrono::steady_clock::now();
     diag::log_tagged_fmt("mcp_burp", "camoufox_passthrough entry tool=%s timeout_ms=%d args_shape=%s bridge_state=%s child_pid=%lu browser_open=%d page_verified=%d child_alive=%d cleanup_pending=%d",
         tool_name.c_str(), timeout_ms, json_shape(args).c_str(), state_label(before.state),
@@ -535,9 +573,9 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
         return tool_camoufox_type_text(params);
     if (tool_name == "wait_for" && params.is_object() && params.contains("selector") && params["selector"].is_string())
         return tool_camoufox_wait_for_selector(params);
-    camoufox::call_result_t bridge_result = camoufox::call_tool(tool_name, args, timeout_ms);
+    camoufox::call_result_t bridge_result = camoufox::call_tool(tool_name, args, timeout_ms, session_id);
     tool_result_t out = bridge_result_to_tool_result(bridge_result);
-    auto after = camoufox::get_status();
+    auto after = camoufox::get_status(session_id);
     const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start).count();
     std::string failure_phase;
@@ -572,53 +610,86 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
 {
     return {
         {"launch_browser", "Launch the bundled Camoufox anti-detection browser through AiDA's integrated bridge.",
-            {{"headless", "boolean", "Run in headless mode; AiDA defaults to visible headed Camoufox", false},
+            {{"session_id", "string", "Independent browser session id; default keeps legacy behavior", false},
+             {"headless", "boolean", "Run in headless mode; AiDA defaults to visible headed Camoufox", false},
              {"os_type", "string", "Spoofed OS: auto, windows, macos, or linux", false},
              {"locale", "string", "Browser locale such as en-US; auto uses the system locale", false},
              {"proxy", "string", "Proxy URL such as http://127.0.0.1:8443", false},
              {"humanize", "boolean", "Enable humanized mouse movement", false},
              {"geoip", "boolean", "Infer geolocation from proxy IP", false},
              {"block_images", "boolean", "Block image loading", false},
-             {"block_webrtc", "boolean", "Block WebRTC to prevent IP leaks", false},
+             {"block_webrtc", "boolean", "Compatibility field; AiDA always blocks WebRTC before launch", false},
              {"enable_trace", "boolean", "Enable engine-level property access tracing", false},
              {"python_executable", "string", "Override Python interpreter path", false},
              {"server_module", "string", "Override Python module name", false},
              {"launch_timeout_ms", "number", "Requested launch timeout in milliseconds; AiDA bounds the readiness handshake internally", false},
              {"window_width", "number", "Initial outer browser window width in pixels", false},
              {"window_height", "number", "Initial outer browser window height in pixels", false}}, false, 60000},
-        {"close_browser", "Close Camoufox and stop the hidden bundled Python bridge.", {}, false, 30000},
-        {"navigate", "Navigate the active Camoufox page with optional hook pre-injection and redirect tracing.",
-            {{"url", "string", "Target URL", true},
+        {"close_browser", "Close Camoufox and stop the selected hidden bundled Python bridge.",
+            {{"session_id", "string", "Browser session id; default closes the legacy session", false}}, false, 30000},
+        {"list_pages", "List pages/tabs in a Camoufox browser session.",
+            {{"session_id", "string", "Browser session id", false}}, true, 15000},
+        {"new_page", "Create a new Camoufox tab/page in a browser session.",
+            {{"session_id", "string", "Browser session id", false},
+             {"page_id", "string", "Stable AiDA page id to request", false},
+             {"url", "string", "Optional URL to navigate after creating the page", false},
+             {"make_active", "boolean", "Make the new page the session active page", false}}, false, 30000},
+        {"select_page", "Select a page as the active target for legacy calls in a browser session.",
+            {{"session_id", "string", "Browser session id", false},
+             {"page_id", "string", "Stable AiDA page id", true}}, false, 15000},
+        {"close_page", "Close a specific Camoufox tab/page without stopping the browser session.",
+            {{"session_id", "string", "Browser session id", false},
+             {"page_id", "string", "Stable AiDA page id", true}}, false, 15000},
+        {"navigate", "Navigate a Camoufox page with optional hook pre-injection and redirect tracing.",
+            {{"session_id", "string", "Browser session id", false},
+             {"page_id", "string", "Stable AiDA page id; omitted uses the selected page", false},
+             {"url", "string", "Target URL", true},
              {"wait_until", "string", "load, domcontentloaded, or networkidle", false},
              {"pre_inject_hooks", "array", "Hook preset names to register before navigation", false},
              {"collect_response_chain", "boolean", "Record response chain for final status resolution", false},
              {"clear_network_capture", "boolean", "Clear stale network capture before navigating", false},
              {"include_title", "boolean", "Return page title when available", false}}, false, 60000},
-        {"reload", "Reload the current Camoufox page while preserving init scripts.",
-            {{"wait_until", "string", "load, domcontentloaded, or networkidle", false}}, false, 45000},
-        {"take_screenshot", "Capture a base64 PNG screenshot of the current page or selected element.",
-            {{"full_page", "boolean", "Capture the full scrollable page", false},
+        {"reload", "Reload a Camoufox page while preserving init scripts.",
+            {{"session_id", "string", "Browser session id", false},
+             {"page_id", "string", "Stable AiDA page id; omitted uses the selected page", false},
+             {"wait_until", "string", "load, domcontentloaded, or networkidle", false}}, false, 45000},
+        {"take_screenshot", "Capture a base64 PNG screenshot of a Camoufox page or selected element.",
+            {{"session_id", "string", "Browser session id", false},
+             {"page_id", "string", "Stable AiDA page id; omitted uses the selected page", false},
+             {"full_page", "boolean", "Capture the full scrollable page", false},
              {"selector", "string", "CSS selector for an element screenshot", false}}, true, 60000},
-        {"take_snapshot", "Return a token-efficient accessibility snapshot of the current page.", {}, true, 30000},
-        {"click", "Click an element matching a CSS selector in the active Camoufox page.",
-            {{"selector", "string", "CSS selector", true}}, false, 30000},
+        {"take_snapshot", "Return a token-efficient accessibility snapshot of a Camoufox page.",
+            {{"session_id", "string", "Browser session id", false},
+             {"page_id", "string", "Stable AiDA page id; omitted uses the selected page", false}}, true, 30000},
+        {"click", "Click an element matching a CSS selector in a Camoufox page.",
+            {{"session_id", "string", "Browser session id", false},
+             {"page_id", "string", "Stable AiDA page id; omitted uses the selected page", false},
+             {"selector", "string", "CSS selector", true}}, false, 30000},
         {"type_text", "Type text into an element with realistic keystroke delay.",
-            {{"selector", "string", "CSS selector", true},
+            {{"session_id", "string", "Browser session id", false},
+             {"page_id", "string", "Stable AiDA page id; omitted uses the selected page", false},
+             {"selector", "string", "CSS selector", true},
              {"text", "string", "Text to type", true},
              {"delay", "number", "Delay between key presses in milliseconds", false}}, false, 30000},
         {"wait_for", "Wait for a selector or URL pattern in Camoufox.",
-            {{"selector", "string", "CSS selector to wait for", false},
+            {{"session_id", "string", "Browser session id", false},
+             {"page_id", "string", "Stable AiDA page id; omitted uses the selected page", false},
+             {"selector", "string", "CSS selector to wait for", false},
              {"url_pattern", "string", "URL pattern to wait for", false},
              {"timeout", "number", "Wait timeout in milliseconds", false}}, true, 45000},
-        {"get_page_info", "Return current page URL, title, and viewport size.", {}, true, 30000},
+        {"get_page_info", "Return page URL, title, viewport size, and page identity.",
+            {{"session_id", "string", "Browser session id", false},
+             {"page_id", "string", "Stable AiDA page id; omitted uses the selected page", false}}, true, 30000},
         {"reset_browser_state", "Clear Camoufox residual state such as persistent hooks, capture buffers, routes, cookies, or storage.",
             {{"clear_persistent_hooks", "boolean", "Remove persistent init scripts", false},
              {"clear_network_capture", "boolean", "Clear network capture buffer and stop captures", false},
              {"clear_active_routes", "boolean", "Clear instrumentation routes", false},
              {"clear_cookies", "boolean", "Clear browser cookies", false},
              {"clear_storage", "boolean", "Clear localStorage and sessionStorage", false}}, false, 45000},
-        {"evaluate_js", "Execute a JavaScript expression in the active page context.",
-            {{"expression", "string", "JavaScript expression", true},
+        {"evaluate_js", "Execute a JavaScript expression in a Camoufox page context.",
+            {{"session_id", "string", "Browser session id", false},
+             {"page_id", "string", "Stable AiDA page id; omitted uses the selected page", false},
+             {"expression", "string", "JavaScript expression", true},
              {"await_promise", "boolean", "Await promise return values", false}}, false, 45000},
         {"hook_function", "Hook or trace a JavaScript function by path.",
             {{"function_path", "string", "Path such as window.encrypt or XMLHttpRequest.prototype.open", true},
@@ -639,16 +710,21 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"persistent", "boolean", "Persist across navigations", false}}, false, 30000},
         {"remove_hooks", "Remove installed JavaScript hooks and restore originals.",
             {{"keep_persistent", "boolean", "Keep persistent init scripts registered", false}}, false, 30000},
-        {"get_console_logs", "Return console output collected from the active page.",
-            {{"level", "string", "Filter by log, warn, error, or info", false},
+        {"get_console_logs", "Return console output collected from Camoufox pages.",
+            {{"session_id", "string", "Browser session id", false},
+             {"page_id", "string", "Stable AiDA page id filter", false},
+             {"level", "string", "Filter by log, warn, error, or info", false},
              {"keyword", "string", "Filter logs containing this text", false},
              {"clear", "boolean", "Clear the log buffer after retrieval", false}}, true, 30000},
         {"network_capture", "Start, stop, clear, or report Camoufox network capture.",
-            {{"action", "string", "start, stop, clear, or status", true},
+            {{"session_id", "string", "Browser session id", false},
+             {"action", "string", "start, stop, clear, or status", true},
              {"url_pattern", "string", "URL glob pattern", false},
              {"capture_body", "boolean", "Capture response bodies", false}}, false, 30000},
         {"list_network_requests", "List captured network requests with optional filters.",
-            {{"url_filter", "string", "Substring filter for URLs", false},
+            {{"session_id", "string", "Browser session id", false},
+             {"page_id", "string", "Stable AiDA page id filter", false},
+             {"url_filter", "string", "Substring filter for URLs", false},
              {"url_contains_domain", "string", "Domain substring filter", false},
              {"method", "string", "HTTP method filter", false},
              {"resource_type", "string", "Resource type filter", false},
@@ -659,7 +735,9 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"include_headers", "boolean", "Include request and response headers", false},
              {"max_body_size", "number", "Maximum body characters", false}}, true, 30000},
         {"get_request_initiator", "Return the JavaScript call stack that initiated a captured request.",
-            {{"request_id", "number", "Request id from list_network_requests", true}}, true, 30000},
+            {{"session_id", "string", "Browser session id", false},
+             {"page_id", "string", "Stable AiDA page id; omitted uses request page or selected page", false},
+             {"request_id", "number", "Request id from list_network_requests", true}}, true, 30000},
         {"intercept_request", "Intercept matching network requests and log, block, modify, mock, or stop routing.",
             {{"url_pattern", "string", "URL glob pattern", true},
              {"action", "string", "log, block, modify, mock, or stop", false},
@@ -681,7 +759,7 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"domain", "string", "Domain filter", false},
              {"cookies_list", "array", "Cookie objects to set", false},
              {"name", "string", "Cookie name for delete", false}}, false, 30000},
-        {"get_storage", "Return localStorage or sessionStorage from the active page.",
+        {"get_storage", "Return localStorage or sessionStorage from the selected page.",
             {{"storage_type", "string", "local or session", false}}, true, 30000},
         {"export_state", "Export cookies and storage to a JSON file.",
             {{"save_path", "string", "Destination JSON path", true}}, false, 30000},
@@ -772,10 +850,10 @@ void register_camoufox_reverse_tools(mcp_standalone::server_t& srv)
 
 tool_result_t tool_headless_stop(const json& params)
 {
-    (void)params;
     diag::log_tagged_fmt("mcp_burp", "headless_stop entry");
-    bool ok = camoufox::stop_bridge();
-    auto s = camoufox::get_status();
+    const std::string session_id = json_string_param(params, "session_id", "default");
+    bool ok = camoufox::stop_bridge(session_id, "camoufox_mcp.stop_on_launch_config_change");
+    auto s = camoufox::get_status(session_id);
     json j = status_to_json(s);
     if (!ok)
     {
@@ -788,9 +866,9 @@ tool_result_t tool_headless_stop(const json& params)
 
 tool_result_t tool_headless_status(const json& params)
 {
-    (void)params;
     diag::log_tagged_fmt("mcp_burp", "headless_status entry");
-    auto s = camoufox::get_status();
+    const std::string session_id = json_string_param(params, "session_id", "default");
+    auto s = camoufox::get_status(session_id);
     json j = status_to_json(s);
     const url_log_t u = summarize_url_for_log(s.active_page_url);
     diag::log_tagged_fmt("mcp_burp", "headless_status ok state=%s calls=%llu errors=%llu browser_open=%d active_host=%s active_path=%s query=%d response_shape=%s",
@@ -809,7 +887,9 @@ tool_result_t tool_headless_navigate(const json& params)
         return tool_result_t::error("missing_url");
     }
     std::string url = params["url"].get<std::string>();
-    std::string wait_until = "load";
+    const std::string session_id = json_string_param(params, "session_id", "default");
+    const std::string page_id = json_string_param(params, "page_id", std::string());
+    std::string wait_until = "domcontentloaded";
     int timeout_ms = 30000;
     if (params.contains("wait_until") && params["wait_until"].is_string())
         wait_until = params["wait_until"].get<std::string>();
@@ -818,19 +898,19 @@ tool_result_t tool_headless_navigate(const json& params)
     const url_log_t u = summarize_url_for_log(url);
     diag::log_tagged_fmt("mcp_burp", "headless_navigate host=%s path=%s query=%d fragment=%d url_len=%zu wait_until=%s timeout_ms=%d",
         u.host.c_str(), u.path.c_str(), (int)u.has_query, (int)u.has_fragment, u.length, wait_until.c_str(), timeout_ms);
-    if (!camoufox::ensure_ready())
+    if (session_id == "default" && !camoufox::ensure_ready())
     {
         std::string err = camoufox::last_error();
         diag::log_tagged_fmt("mcp_burp", "headless_navigate bridge_not_ready err=%s", err.c_str());
         return tool_result_t::error(err.empty() ? std::string("camoufox bridge not ready") : err);
     }
-    if (!camoufox::navigate(url, wait_until, timeout_ms))
+    if (!camoufox::navigate(url, wait_until, timeout_ms, session_id, page_id))
     {
         diag::log_tagged_fmt("mcp_burp", "headless_navigate failed err=%s", camoufox::last_error().c_str());
         return tool_result_t::error(camoufox::last_error().empty() ? std::string("navigate failed") : camoufox::last_error());
     }
     diag::log_tagged_fmt("mcp_burp", "headless_navigate ok host=%s path=%s query=%d", u.host.c_str(), u.path.c_str(), (int)u.has_query);
-    auto page = camoufox::get_page_info();
+    auto page = camoufox::get_page_info(session_id, page_id);
     if (page.ok)
     {
         diag::log_tagged_fmt("mcp_burp", "headless_navigate page_info ok response_shape=%s", json_shape(page.data).c_str());
@@ -842,18 +922,20 @@ tool_result_t tool_headless_navigate(const json& params)
 
 tool_result_t tool_headless_reload(const json& params)
 {
-    std::string wait_until = "load";
+    std::string wait_until = "domcontentloaded";
+    const std::string session_id = json_string_param(params, "session_id", "default");
+    const std::string page_id = json_string_param(params, "page_id", std::string());
     if (params.is_object() && params.contains("wait_until") && params["wait_until"].is_string())
         wait_until = params["wait_until"].get<std::string>();
     diag::log_tagged_fmt("mcp_burp", "headless_reload wait_until=%s", wait_until.c_str());
-    if (!camoufox::reload(wait_until))
+    if (!camoufox::reload(wait_until, session_id, page_id))
     {
         std::string err = camoufox::last_error();
         diag::log_tagged_fmt("mcp_burp", "headless_reload failed err=%s", err.c_str());
         return tool_result_t::error(err.empty() ? std::string("reload failed") : err);
     }
     diag::log_tagged_fmt("mcp_burp", "headless_reload ok");
-    auto page = camoufox::get_page_info();
+    auto page = camoufox::get_page_info(session_id, page_id);
     if (page.ok) return tool_result_t::ok(page.data);
     diag::log_tagged_fmt("mcp_burp", "headless_reload page_info failed err=%s", page.error.c_str());
     return tool_result_t::error(page.error.empty() ? std::string("headless_reload page verification failed") : page.error);
@@ -868,11 +950,13 @@ tool_result_t tool_headless_evaluate(const json& params)
         return tool_result_t::error("missing_expression");
     }
     std::string expr = params["expression"].get<std::string>();
+    const std::string session_id = json_string_param(params, "session_id", "default");
+    const std::string page_id = json_string_param(params, "page_id", std::string());
     bool await_promise = true;
     if (params.contains("await_promise") && params["await_promise"].is_boolean())
         await_promise = params["await_promise"].get<bool>();
     diag::log_tagged_fmt("mcp_burp", "headless_evaluate expr_len=%zu await=%d", expr.size(), (int)await_promise);
-    auto r = camoufox::evaluate_js(expr, await_promise);
+    auto r = camoufox::evaluate_js(expr, await_promise, session_id, page_id);
     if (!r.ok)
     {
         diag::log_tagged_fmt("mcp_burp", "headless_evaluate failed err=%s", r.error.c_str());
@@ -891,11 +975,13 @@ tool_result_t tool_headless_screenshot(const json& params)
         return tool_result_t::error("missing_output_path");
     }
     std::string path = params["output_path"].get<std::string>();
+    const std::string session_id = json_string_param(params, "session_id", "default");
+    const std::string page_id = json_string_param(params, "page_id", std::string());
     bool full_page = true;
     if (params.contains("full_page") && params["full_page"].is_boolean())
         full_page = params["full_page"].get<bool>();
     diag::log_tagged_fmt("mcp_burp", "headless_screenshot path=%s full_page=%d", path.c_str(), (int)full_page);
-    if (!camoufox::take_screenshot(path, full_page))
+    if (!camoufox::take_screenshot(path, full_page, session_id, page_id))
     {
         std::string err = camoufox::last_error();
         diag::log_tagged_fmt("mcp_burp", "headless_screenshot failed err=%s", err.c_str());
@@ -907,10 +993,11 @@ tool_result_t tool_headless_screenshot(const json& params)
 
 tool_result_t tool_headless_snapshot(const json& params)
 {
-    (void)params;
     diag::log_tagged_fmt("mcp_burp", "headless_snapshot entry");
+    const std::string session_id = json_string_param(params, "session_id", "default");
+    const std::string page_id = json_string_param(params, "page_id", std::string());
     std::string text;
-    if (!camoufox::take_snapshot(text))
+    if (!camoufox::take_snapshot(text, session_id, page_id))
     {
         std::string err = camoufox::last_error();
         diag::log_tagged_fmt("mcp_burp", "headless_snapshot failed err=%s", err.c_str());
@@ -929,8 +1016,10 @@ tool_result_t tool_headless_click(const json& params)
         return tool_result_t::error("missing_selector");
     }
     const std::string sel = params["selector"].get<std::string>();
+    const std::string session_id = json_string_param(params, "session_id", "default");
+    const std::string page_id = json_string_param(params, "page_id", std::string());
     diag::log_tagged_fmt("mcp_burp", "headless_click selector=%s", sel.c_str());
-    if (!camoufox::click(sel))
+    if (!camoufox::click(sel, session_id, page_id))
     {
         std::string err = camoufox::last_error();
         diag::log_tagged_fmt("mcp_burp", "headless_click failed err=%s", err.c_str());
@@ -955,8 +1044,10 @@ tool_result_t tool_headless_type(const json& params)
     }
     const std::string sel = params["selector"].get<std::string>();
     const std::string txt = params["text"].get<std::string>();
+    const std::string session_id = json_string_param(params, "session_id", "default");
+    const std::string page_id = json_string_param(params, "page_id", std::string());
     diag::log_tagged_fmt("mcp_burp", "headless_type selector=%s text_len=%zu", sel.c_str(), txt.size());
-    if (!camoufox::type_text(sel, txt))
+    if (!camoufox::type_text(sel, txt, session_id, page_id))
     {
         std::string err = camoufox::last_error();
         diag::log_tagged_fmt("mcp_burp", "headless_type failed err=%s", err.c_str());
@@ -978,8 +1069,10 @@ tool_result_t tool_headless_wait_for(const json& params)
     if (params.contains("timeout_ms") && params["timeout_ms"].is_number_integer())
         timeout_ms = params["timeout_ms"].get<int>();
     const std::string sel = params["selector"].get<std::string>();
+    const std::string session_id = json_string_param(params, "session_id", "default");
+    const std::string page_id = json_string_param(params, "page_id", std::string());
     diag::log_tagged_fmt("mcp_burp", "headless_wait_for selector=%s timeout_ms=%d", sel.c_str(), timeout_ms);
-    if (!camoufox::wait_for(sel, timeout_ms))
+    if (!camoufox::wait_for(sel, timeout_ms, session_id, page_id))
     {
         std::string err = camoufox::last_error();
         diag::log_tagged_fmt("mcp_burp", "headless_wait_for failed err=%s", err.c_str());
@@ -994,8 +1087,10 @@ tool_result_t tool_headless_console_logs(const json& params)
     size_t max_records = 200;
     if (params.is_object() && params.contains("max_records") && params["max_records"].is_number_unsigned())
         max_records = params["max_records"].get<size_t>();
+    const std::string session_id = json_string_param(params, "session_id", "default");
+    const std::string page_id = json_string_param(params, "page_id", std::string());
     diag::log_tagged_fmt("mcp_burp", "headless_console_logs max_records=%zu", max_records);
-    auto r = camoufox::get_console_logs(max_records);
+    auto r = camoufox::get_console_logs(max_records, session_id, page_id);
     if (!r.ok)
     {
         diag::log_tagged_fmt("mcp_burp", "headless_console_logs failed err=%s", r.error.c_str());
@@ -1010,8 +1105,10 @@ tool_result_t tool_headless_network_requests(const json& params)
     size_t max_records = 200;
     if (params.is_object() && params.contains("max_records") && params["max_records"].is_number_unsigned())
         max_records = params["max_records"].get<size_t>();
+    const std::string session_id = json_string_param(params, "session_id", "default");
+    const std::string page_id = json_string_param(params, "page_id", std::string());
     diag::log_tagged_fmt("mcp_burp", "headless_network_requests max_records=%zu", max_records);
-    auto r = camoufox::list_network_requests(max_records);
+    auto r = camoufox::list_network_requests(max_records, session_id, page_id);
     if (!r.ok)
     {
         diag::log_tagged_fmt("mcp_burp", "headless_network_requests failed err=%s", r.error.c_str());
@@ -1104,6 +1201,7 @@ void register_camoufox_tools(mcp_standalone::server_t& srv)
         "in-process and launches a Firefox-derived browser with engine-level fingerprint spoofing. "
         "Optional proxy points at AiDA's MITM proxy for capturing intercepted DOM-XSS traffic.",
         {
+            {"session_id",        "string",  "Independent browser session id; default keeps legacy behavior", false},
             {"headless",          "boolean", "Compatibility flag; AiDA forces visible headed Camoufox", false},
             {"proxy",             "string",  "Proxy URL, e.g. http://127.0.0.1:8443", false},
             {"os",                "string",  "Spoofed OS: auto/windows/macos/linux", false},
@@ -1111,7 +1209,7 @@ void register_camoufox_tools(mcp_standalone::server_t& srv)
             {"humanize",          "boolean", "Enable humanized mouse movement", false},
             {"geoip",             "boolean", "Infer geolocation from proxy IP", false},
             {"block_images",      "boolean", "Block image loading", false},
-            {"block_webrtc",      "boolean", "Block WebRTC to prevent IP leaks", false},
+            {"block_webrtc",      "boolean", "Compatibility field; AiDA always blocks WebRTC before launch", false},
             {"enable_trace",      "boolean", "Enable engine-level property access tracing", false},
             {"python_executable", "string",  "Override python interpreter path", false},
             {"server_module",     "string",  "MCP server module name (default camoufox_reverse_mcp)", false},
@@ -1127,7 +1225,7 @@ void register_camoufox_tools(mcp_standalone::server_t& srv)
         "burp_headless_stop",
         "headless_browser",
         "Stop the Camoufox headless browser bridge and terminate the Python MCP server.",
-        {},
+        {{"session_id", "string", "Browser session id", false}},
         tool_headless_stop,
         false
     });
@@ -1136,7 +1234,7 @@ void register_camoufox_tools(mcp_standalone::server_t& srv)
         "burp_headless_status",
         "headless_browser",
         "Return current Camoufox bridge state, browser status, and call counters.",
-        {},
+        {{"session_id", "string", "Browser session id", false}},
         tool_headless_status,
         true
     });
@@ -1146,8 +1244,10 @@ void register_camoufox_tools(mcp_standalone::server_t& srv)
         "headless_browser",
         "Open visible Camoufox if needed, then navigate it to a URL. Returns page info with final URL/title/status.",
         {
+            {"session_id", "string", "Browser session id", false},
+            {"page_id",    "string", "Stable AiDA page id; omitted uses selected page", false},
             {"url",        "string", "Target URL", true},
-            {"wait_until", "string", "load/domcontentloaded/networkidle (default load)", false},
+            {"wait_until", "string", "load/domcontentloaded/networkidle (default domcontentloaded)", false},
             {"timeout_ms", "number", "Page-load timeout in ms (default 30000)", false},
         },
         tool_headless_navigate,
@@ -1157,9 +1257,11 @@ void register_camoufox_tools(mcp_standalone::server_t& srv)
     register_compat(srv, {
         "burp_headless_reload",
         "headless_browser",
-        "Reload the current page in the headless browser preserving any persistent init scripts.",
+        "Reload the selected or addressed page in the Camoufox browser preserving any persistent init scripts.",
         {
-            {"wait_until", "string", "load/domcontentloaded/networkidle (default load)", false},
+            {"session_id", "string", "Browser session id", false},
+            {"page_id",    "string", "Stable AiDA page id; omitted uses selected page", false},
+            {"wait_until", "string", "load/domcontentloaded/networkidle (default domcontentloaded)", false},
         },
         tool_headless_reload,
         false
@@ -1168,9 +1270,11 @@ void register_camoufox_tools(mcp_standalone::server_t& srv)
     register_compat(srv, {
         "burp_headless_evaluate",
         "headless_browser",
-        "Execute a JavaScript expression in the active page context. Must be a single expression. "
+        "Execute a JavaScript expression in the selected or addressed page context. Must be a single expression. "
         "Returns structured value with type info.",
         {
+            {"session_id",    "string",  "Browser session id", false},
+            {"page_id",       "string",  "Stable AiDA page id; omitted uses selected page", false},
             {"expression",    "string",  "JavaScript expression (single expression, no statements)", true},
             {"await_promise", "boolean", "Await promise return values (default true)", false},
         },
@@ -1181,8 +1285,10 @@ void register_camoufox_tools(mcp_standalone::server_t& srv)
     register_compat(srv, {
         "burp_headless_screenshot",
         "headless_browser",
-        "Capture a PNG screenshot of the current page and write to disk.",
+        "Capture a PNG screenshot of the selected or addressed page and write to disk.",
         {
+            {"session_id",  "string",  "Browser session id", false},
+            {"page_id",     "string",  "Stable AiDA page id; omitted uses selected page", false},
             {"output_path", "string",  "Absolute or relative file path for the PNG", true},
             {"full_page",   "boolean", "Capture full scrollable page (default true)", false},
         },
@@ -1194,7 +1300,8 @@ void register_camoufox_tools(mcp_standalone::server_t& srv)
         "burp_headless_snapshot",
         "headless_browser",
         "Get an accessibility-tree snapshot of the page (token-efficient text representation).",
-        {},
+        {{"session_id", "string", "Browser session id", false},
+         {"page_id", "string", "Stable AiDA page id; omitted uses selected page", false}},
         tool_headless_snapshot,
         true
     });
@@ -1204,6 +1311,8 @@ void register_camoufox_tools(mcp_standalone::server_t& srv)
         "headless_browser",
         "Click an element matching the CSS selector.",
         {
+            {"session_id", "string", "Browser session id", false},
+            {"page_id",    "string", "Stable AiDA page id; omitted uses selected page", false},
             {"selector", "string", "CSS selector", true},
         },
         tool_headless_click,
@@ -1215,6 +1324,8 @@ void register_camoufox_tools(mcp_standalone::server_t& srv)
         "headless_browser",
         "Type text into an input element matching the CSS selector.",
         {
+            {"session_id", "string", "Browser session id", false},
+            {"page_id",    "string", "Stable AiDA page id; omitted uses selected page", false},
             {"selector", "string", "CSS selector", true},
             {"text",     "string", "Text to type", true},
         },
@@ -1227,6 +1338,8 @@ void register_camoufox_tools(mcp_standalone::server_t& srv)
         "headless_browser",
         "Wait for a CSS selector to appear on the page.",
         {
+            {"session_id", "string", "Browser session id", false},
+            {"page_id",    "string", "Stable AiDA page id; omitted uses selected page", false},
             {"selector",   "string", "CSS selector to wait for", true},
             {"timeout_ms", "number", "Wait timeout in ms (default 5000)", false},
         },
@@ -1239,6 +1352,8 @@ void register_camoufox_tools(mcp_standalone::server_t& srv)
         "headless_browser",
         "Retrieve captured browser console logs (info/warn/error/log).",
         {
+            {"session_id", "string", "Browser session id", false},
+            {"page_id", "string", "Stable AiDA page id filter", false},
             {"max_records", "number", "Maximum log records to return (default 200)", false},
         },
         tool_headless_console_logs,
@@ -1250,6 +1365,8 @@ void register_camoufox_tools(mcp_standalone::server_t& srv)
         "headless_browser",
         "Retrieve captured network request summaries (id/url/method/status/type/ms/size).",
         {
+            {"session_id", "string", "Browser session id", false},
+            {"page_id", "string", "Stable AiDA page id filter", false},
             {"max_records", "number", "Maximum request records to return (default 200)", false},
         },
         tool_headless_network_requests,

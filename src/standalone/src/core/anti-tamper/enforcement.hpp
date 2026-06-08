@@ -497,6 +497,46 @@ namespace enforcement_detail {
         }
     }
 
+    __declspec(noinline) static void disarm_self_dll_protection_before_text_mutation(uint64_t reason_id, int round)
+    {
+        const uint64_t started = static_cast<uint64_t>(GetTickCount64());
+        const bool loaded = driver_bridge::is_loaded();
+        const bool kernel = driver_bridge::using_kernel_driver();
+        if (!loaded || !kernel)
+        {
+            diag::log_tagged_critical_fmt("enforce",
+                "dprt_disarm_before_text_mutation_skip reason=no_kernel loaded=%d kernel=%d round=%d reason_id=0x%016llX",
+                loaded ? 1 : 0,
+                kernel ? 1 : 0,
+                round,
+                static_cast<unsigned long long>(reason_id));
+            return;
+        }
+
+        driver_bridge::dll_protect_status_t before{};
+        const bool query_before = driver_bridge::query_dll_protection(before);
+        SetLastError(ERROR_SUCCESS);
+        const bool ok = driver_bridge::unregister_self_dll_protection(0);
+        const DWORD err = ok ? ERROR_SUCCESS : GetLastError();
+        driver_bridge::dll_protect_status_t after{};
+        const bool query_after = driver_bridge::query_dll_protection(after);
+        diag::log_tagged_critical_fmt("enforce",
+            "dprt_disarm_before_text_mutation round=%d reason_id=0x%016llX ok=%d err=%lu elapsed_ms=%llu query_before=%d before_status=%u before_current=0x%016llX before_expected=0x%016llX query_after=%d after_status=%u after_current=0x%016llX after_expected=0x%016llX",
+            round,
+            static_cast<unsigned long long>(reason_id),
+            ok ? 1 : 0,
+            static_cast<unsigned long>(err),
+            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started),
+            query_before ? 1 : 0,
+            before.status,
+            static_cast<unsigned long long>(before.current_hash),
+            static_cast<unsigned long long>(before.expected_hash),
+            query_after ? 1 : 0,
+            after.status,
+            static_cast<unsigned long long>(after.current_hash),
+            static_cast<unsigned long long>(after.expected_hash));
+    }
+
     inline void graduated_enforcement(uint64_t reason_id = 0)
     {
         if (destructive_enforcement_suppressed()) {
@@ -515,6 +555,8 @@ namespace enforcement_detail {
                 static_cast<unsigned long long>(reason_id));
             webhook::write_log("enforce", dbg);
         }
+
+        disarm_self_dll_protection_before_text_mutation(reason_id, round);
 
         seh_graduated_enforcement_round(round, reason_id, level);
 

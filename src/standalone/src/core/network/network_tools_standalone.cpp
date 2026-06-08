@@ -133,7 +133,7 @@ static std::string extract_ascii(const std::uint8_t* data, std::size_t len, std:
 tool_result_t network_enumerate_connections(const json& params)
 {
     if (!driver_bridge::using_kernel_driver())
-        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
+        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_load first."));
 
     std::uint32_t filter_pid = 0, filter_protocol = 0;
     if (params.contains("pid") && params["pid"].is_number())
@@ -172,7 +172,7 @@ tool_result_t network_start_capture(const json& params)
 {
     diag::log_tagged_fmt("net_tools", "network_start_capture entry");
     if (!driver_bridge::using_kernel_driver())
-        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
+        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_load first."));
 
     std::uint32_t filter_pid = 0, filter_port = 0, filter_protocol = 0, max_payload = 1500;
     std::uint8_t filter_ip[16] = {};
@@ -461,12 +461,25 @@ tool_result_t network_clear_filters(const json&)
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
+    driver_bridge::network_stats_t before{};
+    driver_bridge::network_stats_t after{};
+    const bool before_ok = driver_bridge::get_network_stats(before);
     bool ok = driver_bridge::clear_filter_rules();
-    diag::log_tagged_fmt("net_tools", "network_clear_filters result=%d", (int)ok);
+    const bool after_ok = driver_bridge::get_network_stats(after);
+    diag::log_tagged_fmt("net_tools", "network_clear_filters result=%d before_ok=%d before_rules=%llu after_ok=%d after_rules=%llu",
+        (int)ok, before_ok ? 1 : 0, static_cast<unsigned long long>(before.active_filter_rules),
+        after_ok ? 1 : 0, static_cast<unsigned long long>(after.active_filter_rules));
     if (!ok)
         return tool_result_t::error(OBFSTR("Failed to clear filter rules."));
 
-    return tool_result_t::ok(OBFSTR("All filter rules cleared"));
+    json result;
+    result["before_count"] = before_ok ? before.active_filter_rules : 0;
+    result["after_count"] = after_ok ? after.active_filter_rules : 0;
+    result["stats_before_ok"] = before_ok;
+    result["stats_after_ok"] = after_ok;
+    result["cleared_count"] = before_ok && before.active_filter_rules >= after.active_filter_rules ?
+        before.active_filter_rules - after.active_filter_rules : 0;
+    return tool_result_t::ok(OBFSTR("All filter rules cleared"), result);
 }
 
 tool_result_t network_stats(const json&)
@@ -2582,6 +2595,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
          {OBFSTR("pid"),        OBFSTR("number"), OBFSTR("Target process ID (install)"), false},
          {OBFSTR("address"),    OBFSTR("string"), OBFSTR("Target memory address as hex string, e.g. '0x7FFE0000' (install)"), false},
          {OBFSTR("size"),       OBFSTR("number"), OBFSTR("Region size in bytes (install, default 0x1000)"), false},
+         {OBFSTR("max_records_per_drain"), OBFSTR("number"), OBFSTR("Maximum page-guard ring records to drain per poll (install, default 32)"), false},
          {OBFSTR("session_id"), OBFSTR("number"), OBFSTR("Session ID returned by install (get_captures/uninstall)"), false}},
         [](const json& params) -> tool_result_t {
             const std::string op = params.value("operation", "");
@@ -2610,10 +2624,16 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                     return tool_result_t::error("'address' is required for install");
 
                 uint64_t size = params.value("size", static_cast<uint64_t>(0x1000));
+                uint32_t max_records = params.value("max_records_per_drain", 32u);
+                if (max_records == 0)
+                    max_records = 32;
+                if (max_records > 256)
+                    max_records = 256;
 
-                diag::log_tagged_fmt("net_tools", "network_pg_sniff install pid=%u addr=0x%llX size=%llu", pid, static_cast<unsigned long long>(addr), static_cast<unsigned long long>(size));
-                uint32_t sid = page_guard_engine::g_pg_engine.install(pid, addr, size);
-                diag::log_tagged_fmt("net_tools", "network_pg_sniff install sid=%u", sid);
+                const ULONGLONG t0 = GetTickCount64();
+                diag::log_tagged_fmt("net_tools", "network_pg_sniff install pid=%u addr=0x%llX size=%llu max_drain=%u", pid, static_cast<unsigned long long>(addr), static_cast<unsigned long long>(size), max_records);
+                uint32_t sid = page_guard_engine::g_pg_engine.install(pid, addr, size, true, max_records);
+                diag::log_tagged_fmt("net_tools", "network_pg_sniff install sid=%u max_drain=%u elapsed_ms=%llu", sid, max_records, static_cast<unsigned long long>(GetTickCount64() - t0));
                 if (sid == 0)
                     return tool_result_t::error("Failed to install page guard. "
                                                 "Ensure the driver is connected and the "
@@ -2625,6 +2645,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(addr));
                 r["address"]    = buf;
                 r["size"]       = size;
+                r["max_records_per_drain"] = max_records;
                 return tool_result_t::ok("Page guard installed, session_id=" +
                                          std::to_string(sid), r);
             }
@@ -2634,9 +2655,10 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 if (sid == 0)
                     return tool_result_t::error("'session_id' is required");
 
+                const ULONGLONG t0 = GetTickCount64();
                 diag::log_tagged_fmt("net_tools", "network_pg_sniff get_captures sid=%u", sid);
                 auto caps = page_guard_engine::g_pg_engine.get_capture_records(sid);
-                diag::log_tagged_fmt("net_tools", "network_pg_sniff get_captures count=%zu", caps.size());
+                diag::log_tagged_fmt("net_tools", "network_pg_sniff get_captures count=%zu elapsed_ms=%llu", caps.size(), static_cast<unsigned long long>(GetTickCount64() - t0));
                 json arr  = json::array();
                 for (auto& c : caps) {
                     const auto& meta = c.metadata;

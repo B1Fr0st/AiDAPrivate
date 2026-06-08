@@ -335,8 +335,92 @@ inline bool ai_tool_posture_full_test_observed_only(uint32_t high_risk_mask)
         category_mcp_command_server |
         category_local_llm |
         category_ai_coding_tool |
-        category_clipboard_monitor;
+        category_clipboard_monitor |
+        category_foreign_write_handle |
+        category_foreign_vm_operation |
+        category_foreign_create_thread |
+        category_targets_aida;
     return high_risk_mask != 0 && (high_risk_mask & ~observed_mask) == 0;
+}
+
+inline bool ai_tool_posture_post_full_test_tail_observed_only(uint32_t high_risk_mask)
+{
+    using namespace standalone_anti_ai;
+    constexpr uint32_t observed_mask =
+        category_mcp_pipe |
+        category_mcp_process |
+        category_mcp_port |
+        category_mcp_command_server |
+        category_local_llm |
+        category_ai_coding_tool |
+        category_clipboard_monitor |
+        category_foreign_write_handle |
+        category_foreign_vm_operation;
+    return high_risk_mask != 0 && (high_risk_mask & ~observed_mask) == 0;
+}
+
+inline bool ai_tool_posture_full_test_tail_active(uint64_t* expired_ms = nullptr, uint64_t* tail_remaining_ms = nullptr)
+{
+    constexpr uint64_t kTailMs = 30ULL * 60ULL * 1000ULL;
+    const uint64_t until = state::get().full_test_suppression_until_ms.load(std::memory_order_acquire);
+    const uint64_t now = state::monotonic_ms();
+    if (expired_ms)
+        *expired_ms = 0;
+    if (tail_remaining_ms)
+        *tail_remaining_ms = 0;
+    if (until == 0 || now < until)
+        return false;
+    const uint64_t expired = now - until;
+    if (expired > kTailMs)
+        return false;
+    if (expired_ms)
+        *expired_ms = expired;
+    if (tail_remaining_ms)
+        *tail_remaining_ms = kTailMs - expired;
+    return true;
+}
+
+inline void log_ai_tool_posture_handle_detail(
+    const char* log_tag,
+    const char* phase_name,
+    const standalone_anti_ai::combined::threat_report_t& report,
+    bool full_test_active,
+    bool post_full_test_suppressed,
+    uint64_t post_full_test_ms,
+    bool post_full_test_tail,
+    uint64_t post_full_test_expired_ms,
+    uint64_t post_full_test_tail_ms)
+{
+    if (!report.handle_to_us_detected && !report.trusted_system_handle_ignored)
+        return;
+    webhook::write_log_critical_fmt(log_tag,
+        "ai_tool_posture_handle_detail phase=%s handle_any=%d observed_handles=%u access=0x%08lX first_owner_pid=%lu first_handle=0x%016llX first_access=0x%08lX first_owner_hash=0x%016llX first_query_ok=%d first_owner_tool=%d first_owner_mcp=%d first_owner_ai=%d first_owner_memory=%d first_owner_re=%d first_owner_debugger=%d first_owner_dump=%d first_owner_targets_aida=%d trusted_system_ignored=%u trusted_system_access=0x%08lX trusted_system_hash=0x%016llX full_test_active=%d post_full_test_active=%d post_full_test_ms=%llu post_full_test_tail=%d post_full_test_expired_ms=%llu post_full_test_tail_ms=%llu",
+        phase_name,
+        report.handle_to_us_detected ? 1 : 0,
+        report.observed_handle_count,
+        static_cast<unsigned long>(report.handle_access_mask),
+        static_cast<unsigned long>(report.first_handle_owner_pid),
+        static_cast<unsigned long long>(report.first_handle_value),
+        static_cast<unsigned long>(report.first_handle_access_mask),
+        static_cast<unsigned long long>(report.first_handle_owner_hash),
+        report.first_handle_owner_query_ok ? 1 : 0,
+        report.first_handle_owner_tool ? 1 : 0,
+        report.first_handle_owner_mcp ? 1 : 0,
+        report.first_handle_owner_ai ? 1 : 0,
+        report.first_handle_owner_memory ? 1 : 0,
+        report.first_handle_owner_re ? 1 : 0,
+        report.first_handle_owner_debugger ? 1 : 0,
+        report.first_handle_owner_dump ? 1 : 0,
+        report.first_handle_owner_targets_aida ? 1 : 0,
+        report.trusted_system_handle_ignored_count,
+        static_cast<unsigned long>(report.trusted_system_handle_access_mask),
+        static_cast<unsigned long long>(report.trusted_system_handle_owner_hash),
+        full_test_active ? 1 : 0,
+        post_full_test_suppressed ? 1 : 0,
+        static_cast<unsigned long long>(post_full_test_ms),
+        post_full_test_tail ? 1 : 0,
+        static_cast<unsigned long long>(post_full_test_expired_ms),
+        static_cast<unsigned long long>(post_full_test_tail_ms));
 }
 
 inline bool enforce_ai_tool_posture(const char* phase, bool runtime)
@@ -353,15 +437,28 @@ inline bool enforce_ai_tool_posture(const char* phase, bool runtime)
             return true;
         s_last_runtime_scan_ms.store(now_ms, std::memory_order_relaxed);
     }
+    uint64_t pre_post_full_test_ms = 0;
+    uint64_t pre_post_full_test_expired_ms = 0;
+    uint64_t pre_post_full_test_tail_ms = 0;
+    const bool pre_full_test_active = rt.full_test_running.load(std::memory_order_acquire);
+    const bool pre_post_full_test_suppressed =
+        anti_tamper::state::full_test_suppression_active(&pre_post_full_test_ms);
+    const bool pre_post_full_test_tail =
+        ai_tool_posture_full_test_tail_active(&pre_post_full_test_expired_ms, &pre_post_full_test_tail_ms);
     uint64_t scan_tick = GetTickCount64();
     webhook::write_log_critical_fmt(log_tag,
-        "ai_tool_posture_scan_pre phase=%s pid=%lu tid=%lu tick=%llu runtime=%d full_test=%u",
+        "ai_tool_posture_scan_pre phase=%s pid=%lu tid=%lu tick=%llu runtime=%d full_test=%u post_full_test_active=%d post_full_test_ms=%llu post_full_test_tail=%d post_full_test_expired_ms=%llu post_full_test_tail_ms=%llu",
         phase_name,
         GetCurrentProcessId(),
         GetCurrentThreadId(),
         static_cast<unsigned long long>(scan_tick),
         runtime ? 1 : 0,
-        rt.full_test_running.load(std::memory_order_acquire) ? 1u : 0u);
+        pre_full_test_active ? 1u : 0u,
+        pre_post_full_test_suppressed ? 1 : 0,
+        static_cast<unsigned long long>(pre_post_full_test_ms),
+        pre_post_full_test_tail ? 1 : 0,
+        static_cast<unsigned long long>(pre_post_full_test_expired_ms),
+        static_cast<unsigned long long>(pre_post_full_test_tail_ms));
     auto report = standalone_anti_ai::full_scan();
     webhook::write_log_critical_fmt(log_tag,
         "ai_tool_posture_scan_post phase=%s category_mask=0x%08X high_risk_mask=0x%08X high_risk_count=%u evidence_count=%u evidence_hash=0x%016llX summary_hash=0x%016llX elapsed_ms=%llu summary=%s",
@@ -374,23 +471,72 @@ inline bool enforce_ai_tool_posture(const char* phase, bool runtime)
         static_cast<unsigned long long>(report.summary_hash),
         static_cast<unsigned long long>(GetTickCount64() - scan_tick),
         report.summary.c_str());
+    uint64_t full_test_suppression_remaining = 0;
+    uint64_t full_test_suppression_expired_ms = 0;
+    uint64_t full_test_tail_remaining_ms = 0;
+    const bool full_test_active = rt.full_test_running.load(std::memory_order_acquire);
+    const bool post_full_test_suppressed =
+        anti_tamper::state::full_test_suppression_active(&full_test_suppression_remaining);
+    const bool post_full_test_tail =
+        ai_tool_posture_full_test_tail_active(&full_test_suppression_expired_ms, &full_test_tail_remaining_ms);
+    log_ai_tool_posture_handle_detail(
+        log_tag,
+        phase_name,
+        report,
+        full_test_active,
+        post_full_test_suppressed,
+        full_test_suppression_remaining,
+        post_full_test_tail,
+        full_test_suppression_expired_ms,
+        full_test_tail_remaining_ms);
     if (!report.confirmed_high_risk())
         return true;
-    if (rt.full_test_running.load(std::memory_order_acquire) &&
+    if ((full_test_active || post_full_test_suppressed) &&
         ai_tool_posture_full_test_observed_only(report.high_risk_mask))
     {
         webhook::write_log_critical_fmt(log_tag,
-            "ai_tool_posture_full_test_observed phase=%s category_mask=0x%08X high_risk_mask=0x%08X high_risk_count=%u summary_hash=0x%016llX",
+            "ai_tool_posture_full_test_observed phase=%s category_mask=0x%08X high_risk_mask=0x%08X high_risk_count=%u summary_hash=0x%016llX full_test_active=%d post_full_test_ms=%llu handle_any=%d observed_handles=%u first_owner_pid=%lu first_access=0x%08lX first_owner_hash=0x%016llX first_owner_tool=%d first_owner_targets_aida=%d",
             phase_name,
             report.category_mask,
             report.high_risk_mask,
             report.high_risk_count,
-            static_cast<unsigned long long>(report.summary_hash));
+            static_cast<unsigned long long>(report.summary_hash),
+            full_test_active ? 1 : 0,
+            static_cast<unsigned long long>(full_test_suppression_remaining),
+            report.handle_to_us_detected ? 1 : 0,
+            report.observed_handle_count,
+            static_cast<unsigned long>(report.first_handle_owner_pid),
+            static_cast<unsigned long>(report.first_handle_access_mask),
+            static_cast<unsigned long long>(report.first_handle_owner_hash),
+            report.first_handle_owner_tool ? 1 : 0,
+            report.first_handle_owner_targets_aida ? 1 : 0);
         return true;
     }
-    char detail[640];
+    if (post_full_test_tail &&
+        ai_tool_posture_post_full_test_tail_observed_only(report.high_risk_mask))
+    {
+        webhook::write_log_critical_fmt(log_tag,
+            "ai_tool_posture_post_full_test_tail_observed phase=%s category_mask=0x%08X high_risk_mask=0x%08X high_risk_count=%u summary_hash=0x%016llX post_full_test_expired_ms=%llu post_full_test_tail_ms=%llu handle_any=%d observed_handles=%u first_owner_pid=%lu first_access=0x%08lX first_owner_hash=0x%016llX first_owner_tool=%d first_owner_targets_aida=%d trusted_system_ignored=%u",
+            phase_name,
+            report.category_mask,
+            report.high_risk_mask,
+            report.high_risk_count,
+            static_cast<unsigned long long>(report.summary_hash),
+            static_cast<unsigned long long>(full_test_suppression_expired_ms),
+            static_cast<unsigned long long>(full_test_tail_remaining_ms),
+            report.handle_to_us_detected ? 1 : 0,
+            report.observed_handle_count,
+            static_cast<unsigned long>(report.first_handle_owner_pid),
+            static_cast<unsigned long>(report.first_handle_access_mask),
+            static_cast<unsigned long long>(report.first_handle_owner_hash),
+            report.first_handle_owner_tool ? 1 : 0,
+            report.first_handle_owner_targets_aida ? 1 : 0,
+            report.trusted_system_handle_ignored_count);
+        return true;
+    }
+    char detail[1024];
     _snprintf_s(detail, sizeof(detail), _TRUNCATE,
-        "phase=%s category_mask=0x%08X high_risk_mask=0x%08X high_risk_count=%u evidence_count=%u evidence_hash=0x%016llX summary_hash=0x%016llX summary=%s",
+        "phase=%s category_mask=0x%08X high_risk_mask=0x%08X high_risk_count=%u evidence_count=%u evidence_hash=0x%016llX summary_hash=0x%016llX full_test_active=%d post_full_test_active=%d post_full_test_ms=%llu post_full_test_tail=%d post_full_test_expired_ms=%llu handle_any=%d observed_handles=%u first_owner_pid=%lu first_access=0x%08lX first_owner_hash=0x%016llX first_owner_tool=%d first_owner_targets_aida=%d summary=%s",
         phase_name,
         report.category_mask,
         report.high_risk_mask,
@@ -398,8 +544,24 @@ inline bool enforce_ai_tool_posture(const char* phase, bool runtime)
         report.evidence_count,
         static_cast<unsigned long long>(report.evidence_hash),
         static_cast<unsigned long long>(report.summary_hash),
+        full_test_active ? 1 : 0,
+        post_full_test_suppressed ? 1 : 0,
+        static_cast<unsigned long long>(full_test_suppression_remaining),
+        post_full_test_tail ? 1 : 0,
+        static_cast<unsigned long long>(full_test_suppression_expired_ms),
+        report.handle_to_us_detected ? 1 : 0,
+        report.observed_handle_count,
+        static_cast<unsigned long>(report.first_handle_owner_pid),
+        static_cast<unsigned long>(report.first_handle_access_mask),
+        static_cast<unsigned long long>(report.first_handle_owner_hash),
+        report.first_handle_owner_tool ? 1 : 0,
+        report.first_handle_owner_targets_aida ? 1 : 0,
         report.summary.c_str());
     const char* reason = ai_tool_posture_reason(report);
+    webhook::write_log_critical_fmt(log_tag,
+        "ai_tool_posture_enforcing reason=%s %s",
+        reason,
+        detail);
     webhook::send_debug_log(log_tag, detail, true);
     enforce_violation_id(aida::reason_ids::reason_id_from_string(reason), detail);
     return false;
@@ -415,6 +577,23 @@ inline bool ensure_driver_hardening(const char* phase)
             "driver_hardening_already_done phase=%s",
             phase_name);
         return true;
+    }
+    if (rt.violation_latched.load(std::memory_order_acquire))
+    {
+        std::string reason;
+        {
+            std::lock_guard<std::mutex> lk(rt.mtx);
+            reason = rt.violation_reason;
+        }
+        webhook::write_log_critical_fmt("init",
+            "driver_hardening_blocked_violation_latched phase=%s reason=%.96s pid=%lu tid=%lu initialized=%d driver_hardening=%d",
+            phase_name,
+            reason.empty() ? "unknown" : reason.c_str(),
+            GetCurrentProcessId(),
+            GetCurrentThreadId(),
+            rt.initialized.load(std::memory_order_acquire) ? 1 : 0,
+            rt.driver_hardening_done.load(std::memory_order_acquire) ? 1 : 0);
+        return false;
     }
     if (!driver_bridge::is_loaded() || !driver_bridge::using_kernel_driver())
     {
@@ -448,6 +627,35 @@ inline bool ensure_driver_hardening(const char* phase)
         enforce_violation_id(aida::reason_ids::reason_id_from_string("driver_hardening_dynamic_ioctl_not_ready_after_auth"), "driver_hardening_dynamic_ioctl_not_ready_after_auth");
         return false;
     }
+
+    struct driver_hardening_scope_t
+    {
+        state::runtime_t& rt;
+        const char* phase;
+        uint64_t started;
+
+        ~driver_hardening_scope_t()
+        {
+            const uint64_t elapsed = state::monotonic_ms() >= started ? state::monotonic_ms() - started : 0;
+            rt.driver_hardening_active.store(false, std::memory_order_release);
+            webhook::write_log_critical_fmt("init",
+                "driver_hardening_active_end phase=%s elapsed_ms=%llu violation_latched=%d",
+                phase ? phase : "unknown",
+                static_cast<unsigned long long>(elapsed),
+                rt.violation_latched.load(std::memory_order_acquire) ? 1 : 0);
+        }
+    };
+    const uint64_t hardening_started = state::monotonic_ms();
+    rt.driver_hardening_started_ms.store(hardening_started, std::memory_order_release);
+    rt.driver_hardening_active.store(true, std::memory_order_release);
+    webhook::write_log_critical_fmt("init",
+        "driver_hardening_active_begin phase=%s pid=%lu tid=%lu tick=%llu",
+        phase_name,
+        GetCurrentProcessId(),
+        GetCurrentThreadId(),
+        static_cast<unsigned long long>(hardening_started));
+    driver_hardening_scope_t hardening_scope{rt, phase_name, hardening_started};
+
     if (rt.code_snap.module_base == 0 || rt.code_snap.text_base == 0 ||
         rt.code_snap.text_size == 0 || rt.code_snap.text_hash == 0)
     {
@@ -542,6 +750,16 @@ inline bool ensure_driver_hardening(const char* phase)
         }
     }
 
+    if (rt.violation_latched.load(std::memory_order_acquire))
+    {
+        webhook::write_log_critical_fmt("init",
+            "driver_hardening_skip_dprt_register_violation_latched phase=%s stage=pre_hash pid=%lu tid=%lu",
+            phase_name,
+            GetCurrentProcessId(),
+            GetCurrentThreadId());
+        return false;
+    }
+
     bool driver_hash_ok = false;
     uint64_t driver_expected_hash = driver_crc_text_hash_seh(
         reinterpret_cast<const void*>(rt.code_snap.text_base),
@@ -559,6 +777,18 @@ inline bool ensure_driver_hardening(const char* phase)
     {
         webhook::send_debug_log("init", "driver_hardening_driver_hash_failed", true);
         enforce_violation_id(aida::reason_ids::reason_id_from_string("driver_hardening_driver_hash_failed"), "driver_hardening_driver_hash_failed");
+        return false;
+    }
+
+    if (rt.violation_latched.load(std::memory_order_acquire))
+    {
+        webhook::write_log_critical_fmt("init",
+            "driver_hardening_skip_dprt_register_violation_latched phase=%s stage=pre_register pid=%lu tid=%lu hash=0x%016llX app_hash=0x%016llX",
+            phase_name,
+            GetCurrentProcessId(),
+            GetCurrentThreadId(),
+            static_cast<unsigned long long>(driver_expected_hash),
+            static_cast<unsigned long long>(rt.code_snap.text_hash));
         return false;
     }
 
@@ -2662,6 +2892,17 @@ inline bool guard()
     }
     CFF_STATE(guard_cff, 6)
     {
+        if (rt.driver_hardening_active.load(std::memory_order_acquire))
+        {
+            const uint64_t started = rt.driver_hardening_started_ms.load(std::memory_order_acquire);
+            const uint64_t now = state::monotonic_ms();
+            const uint64_t active_ms = started != 0 && now >= started ? now - started : 0;
+            webhook::write_log_critical_fmt("guard",
+                "block_chain_skip_driver_hardening_active active_ms=%llu verify_counter=%u",
+                static_cast<unsigned long long>(active_ms),
+                rt.verify_counter);
+            CFF_GOTO(guard_cff, 7);
+        }
         integrity::block_chain_verify_result_t bc_detail{};
         bool bc_ok = false;
         {
@@ -2683,44 +2924,55 @@ inline bool guard()
                 bc_detail.layout_mismatch ? 1u : 0u,
                 rt.full_test_running.load(std::memory_order_acquire) ? 1u : 0u);
             webhook::write_log_critical_fmt("guard", "%s", detail);
-            if (rt.full_test_running.load(std::memory_order_acquire))
+            Sleep(50);
+            integrity::block_chain_verify_result_t retry_detail{};
+            bool retry_ok = false;
             {
-                Sleep(50);
-                integrity::block_chain_verify_result_t retry_detail{};
-                bool retry_ok = false;
-                {
-                    std::lock_guard<std::mutex> lk(rt.mtx);
-                    retry_ok = integrity::verify_block_chain(rt.code_snap, rt.block_chain, &retry_detail);
-                }
-                if (retry_ok)
-                {
-                    webhook::write_log_critical_fmt("guard", "block_chain_retry_recovered idx=%u", bc_detail.block_index);
-                    CFF_GOTO(guard_cff, 7);
-                }
-                uint32_t eager_page = 0;
-                const bool self_ok = integrity::verify_self_hash();
-                const bool eager_ok = integrity::verify_full_text_eager(&eager_page);
-                bool rebuild_ok = false;
-                if (self_ok && eager_ok)
-                {
-                    std::lock_guard<std::mutex> lk(rt.mtx);
-                    rebuild_ok = integrity::build_block_chain(rt.code_snap, rt.block_chain);
-                }
-                if (rebuild_ok)
-                {
-                    webhook::write_log_critical_fmt("guard",
-                        "block_chain_full_test_resnap idx=%u page=%u",
-                        bc_detail.block_index,
-                        eager_page);
-                    CFF_GOTO(guard_cff, 7);
-                }
-                webhook::write_log_critical_fmt("guard",
-                    "block_chain_full_test_confirmed self=%u eager=%u page=%u retry_idx=%u",
-                    self_ok ? 1u : 0u,
-                    eager_ok ? 1u : 0u,
-                    eager_page,
-                    retry_detail.block_index);
+                std::lock_guard<std::mutex> lk(rt.mtx);
+                retry_ok = integrity::verify_block_chain(rt.code_snap, rt.block_chain, &retry_detail);
             }
+            if (retry_ok)
+            {
+                webhook::write_log_critical_fmt("guard", "block_chain_retry_recovered idx=%u", bc_detail.block_index);
+                CFF_GOTO(guard_cff, 7);
+            }
+            if (rt.driver_hardening_active.load(std::memory_order_acquire))
+            {
+                const uint64_t started = rt.driver_hardening_started_ms.load(std::memory_order_acquire);
+                const uint64_t now = state::monotonic_ms();
+                const uint64_t active_ms = started != 0 && now >= started ? now - started : 0;
+                webhook::write_log_critical_fmt("guard",
+                    "block_chain_retry_deferred_driver_hardening_active idx=%u retry_idx=%u active_ms=%llu",
+                    bc_detail.block_index,
+                    retry_detail.block_index,
+                    static_cast<unsigned long long>(active_ms));
+                CFF_GOTO(guard_cff, 7);
+            }
+            uint32_t eager_page = 0;
+            const bool self_ok = integrity::verify_self_hash();
+            const bool eager_ok = integrity::verify_full_text_eager(&eager_page);
+            bool rebuild_ok = false;
+            if (self_ok && eager_ok)
+            {
+                std::lock_guard<std::mutex> lk(rt.mtx);
+                rebuild_ok = integrity::build_block_chain(rt.code_snap, rt.block_chain);
+            }
+            if (rebuild_ok)
+            {
+                webhook::write_log_critical_fmt("guard",
+                    "block_chain_resnap_recovered idx=%u page=%u full_test=%u",
+                    bc_detail.block_index,
+                    eager_page,
+                    rt.full_test_running.load(std::memory_order_acquire) ? 1u : 0u);
+                CFF_GOTO(guard_cff, 7);
+            }
+            webhook::write_log_critical_fmt("guard",
+                "block_chain_confirmed self=%u eager=%u page=%u retry_idx=%u full_test=%u",
+                self_ok ? 1u : 0u,
+                eager_ok ? 1u : 0u,
+                eager_page,
+                retry_detail.block_index,
+                rt.full_test_running.load(std::memory_order_acquire) ? 1u : 0u);
             webhook::send_debug_log("guard", detail, true);
             enforce_violation_id(aida::reason_ids::reason_id_block_chain_runtime, detail);
             CFF_EXIT(guard_cff);

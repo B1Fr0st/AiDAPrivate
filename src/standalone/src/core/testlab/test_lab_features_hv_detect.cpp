@@ -50,7 +50,7 @@ namespace {
 			ioctl_codes::HVDT(), &buf,
 			static_cast<std::uint32_t>(sizeof(buf)), bytes_returned);
 		test_lab_format::testlab_diag_log_step("hv-detect", "HVDT", "request_post",
-			"ok=%d bytes_returned=%u total_run=%u total_failed=%u is_vm=%u ms_hv_root=%u vendor=\"%.16s\"",
+			"ok=%d bytes_returned=%u total_run=%u total_positive=%u is_vm=%u ms_hv_root=%u vendor=\"%.16s\"",
 			ok ? 1 : 0,
 			bytes_returned,
 			static_cast<unsigned>(buf.result.total_run),
@@ -94,8 +94,21 @@ namespace {
 		r.parsed.push_back({ "is_virtual_machine", d.is_virtual_machine ? "true" : "false" });
 		r.parsed.push_back({ "ms_hv_root", d.ms_hv_root ? "true" : "false" });
 		r.parsed.push_back({ "vm_vendor_name", make_vendor_string(d.vm_vendor_name) });
+		const unsigned vm_hits =
+			static_cast<unsigned>(d.vmf_cpuid_vendor) +
+			static_cast<unsigned>(d.vmf_hyperv_guest) +
+			static_cast<unsigned>(d.vmf_smbios_vm) +
+			static_cast<unsigned>(d.vmf_acpi_vm) +
+			static_cast<unsigned>(d.vmf_pci_vm) +
+			static_cast<unsigned>(d.vmf_disk_vm) +
+			static_cast<unsigned>(d.vmf_mac_vm) +
+			static_cast<unsigned>(d.vmf_registry_vm);
+		const unsigned total_positive = static_cast<unsigned>(d.total_failed);
+		const unsigned hv_probe_positive = total_positive >= vm_hits ? total_positive - vm_hits : 0;
 		r.parsed.push_back({ "total_run", std::to_string(static_cast<unsigned>(d.total_run)) });
-		r.parsed.push_back({ "total_failed", std::to_string(static_cast<unsigned>(d.total_failed)) });
+		r.parsed.push_back({ "total_positive", std::to_string(total_positive) });
+		r.parsed.push_back({ "vm_fingerprint_hits", std::to_string(vm_hits) });
+		r.parsed.push_back({ "hv_probe_positive", std::to_string(hv_probe_positive) });
 
 		r.parsed.push_back({ "sidt.lock_prefix", std::to_string(static_cast<unsigned>(d.sidt_lock_prefix)) });
 		r.parsed.push_back({ "sidt.invalid_pf", std::to_string(static_cast<unsigned>(d.sidt_invalid_pf)) });
