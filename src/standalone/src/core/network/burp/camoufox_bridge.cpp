@@ -9,7 +9,6 @@
 #include "camoufox_install.hpp"
 
 #include "../../infra/event_bus.hpp"
-#include "../../infra/win_thread.hpp"
 #include "../../infra/work_queue.hpp"
 #include "../../mcp/mcp_client.hpp"
 #include "../../../helpers/diag_log.hpp"
@@ -27,11 +26,13 @@
 #include <cwctype>
 #include <cstring>
 #include <exception>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace aida {
@@ -138,6 +139,31 @@ uint64_t now_ms()
     return static_cast<uint64_t>(GetTickCount64());
 }
 
+bool post_bridge_task(const char* name, std::function<void()> task)
+{
+    const uint64_t t0 = now_ms();
+    bool posted = false;
+    try
+    {
+        posted = work_queue::post(std::move(task));
+    }
+    catch (...)
+    {
+        posted = false;
+    }
+    const auto st = work_queue::stats();
+    diag::log_tagged_fmt("camoufox", "work_queue_post name=%s posted=%d alive=%d shutting_down=%d workers=%zu pending=%zu active=%lu elapsed_ms=%llu",
+        name ? name : "<null>",
+        posted ? 1 : 0,
+        st.alive ? 1 : 0,
+        st.shutting_down ? 1 : 0,
+        st.workers,
+        st.pending,
+        static_cast<unsigned long>(st.active),
+        static_cast<unsigned long long>(now_ms() - t0));
+    return posted;
+}
+
 uint64_t next_request_id()
 {
     return sg().next_request_id.fetch_add(1, std::memory_order_relaxed);
@@ -175,6 +201,44 @@ bool prewarm_default_disabled()
            _stricmp(value, "no") == 0 ||
            _stricmp(value, "off") == 0 ||
            _stricmp(value, "disabled") == 0;
+}
+
+bool env_flag_enabled_a(const char* name)
+{
+    if (!name || !name[0]) return false;
+    char value[32] = {};
+    DWORD n = GetEnvironmentVariableA(name, value, static_cast<DWORD>(sizeof(value)));
+    if (n == 0 || n >= static_cast<DWORD>(sizeof(value))) return false;
+    value[sizeof(value) - 1] = '\0';
+    return _stricmp(value, "1") == 0 ||
+           _stricmp(value, "true") == 0 ||
+           _stricmp(value, "yes") == 0 ||
+           _stricmp(value, "on") == 0;
+}
+
+bool read_env_path_a(const char* name, std::string& out)
+{
+    out.clear();
+    if (!name || !name[0]) return false;
+    DWORD need = GetEnvironmentVariableA(name, nullptr, 0);
+    if (need == 0 || need > 32768) return false;
+    std::string value;
+    value.resize(need);
+    DWORD got = GetEnvironmentVariableA(name, value.data(), need);
+    if (got == 0 || got >= need) return false;
+    value.resize(got);
+    while (!value.empty() && (value.front() == ' ' || value.front() == '\t' || value.front() == '"'))
+        value.erase(value.begin());
+    while (!value.empty() && (value.back() == ' ' || value.back() == '\t' || value.back() == '"'))
+        value.pop_back();
+    if (value.empty()) return false;
+    out = value;
+    return true;
+}
+
+bool system_python_discovery_allowed()
+{
+    return env_flag_enabled_a("AIDA_CAMOUFOX_ALLOW_SYSTEM_PYTHON");
 }
 
 void enforce_private_launch_config(launch_config_t& cfg)
@@ -293,6 +357,33 @@ std::vector<std::wstring> runtime_base_dirs()
     append_unique_path(bases, exe_dir);
     append_unique_path(bases, current_dir_w());
     append_unique_path(bases, parent_dir_w(exe_dir));
+    wchar_t local[MAX_PATH] = {};
+    DWORD got = GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
+    if (got != 0 && got < MAX_PATH)
+    {
+        append_unique_path(bases, join_path_w(join_path_w(join_path_w(local, L"AiDA"), L"camoufox"), L"current"));
+        append_unique_path(bases, join_path_w(join_path_w(join_path_w(join_path_w(local, L"AiDA"), L"embedded"), L"camoufox"), L"current"));
+    }
+    return bases;
+}
+
+std::vector<std::wstring> aida_runtime_base_dirs()
+{
+    std::vector<std::wstring> bases;
+    std::wstring exe_dir = executable_dir_w();
+    append_unique_path(bases, exe_dir);
+    append_unique_path(bases, current_dir_w());
+    append_unique_path(bases, parent_dir_w(exe_dir));
+    wchar_t local[MAX_PATH] = {};
+    DWORD got = GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
+    if (got != 0 && got < MAX_PATH)
+    {
+        std::wstring aida_root = join_path_w(local, L"AiDA");
+        append_unique_path(bases, aida_root);
+        append_unique_path(bases, join_path_w(aida_root, L"current"));
+        append_unique_path(bases, join_path_w(aida_root, L"runtime"));
+        append_unique_path(bases, join_path_w(aida_root, L"embedded"));
+    }
     return bases;
 }
 
@@ -323,6 +414,60 @@ bool find_bundled_camoufox_executable(std::string& out_path)
     return false;
 }
 
+bool find_bundled_reverse_mcp_executable(std::string& out_path)
+{
+    const std::vector<std::wstring> rels = {
+        L"deps\\AiDA_CamoufoxReverseMcp.exe",
+        L"deps\\camoufox-reverse-mcp.exe",
+        L"deps\\camoufox_reverse_mcp.exe",
+        L"deps\\camoufox-reverse-mcp\\AiDA_CamoufoxReverseMcp.exe",
+        L"deps\\camoufox-reverse-mcp\\camoufox-reverse-mcp.exe",
+        L"AiDA_CamoufoxReverseMcp.exe",
+        L"camoufox-reverse-mcp.exe",
+        L"camoufox_reverse_mcp.exe",
+    };
+    const auto bases = aida_runtime_base_dirs();
+    for (const auto& base : bases)
+    {
+        for (const auto& rel : rels)
+        {
+            const std::wstring candidate = join_path_w(base, rel);
+            if (path_exists_w(candidate))
+            {
+                out_path = wide_to_utf8(candidate);
+                diag::log_tagged_fmt("camoufox", "bundled_reverse_mcp_executable selected path=%s base=%s rel=%s",
+                    out_path.c_str(), wide_to_utf8(base).c_str(), wide_to_utf8(rel).c_str());
+                return !out_path.empty();
+            }
+        }
+    }
+    diag::log_tagged_fmt("camoufox", "bundled_reverse_mcp_executable missing base_count=%zu rel_count=%zu",
+        bases.size(), rels.size());
+    return false;
+}
+
+bool resolve_reverse_mcp_executable(const launch_config_t& cfg, std::string& out_path)
+{
+    out_path.clear();
+    if (!cfg.server_executable.empty())
+        out_path = cfg.server_executable;
+    if (out_path.empty())
+        read_env_path_a("AIDA_CAMOUFOX_MCP_EXECUTABLE", out_path);
+    if (out_path.empty())
+        find_bundled_reverse_mcp_executable(out_path);
+    if (out_path.empty())
+        return false;
+    DWORD attr = GetFileAttributesW(utf8_to_wide(out_path).c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY) != 0)
+    {
+        diag::log_tagged_fmt("camoufox", "reverse_mcp_executable rejected path=%s attr=0x%08lX",
+            out_path.c_str(), static_cast<unsigned long>(attr));
+        out_path.clear();
+        return false;
+    }
+    return true;
+}
+
 std::wstring local_appdata_aida_root()
 {
     wchar_t root[MAX_PATH] = {};
@@ -334,18 +479,6 @@ std::wstring local_appdata_aida_root()
 void append_bundled_python_candidates(std::vector<std::string>& candidates)
 {
     std::vector<std::wstring> rels = {
-        L"camoufox-runtime\\python.exe",
-        L"camoufox-runtime\\Python312\\python.exe",
-        L"camoufox-runtime\\Python312-3.12.10-x64\\python.exe",
-        L"camoufox-python\\python.exe",
-        L"python-3.12.10-x64\\python.exe",
-        L"python\\python.exe",
-        L"python-3.12\\python.exe",
-        L"Python312\\python.exe",
-        L"Python312-3.12.10-x64\\python.exe",
-        L"runtime\\python\\python.exe",
-        L"runtime\\python\\Python312-3.12.10-x64\\python.exe",
-        L"runtimes\\python\\Python312-3.12.10-x64\\python.exe",
         L"deps\\camoufox-runtime\\python.exe",
         L"deps\\camoufox-runtime\\Python312\\python.exe",
         L"deps\\camoufox-runtime\\Python312-3.12.10-x64\\python.exe",
@@ -357,7 +490,19 @@ void append_bundled_python_candidates(std::vector<std::string>& candidates)
         L"deps\\Python312-3.12.10-x64\\python.exe",
         L"deps\\runtime\\python\\python.exe",
         L"deps\\runtime\\python\\Python312-3.12.10-x64\\python.exe",
-        L"deps\\runtimes\\python\\Python312-3.12.10-x64\\python.exe"
+        L"deps\\runtimes\\python\\Python312-3.12.10-x64\\python.exe",
+        L"camoufox-runtime\\python.exe",
+        L"camoufox-runtime\\Python312\\python.exe",
+        L"camoufox-runtime\\Python312-3.12.10-x64\\python.exe",
+        L"camoufox-python\\python.exe",
+        L"python-3.12.10-x64\\python.exe",
+        L"python\\python.exe",
+        L"python-3.12\\python.exe",
+        L"Python312\\python.exe",
+        L"Python312-3.12.10-x64\\python.exe",
+        L"runtime\\python\\python.exe",
+        L"runtime\\python\\Python312-3.12.10-x64\\python.exe",
+        L"runtimes\\python\\Python312-3.12.10-x64\\python.exe"
     };
     const auto bases = runtime_base_dirs();
     size_t found_count = 0;
@@ -476,12 +621,177 @@ bool is_windows_store_python_alias(const std::string& path)
     return lower.find(needle) != std::wstring::npos;
 }
 
+std::wstring normalized_lower_path(std::wstring value)
+{
+    for (wchar_t& c : value)
+    {
+        if (c == L'/') c = L'\\';
+        c = static_cast<wchar_t>(std::towlower(c));
+    }
+    while (!value.empty() && (value.back() == L'\\' || value.back() == L'/'))
+        value.pop_back();
+    return value;
+}
+
+bool path_under_root_w(const std::wstring& path, const std::wstring& root)
+{
+    std::wstring p = normalized_lower_path(path);
+    std::wstring r = normalized_lower_path(root);
+    if (p.empty() || r.empty() || p.size() <= r.size())
+        return false;
+    return p.compare(0, r.size(), r) == 0 && p[r.size()] == L'\\';
+}
+
+std::wstring camoufox_profile_root_w()
+{
+    std::wstring root = local_appdata_aida_root();
+    if (root.empty()) root = executable_dir_w();
+    if (root.empty()) root = current_dir_w();
+    if (root.empty()) return {};
+    return join_path_w(root, L"camoufox-profiles");
+}
+
+bool remove_directory_tree_w(const std::wstring& dir, uint32_t& files_removed, uint32_t& dirs_removed)
+{
+    DWORD attr = GetFileAttributesW(dir.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES)
+        return GetLastError() == ERROR_FILE_NOT_FOUND || GetLastError() == ERROR_PATH_NOT_FOUND;
+    if ((attr & FILE_ATTRIBUTE_DIRECTORY) == 0)
+        return DeleteFileW(dir.c_str()) != FALSE;
+    std::wstring pattern = join_path_w(dir, L"*");
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE)
+    {
+        do
+        {
+            const std::wstring name = fd.cFileName;
+            if (name == L"." || name == L"..")
+                continue;
+            const std::wstring child = join_path_w(dir, name);
+            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+            {
+                if (!remove_directory_tree_w(child, files_removed, dirs_removed))
+                {
+                    FindClose(h);
+                    return false;
+                }
+            }
+            else
+            {
+                SetFileAttributesW(child.c_str(), fd.dwFileAttributes & ~FILE_ATTRIBUTE_READONLY);
+                if (!DeleteFileW(child.c_str()))
+                {
+                    FindClose(h);
+                    return false;
+                }
+                ++files_removed;
+            }
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    SetFileAttributesW(dir.c_str(), attr & ~FILE_ATTRIBUTE_READONLY);
+    if (!RemoveDirectoryW(dir.c_str()))
+        return GetLastError() == ERROR_FILE_NOT_FOUND || GetLastError() == ERROR_PATH_NOT_FOUND;
+    ++dirs_removed;
+    return true;
+}
+
+void purge_generated_profile_dir(const std::string& profile_dir, const std::string& reason)
+{
+    if (profile_dir.empty())
+        return;
+    const std::wstring profile_w = utf8_to_wide(profile_dir);
+    const std::wstring root_w = camoufox_profile_root_w();
+    if (profile_w.empty() || root_w.empty() || !path_under_root_w(profile_w, root_w))
+    {
+        diag::log_tagged_fmt("camoufox", "profile_cleanup refused reason=%s profile_dir=%s root=%s",
+            reason.c_str(), profile_dir.c_str(), wide_to_utf8(root_w).c_str());
+        return;
+    }
+    uint32_t files_removed = 0;
+    uint32_t dirs_removed = 0;
+    const uint64_t t0 = now_ms();
+    const bool ok = remove_directory_tree_w(profile_w, files_removed, dirs_removed);
+    const DWORD gle = ok ? 0 : GetLastError();
+    diag::log_tagged_fmt("camoufox", "profile_cleanup result=%d gle=%lu reason=%s profile_dir=%s files=%lu dirs=%lu elapsed_ms=%llu",
+        ok ? 1 : 0,
+        static_cast<unsigned long>(gle),
+        reason.c_str(),
+        profile_dir.c_str(),
+        static_cast<unsigned long>(files_removed),
+        static_cast<unsigned long>(dirs_removed),
+        static_cast<unsigned long long>(now_ms() - t0));
+}
+
+bool is_app_controlled_python_path(const std::string& path)
+{
+    std::wstring w = utf8_to_wide(path);
+    if (w.empty()) return false;
+    for (const auto& base : runtime_base_dirs())
+    {
+        if (path_under_root_w(w, base))
+            return true;
+    }
+    std::wstring app_root = local_appdata_aida_root();
+    if (!app_root.empty() && path_under_root_w(w, app_root))
+        return true;
+    return false;
+}
+
+std::wstring parent_directory_w(std::wstring path)
+{
+    for (wchar_t& c : path)
+    {
+        if (c == L'/') c = L'\\';
+    }
+    while (!path.empty() && (path.back() == L'\\' || path.back() == L'/'))
+        path.pop_back();
+    const size_t slash = path.find_last_of(L"\\/");
+    if (slash == std::wstring::npos)
+        return {};
+    return path.substr(0, slash);
+}
+
+std::wstring quote_arg_w(const std::wstring& value)
+{
+    std::wstring out;
+    out.reserve(value.size() + 2);
+    out.push_back(L'"');
+    for (wchar_t ch : value)
+    {
+        if (ch == L'"')
+            out.push_back(L'\\');
+        out.push_back(ch);
+    }
+    out.push_back(L'"');
+    return out;
+}
+
 std::string compact_child_output_tail(std::string s, size_t limit);
 
-bool spawn_capture(const std::string& cmdline, DWORD timeout_ms, DWORD& out_exit_code, std::string& out_stdout)
+bool spawn_capture_impl(const std::wstring& application_path, std::wstring cmdline, const std::wstring& working_directory, const char* label, DWORD timeout_ms, DWORD& out_exit_code, std::string& out_stdout)
 {
     out_exit_code = 0;
     out_stdout.clear();
+    const char* spawn_label = (label && label[0]) ? label : "process";
+    const std::string app_log = application_path.empty() ? std::string("<cmdline>") : wide_to_utf8(application_path);
+    const std::string cwd_log = working_directory.empty() ? std::string("<inherit>") : wide_to_utf8(working_directory);
+    const uint64_t t0 = now_ms();
+    DWORD app_attr = INVALID_FILE_ATTRIBUTES;
+    DWORD cwd_attr = INVALID_FILE_ATTRIBUTES;
+    if (!application_path.empty())
+        app_attr = GetFileAttributesW(application_path.c_str());
+    if (!working_directory.empty())
+        cwd_attr = GetFileAttributesW(working_directory.c_str());
+    diag::log_tagged_fmt("camoufox", "spawn_capture entry label=%s app=%s cwd=%s app_exists=%d cwd_exists=%d cmd_len=%zu timeout_ms=%lu",
+        spawn_label,
+        app_log.c_str(),
+        cwd_log.c_str(),
+        static_cast<int>(application_path.empty() || (app_attr != INVALID_FILE_ATTRIBUTES && (app_attr & FILE_ATTRIBUTE_DIRECTORY) == 0)),
+        static_cast<int>(working_directory.empty() || (cwd_attr != INVALID_FILE_ATTRIBUTES && (cwd_attr & FILE_ATTRIBUTE_DIRECTORY) != 0)),
+        cmdline.size(),
+        static_cast<unsigned long>(timeout_ms));
 
     SECURITY_ATTRIBUTES sa{};
     sa.nLength        = sizeof(sa);
@@ -492,35 +802,166 @@ bool spawn_capture(const std::string& cmdline, DWORD timeout_ms, DWORD& out_exit
     {
         const DWORD gle = GetLastError();
         out_stdout = "spawn pipe create failed gle=" + std::to_string(gle);
-        diag::log_tagged_fmt("camoufox", "spawn_capture pipe_create_failed gle=%lu cmd_len=%zu timeout_ms=%lu",
-            gle, cmdline.size(), static_cast<unsigned long>(timeout_ms));
+        diag::log_tagged_fmt("camoufox", "spawn_capture pipe_create_failed label=%s gle=%lu cmd_len=%zu timeout_ms=%lu elapsed_ms=%llu",
+            spawn_label, gle, cmdline.size(), static_cast<unsigned long>(timeout_ms),
+            static_cast<unsigned long long>(now_ms() - t0));
         return false;
     }
     SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
 
-    STARTUPINFOW si{};
-    si.cb         = sizeof(si);
-    si.dwFlags    = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
-    si.hStdOutput = wr;
-    si.hStdError  = wr;
-    si.hStdInput  = GetStdHandle(STD_INPUT_HANDLE);
-    si.wShowWindow = SW_HIDE;
-
-    PROCESS_INFORMATION pi{};
-    std::wstring wcmdline = utf8_to_wide(cmdline);
-    BOOL ok = CreateProcessW(nullptr, wcmdline.empty() ? nullptr : wcmdline.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
-    CloseHandle(wr);
-    if (!ok)
+    HANDLE child_stdin = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+        &sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (child_stdin == INVALID_HANDLE_VALUE)
     {
-        DWORD gle = GetLastError();
-        out_stdout = "spawn create failed gle=" + std::to_string(gle);
-        diag::log_tagged_fmt("camoufox", "spawn_capture create_failed gle=%lu cmd_len=%zu timeout_ms=%lu",
-            gle, cmdline.size(), static_cast<unsigned long>(timeout_ms));
+        const DWORD gle = GetLastError();
+        out_stdout = "spawn stdin create failed gle=" + std::to_string(gle);
+        diag::log_tagged_fmt("camoufox", "spawn_capture stdin_create_failed label=%s gle=%lu elapsed_ms=%llu",
+            spawn_label, gle, static_cast<unsigned long long>(now_ms() - t0));
+        CloseHandle(wr);
         CloseHandle(rd);
         return false;
     }
-    diag::log_tagged_fmt("camoufox", "spawn_capture process_started pid=%lu cmd_len=%zu timeout_ms=%lu",
-        static_cast<unsigned long>(pi.dwProcessId), cmdline.size(), static_cast<unsigned long>(timeout_ms));
+
+    STARTUPINFOEXW sx{};
+    sx.StartupInfo.cb         = sizeof(sx);
+    sx.StartupInfo.dwFlags    = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    sx.StartupInfo.hStdOutput = wr;
+    sx.StartupInfo.hStdError  = wr;
+    sx.StartupInfo.hStdInput  = child_stdin;
+    sx.StartupInfo.wShowWindow = SW_HIDE;
+
+    SIZE_T attr_bytes = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &attr_bytes);
+    std::vector<uint8_t> attr_storage;
+    bool attr_ready = false;
+    if (attr_bytes != 0)
+    {
+        attr_storage.resize(attr_bytes);
+        sx.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attr_storage.data());
+        if (InitializeProcThreadAttributeList(sx.lpAttributeList, 1, 0, &attr_bytes))
+        {
+            HANDLE inherited_handles[] = { wr, child_stdin };
+            if (UpdateProcThreadAttribute(
+                    sx.lpAttributeList,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                    inherited_handles,
+                    sizeof(inherited_handles),
+                    nullptr,
+                    nullptr))
+            {
+                attr_ready = true;
+            }
+            else
+            {
+                const DWORD gle = GetLastError();
+                diag::log_tagged_fmt("camoufox", "spawn_capture handle_list_update_failed label=%s gle=%lu",
+                    spawn_label, gle);
+                DeleteProcThreadAttributeList(sx.lpAttributeList);
+                sx.lpAttributeList = nullptr;
+            }
+        }
+        else
+        {
+            const DWORD gle = GetLastError();
+            diag::log_tagged_fmt("camoufox", "spawn_capture handle_list_init_failed label=%s gle=%lu",
+                spawn_label, gle);
+            sx.lpAttributeList = nullptr;
+        }
+    }
+    if (!attr_ready)
+    {
+        out_stdout = "spawn handle inheritance isolation failed";
+        diag::log_tagged_fmt("camoufox", "spawn_capture handle_list_unavailable label=%s elapsed_ms=%llu",
+            spawn_label, static_cast<unsigned long long>(now_ms() - t0));
+        CloseHandle(wr);
+        CloseHandle(child_stdin);
+        CloseHandle(rd);
+        return false;
+    }
+
+    PROCESS_INFORMATION pi{};
+    DWORD create_flags = CREATE_NO_WINDOW;
+    create_flags |= EXTENDED_STARTUPINFO_PRESENT;
+    sx.StartupInfo.cb = sizeof(sx);
+    const uint64_t create_t0 = now_ms();
+    diag::log_tagged_fmt("camoufox", "spawn_capture create_begin label=%s app=%s cwd=%s cmd_len=%zu timeout_ms=%lu handle_list=%d elapsed_ms=%llu",
+        spawn_label,
+        app_log.c_str(),
+        cwd_log.c_str(),
+        cmdline.size(),
+        static_cast<unsigned long>(timeout_ms),
+        attr_ready ? 1 : 0,
+        static_cast<unsigned long long>(create_t0 - t0));
+    std::wstring primary_cmdline = cmdline;
+    BOOL ok = CreateProcessW(
+        application_path.empty() ? nullptr : application_path.c_str(),
+        primary_cmdline.empty() ? nullptr : primary_cmdline.data(),
+        nullptr,
+        nullptr,
+        TRUE,
+        create_flags,
+        nullptr,
+        working_directory.empty() ? nullptr : working_directory.c_str(),
+        &sx.StartupInfo,
+        &pi);
+    DWORD create_gle = ok ? 0 : GetLastError();
+    diag::log_tagged_fmt("camoufox", "spawn_capture create_result label=%s ok=%d gle=%lu elapsed_ms=%llu create_elapsed_ms=%llu cmd_len=%zu",
+        spawn_label,
+        ok ? 1 : 0,
+        create_gle,
+        static_cast<unsigned long long>(now_ms() - t0),
+        static_cast<unsigned long long>(now_ms() - create_t0),
+        cmdline.size());
+    if (attr_ready)
+        DeleteProcThreadAttributeList(sx.lpAttributeList);
+    if (!ok && create_gle == ERROR_INVALID_PARAMETER)
+    {
+        STARTUPINFOW si{};
+        si.cb         = sizeof(si);
+        si.dwFlags    = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+        si.hStdOutput = wr;
+        si.hStdError  = wr;
+        si.hStdInput  = child_stdin;
+        si.wShowWindow = SW_HIDE;
+        const uint64_t fallback_t0 = now_ms();
+        std::wstring fallback_cmdline = cmdline;
+        SetLastError(0);
+        ok = CreateProcessW(
+            application_path.empty() ? nullptr : application_path.c_str(),
+            fallback_cmdline.empty() ? nullptr : fallback_cmdline.data(),
+            nullptr,
+            nullptr,
+            TRUE,
+            CREATE_NO_WINDOW,
+            nullptr,
+            working_directory.empty() ? nullptr : working_directory.c_str(),
+            &si,
+            &pi);
+        create_gle = ok ? 0 : GetLastError();
+        diag::log_tagged_fmt("camoufox", "spawn_capture fallback_create_result label=%s ok=%d gle=%lu elapsed_ms=%llu fallback_elapsed_ms=%llu cmd_len=%zu",
+            spawn_label,
+            ok ? 1 : 0,
+            create_gle,
+            static_cast<unsigned long long>(now_ms() - t0),
+            static_cast<unsigned long long>(now_ms() - fallback_t0),
+            cmdline.size());
+    }
+    CloseHandle(wr);
+    CloseHandle(child_stdin);
+    if (!ok)
+    {
+        out_stdout = "spawn create failed gle=" + std::to_string(create_gle);
+        diag::log_tagged_fmt("camoufox", "spawn_capture create_failed label=%s gle=%lu app=%s cwd=%s cmd_len=%zu timeout_ms=%lu elapsed_ms=%llu",
+            spawn_label, create_gle, app_log.c_str(), cwd_log.c_str(), cmdline.size(),
+            static_cast<unsigned long>(timeout_ms),
+            static_cast<unsigned long long>(now_ms() - t0));
+        CloseHandle(rd);
+        return false;
+    }
+    diag::log_tagged_fmt("camoufox", "spawn_capture process_started label=%s pid=%lu cmd_len=%zu timeout_ms=%lu elapsed_ms=%llu",
+        spawn_label, static_cast<unsigned long>(pi.dwProcessId), cmdline.size(),
+        static_cast<unsigned long>(timeout_ms), static_cast<unsigned long long>(now_ms() - t0));
     CloseHandle(pi.hThread);
 
     char buf[4096];
@@ -543,8 +984,8 @@ bool spawn_capture(const std::string& cmdline, DWORD timeout_ms, DWORD& out_exit
             TerminateProcess(pi.hProcess, 1);
             std::string tail = compact_child_output_tail(out_stdout, 600);
             out_stdout += " spawn timeout elapsed_ms=" + std::to_string(elapsed) + " output_tail=" + tail;
-            diag::log_tagged_fmt("camoufox", "spawn_capture timeout pid=%lu elapsed_ms=%lu cmd_len=%zu captured_len=%zu tail=%.600s",
-                static_cast<unsigned long>(pi.dwProcessId),
+            diag::log_tagged_fmt("camoufox", "spawn_capture timeout label=%s pid=%lu elapsed_ms=%lu cmd_len=%zu captured_len=%zu tail=%.600s",
+                spawn_label, static_cast<unsigned long>(pi.dwProcessId),
                 static_cast<unsigned long>(elapsed), cmdline.size(), out_stdout.size(), tail.c_str());
             CloseHandle(pi.hProcess);
             CloseHandle(rd);
@@ -560,12 +1001,42 @@ bool spawn_capture(const std::string& cmdline, DWORD timeout_ms, DWORD& out_exit
         out_stdout.append(buf, buf + got);
     }
     GetExitCodeProcess(pi.hProcess, &out_exit_code);
-    diag::log_tagged_fmt("camoufox", "spawn_capture exit pid=%lu code=%lu cmd_len=%zu captured_len=%zu tail=%.600s",
-        static_cast<unsigned long>(pi.dwProcessId), out_exit_code, cmdline.size(), out_stdout.size(),
+    diag::log_tagged_fmt("camoufox", "spawn_capture exit label=%s pid=%lu code=%lu cmd_len=%zu captured_len=%zu elapsed_ms=%llu tail=%.600s",
+        spawn_label, static_cast<unsigned long>(pi.dwProcessId), out_exit_code, cmdline.size(), out_stdout.size(),
+        static_cast<unsigned long long>(now_ms() - t0),
         compact_child_output_tail(out_stdout, 600).c_str());
     CloseHandle(pi.hProcess);
     CloseHandle(rd);
     return true;
+}
+
+bool spawn_capture(const std::string& cmdline, DWORD timeout_ms, DWORD& out_exit_code, std::string& out_stdout)
+{
+    return spawn_capture_impl({}, utf8_to_wide(cmdline), {}, "cmdline", timeout_ms, out_exit_code, out_stdout);
+}
+
+bool spawn_python_capture(const std::string& python_path, const std::wstring& args, DWORD timeout_ms, DWORD& out_exit_code, std::string& out_stdout, const char* label)
+{
+    std::wstring app = utf8_to_wide(python_path);
+    std::wstring cmdline = quote_arg_w(app);
+    if (!args.empty())
+    {
+        cmdline.push_back(L' ');
+        cmdline.append(args);
+    }
+    return spawn_capture_impl(app, std::move(cmdline), parent_directory_w(app), label, timeout_ms, out_exit_code, out_stdout);
+}
+
+bool spawn_executable_capture(const std::string& executable_path, const std::wstring& args, DWORD timeout_ms, DWORD& out_exit_code, std::string& out_stdout, const char* label)
+{
+    std::wstring app = utf8_to_wide(executable_path);
+    std::wstring cmdline = quote_arg_w(app);
+    if (!args.empty())
+    {
+        cmdline.push_back(L' ');
+        cmdline.append(args);
+    }
+    return spawn_capture_impl(app, std::move(cmdline), parent_directory_w(app), label, timeout_ms, out_exit_code, out_stdout);
 }
 
 std::string compact_child_output(std::string s, size_t limit = 1600)
@@ -960,8 +1431,7 @@ bool query_python_version(const std::string& python_path, int& major, int& minor
         python_path.c_str());
     DWORD code = 0;
     std::string captured;
-    std::string cmd = std::string("\"") + python_path + "\" -c \"import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')\"";
-    if (!spawn_capture(cmd, 3000, code, captured))
+    if (!spawn_python_capture(python_path, L"-I -S -c \"import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')\"", 3000, code, captured, "python_version_probe"))
     {
         detail = "version probe timed out or failed to spawn";
         diag::log_tagged_fmt("camoufox", "python_version_probe spawn_failed path=%s elapsed_ms=%llu detail=%s",
@@ -1081,11 +1551,9 @@ void disconnect_client_async(std::shared_ptr<mcp_client::client_t> cli, const st
         cli->disconnect();
         diag::log_tagged_fmt("camoufox", "disconnect_async done reason=%s", reason.c_str());
     };
-    std::string thread_err;
-    if (!aida::infra::win_thread::start_detached(disconnect_task, &thread_err,
-            aida::infra::win_thread::default_stack_reserve, "camoufox.disconnect")) {
-        diag::log_tagged_fmt("camoufox", "disconnect_async_thread_failed reason=%s err=%s",
-            reason.c_str(), thread_err.c_str());
+    if (!post_bridge_task("camoufox.disconnect", disconnect_task)) {
+        diag::log_tagged_fmt("camoufox", "disconnect_async_post_failed reason=%s",
+            reason.c_str());
         disconnect_client_sync(cli, reason);
     }
 }
@@ -1163,11 +1631,9 @@ void terminate_process_id_async(uint32_t pid, const std::string& reason)
     auto terminate_task = [pid, reason]() {
         terminate_process_tree_sync(pid, reason);
     };
-    std::string thread_err;
-    if (!aida::infra::win_thread::start_detached(terminate_task, &thread_err,
-            aida::infra::win_thread::default_stack_reserve, "camoufox.terminate")) {
-        diag::log_tagged_fmt("camoufox", "terminate_process_thread_failed pid=%lu reason=%s err=%s",
-            static_cast<unsigned long>(pid), reason.c_str(), thread_err.c_str());
+    if (!post_bridge_task("camoufox.terminate", terminate_task)) {
+        diag::log_tagged_fmt("camoufox", "terminate_process_post_failed pid=%lu reason=%s",
+            static_cast<unsigned long>(pid), reason.c_str());
         terminate_process_tree_sync(pid, reason);
     }
 }
@@ -1192,11 +1658,13 @@ void mark_cleanup_started_locked(uint64_t generation, uint32_t child_pid = 0, co
 
 void mark_cleanup_finished(uint64_t generation, uint64_t elapsed_ms, const std::string& reason)
 {
+    std::string cleanup_profile_dir;
+    bool should_purge_profile = false;
     std::unique_lock<std::recursive_mutex> lk(sg().mtx);
     const uint64_t age_ms = sg().cleanup_started_ms == 0 ? 0 : now_ms() - sg().cleanup_started_ms;
     const uint32_t cleanup_pid = sg().cleanup_child_pid;
     const std::string cleanup_reason = sg().cleanup_reason;
-    const std::string cleanup_profile_dir = sg().cleanup_profile_dir;
+    cleanup_profile_dir = sg().cleanup_profile_dir;
     if (sg().cleanup_generation == generation)
     {
         sg().cleanup_pending = false;
@@ -1209,6 +1677,7 @@ void mark_cleanup_finished(uint64_t generation, uint64_t elapsed_ms, const std::
             sg().tracked_child_pid.store(0, std::memory_order_release);
         if (sg().active_profile_dir == cleanup_profile_dir)
             sg().active_profile_dir.clear();
+        should_purge_profile = true;
     }
     diag::log_tagged_fmt("camoufox", "cleanup_state_done generation=%llu current_generation=%llu pending=%d child_pid=%lu profile_dir=%s started_age_ms=%llu start_reason=%s reason=%s elapsed_ms=%llu",
         static_cast<unsigned long long>(generation), static_cast<unsigned long long>(sg().generation),
@@ -1216,6 +1685,9 @@ void mark_cleanup_finished(uint64_t generation, uint64_t elapsed_ms, const std::
         cleanup_profile_dir.empty() ? "<empty>" : cleanup_profile_dir.c_str(),
         static_cast<unsigned long long>(age_ms), cleanup_reason.c_str(), reason.c_str(),
         static_cast<unsigned long long>(elapsed_ms));
+    lk.unlock();
+    if (should_purge_profile)
+        purge_generated_profile_dir(cleanup_profile_dir, reason);
 }
 
 std::string cleanup_profile_dir_snapshot(uint64_t generation)
@@ -1254,11 +1726,9 @@ void cleanup_poisoned_client_async(uint32_t child_pid, const std::string& reason
             static_cast<unsigned long long>(reap.elapsed_ms));
         mark_cleanup_finished(generation, now_ms() - t0, reason);
     };
-    std::string thread_err;
-    if (!aida::infra::win_thread::start_detached(cleanup_task, &thread_err,
-            aida::infra::win_thread::default_stack_reserve, "camoufox.cleanup_poisoned")) {
-        diag::log_tagged_fmt("camoufox", "cleanup_poisoned_thread_failed generation=%llu reason=%s err=%s",
-            static_cast<unsigned long long>(generation), reason.c_str(), thread_err.c_str());
+    if (!post_bridge_task("camoufox.cleanup_poisoned", cleanup_task)) {
+        diag::log_tagged_fmt("camoufox", "cleanup_poisoned_post_failed generation=%llu reason=%s",
+            static_cast<unsigned long long>(generation), reason.c_str());
         cleanup_task();
     }
 }
@@ -1294,11 +1764,9 @@ void cleanup_client_async(std::shared_ptr<mcp_client::client_t> cli, uint32_t ch
             static_cast<unsigned long long>(generation), reason.c_str(),
             static_cast<unsigned long long>(now_ms() - t0));
     };
-    std::string thread_err;
-    if (!aida::infra::win_thread::start_detached(cleanup_task, &thread_err,
-            aida::infra::win_thread::default_stack_reserve, "camoufox.cleanup")) {
-        diag::log_tagged_fmt("camoufox", "cleanup_async_thread_failed generation=%llu reason=%s err=%s",
-            static_cast<unsigned long long>(generation), reason.c_str(), thread_err.c_str());
+    if (!post_bridge_task("camoufox.cleanup", cleanup_task)) {
+        diag::log_tagged_fmt("camoufox", "cleanup_async_post_failed generation=%llu reason=%s",
+            static_cast<unsigned long long>(generation), reason.c_str());
         cleanup_task();
     }
 }
@@ -1903,7 +2371,7 @@ call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::j
             fail.error = sg().last_error;
             if (fail.error.empty())
                 fail.error = old_state == bridge_state_t::stopped
-                    ? "camoufox bridge is not running; call camoufox_open_url for simple navigation or launch_browser for advanced instrumentation"
+                    ? "camoufox bridge is not running; call launch_browser before browser navigation or instrumentation"
                     : "camoufox bridge not ready";
             diag::log_tagged_fmt("camoufox", "call_with_deadline phase=recovery_failed request_id=%llu tool=%s state=%d client=%d err_len=%zu args_shape=%s",
                 static_cast<unsigned long long>(request_id), tool_name.c_str(), static_cast<int>(sg().state), static_cast<int>(sg().client != nullptr),
@@ -1950,8 +2418,7 @@ call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::j
         static_cast<unsigned long long>(request_id), tool_name.c_str(), timeout_ms, static_cast<unsigned long long>(state->generation),
         static_cast<unsigned long>(state->child_pid), json_shape(args).c_str());
 
-    std::string call_thread_err;
-    bool posted = aida::infra::win_thread::start_detached([state, cli, tool_name, args, request_id]() {
+    bool posted = post_bridge_task("camoufox.call", [state, cli, tool_name, args, request_id]() {
         const uint64_t worker_start = now_ms();
         mcp_client::call_result_t r;
         guarded_mcp_call_context_t call_ctx;
@@ -1993,14 +2460,14 @@ call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::j
                 static_cast<unsigned long long>(request_id), tool_name.c_str(), static_cast<unsigned long long>(generation), static_cast<unsigned long>(child_pid),
                 static_cast<unsigned long long>(now_ms() - worker_start));
         }
-    }, &call_thread_err, aida::infra::win_thread::default_stack_reserve, "camoufox.call");
+    });
 
     if (!posted)
     {
-        fail.error = std::string("camoufox call thread failed: ") + call_thread_err;
+        fail.error = "camoufox call dispatch post failed";
         sg().total_errors.fetch_add(1, std::memory_order_relaxed);
-        diag::log_tagged_fmt("camoufox", "call_with_deadline phase=thread_failed request_id=%llu tool=%s err=%s",
-            static_cast<unsigned long long>(request_id), tool_name.c_str(), call_thread_err.c_str());
+        diag::log_tagged_fmt("camoufox", "call_with_deadline phase=post_failed request_id=%llu tool=%s",
+            static_cast<unsigned long long>(request_id), tool_name.c_str());
         return fail;
     }
 
@@ -2225,11 +2692,10 @@ bool wait_for_tool_listed(mcp_client::client_t* cli, const std::string& tool_nam
 
 bool probe_module_installed_locked(const std::string& python_path)
 {
-    std::string cmdline = std::string("\"") + python_path + "\" -c \"import camoufox_reverse_mcp\"";
     diag::log_tagged_fmt("camoufox", "module_probe start python=%s module=camoufox_reverse_mcp", python_path.c_str());
     DWORD code = 0;
     std::string captured;
-    if (!spawn_capture(cmdline, 3000, code, captured))
+    if (!spawn_python_capture(python_path, L"-I -c \"import camoufox_reverse_mcp\"", 3000, code, captured, "module_probe"))
     {
         std::string detail = compact_child_output_tail(captured, 600);
         sg().last_error = detail.empty()
@@ -2253,16 +2719,16 @@ bool probe_module_installed_locked(const std::string& python_path)
 bool preflight_server_entry_locked(const std::string& python_path, const launch_config_t& cfg)
 {
     const std::string module = cfg.server_module.empty() ? std::string("camoufox_reverse_mcp") : cfg.server_module;
-    std::string cmdline;
+    std::wstring args;
     if (module == "camoufox_reverse_mcp")
-        cmdline = std::string("\"") + python_path + "\" -m camoufox_reverse_mcp --help";
+        args = L"-I -m camoufox_reverse_mcp --help";
     else
-        cmdline = std::string("\"") + python_path + "\" -c \"import importlib; importlib.import_module('" + module + "')\"";
+        args = std::wstring(L"-I -c \"import importlib; importlib.import_module('") + utf8_to_wide(module) + L"')\"";
     diag::log_tagged_fmt("camoufox", "server_preflight start python=%s module=%s", python_path.c_str(), module.c_str());
 
     DWORD code = 0;
     std::string captured;
-    if (!spawn_capture(cmdline, 4000, code, captured))
+    if (!spawn_python_capture(python_path, args, 4000, code, captured, "server_preflight"))
     {
         std::string detail = compact_child_output_tail(captured, 600);
         sg().last_error = detail.empty()
@@ -2281,6 +2747,33 @@ bool preflight_server_entry_locked(const std::string& python_path, const launch_
         return false;
     }
     diag::log_tagged_fmt("camoufox", "server preflight ok module=%s captured_len=%zu", module.c_str(), captured.size());
+    return true;
+}
+
+bool preflight_server_executable_locked(const std::string& server_executable)
+{
+    diag::log_tagged_fmt("camoufox", "server_exe_preflight start path=%s", server_executable.c_str());
+    DWORD code = 0;
+    std::string captured;
+    if (!spawn_executable_capture(server_executable, L"--help", 4000, code, captured, "server_exe_preflight"))
+    {
+        std::string detail = compact_child_output_tail(captured, 600);
+        sg().last_error = detail.empty()
+            ? std::string("camoufox MCP executable preflight failed to spawn or timed out")
+            : std::string("camoufox MCP executable preflight failed to spawn or timed out: ") + detail;
+        diag::log_tagged_fmt("camoufox", "server_exe_preflight spawn_failed detail=%.600s", detail.c_str());
+        return false;
+    }
+    if (code != 0)
+    {
+        std::string detail = compact_child_output_tail(captured);
+        sg().last_error = std::string("camoufox MCP executable preflight failed: ") +
+            (detail.empty() ? std::string("exit=") + std::to_string(code) : detail);
+        diag::log_tagged_fmt("camoufox", "server_exe_preflight failed exit=%lu out=%.400s",
+            static_cast<unsigned long>(code), detail.c_str());
+        return false;
+    }
+    diag::log_tagged_fmt("camoufox", "server_exe_preflight ok captured_len=%zu", captured.size());
     return true;
 }
 
@@ -2809,6 +3302,7 @@ uint32_t managed_session_count()
 bool ensure_python_available(std::string& out_python_path)
 {
     const uint64_t t0 = now_ms();
+    const bool allow_system_python = system_python_discovery_allowed();
     diag::log_tagged_fmt("camoufox", "ensure_python_available entry budget_ms=%llu",
         static_cast<unsigned long long>(kPythonDiscoveryBudgetMs));
     std::string cached_python_path;
@@ -2818,16 +3312,24 @@ bool ensure_python_available(std::string& out_python_path)
     }
     if (!cached_python_path.empty() && path_exists_w(utf8_to_wide(cached_python_path)))
     {
-        std::string reason;
-        if (supported_camoufox_python(cached_python_path, &reason))
+        if (!allow_system_python && !is_app_controlled_python_path(cached_python_path))
         {
-            diag::log_tagged_fmt("camoufox", "ensure_python_available cached path=%s %s elapsed_ms=%llu",
-                cached_python_path.c_str(), reason.c_str(), static_cast<unsigned long long>(now_ms() - t0));
-            out_python_path = cached_python_path;
-            return true;
+            diag::log_tagged_fmt("camoufox", "ensure_python_available cached rejected path=%s reason=system_python_discovery_disabled elapsed_ms=%llu",
+                cached_python_path.c_str(), static_cast<unsigned long long>(now_ms() - t0));
         }
-        diag::log_tagged_fmt("camoufox", "ensure_python_available cached rejected path=%s reason=%s elapsed_ms=%llu",
-            cached_python_path.c_str(), reason.c_str(), static_cast<unsigned long long>(now_ms() - t0));
+        else
+        {
+            std::string reason;
+            if (supported_camoufox_python(cached_python_path, &reason))
+            {
+                diag::log_tagged_fmt("camoufox", "ensure_python_available cached path=%s %s elapsed_ms=%llu",
+                    cached_python_path.c_str(), reason.c_str(), static_cast<unsigned long long>(now_ms() - t0));
+                out_python_path = cached_python_path;
+                return true;
+            }
+            diag::log_tagged_fmt("camoufox", "ensure_python_available cached rejected path=%s reason=%s elapsed_ms=%llu",
+                cached_python_path.c_str(), reason.c_str(), static_cast<unsigned long long>(now_ms() - t0));
+        }
         {
             std::lock_guard<std::recursive_mutex> lk(sg().mtx);
             if (_stricmp(sg().cached_python_path.c_str(), cached_python_path.c_str()) == 0)
@@ -2835,14 +3337,31 @@ bool ensure_python_available(std::string& out_python_path)
         }
     }
     std::vector<std::string> candidates;
+    std::string env_python;
+    if (read_env_path_a("AIDA_CAMOUFOX_PYTHON", env_python))
+    {
+        if (allow_system_python || is_app_controlled_python_path(env_python))
+            candidates.push_back(env_python);
+        else
+            diag::log_tagged_fmt("camoufox", "ensure_python_available env_python_skipped path=%s policy=AIDA_CAMOUFOX_ALLOW_SYSTEM_PYTHON", env_python.c_str());
+    }
     append_bundled_python_candidates(candidates);
     append_app_local_python_candidates(candidates);
-    std::string found;
-    if (try_search_path(L"python.exe", found)) candidates.push_back(found);
-    found.clear();
-    if (try_search_path(L"python3.exe", found)) candidates.push_back(found);
-    found.clear();
-    if (try_known_python_roots(found)) candidates.push_back(found);
+    const size_t app_controlled_candidates = candidates.size();
+    if (allow_system_python)
+    {
+        std::string found;
+        if (try_search_path(L"python.exe", found)) candidates.push_back(found);
+        found.clear();
+        if (try_search_path(L"python3.exe", found)) candidates.push_back(found);
+        found.clear();
+        if (try_known_python_roots(found)) candidates.push_back(found);
+    }
+    else
+    {
+        diag::log_tagged_fmt("camoufox", "ensure_python_available system_python_candidates_skipped app_controlled_candidates=%zu policy=AIDA_CAMOUFOX_ALLOW_SYSTEM_PYTHON",
+            app_controlled_candidates);
+    }
     std::vector<std::string> unique_candidates;
     for (const auto& candidate : candidates)
     {
@@ -2903,7 +3422,9 @@ bool ensure_python_available(std::string& out_python_path)
         static_cast<unsigned long long>(kPythonDiscoveryBudgetMs));
     {
         std::lock_guard<std::recursive_mutex> lk(sg().mtx);
-        set_error_locked("supported Python 3.10-3.13 interpreter not found for camoufox");
+        set_error_locked(allow_system_python
+            ? "supported Python 3.10-3.13 interpreter not found for Camoufox"
+            : std::string("Camoufox app-local Python runtime missing\n") + install::setup_instructions());
     }
     return false;
 }
@@ -3051,18 +3572,31 @@ bool start_bridge(const launch_config_t& cfg)
     sg().last_launch_ms = 0;
     publish_state(bridge_state_t::starting, std::string());
 
+    std::string server_executable;
+    const bool use_server_executable = resolve_reverse_mcp_executable(effective_cfg, server_executable);
+    diag::log_tagged_fmt("camoufox", "start_bridge server_executable_resolve use_exe=%d path=%s",
+        static_cast<int>(use_server_executable),
+        server_executable.empty() ? "<empty>" : server_executable.c_str());
+
     std::string python_path = effective_cfg.python_executable;
-    if (!python_path.empty())
+    if (!use_server_executable && !python_path.empty())
     {
         std::string reason;
-        if (!supported_camoufox_python(python_path, &reason))
+        if (!system_python_discovery_allowed() && !is_app_controlled_python_path(python_path))
+        {
+            reason = "explicit Python path is outside AiDA-controlled Camoufox runtime roots";
+            diag::log_tagged_fmt("camoufox", "start_bridge explicit_python_rejected path=%s reason=%s",
+                python_path.c_str(), reason.c_str());
+            python_path.clear();
+        }
+        else if (!supported_camoufox_python(python_path, &reason))
         {
             diag::log_tagged_fmt("camoufox", "start_bridge explicit_python_rejected path=%s reason=%s",
                 python_path.c_str(), reason.c_str());
             python_path.clear();
         }
     }
-    if (python_path.empty())
+    if (!use_server_executable && python_path.empty())
     {
         if (!ensure_python_available(python_path))
         {
@@ -3081,7 +3615,7 @@ bool start_bridge(const launch_config_t& cfg)
             {
                 sg().last_error = install::last_error();
                 if (sg().last_error.empty()) sg().last_error = compact_child_output(setup_log);
-                if (sg().last_error.empty()) sg().last_error = "supported Python 3.10-3.13 interpreter not found for Camoufox";
+                if (sg().last_error.empty()) sg().last_error = install::setup_instructions();
                 sg().state = bridge_state_t::error;
                 publish_state(bridge_state_t::error, sg().last_error);
                 return false;
@@ -3089,6 +3623,12 @@ bool start_bridge(const launch_config_t& cfg)
         }
     }
 
+    if (effective_cfg.browser_executable.empty())
+    {
+        std::string env_browser;
+        if (read_env_path_a("AIDA_CAMOUFOX_EXECUTABLE", env_browser))
+            effective_cfg.browser_executable = env_browser;
+    }
     if (effective_cfg.browser_executable.empty())
     {
         std::string bundled_browser;
@@ -3102,35 +3642,68 @@ bool start_bridge(const launch_config_t& cfg)
         effective_cfg.browser_executable.empty() ? "<empty>" : effective_cfg.browser_executable.c_str(),
         static_cast<int>(browser_attr != INVALID_FILE_ATTRIBUTES && (browser_attr & FILE_ATTRIBUTE_DIRECTORY) == 0),
         static_cast<unsigned long>(browser_attr));
-
-    if (!prepare_install_for_launch_locked(python_path))
+    if (effective_cfg.browser_executable.empty() || browser_attr == INVALID_FILE_ATTRIBUTES || (browser_attr & FILE_ATTRIBUTE_DIRECTORY) != 0)
     {
+        sg().last_error = effective_cfg.browser_executable.empty()
+            ? std::string("Camoufox browser executable not found\n") + install::setup_instructions()
+            : std::string("Configured Camoufox browser executable is unavailable\n") + install::setup_instructions();
         sg().state = bridge_state_t::error;
+        diag::log_tagged_fmt("camoufox", "start_bridge browser_required_failed generation=%llu err=%s",
+            static_cast<unsigned long long>(start_generation), sg().last_error.c_str());
         publish_state(bridge_state_t::error, sg().last_error);
         return false;
     }
 
-    if (!probe_module_installed_locked(python_path))
+    if (use_server_executable)
     {
-        sg().state = bridge_state_t::error;
-        publish_state(bridge_state_t::error, sg().last_error);
-        return false;
+        if (!preflight_server_executable_locked(server_executable))
+        {
+            sg().state = bridge_state_t::error;
+            publish_state(bridge_state_t::error, sg().last_error);
+            return false;
+        }
     }
-
-    if (!preflight_server_entry_locked(python_path, effective_cfg))
+    else
     {
-        sg().state = bridge_state_t::error;
-        publish_state(bridge_state_t::error, sg().last_error);
-        return false;
+        if (!prepare_install_for_launch_locked(python_path))
+        {
+            sg().state = bridge_state_t::error;
+            publish_state(bridge_state_t::error, sg().last_error);
+            return false;
+        }
+
+        if (!probe_module_installed_locked(python_path))
+        {
+            sg().state = bridge_state_t::error;
+            publish_state(bridge_state_t::error, sg().last_error);
+            return false;
+        }
+
+        if (!preflight_server_entry_locked(python_path, effective_cfg))
+        {
+            sg().state = bridge_state_t::error;
+            publish_state(bridge_state_t::error, sg().last_error);
+            return false;
+        }
     }
 
     mcp_client::server_config_t scfg;
     scfg.name      = "camoufox-reverse";
     scfg.transport = mcp_client::transport_type_t::stdio;
-    scfg.command   = python_path;
-    scfg.args.push_back("-m");
-    scfg.args.push_back(effective_cfg.server_module.empty() ? std::string("camoufox_reverse_mcp") : effective_cfg.server_module);
+    scfg.command   = use_server_executable ? server_executable : python_path;
+    if (!use_server_executable)
+    {
+        scfg.args.push_back("-I");
+        scfg.args.push_back("-m");
+        scfg.args.push_back(effective_cfg.server_module.empty() ? std::string("camoufox_reverse_mcp") : effective_cfg.server_module);
+    }
     for (const auto& a : effective_cfg.extra_args) scfg.args.push_back(a);
+    if (use_server_executable)
+        scfg.env["AIDA_CAMOUFOX_MCP_EXECUTABLE"] = server_executable;
+    else
+        scfg.env["AIDA_CAMOUFOX_PYTHON"] = python_path;
+    if (!use_server_executable && system_python_discovery_allowed())
+        scfg.env["AIDA_CAMOUFOX_ALLOW_SYSTEM_PYTHON"] = "1";
     const std::string child_debug_log = camoufox_debug_log_path();
     populate_internal_camoufox_env(scfg, effective_cfg.session_id, effective_cfg.browser_executable, child_debug_log);
     scfg.enabled                 = true;
@@ -3142,7 +3715,7 @@ bool start_bridge(const launch_config_t& cfg)
     diag::log_tagged_fmt("camoufox", "start_bridge mcp_connect_begin generation=%llu command=%s module=%s args=%zu env_pythonio=%d env_browser=%d env_debug_log=%d env_workdir=%d env_profile=%d debug_log=%s browser_exists=%d",
         static_cast<unsigned long long>(start_generation),
         scfg.command.c_str(),
-        (effective_cfg.server_module.empty() ? "camoufox_reverse_mcp" : effective_cfg.server_module.c_str()),
+        use_server_executable ? "<frozen-executable>" : (effective_cfg.server_module.empty() ? "camoufox_reverse_mcp" : effective_cfg.server_module.c_str()),
         scfg.args.size(),
         static_cast<int>(scfg.env.find("PYTHONIOENCODING") != scfg.env.end()),
         static_cast<int>(scfg.env.find("AIDA_CAMOUFOX_EXECUTABLE") != scfg.env.end()),
@@ -3162,7 +3735,9 @@ bool start_bridge(const launch_config_t& cfg)
         publish_state(bridge_state_t::error, sg().last_error);
         return false;
     }
-    sg().server_command = python_path + " -m " + (effective_cfg.server_module.empty() ? std::string("camoufox_reverse_mcp") : effective_cfg.server_module);
+    sg().server_command = use_server_executable
+        ? server_executable
+        : python_path + " -m " + (effective_cfg.server_module.empty() ? std::string("camoufox_reverse_mcp") : effective_cfg.server_module);
     sg().child_pid      = sg().client ? sg().client->child_process_id() : 0;
     sg().tracked_child_pid.store(sg().child_pid, std::memory_order_release);
     sg().launched_ms    = now_ms();
@@ -3231,8 +3806,7 @@ bool start_bridge(const launch_config_t& cfg)
     const uint64_t launch_call_start_ms = now_ms();
     uint64_t last_launch_wait_log_ms = launch_call_start_ms;
     uint64_t last_launch_tree_log_ms = 0;
-    std::string launch_thread_err;
-    bool launch_posted = aida::infra::win_thread::start_detached([launch_state, launch_client, args]() {
+    bool launch_posted = post_bridge_task("camoufox.launch", [launch_state, launch_client, args]() {
         const uint64_t worker_start = now_ms();
         const std::string launch_tool = "launch_browser";
         mcp_client::call_result_t r;
@@ -3269,20 +3843,19 @@ bool start_bridge(const launch_config_t& cfg)
                 static_cast<unsigned long long>(generation), static_cast<unsigned long>(child_pid),
                 static_cast<unsigned long long>(now_ms() - worker_start));
         }
-    }, &launch_thread_err, aida::infra::win_thread::default_stack_reserve, "camoufox.launch");
+    });
     if (!launch_posted)
     {
         auto failed_client = sg().client;
         sg().client.reset();
         sg().child_pid = 0;
         sg().state = bridge_state_t::error;
-        sg().last_error = std::string("launch_browser dispatch thread failed: ") + launch_thread_err;
+        sg().last_error = "launch_browser dispatch post failed";
         clear_page_state_locked();
         sg().last_launch_ms = now_ms() - bridge_start_ms;
         mark_cleanup_started_locked(start_generation, launch_child_pid, "launch_browser_dispatch_failed");
-        diag::log_tagged_fmt("camoufox", "launch_browser dispatch_thread_failed generation=%llu child_pid=%lu err=%s",
-            static_cast<unsigned long long>(start_generation), static_cast<unsigned long>(launch_child_pid),
-            launch_thread_err.c_str());
+        diag::log_tagged_fmt("camoufox", "launch_browser dispatch_post_failed generation=%llu child_pid=%lu",
+            static_cast<unsigned long long>(start_generation), static_cast<unsigned long>(launch_child_pid));
         cleanup_client_async(failed_client, launch_child_pid, "launch_browser_dispatch_failed", start_generation);
         publish_state(bridge_state_t::error, sg().last_error);
         return false;
@@ -3702,10 +4275,8 @@ bool stop_bridge(const char* reason)
             }
             cli->disconnect();
         };
-        std::string close_thread_err;
-        if (!aida::infra::win_thread::start_detached(close_task, &close_thread_err,
-                aida::infra::win_thread::default_stack_reserve, "camoufox.close")) {
-            diag::log_tagged_fmt("camoufox", "stop_bridge close_browser_thread_failed err=%s", close_thread_err.c_str());
+        if (!post_bridge_task("camoufox.close", close_task)) {
+            diag::log_tagged("camoufox", "stop_bridge close_browser_post_failed");
             close_task();
         }
         cleanup_client_async(nullptr, child_pid, std::string("stop_bridge:") + stop_reason, stop_generation);
@@ -3820,6 +4391,65 @@ bool force_cleanup(const char* reason)
     return success;
 }
 
+bool wait_until_idle(uint32_t timeout_ms, const char* reason)
+{
+    const uint64_t t0 = now_ms();
+    const char* wait_reason = safe_reason(reason);
+    const uint64_t limit_ms = timeout_ms == 0 ? 1 : static_cast<uint64_t>(timeout_ms);
+    uint64_t last_log_ms = 0;
+    for (;;)
+    {
+        const uint64_t now = now_ms();
+        std::unique_lock<std::recursive_mutex> op_lk(sg().operation_mtx, std::try_to_lock);
+        const bool operation_idle = op_lk.owns_lock();
+        const uint32_t active = sg().active_activities.load(std::memory_order_acquire);
+        bridge_state_t state = bridge_state_t::stopped;
+        uint64_t generation = 0;
+        uint32_t child_pid = 0;
+        bool cleanup_pending = false;
+        bool child_alive = false;
+        size_t err_len = 0;
+        {
+            std::lock_guard<std::recursive_mutex> lk(sg().mtx);
+            state = sg().state;
+            generation = sg().generation;
+            child_pid = sg().child_pid != 0 ? sg().child_pid : sg().cleanup_child_pid;
+            cleanup_pending = sg().cleanup_pending;
+            err_len = sg().last_error.size();
+        }
+        if (operation_idle && active == 0 && !cleanup_pending)
+        {
+            child_alive = process_alive(child_pid);
+            diag::log_tagged_fmt("camoufox", "wait_until_idle ok reason=%s elapsed_ms=%llu state=%d generation=%llu child_pid=%lu child_alive=%d err_len=%zu",
+                wait_reason, static_cast<unsigned long long>(now - t0), static_cast<int>(state),
+                static_cast<unsigned long long>(generation), static_cast<unsigned long>(child_pid),
+                child_alive ? 1 : 0, err_len);
+            return true;
+        }
+        if (now - t0 >= limit_ms)
+        {
+            child_alive = process_alive(child_pid);
+            diag::log_tagged_fmt("camoufox", "wait_until_idle timeout reason=%s elapsed_ms=%llu limit_ms=%llu operation_idle=%d active=%lu state=%d generation=%llu child_pid=%lu child_alive=%d cleanup_pending=%d err_len=%zu",
+                wait_reason, static_cast<unsigned long long>(now - t0), static_cast<unsigned long long>(limit_ms),
+                operation_idle ? 1 : 0, static_cast<unsigned long>(active), static_cast<int>(state),
+                static_cast<unsigned long long>(generation), static_cast<unsigned long>(child_pid),
+                child_alive ? 1 : 0, cleanup_pending ? 1 : 0, err_len);
+            return false;
+        }
+        if (now - last_log_ms >= 1000)
+        {
+            child_alive = process_alive(child_pid);
+            diag::log_tagged_fmt("camoufox", "wait_until_idle wait reason=%s elapsed_ms=%llu limit_ms=%llu operation_idle=%d active=%lu state=%d generation=%llu child_pid=%lu child_alive=%d cleanup_pending=%d err_len=%zu",
+                wait_reason, static_cast<unsigned long long>(now - t0), static_cast<unsigned long long>(limit_ms),
+                operation_idle ? 1 : 0, static_cast<unsigned long>(active), static_cast<int>(state),
+                static_cast<unsigned long long>(generation), static_cast<unsigned long>(child_pid),
+                child_alive ? 1 : 0, cleanup_pending ? 1 : 0, err_len);
+            last_log_ms = now;
+        }
+        Sleep(50);
+    }
+}
+
 bool is_ready()
 {
     std::unique_lock<std::recursive_mutex> lk(sg().mtx, std::try_to_lock);
@@ -3872,7 +4502,7 @@ bool ensure_ready()
             st.last_message.empty() ? "<empty>" : st.last_message.c_str(),
             static_cast<unsigned long long>(now_ms() - t0));
     }
-    if (st.state == install::install_state_t::missing_python)
+    if (st.state != install::install_state_t::ok)
     {
         std::string setup_log;
         bool setup_ready = false;
@@ -3905,6 +4535,16 @@ bool ensure_ready()
     cfg.headless = false;
     if (cfg.server_module.empty()) cfg.server_module = "camoufox_reverse_mcp";
     if (cfg.python_executable.empty()) cfg.python_executable = st.python_path;
+    if (cfg.python_executable.empty())
+    {
+        std::lock_guard<std::recursive_mutex> lk(sg().mtx);
+        sg().last_error = st.last_message.empty()
+            ? "Camoufox Python runtime unavailable after dependency setup"
+            : st.last_message;
+        diag::log_tagged_fmt("camoufox", "ensure_ready missing_python_after_setup state=%d err=%s",
+            static_cast<int>(st.state), sg().last_error.c_str());
+        return false;
+    }
     diag::log_tagged_fmt("camoufox", "ensure_ready starting_bridge python=%s module=%s has_proxy=%d",
         cfg.python_executable.c_str(), cfg.server_module.c_str(), static_cast<int>(!cfg.proxy.empty()));
     bool ok = start_bridge(cfg);
@@ -4048,8 +4688,7 @@ call_result_t managed_call_with_deadline(const std::shared_ptr<managed_session_t
     diag::log_tagged_fmt("camoufox", "managed_call dispatch session_id=%s request_id=%llu tool=%s timeout_ms=%d generation=%llu child_pid=%lu args_shape=%s",
         session->session_id.c_str(), static_cast<unsigned long long>(request_id), tool_name.c_str(), timeout_ms,
         static_cast<unsigned long long>(generation), static_cast<unsigned long>(child_pid), json_shape(args).c_str());
-    std::string thread_err;
-    bool posted = aida::infra::win_thread::start_detached([state, cli, tool_name, args, request_id, generation, child_pid, sid = session->session_id]() {
+    bool posted = post_bridge_task("camoufox.session.call", [state, cli, tool_name, args, request_id, generation, child_pid, sid = session->session_id]() {
         const uint64_t worker_start = now_ms();
         mcp_client::call_result_t r;
         guarded_mcp_call_context_t call_ctx;
@@ -4073,10 +4712,10 @@ call_result_t managed_call_with_deadline(const std::shared_ptr<managed_session_t
             state->done = true;
         }
         state->cv.notify_all();
-    }, &thread_err, aida::infra::win_thread::default_stack_reserve, "camoufox.session.call");
+    });
     if (!posted)
     {
-        fail.error = std::string("camoufox managed call thread failed: ") + thread_err;
+        fail.error = "camoufox managed call dispatch post failed";
         session->total_errors.fetch_add(1, std::memory_order_relaxed);
         return fail;
     }
@@ -4203,36 +4842,92 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
             return true;
         }
     }
+    std::string server_executable;
+    const bool use_server_executable = resolve_reverse_mcp_executable(effective_cfg, server_executable);
+    diag::log_tagged_fmt("camoufox", "managed_start server_executable_resolve session_id=%s use_exe=%d path=%s",
+        sid.c_str(), static_cast<int>(use_server_executable),
+        server_executable.empty() ? "<empty>" : server_executable.c_str());
+
     std::string python_path = effective_cfg.python_executable;
-    diag::log_tagged_fmt("camoufox", "managed_start python_resolve_begin session_id=%s explicit=%d elapsed_ms=%llu",
-        sid.c_str(), static_cast<int>(!python_path.empty()),
-        static_cast<unsigned long long>(now_ms() - t0));
-    if (python_path.empty() && !ensure_python_available(python_path))
+    if (!use_server_executable && !python_path.empty())
     {
-        std::lock_guard<std::recursive_mutex> lk(session->mtx);
-        session->state = bridge_state_t::error;
-        session->last_error = last_error();
-        if (session->last_error.empty()) session->last_error = "supported Python interpreter not found for Camoufox";
-        diag::log_tagged_fmt("camoufox", "managed_start python_resolve_failed session_id=%s elapsed_ms=%llu err=%s",
-            sid.c_str(), static_cast<unsigned long long>(now_ms() - t0), session->last_error.c_str());
-        return false;
+        std::string reason;
+        if (!system_python_discovery_allowed() && !is_app_controlled_python_path(python_path))
+        {
+            reason = "explicit Python path is outside AiDA-controlled Camoufox runtime roots";
+            diag::log_tagged_fmt("camoufox", "managed_start explicit_python_rejected session_id=%s path=%s reason=%s",
+                sid.c_str(), python_path.c_str(), reason.c_str());
+            python_path.clear();
+        }
+        else if (!supported_camoufox_python(python_path, &reason))
+        {
+            diag::log_tagged_fmt("camoufox", "managed_start explicit_python_rejected session_id=%s path=%s reason=%s",
+                sid.c_str(), python_path.c_str(), reason.c_str());
+            python_path.clear();
+        }
     }
-    diag::log_tagged_fmt("camoufox", "managed_start python_resolve_end session_id=%s python=%s elapsed_ms=%llu",
-        sid.c_str(), python_path.c_str(), static_cast<unsigned long long>(now_ms() - t0));
+    if (!use_server_executable)
+    {
+        diag::log_tagged_fmt("camoufox", "managed_start python_resolve_begin session_id=%s explicit=%d elapsed_ms=%llu",
+            sid.c_str(), static_cast<int>(!python_path.empty()),
+            static_cast<unsigned long long>(now_ms() - t0));
+        if (python_path.empty() && !ensure_python_available(python_path))
+        {
+            std::lock_guard<std::recursive_mutex> lk(session->mtx);
+            session->state = bridge_state_t::error;
+            session->last_error = last_error();
+            if (session->last_error.empty()) session->last_error = install::setup_instructions();
+            diag::log_tagged_fmt("camoufox", "managed_start python_resolve_failed session_id=%s elapsed_ms=%llu err=%s",
+                sid.c_str(), static_cast<unsigned long long>(now_ms() - t0), session->last_error.c_str());
+            return false;
+        }
+        diag::log_tagged_fmt("camoufox", "managed_start python_resolve_end session_id=%s python=%s elapsed_ms=%llu",
+            sid.c_str(), python_path.c_str(), static_cast<unsigned long long>(now_ms() - t0));
+    }
+    if (effective_cfg.browser_executable.empty())
+    {
+        std::string env_browser;
+        if (read_env_path_a("AIDA_CAMOUFOX_EXECUTABLE", env_browser))
+            effective_cfg.browser_executable = env_browser;
+    }
     if (effective_cfg.browser_executable.empty())
     {
         std::string bundled_browser;
         if (find_bundled_camoufox_executable(bundled_browser))
             effective_cfg.browser_executable = bundled_browser;
     }
+    DWORD browser_attr = INVALID_FILE_ATTRIBUTES;
+    if (!effective_cfg.browser_executable.empty())
+        browser_attr = GetFileAttributesW(utf8_to_wide(effective_cfg.browser_executable).c_str());
+    diag::log_tagged_fmt("camoufox", "managed_start browser_executable session_id=%s path=%s exists=%d attr=0x%08lX",
+        sid.c_str(),
+        effective_cfg.browser_executable.empty() ? "<empty>" : effective_cfg.browser_executable.c_str(),
+        static_cast<int>(browser_attr != INVALID_FILE_ATTRIBUTES && (browser_attr & FILE_ATTRIBUTE_DIRECTORY) == 0),
+        static_cast<unsigned long>(browser_attr));
+    if (effective_cfg.browser_executable.empty() || browser_attr == INVALID_FILE_ATTRIBUTES || (browser_attr & FILE_ATTRIBUTE_DIRECTORY) != 0)
+    {
+        std::lock_guard<std::recursive_mutex> lk(session->mtx);
+        session->state = bridge_state_t::error;
+        session->last_error = effective_cfg.browser_executable.empty()
+            ? std::string("Camoufox browser executable not found\n") + install::setup_instructions()
+            : std::string("Configured Camoufox browser executable is unavailable\n") + install::setup_instructions();
+        diag::log_tagged_fmt("camoufox", "managed_start browser_required_failed session_id=%s err=%s",
+            sid.c_str(), session->last_error.c_str());
+        return false;
+    }
     {
         std::lock_guard<std::recursive_mutex> lk(sg().mtx);
         const uint64_t preflight_start_ms = now_ms();
-        diag::log_tagged_fmt("camoufox", "managed_start preflight_begin session_id=%s python=%s browser=%s elapsed_ms=%llu",
-            sid.c_str(), python_path.c_str(),
+        diag::log_tagged_fmt("camoufox", "managed_start preflight_begin session_id=%s command=%s browser=%s elapsed_ms=%llu",
+            sid.c_str(), use_server_executable ? server_executable.c_str() : python_path.c_str(),
             effective_cfg.browser_executable.empty() ? "<empty>" : effective_cfg.browser_executable.c_str(),
             static_cast<unsigned long long>(preflight_start_ms - t0));
-        if (!prepare_install_for_launch_locked(python_path) || !probe_module_installed_locked(python_path) || !preflight_server_entry_locked(python_path, effective_cfg))
+        bool preflight_ok = false;
+        if (use_server_executable)
+            preflight_ok = preflight_server_executable_locked(server_executable);
+        else
+            preflight_ok = prepare_install_for_launch_locked(python_path) && probe_module_installed_locked(python_path) && preflight_server_entry_locked(python_path, effective_cfg);
+        if (!preflight_ok)
         {
             std::lock_guard<std::recursive_mutex> slk(session->mtx);
             session->state = bridge_state_t::error;
@@ -4249,10 +4944,20 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
     mcp_client::server_config_t scfg;
     scfg.name = std::string("camoufox-reverse-") + sid;
     scfg.transport = mcp_client::transport_type_t::stdio;
-    scfg.command = python_path;
-    scfg.args.push_back("-m");
-    scfg.args.push_back(effective_cfg.server_module.empty() ? std::string("camoufox_reverse_mcp") : effective_cfg.server_module);
+    scfg.command = use_server_executable ? server_executable : python_path;
+    if (!use_server_executable)
+    {
+        scfg.args.push_back("-I");
+        scfg.args.push_back("-m");
+        scfg.args.push_back(effective_cfg.server_module.empty() ? std::string("camoufox_reverse_mcp") : effective_cfg.server_module);
+    }
     for (const auto& a : effective_cfg.extra_args) scfg.args.push_back(a);
+    if (use_server_executable)
+        scfg.env["AIDA_CAMOUFOX_MCP_EXECUTABLE"] = server_executable;
+    else
+        scfg.env["AIDA_CAMOUFOX_PYTHON"] = python_path;
+    if (!use_server_executable && system_python_discovery_allowed())
+        scfg.env["AIDA_CAMOUFOX_ALLOW_SYSTEM_PYTHON"] = "1";
     populate_internal_camoufox_env(scfg, sid, effective_cfg.browser_executable, camoufox_debug_log_path());
     scfg.enabled = true;
     scfg.auto_connect = false;
@@ -4270,7 +4975,7 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
         session->generation++;
     }
     diag::log_tagged_fmt("camoufox", "managed_start connect session_id=%s command=%s module=%s env_browser=%d env_workdir=%d env_profile=%d",
-        sid.c_str(), scfg.command.c_str(), scfg.args.size() > 1 ? scfg.args[1].c_str() : "<missing>",
+        sid.c_str(), scfg.command.c_str(), use_server_executable ? "<frozen-executable>" : (scfg.args.size() > 2 ? scfg.args[2].c_str() : "<missing>"),
         static_cast<int>(scfg.env.find("AIDA_CAMOUFOX_EXECUTABLE") != scfg.env.end()),
         static_cast<int>(scfg.env.find("AIDA_CAMOUFOX_WORKING_DIR") != scfg.env.end()),
         static_cast<int>(scfg.env.find("AIDA_CAMOUFOX_PROFILE_ROOT") != scfg.env.end()));
@@ -4284,7 +4989,9 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
     {
         std::lock_guard<std::recursive_mutex> lk(session->mtx);
         session->client = cli;
-        session->server_command = python_path + " -m " + (effective_cfg.server_module.empty() ? std::string("camoufox_reverse_mcp") : effective_cfg.server_module);
+        session->server_command = use_server_executable
+            ? server_executable
+            : python_path + " -m " + (effective_cfg.server_module.empty() ? std::string("camoufox_reverse_mcp") : effective_cfg.server_module);
         session->child_pid = cli->child_process_id();
         session->launched_ms = now_ms();
         session->active_cfg = effective_cfg;

@@ -5,21 +5,25 @@
 #include <bcrypt.h>
 
 #include "collaborator.hpp"
+#include "../../infra/critical_work_queue.hpp"
 #include "../../infra/work_queue.hpp"
-#include "../../infra/win_thread.hpp"
 #include "helpers/diag_log.hpp"
 
 #include "httplib.h"
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <sstream>
+#include <thread>
 #include <unordered_map>
+#include <utility>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "bcrypt.lib")
@@ -59,22 +63,103 @@ struct state_t
 
     std::shared_ptr<httplib::Server>                        http_server;
     SOCKET                                                  http_socket = INVALID_SOCKET;
-    aida::infra::win_thread::joinable_thread_t              http_thread;
     std::atomic<bool>                                       http_thread_alive{false};
+    std::atomic<DWORD>                                      http_worker_tid{0};
+    std::atomic<uint32_t>                                   http_start_state{0};
+    std::atomic<uint32_t>                                   http_sessions_active{0};
+    std::atomic<uint64_t>                                   worker_generation{0};
 
     SOCKET                                                  dns_socket = INVALID_SOCKET;
-    aida::infra::win_thread::joinable_thread_t              dns_thread;
     std::atomic<bool>                                       dns_thread_alive{false};
+    std::atomic<DWORD>                                      dns_worker_tid{0};
 
     SOCKET                                                  smtp_socket = INVALID_SOCKET;
-    aida::infra::win_thread::joinable_thread_t              smtp_thread;
     std::atomic<bool>                                       smtp_thread_alive{false};
+    std::atomic<DWORD>                                      smtp_worker_tid{0};
+    std::atomic<uint32_t>                                   smtp_sessions_active{0};
+
+    std::mutex                                              worker_mtx;
+    std::condition_variable                                 worker_cv;
 
     std::mutex                                              err_mtx;
     std::string                                             last_err;
 };
 
 static state_t g_state;
+
+static uint64_t now_ms();
+
+static void mark_worker_started(std::atomic<bool>& alive, std::atomic<DWORD>& tid)
+{
+    {
+        std::lock_guard<std::mutex> lk(g_state.worker_mtx);
+        tid.store(GetCurrentThreadId(), std::memory_order_release);
+        alive.store(true, std::memory_order_release);
+    }
+    g_state.worker_cv.notify_all();
+}
+
+static void mark_worker_stopped(std::atomic<bool>& alive, std::atomic<DWORD>& tid)
+{
+    {
+        std::lock_guard<std::mutex> lk(g_state.worker_mtx);
+        alive.store(false, std::memory_order_release);
+        tid.store(0, std::memory_order_release);
+    }
+    g_state.worker_cv.notify_all();
+}
+
+struct worker_lifetime_t
+{
+    std::atomic<bool>&  alive;
+    std::atomic<DWORD>& tid;
+
+    worker_lifetime_t(std::atomic<bool>& alive_ref, std::atomic<DWORD>& tid_ref)
+        : alive(alive_ref), tid(tid_ref)
+    {
+        mark_worker_started(alive, tid);
+    }
+
+    ~worker_lifetime_t()
+    {
+        mark_worker_stopped(alive, tid);
+    }
+};
+
+struct active_session_t
+{
+    std::atomic<uint32_t>& counter;
+    const char*            tag;
+    std::string            client;
+    uint16_t               port;
+    uint64_t               started;
+
+    active_session_t(std::atomic<uint32_t>& counter_ref, const char* tag_ref, std::string client_ref, uint16_t port_ref)
+        : counter(counter_ref), tag(tag_ref), client(std::move(client_ref)), port(port_ref), started(0)
+    {
+        started = now_ms();
+        uint32_t active = counter.fetch_add(1, std::memory_order_acq_rel) + 1;
+        ::diag::log_tagged_fmt("collaborator", "%s_enter client=%s:%u active=%u pid=%lu tid=%lu",
+            tag,
+            client.c_str(),
+            static_cast<unsigned>(port),
+            active,
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+    }
+
+    ~active_session_t()
+    {
+        uint32_t active = counter.fetch_sub(1, std::memory_order_acq_rel) - 1;
+        ::diag::log_tagged_fmt("collaborator", "%s_exit client=%s:%u active=%u elapsed_ms=%llu",
+            tag,
+            client.c_str(),
+            static_cast<unsigned>(port),
+            active,
+            static_cast<unsigned long long>(now_ms() - started));
+        g_state.worker_cv.notify_all();
+    }
+};
 
 static void set_last_error(const std::string& msg)
 {
@@ -511,39 +596,90 @@ static SOCKET open_http_listener(const std::string& bind_ip, uint16_t port, uint
     return listen_sock;
 }
 
-static void http_thread_main(SOCKET listen_sock, std::string bind_ip, uint16_t port, uint64_t listener_ready_ms)
+static void http_thread_main(std::string bind_ip, uint16_t port, uint64_t generation, uint64_t post_ms)
 {
     const uint64_t start_ms = now_ms();
-    g_state.http_thread_alive.store(true);
-    ::diag::log_tagged_fmt("collaborator", "http_thread_accept_entry bind=%s:%u socket=0x%llX listener_ready_ms=%llu pid=%lu tid=%lu",
+    worker_lifetime_t worker(g_state.http_thread_alive, g_state.http_worker_tid);
+    ::diag::log_tagged_fmt("collaborator", "http_thread_accept_entry mode=queue bind=%s:%u generation=%llu queued_ms=%llu pid=%lu tid=%lu",
         bind_ip.c_str(),
         static_cast<unsigned>(port),
-        static_cast<unsigned long long>(listen_sock),
-        static_cast<unsigned long long>(listener_ready_ms),
+        static_cast<unsigned long long>(generation),
+        static_cast<unsigned long long>(start_ms >= post_ms ? start_ms - post_ms : 0),
         static_cast<unsigned long>(GetCurrentProcessId()),
         static_cast<unsigned long>(GetCurrentThreadId()));
 
-    if (listen_sock == INVALID_SOCKET) {
+    bool current_generation = generation == g_state.worker_generation.load(std::memory_order_acquire);
+    if (!current_generation || g_state.stop_request.load(std::memory_order_acquire)) {
         g_state.http_alive.store(false);
-        g_state.http_thread_alive.store(false);
-        return;
-    }
-    if (g_state.stop_request.load(std::memory_order_acquire)) {
-        g_state.http_alive.store(false);
-        g_state.http_thread_alive.store(false);
-        ::diag::log_tagged_fmt("collaborator", "http_thread_exit_before_loop bind=%s:%u elapsed_ms=%llu stop_request=1",
+        if (current_generation) {
+            g_state.http_start_state.store(3u, std::memory_order_release);
+            g_state.worker_cv.notify_all();
+        }
+        ::diag::log_tagged_fmt("collaborator", "http_thread_exit_before_open bind=%s:%u generation=%llu current_generation=%llu elapsed_ms=%llu stop_request=%d",
             bind_ip.c_str(),
             static_cast<unsigned>(port),
+            static_cast<unsigned long long>(generation),
+            static_cast<unsigned long long>(g_state.worker_generation.load(std::memory_order_acquire)),
+            static_cast<unsigned long long>(now_ms() - start_ms),
+            g_state.stop_request.load(std::memory_order_acquire) ? 1 : 0);
+        return;
+    }
+
+    g_state.http_start_state.store(1u, std::memory_order_release);
+    g_state.worker_cv.notify_all();
+
+    const uint64_t listener_start_ms = now_ms();
+    SOCKET listen_sock = open_http_listener(bind_ip, port, listener_start_ms);
+    const uint64_t listener_ready_ms = now_ms() - listener_start_ms;
+    if (listen_sock == INVALID_SOCKET) {
+        g_state.http_alive.store(false);
+        current_generation = generation == g_state.worker_generation.load(std::memory_order_acquire);
+        if (current_generation) {
+            g_state.http_start_state.store(3u, std::memory_order_release);
+            g_state.worker_cv.notify_all();
+        }
+        if (current_generation)
+            set_last_error("http_listener_open_failed");
+        ::diag::log_tagged_fmt("collaborator", "http_thread_listener_failed bind=%s:%u generation=%llu elapsed_ms=%llu",
+            bind_ip.c_str(),
+            static_cast<unsigned>(port),
+            static_cast<unsigned long long>(generation),
             static_cast<unsigned long long>(now_ms() - start_ms));
+        return;
+    }
+    current_generation = generation == g_state.worker_generation.load(std::memory_order_acquire);
+    if (!current_generation || g_state.stop_request.load(std::memory_order_acquire)) {
+        closesocket(listen_sock);
+        g_state.http_alive.store(false);
+        if (current_generation) {
+            g_state.http_start_state.store(3u, std::memory_order_release);
+            g_state.worker_cv.notify_all();
+        }
+        ::diag::log_tagged_fmt("collaborator", "http_thread_exit_after_open bind=%s:%u generation=%llu current_generation=%llu socket=0x%llX elapsed_ms=%llu stop_request=%d",
+            bind_ip.c_str(),
+            static_cast<unsigned>(port),
+            static_cast<unsigned long long>(generation),
+            static_cast<unsigned long long>(g_state.worker_generation.load(std::memory_order_acquire)),
+            static_cast<unsigned long long>(listen_sock),
+            static_cast<unsigned long long>(now_ms() - start_ms),
+            g_state.stop_request.load(std::memory_order_acquire) ? 1 : 0);
         return;
     }
 
     {
         std::lock_guard<std::mutex> lk(g_state.mtx);
-        if (g_state.http_socket == INVALID_SOCKET)
-            g_state.http_socket = listen_sock;
+        g_state.http_socket = listen_sock;
     }
     g_state.http_alive.store(true);
+    g_state.http_start_state.store(2u, std::memory_order_release);
+    g_state.worker_cv.notify_all();
+    ::diag::log_tagged_fmt("collaborator", "http_thread_listener_ready bind=%s:%u generation=%llu socket=0x%llX listener_ready_ms=%llu total_ready_ms=%llu",
+        bind_ip.c_str(),
+        static_cast<unsigned>(port),
+        static_cast<unsigned long long>(generation),
+        static_cast<unsigned long long>(listen_sock),
+        static_cast<unsigned long long>(listener_ready_ms),
+        static_cast<unsigned long long>(now_ms() - start_ms));
 
     while (!g_state.stop_request.load(std::memory_order_acquire)) {
         fd_set fds;
@@ -565,14 +701,33 @@ static void http_thread_main(SOCKET listen_sock, std::string bind_ip, uint16_t p
         std::string client_ip = client_ip_to_string(client_addr.sin_addr.s_addr);
         uint16_t client_port = ntohs(client_addr.sin_port);
         auto task = [client_sock, client_ip, client_port]() {
+            active_session_t active(g_state.http_sessions_active, "http_session", client_ip, client_port);
             raw_http_session(client_sock, client_ip, client_port);
         };
-        std::string session_thread_err;
-        if (!aida::infra::win_thread::start_detached(task, &session_thread_err,
-                aida::infra::win_thread::fixture_stack_reserve, "collaborator.http.session")) {
-            ::diag::log_tagged_fmt("collaborator", "http_session_thread_failed client=%s:%u err=%s",
-                client_ip.c_str(), static_cast<unsigned>(client_port), session_thread_err.c_str());
+        ::diag::log_tagged_fmt("collaborator", "http_session_dispatch_begin client=%s:%u active=%u pid=%lu tid=%lu",
+            client_ip.c_str(),
+            static_cast<unsigned>(client_port),
+            g_state.http_sessions_active.load(std::memory_order_acquire),
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        bool spawned = false;
+        try {
+            std::thread(task).detach();
+            spawned = true;
+        } catch (...) {
+            spawned = false;
+        }
+        if (!spawned) {
+            ::diag::log_tagged_fmt("collaborator", "http_session_thread_failed client=%s:%u fallback=inline active=%u",
+                client_ip.c_str(),
+                static_cast<unsigned>(client_port),
+                g_state.http_sessions_active.load(std::memory_order_acquire));
             task();
+        } else {
+            ::diag::log_tagged_fmt("collaborator", "http_session_thread_started client=%s:%u active=%u",
+                client_ip.c_str(),
+                static_cast<unsigned>(client_port),
+                g_state.http_sessions_active.load(std::memory_order_acquire));
         }
     }
 
@@ -588,7 +743,7 @@ static void http_thread_main(SOCKET listen_sock, std::string bind_ip, uint16_t p
     if (close_listen_sock)
         closesocket(listen_sock);
     g_state.http_alive.store(false);
-    g_state.http_thread_alive.store(false);
+    g_state.worker_cv.notify_all();
     ::diag::log_tagged_fmt("collaborator",
         "http_thread_exit bind=%s:%u listen_ok=1 elapsed_ms=%llu stop_request=%d",
         bind_ip.c_str(),
@@ -698,14 +853,34 @@ static std::vector<uint8_t> build_dns_answer(const dns_parse_result_t& q, const 
     return out;
 }
 
-static void dns_thread_main(std::string bind_ip, uint16_t port, std::string public_host, std::string public_ip)
+static void dns_thread_main(std::string bind_ip, uint16_t port, std::string public_host, std::string public_ip, uint64_t generation, uint64_t post_ms)
 {
-    g_state.dns_thread_alive.store(true);
+    const uint64_t start_ms = now_ms();
+    worker_lifetime_t worker(g_state.dns_thread_alive, g_state.dns_worker_tid);
+    ::diag::log_tagged_fmt("collaborator", "dns_thread_enter mode=queue bind=%s:%u host=%s ip=%s generation=%llu queued_ms=%llu pid=%lu tid=%lu",
+        bind_ip.c_str(),
+        static_cast<unsigned>(port),
+        public_host.c_str(),
+        public_ip.c_str(),
+        static_cast<unsigned long long>(generation),
+        static_cast<unsigned long long>(start_ms >= post_ms ? start_ms - post_ms : 0),
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        static_cast<unsigned long>(GetCurrentThreadId()));
+    if (generation != g_state.worker_generation.load(std::memory_order_acquire) ||
+        g_state.stop_request.load(std::memory_order_acquire)) {
+        ::diag::log_tagged_fmt("collaborator", "dns_thread_exit_before_open bind=%s:%u generation=%llu current_generation=%llu elapsed_ms=%llu stop_request=%d",
+            bind_ip.c_str(),
+            static_cast<unsigned>(port),
+            static_cast<unsigned long long>(generation),
+            static_cast<unsigned long long>(g_state.worker_generation.load(std::memory_order_acquire)),
+            static_cast<unsigned long long>(now_ms() - start_ms),
+            g_state.stop_request.load(std::memory_order_acquire) ? 1 : 0);
+        return;
+    }
 
     SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sock == INVALID_SOCKET) {
         ::diag::log_tagged_fmt("collaborator", "dns_socket_create_failed err=%d", WSAGetLastError());
-        g_state.dns_thread_alive.store(false);
         return;
     }
 
@@ -723,7 +898,6 @@ static void dns_thread_main(std::string bind_ip, uint16_t port, std::string publ
         int err = WSAGetLastError();
         ::diag::log_tagged_fmt("collaborator", "dns_bind_failed addr=%s:%u err=%d", bind_ip.c_str(), port, err);
         closesocket(sock);
-        g_state.dns_thread_alive.store(false);
         return;
     }
 
@@ -811,8 +985,9 @@ static void dns_thread_main(std::string bind_ip, uint16_t port, std::string publ
     }
     closesocket(sock);
     g_state.dns_alive.store(false);
-    g_state.dns_thread_alive.store(false);
-    ::diag::log_tagged("collaborator", "dns_thread_exit");
+    ::diag::log_tagged_fmt("collaborator", "dns_thread_exit elapsed_ms=%llu stop_request=%d",
+        static_cast<unsigned long long>(now_ms() - start_ms),
+        g_state.stop_request.load(std::memory_order_acquire) ? 1 : 0);
 }
 
 static bool smtp_send_line(SOCKET s, const char* text)
@@ -961,14 +1136,34 @@ static void smtp_session(SOCKET client_sock, std::string client_ip, uint16_t cli
     closesocket(client_sock);
 }
 
-static void smtp_thread_main(std::string bind_ip, uint16_t port, std::string public_host, int max_message)
+static void smtp_thread_main(std::string bind_ip, uint16_t port, std::string public_host, int max_message, uint64_t generation, uint64_t post_ms)
 {
-    g_state.smtp_thread_alive.store(true);
+    const uint64_t start_ms = now_ms();
+    worker_lifetime_t worker(g_state.smtp_thread_alive, g_state.smtp_worker_tid);
+    ::diag::log_tagged_fmt("collaborator", "smtp_thread_enter mode=queue bind=%s:%u host=%s max_message=%d generation=%llu queued_ms=%llu pid=%lu tid=%lu",
+        bind_ip.c_str(),
+        static_cast<unsigned>(port),
+        public_host.c_str(),
+        max_message,
+        static_cast<unsigned long long>(generation),
+        static_cast<unsigned long long>(start_ms >= post_ms ? start_ms - post_ms : 0),
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        static_cast<unsigned long>(GetCurrentThreadId()));
+    if (generation != g_state.worker_generation.load(std::memory_order_acquire) ||
+        g_state.stop_request.load(std::memory_order_acquire)) {
+        ::diag::log_tagged_fmt("collaborator", "smtp_thread_exit_before_open bind=%s:%u generation=%llu current_generation=%llu elapsed_ms=%llu stop_request=%d",
+            bind_ip.c_str(),
+            static_cast<unsigned>(port),
+            static_cast<unsigned long long>(generation),
+            static_cast<unsigned long long>(g_state.worker_generation.load(std::memory_order_acquire)),
+            static_cast<unsigned long long>(now_ms() - start_ms),
+            g_state.stop_request.load(std::memory_order_acquire) ? 1 : 0);
+        return;
+    }
 
     SOCKET listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (listen_sock == INVALID_SOCKET) {
         ::diag::log_tagged_fmt("collaborator", "smtp_socket_create_failed err=%d", WSAGetLastError());
-        g_state.smtp_thread_alive.store(false);
         return;
     }
 
@@ -986,7 +1181,6 @@ static void smtp_thread_main(std::string bind_ip, uint16_t port, std::string pub
         int err = WSAGetLastError();
         ::diag::log_tagged_fmt("collaborator", "smtp_bind_failed addr=%s:%u err=%d", bind_ip.c_str(), port, err);
         closesocket(listen_sock);
-        g_state.smtp_thread_alive.store(false);
         return;
     }
 
@@ -994,7 +1188,6 @@ static void smtp_thread_main(std::string bind_ip, uint16_t port, std::string pub
         int err = WSAGetLastError();
         ::diag::log_tagged_fmt("collaborator", "smtp_listen_failed err=%d", err);
         closesocket(listen_sock);
-        g_state.smtp_thread_alive.store(false);
         return;
     }
 
@@ -1026,9 +1219,29 @@ static void smtp_thread_main(std::string bind_ip, uint16_t port, std::string pub
 
         std::string pub_host_copy = public_host;
         int max_msg = max_message;
-        work_queue::post([client_sock, client_ip, client_port, pub_host_copy, max_msg]() {
+        auto task = [client_sock, client_ip, client_port, pub_host_copy, max_msg]() {
+            active_session_t active(g_state.smtp_sessions_active, "smtp_session", client_ip, client_port);
             smtp_session(client_sock, client_ip, client_port, pub_host_copy, max_msg);
-        });
+        };
+        ::diag::log_tagged_fmt("collaborator", "smtp_session_post_begin client=%s:%u active=%u pid=%lu tid=%lu",
+            client_ip.c_str(),
+            static_cast<unsigned>(client_port),
+            g_state.smtp_sessions_active.load(std::memory_order_acquire),
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        const bool posted = work_queue::post(task);
+        if (!posted) {
+            ::diag::log_tagged_fmt("collaborator", "smtp_session_post_failed client=%s:%u fallback=inline active=%u",
+                client_ip.c_str(),
+                static_cast<unsigned>(client_port),
+                g_state.smtp_sessions_active.load(std::memory_order_acquire));
+            task();
+        } else {
+            ::diag::log_tagged_fmt("collaborator", "smtp_session_posted client=%s:%u active=%u",
+                client_ip.c_str(),
+                static_cast<unsigned>(client_port),
+                g_state.smtp_sessions_active.load(std::memory_order_acquire));
+        }
     }
 
     {
@@ -1037,8 +1250,9 @@ static void smtp_thread_main(std::string bind_ip, uint16_t port, std::string pub
     }
     closesocket(listen_sock);
     g_state.smtp_alive.store(false);
-    g_state.smtp_thread_alive.store(false);
-    ::diag::log_tagged("collaborator", "smtp_thread_exit");
+    ::diag::log_tagged_fmt("collaborator", "smtp_thread_exit elapsed_ms=%llu stop_request=%d",
+        static_cast<unsigned long long>(now_ms() - start_ms),
+        g_state.stop_request.load(std::memory_order_acquire) ? 1 : 0);
 }
 
 static std::string generate_token_internal()
@@ -1080,6 +1294,9 @@ bool start(const collaborator_config_t& cfg)
     }
 
     g_state.stop_request.store(false);
+    const uint64_t generation = g_state.worker_generation.fetch_add(1u, std::memory_order_acq_rel) + 1u;
+    diag::log_tagged_fmt("collaborator", "start generation=%llu",
+        static_cast<unsigned long long>(generation));
 
     {
         std::lock_guard<std::mutex> lk(g_state.mtx);
@@ -1105,58 +1322,122 @@ bool start(const collaborator_config_t& cfg)
         std::string bind_ip = cfg.bind_ip;
         uint16_t port = cfg.http_port;
         g_state.http_thread_alive.store(false);
+        g_state.http_worker_tid.store(0);
+        g_state.http_start_state.store(0u, std::memory_order_release);
+        g_state.http_sessions_active.store(0);
         g_state.http_alive.store(false);
-        std::string thread_err;
         DWORD thread_start_tick = GetTickCount();
-        const uint64_t listener_start_ms = now_ms();
-        SOCKET listen_sock = open_http_listener(bind_ip, port, listener_start_ms);
-        if (listen_sock == INVALID_SOCKET) {
-            g_state.http_alive.store(false);
-            g_state.http_thread_alive.store(false);
-            set_last_error("http_listener_open_failed");
-            stop();
-            return false;
-        }
-        {
-            std::lock_guard<std::mutex> lk(g_state.mtx);
-            g_state.http_socket = listen_sock;
-        }
-        g_state.http_alive.store(true);
-        const uint64_t listener_ready_ms = now_ms() - listener_start_ms;
-        diag::log_tagged_fmt("collaborator", "http_thread_start requested bind=%s:%u socket=0x%llX listener_ready_ms=%llu host_pid=%lu host_tid=%lu",
+        const uint64_t post_ms = now_ms();
+        const auto cq_before = critical_work_queue::stats();
+        const auto wq_before = work_queue::stats();
+        diag::log_tagged_fmt("collaborator",
+            "http_thread_post requested bind=%s:%u generation=%llu host_pid=%lu host_tid=%lu cq_alive=%d cq_shutdown=%d cq_pending=%llu cq_active=%u cq_started=%llu cq_finished=%llu wq_alive=%d wq_shutdown=%d wq_pending=%llu wq_active=%u wq_started=%llu wq_finished=%llu",
             bind_ip.c_str(),
             port,
-            static_cast<unsigned long long>(listen_sock),
-            static_cast<unsigned long long>(listener_ready_ms),
+            static_cast<unsigned long long>(generation),
             static_cast<unsigned long>(GetCurrentProcessId()),
-            static_cast<unsigned long>(GetCurrentThreadId()));
-        g_state.http_thread_alive.store(true);
-        if (!g_state.http_thread.start([listen_sock, bind_ip, port, listener_ready_ms]() {
-            http_thread_main(listen_sock, bind_ip, port, listener_ready_ms);
-        }, &thread_err, aida::infra::win_thread::default_stack_reserve, "collaborator.http")) {
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            cq_before.alive ? 1 : 0,
+            cq_before.shutting_down ? 1 : 0,
+            static_cast<unsigned long long>(cq_before.pending),
+            cq_before.active,
+            static_cast<unsigned long long>(cq_before.started),
+            static_cast<unsigned long long>(cq_before.finished),
+            wq_before.alive ? 1 : 0,
+            wq_before.shutting_down ? 1 : 0,
+            static_cast<unsigned long long>(wq_before.pending),
+            wq_before.active,
+            static_cast<unsigned long long>(wq_before.started),
+            static_cast<unsigned long long>(wq_before.finished));
+        bool posted = false;
+        bool posted_critical = false;
+        bool posted_work = false;
+        try {
+            std::function<void()> task = [bind_ip, port, generation, post_ms]() {
+                http_thread_main(bind_ip, port, generation, post_ms);
+            };
+            posted_critical = critical_work_queue::post(task);
+            if (!posted_critical)
+                posted_work = work_queue::post(std::move(task));
+            posted = posted_critical || posted_work;
+        } catch (...) {
+            posted = false;
+        }
+        if (!posted) {
             g_state.http_thread_alive.store(false);
             g_state.http_alive.store(false);
-            {
-                std::lock_guard<std::mutex> lk(g_state.mtx);
-                if (g_state.http_socket == listen_sock) {
-                    closesocket(g_state.http_socket);
-                    g_state.http_socket = INVALID_SOCKET;
-                }
-            }
-            diag::log_tagged_fmt("collaborator", "http_thread_failed err=%s elapsed_ms=%lu bind=%s:%u",
-                thread_err.c_str(),
+            const auto cq_after = critical_work_queue::stats();
+            const auto wq_after = work_queue::stats();
+            diag::log_tagged_fmt("collaborator",
+                "http_thread_post_failed elapsed_ms=%lu bind=%s:%u generation=%llu cq_alive=%d cq_shutdown=%d cq_pending=%llu cq_active=%u cq_rejected=%llu wq_alive=%d wq_shutdown=%d wq_pending=%llu wq_active=%u wq_rejected=%llu",
                 static_cast<unsigned long>(GetTickCount() - thread_start_tick),
                 bind_ip.c_str(),
-                port);
-            set_last_error(std::string("http_thread_failed: ") + thread_err);
+                port,
+                static_cast<unsigned long long>(generation),
+                cq_after.alive ? 1 : 0,
+                cq_after.shutting_down ? 1 : 0,
+                static_cast<unsigned long long>(cq_after.pending),
+                cq_after.active,
+                static_cast<unsigned long long>(cq_after.rejected),
+                wq_after.alive ? 1 : 0,
+                wq_after.shutting_down ? 1 : 0,
+                static_cast<unsigned long long>(wq_after.pending),
+                wq_after.active,
+                static_cast<unsigned long long>(wq_after.rejected));
+            set_last_error("http_thread_post_failed");
             stop();
             return false;
         }
-        ::diag::log_tagged_fmt("collaborator", "http_started bind=%s:%u ready=1 alive=%d thread_alive=%d listener_ready_ms=%llu",
+        diag::log_tagged_fmt("collaborator",
+            "http_thread_posted queue=%s bind=%s:%u generation=%llu elapsed_ms=%lu",
+            posted_critical ? "critical_work_queue" : "work_queue",
+            bind_ip.c_str(),
+            port,
+            static_cast<unsigned long long>(generation),
+            static_cast<unsigned long>(GetTickCount() - thread_start_tick));
+        {
+            std::unique_lock<std::mutex> lk(g_state.worker_mtx);
+            const bool ready = g_state.worker_cv.wait_for(
+                lk,
+                std::chrono::milliseconds(3000),
+                []() {
+                    return g_state.http_start_state.load(std::memory_order_acquire) >= 2u;
+                });
+            const uint32_t start_state = g_state.http_start_state.load(std::memory_order_acquire);
+            if (!ready || start_state != 2u || !g_state.http_alive.load(std::memory_order_acquire)) {
+                const auto cq_after = critical_work_queue::stats();
+                const auto wq_after = work_queue::stats();
+                diag::log_tagged_fmt("collaborator",
+                    "http_thread_ready_wait_failed ready=%d state=%u alive=%d thread_alive=%d tid=%lu elapsed_ms=%lu bind=%s:%u generation=%llu queue=%s cq_pending=%llu cq_active=%u cq_started=%llu cq_finished=%llu wq_pending=%llu wq_active=%u wq_started=%llu wq_finished=%llu",
+                    ready ? 1 : 0,
+                    start_state,
+                    g_state.http_alive.load(std::memory_order_acquire) ? 1 : 0,
+                    g_state.http_thread_alive.load(std::memory_order_acquire) ? 1 : 0,
+                    static_cast<unsigned long>(g_state.http_worker_tid.load(std::memory_order_acquire)),
+                    static_cast<unsigned long>(GetTickCount() - thread_start_tick),
+                    bind_ip.c_str(),
+                    port,
+                    static_cast<unsigned long long>(generation),
+                    posted_critical ? "critical_work_queue" : "work_queue",
+                    static_cast<unsigned long long>(cq_after.pending),
+                    cq_after.active,
+                    static_cast<unsigned long long>(cq_after.started),
+                    static_cast<unsigned long long>(cq_after.finished),
+                    static_cast<unsigned long long>(wq_after.pending),
+                    wq_after.active,
+                    static_cast<unsigned long long>(wq_after.started),
+                    static_cast<unsigned long long>(wq_after.finished));
+                lk.unlock();
+                set_last_error(start_state == 3u ? "http_listener_open_failed" : "http_thread_enter_wait_failed");
+                stop();
+                return false;
+            }
+        }
+        ::diag::log_tagged_fmt("collaborator", "http_started mode=queue bind=%s:%u ready=1 alive=%d thread_alive=%d generation=%llu",
             bind_ip.c_str(), port,
             g_state.http_alive.load() ? 1 : 0,
             g_state.http_thread_alive.load() ? 1 : 0,
-            static_cast<unsigned long long>(listener_ready_ms));
+            static_cast<unsigned long long>(generation));
     }
 
     if (cfg.enable_dns) {
@@ -1165,34 +1446,72 @@ bool start(const collaborator_config_t& cfg)
         std::string public_host = cfg.public_host;
         std::string public_ip = cfg.public_ip;
         g_state.dns_thread_alive.store(false);
-        std::string thread_err;
+        g_state.dns_worker_tid.store(0);
         DWORD thread_start_tick = GetTickCount();
-        diag::log_tagged_fmt("collaborator", "dns_thread_start requested bind=%s:%u host=%s ip=%s host_pid=%lu host_tid=%lu",
+        const uint64_t post_ms = now_ms();
+        const auto cq_before = critical_work_queue::stats();
+        const auto wq_before = work_queue::stats();
+        diag::log_tagged_fmt("collaborator",
+            "dns_thread_post requested bind=%s:%u host=%s ip=%s generation=%llu host_pid=%lu host_tid=%lu cq_pending=%llu cq_active=%u wq_pending=%llu wq_active=%u",
             bind_ip.c_str(),
             port,
             public_host.c_str(),
             public_ip.c_str(),
+            static_cast<unsigned long long>(generation),
             static_cast<unsigned long>(GetCurrentProcessId()),
-            static_cast<unsigned long>(GetCurrentThreadId()));
-        if (!g_state.dns_thread.start([bind_ip, port, public_host, public_ip]() {
-            dns_thread_main(bind_ip, port, public_host, public_ip);
-        }, &thread_err, aida::infra::win_thread::default_stack_reserve, "collaborator.dns")) {
-            diag::log_tagged_fmt("collaborator", "dns_thread_failed err=%s elapsed_ms=%lu bind=%s:%u",
-                thread_err.c_str(),
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            static_cast<unsigned long long>(cq_before.pending),
+            cq_before.active,
+            static_cast<unsigned long long>(wq_before.pending),
+            wq_before.active);
+        bool posted = false;
+        bool posted_critical = false;
+        try {
+            std::function<void()> task = [bind_ip, port, public_host, public_ip, generation, post_ms]() {
+                dns_thread_main(bind_ip, port, public_host, public_ip, generation, post_ms);
+            };
+            posted_critical = critical_work_queue::post(task);
+            if (!posted_critical)
+                posted = work_queue::post(std::move(task));
+            else
+                posted = true;
+        } catch (...) {
+            posted = false;
+        }
+        if (!posted) {
+            const auto cq_after = critical_work_queue::stats();
+            const auto wq_after = work_queue::stats();
+            diag::log_tagged_fmt("collaborator",
+                "dns_thread_post_failed elapsed_ms=%lu bind=%s:%u generation=%llu cq_pending=%llu cq_active=%u cq_rejected=%llu wq_pending=%llu wq_active=%u wq_rejected=%llu",
                 static_cast<unsigned long>(GetTickCount() - thread_start_tick),
                 bind_ip.c_str(),
-                port);
-            set_last_error(std::string("dns_thread_failed: ") + thread_err);
+                port,
+                static_cast<unsigned long long>(generation),
+                static_cast<unsigned long long>(cq_after.pending),
+                cq_after.active,
+                static_cast<unsigned long long>(cq_after.rejected),
+                static_cast<unsigned long long>(wq_after.pending),
+                wq_after.active,
+                static_cast<unsigned long long>(wq_after.rejected));
+            set_last_error("dns_thread_post_failed");
             stop();
             return false;
         }
+        diag::log_tagged_fmt("collaborator",
+            "dns_thread_posted queue=%s bind=%s:%u generation=%llu elapsed_ms=%lu",
+            posted_critical ? "critical_work_queue" : "work_queue",
+            bind_ip.c_str(),
+            port,
+            static_cast<unsigned long long>(generation),
+            static_cast<unsigned long>(GetTickCount() - thread_start_tick));
         DWORD wait_iter = 0;
         while (!g_state.dns_alive.load() && wait_iter < 60) {
             Sleep(50);
             ++wait_iter;
         }
-        ::diag::log_tagged_fmt("collaborator", "dns_started bind=%s:%u alive=%d",
-            bind_ip.c_str(), port, g_state.dns_alive.load() ? 1 : 0);
+        ::diag::log_tagged_fmt("collaborator", "dns_started bind=%s:%u alive=%d generation=%llu",
+            bind_ip.c_str(), port, g_state.dns_alive.load() ? 1 : 0,
+            static_cast<unsigned long long>(generation));
         if (!g_state.dns_alive.load()) {
             set_last_error("dns_thread_not_ready");
             stop();
@@ -1206,34 +1525,73 @@ bool start(const collaborator_config_t& cfg)
         std::string public_host = cfg.public_host;
         int max_msg = cfg.smtp_max_message;
         g_state.smtp_thread_alive.store(false);
-        std::string thread_err;
+        g_state.smtp_worker_tid.store(0);
+        g_state.smtp_sessions_active.store(0);
         DWORD thread_start_tick = GetTickCount();
-        diag::log_tagged_fmt("collaborator", "smtp_thread_start requested bind=%s:%u host=%s max_msg=%d host_pid=%lu host_tid=%lu",
+        const uint64_t post_ms = now_ms();
+        const auto cq_before = critical_work_queue::stats();
+        const auto wq_before = work_queue::stats();
+        diag::log_tagged_fmt("collaborator",
+            "smtp_thread_post requested bind=%s:%u host=%s max_msg=%d generation=%llu host_pid=%lu host_tid=%lu cq_pending=%llu cq_active=%u wq_pending=%llu wq_active=%u",
             bind_ip.c_str(),
             port,
             public_host.c_str(),
             max_msg,
+            static_cast<unsigned long long>(generation),
             static_cast<unsigned long>(GetCurrentProcessId()),
-            static_cast<unsigned long>(GetCurrentThreadId()));
-        if (!g_state.smtp_thread.start([bind_ip, port, public_host, max_msg]() {
-            smtp_thread_main(bind_ip, port, public_host, max_msg);
-        }, &thread_err, aida::infra::win_thread::default_stack_reserve, "collaborator.smtp")) {
-            diag::log_tagged_fmt("collaborator", "smtp_thread_failed err=%s elapsed_ms=%lu bind=%s:%u",
-                thread_err.c_str(),
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            static_cast<unsigned long long>(cq_before.pending),
+            cq_before.active,
+            static_cast<unsigned long long>(wq_before.pending),
+            wq_before.active);
+        bool posted = false;
+        bool posted_critical = false;
+        try {
+            std::function<void()> task = [bind_ip, port, public_host, max_msg, generation, post_ms]() {
+                smtp_thread_main(bind_ip, port, public_host, max_msg, generation, post_ms);
+            };
+            posted_critical = critical_work_queue::post(task);
+            if (!posted_critical)
+                posted = work_queue::post(std::move(task));
+            else
+                posted = true;
+        } catch (...) {
+            posted = false;
+        }
+        if (!posted) {
+            const auto cq_after = critical_work_queue::stats();
+            const auto wq_after = work_queue::stats();
+            diag::log_tagged_fmt("collaborator",
+                "smtp_thread_post_failed elapsed_ms=%lu bind=%s:%u generation=%llu cq_pending=%llu cq_active=%u cq_rejected=%llu wq_pending=%llu wq_active=%u wq_rejected=%llu",
                 static_cast<unsigned long>(GetTickCount() - thread_start_tick),
                 bind_ip.c_str(),
-                port);
-            set_last_error(std::string("smtp_thread_failed: ") + thread_err);
+                port,
+                static_cast<unsigned long long>(generation),
+                static_cast<unsigned long long>(cq_after.pending),
+                cq_after.active,
+                static_cast<unsigned long long>(cq_after.rejected),
+                static_cast<unsigned long long>(wq_after.pending),
+                wq_after.active,
+                static_cast<unsigned long long>(wq_after.rejected));
+            set_last_error("smtp_thread_post_failed");
             stop();
             return false;
         }
+        diag::log_tagged_fmt("collaborator",
+            "smtp_thread_posted queue=%s bind=%s:%u generation=%llu elapsed_ms=%lu",
+            posted_critical ? "critical_work_queue" : "work_queue",
+            bind_ip.c_str(),
+            port,
+            static_cast<unsigned long long>(generation),
+            static_cast<unsigned long>(GetTickCount() - thread_start_tick));
         DWORD wait_iter = 0;
         while (!g_state.smtp_alive.load() && wait_iter < 60) {
             Sleep(50);
             ++wait_iter;
         }
-        ::diag::log_tagged_fmt("collaborator", "smtp_started bind=%s:%u alive=%d",
-            bind_ip.c_str(), port, g_state.smtp_alive.load() ? 1 : 0);
+        ::diag::log_tagged_fmt("collaborator", "smtp_started bind=%s:%u alive=%d generation=%llu",
+            bind_ip.c_str(), port, g_state.smtp_alive.load() ? 1 : 0,
+            static_cast<unsigned long long>(generation));
         if (!g_state.smtp_alive.load()) {
             set_last_error("smtp_thread_not_ready");
             stop();
@@ -1259,6 +1617,9 @@ void stop()
     }
 
     g_state.stop_request.store(true);
+    const uint64_t stop_generation = g_state.worker_generation.fetch_add(1u, std::memory_order_acq_rel) + 1u;
+    diag::log_tagged_fmt("collaborator", "stop generation=%llu",
+        static_cast<unsigned long long>(stop_generation));
 
     const bool http_thread_alive = g_state.http_thread_alive.load();
     const bool dns_thread_alive = g_state.dns_thread_alive.load();
@@ -1300,30 +1661,54 @@ void stop()
         }
     }
 
-    if (g_state.http_thread.joinable()) {
-        diag::log_tagged_fmt("collaborator", "stop http_join begin tid=%u", g_state.http_thread.id());
-        bool joined = g_state.http_thread.join_for(1000);
-        diag::log_tagged_fmt("collaborator", "stop http_join end joined=%d thread_alive=%d",
-            joined ? 1 : 0, g_state.http_thread_alive.load() ? 1 : 0);
-        if (!joined)
-            g_state.http_thread.detach();
-    }
-    if (g_state.dns_thread.joinable())  {
-        diag::log_tagged_fmt("collaborator", "stop dns_join begin tid=%u", g_state.dns_thread.id());
-        bool joined = g_state.dns_thread.join_for(1000);
-        diag::log_tagged_fmt("collaborator", "stop dns_join end joined=%d thread_alive=%d",
-            joined ? 1 : 0, g_state.dns_thread_alive.load() ? 1 : 0);
-        if (!joined)
-            g_state.dns_thread.detach();
-    }
-    if (g_state.smtp_thread.joinable()) {
-        diag::log_tagged_fmt("collaborator", "stop smtp_join begin tid=%u", g_state.smtp_thread.id());
-        bool joined = g_state.smtp_thread.join_for(1000);
-        diag::log_tagged_fmt("collaborator", "stop smtp_join end joined=%d thread_alive=%d",
-            joined ? 1 : 0, g_state.smtp_thread_alive.load() ? 1 : 0);
-        if (!joined)
-            g_state.smtp_thread.detach();
-    }
+    auto wait_worker = [](const char* name, std::atomic<bool>& alive, std::atomic<DWORD>& tid, DWORD timeout_ms) {
+        const DWORD tid_snapshot = tid.load(std::memory_order_acquire);
+        diag::log_tagged_fmt("collaborator", "stop %s_wait begin tid=%lu timeout_ms=%lu alive=%d",
+            name,
+            static_cast<unsigned long>(tid_snapshot),
+            static_cast<unsigned long>(timeout_ms),
+            alive.load(std::memory_order_acquire) ? 1 : 0);
+        std::unique_lock<std::mutex> lk(g_state.worker_mtx);
+        const bool stopped = g_state.worker_cv.wait_for(
+            lk,
+            std::chrono::milliseconds(timeout_ms),
+            [&alive]() { return !alive.load(std::memory_order_acquire); });
+        diag::log_tagged_fmt("collaborator", "stop %s_wait end stopped=%d alive=%d tid=%lu",
+            name,
+            stopped ? 1 : 0,
+            alive.load(std::memory_order_acquire) ? 1 : 0,
+            static_cast<unsigned long>(tid.load(std::memory_order_acquire)));
+        return stopped;
+    };
+
+    auto wait_sessions = [](const char* name, std::atomic<uint32_t>& active, DWORD timeout_ms) {
+        const uint32_t initial = active.load(std::memory_order_acquire);
+        diag::log_tagged_fmt("collaborator", "stop %s_wait begin active=%u timeout_ms=%lu",
+            name,
+            initial,
+            static_cast<unsigned long>(timeout_ms));
+        std::unique_lock<std::mutex> lk(g_state.worker_mtx);
+        const bool drained = g_state.worker_cv.wait_for(
+            lk,
+            std::chrono::milliseconds(timeout_ms),
+            [&active]() { return active.load(std::memory_order_acquire) == 0; });
+        diag::log_tagged_fmt("collaborator", "stop %s_wait end drained=%d active=%u",
+            name,
+            drained ? 1 : 0,
+            active.load(std::memory_order_acquire));
+        return drained;
+    };
+
+    if (http_thread_alive)
+        wait_worker("http_worker", g_state.http_thread_alive, g_state.http_worker_tid, 1500);
+    if (dns_thread_alive)
+        wait_worker("dns_worker", g_state.dns_thread_alive, g_state.dns_worker_tid, 1500);
+    if (smtp_thread_alive)
+        wait_worker("smtp_worker", g_state.smtp_thread_alive, g_state.smtp_worker_tid, 1500);
+    if (g_state.http_sessions_active.load(std::memory_order_acquire) != 0)
+        wait_sessions("http_sessions", g_state.http_sessions_active, 1500);
+    if (g_state.smtp_sessions_active.load(std::memory_order_acquire) != 0)
+        wait_sessions("smtp_sessions", g_state.smtp_sessions_active, 1500);
 
     g_state.http_server.reset();
 

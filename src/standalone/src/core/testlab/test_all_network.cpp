@@ -17,7 +17,7 @@
 #include "../network/http2_session.hpp"
 #include "../network/burp/match_replace.hpp"
 #include "../infra/critical_work_queue.hpp"
-#include "../infra/win_thread.hpp"
+#include "../infra/work_queue.hpp"
 #include "../runtime/standalone_driver.hpp"
 #include "net_security.hpp"
 #include "../../helpers/diag_log.hpp"
@@ -111,7 +111,7 @@ namespace {
             result.win32_error = GetLastError();
             const ULONGLONG now = GetTickCount64();
             result.elapsed_ms = static_cast<unsigned long long>(now >= start ? now - start : 0);
-            log_msg(hf, tag, "BOUNDED-THREAD-START-FAIL -- op=%s gle=%lu elapsed_ms=%llu exception=%s",
+            log_msg(hf, tag, "BOUNDED-TASK-INIT-FAIL -- op=%s gle=%lu elapsed_ms=%llu exception=%s",
                 op, static_cast<unsigned long>(result.win32_error), result.elapsed_ms, result.exception.c_str());
             return result;
         } catch (...) {
@@ -121,12 +121,11 @@ namespace {
             result.win32_error = GetLastError();
             const ULONGLONG now = GetTickCount64();
             result.elapsed_ms = static_cast<unsigned long long>(now >= start ? now - start : 0);
-            log_msg(hf, tag, "BOUNDED-THREAD-START-FAIL -- op=%s gle=%lu elapsed_ms=%llu exception=%s",
+            log_msg(hf, tag, "BOUNDED-TASK-INIT-FAIL -- op=%s gle=%lu elapsed_ms=%llu exception=%s",
                 op, static_cast<unsigned long>(result.win32_error), result.elapsed_ms, result.exception.c_str());
             return result;
         }
-        std::string thread_err;
-        const bool started = aida::infra::win_thread::start_detached([promise, start, tag, op, task_ptr]() mutable {
+        const bool started = work_queue::post([promise, start, tag, op, task_ptr]() mutable {
             bounded_bool_result_t result;
             result.worker_pid = static_cast<unsigned long>(GetCurrentProcessId());
             result.worker_tid = static_cast<unsigned long>(GetCurrentThreadId());
@@ -148,15 +147,15 @@ namespace {
                 promise->set_value(std::move(result));
             } catch (...) {
             }
-        }, &thread_err, aida::infra::win_thread::default_stack_reserve, op);
+        });
         if (!started) {
             bounded_bool_result_t result;
             result.threw = true;
-            result.exception = thread_err.empty() ? "thread_start_failed" : thread_err;
-            result.win32_error = GetLastError();
+            result.exception = "work_queue_post_failed";
+            result.win32_error = ERROR_NOT_READY;
             const ULONGLONG now = GetTickCount64();
             result.elapsed_ms = static_cast<unsigned long long>(now >= start ? now - start : 0);
-            log_msg(hf, tag, "BOUNDED-THREAD-START-FAIL -- op=%s gle=%lu elapsed_ms=%llu exception=%s",
+            log_msg(hf, tag, "BOUNDED-WORK-QUEUE-POST-FAIL -- op=%s gle=%lu elapsed_ms=%llu exception=%s",
                 op, static_cast<unsigned long>(result.win32_error), result.elapsed_ms, result.exception.c_str());
             return result;
         }
@@ -1793,20 +1792,22 @@ namespace {
             !status.runtime_validation_performed &&
             !status.runtime_validation_valid &&
             status.prepared &&
-            status.current_user_ca_trusted &&
+            status.trust_readiness_verified &&
             status.ok;
-        if (profile_ready && status.firefox_detected) {
-            log_msg(hf, tag, "PASS -- Firefox profile readiness profile=%s firefox_detected=%s trust=%s prepared=%s elapsed_ms=%llu",
+        if (profile_ready) {
+            log_msg(hf, tag, "PASS -- Firefox profile readiness profile=%s firefox_detected=%s trust=%s trust_verified=%s prepared=%s elapsed_ms=%llu",
                 status.profile_path.u8string().c_str(),
                 status.firefox_detected ? "true" : "false",
                 status.current_user_ca_trusted ? "true" : "false",
+                status.trust_readiness_verified ? "true" : "false",
                 status.prepared ? "true" : "false",
                 static_cast<unsigned long long>(GetTickCount64() - start));
             passed.fetch_add(1);
-        } else if (profile_ready || (profile_files_ready && !status.firefox_detected) || (profile_files_ready && !status.current_user_ca_trusted)) {
-            log_msg(hf, tag, "PASS -- Firefox profile files valid and runtime/trust dependency boundary reported profile=%s trust=%s prepared=%s firefox_detected=%s runtime_checked=%s timeout=%s op=%s error=%s elapsed_ms=%llu",
+        } else if (profile_files_ready && (!status.trust_readiness_verified || !status.prepared || !status.ok)) {
+            log_msg(hf, tag, "FAIL -- Firefox profile files exist but full interception readiness is not proven profile=%s trust=%s trust_verified=%s prepared=%s firefox_detected=%s runtime_checked=%s timeout=%s op=%s error=%s elapsed_ms=%llu",
                 status.profile_path.u8string().c_str(),
                 status.current_user_ca_trusted ? "true" : "false",
+                status.trust_readiness_verified ? "true" : "false",
                 status.prepared ? "true" : "false",
                 status.firefox_detected ? "true" : "false",
                 status.runtime_validation_performed ? "true" : "false",
@@ -1814,7 +1815,7 @@ namespace {
                 status.last_operation.c_str(),
                 status.error.c_str(),
                 static_cast<unsigned long long>(GetTickCount64() - start));
-            passed.fetch_add(1);
+            failed.fetch_add(1);
         } else {
             log_msg(hf, tag, "FAIL -- Firefox profile readiness invalid error=%s files=%s trust=%s prepared=%s firefox_detected=%s runtime_checked=%s ok=%s timeout=%s op=%s elapsed_ms=%llu",
                 status.error.c_str(),
@@ -3441,7 +3442,7 @@ void run_parser_proof_smoke() {
 }
 
 void phase_network_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped, bool(*cancelled)()) {
-    log_msg(hf, "net_phase", "========== Network Tests START (121 tests, includes parser proof suite) ==========");
+    log_msg(hf, "net_phase", "========== Network Tests START (125 tests, includes parser proof suite) ==========");
     diag::log_tagged("parser_proof", "Ctrl+Shift+T network phase reached; parser proof tests are scheduled in this phase");
     struct non_destructive_skip_accounting_t {
         HANDLE hf;
@@ -3615,7 +3616,7 @@ void phase_network_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& 
     call_test(test_cert_generator_spki_hash, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
-    if (!cancelled()) test_cert_profile_manager_firefox(hf, passed, failed, skipped);
+    call_test_s(test_cert_profile_manager_firefox, hf, passed, failed, skipped);
 
     if (cancelled && cancelled()) return;
     call_test(test_cert_generator_server_cert, hf, passed, failed);

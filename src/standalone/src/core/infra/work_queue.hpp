@@ -11,6 +11,8 @@
 #include <thread>
 #include <vector>
 
+#include "../runtime/manual_map_tls.hpp"
+
 namespace work_queue {
 
 inline const int POOL_SIZE = []() {
@@ -22,6 +24,18 @@ inline const int POOL_SIZE = []() {
         base = 32u;
     if (base > 64u)
         base = 64u;
+    return static_cast<int>(base);
+}();
+
+inline const int SERVICE_POOL_SIZE = []() {
+    unsigned int hc = std::thread::hardware_concurrency();
+    if (hc == 0u)
+        hc = 16u;
+    unsigned int base = hc;
+    if (base < 16u)
+        base = 16u;
+    if (base > 32u)
+        base = 32u;
     return static_cast<int>(base);
 }();
 
@@ -44,6 +58,7 @@ struct pool_t {
 };
 
 inline pool_t g_pool;
+inline pool_t g_service_pool;
 
 }
 
@@ -63,12 +78,11 @@ struct stats_t {
 
 inline void shutdown();
 
-inline stats_t stats() {
-    auto& p = detail::g_pool;
+inline stats_t stats_for(detail::pool_t& p, int pool_size) {
     stats_t s;
     s.alive = p.alive.load(std::memory_order_acquire);
     s.shutting_down = p.shutting_down.load(std::memory_order_acquire);
-    s.pool_size = POOL_SIZE;
+    s.pool_size = pool_size;
     s.active = p.active_tasks.load(std::memory_order_acquire);
     s.post_attempts = p.post_attempts.load(std::memory_order_acquire);
     s.posted = p.posted_tasks.load(std::memory_order_acquire);
@@ -83,8 +97,15 @@ inline stats_t stats() {
     return s;
 }
 
-inline void initialize() {
-    auto& p = detail::g_pool;
+inline stats_t stats() {
+    return stats_for(detail::g_pool, POOL_SIZE);
+}
+
+inline stats_t service_stats() {
+    return stats_for(detail::g_service_pool, SERVICE_POOL_SIZE);
+}
+
+inline void initialize_pool(detail::pool_t& p, int pool_size) {
     if (p.shutting_down.load(std::memory_order_acquire)) return;
     bool expected = false;
     if (!p.alive.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
@@ -95,9 +116,10 @@ inline void initialize() {
             return;
         }
         try {
-            p.workers.reserve(POOL_SIZE);
-            for (int i = 0; i < POOL_SIZE; ++i) {
+            p.workers.reserve(static_cast<std::size_t>(pool_size));
+            for (int i = 0; i < pool_size; ++i) {
                 p.workers.emplace_back([&p]() {
+                    aida::manual_map_tls::ensure_current_thread();
                     while (true) {
                         std::function<void()> task;
                         {
@@ -124,10 +146,17 @@ inline void initialize() {
     }
 }
 
-inline bool post(std::function<void()> f) {
-    auto& p = detail::g_pool;
+inline void initialize() {
+    initialize_pool(detail::g_pool, POOL_SIZE);
+}
+
+inline void initialize_services() {
+    initialize_pool(detail::g_service_pool, SERVICE_POOL_SIZE);
+}
+
+inline bool post_to(detail::pool_t& p, int pool_size, std::function<void()> f) {
     p.post_attempts.fetch_add(1u, std::memory_order_acq_rel);
-    if (!p.alive.load(std::memory_order_acquire)) initialize();
+    if (!p.alive.load(std::memory_order_acquire)) initialize_pool(p, pool_size);
     if (!p.alive.load(std::memory_order_acquire) || p.shutting_down.load(std::memory_order_acquire)) {
         p.rejected_tasks.fetch_add(1u, std::memory_order_acq_rel);
         return false;
@@ -150,8 +179,15 @@ inline bool post(std::function<void()> f) {
     return true;
 }
 
-inline void shutdown() {
-    auto& p = detail::g_pool;
+inline bool post(std::function<void()> f) {
+    return post_to(detail::g_pool, POOL_SIZE, std::move(f));
+}
+
+inline bool post_service(std::function<void()> f) {
+    return post_to(detail::g_service_pool, SERVICE_POOL_SIZE, std::move(f));
+}
+
+inline void shutdown_pool(detail::pool_t& p) {
     bool expected = false;
     if (!p.shutdown_called.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
     p.shutting_down.store(true, std::memory_order_release);
@@ -164,6 +200,11 @@ inline void shutdown() {
         p.cv.notify_all();
     }
     for (auto& w : to_join) if (w.joinable()) w.join();
+}
+
+inline void shutdown() {
+    shutdown_pool(detail::g_pool);
+    shutdown_pool(detail::g_service_pool);
 }
 
 struct work_queue_shutdown_guard_t {

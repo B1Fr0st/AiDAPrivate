@@ -15,6 +15,7 @@
 
 #include "obfuscation.hpp"
 #include "key_pipeline.hpp"
+#include "../../helpers/diag_log.hpp"
 
 namespace anti_tamper {
 namespace packer {
@@ -162,24 +163,13 @@ namespace detail {
             static_cast<unsigned>(st.wMilliseconds),
             message ? message : "event=<null>");
 
-        char path[MAX_PATH];
-        DWORD n = GetModuleFileNameA(nullptr, path, MAX_PATH);
-        if (n != 0 && n < MAX_PATH)
+        HANDLE h = diag::open_log_handle("aida_debug.log", FILE_APPEND_DATA | SYNCHRONIZE,
+            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL);
+        if (h != INVALID_HANDLE_VALUE)
         {
-            char* slash = strrchr(path, '\\');
-            if (slash)
-            {
-                slash[1] = '\0';
-                strncat_s(path, MAX_PATH, "aida_debug.log", _TRUNCATE);
-                HANDLE h = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-                if (h != INVALID_HANDLE_VALUE)
-                {
-                    DWORD wr = 0;
-                    WriteFile(h, line, static_cast<DWORD>(strlen(line)), &wr, nullptr);
-                    CloseHandle(h);
-                }
-            }
+            DWORD wr = 0;
+            WriteFile(h, line, static_cast<DWORD>(strlen(line)), &wr, nullptr);
+            CloseHandle(h);
         }
         OutputDebugStringA(line);
     }

@@ -9,6 +9,7 @@
 #include "emulation_engine.hpp"
 #include "obfuscation.hpp"
 #include "pro.h"
+#include "../runtime/diagnostic_exception_scope.hpp"
 #include "../../helpers/diag_log.hpp"
 
 #include <algorithm>
@@ -299,6 +300,7 @@ tool_result_t driver_snapshot_and_emulate(const json& params)
         static_cast<unsigned long long>(snap_base),
         static_cast<unsigned long long>(snap_size),
         static_cast<unsigned long long>(config.timeout_us));
+    aida::diagnostic_exception_scope::scope_t exception_scope("mcp.driver_snapshot_and_emulate");
     auto result = emulation::driver_snapshot_and_emulate(pid, tid, config, snap_base, snap_size);
     if (!result.success)
     {
@@ -474,6 +476,7 @@ tool_result_t trace_execution_unicorn(const json& params)
 
     diag::log_tagged_fmt("emul_tools", "trace_execution_unicorn emulating addr=0x%llx size=%u kernel=%d",
         static_cast<unsigned long long>(*addr), size, (int)kernel_mode);
+    aida::diagnostic_exception_scope::scope_t exception_scope("mcp.trace_execution_unicorn");
     auto result = emulation::emulate_from_snapshot(snapshot, config);
     if (!result.success)
     {
@@ -628,6 +631,7 @@ tool_result_t analyze_vm_handler(const json& params)
 
     diag::log_tagged_fmt("emul_tools", "analyze_vm_handler emulating addr=0x%llx size=%u kernel=%d",
         static_cast<unsigned long long>(*addr), handler_size, (int)kernel_mode);
+    aida::diagnostic_exception_scope::scope_t exception_scope("mcp.analyze_vm_handler");
     auto emu_result = emulation::emulate_from_snapshot(snapshot, config);
 
     json out;
@@ -799,6 +803,7 @@ tool_result_t emulate_multi_trace(const json& params)
         config.analyze_effective_ops = true;
         config.timeout_us         = params.value("timeout_us", 5000000);
 
+        aida::diagnostic_exception_scope::scope_t exception_scope("mcp.emulate_multi_trace");
         auto result = emulation::emulate_from_snapshot(snapshot, config);
 
         json trace;
@@ -985,6 +990,7 @@ tool_result_t emulate_function(const json& params)
         map_size,
         static_cast<unsigned long long>(sentinel_ret),
         (int)kernel_mode);
+    aida::diagnostic_exception_scope::scope_t exception_scope("mcp.emulate_function");
     auto result = emulation::emulate_from_snapshot(snapshot, config);
 
     json out;

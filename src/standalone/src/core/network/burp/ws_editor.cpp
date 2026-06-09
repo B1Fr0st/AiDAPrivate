@@ -11,7 +11,7 @@
 
 #include "ws_editor.hpp"
 
-#include "../../infra/win_thread.hpp"
+#include "../../infra/work_queue.hpp"
 #include "../../../helpers/diag_log.hpp"
 
 #include <openssl/ssl.h>
@@ -148,7 +148,10 @@ struct connection_t
     std::deque<ws_frame_log_t>       frames;
     size_t                           frames_max = 4096;
     std::string                      last_error;
-    aida::infra::win_thread::joinable_thread_t recv_thread;
+    std::atomic<bool>                recv_worker_alive{false};
+    std::atomic<DWORD>               recv_worker_tid{0};
+    std::mutex                       recv_worker_mtx;
+    std::condition_variable          recv_worker_cv;
     std::mutex                       err_mtx;
 };
 
@@ -176,6 +179,33 @@ std::string get_conn_err(connection_t& c)
     std::lock_guard<std::mutex> lk(c.err_mtx);
     return c.last_error;
 }
+
+void mark_recv_worker_started(connection_t& c)
+{
+    {
+        std::lock_guard<std::mutex> lk(c.recv_worker_mtx);
+        c.recv_worker_tid.store(GetCurrentThreadId(), std::memory_order_release);
+        c.recv_worker_alive.store(true, std::memory_order_release);
+    }
+    c.recv_worker_cv.notify_all();
+}
+
+void mark_recv_worker_stopped(connection_t& c)
+{
+    {
+        std::lock_guard<std::mutex> lk(c.recv_worker_mtx);
+        c.recv_worker_alive.store(false, std::memory_order_release);
+        c.recv_worker_tid.store(0, std::memory_order_release);
+    }
+    c.recv_worker_cv.notify_all();
+}
+
+struct recv_worker_lifetime_t
+{
+    connection_t& c;
+    explicit recv_worker_lifetime_t(connection_t& conn) : c(conn) { mark_recv_worker_started(c); }
+    ~recv_worker_lifetime_t() { mark_recv_worker_stopped(c); }
+};
 
 void close_transport_for_stop(connection_t& c)
 {
@@ -547,7 +577,8 @@ void receive_loop(std::shared_ptr<connection_t> cptr)
 {
     auto& c = *cptr;
     const uint64_t t0 = now_steady_ms();
-    diag::log_tagged_fmt("ws_edit", "receive_loop entry conn_id=%llu sock=0x%llX ssl=%p tid=%lu",
+    recv_worker_lifetime_t worker(c);
+    diag::log_tagged_fmt("ws_edit", "receive_loop entry mode=work_queue conn_id=%llu sock=0x%llX ssl=%p tid=%lu",
         static_cast<unsigned long long>(c.id),
         static_cast<unsigned long long>(c.sock),
         c.ssl,
@@ -850,11 +881,17 @@ uint64_t connect(const ws_connection_config_t& cfg)
         cptr->id = r.next_id.fetch_add(1);
         r.by_id.emplace(cptr->id, cptr);
     }
-    std::string recv_thread_err;
-    if (!cptr->recv_thread.start([cptr]() { receive_loop(cptr); }, &recv_thread_err,
-            aida::infra::win_thread::default_stack_reserve, "ws_editor.recv")) {
-        diag::log_tagged_fmt("ws_edit", "recv_thread_failed id=%llu err=%s",
-            static_cast<unsigned long long>(cptr->id), recv_thread_err.c_str());
+    cptr->recv_worker_alive.store(true, std::memory_order_release);
+    bool recv_posted = false;
+    try {
+        recv_posted = work_queue::post([cptr]() { receive_loop(cptr); });
+    } catch (...) {
+        recv_posted = false;
+    }
+    if (!recv_posted) {
+        cptr->recv_worker_alive.store(false, std::memory_order_release);
+        diag::log_tagged_fmt("ws_edit", "recv_worker_post_failed id=%llu",
+            static_cast<unsigned long long>(cptr->id));
         cptr->running.store(false);
         cptr->connected.store(false);
         cleanup_connection(*cptr);
@@ -865,6 +902,37 @@ uint64_t connect(const ws_connection_config_t& cfg)
         }
         set_err("ws_editor: receive worker unavailable");
         return 0;
+    }
+    {
+        std::unique_lock<std::mutex> lk(cptr->recv_worker_mtx);
+        const bool entered = cptr->recv_worker_cv.wait_for(
+            lk,
+            std::chrono::milliseconds(1000),
+            [&cptr]() {
+                return cptr->recv_worker_tid.load(std::memory_order_acquire) != 0 ||
+                       !cptr->recv_worker_alive.load(std::memory_order_acquire);
+            });
+        if (!entered || !cptr->recv_worker_alive.load(std::memory_order_acquire)) {
+            diag::log_tagged_fmt("ws_edit", "recv_worker_enter_wait_failed id=%llu entered=%d alive=%d tid=%lu",
+                static_cast<unsigned long long>(cptr->id),
+                entered ? 1 : 0,
+                cptr->recv_worker_alive.load(std::memory_order_acquire) ? 1 : 0,
+                static_cast<unsigned long>(cptr->recv_worker_tid.load(std::memory_order_acquire)));
+            lk.unlock();
+            cptr->running.store(false);
+            cptr->connected.store(false);
+            if (cptr->recv_worker_alive.load(std::memory_order_acquire))
+                close_transport_for_stop(*cptr);
+            else
+                cleanup_connection(*cptr);
+            {
+                auto& r = registry();
+                std::lock_guard<std::mutex> reg_lk(r.mtx);
+                r.by_id.erase(cptr->id);
+            }
+            set_err("ws_editor: receive worker did not enter");
+            return 0;
+        }
     }
     diag::log_tagged_fmt("burp.ws_editor", "connected id=%llu host=%s:%u path=%s",
         static_cast<unsigned long long>(cptr->id), cptr->cfg.host.c_str(), cptr->cfg.port, cptr->cfg.path.c_str());
@@ -894,25 +962,30 @@ bool disconnect(uint64_t conn_id)
         cptr->ssl,
         static_cast<unsigned long long>(now_steady_ms() - t0));
     close_transport_for_stop(*cptr);
-    bool joined = true;
-    if (cptr->recv_thread.joinable()) {
-        diag::log_tagged_fmt("ws_edit", "disconnect recv_join_begin conn_id=%llu elapsed_ms=%llu",
+    bool stopped = true;
+    if (cptr->recv_worker_alive.load(std::memory_order_acquire)) {
+        diag::log_tagged_fmt("ws_edit", "disconnect recv_wait_begin conn_id=%llu tid=%lu elapsed_ms=%llu",
             static_cast<unsigned long long>(conn_id),
+            static_cast<unsigned long>(cptr->recv_worker_tid.load(std::memory_order_acquire)),
             static_cast<unsigned long long>(now_steady_ms() - t0));
-        joined = cptr->recv_thread.join_for(1000);
-        if (joined) {
-            diag::log_tagged_fmt("ws_edit", "disconnect recv_join_done conn_id=%llu elapsed_ms=%llu",
+        std::unique_lock<std::mutex> lk(cptr->recv_worker_mtx);
+        stopped = cptr->recv_worker_cv.wait_for(
+            lk,
+            std::chrono::milliseconds(1000),
+            [&cptr]() { return !cptr->recv_worker_alive.load(std::memory_order_acquire); });
+        if (stopped) {
+            diag::log_tagged_fmt("ws_edit", "disconnect recv_wait_done conn_id=%llu elapsed_ms=%llu",
                 static_cast<unsigned long long>(conn_id),
                 static_cast<unsigned long long>(now_steady_ms() - t0));
         } else {
             set_conn_err(*cptr, "ws_editor.disconnect: receive worker did not stop within timeout");
-            diag::log_tagged_fmt("ws_edit", "disconnect recv_join_timeout conn_id=%llu elapsed_ms=%llu",
+            diag::log_tagged_fmt("ws_edit", "disconnect recv_wait_timeout conn_id=%llu tid=%lu elapsed_ms=%llu",
                 static_cast<unsigned long long>(conn_id),
+                static_cast<unsigned long>(cptr->recv_worker_tid.load(std::memory_order_acquire)),
                 static_cast<unsigned long long>(now_steady_ms() - t0));
-            cptr->recv_thread.detach();
         }
     }
-    if (joined)
+    if (stopped)
         cleanup_connection(*cptr);
     auto& r = registry();
     std::lock_guard<std::mutex> lk(r.mtx);

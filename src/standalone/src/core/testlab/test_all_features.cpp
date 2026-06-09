@@ -27,6 +27,7 @@
 #include "../disasm/pseudocode_view.hpp"
 #include "../disasm/zydis_disasm.hpp"
 #include "../infra/critical_work_queue.hpp"
+#include "../infra/work_queue.hpp"
 #include "../../helpers/diag_log.hpp"
 #include "../../helpers/globals.h"
 
@@ -270,11 +271,15 @@ namespace test_all_features {
 			const std::uint64_t phase_age = (phase_start != 0 && now >= phase_start) ? (now - phase_start) : 0;
 			const std::uint64_t step_age = (step_start != 0 && now >= step_start) ? (now - step_start) : 0;
 			const auto cq = critical_work_queue::stats();
+			const auto wq = work_queue::stats();
+			const auto sq = work_queue::service_stats();
 
 			_snprintf_s(out, cap, _TRUNCATE,
 				"run_id=%llu host_pid=%lu host_tid=%lu running=%d cancel=%d target_unavailable=%d phase=\"%.160s\" phase_age_ms=%llu "
 				"step=\"%.220s\" step_age_ms=%llu run_age_ms=%llu total=%d current=%d "
 				"pass=%d fail=%d skip=%d suspect=%d cq_alive=%d cq_shutdown=%d cq_workers=%zu cq_pending=%zu cq_active=%u cq_started=%llu cq_finished=%llu "
+				"wq_alive=%d wq_shutdown=%d wq_workers=%zu wq_pending=%zu wq_active=%u wq_started=%llu wq_finished=%llu "
+				"svc_alive=%d svc_shutdown=%d svc_workers=%zu svc_pending=%zu svc_active=%u svc_started=%llu svc_finished=%llu "
 				"target_pid=%u driver_attached=%d "
 				"image_base=0x%016llX target_addr=0x%016llX saved_dtb=0x%016llX",
 				static_cast<unsigned long long>(g_run_id.load(std::memory_order_acquire)),
@@ -301,6 +306,20 @@ namespace test_all_features {
 				static_cast<unsigned>(cq.active),
 				static_cast<unsigned long long>(cq.started),
 				static_cast<unsigned long long>(cq.finished),
+				wq.alive ? 1 : 0,
+				wq.shutting_down ? 1 : 0,
+				wq.workers,
+				wq.pending,
+				static_cast<unsigned>(wq.active),
+				static_cast<unsigned long long>(wq.started),
+				static_cast<unsigned long long>(wq.finished),
+				sq.alive ? 1 : 0,
+				sq.shutting_down ? 1 : 0,
+				sq.workers,
+				sq.pending,
+				static_cast<unsigned>(sq.active),
+				static_cast<unsigned long long>(sq.started),
+				static_cast<unsigned long long>(sq.finished),
 				g_target_pid.load(std::memory_order_acquire),
 				g_driver_attached.load(std::memory_order_acquire) ? 1 : 0,
 				static_cast<unsigned long long>(g_target_image_base.load(std::memory_order_acquire)),
@@ -309,7 +328,7 @@ namespace test_all_features {
 		}
 
 		void log_debug_snapshot(HANDLE hf, const char* tag, const char* prefix) {
-			char snap[1200] = {};
+			char snap[2200] = {};
 			format_debug_snapshot_impl(snap, sizeof(snap));
 			log_msg(hf, tag ? tag : "snapshot", "%s%s%s",
 				prefix ? prefix : "snapshot",
@@ -359,7 +378,7 @@ namespace test_all_features {
 				sizeof(pmc));
 			const DWORD mem_err = mem_ok ? 0UL : GetLastError();
 
-			char debug[1200] = {};
+			char debug[2200] = {};
 			format_debug_snapshot_impl(debug, sizeof(debug));
 			const std::uint64_t now = now_ms_tick();
 			const std::uint64_t run_start = g_run_start_tick.load(std::memory_order_acquire);
@@ -390,7 +409,7 @@ namespace test_all_features {
 		}
 
 		void log_resource_snapshot(HANDLE hf, const char* tag, const char* prefix, DWORD captured_last_error) {
-			char snap[1800] = {};
+			char snap[3000] = {};
 			format_resource_snapshot_impl(snap, sizeof(snap), captured_last_error);
 			log_msg(hf, tag ? tag : "resource", "%s%s%s",
 				prefix ? prefix : "resource snapshot",
@@ -400,8 +419,12 @@ namespace test_all_features {
 
 		void log_work_queue_snapshot(HANDLE hf, const char* tag, const char* prefix) {
 			const auto st = critical_work_queue::stats();
+			const auto wq = work_queue::stats();
+			const auto sq = work_queue::service_stats();
 			log_msg(hf, tag ? tag : "critical_queue",
-				"%s%scritical_alive=%d critical_shutting_down=%d critical_pool_size=%d critical_workers=%zu critical_pending=%zu critical_active=%u critical_post_attempts=%llu critical_posted=%llu critical_rejected=%llu critical_started=%llu critical_finished=%llu",
+				"%s%scritical_alive=%d critical_shutting_down=%d critical_pool_size=%d critical_workers=%zu critical_pending=%zu critical_active=%u critical_post_attempts=%llu critical_posted=%llu critical_rejected=%llu critical_started=%llu critical_finished=%llu "
+				"work_alive=%d work_shutting_down=%d work_pool_size=%d work_workers=%zu work_pending=%zu work_active=%u work_post_attempts=%llu work_posted=%llu work_rejected=%llu work_started=%llu work_finished=%llu "
+				"service_alive=%d service_shutting_down=%d service_pool_size=%d service_workers=%zu service_pending=%zu service_active=%u service_post_attempts=%llu service_posted=%llu service_rejected=%llu service_started=%llu service_finished=%llu",
 				prefix ? prefix : "critical_queue snapshot",
 				(prefix && *prefix) ? " | " : "",
 				st.alive ? 1 : 0,
@@ -414,7 +437,29 @@ namespace test_all_features {
 				static_cast<unsigned long long>(st.posted),
 				static_cast<unsigned long long>(st.rejected),
 				static_cast<unsigned long long>(st.started),
-				static_cast<unsigned long long>(st.finished));
+				static_cast<unsigned long long>(st.finished),
+				wq.alive ? 1 : 0,
+				wq.shutting_down ? 1 : 0,
+				wq.pool_size,
+				wq.workers,
+				wq.pending,
+				static_cast<unsigned>(wq.active),
+				static_cast<unsigned long long>(wq.post_attempts),
+				static_cast<unsigned long long>(wq.posted),
+				static_cast<unsigned long long>(wq.rejected),
+				static_cast<unsigned long long>(wq.started),
+				static_cast<unsigned long long>(wq.finished),
+				sq.alive ? 1 : 0,
+				sq.shutting_down ? 1 : 0,
+				sq.pool_size,
+				sq.workers,
+				sq.pending,
+				static_cast<unsigned>(sq.active),
+				static_cast<unsigned long long>(sq.post_attempts),
+				static_cast<unsigned long long>(sq.posted),
+				static_cast<unsigned long long>(sq.rejected),
+				static_cast<unsigned long long>(sq.started),
+				static_cast<unsigned long long>(sq.finished));
 		}
 
 		void set_full_test_env(HANDLE hf, bool enabled, const char* reason) {
@@ -2714,13 +2759,26 @@ namespace test_all_features {
 			g_cancel_requested.store(true, std::memory_order_release);
 			diag::log_tagged_fmt("test_all", "user cancelled Test All Features");
 			try {
-				std::thread([]() {
+				const bool posted = work_queue::post([]() {
 					try {
 						aida::burp::camoufox::force_cleanup("testlab.cancel");
 					} catch (...) {
 					}
-				}).detach();
+				});
+				if (!posted) {
+					try {
+						aida::burp::camoufox::force_cleanup("testlab.cancel.inline");
+					} catch (...) {
+					}
+				}
+			} catch (const std::exception& ex) {
+				diag::log_tagged_fmt("test_all", "cancel cleanup work_queue post exception: %s", ex.what());
+				try {
+					aida::burp::camoufox::force_cleanup("testlab.cancel.inline");
+				} catch (...) {
+				}
 			} catch (...) {
+				diag::log_tagged("test_all", "cancel cleanup work_queue post exception: unknown");
 				try {
 					aida::burp::camoufox::force_cleanup("testlab.cancel.inline");
 				} catch (...) {

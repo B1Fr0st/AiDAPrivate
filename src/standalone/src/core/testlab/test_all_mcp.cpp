@@ -11,6 +11,7 @@
 #include "../analysis/decrypt_oracle.hpp"
 #include "../analysis/fuzzer_engine.hpp"
 #include "../analysis/integrity_hunter.hpp"
+#include "../analysis/code_patcher.hpp"
 #include "../analysis/struct_monitor.hpp"
 #include "../analysis/symbol_store.hpp"
 #include "../analysis/stealth_engine.hpp"
@@ -37,7 +38,7 @@
 #include "../tools/pre_encrypt_hook.hpp"
 #include "../tools/standalone_tools_fwd.hpp"
 #include "../infra/critical_work_queue.hpp"
-#include "../infra/win_thread.hpp"
+#include "../infra/work_queue.hpp"
 #include "../runtime/standalone_driver.hpp"
 #include "../scanner/crypto_scanner.hpp"
 #include "../scanner/memory_scanner.hpp"
@@ -105,6 +106,7 @@ namespace {
     std::string g_mcp_debugger_trace_id;
     uint64_t g_mcp_patch_addr = 0;
     int g_mcp_patch_index = -1;
+    int g_mcp_get_patches_fixture_index = -1;
     uint64_t g_autoresponder_rule_id = 0;
     uint64_t g_burp_scanner_audit_id = 0;
     uint64_t g_burp_scanner_issue_id = 0;
@@ -126,16 +128,8 @@ namespace {
     uint64_t g_burp_comparer_slot_a = 0;
     uint64_t g_burp_comparer_slot_b = 0;
     uint64_t g_burp_collaborator_interaction_id = 0;
-    uint64_t g_burp_browser_pid = 0;
-    bool g_burp_browser_dependency_guarded = false;
-    std::string g_burp_browser_dependency_reason;
     bool g_burp_dom_xss_browser_infra_failed = false;
     std::string g_burp_dom_xss_dependency_reason;
-    bool g_burp_headless_started = false;
-    bool g_burp_headless_navigated = false;
-    bool g_burp_headless_failed = false;
-    bool g_burp_headless_dependency_guarded = false;
-    std::string g_burp_headless_dependency_reason;
     std::string g_burp_collaborator_token;
     std::string g_burp_fixture_base_url;
     std::string g_burp_fixture_wordlist_path;
@@ -374,61 +368,6 @@ namespace {
         return exact.find(lower_copy(name)) != exact.end();
     }
 
-    bool is_redundant_mcp_tool_name(const std::string& name) {
-        static const std::set<std::string> exact = {
-            "driver_connect",
-            "driver_unattach",
-            "driver_read_memory",
-            "driver_read_string",
-            "driver_enumerate_modules",
-            "driver_enumerate_threads",
-            "driver_query_memory",
-            "debugger_read_memory",
-            "debugger_write_memory",
-            "debugger_protect_memory",
-            "debugger_allocate_memory",
-            "debugger_call_function",
-            "debugger_attach_to_process",
-            "debugger_detach",
-            "debugger_get_threads",
-            "debugger_get_modules",
-            "dbg_set_breakpoint",
-            "dbg_remove_breakpoint",
-            "dbg_list_breakpoints",
-            "dbg_get_callstack",
-            "dbg_run",
-            "dbg_pause",
-            "dbg_step_into",
-            "dbg_step_over",
-            "dbg_step_out",
-            "dbg_get_registers",
-            "dbg_set_register",
-            "dbg_get_memory_map",
-            "dbg_enumerate_handles",
-            "dbg_get_seh_chain",
-            "dbg_list_patches",
-            "driver_enumerate_wfp_callouts",
-            "driver_get_socket_handles",
-            "driver_dump_tcpip_connections",
-            "driver_inject_packet",
-            "driver_modify_packet_rule",
-            "driver_redirect_traffic",
-            "driver_deep_inspect",
-            "driver_intercept_hold",
-            "driver_kill_connection",
-            "driver_spoof_dns",
-            "driver_bandwidth_monitor",
-            "driver_list_interfaces",
-            "driver_export_pcap",
-            "driver_network_fingerprint"
-        };
-        const std::string lowered = lower_copy(name);
-        if (exact.find(lowered) != exact.end())
-            return true;
-        return lowered.rfind("burp_browser_", 0) == 0 ||
-            lowered.rfind("burp_headless_", 0) == 0;
-    }
-
     constexpr const char* k_test_lab_safe_fixture_flag = "__aida_test_safe_fixture";
 
     void log_msg(HANDLE hf, const char* tag, const char* fmt, ...);
@@ -547,9 +486,6 @@ namespace {
         static const std::set<std::string> names = {
             "driver_attach",
             "driver_detach",
-            "driver_unattach",
-            "debugger_attach_to_process",
-            "debugger_detach",
             "sessions_open_file",
             "sessions_attach_pid",
             "sessions_run_binary",
@@ -562,9 +498,7 @@ namespace {
         static const std::set<std::string> no_target_required = {
             "driver_load",
             "driver_status",
-            "driver_connect",
             "driver_detach",
-            "driver_unattach",
             "driver_enumerate_kernel_modules",
             "driver_read_kernel_memory",
             "driver_write_kernel_memory"
@@ -1025,7 +959,7 @@ namespace {
             "intercept_request", "scripts", "search_code", "cookies", "get_storage",
             "export_state", "import_state", "hook_jsvmp_interpreter", "compare_env",
             "instrumentation", "verify_signer_offline", "trace_property_access",
-            "list_trace_files", "query_trace_file", "analyze_cookie_sources", "camoufox_open_url"
+            "list_trace_files", "query_trace_file", "analyze_cookie_sources",
         };
         if (name.rfind("burp_", 0) == 0)
             return "burp";
@@ -1979,8 +1913,7 @@ namespace {
         }
 
         if (tool_lc == "driver_write_kernel_memory" ||
-            tool_lc == "driver_call_function" ||
-            tool_lc == "debugger_call_function") {
+            tool_lc == "driver_call_function") {
             bool validate_only = false;
             (void)payload_bool_field(ir.data, "validate_only", validate_only);
             const bool dry_run = payload_text_contains(ir, "dry-run") ||
@@ -2013,18 +1946,6 @@ namespace {
                         return true;
                     }
                     reason = "driver_call_dry_run_no_execution";
-                    return true;
-                }
-            } else if (tool_lc == "debugger_call_function") {
-                std::string address;
-                uint64_t pid = 0;
-                if (validate_only) {
-                    if (!payload_string_field(ir.data, "address", address) || address.empty() ||
-                        !payload_u64_field(ir.data, "pid", pid) || pid == 0) {
-                        reason = "debugger_call_validate_payload_invalid";
-                        return true;
-                    }
-                    reason = "debugger_call_validate_only_no_execution";
                     return true;
                 }
             }
@@ -2269,17 +2190,6 @@ namespace {
             }
         }
 
-        if (tool_lc == "driver_network_fingerprint") {
-            size_t results = 1;
-            uint64_t count = 1;
-            if ((payload_array_count(ir.data, "results", results) && results == 0) ||
-                (payload_u64_field(ir.data, "count", count) && count == 0) ||
-                payload_text_contains(ir, "0 fingerprint results")) {
-                reason = "fingerprint_results=0";
-                return true;
-            }
-        }
-
         if (tool_lc == "burp_crawler_list" ||
             tool_lc == "burp_intruder_list_jobs" ||
             tool_lc == "burp_scanner_list_audits" ||
@@ -2291,7 +2201,6 @@ namespace {
             tool_lc == "burp_param_miner_results" ||
             tool_lc == "burp_sequencer_list_collections" ||
             tool_lc == "burp_report_list" ||
-            tool_lc == "burp_browser_list" ||
             tool_lc == "burp_scanner_list_issues") {
             size_t items = 1;
             uint64_t count = 1;
@@ -2708,17 +2617,6 @@ namespace {
             }
         }
 
-        if (tool_lc == "driver_deep_inspect") {
-            uint64_t count = 1;
-            size_t packets = 1;
-            if ((payload_u64_field(ir.data, "count", count) && count == 0) ||
-                (payload_array_count(ir.data, "packets", packets) && packets == 0) ||
-                payload_text_contains(ir, "no dpi results")) {
-                reason = "dpi_results=0";
-                return true;
-            }
-        }
-
         if (tool_lc == "network_get_packets") {
             if (ir.data.is_array() && !ir.data.empty())
                 return false;
@@ -2765,17 +2663,6 @@ namespace {
             }
         }
 
-        if (tool_lc == "driver_get_socket_handles") {
-            uint64_t count = 1;
-            size_t sockets = 1;
-            if ((payload_u64_field(ir.data, "count", count) && count == 0) ||
-                (payload_array_count(ir.data, "sockets", sockets) && sockets == 0) ||
-                payload_text_contains(ir, "no afd socket handles found")) {
-                reason = "socket_count=0";
-                return true;
-            }
-        }
-
         if (tool_lc == "driver_sniff_network_buffers") {
             uint64_t capture_count = 1;
             size_t captures = 1;
@@ -2794,17 +2681,6 @@ namespace {
                 (payload_u64_field(ir.data, "total_packets", total_packets) && total_packets == 0) ||
                 payload_text_contains(ir, "0 bytes reassembled")) {
                 reason = "stream_bytes=0";
-                return true;
-            }
-        }
-
-        if (tool_lc == "driver_network_fingerprint") {
-            uint64_t count = 1;
-            size_t fingerprints = 1;
-            if ((payload_u64_field(ir.data, "count", count) && count == 0) ||
-                (payload_array_count(ir.data, "fingerprints", fingerprints) && fingerprints == 0) ||
-                payload_text_contains(ir, "no fingerprint results")) {
-                reason = "fingerprint_count=0";
                 return true;
             }
         }
@@ -2868,7 +2744,7 @@ namespace {
             }
         }
 
-        if (tool_lc == "dbg_list_patches") {
+        if (tool_lc == "debugger_get_patches") {
             uint64_t count = 1;
             size_t patches = 1;
             if ((payload_u64_field(ir.data, "count", count) && count > 0) ||
@@ -2898,7 +2774,7 @@ namespace {
             }
         }
 
-        if (tool_lc == "dbg_get_seh_chain") {
+        if (tool_lc == "driver_walk_seh_chain") {
             uint64_t count = 1;
             size_t handlers = 1;
             if ((payload_u64_field(ir.data, "count", count) && count > 0) ||
@@ -3001,55 +2877,6 @@ namespace {
             }
         }
 
-        if (tool_lc == "burp_browser_launch" ||
-            tool_lc == "burp_browser_detect" ||
-            tool_lc == "burp_headless_start" ||
-            tool_lc == "burp_headless_status" ||
-            tool_lc == "burp_headless_navigate" ||
-            tool_lc == "burp_headless_reload" ||
-            tool_lc == "burp_headless_evaluate" ||
-            tool_lc == "burp_headless_screenshot" ||
-            tool_lc == "burp_headless_snapshot" ||
-            tool_lc == "burp_headless_click" ||
-            tool_lc == "burp_headless_type" ||
-            tool_lc == "burp_headless_wait_for" ||
-            tool_lc == "burp_headless_console_logs" ||
-            tool_lc == "burp_headless_network_requests" ||
-            tool_lc == "burp_headless_inject_hook" ||
-            tool_lc == "burp_headless_hook_function" ||
-            tool_lc == "burp_headless_remove_hooks" ||
-            tool_lc == "burp_headless_reset_state" ||
-            tool_lc == "burp_headless_view_status" ||
-            tool_lc == "burp_headless_view_quick_navigate" ||
-            tool_lc == "burp_headless_view_install") {
-            bool browser_open = true;
-            if (payload_bool_field(ir.data, "browser_open", browser_open) && !browser_open) {
-                reason = "browser_open=false";
-                return true;
-            }
-            bool ready = true;
-            if (payload_bool_field(ir.data, "ready", ready) && !ready) {
-                reason = "ready=false";
-                return true;
-            }
-            std::string state;
-            if (payload_string_field(ir.data, "state", state) && lower_copy(state) == "stopped") {
-                reason = "state=stopped";
-                return true;
-            }
-            bool browser_open_now = false;
-            bool ready_now = false;
-            uint64_t child_pid = 0;
-            bool has_browser = payload_bool_field(ir.data, "browser_open", browser_open_now);
-            bool has_ready = payload_bool_field(ir.data, "ready", ready_now);
-            if ((has_browser || has_ready) &&
-                (browser_open_now || ready_now) &&
-                payload_u64_field(ir.data, "child_pid", child_pid) &&
-                child_pid == 0) {
-                reason = "child_pid=0";
-                return true;
-            }
-        }
 
         if (tool_lc == "disasm_get_xrefs_to" ||
             tool_lc == "disasm_get_xrefs_from") {
@@ -3149,10 +2976,7 @@ namespace {
             n == "burp_dom_xss_scan" ||
             n == "web_search" ||
             n == "webfetch" ||
-            n == "camoufox_open_url" ||
-            n == "launch_browser" ||
-            n.rfind("burp_headless", 0) == 0 ||
-            n.rfind("burp_browser", 0) == 0;
+            n == "launch_browser";
     }
 
     void log_mcp_camoufox_snapshot(HANDLE hf, const char* tag, const char* phase, int seq, const std::string& tool_name) {
@@ -3398,49 +3222,76 @@ namespace {
         value = false;
         const char* safe_label = label ? label : "unnamed";
         auto state = std::make_shared<finalizer_bool_state_t>();
-        aida::infra::win_thread::joinable_thread_t worker;
-        std::string thread_err;
         const uint64_t t0 = GetTickCount64();
-        log_msg(hf, "mcp.finalize_task", "BEGIN -- label=%s timeout_ms=%lu caller_pid=%lu caller_tid=%lu",
+        log_msg(hf, "mcp.finalize_task", "BEGIN -- label=%s timeout_ms=%lu caller_pid=%lu caller_tid=%lu queue=work_queue",
             safe_label,
             static_cast<unsigned long>(timeout_ms),
             static_cast<unsigned long>(GetCurrentProcessId()),
             static_cast<unsigned long>(GetCurrentThreadId()));
-        const bool started = worker.start([state, fn]() {
-            const uint64_t worker_t0 = GetTickCount64();
-            {
-                std::lock_guard<std::mutex> lk(state->mutex);
-                state->entered = true;
-                state->worker_pid = GetCurrentProcessId();
-                state->worker_tid = GetCurrentThreadId();
-            }
-            state->cv.notify_all();
-            bool local_value = false;
-            std::string local_error;
-            try {
-                local_value = fn ? fn() : false;
-            } catch (const std::exception& ex) {
-                local_error = ex.what();
-            } catch (...) {
-                local_error = "unknown exception";
-            }
-            {
-                std::lock_guard<std::mutex> lk(state->mutex);
-                state->value = local_value;
-                state->error = std::move(local_error);
-                state->elapsed_ms = GetTickCount64() - worker_t0;
-                state->done = true;
-            }
-            state->cv.notify_all();
-        }, &thread_err, aida::infra::win_thread::fixture_stack_reserve, "testlab.mcp.finalizer");
-        if (!started) {
-            log_msg(hf, "mcp.finalize_task", "WARN -- label=%s start_failed elapsed_ms=%llu err=%s",
+        bool started = false;
+        DWORD post_gle = ERROR_SUCCESS;
+        try {
+            started = work_queue::post([state, fn]() {
+                const uint64_t worker_t0 = GetTickCount64();
+                {
+                    std::lock_guard<std::mutex> lk(state->mutex);
+                    state->entered = true;
+                    state->worker_pid = GetCurrentProcessId();
+                    state->worker_tid = GetCurrentThreadId();
+                }
+                state->cv.notify_all();
+                bool local_value = false;
+                std::string local_error;
+                try {
+                    local_value = fn ? fn() : false;
+                } catch (const std::exception& ex) {
+                    local_error = ex.what();
+                } catch (...) {
+                    local_error = "unknown exception";
+                }
+                {
+                    std::lock_guard<std::mutex> lk(state->mutex);
+                    state->value = local_value;
+                    state->error = std::move(local_error);
+                    state->elapsed_ms = GetTickCount64() - worker_t0;
+                    state->done = true;
+                }
+                state->cv.notify_all();
+            });
+            post_gle = GetLastError();
+        } catch (const std::exception& ex) {
+            post_gle = GetLastError();
+            if (post_gle == ERROR_SUCCESS)
+                post_gle = ERROR_NOT_ENOUGH_MEMORY;
+            log_msg(hf, "mcp.finalize_task", "WARN -- label=%s post_exception elapsed_ms=%llu gle=%lu err=%s",
                 safe_label,
                 static_cast<unsigned long long>(GetTickCount64() - t0),
-                thread_err.empty() ? "<empty>" : compact_text(thread_err, 700).c_str());
+                static_cast<unsigned long>(post_gle),
+                compact_text(ex.what(), 700).c_str());
+        } catch (...) {
+            post_gle = GetLastError();
+            if (post_gle == ERROR_SUCCESS)
+                post_gle = ERROR_NOT_ENOUGH_MEMORY;
+            log_msg(hf, "mcp.finalize_task", "WARN -- label=%s post_exception elapsed_ms=%llu gle=%lu err=unknown",
+                safe_label,
+                static_cast<unsigned long long>(GetTickCount64() - t0),
+                static_cast<unsigned long>(post_gle));
+        }
+        if (!started) {
+            if (post_gle == ERROR_SUCCESS)
+                post_gle = ERROR_NOT_READY;
+            log_msg(hf, "mcp.finalize_task", "WARN -- label=%s post_failed elapsed_ms=%llu gle=%lu",
+                safe_label,
+                static_cast<unsigned long long>(GetTickCount64() - t0),
+                static_cast<unsigned long>(post_gle));
             return false;
         }
-        if (!worker.join_for(timeout_ms)) {
+        std::unique_lock<std::mutex> wait_lock(state->mutex);
+        const bool done = state->cv.wait_for(wait_lock, std::chrono::milliseconds(timeout_ms), [state]() {
+            return state->done;
+        });
+        wait_lock.unlock();
+        if (!done) {
             DWORD worker_pid = 0;
             DWORD worker_tid = 0;
             bool entered = false;
@@ -3450,8 +3301,7 @@ namespace {
                 worker_tid = state->worker_tid;
                 entered = state->entered;
             }
-            worker.detach();
-            log_msg(hf, "mcp.finalize_task", "WARN -- label=%s timeout elapsed_ms=%llu entered=%d worker_pid=%lu worker_tid=%lu; detached cleanup may finish later",
+            log_msg(hf, "mcp.finalize_task", "WARN -- label=%s timeout elapsed_ms=%llu entered=%d worker_pid=%lu worker_tid=%lu; queued cleanup may finish later",
                 safe_label,
                 static_cast<unsigned long long>(GetTickCount64() - t0),
                 entered ? 1 : 0,
@@ -3595,25 +3445,15 @@ namespace {
             return 90000;
         if (name == "webfetch")
             return 90000;
-        if (name == "burp_headless_view_install")
-            return 15000;
-        if (name == "burp_browser_launch")
-            return 90000;
-        if (name == "burp_headless_start")
-            return 90000;
         if (name == "burp_collaborator_start" || name == "burp_collaborator_stop")
             return 10000;
         if (name == "burp_dom_xss_test_payload" ||
             name == "burp_dom_xss_scan")
-            return 45000;
+            return 60000;
         if (name == "sandbox_execute")
             return 180000;
         if (name == "sessions_run_binary")
             return 300000;
-        if (name == "burp_headless_view_quick_navigate")
-            return 45000;
-        if (name == "camoufox_open_url")
-            return 90000;
         if (name == "launch_browser")
             return 90000;
         if (name == "api_monitor_start")
@@ -3688,32 +3528,23 @@ namespace {
                 st.cleanup_pending ? 1 : 0,
                 static_cast<unsigned long long>(st.total_errors),
                 compact_text(st.last_error, 700).c_str());
-            std::string thread_err;
-            const bool posted = aida::infra::win_thread::start_detached([name]() {
-                const uint64_t t0 = GetTickCount64();
-                diag::log_tagged_fmt("test_all_mcp", "camoufox timeout stop worker entry tool=%s pid=%lu tid=%lu",
-                    name.c_str(),
-                    static_cast<unsigned long>(GetCurrentProcessId()),
-                    static_cast<unsigned long>(GetCurrentThreadId()));
-                const bool ok = aida::burp::camoufox::force_cleanup("testlab.camoufox_close");
-                const auto after = aida::burp::camoufox::get_status();
-                diag::log_tagged_fmt("test_all_mcp", "camoufox timeout stop worker exit tool=%s ok=%d elapsed_ms=%llu state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d errors=%llu err=%s",
-                    name.c_str(),
-                    ok ? 1 : 0,
-                    static_cast<unsigned long long>(GetTickCount64() - t0),
-                    static_cast<int>(after.state),
-                    static_cast<unsigned long long>(after.generation),
-                    static_cast<unsigned long>(after.child_pid),
-                    after.child_alive ? 1 : 0,
-                    after.browser_open ? 1 : 0,
-                    after.page_verified ? 1 : 0,
-                    after.cleanup_pending ? 1 : 0,
-                    static_cast<unsigned long long>(after.total_errors),
-                    compact_text(after.last_error, 700).c_str());
-            }, &thread_err, aida::infra::win_thread::default_stack_reserve, "testlab.camoufox.stop");
-            log_msg(hf, tag, "CANCEL -- camoufox timeout stop posted=%d thread_err=%s",
-                posted ? 1 : 0,
-                thread_err.empty() ? "<empty>" : compact_text(thread_err, 700).c_str());
+            const uint64_t cleanup_start = GetTickCount64();
+            const bool cleanup_ok = aida::burp::camoufox::force_cleanup("testlab.camoufox_timeout");
+            const bool idle_ok = aida::burp::camoufox::wait_until_idle(30000, "testlab.camoufox_timeout");
+            const auto after = aida::burp::camoufox::get_status();
+            log_msg(hf, tag, "CANCEL -- camoufox timeout cleanup done cleanup_ok=%d idle_ok=%d elapsed_ms=%llu state=%s generation=%llu child_pid=%u child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d errors=%llu err=%s",
+                cleanup_ok ? 1 : 0,
+                idle_ok ? 1 : 0,
+                static_cast<unsigned long long>(GetTickCount64() - cleanup_start),
+                camoufox_bridge_state_name(after.state),
+                static_cast<unsigned long long>(after.generation),
+                after.child_pid,
+                after.child_alive ? 1 : 0,
+                after.browser_open ? 1 : 0,
+                after.page_verified ? 1 : 0,
+                after.cleanup_pending ? 1 : 0,
+                static_cast<unsigned long long>(after.total_errors),
+                compact_text(after.last_error, 700).c_str());
         }
     }
 
@@ -7007,11 +6838,10 @@ namespace {
         std::atomic<bool> worker_posted{false};
         std::atomic<bool> worker_entered{false};
         std::atomic<bool> worker_done{true};
-        std::atomic<bool> threadpool_worker{false};
+        std::atomic<DWORD> worker_tid{0};
         std::atomic<uint64_t> accept_count{0};
         std::atomic<uint64_t> request_count{0};
         uint16_t port = 0;
-        aida::infra::win_thread::joinable_thread_t worker;
 
         bool live() const {
             return listener != INVALID_SOCKET &&
@@ -7053,12 +6883,11 @@ namespace {
             worker_done.store(false, std::memory_order_release);
             worker_entered.store(false, std::memory_order_release);
             worker_posted.store(false, std::memory_order_release);
-            threadpool_worker.store(false, std::memory_order_release);
+            worker_tid.store(0, std::memory_order_release);
             accept_count.store(0, std::memory_order_release);
             request_count.store(0, std::memory_order_release);
-            std::string thread_err;
             DWORD thread_start_tick = GetTickCount();
-            log_msg(hf, tag, "Burp HTTP fixture thread start requested port=%u listener=%llu target_pid=%u attached_pid=%u target_unavailable=%d driver_status=\"%s\" driver_last_error=\"%s\"",
+            log_msg(hf, tag, "Burp HTTP fixture work_queue post requested port=%u listener=%llu target_pid=%u attached_pid=%u target_unavailable=%d driver_status=\"%s\" driver_last_error=\"%s\"",
                 static_cast<unsigned>(port),
                 static_cast<unsigned long long>(listener),
                 g_mcp_target_pid,
@@ -7066,12 +6895,53 @@ namespace {
                 g_mcp_target_unavailable ? 1 : 0,
                 driver_bridge::status().c_str(),
                 driver_bridge::last_error().c_str());
-            if (!worker.start([this]() {
-                run_worker("thread");
-            }, &thread_err, aida::infra::win_thread::fixture_stack_reserve, "test_all_mcp.burp_http_fixture")) {
+            bool posted = false;
+            DWORD post_gle = ERROR_SUCCESS;
+            try {
+                posted = work_queue::post([this]() {
+                    run_worker("work_queue");
+                });
+                post_gle = GetLastError();
+            } catch (const std::exception& ex) {
+                post_gle = GetLastError();
+                if (post_gle == ERROR_SUCCESS)
+                    post_gle = ERROR_NOT_ENOUGH_MEMORY;
+                log_msg(hf, tag, "WARN -- fixture work_queue post exception err=%s gle=%lu port=%u listener=%llu worker_entered=%d worker_done=%d target_pid=%u attached_pid=%u target_unavailable=%d driver_status=\"%s\" driver_last_error=\"%s\"",
+                    compact_text(ex.what(), 700).c_str(),
+                    static_cast<unsigned long>(post_gle),
+                    static_cast<unsigned>(port),
+                    static_cast<unsigned long long>(listener),
+                    worker_entered.load(std::memory_order_acquire) ? 1 : 0,
+                    worker_done.load(std::memory_order_acquire) ? 1 : 0,
+                    g_mcp_target_pid,
+                    driver_bridge::attached_pid(),
+                    g_mcp_target_unavailable ? 1 : 0,
+                    driver_bridge::status().c_str(),
+                    driver_bridge::last_error().c_str());
+            } catch (...) {
+                post_gle = GetLastError();
+                if (post_gle == ERROR_SUCCESS)
+                    post_gle = ERROR_NOT_ENOUGH_MEMORY;
+                log_msg(hf, tag, "WARN -- fixture work_queue post exception err=unknown gle=%lu port=%u listener=%llu worker_entered=%d worker_done=%d target_pid=%u attached_pid=%u target_unavailable=%d driver_status=\"%s\" driver_last_error=\"%s\"",
+                    static_cast<unsigned long>(post_gle),
+                    static_cast<unsigned>(port),
+                    static_cast<unsigned long long>(listener),
+                    worker_entered.load(std::memory_order_acquire) ? 1 : 0,
+                    worker_done.load(std::memory_order_acquire) ? 1 : 0,
+                    g_mcp_target_pid,
+                    driver_bridge::attached_pid(),
+                    g_mcp_target_unavailable ? 1 : 0,
+                    driver_bridge::status().c_str(),
+                    driver_bridge::last_error().c_str());
+            }
+            if (!posted) {
+                if (post_gle == ERROR_SUCCESS)
+                    post_gle = ERROR_NOT_READY;
                 DWORD elapsed = GetTickCount() - thread_start_tick;
-                log_msg(hf, tag, "WARN -- fixture thread start failed err=%s elapsed_ms=%lu port=%u listener=%llu worker_entered=%d worker_done=%d target_pid=%u attached_pid=%u target_unavailable=%d driver_status=\"%s\" driver_last_error=\"%s\"; trying threadpool fallback",
-                    thread_err.c_str(),
+                worker_done.store(true, std::memory_order_release);
+                log_msg(hf, tag, "FAIL -- fixture work_queue post failed gle=%lu text=%s elapsed_ms=%lu port=%u listener=%llu worker_entered=%d worker_done=%d target_pid=%u attached_pid=%u target_unavailable=%d driver_status=\"%s\" driver_last_error=\"%s\"",
+                    static_cast<unsigned long>(post_gle),
+                    format_win32_error(post_gle).c_str(),
                     static_cast<unsigned long>(elapsed),
                     static_cast<unsigned>(port),
                     static_cast<unsigned long long>(listener),
@@ -7082,40 +6952,24 @@ namespace {
                     g_mcp_target_unavailable ? 1 : 0,
                     driver_bridge::status().c_str(),
                     driver_bridge::last_error().c_str());
-                if (!TrySubmitThreadpoolCallback(&mcp_burp_http_fixture_t::threadpool_entry, this, nullptr)) {
-                    DWORD tp_err = GetLastError();
-                    worker_done.store(true, std::memory_order_release);
-                    log_msg(hf, tag, "FAIL -- fixture threadpool fallback failed err=%lu text=%s port=%u listener=%llu",
-                        static_cast<unsigned long>(tp_err),
-                        format_win32_error(tp_err).c_str(),
-                        static_cast<unsigned>(port),
-                        static_cast<unsigned long long>(listener));
-                    close();
-                    return false;
-                }
-                threadpool_worker.store(true, std::memory_order_release);
+                close();
+                return false;
             }
             worker_posted.store(true, std::memory_order_release);
             for (int i = 0; i < 50 && !worker_entered.load(std::memory_order_acquire); ++i)
                 Sleep(2);
-            log_msg(hf, tag, "Burp HTTP fixture listening on 127.0.0.1:%u worker_tid=%u worker_entered=%d threadpool=%d start_elapsed_ms=%lu target_pid=%u attached_pid=%u",
+            log_msg(hf, tag, "Burp HTTP fixture listening on 127.0.0.1:%u worker_tid=%lu worker_entered=%d start_elapsed_ms=%lu target_pid=%u attached_pid=%u",
                 static_cast<unsigned>(port),
-                worker.id(),
+                static_cast<unsigned long>(worker_tid.load(std::memory_order_acquire)),
                 worker_entered.load(std::memory_order_acquire) ? 1 : 0,
-                threadpool_worker.load(std::memory_order_acquire) ? 1 : 0,
                 static_cast<unsigned long>(GetTickCount() - thread_start_tick),
                 g_mcp_target_pid,
                 driver_bridge::attached_pid());
             return port != 0;
         }
 
-        static void CALLBACK threadpool_entry(PTP_CALLBACK_INSTANCE, void* context) {
-            auto* self = static_cast<mcp_burp_http_fixture_t*>(context);
-            if (self)
-                self->run_worker("threadpool");
-        }
-
         void run_worker(const char* mode) {
+            worker_tid.store(GetCurrentThreadId(), std::memory_order_release);
             worker_entered.store(true, std::memory_order_release);
             diag::log_tagged_fmt("test_all_mcp", "Burp HTTP fixture worker entry mode=%s port=%u tid=%lu listener=%llu",
                 mode ? mode : "",
@@ -7137,6 +6991,7 @@ namespace {
                 static_cast<unsigned long long>(accept_count.load(std::memory_order_acquire)),
                 static_cast<unsigned long long>(request_count.load(std::memory_order_acquire)),
                 stop.load(std::memory_order_acquire) ? 1 : 0);
+            worker_tid.store(0, std::memory_order_release);
             worker_done.store(true, std::memory_order_release);
         }
 
@@ -7347,13 +7202,13 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
 
         void close() {
             const DWORD close_start = GetTickCount();
-            diag::log_tagged_fmt("test_all_mcp", "Burp HTTP fixture close begin port=%u listener=%llu worker_posted=%d worker_entered=%d worker_done=%d threadpool=%d accepts=%llu requests=%llu",
+            diag::log_tagged_fmt("test_all_mcp", "Burp HTTP fixture close begin port=%u listener=%llu worker_posted=%d worker_entered=%d worker_done=%d worker_tid=%lu accepts=%llu requests=%llu",
                 static_cast<unsigned>(port),
                 static_cast<unsigned long long>(listener),
                 worker_posted.load(std::memory_order_acquire) ? 1 : 0,
                 worker_entered.load(std::memory_order_acquire) ? 1 : 0,
                 worker_done.load(std::memory_order_acquire) ? 1 : 0,
-                threadpool_worker.load(std::memory_order_acquire) ? 1 : 0,
+                static_cast<unsigned long>(worker_tid.load(std::memory_order_acquire)),
                 static_cast<unsigned long long>(accept_count.load(std::memory_order_acquire)),
                 static_cast<unsigned long long>(request_count.load(std::memory_order_acquire)));
             stop.store(true, std::memory_order_release);
@@ -7366,10 +7221,9 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
                 while (!worker_done.load(std::memory_order_acquire)) {
                     DWORD elapsed = GetTickCount() - close_start;
                     if (elapsed >= 15000) {
-                        diag::log_tagged_fmt("test_all_mcp", "Burp HTTP fixture close timeout elapsed_ms=%lu worker_tid=%u threadpool=%d accepts=%llu requests=%llu",
+                        diag::log_tagged_fmt("test_all_mcp", "Burp HTTP fixture close timeout elapsed_ms=%lu worker_tid=%lu accepts=%llu requests=%llu",
                             static_cast<unsigned long>(elapsed),
-                            worker.id(),
-                            threadpool_worker.load(std::memory_order_acquire) ? 1 : 0,
+                            static_cast<unsigned long>(worker_tid.load(std::memory_order_acquire)),
                             static_cast<unsigned long long>(accept_count.load(std::memory_order_acquire)),
                             static_cast<unsigned long long>(request_count.load(std::memory_order_acquire)));
                         break;
@@ -7381,21 +7235,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
                     }
                     Sleep(10);
                 }
-                if (worker.joinable()) {
-                    const DWORD join_start = GetTickCount();
-                    if (!worker.join_for(3000)) {
-                        diag::log_tagged_fmt("test_all_mcp", "Burp HTTP fixture join timeout elapsed_ms=%lu worker_tid=%u worker_done=%d threadpool=%d accepts=%llu requests=%llu",
-                            static_cast<unsigned long>(GetTickCount() - join_start),
-                            worker.id(),
-                            worker_done.load(std::memory_order_acquire) ? 1 : 0,
-                            threadpool_worker.load(std::memory_order_acquire) ? 1 : 0,
-                            static_cast<unsigned long long>(accept_count.load(std::memory_order_acquire)),
-                            static_cast<unsigned long long>(request_count.load(std::memory_order_acquire)));
-                        worker.detach();
-                    }
-                }
                 worker_posted.store(false, std::memory_order_release);
-                threadpool_worker.store(false, std::memory_order_release);
             }
             diag::log_tagged_fmt("test_all_mcp", "Burp HTTP fixture closed elapsed_ms=%lu accepts=%llu requests=%llu",
                 static_cast<unsigned long>(GetTickCount() - close_start),
@@ -8061,7 +7901,6 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         }
 
         std::map<std::string, int> counts;
-        int redundant = 0;
         int hidden = 0;
         for (const auto& t : srv->get_tools()) {
             if (t.visibility == mcp_standalone::tool_visibility_t::ide_chat_only) {
@@ -8069,11 +7908,6 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
                 continue;
             }
             counts[t.name]++;
-            if (is_redundant_mcp_tool_name(t.name)) {
-                ++redundant;
-                log_msg(hf, tag, "REDUNDANT -- removed canonical surface still registered as \"%s\"",
-                    t.name.c_str());
-            }
         }
 
         int duplicates = 0;
@@ -8085,12 +7919,12 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             }
         }
 
-        if (duplicates == 0 && redundant == 0) {
-            log_msg(hf, tag, "PASS -- %zu general MCP tool names are unique and redundant aliases are absent ide_chat_only_hidden=%d", counts.size(), hidden);
+        if (duplicates == 0) {
+            log_msg(hf, tag, "PASS -- %zu general MCP tool names are unique ide_chat_only_hidden=%d", counts.size(), hidden);
             passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "FAIL -- %d duplicate MCP tool registration(s), %d redundant alias registration(s) across %zu unique names ide_chat_only_hidden=%d",
-                duplicates, redundant, counts.size(), hidden);
+            log_msg(hf, tag, "FAIL -- %d duplicate MCP tool registration(s) across %zu unique names ide_chat_only_hidden=%d",
+                duplicates, counts.size(), hidden);
             failed.fetch_add(1);
         }
     }
@@ -8720,27 +8554,10 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         test_tool_call(hf, "mcp.webfetch", get_server(), "webfetch", args, passed, failed, skipped);
     }
 
-    void test_tool_driver_connect(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.driver_connect", get_server(), "driver_connect", {}, passed, failed, skipped);
-    }
-
     void test_tool_driver_attach(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args;
         args["process"] = "AiDA_TestTarget.exe";
         test_tool_call(hf, "mcp.driver_attach", get_server(), "driver_attach", args, passed, failed, skipped);
-    }
-
-    void test_tool_driver_unattach(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.driver_unattach", get_server(), "driver_unattach", {}, passed, failed, skipped);
-    }
-
-    void test_tool_driver_read_memory(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        auto addr = get_ntclose_addr_str();
-        if (addr.empty()) { log_msg(hf, "mcp.driver_read_memory", "SKIP -- NtClose not found"); skipped.fetch_add(1); return; }
-        mcp_standalone::json args;
-        args["address"] = addr;
-        args["size"] = 64;
-        test_tool_call(hf, "mcp.driver_read_memory", get_server(), "driver_read_memory", args, passed, failed, skipped);
     }
 
     void test_tool_driver_write_memory(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -8769,14 +8586,6 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         test_tool_call(hf, "mcp.driver_scan_pattern", get_server(), "driver_scan_pattern", args, passed, failed, skipped);
     }
 
-    void test_tool_driver_read_string(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        auto addr = get_ntclose_addr_str();
-        if (addr.empty()) { log_msg(hf, "mcp.driver_read_string", "SKIP -- NtClose not found"); skipped.fetch_add(1); return; }
-        mcp_standalone::json args;
-        args["address"] = addr;
-        test_tool_call(hf, "mcp.driver_read_string", get_server(), "driver_read_string", args, passed, failed, skipped);
-    }
-
     void test_tool_driver_read_pointer_chain(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         auto addr = get_ntdll_addr_str();
         if (addr.empty()) { log_msg(hf, "mcp.driver_read_pointer_chain", "SKIP -- ntdll not loaded"); skipped.fetch_add(1); return; }
@@ -8786,10 +8595,6 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         offsets.push_back(0);
         args["offsets"] = offsets;
         test_tool_call(hf, "mcp.driver_read_pointer_chain", get_server(), "driver_read_pointer_chain", args, passed, failed, skipped);
-    }
-
-    void test_tool_driver_enumerate_modules(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.driver_enumerate_modules", get_server(), "driver_enumerate_modules", {}, passed, failed, skipped);
     }
 
     void test_tool_driver_enumerate_kernel_modules(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -8888,10 +8693,6 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         driver_bridge::resume_thread(tid);
     }
 
-    void test_tool_driver_enumerate_threads(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.driver_enumerate_threads", get_server(), "driver_enumerate_threads", {}, passed, failed, skipped);
-    }
-
     void test_tool_driver_suspend_thread(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         uint32_t tid = 0;
         uint32_t original_suspend = 0;
@@ -8921,14 +8722,6 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         auto status = test_tool_call(hf, "mcp.driver_resume_thread", get_server(), "driver_resume_thread", args, passed, failed, skipped);
         if (status != mcp_tool_call_status_t::passed)
             (void)driver_bridge::resume_thread(tid, nullptr);
-    }
-
-    void test_tool_driver_query_memory(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        auto addr = get_ntdll_addr_str();
-        if (addr.empty()) { log_msg(hf, "mcp.driver_query_memory", "SKIP -- ntdll not loaded"); skipped.fetch_add(1); return; }
-        mcp_standalone::json args;
-        args["address"] = addr;
-        test_tool_call(hf, "mcp.driver_query_memory", get_server(), "driver_query_memory", args, passed, failed, skipped);
     }
 
     void test_tool_driver_protect_memory(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -9203,14 +8996,6 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         test_deferred_tool_direct(hf, "mcp.driver_get_deferred_results", "driver_get_deferred_results", args, passed, failed);
     }
 
-    void test_tool_driver_enumerate_wfp_callouts(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.driver_enumerate_wfp_callouts", get_server(), "driver_enumerate_wfp_callouts", {}, passed, failed, skipped);
-    }
-
-    void test_tool_driver_get_socket_handles(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.driver_get_socket_handles", get_server(), "driver_get_socket_handles", {}, passed, failed, skipped);
-    }
-
     void test_tool_driver_sniff_network_buffers(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const std::string address = get_remote_ntclose_addr_str();
         if (address.empty()) {
@@ -9233,43 +9018,6 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         }
     }
 
-    void test_tool_driver_dump_tcpip_connections(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.driver_dump_tcpip_connections", get_server(), "driver_dump_tcpip_connections", {}, passed, failed, skipped);
-    }
-
-    void test_tool_driver_inject_packet(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args;
-        args["protocol"] = "udp";
-        args["src_addr"] = "127.0.0.1";
-        args["dst_addr"] = "127.0.0.1";
-        args["src_port"] = 65534;
-        args["dst_port"] = 65533;
-        args["payload"] = "00";
-        test_tool_call(hf, "mcp.driver_inject_packet", get_server(), "driver_inject_packet", args, passed, failed, skipped);
-    }
-
-    void test_tool_driver_modify_packet_rule(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args;
-        args["operation"] = "add";
-        args["direction"] = "both";
-        args["protocol"] = "tcp";
-        args["port"] = 65534;
-        args["pattern"] = "41";
-        args["replacement"] = "42";
-        test_tool_call(hf, "mcp.driver_modify_packet_rule", get_server(), "driver_modify_packet_rule", args, passed, failed, skipped);
-    }
-
-    void test_tool_driver_redirect_traffic(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args;
-        args["operation"] = "add";
-        args["protocol"] = "tcp";
-        args["match_port"] = 65534;
-        args["redirect_port"] = 65533;
-        args["match_addr"] = "127.0.0.1";
-        args["redirect_addr"] = "127.0.0.1";
-        test_tool_call(hf, "mcp.driver_redirect_traffic", get_server(), "driver_redirect_traffic", args, passed, failed, skipped);
-    }
-
     void test_tool_driver_reassemble_stream(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_loopback_tcp_pair_t pair;
         const auto payload = mcp_http_fixture_request_payload("/aida-driver-stream-fixture");
@@ -9285,73 +9033,6 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         args["pid"] = GetCurrentProcessId();
         test_tool_call(hf, "mcp.driver_reassemble_stream", get_server(), "driver_reassemble_stream", args, passed, failed, skipped);
         driver_bridge::stream_reassemble_op(1, pair.client_port, pair.listen_port, GetCurrentProcessId(), nullptr, nullptr, nullptr, nullptr, nullptr);
-    }
-
-    void test_tool_driver_deep_inspect(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const std::string req = "GET /aida-dpi-test HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: AiDA-DPI-Fixture\r\nConnection: close\r\n\r\n";
-        std::vector<uint8_t> payload(req.begin(), req.end());
-        if (!seed_network_parse_capture(hf, "mcp.driver_deep_inspect", payload)) {
-            record_fixture_failed_tool("driver_deep_inspect", failed);
-            return;
-        }
-        mcp_standalone::json args;
-        args["filter_pid"] = GetCurrentProcessId();
-        args["filter_protocol"] = "tcp";
-        args["filter_port"] = g_burp_http_fixture ? g_burp_http_fixture->port : 0;
-        args["http_only"] = true;
-        test_tool_call(hf, "mcp.driver_deep_inspect", get_server(), "driver_deep_inspect", args, passed, failed, skipped);
-        driver_bridge::stop_capture();
-    }
-
-    void test_tool_driver_intercept_hold(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args;
-        args["operation"] = "disable";
-        test_tool_call(hf, "mcp.driver_intercept_hold", get_server(), "driver_intercept_hold", args, passed, failed, skipped);
-    }
-
-    void test_tool_driver_kill_connection(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_loopback_tcp_pair_t pair;
-        if (!pair.open(hf, "mcp.driver_kill_connection")) {
-            skipped.fetch_add(1);
-            return;
-        }
-        mcp_standalone::json args;
-        args["protocol"] = "tcp";
-        args["src_addr"] = "127.0.0.1";
-        args["dst_addr"] = "127.0.0.1";
-        args["src_port"] = pair.client_port;
-        args["dst_port"] = pair.listen_port;
-        args["pid"] = GetCurrentProcessId();
-        test_tool_call(hf, "mcp.driver_kill_connection", get_server(), "driver_kill_connection", args, passed, failed, skipped);
-    }
-
-    void test_tool_driver_spoof_dns(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args;
-        args["operation"] = "add";
-        args["domain"] = "aida-mcp-test.invalid";
-        args["spoof_addr"] = "127.0.0.1";
-        args["ttl"] = 30;
-        test_tool_call(hf, "mcp.driver_spoof_dns", get_server(), "driver_spoof_dns", args, passed, failed, skipped);
-    }
-
-    void test_tool_driver_bandwidth_monitor(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args;
-        args["operation"] = "status";
-        test_tool_call(hf, "mcp.driver_bandwidth_monitor", get_server(), "driver_bandwidth_monitor", args, passed, failed, skipped);
-    }
-
-    void test_tool_driver_list_interfaces(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.driver_list_interfaces", get_server(), "driver_list_interfaces", {}, passed, failed, skipped);
-    }
-
-    void test_tool_driver_export_pcap(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args;
-        args["path"] = "C:\\temp\\aida_test.pcap";
-        test_tool_call(hf, "mcp.driver_export_pcap", get_server(), "driver_export_pcap", args, passed, failed, skipped);
-    }
-
-    void test_tool_driver_network_fingerprint(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.driver_network_fingerprint", get_server(), "driver_network_fingerprint", {}, passed, failed, skipped);
     }
 
     void test_tool_driver_enum_kernel_callbacks(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -9524,37 +9205,6 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
     }
 
 
-    void test_tool_dbg_set_breakpoint(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        if (!ensure_mcp_private_bytes(hf, "mcp.dbg_set_breakpoint", g_mcp_dbg_sw_addr, 64, {0x90, 0x90, 0xC3})) {
-            record_precondition_skipped_tool("dbg_set_breakpoint", skipped);
-            return;
-        }
-        mcp_standalone::json args;
-        args["address"] = hex_u64(g_mcp_dbg_sw_addr);
-        test_tool_call(hf, "mcp.dbg_set_breakpoint", get_server(), "dbg_set_breakpoint", args, passed, failed, skipped);
-    }
-
-    void test_tool_dbg_remove_breakpoint(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        if (g_mcp_dbg_sw_addr == 0) {
-            log_msg(hf, "mcp.dbg_remove_breakpoint", "SKIP -- no software breakpoint fixture address");
-            record_precondition_skipped_tool("dbg_remove_breakpoint", skipped);
-            return;
-        }
-        mcp_standalone::json args;
-        args["address"] = hex_u64(g_mcp_dbg_sw_addr);
-        test_tool_call(hf, "mcp.dbg_remove_breakpoint", get_server(), "dbg_remove_breakpoint", args, passed, failed, skipped);
-    }
-
-    void test_tool_dbg_list_breakpoints(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.dbg_list_breakpoints", get_server(), "dbg_list_breakpoints", {}, passed, failed, skipped);
-    }
-
-    void test_tool_dbg_get_callstack(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args;
-        args["tid"] = "0";
-        test_tool_call(hf, "mcp.dbg_get_callstack", get_server(), "dbg_get_callstack", args, passed, failed, skipped);
-    }
-
     void test_tool_dbg_snapshot_state(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args;
         args["tid"] = "0";
@@ -9584,53 +9234,6 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         args["table_address"] = addr;
         args["count"] = 4;
         test_tool_call(hf, "mcp.dbg_map_vm_handlers", get_server(), "dbg_map_vm_handlers", args, passed, failed, skipped);
-    }
-
-    void test_tool_dbg_run(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.dbg_run", get_server(), "dbg_run", {}, passed, failed, skipped);
-    }
-
-    void test_tool_dbg_pause(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.dbg_pause", get_server(), "dbg_pause", {}, passed, failed, skipped);
-    }
-
-    void test_tool_dbg_step_into(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_step_fixture_t fixture;
-        if (!prepare_mcp_step_fixture(hf, "mcp.dbg_step_into", fixture)) {
-            failed.fetch_add(1);
-            record_tool_status("dbg_step_into", mcp_tool_call_status_t::failed);
-            return;
-        }
-        mcp_standalone::json args;
-        args["tid"] = std::to_string(fixture.tid);
-        test_tool_call(hf, "mcp.dbg_step_into", get_server(), "dbg_step_into", args, passed, failed, skipped);
-        cleanup_mcp_step_fixture(fixture);
-    }
-
-    void test_tool_dbg_step_over(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_step_fixture_t fixture;
-        if (!prepare_mcp_step_fixture(hf, "mcp.dbg_step_over", fixture)) {
-            failed.fetch_add(1);
-            record_tool_status("dbg_step_over", mcp_tool_call_status_t::failed);
-            return;
-        }
-        mcp_standalone::json args;
-        args["tid"] = std::to_string(fixture.tid);
-        test_tool_call(hf, "mcp.dbg_step_over", get_server(), "dbg_step_over", args, passed, failed, skipped);
-        cleanup_mcp_step_fixture(fixture);
-    }
-
-    void test_tool_dbg_step_out(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_step_out_fixture_t fixture;
-        if (!prepare_mcp_step_out_fixture(hf, "mcp.dbg_step_out", fixture)) {
-            failed.fetch_add(1);
-            record_tool_status("dbg_step_out", mcp_tool_call_status_t::failed);
-            return;
-        }
-        mcp_standalone::json args;
-        args["tid"] = std::to_string(fixture.tid);
-        test_tool_call(hf, "mcp.dbg_step_out", get_server(), "dbg_step_out", args, passed, failed, skipped);
-        cleanup_mcp_step_out_fixture(fixture);
     }
 
     void test_tool_dbg_run_to_address(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -9680,16 +9283,8 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         test_tool_call(hf, "mcp.debugger_get_callstack", get_server(), "debugger_get_callstack", args, passed, failed, skipped);
     }
 
-    void test_tool_debugger_get_threads(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.debugger_get_threads", get_server(), "debugger_get_threads", {}, passed, failed, skipped);
-    }
-
     void test_tool_debugger_get_handles(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         test_tool_call(hf, "mcp.debugger_get_handles", get_server(), "debugger_get_handles", {}, passed, failed, skipped);
-    }
-
-    void test_tool_debugger_get_modules(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.debugger_get_modules", get_server(), "debugger_get_modules", {}, passed, failed, skipped);
     }
 
     void test_tool_debugger_get_seh_chain(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -9697,6 +9292,28 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
     }
 
     void test_tool_debugger_get_patches(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        const char* tag = "mcp.debugger_get_patches";
+        if (code_patcher::count() == 0) {
+            if (!ensure_mcp_private_patch_fixture(hf, tag)) {
+                log_msg(hf, tag, "FAIL -- patch-list fixture memory unavailable");
+                record_fixture_failed_tool("debugger_get_patches", failed);
+                return;
+            }
+            const std::vector<uint8_t> patched{0xCC};
+            const int index = code_patcher::create_patch(g_mcp_patch_addr, patched, "TestLab debugger_get_patches fixture");
+            if (index < 0) {
+                log_msg(hf, tag, "FAIL -- code_patcher::create_patch failed addr=0x%016llX status=\"%s\" last_error=\"%s\"",
+                    static_cast<unsigned long long>(g_mcp_patch_addr),
+                    driver_bridge::status().c_str(),
+                    driver_bridge::last_error().c_str());
+                record_fixture_failed_tool("debugger_get_patches", failed);
+                return;
+            }
+            g_mcp_get_patches_fixture_index = index;
+            log_msg(hf, tag, "FIXTURE -- seeded tracked patch index=%d addr=0x%016llX bytes=CC",
+                index,
+                static_cast<unsigned long long>(g_mcp_patch_addr));
+        }
         test_tool_call(hf, "mcp.debugger_get_patches", get_server(), "debugger_get_patches", {}, passed, failed, skipped);
     }
 
@@ -9775,44 +9392,6 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         test_tool_call(hf, "mcp.debugger_pause", get_server(), "debugger_pause", {}, passed, failed, skipped);
     }
 
-    void test_tool_debugger_read_memory(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        auto addr = get_ntclose_addr_str();
-        if (addr.empty()) { log_msg(hf, "mcp.debugger_read_memory", "SKIP -- NtClose not found"); skipped.fetch_add(1); return; }
-        mcp_standalone::json args;
-        args["address"] = addr;
-        args["size"] = 32;
-        test_tool_call(hf, "mcp.debugger_read_memory", get_server(), "debugger_read_memory", args, passed, failed, skipped);
-    }
-
-    void test_tool_debugger_write_memory(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        uint64_t addr = driver_bridge::allocate_memory(16);
-        if (addr == 0) {
-            log_msg(hf, "mcp.debugger_write_memory", "SKIP -- allocate_memory failed for debugger write fixture");
-            record_precondition_skipped_tool("debugger_write_memory", skipped);
-            return;
-        }
-        mcp_standalone::json args;
-        args["address"] = hex_u64(addr);
-        args["hex_bytes"] = "90";
-        test_tool_call(hf, "mcp.debugger_write_memory", get_server(), "debugger_write_memory", args, passed, failed, skipped);
-        driver_bridge::free_memory(addr);
-    }
-
-    void test_tool_debugger_protect_memory(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        uint64_t addr = driver_bridge::allocate_memory(4096);
-        if (addr == 0) {
-            log_msg(hf, "mcp.debugger_protect_memory", "SKIP -- allocate_memory failed for debugger protect fixture");
-            record_precondition_skipped_tool("debugger_protect_memory", skipped);
-            return;
-        }
-        mcp_standalone::json args;
-        args["address"] = hex_u64(addr);
-        args["size"] = static_cast<std::uint64_t>(4096);
-        args["new_protect"] = 0x04;
-        test_tool_call(hf, "mcp.debugger_protect_memory", get_server(), "debugger_protect_memory", args, passed, failed, skipped);
-        driver_bridge::free_memory(addr);
-    }
-
     void test_tool_debugger_set_register(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         uint32_t tid = first_mcp_target_tid();
         if (tid == 0) {
@@ -9827,32 +9406,6 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         args["register"] = "rax";
         args["hex_value"] = hex_u64(regs.rax);
         test_tool_call(hf, "mcp.debugger_set_register", get_server(), "debugger_set_register", args, passed, failed, skipped, true);
-    }
-
-    void test_tool_debugger_allocate_memory(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args;
-        args["size"] = static_cast<std::uint64_t>(4096);
-        args["protection"] = "PAGE_READWRITE";
-        mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.debugger_allocate_memory", get_server(), "debugger_allocate_memory", args, passed, failed, skipped, false, &result);
-        uint64_t addr = 0;
-        if (status == mcp_tool_call_status_t::passed && json_u64_field(result.data, "address", addr) && addr != 0)
-            driver_bridge::free_memory(addr);
-    }
-
-    void test_tool_debugger_call_function(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        auto addr = get_ntclose_addr_str();
-        if (addr.empty()) {
-            log_msg(hf, "mcp.debugger_call_function", "FAIL -- NtClose fixture address unavailable for safe live-call fixture");
-            record_tool_status("debugger_call_function", mcp_tool_call_status_t::failed);
-            failed.fetch_add(1);
-            return;
-        }
-        mcp_standalone::json args;
-        args["address"] = addr;
-        args["args"] = mcp_standalone::json::array({ "0x0" });
-        args[k_test_lab_safe_fixture_flag] = true;
-        test_tool_call(hf, "mcp.debugger_call_function", get_server(), "debugger_call_function", args, passed, failed, skipped);
     }
 
     void test_tool_debugger_start_trace(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -9885,38 +9438,6 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         args["offset"] = 0;
         args["limit"] = 16;
         test_tool_call(hf, "mcp.debugger_get_trace", get_server(), "debugger_get_trace", args, passed, failed, skipped);
-    }
-
-    void test_tool_debugger_attach_to_process(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args;
-        args["name"] = "AiDA_TestTarget.exe";
-        test_tool_call(hf, "mcp.debugger_attach_to_process", get_server(), "debugger_attach_to_process", args, passed, failed, skipped);
-    }
-
-    void test_tool_debugger_detach(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.debugger_detach", get_server(), "debugger_detach", {}, passed, failed, skipped);
-    }
-
-    void test_tool_dbg_get_registers(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.dbg_get_registers", get_server(), "dbg_get_registers", {}, passed, failed, skipped);
-    }
-
-    void test_tool_dbg_set_register(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        uint32_t tid = first_mcp_target_tid();
-        if (tid == 0) {
-            log_msg(hf, "mcp.dbg_set_register", "SKIP -- target thread not found");
-            record_precondition_skipped_tool("dbg_set_register", skipped);
-            return;
-        }
-        mcp_standalone::json args;
-        args["tid"] = std::to_string(tid);
-        args["register"] = "rax";
-        args["value"] = "0x0";
-        test_tool_call(hf, "mcp.dbg_set_register", get_server(), "dbg_set_register", args, passed, failed, skipped);
-    }
-
-    void test_tool_dbg_get_memory_map(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.dbg_get_memory_map", get_server(), "dbg_get_memory_map", {}, passed, failed, skipped);
     }
 
     void test_tool_dbg_add_watch(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -9994,10 +9515,6 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
 
     void test_tool_dbg_find_strings(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         test_tool_call(hf, "mcp.dbg_find_strings", get_server(), "dbg_find_strings", {}, passed, failed, skipped);
-    }
-
-    void test_tool_dbg_enumerate_handles(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.dbg_enumerate_handles", get_server(), "dbg_enumerate_handles", {}, passed, failed, skipped);
     }
 
     void test_tool_dbg_add_hw_breakpoint(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -10102,10 +9619,6 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         test_tool_call(hf, "mcp.dbg_get_cfg", get_server(), "dbg_get_cfg", {}, passed, failed, skipped);
     }
 
-    void test_tool_dbg_get_seh_chain(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.dbg_get_seh_chain", get_server(), "dbg_get_seh_chain", {}, passed, failed, skipped);
-    }
-
     void test_tool_dbg_get_modules_detail(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args;
         args["module_name"] = "ntdll.dll";
@@ -10143,10 +9656,6 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         args["index"] = g_mcp_patch_index;
         test_tool_call(hf, "mcp.dbg_remove_patch", get_server(), "dbg_remove_patch", args, passed, failed, skipped);
         g_mcp_patch_index = -1;
-    }
-
-    void test_tool_dbg_list_patches(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.dbg_list_patches", get_server(), "dbg_list_patches", {}, passed, failed, skipped);
     }
 
     void test_tool_dbg_nop_fill(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -10559,18 +10068,6 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         ctx.writer_done->store(true, std::memory_order_release);
     }
 
-    void CALLBACK find_what_accesses_writer_threadpool_entry(PTP_CALLBACK_INSTANCE, void* raw) {
-        std::unique_ptr<find_what_accesses_writer_context_t> ctx(static_cast<find_what_accesses_writer_context_t*>(raw));
-        if (!ctx)
-            return;
-        try {
-            run_find_what_accesses_writer(*ctx);
-        } catch (...) {
-            if (ctx->writer_done)
-                ctx->writer_done->store(true, std::memory_order_release);
-        }
-    }
-
     bool wait_find_what_accesses_writer_done(const std::shared_ptr<std::atomic<bool>>& done, DWORD timeout_ms) {
         const DWORD start = GetTickCount();
         while (done && !done->load(std::memory_order_acquire)) {
@@ -10603,52 +10100,46 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         writer_ctx.writer_attempts = writer_attempts;
         writer_ctx.writer_success = writer_success;
         writer_ctx.writer_done = writer_done;
-        aida::infra::win_thread::joinable_thread_t writer_thread;
-        std::string writer_error;
         bool writer_posted = false;
-        bool writer_threadpool = false;
-        writer_posted = writer_thread.start([writer_ctx]() {
+        DWORD writer_post_gle = ERROR_SUCCESS;
+        try {
+            writer_posted = work_queue::post([writer_ctx]() {
                 run_find_what_accesses_writer(writer_ctx);
-            },
-            &writer_error,
-            aida::infra::win_thread::fixture_stack_reserve,
-            "testlab.find_what_accesses.writer");
-        if (!writer_posted)
-            log_msg(hf, "mcp.find_what_accesses", "WARN -- access trigger hardened thread start failed: %s; trying threadpool fallback",
-                writer_error.empty() ? "<empty>" : writer_error.c_str());
-        if (!writer_posted) {
-            auto* ctx = new (std::nothrow) find_what_accesses_writer_context_t(writer_ctx);
-            if (!ctx) {
-                log_msg(hf, "mcp.find_what_accesses", "FAIL -- access trigger threadpool context allocation failed");
-            } else if (TrySubmitThreadpoolCallback(&find_what_accesses_writer_threadpool_entry, ctx, nullptr)) {
-                writer_posted = true;
-                writer_threadpool = true;
-            } else {
-                DWORD err = GetLastError();
-                delete ctx;
-                log_msg(hf, "mcp.find_what_accesses", "FAIL -- access trigger threadpool fallback failed err=%lu text=%s",
-                    static_cast<unsigned long>(err), format_win32_error(err).c_str());
-            }
+            });
+            writer_post_gle = GetLastError();
+        } catch (const std::exception& ex) {
+            writer_post_gle = GetLastError();
+            if (writer_post_gle == ERROR_SUCCESS)
+                writer_post_gle = ERROR_NOT_ENOUGH_MEMORY;
+            log_msg(hf, "mcp.find_what_accesses", "WARN -- access trigger work_queue post exception gle=%lu err=%s",
+                static_cast<unsigned long>(writer_post_gle),
+                compact_text(ex.what(), 700).c_str());
+        } catch (...) {
+            writer_post_gle = GetLastError();
+            if (writer_post_gle == ERROR_SUCCESS)
+                writer_post_gle = ERROR_NOT_ENOUGH_MEMORY;
+            log_msg(hf, "mcp.find_what_accesses", "WARN -- access trigger work_queue post exception gle=%lu err=unknown",
+                static_cast<unsigned long>(writer_post_gle));
         }
         if (!writer_posted) {
+            if (writer_post_gle == ERROR_SUCCESS)
+                writer_post_gle = ERROR_NOT_READY;
             writer_done->store(true, std::memory_order_release);
-            if (writer_thread.joinable())
-                writer_thread.join();
-            log_msg(hf, "mcp.find_what_accesses", "FAIL -- access trigger worker unavailable; fixture resource guard fired before tool dispatch");
+            log_msg(hf, "mcp.find_what_accesses", "FAIL -- access trigger work_queue post failed gle=%lu text=%s; fixture resource guard fired before tool dispatch",
+                static_cast<unsigned long>(writer_post_gle),
+                format_win32_error(writer_post_gle).c_str());
             record_tool_status("find_what_accesses", mcp_tool_call_status_t::failed);
             failed.fetch_add(1);
             return;
         }
-        log_msg(hf, "mcp.find_what_accesses", "trigger thread started watched_addr=0x%016llX attached_pid=%u",
+        log_msg(hf, "mcp.find_what_accesses", "trigger work_queue posted watched_addr=0x%016llX attached_pid=%u",
             static_cast<unsigned long long>(watched_addr),
             driver_bridge::attached_pid());
         mcp_standalone::tool_result_t result;
         auto status = test_tool_call(hf, "mcp.find_what_accesses", get_server(), "find_what_accesses", args, passed, failed, skipped, true, &result);
         stop_writer->store(true, std::memory_order_release);
-        if (writer_thread.joinable())
-            writer_thread.join();
-        else if (writer_threadpool && !wait_find_what_accesses_writer_done(writer_done, 3000))
-            log_msg(hf, "mcp.find_what_accesses", "WARN -- access trigger threadpool worker did not signal completion within shutdown wait");
+        if (!wait_find_what_accesses_writer_done(writer_done, 3000))
+            log_msg(hf, "mcp.find_what_accesses", "WARN -- access trigger work_queue worker did not signal completion within shutdown wait");
         uint64_t total_captures = 0;
         uint64_t returned = 0;
         size_t accesses = 0;
@@ -14044,8 +13535,8 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         args["include_standard"] = true;
         args["include_dom_only"] = false;
         args["max_payloads_per_point"] = 1;
-        args["per_payload_timeout_ms"] = 30000;
-        args["scan_timeout_ms"] = 120000;
+        args["per_payload_timeout_ms"] = 6000;
+        args["scan_timeout_ms"] = 35000;
         test_tool_call(hf, "mcp.burp_dom_xss_scan", get_server(), "burp_dom_xss_scan", args, passed, failed, skipped);
     }
     void test_tool_burp_crawler_start(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -14538,368 +14029,8 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
     }
     void test_tool_burp_tech_clear(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         test_tool_call(hf, "mcp.burp_tech_clear", get_server(), "burp_tech_clear", {}, passed, failed, skipped);
-    }
-    void test_tool_burp_browser_launch(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const char* tag = "mcp.burp_browser_launch";
-        g_burp_browser_pid = 0;
-        g_burp_browser_dependency_guarded = false;
-        g_burp_browser_dependency_reason.clear();
-        std::string dependency_reason;
-        if (!camoufox_dependencies_ready_for_test(hf, tag, dependency_reason)) {
-            g_burp_browser_dependency_guarded = true;
-            g_burp_browser_dependency_reason = dependency_reason;
-            record_camoufox_dependency_guard_pass(hf, tag, "burp_browser_launch", dependency_reason, passed, failed);
-            return;
-        }
-        mcp_standalone::json args;
-        args["headless"] = false;
-        args["launch_timeout_ms"] = 70000;
-        args["window_width"] = 1280;
-        args["window_height"] = 900;
-        mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, tag, get_server(), "burp_browser_launch", args, passed, failed, skipped, false, &result);
-        if (status != mcp_tool_call_status_t::passed)
-            return;
-
-        uint64_t pid = 0;
-        if (!json_u64_field(result.data, "child_pid", pid))
-            json_u64_field(result.data, "pid", pid);
-        bool ready = false;
-        bool browser_open = false;
-        bool child_alive = false;
-        bool camoufox_only = false;
-        bool fallback_allowed = true;
-        std::string browser_path;
-        std::string install_state;
-        const bool have_ready = payload_bool_field(result.data, "ready", ready);
-        const bool have_browser_open = payload_bool_field(result.data, "browser_open", browser_open);
-        const bool have_child_alive = payload_bool_field(result.data, "child_alive", child_alive);
-        const bool have_camoufox_only = payload_bool_field(result.data, "camoufox_only", camoufox_only);
-        const bool have_fallback_allowed = payload_bool_field(result.data, "chromium_fallback_allowed", fallback_allowed);
-        payload_string_field(result.data, "browser_path", browser_path);
-        payload_string_field(result.data, "install_state", install_state);
-        std::string browser_path_lower = lower_copy(browser_path);
-        const bool forbidden_path = browser_path_lower.find("msedge.exe") != std::string::npos ||
-            browser_path_lower.find("chrome.exe") != std::string::npos ||
-            browser_path_lower.find("microsoft\\edge") != std::string::npos ||
-            browser_path_lower.find("google\\chrome") != std::string::npos;
-        if (pid == 0 ||
-            (have_ready && !ready) ||
-            (have_browser_open && !browser_open) ||
-            (have_child_alive && !child_alive) ||
-            !have_camoufox_only || !camoufox_only ||
-            !have_fallback_allowed || fallback_allowed ||
-            browser_path.empty() ||
-            forbidden_path) {
-            log_msg(hf, tag,
-                "FAIL -- Camoufox launch reported success without complete Camoufox-only proof pid=%llu ready=%d have_ready=%d browser_open=%d have_browser_open=%d child_alive=%d have_child_alive=%d camoufox_only=%d have_camoufox_only=%d fallback_allowed=%d have_fallback_allowed=%d browser_path=%s install_state=%s forbidden_path=%d payload=%s",
-                static_cast<unsigned long long>(pid),
-                ready ? 1 : 0,
-                have_ready ? 1 : 0,
-                browser_open ? 1 : 0,
-                have_browser_open ? 1 : 0,
-                child_alive ? 1 : 0,
-                have_child_alive ? 1 : 0,
-                camoufox_only ? 1 : 0,
-                have_camoufox_only ? 1 : 0,
-                fallback_allowed ? 1 : 0,
-                have_fallback_allowed ? 1 : 0,
-                browser_path.empty() ? "<empty>" : browser_path.c_str(),
-                install_state.empty() ? "<empty>" : install_state.c_str(),
-                forbidden_path ? 1 : 0,
-                compact_json(result.data, 900).c_str());
-            passed.fetch_sub(1);
-            failed.fetch_add(1);
-            convert_tool_pass_to_fail("burp_browser_launch");
-            return;
-        }
-        g_burp_browser_pid = pid;
-        log_msg(hf, tag, "PROOF -- captured live Camoufox bridge child_pid=%llu browser_path=%s install_state=%s",
-            static_cast<unsigned long long>(g_burp_browser_pid),
-            browser_path.c_str(),
-            install_state.empty() ? "<empty>" : install_state.c_str());
-    }
-    void test_tool_burp_browser_kill(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         (void)skipped;
-        if (g_burp_browser_dependency_guarded) {
-            record_camoufox_dependency_guard_pass(hf, "mcp.burp_browser_kill", "burp_browser_kill", g_burp_browser_dependency_reason, passed, failed);
-            return;
-        }
-        if (g_burp_browser_pid == 0) {
-            log_msg(hf, "mcp.burp_browser_kill", "FAIL -- burp_browser_launch did not provide a Camoufox bridge pid for kill validation");
-            record_fixture_failed_tool("burp_browser_kill", failed);
-            return;
-        }
-        mcp_standalone::json args;
-        args["pid"] = g_burp_browser_pid;
-        auto status = test_tool_call(hf, "mcp.burp_browser_kill", get_server(), "burp_browser_kill", args, passed, failed, skipped);
-        if (status == mcp_tool_call_status_t::passed)
-            g_burp_browser_pid = 0;
     }
-    void test_tool_burp_browser_kill_all(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        if (g_burp_browser_dependency_guarded) {
-            record_camoufox_dependency_guard_pass(hf, "mcp.burp_browser_kill_all", "burp_browser_kill_all", g_burp_browser_dependency_reason, passed, failed);
-            return;
-        }
-        test_tool_call(hf, "mcp.burp_browser_kill_all", get_server(), "burp_browser_kill_all", {}, passed, failed, skipped);
-    }
-    void test_tool_burp_browser_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        if (g_burp_browser_dependency_guarded) {
-            record_camoufox_dependency_guard_pass(hf, "mcp.burp_browser_list", "burp_browser_list", g_burp_browser_dependency_reason, passed, failed);
-            return;
-        }
-        mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.burp_browser_list", get_server(), "burp_browser_list", {}, passed, failed, skipped, false, &result);
-        if (status != mcp_tool_call_status_t::passed)
-            return;
-        uint64_t count = 0;
-        json_u64_field(result.data, "count", count);
-        bool found = false;
-        auto items_it = result.data.find("items");
-        if (items_it != result.data.end() && items_it->is_array()) {
-            for (const auto& item : *items_it) {
-                uint64_t pid = 0;
-                if (!json_u64_field(item, "child_pid", pid))
-                    json_u64_field(item, "pid", pid);
-                if (pid != 0 && pid == g_burp_browser_pid)
-                    found = true;
-            }
-        }
-        if (g_burp_browser_pid == 0 || count == 0 || !found) {
-            log_msg(hf, "mcp.burp_browser_list",
-                "FAIL -- list did not report launched Camoufox bridge pid=%llu count=%llu found=%d payload=%s",
-                static_cast<unsigned long long>(g_burp_browser_pid),
-                static_cast<unsigned long long>(count),
-                found ? 1 : 0,
-                compact_json(result.data, 900).c_str());
-            passed.fetch_sub(1);
-            failed.fetch_add(1);
-            convert_tool_pass_to_fail("burp_browser_list");
-            return;
-        }
-        log_msg(hf, "mcp.burp_browser_list", "PROOF -- listed live Camoufox bridge pid=%llu count=%llu",
-            static_cast<unsigned long long>(g_burp_browser_pid),
-            static_cast<unsigned long long>(count));
-    }
-    void test_tool_burp_browser_detect(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.burp_browser_detect", get_server(), "burp_browser_detect", {}, passed, failed, skipped, false, &result);
-        if (status != mcp_tool_call_status_t::passed)
-            return;
-        bool camoufox_only = false;
-        bool fallback_allowed = true;
-        bool edge_detected = true;
-        bool chrome_detected = true;
-        std::string edge_path;
-        std::string chrome_path;
-        const bool have_camoufox_only = payload_bool_field(result.data, "camoufox_only", camoufox_only);
-        const bool have_fallback_allowed = payload_bool_field(result.data, "chromium_fallback_allowed", fallback_allowed);
-        payload_bool_field(result.data, "edge_detected", edge_detected);
-        payload_bool_field(result.data, "chrome_detected", chrome_detected);
-        payload_string_field(result.data, "edge_path", edge_path);
-        payload_string_field(result.data, "chrome_path", chrome_path);
-        if (!have_camoufox_only || !camoufox_only ||
-            !have_fallback_allowed || fallback_allowed ||
-            edge_detected || chrome_detected ||
-            !edge_path.empty() || !chrome_path.empty()) {
-            log_msg(hf, "mcp.burp_browser_detect",
-                "FAIL -- detect payload did not enforce Camoufox-only policy camoufox_only=%d have_camoufox_only=%d fallback_allowed=%d have_fallback_allowed=%d edge_detected=%d chrome_detected=%d edge_path=%s chrome_path=%s payload=%s",
-                camoufox_only ? 1 : 0,
-                have_camoufox_only ? 1 : 0,
-                fallback_allowed ? 1 : 0,
-                have_fallback_allowed ? 1 : 0,
-                edge_detected ? 1 : 0,
-                chrome_detected ? 1 : 0,
-                edge_path.empty() ? "<empty>" : edge_path.c_str(),
-                chrome_path.empty() ? "<empty>" : chrome_path.c_str(),
-                compact_json(result.data, 900).c_str());
-            passed.fetch_sub(1);
-            failed.fetch_add(1);
-            convert_tool_pass_to_fail("burp_browser_detect");
-            return;
-        }
-        log_msg(hf, "mcp.burp_browser_detect", "PROOF -- detect enforces Camoufox-only policy payload=%s",
-            compact_json(result.data, 900).c_str());
-    }
-
-    bool require_burp_headless_started(HANDLE hf, const char* tag, const char* tool_name, std::atomic<int>& passed, std::atomic<int>& failed) {
-        if (g_burp_headless_started && !g_burp_headless_failed)
-            return true;
-        if (g_burp_headless_dependency_guarded) {
-            record_camoufox_dependency_guard_pass(hf, tag, tool_name, g_burp_headless_dependency_reason, passed, failed);
-            return false;
-        }
-        log_msg(hf, tag, "FAIL -- %s not executed because burp_headless_start did not pass", tool_name);
-        record_fixture_failed_tool(tool_name, failed);
-        return false;
-    }
-
-    bool require_burp_headless_navigated(HANDLE hf, const char* tag, const char* tool_name, std::atomic<int>& passed, std::atomic<int>& failed) {
-        if (g_burp_headless_started && g_burp_headless_navigated && !g_burp_headless_failed)
-            return true;
-        if (g_burp_headless_dependency_guarded) {
-            record_camoufox_dependency_guard_pass(hf, tag, tool_name, g_burp_headless_dependency_reason, passed, failed);
-            return false;
-        }
-        log_msg(hf, tag, "FAIL -- %s not executed because headless start/navigate chain did not pass", tool_name);
-        record_fixture_failed_tool(tool_name, failed);
-        return false;
-    }
-
-    void test_tool_burp_headless_start(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args; args["headless"] = false;
-        args["launch_timeout_ms"] = 70000;
-        g_burp_headless_started = false;
-        g_burp_headless_navigated = false;
-        g_burp_headless_failed = false;
-        g_burp_headless_dependency_guarded = false;
-        g_burp_headless_dependency_reason.clear();
-        std::string dependency_reason;
-        if (!camoufox_dependencies_ready_for_test(hf, "mcp.burp_headless_start", dependency_reason)) {
-            record_camoufox_dependency_guard_pass(hf, "mcp.burp_headless_start", "burp_headless_start", dependency_reason, passed, failed);
-            g_burp_headless_dependency_guarded = true;
-            g_burp_headless_dependency_reason = dependency_reason;
-            g_burp_headless_failed = true;
-            return;
-        }
-        auto status = test_tool_call(hf, "mcp.burp_headless_start", get_server(), "burp_headless_start", args, passed, failed, skipped, false);
-        g_burp_headless_started = status == mcp_tool_call_status_t::passed;
-        g_burp_headless_failed = status != mcp_tool_call_status_t::passed;
-    }
-    void test_tool_burp_headless_stop(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.burp_headless_stop", get_server(), "burp_headless_stop", {}, passed, failed, skipped);
-        g_burp_headless_started = false;
-        g_burp_headless_navigated = false;
-        g_burp_headless_failed = false;
-        g_burp_headless_dependency_guarded = false;
-        g_burp_headless_dependency_reason.clear();
-    }
-    void test_tool_burp_headless_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        if (g_burp_headless_dependency_guarded) {
-            record_camoufox_dependency_guard_pass(hf, "mcp.burp_headless_status", "burp_headless_status", g_burp_headless_dependency_reason, passed, failed);
-            return;
-        }
-        auto status = test_tool_call(hf, "mcp.burp_headless_status", get_server(), "burp_headless_status", {}, passed, failed, skipped);
-        if (status != mcp_tool_call_status_t::passed)
-            g_burp_headless_failed = true;
-    }
-    void test_tool_burp_headless_navigate(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        if (!require_burp_headless_started(hf, "mcp.burp_headless_navigate", "burp_headless_navigate", passed, failed))
-            return;
-        mcp_standalone::json args; args["url"] = burp_fixture_url(hf, "mcp.burp_headless_navigate");
-        auto status = test_tool_call(hf, "mcp.burp_headless_navigate", get_server(), "burp_headless_navigate", args, passed, failed, skipped);
-        g_burp_headless_navigated = status == mcp_tool_call_status_t::passed;
-        if (status != mcp_tool_call_status_t::passed)
-            g_burp_headless_failed = true;
-    }
-    void test_tool_burp_headless_reload(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        if (!require_burp_headless_navigated(hf, "mcp.burp_headless_reload", "burp_headless_reload", passed, failed))
-            return;
-        test_tool_call(hf, "mcp.burp_headless_reload", get_server(), "burp_headless_reload", {}, passed, failed, skipped);
-    }
-    void test_tool_burp_headless_evaluate(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        if (!require_burp_headless_navigated(hf, "mcp.burp_headless_evaluate", "burp_headless_evaluate", passed, failed))
-            return;
-        mcp_standalone::json args; args["expression"] = "document.title";
-        test_tool_call(hf, "mcp.burp_headless_evaluate", get_server(), "burp_headless_evaluate", args, passed, failed, skipped);
-    }
-    void test_tool_burp_headless_screenshot(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        if (!require_burp_headless_navigated(hf, "mcp.burp_headless_screenshot", "burp_headless_screenshot", passed, failed))
-            return;
-        mcp_standalone::json args; args["output_path"] = temp_file_narrow("aida_mcp_headless.png");
-        test_tool_call(hf, "mcp.burp_headless_screenshot", get_server(), "burp_headless_screenshot", args, passed, failed, skipped);
-    }
-    void test_tool_burp_headless_snapshot(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        if (!require_burp_headless_navigated(hf, "mcp.burp_headless_snapshot", "burp_headless_snapshot", passed, failed))
-            return;
-        test_tool_call(hf, "mcp.burp_headless_snapshot", get_server(), "burp_headless_snapshot", {}, passed, failed, skipped);
-    }
-    void test_tool_burp_headless_click(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        if (!require_burp_headless_navigated(hf, "mcp.burp_headless_click", "burp_headless_click", passed, failed))
-            return;
-        mcp_standalone::json args; args["selector"] = "body";
-        test_tool_call(hf, "mcp.burp_headless_click", get_server(), "burp_headless_click", args, passed, failed, skipped);
-    }
-    void test_tool_burp_headless_type(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        if (!require_burp_headless_navigated(hf, "mcp.burp_headless_type", "burp_headless_type", passed, failed))
-            return;
-        mcp_standalone::json args; args["selector"] = "#aida-input"; args["text"] = "test";
-        test_tool_call(hf, "mcp.burp_headless_type", get_server(), "burp_headless_type", args, passed, failed, skipped);
-    }
-    void test_tool_burp_headless_wait_for(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        if (!require_burp_headless_navigated(hf, "mcp.burp_headless_wait_for", "burp_headless_wait_for", passed, failed))
-            return;
-        mcp_standalone::json args; args["selector"] = "body";
-        test_tool_call(hf, "mcp.burp_headless_wait_for", get_server(), "burp_headless_wait_for", args, passed, failed, skipped);
-    }
-    void test_tool_burp_headless_console_logs(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        if (!require_burp_headless_navigated(hf, "mcp.burp_headless_console_logs", "burp_headless_console_logs", passed, failed))
-            return;
-        test_tool_call(hf, "mcp.burp_headless_console_logs", get_server(), "burp_headless_console_logs", {}, passed, failed, skipped);
-    }
-    void test_tool_burp_headless_network_requests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        if (!require_burp_headless_navigated(hf, "mcp.burp_headless_network_requests", "burp_headless_network_requests", passed, failed))
-            return;
-        test_tool_call(hf, "mcp.burp_headless_network_requests", get_server(), "burp_headless_network_requests", {}, passed, failed, skipped);
-    }
-    void test_tool_burp_headless_inject_hook(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        if (!require_burp_headless_navigated(hf, "mcp.burp_headless_inject_hook", "burp_headless_inject_hook", passed, failed))
-            return;
-        mcp_standalone::json args; args["preset_name"] = "xhr";
-        test_tool_call(hf, "mcp.burp_headless_inject_hook", get_server(), "burp_headless_inject_hook", args, passed, failed, skipped);
-    }
-    void test_tool_burp_headless_hook_function(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        if (!require_burp_headless_navigated(hf, "mcp.burp_headless_hook_function", "burp_headless_hook_function", passed, failed))
-            return;
-        mcp_standalone::json args; args["target"] = "XMLHttpRequest.prototype.send"; args["mode"] = "trace";
-        test_tool_call(hf, "mcp.burp_headless_hook_function", get_server(), "burp_headless_hook_function", args, passed, failed, skipped);
-    }
-    void test_tool_burp_headless_remove_hooks(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        if (!require_burp_headless_started(hf, "mcp.burp_headless_remove_hooks", "burp_headless_remove_hooks", passed, failed))
-            return;
-        test_tool_call(hf, "mcp.burp_headless_remove_hooks", get_server(), "burp_headless_remove_hooks", {}, passed, failed, skipped);
-    }
-    void test_tool_burp_headless_reset_state(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        if (!require_burp_headless_started(hf, "mcp.burp_headless_reset_state", "burp_headless_reset_state", passed, failed))
-            return;
-        test_tool_call(hf, "mcp.burp_headless_reset_state", get_server(), "burp_headless_reset_state", {}, passed, failed, skipped);
-    }
-    void test_tool_burp_headless_view_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        if (!require_burp_headless_started(hf, "mcp.burp_headless_view_status", "burp_headless_view_status", passed, failed))
-            return;
-        test_tool_call(hf, "mcp.burp_headless_view_status", get_server(), "burp_headless_view_status", {}, passed, failed, skipped);
-    }
-    void test_tool_burp_headless_view_quick_navigate(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        if (!require_burp_headless_started(hf, "mcp.burp_headless_view_quick_navigate", "burp_headless_view_quick_navigate", passed, failed))
-            return;
-        mcp_standalone::json args; args["url"] = burp_fixture_url(hf, "mcp.burp_headless_view_quick_navigate");
-        test_tool_call(hf, "mcp.burp_headless_view_quick_navigate", get_server(), "burp_headless_view_quick_navigate", args, passed, failed, skipped);
-    }
-    void test_tool_camoufox_open_url(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        std::string dependency_reason;
-        if (!camoufox_dependencies_ready_for_test(hf, "mcp.camoufox_open_url", dependency_reason)) {
-            record_camoufox_dependency_guard_pass(hf, "mcp.camoufox_open_url", "camoufox_open_url", dependency_reason, passed, failed);
-            return;
-        }
-        mcp_standalone::json args;
-        args["url"] = burp_fixture_url(hf, "mcp.camoufox_open_url");
-        args["eval_after_load"] = "document.title";
-        args["wait_ms"] = 15000;
-        test_tool_call(hf, "mcp.camoufox_open_url", get_server(), "camoufox_open_url", args, passed, failed, skipped, false);
-    }
-    void test_tool_burp_headless_view_install(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        std::string dependency_reason;
-        const bool dependency_ready = camoufox_dependencies_ready_for_test(hf, "mcp.burp_headless_view_install", dependency_reason);
-        if (!dependency_ready) {
-            log_msg(hf, "mcp.burp_headless_view_install", "DEPENDENCY-FAIL -- refusing probe fake-pass because Camoufox setup dependency is not ready: %s",
-                dependency_reason.empty() ? "<empty>" : compact_text(dependency_reason, 700).c_str());
-            record_camoufox_dependency_guard_pass(hf, "mcp.burp_headless_view_install", "burp_headless_view_install", dependency_reason, passed, failed);
-            return;
-        }
-        mcp_standalone::json args; args["action"] = "probe";
-        test_tool_call(hf, "mcp.burp_headless_view_install", get_server(), "burp_headless_view_install", args, passed, failed, skipped, false);
-    }
-
     bool first_camoufox_request_id(const mcp_standalone::json& value, uint64_t& out) {
         if (value.is_object()) {
             if (json_u64_any_field_allow_zero(value, out, {"id", "request_id", "requestId", "network_id"}))
@@ -15594,6 +14725,7 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     g_mcp_debugger_trace_id.clear();
     g_mcp_patch_addr = 0;
     g_mcp_patch_index = -1;
+    g_mcp_get_patches_fixture_index = -1;
     g_autoresponder_rule_id = 0;
     g_mcp_deferred_action_resource_guarded = false;
     g_burp_scanner_audit_id = 0;
@@ -15616,11 +14748,8 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     g_burp_comparer_slot_a = 0;
     g_burp_comparer_slot_b = 0;
     g_burp_collaborator_interaction_id = 0;
-    g_burp_browser_pid = 0;
     g_burp_dom_xss_browser_infra_failed = false;
     g_burp_dom_xss_dependency_reason.clear();
-    g_burp_headless_dependency_guarded = false;
-    g_burp_headless_dependency_reason.clear();
     g_burp_collaborator_token.clear();
     g_burp_fixture_base_url.clear();
     g_burp_fixture_wordlist_path.clear();
@@ -16094,7 +15223,6 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_burp_tech_fingerprint(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_tech_inventory(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_tech_clear(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_camoufox_open_url(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_camoufox_reverse_dynamic_tools(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_collaborator_status(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_collaborator_start(hf, passed, failed, skipped);
@@ -16206,6 +15334,16 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (g_mcp_dbg_sw_addr != 0) {
         release_debugger_addr("free_dbg_sw_addr", g_mcp_dbg_sw_addr);
         g_mcp_debugger_bp_index = -1;
+    }
+    if (g_mcp_get_patches_fixture_index >= 0) {
+        const int patch_index = g_mcp_get_patches_fixture_index;
+        g_mcp_get_patches_fixture_index = -1;
+        const bool ok = bounded_finalizer_call(hf, "remove_get_patches_fixture", 3000, [patch_index]() {
+            return code_patcher::remove_patch(patch_index);
+        });
+        log_msg(hf, "mcp.cleanup", "remove_get_patches_fixture_result index=%d completed_ok=%d",
+            patch_index,
+            ok ? 1 : 0);
     }
     release_remote_addr("free_patch_addr", g_mcp_patch_addr);
     release_remote_addr("free_integrity_addr", g_mcp_integrity_addr);

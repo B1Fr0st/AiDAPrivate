@@ -49,7 +49,7 @@
 #include "../network/burp/audit_http.hpp"
 #include "../network/burp/headless_view.hpp"
 #include "../network/network_view.hpp"
-#include "../infra/win_thread.hpp"
+#include "../infra/work_queue.hpp"
 #include "../../helpers/diag_log.hpp"
 #include "test_lab_bounded_runner.hpp"
 
@@ -58,6 +58,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cctype>
 #include <cstdarg>
 #include <cstdio>
@@ -292,7 +293,13 @@ namespace {
         SOCKET listen_socket = INVALID_SOCKET;
         uint16_t port = 0;
         std::atomic<bool> stopping{false};
-        aida::infra::win_thread::joinable_thread_t worker;
+        std::atomic<bool> worker_active{false};
+        std::atomic<DWORD> worker_tid{0};
+        std::atomic<long> active_clients{0};
+        std::mutex worker_mutex;
+        std::condition_variable worker_cv;
+        std::mutex client_mutex;
+        std::condition_variable client_cv;
 
         bool start(HANDLE hf, const char* tag) {
             if (!ensure_burp_fixture_wsa()) {
@@ -335,63 +342,157 @@ namespace {
             }
             port = ntohs(bound.sin_port);
             stopping.store(false);
-            std::string thread_err;
             DWORD thread_start_tick = GetTickCount();
-            log_msg(hf, tag, "fixture_start INFO -- thread start requested port=%u listener=%llu host_pid=%lu host_tid=%lu",
+            worker_active.store(true, std::memory_order_release);
+            worker_tid.store(0, std::memory_order_release);
+            log_msg(hf, tag, "fixture_start INFO -- work_queue post requested port=%u listener=%llu host_pid=%lu host_tid=%lu",
                 static_cast<unsigned>(port),
                 static_cast<unsigned long long>(listen_socket),
                 static_cast<unsigned long>(GetCurrentProcessId()),
                 static_cast<unsigned long>(GetCurrentThreadId()));
-            if (!worker.start([this]() { accept_loop(); }, &thread_err, aida::infra::win_thread::fixture_stack_reserve, "test_all_burp.loopback_fixture")) {
+            bool posted = false;
+            DWORD post_gle = ERROR_SUCCESS;
+            try {
+                posted = work_queue::post([this]() { accept_loop(); });
+                post_gle = GetLastError();
+            } catch (const std::exception& ex) {
+                post_gle = GetLastError();
+                if (post_gle == ERROR_SUCCESS) post_gle = ERROR_NOT_ENOUGH_MEMORY;
+                diag::log_tagged_fmt("testlab_burp", "loopback_fixture_post_exception gle=%lu err=%s",
+                    static_cast<unsigned long>(post_gle), ex.what());
+            } catch (...) {
+                post_gle = GetLastError();
+                if (post_gle == ERROR_SUCCESS) post_gle = ERROR_NOT_ENOUGH_MEMORY;
+                diag::log_tagged_fmt("testlab_burp", "loopback_fixture_post_exception gle=%lu err=unknown",
+                    static_cast<unsigned long>(post_gle));
+            }
+            if (!posted) {
+                if (post_gle == ERROR_SUCCESS) post_gle = ERROR_NOT_READY;
+                worker_active.store(false, std::memory_order_release);
+                worker_cv.notify_all();
                 DWORD elapsed = GetTickCount() - thread_start_tick;
                 closesocket(listen_socket);
                 listen_socket = INVALID_SOCKET;
                 port = 0;
-                log_msg(hf, tag, "fixture_start FAIL -- thread start failed err=%s elapsed_ms=%lu host_pid=%lu host_tid=%lu",
-                    thread_err.c_str(),
+                log_msg(hf, tag, "fixture_start FAIL -- work_queue post failed gle=%lu elapsed_ms=%lu host_pid=%lu host_tid=%lu",
+                    static_cast<unsigned long>(post_gle),
                     static_cast<unsigned long>(elapsed),
                     static_cast<unsigned long>(GetCurrentProcessId()),
                     static_cast<unsigned long>(GetCurrentThreadId()));
                 return false;
             }
-            log_msg(hf, tag, "fixture_start PASS -- loopback_http_ws port=%u worker_tid=%u elapsed_ms=%lu",
+            log_msg(hf, tag, "fixture_start PASS -- loopback_http_ws port=%u worker_tid=%lu elapsed_ms=%lu",
                 static_cast<unsigned>(port),
-                worker.id(),
+                static_cast<unsigned long>(worker_tid.load(std::memory_order_acquire)),
                 static_cast<unsigned long>(GetTickCount() - thread_start_tick));
             return true;
         }
 
         void stop() {
+            const ULONGLONG t0 = GetTickCount64();
             stopping.store(true);
             if (listen_socket != INVALID_SOCKET) {
                 shutdown(listen_socket, SD_BOTH);
                 closesocket(listen_socket);
                 listen_socket = INVALID_SOCKET;
             }
-            if (worker.joinable()) worker.join();
+            {
+                std::unique_lock<std::mutex> lock(worker_mutex);
+                worker_cv.wait_for(lock, std::chrono::milliseconds(2000), [this]() {
+                    return !worker_active.load(std::memory_order_acquire);
+                });
+            }
+            {
+                std::unique_lock<std::mutex> lock(client_mutex);
+                client_cv.wait_for(lock, std::chrono::milliseconds(2000), [this]() {
+                    return active_clients.load(std::memory_order_acquire) == 0;
+                });
+            }
+            diag::log_tagged_fmt("testlab_burp", "loopback_fixture_stop port=%u worker_active=%d worker_tid=%lu active_clients=%ld elapsed_ms=%llu",
+                static_cast<unsigned>(port),
+                worker_active.load(std::memory_order_acquire) ? 1 : 0,
+                static_cast<unsigned long>(worker_tid.load(std::memory_order_acquire)),
+                active_clients.load(std::memory_order_acquire),
+                static_cast<unsigned long long>(GetTickCount64() - t0));
         }
 
         ~burp_loopback_fixture_t() {
             stop();
         }
 
+        struct client_guard_t {
+            burp_loopback_fixture_t& owner;
+            explicit client_guard_t(burp_loopback_fixture_t& fixture) : owner(fixture) {
+                diag::log_tagged_fmt("testlab_burp", "loopback_client_enter active_clients=%ld tid=%lu",
+                    owner.active_clients.load(std::memory_order_acquire),
+                    static_cast<unsigned long>(GetCurrentThreadId()));
+            }
+            ~client_guard_t() {
+                long remaining = owner.active_clients.fetch_sub(1, std::memory_order_acq_rel) - 1;
+                owner.client_cv.notify_all();
+                diag::log_tagged_fmt("testlab_burp", "loopback_client_exit active_clients=%ld tid=%lu",
+                    remaining,
+                    static_cast<unsigned long>(GetCurrentThreadId()));
+            }
+        };
+
         void accept_loop() {
+            const DWORD tid = GetCurrentThreadId();
+            worker_tid.store(tid, std::memory_order_release);
+            diag::log_tagged_fmt("testlab_burp", "loopback_fixture_enter port=%u listener=%llu tid=%lu",
+                static_cast<unsigned>(port),
+                static_cast<unsigned long long>(listen_socket),
+                static_cast<unsigned long>(tid));
             while (!stopping.load()) {
+                SOCKET listener = listen_socket;
+                if (listener == INVALID_SOCKET)
+                    break;
                 fd_set rfds;
                 FD_ZERO(&rfds);
-                FD_SET(listen_socket, &rfds);
+                FD_SET(listener, &rfds);
                 timeval tv{};
                 tv.tv_usec = 100000;
                 int rc = select(0, &rfds, nullptr, nullptr, &tv);
                 if (rc <= 0) continue;
-                SOCKET s = accept(listen_socket, nullptr, nullptr);
+                SOCKET s = accept(listener, nullptr, nullptr);
                 if (s == INVALID_SOCKET) continue;
                 DWORD timeout = 4000;
                 setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
                 setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
-                if (!aida::infra::win_thread::start_detached([s]() { handle_client(s); }, nullptr, aida::infra::win_thread::fixture_stack_reserve, "test_all_burp.loopback_client"))
+                active_clients.fetch_add(1, std::memory_order_acq_rel);
+                bool spawned = false;
+                try {
+                    std::thread([this, s]() {
+                        client_guard_t guard(*this);
+                        handle_client(s);
+                    }).detach();
+                    spawned = true;
+                } catch (const std::exception& ex) {
+                    diag::log_tagged_fmt("testlab_burp", "loopback_client_thread_exception err=%s tid=%lu",
+                        ex.what(), static_cast<unsigned long>(GetCurrentThreadId()));
+                } catch (...) {
+                    diag::log_tagged_fmt("testlab_burp", "loopback_client_thread_exception err=unknown tid=%lu",
+                        static_cast<unsigned long>(GetCurrentThreadId()));
+                }
+                if (!spawned) {
+                    diag::log_tagged_fmt("testlab_burp", "loopback_client_inline active_clients=%ld tid=%lu",
+                        active_clients.load(std::memory_order_acquire),
+                        static_cast<unsigned long>(GetCurrentThreadId()));
+                    client_guard_t guard(*this);
                     handle_client(s);
+                } else {
+                    diag::log_tagged_fmt("testlab_burp", "loopback_client_thread_started active_clients=%ld accept_tid=%lu",
+                        active_clients.load(std::memory_order_acquire),
+                        static_cast<unsigned long>(GetCurrentThreadId()));
+                }
             }
+            worker_tid.store(0, std::memory_order_release);
+            worker_active.store(false, std::memory_order_release);
+            worker_cv.notify_all();
+            diag::log_tagged_fmt("testlab_burp", "loopback_fixture_exit port=%u active_clients=%ld tid=%lu",
+                static_cast<unsigned>(port),
+                active_clients.load(std::memory_order_acquire),
+                static_cast<unsigned long>(tid));
         }
 
         static void handle_client(SOCKET s) {

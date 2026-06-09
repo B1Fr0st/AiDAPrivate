@@ -322,6 +322,39 @@ namespace detail
         return slash ? slash + 1 : path;
     }
 
+    inline std::string wide_to_utf8_lossy(const std::wstring& value)
+    {
+        if (value.empty())
+            return {};
+        int needed = WideCharToMultiByte(CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
+        if (needed <= 0)
+            return {};
+        std::string out(static_cast<size_t>(needed), '\0');
+        int written = WideCharToMultiByte(CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), out.data(), needed, nullptr, nullptr);
+        if (written <= 0)
+            return {};
+        out.resize(static_cast<size_t>(written));
+        for (char& ch : out)
+        {
+            if (ch == '\r' || ch == '\n' || ch == '\t')
+                ch = ' ';
+        }
+        return out;
+    }
+
+    inline bool trusted_windows_core_basename_w(const std::wstring& exe_lower)
+    {
+        static const wchar_t* const core_images[] = {
+            L"lsass.exe",
+            L"csrss.exe",
+            L"wininit.exe",
+            L"services.exe",
+            L"winlogon.exe",
+            L"smss.exe"
+        };
+        return equals_any_w(exe_lower.c_str(), core_images);
+    }
+
     inline uint64_t fnv1a64_bytes(const void* data, size_t len)
     {
         const auto* p = static_cast<const uint8_t*>(data);
@@ -440,6 +473,24 @@ namespace detail
         bool query_ok = false;
     };
 
+    inline std::string probe_image_for_log(const process_probe_t* probe)
+    {
+        if (!probe)
+            return {};
+        if (!probe->exe_lower.empty())
+            return wide_to_utf8_lossy(probe->exe_lower);
+        if (!probe->image_lower.empty())
+            return wide_to_utf8_lossy(basename_ptr(probe->image_lower.c_str()));
+        return {};
+    }
+
+    inline std::string probe_path_for_log(const process_probe_t* probe)
+    {
+        if (!probe || probe->image_lower.empty())
+            return {};
+        return wide_to_utf8_lossy(probe->image_lower);
+    }
+
     inline bool trusted_windows_system_process(const process_probe_t& probe)
     {
         static const wchar_t* const core_images[] = {
@@ -472,6 +523,27 @@ namespace detail
             PROCESS_SET_INFORMATION |
             PROCESS_SUSPEND_RESUME;
         return (access & active_mutation) == 0;
+    }
+
+    inline std::string format_process_handle_access_flags(DWORD access)
+    {
+        std::string flags;
+        auto add = [&flags](const char* name) {
+            if (!flags.empty())
+                flags += "|";
+            flags += name;
+        };
+        if (access & PROCESS_TERMINATE) add("terminate");
+        if (access & PROCESS_CREATE_THREAD) add("create_thread");
+        if (access & PROCESS_VM_OPERATION) add("vm_operation");
+        if (access & PROCESS_VM_READ) add("vm_read");
+        if (access & PROCESS_VM_WRITE) add("vm_write");
+        if (access & PROCESS_DUP_HANDLE) add("dup_handle");
+        if (access & PROCESS_SET_INFORMATION) add("set_information");
+        if (access & PROCESS_QUERY_INFORMATION) add("query_information");
+        if (access & PROCESS_SUSPEND_RESUME) add("suspend_resume");
+        if (access & PROCESS_QUERY_LIMITED_INFORMATION) add("query_limited");
+        return flags.empty() ? "none" : flags;
     }
 
     inline std::vector<process_probe_t> collect_processes()
@@ -657,6 +729,12 @@ namespace detail
     {
         if (probe.parent_pid != GetCurrentProcessId())
             return false;
+        static const wchar_t* const reverse_mcp_names[] = {
+            L"aida_camoufoxreversemcp.exe", L"camoufox-reverse-mcp.exe", L"camoufox_reverse_mcp.exe"
+        };
+        if (basename_equals_any(probe, reverse_mcp_names))
+            return path_under_current_module_subdir_w(probe.image_lower, L"deps") ||
+                path_under_current_module_subdir_w(probe.image_lower, L"camoufox-reverse-mcp");
         static const wchar_t* const python_names[] = {
             L"python.exe", L"pythonw.exe"
         };
@@ -781,6 +859,93 @@ namespace detail
             }
         }
         return false;
+    }
+
+    inline bool env_flag_enabled_a(const char* name)
+    {
+        char value[16] = {};
+        DWORD n = GetEnvironmentVariableA(name, value, static_cast<DWORD>(sizeof(value)));
+        if (n == 0 || n >= static_cast<DWORD>(sizeof(value)))
+            return false;
+        return !(value[0] == '0' && (value[1] == '\0' || value[1] == ' ' || value[1] == '\t'));
+    }
+
+    inline bool env_value_present_a(const char* name)
+    {
+        char value[MAX_PATH] = {};
+        DWORD n = GetEnvironmentVariableA(name, value, static_cast<DWORD>(sizeof(value)));
+        return n > 0 && n < static_cast<DWORD>(sizeof(value));
+    }
+
+    inline DWORD current_parent_pid()
+    {
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap == INVALID_HANDLE_VALUE)
+            return 0;
+        DWORD self = GetCurrentProcessId();
+        DWORD parent = 0;
+        PROCESSENTRY32W pe = {};
+        pe.dwSize = sizeof(pe);
+        for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe))
+        {
+            if (pe.th32ProcessID == self)
+            {
+                parent = pe.th32ParentProcessID;
+                break;
+            }
+        }
+        CloseHandle(snap);
+        return parent;
+    }
+
+    inline bool current_module_is_fileless_host()
+    {
+        wchar_t path[MAX_PATH] = {};
+        DWORD got = GetModuleFileNameW(nullptr, path, static_cast<DWORD>(sizeof(path) / sizeof(path[0])));
+        if (got == 0 || got >= static_cast<DWORD>(sizeof(path) / sizeof(path[0])))
+            return false;
+        std::wstring image = lower_copy(basename_ptr(path));
+        static const wchar_t* const hosts[] = {
+            L"powershell.exe",
+            L"pwsh.exe"
+        };
+        return equals_any_w(image.c_str(), hosts);
+    }
+
+    inline bool fileless_bootstrap_context_active()
+    {
+        return env_flag_enabled_a("AIDA_FILELESS_LAUNCH") &&
+            env_flag_enabled_a("AIDA_FILELESS_NO_DISK_WRITE") &&
+            env_value_present_a("AIDA_FILELESS_DEBUG_LOG_PATH") &&
+            env_value_present_a("AIDA_FILELESS_BOOTSTRAP_LOG_PATH") &&
+            env_value_present_a("AIDA_FILELESS_IMAGE_BASE") &&
+            env_value_present_a("AIDA_FILELESS_IMAGE_SIZE") &&
+            env_value_present_a("AIDA_FILELESS_ENTRY_RVA") &&
+            current_module_is_fileless_host();
+    }
+
+    inline bool is_fileless_bootstrap_parent_owner(const process_probe_t* probe,
+                                                   DWORD owner_pid,
+                                                   DWORD parent_pid)
+    {
+        if (!probe || parent_pid == 0 || owner_pid != parent_pid)
+            return false;
+        if (!fileless_bootstrap_context_active())
+            return false;
+        static const wchar_t* const terminal_hosts[] = {
+            L"windowsterminal.exe",
+            L"wt.exe",
+            L"conhost.exe",
+            L"openconsole.exe"
+        };
+        if (!basename_equals_any(*probe, terminal_hosts))
+            return false;
+        if (is_memory_scanner_tool(*probe) || is_re_tool(*probe) ||
+            is_debugger_tool(*probe) || is_dump_tool(*probe) ||
+            has_mcp_command_evidence(*probe) || is_ai_coding_tool(*probe) ||
+            has_aida_target_evidence(*probe))
+            return false;
+        return true;
     }
 
     struct process_evidence_t
@@ -1334,14 +1499,18 @@ namespace self_analysis
         bool owner_tool = false;
         bool owner_targets_aida = false;
         bool trusted_system_ignored = false;
+        bool fileless_bootstrap_parent_ignored = false;
         DWORD access_mask = 0;
         DWORD first_owner_pid = 0;
         DWORD first_access_mask = 0;
         uint64_t first_handle_value = 0;
         uint64_t first_owner_hash = 0;
+        std::string first_owner_image;
+        std::string first_owner_path;
         bool first_owner_query_ok = false;
         bool first_owner_tool = false;
         bool first_owner_targets_aida = false;
+        bool first_owner_core_system = false;
         bool first_owner_mcp = false;
         bool first_owner_ai = false;
         bool first_owner_memory = false;
@@ -1350,8 +1519,14 @@ namespace self_analysis
         bool first_owner_dump = false;
         uint64_t owner_hash = 0;
         uint64_t trusted_system_owner_hash = 0;
+        uint64_t fileless_bootstrap_parent_owner_hash = 0;
         DWORD trusted_system_access_mask = 0;
+        DWORD fileless_bootstrap_parent_access_mask = 0;
+        DWORD fileless_bootstrap_parent_owner_pid = 0;
+        std::string fileless_bootstrap_parent_owner_image;
+        std::string fileless_bootstrap_parent_owner_path;
         uint32_t trusted_system_ignored_count = 0;
+        uint32_t fileless_bootstrap_parent_ignored_count = 0;
         uint32_t observed_handle_count = 0;
     };
 
@@ -1400,6 +1575,8 @@ namespace self_analysis
             };
             auto* info = reinterpret_cast<system_handle_information_ex_t*>(buf);
             DWORD my_pid = GetCurrentProcessId();
+            DWORD fileless_parent_pid = detail::fileless_bootstrap_context_active() ?
+                detail::current_parent_pid() : 0;
             PVOID self_process_object = nullptr;
             HANDLE self_process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, my_pid);
             if (self_process)
@@ -1464,6 +1641,7 @@ namespace self_analysis
                         wchar_t image_path[MAX_PATH] = {};
                         DWORD path_size = MAX_PATH;
                         fallback.pid = owner_pid;
+                        fallback.query_ok = true;
                         if (QueryFullProcessImageNameW(owner, 0, image_path, &path_size))
                         {
                             fallback.image_lower = detail::lower_copy(image_path);
@@ -1476,6 +1654,35 @@ namespace self_analysis
                         CloseHandle(owner);
                         probe = &fallback;
                     }
+                }
+                if (detail::is_fileless_bootstrap_parent_owner(probe, owner_pid, fileless_parent_pid))
+                {
+                    std::string owner_image = detail::probe_image_for_log(probe);
+                    std::string owner_path = detail::probe_path_for_log(probe);
+                    std::string flags = detail::format_process_handle_access_flags(h.GrantedAccess);
+                    out.fileless_bootstrap_parent_ignored = true;
+                    ++out.fileless_bootstrap_parent_ignored_count;
+                    out.fileless_bootstrap_parent_access_mask |= h.GrantedAccess;
+                    out.fileless_bootstrap_parent_owner_pid = owner_pid;
+                    out.fileless_bootstrap_parent_owner_hash = detail::mix_hash(
+                        out.fileless_bootstrap_parent_owner_hash,
+                        probe ? probe->basename_hash : 0);
+                    if (out.fileless_bootstrap_parent_owner_image.empty())
+                        out.fileless_bootstrap_parent_owner_image = owner_image;
+                    if (out.fileless_bootstrap_parent_owner_path.empty())
+                        out.fileless_bootstrap_parent_owner_path = owner_path;
+                    diag::log_tagged_critical_fmt("guard",
+                        "ai_tool_posture_fileless_parent_handle_ignored owner_pid=%lu parent_pid=%lu handle=0x%016llX access=0x%08lX access_flags=%s owner_hash=0x%016llX owner_image=%s owner_path=%s ignored_count=%u",
+                        static_cast<unsigned long>(owner_pid),
+                        static_cast<unsigned long>(fileless_parent_pid),
+                        static_cast<unsigned long long>(h.HandleValue),
+                        static_cast<unsigned long>(h.GrantedAccess),
+                        flags.c_str(),
+                        static_cast<unsigned long long>(probe ? probe->basename_hash : 0),
+                        owner_image.empty() ? "<empty>" : owner_image.c_str(),
+                        owner_path.empty() ? "<empty>" : owner_path.c_str(),
+                        out.fileless_bootstrap_parent_ignored_count);
+                    continue;
                 }
                 if (detail::trusted_kernel_system_owner(owner_pid))
                 {
@@ -1511,10 +1718,12 @@ namespace self_analysis
                 bool owner_targets = false;
                 uint64_t owner_hash = 0;
                 bool owner_query_ok = false;
+                bool owner_core_system = false;
                 if (probe)
                 {
                     owner_hash = probe->basename_hash;
                     owner_query_ok = probe->query_ok;
+                    owner_core_system = detail::trusted_windows_core_basename_w(probe->exe_lower);
                     owner_memory = detail::is_memory_scanner_tool(*probe);
                     owner_re = detail::is_re_tool(*probe);
                     owner_debugger = detail::is_debugger_tool(*probe);
@@ -1536,7 +1745,10 @@ namespace self_analysis
                     out.first_access_mask = h.GrantedAccess;
                     out.first_handle_value = static_cast<uint64_t>(h.HandleValue);
                     out.first_owner_hash = owner_hash;
+                    out.first_owner_image = detail::probe_image_for_log(probe);
+                    out.first_owner_path = detail::probe_path_for_log(probe);
                     out.first_owner_query_ok = owner_query_ok;
+                    out.first_owner_core_system = owner_core_system;
                     out.first_owner_mcp = owner_mcp;
                     out.first_owner_ai = owner_ai;
                     out.first_owner_memory = owner_memory;
@@ -1596,16 +1808,21 @@ namespace combined
         bool clipboard_monitored = false;
         bool tool_targets_aida = false;
         bool trusted_system_handle_ignored = false;
+        bool fileless_bootstrap_parent_handle_ignored = false;
         uint32_t trusted_system_handle_ignored_count = 0;
+        uint32_t fileless_bootstrap_parent_handle_ignored_count = 0;
         uint32_t observed_handle_count = 0;
         DWORD handle_access_mask = 0;
         DWORD first_handle_owner_pid = 0;
         DWORD first_handle_access_mask = 0;
         uint64_t first_handle_value = 0;
         uint64_t first_handle_owner_hash = 0;
+        std::string first_handle_owner_image;
+        std::string first_handle_owner_path;
         bool first_handle_owner_query_ok = false;
         bool first_handle_owner_tool = false;
         bool first_handle_owner_targets_aida = false;
+        bool first_handle_owner_core_system = false;
         bool first_handle_owner_mcp = false;
         bool first_handle_owner_ai = false;
         bool first_handle_owner_memory = false;
@@ -1613,7 +1830,12 @@ namespace combined
         bool first_handle_owner_debugger = false;
         bool first_handle_owner_dump = false;
         DWORD trusted_system_handle_access_mask = 0;
+        DWORD fileless_bootstrap_parent_handle_access_mask = 0;
+        DWORD fileless_bootstrap_parent_handle_owner_pid = 0;
         uint64_t trusted_system_handle_owner_hash = 0;
+        uint64_t fileless_bootstrap_parent_handle_owner_hash = 0;
+        std::string fileless_bootstrap_parent_handle_owner_image;
+        std::string fileless_bootstrap_parent_handle_owner_path;
         uint32_t category_mask = 0;
         uint32_t high_risk_mask = 0;
         uint32_t high_risk_count = 0;
@@ -1680,15 +1902,20 @@ namespace combined
         report.handle_owner_tool = handle_report.owner_tool;
         report.trusted_system_handle_ignored = handle_report.trusted_system_ignored;
         report.trusted_system_handle_ignored_count = handle_report.trusted_system_ignored_count;
+        report.fileless_bootstrap_parent_handle_ignored = handle_report.fileless_bootstrap_parent_ignored;
+        report.fileless_bootstrap_parent_handle_ignored_count = handle_report.fileless_bootstrap_parent_ignored_count;
         report.observed_handle_count = handle_report.observed_handle_count;
         report.handle_access_mask = handle_report.access_mask;
         report.first_handle_owner_pid = handle_report.first_owner_pid;
         report.first_handle_access_mask = handle_report.first_access_mask;
         report.first_handle_value = handle_report.first_handle_value;
         report.first_handle_owner_hash = handle_report.first_owner_hash;
+        report.first_handle_owner_image = handle_report.first_owner_image;
+        report.first_handle_owner_path = handle_report.first_owner_path;
         report.first_handle_owner_query_ok = handle_report.first_owner_query_ok;
         report.first_handle_owner_tool = handle_report.first_owner_tool;
         report.first_handle_owner_targets_aida = handle_report.first_owner_targets_aida;
+        report.first_handle_owner_core_system = handle_report.first_owner_core_system;
         report.first_handle_owner_mcp = handle_report.first_owner_mcp;
         report.first_handle_owner_ai = handle_report.first_owner_ai;
         report.first_handle_owner_memory = handle_report.first_owner_memory;
@@ -1697,6 +1924,11 @@ namespace combined
         report.first_handle_owner_dump = handle_report.first_owner_dump;
         report.trusted_system_handle_access_mask = handle_report.trusted_system_access_mask;
         report.trusted_system_handle_owner_hash = handle_report.trusted_system_owner_hash;
+        report.fileless_bootstrap_parent_handle_access_mask = handle_report.fileless_bootstrap_parent_access_mask;
+        report.fileless_bootstrap_parent_handle_owner_pid = handle_report.fileless_bootstrap_parent_owner_pid;
+        report.fileless_bootstrap_parent_handle_owner_hash = handle_report.fileless_bootstrap_parent_owner_hash;
+        report.fileless_bootstrap_parent_handle_owner_image = handle_report.fileless_bootstrap_parent_owner_image;
+        report.fileless_bootstrap_parent_handle_owner_path = handle_report.fileless_bootstrap_parent_owner_path;
         auto clipboard = detail::scan_clipboard_monitoring(&processes);
         report.clipboard_monitored = clipboard.suspicious;
         auto window_target = detail::scan_windows_for_aida_targeting(processes);
@@ -1715,6 +1947,8 @@ namespace combined
             report.evidence_hash = detail::mix_hash(report.evidence_hash, handle_report.owner_hash);
         if (handle_report.trusted_system_owner_hash)
             report.evidence_hash = detail::mix_hash(report.evidence_hash, handle_report.trusted_system_owner_hash);
+        if (handle_report.fileless_bootstrap_parent_owner_hash)
+            report.evidence_hash = detail::mix_hash(report.evidence_hash, handle_report.fileless_bootstrap_parent_owner_hash);
         if (clipboard.owner_hash)
             report.evidence_hash = detail::mix_hash(report.evidence_hash, clipboard.owner_hash);
         if (window_target.owner_hash)
@@ -1742,6 +1976,13 @@ namespace combined
             _snprintf_s(ignored_buf, sizeof(ignored_buf), _TRUNCATE,
                 "IGNORED_SYSTEM_HANDLE=%u",
                 report.trusted_system_handle_ignored_count);
+            detail::append_token(report.summary, ignored_buf);
+        }
+        if (report.fileless_bootstrap_parent_handle_ignored) {
+            char ignored_buf[80];
+            _snprintf_s(ignored_buf, sizeof(ignored_buf), _TRUNCATE,
+                "IGNORED_FILELESS_PARENT_HANDLE=%u",
+                report.fileless_bootstrap_parent_handle_ignored_count);
             detail::append_token(report.summary, ignored_buf);
         }
         const bool mcp_correlated_risk = report.mcp_detected &&

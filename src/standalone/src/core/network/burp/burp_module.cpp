@@ -49,7 +49,6 @@ namespace bambda          { void register_bambda_tools(mcp_standalone::server_t&
 namespace csp             { void register_csp_tools(mcp_standalone::server_t&); }
 namespace upstream        { void register_upstream_tools(mcp_standalone::server_t&); }
 namespace tech            { void register_tech_tools(mcp_standalone::server_t&); }
-namespace browser         { void register_browser_tools(mcp_standalone::server_t&); }
 void register_scanner_tools(mcp_standalone::server_t&);
 void register_recon_tools(mcp_standalone::server_t&);
 void register_intruder_tools(mcp_standalone::server_t&);
@@ -59,7 +58,6 @@ void register_match_replace_tools(mcp_standalone::server_t&);
 void register_session_tools(mcp_standalone::server_t&);
 void register_dom_xss_tools(mcp_standalone::server_t&);
 void register_camoufox_tools(mcp_standalone::server_t&);
-void register_headless_view_tools(mcp_standalone::server_t&);
 
 namespace {
 
@@ -214,9 +212,7 @@ void register_all_tools(mcp_standalone::server_t& srv)
     csp::register_csp_tools(srv);
     upstream::register_upstream_tools(srv);
     tech::register_tech_tools(srv);
-    browser::register_browser_tools(srv);
     register_camoufox_tools(srv);
-    register_headless_view_tools(srv);
 }
 
 }

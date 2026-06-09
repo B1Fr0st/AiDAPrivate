@@ -2,6 +2,7 @@
 #define NOMINMAX
 
 #include "arc_loader.hpp"
+#include "../../helpers/diag_log.hpp"
 
 #include <windows.h>
 #include <winternl.h>
@@ -180,16 +181,8 @@ namespace
         static char s_path[MAX_PATH] = {};
         static bool s_path_init = false;
         if (!s_path_init) {
-            DWORD ret = GetModuleFileNameA(nullptr, s_path, MAX_PATH);
-            if (ret == 0 || ret >= MAX_PATH) {
+            if (!diag::build_log_path("aida_debug.log", s_path, sizeof(s_path))) {
                 strcpy_s(s_path, "aida_debug.log");
-            } else {
-                char* last = strrchr(s_path, '\\');
-                if (last)
-                    *(last + 1) = '\0';
-                else
-                    s_path[0] = '\0';
-                strcat_s(s_path, "aida_debug.log");
             }
             s_path_init = true;
         }

@@ -12,6 +12,16 @@ $DST     = "/home/ruarr/aida-server/"
 $AIDA_KEY = Join-Path $env:USERPROFILE ".ssh\aida_server"
 $SSH_OPTS = @('-o', 'StrictHostKeyChecking=yes', '-o', 'IdentitiesOnly=yes', '-o', 'PasswordAuthentication=no', '-i', $AIDA_KEY)
 
+function Stop-Deploy([string]$Message) {
+    Write-Host $Message -ForegroundColor Red
+    exit 1
+}
+
+function ConvertTo-RemoteShellLiteral([string]$Value) {
+    if ($null -eq $Value) { return "''" }
+    return "'" + ($Value -replace "'", "'\''") + "'"
+}
+
 Write-Host "`n=== Deploying server/ to $REMOTE ===" -ForegroundColor Cyan
 
 # --- 1. Upload source files ---
@@ -64,28 +74,79 @@ $files = @(
     "db\migrations\0006_bootstrap_delivery.sql",
     "scripts\create_bootstrap_package.js"
 )
+$migrationDir = Join-Path $SRC "db\migrations"
+if (Test-Path $migrationDir) {
+    $files = @($files + (Get-ChildItem -LiteralPath $migrationDir -Filter "*.sql" -File | ForEach-Object { "db\migrations\$($_.Name)" })) | Sort-Object -Unique
+}
 $remoteDirs = @("routes", "crypto", "middleware", "anomaly", "db", "db/migrations", "nginx", "scripts", "bootstrap_artifacts") | ForEach-Object { "$DST$_" }
-$mkdirCmd = "mkdir -p " + ($remoteDirs -join " ")
+$mkdirCmd = "mkdir -p " + (($remoteDirs | ForEach-Object { ConvertTo-RemoteShellLiteral $_ }) -join " ")
 & ssh @SSH_OPTS $REMOTE $mkdirCmd | Out-Null
-foreach ($f in $files) {
-    $local = Join-Path $SRC $f
-    $remotePath = $DST + ($f -replace '\\', '/')
-    if (Test-Path $local) {
-        & scp @SSH_OPTS "$local" "${REMOTE}:${remotePath}"
-        if ($LASTEXITCODE -ne 0) { Write-Host "SCP failed for $f" -ForegroundColor Red; exit 1 }
-    } else {
-        Write-Host "  [WARN] missing local file: $local" -ForegroundColor Yellow
+$deployId = [Guid]::NewGuid().ToString("N")
+$stageRoot = Join-Path ([IO.Path]::GetTempPath()) "aida-server-deploy-$deployId"
+$stageServer = Join-Path $stageRoot "server"
+$archivePath = Join-Path ([IO.Path]::GetTempPath()) "aida-server-deploy-$deployId.tar.gz"
+$uploadedSourceFiles = 0
+try {
+    New-Item -ItemType Directory -Force -Path $stageServer | Out-Null
+    foreach ($f in $files) {
+        $local = Join-Path $SRC $f
+        if (Test-Path $local) {
+            $stagePath = Join-Path $stageServer $f
+            $stageDir = Split-Path -Parent $stagePath
+            if ($stageDir) { New-Item -ItemType Directory -Force -Path $stageDir | Out-Null }
+            Copy-Item -LiteralPath $local -Destination $stagePath -Force -ErrorAction Stop
+            $uploadedSourceFiles += 1
+        } else {
+            Write-Host "  [WARN] missing local file: $local" -ForegroundColor Yellow
+        }
     }
+    $tar = Get-Command tar -ErrorAction SilentlyContinue
+    if (-not $tar) { Stop-Deploy "tar.exe not found; cannot create deploy bundle." }
+    if (Test-Path $archivePath) { Remove-Item -LiteralPath $archivePath -Force }
+    Push-Location $stageRoot
+    try {
+        & $tar.Source -czf $archivePath server
+        if ($LASTEXITCODE -ne 0) { Stop-Deploy "tar failed while creating deploy bundle." }
+    } finally {
+        Pop-Location
+    }
+    $remoteArchive = "/tmp/aida_server_deploy_$deployId.tar.gz"
+    & scp @SSH_OPTS "$archivePath" "${REMOTE}:${remoteArchive}"
+    if ($LASTEXITCODE -ne 0) { Stop-Deploy "SCP failed for deploy bundle." }
+    $extractCmd = "tar -xzf " + (ConvertTo-RemoteShellLiteral $remoteArchive) + " -C " + (ConvertTo-RemoteShellLiteral $DST) + " --strip-components=1 && rm -f " + (ConvertTo-RemoteShellLiteral $remoteArchive)
+    & ssh @SSH_OPTS $REMOTE $extractCmd | Out-Null
+    if ($LASTEXITCODE -ne 0) { Stop-Deploy "Remote extraction failed for deploy bundle." }
+    Write-Host "      Uploaded $uploadedSourceFiles source file(s) in one bundle." -ForegroundColor Green
+} finally {
+    try { if (Test-Path $archivePath) { Remove-Item -LiteralPath $archivePath -Force } } catch { }
+    try {
+        $tempRoot = [IO.Path]::GetTempPath().TrimEnd('\')
+        $resolvedStage = [IO.Path]::GetFullPath($stageRoot).TrimEnd('\')
+        if ($resolvedStage.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase) -and ([IO.Path]::GetFileName($resolvedStage) -like 'aida-server-deploy-*') -and (Test-Path $resolvedStage)) {
+            Remove-Item -LiteralPath $resolvedStage -Recurse -Force
+        }
+    } catch { }
 }
 $artifactDir = Join-Path $SRC "bootstrap_artifacts"
 if (Test-Path $artifactDir) {
-    $artifactFiles = Get-ChildItem -LiteralPath $artifactDir -Filter "*.pkg" -File -ErrorAction SilentlyContinue
+    $artifactFiles = Get-ChildItem -LiteralPath $artifactDir -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -ieq ".pkg" -or $_.Extension -ieq ".zip" }
+    $artifactUploaded = 0
+    $artifactSkipped = 0
     foreach ($artifact in $artifactFiles) {
+        $localHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $artifact.FullName).Hash.ToLowerInvariant()
+        $remoteArtifactPath = "${DST}bootstrap_artifacts/$($artifact.Name)"
+        $remoteHash = & ssh @SSH_OPTS $REMOTE ("if [ -f " + (ConvertTo-RemoteShellLiteral $remoteArtifactPath) + " ]; then sha256sum " + (ConvertTo-RemoteShellLiteral $remoteArtifactPath) + " | awk '{print `$1}'; else echo missing; fi")
+        $remoteHashText = (($remoteHash | Select-Object -First 1) -as [string]).Trim().ToLowerInvariant()
+        if ($LASTEXITCODE -eq 0 -and $remoteHashText -eq $localHash) {
+            $artifactSkipped += 1
+            continue
+        }
         & scp @SSH_OPTS $artifact.FullName "${REMOTE}:${DST}bootstrap_artifacts/$($artifact.Name)"
-        if ($LASTEXITCODE -ne 0) { Write-Host "SCP failed for bootstrap artifact $($artifact.Name)" -ForegroundColor Red; exit 1 }
+        if ($LASTEXITCODE -ne 0) { Stop-Deploy "SCP failed for bootstrap artifact $($artifact.Name)" }
+        $artifactUploaded += 1
     }
     if ($artifactFiles.Count -gt 0) {
-        Write-Host "      Uploaded $($artifactFiles.Count) encrypted bootstrap artifact(s)." -ForegroundColor Green
+        Write-Host "      Bootstrap artifacts uploaded=$artifactUploaded skipped_unchanged=$artifactSkipped." -ForegroundColor Green
     }
 }
 Write-Host "      Done." -ForegroundColor Green

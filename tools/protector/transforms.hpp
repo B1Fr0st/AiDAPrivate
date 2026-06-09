@@ -1376,6 +1376,7 @@ struct packed_section_layout_t {
     uint32_t blob_data_offset;
     uint32_t master_key_offset;
     uint32_t aux_offset;
+    uint32_t tls_callback_array_offset;
     uint32_t stub_offset;
     uint32_t tls_stub_offset;
     uint32_t total_size;
@@ -1406,7 +1407,7 @@ struct transform_result_t {
 };
 
 constexpr uint32_t kReservedMainStubSize = 0xC000u;
-constexpr uint32_t kReservedTlsStubSize = 0x200u;
+constexpr uint32_t kReservedTlsStubSize = 0xC000u;
 
 struct protect_options_t {
     uint64_t seed = 0;
@@ -2420,6 +2421,7 @@ inline packed_section_layout_t build_packed_section(pe_file::pe_image_t& pe,
                                                      const resource_fixup_table_t& resources,
                                                      const std::vector<uint8_t>& stub_code,
                                                      const std::vector<uint8_t>& tls_stub_code,
+                                                     uint32_t tls_callback_array_entries,
                                                      uint32_t bind_flags,
                                                      const uint8_t bind_salt[16],
                                                      const aux_block_t& aux,
@@ -2455,6 +2457,12 @@ inline packed_section_layout_t build_packed_section(pe_file::pe_image_t& pe,
 
     layout.aux_offset = cursor;
     cursor += static_cast<uint32_t>(sizeof(aux_block_t));
+
+    if (tls_callback_array_entries != 0u) {
+        cursor = pe_file::align_up(cursor, 8u);
+        layout.tls_callback_array_offset = cursor;
+        cursor += tls_callback_array_entries * 8u;
+    }
 
     layout.tls_stub_offset = tls_stub_code.empty() ? 0u : cursor;
     cursor += static_cast<uint32_t>(tls_stub_code.size());
@@ -3745,6 +3753,9 @@ inline transform_result_t protect_pe(pe_file::pe_image_t& pe, const protect_opti
                                           resources,
                                           stub_code,
                                           tls_stub_code,
+                                          (pe.has_tls && pe.tls.address_of_callbacks != 0u && !tls_stub_code.empty())
+                                              ? static_cast<uint32_t>(pe.tls.callback_rvas.size() + 2u)
+                                              : 0u,
                                           bind_flags,
                                           bind_salt,
                                           aux,
@@ -4021,7 +4032,10 @@ inline void redirect_entry_point(pe_file::pe_image_t& pe, uint32_t new_entry_rva
     pe.optional_header.AddressOfEntryPoint = new_entry_rva;
 }
 
-inline bool install_tls_callback(pe_file::pe_image_t& pe, uint32_t tls_stub_rva) {
+inline bool install_tls_callback(pe_file::pe_image_t& pe,
+                                 uint32_t tls_stub_rva,
+                                 uint32_t callback_list_rva,
+                                 uint32_t callback_list_capacity) {
     if (tls_stub_rva == 0u) {
         return false;
     }
@@ -4036,6 +4050,52 @@ inline bool install_tls_callback(pe_file::pe_image_t& pe, uint32_t tls_stub_rva)
     if (cb_va < image_base) {
         return false;
     }
+    uint64_t new_cb_va = image_base + tls_stub_rva;
+    std::vector<uint64_t> new_list;
+    new_list.push_back(new_cb_va);
+    for (uint64_t existing : pe.tls.callback_rvas) {
+        if (existing != 0u) {
+            const uint64_t existing_va = existing >= image_base ? existing : image_base + existing;
+            if (existing_va != new_cb_va) {
+                new_list.push_back(existing_va);
+            }
+        }
+    }
+    new_list.push_back(0u);
+
+    const auto write_callback_list = [&](uint32_t list_rva, uint32_t capacity) -> bool {
+        if (list_rva == 0u || static_cast<size_t>(capacity) < new_list.size() || (list_rva & 7u) != 0u) {
+            return false;
+        }
+        pe_file::section_t* sec = pe.section_from_rva(list_rva);
+        if (sec == nullptr) {
+            return false;
+        }
+        const uint32_t off = list_rva - sec->virtual_address;
+        const size_t bytes_needed = new_list.size() * 8u;
+        if (static_cast<size_t>(off) + bytes_needed > sec->data.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < new_list.size(); ++i) {
+            const uint64_t v = new_list[i];
+            std::memcpy(sec->data.data() + off + i * 8u, &v, 8u);
+        }
+        const uint64_t new_list_va = image_base + list_rva;
+        uint8_t* tls_dir = pe.rva_ptr(pe.data_directories[IMAGE_DIRECTORY_ENTRY_TLS].rva);
+        if (tls_dir == nullptr) {
+            return false;
+        }
+        std::memcpy(tls_dir + 24u, &new_list_va, sizeof(new_list_va));
+        pe.tls.address_of_callbacks = new_list_va;
+        pe.tls.callback_rvas.assign(new_list.begin(), new_list.end());
+        pe.tls.callback_rvas.pop_back();
+        return true;
+    };
+
+    if (write_callback_list(callback_list_rva, callback_list_capacity)) {
+        return true;
+    }
+
     uint32_t cb_rva = static_cast<uint32_t>(cb_va - image_base);
     pe_file::section_t* sec = pe.section_from_rva(cb_rva);
     if (sec == nullptr) {
@@ -4045,25 +4105,10 @@ inline bool install_tls_callback(pe_file::pe_image_t& pe, uint32_t tls_stub_rva)
     if (off + 8u > sec->data.size()) {
         return false;
     }
-    uint64_t new_cb_va = image_base + tls_stub_rva;
-    std::vector<uint64_t> new_list;
-    new_list.push_back(new_cb_va);
-    for (uint64_t existing : pe.tls.callback_rvas) {
-        if (existing != 0u) {
-            new_list.push_back(image_base + existing);
-        }
-    }
-    new_list.push_back(0u);
-    size_t bytes_needed = new_list.size() * 8u;
-    if (off + bytes_needed > sec->data.size()) {
+    const uint32_t in_place_capacity = static_cast<uint32_t>((sec->data.size() - off) / 8u);
+    if (!write_callback_list(cb_rva, in_place_capacity)) {
         return false;
     }
-    for (size_t i = 0; i < new_list.size(); ++i) {
-        uint64_t v = new_list[i];
-        std::memcpy(sec->data.data() + off + i * 8u, &v, 8u);
-    }
-    pe.tls.callback_rvas.clear();
-    pe.tls.callback_rvas.push_back(tls_stub_rva);
     return true;
 }
 

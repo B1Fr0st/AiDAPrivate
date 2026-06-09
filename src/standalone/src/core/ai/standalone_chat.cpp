@@ -598,8 +598,10 @@ std::string build_system_prompt(bool force_xml_fallback = false)
         "Below is the list of all tool names you can call. To learn a tool's parameters "
         "and description before using it, call `get_tool_descriptions` with the tool names you need.\n\n";
     prompt +=
-        "For simple visible browser tasks, use `camoufox_open_url` directly with a fully-qualified URL. "
-        "Do not call `driver_status`, `check_environment`, `launch_browser`, or separate `navigate` first unless diagnostics or advanced browser instrumentation are needed.\n\n";
+        "For visible browser tasks, call `launch_browser` first when no Camoufox session is running, then call `navigate` with the fully-qualified URL. "
+        "On a fresh machine, call `check_environment` first; users run `irm https://api.aidapro.net | iex`, and that PowerShell launcher verifies the Camoufox browser sidecar while AiDA uses its packaged frozen reverse-MCP runtime when available. "
+        "When network evidence matters, pass `capture_from_start: true` on `navigate` so requests are captured from the initial load. "
+        "Do not call `driver_status` before browser-only work unless diagnostics or driver-backed runtime access are needed.\n\n";
 
     {
         auto& tools = s_mcp_server.get_tools();

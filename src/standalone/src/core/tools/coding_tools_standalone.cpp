@@ -14,13 +14,14 @@
 #include "standalone_chat.hpp"
 #include "command_sessions.hpp"
 #include "../helpers/globals.h"
-#include "../infra/win_thread.hpp"
+#include "../infra/work_queue.hpp"
 
 #include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -818,73 +819,116 @@ static tool_result_t tool_run_command(const json& params)
         command_sessions::command_session_t* raw = command_sessions::register_session(std::move(sess));
 
         raw->reader_done.store(false, std::memory_order_release);
-        std::string reader_err;
-        if (!aida::infra::win_thread::start_detached([raw, timeout_ms]() {
-            auto start = std::chrono::steady_clock::now();
-            auto drain_pipe = [&](HANDLE h, std::string& dest) -> bool {
-                DWORD avail = 0;
-                if (!PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr)) return false;
-                if (avail == 0) return true;
-                while (avail > 0) {
-                    char buf[8192];
-                    DWORD read_bytes = 0;
-                    DWORD to_read = (std::min)(static_cast<DWORD>(sizeof(buf)), avail);
-                    if (!ReadFile(h, buf, to_read, &read_bytes, nullptr) || read_bytes == 0)
-                        return false;
-                    {
-                        std::lock_guard<std::mutex> lk(raw->output_mutex);
-                        if (dest.size() < MAX_OUTPUT) {
-                            size_t room = MAX_OUTPUT - dest.size();
-                            size_t take = (read_bytes < room) ? read_bytes : room;
-                            dest.append(buf, take);
+        bool reader_posted = false;
+        try {
+            reader_posted = work_queue::post([raw, timeout_ms]() {
+                const DWORD tid = GetCurrentThreadId();
+                const ULONGLONG start_tick = GetTickCount64();
+                diag::log_tagged_fmt("coding",
+                    "run_command reader_enter session_id='%s' pid=%lu tid=%lu timeout_ms=%d",
+                    raw->id.c_str(),
+                    static_cast<unsigned long>(raw->process_info.dwProcessId),
+                    static_cast<unsigned long>(tid),
+                    timeout_ms);
+                try {
+                    auto start = std::chrono::steady_clock::now();
+                    auto drain_pipe = [&](HANDLE h, std::string& dest) -> bool {
+                        DWORD avail = 0;
+                        if (!PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr)) return false;
+                        if (avail == 0) return true;
+                        while (avail > 0) {
+                            char buf[8192];
+                            DWORD read_bytes = 0;
+                            DWORD to_read = (std::min)(static_cast<DWORD>(sizeof(buf)), avail);
+                            if (!ReadFile(h, buf, to_read, &read_bytes, nullptr) || read_bytes == 0)
+                                return false;
+                            {
+                                std::lock_guard<std::mutex> lk(raw->output_mutex);
+                                if (dest.size() < MAX_OUTPUT) {
+                                    size_t room = MAX_OUTPUT - dest.size();
+                                    size_t take = (read_bytes < room) ? read_bytes : room;
+                                    dest.append(buf, take);
+                                }
+                            }
+                            avail = 0;
+                            if (!PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr)) return false;
+                        }
+                        return true;
+                    };
+
+                    while (raw->alive.load()) {
+                        if (timeout_ms > 0) {
+                            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - start).count();
+                            if (elapsed >= timeout_ms) {
+                                raw->timed_out.store(true);
+                                TerminateProcess(raw->process_info.hProcess, 1);
+                                break;
+                            }
+                        }
+
+                        bool out_ok = drain_pipe(raw->stdout_read, raw->stdout_buf);
+                        bool err_ok = drain_pipe(raw->stderr_read, raw->stderr_buf);
+                        if (!out_ok && !err_ok) break;
+
+                        DWORD wait_res = WaitForSingleObject(raw->process_info.hProcess, 50);
+                        if (wait_res == WAIT_OBJECT_0) {
+                            drain_pipe(raw->stdout_read, raw->stdout_buf);
+                            drain_pipe(raw->stderr_read, raw->stderr_buf);
+                            break;
                         }
                     }
-                    avail = 0;
-                    if (!PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr)) return false;
+
+                    DWORD exit_code = 0;
+                    GetExitCodeProcess(raw->process_info.hProcess, &exit_code);
+                    raw->exit_code.store(static_cast<int64_t>(exit_code));
+                    raw->finished_at = std::chrono::steady_clock::now();
+                    raw->alive.store(false);
+
+                    output_log::push(bottom_tab_t::sandbox_log,
+                        "[run_command:" + raw->id + "] exit=" + std::to_string(exit_code) +
+                        (raw->timed_out.load() ? " (TIMED OUT)" : ""));
                 }
-                return true;
-            };
-
-            while (raw->alive.load()) {
-                if (timeout_ms > 0) {
-                    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now() - start).count();
-                    if (elapsed >= timeout_ms) {
-                        raw->timed_out.store(true);
-                        TerminateProcess(raw->process_info.hProcess, 1);
-                        break;
-                    }
+                catch (const std::exception& ex) {
+                    raw->alive.store(false);
+                    diag::log_tagged_fmt("coding",
+                        "run_command reader_exception session_id='%s' tid=%lu error=%s",
+                        raw->id.c_str(),
+                        static_cast<unsigned long>(tid),
+                        ex.what());
                 }
-
-                bool out_ok = drain_pipe(raw->stdout_read, raw->stdout_buf);
-                bool err_ok = drain_pipe(raw->stderr_read, raw->stderr_buf);
-                if (!out_ok && !err_ok) break;
-
-                DWORD wait_res = WaitForSingleObject(raw->process_info.hProcess, 50);
-                if (wait_res == WAIT_OBJECT_0) {
-                    drain_pipe(raw->stdout_read, raw->stdout_buf);
-                    drain_pipe(raw->stderr_read, raw->stderr_buf);
-                    break;
+                catch (...) {
+                    raw->alive.store(false);
+                    diag::log_tagged_fmt("coding",
+                        "run_command reader_exception_unknown session_id='%s' tid=%lu",
+                        raw->id.c_str(),
+                        static_cast<unsigned long>(tid));
                 }
-            }
-
-            DWORD exit_code = 0;
-            GetExitCodeProcess(raw->process_info.hProcess, &exit_code);
-            raw->exit_code.store(static_cast<int64_t>(exit_code));
-            raw->finished_at = std::chrono::steady_clock::now();
-            raw->alive.store(false);
-
-            output_log::push(bottom_tab_t::sandbox_log,
-                "[run_command:" + raw->id + "] exit=" + std::to_string(exit_code) +
-                (raw->timed_out.load() ? " (TIMED OUT)" : ""));
-            raw->reader_done.store(true, std::memory_order_release);
-        }, &reader_err, aida::infra::win_thread::default_stack_reserve, "coding.run_command.reader"))
-        {
+                diag::log_tagged_fmt("coding",
+                    "run_command reader_exit session_id='%s' tid=%lu elapsed_ms=%llu alive=%d timed_out=%d exit=%lld",
+                    raw->id.c_str(),
+                    static_cast<unsigned long>(tid),
+                    static_cast<unsigned long long>(GetTickCount64() - start_tick),
+                    raw->alive.load() ? 1 : 0,
+                    raw->timed_out.load() ? 1 : 0,
+                    static_cast<long long>(raw->exit_code.load()));
+                raw->reader_done.store(true, std::memory_order_release);
+            });
+        } catch (...) {
+            reader_posted = false;
+        }
+        if (!reader_posted) {
+            const auto qs = work_queue::stats();
             diag::log_tagged_fmt("coding",
-                "run_command reader_start_failed session_id='%s' pid=%lu err=%s",
+                "run_command reader_post_failed session_id='%s' pid=%lu cq_alive=%d cq_shutdown=%d cq_pending=%zu cq_active=%u cq_posted=%llu cq_rejected=%llu",
                 session_id_copy.c_str(),
                 static_cast<unsigned long>(pi.dwProcessId),
-                reader_err.c_str());
+                qs.alive ? 1 : 0,
+                qs.shutting_down ? 1 : 0,
+                qs.pending,
+                qs.active,
+                static_cast<unsigned long long>(qs.posted),
+                static_cast<unsigned long long>(qs.rejected));
             raw->alive.store(false, std::memory_order_release);
             if (raw->process_info.hProcess) {
                 DWORD code = 0;
@@ -893,7 +937,7 @@ static tool_result_t tool_run_command(const json& params)
             }
             raw->reader_done.store(true, std::memory_order_release);
             command_sessions::remove_session(session_id_copy);
-            return tool_result_t::error("Failed to start command reader: " + reader_err);
+            return tool_result_t::error("Failed to schedule command reader on work queue.");
         }
 
         if (wait) {

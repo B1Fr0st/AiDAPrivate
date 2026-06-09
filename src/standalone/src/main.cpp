@@ -1,4 +1,5 @@
 #include "imgui/imgui.h"
+#include "imgui/imgui_internal.h"
 #include "imgui/imgui_impl_win32.h"
 #include "imgui/imgui_impl_dx11.h"
 #include "imgui/freetype/freetype.h"
@@ -28,6 +29,7 @@
 #include "standalone_tools_fwd.hpp"
 #include "core/runtime/arc_loader.hpp"
 #include "core/runtime/diagnostic_exception_scope.hpp"
+#include "core/runtime/manual_map_tls.hpp"
 #include "core/anti-tamper/orchestrator.hpp"
 #include "core/anti-tamper/hv_preflight.hpp"
 #include "core/anti-tamper/mcp_posture.hpp"
@@ -73,6 +75,10 @@ extern "C" {
 #include <exception>
 #include <cwchar>
 #include <cstring>
+#include <cstdint>
+#if defined(_M_X64)
+#include <intrin.h>
+#endif
 
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "Shcore.lib")
@@ -153,45 +159,134 @@ static std::string sys_fonts_dir()
     return std::string(win_dir) + "\\Fonts";
 }
 
+static bool fileless_launch_active()
+{
+    char flag[16] = {};
+    if (GetEnvironmentVariableA("AIDA_FILELESS_LAUNCH", flag, static_cast<DWORD>(sizeof(flag))) > 0 &&
+        flag[0] != '\0' &&
+        std::strcmp(flag, "0") != 0) {
+        return true;
+    }
+    char path[MAX_PATH] = {};
+    return GetEnvironmentVariableA("AIDA_FILELESS_DEBUG_LOG_PATH", path, static_cast<DWORD>(sizeof(path))) > 0 &&
+        path[0] != '\0';
+}
+
 static ImFont* load_font_with_fallbacks(ImGuiIO& io,
                                          const char* embed_data, size_t embed_size,
                                          const std::vector<std::string>& candidate_paths,
                                          float pixel_size,
                                          const ImFontConfig& cfg_in)
 {
+    diag::log_tagged_critical_fmt("fonts",
+        "load_font_enter px=%.2f candidates=%zu embed_size=%zu atlas=0x%llX",
+        pixel_size,
+        candidate_paths.size(),
+        embed_size,
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(io.Fonts)));
     ImFontConfig cfg = cfg_in;
     cfg.FontDataOwnedByAtlas = true;
     for (const auto& p : candidate_paths) {
         if (font_file_exists(p)) {
+            const char* leaf = p.c_str();
+            const char* slash = std::strrchr(leaf, '\\');
+            if (slash) leaf = slash + 1;
+            diag::log_tagged_critical_fmt("fonts",
+                "load_font_file_pre leaf=%.120s path_len=%zu px=%.2f",
+                leaf,
+                p.size(),
+                pixel_size);
             ImFont* f = io.Fonts->AddFontFromFileTTF(p.c_str(), pixel_size, &cfg);
+            diag::log_tagged_critical_fmt("fonts",
+                "load_font_file_post leaf=%.120s font=0x%llX atlas_count=%d",
+                leaf,
+                static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(f)),
+                io.Fonts ? io.Fonts->Fonts.Size : -1);
             if (f) return f;
         }
     }
     if (embed_data && embed_size > 0) {
+        diag::log_tagged_critical_fmt("fonts",
+            "load_font_embed_alloc_pre bytes=%zu px=%.2f",
+            embed_size,
+            pixel_size);
         void* copy = IM_ALLOC(embed_size);
+        diag::log_tagged_critical_fmt("fonts",
+            "load_font_embed_alloc_post ptr=0x%llX bytes=%zu",
+            static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(copy)),
+            embed_size);
+        if (!copy) return nullptr;
         memcpy(copy, embed_data, embed_size);
-        return io.Fonts->AddFontFromMemoryTTF(copy, (int)embed_size, pixel_size, &cfg);
+        ImFont* f = io.Fonts->AddFontFromMemoryTTF(copy, (int)embed_size, pixel_size, &cfg);
+        diag::log_tagged_critical_fmt("fonts",
+            "load_font_embed_post font=0x%llX atlas_count=%d",
+            static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(f)),
+            io.Fonts ? io.Fonts->Fonts.Size : -1);
+        return f;
     }
+    diag::log_tagged_critical_fmt("fonts", "load_font_none px=%.2f", pixel_size);
     return nullptr;
 }
 
 static void merge_icon_font(ImGuiIO& io, float pixel_size)
 {
+    diag::log_tagged_critical_fmt("fonts",
+        "merge_icon_enter px=%.2f icon_bytes=%u atlas=0x%llX count=%d",
+        pixel_size,
+        ide_icon_font_size,
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(io.Fonts)),
+        io.Fonts ? io.Fonts->Fonts.Size : -1);
     static const ImWchar icon_ranges[] = { ICON_MIN_IDE, ICON_MAX_IDE, 0 };
     ImFontConfig icon_cfg{};
     icon_cfg.MergeMode = true;
     icon_cfg.PixelSnapH = true;
     icon_cfg.GlyphMinAdvanceX = pixel_size;
-    icon_cfg.FontBuilderFlags = ImGuiFreeTypeBuilderFlags_LightHinting;
+    const bool fileless = fileless_launch_active();
+    if (!fileless) {
+        icon_cfg.FontBuilderFlags = ImGuiFreeTypeBuilderFlags_LightHinting;
+    }
+    diag::log_tagged_critical_fmt("fonts",
+        "merge_icon_config fileless=%d builder_flags=0x%X",
+        fileless ? 1 : 0,
+        icon_cfg.FontBuilderFlags);
     void* icon_data_copy = IM_ALLOC(ide_icon_font_size);
+    diag::log_tagged_critical_fmt("fonts",
+        "merge_icon_alloc_post ptr=0x%llX bytes=%u",
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(icon_data_copy)),
+        ide_icon_font_size);
+    if (!icon_data_copy) return;
     memcpy(icon_data_copy, ide_icon_font_data, ide_icon_font_size);
-    io.Fonts->AddFontFromMemoryTTF(icon_data_copy, ide_icon_font_size, pixel_size, &icon_cfg, icon_ranges);
+    ImFont* merged = io.Fonts->AddFontFromMemoryTTF(icon_data_copy, ide_icon_font_size, pixel_size, &icon_cfg, icon_ranges);
+    diag::log_tagged_critical_fmt("fonts",
+        "merge_icon_post font=0x%llX atlas_count=%d",
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(merged)),
+        io.Fonts ? io.Fonts->Fonts.Size : -1);
 }
 
 static void rebuild_fonts(float dpi_scale)
 {
     ImGuiIO& io = ImGui::GetIO();
+    const bool fileless = fileless_launch_active();
+    diag::log_tagged_critical_fmt("fonts",
+        "rebuild_fonts_enter dpi_scale=%.3f ctx=0x%llX atlas=0x%llX count=%d fileless=%d builder_before=0x%llX flags_before=0x%X",
+        dpi_scale,
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(ImGui::GetCurrentContext())),
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(io.Fonts)),
+        io.Fonts ? io.Fonts->Fonts.Size : -1,
+        fileless ? 1 : 0,
+        io.Fonts ? static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(io.Fonts->FontBuilderIO)) : 0ULL,
+        io.Fonts ? io.Fonts->FontBuilderFlags : 0U);
     io.Fonts->Clear();
+    if (fileless) {
+        io.Fonts->FontBuilderIO = ImFontAtlasGetBuilderForStbTruetype();
+        io.Fonts->FontBuilderFlags = 0;
+    }
+    diag::log_tagged_critical_fmt("fonts",
+        "rebuild_fonts_clear_post atlas=0x%llX count=%d builder=0x%llX flags=0x%X",
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(io.Fonts)),
+        io.Fonts ? io.Fonts->Fonts.Size : -1,
+        io.Fonts ? static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(io.Fonts->FontBuilderIO)) : 0ULL,
+        io.Fonts ? io.Fonts->FontBuilderFlags : 0U);
 
     float screen_factor = 1.0f;
     {
@@ -209,6 +304,10 @@ static void rebuild_fonts(float dpi_scale)
     }
 
     const float texture_scale = dpi_scale * screen_factor;
+    diag::log_tagged_critical_fmt("fonts",
+        "rebuild_fonts_scale screen_factor=%.3f texture_scale=%.3f",
+        screen_factor,
+        texture_scale);
     const float base = 16.0f * texture_scale;
     const float lg   = 18.0f * texture_scale;
     const float sm   = 13.0f * texture_scale;
@@ -222,8 +321,10 @@ static void rebuild_fonts(float dpi_scale)
 
     auto cfg_ui_smooth = [&](float multiply) {
         ImFontConfig c{};
-        c.FontBuilderFlags = ImGuiFreeTypeBuilderFlags_NoHinting;
-        if (enable_lcd) c.FontBuilderFlags |= lcd_flag_value;
+        if (!fileless) {
+            c.FontBuilderFlags = ImGuiFreeTypeBuilderFlags_NoHinting;
+            if (enable_lcd) c.FontBuilderFlags |= lcd_flag_value;
+        }
         c.PixelSnapH = false;
         c.OversampleH = 3;
         c.OversampleV = 1;
@@ -232,8 +333,10 @@ static void rebuild_fonts(float dpi_scale)
     };
     auto cfg_ui_hinted = [&](float multiply) {
         ImFontConfig c{};
-        c.FontBuilderFlags = ImGuiFreeTypeBuilderFlags_LightHinting;
-        if (enable_lcd) c.FontBuilderFlags |= lcd_flag_value;
+        if (!fileless) {
+            c.FontBuilderFlags = ImGuiFreeTypeBuilderFlags_LightHinting;
+            if (enable_lcd) c.FontBuilderFlags |= lcd_flag_value;
+        }
         c.PixelSnapH = false;
         c.OversampleH = 3;
         c.OversampleV = 1;
@@ -242,7 +345,9 @@ static void rebuild_fonts(float dpi_scale)
     };
     auto cfg_mono = [&](float multiply) {
         ImFontConfig c{};
-        c.FontBuilderFlags = ImGuiFreeTypeBuilderFlags_LightHinting;
+        if (!fileless) {
+            c.FontBuilderFlags = ImGuiFreeTypeBuilderFlags_LightHinting;
+        }
         c.PixelSnapH = true;
         c.OversampleH = 1;
         c.OversampleV = 1;
@@ -253,6 +358,11 @@ static void rebuild_fonts(float dpi_scale)
     const std::string repo_dir = repo_fonts_dir();
     const std::string user_dir = user_fonts_dir();
     const std::string sys_dir  = sys_fonts_dir();
+    diag::log_tagged_critical_fmt("fonts",
+        "rebuild_fonts_dirs repo_len=%zu user_len=%zu sys_len=%zu",
+        repo_dir.size(),
+        user_dir.size(),
+        sys_dir.size());
 
     auto inter_paths = [&](const char* fname) -> std::vector<std::string> {
         std::vector<std::string> v;
@@ -308,24 +418,45 @@ static void rebuild_fonts(float dpi_scale)
 
     g_font_ui_400 = load_font_with_fallbacks(io, (const char*)verdana, sizeof(verdana),
                                               inter_400, base, c_400);
+    diag::log_tagged_critical_fmt("fonts", "rebuild_fonts_ui400 font=0x%llX",
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(g_font_ui_400)));
     merge_icon_font(io, base);
+    diag::log_tagged_critical("fonts", "rebuild_fonts_icon_merge_post");
 
     g_font_ui_500 = load_font_with_fallbacks(io, (const char*)verdana, sizeof(verdana),
                                               inter_500, base, c_500);
+    diag::log_tagged_critical_fmt("fonts", "rebuild_fonts_ui500 font=0x%llX",
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(g_font_ui_500)));
     g_font_ui_600 = load_font_with_fallbacks(io, (const char*)verdana, sizeof(verdana),
                                               inter_600, base, c_600);
+    diag::log_tagged_critical_fmt("fonts", "rebuild_fonts_ui600 font=0x%llX",
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(g_font_ui_600)));
     g_font_ui_700 = load_font_with_fallbacks(io, (const char*)verdana, sizeof(verdana),
                                               inter_700, base, c_700);
+    diag::log_tagged_critical_fmt("fonts", "rebuild_fonts_ui700 font=0x%llX",
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(g_font_ui_700)));
     g_font_ui_400_lg = load_font_with_fallbacks(io, (const char*)verdana, sizeof(verdana),
                                                  inter_400, lg, c_400);
+    diag::log_tagged_critical_fmt("fonts", "rebuild_fonts_ui400_lg font=0x%llX",
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(g_font_ui_400_lg)));
     g_font_ui_500_sm = load_font_with_fallbacks(io, (const char*)verdana, sizeof(verdana),
                                                  inter_500, sm, c_500);
+    diag::log_tagged_critical_fmt("fonts", "rebuild_fonts_ui500_sm font=0x%llX",
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(g_font_ui_500_sm)));
     g_font_ui_700_xl = load_font_with_fallbacks(io, (const char*)verdana, sizeof(verdana),
                                                  inter_700, xl, c_700);
+    diag::log_tagged_critical_fmt("fonts", "rebuild_fonts_ui700_xl font=0x%llX",
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(g_font_ui_700_xl)));
 
     g_font_code_400 = load_font_with_fallbacks(io, nullptr, 0, jbm_400, code, c_mono);
+    diag::log_tagged_critical_fmt("fonts", "rebuild_fonts_code400 font=0x%llX",
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(g_font_code_400)));
     g_font_code_600 = load_font_with_fallbacks(io, nullptr, 0, jbm_600, code, c_mono);
+    diag::log_tagged_critical_fmt("fonts", "rebuild_fonts_code600 font=0x%llX",
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(g_font_code_600)));
     g_font_code_400_lg = load_font_with_fallbacks(io, nullptr, 0, jbm_400, code_lg, c_mono);
+    diag::log_tagged_critical_fmt("fonts", "rebuild_fonts_code400_lg font=0x%llX",
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(g_font_code_400_lg)));
     if (!g_font_code_400) g_font_code_400 = g_font_ui_400;
     if (!g_font_code_600) g_font_code_600 = g_font_code_400;
     if (!g_font_code_400_lg) g_font_code_400_lg = g_font_code_400;
@@ -340,28 +471,55 @@ static void rebuild_fonts(float dpi_scale)
     if (!g_font_ui_700_xl) g_font_ui_700_xl = g_font_ui_700;
 
     io.FontDefault = g_font_ui_400;
+    if (fileless) {
+        for (int i = 0; i < io.Fonts->ConfigData.Size; ++i) {
+            io.Fonts->ConfigData[i].FontBuilderFlags = 0;
+        }
+    }
+    diag::log_tagged_critical_fmt("fonts",
+        "rebuild_fonts_build_pre default=0x%llX atlas_count=%d config_count=%d builder=0x%llX flags=0x%X fileless=%d",
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(io.FontDefault)),
+        io.Fonts ? io.Fonts->Fonts.Size : -1,
+        io.Fonts ? io.Fonts->ConfigData.Size : -1,
+        io.Fonts ? static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(io.Fonts->FontBuilderIO)) : 0ULL,
+        io.Fonts ? io.Fonts->FontBuilderFlags : 0U,
+        fileless ? 1 : 0);
     io.Fonts->Build();
+    diag::log_tagged_critical_fmt("fonts",
+        "rebuild_fonts_build_post atlas_count=%d tex_alpha=0x%llX tex_rgba=0x%llX tex_w=%d tex_h=%d use_colors=%d",
+        io.Fonts ? io.Fonts->Fonts.Size : -1,
+        io.Fonts ? static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(io.Fonts->TexPixelsAlpha8)) : 0ULL,
+        io.Fonts ? static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(io.Fonts->TexPixelsRGBA32)) : 0ULL,
+        io.Fonts ? io.Fonts->TexWidth : 0,
+        io.Fonts ? io.Fonts->TexHeight : 0,
+        (io.Fonts && io.Fonts->TexPixelsUseColors) ? 1 : 0);
     extern bool g_imgui_dx11_initialized;
     if (g_imgui_dx11_initialized) {
+        diag::log_tagged_critical("fonts", "rebuild_fonts_dx11_invalidate_pre");
         ImGui_ImplDX11_InvalidateDeviceObjects();
+        diag::log_tagged_critical("fonts", "rebuild_fonts_dx11_invalidate_post");
     }
+    diag::log_tagged_critical("fonts", "rebuild_fonts_exit");
 }
 
 bool g_imgui_dx11_initialized = false;
 
 static DWORD compute_acrylic_color_for_theme()
 {
+    aida::manual_map_tls::ensure_current_thread();
     const auto& t = aida::ui::resolved();
     return ((DWORD)t.acrylic_color & 0x00FFFFFFu) | (0xFFu << 24);
 }
 
 void set_acrylic_color(HWND hwnd)
 {
+    aida::manual_map_tls::ensure_current_thread();
     struct ACCENT_POLICY { DWORD AccentState; DWORD AccentFlags; DWORD GradientColor; DWORD AnimationId; };
     struct WINCOMPATTRDATA { DWORD Attribute; PVOID pData; ULONG DataSize; };
 
     auto SetWindowCompositionAttribute = (BOOL(WINAPI*)(HWND, void*))
         GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetWindowCompositionAttribute");
+    aida::manual_map_tls::ensure_current_thread();
     if (!SetWindowCompositionAttribute) return;
 
     DWORD color = compute_acrylic_color_for_theme();
@@ -369,6 +527,7 @@ void set_acrylic_color(HWND hwnd)
 
     WINCOMPATTRDATA data = { 19, &accent, sizeof(accent) };
     SetWindowCompositionAttribute(hwnd, &data);
+    aida::manual_map_tls::ensure_current_thread();
     diag::log_tagged_fmt("ui", "acrylic_set color=0x%08X alpha=0xFF (forced opaque)", color);
 }
 
@@ -389,7 +548,19 @@ static bool os_prefers_dark()
 
 static void apply_initial_theme()
 {
+    aida::manual_map_tls::ensure_current_thread();
+    diag::log_tagged_critical_fmt("theme",
+        "apply_initial_theme_enter pid=%lu tid=%lu tick=%llu",
+        GetCurrentProcessId(),
+        GetCurrentThreadId(),
+        static_cast<unsigned long long>(GetTickCount64()));
     aida::ui::apply_immediate(aida::ui::detail::make_aida_dark());
+    aida::manual_map_tls::ensure_current_thread();
+    diag::log_tagged_critical_fmt("theme",
+        "apply_initial_theme_exit pid=%lu tid=%lu tick=%llu",
+        GetCurrentProcessId(),
+        GetCurrentThreadId(),
+        static_cast<unsigned long long>(GetTickCount64()));
 }
 
 static void apply_os_theme_animated()
@@ -398,11 +569,13 @@ static void apply_os_theme_animated()
 
 static void crash_log_write(const char* msg)
 {
+    aida::manual_map_tls::ensure_current_thread();
     diag::log_tagged("main", msg);
 }
 
 static void crash_log_fmt(const char* fmt, ...)
 {
+    aida::manual_map_tls::ensure_current_thread();
     char buf[2048];
     va_list ap;
     va_start(ap, fmt);
@@ -413,11 +586,13 @@ static void crash_log_fmt(const char* fmt, ...)
 
 static void startup_log_critical(const char* detail)
 {
+    aida::manual_map_tls::ensure_current_thread();
     anti_tamper::webhook::write_log_critical("startup", detail ? detail : "<null>");
 }
 
 static void startup_log_critical_fmt(const char* fmt, ...)
 {
+    aida::manual_map_tls::ensure_current_thread();
     char buf[2048] = {};
     va_list ap;
     va_start(ap, fmt);
@@ -1198,7 +1373,7 @@ namespace aida_tracer {
             GetCurrentProcessId(),
             GetCurrentThreadId(),
             static_cast<unsigned long long>(GetTickCount64()));
-        bool posted = work_queue::post([]() {
+        bool posted = work_queue::post_service([]() {
             startup_log_critical_fmt("tracer_thread_entry pid=%lu tid=%lu tick=%llu",
                 GetCurrentProcessId(),
                 GetCurrentThreadId(),
@@ -1240,7 +1415,7 @@ namespace aida_focus_monitor {
             static_cast<unsigned long long>(start_tick));
         g_stop.store(false, std::memory_order_release);
         g_focused.store(foreground_belongs_to_process(hwnd), std::memory_order_release);
-        bool posted = work_queue::post([hwnd]() {
+        bool posted = work_queue::post_service([hwnd]() {
             startup_log_critical_fmt("focus_monitor_worker_enter hwnd=0x%llX pid=%lu tid=%lu tick=%llu",
                 static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
                 GetCurrentProcessId(),
@@ -2154,10 +2329,80 @@ static LONG CALLBACK aida_diagnostic_veh(EXCEPTION_POINTERS* ep)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+static void log_fileless_startup_state(const char* phase)
+{
+    char module[MAX_PATH] = {};
+    char cwd[MAX_PATH] = {};
+    char debug_log[MAX_PATH] = {};
+    char bootstrap_log[MAX_PATH] = {};
+    char mapped_base[64] = {};
+    char mapped_size[64] = {};
+    char entry_rva[64] = {};
+    char fileless[32] = {};
+    char no_disk[32] = {};
+    char payload_trace[32] = {};
+    GetModuleFileNameA(nullptr, module, static_cast<DWORD>(sizeof(module)));
+    GetCurrentDirectoryA(static_cast<DWORD>(sizeof(cwd)), cwd);
+    GetEnvironmentVariableA("AIDA_FILELESS_LAUNCH", fileless, static_cast<DWORD>(sizeof(fileless)));
+    GetEnvironmentVariableA("AIDA_FILELESS_NO_DISK_WRITE", no_disk, static_cast<DWORD>(sizeof(no_disk)));
+    GetEnvironmentVariableA("AIDA_PAYLOAD_TRACE", payload_trace, static_cast<DWORD>(sizeof(payload_trace)));
+    GetEnvironmentVariableA("AIDA_FILELESS_DEBUG_LOG_PATH", debug_log, static_cast<DWORD>(sizeof(debug_log)));
+    GetEnvironmentVariableA("AIDA_FILELESS_BOOTSTRAP_LOG_PATH", bootstrap_log, static_cast<DWORD>(sizeof(bootstrap_log)));
+    GetEnvironmentVariableA("AIDA_FILELESS_IMAGE_BASE", mapped_base, static_cast<DWORD>(sizeof(mapped_base)));
+    GetEnvironmentVariableA("AIDA_FILELESS_IMAGE_SIZE", mapped_size, static_cast<DWORD>(sizeof(mapped_size)));
+    GetEnvironmentVariableA("AIDA_FILELESS_ENTRY_RVA", entry_rva, static_cast<DWORD>(sizeof(entry_rva)));
+
+    std::uintptr_t teb = 0;
+    std::uintptr_t peb = 0;
+    std::uintptr_t tls_vector = 0;
+    std::uintptr_t tls_slot51 = 0;
+#if defined(_M_X64)
+    teb = static_cast<std::uintptr_t>(__readgsqword(0x30));
+    peb = static_cast<std::uintptr_t>(__readgsqword(0x60));
+    tls_vector = static_cast<std::uintptr_t>(__readgsqword(0x58));
+#endif
+    if (tls_vector)
+        safe_read_qword(reinterpret_cast<const void*>(tls_vector + 51u * sizeof(void*)), tls_slot51);
+
+    HMODULE image = GetModuleHandleA(nullptr);
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (image)
+        VirtualQuery(image, &mbi, sizeof(mbi));
+
+    diag::log_tagged_critical_fmt("main",
+        "fileless_startup_state phase=%s pid=%lu tid=%lu fileless=%s no_disk_write=%s payload_trace=%s module=%s cwd=%s debug_log=%s bootstrap_log=%s mapped_base_env=%s mapped_size_env=%s entry_rva_env=%s image_base=0x%016llX alloc_base=0x%016llX mbi_base=0x%016llX mbi_size=0x%llX mbi_state=0x%08lX mbi_protect=0x%08lX teb=0x%016llX peb=0x%016llX tls_vector=0x%016llX tls_slot51=0x%016llX",
+        phase ? phase : "",
+        GetCurrentProcessId(),
+        GetCurrentThreadId(),
+        fileless,
+        no_disk,
+        payload_trace,
+        module,
+        cwd,
+        debug_log,
+        bootstrap_log,
+        mapped_base,
+        mapped_size,
+        entry_rva,
+        static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(image)),
+        static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(mbi.AllocationBase)),
+        static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(mbi.BaseAddress)),
+        static_cast<unsigned long long>(mbi.RegionSize),
+        mbi.State,
+        mbi.Protect,
+        static_cast<unsigned long long>(teb),
+        static_cast<unsigned long long>(peb),
+        static_cast<unsigned long long>(tls_vector),
+        static_cast<unsigned long long>(tls_slot51));
+}
+
 int main(int, char**)
 {
+    aida::manual_map_tls::ensure_current_thread();
+    aida::diagnostic_exception_scope::initialize();
     AddVectoredExceptionHandler(1, aida_diagnostic_veh);
     diag::log_tagged_critical("main", "diagnostic_veh_installed");
+    log_fileless_startup_state("post_veh");
     if (!acquire_single_instance_gate()) {
         diag::log_tagged_critical("main", "single_instance_gate_refused");
         return 0;
@@ -2180,6 +2425,19 @@ int main(int, char**)
         static_cast<unsigned long long>(GetTickCount64()),
         work_queue::POOL_SIZE);
     crash_log_write("work_queue_init_ok");
+
+    startup_log_critical_fmt("work_queue_service_initialize_pre pid=%lu tid=%lu tick=%llu pool_size=%d",
+        GetCurrentProcessId(),
+        GetCurrentThreadId(),
+        static_cast<unsigned long long>(GetTickCount64()),
+        work_queue::SERVICE_POOL_SIZE);
+    work_queue::initialize_services();
+    startup_log_critical_fmt("work_queue_service_initialize_post pid=%lu tid=%lu tick=%llu pool_size=%d",
+        GetCurrentProcessId(),
+        GetCurrentThreadId(),
+        static_cast<unsigned long long>(GetTickCount64()),
+        work_queue::SERVICE_POOL_SIZE);
+    crash_log_write("work_queue_service_init_ok");
 
     startup_log_critical_fmt("critical_work_queue_initialize_pre pid=%lu tid=%lu tick=%llu pool_size=%d",
         GetCurrentProcessId(),
@@ -2545,17 +2803,24 @@ int main(int, char**)
         GetCurrentThreadId(),
         static_cast<unsigned long long>(GetTickCount64()));
     ::ShowWindow(hwnd, SW_SHOWDEFAULT);
+    aida::manual_map_tls::ensure_current_thread();
     const MARGINS margin = { -1 };
     DwmExtendFrameIntoClientArea(hwnd, &margin);
+    aida::manual_map_tls::ensure_current_thread();
     DWM_WINDOW_CORNER_PREFERENCE corner = DWMWCP_ROUND;
     DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corner, sizeof(corner));
+    aida::manual_map_tls::ensure_current_thread();
 
     COLORREF border_color = RGB(33, 35, 39);
     DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &border_color, sizeof(border_color));
+    aida::manual_map_tls::ensure_current_thread();
     SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
+    aida::manual_map_tls::ensure_current_thread();
 
     set_acrylic_color(hwnd);
+    aida::manual_map_tls::ensure_current_thread();
     ::UpdateWindow(hwnd);
+    aida::manual_map_tls::ensure_current_thread();
     startup_log_critical_fmt("show_window_post hwnd=0x%llX last_err=%lu",
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
         static_cast<unsigned long>(GetLastError()));
@@ -2580,26 +2845,66 @@ int main(int, char**)
     }
 
     IMGUI_CHECKVERSION();
+    aida::manual_map_tls::ensure_current_thread();
     startup_log_critical_fmt("imgui_context_create_pre pid=%lu tid=%lu tick=%llu",
         GetCurrentProcessId(),
         GetCurrentThreadId(),
         static_cast<unsigned long long>(GetTickCount64()));
     ImGui::CreateContext();
+    aida::manual_map_tls::ensure_current_thread();
     startup_log_critical_fmt("imgui_context_create_post ctx=0x%llX",
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(ImGui::GetCurrentContext())));
     crash_log_write("imgui_context_created");
-    ImGuiIO& io = ImGui::GetIO(); (void)io;
+    aida::manual_map_tls::ensure_current_thread();
+    startup_log_critical_fmt("imgui_getio_pre ctx=0x%llX pid=%lu tid=%lu tick=%llu",
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(ImGui::GetCurrentContext())),
+        GetCurrentProcessId(),
+        GetCurrentThreadId(),
+        static_cast<unsigned long long>(GetTickCount64()));
+    ImGuiIO& io = ImGui::GetIO();
+    startup_log_critical_fmt("imgui_getio_post io=0x%llX fonts=0x%llX config=0x%08X",
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(&io)),
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(io.Fonts)),
+        static_cast<unsigned>(io.ConfigFlags));
+    aida::manual_map_tls::ensure_current_thread();
+    startup_log_critical_fmt("imgui_config_flags_pre flags=0x%08X nav_capture=%d",
+        static_cast<unsigned>(io.ConfigFlags),
+        io.ConfigNavCaptureKeyboard ? 1 : 0);
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
     io.ConfigNavCaptureKeyboard = false;
+    startup_log_critical_fmt("imgui_config_flags_post flags=0x%08X nav_capture=%d",
+        static_cast<unsigned>(io.ConfigFlags),
+        io.ConfigNavCaptureKeyboard ? 1 : 0);
 
 
     {
+        aida::manual_map_tls::ensure_current_thread();
+        startup_log_critical_fmt("dpi_scale_query_pre hwnd=0x%llX pid=%lu tid=%lu tick=%llu",
+            static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
+            GetCurrentProcessId(),
+            GetCurrentThreadId(),
+            static_cast<unsigned long long>(GetTickCount64()));
         UINT dpi = GetDpiForWindow(hwnd);
+        aida::manual_map_tls::ensure_current_thread();
         globals::ui::dpi_scale = (dpi > 0) ? (static_cast<float>(dpi) / 96.0f) : 1.0f;
+        startup_log_critical_fmt("dpi_scale_query_post dpi=%u scale=%.3f last_err=%lu",
+            dpi,
+            globals::ui::dpi_scale,
+            static_cast<unsigned long>(GetLastError()));
     }
 
+    aida::manual_map_tls::ensure_current_thread();
+    startup_log_critical_fmt("apply_initial_theme_pre pid=%lu tid=%lu tick=%llu",
+        GetCurrentProcessId(),
+        GetCurrentThreadId(),
+        static_cast<unsigned long long>(GetTickCount64()));
     apply_initial_theme();
+    aida::manual_map_tls::ensure_current_thread();
+    startup_log_critical_fmt("apply_initial_theme_post pid=%lu tid=%lu tick=%llu",
+        GetCurrentProcessId(),
+        GetCurrentThreadId(),
+        static_cast<unsigned long long>(GetTickCount64()));
 
     startup_log_critical_fmt("rebuild_fonts_pre dpi_scale=%.3f pid=%lu tid=%lu tick=%llu",
         globals::ui::dpi_scale,
@@ -3586,6 +3891,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 
 LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
+    aida::manual_map_tls::ensure_current_thread();
     aida_tracer::set_wndproc_state("enter", hWnd, msg, wParam, lParam);
     uint64_t wnd_start = static_cast<uint64_t>(GetTickCount64());
     auto finish = [&](const char* path, LRESULT result) -> LRESULT {

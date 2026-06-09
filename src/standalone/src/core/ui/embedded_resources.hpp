@@ -116,13 +116,6 @@ inline bool extract_and_load_z3()
 {
     std::lock_guard<std::mutex> lk(detail::z3_mutex());
 
-    if (g_z3_module)
-        return true;
-
-    std::wstring tmp_dir = detail::make_temp_dir();
-    if (tmp_dir.empty())
-        return false;
-
     struct z3_file {
         int resource_id;
         const wchar_t* filename;
@@ -140,6 +133,29 @@ inline bool extract_and_load_z3()
         { IDR_Z3_VCRUNTIME140_THREADS_DLL, L"vcruntime140_threads.dll" },
         { IDR_LIBZ3_DLL, L"libz3.dll" },
     };
+
+    if (g_z3_module)
+        return true;
+
+    if (HMODULE existing = GetModuleHandleW(L"libz3.dll")) {
+        g_z3_module = existing;
+        wchar_t preload_dir[32768]{};
+        constexpr DWORD preload_dir_count = static_cast<DWORD>(sizeof(preload_dir) / sizeof(preload_dir[0]));
+        DWORD n = GetEnvironmentVariableW(L"AIDA_Z3_PRELOAD_DIR", preload_dir, preload_dir_count);
+        if (n > 0 && n < preload_dir_count) {
+            g_z3_temp_dir = preload_dir;
+            g_z3_temp_path = g_z3_temp_dir + L"\\libz3.dll";
+            g_z3_written_paths.clear();
+            g_z3_written_paths.reserve(sizeof(files) / sizeof(files[0]));
+            for (const auto& f : files)
+                g_z3_written_paths.push_back(g_z3_temp_dir + L"\\" + f.filename);
+        }
+        return true;
+    }
+
+    std::wstring tmp_dir = detail::make_temp_dir();
+    if (tmp_dir.empty())
+        return false;
 
     std::vector<std::wstring> written;
     written.reserve(sizeof(files) / sizeof(files[0]));

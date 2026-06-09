@@ -29,6 +29,7 @@ struct launch_config_t
     bool                     enable_trace       = false;
     std::string              python_executable;
     std::string              browser_executable;
+    std::string              server_executable;
     std::string              server_module      = "camoufox_reverse_mcp";
     std::vector<std::string> extra_args;
     int                      launch_timeout_ms  = 35000;
@@ -121,6 +122,7 @@ bool             stop_bridge(const char* reason = nullptr);
 bool             stop_bridge(const std::string& session_id, const char* reason = nullptr);
 bool             force_cleanup(const char* reason = nullptr);
 bool             force_cleanup(const std::string& session_id, const char* reason = nullptr);
+bool             wait_until_idle(uint32_t timeout_ms, const char* reason = nullptr);
 bool             is_ready();
 bool             ensure_ready();
 bool             prewarm_default_async(const char* reason = nullptr);

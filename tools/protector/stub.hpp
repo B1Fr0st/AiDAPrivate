@@ -54,6 +54,7 @@ struct stub_config_t {
     uint32_t string_table_offset;
     uint32_t resource_table_offset;
     uint32_t master_key_offset;
+    uint32_t stub_code_offset;
     uint64_t seed;
     bool     polymorphic = false;
 };
@@ -163,6 +164,18 @@ inline void mov_reg_reg(std::vector<uint8_t>& buf, uint8_t dst, uint8_t src) {
 inline void xor_reg_reg(std::vector<uint8_t>& buf, uint8_t dst, uint8_t src) {
     emit_rex_rr(buf, true, src, dst);
     buf.push_back(0x31);
+    buf.push_back(static_cast<uint8_t>(0xC0u | ((src & 7u) << 3) | (dst & 7u)));
+}
+
+inline void add_reg_reg(std::vector<uint8_t>& buf, uint8_t dst, uint8_t src) {
+    emit_rex_rr(buf, true, src, dst);
+    buf.push_back(0x01);
+    buf.push_back(static_cast<uint8_t>(0xC0u | ((src & 7u) << 3) | (dst & 7u)));
+}
+
+inline void sub_reg_reg(std::vector<uint8_t>& buf, uint8_t dst, uint8_t src) {
+    emit_rex_rr(buf, true, src, dst);
+    buf.push_back(0x29);
     buf.push_back(static_cast<uint8_t>(0xC0u | ((src & 7u) << 3) | (dst & 7u)));
 }
 
@@ -294,22 +307,23 @@ inline void emit_prologue(std::vector<uint8_t>& buf) {
     emit::sub_rsp_imm32(buf, 0x1C8u);
 }
 
-inline void emit_epilogue_and_jmp_oep(std::vector<uint8_t>& buf, uint32_t original_entry_rva) {
+inline void emit_epilogue_and_jmp_oep(std::vector<uint8_t>& buf, uint32_t original_entry_rva, uint32_t packed_section_rva, uint32_t stub_code_offset) {
     emit::add_rsp_imm32(buf, 0x1C8u);
     emit::raw(buf, internal::kEpilogueRestoreBlob, sizeof(internal::kEpilogueRestoreBlob));
+    const size_t base_lea_pos = buf.size();
+    emit::lea_rip_relative(buf, reg::RCX, 0);
+    emit::mov_reg_imm64(buf, reg::RAX, static_cast<uint64_t>(packed_section_rva) + stub_code_offset + static_cast<uint32_t>(base_lea_pos + 7u));
+    emit::sub_reg_reg(buf, reg::RCX, reg::RAX);
     emit::mov_reg_imm32(buf, reg::RAX, original_entry_rva);
-    static constexpr uint8_t kPebToRcx[] = {
-        0x65, 0x48, 0x8B, 0x0C, 0x25, 0x60, 0x00, 0x00, 0x00,
-        0x48, 0x8B, 0x49, 0x10
-    };
-    emit::raw(buf, kPebToRcx, sizeof(kPebToRcx));
-    static constexpr uint8_t kAddRaxRcx[] = { 0x48, 0x01, 0xC8 };
-    emit::raw(buf, kAddRaxRcx, 3);
+    emit::add_reg_reg(buf, reg::RAX, reg::RCX);
     emit::jmp_reg(buf, reg::RAX);
 }
 
-inline void emit_locate_image_base(std::vector<uint8_t>& buf) {
-    emit::raw(buf, internal::kGsPebImageBaseBlob, sizeof(internal::kGsPebImageBaseBlob));
+inline void emit_locate_image_base(std::vector<uint8_t>& buf, uint32_t packed_section_rva, uint32_t stub_code_offset) {
+    const size_t base_lea_pos = buf.size();
+    emit::lea_rip_relative(buf, reg::R12, 0);
+    emit::mov_reg_imm64(buf, reg::RAX, static_cast<uint64_t>(packed_section_rva) + stub_code_offset + static_cast<uint32_t>(base_lea_pos + 7u));
+    emit::sub_reg_reg(buf, reg::R12, reg::RAX);
 }
 
 inline void emit_tls_body(std::vector<uint8_t>& buf) {
@@ -339,7 +353,7 @@ inline generated_stub_t generate_legacy(const stub_config_t& cfg) {
     emit_prologue(m);
     emit::opaque_jz_jnz(m, rng);
 
-    emit_locate_image_base(m);
+    emit_locate_image_base(m, cfg.packed_section_rva, cfg.stub_code_offset);
 
     static constexpr uint8_t kMovRcxR12[] = { 0x4C, 0x89, 0xE1 };
     emit::raw(m, kMovRcxR12, 3);
@@ -372,7 +386,7 @@ inline generated_stub_t generate_legacy(const stub_config_t& cfg) {
 
     emit::opaque_jz_jnz(m, rng);
 
-    emit_epilogue_and_jmp_oep(m, cfg.original_entry_rva);
+    emit_epilogue_and_jmp_oep(m, cfg.original_entry_rva, cfg.packed_section_rva, cfg.stub_code_offset);
 
     {
         uint32_t pad = 16u - (static_cast<uint32_t>(m.size()) & 0x0Fu);
@@ -414,6 +428,7 @@ inline generated_stub_t generate_legacy(const stub_config_t& cfg) {
     (void)cfg.string_table_offset;
     (void)cfg.resource_table_offset;
     (void)cfg.master_key_offset;
+    (void)cfg.stub_code_offset;
 
     return out;
 }

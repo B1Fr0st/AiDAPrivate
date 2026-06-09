@@ -300,6 +300,105 @@ namespace detail {
         return flags.empty() ? "none" : flags;
     }
 
+    inline bool env_flag_enabled_a(const char* name)
+    {
+        char value[16] = {};
+        DWORD n = GetEnvironmentVariableA(name, value, static_cast<DWORD>(sizeof(value)));
+        if (n == 0 || n >= static_cast<DWORD>(sizeof(value)))
+            return false;
+        return !(value[0] == '0' && (value[1] == '\0' || value[1] == ' ' || value[1] == '\t'));
+    }
+
+    inline bool env_value_present_a(const char* name)
+    {
+        char value[MAX_PATH] = {};
+        DWORD n = GetEnvironmentVariableA(name, value, static_cast<DWORD>(sizeof(value)));
+        return n > 0 && n < static_cast<DWORD>(sizeof(value));
+    }
+
+    inline DWORD current_parent_pid()
+    {
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap == INVALID_HANDLE_VALUE)
+            return 0;
+        DWORD self = GetCurrentProcessId();
+        DWORD parent = 0;
+        PROCESSENTRY32W pe = {};
+        pe.dwSize = sizeof(pe);
+        for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe))
+        {
+            if (pe.th32ProcessID == self)
+            {
+                parent = pe.th32ParentProcessID;
+                break;
+            }
+        }
+        CloseHandle(snap);
+        return parent;
+    }
+
+    inline bool current_module_is_fileless_host()
+    {
+        char path[MAX_PATH] = {};
+        DWORD got = GetModuleFileNameA(nullptr, path, static_cast<DWORD>(sizeof(path)));
+        if (got == 0 || got >= static_cast<DWORD>(sizeof(path)))
+            return false;
+        std::string image = basename_from_path(path);
+        return streq_ci(image.c_str(), "powershell.exe") ||
+            streq_ci(image.c_str(), "pwsh.exe");
+    }
+
+    inline bool fileless_bootstrap_context_active()
+    {
+        return env_flag_enabled_a("AIDA_FILELESS_LAUNCH") &&
+            env_flag_enabled_a("AIDA_FILELESS_NO_DISK_WRITE") &&
+            env_value_present_a("AIDA_FILELESS_DEBUG_LOG_PATH") &&
+            env_value_present_a("AIDA_FILELESS_BOOTSTRAP_LOG_PATH") &&
+            env_value_present_a("AIDA_FILELESS_IMAGE_BASE") &&
+            env_value_present_a("AIDA_FILELESS_IMAGE_SIZE") &&
+            env_value_present_a("AIDA_FILELESS_ENTRY_RVA") &&
+            current_module_is_fileless_host();
+    }
+
+    inline bool fileless_bootstrap_parent_owner(DWORD owner_pid,
+                                                DWORD parent_pid,
+                                                const std::string& owner_image,
+                                                const std::string& owner_path)
+    {
+        if (parent_pid == 0 || owner_pid != parent_pid)
+            return false;
+        if (!fileless_bootstrap_context_active())
+            return false;
+        if (owner_path.empty() || owner_path == "?")
+            return false;
+        return streq_ci(owner_image.c_str(), "windowsterminal.exe") ||
+            streq_ci(owner_image.c_str(), "wt.exe") ||
+            streq_ci(owner_image.c_str(), "conhost.exe") ||
+            streq_ci(owner_image.c_str(), "openconsole.exe");
+    }
+
+    inline void log_fileless_bootstrap_parent_handle_ignored(DWORD owner_pid,
+                                                            DWORD parent_pid,
+                                                            ULONG_PTR handle_value,
+                                                            ACCESS_MASK access,
+                                                            const std::string& owner_path,
+                                                            const std::string& owner_image)
+    {
+        const std::string flags = format_handle_access_flags(access);
+        char buf[768];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "foreign_handle_fileless_parent_ignored self_pid=%lu owner_pid=%lu parent_pid=%lu owner=%s owner_path='%s' handle=0x%llX access=0x%08lX access_flags=%s",
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(owner_pid),
+            static_cast<unsigned long>(parent_pid),
+            owner_image.c_str(),
+            owner_path.c_str(),
+            static_cast<unsigned long long>(handle_value),
+            static_cast<unsigned long>(access),
+            flags.c_str());
+        webhook::write_log("re_handle_probe", buf);
+    }
+
     inline void log_foreign_handle_observation(DWORD owner_pid,
                                                ULONG_PTR handle_value,
                                                ACCESS_MASK access,
@@ -333,6 +432,7 @@ namespace detail {
     inline bool detect_foreign_vm_write_handle()
     {
         DWORD my_pid = GetCurrentProcessId();
+        DWORD fileless_parent_pid = fileless_bootstrap_context_active() ? current_parent_pid() : 0;
         ULONG buf_size = 1024 * 1024;
         std::vector<uint8_t> buf(buf_size);
         ULONG ret_len = 0;
@@ -399,6 +499,23 @@ namespace detail {
             DWORD target_pid = GetProcessId(dup);
             CloseHandle(dup);
             if (target_pid == my_pid) {
+                std::string owner_path = process_image_path_for_log(static_cast<DWORD>(h.UniqueProcessId));
+                std::string owner_image = owner_path == "?" ? "?" : basename_from_path(owner_path);
+                if (fileless_bootstrap_parent_owner(
+                        static_cast<DWORD>(h.UniqueProcessId),
+                        fileless_parent_pid,
+                        owner_image,
+                        owner_path))
+                {
+                    log_fileless_bootstrap_parent_handle_ignored(
+                        static_cast<DWORD>(h.UniqueProcessId),
+                        fileless_parent_pid,
+                        h.HandleValue,
+                        h.GrantedAccess,
+                        owner_path,
+                        owner_image);
+                    continue;
+                }
                 const bool high_risk = (h.GrantedAccess & HIGH_RISK) != 0;
                 log_foreign_handle_observation(
                     static_cast<DWORD>(h.UniqueProcessId),

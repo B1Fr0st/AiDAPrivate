@@ -408,15 +408,15 @@ inline generated_stub_t generate(const stub_config_t& cfg) {
 
     emit_overlap_dispatch(a, rng);
 
-    emit_mba_const(a, rTmp1, 0x60ULL, rng);
-    x86::Mem peb_mem = x86::qword_ptr(rTmp1);
-    peb_mem.set_segment(x86::gs);
-    a.mov(rBase, peb_mem);
-
-    emit_opaque_predicate(a, rTmp2, rng);
-
-    emit_mba_const(a, rTmp1, 0x10ULL, rng);
-    a.mov(rBase, x86::qword_ptr(rBase, rTmp1));
+    Label lBaseAnchor = a.new_label();
+    a.lea(rBase, x86::ptr(lBaseAnchor));
+    a.bind(lBaseAnchor);
+    emit_mba_const(a, rTmp1,
+                   static_cast<uint64_t>(cfg.packed_section_rva)
+                       + static_cast<uint64_t>(cfg.stub_code_offset)
+                       + static_cast<uint64_t>(a.offset()),
+                   rng);
+    a.sub(rBase, rTmp1);
 
     a.mov(x86::qword_ptr(x86::rsp, 0x20), rBase);
 
@@ -521,17 +521,56 @@ inline generated_stub_t generate(const stub_config_t& cfg) {
 
     out.stub_signature_tag = crc32_ieee(out.main_stub.data(), out.main_stub.size());
 
-    if (!cfg.has_existing_tls) {
-        CodeHolder tcode;
-        Environment tenv;
-        tenv.set_arch(Arch::kX64);
-        (void)tcode.init(tenv);
-        x86::Assembler ta(&tcode);
+    CodeHolder tcode;
+    Environment tenv;
+    tenv.set_arch(Arch::kX64);
+    (void)tcode.init(tenv);
+    x86::Assembler ta(&tcode);
 
-        ta.push(x86::rbp);
-        ta.mov(x86::rbp, x86::rsp);
-        ta.sub(x86::rsp, 0x28);
+    ta.push(x86::rbp);
+    ta.mov(x86::rbp, x86::rsp);
+    ta.sub(x86::rsp, cfg.has_existing_tls ? 0x20 : 0x28);
 
+    Label lTlsDone = ta.new_label();
+
+    if (cfg.has_existing_tls) {
+        Label lTlsKey = ta.new_label();
+        Label lTlsAfterKey = ta.new_label();
+        Label lTlsPayload = ta.new_label();
+        ta.cmp(x86::edx, 1);
+        ta.jne(lTlsDone);
+        ta.mov(x86::r11, x86::rcx);
+        ta.jmp(lTlsAfterKey);
+        ta.bind(lTlsKey);
+        ta.embed(key.data(), key.size());
+        ta.bind(lTlsAfterKey);
+
+        x86::Gp rKey2 = x86::r8;
+        x86::Gp rPay2 = x86::r9;
+        x86::Gp rCount2 = x86::r10;
+        ta.lea(rKey2, x86::ptr(lTlsKey));
+        ta.lea(rPay2, x86::ptr(lTlsPayload));
+        ta.mov(rCount2, static_cast<int64_t>(aida_payload::kBlobSize));
+
+        Label lTlsLoop = ta.new_label();
+        ta.bind(lTlsLoop);
+        ta.dec(rCount2);
+        ta.mov(x86::rax, rCount2);
+        ta.and_(x86::rax, 0xFF);
+        ta.mov(x86::al, x86::byte_ptr(rKey2, x86::rax));
+        ta.xor_(x86::byte_ptr(rPay2, rCount2), x86::al);
+        ta.test(rCount2, rCount2);
+        ta.jne(lTlsLoop);
+
+        ta.mov(x86::rcx, x86::r11);
+        ta.lea(x86::rax, x86::ptr(lTlsPayload));
+        ta.add(x86::rax, static_cast<int32_t>(aida_payload::kEntryOffset));
+        ta.call(x86::rax);
+        ta.jmp(lTlsDone);
+
+        ta.bind(lTlsPayload);
+        ta.embed(masked_blob.data(), masked_blob.size());
+    } else {
         x86::Mem pebm = x86::qword_ptr(x86::rax);
         pebm.set_segment(x86::gs);
         ta.mov(x86::rax, 0x60);
@@ -544,17 +583,18 @@ inline generated_stub_t generate(const stub_config_t& cfg) {
         ta.bind(lSpin);
         ta.jmp(lSpin);
         ta.bind(lTlsOk);
-
-        ta.add(x86::rsp, 0x28);
-        ta.pop(x86::rbp);
-        ta.ret();
-
-        (void)tcode.flatten();
-        (void)tcode.resolve_cross_section_fixups();
-        size_t tsz = tcode.code_size();
-        out.tls_stub.resize(tsz, 0);
-        (void)tcode.copy_flattened_data(out.tls_stub.data(), tsz, CopySectionFlags::kNone);
     }
+
+    ta.bind(lTlsDone);
+    ta.add(x86::rsp, cfg.has_existing_tls ? 0x20 : 0x28);
+    ta.pop(x86::rbp);
+    ta.ret();
+
+    (void)tcode.flatten();
+    (void)tcode.resolve_cross_section_fixups();
+    size_t tsz = tcode.code_size();
+    out.tls_stub.resize(tsz, 0);
+    (void)tcode.copy_flattened_data(out.tls_stub.data(), tsz, CopySectionFlags::kNone);
 
     (void)cfg.packed_section_rva;
     (void)cfg.section_count;

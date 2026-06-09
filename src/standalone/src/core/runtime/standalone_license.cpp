@@ -17,6 +17,7 @@
 #include "obfuscation.hpp"
 #include "../infra/work_queue.hpp"
 #include "../crypto/keys.hpp"
+#include "../../helpers/diag_log.hpp"
 #include "standalone_license_transport.hpp"
 #include "license_state.hpp"
 #include "gate_tokens.hpp"
@@ -84,13 +85,8 @@ static void lic_log(const char* step)
     BOOL pending;
     InitOnceBeginInitialize(&s_once, INIT_ONCE_ASYNC, &pending, nullptr);
     if (pending || s_log_path[0] == '\0') {
-        DWORD n = GetModuleFileNameA(nullptr, s_log_path, MAX_PATH);
-        if (n == 0 || n >= MAX_PATH) {
+        if (!diag::build_log_path("aida_debug.log", s_log_path, sizeof(s_log_path))) {
             strcpy_s(s_log_path, "aida_debug.log");
-        } else {
-            char* last = strrchr(s_log_path, '\\');
-            if (last) *(last + 1) = '\0'; else s_log_path[0] = '\0';
-            strcat_s(s_log_path, "aida_debug.log");
         }
         InitOnceComplete(&s_once, INIT_ONCE_ASYNC, nullptr);
     }
@@ -2267,7 +2263,7 @@ namespace
 
 
     arc_loader::loaded_module_t  s_arc_module{};
-    std::mutex                   s_arc_mtx;
+    std::timed_mutex             s_arc_mtx;
     bool                         s_arc_loaded = false;
     std::atomic<bool>            s_arc_fetch_deferred{false};
     std::atomic<bool>            s_arc_download_in_progress{false};
@@ -2362,6 +2358,182 @@ namespace
         s_fn_arc_set_key_seed = nullptr;
         s_fn_arc_unseal_feature = nullptr;
         s_fn_arc_copy_last_status = nullptr;
+    }
+
+    __declspec(noinline) DWORD arc_call_init_seh(arc_init_fn fn,
+                                                 const char* session_token,
+                                                 const char* hwid,
+                                                 int64_t issued_at,
+                                                 uint32_t interface_version,
+                                                 const uint8_t* bind_proof,
+                                                 BOOL* out_ok)
+    {
+        if (out_ok) *out_ok = FALSE;
+        if (!fn || !out_ok)
+            return ERROR_INVALID_PARAMETER;
+        __try {
+            *out_ok = fn(session_token, hwid, issued_at, interface_version, bind_proof) ? TRUE : FALSE;
+            return ERROR_SUCCESS;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return GetExceptionCode();
+        }
+    }
+
+    __declspec(noinline) DWORD arc_call_bind_driver_device_seh(arc_bind_driver_device_fn fn,
+                                                               void* driver_device,
+                                                               uint32_t interface_version,
+                                                               BOOL* out_ok)
+    {
+        if (out_ok) *out_ok = FALSE;
+        if (!fn || !out_ok)
+            return ERROR_INVALID_PARAMETER;
+        __try {
+            *out_ok = fn(driver_device, interface_version) ? TRUE : FALSE;
+            return ERROR_SUCCESS;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return GetExceptionCode();
+        }
+    }
+
+    __declspec(noinline) DWORD arc_call_set_key_seed_seh(arc_set_key_seed_fn fn,
+                                                         const uint8_t* seed,
+                                                         uint32_t seed_len)
+    {
+        if (!fn)
+            return ERROR_INVALID_PARAMETER;
+        __try {
+            fn(seed, seed_len);
+            return ERROR_SUCCESS;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return GetExceptionCode();
+        }
+    }
+
+    __declspec(noinline) DWORD arc_call_unseal_feature_seh(arc_unseal_feature_fn fn,
+                                                           uint32_t feature_id,
+                                                           const uint8_t* nonce,
+                                                           uint32_t nonce_len,
+                                                           uint8_t* out,
+                                                           uint32_t* out_len,
+                                                           uint32_t out_capacity,
+                                                           BOOL* out_ok)
+    {
+        if (out_ok) *out_ok = FALSE;
+        if (!fn || !out_ok)
+            return ERROR_INVALID_PARAMETER;
+        __try {
+            *out_ok = fn(feature_id, nonce, nonce_len, out, out_len, out_capacity) ? TRUE : FALSE;
+            return ERROR_SUCCESS;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return GetExceptionCode();
+        }
+    }
+
+    __declspec(noinline) DWORD arc_call_heartbeat_seh(arc_heartbeat_fn fn,
+                                                      arc_heartbeat_result_t* out)
+    {
+        if (out)
+            SecureZeroMemory(out, sizeof(*out));
+        if (!fn || !out)
+            return ERROR_INVALID_PARAMETER;
+        __try {
+            *out = fn();
+            return ERROR_SUCCESS;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return GetExceptionCode();
+        }
+    }
+
+    __declspec(noinline) DWORD arc_call_heartbeat_ex_seh(arc_heartbeat_ex_fn fn,
+                                                         uint64_t heartbeat_index,
+                                                         const char* code_hash,
+                                                         arc_heartbeat_result_t* out)
+    {
+        if (out)
+            SecureZeroMemory(out, sizeof(*out));
+        if (!fn || !out)
+            return ERROR_INVALID_PARAMETER;
+        __try {
+            *out = fn(heartbeat_index, code_hash);
+            return ERROR_SUCCESS;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return GetExceptionCode();
+        }
+    }
+
+    __declspec(noinline) DWORD arc_call_get_comm_bridge_seh(arc_get_comm_bridge_fn fn,
+                                                            const arc_comm_vtable_t** out)
+    {
+        if (out) *out = nullptr;
+        if (!fn || !out)
+            return ERROR_INVALID_PARAMETER;
+        __try {
+            *out = fn();
+            return ERROR_SUCCESS;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return GetExceptionCode();
+        }
+    }
+
+    __declspec(noinline) DWORD arc_call_validate_tool_seh(arc_validate_tool_fn fn,
+                                                          uint64_t name_hash,
+                                                          uint64_t gate_token,
+                                                          uint64_t* out_token)
+    {
+        if (out_token) *out_token = 0;
+        if (!fn || !out_token)
+            return ERROR_INVALID_PARAMETER;
+        __try {
+            *out_token = fn(name_hash, gate_token);
+            return ERROR_SUCCESS;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return GetExceptionCode();
+        }
+    }
+
+    __declspec(noinline) DWORD arc_call_validate_tool_v2_seh(arc_validate_tool_v2_fn fn,
+                                                             uint64_t caller_nonce,
+                                                             uint64_t name_hash,
+                                                             uint64_t flags,
+                                                             uint64_t* out_token)
+    {
+        if (out_token) *out_token = 0;
+        if (!fn || !out_token)
+            return ERROR_INVALID_PARAMETER;
+        __try {
+            *out_token = fn(caller_nonce, name_hash, flags);
+            return ERROR_SUCCESS;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return GetExceptionCode();
+        }
+    }
+
+    __declspec(noinline) DWORD arc_call_cleanup_seh(arc_cleanup_fn fn)
+    {
+        if (!fn)
+            return ERROR_INVALID_PARAMETER;
+        __try {
+            fn();
+            return ERROR_SUCCESS;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return GetExceptionCode();
+        }
+    }
+
+    __declspec(noinline) DWORD arc_call_copy_last_status_seh(arc_copy_last_status_fn fn,
+                                                             char* buffer,
+                                                             uint32_t capacity,
+                                                             uint32_t* out_copied)
+    {
+        if (out_copied) *out_copied = 0;
+        if (!fn || !buffer || capacity == 0 || !out_copied)
+            return ERROR_INVALID_PARAMETER;
+        __try {
+            *out_copied = fn(buffer, capacity);
+            return ERROR_SUCCESS;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return GetExceptionCode();
+        }
     }
 
     bool arc_driver_ready_for_load(const char* phase)
@@ -2707,7 +2879,17 @@ namespace
 
     bool relay_server_token_v2_if_ready(uint32_t token_hash, uint64_t server_nonce, uint64_t* out_driver_proof)
     {
+        const uint64_t start_ms = static_cast<uint64_t>(GetTickCount64());
+        lic_log_fmt("server_token_relay_if_ready_enter token_set=%d nonce_set=%d tid=%lu",
+            token_hash != 0 ? 1 : 0,
+            server_nonce != 0 ? 1 : 0,
+            static_cast<unsigned long>(GetCurrentThreadId()));
         bool sentinel_ready = driver_bridge::sentinel_bridge_ready();
+        DWORD sentinel_gle = sentinel_ready ? ERROR_SUCCESS : GetLastError();
+        lic_log_fmt("server_token_relay_if_ready_sentinel ready=%d gle=%lu elapsed_ms=%llu",
+            sentinel_ready ? 1 : 0,
+            static_cast<unsigned long>(sentinel_gle),
+            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - start_ms));
         if (!sentinel_ready) {
             SetLastError(ERROR_NOT_READY);
             lic_log_fmt("server_token_relay_preflight_failed reason=sentinel_not_ready token_set=%d nonce_set=%d",
@@ -2715,7 +2897,17 @@ namespace
                 server_nonce != 0 ? 1 : 0);
             return false;
         }
-        return driver_bridge::relay_server_token_v2(token_hash, server_nonce, out_driver_proof);
+        const uint64_t relay_ms = static_cast<uint64_t>(GetTickCount64());
+        bool ok = driver_bridge::relay_server_token_v2(token_hash, server_nonce, out_driver_proof);
+        DWORD relay_gle = ok ? ERROR_SUCCESS : GetLastError();
+        lic_log_fmt("server_token_relay_if_ready_exit ok=%d gle=%lu proof=%d elapsed_ms=%llu total_ms=%llu",
+            ok ? 1 : 0,
+            static_cast<unsigned long>(relay_gle),
+            (out_driver_proof && *out_driver_proof != 0) ? 1 : 0,
+            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - relay_ms),
+            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - start_ms));
+        SetLastError(relay_gle);
+        return ok;
     }
 
     bool parse_server_nonce_u64(const std::string& nonce, uint64_t& out)
@@ -5010,9 +5202,17 @@ namespace
                                 code_hash_value.empty() ? "<absent>" : code_hash_value.c_str());
                             lic_log(dbg_msg);
                         }
-                        auto hb = s_fn_arc_heartbeat_ex(
+                        arc_heartbeat_result_t hb{};
+                        DWORD hb_seh = arc_call_heartbeat_ex_seh(
+                            s_fn_arc_heartbeat_ex,
                             static_cast<uint64_t>(heartbeat_index),
-                            code_hash_value.c_str());
+                            code_hash_value.c_str(),
+                            &hb);
+                        if (hb_seh != ERROR_SUCCESS)
+                        {
+                            lic_log_fmt("heartbeat_compose_arc_ex_seh code=0x%08lX",
+                                static_cast<unsigned long>(hb_seh));
+                        }
                         arc_hb_valid = hb.valid;
                         arc_hb_proof_token = hb.proof_token;
                         if (hb.valid) {
@@ -5020,6 +5220,7 @@ namespace
                             snprintf(pt, sizeof(pt), "%016llx", static_cast<unsigned long long>(hb.proof_token));
                             body["proof_token"] = pt;
                         }
+                        SecureZeroMemory(&hb, sizeof(hb));
                     }
                 }
                 {
@@ -5569,7 +5770,24 @@ namespace
         settings.license_session_token = response.contains("session_token")
             ? response["session_token"].get<std::string>() : settings.license_session_token;
         lic_log("apply_valid_response_set_session_token");
-        settings.license_server_nonce = response.value("server_nonce", "");
+        const bool response_has_server_nonce =
+            response.contains("server_nonce") && response["server_nonce"].is_string();
+        if (response_has_server_nonce) {
+            std::string next_server_nonce = response["server_nonce"].get<std::string>();
+            if (!next_server_nonce.empty())
+                settings.license_server_nonce = std::move(next_server_nonce);
+            else
+                lic_log("apply_valid_response_server_nonce_empty_preserved");
+        } else if (!settings.license_server_nonce.empty()) {
+            lic_log_fmt("apply_valid_response_server_nonce_absent_preserved len=%zu",
+                settings.license_server_nonce.size());
+        } else {
+            lic_log("apply_valid_response_server_nonce_absent_empty");
+        }
+        lic_log_fmt("apply_valid_response_nonce_state had_field=%d nonce_len=%zu session_len=%zu",
+            response_has_server_nonce ? 1 : 0,
+            settings.license_server_nonce.size(),
+            settings.license_session_token.size());
         settings.license_client_nonce = response.contains("client_nonce")
             ? response["client_nonce"].get<std::string>() : settings.license_client_nonce;
         if (response.contains("auth_hmac_key_b64") && response["auth_hmac_key_b64"].is_string())
@@ -6173,7 +6391,20 @@ namespace
             lic_log("pre_arc_anti_tamper_initialize_ok");
         }
 
-        std::unique_lock<std::mutex> lk(s_arc_mtx);
+        std::unique_lock<std::timed_mutex> lk(s_arc_mtx, std::defer_lock);
+        if (!lk.try_lock_for(std::chrono::seconds(20)))
+        {
+            lic_log_fmt("arc_lock_timeout attempt=%u loaded=%d downloading=%d",
+                attempt_number,
+                s_arc_loaded ? 1 : 0,
+                s_arc_download_in_progress.load(std::memory_order_acquire) ? 1 : 0);
+            arc_loader::mark_error_fatal(
+                "ARC state lock timed out during activation. Please restart AiDAStandalone.exe and try again.");
+            return false;
+        }
+        lic_log_fmt("arc_lock_acquired attempt=%u loaded=%d",
+            attempt_number,
+            s_arc_loaded ? 1 : 0);
 
 
         if (s_arc_loaded)
@@ -6230,20 +6461,40 @@ namespace
                 log_arc_status(dbg);
             }
             log_arc_status("arc_reseed_arc_init_pre");
-            const bool reseed_init_ok = s_fn_arc_init(
+            BOOL reseed_init_ok_raw = FALSE;
+            DWORD reseed_init_seh = arc_call_init_seh(
+                s_fn_arc_init,
                 settings.license_session_token.c_str(),
                 hwid.c_str(),
                 reseed_bind_ts,
                 ARC_INTERFACE_VERSION,
-                reseed_bind_proof.data());
+                reseed_bind_proof.data(),
+                &reseed_init_ok_raw);
             SecureZeroMemory(reseed_bind_proof.data(), reseed_bind_proof.size());
+            if (reseed_init_seh != ERROR_SUCCESS)
+            {
+                lic_log_fmt("arc_reseed_arc_init_seh code=0x%08lX", static_cast<unsigned long>(reseed_init_seh));
+                arc_loader::mark_error_fatal(
+                    "ARC runtime reseed raised a structured exception. Please restart AiDAStandalone.exe and try again.");
+                return false;
+            }
+            const bool reseed_init_ok = (reseed_init_ok_raw == TRUE);
             log_arc_status(reseed_init_ok ? "arc_reseed_arc_init_post_ok" : "arc_reseed_arc_init_post_false");
             if (!reseed_init_ok)
             {
                 if (s_fn_arc_copy_last_status)
                 {
                     char arc_status[192] = {};
-                    uint32_t copied = s_fn_arc_copy_last_status(arc_status, static_cast<uint32_t>(sizeof(arc_status)));
+                    uint32_t copied = 0;
+                    DWORD copy_seh = arc_call_copy_last_status_seh(
+                        s_fn_arc_copy_last_status,
+                        arc_status,
+                        static_cast<uint32_t>(sizeof(arc_status)),
+                        &copied);
+                    if (copy_seh != ERROR_SUCCESS)
+                    {
+                        lic_log_fmt("arc_reseed_copy_last_status_seh code=0x%08lX", static_cast<unsigned long>(copy_seh));
+                    }
                     if (copied > 0 && arc_status[0] != '\0')
                     {
                         char detail[256];
@@ -6267,8 +6518,15 @@ namespace
                 std::vector<uint8_t> reseed_seed_bytes = hex_decode(settings.license_key_seed);
                 if (reseed_seed_bytes.size() == 32)
                 {
-                    s_fn_arc_set_key_seed(reseed_seed_bytes.data(), 32);
+                    DWORD seed_seh = arc_call_set_key_seed_seh(s_fn_arc_set_key_seed, reseed_seed_bytes.data(), 32);
                     SecureZeroMemory(reseed_seed_bytes.data(), reseed_seed_bytes.size());
+                    if (seed_seh != ERROR_SUCCESS)
+                    {
+                        lic_log_fmt("arc_reseed_set_key_seed_seh code=0x%08lX", static_cast<unsigned long>(seed_seh));
+                        arc_loader::mark_error_fatal(
+                            "ARC runtime key reseed raised a structured exception. Please restart AiDAStandalone.exe and try again.");
+                        return false;
+                    }
                     log_arc_status("arc_reseed_set_key_seed_ok");
                 }
                 else
@@ -6867,7 +7125,21 @@ namespace
                     device->get_last_heartbeat_global_ioctl_seed_present());
             }
 
-            if (!s_fn_arc_bind_driver_device(device.get(), ARC_INTERFACE_VERSION)) {
+            BOOL bind_device_ok = FALSE;
+            DWORD bind_device_seh = arc_call_bind_driver_device_seh(
+                s_fn_arc_bind_driver_device,
+                device.get(),
+                ARC_INTERFACE_VERSION,
+                &bind_device_ok);
+            if (bind_device_seh != ERROR_SUCCESS) {
+                lic_log_fmt("arc_bind_driver_device_seh code=0x%08lX", static_cast<unsigned long>(bind_device_seh));
+                arc_loader::mark_error_fatal(
+                    "ARC driver binding raised a structured exception. Please restart AiDAStandalone.exe and try again.");
+                arc_loader::unload_without_detach(s_arc_module);
+                clear_arc_exports();
+                return false;
+            }
+            if (!bind_device_ok) {
                 log_arc_status("arc_bind_driver_device_failed");
                 arc_loader::unload_without_detach(s_arc_module);
                 clear_arc_exports();
@@ -6876,23 +7148,12 @@ namespace
 
             log_arc_status("arc_bind_driver_device_ok");
 
-            if (!arc_loader::seal(s_arc_module)) {
-                char sl_buf[192];
-                _snprintf_s(sl_buf, sizeof(sl_buf), _TRUNCATE,
-                    "arc_seal_failed reason=%s",
-                    arc_loader::last_error().c_str());
-                log_arc_status(sl_buf);
-                arc_loader::unload_without_detach(s_arc_module);
-                clear_arc_exports();
-                return false;
-            }
-
-            log_arc_status("arc_seal_ok_pre_bind_proof");
+            log_arc_status("arc_seal_deferred_until_post_init");
 
             std::vector<uint8_t> bind_proof_bytes;
             if (settings.license_bind_proof.empty()) {
                 log_arc_status("arc_missing_bind_proof");
-                arc_loader::unload(s_arc_module);
+                arc_loader::unload_without_detach(s_arc_module);
                 s_fn_arc_init = nullptr;
                 s_fn_arc_bind_driver_device = nullptr;
                 s_fn_arc_get_comm_bridge = nullptr;
@@ -6912,7 +7173,7 @@ namespace
                 log_arc_status("arc_missing_bind_proof");
                 if (!bind_proof_bytes.empty())
                     SecureZeroMemory(bind_proof_bytes.data(), bind_proof_bytes.size());
-                arc_loader::unload(s_arc_module);
+                arc_loader::unload_without_detach(s_arc_module);
                 s_fn_arc_init = nullptr;
                 s_fn_arc_bind_driver_device = nullptr;
                 s_fn_arc_get_comm_bridge = nullptr;
@@ -6940,7 +7201,7 @@ namespace
                     static_cast<long long>(bind_age));
                 log_arc_status(tbuf);
                 SecureZeroMemory(bind_proof_bytes.data(), bind_proof_bytes.size());
-                arc_loader::unload(s_arc_module);
+                arc_loader::unload_without_detach(s_arc_module);
                 s_fn_arc_init = nullptr;
                 s_fn_arc_bind_driver_device = nullptr;
                 s_fn_arc_get_comm_bridge = nullptr;
@@ -6966,18 +7227,38 @@ namespace
             }
 
             log_arc_status("arc_init_pre");
-            bool init_ok = s_fn_arc_init(
+            BOOL init_ok_raw = FALSE;
+            DWORD init_seh = arc_call_init_seh(
+                    s_fn_arc_init,
                     settings.license_session_token.c_str(),
                     hwid.c_str(),
                     bind_timestamp,
                     ARC_INTERFACE_VERSION,
-                    bind_proof_bytes.data());
+                    bind_proof_bytes.data(),
+                    &init_ok_raw);
             SecureZeroMemory(bind_proof_bytes.data(), bind_proof_bytes.size());
+            if (init_seh != ERROR_SUCCESS) {
+                lic_log_fmt("arc_init_seh code=0x%08lX", static_cast<unsigned long>(init_seh));
+                arc_loader::mark_error_fatal(
+                    "ARC runtime initialization raised a structured exception. Please restart AiDAStandalone.exe and try again.");
+                arc_loader::unload_without_detach(s_arc_module);
+                clear_arc_exports();
+                return false;
+            }
+            bool init_ok = (init_ok_raw == TRUE);
             log_arc_status(init_ok ? "arc_init_post_ok" : "arc_init_post_false");
             if (!init_ok) {
                 if (s_fn_arc_copy_last_status) {
                     char arc_status[192] = {};
-                    uint32_t copied = s_fn_arc_copy_last_status(arc_status, static_cast<uint32_t>(sizeof(arc_status)));
+                    uint32_t copied = 0;
+                    DWORD copy_seh = arc_call_copy_last_status_seh(
+                        s_fn_arc_copy_last_status,
+                        arc_status,
+                        static_cast<uint32_t>(sizeof(arc_status)),
+                        &copied);
+                    if (copy_seh != ERROR_SUCCESS) {
+                        lic_log_fmt("arc_init_copy_last_status_seh code=0x%08lX", static_cast<unsigned long>(copy_seh));
+                    }
                     if (copied > 0 && arc_status[0] != '\0') {
                         char detail[256];
                         _snprintf_s(detail, sizeof(detail), _TRUNCATE,
@@ -6993,7 +7274,7 @@ namespace
                 arc_loader::mark_error_fatal(
                     "arc_init returned false; the protected runtime cannot be reinitialized "
                     "in this process. Please restart AiDAStandalone.exe and try again.");
-                arc_loader::unload(s_arc_module);
+                arc_loader::unload_without_detach(s_arc_module);
                 s_fn_arc_init = nullptr;
                 s_fn_arc_bind_driver_device = nullptr;
                 s_fn_arc_get_comm_bridge = nullptr;
@@ -7009,12 +7290,33 @@ namespace
                 return false;
             }
 
+            if (!arc_loader::seal(s_arc_module)) {
+                char sl_buf[192];
+                _snprintf_s(sl_buf, sizeof(sl_buf), _TRUNCATE,
+                    "arc_seal_failed_post_init reason=%s",
+                    arc_loader::last_error().c_str());
+                log_arc_status(sl_buf);
+                arc_loader::unload_without_detach(s_arc_module);
+                clear_arc_exports();
+                return false;
+            }
+
+            log_arc_status("arc_seal_ok_post_init");
+
             if (s_fn_arc_set_key_seed && !settings.license_key_seed.empty())
             {
                 auto seed_bytes = hex_decode(settings.license_key_seed);
                 if (seed_bytes.size() == 32) {
-                    s_fn_arc_set_key_seed(seed_bytes.data(), 32);
+                    DWORD seed_seh = arc_call_set_key_seed_seh(s_fn_arc_set_key_seed, seed_bytes.data(), 32);
                     SecureZeroMemory(seed_bytes.data(), seed_bytes.size());
+                    if (seed_seh != ERROR_SUCCESS) {
+                        lic_log_fmt("arc_set_key_seed_seh code=0x%08lX", static_cast<unsigned long>(seed_seh));
+                        arc_loader::mark_error_fatal(
+                            "ARC runtime key seed raised a structured exception. Please restart AiDAStandalone.exe and try again.");
+                        arc_loader::unload_without_detach(s_arc_module);
+                        clear_arc_exports();
+                        return false;
+                    }
                 }
             }
 
@@ -7022,7 +7324,16 @@ namespace
                 if (!s_fn_arc_copy_last_status)
                     return {};
                 char status[192] = {};
-                uint32_t copied = s_fn_arc_copy_last_status(status, static_cast<uint32_t>(sizeof(status)));
+                uint32_t copied = 0;
+                DWORD copy_seh = arc_call_copy_last_status_seh(
+                    s_fn_arc_copy_last_status,
+                    status,
+                    static_cast<uint32_t>(sizeof(status)),
+                    &copied);
+                if (copy_seh != ERROR_SUCCESS) {
+                    lic_log_fmt("arc_copy_last_status_seh code=0x%08lX", static_cast<unsigned long>(copy_seh));
+                    return {};
+                }
                 if (copied == 0)
                     return {};
                 return std::string(status);
@@ -7040,10 +7351,24 @@ namespace
                 uint32_t poly_seed_len = 0;
                 constexpr uint32_t kPolymorphismSeedFeatureId = 1u;
                 log_arc_status("arc_unseal_pre");
-                bool unseal_ok = s_fn_arc_unseal_feature(
+                BOOL unseal_ok_raw = FALSE;
+                DWORD unseal_seh = arc_call_unseal_feature_seh(
+                    s_fn_arc_unseal_feature,
                     kPolymorphismSeedFeatureId,
                     gate_nonce, sizeof(gate_nonce),
-                    poly_seed, &poly_seed_len, sizeof(poly_seed));
+                    poly_seed, &poly_seed_len, sizeof(poly_seed),
+                    &unseal_ok_raw);
+                if (unseal_seh != ERROR_SUCCESS) {
+                    SecureZeroMemory(poly_seed, sizeof(poly_seed));
+                    SecureZeroMemory(gate_nonce, sizeof(gate_nonce));
+                    lic_log_fmt("arc_unseal_seh code=0x%08lX", static_cast<unsigned long>(unseal_seh));
+                    arc_loader::mark_error_fatal(
+                        "ARC startup gate unseal raised a structured exception. Please restart AiDAStandalone.exe and try again.");
+                    arc_loader::unload_without_detach(s_arc_module);
+                    clear_arc_exports();
+                    return false;
+                }
+                bool unseal_ok = (unseal_ok_raw == TRUE);
                 log_arc_status(unseal_ok ? "arc_unseal_post_ok" : "arc_unseal_post_false");
                 if (!unseal_ok || poly_seed_len != 32) {
                     SecureZeroMemory(poly_seed, sizeof(poly_seed));
@@ -7066,8 +7391,24 @@ namespace
                     __fastfail(0xA1DAFA17u);
                 }
 
-                arc_heartbeat_result_t hb1 = s_fn_arc_heartbeat();
-                arc_heartbeat_result_t hb2 = s_fn_arc_heartbeat();
+                arc_heartbeat_result_t hb1{};
+                arc_heartbeat_result_t hb2{};
+                DWORD hb1_seh = arc_call_heartbeat_seh(s_fn_arc_heartbeat, &hb1);
+                DWORD hb2_seh = (hb1_seh == ERROR_SUCCESS)
+                    ? arc_call_heartbeat_seh(s_fn_arc_heartbeat, &hb2)
+                    : hb1_seh;
+                if (hb1_seh != ERROR_SUCCESS || hb2_seh != ERROR_SUCCESS) {
+                    SecureZeroMemory(&hb1, sizeof(hb1));
+                    SecureZeroMemory(&hb2, sizeof(hb2));
+                    lic_log_fmt("arc_startup_heartbeat_seh code1=0x%08lX code2=0x%08lX",
+                        static_cast<unsigned long>(hb1_seh),
+                        static_cast<unsigned long>(hb2_seh));
+                    arc_loader::mark_error_fatal(
+                        "ARC startup heartbeat raised a structured exception. Please restart AiDAStandalone.exe and try again.");
+                    arc_loader::unload_without_detach(s_arc_module);
+                    clear_arc_exports();
+                    return false;
+                }
                 if (!hb1.valid || !hb2.valid ||
                     hb1.proof_token == 0 || hb2.proof_token == 0 ||
                     hb1.proof_token == hb2.proof_token) {
@@ -7093,14 +7434,37 @@ namespace
                 if (s_fn_arc_validate_tool_v2)
                 {
                     const uint64_t caller_nonce = static_cast<uint64_t>(__rdtsc()) ^ kStartupValidateGateToken;
-                    validate_token = s_fn_arc_validate_tool_v2(
-                        caller_nonce, kStartupValidateNameHash, 0ULL);
+                    DWORD validate_seh = arc_call_validate_tool_v2_seh(
+                        s_fn_arc_validate_tool_v2,
+                        caller_nonce,
+                        kStartupValidateNameHash,
+                        0ULL,
+                        &validate_token);
+                    if (validate_seh != ERROR_SUCCESS) {
+                        lic_log_fmt("arc_startup_validate_v2_seh code=0x%08lX", static_cast<unsigned long>(validate_seh));
+                        arc_loader::mark_error_fatal(
+                            "ARC startup validation raised a structured exception. Please restart AiDAStandalone.exe and try again.");
+                        arc_loader::unload_without_detach(s_arc_module);
+                        clear_arc_exports();
+                        return false;
+                    }
                     log_arc_status("arc_startup_validate_v2");
                 }
                 else
                 {
-                    validate_token = s_fn_arc_validate_tool(
-                        kStartupValidateNameHash, kStartupValidateGateToken);
+                    DWORD validate_seh = arc_call_validate_tool_seh(
+                        s_fn_arc_validate_tool,
+                        kStartupValidateNameHash,
+                        kStartupValidateGateToken,
+                        &validate_token);
+                    if (validate_seh != ERROR_SUCCESS) {
+                        lic_log_fmt("arc_startup_validate_v1_seh code=0x%08lX", static_cast<unsigned long>(validate_seh));
+                        arc_loader::mark_error_fatal(
+                            "ARC startup validation raised a structured exception. Please restart AiDAStandalone.exe and try again.");
+                        arc_loader::unload_without_detach(s_arc_module);
+                        clear_arc_exports();
+                        return false;
+                    }
                     log_arc_status("arc_startup_validate_v1");
                 }
                 if (validate_token == 0) {
@@ -7253,9 +7617,18 @@ namespace
             lic_log(dbg);
         }
 
-        std::lock_guard<std::mutex> lk(s_arc_mtx);
+        std::unique_lock<std::timed_mutex> lk(s_arc_mtx, std::defer_lock);
+        if (!lk.try_lock_for(std::chrono::seconds(5)))
+        {
+            lic_log("unload_arc_lock_timeout");
+            if (!was_unloading)
+                s_arc_unloading.store(false, std::memory_order_release);
+            return;
+        }
         if (s_arc_loaded && s_fn_arc_cleanup) {
-            s_fn_arc_cleanup();
+            DWORD cleanup_seh = arc_call_cleanup_seh(s_fn_arc_cleanup);
+            if (cleanup_seh != ERROR_SUCCESS)
+                lic_log_fmt("unload_arc_cleanup_seh code=0x%08lX", static_cast<unsigned long>(cleanup_seh));
         }
         s_fn_arc_init = nullptr;
         s_fn_arc_bind_driver_device = nullptr;
@@ -7711,19 +8084,41 @@ namespace
             if (!worker_active(worker_epoch))
                 break;
 
-            if (!check_obfuscated_valid() || settings->license_session_token.empty())
+            const bool valid_now = check_obfuscated_valid();
+            const size_t session_token_len = settings->license_session_token.size();
+            const size_t server_nonce_len = settings->license_server_nonce.size();
+            lic_log_fmt("srv_refresh_tick epoch=%llu valid=%d session_len=%zu nonce_len=%zu tid=%lu",
+                static_cast<unsigned long long>(worker_epoch),
+                valid_now ? 1 : 0,
+                session_token_len,
+                server_nonce_len,
+                static_cast<unsigned long>(GetCurrentThreadId()));
+
+            if (!valid_now || settings->license_session_token.empty()) {
+                lic_log_fmt("srv_refresh_skip reason=invalid_or_missing_session valid=%d session_len=%zu",
+                    valid_now ? 1 : 0,
+                    session_token_len);
                 continue;
+            }
 
             if (test_all_features::is_running()) {
                 lic_log("srv_refresh_full_test_running_no_defer");
             }
 
-            if (!driver_bridge::is_loaded() || !driver_bridge::using_kernel_driver())
+            const bool driver_loaded = driver_bridge::is_loaded();
+            const bool driver_kernel = driver_loaded ? driver_bridge::using_kernel_driver() : false;
+            if (!driver_loaded || !driver_kernel) {
+                lic_log_fmt("srv_refresh_skip reason=driver_not_ready loaded=%d kernel=%d",
+                    driver_loaded ? 1 : 0,
+                    driver_kernel ? 1 : 0);
                 continue;
+            }
 
             std::string srv_nonce_str = settings->license_server_nonce;
-            if (srv_nonce_str.empty())
+            if (srv_nonce_str.empty()) {
+                lic_log("srv_refresh_skip reason=empty_server_nonce");
                 continue;
+            }
 
             uint64_t srv_nonce_val = 0;
             if (!parse_server_nonce_u64(srv_nonce_str, srv_nonce_val))
@@ -7738,7 +8133,18 @@ namespace
             uint64_t driver_proof = 0;
             if (!worker_active(worker_epoch))
                 break;
-            if (relay_server_token_v2_if_ready(token_hash, srv_nonce_val, &driver_proof) && driver_proof != 0)
+            const uint64_t relay_start = static_cast<uint64_t>(GetTickCount64());
+            lic_log_fmt("srv_refresh_relay_begin epoch=%llu nonce_len=%zu",
+                static_cast<unsigned long long>(worker_epoch),
+                srv_nonce_str.size());
+            bool relay_ok = relay_server_token_v2_if_ready(token_hash, srv_nonce_val, &driver_proof);
+            DWORD relay_gle = relay_ok ? ERROR_SUCCESS : GetLastError();
+            lic_log_fmt("srv_refresh_relay_end ok=%d proof=%d gle=%lu elapsed_ms=%llu",
+                relay_ok ? 1 : 0,
+                driver_proof != 0 ? 1 : 0,
+                static_cast<unsigned long>(relay_gle),
+                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - relay_start));
+            if (relay_ok && driver_proof != 0)
                 store_driver_proof_cache(driver_proof, srv_nonce_str);
         }
     }
@@ -7806,7 +8212,7 @@ namespace
         bool heartbeat_posted = false;
         try
         {
-            heartbeat_posted = work_queue::post([settings_ptr, worker_epoch]() {
+            heartbeat_posted = work_queue::post_service([settings_ptr, worker_epoch]() {
                 heartbeat_worker(settings_ptr, worker_epoch);
                 if (s_heartbeat_running_epoch.load(std::memory_order_acquire) == worker_epoch)
                     s_heartbeat_done.store(true, std::memory_order_release);
@@ -7822,7 +8228,12 @@ namespace
         }
         if (heartbeat_posted)
         {
-            lic_log("heartbeat_thread_started");
+            auto svc = work_queue::service_stats();
+            lic_log_fmt("heartbeat_thread_started service_pool=%d service_workers=%zu service_pending=%zu service_active=%u",
+                svc.pool_size,
+                svc.workers,
+                svc.pending,
+                svc.active);
         }
         else
         {
@@ -7837,7 +8248,7 @@ namespace
         bool srv_refresh_posted = false;
         try
         {
-            srv_refresh_posted = work_queue::post([settings_ptr, worker_epoch]() {
+            srv_refresh_posted = work_queue::post_service([settings_ptr, worker_epoch]() {
                 srv_refresh_worker(settings_ptr, worker_epoch);
                 if (s_srv_refresh_running_epoch.load(std::memory_order_acquire) == worker_epoch)
                     s_srv_refresh_done.store(true, std::memory_order_release);
@@ -7853,7 +8264,12 @@ namespace
         }
         if (srv_refresh_posted)
         {
-            lic_log("srv_refresh_thread_started");
+            auto svc = work_queue::service_stats();
+            lic_log_fmt("srv_refresh_thread_started service_pool=%d service_workers=%zu service_pending=%zu service_active=%u",
+                svc.pool_size,
+                svc.workers,
+                svc.pending,
+                svc.active);
         }
         else
         {
@@ -8667,7 +9083,14 @@ namespace standalone_license
             return nullptr;
         if (!arc_required_exports_ready() || !s_fn_arc_get_comm_bridge)
             return nullptr;
-        return s_fn_arc_get_comm_bridge();
+        const arc_comm_vtable_t* bridge = nullptr;
+        DWORD seh = arc_call_get_comm_bridge_seh(s_fn_arc_get_comm_bridge, &bridge);
+        if (seh != ERROR_SUCCESS)
+        {
+            lic_log_fmt("arc_get_comm_bridge_seh code=0x%08lX", static_cast<unsigned long>(seh));
+            return nullptr;
+        }
+        return bridge;
     }
 
     uint64_t arc_validate_tool(uint64_t tool_name_hash, uint64_t gate_token)
@@ -8686,11 +9109,34 @@ namespace standalone_license
             const uint64_t caller_nonce = static_cast<uint64_t>(__rdtsc()) ^ gate_token;
             const uint64_t hb_counter = static_cast<uint64_t>(
                 s_heartbeat_counter.load(std::memory_order_acquire));
-            return s_fn_arc_validate_tool_v2(caller_nonce, tool_name_hash, hb_counter);
+            uint64_t token = 0;
+            DWORD seh = arc_call_validate_tool_v2_seh(
+                s_fn_arc_validate_tool_v2,
+                caller_nonce,
+                tool_name_hash,
+                hb_counter,
+                &token);
+            if (seh != ERROR_SUCCESS)
+            {
+                lic_log_fmt("arc_validate_tool_v2_seh code=0x%08lX", static_cast<unsigned long>(seh));
+                return 0;
+            }
+            return token;
         }
         if (!s_fn_arc_validate_tool)
             return 0;
-        return s_fn_arc_validate_tool(tool_name_hash, gate_token);
+        uint64_t token = 0;
+        DWORD seh = arc_call_validate_tool_seh(
+            s_fn_arc_validate_tool,
+            tool_name_hash,
+            gate_token,
+            &token);
+        if (seh != ERROR_SUCCESS)
+        {
+            lic_log_fmt("arc_validate_tool_v1_seh code=0x%08lX", static_cast<unsigned long>(seh));
+            return 0;
+        }
+        return token;
     }
 
     bool verify_tool_runtime(gate_slot_t slot, uint64_t gate_token, const std::string& tool_name)
@@ -8714,7 +9160,13 @@ namespace standalone_license
             return result;
         if (!arc_required_exports_ready() || !s_fn_arc_heartbeat)
             return result;
-        return s_fn_arc_heartbeat();
+        DWORD seh = arc_call_heartbeat_seh(s_fn_arc_heartbeat, &result);
+        if (seh != ERROR_SUCCESS)
+        {
+            lic_log_fmt("arc_heartbeat_seh code=0x%08lX", static_cast<unsigned long>(seh));
+            SecureZeroMemory(&result, sizeof(result));
+        }
+        return result;
     }
 
     bool arc_unseal_feature_blocking(uint32_t feature_id,
@@ -8733,7 +9185,22 @@ namespace standalone_license
             return false;
         if (!arc_required_exports_ready() || !s_fn_arc_unseal_feature)
             return false;
-        return s_fn_arc_unseal_feature(feature_id, nonce, nonce_len, out, out_size, out_cap);
+        BOOL ok = FALSE;
+        DWORD seh = arc_call_unseal_feature_seh(
+            s_fn_arc_unseal_feature,
+            feature_id,
+            nonce,
+            nonce_len,
+            out,
+            out_size,
+            out_cap,
+            &ok);
+        if (seh != ERROR_SUCCESS)
+        {
+            lic_log_fmt("arc_unseal_feature_seh code=0x%08lX", static_cast<unsigned long>(seh));
+            return false;
+        }
+        return ok == TRUE;
     }
 
     uint64_t get_server_nonce_hash()

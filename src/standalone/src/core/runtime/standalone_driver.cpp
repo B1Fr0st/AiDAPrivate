@@ -898,7 +898,7 @@ namespace
                 static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
             return;
         }
-        bool posted = work_queue::post([epoch]() {
+        bool posted = work_queue::post_service([epoch]() {
             driver_critical_fmt("driver_watchdog_thread_entry pid=%lu tid=%lu tick=%llu",
                 GetCurrentProcessId(),
                 GetCurrentThreadId(),
@@ -1043,7 +1043,7 @@ namespace
                 static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
             return;
         }
-        bool posted = work_queue::post([epoch]() {
+        bool posted = work_queue::post_service([epoch]() {
             driver_critical_fmt("event_poller_thread_entry pid=%lu tid=%lu tick=%llu",
                 GetCurrentProcessId(),
                 GetCurrentThreadId(),
@@ -3688,16 +3688,46 @@ namespace driver_bridge
 
     bool sentinel_bridge_ready()
     {
+        const ULONGLONG start = GetTickCount64();
         bool kernel_mode = false;
+        bool initialized = false;
+        bool kernel_flag = false;
+        bool connected = false;
         {
             std::lock_guard<std::mutex> lk(g_state_mtx);
-            kernel_mode = g_kernel_mode && device && device->is_connected();
+            initialized = g_initialized;
+            kernel_flag = g_kernel_mode;
+            connected = device && device->is_connected();
+            kernel_mode = kernel_flag && connected;
         }
-        if (!kernel_mode)
+        if (!kernel_mode) {
+            diag::log_tagged_fmt("driver",
+                "sentinel_bridge_ready_preflight_failed initialized=%d kernel=%d connected=%d elapsed_ms=%llu",
+                initialized ? 1 : 0,
+                kernel_flag ? 1 : 0,
+                connected ? 1 : 0,
+                static_cast<unsigned long long>(GetTickCount64() - start));
             return false;
+        }
 
-        device->refresh_heartbeat();
-        return device->sentinel_bridge_ready();
+        SetLastError(ERROR_SUCCESS);
+        const ULONGLONG hb_start = GetTickCount64();
+        bool hb_ok = device->refresh_heartbeat();
+        DWORD hb_gle = hb_ok ? ERROR_SUCCESS : GetLastError();
+        const ULONGLONG ready_start = GetTickCount64();
+        bool ready = device->sentinel_bridge_ready();
+        DWORD ready_gle = ready ? ERROR_SUCCESS : GetLastError();
+        diag::log_tagged_fmt("driver",
+            "sentinel_bridge_ready_result heartbeat_ok=%d heartbeat_gle=%lu heartbeat_ms=%llu ready=%d ready_gle=%lu ready_ms=%llu total_ms=%llu",
+            hb_ok ? 1 : 0,
+            static_cast<unsigned long>(hb_gle),
+            static_cast<unsigned long long>(ready_start - hb_start),
+            ready ? 1 : 0,
+            static_cast<unsigned long>(ready_gle),
+            static_cast<unsigned long long>(GetTickCount64() - ready_start),
+            static_cast<unsigned long long>(GetTickCount64() - start));
+        SetLastError(ready ? ERROR_SUCCESS : ready_gle);
+        return ready;
     }
 
     uint64_t sentinel_ready_since_tsc()

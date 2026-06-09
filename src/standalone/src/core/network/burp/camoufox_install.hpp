@@ -41,6 +41,7 @@ bool      repair_runtime_dependencies_async();
 bool      fetch_browser_async();
 status_t  get_status();
 std::string last_error();
+std::string setup_instructions();
 
 }
 }

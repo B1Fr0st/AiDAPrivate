@@ -13,6 +13,7 @@
 #include "imgui/imgui_internal.h"
 #include "../../ui/theme.hpp"
 #include "../../ui/components.hpp"
+#include "../../infra/work_queue.hpp"
 #include "helpers/diag_log.hpp"
 
 #include <algorithm>
@@ -23,7 +24,6 @@
 #include <exception>
 #include <mutex>
 #include <string>
-#include <thread>
 #include <vector>
 
 namespace aida {
@@ -257,24 +257,69 @@ void render(float pos_x, float pos_y, float width, float height,
 
             st.in_flight.store(true);
             try {
-                std::thread([&st, req]() {
-                    h2_editor::response_t r = h2_editor::send(req);
-                    {
-                        std::lock_guard<std::mutex> lk(st.resp_mtx);
-                        st.last_response = std::move(r);
-                        st.has_response = true;
+                const ULONGLONG post_ms = GetTickCount64();
+                const bool posted = work_queue::post([&st, req, post_ms]() {
+                    const DWORD tid = GetCurrentThreadId();
+                    const ULONGLONG start_ms = GetTickCount64();
+                    ::diag::log_tagged_fmt("h2_v",
+                        "send_worker_enter host=%s port=%u raw=%d queued_ms=%llu tid=%lu",
+                        req.host.c_str(),
+                        static_cast<unsigned>(req.port),
+                        req.use_raw_frames ? 1 : 0,
+                        static_cast<unsigned long long>(start_ms >= post_ms ? start_ms - post_ms : 0),
+                        static_cast<unsigned long>(tid));
+                    try {
+                        h2_editor::response_t r = h2_editor::send(req);
+                        const int status_code = r.status_code;
+                        const bool ok = r.ok;
+                        const uint64_t latency_ms = r.latency_ms;
+                        {
+                            std::lock_guard<std::mutex> lk(st.resp_mtx);
+                            st.last_response = std::move(r);
+                            st.has_response = true;
+                        }
+                        ::diag::log_tagged_fmt("h2_v",
+                            "send_worker_exit status=%d ok=%d latency=%llums elapsed_ms=%llu tid=%lu",
+                            status_code,
+                            ok ? 1 : 0,
+                            static_cast<unsigned long long>(latency_ms),
+                            static_cast<unsigned long long>(GetTickCount64() - start_ms),
+                            static_cast<unsigned long>(tid));
+                    } catch (const std::exception& ex) {
+                        ::diag::log_tagged_fmt("h2_v",
+                            "send_worker_exception elapsed_ms=%llu tid=%lu err=%s",
+                            static_cast<unsigned long long>(GetTickCount64() - start_ms),
+                            static_cast<unsigned long>(tid),
+                            ex.what());
+                    } catch (...) {
+                        ::diag::log_tagged_fmt("h2_v",
+                            "send_worker_exception elapsed_ms=%llu tid=%lu err=unknown",
+                            static_cast<unsigned long long>(GetTickCount64() - start_ms),
+                            static_cast<unsigned long>(tid));
                     }
-                    ::diag::log_tagged_fmt("h2_v", "send_response_received status=%d ok=%d latency=%llums",
-                        st.last_response.status_code, st.last_response.ok ? 1 : 0,
-                        static_cast<unsigned long long>(st.last_response.latency_ms));
                     st.in_flight.store(false);
-                }).detach();
+                });
+                if (!posted) {
+                    const auto qs = work_queue::stats();
+                    st.in_flight.store(false);
+                    ::diag::log_tagged_fmt("h2_v",
+                        "send_worker_post_failed host=%s port=%u raw=%d queue_alive=%d queue_shutdown=%d queue_pending=%llu queue_active=%u queue_posted=%llu queue_rejected=%llu",
+                        req.host.c_str(),
+                        static_cast<unsigned>(req.port),
+                        req.use_raw_frames ? 1 : 0,
+                        qs.alive ? 1 : 0,
+                        qs.shutting_down ? 1 : 0,
+                        static_cast<unsigned long long>(qs.pending),
+                        qs.active,
+                        static_cast<unsigned long long>(qs.posted),
+                        static_cast<unsigned long long>(qs.rejected));
+                }
             } catch (const std::exception& ex) {
                 st.in_flight.store(false);
-                ::diag::log_tagged_fmt("h2_v", "send_thread_failed err=%s", ex.what());
+                ::diag::log_tagged_fmt("h2_v", "send_worker_post_exception err=%s", ex.what());
             } catch (...) {
                 st.in_flight.store(false);
-                ::diag::log_tagged("h2_v", "send_thread_failed");
+                ::diag::log_tagged("h2_v", "send_worker_post_exception");
             }
             ::diag::log_tagged_fmt("h2_v", "send host=%s port=%d method=%s path=%s raw=%d",
                                  req.host.c_str(), req.port,

@@ -13,6 +13,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
+#include <filesystem>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -209,76 +211,6 @@ url_log_t summarize_url_for_log(const std::string& url)
     return out;
 }
 
-tool_result_t tool_headless_start(const json& params)
-{
-    diag::log_tagged_fmt("mcp_burp", "headless_start entry params_shape=%s", json_shape(params).c_str());
-    camoufox::launch_config_t cfg;
-    if (params.is_object())
-    {
-        if (params.contains("headless") && params["headless"].is_boolean())
-            cfg.headless = params["headless"].get<bool>();
-        if (params.contains("session_id") && params["session_id"].is_string())
-            cfg.session_id = params["session_id"].get<std::string>();
-        if (params.contains("proxy") && params["proxy"].is_string())
-            cfg.proxy = params["proxy"].get<std::string>();
-        if (params.contains("os") && params["os"].is_string())
-            cfg.os = params["os"].get<std::string>();
-        if (params.contains("locale") && params["locale"].is_string())
-            cfg.locale = params["locale"].get<std::string>();
-        if (params.contains("humanize") && params["humanize"].is_boolean())
-            cfg.humanize = params["humanize"].get<bool>();
-        if (params.contains("geoip") && params["geoip"].is_boolean())
-            cfg.geoip = params["geoip"].get<bool>();
-        if (params.contains("block_images") && params["block_images"].is_boolean())
-            cfg.block_images = params["block_images"].get<bool>();
-        if (params.contains("block_webrtc") && params["block_webrtc"].is_boolean())
-            cfg.block_webrtc = params["block_webrtc"].get<bool>();
-        if (params.contains("enable_trace") && params["enable_trace"].is_boolean())
-            cfg.enable_trace = params["enable_trace"].get<bool>();
-        if (params.contains("python_executable") && params["python_executable"].is_string())
-            cfg.python_executable = params["python_executable"].get<std::string>();
-        if (params.contains("server_module") && params["server_module"].is_string())
-            cfg.server_module = params["server_module"].get<std::string>();
-        if (params.contains("launch_timeout_ms") && params["launch_timeout_ms"].is_number_integer())
-            cfg.launch_timeout_ms = params["launch_timeout_ms"].get<int>();
-        if (params.contains("window_width") && params["window_width"].is_number_integer())
-            cfg.window_width = params["window_width"].get<int>();
-        if (params.contains("window_height") && params["window_height"].is_number_integer())
-            cfg.window_height = params["window_height"].get<int>();
-    }
-    cfg.block_webrtc = true;
-    diag::log_tagged_fmt("mcp_burp", "headless_start config headless=%d has_proxy=%d proxy_len=%zu os=%s locale=%s humanize=%d geoip=%d block_images=%d block_webrtc=%d enable_trace=%d python=%s module=%s timeout_ms=%d window=%dx%d",
-        (int)cfg.headless, (int)!cfg.proxy.empty(), cfg.proxy.size(), cfg.os.c_str(), cfg.locale.c_str(),
-        (int)cfg.humanize, (int)cfg.geoip, (int)cfg.block_images, (int)cfg.block_webrtc, (int)cfg.enable_trace,
-        cfg.python_executable.c_str(), cfg.server_module.c_str(), cfg.launch_timeout_ms, cfg.window_width, cfg.window_height);
-    bool ok = camoufox::start_bridge(cfg);
-    auto s = ok ? camoufox::get_status(cfg.session_id) : camoufox::get_status(cfg.session_id);
-    json j = status_to_json(s);
-    if (!ok)
-    {
-        std::string err = s.last_error.empty() ? camoufox::last_error() : s.last_error;
-        diag::log_tagged_fmt("mcp_burp", "headless_start failed state=%s browser_open=%d calls=%llu errors=%llu err_len=%zu err=%s",
-            state_label(s.state), (int)s.browser_open, static_cast<unsigned long long>(s.total_calls),
-            static_cast<unsigned long long>(s.total_errors), err.size(), err.c_str());
-        return tool_result_t::error(err.empty() ? std::string("camoufox start failed") : err);
-    }
-    if (!bridge_ready(s))
-    {
-        std::string err = s.last_error.empty() ? std::string("camoufox bridge did not become ready") : s.last_error;
-        diag::log_tagged_fmt("mcp_burp", "headless_start not_ready state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d err=%s",
-            state_label(s.state), s.child_pid, s.child_alive ? 1 : 0, s.browser_open ? 1 : 0,
-            s.page_verified ? 1 : 0, s.cleanup_pending ? 1 : 0, err.c_str());
-        tool_result_t out;
-        out.success = false;
-        out.text = err;
-        out.data = j;
-        return out;
-    }
-    diag::log_tagged_fmt("mcp_burp", "headless_start ok state=%s browser_open=%d calls=%llu errors=%llu response_shape=%s",
-        state_label(s.state), (int)s.browser_open, static_cast<unsigned long long>(s.total_calls),
-        static_cast<unsigned long long>(s.total_errors), json_shape(j).c_str());
-    return tool_result_t::ok(j);
-}
 
 int json_int_param(const json& params, const char* name, int fallback)
 {
@@ -310,6 +242,257 @@ std::string json_string_param(const json& params, const char* name, const std::s
     return params[name].get<std::string>();
 }
 
+std::string lower_ascii_copy(std::string s)
+{
+    for (char& c : s)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+std::wstring utf8_to_wide_local(const std::string& s)
+{
+    if (s.empty())
+        return {};
+    int needed = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), nullptr, 0);
+    if (needed <= 0)
+        return {};
+    std::wstring out(static_cast<size_t>(needed), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), out.data(), needed);
+    return out;
+}
+
+bool decode_base64_string(const std::string& b64, std::vector<unsigned char>& decoded)
+{
+    static const signed char table[256] = {
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
+        52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-2,-1,-1,
+        -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+        15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+        -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+        41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    };
+    decoded.clear();
+    decoded.reserve((b64.size() / 4) * 3);
+    int value = 0;
+    int bits = 0;
+    bool saw_data = false;
+    for (char c : b64)
+    {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        const int v = table[uc];
+        if (v == -2)
+            break;
+        if (v < 0)
+            continue;
+        saw_data = true;
+        value = (value << 6) | v;
+        bits += 6;
+        if (bits >= 8)
+        {
+            bits -= 8;
+            decoded.push_back(static_cast<unsigned char>((value >> bits) & 0xFF));
+        }
+    }
+    return saw_data && !decoded.empty();
+}
+
+uint32_t read_be_u32(const std::vector<unsigned char>& bytes, size_t offset)
+{
+    if (bytes.size() < offset + 4)
+        return 0;
+    return (static_cast<uint32_t>(bytes[offset]) << 24) |
+           (static_cast<uint32_t>(bytes[offset + 1]) << 16) |
+           (static_cast<uint32_t>(bytes[offset + 2]) << 8) |
+           static_cast<uint32_t>(bytes[offset + 3]);
+}
+
+json png_dimensions(const std::vector<unsigned char>& bytes)
+{
+    static const unsigned char sig[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+    json out = json::object();
+    if (bytes.size() < 24 || !std::equal(sig, sig + 8, bytes.begin()))
+        return out;
+    out["width"] = read_be_u32(bytes, 16);
+    out["height"] = read_be_u32(bytes, 20);
+    return out;
+}
+
+bool write_binary_file_utf8(const std::string& path, const std::vector<unsigned char>& bytes, std::string& error)
+{
+    if (path.empty())
+    {
+        error = "empty path";
+        return false;
+    }
+    ensure_parent_dir_exists(path);
+    std::wstring wpath = utf8_to_wide_local(path);
+    if (wpath.empty())
+    {
+        error = "path conversion failed";
+        return false;
+    }
+    HANDLE h = CreateFileW(wpath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        error = "CreateFileW failed gle=" + std::to_string(GetLastError());
+        return false;
+    }
+    size_t offset = 0;
+    bool ok = true;
+    while (offset < bytes.size())
+    {
+        const size_t remaining = bytes.size() - offset;
+        const DWORD chunk = static_cast<DWORD>((std::min)(remaining, static_cast<size_t>(1 << 20)));
+        DWORD written = 0;
+        if (!WriteFile(h, bytes.data() + offset, chunk, &written, nullptr) || written != chunk)
+        {
+            error = "WriteFile failed gle=" + std::to_string(GetLastError());
+            ok = false;
+            break;
+        }
+        offset += written;
+    }
+    CloseHandle(h);
+    return ok;
+}
+
+std::string default_screenshot_path()
+{
+    char temp[MAX_PATH] = {};
+    DWORD len = GetTempPathA(static_cast<DWORD>(sizeof(temp)), temp);
+    std::filesystem::path root = (len > 0 && len < static_cast<DWORD>(sizeof(temp))) ? std::filesystem::path(temp) : std::filesystem::temp_directory_path();
+    root /= "AiDA";
+    root /= "camoufox-screenshots";
+    std::error_code ec;
+    std::filesystem::create_directories(root, ec);
+    char name[128] = {};
+    std::snprintf(name, sizeof(name), "camoufox_%lu_%lu_%llu.png",
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        static_cast<unsigned long>(GetCurrentThreadId()),
+        static_cast<unsigned long long>(GetTickCount64()));
+    return (root / name).string();
+}
+
+int screenshot_inline_limit(const json& params)
+{
+    int limit = json_int_param(params, "max_base64_chars", 4096);
+    if (limit < 0)
+        limit = 0;
+    if (limit > 16384)
+        limit = 16384;
+    return limit;
+}
+
+void compact_screenshot_response(tool_result_t& out, const json& params)
+{
+    if (!out.success || !out.data.is_object())
+        return;
+    auto b64_it = out.data.find("screenshot_base64");
+    if (b64_it == out.data.end() || !b64_it->is_string())
+        return;
+    const std::string b64 = b64_it->get<std::string>();
+    std::vector<unsigned char> bytes;
+    const bool decoded = decode_base64_string(b64, bytes);
+    out.data["screenshot_base64_total_chars"] = b64.size();
+    out.data["screenshot_inline_policy"] = "compact_by_default";
+    if (decoded)
+    {
+        out.data["screenshot_bytes"] = bytes.size();
+        json dims = png_dimensions(bytes);
+        if (!dims.empty())
+            out.data["image"] = dims;
+        std::string save_path = json_string_param(params, "save_path", std::string());
+        if (save_path.empty())
+            save_path = default_screenshot_path();
+        std::string write_error;
+        if (write_binary_file_utf8(save_path, bytes, write_error))
+        {
+            out.data["artifact_path"] = save_path;
+        }
+        else
+        {
+            out.data["artifact_write_error"] = write_error;
+        }
+    }
+    const bool include_base64 = json_bool_param(params, "include_base64", false);
+    const int max_chars = screenshot_inline_limit(params);
+    if (include_base64 && max_chars > 0)
+    {
+        const size_t returned = (std::min)(b64.size(), static_cast<size_t>(max_chars));
+        out.data["screenshot_base64"] = b64.substr(0, returned);
+        out.data["screenshot_base64_returned_chars"] = returned;
+        out.data["screenshot_base64_truncated"] = returned < b64.size();
+    }
+    else
+    {
+        out.data.erase("screenshot_base64");
+        out.data["screenshot_base64_omitted"] = true;
+        out.data["screenshot_base64_returned_chars"] = 0;
+    }
+    out.text = out.data.dump(2);
+}
+
+std::string evaluate_js_hint_for_error(const std::string& error)
+{
+    const std::string low = lower_ascii_copy(error);
+    if (low.find("takes exactly") != std::string::npos && low.find("argument") != std::string::npos)
+        return "The JavaScript expression or browser callback was invoked with the wrong arity. The MCP tool itself expects arguments {expression:string, await_promise?:boolean, session_id?:string, page_id?:string}; inspect the target function's name and length before calling it, or call it with the required parameters inside an IIFE.";
+    if (low.find("expected expression") != std::string::npos || low.find("unexpected token") != std::string::npos)
+        return "Playwright evaluate expects one JavaScript expression. Wrap statements in an IIFE such as (() => { const x = 1; return x; })().";
+    if (low.find("not serializable") != std::string::npos || low.find("serialize") != std::string::npos || low.find("cloneable") != std::string::npos)
+        return "Return primitives, arrays, or plain JSON objects. Convert DOM nodes, Symbols, functions, and circular objects to strings or explicit fields.";
+    if (low.find("timeout") != std::string::npos || low.find("exceeded") != std::string::npos)
+        return "The page did not finish the evaluation before the timeout. Check page responsiveness, reduce the expression, or keep await_promise enabled for Promise-returning code.";
+    return "evaluate_js expects {expression:string, await_promise?:boolean}. Use a single expression and return serializable data.";
+}
+
+tool_result_t validate_evaluate_js_params(const json& params)
+{
+    if (!params.is_object())
+        return tool_result_t::error("evaluate_js expects an arguments object with `expression` as a string.");
+    auto it = params.find("expression");
+    if (it == params.end() || !it->is_string() || it->get<std::string>().empty())
+    {
+        json data;
+        data["error"] = "missing_expression";
+        data["expected_arguments"] = json::array({"expression", "await_promise", "session_id", "page_id"});
+        data["schema"] = json{{"expression", "string"}, {"await_promise", "boolean"}, {"session_id", "string"}, {"page_id", "string"}};
+        data["hint"] = "Call evaluate_js with arguments like {\"expression\":\"document.title\",\"await_promise\":true}.";
+        return {false, "evaluate_js missing required string argument `expression`.", data};
+    }
+    return tool_result_t::ok(json{{"status", "ok"}});
+}
+
+void enrich_evaluate_js_response(tool_result_t& out)
+{
+    if (out.success)
+        return;
+    std::string error = out.text;
+    if (error.empty() && out.data.is_object())
+    {
+        auto it = out.data.find("error");
+        if (it != out.data.end() && it->is_string())
+            error = it->get<std::string>();
+    }
+    if (out.data.is_null() || !out.data.is_object())
+        out.data = json::object();
+    out.data["error"] = error.empty() ? std::string("evaluate_js failed") : error;
+    if (!out.data.contains("hint") || out.data["hint"].is_null() || (out.data["hint"].is_string() && out.data["hint"].get<std::string>().empty()))
+        out.data["hint"] = evaluate_js_hint_for_error(error);
+    out.data["playwright_evaluate_signature"] = "page.evaluate(expression, arg?)";
+    out.data["mcp_arguments"] = json::array({"expression", "await_promise", "session_id", "page_id"});
+}
+
 json camoufox_args(const json& params)
 {
     json args = params.is_object() ? params : json::object();
@@ -318,6 +501,8 @@ json camoufox_args(const json& params)
     args.erase("call_timeout_ms");
     args.erase("launch_timeout_ms");
     args.erase("python_executable");
+    args.erase("browser_executable");
+    args.erase("server_executable");
     args.erase("server_module");
     return args;
 }
@@ -483,7 +668,8 @@ camoufox::launch_config_t launch_config_from_mcp_params(const json& params)
     cfg.block_webrtc = true;
     cfg.enable_trace = json_bool_param(params, "enable_trace", cfg.enable_trace);
     cfg.python_executable = json_string_param(params, "python_executable", cfg.python_executable);
-    cfg.server_module = json_string_param(params, "server_module", cfg.server_module);
+    cfg.browser_executable = json_string_param(params, "browser_executable", cfg.browser_executable);
+    cfg.server_executable = json_string_param(params, "server_executable", cfg.server_executable);
     cfg.launch_timeout_ms = json_int_param(params, "launch_timeout_ms", cfg.launch_timeout_ms);
     cfg.window_width = json_int_param(params, "window_width", json_int_param(params, "width", cfg.window_width));
     cfg.window_height = json_int_param(params, "window_height", json_int_param(params, "height", cfg.window_height));
@@ -546,9 +732,14 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
             bridge_status.browser_open && bridge_status.page_verified && bridge_status.child_alive &&
             !bridge_status.cleanup_pending;
         data["ready"] = data["dependencies_ready"].get<bool>();
+        const std::string instructions = camoufox::install::setup_instructions();
+        if (!data["dependencies_ready"].get<bool>())
+            data["setup_instructions"] = instructions;
         std::string text = data["dependencies_ready"].get<bool>()
             ? std::string("Camoufox dependencies are ready.")
             : std::string("Camoufox dependencies are not ready: ") + install_status.last_message;
+        if (!data["dependencies_ready"].get<bool>() && text.find(instructions) == std::string::npos)
+            text += "\n" + instructions;
         diag::log_tagged_fmt("mcp_burp", "camoufox_check_environment deps_ready=%d install_state=%s bridge_state=%s message=%s",
             data["dependencies_ready"].get<bool>() ? 1 : 0,
             install_state_label(install_status.state),
@@ -573,8 +764,67 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
         return tool_camoufox_type_text(params);
     if (tool_name == "wait_for" && params.is_object() && params.contains("selector") && params["selector"].is_string())
         return tool_camoufox_wait_for_selector(params);
+    if (tool_name == "evaluate_js")
+    {
+        tool_result_t validation = validate_evaluate_js_params(params);
+        if (!validation.success)
+            return validation;
+    }
+    json capture_info = json::object();
+    if (tool_name == "take_screenshot")
+    {
+        args.erase("include_base64");
+        args.erase("max_base64_chars");
+        args.erase("save_path");
+    }
+    if (tool_name == "navigate")
+    {
+        const bool capture_from_start = json_bool_param(params, "capture_from_start", false);
+        const bool capture_body = json_bool_param(params, "capture_body", false);
+        const std::string capture_pattern = json_string_param(params, "capture_url_pattern", "**/*");
+        args.erase("capture_from_start");
+        args.erase("capture_body");
+        args.erase("capture_url_pattern");
+        if (capture_from_start)
+        {
+            json clear_args;
+            clear_args["action"] = "clear";
+            camoufox::call_result_t clear_result = camoufox::call_tool("network_capture", clear_args, 10000, session_id);
+            json start_args;
+            start_args["action"] = "start";
+            start_args["url_pattern"] = capture_pattern.empty() ? std::string("**/*") : capture_pattern;
+            start_args["capture_body"] = capture_body;
+            camoufox::call_result_t start_result = camoufox::call_tool("network_capture", start_args, 10000, session_id);
+            capture_info["requested"] = true;
+            capture_info["pattern"] = start_args["url_pattern"];
+            capture_info["capture_body"] = capture_body;
+            capture_info["clear_ok"] = clear_result.ok;
+            capture_info["start_ok"] = start_result.ok;
+            if (!clear_result.ok)
+                capture_info["clear_error"] = clear_result.error;
+            if (!start_result.ok)
+            {
+                capture_info["start_error"] = start_result.error;
+                tool_result_t fail;
+                fail.success = false;
+                fail.text = start_result.error.empty() ? std::string("network capture start failed before navigate") : start_result.error;
+                fail.data = json{{"error", fail.text}, {"network_capture", capture_info}};
+                return fail;
+            }
+        }
+    }
     camoufox::call_result_t bridge_result = camoufox::call_tool(tool_name, args, timeout_ms, session_id);
     tool_result_t out = bridge_result_to_tool_result(bridge_result);
+    if (tool_name == "take_screenshot")
+        compact_screenshot_response(out, params);
+    if (tool_name == "evaluate_js")
+        enrich_evaluate_js_response(out);
+    if (tool_name == "navigate" && !capture_info.empty() && capture_info.value("requested", false))
+    {
+        if (out.data.is_null() || !out.data.is_object())
+            out.data = json::object();
+        out.data["network_capture"] = capture_info;
+    }
     auto after = camoufox::get_status(session_id);
     const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start).count();
@@ -609,7 +859,7 @@ struct camoufox_tool_spec_t
 std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
 {
     return {
-        {"launch_browser", "Launch the bundled Camoufox anti-detection browser through AiDA's integrated bridge.",
+        {"launch_browser", "Launch Camoufox through AiDA's private bridge with WebRTC disabled; on fresh machines the PowerShell launcher prepares the verified sidecar.",
             {{"session_id", "string", "Independent browser session id; default keeps legacy behavior", false},
              {"headless", "boolean", "Run in headless mode; AiDA defaults to visible headed Camoufox", false},
              {"os_type", "string", "Spoofed OS: auto, windows, macos, or linux", false},
@@ -620,12 +870,13 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"block_images", "boolean", "Block image loading", false},
              {"block_webrtc", "boolean", "Compatibility field; AiDA always blocks WebRTC before launch", false},
              {"enable_trace", "boolean", "Enable engine-level property access tracing", false},
-             {"python_executable", "string", "Override Python interpreter path", false},
-             {"server_module", "string", "Override Python module name", false},
+             {"python_executable", "string", "Optional Python 3.10-3.13 path; the launcher enables system Python for this session", false},
+             {"browser_executable", "string", "Optional camoufox.exe path; normally set by the PowerShell launcher", false},
+             {"server_executable", "string", "Optional AiDA-owned frozen camoufox reverse MCP executable path", false},
              {"launch_timeout_ms", "number", "Requested launch timeout in milliseconds; AiDA bounds the readiness handshake internally", false},
              {"window_width", "number", "Initial outer browser window width in pixels", false},
              {"window_height", "number", "Initial outer browser window height in pixels", false}}, false, 60000},
-        {"close_browser", "Close Camoufox and stop the selected hidden bundled Python bridge.",
+        {"close_browser", "Close Camoufox and stop the selected private Python bridge.",
             {{"session_id", "string", "Browser session id; default closes the legacy session", false}}, false, 30000},
         {"list_pages", "List pages/tabs in a Camoufox browser session.",
             {{"session_id", "string", "Browser session id", false}}, true, 15000},
@@ -648,16 +899,22 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"pre_inject_hooks", "array", "Hook preset names to register before navigation", false},
              {"collect_response_chain", "boolean", "Record response chain for final status resolution", false},
              {"clear_network_capture", "boolean", "Clear stale network capture before navigating", false},
+             {"capture_from_start", "boolean", "Start network capture immediately before navigation", false},
+             {"capture_body", "boolean", "Capture response bodies when capture_from_start is true", false},
+             {"capture_url_pattern", "string", "Network capture URL glob when capture_from_start is true", false},
              {"include_title", "boolean", "Return page title when available", false}}, false, 60000},
         {"reload", "Reload a Camoufox page while preserving init scripts.",
             {{"session_id", "string", "Browser session id", false},
              {"page_id", "string", "Stable AiDA page id; omitted uses the selected page", false},
              {"wait_until", "string", "load, domcontentloaded, or networkidle", false}}, false, 45000},
-        {"take_screenshot", "Capture a base64 PNG screenshot of a Camoufox page or selected element.",
+        {"take_screenshot", "Capture a compact PNG screenshot artifact of a Camoufox page or selected element.",
             {{"session_id", "string", "Browser session id", false},
              {"page_id", "string", "Stable AiDA page id; omitted uses the selected page", false},
              {"full_page", "boolean", "Capture the full scrollable page", false},
-             {"selector", "string", "CSS selector for an element screenshot", false}}, true, 60000},
+             {"selector", "string", "CSS selector for an element screenshot", false},
+             {"save_path", "string", "Optional PNG file path; omitted writes a temp artifact", false},
+             {"include_base64", "boolean", "Return bounded inline base64; default omits it", false},
+             {"max_base64_chars", "number", "Maximum inline base64 characters, capped at 16384; default 4096", false}}, true, 60000},
         {"take_snapshot", "Return a token-efficient accessibility snapshot of a Camoufox page.",
             {{"session_id", "string", "Browser session id", false},
              {"page_id", "string", "Stable AiDA page id; omitted uses the selected page", false}}, true, 30000},
@@ -686,7 +943,7 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"clear_active_routes", "boolean", "Clear instrumentation routes", false},
              {"clear_cookies", "boolean", "Clear browser cookies", false},
              {"clear_storage", "boolean", "Clear localStorage and sessionStorage", false}}, false, 45000},
-        {"evaluate_js", "Execute a JavaScript expression in a Camoufox page context.",
+        {"evaluate_js", "Execute one JavaScript expression in a Camoufox page context and return serializable data.",
             {{"session_id", "string", "Browser session id", false},
              {"page_id", "string", "Stable AiDA page id; omitted uses the selected page", false},
              {"expression", "string", "JavaScript expression", true},
@@ -848,345 +1105,21 @@ void register_camoufox_reverse_tools(mcp_standalone::server_t& srv)
     }
 }
 
-tool_result_t tool_headless_stop(const json& params)
-{
-    diag::log_tagged_fmt("mcp_burp", "headless_stop entry");
-    const std::string session_id = json_string_param(params, "session_id", "default");
-    bool ok = camoufox::stop_bridge(session_id, "camoufox_mcp.stop_on_launch_config_change");
-    auto s = camoufox::get_status(session_id);
-    json j = status_to_json(s);
-    if (!ok)
-    {
-        diag::log_tagged_fmt("mcp_burp", "headless_stop failed err=%s", camoufox::last_error().c_str());
-        return tool_result_t::error(camoufox::last_error().empty() ? std::string("camoufox stop failed") : camoufox::last_error());
-    }
-    diag::log_tagged_fmt("mcp_burp", "headless_stop ok");
-    return tool_result_t::ok(j);
-}
 
-tool_result_t tool_headless_status(const json& params)
-{
-    diag::log_tagged_fmt("mcp_burp", "headless_status entry");
-    const std::string session_id = json_string_param(params, "session_id", "default");
-    auto s = camoufox::get_status(session_id);
-    json j = status_to_json(s);
-    const url_log_t u = summarize_url_for_log(s.active_page_url);
-    diag::log_tagged_fmt("mcp_burp", "headless_status ok state=%s calls=%llu errors=%llu browser_open=%d active_host=%s active_path=%s query=%d response_shape=%s",
-        state_label(s.state), static_cast<unsigned long long>(s.total_calls),
-        static_cast<unsigned long long>(s.total_errors), (int)s.browser_open,
-        u.host.c_str(), u.path.c_str(), (int)u.has_query, json_shape(j).c_str());
-    return tool_result_t::ok(j);
-}
 
-tool_result_t tool_headless_navigate(const json& params)
-{
-    diag::log_tagged_fmt("mcp_burp", "headless_navigate entry params_shape=%s", json_shape(params).c_str());
-    if (!params.is_object() || !params.contains("url") || !params["url"].is_string())
-    {
-        diag::log_tagged_fmt("mcp_burp", "headless_navigate missing_url");
-        return tool_result_t::error("missing_url");
-    }
-    std::string url = params["url"].get<std::string>();
-    const std::string session_id = json_string_param(params, "session_id", "default");
-    const std::string page_id = json_string_param(params, "page_id", std::string());
-    std::string wait_until = "domcontentloaded";
-    int timeout_ms = 30000;
-    if (params.contains("wait_until") && params["wait_until"].is_string())
-        wait_until = params["wait_until"].get<std::string>();
-    if (params.contains("timeout_ms") && params["timeout_ms"].is_number_integer())
-        timeout_ms = params["timeout_ms"].get<int>();
-    const url_log_t u = summarize_url_for_log(url);
-    diag::log_tagged_fmt("mcp_burp", "headless_navigate host=%s path=%s query=%d fragment=%d url_len=%zu wait_until=%s timeout_ms=%d",
-        u.host.c_str(), u.path.c_str(), (int)u.has_query, (int)u.has_fragment, u.length, wait_until.c_str(), timeout_ms);
-    if (session_id == "default" && !camoufox::ensure_ready())
-    {
-        std::string err = camoufox::last_error();
-        diag::log_tagged_fmt("mcp_burp", "headless_navigate bridge_not_ready err=%s", err.c_str());
-        return tool_result_t::error(err.empty() ? std::string("camoufox bridge not ready") : err);
-    }
-    if (!camoufox::navigate(url, wait_until, timeout_ms, session_id, page_id))
-    {
-        diag::log_tagged_fmt("mcp_burp", "headless_navigate failed err=%s", camoufox::last_error().c_str());
-        return tool_result_t::error(camoufox::last_error().empty() ? std::string("navigate failed") : camoufox::last_error());
-    }
-    diag::log_tagged_fmt("mcp_burp", "headless_navigate ok host=%s path=%s query=%d", u.host.c_str(), u.path.c_str(), (int)u.has_query);
-    auto page = camoufox::get_page_info(session_id, page_id);
-    if (page.ok)
-    {
-        diag::log_tagged_fmt("mcp_burp", "headless_navigate page_info ok response_shape=%s", json_shape(page.data).c_str());
-        return tool_result_t::ok(page.data);
-    }
-    diag::log_tagged_fmt("mcp_burp", "headless_navigate page_info failed error_len=%zu err=%s", page.error.size(), page.error.c_str());
-    return tool_result_t::error(page.error.empty() ? std::string("headless_navigate page verification failed") : page.error);
-}
 
-tool_result_t tool_headless_reload(const json& params)
-{
-    std::string wait_until = "domcontentloaded";
-    const std::string session_id = json_string_param(params, "session_id", "default");
-    const std::string page_id = json_string_param(params, "page_id", std::string());
-    if (params.is_object() && params.contains("wait_until") && params["wait_until"].is_string())
-        wait_until = params["wait_until"].get<std::string>();
-    diag::log_tagged_fmt("mcp_burp", "headless_reload wait_until=%s", wait_until.c_str());
-    if (!camoufox::reload(wait_until, session_id, page_id))
-    {
-        std::string err = camoufox::last_error();
-        diag::log_tagged_fmt("mcp_burp", "headless_reload failed err=%s", err.c_str());
-        return tool_result_t::error(err.empty() ? std::string("reload failed") : err);
-    }
-    diag::log_tagged_fmt("mcp_burp", "headless_reload ok");
-    auto page = camoufox::get_page_info(session_id, page_id);
-    if (page.ok) return tool_result_t::ok(page.data);
-    diag::log_tagged_fmt("mcp_burp", "headless_reload page_info failed err=%s", page.error.c_str());
-    return tool_result_t::error(page.error.empty() ? std::string("headless_reload page verification failed") : page.error);
-}
 
-tool_result_t tool_headless_evaluate(const json& params)
-{
-    diag::log_tagged_fmt("mcp_burp", "headless_evaluate entry");
-    if (!params.is_object() || !params.contains("expression") || !params["expression"].is_string())
-    {
-        diag::log_tagged_fmt("mcp_burp", "headless_evaluate missing_expression");
-        return tool_result_t::error("missing_expression");
-    }
-    std::string expr = params["expression"].get<std::string>();
-    const std::string session_id = json_string_param(params, "session_id", "default");
-    const std::string page_id = json_string_param(params, "page_id", std::string());
-    bool await_promise = true;
-    if (params.contains("await_promise") && params["await_promise"].is_boolean())
-        await_promise = params["await_promise"].get<bool>();
-    diag::log_tagged_fmt("mcp_burp", "headless_evaluate expr_len=%zu await=%d", expr.size(), (int)await_promise);
-    auto r = camoufox::evaluate_js(expr, await_promise, session_id, page_id);
-    if (!r.ok)
-    {
-        diag::log_tagged_fmt("mcp_burp", "headless_evaluate failed err=%s", r.error.c_str());
-        return tool_result_t::error(r.error.empty() ? std::string("evaluate_js failed") : r.error);
-    }
-    diag::log_tagged_fmt("mcp_burp", "headless_evaluate ok response_shape=%s text_len=%zu", json_shape(r.data).c_str(), r.text.size());
-    return tool_result_t::ok(r.data);
-}
 
-tool_result_t tool_headless_screenshot(const json& params)
-{
-    diag::log_tagged_fmt("mcp_burp", "headless_screenshot entry");
-    if (!params.is_object() || !params.contains("output_path") || !params["output_path"].is_string())
-    {
-        diag::log_tagged_fmt("mcp_burp", "headless_screenshot missing_output_path");
-        return tool_result_t::error("missing_output_path");
-    }
-    std::string path = params["output_path"].get<std::string>();
-    const std::string session_id = json_string_param(params, "session_id", "default");
-    const std::string page_id = json_string_param(params, "page_id", std::string());
-    bool full_page = true;
-    if (params.contains("full_page") && params["full_page"].is_boolean())
-        full_page = params["full_page"].get<bool>();
-    diag::log_tagged_fmt("mcp_burp", "headless_screenshot path=%s full_page=%d", path.c_str(), (int)full_page);
-    if (!camoufox::take_screenshot(path, full_page, session_id, page_id))
-    {
-        std::string err = camoufox::last_error();
-        diag::log_tagged_fmt("mcp_burp", "headless_screenshot failed err=%s", err.c_str());
-        return tool_result_t::error(err.empty() ? std::string("screenshot failed") : err);
-    }
-    diag::log_tagged_fmt("mcp_burp", "headless_screenshot ok path=%s", path.c_str());
-    return tool_result_t::ok(json{{"path", path}, {"full_page", full_page}});
-}
 
-tool_result_t tool_headless_snapshot(const json& params)
-{
-    diag::log_tagged_fmt("mcp_burp", "headless_snapshot entry");
-    const std::string session_id = json_string_param(params, "session_id", "default");
-    const std::string page_id = json_string_param(params, "page_id", std::string());
-    std::string text;
-    if (!camoufox::take_snapshot(text, session_id, page_id))
-    {
-        std::string err = camoufox::last_error();
-        diag::log_tagged_fmt("mcp_burp", "headless_snapshot failed err=%s", err.c_str());
-        return tool_result_t::error(err.empty() ? std::string("snapshot failed") : err);
-    }
-    diag::log_tagged_fmt("mcp_burp", "headless_snapshot ok len=%zu", text.size());
-    return tool_result_t::ok(json{{"snapshot", text}});
-}
 
-tool_result_t tool_headless_click(const json& params)
-{
-    diag::log_tagged_fmt("mcp_burp", "headless_click entry");
-    if (!params.is_object() || !params.contains("selector") || !params["selector"].is_string())
-    {
-        diag::log_tagged_fmt("mcp_burp", "headless_click missing_selector");
-        return tool_result_t::error("missing_selector");
-    }
-    const std::string sel = params["selector"].get<std::string>();
-    const std::string session_id = json_string_param(params, "session_id", "default");
-    const std::string page_id = json_string_param(params, "page_id", std::string());
-    diag::log_tagged_fmt("mcp_burp", "headless_click selector=%s", sel.c_str());
-    if (!camoufox::click(sel, session_id, page_id))
-    {
-        std::string err = camoufox::last_error();
-        diag::log_tagged_fmt("mcp_burp", "headless_click failed err=%s", err.c_str());
-        return tool_result_t::error(err.empty() ? std::string("click failed") : err);
-    }
-    diag::log_tagged_fmt("mcp_burp", "headless_click ok selector=%s", sel.c_str());
-    return tool_result_t::ok(json{{"status", "clicked"}});
-}
 
-tool_result_t tool_headless_type(const json& params)
-{
-    diag::log_tagged_fmt("mcp_burp", "headless_type entry");
-    if (!params.is_object() || !params.contains("selector") || !params["selector"].is_string())
-    {
-        diag::log_tagged_fmt("mcp_burp", "headless_type missing_selector");
-        return tool_result_t::error("missing_selector");
-    }
-    if (!params.contains("text") || !params["text"].is_string())
-    {
-        diag::log_tagged_fmt("mcp_burp", "headless_type missing_text");
-        return tool_result_t::error("missing_text");
-    }
-    const std::string sel = params["selector"].get<std::string>();
-    const std::string txt = params["text"].get<std::string>();
-    const std::string session_id = json_string_param(params, "session_id", "default");
-    const std::string page_id = json_string_param(params, "page_id", std::string());
-    diag::log_tagged_fmt("mcp_burp", "headless_type selector=%s text_len=%zu", sel.c_str(), txt.size());
-    if (!camoufox::type_text(sel, txt, session_id, page_id))
-    {
-        std::string err = camoufox::last_error();
-        diag::log_tagged_fmt("mcp_burp", "headless_type failed err=%s", err.c_str());
-        return tool_result_t::error(err.empty() ? std::string("type failed") : err);
-    }
-    diag::log_tagged_fmt("mcp_burp", "headless_type ok selector=%s", sel.c_str());
-    return tool_result_t::ok(json{{"status", "typed"}});
-}
 
-tool_result_t tool_headless_wait_for(const json& params)
-{
-    diag::log_tagged_fmt("mcp_burp", "headless_wait_for entry");
-    if (!params.is_object() || !params.contains("selector") || !params["selector"].is_string())
-    {
-        diag::log_tagged_fmt("mcp_burp", "headless_wait_for missing_selector");
-        return tool_result_t::error("missing_selector");
-    }
-    int timeout_ms = 5000;
-    if (params.contains("timeout_ms") && params["timeout_ms"].is_number_integer())
-        timeout_ms = params["timeout_ms"].get<int>();
-    const std::string sel = params["selector"].get<std::string>();
-    const std::string session_id = json_string_param(params, "session_id", "default");
-    const std::string page_id = json_string_param(params, "page_id", std::string());
-    diag::log_tagged_fmt("mcp_burp", "headless_wait_for selector=%s timeout_ms=%d", sel.c_str(), timeout_ms);
-    if (!camoufox::wait_for(sel, timeout_ms, session_id, page_id))
-    {
-        std::string err = camoufox::last_error();
-        diag::log_tagged_fmt("mcp_burp", "headless_wait_for failed err=%s", err.c_str());
-        return tool_result_t::error(err.empty() ? std::string("wait_for failed") : err);
-    }
-    diag::log_tagged_fmt("mcp_burp", "headless_wait_for ok selector=%s", sel.c_str());
-    return tool_result_t::ok(json{{"status", "found"}});
-}
 
-tool_result_t tool_headless_console_logs(const json& params)
-{
-    size_t max_records = 200;
-    if (params.is_object() && params.contains("max_records") && params["max_records"].is_number_unsigned())
-        max_records = params["max_records"].get<size_t>();
-    const std::string session_id = json_string_param(params, "session_id", "default");
-    const std::string page_id = json_string_param(params, "page_id", std::string());
-    diag::log_tagged_fmt("mcp_burp", "headless_console_logs max_records=%zu", max_records);
-    auto r = camoufox::get_console_logs(max_records, session_id, page_id);
-    if (!r.ok)
-    {
-        diag::log_tagged_fmt("mcp_burp", "headless_console_logs failed err=%s", r.error.c_str());
-        return tool_result_t::error(r.error.empty() ? std::string("get_console_logs failed") : r.error);
-    }
-    diag::log_tagged_fmt("mcp_burp", "headless_console_logs ok response_shape=%s", json_shape(r.data).c_str());
-    return tool_result_t::ok(r.data);
-}
 
-tool_result_t tool_headless_network_requests(const json& params)
-{
-    size_t max_records = 200;
-    if (params.is_object() && params.contains("max_records") && params["max_records"].is_number_unsigned())
-        max_records = params["max_records"].get<size_t>();
-    const std::string session_id = json_string_param(params, "session_id", "default");
-    const std::string page_id = json_string_param(params, "page_id", std::string());
-    diag::log_tagged_fmt("mcp_burp", "headless_network_requests max_records=%zu", max_records);
-    auto r = camoufox::list_network_requests(max_records, session_id, page_id);
-    if (!r.ok)
-    {
-        diag::log_tagged_fmt("mcp_burp", "headless_network_requests failed err=%s", r.error.c_str());
-        return tool_result_t::error(r.error.empty() ? std::string("list_network_requests failed") : r.error);
-    }
-    diag::log_tagged_fmt("mcp_burp", "headless_network_requests ok response_shape=%s", json_shape(r.data).c_str());
-    return tool_result_t::ok(r.data);
-}
 
-tool_result_t tool_headless_inject_hook(const json& params)
-{
-    diag::log_tagged_fmt("mcp_burp", "headless_inject_hook entry");
-    if (!params.is_object() || !params.contains("preset_name") || !params["preset_name"].is_string())
-    {
-        diag::log_tagged_fmt("mcp_burp", "headless_inject_hook missing_preset_name");
-        return tool_result_t::error("missing_preset_name");
-    }
-    const std::string preset = params["preset_name"].get<std::string>();
-    diag::log_tagged_fmt("mcp_burp", "headless_inject_hook preset=%s", preset.c_str());
-    if (!camoufox::inject_hook_preset(preset))
-    {
-        std::string err = camoufox::last_error();
-        diag::log_tagged_fmt("mcp_burp", "headless_inject_hook failed err=%s", err.c_str());
-        return tool_result_t::error(err.empty() ? std::string("inject_hook_preset failed") : err);
-    }
-    diag::log_tagged_fmt("mcp_burp", "headless_inject_hook ok preset=%s", preset.c_str());
-    return tool_result_t::ok(json{{"status", "injected"}, {"preset", params["preset_name"]}});
-}
 
-tool_result_t tool_headless_hook_function(const json& params)
-{
-    diag::log_tagged_fmt("mcp_burp", "headless_hook_function entry");
-    if (!params.is_object() || !params.contains("target") || !params["target"].is_string())
-    {
-        diag::log_tagged_fmt("mcp_burp", "headless_hook_function missing_target");
-        return tool_result_t::error("missing_target");
-    }
-    const std::string target = params["target"].get<std::string>();
-    std::string mode = "trace";
-    if (params.contains("mode") && params["mode"].is_string()) mode = params["mode"].get<std::string>();
-    diag::log_tagged_fmt("mcp_burp", "headless_hook_function target=%s mode=%s", target.c_str(), mode.c_str());
-    if (!camoufox::hook_function(target, mode))
-    {
-        std::string err = camoufox::last_error();
-        diag::log_tagged_fmt("mcp_burp", "headless_hook_function failed err=%s", err.c_str());
-        return tool_result_t::error(err.empty() ? std::string("hook_function failed") : err);
-    }
-    diag::log_tagged_fmt("mcp_burp", "headless_hook_function ok target=%s", target.c_str());
-    return tool_result_t::ok(json{{"status", "hooked"}, {"target", params["target"]}, {"mode", mode}});
-}
 
-tool_result_t tool_headless_remove_hooks(const json& params)
-{
-    (void)params;
-    diag::log_tagged_fmt("mcp_burp", "headless_remove_hooks entry");
-    if (!camoufox::remove_hooks())
-    {
-        std::string err = camoufox::last_error();
-        diag::log_tagged_fmt("mcp_burp", "headless_remove_hooks failed err=%s", err.c_str());
-        return tool_result_t::error(err.empty() ? std::string("remove_hooks failed") : err);
-    }
-    diag::log_tagged_fmt("mcp_burp", "headless_remove_hooks ok");
-    return tool_result_t::ok(json{{"status", "removed"}});
-}
 
-tool_result_t tool_headless_reset_state(const json& params)
-{
-    (void)params;
-    diag::log_tagged_fmt("mcp_burp", "headless_reset_state entry");
-    if (!camoufox::reset_browser_state())
-    {
-        std::string err = camoufox::last_error();
-        diag::log_tagged_fmt("mcp_burp", "headless_reset_state failed err=%s", err.c_str());
-        return tool_result_t::error(err.empty() ? std::string("reset_browser_state failed") : err);
-    }
-    diag::log_tagged_fmt("mcp_burp", "headless_reset_state ok");
-    return tool_result_t::ok(json{{"status", "reset"}});
-}
 
 }
 
@@ -1194,227 +1127,22 @@ void register_camoufox_tools(mcp_standalone::server_t& srv)
 {
     register_camoufox_reverse_tools(srv);
 
-    register_compat(srv, {
-        "burp_headless_start",
-        "headless_browser",
-        "Start the visible Camoufox anti-detect browser bridge. Spawns the Python MCP server "
-        "in-process and launches a Firefox-derived browser with engine-level fingerprint spoofing. "
-        "Optional proxy points at AiDA's MITM proxy for capturing intercepted DOM-XSS traffic.",
-        {
-            {"session_id",        "string",  "Independent browser session id; default keeps legacy behavior", false},
-            {"headless",          "boolean", "Compatibility flag; AiDA forces visible headed Camoufox", false},
-            {"proxy",             "string",  "Proxy URL, e.g. http://127.0.0.1:8443", false},
-            {"os",                "string",  "Spoofed OS: auto/windows/macos/linux", false},
-            {"locale",            "string",  "Browser locale, default auto", false},
-            {"humanize",          "boolean", "Enable humanized mouse movement", false},
-            {"geoip",             "boolean", "Infer geolocation from proxy IP", false},
-            {"block_images",      "boolean", "Block image loading", false},
-            {"block_webrtc",      "boolean", "Compatibility field; AiDA always blocks WebRTC before launch", false},
-            {"enable_trace",      "boolean", "Enable engine-level property access tracing", false},
-            {"python_executable", "string",  "Override python interpreter path", false},
-            {"server_module",     "string",  "MCP server module name (default camoufox_reverse_mcp)", false},
-            {"launch_timeout_ms", "number",  "Requested launch timeout in ms; readiness is internally bounded before caller timeout", false},
-            {"window_width",      "number",  "Initial outer browser window width in pixels", false},
-            {"window_height",     "number",  "Initial outer browser window height in pixels", false},
-        },
-        tool_headless_start,
-        false
-    });
 
-    register_compat(srv, {
-        "burp_headless_stop",
-        "headless_browser",
-        "Stop the Camoufox headless browser bridge and terminate the Python MCP server.",
-        {{"session_id", "string", "Browser session id", false}},
-        tool_headless_stop,
-        false
-    });
 
-    register_compat(srv, {
-        "burp_headless_status",
-        "headless_browser",
-        "Return current Camoufox bridge state, browser status, and call counters.",
-        {{"session_id", "string", "Browser session id", false}},
-        tool_headless_status,
-        true
-    });
 
-    register_compat(srv, {
-        "burp_headless_navigate",
-        "headless_browser",
-        "Open visible Camoufox if needed, then navigate it to a URL. Returns page info with final URL/title/status.",
-        {
-            {"session_id", "string", "Browser session id", false},
-            {"page_id",    "string", "Stable AiDA page id; omitted uses selected page", false},
-            {"url",        "string", "Target URL", true},
-            {"wait_until", "string", "load/domcontentloaded/networkidle (default domcontentloaded)", false},
-            {"timeout_ms", "number", "Page-load timeout in ms (default 30000)", false},
-        },
-        tool_headless_navigate,
-        false
-    });
 
-    register_compat(srv, {
-        "burp_headless_reload",
-        "headless_browser",
-        "Reload the selected or addressed page in the Camoufox browser preserving any persistent init scripts.",
-        {
-            {"session_id", "string", "Browser session id", false},
-            {"page_id",    "string", "Stable AiDA page id; omitted uses selected page", false},
-            {"wait_until", "string", "load/domcontentloaded/networkidle (default domcontentloaded)", false},
-        },
-        tool_headless_reload,
-        false
-    });
 
-    register_compat(srv, {
-        "burp_headless_evaluate",
-        "headless_browser",
-        "Execute a JavaScript expression in the selected or addressed page context. Must be a single expression. "
-        "Returns structured value with type info.",
-        {
-            {"session_id",    "string",  "Browser session id", false},
-            {"page_id",       "string",  "Stable AiDA page id; omitted uses selected page", false},
-            {"expression",    "string",  "JavaScript expression (single expression, no statements)", true},
-            {"await_promise", "boolean", "Await promise return values (default true)", false},
-        },
-        tool_headless_evaluate,
-        false
-    });
 
-    register_compat(srv, {
-        "burp_headless_screenshot",
-        "headless_browser",
-        "Capture a PNG screenshot of the selected or addressed page and write to disk.",
-        {
-            {"session_id",  "string",  "Browser session id", false},
-            {"page_id",     "string",  "Stable AiDA page id; omitted uses selected page", false},
-            {"output_path", "string",  "Absolute or relative file path for the PNG", true},
-            {"full_page",   "boolean", "Capture full scrollable page (default true)", false},
-        },
-        tool_headless_screenshot,
-        false
-    });
 
-    register_compat(srv, {
-        "burp_headless_snapshot",
-        "headless_browser",
-        "Get an accessibility-tree snapshot of the page (token-efficient text representation).",
-        {{"session_id", "string", "Browser session id", false},
-         {"page_id", "string", "Stable AiDA page id; omitted uses selected page", false}},
-        tool_headless_snapshot,
-        true
-    });
 
-    register_compat(srv, {
-        "burp_headless_click",
-        "headless_browser",
-        "Click an element matching the CSS selector.",
-        {
-            {"session_id", "string", "Browser session id", false},
-            {"page_id",    "string", "Stable AiDA page id; omitted uses selected page", false},
-            {"selector", "string", "CSS selector", true},
-        },
-        tool_headless_click,
-        false
-    });
 
-    register_compat(srv, {
-        "burp_headless_type",
-        "headless_browser",
-        "Type text into an input element matching the CSS selector.",
-        {
-            {"session_id", "string", "Browser session id", false},
-            {"page_id",    "string", "Stable AiDA page id; omitted uses selected page", false},
-            {"selector", "string", "CSS selector", true},
-            {"text",     "string", "Text to type", true},
-        },
-        tool_headless_type,
-        false
-    });
 
-    register_compat(srv, {
-        "burp_headless_wait_for",
-        "headless_browser",
-        "Wait for a CSS selector to appear on the page.",
-        {
-            {"session_id", "string", "Browser session id", false},
-            {"page_id",    "string", "Stable AiDA page id; omitted uses selected page", false},
-            {"selector",   "string", "CSS selector to wait for", true},
-            {"timeout_ms", "number", "Wait timeout in ms (default 5000)", false},
-        },
-        tool_headless_wait_for,
-        true
-    });
 
-    register_compat(srv, {
-        "burp_headless_console_logs",
-        "headless_browser",
-        "Retrieve captured browser console logs (info/warn/error/log).",
-        {
-            {"session_id", "string", "Browser session id", false},
-            {"page_id", "string", "Stable AiDA page id filter", false},
-            {"max_records", "number", "Maximum log records to return (default 200)", false},
-        },
-        tool_headless_console_logs,
-        true
-    });
 
-    register_compat(srv, {
-        "burp_headless_network_requests",
-        "headless_browser",
-        "Retrieve captured network request summaries (id/url/method/status/type/ms/size).",
-        {
-            {"session_id", "string", "Browser session id", false},
-            {"page_id", "string", "Stable AiDA page id filter", false},
-            {"max_records", "number", "Maximum request records to return (default 200)", false},
-        },
-        tool_headless_network_requests,
-        true
-    });
 
-    register_compat(srv, {
-        "burp_headless_inject_hook",
-        "headless_browser",
-        "Inject a pre-built persistent JS hook preset into the browser. Presets: xhr, fetch, crypto, "
-        "websocket, debugger_bypass, cookie, runtime_probe (also xss_sentinel/alert_capture/eval_capture/"
-        "function_capture/setTimeout_capture/location_capture if installed).",
-        {
-            {"preset_name", "string", "Preset name", true},
-        },
-        tool_headless_inject_hook,
-        false
-    });
 
-    register_compat(srv, {
-        "burp_headless_hook_function",
-        "headless_browser",
-        "Hook or trace a JS function by dotted path (e.g. window.eval, document.write).",
-        {
-            {"target", "string", "Dotted function path", true},
-            {"mode",   "string", "intercept or trace (default trace)", false},
-        },
-        tool_headless_hook_function,
-        false
-    });
 
-    register_compat(srv, {
-        "burp_headless_remove_hooks",
-        "headless_browser",
-        "Remove installed JS hooks and restore originals.",
-        {},
-        tool_headless_remove_hooks,
-        false
-    });
 
-    register_compat(srv, {
-        "burp_headless_reset_state",
-        "headless_browser",
-        "Reset MCP-side residual state (hooks, network buffer, instrumentation routes) without closing the browser.",
-        {},
-        tool_headless_reset_state,
-        false
-    });
 }
 
 }

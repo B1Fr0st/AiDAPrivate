@@ -6,7 +6,7 @@
 #include <windows.h>
 
 #include "standalone_driver.hpp"
-#include "../infra/win_thread.hpp"
+#include "../infra/work_queue.hpp"
 #include "helpers/diag_log.hpp"
 
 #include <nlohmann/json.hpp>
@@ -1605,20 +1605,21 @@ inline bool start_polling(std::string& error) {
     }
 
     g_state.polling.store(true);
-    std::string thread_err;
-    if (!aida::infra::win_thread::start_detached([]() { debug_event_loop(); },
-        &thread_err,
-        aida::infra::win_thread::default_stack_reserve,
-        "api_monitor.debug_loop")) {
+    bool posted = false;
+    try {
+        posted = work_queue::post([]() { debug_event_loop(); });
+    } catch (...) {
+        posted = false;
+    }
+    if (!posted) {
         g_state.polling.store(false);
         g_state.debug_loop_running.store(false);
-        error = "Failed to schedule API monitor worker: " + thread_err;
+        error = "Failed to schedule API monitor worker on work queue.";
         diag::log_tagged_fmt("api_monitor",
-            "start_polling_thread_failed err=%s",
-            thread_err.c_str());
+            "start_polling_post_failed");
         return false;
     }
-    diag::log_tagged_fmt("api_monitor", "start_polling_thread_started");
+    diag::log_tagged_fmt("api_monitor", "start_polling_worker_posted");
 
     for (int i = 0; i < 60; ++i) {
         if (g_state.debug_attached.load())

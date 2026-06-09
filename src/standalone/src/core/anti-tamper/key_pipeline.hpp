@@ -17,6 +17,7 @@
 
 #include "arc_build_seed.hpp"
 #include "wbaes.hpp"
+#include "../../helpers/diag_log.hpp"
 
 namespace anti_tamper {
 namespace key_pipeline {
@@ -26,14 +27,8 @@ namespace detail_kp {
     inline void kat_dbg_log(const char* msg)
     {
         char path[MAX_PATH] = {};
-        DWORD ret = GetModuleFileNameA(nullptr, path, MAX_PATH);
-        if (ret == 0 || ret >= MAX_PATH) {
+        if (!diag::build_log_path("aida_debug.log", path, sizeof(path))) {
             std::strcpy(path, "aida_debug.log");
-        } else {
-            char* last = std::strrchr(path, '\\');
-            if (last) *(last + 1) = '\0';
-            else path[0] = '\0';
-            std::strcat(path, "aida_debug.log");
         }
         HANDLE hf = CreateFileA(path, FILE_APPEND_DATA | SYNCHRONIZE,
             FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,

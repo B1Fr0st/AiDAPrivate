@@ -263,11 +263,41 @@ def _new_profile_dir() -> str:
 
 def _write_private_profile_prefs(profile_dir: str | None) -> dict[str, Any]:
     prefs = {
+        "beacon.enabled": False,
+        "browser.cache.disk.enable": False,
+        "browser.cache.offline.enable": False,
+        "browser.formfill.enable": False,
+        "browser.newtabpage.activity-stream.feeds.telemetry": False,
+        "browser.newtabpage.activity-stream.telemetry": False,
+        "browser.sessionstore.max_tabs_undo": 0,
+        "browser.sessionstore.privacy_level": 2,
+        "browser.sessionstore.resume_from_crash": False,
+        "browser.urlbar.speculativeConnect.enabled": False,
+        "datareporting.healthreport.uploadEnabled": False,
+        "datareporting.policy.dataSubmissionEnabled": False,
+        "dom.push.enabled": False,
         "media.peerconnection.enabled": False,
         "media.peerconnection.ice.proxy_only": True,
         "media.peerconnection.ice.no_host": True,
         "media.peerconnection.ice.default_address_only": True,
         "media.peerconnection.ice.obfuscate_host_addresses": True,
+        "network.cookie.lifetimePolicy": 2,
+        "network.dns.disablePrefetch": True,
+        "network.http.speculative-parallel-limit": 0,
+        "network.predictor.enabled": False,
+        "network.prefetch-next": False,
+        "permissions.default.geo": 2,
+        "places.history.enabled": False,
+        "privacy.clearOnShutdown.cache": True,
+        "privacy.clearOnShutdown.cookies": True,
+        "privacy.clearOnShutdown.downloads": True,
+        "privacy.clearOnShutdown.formdata": True,
+        "privacy.clearOnShutdown.history": True,
+        "privacy.clearOnShutdown.offlineApps": True,
+        "privacy.clearOnShutdown.sessions": True,
+        "privacy.sanitize.sanitizeOnShutdown": True,
+        "toolkit.telemetry.enabled": False,
+        "toolkit.telemetry.unified": False,
     }
     out: dict[str, Any] = {"profile_dir": profile_dir or "", "prefs": sorted(prefs.keys()), "written": False}
     if not profile_dir:
@@ -332,11 +362,41 @@ async def _verify_private_page(page: Page | None) -> dict[str, Any]:
         string(REPLACE [=[def _windows_descendant_pids(root_pid: int) -> list[int]:]=]
 [=[def _write_private_profile_prefs(profile_dir: str | None) -> dict[str, Any]:
     prefs = {
+        "beacon.enabled": False,
+        "browser.cache.disk.enable": False,
+        "browser.cache.offline.enable": False,
+        "browser.formfill.enable": False,
+        "browser.newtabpage.activity-stream.feeds.telemetry": False,
+        "browser.newtabpage.activity-stream.telemetry": False,
+        "browser.sessionstore.max_tabs_undo": 0,
+        "browser.sessionstore.privacy_level": 2,
+        "browser.sessionstore.resume_from_crash": False,
+        "browser.urlbar.speculativeConnect.enabled": False,
+        "datareporting.healthreport.uploadEnabled": False,
+        "datareporting.policy.dataSubmissionEnabled": False,
+        "dom.push.enabled": False,
         "media.peerconnection.enabled": False,
         "media.peerconnection.ice.proxy_only": True,
         "media.peerconnection.ice.no_host": True,
         "media.peerconnection.ice.default_address_only": True,
         "media.peerconnection.ice.obfuscate_host_addresses": True,
+        "network.cookie.lifetimePolicy": 2,
+        "network.dns.disablePrefetch": True,
+        "network.http.speculative-parallel-limit": 0,
+        "network.predictor.enabled": False,
+        "network.prefetch-next": False,
+        "permissions.default.geo": 2,
+        "places.history.enabled": False,
+        "privacy.clearOnShutdown.cache": True,
+        "privacy.clearOnShutdown.cookies": True,
+        "privacy.clearOnShutdown.downloads": True,
+        "privacy.clearOnShutdown.formdata": True,
+        "privacy.clearOnShutdown.history": True,
+        "privacy.clearOnShutdown.offlineApps": True,
+        "privacy.clearOnShutdown.sessions": True,
+        "privacy.sanitize.sanitizeOnShutdown": True,
+        "toolkit.telemetry.enabled": False,
+        "toolkit.telemetry.unified": False,
     }
     out: dict[str, Any] = {"profile_dir": profile_dir or "", "prefs": sorted(prefs.keys()), "written": False}
     if not profile_dir:
@@ -412,6 +472,47 @@ def _windows_descendant_pids(root_pid: int) -> list[int]:]=]
             AIDA_CAMOUFOX_CONTENT "${AIDA_CAMOUFOX_CONTENT}")
     endif()
 
+    if(NOT AIDA_CAMOUFOX_CONTENT MATCHES "browser\\.cache\\.disk\\.enable")
+        string(REPLACE
+"        \"media.peerconnection.enabled\": False,"
+"        \"beacon.enabled\": False,
+        \"browser.cache.disk.enable\": False,
+        \"browser.cache.offline.enable\": False,
+        \"browser.formfill.enable\": False,
+        \"browser.newtabpage.activity-stream.feeds.telemetry\": False,
+        \"browser.newtabpage.activity-stream.telemetry\": False,
+        \"browser.sessionstore.max_tabs_undo\": 0,
+        \"browser.sessionstore.privacy_level\": 2,
+        \"browser.sessionstore.resume_from_crash\": False,
+        \"browser.urlbar.speculativeConnect.enabled\": False,
+        \"datareporting.healthreport.uploadEnabled\": False,
+        \"datareporting.policy.dataSubmissionEnabled\": False,
+        \"dom.push.enabled\": False,
+        \"media.peerconnection.enabled\": False,"
+            AIDA_CAMOUFOX_CONTENT "${AIDA_CAMOUFOX_CONTENT}")
+        string(REPLACE
+"        \"media.peerconnection.ice.obfuscate_host_addresses\": True,"
+"        \"media.peerconnection.ice.obfuscate_host_addresses\": True,
+        \"network.cookie.lifetimePolicy\": 2,
+        \"network.dns.disablePrefetch\": True,
+        \"network.http.speculative-parallel-limit\": 0,
+        \"network.predictor.enabled\": False,
+        \"network.prefetch-next\": False,
+        \"permissions.default.geo\": 2,
+        \"places.history.enabled\": False,
+        \"privacy.clearOnShutdown.cache\": True,
+        \"privacy.clearOnShutdown.cookies\": True,
+        \"privacy.clearOnShutdown.downloads\": True,
+        \"privacy.clearOnShutdown.formdata\": True,
+        \"privacy.clearOnShutdown.history\": True,
+        \"privacy.clearOnShutdown.offlineApps\": True,
+        \"privacy.clearOnShutdown.sessions\": True,
+        \"privacy.sanitize.sanitizeOnShutdown\": True,
+        \"toolkit.telemetry.enabled\": False,
+        \"toolkit.telemetry.unified\": False,"
+            AIDA_CAMOUFOX_CONTENT "${AIDA_CAMOUFOX_CONTENT}")
+    endif()
+
     if(NOT AIDA_CAMOUFOX_CONTENT MATCHES "prefs\\[\"media\\.peerconnection\\.enabled\"\\] = False")
         string(REPLACE [=[            if isinstance(cfg.get("firefox_user_prefs"), dict):
                 prefs.update(cfg["firefox_user_prefs"])
@@ -424,6 +525,47 @@ def _windows_descendant_pids(root_pid: int) -> list[int]:]=]
             prefs["media.peerconnection.ice.default_address_only"] = True
             prefs["media.peerconnection.ice.obfuscate_host_addresses"] = True
             kwargs["firefox_user_prefs"] = prefs]=]
+            AIDA_CAMOUFOX_CONTENT "${AIDA_CAMOUFOX_CONTENT}")
+    endif()
+
+    if(NOT AIDA_CAMOUFOX_CONTENT MATCHES "prefs\\[\"browser\\.cache\\.disk\\.enable\"\\] = False")
+        string(REPLACE
+"            prefs[\"media.peerconnection.enabled\"] = False"
+"            prefs[\"beacon.enabled\"] = False
+            prefs[\"browser.cache.disk.enable\"] = False
+            prefs[\"browser.cache.offline.enable\"] = False
+            prefs[\"browser.formfill.enable\"] = False
+            prefs[\"browser.newtabpage.activity-stream.feeds.telemetry\"] = False
+            prefs[\"browser.newtabpage.activity-stream.telemetry\"] = False
+            prefs[\"browser.sessionstore.max_tabs_undo\"] = 0
+            prefs[\"browser.sessionstore.privacy_level\"] = 2
+            prefs[\"browser.sessionstore.resume_from_crash\"] = False
+            prefs[\"browser.urlbar.speculativeConnect.enabled\"] = False
+            prefs[\"datareporting.healthreport.uploadEnabled\"] = False
+            prefs[\"datareporting.policy.dataSubmissionEnabled\"] = False
+            prefs[\"dom.push.enabled\"] = False
+            prefs[\"media.peerconnection.enabled\"] = False"
+            AIDA_CAMOUFOX_CONTENT "${AIDA_CAMOUFOX_CONTENT}")
+        string(REPLACE
+"            prefs[\"media.peerconnection.ice.obfuscate_host_addresses\"] = True"
+"            prefs[\"media.peerconnection.ice.obfuscate_host_addresses\"] = True
+            prefs[\"network.cookie.lifetimePolicy\"] = 2
+            prefs[\"network.dns.disablePrefetch\"] = True
+            prefs[\"network.http.speculative-parallel-limit\"] = 0
+            prefs[\"network.predictor.enabled\"] = False
+            prefs[\"network.prefetch-next\"] = False
+            prefs[\"permissions.default.geo\"] = 2
+            prefs[\"places.history.enabled\"] = False
+            prefs[\"privacy.clearOnShutdown.cache\"] = True
+            prefs[\"privacy.clearOnShutdown.cookies\"] = True
+            prefs[\"privacy.clearOnShutdown.downloads\"] = True
+            prefs[\"privacy.clearOnShutdown.formdata\"] = True
+            prefs[\"privacy.clearOnShutdown.history\"] = True
+            prefs[\"privacy.clearOnShutdown.offlineApps\"] = True
+            prefs[\"privacy.clearOnShutdown.sessions\"] = True
+            prefs[\"privacy.sanitize.sanitizeOnShutdown\"] = True
+            prefs[\"toolkit.telemetry.enabled\"] = False
+            prefs[\"toolkit.telemetry.unified\"] = False"
             AIDA_CAMOUFOX_CONTENT "${AIDA_CAMOUFOX_CONTENT}")
     endif()
 

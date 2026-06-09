@@ -944,6 +944,26 @@ namespace anti_tamper::mcp_posture
             return !cwd.empty() && path_under_root(cmd, cwd);
         }
 
+        inline bool command_is_app_local_reverse_mcp_executable(const std::string& command)
+        {
+            const std::string base = basename_for_hash(command);
+            if (base != "aida_camoufoxreversemcp.exe" &&
+                base != "camoufox-reverse-mcp.exe" &&
+                base != "camoufox_reverse_mcp.exe")
+                return false;
+            const std::string cmd = normalized_path_for_compare(command);
+            if (cmd.empty())
+                return false;
+            std::error_code ec;
+            if (!std::filesystem::is_regular_file(cmd, ec) || ec)
+                return false;
+            const std::string mod_dir = module_dir();
+            if (!mod_dir.empty() && path_under_root(cmd, mod_dir))
+                return true;
+            const std::string cwd = normalized_path_for_compare(current_dir());
+            return !cwd.empty() && path_under_root(cmd, cwd);
+        }
+
         inline bool boundary_char(char c)
         {
             unsigned char u = static_cast<unsigned char>(c);
@@ -997,6 +1017,14 @@ namespace anti_tamper::mcp_posture
                 return false;
             if (e.transport != transport_t::stdio || e.command.empty())
                 return false;
+            if (command_is_app_local_reverse_mcp_executable(e.command)) {
+                for (const auto& raw : e.args) {
+                    const std::string arg = lower_ascii(trim(raw));
+                    if (!arg.empty() && contains_high_risk_token(arg))
+                        return false;
+                }
+                return true;
+            }
             if (!command_is_app_local_python(e.command))
                 return false;
             bool module_ok = false;
@@ -1178,6 +1206,12 @@ namespace anti_tamper::mcp_posture
             add_root(exe_dir);
             add_root(current_dir());
             add_root(parent_path_string(exe_dir));
+            const std::string local = read_env("LOCALAPPDATA");
+            if (!local.empty()) {
+                const std::string aida_root = join_path_string(local, "AiDA");
+                add_root(join_path_string(join_path_string(aida_root, "camoufox"), "current"));
+                add_root(join_path_string(join_path_string(join_path_string(aida_root, "embedded"), "camoufox"), "current"));
+            }
             return roots;
         }
 
@@ -1202,6 +1236,71 @@ namespace anti_tamper::mcp_posture
                     if (!runtime_dir.empty() && path_under_or_equal(command_path, runtime_dir))
                         return true;
                 }
+            }
+            return false;
+        }
+
+        inline bool flag_enabled_value(const std::string& value)
+        {
+            const std::string v = lower_ascii(trim(value));
+            return v == "1" || v == "true" || v == "yes" || v == "on";
+        }
+
+        inline bool is_explicit_system_camoufox_runtime_python(const std::string& command, const std::string* configured_python, const std::string* allow_system)
+        {
+            if (!allow_system || !flag_enabled_value(*allow_system) || !configured_python || trim(*configured_python).empty())
+                return false;
+            const std::string command_path = unquote_path_token(command);
+            const std::string configured_path = unquote_path_token(*configured_python);
+            const std::string command_base = basename_for_hash(command_path);
+            if (command_base != "python.exe" && command_base != "pythonw.exe")
+                return false;
+            std::error_code ec;
+            if (!std::filesystem::is_regular_file(command_path, ec) || ec)
+                return false;
+            return canonical_lower_path(command_path) == canonical_lower_path(configured_path);
+        }
+
+        inline bool is_trusted_camoufox_reverse_mcp_executable(const std::string& command)
+        {
+            const std::string command_path = unquote_path_token(command);
+            const std::string command_base = basename_for_hash(command_path);
+            if (command_base != "aida_camoufoxreversemcp.exe" &&
+                command_base != "camoufox-reverse-mcp.exe" &&
+                command_base != "camoufox_reverse_mcp.exe")
+                return false;
+            std::error_code ec;
+            if (!std::filesystem::is_regular_file(command_path, ec) || ec)
+                return false;
+            std::vector<std::string> roots;
+            auto add_root = [&](const std::string& path) {
+                const std::string canonical = canonical_lower_path(path);
+                if (canonical.empty())
+                    return;
+                for (const auto& existing : roots) {
+                    if (canonical_lower_path(existing) == canonical)
+                        return;
+                }
+                roots.push_back(path);
+            };
+            const std::string exe_dir = executable_dir();
+            add_root(exe_dir);
+            add_root(current_dir());
+            add_root(parent_path_string(exe_dir));
+            const std::string local = read_env("LOCALAPPDATA");
+            if (!local.empty()) {
+                const std::string aida_root = join_path_string(local, "AiDA");
+                add_root(join_path_string(aida_root, "current"));
+                add_root(join_path_string(aida_root, "runtime"));
+                add_root(join_path_string(aida_root, "embedded"));
+            }
+            for (const auto& root : roots) {
+                const std::string deps_dir = join_path_string(root, "deps");
+                const std::string mcp_dir = join_path_string(deps_dir, "camoufox-reverse-mcp");
+                if ((!deps_dir.empty() && path_under_or_equal(command_path, deps_dir)) ||
+                    (!mcp_dir.empty() && path_under_or_equal(command_path, mcp_dir)) ||
+                    path_under_or_equal(command_path, root))
+                    return true;
             }
             return false;
         }
@@ -1308,6 +1407,32 @@ namespace anti_tamper::mcp_posture
             return true;
         }
 
+        inline bool camoufox_executable_args_trusted(const std::vector<std::string>& args, std::string& reason)
+        {
+            for (const auto& raw : args) {
+                const std::string arg = lower_ascii(trim(raw));
+                if (arg.empty())
+                    continue;
+                if (arg.find("://") != std::string::npos ||
+                    arg.find("url") != std::string::npos ||
+                    arg.find("uri") != std::string::npos ||
+                    arg.find("host") != std::string::npos ||
+                    arg.find("port") != std::string::npos ||
+                    arg.find("api") != std::string::npos ||
+                    arg.find("key") != std::string::npos ||
+                    arg.find("token") != std::string::npos ||
+                    arg.find("oauth") != std::string::npos) {
+                    reason = "args_external_shape";
+                    return false;
+                }
+                if (contains_high_risk_token(arg)) {
+                    reason = "args_high_risk";
+                    return false;
+                }
+            }
+            return true;
+        }
+
         inline const std::string* env_value(const mcp_client::server_config_t& cfg, const char* key)
         {
             if (!key || !*key)
@@ -1345,16 +1470,25 @@ namespace anti_tamper::mcp_posture
             if (cfg.auto_connect || cfg.oauth_enabled || !cfg.oauth_client_id.empty() || !cfg.oauth_client_secret.empty() ||
                 !cfg.oauth_scope.empty() || !cfg.oauth_redirect_uri.empty())
                 return fail("oauth_shape");
+            const bool direct_executable = is_trusted_camoufox_reverse_mcp_executable(cfg.command);
             std::string args_reason;
-            if (!camoufox_args_trusted(cfg.args, args_reason))
+            if (direct_executable) {
+                if (!camoufox_executable_args_trusted(cfg.args, args_reason))
+                    return fail(args_reason.c_str());
+            } else if (!camoufox_args_trusted(cfg.args, args_reason)) {
                 return fail(args_reason.c_str());
-            if (!is_trusted_camoufox_runtime_python(cfg.command))
-                return fail("python_not_bundled_runtime");
+            }
+            const std::string* configured_python = env_value(cfg, "AIDA_CAMOUFOX_PYTHON");
+            const std::string* allow_system_python = env_value(cfg, "AIDA_CAMOUFOX_ALLOW_SYSTEM_PYTHON");
+            if (!direct_executable &&
+                !is_trusted_camoufox_runtime_python(cfg.command) &&
+                !is_explicit_system_camoufox_runtime_python(cfg.command, configured_python, allow_system_python))
+                return fail("python_runtime_untrusted");
             const std::string* browser = env_value(cfg, "AIDA_CAMOUFOX_EXECUTABLE");
             if (!browser || trim(*browser).empty())
                 return fail("browser_env_missing");
             if (!is_trusted_camoufox_browser_path(*browser))
-                return fail("browser_not_bundled");
+                return fail("browser_runtime_untrusted");
             const std::string* session_id = env_value(cfg, "AIDA_CAMOUFOX_SESSION_ID");
             if (!session_id || trim(*session_id).empty())
                 return fail("session_env_missing");

@@ -15,6 +15,8 @@
 #include <vector>
 
 #include "obfuscation.hpp"
+#include "../runtime/manual_map_tls.hpp"
+#include "../../helpers/diag_log.hpp"
 #include "../../../../../libs/nlohmann/json.hpp"
 #include "../../../../../src/shared/telemetry/telemetry_client.hpp"
 
@@ -29,19 +31,22 @@ namespace detail {
         static bool s_init = false;
         if (!s_init)
         {
-            DWORD ret = GetModuleFileNameA(nullptr, s_path, MAX_PATH);
-            if (ret == 0 || ret >= MAX_PATH)
+            if (!diag::build_log_path("aida_debug.log", s_path, sizeof(s_path)))
             {
-                strcpy_s(s_path, "aida_debug.log");
-            }
-            else
-            {
-                char* last = strrchr(s_path, '\\');
-                if (last)
-                    *(last + 1) = '\0';
+                DWORD ret = GetModuleFileNameA(nullptr, s_path, MAX_PATH);
+                if (ret == 0 || ret >= MAX_PATH)
+                {
+                    strcpy_s(s_path, "aida_debug.log");
+                }
                 else
-                    s_path[0] = '\0';
-                strcat_s(s_path, "aida_debug.log");
+                {
+                    char* last = strrchr(s_path, '\\');
+                    if (last)
+                        *(last + 1) = '\0';
+                    else
+                        s_path[0] = '\0';
+                    strcat_s(s_path, "aida_debug.log");
+                }
             }
             s_init = true;
         }
@@ -132,6 +137,7 @@ namespace detail {
 
 inline void write_log(const char* tag, const char* detail)
 {
+    aida::manual_map_tls::ensure_current_thread();
     detail::log_scope scope;
     if (!scope) return;
 
@@ -172,6 +178,7 @@ inline void write_log(const char* tag, const char* detail)
 
 inline void write_log_critical(const char* tag, const char* detail)
 {
+    aida::manual_map_tls::ensure_current_thread();
     detail::log_scope scope;
     if (!scope) return;
 
@@ -213,6 +220,7 @@ inline void write_log_critical(const char* tag, const char* detail)
 
 inline void write_log_critical_fmt(const char* tag, const char* fmt, ...)
 {
+    aida::manual_map_tls::ensure_current_thread();
     char buf[2048];
     va_list ap;
     va_start(ap, fmt);

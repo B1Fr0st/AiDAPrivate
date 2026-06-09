@@ -10,6 +10,8 @@
 #include <thread>
 #include <vector>
 
+#include "../runtime/manual_map_tls.hpp"
+
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -94,6 +96,7 @@ inline void initialize() {
             p.workers.reserve(POOL_SIZE);
             for (int i = 0; i < POOL_SIZE; ++i) {
                 p.workers.emplace_back([&p]() {
+                    aida::manual_map_tls::ensure_current_thread();
                     while (true) {
                         std::function<void()> task;
                         {

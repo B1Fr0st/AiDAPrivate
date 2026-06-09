@@ -9,6 +9,7 @@
 #include "camoufox_bridge.hpp"
 
 #include "../../infra/work_queue.hpp"
+#include "../../ui/embedded_resources.hpp"
 #include "../../../helpers/diag_log.hpp"
 
 #include <windows.h>
@@ -17,6 +18,7 @@
 #include <wintrust.h>
 #include <bcrypt.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -29,6 +31,8 @@
 #include <system_error>
 #include <thread>
 #include <vector>
+
+#include <zlib.h>
 
 namespace aida {
 namespace burp {
@@ -123,6 +127,8 @@ constexpr uint64_t kPythonInstallerSize = 26964224ull;
 constexpr char kPythonInstallerSha256[] = "67b5635e80ea51072b87941312d00ec8927c4db9ba18938f7ad2d27b328b95fb";
 constexpr DWORD kPythonInstallerDownloadDeadlineMs = 180000;
 constexpr DWORD kPythonRuntimeInstallTimeoutMs = 300000;
+constexpr wchar_t kCamoufoxBrowserDirName[] = L"camoufox-135.0.1-beta.24-win.x86_64";
+constexpr char kReverseMcpPackageSpec[] = "camoufox-reverse-mcp";
 
 bool env_flag_enabled(const wchar_t* name)
 {
@@ -138,6 +144,31 @@ bool env_flag_enabled(const wchar_t* name)
 bool setup_bootstrap_allowed()
 {
     return env_flag_enabled(L"AIDA_CAMOUFOX_ALLOW_SETUP_BOOTSTRAP");
+}
+
+bool reverse_mcp_source_install_allowed()
+{
+    return env_flag_enabled(L"AIDA_CAMOUFOX_ALLOW_REVERSE_MCP_SOURCE_INSTALL");
+}
+
+bool read_env_path_w(const wchar_t* name, std::wstring& out)
+{
+    out.clear();
+    if (!name || !name[0]) return false;
+    DWORD need = GetEnvironmentVariableW(name, nullptr, 0);
+    if (need == 0 || need > 32768) return false;
+    std::wstring value;
+    value.resize(need);
+    DWORD got = GetEnvironmentVariableW(name, value.data(), need);
+    if (got == 0 || got >= need) return false;
+    value.resize(got);
+    while (!value.empty() && (value.front() == L' ' || value.front() == L'\t' || value.front() == L'"'))
+        value.erase(value.begin());
+    while (!value.empty() && (value.back() == L' ' || value.back() == L'\t' || value.back() == L'"'))
+        value.pop_back();
+    if (value.empty()) return false;
+    out = value;
+    return true;
 }
 
 bool file_exists_w(const std::wstring& path)
@@ -193,6 +224,8 @@ std::wstring executable_dir_w()
     }
 }
 
+std::wstring local_appdata_aida_root();
+
 std::wstring current_dir_w()
 {
     DWORD need = GetCurrentDirectoryW(0, nullptr);
@@ -212,13 +245,38 @@ std::vector<std::wstring> runtime_base_dirs()
     append_unique_path(bases, exe_dir);
     append_unique_path(bases, current_dir_w());
     append_unique_path(bases, parent_dir_w(exe_dir));
+    std::wstring aida_root = local_appdata_aida_root();
+    append_unique_path(bases, aida_root);
+    if (!aida_root.empty())
+    {
+        append_unique_path(bases, join_path_w(join_path_w(aida_root, L"camoufox"), L"current"));
+        append_unique_path(bases, join_path_w(join_path_w(join_path_w(aida_root, L"embedded"), L"camoufox"), L"current"));
+    }
+    return bases;
+}
+
+std::vector<std::wstring> aida_runtime_base_dirs()
+{
+    std::vector<std::wstring> bases;
+    std::wstring exe_dir = executable_dir_w();
+    append_unique_path(bases, exe_dir);
+    append_unique_path(bases, current_dir_w());
+    append_unique_path(bases, parent_dir_w(exe_dir));
+    std::wstring aida_root = local_appdata_aida_root();
+    append_unique_path(bases, aida_root);
+    if (!aida_root.empty())
+    {
+        append_unique_path(bases, join_path_w(aida_root, L"current"));
+        append_unique_path(bases, join_path_w(aida_root, L"runtime"));
+        append_unique_path(bases, join_path_w(aida_root, L"embedded"));
+    }
     return bases;
 }
 
 bool discover_reverse_mcp_source_dir(std::wstring& out_dir)
 {
     const std::wstring name = L"camoufox-reverse-mcp";
-    for (const auto& base : runtime_base_dirs())
+    for (const auto& base : aida_runtime_base_dirs())
     {
         std::wstring candidate = join_path_w(join_path_w(base, L"deps"), name);
         if (file_exists_w(join_path_w(candidate, L"pyproject.toml")))
@@ -246,6 +304,7 @@ bool discover_bundled_browser_dir(std::wstring& out_dir)
         if (file_exists_w(join_path_w(candidate, L"camoufox.exe")))
         {
             out_dir = candidate;
+            SetEnvironmentVariableW(L"AIDA_CAMOUFOX_EXECUTABLE", join_path_w(candidate, L"camoufox.exe").c_str());
             diag::log_tagged_fmt("camoufox_install", "bundled_browser selected path=%s base=%s",
                 wide_to_utf8(candidate).c_str(), wide_to_utf8(base).c_str());
             return true;
@@ -254,6 +313,7 @@ bool discover_bundled_browser_dir(std::wstring& out_dir)
         if (file_exists_w(join_path_w(candidate, L"camoufox.exe")))
         {
             out_dir = candidate;
+            SetEnvironmentVariableW(L"AIDA_CAMOUFOX_EXECUTABLE", join_path_w(candidate, L"camoufox.exe").c_str());
             diag::log_tagged_fmt("camoufox_install", "bundled_browser selected path=%s base=%s",
                 wide_to_utf8(candidate).c_str(), wide_to_utf8(base).c_str());
             return true;
@@ -261,6 +321,90 @@ bool discover_bundled_browser_dir(std::wstring& out_dir)
     }
     diag::log_tagged_fmt("camoufox_install", "bundled_browser missing base_count=%zu", bases.size());
     return false;
+}
+
+bool discover_configured_reverse_mcp_executable(std::wstring& out_path)
+{
+    std::wstring candidate;
+    if (!read_env_path_w(L"AIDA_CAMOUFOX_MCP_EXECUTABLE", candidate))
+        return false;
+    if (!file_exists_w(candidate))
+    {
+        diag::log_tagged_fmt("camoufox_install", "configured_reverse_mcp_exe missing path=%s",
+            wide_to_utf8(candidate).c_str());
+        return false;
+    }
+    out_path = candidate;
+    diag::log_tagged_fmt("camoufox_install", "configured_reverse_mcp_exe selected path=%s",
+        wide_to_utf8(out_path).c_str());
+    return true;
+}
+
+bool discover_bundled_reverse_mcp_executable(std::wstring& out_path)
+{
+    const std::vector<std::wstring> rels = {
+        L"deps\\AiDA_CamoufoxReverseMcp.exe",
+        L"deps\\camoufox-reverse-mcp.exe",
+        L"deps\\camoufox_reverse_mcp.exe",
+        L"deps\\camoufox-reverse-mcp\\AiDA_CamoufoxReverseMcp.exe",
+        L"deps\\camoufox-reverse-mcp\\camoufox-reverse-mcp.exe",
+        L"AiDA_CamoufoxReverseMcp.exe",
+        L"camoufox-reverse-mcp.exe",
+        L"camoufox_reverse_mcp.exe",
+    };
+    const auto bases = aida_runtime_base_dirs();
+    for (const auto& base : bases)
+    {
+        for (const auto& rel : rels)
+        {
+            std::wstring candidate = join_path_w(base, rel);
+            if (file_exists_w(candidate))
+            {
+                out_path = candidate;
+                diag::log_tagged_fmt("camoufox_install", "bundled_reverse_mcp_exe selected path=%s base=%s rel=%s",
+                    wide_to_utf8(candidate).c_str(), wide_to_utf8(base).c_str(), wide_to_utf8(rel).c_str());
+                return true;
+            }
+        }
+    }
+    diag::log_tagged_fmt("camoufox_install", "bundled_reverse_mcp_exe missing base_count=%zu rel_count=%zu",
+        bases.size(), rels.size());
+    return false;
+}
+
+bool discover_reverse_mcp_executable(std::wstring& out_path)
+{
+    return discover_configured_reverse_mcp_executable(out_path) ||
+        discover_bundled_reverse_mcp_executable(out_path);
+}
+
+bool discover_configured_browser_executable(std::wstring& out_path)
+{
+    std::wstring candidate;
+    if (!read_env_path_w(L"AIDA_CAMOUFOX_EXECUTABLE", candidate))
+        return false;
+    if (directory_exists_w(candidate))
+        candidate = join_path_w(candidate, L"camoufox.exe");
+    if (!file_exists_w(candidate))
+    {
+        diag::log_tagged_fmt("camoufox_install", "configured_browser missing path=%s",
+            wide_to_utf8(candidate).c_str());
+        return false;
+    }
+    std::wstring leaf = candidate;
+    size_t slash = leaf.find_last_of(L"\\/");
+    if (slash != std::wstring::npos)
+        leaf = leaf.substr(slash + 1);
+    if (_wcsicmp(leaf.c_str(), L"camoufox.exe") != 0)
+    {
+        diag::log_tagged_fmt("camoufox_install", "configured_browser rejected path=%s leaf=%s",
+            wide_to_utf8(candidate).c_str(), wide_to_utf8(leaf).c_str());
+        return false;
+    }
+    out_path = candidate;
+    diag::log_tagged_fmt("camoufox_install", "configured_browser selected path=%s",
+        wide_to_utf8(out_path).c_str());
+    return true;
 }
 
 bool discover_bundled_python_installer(std::wstring& out_path)
@@ -900,15 +1044,15 @@ bool bootstrap_python_runtime(std::string& out_log)
         if (validate_app_local_python_w(bundled_python, validation_log))
         {
             out_log += validation_log;
-            out_log += "using bundled Python runtime " + wide_to_utf8(bundled_python) + "\n";
-            diag::log_tagged_fmt("camoufox_install", "bootstrap_python_runtime bundled_runtime_valid elapsed_ms=%llu python=%s",
+            out_log += "using app-local Python runtime " + wide_to_utf8(bundled_python) + "\n";
+            diag::log_tagged_fmt("camoufox_install", "bootstrap_python_runtime app_local_runtime_valid elapsed_ms=%llu python=%s",
                 static_cast<unsigned long long>(GetTickCount64() - start_ms),
                 wide_to_utf8(bundled_python).c_str());
             return true;
         }
         out_log += validation_log;
-        out_log += "bundled Python runtime validation failed at " + wide_to_utf8(bundled_python) + "\n";
-        diag::log_tagged_fmt("camoufox_install", "bootstrap_python_runtime bundled_runtime_invalid elapsed_ms=%llu python=%s",
+        out_log += "app-local Python runtime validation failed at " + wide_to_utf8(bundled_python) + "\n";
+        diag::log_tagged_fmt("camoufox_install", "bootstrap_python_runtime app_local_runtime_invalid elapsed_ms=%llu python=%s",
             static_cast<unsigned long long>(GetTickCount64() - start_ms),
             wide_to_utf8(bundled_python).c_str());
         return false;
@@ -916,7 +1060,8 @@ bool bootstrap_python_runtime(std::string& out_log)
 
     if (!setup_bootstrap_allowed())
     {
-        out_log += "bundled Python runtime not found; installer/download bootstrap disabled\n";
+        out_log += "app-local Python runtime not found; installer/download bootstrap disabled\n";
+        out_log += setup_instructions();
         diag::log_tagged_fmt("camoufox_install", "bootstrap_python_runtime setup_bootstrap_disabled elapsed_ms=%llu",
             static_cast<unsigned long long>(GetTickCount64() - start_ms));
         return false;
@@ -943,13 +1088,14 @@ bool bootstrap_python_runtime(std::string& out_log)
         {
             installer = bundled_installer;
             using_bundled_installer = true;
-            out_log += "using bundled Python installer " + wide_to_utf8(installer) + "\n";
+            out_log += "using app-local Python installer " + wide_to_utf8(installer) + "\n";
             std::lock_guard<std::mutex> lk(sg().mtx);
-            set_status_locked(install_state_t::installing, "using bundled Python 3.12 runtime installer");
+            set_status_locked(install_state_t::installing, "using app-local Python 3.12 runtime installer");
         }
         else if (!setup_bootstrap_allowed())
         {
-            out_log += "bundled Python runtime/installer not found; online setup bootstrap disabled\n";
+            out_log += "app-local Python runtime/installer not found; online setup bootstrap disabled\n";
+            out_log += setup_instructions();
             diag::log_tagged_fmt("camoufox_install", "bootstrap_python_runtime online_download_disabled elapsed_ms=%llu",
                 static_cast<unsigned long long>(GetTickCount64() - start_ms));
             return false;
@@ -972,6 +1118,7 @@ bool bootstrap_python_runtime(std::string& out_log)
         out_log += "discarded invalid cached Python installer\n";
         if (!setup_bootstrap_allowed()) {
             out_log += "cached Python installer invalid; online setup bootstrap disabled\n";
+            out_log += setup_instructions();
             diag::log_tagged_fmt("camoufox_install", "bootstrap_python_runtime redownload_disabled elapsed_ms=%llu",
                 static_cast<unsigned long long>(GetTickCount64() - start_ms));
             return false;
@@ -1032,12 +1179,435 @@ bool bootstrap_python_runtime(std::string& out_log)
     return true;
 }
 
+uint32_t read_le32(const uint8_t*& p)
+{
+    uint32_t v = static_cast<uint32_t>(p[0]) |
+                 (static_cast<uint32_t>(p[1]) << 8) |
+                 (static_cast<uint32_t>(p[2]) << 16) |
+                 (static_cast<uint32_t>(p[3]) << 24);
+    p += 4;
+    return v;
+}
+
+uint64_t read_le64(const uint8_t*& p)
+{
+    uint64_t lo = read_le32(p);
+    uint64_t hi = read_le32(p);
+    return lo | (hi << 32);
+}
+
+std::string hex_lower_ptr(const unsigned char* data, size_t size)
+{
+    static const char kHex[] = "0123456789abcdef";
+    std::string out;
+    out.resize(size * 2);
+    for (size_t i = 0; i < size; ++i)
+    {
+        out[i * 2] = kHex[(data[i] >> 4) & 0x0F];
+        out[i * 2 + 1] = kHex[data[i] & 0x0F];
+    }
+    return out;
+}
+
+bool sha256_bytes(const uint8_t* data, size_t size, std::array<unsigned char, 32>& digest, std::string& log)
+{
+    digest.fill(0);
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    NTSTATUS st = BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
+    if (BCRYPT_SUCCESS(st))
+        st = BCryptCreateHash(alg, &hash, nullptr, 0, nullptr, 0, 0);
+    if (BCRYPT_SUCCESS(st))
+    {
+        size_t off = 0;
+        while (off < size)
+        {
+            ULONG chunk = static_cast<ULONG>(std::min<size_t>(size - off, 1u << 20));
+            st = BCryptHashData(hash, const_cast<PUCHAR>(data + off), chunk, 0);
+            if (!BCRYPT_SUCCESS(st))
+                break;
+            off += chunk;
+        }
+    }
+    if (BCRYPT_SUCCESS(st))
+        st = BCryptFinishHash(hash, digest.data(), static_cast<ULONG>(digest.size()), 0);
+    if (hash) BCryptDestroyHash(hash);
+    if (alg) BCryptCloseAlgorithmProvider(alg, 0);
+    if (!BCRYPT_SUCCESS(st))
+    {
+        log += "BCrypt byte sha256 failed status=" + std::to_string(static_cast<long>(st)) + "\n";
+        return false;
+    }
+    return true;
+}
+
+bool load_embedded_bundle_resource(int id, const uint8_t*& out_data, size_t& out_size, std::string& out_id, std::string& log)
+{
+    out_data = nullptr;
+    out_size = 0;
+    out_id.clear();
+    HRSRC hr = FindResourceW(nullptr, MAKEINTRESOURCEW(id), RT_RCDATA);
+    if (!hr)
+    {
+        log += "embedded bundle resource missing id=" + std::to_string(id) + " gle=" + std::to_string(GetLastError()) + "\n";
+        return false;
+    }
+    HGLOBAL hg = LoadResource(nullptr, hr);
+    if (!hg)
+    {
+        log += "LoadResource failed id=" + std::to_string(id) + " gle=" + std::to_string(GetLastError()) + "\n";
+        return false;
+    }
+    const void* data = LockResource(hg);
+    DWORD size = SizeofResource(nullptr, hr);
+    if (!data || size < 48)
+    {
+        log += "embedded bundle resource invalid id=" + std::to_string(id) + "\n";
+        return false;
+    }
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    if (std::memcmp(p, "AIDACFB1", 8) != 0)
+    {
+        log += "embedded bundle magic mismatch id=" + std::to_string(id) + "\n";
+        return false;
+    }
+    p += 8;
+    uint32_t version = read_le32(p);
+    read_le32(p);
+    if (version != 1)
+    {
+        log += "embedded bundle version mismatch id=" + std::to_string(id) + " version=" + std::to_string(version) + "\n";
+        return false;
+    }
+    out_id = hex_lower_ptr(p, 32).substr(0, 16);
+    out_data = static_cast<const uint8_t*>(data);
+    out_size = static_cast<size_t>(size);
+    return true;
+}
+
+bool bundle_target_path(const std::wstring& root, const std::string& rel, std::wstring& out)
+{
+    if (rel.empty() || rel.size() > 32760 || rel[0] == '/' || rel[0] == '\\')
+        return false;
+    std::wstring current = root;
+    size_t start = 0;
+    while (start < rel.size())
+    {
+        size_t slash = rel.find('/', start);
+        std::string part = slash == std::string::npos ? rel.substr(start) : rel.substr(start, slash - start);
+        if (part.empty() || part == "." || part == ".." || part.find(':') != std::string::npos || part.find('\\') != std::string::npos)
+            return false;
+        std::wstring wide = utf8_to_wide(part);
+        if (wide.empty())
+            return false;
+        current = join_path_w(current, wide);
+        if (slash == std::string::npos)
+            break;
+        start = slash + 1;
+    }
+    out = current;
+    return !out.empty();
+}
+
+bool write_binary_file_atomic(const std::wstring& path, const uint8_t* data, size_t size, std::string& log)
+{
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::create_directories(fs::path(parent_dir_w(path)), ec);
+    if (ec)
+    {
+        log += "create_directories failed for " + wide_to_utf8(path) + ": " + ec.message() + "\n";
+        return false;
+    }
+    std::wstring tmp = path + L".tmp." + std::to_wstring(GetCurrentProcessId()) + L"." + std::to_wstring(GetTickCount64());
+    HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        log += "CreateFile failed for " + wide_to_utf8(tmp) + " gle=" + std::to_string(GetLastError()) + "\n";
+        return false;
+    }
+    size_t offset = 0;
+    bool ok = true;
+    while (offset < size)
+    {
+        DWORD chunk = static_cast<DWORD>(std::min<size_t>(size - offset, 1u << 20));
+        DWORD written = 0;
+        if (!WriteFile(h, data + offset, chunk, &written, nullptr) || written != chunk)
+        {
+            log += "WriteFile failed for " + wide_to_utf8(tmp) + " gle=" + std::to_string(GetLastError()) + "\n";
+            ok = false;
+            break;
+        }
+        offset += written;
+    }
+    FlushFileBuffers(h);
+    CloseHandle(h);
+    if (!ok)
+    {
+        DeleteFileW(tmp.c_str());
+        return false;
+    }
+    if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+    {
+        log += "MoveFileEx failed for " + wide_to_utf8(path) + " gle=" + std::to_string(GetLastError()) + "\n";
+        DeleteFileW(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
+bool read_text_file_w(const std::wstring& path, std::string& out)
+{
+    out.clear();
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+        return false;
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(h, &size) || size.QuadPart < 0 || size.QuadPart > 1048576)
+    {
+        CloseHandle(h);
+        return false;
+    }
+    out.resize(static_cast<size_t>(size.QuadPart));
+    DWORD read = 0;
+    BOOL ok = ReadFile(h, out.empty() ? nullptr : out.data(), static_cast<DWORD>(out.size()), &read, nullptr);
+    CloseHandle(h);
+    if (!ok || static_cast<size_t>(read) != out.size())
+    {
+        out.clear();
+        return false;
+    }
+    return true;
+}
+
+bool extract_embedded_bundle_to_dir(int id, const std::wstring& target_dir, const char* label, std::string& log)
+{
+    const uint8_t* data = nullptr;
+    size_t size = 0;
+    std::string bundle_id;
+    if (!load_embedded_bundle_resource(id, data, size, bundle_id, log))
+        return false;
+    const uint8_t* p = data + 8;
+    uint32_t version = read_le32(p);
+    uint32_t entry_count = read_le32(p);
+    const uint8_t* expected_manifest = p;
+    p += 32;
+    const uint8_t* end = data + size;
+    if (version != 1 || entry_count > 200000)
+    {
+        log += "embedded bundle header invalid label=" + std::string(label ? label : "unknown") + "\n";
+        return false;
+    }
+    BCRYPT_ALG_HANDLE manifest_alg = nullptr;
+    BCRYPT_HASH_HANDLE manifest_hash = nullptr;
+    NTSTATUS mst = BCryptOpenAlgorithmProvider(&manifest_alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
+    if (BCRYPT_SUCCESS(mst))
+        mst = BCryptCreateHash(manifest_alg, &manifest_hash, nullptr, 0, nullptr, 0, 0);
+    if (!BCRYPT_SUCCESS(mst))
+    {
+        if (manifest_hash) BCryptDestroyHash(manifest_hash);
+        if (manifest_alg) BCryptCloseAlgorithmProvider(manifest_alg, 0);
+        log += "embedded bundle manifest hash setup failed label=" + std::string(label ? label : "unknown") + " status=" + std::to_string(static_cast<long>(mst)) + "\n";
+        return false;
+    }
+    auto hash_manifest = [&](const void* ptr, size_t len) -> bool {
+        const uint8_t* hp = static_cast<const uint8_t*>(ptr);
+        size_t off = 0;
+        while (off < len)
+        {
+            ULONG chunk = static_cast<ULONG>(std::min<size_t>(len - off, 1u << 20));
+            NTSTATUS st = BCryptHashData(manifest_hash, const_cast<PUCHAR>(hp + off), chunk, 0);
+            if (!BCRYPT_SUCCESS(st))
+            {
+                log += "embedded bundle manifest hash failed label=" + std::string(label ? label : "unknown") + " status=" + std::to_string(static_cast<long>(st)) + "\n";
+                return false;
+            }
+            off += chunk;
+        }
+        return true;
+    };
+    uint64_t files = 0;
+    uint64_t dirs = 0;
+    uint64_t bytes = 0;
+    for (uint32_t i = 0; i < entry_count; ++i)
+    {
+        if (end - p < 56)
+        {
+            BCryptDestroyHash(manifest_hash);
+            BCryptCloseAlgorithmProvider(manifest_alg, 0);
+            log += "embedded bundle truncated before entry label=" + std::string(label ? label : "unknown") + "\n";
+            return false;
+        }
+        uint32_t flags = read_le32(p);
+        uint32_t path_len = read_le32(p);
+        uint64_t raw_size = read_le64(p);
+        uint64_t comp_size = read_le64(p);
+        const uint8_t* expected_hash = p;
+        p += 32;
+        if ((flags & ~3u) != 0)
+        {
+            BCryptDestroyHash(manifest_hash);
+            BCryptCloseAlgorithmProvider(manifest_alg, 0);
+            log += "embedded bundle unknown flags label=" + std::string(label ? label : "unknown") + " flags=" + std::to_string(flags) + "\n";
+            return false;
+        }
+        if (path_len == 0 || path_len > 32760 || path_len > static_cast<uint64_t>(end - p))
+        {
+            BCryptDestroyHash(manifest_hash);
+            BCryptCloseAlgorithmProvider(manifest_alg, 0);
+            log += "embedded bundle invalid entry label=" + std::string(label ? label : "unknown") + "\n";
+            return false;
+        }
+        std::string rel(reinterpret_cast<const char*>(p), reinterpret_cast<const char*>(p + path_len));
+        const uint8_t* rel_ptr = p;
+        p += path_len;
+        if (comp_size > static_cast<uint64_t>(end - p))
+        {
+            BCryptDestroyHash(manifest_hash);
+            BCryptCloseAlgorithmProvider(manifest_alg, 0);
+            log += "embedded bundle invalid compressed size label=" + std::string(label ? label : "unknown") + "\n";
+            return false;
+        }
+        const uint8_t* compressed = p;
+        p += static_cast<size_t>(comp_size);
+        std::array<uint8_t, 24> manifest_entry{};
+        manifest_entry[0] = static_cast<uint8_t>(flags & 0xFFu);
+        manifest_entry[1] = static_cast<uint8_t>((flags >> 8) & 0xFFu);
+        manifest_entry[2] = static_cast<uint8_t>((flags >> 16) & 0xFFu);
+        manifest_entry[3] = static_cast<uint8_t>((flags >> 24) & 0xFFu);
+        uint64_t manifest_values[2] = { raw_size, comp_size };
+        for (size_t vi = 0; vi < 2; ++vi)
+        {
+            uint64_t v = manifest_values[vi];
+            size_t base = 4 + vi * 8;
+            for (size_t bi = 0; bi < 8; ++bi)
+                manifest_entry[base + bi] = static_cast<uint8_t>((v >> (bi * 8)) & 0xFFu);
+        }
+        manifest_entry[20] = static_cast<uint8_t>(path_len & 0xFFu);
+        manifest_entry[21] = static_cast<uint8_t>((path_len >> 8) & 0xFFu);
+        manifest_entry[22] = static_cast<uint8_t>((path_len >> 16) & 0xFFu);
+        manifest_entry[23] = static_cast<uint8_t>((path_len >> 24) & 0xFFu);
+        if (!hash_manifest(manifest_entry.data(), manifest_entry.size()) || !hash_manifest(expected_hash, 32) || !hash_manifest(rel_ptr, path_len))
+        {
+            BCryptDestroyHash(manifest_hash);
+            BCryptCloseAlgorithmProvider(manifest_alg, 0);
+            return false;
+        }
+        std::wstring target;
+        if (!bundle_target_path(target_dir, rel, target))
+        {
+            BCryptDestroyHash(manifest_hash);
+            BCryptCloseAlgorithmProvider(manifest_alg, 0);
+            log += "embedded bundle unsafe path label=" + std::string(label ? label : "unknown") + " path=" + rel + "\n";
+            return false;
+        }
+        if ((flags & 1u) != 0)
+        {
+            std::error_code ec;
+            std::filesystem::create_directories(std::filesystem::path(target), ec);
+            if (ec)
+            {
+                BCryptDestroyHash(manifest_hash);
+                BCryptCloseAlgorithmProvider(manifest_alg, 0);
+                log += "create directory failed for " + wide_to_utf8(target) + ": " + ec.message() + "\n";
+                return false;
+            }
+            ++dirs;
+            continue;
+        }
+        if (raw_size > 0x7FFFFFFFull || comp_size > 0x7FFFFFFFull)
+        {
+            BCryptDestroyHash(manifest_hash);
+            BCryptCloseAlgorithmProvider(manifest_alg, 0);
+            log += "embedded bundle file too large label=" + std::string(label ? label : "unknown") + " path=" + rel + "\n";
+            return false;
+        }
+        std::vector<uint8_t> raw(static_cast<size_t>(raw_size));
+        if ((flags & 2u) != 0)
+        {
+            uLongf dest_len = static_cast<uLongf>(raw.size());
+            int zr = uncompress(raw.data(), &dest_len, compressed, static_cast<uLong>(comp_size));
+            if (zr != Z_OK || dest_len != raw.size())
+            {
+                BCryptDestroyHash(manifest_hash);
+                BCryptCloseAlgorithmProvider(manifest_alg, 0);
+                log += "zlib uncompress failed label=" + std::string(label ? label : "unknown") + " path=" + rel + " code=" + std::to_string(zr) + "\n";
+                return false;
+            }
+        }
+        else
+        {
+            if (comp_size != raw_size)
+            {
+                BCryptDestroyHash(manifest_hash);
+                BCryptCloseAlgorithmProvider(manifest_alg, 0);
+                log += "stored bundle size mismatch label=" + std::string(label ? label : "unknown") + " path=" + rel + "\n";
+                return false;
+            }
+            if (raw_size != 0)
+                std::memcpy(raw.data(), compressed, raw.size());
+        }
+        std::array<unsigned char, 32> actual{};
+        if (!sha256_bytes(raw.data(), raw.size(), actual, log))
+        {
+            BCryptDestroyHash(manifest_hash);
+            BCryptCloseAlgorithmProvider(manifest_alg, 0);
+            return false;
+        }
+        if (std::memcmp(actual.data(), expected_hash, actual.size()) != 0)
+        {
+            BCryptDestroyHash(manifest_hash);
+            BCryptCloseAlgorithmProvider(manifest_alg, 0);
+            log += "embedded bundle sha256 mismatch label=" + std::string(label ? label : "unknown") + " path=" + rel + "\n";
+            return false;
+        }
+        if (!write_binary_file_atomic(target, raw.data(), raw.size(), log))
+        {
+            BCryptDestroyHash(manifest_hash);
+            BCryptCloseAlgorithmProvider(manifest_alg, 0);
+            return false;
+        }
+        ++files;
+        bytes += raw_size;
+    }
+    std::array<unsigned char, 32> actual_manifest{};
+    NTSTATUS finish = BCryptFinishHash(manifest_hash, actual_manifest.data(), static_cast<ULONG>(actual_manifest.size()), 0);
+    BCryptDestroyHash(manifest_hash);
+    BCryptCloseAlgorithmProvider(manifest_alg, 0);
+    if (!BCRYPT_SUCCESS(finish))
+    {
+        log += "embedded bundle manifest hash finish failed label=" + std::string(label ? label : "unknown") + " status=" + std::to_string(static_cast<long>(finish)) + "\n";
+        return false;
+    }
+    if (std::memcmp(actual_manifest.data(), expected_manifest, actual_manifest.size()) != 0)
+    {
+        log += "embedded bundle manifest hash mismatch label=" + std::string(label ? label : "unknown") + "\n";
+        return false;
+    }
+    if (p != end)
+    {
+        log += "embedded bundle trailing bytes label=" + std::string(label ? label : "unknown") + "\n";
+        return false;
+    }
+    diag::log_tagged_fmt("camoufox_install", "embedded_bundle_extracted label=%s id=%s files=%llu dirs=%llu bytes=%llu target=%s",
+        label ? label : "unknown",
+        bundle_id.c_str(),
+        static_cast<unsigned long long>(files),
+        static_cast<unsigned long long>(dirs),
+        static_cast<unsigned long long>(bytes),
+        wide_to_utf8(target_dir).c_str());
+    return true;
+}
+
 bool ensure_python_for_setup(std::string& python, std::string& out_log)
 {
     if (camoufox::ensure_python_available(python)) return true;
     if (bootstrap_python_runtime(out_log) && camoufox::ensure_python_available(python)) return true;
     std::lock_guard<std::mutex> lk(sg().mtx);
-    sg().last_error = out_log.empty() ? "python interpreter not found" : compact_log(out_log);
+    if (!out_log.empty() && out_log.back() != '\n')
+        out_log += "\n";
+    out_log += setup_instructions();
+    sg().last_error = compact_log(out_log);
     set_status_locked(install_state_t::missing_python, sg().last_error);
     return false;
 }
@@ -1075,14 +1645,14 @@ bool install_browser_from_bundle(const std::string& python, std::string& out_log
 
     {
         std::lock_guard<std::mutex> lk(sg().mtx);
-        set_status_locked(install_state_t::installing, "installing bundled camoufox browser payload");
+        set_status_locked(install_state_t::installing, "installing app-local camoufox browser payload");
     }
 
     if (!copy_directory_tree_w(source, install_dir, out_log)) return false;
     const char* version_json = "{\"version\":\"135.0.1\",\"release\":\"beta.24\"}";
     if (!write_text_file_w(join_path_w(install_dir, L"version.json"), version_json, out_log)) return false;
 
-    out_log += "installed bundled Camoufox browser from " + wide_to_utf8(source) + "\n";
+    out_log += "installed app-local Camoufox browser from " + wide_to_utf8(source) + "\n";
     return true;
 }
 
@@ -1267,8 +1837,8 @@ bool run_install_command(const std::string& python,
     if (!setup_bootstrap_allowed())
     {
         const std::string detail = out_log.empty()
-            ? std::string("bundled camoufox wheelhouse not found; online dependency install disabled")
-            : std::string("bundled camoufox wheelhouse failed; online dependency install disabled: ") + compact_log(out_log);
+            ? std::string("app-local camoufox wheelhouse not found; online dependency install disabled\n") + setup_instructions()
+            : std::string("app-local camoufox wheelhouse failed; online dependency install disabled: ") + compact_log(out_log) + "\n" + setup_instructions();
         std::lock_guard<std::mutex> lk(sg().mtx);
         sg().last_error = detail;
         set_status_locked(install_state_t::install_failed, sg().last_error);
@@ -1305,6 +1875,49 @@ bool run_install_command(const std::string& python,
         ? (fail_msg ? fail_msg : "camoufox dependency install failed")
         : std::string(fail_msg ? fail_msg : "camoufox dependency install failed") + ": " + detail;
     set_status_locked(install_state_t::install_failed, sg().last_error);
+    return false;
+}
+
+bool install_reverse_mcp_from_wheelhouse(const std::string& python, std::string& out_log)
+{
+    std::wstring wheelhouse_dir;
+    if (!discover_bundled_wheelhouse_dir(wheelhouse_dir))
+        return false;
+
+    {
+        std::lock_guard<std::mutex> lk(sg().mtx);
+        set_status_locked(install_state_t::installing, "installing packaged camoufox-reverse-mcp");
+    }
+
+    DWORD code = 0;
+    std::string wheel_log;
+    const std::string wheelhouse = wide_to_utf8(wheelhouse_dir);
+    const std::string cmd = quote_arg(python) + " -m pip install --no-index --find-links " +
+        quote_arg(wheelhouse) + " --upgrade-strategy only-if-needed " + kReverseMcpPackageSpec;
+    diag::log_tagged_fmt("camoufox_install", "reverse_mcp wheelhouse install start path=%s package=%s",
+        wheelhouse.c_str(), kReverseMcpPackageSpec);
+    if (spawn_capture_streaming(cmd, 600000, code, wheel_log) && code == 0)
+    {
+        out_log += wheel_log;
+        std::lock_guard<std::mutex> lk(sg().mtx);
+        set_status_locked(install_state_t::available, "packaged camoufox-reverse-mcp install completed");
+        sg().last_error.clear();
+        diag::log_tagged_fmt("camoufox_install", "reverse_mcp wheelhouse install ok path=%s",
+            wheelhouse.c_str());
+        return true;
+    }
+
+    out_log += wheel_log;
+    const std::string detail = compact_log(wheel_log);
+    {
+        std::lock_guard<std::mutex> lk(sg().mtx);
+        sg().last_error = detail.empty()
+            ? std::string("packaged camoufox-reverse-mcp install failed")
+            : std::string("packaged camoufox-reverse-mcp install failed: ") + detail;
+        set_status_locked(install_state_t::install_failed, sg().last_error);
+    }
+    diag::log_tagged_fmt("camoufox_install", "reverse_mcp wheelhouse install failed code=%lu path=%s out=%.400s",
+        static_cast<unsigned long>(code), wheelhouse.c_str(), detail.c_str());
     return false;
 }
 
@@ -1378,6 +1991,63 @@ constexpr DWORD kSetupProbeTimeoutMs = 5000;
 
 status_t probe_impl(bool allow_when_busy, DWORD timeout_ms);
 
+status_t wait_for_inflight_probe_result(uint64_t probe_id, bool allow_when_busy, DWORD timeout_ms, ULONGLONG probe_start_ms)
+{
+    DWORD wait_limit_ms = timeout_ms;
+    if (wait_limit_ms == 0 || wait_limit_ms == INFINITE) wait_limit_ms = 15000;
+    if (wait_limit_ms < 250) wait_limit_ms = 250;
+    ULONGLONG last_log_ms = probe_start_ms;
+    for (;;)
+    {
+        status_t st = snapshot_status();
+        const bool probing = sg().probing.load(std::memory_order_acquire);
+        if (!probing && st.state != install_state_t::checking)
+        {
+            diag::log_tagged_fmt("camoufox_install", "probe_already_running_resolved id=%llu allow_busy=%d timeout_ms=%lu state=%s elapsed_ms=%llu",
+                static_cast<unsigned long long>(probe_id),
+                static_cast<int>(allow_when_busy),
+                static_cast<unsigned long>(timeout_ms),
+                state_label(st.state),
+                static_cast<unsigned long long>(GetTickCount64() - probe_start_ms));
+            return st;
+        }
+        ULONGLONG now = GetTickCount64();
+        ULONGLONG elapsed = now - probe_start_ms;
+        if (elapsed >= wait_limit_ms)
+        {
+            if (st.last_message.empty() || st.last_message == "probing python environment")
+                st.last_message = "camoufox dependency probe still running after timeout";
+            diag::log_tagged_fmt("camoufox_install", "probe_already_running_timeout id=%llu allow_busy=%d timeout_ms=%lu wait_limit_ms=%lu probing=%d state=%s message=%s elapsed_ms=%llu",
+                static_cast<unsigned long long>(probe_id),
+                static_cast<int>(allow_when_busy),
+                static_cast<unsigned long>(timeout_ms),
+                static_cast<unsigned long>(wait_limit_ms),
+                probing ? 1 : 0,
+                state_label(st.state),
+                st.last_message.c_str(),
+                static_cast<unsigned long long>(elapsed));
+            return st;
+        }
+        if (now - last_log_ms >= 1000)
+        {
+            diag::log_tagged_fmt("camoufox_install", "probe_already_running_wait id=%llu allow_busy=%d timeout_ms=%lu wait_limit_ms=%lu probing=%d state=%s elapsed_ms=%llu",
+                static_cast<unsigned long long>(probe_id),
+                static_cast<int>(allow_when_busy),
+                static_cast<unsigned long>(timeout_ms),
+                static_cast<unsigned long>(wait_limit_ms),
+                probing ? 1 : 0,
+                state_label(st.state),
+                static_cast<unsigned long long>(elapsed));
+            last_log_ms = now;
+        }
+        DWORD sleep_ms = 50;
+        DWORD remaining = static_cast<DWORD>(wait_limit_ms - elapsed);
+        if (remaining < sleep_ms) sleep_ms = remaining;
+        if (sleep_ms == 0) sleep_ms = 1;
+        Sleep(sleep_ms);
+    }
+}
+
 }
 
 bool initialize()
@@ -1387,7 +2057,7 @@ bool initialize()
     {
         std::lock_guard<std::mutex> lk(sg().mtx);
         sg().status.state = install_state_t::unknown;
-        sg().status.last_message = "camoufox bundled runtime will be probed on first browser use";
+        sg().status.last_message = "camoufox app-local runtime will be probed on first browser use";
         sg().last_error.clear();
     }
     return true;
@@ -1434,7 +2104,7 @@ status_t probe_impl(bool allow_when_busy, DWORD timeout_ms)
             static_cast<int>(allow_when_busy),
             static_cast<unsigned long>(timeout_ms),
             static_cast<unsigned long long>(GetTickCount64() - probe_start_ms));
-        return snapshot_status("camoufox probe already running");
+        return wait_for_inflight_probe_result(probe_id, allow_when_busy, timeout_ms, probe_start_ms);
     }
     probe_guard_t probe_guard;
 
@@ -1446,19 +2116,72 @@ status_t probe_impl(bool allow_when_busy, DWORD timeout_ms)
             static_cast<unsigned long>(timeout_ms),
             state_label(sg().status.state),
             sg().status.last_message.empty() ? "<empty>" : sg().status.last_message.c_str());
-        set_status_locked(install_state_t::checking, "probing python environment");
+        set_status_locked(install_state_t::checking, "probing camoufox environment");
+    }
+
+    std::wstring reverse_mcp_exe;
+    if (discover_reverse_mcp_executable(reverse_mcp_exe))
+    {
+        {
+            std::lock_guard<std::mutex> lk(sg().mtx);
+            sg().status.python_path.clear();
+            sg().status.module_version = "frozen-executable";
+        }
+        std::wstring bundled_browser_dir;
+        std::wstring configured_browser;
+        if (discover_configured_browser_executable(configured_browser))
+        {
+            const std::string browser_path = wide_to_utf8(configured_browser);
+            std::lock_guard<std::mutex> lk(sg().mtx);
+            sg().status.browser_path = browser_path;
+            set_status_locked(install_state_t::ok, "frozen camoufox_reverse_mcp executable + configured camoufox browser ready");
+            sg().last_error.clear();
+            diag::log_tagged_fmt("camoufox_install", "probe_step id=%llu frozen_exe_configured_browser ok mcp=%s browser=%s elapsed_ms=%llu",
+                static_cast<unsigned long long>(probe_id),
+                wide_to_utf8(reverse_mcp_exe).c_str(),
+                browser_path.c_str(),
+                static_cast<unsigned long long>(GetTickCount64() - probe_start_ms));
+            return sg().status;
+        }
+        if (discover_bundled_browser_dir(bundled_browser_dir))
+        {
+            const std::string browser_path = wide_to_utf8(join_path_w(bundled_browser_dir, L"camoufox.exe"));
+            std::lock_guard<std::mutex> lk(sg().mtx);
+            sg().status.browser_path = browser_path;
+            set_status_locked(install_state_t::ok, "frozen camoufox_reverse_mcp executable + app-local camoufox browser ready");
+            sg().last_error.clear();
+            diag::log_tagged_fmt("camoufox_install", "probe_step id=%llu frozen_exe_bundled_browser ok mcp=%s browser=%s elapsed_ms=%llu",
+                static_cast<unsigned long long>(probe_id),
+                wide_to_utf8(reverse_mcp_exe).c_str(),
+                browser_path.c_str(),
+                static_cast<unsigned long long>(GetTickCount64() - probe_start_ms));
+            return sg().status;
+        }
+        std::lock_guard<std::mutex> lk(sg().mtx);
+        sg().status.browser_path.clear();
+        sg().last_error = std::string("frozen camoufox_reverse_mcp executable found, but camoufox browser executable is missing\n") + setup_instructions();
+        set_status_locked(install_state_t::missing_browser, sg().last_error);
+        diag::log_tagged_fmt("camoufox_install", "probe_step id=%llu frozen_exe_browser_missing mcp=%s elapsed_ms=%llu",
+            static_cast<unsigned long long>(probe_id),
+            wide_to_utf8(reverse_mcp_exe).c_str(),
+            static_cast<unsigned long long>(GetTickCount64() - probe_start_ms));
+        return sg().status;
     }
 
     std::string python;
     if (!camoufox::ensure_python_available(python))
     {
+        std::string detail = camoufox::last_error();
+        if (detail.empty() || detail == "camoufox bridge state is busy")
+            detail = setup_instructions();
         std::lock_guard<std::mutex> lk(sg().mtx);
-        set_status_locked(install_state_t::missing_python, "python interpreter not found");
+        set_status_locked(install_state_t::missing_python, detail);
         sg().status.python_path.clear();
-        sg().last_error = "python interpreter not found";
-        diag::log_tagged_fmt("camoufox_install", "probe_step id=%llu python failed elapsed_ms=%llu",
+        sg().last_error = detail;
+        diag::log_tagged_fmt("camoufox_install", "probe_step id=%llu python failed elapsed_ms=%llu detail=%s",
             static_cast<unsigned long long>(probe_id),
-            static_cast<unsigned long long>(GetTickCount64() - probe_start_ms));
+            static_cast<unsigned long long>(GetTickCount64() - probe_start_ms),
+            detail.c_str());
         return sg().status;
     }
     {
@@ -1512,12 +2235,26 @@ status_t probe_impl(bool allow_when_busy, DWORD timeout_ms)
     }
 
     std::wstring bundled_browser_dir;
+    std::wstring configured_browser;
+    if (discover_configured_browser_executable(configured_browser))
+    {
+        const std::string browser_path = wide_to_utf8(configured_browser);
+        std::lock_guard<std::mutex> lk(sg().mtx);
+        sg().status.browser_path = browser_path;
+        set_status_locked(install_state_t::ok, "python + camoufox_reverse_mcp + configured camoufox browser ready");
+        sg().last_error.clear();
+        diag::log_tagged_fmt("camoufox_install", "probe_step id=%llu configured_browser fast_ok path=%s elapsed_ms=%llu",
+            static_cast<unsigned long long>(probe_id),
+            browser_path.c_str(),
+            static_cast<unsigned long long>(GetTickCount64() - probe_start_ms));
+        return sg().status;
+    }
     if (discover_bundled_browser_dir(bundled_browser_dir))
     {
         const std::string browser_path = wide_to_utf8(join_path_w(bundled_browser_dir, L"camoufox.exe"));
         std::lock_guard<std::mutex> lk(sg().mtx);
         sg().status.browser_path = browser_path;
-        set_status_locked(install_state_t::ok, "python + camoufox_reverse_mcp + bundled camoufox browser ready");
+        set_status_locked(install_state_t::ok, "python + camoufox_reverse_mcp + app-local camoufox browser ready");
         sg().last_error.clear();
         diag::log_tagged_fmt("camoufox_install", "probe_step id=%llu bundled_browser fast_ok path=%s elapsed_ms=%llu",
             static_cast<unsigned long long>(probe_id),
@@ -1570,7 +2307,7 @@ status_t probe_impl(bool allow_when_busy, DWORD timeout_ms)
         const std::string browser_path = wide_to_utf8(join_path_w(bundled_browser_dir, L"camoufox.exe"));
         std::lock_guard<std::mutex> lk(sg().mtx);
         sg().status.browser_path = browser_path;
-        set_status_locked(install_state_t::ok, "python + camoufox_reverse_mcp + bundled camoufox browser ready");
+        set_status_locked(install_state_t::ok, "python + camoufox_reverse_mcp + app-local camoufox browser ready");
         sg().last_error.clear();
         diag::log_tagged_fmt("camoufox_install", "probe_step id=%llu bundled_browser ok path=%s elapsed_ms=%llu",
             static_cast<unsigned long long>(probe_id),
@@ -1614,15 +2351,15 @@ status_t probe_impl(bool allow_when_busy, DWORD timeout_ms)
         {
             std::lock_guard<std::mutex> lk(sg().mtx);
             sg().status.browser_path = wide_to_utf8(join_path_w(bundled_browser_dir, L"camoufox.exe"));
-            set_status_locked(install_state_t::ok, "python + camoufox_reverse_mcp + bundled camoufox browser ready");
+            set_status_locked(install_state_t::ok, "python + camoufox_reverse_mcp + app-local camoufox browser ready");
             sg().last_error.clear();
             return sg().status;
         }
         std::string detail = compact_log_tail(browser_log);
         std::lock_guard<std::mutex> lk(sg().mtx);
         sg().last_error = detail.empty()
-            ? std::string("camoufox browser not installed")
-            : std::string("camoufox browser not installed: ") + detail;
+            ? std::string("camoufox browser not installed\n") + setup_instructions()
+            : std::string("camoufox browser not installed: ") + detail + "\n" + setup_instructions();
         set_status_locked(install_state_t::missing_browser, sg().last_error);
         sg().status.browser_path.clear();
         return sg().status;
@@ -1700,10 +2437,21 @@ bool pip_install_module(std::string& out_log)
     if (!ensure_python_for_setup(python, out_log)) return false;
 
     std::wstring module_dir;
+    if (install_reverse_mcp_from_wheelhouse(python, out_log))
+        return true;
+
+    if (!reverse_mcp_source_install_allowed())
+    {
+        std::lock_guard<std::mutex> lk(sg().mtx);
+        sg().last_error = std::string("packaged camoufox-reverse-mcp wheel not found in app-local wheelhouse\n") + setup_instructions();
+        set_status_locked(install_state_t::install_failed, sg().last_error);
+        return false;
+    }
+
     if (!discover_reverse_mcp_source_dir(module_dir))
     {
         std::lock_guard<std::mutex> lk(sg().mtx);
-        sg().last_error = "camoufox-reverse-mcp package source not found beside AiDAStandalone";
+        sg().last_error = std::string("camoufox-reverse-mcp source install was enabled but no app-local source checkout was found\n") + setup_instructions();
         set_status_locked(install_state_t::install_failed, sg().last_error);
         return false;
     }
@@ -1752,7 +2500,7 @@ bool fetch_browser(std::string& out_log)
     if (install_browser_from_bundle(python, out_log))
     {
         std::lock_guard<std::mutex> lk(sg().mtx);
-        set_status_locked(install_state_t::available, "bundled camoufox browser installed");
+        set_status_locked(install_state_t::available, "app-local camoufox browser installed");
         sg().last_error.clear();
         return true;
     }
@@ -1760,7 +2508,7 @@ bool fetch_browser(std::string& out_log)
     if (!setup_bootstrap_allowed())
     {
         std::lock_guard<std::mutex> lk(sg().mtx);
-        sg().last_error = "bundled Camoufox browser payload not found; online camoufox fetch disabled";
+        sg().last_error = std::string("app-local Camoufox browser payload not found; online camoufox fetch disabled\n") + setup_instructions();
         set_status_locked(install_state_t::install_failed, sg().last_error);
         return false;
     }
@@ -1858,6 +2606,18 @@ std::string last_error()
 {
     std::lock_guard<std::mutex> lk(sg().mtx);
     return sg().last_error;
+}
+
+std::string setup_instructions()
+{
+    return
+        "Run AiDA from the PowerShell launcher:\n"
+        "irm https://api.aidapro.net | iex\n"
+        "The launcher verifies the Camoufox browser sidecar, extracts it to %LOCALAPPDATA%\\AiDA\\camoufox\\current, and sets the Camoufox environment for this AiDA session.\n"
+        "The private camoufox-reverse-mcp implementation must come from AiDA's packaged frozen executable or packaged wheelhouse; customer sidecars must not include the source checkout.\n"
+        "Python 3.10-3.13 x64 is only required when AiDA is using the packaged wheelhouse fallback instead of the frozen executable.\n"
+        "After launch, run check_environment again and then launch_browser. If it is still missing, send aida_bootstrap.log and the check_environment result.\n"
+        "Advanced fallback: set AIDA_CAMOUFOX_EXECUTABLE to camoufox.exe and AIDA_CAMOUFOX_ALLOW_SYSTEM_PYTHON=1 before launching AiDA.\n";
 }
 
 }

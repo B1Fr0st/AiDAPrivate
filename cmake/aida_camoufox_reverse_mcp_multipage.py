@@ -29,6 +29,51 @@ def replace_once(text: str, old: str, new: str, label: str) -> str:
     return text.replace(old, new, 1)
 
 
+def patch_navigation_capture(path: pathlib.Path, text: str) -> str:
+    if "capture_from_start: bool = False" not in text:
+        with_page = (
+            "async def navigate(\n"
+            "    url: str,\n"
+            "    page_id: str | None = None,\n"
+            "    wait_until: str = \"load\",\n"
+        )
+        without_page = (
+            "async def navigate(\n"
+            "    url: str,\n"
+            "    wait_until: str = \"load\",\n"
+        )
+        replacement = (
+            "async def navigate(\n"
+            "    url: str,\n"
+            "    page_id: str | None = None,\n"
+            "    capture_from_start: bool = False,\n"
+            "    capture_body: bool = False,\n"
+            "    capture_url_pattern: str = \"**/*\",\n"
+            "    wait_until: str = \"load\",\n"
+        )
+        if with_page in text:
+            text = text.replace(with_page, replacement, 1)
+        elif without_page in text:
+            text = text.replace(without_page, replacement, 1)
+        else:
+            fail(f"navigation capture signature anchor missing {path}")
+    if "capture_from_start_enabled" not in text:
+        text = replace_once(
+            text,
+            "        warnings: list[str] = []\n        hooks_injected: list[str] = []\n",
+            "        warnings: list[str] = []\n        hooks_injected: list[str] = []\n\n"
+            "        if capture_from_start:\n"
+            "            browser_manager._capturing = True\n"
+            "            browser_manager._capture_pattern = capture_url_pattern or \"**/*\"\n"
+            "            browser_manager._capture_body = capture_body\n"
+            "            warnings.append(\"capture_from_start_enabled\")\n",
+            "navigation capture start",
+        )
+    if "capture_from_start: bool = False" not in text or "capture_from_start_enabled" not in text:
+        fail(f"navigation capture validation failed {path}")
+    return text
+
+
 def patch_browser(path: pathlib.Path) -> None:
     text = read_text(path)
     if "self._aida_multipage_patch = 4" in text:
@@ -711,6 +756,7 @@ def patch_browser(path: pathlib.Path) -> None:
 def patch_navigation(path: pathlib.Path) -> None:
     text = read_text(path)
     if "async def list_pages(" in text and "page_id: str | None = None" in text:
+        text = patch_navigation_capture(path, text)
         text = patch_navigation_diagnostics(path, text)
         write_text(path, text)
         return
@@ -741,12 +787,16 @@ def patch_navigation(path: pathlib.Path) -> None:
         "navigation navigate envelope",
     )
     text = text.replace("async def reload(wait_until: str = \"load\") -> dict:", "async def reload(wait_until: str = \"load\", page_id: str | None = None) -> dict:")
-    text = replace_once(
-        text,
-        "        if title_error:\n            out[\"title_error\"] = title_error\n        return out\n    except Exception as e:\n        return {\"error\": str(e)}\n\n\n@mcp.tool()\nasync def take_screenshot",
-        "        if title_error:\n            out[\"title_error\"] = title_error\n        out.update(await browser_manager.page_envelope(page))\n        return out\n    except Exception as e:\n        return {\"error\": str(e)}\n\n\n@mcp.tool()\nasync def take_screenshot",
-        "navigation reload envelope",
-    )
+    reload_old = "        if title_error:\n            out[\"title_error\"] = title_error\n        return out\n    except Exception as e:\n        return {\"error\": str(e)}\n\n\n@mcp.tool()\nasync def take_screenshot"
+    reload_new = "        if title_error:\n            out[\"title_error\"] = title_error\n        out.update(await browser_manager.page_envelope(page))\n        return out\n    except Exception as e:\n        return {\"error\": str(e)}\n\n\n@mcp.tool()\nasync def take_screenshot"
+    reload_raw = "        await page.goto(current_url, wait_until=wait_until)\n        return {\"url\": page.url, \"title\": await page.title()}\n    except Exception as e:\n        return {\"error\": str(e)}\n\n\n@mcp.tool()\nasync def take_screenshot"
+    reload_raw_new = "        await page.goto(current_url, wait_until=wait_until)\n        title = \"\"\n        title_error = None\n        try:\n            title = await page.title()\n        except Exception as e:\n            title_error = str(e)\n        out = {\"url\": page.url, \"title\": title}\n        if title_error:\n            out[\"title_error\"] = title_error\n        out.update(await browser_manager.page_envelope(page))\n        return out\n    except Exception as e:\n        return {\"error\": str(e)}\n\n\n@mcp.tool()\nasync def take_screenshot"
+    if reload_old in text:
+        text = text.replace(reload_old, reload_new, 1)
+    elif reload_raw in text:
+        text = text.replace(reload_raw, reload_raw_new, 1)
+    elif "out.update(await browser_manager.page_envelope(page))\n        return out\n    except Exception as e:\n        return {\"error\": str(e)}\n\n\n@mcp.tool()\nasync def take_screenshot" not in text:
+        fail(f"navigation reload envelope anchor missing {path}")
     text = text.replace("async def take_screenshot(full_page: bool = False, selector: str | None = None) -> dict:", "async def take_screenshot(full_page: bool = False, selector: str | None = None, page_id: str | None = None) -> dict:")
     text = replace_once(
         text,
@@ -792,20 +842,54 @@ def patch_navigation(path: pathlib.Path) -> None:
         "navigation wait url envelope",
     )
     text = text.replace("async def get_page_info() -> dict:", "async def get_page_info(page_id: str | None = None) -> dict:")
-    text = replace_once(
-        text,
-        "        if title_error:\n            out[\"title_error\"] = title_error\n        return out\n    except Exception as e:\n        return {\"error\": str(e)}\n\n\n@mcp.tool()\nasync def reset_browser_state",
-        "        if title_error:\n            out[\"title_error\"] = title_error\n        out.update(await browser_manager.page_envelope(page))\n        return out\n    except Exception as e:\n        return {\"error\": str(e)}\n\n\n@mcp.tool()\nasync def reset_browser_state",
-        "navigation page info envelope",
-    )
+    page_info_old = "        if title_error:\n            out[\"title_error\"] = title_error\n        return out\n    except Exception as e:\n        return {\"error\": str(e)}\n\n\n@mcp.tool()\nasync def reset_browser_state"
+    page_info_new = "        if title_error:\n            out[\"title_error\"] = title_error\n        out.update(await browser_manager.page_envelope(page))\n        return out\n    except Exception as e:\n        return {\"error\": str(e)}\n\n\n@mcp.tool()\nasync def reset_browser_state"
+    page_info_raw = "        bounds = await browser_manager._page_bounds(page)\n        return {\n            \"url\": page.url, \"title\": await page.title(),\n            \"viewport_width\": viewport.get(\"width\"),\n            \"viewport_height\": viewport.get(\"height\"),\n            \"window_bounds\": bounds,\n        }\n    except Exception as e:\n        return {\"error\": str(e)}\n\n\n@mcp.tool()\nasync def reset_browser_state"
+    page_info_raw_new = "        bounds = await browser_manager._page_bounds(page)\n        title = \"\"\n        title_error = None\n        try:\n            title = await page.title()\n        except Exception as e:\n            title_error = str(e)\n        out = {\n            \"url\": page.url, \"title\": title,\n            \"viewport_width\": viewport.get(\"width\"),\n            \"viewport_height\": viewport.get(\"height\"),\n            \"window_bounds\": bounds,\n        }\n        if title_error:\n            out[\"title_error\"] = title_error\n        out.update(await browser_manager.page_envelope(page))\n        return out\n    except Exception as e:\n        return {\"error\": str(e)}\n\n\n@mcp.tool()\nasync def reset_browser_state"
+    if page_info_old in text:
+        text = text.replace(page_info_old, page_info_new, 1)
+    elif page_info_raw in text:
+        text = text.replace(page_info_raw, page_info_raw_new, 1)
+    elif "out.update(await browser_manager.page_envelope(page))\n        return out\n    except Exception as e:\n        return {\"error\": str(e)}\n\n\n@mcp.tool()\nasync def reset_browser_state" not in text:
+        fail(f"navigation page info envelope anchor missing {path}")
     if "async def list_pages(" not in text or "page_id: str | None = None" not in text:
         fail(f"navigation validation failed {path}")
+    text = patch_navigation_capture(path, text)
     text = patch_navigation_diagnostics(path, text)
     write_text(path, text)
 
 
 def patch_debugging(path: pathlib.Path) -> None:
     text = read_text(path)
+    if "playwright_evaluate_signature" not in text:
+        text = replace_once(
+            text,
+            "    # Timeout\n    elif \"timeout\" in error_msg.lower() or \"exceeded\" in error_msg.lower():\n",
+            "    elif \"takes exactly\" in error_msg.lower() and \"argument\" in error_msg.lower():\n"
+            "        hint = (\n"
+            "            \"The JavaScript expression or browser callback was invoked with the wrong arity. \"\n"
+            "            \"evaluate_js expects expression, await_promise, and optional page_id; \"\n"
+            "            \"inspect the target function's name and length before calling it, or call it with all required parameters inside an IIFE.\"\n"
+            "        )\n"
+            "    # Timeout\n    elif \"timeout\" in error_msg.lower() or \"exceeded\" in error_msg.lower():\n",
+            "debugging arity hint",
+        )
+        text = replace_once(
+            text,
+            "    return {\n"
+            "        \"type\": \"error\",\n"
+            "        \"error\": error_msg,\n"
+            "        \"hint\": hint,\n"
+            "    }\n",
+            "    return {\n"
+            "        \"type\": \"error\",\n"
+            "        \"error\": error_msg,\n"
+            "        \"hint\": hint,\n"
+            "        \"playwright_evaluate_signature\": \"page.evaluate(expression, arg?)\",\n"
+            "        \"mcp_arguments\": [\"expression\", \"await_promise\", \"page_id\"],\n"
+            "    }\n",
+            "debugging error signature metadata",
+        )
     if "async def evaluate_js(expression: str, await_promise: bool = True, page_id: str | None = None)" not in text:
         text = replace_once(
             text,

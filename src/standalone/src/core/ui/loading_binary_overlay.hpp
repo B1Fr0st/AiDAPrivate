@@ -21,7 +21,6 @@
 #include "../disasm/xref_index.hpp"
 #include "../editor/hex_view.hpp"
 #include "../infra/work_queue.hpp"
-#include "../infra/win_thread.hpp"
 #include "../infra/event_bus.hpp"
 #include "../analysis/initial_analysis.hpp"
 #include "../analysis/symbol_store.hpp"
@@ -615,24 +614,39 @@ inline void begin_load(const std::string& path, completion_action_t action = com
 	}
 	std::string captured_path = path;
 	completion_action_t captured_action = action;
-	std::string thread_err;
-	bool queued = aida::infra::win_thread::start_detached([captured_path, captured_action, generation]() {
-		detail::worker_load(captured_path, captured_action, generation);
-	}, &thread_err, aida::infra::win_thread::default_stack_reserve, "loading_binary_overlay.worker");
+	bool queued = false;
+	try {
+		queued = work_queue::post([captured_path, captured_action, generation]() {
+			const DWORD tid = GetCurrentThreadId();
+			const ULONGLONG start_ms = GetTickCount64();
+			diag::log_tagged_fmt("loading_binary_overlay",
+				"begin_load worker_enter path=%s action=%u generation=%llu tid=%lu",
+				captured_path.c_str(),
+				static_cast<unsigned int>(captured_action),
+				static_cast<unsigned long long>(generation),
+				static_cast<unsigned long>(tid));
+			detail::worker_load(captured_path, captured_action, generation);
+			diag::log_tagged_fmt("loading_binary_overlay",
+				"begin_load worker_exit path=%s generation=%llu tid=%lu elapsed_ms=%llu",
+				captured_path.c_str(),
+				static_cast<unsigned long long>(generation),
+				static_cast<unsigned long>(tid),
+				static_cast<unsigned long long>(GetTickCount64() - start_ms));
+		});
+	} catch (...) {
+		queued = false;
+	}
 	if (!queued) {
 		const auto qs = work_queue::stats();
 		diag::log_tagged_fmt("loading_binary_overlay",
-			"begin_load dedicated_worker_failed path=%s err=%s queue_alive=%d queue_pending=%llu queue_active=%u queue_started=%llu queue_finished=%llu",
+			"begin_load worker_post_failed path=%s queue_alive=%d queue_shutdown=%d queue_pending=%llu queue_active=%u queue_posted=%llu queue_rejected=%llu",
 			path.c_str(),
-			thread_err.c_str(),
 			qs.alive ? 1 : 0,
+			qs.shutting_down ? 1 : 0,
 			static_cast<unsigned long long>(qs.pending),
 			qs.active,
-			static_cast<unsigned long long>(qs.started),
-			static_cast<unsigned long long>(qs.finished));
-		queued = work_queue::post([captured_path, captured_action, generation]() {
-			detail::worker_load(captured_path, captured_action, generation);
-		});
+			static_cast<unsigned long long>(qs.posted),
+			static_cast<unsigned long long>(qs.rejected));
 	}
 	diag::log_tagged_fmt("loading_binary_overlay",
 		"begin_load accepted path=%s action=%u queued=%d generation=%llu",

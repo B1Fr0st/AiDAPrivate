@@ -2575,6 +2575,8 @@ void helpers::render_title()
 				"Sealing..."
 			};
 			int act_phase = globals::ui::license_activation_phase.load(std::memory_order_acquire);
+			if (standalone_license::is_arc_download_in_progress() && act_phase < 3)
+				act_phase = 3;
 			if (act_phase < 0) act_phase = 0;
 			if (act_phase > 4) act_phase = 4;
 

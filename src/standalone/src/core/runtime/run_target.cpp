@@ -21,6 +21,7 @@
 #include "run_target.hpp"
 #include "vm_guest_bridge.hpp"
 #include "standalone_driver.hpp"
+#include "../infra/work_queue.hpp"
 #include "../../helpers/diag_log.hpp"
 
 #include <atomic>
@@ -34,7 +35,6 @@
 #include <memory>
 #include <mutex>
 #include <string>
-#include <thread>
 #include <vector>
 
 #pragma comment(lib, "ole32.lib")
@@ -650,7 +650,18 @@ void spawn_watchdog_kill(HANDLE process_handle, HANDLE job_handle, uint32_t sec,
 	const uint32_t timeout_ms = sec * 1000u;
 	uint32_t local_pid = pid;
 	try {
-		std::thread([dup_proc, dup_job, timeout_ms, local_pid]() mutable {
+		const ULONGLONG post_ms = GetTickCount64();
+		const bool posted = work_queue::post([dup_proc, dup_job, timeout_ms, local_pid, post_ms]() mutable {
+			const ULONGLONG start_ms = GetTickCount64();
+			const DWORD tid = GetCurrentThreadId();
+			diag::log_tagged_critical_fmt("run_target",
+				"watchdog worker_enter pid=%u timeout_ms=%lu queued_ms=%llu tid=%lu dup_proc=%p dup_job=%p",
+				static_cast<unsigned>(local_pid),
+				static_cast<unsigned long>(timeout_ms),
+				static_cast<unsigned long long>(start_ms >= post_ms ? start_ms - post_ms : 0),
+				static_cast<unsigned long>(tid),
+				dup_proc,
+				dup_job);
 			DWORD w = WaitForSingleObject(dup_proc, timeout_ms);
 			if (w == WAIT_TIMEOUT) {
 				diag::log_tagged_critical_fmt("run_target",
@@ -665,7 +676,27 @@ void spawn_watchdog_kill(HANDLE process_handle, HANDLE job_handle, uint32_t sec,
 			}
 			if (dup_job) CloseHandle(dup_job);
 			CloseHandle(dup_proc);
-		}).detach();
+			diag::log_tagged_critical_fmt("run_target",
+				"watchdog worker_exit pid=%u wait=0x%08lX elapsed_ms=%llu tid=%lu",
+				static_cast<unsigned>(local_pid),
+				static_cast<unsigned long>(w),
+				static_cast<unsigned long long>(GetTickCount64() - start_ms),
+				static_cast<unsigned long>(tid));
+		});
+		if (!posted) {
+			const auto qs = work_queue::stats();
+			diag::log_tagged_critical_fmt("run_target",
+				"watchdog worker post failed pid=%u queue_alive=%d queue_shutdown=%d queue_pending=%llu queue_active=%u queue_posted=%llu queue_rejected=%llu",
+				static_cast<unsigned>(local_pid),
+				qs.alive ? 1 : 0,
+				qs.shutting_down ? 1 : 0,
+				static_cast<unsigned long long>(qs.pending),
+				qs.active,
+				static_cast<unsigned long long>(qs.posted),
+				static_cast<unsigned long long>(qs.rejected));
+			if (dup_job) CloseHandle(dup_job);
+			CloseHandle(dup_proc);
+		}
 	} catch (const std::exception& ex) {
 		diag::log_tagged_critical_fmt("run_target",
 			"watchdog worker unavailable pid=%u err=%s",

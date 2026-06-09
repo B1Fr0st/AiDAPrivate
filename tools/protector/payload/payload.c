@@ -69,6 +69,12 @@ typedef long (__stdcall *ldr_load_t)(uint16_t*, uint32_t*, unicode_string_t*, vo
 typedef int (__stdcall *vp_t)(void*, size_t, uint32_t, uint32_t*);
 typedef void* (__stdcall *ll_t)(const char*);
 typedef void* (__stdcall *gpa_t)(void*, const char*);
+typedef uint32_t (__stdcall *get_env_w_t)(const uint16_t*, uint16_t*, uint32_t);
+typedef void* (__stdcall *create_file_w_t)(const uint16_t*, uint32_t, uint32_t, void*, uint32_t, uint32_t, void*);
+typedef int (__stdcall *write_file_t)(void*, const void*, uint32_t, uint32_t*, void*);
+typedef int (__stdcall *close_handle_t)(void*);
+typedef uint32_t (__stdcall *get_u32_t)(void);
+typedef uint64_t (__stdcall *get_u64_t)(void);
 
 typedef struct resolved_s {
     void* ntdll;
@@ -161,10 +167,19 @@ typedef struct resource_fixup_s {
 #define HASH_NTQUERYSYSINFO 0xcac033026619e14aULL
 #define HASH_CHECKREMOTEDBG 0xe3549a1b1e8d41e1ULL
 #define HASH_SLEEP          0x503cbccd6a5cdea8ULL
+#define HASH_GETENVW        0x7cbbdeaeac1f88e5ULL
+#define HASH_CREATEFILEW    0xebc4dae9b1541624ULL
+#define HASH_WRITEFILE      0x2fa16c1d95e4306aULL
+#define HASH_CLOSEHANDLE    0x00556a045b10de85ULL
+#define HASH_GETPID         0xc739cdb562a88e60ULL
+#define HASH_GETTID         0x91e1cbfb1d7bcb35ULL
+#define HASH_GETTICK64      0x228a6fe4178f3b37ULL
 
 #define IMG_MAGIC           0x41504B44u
 #define IMG_VERSION_LEGACY  0x00020000u
 #define IMG_VERSION_MATRYO  0x00030000u
+#define IMG_UNPACK_BUSY     0xA1DA7557u
+#define IMG_UNPACK_DONE     0xA1DA7558u
 #define IMG_NT_SIGNATURE    0x00004550u
 #define IMG_OPT64_MAGIC     0x020Bu
 #define IMG_AUX_BLOCK_SIZE  368u
@@ -181,6 +196,39 @@ typedef struct resource_fixup_s {
 #define PAGE_R              0x02u
 #define PAGE_NA             0x01u
 #define MEM_RELEASE         0x8000u
+#define APL_FILE_APPEND_DATA 0x00000004u
+#define APL_FILE_SHARE_ALL  0x00000007u
+#define APL_OPEN_ALWAYS     4u
+#define APL_FILE_NORMAL     0x00000080u
+
+#define APL_EVENT_UNPACK_ENTER          0x1001u
+#define APL_EVENT_RESOLVE_FAIL          0x1002u
+#define APL_EVENT_RESOLVE_OK            0x1003u
+#define APL_EVENT_ENV_ENTER             0x1004u
+#define APL_EVENT_ENV_EXIT              0x1005u
+#define APL_EVENT_HOSTILE               0x1006u
+#define APL_EVENT_PACKED_FOUND          0x1007u
+#define APL_EVENT_VALIDATE_FAIL         0x1008u
+#define APL_EVENT_VALIDATE_OK           0x1009u
+#define APL_EVENT_ALREADY_DONE          0x100Au
+#define APL_EVENT_BUSY_WAIT             0x100Bu
+#define APL_EVENT_BUSY_DONE             0x100Cu
+#define APL_EVENT_MASTER_DERIVED        0x100Du
+#define APL_EVENT_PHASE_ENTER           0x100Eu
+#define APL_EVENT_PHASE_EXIT            0x100Fu
+#define APL_EVENT_UNPACK_DONE           0x1010u
+#define APL_EVENT_SECTIONS_START        0x2001u
+#define APL_EVENT_SECTIONS_ALLOC_FAIL   0x2002u
+#define APL_EVENT_SECTION_ENTER         0x2003u
+#define APL_EVENT_SECTION_EXIT          0x2004u
+#define APL_EVENT_IMPORT_START          0x3001u
+#define APL_EVENT_IMPORT_ALLOC_FAIL     0x3002u
+#define APL_EVENT_IMPORT_LOAD_ENTER     0x3003u
+#define APL_EVENT_IMPORT_LOAD_EXIT      0x3004u
+#define APL_EVENT_IMPORT_RESOLVE_ENTER  0x3005u
+#define APL_EVENT_IMPORT_MISSING_MOD    0x3006u
+#define APL_EVENT_IMPORT_MISSING_FUNC   0x3007u
+#define APL_EVENT_IMPORT_DONE           0x3008u
 
 #define IMG_SCN_EXEC        0x20000000u
 #define IMG_SCN_READ        0x40000000u
@@ -1414,6 +1462,275 @@ static int resolve_all(resolved_t* r) {
         && r->LoadLibraryA != 0;
 }
 
+typedef struct payload_log_apis_s {
+    get_env_w_t GetEnvironmentVariableW;
+    create_file_w_t CreateFileW;
+    write_file_t WriteFile;
+    close_handle_t CloseHandle;
+    get_u32_t GetCurrentProcessId;
+    get_u32_t GetCurrentThreadId;
+    get_u64_t GetTickCount64;
+} payload_log_apis_t;
+
+static void* payload_resolve_kernel_export(void* kernel32_local, void* kernelbase_local, uint64_t hash) {
+    void* p = 0;
+    if (kernel32_local != 0) {
+        p = resolve_export(kernel32_local, hash, 0, 0, 0);
+    }
+    if (p == 0 && kernelbase_local != 0) {
+        p = resolve_export(kernelbase_local, hash, 0, 0, 0);
+    }
+    return p;
+}
+
+static int payload_resolve_log_apis(payload_log_apis_t* out) {
+    mem_set(out, 0, sizeof(*out));
+    void* kernel32_local = find_module(HASH_KERNEL32);
+    void* kernelbase_local = find_module(HASH_KERNELBASE);
+    if (kernel32_local == 0 && kernelbase_local == 0) {
+        return 0;
+    }
+    out->GetEnvironmentVariableW = (get_env_w_t)payload_resolve_kernel_export(kernel32_local, kernelbase_local, HASH_GETENVW);
+    out->CreateFileW = (create_file_w_t)payload_resolve_kernel_export(kernel32_local, kernelbase_local, HASH_CREATEFILEW);
+    out->WriteFile = (write_file_t)payload_resolve_kernel_export(kernel32_local, kernelbase_local, HASH_WRITEFILE);
+    out->CloseHandle = (close_handle_t)payload_resolve_kernel_export(kernel32_local, kernelbase_local, HASH_CLOSEHANDLE);
+    out->GetCurrentProcessId = (get_u32_t)payload_resolve_kernel_export(kernel32_local, kernelbase_local, HASH_GETPID);
+    out->GetCurrentThreadId = (get_u32_t)payload_resolve_kernel_export(kernel32_local, kernelbase_local, HASH_GETTID);
+    out->GetTickCount64 = (get_u64_t)payload_resolve_kernel_export(kernel32_local, kernelbase_local, HASH_GETTICK64);
+    return out->GetEnvironmentVariableW != 0
+        && out->CreateFileW != 0
+        && out->WriteFile != 0
+        && out->CloseHandle != 0;
+}
+
+static void payload_wput(uint16_t* s, size_t* p, size_t cap, uint16_t ch) {
+    if (*p + 1u < cap) {
+        s[*p] = ch;
+        *p += 1u;
+    }
+}
+
+static void payload_make_trace_env(uint16_t* s, size_t cap) {
+    size_t p = 0;
+    payload_wput(s, &p, cap, 'A');
+    payload_wput(s, &p, cap, 'I');
+    payload_wput(s, &p, cap, 'D');
+    payload_wput(s, &p, cap, 'A');
+    payload_wput(s, &p, cap, '_');
+    payload_wput(s, &p, cap, 'P');
+    payload_wput(s, &p, cap, 'A');
+    payload_wput(s, &p, cap, 'Y');
+    payload_wput(s, &p, cap, 'L');
+    payload_wput(s, &p, cap, 'O');
+    payload_wput(s, &p, cap, 'A');
+    payload_wput(s, &p, cap, 'D');
+    payload_wput(s, &p, cap, '_');
+    payload_wput(s, &p, cap, 'T');
+    payload_wput(s, &p, cap, 'R');
+    payload_wput(s, &p, cap, 'A');
+    payload_wput(s, &p, cap, 'C');
+    payload_wput(s, &p, cap, 'E');
+    s[p] = 0;
+}
+
+static void payload_make_temp_env(uint16_t* s, size_t cap, int tmp) {
+    size_t p = 0;
+    payload_wput(s, &p, cap, 'T');
+    payload_wput(s, &p, cap, 'M');
+    if (tmp) {
+        payload_wput(s, &p, cap, 'P');
+    } else {
+        payload_wput(s, &p, cap, 'E');
+        payload_wput(s, &p, cap, 'M');
+        payload_wput(s, &p, cap, 'P');
+    }
+    s[p] = 0;
+}
+
+static int payload_trace_enabled(const payload_log_apis_t* api) {
+    uint16_t name[24];
+    uint16_t val[16];
+    payload_make_trace_env(name, 24);
+    mem_set(val, 0, sizeof(val));
+    uint32_t got = api->GetEnvironmentVariableW(name, val, 16);
+    if (got == 0u || got >= 16u) {
+        return 0;
+    }
+    if (val[0] == (uint16_t)'0' && (got == 1u || val[1] == 0)) {
+        return 0;
+    }
+    return 1;
+}
+
+static void payload_append_log_name(uint16_t* path, size_t* p, size_t cap) {
+    payload_wput(path, p, cap, 'a');
+    payload_wput(path, p, cap, 'i');
+    payload_wput(path, p, cap, 'd');
+    payload_wput(path, p, cap, 'a');
+    payload_wput(path, p, cap, '_');
+    payload_wput(path, p, cap, 'b');
+    payload_wput(path, p, cap, 'o');
+    payload_wput(path, p, cap, 'o');
+    payload_wput(path, p, cap, 't');
+    payload_wput(path, p, cap, 's');
+    payload_wput(path, p, cap, 't');
+    payload_wput(path, p, cap, 'r');
+    payload_wput(path, p, cap, 'a');
+    payload_wput(path, p, cap, 'p');
+    payload_wput(path, p, cap, '.');
+    payload_wput(path, p, cap, 'l');
+    payload_wput(path, p, cap, 'o');
+    payload_wput(path, p, cap, 'g');
+}
+
+static int payload_build_log_path(const payload_log_apis_t* api, uint16_t* path, size_t cap) {
+    uint16_t env_name[8];
+    payload_make_temp_env(env_name, 8, 0);
+    uint32_t got = api->GetEnvironmentVariableW(env_name, path, (uint32_t)cap);
+    if (got == 0u || got + 32u >= cap) {
+        payload_make_temp_env(env_name, 8, 1);
+        got = api->GetEnvironmentVariableW(env_name, path, (uint32_t)cap);
+    }
+    size_t p = 0;
+    if (got == 0u || got + 32u >= cap) {
+        payload_wput(path, &p, cap, 'C');
+        payload_wput(path, &p, cap, ':');
+        payload_wput(path, &p, cap, '\\');
+        payload_wput(path, &p, cap, 'W');
+        payload_wput(path, &p, cap, 'i');
+        payload_wput(path, &p, cap, 'n');
+        payload_wput(path, &p, cap, 'd');
+        payload_wput(path, &p, cap, 'o');
+        payload_wput(path, &p, cap, 'w');
+        payload_wput(path, &p, cap, 's');
+        payload_wput(path, &p, cap, '\\');
+        payload_wput(path, &p, cap, 'T');
+        payload_wput(path, &p, cap, 'e');
+        payload_wput(path, &p, cap, 'm');
+        payload_wput(path, &p, cap, 'p');
+    } else {
+        p = (size_t)got;
+    }
+    if (p == 0u || p + 32u >= cap) {
+        return 0;
+    }
+    if (path[p - 1u] != (uint16_t)'\\' && path[p - 1u] != (uint16_t)'/') {
+        payload_wput(path, &p, cap, '\\');
+    }
+    payload_append_log_name(path, &p, cap);
+    if (p + 1u >= cap) {
+        return 0;
+    }
+    path[p] = 0;
+    return 1;
+}
+
+static void payload_aput(char* s, size_t* p, size_t cap, char ch) {
+    if (*p + 1u < cap) {
+        s[*p] = ch;
+        *p += 1u;
+    }
+}
+
+static void payload_append_dec64(char* s, size_t* p, size_t cap, uint64_t v) {
+    char tmp[24];
+    size_t n = 0;
+    if (v == 0u) {
+        payload_aput(s, p, cap, '0');
+        return;
+    }
+    while (v != 0u && n < sizeof(tmp)) {
+        uint64_t q = v / 10u;
+        uint64_t r = v - q * 10u;
+        tmp[n++] = (char)('0' + (char)r);
+        v = q;
+    }
+    while (n > 0u) {
+        payload_aput(s, p, cap, tmp[--n]);
+    }
+}
+
+static void payload_append_hex64(char* s, size_t* p, size_t cap, uint64_t v, uint32_t digits) {
+    for (int32_t i = (int32_t)digits - 1; i >= 0; --i) {
+        uint8_t n = (uint8_t)((v >> ((uint32_t)i * 4u)) & 0x0Fu);
+        payload_aput(s, p, cap, (char)(n < 10u ? ('0' + n) : ('A' + (n - 10u))));
+    }
+}
+
+static void payload_log_event(uint32_t event_id, uint64_t a, uint64_t b, uint64_t c) {
+    payload_log_apis_t api;
+    if (!payload_resolve_log_apis(&api)) {
+        return;
+    }
+    if (!payload_trace_enabled(&api)) {
+        return;
+    }
+    uint16_t path[384];
+    mem_set(path, 0, sizeof(path));
+    if (!payload_build_log_path(&api, path, 384)) {
+        return;
+    }
+    void* h = api.CreateFileW(path, APL_FILE_APPEND_DATA, APL_FILE_SHARE_ALL, 0, APL_OPEN_ALWAYS, APL_FILE_NORMAL, 0);
+    if (h == 0 || h == (void*)(intptr_t)-1) {
+        return;
+    }
+    char line[448];
+    size_t p = 0;
+    payload_aput(line, &p, sizeof(line), '[');
+    payload_aput(line, &p, sizeof(line), 'P');
+    payload_aput(line, &p, sizeof(line), 'A');
+    payload_aput(line, &p, sizeof(line), 'Y');
+    payload_aput(line, &p, sizeof(line), 'L');
+    payload_aput(line, &p, sizeof(line), 'O');
+    payload_aput(line, &p, sizeof(line), 'A');
+    payload_aput(line, &p, sizeof(line), 'D');
+    payload_aput(line, &p, sizeof(line), ']');
+    payload_aput(line, &p, sizeof(line), ' ');
+    payload_aput(line, &p, sizeof(line), 't');
+    payload_aput(line, &p, sizeof(line), 'i');
+    payload_aput(line, &p, sizeof(line), 'c');
+    payload_aput(line, &p, sizeof(line), 'k');
+    payload_aput(line, &p, sizeof(line), '=');
+    payload_append_dec64(line, &p, sizeof(line), api.GetTickCount64 != 0 ? api.GetTickCount64() : 0u);
+    payload_aput(line, &p, sizeof(line), ' ');
+    payload_aput(line, &p, sizeof(line), 'p');
+    payload_aput(line, &p, sizeof(line), 'i');
+    payload_aput(line, &p, sizeof(line), 'd');
+    payload_aput(line, &p, sizeof(line), '=');
+    payload_append_dec64(line, &p, sizeof(line), api.GetCurrentProcessId != 0 ? api.GetCurrentProcessId() : 0u);
+    payload_aput(line, &p, sizeof(line), ' ');
+    payload_aput(line, &p, sizeof(line), 't');
+    payload_aput(line, &p, sizeof(line), 'i');
+    payload_aput(line, &p, sizeof(line), 'd');
+    payload_aput(line, &p, sizeof(line), '=');
+    payload_append_dec64(line, &p, sizeof(line), api.GetCurrentThreadId != 0 ? api.GetCurrentThreadId() : 0u);
+    payload_aput(line, &p, sizeof(line), ' ');
+    payload_aput(line, &p, sizeof(line), 'e');
+    payload_aput(line, &p, sizeof(line), 'v');
+    payload_aput(line, &p, sizeof(line), 'e');
+    payload_aput(line, &p, sizeof(line), 'n');
+    payload_aput(line, &p, sizeof(line), 't');
+    payload_aput(line, &p, sizeof(line), '=');
+    payload_append_hex64(line, &p, sizeof(line), (uint64_t)event_id, 8u);
+    payload_aput(line, &p, sizeof(line), ' ');
+    payload_aput(line, &p, sizeof(line), 'a');
+    payload_aput(line, &p, sizeof(line), '=');
+    payload_append_hex64(line, &p, sizeof(line), a, 16u);
+    payload_aput(line, &p, sizeof(line), ' ');
+    payload_aput(line, &p, sizeof(line), 'b');
+    payload_aput(line, &p, sizeof(line), '=');
+    payload_append_hex64(line, &p, sizeof(line), b, 16u);
+    payload_aput(line, &p, sizeof(line), ' ');
+    payload_aput(line, &p, sizeof(line), 'c');
+    payload_aput(line, &p, sizeof(line), '=');
+    payload_append_hex64(line, &p, sizeof(line), c, 16u);
+    payload_aput(line, &p, sizeof(line), '\r');
+    payload_aput(line, &p, sizeof(line), '\n');
+    uint32_t written = 0;
+    api.WriteFile(h, line, (uint32_t)p, &written, 0);
+    api.CloseHandle(h);
+}
+
 static uint8_t* find_packed_section(uint8_t* image_base, uint32_t* out_size) {
     uint32_t image_size = image_size_from_headers(image_base);
     if (image_size == 0u) {
@@ -1496,6 +1813,7 @@ static void unpack_sections(uint8_t* image_base, const uint8_t master[32],
                             uint8_t* packed_base, const packed_header_t* hdr,
                             const resolved_t* r) {
     if (hdr->section_count == 0) {
+        payload_log_event(APL_EVENT_SECTIONS_START, 0u, 0u, 0u);
         return;
     }
     section_descriptor_t* descs = (section_descriptor_t*)(packed_base + hdr->section_table_offset);
@@ -1506,10 +1824,13 @@ static void unpack_sections(uint8_t* image_base, const uint8_t master[32],
         }
     }
     if (max_enc == 0) {
+        payload_log_event(APL_EVENT_SECTIONS_START, hdr->section_count, 0u, 0u);
         return;
     }
+    payload_log_event(APL_EVENT_SECTIONS_START, hdr->section_count, (uint64_t)max_enc, 0u);
     uint8_t* scratch = (uint8_t*)alloc_scratch(r, max_enc);
     if (scratch == 0) {
+        payload_log_event(APL_EVENT_SECTIONS_ALLOC_FAIL, hdr->section_count, (uint64_t)max_enc, 0u);
         return;
     }
     uint8_t hwid_anchor[32];
@@ -1525,6 +1846,10 @@ static void unpack_sections(uint8_t* image_base, const uint8_t master[32],
         if (d->encrypted_size == 0 || d->original_virtual_size == 0) {
             continue;
         }
+        payload_log_event(APL_EVENT_SECTION_ENTER,
+                          i,
+                          d->original_rva,
+                          ((uint64_t)d->original_virtual_size << 32) | (uint64_t)d->encrypted_size);
         mem_copy(scratch, packed_base + d->blob_offset, d->encrypted_size);
         if (d->layers_applied >= MATRYOSHKA_LAYERS_FULL) {
             uint8_t l3_key[16];
@@ -1547,6 +1872,7 @@ static void unpack_sections(uint8_t* image_base, const uint8_t master[32],
         lz_decompress(scratch, d->compressed_size, image_base + d->original_rva, d->original_virtual_size);
         uint32_t pp = chars_to_protect(d->original_characteristics);
         protect_region(r, image_base + d->original_rva, d->original_virtual_size, pp, &old);
+        payload_log_event(APL_EVENT_SECTION_EXIT, i, d->original_rva, pp);
     }
     free_scratch(r, scratch);
 }
@@ -1555,18 +1881,21 @@ static void rebuild_iat(uint8_t* image_base, const uint8_t master[32],
                         uint8_t* packed_base, const packed_header_t* hdr,
                         const resolved_t* r) {
     if (hdr->import_count == 0 || hdr->import_table_offset == 0) {
+        payload_log_event(APL_EVENT_IMPORT_START, 0u, 0u, 0u);
         return;
     }
     uint8_t* tbl = packed_base + hdr->import_table_offset;
     uint32_t count = *(uint32_t*)tbl;
     import_entry_t* entries = (import_entry_t*)(tbl + 4);
     uint32_t pool_size = *(uint32_t*)(tbl + 4 + count * 24u);
+    payload_log_event(APL_EVENT_IMPORT_START, count, pool_size, hdr->import_count);
     uint8_t* pool_enc = tbl + 4 + count * 24u + 4;
     uint64_t k64 = siphash_2_4(master, 32, 0x494D504F5254434EULL, 0x494D504F5254434EULL);
     uint8_t kb[8];
     mem_copy(kb, &k64, 8);
     uint8_t* pool_local = (uint8_t*)alloc_scratch(r, pool_size > 0 ? pool_size : 16);
     if (pool_local == 0) {
+        payload_log_event(APL_EVENT_IMPORT_ALLOC_FAIL, count, pool_size, 0u);
         return;
     }
     for (uint32_t i = 0; i < pool_size; ++i) {
@@ -1575,6 +1904,9 @@ static void rebuild_iat(uint8_t* image_base, const uint8_t master[32],
     void* loaded[64];
     uint64_t loaded_h[64];
     uint32_t n_loaded = 0;
+    uint32_t resolved_count = 0;
+    uint32_t missing_mod = 0;
+    uint32_t missing_func = 0;
     for (uint32_t i = 0; i < count; ++i) {
         import_entry_t* e = &entries[i];
         void* mod = 0;
@@ -1605,10 +1937,14 @@ static void rebuild_iat(uint8_t* image_base, const uint8_t master[32],
                             uint64_t host_hash = fnv1a64_a_upper(host_name, host_len);
                             mod = find_module(host_hash);
                             if (mod == 0) {
+                                payload_log_event(APL_EVENT_IMPORT_LOAD_ENTER, i, e->dll_hash, host_hash);
                                 mod = r->LoadLibraryA(host_name);
+                                payload_log_event(APL_EVENT_IMPORT_LOAD_EXIT, i, e->dll_hash, (uint64_t)(uintptr_t)mod);
                             }
                         } else {
+                            payload_log_event(APL_EVENT_IMPORT_LOAD_ENTER, i, e->dll_hash, (uint64_t)nl);
                             mod = r->LoadLibraryA(dll_name);
+                            payload_log_event(APL_EVENT_IMPORT_LOAD_EXIT, i, e->dll_hash, (uint64_t)(uintptr_t)mod);
                         }
                         found = 1;
                         break;
@@ -1619,6 +1955,8 @@ static void rebuild_iat(uint8_t* image_base, const uint8_t master[32],
             (void)found;
         }
         if (mod == 0) {
+            ++missing_mod;
+            payload_log_event(APL_EVENT_IMPORT_MISSING_MOD, i, e->dll_hash, 0u);
             continue;
         }
         if (n_loaded < 64) {
@@ -1636,12 +1974,18 @@ static void rebuild_iat(uint8_t* image_base, const uint8_t master[32],
             }
         }
         void* fp = 0;
+        payload_log_event(APL_EVENT_IMPORT_RESOLVE_ENTER,
+                          i,
+                          e->iat_rva,
+                          (e->flags & 0x1u) ? ((uint64_t)0x8000000000000000ULL | (uint64_t)e->ordinal) : e->func_hash);
         if (e->flags & 0x1u) {
             fp = resolve_export(mod, 0, e->ordinal, 1, 0);
         } else {
             fp = resolve_export(mod, e->func_hash, 0, 0, 0);
         }
         if (fp == 0) {
+            ++missing_func;
+            payload_log_event(APL_EVENT_IMPORT_MISSING_FUNC, i, e->func_hash, e->flags);
             continue;
         }
         uint64_t* slot = (uint64_t*)(image_base + e->iat_rva);
@@ -1650,7 +1994,12 @@ static void rebuild_iat(uint8_t* image_base, const uint8_t master[32],
         *slot = (uint64_t)(uintptr_t)fp;
         uint32_t old2 = 0;
         protect_region(r, slot, 8, old, &old2);
+        ++resolved_count;
     }
+    payload_log_event(APL_EVENT_IMPORT_DONE,
+                      resolved_count,
+                      ((uint64_t)missing_mod << 32) | (uint64_t)missing_func,
+                      n_loaded);
     free_scratch(r, pool_local);
 }
 
@@ -2250,28 +2599,62 @@ static void env_react_to_hostile(int reason, const resolved_t* r) {
 
 void __cdecl aida_unpack(void* image_base_arg) {
     uint8_t* image_base = (uint8_t*)image_base_arg;
+    payload_log_event(APL_EVENT_UNPACK_ENTER, (uint64_t)(uintptr_t)image_base, 0u, 0u);
     if (image_base == 0) {
         for (;;) { }
     }
     resolved_t r;
     mem_set(&r, 0, sizeof(r));
     if (!resolve_all(&r)) {
+        payload_log_event(APL_EVENT_RESOLVE_FAIL, (uint64_t)(uintptr_t)image_base, 0u, 0u);
         for (;;) { }
     }
+    payload_log_event(APL_EVENT_RESOLVE_OK,
+                      (uint64_t)(uintptr_t)r.ntdll,
+                      (uint64_t)(uintptr_t)r.kernel32,
+                      (uint64_t)(uintptr_t)r.kernelbase);
+    payload_log_event(APL_EVENT_ENV_ENTER, 0u, 0u, 0u);
     int env_status = runtime_environment_check();
+    payload_log_event(APL_EVENT_ENV_EXIT, (uint64_t)(uint32_t)env_status, 0u, 0u);
     if (env_status != 0) {
+        payload_log_event(APL_EVENT_HOSTILE, (uint64_t)(uint32_t)env_status, 0u, 0u);
         env_react_to_hostile(env_status, &r);
         for (;;) { }
     }
     uint32_t packed_vsize = 0;
     uint8_t* packed_base = find_packed_section(image_base, &packed_vsize);
     if (packed_base == 0) {
+        payload_log_event(APL_EVENT_PACKED_FOUND, 0u, 0u, 0u);
         __fastfail(0xA1DA0001u);
     }
+    payload_log_event(APL_EVENT_PACKED_FOUND, (uint64_t)(uintptr_t)packed_base, packed_vsize, 0u);
     packed_header_t* hdr = (packed_header_t*)packed_base;
     if (!validate_packed_header(image_base, packed_base, packed_vsize, hdr)) {
+        payload_log_event(APL_EVENT_VALIDATE_FAIL,
+                          (uint64_t)(uintptr_t)packed_base,
+                          packed_vsize,
+                          hdr != 0 ? hdr->version : 0u);
         __fastfail(0xA1DA0002u);
     }
+    payload_log_event(APL_EVENT_VALIDATE_OK,
+                      hdr->section_count,
+                      hdr->import_count,
+                      ((uint64_t)hdr->string_fixup_count << 32) | (uint64_t)hdr->resource_fixup_count);
+    if (hdr->reserved[0] == IMG_UNPACK_DONE) {
+        payload_log_event(APL_EVENT_ALREADY_DONE, (uint64_t)(uintptr_t)packed_base, hdr->reserved[0], 0u);
+        return;
+    }
+    if (hdr->reserved[0] == IMG_UNPACK_BUSY) {
+        payload_log_event(APL_EVENT_BUSY_WAIT, (uint64_t)(uintptr_t)packed_base, hdr->reserved[0], 0u);
+        for (;;) {
+            if (hdr->reserved[0] == IMG_UNPACK_DONE) {
+                payload_log_event(APL_EVENT_BUSY_DONE, (uint64_t)(uintptr_t)packed_base, hdr->reserved[0], 0u);
+                return;
+            }
+            _mm_pause();
+        }
+    }
+    hdr->reserved[0] = IMG_UNPACK_BUSY;
     uint8_t* obfuscated = packed_base + hdr->master_key_offset;
     uint8_t* mask = obfuscated + 32;
     uint8_t pe_mask[32];
@@ -2298,9 +2681,25 @@ void __cdecl aida_unpack(void* image_base_arg) {
             }
         }
     }
+    payload_log_event(APL_EVENT_MASTER_DERIVED,
+                      hdr->bind_flags,
+                      hdr->master_key_pe_timestamp,
+                      hdr->master_key_pe_size_of_code);
+    payload_log_event(APL_EVENT_PHASE_ENTER, 1u, 0u, 0u);
     unpack_sections(image_base, master, packed_base, hdr, &r);
+    payload_log_event(APL_EVENT_PHASE_EXIT, 1u, 0u, 0u);
+    payload_log_event(APL_EVENT_PHASE_ENTER, 2u, 0u, 0u);
     rebuild_iat(image_base, master, packed_base, hdr, &r);
+    payload_log_event(APL_EVENT_PHASE_EXIT, 2u, 0u, 0u);
+    payload_log_event(APL_EVENT_PHASE_ENTER, 3u, hdr->string_fixup_count, 0u);
     decrypt_strings(image_base, master, packed_base, hdr, &r);
+    payload_log_event(APL_EVENT_PHASE_EXIT, 3u, hdr->string_fixup_count, 0u);
+    payload_log_event(APL_EVENT_PHASE_ENTER, 4u, hdr->resource_fixup_count, 0u);
     decrypt_resources(image_base, packed_base, hdr, &r);
+    payload_log_event(APL_EVENT_PHASE_EXIT, 4u, hdr->resource_fixup_count, 0u);
+    payload_log_event(APL_EVENT_PHASE_ENTER, 5u, 0u, 0u);
     apply_relocations(image_base, &r);
+    payload_log_event(APL_EVENT_PHASE_EXIT, 5u, 0u, 0u);
+    hdr->reserved[0] = IMG_UNPACK_DONE;
+    payload_log_event(APL_EVENT_UNPACK_DONE, (uint64_t)(uintptr_t)image_base, (uint64_t)(uintptr_t)packed_base, 0u);
 }

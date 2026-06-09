@@ -4,6 +4,7 @@
 #include <shlobj.h>
 
 #include "cert_generator.hpp"
+#include "../infra/work_queue.hpp"
 #include "helpers/diag_log.hpp"
 
 #include <openssl/bn.h>
@@ -20,12 +21,12 @@
 #include <climits>
 #include <cctype>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <limits>
 #include <memory>
 #include <mutex>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -80,9 +81,8 @@ static bool run_cert_store_operation_bounded(const char* op_name,
 
     auto state = std::make_shared<cert_store_async_state_t>();
     std::string op = op_name ? op_name : "cert_store_operation";
-    std::thread worker;
     try {
-        worker = std::thread([state, op, fn = std::move(fn)]() mutable {
+        if (!work_queue::post([state, op, fn = std::move(fn)]() mutable {
             const ULONGLONG t0 = GetTickCount64();
             diag::log_tagged_fmt("cert", "%s worker_entry tid=%lu active_workers=%ld",
                 op.c_str(),
@@ -103,7 +103,6 @@ static bool run_cert_store_operation_bounded(const char* op_name,
             state->gle.store(result.gle, std::memory_order_release);
             state->detail.store(result.detail, std::memory_order_release);
             state->elapsed_ms.store(static_cast<unsigned long long>(elapsed), std::memory_order_release);
-            state->done.store(true, std::memory_order_release);
             diag::log_tagged_fmt("cert", "%s worker_exit ok=%d gle=%lu detail=%lu elapsed_ms=%llu",
                 op.c_str(),
                 result.ok ? 1 : 0,
@@ -111,11 +110,35 @@ static bool run_cert_store_operation_bounded(const char* op_name,
                 static_cast<unsigned long>(result.detail),
                 static_cast<unsigned long long>(elapsed));
             g_cert_store_workers.fetch_sub(1, std::memory_order_acq_rel);
-        });
+            state->done.store(true, std::memory_order_release);
+        })) {
+            DWORD start_gle = ERROR_NOT_READY;
+            g_cert_store_workers.fetch_sub(1, std::memory_order_acq_rel);
+            diag::log_tagged_fmt("cert", "%s worker_post_failed gle=%lu",
+                op.c_str(),
+                static_cast<unsigned long>(start_gle));
+            if (gle_out) *gle_out = start_gle;
+            if (detail_out) *detail_out = 0;
+            return false;
+        }
+    } catch (const std::exception& ex) {
+        g_cert_store_workers.fetch_sub(1, std::memory_order_acq_rel);
+        DWORD start_gle = GetLastError();
+        if (start_gle == ERROR_SUCCESS)
+            start_gle = ERROR_NOT_ENOUGH_MEMORY;
+        diag::log_tagged_fmt("cert", "%s worker_post_failed err=%s gle=%lu",
+            op.c_str(), ex.what(), static_cast<unsigned long>(start_gle));
+        if (gle_out) *gle_out = start_gle;
+        if (detail_out) *detail_out = 0;
+        return false;
     } catch (...) {
         g_cert_store_workers.fetch_sub(1, std::memory_order_acq_rel);
-        diag::log_tagged_fmt("cert", "%s worker_start_failed", op.c_str());
-        if (gle_out) *gle_out = ERROR_NOT_ENOUGH_MEMORY;
+        DWORD start_gle = GetLastError();
+        if (start_gle == ERROR_SUCCESS)
+            start_gle = ERROR_NOT_ENOUGH_MEMORY;
+        diag::log_tagged_fmt("cert", "%s worker_post_failed err=unknown gle=%lu",
+            op.c_str(), static_cast<unsigned long>(start_gle));
+        if (gle_out) *gle_out = start_gle;
         if (detail_out) *detail_out = 0;
         return false;
     }
@@ -123,8 +146,6 @@ static bool run_cert_store_operation_bounded(const char* op_name,
     const ULONGLONG wait_start = GetTickCount64();
     for (;;) {
         if (state->done.load(std::memory_order_acquire)) {
-            if (worker.joinable())
-                worker.join();
             const DWORD gle = state->gle.load(std::memory_order_acquire);
             const DWORD detail = state->detail.load(std::memory_order_acquire);
             const bool ok = state->ok.load(std::memory_order_acquire) != 0;
@@ -141,8 +162,6 @@ static bool run_cert_store_operation_bounded(const char* op_name,
         }
         const ULONGLONG elapsed = GetTickCount64() - wait_start;
         if (elapsed >= timeout_ms) {
-            if (worker.joinable())
-                worker.detach();
             if (gle_out) *gle_out = ERROR_TIMEOUT;
             if (detail_out) *detail_out = static_cast<DWORD>(elapsed > 0xFFFFFFFFULL ? 0xFFFFFFFFUL : elapsed);
             diag::log_tagged_fmt("cert", "%s timeout timeout_ms=%lu waited_ms=%llu active_workers=%ld",

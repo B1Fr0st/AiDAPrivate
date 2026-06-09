@@ -1188,6 +1188,7 @@ inline int run(const config_t& cfg) {
     stub_cfg.string_table_offset = result.layout.string_table_offset;
     stub_cfg.resource_table_offset = result.layout.resource_table_offset;
     stub_cfg.master_key_offset = result.layout.master_key_offset;
+    stub_cfg.stub_code_offset = result.layout.stub_offset;
     stub_cfg.seed = result.seed_used;
     stub_cfg.polymorphic = cfg.polymorphic_stub;
 
@@ -1245,7 +1246,16 @@ inline int run(const config_t& cfg) {
         const uint32_t tls_rva = result.packed_section_rva
                                  + result.layout.tls_stub_offset
                                  + gen.tls_stub_entry_offset;
-        tls_installed = protector::install_tls_callback(pe, tls_rva);
+        const uint32_t tls_callback_list_rva = result.layout.tls_callback_array_offset != 0u
+            ? result.packed_section_rva + result.layout.tls_callback_array_offset
+            : 0u;
+        const uint32_t tls_callback_list_capacity = result.layout.tls_callback_array_offset != 0u
+            ? static_cast<uint32_t>(pe.tls.callback_rvas.size() + 2u)
+            : 0u;
+        tls_installed = protector::install_tls_callback(pe,
+                                                        tls_rva,
+                                                        tls_callback_list_rva,
+                                                        tls_callback_list_capacity);
     }
 
     bool flatten_applied = false;

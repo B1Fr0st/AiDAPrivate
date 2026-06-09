@@ -429,7 +429,7 @@ tool_result_t tls_stop_keylog(const json&) {
 tool_result_t tls_get_extracted_keys(const json&) {
     diag::log_tagged("net_sec", "tls_get_extracted_keys entry");
     auto& ext = net_security::TlsKeyExtractor::instance();
-    auto& seen = ext.get_seen_keys();
+    auto seen = ext.get_seen_keys();
     diag::log_tagged_fmt("net_sec", "tls_get_extracted_keys total_keys=%zu", seen.size());
 
     json result;

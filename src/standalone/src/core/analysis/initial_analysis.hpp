@@ -31,7 +31,6 @@
 #include "function_index.hpp"
 #include "xref_index.hpp"
 #include "work_queue.hpp"
-#include "../infra/win_thread.hpp"
 #include "../../helpers/diag_log.hpp"
 #include "../../helpers/globals.h"
 #include "../anti-tamper/webhook.hpp"
@@ -1065,11 +1064,23 @@ inline void run_initial_analysis(const std::string& path, const std::string& fil
 				p.c_str(), n.c_str());
 		}
 	};
-	std::string thread_error;
-	bool posted = aida::infra::win_thread::start_detached(run_worker, &thread_error, aida::infra::win_thread::default_stack_reserve, "aida-initial-analysis");
-	if (!posted) {
-		detail::push_log_fmt("run_initial_analysis_thread_failed path=%s filename=%s err=%s", path.c_str(), filename.c_str(), thread_error.c_str());
+	bool posted = false;
+	try {
 		posted = work_queue::post(std::move(run_worker));
+	} catch (...) {
+		posted = false;
+	}
+	if (!posted) {
+		const auto qs = work_queue::stats();
+		detail::push_log_fmt("run_initial_analysis_post_failed_queue path=%s filename=%s alive=%d shutdown=%d pending=%llu active=%u posted=%llu rejected=%llu",
+			path.c_str(),
+			filename.c_str(),
+			qs.alive ? 1 : 0,
+			qs.shutting_down ? 1 : 0,
+			static_cast<unsigned long long>(qs.pending),
+			qs.active,
+			static_cast<unsigned long long>(qs.posted),
+			static_cast<unsigned long long>(qs.rejected));
 	}
 	detail::push_log_fmt("run_initial_analysis_post path=%s filename=%s posted=%d",
 		path.c_str(),

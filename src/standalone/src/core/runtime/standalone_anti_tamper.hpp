@@ -770,7 +770,7 @@ inline void start_monitors()
     bool posted = false;
     try
     {
-        posted = work_queue::post([]() {
+        posted = work_queue::post_service([]() {
             Sleep(5000);
 
             auto& rt = state::get();

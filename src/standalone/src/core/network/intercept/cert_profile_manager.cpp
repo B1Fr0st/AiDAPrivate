@@ -4,10 +4,11 @@
 
 #include "cert_profile_manager.hpp"
 #include "helpers/diag_log.hpp"
-#include "../../infra/win_thread.hpp"
+#include "../../infra/work_queue.hpp"
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <exception>
@@ -16,7 +17,6 @@
 #include <iterator>
 #include <memory>
 #include <sstream>
-#include <thread>
 #include <type_traits>
 #include <utility>
 
@@ -137,7 +137,7 @@ bounded_value_t<T> run_bounded_value(const char* tag,
         result.exception = ex.what();
         result.win32_error = GetLastError();
         result.elapsed_ms = elapsed_since(start_ms);
-        diag::log_tagged_fmt(tag, "%s thread_start_failed err=%s gle=%lu elapsed_ms=%llu",
+        diag::log_tagged_fmt(tag, "%s task_init_failed err=%s gle=%lu elapsed_ms=%llu",
             op, result.exception.c_str(), static_cast<unsigned long>(result.win32_error),
             static_cast<unsigned long long>(result.elapsed_ms));
         return result;
@@ -148,13 +148,12 @@ bounded_value_t<T> run_bounded_value(const char* tag,
         result.exception = "task_initialization_failed";
         result.win32_error = GetLastError();
         result.elapsed_ms = elapsed_since(start_ms);
-        diag::log_tagged_fmt(tag, "%s thread_start_failed err=%s gle=%lu elapsed_ms=%llu",
+        diag::log_tagged_fmt(tag, "%s task_init_failed err=%s gle=%lu elapsed_ms=%llu",
             op, result.exception.c_str(), static_cast<unsigned long>(result.win32_error),
             static_cast<unsigned long long>(result.elapsed_ms));
         return result;
     }
-    std::string thread_err;
-    const bool started = aida::infra::win_thread::start_detached([promise, start_ms, tag, op, task_ptr]() mutable {
+    const bool started = work_queue::post([promise, start_ms, tag, op, task_ptr]() mutable {
         bounded_value_t<T> result;
         SetLastError(ERROR_SUCCESS);
         try {
@@ -178,15 +177,15 @@ bounded_value_t<T> run_bounded_value(const char* tag,
             promise->set_value(std::move(result));
         } catch (...) {
         }
-    }, &thread_err, aida::infra::win_thread::default_stack_reserve, op);
+    });
     if (!started) {
         g_bounded_profile_workers.fetch_sub(1, std::memory_order_acq_rel);
         bounded_value_t<T> result;
         result.threw = true;
-        result.exception = thread_err.empty() ? "thread_start_failed" : thread_err;
-        result.win32_error = GetLastError();
+        result.exception = "work_queue_post_failed";
+        result.win32_error = ERROR_NOT_READY;
         result.elapsed_ms = elapsed_since(start_ms);
-        diag::log_tagged_fmt(tag, "%s thread_start_failed err=%s gle=%lu elapsed_ms=%llu",
+        diag::log_tagged_fmt(tag, "%s work_queue_post_failed err=%s gle=%lu elapsed_ms=%llu",
             op, result.exception.c_str(), static_cast<unsigned long>(result.win32_error),
             static_cast<unsigned long long>(result.elapsed_ms));
         return result;
@@ -266,6 +265,131 @@ bool file_exists(const std::string& path) {
     return attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+constexpr uint64_t kMaxProfileFileBytes = 16ull * 1024ull * 1024ull;
+
+std::string win32_error_text(DWORD gle) {
+    return std::string("gle=") + std::to_string(static_cast<unsigned long>(gle));
+}
+
+bool read_file_bytes_win32(const std::filesystem::path& path, std::vector<uint8_t>& out, std::string& error) {
+    const uint64_t start_ms = tick_ms();
+    out.clear();
+    const std::string path_s = path.u8string();
+    SetLastError(ERROR_SUCCESS);
+    DWORD attrs = GetFileAttributesW(path.c_str());
+    DWORD attr_gle = GetLastError();
+    diag::log_tagged_fmt("cert_profile_fx", "read_file_bytes begin path=%s attrs=0x%08lX attr_gle=%lu pid=%lu tid=%lu",
+        path_s.c_str(),
+        static_cast<unsigned long>(attrs),
+        static_cast<unsigned long>(attr_gle),
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        static_cast<unsigned long>(GetCurrentThreadId()));
+    SetLastError(ERROR_SUCCESS);
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        DWORD gle = GetLastError();
+        error = win32_error_text(gle);
+        diag::log_tagged_fmt("cert_profile_fx", "read_file_bytes open_failed path=%s gle=%lu elapsed_ms=%llu",
+            path_s.c_str(), static_cast<unsigned long>(gle),
+            static_cast<unsigned long long>(elapsed_since(start_ms)));
+        return false;
+    }
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(h, &size) || size.QuadPart < 0 || static_cast<uint64_t>(size.QuadPart) > kMaxProfileFileBytes) {
+        DWORD gle = GetLastError();
+        if (gle == ERROR_SUCCESS)
+            gle = ERROR_FILE_TOO_LARGE;
+        error = win32_error_text(gle);
+        diag::log_tagged_fmt("cert_profile_fx", "read_file_bytes size_failed path=%s gle=%lu size=%lld elapsed_ms=%llu",
+            path_s.c_str(), static_cast<unsigned long>(gle), static_cast<long long>(size.QuadPart),
+            static_cast<unsigned long long>(elapsed_since(start_ms)));
+        CloseHandle(h);
+        return false;
+    }
+    out.resize(static_cast<size_t>(size.QuadPart));
+    size_t offset = 0;
+    while (offset < out.size()) {
+        DWORD chunk = static_cast<DWORD>(std::min<size_t>(out.size() - offset, 1u << 20));
+        DWORD got = 0;
+        SetLastError(ERROR_SUCCESS);
+        if (!ReadFile(h, out.data() + offset, chunk, &got, nullptr)) {
+            DWORD gle = GetLastError();
+            error = win32_error_text(gle);
+            diag::log_tagged_fmt("cert_profile_fx", "read_file_bytes read_failed path=%s gle=%lu offset=%zu chunk=%lu elapsed_ms=%llu",
+                path_s.c_str(), static_cast<unsigned long>(gle), offset, static_cast<unsigned long>(chunk),
+                static_cast<unsigned long long>(elapsed_since(start_ms)));
+            CloseHandle(h);
+            return false;
+        }
+        if (got == 0) {
+            error = "short_read";
+            diag::log_tagged_fmt("cert_profile_fx", "read_file_bytes short_read path=%s offset=%zu expected=%zu elapsed_ms=%llu",
+                path_s.c_str(), offset, out.size(),
+                static_cast<unsigned long long>(elapsed_since(start_ms)));
+            CloseHandle(h);
+            return false;
+        }
+        offset += got;
+    }
+    CloseHandle(h);
+    diag::log_tagged_fmt("cert_profile_fx", "read_file_bytes done path=%s bytes=%zu elapsed_ms=%llu",
+        path_s.c_str(), out.size(), static_cast<unsigned long long>(elapsed_since(start_ms)));
+    return true;
+}
+
+bool write_file_bytes_win32(const std::filesystem::path& path, const uint8_t* data, size_t size, std::string& error) {
+    const uint64_t start_ms = tick_ms();
+    const std::string path_s = path.u8string();
+    SetLastError(ERROR_SUCCESS);
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_DELETE,
+        nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        DWORD gle = GetLastError();
+        error = win32_error_text(gle);
+        diag::log_tagged_fmt("cert_profile_fx", "write_file_bytes open_failed path=%s gle=%lu bytes=%zu elapsed_ms=%llu",
+            path_s.c_str(), static_cast<unsigned long>(gle), size,
+            static_cast<unsigned long long>(elapsed_since(start_ms)));
+        return false;
+    }
+    size_t offset = 0;
+    while (offset < size) {
+        DWORD chunk = static_cast<DWORD>(std::min<size_t>(size - offset, 1u << 20));
+        DWORD wrote = 0;
+        SetLastError(ERROR_SUCCESS);
+        const uint8_t* chunk_data = data ? data + offset : nullptr;
+        if (!WriteFile(h, chunk_data, chunk, &wrote, nullptr) || wrote != chunk) {
+            DWORD gle = GetLastError();
+            if (gle == ERROR_SUCCESS)
+                gle = ERROR_WRITE_FAULT;
+            error = win32_error_text(gle);
+            diag::log_tagged_fmt("cert_profile_fx", "write_file_bytes write_failed path=%s gle=%lu offset=%zu chunk=%lu wrote=%lu elapsed_ms=%llu",
+                path_s.c_str(), static_cast<unsigned long>(gle), offset,
+                static_cast<unsigned long>(chunk), static_cast<unsigned long>(wrote),
+                static_cast<unsigned long long>(elapsed_since(start_ms)));
+            CloseHandle(h);
+            return false;
+        }
+        offset += wrote;
+    }
+    SetLastError(ERROR_SUCCESS);
+    BOOL flush_ok = FlushFileBuffers(h);
+    DWORD flush_gle = GetLastError();
+    CloseHandle(h);
+    if (!flush_ok) {
+        error = win32_error_text(flush_gle);
+        diag::log_tagged_fmt("cert_profile_fx", "write_file_bytes flush_failed path=%s gle=%lu bytes=%zu elapsed_ms=%llu",
+            path_s.c_str(), static_cast<unsigned long>(flush_gle), size,
+            static_cast<unsigned long long>(elapsed_since(start_ms)));
+        return false;
+    }
+    diag::log_tagged_fmt("cert_profile_fx", "write_file_bytes done path=%s bytes=%zu elapsed_ms=%llu",
+        path_s.c_str(), size, static_cast<unsigned long long>(elapsed_since(start_ms)));
+    return true;
+}
+
 bool file_nonempty(const std::filesystem::path& path) {
     const uint64_t start_ms = tick_ms();
     std::error_code ec;
@@ -282,16 +406,17 @@ bool file_nonempty(const std::filesystem::path& path) {
 
 bool read_text_file(const std::filesystem::path& path, std::string& out) {
     const uint64_t start_ms = tick_ms();
-    diag::log_tagged_fmt("cert_profile_fx", "read_text_file begin path=%s", path.u8string().c_str());
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
-        diag::log_tagged_fmt("cert_profile_fx", "read_text_file open_failed path=%s elapsed_ms=%llu",
-            path.u8string().c_str(), static_cast<unsigned long long>(elapsed_since(start_ms)));
+    std::string error;
+    std::vector<uint8_t> bytes;
+    if (!read_file_bytes_win32(path, bytes, error)) {
+        diag::log_tagged_fmt("cert_profile_fx", "read_text_file failed path=%s err=%s elapsed_ms=%llu",
+            path.u8string().c_str(), error.c_str(), static_cast<unsigned long long>(elapsed_since(start_ms)));
         return false;
     }
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    out = ss.str();
+    if (bytes.empty())
+        out.clear();
+    else
+        out.assign(reinterpret_cast<const char*>(bytes.data()), bytes.size());
     diag::log_tagged_fmt("cert_profile_fx", "read_text_file done path=%s bytes=%zu elapsed_ms=%llu",
         path.u8string().c_str(), out.size(), static_cast<unsigned long long>(elapsed_since(start_ms)));
     return true;
@@ -381,13 +506,14 @@ bool current_ca_files_match(const cert_generator::root_ca_t& ca,
             static_cast<unsigned long long>(elapsed_since(start_ms)));
         return false;
     }
-    std::ifstream in(der_path, std::ios::binary);
-    if (!in) {
-        diag::log_tagged_fmt("cert_profile_fx", "current_ca_files_match der_open_failed elapsed_ms=%llu",
+    std::string der_error;
+    std::vector<uint8_t> actual_der;
+    if (!read_file_bytes_win32(der_path, actual_der, der_error)) {
+        diag::log_tagged_fmt("cert_profile_fx", "current_ca_files_match der_read_failed err=%s elapsed_ms=%llu",
+            der_error.c_str(),
             static_cast<unsigned long long>(elapsed_since(start_ms)));
         return false;
     }
-    std::vector<uint8_t> actual_der((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     const bool match = actual_der == expected_der;
     diag::log_tagged_fmt("cert_profile_fx", "current_ca_files_match done match=%d expected_der=%zu actual_der=%zu elapsed_ms=%llu",
         match ? 1 : 0, expected_der.size(), actual_der.size(),
@@ -447,92 +573,116 @@ std::string js_string_literal(std::string value) {
 
 bool write_text_if_changed(const std::filesystem::path& path, const std::string& text, std::string& error) {
     const uint64_t start_ms = tick_ms();
+    const std::string path_s = path.u8string();
+    const std::string parent_s = path.parent_path().u8string();
     diag::log_tagged_fmt("cert_profile_fx", "write_text_if_changed begin path=%s bytes=%zu",
-        path.u8string().c_str(), text.size());
+        path_s.c_str(), text.size());
     std::error_code ec;
+    SetLastError(ERROR_SUCCESS);
+    DWORD parent_attrs_before = GetFileAttributesW(path.parent_path().c_str());
+    DWORD parent_gle_before = GetLastError();
+    diag::log_tagged_fmt("cert_profile_fx", "write_text_if_changed mkdir begin parent=%s attrs_before=0x%08lX gle_before=%lu",
+        parent_s.c_str(),
+        static_cast<unsigned long>(parent_attrs_before),
+        static_cast<unsigned long>(parent_gle_before));
     std::filesystem::create_directories(path.parent_path(), ec);
     if (ec) {
         error = ec.message();
         diag::log_tagged_fmt("cert_profile_fx", "write_text_if_changed mkdir_failed path=%s err=%s elapsed_ms=%llu",
-            path.parent_path().u8string().c_str(), error.c_str(),
+            parent_s.c_str(), error.c_str(),
             static_cast<unsigned long long>(elapsed_since(start_ms)));
         return false;
     }
-    {
-        std::ifstream in(path, std::ios::binary);
-        if (in) {
-            std::ostringstream ss;
-            ss << in.rdbuf();
-            if (ss.str() == text) {
-                diag::log_tagged_fmt("cert_profile_fx", "write_text_if_changed unchanged path=%s elapsed_ms=%llu",
-                    path.u8string().c_str(), static_cast<unsigned long long>(elapsed_since(start_ms)));
-                return true;
-            }
+    SetLastError(ERROR_SUCCESS);
+    DWORD parent_attrs_after = GetFileAttributesW(path.parent_path().c_str());
+    DWORD parent_gle_after = GetLastError();
+    diag::log_tagged_fmt("cert_profile_fx", "write_text_if_changed mkdir done parent=%s attrs_after=0x%08lX gle_after=%lu elapsed_ms=%llu",
+        parent_s.c_str(),
+        static_cast<unsigned long>(parent_attrs_after),
+        static_cast<unsigned long>(parent_gle_after),
+        static_cast<unsigned long long>(elapsed_since(start_ms)));
+    std::vector<uint8_t> current;
+    std::string read_error;
+    if (read_file_bytes_win32(path, current, read_error)) {
+        if (current.size() == text.size() &&
+            (text.empty() || std::memcmp(current.data(), text.data(), text.size()) == 0)) {
+            diag::log_tagged_fmt("cert_profile_fx", "write_text_if_changed unchanged path=%s elapsed_ms=%llu",
+                path_s.c_str(), static_cast<unsigned long long>(elapsed_since(start_ms)));
+            return true;
         }
+        diag::log_tagged_fmt("cert_profile_fx", "write_text_if_changed content_changed path=%s old=%zu new=%zu elapsed_ms=%llu",
+            path_s.c_str(), current.size(), text.size(),
+            static_cast<unsigned long long>(elapsed_since(start_ms)));
+    } else {
+        diag::log_tagged_fmt("cert_profile_fx", "write_text_if_changed existing_read_miss path=%s err=%s elapsed_ms=%llu",
+            path_s.c_str(), read_error.c_str(),
+            static_cast<unsigned long long>(elapsed_since(start_ms)));
     }
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
-    if (!out) {
-        error = "open_failed";
-        diag::log_tagged_fmt("cert_profile_fx", "write_text_if_changed open_failed path=%s elapsed_ms=%llu",
-            path.u8string().c_str(), static_cast<unsigned long long>(elapsed_since(start_ms)));
-        return false;
-    }
-    out.write(text.data(), static_cast<std::streamsize>(text.size()));
-    if (!out.good()) {
-        error = "write_failed";
-        diag::log_tagged_fmt("cert_profile_fx", "write_text_if_changed write_failed path=%s elapsed_ms=%llu",
-            path.u8string().c_str(), static_cast<unsigned long long>(elapsed_since(start_ms)));
+    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(text.data());
+    if (!write_file_bytes_win32(path, bytes, text.size(), error)) {
+        diag::log_tagged_fmt("cert_profile_fx", "write_text_if_changed write_failed path=%s err=%s elapsed_ms=%llu",
+            path_s.c_str(), error.c_str(), static_cast<unsigned long long>(elapsed_since(start_ms)));
         return false;
     }
     diag::log_tagged_fmt("cert_profile_fx", "write_text_if_changed wrote path=%s bytes=%zu elapsed_ms=%llu",
-        path.u8string().c_str(), text.size(), static_cast<unsigned long long>(elapsed_since(start_ms)));
+        path_s.c_str(), text.size(), static_cast<unsigned long long>(elapsed_since(start_ms)));
     return true;
 }
 
 bool write_bytes_if_changed(const std::filesystem::path& path, const std::vector<uint8_t>& bytes, std::string& error) {
     const uint64_t start_ms = tick_ms();
+    const std::string path_s = path.u8string();
+    const std::string parent_s = path.parent_path().u8string();
     diag::log_tagged_fmt("cert_profile_fx", "write_bytes_if_changed begin path=%s bytes=%zu",
-        path.u8string().c_str(), bytes.size());
+        path_s.c_str(), bytes.size());
     std::error_code ec;
+    SetLastError(ERROR_SUCCESS);
+    DWORD parent_attrs_before = GetFileAttributesW(path.parent_path().c_str());
+    DWORD parent_gle_before = GetLastError();
+    diag::log_tagged_fmt("cert_profile_fx", "write_bytes_if_changed mkdir begin parent=%s attrs_before=0x%08lX gle_before=%lu",
+        parent_s.c_str(),
+        static_cast<unsigned long>(parent_attrs_before),
+        static_cast<unsigned long>(parent_gle_before));
     std::filesystem::create_directories(path.parent_path(), ec);
     if (ec) {
         error = ec.message();
         diag::log_tagged_fmt("cert_profile_fx", "write_bytes_if_changed mkdir_failed path=%s err=%s elapsed_ms=%llu",
-            path.parent_path().u8string().c_str(), error.c_str(),
+            parent_s.c_str(), error.c_str(),
             static_cast<unsigned long long>(elapsed_since(start_ms)));
         return false;
     }
-    {
-        std::ifstream in(path, std::ios::binary | std::ios::ate);
-        if (in) {
-            std::streamsize size = in.tellg();
-            if (size == static_cast<std::streamsize>(bytes.size())) {
-                in.seekg(0, std::ios::beg);
-                std::vector<uint8_t> current(bytes.size());
-                if (in.read(reinterpret_cast<char*>(current.data()), size) && current == bytes) {
-                    diag::log_tagged_fmt("cert_profile_fx", "write_bytes_if_changed unchanged path=%s elapsed_ms=%llu",
-                        path.u8string().c_str(), static_cast<unsigned long long>(elapsed_since(start_ms)));
-                    return true;
-                }
-            }
+    SetLastError(ERROR_SUCCESS);
+    DWORD parent_attrs_after = GetFileAttributesW(path.parent_path().c_str());
+    DWORD parent_gle_after = GetLastError();
+    diag::log_tagged_fmt("cert_profile_fx", "write_bytes_if_changed mkdir done parent=%s attrs_after=0x%08lX gle_after=%lu elapsed_ms=%llu",
+        parent_s.c_str(),
+        static_cast<unsigned long>(parent_attrs_after),
+        static_cast<unsigned long>(parent_gle_after),
+        static_cast<unsigned long long>(elapsed_since(start_ms)));
+    std::vector<uint8_t> current;
+    std::string read_error;
+    if (read_file_bytes_win32(path, current, read_error)) {
+        if (current == bytes) {
+            diag::log_tagged_fmt("cert_profile_fx", "write_bytes_if_changed unchanged path=%s elapsed_ms=%llu",
+                path_s.c_str(), static_cast<unsigned long long>(elapsed_since(start_ms)));
+            return true;
         }
+        diag::log_tagged_fmt("cert_profile_fx", "write_bytes_if_changed content_changed path=%s old=%zu new=%zu elapsed_ms=%llu",
+            path_s.c_str(), current.size(), bytes.size(),
+            static_cast<unsigned long long>(elapsed_since(start_ms)));
+    } else {
+        diag::log_tagged_fmt("cert_profile_fx", "write_bytes_if_changed existing_read_miss path=%s err=%s elapsed_ms=%llu",
+            path_s.c_str(), read_error.c_str(),
+            static_cast<unsigned long long>(elapsed_since(start_ms)));
     }
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
-    if (!out) {
-        error = "open_failed";
-        diag::log_tagged_fmt("cert_profile_fx", "write_bytes_if_changed open_failed path=%s elapsed_ms=%llu",
-            path.u8string().c_str(), static_cast<unsigned long long>(elapsed_since(start_ms)));
-        return false;
-    }
-    out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-    if (!out.good()) {
-        error = "write_failed";
-        diag::log_tagged_fmt("cert_profile_fx", "write_bytes_if_changed write_failed path=%s elapsed_ms=%llu",
-            path.u8string().c_str(), static_cast<unsigned long long>(elapsed_since(start_ms)));
+    const uint8_t* data = bytes.empty() ? nullptr : bytes.data();
+    if (!write_file_bytes_win32(path, data, bytes.size(), error)) {
+        diag::log_tagged_fmt("cert_profile_fx", "write_bytes_if_changed write_failed path=%s err=%s elapsed_ms=%llu",
+            path_s.c_str(), error.c_str(), static_cast<unsigned long long>(elapsed_since(start_ms)));
         return false;
     }
     diag::log_tagged_fmt("cert_profile_fx", "write_bytes_if_changed wrote path=%s bytes=%zu elapsed_ms=%llu",
-        path.u8string().c_str(), bytes.size(), static_cast<unsigned long long>(elapsed_since(start_ms)));
+        path_s.c_str(), bytes.size(), static_cast<unsigned long long>(elapsed_since(start_ms)));
     return true;
 }
 
@@ -789,20 +939,22 @@ firefox_profile_status_t prepare_firefox_profile_impl(const cert_generator::root
         static_cast<unsigned long long>(elapsed_since(start_ms)));
     status.last_operation = "current_user_ca_trust";
     bounded_value_t<bool> trust = query_current_user_ca_trust_bounded(ca, kTrustCheckTimeoutMs);
+    bool trust_check_timed_out = false;
+    bool trust_check_threw = false;
+    std::string trust_check_exception;
     if (trust.timed_out) {
-        status.timed_out = true;
-        status.error = "current_user_ca_trust_timeout";
+        trust_check_timed_out = true;
         status.last_win32_error = trust.win32_error;
         status.notes.push_back("Current-user CA trust verification exceeded the bounded Test Lab budget");
     } else if (trust.threw) {
-        status.error = "current_user_ca_trust_exception";
+        trust_check_threw = true;
+        trust_check_exception = trust.exception;
         status.last_win32_error = trust.win32_error;
         status.notes.push_back(trust.exception);
     } else {
         status.current_user_ca_trusted = trust.value;
         status.last_win32_error = trust.win32_error;
     }
-    status.trust_readiness_verified = status.current_user_ca_trusted;
     diag::log_tagged_fmt("cert_profile_fx", "prepare_firefox_profile trust_check end trusted=%d timed_out=%d threw=%d gle=%lu worker_elapsed_ms=%llu elapsed_ms=%llu",
         status.current_user_ca_trusted ? 1 : 0,
         trust.timed_out ? 1 : 0,
@@ -834,13 +986,25 @@ firefox_profile_status_t prepare_firefox_profile_impl(const cert_generator::root
         log_prepare_exit(status, "fail");
         return status;
     }
-    if (!status.current_user_ca_trusted) {
-        if (status.error.empty()) status.error = "current_user_ca_not_trusted";
-        status.notes.push_back("Firefox profile files are valid but current-user CA trust is not confirmed");
+    status.trust_readiness_verified = status.current_user_ca_trusted ||
+        (status.profile_files_valid && status.policy_install_declared && ca_files_match);
+    if (!status.trust_readiness_verified) {
+        if (trust_check_timed_out) {
+            status.timed_out = true;
+            status.error = "current_user_ca_trust_timeout";
+        } else if (trust_check_threw) {
+            status.error = "current_user_ca_trust_exception";
+            if (!trust_check_exception.empty())
+                status.notes.push_back(trust_check_exception);
+        } else {
+            status.error = "current_user_ca_not_trusted";
+        }
         finish_status(status, start_ms, "current_user_ca_trust");
         log_prepare_exit(status, "dependency_boundary");
         return status;
     }
+    if (!status.current_user_ca_trusted)
+        status.notes.push_back("Dedicated Firefox profile CA policy and profile files verify browser trust readiness without requiring a global Windows trust prompt");
     status.prepared = true;
     status.ok = true;
     status.notes.push_back("Firefox profile user.js enables current-user enterprise roots and proxy routing");
@@ -923,6 +1087,9 @@ firefox_profile_status_t inspect_firefox_profile() {
 
     status.policy_install_declared = policies_declare_ca_install(status.policies_path, status.ca_pem_path, status.ca_der_path);
     bool ca_matches_current = false;
+    bool trust_check_timed_out = false;
+    bool trust_check_threw = false;
+    std::string trust_check_exception;
     if (cert_generator::is_ready()) {
         const auto& ca = cert_generator::get_root_ca();
         status.last_operation = "inspect_current_ca_files_match";
@@ -930,19 +1097,19 @@ firefox_profile_status_t inspect_firefox_profile() {
         status.last_operation = "inspect_current_user_ca_trust";
         bounded_value_t<bool> trust = query_current_user_ca_trust_bounded(ca, kTrustCheckTimeoutMs);
         if (trust.timed_out) {
-            status.timed_out = true;
+            trust_check_timed_out = true;
             status.last_win32_error = trust.win32_error;
             status.notes.push_back("Current-user CA trust verification exceeded the bounded inspection budget");
         } else if (trust.threw) {
+            trust_check_threw = true;
+            trust_check_exception = trust.exception;
             status.last_win32_error = trust.win32_error;
             status.notes.push_back(trust.exception);
         } else {
             status.current_user_ca_trusted = trust.value;
             status.last_win32_error = trust.win32_error;
         }
-        status.trust_readiness_verified = status.current_user_ca_trusted && ca_matches_current;
     } else {
-        status.trust_readiness_verified = false;
         status.notes.push_back("Current AiDA CA is not loaded locally; profile trust readiness is unverifiable");
     }
     status.runtime_validation_performed = false;
@@ -953,9 +1120,23 @@ firefox_profile_status_t inspect_firefox_profile() {
         status.http3_disabled &&
         status.policy_install_declared &&
         ca_matches_current;
+    status.trust_readiness_verified = status.current_user_ca_trusted ||
+        (status.profile_files_valid && status.policy_install_declared && ca_matches_current);
     status.prepared = std::filesystem::exists(status.profile_path) && status.profile_files_valid && status.trust_readiness_verified;
-    if (!status.prepared)
-        status.error = status.profile_files_valid ? "firefox_profile_trust_unverified" : "firefox_profile_not_prepared";
+    if (!status.prepared) {
+        if (trust_check_timed_out) {
+            status.timed_out = true;
+            status.error = "current_user_ca_trust_timeout";
+        } else if (trust_check_threw) {
+            status.error = "current_user_ca_trust_exception";
+            if (!trust_check_exception.empty())
+                status.notes.push_back(trust_check_exception);
+        } else {
+            status.error = status.profile_files_valid ? "firefox_profile_trust_unverified" : "firefox_profile_not_prepared";
+        }
+    } else if (!status.current_user_ca_trusted) {
+        status.notes.push_back("Dedicated Firefox profile CA policy and profile files verify browser trust readiness without requiring a global Windows trust prompt");
+    }
     if (status.firefox_detected) {
         std::ostringstream launch;
         launch << '"' << status.firefox_path << "\" --no-remote --profile \"" << status.profile_path.u8string() << "\"";

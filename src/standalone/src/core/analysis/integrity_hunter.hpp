@@ -438,33 +438,28 @@ inline bool start_hunt(uint64_t target_address, uint64_t target_size)
 			static_cast<unsigned long long>(generation));
 		if (critical_work_queue::post(worker) || work_queue::post(worker))
 			return true;
-		try {
-			std::thread(std::move(worker)).detach();
-			return true;
-		} catch (const std::exception& ex) {
-			diag::log_tagged_fmt("integrity_hunter",
-				"start_reject reason=thread_start_failed gen=%llu err=%s",
-				static_cast<unsigned long long>(generation),
-				ex.what());
-			std::lock_guard<std::mutex> lk(g_state.mutex);
-			g_state.status_text = "Failed to start integrity hunter worker";
-			g_state.worker_active.store(false);
-			g_state.install_complete.store(true);
-			g_state.install_success.store(false);
-			g_state.hunting.store(false);
-			return false;
-		} catch (...) {
-			diag::log_tagged_fmt("integrity_hunter",
-				"start_reject reason=thread_start_failed gen=%llu err='<unknown>'",
-				static_cast<unsigned long long>(generation));
-			std::lock_guard<std::mutex> lk(g_state.mutex);
-			g_state.status_text = "Failed to start integrity hunter worker";
-			g_state.worker_active.store(false);
-			g_state.install_complete.store(true);
-			g_state.install_success.store(false);
-			g_state.hunting.store(false);
-			return false;
-		}
+		const auto cq = critical_work_queue::stats();
+		const auto wq = work_queue::stats();
+		diag::log_tagged_fmt("integrity_hunter",
+			"start_reject reason=worker_post_failed gen=%llu cq_alive=%d cq_shutdown=%d cq_pending=%llu cq_active=%u cq_rejected=%llu wq_alive=%d wq_shutdown=%d wq_pending=%llu wq_active=%u wq_rejected=%llu",
+			static_cast<unsigned long long>(generation),
+			cq.alive ? 1 : 0,
+			cq.shutting_down ? 1 : 0,
+			static_cast<unsigned long long>(cq.pending),
+			cq.active,
+			static_cast<unsigned long long>(cq.rejected),
+			wq.alive ? 1 : 0,
+			wq.shutting_down ? 1 : 0,
+			static_cast<unsigned long long>(wq.pending),
+			wq.active,
+			static_cast<unsigned long long>(wq.rejected));
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		g_state.status_text = "Failed to queue integrity hunter worker";
+		g_state.worker_active.store(false);
+		g_state.install_complete.store(true);
+		g_state.install_success.store(false);
+		g_state.hunting.store(false);
+		return false;
 	}
 	const bool posted = critical_work_queue::post(worker) || work_queue::post(std::move(worker));
 	if (!posted) {

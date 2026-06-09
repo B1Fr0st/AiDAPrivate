@@ -1,6 +1,7 @@
 ﻿#include "arc.h"
 #include "../runtime/reason_ids.hpp"
 #include "comm.h"
+#include "../../helpers/diag_log.hpp"
 
 #include <windows.h>
 #include <winioctl.h>
@@ -54,17 +55,11 @@ static void arc_log(const char* tag, const char* msg)
 {
     arc_store_status(tag, msg);
 
-    static WCHAR s_log_path[MAX_PATH] = {};
+    static char s_log_path[MAX_PATH] = {};
     static bool  s_path_ready = false;
     if (!s_path_ready) {
-        WCHAR exe_path[MAX_PATH] = {};
-        GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
-        WCHAR* last_sep = wcsrchr(exe_path, L'\\');
-        if (last_sep) {
-            last_sep[1] = L'\0';
-            _snwprintf_s(s_log_path, MAX_PATH, _TRUNCATE, L"%saida_debug.log", exe_path);
-        } else {
-            wcscpy_s(s_log_path, MAX_PATH, L"aida_debug.log");
+        if (!diag::build_log_path("aida_debug.log", s_log_path, sizeof(s_log_path))) {
+            strcpy_s(s_log_path, "aida_debug.log");
         }
         s_path_ready = true;
     }
@@ -76,7 +71,7 @@ static void arc_log(const char* tag, const char* msg)
         "[%02d:%02d:%02d.%03d] [arc/%s] %s\n",
         st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, tag, msg);
     if (n <= 0) return;
-    HANDLE h = CreateFileW(s_log_path, GENERIC_WRITE,
+    HANDLE h = CreateFileA(s_log_path, GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
         OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h != INVALID_HANDLE_VALUE)
@@ -1291,6 +1286,40 @@ voyager::device_t* get_device_enc(uint64_t crypt_key)
     uint64_t enc = g_device_enc;
     if (enc == 0) return nullptr;
     return reinterpret_cast<voyager::device_t*>(enc ^ crypt_key ^ _rotl64(crypt_key, 17) ^ _rotr64(crypt_key, 11));
+}
+
+__declspec(noinline) DWORD refresh_device_heartbeat_seh(voyager::device_t* dev, bool* out_ok)
+{
+    if (out_ok)
+        *out_ok = false;
+    if (!dev || !out_ok)
+        return ERROR_INVALID_PARAMETER;
+    __try
+    {
+        *out_ok = dev->refresh_heartbeat();
+        return ERROR_SUCCESS;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return GetExceptionCode();
+    }
+}
+
+__declspec(noinline) DWORD send_device_heartbeat_seh(voyager::device_t* dev, bool* out_ok)
+{
+    if (out_ok)
+        *out_ok = false;
+    if (!dev || !out_ok)
+        return ERROR_INVALID_PARAMETER;
+    __try
+    {
+        *out_ok = dev->send_heartbeat();
+        return ERROR_SUCCESS;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return GetExceptionCode();
+    }
 }
 
 __declspec(noreturn) __forceinline void enforce_violation(const char* reason, const char* extra);
@@ -2718,7 +2747,46 @@ ARC_API bool arc_init(
             arc_log("driver", sec_buf);
         }
 
-        if (!dev->refresh_heartbeat())
+        arc_log("driver", "heartbeat_send_pre");
+        bool heartbeat_ok = false;
+        DWORD heartbeat_seh = send_device_heartbeat_seh(dev, &heartbeat_ok);
+        if (heartbeat_seh != ERROR_SUCCESS)
+        {
+            char hb_seh_buf[256];
+            _snprintf_s(hb_seh_buf, sizeof(hb_seh_buf), _TRUNCATE,
+                "heartbeat_send_seh code=0x%08lX err=%lu bytes=%lu ioctl=0x%08X base=0x%04X key_hash=0x%08X ioctl_seed_hash=0x%08X inst_seed=%u/%u global_seed=%u/%u",
+                static_cast<unsigned long>(heartbeat_seh),
+                static_cast<unsigned long>(dev->get_last_heartbeat_error()),
+                static_cast<unsigned long>(dev->get_last_heartbeat_bytes_returned()),
+                dev->get_last_heartbeat_ioctl_code(),
+                dev->get_last_heartbeat_base(),
+                dev->get_last_heartbeat_key_hash(),
+                dev->get_last_heartbeat_ioctl_seed_hash(),
+                dev->get_last_heartbeat_server_seed_present(),
+                dev->get_last_heartbeat_ioctl_seed_present(),
+                dev->get_last_heartbeat_global_server_seed_present(),
+                dev->get_last_heartbeat_global_ioctl_seed_present());
+            arc_log("driver", hb_seh_buf);
+            enforce_violation_id(aida::reason_ids::reason_id_arc_no_driver, "heartbeat_send_seh");
+        }
+        {
+            char hb_ok_buf[256];
+            _snprintf_s(hb_ok_buf, sizeof(hb_ok_buf), _TRUNCATE,
+                "heartbeat_send_post ok=%d err=%lu bytes=%lu ioctl=0x%08X base=0x%04X key_hash=0x%08X ioctl_seed_hash=0x%08X inst_seed=%u/%u global_seed=%u/%u",
+                heartbeat_ok ? 1 : 0,
+                static_cast<unsigned long>(dev->get_last_heartbeat_error()),
+                static_cast<unsigned long>(dev->get_last_heartbeat_bytes_returned()),
+                dev->get_last_heartbeat_ioctl_code(),
+                dev->get_last_heartbeat_base(),
+                dev->get_last_heartbeat_key_hash(),
+                dev->get_last_heartbeat_ioctl_seed_hash(),
+                dev->get_last_heartbeat_server_seed_present(),
+                dev->get_last_heartbeat_ioctl_seed_present(),
+                dev->get_last_heartbeat_global_server_seed_present(),
+                dev->get_last_heartbeat_global_ioctl_seed_present());
+            arc_log("driver", hb_ok_buf);
+        }
+        if (!heartbeat_ok)
         {
             char hb_buf[256];
             _snprintf_s(hb_buf, sizeof(hb_buf), _TRUNCATE,
@@ -2772,7 +2840,48 @@ ARC_API bool arc_init(
                     arc_log("driver", wait_buf);
                     last_logged_ms = waited_ms;
                 }
-                if (!dev->refresh_heartbeat())
+                arc_log("driver", "heartbeat_refresh_during_bridge_wait_pre");
+                bool wait_heartbeat_ok = false;
+                DWORD wait_heartbeat_seh = refresh_device_heartbeat_seh(dev, &wait_heartbeat_ok);
+                if (wait_heartbeat_seh != ERROR_SUCCESS)
+                {
+                    char hb_seh_buf[256];
+                    _snprintf_s(hb_seh_buf, sizeof(hb_seh_buf), _TRUNCATE,
+                        "heartbeat_refresh_during_bridge_wait_seh code=0x%08lX err=%lu bytes=%lu ioctl=0x%08X base=0x%04X key_hash=0x%08X ioctl_seed_hash=0x%08X inst_seed=%u/%u global_seed=%u/%u waited_ms=%lu",
+                        static_cast<unsigned long>(wait_heartbeat_seh),
+                        static_cast<unsigned long>(dev->get_last_heartbeat_error()),
+                        static_cast<unsigned long>(dev->get_last_heartbeat_bytes_returned()),
+                        dev->get_last_heartbeat_ioctl_code(),
+                        dev->get_last_heartbeat_base(),
+                        dev->get_last_heartbeat_key_hash(),
+                        dev->get_last_heartbeat_ioctl_seed_hash(),
+                        dev->get_last_heartbeat_server_seed_present(),
+                        dev->get_last_heartbeat_ioctl_seed_present(),
+                        dev->get_last_heartbeat_global_server_seed_present(),
+                        dev->get_last_heartbeat_global_ioctl_seed_present(),
+                        static_cast<unsigned long>(waited_ms));
+                    arc_log("driver", hb_seh_buf);
+                    enforce_violation_id(aida::reason_ids::reason_id_arc_no_driver, "heartbeat_refresh_wait_seh");
+                }
+                {
+                    char hb_ok_buf[256];
+                    _snprintf_s(hb_ok_buf, sizeof(hb_ok_buf), _TRUNCATE,
+                        "heartbeat_refresh_during_bridge_wait_post ok=%d err=%lu bytes=%lu ioctl=0x%08X base=0x%04X key_hash=0x%08X ioctl_seed_hash=0x%08X inst_seed=%u/%u global_seed=%u/%u waited_ms=%lu",
+                        wait_heartbeat_ok ? 1 : 0,
+                        static_cast<unsigned long>(dev->get_last_heartbeat_error()),
+                        static_cast<unsigned long>(dev->get_last_heartbeat_bytes_returned()),
+                        dev->get_last_heartbeat_ioctl_code(),
+                        dev->get_last_heartbeat_base(),
+                        dev->get_last_heartbeat_key_hash(),
+                        dev->get_last_heartbeat_ioctl_seed_hash(),
+                        dev->get_last_heartbeat_server_seed_present(),
+                        dev->get_last_heartbeat_ioctl_seed_present(),
+                        dev->get_last_heartbeat_global_server_seed_present(),
+                        dev->get_last_heartbeat_global_ioctl_seed_present(),
+                        static_cast<unsigned long>(waited_ms));
+                    arc_log("driver", hb_ok_buf);
+                }
+                if (!wait_heartbeat_ok)
                 {
                     char hb_buf[256];
                     _snprintf_s(hb_buf, sizeof(hb_buf), _TRUNCATE,

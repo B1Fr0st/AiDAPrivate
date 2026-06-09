@@ -28,6 +28,7 @@
 
 #include "../crypto/keys.hpp"
 #include "../crypto/wb_ed25519.hpp"
+#include "../../helpers/diag_log.hpp"
 
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "crypt32.lib")
@@ -112,13 +113,8 @@ void trans_log(const char* step)
     BOOL pending = FALSE;
     InitOnceBeginInitialize(&s_once, INIT_ONCE_ASYNC, &pending, nullptr);
     if (pending || s_log_path[0] == '\0') {
-        DWORD n = GetModuleFileNameA(nullptr, s_log_path, MAX_PATH);
-        if (n == 0 || n >= MAX_PATH) {
+        if (!diag::build_log_path("aida_debug.log", s_log_path, sizeof(s_log_path))) {
             strcpy_s(s_log_path, "aida_debug.log");
-        } else {
-            char* last = strrchr(s_log_path, '\\');
-            if (last) { *(last + 1) = '\0'; } else { s_log_path[0] = '\0'; }
-            strcat_s(s_log_path, "aida_debug.log");
         }
         InitOnceComplete(&s_once, INIT_ONCE_ASYNC, nullptr);
     }

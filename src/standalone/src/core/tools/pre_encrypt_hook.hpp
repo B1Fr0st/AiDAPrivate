@@ -16,7 +16,6 @@
 
 #include "helpers/diag_log.hpp"
 #include "standalone_driver.hpp"
-#include "../infra/win_thread.hpp"
 
 namespace pre_encrypt_hook {
 
@@ -57,7 +56,7 @@ struct state_t {
     std::atomic<bool> debug_attached{false};
     std::atomic<bool> debug_loop_running{false};
     std::atomic<DWORD> debugger_error{0};
-    aida::infra::win_thread::joinable_thread_t debug_thread;
+    std::atomic<DWORD> debug_loop_tid{0};
     size_t max_captures = 4096;
     uint32_t attached_pid = 0;
     std::vector<driver_bridge::module_info_t> cached_modules;
@@ -444,17 +443,33 @@ inline void close_debug_event_handles(const DEBUG_EVENT& evt) {
 }
 
 inline void debug_event_loop() {
+    const DWORD tid = GetCurrentThreadId();
+    const ULONGLONG start_ms = GetTickCount64();
+    g_state.debug_loop_tid.store(tid, std::memory_order_release);
     uint32_t pid = 0;
     {
         std::lock_guard<std::mutex> lock(g_state.mutex);
         pid = g_state.attached_pid;
     }
+    diag::log_tagged_fmt("pre_encrypt_hook",
+        "debug_loop_enter pid=%u tid=%lu polling=%d attached=%d",
+        pid,
+        static_cast<unsigned long>(tid),
+        g_state.polling.load() ? 1 : 0,
+        g_state.debug_attached.load() ? 1 : 0);
 
     if (pid == 0 || !driver_bridge::using_kernel_driver()) {
         g_state.polling.store(false);
         g_state.debug_loop_running.store(false);
         g_state.active.store(false);
         g_state.debugger_error.store(ERROR_INVALID_PARAMETER);
+        g_state.debug_loop_tid.store(0, std::memory_order_release);
+        diag::log_tagged_fmt("pre_encrypt_hook",
+            "debug_loop_exit_invalid pid=%u tid=%lu elapsed_ms=%llu driver=%d",
+            pid,
+            static_cast<unsigned long>(tid),
+            static_cast<unsigned long long>(GetTickCount64() - start_ms),
+            driver_bridge::using_kernel_driver() ? 1 : 0);
         return;
     }
 
@@ -463,6 +478,13 @@ inline void debug_event_loop() {
         g_state.polling.store(false);
         g_state.debug_loop_running.store(false);
         g_state.active.store(false);
+        g_state.debug_loop_tid.store(0, std::memory_order_release);
+        diag::log_tagged_fmt("pre_encrypt_hook",
+            "debug_loop_exit_attach_failed pid=%u tid=%lu elapsed_ms=%llu error=%lu",
+            pid,
+            static_cast<unsigned long>(tid),
+            static_cast<unsigned long long>(GetTickCount64() - start_ms),
+            static_cast<unsigned long>(g_state.debugger_error.load()));
         return;
     }
 
@@ -507,6 +529,14 @@ inline void debug_event_loop() {
         DebugActiveProcessStop(pid);
     g_state.polling.store(false);
     g_state.debug_loop_running.store(false);
+    g_state.debug_loop_tid.store(0, std::memory_order_release);
+    diag::log_tagged_fmt("pre_encrypt_hook",
+        "debug_loop_exit pid=%u tid=%lu elapsed_ms=%llu active=%d error=%lu",
+        pid,
+        static_cast<unsigned long>(tid),
+        static_cast<unsigned long long>(GetTickCount64() - start_ms),
+        g_state.active.load() ? 1 : 0,
+        static_cast<unsigned long>(g_state.debugger_error.load()));
 }
 
 inline bool hook_address_with_kind(uint64_t address, const std::string& name,
@@ -640,15 +670,21 @@ inline bool auto_hook(uint32_t pid) {
 
 inline void unhook_all() {
     g_state.polling.store(false);
-    if (g_state.debug_thread.joinable() && !g_state.debug_thread.join_for(3000)) {
+    const ULONGLONG wait_start = GetTickCount64();
+    for (int i = 0; i < 120 && g_state.debug_loop_running.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    if (g_state.debug_loop_running.load()) {
         diag::log_tagged_fmt("pre_encrypt_hook", "debug_loop_join_timeout pid=%u attached=%d running=%d error=%lu",
             g_state.attached_pid,
             g_state.debug_attached.load() ? 1 : 0,
             g_state.debug_loop_running.load() ? 1 : 0,
             static_cast<unsigned long>(g_state.debugger_error.load()));
     }
-    for (int i = 0; i < 20 && g_state.debug_loop_running.load(); ++i)
-        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    diag::log_tagged_fmt("pre_encrypt_hook",
+        "unhook_wait_complete running=%d attached=%d waited_ms=%llu",
+        g_state.debug_loop_running.load() ? 1 : 0,
+        g_state.debug_attached.load() ? 1 : 0,
+        static_cast<unsigned long long>(GetTickCount64() - wait_start));
     clear_armed_breakpoints();
 
     std::lock_guard<std::mutex> lock(g_state.mutex);
@@ -677,20 +713,36 @@ inline bool start_polling() {
 
     g_state.polling.store(true);
 
-    if (g_state.debug_thread.joinable())
-        g_state.debug_thread.join_for(0);
-
-    std::string thread_error;
-    if (!g_state.debug_thread.start([]() { debug_event_loop(); },
-        &thread_error,
-        aida::infra::win_thread::fixture_stack_reserve,
-        "pre_encrypt_hook.debug_event_loop")) {
-        diag::log_tagged_fmt("pre_encrypt_hook", "debug_loop_thread_start_failed error=%s", thread_error.c_str());
+    bool posted = false;
+    try {
+        posted = work_queue::post([]() { debug_event_loop(); });
+    } catch (...) {
+        posted = false;
+    }
+    if (!posted) {
+        const auto qs = work_queue::stats();
+        diag::log_tagged_fmt("pre_encrypt_hook",
+            "debug_loop_post_failed cq_alive=%d cq_shutdown=%d cq_pending=%zu cq_active=%u cq_posted=%llu cq_rejected=%llu",
+            qs.alive ? 1 : 0,
+            qs.shutting_down ? 1 : 0,
+            qs.pending,
+            qs.active,
+            static_cast<unsigned long long>(qs.posted),
+            static_cast<unsigned long long>(qs.rejected));
         g_state.polling.store(false);
         g_state.debug_loop_running.store(false);
         g_state.debugger_error.store(ERROR_NOT_ENOUGH_MEMORY);
         return false;
     }
+    const auto qs = work_queue::stats();
+    diag::log_tagged_fmt("pre_encrypt_hook",
+        "debug_loop_posted cq_alive=%d cq_shutdown=%d cq_pending=%zu cq_active=%u cq_started=%llu cq_finished=%llu",
+        qs.alive ? 1 : 0,
+        qs.shutting_down ? 1 : 0,
+        qs.pending,
+        qs.active,
+        static_cast<unsigned long long>(qs.started),
+        static_cast<unsigned long long>(qs.finished));
 
     for (int i = 0; i < 40; ++i) {
         if (g_state.debug_attached.load())

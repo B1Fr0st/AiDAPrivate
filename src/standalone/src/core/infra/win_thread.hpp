@@ -22,6 +22,7 @@
 
 #include "../../helpers/diag_log.hpp"
 #include "../runtime/loader_header_invariant.hpp"
+#include "../runtime/manual_map_tls.hpp"
 
 namespace aida::infra::win_thread {
 
@@ -36,6 +37,11 @@ struct thread_state_t {
 
 inline DWORD WINAPI entry(void* arg)
 {
+    const bool tls_ready = aida::manual_map_tls::ensure_current_thread();
+    diag::log_tagged_fmt("win_thread", "thread_entry tls_ready=%d tid=%lu state=%p",
+        tls_ready ? 1 : 0,
+        static_cast<unsigned long>(GetCurrentThreadId()),
+        arg);
     std::unique_ptr<thread_state_t> state(static_cast<thread_state_t*>(arg));
     try {
         state->fn();
@@ -299,13 +305,17 @@ bool start_raw(Fn&& fn, unsigned stack_reserve, HANDLE& out_handle, unsigned& ou
 
     std::string errors;
     if (stack_reserve != 0 &&
+        try_beginthreadex(state, name, stack_reserve, out_handle, out_tid, errors))
+        return true;
+
+    if (try_beginthreadex(state, name, 0, out_handle, out_tid, errors))
+        return true;
+
+    if (stack_reserve != 0 &&
         try_create_thread(state, name, stack_reserve, STACK_SIZE_PARAM_IS_A_RESERVATION, out_handle, out_tid, errors))
         return true;
 
     if (try_create_thread(state, name, 0, 0, out_handle, out_tid, errors))
-        return true;
-
-    if (try_beginthreadex(state, name, 0, out_handle, out_tid, errors))
         return true;
 
     if (try_nt_create_thread_ex(state, name, stack_reserve, out_handle, out_tid, errors))

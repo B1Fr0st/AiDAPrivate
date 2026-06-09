@@ -716,9 +716,7 @@ static bool is_camoufox_reverse_tool_name(const std::string& name)
 
 static bool is_camoufox_browser_tool_name(const std::string& name)
 {
-    return is_camoufox_reverse_tool_name(name) ||
-           name == "camoufox_open_url" ||
-           name.rfind("burp_headless_", 0) == 0;
+    return is_camoufox_reverse_tool_name(name);
 }
 
 static bool is_standalone_internal_only_tool_name(const std::string& name)
@@ -751,66 +749,6 @@ static bool is_standalone_ide_chat_only_tool_name(const std::string& name)
     return false;
 }
 
-static bool is_standalone_redundant_tool_name(const std::string& name)
-{
-    static const char* const names[] = {
-        "driver_connect",
-        "driver_unattach",
-        "driver_read_memory",
-        "driver_read_string",
-        "driver_enumerate_modules",
-        "driver_enumerate_threads",
-        "driver_query_memory",
-        "debugger_read_memory",
-        "debugger_write_memory",
-        "debugger_protect_memory",
-        "debugger_allocate_memory",
-        "debugger_call_function",
-        "debugger_attach_to_process",
-        "debugger_detach",
-        "debugger_get_threads",
-        "debugger_get_modules",
-        "dbg_set_breakpoint",
-        "dbg_remove_breakpoint",
-        "dbg_list_breakpoints",
-        "dbg_get_callstack",
-        "dbg_run",
-        "dbg_pause",
-        "dbg_step_into",
-        "dbg_step_over",
-        "dbg_step_out",
-        "dbg_get_registers",
-        "dbg_set_register",
-        "dbg_get_memory_map",
-        "dbg_enumerate_handles",
-        "dbg_get_seh_chain",
-        "dbg_list_patches",
-        "driver_enumerate_wfp_callouts",
-        "driver_get_socket_handles",
-        "driver_dump_tcpip_connections",
-        "driver_inject_packet",
-        "driver_modify_packet_rule",
-        "driver_redirect_traffic",
-        "driver_deep_inspect",
-        "driver_intercept_hold",
-        "driver_kill_connection",
-        "driver_spoof_dns",
-        "driver_bandwidth_monitor",
-        "driver_list_interfaces",
-        "driver_export_pcap",
-        "driver_network_fingerprint"
-    };
-    for (const char* n : names)
-    {
-        if (name == n)
-            return true;
-    }
-    if (name.rfind("burp_browser_", 0) == 0 ||
-        name.rfind("burp_headless_", 0) == 0)
-        return true;
-    return false;
-}
-
 static bool is_external_mcp_tool(const tool_def_t& tool)
 {
     return tool.visibility == tool_visibility_t::external_visible &&
@@ -820,11 +758,6 @@ static bool is_external_mcp_tool(const tool_def_t& tool)
 
 bool server_t::register_tool(tool_def_t tool)
 {
-    if (is_standalone_redundant_tool_name(tool.name)) {
-        diag::log_tagged_fmt("mcp_srv", "register_tool redundant skipped name='%s'", tool.name.c_str());
-        return false;
-    }
-
     if (is_standalone_ide_chat_only_tool_name(tool.name))
         tool.visibility = tool_visibility_t::ide_chat_only;
     else if (is_standalone_internal_only_tool_name(tool.name))
@@ -1064,7 +997,7 @@ json server_t::handle_initialize(const json& id, const json&)
         "- Attach to or detach from running processes when runtime access is required\n"
         "- Execute untrusted binaries in Windows Sandbox when explicitly requested\n"
         "- Convert integers, endian bytes, ASCII, signed/unsigned views, IEEE-754 values, alignment, VA, RVA, module-relative, and PE file-offset references\n"
-        "- Use bundled Camoufox reverse-engineering browser tools such as camoufox_open_url, launch_browser, navigate, evaluate_js, network_capture, and hook_function\n\n"
+        "- Use bundled Camoufox reverse-engineering browser tools such as launch_browser, navigate, evaluate_js, network_capture, and hook_function\n\n"
         "## First-use workflow\n"
         "- Use `get_tool_descriptions` with `names`, `prefix`, or `query` for only the tools you plan to call; do not spam broad discovery calls\n"
         "- For standalone static binaries, use `sessions_open_file`, then `analysis_get_binary_map_overview` or `disasm_get_section_info`, `disasm_list_functions`, and targeted disassembly/decompilation tools\n"
@@ -1084,8 +1017,8 @@ json server_t::handle_initialize(const json& id, const json&)
         "- Only call mutating tools when the user asked for that action and the target is clear\n"
         "- Runtime, debugger, sandbox, browser interception, and filesystem tools are local trust-boundary tools even though the server binds to localhost\n\n"
         "## Browser/runtime shortcuts\n"
-        "- For simple browser tasks, call `camoufox_open_url` with a fully-qualified URL; it starts visible Camoufox, navigates, and recovers one stale browser context automatically\n"
-        "- Do not call `driver_status`, `check_environment`, `launch_browser`, or separate `navigate` before `camoufox_open_url` unless the user asks for diagnostics or advanced browser instrumentation\n"
+        "- For browser tasks, call `launch_browser` first when no Camoufox session is running, then call `navigate` with the fully-qualified URL\n"
+        "- Do not call `driver_status` before browser-only work unless the user asks for diagnostics or driver-backed runtime access\n"
         "- Call `driver_status` first only for kernel driver, live process memory, debugger, or driver-backed disassembly tasks\n"
         "- Call `driver_load` when kernel backend is not active and deep runtime access is required\n"
         "- Call `driver_attach` with a PID or process name before memory operations\n"

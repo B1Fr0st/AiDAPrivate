@@ -1,8 +1,16 @@
 #pragma once
 
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
 #include <string>
 #include "work_queue.hpp"
-#include "../infra/win_thread.hpp"
+#include "../../helpers/diag_log.hpp"
 #include <vector>
 #include <map>
 #include <unordered_map>
@@ -303,13 +311,36 @@ public:
             }
             _done_cv.notify_all();
         };
-        std::string thread_error;
-        if (!aida::infra::win_thread::start_detached(index_task, &thread_error, aida::infra::win_thread::default_stack_reserve, "code-index.worker")) {
-            if (!work_queue::post(std::move(index_task))) {
-                _state = index_state_t::error;
-                _running = false;
-                _done_cv.notify_all();
-            }
+        bool posted = false;
+        try {
+            posted = work_queue::post([index_task = std::move(index_task)]() mutable {
+                const DWORD tid = GetCurrentThreadId();
+                const ULONGLONG start_ms = GetTickCount64();
+                diag::log_tagged_fmt("code_index",
+                    "worker_enter tid=%lu",
+                    static_cast<unsigned long>(tid));
+                index_task();
+                diag::log_tagged_fmt("code_index",
+                    "worker_exit tid=%lu elapsed_ms=%llu",
+                    static_cast<unsigned long>(tid),
+                    static_cast<unsigned long long>(GetTickCount64() - start_ms));
+            });
+        } catch (...) {
+            posted = false;
+        }
+        if (!posted) {
+            const auto qs = work_queue::stats();
+            diag::log_tagged_fmt("code_index",
+                "worker_post_failed alive=%d shutdown=%d pending=%llu active=%u posted=%llu rejected=%llu",
+                qs.alive ? 1 : 0,
+                qs.shutting_down ? 1 : 0,
+                static_cast<unsigned long long>(qs.pending),
+                qs.active,
+                static_cast<unsigned long long>(qs.posted),
+                static_cast<unsigned long long>(qs.rejected));
+            _state = index_state_t::error;
+            _running = false;
+            _done_cv.notify_all();
         }
     }
 
