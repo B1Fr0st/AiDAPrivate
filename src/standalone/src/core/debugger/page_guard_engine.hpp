@@ -684,17 +684,25 @@ public:
         uint32_t orig_protect = mri.protect;
 
 
+        uint64_t kbase_base = find_module_base(pid, "kernelbase.dll");
         uint64_t k32_base = find_module_base(pid, "kernel32.dll");
-        if (k32_base == 0) {
-            diag::log_tagged_fmt("pg_sniff", "install_failed reason=kernel32_missing pid=%u", pid);
-            return 0;
-        }
-        uint64_t virt_protect_fn = driver_bridge::resolve_export(k32_base, "VirtualProtect");
+        uint64_t virt_protect_fn = kbase_base != 0 ? driver_bridge::resolve_export(kbase_base, "VirtualProtect") : 0;
+        const char* virt_protect_module = virt_protect_fn != 0 ? "kernelbase.dll" : "kernel32.dll";
+        if (virt_protect_fn == 0 && k32_base != 0)
+            virt_protect_fn = driver_bridge::resolve_export(k32_base, "VirtualProtect");
         if (virt_protect_fn == 0) {
-            diag::log_tagged_fmt("pg_sniff", "install_failed reason=virtualprotect_missing pid=%u k32=0x%llX",
-                pid, static_cast<unsigned long long>(k32_base));
+            diag::log_tagged_fmt("pg_sniff", "install_failed reason=virtualprotect_missing pid=%u kernelbase=0x%llX kernel32=0x%llX",
+                pid,
+                static_cast<unsigned long long>(kbase_base),
+                static_cast<unsigned long long>(k32_base));
             return 0;
         }
+        diag::log_tagged_fmt("pg_sniff", "install_virtualprotect pid=%u module=%s addr=0x%llX kernelbase=0x%llX kernel32=0x%llX",
+            pid,
+            virt_protect_module,
+            static_cast<unsigned long long>(virt_protect_fn),
+            static_cast<unsigned long long>(kbase_base),
+            static_cast<unsigned long long>(k32_base));
 
 
         uint64_t ring_addr = driver_bridge::allocate_memory(RING_TOTAL_SIZE + 16);

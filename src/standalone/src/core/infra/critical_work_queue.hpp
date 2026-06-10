@@ -7,10 +7,11 @@
 #include <functional>
 #include <mutex>
 #include <queue>
-#include <thread>
+#include <string>
 #include <vector>
 
 #include "../runtime/manual_map_tls.hpp"
+#include "win_thread.hpp"
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -26,7 +27,7 @@ inline constexpr int POOL_SIZE = 12;
 namespace detail {
 
 struct pool_t {
-    std::vector<std::thread>          workers;
+    std::vector<aida::infra::win_thread::joinable_thread_t> workers;
     std::queue<std::function<void()>> tasks;
     std::mutex                        mtx;
     std::condition_variable           cv;
@@ -95,8 +96,15 @@ inline void initialize() {
         try {
             p.workers.reserve(POOL_SIZE);
             for (int i = 0; i < POOL_SIZE; ++i) {
-                p.workers.emplace_back([&p]() {
-                    aida::manual_map_tls::ensure_current_thread();
+                aida::infra::win_thread::joinable_thread_t worker;
+                std::string err;
+                const bool started = worker.start([&p]() {
+                    bool thread_tls_ready = aida::manual_map_tls::ensure_current_thread();
+                    if (!thread_tls_ready) {
+                        diag::log_tagged_fmt("critical_work_queue",
+                            "worker_tls_unavailable phase=thread_start tid=%lu",
+                            static_cast<unsigned long>(GetCurrentThreadId()));
+                    }
                     while (true) {
                         std::function<void()> task;
                         {
@@ -108,11 +116,27 @@ inline void initialize() {
                         }
                         p.active_tasks.fetch_add(1u, std::memory_order_acq_rel);
                         p.started_tasks.fetch_add(1u, std::memory_order_acq_rel);
+                        const bool task_tls_ready = aida::manual_map_tls::ensure_current_thread();
+                        if (!task_tls_ready) {
+                            diag::log_tagged_fmt("critical_work_queue",
+                                "worker_tls_unavailable phase=task_start tid=%lu started=%llu finished=%llu",
+                                static_cast<unsigned long>(GetCurrentThreadId()),
+                                static_cast<unsigned long long>(p.started_tasks.load(std::memory_order_acquire)),
+                                static_cast<unsigned long long>(p.finished_tasks.load(std::memory_order_acquire)));
+                        }
                         try { task(); } catch (...) {}
                         p.finished_tasks.fetch_add(1u, std::memory_order_acq_rel);
                         p.active_tasks.fetch_sub(1u, std::memory_order_acq_rel);
                     }
-                });
+                }, &err, aida::infra::win_thread::default_stack_reserve, "critical_work_queue");
+                if (started) {
+                    p.workers.emplace_back(std::move(worker));
+                } else {
+                    diag::log_tagged_fmt("critical_work_queue",
+                        "worker_start_failed index=%d err=%s",
+                        i,
+                        err.empty() ? "<none>" : err.c_str());
+                }
             }
         } catch (...) {
             if (p.workers.empty()) {
@@ -154,7 +178,7 @@ inline void shutdown(std::uint32_t timeout_ms) {
     if (!p.shutdown_called.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
     p.shutting_down.store(true, std::memory_order_release);
     p.alive.store(false, std::memory_order_release);
-    std::vector<std::thread> to_join;
+    std::vector<aida::infra::win_thread::joinable_thread_t> to_join;
     {
         std::lock_guard<std::mutex> lk(p.mtx);
         to_join = std::move(p.workers);
@@ -173,9 +197,8 @@ inline void shutdown(std::uint32_t timeout_ms) {
             const ULONGLONG now = GetTickCount64();
             wait_ms = now >= deadline ? 0 : static_cast<DWORD>(deadline - now);
         }
-        DWORD rc = WaitForSingleObject(static_cast<HANDLE>(w.native_handle()), wait_ms);
-        if (rc == WAIT_OBJECT_0)
-            w.join();
+        if (w.join_for(wait_ms))
+            continue;
         else
             w.detach();
 #else

@@ -2,6 +2,11 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const os = require('node:os');
+const path = require('node:path');
+
+process.env.LOCAL_HSM_PATH = process.env.LOCAL_HSM_PATH || path.join(os.tmpdir(), `aida-local-hsm-${process.pid}.bin`);
+process.env.LOCAL_HSM_PASSPHRASE = process.env.LOCAL_HSM_PASSPHRASE || 'license-false-positive-test-passphrase';
 
 const capturedQueries = [];
 const poolPath = require.resolve('../db/pool');

@@ -1189,28 +1189,78 @@ namespace anti_tamper::mcp_posture
             return p.lexically_normal().string();
         }
 
-        inline std::vector<std::string> camoufox_trusted_runtime_roots()
+        inline void add_unique_camoufox_root(std::vector<std::string>& roots, const std::string& path)
         {
-            std::vector<std::string> roots;
-            auto add_root = [&](const std::string& path) {
-                const std::string canonical = canonical_lower_path(path);
-                if (canonical.empty())
+            const std::string canonical = canonical_lower_path(path);
+            if (canonical.empty())
+                return;
+            for (const auto& existing : roots) {
+                if (canonical_lower_path(existing) == canonical)
                     return;
-                for (const auto& existing : roots) {
-                    if (canonical_lower_path(existing) == canonical)
-                        return;
-                }
-                roots.push_back(path);
-            };
-            const std::string exe_dir = executable_dir();
-            add_root(exe_dir);
-            add_root(current_dir());
-            add_root(parent_path_string(exe_dir));
+            }
+            roots.push_back(path);
+        }
+
+        inline void add_path_and_ancestors_to_roots(std::vector<std::string>& roots, const std::string& path, std::size_t depth)
+        {
+            std::string current = unquote_path_token(path);
+            for (std::size_t i = 0; i < depth && !current.empty(); ++i) {
+                add_unique_camoufox_root(roots, current);
+                current = parent_path_string(current);
+            }
+        }
+
+        inline void add_env_path_and_ancestors_to_roots(std::vector<std::string>& roots, const char* name, std::size_t depth)
+        {
+            const std::string value = read_env(name);
+            if (!trim(value).empty())
+                add_path_and_ancestors_to_roots(roots, value, depth);
+        }
+
+        inline void add_camoufox_sidecar_roots(std::vector<std::string>& roots)
+        {
+            add_env_path_and_ancestors_to_roots(roots, "AIDA_CAMOUFOX_EXECUTABLE", 6);
+            add_env_path_and_ancestors_to_roots(roots, "AIDA_CAMOUFOX_PYTHON", 6);
+            add_env_path_and_ancestors_to_roots(roots, "AIDA_CAMOUFOX_MCP_EXECUTABLE", 6);
             const std::string local = read_env("LOCALAPPDATA");
             if (!local.empty()) {
                 const std::string aida_root = join_path_string(local, "AiDA");
-                add_root(join_path_string(join_path_string(aida_root, "camoufox"), "current"));
-                add_root(join_path_string(join_path_string(join_path_string(aida_root, "embedded"), "camoufox"), "current"));
+                add_unique_camoufox_root(roots, aida_root);
+                add_unique_camoufox_root(roots, join_path_string(join_path_string(aida_root, "camoufox"), "current"));
+                add_unique_camoufox_root(roots, join_path_string(join_path_string(join_path_string(aida_root, "embedded"), "camoufox"), "current"));
+            }
+            const std::string temp = read_env("TEMP").empty() ? read_env("TMP") : read_env("TEMP");
+            if (!temp.empty()) {
+                add_unique_camoufox_root(roots, join_path_string(temp, "AiDA"));
+                add_unique_camoufox_root(roots, join_path_string(join_path_string(temp, "AiDA"), "camoufox"));
+                add_unique_camoufox_root(roots, join_path_string(join_path_string(join_path_string(temp, "AiDA"), "camoufox"), "current"));
+                add_unique_camoufox_root(roots, join_path_string(temp, "aida-camoufox"));
+                add_unique_camoufox_root(roots, join_path_string(join_path_string(temp, "aida-camoufox"), "current"));
+            }
+        }
+
+        inline bool path_matches_env_path(const std::string& path, const char* name)
+        {
+            const std::string value = read_env(name);
+            if (trim(value).empty())
+                return false;
+            return canonical_lower_path(unquote_path_token(path)) == canonical_lower_path(unquote_path_token(value));
+        }
+
+        inline std::vector<std::string> camoufox_trusted_runtime_roots()
+        {
+            std::vector<std::string> roots;
+            add_camoufox_sidecar_roots(roots);
+            const std::string exe_dir = executable_dir();
+            add_unique_camoufox_root(roots, exe_dir);
+            add_unique_camoufox_root(roots, current_dir());
+            add_unique_camoufox_root(roots, parent_path_string(exe_dir));
+            add_unique_camoufox_root(roots, parent_path_string(parent_path_string(exe_dir)));
+            const std::string local = read_env("LOCALAPPDATA");
+            if (!local.empty()) {
+                const std::string aida_root = join_path_string(local, "AiDA");
+                add_unique_camoufox_root(roots, join_path_string(join_path_string(aida_root, "camoufox"), "current"));
+                add_unique_camoufox_root(roots, join_path_string(join_path_string(join_path_string(aida_root, "embedded"), "camoufox"), "current"));
             }
             return roots;
         }
@@ -1224,11 +1274,23 @@ namespace anti_tamper::mcp_posture
             std::error_code ec;
             if (!std::filesystem::is_regular_file(command_path, ec) || ec)
                 return false;
+            if (path_matches_env_path(command_path, "AIDA_CAMOUFOX_PYTHON"))
+                return true;
             static const char* runtime_dirs[] = {
                 "deps\\camoufox-runtime",
                 "camoufox-runtime",
                 "deps\\camoufox-python",
-                "camoufox-python"
+                "camoufox-python",
+                "deps\\python",
+                "python",
+                "deps\\python-3.12",
+                "python-3.12",
+                "deps\\python-3.12.10-x64",
+                "python-3.12.10-x64",
+                "deps\\Python312",
+                "Python312",
+                "deps\\Python312-3.12.10-x64",
+                "Python312-3.12.10-x64"
             };
             for (const auto& root : camoufox_trusted_runtime_roots()) {
                 for (const char* rel : runtime_dirs) {
@@ -1272,27 +1334,21 @@ namespace anti_tamper::mcp_posture
             std::error_code ec;
             if (!std::filesystem::is_regular_file(command_path, ec) || ec)
                 return false;
+            if (path_matches_env_path(command_path, "AIDA_CAMOUFOX_MCP_EXECUTABLE"))
+                return true;
             std::vector<std::string> roots;
-            auto add_root = [&](const std::string& path) {
-                const std::string canonical = canonical_lower_path(path);
-                if (canonical.empty())
-                    return;
-                for (const auto& existing : roots) {
-                    if (canonical_lower_path(existing) == canonical)
-                        return;
-                }
-                roots.push_back(path);
-            };
+            add_camoufox_sidecar_roots(roots);
             const std::string exe_dir = executable_dir();
-            add_root(exe_dir);
-            add_root(current_dir());
-            add_root(parent_path_string(exe_dir));
+            add_unique_camoufox_root(roots, exe_dir);
+            add_unique_camoufox_root(roots, current_dir());
+            add_unique_camoufox_root(roots, parent_path_string(exe_dir));
+            add_unique_camoufox_root(roots, parent_path_string(parent_path_string(exe_dir)));
             const std::string local = read_env("LOCALAPPDATA");
             if (!local.empty()) {
                 const std::string aida_root = join_path_string(local, "AiDA");
-                add_root(join_path_string(aida_root, "current"));
-                add_root(join_path_string(aida_root, "runtime"));
-                add_root(join_path_string(aida_root, "embedded"));
+                add_unique_camoufox_root(roots, join_path_string(aida_root, "current"));
+                add_unique_camoufox_root(roots, join_path_string(aida_root, "runtime"));
+                add_unique_camoufox_root(roots, join_path_string(aida_root, "embedded"));
             }
             for (const auto& root : roots) {
                 const std::string deps_dir = join_path_string(root, "deps");
@@ -1313,6 +1369,8 @@ namespace anti_tamper::mcp_posture
             std::error_code ec;
             if (!std::filesystem::is_regular_file(browser_path, ec) || ec)
                 return false;
+            if (path_matches_env_path(browser_path, "AIDA_CAMOUFOX_EXECUTABLE"))
+                return true;
             const std::string canonical = canonical_lower_path(browser_path);
             if (canonical.find("\\camoufox-") == std::string::npos)
                 return false;
@@ -1371,19 +1429,22 @@ namespace anti_tamper::mcp_posture
 
         inline bool camoufox_args_trusted(const std::vector<std::string>& args, std::string& reason)
         {
-            if (args.size() < 2) {
+            std::size_t module_index = 0;
+            while (module_index < args.size() && trim(args[module_index]) == "-I")
+                ++module_index;
+            if (args.size() < module_index + 2) {
                 reason = "args_missing_module";
                 return false;
             }
-            if (trim(args[0]) != "-m") {
+            if (trim(args[module_index]) != "-m") {
                 reason = "args_missing_module_switch";
                 return false;
             }
-            if (lower_ascii(trim(args[1])) != "camoufox_reverse_mcp") {
+            if (lower_ascii(trim(args[module_index + 1])) != "camoufox_reverse_mcp") {
                 reason = "args_module_mismatch";
                 return false;
             }
-            for (std::size_t i = 2; i < args.size(); ++i) {
+            for (std::size_t i = module_index + 2; i < args.size(); ++i) {
                 const std::string arg = lower_ascii(trim(args[i]));
                 if (arg.empty())
                     continue;

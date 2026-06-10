@@ -35,6 +35,7 @@ struct launch_config_t
     int                      launch_timeout_ms  = 35000;
     int                      window_width       = 1280;
     int                      window_height      = 900;
+    bool                     testlab_fast_probe = false;
 };
 
 struct page_status_t

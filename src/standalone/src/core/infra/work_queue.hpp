@@ -8,10 +8,11 @@
 #include <functional>
 #include <mutex>
 #include <queue>
-#include <thread>
+#include <string>
 #include <vector>
 
 #include "../runtime/manual_map_tls.hpp"
+#include "win_thread.hpp"
 
 namespace work_queue {
 
@@ -42,7 +43,7 @@ inline const int SERVICE_POOL_SIZE = []() {
 namespace detail {
 
 struct pool_t {
-    std::vector<std::thread>          workers;
+    std::vector<aida::infra::win_thread::joinable_thread_t> workers;
     std::queue<std::function<void()>> tasks;
     std::mutex                        mtx;
     std::condition_variable           cv;
@@ -118,8 +119,15 @@ inline void initialize_pool(detail::pool_t& p, int pool_size) {
         try {
             p.workers.reserve(static_cast<std::size_t>(pool_size));
             for (int i = 0; i < pool_size; ++i) {
-                p.workers.emplace_back([&p]() {
-                    aida::manual_map_tls::ensure_current_thread();
+                aida::infra::win_thread::joinable_thread_t worker;
+                std::string err;
+                const bool started = worker.start([&p]() {
+                    bool thread_tls_ready = aida::manual_map_tls::ensure_current_thread();
+                    if (!thread_tls_ready) {
+                        diag::log_tagged_fmt("work_queue",
+                            "worker_tls_unavailable phase=thread_start tid=%lu",
+                            static_cast<unsigned long>(GetCurrentThreadId()));
+                    }
                     while (true) {
                         std::function<void()> task;
                         {
@@ -131,11 +139,28 @@ inline void initialize_pool(detail::pool_t& p, int pool_size) {
                         }
                         p.active_tasks.fetch_add(1u, std::memory_order_acq_rel);
                         p.started_tasks.fetch_add(1u, std::memory_order_acq_rel);
+                        const bool task_tls_ready = aida::manual_map_tls::ensure_current_thread();
+                        if (!task_tls_ready) {
+                            diag::log_tagged_fmt("work_queue",
+                                "worker_tls_unavailable phase=task_start tid=%lu started=%llu finished=%llu",
+                                static_cast<unsigned long>(GetCurrentThreadId()),
+                                static_cast<unsigned long long>(p.started_tasks.load(std::memory_order_acquire)),
+                                static_cast<unsigned long long>(p.finished_tasks.load(std::memory_order_acquire)));
+                        }
                         try { task(); } catch (...) {}
                         p.finished_tasks.fetch_add(1u, std::memory_order_acq_rel);
                         p.active_tasks.fetch_sub(1u, std::memory_order_acq_rel);
                     }
-                });
+                }, &err, aida::infra::win_thread::default_stack_reserve, "work_queue");
+                if (started) {
+                    p.workers.emplace_back(std::move(worker));
+                } else {
+                    diag::log_tagged_fmt("work_queue",
+                        "worker_start_failed index=%d pool_size=%d err=%s",
+                        i,
+                        pool_size,
+                        err.empty() ? "<none>" : err.c_str());
+                }
             }
         } catch (...) {
             if (p.workers.empty()) {
@@ -192,7 +217,7 @@ inline void shutdown_pool(detail::pool_t& p) {
     if (!p.shutdown_called.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
     p.shutting_down.store(true, std::memory_order_release);
     p.alive.store(false, std::memory_order_release);
-    std::vector<std::thread> to_join;
+    std::vector<aida::infra::win_thread::joinable_thread_t> to_join;
     {
         std::lock_guard<std::mutex> lk(p.mtx);
         to_join = std::move(p.workers);

@@ -26,6 +26,7 @@
 #include "hardware_id/hardware_id_v2.hpp"
 #include "plaintext_window.hpp"
 #include "../testlab/test_all_features.hpp"
+#include "../../../../../src/shared/telemetry/telemetry_client.hpp"
 
 #include <windows.h>
 #include <winioctl.h>
@@ -2653,9 +2654,12 @@ namespace
         return wait_for_arc_driver_ready_for_load(phase, timeout_ms);
     }
 
-    std::string s_challenge_id;
-    std::string s_challenge_nonce;
-    std::mutex  s_challenge_mtx;
+    struct challenge_material_t {
+        std::string id;
+        std::string nonce;
+    };
+
+    std::mutex s_validation_endpoint_mtx;
 
     std::string s_tls_exporter_value;
     std::mutex  s_tls_exporter_mtx;
@@ -3357,6 +3361,50 @@ namespace
 #else
         return "https://api.aidapro.net";
 #endif
+    }
+
+    void configure_telemetry_from_settings(const settings_sa_t& settings, const char* phase)
+    {
+        const char* phase_name = phase ? phase : "unknown";
+        if (settings.license_key.empty() ||
+            settings.license_session_token.empty() ||
+            settings.license_auth_hmac_key_b64.empty())
+        {
+            lic_log_fmt(
+                "telemetry_config_skipped phase=%s key_set=%d session_len=%zu auth_b64_len=%zu",
+                phase_name,
+                settings.license_key.empty() ? 0 : 1,
+                settings.license_session_token.size(),
+                settings.license_auth_hmac_key_b64.size());
+            return;
+        }
+
+        std::vector<uint8_t> auth_key = base64_decode(settings.license_auth_hmac_key_b64);
+        if (auth_key.size() != 32)
+        {
+            lic_log_fmt(
+                "telemetry_config_invalid_auth_key phase=%s auth_len=%zu auth_b64_len=%zu",
+                phase_name,
+                auth_key.size(),
+                settings.license_auth_hmac_key_b64.size());
+            return;
+        }
+
+        auto& telemetry = aida::telemetry::instance();
+        telemetry.set_endpoint(get_cloud_function_host());
+        telemetry.set_license_key(settings.license_key);
+        telemetry.set_auth_hmac_key(std::move(auth_key));
+        telemetry.set_session_token(settings.license_session_token);
+        telemetry.start_background_flusher();
+        lic_log_fmt(
+            "telemetry_configured phase=%s session_len=%zu auth_len=32",
+            phase_name,
+            settings.license_session_token.size());
+        const bool flushed = telemetry.flush_blocking();
+        lic_log_fmt(
+            "telemetry_initial_flush phase=%s ok=%d",
+            phase_name,
+            flushed ? 1 : 0);
     }
 
     std::shared_ptr<httplib::Client> get_or_create_license_client()
@@ -4569,7 +4617,7 @@ namespace
         return result;
     }
 
-    bool fetch_challenge()
+    bool fetch_challenge(challenge_material_t& out)
     {
         lic_log("fetch_challenge_enter");
         std::string host = get_cloud_function_host();
@@ -4609,9 +4657,9 @@ namespace
         std::string cnonce = j.value("challenge_nonce", "");
         if (cid.empty() || cnonce.empty()) return false;
 
-        std::lock_guard<std::mutex> lk(s_challenge_mtx);
-        s_challenge_id = std::move(cid);
-        s_challenge_nonce = std::move(cnonce);
+        out.id = std::move(cid);
+        out.nonce = std::move(cnonce);
+        lic_log_fmt("fetch_challenge_ok id_len=%zu nonce_len=%zu", out.id.size(), out.nonce.size());
         return true;
     }
 
@@ -4703,17 +4751,19 @@ namespace
         std::string& error_out,
         json& response_out)
     {
-        fetch_challenge();
+        std::unique_lock<std::mutex> endpoint_lk(s_validation_endpoint_mtx);
+        challenge_material_t challenge;
+        if (!fetch_challenge(challenge)) {
+            lic_log("endpoint_once_challenge_unavailable");
+            error_out = "License activation challenge unavailable.";
+            response_out = json::object({{"ok", false}, {"error", "challenge_unavailable"}});
+            return false;
+        }
 
         std::vector<std::pair<std::string,std::string>> hdrs;
-        {
-            std::lock_guard<std::mutex> lk(s_challenge_mtx);
-            if (!s_challenge_id.empty() && !s_challenge_nonce.empty()) {
-                hdrs.push_back({"X-Challenge-Id", s_challenge_id});
-                hdrs.push_back({"X-Challenge-Signature",
-                                hmac_sha256_hex(s_challenge_nonce, body_str)});
-            }
-        }
+        hdrs.push_back({"X-Challenge-Id", challenge.id});
+        hdrs.push_back({"X-Challenge-Signature",
+                        hmac_sha256_hex(challenge.nonce, body_str)});
         {
             std::lock_guard<std::mutex> lk(s_tls_exporter_mtx);
             if (!s_tls_exporter_value.empty())
@@ -5832,6 +5882,7 @@ namespace
             s_cached_arc_bind_token = settings.license_session_token;
         }
         update_proof_hash(settings.license_session_token, hwid);
+        configure_telemetry_from_settings(settings, "apply_valid_response");
 
         {
             std::lock_guard<std::mutex> rot_lk(s_rotation_mtx);

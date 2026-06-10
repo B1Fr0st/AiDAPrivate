@@ -673,6 +673,7 @@ camoufox::launch_config_t launch_config_from_mcp_params(const json& params)
     cfg.launch_timeout_ms = json_int_param(params, "launch_timeout_ms", cfg.launch_timeout_ms);
     cfg.window_width = json_int_param(params, "window_width", json_int_param(params, "width", cfg.window_width));
     cfg.window_height = json_int_param(params, "window_height", json_int_param(params, "height", cfg.window_height));
+    cfg.testlab_fast_probe = json_bool_param(params, "aida_testlab_fast_probe", json_bool_param(params, "testlab_fast_probe", cfg.testlab_fast_probe));
     return cfg;
 }
 
@@ -1030,7 +1031,7 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"track_props", "boolean", "Track property access", false},
              {"track_reflect", "boolean", "Track Reflect APIs", false},
              {"proxy_objects", "array", "Global objects to proxy", false},
-             {"max_entries", "number", "Maximum log entries", false}}, false, 45000},
+             {"max_entries", "number", "Maximum log entries", false}}, false, 60000},
         {"compare_env", "Collect browser environment fingerprint data for comparison.",
             {{"properties", "array", "Specific properties to check", false}}, true, 30000},
         {"instrumentation", "Install, query, stop, or reload source-level JSVMP instrumentation.",

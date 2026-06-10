@@ -210,6 +210,50 @@ bool append_unique_path(std::vector<std::wstring>& paths, const std::wstring& pa
     return true;
 }
 
+std::wstring local_appdata_aida_root();
+
+void append_path_and_ancestors(std::vector<std::wstring>& paths, const std::wstring& path, size_t depth)
+{
+    std::wstring current = path;
+    for (size_t i = 0; i < depth && !current.empty(); ++i)
+    {
+        append_unique_path(paths, current);
+        current = parent_dir_w(current);
+    }
+}
+
+void append_env_path_roots(std::vector<std::wstring>& paths, const wchar_t* name, size_t depth)
+{
+    std::wstring value;
+    if (read_env_path_w(name, value))
+        append_path_and_ancestors(paths, value, depth);
+}
+
+void append_camoufox_sidecar_roots(std::vector<std::wstring>& paths)
+{
+    append_env_path_roots(paths, L"AIDA_CAMOUFOX_EXECUTABLE", 6);
+    append_env_path_roots(paths, L"AIDA_CAMOUFOX_PYTHON", 6);
+    append_env_path_roots(paths, L"AIDA_CAMOUFOX_MCP_EXECUTABLE", 6);
+    std::wstring aida_root = local_appdata_aida_root();
+    append_unique_path(paths, aida_root);
+    if (!aida_root.empty())
+    {
+        append_unique_path(paths, join_path_w(join_path_w(aida_root, L"camoufox"), L"current"));
+        append_unique_path(paths, join_path_w(join_path_w(join_path_w(aida_root, L"embedded"), L"camoufox"), L"current"));
+    }
+    std::vector<wchar_t> temp(32768);
+    DWORD temp_len = GetTempPathW(static_cast<DWORD>(temp.size()), temp.data());
+    if (temp_len != 0 && temp_len < static_cast<DWORD>(temp.size()))
+    {
+        std::wstring temp_root(temp.data(), temp_len);
+        append_unique_path(paths, join_path_w(temp_root, L"AiDA"));
+        append_unique_path(paths, join_path_w(join_path_w(temp_root, L"AiDA"), L"camoufox"));
+        append_unique_path(paths, join_path_w(join_path_w(join_path_w(temp_root, L"AiDA"), L"camoufox"), L"current"));
+        append_unique_path(paths, join_path_w(temp_root, L"aida-camoufox"));
+        append_unique_path(paths, join_path_w(join_path_w(temp_root, L"aida-camoufox"), L"current"));
+    }
+}
+
 std::wstring executable_dir_w()
 {
     std::vector<wchar_t> buffer(MAX_PATH);
@@ -223,8 +267,6 @@ std::wstring executable_dir_w()
         if (buffer.size() > 32768) return {};
     }
 }
-
-std::wstring local_appdata_aida_root();
 
 std::wstring current_dir_w()
 {
@@ -241,10 +283,12 @@ std::wstring current_dir_w()
 std::vector<std::wstring> runtime_base_dirs()
 {
     std::vector<std::wstring> bases;
+    append_camoufox_sidecar_roots(bases);
     std::wstring exe_dir = executable_dir_w();
     append_unique_path(bases, exe_dir);
     append_unique_path(bases, current_dir_w());
     append_unique_path(bases, parent_dir_w(exe_dir));
+    append_unique_path(bases, parent_dir_w(parent_dir_w(exe_dir)));
     std::wstring aida_root = local_appdata_aida_root();
     append_unique_path(bases, aida_root);
     if (!aida_root.empty())
@@ -255,13 +299,22 @@ std::vector<std::wstring> runtime_base_dirs()
     return bases;
 }
 
+bool is_bundled_browser_dir(const std::wstring& dir)
+{
+    return file_exists_w(join_path_w(dir, L"camoufox.exe")) &&
+        file_exists_w(join_path_w(dir, L"application.ini")) &&
+        directory_exists_w(join_path_w(dir, L"browser"));
+}
+
 std::vector<std::wstring> aida_runtime_base_dirs()
 {
     std::vector<std::wstring> bases;
+    append_camoufox_sidecar_roots(bases);
     std::wstring exe_dir = executable_dir_w();
     append_unique_path(bases, exe_dir);
     append_unique_path(bases, current_dir_w());
     append_unique_path(bases, parent_dir_w(exe_dir));
+    append_unique_path(bases, parent_dir_w(parent_dir_w(exe_dir)));
     std::wstring aida_root = local_appdata_aida_root();
     append_unique_path(bases, aida_root);
     if (!aida_root.empty())
@@ -300,8 +353,17 @@ bool discover_bundled_browser_dir(std::wstring& out_dir)
     const auto bases = runtime_base_dirs();
     for (const auto& base : bases)
     {
-        std::wstring candidate = join_path_w(join_path_w(base, L"deps"), name);
-        if (file_exists_w(join_path_w(candidate, L"camoufox.exe")))
+        std::wstring candidate = base;
+        if (is_bundled_browser_dir(candidate))
+        {
+            out_dir = candidate;
+            SetEnvironmentVariableW(L"AIDA_CAMOUFOX_EXECUTABLE", join_path_w(candidate, L"camoufox.exe").c_str());
+            diag::log_tagged_fmt("camoufox_install", "bundled_browser selected path=%s base=%s",
+                wide_to_utf8(candidate).c_str(), wide_to_utf8(base).c_str());
+            return true;
+        }
+        candidate = join_path_w(join_path_w(base, L"deps"), name);
+        if (is_bundled_browser_dir(candidate))
         {
             out_dir = candidate;
             SetEnvironmentVariableW(L"AIDA_CAMOUFOX_EXECUTABLE", join_path_w(candidate, L"camoufox.exe").c_str());
@@ -310,7 +372,7 @@ bool discover_bundled_browser_dir(std::wstring& out_dir)
             return true;
         }
         candidate = join_path_w(base, name);
-        if (file_exists_w(join_path_w(candidate, L"camoufox.exe")))
+        if (is_bundled_browser_dir(candidate))
         {
             out_dir = candidate;
             SetEnvironmentVariableW(L"AIDA_CAMOUFOX_EXECUTABLE", join_path_w(candidate, L"camoufox.exe").c_str());
@@ -343,6 +405,9 @@ bool discover_configured_reverse_mcp_executable(std::wstring& out_path)
 bool discover_bundled_reverse_mcp_executable(std::wstring& out_path)
 {
     const std::vector<std::wstring> rels = {
+        L".deps\\AiDA_CamoufoxReverseMcp.exe",
+        L".deps\\camoufox-reverse-mcp.exe",
+        L".deps\\camoufox_reverse_mcp.exe",
         L"deps\\AiDA_CamoufoxReverseMcp.exe",
         L"deps\\camoufox-reverse-mcp.exe",
         L"deps\\camoufox_reverse_mcp.exe",

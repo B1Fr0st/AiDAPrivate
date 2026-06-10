@@ -13,6 +13,7 @@
 
 #include "webhook.hpp"
 #include "key_pipeline.hpp"
+#include "../infra/win_thread.hpp"
 
 #pragma comment(lib, "bcrypt.lib")
 
@@ -362,10 +363,11 @@ inline bool check_smc_race_between_threads()
     std::atomic<bool> stop{false};
     std::atomic<bool> writer_started{false};
 
-    std::thread writer;
+    aida::infra::win_thread::joinable_thread_t writer;
     try
     {
-        writer = std::thread([&]() {
+        std::string err;
+        if (!writer.start([&]() {
             writer_started.store(true);
             uint8_t toggle = 0;
             while (!stop.load(std::memory_order_acquire))
@@ -377,7 +379,15 @@ inline bool check_smc_race_between_threads()
                 if ((toggle & 0x3F) == 0)
                     std::this_thread::yield();
             }
-        });
+        },
+            &err,
+            aida::infra::win_thread::default_stack_reserve,
+            "anti_emulation_smc_writer"))
+        {
+            webhook::send_debug_log("emu_smc_race", std::string("worker_unavailable: ") + err, false);
+            VirtualFree(code_pg, 0, MEM_RELEASE);
+            return false;
+        }
     }
     catch (const std::exception& ex)
     {

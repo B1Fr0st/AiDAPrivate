@@ -114,22 +114,24 @@ test('AnomalyModel flags slightly-anomalous metrics between flag and revoke thre
         }, Date.now() - (baselineCount - i) * 60_000);
     }
     for (let i = 0; i < baselineCount; i++) {
+        const cadenceJitter = (i % 101) - 50;
+        const rdtscJitter = ((i * 37) % 1009) * 1000;
         m.addSample('LIC-FLAG', {
-            cadenceMs: 5000 + (Math.random() * 100 - 50),
-            rdtscDeltaMean: 1e9 + Math.random() * 1e6,
-            rdtscDeltaStd: 1e5 + Math.random() * 200,
+            cadenceMs: 5000 + cadenceJitter,
+            rdtscDeltaMean: 1e9 + rdtscJitter,
+            rdtscDeltaStd: 1e5 + (i % 200),
             exceptionCount: 0,
-            moduleLoadCount: 12 + (Math.random() < 0.05 ? 1 : 0),
+            moduleLoadCount: 12 + (i % 20 === 0 ? 1 : 0),
             moduleLoadUnique: 12,
         }, Date.now() - (baselineCount - i) * 30_000);
     }
     const engine = new anomalyScore.AnomalyScoringEngine({ model: m, minBaselineSamples: 32 });
     const summary = m.summary('LIC-FLAG');
-    const cadStd = Math.max(1, summary.metrics.cadenceMs.std);
-    const flagDelta = (anomalyScore.FLAG_THRESHOLD + 0.4) * cadStd;
+    const rdtscStd = Math.max(1, summary.metrics.rdtscDeltaMean.std);
+    const flagDelta = (anomalyScore.FLAG_THRESHOLD + 0.4) * rdtscStd;
     const decision = engine.evaluate('LIC-FLAG', {
-        cadenceMs: summary.metrics.cadenceMs.mean + flagDelta,
-        rdtscDeltaMean: summary.metrics.rdtscDeltaMean.mean,
+        cadenceMs: summary.metrics.cadenceMs.mean,
+        rdtscDeltaMean: summary.metrics.rdtscDeltaMean.mean + flagDelta,
         rdtscDeltaStd: summary.metrics.rdtscDeltaStd.mean,
         exceptionCount: summary.metrics.exceptionCount.mean,
         moduleLoadCount: summary.metrics.moduleLoadCount.mean,

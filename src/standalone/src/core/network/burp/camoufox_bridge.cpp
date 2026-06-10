@@ -173,6 +173,8 @@ constexpr int kToolListWaitMaxMs = 5000;
 constexpr int kLaunchWaitMinMs = 5000;
 constexpr int kLaunchWaitMaxMs = 120000;
 constexpr int kBundledVisibleLaunchWaitMinMs = 70000;
+constexpr int kTestLabLaunchWaitDefaultMs = 15000;
+constexpr int kTestLabLaunchWaitMaxMs = 15000;
 constexpr int kReadinessProbeTimeoutMs = 10000;
 constexpr int kNavigationWaitMaxMs = 50000;
 constexpr uint64_t kPythonDiscoveryBudgetMs = 15000;
@@ -216,6 +218,25 @@ bool env_flag_enabled_a(const char* name)
            _stricmp(value, "on") == 0;
 }
 
+int env_int_a(const char* name, int fallback)
+{
+    if (!name || !name[0]) return fallback;
+    char value[32] = {};
+    DWORD n = GetEnvironmentVariableA(name, value, static_cast<DWORD>(sizeof(value)));
+    if (n == 0 || n >= static_cast<DWORD>(sizeof(value))) return fallback;
+    value[sizeof(value) - 1] = '\0';
+    char* end = nullptr;
+    long parsed = std::strtol(value, &end, 10);
+    if (end == value) return fallback;
+    while (end && *end)
+    {
+        if (*end != ' ' && *end != '\t') return fallback;
+        ++end;
+    }
+    if (parsed < 0 || parsed > 1000000) return fallback;
+    return static_cast<int>(parsed);
+}
+
 bool read_env_path_a(const char* name, std::string& out)
 {
     out.clear();
@@ -230,6 +251,32 @@ bool read_env_path_a(const char* name, std::string& out)
     while (!value.empty() && (value.front() == ' ' || value.front() == '\t' || value.front() == '"'))
         value.erase(value.begin());
     while (!value.empty() && (value.back() == ' ' || value.back() == '\t' || value.back() == '"'))
+        value.pop_back();
+    if (value.empty()) return false;
+    out = value;
+    return true;
+}
+
+bool env_path_configured_a(const char* name)
+{
+    std::string value;
+    return read_env_path_a(name, value);
+}
+
+bool read_env_path_w(const wchar_t* name, std::wstring& out)
+{
+    out.clear();
+    if (!name || !name[0]) return false;
+    DWORD need = GetEnvironmentVariableW(name, nullptr, 0);
+    if (need == 0 || need > 32768) return false;
+    std::wstring value;
+    value.resize(need);
+    DWORD got = GetEnvironmentVariableW(name, value.data(), need);
+    if (got == 0 || got >= need) return false;
+    value.resize(got);
+    while (!value.empty() && (value.front() == L' ' || value.front() == L'\t' || value.front() == L'"'))
+        value.erase(value.begin());
+    while (!value.empty() && (value.back() == L' ' || value.back() == L'\t' || value.back() == L'"'))
         value.pop_back();
     if (value.empty()) return false;
     out = value;
@@ -297,6 +344,78 @@ bool path_exists_w(const std::wstring& path)
     return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+bool directory_exists_w(const std::wstring& path)
+{
+    DWORD attr = GetFileAttributesW(path.c_str());
+    return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+struct executable_image_probe_t
+{
+    DWORD machine = 0;
+    LARGE_INTEGER size{};
+};
+
+bool probe_executable_image_w(const std::wstring& path, executable_image_probe_t& out, DWORD& gle)
+{
+    out = {};
+    gle = ERROR_SUCCESS;
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        gle = GetLastError();
+        return false;
+    }
+
+    auto close_fail = [&](DWORD err) {
+        CloseHandle(h);
+        gle = err;
+        return false;
+    };
+
+    if (!GetFileSizeEx(h, &out.size))
+        return close_fail(GetLastError());
+    if (out.size.QuadPart < static_cast<LONGLONG>(sizeof(IMAGE_DOS_HEADER) + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER)))
+        return close_fail(ERROR_BAD_EXE_FORMAT);
+
+    IMAGE_DOS_HEADER dos{};
+    DWORD read = 0;
+    if (!ReadFile(h, &dos, static_cast<DWORD>(sizeof(dos)), &read, nullptr))
+        return close_fail(GetLastError());
+    if (read != sizeof(dos) || dos.e_magic != IMAGE_DOS_SIGNATURE)
+        return close_fail(ERROR_BAD_EXE_FORMAT);
+
+    const LONGLONG nt_min = static_cast<LONGLONG>(sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER));
+    if (dos.e_lfanew <= 0 || static_cast<LONGLONG>(dos.e_lfanew) > out.size.QuadPart - nt_min)
+        return close_fail(ERROR_BAD_EXE_FORMAT);
+
+    LARGE_INTEGER pos{};
+    pos.QuadPart = dos.e_lfanew;
+    if (!SetFilePointerEx(h, pos, nullptr, FILE_BEGIN))
+        return close_fail(GetLastError());
+
+    struct nt_probe_t
+    {
+        DWORD signature = 0;
+        IMAGE_FILE_HEADER file_header{};
+    } nt_probe;
+
+    read = 0;
+    if (!ReadFile(h, &nt_probe, static_cast<DWORD>(sizeof(nt_probe)), &read, nullptr))
+        return close_fail(GetLastError());
+    if (read != sizeof(nt_probe) || nt_probe.signature != IMAGE_NT_SIGNATURE)
+        return close_fail(ERROR_BAD_EXE_FORMAT);
+    if (nt_probe.file_header.Machine != IMAGE_FILE_MACHINE_I386 &&
+        nt_probe.file_header.Machine != IMAGE_FILE_MACHINE_AMD64)
+        return close_fail(ERROR_BAD_EXE_FORMAT);
+
+    out.machine = nt_probe.file_header.Machine;
+    CloseHandle(h);
+    return true;
+}
+
 std::wstring parent_dir_w(const std::wstring& path)
 {
     size_t pos = path.find_last_of(L"\\/");
@@ -322,6 +441,50 @@ bool append_unique_path(std::vector<std::wstring>& paths, const std::wstring& pa
     }
     paths.push_back(path);
     return true;
+}
+
+void append_path_and_ancestors(std::vector<std::wstring>& paths, const std::wstring& path, size_t depth)
+{
+    std::wstring current = path;
+    for (size_t i = 0; i < depth && !current.empty(); ++i)
+    {
+        append_unique_path(paths, current);
+        current = parent_dir_w(current);
+    }
+}
+
+void append_env_path_roots(std::vector<std::wstring>& paths, const wchar_t* name, size_t depth)
+{
+    std::wstring value;
+    if (read_env_path_w(name, value))
+        append_path_and_ancestors(paths, value, depth);
+}
+
+void append_camoufox_sidecar_roots(std::vector<std::wstring>& paths)
+{
+    append_env_path_roots(paths, L"AIDA_CAMOUFOX_EXECUTABLE", 6);
+    append_env_path_roots(paths, L"AIDA_CAMOUFOX_PYTHON", 6);
+    append_env_path_roots(paths, L"AIDA_CAMOUFOX_MCP_EXECUTABLE", 6);
+    wchar_t local[MAX_PATH] = {};
+    DWORD got = GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
+    if (got != 0 && got < MAX_PATH)
+    {
+        std::wstring aida_root = join_path_w(local, L"AiDA");
+        append_unique_path(paths, aida_root);
+        append_unique_path(paths, join_path_w(join_path_w(aida_root, L"camoufox"), L"current"));
+        append_unique_path(paths, join_path_w(join_path_w(join_path_w(aida_root, L"embedded"), L"camoufox"), L"current"));
+    }
+    std::vector<wchar_t> temp(32768);
+    DWORD temp_len = GetTempPathW(static_cast<DWORD>(temp.size()), temp.data());
+    if (temp_len != 0 && temp_len < static_cast<DWORD>(temp.size()))
+    {
+        std::wstring temp_root(temp.data(), temp_len);
+        append_unique_path(paths, join_path_w(temp_root, L"AiDA"));
+        append_unique_path(paths, join_path_w(join_path_w(temp_root, L"AiDA"), L"camoufox"));
+        append_unique_path(paths, join_path_w(join_path_w(join_path_w(temp_root, L"AiDA"), L"camoufox"), L"current"));
+        append_unique_path(paths, join_path_w(temp_root, L"aida-camoufox"));
+        append_unique_path(paths, join_path_w(join_path_w(temp_root, L"aida-camoufox"), L"current"));
+    }
 }
 
 std::wstring executable_dir_w()
@@ -353,10 +516,12 @@ std::wstring current_dir_w()
 std::vector<std::wstring> runtime_base_dirs()
 {
     std::vector<std::wstring> bases;
+    append_camoufox_sidecar_roots(bases);
     std::wstring exe_dir = executable_dir_w();
     append_unique_path(bases, exe_dir);
     append_unique_path(bases, current_dir_w());
     append_unique_path(bases, parent_dir_w(exe_dir));
+    append_unique_path(bases, parent_dir_w(parent_dir_w(exe_dir)));
     wchar_t local[MAX_PATH] = {};
     DWORD got = GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
     if (got != 0 && got < MAX_PATH)
@@ -370,10 +535,12 @@ std::vector<std::wstring> runtime_base_dirs()
 std::vector<std::wstring> aida_runtime_base_dirs()
 {
     std::vector<std::wstring> bases;
+    append_camoufox_sidecar_roots(bases);
     std::wstring exe_dir = executable_dir_w();
     append_unique_path(bases, exe_dir);
     append_unique_path(bases, current_dir_w());
     append_unique_path(bases, parent_dir_w(exe_dir));
+    append_unique_path(bases, parent_dir_w(parent_dir_w(exe_dir)));
     wchar_t local[MAX_PATH] = {};
     DWORD got = GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
     if (got != 0 && got < MAX_PATH)
@@ -387,23 +554,41 @@ std::vector<std::wstring> aida_runtime_base_dirs()
     return bases;
 }
 
+bool is_bundled_browser_dir(const std::wstring& dir)
+{
+    return path_exists_w(join_path_w(dir, L"camoufox.exe")) &&
+        path_exists_w(join_path_w(dir, L"application.ini")) &&
+        directory_exists_w(join_path_w(dir, L"browser"));
+}
+
 bool find_bundled_camoufox_executable(std::string& out_path)
 {
     const std::wstring name = L"camoufox-135.0.1-beta.24-win.x86_64";
     const auto bases = runtime_base_dirs();
     for (const auto& base : bases)
     {
-        std::wstring candidate = join_path_w(join_path_w(join_path_w(base, L"deps"), name), L"camoufox.exe");
-        if (path_exists_w(candidate))
+        std::wstring candidate_dir = base;
+        if (is_bundled_browser_dir(candidate_dir))
         {
+            const std::wstring candidate = join_path_w(candidate_dir, L"camoufox.exe");
             out_path = wide_to_utf8(candidate);
             diag::log_tagged_fmt("camoufox", "bundled_browser_executable selected path=%s base=%s",
                 out_path.c_str(), wide_to_utf8(base).c_str());
             return !out_path.empty();
         }
-        candidate = join_path_w(join_path_w(base, name), L"camoufox.exe");
-        if (path_exists_w(candidate))
+        candidate_dir = join_path_w(join_path_w(base, L"deps"), name);
+        if (is_bundled_browser_dir(candidate_dir))
         {
+            const std::wstring candidate = join_path_w(candidate_dir, L"camoufox.exe");
+            out_path = wide_to_utf8(candidate);
+            diag::log_tagged_fmt("camoufox", "bundled_browser_executable selected path=%s base=%s",
+                out_path.c_str(), wide_to_utf8(base).c_str());
+            return !out_path.empty();
+        }
+        candidate_dir = join_path_w(base, name);
+        if (is_bundled_browser_dir(candidate_dir))
+        {
+            const std::wstring candidate = join_path_w(candidate_dir, L"camoufox.exe");
             out_path = wide_to_utf8(candidate);
             diag::log_tagged_fmt("camoufox", "bundled_browser_executable selected path=%s base=%s",
                 out_path.c_str(), wide_to_utf8(base).c_str());
@@ -417,6 +602,9 @@ bool find_bundled_camoufox_executable(std::string& out_path)
 bool find_bundled_reverse_mcp_executable(std::string& out_path)
 {
     const std::vector<std::wstring> rels = {
+        L".deps\\AiDA_CamoufoxReverseMcp.exe",
+        L".deps\\camoufox-reverse-mcp.exe",
+        L".deps\\camoufox_reverse_mcp.exe",
         L"deps\\AiDA_CamoufoxReverseMcp.exe",
         L"deps\\camoufox-reverse-mcp.exe",
         L"deps\\camoufox_reverse_mcp.exe",
@@ -465,6 +653,17 @@ bool resolve_reverse_mcp_executable(const launch_config_t& cfg, std::string& out
         out_path.clear();
         return false;
     }
+    return true;
+}
+
+bool should_prefer_developer_python_runtime(const launch_config_t& cfg)
+{
+    if (env_flag_enabled_a("AIDA_FILELESS_LAUNCH"))
+        return false;
+    if (!cfg.server_executable.empty())
+        return false;
+    if (env_path_configured_a("AIDA_CAMOUFOX_MCP_EXECUTABLE"))
+        return false;
     return true;
 }
 
@@ -1410,6 +1609,31 @@ int clamp_launch_wait_ms(int requested)
     int wait_ms = requested > 0 ? requested : kLaunchWaitMaxMs;
     if (wait_ms < kLaunchWaitMinMs) wait_ms = kLaunchWaitMinMs;
     if (wait_ms > kLaunchWaitMaxMs) wait_ms = kLaunchWaitMaxMs;
+    return wait_ms;
+}
+
+bool test_lab_launch_fail_fast_enabled(const launch_config_t& cfg)
+{
+    return cfg.testlab_fast_probe || env_flag_enabled_a("AIDA_CAMOUFOX_TESTLAB_FAST_PROBE");
+}
+
+int test_lab_launch_wait_ms(const launch_config_t& cfg)
+{
+    int wait_ms = env_int_a("AIDA_CAMOUFOX_TESTLAB_LAUNCH_MS", 0);
+    if (wait_ms <= 0)
+        wait_ms = cfg.launch_timeout_ms > 0 ? cfg.launch_timeout_ms : kTestLabLaunchWaitDefaultMs;
+    if (wait_ms < kLaunchWaitMinMs) wait_ms = kLaunchWaitMinMs;
+    if (wait_ms > kTestLabLaunchWaitMaxMs) wait_ms = kTestLabLaunchWaitMaxMs;
+    return wait_ms;
+}
+
+int effective_launch_wait_ms(const launch_config_t& cfg, bool bundled_visible_launch)
+{
+    if (test_lab_launch_fail_fast_enabled(cfg))
+        return test_lab_launch_wait_ms(cfg);
+    int wait_ms = clamp_launch_wait_ms(cfg.launch_timeout_ms);
+    if (bundled_visible_launch && wait_ms < kBundledVisibleLaunchWaitMinMs)
+        wait_ms = kBundledVisibleLaunchWaitMinMs;
     return wait_ms;
 }
 
@@ -2753,42 +2977,55 @@ bool preflight_server_entry_locked(const std::string& python_path, const launch_
 bool preflight_server_executable_locked(const std::string& server_executable)
 {
     diag::log_tagged_fmt("camoufox", "server_exe_preflight start path=%s", server_executable.c_str());
-    DWORD code = 0;
-    std::string captured;
-    if (!spawn_executable_capture(server_executable, L"--help", 4000, code, captured, "server_exe_preflight"))
+    if (server_executable.empty())
     {
-        std::string detail = compact_child_output_tail(captured, 600);
-        sg().last_error = detail.empty()
-            ? std::string("camoufox MCP executable preflight failed to spawn or timed out")
-            : std::string("camoufox MCP executable preflight failed to spawn or timed out: ") + detail;
-        diag::log_tagged_fmt("camoufox", "server_exe_preflight spawn_failed detail=%.600s", detail.c_str());
+        sg().last_error = "camoufox MCP executable preflight failed: empty executable path";
+        diag::log_tagged("camoufox", sg().last_error.c_str());
         return false;
     }
-    if (code != 0)
+    const std::wstring path = utf8_to_wide(server_executable);
+    if (path.empty())
     {
-        std::string detail = compact_child_output_tail(captured);
-        sg().last_error = std::string("camoufox MCP executable preflight failed: ") +
-            (detail.empty() ? std::string("exit=") + std::to_string(code) : detail);
-        diag::log_tagged_fmt("camoufox", "server_exe_preflight failed exit=%lu out=%.400s",
-            static_cast<unsigned long>(code), detail.c_str());
+        sg().last_error = "camoufox MCP executable preflight failed: path encoding conversion failed";
+        diag::log_tagged("camoufox", sg().last_error.c_str());
         return false;
     }
-    diag::log_tagged_fmt("camoufox", "server_exe_preflight ok captured_len=%zu", captured.size());
+    const DWORD attr = GetFileAttributesW(path.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY) != 0)
+    {
+        const DWORD gle = attr == INVALID_FILE_ATTRIBUTES ? GetLastError() : ERROR_DIRECTORY;
+        sg().last_error = "camoufox MCP executable preflight failed: executable path is unavailable gle=" + std::to_string(gle);
+        diag::log_tagged_fmt("camoufox", "server_exe_preflight unavailable path=%s attr=0x%08lX gle=%lu",
+            server_executable.c_str(), static_cast<unsigned long>(attr), static_cast<unsigned long>(gle));
+        return false;
+    }
+    executable_image_probe_t image_probe;
+    DWORD probe_gle = ERROR_SUCCESS;
+    if (!probe_executable_image_w(path, image_probe, probe_gle))
+    {
+        sg().last_error = "camoufox MCP executable preflight failed: executable image probe failed gle=" + std::to_string(probe_gle);
+        diag::log_tagged_fmt("camoufox", "server_exe_preflight image_probe_failed path=%s attr=0x%08lX gle=%lu size=%lld machine=0x%04lX",
+            server_executable.c_str(), static_cast<unsigned long>(attr), static_cast<unsigned long>(probe_gle),
+            static_cast<long long>(image_probe.size.QuadPart), static_cast<unsigned long>(image_probe.machine));
+        return false;
+    }
+    diag::log_tagged_fmt("camoufox", "server_exe_preflight ok path=%s attr=0x%08lX machine=0x%04lX size=%lld",
+        server_executable.c_str(), static_cast<unsigned long>(attr), static_cast<unsigned long>(image_probe.machine),
+        static_cast<long long>(image_probe.size.QuadPart));
     return true;
 }
 
 bool wait_for_existing_start_bridge_result(const launch_config_t& cfg, uint64_t caller_start_ms)
 {
-    int wait_ms = clamp_launch_wait_ms(cfg.launch_timeout_ms);
-    if (wait_ms < kBundledVisibleLaunchWaitMinMs)
-        wait_ms = kBundledVisibleLaunchWaitMinMs;
+    int wait_ms = effective_launch_wait_ms(cfg, true);
     if (wait_ms < 5000)
         wait_ms = 5000;
     const uint64_t wait_limit_ms = static_cast<uint64_t>(wait_ms) + 5000;
     const uint64_t wait_start_ms = now_ms();
     uint64_t last_log_ms = 0;
-    diag::log_tagged_fmt("camoufox", "start_bridge operation_busy_wait_begin wait_ms=%llu requested_timeout_ms=%d caller_elapsed_ms=%llu",
+    diag::log_tagged_fmt("camoufox", "start_bridge operation_busy_wait_begin wait_ms=%llu requested_timeout_ms=%d testlab_fast_probe=%d caller_elapsed_ms=%llu",
         static_cast<unsigned long long>(wait_limit_ms), cfg.launch_timeout_ms,
+        test_lab_launch_fail_fast_enabled(cfg) ? 1 : 0,
         static_cast<unsigned long long>(wait_start_ms - caller_start_ms));
     for (;;)
     {
@@ -2903,6 +3140,8 @@ bool prepare_install_for_launch_locked(std::string& python_path)
 nlohmann::json build_launch_args(const launch_config_t& cfg)
 {
     nlohmann::json j;
+    const bool testlab_fast_probe = test_lab_launch_fail_fast_enabled(cfg);
+    const int launch_timeout_ms = testlab_fast_probe ? test_lab_launch_wait_ms(cfg) : cfg.launch_timeout_ms;
     j["session_id"]    = cfg.session_id.empty() ? std::string("default") : cfg.session_id;
     j["headless"]     = cfg.headless;
     j["os_type"]      = cfg.os.empty() ? std::string("auto") : cfg.os;
@@ -2916,7 +3155,9 @@ nlohmann::json build_launch_args(const launch_config_t& cfg)
     j["enable_trace"] = cfg.enable_trace;
     j["window_width"] = cfg.window_width > 0 ? cfg.window_width : 1280;
     j["window_height"] = cfg.window_height > 0 ? cfg.window_height : 900;
-    j["launch_timeout_ms"] = cfg.launch_timeout_ms > 2000 ? cfg.launch_timeout_ms - 1000 : cfg.launch_timeout_ms;
+    j["launch_timeout_ms"] = launch_timeout_ms > 2000 ? launch_timeout_ms - 1000 : launch_timeout_ms;
+    if (testlab_fast_probe)
+        j["aida_testlab_fast_probe"] = true;
     if (!cfg.proxy.empty()) j["proxy"] = cfg.proxy;
     if (!cfg.browser_executable.empty())
     {
@@ -2928,6 +3169,23 @@ nlohmann::json build_launch_args(const launch_config_t& cfg)
 
 std::string camoufox_debug_log_path()
 {
+    std::string configured;
+    if (read_env_path_a("AIDA_CAMOUFOX_DEBUG_LOG", configured))
+        return configured;
+    if (env_flag_enabled_a("AIDA_FILELESS_LAUNCH"))
+    {
+        wchar_t temp[MAX_PATH + 1] = {};
+        DWORD got = GetTempPathW(MAX_PATH, temp);
+        if (got != 0 && got < MAX_PATH)
+        {
+            std::wstring root = join_path_w(std::wstring(temp), L"AiDA");
+            CreateDirectoryW(root.c_str(), nullptr);
+            std::wstring camoufox_root = join_path_w(root, L"camoufox");
+            CreateDirectoryW(camoufox_root.c_str(), nullptr);
+            std::string out = wide_to_utf8(join_path_w(camoufox_root, L"aida_camoufox_debug.log"));
+            if (!out.empty()) return out;
+        }
+    }
     std::wstring dir = executable_dir_w();
     if (dir.empty()) dir = current_dir_w();
     if (dir.empty()) return "aida_camoufox_debug.log";
@@ -2990,6 +3248,45 @@ std::string json_string_or(const nlohmann::json& j, const char* key, const std::
     auto it = j.find(key);
     if (it == j.end() || !it->is_string()) return fallback;
     return it->get<std::string>();
+}
+
+std::string last_camoufox_debug_event_from_tail(const std::string& tail)
+{
+    if (tail.empty()) return {};
+    const std::string prefix = "AIDA_CAMOUFOX ";
+    std::size_t end = tail.size();
+    while (end > 0)
+    {
+        std::size_t begin = tail.rfind('\n', end - 1);
+        std::size_t line_begin = begin == std::string::npos ? 0 : begin + 1;
+        std::string line = tail.substr(line_begin, end - line_begin);
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
+            line.pop_back();
+        std::size_t pos = line.find(prefix);
+        if (pos != std::string::npos)
+        {
+            nlohmann::json parsed = nlohmann::json::parse(line.substr(pos + prefix.size()), nullptr, false);
+            if (parsed.is_object())
+            {
+                std::string event = json_string_or(parsed, "event", std::string());
+                if (!event.empty())
+                {
+                    std::string out = event;
+                    const int elapsed = json_int_or(parsed, "elapsed_ms", -1);
+                    const int uptime = json_int_or(parsed, "uptime_ms", -1);
+                    if (elapsed >= 0)
+                        out += " elapsed_ms=" + std::to_string(elapsed);
+                    if (uptime >= 0)
+                        out += " uptime_ms=" + std::to_string(uptime);
+                    return out;
+                }
+            }
+        }
+        if (begin == std::string::npos)
+            break;
+        end = begin;
+    }
+    return {};
 }
 
 std::string launch_profile_dir_from_response(const nlohmann::json& parsed)
@@ -3572,13 +3869,36 @@ bool start_bridge(const launch_config_t& cfg)
     sg().last_launch_ms = 0;
     publish_state(bridge_state_t::starting, std::string());
 
+    std::string python_path = effective_cfg.python_executable;
+    const bool prefer_developer_python = should_prefer_developer_python_runtime(effective_cfg);
+    bool developer_python_ready = false;
+    lk.unlock();
+    if (prefer_developer_python && python_path.empty())
+        developer_python_ready = ensure_python_available(python_path);
+    else
+        developer_python_ready = !python_path.empty();
+    lk.lock();
+    if (sg().stop_epoch.load(std::memory_order_acquire) != start_stop_epoch)
+    {
+        sg().last_error = "camoufox bridge start cancelled during Python runtime probe";
+        sg().last_launch_ms = now_ms() - bridge_start_ms;
+        diag::log_tagged_fmt("camoufox", "start_bridge cancelled_after_python_probe elapsed_ms=%llu",
+            static_cast<unsigned long long>(sg().last_launch_ms));
+        publish_state(bridge_state_t::error, sg().last_error);
+        return false;
+    }
+
     std::string server_executable;
-    const bool use_server_executable = resolve_reverse_mcp_executable(effective_cfg, server_executable);
-    diag::log_tagged_fmt("camoufox", "start_bridge server_executable_resolve use_exe=%d path=%s",
+    bool use_server_executable = false;
+    if (!(prefer_developer_python && developer_python_ready))
+        use_server_executable = resolve_reverse_mcp_executable(effective_cfg, server_executable);
+    diag::log_tagged_fmt("camoufox", "start_bridge server_executable_resolve use_exe=%d prefer_python=%d python_ready=%d python=%s path=%s",
         static_cast<int>(use_server_executable),
+        prefer_developer_python ? 1 : 0,
+        developer_python_ready ? 1 : 0,
+        python_path.empty() ? "<empty>" : python_path.c_str(),
         server_executable.empty() ? "<empty>" : server_executable.c_str());
 
-    std::string python_path = effective_cfg.python_executable;
     if (!use_server_executable && !python_path.empty())
     {
         std::string reason;
@@ -3745,16 +4065,17 @@ bool start_bridge(const launch_config_t& cfg)
         static_cast<unsigned long long>(start_generation), static_cast<unsigned long>(sg().child_pid),
         sg().server_command.c_str());
 
-    int launch_wait_ms = clamp_launch_wait_ms(effective_cfg.launch_timeout_ms);
-    if (!effective_cfg.headless && !effective_cfg.browser_executable.empty() && launch_wait_ms < kBundledVisibleLaunchWaitMinMs)
-        launch_wait_ms = kBundledVisibleLaunchWaitMinMs;
+    const bool bundled_visible_launch = !effective_cfg.headless && !effective_cfg.browser_executable.empty();
+    const bool testlab_fast_probe = test_lab_launch_fail_fast_enabled(effective_cfg);
+    int launch_wait_ms = effective_launch_wait_ms(effective_cfg, bundled_visible_launch);
     int wait_ms = launch_wait_ms / 4;
     if (wait_ms < 5000) wait_ms = 5000;
     if (wait_ms > kToolListWaitMaxMs) wait_ms = kToolListWaitMaxMs;
-    if (effective_cfg.launch_timeout_ms != launch_wait_ms)
+    if (effective_cfg.launch_timeout_ms != launch_wait_ms || testlab_fast_probe)
     {
-        diag::log_tagged_fmt("camoufox", "start_bridge launch_timeout_clamped requested_ms=%d effective_ms=%d tool_list_ms=%d generation=%llu",
-            effective_cfg.launch_timeout_ms, launch_wait_ms, wait_ms, static_cast<unsigned long long>(start_generation));
+        diag::log_tagged_fmt("camoufox", "start_bridge launch_timeout_clamped requested_ms=%d effective_ms=%d tool_list_ms=%d generation=%llu bundled_visible=%d testlab_fast_probe=%d",
+            effective_cfg.launch_timeout_ms, launch_wait_ms, wait_ms, static_cast<unsigned long long>(start_generation),
+            bundled_visible_launch ? 1 : 0, testlab_fast_probe ? 1 : 0);
     }
     effective_cfg.launch_timeout_ms = launch_wait_ms;
     diag::log_tagged_fmt("camoufox", "start_bridge waiting_for_tool tool=launch_browser wait_ms=%d generation=%llu child_pid=%lu",
@@ -3779,12 +4100,12 @@ bool start_bridge(const launch_config_t& cfg)
     sg().active_cfg     = effective_cfg;
 
     nlohmann::json args = build_launch_args(effective_cfg);
-    diag::log_tagged_fmt("camoufox", "launch_browser request headless=%d has_proxy=%d os=%s locale=%s window=%dx%d timeout_ms=%d",
+    diag::log_tagged_fmt("camoufox", "launch_browser request headless=%d has_proxy=%d os=%s locale=%s window=%dx%d timeout_ms=%d testlab_fast_probe=%d",
         static_cast<int>(effective_cfg.headless), static_cast<int>(!effective_cfg.proxy.empty()),
         (effective_cfg.os.empty() ? "auto" : effective_cfg.os.c_str()),
         (effective_cfg.locale.empty() ? "auto" : effective_cfg.locale.c_str()),
         json_int_or(args, "window_width", -1), json_int_or(args, "window_height", -1),
-        effective_cfg.launch_timeout_ms);
+        effective_cfg.launch_timeout_ms, testlab_fast_probe ? 1 : 0);
     struct launch_state_t
     {
         std::mutex                mtx;
@@ -3922,13 +4243,15 @@ bool start_bridge(const launch_config_t& cfg)
             mark_cleanup_started_locked(start_generation, timed_out_pid, cleanup_reason);
             const std::string timeout_tree = timed_out_pid == 0 ? std::string() : compact_process_tree(enumerate_process_tree(timed_out_pid));
             const std::string debug_tail = read_file_tail_for_log(child_debug_log, 6000);
-            diag::log_tagged_fmt("camoufox", "launch_browser %s generation=%llu child_pid=%lu elapsed_ms=%llu requested_ms=%d effective_ms=%d stop_requested=%d active=%lu cleanup_pending=%d process_tree=%s debug_tail_len=%zu debug_tail=%.6000s",
+            const std::string debug_phase = last_camoufox_debug_event_from_tail(debug_tail);
+            diag::log_tagged_fmt("camoufox", "launch_browser %s generation=%llu child_pid=%lu elapsed_ms=%llu requested_ms=%d effective_ms=%d stop_requested=%d active=%lu cleanup_pending=%d debug_phase=%s process_tree=%s debug_tail_len=%zu debug_tail=%.6000s",
                 launch_cancelled_by_stop ? "cancelled" : "timeout",
                 static_cast<unsigned long long>(start_generation), static_cast<unsigned long>(timed_out_pid),
                 static_cast<unsigned long long>(sg().last_launch_ms), cfg.launch_timeout_ms, launch_wait_ms,
                 sg().stop_requested.load(std::memory_order_acquire) ? 1 : 0,
                 static_cast<unsigned long>(sg().active_activities.load(std::memory_order_acquire)),
                 sg().cleanup_pending ? 1 : 0,
+                debug_phase.empty() ? "<none>" : debug_phase.c_str(),
                 timeout_tree.empty() ? "<empty>" : timeout_tree.c_str(),
                 debug_tail.size(), debug_tail.c_str());
             cleanup_client_reap_now_detach_disconnect(timed_out_client, timed_out_pid, cleanup_reason, start_generation);
@@ -4534,8 +4857,12 @@ bool ensure_ready()
     }
     cfg.headless = false;
     if (cfg.server_module.empty()) cfg.server_module = "camoufox_reverse_mcp";
+    std::string server_executable;
+    const bool use_server_executable = resolve_reverse_mcp_executable(cfg, server_executable);
+    if (use_server_executable && cfg.server_executable.empty())
+        cfg.server_executable = server_executable;
     if (cfg.python_executable.empty()) cfg.python_executable = st.python_path;
-    if (cfg.python_executable.empty())
+    if (!use_server_executable && cfg.python_executable.empty())
     {
         std::lock_guard<std::recursive_mutex> lk(sg().mtx);
         sg().last_error = st.last_message.empty()
@@ -4545,8 +4872,11 @@ bool ensure_ready()
             static_cast<int>(st.state), sg().last_error.c_str());
         return false;
     }
-    diag::log_tagged_fmt("camoufox", "ensure_ready starting_bridge python=%s module=%s has_proxy=%d",
-        cfg.python_executable.c_str(), cfg.server_module.c_str(), static_cast<int>(!cfg.proxy.empty()));
+    diag::log_tagged_fmt("camoufox", "ensure_ready starting_bridge mode=%s command=%s module=%s has_proxy=%d",
+        use_server_executable ? "frozen_executable" : "python",
+        use_server_executable ? cfg.server_executable.c_str() : cfg.python_executable.c_str(),
+        cfg.server_module.c_str(),
+        static_cast<int>(!cfg.proxy.empty()));
     bool ok = start_bridge(cfg);
     diag::log_tagged_fmt("camoufox", "ensure_ready exit ok=%d elapsed_ms=%llu err_len=%zu",
         static_cast<int>(ok), static_cast<unsigned long long>(now_ms() - t0), last_error().size());
@@ -4842,13 +5172,25 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
             return true;
         }
     }
+    std::string python_path = effective_cfg.python_executable;
+    const bool prefer_developer_python = should_prefer_developer_python_runtime(effective_cfg);
+    bool developer_python_ready = false;
+    if (prefer_developer_python && python_path.empty())
+        developer_python_ready = ensure_python_available(python_path);
+    else
+        developer_python_ready = !python_path.empty();
+
     std::string server_executable;
-    const bool use_server_executable = resolve_reverse_mcp_executable(effective_cfg, server_executable);
-    diag::log_tagged_fmt("camoufox", "managed_start server_executable_resolve session_id=%s use_exe=%d path=%s",
+    bool use_server_executable = false;
+    if (!(prefer_developer_python && developer_python_ready))
+        use_server_executable = resolve_reverse_mcp_executable(effective_cfg, server_executable);
+    diag::log_tagged_fmt("camoufox", "managed_start server_executable_resolve session_id=%s use_exe=%d prefer_python=%d python_ready=%d python=%s path=%s",
         sid.c_str(), static_cast<int>(use_server_executable),
+        prefer_developer_python ? 1 : 0,
+        developer_python_ready ? 1 : 0,
+        python_path.empty() ? "<empty>" : python_path.c_str(),
         server_executable.empty() ? "<empty>" : server_executable.c_str());
 
-    std::string python_path = effective_cfg.python_executable;
     if (!use_server_executable && !python_path.empty())
     {
         std::string reason;
@@ -4996,9 +5338,15 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
         session->launched_ms = now_ms();
         session->active_cfg = effective_cfg;
     }
-    int launch_wait_ms = clamp_launch_wait_ms(effective_cfg.launch_timeout_ms);
-    if (!effective_cfg.headless && !effective_cfg.browser_executable.empty() && launch_wait_ms < kBundledVisibleLaunchWaitMinMs)
-        launch_wait_ms = kBundledVisibleLaunchWaitMinMs;
+    const bool bundled_visible_launch = !effective_cfg.headless && !effective_cfg.browser_executable.empty();
+    const bool testlab_fast_probe = test_lab_launch_fail_fast_enabled(effective_cfg);
+    int launch_wait_ms = effective_launch_wait_ms(effective_cfg, bundled_visible_launch);
+    if (effective_cfg.launch_timeout_ms != launch_wait_ms || testlab_fast_probe)
+    {
+        diag::log_tagged_fmt("camoufox", "managed_start launch_timeout_clamped session_id=%s requested_ms=%d effective_ms=%d bundled_visible=%d testlab_fast_probe=%d",
+            sid.c_str(), effective_cfg.launch_timeout_ms, launch_wait_ms,
+            bundled_visible_launch ? 1 : 0, testlab_fast_probe ? 1 : 0);
+    }
     int tool_wait_ms = std::min<int>(std::max<int>(launch_wait_ms / 4, 5000), kToolListWaitMaxMs);
     if (!wait_for_tool_listed(cli.get(), "launch_browser", tool_wait_ms))
     {

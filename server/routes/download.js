@@ -10,6 +10,8 @@ const columnCrypt = require('../crypto/column_crypt');
 const licenseRateLimit = require('../middleware/license_rate_limit');
 const canonicalResponse = require('../crypto/canonical_response');
 const auditLog = require('../middleware/audit_log');
+const pageKeys = require('../crypto/page_keys');
+const { signPayload } = require('../crypto/signing');
 
 const router = express.Router();
 
@@ -183,6 +185,22 @@ function purgeExpiredTransformedBlobs() {
 
 setInterval(purgeExpiredTransformedBlobs, 5 * 60 * 1000).unref();
 
+function currentStreamingEpoch() {
+    return pageKeys.currentEpoch(Math.floor(Date.now() / 1000));
+}
+
+function validateClientEpoch(clientEpoch, currentEpoch) {
+    if (clientEpoch === undefined || clientEpoch === null || clientEpoch === '') return null;
+    const n = Number(clientEpoch);
+    if (!Number.isFinite(n) || !Number.isInteger(n) || n < 0) {
+        return { stale: false, invalid: true };
+    }
+    if (n !== currentEpoch) {
+        return { stale: true, invalid: false };
+    }
+    return null;
+}
+
 
 async function validateSession(licenseKey, sessionToken, hwid) {
     if (!licenseKey || !sessionToken || !hwid) {
@@ -246,6 +264,94 @@ async function validateSession(licenseKey, sessionToken, hwid) {
 
     return { valid: true, session, license };
 }
+
+router.post('/streaming/info', async (req, res) => {
+    try {
+        const { license_key, session_token, hwid, client_epoch } = req.body || {};
+        const validation = await validateSession(license_key, session_token, hwid);
+        if (!validation.valid) {
+            return res.status(403).json({ status: 'error', reason: validation.reason });
+        }
+
+        const currentEpoch = currentStreamingEpoch();
+        const epochCheck = validateClientEpoch(client_epoch, currentEpoch);
+        if (epochCheck && epochCheck.invalid) {
+            return res.status(400).json({ status: 'error', reason: 'invalid_client_epoch' });
+        }
+        if (epochCheck && epochCheck.stale) {
+            return res.status(409).json({ status: 'error', reason: 'epoch_stale', current_epoch: currentEpoch });
+        }
+
+        const arcBlob = loadArcBlob();
+        const totalPages = pageKeys.getPageCount(arcBlob.length);
+        const epochNonce = pageKeys.epochNonce(currentEpoch, session_token, hwid);
+        const responsePayload = {
+            status: 'ok',
+            total_pages: totalPages,
+            page_size: pageKeys.PAGE_SIZE_BYTES,
+            blob_size: arcBlob.length,
+            current_epoch: currentEpoch,
+            epoch_nonce: epochNonce.toString('hex'),
+        };
+        responsePayload.signature = signPayload(responsePayload);
+        return res.json(responsePayload);
+    } catch (err) {
+        console.error('[arc-streaming/info] error:', err);
+        return res.status(500).json({ status: 'error', reason: 'internal_error' });
+    }
+});
+
+router.post('/page/:idx', async (req, res) => {
+    try {
+        const pageIndex = Number(req.params.idx);
+        if (!Number.isInteger(pageIndex) || pageIndex < 0) {
+            return res.status(400).json({ status: 'error', reason: 'invalid_page_index' });
+        }
+
+        const { license_key, session_token, hwid, client_epoch } = req.body || {};
+        const validation = await validateSession(license_key, session_token, hwid);
+        if (!validation.valid) {
+            return res.status(403).json({ status: 'error', reason: validation.reason });
+        }
+
+        const currentEpoch = currentStreamingEpoch();
+        const epochCheck = validateClientEpoch(client_epoch, currentEpoch);
+        if (epochCheck && epochCheck.invalid) {
+            return res.status(400).json({ status: 'error', reason: 'invalid_client_epoch' });
+        }
+        if (epochCheck && epochCheck.stale) {
+            return res.status(409).json({ status: 'error', reason: 'epoch_stale', current_epoch: currentEpoch });
+        }
+
+        const arcBlob = loadArcBlob();
+        const bounds = pageKeys.pageBoundsForBlob(arcBlob.length, pageIndex);
+        if (!bounds) {
+            return res.status(404).json({ status: 'error', reason: 'page_not_found' });
+        }
+
+        const totalPages = pageKeys.getPageCount(arcBlob.length);
+        const plaintext = arcBlob.subarray(bounds.start, bounds.end);
+        const enc = pageKeys.encryptPage(plaintext, license_key, session_token, hwid, pageIndex, currentEpoch);
+        const responsePayload = {
+            status: 'ok',
+            page_index: pageIndex,
+            total_pages: totalPages,
+            page_size: pageKeys.PAGE_SIZE_BYTES,
+            blob_size: arcBlob.length,
+            current_epoch: currentEpoch,
+            epoch_nonce: pageKeys.epochNonce(currentEpoch, session_token, hwid).toString('hex'),
+            data: enc.ciphertext.toString('base64'),
+            iv: enc.iv.toString('hex'),
+            auth_tag: enc.authTag.toString('hex'),
+            hmac: enc.hmac.toString('hex'),
+        };
+        responsePayload.signature = signPayload(responsePayload);
+        return res.json(responsePayload);
+    } catch (err) {
+        console.error('[arc-page] error:', err);
+        return res.status(500).json({ status: 'error', reason: 'internal_error' });
+    }
+});
 
 
 

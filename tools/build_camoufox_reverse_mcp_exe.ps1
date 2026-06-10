@@ -2,6 +2,9 @@ param(
     [string]$Python = "",
     [string]$SourceRoot = "",
     [string]$OutputDir = "",
+    [ValidateSet("auto", "pyinstaller", "nuitka")]
+    [string]$Backend = "auto",
+    [int]$Jobs = 0,
     [switch]$Force
 )
 
@@ -59,6 +62,9 @@ if ($LASTEXITCODE -ne 0 -or -not ($version -match '^3\.(12|13)$')) {
 
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 $OutputDir = (Resolve-Path -LiteralPath $OutputDir).Path
+if ($Jobs -lt 1) {
+    $Jobs = [Math]::Max(1, [Math]::Min(8, [Environment]::ProcessorCount - 1))
+}
 $target = Join-Path $OutputDir "AiDA_CamoufoxReverseMcp.exe"
 if ([IO.File]::Exists($target) -and -not $Force) {
     Write-Output "frozen_mcp_exists=$target"
@@ -66,7 +72,7 @@ if ([IO.File]::Exists($target) -and -not $Force) {
 }
 
 $stamp = Get-Date -Format "yyyyMMddHHmmss"
-$workRoot = Join-Path $env:TEMP "aida-camoufox-reverse-mcp-build-$stamp"
+$workRoot = Join-Path $OutputDir ".camoufox-reverse-mcp-build-$stamp"
 $venv = Join-Path $workRoot "venv"
 $buildOut = Join-Path $workRoot "nuitka-out"
 New-Item -ItemType Directory -Force -Path $workRoot | Out-Null
@@ -75,31 +81,74 @@ try {
     & $Python -m venv $venv
     if ($LASTEXITCODE -ne 0) { throw "venv creation failed" }
     $venvPython = Join-Path $venv "Scripts\python.exe"
-    & $venvPython -m pip install --upgrade pip wheel setuptools nuitka zstandard ordered-set
+    & $venvPython -m pip install --upgrade pip wheel setuptools nuitka zstandard ordered-set pyinstaller
     if ($LASTEXITCODE -ne 0) { throw "build dependency install failed" }
     & $venvPython -m pip install $SourceRoot
     if ($LASTEXITCODE -ne 0) { throw "camoufox-reverse-mcp dependency install failed" }
-    $entry = Join-Path $SourceRoot "src\camoufox_reverse_mcp\__main__.py"
-    & $venvPython -m nuitka `
-        --standalone `
-        --onefile `
-        --assume-yes-for-downloads `
-        --remove-output `
-        --output-dir=$buildOut `
-        --output-filename=AiDA_CamoufoxReverseMcp.exe `
-        --include-package=camoufox_reverse_mcp `
-        --include-package-data=camoufox_reverse_mcp `
-        --include-package=mcp `
-        --include-package=camoufox `
-        --include-package=playwright `
-        --include-package=esprima `
-        $entry
-    if ($LASTEXITCODE -ne 0) { throw "Nuitka build failed" }
-    $built = Join-Path $buildOut "AiDA_CamoufoxReverseMcp.exe"
-    if (-not [IO.File]::Exists($built)) { throw "Nuitka output executable was not produced" }
-    Copy-Item -LiteralPath $built -Destination $target -Force
+    $entry = Join-Path $workRoot "aida_camoufox_reverse_mcp_launcher.py"
+    @"
+from camoufox_reverse_mcp.__main__ import main
+
+if __name__ == "__main__":
+    main()
+"@ | Set-Content -LiteralPath $entry -Encoding UTF8
+    $selectedBackend = $Backend.ToLowerInvariant()
+    if ($selectedBackend -eq "auto") { $selectedBackend = "pyinstaller" }
+    if ($selectedBackend -eq "pyinstaller") {
+        $pyiWork = Join-Path $workRoot "pyinstaller-work"
+        $pyiSpec = Join-Path $workRoot "pyinstaller-spec"
+        & $venvPython -m PyInstaller `
+            --noconfirm `
+            --clean `
+            --onefile `
+            --console `
+            --noupx `
+            --name AiDA_CamoufoxReverseMcp `
+            --distpath $OutputDir `
+            --workpath $pyiWork `
+            --specpath $pyiSpec `
+            --collect-submodules camoufox_reverse_mcp `
+            --collect-data camoufox_reverse_mcp `
+            --collect-submodules camoufox `
+            --collect-data camoufox `
+            --collect-submodules playwright `
+            --collect-data playwright `
+            --collect-submodules esprima `
+            --hidden-import mcp.server.fastmcp `
+            --hidden-import mcp.server.stdio `
+            --hidden-import mcp.shared.session `
+            --hidden-import mcp.shared.message `
+            --hidden-import mcp.types `
+            $entry
+        if ($LASTEXITCODE -ne 0) { throw "PyInstaller build failed" }
+    } elseif ($selectedBackend -eq "nuitka") {
+        & $venvPython -m nuitka `
+            --standalone `
+            --onefile `
+            --assume-yes-for-downloads `
+            --remove-output `
+            --disable-cache=ccache `
+            --jobs=$Jobs `
+            --output-dir=$buildOut `
+            --output-filename=AiDA_CamoufoxReverseMcp.exe `
+            --include-package=camoufox_reverse_mcp `
+            --include-package-data=camoufox_reverse_mcp `
+            --include-package=mcp `
+            --include-package=camoufox `
+            --include-package=playwright `
+            --include-package=esprima `
+            $entry
+        if ($LASTEXITCODE -ne 0) { throw "Nuitka build failed" }
+        $built = Join-Path $buildOut "AiDA_CamoufoxReverseMcp.exe"
+        if (-not [IO.File]::Exists($built)) { throw "Nuitka output executable was not produced" }
+        Copy-Item -LiteralPath $built -Destination $target -Force
+    } else {
+        throw "Unsupported backend: $Backend"
+    }
+    if (-not [IO.File]::Exists($target)) { throw "Frozen executable was not produced" }
     $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $target).Hash.ToLowerInvariant()
     $size = (Get-Item -LiteralPath $target).Length
+    Write-Output "frozen_mcp_backend=$selectedBackend"
     Write-Output "frozen_mcp_built=$target"
     Write-Output "frozen_mcp_size=$size"
     Write-Output "frozen_mcp_sha256=$hash"

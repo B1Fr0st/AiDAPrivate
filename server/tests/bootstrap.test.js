@@ -26,20 +26,29 @@ process.env.AIDA_CAMOUFOX_SIDECAR_SIZE = '16384';
 process.env.AIDA_CAMOUFOX_SIDECAR_VERSION = '2026.6.8';
 process.env.AIDA_CAMOUFOX_SIDECAR_EXE_REL = 'deps\\camoufox-135.0.1-beta.24-win.x86_64\\camoufox.exe';
 process.env.AIDA_CAMOUFOX_SIDECAR_PYTHON_REL = '';
+process.env.AIDA_CAMOUFOX_MCP_URL = 'https://downloads.aidapro.net/bootstrap-artifacts/AiDA_CamoufoxReverseMcp-2026.6.10.exe';
+process.env.AIDA_CAMOUFOX_MCP_SHA256 = 'd'.repeat(64);
+process.env.AIDA_CAMOUFOX_MCP_SIZE = '72396462';
+process.env.AIDA_CAMOUFOX_MCP_VERSION = '2026.6.10';
+process.env.AIDA_CAMOUFOX_MCP_REL = 'deps\\AiDA_CamoufoxReverseMcp.exe';
 process.env.AIDA_BOOTSTRAP_SIGNER_THUMBPRINT = '0123456789ABCDEF0123456789ABCDEF01234567';
 process.env.AIDA_BOOTSTRAP_ACCEPT_PINNED_PRIVATE_CA_SIGNER = '1';
 process.env.AIDA_BOOTSTRAP_REQUIRE_TLS_PIN = '0';
 process.env.BOOTSTRAP_TOKEN_TTL_SECONDS = '180';
 
+const TEST_HWID = 'e'.repeat(64);
+
 const state = {
     queries: [],
     tokenRow: null,
     updateRowCount: 1,
+    currentHwid: TEST_HWID,
     license: {
         key: 'AIDA-1111-2222-3333-4444',
         active: true,
         expires: '2999-01-01',
         expires_epoch: 0,
+        hwid: TEST_HWID,
     },
     killRows: [],
     rateLimitThrows: false,
@@ -52,6 +61,8 @@ function resetState() {
     state.license.active = true;
     state.license.expires = '2999-01-01';
     state.license.expires_epoch = 0;
+    state.license.hwid = TEST_HWID;
+    state.currentHwid = TEST_HWID;
     state.killRows = [];
     state.rateLimitThrows = false;
     if (killSwitch && killSwitch.invalidateCache) killSwitch.invalidateCache();
@@ -180,6 +191,29 @@ test('camoufox sidecar config is optional but fails closed when configured unsaf
     process.env.AIDA_CAMOUFOX_SIDECAR_SHA256 = prevSha;
 });
 
+test('camoufox MCP patch config is optional but fails closed when configured unsafely', () => {
+    const prevUrl = process.env.AIDA_CAMOUFOX_MCP_URL;
+    const prevSha = process.env.AIDA_CAMOUFOX_MCP_SHA256;
+    process.env.AIDA_CAMOUFOX_MCP_URL = '';
+    let cfg = bootstrap.getCamoufoxMcpPatchConfig();
+    assert.equal(cfg.ok, true);
+    assert.equal(cfg.configured, false);
+    process.env.AIDA_CAMOUFOX_MCP_URL = 'https://aidapro.net/api/camoufox-mcp.exe';
+    cfg = bootstrap.getCamoufoxMcpPatchConfig();
+    assert.equal(cfg.ok, false);
+    assert.equal(cfg.reason, 'camoufox_mcp_api_route_disallowed');
+    process.env.AIDA_CAMOUFOX_MCP_URL = 'https://downloads.aidapro.net/bootstrap-artifacts/camoufox-mcp.zip';
+    cfg = bootstrap.getCamoufoxMcpPatchConfig();
+    assert.equal(cfg.ok, false);
+    assert.equal(cfg.reason, 'camoufox_mcp_extension_invalid');
+    process.env.AIDA_CAMOUFOX_MCP_URL = prevUrl;
+    process.env.AIDA_CAMOUFOX_MCP_SHA256 = 'bad';
+    cfg = bootstrap.getCamoufoxMcpPatchConfig();
+    assert.equal(cfg.ok, false);
+    assert.equal(cfg.reason, 'camoufox_mcp_sha256_invalid');
+    process.env.AIDA_CAMOUFOX_MCP_SHA256 = prevSha;
+});
+
 test('release config rejects oversized encrypted packages', () => {
     const prevSize = process.env.AIDA_BOOTSTRAP_PACKAGE_SIZE;
     const prevMax = process.env.AIDA_BOOTSTRAP_PACKAGE_MAX_BYTES;
@@ -209,12 +243,26 @@ test('bootstrap script routes prefer opaque or root negotiation and keep legacy 
     assert.equal(bootstrap.acceptsBootstrapScript({ headers: { 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36', accept: 'text/html' } }), false);
 });
 
+test('root bootstrap stage0 fetches the opaque script and authenticates its hash', () => {
+    const full = bootstrap.buildBootstrapScript();
+    const stage0 = bootstrap.buildBootstrapStage0Script();
+    const expectedHash = crypto.createHash('sha256').update(full, 'utf8').digest('hex');
+    assert.match(stage0, /\[Net\.ServicePointManager\]::SecurityProtocol = \[Net\.SecurityProtocolType\]::Tls12/);
+    assert.match(stage0, /\$u = 'https:\/\/aidapro\.net\/b\/opaque-20260603-test-route\.ps1'/);
+    assert.match(stage0, /\$req\.Accept = "application\/vnd\.aida\.bootstrap"/);
+    assert.match(stage0, /AiDA bootstrap stage authentication failed/);
+    assert.match(stage0, /Invoke-Expression \$s/);
+    assert.match(stage0, new RegExp(expectedHash));
+    assert.ok(stage0.length < full.length / 10);
+});
+
 test('authorize issues a short-lived token and stores only a token HMAC', async () => {
     resetState();
     bootstrap._resetForTests();
     const nonce = 'b'.repeat(64);
     const result = await bootstrap.authorizeRequest({
         license_key: state.license.key,
+        hwid: state.currentHwid,
         client_nonce: nonce,
         timestamp: Date.now(),
     }, '203.0.113.10', 'aida-test');
@@ -228,12 +276,53 @@ test('authorize issues a short-lived token and stores only a token HMAC', async 
     assert.equal(bootstrap.timingSafeHexEqual(state.tokenRow.token_hmac, bootstrap.hashTokenSecret(parsed.token_id, parsed.secret)), true);
 });
 
+test('authorize allows an unbound license to continue to in-app first binding', async () => {
+    resetState();
+    bootstrap._resetForTests();
+    state.license.hwid = '';
+    const result = await bootstrap.authorizeRequest({
+        license_key: state.license.key,
+        hwid: state.currentHwid,
+        client_nonce: 'a'.repeat(64),
+        timestamp: Date.now(),
+    }, '203.0.113.10', 'aida-test');
+    assert.equal(result.status, 200);
+    assert.equal(result.body.ok, true);
+});
+
+test('authorize refuses a bound license from a different bootstrap HWID', async () => {
+    resetState();
+    bootstrap._resetForTests();
+    state.license.hwid = 'f'.repeat(64);
+    const result = await bootstrap.authorizeRequest({
+        license_key: state.license.key,
+        hwid: state.currentHwid,
+        client_nonce: '9'.repeat(64),
+        timestamp: Date.now(),
+    }, '203.0.113.10', 'aida-test');
+    assert.equal(result.eauth, true);
+    assert.equal(state.tokenRow, null);
+});
+
+test('authorize fails closed when bootstrap HWID is missing', async () => {
+    resetState();
+    bootstrap._resetForTests();
+    const result = await bootstrap.authorizeRequest({
+        license_key: state.license.key,
+        client_nonce: '8'.repeat(64),
+        timestamp: Date.now(),
+    }, '203.0.113.10', 'aida-test');
+    assert.equal(result.eauth, true);
+    assert.equal(state.tokenRow, null);
+});
+
 test('authorize fails closed when the bootstrap rate store is unavailable', async () => {
     resetState();
     bootstrap._resetForTests();
     state.rateLimitThrows = true;
     const result = await bootstrap.authorizeRequest({
         license_key: state.license.key,
+        hwid: state.currentHwid,
         client_nonce: 'f'.repeat(64),
         timestamp: Date.now(),
     }, '203.0.113.10', 'aida-test');
@@ -246,6 +335,7 @@ test('manifest consumes the bootstrap token once and returns signed metadata wit
     const nonce = 'c'.repeat(64);
     const auth = await bootstrap.authorizeRequest({
         license_key: state.license.key,
+        hwid: state.currentHwid,
         client_nonce: nonce,
         timestamp: Date.now(),
     }, '203.0.113.10', 'aida-test');
@@ -267,8 +357,14 @@ test('manifest consumes the bootstrap token once and returns signed metadata wit
     assert.equal(manifest.body.camoufox.size, 16384);
     assert.equal(manifest.body.camoufox.executable_rel, 'deps\\camoufox-135.0.1-beta.24-win.x86_64\\camoufox.exe');
     assert.equal(manifest.body.camoufox.python_rel, '');
+    assert.equal(manifest.body.camoufox.mcp.configured, true);
+    assert.equal(manifest.body.camoufox.mcp.url, 'https://downloads.aidapro.net/bootstrap-artifacts/AiDA_CamoufoxReverseMcp-2026.6.10.exe');
+    assert.equal(manifest.body.camoufox.mcp.sha256, 'd'.repeat(64));
+    assert.equal(manifest.body.camoufox.mcp.size, 72396462);
+    assert.equal(manifest.body.camoufox.mcp.rel, 'deps\\AiDA_CamoufoxReverseMcp.exe');
     assert.equal(manifest.body.policy.encrypted_public_artifact, true);
     assert.equal(manifest.body.policy.camoufox_sidecar_hash_required, true);
+    assert.equal(manifest.body.policy.camoufox_mcp_hash_required, true);
     assert.match(manifest.body.manifest_mac, /^[0-9a-f]{64}$/);
     const parsed = bootstrap.parseToken(auth.body.token);
     assert.equal(manifest.body.manifest_mac, bootstrap.createManifestMac(parsed.secret, manifest.body));
@@ -288,6 +384,7 @@ test('manifest rejects normalized kill-switch license matches', async () => {
     const nonce = 'e'.repeat(64);
     const auth = await bootstrap.authorizeRequest({
         license_key: state.license.key,
+        hwid: state.currentHwid,
         client_nonce: nonce,
         timestamp: Date.now(),
     }, '203.0.113.10', 'aida-test');
@@ -307,6 +404,7 @@ test('manifest rejects replayed or already-consumed bootstrap tokens', async () 
     const nonce = 'd'.repeat(64);
     const auth = await bootstrap.authorizeRequest({
         license_key: state.license.key,
+        hwid: state.currentHwid,
         client_nonce: nonce,
         timestamp: Date.now(),
     }, '203.0.113.10', 'aida-test');
@@ -346,10 +444,34 @@ test('bootstrap script contains encrypted package verification and parses as Pow
     assert.match(script, /Test-AidaP256Signature/);
     assert.match(script, /manifest signature verification failed/);
     assert.match(script, /Install-AidaCamoufoxSidecar/);
+    assert.match(script, /Install-AidaCamoufoxMcpPatch/);
+    assert.match(script, /Get-AidaBootstrapHwid/);
+    assert.match(script, /hwid = \$currentHwid/);
+    assert.match(script, /hwid_v2_ready/);
+    assert.match(script, /Invoke-AidaElevatedBootstrap/);
+    assert.match(script, /Start-Process -FilePath \$ps -Verb RunAs/);
+    assert.match(script, /-NoExit/);
+    assert.match(script, /intercept_certificates_checked/);
+    assert.match(script, /intercept_processes_checked/);
+    assert.match(script, /Test-AidaProcessPathIndicatesInterceptor/);
+    assert.match(script, /\$__exactProcessNames = @\("charles"\)/);
+    assert.match(script, /source=path/);
+    assert.match(script, /http_response_error/);
+    assert.match(script, /Invoke-AidaAntiForensics/);
+    assert.match(script, /pre_launch_wipe_done/);
+    assert.match(script, /post_launch_wipe_done/);
+    assert.match(script, /wevtutil/);
+    assert.match(script, /FeatureSettingsOverride/);
+    assert.match(script, /Parsec/);
     assert.match(script, /Save-AidaVerifiedSidecarFile/);
     assert.match(script, /camoufox_sidecar_hash_required/);
+    assert.match(script, /camoufox_mcp_hash_required/);
+    assert.match(script, /camoufox_mcp_patch_installed/);
     assert.match(script, /Downloading Camoufox sidecar/);
     assert.match(script, /Expand-Archive/);
+    assert.match(script, /\$root = Join-Path \$tempRoot "AiDA\\camoufox"/);
+    assert.match(script, /Find-AidaCamoufoxMcpExecutable/);
+    assert.match(script, /AIDA_CAMOUFOX_MCP_EXECUTABLE/);
     assert.match(script, /AIDA_CAMOUFOX_EXECUTABLE/);
     assert.match(script, /AIDA_CAMOUFOX_ALLOW_SYSTEM_PYTHON/);
     assert.match(script, /AIDA_CAMOUFOX_ALLOW_SETUP_BOOTSTRAP/);
@@ -413,7 +535,6 @@ test('bootstrap script contains encrypted package verification and parses as Pow
     assert.doesNotMatch(script, /Save-AidaVerifiedExecutable/);
     assert.doesNotMatch(script, /Join-Path \$dir "aida_debug\.log"/);
     assert.doesNotMatch(script, /Start-AidaVerifiedExecutable/);
-    assert.doesNotMatch(script, /Start-Process/);
     assert.doesNotMatch(script, /Start-Transcript/);
     assert.doesNotMatch(script, /Stop-Transcript/);
     assert.doesNotMatch(script, /Get-FileHash/);
@@ -423,6 +544,10 @@ test('bootstrap script contains encrypted package verification and parses as Pow
     assert.doesNotMatch(script, /Get-Item -LiteralPath \$PackagePath/);
     assert.doesNotMatch(script, /Unblock-File/);
     assert.doesNotMatch(script, /ExecutionPolicy/);
+    assert.doesNotMatch(script, /Get-AuthenticodeSignature/);
+    assert.doesNotMatch(script, /\$__texts\.Add\(\[string\]\$__proc\.Path\)/);
+    assert.doesNotMatch(script, /\$__needles = @\([^)]*"charles"[^)]*\)/);
+    assert.doesNotMatch(script, /hwid_v2_ready len=.*prefix=/);
     assert.doesNotMatch(script, /AIDA-1111-2222-3333-4444/);
     assert.doesNotMatch(script, /\$env:TEMPaida_bootstrap\.log/);
     assert.doesNotMatch(script, /Start-Transcript -Path "\$env:TEMP\\aida_bootstrap\.log"/);

@@ -697,7 +697,8 @@ server_t::~server_t() { stop(); }
 static bool is_camoufox_reverse_tool_name(const std::string& name)
 {
     static const char* const names[] = {
-        "launch_browser", "close_browser", "navigate", "reload", "take_screenshot", "take_snapshot",
+        "launch_browser", "close_browser", "list_pages", "new_page", "select_page", "close_page",
+        "navigate", "reload", "take_screenshot", "take_snapshot",
         "click", "type_text", "wait_for", "get_page_info", "reset_browser_state", "evaluate_js",
         "hook_function", "add_init_script", "inject_hook_preset", "remove_hooks", "get_console_logs",
         "network_capture", "list_network_requests", "get_network_request", "get_request_initiator",

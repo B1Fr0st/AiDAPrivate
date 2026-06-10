@@ -26,6 +26,8 @@
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
 
+extern "C" IMAGE_DOS_HEADER __ImageBase;
+
 namespace standalone_anti_ai
 {
 
@@ -310,6 +312,188 @@ namespace detail
         return path_has_dir_prefix_w(canonical_path_lower_w(path), canonical_path_lower_w(root));
     }
 
+    inline bool path_under_or_equal_w(const std::wstring& path, const std::wstring& dir)
+    {
+        const std::wstring p = canonical_path_lower_w(path);
+        const std::wstring d = canonical_path_lower_w(dir);
+        if (p.empty() || d.empty())
+            return false;
+        return p == d || path_has_dir_prefix_w(p, d);
+    }
+
+    inline std::wstring parent_dir_lower_w(const std::wstring& path)
+    {
+        std::wstring p = canonical_path_lower_w(path);
+        size_t slash = p.find_last_of(L"\\/");
+        if (slash == std::wstring::npos)
+            return {};
+        return p.substr(0, slash);
+    }
+
+    inline std::wstring current_dir_lower_w()
+    {
+        DWORD needed = GetCurrentDirectoryW(0, nullptr);
+        if (needed == 0 || needed > 32768)
+            return {};
+        std::wstring out;
+        out.resize(needed);
+        DWORD got = GetCurrentDirectoryW(needed, out.data());
+        if (got == 0 || got >= needed)
+            return {};
+        out.resize(got);
+        return canonical_path_lower_w(out);
+    }
+
+    inline std::wstring temp_dir_lower_w()
+    {
+        std::vector<wchar_t> buffer(32768);
+        DWORD got = GetTempPathW(static_cast<DWORD>(buffer.size()), buffer.data());
+        if (got == 0 || got >= static_cast<DWORD>(buffer.size()))
+            return {};
+        return canonical_path_lower_w(std::wstring(buffer.data(), got));
+    }
+
+    inline bool read_env_path_w(const wchar_t* name, std::wstring& out)
+    {
+        out.clear();
+        if (!name || !*name)
+            return false;
+        DWORD needed = GetEnvironmentVariableW(name, nullptr, 0);
+        if (needed == 0 || needed > 32768)
+            return false;
+        std::wstring value;
+        value.resize(needed);
+        DWORD got = GetEnvironmentVariableW(name, value.data(), needed);
+        if (got == 0 || got >= needed)
+            return false;
+        value.resize(got);
+        value = trim_w(value);
+        while (value.size() >= 2 &&
+               ((value.front() == L'"' && value.back() == L'"') ||
+                (value.front() == L'\'' && value.back() == L'\'')))
+        {
+            value = trim_w(value.substr(1, value.size() - 2));
+        }
+        if (value.empty())
+            return false;
+        out = canonical_path_lower_w(value);
+        return !out.empty();
+    }
+
+    inline bool env_path_equals_w(const std::wstring& path, const wchar_t* name)
+    {
+        std::wstring configured;
+        if (!read_env_path_w(name, configured))
+            return false;
+        return canonical_path_lower_w(path) == configured;
+    }
+
+    inline void append_unique_root_w(std::vector<std::wstring>& roots, const std::wstring& path)
+    {
+        const std::wstring root = canonical_path_lower_w(path);
+        if (root.empty())
+            return;
+        for (const auto& existing : roots)
+        {
+            if (existing == root)
+                return;
+        }
+        roots.push_back(root);
+    }
+
+    inline void append_path_and_ancestors_w(std::vector<std::wstring>& roots, const std::wstring& path, size_t depth)
+    {
+        std::wstring current = canonical_path_lower_w(path);
+        for (size_t i = 0; i < depth && !current.empty(); ++i)
+        {
+            append_unique_root_w(roots, current);
+            current = parent_dir_lower_w(current);
+        }
+    }
+
+    inline void append_env_path_and_ancestors_w(std::vector<std::wstring>& roots, const wchar_t* name, size_t depth)
+    {
+        std::wstring value;
+        if (read_env_path_w(name, value))
+            append_path_and_ancestors_w(roots, value, depth);
+    }
+
+    inline std::vector<std::wstring> trusted_camoufox_runtime_roots_w()
+    {
+        std::vector<std::wstring> roots;
+        const std::wstring module_dir = current_module_dir_lower_w();
+        append_unique_root_w(roots, module_dir);
+        append_unique_root_w(roots, current_dir_lower_w());
+        append_unique_root_w(roots, parent_dir_lower_w(module_dir));
+        append_unique_root_w(roots, parent_dir_lower_w(parent_dir_lower_w(module_dir)));
+        append_env_path_and_ancestors_w(roots, L"AIDA_CAMOUFOX_EXECUTABLE", 6);
+        append_env_path_and_ancestors_w(roots, L"AIDA_CAMOUFOX_PYTHON", 6);
+        append_env_path_and_ancestors_w(roots, L"AIDA_CAMOUFOX_MCP_EXECUTABLE", 6);
+        std::wstring local;
+        if (read_env_path_w(L"LOCALAPPDATA", local))
+        {
+            append_unique_root_w(roots, local + L"\\aida");
+            append_unique_root_w(roots, local + L"\\aida\\camoufox\\current");
+            append_unique_root_w(roots, local + L"\\aida\\embedded\\camoufox\\current");
+        }
+        const std::wstring temp = temp_dir_lower_w();
+        if (!temp.empty())
+        {
+            append_unique_root_w(roots, temp + L"\\aida");
+            append_unique_root_w(roots, temp + L"\\aida\\camoufox");
+            append_unique_root_w(roots, temp + L"\\aida\\camoufox\\current");
+            append_unique_root_w(roots, temp + L"\\aida-camoufox");
+            append_unique_root_w(roots, temp + L"\\aida-camoufox\\current");
+        }
+        return roots;
+    }
+
+    inline bool path_under_trusted_camoufox_runtime_root_w(const std::wstring& path)
+    {
+        for (const auto& root : trusted_camoufox_runtime_roots_w())
+        {
+            if (path_under_or_equal_w(path, root))
+                return true;
+        }
+        return false;
+    }
+
+    inline bool trusted_camoufox_runtime_python_path_w(const std::wstring& path)
+    {
+        if (env_path_equals_w(path, L"AIDA_CAMOUFOX_PYTHON"))
+            return true;
+        static const wchar_t* const runtime_dirs[] = {
+            L"deps\\camoufox-runtime",
+            L"camoufox-runtime",
+            L"deps\\camoufox-python",
+            L"camoufox-python",
+            L"deps\\python",
+            L"python",
+            L"deps\\python-3.12",
+            L"python-3.12",
+            L"deps\\python-3.12.10-x64",
+            L"python-3.12.10-x64",
+            L"deps\\python312",
+            L"python312",
+            L"deps\\python312-3.12.10-x64",
+            L"python312-3.12.10-x64"
+        };
+        const std::wstring canonical = canonical_path_lower_w(path);
+        for (const auto& root : trusted_camoufox_runtime_roots_w())
+        {
+            for (const wchar_t* rel : runtime_dirs)
+            {
+                std::wstring candidate = root;
+                if (!candidate.empty() && candidate.back() != L'\\')
+                    candidate.push_back(L'\\');
+                candidate.append(rel);
+                if (path_under_or_equal_w(canonical, candidate))
+                    return true;
+            }
+        }
+        return false;
+    }
+
     inline const wchar_t* basename_ptr(const wchar_t* path)
     {
         if (!path)
@@ -349,6 +533,7 @@ namespace detail
             L"csrss.exe",
             L"wininit.exe",
             L"services.exe",
+            L"svchost.exe",
             L"winlogon.exe",
             L"smss.exe"
         };
@@ -733,8 +918,10 @@ namespace detail
             L"aida_camoufoxreversemcp.exe", L"camoufox-reverse-mcp.exe", L"camoufox_reverse_mcp.exe"
         };
         if (basename_equals_any(probe, reverse_mcp_names))
-            return path_under_current_module_subdir_w(probe.image_lower, L"deps") ||
-                path_under_current_module_subdir_w(probe.image_lower, L"camoufox-reverse-mcp");
+            return env_path_equals_w(probe.image_lower, L"AIDA_CAMOUFOX_MCP_EXECUTABLE") ||
+                path_under_current_module_subdir_w(probe.image_lower, L"deps") ||
+                path_under_current_module_subdir_w(probe.image_lower, L"camoufox-reverse-mcp") ||
+                path_under_trusted_camoufox_runtime_root_w(probe.image_lower);
         static const wchar_t* const python_names[] = {
             L"python.exe", L"pythonw.exe"
         };
@@ -744,7 +931,76 @@ namespace detail
         if (!command_has_camoufox_mcp_module(command))
             return false;
         return path_under_current_module_subdir_w(probe.image_lower, L"deps\\camoufox-runtime") ||
-            path_under_current_module_subdir_w(probe.image_lower, L"camoufox-runtime");
+            path_under_current_module_subdir_w(probe.image_lower, L"camoufox-runtime") ||
+            trusted_camoufox_runtime_python_path_w(probe.image_lower);
+    }
+
+    inline bool trusted_aida_build_command_context(const process_probe_t& probe)
+    {
+        if (probe.command_lower.empty())
+            return false;
+        std::wstring command_path = probe.command_lower;
+        for (wchar_t& ch : command_path)
+        {
+            if (ch == L'/')
+                ch = L'\\';
+        }
+        const std::wstring module_dir = current_module_dir_lower_w();
+        const std::wstring build_dir = parent_dir_lower_w(module_dir);
+        const std::wstring repo_dir = parent_dir_lower_w(build_dir);
+        bool references_build_tree = false;
+        if (!module_dir.empty() && contains_w(command_path, module_dir.c_str()))
+            references_build_tree = true;
+        if (!references_build_tree && !build_dir.empty() && contains_w(command_path, build_dir.c_str()))
+            references_build_tree = true;
+        if (!references_build_tree && !repo_dir.empty() && contains_w(command_path, repo_dir.c_str()))
+            references_build_tree = true;
+        if (!references_build_tree)
+            return false;
+        static const wchar_t* const build_markers[] = {
+            L"\\build-ninja", L"\\cmakefiles\\",
+            L" -daida_standalone", L"/daida_standalone", L"aidastandalone.pdb",
+            L"src\\standalone\\src"
+        };
+        return contains_any_w(command_path, build_markers);
+    }
+
+    inline bool trusted_aida_build_tool_image(const process_probe_t& probe)
+    {
+        const std::wstring path = canonical_path_lower_w(probe.image_lower.empty() ? probe.exe_lower : probe.image_lower);
+        if (path.empty())
+            return false;
+        static const wchar_t* const vs_tools[] = {
+            L"cmake.exe", L"cl.exe", L"link.exe", L"lib.exe", L"rc.exe",
+            L"mt.exe", L"cvtres.exe", L"vctip.exe"
+        };
+        if (basename_equals_any(probe, vs_tools))
+        {
+            return contains_w(path, L"\\microsoft visual studio\\2022\\") ||
+                contains_w(path, L"\\windows kits\\10\\bin\\");
+        }
+        static const wchar_t* const repo_tools[] = {
+            L"sccache.exe", L"ninja.exe"
+        };
+        if (!basename_equals_any(probe, repo_tools))
+            return false;
+        const std::wstring module_dir = current_module_dir_lower_w();
+        const std::wstring build_dir = parent_dir_lower_w(module_dir);
+        const std::wstring repo_dir = parent_dir_lower_w(build_dir);
+        return (!repo_dir.empty() && path_under_or_equal_w(path, repo_dir)) ||
+            (!build_dir.empty() && path_under_or_equal_w(path, build_dir)) ||
+            contains_w(path, L"\\ninja-win\\ninja.exe");
+    }
+
+    inline bool is_trusted_aida_build_tool_process(const process_probe_t& probe)
+    {
+        static const wchar_t* const names[] = {
+            L"cmake.exe", L"ninja.exe", L"sccache.exe", L"cl.exe", L"link.exe",
+            L"lib.exe", L"rc.exe", L"mt.exe", L"cvtres.exe", L"vctip.exe"
+        };
+        return basename_equals_any(probe, names) &&
+            trusted_aida_build_tool_image(probe) &&
+            trusted_aida_build_command_context(probe);
     }
 
     inline bool is_ai_coding_tool(const process_probe_t& probe)
@@ -861,6 +1117,29 @@ namespace detail
         return false;
     }
 
+    inline bool is_ida_host_process(const process_probe_t& probe)
+    {
+        static const wchar_t* const exact_names[] = {
+            L"ida.exe", L"ida64.exe", L"idaq.exe", L"idaq64.exe", L"idat.exe", L"idat64.exe"
+        };
+        return basename_equals_any(probe, exact_names);
+    }
+
+    inline bool is_supported_ida_host_observation(const process_probe_t& probe)
+    {
+        if (!is_ida_host_process(probe))
+            return false;
+        if (has_aida_target_evidence(probe) ||
+            has_mcp_command_evidence(probe) ||
+            is_memory_scanner_tool(probe) ||
+            is_dump_tool(probe) ||
+            is_ai_coding_tool(probe))
+        {
+            return false;
+        }
+        return true;
+    }
+
     inline bool env_flag_enabled_a(const char* name)
     {
         char value[16] = {};
@@ -875,6 +1154,25 @@ namespace detail
         char value[MAX_PATH] = {};
         DWORD n = GetEnvironmentVariableA(name, value, static_cast<DWORD>(sizeof(value)));
         return n > 0 && n < static_cast<DWORD>(sizeof(value));
+    }
+
+    inline bool env_u64_a(const char* name, uint64_t& out)
+    {
+        out = 0;
+        char value[64] = {};
+        DWORD n = GetEnvironmentVariableA(name, value, static_cast<DWORD>(sizeof(value)));
+        if (n == 0 || n >= static_cast<DWORD>(sizeof(value)))
+            return false;
+        char* end = nullptr;
+        unsigned long long parsed = std::strtoull(value, &end, 0);
+        if (end == value || parsed == 0)
+            return false;
+        while (end && (*end == ' ' || *end == '\t'))
+            ++end;
+        if (end && *end != '\0')
+            return false;
+        out = static_cast<uint64_t>(parsed);
+        return true;
     }
 
     inline DWORD current_parent_pid()
@@ -912,25 +1210,36 @@ namespace detail
         return equals_any_w(image.c_str(), hosts);
     }
 
+    inline bool fileless_image_base_matches_current_module()
+    {
+        uint64_t mapped_base = 0;
+        if (!env_u64_a("AIDA_FILELESS_IMAGE_BASE", mapped_base))
+            return false;
+        return mapped_base == reinterpret_cast<uint64_t>(&__ImageBase);
+    }
+
     inline bool fileless_bootstrap_context_active()
     {
-        return env_flag_enabled_a("AIDA_FILELESS_LAUNCH") &&
+        static std::atomic<bool> s_fileless_context_seen{false};
+        if (s_fileless_context_seen.load(std::memory_order_acquire))
+            return true;
+        const bool env_ok = env_flag_enabled_a("AIDA_FILELESS_LAUNCH") &&
             env_flag_enabled_a("AIDA_FILELESS_NO_DISK_WRITE") &&
             env_value_present_a("AIDA_FILELESS_DEBUG_LOG_PATH") &&
             env_value_present_a("AIDA_FILELESS_BOOTSTRAP_LOG_PATH") &&
             env_value_present_a("AIDA_FILELESS_IMAGE_BASE") &&
             env_value_present_a("AIDA_FILELESS_IMAGE_SIZE") &&
-            env_value_present_a("AIDA_FILELESS_ENTRY_RVA") &&
-            current_module_is_fileless_host();
+            env_value_present_a("AIDA_FILELESS_ENTRY_RVA");
+        const bool active = env_ok &&
+            (current_module_is_fileless_host() || fileless_image_base_matches_current_module());
+        if (active)
+            s_fileless_context_seen.store(true, std::memory_order_release);
+        return active;
     }
 
-    inline bool is_fileless_bootstrap_parent_owner(const process_probe_t* probe,
-                                                   DWORD owner_pid,
-                                                   DWORD parent_pid)
+    inline bool is_fileless_terminal_basename(const process_probe_t* probe)
     {
-        if (!probe || parent_pid == 0 || owner_pid != parent_pid)
-            return false;
-        if (!fileless_bootstrap_context_active())
+        if (!probe)
             return false;
         static const wchar_t* const terminal_hosts[] = {
             L"windowsterminal.exe",
@@ -938,7 +1247,56 @@ namespace detail
             L"conhost.exe",
             L"openconsole.exe"
         };
-        if (!basename_equals_any(*probe, terminal_hosts))
+        return basename_equals_any(*probe, terminal_hosts);
+    }
+
+    inline bool processes_share_session(DWORD a, DWORD b)
+    {
+        DWORD sa = 0;
+        DWORD sb = 0;
+        return a != 0 && b != 0 &&
+            ProcessIdToSessionId(a, &sa) &&
+            ProcessIdToSessionId(b, &sb) &&
+            sa == sb;
+    }
+
+    inline bool trusted_fileless_terminal_owner_path(const process_probe_t& probe)
+    {
+        const std::wstring path = canonical_path_lower_w(probe.image_lower.empty() ? probe.exe_lower : probe.image_lower);
+        if (path.empty())
+            return false;
+        const std::wstring base = lower_copy(basename_ptr(path.c_str()));
+        const bool windows_terminal_package =
+            contains_w(path, L"\\program files\\windowsapps\\microsoft.windowsterminal_") ||
+            contains_w(path, L"\\appdata\\local\\microsoft\\windowsapps\\microsoft.windowsterminal_");
+        if (equals_w(base.c_str(), L"windowsterminal.exe"))
+            return windows_terminal_package;
+        if (equals_w(base.c_str(), L"wt.exe"))
+            return windows_terminal_package ||
+                ends_with_w(path, L"\\appdata\\local\\microsoft\\windowsapps\\wt.exe");
+        if (equals_w(base.c_str(), L"openconsole.exe"))
+            return windows_terminal_package ||
+                ends_with_w(path, L"\\windows\\system32\\openconsole.exe") ||
+                ends_with_w(path, L"\\windows\\syswow64\\openconsole.exe");
+        if (equals_w(base.c_str(), L"conhost.exe"))
+            return ends_with_w(path, L"\\windows\\system32\\conhost.exe") ||
+                ends_with_w(path, L"\\windows\\syswow64\\conhost.exe");
+        return false;
+    }
+
+    inline bool is_fileless_bootstrap_parent_owner(const process_probe_t* probe,
+                                                   DWORD owner_pid,
+                                                   DWORD parent_pid)
+    {
+        if (!probe || owner_pid == 0)
+            return false;
+        if (!fileless_bootstrap_context_active())
+            return false;
+        if (!is_fileless_terminal_basename(probe))
+            return false;
+        if (!trusted_fileless_terminal_owner_path(*probe))
+            return false;
+        if (owner_pid != parent_pid && !processes_share_session(owner_pid, GetCurrentProcessId()))
             return false;
         if (is_memory_scanner_tool(*probe) || is_re_tool(*probe) ||
             is_debugger_tool(*probe) || is_dump_tool(*probe) ||
@@ -981,6 +1339,17 @@ namespace detail
         process_evidence_t out{};
         for (const auto& probe : probes)
         {
+            if (is_trusted_aida_build_tool_process(probe))
+            {
+                diag::log_tagged_fmt("guard",
+                    "ai_tool_posture_trusted_build_tool_ignored pid=%lu parent_pid=%lu exe_hash=0x%016llX image_hash=0x%016llX command_hash=0x%016llX",
+                    static_cast<unsigned long>(probe.pid),
+                    static_cast<unsigned long>(probe.parent_pid),
+                    static_cast<unsigned long long>(probe.basename_hash),
+                    static_cast<unsigned long long>(hash_wide_lower(probe.image_lower.c_str())),
+                    static_cast<unsigned long long>(hash_wide_lower(probe.command_lower.c_str())));
+                continue;
+            }
             const bool mcp_evidence = has_mcp_command_evidence(probe);
             const bool mcp_command = is_shell_or_interpreter(probe) && mcp_evidence;
             const bool ai_tool = is_ai_coding_tool(probe);
@@ -991,6 +1360,7 @@ namespace detail
             const bool dump_tool = is_dump_tool(probe);
             const bool high_value_tool = mcp_evidence || ai_tool || memory_tool || re_tool || debugger_tool || dump_tool;
             const bool trusted_internal_camoufox = is_trusted_aida_internal_camoufox_mcp_process(probe);
+            const bool supported_ida_host = is_supported_ida_host_observation(probe);
             if (trusted_internal_camoufox)
             {
                 diag::log_tagged_fmt("guard",
@@ -1002,6 +1372,20 @@ namespace detail
                     static_cast<unsigned long long>(hash_wide_lower(probe.command_lower.c_str())),
                     mcp_evidence ? 1 : 0,
                     mcp_command ? 1 : 0,
+                    has_aida_target_evidence(probe) ? 1 : 0);
+                continue;
+            }
+            if (supported_ida_host)
+            {
+                diag::log_tagged_fmt("guard",
+                    "ai_tool_posture_supported_ida_host_observed pid=%lu parent_pid=%lu exe_hash=0x%016llX image_hash=0x%016llX command_hash=0x%016llX re=%d dbg=%d target=%d",
+                    static_cast<unsigned long>(probe.pid),
+                    static_cast<unsigned long>(probe.parent_pid),
+                    static_cast<unsigned long long>(probe.basename_hash),
+                    static_cast<unsigned long long>(hash_wide_lower(probe.image_lower.c_str())),
+                    static_cast<unsigned long long>(hash_wide_lower(probe.command_lower.c_str())),
+                    re_tool ? 1 : 0,
+                    debugger_tool ? 1 : 0,
                     has_aida_target_evidence(probe) ? 1 : 0);
                 continue;
             }
@@ -1683,6 +2067,41 @@ namespace self_analysis
                         owner_path.empty() ? "<empty>" : owner_path.c_str(),
                         out.fileless_bootstrap_parent_ignored_count);
                     continue;
+                }
+                if (detail::fileless_bootstrap_context_active() &&
+                    detail::is_fileless_terminal_basename(probe))
+                {
+                    std::string owner_image = detail::probe_image_for_log(probe);
+                    std::string owner_path = detail::probe_path_for_log(probe);
+                    std::string flags = detail::format_process_handle_access_flags(h.GrantedAccess);
+                    const bool trusted_path = probe && detail::trusted_fileless_terminal_owner_path(*probe);
+                    const bool same_session = detail::processes_share_session(owner_pid, GetCurrentProcessId());
+                    const bool owner_memory_fail = probe && detail::is_memory_scanner_tool(*probe);
+                    const bool owner_re_fail = probe && detail::is_re_tool(*probe);
+                    const bool owner_debugger_fail = probe && detail::is_debugger_tool(*probe);
+                    const bool owner_dump_fail = probe && detail::is_dump_tool(*probe);
+                    const bool owner_mcp_fail = probe && detail::has_mcp_command_evidence(*probe);
+                    const bool owner_ai_fail = probe && detail::is_ai_coding_tool(*probe);
+                    const bool owner_target_fail = probe && detail::has_aida_target_evidence(*probe);
+                    diag::log_tagged_critical_fmt("guard",
+                        "ai_tool_posture_fileless_parent_handle_not_ignored owner_pid=%lu parent_pid=%lu handle=0x%016llX access=0x%08lX access_flags=%s trusted_path=%d same_session=%d owner_memory=%d owner_re=%d owner_debugger=%d owner_dump=%d owner_mcp=%d owner_ai=%d owner_target=%d owner_hash=0x%016llX owner_image=%s owner_path=%s",
+                        static_cast<unsigned long>(owner_pid),
+                        static_cast<unsigned long>(fileless_parent_pid),
+                        static_cast<unsigned long long>(h.HandleValue),
+                        static_cast<unsigned long>(h.GrantedAccess),
+                        flags.c_str(),
+                        trusted_path ? 1 : 0,
+                        same_session ? 1 : 0,
+                        owner_memory_fail ? 1 : 0,
+                        owner_re_fail ? 1 : 0,
+                        owner_debugger_fail ? 1 : 0,
+                        owner_dump_fail ? 1 : 0,
+                        owner_mcp_fail ? 1 : 0,
+                        owner_ai_fail ? 1 : 0,
+                        owner_target_fail ? 1 : 0,
+                        static_cast<unsigned long long>(probe ? probe->basename_hash : 0),
+                        owner_image.empty() ? "<empty>" : owner_image.c_str(),
+                        owner_path.empty() ? "<empty>" : owner_path.c_str());
                 }
                 if (detail::trusted_kernel_system_owner(owner_pid))
                 {

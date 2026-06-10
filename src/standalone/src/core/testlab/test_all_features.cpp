@@ -756,6 +756,169 @@ namespace test_all_features {
 			return std::strncmp(name, prefix, std::strlen(prefix)) == 0;
 		}
 
+		bool text_contains_ascii_ci(const std::string& value, const char* needle) {
+			if (needle == nullptr || *needle == '\0')
+				return true;
+			const std::size_t needle_len = std::strlen(needle);
+			if (value.size() < needle_len)
+				return false;
+			for (std::size_t i = 0; i + needle_len <= value.size(); ++i) {
+				bool matched = true;
+				for (std::size_t j = 0; j < needle_len; ++j) {
+					char a = value[i + j];
+					char b = needle[j];
+					if (a >= 'A' && a <= 'Z') a = static_cast<char>(a - 'A' + 'a');
+					if (b >= 'A' && b <= 'Z') b = static_cast<char>(b - 'A' + 'a');
+					if (a != b) {
+						matched = false;
+						break;
+					}
+				}
+				if (matched)
+					return true;
+			}
+			return false;
+		}
+
+		const std::string* parsed_value(const test_lab::result_t& r, const char* label) {
+			if (label == nullptr)
+				return nullptr;
+			for (const auto& kv : r.parsed) {
+				if (kv.label == label)
+					return &kv.value;
+			}
+			return nullptr;
+		}
+
+		bool parsed_u64(const test_lab::result_t& r, const char* label, std::uint64_t& out) {
+			const std::string* value = parsed_value(r, label);
+			if (value == nullptr)
+				return false;
+			const char* s = value->c_str();
+			while (*s == ' ' || *s == '\t')
+				++s;
+			char* end = nullptr;
+			out = std::strtoull(s, &end, 0);
+			return end != s;
+		}
+
+		bool parsed_nonzero(const test_lab::result_t& r, const char* label) {
+			std::uint64_t value = 0;
+			return parsed_u64(r, label, value) && value != 0;
+		}
+
+		bool any_parsed_nonzero(const test_lab::result_t& r, const char* const* labels, std::size_t count) {
+			for (std::size_t i = 0; i < count; ++i) {
+				if (parsed_nonzero(r, labels[i]))
+					return true;
+			}
+			return false;
+		}
+
+		bool parsed_value_contains(const test_lab::result_t& r, const char* label, const char* needle) {
+			const std::string* value = parsed_value(r, label);
+			return value != nullptr && text_contains_ascii_ci(*value, needle);
+		}
+
+		bool feature_evidence_failure_reason(const char* category, const char* name, const test_lab::result_t& r, std::string& reason) {
+			reason.clear();
+			const char* cat = category ? category : "";
+			const char* feature = name ? name : "";
+			if (r.bytes_returned == 0 && r.raw.empty() && r.parsed.empty()) {
+				reason = "empty_result_without_evidence";
+				return true;
+			}
+			if (std::strcmp(cat, "module") == 0 && name_starts_with(feature, "PMOD") && !parsed_nonzero(r, "rule_count")) {
+				reason = "PMOD rule_count=0_or_missing";
+				return true;
+			}
+			if (std::strcmp(cat, "module") == 0 && name_starts_with(feature, "DPIN") && !parsed_nonzero(r, "result_count")) {
+				reason = "DPIN result_count=0_or_missing";
+				return true;
+			}
+			if (std::strcmp(cat, "module") == 0 && name_starts_with(feature, "IHLD") && !parsed_nonzero(r, "held_count")) {
+				reason = "IHLD held_count=0_or_missing";
+				return true;
+			}
+			if (std::strcmp(cat, "network-query") == 0 && name_starts_with(feature, "NCAP") && !parsed_nonzero(r, "packets_captured")) {
+				reason = "NCAP packets_captured=0_or_missing";
+				return true;
+			}
+			if (std::strcmp(cat, "network-query") == 0 && name_starts_with(feature, "NCPG") && !parsed_nonzero(r, "packet_count")) {
+				reason = "NCPG packet_count=0_or_missing";
+				return true;
+			}
+			if (std::strcmp(cat, "network-query") == 0 && name_starts_with(feature, "NDNS") && !parsed_nonzero(r, "entry_count")) {
+				reason = "NDNS entry_count=0_or_missing";
+				return true;
+			}
+			if (std::strcmp(cat, "network-query") == 0 && name_starts_with(feature, "NFLT")) {
+				const char* labels[] = { "rule_id", "rule_count", "action", "direction", "protocol" };
+				if (!any_parsed_nonzero(r, labels, sizeof(labels) / sizeof(labels[0]))) {
+					reason = "NFLT rule_lifecycle_fields_all_zero_or_missing";
+					return true;
+				}
+			}
+			if (std::strcmp(cat, "network-query") == 0 && name_starts_with(feature, "NSTS")) {
+				const char* labels[] = {
+					"bytes_sent", "bytes_received", "packets_sent", "packets_received",
+					"active_connections", "total_captured", "total_dns_logged", "active_filter_rules"
+				};
+				if (!any_parsed_nonzero(r, labels, sizeof(labels) / sizeof(labels[0]))) {
+					reason = "NSTS all_activity_counters_zero_or_missing";
+					return true;
+				}
+			}
+			if (std::strcmp(cat, "network-query") == 0 && name_starts_with(feature, "GSKT") && !parsed_nonzero(r, "socket_count")) {
+				reason = "GSKT socket_count=0_or_missing";
+				return true;
+			}
+			if (std::strcmp(cat, "network-query") == 0 && name_starts_with(feature, "SNBF") && !parsed_nonzero(r, "capture_count")) {
+				reason = "SNBF capture_count=0_or_missing";
+				return true;
+			}
+			if (std::strcmp(cat, "network-query") == 0 && name_starts_with(feature, "NFPR") && !parsed_nonzero(r, "result_count")) {
+				reason = "NFPR result_count=0_or_missing";
+				return true;
+			}
+			if (std::strcmp(cat, "tamper") == 0 && name_starts_with(feature, "SRVT")) {
+				if (!parsed_value_contains(r, "result", "accepted") ||
+					!parsed_nonzero(r, "server_nonce") ||
+					!parsed_nonzero(r, "token_bytes_consumed")) {
+					reason = "SRVT accepted_token_evidence_missing";
+					return true;
+				}
+			}
+			if (std::strcmp(cat, "tamper") == 0 && name_starts_with(feature, "SRV2")) {
+				if (!parsed_value_contains(r, "result", "accepted") ||
+					!parsed_nonzero(r, "server_nonce") ||
+					!parsed_nonzero(r, "epoch") ||
+					!parsed_nonzero(r, "driver_proof")) {
+					reason = "SRV2 accepted_driver_proof_missing";
+					return true;
+				}
+			}
+			if (std::strcmp(cat, "tamper") == 0 && name_starts_with(feature, "RELA")) {
+				if (!parsed_value_contains(r, "result", "latched") && !parsed_value_contains(r, "result", "accepted")) {
+					reason = "RELA latch_result_missing";
+					return true;
+				}
+			}
+			if (std::strcmp(cat, "sentinel") == 0 && name_starts_with(feature, "Sentinel Evidence Ring") && !parsed_nonzero(r, "returned_count")) {
+				reason = "sentinel_evidence_returned_count=0_or_missing";
+				return true;
+			}
+			if (std::strcmp(cat, "sentinel") == 0 && name_starts_with(feature, "Sentinel Tier-A Query")) {
+				if (!parsed_nonzero(r, "present_flag") ||
+					!parsed_nonzero(r, "tier_mask") ||
+					!parsed_nonzero(r, "first_driver_base")) {
+					reason = "sentinel_tier_a_presence_fields_zero_or_missing";
+					return true;
+				}
+			}
+			return false;
+		}
+
 
 		std::uint32_t current_target_pid() {
 			return g_target_pid.load(std::memory_order_acquire);
@@ -1529,22 +1692,35 @@ namespace test_all_features {
 						r.error.c_str(),
 						static_cast<unsigned long long>(r.elapsed_us));
 				} else if (r.ok) {
-					g_passed.fetch_add(1);
-					bool target_verified = g_driver_attached.load(std::memory_order_acquire) && target_pid != 0;
-					if (!target_verified) {
-						g_suspect.fetch_add(1);
-						log_msg(hf, "testlab", "[%d/%d] PASS %s/%s SUSPECT (no verified target attach; success may be against host/self) ntstatus=%s bytes=%u elapsed=%llu us",
-							i + 1, total, cat, name,
-							test_lab_format::ntstatus_to_string(r.ntstatus),
-							r.bytes_returned,
-							static_cast<unsigned long long>(r.elapsed_us));
-					} else {
-						log_msg(hf, "testlab", "[%d/%d] PASS %s/%s ntstatus=%s bytes=%u parsed_fields=%zu elapsed=%llu us",
+					std::string evidence_reason;
+					if (feature_evidence_failure_reason(cat, name, r, evidence_reason)) {
+						g_failed.fetch_add(1);
+						log_msg(hf, "testlab", "[%d/%d] FAIL %s/%s evidence gate rejected success ntstatus=%s bytes=%u parsed_fields=%zu raw=%zu reason=\"%s\" elapsed=%llu us",
 							i + 1, total, cat, name,
 							test_lab_format::ntstatus_to_string(r.ntstatus),
 							r.bytes_returned,
 							r.parsed.size(),
+							r.raw.size(),
+							evidence_reason.c_str(),
 							static_cast<unsigned long long>(r.elapsed_us));
+					} else {
+						g_passed.fetch_add(1);
+						bool target_verified = g_driver_attached.load(std::memory_order_acquire) && target_pid != 0;
+						if (!target_verified) {
+							g_suspect.fetch_add(1);
+							log_msg(hf, "testlab", "[%d/%d] PASS %s/%s SUSPECT (no verified target attach; success may be against host/self) ntstatus=%s bytes=%u elapsed=%llu us",
+								i + 1, total, cat, name,
+								test_lab_format::ntstatus_to_string(r.ntstatus),
+								r.bytes_returned,
+								static_cast<unsigned long long>(r.elapsed_us));
+						} else {
+							log_msg(hf, "testlab", "[%d/%d] PASS %s/%s ntstatus=%s bytes=%u parsed_fields=%zu elapsed=%llu us",
+								i + 1, total, cat, name,
+								test_lab_format::ntstatus_to_string(r.ntstatus),
+								r.bytes_returned,
+								r.parsed.size(),
+								static_cast<unsigned long long>(r.elapsed_us));
+						}
 					}
 				} else {
 					g_failed.fetch_add(1);

@@ -323,9 +323,15 @@ inline void send_violation_alert(const char* reason, const std::string& extra_de
         ev.severity = aida::telemetry::severity_t::critical;
         ev.payload_json = payload.dump();
         aida::telemetry::instance().enqueue(ev);
-        aida::telemetry::instance().flush_blocking();
+        const bool flushed = aida::telemetry::instance().flush_blocking();
+        write_log_critical_fmt("violation",
+            "violation_alert_flush_result kind=reason flushed=%d detail_len=%zu",
+            flushed ? 1 : 0,
+            extra_detail.size());
     }
-    catch (...) {}
+    catch (...) {
+        write_log_critical("violation", "violation_alert_flush_exception kind=reason");
+    }
 }
 
 inline void send_violation_alert_id(uint64_t reason_id, const std::string& extra_detail)
@@ -351,9 +357,15 @@ inline void send_violation_alert_id(uint64_t reason_id, const std::string& extra
         ev.severity = aida::telemetry::severity_t::critical;
         ev.payload_json = payload.dump();
         aida::telemetry::instance().enqueue(ev);
-        aida::telemetry::instance().flush_blocking();
+        const bool flushed = aida::telemetry::instance().flush_blocking();
+        write_log_critical_fmt("violation",
+            "violation_alert_flush_result kind=reason_id flushed=%d detail_len=%zu",
+            flushed ? 1 : 0,
+            extra_detail.size());
     }
-    catch (...) {}
+    catch (...) {
+        write_log_critical("violation", "violation_alert_flush_exception kind=reason_id");
+    }
 }
 
 inline void post_critical_then_enforce(const char* reason,
@@ -378,9 +390,16 @@ inline void post_critical_then_enforce(const char* reason,
         ev.severity = aida::telemetry::severity_t::critical;
         ev.payload_json = payload.dump();
         aida::telemetry::instance().enqueue(ev);
-        aida::telemetry::instance().flush_blocking();
+        const bool flushed = aida::telemetry::instance().flush_blocking();
+        write_log_critical_fmt("critical_webhook",
+            "critical_webhook_flush_result flushed=%d detail_len=%zu signal_mask=0x%08X",
+            flushed ? 1 : 0,
+            extra_detail.size(),
+            signal_mask);
     }
-    catch (...) {}
+    catch (...) {
+        write_log_critical("critical_webhook", "critical_webhook_flush_exception");
+    }
     write_log("critical_webhook",
         (std::string(reason ? reason : "") + " " + extra_detail).c_str());
 }

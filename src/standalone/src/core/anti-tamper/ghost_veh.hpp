@@ -11,10 +11,12 @@
 #include <cstring>
 #include <exception>
 #include <mutex>
+#include <string>
 #include <system_error>
 #include <thread>
 
 #include "../../helpers/diag_log.hpp"
+#include "../infra/win_thread.hpp"
 
 #ifdef AIDA_STANDALONE
 #include <Zydis/Zydis.h>
@@ -90,7 +92,7 @@ namespace detail {
         std::atomic<int64_t> last_regen_ms{0};
 
         std::atomic<bool> regen_thread_running{false};
-        std::thread       regen_thread;
+        aida::infra::win_thread::joinable_thread_t regen_thread;
         HANDLE            regen_stop_event{nullptr};
 
         uint64_t          fake_ntdll_ra{0};
@@ -720,8 +722,20 @@ inline bool initialize()
         try
         {
             s.regen_thread_running.store(true, std::memory_order_release);
-            s.regen_thread = std::thread(detail::regen_loop);
-            regen_started = true;
+            std::string err;
+            regen_started = s.regen_thread.start(detail::regen_loop,
+                &err,
+                aida::infra::win_thread::default_stack_reserve,
+                "ghost_veh_regen");
+            if (!regen_started)
+            {
+                s.regen_thread_running.store(false, std::memory_order_release);
+                detail::log_init_event_fmt(
+                    "regen_thread_start_failed error=0 category=0 what=%s static_detour_mode",
+                    0,
+                    0,
+                    err.empty() ? "<none>" : err.c_str());
+            }
         }
         catch (const std::system_error& e)
         {

@@ -1800,6 +1800,7 @@ async function handleValidate(body, clientIp) {
         challenge_ttl: CHALLENGE_TTL_SECONDS,
         bind_response: bindDerivation.bind_response.toString('hex'),
         bind_token: sentinelBindTokenHex,
+        auth_hmac_key_b64: authHmacKey.toString('base64'),
         session_key_fingerprint: sessionKeyFingerprint,
     };
     if (initialChallenge) {

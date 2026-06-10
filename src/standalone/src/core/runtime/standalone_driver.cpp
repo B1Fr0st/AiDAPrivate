@@ -387,6 +387,16 @@ namespace
 
     bool usermode_get_thread_context(uint32_t tid, driver_bridge::thread_context_t& ctx, const char* source)
     {
+        const DWORD current_tid = GetCurrentThreadId();
+        if (tid == current_tid) {
+            diag::log_tagged_fmt("driver",
+                "%s user_getctx_rejected_self tid=%u",
+                source ? source : "thread",
+                tid);
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return false;
+        }
+
         unique_handle thread(make_handle(OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(tid))));
         if (!thread) {
             DWORD gle = GetLastError();

@@ -12,9 +12,11 @@
 #include <thread>
 #include <chrono>
 #include <array>
+#include <string>
 #include <system_error>
 
 #include "ghost_veh.hpp"
+#include "../infra/win_thread.hpp"
 
 namespace anti_tamper {
 namespace nanomites {
@@ -105,7 +107,7 @@ namespace detail {
         std::atomic<bool>     refresher_stop{false};
         std::atomic<bool>     refresher_degraded{false};
         std::atomic<uint32_t> refresher_start_error{0};
-        std::thread           refresher_thread;
+        aida::infra::win_thread::joinable_thread_t refresher_thread;
         DWORD                 owner_pid{0};
     };
 
@@ -807,7 +809,19 @@ inline bool initialize()
     s.refresher_start_error.store(0, std::memory_order_release);
     try
     {
-        s.refresher_thread = std::thread(detail::refresher_thread_proc);
+        std::string err;
+        if (!s.refresher_thread.start(detail::refresher_thread_proc,
+                &err,
+                aida::infra::win_thread::default_stack_reserve,
+                "nanomite_refresher"))
+        {
+            s.refresher_degraded.store(true, std::memory_order_release);
+            s.refresher_running.store(false, std::memory_order_release);
+            s.refresher_start_error.store(GetLastError(), std::memory_order_release);
+            diag::log_tagged_fmt("nanomite",
+                "refresher_thread_start_failed err=%s",
+                err.empty() ? "<none>" : err.c_str());
+        }
     }
     catch (const std::system_error& ex)
     {

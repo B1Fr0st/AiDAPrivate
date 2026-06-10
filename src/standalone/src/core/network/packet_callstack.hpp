@@ -9,6 +9,14 @@
 #include <algorithm>
 #include <cstring>
 
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
 #include "standalone_driver.hpp"
 
 namespace packet_callstack {
@@ -42,6 +50,49 @@ inline state_t g_state;
 
 inline void set_enabled(bool en) { g_state.enabled.store(en); }
 inline bool is_enabled() { return g_state.enabled.load(); }
+
+inline void push_entry(packet_callstack_entry_t&& entry) {
+	std::lock_guard<std::mutex> lk(g_state.mutex);
+	g_state.entries.push_back(std::move(entry));
+	while (g_state.entries.size() > g_state.max_entries)
+		g_state.entries.pop_front();
+}
+
+inline stack_frame_t local_frame_from_address(uint64_t addr) {
+	stack_frame_t frame{};
+	frame.address = addr;
+	frame.return_address = addr;
+	HMODULE module = nullptr;
+	if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+		reinterpret_cast<LPCSTR>(addr),
+		&module)) {
+		frame.module_offset = addr - reinterpret_cast<uint64_t>(module);
+		char path[MAX_PATH]{};
+		DWORD len = GetModuleFileNameA(module, path, static_cast<DWORD>(sizeof(path)));
+		if (len > 0) {
+			path[(std::min)(static_cast<size_t>(len), sizeof(path) - 1)] = '\0';
+			const char* slash = std::strrchr(path, '\\');
+			frame.module_name = slash ? slash + 1 : path;
+		}
+	}
+	return frame;
+}
+
+inline bool capture_current_thread(packet_callstack_entry_t& entry) {
+	void* frames[32]{};
+	USHORT count = CaptureStackBackTrace(0, static_cast<DWORD>(sizeof(frames) / sizeof(frames[0])), frames, nullptr);
+	entry.frames.reserve(count);
+	for (USHORT i = 0; i < count; ++i) {
+		uint64_t addr = reinterpret_cast<uint64_t>(frames[i]);
+		if (addr == 0)
+			continue;
+		if (entry.rip == 0)
+			entry.rip = addr;
+		entry.frames.push_back(local_frame_from_address(addr));
+	}
+	entry.resolved = true;
+	return !entry.frames.empty();
+}
 
 inline void resolve_modules(packet_callstack_entry_t& entry) {
 	auto modules = driver_bridge::enumerate_modules();
@@ -78,12 +129,15 @@ inline void capture_for_packet(uint64_t packet_idx, uint64_t timestamp,
 	entry.tid = tid;
 	entry.resolved = false;
 
+	if (pid == GetCurrentProcessId() && tid == GetCurrentThreadId()) {
+		capture_current_thread(entry);
+		push_entry(std::move(entry));
+		return;
+	}
+
 	driver_bridge::thread_context_t ctx{};
 	if (!driver_bridge::get_thread_context(tid, ctx)) {
-		std::lock_guard<std::mutex> lk(g_state.mutex);
-		g_state.entries.push_back(std::move(entry));
-		while (g_state.entries.size() > g_state.max_entries)
-			g_state.entries.pop_front();
+		push_entry(std::move(entry));
 		return;
 	}
 
@@ -168,12 +222,7 @@ inline void capture_for_packet(uint64_t packet_idx, uint64_t timestamp,
 
 	entry.resolved = !modules.empty();
 
-	{
-		std::lock_guard<std::mutex> lk(g_state.mutex);
-		g_state.entries.push_back(std::move(entry));
-		while (g_state.entries.size() > g_state.max_entries)
-			g_state.entries.pop_front();
-	}
+	push_entry(std::move(entry));
 }
 
 inline bool get_callstack(uint64_t packet_idx, packet_callstack_entry_t& out) {

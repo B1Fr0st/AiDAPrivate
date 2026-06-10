@@ -3624,9 +3624,10 @@ namespace {
         aida::burp::camoufox::launch_config_t cfg;
         cfg.headless = false;
         cfg.proxy = "http://127.0.0.1:18888";
-        cfg.launch_timeout_ms = 70000;
+        cfg.launch_timeout_ms = 15000;
         cfg.window_width = 1280;
         cfg.window_height = 900;
+        cfg.testlab_fast_probe = true;
         bool launched = aida::burp::camoufox::start_bridge(cfg);
         auto bridge_after = aida::burp::camoufox::get_status();
         const bool ready = bridge_after.state == aida::burp::camoufox::bridge_state_t::ready &&

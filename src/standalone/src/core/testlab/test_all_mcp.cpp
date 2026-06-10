@@ -34,6 +34,7 @@
 #include "../network/burp/intruder_engine.hpp"
 #include "../network/burp/param_miner.hpp"
 #include "../network/network_view.hpp"
+#include "../network/packet_callstack.hpp"
 #include "../network/tcp_stream_tracker.hpp"
 #include "../tools/pre_encrypt_hook.hpp"
 #include "../tools/standalone_tools_fwd.hpp"
@@ -136,6 +137,11 @@ namespace {
     std::string g_mcp_cert_thumbprint;
     bool g_mcp_cert_inject_validate_only = false;
     std::string g_mcp_session_binary_id;
+    bool g_mcp_camoufox_bridge_ready_proven = false;
+    uint64_t g_mcp_camoufox_bridge_generation = 0;
+    std::string g_mcp_camoufox_bridge_block_reason;
+    constexpr DWORD k_camoufox_testlab_launch_timeout_ms = 15000;
+    constexpr long long k_camoufox_testlab_launch_watchdog_ms = 22000;
     enum class mcp_tool_call_status_t {
         passed,
         failed,
@@ -165,6 +171,48 @@ namespace {
     void record_fixture_failed_tool(const char* tool_name, std::atomic<int>& failed);
     mcp_standalone::server_t* get_server();
     void record_tool_status(const std::string& name, mcp_tool_call_status_t status);
+
+    struct scoped_env_var_t {
+        std::string name;
+        std::string previous;
+        bool had_previous = false;
+
+        scoped_env_var_t(const char* key, const char* value) : name(key ? key : "") {
+            if (name.empty())
+                return;
+            DWORD need = GetEnvironmentVariableA(name.c_str(), nullptr, 0);
+            if (need > 0 && need < 32768) {
+                previous.resize(need);
+                DWORD got = GetEnvironmentVariableA(name.c_str(), previous.data(), need);
+                if (got > 0 && got < need) {
+                    previous.resize(got);
+                    had_previous = true;
+                } else {
+                    previous.clear();
+                }
+            }
+            SetEnvironmentVariableA(name.c_str(), value);
+        }
+
+        ~scoped_env_var_t() {
+            if (name.empty())
+                return;
+            SetEnvironmentVariableA(name.c_str(), had_previous ? previous.c_str() : nullptr);
+        }
+
+        scoped_env_var_t(const scoped_env_var_t&) = delete;
+        scoped_env_var_t& operator=(const scoped_env_var_t&) = delete;
+    };
+
+    struct scoped_camoufox_testlab_launch_t {
+        scoped_env_var_t fast_probe;
+        scoped_env_var_t timeout_ms;
+
+        scoped_camoufox_testlab_launch_t()
+            : fast_probe("AIDA_CAMOUFOX_TESTLAB_FAST_PROBE", "1"),
+              timeout_ms("AIDA_CAMOUFOX_TESTLAB_LAUNCH_MS", "15000") {
+        }
+    };
     const mcp_standalone::tool_def_t* find_registered_tool(mcp_standalone::server_t* srv, const char* tool_name);
 
     bool browser_infrastructure_text(const std::string& text) {
@@ -807,6 +855,197 @@ namespace {
         return out;
     }
 
+    bool mcp_tool_requires_live_camoufox_bridge(const std::string& name) {
+        const std::string n = lower_copy(name);
+        static const char* tools[] = {
+            "web_search", "webfetch", "burp_dom_xss_status", "burp_dom_xss_test_payload",
+            "burp_dom_xss_scan", "list_pages", "new_page", "select_page", "close_page",
+            "navigate", "reload", "take_screenshot", "take_snapshot", "click", "type_text",
+            "wait_for", "get_page_info", "reset_browser_state", "evaluate_js", "hook_function",
+            "add_init_script", "inject_hook_preset", "remove_hooks", "get_console_logs",
+            "network_capture", "list_network_requests", "get_network_request",
+            "get_request_initiator", "intercept_request", "scripts", "search_code", "cookies",
+            "get_storage", "export_state", "import_state", "hook_jsvmp_interpreter", "compare_env",
+            "instrumentation", "verify_signer_offline", "trace_property_access", "list_trace_files",
+            "query_trace_file", "analyze_cookie_sources"
+        };
+        for (const char* tool : tools) {
+            if (n == tool)
+                return true;
+        }
+        return false;
+    }
+
+    bool camoufox_live_bridge_status(const aida::burp::camoufox::bridge_status_t& st) {
+        return st.state == aida::burp::camoufox::bridge_state_t::ready &&
+               st.child_pid != 0 &&
+               st.child_alive &&
+               st.browser_open &&
+               st.page_verified &&
+               !st.cleanup_pending;
+    }
+
+    std::string camoufox_status_compact(const aida::burp::camoufox::bridge_status_t& st) {
+        char buf[960];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "state=%s generation=%llu child_pid=%u child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d page_count=%u active_page_id=%s active_url_len=%zu calls=%llu errors=%llu last_launch_ms=%llu last_call_ms=%llu last_nav_ms=%llu last_cleanup_ms=%llu last_verified_ms=%llu err=%s",
+            camoufox_bridge_state_name(st.state),
+            static_cast<unsigned long long>(st.generation),
+            st.child_pid,
+            st.child_alive ? 1 : 0,
+            st.browser_open ? 1 : 0,
+            st.page_verified ? 1 : 0,
+            st.cleanup_pending ? 1 : 0,
+            st.page_count,
+            st.active_page_id.empty() ? "<empty>" : st.active_page_id.c_str(),
+            st.active_page_url.size(),
+            static_cast<unsigned long long>(st.total_calls),
+            static_cast<unsigned long long>(st.total_errors),
+            static_cast<unsigned long long>(st.last_launch_ms),
+            static_cast<unsigned long long>(st.last_call_ms),
+            static_cast<unsigned long long>(st.last_nav_ms),
+            static_cast<unsigned long long>(st.last_cleanup_ms),
+            static_cast<unsigned long long>(st.last_verified_ms),
+            compact_text(st.last_error, 420).c_str());
+        return std::string(buf);
+    }
+
+    void log_camoufox_live_bridge_status(HANDLE hf, const char* tag, const char* phase, const aida::burp::camoufox::bridge_status_t& st) {
+        log_msg(hf, tag, "CAMOUFOX-LIVE -- phase=%s live=%d %s",
+            phase ? phase : "<null>",
+            camoufox_live_bridge_status(st) ? 1 : 0,
+            camoufox_status_compact(st).c_str());
+    }
+
+    struct camoufox_launch_attempt_result_t {
+        bool completed = false;
+        bool ok = false;
+        aida::burp::camoufox::bridge_status_t status;
+        std::string runner_error;
+    };
+
+    camoufox_launch_attempt_result_t bounded_camoufox_start_bridge(HANDLE hf, const char* tag, const aida::burp::camoufox::launch_config_t& cfg, DWORD timeout_ms) {
+        static test_lab::bounded_runner_t runner(1);
+        auto state = std::make_shared<camoufox_launch_attempt_result_t>();
+        const uint64_t t0 = GetTickCount64();
+        log_msg(hf, tag, "CAMOUFOX-LAUNCH -- begin session=%s headless=%d timeout_ms=%lu requested_launch_timeout_ms=%d trace=%d",
+            cfg.session_id.empty() ? "default" : cfg.session_id.c_str(),
+            cfg.headless ? 1 : 0,
+            static_cast<unsigned long>(timeout_ms),
+            cfg.launch_timeout_ms,
+            cfg.enable_trace ? 1 : 0);
+        const auto result = runner.run(static_cast<std::uint32_t>(timeout_ms), [state, cfg]() {
+            state->ok = aida::burp::camoufox::start_bridge(cfg);
+            state->status = aida::burp::camoufox::get_status();
+        });
+        const uint64_t elapsed = GetTickCount64() - t0;
+        camoufox_launch_attempt_result_t out;
+        if (result.status == test_lab::bounded_run_status_t::completed) {
+            out = *state;
+            out.completed = true;
+        } else {
+            out.completed = false;
+            out.ok = false;
+            out.status = aida::burp::camoufox::get_status();
+            out.runner_error = result.error;
+        }
+        log_msg(hf, tag, "CAMOUFOX-LAUNCH -- end completed=%d runner_status=%d ok=%d elapsed_ms=%llu runner_error=%s %s",
+            out.completed ? 1 : 0,
+            static_cast<int>(result.status),
+            out.ok ? 1 : 0,
+            static_cast<unsigned long long>(elapsed),
+            out.runner_error.empty() ? "<empty>" : compact_text(out.runner_error, 500).c_str(),
+            camoufox_status_compact(out.status).c_str());
+        return out;
+    }
+
+    bool wait_for_camoufox_live_status(HANDLE hf, const char* tag, DWORD timeout_ms, aida::burp::camoufox::bridge_status_t& out_status) {
+        const uint64_t t0 = GetTickCount64();
+        uint64_t last_log = 0;
+        for (;;) {
+            out_status = aida::burp::camoufox::get_status();
+            if (camoufox_live_bridge_status(out_status)) {
+                log_msg(hf, tag, "CAMOUFOX-WAIT -- ready elapsed_ms=%llu %s",
+                    static_cast<unsigned long long>(GetTickCount64() - t0),
+                    camoufox_status_compact(out_status).c_str());
+                return true;
+            }
+            const uint64_t elapsed = GetTickCount64() - t0;
+            if (elapsed >= timeout_ms)
+                break;
+            if (elapsed - last_log >= 1000) {
+                last_log = elapsed;
+                log_msg(hf, tag, "CAMOUFOX-WAIT -- pending elapsed_ms=%llu timeout_ms=%lu %s",
+                    static_cast<unsigned long long>(elapsed),
+                    static_cast<unsigned long>(timeout_ms),
+                    camoufox_status_compact(out_status).c_str());
+            }
+            Sleep(100);
+        }
+        log_msg(hf, tag, "CAMOUFOX-WAIT -- timeout timeout_ms=%lu %s",
+            static_cast<unsigned long>(timeout_ms),
+            camoufox_status_compact(out_status).c_str());
+        return false;
+    }
+
+    bool prove_camoufox_live_bridge(HANDLE hf, const char* tag, const char* owner, std::string& reason) {
+        reason.clear();
+        aida::burp::camoufox::bridge_status_t st;
+        if (!wait_for_camoufox_live_status(hf, tag, 12000, st)) {
+            reason = std::string("Camoufox bridge did not reach live ready status for ") + (owner ? owner : "<unknown>") + ": " + camoufox_status_compact(st);
+            return false;
+        }
+        log_camoufox_live_bridge_status(hf, tag, "proof_status_ready", st);
+
+        const auto list_result = aida::burp::camoufox::call_tool("list_pages", mcp_standalone::json::object(), 15000);
+        log_msg(hf, tag, "CAMOUFOX-PROOF -- owner=%s step=list_pages ok=%d text_len=%zu data_type=%s error=%s data=%s",
+            owner ? owner : "<unknown>",
+            list_result.ok ? 1 : 0,
+            list_result.text.size(),
+            list_result.data.type_name(),
+            list_result.error.empty() ? "<empty>" : compact_text(list_result.error, 500).c_str(),
+            compact_json(list_result.data, 900).c_str());
+        if (!list_result.ok) {
+            reason = std::string("Camoufox list_pages proof failed for ") + (owner ? owner : "<unknown>") + ": " +
+                (list_result.error.empty() ? compact_text(list_result.text, 500) : compact_text(list_result.error, 500));
+            return false;
+        }
+
+        mcp_standalone::json eval_args;
+        eval_args["expression"] = "(()=>({aida_probe:'ready',href:location.href,title:document.title,readyState:document.readyState}))()";
+        eval_args["await_promise"] = true;
+        const auto eval_result = aida::burp::camoufox::call_tool("evaluate_js", eval_args, 15000);
+        log_msg(hf, tag, "CAMOUFOX-PROOF -- owner=%s step=evaluate_js ok=%d text_len=%zu data_type=%s error=%s data=%s",
+            owner ? owner : "<unknown>",
+            eval_result.ok ? 1 : 0,
+            eval_result.text.size(),
+            eval_result.data.type_name(),
+            eval_result.error.empty() ? "<empty>" : compact_text(eval_result.error, 500).c_str(),
+            compact_json(eval_result.data, 900).c_str());
+        if (!eval_result.ok) {
+            reason = std::string("Camoufox evaluate_js proof failed for ") + (owner ? owner : "<unknown>") + ": " +
+                (eval_result.error.empty() ? compact_text(eval_result.text, 500) : compact_text(eval_result.error, 500));
+            return false;
+        }
+
+        st = aida::burp::camoufox::get_status();
+        if (!camoufox_live_bridge_status(st)) {
+            reason = std::string("Camoufox bridge lost live ready status after proof for ") + (owner ? owner : "<unknown>") + ": " + camoufox_status_compact(st);
+            log_camoufox_live_bridge_status(hf, tag, "proof_status_lost", st);
+            return false;
+        }
+        g_mcp_camoufox_bridge_ready_proven = true;
+        g_mcp_camoufox_bridge_generation = st.generation;
+        g_mcp_camoufox_bridge_block_reason.clear();
+        log_msg(hf, tag, "CAMOUFOX-PROOF -- owner=%s complete generation=%llu child_pid=%u page_count=%u active_url_len=%zu",
+            owner ? owner : "<unknown>",
+            static_cast<unsigned long long>(st.generation),
+            st.child_pid,
+            st.page_count,
+            st.active_page_url.size());
+        return true;
+    }
+
     bool sensitive_log_tool(const std::string& tool_name) {
         const std::string t = lower_copy(tool_name);
         static const char* markers[] = {
@@ -951,7 +1190,8 @@ namespace {
     std::string mcp_tool_domain(const std::string& tool_name) {
         const std::string name = lower_copy(tool_name);
         static const std::set<std::string> camoufox_tools = {
-            "check_environment", "launch_browser", "close_browser", "reset_browser_state",
+            "check_environment", "launch_browser", "close_browser", "list_pages", "new_page",
+            "select_page", "close_page", "reset_browser_state",
             "add_init_script", "navigate", "reload", "take_screenshot", "take_snapshot",
             "click", "type_text", "wait_for", "get_page_info", "evaluate_js",
             "hook_function", "inject_hook_preset", "remove_hooks", "get_console_logs",
@@ -1138,6 +1378,138 @@ namespace {
             record_tool_status(tool_name_s, mcp_tool_call_status_t::failed);
         }
         failed.fetch_add(1);
+    }
+
+    void record_camoufox_bridge_blocked_tool(HANDLE hf, const char* tag, const char* tool_name, const std::string& reason, std::atomic<int>& failed) {
+        const std::string tool_name_s = tool_name ? std::string(tool_name) : std::string();
+        if (tool_name_s.empty()) {
+            failed.fetch_add(1);
+            return;
+        }
+        g_invoked_tools.insert(tool_name_s);
+        const auto* tool = find_registered_tool(get_server(), tool_name);
+        const auto st = aida::burp::camoufox::get_status();
+        if (!tool) {
+            log_msg(hf, tag, "FAIL -- Camoufox browser tool \"%s\" is not registered while bridge was blocked reason=%s %s",
+                tool_name_s.c_str(),
+                reason.empty() ? "<empty>" : compact_text(reason, 900).c_str(),
+                camoufox_status_compact(st).c_str());
+            record_tool_status(tool_name_s, mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return;
+        }
+        if (!tool->handler) {
+            log_msg(hf, tag, "FAIL -- Camoufox browser tool \"%s\" has no handler while bridge was blocked reason=%s %s",
+                tool_name_s.c_str(),
+                reason.empty() ? "<empty>" : compact_text(reason, 900).c_str(),
+                camoufox_status_compact(st).c_str());
+            record_tool_status(tool_name_s, mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return;
+        }
+        log_msg(hf, tag, "BLOCKED-FAIL -- \"%s\" not dispatched because Camoufox live bridge was not proven reason=%s read_only=%d visibility=%s params=%zu %s",
+            tool_name_s.c_str(),
+            reason.empty() ? "<empty>" : compact_text(reason, 900).c_str(),
+            tool->read_only ? 1 : 0,
+            tool_visibility_name(tool->visibility),
+            tool->params.size(),
+            camoufox_status_compact(st).c_str());
+        record_tool_status(tool_name_s, mcp_tool_call_status_t::failed);
+        failed.fetch_add(1);
+    }
+
+    bool ensure_mcp_camoufox_bridge_ready_for_tool(HANDLE hf, const char* tag, const char* tool_name, std::atomic<int>& failed, std::string* out_reason = nullptr) {
+        const std::string tool_name_s = tool_name ? std::string(tool_name) : std::string();
+        std::string reason;
+        auto st = aida::burp::camoufox::get_status();
+        log_camoufox_live_bridge_status(hf, tag, "preflight_entry", st);
+
+        if (!g_mcp_camoufox_bridge_ready_proven &&
+            !g_mcp_camoufox_bridge_block_reason.empty() &&
+            !camoufox_live_bridge_status(st)) {
+            reason = std::string("previous Camoufox live bridge proof failed: ") + g_mcp_camoufox_bridge_block_reason +
+                "; current " + camoufox_status_compact(st);
+            if (out_reason)
+                *out_reason = reason;
+            record_camoufox_bridge_blocked_tool(hf, tag, tool_name, reason, failed);
+            return false;
+        }
+
+        if (g_mcp_camoufox_bridge_ready_proven && camoufox_live_bridge_status(st) &&
+            (g_mcp_camoufox_bridge_generation == 0 || g_mcp_camoufox_bridge_generation == st.generation)) {
+            log_msg(hf, tag, "CAMOUFOX-PREFLIGHT -- cached live bridge accepted tool=%s generation=%llu child_pid=%u",
+                tool_name_s.empty() ? "<empty>" : tool_name_s.c_str(),
+                static_cast<unsigned long long>(st.generation),
+                st.child_pid);
+            if (out_reason)
+                out_reason->clear();
+            return true;
+        }
+
+        std::string dependency_reason;
+        if (!camoufox_dependencies_ready_for_test(hf, tag, dependency_reason)) {
+            reason = dependency_reason.empty() ? std::string("Camoufox dependencies are not ready") : dependency_reason;
+            g_mcp_camoufox_bridge_ready_proven = false;
+            g_mcp_camoufox_bridge_block_reason = reason;
+            if (out_reason)
+                *out_reason = reason;
+            record_camoufox_bridge_blocked_tool(hf, tag, tool_name, reason, failed);
+            return false;
+        }
+
+        st = aida::burp::camoufox::get_status();
+        if (!camoufox_live_bridge_status(st)) {
+            if (st.cleanup_pending) {
+                const bool idle = aida::burp::camoufox::wait_until_idle(7000, "testlab.camoufox.preflight_cleanup_wait");
+                auto after_idle = aida::burp::camoufox::get_status();
+                log_msg(hf, tag, "CAMOUFOX-PREFLIGHT -- cleanup wait idle=%d before=%s after=%s",
+                    idle ? 1 : 0,
+                    camoufox_status_compact(st).c_str(),
+                    camoufox_status_compact(after_idle).c_str());
+                st = after_idle;
+            }
+        }
+
+        if (!camoufox_live_bridge_status(st)) {
+            for (int attempt = 1; attempt <= 1; ++attempt) {
+                aida::burp::camoufox::launch_config_t cfg;
+                cfg.headless = false;
+                cfg.launch_timeout_ms = static_cast<int>(k_camoufox_testlab_launch_timeout_ms);
+                cfg.window_width = 1280;
+                cfg.window_height = 900;
+                cfg.enable_trace = true;
+                cfg.testlab_fast_probe = true;
+                const DWORD runner_timeout = static_cast<DWORD>(cfg.launch_timeout_ms + 8000);
+                auto launch = bounded_camoufox_start_bridge(hf, tag, cfg, runner_timeout);
+                st = launch.status;
+                if (launch.completed && launch.ok && camoufox_live_bridge_status(st))
+                    break;
+                reason = launch.completed
+                    ? std::string("Camoufox bridge launch did not produce live ready state for ") + tool_name_s + ": " + camoufox_status_compact(st)
+                    : std::string("Camoufox bridge launch runner did not complete for ") + tool_name_s + " status=" + camoufox_status_compact(st);
+                if (attempt == 1) {
+                    const bool stopped = aida::burp::camoufox::stop_bridge("testlab.camoufox.preflight_retry");
+                    auto stopped_status = aida::burp::camoufox::get_status();
+                    log_msg(hf, tag, "CAMOUFOX-PREFLIGHT -- retry cleanup stopped=%d %s",
+                        stopped ? 1 : 0,
+                        camoufox_status_compact(stopped_status).c_str());
+                    Sleep(500);
+                }
+            }
+        }
+
+        if (!prove_camoufox_live_bridge(hf, tag, tool_name, reason)) {
+            g_mcp_camoufox_bridge_ready_proven = false;
+            g_mcp_camoufox_bridge_block_reason = reason;
+            if (out_reason)
+                *out_reason = reason;
+            record_camoufox_bridge_blocked_tool(hf, tag, tool_name, reason, failed);
+            return false;
+        }
+
+        if (out_reason)
+            out_reason->clear();
+        return true;
     }
 
     std::filesystem::path mcp_scratch_workspace_root() {
@@ -2161,6 +2533,56 @@ namespace {
             }
         }
 
+        if (tool_lc == "network_get_held_packets") {
+            bool expected_empty = false;
+            if (payload_bool_field(ir.data, "expected_empty", expected_empty) && expected_empty)
+                return false;
+            uint64_t count = 1;
+            size_t packets = 1;
+            if ((ir.data.is_array() && !ir.data.empty()) ||
+                (payload_array_count(ir.data, "packets", packets) && packets > 0) ||
+                (payload_array_count(ir.data, "held_packets", packets) && packets > 0) ||
+                (payload_u64_field(ir.data, "count", count) && count > 0) ||
+                (payload_u64_field(ir.data, "held_count", count) && count > 0))
+                return false;
+            if ((ir.data.is_array() && ir.data.empty()) ||
+                (payload_array_count(ir.data, "packets", packets) && packets == 0) ||
+                (payload_array_count(ir.data, "held_packets", packets) && packets == 0) ||
+                (payload_u64_field(ir.data, "count", count) && count == 0) ||
+                (payload_u64_field(ir.data, "held_count", count) && count == 0) ||
+                payload_text_contains(ir, "0 packets held") ||
+                payload_text_contains(ir, "0 held packet")) {
+                reason = "held_packets=0";
+                return true;
+            }
+        }
+
+        if (tool_lc == "network_packet_callstack") {
+            bool expected_empty = false;
+            if (payload_bool_field(ir.data, "expected_empty", expected_empty) && expected_empty)
+                return false;
+            uint64_t count = 1;
+            size_t entries = 1;
+            if ((ir.data.is_array() && !ir.data.empty()) ||
+                (payload_array_count(ir.data, "entries", entries) && entries > 0) ||
+                (payload_array_count(ir.data, "callstacks", entries) && entries > 0) ||
+                (payload_array_count(ir.data, "callstack", entries) && entries > 0) ||
+                (payload_u64_field(ir.data, "count", count) && count > 0) ||
+                (payload_u64_field(ir.data, "entry_count", count) && count > 0))
+                return false;
+            if ((ir.data.is_array() && ir.data.empty()) ||
+                (payload_array_count(ir.data, "entries", entries) && entries == 0) ||
+                (payload_array_count(ir.data, "callstacks", entries) && entries == 0) ||
+                (payload_array_count(ir.data, "callstack", entries) && entries == 0) ||
+                (payload_u64_field(ir.data, "count", count) && count == 0) ||
+                (payload_u64_field(ir.data, "entry_count", count) && count == 0) ||
+                payload_text_contains(ir, "0 callstack entries") ||
+                payload_text_contains(ir, "0 packet callstack")) {
+                reason = "packet_callstack_entries=0";
+                return true;
+            }
+        }
+
         if (tool_lc == "quic_detect_connections" ||
             tool_lc == "dtls_detect_sessions") {
             uint64_t count = 1;
@@ -2710,7 +3132,9 @@ namespace {
             if ((payload_u64_field(ir.data, "count", count) && count == 0) ||
                 (payload_array_count(ir.data, "entries", entries) && entries == 0) ||
                 (payload_array_count(ir.data, "trace", entries) && entries == 0) ||
-                payload_text_contains(ir, "0 trace entries")) {
+                payload_text_contains(ir, "0 trace entries") ||
+                payload_text_contains(ir, "trace is empty") ||
+                payload_text_contains(ir, "no traced step")) {
                 reason = "trace_entries=0";
                 return true;
             }
@@ -2971,12 +3395,10 @@ namespace {
 
     bool mcp_tool_uses_camoufox_runtime(const std::string& name) {
         const std::string n = lower_copy(name);
-        return n == "burp_dom_xss_status" ||
-            n == "burp_dom_xss_test_payload" ||
-            n == "burp_dom_xss_scan" ||
-            n == "web_search" ||
-            n == "webfetch" ||
-            n == "launch_browser";
+        return mcp_tool_requires_live_camoufox_bridge(n) ||
+            n == "launch_browser" ||
+            n == "close_browser" ||
+            n == "check_environment";
     }
 
     void log_mcp_camoufox_snapshot(HANDLE hf, const char* tag, const char* phase, int seq, const std::string& tool_name) {
@@ -3455,7 +3877,7 @@ namespace {
         if (name == "sessions_run_binary")
             return 300000;
         if (name == "launch_browser")
-            return 90000;
+            return k_camoufox_testlab_launch_watchdog_ms;
         if (name == "api_monitor_start")
             return 60000;
         if (name == "cert_generate_ca")
@@ -3466,6 +3888,8 @@ namespace {
             return 60000;
         if (name == "compare_env")
             return 45000;
+        if (name == "instrumentation" || name == "verify_signer_offline")
+            return 60000;
         if (name == "pointer_scan_start" || name == "pointer_scan_results")
             return 45000;
         if (name.find("scan_mem_") == 0)
@@ -3910,6 +4334,44 @@ namespace {
             record_tool_status(tool_name_s, mcp_tool_call_status_t::failed);
             failed.fetch_add(1);
             return mcp_tool_call_status_t::failed;
+        }
+        if (mcp_tool_requires_live_camoufox_bridge(tool_name_s)) {
+            std::string bridge_reason;
+            if (!ensure_mcp_camoufox_bridge_ready_for_tool(hf, tag, tool_name, failed, &bridge_reason)) {
+                if (out_result) {
+                    mcp_standalone::json data;
+                    data["camoufox_bridge_blocked"] = true;
+                    data["reason"] = bridge_reason;
+                    data["status"] = camoufox_status_compact(aida::burp::camoufox::get_status());
+                    *out_result = { false, bridge_reason, data };
+                }
+                log_msg(hf, tag, "FAIL -- \"%s\" blocked before dispatch because Camoufox bridge proof failed: %s",
+                    tool_name ? tool_name : "<null>",
+                    bridge_reason.empty() ? "<empty>" : compact_text(bridge_reason, 900).c_str());
+                return mcp_tool_call_status_t::failed;
+            }
+        }
+        std::unique_ptr<scoped_camoufox_testlab_launch_t> camoufox_launch_scope;
+        if (tool_name_s == "launch_browser") {
+            camoufox_launch_scope = std::make_unique<scoped_camoufox_testlab_launch_t>();
+            if (call_args.is_object()) {
+                int requested_launch_timeout = static_cast<int>(k_camoufox_testlab_launch_timeout_ms);
+                auto timeout_it = call_args.find("launch_timeout_ms");
+                if (timeout_it != call_args.end()) {
+                    if (timeout_it->is_number_integer() || timeout_it->is_number_unsigned())
+                        requested_launch_timeout = timeout_it->get<int>();
+                    else if (timeout_it->is_number_float())
+                        requested_launch_timeout = static_cast<int>(timeout_it->get<double>());
+                }
+                if (requested_launch_timeout <= 0 || requested_launch_timeout > static_cast<int>(k_camoufox_testlab_launch_timeout_ms))
+                    requested_launch_timeout = static_cast<int>(k_camoufox_testlab_launch_timeout_ms);
+                call_args["launch_timeout_ms"] = requested_launch_timeout;
+                call_args["aida_testlab_fast_probe"] = true;
+            }
+            log_msg(hf, tag, "CAMOUFOX-FAST-LAUNCH -- \"%s\" fail_fast=1 cap_ms=%lu watchdog_ms=%lld",
+                tool_name ? tool_name : "<null>",
+                static_cast<unsigned long>(k_camoufox_testlab_launch_timeout_ms),
+                k_camoufox_testlab_launch_watchdog_ms);
         }
         const long long timeout_ms = tool_timeout_ms(tool_name_s);
         log_msg(hf, tag, "DISPATCH -- \"%s\" watchdog=%lld ms", tool_name, timeout_ms);
@@ -7937,6 +8399,14 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             skipped.fetch_add(1);
             return;
         }
+        std::string lifecycle_reason;
+        if (!srv->is_running() || !mcp_standalone::lifecycle_authorized(&lifecycle_reason)) {
+            log_msg(hf, tag, "FAIL -- JSON-RPC smoke requires running authorized MCP server running=%d reason=%s",
+                srv->is_running() ? 1 : 0,
+                lifecycle_reason.empty() ? "unknown" : lifecycle_reason.c_str());
+            failed.fetch_add(1);
+            return;
+        }
 
         try {
             mcp_standalone::json init_req = {
@@ -8167,7 +8637,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
                     ++covered;
                     ++passed_tools;
                     if (st.failed > 0 || st.timed_out > 0) {
-                        log_msg(hf, tag, "INFO -- registered tool \"%s\" had pass evidence after attempted=%d failed=%d skipped=%d timed_out=%d",
+                        log_msg(hf, tag, "MIXED-FAIL -- registered tool \"%s\" had pass evidence but also failed or timed out attempted=%d failed=%d skipped=%d timed_out=%d",
                             t.name.c_str(), st.attempted, st.failed, st.skipped, st.timed_out);
                     }
                 } else {
@@ -8487,6 +8957,12 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             failed.fetch_add(1);
             return;
         }
+        std::string bridge_reason;
+        if (!ensure_mcp_camoufox_bridge_ready_for_tool(hf, tag, "web_search", failed, &bridge_reason)) {
+            log_msg(hf, tag, "FAIL -- web_search not dispatched because Camoufox bridge proof failed: %s",
+                bridge_reason.empty() ? "<empty>" : compact_text(bridge_reason, 900).c_str());
+            return;
+        }
 
         g_invoked_tools.insert("web_search");
         auto timed = invoke_tool_bounded(get_server(), "web_search", args, tool_timeout_ms("web_search"), hf, tag, seq);
@@ -8551,6 +9027,12 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         args["url"] = url;
         args["format"] = "text";
         args["timeout"] = 5;
+        std::string bridge_reason;
+        if (!ensure_mcp_camoufox_bridge_ready_for_tool(hf, "mcp.webfetch", "webfetch", failed, &bridge_reason)) {
+            log_msg(hf, "mcp.webfetch", "FAIL -- webfetch not dispatched because Camoufox bridge proof failed: %s",
+                bridge_reason.empty() ? "<empty>" : compact_text(bridge_reason, 900).c_str());
+            return;
+        }
         test_tool_call(hf, "mcp.webfetch", get_server(), "webfetch", args, passed, failed, skipped);
     }
 
@@ -11287,12 +11769,51 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             failed.fetch_add(1);
             return;
         }
-        Sleep(150);
+        const char* tool_name = "read_command_output";
+        g_invoked_tools.insert(tool_name);
         mcp_standalone::json args;
         args["id"] = session_id;
         args["max_bytes"] = 4096;
         args["drop"] = true;
-        test_tool_call(hf, "mcp.read_command_output", get_server(), "read_command_output", args, passed, failed, skipped);
+        invoke_result_t last_ir;
+        long long last_elapsed = 0;
+        const DWORD started = GetTickCount();
+        int attempts = 0;
+        while (GetTickCount() - started < 5000) {
+            ++attempts;
+            const int seq = g_mcp_tool_sequence.fetch_add(1, std::memory_order_acq_rel) + 1;
+            auto timed = invoke_tool_bounded(get_server(), tool_name, args, tool_timeout_ms(tool_name), hf, "mcp.read_command_output", seq);
+            last_ir = timed.result;
+            last_elapsed = timed.elapsed_ms;
+            log_mcp_result_detail(timed.timed_out ? "timeout" : "completed", seq, tool_name, args, last_ir, timed.elapsed_ms, "");
+            if (!timed.timed_out && last_ir.found && !last_ir.threw && last_ir.success && payload_text_contains(last_ir, "aida_mcp_read_command_output")) {
+                log_msg(hf, "mcp.read_command_output", "PASS -- deterministic command output marker observed attempts=%d elapsed_total_ms=%lu",
+                    attempts,
+                    static_cast<unsigned long>(GetTickCount() - started));
+                record_tool_status(tool_name, mcp_tool_call_status_t::passed);
+                passed.fetch_add(1);
+                return;
+            }
+            if (!timed.timed_out && last_ir.found && !last_ir.threw && last_ir.success) {
+                std::string text_lc = lower_copy(last_ir.text + " " + compact_json(last_ir.data, 700));
+                if (text_lc.find("no output yet") != std::string::npos || text_lc.find("running") != std::string::npos) {
+                    Sleep(150);
+                    continue;
+                }
+            }
+            if (timed.timed_out || !last_ir.found || last_ir.threw || !last_ir.success)
+                break;
+            Sleep(150);
+        }
+        log_msg(hf, "mcp.read_command_output", "FAIL -- deterministic command output marker was not returned attempts=%d elapsed_total_ms=%lu last_elapsed_ms=%lld text=%s data=%s exception=%s",
+            attempts,
+            static_cast<unsigned long>(GetTickCount() - started),
+            last_elapsed,
+            compact_text(last_ir.text, 700).c_str(),
+            compact_json(last_ir.data, 900).c_str(),
+            compact_text(last_ir.exception_msg, 500).c_str());
+        record_tool_status(tool_name, mcp_tool_call_status_t::failed);
+        failed.fetch_add(1);
     }
 
     void test_tool_save_checkpoint(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -11880,20 +12401,19 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         test_tool_call(hf, "mcp.network_intercept", get_server(), "network_intercept", args, passed, failed, skipped);
     }
 
-    void test_tool_network_get_held_packets(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.network_get_held_packets", get_server(), "network_get_held_packets", {}, passed, failed, skipped);
-    }
+    struct mcp_held_udp_fixture_t {
+        uint64_t hold_id = 0;
+        size_t held_count = 0;
+        int sent = 0;
+    };
 
-    void test_tool_network_release_packet(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        (void)skipped;
-        const char* tool_name = "network_release_packet";
-        const char* tag = "mcp.network_release_packet";
+    bool create_mcp_held_udp_fixture(HANDLE hf, const char* tag, const char* tool_name, mcp_held_udp_fixture_t& fixture, std::atomic<int>& failed) {
         g_invoked_tools.insert(tool_name);
         if (!driver_bridge::using_kernel_driver()) {
             log_msg(hf, tag, "FAIL -- cannot create held packet fixture because kernel driver is not connected");
             record_tool_status(tool_name, mcp_tool_call_status_t::failed);
             failed.fetch_add(1);
-            return;
+            return false;
         }
         driver_bridge::intercept_op(1, 0, 0, 0, 0, nullptr, 0, nullptr, nullptr);
         mcp_standalone::json enable_args;
@@ -11913,7 +12433,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
                 compact_text(enable_ir.exception_msg, 700).c_str());
             record_tool_status(tool_name, mcp_tool_call_status_t::failed);
             failed.fetch_add(1);
-            return;
+            return false;
         }
         WSADATA wsa{};
         int wsa_err = WSAStartup(MAKEWORD(2, 2), &wsa);
@@ -11922,7 +12442,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             log_msg(hf, tag, "FAIL -- held packet fixture WSAStartup failed err=%d", wsa_err);
             record_tool_status(tool_name, mcp_tool_call_status_t::failed);
             failed.fetch_add(1);
-            return;
+            return false;
         }
         SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (s == INVALID_SOCKET) {
@@ -11932,13 +12452,13 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             log_msg(hf, tag, "FAIL -- held packet fixture socket creation failed err=%lu", static_cast<unsigned long>(err));
             record_tool_status(tool_name, mcp_tool_call_status_t::failed);
             failed.fetch_add(1);
-            return;
+            return false;
         }
         sockaddr_in dst{};
         dst.sin_family = AF_INET;
         dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         dst.sin_port = htons(65432);
-        const char payload[] = "AiDA network_release_packet held fixture";
+        const char payload[] = "AiDA MCP held packet fixture";
         int sent = sendto(s, payload, static_cast<int>(sizeof(payload) - 1), 0, reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
         int send_err = sent == SOCKET_ERROR ? WSAGetLastError() : 0;
         closesocket(s);
@@ -11948,34 +12468,61 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             log_msg(hf, tag, "FAIL -- held packet fixture UDP send failed err=%d", send_err);
             record_tool_status(tool_name, mcp_tool_call_status_t::failed);
             failed.fetch_add(1);
-            return;
+            return false;
         }
-        uint64_t hold_id = 0;
-        size_t held_count = 0;
-        for (int i = 0; i < 40 && hold_id == 0; ++i) {
+        fixture.sent = sent;
+        for (int i = 0; i < 40 && fixture.hold_id == 0; ++i) {
             auto held = driver_bridge::get_held_packets();
-            held_count = held.size();
+            fixture.held_count = held.size();
             for (const auto& h : held) {
                 if (h.pid == GetCurrentProcessId() && h.protocol == 17) {
-                    hold_id = h.hold_id;
+                    fixture.hold_id = h.hold_id;
                     break;
                 }
             }
-            if (hold_id == 0)
+            if (fixture.hold_id == 0)
                 Sleep(50);
         }
-        if (hold_id == 0) {
+        if (fixture.hold_id == 0) {
             driver_bridge::intercept_op(1, 0, 0, 0, 0, nullptr, 0, nullptr, nullptr);
             log_msg(hf, tag, "FAIL -- held packet fixture produced no held UDP packet pid=%lu held_count=%zu sent=%d",
                 static_cast<unsigned long>(GetCurrentProcessId()),
-                held_count,
+                fixture.held_count,
                 sent);
             record_tool_status(tool_name, mcp_tool_call_status_t::failed);
             failed.fetch_add(1);
-            return;
+            return false;
         }
+        log_msg(hf, tag, "FIXTURE -- held UDP packet ready hold_id=%llu held_count=%zu sent=%d",
+            static_cast<unsigned long long>(fixture.hold_id),
+            fixture.held_count,
+            fixture.sent);
+        return true;
+    }
+
+    void test_tool_network_get_held_packets(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        (void)skipped;
+        const char* tool_name = "network_get_held_packets";
+        const char* tag = "mcp.network_get_held_packets";
+        mcp_held_udp_fixture_t fixture;
+        if (!create_mcp_held_udp_fixture(hf, tag, tool_name, fixture, failed))
+            return;
+        test_tool_call(hf, tag, get_server(), tool_name, {}, passed, failed, skipped);
+        const bool disabled = driver_bridge::intercept_op(1, 0, 0, 0, 0, nullptr, 0, nullptr, nullptr);
+        log_msg(hf, tag, "CLEANUP -- disabled=%d hold_id=%llu",
+            disabled ? 1 : 0,
+            static_cast<unsigned long long>(fixture.hold_id));
+    }
+
+    void test_tool_network_release_packet(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        (void)skipped;
+        const char* tool_name = "network_release_packet";
+        const char* tag = "mcp.network_release_packet";
+        mcp_held_udp_fixture_t fixture;
+        if (!create_mcp_held_udp_fixture(hf, tag, tool_name, fixture, failed))
+            return;
         mcp_standalone::json args;
-        args["hold_id"] = hold_id;
+        args["hold_id"] = fixture.hold_id;
         args["action"] = "release";
         auto timed = invoke_tool_bounded(get_server(), tool_name, args, tool_timeout_ms(tool_name));
         const auto& ir = timed.result;
@@ -11983,7 +12530,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         const bool disabled = driver_bridge::intercept_op(1, 0, 0, 0, 0, nullptr, 0, nullptr, nullptr);
         if (timed.timed_out || !ir.found || ir.threw || !ir.success || !disabled) {
             log_msg(hf, tag, "FAIL -- release held packet failed hold_id=%llu found=%d threw=%d success=%d timeout=%d cleanup_disabled=%d text=%s err=%s",
-                static_cast<unsigned long long>(hold_id),
+                static_cast<unsigned long long>(fixture.hold_id),
                 ir.found ? 1 : 0,
                 ir.threw ? 1 : 0,
                 ir.success ? 1 : 0,
@@ -11996,8 +12543,8 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             return;
         }
         log_msg(hf, tag, "PASS -- released real held UDP packet hold_id=%llu sent=%d",
-            static_cast<unsigned long long>(hold_id),
-            sent);
+            static_cast<unsigned long long>(fixture.hold_id),
+            fixture.sent);
         record_tool_status(tool_name, mcp_tool_call_status_t::passed);
         passed.fetch_add(1);
     }
@@ -12284,27 +12831,129 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
     }
 
     void test_tool_network_pg_sniff(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        if (g_mcp_scanner_addr == 0 && !ensure_mcp_private_bytes(hf, "mcp.network_pg_sniff", g_mcp_scanner_addr, 4096, {0x50, 0x47, 0x53, 0x4E})) {
+        uint64_t pg_addr = 0;
+        std::vector<uint8_t> marker(4096, 0);
+        const std::string marker_text = "AIDA_NETWORK_PG_SNIFF_DIRECT_FIXTURE";
+        std::copy(marker_text.begin(), marker_text.end(), marker.begin());
+        const uint64_t install_size = static_cast<uint64_t>(marker.size());
+        if (!ensure_mcp_private_bytes(hf, "mcp.network_pg_sniff", pg_addr, marker.size(), marker)) {
+            record_fixture_failed_tool("network_pg_sniff", failed);
+            return;
+        }
+        const uint32_t pid = g_mcp_target_pid != 0 ? g_mcp_target_pid : driver_bridge::attached_pid();
+        if (pid == 0 || (driver_bridge::attached_pid() != pid && !restore_mcp_target(hf, "mcp.network_pg_sniff"))) {
+            log_msg(hf, "mcp.network_pg_sniff", "FIXTURE-INVALID -- dedicated page-guard target unavailable pid=%u active_pid=%u addr=0x%016llX size=%llu status=\"%s\" last_error=\"%s\"",
+                pid,
+                driver_bridge::attached_pid(),
+                static_cast<unsigned long long>(pg_addr),
+                static_cast<unsigned long long>(install_size),
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            if (pg_addr != 0)
+                driver_bridge::free_memory(pg_addr);
+            record_fixture_failed_tool("network_pg_sniff", failed);
+            return;
+        }
+        driver_bridge::memory_region_t region{};
+        const bool query_ok = driver_bridge::query_memory_for(pid, pg_addr, region);
+        const bool region_offset_ok = query_ok && pg_addr >= region.base && (pg_addr - region.base) < region.size;
+        const uint64_t region_offset = region_offset_ok ? (pg_addr - region.base) : 0;
+        const bool region_covers = region_offset_ok && install_size <= (region.size - region_offset);
+        const bool committed = query_ok && region.state == MEM_COMMIT;
+        const bool readable = query_ok && (region.protect & PAGE_NOACCESS) == 0;
+        std::vector<uint8_t> readback;
+        const bool read_ok = driver_bridge::read_memory_for(pid, pg_addr, marker_text.size(), readback);
+        const bool marker_ok = read_ok && readback.size() >= marker_text.size() &&
+            std::equal(marker.begin(), marker.begin() + marker_text.size(), readback.begin());
+        log_msg(hf, "mcp.network_pg_sniff", "PRECHECK-REGION -- pid=%u active_pid=%u addr=0x%016llX size=%llu page_offset=0x%03llX query_ok=%d covers=%d state=0x%08X protect=0x%08X type=0x%08X base=0x%016llX region_size=%llu status=\"%s\" last_error=\"%s\"",
+            pid,
+            driver_bridge::attached_pid(),
+            static_cast<unsigned long long>(pg_addr),
+            static_cast<unsigned long long>(install_size),
+            static_cast<unsigned long long>(pg_addr & 0xFFFULL),
+            query_ok ? 1 : 0,
+            region_covers ? 1 : 0,
+            query_ok ? region.state : 0,
+            query_ok ? region.protect : 0,
+            query_ok ? region.type : 0,
+            static_cast<unsigned long long>(query_ok ? region.base : 0),
+            static_cast<unsigned long long>(query_ok ? region.size : 0),
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str());
+        log_msg(hf, "mcp.network_pg_sniff", "PRECHECK-READBACK -- read_ok=%d read_size=%zu marker_ok=%d marker=[%s]",
+            read_ok ? 1 : 0,
+            readback.size(),
+            marker_ok ? 1 : 0,
+            hex_preview(readback).c_str());
+        std::string fixture_reason;
+        if (pg_addr == 0)
+            fixture_reason = "fixture_addr=0";
+        else if (!query_ok)
+            fixture_reason = "query_memory_failed";
+        else if (!region_covers)
+            fixture_reason = "region_does_not_cover_guard_page";
+        else if (!committed)
+            fixture_reason = "region_not_committed";
+        else if (!readable)
+            fixture_reason = "region_not_readable";
+        else if (!marker_ok)
+            fixture_reason = "fixture_marker_readback_mismatch";
+        if (!fixture_reason.empty()) {
+            log_msg(hf, "mcp.network_pg_sniff", "FIXTURE-INVALID -- reason=%s pid=%u active_pid=%u addr=0x%016llX size=%llu query_ok=%d read_ok=%d marker_ok=%d status=\"%s\" last_error=\"%s\"",
+                fixture_reason.c_str(),
+                pid,
+                driver_bridge::attached_pid(),
+                static_cast<unsigned long long>(pg_addr),
+                static_cast<unsigned long long>(install_size),
+                query_ok ? 1 : 0,
+                read_ok ? 1 : 0,
+                marker_ok ? 1 : 0,
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            if (pg_addr != 0)
+                driver_bridge::free_memory(pg_addr);
             record_fixture_failed_tool("network_pg_sniff", failed);
             return;
         }
         mcp_standalone::json install_args;
         install_args["operation"] = "install";
-        install_args["pid"] = driver_bridge::attached_pid();
-        install_args["address"] = hex_u64(g_mcp_scanner_addr);
-        install_args["size"] = 4;
+        install_args["pid"] = pid;
+        install_args["address"] = hex_u64(pg_addr);
+        install_args["size"] = install_size;
+        install_args["max_records_per_drain"] = 16;
         auto installed = invoke_tool_bounded(get_server(), "network_pg_sniff", install_args, tool_timeout_ms("network_pg_sniff"));
         uint64_t session_id = 0;
         payload_u64_field(installed.result.data, "session_id", session_id);
         if (installed.timed_out || !installed.result.found || installed.result.threw || !installed.result.success || session_id == 0) {
-            log_msg(hf, "mcp.network_pg_sniff", "FAIL -- install precondition failed found=%d threw=%d success=%d timeout=%d session_id=%llu err=%s",
+            log_msg(hf, "mcp.network_pg_sniff", "PRODUCT-FAIL -- dedicated install failed after valid fixture pid=%u active_pid=%u addr=0x%016llX size=%llu found=%d threw=%d success=%d timeout=%d session_id=%llu elapsed_ms=%lld text=%s data=%s err=%s",
+                pid,
+                driver_bridge::attached_pid(),
+                static_cast<unsigned long long>(pg_addr),
+                static_cast<unsigned long long>(install_size),
                 installed.result.found ? 1 : 0,
                 installed.result.threw ? 1 : 0,
                 installed.result.success ? 1 : 0,
                 installed.timed_out ? 1 : 0,
                 static_cast<unsigned long long>(session_id),
+                installed.elapsed_ms,
+                compact_text(installed.result.text, 420).c_str(),
+                compact_json(installed.result.data, 420).c_str(),
                 compact_text(installed.result.exception_msg.empty() ? installed.result.text : installed.result.exception_msg, 700).c_str());
+            log_mcp_result_detail("network_pg_sniff_install_failed", 0, "network_pg_sniff", install_args, installed.result, installed.elapsed_ms, "install_failed_after_valid_fixture");
+            if (session_id != 0) {
+                mcp_standalone::json uninstall_args;
+                uninstall_args["operation"] = "uninstall";
+                uninstall_args["session_id"] = session_id;
+                auto uninstalled = invoke_tool_bounded(get_server(), "network_pg_sniff", uninstall_args, tool_timeout_ms("network_pg_sniff"));
+                log_msg(hf, "mcp.network_pg_sniff", "CLEANUP -- failed-install session_id=%llu timeout=%d success=%d text=%s",
+                    static_cast<unsigned long long>(session_id),
+                    uninstalled.timed_out ? 1 : 0,
+                    uninstalled.result.success ? 1 : 0,
+                    compact_text(uninstalled.result.text, 500).c_str());
+            }
             record_tool_status("network_pg_sniff", mcp_tool_call_status_t::failed);
+            if (pg_addr != 0)
+                driver_bridge::free_memory(pg_addr);
             failed.fetch_add(1);
             return;
         }
@@ -12315,10 +12964,15 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         uninstall_args["operation"] = "uninstall";
         uninstall_args["session_id"] = session_id;
         auto uninstalled = invoke_tool_bounded(get_server(), "network_pg_sniff", uninstall_args, tool_timeout_ms("network_pg_sniff"));
-        log_msg(hf, "mcp.network_pg_sniff", "CLEANUP -- session_id=%llu timeout=%d success=%d text=%s",
+        bool freed = false;
+        if (pg_addr != 0)
+            freed = driver_bridge::free_memory(pg_addr);
+        log_msg(hf, "mcp.network_pg_sniff", "CLEANUP -- session_id=%llu timeout=%d success=%d freed=%d addr=0x%016llX text=%s",
             static_cast<unsigned long long>(session_id),
             uninstalled.timed_out ? 1 : 0,
             uninstalled.result.success ? 1 : 0,
+            freed ? 1 : 0,
+            static_cast<unsigned long long>(pg_addr),
             compact_text(uninstalled.result.text, 500).c_str());
     }
 
@@ -12385,10 +13039,43 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
     }
 
     void test_tool_network_packet_callstack(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        const char* tool_name = "network_packet_callstack";
+        const char* tag = "mcp.network_packet_callstack";
+        log_msg(hf, tag, "FIXTURE-BEGIN -- pid=%lu tid=%lu driver=%d status=\"%s\"",
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            driver_bridge::using_kernel_driver() ? 1 : 0,
+            driver_bridge::status().c_str());
+        packet_callstack::clear();
+        log_msg(hf, tag, "FIXTURE -- clear complete");
+        packet_callstack::set_enabled(true);
+        log_msg(hf, tag, "FIXTURE -- enable complete");
+        packet_callstack::capture_for_packet(0xA1DA0001ULL, GetTickCount64(), GetCurrentProcessId(), GetCurrentThreadId());
+        log_msg(hf, tag, "FIXTURE -- capture complete");
+        packet_callstack::set_enabled(false);
+        log_msg(hf, tag, "FIXTURE -- disable complete");
+        const auto seeded = packet_callstack::get_recent(8);
+        log_msg(hf, tag, "FIXTURE -- seeded_entries=%zu frame_count=%zu driver=%d pid=%lu tid=%lu",
+            seeded.size(),
+            seeded.empty() ? 0 : seeded.back().frames.size(),
+            driver_bridge::using_kernel_driver() ? 1 : 0,
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        if (seeded.empty()) {
+            log_msg(hf, tag, "FAIL -- packet callstack fixture produced no entries driver=%d status=\"%s\" last_error=\"%s\"",
+                driver_bridge::using_kernel_driver() ? 1 : 0,
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            record_tool_status(tool_name, mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return;
+        }
         mcp_standalone::json args;
         args["operation"] = "recent";
         args["max_count"] = 8;
-        test_tool_call(hf, "mcp.network_packet_callstack", get_server(), "network_packet_callstack", args, passed, failed, skipped);
+        test_tool_call(hf, tag, get_server(), tool_name, args, passed, failed, skipped);
+        packet_callstack::clear();
+        log_msg(hf, tag, "CLEANUP -- cleared seeded packet callstack entries");
     }
 
     void test_tool_network_pre_encrypt_hook(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -12762,12 +13449,31 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         }
         if (ir.success) {
             bool firefox_detected = false;
+            bool profile_files_valid = false;
+            bool trust_verified = false;
+            bool prepared = false;
             payload_bool_field(ir.data, "firefox_detected", firefox_detected);
+            payload_bool_field(ir.data, "profile_files_valid", profile_files_valid);
+            payload_bool_field(ir.data, "trust_readiness_verified", trust_verified);
+            payload_bool_field(ir.data, "prepared", prepared);
             if (!firefox_detected) {
-                log_msg(hf, "mcp.firefox_profile_prepare.guard", "FAIL -- Firefox host dependency unavailable after profile prepare diagnostic: %s",
-                    compact_text(ir.text, 700).c_str());
-                record_tool_status(tool_name, mcp_tool_call_status_t::failed);
-                failed.fetch_add(1);
+                if (profile_files_valid && trust_verified && prepared) {
+                    log_msg(hf, "mcp.firefox_profile_prepare.guard", "PASS -- Firefox profile prepare completed and reported missing host browser explicitly files=%d trust=%d prepared=%d text=%s",
+                        profile_files_valid ? 1 : 0,
+                        trust_verified ? 1 : 0,
+                        prepared ? 1 : 0,
+                        compact_text(ir.text, 700).c_str());
+                    record_tool_status(tool_name, mcp_tool_call_status_t::passed);
+                    passed.fetch_add(1);
+                } else {
+                    log_msg(hf, "mcp.firefox_profile_prepare.guard", "FAIL -- Firefox prepare missing-browser response lacked structured readiness proof files=%d trust=%d prepared=%d text=%s",
+                        profile_files_valid ? 1 : 0,
+                        trust_verified ? 1 : 0,
+                        prepared ? 1 : 0,
+                        compact_text(ir.text, 700).c_str());
+                    record_tool_status(tool_name, mcp_tool_call_status_t::failed);
+                    failed.fetch_add(1);
+                }
                 return;
             }
             log_msg(hf, "mcp.firefox_profile_prepare.guard", "PASS -- Firefox profile prepare completed success=%s",
@@ -12854,7 +13560,8 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             const std::string fail_text_lc = lower_copy(result.text + " " + compact_json(result.data, 700));
             if (fail_text_lc.find("current_user_ca_not_trusted") != std::string::npos ||
                 fail_text_lc.find("firefox host dependency unavailable") != std::string::npos ||
-                fail_text_lc.find("firefox not detected") != std::string::npos) {
+                fail_text_lc.find("firefox not detected") != std::string::npos ||
+                fail_text_lc.find("firefox_not_detected") != std::string::npos) {
                 bool profile_files_valid = false;
                 bool trust_verified = true;
                 bool firefox_detected = true;
@@ -13382,6 +14089,28 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         test_tool_call(hf, "mcp.burp_scope_remove", get_server(), "burp_scope_remove", args, passed, failed, skipped);
     }
     void test_tool_burp_scope_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json seed_args;
+        seed_args["id"] = static_cast<std::uint64_t>(424243);
+        seed_args["kind"] = "include";
+        seed_args["protocol"] = "http";
+        seed_args["host_pattern"] = "127.0.0.1";
+        seed_args["port"] = 0;
+        seed_args["path_prefix"] = "/";
+        seed_args["enabled"] = true;
+        auto seeded = invoke_tool_bounded(get_server(), "burp_scope_add", seed_args, tool_timeout_ms("burp_scope_add"));
+        log_mcp_result_detail("scope_list_fixture", 0, "burp_scope_add", seed_args, seeded.result, seeded.elapsed_ms, "");
+        if (seeded.timed_out || !seeded.result.found || seeded.result.threw || !seeded.result.success) {
+            log_msg(hf, "mcp.burp_scope_list", "FAIL -- scope list fixture add failed found=%d threw=%d success=%d timeout=%d text=%s err=%s",
+                seeded.result.found ? 1 : 0,
+                seeded.result.threw ? 1 : 0,
+                seeded.result.success ? 1 : 0,
+                seeded.timed_out ? 1 : 0,
+                compact_text(seeded.result.text, 700).c_str(),
+                compact_text(seeded.result.exception_msg, 700).c_str());
+            record_tool_status("burp_scope_list", mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return;
+        }
         test_tool_call(hf, "mcp.burp_scope_list", get_server(), "burp_scope_list", {}, passed, failed, skipped);
     }
     void test_tool_burp_scope_check(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -13417,80 +14146,13 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             record_camoufox_dependency_guard_pass(hf, tag, "burp_dom_xss_status", dependency_reason, passed, failed);
             return;
         }
-        auto bridge_before = aida::burp::camoufox::get_status();
-        if (bridge_before.state != aida::burp::camoufox::bridge_state_t::ready ||
-            !bridge_before.browser_open ||
-            !bridge_before.page_verified ||
-            !bridge_before.child_alive) {
-            log_msg(hf, tag, "PRECHECK -- starting Camoufox bridge before DOM-XSS status state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d",
-                camoufox_bridge_state_name(bridge_before.state),
-                bridge_before.child_pid,
-                bridge_before.child_alive ? 1 : 0,
-                bridge_before.browser_open ? 1 : 0,
-                bridge_before.page_verified ? 1 : 0,
-                bridge_before.cleanup_pending ? 1 : 0);
-            bool launch_ok = false;
-            aida::burp::camoufox::bridge_status_t bridge_after;
-            for (int attempt = 1; attempt <= 2; ++attempt) {
-                aida::burp::camoufox::launch_config_t cfg;
-                cfg.headless = false;
-                cfg.launch_timeout_ms = attempt == 1 ? 70000 : 90000;
-                cfg.window_width = 1280;
-                cfg.window_height = 900;
-                cfg.enable_trace = true;
-                log_msg(hf, tag, "PRECHECK -- Camoufox bridge launch attempt=%d timeout_ms=%d", attempt, cfg.launch_timeout_ms);
-                launch_ok = aida::burp::camoufox::start_bridge(cfg);
-                bridge_after = aida::burp::camoufox::get_status();
-                log_msg(hf, tag, "PRECHECK -- Camoufox bridge start result attempt=%d ok=%d state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d last_launch_ms=%llu last_cleanup_ms=%llu calls=%llu errors=%llu err=%s",
-                    attempt,
-                    launch_ok ? 1 : 0,
-                    camoufox_bridge_state_name(bridge_after.state),
-                    bridge_after.child_pid,
-                    bridge_after.child_alive ? 1 : 0,
-                    bridge_after.browser_open ? 1 : 0,
-                    bridge_after.page_verified ? 1 : 0,
-                    bridge_after.cleanup_pending ? 1 : 0,
-                    static_cast<unsigned long long>(bridge_after.last_launch_ms),
-                    static_cast<unsigned long long>(bridge_after.last_cleanup_ms),
-                    static_cast<unsigned long long>(bridge_after.total_calls),
-                    static_cast<unsigned long long>(bridge_after.total_errors),
-                    compact_text(bridge_after.last_error, 700).c_str());
-                if (launch_ok &&
-                    bridge_after.state == aida::burp::camoufox::bridge_state_t::ready &&
-                    bridge_after.browser_open &&
-                    bridge_after.page_verified &&
-                    bridge_after.child_alive) {
-                    break;
-                }
-                if (attempt == 1 &&
-                    bridge_after.last_error.find("launch_browser timeout") != std::string::npos) {
-                    const bool stopped = aida::burp::camoufox::stop_bridge("testlab.dom_xss_status.launch_timeout_retry");
-                    auto bridge_retry_stop = aida::burp::camoufox::get_status();
-                    log_msg(hf, tag, "PRECHECK -- Camoufox retry cleanup stopped=%d state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d err=%s",
-                        stopped ? 1 : 0,
-                        camoufox_bridge_state_name(bridge_retry_stop.state),
-                        bridge_retry_stop.child_pid,
-                        bridge_retry_stop.child_alive ? 1 : 0,
-                        bridge_retry_stop.browser_open ? 1 : 0,
-                        bridge_retry_stop.page_verified ? 1 : 0,
-                        bridge_retry_stop.cleanup_pending ? 1 : 0,
-                        compact_text(bridge_retry_stop.last_error, 700).c_str());
-                    Sleep(900);
-                    continue;
-                }
-                break;
-            }
-            if (!launch_ok ||
-                bridge_after.state != aida::burp::camoufox::bridge_state_t::ready ||
-                !bridge_after.browser_open ||
-                !bridge_after.page_verified ||
-                !bridge_after.child_alive) {
-                g_burp_dom_xss_browser_infra_failed = true;
-                log_msg(hf, tag, "FAIL -- Camoufox bridge did not become ready for DOM-XSS status");
-                record_tool_status("burp_dom_xss_status", mcp_tool_call_status_t::failed);
-                failed.fetch_add(1);
-                return;
-            }
+        std::string bridge_reason;
+        if (!ensure_mcp_camoufox_bridge_ready_for_tool(hf, tag, "burp_dom_xss_status", failed, &bridge_reason)) {
+            g_burp_dom_xss_browser_infra_failed = true;
+            g_burp_dom_xss_dependency_reason = bridge_reason;
+            log_msg(hf, tag, "FAIL -- burp_dom_xss_status not dispatched because Camoufox bridge proof failed: %s",
+                bridge_reason.empty() ? "<empty>" : compact_text(bridge_reason, 900).c_str());
+            return;
         }
         mcp_standalone::tool_result_t result;
         auto status = test_tool_call(hf, tag, get_server(), "burp_dom_xss_status", {}, passed, failed, skipped, false, &result);
@@ -14086,6 +14748,23 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         }
     }
 
+    void mark_camoufox_reverse_bridge_blocked(HANDLE hf, const char* reason, std::atomic<int>& failed) {
+        static const char* dependent_tools[] = {
+            "list_pages", "new_page", "select_page", "close_page",
+            "navigate", "reload", "take_screenshot", "take_snapshot", "click", "type_text",
+            "wait_for", "get_page_info", "reset_browser_state", "evaluate_js", "hook_function",
+            "add_init_script", "inject_hook_preset", "remove_hooks", "get_console_logs",
+            "network_capture", "list_network_requests", "get_network_request", "get_request_initiator",
+            "intercept_request", "scripts", "search_code", "cookies", "get_storage", "export_state",
+            "import_state", "hook_jsvmp_interpreter", "compare_env", "instrumentation",
+            "verify_signer_offline", "trace_property_access", "list_trace_files", "query_trace_file",
+            "analyze_cookie_sources"
+        };
+        const std::string reason_s = reason ? std::string(reason) : std::string();
+        for (const char* tool : dependent_tools)
+            record_camoufox_bridge_blocked_tool(hf, "mcp.camoufox_reverse_dynamic", tool, reason_s, failed);
+    }
+
     void test_tool_camoufox_reverse_dynamic_tools(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "mcp.camoufox_reverse_dynamic";
         ensure_burp_http_fixture(hf, tag);
@@ -14103,7 +14782,8 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
 
         mcp_standalone::json launch_args;
         launch_args["headless"] = false;
-        launch_args["launch_timeout_ms"] = 70000;
+        launch_args["launch_timeout_ms"] = k_camoufox_testlab_launch_timeout_ms;
+        launch_args["aida_testlab_fast_probe"] = true;
         launch_args["enable_trace"] = true;
         launch_args["window_width"] = 1280;
         launch_args["window_height"] = 900;
@@ -14111,19 +14791,25 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         auto launch_status = test_tool_call(hf, "mcp.camoufox.launch_browser", get_server(), "launch_browser",
             launch_args, passed, failed, skipped, false, &launch_result);
         if (launch_status != mcp_tool_call_status_t::passed) {
-            for (const char* tool : {"list_pages", "new_page", "select_page", "close_page",
-                "navigate", "reload", "take_screenshot", "take_snapshot", "click", "type_text",
-                "wait_for", "get_page_info", "reset_browser_state", "evaluate_js", "hook_function",
-                "add_init_script", "inject_hook_preset", "remove_hooks", "get_console_logs",
-                "network_capture", "list_network_requests", "get_network_request", "get_request_initiator",
-                "intercept_request", "scripts", "search_code", "cookies", "get_storage", "export_state",
-                "import_state", "hook_jsvmp_interpreter", "compare_env", "instrumentation",
-                "verify_signer_offline", "trace_property_access", "list_trace_files", "query_trace_file",
-                "analyze_cookie_sources"}) {
-                log_msg(hf, "mcp.camoufox_reverse_dynamic", "FAIL -- \"%s\" not executed because launch_browser failed after dependencies were ready: %s",
-                    tool, launch_result.text.c_str());
-                record_fixture_failed_tool(tool, failed);
-            }
+            std::string reason = launch_result.text.empty()
+                ? std::string("launch_browser did not pass after Camoufox dependencies were ready")
+                : std::string("launch_browser did not pass after Camoufox dependencies were ready: ") + launch_result.text;
+            log_msg(hf, tag, "FAIL -- Camoufox reverse dynamic sequence blocked because launch_browser status=%d reason=%s",
+                static_cast<int>(launch_status),
+                compact_text(reason, 900).c_str());
+            mark_camoufox_reverse_bridge_blocked(hf, reason.c_str(), failed);
+            test_tool_call(hf, "mcp.camoufox.close_browser", get_server(), "close_browser", {}, passed, failed, skipped);
+            return;
+        }
+        std::string proof_reason;
+        if (!prove_camoufox_live_bridge(hf, tag, "launch_browser", proof_reason)) {
+            log_msg(hf, tag, "FAIL -- launch_browser returned success but live bridge proof failed: %s",
+                proof_reason.empty() ? "<empty>" : compact_text(proof_reason, 900).c_str());
+            convert_tool_pass_to_fail("launch_browser");
+            if (passed.load(std::memory_order_acquire) > 0)
+                passed.fetch_sub(1, std::memory_order_acq_rel);
+            failed.fetch_add(1, std::memory_order_acq_rel);
+            mark_camoufox_reverse_bridge_blocked(hf, proof_reason.c_str(), failed);
             test_tool_call(hf, "mcp.camoufox.close_browser", get_server(), "close_browser", {}, passed, failed, skipped);
             return;
         }
@@ -14206,7 +14892,8 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         mcp_standalone::json launch_session_two;
         launch_session_two["session_id"] = session_two;
         launch_session_two["headless"] = false;
-        launch_session_two["launch_timeout_ms"] = 70000;
+        launch_session_two["launch_timeout_ms"] = k_camoufox_testlab_launch_timeout_ms;
+        launch_session_two["aida_testlab_fast_probe"] = true;
         launch_session_two["window_width"] = 960;
         launch_session_two["window_height"] = 700;
         mcp_standalone::tool_result_t launch_session_two_result;
@@ -14754,6 +15441,9 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     g_burp_fixture_base_url.clear();
     g_burp_fixture_wordlist_path.clear();
     g_burp_http_fixture.reset();
+    g_mcp_camoufox_bridge_ready_proven = false;
+    g_mcp_camoufox_bridge_generation = 0;
+    g_mcp_camoufox_bridge_block_reason.clear();
     log_msg(hf, "mcp_phase", "target snapshot active_pid=%u target_unavailable=%d attached_pid=%u driver_status=\"%s\" driver_last_error=\"%s\" host_pid=%lu host_tid=%lu",
         g_mcp_target_pid,
         g_mcp_target_unavailable ? 1 : 0,

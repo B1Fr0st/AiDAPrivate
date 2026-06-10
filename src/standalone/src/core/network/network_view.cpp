@@ -228,7 +228,22 @@ static std::string capture_control_status() {
 template <typename Fn>
 static bool post_network_task(const char* name, Fn&& fn) {
     try {
-        bool ok = work_queue::post(std::function<void()>(std::forward<Fn>(fn)));
+        std::string task_name = name ? name : "?";
+        std::function<void()> task(std::forward<Fn>(fn));
+        bool ok = work_queue::post(std::function<void()>(
+            [task_name, task = std::move(task)]() mutable {
+                const bool tls_ready = aida::manual_map_tls::ensure_current_thread();
+                diag::log_tagged_fmt("network",
+                    "work_queue_task_enter name=%s tid=%lu tls_ready=%d",
+                    task_name.c_str(),
+                    static_cast<unsigned long>(GetCurrentThreadId()),
+                    tls_ready ? 1 : 0);
+                task();
+                diag::log_tagged_fmt("network",
+                    "work_queue_task_exit name=%s tid=%lu",
+                    task_name.c_str(),
+                    static_cast<unsigned long>(GetCurrentThreadId()));
+            }));
         diag::log_tagged_fmt("network", "work_queue_post name=%s ok=%d",
             name ? name : "?", ok ? 1 : 0);
         return ok;

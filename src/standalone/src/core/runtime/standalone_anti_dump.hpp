@@ -521,9 +521,79 @@ namespace section_encrypt
         return ok;
     }
 
-    inline bool region_is_host_image(const MEMORY_BASIC_INFORMATION& mbi)
+    inline bool region_overlaps_range(uint64_t left_base,
+                                      uint64_t left_size,
+                                      uint64_t right_base,
+                                      uint64_t right_size)
     {
-        return mbi.Type == MEM_IMAGE;
+        if (left_size == 0 || right_size == 0)
+            return false;
+        uint64_t left_end = left_base + left_size;
+        uint64_t right_end = right_base + right_size;
+        if (left_end < left_base || right_end < right_base)
+            return false;
+        return left_base < right_end && right_base < left_end;
+    }
+
+    inline bool region_overlaps_self_section(uint8_t* module_base,
+                                             uint64_t region_base,
+                                             uint64_t region_size)
+    {
+        bool overlaps = false;
+        __try
+        {
+            auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(module_base);
+            if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+                return false;
+            LONG e_lfanew = dos->e_lfanew;
+            if (e_lfanew <= 0 || static_cast<uint32_t>(e_lfanew) > 0x10000u)
+                return false;
+            auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(module_base + e_lfanew);
+            if (nt->Signature != IMAGE_NT_SIGNATURE ||
+                nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+                return false;
+            WORD num_sections = nt->FileHeader.NumberOfSections;
+            if (num_sections == 0 || num_sections > 96)
+                return false;
+            auto* sections = IMAGE_FIRST_SECTION(nt);
+            uint64_t image_size = nt->OptionalHeader.SizeOfImage;
+            for (WORD i = 0; i < num_sections; ++i)
+            {
+                uint64_t section_rva = sections[i].VirtualAddress;
+                uint64_t section_size = sections[i].Misc.VirtualSize;
+                if (sections[i].SizeOfRawData > section_size)
+                    section_size = sections[i].SizeOfRawData;
+                if (section_rva == 0 || section_size == 0 || section_rva >= image_size)
+                    continue;
+                if (section_size > image_size - section_rva)
+                    section_size = image_size - section_rva;
+                uint64_t section_base = reinterpret_cast<uint64_t>(module_base) + section_rva;
+                if (region_overlaps_range(region_base, region_size, section_base, section_size))
+                {
+                    overlaps = true;
+                    break;
+                }
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            overlaps = false;
+        }
+        return overlaps;
+    }
+
+    inline bool region_is_host_image(const MEMORY_BASIC_INFORMATION& mbi,
+                                     uint8_t* module_base,
+                                     uint64_t region_base,
+                                     uint64_t region_size)
+    {
+        if (mbi.Type == MEM_IMAGE)
+            return true;
+        if (mbi.Type != MEM_PRIVATE)
+            return false;
+        if (reinterpret_cast<uint64_t>(mbi.AllocationBase) != reinterpret_cast<uint64_t>(module_base))
+            return false;
+        return region_overlaps_self_section(module_base, region_base, region_size);
     }
 
     inline bool encrypt_non_code_sections()
@@ -572,7 +642,7 @@ namespace section_encrypt
                 && !(mbi.Protect & PAGE_GUARD)
                 && region_size >= 0x100)
             {
-                if (region_is_host_image(mbi))
+                if (region_is_host_image(mbi, reinterpret_cast<uint8_t*>(mod), region_base, region_size))
                 {
                     anti_tamper::webhook::write_log_critical_fmt("anti_dump",
                         "encrypt_non_code_region_skipped #%d reason=host_image_live_data base=0x%llX size=0x%X",
@@ -999,6 +1069,19 @@ namespace handle_strip
             return false;
         };
 
+        bool posted = work_queue::post([state]() {
+            dacl_seal_worker_proc(state);
+        });
+        if (posted)
+        {
+            anti_tamper::webhook::write_log_critical("anti_dump",
+                "sa_seal_dacl_worker_work_queue_posted");
+            return wait_for_worker(nullptr, "work_queue");
+        }
+
+        anti_tamper::webhook::write_log_critical("anti_dump",
+            "sa_seal_dacl_worker_work_queue_post_failed");
+
         SetLastError(ERROR_SUCCESS);
         HANDLE thread = CreateThread(nullptr, 0, dacl_seal_worker_proc, state, 0, nullptr);
         if (!thread)
@@ -1006,18 +1089,9 @@ namespace handle_strip
             DWORD create_gle = GetLastError();
             anti_tamper::webhook::write_log_critical_fmt("anti_dump",
                 "sa_seal_dacl_worker_create_failed gle=%lu", create_gle);
-            bool posted = work_queue::post([state]() {
-                dacl_seal_worker_proc(state);
-            });
-            if (!posted)
-            {
-                anti_tamper::webhook::write_log_critical("anti_dump",
-                    "sa_seal_dacl_worker_work_queue_post_failed");
-                CloseHandle(state->done_event);
-                delete state;
-                return false;
-            }
-            return wait_for_worker(nullptr, "work_queue");
+            CloseHandle(state->done_event);
+            delete state;
+            return false;
         }
 
         return wait_for_worker(thread, "thread");

@@ -271,6 +271,63 @@ inline bool kernel_adbg_thread_walk_optional_error(DWORD err)
     return err == ERROR_NOT_SUPPORTED || err == ERROR_INVALID_FUNCTION;
 }
 
+inline bool kernel_adbg_hard_flags_present(uint32_t flags)
+{
+    constexpr uint32_t kHardFlags = 0x00000001u | 0x00000008u;
+    return (flags & kHardFlags) != 0;
+}
+
+inline void kernel_debugger_scan_process_names_for_log(DWORD pid, std::string& image, std::string& path)
+{
+    image = "?";
+    path = "?";
+    if (pid == 0)
+        return;
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process)
+        return;
+    std::vector<wchar_t> buffer(32768);
+    DWORD size = static_cast<DWORD>(buffer.size());
+    if (QueryFullProcessImageNameW(process, 0, buffer.data(), &size) && size > 0 && size < buffer.size())
+    {
+        std::wstring lower = standalone_anti_ai::detail::lower_copy(std::wstring(buffer.data(), size));
+        path = standalone_anti_ai::detail::wide_to_utf8_lossy(lower);
+        image = standalone_anti_ai::detail::wide_to_utf8_lossy(std::wstring(standalone_anti_ai::detail::basename_ptr(lower.c_str())));
+    }
+    CloseHandle(process);
+}
+
+inline bool kernel_debugger_scan_confirmed_for_enforcement(const char* phase,
+                                                           const char* source,
+                                                           uint64_t scan_pid)
+{
+    const DWORD pid32 = scan_pid <= 0xFFFFFFFFULL ? static_cast<DWORD>(scan_pid) : 0;
+    std::string image;
+    std::string path;
+    kernel_debugger_scan_process_names_for_log(pid32, image, path);
+    driver_bridge::anti_debug_result_t query{};
+    SetLastError(ERROR_SUCCESS);
+    const uint64_t started = GetTickCount64();
+    const bool query_ok = driver_bridge::kernel_anti_debug_query(query);
+    const DWORD query_err = query_ok ? ERROR_SUCCESS : GetLastError();
+    const bool confirmed = query_ok &&
+        (kernel_adbg_hard_flags_present(query.result_flags) || query.detected_debugger_pid != 0);
+    webhook::write_log_critical_fmt(
+        phase ? phase : "guard",
+        "kernel_debugger_scan_evaluation source=%s scan_pid=%llu scan_image=%s scan_path='%s' query_ok=%d query_err=%lu query_flags=0x%08X query_pid=%llu confirmed=%d elapsed_ms=%llu",
+        source ? source : "unknown",
+        static_cast<unsigned long long>(scan_pid),
+        image.c_str(),
+        path.c_str(),
+        query_ok ? 1 : 0,
+        static_cast<unsigned long>(query_err),
+        query.result_flags,
+        static_cast<unsigned long long>(query.detected_debugger_pid),
+        confirmed ? 1 : 0,
+        static_cast<unsigned long long>(GetTickCount64() - started));
+    return confirmed;
+}
+
 inline uint64_t run_inline_check(check_class_t which, uint64_t proof_hash = 0)
 {
     return token_chain::run_inline_check(which, proof_hash);
@@ -1027,9 +1084,16 @@ inline bool ensure_driver_hardening(const char* phase)
     }
     if (debugger_pid != 0)
     {
-        webhook::send_debug_log("init", "kernel_debugger_detected_pid_" + std::to_string(debugger_pid), true);
-        enforce_violation_id(aida::reason_ids::reason_id_kernel_debugger_at_startup);
-        return false;
+        if (kernel_debugger_scan_confirmed_for_enforcement("init", "startup_scan", debugger_pid))
+        {
+            webhook::send_debug_log("init", "kernel_debugger_detected_pid_" + std::to_string(debugger_pid), true);
+            enforce_violation_id(aida::reason_ids::reason_id_kernel_debugger_at_startup);
+            return false;
+        }
+        webhook::write_log_critical_fmt("init",
+            "kernel_debugger_scan_unconfirmed_global_tool_ignored phase=%s debugger_pid=%llu",
+            phase_name,
+            static_cast<unsigned long long>(debugger_pid));
     }
     webhook::write_log("init", "kernel_debugger_scan_ok");
 
@@ -3167,9 +3231,15 @@ inline bool guard()
                 }
                 if (debugger_pid != 0)
                 {
-                    webhook::send_debug_log("guard", "kernel_debugger_runtime_" + std::to_string(debugger_pid), true);
-                    enforce_violation_id(aida::reason_ids::reason_id_kernel_debugger_runtime);
-                    CFF_EXIT(guard_cff);
+                    if (kernel_debugger_scan_confirmed_for_enforcement("guard", "runtime_scan", debugger_pid))
+                    {
+                        webhook::send_debug_log("guard", "kernel_debugger_runtime_" + std::to_string(debugger_pid), true);
+                        enforce_violation_id(aida::reason_ids::reason_id_kernel_debugger_runtime);
+                        CFF_EXIT(guard_cff);
+                    }
+                    webhook::write_log_critical_fmt("guard",
+                        "kernel_debugger_runtime_unconfirmed_global_tool_ignored debugger_pid=%llu",
+                        static_cast<unsigned long long>(debugger_pid));
                 }
 
                 SetLastError(ERROR_SUCCESS);
@@ -3280,10 +3350,6 @@ inline bool guard()
                         adbg_result.result_flags, rt.last_kernel_flags, rt.kernel_flag_persist_count);
                     webhook::write_log("guard", flag_dbg);
 
-                    constexpr uint32_t kHardFlags =
-                        0x00000001u |
-                        0x00000008u;
-
                     constexpr uint32_t kSoftFlags =
                         0x00000002u |
                         0x00000010u |
@@ -3292,7 +3358,7 @@ inline bool guard()
                     constexpr uint64_t kKernelDetectionSettleGraceMs = 3000;
 
                     const uint32_t flags = adbg_result.result_flags;
-                    const bool hard_hit  = (flags & kHardFlags) != 0;
+                    const bool hard_hit  = kernel_adbg_hard_flags_present(flags);
                     const bool two_soft  = (flags & kSoftFlags) != 0 &&
                                            ((flags & kSoftFlags) & ((flags & kSoftFlags) - 1)) != 0;
 

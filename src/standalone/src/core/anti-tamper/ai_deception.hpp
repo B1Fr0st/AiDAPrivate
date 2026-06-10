@@ -13,6 +13,7 @@
 
 #include "webhook.hpp"
 #include "obfuscation.hpp"
+#include "../infra/win_thread.hpp"
 
 namespace anti_tamper {
 namespace ai_deception {
@@ -755,9 +756,8 @@ namespace mcp_decoy {
         if (decoy_running().exchange(true))
             return;
 
-        try
-        {
-            std::thread([]() {
+        std::string err;
+        if (!aida::infra::win_thread::start_detached([]() {
                 HANDLE h = CreateNamedPipeW(
                     L"\\\\.\\pipe\\AiDA_MCP_Bridge",
                     PIPE_ACCESS_DUPLEX,
@@ -777,11 +777,11 @@ namespace mcp_decoy {
                 pipe_handle() = h;
                 ConnectNamedPipe(h, nullptr);
                 serve_fake_responses(h);
-            }).detach();
-        }
-        catch (...)
+            },
+            &err,
+            aida::infra::win_thread::default_stack_reserve,
+            "ai_deception_decoy_pipe"))
         {
-
             decoy_running().store(false);
         }
     }

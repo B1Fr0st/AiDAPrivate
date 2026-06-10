@@ -481,6 +481,7 @@ test('POST /api/arc/function/prologue rapid same-function refetch is flagged', a
 });
 
 test('POST /api/arc/function/prologue replayed nonce is rejected', async () => {
+    sharedRows.arc_prologue_requests.length = 0;
     const fnHashParam = fnHash;
     const nonce = crypto.randomBytes(16).toString('hex');
     const body = {

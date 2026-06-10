@@ -8,10 +8,10 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include "webhook.hpp"
@@ -20,6 +20,9 @@
 #include "anti_debug.hpp"
 #include "standalone_driver.hpp"
 #include "standalone_license.hpp"
+#include "../infra/win_thread.hpp"
+
+extern "C" IMAGE_DOS_HEADER __ImageBase;
 
 namespace anti_tamper {
 namespace re_detect {
@@ -114,8 +117,6 @@ struct engine_state_t
     std::atomic<uint64_t> last_tick_tsc{ 0 };
     std::atomic<DWORD> worker_tid{ 0 };
     std::atomic<DWORD> watchdog_tid{ 0 };
-    std::thread worker;
-    std::thread watchdog;
     std::mutex mtx;
 };
 
@@ -246,6 +247,44 @@ namespace detail {
         return path[n] == '\\' || path[n] == '/';
     }
 
+    inline std::string lower_path_copy(std::string value)
+    {
+        for (char& ch : value)
+        {
+            if (ch >= 'A' && ch <= 'Z')
+                ch = static_cast<char>(ch - 'A' + 'a');
+            else if (ch == '/')
+                ch = '\\';
+        }
+        return value;
+    }
+
+    inline bool contains_ci(const std::string& value, const char* needle)
+    {
+        if (!needle || !*needle)
+            return false;
+        return lower_path_copy(value).find(lower_path_copy(std::string(needle))) != std::string::npos;
+    }
+
+    inline bool ends_with_ci(const std::string& value, const char* suffix)
+    {
+        if (!suffix || !*suffix)
+            return false;
+        const std::string v = lower_path_copy(value);
+        const std::string s = lower_path_copy(std::string(suffix));
+        return s.size() <= v.size() && v.compare(v.size() - s.size(), s.size(), s) == 0;
+    }
+
+    inline bool processes_share_session(DWORD a, DWORD b)
+    {
+        DWORD sa = 0;
+        DWORD sb = 0;
+        return a != 0 && b != 0 &&
+            ProcessIdToSessionId(a, &sa) &&
+            ProcessIdToSessionId(b, &sb) &&
+            sa == sb;
+    }
+
     inline bool trusted_windows_system_owner(const foreign_handle_observation_t& obs)
     {
         if (!obs.valid || obs.owner_path.empty() || obs.owner_path == "?")
@@ -316,6 +355,25 @@ namespace detail {
         return n > 0 && n < static_cast<DWORD>(sizeof(value));
     }
 
+    inline bool env_u64_a(const char* name, uint64_t& out)
+    {
+        out = 0;
+        char value[64] = {};
+        DWORD n = GetEnvironmentVariableA(name, value, static_cast<DWORD>(sizeof(value)));
+        if (n == 0 || n >= static_cast<DWORD>(sizeof(value)))
+            return false;
+        char* end = nullptr;
+        unsigned long long parsed = std::strtoull(value, &end, 0);
+        if (end == value || parsed == 0)
+            return false;
+        while (end && (*end == ' ' || *end == '\t'))
+            ++end;
+        if (end && *end != '\0')
+            return false;
+        out = static_cast<uint64_t>(parsed);
+        return true;
+    }
+
     inline DWORD current_parent_pid()
     {
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -348,16 +406,31 @@ namespace detail {
             streq_ci(image.c_str(), "pwsh.exe");
     }
 
+    inline bool fileless_image_base_matches_current_module()
+    {
+        uint64_t mapped_base = 0;
+        if (!env_u64_a("AIDA_FILELESS_IMAGE_BASE", mapped_base))
+            return false;
+        return mapped_base == reinterpret_cast<uint64_t>(&__ImageBase);
+    }
+
     inline bool fileless_bootstrap_context_active()
     {
-        return env_flag_enabled_a("AIDA_FILELESS_LAUNCH") &&
+        static std::atomic<bool> s_fileless_context_seen{false};
+        if (s_fileless_context_seen.load(std::memory_order_acquire))
+            return true;
+        const bool env_ok = env_flag_enabled_a("AIDA_FILELESS_LAUNCH") &&
             env_flag_enabled_a("AIDA_FILELESS_NO_DISK_WRITE") &&
             env_value_present_a("AIDA_FILELESS_DEBUG_LOG_PATH") &&
             env_value_present_a("AIDA_FILELESS_BOOTSTRAP_LOG_PATH") &&
             env_value_present_a("AIDA_FILELESS_IMAGE_BASE") &&
             env_value_present_a("AIDA_FILELESS_IMAGE_SIZE") &&
-            env_value_present_a("AIDA_FILELESS_ENTRY_RVA") &&
-            current_module_is_fileless_host();
+            env_value_present_a("AIDA_FILELESS_ENTRY_RVA");
+        const bool active = env_ok &&
+            (current_module_is_fileless_host() || fileless_image_base_matches_current_module());
+        if (active)
+            s_fileless_context_seen.store(true, std::memory_order_release);
+        return active;
     }
 
     inline bool fileless_bootstrap_parent_owner(DWORD owner_pid,
@@ -365,16 +438,35 @@ namespace detail {
                                                 const std::string& owner_image,
                                                 const std::string& owner_path)
     {
-        if (parent_pid == 0 || owner_pid != parent_pid)
+        if (owner_pid == 0)
             return false;
         if (!fileless_bootstrap_context_active())
             return false;
         if (owner_path.empty() || owner_path == "?")
             return false;
-        return streq_ci(owner_image.c_str(), "windowsterminal.exe") ||
+        const bool terminal_image = streq_ci(owner_image.c_str(), "windowsterminal.exe") ||
             streq_ci(owner_image.c_str(), "wt.exe") ||
             streq_ci(owner_image.c_str(), "conhost.exe") ||
             streq_ci(owner_image.c_str(), "openconsole.exe");
+        if (!terminal_image)
+            return false;
+        const bool windows_terminal_package =
+            contains_ci(owner_path, "\\program files\\windowsapps\\microsoft.windowsterminal_") ||
+            contains_ci(owner_path, "\\appdata\\local\\microsoft\\windowsapps\\microsoft.windowsterminal_");
+        const bool trusted_path =
+            (streq_ci(owner_image.c_str(), "windowsterminal.exe") && windows_terminal_package) ||
+            (streq_ci(owner_image.c_str(), "wt.exe") &&
+                (windows_terminal_package || ends_with_ci(owner_path, "\\appdata\\local\\microsoft\\windowsapps\\wt.exe"))) ||
+            (streq_ci(owner_image.c_str(), "openconsole.exe") &&
+                (windows_terminal_package ||
+                 ends_with_ci(owner_path, "\\windows\\system32\\openconsole.exe") ||
+                 ends_with_ci(owner_path, "\\windows\\syswow64\\openconsole.exe"))) ||
+            (streq_ci(owner_image.c_str(), "conhost.exe") &&
+                (ends_with_ci(owner_path, "\\windows\\system32\\conhost.exe") ||
+                 ends_with_ci(owner_path, "\\windows\\syswow64\\conhost.exe")));
+        if (!trusted_path)
+            return false;
+        return owner_pid == parent_pid || processes_share_session(owner_pid, GetCurrentProcessId());
     }
 
     inline void log_fileless_bootstrap_parent_handle_ignored(DWORD owner_pid,
@@ -1173,23 +1265,35 @@ namespace detail {
         if (kernel_ready) {
             query_ok = driver_bridge::kernel_anti_debug_query(query);
             scan_ok = driver_bridge::kernel_anti_debug_scan_debuggers(&scan_pid);
+            constexpr uint32_t hard_kernel_flags = 0x00000001u | 0x00000008u;
             confirmed =
-                (query_ok && ((query.result_flags & 0x1u) != 0 || query.detected_debugger_pid != 0)) ||
-                (scan_ok && scan_pid != 0);
+                query_ok &&
+                (((query.result_flags & hard_kernel_flags) != 0) || query.detected_debugger_pid != 0);
         }
 
+        const DWORD fileless_parent_pid = fileless_bootstrap_context_active() ? current_parent_pid() : 0;
+        const bool trusted_fileless_terminal =
+            obs.valid &&
+            fileless_bootstrap_parent_owner(obs.owner_pid,
+                fileless_parent_pid,
+                obs.owner_image,
+                obs.owner_path);
         const bool suppress_unconfirmed_system =
             !confirmed && trusted_system && passive_system_access;
-        const bool enforce = confirmed || !suppress_unconfirmed_system;
+        const bool suppress_unconfirmed_fileless_terminal =
+            !confirmed && trusted_fileless_terminal;
+        const bool enforce = confirmed ||
+            (!suppress_unconfirmed_system && !suppress_unconfirmed_fileless_terminal);
         const char* decision = confirmed ? "enforce_confirmed_kernel_evidence" :
             (suppress_unconfirmed_system ? "suppress_unconfirmed_trusted_system_handle" :
+             (suppress_unconfirmed_fileless_terminal ? "suppress_unconfirmed_fileless_terminal_handle" :
              (kernel_ready ? "enforce_unconfirmed_non_system_handle" :
-              "enforce_no_kernel_confirmation_path"));
+              "enforce_no_kernel_confirmation_path")));
         const std::string flags = obs.valid ? format_handle_access_flags(obs.access) : "none";
 
         char buf[1152];
         _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-            "foreign_handle_decision path=%s decision=%s should_bsod=%d kernel_ready=%d confirmed=%d query_ok=%d query_flags=0x%08X query_pid=%llu scan_ok=%d scan_pid=%llu owner_valid=%d self_pid=%lu owner_pid=%lu owner=%s owner_path='%s' handle=0x%llX access=0x%08lX access_flags=%s high_risk=%d trusted_system_owner=%d passive_system_access=%d ordinal=%u %s",
+            "foreign_handle_decision path=%s decision=%s should_bsod=%d kernel_ready=%d confirmed=%d query_ok=%d query_flags=0x%08X query_pid=%llu scan_ok=%d scan_pid=%llu owner_valid=%d self_pid=%lu owner_pid=%lu owner=%s owner_path='%s' handle=0x%llX access=0x%08lX access_flags=%s high_risk=%d trusted_system_owner=%d passive_system_access=%d trusted_fileless_terminal=%d fileless_parent_pid=%lu ordinal=%u %s",
             path ? path : "re_detect",
             decision,
             enforce ? 1 : 0,
@@ -1211,6 +1315,8 @@ namespace detail {
             obs.valid && obs.high_risk ? 1 : 0,
             trusted_system ? 1 : 0,
             passive_system_access ? 1 : 0,
+            trusted_fileless_terminal ? 1 : 0,
+            static_cast<unsigned long>(fileless_parent_pid),
             obs.valid ? obs.ordinal : 0,
             detail_str.c_str());
         webhook::write_log(path ? path : "re_detect", buf);
@@ -1453,19 +1559,25 @@ inline void initialize()
         }
     }
 
-    try
+    std::string worker_error;
+    if (!aida::infra::win_thread::start_detached(worker_loop,
+            &worker_error,
+            aida::infra::win_thread::default_stack_reserve,
+            "re_detection_worker"))
     {
-        s.worker = std::thread(worker_loop);
-        s.worker.detach();
+        webhook::write_log("re_detect",
+            worker_error.empty() ? "worker_start_failed" : worker_error.c_str());
     }
-    catch (...) {}
 
-    try
+    std::string watchdog_error;
+    if (!aida::infra::win_thread::start_detached(watchdog_loop,
+            &watchdog_error,
+            aida::infra::win_thread::default_stack_reserve,
+            "re_detection_watchdog"))
     {
-        s.watchdog = std::thread(watchdog_loop);
-        s.watchdog.detach();
+        webhook::write_log("re_detect",
+            watchdog_error.empty() ? "watchdog_start_failed" : watchdog_error.c_str());
     }
-    catch (...) {}
 }
 
 inline void shutdown()

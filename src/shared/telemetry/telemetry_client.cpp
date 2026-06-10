@@ -11,6 +11,7 @@
 #include <thread>
 #include <atomic>
 #include <random>
+#include <algorithm>
 
 #pragma comment(lib, "bcrypt.lib")
 
@@ -175,6 +176,18 @@ namespace aida::telemetry
         m_signing_key = std::move(priv_key_32b);
     }
 
+    void telemetry_client_t::set_auth_hmac_key(std::vector<std::uint8_t> auth_key_32b) noexcept
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        m_auth_hmac_key = std::move(auth_key_32b);
+    }
+
+    void telemetry_client_t::set_session_token(std::string token) noexcept
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        m_session_token = std::move(token);
+    }
+
     void telemetry_client_t::enqueue(const event_t& ev) noexcept
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -187,12 +200,17 @@ namespace aida::telemetry
         std::vector<event_t> drained;
         std::string          base_url;
         std::string          license_key;
+        std::vector<std::uint8_t> auth_key;
+        std::string          session_token;
         {
             std::lock_guard<std::mutex> lock(g_mutex);
-            if (m_base_url.empty() || m_license_key.empty()) return false;
+            if (m_base_url.empty() || m_license_key.empty() ||
+                m_auth_hmac_key.empty() || m_session_token.empty()) return false;
             drained.swap(m_queue);
             base_url    = m_base_url;
             license_key = m_license_key;
+            auth_key = m_auth_hmac_key;
+            session_token = m_session_token;
         }
         if (drained.empty()) return true;
 
@@ -217,7 +235,16 @@ namespace aida::telemetry
             body["events"]      = events;
 
             std::string resp;
-            (void)http_post_json(base_url, "/api/telemetry", body.dump(), resp);
+            const bool ok = http_post_json_authed(
+                base_url, "/api/telemetry", body.dump(), auth_key, session_token, resp);
+            if (!ok) {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                const size_t room = m_queue.size() < 4096 ? 4096 - m_queue.size() : 0;
+                const size_t keep = std::min(room, drained.size());
+                if (keep > 0)
+                    m_queue.insert(m_queue.begin(), drained.begin(), drained.begin() + keep);
+                return false;
+            }
         } catch (...) {
             return false;
         }

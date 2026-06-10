@@ -44,6 +44,8 @@ namespace aida::telemetry
         std::string                m_base_url;
         std::string                m_license_key;
         std::vector<std::uint8_t>  m_signing_key;
+        std::vector<std::uint8_t>  m_auth_hmac_key;
+        std::string                m_session_token;
         std::vector<event_t>       m_queue;
         bool                       m_running = false;
     };

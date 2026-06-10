@@ -1986,79 +1986,88 @@ if(WIN32)
 
         option(AIDA_CAMOUFOX_STAGE_SIDECAR_DEPS "Stage Camoufox runtime sidecars beside AiDAStandalone for development" OFF)
         option(AIDA_CAMOUFOX_STAGE_REVERSE_MCP_SOURCE "Stage private camoufox-reverse-mcp source beside AiDAStandalone for local development" OFF)
-        if(AIDA_CAMOUFOX_STAGE_SIDECAR_DEPS)
-            set(AIDA_CAMOUFOX_MCP_DIR "")
-            if(AIDA_CAMOUFOX_STAGE_REVERSE_MCP_SOURCE)
-                set(AIDA_CAMOUFOX_MCP_CANDIDATES
-                    "${CMAKE_CURRENT_SOURCE_DIR}/.deps/camoufox-reverse-mcp"
-                    "${CMAKE_CURRENT_SOURCE_DIR}/camoufox-reverse-mcp"
-                )
-                foreach(AIDA_CAMOUFOX_MCP_CANDIDATE IN LISTS AIDA_CAMOUFOX_MCP_CANDIDATES)
-                    if(NOT AIDA_CAMOUFOX_MCP_DIR AND EXISTS "${AIDA_CAMOUFOX_MCP_CANDIDATE}/pyproject.toml")
-                        set(AIDA_CAMOUFOX_MCP_DIR "${AIDA_CAMOUFOX_MCP_CANDIDATE}")
-                    endif()
-                endforeach()
-                if(NOT AIDA_CAMOUFOX_MCP_DIR)
-                    message(FATAL_ERROR "AiDA Camoufox source staging enabled but camoufox-reverse-mcp/pyproject.toml was not found")
-                endif()
-            endif()
 
-            set(AIDA_CAMOUFOX_BROWSER_CANDIDATES
-                "${CMAKE_CURRENT_SOURCE_DIR}/.deps/camoufox-135.0.1-beta.24-win.x86_64"
-                "${CMAKE_CURRENT_SOURCE_DIR}/camoufox-135.0.1-beta.24-win.x86_64"
+        set(AIDA_CAMOUFOX_MCP_DIR "")
+        if(AIDA_CAMOUFOX_STAGE_REVERSE_MCP_SOURCE)
+            set(AIDA_CAMOUFOX_MCP_CANDIDATES
+                "${CMAKE_CURRENT_SOURCE_DIR}/.deps/camoufox-reverse-mcp"
+                "${CMAKE_CURRENT_SOURCE_DIR}/camoufox-reverse-mcp"
             )
-            set(AIDA_CAMOUFOX_BROWSER_DIR "")
-            foreach(AIDA_CAMOUFOX_BROWSER_CANDIDATE IN LISTS AIDA_CAMOUFOX_BROWSER_CANDIDATES)
-                if(NOT AIDA_CAMOUFOX_BROWSER_DIR AND EXISTS "${AIDA_CAMOUFOX_BROWSER_CANDIDATE}/camoufox.exe")
-                    set(AIDA_CAMOUFOX_BROWSER_DIR "${AIDA_CAMOUFOX_BROWSER_CANDIDATE}")
+            foreach(AIDA_CAMOUFOX_MCP_CANDIDATE IN LISTS AIDA_CAMOUFOX_MCP_CANDIDATES)
+                if(NOT AIDA_CAMOUFOX_MCP_DIR AND EXISTS "${AIDA_CAMOUFOX_MCP_CANDIDATE}/pyproject.toml")
+                    set(AIDA_CAMOUFOX_MCP_DIR "${AIDA_CAMOUFOX_MCP_CANDIDATE}")
                 endif()
             endforeach()
+            if(NOT AIDA_CAMOUFOX_MCP_DIR)
+                message(FATAL_ERROR "AiDA Camoufox source staging enabled but camoufox-reverse-mcp/pyproject.toml was not found")
+            endif()
+        endif()
+
+        set(AIDA_CAMOUFOX_BROWSER_CANDIDATES
+            "${CMAKE_CURRENT_SOURCE_DIR}/.deps/camoufox-135.0.1-beta.24-win.x86_64"
+            "${CMAKE_CURRENT_SOURCE_DIR}/camoufox-135.0.1-beta.24-win.x86_64"
+        )
+        set(AIDA_CAMOUFOX_BROWSER_DIR "")
+        foreach(AIDA_CAMOUFOX_BROWSER_CANDIDATE IN LISTS AIDA_CAMOUFOX_BROWSER_CANDIDATES)
+            if(NOT AIDA_CAMOUFOX_BROWSER_DIR AND EXISTS "${AIDA_CAMOUFOX_BROWSER_CANDIDATE}/camoufox.exe")
+                set(AIDA_CAMOUFOX_BROWSER_DIR "${AIDA_CAMOUFOX_BROWSER_CANDIDATE}")
+            endif()
+        endforeach()
+
+        set(AIDA_CAMOUFOX_REVERSE_MCP_EXE_CANDIDATES
+            "${CMAKE_CURRENT_SOURCE_DIR}/.deps/AiDA_CamoufoxReverseMcp.exe"
+            "${CMAKE_CURRENT_SOURCE_DIR}/.deps/camoufox-reverse-mcp.exe"
+            "${CMAKE_CURRENT_SOURCE_DIR}/camoufox-reverse-mcp/dist/AiDA_CamoufoxReverseMcp.exe"
+            "${CMAKE_CURRENT_SOURCE_DIR}/camoufox-reverse-mcp/dist/camoufox-reverse-mcp.exe"
+            "${CMAKE_CURRENT_SOURCE_DIR}/AiDA_CamoufoxReverseMcp.exe"
+            "${CMAKE_CURRENT_SOURCE_DIR}/camoufox-reverse-mcp.exe"
+        )
+        set(AIDA_CAMOUFOX_REVERSE_MCP_EXE "")
+        foreach(AIDA_CAMOUFOX_REVERSE_MCP_EXE_CANDIDATE IN LISTS AIDA_CAMOUFOX_REVERSE_MCP_EXE_CANDIDATES)
+            if(NOT AIDA_CAMOUFOX_REVERSE_MCP_EXE AND EXISTS "${AIDA_CAMOUFOX_REVERSE_MCP_EXE_CANDIDATE}")
+                set(AIDA_CAMOUFOX_REVERSE_MCP_EXE "${AIDA_CAMOUFOX_REVERSE_MCP_EXE_CANDIDATE}")
+            endif()
+        endforeach()
+
+        set(AIDA_BUNDLED_PYTHON_CANDIDATES
+            "${CMAKE_CURRENT_SOURCE_DIR}/.deps/camoufox-runtime"
+            "${CMAKE_CURRENT_SOURCE_DIR}/.deps/camoufox-python"
+            "${CMAKE_CURRENT_SOURCE_DIR}/.deps/python-3.12"
+            "${CMAKE_CURRENT_SOURCE_DIR}/.deps/python-3.12.10-x64"
+            "${CMAKE_CURRENT_SOURCE_DIR}/.deps/Python312"
+            "${CMAKE_CURRENT_SOURCE_DIR}/.deps/Python312-3.12.10-x64"
+            "${CMAKE_CURRENT_SOURCE_DIR}/camoufox-runtime"
+            "${CMAKE_CURRENT_SOURCE_DIR}/camoufox-python"
+            "${CMAKE_CURRENT_SOURCE_DIR}/python-3.12"
+            "${CMAKE_CURRENT_SOURCE_DIR}/python-3.12.10-x64"
+            "${CMAKE_CURRENT_SOURCE_DIR}/Python312"
+            "${CMAKE_CURRENT_SOURCE_DIR}/Python312-3.12.10-x64"
+            "${CMAKE_CURRENT_SOURCE_DIR}/runtime/python"
+            "${CMAKE_CURRENT_SOURCE_DIR}/runtime/python/Python312-3.12.10-x64"
+            "${CMAKE_CURRENT_SOURCE_DIR}/runtimes/python/Python312-3.12.10-x64"
+        )
+        set(AIDA_BUNDLED_PYTHON_DIR "")
+        foreach(AIDA_BUNDLED_PYTHON_CANDIDATE IN LISTS AIDA_BUNDLED_PYTHON_CANDIDATES)
+            if(NOT AIDA_BUNDLED_PYTHON_DIR AND EXISTS "${AIDA_BUNDLED_PYTHON_CANDIDATE}/python.exe")
+                set(AIDA_BUNDLED_PYTHON_DIR "${AIDA_BUNDLED_PYTHON_CANDIDATE}")
+            endif()
+        endforeach()
+
+        set(AIDA_CAMOUFOX_STAGE_EFFECTIVE OFF)
+        if(AIDA_CAMOUFOX_STAGE_SIDECAR_DEPS)
+            set(AIDA_CAMOUFOX_STAGE_EFFECTIVE ON)
             if(NOT AIDA_CAMOUFOX_BROWSER_DIR)
                 message(FATAL_ERROR "AiDA Camoufox sidecar staging enabled but camoufox-135.0.1-beta.24-win.x86_64/camoufox.exe was not found")
             endif()
-
-            set(AIDA_CAMOUFOX_REVERSE_MCP_EXE_CANDIDATES
-                "${CMAKE_CURRENT_SOURCE_DIR}/.deps/AiDA_CamoufoxReverseMcp.exe"
-                "${CMAKE_CURRENT_SOURCE_DIR}/.deps/camoufox-reverse-mcp.exe"
-                "${CMAKE_CURRENT_SOURCE_DIR}/camoufox-reverse-mcp/dist/AiDA_CamoufoxReverseMcp.exe"
-                "${CMAKE_CURRENT_SOURCE_DIR}/camoufox-reverse-mcp/dist/camoufox-reverse-mcp.exe"
-                "${CMAKE_CURRENT_SOURCE_DIR}/AiDA_CamoufoxReverseMcp.exe"
-                "${CMAKE_CURRENT_SOURCE_DIR}/camoufox-reverse-mcp.exe"
-            )
-            set(AIDA_CAMOUFOX_REVERSE_MCP_EXE "")
-            foreach(AIDA_CAMOUFOX_REVERSE_MCP_EXE_CANDIDATE IN LISTS AIDA_CAMOUFOX_REVERSE_MCP_EXE_CANDIDATES)
-                if(NOT AIDA_CAMOUFOX_REVERSE_MCP_EXE AND EXISTS "${AIDA_CAMOUFOX_REVERSE_MCP_EXE_CANDIDATE}")
-                    set(AIDA_CAMOUFOX_REVERSE_MCP_EXE "${AIDA_CAMOUFOX_REVERSE_MCP_EXE_CANDIDATE}")
-                endif()
-            endforeach()
-
-            set(AIDA_BUNDLED_PYTHON_CANDIDATES
-                "${CMAKE_CURRENT_SOURCE_DIR}/.deps/camoufox-runtime"
-                "${CMAKE_CURRENT_SOURCE_DIR}/.deps/camoufox-python"
-                "${CMAKE_CURRENT_SOURCE_DIR}/.deps/python-3.12"
-                "${CMAKE_CURRENT_SOURCE_DIR}/.deps/python-3.12.10-x64"
-                "${CMAKE_CURRENT_SOURCE_DIR}/.deps/Python312"
-                "${CMAKE_CURRENT_SOURCE_DIR}/.deps/Python312-3.12.10-x64"
-                "${CMAKE_CURRENT_SOURCE_DIR}/camoufox-runtime"
-                "${CMAKE_CURRENT_SOURCE_DIR}/camoufox-python"
-                "${CMAKE_CURRENT_SOURCE_DIR}/python-3.12"
-                "${CMAKE_CURRENT_SOURCE_DIR}/python-3.12.10-x64"
-                "${CMAKE_CURRENT_SOURCE_DIR}/Python312"
-                "${CMAKE_CURRENT_SOURCE_DIR}/Python312-3.12.10-x64"
-                "${CMAKE_CURRENT_SOURCE_DIR}/runtime/python"
-                "${CMAKE_CURRENT_SOURCE_DIR}/runtime/python/Python312-3.12.10-x64"
-                "${CMAKE_CURRENT_SOURCE_DIR}/runtimes/python/Python312-3.12.10-x64"
-            )
-            set(AIDA_BUNDLED_PYTHON_DIR "")
-            foreach(AIDA_BUNDLED_PYTHON_CANDIDATE IN LISTS AIDA_BUNDLED_PYTHON_CANDIDATES)
-                if(NOT AIDA_BUNDLED_PYTHON_DIR AND EXISTS "${AIDA_BUNDLED_PYTHON_CANDIDATE}/python.exe")
-                    set(AIDA_BUNDLED_PYTHON_DIR "${AIDA_BUNDLED_PYTHON_CANDIDATE}")
-                endif()
-            endforeach()
             if(NOT AIDA_BUNDLED_PYTHON_DIR AND NOT AIDA_CAMOUFOX_REVERSE_MCP_EXE)
                 message(FATAL_ERROR "AiDA Camoufox sidecar staging enabled but neither frozen reverse MCP executable nor camoufox-runtime/python.exe was found")
             endif()
+        elseif(AIDA_CAMOUFOX_BROWSER_DIR AND (AIDA_BUNDLED_PYTHON_DIR OR AIDA_CAMOUFOX_REVERSE_MCP_EXE))
+            set(AIDA_CAMOUFOX_STAGE_EFFECTIVE ON)
+            message(STATUS "AiDA Camoufox app-local sidecar assets detected; staging beside AiDAStandalone")
+        endif()
 
+        if(AIDA_CAMOUFOX_STAGE_EFFECTIVE)
             if(AIDA_CAMOUFOX_STAGE_REVERSE_MCP_SOURCE)
                 add_custom_command(TARGET AiDAStandalone POST_BUILD
                     COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:AiDAStandalone>/deps"
@@ -2100,20 +2109,21 @@ if(WIN32)
                     COMMENT "Staging app-local Python runtime beside AiDAStandalone.exe..."
                     VERBATIM
                 )
+                message(STATUS "AiDA Camoufox app-local Python runtime: ${AIDA_BUNDLED_PYTHON_DIR}")
             endif()
 
-            if(AIDA_CAMOUFOX_STAGE_REVERSE_MCP_SOURCE)
+            if(AIDA_BUNDLED_PYTHON_DIR OR AIDA_CAMOUFOX_STAGE_REVERSE_MCP_SOURCE)
                 add_custom_command(TARGET AiDAStandalone POST_BUILD
                     COMMAND ${CMAKE_COMMAND}
                         "-DAIDA_CAMOUFOX_STAGE_ROOT=$<TARGET_FILE_DIR:AiDAStandalone>"
                         -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/aida_patch_camoufox_reverse_mcp.cmake"
-                    COMMENT "Patching staged local-development camoufox-reverse-mcp launcher..."
+                    COMMENT "Patching staged Camoufox reverse MCP runtime..."
                     VERBATIM
                 )
             endif()
         endif()
 
-        if(AIDA_CAMOUFOX_STAGE_SIDECAR_DEPS)
+        if(AIDA_CAMOUFOX_STAGE_EFFECTIVE)
             set(AIDA_PYTHON_INSTALLER_CANDIDATES
                 "${CMAKE_CURRENT_SOURCE_DIR}/python-3.12.10-amd64.exe"
                 "${CMAKE_CURRENT_SOURCE_DIR}/camoufox-runtime/python-3.12.10-amd64.exe"
