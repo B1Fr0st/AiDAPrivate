@@ -3120,16 +3120,15 @@ namespace {
 
         if (tool_lc == "dbg_get_trace" ||
             tool_lc == "debugger_get_trace") {
-            bool expected_empty = false;
-            if (payload_bool_field(ir.data, "expected_empty", expected_empty) && expected_empty)
-                return false;
             uint64_t count = 1;
             size_t entries = 1;
             if ((payload_u64_field(ir.data, "count", count) && count > 0) ||
+                (payload_u64_field(ir.data, "returned", count) && count > 0) ||
                 (payload_array_count(ir.data, "entries", entries) && entries > 0) ||
                 (payload_array_count(ir.data, "trace", entries) && entries > 0))
                 return false;
             if ((payload_u64_field(ir.data, "count", count) && count == 0) ||
+                (payload_u64_field(ir.data, "returned", count) && count == 0) ||
                 (payload_array_count(ir.data, "entries", entries) && entries == 0) ||
                 (payload_array_count(ir.data, "trace", entries) && entries == 0) ||
                 payload_text_contains(ir, "0 trace entries") ||
@@ -7595,7 +7594,7 @@ namespace {
                 route = "token";
             } else if (req.rfind("POST /graphql ", 0) == 0) {
                 content_type = "application/json";
-                body = "{\"data\":{\"__typename\":\"Query\",\"__schema\":{\"queryType\":{\"name\":\"Query\"},\"types\":[]}}}";
+                body = "{\"data\":{\"__typename\":\"Query\",\"aidaStatus\":\"ready\",\"viewer\":{\"id\":\"fixture\",\"name\":\"AiDA Fixture\"},\"__schema\":{\"queryType\":{\"name\":\"Query\"},\"types\":[{\"kind\":\"OBJECT\",\"name\":\"Query\",\"fields\":[{\"name\":\"__typename\",\"type\":{\"kind\":\"SCALAR\",\"name\":\"String\"},\"args\":[]},{\"name\":\"aidaStatus\",\"type\":{\"kind\":\"SCALAR\",\"name\":\"String\"},\"args\":[]},{\"name\":\"viewer\",\"type\":{\"kind\":\"OBJECT\",\"name\":\"AidaViewer\"},\"args\":[]}],\"interfaces\":[]},{\"kind\":\"OBJECT\",\"name\":\"AidaViewer\",\"fields\":[{\"name\":\"id\",\"type\":{\"kind\":\"SCALAR\",\"name\":\"ID\"},\"args\":[]},{\"name\":\"name\",\"type\":{\"kind\":\"SCALAR\",\"name\":\"String\"},\"args\":[]}],\"interfaces\":[]},{\"kind\":\"SCALAR\",\"name\":\"String\",\"fields\":[],\"interfaces\":[]},{\"kind\":\"SCALAR\",\"name\":\"ID\",\"fields\":[],\"interfaces\":[]}]}}}";
                 route = "graphql";
             } else if (req.rfind("GET /aida-fixture.js ", 0) == 0) {
                 content_type = "application/javascript";
@@ -9953,6 +9952,19 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
     }
 
     void test_tool_dbg_stop_trace(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        if (debugger_engine::g_state.tracing.load(std::memory_order_acquire)) {
+            mcp_step_fixture_t fixture;
+            if (prepare_mcp_step_fixture(hf, "mcp.dbg_stop_trace.trace_step", fixture)) {
+                mcp_standalone::json step_args;
+                step_args["tid"] = std::to_string(fixture.tid);
+                auto step = invoke_tool_bounded(get_server(), "debugger_step_into", step_args, tool_timeout_ms("debugger_step_into"));
+                log_mcp_result_detail("fixture", 0, "debugger_step_into", step_args, step.result, step.elapsed_ms,
+                    step.timed_out ? "dbg_trace_step_timeout" : "dbg_trace_step");
+                cleanup_mcp_step_fixture(fixture);
+            } else {
+                log_msg(hf, "mcp.dbg_stop_trace", "TRACE-FIXTURE -- controlled trace step fixture setup failed");
+            }
+        }
         std::size_t trace_count = 0;
         {
             std::lock_guard<std::mutex> lk(debugger_engine::g_state.trace_mutex);
@@ -11120,7 +11132,29 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
     }
 
     void test_tool_analysis_get_exports(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.analysis_get_exports", get_server(), "analysis_get_exports", {}, passed, failed, skipped);
+        mcp_standalone::json args;
+        args["module_name"] = "ntdll.dll";
+        args["max_entries"] = 128;
+        mcp_standalone::tool_result_t result;
+        auto status = test_tool_call(hf, "mcp.analysis_get_exports", get_server(), "analysis_get_exports", args, passed, failed, skipped, false, &result);
+        if (status != mcp_tool_call_status_t::passed)
+            return;
+        uint64_t count = 0;
+        const bool has_count = payload_u64_field(result.data, "count", count);
+        size_t exports = 0;
+        const bool has_exports = payload_array_count(result.data, "exports", exports);
+        if (!has_count || count == 0 || !has_exports || exports == 0) {
+            log_msg(hf, "mcp.analysis_get_exports", "FAIL -- selected module export list empty count_present=%d count=%llu exports_present=%d exports=%zu data=%s",
+                has_count ? 1 : 0,
+                static_cast<unsigned long long>(count),
+                has_exports ? 1 : 0,
+                exports,
+                compact_json(result.data, 900).c_str());
+            if (passed.load(std::memory_order_acquire) > 0)
+                passed.fetch_sub(1, std::memory_order_acq_rel);
+            failed.fetch_add(1, std::memory_order_acq_rel);
+            convert_tool_pass_to_fail("analysis_get_exports");
+        }
     }
 
     bool pdb_fixture_loaded_counts(size_t& symbols, size_t& types, std::string& status_text) {
@@ -12750,8 +12784,24 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             compact_text(code, 300).c_str());
         mcp_standalone::tool_result_t result;
         auto status = test_tool_call(hf, "mcp.network_script_execute", get_server(), "network_script_execute", args, passed, failed, skipped, false, &result);
-        if (status == mcp_tool_call_status_t::passed)
+        if (status == mcp_tool_call_status_t::passed) {
             log_tool_result_payload(hf, "mcp.network_script_execute", "VERIFY-RESULT", result);
+            std::string output;
+            const bool has_output = payload_string_field(result.data, "output", output);
+            const bool output_ok = has_output && output == "1";
+            const bool text_ok = result.text == "1";
+            if (!output_ok || !text_ok) {
+                log_msg(hf, "mcp.network_script_execute", "FAIL -- script result mismatch expected=1 has_output=%d output=%s text=%s data=%s",
+                    has_output ? 1 : 0,
+                    compact_text(output, 300).c_str(),
+                    compact_text(result.text, 300).c_str(),
+                    compact_json(result.data, 900).c_str());
+                if (passed.load(std::memory_order_acquire) > 0)
+                    passed.fetch_sub(1, std::memory_order_acq_rel);
+                failed.fetch_add(1, std::memory_order_acq_rel);
+                convert_tool_pass_to_fail("network_script_execute");
+            }
+        }
     }
 
     void test_tool_network_script_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -14570,15 +14620,57 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
     }
     void test_tool_burp_graphql_introspect(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["endpoint"] = burp_fixture_url(hf, "mcp.burp_graphql_introspect", "/graphql");
-        test_tool_call(hf, "mcp.burp_graphql_introspect", get_server(), "burp_graphql_introspect", args, passed, failed, skipped);
+        mcp_standalone::tool_result_t result;
+        auto status = test_tool_call(hf, "mcp.burp_graphql_introspect", get_server(), "burp_graphql_introspect", args, passed, failed, skipped, false, &result);
+        if (status == mcp_tool_call_status_t::passed) {
+            size_t types = 0;
+            if (!payload_array_count(result.data, "types", types) || types == 0) {
+                log_msg(hf, "mcp.burp_graphql_introspect", "FAIL -- GraphQL schema has no parsed types data=%s",
+                    compact_json(result.data, 900).c_str());
+                if (passed.load(std::memory_order_acquire) > 0)
+                    passed.fetch_sub(1, std::memory_order_acq_rel);
+                failed.fetch_add(1, std::memory_order_acq_rel);
+                convert_tool_pass_to_fail("burp_graphql_introspect");
+            }
+        }
     }
     void test_tool_burp_graphql_example(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args; args["endpoint"] = burp_fixture_url(hf, "mcp.burp_graphql_example", "/graphql"); args["field_name"] = "__typename"; args["depth"] = 1;
-        test_tool_call(hf, "mcp.burp_graphql_example", get_server(), "burp_graphql_example", args, passed, failed, skipped);
+        mcp_standalone::json args; args["endpoint"] = burp_fixture_url(hf, "mcp.burp_graphql_example", "/graphql"); args["field_name"] = "viewer"; args["depth"] = 2;
+        mcp_standalone::tool_result_t result;
+        auto status = test_tool_call(hf, "mcp.burp_graphql_example", get_server(), "burp_graphql_example", args, passed, failed, skipped, false, &result);
+        if (status == mcp_tool_call_status_t::passed &&
+            (result.text.find("viewer") == std::string::npos || result.text.find("id") == std::string::npos || result.text.find("name") == std::string::npos)) {
+            log_msg(hf, "mcp.burp_graphql_example", "FAIL -- generated query did not use fixture schema text=%s data=%s",
+                compact_text(result.text, 900).c_str(),
+                compact_json(result.data, 900).c_str());
+            if (passed.load(std::memory_order_acquire) > 0)
+                passed.fetch_sub(1, std::memory_order_acq_rel);
+            failed.fetch_add(1, std::memory_order_acq_rel);
+            convert_tool_pass_to_fail("burp_graphql_example");
+        }
     }
     void test_tool_burp_graphql_send(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args; args["endpoint"] = burp_fixture_url(hf, "mcp.burp_graphql_send", "/graphql"); args["query"] = "{ __typename }";
-        test_tool_call(hf, "mcp.burp_graphql_send", get_server(), "burp_graphql_send", args, passed, failed, skipped);
+        mcp_standalone::json args; args["endpoint"] = burp_fixture_url(hf, "mcp.burp_graphql_send", "/graphql"); args["query"] = "{ __typename aidaStatus }";
+        mcp_standalone::tool_result_t result;
+        auto status = test_tool_call(hf, "mcp.burp_graphql_send", get_server(), "burp_graphql_send", args, passed, failed, skipped, false, &result);
+        if (status == mcp_tool_call_status_t::passed) {
+            std::string typename_value;
+            std::string status_value;
+            const bool has_typename = payload_string_field(result.data, "__typename", typename_value);
+            const bool has_status = payload_string_field(result.data, "aidaStatus", status_value);
+            if (!has_typename || typename_value != "Query" || !has_status || status_value != "ready") {
+                log_msg(hf, "mcp.burp_graphql_send", "FAIL -- GraphQL fixture response mismatch has_typename=%d typename=%s has_status=%d status=%s data=%s",
+                    has_typename ? 1 : 0,
+                    compact_text(typename_value, 120).c_str(),
+                    has_status ? 1 : 0,
+                    compact_text(status_value, 120).c_str(),
+                    compact_json(result.data, 900).c_str());
+                if (passed.load(std::memory_order_acquire) > 0)
+                    passed.fetch_sub(1, std::memory_order_acq_rel);
+                failed.fetch_add(1, std::memory_order_acq_rel);
+                convert_tool_pass_to_fail("burp_graphql_send");
+            }
+        }
     }
     void test_tool_burp_ws_connect(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         if (!ensure_burp_http_fixture(hf, "mcp.burp_ws_connect") || !g_burp_http_fixture || g_burp_http_fixture->port == 0) {

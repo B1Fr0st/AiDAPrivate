@@ -60,6 +60,58 @@ namespace {
 		return std::string(tmp);
 	}
 
+	void push_child_field(test_lab::result_t& r, std::uint32_t index, const char* field, const std::string& value) {
+		char label[64];
+		std::snprintf(label, sizeof(label), "child[%u].%s", index, field);
+		r.parsed.push_back({ label, value });
+	}
+
+	void push_child_field_u32(test_lab::result_t& r, std::uint32_t index, const char* field, std::uint32_t value) {
+		char buf[32];
+		std::snprintf(buf, sizeof(buf), "%u", static_cast<unsigned>(value));
+		push_child_field(r, index, field, buf);
+	}
+
+	bool launch_evidence_child(test_lab::result_t& r, std::uint32_t index) {
+		wchar_t sysdir[MAX_PATH] = {};
+		UINT len = GetSystemDirectoryW(sysdir, MAX_PATH);
+		if (len == 0u || len >= MAX_PATH) {
+			push_child_field_u32(r, index, "create_ok", 0u);
+			push_child_field_u32(r, index, "gle", GetLastError());
+			return false;
+		}
+		std::wstring exe(sysdir);
+		exe += L"\\cmd.exe";
+		std::wstring cmd = L"\"";
+		cmd += exe;
+		cmd += L"\" /d /c exit 0";
+		STARTUPINFOW si{};
+		si.cb = sizeof(si);
+		PROCESS_INFORMATION pi{};
+		BOOL ok = CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE,
+			CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+		DWORD gle = ok ? 0u : GetLastError();
+		push_child_field_u32(r, index, "create_ok", ok ? 1u : 0u);
+		push_child_field_u32(r, index, "gle", gle);
+		if (!ok)
+			return false;
+		push_child_field_u32(r, index, "pid", pi.dwProcessId);
+		push_child_field_u32(r, index, "tid", pi.dwThreadId);
+		DWORD wait_rc = WaitForSingleObject(pi.hProcess, 2000u);
+		DWORD exit_code = STILL_ACTIVE;
+		GetExitCodeProcess(pi.hProcess, &exit_code);
+		if (wait_rc == WAIT_TIMEOUT) {
+			TerminateProcess(pi.hProcess, 0xE1u);
+			WaitForSingleObject(pi.hProcess, 500u);
+			GetExitCodeProcess(pi.hProcess, &exit_code);
+		}
+		push_child_field_u32(r, index, "wait_rc", wait_rc);
+		push_child_field_u32(r, index, "exit_code", exit_code);
+		CloseHandle(pi.hThread);
+		CloseHandle(pi.hProcess);
+		return true;
+	}
+
 	void render_inputs_sentinel_hb(test_lab::state_t& s) {
 		(void)s;
 		ImGui::TextDisabled("Sends one heartbeat to WhosWho and reads back the SentinelBridge state (sentinel_tsc / whoswho_tsc).");
@@ -119,18 +171,58 @@ namespace {
 		if (cap > voyager::detail::DRAIN_DEBUG_EVENTS_CAP) {
 			cap = voyager::detail::DRAIN_DEBUG_EVENTS_CAP;
 		}
-		std::vector<voyager::device_t::debug_event_record> events;
-		voyager::device_t::debug_event_drain_stats stats{};
-		bool ok = device->drain_debug_events(events, cap, &stats);
-		if (!ok) {
+		std::vector<voyager::device_t::debug_event_record> baseline_events;
+		voyager::device_t::debug_event_drain_stats baseline_stats{};
+		bool baseline_ok = device->drain_debug_events(baseline_events, cap, &baseline_stats);
+		if (!baseline_ok) {
 			r.ok = false;
-			r.error = "drain_debug_events failed";
+			r.error = "baseline drain_debug_events failed";
 			return;
 		}
+		push_u32(r, "baseline_returned_count", baseline_stats.returned_count);
+		push_u32(r, "baseline_dropped_since_last_drain", baseline_stats.dropped_since_last_drain);
+		push_u64(r, "baseline_total_dropped", baseline_stats.total_dropped);
+		push_u64(r, "baseline_total_published", baseline_stats.total_published);
+		push_u32(r, "fresh_trigger_requested", 1u);
+		std::vector<voyager::device_t::debug_event_record> events;
+		voyager::device_t::debug_event_drain_stats stats{};
+		bool ok = true;
+		std::uint32_t created_children = 0u;
+		std::uint32_t poll_attempts = 0u;
+		for (std::uint32_t child = 0; child < 4u && events.empty(); ++child) {
+			if (launch_evidence_child(r, child))
+				++created_children;
+			for (std::uint32_t poll = 0; poll < 10u; ++poll) {
+				Sleep(50u);
+				events.clear();
+				stats = {};
+				ok = device->drain_debug_events(events, cap, &stats);
+				++poll_attempts;
+				if (!ok) {
+					r.ok = false;
+					r.error = "post-trigger drain_debug_events failed";
+					push_u32(r, "fresh_children_created", created_children);
+					push_u32(r, "fresh_poll_attempts", poll_attempts);
+					return;
+				}
+				if (!events.empty())
+					break;
+			}
+		}
+		push_u32(r, "fresh_children_created", created_children);
+		push_u32(r, "fresh_poll_attempts", poll_attempts);
 		push_u32(r, "returned_count", stats.returned_count);
 		push_u32(r, "dropped_since_last_drain", stats.dropped_since_last_drain);
 		push_u64(r, "total_dropped", stats.total_dropped);
 		push_u64(r, "total_published", stats.total_published);
+		std::uint64_t published_delta = 0;
+		if (stats.total_published >= baseline_stats.total_published)
+			published_delta = stats.total_published - baseline_stats.total_published;
+		push_u64(r, "fresh_total_published_delta", published_delta);
+		std::uint64_t dropped_delta = 0;
+		if (stats.total_dropped >= baseline_stats.total_dropped)
+			dropped_delta = stats.total_dropped - baseline_stats.total_dropped;
+		push_u64(r, "fresh_total_dropped_delta", dropped_delta);
 		for (std::size_t i = 0; i < events.size(); ++i) {
 			const auto& e = events[i];
 			const char* type_name = "invalid";
@@ -168,6 +260,21 @@ namespace {
 			std::snprintf(label, sizeof(label), "event[%zu].image_path", i);
 			r.parsed.push_back({ label, path_utf8 });
 		}
+		if (events.empty()) {
+			r.ok = false;
+			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
+			if (published_delta != 0) {
+				r.error = "fresh Sentinel evidence was published but direct drain returned zero";
+				r.parsed.push_back({ "recommendation", "Serialize Test Lab EVTS drain against any background debug-event consumer or expose a non-consuming fresh-publication snapshot for this test" });
+			} else if (created_children == 0u) {
+				r.error = "fresh Sentinel evidence trigger could not create a child process";
+				r.parsed.push_back({ "recommendation", "Verify CreateProcessW is allowed from Test Lab before evaluating Sentinel debug-event publication" });
+			} else {
+				r.error = "Sentinel evidence ring returned zero after fresh child-process triggers";
+				r.parsed.push_back({ "recommendation", "Verify debug_events parent PID registration matches the AiDAStandalone process and PsSetCreateProcessNotifyRoutineEx publishes child-process events" });
+			}
+			return;
+		}
 		r.ok = true;
 	}
 
@@ -197,6 +304,15 @@ namespace {
 		char b[32];
 		std::snprintf(b, sizeof(b), "0x%016llX", static_cast<unsigned long long>(first_base));
 		r.parsed.push_back({ "first_driver_base", b });
+		r.parsed.push_back({ "hostile_driver_absent", present ? "0" : "1" });
+		r.parsed.push_back({ "absence_expected_healthy", present ? "0" : "1" });
+		r.parsed.push_back({ "security_interpretation", present ? "tier_a_driver_present_review_required" : "healthy_no_tier_a_driver_present" });
+		if (present) {
+			r.ok = false;
+			r.error = "Tier-A hostile driver presence reported by Sentinel";
+			r.ntstatus = static_cast<std::int32_t>(0xC0000428u);
+			return;
+		}
 		r.ok = true;
 	}
 
@@ -332,7 +448,7 @@ TESTLAB_REGISTER(g_reg_sentinel_recu,
 
 TESTLAB_REGISTER(g_reg_sentinel_tira,
 	"sentinel", test_lab::driver_e::sentinel,
-	"Sentinel Tier-A Query", "Read preloaded tier-A driver flag and mask",
+	"Sentinel Tier-A Health", "Read tier-A hostile-driver flag and mask; absence is the expected healthy state",
 	&render_inputs_sentinel_tier_a, &run_sentinel_tier_a);
 
 TESTLAB_REGISTER(g_reg_sentinel_hvdt,

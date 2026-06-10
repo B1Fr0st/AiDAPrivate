@@ -479,7 +479,8 @@ static std::string format_lua_number(double value) {
     return std::string(buf);
 }
 
-static std::string lua_value_to_string(const sol::stack_proxy& v) {
+template <typename LuaValue>
+static std::string lua_value_to_string(const LuaValue& v) {
     switch (v.get_type()) {
         case sol::type::string: {
             sol::optional<std::string> s = v.as<sol::optional<std::string>>();
@@ -1058,7 +1059,7 @@ static std::string stringify_result(const sol::protected_function_result& result
     if (count <= 0) return std::string();
     std::string out;
     for (int i = 0; i < count; ++i) {
-        sol::stack_proxy obj = result[i];
+        sol::object obj = result.get<sol::object>(i);
         if (i > 0) out += "\t";
         out += lua_value_to_string(obj);
     }

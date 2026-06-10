@@ -83,6 +83,37 @@ static uint32_t bounded_u32_param(const json& params, const char* name, uint32_t
 	return value;
 }
 
+static std::string lower_ascii(std::string value)
+{
+	std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+		return static_cast<char>(std::tolower(c));
+	});
+	return value;
+}
+
+static const driver_bridge::module_info_t* select_module_by_name(const std::vector<driver_bridge::module_info_t>& modules, const std::string& requested)
+{
+	if (modules.empty())
+		return nullptr;
+	if (requested.empty())
+		return &modules.front();
+	const std::string want = lower_ascii(requested);
+	for (const auto& mod : modules) {
+		if (lower_ascii(mod.name) == want)
+			return &mod;
+	}
+	for (const auto& mod : modules) {
+		const std::string path = lower_ascii(mod.path);
+		if (path.size() >= want.size() && path.compare(path.size() - want.size(), want.size(), want) == 0)
+			return &mod;
+	}
+	for (const auto& mod : modules) {
+		if (lower_ascii(mod.name).find(want) != std::string::npos || lower_ascii(mod.path).find(want) != std::string::npos)
+			return &mod;
+	}
+	return nullptr;
+}
+
 static std::string wide_to_utf8_lossy(const wchar_t* text)
 {
 	if (!text || !*text)
@@ -1392,9 +1423,10 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 
 	srv.register_tool({
 		"analysis_get_exports",
-		"List the exports of the attached process's main module (ordinal, name, RVA, absolute address, forwarder info).",
+		"List the exports of the attached process's main module or selected loaded module (ordinal, name, RVA, absolute address, forwarder info).",
 		{{"max_entries", "integer", "Maximum exports to return (default 512, max 4096)", false},
-		 {"timeout_ms", "integer", "Maximum parse time before returning partial results (default 2500, max 10000)", false}},
+		 {"timeout_ms", "integer", "Maximum parse time before returning partial results (default 2500, max 10000)", false},
+		 {"module_name", "string", "Optional loaded module name or path suffix to parse instead of the main module", false}},
 		true,
 		[](const json& params) -> tool_result_t {
 			diag::log_tagged("analysis", "analysis_get_exports entry");
@@ -1407,16 +1439,24 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 				diag::log_tagged("analysis", "analysis_get_exports failed no_modules");
 				return tool_result_t::error("Module enumeration returned no entries.");
 			}
+			const std::string requested_module = params.value("module_name", std::string());
+			const driver_bridge::module_info_t* selected = select_module_by_name(modules, requested_module);
+			if (!selected) {
+				diag::log_tagged_fmt("analysis", "analysis_get_exports failed module_not_found requested=%s module_count=%zu",
+					requested_module.c_str(), modules.size());
+				return tool_result_t::error("Requested module was not found in the attached process.");
+			}
 			pe_parser::pe_info_t pe;
-			if (!pe_parser::parse(modules.front().base, pe, false)) {
-				diag::log_tagged("analysis", "analysis_get_exports failed pe_parse_failed");
-				return tool_result_t::error("pe_parser::parse failed on the main module.");
+			if (!pe_parser::parse(selected->base, pe, false)) {
+				diag::log_tagged_fmt("analysis", "analysis_get_exports failed pe_parse_failed module=%s base=0x%llX",
+					selected->name.c_str(), static_cast<unsigned long long>(selected->base));
+				return tool_result_t::error("pe_parser::parse failed on the selected module.");
 			}
 			size_t max_entries = bounded_size_param(params, "max_entries", 512, 1, 4096);
 			uint32_t timeout_ms = bounded_u32_param(params, "timeout_ms", 2500, 100, 10000);
 			auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
 			bool truncated = false;
-			bool parsed = pe_parser::parse_exports(modules.front().base, pe, pe.exports, max_entries, &deadline, &truncated);
+			bool parsed = pe_parser::parse_exports(selected->base, pe, pe.exports, max_entries, &deadline, &truncated);
 			if (!parsed)
 				truncated = true;
 			json arr = json::array();
@@ -1436,7 +1476,10 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 				arr.push_back(std::move(o));
 			}
 			json result;
-			result["module"]  = modules.front().name;
+			result["module"]  = selected->name;
+			result["module_path"] = selected->path;
+			std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(selected->base));
+			result["module_base"] = buf;
 			result["count"]   = arr.size();
 			result["truncated"] = truncated;
 			result["parse_complete"] = parsed && !truncated;
@@ -1444,7 +1487,7 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			result["timeout_ms"] = timeout_ms;
 			result["exports"] = std::move(arr);
 			diag::log_tagged_fmt("analysis", "analysis_get_exports complete module=%s count=%zu truncated=%d parsed=%d",
-				modules.front().name.c_str(), static_cast<size_t>(result["count"].get<size_t>()),
+				selected->name.c_str(), static_cast<size_t>(result["count"].get<size_t>()),
 				static_cast<int>(truncated), static_cast<int>(parsed));
 			return tool_result_t::ok(result);
 		}

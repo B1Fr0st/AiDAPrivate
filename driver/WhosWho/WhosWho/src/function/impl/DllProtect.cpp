@@ -21,6 +21,7 @@ namespace dll_protection {
     static constexpr UINT64 DTB_ADDRESS_MASK = 0x000FFFFFFFFFF000ULL;
     static constexpr UINT64 DTB_MAX_PFN = 0x1000000ULL;
     static constexpr UINT32 EPROCESS_DIRECTORY_TABLE_BASE_OFFSET = 0x28;
+    static constexpr ULONG DPRT_REASON_FOREIGN_INSTRUMENTATION = 0xAE46u;
 
     struct protection_entry_t {
         volatile LONG active;
@@ -312,11 +313,33 @@ namespace dll_protection {
         return DPRT_MISMATCH_UNKNOWN;
     }
 
+    static void publish_bridge_command(ULONG cmd, ULONG param)
+    {
+        sentinel_bridge::bridge_encrypt_cmd(cmd, param);
+        _InterlockedExchange(
+            reinterpret_cast<volatile LONG*>(&sentinel_bridge::g_bridge.sentinel_cmd),
+            static_cast<LONG>(cmd));
+        _InterlockedExchange(
+            reinterpret_cast<volatile LONG*>(&sentinel_bridge::g_bridge.sentinel_cmd_param),
+            static_cast<LONG>(param));
+    }
+
+    static void publish_re_evidence(ULONG reason, ULONG family, ULONG score, ULONG pid,
+                                    ULONG64 image_hash, ULONG64 bitmap, ULONG64 siphash)
+    {
+        sentinel_bridge::populate_evidence_blob(family, reason, score, pid, image_hash, bitmap, siphash);
+        publish_bridge_command(sentinel_bridge::BRIDGE_CMD_RE_EVIDENCE, reason);
+    }
+
     static void publish_text_integrity_evidence(const protection_entry_t& slot)
     {
-        UNREFERENCED_PARAMETER(slot);
-        sentinel_bridge::g_bridge.sentinel_cmd = sentinel_bridge::BRIDGE_CMD_RE_EVIDENCE;
-        sentinel_bridge::g_bridge.sentinel_cmd_param = sentinel_bridge::RE_REASON_TEXT_WRITABLE;
+        publish_re_evidence(sentinel_bridge::RE_REASON_TEXT_WRITABLE,
+            sentinel_bridge::EVIDENCE_FAMILY_INTEGRITY,
+            100,
+            slot.pid,
+            slot.module_base,
+            slot.text_va,
+            slot.expected_hash ^ slot.current_hash);
     }
 
     static void reset_slot(protection_entry_t& slot)
@@ -1020,8 +1043,15 @@ namespace dll_protection {
             if (check_debug_port_eprocess(slot.pid, &debug_port)) {
                 UINT32 port_tag = static_cast<UINT32>((debug_port >> 32) ^ debug_port ^ 0x0A1DADBAu);
                 WW_LOG("[DLL-PROTECT] pid=%u debug_port_present tag=0x%08X", slot.pid, port_tag);
-                sentinel_bridge::g_bridge.sentinel_cmd = sentinel_bridge::BRIDGE_CMD_DEBUGGER_FOUND;
-                sentinel_bridge::g_bridge.sentinel_cmd_param = port_tag;
+                sentinel_bridge::populate_evidence_blob(
+                    sentinel_bridge::EVIDENCE_FAMILY_DEBUG,
+                    sentinel_bridge::RE_REASON_DEBUG_ATTACH,
+                    100,
+                    slot.pid,
+                    0,
+                    0,
+                    port_tag);
+                publish_bridge_command(sentinel_bridge::BRIDGE_CMD_DEBUGGER_FOUND, port_tag);
             }
 
 
@@ -1065,9 +1095,14 @@ namespace dll_protection {
                 WW_LOG("[DLL-PROTECT] pid=%u check_foreign_instrumentation=%d cb_present=%u cb_tag=0x%08X",
                     slot.pid, has_instr ? 1 : 0, instr_cb != 0 ? 1u : 0u, instr_tag);
                 if (has_instr) {
-                    WW_LOG("[DLL-PROTECT] pid=%u FOREIGN_INSTR_CB triggering BRIDGE_CMD_DEBUGGER_FOUND cb_tag=0x%08X", slot.pid, instr_tag);
-                    sentinel_bridge::g_bridge.sentinel_cmd = sentinel_bridge::BRIDGE_CMD_DEBUGGER_FOUND;
-                    sentinel_bridge::g_bridge.sentinel_cmd_param = (ULONG)(instr_cb & 0xFFFFFFFFu);
+                    WW_LOG("[DLL-PROTECT] pid=%u foreign_instr_cb_observed reason=0x%08X cb_tag=0x%08X", slot.pid, DPRT_REASON_FOREIGN_INSTRUMENTATION, instr_tag);
+                    publish_re_evidence(DPRT_REASON_FOREIGN_INSTRUMENTATION,
+                        sentinel_bridge::EVIDENCE_FAMILY_SIDECHANNEL,
+                        35,
+                        slot.pid,
+                        0,
+                        static_cast<ULONG64>(instr_cb),
+                        instr_tag);
                 }
             }
 

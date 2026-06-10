@@ -1,10 +1,15 @@
 #include "test_lab.hpp"
 #include "test_lab_format.hpp"
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include "../../../../../driver/comm.h"
 #include "imgui/imgui.h"
 
+#pragma comment(lib, "ws2_32.lib")
+
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -46,6 +51,12 @@ namespace {
 	std::string format_dec_u64(std::uint64_t v) {
 		char buf[32];
 		std::snprintf(buf, sizeof(buf), "%llu", static_cast<unsigned long long>(v));
+		return std::string(buf);
+	}
+
+	std::string format_dec_i32(std::int32_t v) {
+		char buf[16];
+		std::snprintf(buf, sizeof(buf), "%d", v);
 		return std::string(buf);
 	}
 
@@ -148,6 +159,162 @@ namespace {
 		return true;
 	}
 
+	BOOL CALLBACK init_netq_winsock_once(PINIT_ONCE, PVOID parameter, PVOID*) {
+		bool* ok = static_cast<bool*>(parameter);
+		WSADATA d{};
+		*ok = (WSAStartup(MAKEWORD(2, 2), &d) == 0);
+		return TRUE;
+	}
+
+	bool ensure_netq_winsock_ready() {
+		static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+		static bool ok = false;
+		if (!InitOnceExecuteOnce(&once, init_netq_winsock_once, &ok, nullptr))
+			return false;
+		return ok;
+	}
+
+	void configure_loopback_socket(SOCKET s) {
+		DWORD timeout_ms = 750u;
+		setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+		setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+		BOOL nodelay = TRUE;
+		setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
+	}
+
+	struct loopback_tcp_fixture_t {
+		SOCKET listener = INVALID_SOCKET;
+		SOCKET client = INVALID_SOCKET;
+		SOCKET accepted = INVALID_SOCKET;
+		std::uint32_t listen_port = 0;
+		std::uint32_t client_port = 0;
+		int setup_wsa_error = 0;
+		int send_error = 0;
+		int recv_error = 0;
+		int sent_bytes = 0;
+		int recv_bytes = 0;
+		int response_sent_bytes = 0;
+		int response_recv_bytes = 0;
+
+		void close() {
+			if (client != INVALID_SOCKET) {
+				closesocket(client);
+				client = INVALID_SOCKET;
+			}
+			if (accepted != INVALID_SOCKET) {
+				closesocket(accepted);
+				accepted = INVALID_SOCKET;
+			}
+			if (listener != INVALID_SOCKET) {
+				closesocket(listener);
+				listener = INVALID_SOCKET;
+			}
+		}
+
+		~loopback_tcp_fixture_t() {
+			close();
+		}
+	};
+
+	bool open_loopback_tcp_fixture(loopback_tcp_fixture_t& fx, std::string& diag) {
+		fx.close();
+		fx.listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+		if (fx.listener == INVALID_SOCKET) {
+			fx.setup_wsa_error = WSAGetLastError();
+			diag = "listener socket failed";
+			return false;
+		}
+		configure_loopback_socket(fx.listener);
+		sockaddr_in bind_addr{};
+		bind_addr.sin_family = AF_INET;
+		bind_addr.sin_port = 0;
+		bind_addr.sin_addr.s_addr = htonl(0x7f000001u);
+		if (bind(fx.listener, reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr)) == SOCKET_ERROR) {
+			fx.setup_wsa_error = WSAGetLastError();
+			diag = "bind failed";
+			return false;
+		}
+		if (listen(fx.listener, 1) == SOCKET_ERROR) {
+			fx.setup_wsa_error = WSAGetLastError();
+			diag = "listen failed";
+			return false;
+		}
+		int name_len = sizeof(bind_addr);
+		if (getsockname(fx.listener, reinterpret_cast<sockaddr*>(&bind_addr), &name_len) == SOCKET_ERROR) {
+			fx.setup_wsa_error = WSAGetLastError();
+			diag = "getsockname listener failed";
+			return false;
+		}
+		fx.listen_port = ntohs(bind_addr.sin_port);
+		fx.client = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+		if (fx.client == INVALID_SOCKET) {
+			fx.setup_wsa_error = WSAGetLastError();
+			diag = "client socket failed";
+			return false;
+		}
+		configure_loopback_socket(fx.client);
+		if (connect(fx.client, reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr)) == SOCKET_ERROR) {
+			fx.setup_wsa_error = WSAGetLastError();
+			diag = "connect failed";
+			return false;
+		}
+		fx.accepted = accept(fx.listener, nullptr, nullptr);
+		if (fx.accepted == INVALID_SOCKET) {
+			fx.setup_wsa_error = WSAGetLastError();
+			diag = "accept failed";
+			return false;
+		}
+		configure_loopback_socket(fx.accepted);
+		sockaddr_in client_addr{};
+		int client_len = sizeof(client_addr);
+		if (getsockname(fx.client, reinterpret_cast<sockaddr*>(&client_addr), &client_len) == 0) {
+			fx.client_port = ntohs(client_addr.sin_port);
+		}
+		closesocket(fx.listener);
+		fx.listener = INVALID_SOCKET;
+		diag = "loopback connected";
+		return true;
+	}
+
+	bool emit_loopback_http(loopback_tcp_fixture_t& fx, const char* marker) {
+		char payload[256];
+		std::snprintf(payload, sizeof(payload),
+			"GET /aida-testlab-%s HTTP/1.1\r\nHost: aida.testlab\r\nConnection: close\r\nUser-Agent: AiDA-TestLab\r\n\r\n",
+			marker ? marker : "probe");
+		fx.sent_bytes = send(fx.client, payload, static_cast<int>(std::strlen(payload)), 0);
+		fx.send_error = (fx.sent_bytes == SOCKET_ERROR) ? WSAGetLastError() : 0;
+		if (fx.sent_bytes == SOCKET_ERROR)
+			return false;
+		char recv_buf[256];
+		fx.recv_bytes = recv(fx.accepted, recv_buf, sizeof(recv_buf), 0);
+		fx.recv_error = (fx.recv_bytes == SOCKET_ERROR) ? WSAGetLastError() : 0;
+		if (fx.recv_bytes > 0) {
+			const char response[] = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+			fx.response_sent_bytes = send(fx.accepted, response, static_cast<int>(sizeof(response) - 1), 0);
+			char response_buf[128];
+			fx.response_recv_bytes = recv(fx.client, response_buf, sizeof(response_buf), 0);
+		}
+		return true;
+	}
+
+	void append_loopback_fields(test_lab::result_t& r, const loopback_tcp_fixture_t& fx, const char* prefix) {
+		char label[64];
+		std::snprintf(label, sizeof(label), "%s_listen_port", prefix);
+		r.parsed.push_back({ label, format_dec_u32(fx.listen_port) });
+		std::snprintf(label, sizeof(label), "%s_client_port", prefix);
+		r.parsed.push_back({ label, format_dec_u32(fx.client_port) });
+		std::snprintf(label, sizeof(label), "%s_setup_wsa_error", prefix);
+		r.parsed.push_back({ label, format_dec_i32(fx.setup_wsa_error) });
+		std::snprintf(label, sizeof(label), "%s_sent_bytes", prefix);
+		r.parsed.push_back({ label, format_dec_i32(fx.sent_bytes) });
+		std::snprintf(label, sizeof(label), "%s_send_error", prefix);
+		r.parsed.push_back({ label, format_dec_i32(fx.send_error) });
+		std::snprintf(label, sizeof(label), "%s_recv_bytes", prefix);
+		r.parsed.push_back({ label, format_dec_i32(fx.recv_bytes) });
+		std::snprintf(label, sizeof(label), "%s_recv_error", prefix);
+		r.parsed.push_back({ label, format_dec_i32(fx.recv_error) });
+	}
+
 	void render_inputs_ncon(test_lab::state_t& s) {
 		const char* items[] = { "All", "TCP only", "UDP only" };
 		int cur = static_cast<int>(s.u32_a);
@@ -244,9 +411,68 @@ namespace {
 
 	void run_ncpg(test_lab::state_t& s, test_lab::result_t& r) {
 		if (!ensure_driver(r)) return;
+		if (!ensure_netq_winsock_ready()) {
+			r.ok = false;
+			r.error = "WSAStartup failed before NCPG stimulus";
+			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
+			return;
+		}
+		const std::uint32_t self_pid = static_cast<std::uint32_t>(GetCurrentProcessId());
+		r.parsed.push_back({ "requested_pid_filter", format_dec_u32(s.pid) });
+		r.parsed.push_back({ "stimulus_pid", format_dec_u32(self_pid) });
+		voyager::detail::net_cap_ctrl_request start_req{};
+		start_req.operation = 0u;
+		start_req.filter_pid = self_pid;
+		start_req.filter_protocol = 6u;
+		start_req.max_packet_bytes = 1500u;
+		std::uint32_t start_bytes = 0;
+		bool start_ok = device->send_ioctl_raw(ioctl_codes::NCAP(), &start_req,
+			static_cast<std::uint32_t>(sizeof(start_req)), start_bytes);
+		r.parsed.push_back({ "capture_start_ok", start_ok ? "1" : "0" });
+		r.parsed.push_back({ "capture_start_bytes", format_dec_u32(start_bytes) });
+		r.parsed.push_back({ "capture_active_after_start", format_dec_u32(start_req.capture_active) });
+		if (!start_ok) {
+			r.ok = false;
+			r.error = "NCAP start failed before NCPG deterministic stimulus";
+			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
+			return;
+		}
+		auto stop_capture = [&]() {
+			voyager::detail::net_cap_ctrl_request stop_req{};
+			stop_req.operation = 1u;
+			stop_req.filter_pid = self_pid;
+			stop_req.filter_protocol = 6u;
+			stop_req.max_packet_bytes = 1500u;
+			std::uint32_t stop_bytes = 0;
+			bool stop_ok = device->send_ioctl_raw(ioctl_codes::NCAP(), &stop_req,
+				static_cast<std::uint32_t>(sizeof(stop_req)), stop_bytes);
+			r.parsed.push_back({ "capture_stop_ok", stop_ok ? "1" : "0" });
+			r.parsed.push_back({ "capture_stop_bytes", format_dec_u32(stop_bytes) });
+			r.parsed.push_back({ "capture_packets_captured", format_dec_u32(stop_req.packets_captured) });
+			r.parsed.push_back({ "capture_packets_dropped", format_dec_u32(stop_req.packets_dropped) });
+		};
+		loopback_tcp_fixture_t fx;
+		std::string fixture_diag;
+		bool fixture_ok = open_loopback_tcp_fixture(fx, fixture_diag);
+		r.parsed.push_back({ "loopback_fixture_ok", fixture_ok ? "1" : "0" });
+		r.parsed.push_back({ "loopback_fixture_diag", fixture_diag });
+		append_loopback_fields(r, fx, "loopback_before_send");
+		if (!fixture_ok) {
+			stop_capture();
+			r.ok = false;
+			r.error = "loopback TCP fixture failed before NCPG query";
+			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
+			return;
+		}
+		Sleep(80);
+		bool traffic_ok = emit_loopback_http(fx, "ncpg");
+		r.parsed.push_back({ "loopback_traffic_ok", traffic_ok ? "1" : "0" });
+		append_loopback_fields(r, fx, "loopback_after_send");
+		Sleep(250);
 		voyager::detail::net_cap_get_request* req =
 			static_cast<voyager::detail::net_cap_get_request*>(std::calloc(1, sizeof(voyager::detail::net_cap_get_request)));
 		if (req == nullptr) {
+			stop_capture();
 			r.ok = false;
 			r.error = "calloc failed for net_cap_get_request";
 			r.ntstatus = static_cast<std::int32_t>(0xC000009Au);
@@ -261,13 +487,20 @@ namespace {
 		r.bytes_returned = bytes_returned;
 		if (!ok) {
 			set_fail_from_ioctl(r, bytes_returned);
+			stop_capture();
 			std::free(req);
 			return;
 		}
 		r.parsed.push_back({ "packet_count", format_dec_u32(req->packet_count) });
-		const std::uint32_t cap = (req->packet_count > 50u) ? 50u : req->packet_count;
+		std::uint32_t matching_self_pid = 0u;
+		std::uint32_t cap = req->packet_count;
+		if (cap > static_cast<std::uint32_t>(voyager::detail::NET_CAP_GET_MAX))
+			cap = static_cast<std::uint32_t>(voyager::detail::NET_CAP_GET_MAX);
+		if (cap > 50u) cap = 50u;
 		for (std::uint32_t i = 0; i < cap; ++i) {
 			const auto& p = req->packets[i];
+			if (p.pid == self_pid)
+				++matching_self_pid;
 			char label[24];
 			std::snprintf(label, sizeof(label), "Pkt[%u]", i);
 			char val[512];
@@ -283,6 +516,16 @@ namespace {
 				p.payload_size,
 				p.pid);
 			r.parsed.push_back({ std::string(label), std::string(val) });
+		}
+		r.parsed.push_back({ "packets_matching_self_pid", format_dec_u32(matching_self_pid) });
+		stop_capture();
+		if (req->packet_count == 0u || matching_self_pid == 0u) {
+			r.ok = false;
+			r.error = "NCPG did not return a self-PID packet after NCAP self-PID start and loopback HTTP stimulus";
+			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
+			r.parsed.push_back({ "recommendation", "Verify WFP capture stores loopback/self PID packets in net_capture ring before NCPG drains captured packets" });
+			std::free(req);
+			return;
 		}
 		r.ntstatus = 0;
 		r.ok = true;
@@ -364,6 +607,73 @@ namespace {
 
 	void run_nflt(test_lab::state_t& s, test_lab::result_t& r) {
 		if (!ensure_driver(r)) return;
+		if (s.u32_a == 3u) {
+			voyager::detail::net_filter_rule_request seed{};
+			seed.operation = 0u;
+			seed.action = 1u;
+			seed.direction = 2u;
+			seed.protocol = 6u;
+			seed.pid = static_cast<std::uint32_t>(GetCurrentProcessId());
+			std::uint32_t seed_bytes = 0;
+			bool seed_ok = device->send_ioctl_raw(ioctl_codes::NFLT(), &seed,
+				static_cast<std::uint32_t>(sizeof(seed)), seed_bytes);
+			r.parsed.push_back({ "seed_add_ok", seed_ok ? "1" : "0" });
+			r.parsed.push_back({ "seed_add_bytes", format_dec_u32(seed_bytes) });
+			r.parsed.push_back({ "seed_rule_id", format_dec_u32(seed.rule_id) });
+			r.parsed.push_back({ "seed_rule_count", format_dec_u32(seed.rule_count) });
+			r.parsed.push_back({ "seed_action", format_dec_u32(seed.action) });
+			r.parsed.push_back({ "seed_direction", format_dec_u32(seed.direction) });
+			r.parsed.push_back({ "seed_protocol", format_dec_u32(seed.protocol) });
+			r.parsed.push_back({ "seed_pid", format_dec_u32(seed.pid) });
+			if (!seed_ok || seed.rule_id == 0u || seed.rule_count == 0u) {
+				r.ok = false;
+				r.error = "NFLT deterministic seed add failed before query-count";
+				r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
+				return;
+			}
+			voyager::detail::net_filter_rule_request query{};
+			query.operation = 3u;
+			std::uint32_t bytes_returned = 0;
+			bool ok = device->send_ioctl_raw(ioctl_codes::NFLT(), &query,
+				static_cast<std::uint32_t>(sizeof(query)), bytes_returned);
+			capture_raw_struct(r, &query, sizeof(query));
+			r.bytes_returned = bytes_returned;
+			voyager::detail::net_filter_rule_request del{};
+			del.operation = 1u;
+			del.rule_id = seed.rule_id;
+			std::uint32_t del_bytes = 0;
+			bool del_ok = device->send_ioctl_raw(ioctl_codes::NFLT(), &del,
+				static_cast<std::uint32_t>(sizeof(del)), del_bytes);
+			r.parsed.push_back({ "seed_delete_ok", del_ok ? "1" : "0" });
+			r.parsed.push_back({ "seed_delete_bytes", format_dec_u32(del_bytes) });
+			r.parsed.push_back({ "seed_delete_remaining", format_dec_u32(del.rule_count) });
+			if (!ok) {
+				set_fail_from_ioctl(r, bytes_returned);
+				return;
+			}
+			r.parsed.push_back({ "operation", format_dec_u32(3u) });
+			r.parsed.push_back({ "rule_id", format_dec_u32(seed.rule_id) });
+			r.parsed.push_back({ "rule_count", format_dec_u32(query.rule_count) });
+			r.parsed.push_back({ "action", format_dec_u32(seed.action) });
+			r.parsed.push_back({ "direction", format_dec_u32(seed.direction) });
+			r.parsed.push_back({ "protocol", format_dec_u32(seed.protocol) });
+			if (query.rule_count == 0u) {
+				r.ok = false;
+				r.error = "NFLT query-count did not observe the deterministic seed rule";
+				r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
+				r.parsed.push_back({ "recommendation", "Verify NFLT operation=3 reads the same active filter rule counter updated by operation=0 add" });
+				return;
+			}
+			if (!del_ok) {
+				r.ok = false;
+				r.error = "NFLT deterministic seed rule cleanup failed";
+				r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
+				return;
+			}
+			r.ntstatus = 0;
+			r.ok = true;
+			return;
+		}
 		voyager::detail::net_filter_rule_request req{};
 		req.operation = s.u32_a;
 		const char* p = s.text_a.c_str();
@@ -510,6 +820,27 @@ namespace {
 
 	void run_gskt(test_lab::state_t& s, test_lab::result_t& r) {
 		if (!ensure_driver(r)) return;
+		if (!ensure_netq_winsock_ready()) {
+			r.ok = false;
+			r.error = "WSAStartup failed before GSKT stimulus";
+			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
+			return;
+		}
+		const std::uint32_t self_pid = static_cast<std::uint32_t>(GetCurrentProcessId());
+		r.parsed.push_back({ "requested_pid_filter", format_dec_u32(s.pid) });
+		r.parsed.push_back({ "stimulus_pid", format_dec_u32(self_pid) });
+		loopback_tcp_fixture_t fx;
+		std::string fixture_diag;
+		bool fixture_ok = open_loopback_tcp_fixture(fx, fixture_diag);
+		r.parsed.push_back({ "loopback_fixture_ok", fixture_ok ? "1" : "0" });
+		r.parsed.push_back({ "loopback_fixture_diag", fixture_diag });
+		append_loopback_fields(r, fx, "loopback_before_query");
+		if (!fixture_ok) {
+			r.ok = false;
+			r.error = "loopback TCP fixture failed before GSKT query";
+			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
+			return;
+		}
 		voyager::detail::socket_handle_enum_request* req =
 			static_cast<voyager::detail::socket_handle_enum_request*>(std::calloc(1, sizeof(voyager::detail::socket_handle_enum_request)));
 		if (req == nullptr) {
@@ -518,7 +849,7 @@ namespace {
 			r.ntstatus = static_cast<std::int32_t>(0xC000009Au);
 			return;
 		}
-		req->target_pid = s.pid;
+		req->target_pid = self_pid;
 		std::uint32_t bytes_returned = 0;
 		bool ok = device->send_ioctl_raw(ioctl_codes::GSKT(), req, static_cast<std::uint32_t>(sizeof(*req)), bytes_returned);
 		capture_raw_struct(r, req, sizeof(*req));
@@ -548,6 +879,14 @@ namespace {
 				e.remote_port);
 			r.parsed.push_back({ std::string(label), std::string(val) });
 		}
+		if (req->socket_count == 0u) {
+			r.ok = false;
+			r.error = "GSKT returned zero while deterministic loopback sockets were open for current process";
+			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
+			r.parsed.push_back({ "recommendation", "Verify socket handle enumeration scans the current process handle table for AFD endpoints and preserves target_pid filtering" });
+			std::free(req);
+			return;
+		}
 		r.ntstatus = 0;
 		r.ok = true;
 		std::free(req);
@@ -560,9 +899,73 @@ namespace {
 
 	void run_snbf(test_lab::state_t& s, test_lab::result_t& r) {
 		if (!ensure_driver(r)) return;
+		voyager::detail::sniff_net_buffers_request baseline{};
+		baseline.operation = 2u;
+		baseline.max_captures = 1u;
+		std::uint32_t baseline_bytes = 0;
+		bool baseline_ok = device->send_ioctl_raw(ioctl_codes::SNBF(), &baseline,
+			static_cast<std::uint32_t>(sizeof(baseline)), baseline_bytes);
+		r.parsed.push_back({ "baseline_query_ok", baseline_ok ? "1" : "0" });
+		r.parsed.push_back({ "baseline_query_bytes", format_dec_u32(baseline_bytes) });
+		r.parsed.push_back({ "baseline_active", format_dec_u32(baseline.active) });
+		r.parsed.push_back({ "baseline_capture_count", format_dec_u32(baseline.capture_count) });
+		if (!baseline_ok) {
+			r.ok = false;
+			r.error = "SNBF baseline query failed before deterministic sniff stimulus";
+			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
+			return;
+		}
+		bool started_by_test = false;
+		if (baseline.active == 0u) {
+			voyager::detail::sniff_net_buffers_request start_req{};
+			start_req.operation = 0u;
+			start_req.max_captures = 4u;
+			start_req.target_tid = static_cast<std::uint32_t>(GetCurrentThreadId());
+			std::uint32_t start_bytes = 0;
+			bool start_ok = device->send_ioctl_raw(ioctl_codes::SNBF(), &start_req,
+				static_cast<std::uint32_t>(sizeof(start_req)), start_bytes);
+			r.parsed.push_back({ "sniff_start_ok", start_ok ? "1" : "0" });
+			r.parsed.push_back({ "sniff_start_bytes", format_dec_u32(start_bytes) });
+			r.parsed.push_back({ "sniff_active_after_start", format_dec_u32(start_req.active) });
+			r.parsed.push_back({ "sniff_start_capture_count", format_dec_u32(start_req.capture_count) });
+			if (!start_ok || start_req.active == 0u) {
+				r.ok = false;
+				r.error = "SNBF start failed before deterministic store/query";
+				r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
+				r.parsed.push_back({ "recommendation", "Verify SNBF operation=0 allocates a capture ring before operation=3 store is used by user-mode capture bridges" });
+				return;
+			}
+			started_by_test = true;
+		} else {
+			r.parsed.push_back({ "sniff_start_ok", "already_active" });
+		}
+		voyager::detail::sniff_net_buffers_request store_req{};
+		store_req.operation = 3u;
+		store_req.max_captures = 4u;
+		store_req.captures[0].timestamp = static_cast<std::uint64_t>(GetTickCount64());
+		store_req.captures[0].thread_id = static_cast<std::uint64_t>(GetCurrentThreadId());
+		const char sample[] = "AIDA_TESTLAB_SNBF_DETERMINISTIC_CAPTURE";
+		store_req.captures[0].buffer_size = static_cast<std::uint32_t>(sizeof(sample) - 1u);
+		std::memcpy(store_req.captures[0].buffer, sample, sizeof(sample) - 1u);
+		std::uint32_t store_bytes = 0;
+		bool store_ok = device->send_ioctl_raw(ioctl_codes::SNBF(), &store_req,
+			static_cast<std::uint32_t>(sizeof(store_req)), store_bytes);
+		r.parsed.push_back({ "sniff_store_ok", store_ok ? "1" : "0" });
+		r.parsed.push_back({ "sniff_store_bytes", format_dec_u32(store_bytes) });
+		r.parsed.push_back({ "sniff_store_active", format_dec_u32(store_req.active) });
+		r.parsed.push_back({ "sniff_store_capture_count", format_dec_u32(store_req.capture_count) });
+		bool store_advanced = store_ok && store_req.capture_count > baseline.capture_count;
+		r.parsed.push_back({ "sniff_store_advanced_count", store_advanced ? "1" : "0" });
 		voyager::detail::sniff_net_buffers_request* req =
 			static_cast<voyager::detail::sniff_net_buffers_request*>(std::calloc(1, sizeof(voyager::detail::sniff_net_buffers_request)));
 		if (req == nullptr) {
+			if (started_by_test) {
+				voyager::detail::sniff_net_buffers_request stop_req{};
+				stop_req.operation = 1u;
+				std::uint32_t stop_bytes = 0;
+				device->send_ioctl_raw(ioctl_codes::SNBF(), &stop_req,
+					static_cast<std::uint32_t>(sizeof(stop_req)), stop_bytes);
+			}
 			r.ok = false;
 			r.error = "calloc failed for sniff_net_buffers_request";
 			r.ntstatus = static_cast<std::int32_t>(0xC000009Au);
@@ -580,6 +983,15 @@ namespace {
 		r.bytes_returned = bytes_returned;
 		if (!ok) {
 			set_fail_from_ioctl(r, bytes_returned);
+			if (started_by_test) {
+				voyager::detail::sniff_net_buffers_request stop_req{};
+				stop_req.operation = 1u;
+				std::uint32_t stop_bytes = 0;
+				bool stop_ok = device->send_ioctl_raw(ioctl_codes::SNBF(), &stop_req,
+					static_cast<std::uint32_t>(sizeof(stop_req)), stop_bytes);
+				r.parsed.push_back({ "sniff_stop_ok", stop_ok ? "1" : "0" });
+				r.parsed.push_back({ "sniff_stop_bytes", format_dec_u32(stop_bytes) });
+			}
 			std::free(req);
 			return;
 		}
@@ -601,6 +1013,23 @@ namespace {
 				static_cast<unsigned long long>(c.thread_id),
 				c.buffer_size);
 			r.parsed.push_back({ std::string(label), std::string(val) });
+		}
+		if (started_by_test) {
+			voyager::detail::sniff_net_buffers_request stop_req{};
+			stop_req.operation = 1u;
+			std::uint32_t stop_bytes = 0;
+			bool stop_ok = device->send_ioctl_raw(ioctl_codes::SNBF(), &stop_req,
+				static_cast<std::uint32_t>(sizeof(stop_req)), stop_bytes);
+			r.parsed.push_back({ "sniff_stop_ok", stop_ok ? "1" : "0" });
+			r.parsed.push_back({ "sniff_stop_bytes", format_dec_u32(stop_bytes) });
+		}
+		if (!store_advanced || req->capture_count == 0u) {
+			r.ok = false;
+			r.error = "SNBF query did not include a newly stored deterministic capture";
+			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
+			r.parsed.push_back({ "recommendation", "Verify SNBF operation=3 stores into the active capture ring and operation=2 copies g_sniff_capture_count entries before cleanup" });
+			std::free(req);
+			return;
 		}
 		r.ntstatus = 0;
 		r.ok = true;

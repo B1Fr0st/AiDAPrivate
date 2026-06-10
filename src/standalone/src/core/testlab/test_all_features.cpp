@@ -909,10 +909,9 @@ namespace test_all_features {
 				return true;
 			}
 			if (std::strcmp(cat, "sentinel") == 0 && name_starts_with(feature, "Sentinel Tier-A Query")) {
-				if (!parsed_nonzero(r, "present_flag") ||
-					!parsed_nonzero(r, "tier_mask") ||
-					!parsed_nonzero(r, "first_driver_base")) {
-					reason = "sentinel_tier_a_presence_fields_zero_or_missing";
+				if (!parsed_nonzero(r, "hostile_driver_absent") &&
+					!parsed_nonzero(r, "absence_expected_healthy")) {
+					reason = "sentinel_tier_a_healthy_absence_marker_missing";
 					return true;
 				}
 			}

@@ -683,6 +683,7 @@ namespace detail
             L"csrss.exe",
             L"wininit.exe",
             L"services.exe",
+            L"svchost.exe",
             L"winlogon.exe",
             L"smss.exe"
         };

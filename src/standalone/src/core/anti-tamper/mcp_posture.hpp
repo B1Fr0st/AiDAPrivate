@@ -1247,6 +1247,15 @@ namespace anti_tamper::mcp_posture
             return canonical_lower_path(unquote_path_token(path)) == canonical_lower_path(unquote_path_token(value));
         }
 
+        inline bool is_aida_app_local_python_runtime_path(const std::string& path)
+        {
+            const std::string local = read_env("LOCALAPPDATA");
+            if (local.empty())
+                return false;
+            const std::string runtime_root = join_path_string(join_path_string(join_path_string(local, "AiDA"), "runtimes"), "python");
+            return !runtime_root.empty() && path_under_or_equal(path, runtime_root);
+        }
+
         inline std::vector<std::string> camoufox_trusted_runtime_roots()
         {
             std::vector<std::string> roots;
@@ -1275,6 +1284,8 @@ namespace anti_tamper::mcp_posture
             if (!std::filesystem::is_regular_file(command_path, ec) || ec)
                 return false;
             if (path_matches_env_path(command_path, "AIDA_CAMOUFOX_PYTHON"))
+                return true;
+            if (is_aida_app_local_python_runtime_path(command_path))
                 return true;
             static const char* runtime_dirs[] = {
                 "deps\\camoufox-runtime",

@@ -3871,12 +3871,17 @@ bool start_bridge(const launch_config_t& cfg)
 
     std::string python_path = effective_cfg.python_executable;
     const bool prefer_developer_python = should_prefer_developer_python_runtime(effective_cfg);
-    bool developer_python_ready = false;
+    std::string server_executable;
+    bool use_server_executable = resolve_reverse_mcp_executable(effective_cfg, server_executable);
+    bool developer_python_ready = !python_path.empty();
     lk.unlock();
-    if (prefer_developer_python && python_path.empty())
-        developer_python_ready = ensure_python_available(python_path);
-    else
-        developer_python_ready = !python_path.empty();
+    if (!use_server_executable)
+    {
+        if (prefer_developer_python && python_path.empty())
+            developer_python_ready = ensure_python_available(python_path);
+        else
+            developer_python_ready = !python_path.empty();
+    }
     lk.lock();
     if (sg().stop_epoch.load(std::memory_order_acquire) != start_stop_epoch)
     {
@@ -3888,10 +3893,6 @@ bool start_bridge(const launch_config_t& cfg)
         return false;
     }
 
-    std::string server_executable;
-    bool use_server_executable = false;
-    if (!(prefer_developer_python && developer_python_ready))
-        use_server_executable = resolve_reverse_mcp_executable(effective_cfg, server_executable);
     diag::log_tagged_fmt("camoufox", "start_bridge server_executable_resolve use_exe=%d prefer_python=%d python_ready=%d python=%s path=%s",
         static_cast<int>(use_server_executable),
         prefer_developer_python ? 1 : 0,
@@ -5174,16 +5175,16 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
     }
     std::string python_path = effective_cfg.python_executable;
     const bool prefer_developer_python = should_prefer_developer_python_runtime(effective_cfg);
-    bool developer_python_ready = false;
-    if (prefer_developer_python && python_path.empty())
-        developer_python_ready = ensure_python_available(python_path);
-    else
-        developer_python_ready = !python_path.empty();
-
     std::string server_executable;
-    bool use_server_executable = false;
-    if (!(prefer_developer_python && developer_python_ready))
-        use_server_executable = resolve_reverse_mcp_executable(effective_cfg, server_executable);
+    bool use_server_executable = resolve_reverse_mcp_executable(effective_cfg, server_executable);
+    bool developer_python_ready = !python_path.empty();
+    if (!use_server_executable)
+    {
+        if (prefer_developer_python && python_path.empty())
+            developer_python_ready = ensure_python_available(python_path);
+        else
+            developer_python_ready = !python_path.empty();
+    }
     diag::log_tagged_fmt("camoufox", "managed_start server_executable_resolve session_id=%s use_exe=%d prefer_python=%d python_ready=%d python=%s path=%s",
         sid.c_str(), static_cast<int>(use_server_executable),
         prefer_developer_python ? 1 : 0,
