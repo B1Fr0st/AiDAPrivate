@@ -10,6 +10,7 @@
 #include "match_replace.hpp"
 #include "auth_lab.hpp"
 
+#include "../../settings/standalone_compat.hpp"
 #include "../../../helpers/diag_log.hpp"
 
 #include <nlohmann/json.hpp>
@@ -206,55 +207,22 @@ tool_result_t handle_test(const json& params)
 void register_match_replace_tools(mcp_standalone::server_t& srv)
 {
     srv.register_tool({
-        "burp_match_replace_add",
-        "Add a match-and-replace rule applied to in-flight proxy exchanges. Target: request_url|request_headers|request_body|response_headers|response_body|all.",
-        {{"label", "string", "Rule label", false},
-         {"target", "string", "Match target", true},
-         {"match_regex", "string", "Regex or literal", true},
-         {"replacement", "string", "Replacement", false},
-         {"regex", "boolean", "Treat match as regex (default true)", false},
-         {"case_insensitive", "boolean", "Case insensitive (default false)", false},
-         {"host_filter", "string", "Optional host regex", false},
-         {"scheme_filter", "string", "Optional 'http' / 'https'", false}},
-        false, handle_add
-    });
-
-    srv.register_tool({
-        "burp_match_replace_update",
-        "Update an existing match-replace rule by id. 'fields' is a partial object of fields to overwrite.",
-        {{"rule_id", "number", "Rule id", true},
-         {"fields", "object", "Partial fields to update", true}},
-        false, handle_update
-    });
-
-    srv.register_tool({
-        "burp_match_replace_remove",
-        "Remove a match-replace rule by id.",
-        {{"rule_id", "number", "Rule id", true}},
-        false, handle_remove
-    });
-
-    srv.register_tool({
-        "burp_match_replace_list",
-        "List all match-replace rules.",
-        {},
-        true, handle_list
-    });
-
-    srv.register_tool({
-        "burp_match_replace_clear",
-        "Remove all match-replace rules.",
-        {},
-        false, handle_clear
-    });
-
-    srv.register_tool({
-        "burp_match_replace_test",
-        "Apply a rule to a base64-encoded sample and return the modified text.",
-        {{"target", "string", "Match target (kept for parity)", true},
-         {"sample_b64", "string", "Base64 sample", true},
-         {"rule_id", "number", "Rule id to test", true}},
-        true, handle_test
+        "burp_match_replace_manage",
+        "Manage proxy match-and-replace rules. Actions: add, update, remove, list, clear, test.",
+        {{"action", "string", "add|update|remove|list|clear|test", true},
+         {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted.", false}},
+        false,
+        [](const json& params) -> tool_result_t {
+            const std::string action = compat_action_name(params);
+            const json p = compat_action_payload(params);
+            if (action == "add") return handle_add(p);
+            if (action == "update") return handle_update(p);
+            if (action == "remove") return handle_remove(p);
+            if (action == "list") return handle_list(p);
+            if (action == "clear") return handle_clear(p);
+            if (action == "test") return handle_test(p);
+            return compat_unknown_action("burp_match_replace_manage", action);
+        }
     });
 }
 

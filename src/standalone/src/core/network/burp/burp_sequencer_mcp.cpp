@@ -259,67 +259,23 @@ tool_result_t handle_delete(const json& p)
 void register_sequencer_tools(mcp_standalone::server_t& srv)
 {
     register_compat(srv, {
-        "burp_sequencer_start_collection", "burp",
-        "Start a Burp-style Sequencer collection: repeatedly send an HTTP request to the target URL and extract a token "
-        "from each response via regex. Tokens accumulate into a sample set used for entropy/randomness analysis "
-        "(FIPS 140-2, NIST SP 800-22 monobit / poker / runs / long-run / Maurer's universal).",
-        {{"url",            "string",  "Target URL (full https://... or path)", false},
-         {"raw_request_b64","string",  "Optional base64 raw HTTP/1.1 request body bytes to use instead of GET", false},
-         {"use_tls",        "boolean", "Use TLS (default true)", false},
-         {"host",           "string",  "Host override (used when url empty)", false},
-         {"port",           "number",  "Port (default 443 / 80)", false},
-         {"extract_regex",  "string",  "ECMAScript regex applied to response body and headers; capture_group=1 by default", true},
-         {"capture_group",  "number",  "Regex capture group index", false},
-         {"target_count",   "number",  "Target number of tokens (default 200)", false},
-         {"concurrency",    "number",  "In-flight request concurrency (default 4)", false},
-         {"throttle_ms",    "number",  "Per-request throttle delay in ms", false},
-         {"name",           "string",  "Human-readable label", false}},
-        handle_start, false
-    });
-
-    register_compat(srv, {
-        "burp_sequencer_status", "burp",
-        "Get the current state of a sequencer collection (collected/target counts, running flag, error message).",
-        {{"collection_id", "number", "Sequencer collection id", true}},
-        handle_status, true
-    });
-
-    register_compat(srv, {
-        "burp_sequencer_stop", "burp",
-        "Request a sequencer collection to stop. Already in-flight requests are allowed to complete.",
-        {{"collection_id", "number", "Sequencer collection id", true}},
-        handle_stop, false
-    });
-
-    register_compat(srv, {
-        "burp_sequencer_samples", "burp",
-        "Retrieve the captured tokens for inspection or external analysis.",
-        {{"collection_id", "number", "Sequencer collection id", true},
-         {"max",           "number", "Limit to last N tokens (0 = all)", false}},
-        handle_samples, true
-    });
-
-    register_compat(srv, {
-        "burp_sequencer_analyze", "burp",
-        "Run full entropy/randomness analysis over the captured tokens: Shannon entropy, chi-square, FIPS 140-2 monobit, "
-        "NIST SP 800-22 (monobit, poker, runs, long-run, Maurer's universal), lag-1 autocorrelation, per-byte position bias, "
-        "byte-frequency histogram, and a verdict ('Excellent / Good / Adequate / Poor').",
-        {{"collection_id", "number", "Sequencer collection id", true}},
-        handle_analyze, true
-    });
-
-    register_compat(srv, {
-        "burp_sequencer_list_collections", "burp",
-        "List every Sequencer collection currently tracked, with progress and state.",
-        {},
-        handle_list, true
-    });
-
-    register_compat(srv, {
-        "burp_sequencer_delete", "burp",
-        "Stop and remove a Sequencer collection.",
-        {{"collection_id", "number", "Sequencer collection id", true}},
-        handle_delete, false
+        "burp_sequencer_manage", "burp",
+        "Manage Sequencer token collection and entropy analysis. Actions: start_collection, status, stop, samples, analyze, list_collections, delete.",
+        {{"action", "string", "start_collection|status|stop|samples|analyze|list_collections|delete", true},
+         {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted.", false}},
+        [](const json& params) -> tool_result_t {
+            const std::string action = compat_action_name(params);
+            const json p = compat_action_payload(params);
+            if (action == "start_collection") return handle_start(p);
+            if (action == "status") return handle_status(p);
+            if (action == "stop") return handle_stop(p);
+            if (action == "samples") return handle_samples(p);
+            if (action == "analyze") return handle_analyze(p);
+            if (action == "list_collections") return handle_list(p);
+            if (action == "delete") return handle_delete(p);
+            return compat_unknown_action("burp_sequencer_manage", action);
+        },
+        false
     });
 }
 

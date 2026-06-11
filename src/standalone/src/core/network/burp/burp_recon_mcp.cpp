@@ -450,134 +450,53 @@ void register_recon_tools(mcp_standalone::server_t& srv)
     payloads::initialize();
 
     register_compat(srv, {
-        "burp_crawler_start", "burp",
-        "Start a recursive web crawler that ingests pages, extracts links from HTML and JS, "
-        "and publishes each fetched exchange to the Burp event bus.",
-        {
-            {"start_urls", "array", "Seed URLs (strings).", true},
-            {"max_depth", "number", "Max crawl depth (default 3).", false},
-            {"same_host_only", "boolean", "Restrict to seed host (default true).", false},
-            {"scope_only", "boolean", "Restrict to URLs inside Burp scope (default false).", false},
-            {"parse_js", "boolean", "Extract URLs from JS regex pass (default true).", false},
-            {"max_pages", "number", "Stop after N pages (default 500).", false},
-            {"concurrency", "number", "Parallel workers (default 8).", false},
-            {"rate_per_host", "number", "Per-host RPS cap (default 10).", false},
-            {"respect_robots", "boolean", "Honour robots.txt (default true).", false},
-            {"user_agent", "string", "User-Agent header.", false},
-            {"exclude_extensions", "array", "Skip URLs ending with any of these strings.", false},
-            {"exclude_patterns", "array", "Skip URLs matching any regex.", false},
+        "burp_crawler_manage", "burp",
+        "Manage recursive crawl jobs. Actions: start, status, stop, list.",
+        {{"action", "string", "start|status|stop|list", true},
+         {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted.", false}},
+        [](const json& params) -> tool_result_t {
+            const std::string action = compat_action_name(params);
+            const json p = compat_action_payload(params);
+            if (action == "start") return crawler_start(p);
+            if (action == "status") return crawler_status_(p);
+            if (action == "stop") return crawler_stop_(p);
+            if (action == "list") return crawler_list_(p);
+            return compat_unknown_action("burp_crawler_manage", action);
         },
-        crawler_start, false
+        false
     });
 
     register_compat(srv, {
-        "burp_crawler_status", "burp",
-        "Return progress and discovered URLs for a running or finished crawl.",
-        {
-            {"crawl_id", "number", "ID returned by burp_crawler_start.", true},
-            {"max_urls", "number", "Cap urls included (default 200).", false},
+        "burp_content_discovery_manage", "burp",
+        "Manage directory and file discovery jobs. Actions: start, status, results, stop.",
+        {{"action", "string", "start|status|results|stop", true},
+         {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted.", false}},
+        [](const json& params) -> tool_result_t {
+            const std::string action = compat_action_name(params);
+            const json p = compat_action_payload(params);
+            if (action == "start") return cd_start(p);
+            if (action == "status") return cd_status_(p);
+            if (action == "results") return cd_results_(p);
+            if (action == "stop") return cd_stop_(p);
+            return compat_unknown_action("burp_content_discovery_manage", action);
         },
-        crawler_status_, true
+        false
     });
 
     register_compat(srv, {
-        "burp_crawler_stop", "burp",
-        "Request graceful shutdown of an active crawl.",
-        {{"crawl_id", "number", "ID returned by burp_crawler_start.", true}},
-        crawler_stop_, false
-    });
-
-    register_compat(srv, {
-        "burp_crawler_list", "burp",
-        "List all active and recent crawls.",
-        {},
-        crawler_list_, true
-    });
-
-    register_compat(srv, {
-        "burp_content_discovery_start", "burp",
-        "ffuf-style directory and file brute force. Replaces the FUZZ marker in target_url with each "
-        "wordlist entry and reports hits.",
-        {
-            {"target_url", "string", "URL with FUZZ marker (path, query, header).", true},
-            {"wordlist_id", "string", "Payload library set id (default dirs/common-100).", false},
-            {"wordlist_file", "string", "Path to wordlist file (newline-separated).", false},
-            {"extensions", "array", "Extensions to append (.php, .bak, ...).", false},
-            {"concurrency", "number", "Parallel requests (default 25).", false},
-            {"delay_ms", "number", "Inter-request delay per worker.", false},
-            {"match_status", "array", "Status codes counted as hits (default 200,201,204,301,302,401,403,500).", false},
-            {"filter_status", "array", "Status codes ignored.", false},
-            {"filter_size_min", "number", "Filter response bodies whose size >= this.", false},
-            {"filter_size_max", "number", "Filter response bodies whose size <= this.", false},
-            {"filter_words_regex", "string", "Regex on body; matched responses filtered.", false},
-            {"recurse", "boolean", "Recurse into hits as new bases.", false},
-            {"recurse_depth", "number", "Max recursion depth (default 1).", false},
-            {"method", "string", "HTTP method (default GET).", false},
-            {"cookie", "string", "Cookie header value.", false},
-            {"user_agent", "string", "User-Agent header.", false},
-            {"follow_redirects", "boolean", "Follow Location: redirects.", false},
-            {"auto_calibrate", "boolean", "Detect and filter soft-404 page size (default true).", false},
-            {"extra_headers", "object", "Additional headers (name -> value).", false},
+        "burp_subdomain_enum_manage", "burp",
+        "Manage passive and brute-force subdomain enumeration jobs. Actions: start, status, results.",
+        {{"action", "string", "start|status|results", true},
+         {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted.", false}},
+        [](const json& params) -> tool_result_t {
+            const std::string action = compat_action_name(params);
+            const json p = compat_action_payload(params);
+            if (action == "start") return sub_start(p);
+            if (action == "status") return sub_status_(p);
+            if (action == "results") return sub_results_(p);
+            return compat_unknown_action("burp_subdomain_enum_manage", action);
         },
-        cd_start, false
-    });
-
-    register_compat(srv, {
-        "burp_content_discovery_status", "burp",
-        "Return counters and calibration data for a discovery run.",
-        {{"disc_id", "number", "ID returned by burp_content_discovery_start.", true}},
-        cd_status_, true
-    });
-
-    register_compat(srv, {
-        "burp_content_discovery_results", "burp",
-        "Return discovered hits (filtered by match/filter status and size range).",
-        {
-            {"disc_id", "number", "ID returned by burp_content_discovery_start.", true},
-            {"max_results", "number", "Cap returned hits (default 500).", false},
-        },
-        cd_results_, true
-    });
-
-    register_compat(srv, {
-        "burp_content_discovery_stop", "burp",
-        "Request graceful shutdown of an active discovery run.",
-        {{"disc_id", "number", "ID returned by burp_content_discovery_start.", true}},
-        cd_stop_, false
-    });
-
-    register_compat(srv, {
-        "burp_subdomain_enum_start", "burp",
-        "Run passive subdomain sources (crt.sh, bufferover, hackertarget) and optional brute-force DNS resolution.",
-        {
-            {"domain", "string", "Apex domain (example.com).", true},
-            {"brute_wordlist_id", "string", "Payload library set id (default subdomains/top1000).", false},
-            {"brute_wordlist_file", "string", "Path to wordlist file.", false},
-            {"sources", "array", "Passive sources to use (crt.sh, bufferover, hackertarget).", false},
-            {"run_passive", "boolean", "Enable passive sources (default true).", false},
-            {"run_brute", "boolean", "Enable brute resolution (default true).", false},
-            {"concurrency", "number", "Resolver concurrency (default 32).", false},
-            {"bypass_dns_cache", "boolean", "Use DNS_QUERY_BYPASS_CACHE (default true).", false},
-            {"user_agent", "string", "User-Agent for passive HTTP calls.", false},
-        },
-        sub_start, false
-    });
-
-    register_compat(srv, {
-        "burp_subdomain_enum_status", "burp",
-        "Return counters for a subdomain enumeration run.",
-        {{"sub_id", "number", "ID returned by burp_subdomain_enum_start.", true}},
-        sub_status_, true
-    });
-
-    register_compat(srv, {
-        "burp_subdomain_enum_results", "burp",
-        "Return discovered subdomains with sources and resolved IPs.",
-        {
-            {"sub_id", "number", "ID returned by burp_subdomain_enum_start.", true},
-            {"max_results", "number", "Cap returned entries (default 1000).", false},
-        },
-        sub_results_, true
+        false
     });
 
     register_compat(srv, {

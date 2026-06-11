@@ -133,7 +133,7 @@ static std::string extract_ascii(const std::uint8_t* data, std::size_t len, std:
 tool_result_t network_enumerate_connections(const json& params)
 {
     if (!driver_bridge::using_kernel_driver())
-        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_load first."));
+        return tool_result_t::error(OBFSTR("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
 
     std::uint32_t filter_pid = 0, filter_protocol = 0;
     if (params.contains("pid") && params["pid"].is_number())
@@ -172,7 +172,7 @@ tool_result_t network_start_capture(const json& params)
 {
     diag::log_tagged_fmt("net_tools", "network_start_capture entry");
     if (!driver_bridge::using_kernel_driver())
-        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_load first."));
+        return tool_result_t::error(OBFSTR("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
 
     std::uint32_t filter_pid = 0, filter_port = 0, filter_protocol = 0, max_payload = 1500;
     std::uint8_t filter_ip[16] = {};
@@ -387,8 +387,11 @@ tool_result_t network_add_filter(const json& params)
     std::uint32_t protocol = 0, pid = 0, port = 0;
     std::uint8_t ip_addr[16] = {}, ip_mask[16] = {};
 
-    if (params.contains("action") && params["action"].is_string()) {
-        std::string a = params["action"].get<std::string>();
+    const char* filter_action_key = params.contains("filter_action") && params["filter_action"].is_string()
+        ? "filter_action"
+        : "action";
+    if (params.contains(filter_action_key) && params[filter_action_key].is_string()) {
+        std::string a = params[filter_action_key].get<std::string>();
         if (a == "allow") action = 0;
         else if (a == "block") action = 1;
         else if (a == "log") action = 2;
@@ -1899,43 +1902,22 @@ void register_network_tools(mcp_standalone::server_t& srv) {
     diag::log_tagged("net_tools", "register_network_tools entry");
         aida::burp::register_all_tools(srv);
 
-        register_compat(srv, {
-        OBFSTR("network_enumerate_connections"), OBFSTR("network"),
-        OBFSTR("Enumerate all active TCP/UDP connections on the system via kernel driver. "
-               "Returns PID, protocol, state, local/remote addresses and ports. "
-               "Like netstat but kernel-level - invisible to usermode hooks. "
-               "Optionally filter by PID or protocol."),
-        {{OBFSTR("pid"), OBFSTR("number"), OBFSTR("Filter connections by process ID"), false},
-         {OBFSTR("protocol"), OBFSTR("string"), OBFSTR("Filter by protocol: 'tcp' or 'udp'"), false}},
-        network_enumerate_connections, true});
-
     register_compat(srv, {
-        OBFSTR("network_start_capture"), OBFSTR("network"),
-        OBFSTR("Start kernel-level packet capture using WFP (Windows Filtering Platform) callouts. "
-               "Captures all network traffic with process attribution. "
-               "Like Wireshark but running in kernel space with PID-level visibility. "
-               "Optionally filter by PID, port, protocol, or IP address."),
-        {{OBFSTR("pid"), OBFSTR("number"), OBFSTR("Only capture traffic from this process"), false},
-         {OBFSTR("port"), OBFSTR("number"), OBFSTR("Only capture traffic on this port"), false},
-         {OBFSTR("protocol"), OBFSTR("string"), OBFSTR("Only capture 'tcp' or 'udp'"), false},
-         {OBFSTR("ip"), OBFSTR("string"), OBFSTR("Only capture traffic to/from this IPv4 address"), false},
-         {OBFSTR("max_payload"), OBFSTR("number"), OBFSTR("Max payload bytes per packet (default 1500)"), false}},
-        network_start_capture, false});
-
-    register_compat(srv, {
-        OBFSTR("network_stop_capture"), OBFSTR("network"),
-        OBFSTR("Stop the active kernel packet capture session."),
-        {},
-        network_stop_capture, false});
-
-    register_compat(srv, {
-        OBFSTR("network_get_packets"), OBFSTR("network"),
-        OBFSTR("Retrieve captured network packets from the kernel ring buffer. "
-               "Returns up to 32 packets per call with full headers, payload hex dump, "
-               "ASCII render, PID, protocol, direction, and endpoint info. "
-               "Packets are consumed (removed from buffer) after retrieval."),
-        {{OBFSTR("count"), OBFSTR("number"), OBFSTR("Max packets to retrieve (1-32, default 32)"), false}},
-        network_get_packets, true});
+        OBFSTR("network_capture_manage"), OBFSTR("network"),
+        OBFSTR("Manage kernel packet capture. Actions: start, stop, get_packets, status, export_pcap."),
+        {{OBFSTR("action"), OBFSTR("string"), OBFSTR("start|stop|get_packets|status|export_pcap"), true},
+         {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
+        [](const json& params) -> tool_result_t {
+            const std::string action = compat_action_name(params);
+            const json p = compat_action_payload(params);
+            if (action == "start") return network_start_capture(p);
+            if (action == "stop") return network_stop_capture(p);
+            if (action == "get_packets") return network_get_packets(p);
+            if (action == "status") return network_capture_status(p);
+            if (action == "export_pcap") return network_export_pcap(p);
+            return compat_unknown_action("network_capture_manage", action);
+        },
+        false});
 
     register_compat(srv, {
         OBFSTR("network_analyze_packet"), OBFSTR("network"),
@@ -1946,74 +1928,50 @@ void register_network_tools(mcp_standalone::server_t& srv) {
         network_analyze_packet, true});
 
     register_compat(srv, {
-        OBFSTR("network_dns_log"), OBFSTR("network"),
-        OBFSTR("Retrieve captured DNS queries and responses from the kernel. "
-               "Shows domain names, query types (A/AAAA/CNAME/MX/etc.), resolved IPs, "
-               "TTLs, and owning PIDs. Requires capture to be active. "
-               "Like a DNS sniffer with process attribution."),
-        {{OBFSTR("pid"), OBFSTR("number"), OBFSTR("Filter DNS entries by process ID"), false}},
-        network_dns_log, true});
+        OBFSTR("network_filter_manage"), OBFSTR("network"),
+        OBFSTR("Manage kernel-level network filter rules. Actions: add, remove, clear."),
+        {{OBFSTR("action"), OBFSTR("string"), OBFSTR("add|remove|clear"), true},
+         {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
+        [](const json& params) -> tool_result_t {
+            const std::string action = compat_action_name(params);
+            const json p = compat_action_payload(params);
+            if (action == "add") return network_add_filter(p);
+            if (action == "remove") return network_remove_filter(p);
+            if (action == "clear") return network_clear_filters(p);
+            return compat_unknown_action("network_filter_manage", action);
+        },
+        false});
 
     register_compat(srv, {
-        OBFSTR("network_add_filter"), OBFSTR("network"),
-        OBFSTR("Add a kernel-level network filter rule. Can allow, block, or log traffic "
-               "matching specified criteria. Rules are enforced in the WFP classify callback. "
-               "Like a kernel firewall - operates below all usermode network stacks."),
-        {{OBFSTR("action"), OBFSTR("string"), OBFSTR("Rule action: 'allow', 'block', or 'log' (default 'log')"), false},
-         {OBFSTR("direction"), OBFSTR("string"), OBFSTR("'inbound', 'outbound', or 'both' (default 'both')"), false},
-         {OBFSTR("protocol"), OBFSTR("string"), OBFSTR("'tcp', 'udp', or omit for all"), false},
-         {OBFSTR("pid"), OBFSTR("number"), OBFSTR("Match only this process ID"), false},
-         {OBFSTR("port"), OBFSTR("number"), OBFSTR("Match only this port"), false},
-         {OBFSTR("ip"), OBFSTR("string"), OBFSTR("Match only this IPv4 address"), false}},
-        network_add_filter, false});
+        OBFSTR("network_bandwidth_manage"), OBFSTR("network"),
+        OBFSTR("Manage network bandwidth monitoring and summary stats. Actions: monitor, per_process, stats."),
+        {{OBFSTR("action"), OBFSTR("string"), OBFSTR("monitor|per_process|stats"), true},
+         {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
+        [](const json& params) -> tool_result_t {
+            const std::string action = compat_action_name(params);
+            const json p = compat_action_payload(params);
+            if (action == "monitor") return network_bandwidth_monitor(p);
+            if (action == "per_process") return network_bandwidth_per_process(p);
+            if (action == "stats") return network_stats(p);
+            return compat_unknown_action("network_bandwidth_manage", action);
+        },
+        false});
 
     register_compat(srv, {
-        OBFSTR("network_remove_filter"), OBFSTR("network"),
-        OBFSTR("Remove a previously added network filter rule by its ID."),
-        {{OBFSTR("rule_id"), OBFSTR("number"), OBFSTR("The rule ID returned when the filter was added"), true}},
-        network_remove_filter, false});
-
-    register_compat(srv, {
-        OBFSTR("network_clear_filters"), OBFSTR("network"),
-        OBFSTR("Remove all active network filter rules at once."),
-        {},
-        network_clear_filters, false});
-
-    register_compat(srv, {
-        OBFSTR("network_stats"), OBFSTR("network"),
-        OBFSTR("Get comprehensive kernel-level network statistics: total bytes/packets sent/received, "
-               "capture status, total captured/dropped, DNS queries logged, and active filter rules."),
-        {},
-        network_stats, true});
-
-    register_compat(srv, {
-        OBFSTR("network_capture_status"), OBFSTR("network"),
-        OBFSTR("Check if packet capture is currently active and get capture counters."),
-        {},
-        network_capture_status, true});
-
-    register_compat(srv, {
-        OBFSTR("network_block_ip"), OBFSTR("network"),
-        OBFSTR("Quick shortcut to block all traffic to/from a specific IP address. "
-               "Creates a kernel-level WFP block rule. Returns rule_id for later removal."),
-        {{OBFSTR("ip"), OBFSTR("string"), OBFSTR("IPv4 address to block (e.g. '192.168.1.1')"), true},
-         {OBFSTR("direction"), OBFSTR("string"), OBFSTR("'inbound', 'outbound', or 'both' (default 'both')"), false}},
-        network_block_ip, false});
-
-    register_compat(srv, {
-        OBFSTR("network_block_port"), OBFSTR("network"),
-        OBFSTR("Quick shortcut to block all traffic on a specific port. "
-               "Creates a kernel-level WFP block rule. Returns rule_id for later removal."),
-        {{OBFSTR("port"), OBFSTR("number"), OBFSTR("Port number to block"), true},
-         {OBFSTR("protocol"), OBFSTR("string"), OBFSTR("Optional: 'tcp' or 'udp' (default: both)"), false}},
-        network_block_port, false});
-
-    register_compat(srv, {
-        OBFSTR("network_block_process"), OBFSTR("network"),
-        OBFSTR("Quick shortcut to block all network traffic for a specific process by PID. "
-               "Creates a kernel-level WFP block rule. Returns rule_id for later removal."),
-        {{OBFSTR("pid"), OBFSTR("number"), OBFSTR("Process ID to block"), true}},
-        network_block_process, false});
+        OBFSTR("network_firewall_manage"), OBFSTR("network"),
+        OBFSTR("Manage quick firewall actions. Actions: block_ip, block_port, block_process, kill_connection."),
+        {{OBFSTR("action"), OBFSTR("string"), OBFSTR("block_ip|block_port|block_process|kill_connection"), true},
+         {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
+        [](const json& params) -> tool_result_t {
+            const std::string action = compat_action_name(params);
+            const json p = compat_action_payload(params);
+            if (action == "block_ip") return network_block_ip(p);
+            if (action == "block_port") return network_block_port(p);
+            if (action == "block_process") return network_block_process(p);
+            if (action == "kill_connection") return network_kill_connection(p);
+            return compat_unknown_action("network_firewall_manage", action);
+        },
+        false});
 
     register_compat(srv, {
         OBFSTR("network_deep_inspect"), OBFSTR("network"),
@@ -2024,17 +1982,6 @@ void register_network_tools(mcp_standalone::server_t& srv) {
          {OBFSTR("port"), OBFSTR("number"), OBFSTR("Filter by port number"), false},
          {OBFSTR("protocol"), OBFSTR("string"), OBFSTR("Filter: 'tcp' or 'udp'"), false}},
         network_deep_inspect, true});
-
-    register_compat(srv, {
-        OBFSTR("network_follow_tcp_stream"), OBFSTR("network"),
-        OBFSTR("TCP stream reassembly - equivalent to Wireshark 'Follow TCP Stream'. Reassembles TCP segments into "
-               "complete application-layer data. Operations: 'start' begins tracking a flow, 'get' returns reassembled "
-               "bytes (hex + ASCII), 'stop' ends tracking. Identify flows via src_port/dst_port. Max 1024 concurrent streams."),
-        {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("'start', 'stop', or 'get'"), true},
-         {OBFSTR("src_port"), OBFSTR("number"), OBFSTR("Source (client) port of the TCP flow"), false},
-         {OBFSTR("dst_port"), OBFSTR("number"), OBFSTR("Destination (server) port of the TCP flow"), false},
-         {OBFSTR("pid"), OBFSTR("number"), OBFSTR("Process ID filter"), false}},
-        network_follow_tcp_stream, false});
 
     register_compat(srv, {
         OBFSTR("network_parse_http"), OBFSTR("network"),
@@ -2101,23 +2048,6 @@ void register_network_tools(mcp_standalone::server_t& srv) {
         network_inject_packet, false});
 
     register_compat(srv, {
-        OBFSTR("network_modify_packet_rule"), OBFSTR("network"),
-        OBFSTR("Manage real-time packet content modification rules. 'add' creates a rule that search-and-replaces "
-               "byte patterns in matching packet payloads (like HTTP Debugger rewrite rules). 'remove' deletes a rule by ID. "
-               "'clear' removes all rules. Patterns/replacements as hex or text. Filter by direction/protocol/port/pid. Max 32 rules."),
-        {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("'add', 'remove', or 'clear'"), true},
-         {OBFSTR("direction"), OBFSTR("string"), OBFSTR("For add: 'inbound', 'outbound', or 'both' (default: both)"), false},
-         {OBFSTR("protocol"), OBFSTR("string"), OBFSTR("For add: 'tcp' or 'udp'"), false},
-         {OBFSTR("port"), OBFSTR("number"), OBFSTR("For add: port filter (0 = any)"), false},
-         {OBFSTR("pid"), OBFSTR("number"), OBFSTR("For add: process ID filter (0 = any)"), false},
-         {OBFSTR("pattern_hex"), OBFSTR("string"), OBFSTR("For add: byte pattern to find (hex)"), false},
-         {OBFSTR("pattern_text"), OBFSTR("string"), OBFSTR("For add: text pattern to find"), false},
-         {OBFSTR("replacement_hex"), OBFSTR("string"), OBFSTR("For add: replacement bytes (hex)"), false},
-         {OBFSTR("replacement_text"), OBFSTR("string"), OBFSTR("For add: replacement text"), false},
-         {OBFSTR("rule_id"), OBFSTR("number"), OBFSTR("For remove: rule ID to remove"), false}},
-        network_modify_packet_rule, false});
-
-    register_compat(srv, {
         OBFSTR("network_list_mod_rules"), OBFSTR("network"),
         OBFSTR("List all active packet modification rules. Shows rule ID, direction, protocol, port/pid filters, "
                "match count, and active status."),
@@ -2125,35 +2055,10 @@ void register_network_tools(mcp_standalone::server_t& srv) {
         network_list_mod_rules, true});
 
     register_compat(srv, {
-        OBFSTR("network_redirect_traffic"), OBFSTR("network"),
-        OBFSTR("Manage kernel-level traffic redirect rules. 'add' redirects traffic matching IP:port to a different "
-               "IP:port (transparent proxy). 'remove' deletes by rule ID. 'clear' removes all. Filter by protocol. "
-               "Equivalent to iptables REDIRECT/DNAT but at WFP level. Max 16 rules."),
-        {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("'add', 'remove', or 'clear'"), true},
-         {OBFSTR("protocol"), OBFSTR("string"), OBFSTR("For add: 'tcp' or 'udp' (default: tcp)"), false},
-         {OBFSTR("match_port"), OBFSTR("number"), OBFSTR("For add: original destination port to match"), false},
-         {OBFSTR("match_ip"), OBFSTR("string"), OBFSTR("For add: original destination IP to match"), false},
-         {OBFSTR("redirect_port"), OBFSTR("number"), OBFSTR("For add: new destination port"), false},
-         {OBFSTR("redirect_ip"), OBFSTR("string"), OBFSTR("For add: new destination IP"), false},
-         {OBFSTR("rule_id"), OBFSTR("number"), OBFSTR("For remove: rule ID"), false}},
-        network_redirect_traffic, false});
-
-    register_compat(srv, {
         OBFSTR("network_list_redirect_rules"), OBFSTR("network"),
         OBFSTR("List all active traffic redirect rules with match counts and status."),
         {},
         network_list_redirect_rules, true});
-
-    register_compat(srv, {
-        OBFSTR("network_intercept"), OBFSTR("network"),
-        OBFSTR("Enable/disable real-time packet interception and hold. When enabled, matching packets are "
-               "held in a queue (like Fiddler breakpoints). Use network_get_held_packets to inspect them, then "
-               "network_release_packet to release, drop, or modify-and-release each packet. Filter by pid/port/protocol."),
-        {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("'enable' or 'disable'"), true},
-         {OBFSTR("pid"), OBFSTR("number"), OBFSTR("For enable: process ID filter (0 = all)"), false},
-         {OBFSTR("port"), OBFSTR("number"), OBFSTR("For enable: port filter (0 = all)"), false},
-         {OBFSTR("protocol"), OBFSTR("string"), OBFSTR("For enable: 'tcp' or 'udp'"), false}},
-        network_intercept, false});
 
     register_compat(srv, {
         OBFSTR("network_get_held_packets"), OBFSTR("network"),
@@ -2175,18 +2080,6 @@ void register_network_tools(mcp_standalone::server_t& srv) {
         network_release_packet, false});
 
     register_compat(srv, {
-        OBFSTR("network_kill_connection"), OBFSTR("network"),
-        OBFSTR("Forcefully terminate a network connection. Uses kernel-level socket close + TCP RST injection. "
-               "Specify the connection by src/dst IP:port and/or PID. Like right-click 'Kill Connection' in TCPView."),
-        {{OBFSTR("protocol"), OBFSTR("string"), OBFSTR("'tcp' or 'udp' (default: tcp)"), false},
-         {OBFSTR("src_ip"), OBFSTR("string"), OBFSTR("Source (local) IP address"), false},
-         {OBFSTR("dst_ip"), OBFSTR("string"), OBFSTR("Destination (remote) IP address"), false},
-         {OBFSTR("src_port"), OBFSTR("number"), OBFSTR("Source (local) port"), false},
-         {OBFSTR("dst_port"), OBFSTR("number"), OBFSTR("Destination (remote) port"), false},
-         {OBFSTR("pid"), OBFSTR("number"), OBFSTR("Process ID owning the connection"), false}},
-        network_kill_connection, false});
-
-    register_compat(srv, {
         OBFSTR("network_spoof_dns"), OBFSTR("network"),
         OBFSTR("Manage kernel-level DNS spoofing rules. 'add' creates a rule to intercept DNS queries for a domain "
                "and return a spoofed A/AAAA record. 'remove' deletes by rule ID. 'clear' removes all. Like a kernel "
@@ -2205,40 +2098,12 @@ void register_network_tools(mcp_standalone::server_t& srv) {
         network_list_dns_spoof_rules, true});
 
     register_compat(srv, {
-        OBFSTR("network_bandwidth_monitor"), OBFSTR("network"),
-        OBFSTR("Real-time bandwidth monitoring at the kernel level. 'start' begins tracking (optionally for a specific PID). "
-               "'get' returns total bytes/packets sent/received plus current throughput (bps). 'stop' ends monitoring. "
-               "'reset' zeroes all counters. Like Wireshark I/O graphs + NetLimiter bandwidth view."),
-        {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("'start', 'stop', 'get', or 'reset'"), true},
-         {OBFSTR("pid"), OBFSTR("number"), OBFSTR("For start/get: filter by process ID (0 = all)"), false}},
-        network_bandwidth_monitor, false});
-
-    register_compat(srv, {
-        OBFSTR("network_bandwidth_per_process"), OBFSTR("network"),
-        OBFSTR("Get per-process bandwidth usage breakdown. Shows bytes/packets sent/received and last activity "
-               "timestamp for each process. Requires bandwidth monitoring to be active (network_bandwidth_monitor start)."),
-        {{OBFSTR("pid"), OBFSTR("number"), OBFSTR("Filter by process ID (0 = all processes)"), false}},
-        network_bandwidth_per_process, true});
-
-    register_compat(srv, {
         OBFSTR("network_os_fingerprint"), OBFSTR("network"),
         OBFSTR("Passive OS fingerprinting via TCP SYN packet analysis (p0f-style). 'enable' starts collecting "
                "fingerprints from incoming connections. 'get' returns results: remote IP, OS guess, TTL, window size, "
                "MSS, window scale, DF flag, SACK. 'disable' stops. Like p0f or Wireshark OS detection."),
         {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("'enable', 'disable', or 'get'"), true}},
         network_os_fingerprint, false});
-
-    register_compat(srv, {
-        OBFSTR("network_export_pcap"), OBFSTR("network"),
-        OBFSTR("Export captured packets to a PCAP file that can be opened in Wireshark. Writes standard libpcap "
-               "format with global header + packet records. Filter by pid/protocol. File saved to Downloads folder "
-               "by default. Max 256 packets per export."),
-        {{OBFSTR("pid"), OBFSTR("number"), OBFSTR("Filter by process ID"), false},
-         {OBFSTR("protocol"), OBFSTR("string"), OBFSTR("Filter: 'tcp' or 'udp'"), false},
-         {OBFSTR("max_packets"), OBFSTR("number"), OBFSTR("Max packets to export (default 256, max 256)"), false},
-         {OBFSTR("filename"), OBFSTR("string"), OBFSTR("Output filename (default: 'aida_capture.pcap')"), false}},
-        network_export_pcap, false});
-
 
     register_compat(srv, {
         OBFSTR("network_decode_data"), OBFSTR("network"),
@@ -3172,744 +3037,9 @@ void register_network_tools(mcp_standalone::server_t& srv) {
             return tool_result_t::error("Unknown operation '" + op + "'. Use decode|encode|decode_grpc|modify|auto_detect");
         }, true});
 
-    register_compat(srv, {
-        OBFSTR("network_fuzzer"), OBFSTR("network"),
-        OBFSTR("HTTP fuzzer / intruder. Configure target, base request with injection points, "
-               "payload sets, and attack mode. Then start fuzzing to send requests with substituted "
-               "payloads and collect responses. Operations: configure, start, stop, status, get_results, clear."),
-        {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("configure|start|stop|status|get_results|clear"), true},
-         {OBFSTR("host"), OBFSTR("string"), OBFSTR("Target host for configure"), false},
-         {OBFSTR("port"), OBFSTR("number"), OBFSTR("Target port"), false},
-         {OBFSTR("use_tls"), OBFSTR("boolean"), OBFSTR("Use HTTPS"), false},
-         {OBFSTR("base_request"), OBFSTR("string"), OBFSTR("HTTP request template with injection points"), false},
-         {OBFSTR("attack_mode"), OBFSTR("string"), OBFSTR("sniper|pitchfork|clusterbomb"), false},
-         {OBFSTR("payload_source"), OBFSTR("string"), OBFSTR("Wordlist path or inline data"), false},
-         {OBFSTR("payload_type"), OBFSTR("number"), OBFSTR("0=wordlist, 1=sequential, 2=charset"), false},
-         {OBFSTR("thread_count"), OBFSTR("number"), OBFSTR("Concurrent workers 1-32"), false},
-         {OBFSTR("delay_ms"), OBFSTR("number"), OBFSTR("Throttle between requests in ms"), false},
-         {OBFSTR("match_status"), OBFSTR("number"), OBFSTR("Filter by HTTP status code (0=any)"), false},
-         {OBFSTR("stop_on_match"), OBFSTR("boolean"), OBFSTR("Stop fuzzing when a match is found"), false},
-         {OBFSTR("max_results"), OBFSTR("number"), OBFSTR("Max results to return for get_results (default 100)"), false}},
-        [](const json& args) -> tool_result_t {
-            std::string op = args.value("operation", "");
-            if (op.empty())
-                return tool_result_t::error(OBFSTR("Missing 'operation' parameter"));
 
-            diag::log_tagged_fmt("net_tools", "network_fuzzer op=%s", op.c_str());
-            auto& state = network_view::g_state;
 
-            if (op == "configure") {
-                auto& cfg = state.fuzz_config;
-                if (args.contains("host") && args["host"].is_string())
-                    cfg.host = args["host"].get<std::string>();
-                if (args.contains("port") && args["port"].is_number())
-                    cfg.port = static_cast<uint16_t>(args["port"].get<int>());
-                if (args.contains("use_tls") && args["use_tls"].is_boolean())
-                    cfg.use_tls = args["use_tls"].get<bool>();
-                if (args.contains("base_request") && args["base_request"].is_string())
-                    cfg.base_request = args["base_request"].get<std::string>();
-                if (args.contains("attack_mode") && args["attack_mode"].is_string()) {
-                    std::string m = args["attack_mode"].get<std::string>();
-                    if (m == "pitchfork") cfg.attack_mode = network_view::fuzzer_attack_mode_t::pitchfork;
-                    else if (m == "clusterbomb") cfg.attack_mode = network_view::fuzzer_attack_mode_t::clusterbomb;
-                    else cfg.attack_mode = network_view::fuzzer_attack_mode_t::sniper;
-                }
-                if (args.contains("payload_source") && args["payload_source"].is_string())
-                    cfg.payload_source = args["payload_source"].get<std::string>();
-                if (args.contains("payload_type") && args["payload_type"].is_number())
-                    cfg.payload_type = args["payload_type"].get<int>();
-                if (args.contains("thread_count") && args["thread_count"].is_number())
-                    cfg.thread_count = std::max(1, std::min(32, args["thread_count"].get<int>()));
-                if (args.contains("delay_ms") && args["delay_ms"].is_number())
-                    cfg.delay_ms = args["delay_ms"].get<int>();
-                if (args.contains("match_status") && args["match_status"].is_number())
-                    cfg.match_status = args["match_status"].get<int>();
-                if (args.contains("stop_on_match") && args["stop_on_match"].is_boolean())
-                    cfg.stop_on_match = args["stop_on_match"].get<bool>();
-                json r;
-                r["host"] = cfg.host;
-                r["port"] = cfg.port;
-                r["use_tls"] = cfg.use_tls;
-                r["attack_mode"] = static_cast<int>(cfg.attack_mode);
-                r["thread_count"] = cfg.thread_count;
-                diag::log_tagged_fmt("net_tools", "network_fuzzer configure host=%s port=%u use_tls=%d threads=%d", cfg.host.c_str(), cfg.port, (int)cfg.use_tls, cfg.thread_count);
-                return tool_result_t::ok(OBFSTR("Fuzzer configured"), r);
-            }
 
-            if (op == "start") {
-                diag::log_tagged_fmt("net_tools", "network_fuzzer start host=%s port=%u use_tls=%d", state.fuzz_config.host.c_str(), state.fuzz_config.port, (int)state.fuzz_config.use_tls);
-                if (state.fuzz_running.load())
-                    return tool_result_t::error(OBFSTR("Fuzzer is already running"));
-                {
-                    std::lock_guard<std::mutex> lk(state.fuzz_mutex);
-                    state.fuzz_results.clear();
-                }
-                state.fuzz_progress.store(0);
-                state.fuzz_total.store(0);
-                state.fuzz_running.store(true);
-                while (!state.fuzz_thread_done.load(std::memory_order_acquire))
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                state.fuzz_thread_done.store(false, std::memory_order_release);
-                network_view::state_t* state_ptr = &state;
-                if (!work_queue::post([state_ptr]() {
-                    auto& state = *state_ptr;
-                    auto& cfg = state.fuzz_config;
-
-                    auto load_set = [](const network_view::payload_set_t& ps) -> std::vector<std::string> {
-                        std::vector<std::string> lines;
-                        auto push_line = [&](std::istream& is) {
-                            std::string line;
-                            while (std::getline(is, line)) {
-                                if (!line.empty() && line.back() == '\r') line.pop_back();
-                                if (!line.empty()) lines.push_back(std::move(line));
-                            }
-                        };
-                        if (ps.type == 0) {
-                            std::ifstream f(ps.source);
-                            if (f.is_open()) push_line(f);
-                        } else {
-                            std::istringstream ss(ps.source);
-                            push_line(ss);
-                        }
-                        return lines;
-                    };
-
-                    auto load_legacy_set = [&]() -> std::vector<std::string> {
-                        network_view::payload_set_t tmp;
-                        tmp.type = cfg.payload_type;
-                        tmp.source = cfg.payload_source;
-                        if (cfg.payload_type == 1) {
-                            std::vector<std::string> nums;
-                            int start_n = 0, end_n = 100;
-                            if (sscanf(cfg.payload_source.c_str(), "%d-%d", &start_n, &end_n) >= 1)
-                                for (int n = start_n; n <= end_n; n++)
-                                    nums.push_back(std::to_string(n));
-                            return nums;
-                        } else if (cfg.payload_type == 2) {
-                            std::string charset = cfg.payload_source.empty()
-                                ? "abcdefghijklmnopqrstuvwxyz0123456789" : cfg.payload_source;
-                            std::vector<std::string> v;
-                            for (char c : charset) v.push_back(std::string(1, c));
-                            for (char a : charset)
-                                for (char b : charset)
-                                    v.push_back(std::string(1, a) + b);
-                            return v;
-                        }
-                        return load_set(tmp);
-                    };
-
-                    auto make_request_multi = [](const std::string& tmpl,
-                                                  const std::vector<std::string>& payloads) -> std::string {
-                        const std::string marker = "\xc2\xa7";
-                        std::string result;
-                        result.reserve(tmpl.size() + 512);
-                        size_t pos = 0;
-                        size_t pi = 0;
-                        while (pos < tmpl.size()) {
-                            size_t s = tmpl.find(marker, pos);
-                            if (s == std::string::npos) { result.append(tmpl, pos, std::string::npos); break; }
-                            size_t e = tmpl.find(marker, s + marker.size());
-                            if (e == std::string::npos) { result.append(tmpl, pos, std::string::npos); break; }
-                            result.append(tmpl, pos, s - pos);
-                            if (pi < payloads.size()) result.append(payloads[pi]);
-                            pi++;
-                            pos = e + marker.size();
-                        }
-                        if (!payloads.empty()) {
-                            size_t fp = 0;
-                            const std::string fuzz_tok = "FUZZ";
-                            while ((fp = result.find(fuzz_tok, fp)) != std::string::npos) {
-                                result.replace(fp, fuzz_tok.size(), payloads[0]);
-                                fp += payloads[0].size();
-                            }
-                        }
-                        return result;
-                    };
-
-                    using combo_t = std::vector<std::string>;
-                    std::vector<combo_t> combos;
-
-                    switch (cfg.attack_mode) {
-                        case network_view::fuzzer_attack_mode_t::sniper: {
-                            std::vector<std::string> payloads = cfg.payload_sets.empty()
-                                ? load_legacy_set()
-                                : load_set(cfg.payload_sets[0]);
-                            combos.reserve(payloads.size());
-                            for (auto& p : payloads) combos.push_back({ p });
-                            break;
-                        }
-                        case network_view::fuzzer_attack_mode_t::pitchfork: {
-                            if (cfg.payload_sets.empty()) { state.fuzz_running.store(false); return; }
-                            std::vector<std::vector<std::string>> sets;
-                            sets.reserve(cfg.payload_sets.size());
-                            for (auto& ps : cfg.payload_sets) {
-                                sets.push_back(load_set(ps));
-                                if (sets.back().empty()) { state.fuzz_running.store(false); return; }
-                            }
-                            size_t min_len = sets[0].size();
-                            for (auto& s : sets) min_len = std::min(min_len, s.size());
-                            combos.reserve(min_len);
-                            for (size_t i = 0; i < min_len; i++) {
-                                combo_t c;
-                                c.reserve(sets.size());
-                                for (auto& s : sets) c.push_back(s[i]);
-                                combos.push_back(std::move(c));
-                            }
-                            break;
-                        }
-                        case network_view::fuzzer_attack_mode_t::clusterbomb: {
-                            if (cfg.payload_sets.empty()) { state.fuzz_running.store(false); return; }
-                            std::vector<std::vector<std::string>> sets;
-                            sets.reserve(cfg.payload_sets.size());
-                            for (auto& ps : cfg.payload_sets) {
-                                sets.push_back(load_set(ps));
-                                if (sets.back().empty()) { state.fuzz_running.store(false); return; }
-                            }
-                            combos.push_back(combo_t{});
-                            for (auto& s : sets) {
-                                std::vector<combo_t> next;
-                                next.reserve(combos.size() * s.size());
-                                for (auto& base : combos)
-                                    for (auto& val : s) {
-                                        combo_t nc = base;
-                                        nc.push_back(val);
-                                        next.push_back(std::move(nc));
-                                    }
-                                combos = std::move(next);
-                            }
-                            break;
-                        }
-                    }
-
-                    if (combos.empty()) { state.fuzz_running.store(false); return; }
-
-                    state.fuzz_total.store(static_cast<int>(combos.size()));
-                    state.fuzz_progress.store(0);
-
-                    std::atomic<int> next_index{0};
-                    int total = static_cast<int>(combos.size());
-                    int threads = std::min(std::max(cfg.thread_count, 1), 32);
-
-                    auto worker = [&]() {
-                        while (state.fuzz_running.load()) {
-                            int idx = next_index.fetch_add(1);
-                            if (idx >= total) break;
-                            auto& combo = combos[static_cast<size_t>(idx)];
-                            std::string req_s = make_request_multi(cfg.base_request, combo);
-                            std::vector<uint8_t> raw_req(req_s.begin(), req_s.end());
-                            auto t0 = GetTickCount64();
-                            auto res = mitm_proxy::repeat_request(cfg.host, cfg.port, cfg.use_tls, raw_req);
-                            auto elapsed = GetTickCount64() - t0;
-                            network_view::state_t::fuzzer_result_t fr;
-                            fr.index = idx;
-                            fr.payloads = combo;
-                            fr.payload = combo.empty() ? std::string() : combo[0];
-                            fr.latency_ms = elapsed;
-                            if (res.success) {
-                                fr.status_code = res.exchange.response.status_code;
-                                fr.response_len = res.exchange.raw_response.size();
-                                std::string body(res.exchange.raw_response.begin(),
-                                                 res.exchange.raw_response.end());
-                                fr.response_preview = body.substr(0, std::min<size_t>(200, body.size()));
-                                fr.match = (cfg.match_status > 0) ? (fr.status_code == cfg.match_status) : true;
-                            }
-                            {
-                                std::lock_guard<std::mutex> lk(state.fuzz_mutex);
-                                state.fuzz_results.push_back(std::move(fr));
-                            }
-                            state.fuzz_progress.fetch_add(1);
-                            if (cfg.stop_on_match && fr.match) {
-                                state.fuzz_running.store(false);
-                                break;
-                            }
-                            if (cfg.delay_ms > 0) Sleep(static_cast<DWORD>(cfg.delay_ms));
-                        }
-                    };
-
-                    std::atomic<int> remaining{threads};
-                    for (int t = 0; t < threads; t++) {
-                        if (!work_queue::post([worker, &remaining]() {
-                                worker();
-                                remaining.fetch_sub(1, std::memory_order_acq_rel);
-                            }))
-                        {
-                            remaining.fetch_sub(1, std::memory_order_acq_rel);
-                        }
-                    }
-                    while (remaining.load(std::memory_order_acquire) > 0)
-                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                    state.fuzz_running.store(false);
-                    state.fuzz_thread_done.store(true, std::memory_order_release);
-                }))
-                {
-                    state.fuzz_thread_done.store(true, std::memory_order_release);
-                }
-                json r;
-                r["status"] = "started";
-                r["host"] = state.fuzz_config.host;
-                r["port"] = state.fuzz_config.port;
-                return tool_result_t::ok(OBFSTR("Fuzzer started"), r);
-            }
-
-            if (op == "stop") {
-                bool was_running = state.fuzz_running.load();
-                diag::log_tagged_fmt("net_tools", "network_fuzzer stop was_running=%d", (int)was_running);
-                if (!was_running)
-                    return tool_result_t::ok(OBFSTR("Fuzzer is not running"));
-                state.fuzz_running.store(false);
-                return tool_result_t::ok(OBFSTR("Fuzzer stop signal sent"));
-            }
-
-            if (op == "status") {
-                json r;
-                r["running"] = state.fuzz_running.load();
-                r["progress"] = state.fuzz_progress.load();
-                r["total"] = state.fuzz_total.load();
-                std::lock_guard<std::mutex> lk(state.fuzz_mutex);
-                r["result_count"] = static_cast<int>(state.fuzz_results.size());
-                diag::log_tagged_fmt("net_tools", "network_fuzzer status running=%d progress=%d total=%d results=%zu", (int)state.fuzz_running.load(), (int)state.fuzz_progress.load(), (int)state.fuzz_total.load(), state.fuzz_results.size());
-                return tool_result_t::ok(state.fuzz_running.load() ? OBFSTR("Fuzzer running") : OBFSTR("Fuzzer idle"), r);
-            }
-
-            if (op == "get_results") {
-                int max_count = args.value("max_results", 100);
-                std::lock_guard<std::mutex> lk(state.fuzz_mutex);
-                json arr = json::array();
-                int count = 0;
-                for (auto it = state.fuzz_results.rbegin();
-                     it != state.fuzz_results.rend() && count < max_count; ++it, ++count) {
-                    json ej;
-                    ej["index"] = it->index;
-                    ej["payload"] = it->payload;
-                    if (it->payloads.size() > 1) {
-                        json pa = json::array();
-                        for (const auto& p : it->payloads) pa.push_back(p);
-                        ej["payloads"] = pa;
-                    }
-                    ej["status_code"] = it->status_code;
-                    ej["response_len"] = it->response_len;
-                    ej["latency_ms"] = it->latency_ms;
-                    ej["match"] = it->match;
-                    if (!it->response_preview.empty())
-                        ej["response_preview"] = it->response_preview;
-                    if (!it->extracted_value.empty())
-                        ej["extracted_value"] = it->extracted_value;
-                    arr.push_back(ej);
-                }
-                json r;
-                r["results"] = arr;
-                r["total"] = static_cast<int>(state.fuzz_results.size());
-                diag::log_tagged_fmt("net_tools", "network_fuzzer get_results returned=%zu total=%zu", arr.size(), state.fuzz_results.size());
-                return tool_result_t::ok(std::to_string(state.fuzz_results.size()) + OBFSTR(" total results"), r);
-            }
-
-            if (op == "clear") {
-                std::lock_guard<std::mutex> lk(state.fuzz_mutex);
-                size_t was = state.fuzz_results.size();
-                state.fuzz_results.clear();
-                state.fuzz_progress.store(0);
-                state.fuzz_total.store(0);
-                diag::log_tagged_fmt("net_tools", "network_fuzzer clear cleared=%zu", was);
-                return tool_result_t::ok(OBFSTR("Fuzzer results cleared"));
-            }
-
-            return tool_result_t::error(OBFSTR("Unknown operation. Use configure|start|stop|status|get_results|clear"));
-        }, false});
-
-    register_compat(srv, {
-        OBFSTR("network_websocket"), OBFSTR("network"),
-        OBFSTR("WebSocket frame viewer and injector. List captured WebSocket frames from proxy connections, "
-               "filter by host or content, inject new frames, or clear the frame buffer. "
-               "Operations: list_frames, inject_frame, clear."),
-        {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("list_frames|inject_frame|clear"), true},
-         {OBFSTR("max_count"), OBFSTR("number"), OBFSTR("Max frames to return for list_frames (default 64)"), false},
-         {OBFSTR("filter"), OBFSTR("string"), OBFSTR("Substring filter on host/preview"), false},
-         {OBFSTR("host"), OBFSTR("string"), OBFSTR("Target host for inject_frame"), false},
-         {OBFSTR("port"), OBFSTR("number"), OBFSTR("Target port for inject_frame"), false},
-         {OBFSTR("opcode"), OBFSTR("number"), OBFSTR("WebSocket opcode: 0x1=text, 0x2=binary"), false},
-         {OBFSTR("payload"), OBFSTR("string"), OBFSTR("Frame payload text or hex string"), false},
-         {OBFSTR("is_hex"), OBFSTR("boolean"), OBFSTR("If true, interpret payload as hex"), false}},
-        [](const json& args) -> tool_result_t {
-            std::string op = args.value("operation", "");
-            if (op.empty())
-                return tool_result_t::error(OBFSTR("Missing 'operation' parameter"));
-
-            diag::log_tagged_fmt("net_tools", "network_websocket op=%s", op.c_str());
-
-            auto& state = network_view::g_state;
-
-            if (op == "list_frames") {
-                int max_count = args.value("max_count", 64);
-                std::string filter = args.value("filter", "");
-                diag::log_tagged_fmt("net_tools", "network_websocket list_frames max_count=%d filter=%s", max_count, filter.c_str());
-                std::lock_guard<std::mutex> lk(state.ws_mutex);
-                json arr = json::array();
-                int count = 0;
-                for (auto it = state.ws_frames.rbegin();
-                     it != state.ws_frames.rend() && count < max_count; ++it) {
-                    if (!filter.empty()) {
-                        if (it->host.find(filter) == std::string::npos &&
-                            it->preview.find(filter) == std::string::npos)
-                            continue;
-                    }
-                    json fj;
-                    fj["direction"] = it->is_outbound ? "outbound" : "inbound";
-                    fj["host"] = it->host;
-                    fj["port"] = it->port;
-                    fj["opcode"] = it->opcode;
-                    fj["is_text"] = it->is_text;
-                    fj["size"] = it->payload.size();
-                    fj["preview"] = it->preview;
-                    fj["exchange_id"] = it->exchange_id;
-                    fj["timestamp"] = it->timestamp;
-                    arr.push_back(fj);
-                    count++;
-                }
-                json r;
-                r["frames"] = arr;
-                r["total_buffered"] = static_cast<int>(state.ws_frames.size());
-                diag::log_tagged_fmt("net_tools", "network_websocket list_frames returned=%d total_buffered=%zu", count, state.ws_frames.size());
-                return tool_result_t::ok(std::to_string(count) + OBFSTR(" WebSocket frames"), r);
-            }
-
-            if (op == "inject_frame") {
-                diag::log_tagged("net_tools", "network_websocket inject_frame not_supported");
-                return tool_result_t::error(OBFSTR("WebSocket frame injection requires an active proxy connection with an established WebSocket upgrade. Use the proxy to intercept and modify frames instead."));
-            }
-
-            if (op == "clear") {
-                std::lock_guard<std::mutex> lk(state.ws_mutex);
-                size_t was = state.ws_frames.size();
-                state.ws_frames.clear();
-                diag::log_tagged_fmt("net_tools", "network_websocket clear cleared=%zu", was);
-                return tool_result_t::ok(OBFSTR("WebSocket frame buffer cleared"));
-            }
-
-            diag::log_tagged_fmt("net_tools", "network_websocket unknown_op op=%s", op.c_str());
-            return tool_result_t::error(OBFSTR("Unknown operation. Use list_frames|inject_frame|clear"));
-        }, false});
-
-    register_compat(srv, {
-        OBFSTR("network_proxy"), OBFSTR("network"),
-        OBFSTR("HTTP/HTTPS MITM proxy with TLS interception. Start a local proxy that captures all HTTP traffic, "
-               "decrypts TLS, and logs request/response pairs. Supports WebSocket and HTTP/2. "
-               "Operations: start, stop, status, get_history, clear_history, get_exchange."),
-        {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("start|stop|status|get_history|clear_history|get_exchange"), true},
-         {OBFSTR("bind_addr"), OBFSTR("string"), OBFSTR("Bind address for start (default 127.0.0.1)"), false},
-         {OBFSTR("port"), OBFSTR("number"), OBFSTR("Bind port for start (default 8443)"), false},
-         {OBFSTR("decode_tls"), OBFSTR("boolean"), OBFSTR("Enable TLS MITM decryption"), false},
-         {OBFSTR("max_count"), OBFSTR("number"), OBFSTR("Max entries for get_history"), false},
-         {OBFSTR("filter"), OBFSTR("string"), OBFSTR("Filter on host/method/path"), false},
-         {OBFSTR("exchange_id"), OBFSTR("number"), OBFSTR("Exchange ID for get_exchange"), false}},
-        [](const json& args) -> tool_result_t {
-            std::string op = args.value("operation", "");
-            if (op.empty())
-                return tool_result_t::error(OBFSTR("Missing 'operation' parameter"));
-
-            diag::log_tagged_fmt("net_tools", "network_proxy op=%s", op.c_str());
-
-            if (op == "start") {
-                bool already_running = mitm_proxy::is_running();
-                diag::log_tagged_fmt("net_tools", "network_proxy start already_running=%d", (int)already_running);
-                if (already_running)
-                    return tool_result_t::error(OBFSTR("Proxy is already running"));
-                mitm_proxy::proxy_config cfg;
-                cfg.bind_addr = args.value("bind_addr", std::string("127.0.0.1"));
-                if (args.contains("port") && args["port"].is_number())
-                    cfg.bind_port = static_cast<uint16_t>(args["port"].get<int>());
-                if (args.contains("decode_tls") && args["decode_tls"].is_boolean())
-                    cfg.decode_tls = args["decode_tls"].get<bool>();
-                diag::log_tagged_fmt("net_tools", "network_proxy start bind_addr=%s port=%u decode_tls=%d", cfg.bind_addr.c_str(), (unsigned)cfg.bind_port, (int)cfg.decode_tls);
-                bool ok = mitm_proxy::start(cfg);
-                diag::log_tagged_fmt("net_tools", "network_proxy start result=%d", (int)ok);
-                if (!ok)
-                    return tool_result_t::error(OBFSTR("Failed to start proxy"));
-                json r;
-                r["bind_addr"] = cfg.bind_addr;
-                r["bind_port"] = cfg.bind_port;
-                r["decode_tls"] = cfg.decode_tls;
-                return tool_result_t::ok(OBFSTR("Proxy started on ") + cfg.bind_addr + ":" + std::to_string(cfg.bind_port), r);
-            }
-
-            if (op == "stop") {
-                bool was_running = mitm_proxy::is_running();
-                diag::log_tagged_fmt("net_tools", "network_proxy stop was_running=%d", (int)was_running);
-                if (!was_running)
-                    return tool_result_t::ok(OBFSTR("Proxy is not running"));
-                mitm_proxy::stop();
-                diag::log_tagged("net_tools", "network_proxy stop done");
-                return tool_result_t::ok(OBFSTR("Proxy stopped"));
-            }
-
-            if (op == "status") {
-                auto stats = mitm_proxy::get_stats();
-                diag::log_tagged_fmt("net_tools", "network_proxy status running=%d requests=%llu history=%zu held=%zu active=%zu",
-                    (int)stats.running, (unsigned long long)stats.total_requests, stats.history_size, stats.held_count, stats.active_connections);
-                json r;
-                r["running"] = stats.running;
-                r["total_requests"] = stats.total_requests;
-                r["total_bytes_in"] = stats.total_bytes_in;
-                r["total_bytes_out"] = stats.total_bytes_out;
-                r["active_connections"] = stats.active_connections;
-                r["history_size"] = stats.history_size;
-                r["held_count"] = stats.held_count;
-                return tool_result_t::ok(stats.running ? OBFSTR("Proxy running") : OBFSTR("Proxy stopped"), r);
-            }
-
-            if (op == "get_history") {
-                size_t max_count = args.value("max_count", static_cast<size_t>(100));
-                std::string filter = args.value("filter", "");
-                diag::log_tagged_fmt("net_tools", "network_proxy get_history max_count=%zu filter=%s", max_count, filter.c_str());
-                auto history = mitm_proxy::get_history(max_count);
-                json arr = json::array();
-                for (const auto& ex : history) {
-                    if (!filter.empty()) {
-                        bool match = ex.target_host.find(filter) != std::string::npos ||
-                                     ex.request.method.find(filter) != std::string::npos ||
-                                     ex.request.uri.find(filter) != std::string::npos;
-                        if (!match) continue;
-                    }
-                    json ej;
-                    ej["id"] = ex.id;
-                    ej["method"] = ex.request.method;
-                    ej["host"] = ex.target_host;
-                    ej["port"] = ex.target_port;
-                    ej["path"] = ex.request.uri;
-                    ej["status_code"] = ex.response.status_code;
-                    ej["is_tls"] = ex.is_tls;
-                    ej["is_websocket"] = ex.is_websocket;
-                    ej["latency_ms"] = ex.latency_ms;
-                    ej["request_size"] = ex.request_size;
-                    ej["response_size"] = ex.response_size;
-                    arr.push_back(ej);
-                }
-                json r;
-                r["exchanges"] = arr;
-                r["count"] = static_cast<int>(arr.size());
-                diag::log_tagged_fmt("net_tools", "network_proxy get_history returned=%zu fetched=%zu", arr.size(), history.size());
-                return tool_result_t::ok(std::to_string(arr.size()) + OBFSTR(" proxy exchanges"), r);
-            }
-
-            if (op == "clear_history") {
-                mitm_proxy::clear_history();
-                diag::log_tagged("net_tools", "network_proxy clear_history done");
-                return tool_result_t::ok(OBFSTR("Proxy history cleared"));
-            }
-
-            if (op == "get_exchange") {
-                if (!args.contains("exchange_id") || !args["exchange_id"].is_number())
-                    return tool_result_t::error(OBFSTR("Missing 'exchange_id' parameter"));
-                uint64_t eid = args["exchange_id"].get<uint64_t>();
-                diag::log_tagged_fmt("net_tools", "network_proxy get_exchange eid=%llu", (unsigned long long)eid);
-                const auto* ex = mitm_proxy::find_exchange(eid);
-                if (!ex) {
-                    diag::log_tagged_fmt("net_tools", "network_proxy get_exchange not_found eid=%llu", (unsigned long long)eid);
-                    return tool_result_t::error(OBFSTR("Exchange not found: ") + std::to_string(eid));
-                }
-                diag::log_tagged_fmt("net_tools", "network_proxy get_exchange found eid=%llu method=%s host=%s status=%d", (unsigned long long)eid, ex->request.method.c_str(), ex->target_host.c_str(), ex->response.status_code);
-                json r;
-                r["id"] = ex->id;
-                r["method"] = ex->request.method;
-                r["host"] = ex->target_host;
-                r["port"] = ex->target_port;
-                r["path"] = ex->request.uri;
-                r["status_code"] = ex->response.status_code;
-                r["is_tls"] = ex->is_tls;
-                r["latency_ms"] = ex->latency_ms;
-                json req_headers = json::object();
-                for (const auto& h : ex->request.headers)
-                    req_headers[h.name] = h.value;
-                r["request_headers"] = req_headers;
-                if (!ex->raw_request.empty()) {
-                    std::string req_body(ex->raw_request.begin(), ex->raw_request.end());
-                    r["raw_request"] = req_body.substr(0, std::min<size_t>(4096, req_body.size()));
-                }
-                json resp_headers = json::object();
-                for (const auto& h : ex->response.headers)
-                    resp_headers[h.name] = h.value;
-                r["response_headers"] = resp_headers;
-                if (!ex->raw_response.empty()) {
-                    std::string resp_body(ex->raw_response.begin(), ex->raw_response.end());
-                    r["raw_response"] = resp_body.substr(0, std::min<size_t>(4096, resp_body.size()));
-                }
-                if (ex->is_websocket) {
-                    r["ws_frames_sent"] = ex->ws_frames_sent;
-                    r["ws_frames_recv"] = ex->ws_frames_recv;
-                }
-                if (!ex->tls_sni.empty()) r["tls_sni"] = ex->tls_sni;
-                if (!ex->tls_version_str.empty()) r["tls_version"] = ex->tls_version_str;
-                if (!ex->alpn_protocol.empty()) r["alpn"] = ex->alpn_protocol;
-                return tool_result_t::ok(OBFSTR("Exchange ") + std::to_string(eid), r);
-            }
-
-            diag::log_tagged_fmt("net_tools", "network_proxy unknown_op op=%s", op.c_str());
-            return tool_result_t::error(OBFSTR("Unknown operation. Use start|stop|status|get_history|clear_history|get_exchange"));
-        }, false});
-
-    register_compat(srv, {
-        OBFSTR("network_repeater"), OBFSTR("network"),
-        OBFSTR("HTTP request repeater. Create entries with host/port/request, send them, and inspect responses. "
-               "Like Burp Suite Repeater. Operations: create, send, list, get, delete."),
-        {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("create|send|list|get|delete"), true},
-         {OBFSTR("host"), OBFSTR("string"), OBFSTR("Target host"), false},
-         {OBFSTR("port"), OBFSTR("number"), OBFSTR("Target port"), false},
-         {OBFSTR("use_tls"), OBFSTR("boolean"), OBFSTR("Use HTTPS"), false},
-         {OBFSTR("raw_request"), OBFSTR("string"), OBFSTR("Raw HTTP request to send"), false},
-         {OBFSTR("index"), OBFSTR("number"), OBFSTR("Repeater entry index"), false},
-         {OBFSTR("max_count"), OBFSTR("number"), OBFSTR("Max entries to return for list"), false}},
-        [](const json& args) -> tool_result_t {
-            std::string op = args.value("operation", "");
-            if (op.empty())
-                return tool_result_t::error(OBFSTR("Missing 'operation' parameter"));
-
-            diag::log_tagged_fmt("net_tools", "network_repeater op=%s", op.c_str());
-
-            auto& state = network_view::g_state;
-
-            if (op == "create") {
-                auto entry = std::make_shared<network_view::repeater_entry_t>();
-                entry->host = args.value("host", std::string("localhost"));
-                if (args.contains("port") && args["port"].is_number())
-                    entry->port = static_cast<uint16_t>(args["port"].get<int>());
-                if (args.contains("use_tls") && args["use_tls"].is_boolean())
-                    entry->use_tls = args["use_tls"].get<bool>();
-                if (args.contains("raw_request") && args["raw_request"].is_string())
-                    entry->raw_request = args["raw_request"].get<std::string>();
-                state.repeater_entries.push_back(entry);
-                int idx = static_cast<int>(state.repeater_entries.size()) - 1;
-                diag::log_tagged_fmt("net_tools", "network_repeater create host=%s port=%u use_tls=%d idx=%d", entry->host.c_str(), (unsigned)entry->port, (int)entry->use_tls, idx);
-                json r;
-                r["index"] = idx;
-                r["host"] = entry->host;
-                r["port"] = entry->port;
-                return tool_result_t::ok(OBFSTR("Repeater entry created at index ") + std::to_string(idx), r);
-            }
-
-            if (op == "send") {
-                if (!args.contains("index") || !args["index"].is_number())
-                    return tool_result_t::error(OBFSTR("Missing 'index' parameter"));
-                int idx = args["index"].get<int>();
-                diag::log_tagged_fmt("net_tools", "network_repeater send idx=%d total_entries=%zu", idx, state.repeater_entries.size());
-                if (idx < 0 || idx >= static_cast<int>(state.repeater_entries.size()))
-                    return tool_result_t::error(OBFSTR("Invalid repeater entry index"));
-                std::shared_ptr<network_view::repeater_entry_t> entry = state.repeater_entries[static_cast<size_t>(idx)];
-                if (!entry)
-                    return tool_result_t::error(OBFSTR("Invalid repeater entry"));
-                if (entry->in_progress.load()) {
-                    diag::log_tagged_fmt("net_tools", "network_repeater send already_in_progress idx=%d", idx);
-                    return tool_result_t::error(OBFSTR("Request already in progress for this entry"));
-                }
-                if (args.contains("raw_request") && args["raw_request"].is_string())
-                    entry->raw_request = args["raw_request"].get<std::string>();
-                if (args.contains("host") && args["host"].is_string())
-                    entry->host = args["host"].get<std::string>();
-                if (args.contains("port") && args["port"].is_number())
-                    entry->port = static_cast<uint16_t>(args["port"].get<int>());
-                if (args.contains("use_tls") && args["use_tls"].is_boolean())
-                    entry->use_tls = args["use_tls"].get<bool>();
-                entry->in_progress.store(true);
-                entry->raw_response.clear();
-                entry->status_code = 0;
-                entry->latency_ms = 0;
-                std::string host = entry->host;
-                uint16_t port = entry->port;
-                bool tls = entry->use_tls;
-                std::vector<uint8_t> raw(entry->raw_request.begin(), entry->raw_request.end());
-                diag::log_tagged_fmt("net_tools", "network_repeater send dispatch host=%s port=%u tls=%d raw_size=%zu idx=%d", host.c_str(), (unsigned)port, (int)tls, raw.size(), idx);
-                work_queue::post([entry, host, port, tls, raw]() {
-                    diag::log_tagged_fmt("net_tools", "network_repeater send_worker host=%s port=%u tls=%d raw_size=%zu", host.c_str(), (unsigned)port, (int)tls, raw.size());
-                    auto t0 = GetTickCount64();
-                    auto res = mitm_proxy::repeat_request(host, port, tls, raw);
-                    uint64_t latency = GetTickCount64() - t0;
-                    entry->latency_ms = latency;
-                    if (res.success) {
-                        entry->status_code = res.exchange.response.status_code;
-                        entry->raw_response = std::string(res.exchange.raw_response.begin(),
-                                                          res.exchange.raw_response.end());
-                        diag::log_tagged_fmt("net_tools", "network_repeater send_worker success status=%d latency_ms=%llu resp_size=%zu", entry->status_code, (unsigned long long)latency, entry->raw_response.size());
-                    } else {
-                        entry->status_code = 0;
-                        entry->raw_response = res.error;
-                        diag::log_tagged_fmt("net_tools", "network_repeater send_worker failed error=%s latency_ms=%llu", res.error.c_str(), (unsigned long long)latency);
-                    }
-                    entry->in_progress.store(false);
-                });
-                json r;
-                r["index"] = idx;
-                r["status"] = "sending";
-                return tool_result_t::ok(OBFSTR("Request sent for repeater entry ") + std::to_string(idx), r);
-            }
-
-            if (op == "list") {
-                int max_count = args.value("max_count", static_cast<int>(state.repeater_entries.size()));
-                diag::log_tagged_fmt("net_tools", "network_repeater list max_count=%d total=%zu", max_count, state.repeater_entries.size());
-                json arr = json::array();
-                for (int i = 0; i < static_cast<int>(state.repeater_entries.size()) && i < max_count; i++) {
-                    const auto& e_ptr = state.repeater_entries[static_cast<size_t>(i)];
-                    if (!e_ptr) continue;
-                    const auto& e = *e_ptr;
-                    json ej;
-                    ej["index"] = i;
-                    ej["host"] = e.host;
-                    ej["port"] = e.port;
-                    ej["use_tls"] = e.use_tls;
-                    ej["status_code"] = e.status_code;
-                    ej["latency_ms"] = e.latency_ms;
-                    ej["in_progress"] = e.in_progress.load();
-                    arr.push_back(ej);
-                }
-                json r;
-                r["entries"] = arr;
-                r["count"] = static_cast<int>(state.repeater_entries.size());
-                diag::log_tagged_fmt("net_tools", "network_repeater list returned=%zu total=%zu", arr.size(), state.repeater_entries.size());
-                return tool_result_t::ok(std::to_string(state.repeater_entries.size()) + OBFSTR(" repeater entries"), r);
-            }
-
-            if (op == "get") {
-                if (!args.contains("index") || !args["index"].is_number())
-                    return tool_result_t::error(OBFSTR("Missing 'index' parameter"));
-                int idx = args["index"].get<int>();
-                diag::log_tagged_fmt("net_tools", "network_repeater get idx=%d total=%zu", idx, state.repeater_entries.size());
-                if (idx < 0 || idx >= static_cast<int>(state.repeater_entries.size()))
-                    return tool_result_t::error(OBFSTR("Invalid repeater entry index"));
-                const auto& e_ptr = state.repeater_entries[static_cast<size_t>(idx)];
-                if (!e_ptr)
-                    return tool_result_t::error(OBFSTR("Invalid repeater entry"));
-                const auto& e = *e_ptr;
-                diag::log_tagged_fmt("net_tools", "network_repeater get found idx=%d host=%s port=%u status=%d in_progress=%d", idx, e.host.c_str(), (unsigned)e.port, e.status_code, (int)e.in_progress.load());
-                json r;
-                r["index"] = idx;
-                r["host"] = e.host;
-                r["port"] = e.port;
-                r["use_tls"] = e.use_tls;
-                r["status_code"] = e.status_code;
-                r["latency_ms"] = e.latency_ms;
-                r["in_progress"] = e.in_progress.load();
-                r["raw_request"] = e.raw_request;
-                r["raw_response"] = e.raw_response.substr(0, std::min<size_t>(4096, e.raw_response.size()));
-                return tool_result_t::ok(OBFSTR("Repeater entry ") + std::to_string(idx), r);
-            }
-
-            if (op == "delete") {
-                if (!args.contains("index") || !args["index"].is_number())
-                    return tool_result_t::error(OBFSTR("Missing 'index' parameter"));
-                int idx = args["index"].get<int>();
-                diag::log_tagged_fmt("net_tools", "network_repeater delete idx=%d total=%zu", idx, state.repeater_entries.size());
-                if (idx < 0 || idx >= static_cast<int>(state.repeater_entries.size()))
-                    return tool_result_t::error(OBFSTR("Invalid repeater entry index"));
-                const auto& del_ptr = state.repeater_entries[static_cast<size_t>(idx)];
-                if (del_ptr && del_ptr->in_progress.load()) {
-                    diag::log_tagged_fmt("net_tools", "network_repeater delete blocked_in_progress idx=%d", idx);
-                    return tool_result_t::error(OBFSTR("Cannot delete entry while request is in progress"));
-                }
-                state.repeater_entries.erase(state.repeater_entries.begin() + idx);
-                diag::log_tagged_fmt("net_tools", "network_repeater delete done idx=%d remaining=%zu", idx, state.repeater_entries.size());
-                return tool_result_t::ok(OBFSTR("Repeater entry ") + std::to_string(idx) + OBFSTR(" deleted"));
-            }
-
-            diag::log_tagged_fmt("net_tools", "network_repeater unknown_op op=%s", op.c_str());
-            return tool_result_t::error(OBFSTR("Unknown operation. Use create|send|list|get|delete"));
-        }, false});
 
 }
 

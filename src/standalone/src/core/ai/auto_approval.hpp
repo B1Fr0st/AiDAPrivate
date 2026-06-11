@@ -289,18 +289,17 @@ inline tool_category_t categorize_tool(const std::string& tool_name)
     if (tool_name.size() > 5 && tool_name.substr(0, 5) == "mcp::")
         return tool_category_t::mcp;
 
-    if (tool_name == "list_directory" || tool_name == "read_file" ||
+        if (tool_name == "list_directory" || tool_name == "read_file" ||
         tool_name == "read_file_content" || tool_name == "search_files" ||
         tool_name == "get_file_info" || tool_name == "grep_in_files" ||
         tool_name == "codebase_search" || tool_name == "web_search" ||
         tool_name == "read_memory" || tool_name == "read_memory_string" ||
-        tool_name == "disassemble_address" || tool_name == "disassemble_file" ||
+        tool_name == "disassemble_zydis" || tool_name == "disassemble_file" ||
         tool_name == "get_imports" || tool_name == "get_exports" ||
         tool_name == "get_sections" || tool_name == "get_pe_header" ||
         tool_name == "hex_dump" || tool_name == "hex_dump_file" ||
         tool_name == "list_checkpoints" || tool_name == "list_processes" ||
-        tool_name == "list_modules" || tool_name == "list_threads" ||
-        tool_name == "driver_status")
+        tool_name == "dbg_get_modules_detail")
         return tool_category_t::read_only;
 
     auto has_prefix = [&](const char* p) {
@@ -308,10 +307,9 @@ inline tool_category_t categorize_tool(const std::string& tool_name)
         return tool_name.size() > plen && tool_name.compare(0, plen, p) == 0;
     };
     if (has_prefix("disasm_get_") || has_prefix("disasm_list_") ||
-        has_prefix("disasm_search_") || has_prefix("analysis_get_") ||
-        has_prefix("debugger_get_") || has_prefix("crypto_scanner_get") ||
-        has_prefix("network_get_") || has_prefix("network_capture_status") ||
-        has_prefix("bookmarks_list") || has_prefix("scanner_get_") ||
+        has_prefix("disasm_search_") || tool_name == "analysis_query" ||
+        has_prefix("debugger_get_") ||
+        has_prefix("network_get_") ||
         tool_name == "decompile_function" || tool_name == "disasm_get_comment")
         return tool_category_t::read_only;
 

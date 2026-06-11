@@ -15,6 +15,7 @@
 #include "report_generator.hpp"
 #include "issue.hpp"
 
+#include "../../settings/standalone_compat.hpp"
 #include "../../../helpers/diag_log.hpp"
 
 #include <algorithm>
@@ -780,206 +781,77 @@ void register_api_tools(mcp_standalone::server_t& srv)
     using p = mcp_standalone::tool_param_t;
 
     srv.register_tool({
-        "burp_api_import",
-        "Import an API definition (OpenAPI/Swagger/Postman/HAR/GraphQL SDL). "
-        "source may be a local file path, an http(s) URL, or 'text:<inline>' to import literal content.",
-        {
-            {"format", "string", "Format hint: auto|openapi_json|openapi_yaml|swagger_v2|postman_v2_1|har|graphql_sdl.", false},
-            {"source", "string", "File path, URL, or 'text:' prefix for inline content.", true},
+        "burp_api_manage",
+        "Manage imported API collections and requests. Actions: import, list_collections, get_collection, remove_collection, send_request, audit_collection.",
+        {{"action", "string", "import|list_collections|get_collection|remove_collection|send_request|audit_collection", true},
+         {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted.", false}},
+        false,
+        [](const json& params) -> tool_result_t {
+            const std::string action = compat_action_name(params);
+            const json p = compat_action_payload(params);
+            if (action == "import") return tool_api_import(p);
+            if (action == "list_collections") return tool_api_list(p);
+            if (action == "get_collection") return tool_api_get(p);
+            if (action == "remove_collection") return tool_api_remove(p);
+            if (action == "send_request") return tool_api_send(p);
+            if (action == "audit_collection") return tool_api_audit(p);
+            return compat_unknown_action("burp_api_manage", action);
         },
-        false, tool_api_import,
         mcp_standalone::tool_visibility_t::external_visible
     });
 
     srv.register_tool({
-        "burp_api_list_collections",
-        "List all imported API collections, with their parsed request templates.",
-        {}, true, tool_api_list
+        "burp_graphql_manage",
+        "Manage GraphQL introspection, examples, and requests. Actions: introspect, example, send.",
+        {{"action", "string", "introspect|example|send", true},
+         {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted.", false}},
+        false,
+        [](const json& params) -> tool_result_t {
+            const std::string action = compat_action_name(params);
+            const json p = compat_action_payload(params);
+            if (action == "introspect") return tool_gql_introspect(p);
+            if (action == "example") return tool_gql_example(p);
+            if (action == "send") return tool_gql_send(p);
+            return compat_unknown_action("burp_graphql_manage", action);
+        }
     });
 
     srv.register_tool({
-        "burp_api_get_collection",
-        "Return a single API collection (with all request templates) by id.",
-        { {"collection_id", "number", "Collection id.", true} },
-        true, tool_api_get
+        "burp_ws_manage",
+        "Manage WebSocket connections and frames. Actions: connect, disconnect, send_text, send_binary, send_raw, list_connections, frames, clear_frames.",
+        {{"action", "string", "connect|disconnect|send_text|send_binary|send_raw|list_connections|frames|clear_frames", true},
+         {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted.", false}},
+        false,
+        [](const json& params) -> tool_result_t {
+            const std::string action = compat_action_name(params);
+            const json p = compat_action_payload(params);
+            if (action == "connect") return tool_ws_connect(p);
+            if (action == "disconnect") return tool_ws_disconnect(p);
+            if (action == "send_text") return tool_ws_send_text(p);
+            if (action == "send_binary") return tool_ws_send_binary(p);
+            if (action == "send_raw") return tool_ws_send_raw(p);
+            if (action == "list_connections") return tool_ws_list(p);
+            if (action == "frames") return tool_ws_frames(p);
+            if (action == "clear_frames") return tool_ws_clear(p);
+            return compat_unknown_action("burp_ws_manage", action);
+        }
     });
 
     srv.register_tool({
-        "burp_api_remove_collection",
-        "Remove an imported API collection by id.",
-        { {"collection_id", "number", "Collection id.", true} },
-        false, tool_api_remove
-    });
-
-    srv.register_tool({
-        "burp_api_send_request",
-        "Render an API request template, substitute path/query/header overrides, send it, and "
-        "return the response (also logged into burp_logger as source=api).",
-        {
-            {"collection_id", "number", "Collection id.", true},
-            {"request_id",    "string", "Request template id (operationId / Postman item name).", true},
-            {"path_values",   "object", "Map of path parameter overrides.", false},
-            {"query_values",  "object", "Map of query parameter overrides.", false},
-            {"header_values", "object", "Map of header overrides.", false},
-            {"body_override", "string", "Replace the template body with this raw text.", false},
-            {"enforce_scope", "boolean", "If true, the call must pass scope checks (default false).", false},
-        },
-        false, tool_api_send
-    });
-
-    srv.register_tool({
-        "burp_api_audit_collection",
-        "Send every request in the collection through audit_http (issues are raised into issue_store).",
-        {
-            {"collection_id", "number", "Collection id.", true},
-            {"auth_values",   "object", "Map: bearer|basic|api_key|<header_name> -> value.", false},
-        },
-        false, tool_api_audit
-    });
-
-    srv.register_tool({
-        "burp_graphql_introspect",
-        "Run a standard introspection query against a GraphQL endpoint and parse the schema.",
-        {
-            {"endpoint", "string", "GraphQL endpoint URL.", true},
-            {"headers",  "object", "Extra headers (auth, cookies).", false},
-        },
-        false, tool_gql_introspect
-    });
-
-    srv.register_tool({
-        "burp_graphql_example",
-        "Build an example query selecting nested fields up to the given depth. Uses the cached schema.",
-        {
-            {"endpoint",   "string", "GraphQL endpoint URL.", true},
-            {"field_name", "string", "Top-level Query field name.", true},
-            {"depth",      "number", "Expansion depth (1..5).", false},
-        },
-        true, tool_gql_example
-    });
-
-    srv.register_tool({
-        "burp_graphql_send",
-        "Send a GraphQL query/mutation to the endpoint and return the parsed JSON response.",
-        {
-            {"endpoint",  "string", "GraphQL endpoint URL.", true},
-            {"headers",   "object", "Extra headers.", false},
-            {"query",     "string", "Query / mutation text.", true},
-            {"variables", "object", "Variables JSON object.", false},
-        },
-        false, tool_gql_send
-    });
-
-    srv.register_tool({
-        "burp_ws_connect",
-        "Open a WebSocket (ws:// or wss://) connection and return its connection id.",
-        {
-            {"scheme",      "string",  "'ws' or 'wss'.", true},
-            {"host",        "string",  "Server host.", true},
-            {"port",        "number",  "Server port.", true},
-            {"path",        "string",  "WebSocket path (default '/').", false},
-            {"headers",     "object",  "Extra request headers for the upgrade.", false},
-            {"origin",      "string",  "Origin header.", false},
-            {"subprotocol", "string",  "Sec-WebSocket-Protocol header.", false},
-            {"verify_tls",  "boolean", "Verify server certificate (wss).", false},
-        },
-        false, tool_ws_connect
-    });
-
-    srv.register_tool({
-        "burp_ws_disconnect",
-        "Close an open WebSocket connection.",
-        { {"conn_id", "number", "Connection id from burp_ws_connect.", true} },
-        false, tool_ws_disconnect
-    });
-
-    srv.register_tool({
-        "burp_ws_send_text",
-        "Send a text frame on a WebSocket connection (masked client-to-server per RFC 6455).",
-        {
-            {"conn_id", "number", "Connection id.", true},
-            {"msg",     "string", "Text payload.", true},
-        },
-        false, tool_ws_send_text
-    });
-
-    srv.register_tool({
-        "burp_ws_send_binary",
-        "Send a binary frame (payload base64-decoded).",
-        {
-            {"conn_id",  "number", "Connection id.", true},
-            {"data_b64", "string", "Base64 payload.", true},
-        },
-        false, tool_ws_send_binary
-    });
-
-    srv.register_tool({
-        "burp_ws_send_raw",
-        "Send a raw WebSocket frame with explicit opcode/fin/masked flags.",
-        {
-            {"conn_id",     "number",  "Connection id.", true},
-            {"opcode",      "number",  "Opcode (0..15).", true},
-            {"fin",         "boolean", "FIN flag.", false},
-            {"masked",      "boolean", "Apply RFC 6455 masking.", false},
-            {"payload_b64", "string",  "Base64 payload.", false},
-        },
-        false, tool_ws_send_raw
-    });
-
-    srv.register_tool({
-        "burp_ws_list_connections",
-        "List open WebSocket connections with frame counters and last error.",
-        {}, true, tool_ws_list
-    });
-
-    srv.register_tool({
-        "burp_ws_frames",
-        "Return a slice of frames captured on the connection (preview text plus base64 payload).",
-        {
-            {"conn_id", "number", "Connection id.", true},
-            {"start",   "number", "Starting frame index.", false},
-            {"max",     "number", "Maximum frames to return.", false},
-        },
-        true, tool_ws_frames
-    });
-
-    srv.register_tool({
-        "burp_ws_clear_frames",
-        "Clear the frame log for a connection (does not disconnect).",
-        { {"conn_id", "number", "Connection id.", true} },
-        false, tool_ws_clear
-    });
-
-    srv.register_tool({
-        "burp_logger_query",
-        "Query the unified Burp logger ring buffer (filter object: method, host_regex, url_regex, status_min/max, source, mime_type).",
-        {
-            {"filter", "object", "Filter object.", false},
-            {"limit",  "number", "Maximum rows to return.", false},
-        },
-        true, tool_logger_query
-    });
-
-    srv.register_tool({
-        "burp_logger_total",
-        "Return total row count and ring capacity of the logger.",
-        {}, true, tool_logger_total
-    });
-
-    srv.register_tool({
-        "burp_logger_clear",
-        "Clear the logger ring buffer.",
-        {}, false, tool_logger_clear
-    });
-
-    srv.register_tool({
-        "burp_logger_export_csv",
-        "Export filtered logger rows to a CSV file.",
-        {
-            {"path",   "string", "Output CSV file path.", true},
-            {"filter", "object", "Filter object (same as burp_logger_query).", false},
-        },
-        false, tool_logger_export_csv
+        "burp_logger_manage",
+        "Manage the unified Burp logger ring buffer. Actions: query, total, clear, export_csv.",
+        {{"action", "string", "query|total|clear|export_csv", true},
+         {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted.", false}},
+        false,
+        [](const json& params) -> tool_result_t {
+            const std::string action = compat_action_name(params);
+            const json p = compat_action_payload(params);
+            if (action == "query") return tool_logger_query(p);
+            if (action == "total") return tool_logger_total(p);
+            if (action == "clear") return tool_logger_clear(p);
+            if (action == "export_csv") return tool_logger_export_csv(p);
+            return compat_unknown_action("burp_logger_manage", action);
+        }
     });
 
     srv.register_tool({

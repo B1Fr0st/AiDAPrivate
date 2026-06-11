@@ -397,53 +397,6 @@ static json instruction_to_json(const AsmInstr& ins)
     return entry;
 }
 
-static tool_result_t handle_jump_to_address(const json& params)
-{
-    uint64_t addr = 0;
-    if (!parse_address_param(params, "address", addr)) {
-        diag::log_tagged_fmt("disasm_tools", "jump_to_address_bad_params");
-        return tool_result_t::error("'address' is required (hex string or integer).");
-    }
-    diag::log_tagged_fmt("disasm_tools", "jump_to_address addr=0x%llX",
-        static_cast<unsigned long long>(addr));
-
-    int idx = find_instr_index(g_disasm.file, addr);
-    if (idx < 0) {
-        AsmInstr live{};
-        if (!decode_instruction_at(addr, live)) {
-            diag::log_tagged_fmt("disasm_tools", "jump_to_address_not_found addr=0x%llX instrs=%zu live_decode=0",
-                static_cast<unsigned long long>(addr), g_disasm.file.instrs.size());
-            return tool_result_t::error("Address not found in current disassembly listing and live memory decode failed.");
-        }
-
-        const bool live_active = activate_live_disassembly_for_address(addr);
-        diag::log_tagged_fmt("disasm_tools", "jump_to_address_live addr=0x%llX live_active=%d mnemonic=%s len=%d",
-            static_cast<unsigned long long>(addr),
-            live_active ? 1 : 0,
-            live.mnem,
-            live.len);
-
-        globals::ui::active_center_view = center_view_t::disassembly;
-        json result;
-        result["address"] = hex_u64(addr);
-        result["row_index"] = -1;
-        result["active_center_view"] = "disassembly";
-        result["source"] = live_active ? "live_disassembly" : "live_memory_decode";
-        result["instruction"] = instruction_to_json(live);
-        return tool_result_t::ok(result);
-    }
-    diag::log_tagged_fmt("disasm_tools", "jump_to_address_resolved addr=0x%llX row=%d",
-        static_cast<unsigned long long>(addr), idx);
-
-    globals::ui::active_center_view = center_view_t::disassembly;
-    disasm_view::goto_address(addr, g_disasm);
-
-    json result;
-    result["address"] = hex_u64(addr);
-    result["row_index"] = idx;
-    result["active_center_view"] = "disassembly";
-    return tool_result_t::ok(result);
-}
 
 static tool_result_t handle_get_instruction(const json& params)
 {
@@ -793,6 +746,36 @@ static tool_result_t handle_get_xrefs_from(const json& params)
     return tool_result_t::ok(result);
 }
 
+static tool_result_t handle_get_xrefs(const json& params)
+{
+    const std::string action = compat_action_name(params);
+    const json p = compat_action_payload(params);
+    std::string direction = action.empty() ? p.value("direction", std::string("to")) : action;
+    std::transform(direction.begin(), direction.end(), direction.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (direction == "to")
+        return handle_get_xrefs_to(p);
+    if (direction == "from")
+        return handle_get_xrefs_from(p);
+    if (direction != "both")
+        return tool_result_t::error("get_xrefs unknown direction: " + direction);
+
+    tool_result_t to = handle_get_xrefs_to(p);
+    tool_result_t from = handle_get_xrefs_from(p);
+    if (!to.success)
+        return to;
+    if (!from.success)
+        return from;
+
+    json result;
+    result["address"] = p.contains("address") ? p["address"] : json();
+    result["direction"] = "both";
+    result["to"] = to.data;
+    result["from"] = from.data;
+    result["count"] = to.data.value("count", 0) + from.data.value("count", 0);
+    return tool_result_t::ok(result);
+}
+
 static tool_result_t handle_set_comment(const json& params)
 {
     uint64_t addr = 0;
@@ -853,6 +836,19 @@ static tool_result_t handle_rename_function(const json& params)
     result["new_name"] = new_name;
     result["action"]   = new_name.empty() ? "cleared" : "renamed";
     return tool_result_t::ok(result);
+}
+
+static tool_result_t handle_disasm_annotations_manage(const json& params)
+{
+    const std::string action = compat_action_name(params);
+    const json p = compat_action_payload(params);
+    if (action == "get_comment")
+        return handle_get_comment(p);
+    if (action == "set_comment")
+        return handle_set_comment(p);
+    if (action == "rename_function")
+        return handle_rename_function(p);
+    return compat_unknown_action("disasm_annotations_manage", action);
 }
 
 static tool_result_t handle_get_section_info(const json&)
@@ -1109,186 +1105,13 @@ static tool_result_t handle_get_strings(const json& params)
     return tool_result_t::ok(result);
 }
 
-static tool_result_t handle_ui_set_active_view(const json& params)
-{
-    if (!params.contains("view") || !params["view"].is_string()) {
-        diag::log_tagged_fmt("disasm_tools", "ui_set_active_view_bad_params");
-        return tool_result_t::error("'view' is required.");
-    }
-    std::string name = lower_copy(params["view"].get<std::string>());
-    diag::log_tagged_fmt("disasm_tools", "ui_set_active_view view=%s", name.c_str());
 
-    struct entry_t { const char* key; center_view_t v; };
-    static const entry_t table[] = {
-        {"code_editor",     center_view_t::code_editor},
-        {"disassembly",     center_view_t::disassembly},
-        {"hex_view",        center_view_t::hex_view},
-        {"welcome",         center_view_t::welcome},
-        {"settings",        center_view_t::settings_view},
-        {"settings_view",   center_view_t::settings_view},
-        {"network",         center_view_t::network_view},
-        {"network_view",    center_view_t::network_view},
-        {"memory_scanner",  center_view_t::memory_scanner},
-        {"debugger",        center_view_t::debugger_view},
-        {"debugger_view",   center_view_t::debugger_view},
-        {"pseudocode",      center_view_t::pseudocode},
-        {"struct_recon",    center_view_t::struct_recon},
-        {"crypto_scanner",  center_view_t::crypto_scanner},
-        {"aob_generator",   center_view_t::aob_generator},
-        {"fuzzer",          center_view_t::fuzzer_view},
-        {"xref_browser",    center_view_t::xref_browser},
-        {"snapshot_diff",   center_view_t::snapshot_diff},
-        {"pointer_scanner", center_view_t::pointer_scanner},
-        {"decrypt_oracle",  center_view_t::decrypt_oracle},
-        {"integrity_hunter",center_view_t::integrity_hunter},
-        {"symbolic",        center_view_t::symbolic_view},
-        {"taint",           center_view_t::taint_view},
-        {"deobfuscation",   center_view_t::deobfuscation_view},
-        {"stealth",         center_view_t::stealth_view},
-        {"scan_hub",        center_view_t::scan_hub},
-        {"types_hub",       center_view_t::types_hub},
-        {"analysis_hub",    center_view_t::analysis_hub},
-        {"binary_map",      center_view_t::binary_map},
-        {"graph",           center_view_t::graph_view},
-        {"graph_view",      center_view_t::graph_view},
-    };
 
-    for (const entry_t& e : table) {
-        if (name == e.key) {
-            diag::log_tagged_fmt("disasm_tools", "ui_set_active_view_activated view=%s", e.key);
-            globals::ui::active_center_view = e.v;
-            json result;
-            result["view"]   = e.key;
-            result["status"] = "activated";
-            return tool_result_t::ok(result);
-        }
-    }
-    diag::log_tagged_fmt("disasm_tools", "ui_set_active_view_unknown view=%s", name.c_str());
-    return tool_result_t::error("Unknown view name. Accepted: code_editor, disassembly, hex_view, welcome, settings, network, memory_scanner, debugger, pseudocode, struct_recon, crypto_scanner, aob_generator, fuzzer, xref_browser, snapshot_diff, pointer_scanner, decrypt_oracle, integrity_hunter, symbolic, taint, deobfuscation, stealth, scan_hub, types_hub, analysis_hub, binary_map, graph.");
-}
 
-static tool_result_t handle_bookmarks_add(const json& params)
-{
-    uint64_t addr = 0;
-    if (!parse_address_param(params, "address", addr)) {
-        diag::log_tagged_fmt("disasm_tools", "bookmark_add_bad_params");
-        return tool_result_t::error("'address' is required.");
-    }
-    std::string label;
-    if (params.contains("label") && params["label"].is_string())
-        label = params["label"].get<std::string>();
-    diag::log_tagged_fmt("disasm_tools", "bookmark_add addr=0x%llX label=%s",
-        static_cast<unsigned long long>(addr), label.c_str());
 
-    auto& bms = disasm_view::g_state.bookmarks;
-    for (auto& bm : bms) {
-        if (bm.addr == addr) {
-            if (!label.empty()) bm.label = label;
-            diag::log_tagged_fmt("disasm_tools", "bookmark_add_updated addr=0x%llX",
-                static_cast<unsigned long long>(addr));
-            json result;
-            result["address"] = hex_u64(addr);
-            result["label"]   = bm.label;
-            result["status"]  = "updated";
-            return tool_result_t::ok(result);
-        }
-    }
-    disasm_view::bookmark_t b;
-    b.addr  = addr;
-    b.label = label;
-    bms.push_back(std::move(b));
-    diag::log_tagged_fmt("disasm_tools", "bookmark_add_created addr=0x%llX total=%zu",
-        static_cast<unsigned long long>(addr), bms.size());
-    json result;
-    result["address"] = hex_u64(addr);
-    result["label"]   = label;
-    result["status"]  = "added";
-    return tool_result_t::ok(result);
-}
-
-static tool_result_t handle_bookmarks_remove(const json& params)
-{
-    uint64_t addr = 0;
-    if (!parse_address_param(params, "address", addr)) {
-        diag::log_tagged_fmt("disasm_tools", "bookmark_remove_bad_params");
-        return tool_result_t::error("'address' is required.");
-    }
-    diag::log_tagged_fmt("disasm_tools", "bookmark_remove addr=0x%llX",
-        static_cast<unsigned long long>(addr));
-    auto& bms = disasm_view::g_state.bookmarks;
-    for (auto it = bms.begin(); it != bms.end(); ++it) {
-        if (it->addr == addr) {
-            bms.erase(it);
-            diag::log_tagged_fmt("disasm_tools", "bookmark_remove_ok addr=0x%llX remaining=%zu",
-                static_cast<unsigned long long>(addr), bms.size());
-            json result;
-            result["address"] = hex_u64(addr);
-            result["status"]  = "removed";
-            return tool_result_t::ok(result);
-        }
-    }
-    diag::log_tagged_fmt("disasm_tools", "bookmark_remove_not_found addr=0x%llX",
-        static_cast<unsigned long long>(addr));
-    return tool_result_t::error("Bookmark not found at this address.");
-}
-
-static tool_result_t handle_bookmarks_list(const json&)
-{
-    diag::log_tagged_fmt("disasm_tools", "bookmark_list count=%zu",
-        disasm_view::g_state.bookmarks.size());
-    json arr = json::array();
-    for (const auto& bm : disasm_view::g_state.bookmarks) {
-        json o;
-        o["address"] = hex_u64(bm.addr);
-        o["label"]   = bm.label;
-        arr.push_back(std::move(o));
-    }
-    json result;
-    result["count"]     = arr.size();
-    result["bookmarks"] = std::move(arr);
-    return tool_result_t::ok(result);
-}
-
-static tool_result_t handle_hex_view_open(const json& params)
-{
-    uint64_t addr = 0;
-    if (!parse_address_param(params, "address", addr)) {
-        diag::log_tagged_fmt("disasm_tools", "hex_view_open_bad_params");
-        return tool_result_t::error("'address' is required.");
-    }
-    size_t size = 0x1000;
-    if (params.contains("size") && params["size"].is_number_unsigned()) {
-        size_t v = params["size"].get<size_t>();
-        if (v == 0) return tool_result_t::error("'size' must be > 0.");
-        if (v > (1u << 20)) v = (1u << 20);
-        size = v;
-    }
-    diag::log_tagged_fmt("disasm_tools", "hex_view_open addr=0x%llX size=%zu",
-        static_cast<unsigned long long>(addr), size);
-    if (!hex_view::read_from_process(addr, size)) {
-        std::string err = hex_view::last_error();
-        if (err.empty()) err = "hex_view::read_from_process failed.";
-        diag::log_tagged_fmt("disasm_tools", "hex_view_open_failed addr=0x%llX err=%s",
-            static_cast<unsigned long long>(addr), err.c_str());
-        return tool_result_t::error(err);
-    }
-    diag::log_tagged_fmt("disasm_tools", "hex_view_open_ok addr=0x%llX size=%zu",
-        static_cast<unsigned long long>(addr), size);
-    globals::ui::active_center_view = center_view_t::hex_view;
-    json result;
-    result["address"] = hex_u64(addr);
-    result["size"]    = size;
-    result["status"]  = "opened";
-    return tool_result_t::ok(result);
-}
 
 void register_disasm_tools(mcp_standalone::server_t& srv)
 {
-    srv.register_tool({
-        "disasm_jump_to_address",
-        "Navigate the central Disassembly view to an address. Switches the active center view to disassembly and scrolls the cursor to the requested address.",
-        {{"address", "string", "Target address (hex string or integer)", true}},
-        false, handle_jump_to_address});
 
     srv.register_tool({
         "disasm_get_instruction",
@@ -1318,36 +1141,24 @@ void register_disasm_tools(mcp_standalone::server_t& srv)
         true, handle_list_functions});
 
     srv.register_tool({
-        "disasm_get_xrefs_to",
-        "Return cached cross-references that target an address from the xref_db (call/jump/data_ref). Requires the containing module to have been indexed via the Xref DB panel.",
-        {{"address", "string", "Target address (hex string or integer)", true}},
-        true, handle_get_xrefs_to});
-
-    srv.register_tool({
-        "disasm_get_xrefs_from",
-        "Return cached cross-references that originate at an address from the xref_db. Requires the containing module to have been indexed.",
-        {{"address", "string", "Source address (hex string or integer)", true}},
-        true, handle_get_xrefs_from});
-
-    srv.register_tool({
-        "disasm_set_comment",
-        "Attach (or clear) a comment string for an instruction address. Empty comment deletes the entry.",
+        "get_xrefs",
+        "Return cached cross-references for an address from the xref_db. Set direction to to, from, or both.",
         {{"address", "string", "Address (hex string or integer)", true},
-         {"comment", "string", "Comment text (empty string clears the comment)", false}},
-        false, handle_set_comment});
+         {"direction", "string", "to|from|both; action is accepted as an alias", false},
+         {"action", "string", "Optional alias for direction", false},
+         {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted", false}},
+        true, handle_get_xrefs});
 
     srv.register_tool({
-        "disasm_get_comment",
-        "Return the comment string previously stored for an address (empty when none).",
-        {{"address", "string", "Address (hex string or integer)", true}},
-        true, handle_get_comment});
-
-    srv.register_tool({
-        "disasm_rename_function",
-        "Set (or clear) the user-visible name of a function at an address. Empty name clears the rename and falls back to PDB/synthetic naming. Triggers a disasm view format refresh.",
-        {{"address", "string", "Function start (hex string or integer)", true},
-         {"new_name", "string", "New display name (empty to clear)", false}},
-        false, handle_rename_function});
+        "disasm_annotations_manage",
+        "Manage disassembly annotations. Actions: get_comment, set_comment, rename_function.",
+        {{"action", "string", "get_comment|set_comment|rename_function", true},
+         {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted", false},
+         {"address", "string", "Instruction or function address (hex string or integer)", false},
+         {"comment", "string", "Comment text; empty clears the comment", false},
+         {"new_name", "string", "Function display name; empty clears the rename", false},
+         {"name", "string", "Alias for new_name", false}},
+        false, handle_disasm_annotations_manage});
 
     srv.register_tool({
         "disasm_get_section_info",
@@ -1370,37 +1181,10 @@ void register_disasm_tools(mcp_standalone::server_t& srv)
          {"limit",      "number", "Maximum strings to return (default 2048, max 8192)", false}},
         true, handle_get_strings});
 
-    srv.register_tool({
-        "ui_set_active_view",
-        "Switch the central view to a named panel (disassembly, hex_view, debugger, pseudocode, settings, analysis_hub, etc.).",
-        {{"view", "string", "View name (case-insensitive)", true}},
-        false, handle_ui_set_active_view});
 
-    srv.register_tool({
-        "bookmarks_add",
-        "Add an address to the Disassembly bookmark list with an optional label.",
-        {{"address", "string", "Bookmark address (hex string or integer)", true},
-         {"label",   "string", "Optional descriptive label", false}},
-        false, handle_bookmarks_add});
 
-    srv.register_tool({
-        "bookmarks_remove",
-        "Remove the bookmark at the given address.",
-        {{"address", "string", "Bookmark address (hex string or integer)", true}},
-        false, handle_bookmarks_remove});
 
-    srv.register_tool({
-        "bookmarks_list",
-        "List all addresses currently bookmarked in the Disassembly view.",
-        {},
-        true, handle_bookmarks_list});
 
-    srv.register_tool({
-        "hex_view_open",
-        "Read a range of bytes from the attached process via the kernel driver and open them in the Hex View (size capped to 1 MiB).",
-        {{"address", "string", "Source address (hex string or integer)", true},
-         {"size",    "number", "Number of bytes to read (default 4096, max 1048576)", false}},
-        false, handle_hex_view_open});
 }
 
 }

@@ -62,7 +62,7 @@ static std::optional<tool_result_t> ensure_attached(const json& params)
     diag::log_tagged_fmt("dbg_tools", "ensure_attached: entry");
     if (!device->is_connected()) {
         diag::log_tagged_fmt("dbg_tools", "ensure_attached: driver not connected");
-        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_load first."));
+        return tool_result_t::error(OBFSTR("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
     }
 
     std::uint32_t requested_pid = 0;
@@ -137,7 +137,7 @@ static std::optional<tool_result_t> ensure_attached(const json& params)
 
     if (driver_bridge::attached_pid() == 0) {
         diag::log_tagged_fmt("dbg_tools", "ensure_attached: not attached");
-        return tool_result_t::error(OBFSTR("Not attached. Call driver_attach first or pass target_pid."));
+        return tool_result_t::error(OBFSTR("Not attached. Use sessions_manage action=attach_pid or pass target_pid."));
     }
 
     if (!is_process_alive(driver_bridge::attached_pid()))
@@ -147,7 +147,7 @@ static std::optional<tool_result_t> ensure_attached(const json& params)
         device->clear_process_context();
         return tool_result_t::error(
             OBFSTR("Attached process PID ") + std::to_string(dead_pid) +
-            OBFSTR(" is no longer alive. Call driver_attach again."));
+            OBFSTR(" is no longer alive. Reattach with sessions_manage action=attach_pid."));
     }
 
     if (device->get_dtb() == 0)
@@ -2141,33 +2141,6 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         }
     });
 
-    srv.register_tool({
-        "debugger_get_memory_map",
-        "Snapshot the virtual memory map of the attached process (alias of dbg_get_memory_map).",
-        {},
-        true,
-        [](const json& params) -> tool_result_t {
-            diag::log_tagged_fmt("dbg_tools", "debugger_get_memory_map: entry");
-            if (auto err = ensure_attached(params)) return *err;
-            auto regions = debugger_engine::get_memory_map();
-            diag::log_tagged_fmt("dbg_tools", "debugger_get_memory_map: got %zu regions", regions.size());
-            json arr = json::array();
-            for (const auto& r : regions) {
-                json o;
-                o["base"]    = sa_format_address(r.base);
-                o["size"]    = r.size;
-                o["protect"] = debugger_engine::format_protect(r.protect);
-                o["state"]   = r.state;
-                o["type"]    = r.type;
-                if (!r.module_name.empty()) o["module"] = r.module_name;
-                arr.push_back(std::move(o));
-            }
-            json result;
-            result["count"]   = arr.size();
-            result["regions"] = std::move(arr);
-            return tool_result_t::ok(result);
-        }
-    });
 
     srv.register_tool({
         "debugger_get_callstack",
@@ -2311,7 +2284,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         [](const json& params) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "debugger_set_breakpoint: entry");
             if (!device->is_connected())
-                return tool_result_t::error("Driver not connected. Call driver_load first.");
+                return tool_result_t::error("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first.");
             uint64_t addr = 0;
             if (params.contains("address") && params["address"].is_string()) {
                 auto p = sa_parse_address(params["address"].get<std::string>());
@@ -2458,41 +2431,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         }
     });
 
-    srv.register_tool({
-        "debugger_continue",
-        "Resume the attached process (alias of dbg_run).",
-        {},
-        false,
-        [](const json& params) -> tool_result_t {
-            diag::log_tagged_fmt("dbg_tools", "debugger_continue: entry");
-            if (auto err = ensure_attached(params)) return *err;
-            bool ok = debugger_engine::run_target();
-            diag::log_tagged_fmt("dbg_tools", "debugger_continue: run_target returned ok=%d", (int)ok);
-            if (!ok)
-                return tool_result_t::error(debugger_engine::last_error().empty() ? OBFSTR("run_target failed.") : debugger_engine::last_error());
-            json result;
-            result["status"] = "running";
-            return tool_result_t::ok(result);
-        }
-    });
 
-    srv.register_tool({
-        "debugger_pause",
-        "Pause / break the attached process (alias of dbg_pause).",
-        {},
-        false,
-        [](const json& params) -> tool_result_t {
-            diag::log_tagged_fmt("dbg_tools", "debugger_pause: entry");
-            if (auto err = ensure_attached(params)) return *err;
-            bool ok = debugger_engine::pause_target();
-            diag::log_tagged_fmt("dbg_tools", "debugger_pause: pause_target returned ok=%d", (int)ok);
-            if (!ok)
-                return tool_result_t::error(debugger_engine::last_error().empty() ? OBFSTR("pause_target failed.") : debugger_engine::last_error());
-            json result;
-            result["status"] = "paused";
-            return tool_result_t::ok(result);
-        }
-    });
 
 
 
@@ -2557,102 +2496,10 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 std::to_string(arr.size()) + OBFSTR(" watches."), arr);
         }, true});
 
-    register_compat(srv, {
-        OBFSTR("dbg_start_trace"), OBFSTR("debugger"),
-        OBFSTR("Start instruction tracing on the attached process. Each step records address, "
-               "disassembly, and register state."),
-        {{OBFSTR("max_records"), OBFSTR("number"), OBFSTR("Maximum trace records to keep (default 50000)"), false},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
-        [](const json& params) -> tool_result_t {
-            diag::log_tagged_fmt("dbg_tools", "dbg_start_trace: entry");
-            if (auto err = ensure_attached(params)) return *err;
-            int max_records = params.value("max_records", 50000);
-            diag::log_tagged_fmt("dbg_tools", "dbg_start_trace: max_records=%d", max_records);
-            debugger_engine::start_trace(max_records);
-            diag::log_tagged_fmt("dbg_tools", "dbg_start_trace: trace started");
-            return tool_result_t::ok(OBFSTR("Trace started."));
-        }, false});
 
-    register_compat(srv, {
-        OBFSTR("dbg_stop_trace"), OBFSTR("debugger"),
-        OBFSTR("Stop instruction tracing."),
-        {},
-        [](const json& ) -> tool_result_t {
-            diag::log_tagged_fmt("dbg_tools", "dbg_stop_trace: entry");
-            debugger_engine::stop_trace();
-            diag::log_tagged_fmt("dbg_tools", "dbg_stop_trace: trace stopped");
-            return tool_result_t::ok(OBFSTR("Trace stopped."));
-        }, false});
 
-    register_compat(srv, {
-        OBFSTR("dbg_get_trace"), OBFSTR("debugger"),
-        OBFSTR("Get recorded trace entries. Returns instruction addresses, disassembly, and register diffs."),
-        {{OBFSTR("offset"), OBFSTR("number"), OBFSTR("Start index (default 0)"), false},
-         {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max entries to return (default 200)"), false}},
-        [](const json& params) -> tool_result_t {
-            diag::log_tagged_fmt("dbg_tools", "dbg_get_trace: entry");
-            auto& st = debugger_engine::g_state;
-            std::lock_guard<std::mutex> lk(st.trace_mutex);
-            int offset = params.value("offset", 0);
-            int limit = params.value("limit", 200);
-            if (limit > 1000) limit = 1000;
-            json arr = json::array();
-            for (int i = offset; i < static_cast<int>(st.trace_log.size()) && i < offset + limit; ++i) {
-                auto& tr = st.trace_log[static_cast<size_t>(i)];
-                json tj;
-                tj["index"] = tr.index;
-                tj["address"] = sa_format_address(tr.address);
-                tj["disasm"] = tr.disasm_text;
-                arr.push_back(tj);
-            }
-            json result;
-            result["total"] = st.trace_log.size();
-            result["returned"] = arr.size();
-            const bool expected_empty = st.trace_log.empty() && !st.tracing.load(std::memory_order_acquire);
-            result["expected_empty"] = expected_empty;
-            if (expected_empty)
-                result["empty_reason"] = OBFSTR("trace_not_active_or_no_steps_recorded");
-            result["entries"] = arr;
-            diag::log_tagged_fmt("dbg_tools", "dbg_get_trace: total=%zu returned=%zu", st.trace_log.size(), arr.size());
-            const std::string message = expected_empty
-                ? OBFSTR("Trace is empty because no traced step has been recorded.")
-                : std::to_string(arr.size()) + OBFSTR(" trace entries.");
-            return tool_result_t::ok(message, result);
-        }, true});
 
-    register_compat(srv, {
-        OBFSTR("dbg_set_comment"), OBFSTR("debugger"),
-        OBFSTR("Set a comment annotation at an address."),
-        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address (hex)"), true},
-         {OBFSTR("text"), OBFSTR("string"), OBFSTR("Comment text"), true}},
-        [](const json& params) -> tool_result_t {
-            diag::log_tagged_fmt("dbg_tools", "dbg_set_comment: entry");
-            if (!params.contains("address") || !params.contains("text"))
-                return tool_result_t::error(OBFSTR("'address' and 'text' required."));
-            auto addr = sa_parse_address(params["address"].get<std::string>());
-            if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
-            const std::string text = params["text"].get<std::string>();
-            diag::log_tagged_fmt("dbg_tools", "dbg_set_comment: addr=0x%llX text=%s", (unsigned long long)*addr, text.c_str());
-            debugger_engine::set_comment(*addr, text);
-            return tool_result_t::ok(OBFSTR("Comment set at ") + sa_format_address(*addr));
-        }, false});
 
-    register_compat(srv, {
-        OBFSTR("dbg_set_label"), OBFSTR("debugger"),
-        OBFSTR("Set a label (name) at an address."),
-        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address (hex)"), true},
-         {OBFSTR("text"), OBFSTR("string"), OBFSTR("Label text"), true}},
-        [](const json& params) -> tool_result_t {
-            diag::log_tagged_fmt("dbg_tools", "dbg_set_label: entry");
-            if (!params.contains("address") || !params.contains("text"))
-                return tool_result_t::error(OBFSTR("'address' and 'text' required."));
-            auto addr = sa_parse_address(params["address"].get<std::string>());
-            if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
-            const std::string text = params["text"].get<std::string>();
-            diag::log_tagged_fmt("dbg_tools", "dbg_set_label: addr=0x%llX text=%s", (unsigned long long)*addr, text.c_str());
-            debugger_engine::set_label(*addr, text);
-            return tool_result_t::ok(OBFSTR("Label set at ") + sa_format_address(*addr));
-        }, false});
 
     register_compat(srv, {
         OBFSTR("dbg_toggle_bookmark"), OBFSTR("debugger"),
@@ -2739,23 +2586,6 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             return tool_result_t::ok(OBFSTR("Hardware breakpoint set at ") + sa_format_address(*addr));
         }, false});
 
-    register_compat(srv, {
-        OBFSTR("dbg_toggle_breakpoint"), OBFSTR("debugger"),
-        OBFSTR("Toggle a breakpoint on or off by its index in the breakpoint list."),
-        {{OBFSTR("index"), OBFSTR("number"), OBFSTR("Breakpoint index"), true}},
-        [](const json& params) -> tool_result_t {
-            diag::log_tagged_fmt("dbg_tools", "dbg_toggle_breakpoint: entry");
-            if (!params.contains("index") || !params["index"].is_number())
-                return tool_result_t::error(OBFSTR("'index' is required."));
-            int idx = params["index"].get<int>();
-            diag::log_tagged_fmt("dbg_tools", "dbg_toggle_breakpoint: toggling idx=%d", idx);
-            if (!debugger_engine::toggle_breakpoint(idx)) {
-                diag::log_tagged_fmt("dbg_tools", "dbg_toggle_breakpoint: toggle failed for idx=%d", idx);
-                return tool_result_t::error(OBFSTR("Failed to toggle breakpoint at index ") + std::to_string(idx));
-            }
-            diag::log_tagged_fmt("dbg_tools", "dbg_toggle_breakpoint: toggled idx=%d", idx);
-            return tool_result_t::ok(OBFSTR("Breakpoint toggled."));
-        }, false});
 
     register_compat(srv, {
         OBFSTR("dbg_clear_all_breakpoints"), OBFSTR("debugger"),
@@ -2768,41 +2598,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             return tool_result_t::ok(OBFSTR("All breakpoints cleared."));
         }, false});
 
-    register_compat(srv, {
-        OBFSTR("dbg_get_comment"), OBFSTR("debugger"),
-        OBFSTR("Get the comment annotation at an address."),
-        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address (hex)"), true}},
-        [](const json& params) -> tool_result_t {
-            diag::log_tagged_fmt("dbg_tools", "dbg_get_comment: entry");
-            if (!params.contains("address") || !params["address"].is_string())
-                return tool_result_t::error(OBFSTR("'address' is required."));
-            auto addr = sa_parse_address(params["address"].get<std::string>());
-            if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
-            std::string text = debugger_engine::get_comment(*addr);
-            diag::log_tagged_fmt("dbg_tools", "dbg_get_comment: addr=0x%llX comment=%s", (unsigned long long)*addr, text.c_str());
-            json result;
-            result["address"] = sa_format_address(*addr);
-            result["comment"] = text;
-            return tool_result_t::ok(text.empty() ? OBFSTR("No comment at this address.") : text, result);
-        }, true});
 
-    register_compat(srv, {
-        OBFSTR("dbg_get_label"), OBFSTR("debugger"),
-        OBFSTR("Get the label (name) at an address."),
-        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address (hex)"), true}},
-        [](const json& params) -> tool_result_t {
-            diag::log_tagged_fmt("dbg_tools", "dbg_get_label: entry");
-            if (!params.contains("address") || !params["address"].is_string())
-                return tool_result_t::error(OBFSTR("'address' is required."));
-            auto addr = sa_parse_address(params["address"].get<std::string>());
-            if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
-            std::string text = debugger_engine::get_label(*addr);
-            diag::log_tagged_fmt("dbg_tools", "dbg_get_label: addr=0x%llX label=%s", (unsigned long long)*addr, text.c_str());
-            json result;
-            result["address"] = sa_format_address(*addr);
-            result["label"] = text;
-            return tool_result_t::ok(text.empty() ? OBFSTR("No label at this address.") : text, result);
-        }, true});
 
     register_compat(srv, {
         OBFSTR("dbg_get_bookmarks"), OBFSTR("debugger"),
@@ -2823,161 +2619,8 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 std::to_string(arr.size()) + OBFSTR(" bookmark(s)."), result);
         }, true});
 
-    register_compat(srv, {
-        OBFSTR("dbg_get_xrefs_to"), OBFSTR("debugger"),
-        OBFSTR("Get cross-references to a target address. Scans for CALL, JMP, Jcc, LEA and data refs that point to the given address."),
-        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Target address (hex)"), true},
-         {OBFSTR("max_results"), OBFSTR("number"), OBFSTR("Maximum results to return (default 100)"), false}},
-        [](const json& params) -> tool_result_t {
-            diag::log_tagged_fmt("dbg_tools", "dbg_get_xrefs_to: entry");
-            if (auto err = ensure_attached(params)) return *err;
-            if (!params.contains("address") || !params["address"].is_string())
-                return tool_result_t::error(OBFSTR("'address' is required."));
-            auto addr = sa_parse_address(params["address"].get<std::string>());
-            if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
-            int max_results = params.value("max_results", 100);
-            if (max_results <= 0) max_results = 100;
-            if (max_results > 10000) max_results = 10000;
-            diag::log_tagged_fmt("dbg_tools", "dbg_get_xrefs_to: addr=0x%llX max_results=%d", (unsigned long long)*addr, max_results);
-            auto modules = driver_bridge::enumerate_modules();
-            uint64_t search_start = 0;
-            uint64_t search_size = 0;
-            for (const auto& m : modules) {
-                if (*addr >= m.base && *addr < m.base + m.size) {
-                    search_start = m.base;
-                    search_size = m.size;
-                    break;
-                }
-            }
-            if (search_size == 0) {
-                search_start = (*addr > 0x10000) ? *addr - 0x10000 : 0;
-                search_size = 0x20000;
-            }
-            if (!xref_engine::find_xrefs_to(*addr, search_start, search_size))
-                return tool_result_t::error(OBFSTR("xref scan is still busy after cancellation."));
-            for (int i = 0; i < 300; ++i) {
-                if (!xref_engine::g_state.scanning.load()) break;
-                Sleep(10);
-            }
-            if (xref_engine::g_state.scanning.load()) {
-                diag::log_tagged_fmt("dbg_tools", "dbg_get_xrefs_to: scan timeout, cancelling");
-                xref_engine::cancel_scan();
-            }
-            std::lock_guard<std::mutex> lk(xref_engine::g_state.mutex);
-            json arr = json::array();
-            size_t n = std::min(static_cast<size_t>(max_results), xref_engine::g_state.results.size());
-            for (size_t i = 0; i < n; ++i) {
-                const auto& x = xref_engine::g_state.results[i];
-                json xj;
-                xj["from"] = sa_format_address(x.from_addr);
-                xj["to"] = sa_format_address(x.to_addr);
-                xj["type"] = xref_engine::xref_type_name(x.type);
-                xj["disasm"] = x.disasm_text;
-                if (!x.module_name.empty()) xj["module"] = x.module_name;
-                arr.push_back(std::move(xj));
-            }
-            json result;
-            result["count"] = arr.size();
-            result["total"] = xref_engine::g_state.results.size();
-            result["xrefs"] = std::move(arr);
-            diag::log_tagged_fmt("dbg_tools", "dbg_get_xrefs_to: found %zu xrefs to 0x%llX", xref_engine::g_state.results.size(), (unsigned long long)*addr);
-            return tool_result_t::ok(
-                std::to_string(result["count"].get<size_t>()) + OBFSTR(" xref(s) to ") + sa_format_address(*addr), result);
-        }, true});
 
-    register_compat(srv, {
-        OBFSTR("dbg_get_xrefs_from"), OBFSTR("debugger"),
-        OBFSTR("Get cross-references from a source address. Follows instructions and collects all outgoing CALL, JMP, Jcc, LEA and data refs."),
-        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Source address (hex)"), true},
-         {OBFSTR("max_results"), OBFSTR("number"), OBFSTR("Maximum instructions to scan (default 200)"), false}},
-        [](const json& params) -> tool_result_t {
-            diag::log_tagged_fmt("dbg_tools", "dbg_get_xrefs_from: entry");
-            if (auto err = ensure_attached(params)) return *err;
-            if (!params.contains("address") || !params["address"].is_string())
-                return tool_result_t::error(OBFSTR("'address' is required."));
-            auto addr = sa_parse_address(params["address"].get<std::string>());
-            if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
-            int max_insns = params.value("max_results", 200);
-            if (max_insns <= 0) max_insns = 200;
-            if (max_insns > 10000) max_insns = 10000;
-            std::vector<xref_engine::xref_t> xrefs;
-            xref_engine::find_xrefs_from(*addr, static_cast<size_t>(max_insns), xrefs);
-            json arr = json::array();
-            for (const auto& x : xrefs) {
-                json xj;
-                xj["from"] = sa_format_address(x.from_addr);
-                xj["to"] = sa_format_address(x.to_addr);
-                xj["type"] = xref_engine::xref_type_name(x.type);
-                xj["disasm"] = x.disasm_text;
-                if (!x.module_name.empty()) xj["module"] = x.module_name;
-                arr.push_back(std::move(xj));
-            }
-            json result;
-            result["count"] = arr.size();
-            result["xrefs"] = std::move(arr);
-            diag::log_tagged_fmt("dbg_tools", "dbg_get_xrefs_from: found %zu xrefs from 0x%llX", xrefs.size(), (unsigned long long)*addr);
-            return tool_result_t::ok(
-                std::to_string(result["count"].get<size_t>()) + OBFSTR(" xref(s) from ") + sa_format_address(*addr), result);
-        }, true});
 
-    register_compat(srv, {
-        OBFSTR("dbg_scan_xrefs"), OBFSTR("debugger"),
-        OBFSTR("Scan a memory range for cross-references that target a specific address."),
-        {{OBFSTR("target_address"), OBFSTR("string"), OBFSTR("Address to find references to (hex)"), true},
-         {OBFSTR("start_address"), OBFSTR("string"), OBFSTR("Start of scan range (hex)"), true},
-         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Size of range in bytes (default 0x10000)"), false}},
-        [](const json& params) -> tool_result_t {
-            diag::log_tagged_fmt("dbg_tools", "dbg_scan_xrefs: entry");
-            if (auto err = ensure_attached(params)) return *err;
-            if (!params.contains("target_address") || !params["target_address"].is_string())
-                return tool_result_t::error(OBFSTR("'target_address' is required."));
-            if (!params.contains("start_address") || !params["start_address"].is_string())
-                return tool_result_t::error(OBFSTR("'start_address' is required."));
-            auto target = sa_parse_address(params["target_address"].get<std::string>());
-            if (!target) return tool_result_t::error(OBFSTR("Invalid target_address."));
-            auto start = sa_parse_address(params["start_address"].get<std::string>());
-            if (!start) return tool_result_t::error(OBFSTR("Invalid start_address."));
-            uint64_t size = params.value("size", 0x10000);
-            if (size == 0) size = 0x10000;
-            if (size > 0x1000000) size = 0x1000000;
-            if (!xref_engine::find_xrefs_to(*target, *start, size))
-                return tool_result_t::error(OBFSTR("xref scan is still busy after cancellation."));
-            for (int i = 0; i < 300; ++i) {
-                if (!xref_engine::g_state.scanning.load()) break;
-                Sleep(10);
-            }
-            bool timed_out = false;
-            if (xref_engine::g_state.scanning.load()) {
-                diag::log_tagged_fmt("dbg_tools", "dbg_scan_xrefs: scan timeout, cancelling");
-                timed_out = true;
-                xref_engine::cancel_scan();
-            }
-            std::lock_guard<std::mutex> lk(xref_engine::g_state.mutex);
-            json arr = json::array();
-            for (const auto& x : xref_engine::g_state.results) {
-                json xj;
-                xj["from"] = sa_format_address(x.from_addr);
-                xj["to"] = sa_format_address(x.to_addr);
-                xj["type"] = xref_engine::xref_type_name(x.type);
-                xj["disasm"] = x.disasm_text;
-                if (!x.module_name.empty()) xj["module"] = x.module_name;
-                arr.push_back(std::move(xj));
-            }
-            const std::size_t found_count = arr.size();
-            json result;
-            result["count"] = found_count;
-            result["total_found"] = found_count;
-            result["target"] = sa_format_address(*target);
-            result["range_start"] = sa_format_address(*start);
-            result["range_size"] = size;
-            result["timed_out"] = timed_out;
-            result["xrefs"] = std::move(arr);
-            diag::log_tagged_fmt("dbg_tools", "dbg_scan_xrefs: target=0x%llX start=0x%llX size=0x%llX results=%zu timed_out=%d", (unsigned long long)*target, (unsigned long long)*start, (unsigned long long)size, found_count, timed_out ? 1 : 0);
-            if (timed_out)
-                return tool_result_t{false, OBFSTR("Xref scan did not complete within the timeout."), result};
-            return tool_result_t::ok(
-                OBFSTR("Scan complete. ") + std::to_string(found_count) + OBFSTR(" xref(s) found."), result);
-        }, true});
 
     register_compat(srv, {
         OBFSTR("dbg_build_cfg"), OBFSTR("debugger"),

@@ -496,99 +496,38 @@ static tool_result_t burp_h2_send(const json& params)
 void register_intruder_tools(mcp_standalone::server_t& srv)
 {
     register_compat(srv, {
-        "burp_intruder_start", "burp_intruder",
-        "Start an Intruder/Turbo attack job. Supports sniper, battering_ram, pitchfork, "
-        "clusterbomb, turbo, and race attack modes plus http1_serial/pipelined/pooled, "
-        "http2_multiplexed, and http2_single_packet (Kettle) engine modes.",
-        {
-            { "host", "string", "Target host", true },
-            { "port", "number", "Target port (defaults 443)", false },
-            { "scheme", "string", "'http' or 'https'", false },
-            { "base_request", "string", "Raw HTTP/1.1 request as text", false },
-            { "base_request_b64", "string", "Raw HTTP/1.1 request, base64 encoded", false },
-            { "attack_mode", "string", "sniper|battering_ram|pitchfork|clusterbomb|turbo|race", false },
-            { "engine_mode", "string", "http1_serial|http1_pipelined|http1_pooled|http2_multiplexed|http2_single_packet", false },
-            { "positions", "array", "Array of [offset, length] pairs into base_request", false },
-            { "payload_sets", "array", "Array of arrays of strings, one set per position", false },
-            { "concurrency", "number", "Worker count / inflight streams (default 32)", false },
-            { "rps_cap", "number", "Requests-per-second cap (0 = unbounded)", false },
-            { "total_cap", "number", "Total request cap (0 = exhaust payloads)", false },
-            { "timeout_ms", "number", "Per-request timeout in ms (default 15000)", false },
-            { "follow_redirects", "number", "Max redirect hops (default 0)", false },
-            { "race_gate_size", "number", "Race gate size (default 30)", false },
-            { "race_warmup", "number", "Race warmup count (default 0)", false },
-            { "max_body_bytes", "number", "Max response body bytes captured per request (default 65536)", false }
+        "burp_intruder_manage", "burp_intruder",
+        "Manage Intruder/Turbo attack jobs. Actions: start, status, results, stop, list_jobs, clear.",
+        {{"action", "string", "start|status|results|stop|list_jobs|clear", true},
+         {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted.", false}},
+        [](const json& params) -> tool_result_t {
+            const std::string action = compat_action_name(params);
+            const json p = compat_action_payload(params);
+            if (action == "start") return burp_intruder_start(p);
+            if (action == "status") return burp_intruder_status(p);
+            if (action == "results") return burp_intruder_results(p);
+            if (action == "stop") return burp_intruder_stop(p);
+            if (action == "list_jobs") return burp_intruder_list_jobs(p);
+            if (action == "clear") return burp_intruder_clear(p);
+            return compat_unknown_action("burp_intruder_manage", action);
         },
-        burp_intruder_start, false });
+        false });
 
     register_compat(srv, {
-        "burp_intruder_status", "burp_intruder",
-        "Get the running status of an Intruder job.",
-        { { "job_id", "number", "Job id from burp_intruder_start", true } },
-        burp_intruder_status, true });
-
-    register_compat(srv, {
-        "burp_intruder_results", "burp_intruder",
-        "Retrieve Intruder job results.",
-        {
-            { "job_id", "number", "Job id", true },
-            { "start", "number", "Result start index (default 0)", false },
-            { "max", "number", "Max results returned (default 100)", false }
+        "burp_param_miner_manage", "burp_param_miner",
+        "Manage hidden parameter discovery jobs. Actions: start, status, results, stop.",
+        {{"action", "string", "start|status|results|stop", true},
+         {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted.", false}},
+        [](const json& params) -> tool_result_t {
+            const std::string action = compat_action_name(params);
+            const json p = compat_action_payload(params);
+            if (action == "start") return burp_param_miner_start(p);
+            if (action == "status") return burp_param_miner_status(p);
+            if (action == "results") return burp_param_miner_results(p);
+            if (action == "stop") return burp_param_miner_stop(p);
+            return compat_unknown_action("burp_param_miner_manage", action);
         },
-        burp_intruder_results, true });
-
-    register_compat(srv, {
-        "burp_intruder_stop", "burp_intruder",
-        "Cancel a running Intruder job.",
-        { { "job_id", "number", "Job id", true } },
-        burp_intruder_stop, false });
-
-    register_compat(srv, {
-        "burp_intruder_list_jobs", "burp_intruder",
-        "Enumerate all Intruder jobs.",
-        {},
-        burp_intruder_list_jobs, true });
-
-    register_compat(srv, {
-        "burp_intruder_clear", "burp_intruder",
-        "Forget an Intruder job (cancels if running).",
-        { { "job_id", "number", "Job id", true } },
-        burp_intruder_clear, false });
-
-    register_compat(srv, {
-        "burp_param_miner_start", "burp_param_miner",
-        "Start a hidden parameter discovery job over a target URL.",
-        {
-            { "target_url", "string", "Absolute URL to probe", true },
-            { "location", "string", "query|body_form|json_body|header|cookie", false },
-            { "wordlist_id", "string", "Payload library wordlist id (e.g. 'params/common')", false },
-            { "custom_words", "array", "Optional custom parameter name list", false },
-            { "concurrency", "number", "Worker count (default 8, max 16)", false },
-            { "throttle_ms", "number", "Per-request delay in ms", false },
-            { "timeout_ms", "number", "Per-request timeout (default 12000)", false },
-            { "baseline_count", "number", "Baseline sample count (default 5)", false },
-            { "diff_sigma_threshold", "number", "Standard-deviation threshold for size diff (default 3.0)", false },
-            { "report_as_issues", "boolean", "Emit hits to the issue store (default true)", false }
-        },
-        burp_param_miner_start, false });
-
-    register_compat(srv, {
-        "burp_param_miner_status", "burp_param_miner",
-        "Get the status of a param miner job.",
-        { { "id", "number", "Job id", true } },
-        burp_param_miner_status, true });
-
-    register_compat(srv, {
-        "burp_param_miner_results", "burp_param_miner",
-        "Retrieve hits from a param miner job.",
-        { { "id", "number", "Job id", true } },
-        burp_param_miner_results, true });
-
-    register_compat(srv, {
-        "burp_param_miner_stop", "burp_param_miner",
-        "Cancel a running param miner job.",
-        { { "id", "number", "Job id", true } },
-        burp_param_miner_stop, false });
+        false });
 
     register_compat(srv, {
         "burp_h2_send", "burp_h2",

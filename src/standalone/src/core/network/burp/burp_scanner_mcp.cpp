@@ -283,99 +283,30 @@ void register_scanner_tools(mcp_standalone::server_t& srv)
     issue_store::initialize();
 
     register_compat(srv, {
-        "burp_scanner_start_audit", "scanner",
-        "Start a Burp-style active vulnerability audit against a single HTTP target. "
-        "Accepts a target URL plus a raw HTTP/1.1 request (either text or base64). "
-        "Optionally restrict to enabled modules, set scope-only behavior, redirect-following, "
-        "timeout, parallelism, throttle, and per-module request cap. Returns an audit_id.",
-        {
-            {"url", "string", "Target URL (e.g. https://target.example/path?id=1)", true},
-            {"raw_request", "string", "Raw HTTP/1.1 textual request (mutually exclusive with raw_request_b64)", false},
-            {"raw_request_b64", "string", "Base64-encoded raw request bytes", false},
-            {"modules", "array", "Optional list of module ids to enable (e.g. ['sqli','xss']); empty = all", false},
-            {"scope_only", "boolean", "Refuse audits for URLs outside the configured scope (default true)", false},
-            {"follow_redirects", "boolean", "Follow 3xx Location redirects (default false)", false},
-            {"timeout_ms", "number", "Per-request timeout in milliseconds (default 15000)", false},
-            {"max_concurrent", "number", "Maximum concurrent in-flight requests for this audit (default 16)", false},
-            {"throttle_ms", "number", "Inter-request throttle in milliseconds (default 0)", false},
-            {"per_module_cap", "number", "Maximum requests any one module may issue (default 64)", false}
+        "burp_scanner_manage", "scanner",
+        "Manage Burp-style active/passive scanning and issue storage. Actions: start_audit, audit_status, list_audits, cancel, list_issues, get_issue, clear_issues, passive_status, list_modules, passive_enable.",
+        {{"action", "string", "start_audit|audit_status|list_audits|cancel|list_issues|get_issue|clear_issues|passive_status|list_modules|passive_enable", true},
+         {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted.", false}},
+        [](const json& params) -> tool_result_t {
+            const std::string action = compat_action_name(params);
+            const json p = compat_action_payload(params);
+            if (action == "start_audit") return tool_start_audit(p);
+            if (action == "audit_status") return tool_audit_status(p);
+            if (action == "list_audits") return tool_list_audits(p);
+            if (action == "cancel") return tool_cancel(p);
+            if (action == "list_issues") return tool_list_issues(p);
+            if (action == "get_issue") return tool_get_issue(p);
+            if (action == "clear_issues") return tool_clear_issues(p);
+            if (action == "passive_status") return tool_passive_status(p);
+            if (action == "list_modules") return tool_list_modules(p);
+            if (action == "passive_enable") return tool_passive_enable(p);
+            return compat_unknown_action("burp_scanner_manage", action);
         },
-        tool_start_audit, false
-    });
-
-    register_compat(srv, {
-        "burp_scanner_audit_status", "scanner",
-        "Get progress and result counters for a single audit.",
-        {{"audit_id", "number", "The id returned by burp_scanner_start_audit", true}},
-        tool_audit_status, true
-    });
-
-    register_compat(srv, {
-        "burp_scanner_list_audits", "scanner",
-        "List all known audits (running and completed) with summary counters.",
-        {},
-        tool_list_audits, true
-    });
-
-    register_compat(srv, {
-        "burp_scanner_cancel", "scanner",
-        "Cancel a running audit. Workers stop within ~1 second.",
-        {{"audit_id", "number", "Audit id to cancel", true}},
-        tool_cancel, false
-    });
-
-    register_compat(srv, {
-        "burp_scanner_list_issues", "scanner",
-        "List discovered issues filtered by severity, confidence, host substring, type-key substring, audit_id, or limit. "
-        "Output schema matches burp_scanner_get_issue per-item.",
-        {
-            {"severity_min", "string", "info|low|medium|high|critical", false},
-            {"confidence_min", "string", "tentative|firm|certain", false},
-            {"host", "string", "Substring filter on host", false},
-            {"type", "string", "Substring filter on type_key (e.g. 'sqli', 'xss')", false},
-            {"audit_id", "number", "Restrict to issues from this audit", false},
-            {"limit", "number", "Cap the number of issues returned", false}
-        },
-        tool_list_issues, true
-    });
-
-    register_compat(srv, {
-        "burp_scanner_get_issue", "scanner",
-        "Get the full issue record including description, remediation, CWE list, and evidence (request/response snippets).",
-        {{"issue_id", "number", "Issue id", true}},
-        tool_get_issue, true
-    });
-
-    register_compat(srv, {
-        "burp_scanner_passive_status", "scanner",
-        "Get passive scanner counters (exchanges scanned, issues produced, last-scan timestamp) and enable state.",
-        {},
-        tool_passive_status, true
-    });
-
-    register_compat(srv, {
-        "burp_scanner_list_modules", "scanner",
-        "List all registered scanner modules with id, name, and category.",
-        {},
-        tool_list_modules, true
-    });
-
-    register_compat(srv, {
-        "burp_scanner_clear_issues", "scanner",
-        "Delete all stored issues (irreversible).",
-        {},
-        tool_clear_issues, false
-    });
-
-    register_compat(srv, {
-        "burp_scanner_passive_enable", "scanner",
-        "Enable or disable the passive scanner globally without unsubscribing.",
-        {{"enabled", "boolean", "True to enable passive scanning, false to mute it", true}},
-        tool_passive_enable, false
+        false
     });
 
     diag::log_tagged_fmt("burp", "burp_scanner_mcp registered %zu tools (modules=%zu)",
-        static_cast<size_t>(10), scanner::count());
+        static_cast<size_t>(1), scanner::count());
 }
 
 }

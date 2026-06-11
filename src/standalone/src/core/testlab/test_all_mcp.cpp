@@ -93,7 +93,6 @@ namespace {
     uint64_t g_mcp_dbg_sw_addr = 0;
     uint64_t g_mcp_integrity_addr = 0;
     uint64_t g_mcp_emulation_addr = 0;
-    uint64_t g_mcp_emulate_function_addr = 0;
     uint64_t g_mcp_fuzz_addr = 0;
     uint64_t g_mcp_fuzz_input_addr = 0;
     int g_mcp_debugger_bp_index = -1;
@@ -410,7 +409,6 @@ namespace {
 
     bool is_destructive_mcp_tool(const std::string& name) {
         static const std::set<std::string> exact = {
-            "driver_write_kernel_memory",
             "driver_call_function"
         };
         return exact.find(lower_copy(name)) != exact.end();
@@ -532,39 +530,18 @@ namespace {
 
     bool tool_may_change_target(const std::string& name) {
         static const std::set<std::string> names = {
-            "driver_attach",
-            "driver_detach",
-            "sessions_open_file",
-            "sessions_attach_pid",
-            "sessions_run_binary",
-            "sessions_close"
+            "sessions_manage"
         };
         return names.find(name) != names.end();
     }
 
     bool tool_uses_live_target(const std::string& name) {
         static const std::set<std::string> no_target_required = {
-            "driver_load",
-            "driver_status",
-            "driver_detach",
+            "debugger_get_attached",
             "driver_enumerate_kernel_modules",
-            "driver_read_kernel_memory",
-            "driver_write_kernel_memory"
         };
         if (no_target_required.find(name) != no_target_required.end())
             return false;
-        if (name == "scan_mem_start" ||
-            name == "scan_mem_next" ||
-            name == "scan_mem_results" ||
-            name == "scan_mem_reset" ||
-            name == "pointer_scan_start" ||
-            name == "pointer_scan_results" ||
-            name == "find_what_accesses" ||
-            name == "watch_memory_layout" ||
-            name == "assert_memory_type" ||
-            name == "api_monitor_start") {
-            return true;
-        }
         return name.rfind("driver_", 0) == 0 ||
             name.rfind("dbg_", 0) == 0 ||
             name.rfind("debugger_", 0) == 0 ||
@@ -572,25 +549,17 @@ namespace {
             name.rfind("memory_", 0) == 0 ||
             name == "decompile_function" ||
             name == "scan_crypto_constants" ||
-            name == "crypto_scanner_run" ||
-            name == "crypto_scanner_get_results" ||
-            name == "generate_aob_signature" ||
+                        name == "generate_aob_signature" ||
             name == "reconstruct_struct" ||
-            name == "start_fuzz" ||
-            name == "stop_fuzz" ||
-            name == "get_fuzz_results" ||
+            name == "fuzzer_manage" ||
             name == "auto_decrypt_strings" ||
             name == "hunt_integrity_checkers" ||
             name == "neutralize_integrity_node" ||
-            name == "start_live_monitor" ||
-            name == "stop_live_monitor" ||
+            name == "live_monitor_manage" ||
             name == "trace_execution_unicorn" ||
             name == "analyze_vm_handler" ||
             name == "emulate_multi_trace" ||
-            name == "emulate_function" ||
-            name == "symbolic_deobfuscate" ||
-            name == "symbolic_slice_function" ||
-            name == "symbolic_solve_path" ||
+            name == "symbolic_execution" ||
             name == "taint_trace_register";
     }
 
@@ -858,16 +827,11 @@ namespace {
     bool mcp_tool_requires_live_camoufox_bridge(const std::string& name) {
         const std::string n = lower_copy(name);
         static const char* tools[] = {
-            "web_search", "webfetch", "burp_dom_xss_status", "burp_dom_xss_test_payload",
-            "burp_dom_xss_scan", "list_pages", "new_page", "select_page", "close_page",
-            "navigate", "reload", "take_screenshot", "take_snapshot", "click", "type_text",
-            "wait_for", "get_page_info", "reset_browser_state", "evaluate_js", "hook_function",
-            "add_init_script", "inject_hook_preset", "remove_hooks", "get_console_logs",
-            "network_capture", "list_network_requests", "get_network_request",
-            "get_request_initiator", "intercept_request", "scripts", "search_code", "cookies",
-            "get_storage", "export_state", "import_state", "hook_jsvmp_interpreter", "compare_env",
-            "instrumentation", "verify_signer_offline", "trace_property_access", "list_trace_files",
-            "query_trace_file", "analyze_cookie_sources"
+            "web_search", "webfetch", "burp_dom_xss_manage",
+            "browser_lifecycle", "browser_navigation", "browser_interaction",
+            "browser_inspect", "browser_state", "browser_network", "browser_hooks",
+            "browser_instrumentation", "get_console_logs", "scripts", "search_code",
+            "compare_env", "verify_signer_offline", "analyze_cookie_sources"
         };
         for (const char* tool : tools) {
             if (n == tool)
@@ -1190,16 +1154,10 @@ namespace {
     std::string mcp_tool_domain(const std::string& tool_name) {
         const std::string name = lower_copy(tool_name);
         static const std::set<std::string> camoufox_tools = {
-            "check_environment", "launch_browser", "close_browser", "list_pages", "new_page",
-            "select_page", "close_page", "reset_browser_state",
-            "add_init_script", "navigate", "reload", "take_screenshot", "take_snapshot",
-            "click", "type_text", "wait_for", "get_page_info", "evaluate_js",
-            "hook_function", "inject_hook_preset", "remove_hooks", "get_console_logs",
-            "network_capture", "list_network_requests", "get_network_request", "get_request_initiator",
-            "intercept_request", "scripts", "search_code", "cookies", "get_storage",
-            "export_state", "import_state", "hook_jsvmp_interpreter", "compare_env",
-            "instrumentation", "verify_signer_offline", "trace_property_access",
-            "list_trace_files", "query_trace_file", "analyze_cookie_sources",
+            "browser_lifecycle", "browser_navigation", "browser_interaction", "browser_inspect",
+            "browser_state", "browser_network", "browser_hooks", "browser_instrumentation",
+            "get_console_logs", "scripts", "search_code", "compare_env",
+            "verify_signer_offline", "analyze_cookie_sources",
         };
         if (name.rfind("burp_", 0) == 0)
             return "burp";
@@ -1211,8 +1169,7 @@ namespace {
             return "debugger";
         if (name.rfind("network_", 0) == 0 || name == "mitm_status")
             return "network";
-        if (name.rfind("scanner_", 0) == 0 || name.rfind("scan_mem_", 0) == 0 ||
-            name.rfind("pointer_scan_", 0) == 0 || name.rfind("memory_", 0) == 0)
+        if (name.rfind("scanner_", 0) == 0 || name.rfind("memory_", 0) == 0)
             return "scanner";
         if (name.rfind("analysis_", 0) == 0 || name.rfind("disasm_", 0) == 0 ||
             name.find("decompile") != std::string::npos)
@@ -2090,43 +2047,43 @@ namespace {
             return missing_required_u64_arg(args, key, reason);
         };
 
-        if (tool_lc == "burp_crawler_status" ||
-            tool_lc == "burp_crawler_stop")
+        if (tool_lc == "burp_crawler_manage" ||
+            tool_lc == "burp_crawler_manage")
             return require("crawl_id");
-        if (tool_lc == "burp_content_discovery_status" ||
-            tool_lc == "burp_content_discovery_results" ||
-            tool_lc == "burp_content_discovery_stop")
+        if (tool_lc == "burp_content_discovery_manage" ||
+            tool_lc == "burp_content_discovery_manage" ||
+            tool_lc == "burp_content_discovery_manage")
             return require("disc_id");
-        if (tool_lc == "burp_subdomain_enum_status" ||
-            tool_lc == "burp_subdomain_enum_results")
+        if (tool_lc == "burp_subdomain_enum_manage" ||
+            tool_lc == "burp_subdomain_enum_manage")
             return require("sub_id");
-        if (tool_lc == "burp_intruder_status" ||
-            tool_lc == "burp_intruder_results" ||
-            tool_lc == "burp_intruder_stop" ||
-            tool_lc == "burp_intruder_clear")
+        if (tool_lc == "burp_intruder_manage" ||
+            tool_lc == "burp_intruder_manage" ||
+            tool_lc == "burp_intruder_manage" ||
+            tool_lc == "burp_intruder_manage")
             return require("job_id");
-        if (tool_lc == "burp_param_miner_status" ||
-            tool_lc == "burp_param_miner_results" ||
-            tool_lc == "burp_param_miner_stop")
+        if (tool_lc == "burp_param_miner_manage" ||
+            tool_lc == "burp_param_miner_manage" ||
+            tool_lc == "burp_param_miner_manage")
             return require("id");
-        if (tool_lc == "burp_sequencer_status" ||
-            tool_lc == "burp_sequencer_stop" ||
-            tool_lc == "burp_sequencer_samples" ||
-            tool_lc == "burp_sequencer_analyze" ||
-            tool_lc == "burp_sequencer_delete")
+        if (tool_lc == "burp_sequencer_manage" ||
+            tool_lc == "burp_sequencer_manage" ||
+            tool_lc == "burp_sequencer_manage" ||
+            tool_lc == "burp_sequencer_manage" ||
+            tool_lc == "burp_sequencer_manage")
             return require("collection_id");
-        if (tool_lc == "burp_ws_disconnect" ||
-            tool_lc == "burp_ws_send_text" ||
-            tool_lc == "burp_ws_send_binary" ||
-            tool_lc == "burp_ws_send_raw" ||
-            tool_lc == "burp_ws_frames" ||
-            tool_lc == "burp_ws_clear_frames")
+        if (tool_lc == "burp_ws_manage" ||
+            tool_lc == "burp_ws_manage" ||
+            tool_lc == "burp_ws_manage" ||
+            tool_lc == "burp_ws_manage" ||
+            tool_lc == "burp_ws_manage" ||
+            tool_lc == "burp_ws_manage")
             return require("conn_id");
-        if (tool_lc == "burp_collaborator_get_interaction")
+        if (tool_lc == "burp_collaborator_manage")
             return require("id");
-        if (tool_lc == "burp_comparer_remove_slot")
+        if (tool_lc == "burp_comparer_manage")
             return require("slot_id");
-        if (tool_lc == "burp_comparer_diff") {
+        if (tool_lc == "burp_comparer_manage") {
             uint64_t slot_a = 0;
             uint64_t slot_b = 0;
             if (!positive_u64_arg(args, "slot_a", slot_a)) {
@@ -2262,7 +2219,7 @@ namespace {
             }
         }
 
-        if (tool_lc == "cert_generate_ca") {
+        if (tool_lc == "cert_manage") {
             if (find_payload_key_recursive(ir.data, "key_der_hex") ||
                 find_payload_key_recursive(ir.data, "private_key_der") ||
                 find_payload_key_recursive(ir.data, "private_key_pem")) {
@@ -2271,7 +2228,7 @@ namespace {
             }
         }
 
-        if (tool_lc == "autoresponder_export_rules") {
+        if (tool_lc == "autoresponder_manage") {
             std::string path;
             bool wrote_file = false;
             uint64_t file_size = 0;
@@ -2284,8 +2241,7 @@ namespace {
             }
         }
 
-        if (tool_lc == "driver_write_kernel_memory" ||
-            tool_lc == "driver_call_function") {
+        if (tool_lc == "driver_call_function") {
             bool validate_only = false;
             (void)payload_bool_field(ir.data, "validate_only", validate_only);
             const bool dry_run = payload_text_contains(ir, "dry-run") ||
@@ -2293,22 +2249,7 @@ namespace {
                 payload_text_contains(ir, "no remote execution performed") ||
                 payload_text_contains(ir, "without executing") ||
                 payload_text_contains(ir, "without writing memory");
-            if (tool_lc == "driver_write_kernel_memory") {
-                uint64_t requested = 0;
-                uint64_t written = 1;
-                if (validate_only) {
-                    if (!payload_u64_field(ir.data, "requested", requested) || requested == 0 ||
-                        !payload_u64_field(ir.data, "bytes_written", written) || written != 0) {
-                        reason = "kernel_write_validate_payload_invalid";
-                        return true;
-                    }
-                    return false;
-                }
-                if (!payload_u64_field(ir.data, "bytes_written", written) || written == 0) {
-                    reason = "kernel_write_bytes=0";
-                    return true;
-                }
-            } else if (tool_lc == "driver_call_function") {
+            if (tool_lc == "driver_call_function") {
                 std::string function_addr;
                 uint64_t pid = 0;
                 if (dry_run) {
@@ -2323,7 +2264,7 @@ namespace {
             }
         }
 
-        if (tool_lc == "cert_inject") {
+        if (tool_lc == "cert_manage") {
             bool validate_only = false;
             bool success = false;
             std::string thumbprint;
@@ -2340,7 +2281,7 @@ namespace {
             }
         }
 
-        if (tool_lc == "cert_remove") {
+        if (tool_lc == "cert_manage") {
             bool validate_only = false;
             bool removed = false;
             if ((payload_bool_field(ir.data, "validate_only", validate_only) && validate_only) ||
@@ -2351,21 +2292,7 @@ namespace {
             }
         }
 
-        if (tool_lc == "pin_bypass_revert") {
-            bool reverted = false;
-            bool active_after = true;
-            const bool have_active_after = payload_bool_field(ir.data, "active_after", active_after);
-            if (!payload_bool_field(ir.data, "reverted", reverted)) {
-                reason = "pin_bypass_revert_payload_missing_reverted";
-                return true;
-            }
-            if (!reverted && !(have_active_after && !active_after)) {
-                reason = "pin_bypass_revert_no_active_state";
-                return true;
-            }
-        }
-
-        if (tool_lc == "burp_api_audit_collection") {
+        if (tool_lc == "burp_api_manage") {
             uint64_t requests_sent = 0;
             uint64_t requests_failed = 0;
             if (payload_u64_field(ir.data, "requests_sent", requests_sent) && requests_sent == 0) {
@@ -2378,7 +2305,7 @@ namespace {
             }
         }
 
-        if (tool_lc == "burp_intruder_results") {
+        if (tool_lc == "burp_intruder_manage") {
             uint64_t count = 0;
             uint64_t error_count = 0;
             uint64_t successful_count = 0;
@@ -2396,7 +2323,7 @@ namespace {
             }
         }
 
-        if (tool_lc == "autoresponder_export_rules") {
+        if (tool_lc == "autoresponder_manage") {
             uint64_t rule_count = 0;
             uint64_t file_size = 0;
             bool wrote_file = false;
@@ -2414,7 +2341,7 @@ namespace {
             }
         }
 
-        if (tool_lc == "network_clear_filters") {
+        if (tool_lc == "network_filter_manage") {
             uint64_t before_count = 0;
             uint64_t after_count = 0;
             uint64_t cleared_count = 0;
@@ -2430,7 +2357,7 @@ namespace {
             }
         }
 
-        if (tool_lc == "burp_collaborator_clear") {
+        if (tool_lc == "burp_collaborator_manage") {
             uint64_t before_count = 0;
             uint64_t after_count = 1;
             uint64_t cleared_count = 0;
@@ -2442,7 +2369,7 @@ namespace {
             }
         }
 
-        if (tool_lc == "burp_comparer_clear") {
+        if (tool_lc == "burp_comparer_manage") {
             uint64_t before_count = 0;
             uint64_t after_count = 1;
             uint64_t cleared_count = 0;
@@ -2462,7 +2389,7 @@ namespace {
             }
         }
 
-        if (tool_lc == "network_get_packets") {
+        if (tool_lc == "network_capture_manage") {
             if (ir.data.is_array() && !ir.data.empty())
                 return false;
             size_t packets = 1;
@@ -2499,7 +2426,7 @@ namespace {
             }
         }
 
-        if (tool_lc == "network_bandwidth_per_process") {
+        if (tool_lc == "network_bandwidth_manage") {
             uint64_t count = 1;
             size_t processes = 1;
             if ((payload_u64_field(ir.data, "count", count) && count == 0) ||
@@ -2583,8 +2510,8 @@ namespace {
             }
         }
 
-        if (tool_lc == "quic_detect_connections" ||
-            tool_lc == "dtls_detect_sessions") {
+        if (tool_lc == "quic_manage" ||
+            tool_lc == "dtls_manage") {
             uint64_t count = 1;
             size_t items = 1;
             if ((payload_u64_field(ir.data, "count", count) && count > 0) ||
@@ -2612,18 +2539,18 @@ namespace {
             }
         }
 
-        if (tool_lc == "burp_crawler_list" ||
-            tool_lc == "burp_intruder_list_jobs" ||
-            tool_lc == "burp_scanner_list_audits" ||
-            tool_lc == "burp_ws_list_connections" ||
-            tool_lc == "burp_logger_query" ||
+        if (tool_lc == "burp_crawler_manage" ||
+            tool_lc == "burp_intruder_manage" ||
+            tool_lc == "burp_scanner_manage" ||
+            tool_lc == "burp_ws_manage" ||
+            tool_lc == "burp_logger_manage" ||
             tool_lc == "burp_tech_inventory" ||
-            tool_lc == "burp_content_discovery_results" ||
-            tool_lc == "burp_subdomain_enum_results" ||
-            tool_lc == "burp_param_miner_results" ||
-            tool_lc == "burp_sequencer_list_collections" ||
+            tool_lc == "burp_content_discovery_manage" ||
+            tool_lc == "burp_subdomain_enum_manage" ||
+            tool_lc == "burp_param_miner_manage" ||
+            tool_lc == "burp_sequencer_manage" ||
             tool_lc == "burp_report_list" ||
-            tool_lc == "burp_scanner_list_issues") {
+            tool_lc == "burp_scanner_manage") {
             size_t items = 1;
             uint64_t count = 1;
             if ((ir.data.is_array() && ir.data.empty()) ||
@@ -2646,7 +2573,7 @@ namespace {
         if (tool_lc == "burp_payloads_list" ||
             tool_lc == "burp_payloads_get" ||
             tool_lc == "burp_payloads_search" ||
-            tool_lc == "burp_collaborator_list_tokens") {
+            tool_lc == "burp_collaborator_manage") {
             size_t items = 1;
             uint64_t count = 1;
             if ((ir.data.is_array() && ir.data.empty()) ||
@@ -2662,7 +2589,7 @@ namespace {
             }
         }
 
-        if (tool_lc == "burp_crawler_status") {
+        if (tool_lc == "burp_crawler_manage") {
             bool had_count = false;
             bool had_positive = false;
             auto probe_count = [&](const char* key) {
@@ -2688,7 +2615,7 @@ namespace {
             }
         }
 
-        if (tool_lc == "burp_content_discovery_status") {
+        if (tool_lc == "burp_content_discovery_manage") {
             uint64_t attempts = 1;
             uint64_t hits = 1;
             uint64_t total = 1;
@@ -2700,7 +2627,7 @@ namespace {
             }
         }
 
-        if (tool_lc == "burp_subdomain_enum_status") {
+        if (tool_lc == "burp_subdomain_enum_manage") {
             uint64_t attempts = 1;
             uint64_t resolved = 1;
             uint64_t results = 1;
@@ -2712,7 +2639,7 @@ namespace {
             }
         }
 
-        if (tool_lc == "burp_collaborator_poll") {
+        if (tool_lc == "burp_collaborator_manage") {
             size_t interactions = 1;
             uint64_t count = 1;
             if ((ir.data.is_array() && ir.data.empty()) ||
@@ -2725,7 +2652,7 @@ namespace {
             }
         }
 
-        if (tool_lc == "burp_collaborator_start") {
+        if (tool_lc == "burp_collaborator_manage") {
             bool running = false;
             bool http_alive = false;
             if (payload_data_empty(ir.data) ||
@@ -2739,7 +2666,7 @@ namespace {
             }
         }
 
-        if (tool_lc == "burp_collaborator_generate_token") {
+        if (tool_lc == "burp_collaborator_manage") {
             std::string token;
             if (payload_data_empty(ir.data) || !payload_string_field(ir.data, "token", token) || token.empty()) {
                 reason = "collaborator_token_empty";
@@ -2747,7 +2674,7 @@ namespace {
             }
         }
 
-        if (tool_lc == "burp_comparer_list_slots") {
+        if (tool_lc == "burp_comparer_manage") {
             size_t slots = 2;
             uint64_t count = 2;
             if ((ir.data.is_array() && ir.data.size() < 2) ||
@@ -2758,7 +2685,7 @@ namespace {
             }
         }
 
-        if (tool_lc == "burp_comparer_diff") {
+        if (tool_lc == "burp_comparer_manage") {
             size_t blocks = 1;
             uint64_t count = 1;
             if ((ir.data.is_array() && ir.data.empty()) ||
@@ -2790,46 +2717,6 @@ namespace {
             uint64_t total = 1;
             if (payload_u64_field(ir.data, "total_found", total) && total == 0) {
                 reason = "total_found=0";
-                return true;
-            }
-        }
-
-        if (tool_lc == "scan_mem_start" ||
-            tool_lc == "scan_mem_next" ||
-            tool_lc == "scan_mem_results") {
-            bool scanning = false;
-            bool completed = true;
-            uint64_t total_found = 1;
-            uint64_t returned = 1;
-            size_t results = 1;
-            if (payload_data_empty(ir.data) ||
-                (payload_bool_field(ir.data, "scanning", scanning) && scanning) ||
-                (payload_bool_field(ir.data, "completed", completed) && !completed) ||
-                (payload_u64_field(ir.data, "total_found", total_found) && total_found == 0) ||
-                (payload_u64_field(ir.data, "returned", returned) && returned == 0) ||
-                (payload_array_count(ir.data, "results", results) && results == 0) ||
-                payload_text_contains(ir, "total_found=0")) {
-                reason = "scan_mem_no_completed_results";
-                return true;
-            }
-        }
-
-        if (tool_lc == "pointer_scan_start" ||
-            tool_lc == "pointer_scan_results") {
-            bool scanning = false;
-            bool running = false;
-            uint64_t total = 1;
-            uint64_t count = 1;
-            size_t results = 1;
-            if (payload_data_empty(ir.data) ||
-                (payload_bool_field(ir.data, "scanning", scanning) && scanning) ||
-                (payload_bool_field(ir.data, "running", running) && running) ||
-                (payload_u64_field(ir.data, "total", total) && total == 0) ||
-                (payload_u64_field(ir.data, "count", count) && count == 0) ||
-                (payload_array_count(ir.data, "results", results) && results == 0) ||
-                (payload_array_count(ir.data, "pointers", results) && results == 0) ||
-                payload_text_contains(ir, "0 pointer")) {
-                reason = "pointer_scan_no_results";
                 return true;
             }
         }
@@ -2868,8 +2755,7 @@ namespace {
             }
         }
 
-        if (tool_lc == "analysis_get_types" ||
-            tool_lc == "analysis_get_pdb_symbols") {
+        if (tool_lc == "analysis_query") {
             uint64_t total = 1;
             uint64_t returned = 1;
             if (payload_u64_field(ir.data, "total", total) && total == 0) {
@@ -2882,7 +2768,7 @@ namespace {
             }
         }
 
-        if (tool_lc == "analysis_get_binary_map_overview") {
+        if (tool_lc == "analysis_query") {
             size_t functions = 1;
             size_t sections = 0;
             if (payload_array_count(ir.data, "sections", sections) &&
@@ -2904,7 +2790,7 @@ namespace {
             }
         }
 
-        if (tool_lc == "get_fuzz_results") {
+        if (tool_lc == "fuzzer_manage") {
             std::string setup_error;
             if (payload_string_field(ir.data, "setup_error", setup_error) && !setup_error.empty()) {
                 reason = "setup_error=" + setup_error;
@@ -2962,23 +2848,17 @@ namespace {
             }
         }
 
-        if (tool_lc == "burp_dom_xss_test_payload") {
+        if (tool_lc == "burp_dom_xss_manage") {
             bool canary = false;
             if (payload_bool_field(ir.data, "canary_fired", canary) && !canary) {
                 reason = "canary_fired=false";
                 return true;
             }
-        }
-
-        if (tool_lc == "burp_dom_xss_scan") {
             uint64_t issues = 1;
             if (payload_u64_field(ir.data, "issues_emitted", issues) && issues == 0) {
                 reason = "issues_emitted=0";
                 return true;
             }
-        }
-
-        if (tool_lc == "burp_dom_xss_status") {
             bool ready = true;
             if (payload_bool_field(ir.data, "camoufox_ready", ready) && !ready) {
                 reason = "camoufox_ready=false";
@@ -2991,7 +2871,7 @@ namespace {
             }
         }
 
-        if (tool_lc == "burp_sequencer_status") {
+        if (tool_lc == "burp_sequencer_manage") {
             uint64_t collected = 1;
             if (payload_u64_field(ir.data, "collected", collected) && collected == 0) {
                 reason = "sequencer_collected=0";
@@ -2999,7 +2879,7 @@ namespace {
             }
         }
 
-        if (tool_lc == "burp_sequencer_samples") {
+        if (tool_lc == "burp_sequencer_manage") {
             uint64_t count = 1;
             if (payload_u64_field(ir.data, "count", count) && count == 0) {
                 reason = "sequencer_samples=0";
@@ -3007,7 +2887,7 @@ namespace {
             }
         }
 
-        if (tool_lc == "burp_sequencer_analyze") {
+        if (tool_lc == "burp_sequencer_manage") {
             uint64_t samples = 1;
             if (payload_u64_field(ir.data, "samples_count", samples) && samples == 0) {
                 reason = "sequencer_samples_count=0";
@@ -3020,7 +2900,7 @@ namespace {
             }
         }
 
-        if (tool_lc == "burp_scanner_audit_status") {
+        if (tool_lc == "burp_scanner_manage") {
             bool running = true;
             uint64_t probes = 1;
             if (payload_bool_field(ir.data, "running", running) &&
@@ -3031,7 +2911,7 @@ namespace {
             }
         }
 
-        if (tool_lc == "burp_scanner_passive_status") {
+        if (tool_lc == "burp_scanner_manage") {
             uint64_t scanned = 1;
             if (payload_u64_field(ir.data, "exchanges_scanned", scanned) && scanned == 0) {
                 reason = "exchanges_scanned=0";
@@ -3039,7 +2919,7 @@ namespace {
             }
         }
 
-        if (tool_lc == "network_get_packets") {
+        if (tool_lc == "network_capture_manage") {
             if (ir.data.is_array() && !ir.data.empty())
                 return false;
             if (ir.data.is_array() && ir.data.empty()) {
@@ -3248,43 +3128,10 @@ namespace {
             }
         }
 
-        if (tool_lc == "network_websocket") {
-            uint64_t count = 1;
-            size_t frames = 1;
-            if (payload_data_empty(ir.data) ||
-                (ir.data.is_array() && ir.data.empty()) ||
-                (payload_u64_field(ir.data, "count", count) && count == 0) ||
-                (payload_u64_field(ir.data, "frame_count", count) && count == 0) ||
-                (payload_array_count(ir.data, "frames", frames) && frames == 0) ||
-                (payload_array_count(ir.data, "items", frames) && frames == 0) ||
-                payload_text_contains(ir, "0 websocket") ||
-                payload_text_contains(ir, "no websocket frames")) {
-                reason = "websocket_frames=0";
-                return true;
-            }
-        }
-
-        if (tool_lc == "network_repeater") {
-            uint64_t count = 1;
-            size_t items = 1;
-            if (payload_data_empty(ir.data) ||
-                (ir.data.is_array() && ir.data.empty()) ||
-                (payload_u64_field(ir.data, "count", count) && count == 0) ||
-                (payload_u64_field(ir.data, "total", count) && count == 0) ||
-                (payload_array_count(ir.data, "items", items) && items == 0) ||
-                (payload_array_count(ir.data, "requests", items) && items == 0) ||
-                (payload_array_count(ir.data, "entries", items) && items == 0) ||
-                payload_text_contains(ir, "0 repeater") ||
-                payload_text_contains(ir, "no repeater")) {
-                reason = "repeater_items=0";
-                return true;
-            }
-        }
-
-        if (tool_lc == "quic_extract_keys" ||
-            tool_lc == "dtls_extract_keys" ||
-            tool_lc == "tls_get_extracted_keys" ||
-            tool_lc == "tls_extract_keys") {
+        if (tool_lc == "quic_manage" ||
+            tool_lc == "dtls_manage" ||
+            tool_lc == "tls_manage" ||
+            tool_lc == "tls_manage") {
             uint64_t count = 1;
             size_t keys = 1;
             if (payload_data_empty(ir.data) ||
@@ -3301,8 +3148,7 @@ namespace {
         }
 
 
-        if (tool_lc == "disasm_get_xrefs_to" ||
-            tool_lc == "disasm_get_xrefs_from") {
+        if (tool_lc == "get_xrefs") {
             uint64_t count = 1;
             if (payload_u64_field(ir.data, "count", count) && count == 0) {
                 reason = "count=0";
@@ -3395,9 +3241,14 @@ namespace {
     bool mcp_tool_uses_camoufox_runtime(const std::string& name) {
         const std::string n = lower_copy(name);
         return mcp_tool_requires_live_camoufox_bridge(n) ||
-            n == "launch_browser" ||
-            n == "close_browser" ||
-            n == "check_environment";
+            n == "browser_lifecycle" ||
+            n == "browser_navigation" ||
+            n == "browser_interaction" ||
+            n == "browser_inspect" ||
+            n == "browser_state" ||
+            n == "browser_network" ||
+            n == "browser_hooks" ||
+            n == "browser_instrumentation";
     }
 
     void log_mcp_camoufox_snapshot(HANDLE hf, const char* tag, const char* phase, int seq, const std::string& tool_name) {
@@ -3866,33 +3717,26 @@ namespace {
             return 90000;
         if (name == "webfetch")
             return 90000;
-        if (name == "burp_collaborator_start" || name == "burp_collaborator_stop")
+        if (name == "burp_collaborator_manage" || name == "burp_collaborator_manage")
             return 10000;
-        if (name == "burp_dom_xss_test_payload" ||
-            name == "burp_dom_xss_scan")
+        if (name == "burp_dom_xss_manage")
             return 60000;
         if (name == "sandbox_execute")
             return 180000;
-        if (name == "sessions_run_binary")
+        if (name == "sessions_manage")
             return 300000;
-        if (name == "launch_browser")
+        if (name == "browser_lifecycle")
             return k_camoufox_testlab_launch_watchdog_ms;
         if (name == "api_monitor_start")
             return 60000;
-        if (name == "cert_generate_ca")
+        if (name == "cert_manage")
             return 60000;
-        if (name == "check_environment")
-            return 5000;
-        if (name == "hook_jsvmp_interpreter")
+        if (name == "browser_instrumentation")
             return 60000;
         if (name == "compare_env")
             return 45000;
         if (name == "instrumentation" || name == "verify_signer_offline")
             return 60000;
-        if (name == "pointer_scan_start" || name == "pointer_scan_results")
-            return 45000;
-        if (name.find("scan_mem_") == 0)
-            return 45000;
         if (name.find("burp_headless") == 0)
             return 45000;
         if (name == "scanner_pointer_scan")
@@ -3903,10 +3747,9 @@ namespace {
             return 20000;
         if (name == "auto_decrypt_strings" ||
             name == "reconstruct_struct" ||
-            name == "start_live_monitor" ||
-            name == "stop_live_monitor" ||
+            name == "live_monitor_manage" ||
             name == "scan_crypto_constants" ||
-            name == "crypto_scanner_run")
+            name == "scan_crypto_constants")
             return 7000;
         if (name.find("reconstruct_") == 0)
             return 45000;
@@ -3922,7 +3765,7 @@ namespace {
             decrypt_oracle::g_state.cancel.store(true, std::memory_order_release);
             xref_engine::cancel_scan();
             log_msg(hf, tag, "CANCEL -- auto_decrypt_strings decrypt/xref state signalled");
-        } else if (name == "start_live_monitor" || name == "stop_live_monitor") {
+        } else if (name == "live_monitor_manage") {
             struct_monitor::stop();
             log_msg(hf, tag, "CANCEL -- live monitor stop signalled");
         } else if (name == "scanner_pointer_scan") {
@@ -4226,6 +4069,21 @@ namespace {
         return out;
     }
 
+    timed_invoke_result_t invoke_tool_action_bounded(mcp_standalone::server_t* srv,
+                                                     const std::string& tool_name,
+                                                     const std::string& action,
+                                                     mcp_standalone::json args,
+                                                     long long timeout_ms,
+                                                     HANDLE hf = INVALID_HANDLE_VALUE,
+                                                     const char* tag = nullptr,
+                                                     int seq = 0)
+    {
+        if (!args.is_object())
+            args = mcp_standalone::json::object();
+        args["action"] = action;
+        return invoke_tool_bounded(srv, tool_name, args, timeout_ms, hf, tag, seq);
+    }
+
 
     mcp_tool_call_status_t test_tool_call(HANDLE hf, const char* tag, mcp_standalone::server_t* srv,
                                           const char* tool_name, const mcp_standalone::json& args,
@@ -4351,7 +4209,7 @@ namespace {
             }
         }
         std::unique_ptr<scoped_camoufox_testlab_launch_t> camoufox_launch_scope;
-        if (tool_name_s == "launch_browser") {
+        if (tool_name_s == "browser_lifecycle" && call_args.is_object() && call_args.value("action", std::string()) == "launch") {
             camoufox_launch_scope = std::make_unique<scoped_camoufox_testlab_launch_t>();
             if (call_args.is_object()) {
                 int requested_launch_timeout = static_cast<int>(k_camoufox_testlab_launch_timeout_ms);
@@ -4556,6 +4414,19 @@ namespace {
                 return mcp_tool_call_status_t::failed;
             }
         }
+    }
+
+
+    mcp_tool_call_status_t test_tool_action_call(HANDLE hf, const char* tag, const char* tool_name, const char* action,
+                                                 mcp_standalone::json args,
+                                                 std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped,
+                                                 bool skip_on_error = false,
+                                                 mcp_standalone::tool_result_t* out_result = nullptr)
+    {
+        if (!args.is_object())
+            args = mcp_standalone::json::object();
+        args["action"] = action ? action : "";
+        return test_tool_call(hf, tag, get_server(), tool_name, args, passed, failed, skipped, skip_on_error, out_result);
     }
 
 
@@ -4771,8 +4642,8 @@ namespace {
         candidates.push_back(root / L"src" / L"standalone" / L"test_target" / L"AiDA_TestTarget.exe");
     }
 
-    std::string find_sessions_run_binary_target(HANDLE hf) {
-        const char* tag = "mcp.sessions_run_binary.target";
+    std::string find_sessions_manage_run_binary_target(HANDLE hf) {
+        const char* tag = "mcp.sessions_manage.run_binary.target";
         std::vector<std::filesystem::path> candidates;
 
         wchar_t env_buf[32768] = {};
@@ -4822,7 +4693,7 @@ namespace {
             bool regular = exists && std::filesystem::is_regular_file(normalized, ec) && !ec;
             const std::string path = path_to_utf8(normalized);
             log_msg(hf, tag, "probe %s -> %s", path.c_str(), regular ? "EXISTS" : (exists ? "not-file" : "missing"));
-            diag::log_tagged_fmt("test_all", "sessions_run_binary target probe %s -> %s",
+            diag::log_tagged_fmt("test_all", "sessions_manage run_binary target probe %s -> %s",
                 path.c_str(), regular ? "EXISTS" : (exists ? "not-file" : "missing"));
             if (regular)
                 return path;
@@ -7348,7 +7219,7 @@ namespace {
             accept_count.store(0, std::memory_order_release);
             request_count.store(0, std::memory_order_release);
             DWORD thread_start_tick = GetTickCount();
-            log_msg(hf, tag, "Burp HTTP fixture work_queue post requested port=%u listener=%llu target_pid=%u attached_pid=%u target_unavailable=%d driver_status=\"%s\" driver_last_error=\"%s\"",
+            log_msg(hf, tag, "Burp HTTP fixture work_queue post requested port=%u listener=%llu target_pid=%u attached_pid=%u target_unavailable=%d driver_bridge_status=\"%s\" driver_last_error=\"%s\"",
                 static_cast<unsigned>(port),
                 static_cast<unsigned long long>(listener),
                 g_mcp_target_pid,
@@ -7367,7 +7238,7 @@ namespace {
                 post_gle = GetLastError();
                 if (post_gle == ERROR_SUCCESS)
                     post_gle = ERROR_NOT_ENOUGH_MEMORY;
-                log_msg(hf, tag, "WARN -- fixture work_queue post exception err=%s gle=%lu port=%u listener=%llu worker_entered=%d worker_done=%d target_pid=%u attached_pid=%u target_unavailable=%d driver_status=\"%s\" driver_last_error=\"%s\"",
+                log_msg(hf, tag, "WARN -- fixture work_queue post exception err=%s gle=%lu port=%u listener=%llu worker_entered=%d worker_done=%d target_pid=%u attached_pid=%u target_unavailable=%d driver_bridge_status=\"%s\" driver_last_error=\"%s\"",
                     compact_text(ex.what(), 700).c_str(),
                     static_cast<unsigned long>(post_gle),
                     static_cast<unsigned>(port),
@@ -7383,7 +7254,7 @@ namespace {
                 post_gle = GetLastError();
                 if (post_gle == ERROR_SUCCESS)
                     post_gle = ERROR_NOT_ENOUGH_MEMORY;
-                log_msg(hf, tag, "WARN -- fixture work_queue post exception err=unknown gle=%lu port=%u listener=%llu worker_entered=%d worker_done=%d target_pid=%u attached_pid=%u target_unavailable=%d driver_status=\"%s\" driver_last_error=\"%s\"",
+                log_msg(hf, tag, "WARN -- fixture work_queue post exception err=unknown gle=%lu port=%u listener=%llu worker_entered=%d worker_done=%d target_pid=%u attached_pid=%u target_unavailable=%d driver_bridge_status=\"%s\" driver_last_error=\"%s\"",
                     static_cast<unsigned long>(post_gle),
                     static_cast<unsigned>(port),
                     static_cast<unsigned long long>(listener),
@@ -7400,7 +7271,7 @@ namespace {
                     post_gle = ERROR_NOT_READY;
                 DWORD elapsed = GetTickCount() - thread_start_tick;
                 worker_done.store(true, std::memory_order_release);
-                log_msg(hf, tag, "FAIL -- fixture work_queue post failed gle=%lu text=%s elapsed_ms=%lu port=%u listener=%llu worker_entered=%d worker_done=%d target_pid=%u attached_pid=%u target_unavailable=%d driver_status=\"%s\" driver_last_error=\"%s\"",
+                log_msg(hf, tag, "FAIL -- fixture work_queue post failed gle=%lu text=%s elapsed_ms=%lu port=%u listener=%llu worker_entered=%d worker_done=%d target_pid=%u attached_pid=%u target_unavailable=%d driver_bridge_status=\"%s\" driver_last_error=\"%s\"",
                     static_cast<unsigned long>(post_gle),
                     format_win32_error(post_gle).c_str(),
                     static_cast<unsigned long>(elapsed),
@@ -8458,7 +8329,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
                 {"id", 3},
                 {"method", "tools/call"},
                 {"params", {
-                    {"name", "driver_status"},
+                    {"name", "debugger_get_attached"},
                     {"arguments", mcp_standalone::json::object()}
                 }}
             };
@@ -8532,7 +8403,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         (void)skipped;
         const char* tag = "mcp.get_tool_descriptions";
         mcp_standalone::json args;
-        args["names"] = mcp_standalone::json::array({"get_tool_descriptions", "driver_status", "switch_agent"});
+        args["names"] = mcp_standalone::json::array({"get_tool_descriptions", "sessions_manage", "switch_agent"});
         args["include_schema"] = true;
         g_invoked_tools.insert("get_tool_descriptions");
         auto timed = invoke_tool_bounded(get_server(), "get_tool_descriptions", args, tool_timeout_ms("get_tool_descriptions"));
@@ -8550,19 +8421,19 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         }
         const std::string text_lc = lower_copy(ir.text);
         const bool has_self = text_lc.find("### get_tool_descriptions") != std::string::npos;
-        const bool has_driver_status = text_lc.find("### driver_status") != std::string::npos;
+        const bool has_sessions_manage = text_lc.find("### sessions_manage") != std::string::npos;
         const bool leaked_internal = text_lc.find("### switch_agent") != std::string::npos;
         const bool has_schema = text_lc.find("`names`") != std::string::npos &&
             text_lc.find("include_schema") != std::string::npos;
-        if (has_self && has_driver_status && has_schema && !leaked_internal) {
+        if (has_self && has_sessions_manage && has_schema && !leaked_internal) {
             log_msg(hf, tag, "PASS -- returned detailed schemas for selected tools");
             record_tool_status("get_tool_descriptions", mcp_tool_call_status_t::passed);
             passed.fetch_add(1);
             return;
         }
-        log_msg(hf, tag, "FAIL -- response missing expected detail self=%s driver_status=%s schema=%s leaked_internal=%s text=%s",
+        log_msg(hf, tag, "FAIL -- response missing expected detail self=%s sessions_manage=%s schema=%s leaked_internal=%s text=%s",
             has_self ? "true" : "false",
-            has_driver_status ? "true" : "false",
+            has_sessions_manage ? "true" : "false",
             has_schema ? "true" : "false",
             leaked_internal ? "true" : "false",
             compact_text(ir.text, 900).c_str());
@@ -8709,15 +8580,9 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
     }
 
 
-    void test_tool_driver_load(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.driver_load", get_server(), "driver_load", {}, passed, failed, skipped);
-    }
 
-    void test_tool_driver_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.driver_status", get_server(), "driver_status", {}, passed, failed, skipped);
-    }
 
-    void test_tool_list_processes(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+void test_tool_list_processes(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         test_tool_call(hf, "mcp.list_processes", get_server(), "list_processes", {}, passed, failed, skipped);
     }
 
@@ -8727,15 +8592,9 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         test_tool_call(hf, "mcp.list_processes_filter", get_server(), "list_processes", args, passed, failed, skipped);
     }
 
-    void test_tool_enumerate_modules(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.enumerate_modules", get_server(), "enumerate_modules", {}, passed, failed, skipped);
-    }
 
-    void test_tool_enumerate_threads(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.enumerate_threads", get_server(), "enumerate_threads", {}, passed, failed, skipped);
-    }
 
-    void test_tool_read_memory(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+void test_tool_read_memory(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         auto addr = get_ntclose_addr_str();
         if (addr.empty()) { log_msg(hf, "mcp.read_memory", "SKIP -- NtClose not found"); skipped.fetch_add(1); return; }
         mcp_standalone::json args;
@@ -8760,12 +8619,12 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         test_tool_call(hf, "mcp.query_memory", get_server(), "query_memory", args, passed, failed, skipped);
     }
 
-    void test_tool_disassemble_address(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_disassemble_zydis(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         auto addr = get_ntclose_addr_str();
-        if (addr.empty()) { log_msg(hf, "mcp.disassemble_address", "SKIP -- NtClose not found"); skipped.fetch_add(1); return; }
+        if (addr.empty()) { log_msg(hf, "mcp.disassemble_zydis", "SKIP -- NtClose not found"); skipped.fetch_add(1); return; }
         mcp_standalone::json args;
         args["address"] = addr;
-        test_tool_call(hf, "mcp.disassemble_address", get_server(), "disassemble_address", args, passed, failed, skipped);
+        test_tool_call(hf, "mcp.disassemble_zydis", get_server(), "disassemble_zydis", args, passed, failed, skipped);
     }
 
     void test_tool_disassemble_file(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -8775,11 +8634,8 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         test_tool_call(hf, "mcp.disassemble_file", get_server(), "disassemble_file", args, passed, failed, skipped);
     }
 
-    void test_tool_driver_detach(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.driver_detach", get_server(), "driver_detach", {}, passed, failed, skipped);
-    }
 
-    void test_tool_sandbox_execute(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+void test_tool_sandbox_execute(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         (void)skipped;
         const char* tool_name = "sandbox_execute";
         mcp_standalone::json args;
@@ -9035,39 +8891,16 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         test_tool_call(hf, "mcp.webfetch", get_server(), "webfetch", args, passed, failed, skipped);
     }
 
-    void test_tool_driver_attach(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args;
-        args["process"] = "AiDA_TestTarget.exe";
-        test_tool_call(hf, "mcp.driver_attach", get_server(), "driver_attach", args, passed, failed, skipped);
-    }
 
-    void test_tool_driver_write_memory(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        uint64_t addr = driver_bridge::allocate_memory(16);
-        if (addr == 0) {
-            log_msg(hf, "mcp.driver_write_memory", "SKIP -- allocate_memory failed for write fixture");
-            skipped.fetch_add(1);
-            return;
-        }
-        mcp_standalone::json args;
-        args["address"] = hex_u64(addr);
-        args["bytes"] = "90";
-        test_tool_call(hf, "mcp.driver_write_memory", get_server(), "driver_write_memory", args, passed, failed, skipped);
-        driver_bridge::free_memory(addr);
-    }
 
-    void test_tool_driver_dump_module(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+void test_tool_driver_dump_module(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args;
         args["module_name"] = "ntdll.dll";
         test_tool_call(hf, "mcp.driver_dump_module", get_server(), "driver_dump_module", args, passed, failed, skipped);
     }
 
-    void test_tool_driver_scan_pattern(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args;
-        args["pattern"] = "48 89 5C 24";
-        test_tool_call(hf, "mcp.driver_scan_pattern", get_server(), "driver_scan_pattern", args, passed, failed, skipped);
-    }
 
-    void test_tool_driver_read_pointer_chain(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+void test_tool_driver_read_pointer_chain(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         auto addr = get_ntdll_addr_str();
         if (addr.empty()) { log_msg(hf, "mcp.driver_read_pointer_chain", "SKIP -- ntdll not loaded"); skipped.fetch_add(1); return; }
         mcp_standalone::json args;
@@ -9082,23 +8915,9 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         test_tool_call(hf, "mcp.driver_enumerate_kernel_modules", get_server(), "driver_enumerate_kernel_modules", {}, passed, failed, skipped);
     }
 
-    void test_tool_driver_read_kernel_memory(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args;
-        args["address"] = "0xFFFFF80000000000";
-        args["size"] = 16;
-        test_tool_call(hf, "mcp.driver_read_kernel_memory", get_server(), "driver_read_kernel_memory", args, passed, failed, skipped);
-    }
 
-    void test_tool_driver_write_kernel_memory(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args;
-        args["address"] = "0xFFFFF80000000000";
-        args["bytes"] = "90";
-        args["validate_only"] = true;
-        args[k_test_lab_safe_fixture_flag] = true;
-        test_tool_call(hf, "mcp.driver_write_kernel_memory", get_server(), "driver_write_kernel_memory", args, passed, failed, skipped);
-    }
 
-    void test_tool_driver_allocate_memory(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+void test_tool_driver_allocate_memory(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args;
         args["size"] = 4096;
         test_tool_call(hf, "mcp.driver_allocate_memory", get_server(), "driver_allocate_memory", args, passed, failed, skipped);
@@ -9134,78 +8953,11 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         test_tool_call(hf, "mcp.driver_call_function", get_server(), "driver_call_function", args, passed, failed, skipped);
     }
 
-    void test_tool_driver_get_thread_context(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        uint32_t tid = 0;
-        uint32_t original_suspend = 0;
-        driver_bridge::thread_context_t ctx{};
-        if (!acquire_contextable_mcp_thread(hf, "mcp.driver_get_thread_context", "driver_get_thread_context", tid, original_suspend, ctx)) {
-            record_fixture_failed_tool("driver_get_thread_context", failed);
-            return;
-        }
-        mcp_standalone::json args;
-        args["tid"] = std::to_string(tid);
-        test_tool_call(hf, "mcp.driver_get_thread_context", get_server(), "driver_get_thread_context", args, passed, failed, skipped);
-        (void)driver_bridge::resume_thread(tid, nullptr);
-    }
 
-    void test_tool_driver_set_thread_context(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        uint32_t tid = first_mcp_target_tid();
-        if (tid == 0) {
-            log_msg(hf, "mcp.driver_set_thread_context", "SKIP -- target thread not found");
-            record_precondition_skipped_tool("driver_set_thread_context", skipped);
-            return;
-        }
-        if (!driver_bridge::suspend_thread(tid, nullptr)) {
-            log_msg(hf, "mcp.driver_set_thread_context", "SKIP -- could not suspend target thread tid=%u", tid);
-            record_precondition_skipped_tool("driver_set_thread_context", skipped);
-            return;
-        }
-        driver_bridge::thread_context_t ctx{};
-        if (!driver_bridge::get_thread_context(tid, ctx)) {
-            driver_bridge::resume_thread(tid);
-            log_msg(hf, "mcp.driver_set_thread_context", "SKIP -- could not read target thread context tid=%u", tid);
-            record_precondition_skipped_tool("driver_set_thread_context", skipped);
-            return;
-        }
-        mcp_standalone::json args;
-        args["tid"] = std::to_string(tid);
-        args["rax"] = hex_u64(ctx.rax);
-        test_tool_call(hf, "mcp.driver_set_thread_context", get_server(), "driver_set_thread_context", args, passed, failed, skipped);
-        driver_bridge::resume_thread(tid);
-    }
 
-    void test_tool_driver_suspend_thread(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        uint32_t tid = 0;
-        uint32_t original_suspend = 0;
-        driver_bridge::thread_context_t ctx{};
-        if (!acquire_contextable_mcp_thread(hf, "mcp.driver_suspend_thread", "driver_suspend_thread", tid, original_suspend, ctx)) {
-            record_fixture_failed_tool("driver_suspend_thread", failed);
-            return;
-        }
-        (void)driver_bridge::resume_thread(tid, nullptr);
-        mcp_standalone::json args;
-        args["tid"] = std::to_string(tid);
-        auto status = test_tool_call(hf, "mcp.driver_suspend_thread", get_server(), "driver_suspend_thread", args, passed, failed, skipped);
-        if (status == mcp_tool_call_status_t::passed)
-            (void)driver_bridge::resume_thread(tid, nullptr);
-    }
 
-    void test_tool_driver_resume_thread(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        uint32_t tid = 0;
-        uint32_t original_suspend = 0;
-        driver_bridge::thread_context_t ctx{};
-        if (!acquire_contextable_mcp_thread(hf, "mcp.driver_resume_thread", "driver_resume_thread", tid, original_suspend, ctx)) {
-            record_fixture_failed_tool("driver_resume_thread", failed);
-            return;
-        }
-        mcp_standalone::json args;
-        args["tid"] = std::to_string(tid);
-        auto status = test_tool_call(hf, "mcp.driver_resume_thread", get_server(), "driver_resume_thread", args, passed, failed, skipped);
-        if (status != mcp_tool_call_status_t::passed)
-            (void)driver_bridge::resume_thread(tid, nullptr);
-    }
 
-    void test_tool_driver_protect_memory(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+void test_tool_driver_protect_memory(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         uint64_t addr = driver_bridge::allocate_memory(4096);
         if (addr == 0) {
             log_msg(hf, "mcp.driver_protect_memory", "SKIP -- allocate_memory failed for protect fixture");
@@ -9220,19 +8972,13 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         driver_bridge::free_memory(addr);
     }
 
-    void test_tool_driver_enumerate_memory_regions(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.driver_enumerate_memory_regions", get_server(), "driver_enumerate_memory_regions", {}, passed, failed, skipped);
-    }
 
-    void test_tool_driver_read_peb(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+void test_tool_driver_read_peb(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         test_tool_call(hf, "mcp.driver_read_peb", get_server(), "driver_read_peb", {}, passed, failed, skipped);
     }
 
-    void test_tool_driver_spoof_debug_flags(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.driver_spoof_debug_flags", get_server(), "driver_spoof_debug_flags", {}, passed, failed, skipped);
-    }
 
-    void test_tool_driver_set_hw_breakpoint(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+void test_tool_driver_set_hw_breakpoint(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         uint64_t addr_raw = alloc_private_mcp_bp_region(hf, "mcp.driver_set_hw_breakpoint");
         if (addr_raw == 0) { skipped.fetch_add(1); return; }
         uint32_t tid = 0;
@@ -9307,7 +9053,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         args["timeout"] = 30;
         args["poll_interval"] = 100;
         args["actions"] = mcp_standalone::json::array({
-            {{"tool", "driver_status"}, {"params", mcp_standalone::json::object()}}
+            {{"tool", "debugger_get_attached"}, {"params", mcp_standalone::json::object()}}
         });
         mcp_standalone::tool_result_t result;
         auto status = test_tool_call(hf, "mcp.driver_defer_action", get_server(), "driver_defer_action", args, passed, failed, skipped, true, &result);
@@ -9548,109 +9294,23 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         test_tool_call(hf, "mcp.driver_enumerate_handles", get_server(), "driver_enumerate_handles", {}, passed, failed, skipped);
     }
 
-    void test_tool_driver_walk_seh_chain(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        uint32_t tid = first_mcp_target_tid();
-        if (tid == 0) {
-            log_msg(hf, "mcp.driver_walk_seh_chain", "FAIL -- target thread fixture not found");
-            record_fixture_failed_tool("driver_walk_seh_chain", failed);
-            return;
-        }
-        mcp_standalone::json args;
-        args["tid"] = std::to_string(tid);
-        test_tool_call(hf, "mcp.driver_walk_seh_chain", get_server(), "driver_walk_seh_chain", args, passed, failed, skipped);
-    }
 
-    void test_tool_driver_find_code_caves(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        auto addr = get_ntdll_addr_str();
-        if (addr.empty()) { log_msg(hf, "mcp.driver_find_code_caves", "SKIP -- ntdll not loaded"); skipped.fetch_add(1); return; }
-        mcp_standalone::json args;
-        args["address"] = addr;
-        args["size"] = 0x1000;
-        test_tool_call(hf, "mcp.driver_find_code_caves", get_server(), "driver_find_code_caves", args, passed, failed, skipped);
-    }
 
-    void test_tool_driver_scan_memory_value(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        uint64_t addr = driver_bridge::allocate_memory(4096);
-        if (addr == 0) {
-            log_msg(hf, "mcp.driver_scan_memory_value", "SKIP -- allocate_memory failed for scan fixture");
-            record_precondition_skipped_tool("driver_scan_memory_value", skipped);
-            return;
-        }
-        const std::vector<uint8_t> fixture = { 0x78, 0x56, 0x34, 0x12 };
-        if (!driver_bridge::write_memory(addr, fixture)) {
-            log_msg(hf, "mcp.driver_scan_memory_value", "SKIP -- write_memory failed for scan fixture addr=0x%016llX",
-                static_cast<unsigned long long>(addr));
-            driver_bridge::free_memory(addr);
-            record_precondition_skipped_tool("driver_scan_memory_value", skipped);
-            return;
-        }
-        mcp_standalone::json args;
-        args["value"] = 0x12345678;
-        args["value_type"] = "int32";
-        args["start"] = hex_u64(addr);
-        args["end"] = hex_u64(addr + 4096);
-        args["limit"] = 8;
-        test_tool_call(hf, "mcp.driver_scan_memory_value", get_server(), "driver_scan_memory_value", args, passed, failed, skipped);
-        driver_bridge::free_memory(addr);
-    }
 
-    void test_tool_driver_pointer_scan(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        uint64_t target = driver_bridge::allocate_memory(4096);
-        uint64_t pointer_slot = driver_bridge::allocate_memory(4096);
-        if (target == 0 || pointer_slot == 0) {
-            if (target) driver_bridge::free_memory(target);
-            if (pointer_slot) driver_bridge::free_memory(pointer_slot);
-            log_msg(hf, "mcp.driver_pointer_scan", "SKIP -- allocate_memory failed for pointer fixture");
-            record_precondition_skipped_tool("driver_pointer_scan", skipped);
-            return;
-        }
-        std::vector<uint8_t> ptr_bytes(sizeof(target), 0);
-        std::memcpy(ptr_bytes.data(), &target, sizeof(target));
-        if (!driver_bridge::write_memory(pointer_slot, ptr_bytes)) {
-            driver_bridge::free_memory(target);
-            driver_bridge::free_memory(pointer_slot);
-            log_msg(hf, "mcp.driver_pointer_scan", "SKIP -- write_memory failed for pointer fixture");
-            record_precondition_skipped_tool("driver_pointer_scan", skipped);
-            return;
-        }
-        mcp_standalone::json args;
-        args["target_address"] = hex_u64(target);
-        args["max_depth"] = 1;
-        args["max_offset"] = 0;
-        args["limit"] = 4;
-        test_tool_call(hf, "mcp.driver_pointer_scan", get_server(), "driver_pointer_scan", args, passed, failed, skipped);
-        driver_bridge::free_memory(target);
-        driver_bridge::free_memory(pointer_slot);
-    }
 
-    void test_tool_driver_enumerate_windows(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+void test_tool_driver_enumerate_windows(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         test_tool_call(hf, "mcp.driver_enumerate_windows", get_server(), "driver_enumerate_windows", {}, passed, failed, skipped);
     }
 
-    void test_tool_driver_walk_stack(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args;
-        args["tid"] = "0";
-        test_tool_call(hf, "mcp.driver_walk_stack", get_server(), "driver_walk_stack", args, passed, failed, skipped);
-    }
 
-    void test_tool_driver_assemble(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+void test_tool_driver_assemble(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args;
         args["assembly"] = "nop";
         test_tool_call(hf, "mcp.driver_assemble", get_server(), "driver_assemble", args, passed, failed, skipped);
     }
 
-    void test_tool_driver_compare_memory_snapshot(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        auto addr = get_ntdll_addr_str();
-        if (addr.empty()) { log_msg(hf, "mcp.driver_compare_memory_snapshot", "SKIP -- ntdll not loaded"); skipped.fetch_add(1); return; }
-        mcp_standalone::json args;
-        args["operation"] = "take";
-        args["name"] = "mcp_test";
-        args["address"] = addr;
-        args["size"] = 32;
-        test_tool_call(hf, "mcp.driver_compare_memory_snapshot", get_server(), "driver_compare_memory_snapshot", args, passed, failed, skipped);
-    }
 
-    void test_tool_driver_find_references(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+void test_tool_driver_find_references(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         auto addr = get_ntclose_addr_str();
         if (addr.empty()) { log_msg(hf, "mcp.driver_find_references", "SKIP -- NtClose not found"); skipped.fetch_add(1); return; }
         mcp_standalone::json args;
@@ -9981,15 +9641,6 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         test_tool_call(hf, "mcp.dbg_get_trace", get_server(), "dbg_get_trace", {}, passed, failed, skipped);
     }
 
-    void test_tool_dbg_set_comment(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        auto addr = get_ntclose_addr_str();
-        if (addr.empty()) { log_msg(hf, "mcp.dbg_set_comment", "SKIP -- NtClose not found"); skipped.fetch_add(1); return; }
-        mcp_standalone::json args;
-        args["address"] = addr;
-        args["text"] = "test_comment";
-        test_tool_call(hf, "mcp.dbg_set_comment", get_server(), "dbg_set_comment", args, passed, failed, skipped);
-    }
-
     void test_tool_dbg_set_label(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         auto addr = get_ntclose_addr_str();
         if (addr.empty()) { log_msg(hf, "mcp.dbg_set_label", "SKIP -- NtClose not found"); skipped.fetch_add(1); return; }
@@ -10036,14 +9687,6 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         }
     }
 
-    void test_tool_dbg_get_comment(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        auto addr = get_ntclose_addr_str();
-        if (addr.empty()) { log_msg(hf, "mcp.dbg_get_comment", "SKIP -- NtClose not found"); skipped.fetch_add(1); return; }
-        mcp_standalone::json args;
-        args["address"] = addr;
-        test_tool_call(hf, "mcp.dbg_get_comment", get_server(), "dbg_get_comment", args, passed, failed, skipped);
-    }
-
     void test_tool_dbg_get_label(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         auto addr = get_ntclose_addr_str();
         if (addr.empty()) { log_msg(hf, "mcp.dbg_get_label", "SKIP -- NtClose not found"); skipped.fetch_add(1); return; }
@@ -10054,22 +9697,6 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
 
     void test_tool_dbg_get_bookmarks(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         test_tool_call(hf, "mcp.dbg_get_bookmarks", get_server(), "dbg_get_bookmarks", {}, passed, failed, skipped);
-    }
-
-    void test_tool_dbg_get_xrefs_to(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        auto addr = get_ntclose_addr_str();
-        if (addr.empty()) { log_msg(hf, "mcp.dbg_get_xrefs_to", "SKIP -- NtClose not found"); skipped.fetch_add(1); return; }
-        mcp_standalone::json args;
-        args["address"] = addr;
-        test_tool_call(hf, "mcp.dbg_get_xrefs_to", get_server(), "dbg_get_xrefs_to", args, passed, failed, skipped);
-    }
-
-    void test_tool_dbg_get_xrefs_from(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        auto addr = get_ntclose_addr_str();
-        if (addr.empty()) { log_msg(hf, "mcp.dbg_get_xrefs_from", "SKIP -- NtClose not found"); skipped.fetch_add(1); return; }
-        mcp_standalone::json args;
-        args["address"] = addr;
-        test_tool_call(hf, "mcp.dbg_get_xrefs_from", get_server(), "dbg_get_xrefs_from", args, passed, failed, skipped);
     }
 
     void test_tool_dbg_scan_xrefs(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -10294,105 +9921,58 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         test_tool_call(hf, "mcp.scanner_get_results", get_server(), "scanner_get_results", {}, passed, failed, skipped);
     }
 
-    void test_tool_scanner_reset(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.scanner_reset", get_server(), "scanner_reset", {}, passed, failed, skipped);
-    }
-
-    mcp_tool_call_status_t test_tool_scan_mem_start(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        memory_scanner::reset_scan();
-        log_msg(hf, "mcp.scan_mem_start", "INFO -- memory scanner reset before scan_mem_start fixture");
-        const uint32_t value = 0x4D3C2B1A;
-        std::vector<uint8_t> bytes(sizeof(value), 0);
-        std::memcpy(bytes.data(), &value, sizeof(value));
-        if (!ensure_mcp_private_bytes(hf, "mcp.scan_mem_start", g_mcp_scanner_addr, 4096, bytes)) {
-            record_precondition_skipped_tool("scan_mem_start", skipped);
-            return mcp_tool_call_status_t::skipped;
-        }
-        uint32_t old_protect = 0;
-        driver_bridge::protect_memory(g_mcp_scanner_addr, 4096, PAGE_READWRITE, &old_protect);
-        mcp_standalone::json args;
-        args["value_type"] = "int32";
-        args["value"] = "1295788826";
-        args["alignment"] = 4;
-        args["writable_only"] = true;
-        args["executable_exclude"] = false;
-        args["range_base"] = hex_u64(g_mcp_scanner_addr & ~0xFFFULL);
-        args["range_size"] = static_cast<std::uint64_t>(4096);
-        args["wait_ms"] = 30000;
-        args["limit"] = 16;
-        return test_tool_call(hf, "mcp.scan_mem_start", get_server(), "scan_mem_start", args, passed, failed, skipped);
-    }
-
-    void test_tool_scan_mem_next(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args;
-        args["compare_type"] = "exact";
-        args["value"] = "1295788826";
-        args["wait_ms"] = 30000;
-        args["limit"] = 16;
-        test_tool_call(hf, "mcp.scan_mem_next", get_server(), "scan_mem_next", args, passed, failed, skipped);
-    }
-
-    void test_tool_scan_mem_results(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args;
-        args["limit"] = 16;
-        test_tool_call(hf, "mcp.scan_mem_results", get_server(), "scan_mem_results", args, passed, failed, skipped);
-    }
-
-    void test_tool_scan_mem_reset(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.scan_mem_reset", get_server(), "scan_mem_reset", {}, passed, failed, skipped);
-    }
-
-    void test_tool_scanner_undo(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+void test_tool_scanner_undo(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         test_tool_call(hf, "mcp.scanner_undo", get_server(), "scanner_undo", {}, passed, failed, skipped);
     }
 
-    void test_tool_scanner_add_address(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_scanner_address_list_manage_add(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const uint32_t value = 0x4D3C2B1A;
         std::vector<uint8_t> bytes(sizeof(value), 0);
         std::memcpy(bytes.data(), &value, sizeof(value));
-        if (!ensure_mcp_private_bytes(hf, "mcp.scanner_add_address", g_mcp_scanner_addr, 4096, bytes)) {
-            record_precondition_skipped_tool("scanner_add_address", skipped);
+        if (!ensure_mcp_private_bytes(hf, "mcp.scanner_address_list_manage.add", g_mcp_scanner_addr, 4096, bytes)) {
+            record_precondition_skipped_tool("scanner_address_list_manage", skipped);
             return;
         }
         mcp_standalone::json args;
         args["address"] = hex_u64(g_mcp_scanner_addr);
         args["description"] = "mcp_test_value";
         args["value_type"] = "int32";
-        test_tool_call(hf, "mcp.scanner_add_address", get_server(), "scanner_add_address", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.scanner_address_list_manage.add", "scanner_address_list_manage", "add", args, passed, failed, skipped);
     }
 
-    void test_tool_scanner_remove_address(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_scanner_address_list_manage_remove(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args;
         args["index"] = 0;
-        test_tool_call(hf, "mcp.scanner_remove_address", get_server(), "scanner_remove_address", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.scanner_address_list_manage.remove", "scanner_address_list_manage", "remove", args, passed, failed, skipped);
     }
 
-    void test_tool_scanner_freeze_address(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_scanner_address_list_manage_freeze(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args;
         args["index"] = 0;
         args["enable"] = true;
-        test_tool_call(hf, "mcp.scanner_freeze_address", get_server(), "scanner_freeze_address", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.scanner_address_list_manage.freeze", "scanner_address_list_manage", "freeze", args, passed, failed, skipped);
     }
 
-    void test_tool_scanner_read_value(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_read_memory_typed_value(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         uint64_t addr = driver_bridge::allocate_memory(16);
         if (addr == 0) {
-            log_msg(hf, "mcp.scanner_read_value", "SKIP -- allocate_memory failed for scanner read fixture");
-            record_precondition_skipped_tool("scanner_read_value", skipped);
+            log_msg(hf, "mcp.read_memory.typed", "SKIP -- allocate_memory failed for typed memory read fixture");
+            record_precondition_skipped_tool("read_memory", skipped);
             return;
         }
         std::vector<uint8_t> bytes = {0x39, 0x30, 0x00, 0x00};
         if (!driver_bridge::write_memory(addr, bytes)) {
-            log_msg(hf, "mcp.scanner_read_value", "SKIP -- write_memory failed for scanner read fixture addr=0x%016llX",
+            log_msg(hf, "mcp.read_memory.typed", "SKIP -- write_memory failed for typed memory read fixture addr=0x%016llX",
                 static_cast<unsigned long long>(addr));
             driver_bridge::free_memory(addr);
-            record_precondition_skipped_tool("scanner_read_value", skipped);
+            record_precondition_skipped_tool("read_memory", skipped);
             return;
         }
         mcp_standalone::json args;
         args["address"] = hex_u64(addr);
+        args["size"] = 4;
         args["value_type"] = "int32";
-        test_tool_call(hf, "mcp.scanner_read_value", get_server(), "scanner_read_value", args, passed, failed, skipped);
+        test_tool_call(hf, "mcp.read_memory.typed", get_server(), "read_memory", args, passed, failed, skipped);
         driver_bridge::free_memory(addr);
     }
 
@@ -10428,8 +10008,8 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         driver_bridge::free_memory(addr);
     }
 
-    void test_tool_scanner_get_address_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.scanner_get_address_list", get_server(), "scanner_get_address_list", {}, passed, failed, skipped);
+    void test_tool_scanner_address_list_manage_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_action_call(hf, "mcp.scanner_address_list_manage.list", "scanner_address_list_manage", "list", {}, passed, failed, skipped);
     }
 
     void test_tool_scanner_pointer_scan(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -10451,60 +10031,38 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         test_tool_call(hf, "mcp.scanner_cancel_pointer_scan", get_server(), "scanner_cancel_pointer_scan", {}, passed, failed, skipped);
     }
 
-    void test_tool_pointer_scan_start(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        if (!ensure_mcp_scanner_pointer_fixture(hf, "mcp.pointer_scan_start")) {
-            record_precondition_skipped_tool("pointer_scan_start", skipped);
-            return;
-        }
-        mcp_standalone::json args;
-        args["target_address"] = hex_u64(g_mcp_scanner_addr);
-        args["max_depth"] = 1;
-        args["max_offset"] = 0x100;
-        args["range_base"] = hex_u64(g_mcp_scanner_pointer_addr & ~0xFFFULL);
-        args["range_size"] = 4096;
-        test_tool_call(hf, "mcp.pointer_scan_start", get_server(), "pointer_scan_start", args, passed, failed, skipped);
-    }
 
-    void test_tool_pointer_scan_results(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args;
-        args["wait"] = true;
-        args["wait_ms"] = 30000;
-        args["limit"] = 16;
-        test_tool_call(hf, "mcp.pointer_scan_results", get_server(), "pointer_scan_results", args, passed, failed, skipped);
-        if (memory_scanner::g_state.pointer_scanning.load())
-            memory_scanner::cancel_pointer_scan();
-    }
 
-    void test_tool_scanner_define_struct(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        if (g_mcp_scanner_addr == 0 && !ensure_mcp_private_bytes(hf, "mcp.scanner_define_struct", g_mcp_scanner_addr, 4096, {0x1A, 0x2B, 0x3C, 0x4D})) {
-            record_precondition_skipped_tool("scanner_define_struct", skipped);
+void test_tool_scanner_struct_manage_define(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        if (g_mcp_scanner_addr == 0 && !ensure_mcp_private_bytes(hf, "mcp.scanner_struct_manage.define", g_mcp_scanner_addr, 4096, {0x1A, 0x2B, 0x3C, 0x4D})) {
+            record_precondition_skipped_tool("scanner_struct_manage", skipped);
             return;
         }
         mcp_standalone::json args;
         args["name"] = "test_struct";
         args["base_address"] = hex_u64(g_mcp_scanner_addr);
-        test_tool_call(hf, "mcp.scanner_define_struct", get_server(), "scanner_define_struct", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.scanner_struct_manage.define", "scanner_struct_manage", "define", args, passed, failed, skipped);
     }
 
-    void test_tool_scanner_add_struct_field(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_scanner_struct_manage_add_field(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args;
         args["struct_index"] = 0;
         args["name"] = "field1";
         args["field_type"] = "int32";
         args["offset"] = 0;
-        test_tool_call(hf, "mcp.scanner_add_struct_field", get_server(), "scanner_add_struct_field", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.scanner_struct_manage.add_field", "scanner_struct_manage", "add_field", args, passed, failed, skipped);
     }
 
-    void test_tool_scanner_get_struct(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_scanner_struct_manage_get(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args;
         args["struct_index"] = 0;
-        test_tool_call(hf, "mcp.scanner_get_struct", get_server(), "scanner_get_struct", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.scanner_struct_manage.get", "scanner_struct_manage", "get", args, passed, failed, skipped);
     }
 
-    void test_tool_scanner_export_struct_c(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_scanner_struct_manage_export_c(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args;
         args["struct_index"] = 0;
-        test_tool_call(hf, "mcp.scanner_export_struct_c", get_server(), "scanner_export_struct_c", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.scanner_struct_manage.export_c", "scanner_struct_manage", "export_c", args, passed, failed, skipped);
     }
 
     struct find_what_accesses_writer_context_t {
@@ -10753,23 +10311,23 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         driver_bridge::free_memory(addr);
     }
 
-    void test_tool_start_fuzz(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        if (!require_tool_read_only_metadata(hf, "mcp.start_fuzz", "start_fuzz", false, failed))
+    void test_tool_fuzzer_manage_start(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        if (!require_tool_read_only_metadata(hf, "mcp.fuzzer_manage.start", "fuzzer_manage", false, failed))
             return;
         std::vector<uint8_t> bytes(4096, 0x90);
         bytes[0] = 0xC3;
-        if (!ensure_mcp_private_bytes(hf, "mcp.start_fuzz", g_mcp_fuzz_addr, bytes.size(), bytes)) {
-            record_fixture_failed_tool("start_fuzz", failed);
+        if (!ensure_mcp_private_bytes(hf, "mcp.fuzzer_manage.start", g_mcp_fuzz_addr, bytes.size(), bytes)) {
+            record_fixture_failed_tool("fuzzer_manage", failed);
             return;
         }
         std::vector<uint8_t> input_bytes(16, 0);
         for (size_t i = 0; i < input_bytes.size(); ++i)
             input_bytes[i] = static_cast<uint8_t>((i * 31u + 0x21u) & 0xFFu);
-        if (!ensure_mcp_private_bytes(hf, "mcp.start_fuzz", g_mcp_fuzz_input_addr, input_bytes.size(), input_bytes)) {
-            record_fixture_failed_tool("start_fuzz", failed);
+        if (!ensure_mcp_private_bytes(hf, "mcp.fuzzer_manage.start", g_mcp_fuzz_input_addr, input_bytes.size(), input_bytes)) {
+            record_fixture_failed_tool("fuzzer_manage", failed);
             return;
         }
-        log_msg(hf, "mcp.start_fuzz", "fixture target=0x%016llX input=0x%016llX attached_pid=%u",
+        log_msg(hf, "mcp.fuzzer_manage.start", "fixture target=0x%016llX input=0x%016llX attached_pid=%u",
             static_cast<unsigned long long>(g_mcp_fuzz_addr),
             static_cast<unsigned long long>(g_mcp_fuzz_input_addr),
             driver_bridge::attached_pid());
@@ -10779,7 +10337,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         args["input_address"] = hex_u64(g_mcp_fuzz_input_addr);
         args["max_iterations"] = 8;
         args["input_size"] = 16;
-        auto call_status = test_tool_call(hf, "mcp.start_fuzz", get_server(), "start_fuzz", args, passed, failed, skipped);
+        auto call_status = test_tool_action_call(hf, "mcp.fuzzer_manage.start", "fuzzer_manage", "start", args, passed, failed, skipped);
         if (call_status != mcp_tool_call_status_t::passed)
             return;
         const auto setup_start = std::chrono::steady_clock::now();
@@ -10797,7 +10355,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
                 std::lock_guard<std::mutex> lk(fuzzer_engine::g_state.mutex);
                 setup_error = fuzzer_engine::g_state.setup_error;
             }
-            log_msg(hf, "mcp.start_fuzz", "FAIL -- fuzzer setup incomplete success=%d complete=%d running=%d worker=%d err=%s",
+            log_msg(hf, "mcp.fuzzer_manage.start", "FAIL -- fuzzer setup incomplete success=%d complete=%d running=%d worker=%d err=%s",
                 fuzzer_engine::g_state.setup_success.load() ? 1 : 0,
                 fuzzer_engine::g_state.setup_complete.load() ? 1 : 0,
                 fuzzer_engine::g_state.running.load() ? 1 : 0,
@@ -10805,15 +10363,15 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
                 setup_error.c_str());
             fuzzer_engine::stop_fuzzing();
             fuzzer_engine::wait_until_idle(12000);
-            record_fixture_failed_tool("start_fuzz", failed);
+            record_fixture_failed_tool("fuzzer_manage", failed);
             return;
         }
         for (int i = 0; i < 20; ++i) {
-            auto status = invoke_tool_bounded(get_server(), "get_fuzz_results", {}, 1000);
+            auto status = invoke_tool_bounded(get_server(), "fuzzer_manage", mcp_standalone::json{{"action", "results"}}, 1000);
             uint64_t execs = 0;
             if (!status.timed_out && status.result.success && status.result.data.is_object())
                 payload_u64_field(status.result.data, "total_executions", execs);
-            log_msg(hf, "mcp.start_fuzz", "poll execs=%llu timed_out=%d success=%d running=%d worker=%d setup_success=%d",
+            log_msg(hf, "mcp.fuzzer_manage.start", "poll execs=%llu timed_out=%d success=%d running=%d worker=%d setup_success=%d",
                 static_cast<unsigned long long>(execs),
                 status.timed_out ? 1 : 0,
                 status.result.success ? 1 : 0,
@@ -10821,32 +10379,32 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
                 fuzzer_engine::g_state.worker_active.load() ? 1 : 0,
                 fuzzer_engine::g_state.setup_success.load() ? 1 : 0);
             if (execs > 0) {
-                log_msg(hf, "mcp.start_fuzz", "semantic PASS -- fuzzer executed fixture iterations=%llu",
+                log_msg(hf, "mcp.fuzzer_manage.start", "semantic PASS -- fuzzer executed fixture iterations=%llu",
                     static_cast<unsigned long long>(execs));
                 return;
             }
             Sleep(50);
         }
-        log_msg(hf, "mcp.start_fuzz", "FAIL -- fuzzer reported no executions after successful setup");
+        log_msg(hf, "mcp.fuzzer_manage.start", "FAIL -- fuzzer reported no executions after successful setup");
         fuzzer_engine::stop_fuzzing();
         fuzzer_engine::wait_until_idle(12000);
-        record_fixture_failed_tool("start_fuzz", failed);
+        record_fixture_failed_tool("fuzzer_manage", failed);
     }
 
-    void test_tool_stop_fuzz(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        auto status = test_tool_call(hf, "mcp.stop_fuzz", get_server(), "stop_fuzz", {}, passed, failed, skipped);
+    void test_tool_fuzzer_manage_stop(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        auto status = test_tool_action_call(hf, "mcp.fuzzer_manage.stop", "fuzzer_manage", "stop", {}, passed, failed, skipped);
         const bool idle = fuzzer_engine::wait_until_idle(12000);
-        log_msg(hf, "mcp.stop_fuzz", "post-stop idle=%d running=%d worker=%d status=%d",
+        log_msg(hf, "mcp.fuzzer_manage.stop", "post-stop idle=%d running=%d worker=%d status=%d",
             idle ? 1 : 0,
             fuzzer_engine::g_state.running.load() ? 1 : 0,
             fuzzer_engine::g_state.worker_active.load() ? 1 : 0,
             static_cast<int>(status));
         if (status == mcp_tool_call_status_t::passed && !idle)
-            record_fixture_failed_tool("stop_fuzz", failed);
+            record_fixture_failed_tool("fuzzer_manage", failed);
     }
 
-    void test_tool_get_fuzz_results(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.get_fuzz_results", get_server(), "get_fuzz_results", {}, passed, failed, skipped);
+    void test_tool_fuzzer_manage_results(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_action_call(hf, "mcp.fuzzer_manage.results", "fuzzer_manage", "results", {}, passed, failed, skipped);
     }
 
     void test_tool_auto_decrypt_strings(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -11002,12 +10560,12 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         test_tool_call(hf, "mcp.neutralize_integrity_node", get_server(), "neutralize_integrity_node", args, passed, failed, skipped);
     }
 
-    void test_tool_start_live_monitor(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        if (!require_tool_read_only_metadata(hf, "mcp.start_live_monitor", "start_live_monitor", false, failed))
+    void test_tool_live_monitor_manage_start(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        if (!require_tool_read_only_metadata(hf, "mcp.live_monitor_manage.start", "live_monitor_manage", false, failed))
             return;
-        if (g_mcp_live_monitor_addr == 0 && !prepare_live_monitor_regions(hf, "mcp.start_live_monitor")) {
-            log_msg(hf, "mcp.start_live_monitor", "FAIL -- live monitor fixture memory setup failed");
-            record_fixture_failed_tool("start_live_monitor", failed);
+        if (g_mcp_live_monitor_addr == 0 && !prepare_live_monitor_regions(hf, "mcp.live_monitor_manage.start")) {
+            log_msg(hf, "mcp.live_monitor_manage.start", "FAIL -- live monitor fixture memory setup failed");
+            record_fixture_failed_tool("live_monitor_manage", failed);
             return;
         }
         mcp_standalone::json args;
@@ -11016,29 +10574,29 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         args["name"] = "mcp_live_monitor_fixture";
         args["backend"] = "polling";
         args["timeout_ms"] = 1500;
-        auto status = test_tool_call(hf, "mcp.start_live_monitor", get_server(), "start_live_monitor", args, passed, failed, skipped);
+        auto status = test_tool_action_call(hf, "mcp.live_monitor_manage.start", "live_monitor_manage", "start", args, passed, failed, skipped);
         if (status != mcp_tool_call_status_t::passed) {
-            log_msg(hf, "mcp.start_live_monitor", "INFO -- monitor did not start; skipping access trigger and cleaning fixture buffers");
-            cleanup_live_monitor_regions(hf, "mcp.start_live_monitor");
+            log_msg(hf, "mcp.live_monitor_manage.start", "INFO -- monitor did not start; skipping access trigger and cleaning fixture buffers");
+            cleanup_live_monitor_regions(hf, "mcp.live_monitor_manage.start");
             return;
         }
-        trigger_live_monitor_accesses(hf, "mcp.start_live_monitor");
-        if (!ensure_mcp_target_live(hf, "mcp.start_live_monitor")) {
+        trigger_live_monitor_accesses(hf, "mcp.live_monitor_manage.start");
+        if (!ensure_mcp_target_live(hf, "mcp.live_monitor_manage.start")) {
             failed.fetch_add(1);
-            cleanup_live_monitor_regions(hf, "mcp.start_live_monitor");
+            cleanup_live_monitor_regions(hf, "mcp.live_monitor_manage.start");
         }
     }
 
-    void test_tool_stop_live_monitor(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        if (!require_tool_read_only_metadata(hf, "mcp.stop_live_monitor", "stop_live_monitor", false, failed))
+    void test_tool_live_monitor_manage_stop(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        if (!require_tool_read_only_metadata(hf, "mcp.live_monitor_manage.stop", "live_monitor_manage", false, failed))
             return;
         mcp_standalone::json args;
         args["require_captures"] = true;
-        test_tool_call(hf, "mcp.stop_live_monitor", get_server(), "stop_live_monitor", args, passed, failed, skipped);
-        cleanup_live_monitor_regions(hf, "mcp.stop_live_monitor");
+        test_tool_action_call(hf, "mcp.live_monitor_manage.stop", "live_monitor_manage", "stop", args, passed, failed, skipped);
+        cleanup_live_monitor_regions(hf, "mcp.live_monitor_manage.stop");
     }
 
-    void test_tool_symbolic_deobfuscate(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_symbolic_execution_deobfuscate(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         std::vector<uint8_t> code(4096, 0x90);
         const uint8_t fixture[] = {
             0x48, 0x89, 0xC8,
@@ -11050,37 +10608,37 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             0xC3
         };
         std::copy(std::begin(fixture), std::end(fixture), code.begin());
-        if (!ensure_mcp_private_bytes(hf, "mcp.symbolic_deobfuscate", g_mcp_symbolic_deobf_addr, code.size(), code)) {
-            log_msg(hf, "mcp.symbolic_deobfuscate", "FAIL -- symbolic deobfuscation fixture setup failed");
-            record_fixture_failed_tool("symbolic_deobfuscate", failed);
+        if (!ensure_mcp_private_bytes(hf, "mcp.symbolic_execution.deobfuscate", g_mcp_symbolic_deobf_addr, code.size(), code)) {
+            log_msg(hf, "mcp.symbolic_execution.deobfuscate", "FAIL -- symbolic deobfuscation fixture setup failed");
+            record_fixture_failed_tool("symbolic_execution", failed);
             return;
         }
         mcp_standalone::json args;
         args["entry_address"] = hex_u64(g_mcp_symbolic_deobf_addr);
         args["max_instructions"] = 128;
-        test_tool_call(hf, "mcp.symbolic_deobfuscate", get_server(), "symbolic_deobfuscate", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.symbolic_execution.deobfuscate", "symbolic_execution", "deobfuscate", args, passed, failed, skipped);
     }
 
-    void test_tool_symbolic_slice_function(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_symbolic_execution_slice_function(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         auto addr = get_ntclose_addr_str();
-        if (addr.empty()) { log_msg(hf, "mcp.symbolic_slice_function", "SKIP -- NtClose not found"); skipped.fetch_add(1); return; }
+        if (addr.empty()) { log_msg(hf, "mcp.symbolic_execution.slice_function", "SKIP -- NtClose not found"); skipped.fetch_add(1); return; }
         mcp_standalone::json args;
         args["start_address"] = addr;
         args["end_address"] = hex_u64(std::strtoull(addr.c_str(), nullptr, 16) + 64);
         args["target_register"] = "rax";
         args["max_instructions"] = 128;
-        test_tool_call(hf, "mcp.symbolic_slice_function", get_server(), "symbolic_slice_function", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.symbolic_execution.slice_function", "symbolic_execution", "slice_function", args, passed, failed, skipped);
     }
 
-    void test_tool_symbolic_solve_path(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_symbolic_execution_solve_path(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         auto addr = get_ntclose_addr_str();
-        if (addr.empty()) { log_msg(hf, "mcp.symbolic_solve_path", "SKIP -- NtClose not found"); skipped.fetch_add(1); return; }
+        if (addr.empty()) { log_msg(hf, "mcp.symbolic_execution.solve_path", "SKIP -- NtClose not found"); skipped.fetch_add(1); return; }
         mcp_standalone::json args;
         args["start_address"] = addr;
         args["target_address"] = hex_u64(std::strtoull(addr.c_str(), nullptr, 16) + 16);
         args["symbolic_registers"] = "rax";
         args["max_instructions"] = 64;
-        test_tool_call(hf, "mcp.symbolic_solve_path", get_server(), "symbolic_solve_path", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.symbolic_execution.solve_path", "symbolic_execution", "solve_path", args, passed, failed, skipped);
     }
 
     void test_tool_taint_trace_register(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -11102,41 +10660,16 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         test_tool_call(hf, "mcp.decompile_function", get_server(), "decompile_function", args, passed, failed, skipped);
     }
 
-    void test_tool_analysis_get_imports(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.analysis_get_imports", get_server(), "analysis_get_imports", {}, passed, failed, skipped);
+    void test_tool_analysis_query_imports(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_action_call(hf, "mcp.analysis_query.imports", "analysis_query", "imports", {}, passed, failed, skipped);
     }
 
-    void test_tool_enable_stealth_context(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        if (!require_tool_read_only_metadata(hf, "mcp.enable_stealth_context", "enable_stealth_context", false, failed))
-            return;
-        mcp_standalone::json args;
-        uint32_t pid = driver_bridge::attached_pid();
-        if (pid != 0)
-            args["pid"] = std::to_string(pid);
-        args["spoof_peb"] = false;
-        args["hook_rdtsc"] = false;
-        args["scrub_context"] = false;
-        test_tool_call(hf, "mcp.enable_stealth_context", get_server(), "enable_stealth_context", args, passed, failed, skipped);
-    }
-
-    void test_tool_disable_stealth_context(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        if (!require_tool_read_only_metadata(hf, "mcp.disable_stealth_context", "disable_stealth_context", false, failed))
-            return;
-        auto status = test_tool_call(hf, "mcp.disable_stealth_context", get_server(), "disable_stealth_context", {}, passed, failed, skipped);
-        uint32_t pid = driver_bridge::attached_pid();
-        bool restored = pid != 0 ? stealth_engine::ensure_default_enabled(pid, "testlab.mcp.disable_stealth_context.restore") : false;
-        log_msg(hf, "mcp.disable_stealth_context", "restore_default pid=%u restored=%d status=%d",
-            pid, restored ? 1 : 0, static_cast<int>(status));
-        if (status == mcp_tool_call_status_t::passed && pid != 0 && !restored)
-            record_fixture_failed_tool("disable_stealth_context", failed);
-    }
-
-    void test_tool_analysis_get_exports(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+void test_tool_analysis_query_exports(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args;
         args["module_name"] = "ntdll.dll";
         args["max_entries"] = 128;
         mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.analysis_get_exports", get_server(), "analysis_get_exports", args, passed, failed, skipped, false, &result);
+        auto status = test_tool_action_call(hf, "mcp.analysis_query.exports", "analysis_query", "exports", args, passed, failed, skipped, false, &result);
         if (status != mcp_tool_call_status_t::passed)
             return;
         uint64_t count = 0;
@@ -11144,7 +10677,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         size_t exports = 0;
         const bool has_exports = payload_array_count(result.data, "exports", exports);
         if (!has_count || count == 0 || !has_exports || exports == 0) {
-            log_msg(hf, "mcp.analysis_get_exports", "FAIL -- selected module export list empty count_present=%d count=%llu exports_present=%d exports=%zu data=%s",
+            log_msg(hf, "mcp.analysis_query.exports", "FAIL -- selected module export list empty count_present=%d count=%llu exports_present=%d exports=%zu data=%s",
                 has_count ? 1 : 0,
                 static_cast<unsigned long long>(count),
                 has_exports ? 1 : 0,
@@ -11153,7 +10686,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             if (passed.load(std::memory_order_acquire) > 0)
                 passed.fetch_sub(1, std::memory_order_acq_rel);
             failed.fetch_add(1, std::memory_order_acq_rel);
-            convert_tool_pass_to_fail("analysis_get_exports");
+            convert_tool_pass_to_fail("analysis_query");
         }
     }
 
@@ -11203,9 +10736,9 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         return false;
     }
 
-    void test_tool_analysis_get_types(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        if (!ensure_pdb_fixture_loaded(hf, "mcp.analysis_get_types")) {
-            record_tool_status("analysis_get_types", mcp_tool_call_status_t::failed);
+    void test_tool_analysis_query_types(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        if (!ensure_pdb_fixture_loaded(hf, "mcp.analysis_query.types")) {
+            record_tool_status("analysis_query", mcp_tool_call_status_t::failed);
             failed.fetch_add(1);
             return;
         }
@@ -11214,23 +10747,23 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         args["filter"] = "protocol";
         args["limit"] = 64;
         mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.analysis_get_types", get_server(), "analysis_get_types", args, passed, failed, skipped, true, &result);
+        auto status = test_tool_action_call(hf, "mcp.analysis_query.types", "analysis_query", "types", args, passed, failed, skipped, true, &result);
         if (status == mcp_tool_call_status_t::passed) {
             uint64_t returned = 0;
             payload_u64_field(result.data, "returned", returned);
-            log_msg(hf, "mcp.analysis_get_types", "PDB-PROOF -- returned=%llu filter=protocol module=target_protocol.exe", static_cast<unsigned long long>(returned));
+            log_msg(hf, "mcp.analysis_query.types", "PDB-PROOF -- returned=%llu filter=protocol module=target_protocol.exe", static_cast<unsigned long long>(returned));
         }
     }
 
-    void test_tool_analysis_get_type_definition(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_analysis_query_type_definition(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args;
         args["name"] = "HANDLE";
-        test_tool_call(hf, "mcp.analysis_get_type_definition", get_server(), "analysis_get_type_definition", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.analysis_query.type_definition", "analysis_query", "type_definition", args, passed, failed, skipped);
     }
 
-    void test_tool_analysis_get_pdb_symbols(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        if (!ensure_pdb_fixture_loaded(hf, "mcp.analysis_get_pdb_symbols")) {
-            record_tool_status("analysis_get_pdb_symbols", mcp_tool_call_status_t::failed);
+    void test_tool_analysis_query_pdb_symbols(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        if (!ensure_pdb_fixture_loaded(hf, "mcp.analysis_query.pdb_symbols")) {
+            record_tool_status("analysis_query", mcp_tool_call_status_t::failed);
             failed.fetch_add(1);
             return;
         }
@@ -11240,15 +10773,15 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         args["functions_only"] = true;
         args["limit"] = 64;
         mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.analysis_get_pdb_symbols", get_server(), "analysis_get_pdb_symbols", args, passed, failed, skipped, true, &result);
+        auto status = test_tool_action_call(hf, "mcp.analysis_query.pdb_symbols", "analysis_query", "pdb_symbols", args, passed, failed, skipped, true, &result);
         if (status == mcp_tool_call_status_t::passed) {
             uint64_t returned = 0;
             payload_u64_field(result.data, "returned", returned);
-            log_msg(hf, "mcp.analysis_get_pdb_symbols", "PDB-PROOF -- returned=%llu filter=vuln_ module=target_protocol.exe", static_cast<unsigned long long>(returned));
+            log_msg(hf, "mcp.analysis_query.pdb_symbols", "PDB-PROOF -- returned=%llu filter=vuln_ module=target_protocol.exe", static_cast<unsigned long long>(returned));
         }
     }
 
-    void test_tool_analysis_get_binary_map_overview(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_analysis_query_binary_map_overview(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args;
         args["max_functions"] = 8;
         args["max_globals"] = 4;
@@ -11256,42 +10789,16 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         args["include_exports"] = false;
         args["include_xrefs"] = false;
         args["fast_summary"] = true;
-        test_tool_call(hf, "mcp.analysis_get_binary_map_overview", get_server(), "analysis_get_binary_map_overview", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.analysis_query.binary_map_overview", "analysis_query", "binary_map_overview", args, passed, failed, skipped);
     }
 
-    void test_tool_analysis_get_xref_db_stats(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.analysis_get_xref_db_stats", get_server(), "analysis_get_xref_db_stats", {}, passed, failed, skipped);
-    }
-
-    void test_tool_crypto_scanner_run(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args;
-        args["module_filter"] = "AiDA_TestTarget.exe";
-        args["max_regions"] = 64;
-        args["max_bytes"] = 0x400000;
-        args["max_hits"] = 64;
-        args["timeout_ms"] = 4500;
-        test_tool_call(hf, "mcp.crypto_scanner_run", get_server(), "crypto_scanner_run", args, passed, failed, skipped);
-    }
-
-    void test_tool_crypto_scanner_get_results(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.crypto_scanner_get_results", get_server(), "crypto_scanner_get_results", {}, passed, failed, skipped);
+    void test_tool_analysis_query_xref_db_stats(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_action_call(hf, "mcp.analysis_query.xref_db_stats", "analysis_query", "xref_db_stats", {}, passed, failed, skipped);
     }
 
 
-    void test_tool_disasm_jump_to_address(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        auto addr = get_static_disasm_instruction_addr(hf, "mcp.disasm_jump_to_address");
-        if (addr.empty()) {
-            addr = get_ntclose_addr_str();
-            if (!addr.empty())
-                log_msg(hf, "mcp.disasm_jump_to_address", "INFO -- using live NtClose fallback fixture address=%s", addr.c_str());
-        }
-        if (addr.empty()) { record_precondition_skipped_tool("disasm_jump_to_address", skipped); return; }
-        mcp_standalone::json args;
-        args["address"] = addr;
-        test_tool_call(hf, "mcp.disasm_jump_to_address", get_server(), "disasm_jump_to_address", args, passed, failed, skipped);
-    }
 
-    void test_tool_disasm_get_instruction(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+void test_tool_disasm_get_instruction(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         auto addr = get_remote_ntclose_addr_str();
         if (addr.empty()) { log_msg(hf, "mcp.disasm_get_instruction", "SKIP -- NtClose not found"); skipped.fetch_add(1); return; }
         mcp_standalone::json args;
@@ -11319,44 +10826,46 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         test_tool_call(hf, "mcp.disasm_list_functions", get_server(), "disasm_list_functions", {}, passed, failed, skipped);
     }
 
-    void test_tool_disasm_get_xrefs_to(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_get_xrefs_to(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         seed_mcp_xref_db_fixture();
         mcp_standalone::json args;
         args["address"] = hex_u64(g_mcp_xref_to_addr);
-        test_tool_call(hf, "mcp.disasm_get_xrefs_to", get_server(), "disasm_get_xrefs_to", args, passed, failed, skipped);
+        args["direction"] = "to";
+        test_tool_call(hf, "mcp.get_xrefs.to", get_server(), "get_xrefs", args, passed, failed, skipped);
     }
 
-    void test_tool_disasm_get_xrefs_from(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_get_xrefs_from(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         seed_mcp_xref_db_fixture();
         mcp_standalone::json args;
         args["address"] = hex_u64(g_mcp_xref_from_addr);
-        test_tool_call(hf, "mcp.disasm_get_xrefs_from", get_server(), "disasm_get_xrefs_from", args, passed, failed, skipped);
+        args["direction"] = "from";
+        test_tool_call(hf, "mcp.get_xrefs.from", get_server(), "get_xrefs", args, passed, failed, skipped);
     }
 
-    void test_tool_disasm_set_comment(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_disasm_annotations_manage_set_comment(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         auto addr = get_ntclose_addr_str();
-        if (addr.empty()) { log_msg(hf, "mcp.disasm_set_comment", "SKIP -- NtClose not found"); skipped.fetch_add(1); return; }
+        if (addr.empty()) { log_msg(hf, "mcp.disasm_annotations_manage.set_comment", "SKIP -- NtClose not found"); skipped.fetch_add(1); return; }
         mcp_standalone::json args;
         args["address"] = addr;
         args["comment"] = "test";
-        test_tool_call(hf, "mcp.disasm_set_comment", get_server(), "disasm_set_comment", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.disasm_annotations_manage.set_comment", "disasm_annotations_manage", "set_comment", args, passed, failed, skipped);
     }
 
-    void test_tool_disasm_get_comment(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_disasm_annotations_manage_get_comment(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         auto addr = get_ntclose_addr_str();
-        if (addr.empty()) { log_msg(hf, "mcp.disasm_get_comment", "SKIP -- NtClose not found"); skipped.fetch_add(1); return; }
+        if (addr.empty()) { log_msg(hf, "mcp.disasm_annotations_manage.get_comment", "SKIP -- NtClose not found"); skipped.fetch_add(1); return; }
         mcp_standalone::json args;
         args["address"] = addr;
-        test_tool_call(hf, "mcp.disasm_get_comment", get_server(), "disasm_get_comment", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.disasm_annotations_manage.get_comment", "disasm_annotations_manage", "get_comment", args, passed, failed, skipped);
     }
 
-    void test_tool_disasm_rename_function(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_disasm_annotations_manage_rename_function(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         auto addr = get_ntclose_addr_str();
-        if (addr.empty()) { log_msg(hf, "mcp.disasm_rename_function", "SKIP -- NtClose not found"); skipped.fetch_add(1); return; }
+        if (addr.empty()) { log_msg(hf, "mcp.disasm_annotations_manage.rename_function", "SKIP -- NtClose not found"); skipped.fetch_add(1); return; }
         mcp_standalone::json args;
         args["address"] = addr;
         args["new_name"] = "test_func";
-        test_tool_call(hf, "mcp.disasm_rename_function", get_server(), "disasm_rename_function", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.disasm_annotations_manage.rename_function", "disasm_annotations_manage", "rename_function", args, passed, failed, skipped);
     }
 
     void test_tool_disasm_get_section_info(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -11373,99 +10882,17 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         test_tool_call(hf, "mcp.disasm_get_strings", get_server(), "disasm_get_strings", {}, passed, failed, skipped);
     }
 
-    void test_tool_ui_set_active_view(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args;
-        args["view"] = "disassembly";
-        test_tool_call(hf, "mcp.ui_set_active_view", get_server(), "ui_set_active_view", args, passed, failed, skipped);
-    }
-
-    void test_tool_bookmarks_add(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        auto addr = get_ntclose_addr_str();
-        if (addr.empty()) { log_msg(hf, "mcp.bookmarks_add", "SKIP -- NtClose not found"); skipped.fetch_add(1); return; }
-        mcp_standalone::json args;
-        args["address"] = addr;
-        const uint64_t addr_u64 = static_cast<uint64_t>(std::strtoull(addr.c_str(), nullptr, 0));
-        log_msg(hf, "mcp.bookmarks_add", "VERIFY-INPUT -- address=%s parsed=0x%llX existing_bookmarks=%zu",
-            addr.c_str(),
-            (unsigned long long)addr_u64,
-            disasm_view::g_state.bookmarks.size());
-        mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.bookmarks_add", get_server(), "bookmarks_add", args, passed, failed, skipped, false, &result);
-        if (status == mcp_tool_call_status_t::passed) {
-            log_tool_result_payload(hf, "mcp.bookmarks_add", "VERIFY-RESULT", result);
-            auto listed = invoke_tool_bounded(get_server(), "bookmarks_list", {}, tool_timeout_ms("bookmarks_list"));
-            const uint64_t count = json_count_or_array_size(listed.result.data, "count", "bookmarks");
-            const bool contains = json_array_contains_u64_field(listed.result.data, "bookmarks", addr_u64, { "address", "addr", "va" });
-            log_msg(hf, "mcp.bookmarks_add", "VERIFY-LIST -- timeout=%d success=%d count=%llu contains_target=%d text=%s data=%s",
-                listed.timed_out ? 1 : 0,
-                listed.result.success ? 1 : 0,
-                (unsigned long long)count,
-                contains ? 1 : 0,
-                compact_text(listed.result.text, 500).c_str(),
-                compact_json(listed.result.data, 900).c_str());
-        }
-    }
-
-    void test_tool_bookmarks_remove(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        auto addr = get_ntclose_addr_str();
-        if (addr.empty()) { log_msg(hf, "mcp.bookmarks_remove", "SKIP -- NtClose not found"); skipped.fetch_add(1); return; }
-        mcp_standalone::json args;
-        args["address"] = addr;
-        const uint64_t addr_u64 = static_cast<uint64_t>(std::strtoull(addr.c_str(), nullptr, 0));
-        log_msg(hf, "mcp.bookmarks_remove", "VERIFY-INPUT -- address=%s parsed=0x%llX existing_bookmarks=%zu",
-            addr.c_str(),
-            (unsigned long long)addr_u64,
-            disasm_view::g_state.bookmarks.size());
-        mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.bookmarks_remove", get_server(), "bookmarks_remove", args, passed, failed, skipped, false, &result);
-        if (status == mcp_tool_call_status_t::passed) {
-            log_tool_result_payload(hf, "mcp.bookmarks_remove", "VERIFY-RESULT", result);
-            auto listed = invoke_tool_bounded(get_server(), "bookmarks_list", {}, tool_timeout_ms("bookmarks_list"));
-            const uint64_t count = json_count_or_array_size(listed.result.data, "count", "bookmarks");
-            const bool contains = json_array_contains_u64_field(listed.result.data, "bookmarks", addr_u64, { "address", "addr", "va" });
-            log_msg(hf, "mcp.bookmarks_remove", "VERIFY-LIST -- timeout=%d success=%d count=%llu contains_target=%d text=%s data=%s",
-                listed.timed_out ? 1 : 0,
-                listed.result.success ? 1 : 0,
-                (unsigned long long)count,
-                contains ? 1 : 0,
-                compact_text(listed.result.text, 500).c_str(),
-                compact_json(listed.result.data, 900).c_str());
-        }
-    }
-
-    void test_tool_bookmarks_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        log_msg(hf, "mcp.bookmarks_list", "VERIFY-INPUT -- in_memory_bookmarks=%zu", disasm_view::g_state.bookmarks.size());
-        mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.bookmarks_list", get_server(), "bookmarks_list", {}, passed, failed, skipped, false, &result);
-        if (status == mcp_tool_call_status_t::passed) {
-            const uint64_t count = json_count_or_array_size(result.data, "count", "bookmarks");
-            log_msg(hf, "mcp.bookmarks_list", "VERIFY-RESULT -- count=%llu array_size=%zu data=%s",
-                (unsigned long long)count,
-                json_array_size_field(result.data, "bookmarks"),
-                compact_json(result.data, 900).c_str());
-        }
-    }
-
-    void test_tool_hex_view_open(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        auto addr = get_ntdll_addr_str();
-        if (addr.empty()) { log_msg(hf, "mcp.hex_view_open", "SKIP -- ntdll not loaded"); skipped.fetch_add(1); return; }
-        mcp_standalone::json args;
-        args["address"] = addr;
-        test_tool_call(hf, "mcp.hex_view_open", get_server(), "hex_view_open", args, passed, failed, skipped);
-    }
-
-
-    void test_tool_sessions_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        log_msg(hf, "mcp.sessions_list", "VERIFY-INPUT -- fixture_session_id=%s target_pid=%u attached_pid=%u",
+void test_tool_sessions_manage_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        log_msg(hf, "mcp.sessions_manage.list", "VERIFY-INPUT -- fixture_session_id=%s target_pid=%u attached_pid=%u",
             g_mcp_session_binary_id.empty() ? "<empty>" : g_mcp_session_binary_id.c_str(),
             g_mcp_target_pid,
             driver_bridge::attached_pid());
         mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.sessions_list", get_server(), "sessions_list", {}, passed, failed, skipped, false, &result);
+        auto status = test_tool_action_call(hf, "mcp.sessions_manage.list", "sessions_manage", "list", {}, passed, failed, skipped, false, &result);
         if (status == mcp_tool_call_status_t::passed) {
             const uint64_t count = json_count_or_array_size(result.data, "count", "sessions");
             const bool fixture_present = json_array_contains_string_field(result.data, "sessions", g_mcp_session_binary_id, { "id", "binary_id" });
-            log_msg(hf, "mcp.sessions_list", "VERIFY-RESULT -- count=%llu array_size=%zu fixture_present=%d data=%s",
+            log_msg(hf, "mcp.sessions_manage.list", "VERIFY-RESULT -- count=%llu array_size=%zu fixture_present=%d data=%s",
                 (unsigned long long)count,
                 json_array_size_field(result.data, "sessions"),
                 fixture_present ? 1 : 0,
@@ -11473,13 +10900,13 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         }
     }
 
-    void test_tool_sessions_get_active(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        log_msg(hf, "mcp.sessions_get_active", "VERIFY-INPUT -- fixture_session_id=%s target_pid=%u attached_pid=%u",
+    void test_tool_sessions_manage_get_active(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        log_msg(hf, "mcp.sessions_manage.get_active", "VERIFY-INPUT -- fixture_session_id=%s target_pid=%u attached_pid=%u",
             g_mcp_session_binary_id.empty() ? "<empty>" : g_mcp_session_binary_id.c_str(),
             g_mcp_target_pid,
             driver_bridge::attached_pid());
         mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.sessions_get_active", get_server(), "sessions_get_active", {}, passed, failed, skipped, false, &result);
+        auto status = test_tool_action_call(hf, "mcp.sessions_manage.get_active", "sessions_manage", "get_active", {}, passed, failed, skipped, false, &result);
         if (status == mcp_tool_call_status_t::passed) {
             std::string active_id;
             std::string active_kind;
@@ -11487,7 +10914,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
                 json_string_any_field(result.data["active"], active_id, { "id", "binary_id" });
                 json_string_any_field(result.data["active"], active_kind, { "kind" });
             }
-            log_msg(hf, "mcp.sessions_get_active", "VERIFY-RESULT -- active_id=%s active_kind=%s fixture_matches=%d data=%s",
+            log_msg(hf, "mcp.sessions_manage.get_active", "VERIFY-RESULT -- active_id=%s active_kind=%s fixture_matches=%d data=%s",
                 active_id.empty() ? "<empty>" : active_id.c_str(),
                 active_kind.empty() ? "<empty>" : active_kind.c_str(),
                 (!g_mcp_session_binary_id.empty() && active_id == g_mcp_session_binary_id) ? 1 : 0,
@@ -11495,91 +10922,64 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         }
     }
 
-    void test_tool_sessions_switch(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        if (g_mcp_session_binary_id.empty()) {
-            log_msg(hf, "mcp.sessions_switch", "FAIL -- no session fixture id from sessions_open_file");
-            record_tool_status("sessions_switch", mcp_tool_call_status_t::failed);
-            failed.fetch_add(1);
-            return;
-        }
-        mcp_standalone::json args;
-        args["binary_id"] = g_mcp_session_binary_id;
-        log_msg(hf, "mcp.sessions_switch", "VERIFY-INPUT -- binary_id=%s target_pid=%u attached_pid=%u",
-            g_mcp_session_binary_id.c_str(),
-            g_mcp_target_pid,
-            driver_bridge::attached_pid());
-        mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.sessions_switch", get_server(), "sessions_switch", args, passed, failed, skipped, false, &result);
-        if (status == mcp_tool_call_status_t::passed) {
-            std::string switched_id;
-            if (result.data.is_object() && result.data.contains("switched_to") && result.data["switched_to"].is_object())
-                json_string_any_field(result.data["switched_to"], switched_id, { "id", "binary_id" });
-            bool already_active = false;
-            payload_bool_field(result.data, "already_active", already_active);
-            log_msg(hf, "mcp.sessions_switch", "VERIFY-RESULT -- switched_id=%s already_active=%d fixture_matches=%d data=%s",
-                switched_id.empty() ? "<empty>" : switched_id.c_str(),
-                already_active ? 1 : 0,
-                switched_id == g_mcp_session_binary_id ? 1 : 0,
-                compact_json(result.data, 900).c_str());
-        }
-    }
 
-    void test_tool_sessions_open_file(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+void test_tool_sessions_manage_open_file(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args;
         args["path"] = get_small_pe_fixture_path();
         const std::string path_arg = args["path"].is_string() ? args["path"].get<std::string>() : std::string("<non-string>");
-        log_msg(hf, "mcp.sessions_open_file", "VERIFY-INPUT -- path=%s previous_fixture_session_id=%s",
+        log_msg(hf, "mcp.sessions_manage.open_file", "VERIFY-INPUT -- path=%s previous_fixture_session_id=%s",
             path_arg.c_str(),
             g_mcp_session_binary_id.empty() ? "<empty>" : g_mcp_session_binary_id.c_str());
         mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.sessions_open_file", get_server(), "sessions_open_file", args, passed, failed, skipped, true, &result);
+        auto status = test_tool_action_call(hf, "mcp.sessions_manage.open_file", "sessions_manage", "open_file", args, passed, failed, skipped, true, &result);
         if (status == mcp_tool_call_status_t::passed && result.data.is_object() &&
             result.data.contains("opened") && result.data["opened"].is_object() &&
             result.data["opened"].contains("id") && result.data["opened"]["id"].is_string()) {
             g_mcp_session_binary_id = result.data["opened"]["id"].get<std::string>();
             std::string kind;
             json_string_any_field(result.data["opened"], kind, { "kind" });
-            log_msg(hf, "mcp.sessions_open_file", "VERIFY-RESULT -- stored_fixture_session_id=%s kind=%s data=%s",
+            log_msg(hf, "mcp.sessions_manage.open_file", "VERIFY-RESULT -- stored_fixture_session_id=%s kind=%s data=%s",
                 g_mcp_session_binary_id.c_str(),
                 kind.empty() ? "<empty>" : kind.c_str(),
                 compact_json(result.data, 900).c_str());
         } else if (status == mcp_tool_call_status_t::passed) {
-            log_msg(hf, "mcp.sessions_open_file", "VERIFY-RESULT -- missing opened.id data=%s",
+            log_msg(hf, "mcp.sessions_manage.open_file", "VERIFY-RESULT -- missing opened.id data=%s",
                 compact_json(result.data, 900).c_str());
         }
     }
 
-    void test_tool_sessions_attach_pid(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_sessions_manage_attach_pid(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args;
         args["pid"] = g_mcp_target_pid != 0 ? g_mcp_target_pid : GetCurrentProcessId();
-        test_tool_call(hf, "mcp.sessions_attach_pid", get_server(), "sessions_attach_pid", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.sessions_manage.attach_pid", "sessions_manage", "attach_pid", args, passed, failed, skipped);
     }
 
-    void test_tool_sessions_close(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_sessions_manage_close(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         if (g_mcp_session_binary_id.empty()) {
-            log_msg(hf, "mcp.sessions_close", "FAIL -- no session fixture id from sessions_open_file");
-            record_tool_status("sessions_close", mcp_tool_call_status_t::failed);
+            log_msg(hf, "mcp.sessions_manage.close", "FAIL -- no session fixture id from sessions_manage action=open_file");
+            record_tool_status("sessions_manage", mcp_tool_call_status_t::failed);
             failed.fetch_add(1);
             return;
         }
         mcp_standalone::json args;
         args["binary_id"] = g_mcp_session_binary_id;
-        test_tool_call(hf, "mcp.sessions_close", get_server(), "sessions_close", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.sessions_manage.close", "sessions_manage", "close", args, passed, failed, skipped);
         g_mcp_session_binary_id.clear();
     }
 
-    void test_tool_sessions_run_binary(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_sessions_manage_run_binary(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         (void)skipped;
-        const char* tool_name = "sessions_run_binary";
-        const char* tag = "mcp.sessions_run_binary";
+        const char* tool_name = "sessions_manage";
+        const char* tag = "mcp.sessions_manage.run_binary";
         mcp_standalone::json args;
-        const std::string target = find_sessions_run_binary_target(hf);
+        const std::string target = find_sessions_manage_run_binary_target(hf);
         if (target.empty()) {
             g_invoked_tools.insert(tool_name);
             record_tool_status(tool_name, mcp_tool_call_status_t::failed);
             failed.fetch_add(1);
             return;
         }
+        args["action"] = "run_binary";
         args["path"] = target;
         args["args"] = "--no-external --duration 600 --net-rate 0 --absorb-external-single-step";
         args["isolation"] = "windows_sandbox";
@@ -11612,7 +11012,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
                 static const char* required_params[] = {"path", "args", "working_dir", "isolation", "block_network", "kill_on_host_exit", "attach_after_resume", "memory_cap_mb", "auto_terminate_sec"};
                 for (const char* param : required_params) {
                     if (!tool || !tool_has_param(*tool, param)) {
-                        log_msg(hf, tag, "FAIL -- sessions_run_binary dependency guard schema missing parameter \"%s\"", param);
+                        log_msg(hf, tag, "FAIL -- sessions_manage run_binary dependency guard schema missing parameter \"%s\"", param);
                         record_tool_status(tool_name, mcp_tool_call_status_t::failed);
                         failed.fetch_add(1);
                         return;
@@ -11624,7 +11024,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
                 passed.fetch_add(1);
                 return;
             }
-            log_msg(hf, tag, "FAIL -- sessions_run_binary returned unexpected failure: %s",
+            log_msg(hf, tag, "FAIL -- sessions_manage run_binary returned unexpected failure: %s",
                 compact_text(ir.text, 900).c_str());
             record_tool_status(tool_name, mcp_tool_call_status_t::failed);
             failed.fetch_add(1);
@@ -11633,12 +11033,12 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         uint64_t pid = 0;
         payload_u64_field(ir.data, "pid", pid);
         if (pid == 0) {
-            log_msg(hf, tag, "FAIL -- sessions_run_binary success missing guest pid data=%s", compact_json(ir.data).c_str());
+            log_msg(hf, tag, "FAIL -- sessions_manage run_binary success missing guest pid data=%s", compact_json(ir.data).c_str());
             record_tool_status(tool_name, mcp_tool_call_status_t::failed);
             failed.fetch_add(1);
             return;
         }
-        log_msg(hf, tag, "PASS -- sessions_run_binary launched Windows Sandbox target pid=%llu",
+        log_msg(hf, tag, "PASS -- sessions_manage run_binary launched Windows Sandbox target pid=%llu",
             static_cast<unsigned long long>(pid));
         record_tool_status(tool_name, mcp_tool_call_status_t::passed);
         passed.fetch_add(1);
@@ -11948,14 +11348,6 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
     }
 
 
-    void test_tool_disassemble_zydis(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        auto addr = get_ntclose_addr_str();
-        if (addr.empty()) { log_msg(hf, "mcp.disassemble_zydis", "SKIP -- NtClose not found"); skipped.fetch_add(1); return; }
-        mcp_standalone::json args;
-        args["address"] = addr;
-        test_tool_call(hf, "mcp.disassemble_zydis", get_server(), "disassemble_zydis", args, passed, failed, skipped);
-    }
-
     void test_tool_driver_snapshot_and_emulate(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         uint32_t tid = first_mcp_target_tid();
         if (tid == 0) {
@@ -12008,22 +11400,8 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         test_tool_call(hf, "mcp.emulate_multi_trace", get_server(), "emulate_multi_trace", args, passed, failed, skipped);
     }
 
-    void test_tool_emulate_function(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        if (!ensure_mcp_private_bytes(hf, "mcp.emulate_function", g_mcp_emulate_function_addr, 4096,
-            {0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3, 0xCC, 0xCC})) {
-            log_msg(hf, "mcp.emulate_function", "FAIL -- emulation fixture memory setup failed");
-            record_fixture_failed_tool("emulate_function", failed);
-            return;
-        }
-        mcp_standalone::json args;
-        args["address"] = hex_u64(g_mcp_emulate_function_addr);
-        args["size"] = 6;
-        args["max_instructions"] = 8;
-        args["max_trace_entries"] = 8;
-        test_tool_call(hf, "mcp.emulate_function", get_server(), "emulate_function", args, passed, failed, skipped);
-    }
 
-    void test_tool_api_monitor_start(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+void test_tool_api_monitor_start(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         if (!ensure_mcp_target_live(hf, "mcp.api_monitor_start")) {
             record_precondition_skipped_tool("api_monitor_start", skipped);
             return;
@@ -12083,9 +11461,9 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         test_tool_call(hf, "mcp.network_enumerate_conns", get_server(), "network_enumerate_connections", {}, passed, failed, skipped);
     }
 
-    void test_tool_network_start_capture(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        if (!ensure_burp_http_fixture(hf, "mcp.network_start_capture")) {
-            record_fixture_failed_tool("network_start_capture", failed);
+    void test_tool_network_capture_manage_start(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        if (!ensure_burp_http_fixture(hf, "mcp.network_capture_manage.start")) {
+            record_fixture_failed_tool("network_capture_manage", failed);
             return;
         }
         mcp_standalone::json args;
@@ -12093,26 +11471,26 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         args["port"] = g_burp_http_fixture ? g_burp_http_fixture->port : 0;
         args["protocol"] = "tcp";
         args["max_payload"] = 256;
-        auto status = test_tool_call(hf, "mcp.network_start_capture", get_server(), "network_start_capture", args, passed, failed, skipped);
+        auto status = test_tool_action_call(hf, "mcp.network_capture_manage.start", "network_capture_manage", "start", args, passed, failed, skipped);
         if (status == mcp_tool_call_status_t::passed) {
             const auto payload = mcp_http_fixture_request_payload("/aida-network-start-fixture");
-            if (!send_burp_fixture_tcp_payload(hf, "mcp.network_start_capture", payload)) {
-                log_msg(hf, "mcp.network_start_capture", "WARN -- capture start succeeded but traffic fixture send failed; packet queries seed their own captures");
+            if (!send_burp_fixture_tcp_payload(hf, "mcp.network_capture_manage.start", payload)) {
+                log_msg(hf, "mcp.network_capture_manage.start", "WARN -- capture start succeeded but traffic fixture send failed; packet queries seed their own captures");
             }
         }
     }
 
-    void test_tool_network_stop_capture(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.network_stop_capture", get_server(), "network_stop_capture", {}, passed, failed, skipped);
+    void test_tool_network_capture_manage_stop(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_action_call(hf, "mcp.network_capture_manage.stop", "network_capture_manage", "stop", {}, passed, failed, skipped);
     }
 
-    void test_tool_network_get_packets(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_network_capture_manage_get_packets(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const auto payload = mcp_http_fixture_request_payload("/aida-network-packets-fixture");
-        if (!seed_network_packet_queue(hf, "mcp.network_get_packets", payload)) {
-            record_fixture_failed_tool("network_get_packets", failed);
+        if (!seed_network_packet_queue(hf, "mcp.network_capture_manage.get_packets", payload)) {
+            record_fixture_failed_tool("network_capture_manage", failed);
             return;
         }
-        test_tool_call(hf, "mcp.network_get_packets", get_server(), "network_get_packets", {}, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.network_capture_manage.get_packets", "network_capture_manage", "get_packets", {}, passed, failed, skipped);
     }
 
     void test_tool_network_analyze_packet(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -12130,36 +11508,36 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         test_tool_call(hf, "mcp.network_dns_log", get_server(), "network_dns_log", {}, passed, failed, skipped);
     }
 
-    void test_tool_network_add_filter(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_network_filter_manage_add(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args;
-        args["action"] = "log";
+        args["filter_action"] = "log";
         args["direction"] = "both";
         args["protocol"] = "tcp";
         args["port"] = 65534;
-        test_tool_call(hf, "mcp.network_add_filter", get_server(), "network_add_filter", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.network_filter_manage.add", "network_filter_manage", "add", args, passed, failed, skipped);
     }
 
-    void test_tool_network_remove_filter(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_network_filter_manage_remove(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         if (!driver_bridge::using_kernel_driver()) {
-            log_msg(hf, "mcp.network_remove_filter", "SKIP -- kernel driver not loaded");
+            log_msg(hf, "mcp.network_filter_manage.remove", "SKIP -- kernel driver not loaded");
             skipped.fetch_add(1);
             return;
         }
         std::uint32_t rule_id = 0;
         if (!driver_bridge::add_filter_rule(2, 2, 6, 0, 65533, nullptr, nullptr, &rule_id) || rule_id == 0) {
-            log_msg(hf, "mcp.network_remove_filter", "SKIP -- setup add_filter_rule failed");
+            log_msg(hf, "mcp.network_filter_manage.remove", "SKIP -- setup add_filter_rule failed");
             skipped.fetch_add(1);
             return;
         }
         mcp_standalone::json args;
         args["rule_id"] = rule_id;
-        test_tool_call(hf, "mcp.network_remove_filter", get_server(), "network_remove_filter", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.network_filter_manage.remove", "network_filter_manage", "remove", args, passed, failed, skipped);
     }
 
-    void test_tool_network_clear_filters(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_network_filter_manage_clear(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         (void)skipped;
-        const char* tool_name = "network_clear_filters";
-        const char* tag = "mcp.network_clear_filters";
+        const char* tool_name = "network_filter_manage";
+        const char* tag = "mcp.network_filter_manage.clear";
         g_invoked_tools.insert(tool_name);
         if (!driver_bridge::using_kernel_driver()) {
             log_msg(hf, tag, "FAIL -- kernel driver not connected; clear filter lifecycle cannot be proven");
@@ -12184,7 +11562,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             failed.fetch_add(1);
             return;
         }
-        auto timed = invoke_tool_bounded(get_server(), tool_name, {}, tool_timeout_ms(tool_name));
+        auto timed = invoke_tool_action_bounded(get_server(), tool_name, "clear", {}, tool_timeout_ms(tool_name));
         const auto& ir = timed.result;
         log_mcp_result_detail("completed", 0, tool_name, {}, ir, timed.elapsed_ms, "");
         driver_bridge::network_stats_t after_stats{};
@@ -12225,35 +11603,35 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         passed.fetch_add(1);
     }
 
-    void test_tool_network_stats(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.network_stats", get_server(), "network_stats", {}, passed, failed, skipped);
+    void test_tool_network_bandwidth_manage_stats(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_action_call(hf, "mcp.network_bandwidth_manage.stats", "network_bandwidth_manage", "stats", {}, passed, failed, skipped);
     }
 
-    void test_tool_network_capture_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.network_capture_status", get_server(), "network_capture_status", {}, passed, failed, skipped);
+    void test_tool_network_capture_manage_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_action_call(hf, "mcp.network_capture_manage.status", "network_capture_manage", "status", {}, passed, failed, skipped);
     }
 
-    void test_tool_network_block_ip(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_network_firewall_manage_block_ip(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args;
         args["ip"] = "203.0.113.254";
         args["direction"] = "both";
-        test_tool_call(hf, "mcp.network_block_ip", get_server(), "network_block_ip", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.network_firewall_manage.block_ip", "network_firewall_manage", "block_ip", args, passed, failed, skipped);
     }
 
-    void test_tool_network_block_port(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_network_firewall_manage_block_port(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args;
         args["port"] = 65534;
-        test_tool_call(hf, "mcp.network_block_port", get_server(), "network_block_port", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.network_firewall_manage.block_port", "network_firewall_manage", "block_port", args, passed, failed, skipped);
     }
 
-    void test_tool_network_block_process(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_network_firewall_manage_block_process(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         (void)skipped;
-        const char* tool_name = "network_block_process";
-        const char* tag = "mcp.network_block_process";
+        const char* tool_name = "network_firewall_manage";
+        const char* tag = "mcp.network_firewall_manage.block_process";
         mcp_standalone::json args;
         args["pid"] = GetCurrentProcessId();
         g_invoked_tools.insert(tool_name);
-        auto timed = invoke_tool_bounded(get_server(), tool_name, args, tool_timeout_ms(tool_name));
+        auto timed = invoke_tool_action_bounded(get_server(), tool_name, "block_process", args, tool_timeout_ms(tool_name));
         const auto& ir = timed.result;
         log_mcp_result_detail("completed", 0, tool_name, args, ir, timed.elapsed_ms, "");
         if (timed.timed_out || !ir.found || ir.threw || !ir.success) {
@@ -12583,9 +11961,9 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         passed.fetch_add(1);
     }
 
-    void test_tool_network_kill_connection(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_network_firewall_manage_kill_connection(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_loopback_tcp_pair_t pair;
-        if (!pair.open(hf, "mcp.network_kill_connection")) {
+        if (!pair.open(hf, "mcp.network_firewall_manage.kill_connection")) {
             skipped.fetch_add(1);
             return;
         }
@@ -12596,7 +11974,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         args["src_port"] = pair.client_port;
         args["dst_port"] = pair.listen_port;
         args["pid"] = GetCurrentProcessId();
-        test_tool_call(hf, "mcp.network_kill_connection", get_server(), "network_kill_connection", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.network_firewall_manage.kill_connection", "network_firewall_manage", "kill_connection", args, passed, failed, skipped);
     }
 
     void test_tool_network_spoof_dns(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -12612,64 +11990,64 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         test_tool_call(hf, "mcp.network_list_dns_spoof_rules", get_server(), "network_list_dns_spoof_rules", {}, passed, failed, skipped);
     }
 
-    void test_tool_network_bandwidth_monitor(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_network_bandwidth_manage_monitor(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json start_args;
         start_args["operation"] = "start";
         start_args["pid"] = GetCurrentProcessId();
-        auto started = invoke_tool_bounded(get_server(), "network_bandwidth_monitor", start_args, tool_timeout_ms("network_bandwidth_monitor"));
-        log_msg(hf, "mcp.network_bandwidth_monitor", "BANDWIDTH-FIXTURE -- start timed_out=%d found=%d threw=%d success=%d elapsed_ms=%lld",
+        auto started = invoke_tool_action_bounded(get_server(), "network_bandwidth_manage", "monitor", start_args, tool_timeout_ms("network_bandwidth_manage"));
+        log_msg(hf, "mcp.network_bandwidth_manage.monitor", "BANDWIDTH-FIXTURE -- start timed_out=%d found=%d threw=%d success=%d elapsed_ms=%lld",
             started.timed_out ? 1 : 0,
             started.result.found ? 1 : 0,
             started.result.threw ? 1 : 0,
             started.result.success ? 1 : 0,
             started.elapsed_ms);
         if (started.timed_out || !started.result.found || started.result.threw || !started.result.success) {
-            record_tool_status("network_bandwidth_monitor", started.timed_out ? mcp_tool_call_status_t::timed_out : mcp_tool_call_status_t::failed);
+            record_tool_status("network_bandwidth_manage", started.timed_out ? mcp_tool_call_status_t::timed_out : mcp_tool_call_status_t::failed);
             failed.fetch_add(1);
             return;
         }
         const auto payload = mcp_http_fixture_request_payload("/aida-network-bandwidth-fixture");
-        send_burp_fixture_tcp_payload(hf, "mcp.network_bandwidth_monitor", payload);
+        send_burp_fixture_tcp_payload(hf, "mcp.network_bandwidth_manage.monitor", payload);
         Sleep(500);
         mcp_standalone::json args;
         args["operation"] = "get";
         args["pid"] = GetCurrentProcessId();
-        test_tool_call(hf, "mcp.network_bandwidth_monitor", get_server(), "network_bandwidth_monitor", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.network_bandwidth_manage.monitor", "network_bandwidth_manage", "monitor", args, passed, failed, skipped);
         mcp_standalone::json stop_args;
         stop_args["operation"] = "stop";
-        auto stopped = invoke_tool_bounded(get_server(), "network_bandwidth_monitor", stop_args, tool_timeout_ms("network_bandwidth_monitor"));
-        log_msg(hf, "mcp.network_bandwidth_monitor", "BANDWIDTH-FIXTURE -- stop timed_out=%d success=%d elapsed_ms=%lld",
+        auto stopped = invoke_tool_action_bounded(get_server(), "network_bandwidth_manage", "monitor", stop_args, tool_timeout_ms("network_bandwidth_manage"));
+        log_msg(hf, "mcp.network_bandwidth_manage.monitor", "BANDWIDTH-FIXTURE -- stop timed_out=%d success=%d elapsed_ms=%lld",
             stopped.timed_out ? 1 : 0,
             stopped.result.success ? 1 : 0,
             stopped.elapsed_ms);
     }
 
-    void test_tool_network_bandwidth_per_process(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_network_bandwidth_manage_per_process(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json start_args;
         start_args["operation"] = "start";
         start_args["pid"] = GetCurrentProcessId();
-        auto started = invoke_tool_bounded(get_server(), "network_bandwidth_monitor", start_args, tool_timeout_ms("network_bandwidth_monitor"));
-        log_msg(hf, "mcp.network_bandwidth_per_process", "BANDWIDTH-FIXTURE -- start timed_out=%d found=%d threw=%d success=%d elapsed_ms=%lld",
+        auto started = invoke_tool_action_bounded(get_server(), "network_bandwidth_manage", "monitor", start_args, tool_timeout_ms("network_bandwidth_manage"));
+        log_msg(hf, "mcp.network_bandwidth_manage.per_process", "BANDWIDTH-FIXTURE -- start timed_out=%d found=%d threw=%d success=%d elapsed_ms=%lld",
             started.timed_out ? 1 : 0,
             started.result.found ? 1 : 0,
             started.result.threw ? 1 : 0,
             started.result.success ? 1 : 0,
             started.elapsed_ms);
         if (started.timed_out || !started.result.found || started.result.threw || !started.result.success) {
-            record_tool_status("network_bandwidth_per_process", started.timed_out ? mcp_tool_call_status_t::timed_out : mcp_tool_call_status_t::failed);
+            record_tool_status("network_bandwidth_manage", started.timed_out ? mcp_tool_call_status_t::timed_out : mcp_tool_call_status_t::failed);
             failed.fetch_add(1);
             return;
         }
         const auto payload = mcp_http_fixture_request_payload("/aida-network-bw-process-fixture");
-        send_burp_fixture_tcp_payload(hf, "mcp.network_bandwidth_per_process", payload);
+        send_burp_fixture_tcp_payload(hf, "mcp.network_bandwidth_manage.per_process", payload);
         Sleep(500);
         mcp_standalone::json args;
         args["pid"] = GetCurrentProcessId();
-        test_tool_call(hf, "mcp.network_bandwidth_per_process", get_server(), "network_bandwidth_per_process", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.network_bandwidth_manage.per_process", "network_bandwidth_manage", "per_process", args, passed, failed, skipped);
         mcp_standalone::json stop_args;
         stop_args["operation"] = "stop";
-        auto stopped = invoke_tool_bounded(get_server(), "network_bandwidth_monitor", stop_args, tool_timeout_ms("network_bandwidth_monitor"));
-        log_msg(hf, "mcp.network_bandwidth_per_process", "BANDWIDTH-FIXTURE -- stop timed_out=%d success=%d elapsed_ms=%lld",
+        auto stopped = invoke_tool_action_bounded(get_server(), "network_bandwidth_manage", "monitor", stop_args, tool_timeout_ms("network_bandwidth_manage"));
+        log_msg(hf, "mcp.network_bandwidth_manage.per_process", "BANDWIDTH-FIXTURE -- stop timed_out=%d success=%d elapsed_ms=%lld",
             stopped.timed_out ? 1 : 0,
             stopped.result.success ? 1 : 0,
             stopped.elapsed_ms);
@@ -12681,10 +12059,10 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         test_tool_call(hf, "mcp.network_os_fingerprint", get_server(), "network_os_fingerprint", args, passed, failed, skipped);
     }
 
-    void test_tool_network_export_pcap(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_network_capture_manage_export_pcap(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args;
         args["path"] = "C:\\temp\\aida_test_net.pcap";
-        test_tool_call(hf, "mcp.network_export_pcap", get_server(), "network_export_pcap", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.network_capture_manage.export_pcap", "network_capture_manage", "export_pcap", args, passed, failed, skipped);
     }
 
     void test_tool_network_decode_data(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -13180,83 +12558,13 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         test_tool_call(hf, "mcp.network_protobuf_decode", get_server(), "network_protobuf_decode", args, passed, failed, skipped);
     }
 
-    void test_tool_network_fuzzer(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args;
-        args["operation"] = "status";
-        test_tool_call(hf, "mcp.network_fuzzer", get_server(), "network_fuzzer", args, passed, failed, skipped);
+    void test_tool_tls_manage_extract_keys(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_action_call(hf, "mcp.tls_manage.extract_keys", "tls_manage", "extract_keys", {}, passed, failed, skipped);
     }
 
-    void test_tool_network_websocket(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        size_t seeded_count = 0;
-        {
-            std::lock_guard<std::mutex> lk(network_view::g_state.ws_mutex);
-            network_view::state_t::ws_frame_entry_t frame;
-            frame.timestamp = GetTickCount64();
-            frame.exchange_id = 0xA1DA5701ULL;
-            frame.host = "127.0.0.1";
-            frame.port = g_burp_http_fixture ? g_burp_http_fixture->port : 80;
-            frame.is_outbound = true;
-            frame.is_text = true;
-            frame.opcode = 0x1;
-            const std::string payload = "aida-websocket-fixture";
-            frame.payload.assign(payload.begin(), payload.end());
-            frame.preview = payload;
-            network_view::g_state.ws_frames.push_back(std::move(frame));
-            while (network_view::g_state.ws_frames.size() > network_view::g_state.ws_max_frames)
-                network_view::g_state.ws_frames.pop_front();
-            seeded_count = network_view::g_state.ws_frames.size();
-        }
-        log_msg(hf, "mcp.network_websocket", "FIXTURE -- seeded WebSocket frame count=%zu",
-            seeded_count);
-        mcp_standalone::json args;
-        args["operation"] = "list_frames";
-        test_tool_call(hf, "mcp.network_websocket", get_server(), "network_websocket", args, passed, failed, skipped);
-    }
-
-    void test_tool_network_proxy(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args;
-        args["operation"] = "status";
-        test_tool_call(hf, "mcp.network_proxy", get_server(), "network_proxy", args, passed, failed, skipped);
-    }
-
-    void test_tool_network_repeater(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json create_args;
-        create_args["operation"] = "create";
-        create_args["host"] = "127.0.0.1";
-        create_args["port"] = g_burp_http_fixture ? g_burp_http_fixture->port : 80;
-        create_args["use_tls"] = false;
-        create_args["raw_request"] = "GET /aida-repeater-fixture HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
-        auto created = invoke_tool_bounded(get_server(), "network_repeater", create_args, tool_timeout_ms("network_repeater"));
-        if (created.timed_out || !created.result.found || created.result.threw || !created.result.success) {
-            log_msg(hf, "mcp.network_repeater", "FAIL -- create precondition failed found=%d threw=%d success=%d timeout=%d err=%s",
-                created.result.found ? 1 : 0,
-                created.result.threw ? 1 : 0,
-                created.result.success ? 1 : 0,
-                created.timed_out ? 1 : 0,
-                compact_text(created.result.exception_msg.empty() ? created.result.text : created.result.exception_msg, 700).c_str());
-            record_tool_status("network_repeater", mcp_tool_call_status_t::failed);
-            failed.fetch_add(1);
-            return;
-        }
-        mcp_standalone::json args;
-        args["operation"] = "list";
-        test_tool_call(hf, "mcp.network_repeater", get_server(), "network_repeater", args, passed, failed, skipped);
-    }
-
-    void test_tool_mitm_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args;
-        args["operation"] = "status";
-        test_tool_call(hf, "mcp.mitm_status", get_server(), "network_proxy", args, passed, failed, skipped);
-    }
-
-
-    void test_tool_tls_extract_keys(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.tls_extract_keys", get_server(), "tls_extract_keys", {}, passed, failed, skipped);
-    }
-
-    void test_tool_tls_start_keylog(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        auto cleanup = invoke_tool_bounded(get_server(), "tls_stop_keylog", {}, tool_timeout_ms("tls_stop_keylog"));
-        log_msg(hf, "mcp.tls_start_keylog.cleanup", "INFO -- pre-start stop cleanup success=%s timeout=%s elapsed_ms=%lld err=%s",
+    void test_tool_tls_manage_start_keylog(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        auto cleanup = invoke_tool_action_bounded(get_server(), "tls_manage", "stop_keylog", {}, tool_timeout_ms("tls_manage"));
+        log_msg(hf, "mcp.tls_manage.start_keylog.cleanup", "INFO -- pre-start stop cleanup success=%s timeout=%s elapsed_ms=%lld err=%s",
             cleanup.result.success ? "true" : "false",
             cleanup.timed_out ? "true" : "false",
             cleanup.elapsed_ms,
@@ -13266,15 +12574,15 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         args["output_file"] = temp_file_narrow("aida_mcp_tls_keylog_test.keys");
         args["poll_interval_ms"] = 100u;
         args["append"] = false;
-        test_tool_call(hf, "mcp.tls_start_keylog", get_server(), "tls_start_keylog", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.tls_manage.start_keylog", "tls_manage", "start_keylog", args, passed, failed, skipped);
     }
 
-    void test_tool_tls_stop_keylog(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.tls_stop_keylog", get_server(), "tls_stop_keylog", {}, passed, failed, skipped);
+    void test_tool_tls_manage_stop_keylog(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_action_call(hf, "mcp.tls_manage.stop_keylog", "tls_manage", "stop_keylog", {}, passed, failed, skipped);
     }
 
-    void test_tool_tls_get_extracted_keys(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.tls_get_extracted_keys", get_server(), "tls_get_extracted_keys", {}, passed, failed, skipped);
+    void test_tool_tls_manage_get_extracted_keys(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_action_call(hf, "mcp.tls_manage.get_extracted_keys", "tls_manage", "get_extracted_keys", {}, passed, failed, skipped);
     }
 
     const char* cert_inject_fixture_pem() {
@@ -13297,13 +12605,13 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             "-----END CERTIFICATE-----\n";
     }
 
-    void test_tool_cert_inject(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_cert_manage_inject(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args;
         args["cert_pem"] = cert_inject_fixture_pem();
         args["store_name"] = "MY";
         args["system_wide"] = false;
         mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.cert_inject", get_server(), "cert_inject", args, passed, failed, skipped, false, &result);
+        auto status = test_tool_action_call(hf, "mcp.cert_manage.inject", "cert_manage", "inject", args, passed, failed, skipped, false, &result);
         bool validate_only = false;
         g_mcp_cert_inject_validate_only = status == mcp_tool_call_status_t::passed &&
             payload_bool_field(result.data, "validate_only", validate_only) &&
@@ -13313,26 +12621,26 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             payload_string_field(result.data, "thumbprint", thumbprint) &&
             !thumbprint.empty()) {
             g_mcp_cert_thumbprint = thumbprint;
-            log_msg(hf, "mcp.cert_inject", "CERT-FIXTURE -- captured thumbprint_len=%zu store=MY system_wide=0", g_mcp_cert_thumbprint.size());
+            log_msg(hf, "mcp.cert_manage.inject", "CERT-FIXTURE -- captured thumbprint_len=%zu store=MY system_wide=0", g_mcp_cert_thumbprint.size());
         }
     }
 
-    void test_tool_cert_remove(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_cert_manage_remove(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         if (g_mcp_cert_thumbprint.empty()) {
             if (g_mcp_cert_inject_validate_only) {
-                log_msg(hf, "mcp.cert_remove", "PASS -- cert_inject ran in validate_only mode; no certificate store mutation required removal");
-                record_tool_status("cert_remove", mcp_tool_call_status_t::passed);
+                log_msg(hf, "mcp.cert_manage.remove", "PASS -- cert_manage action=inject ran in validate_only mode; no certificate store mutation required removal");
+                record_tool_status("cert_manage", mcp_tool_call_status_t::passed);
                 passed.fetch_add(1);
                 return;
             }
-            log_msg(hf, "mcp.cert_remove", "FAIL -- cert_inject did not capture a thumbprint for removal");
-            record_fixture_failed_tool("cert_remove", failed);
+            log_msg(hf, "mcp.cert_manage.remove", "FAIL -- cert_manage action=inject did not capture a thumbprint for removal");
+            record_fixture_failed_tool("cert_manage", failed);
             return;
         }
         mcp_standalone::json args;
         args["thumbprint"] = g_mcp_cert_thumbprint;
         args["store_name"] = "MY";
-        auto status = test_tool_call(hf, "mcp.cert_remove", get_server(), "cert_remove", args, passed, failed, skipped);
+        auto status = test_tool_action_call(hf, "mcp.cert_manage.remove", "cert_manage", "remove", args, passed, failed, skipped);
         if (status == mcp_tool_call_status_t::passed)
             g_mcp_cert_thumbprint.clear();
     }
@@ -13343,7 +12651,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         mcp_standalone::json args;
         args["thumbprint"] = g_mcp_cert_thumbprint;
         args["store_name"] = "MY";
-        auto result = invoke_tool_bounded(get_server(), "cert_remove", args, tool_timeout_ms("cert_remove"));
+        auto result = invoke_tool_action_bounded(get_server(), "cert_manage", "remove", args, tool_timeout_ms("cert_manage"));
         log_msg(hf, tag, "CERT-CLEANUP -- attempted remaining fixture removal timed_out=%d found=%d threw=%d success=%d elapsed_ms=%lld",
             result.timed_out ? 1 : 0,
             result.result.found ? 1 : 0,
@@ -13354,12 +12662,12 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             g_mcp_cert_thumbprint.clear();
     }
 
-    void test_tool_cert_generate_ca(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_cert_manage_generate_ca(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::tool_result_t result;
         mcp_standalone::json args;
         args["cn"] = "AiDA TestLab CA";
         args["validity_days"] = 7u;
-        auto status = test_tool_call(hf, "mcp.cert_generate_ca", get_server(), "cert_generate_ca", args, passed, failed, skipped, false, &result);
+        auto status = test_tool_action_call(hf, "mcp.cert_manage.generate_ca", "cert_manage", "generate_ca", args, passed, failed, skipped, false, &result);
         if (status != mcp_tool_call_status_t::passed)
             return;
         bool private_exported = true;
@@ -13369,15 +12677,15 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             find_payload_key_recursive(result.data, "private_key_pem");
         if (payload_bool_field(result.data, "private_key_exported", private_exported) &&
             !private_exported && !has_private_material) {
-            log_msg(hf, "mcp.cert_generate_ca.guard", "PASS -- cert_generate_ca returned public certificate only");
+            log_msg(hf, "mcp.cert_manage.generate_ca.guard", "PASS -- cert_manage action=generate_ca returned public certificate only");
             return;
         }
-        log_msg(hf, "mcp.cert_generate_ca.guard", "FAIL -- cert_generate_ca exposed private key material or omitted private_key_exported=false");
+        log_msg(hf, "mcp.cert_manage.generate_ca.guard", "FAIL -- cert_manage action=generate_ca exposed private key material or omitted private_key_exported=false");
         failed.fetch_add(1);
     }
 
-    void test_tool_cert_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.cert_list", get_server(), "cert_list", {}, passed, failed, skipped);
+    void test_tool_cert_manage_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_action_call(hf, "mcp.cert_manage.list", "cert_manage", "list", {}, passed, failed, skipped);
     }
 
     void test_tool_pin_bypass(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -13424,153 +12732,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         failed.fetch_add(1);
     }
 
-    void test_tool_pin_bypass_revert(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args;
-        args["pid"] = 0xFFFFFFFEu;
-        test_tool_call(hf, "mcp.pin_bypass_revert", get_server(), "pin_bypass_revert", args, passed, failed, skipped);
-    }
-
-    void test_tool_pin_bypass_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.pin_bypass_status", get_server(), "pin_bypass_status", {}, passed, failed, skipped);
-    }
-
-    void test_tool_firefox_profile_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        (void)skipped;
-        g_invoked_tools.insert("firefox_profile_status");
-        auto timed = invoke_tool_bounded(get_server(), "firefox_profile_status", {}, tool_timeout_ms("firefox_profile_status"));
-        auto& ir = timed.result;
-        if (timed.timed_out || !ir.found || ir.threw || !ir.success) {
-            log_msg(hf, "mcp.firefox_profile_status.guard", "FAIL -- firefox_profile_status dispatch failed found=%s threw=%s success=%s timeout=%s err=%s",
-                ir.found ? "true" : "false",
-                ir.threw ? "true" : "false",
-                ir.success ? "true" : "false",
-                timed.timed_out ? "true" : "false",
-                ir.exception_msg.c_str());
-            record_tool_status("firefox_profile_status", mcp_tool_call_status_t::failed);
-            failed.fetch_add(1);
-            return;
-        }
-        bool profile_files_valid = false;
-        bool trust_verified = true;
-        bool runtime_checked = true;
-        bool runtime_valid = true;
-        bool prepared = true;
-        payload_bool_field(ir.data, "profile_files_valid", profile_files_valid);
-        payload_bool_field(ir.data, "trust_readiness_verified", trust_verified);
-        payload_bool_field(ir.data, "runtime_validation_performed", runtime_checked);
-        payload_bool_field(ir.data, "runtime_validation_valid", runtime_valid);
-        payload_bool_field(ir.data, "prepared", prepared);
-        if (!runtime_checked && !runtime_valid && (!profile_files_valid || prepared == trust_verified)) {
-            log_msg(hf, "mcp.firefox_profile_status.guard", "PASS -- Firefox status separates file validity from trust/runtime validation");
-            record_tool_status("firefox_profile_status", mcp_tool_call_status_t::passed);
-            passed.fetch_add(1);
-            return;
-        }
-        log_msg(hf, "mcp.firefox_profile_status.guard", "FAIL -- Firefox status regressed to schema/file-only readiness files=%s trust=%s runtime_checked=%s runtime_valid=%s prepared=%s",
-            profile_files_valid ? "true" : "false",
-            trust_verified ? "true" : "false",
-            runtime_checked ? "true" : "false",
-            runtime_valid ? "true" : "false",
-            prepared ? "true" : "false");
-        record_tool_status("firefox_profile_status", mcp_tool_call_status_t::failed);
-        failed.fetch_add(1);
-    }
-
-    void test_tool_firefox_profile_prepare(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        (void)skipped;
-        mcp_standalone::json args;
-        args["proxy_host"] = "127.0.0.1";
-        args["proxy_port"] = 18443;
-        const char* tool_name = "firefox_profile_prepare";
-        g_invoked_tools.insert(tool_name);
-        auto timed = invoke_tool_bounded(get_server(), tool_name, args, tool_timeout_ms(tool_name));
-        auto& ir = timed.result;
-        log_mcp_result_detail("completed", 0, tool_name, args, ir, timed.elapsed_ms, "");
-        if (timed.timed_out || !ir.found || ir.threw) {
-            log_msg(hf, "mcp.firefox_profile_prepare.guard", "FAIL -- firefox_profile_prepare dispatch failed found=%s threw=%s success=%s timeout=%s err=%s",
-                ir.found ? "true" : "false",
-                ir.threw ? "true" : "false",
-                ir.success ? "true" : "false",
-                timed.timed_out ? "true" : "false",
-                compact_text(ir.exception_msg, 700).c_str());
-            record_tool_status(tool_name, timed.timed_out ? mcp_tool_call_status_t::timed_out : mcp_tool_call_status_t::failed);
-            failed.fetch_add(1);
-            return;
-        }
-        if (ir.success) {
-            bool firefox_detected = false;
-            bool profile_files_valid = false;
-            bool trust_verified = false;
-            bool prepared = false;
-            payload_bool_field(ir.data, "firefox_detected", firefox_detected);
-            payload_bool_field(ir.data, "profile_files_valid", profile_files_valid);
-            payload_bool_field(ir.data, "trust_readiness_verified", trust_verified);
-            payload_bool_field(ir.data, "prepared", prepared);
-            if (!firefox_detected) {
-                if (profile_files_valid && trust_verified && prepared) {
-                    log_msg(hf, "mcp.firefox_profile_prepare.guard", "PASS -- Firefox profile prepare completed and reported missing host browser explicitly files=%d trust=%d prepared=%d text=%s",
-                        profile_files_valid ? 1 : 0,
-                        trust_verified ? 1 : 0,
-                        prepared ? 1 : 0,
-                        compact_text(ir.text, 700).c_str());
-                    record_tool_status(tool_name, mcp_tool_call_status_t::passed);
-                    passed.fetch_add(1);
-                } else {
-                    log_msg(hf, "mcp.firefox_profile_prepare.guard", "FAIL -- Firefox prepare missing-browser response lacked structured readiness proof files=%d trust=%d prepared=%d text=%s",
-                        profile_files_valid ? 1 : 0,
-                        trust_verified ? 1 : 0,
-                        prepared ? 1 : 0,
-                        compact_text(ir.text, 700).c_str());
-                    record_tool_status(tool_name, mcp_tool_call_status_t::failed);
-                    failed.fetch_add(1);
-                }
-                return;
-            }
-            log_msg(hf, "mcp.firefox_profile_prepare.guard", "PASS -- Firefox profile prepare completed success=%s",
-                compact_text(ir.text, 700).c_str());
-            record_tool_status(tool_name, mcp_tool_call_status_t::passed);
-            passed.fetch_add(1);
-            return;
-        }
-        if (payload_text_contains(ir, "current_user_ca_not_trusted")) {
-            bool profile_files_valid = false;
-            bool trust_verified = true;
-            bool runtime_checked = true;
-            bool runtime_valid = true;
-            bool prepared = true;
-            bool firefox_detected = false;
-            payload_bool_field(ir.data, "profile_files_valid", profile_files_valid);
-            payload_bool_field(ir.data, "trust_readiness_verified", trust_verified);
-            payload_bool_field(ir.data, "runtime_validation_performed", runtime_checked);
-            payload_bool_field(ir.data, "runtime_validation_valid", runtime_valid);
-            payload_bool_field(ir.data, "prepared", prepared);
-            payload_bool_field(ir.data, "firefox_detected", firefox_detected);
-            if (profile_files_valid && !trust_verified && !runtime_checked && !runtime_valid && !prepared) {
-                log_msg(hf, "mcp.firefox_profile_prepare.guard", "PASS -- Firefox profile files were prepared and current-user CA trust dependency was reported explicitly firefox_detected=%s text=%s",
-                    firefox_detected ? "true" : "false",
-                    compact_text(ir.text, 700).c_str());
-                record_tool_status(tool_name, mcp_tool_call_status_t::passed);
-                passed.fetch_add(1);
-                return;
-            }
-            log_msg(hf, "mcp.firefox_profile_prepare.guard", "FAIL -- current-user trust diagnostic was returned but status did not confirm prepared profile files files=%s trust=%s runtime_checked=%s runtime_valid=%s prepared=%s status_success=%s",
-                profile_files_valid ? "true" : "false",
-                trust_verified ? "true" : "false",
-                runtime_checked ? "true" : "false",
-                runtime_valid ? "true" : "false",
-                prepared ? "true" : "false",
-                ir.success ? "true" : "false");
-            record_tool_status(tool_name, mcp_tool_call_status_t::failed);
-            failed.fetch_add(1);
-            return;
-        }
-        log_msg(hf, "mcp.firefox_profile_prepare.guard", "FAIL -- firefox_profile_prepare returned unexpected failure text=%s",
-            compact_text(ir.text, 900).c_str());
-        record_tool_status(tool_name, mcp_tool_call_status_t::failed);
-        failed.fetch_add(1);
-    }
-
-    void test_tool_firefox_profile_launch(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+void test_tool_firefox_profile_launch(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         (void)skipped;
         const auto firefox_before = process_ids_by_image_name(L"firefox.exe");
         mcp_standalone::json args;
@@ -13588,7 +12750,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         };
         const char* tool_name = "firefox_profile_launch";
         g_invoked_tools.insert(tool_name);
-        auto timed = invoke_tool_bounded(get_server(), tool_name, args, tool_timeout_ms(tool_name));
+        auto timed = invoke_tool_action_bounded(get_server(), tool_name, "import_rules", args, tool_timeout_ms(tool_name));
         result = timed.result;
         log_mcp_result_detail("completed", 0, tool_name, args, result, timed.elapsed_ms, "");
         uint64_t launched_pid64 = 0;
@@ -13690,7 +12852,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         cleanup_firefox(launched_pid);
     }
 
-    void test_tool_quic_detect_connections(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_quic_manage_detect_connections(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         std::vector<uint8_t> packet = {
             0xC0, 0x00, 0x00, 0x00, 0x01,
             0x08, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
@@ -13699,25 +12861,25 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
             0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10
         };
-        if (!seed_udp_capture_for_detection(hf, "mcp.quic_detect_connections", 443, packet)) {
-            record_fixture_failed_tool("quic_detect_connections", failed);
+        if (!seed_udp_capture_for_detection(hf, "mcp.quic_manage.detect_connections", 443, packet)) {
+            record_fixture_failed_tool("quic_manage", failed);
             return;
         }
         mcp_standalone::json args;
         args["pid"] = GetCurrentProcessId();
-        test_tool_call(hf, "mcp.quic_detect_connections", get_server(), "quic_detect_connections", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.quic_manage.detect_connections", "quic_manage", "detect_connections", args, passed, failed, skipped);
         driver_bridge::stop_capture();
     }
 
-    void test_tool_quic_decrypt_initial(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_quic_manage_decrypt_initial(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args;
         args["packet_hex"] = "C000000001080011223344556677088899AABBCCDDEEFF00100000000000";
-        test_tool_call(hf, "mcp.quic_decrypt_initial", get_server(), "quic_decrypt_initial", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.quic_manage.decrypt_initial", "quic_manage", "decrypt_initial", args, passed, failed, skipped);
     }
 
-    void test_tool_quic_extract_keys(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        if (g_mcp_scanner_addr == 0 && !ensure_mcp_private_bytes(hf, "mcp.quic_extract_keys", g_mcp_scanner_addr, 4096, {0x51, 0x55, 0x49, 0x43})) {
-            record_fixture_failed_tool("quic_extract_keys", failed);
+    void test_tool_quic_manage_extract_keys(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        if (g_mcp_scanner_addr == 0 && !ensure_mcp_private_bytes(hf, "mcp.quic_manage.extract_keys", g_mcp_scanner_addr, 4096, {0x51, 0x55, 0x49, 0x43})) {
+            record_fixture_failed_tool("quic_manage", failed);
             return;
         }
         const std::string key_line =
@@ -13727,18 +12889,18 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         std::vector<uint8_t> bytes(key_line.begin(), key_line.end());
         bytes.push_back(0);
         if (!driver_bridge::write_memory(g_mcp_scanner_addr, bytes)) {
-            log_msg(hf, "mcp.quic_extract_keys", "FAIL -- could not seed target memory key fixture addr=0x%016llX",
+            log_msg(hf, "mcp.quic_manage.extract_keys", "FAIL -- could not seed target memory key fixture addr=0x%016llX",
                 static_cast<unsigned long long>(g_mcp_scanner_addr));
-            record_tool_status("quic_extract_keys", mcp_tool_call_status_t::failed);
+            record_tool_status("quic_manage", mcp_tool_call_status_t::failed);
             failed.fetch_add(1);
             return;
         }
         mcp_standalone::json args;
         args["pid"] = driver_bridge::attached_pid();
-        test_tool_call(hf, "mcp.quic_extract_keys", get_server(), "quic_extract_keys", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.quic_manage.extract_keys", "quic_manage", "extract_keys", args, passed, failed, skipped);
     }
 
-    void test_tool_dtls_detect_sessions(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_dtls_manage_detect_sessions(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         std::vector<uint8_t> packet = {
             0x16, 0xFE, 0xFD,
             0x00, 0x00,
@@ -13746,21 +12908,21 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             0x00, 0x01,
             0x01
         };
-        if (!seed_udp_capture_for_detection(hf, "mcp.dtls_detect_sessions", 4443, packet)) {
-            record_fixture_failed_tool("dtls_detect_sessions", failed);
+        if (!seed_udp_capture_for_detection(hf, "mcp.dtls_manage.detect_sessions", 4443, packet)) {
+            record_fixture_failed_tool("dtls_manage", failed);
             return;
         }
         mcp_standalone::json args;
         args["pid"] = GetCurrentProcessId();
-        test_tool_call(hf, "mcp.dtls_detect_sessions", get_server(), "dtls_detect_sessions", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.dtls_manage.detect_sessions", "dtls_manage", "detect_sessions", args, passed, failed, skipped);
         driver_bridge::stop_capture();
     }
 
-    void test_tool_dtls_extract_keys(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.dtls_extract_keys", get_server(), "dtls_extract_keys", {}, passed, failed, skipped);
+    void test_tool_dtls_manage_extract_keys(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_action_call(hf, "mcp.dtls_manage.extract_keys", "dtls_manage", "extract_keys", {}, passed, failed, skipped);
     }
 
-    void test_tool_autoresponder_add_rule(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_autoresponder_manage_add_rule(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args;
         args["match_type"] = "prefix_url";
         args["match_pattern"] = "http://test.local/";
@@ -13768,24 +12930,24 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         const std::string match_type = args["match_type"].get<std::string>();
         const std::string match_pattern = args["match_pattern"].get<std::string>();
         const std::string response_body = args["response_body"].get<std::string>();
-        log_msg(hf, "mcp.autoresponder_add_rule", "VERIFY-INPUT -- match_type=%s pattern=%s response_len=%zu previous_rule_id=%llu",
+        log_msg(hf, "mcp.autoresponder_manage.add_rule", "VERIFY-INPUT -- match_type=%s pattern=%s response_len=%zu previous_rule_id=%llu",
             match_type.c_str(),
             match_pattern.c_str(),
             response_body.size(),
             (unsigned long long)g_autoresponder_rule_id);
         mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.autoresponder_add_rule", get_server(), "autoresponder_add_rule", args, passed, failed, skipped, true, &result);
+        auto status = test_tool_action_call(hf, "mcp.autoresponder_manage.add_rule", "autoresponder_manage", "add_rule", args, passed, failed, skipped, true, &result);
         if (status == mcp_tool_call_status_t::passed) {
             json_u64_field(result.data, "rule_id", g_autoresponder_rule_id);
-            log_msg(hf, "mcp.autoresponder_add_rule", "VERIFY-RESULT -- captured_rule_id=%llu data=%s text=%s",
+            log_msg(hf, "mcp.autoresponder_manage.add_rule", "VERIFY-RESULT -- captured_rule_id=%llu data=%s text=%s",
                 (unsigned long long)g_autoresponder_rule_id,
                 compact_json(result.data, 900).c_str(),
                 compact_text(result.text, 700).c_str());
-            auto listed = invoke_tool_bounded(get_server(), "autoresponder_list_rules", {}, tool_timeout_ms("autoresponder_list_rules"));
+            auto listed = invoke_tool_action_bounded(get_server(), "autoresponder_manage", "list_rules", {}, tool_timeout_ms("autoresponder_manage"));
             const uint64_t count = json_count_or_array_size(listed.result.data, "count", "rules");
             const bool contains = g_autoresponder_rule_id != 0 &&
                 json_array_contains_u64_field(listed.result.data, "rules", g_autoresponder_rule_id, { "id", "rule_id" });
-            log_msg(hf, "mcp.autoresponder_add_rule", "VERIFY-LIST -- timeout=%d success=%d count=%llu contains_rule=%d text=%s data=%s",
+            log_msg(hf, "mcp.autoresponder_manage.add_rule", "VERIFY-LIST -- timeout=%d success=%d count=%llu contains_rule=%d text=%s data=%s",
                 listed.timed_out ? 1 : 0,
                 listed.result.success ? 1 : 0,
                 (unsigned long long)count,
@@ -13795,19 +12957,19 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         }
     }
 
-    void test_tool_autoresponder_remove_rule(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_autoresponder_manage_remove_rule(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args;
         args["rule_id"] = g_autoresponder_rule_id;
-        log_msg(hf, "mcp.autoresponder_remove_rule", "VERIFY-INPUT -- rule_id=%llu", (unsigned long long)g_autoresponder_rule_id);
+        log_msg(hf, "mcp.autoresponder_manage.remove_rule", "VERIFY-INPUT -- rule_id=%llu", (unsigned long long)g_autoresponder_rule_id);
         mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.autoresponder_remove_rule", get_server(), "autoresponder_remove_rule", args, passed, failed, skipped, false, &result);
+        auto status = test_tool_action_call(hf, "mcp.autoresponder_manage.remove_rule", "autoresponder_manage", "remove_rule", args, passed, failed, skipped, false, &result);
         if (status == mcp_tool_call_status_t::passed) {
-            log_tool_result_payload(hf, "mcp.autoresponder_remove_rule", "VERIFY-RESULT", result);
-            auto listed = invoke_tool_bounded(get_server(), "autoresponder_list_rules", {}, tool_timeout_ms("autoresponder_list_rules"));
+            log_tool_result_payload(hf, "mcp.autoresponder_manage.remove_rule", "VERIFY-RESULT", result);
+            auto listed = invoke_tool_action_bounded(get_server(), "autoresponder_manage", "list_rules", {}, tool_timeout_ms("autoresponder_manage"));
             const uint64_t count = json_count_or_array_size(listed.result.data, "count", "rules");
             const bool contains = g_autoresponder_rule_id != 0 &&
                 json_array_contains_u64_field(listed.result.data, "rules", g_autoresponder_rule_id, { "id", "rule_id" });
-            log_msg(hf, "mcp.autoresponder_remove_rule", "VERIFY-LIST -- timeout=%d success=%d count=%llu contains_removed_rule=%d text=%s data=%s",
+            log_msg(hf, "mcp.autoresponder_manage.remove_rule", "VERIFY-LIST -- timeout=%d success=%d count=%llu contains_removed_rule=%d text=%s data=%s",
                 listed.timed_out ? 1 : 0,
                 listed.result.success ? 1 : 0,
                 (unsigned long long)count,
@@ -13817,13 +12979,13 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         }
     }
 
-    void test_tool_autoresponder_list_rules(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        log_msg(hf, "mcp.autoresponder_list_rules", "VERIFY-INPUT -- captured_rule_id=%llu", (unsigned long long)g_autoresponder_rule_id);
+    void test_tool_autoresponder_manage_list_rules(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        log_msg(hf, "mcp.autoresponder_manage.list_rules", "VERIFY-INPUT -- captured_rule_id=%llu", (unsigned long long)g_autoresponder_rule_id);
         mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.autoresponder_list_rules", get_server(), "autoresponder_list_rules", {}, passed, failed, skipped, false, &result);
+        auto status = test_tool_action_call(hf, "mcp.autoresponder_manage.list_rules", "autoresponder_manage", "list_rules", {}, passed, failed, skipped, false, &result);
         if (status == mcp_tool_call_status_t::passed) {
             const uint64_t count = json_count_or_array_size(result.data, "count", "rules");
-            log_msg(hf, "mcp.autoresponder_list_rules", "VERIFY-RESULT -- count=%llu array_size=%zu captured_rule_present=%d data=%s",
+            log_msg(hf, "mcp.autoresponder_manage.list_rules", "VERIFY-RESULT -- count=%llu array_size=%zu captured_rule_present=%d data=%s",
                 (unsigned long long)count,
                 json_array_size_field(result.data, "rules"),
                 (g_autoresponder_rule_id != 0 &&
@@ -13832,36 +12994,36 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         }
     }
 
-    void test_tool_autoresponder_start(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        log_msg(hf, "mcp.autoresponder_start", "VERIFY-INPUT -- captured_rule_id=%llu", (unsigned long long)g_autoresponder_rule_id);
+    void test_tool_autoresponder_manage_start(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        log_msg(hf, "mcp.autoresponder_manage.start", "VERIFY-INPUT -- captured_rule_id=%llu", (unsigned long long)g_autoresponder_rule_id);
         mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.autoresponder_start", get_server(), "autoresponder_start", {}, passed, failed, skipped, false, &result);
+        auto status = test_tool_action_call(hf, "mcp.autoresponder_manage.start", "autoresponder_manage", "start", {}, passed, failed, skipped, false, &result);
         if (status == mcp_tool_call_status_t::passed)
-            log_tool_result_payload(hf, "mcp.autoresponder_start", "VERIFY-RESULT", result);
+            log_tool_result_payload(hf, "mcp.autoresponder_manage.start", "VERIFY-RESULT", result);
     }
 
-    void test_tool_autoresponder_stop(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        log_msg(hf, "mcp.autoresponder_stop", "VERIFY-INPUT -- captured_rule_id=%llu", (unsigned long long)g_autoresponder_rule_id);
+    void test_tool_autoresponder_manage_stop(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        log_msg(hf, "mcp.autoresponder_manage.stop", "VERIFY-INPUT -- captured_rule_id=%llu", (unsigned long long)g_autoresponder_rule_id);
         mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.autoresponder_stop", get_server(), "autoresponder_stop", {}, passed, failed, skipped, false, &result);
+        auto status = test_tool_action_call(hf, "mcp.autoresponder_manage.stop", "autoresponder_manage", "stop", {}, passed, failed, skipped, false, &result);
         if (status == mcp_tool_call_status_t::passed)
-            log_tool_result_payload(hf, "mcp.autoresponder_stop", "VERIFY-RESULT", result);
+            log_tool_result_payload(hf, "mcp.autoresponder_manage.stop", "VERIFY-RESULT", result);
     }
 
-    void test_tool_autoresponder_import_rules(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_autoresponder_manage_import_rules(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         (void)skipped;
-        const char* tool_name = "autoresponder_import_rules";
-        const char* tag = "mcp.autoresponder_import_rules";
+        const char* tool_name = "autoresponder_manage";
+        const char* tag = "mcp.autoresponder_manage.import_rules";
         mcp_standalone::json args;
         args["rules_json"] = "[{\"enabled\":true,\"priority\":7,\"match_type\":\"prefix_url\",\"match_pattern\":\"http://aida-mcp-import.local/\",\"status_code\":207,\"status_reason\":\"AiDA\",\"response_body\":\"aida-autoresponder-import\",\"response_headers\":{\"X-AiDA\":\"import\"}}]";
         log_msg(hf, tag, "VERIFY-INPUT -- rules_json_len=%zu captured_rule_id=%llu",
             args["rules_json"].get<std::string>().size(),
             (unsigned long long)g_autoresponder_rule_id);
         g_invoked_tools.insert(tool_name);
-        auto timed = invoke_tool_bounded(get_server(), tool_name, args, tool_timeout_ms(tool_name));
+        auto timed = invoke_tool_action_bounded(get_server(), tool_name, "export_rules", args, tool_timeout_ms(tool_name));
         const auto& ir = timed.result;
         log_mcp_result_detail("completed", 0, tool_name, args, ir, timed.elapsed_ms, "");
-        auto listed = invoke_tool_bounded(get_server(), "autoresponder_list_rules", {}, tool_timeout_ms("autoresponder_list_rules"));
+        auto listed = invoke_tool_action_bounded(get_server(), "autoresponder_manage", "list_rules", {}, tool_timeout_ms("autoresponder_manage"));
         const uint64_t listed_count = json_count_or_array_size(listed.result.data, "count", "rules");
         const bool import_pattern_present = payload_text_contains(listed.result, "aida-mcp-import.local");
         log_msg(hf, tag, "VERIFY-LIST -- timeout=%d success=%d count=%llu pattern_present=%d text=%s data=%s",
@@ -13886,10 +13048,10 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         passed.fetch_add(1);
     }
 
-    void test_tool_autoresponder_export_rules(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_autoresponder_manage_export_rules(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         (void)skipped;
-        const char* tool_name = "autoresponder_export_rules";
-        const char* tag = "mcp.autoresponder_export_rules";
+        const char* tool_name = "autoresponder_manage";
+        const char* tag = "mcp.autoresponder_manage.export_rules";
         mcp_standalone::json args;
         args["path"] = temp_file_narrow("aida_test_rules.json");
         const std::string path = args["path"].get<std::string>();
@@ -14032,78 +13194,74 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         failed.fetch_add(1);
     }
 
-    void test_tool_tls_ensure_keylogfile(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.tls_ensure_keylogfile", get_server(), "tls_ensure_keylogfile", {}, passed, failed, skipped);
-    }
-
-    void test_tool_burp_scanner_start_audit(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const std::string url = burp_fixture_url(hf, "mcp.burp_scanner_start_audit", "/?q=test");
+void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        const std::string url = burp_fixture_url(hf, "mcp.burp_scanner_manage.start_audit", "/?q=test");
         mcp_standalone::json args; args["url"] = url; args["raw_request"] = "GET /?q=test HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: AiDA-Scanner-Fixture\r\nConnection: close\r\n\r\n"; args["modules"] = mcp_standalone::json::array({"host-header"}); args["per_module_cap"] = 1; args["timeout_ms"] = 3000; args["max_concurrent"] = 1;
         mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.burp_scanner_start_audit", get_server(), "burp_scanner_start_audit", args, passed, failed, skipped, true, &result);
+        auto status = test_tool_action_call(hf, "mcp.burp_scanner_manage.start_audit", "burp_scanner_manage", "start_audit", args, passed, failed, skipped, true, &result);
         if (status == mcp_tool_call_status_t::passed) {
             json_u64_field(result.data, "audit_id", g_burp_scanner_audit_id);
             Sleep(1000);
         }
     }
-    void test_tool_burp_scanner_audit_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_scanner_manage_audit_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["audit_id"] = g_burp_scanner_audit_id;
-        test_tool_call(hf, "mcp.burp_scanner_audit_status", get_server(), "burp_scanner_audit_status", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_scanner_manage.audit_status", "burp_scanner_manage", "audit_status", args, passed, failed, skipped);
     }
-    void test_tool_burp_scanner_list_audits(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.burp_scanner_list_audits", get_server(), "burp_scanner_list_audits", {}, passed, failed, skipped);
+    void test_tool_burp_scanner_manage_list_audits(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_action_call(hf, "mcp.burp_scanner_manage.list_audits", "burp_scanner_manage", "list_audits", {}, passed, failed, skipped);
     }
-    void test_tool_burp_scanner_cancel(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_scanner_manage_cancel(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["audit_id"] = g_burp_scanner_audit_id;
-        auto status = test_tool_call(hf, "mcp.burp_scanner_cancel", get_server(), "burp_scanner_cancel", args, passed, failed, skipped);
+        auto status = test_tool_action_call(hf, "mcp.burp_scanner_manage.cancel", "burp_scanner_manage", "cancel", args, passed, failed, skipped);
         if (status != mcp_tool_call_status_t::passed || g_burp_scanner_audit_id == 0)
             return;
         for (int i = 0; i < 20; ++i) {
             mcp_standalone::json status_args; status_args["audit_id"] = g_burp_scanner_audit_id;
-            auto timed = invoke_tool_bounded(get_server(), "burp_scanner_audit_status", status_args, 2000);
+            auto timed = invoke_tool_bounded(get_server(), "burp_scanner_manage", status_args, 2000);
             bool running = true;
             if (!timed.timed_out && timed.result.success && payload_bool_field(timed.result.data, "running", running)) {
-                log_msg(hf, "mcp.burp_scanner_cancel", "POLL -- audit_id=%llu running=%d",
+                log_msg(hf, "mcp.burp_scanner_manage.cancel", "POLL -- audit_id=%llu running=%d",
                     static_cast<unsigned long long>(g_burp_scanner_audit_id), running ? 1 : 0);
                 if (!running)
                     return;
             }
             Sleep(250);
         }
-        log_msg(hf, "mcp.burp_scanner_cancel", "WARN -- audit_id=%llu still running after cancel drain poll",
+        log_msg(hf, "mcp.burp_scanner_manage.cancel", "WARN -- audit_id=%llu still running after cancel drain poll",
             static_cast<unsigned long long>(g_burp_scanner_audit_id));
     }
-    void test_tool_burp_scanner_list_issues(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_scanner_manage_list_issues(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         if (g_burp_scanner_issue_id == 0)
-            seed_burp_scanner_issue_fixture(hf, "mcp.burp_scanner_list_issues");
+            seed_burp_scanner_issue_fixture(hf, "mcp.burp_scanner_manage.list_issues");
         mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.burp_scanner_list_issues", get_server(), "burp_scanner_list_issues", {}, passed, failed, skipped, true, &result);
+        auto status = test_tool_action_call(hf, "mcp.burp_scanner_manage.list_issues", "burp_scanner_manage", "list_issues", {}, passed, failed, skipped, true, &result);
         if (status == mcp_tool_call_status_t::passed)
             json_u64_array_first_field(result.data, "issues", g_burp_scanner_issue_id, {"id", "issue_id"});
     }
-    void test_tool_burp_scanner_get_issue(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_scanner_manage_get_issue(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         if (g_burp_scanner_issue_id == 0)
-            seed_burp_scanner_issue_fixture(hf, "mcp.burp_scanner_get_issue");
+            seed_burp_scanner_issue_fixture(hf, "mcp.burp_scanner_manage.get_issue");
         if (g_burp_scanner_issue_id == 0) {
-            record_precondition_skipped_tool("burp_scanner_get_issue", skipped);
+            record_precondition_skipped_tool("burp_scanner_manage", skipped);
             return;
         }
         mcp_standalone::json args; args["issue_id"] = g_burp_scanner_issue_id;
-        test_tool_call(hf, "mcp.burp_scanner_get_issue", get_server(), "burp_scanner_get_issue", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_scanner_manage.get_issue", "burp_scanner_manage", "get_issue", args, passed, failed, skipped);
     }
-    void test_tool_burp_scanner_passive_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        seed_burp_passive_scanner_exchange(hf, "mcp.burp_scanner_passive_status");
-        test_tool_call(hf, "mcp.burp_scanner_passive_status", get_server(), "burp_scanner_passive_status", {}, passed, failed, skipped);
+    void test_tool_burp_scanner_manage_passive_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        seed_burp_passive_scanner_exchange(hf, "mcp.burp_scanner_manage.passive_status");
+        test_tool_action_call(hf, "mcp.burp_scanner_manage.passive_status", "burp_scanner_manage", "passive_status", {}, passed, failed, skipped);
     }
-    void test_tool_burp_scanner_list_modules(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.burp_scanner_list_modules", get_server(), "burp_scanner_list_modules", {}, passed, failed, skipped);
+    void test_tool_burp_scanner_manage_list_modules(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_action_call(hf, "mcp.burp_scanner_manage.list_modules", "burp_scanner_manage", "list_modules", {}, passed, failed, skipped);
     }
-    void test_tool_burp_scanner_clear_issues(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.burp_scanner_clear_issues", get_server(), "burp_scanner_clear_issues", {}, passed, failed, skipped);
+    void test_tool_burp_scanner_manage_clear_issues(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_action_call(hf, "mcp.burp_scanner_manage.clear_issues", "burp_scanner_manage", "clear_issues", {}, passed, failed, skipped);
     }
-    void test_tool_burp_scanner_passive_enable(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_scanner_manage_passive_enable(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["enabled"] = false;
-        test_tool_call(hf, "mcp.burp_scanner_passive_enable", get_server(), "burp_scanner_passive_enable", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_scanner_manage.passive_enable", "burp_scanner_manage", "passive_enable", args, passed, failed, skipped);
     }
     void test_tool_burp_sitemap_list_hosts(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         seed_burp_sitemap_fixture(hf, "mcp.burp_sitemap_list_hosts");
@@ -14130,15 +13288,15 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         mcp_standalone::json args; args["exchange_id"] = g_burp_sitemap_exchange_id; args["target"] = "repeater";
         test_tool_call(hf, "mcp.burp_sitemap_send_to", get_server(), "burp_sitemap_send_to", args, passed, failed, skipped);
     }
-    void test_tool_burp_scope_add(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_scope_manage_add(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["id"] = static_cast<std::uint64_t>(424242); args["kind"] = "include"; args["protocol"] = "http"; args["host_pattern"] = "127.0.0.1"; args["port"] = 0; args["path_prefix"] = "/"; args["enabled"] = true;
-        test_tool_call(hf, "mcp.burp_scope_add", get_server(), "burp_scope_add", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_scope_manage.add", "burp_scope_manage", "add", args, passed, failed, skipped);
     }
-    void test_tool_burp_scope_remove(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_scope_manage_remove(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["rule_id"] = static_cast<std::uint64_t>(424242);
-        test_tool_call(hf, "mcp.burp_scope_remove", get_server(), "burp_scope_remove", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_scope_manage.remove", "burp_scope_manage", "remove", args, passed, failed, skipped);
     }
-    void test_tool_burp_scope_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_scope_manage_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json seed_args;
         seed_args["id"] = static_cast<std::uint64_t>(424243);
         seed_args["kind"] = "include";
@@ -14147,40 +13305,40 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         seed_args["port"] = 0;
         seed_args["path_prefix"] = "/";
         seed_args["enabled"] = true;
-        auto seeded = invoke_tool_bounded(get_server(), "burp_scope_add", seed_args, tool_timeout_ms("burp_scope_add"));
-        log_mcp_result_detail("scope_list_fixture", 0, "burp_scope_add", seed_args, seeded.result, seeded.elapsed_ms, "");
+        auto seeded = invoke_tool_action_bounded(get_server(), "burp_scope_manage", "add", seed_args, tool_timeout_ms("burp_scope_manage"));
+        log_mcp_result_detail("scope_list_fixture", 0, "burp_scope_manage", seed_args, seeded.result, seeded.elapsed_ms, "");
         if (seeded.timed_out || !seeded.result.found || seeded.result.threw || !seeded.result.success) {
-            log_msg(hf, "mcp.burp_scope_list", "FAIL -- scope list fixture add failed found=%d threw=%d success=%d timeout=%d text=%s err=%s",
+            log_msg(hf, "mcp.burp_scope_manage.list", "FAIL -- scope list fixture add failed found=%d threw=%d success=%d timeout=%d text=%s err=%s",
                 seeded.result.found ? 1 : 0,
                 seeded.result.threw ? 1 : 0,
                 seeded.result.success ? 1 : 0,
                 seeded.timed_out ? 1 : 0,
                 compact_text(seeded.result.text, 700).c_str(),
                 compact_text(seeded.result.exception_msg, 700).c_str());
-            record_tool_status("burp_scope_list", mcp_tool_call_status_t::failed);
+            record_tool_status("burp_scope_manage", mcp_tool_call_status_t::failed);
             failed.fetch_add(1);
             return;
         }
-        test_tool_call(hf, "mcp.burp_scope_list", get_server(), "burp_scope_list", {}, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_scope_manage.list", "burp_scope_manage", "list", {}, passed, failed, skipped);
     }
-    void test_tool_burp_scope_check(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_scope_manage_check(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["url"] = "http://127.0.0.1/";
-        test_tool_call(hf, "mcp.burp_scope_check", get_server(), "burp_scope_check", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_scope_manage.check", "burp_scope_manage", "check", args, passed, failed, skipped);
     }
-    void test_tool_burp_cookie_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.burp_cookie_list", get_server(), "burp_cookie_list", {}, passed, failed, skipped);
+    void test_tool_burp_cookie_manage_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_action_call(hf, "mcp.burp_cookie_manage.list", "burp_cookie_manage", "list", {}, passed, failed, skipped);
     }
-    void test_tool_burp_cookie_set(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_cookie_manage_set(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["host"] = "127.0.0.1"; args["name"] = "test_cookie"; args["value"] = "test_val"; args["domain"] = "127.0.0.1";
-        test_tool_call(hf, "mcp.burp_cookie_set", get_server(), "burp_cookie_set", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_cookie_manage.set", "burp_cookie_manage", "set", args, passed, failed, skipped);
     }
-    void test_tool_burp_cookie_delete(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_cookie_manage_delete(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["host"] = "127.0.0.1"; args["name"] = "test_cookie";
-        test_tool_call(hf, "mcp.burp_cookie_delete", get_server(), "burp_cookie_delete", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_cookie_manage.delete", "burp_cookie_manage", "delete", args, passed, failed, skipped);
     }
-    void test_tool_burp_cookie_export_netscape(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_cookie_manage_export_netscape(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["file_path"] = temp_file_narrow("aida_mcp_cookies.txt");
-        test_tool_call(hf, "mcp.burp_cookie_export_netscape", get_server(), "burp_cookie_export_netscape", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_cookie_manage.export_netscape", "burp_cookie_manage", "export_netscape", args, passed, failed, skipped);
     }
     void test_tool_burp_dom_xss_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "mcp.burp_dom_xss_status";
@@ -14251,98 +13409,98 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         args["scan_timeout_ms"] = 35000;
         test_tool_call(hf, "mcp.burp_dom_xss_scan", get_server(), "burp_dom_xss_scan", args, passed, failed, skipped);
     }
-    void test_tool_burp_crawler_start(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args; args["start_urls"] = mcp_standalone::json::array({burp_fixture_url(hf, "mcp.burp_crawler_start")}); args["max_depth"] = 1; args["max_pages"] = 2; args["concurrency"] = 1; args["respect_robots"] = false;
+    void test_tool_burp_crawler_manage_start(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["start_urls"] = mcp_standalone::json::array({burp_fixture_url(hf, "mcp.burp_crawler_manage.start")}); args["max_depth"] = 1; args["max_pages"] = 2; args["concurrency"] = 1; args["respect_robots"] = false;
         mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.burp_crawler_start", get_server(), "burp_crawler_start", args, passed, failed, skipped, true, &result);
+        auto status = test_tool_action_call(hf, "mcp.burp_crawler_manage.start", "burp_crawler_manage", "start", args, passed, failed, skipped, true, &result);
         if (status == mcp_tool_call_status_t::passed)
             json_u64_field(result.data, "crawl_id", g_burp_crawler_id);
     }
-    void test_tool_burp_crawler_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_crawler_manage_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         for (int i = 0; i < 40 && g_burp_crawler_id != 0; ++i) {
             auto st = aida::burp::crawler::status(g_burp_crawler_id);
-            log_msg(hf, "mcp.burp_crawler_status", "WAIT -- crawl_id=%llu poll=%d phase=%d queue=%d visited=%d failed=%d found=%d",
+            log_msg(hf, "mcp.burp_crawler_manage.status", "WAIT -- crawl_id=%llu poll=%d phase=%d queue=%d visited=%d failed=%d found=%d",
                 static_cast<unsigned long long>(g_burp_crawler_id), i, static_cast<int>(st.phase), st.queue_depth, st.pages_visited, st.pages_failed, st.urls_found);
             if (st.pages_visited > 0 || st.urls_found > 0 || st.pages_failed > 0 || st.phase == aida::burp::crawler::crawl_status_phase_t::complete)
                 break;
             Sleep(100);
         }
         mcp_standalone::json args; args["crawl_id"] = g_burp_crawler_id;
-        test_tool_call(hf, "mcp.burp_crawler_status", get_server(), "burp_crawler_status", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_crawler_manage.status", "burp_crawler_manage", "status", args, passed, failed, skipped);
     }
-    void test_tool_burp_crawler_stop(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_crawler_manage_stop(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["crawl_id"] = g_burp_crawler_id;
-        test_tool_call(hf, "mcp.burp_crawler_stop", get_server(), "burp_crawler_stop", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_crawler_manage.stop", "burp_crawler_manage", "stop", args, passed, failed, skipped);
     }
-    void test_tool_burp_crawler_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.burp_crawler_list", get_server(), "burp_crawler_list", {}, passed, failed, skipped);
+    void test_tool_burp_crawler_manage_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_action_call(hf, "mcp.burp_crawler_manage.list", "burp_crawler_manage", "list", {}, passed, failed, skipped);
     }
-    void test_tool_burp_content_discovery_start(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const std::string target = burp_fixture_url(hf, "mcp.burp_content_discovery_start", "/FUZZ");
+    void test_tool_burp_content_discovery_manage_start(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        const std::string target = burp_fixture_url(hf, "mcp.burp_content_discovery_manage.start", "/FUZZ");
         mcp_standalone::json args; args["target_url"] = target; args["wordlist_file"] = g_burp_fixture_wordlist_path; args["concurrency"] = 1; args["request_timeout_ms"] = 1500; args["auto_calibrate"] = false; args["match_status"] = mcp_standalone::json::array({200});
         mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.burp_content_discovery_start", get_server(), "burp_content_discovery_start", args, passed, failed, skipped, true, &result);
+        auto status = test_tool_action_call(hf, "mcp.burp_content_discovery_manage.start", "burp_content_discovery_manage", "start", args, passed, failed, skipped, true, &result);
         if (status == mcp_tool_call_status_t::passed)
             json_u64_field(result.data, "disc_id", g_burp_content_discovery_id);
     }
-    void test_tool_burp_content_discovery_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_content_discovery_manage_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         for (int i = 0; i < 40 && g_burp_content_discovery_id != 0; ++i) {
             auto st = aida::burp::content_discovery::status(g_burp_content_discovery_id);
-            log_msg(hf, "mcp.burp_content_discovery_status", "WAIT -- disc_id=%llu poll=%d phase=%d attempts=%d total=%d hits=%d errors=%d",
+            log_msg(hf, "mcp.burp_content_discovery_manage.status", "WAIT -- disc_id=%llu poll=%d phase=%d attempts=%d total=%d hits=%d errors=%d",
                 static_cast<unsigned long long>(g_burp_content_discovery_id), i, static_cast<int>(st.phase), st.attempts, st.total, st.hits, st.errors);
             if (st.attempts > 0 || st.hits > 0 || st.errors > 0 || st.phase == aida::burp::content_discovery::disc_phase_t::complete || st.phase == aida::burp::content_discovery::disc_phase_t::error)
                 break;
             Sleep(100);
         }
         mcp_standalone::json args; args["disc_id"] = g_burp_content_discovery_id;
-        test_tool_call(hf, "mcp.burp_content_discovery_status", get_server(), "burp_content_discovery_status", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_content_discovery_manage.status", "burp_content_discovery_manage", "status", args, passed, failed, skipped);
     }
-    void test_tool_burp_content_discovery_results(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_content_discovery_manage_results(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         for (int i = 0; i < 20 && g_burp_content_discovery_id != 0; ++i) {
             auto st = aida::burp::content_discovery::status(g_burp_content_discovery_id);
-            log_msg(hf, "mcp.burp_content_discovery_results", "WAIT -- disc_id=%llu poll=%d phase=%d attempts=%d total=%d hits=%d errors=%d",
+            log_msg(hf, "mcp.burp_content_discovery_manage.results", "WAIT -- disc_id=%llu poll=%d phase=%d attempts=%d total=%d hits=%d errors=%d",
                 static_cast<unsigned long long>(g_burp_content_discovery_id), i, static_cast<int>(st.phase), st.attempts, st.total, st.hits, st.errors);
             if (st.hits > 0 || st.phase == aida::burp::content_discovery::disc_phase_t::complete || st.phase == aida::burp::content_discovery::disc_phase_t::error) break;
             Sleep(100);
         }
         mcp_standalone::json args; args["disc_id"] = g_burp_content_discovery_id;
-        test_tool_call(hf, "mcp.burp_content_discovery_results", get_server(), "burp_content_discovery_results", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_content_discovery_manage.results", "burp_content_discovery_manage", "results", args, passed, failed, skipped);
     }
-    void test_tool_burp_content_discovery_stop(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_content_discovery_manage_stop(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["disc_id"] = g_burp_content_discovery_id;
-        test_tool_call(hf, "mcp.burp_content_discovery_stop", get_server(), "burp_content_discovery_stop", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_content_discovery_manage.stop", "burp_content_discovery_manage", "stop", args, passed, failed, skipped);
     }
-    void test_tool_burp_subdomain_enum_start(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_subdomain_enum_manage_start(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const std::string wordlist_path = temp_file_narrow("aida_mcp_subdomain_words.txt");
         write_text_file_narrow(wordlist_path, "@\n");
         mcp_standalone::json args; args["domain"] = "localhost"; args["run_passive"] = false; args["run_brute"] = true; args["brute_wordlist_file"] = wordlist_path; args["concurrency"] = 1; args["request_timeout_ms"] = 1000; args["bypass_dns_cache"] = false;
         mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.burp_subdomain_enum_start", get_server(), "burp_subdomain_enum_start", args, passed, failed, skipped, true, &result);
+        auto status = test_tool_action_call(hf, "mcp.burp_subdomain_enum_manage.start", "burp_subdomain_enum_manage", "start", args, passed, failed, skipped, true, &result);
         if (status == mcp_tool_call_status_t::passed)
             json_u64_field(result.data, "sub_id", g_burp_subdomain_id);
     }
-    void test_tool_burp_subdomain_enum_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_subdomain_enum_manage_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         for (int i = 0; i < 40 && g_burp_subdomain_id != 0; ++i) {
             auto st = aida::burp::subdomain_enum::status(g_burp_subdomain_id);
-            log_msg(hf, "mcp.burp_subdomain_enum_status", "WAIT -- sub_id=%llu poll=%d phase=%d attempts=%d resolved=%d results=%zu",
+            log_msg(hf, "mcp.burp_subdomain_enum_manage.status", "WAIT -- sub_id=%llu poll=%d phase=%d attempts=%d resolved=%d results=%zu",
                 static_cast<unsigned long long>(g_burp_subdomain_id), i, static_cast<int>(st.phase), st.brute_attempts, st.brute_resolved, st.results.size());
             if (st.brute_attempts > 0 || st.brute_resolved > 0 || !st.results.empty() || st.phase == aida::burp::subdomain_enum::enum_phase_t::complete)
                 break;
             Sleep(100);
         }
         mcp_standalone::json args; args["sub_id"] = g_burp_subdomain_id;
-        test_tool_call(hf, "mcp.burp_subdomain_enum_status", get_server(), "burp_subdomain_enum_status", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_subdomain_enum_manage.status", "burp_subdomain_enum_manage", "status", args, passed, failed, skipped);
     }
-    void test_tool_burp_subdomain_enum_results(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_subdomain_enum_manage_results(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         for (int i = 0; i < 20 && g_burp_subdomain_id != 0; ++i) {
             auto st = aida::burp::subdomain_enum::status(g_burp_subdomain_id);
-            log_msg(hf, "mcp.burp_subdomain_enum_results", "WAIT -- sub_id=%llu poll=%d phase=%d attempts=%d resolved=%d results=%zu",
+            log_msg(hf, "mcp.burp_subdomain_enum_manage.results", "WAIT -- sub_id=%llu poll=%d phase=%d attempts=%d resolved=%d results=%zu",
                 static_cast<unsigned long long>(g_burp_subdomain_id), i, static_cast<int>(st.phase), st.brute_attempts, st.brute_resolved, st.results.size());
             if (!st.results.empty() || st.phase == aida::burp::subdomain_enum::enum_phase_t::complete) break;
             Sleep(100);
         }
         mcp_standalone::json args; args["sub_id"] = g_burp_subdomain_id;
-        test_tool_call(hf, "mcp.burp_subdomain_enum_results", get_server(), "burp_subdomain_enum_results", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_subdomain_enum_manage.results", "burp_subdomain_enum_manage", "results", args, passed, failed, skipped);
     }
     void test_tool_burp_payloads_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         test_tool_call(hf, "mcp.burp_payloads_list", get_server(), "burp_payloads_list", {}, passed, failed, skipped);
@@ -14359,11 +13517,11 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         mcp_standalone::json args; args["set_id"] = "custom/aida_mcp_test"; args["label"] = "AiDA MCP Test"; args["entries"] = mcp_standalone::json::array({"test"});
         test_tool_call(hf, "mcp.burp_payloads_add_custom", get_server(), "burp_payloads_add_custom", args, passed, failed, skipped);
     }
-    void test_tool_burp_intruder_start(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        if (!ensure_burp_http_fixture(hf, "mcp.burp_intruder_start") ||
-            !probe_burp_fixture_connect(hf, "mcp.burp_intruder_start")) {
-            log_msg(hf, "mcp.burp_intruder_start", "FAIL -- local HTTP fixture was not reachable before starting Intruder job");
-            record_fixture_failed_tool("burp_intruder_start", failed);
+    void test_tool_burp_intruder_manage_start(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        if (!ensure_burp_http_fixture(hf, "mcp.burp_intruder_manage.start") ||
+            !probe_burp_fixture_connect(hf, "mcp.burp_intruder_manage.start")) {
+            log_msg(hf, "mcp.burp_intruder_manage.start", "FAIL -- local HTTP fixture was not reachable before starting Intruder job");
+            record_fixture_failed_tool("burp_intruder_manage", failed);
             return;
         }
         const uint16_t port = g_burp_http_fixture ? g_burp_http_fixture->port : 1;
@@ -14372,106 +13530,106 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         base_request += "\r\nConnection: close\r\n\r\n";
         mcp_standalone::json args; args["host"] = "127.0.0.1"; args["port"] = port; args["scheme"] = "http"; args["base_request"] = base_request; args["positions"] = mcp_standalone::json::array({mcp_standalone::json::array({8, 4})}); args["payload_sets"] = mcp_standalone::json::array({mcp_standalone::json::array({"aida"})}); args["total_cap"] = 1; args["concurrency"] = 1; args["timeout_ms"] = 1500;
         mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.burp_intruder_start", get_server(), "burp_intruder_start", args, passed, failed, skipped, true, &result);
+        auto status = test_tool_action_call(hf, "mcp.burp_intruder_manage.start", "burp_intruder_manage", "start", args, passed, failed, skipped, true, &result);
         if (status == mcp_tool_call_status_t::passed)
             json_u64_field(result.data, "job_id", g_burp_intruder_job_id);
     }
-    void test_tool_burp_intruder_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_intruder_manage_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["job_id"] = g_burp_intruder_job_id;
-        test_tool_call(hf, "mcp.burp_intruder_status", get_server(), "burp_intruder_status", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_intruder_manage.status", "burp_intruder_manage", "status", args, passed, failed, skipped);
     }
-    void test_tool_burp_intruder_results(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_intruder_manage_results(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         for (int i = 0; i < 20 && g_burp_intruder_job_id != 0; ++i) {
             auto st = aida::burp::intruder::status(g_burp_intruder_job_id);
-            log_msg(hf, "mcp.burp_intruder_results", "WAIT -- job_id=%llu poll=%d total=%zu sent=%zu errors=%zu running=%d",
+            log_msg(hf, "mcp.burp_intruder_manage.results", "WAIT -- job_id=%llu poll=%d total=%zu sent=%zu errors=%zu running=%d",
                 static_cast<unsigned long long>(g_burp_intruder_job_id), i, st.total, st.sent, st.errors, st.running ? 1 : 0);
             if ((st.sent > 0 && !st.running) || st.errors > 0) break;
             Sleep(100);
         }
         mcp_standalone::json args; args["job_id"] = g_burp_intruder_job_id;
-        test_tool_call(hf, "mcp.burp_intruder_results", get_server(), "burp_intruder_results", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_intruder_manage.results", "burp_intruder_manage", "results", args, passed, failed, skipped);
     }
-    void test_tool_burp_intruder_stop(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_intruder_manage_stop(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["job_id"] = g_burp_intruder_job_id;
-        test_tool_call(hf, "mcp.burp_intruder_stop", get_server(), "burp_intruder_stop", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_intruder_manage.stop", "burp_intruder_manage", "stop", args, passed, failed, skipped);
     }
-    void test_tool_burp_intruder_list_jobs(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.burp_intruder_list_jobs", get_server(), "burp_intruder_list_jobs", {}, passed, failed, skipped);
+    void test_tool_burp_intruder_manage_list_jobs(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_action_call(hf, "mcp.burp_intruder_manage.list_jobs", "burp_intruder_manage", "list_jobs", {}, passed, failed, skipped);
     }
-    void test_tool_burp_intruder_clear(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_intruder_manage_clear(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["job_id"] = g_burp_intruder_job_id;
-        test_tool_call(hf, "mcp.burp_intruder_clear", get_server(), "burp_intruder_clear", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_intruder_manage.clear", "burp_intruder_manage", "clear", args, passed, failed, skipped);
     }
-    void test_tool_burp_param_miner_start(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args; args["target_url"] = burp_fixture_url(hf, "mcp.burp_param_miner_start"); args["custom_words"] = mcp_standalone::json::array({"aida_mcp_param"}); args["baseline_count"] = 1; args["concurrency"] = 1; args["timeout_ms"] = 1500;
+    void test_tool_burp_param_miner_manage_start(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["target_url"] = burp_fixture_url(hf, "mcp.burp_param_miner_manage.start"); args["custom_words"] = mcp_standalone::json::array({"aida_mcp_param"}); args["baseline_count"] = 1; args["concurrency"] = 1; args["timeout_ms"] = 1500;
         mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.burp_param_miner_start", get_server(), "burp_param_miner_start", args, passed, failed, skipped, true, &result);
+        auto status = test_tool_action_call(hf, "mcp.burp_param_miner_manage.start", "burp_param_miner_manage", "start", args, passed, failed, skipped, true, &result);
         if (status == mcp_tool_call_status_t::passed)
             json_u64_field(result.data, "job_id", g_burp_param_miner_job_id);
     }
-    void test_tool_burp_param_miner_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_param_miner_manage_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         for (int i = 0; i < 40 && g_burp_param_miner_job_id != 0; ++i) {
             auto st = aida::burp::param_miner::status(g_burp_param_miner_job_id);
-            log_msg(hf, "mcp.burp_param_miner_status", "WAIT -- job_id=%llu poll=%d total=%zu tried=%zu hits=%zu running=%d",
+            log_msg(hf, "mcp.burp_param_miner_manage.status", "WAIT -- job_id=%llu poll=%d total=%zu tried=%zu hits=%zu running=%d",
                 static_cast<unsigned long long>(g_burp_param_miner_job_id), i, st.total, st.tried, st.hits, st.running ? 1 : 0);
             if (st.tried > 0 || st.hits > 0 || !st.running)
                 break;
             Sleep(100);
         }
         mcp_standalone::json args; args["id"] = g_burp_param_miner_job_id;
-        test_tool_call(hf, "mcp.burp_param_miner_status", get_server(), "burp_param_miner_status", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_param_miner_manage.status", "burp_param_miner_manage", "status", args, passed, failed, skipped);
     }
-    void test_tool_burp_param_miner_results(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_param_miner_manage_results(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         for (int i = 0; i < 20 && g_burp_param_miner_job_id != 0; ++i) {
             auto st = aida::burp::param_miner::status(g_burp_param_miner_job_id);
-            log_msg(hf, "mcp.burp_param_miner_results", "WAIT -- job_id=%llu poll=%d total=%zu tried=%zu hits=%zu running=%d",
+            log_msg(hf, "mcp.burp_param_miner_manage.results", "WAIT -- job_id=%llu poll=%d total=%zu tried=%zu hits=%zu running=%d",
                 static_cast<unsigned long long>(g_burp_param_miner_job_id), i, st.total, st.tried, st.hits, st.running ? 1 : 0);
             if ((st.tried > 0 && !st.running) || st.hits > 0) break;
             Sleep(100);
         }
         mcp_standalone::json args; args["id"] = g_burp_param_miner_job_id;
-        test_tool_call(hf, "mcp.burp_param_miner_results", get_server(), "burp_param_miner_results", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_param_miner_manage.results", "burp_param_miner_manage", "results", args, passed, failed, skipped);
     }
-    void test_tool_burp_param_miner_stop(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_param_miner_manage_stop(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["id"] = g_burp_param_miner_job_id;
-        test_tool_call(hf, "mcp.burp_param_miner_stop", get_server(), "burp_param_miner_stop", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_param_miner_manage.stop", "burp_param_miner_manage", "stop", args, passed, failed, skipped);
     }
     void test_tool_burp_h2_send(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["host"] = "127.0.0.1"; args["port"] = 443; args["timeout_ms"] = 1500; args["offline_validate"] = true;
         args["pseudo_headers"] = mcp_standalone::json::object({{"method", "GET"}, {"scheme", "https"}, {"path", "/aida-h2-fixture"}, {"authority", "127.0.0.1"}});
         test_tool_call(hf, "mcp.burp_h2_send", get_server(), "burp_h2_send", args, passed, failed, skipped);
     }
-    void test_tool_burp_jwt_decode(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_jwt_manage_decode(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["token"] = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ0ZXN0In0.test";
-        test_tool_call(hf, "mcp.burp_jwt_decode", get_server(), "burp_jwt_decode", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_jwt_manage.decode", "burp_jwt_manage", "decode", args, passed, failed, skipped);
     }
-    void test_tool_burp_jwt_forge(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_jwt_manage_forge(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["header"] = mcp_standalone::json::object({{"typ", "JWT"}}); args["payload"] = mcp_standalone::json::object({{"sub", "test"}}); args["alg"] = "HS256"; args["hmac_secret"] = "test";
-        test_tool_call(hf, "mcp.burp_jwt_forge", get_server(), "burp_jwt_forge", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_jwt_manage.forge", "burp_jwt_manage", "forge", args, passed, failed, skipped);
     }
-    void test_tool_burp_jwt_verify(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_jwt_manage_verify(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["token"] = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ0ZXN0In0.Gmlw_dPyBS-autswceWkocF9ELiEHKeS86-MHgG8MhY"; args["key"] = "test"; args["mode"] = "hmac";
-        test_tool_call(hf, "mcp.burp_jwt_verify", get_server(), "burp_jwt_verify", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_jwt_manage.verify", "burp_jwt_manage", "verify", args, passed, failed, skipped);
     }
-    void test_tool_burp_jwt_crack_start(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_jwt_manage_crack_start(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["token"] = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ0ZXN0In0.Gmlw_dPyBS-autswceWkocF9ELiEHKeS86-MHgG8MhY";
         args["custom_words"] = mcp_standalone::json::array({"test", "secret"}); args["concurrency"] = 1; args["max_attempts"] = 2;
         mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.burp_jwt_crack_start", get_server(), "burp_jwt_crack_start", args, passed, failed, skipped, true, &result);
+        auto status = test_tool_action_call(hf, "mcp.burp_jwt_manage.crack_start", "burp_jwt_manage", "crack_start", args, passed, failed, skipped, true, &result);
         if (status == mcp_tool_call_status_t::passed)
             json_u64_field(result.data, "crack_id", g_burp_jwt_crack_id);
     }
-    void test_tool_burp_jwt_crack_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_jwt_manage_crack_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["crack_id"] = g_burp_jwt_crack_id;
-        test_tool_call(hf, "mcp.burp_jwt_crack_status", get_server(), "burp_jwt_crack_status", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_jwt_manage.crack_status", "burp_jwt_manage", "crack_status", args, passed, failed, skipped);
     }
-    void test_tool_burp_jwt_crack_stop(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_jwt_manage_crack_stop(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["crack_id"] = g_burp_jwt_crack_id;
-        test_tool_call(hf, "mcp.burp_jwt_crack_stop", get_server(), "burp_jwt_crack_stop", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_jwt_manage.crack_stop", "burp_jwt_manage", "crack_stop", args, passed, failed, skipped);
     }
-    void test_tool_burp_jwt_attack(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_jwt_manage_attack(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["token"] = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ0ZXN0In0.test";
-        test_tool_call(hf, "mcp.burp_jwt_attack", get_server(), "burp_jwt_attack", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_jwt_manage.attack", "burp_jwt_manage", "attack", args, passed, failed, skipped);
     }
     void test_tool_burp_auth_basic_encode(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["user"] = "test"; args["pass"] = "test";
@@ -14520,33 +13678,33 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         mcp_standalone::json args; args["saml_b64"] = "PHNhbWxwOlJlc3BvbnNlIHhtbG5zOnNhbWxwPSJ1cm46b2FzaXM6bmFtZXM6dGM6U0FNTDoyLjA6cHJvdG9jb2wiIElEPSJfYWlkYV9yZXNwIiBWZXJzaW9uPSIyLjAiIElzc3VlSW5zdGFudD0iMjAyNi0wNS0yNFQwMDowMDowMFoiPjwvc2FtbHA6UmVzcG9uc2U+";
         test_tool_call(hf, "mcp.burp_auth_saml_decode_response", get_server(), "burp_auth_saml_decode_response", args, passed, failed, skipped);
     }
-    void test_tool_burp_match_replace_add(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_match_replace_manage_add(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["label"] = "aida_mcp_match_replace"; args["target"] = "request_body"; args["match_regex"] = "test"; args["replacement"] = "test_replace"; args["regex"] = false;
         mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.burp_match_replace_add", get_server(), "burp_match_replace_add", args, passed, failed, skipped, true, &result);
+        auto status = test_tool_action_call(hf, "mcp.burp_match_replace_manage.add", "burp_match_replace_manage", "add", args, passed, failed, skipped, true, &result);
         if (status == mcp_tool_call_status_t::passed)
             json_u64_field(result.data, "rule_id", g_burp_match_replace_rule_id);
     }
-    void test_tool_burp_match_replace_update(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_match_replace_manage_update(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["rule_id"] = g_burp_match_replace_rule_id; args["fields"] = mcp_standalone::json::object({{"replacement", "test_replace2"}});
-        test_tool_call(hf, "mcp.burp_match_replace_update", get_server(), "burp_match_replace_update", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_match_replace_manage.update", "burp_match_replace_manage", "update", args, passed, failed, skipped);
     }
-    void test_tool_burp_match_replace_remove(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_match_replace_manage_remove(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["rule_id"] = g_burp_match_replace_rule_id;
-        test_tool_call(hf, "mcp.burp_match_replace_remove", get_server(), "burp_match_replace_remove", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_match_replace_manage.remove", "burp_match_replace_manage", "remove", args, passed, failed, skipped);
     }
-    void test_tool_burp_match_replace_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.burp_match_replace_list", get_server(), "burp_match_replace_list", {}, passed, failed, skipped);
+    void test_tool_burp_match_replace_manage_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_action_call(hf, "mcp.burp_match_replace_manage.list", "burp_match_replace_manage", "list", {}, passed, failed, skipped);
     }
-    void test_tool_burp_match_replace_clear(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.burp_match_replace_clear", get_server(), "burp_match_replace_clear", {}, passed, failed, skipped);
+    void test_tool_burp_match_replace_manage_clear(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_action_call(hf, "mcp.burp_match_replace_manage.clear", "burp_match_replace_manage", "clear", {}, passed, failed, skipped);
     }
-    void test_tool_burp_match_replace_test(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_match_replace_manage_test(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["rule_id"] = g_burp_match_replace_rule_id; args["target"] = "request_body"; args["sample_b64"] = "dGVzdCBkYXRh";
-        test_tool_call(hf, "mcp.burp_match_replace_test", get_server(), "burp_match_replace_test", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_match_replace_manage.test", "burp_match_replace_manage", "test", args, passed, failed, skipped);
     }
-    void test_tool_burp_macro_add(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        ensure_burp_http_fixture(hf, "mcp.burp_macro_add");
+    void test_tool_burp_macro_manage_add(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        ensure_burp_http_fixture(hf, "mcp.burp_macro_manage.add");
         const uint16_t port = g_burp_http_fixture ? g_burp_http_fixture->port : 1;
         mcp_standalone::json step = mcp_standalone::json::object();
         step["label"] = "fixture";
@@ -14558,108 +13716,108 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         step["extracts"] = mcp_standalone::json::array({mcp_standalone::json::object({{"name", "title"}, {"from", "resp_body"}, {"regex", "AiDA MCP Fixture"}, {"group", 0}})});
         mcp_standalone::json args; args["name"] = "aida_mcp_macro"; args["steps"] = mcp_standalone::json::array({step});
         mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.burp_macro_add", get_server(), "burp_macro_add", args, passed, failed, skipped, true, &result);
+        auto status = test_tool_action_call(hf, "mcp.burp_macro_manage.add", "burp_macro_manage", "add", args, passed, failed, skipped, true, &result);
         if (status == mcp_tool_call_status_t::passed)
             json_u64_field(result.data, "macro_id", g_burp_macro_id);
     }
-    void test_tool_burp_macro_run(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_macro_manage_run(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["macro_id"] = g_burp_macro_id;
-        test_tool_call(hf, "mcp.burp_macro_run", get_server(), "burp_macro_run", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_macro_manage.run", "burp_macro_manage", "run", args, passed, failed, skipped);
     }
-    void test_tool_burp_macro_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.burp_macro_list", get_server(), "burp_macro_list", {}, passed, failed, skipped);
+    void test_tool_burp_macro_manage_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_action_call(hf, "mcp.burp_macro_manage.list", "burp_macro_manage", "list", {}, passed, failed, skipped);
     }
-    void test_tool_burp_macro_remove(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_macro_manage_remove(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["macro_id"] = g_burp_macro_id;
-        test_tool_call(hf, "mcp.burp_macro_remove", get_server(), "burp_macro_remove", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_macro_manage.remove", "burp_macro_manage", "remove", args, passed, failed, skipped);
     }
-    void test_tool_burp_macro_update(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_macro_manage_update(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["macro_id"] = g_burp_macro_id; args["fields"] = mcp_standalone::json::object({{"name", "aida_mcp_macro_updated"}});
-        test_tool_call(hf, "mcp.burp_macro_update", get_server(), "burp_macro_update", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_macro_manage.update", "burp_macro_manage", "update", args, passed, failed, skipped);
     }
-    void test_tool_burp_session_rule_add(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_session_rule_manage_add(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["name"] = "aida_mcp_session_rule"; args["match"] = "url_regex"; args["pattern"] = ".*"; args["macro_id"] = g_burp_macro_id;
         mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.burp_session_rule_add", get_server(), "burp_session_rule_add", args, passed, failed, skipped, true, &result);
+        auto status = test_tool_action_call(hf, "mcp.burp_session_rule_manage.add", "burp_session_rule_manage", "add", args, passed, failed, skipped, true, &result);
         if (status == mcp_tool_call_status_t::passed)
             json_u64_field(result.data, "rule_id", g_burp_session_rule_id);
     }
-    void test_tool_burp_session_rule_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.burp_session_rule_list", get_server(), "burp_session_rule_list", {}, passed, failed, skipped);
+    void test_tool_burp_session_rule_manage_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_action_call(hf, "mcp.burp_session_rule_manage.list", "burp_session_rule_manage", "list", {}, passed, failed, skipped);
     }
-    void test_tool_burp_session_rule_remove(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_session_rule_manage_remove(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["rule_id"] = g_burp_session_rule_id;
-        test_tool_call(hf, "mcp.burp_session_rule_remove", get_server(), "burp_session_rule_remove", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_session_rule_manage.remove", "burp_session_rule_manage", "remove", args, passed, failed, skipped);
     }
-    void test_tool_burp_api_import(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const std::string source = "text:{\"openapi\":\"3.0.0\",\"info\":{\"title\":\"AiDA MCP Test\",\"version\":\"1.0.0\"},\"servers\":[{\"url\":\"" + burp_fixture_url(hf, "mcp.burp_api_import") + "\"}],\"paths\":{\"/ping\":{\"get\":{\"operationId\":\"ping\",\"responses\":{\"200\":{\"description\":\"ok\"}}}}}}";
+    void test_tool_burp_api_manage_import(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        const std::string source = "text:{\"openapi\":\"3.0.0\",\"info\":{\"title\":\"AiDA MCP Test\",\"version\":\"1.0.0\"},\"servers\":[{\"url\":\"" + burp_fixture_url(hf, "mcp.burp_api_manage.import") + "\"}],\"paths\":{\"/ping\":{\"get\":{\"operationId\":\"ping\",\"responses\":{\"200\":{\"description\":\"ok\"}}}}}}";
         mcp_standalone::json args; args["format"] = "openapi_json"; args["source"] = source;
         mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.burp_api_import", get_server(), "burp_api_import", args, passed, failed, skipped, true, &result);
+        auto status = test_tool_action_call(hf, "mcp.burp_api_manage.import", "burp_api_manage", "import", args, passed, failed, skipped, true, &result);
         if (status == mcp_tool_call_status_t::passed)
             json_u64_any_field(result.data, g_burp_api_collection_id, {"id", "collection_id"});
     }
-    void test_tool_burp_api_list_collections(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.burp_api_list_collections", get_server(), "burp_api_list_collections", {}, passed, failed, skipped);
+    void test_tool_burp_api_manage_list_collections(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_action_call(hf, "mcp.burp_api_manage.list_collections", "burp_api_manage", "list_collections", {}, passed, failed, skipped);
     }
-    void test_tool_burp_api_get_collection(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_api_manage_get_collection(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["collection_id"] = g_burp_api_collection_id;
-        test_tool_call(hf, "mcp.burp_api_get_collection", get_server(), "burp_api_get_collection", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_api_manage.get_collection", "burp_api_manage", "get_collection", args, passed, failed, skipped);
     }
-    void test_tool_burp_api_remove_collection(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_api_manage_remove_collection(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["collection_id"] = g_burp_api_collection_id;
-        test_tool_call(hf, "mcp.burp_api_remove_collection", get_server(), "burp_api_remove_collection", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_api_manage.remove_collection", "burp_api_manage", "remove_collection", args, passed, failed, skipped);
     }
-    void test_tool_burp_api_send_request(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_api_manage_send_request(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["collection_id"] = g_burp_api_collection_id; args["request_id"] = "ping";
-        test_tool_call(hf, "mcp.burp_api_send_request", get_server(), "burp_api_send_request", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_api_manage.send_request", "burp_api_manage", "send_request", args, passed, failed, skipped);
     }
-    void test_tool_burp_api_audit_collection(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_api_manage_audit_collection(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["collection_id"] = g_burp_api_collection_id;
-        test_tool_call(hf, "mcp.burp_api_audit_collection", get_server(), "burp_api_audit_collection", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_api_manage.audit_collection", "burp_api_manage", "audit_collection", args, passed, failed, skipped);
     }
-    void test_tool_burp_graphql_introspect(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args; args["endpoint"] = burp_fixture_url(hf, "mcp.burp_graphql_introspect", "/graphql");
+    void test_tool_burp_graphql_manage_introspect(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["endpoint"] = burp_fixture_url(hf, "mcp.burp_graphql_manage.introspect", "/graphql");
         mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.burp_graphql_introspect", get_server(), "burp_graphql_introspect", args, passed, failed, skipped, false, &result);
+        auto status = test_tool_action_call(hf, "mcp.burp_graphql_manage.introspect", "burp_graphql_manage", "introspect", args, passed, failed, skipped, false, &result);
         if (status == mcp_tool_call_status_t::passed) {
             size_t types = 0;
             if (!payload_array_count(result.data, "types", types) || types == 0) {
-                log_msg(hf, "mcp.burp_graphql_introspect", "FAIL -- GraphQL schema has no parsed types data=%s",
+                log_msg(hf, "mcp.burp_graphql_manage.introspect", "FAIL -- GraphQL schema has no parsed types data=%s",
                     compact_json(result.data, 900).c_str());
                 if (passed.load(std::memory_order_acquire) > 0)
                     passed.fetch_sub(1, std::memory_order_acq_rel);
                 failed.fetch_add(1, std::memory_order_acq_rel);
-                convert_tool_pass_to_fail("burp_graphql_introspect");
+                convert_tool_pass_to_fail("burp_graphql_manage");
             }
         }
     }
-    void test_tool_burp_graphql_example(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args; args["endpoint"] = burp_fixture_url(hf, "mcp.burp_graphql_example", "/graphql"); args["field_name"] = "viewer"; args["depth"] = 2;
+    void test_tool_burp_graphql_manage_example(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["endpoint"] = burp_fixture_url(hf, "mcp.burp_graphql_manage.example", "/graphql"); args["field_name"] = "viewer"; args["depth"] = 2;
         mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.burp_graphql_example", get_server(), "burp_graphql_example", args, passed, failed, skipped, false, &result);
+        auto status = test_tool_action_call(hf, "mcp.burp_graphql_manage.example", "burp_graphql_manage", "example", args, passed, failed, skipped, false, &result);
         if (status == mcp_tool_call_status_t::passed &&
             (result.text.find("viewer") == std::string::npos || result.text.find("id") == std::string::npos || result.text.find("name") == std::string::npos)) {
-            log_msg(hf, "mcp.burp_graphql_example", "FAIL -- generated query did not use fixture schema text=%s data=%s",
+            log_msg(hf, "mcp.burp_graphql_manage.example", "FAIL -- generated query did not use fixture schema text=%s data=%s",
                 compact_text(result.text, 900).c_str(),
                 compact_json(result.data, 900).c_str());
             if (passed.load(std::memory_order_acquire) > 0)
                 passed.fetch_sub(1, std::memory_order_acq_rel);
             failed.fetch_add(1, std::memory_order_acq_rel);
-            convert_tool_pass_to_fail("burp_graphql_example");
+            convert_tool_pass_to_fail("burp_graphql_manage");
         }
     }
-    void test_tool_burp_graphql_send(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args; args["endpoint"] = burp_fixture_url(hf, "mcp.burp_graphql_send", "/graphql"); args["query"] = "{ __typename aidaStatus }";
+    void test_tool_burp_graphql_manage_send(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args; args["endpoint"] = burp_fixture_url(hf, "mcp.burp_graphql_manage.send", "/graphql"); args["query"] = "{ __typename aidaStatus }";
         mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.burp_graphql_send", get_server(), "burp_graphql_send", args, passed, failed, skipped, false, &result);
+        auto status = test_tool_action_call(hf, "mcp.burp_graphql_manage.send", "burp_graphql_manage", "send", args, passed, failed, skipped, false, &result);
         if (status == mcp_tool_call_status_t::passed) {
             std::string typename_value;
             std::string status_value;
             const bool has_typename = payload_string_field(result.data, "__typename", typename_value);
             const bool has_status = payload_string_field(result.data, "aidaStatus", status_value);
             if (!has_typename || typename_value != "Query" || !has_status || status_value != "ready") {
-                log_msg(hf, "mcp.burp_graphql_send", "FAIL -- GraphQL fixture response mismatch has_typename=%d typename=%s has_status=%d status=%s data=%s",
+                log_msg(hf, "mcp.burp_graphql_manage.send", "FAIL -- GraphQL fixture response mismatch has_typename=%d typename=%s has_status=%d status=%s data=%s",
                     has_typename ? 1 : 0,
                     compact_text(typename_value, 120).c_str(),
                     has_status ? 1 : 0,
@@ -14668,61 +13826,61 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
                 if (passed.load(std::memory_order_acquire) > 0)
                     passed.fetch_sub(1, std::memory_order_acq_rel);
                 failed.fetch_add(1, std::memory_order_acq_rel);
-                convert_tool_pass_to_fail("burp_graphql_send");
+                convert_tool_pass_to_fail("burp_graphql_manage");
             }
         }
     }
-    void test_tool_burp_ws_connect(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        if (!ensure_burp_http_fixture(hf, "mcp.burp_ws_connect") || !g_burp_http_fixture || g_burp_http_fixture->port == 0) {
-            log_msg(hf, "mcp.burp_ws_connect", "FAIL -- websocket fixture listener setup failed");
-            record_fixture_failed_tool("burp_ws_connect", failed);
+    void test_tool_burp_ws_manage_connect(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        if (!ensure_burp_http_fixture(hf, "mcp.burp_ws_manage.connect") || !g_burp_http_fixture || g_burp_http_fixture->port == 0) {
+            log_msg(hf, "mcp.burp_ws_manage.connect", "FAIL -- websocket fixture listener setup failed");
+            record_fixture_failed_tool("burp_ws_manage", failed);
             return;
         }
         mcp_standalone::json args; args["scheme"] = "ws"; args["host"] = "127.0.0.1"; args["port"] = g_burp_http_fixture->port; args["path"] = "/ws";
         mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.burp_ws_connect", get_server(), "burp_ws_connect", args, passed, failed, skipped, false, &result);
+        auto status = test_tool_action_call(hf, "mcp.burp_ws_manage.connect", "burp_ws_manage", "connect", args, passed, failed, skipped, false, &result);
         if (status == mcp_tool_call_status_t::passed)
             json_u64_any_field(result.data, g_burp_ws_conn_id, {"conn_id", "id"});
     }
-    void test_tool_burp_ws_disconnect(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_ws_manage_disconnect(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["conn_id"] = g_burp_ws_conn_id;
-        test_tool_call(hf, "mcp.burp_ws_disconnect", get_server(), "burp_ws_disconnect", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_ws_manage.disconnect", "burp_ws_manage", "disconnect", args, passed, failed, skipped);
     }
-    void test_tool_burp_ws_send_text(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_ws_manage_send_text(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["conn_id"] = g_burp_ws_conn_id; args["msg"] = "test";
-        test_tool_call(hf, "mcp.burp_ws_send_text", get_server(), "burp_ws_send_text", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_ws_manage.send_text", "burp_ws_manage", "send_text", args, passed, failed, skipped);
     }
-    void test_tool_burp_ws_send_binary(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_ws_manage_send_binary(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["conn_id"] = g_burp_ws_conn_id; args["data_b64"] = "AA==";
-        test_tool_call(hf, "mcp.burp_ws_send_binary", get_server(), "burp_ws_send_binary", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_ws_manage.send_binary", "burp_ws_manage", "send_binary", args, passed, failed, skipped);
     }
-    void test_tool_burp_ws_send_raw(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_ws_manage_send_raw(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["conn_id"] = g_burp_ws_conn_id; args["opcode"] = 1; args["fin"] = true; args["masked"] = true; args["payload_b64"] = "dGVzdA==";
-        test_tool_call(hf, "mcp.burp_ws_send_raw", get_server(), "burp_ws_send_raw", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_ws_manage.send_raw", "burp_ws_manage", "send_raw", args, passed, failed, skipped);
     }
-    void test_tool_burp_ws_list_connections(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.burp_ws_list_connections", get_server(), "burp_ws_list_connections", {}, passed, failed, skipped);
+    void test_tool_burp_ws_manage_list_connections(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_action_call(hf, "mcp.burp_ws_manage.list_connections", "burp_ws_manage", "list_connections", {}, passed, failed, skipped);
     }
-    void test_tool_burp_ws_frames(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_ws_manage_frames(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["conn_id"] = g_burp_ws_conn_id;
-        test_tool_call(hf, "mcp.burp_ws_frames", get_server(), "burp_ws_frames", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_ws_manage.frames", "burp_ws_manage", "frames", args, passed, failed, skipped);
     }
-    void test_tool_burp_ws_clear_frames(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_ws_manage_clear_frames(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["conn_id"] = g_burp_ws_conn_id;
-        test_tool_call(hf, "mcp.burp_ws_clear_frames", get_server(), "burp_ws_clear_frames", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_ws_manage.clear_frames", "burp_ws_manage", "clear_frames", args, passed, failed, skipped);
     }
-    void test_tool_burp_logger_query(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.burp_logger_query", get_server(), "burp_logger_query", {}, passed, failed, skipped);
+    void test_tool_burp_logger_manage_query(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_action_call(hf, "mcp.burp_logger_manage.query", "burp_logger_manage", "query", {}, passed, failed, skipped);
     }
-    void test_tool_burp_logger_total(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.burp_logger_total", get_server(), "burp_logger_total", {}, passed, failed, skipped);
+    void test_tool_burp_logger_manage_total(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_action_call(hf, "mcp.burp_logger_manage.total", "burp_logger_manage", "total", {}, passed, failed, skipped);
     }
-    void test_tool_burp_logger_clear(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.burp_logger_clear", get_server(), "burp_logger_clear", {}, passed, failed, skipped);
+    void test_tool_burp_logger_manage_clear(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_action_call(hf, "mcp.burp_logger_manage.clear", "burp_logger_manage", "clear", {}, passed, failed, skipped);
     }
-    void test_tool_burp_logger_export_csv(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_logger_manage_export_csv(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["path"] = "C:\\temp\\aida_logger_test.csv";
-        test_tool_call(hf, "mcp.burp_logger_export_csv", get_server(), "burp_logger_export_csv", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_logger_manage.export_csv", "burp_logger_manage", "export_csv", args, passed, failed, skipped);
     }
     void test_tool_burp_report_generate(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["format"] = "html"; args["output_path"] = temp_file_narrow("aida_burp_report.html"); args["title"] = "AiDA MCP Test";
@@ -14747,32 +13905,32 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         mcp_standalone::json args; args["url"] = burp_fixture_url(hf, "mcp.burp_csp_analyze_url");
         test_tool_call(hf, "mcp.burp_csp_analyze_url", get_server(), "burp_csp_analyze_url", args, passed, failed, skipped);
     }
-    void test_tool_burp_upstream_add_chain(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        ensure_burp_http_fixture(hf, "mcp.burp_upstream_add_chain");
+    void test_tool_burp_upstream_manage_add_chain(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        ensure_burp_http_fixture(hf, "mcp.burp_upstream_manage.add_chain");
         mcp_standalone::json hop = mcp_standalone::json::object({{"type", "http_connect"}, {"host", "127.0.0.1"}, {"port", g_burp_http_fixture ? g_burp_http_fixture->port : 1}});
         mcp_standalone::json args; args["label"] = "aida_mcp_upstream"; args["hops"] = mcp_standalone::json::array({hop});
         mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.burp_upstream_add_chain", get_server(), "burp_upstream_add_chain", args, passed, failed, skipped, true, &result);
+        auto status = test_tool_action_call(hf, "mcp.burp_upstream_manage.add_chain", "burp_upstream_manage", "add_chain", args, passed, failed, skipped, true, &result);
         if (status == mcp_tool_call_status_t::passed)
             json_u64_field(result.data, "id", g_burp_upstream_chain_id);
     }
-    void test_tool_burp_upstream_remove_chain(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_upstream_manage_remove_chain(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["id"] = g_burp_upstream_chain_id;
-        test_tool_call(hf, "mcp.burp_upstream_remove_chain", get_server(), "burp_upstream_remove_chain", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_upstream_manage.remove_chain", "burp_upstream_manage", "remove_chain", args, passed, failed, skipped);
     }
-    void test_tool_burp_upstream_list_chains(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.burp_upstream_list_chains", get_server(), "burp_upstream_list_chains", {}, passed, failed, skipped);
+    void test_tool_burp_upstream_manage_list_chains(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_action_call(hf, "mcp.burp_upstream_manage.list_chains", "burp_upstream_manage", "list_chains", {}, passed, failed, skipped);
     }
-    void test_tool_burp_upstream_set_active(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_upstream_manage_set_active(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["id"] = g_burp_upstream_chain_id;
-        test_tool_call(hf, "mcp.burp_upstream_set_active", get_server(), "burp_upstream_set_active", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_upstream_manage.set_active", "burp_upstream_manage", "set_active", args, passed, failed, skipped);
     }
-    void test_tool_burp_upstream_get_active(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.burp_upstream_get_active", get_server(), "burp_upstream_get_active", {}, passed, failed, skipped);
+    void test_tool_burp_upstream_manage_get_active(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_action_call(hf, "mcp.burp_upstream_manage.get_active", "burp_upstream_manage", "get_active", {}, passed, failed, skipped);
     }
-    void test_tool_burp_upstream_test_chain(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_upstream_manage_test_chain(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["id"] = g_burp_upstream_chain_id; args["target_host"] = "127.0.0.1"; args["target_port"] = g_burp_http_fixture ? g_burp_http_fixture->port : 1;
-        test_tool_call(hf, "mcp.burp_upstream_test_chain", get_server(), "burp_upstream_test_chain", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_upstream_manage.test_chain", "burp_upstream_manage", "test_chain", args, passed, failed, skipped);
     }
     void test_tool_burp_tech_fingerprint(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["url"] = burp_fixture_url(hf, "mcp.burp_tech_fingerprint");
@@ -14825,15 +13983,10 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
 
     void mark_camoufox_reverse_dependency_guarded(HANDLE hf, const char* reason, std::atomic<int>& passed, std::atomic<int>& failed) {
         static const char* dependent_tools[] = {
-            "list_pages", "new_page", "select_page", "close_page",
-            "navigate", "reload", "take_screenshot", "take_snapshot", "click", "type_text",
-            "wait_for", "get_page_info", "reset_browser_state", "evaluate_js", "hook_function",
-            "add_init_script", "inject_hook_preset", "remove_hooks", "get_console_logs",
-            "network_capture", "list_network_requests", "get_network_request", "get_request_initiator",
-            "intercept_request", "scripts", "search_code", "cookies", "get_storage", "export_state",
-            "import_state", "hook_jsvmp_interpreter", "compare_env", "instrumentation",
-            "verify_signer_offline", "trace_property_access", "list_trace_files", "query_trace_file",
-            "analyze_cookie_sources"
+            "browser_lifecycle", "browser_navigation", "browser_interaction", "browser_inspect",
+            "browser_state", "browser_network", "browser_hooks", "browser_instrumentation",
+            "get_console_logs", "scripts", "search_code", "compare_env",
+            "verify_signer_offline", "analyze_cookie_sources"
         };
         for (const char* tool : dependent_tools) {
             record_camoufox_dependency_guard_pass(hf, "mcp.camoufox_reverse_dynamic", tool, reason ? std::string(reason) : std::string(), passed, failed);
@@ -14842,15 +13995,10 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
 
     void mark_camoufox_reverse_bridge_blocked(HANDLE hf, const char* reason, std::atomic<int>& failed) {
         static const char* dependent_tools[] = {
-            "list_pages", "new_page", "select_page", "close_page",
-            "navigate", "reload", "take_screenshot", "take_snapshot", "click", "type_text",
-            "wait_for", "get_page_info", "reset_browser_state", "evaluate_js", "hook_function",
-            "add_init_script", "inject_hook_preset", "remove_hooks", "get_console_logs",
-            "network_capture", "list_network_requests", "get_network_request", "get_request_initiator",
-            "intercept_request", "scripts", "search_code", "cookies", "get_storage", "export_state",
-            "import_state", "hook_jsvmp_interpreter", "compare_env", "instrumentation",
-            "verify_signer_offline", "trace_property_access", "list_trace_files", "query_trace_file",
-            "analyze_cookie_sources"
+            "browser_lifecycle", "browser_navigation", "browser_interaction", "browser_inspect",
+            "browser_state", "browser_network", "browser_hooks", "browser_instrumentation",
+            "get_console_logs", "scripts", "search_code", "compare_env",
+            "verify_signer_offline", "analyze_cookie_sources"
         };
         const std::string reason_s = reason ? std::string(reason) : std::string();
         for (const char* tool : dependent_tools)
@@ -14863,14 +14011,11 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
 
         std::string dependency_reason;
         if (!camoufox_dependencies_ready_for_test(hf, tag, dependency_reason)) {
-            record_camoufox_dependency_guard_pass(hf, tag, "check_environment", dependency_reason, passed, failed);
-            record_camoufox_dependency_guard_pass(hf, tag, "launch_browser", dependency_reason, passed, failed);
+            record_camoufox_dependency_guard_pass(hf, tag, "browser_lifecycle", dependency_reason, passed, failed);
             mark_camoufox_reverse_dependency_guarded(hf, dependency_reason.c_str(), passed, failed);
-            test_tool_call(hf, "mcp.camoufox.close_browser", get_server(), "close_browser", {}, passed, failed, skipped);
+            test_tool_action_call(hf, "mcp.camoufox.browser_lifecycle.close", "browser_lifecycle", "close", {}, passed, failed, skipped);
             return;
         }
-
-        test_tool_call(hf, "mcp.camoufox.check_environment", get_server(), "check_environment", {}, passed, failed, skipped);
 
         mcp_standalone::json launch_args;
         launch_args["headless"] = false;
@@ -14880,35 +14025,35 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         launch_args["window_width"] = 1280;
         launch_args["window_height"] = 900;
         mcp_standalone::tool_result_t launch_result;
-        auto launch_status = test_tool_call(hf, "mcp.camoufox.launch_browser", get_server(), "launch_browser",
+        auto launch_status = test_tool_action_call(hf, "mcp.camoufox.browser_lifecycle.launch", "browser_lifecycle", "launch",
             launch_args, passed, failed, skipped, false, &launch_result);
         if (launch_status != mcp_tool_call_status_t::passed) {
             std::string reason = launch_result.text.empty()
-                ? std::string("launch_browser did not pass after Camoufox dependencies were ready")
-                : std::string("launch_browser did not pass after Camoufox dependencies were ready: ") + launch_result.text;
-            log_msg(hf, tag, "FAIL -- Camoufox reverse dynamic sequence blocked because launch_browser status=%d reason=%s",
+                ? std::string("browser_lifecycle launch did not pass after Camoufox dependencies were ready")
+                : std::string("browser_lifecycle launch did not pass after Camoufox dependencies were ready: ") + launch_result.text;
+            log_msg(hf, tag, "FAIL -- Camoufox reverse dynamic sequence blocked because browser_lifecycle launch status=%d reason=%s",
                 static_cast<int>(launch_status),
                 compact_text(reason, 900).c_str());
             mark_camoufox_reverse_bridge_blocked(hf, reason.c_str(), failed);
-            test_tool_call(hf, "mcp.camoufox.close_browser", get_server(), "close_browser", {}, passed, failed, skipped);
+            test_tool_action_call(hf, "mcp.camoufox.browser_lifecycle.close", "browser_lifecycle", "close", {}, passed, failed, skipped);
             return;
         }
         std::string proof_reason;
-        if (!prove_camoufox_live_bridge(hf, tag, "launch_browser", proof_reason)) {
-            log_msg(hf, tag, "FAIL -- launch_browser returned success but live bridge proof failed: %s",
+        if (!prove_camoufox_live_bridge(hf, tag, "browser_lifecycle", proof_reason)) {
+            log_msg(hf, tag, "FAIL -- browser_lifecycle launch returned success but live bridge proof failed: %s",
                 proof_reason.empty() ? "<empty>" : compact_text(proof_reason, 900).c_str());
-            convert_tool_pass_to_fail("launch_browser");
+            convert_tool_pass_to_fail("browser_lifecycle");
             if (passed.load(std::memory_order_acquire) > 0)
                 passed.fetch_sub(1, std::memory_order_acq_rel);
             failed.fetch_add(1, std::memory_order_acq_rel);
             mark_camoufox_reverse_bridge_blocked(hf, proof_reason.c_str(), failed);
-            test_tool_call(hf, "mcp.camoufox.close_browser", get_server(), "close_browser", {}, passed, failed, skipped);
+            test_tool_action_call(hf, "mcp.camoufox.browser_lifecycle.close", "browser_lifecycle", "close", {}, passed, failed, skipped);
             return;
         }
 
         const std::string fixture_url = burp_fixture_url(hf, tag, "/?q=AIDA_CAMOUFOX_DYNAMIC");
 
-        test_tool_call(hf, "mcp.camoufox.list_pages.initial", get_server(), "list_pages", {}, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.camoufox.browser_lifecycle.list.initial", "browser_lifecycle", "list", {}, passed, failed, skipped);
 
         const std::string page_suffix = std::to_string(static_cast<unsigned long long>(GetTickCount64()));
         const std::string page_a = "aida_testlab_page_a_" + page_suffix;
@@ -14917,24 +14062,24 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         mcp_standalone::json page_a_args;
         page_a_args["page_id"] = page_a;
         page_a_args["make_active"] = true;
-        test_tool_call(hf, "mcp.camoufox.new_page.a", get_server(), "new_page", page_a_args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.camoufox.browser_lifecycle.new.a", "browser_lifecycle", "new", page_a_args, passed, failed, skipped);
 
         mcp_standalone::json page_b_args;
         page_b_args["page_id"] = page_b;
         page_b_args["make_active"] = false;
-        test_tool_call(hf, "mcp.camoufox.new_page.b", get_server(), "new_page", page_b_args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.camoufox.browser_lifecycle.new.b", "browser_lifecycle", "new", page_b_args, passed, failed, skipped);
 
         mcp_standalone::json list_pages_after_create;
         mcp_standalone::tool_result_t list_pages_created_result;
-        auto list_pages_created_status = test_tool_call(hf, "mcp.camoufox.list_pages.created", get_server(), "list_pages",
+        auto list_pages_created_status = test_tool_action_call(hf, "mcp.camoufox.browser_lifecycle.list.created", "browser_lifecycle", "list",
             list_pages_after_create, passed, failed, skipped, false, &list_pages_created_result);
         if (list_pages_created_status == mcp_tool_call_status_t::passed) {
             const bool found_a = json_array_contains_string_field(list_pages_created_result.data, "pages", page_a, {"page_id"});
             const bool found_b = json_array_contains_string_field(list_pages_created_result.data, "pages", page_b, {"page_id"});
             if (!found_a || !found_b) {
-                log_msg(hf, tag, "FAIL -- list_pages did not report both explicit page ids found_a=%d found_b=%d data=%s",
+                log_msg(hf, tag, "FAIL -- browser_lifecycle list did not report both explicit page ids found_a=%d found_b=%d data=%s",
                     found_a ? 1 : 0, found_b ? 1 : 0, compact_json(list_pages_created_result.data, 1200).c_str());
-                record_fixture_failed_tool("list_pages", failed);
+                record_fixture_failed_tool("browser_lifecycle", failed);
             }
         }
 
@@ -14945,7 +14090,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         nav_page_a["collect_response_chain"] = true;
         nav_page_a["clear_network_capture"] = false;
         nav_page_a["include_title"] = true;
-        test_tool_call(hf, "mcp.camoufox.navigate.page_a", get_server(), "navigate", nav_page_a, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.camoufox.browser_navigation.navigate.page_a", "browser_navigation", "navigate", nav_page_a, passed, failed, skipped);
 
         mcp_standalone::json nav_page_b;
         nav_page_b["page_id"] = page_b;
@@ -14954,31 +14099,31 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         nav_page_b["collect_response_chain"] = true;
         nav_page_b["clear_network_capture"] = false;
         nav_page_b["include_title"] = true;
-        test_tool_call(hf, "mcp.camoufox.navigate.page_b", get_server(), "navigate", nav_page_b, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.camoufox.browser_navigation.navigate.page_b", "browser_navigation", "navigate", nav_page_b, passed, failed, skipped);
 
         mcp_standalone::json eval_page_a;
         eval_page_a["page_id"] = page_a;
         eval_page_a["expression"] = "(()=>{document.title='AIDA_PAGE_A';window.__aidaPage='A';return {page:window.__aidaPage,title:document.title,url:location.href};})()";
         eval_page_a["await_promise"] = true;
-        test_tool_call(hf, "mcp.camoufox.evaluate_js.page_a", get_server(), "evaluate_js", eval_page_a, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.camoufox.browser_interaction.evaluate.page_a", "browser_interaction", "evaluate", eval_page_a, passed, failed, skipped);
 
         mcp_standalone::json eval_page_b;
         eval_page_b["page_id"] = page_b;
         eval_page_b["expression"] = "(()=>{document.title='AIDA_PAGE_B';window.__aidaPage='B';return {page:window.__aidaPage,title:document.title,url:location.href};})()";
         eval_page_b["await_promise"] = true;
-        test_tool_call(hf, "mcp.camoufox.evaluate_js.page_b", get_server(), "evaluate_js", eval_page_b, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.camoufox.browser_interaction.evaluate.page_b", "browser_interaction", "evaluate", eval_page_b, passed, failed, skipped);
 
         mcp_standalone::json select_page_a;
         select_page_a["page_id"] = page_a;
-        test_tool_call(hf, "mcp.camoufox.select_page.a", get_server(), "select_page", select_page_a, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.camoufox.browser_lifecycle.select.a", "browser_lifecycle", "select", select_page_a, passed, failed, skipped);
 
         mcp_standalone::json info_page_a;
         info_page_a["page_id"] = page_a;
-        test_tool_call(hf, "mcp.camoufox.get_page_info.page_a", get_server(), "get_page_info", info_page_a, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.camoufox.browser_inspect.info.page_a", "browser_inspect", "info", info_page_a, passed, failed, skipped);
 
         mcp_standalone::json close_page_b;
         close_page_b["page_id"] = page_b;
-        test_tool_call(hf, "mcp.camoufox.close_page.b", get_server(), "close_page", close_page_b, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.camoufox.browser_lifecycle.close_page.b", "browser_lifecycle", "close_page", close_page_b, passed, failed, skipped);
 
         const std::string session_two = "aida_testlab_session_" + page_suffix;
         mcp_standalone::json launch_session_two;
@@ -14989,7 +14134,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         launch_session_two["window_width"] = 960;
         launch_session_two["window_height"] = 700;
         mcp_standalone::tool_result_t launch_session_two_result;
-        auto launch_session_two_status = test_tool_call(hf, "mcp.camoufox.launch_browser.session_two", get_server(), "launch_browser",
+        auto launch_session_two_status = test_tool_action_call(hf, "mcp.camoufox.browser_lifecycle.launch.session_two", "browser_lifecycle", "launch",
             launch_session_two, passed, failed, skipped, false, &launch_session_two_result);
         if (launch_session_two_status == mcp_tool_call_status_t::passed) {
             const std::string page_c = "aida_testlab_page_c_" + page_suffix;
@@ -14997,28 +14142,28 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             page_c_args["session_id"] = session_two;
             page_c_args["page_id"] = page_c;
             page_c_args["make_active"] = true;
-            test_tool_call(hf, "mcp.camoufox.new_page.session_two", get_server(), "new_page", page_c_args, passed, failed, skipped);
+            test_tool_action_call(hf, "mcp.camoufox.browser_lifecycle.new.session_two", "browser_lifecycle", "new", page_c_args, passed, failed, skipped);
 
             mcp_standalone::json nav_page_c;
             nav_page_c["session_id"] = session_two;
             nav_page_c["page_id"] = page_c;
             nav_page_c["url"] = burp_fixture_url(hf, tag, "/?q=AIDA_CAMOUFOX_SESSION_TWO");
             nav_page_c["wait_until"] = "load";
-            test_tool_call(hf, "mcp.camoufox.navigate.session_two", get_server(), "navigate", nav_page_c, passed, failed, skipped);
+            test_tool_action_call(hf, "mcp.camoufox.browser_navigation.navigate.session_two", "browser_navigation", "navigate", nav_page_c, passed, failed, skipped);
 
             mcp_standalone::json eval_page_c;
             eval_page_c["session_id"] = session_two;
             eval_page_c["page_id"] = page_c;
             eval_page_c["expression"] = "(()=>({session:'two',title:document.title,url:location.href}))()";
             eval_page_c["await_promise"] = true;
-            test_tool_call(hf, "mcp.camoufox.evaluate_js.session_two", get_server(), "evaluate_js", eval_page_c, passed, failed, skipped);
+            test_tool_action_call(hf, "mcp.camoufox.browser_interaction.evaluate.session_two", "browser_interaction", "evaluate", eval_page_c, passed, failed, skipped);
 
             mcp_standalone::json close_session_two;
             close_session_two["session_id"] = session_two;
-            test_tool_call(hf, "mcp.camoufox.close_browser.session_two", get_server(), "close_browser", close_session_two, passed, failed, skipped);
+            test_tool_action_call(hf, "mcp.camoufox.browser_lifecycle.close.session_two", "browser_lifecycle", "close", close_session_two, passed, failed, skipped);
         } else {
-            for (const char* tool : {"new_page", "navigate", "evaluate_js"}) {
-                log_msg(hf, "mcp.camoufox_reverse_dynamic", "FAIL -- session_two \"%s\" not executed because launch_browser for second session failed: %s",
+            for (const char* tool : {"browser_lifecycle", "browser_navigation", "browser_interaction"}) {
+                log_msg(hf, "mcp.camoufox_reverse_dynamic", "FAIL -- session_two \"%s\" not executed because browser_lifecycle launch for second session failed: %s",
                     tool, launch_session_two_result.text.c_str());
                 record_fixture_failed_tool(tool, failed);
             }
@@ -15030,23 +14175,25 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         reset_args["clear_active_routes"] = true;
         reset_args["clear_cookies"] = true;
         reset_args["clear_storage"] = true;
-        test_tool_call(hf, "mcp.camoufox.reset_browser_state", get_server(), "reset_browser_state", reset_args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.camoufox.browser_state.reset", "browser_state", "reset", reset_args, passed, failed, skipped);
 
         mcp_standalone::json init_args;
         init_args["name"] = "aida_testlab_init";
         init_args["script"] = "window.aidaInitScriptRan=(window.aidaInitScriptRan||0)+1;";
-        test_tool_call(hf, "mcp.camoufox.add_init_script", get_server(), "add_init_script", init_args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.camoufox.browser_hooks.init_script", "browser_hooks", "init_script", init_args, passed, failed, skipped);
 
         mcp_standalone::json capture_start;
-        capture_start["action"] = "start";
-        capture_start["url_pattern"] = "*";
-        capture_start["capture_body"] = true;
-        test_tool_call(hf, "mcp.camoufox.network_capture_start", get_server(), "network_capture", capture_start, passed, failed, skipped);
+        capture_start["payload"] = mcp_standalone::json::object({
+            {"action", "start"},
+            {"url_pattern", "*"},
+            {"capture_body", true}
+        });
+        test_tool_action_call(hf, "mcp.camoufox.browser_network.capture_start", "browser_network", "capture", capture_start, passed, failed, skipped);
 
         mcp_standalone::json intercept_args;
         intercept_args["url_pattern"] = "**/aida-fixture.js";
-        intercept_args["action"] = "log";
-        test_tool_call(hf, "mcp.camoufox.intercept_request", get_server(), "intercept_request", intercept_args, passed, failed, skipped);
+        intercept_args["payload"] = mcp_standalone::json::object({{"action", "log"}});
+        test_tool_action_call(hf, "mcp.camoufox.browser_network.intercept", "browser_network", "intercept", intercept_args, passed, failed, skipped);
 
         mcp_standalone::json nav_args;
         nav_args["url"] = fixture_url;
@@ -15054,7 +14201,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         nav_args["collect_response_chain"] = true;
         nav_args["clear_network_capture"] = false;
         nav_args["include_title"] = true;
-        test_tool_call(hf, "mcp.camoufox.navigate", get_server(), "navigate", nav_args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.camoufox.browser_navigation.navigate", "browser_navigation", "navigate", nav_args, passed, failed, skipped);
 
         mcp_standalone::json hook_args;
         hook_args["function_path"] = "window.aidaHookTarget";
@@ -15062,45 +14209,45 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         hook_args["log_args"] = true;
         hook_args["log_return"] = true;
         hook_args["max_captures"] = 8;
-        test_tool_call(hf, "mcp.camoufox.hook_function", get_server(), "hook_function", hook_args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.camoufox.browser_hooks.hook", "browser_hooks", "hook", hook_args, passed, failed, skipped);
 
         mcp_standalone::json preset_args;
         preset_args["preset"] = "fetch";
         preset_args["persistent"] = false;
-        test_tool_call(hf, "mcp.camoufox.inject_hook_preset", get_server(), "inject_hook_preset", preset_args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.camoufox.browser_hooks.preset", "browser_hooks", "preset", preset_args, passed, failed, skipped);
 
         mcp_standalone::json eval_args;
         eval_args["expression"] = "(async()=>{console.log('AIDA_CAMOUFOX_CONSOLE');localStorage.setItem('aida_storage','ok');document.cookie='aida_cookie=ok; path=/';let fetch_status=0;try{const r=await fetch('/aida-fixture.js?capture=AIDA_CAMOUFOX_DYNAMIC',{cache:'no-store'});fetch_status=r.status;await r.text();}catch(e){fetch_status=-1;}const hook_value=window.aidaHookTarget?window.aidaHookTarget('x'):'missing';return {hook_value,fetch_status,storage:localStorage.getItem('aida_storage')};})()";
         eval_args["await_promise"] = true;
-        test_tool_call(hf, "mcp.camoufox.evaluate_js", get_server(), "evaluate_js", eval_args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.camoufox.browser_interaction.evaluate", "browser_interaction", "evaluate", eval_args, passed, failed, skipped);
 
         mcp_standalone::json click_args;
         click_args["selector"] = "body";
-        test_tool_call(hf, "mcp.camoufox.click", get_server(), "click", click_args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.camoufox.click", "browser_interaction", "click", click_args, passed, failed, skipped);
 
         mcp_standalone::json type_args;
         type_args["selector"] = "#aida-input";
         type_args["text"] = "camoufox direct test";
         type_args["delay"] = 1;
-        test_tool_call(hf, "mcp.camoufox.type_text", get_server(), "type_text", type_args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.camoufox.browser_interaction.type", "browser_interaction", "type", type_args, passed, failed, skipped);
 
         mcp_standalone::json wait_args;
         wait_args["selector"] = "#aida-input";
         wait_args["timeout"] = 5000;
-        test_tool_call(hf, "mcp.camoufox.wait_for", get_server(), "wait_for", wait_args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.camoufox.browser_navigation.wait", "browser_navigation", "wait", wait_args, passed, failed, skipped);
 
-        test_tool_call(hf, "mcp.camoufox.get_page_info", get_server(), "get_page_info", {}, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.camoufox.browser_inspect.info", "browser_inspect", "info", {}, passed, failed, skipped);
 
-        test_tool_call(hf, "mcp.camoufox.navigate.before_reload", get_server(), "navigate", nav_args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.camoufox.browser_navigation.navigate.before_reload", "browser_navigation", "navigate", nav_args, passed, failed, skipped);
 
         mcp_standalone::json reload_args;
         reload_args["wait_until"] = "load";
-        test_tool_call(hf, "mcp.camoufox.reload", get_server(), "reload", reload_args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.camoufox.browser_navigation.reload", "browser_navigation", "reload", reload_args, passed, failed, skipped);
 
         mcp_standalone::json screenshot_args;
         screenshot_args["full_page"] = false;
-        test_tool_call(hf, "mcp.camoufox.take_screenshot", get_server(), "take_screenshot", screenshot_args, passed, failed, skipped);
-        test_tool_call(hf, "mcp.camoufox.take_snapshot", get_server(), "take_snapshot", {}, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.camoufox.browser_inspect.screenshot", "browser_inspect", "screenshot", screenshot_args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.camoufox.browser_inspect.snapshot", "browser_inspect", "snapshot", {}, passed, failed, skipped);
 
         mcp_standalone::json console_args;
         console_args["keyword"] = "AIDA_CAMOUFOX";
@@ -15110,39 +14257,39 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         mcp_standalone::json list_req_args;
         list_req_args["url_contains_domain"] = "127.0.0.1";
         mcp_standalone::tool_result_t list_req_result;
-        auto list_req_status = test_tool_call(hf, "mcp.camoufox.list_network_requests", get_server(), "list_network_requests",
+        auto list_req_status = test_tool_action_call(hf, "mcp.camoufox.browser_network.list", "browser_network", "list",
             list_req_args, passed, failed, skipped, false, &list_req_result);
         uint64_t request_id = 0;
         bool have_request_id = list_req_status == mcp_tool_call_status_t::passed &&
             first_camoufox_request_id(list_req_result.data, request_id);
         if (!have_request_id) {
-            log_msg(hf, tag, "WARN -- list_network_requests did not expose an id; forcing fixture fetch and retrying capture list");
+            log_msg(hf, tag, "WARN -- browser_network list did not expose an id; forcing fixture fetch and retrying capture list");
             mcp_standalone::json recapture_eval_args;
             recapture_eval_args["expression"] = "(async()=>{const r=await fetch('/aida-fixture.js?capture=AIDA_CAMOUFOX_DYNAMIC_RETRY',{cache:'no-store'});await r.text();return {status:r.status,url:r.url};})()";
             recapture_eval_args["await_promise"] = true;
-            test_tool_call(hf, "mcp.camoufox.evaluate_js.network_capture_retry", get_server(), "evaluate_js", recapture_eval_args, passed, failed, skipped);
+            test_tool_action_call(hf, "mcp.camoufox.browser_interaction.evaluate.network_capture_retry", "browser_interaction", "evaluate", recapture_eval_args, passed, failed, skipped);
             list_req_result = {};
-            list_req_status = test_tool_call(hf, "mcp.camoufox.list_network_requests.retry", get_server(), "list_network_requests",
+            list_req_status = test_tool_action_call(hf, "mcp.camoufox.browser_network.list.retry", "browser_network", "list",
                 list_req_args, passed, failed, skipped, false, &list_req_result);
             have_request_id = list_req_status == mcp_tool_call_status_t::passed &&
                 first_camoufox_request_id(list_req_result.data, request_id);
         }
         if (!have_request_id || request_id == 0) {
-            log_msg(hf, tag, "FAIL -- list_network_requests did not expose a usable request id after deterministic fixture fetch payload=%s",
+            log_msg(hf, tag, "FAIL -- browser_network list did not expose a usable request id after deterministic fixture fetch payload=%s",
                 compact_json(list_req_result.data, 900).c_str());
-            record_fixture_failed_tool("get_network_request", failed);
-            record_fixture_failed_tool("get_request_initiator", failed);
+            record_fixture_failed_tool("browser_network", failed);
+            record_fixture_failed_tool("browser_network", failed);
         } else {
             mcp_standalone::json req_detail_args;
             req_detail_args["request_id"] = request_id;
             req_detail_args["include_body"] = true;
             req_detail_args["include_headers"] = true;
             req_detail_args["max_body_size"] = 4096;
-            test_tool_call(hf, "mcp.camoufox.get_network_request", get_server(), "get_network_request", req_detail_args, passed, failed, skipped);
+            test_tool_action_call(hf, "mcp.camoufox.browser_network.get", "browser_network", "get", req_detail_args, passed, failed, skipped);
 
             mcp_standalone::json req_init_args;
             req_init_args["request_id"] = request_id;
-            test_tool_call(hf, "mcp.camoufox.get_request_initiator", get_server(), "get_request_initiator", req_init_args, passed, failed, skipped);
+            test_tool_action_call(hf, "mcp.camoufox.browser_network.initiator", "browser_network", "initiator", req_init_args, passed, failed, skipped);
         }
 
         mcp_standalone::json scripts_args;
@@ -15156,21 +14303,21 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         test_tool_call(hf, "mcp.camoufox.search_code", get_server(), "search_code", search_args, passed, failed, skipped);
 
         mcp_standalone::json cookies_args;
-        cookies_args["action"] = "get";
         cookies_args["domain"] = "127.0.0.1";
-        test_tool_call(hf, "mcp.camoufox.cookies", get_server(), "cookies", cookies_args, passed, failed, skipped);
+        cookies_args["payload"] = mcp_standalone::json::object({{"action", "get"}});
+        test_tool_action_call(hf, "mcp.camoufox.cookies", "browser_state", "cookies", cookies_args, passed, failed, skipped);
 
         mcp_standalone::json storage_args;
         storage_args["storage_type"] = "local";
-        test_tool_call(hf, "mcp.camoufox.get_storage", get_server(), "get_storage", storage_args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.camoufox.browser_state.storage", "browser_state", "storage", storage_args, passed, failed, skipped);
 
         const std::string state_path = temp_file_narrow("aida_camoufox_state.json");
         mcp_standalone::json export_args;
         export_args["save_path"] = state_path;
-        test_tool_call(hf, "mcp.camoufox.export_state", get_server(), "export_state", export_args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.camoufox.browser_state.export", "browser_state", "export", export_args, passed, failed, skipped);
         mcp_standalone::json import_args;
         import_args["state_path"] = state_path;
-        test_tool_call(hf, "mcp.camoufox.import_state", get_server(), "import_state", import_args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.camoufox.browser_state.import", "browser_state", "import", import_args, passed, failed, skipped);
 
         mcp_standalone::json jsvmp_args;
         jsvmp_args["persistent"] = false;
@@ -15178,15 +14325,15 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         jsvmp_args["track_calls"] = true;
         jsvmp_args["track_props"] = true;
         jsvmp_args["max_entries"] = 32;
-        test_tool_call(hf, "mcp.camoufox.hook_jsvmp_interpreter", get_server(), "hook_jsvmp_interpreter", jsvmp_args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.camoufox.browser_instrumentation.jsvmp", "browser_instrumentation", "jsvmp", jsvmp_args, passed, failed, skipped);
 
         mcp_standalone::json compare_args;
         compare_args["properties"] = mcp_standalone::json::array({"navigator.userAgent", "navigator.webdriver", "screen.width"});
         test_tool_call(hf, "mcp.camoufox.compare_env", get_server(), "compare_env", compare_args, passed, failed, skipped);
 
         mcp_standalone::json instr_args;
-        instr_args["action"] = "status";
-        test_tool_call(hf, "mcp.camoufox.instrumentation", get_server(), "instrumentation", instr_args, passed, failed, skipped);
+        instr_args["payload"] = mcp_standalone::json::object({{"action", "status"}});
+        test_tool_action_call(hf, "mcp.camoufox.browser_instrumentation.manage", "browser_instrumentation", "manage", instr_args, passed, failed, skipped);
 
         mcp_standalone::json signer_args;
         signer_args["signer_code"] = "(sample) => ({aida_value: sample && sample.aida_value ? sample.aida_value : 'signed'})";
@@ -15205,12 +14352,12 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         trace_args["mode"] = "summary";
         trace_args["limit"] = 64;
         trace_args["collect_values"] = false;
-        test_tool_call(hf, "mcp.camoufox.trace_property_access", get_server(), "trace_property_access", trace_args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.camoufox.browser_instrumentation.trace", "browser_instrumentation", "trace", trace_args, passed, failed, skipped);
 
         mcp_standalone::json trace_list_args;
         trace_list_args["limit"] = 5;
         mcp_standalone::tool_result_t trace_list_result;
-        auto trace_list_status = test_tool_call(hf, "mcp.camoufox.list_trace_files", get_server(), "list_trace_files",
+        auto trace_list_status = test_tool_action_call(hf, "mcp.camoufox.browser_instrumentation.list_files", "browser_instrumentation", "list_files",
             trace_list_args, passed, failed, skipped, false, &trace_list_result);
         std::string trace_path;
         if (trace_list_status == mcp_tool_call_status_t::passed)
@@ -15218,27 +14365,27 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         if (trace_path.empty()) {
             trace_path = temp_file_narrow("aida_camoufox_trace_empty.jsonl");
             write_text_file_narrow(trace_path, "{\"object\":\"window\",\"property\":\"navigator\",\"timestamp\":0}\n");
-            log_msg(hf, tag, "WARN -- list_trace_files did not expose a path; using local trace fixture %s", trace_path.c_str());
+            log_msg(hf, tag, "WARN -- browser_instrumentation list_files did not expose a path; using local trace fixture %s", trace_path.c_str());
         }
         mcp_standalone::json trace_query_args;
         trace_query_args["file_path"] = trace_path;
         trace_query_args["mode"] = "summary";
         trace_query_args["limit"] = 16;
-        test_tool_call(hf, "mcp.camoufox.query_trace_file", get_server(), "query_trace_file", trace_query_args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.camoufox.browser_instrumentation.query_file", "browser_instrumentation", "query_file", trace_query_args, passed, failed, skipped);
 
         mcp_standalone::json cookie_source_args;
         cookie_source_args["name_filter"] = "aida_cookie";
         test_tool_call(hf, "mcp.camoufox.analyze_cookie_sources", get_server(), "analyze_cookie_sources", cookie_source_args, passed, failed, skipped);
 
         mcp_standalone::json capture_stop;
-        capture_stop["action"] = "stop";
-        test_tool_call(hf, "mcp.camoufox.network_capture_stop", get_server(), "network_capture", capture_stop, passed, failed, skipped);
+        capture_stop["payload"] = mcp_standalone::json::object({{"action", "stop"}});
+        test_tool_action_call(hf, "mcp.camoufox.browser_network.capture_stop", "browser_network", "capture", capture_stop, passed, failed, skipped);
 
         mcp_standalone::json remove_hooks_args;
         remove_hooks_args["keep_persistent"] = false;
-        test_tool_call(hf, "mcp.camoufox.remove_hooks", get_server(), "remove_hooks", remove_hooks_args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.camoufox.browser_hooks.remove", "browser_hooks", "remove", remove_hooks_args, passed, failed, skipped);
 
-        test_tool_call(hf, "mcp.camoufox.close_browser", get_server(), "close_browser", {}, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.camoufox.browser_lifecycle.close", "browser_lifecycle", "close", {}, passed, failed, skipped);
     }
     uint16_t reserve_mcp_loopback_port(HANDLE hf, const char* tag) {
         if (!ensure_mcp_winsock_ready()) {
@@ -15314,13 +14461,13 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             }
         }
     }
-    void test_tool_burp_collaborator_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.burp_collaborator_status", get_server(), "burp_collaborator_status", {}, passed, failed, skipped);
+    void test_tool_burp_collaborator_manage_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_action_call(hf, "mcp.burp_collaborator_manage.status", "burp_collaborator_manage", "status", {}, passed, failed, skipped);
     }
-    void test_tool_burp_collaborator_start(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_collaborator_manage_start(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args;
         args["bind_ip"] = "127.0.0.1";
-        uint16_t http_port = reserve_mcp_loopback_port(hf, "mcp.burp_collaborator_start");
+        uint16_t http_port = reserve_mcp_loopback_port(hf, "mcp.burp_collaborator_manage.start");
         if (http_port == 0) http_port = 28444;
         args["http_port"] = http_port;
         args["enable_http"] = true;
@@ -15331,46 +14478,46 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         args["public_host"] = "aidacollab.local";
         args["public_ip"] = "127.0.0.1";
         args["canned_body"] = "aida collaborator fixture";
-        test_tool_call(hf, "mcp.burp_collaborator_start", get_server(), "burp_collaborator_start", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_collaborator_manage.start", "burp_collaborator_manage", "start", args, passed, failed, skipped);
     }
-    void test_tool_burp_collaborator_stop(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.burp_collaborator_stop", get_server(), "burp_collaborator_stop", {}, passed, failed, skipped);
+    void test_tool_burp_collaborator_manage_stop(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_action_call(hf, "mcp.burp_collaborator_manage.stop", "burp_collaborator_manage", "stop", {}, passed, failed, skipped);
     }
-    void test_tool_burp_collaborator_generate_token(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_collaborator_manage_generate_token(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.burp_collaborator_generate_token", get_server(), "burp_collaborator_generate_token", {}, passed, failed, skipped, true, &result);
+        auto status = test_tool_action_call(hf, "mcp.burp_collaborator_manage.generate_token", "burp_collaborator_manage", "generate_token", {}, passed, failed, skipped, true, &result);
         if (status == mcp_tool_call_status_t::passed && result.data.is_object() && result.data.contains("token") && result.data["token"].is_string()) {
             g_burp_collaborator_token = result.data["token"].get<std::string>();
             collaborator_http_probe(hf, g_burp_collaborator_token);
         }
     }
-    void test_tool_burp_collaborator_poll(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_collaborator_manage_poll(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args;
         if (!g_burp_collaborator_token.empty())
             args["token"] = g_burp_collaborator_token;
         mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.burp_collaborator_poll", get_server(), "burp_collaborator_poll", args, passed, failed, skipped, true, &result);
+        auto status = test_tool_action_call(hf, "mcp.burp_collaborator_manage.poll", "burp_collaborator_manage", "poll", args, passed, failed, skipped, true, &result);
         if (status == mcp_tool_call_status_t::passed)
             capture_collaborator_interaction_id(result);
     }
-    void test_tool_burp_collaborator_get_interaction(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_collaborator_manage_get_interaction(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         if (g_burp_collaborator_interaction_id == 0 && !g_burp_collaborator_token.empty()) {
             collaborator_http_probe(hf, g_burp_collaborator_token);
             mcp_standalone::json poll_args;
             poll_args["token"] = g_burp_collaborator_token;
             mcp_standalone::tool_result_t poll_result;
-            auto poll_status = test_tool_call(hf, "mcp.burp_collaborator_poll_for_get", get_server(), "burp_collaborator_poll", poll_args, passed, failed, skipped, true, &poll_result);
+            auto poll_status = test_tool_action_call(hf, "mcp.burp_collaborator_manage.poll", "burp_collaborator_manage", "poll", poll_args, passed, failed, skipped, true, &poll_result);
             if (poll_status == mcp_tool_call_status_t::passed)
                 capture_collaborator_interaction_id(poll_result);
         }
         mcp_standalone::json args; args["id"] = g_burp_collaborator_interaction_id;
-        test_tool_call(hf, "mcp.burp_collaborator_get_interaction", get_server(), "burp_collaborator_get_interaction", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_collaborator_manage.get_interaction", "burp_collaborator_manage", "get_interaction", args, passed, failed, skipped);
     }
-    void test_tool_burp_collaborator_clear(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.burp_collaborator_clear", get_server(), "burp_collaborator_clear", {}, passed, failed, skipped);
+    void test_tool_burp_collaborator_manage_clear(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_action_call(hf, "mcp.burp_collaborator_manage.clear", "burp_collaborator_manage", "clear", {}, passed, failed, skipped);
     }
-    void test_tool_burp_collaborator_list_tokens(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.burp_collaborator_list_tokens", get_server(), "burp_collaborator_list_tokens", {}, passed, failed, skipped);
+    void test_tool_burp_collaborator_manage_list_tokens(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_action_call(hf, "mcp.burp_collaborator_manage.list_tokens", "burp_collaborator_manage", "list_tokens", {}, passed, failed, skipped);
     }
     bool wait_for_burp_sequencer_samples(HANDLE hf, const char* tag, uint64_t collection_id, uint64_t target_count) {
         if (collection_id == 0 || target_count == 0)
@@ -15379,7 +14526,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         args["collection_id"] = collection_id;
         const uint64_t deadline = GetTickCount64() + 15000;
         while (GetTickCount64() < deadline) {
-            auto timed = invoke_tool_bounded(get_server(), "burp_sequencer_status", args, tool_timeout_ms("burp_sequencer_status"));
+            auto timed = invoke_tool_action_bounded(get_server(), "burp_sequencer_manage", "status", args, tool_timeout_ms("burp_sequencer_manage"));
             uint64_t collected = 0;
             bool running = false;
             bool error = false;
@@ -15405,72 +14552,72 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         }
         return false;
     }
-    void test_tool_burp_sequencer_start_collection(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_sequencer_manage_start_collection(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const uint64_t target_count = 4;
-        mcp_standalone::json args; args["url"] = burp_fixture_url(hf, "mcp.burp_sequencer_start_collection", "/?q=AIDASEQ1234"); args["extract_regex"] = "(AIDASEQ[0-9]{4})"; args["capture_group"] = 1; args["target_count"] = target_count; args["concurrency"] = 1; args["throttle_ms"] = 1;
+        mcp_standalone::json args; args["url"] = burp_fixture_url(hf, "mcp.burp_sequencer_manage.start_collection", "/?q=AIDASEQ1234"); args["extract_regex"] = "(AIDASEQ[0-9]{4})"; args["capture_group"] = 1; args["target_count"] = target_count; args["concurrency"] = 1; args["throttle_ms"] = 1;
         mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.burp_sequencer_start_collection", get_server(), "burp_sequencer_start_collection", args, passed, failed, skipped, true, &result);
+        auto status = test_tool_action_call(hf, "mcp.burp_sequencer_manage.start_collection", "burp_sequencer_manage", "start_collection", args, passed, failed, skipped, true, &result);
         if (status == mcp_tool_call_status_t::passed) {
             json_u64_field(result.data, "collection_id", g_burp_sequencer_collection_id);
             g_burp_sequencer_target_count = target_count;
-            wait_for_burp_sequencer_samples(hf, "mcp.burp_sequencer_start_collection", g_burp_sequencer_collection_id, g_burp_sequencer_target_count);
+            wait_for_burp_sequencer_samples(hf, "mcp.burp_sequencer_manage.start_collection", g_burp_sequencer_collection_id, g_burp_sequencer_target_count);
         }
     }
-    void test_tool_burp_sequencer_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        wait_for_burp_sequencer_samples(hf, "mcp.burp_sequencer_status", g_burp_sequencer_collection_id, g_burp_sequencer_target_count);
+    void test_tool_burp_sequencer_manage_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        wait_for_burp_sequencer_samples(hf, "mcp.burp_sequencer_manage.status", g_burp_sequencer_collection_id, g_burp_sequencer_target_count);
         mcp_standalone::json args; args["collection_id"] = g_burp_sequencer_collection_id;
-        test_tool_call(hf, "mcp.burp_sequencer_status", get_server(), "burp_sequencer_status", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_sequencer_manage.status", "burp_sequencer_manage", "status", args, passed, failed, skipped);
     }
-    void test_tool_burp_sequencer_stop(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_sequencer_manage_stop(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["collection_id"] = g_burp_sequencer_collection_id;
-        test_tool_call(hf, "mcp.burp_sequencer_stop", get_server(), "burp_sequencer_stop", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_sequencer_manage.stop", "burp_sequencer_manage", "stop", args, passed, failed, skipped);
     }
-    void test_tool_burp_sequencer_samples(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        wait_for_burp_sequencer_samples(hf, "mcp.burp_sequencer_samples", g_burp_sequencer_collection_id, g_burp_sequencer_target_count);
+    void test_tool_burp_sequencer_manage_samples(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        wait_for_burp_sequencer_samples(hf, "mcp.burp_sequencer_manage.samples", g_burp_sequencer_collection_id, g_burp_sequencer_target_count);
         mcp_standalone::json args; args["collection_id"] = g_burp_sequencer_collection_id;
-        test_tool_call(hf, "mcp.burp_sequencer_samples", get_server(), "burp_sequencer_samples", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_sequencer_manage.samples", "burp_sequencer_manage", "samples", args, passed, failed, skipped);
     }
-    void test_tool_burp_sequencer_analyze(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        wait_for_burp_sequencer_samples(hf, "mcp.burp_sequencer_analyze", g_burp_sequencer_collection_id, g_burp_sequencer_target_count);
+    void test_tool_burp_sequencer_manage_analyze(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        wait_for_burp_sequencer_samples(hf, "mcp.burp_sequencer_manage.analyze", g_burp_sequencer_collection_id, g_burp_sequencer_target_count);
         mcp_standalone::json args; args["collection_id"] = g_burp_sequencer_collection_id;
-        test_tool_call(hf, "mcp.burp_sequencer_analyze", get_server(), "burp_sequencer_analyze", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_sequencer_manage.analyze", "burp_sequencer_manage", "analyze", args, passed, failed, skipped);
     }
-    void test_tool_burp_sequencer_list_collections(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.burp_sequencer_list_collections", get_server(), "burp_sequencer_list_collections", {}, passed, failed, skipped);
+    void test_tool_burp_sequencer_manage_list_collections(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_action_call(hf, "mcp.burp_sequencer_manage.list_collections", "burp_sequencer_manage", "list_collections", {}, passed, failed, skipped);
     }
-    void test_tool_burp_sequencer_delete(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_sequencer_manage_delete(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["collection_id"] = g_burp_sequencer_collection_id;
-        test_tool_call(hf, "mcp.burp_sequencer_delete", get_server(), "burp_sequencer_delete", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_sequencer_manage.delete", "burp_sequencer_manage", "delete", args, passed, failed, skipped);
     }
-    void test_tool_burp_comparer_add_slot(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_comparer_manage_add_slot(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["label"] = "aida_mcp_test_a"; args["data_text"] = "test data\nalpha\n";
         mcp_standalone::tool_result_t result_a;
-        auto status_a = test_tool_call(hf, "mcp.burp_comparer_add_slot_a", get_server(), "burp_comparer_add_slot", args, passed, failed, skipped, true, &result_a);
+        auto status_a = test_tool_action_call(hf, "mcp.burp_comparer_manage.add_slot", "burp_comparer_manage", "add_slot", args, passed, failed, skipped, true, &result_a);
         if (status_a == mcp_tool_call_status_t::passed) {
             if (!json_u64_field(result_a.data, "slot_id", g_burp_comparer_slot_a))
                 json_u64_field(result_a.data, "id", g_burp_comparer_slot_a);
         }
         args["label"] = "aida_mcp_test_b"; args["data_text"] = "test data\nbeta\n";
         mcp_standalone::tool_result_t result_b;
-        auto status_b = test_tool_call(hf, "mcp.burp_comparer_add_slot_b", get_server(), "burp_comparer_add_slot", args, passed, failed, skipped, true, &result_b);
+        auto status_b = test_tool_action_call(hf, "mcp.burp_comparer_manage.add_slot", "burp_comparer_manage", "add_slot", args, passed, failed, skipped, true, &result_b);
         if (status_b == mcp_tool_call_status_t::passed) {
             if (!json_u64_field(result_b.data, "slot_id", g_burp_comparer_slot_b))
                 json_u64_field(result_b.data, "id", g_burp_comparer_slot_b);
         }
     }
-    void test_tool_burp_comparer_list_slots(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.burp_comparer_list_slots", get_server(), "burp_comparer_list_slots", {}, passed, failed, skipped);
+    void test_tool_burp_comparer_manage_list_slots(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_action_call(hf, "mcp.burp_comparer_manage.list_slots", "burp_comparer_manage", "list_slots", {}, passed, failed, skipped);
     }
-    void test_tool_burp_comparer_remove_slot(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_comparer_manage_remove_slot(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["slot_id"] = g_burp_comparer_slot_a;
-        test_tool_call(hf, "mcp.burp_comparer_remove_slot", get_server(), "burp_comparer_remove_slot", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_comparer_manage.remove_slot", "burp_comparer_manage", "remove_slot", args, passed, failed, skipped);
     }
-    void test_tool_burp_comparer_clear(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.burp_comparer_clear", get_server(), "burp_comparer_clear", {}, passed, failed, skipped);
+    void test_tool_burp_comparer_manage_clear(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        test_tool_action_call(hf, "mcp.burp_comparer_manage.clear", "burp_comparer_manage", "clear", {}, passed, failed, skipped);
     }
-    void test_tool_burp_comparer_diff(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_comparer_manage_diff(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["slot_a"] = g_burp_comparer_slot_a; args["slot_b"] = g_burp_comparer_slot_b;
-        test_tool_call(hf, "mcp.burp_comparer_diff", get_server(), "burp_comparer_diff", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_comparer_manage.diff", "burp_comparer_manage", "diff", args, passed, failed, skipped);
     }
 
 }
@@ -15495,7 +14642,6 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     g_mcp_debugger_bp_index = -1;
     g_mcp_deferred_action_id = 0;
     g_mcp_emulation_addr = 0;
-    g_mcp_emulate_function_addr = 0;
     g_mcp_fuzz_addr = 0;
     g_mcp_fuzz_input_addr = 0;
     g_mcp_scanner_addr = 0;
@@ -15536,7 +14682,7 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     g_mcp_camoufox_bridge_ready_proven = false;
     g_mcp_camoufox_bridge_generation = 0;
     g_mcp_camoufox_bridge_block_reason.clear();
-    log_msg(hf, "mcp_phase", "target snapshot active_pid=%u target_unavailable=%d attached_pid=%u driver_status=\"%s\" driver_last_error=\"%s\" host_pid=%lu host_tid=%lu",
+    log_msg(hf, "mcp_phase", "target snapshot active_pid=%u target_unavailable=%d attached_pid=%u driver_bridge_status=\"%s\" driver_last_error=\"%s\" host_pid=%lu host_tid=%lu",
         g_mcp_target_pid,
         g_mcp_target_unavailable ? 1 : 0,
         driver_bridge::attached_pid(),
@@ -15555,18 +14701,13 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_mcp_jsonrpc_smoke(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_get_tool_descriptions(hf, passed, failed, skipped);
 
-    if (!cancelled()) test_tool_driver_load(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_status(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_list_processes(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_list_processes_filter(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_enumerate_modules(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_enumerate_threads(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_read_memory(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_read_string(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_query_memory(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_disassemble_address(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_disassemble_zydis(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_disassemble_file(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_detach(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_sandbox_execute(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_convert_number_decimal(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_convert_number_hex(hf, passed, failed, skipped);
@@ -15581,25 +14722,14 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_grep_in_files(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_web_search(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_webfetch(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_attach(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_write_memory(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_dump_module(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_scan_pattern(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_read_pointer_chain(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_enumerate_kernel_modules(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_read_kernel_memory(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_write_kernel_memory(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_allocate_memory(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_free_memory(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_call_function(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_get_thread_context(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_set_thread_context(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_suspend_thread(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_resume_thread(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_protect_memory(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_enumerate_memory_regions(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_read_peb(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_spoof_debug_flags(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_set_hw_breakpoint(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_clear_hw_breakpoint(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_resolve_export(hf, passed, failed, skipped);
@@ -15620,14 +14750,8 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_driver_detect_hidden_modules(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_walk_heap(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_enumerate_handles(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_walk_seh_chain(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_find_code_caves(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_scan_memory_value(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_pointer_scan(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_enumerate_windows(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_walk_stack(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_assemble(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_compare_memory_snapshot(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_find_references(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_read_teb(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_map_peb_modules(hf, passed, failed, skipped);
@@ -15683,39 +14807,22 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_dbg_nop_fill(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_find_code_caves(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_conditional_breakpoint(hf, passed, failed, skipped);
-
-    mcp_tool_call_status_t scan_mem_status = mcp_tool_call_status_t::skipped;
-    if (!cancelled()) scan_mem_status = test_tool_scan_mem_start(hf, passed, failed, skipped);
-    if (!cancelled() && scan_mem_status == mcp_tool_call_status_t::passed) {
-        test_tool_scan_mem_next(hf, passed, failed, skipped);
-        if (!cancelled()) test_tool_scan_mem_results(hf, passed, failed, skipped);
-        if (!cancelled()) test_tool_scan_mem_reset(hf, passed, failed, skipped);
-    } else if (!cancelled()) {
-        log_msg(hf, "mcp.scan_mem_chain", "FAIL -- scan_mem_start did not pass; dependent next/results/reset cannot execute status=%d",
-            static_cast<int>(scan_mem_status));
-        record_fixture_failed_tool("scan_mem_next", failed);
-        record_fixture_failed_tool("scan_mem_results", failed);
-        record_fixture_failed_tool("scan_mem_reset", failed);
-    }
     if (!cancelled()) test_tool_scanner_first_scan(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_scanner_next_scan(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_scanner_get_results(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_scanner_undo(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_scanner_reset(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_scanner_add_address(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_scanner_freeze_address(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_scanner_get_address_list(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_scanner_remove_address(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_scanner_address_list_manage_add(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_scanner_address_list_manage_freeze(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_scanner_address_list_manage_list(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_scanner_address_list_manage_remove(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_scanner_read_value(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_scanner_write_value(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_scanner_pointer_scan(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_scanner_cancel_pointer_scan(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_pointer_scan_start(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_pointer_scan_results(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_scanner_define_struct(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_scanner_add_struct_field(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_scanner_get_struct(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_scanner_export_struct_c(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_scanner_struct_manage_define(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_scanner_struct_manage_add_field(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_scanner_struct_manage_get(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_scanner_struct_manage_export_c(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_find_what_accesses(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_watch_memory_layout(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_assert_memory_type(hf, passed, failed, skipped);
@@ -15723,33 +14830,28 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_generate_aob_signature(hf, passed, failed, skipped);
 
     if (!cancelled()) test_tool_reconstruct_struct(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_start_fuzz(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_stop_fuzz(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_get_fuzz_results(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_fuzzer_manage_start(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_fuzzer_manage_stop(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_fuzzer_manage_results(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_auto_decrypt_strings(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_hunt_integrity_checkers(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_neutralize_integrity_node(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_start_live_monitor(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_stop_live_monitor(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_symbolic_deobfuscate(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_symbolic_slice_function(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_symbolic_solve_path(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_live_monitor_manage_start(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_live_monitor_manage_stop(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_symbolic_execution_deobfuscate(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_symbolic_execution_slice_function(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_symbolic_execution_solve_path(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_taint_trace_register(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_enable_stealth_context(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_disable_stealth_context(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_decompile_function(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_analysis_get_imports(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_analysis_get_exports(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_analysis_get_types(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_analysis_get_type_definition(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_analysis_get_pdb_symbols(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_analysis_get_binary_map_overview(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_analysis_get_xref_db_stats(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_crypto_scanner_run(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_crypto_scanner_get_results(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_analysis_query_imports(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_analysis_query_exports(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_analysis_query_types(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_analysis_query_type_definition(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_analysis_query_pdb_symbols(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_analysis_query_binary_map_overview(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_analysis_query_xref_db_stats(hf, passed, failed, skipped);
 
-    if (!cancelled()) test_tool_sessions_open_file(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_disasm_jump_to_address(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_sessions_manage_open_file(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_disasm_get_instruction(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_disasm_get_function_bounds(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_disasm_get_function_disassembly(hf, passed, failed, skipped);
@@ -15762,18 +14864,12 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_disasm_get_section_info(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_disasm_search_bytes(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_disasm_get_strings(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_ui_set_active_view(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_bookmarks_add(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_bookmarks_remove(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_bookmarks_list(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_hex_view_open(hf, passed, failed, skipped);
 
-    if (!cancelled()) test_tool_sessions_list(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_sessions_get_active(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_sessions_switch(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_sessions_attach_pid(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_sessions_close(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_sessions_run_binary(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_sessions_manage_list(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_sessions_manage_get_active(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_sessions_manage_attach_pid(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_sessions_manage_close(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_sessions_manage_run_binary(hf, passed, failed, skipped);
 
     if (!cancelled()) test_tool_apply_diff(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_apply_patch(hf, passed, failed, skipped);
@@ -15785,30 +14881,28 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_cancel_command(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_list_commands(hf, passed, failed, skipped);
 
-    if (!cancelled()) test_tool_disassemble_zydis(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_snapshot_and_emulate(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_trace_execution_unicorn(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_analyze_vm_handler(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_emulate_multi_trace(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_emulate_function(hf, passed, failed, skipped);
 
     if (!cancelled()) cleanup_mcp_network_state(hf, "before MCP network tools");
     if (!cancelled()) test_tool_api_monitor_start(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_api_monitor_results(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_network_enumerate_connections(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_network_start_capture(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_network_stop_capture(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_network_get_packets(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_network_capture_manage_start(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_network_capture_manage_stop(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_network_capture_manage_get_packets(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_network_analyze_packet(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_network_dns_log(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_network_add_filter(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_network_remove_filter(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_network_clear_filters(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_network_stats(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_network_capture_status(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_network_block_ip(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_network_block_port(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_network_block_process(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_network_filter_manage_add(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_network_filter_manage_remove(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_network_filter_manage_clear(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_network_bandwidth_manage_stats(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_network_capture_manage_status(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_network_firewall_manage_block_ip(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_network_firewall_manage_block_port(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_network_firewall_manage_block_process(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_network_deep_inspect(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_network_follow_tcp_stream(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_network_parse_http(hf, passed, failed, skipped);
@@ -15825,13 +14919,13 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_network_intercept(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_network_get_held_packets(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_network_release_packet(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_network_kill_connection(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_network_firewall_manage_kill_connection(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_network_spoof_dns(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_network_list_dns_spoof_rules(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_network_bandwidth_monitor(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_network_bandwidth_per_process(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_network_bandwidth_manage_monitor(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_network_bandwidth_manage_per_process(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_network_os_fingerprint(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_network_export_pcap(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_network_capture_manage_export_pcap(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_network_decode_data(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_network_list_transforms(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_network_script_load(hf, passed, failed, skipped);
@@ -15848,101 +14942,91 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_network_pre_encrypt_hook(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_network_display_filter(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_network_protobuf_decode(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_network_fuzzer(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_network_websocket(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_network_proxy(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_network_repeater(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_mitm_status(hf, passed, failed, skipped);
     if (!cancelled()) cleanup_mcp_network_state(hf, "after MCP network tools");
 
-    if (!cancelled()) test_tool_tls_extract_keys(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_tls_start_keylog(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_tls_stop_keylog(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_tls_get_extracted_keys(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_cert_inject(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_cert_remove(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_tls_manage_extract_keys(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_tls_manage_start_keylog(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_tls_manage_stop_keylog(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_tls_manage_get_extracted_keys(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_cert_manage_inject(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_cert_manage_remove(hf, passed, failed, skipped);
     if (!cancelled()) cleanup_mcp_cert_fixture(hf, "mcp.cert_cleanup");
-    if (!cancelled()) test_tool_cert_generate_ca(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_cert_list(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_cert_manage_generate_ca(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_cert_manage_list(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_pin_bypass(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_pin_bypass_revert(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_pin_bypass_status(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_firefox_profile_status(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_firefox_profile_prepare(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_firefox_profile_launch(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_quic_detect_connections(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_quic_decrypt_initial(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_quic_extract_keys(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_dtls_detect_sessions(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_dtls_extract_keys(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_autoresponder_add_rule(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_autoresponder_list_rules(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_autoresponder_start(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_autoresponder_stop(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_autoresponder_remove_rule(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_autoresponder_import_rules(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_autoresponder_export_rules(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_quic_manage_detect_connections(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_quic_manage_decrypt_initial(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_quic_manage_extract_keys(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_dtls_manage_detect_sessions(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_dtls_manage_extract_keys(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_autoresponder_manage_add_rule(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_autoresponder_manage_list_rules(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_autoresponder_manage_start(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_autoresponder_manage_stop(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_autoresponder_manage_remove_rule(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_autoresponder_manage_import_rules(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_autoresponder_manage_export_rules(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_network_decrypt_capture(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_tls_ensure_keylogfile(hf, passed, failed, skipped);
 
-    if (!cancelled()) test_tool_burp_scanner_start_audit(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_scanner_audit_status(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_scanner_list_audits(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_scanner_cancel(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_scanner_list_issues(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_scanner_get_issue(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_scanner_manage_start_audit(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_scanner_manage_audit_status(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_scanner_manage_list_audits(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_scanner_manage_cancel(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_scanner_manage_list_issues(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_scanner_manage_get_issue(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_scanner_passive_status(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_scanner_list_modules(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_scanner_clear_issues(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_scanner_manage_clear_issues(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_scanner_passive_enable(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_sitemap_list_hosts(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_sitemap_list_paths(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_sitemap_get_exchange(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_sitemap_send_to(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_scope_add(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_scope_remove(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_scope_list(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_scope_check(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_cookie_list(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_cookie_set(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_cookie_delete(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_cookie_export_netscape(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_scope_manage_add(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_scope_manage_remove(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_scope_manage_list(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_scope_manage_check(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_cookie_manage_list(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_cookie_manage_set(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_cookie_manage_delete(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_cookie_manage_export_netscape(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_dom_xss_status(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_dom_xss_test_payload(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_dom_xss_scan(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_crawler_start(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_crawler_status(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_crawler_stop(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_crawler_list(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_content_discovery_start(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_content_discovery_status(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_content_discovery_results(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_content_discovery_stop(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_subdomain_enum_start(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_subdomain_enum_status(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_subdomain_enum_results(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_crawler_manage_start(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_crawler_manage_status(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_crawler_manage_stop(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_crawler_manage_list(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_content_discovery_manage_start(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_content_discovery_manage_status(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_content_discovery_manage_results(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_content_discovery_manage_stop(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_subdomain_enum_manage_start(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_subdomain_enum_manage_status(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_subdomain_enum_manage_results(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_payloads_list(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_payloads_get(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_payloads_search(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_payloads_add_custom(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_intruder_start(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_intruder_status(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_intruder_results(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_intruder_stop(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_intruder_list_jobs(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_intruder_clear(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_param_miner_start(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_param_miner_status(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_param_miner_results(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_param_miner_stop(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_intruder_manage_start(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_intruder_manage_status(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_intruder_manage_results(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_intruder_manage_stop(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_intruder_manage_list_jobs(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_intruder_manage_clear(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_param_miner_manage_start(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_param_miner_manage_status(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_param_miner_manage_results(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_param_miner_manage_stop(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_h2_send(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_jwt_decode(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_jwt_forge(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_jwt_verify(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_jwt_crack_start(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_jwt_crack_status(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_jwt_crack_stop(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_jwt_attack(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_jwt_manage_decode(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_jwt_manage_forge(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_jwt_manage_verify(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_jwt_manage_crack_start(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_jwt_manage_crack_status(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_jwt_manage_crack_stop(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_jwt_manage_attack(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_auth_basic_encode(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_auth_basic_decode(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_auth_digest_solve(hf, passed, failed, skipped);
@@ -15955,77 +15039,77 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_burp_auth_oauth2_refresh(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_auth_saml_decode_request(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_auth_saml_decode_response(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_match_replace_add(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_match_replace_update(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_match_replace_list(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_match_replace_test(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_match_replace_remove(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_match_replace_clear(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_macro_add(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_macro_run(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_macro_list(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_macro_update(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_session_rule_add(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_session_rule_list(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_session_rule_remove(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_macro_remove(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_api_import(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_api_list_collections(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_api_get_collection(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_api_send_request(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_api_audit_collection(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_api_remove_collection(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_graphql_introspect(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_graphql_example(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_graphql_send(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_ws_connect(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_ws_send_text(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_ws_send_binary(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_ws_send_raw(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_ws_list_connections(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_ws_frames(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_ws_clear_frames(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_ws_disconnect(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_logger_query(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_logger_total(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_logger_clear(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_logger_export_csv(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_match_replace_manage_add(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_match_replace_manage_update(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_match_replace_manage_list(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_match_replace_manage_test(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_match_replace_manage_remove(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_match_replace_manage_clear(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_macro_manage_add(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_macro_manage_run(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_macro_manage_list(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_macro_manage_update(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_session_rule_manage_add(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_session_rule_manage_list(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_session_rule_manage_remove(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_macro_manage_remove(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_api_manage_import(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_api_manage_list_collections(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_api_manage_get_collection(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_api_manage_send_request(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_api_manage_audit_collection(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_api_manage_remove_collection(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_graphql_manage_introspect(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_graphql_manage_example(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_graphql_manage_send(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_ws_manage_connect(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_ws_manage_send_text(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_ws_manage_send_binary(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_ws_manage_send_raw(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_ws_manage_list_connections(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_ws_manage_frames(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_ws_manage_clear_frames(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_ws_manage_disconnect(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_logger_manage_query(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_logger_manage_total(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_logger_manage_clear(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_logger_manage_export_csv(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_report_generate(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_bambda_compile(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_bambda_test(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_bambda_help(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_csp_analyze(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_csp_analyze_url(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_upstream_add_chain(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_upstream_list_chains(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_upstream_set_active(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_upstream_get_active(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_upstream_test_chain(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_upstream_remove_chain(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_upstream_manage_add_chain(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_upstream_manage_list_chains(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_upstream_manage_set_active(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_upstream_manage_get_active(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_upstream_manage_test_chain(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_upstream_manage_remove_chain(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_tech_fingerprint(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_tech_inventory(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_tech_clear(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_camoufox_reverse_dynamic_tools(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_collaborator_status(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_collaborator_start(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_collaborator_generate_token(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_collaborator_poll(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_collaborator_get_interaction(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_collaborator_list_tokens(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_collaborator_clear(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_collaborator_stop(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_sequencer_start_collection(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_sequencer_status(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_sequencer_samples(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_sequencer_analyze(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_sequencer_list_collections(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_sequencer_stop(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_sequencer_delete(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_comparer_add_slot(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_comparer_list_slots(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_comparer_diff(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_comparer_remove_slot(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_comparer_clear(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_collaborator_manage_status(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_collaborator_manage_start(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_collaborator_manage_generate_token(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_collaborator_manage_poll(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_collaborator_manage_get_interaction(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_collaborator_manage_list_tokens(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_collaborator_manage_clear(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_collaborator_manage_stop(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_sequencer_manage_start_collection(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_sequencer_manage_status(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_sequencer_manage_samples(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_sequencer_manage_analyze(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_sequencer_manage_list_collections(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_sequencer_manage_stop(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_sequencer_manage_delete(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_comparer_manage_add_slot(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_comparer_manage_list_slots(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_comparer_manage_diff(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_comparer_manage_remove_slot(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_comparer_manage_clear(hf, passed, failed, skipped);
     if (!cancelled()) {
         set_progress_step("mcp finalization: network cleanup before coverage audit");
         cleanup_mcp_network_state(hf, "before MCP coverage audit");
@@ -16051,7 +15135,7 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     wait_timed_out_invocation_drain(hf, "after coverage audit", 5000);
 
     set_progress_step("mcp finalization: fixture cleanup");
-    log_msg(hf, "mcp.cleanup", "final_cleanup_begin driver_hw_tid=%u driver_hw_addr=0x%016llX dbg_hw_addr=0x%016llX dbg_sw_addr=0x%016llX patch_addr=0x%016llX integrity_addr=0x%016llX emu_addr=0x%016llX emulate_func_addr=0x%016llX fuzz_addr=0x%016llX fuzz_input_addr=0x%016llX scanner_pointer_addr=0x%016llX scanner_addr=0x%016llX fixture_active=%d",
+    log_msg(hf, "mcp.cleanup", "final_cleanup_begin driver_hw_tid=%u driver_hw_addr=0x%016llX dbg_hw_addr=0x%016llX dbg_sw_addr=0x%016llX patch_addr=0x%016llX integrity_addr=0x%016llX emu_addr=0x%016llX fuzz_addr=0x%016llX fuzz_input_addr=0x%016llX scanner_pointer_addr=0x%016llX scanner_addr=0x%016llX fixture_active=%d",
         g_mcp_driver_hw_tid,
         static_cast<unsigned long long>(g_mcp_driver_hw_addr),
         static_cast<unsigned long long>(g_mcp_dbg_hw_addr),
@@ -16059,7 +15143,6 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
         static_cast<unsigned long long>(g_mcp_patch_addr),
         static_cast<unsigned long long>(g_mcp_integrity_addr),
         static_cast<unsigned long long>(g_mcp_emulation_addr),
-        static_cast<unsigned long long>(g_mcp_emulate_function_addr),
         static_cast<unsigned long long>(g_mcp_fuzz_addr),
         static_cast<unsigned long long>(g_mcp_fuzz_input_addr),
         static_cast<unsigned long long>(g_mcp_scanner_pointer_addr),
@@ -16130,7 +15213,6 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     release_remote_addr("free_patch_addr", g_mcp_patch_addr);
     release_remote_addr("free_integrity_addr", g_mcp_integrity_addr);
     release_remote_addr("free_emulation_addr", g_mcp_emulation_addr);
-    release_remote_addr("free_emulate_function_addr", g_mcp_emulate_function_addr);
     if (fuzzer_engine::g_state.running.load() || fuzzer_engine::g_state.worker_active.load()) {
         log_msg(hf, "mcp.cleanup", "waiting for fuzzer idle running=%d worker=%d setup_complete=%d setup_success=%d",
             fuzzer_engine::g_state.running.load() ? 1 : 0,

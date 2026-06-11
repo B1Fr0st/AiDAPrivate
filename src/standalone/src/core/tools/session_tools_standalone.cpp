@@ -226,56 +226,6 @@ static tool_result_t sessions_get_active(const json& params)
 	return tool_result_t::ok(root);
 }
 
-static tool_result_t sessions_switch(const json& params)
-{
-	diag::log_tagged_fmt("sess_tools", "sessions_switch entry id='%s'",
-		params.contains("binary_id") && params["binary_id"].is_string()
-			? params["binary_id"].get<std::string>().c_str() : "");
-	if (!params.contains("binary_id") || !params["binary_id"].is_string()) {
-		return tool_result_t::error("binary_id (string) is required");
-	}
-	std::string id = params["binary_id"].get<std::string>();
-	size_t idx = 0;
-	if (!analysis_session::find_session_by_id(id, &idx)) {
-		diag::log_tagged_fmt("sess_tools",
-			"sessions_switch id='%s' not_found", id.c_str());
-		return tool_result_t::error("binary_id not found: " + id);
-	}
-	const size_t active = analysis_session::active_session_idx();
-	diag::log_tagged_fmt("sess_tools",
-		"sessions_switch resolved id='%s' idx=%llu active=%llu phase=%s",
-		id.c_str(),
-		static_cast<unsigned long long>(idx),
-		static_cast<unsigned long long>(active),
-		loading_binary_overlay::current_phase_name());
-	if (idx == active) {
-		auto sum = analysis_session::summarize_session_at(idx);
-		json root;
-		root["switched_to"] = summary_to_json(sum);
-		root["already_active"] = true;
-		diag::log_tagged_fmt("sess_tools",
-			"sessions_switch id='%s' already_active idx=%llu",
-			id.c_str(), static_cast<unsigned long long>(idx));
-		return tool_result_t::ok(root);
-	}
-	if (!wait_for_binary_load_quiescent(30000)) {
-		return tool_result_t::error("switch failed: load timeout");
-	}
-	if (!analysis_session::switch_session(idx)) {
-		std::string err = analysis_session::last_error();
-		diag::log_tagged_fmt("sess_tools",
-			"sessions_switch id='%s' switch_failed err='%s'", id.c_str(), err.c_str());
-		return tool_result_t::error(std::string("switch failed: ") + err);
-	}
-	auto sum = analysis_session::summarize_session_at(idx);
-	json root;
-	root["switched_to"] = summary_to_json(sum);
-	diag::log_tagged_fmt("sess_tools",
-		"sessions_switch id='%s' switched_idx=%llu",
-		id.c_str(), static_cast<unsigned long long>(idx));
-	return tool_result_t::ok(root);
-}
-
 static tool_result_t sessions_open_file(const json& params)
 {
 	diag::log_tagged_fmt("sess_tools", "sessions_open_file entry path='%.120s'",
@@ -597,58 +547,14 @@ void register_session_tools(mcp_standalone::server_t& srv)
 {
 	diag::log_tagged_fmt("sess_tools", "register_session_tools entry");
 	srv.register_tool({
-		"sessions_list",
-		"List all open analysis sessions (static files and live process attaches). Returns each session's id, kind (file|live), path, pid, process name, is_active, is_alive, and last_active_steady_ms. Use the returned id as `binary_id` on any other tool call to target that session.",
-		{},
-		true,
-		&sessions_list
-	});
-
-	srv.register_tool({
-		"sessions_get_active",
-		"Return the currently active session, or null if none are open.",
-		{},
-		true,
-		&sessions_get_active
-	});
-
-	srv.register_tool({
-		"sessions_switch",
-		"Switch the active analysis session by id. Required for swapping which binary the UI shows. Other tools auto-route via the `binary_id` parameter without changing the active session.",
-		{{"binary_id", "string", "Session id returned by sessions_list", true}},
-		false,
-		&sessions_switch
-	});
-
-	srv.register_tool({
-		"sessions_open_file",
-		"Open a static PE/ELF/Mach-O file as a new session. Returns the new session id.",
-		{{"path", "string", "Absolute path to the binary file", true}},
-		false,
-		&sessions_open_file
-	});
-
-	srv.register_tool({
-		"sessions_attach_pid",
-		"Attach the kernel driver to a running process and open it as a new live session. Returns the new session id.",
-		{{"pid", "number", "Target process id", true}},
-		false,
-		&sessions_attach_pid
-	});
-
-	srv.register_tool({
-		"sessions_close",
-		"Close a session by id. Detaches the driver if it's a live session.",
-		{{"binary_id", "string", "Session id returned by sessions_list", true}},
-		false,
-		&sessions_close
-	});
-
-	srv.register_tool({
-		"sessions_run_binary",
-		"Launch a binary inside an interactive Windows Sandbox VM. Host execution and host driver attach are disabled for malware safety.",
+		"sessions_manage",
+		"Manage static file, live process, and sandbox sessions. Actions: list, get_active, open_file, attach_pid, close, run_binary.",
 		{
-			{"path", "string", "Absolute path to the binary to launch", true},
+			{"action", "string", "list|get_active|open_file|attach_pid|close|run_binary", true},
+			{"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted.", false},
+			{"binary_id", "string", "Session id returned by sessions_manage action=list", false},
+			{"path", "string", "Absolute path to the binary to open or launch", false},
+			{"pid", "number", "Target process id for attach_pid", false},
 			{"args", "string", "Command-line arguments (optional)", false},
 			{"working_dir", "string", "Ignored for Windows Sandbox runs; the sample starts from the VM input folder", false},
 			{"isolation", "string", "Isolation level: windows_sandbox", false},
@@ -659,7 +565,26 @@ void register_session_tools(mcp_standalone::server_t& srv)
 			{"auto_terminate_sec", "number", "Kill the target after this many seconds (0 = never)", false}
 		},
 		false,
-		&sessions_run_binary
+		[](const json& params) -> tool_result_t {
+			const std::string action = params.contains("action") && params["action"].is_string()
+				? params["action"].get<std::string>()
+				: (params.contains("operation") && params["operation"].is_string() ? params["operation"].get<std::string>() : std::string());
+			json p = params.is_object() ? params : json::object();
+			if (params.contains("payload") && params["payload"].is_object()) {
+				for (auto it = params["payload"].begin(); it != params["payload"].end(); ++it)
+					p[it.key()] = it.value();
+			}
+			p.erase("action");
+			p.erase("operation");
+			p.erase("payload");
+			if (action == "list") return sessions_list(p);
+			if (action == "get_active") return sessions_get_active(p);
+			if (action == "open_file") return sessions_open_file(p);
+			if (action == "attach_pid") return sessions_attach_pid(p);
+			if (action == "close") return sessions_close(p);
+			if (action == "run_binary") return sessions_run_binary(p);
+			return tool_result_t::error("sessions_manage unknown action: " + action);
+		}
 	});
 }
 

@@ -164,6 +164,35 @@ inline void register_compat(mcp_standalone::server_t& srv,
     });
 }
 
+inline std::string compat_action_name(const nlohmann::json& params)
+{
+    if (params.contains("action") && params["action"].is_string())
+        return params["action"].get<std::string>();
+    if (params.contains("operation") && params["operation"].is_string())
+        return params["operation"].get<std::string>();
+    return {};
+}
+
+inline nlohmann::json compat_action_payload(const nlohmann::json& params)
+{
+    nlohmann::json out = params.is_object() ? params : nlohmann::json::object();
+    if (params.contains("payload") && params["payload"].is_object()) {
+        for (auto it = params["payload"].begin(); it != params["payload"].end(); ++it)
+            out[it.key()] = it.value();
+    }
+    out.erase("action");
+    out.erase("operation");
+    out.erase("payload");
+    return out;
+}
+
+inline mcp_standalone::tool_result_t compat_unknown_action(const char* tool_name,
+                                                           const std::string& action)
+{
+    return mcp_standalone::tool_result_t::error(
+        std::string(tool_name) + " unknown action: " + action);
+}
+
 
 inline std::string get_downloads_folder()
 {

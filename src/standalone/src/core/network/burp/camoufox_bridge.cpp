@@ -2640,7 +2640,7 @@ call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::j
             fail.error = sg().last_error;
             if (fail.error.empty())
                 fail.error = old_state == bridge_state_t::stopped
-                    ? "camoufox bridge is not running; call launch_browser before browser navigation or instrumentation"
+                    ? "camoufox bridge is not running; use browser_lifecycle action=launch before browser navigation or instrumentation"
                     : "camoufox bridge not ready";
             diag::log_tagged_fmt("camoufox", "call_with_deadline phase=recovery_failed request_id=%llu tool=%s state=%d client=%d err_len=%zu args_shape=%s",
                 static_cast<unsigned long long>(request_id), tool_name.c_str(), static_cast<int>(sg().state), static_cast<int>(sg().client != nullptr),

@@ -226,75 +226,24 @@ tool_result_t handle_list_tokens(const json&)
 void register_collaborator_tools(mcp_standalone::server_t& srv)
 {
     register_compat(srv, {
-        "burp_collaborator_status", "burp",
-        "Get the current state of the Burp-style out-of-band Collaborator server: "
-        "running flag, HTTP/DNS/SMTP listener health, ports, public host/IP, interaction count, token count.",
-        {},
-        handle_status, true
-    });
-
-    register_compat(srv, {
-        "burp_collaborator_start", "burp",
-        "Start the out-of-band Collaborator server. Listens on HTTP (default 8444), DNS (UDP, default 5353), and SMTP (default 2525). "
-        "Every inbound HTTP request, DNS query, or SMTP envelope is captured and timestamped, with the embedded token "
-        "extracted from the subdomain/path. Use this to detect blind injection (SSRF, XXE, RCE, SQLi out-of-band).",
-        {{"bind_ip",      "string",  "Interface to bind (default '0.0.0.0')", false},
-         {"http_port",    "number",  "HTTP listener port (default 8444)", false},
-         {"dns_port",     "number",  "DNS UDP port (default 5353)", false},
-         {"smtp_port",    "number",  "SMTP TCP port (default 2525)", false},
-         {"public_host",  "string",  "Public hostname victims will resolve (default 'aidacollab.local')", false},
-         {"public_ip",    "string",  "Public IPv4 the DNS server returns as A record (default '127.0.0.1')", false},
-         {"enable_http",  "boolean", "Enable HTTP listener (default true)", false},
-         {"enable_dns",   "boolean", "Enable DNS listener (default true)", false},
-         {"enable_smtp",  "boolean", "Enable SMTP listener (default true)", false},
-         {"canned_body",  "string",  "Optional response body returned for every HTTP hit", false},
-         {"canned_content_type", "string", "Content-Type for canned body (default 'text/plain')", false}},
-        handle_start, false
-    });
-
-    register_compat(srv, {
-        "burp_collaborator_stop", "burp",
-        "Stop the Collaborator server and tear down all three listener sockets. Interactions captured prior to stop are kept.",
-        {},
-        handle_stop, false
-    });
-
-    register_compat(srv, {
-        "burp_collaborator_generate_token", "burp",
-        "Generate a fresh 16-letter lowercase token and bind it to the configured public host. "
-        "Returns the bare token and the full callback domain (e.g. 'abcdefghijklmnop.aidacollab.local'). "
-        "Inject this domain into target inputs to detect out-of-band callbacks.",
-        {},
-        handle_generate_token, false
-    });
-
-    register_compat(srv, {
-        "burp_collaborator_poll", "burp",
-        "Poll captured interactions. Filter by exact token, or by timestamp (interactions with timestamp_ms >= since_ms).",
-        {{"since_ms", "number", "Inclusive lower bound on interaction timestamp (ms)", false},
-         {"token",    "string", "Exact token to filter by", false}},
-        handle_poll, true
-    });
-
-    register_compat(srv, {
-        "burp_collaborator_get_interaction", "burp",
-        "Retrieve a single interaction record by its numeric id (raw request, decoded details, client ip, token).",
-        {{"id", "number", "Numeric interaction id", true}},
-        handle_get_interaction, true
-    });
-
-    register_compat(srv, {
-        "burp_collaborator_clear", "burp",
-        "Clear the captured interaction history. Issued tokens are retained but their counters reset.",
-        {},
-        handle_clear, false
-    });
-
-    register_compat(srv, {
-        "burp_collaborator_list_tokens", "burp",
-        "Enumerate all tokens that have been issued by the Collaborator with per-token interaction counters and last-seen timestamps.",
-        {},
-        handle_list_tokens, true
+        "burp_collaborator_manage", "burp",
+        "Manage the Burp-style out-of-band Collaborator server. Actions: status, start, stop, generate_token, poll, get_interaction, clear, list_tokens.",
+        {{"action", "string", "status|start|stop|generate_token|poll|get_interaction|clear|list_tokens", true},
+         {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted.", false}},
+        [](const json& params) -> tool_result_t {
+            const std::string action = compat_action_name(params);
+            const json p = compat_action_payload(params);
+            if (action == "status") return handle_status(p);
+            if (action == "start") return handle_start(p);
+            if (action == "stop") return handle_stop(p);
+            if (action == "generate_token") return handle_generate_token(p);
+            if (action == "poll") return handle_poll(p);
+            if (action == "get_interaction") return handle_get_interaction(p);
+            if (action == "clear") return handle_clear(p);
+            if (action == "list_tokens") return handle_list_tokens(p);
+            return compat_unknown_action("burp_collaborator_manage", action);
+        },
+        false
     });
 }
 

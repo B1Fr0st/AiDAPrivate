@@ -378,21 +378,7 @@ namespace
         s_last_web_error_ref() = text;
     }
 
-    tool_result_t handle_driver_status(const json&)
-    {
-        diag::log_tagged_fmt("mcp_tools", "handle_driver_status entry");
-        json out;
-        out["ready"] = driver_bridge::is_loaded();
-        out["kernel_backend"] = driver_bridge::using_kernel_driver();
-        out["attached_pid"] = driver_bridge::attached_pid();
-        out["attached_process"] = driver_bridge::attached_process_name();
-        out["status"] = driver_bridge::status();
-        if (!driver_bridge::last_error().empty())
-            out["last_error"] = driver_bridge::last_error();
-        return tool_result_t::ok(driver_bridge::status(), out);
-    }
-
-    tool_result_t handle_vm_bridge_attach(const json& params)
+tool_result_t handle_vm_bridge_attach(const json& params)
     {
         diag::log_tagged_fmt("mcp_tools", "handle_vm_bridge_attach entry");
         return vm_bridge_call("attach", params, "Attached to VM process.");
@@ -440,13 +426,6 @@ namespace
         return vm_bridge_call("threads", params, "Enumerated VM threads.");
     }
 
-    tool_result_t handle_driver_load(const json&)
-    {
-        diag::log_tagged_fmt("mcp_tools", "handle_driver_load entry");
-        if (!driver_bridge::load_kernel_driver())
-            return error(driver_bridge::last_error().empty() ? "Failed to load kernel driver." : driver_bridge::last_error());
-        return handle_driver_status({});
-    }
 
     tool_result_t handle_list_processes(const json& params)
     {
@@ -463,62 +442,116 @@ namespace
         return tool_result_t::ok("Enumerated processes", json{{"processes", items}});
     }
 
-    tool_result_t handle_driver_attach(const json& params)
-    {
-        diag::log_tagged_fmt("mcp_tools", "handle_driver_attach entry");
-        if (wants_vm_target(params))
-            return handle_vm_bridge_attach(params);
-        if (params.contains("pid") && params["pid"].is_number_integer()) {
-            uint32_t pid = params["pid"].get<uint32_t>();
-            if (pid == static_cast<uint32_t>(GetCurrentProcessId()))
-                return error("Cannot attach to AiDA's own process.");
-            const uint32_t previous_pid = driver_bridge::attached_pid();
-            if (previous_pid != 0 && previous_pid != pid)
-                stealth_engine::disable_for_detach(previous_pid, "mcp.driver_attach.pid.replace");
-            if (driver_bridge::attach(pid)) {
-                (void)stealth_engine::ensure_default_enabled(pid, "mcp.driver_attach.pid");
-                return handle_driver_status({});
-            }
-            if (previous_pid != 0 && driver_bridge::attached_pid() == previous_pid)
-                (void)stealth_engine::ensure_default_enabled(previous_pid, "mcp.driver_attach.pid.restore_failed_switch");
-            return error(driver_bridge::last_error());
-        }
-        if (params.contains("process") && params["process"].is_string()) {
-            std::string name = params["process"].get<std::string>();
-            std::string lower = to_lower(name);
-            if (lower.find("aidastan") != std::string::npos
-                || lower.find("aida_stan") != std::string::npos
-                || lower == "aida.exe")
-                return error("Cannot attach to AiDA's own process.");
-            const uint32_t previous_pid = driver_bridge::attached_pid();
-            if (previous_pid != 0)
-                stealth_engine::disable_for_detach(previous_pid, "mcp.driver_attach.name.replace");
-            if (driver_bridge::attach_by_name(name)) {
-                (void)stealth_engine::ensure_default_enabled(driver_bridge::attached_pid(), "mcp.driver_attach.name");
-                return handle_driver_status({});
-            }
-            if (previous_pid != 0 && driver_bridge::attached_pid() == previous_pid)
-                (void)stealth_engine::ensure_default_enabled(previous_pid, "mcp.driver_attach.name.restore_failed_switch");
-            return error(driver_bridge::last_error());
-        }
-        return error("Provide either a numeric pid or a process name.");
-    }
-
-    tool_result_t handle_driver_detach(const json& params)
-    {
-        diag::log_tagged_fmt("mcp_tools", "handle_driver_detach entry");
-        if (wants_vm_target(params))
-            return handle_vm_bridge_detach(params);
-        stealth_engine::disable_for_detach(driver_bridge::attached_pid(), "mcp.driver_detach");
-        driver_bridge::detach();
-        return tool_result_t::ok("Detached from the live process.");
-    }
-
-    tool_result_t ensure_attached()
+tool_result_t ensure_attached()
     {
         if (driver_bridge::attached_pid() == 0)
-            return error("No process is attached. Call driver_attach first.");
+            return error("No process is attached. Use sessions_manage action=attach_pid first.");
         return tool_result_t::ok("");
+    }
+
+    size_t typed_read_size(const std::string& value_type, size_t requested)
+    {
+        const std::string type = to_lower(value_type);
+        if (requested != 0)
+            return requested;
+        if (type == "byte" || type == "uint8" || type == "int8")
+            return 1;
+        if (type == "int16" || type == "uint16")
+            return 2;
+        if (type == "int64" || type == "uint64")
+            return 8;
+        if (type == "float" || type == "int32" || type == "uint32" || type == "int" || type == "integer")
+            return 4;
+        if (type == "double")
+            return 8;
+        if (type == "ascii" || type == "string" || type == "str" || type == "utf16" || type == "wstring")
+            return 256;
+        return 4;
+    }
+
+    template <typename T>
+    bool read_le_value(const std::vector<uint8_t>& bytes, T& out)
+    {
+        if (bytes.size() < sizeof(T))
+            return false;
+        std::memcpy(&out, bytes.data(), sizeof(T));
+        return true;
+    }
+
+    json decode_typed_memory_value(const std::vector<uint8_t>& bytes, const std::string& value_type)
+    {
+        const std::string type = to_lower(value_type);
+        json out;
+        out["type"] = value_type;
+        out["read_size"] = bytes.size();
+        if (type == "byte" || type == "uint8") {
+            if (!bytes.empty()) out["value"] = bytes[0];
+            return out;
+        }
+        if (type == "int8") {
+            if (!bytes.empty()) out["value"] = static_cast<int>(static_cast<int8_t>(bytes[0]));
+            return out;
+        }
+        if (type == "int16") {
+            int16_t v = 0;
+            if (read_le_value(bytes, v)) out["value"] = v;
+            return out;
+        }
+        if (type == "uint16") {
+            uint16_t v = 0;
+            if (read_le_value(bytes, v)) out["value"] = v;
+            return out;
+        }
+        if (type == "int64") {
+            int64_t v = 0;
+            if (read_le_value(bytes, v)) out["value"] = v;
+            return out;
+        }
+        if (type == "uint64") {
+            uint64_t v = 0;
+            if (read_le_value(bytes, v)) {
+                out["value"] = v;
+                out["hex_value"] = hex_addr(v);
+            }
+            return out;
+        }
+        if (type == "float") {
+            float v = 0.0f;
+            if (read_le_value(bytes, v)) out["value"] = v;
+            return out;
+        }
+        if (type == "double") {
+            double v = 0.0;
+            if (read_le_value(bytes, v)) out["value"] = v;
+            return out;
+        }
+        if (type == "ascii" || type == "string" || type == "str") {
+            std::string text;
+            for (uint8_t b : bytes) {
+                if (b == 0)
+                    break;
+                text.push_back((b >= 32 && b < 127) ? static_cast<char>(b) : '.');
+            }
+            out["value"] = text;
+            return out;
+        }
+        if (type == "utf16" || type == "wstring") {
+            std::string text;
+            for (size_t i = 0; i + 1 < bytes.size(); i += 2) {
+                const uint16_t ch = static_cast<uint16_t>(bytes[i]) | (static_cast<uint16_t>(bytes[i + 1]) << 8);
+                if (ch == 0)
+                    break;
+                text.push_back((ch >= 32 && ch < 127) ? static_cast<char>(ch) : '?');
+            }
+            out["value"] = text;
+            out["encoding"] = "utf16le_ascii_preview";
+            return out;
+        }
+        int32_t v = 0;
+        if (read_le_value(bytes, v))
+            out["value"] = v;
+        out["normalized_type"] = "int32";
+        return out;
     }
 
     tool_result_t handle_read_memory(const json& params)
@@ -534,7 +567,9 @@ namespace
         if (!address)
             return error("Missing or invalid address.");
 
-        const auto size = static_cast<size_t>(params.value("size", 256));
+        const std::string value_type = params.value("value_type", std::string());
+        size_t requested_size = static_cast<size_t>(params.value("size", 0));
+        const auto size = value_type.empty() ? (requested_size == 0 ? 256 : requested_size) : typed_read_size(value_type, requested_size);
         std::vector<uint8_t> bytes;
         if (!driver_bridge::read_memory(*address, size, bytes))
             return error("Memory read failed. Ensure the kernel driver is loaded and attached.");
@@ -556,6 +591,8 @@ namespace
         out["size"] = bytes.size();
         out["hex"] = hex;
         out["ascii"] = ascii;
+        if (!value_type.empty())
+            out["typed"] = decode_typed_memory_value(bytes, value_type);
         return tool_result_t::ok("Read process memory.", out);
     }
 
@@ -605,125 +642,8 @@ namespace
         return tool_result_t::ok("Queried memory region.", out);
     }
 
-    tool_result_t handle_enumerate_modules(const json& params)
-    {
-        diag::log_tagged_fmt("mcp_tools", "handle_enumerate_modules entry");
-        if (wants_vm_target(params))
-            return handle_vm_bridge_enumerate_modules(params);
-        auto chk = ensure_attached();
-        if (!chk.success)
-            return chk;
 
-        json modules = json::array();
-        for (const auto& mod : driver_bridge::enumerate_modules()) {
-            modules.push_back({
-                {"name", mod.name},
-                {"path", mod.path},
-                {"base", hex_addr(mod.base)},
-                {"size", mod.size}
-            });
-        }
-        return tool_result_t::ok("Enumerated modules.", json{{"modules", modules}});
-    }
 
-    tool_result_t handle_enumerate_threads(const json& params)
-    {
-        diag::log_tagged_fmt("mcp_tools", "handle_enumerate_threads entry");
-        if (wants_vm_target(params))
-            return handle_vm_bridge_enumerate_threads(params);
-        auto chk = ensure_attached();
-        if (!chk.success)
-            return chk;
-
-        json threads = json::array();
-        for (const auto& thread : driver_bridge::enumerate_threads()) {
-            threads.push_back({
-                {"tid", thread.tid},
-                {"owner_pid", thread.owner_pid},
-                {"priority", thread.priority}
-            });
-        }
-        return tool_result_t::ok("Enumerated threads.", json{{"threads", threads}});
-    }
-
-    tool_result_t handle_disassemble_address(const json& params)
-    {
-        diag::log_tagged_fmt("mcp_tools", "handle_disassemble_address entry");
-        if (wants_vm_target(params)) {
-            const auto address = parse_addr_opt(params, "address");
-            if (!address)
-                return error("Missing or invalid address.");
-            const size_t bytes_to_read = static_cast<size_t>(params.value("size", 128));
-            const size_t max_count = static_cast<size_t>(params.value("count", 32));
-            json read_params = vm_bridge_params_from(params);
-            read_params["size"] = bytes_to_read;
-            std::string err;
-            json response = vm_guest_bridge::request("read_memory", read_params, vm_bridge_timeout_ms(params), &err);
-            if (!err.empty())
-                return error(err);
-            json data = response.value("data", json::object());
-            std::string hex = data.value("hex", std::string());
-            std::vector<uint8_t> bytes;
-            if (!hex_to_bytes_string(hex, bytes))
-                return error("Guest memory response contained invalid hex.");
-            json instructions = json::array();
-            uint64_t cursor = *address;
-            size_t offset = 0;
-            while (offset < bytes.size() && instructions.size() < max_count) {
-                const auto insn = zydis_decode_one(bytes.data() + offset,
-                                                   static_cast<int>(bytes.size() - offset), cursor);
-                instructions.push_back({
-                    {"address", hex_addr(insn.addr)},
-                    {"mnemonic", insn.mnem},
-                    {"operands", insn.ops},
-                    {"length", insn.len}
-                });
-                const int advance = (insn.len > 1) ? insn.len : 1;
-                offset += static_cast<size_t>(advance);
-                cursor += static_cast<uint64_t>(advance);
-            }
-            json out;
-            out["address"] = hex_addr(*address);
-            out["instructions"] = instructions;
-            out["bytes_read"] = bytes.size();
-            enrich_vm_bridge_data(out);
-            return tool_result_t::ok("Disassembled VM process memory.", out);
-        }
-        auto chk = ensure_attached();
-        if (!chk.success)
-            return chk;
-
-        const auto address = parse_addr_opt(params, "address");
-        if (!address)
-            return error("Missing or invalid address.");
-
-        const size_t bytes_to_read = static_cast<size_t>(params.value("size", 128));
-        const size_t max_count = static_cast<size_t>(params.value("count", 32));
-
-        std::vector<uint8_t> bytes;
-        if (!driver_bridge::read_memory(*address, bytes_to_read, bytes))
-            return error("Could not read the requested memory.");
-
-        json instructions = json::array();
-        uint64_t cursor = *address;
-        size_t offset = 0;
-        while (offset < bytes.size() && instructions.size() < max_count) {
-            const auto insn = zydis_decode_one(bytes.data() + offset,
-                                               static_cast<int>(bytes.size() - offset), cursor);
-            instructions.push_back({
-                {"address", hex_addr(insn.addr)},
-                {"mnemonic", insn.mnem},
-                {"operands", insn.ops},
-                {"length", insn.len}
-            });
-            const int advance = (insn.len > 1) ? insn.len : 1;
-            offset += static_cast<size_t>(advance);
-            cursor += static_cast<uint64_t>(advance);
-        }
-
-        return tool_result_t::ok("Disassembled live memory.",
-                                 json{{"address", hex_addr(*address)}, {"instructions", instructions}});
-    }
 
     tool_result_t handle_disassemble_file(const json& params)
     {
@@ -2161,27 +2081,16 @@ namespace mcp_standalone
             true,
             [&srv](const json& params) { return srv.describe_tools(params); }});
 
-        srv.register_tool({"driver_load", "Load and connect the host kernel driver backend for host live analysis.", {}, false, handle_driver_load});
-        srv.register_tool({"driver_detach", "Detach from the current process. If a VM bridge is active this detaches the VM active process by default; pass target='host' for host detach.",
-            {{"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "VM bridge timeout", false}},
-            false, handle_driver_detach});
         srv.register_tool({"list_processes", "Enumerate processes. If a VM bridge is active this lists VM processes by default; pass target='host' for host processes.",
             {{"filter", "string", "Optional substring filter", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "VM bridge timeout", false}}, true, handle_list_processes});
-        srv.register_tool({"read_memory", "Read bytes from the attached process. If a VM bridge is active this reads VM memory by default; pass target='host' for host memory.",
-            {{"address", "string", "Target address", true}, {"size", "number", "Bytes to read", false}, {"pid", "number", "VM process id when target is guest", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "VM bridge timeout", false}},
+        srv.register_tool({"read_memory", "Read bytes or a typed scalar/string from the attached process. If a VM bridge is active this reads VM memory by default; pass target='host' for host memory.",
+            {{"address", "string", "Target address", true}, {"size", "number", "Bytes to read", false}, {"value_type", "string", "Optional typed decode: byte/int8/uint8/int16/uint16/int32/uint32/int64/uint64/float/double/ascii/utf16", false}, {"pid", "number", "VM process id when target is guest", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "VM bridge timeout", false}},
             true, handle_read_memory});
         srv.register_tool({"read_string", "Read a UTF-8/ASCII string from the attached process. If a VM bridge is active this reads VM memory by default; pass target='host' for host memory.",
             {{"address", "string", "Target address", true}, {"max_length", "number", "Maximum bytes to inspect", false}, {"encoding", "string", "ascii|utf16 for VM reads", false}, {"pid", "number", "VM process id when target is guest", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "VM bridge timeout", false}},
             true, handle_read_string});
         srv.register_tool({"query_memory", "Query the memory region containing an address. If a VM bridge is active this queries VM memory by default; pass target='host' for host memory.",
             {{"address", "string", "Target address", true}, {"pid", "number", "VM process id when target is guest", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "VM bridge timeout", false}}, true, handle_query_memory});
-        srv.register_tool({"enumerate_modules", "List modules for the attached process. If a VM bridge is active this lists VM modules by default; pass target='host' for host modules.",
-            {{"pid", "number", "VM process id when target is guest", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "VM bridge timeout", false}}, true, handle_enumerate_modules});
-        srv.register_tool({"enumerate_threads", "List threads for the attached process. If a VM bridge is active this lists VM threads by default; pass target='host' for host threads.",
-            {{"pid", "number", "VM process id when target is guest", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "VM bridge timeout", false}}, true, handle_enumerate_threads});
-        srv.register_tool({"disassemble_address", "Disassemble bytes from the attached process using Zydis. If a VM bridge is active this reads VM memory by default; pass target='host' for host memory.",
-            {{"address", "string", "Start address", true}, {"size", "number", "Bytes to read", false}, {"count", "number", "Maximum instructions", false}, {"pid", "number", "VM process id when target is guest", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "VM bridge timeout", false}},
-            true, handle_disassemble_address});
         srv.register_tool({"disassemble_file", "Disassemble a PE file from disk using Zydis.",
             {{"path", "string", "Path to an EXE/DLL/SYS file", true}, {"count", "number", "Maximum instructions", false}},
             true, handle_disassemble_file});

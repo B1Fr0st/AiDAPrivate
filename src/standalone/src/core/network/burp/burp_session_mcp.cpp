@@ -10,6 +10,7 @@
 #include "session_handler.hpp"
 #include "auth_lab.hpp"
 
+#include "../../settings/standalone_compat.hpp"
 #include "../../../helpers/diag_log.hpp"
 
 #include <nlohmann/json.hpp>
@@ -278,69 +279,37 @@ tool_result_t handle_rule_remove(const json& params)
 void register_session_tools(mcp_standalone::server_t& srv)
 {
     srv.register_tool({
-        "burp_macro_add",
-        "Create a Burp-style request macro. 'steps' is an array of {label, scheme, host, port, raw_request_b64, timeout_ms, extracts[{name, from, regex, group}]}. 'from' must be one of resp_body | resp_headers | resp_url.",
-        {{"name", "string", "Macro name", false},
-         {"steps", "array", "List of macro steps", true}},
-        false, handle_macro_add
+        "burp_macro_manage",
+        "Manage Burp-style request macros. Actions: add, run, list, remove, update.",
+        {{"action", "string", "add|run|list|remove|update", true},
+         {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted.", false}},
+        false,
+        [](const json& params) -> tool_result_t {
+            const std::string action = compat_action_name(params);
+            const json p = compat_action_payload(params);
+            if (action == "add") return handle_macro_add(p);
+            if (action == "run") return handle_macro_run(p);
+            if (action == "list") return handle_macro_list(p);
+            if (action == "remove") return handle_macro_remove(p);
+            if (action == "update") return handle_macro_update(p);
+            return compat_unknown_action("burp_macro_manage", action);
+        }
     });
 
     srv.register_tool({
-        "burp_macro_run",
-        "Run a macro now and return the extracted values map.",
-        {{"macro_id", "number", "Macro id", true}},
-        false, handle_macro_run
-    });
-
-    srv.register_tool({
-        "burp_macro_list",
-        "List all macros and their last-run state.",
-        {},
-        true, handle_macro_list
-    });
-
-    srv.register_tool({
-        "burp_macro_remove",
-        "Remove a macro by id.",
-        {{"macro_id", "number", "Macro id", true}},
-        false, handle_macro_remove
-    });
-
-    srv.register_tool({
-        "burp_macro_update",
-        "Update a macro by id (fields may overwrite 'name' and 'steps').",
-        {{"macro_id", "number", "Macro id", true},
-         {"fields", "object", "Partial fields", true}},
-        false, handle_macro_update
-    });
-
-    srv.register_tool({
-        "burp_session_rule_add",
-        "Add a session-handler rule. When an exchange matches, the associated macro runs and the extracted values are substituted as {{name}} tokens in the outgoing request.",
-        {{"name", "string", "Rule name", false},
-         {"match", "string", "url_regex | response_status | response_regex", true},
-         {"pattern", "string", "Regex (for url_regex/response_regex)", false},
-         {"status", "number", "HTTP status (for response_status)", false},
-         {"macro_id", "number", "Macro to run", true},
-         {"replace_in_url", "boolean", "Substitute tokens in URL line (default true)", false},
-         {"replace_in_headers", "boolean", "Substitute tokens in headers (default true)", false},
-         {"replace_in_body", "boolean", "Substitute tokens in body (default true)", false},
-         {"active", "boolean", "Active (default true)", false}},
-        false, handle_rule_add
-    });
-
-    srv.register_tool({
-        "burp_session_rule_list",
-        "List all session rules.",
-        {},
-        true, handle_rule_list
-    });
-
-    srv.register_tool({
-        "burp_session_rule_remove",
-        "Remove a session rule by id.",
-        {{"rule_id", "number", "Rule id", true}},
-        false, handle_rule_remove
+        "burp_session_rule_manage",
+        "Manage Burp session-handler rules. Actions: add, list, remove.",
+        {{"action", "string", "add|list|remove", true},
+         {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted.", false}},
+        false,
+        [](const json& params) -> tool_result_t {
+            const std::string action = compat_action_name(params);
+            const json p = compat_action_payload(params);
+            if (action == "add") return handle_rule_add(p);
+            if (action == "list") return handle_rule_list(p);
+            if (action == "remove") return handle_rule_remove(p);
+            return compat_unknown_action("burp_session_rule_manage", action);
+        }
     });
 }
 

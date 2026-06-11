@@ -226,47 +226,21 @@ tool_result_t handle_diff(const json& p)
 void register_comparer_tools(mcp_standalone::server_t& srv)
 {
     register_compat(srv, {
-        "burp_comparer_add_slot", "burp",
-        "Add a slot to the Comparer pool. Provide either base64-encoded bytes (for binary), or plain text. "
-        "Slots can later be diffed against each other using bytes / chars / words / lines tokenisation.",
-        {{"label",       "string", "Human label for the slot", false},
-         {"data_b64",    "string", "Base64-encoded raw bytes (preferred for binary payloads)", false},
-         {"data_text",   "string", "UTF-8 plain text", false},
-         {"source_hint", "string", "Where the data came from (e.g. 'repeater', 'sitemap_response')", false}},
-        handle_add_slot, false
-    });
-
-    register_compat(srv, {
-        "burp_comparer_list_slots", "burp",
-        "List all slots currently held by the Comparer (id, label, size, source hint, creation time).",
-        {},
-        handle_list, true
-    });
-
-    register_compat(srv, {
-        "burp_comparer_remove_slot", "burp",
-        "Remove a single slot by id.",
-        {{"slot_id", "number", "Slot id to delete", true}},
-        handle_remove, false
-    });
-
-    register_compat(srv, {
-        "burp_comparer_clear", "burp",
-        "Delete every slot.",
-        {},
-        handle_clear, false
-    });
-
-    register_compat(srv, {
-        "burp_comparer_diff", "burp",
-        "Compute a Myers shortest-edit-script diff between slot_a and slot_b. Returns blocks { kind, a_start, a_end, b_start, b_end } "
-        "with byte offsets into the original slot data. Modes: 'bytes' (per-byte), 'chars' (UTF-8 code point), "
-        "'words' (alnum-or-underscore runs), 'lines' (newline-separated). Inputs above ~32 KiB are clamped to a window with "
-        "'truncated' set in stats.",
-        {{"slot_a", "number", "First slot id", true},
-         {"slot_b", "number", "Second slot id", true},
-         {"mode",   "string", "'bytes' | 'chars' | 'words' | 'lines' (default 'lines')", false}},
-        handle_diff, true
+        "burp_comparer_manage", "burp",
+        "Manage Burp Comparer slots and diffs. Actions: add_slot, list_slots, remove_slot, clear, diff.",
+        {{"action", "string", "add_slot|list_slots|remove_slot|clear|diff", true},
+         {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted.", false}},
+        [](const json& params) -> tool_result_t {
+            const std::string action = compat_action_name(params);
+            const json p = compat_action_payload(params);
+            if (action == "add_slot") return handle_add_slot(p);
+            if (action == "list_slots") return handle_list(p);
+            if (action == "remove_slot") return handle_remove(p);
+            if (action == "clear") return handle_clear(p);
+            if (action == "diff") return handle_diff(p);
+            return compat_unknown_action("burp_comparer_manage", action);
+        },
+        false
     });
 }
 

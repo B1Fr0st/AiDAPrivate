@@ -40,10 +40,10 @@ static constexpr std::uint64_t SYNTH_STACK_SIZE        = 0x20000ULL;
 static tool_result_t check_driver_for_address(std::uint64_t addr)
 {
     if (!driver_bridge::using_kernel_driver())
-        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_load first."));
+        return tool_result_t::error(OBFSTR("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
 
     if (!is_kernel_address(addr) && driver_bridge::attached_pid() == 0)
-        return tool_result_t::error(OBFSTR("Not attached to a process. Call driver_attach first (kernel addresses work without attachment)."));
+        return tool_result_t::error(OBFSTR("Not attached to a process. Use sessions_manage action=attach_pid first (kernel addresses work without attachment)."));
 
     return tool_result_t::ok("", {});
 }
@@ -211,13 +211,13 @@ tool_result_t driver_snapshot_and_emulate(const json& params)
     if (!driver_bridge::using_kernel_driver())
     {
         diag::log_tagged_fmt("emul_tools", "driver_snapshot_and_emulate driver not connected");
-        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_load first."));
+        return tool_result_t::error(OBFSTR("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
     }
 
     if (driver_bridge::attached_pid() == 0)
     {
         diag::log_tagged_fmt("emul_tools", "driver_snapshot_and_emulate no attached pid");
-        return tool_result_t::error(OBFSTR("Not attached to a process. Call driver_attach first."));
+        return tool_result_t::error(OBFSTR("Not attached to a process. Use sessions_manage action=attach_pid first."));
     }
 
     std::uint32_t pid = driver_bridge::attached_pid();
@@ -888,232 +888,6 @@ tool_result_t emulate_multi_trace(const json& params)
 }
 
 
-tool_result_t emulate_function(const json& params)
-{
-    diag::log_tagged_fmt("emul_tools", "emulate_function entry addr='%s'",
-        params.value("address", std::string()).c_str());
-    auto addr = sa_parse_address(params.value("address", std::string()));
-    if (!addr)
-    {
-        diag::log_tagged_fmt("emul_tools", "emulate_function invalid address");
-        return tool_result_t::error(OBFSTR("Invalid address"));
-    }
-
-    auto chk = check_driver_for_address(*addr);
-    if (!chk.success) return chk;
-
-    const bool kernel_mode = is_kernel_address(*addr);
-
-    const bool explicit_size = params.contains("size") && params["size"].is_number();
-    std::uint32_t fn_size = params.value("size", 4096);
-    if (fn_size > 1024 * 1024) fn_size = 1024 * 1024;
-    if (fn_size == 0) fn_size = 1;
-
-    std::uint32_t map_size = std::max(fn_size * 2, 8192u);
-    if (map_size > 1024 * 1024) map_size = 1024 * 1024;
-    std::uint32_t read_size = explicit_size ? fn_size : map_size;
-    if (read_size > map_size) read_size = map_size;
-    if (read_size == 0) read_size = 1;
-
-    auto code = emulation::driver_read_bytes(*addr, read_size);
-    if (code.empty())
-        return tool_result_t::error(OBFSTR("Failed to read function bytes at ") +
-                                    sa_format_address(*addr));
-    if (explicit_size && code.size() < read_size)
-        return tool_result_t::error(OBFSTR("Short function read at ") +
-                                    sa_format_address(*addr) +
-                                    OBFSTR(": requested ") + std::to_string(read_size) +
-                                    OBFSTR(" bytes, got ") + std::to_string(code.size()));
-
-    const std::uint64_t sentinel_ret = kernel_mode ? 0xFFFFFAFEFFFF0000ULL : 0x000000007FFC0000ULL;
-    std::uint64_t stack_base = kernel_mode ? KERNEL_SYNTH_STACK_BASE : USER_SYNTH_STACK_BASE;
-    std::uint64_t stack_top  = stack_base + SYNTH_STACK_SIZE - 0x1000;
-
-    emulation::process_snapshot_t snapshot;
-    snapshot.success = true;
-    snapshot.rip     = *addr;
-    snapshot.rsp     = stack_top;
-    snapshot.rbp     = stack_top + 0x100;
-    snapshot.rflags  = 0x202;
-
-    if (params.contains("rax")) { auto v = sa_parse_address(params.value("rax", std::string())); if (v) snapshot.rax = *v; }
-    if (params.contains("rbx")) { auto v = sa_parse_address(params.value("rbx", std::string())); if (v) snapshot.rbx = *v; }
-    if (params.contains("rcx")) { auto v = sa_parse_address(params.value("rcx", std::string())); if (v) snapshot.rcx = *v; }
-    if (params.contains("rdx")) { auto v = sa_parse_address(params.value("rdx", std::string())); if (v) snapshot.rdx = *v; }
-    if (params.contains("rsi")) { auto v = sa_parse_address(params.value("rsi", std::string())); if (v) snapshot.rsi = *v; }
-    if (params.contains("rdi")) { auto v = sa_parse_address(params.value("rdi", std::string())); if (v) snapshot.rdi = *v; }
-    if (params.contains("r8"))  { auto v = sa_parse_address(params.value("r8", std::string()));  if (v) snapshot.r8  = *v; }
-    if (params.contains("r9"))  { auto v = sa_parse_address(params.value("r9", std::string()));  if (v) snapshot.r9  = *v; }
-
-    emulation::memory_snapshot_region_t code_region;
-    code_region.base = *addr & ~0xFFFULL;
-    code_region.size = (static_cast<std::uint64_t>(map_size) + 0xFFF + (*addr & 0xFFF)) & ~0xFFFULL;
-    code_region.data.resize(static_cast<std::size_t>(code_region.size), 0);
-    std::memcpy(code_region.data.data() + (*addr - code_region.base), code.data(), code.size());
-    const std::uint64_t code_region_base = code_region.base;
-    const std::uint64_t code_region_size = code_region.size;
-    snapshot.regions.push_back(std::move(code_region));
-
-    emulation::memory_snapshot_region_t stack_region;
-    stack_region.base = stack_base;
-    stack_region.size = SYNTH_STACK_SIZE;
-    stack_region.data.resize(static_cast<std::size_t>(SYNTH_STACK_SIZE), 0);
-
-    std::uint64_t sentinel = sentinel_ret;
-    std::memcpy(stack_region.data.data() + (stack_top - stack_base), &sentinel, 8);
-    snapshot.regions.push_back(std::move(stack_region));
-
-    emulation::memory_snapshot_region_t sentinel_region;
-    sentinel_region.base = sentinel_ret & ~0xFFFULL;
-    sentinel_region.size = 0x1000;
-    sentinel_region.data.resize(0x1000, 0xCC);
-    snapshot.regions.push_back(std::move(sentinel_region));
-
-    map_additional_regions(snapshot, params, code_region_base, code_region_base + code_region_size);
-
-    emulation::emulation_config_t config;
-    config.start_address     = *addr;
-    config.stop_address      = sentinel_ret;
-    config.max_instructions  = params.value("max_instructions", 100000);
-    config.max_trace_entries  = params.value("max_trace_entries", 10000);
-    config.record_mem_reads   = params.value("record_mem_reads", true);
-    config.record_mem_writes  = params.value("record_mem_writes", true);
-    config.record_registers   = true;
-    config.analyze_effective_ops = true;
-    config.timeout_us         = params.value("timeout_us", 15000000);
-    config.breakpoint_addresses.insert(sentinel_ret);
-
-    diag::log_tagged_fmt("emul_tools", "emulate_function running addr=0x%llx fn_size=%u read_size=%u map_size=%u sentinel=0x%llX kernel=%d",
-        static_cast<unsigned long long>(*addr),
-        fn_size,
-        read_size,
-        map_size,
-        static_cast<unsigned long long>(sentinel_ret),
-        (int)kernel_mode);
-    aida::diagnostic_exception_scope::scope_t exception_scope("mcp.emulate_function");
-    auto result = emulation::emulate_from_snapshot(snapshot, config);
-
-    json out;
-    out["function_address"] = sa_format_address(*addr);
-    out["function_size"]    = fn_size;
-    out["mapped_size"]      = map_size;
-    out["read_size"]        = read_size;
-    out["kernel_mode"]      = kernel_mode;
-    out["success"]          = result.success;
-
-    bool returned_normally = result.success &&
-        (result.hit_ret || result.end_address == sentinel_ret || result.end_address == sentinel_ret + 1);
-    out["returned_normally"] = returned_normally;
-    out["hit_ret"] = result.hit_ret;
-    out["hit_breakpoint"] = result.hit_breakpoint;
-
-    if (result.success)
-    {
-        out["total_instructions"]     = result.total_instructions;
-        out["junk_instructions"]      = result.junk_instruction_count;
-        out["effective_instructions"] = result.total_instructions - result.junk_instruction_count;
-        out["end_address"]            = sa_format_address(static_cast<uint64_t>(result.end_address));
-
-        for (const auto& d : result.reg_deltas)
-        {
-            if (d.name == "RAX" || d.name == "rax")
-            {
-                out["return_value"] = sa_format_address(static_cast<uint64_t>(d.after));
-                break;
-            }
-        }
-
-        json deltas = json::array();
-        for (const auto& d : result.reg_deltas)
-        {
-            json delta;
-            delta["register"] = d.name;
-            delta["before"]   = sa_format_address(static_cast<uint64_t>(d.before));
-            delta["after"]    = sa_format_address(static_cast<uint64_t>(d.after));
-            deltas.push_back(std::move(delta));
-        }
-        out["register_deltas"] = std::move(deltas);
-
-        json eff = json::array();
-        for (const auto& op : result.effective_ops) eff.push_back(op);
-        out["effective_operations"] = std::move(eff);
-
-        json writes = json::array();
-        std::size_t wl = std::min<std::size_t>(result.mem_writes.size(), 128);
-        for (std::size_t w = 0; w < wl; ++w)
-        {
-            json wr;
-            wr["address"] = sa_format_address(static_cast<uint64_t>(result.mem_writes[w].address));
-            wr["size"]    = result.mem_writes[w].size;
-            writes.push_back(std::move(wr));
-        }
-        out["memory_writes"] = std::move(writes);
-
-        constexpr std::size_t EX = 30;
-        json trace_arr = json::array();
-        for (std::size_t i = 0; i < std::min(result.trace.size(), EX); ++i)
-        {
-            json te; te["address"] = sa_format_address(static_cast<uint64_t>(result.trace[i].address));
-            te["disasm"] = result.trace[i].disasm; trace_arr.push_back(std::move(te));
-        }
-        if (result.trace.size() > EX * 2)
-        {
-            trace_arr.push_back(json{{"note", "... " + std::to_string(result.trace.size() - EX * 2) + " instructions omitted ..."}});
-            for (std::size_t i = result.trace.size() - EX; i < result.trace.size(); ++i)
-            {
-                json te; te["address"] = sa_format_address(static_cast<uint64_t>(result.trace[i].address));
-                te["disasm"] = result.trace[i].disasm; trace_arr.push_back(std::move(te));
-            }
-        }
-        out["trace_excerpt"] = std::move(trace_arr);
-    }
-    else
-    {
-        out["error"] = result.error;
-    }
-
-    if (!result.success)
-    {
-        diag::log_tagged_fmt("emul_tools",
-            "emulate_function failed addr=0x%llX err='%s' total=%u trace=%zu end=0x%llX regions=%zu",
-            static_cast<unsigned long long>(*addr),
-            result.error.c_str(),
-            result.total_instructions,
-            result.trace.size(),
-            static_cast<unsigned long long>(result.end_address),
-            snapshot.regions.size());
-        return tool_result_t::error(OBFSTR("Function emulation failed: ") + result.error);
-    }
-
-    if (!returned_normally) {
-        std::string last_trace;
-        if (!result.trace.empty()) {
-            const auto& tail = result.trace.back();
-            last_trace = sa_format_address(static_cast<uint64_t>(tail.address)) + " " + tail.disasm;
-        }
-        diag::log_tagged_fmt("emul_tools",
-            "emulate_function did_not_return addr=0x%llX end=0x%llX sentinel=0x%llX total=%u trace=%zu last='%s' regions=%zu",
-            static_cast<unsigned long long>(*addr),
-            static_cast<unsigned long long>(result.end_address),
-            static_cast<unsigned long long>(sentinel_ret),
-            result.total_instructions,
-            result.trace.size(),
-            last_trace.c_str(),
-            snapshot.regions.size());
-        return tool_result_t::error(OBFSTR("Function emulation ") + sa_format_address(*addr) +
-                                    OBFSTR(" did not return") +
-                                    (kernel_mode ? OBFSTR(" [kernel]") : OBFSTR(" [user]")));
-    }
-
-    diag::log_tagged_fmt("emul_tools", "emulate_function ok returned=%d total=%u junk=%u",
-        (int)returned_normally, result.success ? result.total_instructions : 0u,
-        result.success ? result.junk_instruction_count : 0u);
-    return tool_result_t::ok(
-        OBFSTR("Function emulation ") + sa_format_address(*addr) +
-        OBFSTR(": returned normally") +
-        (kernel_mode ? OBFSTR(" [kernel]") : OBFSTR(" [user]")), out);
-}
-
 #else
 
 tool_result_t disassemble_zydis(const json&)
@@ -1141,22 +915,17 @@ tool_result_t emulate_multi_trace(const json&)
     return tool_result_t::error(OBFSTR("Emulation engine requires Windows (NT kernel driver)."));
 }
 
-tool_result_t emulate_function(const json&)
-{
-    return tool_result_t::error(OBFSTR("Emulation engine requires Windows (NT kernel driver)."));
-}
-
 #endif
 
 void register_emulation_tools(mcp_standalone::server_t& srv)
 {
-    diag::log_tagged_fmt("emul_tools", "register_emulation_tools registering 6 tools");
+    diag::log_tagged_fmt("emul_tools", "register_emulation_tools registering 5 tools");
         register_compat(srv, {
         OBFSTR("disassemble_zydis"), OBFSTR("emulation"),
         OBFSTR("Disassemble raw bytes from LIVE MEMORY using the Zydis engine via the kernel driver. "
                "Reads memory directly - completely independent of the IDA database. "
-               "Works on both user-mode process addresses (requires driver_attach) and "
-               "kernel-mode addresses (requires only driver_load). "
+               "Works on both user-mode process addresses (attach with sessions_manage action=attach_pid) and "
+               "kernel-mode addresses through the driver bridge. "
                "Produces rich instruction metadata: branch/call/ret/nop/privileged "
                "classification, precise mnemonic parsing, and accurate instruction lengths. "
                "Use follow_jumps=true to automatically follow unconditional JMP trampolines (up to 16 hops) "
@@ -1178,7 +947,7 @@ void register_emulation_tools(mcp_standalone::server_t& srv)
                "classification, and an execution trace. "
                "Use this to analyze VM handlers, unpacking stubs, and obfuscated code in protected "
                "processes where the debugger would be detected. "
-               "Requires: driver_load + driver_attach first."),
+               "Requires an attached process through sessions_manage action=attach_pid."),
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Emulation start address (entry point of VM handler or code to trace)"), true},
          {OBFSTR("tid"), OBFSTR("number"), OBFSTR("Target thread ID (auto-selects first thread if omitted)"), false},
          {OBFSTR("max_instructions"), OBFSTR("number"), OBFSTR("Maximum instructions to emulate (default 50000)"), false},
@@ -1198,8 +967,8 @@ void register_emulation_tools(mcp_standalone::server_t& srv)
         OBFSTR("trace_execution_unicorn"), OBFSTR("emulation"),
         OBFSTR("Read raw code bytes from LIVE MEMORY via the kernel driver and emulate them "
                "offline in a Unicorn x86-64 engine with a synthetic stack. Completely independent of "
-               "the IDA database. Works on both user-mode (requires driver_attach) and "
-               "kernel-mode addresses (requires only driver_load). "
+               "the IDA database. Works on both user-mode addresses attached through sessions_manage action=attach_pid and "
+               "kernel-mode addresses through the driver bridge. "
                "Produces register deltas, memory writes, effective vs junk instruction classification, "
                "and an execution trace. "
                "Use additional_regions to map extra memory sections into the emulator (e.g. .be0 packed "
@@ -1226,8 +995,8 @@ void register_emulation_tools(mcp_standalone::server_t& srv)
     register_compat(srv, {
         OBFSTR("analyze_vm_handler"), OBFSTR("emulation"),
         OBFSTR("Combined disassembly + emulation analysis of a VM handler or obfuscated code block "
-               "via the kernel driver. Works on user-mode (requires driver_attach) and "
-               "kernel-mode addresses (requires only driver_load). "
+               "via the kernel driver. Works on user-mode addresses attached through sessions_manage action=attach_pid and "
+               "kernel-mode addresses through the driver bridge. "
                "Step 1: Read raw bytes from live memory and disassemble with Zydis. "
                "Step 2: Emulate the same bytes offline in Unicorn to separate junk from effective operations. "
                "Produces: static instruction counts (nop/branch/call/privileged ratios), "
@@ -1252,7 +1021,7 @@ void register_emulation_tools(mcp_standalone::server_t& srv)
         OBFSTR("emulate_multi_trace"), OBFSTR("emulation"),
         OBFSTR("Read code from LIVE MEMORY via the kernel driver and run multiple Unicorn emulation "
                "traces with different register inputs for differential analysis. "
-               "Works on user-mode (requires driver_attach) and kernel-mode addresses (requires only driver_load). "
+               "Works on user-mode addresses attached through sessions_manage action=attach_pid and kernel-mode addresses through the driver bridge. "
                "Compare execution paths, register outputs, and memory writes across traces. "
                "Classifies behavior: constant_operation, register_transform_only, input_dependent_behavior, "
                "memory_behavior_varies. Use additional_regions for cross-section jumps."),
@@ -1265,33 +1034,6 @@ void register_emulation_tools(mcp_standalone::server_t& srv)
          {OBFSTR("timeout_us"), OBFSTR("number"), OBFSTR("Timeout per trace in microseconds (default: 5s)"), false}},
         emulate_multi_trace, true});
 
-    register_compat(srv, {
-        OBFSTR("emulate_function"), OBFSTR("emulation"),
-        OBFSTR("Read a function's code from LIVE MEMORY via the kernel driver and emulate it "
-               "offline in Unicorn until it returns (RET). "
-               "Works on user-mode (requires driver_attach) and kernel-mode addresses (requires only driver_load). "
-               "Sets up a synthetic stack with a sentinel return address to detect normal function return. "
-               "Reports: return value (RAX), register deltas, memory writes, effective operations, "
-               "and whether the function returned normally. "
-               "Use additional_regions to map extra sections for cross-section jumps."),
-        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function entry point (user-mode or kernel-mode)"), true},
-         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Function size in bytes to read (required)"), false},
-         {OBFSTR("max_instructions"), OBFSTR("number"), OBFSTR("Max instructions (default: 100000)"), false},
-         {OBFSTR("max_trace_entries"), OBFSTR("number"), OBFSTR("Max trace entries (default: 10000)"), false},
-         {OBFSTR("additional_regions"), OBFSTR("array"), OBFSTR("Extra memory regions to map: [{address,size},...] for cross-section code"), false,
-          {}, {{"type", "object"}}},
-         {OBFSTR("rax"), OBFSTR("string"), OBFSTR("Initial RAX (hex)"), false},
-         {OBFSTR("rbx"), OBFSTR("string"), OBFSTR("Initial RBX (hex)"), false},
-         {OBFSTR("rcx"), OBFSTR("string"), OBFSTR("Initial RCX (hex)"), false},
-         {OBFSTR("rdx"), OBFSTR("string"), OBFSTR("Initial RDX (hex)"), false},
-         {OBFSTR("rsi"), OBFSTR("string"), OBFSTR("Initial RSI (hex)"), false},
-         {OBFSTR("rdi"), OBFSTR("string"), OBFSTR("Initial RDI (hex)"), false},
-         {OBFSTR("r8"), OBFSTR("string"), OBFSTR("Initial R8 (hex)"), false},
-         {OBFSTR("r9"), OBFSTR("string"), OBFSTR("Initial R9 (hex)"), false},
-         {OBFSTR("record_mem_reads"), OBFSTR("boolean"), OBFSTR("Log memory reads (default: true)"), false},
-         {OBFSTR("record_mem_writes"), OBFSTR("boolean"), OBFSTR("Log memory writes (default: true)"), false},
-         {OBFSTR("timeout_us"), OBFSTR("number"), OBFSTR("Timeout in microseconds (default: 15s)"), false}},
-        emulate_function, true});
 }
 
 }

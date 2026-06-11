@@ -2684,7 +2684,7 @@ std::string setup_instructions()
         "The launcher verifies the Camoufox browser sidecar, extracts it to %LOCALAPPDATA%\\AiDA\\Standalone\\camoufox\\current, and sets the Camoufox environment for this AiDA session.\n"
         "The private camoufox-reverse-mcp implementation must come from AiDA's packaged frozen executable or packaged wheelhouse; customer sidecars must not include the source checkout.\n"
         "Python 3.10-3.13 x64 is only required when AiDA is using the packaged wheelhouse fallback instead of the frozen executable.\n"
-        "After launch, run check_environment again and then launch_browser. If it is still missing, send aida_bootstrap.log and the check_environment result.\n"
+        "After launch, use browser_lifecycle with action=launch. If it is still missing, send aida_bootstrap.log and the browser_lifecycle result.\n"
         "Advanced fallback: set AIDA_CAMOUFOX_EXECUTABLE to camoufox.exe and AIDA_CAMOUFOX_ALLOW_SYSTEM_PYTHON=1 before launching AiDA.\n";
 }
 

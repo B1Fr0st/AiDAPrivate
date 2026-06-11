@@ -1,6 +1,5 @@
 #include "camoufox_bridge_mcp.hpp"
 #include "camoufox_bridge.hpp"
-#include "camoufox_install.hpp"
 #include "../../settings/standalone_compat.hpp"
 
 #ifdef small
@@ -38,35 +37,6 @@ const char* state_label(camoufox::bridge_state_t s)
         case camoufox::bridge_state_t::error:    return "error";
     }
     return "unknown";
-}
-
-const char* install_state_label(camoufox::install::install_state_t s)
-{
-    switch (s)
-    {
-        case camoufox::install::install_state_t::unknown:         return "unknown";
-        case camoufox::install::install_state_t::checking:        return "checking";
-        case camoufox::install::install_state_t::available:       return "available";
-        case camoufox::install::install_state_t::missing_python:  return "missing_python";
-        case camoufox::install::install_state_t::missing_module:  return "missing_module";
-        case camoufox::install::install_state_t::missing_browser: return "missing_browser";
-        case camoufox::install::install_state_t::installing:      return "installing";
-        case camoufox::install::install_state_t::install_failed:  return "install_failed";
-        case camoufox::install::install_state_t::ok:              return "ok";
-    }
-    return "unknown";
-}
-
-json install_status_to_json(const camoufox::install::status_t& s)
-{
-    json j;
-    j["state"] = install_state_label(s.state);
-    j["python_path"] = s.python_path;
-    j["module_version"] = s.module_version;
-    j["browser_path"] = s.browser_path;
-    j["last_message"] = s.last_message;
-    j["ready"] = s.state == camoufox::install::install_state_t::ok;
-    return j;
 }
 
 json status_to_json(const camoufox::bridge_status_t& s)
@@ -504,6 +474,9 @@ json camoufox_args(const json& params)
     args.erase("browser_executable");
     args.erase("server_executable");
     args.erase("server_module");
+    args.erase("action");
+    args.erase("operation");
+    args.erase("payload");
     return args;
 }
 
@@ -720,36 +693,6 @@ tool_result_t tool_close_browser(const json& params)
 
 tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json& params, int default_timeout_ms)
 {
-    if (tool_name == "check_environment")
-    {
-        (void)params;
-        auto install_status = camoufox::install::probe();
-        auto bridge_status = camoufox::get_status();
-        json data;
-        data["install"] = install_status_to_json(install_status);
-        data["bridge"] = status_to_json(bridge_status);
-        data["dependencies_ready"] = install_status.state == camoufox::install::install_state_t::ok;
-        data["bridge_ready"] = bridge_status.state == camoufox::bridge_state_t::ready &&
-            bridge_status.browser_open && bridge_status.page_verified && bridge_status.child_alive &&
-            !bridge_status.cleanup_pending;
-        data["ready"] = data["dependencies_ready"].get<bool>();
-        const std::string instructions = camoufox::install::setup_instructions();
-        if (!data["dependencies_ready"].get<bool>())
-            data["setup_instructions"] = instructions;
-        std::string text = data["dependencies_ready"].get<bool>()
-            ? std::string("Camoufox dependencies are ready.")
-            : std::string("Camoufox dependencies are not ready: ") + install_status.last_message;
-        if (!data["dependencies_ready"].get<bool>() && text.find(instructions) == std::string::npos)
-            text += "\n" + instructions;
-        diag::log_tagged_fmt("mcp_burp", "camoufox_check_environment deps_ready=%d install_state=%s bridge_state=%s message=%s",
-            data["dependencies_ready"].get<bool>() ? 1 : 0,
-            install_state_label(install_status.state),
-            state_label(bridge_status.state),
-            install_status.last_message.c_str());
-        if (!data["dependencies_ready"].get<bool>())
-            return {false, text, data};
-        return tool_result_t::ok(text, data);
-    }
     json args = camoufox_args(params);
     int timeout_ms = camoufox_timeout_ms(params, default_timeout_ms);
     const std::string session_id = json_string_param(params, "session_id", "default");
@@ -857,187 +800,299 @@ struct camoufox_tool_spec_t
     int timeout_ms;
 };
 
+struct camoufox_action_entry_t
+{
+    const char* action;
+    const char* internal_tool;
+    int default_timeout_ms;
+};
+
+const camoufox_action_entry_t* find_camoufox_action(
+    const std::string& action,
+    const camoufox_action_entry_t* entries,
+    size_t entry_count)
+{
+    for (size_t i = 0; i < entry_count; ++i)
+    {
+        if (action == entries[i].action)
+            return &entries[i];
+    }
+    return nullptr;
+}
+
+json camoufox_group_payload(const json& params)
+{
+    json out = params.is_object() ? params : json::object();
+    out.erase("action");
+    out.erase("operation");
+    out.erase("payload");
+    if (params.contains("payload") && params["payload"].is_object())
+    {
+        for (auto it = params["payload"].begin(); it != params["payload"].end(); ++it)
+            out[it.key()] = it.value();
+    }
+    return out;
+}
+
+tool_result_t dispatch_camoufox_browser_group(
+    const json& params,
+    const char* group_name,
+    const camoufox_action_entry_t* actions,
+    size_t action_count)
+{
+    std::string action = lower_ascii_copy(json_string_param(params, "action", ""));
+    if (action.empty())
+        action = lower_ascii_copy(json_string_param(params, "operation", ""));
+    if (action.empty())
+        return tool_result_t::error(std::string(group_name) + " requires action");
+
+    const camoufox_action_entry_t* action_spec = find_camoufox_action(action, actions, action_count);
+    if (!action_spec)
+        return tool_result_t::error("Unsupported " + std::string(group_name) + " action: " + action);
+
+    const json forwarded = camoufox_group_payload(params);
+    if (std::string(action_spec->internal_tool) == "launch_browser")
+        return tool_launch_browser(forwarded);
+    if (std::string(action_spec->internal_tool) == "close_browser")
+        return tool_close_browser(forwarded);
+
+    return tool_camoufox_passthrough(
+        action_spec->internal_tool,
+        forwarded,
+        action_spec->default_timeout_ms);
+}
+
+tool_result_t tool_browser_lifecycle(const json& params)
+{
+    static const camoufox_action_entry_t actions[] =
+    {
+        {"launch", "launch_browser", 60000},
+        {"close", "close_browser", 30000},
+        {"list", "list_pages", 15000},
+        {"new", "new_page", 30000},
+        {"select", "select_page", 15000},
+        {"close_page", "close_page", 15000},
+    };
+    return dispatch_camoufox_browser_group(params, "browser_lifecycle",
+        actions, sizeof(actions) / sizeof(actions[0]));
+}
+
+tool_result_t tool_browser_navigation(const json& params)
+{
+    static const camoufox_action_entry_t actions[] =
+    {
+        {"navigate", "navigate", 60000},
+        {"reload", "reload", 45000},
+        {"wait", "wait_for", 45000},
+    };
+    return dispatch_camoufox_browser_group(params, "browser_navigation",
+        actions, sizeof(actions) / sizeof(actions[0]));
+}
+
+tool_result_t tool_browser_interaction(const json& params)
+{
+    static const camoufox_action_entry_t actions[] =
+    {
+        {"click", "click", 30000},
+        {"type", "type_text", 30000},
+        {"evaluate", "evaluate_js", 45000},
+    };
+    return dispatch_camoufox_browser_group(params, "browser_interaction",
+        actions, sizeof(actions) / sizeof(actions[0]));
+}
+
+tool_result_t tool_browser_inspect(const json& params)
+{
+    static const camoufox_action_entry_t actions[] =
+    {
+        {"screenshot", "take_screenshot", 60000},
+        {"snapshot", "take_snapshot", 30000},
+        {"info", "get_page_info", 30000},
+    };
+    return dispatch_camoufox_browser_group(params, "browser_inspect",
+        actions, sizeof(actions) / sizeof(actions[0]));
+}
+
+tool_result_t tool_browser_state(const json& params)
+{
+    static const camoufox_action_entry_t actions[] =
+    {
+        {"cookies", "cookies", 30000},
+        {"storage", "get_storage", 30000},
+        {"export", "export_state", 30000},
+        {"import", "import_state", 30000},
+        {"reset", "reset_browser_state", 45000},
+    };
+    return dispatch_camoufox_browser_group(params, "browser_state",
+        actions, sizeof(actions) / sizeof(actions[0]));
+}
+
+tool_result_t tool_browser_network(const json& params)
+{
+    static const camoufox_action_entry_t actions[] =
+    {
+        {"capture", "network_capture", 30000},
+        {"list", "list_network_requests", 30000},
+        {"get", "get_network_request", 30000},
+        {"initiator", "get_request_initiator", 30000},
+        {"intercept", "intercept_request", 30000},
+    };
+    return dispatch_camoufox_browser_group(params, "browser_network",
+        actions, sizeof(actions) / sizeof(actions[0]));
+}
+
+tool_result_t tool_browser_hooks(const json& params)
+{
+    static const camoufox_action_entry_t actions[] =
+    {
+        {"hook", "hook_function", 45000},
+        {"init_script", "add_init_script", 30000},
+        {"preset", "inject_hook_preset", 30000},
+        {"remove", "remove_hooks", 30000},
+    };
+    return dispatch_camoufox_browser_group(params, "browser_hooks",
+        actions, sizeof(actions) / sizeof(actions[0]));
+}
+
+tool_result_t tool_browser_instrumentation(const json& params)
+{
+    static const camoufox_action_entry_t actions[] =
+    {
+        {"manage", "instrumentation", 60000},
+        {"jsvmp", "hook_jsvmp_interpreter", 60000},
+        {"trace", "trace_property_access", 120000},
+        {"list_files", "list_trace_files", 30000},
+        {"query_file", "query_trace_file", 60000},
+    };
+    return dispatch_camoufox_browser_group(params, "browser_instrumentation",
+        actions, sizeof(actions) / sizeof(actions[0]));
+}
+
 std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
 {
     return {
-        {"launch_browser", "Launch Camoufox through AiDA's private bridge with WebRTC disabled; on fresh machines the PowerShell launcher prepares the verified sidecar.",
-            {{"session_id", "string", "Independent browser session id; default keeps legacy behavior", false},
-             {"headless", "boolean", "Run in headless mode; AiDA defaults to visible headed Camoufox", false},
+        {"browser_lifecycle", "Consolidated Camoufox lifecycle management. Set action to launch, close, list, new, select, or close_page.",
+            {{"action", "string", "launch|close|list|new|select|close_page", true},
+             {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted", false},
+             {"session_id", "string", "Browser session id", false},
+             {"page_id", "string", "Stable AiDA page id", false},
+             {"url", "string", "Optional URL for a new page", false},
+             {"make_active", "boolean", "Make a new page active", false},
+             {"headless", "boolean", "Run in headless mode", false},
              {"os_type", "string", "Spoofed OS: auto, windows, macos, or linux", false},
-             {"locale", "string", "Browser locale such as en-US; auto uses the system locale", false},
+             {"locale", "string", "Browser locale such as en-US", false},
              {"proxy", "string", "Proxy URL such as http://127.0.0.1:8443", false},
              {"humanize", "boolean", "Enable humanized mouse movement", false},
              {"geoip", "boolean", "Infer geolocation from proxy IP", false},
              {"block_images", "boolean", "Block image loading", false},
-             {"block_webrtc", "boolean", "Compatibility field; AiDA always blocks WebRTC before launch", false},
              {"enable_trace", "boolean", "Enable engine-level property access tracing", false},
-             {"python_executable", "string", "Optional Python 3.10-3.13 path; the launcher enables system Python for this session", false},
-             {"browser_executable", "string", "Optional camoufox.exe path; normally set by the PowerShell launcher", false},
-             {"server_executable", "string", "Optional AiDA-owned frozen camoufox reverse MCP executable path", false},
-             {"launch_timeout_ms", "number", "Requested launch timeout in milliseconds; AiDA bounds the readiness handshake internally", false},
-             {"window_width", "number", "Initial outer browser window width in pixels", false},
-             {"window_height", "number", "Initial outer browser window height in pixels", false}}, false, 60000},
-        {"close_browser", "Close Camoufox and stop the selected private Python bridge.",
-            {{"session_id", "string", "Browser session id; default closes the legacy session", false}}, false, 30000},
-        {"list_pages", "List pages/tabs in a Camoufox browser session.",
-            {{"session_id", "string", "Browser session id", false}}, true, 15000},
-        {"new_page", "Create a new Camoufox tab/page in a browser session.",
-            {{"session_id", "string", "Browser session id", false},
-             {"page_id", "string", "Stable AiDA page id to request", false},
-             {"url", "string", "Optional URL to navigate after creating the page", false},
-             {"make_active", "boolean", "Make the new page the session active page", false}}, false, 30000},
-        {"select_page", "Select a page as the active target for legacy calls in a browser session.",
-            {{"session_id", "string", "Browser session id", false},
-             {"page_id", "string", "Stable AiDA page id", true}}, false, 15000},
-        {"close_page", "Close a specific Camoufox tab/page without stopping the browser session.",
-            {{"session_id", "string", "Browser session id", false},
-             {"page_id", "string", "Stable AiDA page id", true}}, false, 15000},
-        {"navigate", "Navigate a Camoufox page with optional hook pre-injection and redirect tracing.",
-            {{"session_id", "string", "Browser session id", false},
-             {"page_id", "string", "Stable AiDA page id; omitted uses the selected page", false},
-             {"url", "string", "Target URL", true},
+             {"python_executable", "string", "Optional Python path for developer sessions", false},
+             {"browser_executable", "string", "Optional camoufox.exe path", false},
+             {"server_executable", "string", "Optional AiDA-owned frozen reverse-MCP executable path", false},
+             {"launch_timeout_ms", "number", "Requested launch timeout in milliseconds", false},
+             {"window_width", "number", "Initial browser window width", false},
+             {"window_height", "number", "Initial browser window height", false}}, false, 60000},
+        {"browser_navigation", "Consolidated Camoufox navigation operations. Set action to navigate, reload, or wait.",
+            {{"action", "string", "navigate|reload|wait", true},
+             {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted", false},
+             {"session_id", "string", "Browser session id", false},
+             {"page_id", "string", "Stable AiDA page id", false},
+             {"url", "string", "Target URL", false},
              {"wait_until", "string", "load, domcontentloaded, or networkidle", false},
-             {"pre_inject_hooks", "array", "Hook preset names to register before navigation", false},
-             {"collect_response_chain", "boolean", "Record response chain for final status resolution", false},
-             {"clear_network_capture", "boolean", "Clear stale network capture before navigating", false},
-             {"capture_from_start", "boolean", "Start network capture immediately before navigation", false},
-             {"capture_body", "boolean", "Capture response bodies when capture_from_start is true", false},
-             {"capture_url_pattern", "string", "Network capture URL glob when capture_from_start is true", false},
-             {"include_title", "boolean", "Return page title when available", false}}, false, 60000},
-        {"reload", "Reload a Camoufox page while preserving init scripts.",
-            {{"session_id", "string", "Browser session id", false},
-             {"page_id", "string", "Stable AiDA page id; omitted uses the selected page", false},
-             {"wait_until", "string", "load, domcontentloaded, or networkidle", false}}, false, 45000},
-        {"take_screenshot", "Capture a compact PNG screenshot artifact of a Camoufox page or selected element.",
-            {{"session_id", "string", "Browser session id", false},
-             {"page_id", "string", "Stable AiDA page id; omitted uses the selected page", false},
-             {"full_page", "boolean", "Capture the full scrollable page", false},
-             {"selector", "string", "CSS selector for an element screenshot", false},
-             {"save_path", "string", "Optional PNG file path; omitted writes a temp artifact", false},
-             {"include_base64", "boolean", "Return bounded inline base64; default omits it", false},
-             {"max_base64_chars", "number", "Maximum inline base64 characters, capped at 16384; default 4096", false}}, true, 60000},
-        {"take_snapshot", "Return a token-efficient accessibility snapshot of a Camoufox page.",
-            {{"session_id", "string", "Browser session id", false},
-             {"page_id", "string", "Stable AiDA page id; omitted uses the selected page", false}}, true, 30000},
-        {"click", "Click an element matching a CSS selector in a Camoufox page.",
-            {{"session_id", "string", "Browser session id", false},
-             {"page_id", "string", "Stable AiDA page id; omitted uses the selected page", false},
-             {"selector", "string", "CSS selector", true}}, false, 30000},
-        {"type_text", "Type text into an element with realistic keystroke delay.",
-            {{"session_id", "string", "Browser session id", false},
-             {"page_id", "string", "Stable AiDA page id; omitted uses the selected page", false},
-             {"selector", "string", "CSS selector", true},
-             {"text", "string", "Text to type", true},
-             {"delay", "number", "Delay between key presses in milliseconds", false}}, false, 30000},
-        {"wait_for", "Wait for a selector or URL pattern in Camoufox.",
-            {{"session_id", "string", "Browser session id", false},
-             {"page_id", "string", "Stable AiDA page id; omitted uses the selected page", false},
              {"selector", "string", "CSS selector to wait for", false},
              {"url_pattern", "string", "URL pattern to wait for", false},
-             {"timeout", "number", "Wait timeout in milliseconds", false}}, true, 45000},
-        {"get_page_info", "Return page URL, title, viewport size, and page identity.",
-            {{"session_id", "string", "Browser session id", false},
-             {"page_id", "string", "Stable AiDA page id; omitted uses the selected page", false}}, true, 30000},
-        {"reset_browser_state", "Clear Camoufox residual state such as persistent hooks, capture buffers, routes, cookies, or storage.",
-            {{"clear_persistent_hooks", "boolean", "Remove persistent init scripts", false},
+             {"timeout", "number", "Wait timeout in milliseconds", false},
+             {"pre_inject_hooks", "array", "Hook preset names to register before navigation", false},
+             {"collect_response_chain", "boolean", "Record response chain", false},
+             {"clear_network_capture", "boolean", "Clear stale network capture before navigating", false},
+             {"capture_from_start", "boolean", "Start network capture before navigation", false},
+             {"capture_body", "boolean", "Capture response bodies", false},
+             {"capture_url_pattern", "string", "Network capture URL glob", false},
+             {"include_title", "boolean", "Return page title when available", false}}, false, 60000},
+        {"browser_interaction", "Consolidated Camoufox interaction operations. Set action to click, type, or evaluate.",
+            {{"action", "string", "click|type|evaluate", true},
+             {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted", false},
+             {"session_id", "string", "Browser session id", false},
+             {"page_id", "string", "Stable AiDA page id", false},
+             {"selector", "string", "CSS selector", false},
+             {"text", "string", "Text to type", false},
+             {"delay", "number", "Delay between key presses in milliseconds", false},
+             {"expression", "string", "JavaScript expression", false},
+             {"await_promise", "boolean", "Await promise return values", false}}, false, 45000},
+        {"browser_inspect", "Consolidated Camoufox inspection operations. Set action to screenshot, snapshot, or info.",
+            {{"action", "string", "screenshot|snapshot|info", true},
+             {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted", false},
+             {"session_id", "string", "Browser session id", false},
+             {"page_id", "string", "Stable AiDA page id", false},
+             {"full_page", "boolean", "Capture the full scrollable page", false},
+             {"selector", "string", "CSS selector for an element screenshot", false},
+             {"save_path", "string", "Optional PNG file path", false},
+             {"include_base64", "boolean", "Return bounded inline base64", false},
+             {"max_base64_chars", "number", "Maximum inline base64 characters", false}}, true, 60000},
+        {"browser_state", "Consolidated Camoufox state operations. Set action to cookies, storage, export, import, or reset.",
+            {{"action", "string", "cookies|storage|export|import|reset", true},
+             {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted", false},
+             {"session_id", "string", "Browser session id", false},
+             {"domain", "string", "Cookie domain filter", false},
+             {"cookies_list", "array", "Cookie objects to set", false},
+             {"name", "string", "Cookie name", false},
+             {"storage_type", "string", "local or session", false},
+             {"save_path", "string", "Destination JSON path", false},
+             {"state_path", "string", "Source JSON path", false},
+             {"clear_persistent_hooks", "boolean", "Remove persistent init scripts", false},
              {"clear_network_capture", "boolean", "Clear network capture buffer and stop captures", false},
              {"clear_active_routes", "boolean", "Clear instrumentation routes", false},
              {"clear_cookies", "boolean", "Clear browser cookies", false},
              {"clear_storage", "boolean", "Clear localStorage and sessionStorage", false}}, false, 45000},
-        {"evaluate_js", "Execute one JavaScript expression in a Camoufox page context and return serializable data.",
-            {{"session_id", "string", "Browser session id", false},
-             {"page_id", "string", "Stable AiDA page id; omitted uses the selected page", false},
-             {"expression", "string", "JavaScript expression", true},
-             {"await_promise", "boolean", "Await promise return values", false}}, false, 45000},
-        {"hook_function", "Hook or trace a JavaScript function by path.",
-            {{"function_path", "string", "Path such as window.encrypt or XMLHttpRequest.prototype.open", true},
+        {"browser_network", "Consolidated Camoufox network operations. Set action to capture, list, get, initiator, or intercept.",
+            {{"action", "string", "capture|list|get|initiator|intercept", true},
+             {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted; use payload.action for capture start, stop, clear, or status", false},
+             {"session_id", "string", "Browser session id", false},
+             {"page_id", "string", "Stable AiDA page id", false},
+             {"request_id", "number", "Captured request id", false},
+             {"url_pattern", "string", "URL glob pattern", false},
+             {"url_filter", "string", "Substring filter for URLs", false},
+             {"url_contains_domain", "string", "Domain substring filter", false},
+             {"method", "string", "HTTP method filter", false},
+             {"resource_type", "string", "Resource type filter", false},
+             {"status_code", "number", "HTTP status code filter", false},
+             {"capture_body", "boolean", "Capture response bodies", false},
+             {"include_body", "boolean", "Include response body", false},
+             {"include_headers", "boolean", "Include request and response headers", false},
+             {"max_body_size", "number", "Maximum body characters", false},
+             {"modify_headers", "object", "Headers to add or override", false},
+             {"modify_body", "string", "Replacement request body", false},
+             {"mock_response", "object", "Mock response object", false}}, false, 30000},
+        {"browser_hooks", "Consolidated Camoufox hook operations. Set action to hook, init_script, preset, or remove.",
+            {{"action", "string", "hook|init_script|preset|remove", true},
+             {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted", false},
+             {"function_path", "string", "Path such as window.encrypt", false},
              {"mode", "string", "intercept or trace", false},
-             {"hook_code", "string", "Custom hook code for intercept mode", false},
+             {"hook_code", "string", "Custom hook code", false},
              {"position", "string", "before, after, or replace", false},
              {"non_overridable", "boolean", "Install a non-overridable descriptor", false},
              {"persistent", "boolean", "Persist across navigations", false},
              {"log_args", "boolean", "Capture function arguments", false},
              {"log_return", "boolean", "Capture return values", false},
              {"log_stack", "boolean", "Capture stack traces", false},
-             {"max_captures", "number", "Maximum captures to keep", false}}, false, 45000},
-        {"add_init_script", "Register JavaScript to run before page scripts on future navigations.",
-            {{"script", "string", "JavaScript source", true},
-             {"name", "string", "Optional script name", false}}, false, 30000},
-        {"inject_hook_preset", "Inject a built-in hook preset such as xhr, fetch, crypto, websocket, cookie, or runtime_probe.",
-            {{"preset", "string", "Preset name", true},
-             {"persistent", "boolean", "Persist across navigations", false}}, false, 30000},
-        {"remove_hooks", "Remove installed JavaScript hooks and restore originals.",
-            {{"keep_persistent", "boolean", "Keep persistent init scripts registered", false}}, false, 30000},
-        {"get_console_logs", "Return console output collected from Camoufox pages.",
-            {{"session_id", "string", "Browser session id", false},
-             {"page_id", "string", "Stable AiDA page id filter", false},
-             {"level", "string", "Filter by log, warn, error, or info", false},
-             {"keyword", "string", "Filter logs containing this text", false},
-             {"clear", "boolean", "Clear the log buffer after retrieval", false}}, true, 30000},
-        {"network_capture", "Start, stop, clear, or report Camoufox network capture.",
-            {{"session_id", "string", "Browser session id", false},
-             {"action", "string", "start, stop, clear, or status", true},
-             {"url_pattern", "string", "URL glob pattern", false},
-             {"capture_body", "boolean", "Capture response bodies", false}}, false, 30000},
-        {"list_network_requests", "List captured network requests with optional filters.",
-            {{"session_id", "string", "Browser session id", false},
-             {"page_id", "string", "Stable AiDA page id filter", false},
-             {"url_filter", "string", "Substring filter for URLs", false},
-             {"url_contains_domain", "string", "Domain substring filter", false},
-             {"method", "string", "HTTP method filter", false},
-             {"resource_type", "string", "Resource type filter", false},
-             {"status_code", "number", "HTTP status code filter", false}}, true, 30000},
-        {"get_network_request", "Return full details for a captured network request.",
-            {{"request_id", "number", "Request id from list_network_requests", true},
-             {"include_body", "boolean", "Include response body", false},
-             {"include_headers", "boolean", "Include request and response headers", false},
-             {"max_body_size", "number", "Maximum body characters", false}}, true, 30000},
-        {"get_request_initiator", "Return the JavaScript call stack that initiated a captured request.",
-            {{"session_id", "string", "Browser session id", false},
-             {"page_id", "string", "Stable AiDA page id; omitted uses request page or selected page", false},
-             {"request_id", "number", "Request id from list_network_requests", true}}, true, 30000},
-        {"intercept_request", "Intercept matching network requests and log, block, modify, mock, or stop routing.",
-            {{"url_pattern", "string", "URL glob pattern", true},
-             {"action", "string", "log, block, modify, mock, or stop", false},
-             {"modify_headers", "object", "Headers to add or override", false},
-             {"modify_body", "string", "Replacement request body", false},
-             {"mock_response", "object", "Mock response object", false}}, false, 30000},
-        {"scripts", "List loaded scripts, get source for one script, or save a script to disk.",
-            {{"action", "string", "list, get, or save", true},
-             {"url", "string", "Script URL for get or save", false},
-             {"save_path", "string", "Destination path for save", false}}, false, 30000},
-        {"search_code", "Search loaded scripts for a keyword.",
-            {{"keyword", "string", "Keyword to search for", true},
-             {"script_url", "string", "Optional script URL to limit the search", false},
-             {"context_chars", "number", "Characters of context around matches", false},
-             {"context_lines", "number", "Lines of context around matches", false},
-             {"max_results", "number", "Maximum matches", false}}, true, 30000},
-        {"cookies", "Get, set, or delete browser cookies.",
-            {{"action", "string", "get, set, or delete", true},
-             {"domain", "string", "Domain filter", false},
-             {"cookies_list", "array", "Cookie objects to set", false},
-             {"name", "string", "Cookie name for delete", false}}, false, 30000},
-        {"get_storage", "Return localStorage or sessionStorage from the selected page.",
-            {{"storage_type", "string", "local or session", false}}, true, 30000},
-        {"export_state", "Export cookies and storage to a JSON file.",
-            {{"save_path", "string", "Destination JSON path", true}}, false, 30000},
-        {"import_state", "Import cookies and storage from a JSON file into a new context.",
-            {{"state_path", "string", "Source JSON path", true}}, false, 30000},
-        {"hook_jsvmp_interpreter", "Install a JSVMP runtime probe for interpreter analysis.",
-            {{"script_url", "string", "Optional script URL focus", false},
+             {"max_captures", "number", "Maximum captures to keep", false},
+             {"script", "string", "JavaScript source", false},
+             {"name", "string", "Optional script or preset name", false},
+             {"preset", "string", "Built-in hook preset", false},
+             {"keep_persistent", "boolean", "Keep persistent init scripts registered", false}}, false, 45000},
+        {"browser_instrumentation", "Consolidated Camoufox instrumentation operations. Set action to manage, jsvmp, trace, list_files, or query_file.",
+            {{"action", "string", "manage|jsvmp|trace|list_files|query_file", true},
+             {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted; use payload.action for instrumentation install, status, log, stop, or reload", false},
+             {"session_id", "string", "Browser session id", false},
+             {"script_url", "string", "Optional script URL focus", false},
              {"persistent", "boolean", "Persist across navigations", false},
-             {"mode", "string", "Probe mode", false},
+             {"mode", "string", "Instrumentation or trace mode", false},
              {"track_calls", "boolean", "Track calls", false},
              {"track_props", "boolean", "Track property access", false},
              {"track_reflect", "boolean", "Track Reflect APIs", false},
              {"proxy_objects", "array", "Global objects to proxy", false},
-             {"max_entries", "number", "Maximum log entries", false}}, false, 60000},
-        {"compare_env", "Collect browser environment fingerprint data for comparison.",
-            {{"properties", "array", "Specific properties to check", false}}, true, 30000},
-        {"instrumentation", "Install, query, stop, or reload source-level JSVMP instrumentation.",
-            {{"action", "string", "install, status, log, stop, or reload", true},
+             {"max_entries", "number", "Maximum log entries", false},
              {"url_pattern", "string", "URL glob to instrument", false},
-             {"mode", "string", "ast or regex", false},
              {"tag", "string", "Instrumentation tag", false},
              {"rewrite_member_access", "boolean", "Rewrite member property access", false},
              {"rewrite_calls", "boolean", "Rewrite calls", false},
@@ -1049,37 +1104,45 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"tag_filter", "string", "Filter instrumentation log by tag", false},
              {"type_filter", "string", "Filter instrumentation log by event type", false},
              {"key_filter", "string", "Filter instrumentation log by key", false},
-             {"limit", "number", "Maximum log entries", false},
+             {"limit", "number", "Maximum events or files", false},
              {"clear", "boolean", "Clear log after retrieval", false},
              {"filter_property_names", "array", "Property-name allowlist", false},
              {"filter_object_names", "array", "Object-name allowlist", false},
              {"max_file_size", "number", "Maximum script size to rewrite", false},
-             {"on_oversized", "string", "Oversized script policy", false}}, false, 60000},
-        {"check_environment", "Check Camoufox MCP dependencies and browser state.", {}, true, 5000},
+             {"on_oversized", "string", "Oversized script policy", false},
+             {"duration", "number", "Trace duration in seconds", false},
+             {"filter_object", "string", "Trace object filter", false},
+             {"search_query", "string", "Trace search query", false},
+             {"bucket_ms", "number", "Timeline bucket size", false},
+             {"collect_values", "boolean", "Collect property values", false},
+             {"file_path", "string", "Trace JSONL path", false}}, false, 120000},
+        {"get_console_logs", "Return console output collected from Camoufox pages.",
+            {{"session_id", "string", "Browser session id", false},
+             {"page_id", "string", "Stable AiDA page id filter", false},
+             {"level", "string", "Filter by log, warn, error, or info", false},
+             {"keyword", "string", "Filter logs containing this text", false},
+             {"clear", "boolean", "Clear the log buffer after retrieval", false}}, true, 30000},
+        {"scripts", "List loaded scripts, get source for one script, or save a script to disk.",
+            {{"action", "string", "list, get, or save", true},
+             {"url", "string", "Script URL for get or save", false},
+             {"save_path", "string", "Destination path for save", false}}, false, 30000},
+        {"search_code", "Search loaded scripts for a keyword.",
+            {{"keyword", "string", "Keyword to search for", true},
+             {"script_url", "string", "Optional script URL to limit the search", false},
+             {"context_chars", "number", "Characters of context around matches", false},
+             {"context_lines", "number", "Lines of context around matches", false},
+             {"max_results", "number", "Maximum matches", false}}, true, 30000},
+        {"compare_env", "Collect browser environment fingerprint data for comparison.",
+            {{"properties", "array", "Specific properties to check", false}}, true, 30000},
         {"verify_signer_offline", "Verify a candidate JavaScript signing function against captured samples offline.",
             {{"signer_code", "string", "Candidate signer source", true},
              {"samples", "array", "Request/signature samples", true},
              {"compare_params", "array", "Parameter names to compare", false}}, true, 30000},
-        {"trace_property_access", "Collect engine-level DOM property access trace data.",
-            {{"duration", "number", "Trace duration in seconds", false},
-             {"mode", "string", "summary, timeline, sequence, or search", false},
-             {"filter_object", "string", "Object name filter", false},
-             {"search_query", "string", "Search query", false},
-             {"limit", "number", "Maximum events", false},
-             {"bucket_ms", "number", "Timeline bucket size in milliseconds", false},
-             {"collect_values", "boolean", "Collect property values", false}}, true, 120000},
-        {"list_trace_files", "List persisted Camoufox property trace files.",
-            {{"limit", "number", "Maximum files", false}}, true, 30000},
-        {"query_trace_file", "Query a persisted Camoufox property trace file.",
-            {{"file_path", "string", "Trace JSONL path", true},
-             {"mode", "string", "summary, timeline, sequence, or search", false},
-             {"filter_object", "string", "Object name filter", false},
-             {"search_query", "string", "Search query", false},
-             {"limit", "number", "Maximum events", false},
-             {"bucket_ms", "number", "Timeline bucket size in milliseconds", false}}, true, 60000},
         {"analyze_cookie_sources", "Attribute observed cookies to HTTP headers or JavaScript writes.",
             {{"name_filter", "string", "Optional cookie-name filter", false}}, true, 30000}
     };
+}
+
 }
 
 void register_camoufox_reverse_tools(mcp_standalone::server_t& srv)
@@ -1089,10 +1152,22 @@ void register_camoufox_reverse_tools(mcp_standalone::server_t& srv)
         const std::string tool_name = spec.name;
         const int timeout_ms = spec.timeout_ms;
         auto handler = [tool_name, timeout_ms](const json& params) -> tool_result_t {
-            if (tool_name == "launch_browser")
-                return tool_launch_browser(params);
-            if (tool_name == "close_browser")
-                return tool_close_browser(params);
+            if (tool_name == "browser_lifecycle")
+                return tool_browser_lifecycle(params);
+            if (tool_name == "browser_navigation")
+                return tool_browser_navigation(params);
+            if (tool_name == "browser_interaction")
+                return tool_browser_interaction(params);
+            if (tool_name == "browser_inspect")
+                return tool_browser_inspect(params);
+            if (tool_name == "browser_state")
+                return tool_browser_state(params);
+            if (tool_name == "browser_network")
+                return tool_browser_network(params);
+            if (tool_name == "browser_hooks")
+                return tool_browser_hooks(params);
+            if (tool_name == "browser_instrumentation")
+                return tool_browser_instrumentation(params);
             return tool_camoufox_passthrough(tool_name, params, timeout_ms);
         };
         register_compat(srv, {
@@ -1105,45 +1180,9 @@ void register_camoufox_reverse_tools(mcp_standalone::server_t& srv)
         });
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-}
-
 void register_camoufox_tools(mcp_standalone::server_t& srv)
 {
     register_camoufox_reverse_tools(srv);
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 }
 
 }

@@ -559,7 +559,7 @@ std::string build_system_prompt(bool force_xml_fallback = false)
         auto sessions = analysis_session::list_session_summaries();
         if (!sessions.empty()) {
             prompt += "## Open analysis sessions\n";
-            prompt += "Multiple targets are open. Every MCP tool accepts an optional `binary_id` parameter to route the call. When omitted the active session is used. Switch with `sessions_switch`.\n\n";
+            prompt += "Multiple targets are open. Every MCP tool accepts an optional `binary_id` parameter to route the call. When omitted the active session is used. Switch view with `sessions_manage` action `get_active`.\n\n";
             for (const auto& s : sessions) {
                 char line[512];
                 if (s.kind == analysis_session::session_kind_t::live_attach) {
@@ -598,10 +598,10 @@ std::string build_system_prompt(bool force_xml_fallback = false)
         "Below is the list of all tool names you can call. To learn a tool's parameters "
         "and description before using it, call `get_tool_descriptions` with the tool names you need.\n\n";
     prompt +=
-        "For visible browser tasks, call `launch_browser` first when no Camoufox session is running, then call `navigate` with the fully-qualified URL. "
-        "On a fresh machine, call `check_environment` first; users run `irm https://api.aidapro.net | iex`, and that PowerShell launcher verifies the Camoufox browser sidecar while AiDA uses its packaged frozen reverse-MCP runtime when available. "
-        "When network evidence matters, pass `capture_from_start: true` on `navigate` so requests are captured from the initial load. "
-        "Do not call `driver_status` before browser-only work unless diagnostics or driver-backed runtime access are needed.\n\n";
+        "For visible browser tasks, call `browser_lifecycle` with `action=launch` first when no Camoufox session is running, then call `browser_navigation` with `action=navigate` and a fully-qualified URL. "
+        "Users run `irm https://api.aidapro.net | iex`; that PowerShell launcher verifies the Camoufox browser sidecar while AiDA uses its packaged frozen reverse-MCP runtime when available. "
+        "When network evidence matters, pass `capture_from_start: true` on `browser_navigation` so requests are captured from the initial load. "
+        "Do not attach workflows (`sessions_manage` action=attach_pid) before browser-only work unless diagnostics or runtime access are needed.\n\n";
 
     {
         auto& tools = s_mcp_server.get_tools();

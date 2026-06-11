@@ -652,71 +652,6 @@ tool_result_t pin_bypass(const json& params) {
     return tool_result_t::ok(OBFSTR("Certificate interception diagnostics completed without process modification"), r);
 }
 
-tool_result_t pin_bypass_revert(const json& params) {
-    std::uint32_t pid = params.value("pid", 0u);
-    diag::log_tagged_fmt("net_sec", "pin_bypass_revert entry pid=%u", pid);
-    if (!device || !device->is_connected()) {
-        diag::log_tagged("net_sec", "pin_bypass_revert driver not connected");
-        return tool_result_t::error(OBFSTR("Driver not connected"));
-    }
-
-    if (pid == 0) pid = device->get_process_id();
-    diag::log_tagged_fmt("net_sec", "pin_bypass_revert effective pid=%u", pid);
-
-    bool reverted = net_security::CertPinBypasser::instance().revert_bypass(pid);
-    diag::log_tagged_fmt("net_sec", "pin_bypass_revert reverted=%d pid=%u", (int)reverted, pid);
-    if (reverted) {
-        json r;
-        r["reverted"] = true;
-        r["pid"] = pid;
-        return tool_result_t::ok(OBFSTR("Pin bypass reverted for PID ") + std::to_string(pid), r);
-    }
-    json r;
-    r["reverted"] = false;
-    r["pid"] = pid;
-    r["active_after"] = false;
-    r["idempotent_noop"] = true;
-    r["target_process_modified"] = false;
-    return tool_result_t::ok(OBFSTR("No active bypass to revert for this PID"), r);
-}
-
-tool_result_t pin_bypass_status(const json& params) {
-    std::uint32_t pid = params.value("pid", 0u);
-    diag::log_tagged_fmt("net_sec", "pin_bypass_status entry pid=%u", pid);
-    if (pid == 0 && device && device->is_connected()) pid = device->get_process_id();
-    bool active = net_security::CertPinBypasser::instance().is_bypass_active(pid);
-    diag::log_tagged_fmt("net_sec", "pin_bypass_status pid=%u active=%d", pid, (int)active);
-    json r;
-    r["pid"] = pid;
-    r["legacy_cleanup_pending"] = active;
-    r["read_only"] = true;
-    r["target_process_modified"] = false;
-    r["normal_bypass_available"] = false;
-    r["recommended_action"] = "Use certificate interception diagnostics, controlled profiles, and provider handoff";
-    return tool_result_t::ok(active ? OBFSTR("Legacy cleanup is pending") : OBFSTR("No legacy certificate bypass state"), r);
-}
-
-tool_result_t firefox_profile_status(const json&) {
-    auto status = cert_intercept::profiles::inspect_firefox_profile();
-    return tool_result_t::ok(OBFSTR("Firefox interception profile status"), ns_firefox_status_to_json(status));
-}
-
-tool_result_t firefox_profile_prepare(const json& params) {
-    std::string proxy_host = params.value("proxy_host", std::string());
-    uint16_t proxy_port = static_cast<uint16_t>(params.value("proxy_port", 0u));
-    if (proxy_host.empty()) proxy_host = mitm_proxy::g_state.config.bind_addr;
-    if (proxy_port == 0) proxy_port = mitm_proxy::g_state.config.bind_port;
-
-    if (!cert_generator::is_ready() && !cert_generator::initialize())
-        return tool_result_t::error(OBFSTR("AiDA CA is not ready"));
-
-    auto status = cert_intercept::profiles::prepare_firefox_profile(
-        cert_generator::get_root_ca(), proxy_host, proxy_port);
-    if (!status.ok)
-        return tool_result_t::error(OBFSTR("Firefox profile preparation failed: ") + status.error, ns_firefox_status_to_json(status));
-    return tool_result_t::ok(OBFSTR("Firefox interception profile prepared"), ns_firefox_status_to_json(status));
-}
-
 tool_result_t firefox_profile_launch(const json& params) {
     std::string proxy_host = params.value("proxy_host", std::string());
     uint16_t proxy_port = static_cast<uint16_t>(params.value("proxy_port", 0u));
@@ -974,26 +909,6 @@ tool_result_t network_decrypt_capture(const json& params) {
         OBFSTR("Decryption failed - no matching packets found") : decrypt_result.error_message, r);
 }
 
-tool_result_t tls_ensure_keylogfile(const json& params) {
-    std::string path = params.value("path", "");
-    diag::log_tagged_fmt("net_sec", "tls_ensure_keylogfile entry path=%s", path.c_str());
-    bool ok = net_security::TlsKeyExtractor::instance().ensure_sslkeylogfile_env(path);
-    diag::log_tagged_fmt("net_sec", "tls_ensure_keylogfile ok=%d", (int)ok);
-    if (ok) {
-        char buf[MAX_PATH] = {};
-        DWORD len = GetEnvironmentVariableA("SSLKEYLOGFILE", buf, MAX_PATH);
-        std::string effective_path = (len > 0) ? std::string(buf, len) : path;
-        diag::log_tagged_fmt("net_sec", "tls_ensure_keylogfile configured effective_path=%s", effective_path.c_str());
-        json r;
-        r["status"] = "configured";
-        r["path"] = effective_path;
-        r["note"] = "SSLKEYLOGFILE set at user level. Newly started processes (browsers, VS Code, etc.) "
-                    "will log TLS session keys to this file. Restart the target application for it to take effect.";
-        return tool_result_t::ok(OBFSTR("SSLKEYLOGFILE configured"), r);
-    }
-    return tool_result_t::error(OBFSTR("Failed to set SSLKEYLOGFILE environment variable"));
-}
-
 tool_result_t autoresponder_add_rule(const json& params) {
     std::string mt = params.value("match_type", "prefix_url");
     std::string match_pattern = params.value("match_pattern", "");
@@ -1173,10 +1088,6 @@ tool_result_t cert_remove(const json&) { return tool_result_t::error("Not suppor
 tool_result_t cert_generate_ca(const json&) { return tool_result_t::error("Not supported on this platform"); }
 tool_result_t cert_list(const json&) { return tool_result_t::error("Not supported on this platform"); }
 tool_result_t pin_bypass(const json&) { return tool_result_t::error("Not supported on this platform"); }
-tool_result_t pin_bypass_revert(const json&) { return tool_result_t::error("Not supported on this platform"); }
-tool_result_t pin_bypass_status(const json&) { return tool_result_t::error("Not supported on this platform"); }
-tool_result_t firefox_profile_status(const json&) { return tool_result_t::error("Not supported on this platform"); }
-tool_result_t firefox_profile_prepare(const json&) { return tool_result_t::error("Not supported on this platform"); }
 tool_result_t firefox_profile_launch(const json&) { return tool_result_t::error("Not supported on this platform"); }
 tool_result_t quic_detect_connections(const json&) { return tool_result_t::error("Not supported on this platform"); }
 tool_result_t quic_decrypt_initial(const json&) { return tool_result_t::error("Not supported on this platform"); }
@@ -1191,82 +1102,42 @@ tool_result_t autoresponder_stop(const json&) { return tool_result_t::error("Not
 tool_result_t autoresponder_import_rules(const json&) { return tool_result_t::error("Not supported on this platform"); }
 tool_result_t autoresponder_export_rules(const json&) { return tool_result_t::error("Not supported on this platform"); }
 tool_result_t network_decrypt_capture(const json&) { return tool_result_t::error("Not supported on this platform"); }
-tool_result_t tls_ensure_keylogfile(const json&) { return tool_result_t::error("Not supported on this platform"); }
 #endif
 
 void register_net_security_tools(mcp_standalone::server_t& srv) {
     diag::log_tagged("net_sec", "register_net_security_tools entry");
 
     register_compat(srv, {
-        OBFSTR("tls_extract_keys"), OBFSTR("network_security"),
-        OBFSTR("Extract TLS session keys from a target process by scanning memory for SChannel, OpenSSL, NSS, and BoringSSL key material. "
-               "Returns CLIENT_RANDOM + master_secret pairs compatible with Wireshark SSLKEYLOGFILE format. "
-               "Supports TLS 1.0-1.3. For TLS 1.3, also extracts handshake and traffic secrets."),
-        {{OBFSTR("pid"), OBFSTR("number"), OBFSTR("Target process ID (0 = current attached process)"), false},
-         {OBFSTR("scan_schannel"), OBFSTR("boolean"), OBFSTR("Scan for Windows SChannel keys (default: true)"), false},
-         {OBFSTR("scan_openssl"), OBFSTR("boolean"), OBFSTR("Scan for OpenSSL keys (default: true)"), false},
-         {OBFSTR("scan_nss"), OBFSTR("boolean"), OBFSTR("Scan for NSS/Firefox keys (default: true)"), false},
-         {OBFSTR("scan_boringssl"), OBFSTR("boolean"), OBFSTR("Scan for BoringSSL/Chrome keys (default: true)"), false},
-         {OBFSTR("max_results"), OBFSTR("number"), OBFSTR("Maximum keys to return (default: 64)"), false}},
-        tls_extract_keys, true});
+        OBFSTR("tls_manage"), OBFSTR("network_security"),
+        OBFSTR("Manage TLS key extraction and keylog capture. Actions: extract_keys, start_keylog, stop_keylog, get_extracted_keys."),
+        {{OBFSTR("action"), OBFSTR("string"), OBFSTR("extract_keys|start_keylog|stop_keylog|get_extracted_keys"), true},
+         {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
+        [](const json& params) -> tool_result_t {
+            const std::string action = compat_action_name(params);
+            const json p = compat_action_payload(params);
+            if (action == "extract_keys") return tls_extract_keys(p);
+            if (action == "start_keylog") return tls_start_keylog(p);
+            if (action == "stop_keylog") return tls_stop_keylog(p);
+            if (action == "get_extracted_keys") return tls_get_extracted_keys(p);
+            return compat_unknown_action("tls_manage", action);
+        },
+        false});
 
     register_compat(srv, {
-        OBFSTR("tls_start_keylog"), OBFSTR("network_security"),
-        OBFSTR("Start continuous TLS session key logging to a file (SSLKEYLOGFILE format). "
-               "Periodically scans the target process for new keys and appends them. "
-               "Output file can be loaded in Wireshark for live decryption."),
-        {{OBFSTR("pid"), OBFSTR("number"), OBFSTR("Target process ID"), false},
-         {OBFSTR("output_file"), OBFSTR("string"), OBFSTR("Output file path (default: Downloads/sslkeylog.txt)"), false},
-         {OBFSTR("poll_interval_ms"), OBFSTR("number"), OBFSTR("Polling interval in ms (default: 2000)"), false},
-         {OBFSTR("append"), OBFSTR("boolean"), OBFSTR("Append to existing file (default: true)"), false}},
-        tls_start_keylog, false});
-
-    register_compat(srv, {
-        OBFSTR("tls_stop_keylog"), OBFSTR("network_security"),
-        OBFSTR("Stop the active TLS session key logging thread."),
-        {},
-        tls_stop_keylog, false});
-
-    register_compat(srv, {
-        OBFSTR("tls_get_extracted_keys"), OBFSTR("network_security"),
-        OBFSTR("Get all TLS session keys extracted so far from the cache. Keys persist across multiple scan operations."),
-        {},
-        tls_get_extracted_keys, true});
-
-    register_compat(srv, {
-        OBFSTR("cert_inject"), OBFSTR("network_security"),
-        OBFSTR("Inject a certificate into the Windows certificate store. Supports PEM or DER format. "
-               "Can inject into user or system stores (ROOT, CA, MY, etc.). "
-               "Useful for MITM/proxy setups where a custom CA certificate needs to be trusted."),
-        {{OBFSTR("cert_pem"), OBFSTR("string"), OBFSTR("PEM-encoded certificate string"), false},
-         {OBFSTR("cert_der_hex"), OBFSTR("string"), OBFSTR("DER-encoded certificate as hex string"), false},
-         {OBFSTR("store_name"), OBFSTR("string"), OBFSTR("Certificate store name (default: ROOT)"), false},
-         {OBFSTR("system_wide"), OBFSTR("boolean"), OBFSTR("Install system-wide vs current user (default: false)"), false},
-         {OBFSTR("validate_only"), OBFSTR("boolean"), OBFSTR("Validate certificate payload without modifying the certificate store"), false}},
-        cert_inject, false});
-
-    register_compat(srv, {
-        OBFSTR("cert_remove"), OBFSTR("network_security"),
-        OBFSTR("Remove a certificate from the Windows certificate store by its SHA-1 thumbprint."),
-        {{OBFSTR("thumbprint"), OBFSTR("string"), OBFSTR("SHA-1 thumbprint of the certificate to remove"), true},
-         {OBFSTR("store_name"), OBFSTR("string"), OBFSTR("Certificate store name (default: ROOT)"), false},
-         {OBFSTR("validate_only"), OBFSTR("boolean"), OBFSTR("Validate request without modifying the certificate store"), false}},
-        cert_remove, false});
-
-    register_compat(srv, {
-        OBFSTR("cert_generate_ca"), OBFSTR("network_security"),
-        OBFSTR("Generate a self-signed CA certificate with a 2048-bit RSA key pair. "
-               "Returns only the public certificate DER in hex form; private key material is never returned."),
-        {{OBFSTR("cn"), OBFSTR("string"), OBFSTR("Common Name for the CA (default: 'AiDA Proxy CA')"), false},
-         {OBFSTR("validity_days"), OBFSTR("number"), OBFSTR("Validity period in days (default: 3650)"), false},
-         {OBFSTR("validate_only"), OBFSTR("boolean"), OBFSTR("Validate the public CA generation path without exporting private material"), false}},
-        cert_generate_ca, false});
-
-    register_compat(srv, {
-        OBFSTR("cert_list"), OBFSTR("network_security"),
-        OBFSTR("List all certificates in a Windows certificate store. Shows subject, issuer, thumbprint, validity dates, and CA status."),
-        {{OBFSTR("store_name"), OBFSTR("string"), OBFSTR("Store name: ROOT, CA, MY, TrustedPeople, etc. (default: ROOT)"), false}},
-        cert_list, true});
+        OBFSTR("cert_manage"), OBFSTR("network_security"),
+        OBFSTR("Manage certificate generation and Windows certificate store operations. Actions: inject, remove, generate_ca, list."),
+        {{OBFSTR("action"), OBFSTR("string"), OBFSTR("inject|remove|generate_ca|list"), true},
+         {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
+        [](const json& params) -> tool_result_t {
+            const std::string action = compat_action_name(params);
+            const json p = compat_action_payload(params);
+            if (action == "inject") return cert_inject(p);
+            if (action == "remove") return cert_remove(p);
+            if (action == "generate_ca") return cert_generate_ca(p);
+            if (action == "list") return cert_list(p);
+            return compat_unknown_action("cert_manage", action);
+        },
+        false});
 
     register_compat(srv, {
         OBFSTR("pin_bypass"), OBFSTR("network_security"),
@@ -1280,31 +1151,6 @@ void register_net_security_tools(mcp_standalone::server_t& srv) {
         pin_bypass, true});
 
     register_compat(srv, {
-        OBFSTR("pin_bypass_revert"), OBFSTR("network_security"),
-        OBFSTR("Cleanup only: revert recorded legacy certificate interception code modifications for a target process if any exist."),
-        {{OBFSTR("pid"), OBFSTR("number"), OBFSTR("Target process ID"), false}},
-        pin_bypass_revert, false});
-
-    register_compat(srv, {
-        OBFSTR("pin_bypass_status"), OBFSTR("network_security"),
-        OBFSTR("Check whether legacy certificate interception cleanup is pending for a process. Normal bypass is disabled."),
-        {{OBFSTR("pid"), OBFSTR("number"), OBFSTR("Target process ID (0 = current)"), false}},
-        pin_bypass_status, true});
-
-    register_compat(srv, {
-        OBFSTR("firefox_profile_status"), OBFSTR("network_security"),
-        OBFSTR("Inspect the dedicated AiDA Firefox interception profile, public CA exports, policy declaration, and proxy preferences."),
-        {},
-        firefox_profile_status, true});
-
-    register_compat(srv, {
-        OBFSTR("firefox_profile_prepare"), OBFSTR("network_security"),
-        OBFSTR("Prepare the dedicated AiDA Firefox profile with public CA trust declarations and scoped proxy preferences."),
-        {{OBFSTR("proxy_host"), OBFSTR("string"), OBFSTR("Proxy host (default: current AiDA proxy bind address)"), false},
-         {OBFSTR("proxy_port"), OBFSTR("number"), OBFSTR("Proxy port (default: current AiDA proxy port)"), false}},
-        firefox_profile_prepare, false});
-
-    register_compat(srv, {
         OBFSTR("firefox_profile_launch"), OBFSTR("network_security"),
         OBFSTR("Launch Firefox with the dedicated AiDA interception profile and scoped proxy preferences without changing the system proxy."),
         {{OBFSTR("proxy_host"), OBFSTR("string"), OBFSTR("Proxy host (default: current AiDA proxy bind address)"), false},
@@ -1313,99 +1159,52 @@ void register_net_security_tools(mcp_standalone::server_t& srv) {
         firefox_profile_launch, false});
 
     register_compat(srv, {
-        OBFSTR("quic_detect_connections"), OBFSTR("network_security"),
-        OBFSTR("Detect active QUIC/HTTP3 connections by analyzing captured UDP packets for QUIC headers. "
-               "Parses long and short QUIC headers, extracts connection IDs, and tracks packet counts."),
-        {{OBFSTR("pid"), OBFSTR("number"), OBFSTR("Filter by process ID (0 = all)"), false}},
-        quic_detect_connections, true});
+        OBFSTR("quic_manage"), OBFSTR("network_security"),
+        OBFSTR("Manage QUIC analysis. Actions: detect_connections, decrypt_initial, extract_keys."),
+        {{OBFSTR("action"), OBFSTR("string"), OBFSTR("detect_connections|decrypt_initial|extract_keys"), true},
+         {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
+        [](const json& params) -> tool_result_t {
+            const std::string action = compat_action_name(params);
+            const json p = compat_action_payload(params);
+            if (action == "detect_connections") return quic_detect_connections(p);
+            if (action == "decrypt_initial") return quic_decrypt_initial(p);
+            if (action == "extract_keys") return quic_extract_keys(p);
+            return compat_unknown_action("quic_manage", action);
+        },
+        false});
 
     register_compat(srv, {
-        OBFSTR("quic_decrypt_initial"), OBFSTR("network_security"),
-        OBFSTR("Decrypt a QUIC Initial packet. Initial packets use deterministic key derivation from the "
-               "Destination Connection ID, requiring no secret material. Parses header, extracts versions and CIDs."),
-        {{OBFSTR("packet_hex"), OBFSTR("string"), OBFSTR("Raw QUIC packet data as hex string"), true}},
-        quic_decrypt_initial, true});
+        OBFSTR("dtls_manage"), OBFSTR("network_security"),
+        OBFSTR("Manage DTLS analysis. Actions: detect_sessions, extract_keys."),
+        {{OBFSTR("action"), OBFSTR("string"), OBFSTR("detect_sessions|extract_keys"), true},
+         {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
+        [](const json& params) -> tool_result_t {
+            const std::string action = compat_action_name(params);
+            const json p = compat_action_payload(params);
+            if (action == "detect_sessions") return dtls_detect_sessions(p);
+            if (action == "extract_keys") return dtls_extract_keys(p);
+            return compat_unknown_action("dtls_manage", action);
+        },
+        false});
 
     register_compat(srv, {
-        OBFSTR("quic_extract_keys"), OBFSTR("network_security"),
-        OBFSTR("Extract QUIC traffic encryption keys from a process. Scans for TLS 1.3 traffic secrets "
-               "used by QUIC implementations (msquic, BoringSSL). Keys enable full QUIC payload decryption."),
-        {{OBFSTR("pid"), OBFSTR("number"), OBFSTR("Target process ID"), false}},
-        quic_extract_keys, true});
-
-    register_compat(srv, {
-        OBFSTR("dtls_detect_sessions"), OBFSTR("network_security"),
-        OBFSTR("Detect active DTLS sessions by analyzing captured UDP packets for DTLS record headers. "
-               "Identifies DTLS versions (1.0/1.2), handshake state, epochs, and sequence numbers."),
-        {{OBFSTR("pid"), OBFSTR("number"), OBFSTR("Filter by process ID (0 = all)"), false}},
-        dtls_detect_sessions, true});
-
-    register_compat(srv, {
-        OBFSTR("dtls_extract_keys"), OBFSTR("network_security"),
-        OBFSTR("Extract DTLS session keys from a process. Scans memory for DTLS version markers adjacent to "
-               "client_random and master_secret pairs. Supports DTLS 1.0 (0xFEFF) and DTLS 1.2 (0xFEFD)."),
-        {{OBFSTR("pid"), OBFSTR("number"), OBFSTR("Target process ID"), false}},
-        dtls_extract_keys, true});
-
-    register_compat(srv, {
-        OBFSTR("autoresponder_add_rule"), OBFSTR("network_security"),
-        OBFSTR("Add an AutoResponder rule (similar to Fiddler's AutoResponder). Rules match intercepted HTTP requests "
-               "by URL pattern, method, headers, or body content, and return custom responses. For HTTPS/TLS traffic, "
-               "use match_type 'sni_contains' to match on the TLS Server Name Indication (domain). "
-               "Supports exact, prefix, regex URL matching, SNI matching, custom status codes, headers, response bodies, and file-based responses."),
-        {{OBFSTR("match_type"), OBFSTR("string"), OBFSTR("Match type: exact_url, prefix_url, regex_url, method_and_url, header_contains, body_contains, sni_contains (for HTTPS)"), false},
-         {OBFSTR("match_pattern"), OBFSTR("string"), OBFSTR("Pattern to match against"), true},
-         {OBFSTR("match_method"), OBFSTR("string"), OBFSTR("HTTP method filter (e.g., GET, POST)"), false},
-         {OBFSTR("status_code"), OBFSTR("number"), OBFSTR("HTTP status code for the response (default: 200)"), false},
-         {OBFSTR("status_reason"), OBFSTR("string"), OBFSTR("HTTP status reason phrase"), false},
-         {OBFSTR("response_body"), OBFSTR("string"), OBFSTR("Response body content"), false},
-         {OBFSTR("response_file_path"), OBFSTR("string"), OBFSTR("File path to serve as response body"), false},
-         {OBFSTR("response_headers"), OBFSTR("object"), OBFSTR("Custom response headers as key-value pairs"), false},
-         {OBFSTR("priority"), OBFSTR("number"), OBFSTR("Rule priority (lower = higher priority, default: 0)"), false},
-         {OBFSTR("latency_ms"), OBFSTR("number"), OBFSTR("Artificial response latency in ms"), false},
-         {OBFSTR("drop_request"), OBFSTR("boolean"), OBFSTR("Drop the request silently (default: false)"), false},
-         {OBFSTR("passthrough"), OBFSTR("boolean"), OBFSTR("Let the request pass through unmodified (default: false)"), false},
-         {OBFSTR("enabled"), OBFSTR("boolean"), OBFSTR("Enable the rule (default: true)"), false}},
-        autoresponder_add_rule, false});
-
-    register_compat(srv, {
-        OBFSTR("autoresponder_remove_rule"), OBFSTR("network_security"),
-        OBFSTR("Remove an AutoResponder rule by its ID."),
-        {{OBFSTR("rule_id"), OBFSTR("number"), OBFSTR("Rule ID to remove"), true}},
-        autoresponder_remove_rule, false});
-
-    register_compat(srv, {
-        OBFSTR("autoresponder_list_rules"), OBFSTR("network_security"),
-        OBFSTR("List all AutoResponder rules with their match patterns, status codes, and hit counts."),
-        {},
-        autoresponder_list_rules, true});
-
-    register_compat(srv, {
-        OBFSTR("autoresponder_start"), OBFSTR("network_security"),
-        OBFSTR("Start the AutoResponder engine. Automatically enables packet capture and interception. "
-               "Monitors both HTTP (plaintext) and HTTPS (via TLS SNI extraction) traffic. "
-               "Works on any network interface including WiFi. Use sni_contains rules for HTTPS domain blocking."),
-        {},
-        autoresponder_start, false});
-
-    register_compat(srv, {
-        OBFSTR("autoresponder_stop"), OBFSTR("network_security"),
-        OBFSTR("Stop the AutoResponder engine."),
-        {},
-        autoresponder_stop, false});
-
-    register_compat(srv, {
-        OBFSTR("autoresponder_import_rules"), OBFSTR("network_security"),
-        OBFSTR("Import AutoResponder rules from a JSON array string. Each rule object should have match_type, match_pattern, "
-               "status_code, response_body, response_headers, and other fields."),
-        {{OBFSTR("rules_json"), OBFSTR("string"), OBFSTR("JSON array of rule objects"), true}},
-        autoresponder_import_rules, false});
-
-    register_compat(srv, {
-        OBFSTR("autoresponder_export_rules"), OBFSTR("network_security"),
-        OBFSTR("Export all AutoResponder rules as a JSON array string. Can be saved and re-imported later."),
-        {{OBFSTR("path"), OBFSTR("string"), OBFSTR("Optional output file path for the exported rules JSON"), false}},
-        autoresponder_export_rules, true});
+        OBFSTR("autoresponder_manage"), OBFSTR("network_security"),
+        OBFSTR("Manage AutoResponder rules and runtime state. Actions: add_rule, remove_rule, list_rules, start, stop, import_rules, export_rules."),
+        {{OBFSTR("action"), OBFSTR("string"), OBFSTR("add_rule|remove_rule|list_rules|start|stop|import_rules|export_rules"), true},
+         {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
+        [](const json& params) -> tool_result_t {
+            const std::string action = compat_action_name(params);
+            const json p = compat_action_payload(params);
+            if (action == "add_rule") return autoresponder_add_rule(p);
+            if (action == "remove_rule") return autoresponder_remove_rule(p);
+            if (action == "list_rules") return autoresponder_list_rules(p);
+            if (action == "start") return autoresponder_start(p);
+            if (action == "stop") return autoresponder_stop(p);
+            if (action == "import_rules") return autoresponder_import_rules(p);
+            if (action == "export_rules") return autoresponder_export_rules(p);
+            return compat_unknown_action("autoresponder_manage", action);
+        },
+        false});
 
     register_compat(srv, {
         OBFSTR("network_decrypt_capture"), OBFSTR("network_security"),
@@ -1418,15 +1217,6 @@ void register_net_security_tools(mcp_standalone::server_t& srv) {
          {OBFSTR("keylog_path"), OBFSTR("string"), OBFSTR("Path to the SSLKEYLOGFILE (auto-detected from env if empty)"), false},
          {OBFSTR("display_filter"), OBFSTR("string"), OBFSTR("Wireshark display filter (default: 'http2')"), false}},
         network_decrypt_capture, true});
-
-    register_compat(srv, {
-        OBFSTR("tls_ensure_keylogfile"), OBFSTR("network_security"),
-        OBFSTR("Ensure the SSLKEYLOGFILE environment variable is set at the user level so that all newly launched "
-               "Chromium-based browsers, VS Code, Electron apps, and other BoringSSL/OpenSSL applications "
-               "will log TLS session keys to a file. The target application must be RESTARTED after this is set. "
-               "Once set, use tls_extract_keys or network_decrypt_capture to read the logged keys and decrypt traffic."),
-        {{OBFSTR("path"), OBFSTR("string"), OBFSTR("File path for the keylog file (default: %USERPROFILE%\\sslkeys.log)"), false}},
-        tls_ensure_keylogfile, false});
 
     diag::log_tagged("net_sec", "register_net_security_tools complete");
 }

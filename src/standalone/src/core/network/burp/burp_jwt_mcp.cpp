@@ -9,6 +9,7 @@
 #include "burp_jwt_mcp.hpp"
 #include "jwt_lab.hpp"
 
+#include "../../settings/standalone_compat.hpp"
 #include "../../../helpers/diag_log.hpp"
 
 #include <nlohmann/json.hpp>
@@ -164,66 +165,23 @@ tool_result_t handle_attack(const json& params)
 void register_jwt_tools(mcp_standalone::server_t& srv)
 {
     srv.register_tool({
-        "burp_jwt_decode",
-        "Decode a JWT token. Returns parsed header, payload, alg, and kid. Validates structure but does not verify signature.",
-        {{"token", "string", "JWT token (header.payload.signature)", true}},
-        true, handle_decode
-    });
-
-    srv.register_tool({
-        "burp_jwt_forge",
-        "Forge a JWT token. Supports alg values: none, HS256, HS384, HS512, RS256, RS384, RS512, ES256, ES384, ES512. Returns the encoded token.",
-        {{"header", "object", "JWT header object", false},
-         {"payload", "object", "JWT payload object", false},
-         {"alg", "string", "Signing algorithm", true},
-         {"hmac_secret", "string", "HMAC secret (HS*)", false},
-         {"rsa_private_pem", "string", "RSA private key PEM (RS*)", false},
-         {"ecdsa_private_pem", "string", "ECDSA private key PEM (ES*)", false}},
-        false, handle_forge
-    });
-
-    srv.register_tool({
-        "burp_jwt_verify",
-        "Verify a JWT signature. Mode = hmac | rsa | ecdsa | auto. The 'key' is the shared secret for HMAC or the public PEM for RSA/ECDSA.",
-        {{"token", "string", "JWT token", true},
-         {"key", "string", "Secret or public PEM", true},
-         {"mode", "string", "hmac|rsa|ecdsa|auto", false}},
-        true, handle_verify
-    });
-
-    srv.register_tool({
-        "burp_jwt_crack_start",
-        "Start a JWT HMAC secret crack using a wordlist. Returns a crack_id for status polling.",
-        {{"token", "string", "JWT token (HS256/384/512)", true},
-         {"wordlist_id", "string", "Payload library wordlist id", false},
-         {"custom_words", "array", "Extra words to test", false},
-         {"max_attempts", "number", "Maximum attempts (default 1000000)", false},
-         {"concurrency", "number", "Worker thread count (default 8, max 32)", false}},
-        false, handle_crack_start
-    });
-
-    srv.register_tool({
-        "burp_jwt_crack_status",
-        "Poll the status of a JWT crack job.",
-        {{"crack_id", "number", "Crack job id", true}},
-        true, handle_crack_status
-    });
-
-    srv.register_tool({
-        "burp_jwt_crack_stop",
-        "Request a JWT crack job to stop.",
-        {{"crack_id", "number", "Crack job id", true}},
-        false, handle_crack_stop
-    });
-
-    srv.register_tool({
-        "burp_jwt_attack",
-        "Run a JWT attack and get forged candidate tokens. Attack: alg_none | alg_confusion | kid_traversal | jku_injection | signature_strip.",
-        {{"token", "string", "JWT token", true},
-         {"attack", "string", "Attack name", true},
-         {"rsa_public_pem", "string", "Public PEM (alg_confusion)", false},
-         {"attacker_jku_url", "string", "Attacker URL (jku_injection)", false}},
-        false, handle_attack
+        "burp_jwt_manage",
+        "Manage JWT decoding, verification, forging, cracking, and attack generation. Actions: decode, forge, verify, crack_start, crack_status, crack_stop, attack.",
+        {{"action", "string", "decode|forge|verify|crack_start|crack_status|crack_stop|attack", true},
+         {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted.", false}},
+        false,
+        [](const json& params) -> tool_result_t {
+            const std::string action = compat_action_name(params);
+            const json p = compat_action_payload(params);
+            if (action == "decode") return handle_decode(p);
+            if (action == "forge") return handle_forge(p);
+            if (action == "verify") return handle_verify(p);
+            if (action == "crack_start") return handle_crack_start(p);
+            if (action == "crack_status") return handle_crack_status(p);
+            if (action == "crack_stop") return handle_crack_stop(p);
+            if (action == "attack") return handle_attack(p);
+            return compat_unknown_action("burp_jwt_manage", action);
+        }
     });
 }
 

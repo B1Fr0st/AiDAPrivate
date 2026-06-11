@@ -1,6 +1,7 @@
 #include "burp_upstream_mcp.hpp"
 #include "upstream_chain.hpp"
 
+#include "../../settings/standalone_compat.hpp"
 #include "../../../helpers/diag_log.hpp"
 
 #include <nlohmann/json.hpp>
@@ -220,68 +221,26 @@ tool_result_t tool_test(const json& params)
 
 void register_upstream_tools(mcp_standalone::server_t& srv)
 {
-    {
-        tool_def_t t;
-        t.name = "burp_upstream_add_chain";
-        t.description = "Create a new upstream proxy chain with one or more hops. Each hop has type "
-                        "('http_connect' or 'socks5'), host, port, and optional username/password.";
-        t.params = {
-            {"label", "string", "Friendly label for the chain", false},
-            {"hops",  "array",  "Array of {type, host, port, username, password}", true},
-        };
-        t.read_only = false;
-        t.handler = tool_add;
-        srv.register_tool(std::move(t));
-    }
-    {
-        tool_def_t t;
-        t.name = "burp_upstream_remove_chain";
-        t.description = "Remove a saved upstream chain by id.";
-        t.params = { {"id", "number", "Chain id", true} };
-        t.read_only = false;
-        t.handler = tool_remove;
-        srv.register_tool(std::move(t));
-    }
-    {
-        tool_def_t t;
-        t.name = "burp_upstream_list_chains";
-        t.description = "List every saved upstream chain plus the currently-active chain id.";
-        t.params = {};
-        t.read_only = true;
-        t.handler = tool_list;
-        srv.register_tool(std::move(t));
-    }
-    {
-        tool_def_t t;
-        t.name = "burp_upstream_set_active";
-        t.description = "Set the currently-active upstream chain. Pass id=0 to deactivate.";
-        t.params = { {"id", "number", "Chain id (0 = none)", true} };
-        t.read_only = false;
-        t.handler = tool_set_active;
-        srv.register_tool(std::move(t));
-    }
-    {
-        tool_def_t t;
-        t.name = "burp_upstream_get_active";
-        t.description = "Return the currently-active upstream chain id.";
-        t.params = {};
-        t.read_only = true;
-        t.handler = tool_get_active;
-        srv.register_tool(std::move(t));
-    }
-    {
-        tool_def_t t;
-        t.name = "burp_upstream_test_chain";
-        t.description = "Walk the chain end-to-end to (target_host:target_port). Returns ok=true/false + error.";
-        t.params = {
-            {"id",          "number", "Chain id",    true},
-            {"target_host", "string", "Target host", true},
-            {"target_port", "number", "Target port", true},
-        };
-        t.read_only = true;
-        t.handler = tool_test;
-        srv.register_tool(std::move(t));
-    }
+    tool_def_t t;
+    t.name = "burp_upstream_manage";
+    t.description = "Manage upstream proxy chains. Actions: add_chain, remove_chain, list_chains, set_active, get_active, test_chain.";
+    t.params = {
+        {"action", "string", "add_chain|remove_chain|list_chains|set_active|get_active|test_chain", true},
+        {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted.", false},
+    };
+    t.read_only = false;
+    t.handler = [](const json& params) -> tool_result_t {
+        const std::string action = compat_action_name(params);
+        const json p = compat_action_payload(params);
+        if (action == "add_chain") return tool_add(p);
+        if (action == "remove_chain") return tool_remove(p);
+        if (action == "list_chains") return tool_list(p);
+        if (action == "set_active") return tool_set_active(p);
+        if (action == "get_active") return tool_get_active(p);
+        if (action == "test_chain") return tool_test(p);
+        return compat_unknown_action("burp_upstream_manage", action);
+    };
+    srv.register_tool(std::move(t));
 }
 
 }

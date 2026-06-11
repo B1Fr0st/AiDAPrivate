@@ -412,7 +412,7 @@ static bool is_process_alive(std::uint32_t pid)
 static std::optional<tool_result_t> ensure_attached_process_context(const json& params)
 {
     if (!device->is_connected())
-        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_load first."));
+        return tool_result_t::error(OBFSTR("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
 
     std::uint32_t requested_pid = 0;
     for (const char* key : {"target_pid", "process_id", "pid"})
@@ -468,13 +468,13 @@ static std::optional<tool_result_t> ensure_attached_process_context(const json& 
     }
 
     if (driver_bridge::attached_pid() == 0)
-        return tool_result_t::error(OBFSTR("Not attached. Call driver_attach first or pass target_pid."));
+        return tool_result_t::error(OBFSTR("Not attached. Use sessions_manage action=attach_pid or pass target_pid."));
 
     if (!is_process_alive(driver_bridge::attached_pid()))
     {
         const std::uint32_t dead_pid = driver_bridge::attached_pid();
         device->clear_process_context();
-        return tool_result_t::error(OBFSTR("Attached process PID ") + std::to_string(dead_pid) + OBFSTR(" is no longer alive. Call driver_attach again."));
+        return tool_result_t::error(OBFSTR("Attached process PID ") + std::to_string(dead_pid) + OBFSTR(" is no longer alive. Reattach with sessions_manage action=attach_pid."));
     }
 
     if (device->get_dtb() == 0)
@@ -788,146 +788,10 @@ static bool resolve_loaded_module_base(const std::string& query,
 
 
 
-tool_result_t driver_status(const json&)
-{
-    diag::log_tagged_fmt("drv_tools", "driver_status entry");
-    const std::uint32_t attached_pid = device->get_process_id();
-    const bool self_target = is_self_target_pid(attached_pid);
-
-    json result;
-    result["connected"]    = device->is_connected();
-    result["process_id"]   = attached_pid;
-    result["base_address"] = sa_format_address(device->get_base_address());
-    result["dtb"]          = sa_format_address(device->get_dtb());
-    result["kernel_dtb"]   = sa_format_address(device->get_kernel_dtb());
-    result["has_process"]  = attached_pid != 0;
-    result["has_kernel"]   = device->get_kernel_dtb() != 0;
-    result["is_self_target"] = self_target;
-
-    if (self_target)
-        result["warning"] = "Driver target is AiDA's own process. Call driver_detach and driver_attach <target>.exe.";
-
-    if (device->is_connected() && attached_pid != 0)
-        result["heartbeat"] = device->send_heartbeat() ? "ok" : "failed";
-
-    diag::log_tagged_fmt("drv_tools", "driver_status connected=%d pid=%u",
-        (int)device->is_connected(), attached_pid);
-    return tool_result_t::ok(OBFSTR("Driver status"), result);
-}
-
-tool_result_t driver_attach(const json& params)
-{
-    diag::log_tagged_fmt("drv_tools", "driver_attach entry");
-    if (!device->is_connected())
-    {
-        if (!device->connect())
-            return tool_result_t::error(OBFSTR("Cannot connect to kernel driver. Load the driver first."));
-    }
-
-    std::string process_name;
-    if (params.contains("process") && params["process"].is_string())
-        process_name = trim_ascii_copy(params["process"].get<std::string>());
-    else if (params.contains("process_name") && params["process_name"].is_string())
-        process_name = trim_ascii_copy(params["process_name"].get<std::string>());
-    else if (params.contains("name") && params["name"].is_string())
-        process_name = trim_ascii_copy(params["name"].get<std::string>());
-
-    if (process_name.empty())
-        return tool_result_t::error(OBFSTR("Missing process name. Use process='target.exe'. Aliases supported: process_name, name."));
-
-    if (is_ida_host_process_name(process_name))
-        return tool_result_t::error(OBFSTR("Refusing to attach kernel driver to IDA host process name."));
-
-    if (is_self_target_process_name(process_name))
-        return tool_result_t::error(OBFSTR("Cannot attach to AiDA's own process."));
-
-    std::uint32_t pid = device->find_process(process_name.c_str());
-    if (pid == 0)
-        return tool_result_t::error(OBFSTR("Process not found: ") + process_name);
-
-    if (is_self_target_pid(pid))
-        return tool_result_t::error(OBFSTR("Cannot attach to AiDA's own process."));
-
-    const std::uint32_t previous_pid = driver_bridge::attached_pid();
-    if (previous_pid != 0 && previous_pid != pid)
-        stealth_engine::disable_for_detach(previous_pid, "driver_tools.driver_attach.replace");
-
-    if (!driver_bridge::attach(pid))
-    {
-        if (previous_pid != 0 && driver_bridge::attached_pid() == previous_pid)
-            (void)stealth_engine::ensure_default_enabled(previous_pid, "driver_tools.driver_attach.restore_failed_switch");
-        return tool_result_t::error(
-            OBFSTR("Failed to attach to process: ") + process_name +
-            OBFSTR(". ") + driver_bridge::last_error());
-    }
-
-    const bool stealth_ok = stealth_engine::ensure_default_enabled(pid, "driver_tools.driver_attach");
-
-    std::uint64_t base = device->get_base_address();
-    if (base == 0)
-    {
-        base = device->find_image();
-        if (base != 0)
-            device->set_base_address(base);
-    }
-
-    if (device->get_dtb() == 0)
-        device->solve_dtb();
-
-    if (base == 0)
-        return tool_result_t::error(OBFSTR("Failed to locate image base for process: ") + process_name);
-
-    json result;
-    result["process_name"] = process_name;
-    result["process_id"]   = pid;
-    result["base_address"] = sa_format_address(base);
-    result["dtb"]          = sa_format_address(device->get_dtb());
-    result["stealth_default_enabled"] = stealth_ok;
-    result["stealth_auto_state"] = stealth_engine::get_status();
-    diag::log_tagged_fmt("drv_tools", "driver_attach ok process='%s' pid=%u base=%s stealth_ok=%d",
-        process_name.c_str(), pid, sa_format_address(base).c_str(), stealth_ok ? 1 : 0);
-    return tool_result_t::ok(OBFSTR("Attached to process: ") + process_name, result);
-}
 
 
 
-tool_result_t driver_write_memory(const json& params)
-{
-    diag::log_tagged_fmt("drv_tools", "driver_write_memory entry addr='%s'",
-        params.contains("address") && params["address"].is_string()
-            ? params["address"].get<std::string>().c_str() : "");
-    if (auto ctx_err = ensure_attached_process_context(params))
-        return *ctx_err;
 
-    auto ea_opt = sa_parse_address(params["address"].get<std::string>());
-    if (!ea_opt)
-        return tool_result_t::error(OBFSTR("Invalid address"));
-
-
-    std::vector<std::uint8_t> bytes;
-    std::string parse_error;
-    if (!parse_byte_sequence(params["bytes"], bytes, parse_error))
-    {
-        return tool_result_t::error(
-            OBFSTR("Invalid bytes format. Use one of: 'DE AD BE EF', 'DEADBEEF', [222,173,190,239], ['DE','AD',...]. Detail: ") +
-            parse_error);
-    }
-    if (bytes.empty())
-        return tool_result_t::error(OBFSTR("Byte sequence is empty"));
-
-    if (auto reject = reject_full_test_system_mutation(*ea_opt, static_cast<std::uint64_t>(bytes.size()), "driver_write_memory"))
-        return *reject;
-
-    std::size_t written = device->write_raw(*ea_opt, bytes.data(), bytes.size());
-    if (written == 0)
-        return tool_result_t::error(OBFSTR("Kernel write failed at ") + sa_format_address(*ea_opt));
-
-    json result;
-    result["address"]       = sa_format_address(*ea_opt);
-    result["bytes_written"] = written;
-    result["requested"]     = bytes.size();
-    return tool_result_t::ok(OBFSTR("Kernel write: ") + std::to_string(written) + " bytes", result);
-}
 
 
 struct vad_dump_plan_t
@@ -4060,7 +3924,7 @@ tool_result_t driver_dump_module(const json& params)
     }
 
     if (device->get_process_id() == 0)
-        return tool_result_t::error(OBFSTR("No process attached. Provide 'process' param or call driver_attach first."));
+        return tool_result_t::error(OBFSTR("No process attached. Provide 'process' param or use sessions_manage action=attach_pid."));
 
     if (device->get_dtb() == 0)
         device->solve_dtb();
@@ -4727,152 +4591,6 @@ tool_result_t driver_dump_module(const json& params)
                              OBFSTR(". Open this file in a clean disassembler session for proper analysis."), result);
 }
 
-tool_result_t driver_scan_pattern(const json& params)
-{
-    diag::log_tagged_fmt("drv_tools", "driver_scan_pattern entry");
-    if (!device->is_connected() || device->get_process_id() == 0)
-        return tool_result_t::error(OBFSTR("Not attached. Call driver_load then driver_attach first."));
-
-    std::string pattern_str = params["pattern"].get<std::string>();
-
-    int limit = 20;
-    if (params.contains("limit")) {
-        if (params["limit"].is_number())
-            limit = params["limit"].get<int>();
-        else if (params["limit"].is_string()) {
-            try { limit = std::stoi(params["limit"].get<std::string>()); } catch (...) {}
-        }
-    }
-
-    std::uint64_t scan_size = 0x200000;
-    if (params.contains("size")) {
-        if (params["size"].is_number())
-            scan_size = params["size"].get<std::uint64_t>();
-        else if (params["size"].is_string()) {
-            auto sz = sa_parse_address(params["size"].get<std::string>());
-            if (sz) scan_size = *sz;
-        }
-    }
-
-    constexpr std::uint64_t MAX_SCAN_SIZE = 0x40000000ULL;
-    if (scan_size > MAX_SCAN_SIZE)
-        scan_size = MAX_SCAN_SIZE;
-
-    uint64_t start_addr = static_cast<uint64_t>(device->get_base_address());
-    if (start_addr == 0)
-        return tool_result_t::error(OBFSTR("Process base address is 0 - not attached or invalid target"));
-    uint64_t end_addr   = start_addr + (uint64_t)scan_size;
-    if (params.contains("start"))
-    {
-        auto s = sa_parse_address(params["start"].get<std::string>());
-        if (s) start_addr = *s;
-    }
-    if (params.contains("end"))
-    {
-        auto e = sa_parse_address(params["end"].get<std::string>());
-        if (e) end_addr = *e;
-    }
-
-    if (start_addr == 0)
-        return tool_result_t::error(OBFSTR("Scan start address is 0 - provide a valid start address"));
-
-    if (end_addr <= start_addr)
-        return tool_result_t::error(OBFSTR("Scan end must be greater than start"));
-
-    if ((end_addr - start_addr) > MAX_SCAN_SIZE)
-        end_addr = start_addr + MAX_SCAN_SIZE;
-
-
-    std::vector<std::uint8_t> pat;
-    std::vector<bool> mask;
-    {
-        std::istringstream iss(pattern_str);
-        std::string tok;
-        while (iss >> tok)
-        {
-            if (tok == "??" || tok == "?")
-            {
-                pat.push_back(0);
-                mask.push_back(false);
-            }
-            else
-            {
-                try
-                {
-                    pat.push_back(static_cast<std::uint8_t>(std::stoul(tok, nullptr, 16)));
-                    mask.push_back(true);
-                }
-                catch (...) { return tool_result_t::error(OBFSTR("Invalid pattern token: ") + tok); }
-            }
-        }
-    }
-    if (pat.empty())
-        return tool_result_t::error(OBFSTR("Empty pattern"));
-
-    json matches = json::array();
-    const std::size_t chunk_sz = 0x10000;
-    std::vector<std::uint8_t> chunk(chunk_sz + pat.size());
-
-    constexpr int MAX_CONSEC_FAILURES = 256;
-    constexpr int SCAN_TIMEOUT_SEC    = 30;
-    int consec_failures = 0;
-    auto scan_start_time = std::chrono::steady_clock::now();
-
-    show_wait_box("HIDECANCEL\nAiDA: Kernel pattern scan...");
-    for (uint64_t addr = start_addr; addr < end_addr && (int)matches.size() < limit; addr += chunk_sz)
-    {
-        auto elapsed = std::chrono::steady_clock::now() - scan_start_time;
-        if (std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() >= SCAN_TIMEOUT_SEC)
-        {
-            hide_wait_box();
-            json timeout_result;
-            timeout_result["matches"] = matches;
-            timeout_result["scanned_to"] = sa_format_address(addr);
-            timeout_result["timeout"] = true;
-            return tool_result_t::ok(OBFSTR("Pattern scan timed out after 30s: ") +
-                                     std::to_string(matches.size()) + " matches so far", timeout_result);
-        }
-
-        replace_wait_box("HIDECANCEL\nAiDA: Kernel scan 0x%llX (%d found)...",
-                         (unsigned long long)addr, (int)matches.size());
-        std::size_t to_read = std::min((std::size_t)(end_addr - addr) + pat.size(), chunk_sz + pat.size());
-        std::size_t got = device->read_raw(addr, chunk.data(), to_read);
-        if (got < pat.size())
-        {
-            if (++consec_failures >= MAX_CONSEC_FAILURES)
-            {
-                hide_wait_box();
-                json bail_result;
-                bail_result["matches"] = matches;
-                bail_result["scanned_to"] = sa_format_address(addr);
-                bail_result["aborted"] = true;
-                bail_result["reason"] = OBFSTR("Too many consecutive unreadable pages (16 MB gap)");
-                return tool_result_t::ok(OBFSTR("Pattern scan aborted (unreadable region): ") +
-                                         std::to_string(matches.size()) + " matches", bail_result);
-            }
-            continue;
-        }
-        consec_failures = 0;
-
-        for (std::size_t i = 0; i + pat.size() <= got && (int)matches.size() < limit; i++)
-        {
-            bool found = true;
-            for (std::size_t j = 0; j < pat.size(); j++)
-            {
-                if (mask[j] && chunk[i + j] != pat[j]) { found = false; break; }
-            }
-            if (found)
-            {
-                uint64_t m = addr + i;
-                matches.push_back({{"address", sa_format_address(m)},
-                                   {"name", sa_format_address(m)}});
-            }
-        }
-    }
-    hide_wait_box();
-
-    return tool_result_t::ok(OBFSTR("Pattern scan: ") + std::to_string(matches.size()) + " matches", matches);
-}
 
 tool_result_t driver_read_pointer_chain(const json& params)
 {
@@ -5132,159 +4850,7 @@ tool_result_t driver_enumerate_kernel_modules(const json& params)
 
 
 
-tool_result_t driver_read_kernel_memory(const json& params)
-{
-    diag::log_tagged_fmt("drv_tools", "driver_read_kernel_memory entry");
-    if (!device || !device->is_connected())
-        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_load first."));
 
-    if (device->get_kernel_dtb() == 0)
-    {
-        device->solve_kernel_dtb();
-        if (device->get_kernel_dtb() == 0)
-            return tool_result_t::error(OBFSTR("Failed to solve kernel DTB."));
-    }
-
-    std::string addr_str = params["address"].get<std::string>();
-    auto addr_opt = sa_parse_address(addr_str);
-    if (!addr_opt.has_value())
-        return tool_result_t::error(OBFSTR("Invalid address: ") + addr_str);
-
-    std::uint64_t address = static_cast<std::uint64_t>(addr_opt.value());
-    if (!is_probably_kernel_address(address))
-        return tool_result_t::error(OBFSTR("Address is not a canonical kernel virtual address. Use read_memory for user-mode addresses."));
-
-    std::size_t size = params.value("size", 256);
-    if (size > 65536) size = 65536;
-    if (size == 0) size = 256;
-
-    bool patch_idb = params.value("patch_idb", false);
-
-    std::vector<std::uint8_t> buffer(size, 0);
-    std::size_t bytes_read = device->read_kernel_raw(address, buffer.data(), size);
-
-    if (bytes_read == 0)
-        return tool_result_t::error(
-            OBFSTR("Failed to read kernel memory at ") +
-            sa_format_address(static_cast<uint64_t>(address)));
-
-    std::ostringstream hex_dump;
-    hex_dump << std::hex << std::setfill('0');
-    for (std::size_t i = 0; i < bytes_read; i++)
-    {
-        if (i > 0 && (i % 16) == 0) hex_dump << "\n";
-        else if (i > 0) hex_dump << " ";
-        hex_dump << std::setw(2) << static_cast<int>(buffer[i]);
-    }
-
-    std::string ascii;
-    ascii.reserve(bytes_read);
-    for (std::size_t i = 0; i < bytes_read; i++)
-        ascii += (buffer[i] >= 0x20 && buffer[i] < 0x7F) ? static_cast<char>(buffer[i]) : '.';
-
-    std::size_t patched = 0;
-    if (patch_idb)
-    {
-        uint64_t ea = static_cast<uint64_t>(address);
-        for (std::size_t i = 0; i < bytes_read; i++)
-        {
-            if (is_mapped(ea + static_cast<uint64_t>(i)))
-            {
-                patch_byte(ea + static_cast<uint64_t>(i), buffer[i]);
-                patched++;
-            }
-        }
-    }
-
-    json result;
-    result["address"]       = sa_format_address(static_cast<uint64_t>(address));
-    result["bytes_read"]    = bytes_read;
-    result["requested"]     = size;
-    result["hex"]           = hex_dump.str();
-    result["ascii"]         = ascii;
-    result["source"]        = "kernel_memory";
-    result["kernel_dtb"]    = sa_format_address(static_cast<uint64_t>(device->get_kernel_dtb()));
-    if (patch_idb)
-        result["bytes_patched"] = patched;
-
-    return tool_result_t::ok(
-        OBFSTR("Read ") + std::to_string(bytes_read) + OBFSTR(" bytes from kernel address ") +
-        sa_format_address(static_cast<uint64_t>(address)), result);
-}
-
-tool_result_t driver_write_kernel_memory(const json& params)
-{
-    const bool validate_only = params.contains("validate_only") &&
-        params["validate_only"].is_boolean() &&
-        params["validate_only"].get<bool>();
-    diag::log_tagged_fmt("drv_tools", "driver_write_kernel_memory entry validate_only=%d", validate_only ? 1 : 0);
-
-    if (!params.contains("address") || !params["address"].is_string())
-        return tool_result_t::error(OBFSTR("'address' is required and must be a string."));
-
-    std::string addr_str = params["address"].get<std::string>();
-    auto addr_opt = sa_parse_address(addr_str);
-    if (!addr_opt.has_value())
-        return tool_result_t::error(OBFSTR("Invalid address: ") + addr_str);
-
-    std::uint64_t address = static_cast<std::uint64_t>(addr_opt.value());
-
-    if (!is_probably_kernel_address(address))
-        return tool_result_t::error(OBFSTR("Address is not a canonical kernel virtual address. Use driver_write_memory for user-mode addresses."));
-
-    if (!params.contains("bytes"))
-        return tool_result_t::error(OBFSTR("'bytes' is required."));
-
-    std::vector<std::uint8_t> data;
-    std::string parse_error;
-    if (!parse_byte_sequence(params["bytes"], data, parse_error))
-        return tool_result_t::error(OBFSTR("Invalid bytes format. ") + parse_error);
-
-    if (data.empty())
-        return tool_result_t::error(OBFSTR("Write payload is empty."));
-
-    if (data.size() > 4096)
-        return tool_result_t::error(OBFSTR("Write size exceeds 4096 byte limit."));
-
-    if (validate_only)
-    {
-        json result;
-        result["address"]       = sa_format_address(static_cast<uint64_t>(address));
-        result["bytes_written"] = 0;
-        result["requested"]     = data.size();
-        result["source"]        = "kernel_memory";
-        result["validate_only"] = true;
-        return tool_result_t::ok(
-            OBFSTR("Validated kernel memory write request without writing memory."), result);
-    }
-
-    if (!device || !device->is_connected())
-        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_load first."));
-
-    if (device->get_kernel_dtb() == 0)
-    {
-        device->solve_kernel_dtb();
-        if (device->get_kernel_dtb() == 0)
-            return tool_result_t::error(OBFSTR("Failed to solve kernel DTB."));
-    }
-
-    std::size_t written = device->write_kernel_raw(address, data.data(), data.size());
-
-    json result;
-    result["address"]       = sa_format_address(static_cast<uint64_t>(address));
-    result["bytes_written"] = written;
-    result["requested"]     = data.size();
-    result["source"]        = "kernel_memory";
-
-    if (written == 0)
-        return tool_result_t::error(
-            OBFSTR("Failed to write kernel memory at ") +
-            sa_format_address(static_cast<uint64_t>(address)));
-
-    return tool_result_t::ok(
-        OBFSTR("Wrote ") + std::to_string(written) + OBFSTR(" bytes to kernel address ") +
-        sa_format_address(static_cast<uint64_t>(address)), result);
-}
 
 tool_result_t driver_allocate_memory(const json& params)
 {
@@ -5434,143 +5000,9 @@ tool_result_t driver_call_function(const json& params)
 }
 
 
-tool_result_t driver_get_thread_context(const json& params)
-{
-    diag::log_tagged_fmt("drv_tools", "driver_get_thread_context entry");
-    if (auto ctx_err = ensure_attached_process_context(params))
-        return *ctx_err;
 
-    const auto tid_opt = parse_tid_param(params);
-    if (!tid_opt)
-        return tool_result_t::error(OBFSTR("Thread ID (tid) is required and must be a decimal integer or 0x-prefixed hex."));
-    const std::uint32_t tid = *tid_opt;
 
-    driver_bridge::thread_context_t ctx{};
-    if (!driver_bridge::get_thread_context(tid, ctx))
-        return tool_result_t::error(OBFSTR("Failed to get thread context for TID ") + std::to_string(tid));
 
-    json result;
-    result["tid"] = tid;
-    result["rax"] = sa_format_address(static_cast<uint64_t>(ctx.rax));
-    result["rbx"] = sa_format_address(static_cast<uint64_t>(ctx.rbx));
-    result["rcx"] = sa_format_address(static_cast<uint64_t>(ctx.rcx));
-    result["rdx"] = sa_format_address(static_cast<uint64_t>(ctx.rdx));
-    result["rsi"] = sa_format_address(static_cast<uint64_t>(ctx.rsi));
-    result["rdi"] = sa_format_address(static_cast<uint64_t>(ctx.rdi));
-    result["rbp"] = sa_format_address(static_cast<uint64_t>(ctx.rbp));
-    result["rsp"] = sa_format_address(static_cast<uint64_t>(ctx.rsp));
-    result["r8"]  = sa_format_address(static_cast<uint64_t>(ctx.r8));
-    result["r9"]  = sa_format_address(static_cast<uint64_t>(ctx.r9));
-    result["r10"] = sa_format_address(static_cast<uint64_t>(ctx.r10));
-    result["r11"] = sa_format_address(static_cast<uint64_t>(ctx.r11));
-    result["r12"] = sa_format_address(static_cast<uint64_t>(ctx.r12));
-    result["r13"] = sa_format_address(static_cast<uint64_t>(ctx.r13));
-    result["r14"] = sa_format_address(static_cast<uint64_t>(ctx.r14));
-    result["r15"] = sa_format_address(static_cast<uint64_t>(ctx.r15));
-    result["rip"] = sa_format_address(static_cast<uint64_t>(ctx.rip));
-    result["rflags"] = sa_format_address(static_cast<uint64_t>(ctx.rflags));
-    result["dr0"] = sa_format_address(static_cast<uint64_t>(ctx.dr0));
-    result["dr1"] = sa_format_address(static_cast<uint64_t>(ctx.dr1));
-    result["dr2"] = sa_format_address(static_cast<uint64_t>(ctx.dr2));
-    result["dr3"] = sa_format_address(static_cast<uint64_t>(ctx.dr3));
-    result["dr6"] = sa_format_address(static_cast<uint64_t>(ctx.dr6));
-    result["dr7"] = sa_format_address(static_cast<uint64_t>(ctx.dr7));
-
-    return tool_result_t::ok(OBFSTR("Thread context for TID ") + std::to_string(tid), result);
-}
-
-tool_result_t driver_set_thread_context(const json& params)
-{
-    diag::log_tagged_fmt("drv_tools", "driver_set_thread_context entry");
-    if (auto ctx_err = ensure_attached_process_context(params))
-        return *ctx_err;
-
-    const auto tid_opt = parse_tid_param(params);
-    if (!tid_opt)
-        return tool_result_t::error(OBFSTR("Thread ID (tid) is required and must be a decimal integer or 0x-prefixed hex."));
-    const std::uint32_t tid = *tid_opt;
-
-    voyager::device_t::thread_context ctx{};
-    std::uint64_t mask = 0;
-
-    auto set_reg = [&](const char* name, std::uint64_t& reg, int bit) {
-        if (params.contains(name)) {
-            if (params[name].is_string())
-                reg = sa_parse_address(params[name].get<std::string>()).value_or(0);
-            else
-                reg = params[name].get<std::uint64_t>();
-            mask |= (1ULL << bit);
-        }
-    };
-
-    set_reg("rax", ctx.rax, 0);  set_reg("rbx", ctx.rbx, 1);
-    set_reg("rcx", ctx.rcx, 2);  set_reg("rdx", ctx.rdx, 3);
-    set_reg("rsi", ctx.rsi, 4);  set_reg("rdi", ctx.rdi, 5);
-    set_reg("rbp", ctx.rbp, 6);  set_reg("rsp", ctx.rsp, 7);
-    set_reg("r8",  ctx.r8,  8);  set_reg("r9",  ctx.r9,  9);
-    set_reg("r10", ctx.r10, 10); set_reg("r11", ctx.r11, 11);
-    set_reg("r12", ctx.r12, 12); set_reg("r13", ctx.r13, 13);
-    set_reg("r14", ctx.r14, 14); set_reg("r15", ctx.r15, 15);
-    set_reg("rip", ctx.rip, 16); set_reg("rflags", ctx.rflags, 17);
-    set_reg("dr0", ctx.dr0, 18); set_reg("dr1", ctx.dr1, 19);
-    set_reg("dr2", ctx.dr2, 20); set_reg("dr3", ctx.dr3, 21);
-    set_reg("dr6", ctx.dr6, 22); set_reg("dr7", ctx.dr7, 23);
-
-    if (mask == 0) return tool_result_t::error(OBFSTR("No registers specified to set"));
-
-    if (!device->set_thread_context(tid, ctx, mask)) {
-        diag::log_tagged_fmt("drv_tools", "driver_set_thread_context kernel path failed tid=%u mask=0x%llX", tid, static_cast<unsigned long long>(mask));
-        if (!set_thread_context_win32_fallback(tid, ctx, mask))
-            return tool_result_t::error(OBFSTR("Failed to set thread context for TID ") + std::to_string(tid));
-    }
-
-    json result;
-    result["tid"] = tid;
-    result["register_mask"] = sa_format_address(static_cast<uint64_t>(mask));
-    return tool_result_t::ok(OBFSTR("Thread context updated for TID ") + std::to_string(tid), result);
-}
-
-tool_result_t driver_suspend_thread(const json& params)
-{
-    diag::log_tagged_fmt("drv_tools", "driver_suspend_thread entry");
-    if (auto ctx_err = ensure_attached_process_context(params))
-        return *ctx_err;
-
-    const auto tid_opt = parse_tid_param(params);
-    if (!tid_opt)
-        return tool_result_t::error(OBFSTR("Thread ID (tid) is required and must be a decimal integer or 0x-prefixed hex."));
-    const std::uint32_t tid = *tid_opt;
-
-    std::uint32_t prev = 0;
-    if (!driver_bridge::suspend_thread(tid, &prev))
-        return tool_result_t::error(OBFSTR("Failed to suspend thread ") + std::to_string(tid));
-
-    json result;
-    result["tid"] = tid;
-    result["previous_suspend_count"] = prev;
-    return tool_result_t::ok(OBFSTR("Thread ") + std::to_string(tid) + OBFSTR(" suspended"), result);
-}
-
-tool_result_t driver_resume_thread(const json& params)
-{
-    diag::log_tagged_fmt("drv_tools", "driver_resume_thread entry");
-    if (auto ctx_err = ensure_attached_process_context(params))
-        return *ctx_err;
-
-    const auto tid_opt = parse_tid_param(params);
-    if (!tid_opt)
-        return tool_result_t::error(OBFSTR("Thread ID (tid) is required and must be a decimal integer or 0x-prefixed hex."));
-    const std::uint32_t tid = *tid_opt;
-
-    std::uint32_t prev = 0;
-    if (!driver_bridge::resume_thread(tid, &prev))
-        return tool_result_t::error(OBFSTR("Failed to resume thread ") + std::to_string(tid));
-
-    json result;
-    result["tid"] = tid;
-    result["previous_suspend_count"] = prev;
-    return tool_result_t::ok(OBFSTR("Thread ") + std::to_string(tid) + OBFSTR(" resumed"), result);
-}
 
 tool_result_t driver_protect_memory(const json& params)
 {
@@ -5618,57 +5050,6 @@ tool_result_t driver_protect_memory(const json& params)
     return tool_result_t::ok(OBFSTR("Memory protection changed"), result);
 }
 
-tool_result_t driver_enumerate_memory_regions(const json& params)
-{
-    diag::log_tagged_fmt("drv_tools", "driver_enumerate_memory_regions entry");
-    if (auto ctx_err = ensure_attached_process_context(params))
-        return *ctx_err;
-
-    std::uint64_t start = 0;
-    if (params.contains("start"))
-        start = sa_parse_address(params["start"].get<std::string>()).value_or(0);
-
-    std::uint64_t end_addr = 0;
-    if (params.contains("end"))
-        end_addr = sa_parse_address(params["end"].get<std::string>()).value_or(0);
-
-    bool include_all = false;
-    if (params.contains("include_all") && params["include_all"].is_boolean())
-        include_all = params["include_all"].get<bool>();
-
-    auto regions = device->enumerate_memory_regions(start, end_addr, include_all);
-    if (regions.empty())
-        return tool_result_t::error(OBFSTR("No memory regions found"));
-
-    auto prot_str = [](std::uint32_t p) -> std::string {
-        if (p & 0x40) return "ERW";
-        if (p & 0x20) return "ER";
-        if (p & 0x10) return "E";
-        if (p & 0x04) return "RW";
-        if (p & 0x02) return "R";
-        if (p & 0x01) return "NA";
-        return std::to_string(p);
-    };
-
-    json result;
-    result["process_id"] = device->get_process_id();
-    result["region_count"] = regions.size();
-    json arr = json::array();
-    for (const auto& r : regions) {
-        json rj;
-        rj["base"] = sa_format_address(static_cast<uint64_t>(r.base));
-        rj["size"] = sa_format_address(static_cast<uint64_t>(r.size));
-        rj["state"] = (r.state == 0x1000) ? "COMMIT" :
-                      (r.state == 0x2000) ? "RESERVE" : "FREE";
-        rj["protect"] = prot_str(r.protect);
-        rj["type"] = (r.type == 0x20000) ? "PRIVATE" :
-                     (r.type == 0x40000) ? "MAPPED" :
-                     (r.type == 0x1000000) ? "IMAGE" : std::to_string(r.type);
-        arr.push_back(rj);
-    }
-    result["regions"] = arr;
-    return tool_result_t::ok(OBFSTR("Enumerated ") + std::to_string(regions.size()) + OBFSTR(" regions"), result);
-}
 
 tool_result_t driver_read_peb(const json& params)
 {
@@ -5694,24 +5075,6 @@ tool_result_t driver_read_peb(const json& params)
     return tool_result_t::ok(OBFSTR("PEB info for PID ") + std::to_string(device->get_process_id()), result);
 }
 
-tool_result_t driver_spoof_debug_flags(const json& params)
-{
-    diag::log_tagged_fmt("drv_tools", "driver_spoof_debug_flags entry");
-    (void)params;
-    if (auto ctx_err = ensure_attached_process_context(params))
-        return *ctx_err;
-
-    std::uint32_t flags = 0;
-    if (!device->spoof_debug_flags(&flags))
-        return tool_result_t::error(OBFSTR("Failed to spoof debug flags"));
-
-    json result;
-    result["process_id"] = device->get_process_id();
-    result["cleared_debug_port"] = (flags & 1) != 0;
-    result["cleared_being_debugged"] = (flags & 2) != 0;
-    result["cleared_nt_global_flag"] = (flags & 4) != 0;
-    return tool_result_t::ok(OBFSTR("Anti-debug flags cleared"), result);
-}
 
 tool_result_t driver_set_hw_breakpoint(const json& params)
 {
@@ -7078,9 +6441,9 @@ tool_result_t driver_enum_kernel_callbacks(const json& params)
 {
     diag::log_tagged_fmt("drv_tools", "driver_enum_kernel_callbacks entry");
     if (!device->is_connected())
-        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_load first."));
+        return tool_result_t::error(OBFSTR("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
     if (device->get_kernel_dtb() == 0)
-        return tool_result_t::error(OBFSTR("Kernel DTB not resolved. Call driver_load first."));
+        return tool_result_t::error(OBFSTR("Kernel DTB is not resolved. Attach with sessions_manage action=attach_pid first."));
 
     std::vector<std::uint8_t> mod_buf;
     sys_module_info_t* info = nullptr;
@@ -7219,9 +6582,9 @@ tool_result_t driver_detect_integrity_checks(const json& params)
 {
     diag::log_tagged_fmt("drv_tools", "driver_detect_integrity_checks entry");
     if (!device->is_connected())
-        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_load first."));
+        return tool_result_t::error(OBFSTR("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
     if (device->get_kernel_dtb() == 0)
-        return tool_result_t::error(OBFSTR("Kernel DTB not resolved. Call driver_load first."));
+        return tool_result_t::error(OBFSTR("Kernel DTB is not resolved. Attach with sessions_manage action=attach_pid first."));
 
     std::vector<std::uint8_t> mod_buf;
     sys_module_info_t* info = nullptr;
@@ -7355,9 +6718,9 @@ tool_result_t driver_detect_ssdt_hooks(const json&)
 {
     diag::log_tagged_fmt("drv_tools", "driver_detect_ssdt_hooks entry");
     if (!device->is_connected())
-        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_load first."));
+        return tool_result_t::error(OBFSTR("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
     if (device->get_kernel_dtb() == 0)
-        return tool_result_t::error(OBFSTR("Kernel DTB not resolved. Call driver_load first."));
+        return tool_result_t::error(OBFSTR("Kernel DTB is not resolved. Attach with sessions_manage action=attach_pid first."));
 
     std::vector<uint8_t> buf;
     sys_module_info_t* info = nullptr;
@@ -7556,9 +6919,9 @@ tool_result_t driver_enum_minifilters(const json& params)
 {
     diag::log_tagged_fmt("drv_tools", "driver_enum_minifilters entry");
     if (!device->is_connected())
-        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_load first."));
+        return tool_result_t::error(OBFSTR("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
     if (device->get_kernel_dtb() == 0)
-        return tool_result_t::error(OBFSTR("Kernel DTB not resolved. Call driver_load first."));
+        return tool_result_t::error(OBFSTR("Kernel DTB is not resolved. Attach with sessions_manage action=attach_pid first."));
 
     std::vector<uint8_t> buf;
     sys_module_info_t* info = nullptr;
@@ -7759,9 +7122,9 @@ tool_result_t driver_detect_etw_monitors(const json& params)
 {
     diag::log_tagged_fmt("drv_tools", "driver_detect_etw_monitors entry");
     if (!device->is_connected())
-        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_load first."));
+        return tool_result_t::error(OBFSTR("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
     if (device->get_kernel_dtb() == 0)
-        return tool_result_t::error(OBFSTR("Kernel DTB not resolved. Call driver_load first."));
+        return tool_result_t::error(OBFSTR("Kernel DTB is not resolved. Attach with sessions_manage action=attach_pid first."));
 
     std::vector<uint8_t> buf;
     sys_module_info_t* info = nullptr;
@@ -7930,9 +7293,9 @@ tool_result_t driver_detect_hidden_modules(const json& params)
 {
     diag::log_tagged_fmt("drv_tools", "driver_detect_hidden_modules entry");
     if (!device->is_connected())
-        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_load first."));
+        return tool_result_t::error(OBFSTR("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
     if (device->get_process_id() == 0)
-        return tool_result_t::error(OBFSTR("No target process attached. Call driver_attach first."));
+        return tool_result_t::error(OBFSTR("No target process attached. Use sessions_manage action=attach_pid first."));
 
     bool scan_kernel = params.value("kernel", false);
 
@@ -8385,7 +7748,7 @@ tool_result_t driver_enumerate_handles(const json& params)
 {
     diag::log_tagged_fmt("drv_tools", "driver_enumerate_handles entry");
     if (!device->is_connected())
-        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_load first."));
+        return tool_result_t::error(OBFSTR("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
 
     const std::uint32_t filter_pid = params.value("pid", 0u);
     const std::string filter_type = params.value("type_filter", "");
@@ -8497,769 +7860,15 @@ tool_result_t driver_enumerate_handles(const json& params)
                              std::to_string(count) + OBFSTR(" total system-wide)"), result);
 }
 
-tool_result_t driver_walk_seh_chain(const json& params)
-{
-    diag::log_tagged_fmt("drv_tools", "driver_walk_seh_chain entry");
-    if (auto ctx_err = ensure_attached_process_context(params))
-        return *ctx_err;
 
-    auto tid_opt = parse_tid_param(params);
-    if (!tid_opt)
-        return tool_result_t::error(OBFSTR("Missing or invalid tid parameter. Provide the thread ID."));
 
-    const std::uint32_t tid = *tid_opt;
 
-
-    driver_bridge::thread_context_t ctx{};
-    if (!driver_bridge::get_thread_context(tid, ctx))
-        return tool_result_t::error(OBFSTR("Failed to get thread context for TID ") + std::to_string(tid));
-
-
-    std::uint64_t teb_addr = 0;
-    std::string teb_source;
-    std::string teb_error;
-    if (!resolve_teb_address_for_thread(tid, ctx, teb_addr, teb_source, teb_error))
-        return tool_result_t::error(OBFSTR("TEB address unavailable for TID ") +
-                                    std::to_string(tid) + OBFSTR(": ") + teb_error);
-
-
-    std::uint64_t seh_head = device->read<std::uint64_t>(teb_addr);
-    std::string seh_source = "teb_nt_tib";
-    diag::log_tagged_fmt("drv_tools",
-        "driver_walk_seh_chain tid=%u teb=0x%llX source=%s rip=0x%llX rsp=0x%llX head=0x%llX",
-        tid,
-        static_cast<unsigned long long>(teb_addr),
-        teb_source.c_str(),
-        static_cast<unsigned long long>(ctx.rip),
-        static_cast<unsigned long long>(ctx.rsp),
-        static_cast<unsigned long long>(seh_head));
-    if ((seh_head == 0 || seh_head == 0xFFFFFFFFFFFFFFFFULL) && ctx.rsp != 0)
-    {
-        auto modules_snapshot = enumerate_ldr_modules_for_iat(device.get());
-        std::vector<std::uint8_t> stack_buf(4096);
-        const std::size_t stack_read = device->read_raw(ctx.rsp, stack_buf.data(), stack_buf.size());
-        diag::log_tagged_fmt("drv_tools",
-            "driver_walk_seh_chain stack_probe rsp=0x%llX read=%zu modules=%zu",
-            static_cast<unsigned long long>(ctx.rsp),
-            stack_read,
-            modules_snapshot.size());
-        if (stack_read >= 16)
-        {
-            for (std::size_t i = 8; i + 8 <= stack_read; i += 8)
-            {
-                std::uint64_t candidate = 0;
-                std::memcpy(&candidate, stack_buf.data() + i, sizeof(candidate));
-                bool candidate_in_module = false;
-                for (const auto& m : modules_snapshot)
-                {
-                    if (m.base != 0 && candidate >= m.base && candidate < m.base + m.size)
-                    {
-                        candidate_in_module = true;
-                        break;
-                    }
-                }
-                if (!candidate_in_module)
-                    continue;
-                std::uint64_t potential_next = 0;
-                std::memcpy(&potential_next, stack_buf.data() + i - 8, sizeof(potential_next));
-                if (potential_next > ctx.rsp && potential_next < ctx.rsp + 0x100000)
-                {
-                    seh_head = ctx.rsp + i - 8;
-                    seh_source = "stack_probe";
-                    diag::log_tagged_fmt("drv_tools",
-                        "driver_walk_seh_chain stack_probe_hit frame=0x%llX handler=0x%llX next=0x%llX",
-                        static_cast<unsigned long long>(seh_head),
-                        static_cast<unsigned long long>(candidate),
-                        static_cast<unsigned long long>(potential_next));
-                    break;
-                }
-            }
-        }
-    }
-
-    json seh_chain = json::array();
-    int max_walk = 256;
-    std::uint64_t current = seh_head;
-
-    while (current != 0 && current != 0xFFFFFFFFFFFFFFFF && max_walk-- > 0)
-    {
-
-        std::uint64_t next = device->read<std::uint64_t>(current);
-        std::uint64_t handler = device->read<std::uint64_t>(current + 8);
-
-        json entry;
-        entry["record_address"] = sa_format_address(static_cast<uint64_t>(current));
-        entry["handler_address"] = sa_format_address(static_cast<uint64_t>(handler));
-        entry["next"] = (next == 0xFFFFFFFFFFFFFFFF) ? "END" : sa_format_address(static_cast<uint64_t>(next));
-
-
-        std::uint64_t mod_base = 0;
-        std::string mod_name;
-        if (handler != 0 && resolve_loaded_module_base("", mod_base, mod_name))
-        {
-
-            voyager::device_t::peb_info peb{};
-            if (device->read_peb(peb) && peb.ldr_address != 0)
-            {
-                const std::uint64_t list_head = peb.ldr_address + 0x10;
-                std::uint64_t ldr_current = device->read<std::uint64_t>(list_head);
-                int ldr_iter = 1024;
-                while (ldr_current != list_head && ldr_current != 0 && ldr_iter-- > 0)
-                {
-                    const std::uint64_t base = device->read<std::uint64_t>(ldr_current + 0x30);
-                    const std::uint32_t size = device->read<std::uint32_t>(ldr_current + 0x40);
-                    if (handler >= base && handler < base + size)
-                    {
-                        entry["module"] = read_remote_unicode_ascii(device.get(),
-                            device->read<std::uint64_t>(ldr_current + 0x60),
-                            device->read<std::uint16_t>(ldr_current + 0x58), 520);
-                        entry["handler_offset"] = sa_format_address(static_cast<uint64_t>(handler - base));
-                        break;
-                    }
-                    std::uint64_t n = device->read<std::uint64_t>(ldr_current);
-                    if (n == ldr_current) break;
-                    ldr_current = n;
-                }
-            }
-        }
-
-        seh_chain.push_back(std::move(entry));
-
-        if (next == 0xFFFFFFFFFFFFFFFF || next == current)
-            break;
-        current = next;
-    }
-
-
-    json veh_chain = json::array();
-    std::uint64_t ntdll_base = 0;
-    std::string ntdll_name;
-    if (resolve_loaded_module_base("ntdll.dll", ntdll_base, ntdll_name) && ntdll_base != 0)
-    {
-        const std::uint64_t add_veh = device->resolve_export(ntdll_base, "RtlAddVectoredExceptionHandler");
-        if (add_veh != 0)
-        {
-            std::uint8_t prologue[128] = {};
-            const std::size_t prologue_read = device->read_raw(add_veh, prologue, sizeof(prologue));
-            if (prologue_read >= 16)
-            {
-                zydis_detail::ensure_init();
-
-                std::uint64_t list_head_va = 0;
-                std::size_t off = 0;
-                std::uint64_t va = add_veh;
-                int decoded = 0;
-
-                ZydisDecodedInstruction instr;
-                ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
-
-                while (off < prologue_read && decoded < 48 && list_head_va == 0)
-                {
-                    if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(
-                            &zydis_detail::decoder(),
-                            prologue + off,
-                            prologue_read - off,
-                            &instr, operands)))
-                    {
-                        ++off;
-                        ++va;
-                        continue;
-                    }
-
-                    ++decoded;
-
-                    if (instr.mnemonic == ZYDIS_MNEMONIC_LEA &&
-                        instr.operand_count_visible >= 2 &&
-                        operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-                        operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
-                        operands[1].mem.base == ZYDIS_REGISTER_RIP &&
-                        operands[1].mem.index == ZYDIS_REGISTER_NONE &&
-                        operands[1].mem.disp.size > 0)
-                    {
-                        const ZydisRegister reg = operands[0].reg.value;
-                        if (reg == ZYDIS_REGISTER_RCX || reg == ZYDIS_REGISTER_RDX)
-                        {
-                            ZyanU64 abs_addr = 0;
-                            if (ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&instr, &operands[1], va, &abs_addr)) &&
-                                abs_addr >= ntdll_base &&
-                                abs_addr < ntdll_base + 0x10000000ULL)
-                            {
-                                list_head_va = static_cast<std::uint64_t>(abs_addr);
-                                break;
-                            }
-                        }
-                    }
-
-                    if (instr.meta.category == ZYDIS_CATEGORY_RET ||
-                        instr.mnemonic == ZYDIS_MNEMONIC_INT3)
-                        break;
-
-                    off += instr.length;
-                    va += instr.length;
-                }
-
-                if (list_head_va != 0)
-                {
-                    const std::uint64_t list_entry_va = list_head_va + 0x8;
-                    const std::uint64_t cookie_va = 0x7FFE0000ULL + 0x330ULL;
-                    std::uint64_t pointer_cookie = 0;
-                    device->read_raw(cookie_va, &pointer_cookie, sizeof(pointer_cookie));
-
-                    std::uint64_t entry = device->read<std::uint64_t>(list_entry_va);
-                    int veh_iter = 0;
-                    int idx = 0;
-
-                    auto modules_snapshot = enumerate_ldr_modules_for_iat(device.get());
-
-                    auto resolve_in_modules = [&](std::uint64_t addr,
-                                                  std::string& out_module,
-                                                  std::uint64_t& out_offset) {
-                        for (const auto& m : modules_snapshot)
-                        {
-                            if (m.base != 0 && addr >= m.base && addr < m.base + m.size)
-                            {
-                                std::string base_name = m.name;
-                                const auto slash = base_name.find_last_of("\\/");
-                                if (slash != std::string::npos)
-                                    base_name = base_name.substr(slash + 1);
-                                out_module = base_name;
-                                out_offset = addr - m.base;
-                                return true;
-                            }
-                        }
-                        return false;
-                    };
-
-                    while (entry != 0 &&
-                           entry != list_entry_va &&
-                           veh_iter++ < 256)
-                    {
-                        const std::uint64_t flink = device->read<std::uint64_t>(entry);
-                        const std::uint32_t ref_count = device->read<std::uint32_t>(entry + 0x10);
-                        const std::uint32_t flags = device->read<std::uint32_t>(entry + 0x14);
-                        const std::uint64_t handler_raw = device->read<std::uint64_t>(entry + 0x18);
-
-                        std::uint64_t handler_decoded = handler_raw;
-                        if (handler_raw != 0 && pointer_cookie != 0)
-                        {
-                            const std::uint32_t rot = static_cast<std::uint32_t>(pointer_cookie & 0x3F);
-                            const std::uint64_t xored = handler_raw ^ pointer_cookie;
-                            handler_decoded = (xored >> rot) | (xored << (64 - rot));
-                        }
-
-                        json veh_entry;
-                        veh_entry["index"] = idx++;
-                        veh_entry["entry_address"] = sa_format_address(static_cast<uint64_t>(entry));
-                        veh_entry["ref_count"] = ref_count;
-                        veh_entry["flags"] = sa_format_address(static_cast<uint64_t>(flags));
-                        veh_entry["handler_encoded"] = sa_format_address(static_cast<uint64_t>(handler_raw));
-                        veh_entry["handler_va"] = sa_format_address(static_cast<uint64_t>(handler_decoded));
-
-                        std::string mod_label;
-                        std::uint64_t mod_off = 0;
-                        if (resolve_in_modules(handler_decoded, mod_label, mod_off))
-                        {
-                            veh_entry["module"] = mod_label;
-                            veh_entry["offset"] = sa_format_address(static_cast<uint64_t>(mod_off));
-                        }
-                        else if (handler_raw != handler_decoded &&
-                                 resolve_in_modules(handler_raw, mod_label, mod_off))
-                        {
-                            veh_entry["module"] = mod_label;
-                            veh_entry["offset"] = sa_format_address(static_cast<uint64_t>(mod_off));
-                            veh_entry["handler_va"] = sa_format_address(static_cast<uint64_t>(handler_raw));
-                        }
-
-                        veh_chain.push_back(std::move(veh_entry));
-
-                        if (flink == entry || flink == 0)
-                            break;
-                        entry = flink;
-                    }
-                }
-            }
-        }
-    }
-
-    json result;
-    result["thread_id"] = tid;
-    result["teb_address"] = sa_format_address(static_cast<uint64_t>(teb_addr));
-    result["teb_source"] = teb_source;
-    result["seh_source"] = seh_source;
-    result["teb_available"] = true;
-    result["seh_entries"] = seh_chain.size();
-    result["seh_chain"] = std::move(seh_chain);
-    result["veh_entries"] = veh_chain.size();
-    result["veh_chain"] = std::move(veh_chain);
-    result["rip"] = sa_format_address(static_cast<uint64_t>(ctx.rip));
-    return tool_result_t::ok(OBFSTR("SEH chain: ") + std::to_string(result["seh_entries"].get<int>()) +
-                             OBFSTR(" handlers, VEH chain: ") +
-                             std::to_string(result["veh_entries"].get<int>()) +
-                             OBFSTR(" handlers for TID ") + std::to_string(tid), result);
-}
-
-tool_result_t driver_find_code_caves(const json& params)
-{
-    diag::log_tagged_fmt("drv_tools", "driver_find_code_caves entry");
-    if (auto ctx_err = ensure_attached_process_context(params))
-        return *ctx_err;
-
-    const std::size_t min_size = params.value("min_size", 64);
-    const int limit = std::min(params.value("limit", 50), 500);
-    const std::uint8_t fill_byte = static_cast<std::uint8_t>(params.value("fill_byte", 0x00));
-    const bool executable_only = params.value("executable_only", true);
-
-
-    auto regions = enumerate_all_memory_regions_paginated(
-        device.get(), 0x10000, 0x7FFFFFFFFFFF, false);
-
-    if (regions.empty())
-        return tool_result_t::error(OBFSTR("No memory regions found."));
-
-    json caves = json::array();
-    int found = 0;
-
-    for (const auto& region : regions)
-    {
-        if (found >= limit) break;
-        if (region.size == 0 || region.size > 0x10000000) continue;
-
-
-        bool is_exec = (region.protect & 0x10) ||
-                       (region.protect & 0x20) ||
-                       (region.protect & 0x40) ||
-                       (region.protect & 0x80);
-
-        if (executable_only && !is_exec)
-            continue;
-
-
-        if ((region.state & 0x1000) == 0)
-            continue;
-
-
-        constexpr std::size_t CHUNK = 0x10000;
-        for (std::uint64_t offset = 0; offset < region.size && found < limit; offset += CHUNK)
-        {
-            const std::size_t to_read = std::min<std::size_t>(CHUNK, region.size - offset);
-            std::vector<std::uint8_t> buf(to_read);
-            if (device->read_raw(region.base + offset, buf.data(), to_read) == 0)
-                continue;
-
-
-            std::size_t run_start = 0;
-            bool in_run = false;
-
-            for (std::size_t i = 0; i <= to_read; ++i)
-            {
-                bool is_fill = (i < to_read) && (buf[i] == fill_byte);
-
-                if (is_fill && !in_run)
-                {
-                    run_start = i;
-                    in_run = true;
-                }
-                else if (!is_fill && in_run)
-                {
-                    std::size_t run_len = i - run_start;
-                    if (run_len >= min_size)
-                    {
-                        json cave;
-                        cave["address"] = sa_format_address(
-                            static_cast<uint64_t>(region.base + offset + run_start));
-                        cave["size"] = run_len;
-                        cave["fill_byte"] = sa_format_address(static_cast<uint64_t>(fill_byte));
-                        cave["executable"] = is_exec;
-                        cave["protection"] = sa_format_address(static_cast<uint64_t>(region.protect));
-                        cave["region_base"] = sa_format_address(static_cast<uint64_t>(region.base));
-                        caves.push_back(std::move(cave));
-                        ++found;
-                        if (found >= limit) break;
-                    }
-                    in_run = false;
-                }
-            }
-        }
-    }
-
-    json result;
-    result["caves_found"] = found;
-    result["min_size_filter"] = min_size;
-    result["executable_only"] = executable_only;
-    result["fill_byte"] = sa_format_address(static_cast<uint64_t>(fill_byte));
-    result["caves"] = std::move(caves);
-    return tool_result_t::ok(std::to_string(found) + OBFSTR(" code caves found (>= ") +
-                             std::to_string(min_size) + OBFSTR(" bytes)"), result);
-}
-
-tool_result_t driver_scan_memory_value(const json& params)
-{
-    diag::log_tagged_fmt("drv_tools", "driver_scan_memory_value entry");
-    if (auto ctx_err = ensure_attached_process_context(params))
-        return *ctx_err;
-
-
-    const std::string value_type = params.value("value_type", "int32");
-    const std::string scan_mode = params.value("scan_mode", "exact");
-    const int limit = std::min(params.value("limit", 100), 10000);
-
-
-    std::uint64_t scan_start = 0x10000;
-    std::uint64_t scan_end = 0x7FFFFFFFFFFF;
-    if (params.contains("start"))
-    {
-        auto s = sa_parse_address(params["start"].get<std::string>());
-        if (s) scan_start = *s;
-    }
-    if (params.contains("end"))
-    {
-        auto e = sa_parse_address(params["end"].get<std::string>());
-        if (e) scan_end = *e;
-    }
-
-
-    std::size_t value_size = 4;
-    std::vector<std::uint8_t> search_bytes;
-    std::vector<std::uint8_t> search_bytes_max;
-
-    if (value_type == "byte")
-    {
-        value_size = 1;
-        std::uint8_t v = static_cast<std::uint8_t>(params.value("value", 0));
-        search_bytes.assign(reinterpret_cast<const std::uint8_t*>(&v),
-                           reinterpret_cast<const std::uint8_t*>(&v) + 1);
-    }
-    else if (value_type == "int16")
-    {
-        value_size = 2;
-        std::int16_t v = static_cast<std::int16_t>(params.value("value", 0));
-        search_bytes.assign(reinterpret_cast<const std::uint8_t*>(&v),
-                           reinterpret_cast<const std::uint8_t*>(&v) + 2);
-    }
-    else if (value_type == "int32")
-    {
-        value_size = 4;
-        std::int32_t v = static_cast<std::int32_t>(params.value("value", 0));
-        search_bytes.assign(reinterpret_cast<const std::uint8_t*>(&v),
-                           reinterpret_cast<const std::uint8_t*>(&v) + 4);
-    }
-    else if (value_type == "int64")
-    {
-        value_size = 8;
-        std::int64_t v = static_cast<std::int64_t>(params.value("value", 0));
-        search_bytes.assign(reinterpret_cast<const std::uint8_t*>(&v),
-                           reinterpret_cast<const std::uint8_t*>(&v) + 8);
-    }
-    else if (value_type == "float")
-    {
-        value_size = 4;
-        float v = params.value("value", 0.0f);
-        search_bytes.assign(reinterpret_cast<const std::uint8_t*>(&v),
-                           reinterpret_cast<const std::uint8_t*>(&v) + 4);
-    }
-    else if (value_type == "double")
-    {
-        value_size = 8;
-        double v = params.value("value", 0.0);
-        search_bytes.assign(reinterpret_cast<const std::uint8_t*>(&v),
-                           reinterpret_cast<const std::uint8_t*>(&v) + 8);
-    }
-    else if (value_type == "string")
-    {
-        const std::string str_val = params.value("value_string", "");
-        if (str_val.empty()) return tool_result_t::error(OBFSTR("value_string required for string type"));
-        search_bytes.assign(str_val.begin(), str_val.end());
-        value_size = search_bytes.size();
-    }
-    else if (value_type == "aob")
-    {
-
-        return tool_result_t::error(OBFSTR("Use driver_scan_pattern for AOB/wildcard scans"));
-    }
-    else
-    {
-        return tool_result_t::error(OBFSTR("Invalid value_type. Use: byte, int16, int32, int64, float, double, string"));
-    }
-
-    if (scan_mode == "range")
-    {
-
-        if (value_type == "int32")
-        {
-            std::int32_t v = static_cast<std::int32_t>(params.value("value_max", 0));
-            search_bytes_max.assign(reinterpret_cast<const std::uint8_t*>(&v),
-                                   reinterpret_cast<const std::uint8_t*>(&v) + 4);
-        }
-        else if (value_type == "float")
-        {
-            float v = params.value("value_max", 0.0f);
-            search_bytes_max.assign(reinterpret_cast<const std::uint8_t*>(&v),
-                                   reinterpret_cast<const std::uint8_t*>(&v) + 4);
-        }
-
-    }
-
-
-    auto regions = enumerate_all_memory_regions_paginated(
-        device.get(), scan_start, scan_end, false);
-
-    json matches = json::array();
-    int found = 0;
-
-    for (const auto& region : regions)
-    {
-        if (found >= limit) break;
-        if (region.size == 0 || region.size > 0x10000000) continue;
-        if ((region.state & 0x1000) == 0) continue;
-        if (region.base < scan_start || region.base >= scan_end) continue;
-
-
-        if ((region.protect & 0x01) ||
-            (region.protect & 0x100))
-            continue;
-
-        constexpr std::size_t CHUNK = 0x10000;
-        for (std::uint64_t offset = 0; offset < region.size && found < limit; offset += CHUNK)
-        {
-            const std::size_t to_read = std::min<std::size_t>(CHUNK, region.size - offset);
-            if (to_read < value_size) continue;
-
-            std::vector<std::uint8_t> buf(to_read);
-            if (device->read_raw(region.base + offset, buf.data(), to_read) == 0)
-                continue;
-
-
-            if (scan_mode == "exact" && !search_bytes.empty())
-            {
-                for (std::size_t i = 0; i + value_size <= to_read && found < limit; ++i)
-                {
-                    if (std::memcmp(&buf[i], search_bytes.data(), value_size) == 0)
-                    {
-                        json m;
-                        m["address"] = sa_format_address(static_cast<uint64_t>(region.base + offset + i));
-
-
-                        if (value_type == "float")
-                        {
-                            float fv;
-                            std::memcpy(&fv, &buf[i], 4);
-                            m["value"] = fv;
-                        }
-                        else if (value_type == "double")
-                        {
-                            double dv;
-                            std::memcpy(&dv, &buf[i], 8);
-                            m["value"] = dv;
-                        }
-                        else if (value_type == "string")
-                        {
-                            m["value"] = std::string(buf.begin() + i, buf.begin() + i + value_size);
-                        }
-                        else
-                        {
-                            std::int64_t iv = 0;
-                            std::memcpy(&iv, &buf[i], std::min<std::size_t>(value_size, 8));
-                            m["value"] = iv;
-                        }
-                        m["region_protect"] = sa_format_address(static_cast<uint64_t>(region.protect));
-                        matches.push_back(std::move(m));
-                        ++found;
-                    }
-                }
-            }
-            else if (scan_mode == "range" && !search_bytes.empty() && !search_bytes_max.empty())
-            {
-
-                for (std::size_t i = 0; i + value_size <= to_read && found < limit; i += value_size)
-                {
-                    bool in_range = false;
-                    if (value_type == "int32")
-                    {
-                        std::int32_t current_val, min_val, max_val;
-                        std::memcpy(&current_val, &buf[i], 4);
-                        std::memcpy(&min_val, search_bytes.data(), 4);
-                        std::memcpy(&max_val, search_bytes_max.data(), 4);
-                        in_range = (current_val >= min_val && current_val <= max_val);
-                        if (in_range)
-                        {
-                            json m;
-                            m["address"] = sa_format_address(static_cast<uint64_t>(region.base + offset + i));
-                            m["value"] = current_val;
-                            matches.push_back(std::move(m));
-                            ++found;
-                        }
-                    }
-                    else if (value_type == "float")
-                    {
-                        float current_val, min_val, max_val;
-                        std::memcpy(&current_val, &buf[i], 4);
-                        std::memcpy(&min_val, search_bytes.data(), 4);
-                        std::memcpy(&max_val, search_bytes_max.data(), 4);
-                        in_range = (current_val >= min_val && current_val <= max_val);
-                        if (in_range)
-                        {
-                            json m;
-                            m["address"] = sa_format_address(static_cast<uint64_t>(region.base + offset + i));
-                            m["value"] = current_val;
-                            matches.push_back(std::move(m));
-                            ++found;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    json result;
-    result["value_type"] = value_type;
-    result["scan_mode"] = scan_mode;
-    result["matches_found"] = found;
-    result["matches"] = std::move(matches);
-    return tool_result_t::ok(std::to_string(found) + OBFSTR(" matches found"), result);
-}
-
-tool_result_t driver_pointer_scan(const json& params)
-{
-    diag::log_tagged_fmt("drv_tools", "driver_pointer_scan entry");
-    if (auto ctx_err = ensure_attached_process_context(params))
-        return *ctx_err;
-
-    const std::string target_addr_str = params.value("target_address", "");
-    if (target_addr_str.empty())
-        return tool_result_t::error(OBFSTR("Missing required parameter: target_address"));
-
-    auto target_opt = sa_parse_address(target_addr_str);
-    if (!target_opt)
-        return tool_result_t::error(OBFSTR("Invalid target_address"));
-
-    const std::uint64_t target = *target_opt;
-    const int max_depth = std::min(params.value("max_depth", 3), 7);
-    const std::uint64_t max_offset = params.value("max_offset", 0x1000);
-    const int limit = std::min(params.value("limit", 50), 500);
-
-
-    const std::uint64_t image_base = device->get_base_address();
-
-
-    auto regions = enumerate_all_memory_regions_paginated(
-        device.get(), 0x10000, 0x7FFFFFFFFFFF, false);
-
-
-    struct ptr_hit_t {
-        std::uint64_t address;
-        std::uint64_t value;
-        std::int64_t offset;
-        bool is_static;
-        std::string module_name;
-    };
-
-    auto find_pointers_to_range = [&](std::uint64_t range_start, std::uint64_t range_end,
-                                      int current_limit) -> std::vector<ptr_hit_t>
-    {
-        std::vector<ptr_hit_t> hits;
-        for (const auto& region : regions)
-        {
-            if (static_cast<int>(hits.size()) >= current_limit) break;
-            if (region.size == 0 || region.size > 0x10000000) continue;
-            if ((region.state & 0x1000) == 0) continue;
-            if ((region.protect & 0x01) || (region.protect & 0x100)) continue;
-
-            constexpr std::size_t CHUNK = 0x10000;
-            for (std::uint64_t off2 = 0; off2 < region.size && static_cast<int>(hits.size()) < current_limit; off2 += CHUNK)
-            {
-                const std::size_t to_read = std::min<std::size_t>(CHUNK, region.size - off2);
-                if (to_read < 8) continue;
-
-                std::vector<std::uint8_t> buf(to_read);
-                if (device->read_raw(region.base + off2, buf.data(), to_read) == 0)
-                    continue;
-
-                for (std::size_t i = 0; i + 8 <= to_read && static_cast<int>(hits.size()) < current_limit; i += 8)
-                {
-                    std::uint64_t val;
-                    std::memcpy(&val, &buf[i], 8);
-                    if (val >= range_start && val <= range_end)
-                    {
-                        ptr_hit_t hit;
-                        hit.address = region.base + off2 + i;
-                        hit.value = val;
-                        hit.offset = static_cast<std::int64_t>(val) - static_cast<std::int64_t>(range_start + max_offset);
-                        hit.is_static = false;
-                        hits.push_back(std::move(hit));
-                    }
-                }
-            }
-        }
-        return hits;
-    };
-
-
-    std::uint64_t range_lo = target > max_offset ? target - max_offset : 0;
-    std::uint64_t range_hi = target + max_offset;
-    auto level0 = find_pointers_to_range(range_lo, range_hi, limit * 10);
-
-    json chains = json::array();
-    int chain_count = 0;
-
-
-    for (auto& hit : level0)
-    {
-        if (chain_count >= limit) break;
-
-        json chain;
-        chain["depth"] = 1;
-        chain["base_address"] = sa_format_address(static_cast<uint64_t>(hit.address));
-        chain["pointer_value"] = sa_format_address(static_cast<uint64_t>(hit.value));
-        chain["final_offset"] = static_cast<std::int64_t>(hit.value - target);
-
-
-        bool is_static = false;
-        voyager::device_t::peb_info peb{};
-        if (device->read_peb(peb) && peb.ldr_address != 0)
-        {
-            const std::uint64_t list_head = peb.ldr_address + 0x10;
-            std::uint64_t ldr_curr = device->read<std::uint64_t>(list_head);
-            int ldr_iter = 512;
-            while (ldr_curr != list_head && ldr_curr != 0 && ldr_iter-- > 0)
-            {
-                const std::uint64_t base = device->read<std::uint64_t>(ldr_curr + 0x30);
-                const std::uint32_t size = device->read<std::uint32_t>(ldr_curr + 0x40);
-                if (hit.address >= base && hit.address < base + size)
-                {
-                    is_static = true;
-                    chain["module"] = read_remote_unicode_ascii(device.get(),
-                        device->read<std::uint64_t>(ldr_curr + 0x60),
-                        device->read<std::uint16_t>(ldr_curr + 0x58), 520);
-                    chain["module_offset"] = sa_format_address(static_cast<uint64_t>(hit.address - base));
-                    break;
-                }
-                std::uint64_t n = device->read<std::uint64_t>(ldr_curr);
-                if (n == ldr_curr) break;
-                ldr_curr = n;
-            }
-        }
-
-        chain["is_static"] = is_static;
-        chains.push_back(std::move(chain));
-        ++chain_count;
-    }
-
-    json result;
-    result["target_address"] = sa_format_address(static_cast<uint64_t>(target));
-    result["max_depth"] = max_depth;
-    result["max_offset"] = max_offset;
-    result["chains_found"] = chain_count;
-    result["chains"] = std::move(chains);
-    result["note"] = OBFSTR("Static pointers (is_static=true) with module+offset are stable across "
-                            "restarts. Use module base + module_offset + final_offset to reach target.");
-    return tool_result_t::ok(std::to_string(chain_count) + OBFSTR(" pointer chains found"), result);
-}
 
 tool_result_t driver_enumerate_windows(const json& params)
 {
     diag::log_tagged_fmt("drv_tools", "driver_enumerate_windows entry");
     if (!device->is_connected())
-        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_load first."));
+        return tool_result_t::error(OBFSTR("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
 
     const std::uint32_t filter_pid = params.value("pid", device->get_process_id());
     const bool include_children = params.value("include_children", true);
@@ -9348,138 +7957,6 @@ tool_result_t driver_enumerate_windows(const json& params)
                              std::to_string(filter_pid), result);
 }
 
-tool_result_t driver_walk_stack(const json& params)
-{
-    diag::log_tagged_fmt("drv_tools", "driver_walk_stack entry");
-    if (auto ctx_err = ensure_attached_process_context(params))
-        return *ctx_err;
-
-    auto tid_opt = parse_tid_param(params);
-    if (!tid_opt)
-        return tool_result_t::error(OBFSTR("Missing or invalid tid parameter."));
-
-    const std::uint32_t tid = *tid_opt;
-    const int max_frames = std::min(params.value("max_frames", 64), 256);
-
-    driver_bridge::thread_context_t ctx{};
-    if (!driver_bridge::get_thread_context(tid, ctx))
-        return tool_result_t::error(OBFSTR("Failed to get thread context for TID ") + std::to_string(tid));
-
-
-    const std::uint64_t rsp = ctx.rsp;
-    const std::uint64_t rbp = ctx.rbp;
-    const std::uint64_t rip = ctx.rip;
-
-
-    struct mod_info_t {
-        std::uint64_t base;
-        std::uint32_t size;
-        std::string name;
-    };
-    std::vector<mod_info_t> modules;
-
-    voyager::device_t::peb_info peb{};
-    if (device->read_peb(peb) && peb.ldr_address != 0)
-    {
-        const std::uint64_t list_head = peb.ldr_address + 0x10;
-        std::uint64_t ldr_curr = device->read<std::uint64_t>(list_head);
-        int ldr_iter = 1024;
-        while (ldr_curr != list_head && ldr_curr != 0 && ldr_iter-- > 0)
-        {
-            mod_info_t mi;
-            mi.base = device->read<std::uint64_t>(ldr_curr + 0x30);
-            mi.size = device->read<std::uint32_t>(ldr_curr + 0x40);
-            mi.name = read_remote_unicode_ascii(device.get(),
-                device->read<std::uint64_t>(ldr_curr + 0x60),
-                device->read<std::uint16_t>(ldr_curr + 0x58), 520);
-            if (mi.base != 0 && mi.size != 0)
-                modules.push_back(std::move(mi));
-            std::uint64_t n = device->read<std::uint64_t>(ldr_curr);
-            if (n == ldr_curr) break;
-            ldr_curr = n;
-        }
-    }
-
-    auto resolve_module = [&](std::uint64_t addr) -> std::pair<std::string, std::uint64_t> {
-        for (const auto& m : modules)
-        {
-            if (addr >= m.base && addr < m.base + m.size)
-                return {m.name, addr - m.base};
-        }
-        return {"", 0};
-    };
-
-    json frames = json::array();
-
-
-    {
-        json f;
-        f["frame"] = 0;
-        f["rip"] = sa_format_address(static_cast<uint64_t>(rip));
-        f["rsp"] = sa_format_address(static_cast<uint64_t>(rsp));
-        f["rbp"] = sa_format_address(static_cast<uint64_t>(rbp));
-        auto [mod, off] = resolve_module(rip);
-        if (!mod.empty()) { f["module"] = mod; f["offset"] = sa_format_address(static_cast<uint64_t>(off)); }
-        frames.push_back(std::move(f));
-    }
-
-
-    constexpr std::size_t STACK_READ_SIZE = 0x2000;
-    std::vector<std::uint8_t> stack_buf(STACK_READ_SIZE);
-    const std::size_t stack_read = device->read_raw(rsp, stack_buf.data(), STACK_READ_SIZE);
-
-    int frame_idx = 1;
-    std::set<std::uint64_t> seen_addresses;
-
-    for (std::size_t i = 0; i + 8 <= stack_read && frame_idx < max_frames; i += 8)
-    {
-        std::uint64_t candidate;
-        std::memcpy(&candidate, &stack_buf[i], 8);
-
-
-        if (candidate < 0x10000 || candidate > 0x7FFFFFFFFFFF)
-            continue;
-
-        auto [mod, off] = resolve_module(candidate);
-        if (mod.empty()) continue;
-        if (seen_addresses.count(candidate)) continue;
-        seen_addresses.insert(candidate);
-
-
-        std::uint8_t pre_bytes[8] = {};
-        device->read_raw(candidate - 8, pre_bytes, 8);
-
-
-        bool looks_like_ret_addr = false;
-        if (pre_bytes[3] == 0xE8) looks_like_ret_addr = true;
-        if (pre_bytes[2] == 0xFF && (pre_bytes[3] & 0x38) == 0x10)
-            looks_like_ret_addr = true;
-        if (pre_bytes[6] == 0xFF && pre_bytes[7] >= 0xD0 && pre_bytes[7] <= 0xD7)
-            looks_like_ret_addr = true;
-
-        if (!looks_like_ret_addr) continue;
-
-        json f;
-        f["frame"] = frame_idx;
-        f["return_address"] = sa_format_address(static_cast<uint64_t>(candidate));
-        f["stack_offset"] = sa_format_address(static_cast<uint64_t>(rsp + i));
-        f["module"] = mod;
-        f["offset"] = sa_format_address(static_cast<uint64_t>(off));
-        frames.push_back(std::move(f));
-        ++frame_idx;
-    }
-
-    json result;
-    result["thread_id"] = tid;
-    result["rip"] = sa_format_address(static_cast<uint64_t>(rip));
-    result["rsp"] = sa_format_address(static_cast<uint64_t>(rsp));
-    result["rbp"] = sa_format_address(static_cast<uint64_t>(rbp));
-    result["frame_count"] = frames.size();
-    result["frames"] = std::move(frames);
-    result["method"] = OBFSTR("heuristic_stack_scan");
-    return tool_result_t::ok(std::to_string(result["frame_count"].get<int>()) +
-                             OBFSTR(" stack frames for TID ") + std::to_string(tid), result);
-}
 
 tool_result_t driver_assemble(const json& params)
 {
@@ -9797,137 +8274,6 @@ tool_result_t driver_assemble(const json& params)
 static std::map<std::string, std::vector<std::uint8_t>> s_memory_snapshots;
 static std::mutex s_snapshot_mutex;
 
-tool_result_t driver_compare_memory_snapshot(const json& params)
-{
-    diag::log_tagged_fmt("drv_tools", "driver_compare_memory_snapshot entry");
-    if (auto ctx_err = ensure_attached_process_context(params))
-        return *ctx_err;
-
-    const std::string operation = params.value("operation", "take");
-    const std::string snapshot_name = params.value("name", "default");
-
-    if (operation == "take")
-    {
-        if (!params.contains("address"))
-            return tool_result_t::error(OBFSTR("Missing required parameter: address"));
-
-        auto addr_opt = sa_parse_address(params["address"].get<std::string>());
-        if (!addr_opt) return tool_result_t::error(OBFSTR("Invalid address"));
-
-        std::size_t size = params.value("size", 4096);
-        if (size > 0x100000) return tool_result_t::error(OBFSTR("Size too large (max 1MB)"));
-
-        std::vector<std::uint8_t> buffer(size);
-        std::size_t read = device->read_raw(*addr_opt, buffer.data(), size);
-        if (read == 0) return tool_result_t::error(OBFSTR("Failed to read memory for snapshot"));
-        buffer.resize(read);
-
-        std::string key = snapshot_name + "|" + sa_format_address(*addr_opt) + "|" + std::to_string(read);
-        {
-            std::lock_guard<std::mutex> lock(s_snapshot_mutex);
-            s_memory_snapshots[key] = std::move(buffer);
-        }
-
-        json result;
-        result["operation"] = "take";
-        result["name"] = snapshot_name;
-        result["address"] = sa_format_address(*addr_opt);
-        result["size"] = read;
-        result["snapshot_key"] = key;
-        return tool_result_t::ok(OBFSTR("Snapshot taken: ") + key, result);
-    }
-    else if (operation == "compare")
-    {
-        if (!params.contains("address"))
-            return tool_result_t::error(OBFSTR("Missing required parameter: address"));
-
-        auto addr_opt = sa_parse_address(params["address"].get<std::string>());
-        if (!addr_opt) return tool_result_t::error(OBFSTR("Invalid address"));
-
-
-        std::vector<std::uint8_t> old_snapshot;
-        std::string found_key;
-        {
-            std::lock_guard<std::mutex> lock(s_snapshot_mutex);
-            for (const auto& [k, v] : s_memory_snapshots)
-            {
-                if (k.find(snapshot_name + "|") == 0 && k.find(sa_format_address(*addr_opt)) != std::string::npos)
-                {
-                    old_snapshot = v;
-                    found_key = k;
-                    break;
-                }
-            }
-        }
-
-        if (old_snapshot.empty())
-            return tool_result_t::error(OBFSTR("No snapshot found with name '") + snapshot_name +
-                                        OBFSTR("' at address ") + sa_format_address(*addr_opt));
-
-        const std::size_t size = old_snapshot.size();
-        std::vector<std::uint8_t> current(size);
-        std::size_t read = device->read_raw(*addr_opt, current.data(), size);
-        if (read == 0) return tool_result_t::error(OBFSTR("Failed to read current memory for comparison"));
-
-
-        json diffs = json::array();
-        int diff_count = 0;
-        const int max_diffs = std::min(params.value("max_diffs", 200), 5000);
-
-        for (std::size_t i = 0; i < std::min(old_snapshot.size(), static_cast<std::size_t>(read)); ++i)
-        {
-            if (old_snapshot[i] != current[i])
-            {
-                if (diff_count < max_diffs)
-                {
-                    json d;
-                    d["offset"] = i;
-                    d["address"] = sa_format_address(static_cast<uint64_t>(*addr_opt + i));
-                    d["old_value"] = old_snapshot[i];
-                    d["new_value"] = current[i];
-                    diffs.push_back(std::move(d));
-                }
-                ++diff_count;
-            }
-        }
-
-        json result;
-        result["operation"] = "compare";
-        result["name"] = snapshot_name;
-        result["address"] = sa_format_address(*addr_opt);
-        result["snapshot_size"] = old_snapshot.size();
-        result["current_read"] = read;
-        result["total_diffs"] = diff_count;
-        result["identical"] = diff_count == 0;
-        result["diffs"] = std::move(diffs);
-        return tool_result_t::ok(diff_count == 0
-            ? OBFSTR("Memory identical to snapshot")
-            : std::to_string(diff_count) + OBFSTR(" bytes changed since snapshot"), result);
-    }
-    else if (operation == "list")
-    {
-        std::lock_guard<std::mutex> lock(s_snapshot_mutex);
-        json snapshots = json::array();
-        for (const auto& [k, v] : s_memory_snapshots)
-        {
-            json s;
-            s["key"] = k;
-            s["size"] = v.size();
-            snapshots.push_back(std::move(s));
-        }
-        json result;
-        result["snapshots"] = std::move(snapshots);
-        return tool_result_t::ok(std::to_string(s_memory_snapshots.size()) + OBFSTR(" snapshots stored"), result);
-    }
-    else if (operation == "clear")
-    {
-        std::lock_guard<std::mutex> lock(s_snapshot_mutex);
-        int count = static_cast<int>(s_memory_snapshots.size());
-        s_memory_snapshots.clear();
-        return tool_result_t::ok(std::to_string(count) + OBFSTR(" snapshots cleared"));
-    }
-    return tool_result_t::error(OBFSTR("Invalid operation. Use 'take', 'compare', 'list', or 'clear'."));
-}
 
 tool_result_t driver_find_references(const json& params)
 {
@@ -10338,36 +8684,10 @@ void register_driver_tools(mcp_standalone::server_t& srv)
     s_deferred_tool_list = &srv.get_tools();
 
 
-    register_compat(srv, {
-        OBFSTR("driver_status"), OBFSTR("driver"),
-        OBFSTR("Get kernel driver connection status: connected flag, attached process ID, "
-               "image base address, DirectoryTableBase (DTB), and heartbeat result."),
-        {}, driver_status, true});
-
-    register_compat(srv, {
-        OBFSTR("driver_attach"), OBFSTR("driver"),
-        OBFSTR("Attach the kernel driver to a running process by name. "
-               "Finds the process, locates the image base, and solves the DTB for physical memory access. "
-               "Bypasses all process isolation and memory protection."),
-        {{OBFSTR("process"), OBFSTR("string"),
-                    OBFSTR("Target process executable name (e.g. 'target.exe'). Case-insensitive. Aliases: process_name, name."), false},
-                 {OBFSTR("process_name"), OBFSTR("string"),
-                    OBFSTR("Alias of process."), false},
-                 {OBFSTR("name"), OBFSTR("string"),
-                    OBFSTR("Alias of process."), false}},
-        driver_attach, false});
 
 
 
-    register_compat(srv, {
-        OBFSTR("driver_write_memory"), OBFSTR("driver"),
-        OBFSTR("Write bytes to the target process via kernel driver. "
-             "Bypasses all memory protection including DEP, guard pages, and write protection. "
-             "Accepted bytes formats: 'DE AD BE EF', 'DEADBEEF', [222,173,...], ['DE','AD',...]."),
-        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Virtual address in target process"), true},
-          {OBFSTR("bytes"), OBFSTR("string"), OBFSTR("Bytes payload in hex string or JSON array."), true},
-          {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}},
-        driver_write_memory, false});
+
 
     register_compat(srv, {
         OBFSTR("driver_dump_module"), OBFSTR("driver"),
@@ -10390,17 +8710,6 @@ void register_driver_tools(mcp_standalone::server_t& srv)
           {OBFSTR("patch_idb"), OBFSTR("boolean"), OBFSTR("Patch dumped runtime bytes into IDA database (default true)"), false}},
         driver_dump_module, false});
 
-    register_compat(srv, {
-        OBFSTR("driver_scan_pattern"), OBFSTR("driver"),
-        OBFSTR("Scan target process memory for a byte pattern via kernel driver. "
-               "Supports wildcard '??' bytes. Scans the attached module range by default."),
-        {{OBFSTR("pattern"), OBFSTR("string"),
-          OBFSTR("Hex byte pattern with '??' wildcards (e.g. '48 8B ?? ?? 89 ?? 00')"), true},
-         {OBFSTR("start"), OBFSTR("string"), OBFSTR("Start address (default: image base)"), false},
-         {OBFSTR("end"), OBFSTR("string"), OBFSTR("End address"), false},
-         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Scan size from start in bytes (default 0x200000)"), false},
-         {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum matches to return (default 20)"), false}},
-        driver_scan_pattern, false});
 
 
     register_compat(srv, {
@@ -10429,33 +8738,7 @@ void register_driver_tools(mcp_standalone::server_t& srv)
           OBFSTR("Maximum number of modules to return (default 500)"), false}},
         driver_enumerate_kernel_modules, false});
 
-    register_compat(srv, {
-        OBFSTR("driver_read_kernel_memory"), OBFSTR("driver"),
-        OBFSTR("Read raw bytes from ANY kernel virtual address via physical memory translation. "
-               "Requires driver connected. Solves System DTB automatically. "
-               "Bypasses all kernel integrity checks, PatchGuard, and memory protections. "
-               "Can read anticheat driver memory, ntoskrnl internals, SSDT, IDT, anything."),
-        {{OBFSTR("address"), OBFSTR("string"),
-          OBFSTR("Kernel virtual address to read (e.g. 'FFFFF80012345000')"), true},
-         {OBFSTR("size"), OBFSTR("number"),
-          OBFSTR("Bytes to read (default 256, max 65536)"), false},
-         {OBFSTR("patch_idb"), OBFSTR("boolean"),
-          OBFSTR("Patch read bytes into IDA database at the same address (default false)"), false}},
-        driver_read_kernel_memory, false});
 
-    register_compat(srv, {
-        OBFSTR("driver_write_kernel_memory"), OBFSTR("driver"),
-        OBFSTR("Write raw bytes to ANY kernel virtual address via physical memory translation. "
-               "Requires driver connected. Bypasses all memory protection, write-protection, "
-               "PatchGuard, code integrity. WARNING: Writing to kernel memory can cause BSOD "
-                             "if done incorrectly. Use with extreme caution. User-mode addresses are rejected."),
-        {{OBFSTR("address"), OBFSTR("string"),
-          OBFSTR("Kernel virtual address to write (e.g. 'FFFFF80012345000')"), true},
-         {OBFSTR("bytes"), OBFSTR("string"),
-                    OBFSTR("Bytes payload in hex string or JSON array."), true},
-         {OBFSTR("validate_only"), OBFSTR("boolean"),
-                    OBFSTR("Validate address and byte payload without writing memory."), false}},
-        driver_write_kernel_memory, false});
 
 
     register_compat(srv, {
@@ -10510,65 +8793,10 @@ void register_driver_tools(mcp_standalone::server_t& srv)
         driver_call_function, false});
 
 
-    register_compat(srv, {
-        OBFSTR("driver_get_thread_context"), OBFSTR("driver"),
-        OBFSTR("Get the full register state of a thread in the attached process via kernel PsGetContextThread. "
-               "Returns all general purpose registers (RAX-R15), RIP, RFLAGS, and debug registers (DR0-DR7). "
-               "Thread must exist in the attached process. Bypasses all anti-debug since it operates from kernel."),
-        {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID. Decimal string recommended; 0x-prefixed hex supported."), true},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}},
-        driver_get_thread_context, true});
-
-    register_compat(srv, {
-        OBFSTR("driver_set_thread_context"), OBFSTR("driver"),
-        OBFSTR("Set registers of a thread in the attached process via kernel PsSetContextThread. "
-               "Only specified registers are modified; unspecified registers are untouched. "
-               "Can set RIP to redirect execution, modify debug registers for HW breakpoints, "
-               "change RSP, or any other register. Operates from kernel, bypasses all protection."),
-        {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID. Decimal string recommended; 0x-prefixed hex supported."), true},
-         {OBFSTR("rax"), OBFSTR("string"), OBFSTR("RAX value (hex)"), false},
-         {OBFSTR("rbx"), OBFSTR("string"), OBFSTR("RBX value"), false},
-         {OBFSTR("rcx"), OBFSTR("string"), OBFSTR("RCX value"), false},
-         {OBFSTR("rdx"), OBFSTR("string"), OBFSTR("RDX value"), false},
-         {OBFSTR("rsi"), OBFSTR("string"), OBFSTR("RSI value"), false},
-         {OBFSTR("rdi"), OBFSTR("string"), OBFSTR("RDI value"), false},
-         {OBFSTR("rbp"), OBFSTR("string"), OBFSTR("RBP value"), false},
-         {OBFSTR("rsp"), OBFSTR("string"), OBFSTR("RSP value"), false},
-         {OBFSTR("r8"), OBFSTR("string"), OBFSTR("R8 value"), false},
-         {OBFSTR("r9"), OBFSTR("string"), OBFSTR("R9 value"), false},
-         {OBFSTR("r10"), OBFSTR("string"), OBFSTR("R10 value"), false},
-         {OBFSTR("r11"), OBFSTR("string"), OBFSTR("R11 value"), false},
-         {OBFSTR("r12"), OBFSTR("string"), OBFSTR("R12 value"), false},
-         {OBFSTR("r13"), OBFSTR("string"), OBFSTR("R13 value"), false},
-         {OBFSTR("r14"), OBFSTR("string"), OBFSTR("R14 value"), false},
-         {OBFSTR("r15"), OBFSTR("string"), OBFSTR("R15 value"), false},
-         {OBFSTR("rip"), OBFSTR("string"), OBFSTR("RIP value"), false},
-         {OBFSTR("rflags"), OBFSTR("string"), OBFSTR("RFLAGS value"), false},
-         {OBFSTR("dr0"), OBFSTR("string"), OBFSTR("DR0 value"), false},
-         {OBFSTR("dr1"), OBFSTR("string"), OBFSTR("DR1 value"), false},
-         {OBFSTR("dr2"), OBFSTR("string"), OBFSTR("DR2 value"), false},
-         {OBFSTR("dr3"), OBFSTR("string"), OBFSTR("DR3 value"), false},
-         {OBFSTR("dr6"), OBFSTR("string"), OBFSTR("DR6 value"), false},
-         {OBFSTR("dr7"), OBFSTR("string"), OBFSTR("DR7 value"), false},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}},
-        driver_set_thread_context, false});
 
 
-    register_compat(srv, {
-        OBFSTR("driver_suspend_thread"), OBFSTR("driver"),
-        OBFSTR("Suspend a thread in the attached process via kernel PsSuspendThread. "
-               "Thread execution is paused until resumed. Returns previous suspend count."),
-        {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID to suspend. Decimal string recommended; 0x-prefixed hex supported."), true},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}},
-        driver_suspend_thread, false});
 
-    register_compat(srv, {
-        OBFSTR("driver_resume_thread"), OBFSTR("driver"),
-        OBFSTR("Resume a suspended thread in the attached process via kernel PsResumeThread. "
-               "Returns previous suspend count. Thread resumes execution."),
-        {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID to resume. Decimal string recommended; 0x-prefixed hex supported."), true},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}},
-        driver_resume_thread, false});
+
 
 
     register_compat(srv, {
@@ -10584,17 +8812,6 @@ void register_driver_tools(mcp_standalone::server_t& srv)
          {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}},
         driver_protect_memory, false});
 
-    register_compat(srv, {
-        OBFSTR("driver_enumerate_memory_regions"), OBFSTR("driver"),
-        OBFSTR("Walk the entire virtual address space of the attached process, enumerating all "
-               "committed memory regions. Returns base, size, state, protection, and type for each. "
-               "Useful for finding all executable regions, mapped images, private memory, etc."),
-        {{OBFSTR("start"), OBFSTR("string"), OBFSTR("Start address (default 0)"), false},
-         {OBFSTR("end"), OBFSTR("string"), OBFSTR("End address (default max user-mode)"), false},
-         {OBFSTR("include_all"), OBFSTR("boolean"),
-                    OBFSTR("Include free/reserved regions too (default false, only committed)"), false},
-                 {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}},
-        driver_enumerate_memory_regions, true});
 
     register_compat(srv, {
         OBFSTR("driver_read_peb"), OBFSTR("driver"),
@@ -10603,13 +8820,6 @@ void register_driver_tools(mcp_standalone::server_t& srv)
                "loader data address, process heap, and heap info."),
         {{OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}}, driver_read_peb, true});
 
-    register_compat(srv, {
-        OBFSTR("driver_spoof_debug_flags"), OBFSTR("driver"),
-        OBFSTR("Clear ALL anti-debug indicators in the attached process from kernel space. "
-               "Zeroes EPROCESS.DebugPort, PEB.BeingDebugged, clears PEB.NtGlobalFlag heap debug flags. "
-               "Completely invisible to the target process. Call this before the target's anti-debug "
-               "checks run to bypass IsDebuggerPresent, NtQueryInformationProcess, etc."),
-        {{OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}}, driver_spoof_debug_flags, false});
 
     register_compat(srv, {
         OBFSTR("driver_set_hw_breakpoint"), OBFSTR("driver"),
@@ -10869,62 +9079,9 @@ void register_driver_tools(mcp_standalone::server_t& srv)
          {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max handles to return (default 500, max 10000)"), false}},
         driver_enumerate_handles, true});
 
-    register_compat(srv, {
-        OBFSTR("driver_walk_seh_chain"), OBFSTR("driver"),
-        OBFSTR("Walk the SEH (Structured Exception Handler) chain for a thread by reading the TEB exception list. "
-               "For each handler, returns the record address, handler function address, and resolves which module "
-               "owns the handler. Also provides VEH (Vectored Exception Handler) enumeration hints. "
-               "Equivalent to x64dbg's SEH tab. Requires TID and attached process."),
-        {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID to walk SEH chain for"), true},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
-        driver_walk_seh_chain, true});
 
-    register_compat(srv, {
-        OBFSTR("driver_find_code_caves"), OBFSTR("driver"),
-        OBFSTR("Scan the attached process memory for code caves - contiguous regions of a fill byte "
-               "(default 0x00) large enough to hold injected code. Scans executable regions by default. "
-               "Equivalent to x64dbg's 'Find Code Caves' plugin. Returns address, size, and protection "
-               "for each cave. Use for shellcode injection, detour trampolines, or hook stubs."),
-        {{OBFSTR("min_size"), OBFSTR("number"), OBFSTR("Minimum cave size in bytes (default 64)"), false},
-         {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max caves to return (default 50, max 500)"), false},
-         {OBFSTR("fill_byte"), OBFSTR("number"), OBFSTR("Byte value to treat as empty (default 0x00, use 0xCC for INT3 padding)"), false},
-         {OBFSTR("executable_only"), OBFSTR("boolean"), OBFSTR("Only scan executable regions (default true)"), false},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
-        driver_find_code_caves, true});
 
-    register_compat(srv, {
-        OBFSTR("driver_scan_memory_value"), OBFSTR("driver"),
-        OBFSTR("Cheat Engine-style value scanner. Scan the target process memory for a specific value "
-               "with type awareness: byte, int16, int32, int64, float, double, string. "
-               "Supports exact match and range scan modes. For differential scans (changed/unchanged/"
-               "increased/decreased), use driver_compare_memory_snapshot. "
-               "Equivalent to Cheat Engine's First Scan. Filter by address range."),
-        {{OBFSTR("value"), OBFSTR("number"), OBFSTR("Numeric value to search for"), false},
-         {OBFSTR("value_string"), OBFSTR("string"), OBFSTR("String value (for value_type='string')"), false},
-         {OBFSTR("value_max"), OBFSTR("number"), OBFSTR("Upper bound for range scan"), false},
-         {OBFSTR("value_type"), OBFSTR("string"), OBFSTR("Data type: byte, int16, int32, int64, float, double, string (default int32)"), false,
-          {OBFSTR("byte"), OBFSTR("int16"), OBFSTR("int32"), OBFSTR("int64"), OBFSTR("float"), OBFSTR("double"), OBFSTR("string")}},
-         {OBFSTR("scan_mode"), OBFSTR("string"), OBFSTR("Scan mode: exact, range (default exact)"), false,
-          {OBFSTR("exact"), OBFSTR("range")}},
-         {OBFSTR("start"), OBFSTR("string"), OBFSTR("Scan start address (default 0x10000)"), false},
-         {OBFSTR("end"), OBFSTR("string"), OBFSTR("Scan end address (default 0x7FFFFFFFFFFF)"), false},
-         {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max matches (default 100, max 10000)"), false},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
-        driver_scan_memory_value, true});
 
-    register_compat(srv, {
-        OBFSTR("driver_pointer_scan"), OBFSTR("driver"),
-        OBFSTR("Cheat Engine-style pointer scanner. Find all pointers in the target process that point "
-               "to or near a target address (within max_offset). Identifies static pointers (in module .data sections) "
-               "that can survive process restarts. Returns pointer address, value, offset from target, "
-               "owning module, and module+offset for static references. "
-               "Equivalent to CE's Pointer Scan with configurable depth and offset bounds."),
-        {{OBFSTR("target_address"), OBFSTR("string"), OBFSTR("Address to find pointers to (hex)"), true},
-         {OBFSTR("max_depth"), OBFSTR("number"), OBFSTR("Max pointer chain depth (default 3, max 7)"), false},
-         {OBFSTR("max_offset"), OBFSTR("number"), OBFSTR("Max +/- offset from target (default 0x1000)"), false},
-         {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max chains to return (default 50, max 500)"), false},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
-        driver_pointer_scan, true});
 
     register_compat(srv, {
         OBFSTR("driver_enumerate_windows"), OBFSTR("driver"),
@@ -10937,16 +9094,6 @@ void register_driver_tools(mcp_standalone::server_t& srv)
          {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max windows (default 200, max 2000)"), false}},
         driver_enumerate_windows, true});
 
-    register_compat(srv, {
-        OBFSTR("driver_walk_stack"), OBFSTR("driver"),
-        OBFSTR("Full stack walk for any thread via kernel driver. Gets thread context, reads RSP stack memory, "
-               "and identifies return addresses by cross-referencing with loaded modules and verifying "
-               "call instruction patterns. Resolves each frame to module+offset. "
-               "Equivalent to x64dbg's Call Stack panel. Uses heuristic stack scanning for x64 code."),
-        {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID to walk stack for"), true},
-         {OBFSTR("max_frames"), OBFSTR("number"), OBFSTR("Max stack frames (default 64, max 256)"), false},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
-        driver_walk_stack, true});
 
     register_compat(srv, {
         OBFSTR("driver_assemble"), OBFSTR("driver"),
@@ -10960,20 +9107,6 @@ void register_driver_tools(mcp_standalone::server_t& srv)
          {OBFSTR("write_to"), OBFSTR("string"), OBFSTR("If specified, write assembled bytes to this address in the attached process"), false}},
         driver_assemble, false});
 
-    register_compat(srv, {
-        OBFSTR("driver_compare_memory_snapshot"), OBFSTR("driver"),
-        OBFSTR("Take and compare memory snapshots for differential analysis. Operations: "
-               "'take' captures a snapshot, 'compare' diffs current memory against a saved snapshot, "
-               "'list' shows all snapshots, 'clear' removes all. Enables Cheat Engine-style "
-               "changed/unchanged/increased/decreased value scanning by comparing snapshots over time."),
-        {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("'take', 'compare', 'list', or 'clear'"), true,
-          {OBFSTR("take"), OBFSTR("compare"), OBFSTR("list"), OBFSTR("clear")}},
-         {OBFSTR("address"), OBFSTR("string"), OBFSTR("Memory address for take/compare"), false},
-         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Bytes to snapshot (default 4096, max 1MB)"), false},
-         {OBFSTR("name"), OBFSTR("string"), OBFSTR("Snapshot name (default 'default')"), false},
-         {OBFSTR("max_diffs"), OBFSTR("number"), OBFSTR("Max diffs to report on compare (default 200)"), false},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
-        driver_compare_memory_snapshot, false});
 
     register_compat(srv, {
         OBFSTR("driver_find_references"), OBFSTR("driver"),
@@ -11005,7 +9138,7 @@ void register_driver_tools(mcp_standalone::server_t& srv)
                "Returns complete module details: base, entry point, size, name, full path, flags "
                "(static import, entry processed, process attach called, etc.), load count, TLS index. "
                "Order differences reveal manually mapped modules and load-order anomalies. "
-               "More detailed than enumerate_modules - shows all three orderings and decoded flags."),
+               "More detailed than basic module enumeration - shows all three orderings and decoded flags."),
         {{OBFSTR("order"), OBFSTR("string"), OBFSTR("Which list: load, memory, init, or all (default all)"), false,
           {OBFSTR("load"), OBFSTR("memory"), OBFSTR("init"), OBFSTR("all")}},
          {OBFSTR("filter"), OBFSTR("string"), OBFSTR("Module name/path substring filter (case-insensitive)"), false},

@@ -559,39 +559,14 @@ void register_dom_xss_tools(mcp_standalone::server_t& srv)
     dom_xss::initialize();
 
     register_compat(srv, {
-        "burp_dom_xss_status", "scanner",
-        "Report the DOM-XSS engine status and Camoufox bridge readiness. "
-        "Returns whether the headless-browser bridge is up, the active page URL, "
-        "total payloads fired, total scans run, and the wall-clock timestamp of the last scan.",
-        {},
-        tool_status, true
-    });
-
-    register_compat(srv, {
-        "burp_dom_xss_test_payload", "scanner",
-        "Fire one DOM-XSS payload at the target URL via Camoufox and report whether the "
-        "sentinel canary was triggered. Use this to test a custom payload template against "
-        "a single query/path parameter. The payload may contain '{CANARY_FN}' and '{CANARY}' "
-        "placeholders which are substituted with the per-scan sentinel token before delivery.",
+        "burp_dom_xss_manage", "scanner",
+        "Manage DOM-XSS status, payload tests, and full scans. Actions: status, test_payload, scan.",
         {
-            {"target_url",          "string",  "Absolute URL with at least one query or path parameter to inject into.", true},
-            {"payload",             "string",  "Payload template (may use {CANARY_FN} / {CANARY} placeholders).", true},
+            {"action",              "string",  "status|test_payload|scan", true},
+            {"payload",             "object",  "Action-specific parameters; top-level action-specific fields are also accepted.", false},
+            {"target_url",          "string",  "Absolute URL with at least one query or path parameter to inject into.", false},
+            {"payload_template",    "string",  "Payload template alias for test_payload; payload may also be a string.", false},
             {"capture_screenshot",  "boolean", "If true and a sink fires, capture a PNG screenshot of the loaded page.", false},
-            {"timeout_ms",          "number",  "Per-payload navigation/eval timeout in milliseconds (1000-30000).", false}
-        },
-        tool_test_payload, false
-    });
-
-    register_compat(srv, {
-        "burp_dom_xss_scan", "scanner",
-        "Run a full DOM-XSS sweep against every query/path/body/cookie/header insertion point "
-        "in the supplied request. Each insertion point is exercised with a curated polyglot + "
-        "standard + dom-only payload battery; the headless browser's runtime hooks record any "
-        "sink that fires (alert, eval, Function, setTimeout(string), document.write, innerHTML "
-        "setter, location assignment, etc.). When a sink is triggered the engine emits a "
-        "high-severity, certain-confidence issue to the global issue store.",
-        {
-            {"target_url",              "string",  "Absolute URL of the target.", true},
             {"raw_request",             "string",  "Raw HTTP/1.1 textual request (optional - if omitted a synthesized GET is used).", false},
             {"raw_request_b64",         "string",  "Base64-encoded raw request (optional alternative to raw_request).", false},
             {"include_polyglot",        "boolean", "Include polyglot payload set (default true).", false},
@@ -603,10 +578,24 @@ void register_dom_xss_tools(mcp_standalone::server_t& srv)
             {"scan_timeout_ms",         "number",  "Total scan deadline in milliseconds (5000-300000, default 120000).", false},
             {"timeout_ms",              "number",  "Alias for scan_timeout_ms.", false}
         },
-        tool_scan, false
+        [](const json& params) -> tool_result_t {
+            const std::string action = compat_action_name(params);
+            json p = compat_action_payload(params);
+            if (action == "status") return tool_status(p);
+            if (action == "test_payload") {
+                if (!p.contains("payload") && params.contains("payload") && params["payload"].is_string())
+                    p["payload"] = params["payload"];
+                if (!p.contains("payload") && p.contains("payload_template"))
+                    p["payload"] = p["payload_template"];
+                return tool_test_payload(p);
+            }
+            if (action == "scan") return tool_scan(p);
+            return compat_unknown_action("burp_dom_xss_manage", action);
+        },
+        false
     });
 
-    diag::log_tagged("dom_xss", "dom_xss_mcp registered 3 tools");
+    diag::log_tagged("dom_xss", "dom_xss_mcp registered 1 tool");
 }
 
 }

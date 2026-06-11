@@ -157,6 +157,618 @@ static std::vector<driver_bridge::module_info_t> enumerate_modules_toolhelp(uint
 	return result;
 }
 
+static tool_result_t fuzzer_manage_start(const json& params)
+{
+	std::string target = params.value("target_address", "");
+	std::string end = params.value("end_address", "");
+	std::string input = params.value("input_address", "");
+	diag::log_tagged_fmt("analysis", "fuzzer_manage start target=%s end=%s input=%s",
+		target.c_str(), end.c_str(), input.c_str());
+	if (target.empty())
+		return tool_result_t::error("target_address is required");
+
+	fuzzer_engine::fuzz_config_t cfg;
+	cfg.target_address = std::strtoull(target.c_str(), nullptr, 16);
+	if (cfg.target_address == 0)
+		return tool_result_t::error("invalid target_address");
+	if (!end.empty()) {
+		cfg.end_address = std::strtoull(end.c_str(), nullptr, 16);
+		if (cfg.end_address <= cfg.target_address)
+			return tool_result_t::error("end_address must be greater than target_address");
+	} else {
+		cfg.end_address = cfg.target_address + 1;
+	}
+	if (!input.empty())
+		cfg.input_address = std::strtoull(input.c_str(), nullptr, 16);
+	cfg.input_size = static_cast<int>(bounded_u32_param(params, "input_size", 256, 1, 1024 * 1024));
+	cfg.max_iterations = bounded_u32_param(params, "max_iterations", 10000, 1, 1000000);
+	cfg.pid = driver_bridge::attached_pid();
+	auto threads_snap = driver_bridge::enumerate_threads();
+	cfg.tid = threads_snap.empty() ? 0 : threads_snap.front().tid;
+	if (cfg.pid == 0 || cfg.tid == 0)
+		return tool_result_t::error("fuzzer requires an attached process and at least one thread for snapshotting");
+
+	{
+		std::lock_guard<std::mutex> lk(fuzzer_engine::g_state.mutex);
+		fuzzer_engine::g_state.config = cfg;
+	}
+	if (!fuzzer_engine::start_fuzzing())
+		return tool_result_t::error("fuzzer is already running or worker queue is unavailable");
+
+	char end_buf[32];
+	char input_buf[32];
+	std::snprintf(end_buf, sizeof(end_buf), "0x%llX", static_cast<unsigned long long>(cfg.end_address));
+	std::snprintf(input_buf, sizeof(input_buf), "0x%llX", static_cast<unsigned long long>(cfg.input_address));
+	json result;
+	result["status"] = "started";
+	result["worker_posted"] = true;
+	result["pid"] = cfg.pid;
+	result["tid"] = cfg.tid;
+	result["thread_count"] = threads_snap.size();
+	result["target_address"] = target;
+	result["end_address"] = end_buf;
+	result["input_address"] = input_buf;
+	result["input_size"] = cfg.input_size;
+	result["max_iterations"] = cfg.max_iterations;
+	result["setup_complete"] = fuzzer_engine::g_state.setup_complete.load();
+	result["setup_success"] = fuzzer_engine::g_state.setup_success.load();
+	return tool_result_t::ok(result);
+}
+
+static tool_result_t fuzzer_manage_stop(const json&)
+{
+	diag::log_tagged("analysis", "fuzzer_manage stop");
+	fuzzer_engine::stop_fuzzing();
+	return tool_result_t::ok("Fuzzer stop requested.");
+}
+
+static tool_result_t fuzzer_manage_results(const json&)
+{
+	diag::log_tagged("analysis", "fuzzer_manage results");
+	std::lock_guard<std::mutex> lk(fuzzer_engine::g_state.mutex);
+	auto& stats = fuzzer_engine::g_state.stats;
+	json result;
+	result["running"] = fuzzer_engine::g_state.running.load();
+	result["total_executions"] = stats.total_executions;
+	result["executions_per_second"] = stats.executions_per_second;
+	result["total_crashes"] = stats.total_crashes;
+	result["unique_crashes"] = stats.total_unique_crashes;
+	result["edge_coverage"] = stats.edge_coverage;
+	result["new_coverage_finds"] = stats.new_coverage_finds;
+	result["corpus_size"] = stats.corpus_size;
+	result["elapsed_seconds"] = stats.elapsed_seconds;
+	result["setup_error"] = fuzzer_engine::g_state.setup_error;
+	result["worker_active"] = fuzzer_engine::g_state.worker_active.load();
+	result["setup_complete"] = fuzzer_engine::g_state.setup_complete.load();
+	result["setup_success"] = fuzzer_engine::g_state.setup_success.load();
+	json crashes_arr = json::array();
+	for (auto& c : fuzzer_engine::g_state.unique_crashes) {
+		json cobj;
+		cobj["type"] = fuzzer_engine::crash_type_name(c.type);
+		char abuf[32];
+		std::snprintf(abuf, sizeof(abuf), "0x%llX", static_cast<unsigned long long>(c.instruction_address));
+		cobj["instruction_address"] = abuf;
+		cobj["description"] = c.description;
+		crashes_arr.push_back(cobj);
+	}
+	result["crashes"] = crashes_arr;
+	return tool_result_t::ok(result);
+}
+
+static tool_result_t live_monitor_manage_start(const json& params)
+{
+	std::string addr_str = params.value("address", "");
+	int size = params.value("size", 256);
+	std::string name = params.value("name", "struct_t");
+	std::string backend = params.value("backend", "auto");
+	uint32_t timeout_ms = bounded_u32_param(params, "timeout_ms", 3000, 100, 3500);
+	diag::log_tagged_fmt("analysis", "live_monitor_manage start addr=%s size=%d backend=%s",
+		addr_str.c_str(), size, backend.c_str());
+	if (addr_str.empty())
+		return tool_result_t::error("address parameter is required");
+	uint64_t addr = std::strtoull(addr_str.c_str(), nullptr, 16);
+	if (addr == 0)
+		return tool_result_t::error("invalid address");
+	if (struct_monitor::g_state.active.load())
+		return tool_result_t::error("Live monitor already active. Stop it first.");
+	if (size <= 0)
+		return tool_result_t::error("size must be positive");
+
+	struct_monitor::start(addr, size, name, backend);
+	int max_wait = static_cast<int>((timeout_ms + 49) / 50);
+	for (int wait = 0; wait < max_wait; ++wait) {
+		if (!struct_monitor::g_state.active.load())
+			break;
+		if (struct_monitor::g_state.session.using_page_guard ||
+		    struct_monitor::g_state.session.using_hwbp ||
+		    struct_monitor::g_state.session.using_polling)
+			break;
+		Sleep(50);
+	}
+
+	bool active = struct_monitor::g_state.active.load();
+	bool page_guard = struct_monitor::g_state.session.using_page_guard;
+	bool hwbp = struct_monitor::g_state.session.using_hwbp;
+	bool polling = struct_monitor::g_state.session.using_polling;
+	char abuf[32];
+	std::snprintf(abuf, sizeof(abuf), "0x%llX", static_cast<unsigned long long>(addr));
+	json result;
+	result["address"] = abuf;
+	result["size"] = size;
+	result["active"] = active;
+	result["backend"] = page_guard ? "page_guard" : (hwbp ? "hardware_breakpoint" : (polling ? "polling" : "none"));
+	result["page_guard"] = page_guard;
+	result["hardware_breakpoint"] = hwbp;
+	result["polling"] = polling;
+	result["total_captures"] = struct_monitor::g_state.total_captures.load();
+	if (!active || (!page_guard && !hwbp && !polling)) {
+		struct_monitor::stop();
+		for (int wait = 0; wait < 10 && struct_monitor::g_state.active.load(); ++wait)
+			Sleep(50);
+		return tool_result_t::error("live monitor backend did not become active", result);
+	}
+	return tool_result_t::ok(result);
+}
+
+static tool_result_t live_monitor_snapshot(bool require_captures)
+{
+	auto accesses = struct_monitor::get_access_snapshot();
+	json arr = json::array();
+	for (auto& a : accesses) {
+		json obj;
+		char obuf[16];
+		std::snprintf(obuf, sizeof(obuf), "0x%04llX", static_cast<unsigned long long>(a.field_offset));
+		obj["offset"] = obuf;
+		obj["access_size"] = a.access_size;
+		obj["is_write"] = a.is_write;
+		obj["inferred_type"] = struct_recon::field_type_name(a.inferred_type);
+		obj["hit_count"] = a.hit_count;
+		obj["disasm"] = a.disasm;
+		char rbuf[32];
+		std::snprintf(rbuf, sizeof(rbuf), "0x%llX", static_cast<unsigned long long>(a.rip));
+		obj["rip"] = rbuf;
+		arr.push_back(obj);
+	}
+	json result;
+	result["active"] = struct_monitor::g_state.active.load();
+	result["total_captures"] = struct_monitor::g_state.total_captures.load();
+	result["unique_offsets"] = accesses.size();
+	result["page_guard"] = struct_monitor::g_state.session.using_page_guard;
+	result["hardware_breakpoint"] = struct_monitor::g_state.session.using_hwbp;
+	result["polling"] = struct_monitor::g_state.session.using_polling;
+	result["accesses"] = arr;
+	if (require_captures && accesses.empty())
+		return tool_result_t::error("live monitor captured no accesses", result);
+	return tool_result_t::ok(result);
+}
+
+static tool_result_t live_monitor_manage_stop(const json& params)
+{
+	diag::log_tagged("analysis", "live_monitor_manage stop");
+	if (!struct_monitor::g_state.active.load())
+		return tool_result_t::error("No active live monitor session.");
+	struct_monitor::stop();
+	for (int wait = 0; struct_monitor::g_state.active.load() && wait < 10; ++wait)
+		Sleep(50);
+	return live_monitor_snapshot(params.value("require_captures", false));
+}
+
+static tool_result_t symbolic_manage_deobfuscate(const json& params)
+{
+	std::string addr_str = params.value("entry_address", "");
+	if (addr_str.empty())
+		return tool_result_t::error("entry_address is required");
+	uint64_t entry = std::strtoull(addr_str.c_str(), nullptr, 16);
+	if (entry == 0)
+		return tool_result_t::error("invalid entry_address");
+	uint32_t max_insns = static_cast<uint32_t>(params.value("max_instructions", 10000));
+	auto result = deobfuscation_engine::deobfuscate_function(entry, max_insns);
+	json out;
+	out["statistics"] = {
+		{"total_instructions", result.total_original},
+		{"clean_instructions", result.total_clean},
+		{"junk_removed", result.removed_junk},
+		{"opaque_predicates", result.opaque_predicates_found},
+		{"constants_resolved", result.constants_resolved}
+	};
+	json insns = json::array();
+	for (auto& ci : result.clean_instructions) {
+		json obj;
+		char abuf[32];
+		std::snprintf(abuf, sizeof(abuf), "0x%llX", static_cast<unsigned long long>(ci.address));
+		obj["address"] = abuf;
+		obj["disasm"] = ci.disasm;
+		obj["is_original"] = !ci.was_junk;
+		obj["was_constant_folded"] = ci.was_constant_folded;
+		insns.push_back(obj);
+	}
+	out["clean_instructions"] = insns;
+	json opaques = json::array();
+	for (auto& op : result.opaques) {
+		json obj;
+		char abuf[32];
+		std::snprintf(abuf, sizeof(abuf), "0x%llX", static_cast<unsigned long long>(op.address));
+		obj["address"] = abuf;
+		obj["condition_str"] = op.condition_ast;
+		obj["always_true"] = op.always_taken;
+		opaques.push_back(obj);
+	}
+	out["opaque_predicates"] = opaques;
+	json constants = json::array();
+	for (auto& cf : result.constants) {
+		json obj;
+		char abuf[32];
+		std::snprintf(abuf, sizeof(abuf), "0x%llX", static_cast<unsigned long long>(cf.address));
+		obj["address"] = abuf;
+		obj["original_expression"] = cf.original_ast;
+		char vbuf[32];
+		std::snprintf(vbuf, sizeof(vbuf), "0x%llX", static_cast<unsigned long long>(cf.concrete_value));
+		obj["resolved_value"] = vbuf;
+		constants.push_back(obj);
+	}
+	out["constants"] = constants;
+	return tool_result_t::ok(out);
+}
+
+static tool_result_t symbolic_manage_slice(const json& params)
+{
+	std::string start_str = params.value("start_address", "");
+	std::string end_str = params.value("end_address", "");
+	std::string reg = params.value("target_register", "");
+	if (start_str.empty() || end_str.empty() || reg.empty())
+		return tool_result_t::error("start_address, end_address, and target_register are required");
+	uint64_t start = std::strtoull(start_str.c_str(), nullptr, 16);
+	uint64_t end = std::strtoull(end_str.c_str(), nullptr, 16);
+	uint32_t max_insns = static_cast<uint32_t>(params.value("max_instructions", 5000));
+	auto result = symbolic_engine::slice_to_register(start, end, max_insns, reg);
+	json out;
+	out["target_register"] = reg;
+	out["total_instructions"] = result.total_instructions;
+	out["effective_instructions"] = result.effective_count;
+	out["removed_count"] = result.total_instructions - result.effective_count;
+	json insns = json::array();
+	for (auto& ti : result.effective_instructions) {
+		json obj;
+		char abuf[32];
+		std::snprintf(abuf, sizeof(abuf), "0x%llX", static_cast<unsigned long long>(ti.address));
+		obj["address"] = abuf;
+		obj["disasm"] = ti.disasm;
+		insns.push_back(obj);
+	}
+	out["instructions"] = insns;
+	return tool_result_t::ok(out);
+}
+
+static tool_result_t symbolic_manage_solve_path(const json& params)
+{
+	std::string start_str = params.value("start_address", "");
+	std::string target_str = params.value("target_address", "");
+	std::string regs_str = params.value("symbolic_registers", "");
+	if (start_str.empty() || target_str.empty() || regs_str.empty())
+		return tool_result_t::error("start_address, target_address, and symbolic_registers are required");
+	uint64_t start = std::strtoull(start_str.c_str(), nullptr, 16);
+	uint64_t target = std::strtoull(target_str.c_str(), nullptr, 16);
+	uint32_t max_insns = static_cast<uint32_t>(params.value("max_instructions", 5000));
+	std::vector<std::string> sym_regs;
+	std::istringstream iss(regs_str);
+	std::string tok;
+	while (std::getline(iss, tok, ',')) {
+		while (!tok.empty() && tok.front() == ' ') tok.erase(tok.begin());
+		while (!tok.empty() && tok.back() == ' ') tok.pop_back();
+		if (!tok.empty())
+			sym_regs.push_back(tok);
+	}
+	auto result = symbolic_engine::solve_for_path(start, target, max_insns, sym_regs);
+	json out;
+	out["satisfiable"] = result.satisfiable;
+	out["solving_time_ms"] = result.solving_time_ms;
+	if (result.satisfiable) {
+		json vars = json::object();
+		for (auto& kv : result.variable_values) {
+			char vbuf[32];
+			std::snprintf(vbuf, sizeof(vbuf), "0x%llX", static_cast<unsigned long long>(kv.second));
+			vars[kv.first] = vbuf;
+		}
+		out["solution"] = vars;
+	}
+	return tool_result_t::ok(out);
+}
+
+static tool_result_t analysis_query_imports(const json& params)
+{
+	if (driver_bridge::attached_pid() == 0)
+		return tool_result_t::error("No process is attached; use sessions_manage action=attach_pid first.");
+	auto modules = driver_bridge::enumerate_modules();
+	if (modules.empty())
+		return tool_result_t::error("Module enumeration returned no entries.");
+	pe_parser::pe_info_t pe;
+	if (!pe_parser::parse(modules.front().base, pe, false))
+		return tool_result_t::error("pe_parser::parse failed on the main module.");
+	size_t max_entries = bounded_size_param(params, "max_entries", 512, 1, 4096);
+	uint32_t timeout_ms = bounded_u32_param(params, "timeout_ms", 2500, 100, 10000);
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+	bool truncated = false;
+	bool parsed = pe_parser::parse_imports(modules.front().base, pe, pe.imports, max_entries, &deadline, &truncated);
+	if (!parsed)
+		truncated = true;
+	json arr = json::array();
+	char buf[32];
+	for (const auto& imp : pe.imports) {
+		json o;
+		o["module"] = imp.module_name;
+		o["function"] = imp.function_name;
+		o["ordinal"] = imp.ordinal;
+		o["hint"] = imp.hint;
+		std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(imp.iat_address));
+		o["iat_address"] = buf;
+		std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(imp.bound_address));
+		o["bound_address"] = buf;
+		arr.push_back(std::move(o));
+	}
+	json result;
+	result["module"] = modules.front().name;
+	result["count"] = arr.size();
+	result["truncated"] = truncated;
+	result["parse_complete"] = parsed && !truncated;
+	result["max_entries"] = max_entries;
+	result["timeout_ms"] = timeout_ms;
+	result["imports"] = std::move(arr);
+	return tool_result_t::ok(result);
+}
+
+static tool_result_t analysis_query_exports(const json& params)
+{
+	if (driver_bridge::attached_pid() == 0)
+		return tool_result_t::error("No process is attached; use sessions_manage action=attach_pid first.");
+	auto modules = driver_bridge::enumerate_modules();
+	if (modules.empty())
+		return tool_result_t::error("Module enumeration returned no entries.");
+	const std::string requested_module = params.value("module_name", std::string());
+	const driver_bridge::module_info_t* selected = select_module_by_name(modules, requested_module);
+	if (!selected)
+		return tool_result_t::error("Requested module was not found in the attached process.");
+	pe_parser::pe_info_t pe;
+	if (!pe_parser::parse(selected->base, pe, false))
+		return tool_result_t::error("pe_parser::parse failed on the selected module.");
+	size_t max_entries = bounded_size_param(params, "max_entries", 512, 1, 4096);
+	uint32_t timeout_ms = bounded_u32_param(params, "timeout_ms", 2500, 100, 10000);
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+	bool truncated = false;
+	bool parsed = pe_parser::parse_exports(selected->base, pe, pe.exports, max_entries, &deadline, &truncated);
+	if (!parsed)
+		truncated = true;
+	json arr = json::array();
+	char buf[32];
+	for (const auto& exp : pe.exports) {
+		json o;
+		o["ordinal"] = exp.ordinal;
+		o["name"] = exp.name;
+		std::snprintf(buf, sizeof(buf), "0x%X", exp.rva);
+		o["rva"] = buf;
+		std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(exp.address));
+		o["address"] = buf;
+		if (exp.is_forwarded) {
+			o["forwarded"] = true;
+			o["forward_to"] = exp.forward_name;
+		}
+		arr.push_back(std::move(o));
+	}
+	json result;
+	result["module"] = selected->name;
+	result["module_path"] = selected->path;
+	std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(selected->base));
+	result["module_base"] = buf;
+	result["count"] = arr.size();
+	result["truncated"] = truncated;
+	result["parse_complete"] = parsed && !truncated;
+	result["max_entries"] = max_entries;
+	result["timeout_ms"] = timeout_ms;
+	result["exports"] = std::move(arr);
+	return tool_result_t::ok(result);
+}
+
+static tool_result_t analysis_query_types(const json& params)
+{
+	std::string filter;
+	if (params.contains("filter") && params["filter"].is_string()) {
+		filter = params["filter"].get<std::string>();
+		std::transform(filter.begin(), filter.end(), filter.begin(), [](unsigned char c) {
+			return static_cast<char>(std::tolower(c));
+		});
+	}
+	size_t limit = bounded_size_param(params, "limit", 200, 1, 5000);
+	json arr = json::array();
+	size_t total = 0;
+	{
+		std::lock_guard<std::mutex> lk(symbol_store::g_state.mutex);
+		for (const auto& kv : symbol_store::g_state.modules) {
+			const auto& mod = kv.second;
+			for (const auto& s : mod.pdb.structs) {
+				std::string lname = lower_ascii(s.name);
+				if (!filter.empty() && lname.find(filter) == std::string::npos)
+					continue;
+				++total;
+				if (arr.size() >= limit) continue;
+				arr.push_back({{"module", mod.module_name}, {"name", s.name}, {"kind", s.is_union ? "union" : "struct"}, {"size", s.size}, {"member_count", s.members.size()}});
+			}
+			for (const auto& e : mod.pdb.enums) {
+				std::string lname = lower_ascii(e.name);
+				if (!filter.empty() && lname.find(filter) == std::string::npos)
+					continue;
+				++total;
+				if (arr.size() >= limit) continue;
+				arr.push_back({{"module", mod.module_name}, {"name", e.name}, {"kind", "enum"}, {"member_count", e.members.size()}});
+			}
+		}
+	}
+	return tool_result_t::ok(json{{"total", total}, {"returned", arr.size()}, {"types", arr}});
+}
+
+static tool_result_t analysis_query_type_definition(const json& params)
+{
+	if (!params.contains("name") || !params["name"].is_string())
+		return tool_result_t::error("'name' is required.");
+	std::string want = params["name"].get<std::string>();
+	std::string want_module = params.value("module", std::string());
+	std::lock_guard<std::mutex> lk(symbol_store::g_state.mutex);
+	for (const auto& kv : symbol_store::g_state.modules) {
+		const auto& mod = kv.second;
+		if (!want_module.empty() && mod.module_name != want_module) continue;
+		for (const auto& s : mod.pdb.structs) {
+			if (s.name != want) continue;
+			json members = json::array();
+			for (const auto& m : s.members) {
+				json mj;
+				mj["name"] = m.name;
+				mj["type"] = m.type_name;
+				mj["offset"] = m.offset;
+				mj["size"] = m.size;
+				if (m.is_pointer) {
+					mj["pointer"] = true;
+					mj["pointer_depth"] = m.pointer_depth;
+				}
+				if (m.is_array) {
+					mj["array"] = true;
+					mj["array_count"] = m.array_count;
+				}
+				if (m.bit_offset >= 0) mj["bit_offset"] = m.bit_offset;
+				if (m.bit_size >= 0) mj["bit_size"] = m.bit_size;
+				members.push_back(std::move(mj));
+			}
+			return tool_result_t::ok(json{{"module", mod.module_name}, {"name", s.name}, {"kind", s.is_union ? "union" : "struct"}, {"size", s.size}, {"members", members}});
+		}
+		for (const auto& e : mod.pdb.enums) {
+			if (e.name != want) continue;
+			json members = json::array();
+			for (const auto& em : e.members)
+				members.push_back({{"name", em.name}, {"value", em.value}});
+			return tool_result_t::ok(json{{"module", mod.module_name}, {"name", e.name}, {"kind", "enum"}, {"members", members}});
+		}
+	}
+	if (want == "HANDLE")
+		return tool_result_t::ok(json{{"module", "builtin"}, {"name", "HANDLE"}, {"kind", "typedef"}, {"type", "void*"}, {"size", sizeof(void*)}, {"members", json::array()}});
+	return tool_result_t::error("Type not found in any loaded module's PDB.");
+}
+
+static tool_result_t analysis_query_pdb_symbols(const json& params)
+{
+	std::string filter;
+	if (params.contains("filter") && params["filter"].is_string())
+		filter = lower_ascii(params["filter"].get<std::string>());
+	std::string want_module = params.value("module", std::string());
+	bool funcs_only = params.value("functions_only", false);
+	size_t limit = bounded_size_param(params, "limit", 500, 1, 10000);
+	json arr = json::array();
+	size_t total = 0;
+	char buf[32];
+	{
+		std::lock_guard<std::mutex> lk(symbol_store::g_state.mutex);
+		for (const auto& kv : symbol_store::g_state.modules) {
+			const auto& mod = kv.second;
+			if (!want_module.empty() && mod.module_name != want_module) continue;
+			for (const auto& sym : mod.pdb.symbols) {
+				if (funcs_only && !sym.is_function) continue;
+				if (!filter.empty() && lower_ascii(sym.name).find(filter) == std::string::npos) continue;
+				++total;
+				if (arr.size() >= limit) continue;
+				json o;
+				o["module"] = mod.module_name;
+				o["name"] = sym.name;
+				std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(mod.base + sym.rva));
+				o["address"] = buf;
+				std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(sym.rva));
+				o["rva"] = buf;
+				o["size"] = sym.size;
+				o["is_function"] = sym.is_function;
+				arr.push_back(std::move(o));
+			}
+		}
+	}
+	return tool_result_t::ok(json{{"total", total}, {"returned", arr.size()}, {"symbols", arr}});
+}
+
+static tool_result_t analysis_query_binary_map_overview(const json& params)
+{
+	aida::binary_map::map_options_t opts;
+	opts.max_functions = params.value("max_functions", 24);
+	opts.max_globals = params.value("max_globals", 12);
+	opts.max_callees_per_function = 2;
+	opts.include_imports = params.value("include_imports", false);
+	opts.include_exports = params.value("include_exports", false);
+	opts.include_xrefs = params.value("include_xrefs", false);
+	aida::binary_map::map_t m;
+	if (!aida::binary_map::generate(opts, m))
+		return tool_result_t::error(aida::binary_map::last_error());
+	char buf[32];
+	json sections = json::array();
+	for (const auto& s : m.sections) {
+		json o;
+		o["name"] = s.name;
+		std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(s.va));
+		o["va"] = buf;
+		o["size"] = s.size;
+		o["executable"] = s.executable;
+		o["readable"] = s.readable;
+		o["writable"] = s.writable;
+		sections.push_back(std::move(o));
+	}
+	json functions = json::array();
+	for (const auto& f : m.functions) {
+		json o;
+		std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(f.va));
+		o["va"] = buf;
+		o["name"] = f.name;
+		o["xref_count"] = f.xref_count;
+		o["callee_count"] = f.callee_count;
+		if (!f.section_name.empty()) o["section"] = f.section_name;
+		if (!f.top_callees.empty()) o["top_callees"] = f.top_callees;
+		if (f.pinned) o["pinned"] = true;
+		functions.push_back(std::move(o));
+	}
+	json globals = json::array();
+	for (const auto& g : m.globals) {
+		json o;
+		std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(g.va));
+		o["va"] = buf;
+		o["name"] = g.name;
+		o["xref_count"] = g.xref_count;
+		o["writable"] = g.writable;
+		if (!g.section_name.empty()) o["section"] = g.section_name;
+		globals.push_back(std::move(o));
+	}
+	std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(m.image_base));
+	json result;
+	result["module_name"] = m.module_name;
+	result["module_path"] = m.module_path;
+	result["architecture"] = m.architecture;
+	result["format"] = m.format;
+	result["image_base"] = buf;
+	result["image_size"] = m.image_size;
+	result["sections"] = std::move(sections);
+	result["functions"] = std::move(functions);
+	result["globals"] = std::move(globals);
+	result["imports"] = m.imports;
+	result["exports"] = m.exports;
+	return tool_result_t::ok(result);
+}
+
+static tool_result_t analysis_query_xref_db_stats(const json&)
+{
+	std::lock_guard<std::mutex> lk(xref_db::g_state.mutex);
+	json arr = json::array();
+	size_t total = 0;
+	size_t built = 0;
+	for (const auto& kv : xref_db::g_state.modules) {
+		const auto& mod = kv.second;
+		arr.push_back({{"module", mod.name}, {"base", mod.base}, {"size", mod.size}, {"total_xrefs", mod.total_xrefs}, {"built", mod.built}});
+		if (mod.built) {
+			++built;
+			total += mod.total_xrefs;
+		}
+	}
+	return tool_result_t::ok(json{{"module_count", xref_db::g_state.modules.size()}, {"modules_built", built}, {"total_xrefs", total}, {"building", xref_db::g_state.building.load()}, {"progress", xref_db::g_state.progress.load()}, {"modules", arr}});
+}
+
 void register_analysis_tools(mcp_standalone::server_t& srv)
 {
 	srv.register_tool({
@@ -407,157 +1019,8 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 		}
 	});
 
-	srv.register_tool({
-		"start_fuzz",
-		"Start snapshot-based fuzzing of a target function using Unicorn emulation. Mutates input buffer and tracks coverage/crashes.",
-		{
-			{"target_address", "string", "Hex address of the function to fuzz", true},
-			{"end_address", "string", "Hex address where execution should stop", false},
-			{"input_address", "string", "Hex address of the input buffer in target memory", false},
-			{"input_size", "integer", "Size of input buffer in bytes (default: 256)", false},
-			{"max_iterations", "integer", "Maximum fuzzing iterations (default: 10000)", false}
-		},
-		false,
-		[](const json& params) -> tool_result_t {
-			std::string target = params.value("target_address", "");
-			std::string end = params.value("end_address", "");
-			std::string input = params.value("input_address", "");
-			diag::log_tagged_fmt("analysis", "start_fuzz entry target=%s end=%s input=%s",
-				target.c_str(), end.c_str(), input.c_str());
 
-			if (target.empty()) {
-				diag::log_tagged("analysis", "start_fuzz refused no_target_address");
-				return tool_result_t::error("target_address is required");
-			}
 
-			fuzzer_engine::fuzz_config_t cfg;
-			cfg.target_address = std::strtoull(target.c_str(), nullptr, 16);
-			if (cfg.target_address == 0) {
-				diag::log_tagged("analysis", "start_fuzz refused invalid_target_address");
-				return tool_result_t::error("invalid target_address");
-			}
-			if (!end.empty()) {
-				cfg.end_address = std::strtoull(end.c_str(), nullptr, 16);
-				if (cfg.end_address <= cfg.target_address) {
-					diag::log_tagged_fmt("analysis", "start_fuzz refused invalid_end target=0x%llX end=0x%llX",
-						static_cast<unsigned long long>(cfg.target_address),
-						static_cast<unsigned long long>(cfg.end_address));
-					return tool_result_t::error("end_address must be greater than target_address");
-				}
-			} else {
-				cfg.end_address = cfg.target_address + 1;
-			}
-			if (!input.empty())
-				cfg.input_address = std::strtoull(input.c_str(), nullptr, 16);
-			const uint32_t input_size = bounded_u32_param(params, "input_size", 256, 1, 1024 * 1024);
-			cfg.input_size = static_cast<int>(input_size);
-			cfg.max_iterations = bounded_u32_param(params, "max_iterations", 10000, 1, 1000000);
-
-			cfg.pid = driver_bridge::attached_pid();
-			auto threads_snap = driver_bridge::enumerate_threads();
-			cfg.tid = threads_snap.empty() ? 0 : threads_snap.front().tid;
-
-			if (cfg.pid == 0 || cfg.tid == 0) {
-				diag::log_tagged_fmt("analysis", "start_fuzz refused pid=%u tid=%u",
-					cfg.pid, cfg.tid);
-				return tool_result_t::error("fuzzer requires an attached process and at least one thread for snapshotting");
-			}
-
-			diag::log_tagged_fmt("analysis", "start_fuzz starting pid=%u tid=%u target=0x%llX end=0x%llX input=0x%llX input_size=%d max_iters=%d",
-				cfg.pid, cfg.tid,
-				static_cast<unsigned long long>(cfg.target_address),
-				static_cast<unsigned long long>(cfg.end_address),
-				static_cast<unsigned long long>(cfg.input_address),
-				cfg.input_size, cfg.max_iterations);
-			{
-				std::lock_guard<std::mutex> lk(fuzzer_engine::g_state.mutex);
-				fuzzer_engine::g_state.config = cfg;
-			}
-			if (!fuzzer_engine::start_fuzzing()) {
-				diag::log_tagged("analysis", "start_fuzz refused worker_unavailable");
-				return tool_result_t::error("fuzzer is already running or worker queue is unavailable");
-			}
-
-			char end_buf[32];
-			char input_buf[32];
-			std::snprintf(end_buf, sizeof(end_buf), "0x%llX", static_cast<unsigned long long>(cfg.end_address));
-			std::snprintf(input_buf, sizeof(input_buf), "0x%llX", static_cast<unsigned long long>(cfg.input_address));
-			json result;
-			result["status"] = "started";
-			result["worker_posted"] = true;
-			result["pid"] = cfg.pid;
-			result["tid"] = cfg.tid;
-			result["thread_count"] = threads_snap.size();
-			result["target_address"] = target;
-			result["end_address"] = end_buf;
-			result["input_address"] = input_buf;
-			result["input_size"] = cfg.input_size;
-			result["max_iterations"] = cfg.max_iterations;
-			result["setup_complete"] = fuzzer_engine::g_state.setup_complete.load();
-			result["setup_success"] = fuzzer_engine::g_state.setup_success.load();
-			return tool_result_t::ok(result);
-		}
-	});
-
-	srv.register_tool({
-		"stop_fuzz",
-		"Stop the currently running fuzzer.",
-		{},
-		false,
-		[](const json&) -> tool_result_t {
-			diag::log_tagged("analysis", "stop_fuzz entry");
-			fuzzer_engine::stop_fuzzing();
-			diag::log_tagged("analysis", "stop_fuzz stop_requested");
-			return tool_result_t::ok("Fuzzer stop requested.");
-		}
-	});
-
-	srv.register_tool({
-		"get_fuzz_results",
-		"Get current fuzzing statistics and crash results.",
-		{},
-		true,
-		[](const json&) -> tool_result_t {
-			diag::log_tagged("analysis", "get_fuzz_results entry");
-			std::lock_guard<std::mutex> lk(fuzzer_engine::g_state.mutex);
-			auto& stats = fuzzer_engine::g_state.stats;
-			diag::log_tagged_fmt("analysis", "get_fuzz_results running=%d executions=%llu crashes=%llu unique=%llu coverage=%llu",
-				fuzzer_engine::g_state.running.load() ? 1 : 0,
-				static_cast<unsigned long long>(stats.total_executions),
-				static_cast<unsigned long long>(stats.total_crashes),
-				static_cast<unsigned long long>(stats.total_unique_crashes),
-				static_cast<unsigned long long>(stats.edge_coverage));
-
-			json result;
-			result["running"] = fuzzer_engine::g_state.running.load();
-			result["total_executions"] = stats.total_executions;
-			result["executions_per_second"] = stats.executions_per_second;
-			result["total_crashes"] = stats.total_crashes;
-			result["unique_crashes"] = stats.total_unique_crashes;
-			result["edge_coverage"] = stats.edge_coverage;
-			result["new_coverage_finds"] = stats.new_coverage_finds;
-			result["corpus_size"] = stats.corpus_size;
-			result["elapsed_seconds"] = stats.elapsed_seconds;
-			result["setup_error"] = fuzzer_engine::g_state.setup_error;
-			result["worker_active"] = fuzzer_engine::g_state.worker_active.load();
-			result["setup_complete"] = fuzzer_engine::g_state.setup_complete.load();
-			result["setup_success"] = fuzzer_engine::g_state.setup_success.load();
-
-			json crashes_arr = json::array();
-			for (auto& c : fuzzer_engine::g_state.unique_crashes) {
-				json cobj;
-				cobj["type"] = fuzzer_engine::crash_type_name(c.type);
-				char abuf[32];
-				std::snprintf(abuf, sizeof(abuf), "0x%llX", static_cast<unsigned long long>(c.instruction_address));
-				cobj["instruction_address"] = abuf;
-				cobj["description"] = c.description;
-				crashes_arr.push_back(cobj);
-			}
-			result["crashes"] = crashes_arr;
-
-			return tool_result_t::ok(result);
-		}
-	});
 
 	srv.register_tool({
 		"auto_decrypt_strings",
@@ -825,359 +1288,10 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 		}
 	});
 
-	srv.register_tool({
-		"start_live_monitor",
-		"Start continuous live struct monitoring using page guards, polling, or hardware breakpoints. Watches memory accesses to a struct region and infers field types from instruction analysis.",
-		{
-			{"address", "string", "Base address of the struct in hex", true},
-			{"size", "integer", "Size of the struct in bytes (default: 256)", false},
-			{"name", "string", "Name for the struct (default: 'struct_t')", false},
-			{"backend", "string", "Backend preference: auto, page_guard, polling, hardware_breakpoint", false},
-			{"timeout_ms", "integer", "Maximum backend startup wait in milliseconds (default: 3000, max 3500)", false}
-		},
-		false,
-		[](const json& params) -> tool_result_t {
-			std::string addr_str = params.value("address", "");
-			int size = params.value("size", 256);
-			std::string name = params.value("name", "struct_t");
-			std::string backend = params.value("backend", "auto");
-			uint32_t timeout_ms = bounded_u32_param(params, "timeout_ms", 3000, 100, 3500);
-			diag::log_tagged_fmt("analysis",
-				"start_live_monitor entry addr=%s size=%d name=%s backend=%s timeout_ms=%u driver=%d attached_pid=%u active=%d",
-				addr_str.c_str(), size, name.c_str(), backend.c_str(), timeout_ms,
-				driver_bridge::using_kernel_driver() ? 1 : 0,
-				driver_bridge::attached_pid(),
-				struct_monitor::g_state.active.load() ? 1 : 0);
 
-			if (addr_str.empty()) {
-				diag::log_tagged("analysis", "start_live_monitor refused no_address");
-				return tool_result_t::error("address parameter is required");
-			}
 
-			uint64_t addr = std::strtoull(addr_str.c_str(), nullptr, 16);
-			if (addr == 0) {
-				diag::log_tagged("analysis", "start_live_monitor refused invalid_address");
-				return tool_result_t::error("invalid address");
-			}
 
-			if (struct_monitor::g_state.active.load()) {
-				diag::log_tagged("analysis", "start_live_monitor refused already_active");
-				return tool_result_t::error("Live monitor already active. Stop it first.");
-			}
 
-			if (size <= 0) {
-				diag::log_tagged_fmt("analysis", "start_live_monitor refused invalid_size=%d", size);
-				return tool_result_t::error("size must be positive");
-			}
-
-			diag::log_tagged_fmt("analysis", "start_live_monitor starting addr=0x%llX size=%d name=%s backend=%s",
-				static_cast<unsigned long long>(addr), size, name.c_str(), backend.c_str());
-			struct_monitor::start(addr, size, name, backend);
-
-			int max_wait = static_cast<int>((timeout_ms + 49) / 50);
-			for (int wait = 0; wait < max_wait; ++wait) {
-				if (wait == 0 || ((wait + 1) % 10) == 0) {
-					diag::log_tagged_fmt("analysis",
-						"start_live_monitor wait tick=%d/%d active=%d page_guard=%d hwbp=%d polling=%d captures=%llu",
-						wait + 1,
-						max_wait,
-						struct_monitor::g_state.active.load() ? 1 : 0,
-						struct_monitor::g_state.session.using_page_guard ? 1 : 0,
-						struct_monitor::g_state.session.using_hwbp ? 1 : 0,
-						struct_monitor::g_state.session.using_polling ? 1 : 0,
-						static_cast<unsigned long long>(struct_monitor::g_state.total_captures.load()));
-				}
-				if (!struct_monitor::g_state.active.load())
-					break;
-				if (struct_monitor::g_state.session.using_page_guard ||
-				    struct_monitor::g_state.session.using_hwbp ||
-				    struct_monitor::g_state.session.using_polling)
-					break;
-				Sleep(50);
-			}
-
-			bool active = struct_monitor::g_state.active.load();
-			bool page_guard = struct_monitor::g_state.session.using_page_guard;
-			bool hwbp = struct_monitor::g_state.session.using_hwbp;
-			bool polling = struct_monitor::g_state.session.using_polling;
-			json result;
-			char abuf[32];
-			std::snprintf(abuf, sizeof(abuf), "0x%llX", static_cast<unsigned long long>(addr));
-			result["address"] = abuf;
-			result["size"] = size;
-			if (!active || (!page_guard && !hwbp && !polling)) {
-				diag::log_tagged_fmt("analysis",
-					"start_live_monitor failed backend active=%d page_guard=%d hwbp=%d polling=%d captures=%llu driver=%d attached_pid=%u",
-					active ? 1 : 0, page_guard ? 1 : 0, hwbp ? 1 : 0, polling ? 1 : 0,
-					static_cast<unsigned long long>(struct_monitor::g_state.total_captures.load()),
-					driver_bridge::using_kernel_driver() ? 1 : 0,
-					driver_bridge::attached_pid());
-				struct_monitor::stop();
-				for (int wait = 0; wait < 10 && struct_monitor::g_state.active.load(); ++wait)
-					Sleep(50);
-				return tool_result_t::error("live monitor backend did not become active");
-			}
-
-			result["status"] = "monitoring";
-			result["backend"] = page_guard ? "page_guard" : (hwbp ? "hardware_breakpoint" : "polling");
-			return tool_result_t::ok(result);
-		}
-	});
-
-	srv.register_tool({
-		"stop_live_monitor",
-		"Stop the active live struct monitoring session and return accumulated access data.",
-		{{"require_captures", "boolean", "Return an error if no accesses were captured", false}},
-		false,
-		[](const json& params) -> tool_result_t {
-			diag::log_tagged_fmt("analysis", "stop_live_monitor entry active=%d captures=%llu require=%d",
-				struct_monitor::g_state.active.load() ? 1 : 0,
-				static_cast<unsigned long long>(struct_monitor::g_state.total_captures.load()),
-				params.value("require_captures", false) ? 1 : 0);
-			if (!struct_monitor::g_state.active.load()) {
-				diag::log_tagged("analysis", "stop_live_monitor refused not_active");
-				return tool_result_t::error("No active live monitor session.");
-			}
-
-			struct_monitor::stop();
-
-			int wait = 0;
-			while (struct_monitor::g_state.active.load() && wait < 10) {
-				Sleep(50);
-				++wait;
-			}
-
-			auto accesses = struct_monitor::get_access_snapshot();
-			diag::log_tagged_fmt("analysis", "stop_live_monitor complete total_captures=%llu unique_offsets=%zu",
-				static_cast<unsigned long long>(struct_monitor::g_state.total_captures.load()),
-				accesses.size());
-
-			json arr = json::array();
-			for (auto& a : accesses) {
-				json obj;
-				char obuf[16];
-				std::snprintf(obuf, sizeof(obuf), "0x%04llX", static_cast<unsigned long long>(a.field_offset));
-				obj["offset"] = obuf;
-				obj["access_size"] = a.access_size;
-				obj["is_write"] = a.is_write;
-				obj["inferred_type"] = struct_recon::field_type_name(a.inferred_type);
-				obj["hit_count"] = a.hit_count;
-				obj["disasm"] = a.disasm;
-				char rbuf[32];
-				std::snprintf(rbuf, sizeof(rbuf), "0x%llX", static_cast<unsigned long long>(a.rip));
-				obj["rip"] = rbuf;
-				arr.push_back(obj);
-			}
-
-			json result;
-			result["total_captures"] = struct_monitor::g_state.total_captures.load();
-			result["unique_offsets"] = accesses.size();
-			result["accesses"] = arr;
-			if (params.value("require_captures", false) && accesses.empty()) {
-				diag::log_tagged_fmt("analysis",
-					"stop_live_monitor failed require_captures no_accesses total_captures=%llu page_guard=%d hwbp=%d polling=%d",
-					static_cast<unsigned long long>(struct_monitor::g_state.total_captures.load()),
-					struct_monitor::g_state.session.using_page_guard ? 1 : 0,
-					struct_monitor::g_state.session.using_hwbp ? 1 : 0,
-					struct_monitor::g_state.session.using_polling ? 1 : 0);
-				return tool_result_t::error("live monitor captured no accesses");
-			}
-			return tool_result_t::ok(result);
-		}
-	});
-
-	srv.register_tool({
-		"symbolic_deobfuscate",
-		"Run symbolic execution-based deobfuscation on a function. Detects opaque predicates, removes junk code, resolves constants, and recovers the clean control flow graph. Returns cleaned instructions with statistics.",
-		{{"entry_address", "string", "Entry address of the function to deobfuscate (hex)", true},
-		 {"max_instructions", "number", "Maximum instructions to process (default 10000)", false}},
-		true,
-		[](const json& params) -> tool_result_t {
-			std::string addr_str = params.value("entry_address", "");
-			diag::log_tagged_fmt("analysis", "symbolic_deobfuscate entry addr=%s", addr_str.c_str());
-			if (addr_str.empty()) {
-				diag::log_tagged("analysis", "symbolic_deobfuscate refused no_entry_address");
-				return tool_result_t::error("entry_address is required");
-			}
-
-			uint64_t entry = std::strtoull(addr_str.c_str(), nullptr, 16);
-			if (entry == 0) {
-				diag::log_tagged("analysis", "symbolic_deobfuscate refused invalid_entry_address");
-				return tool_result_t::error("invalid entry_address");
-			}
-
-			uint32_t max_insns = static_cast<uint32_t>(params.value("max_instructions", 10000));
-			diag::log_tagged_fmt("analysis", "symbolic_deobfuscate running entry=0x%llX max_insns=%u",
-				static_cast<unsigned long long>(entry), max_insns);
-
-			auto result = deobfuscation_engine::deobfuscate_function(entry, max_insns);
-			diag::log_tagged_fmt("analysis", "symbolic_deobfuscate complete total=%u clean=%u junk_removed=%u opaques=%u constants=%u",
-				result.total_original, result.total_clean,
-				result.removed_junk, result.opaque_predicates_found, result.constants_resolved);
-
-			json out;
-			out["statistics"] = {
-				{"total_instructions", result.total_original},
-				{"clean_instructions", result.total_clean},
-				{"junk_removed", result.removed_junk},
-				{"opaque_predicates", result.opaque_predicates_found},
-				{"constants_resolved", result.constants_resolved}
-			};
-
-			json insns = json::array();
-			for (auto& ci : result.clean_instructions) {
-				json obj;
-				char abuf[32];
-				std::snprintf(abuf, sizeof(abuf), "0x%llX", static_cast<unsigned long long>(ci.address));
-				obj["address"] = abuf;
-				obj["disasm"] = ci.disasm;
-				obj["is_original"] = !ci.was_junk;
-				obj["was_constant_folded"] = ci.was_constant_folded;
-				insns.push_back(obj);
-			}
-			out["clean_instructions"] = insns;
-
-			json opaques = json::array();
-			for (auto& op : result.opaques) {
-				json obj;
-				char abuf[32];
-				std::snprintf(abuf, sizeof(abuf), "0x%llX", static_cast<unsigned long long>(op.address));
-				obj["address"] = abuf;
-				obj["condition_str"] = op.condition_ast;
-				obj["always_true"] = op.always_taken;
-				opaques.push_back(obj);
-			}
-			out["opaque_predicates"] = opaques;
-
-			json constants = json::array();
-			for (auto& cf : result.constants) {
-				json obj;
-				char abuf[32];
-				std::snprintf(abuf, sizeof(abuf), "0x%llX", static_cast<unsigned long long>(cf.address));
-				obj["address"] = abuf;
-				obj["original_expression"] = cf.original_ast;
-				char vbuf[32];
-				std::snprintf(vbuf, sizeof(vbuf), "0x%llX", static_cast<unsigned long long>(cf.concrete_value));
-				obj["resolved_value"] = vbuf;
-				constants.push_back(obj);
-			}
-			out["constants"] = constants;
-
-			return tool_result_t::ok(out);
-		}
-	});
-
-	srv.register_tool({
-		"symbolic_slice_function",
-		"Perform backward program slicing using symbolic execution. Returns only the instructions that contribute to the final value of the target register, removing all irrelevant code.",
-		{{"start_address", "string", "Start address for the slice range (hex)", true},
-		 {"end_address", "string", "End address for the slice range (hex)", true},
-		 {"target_register", "string", "Target register to slice to (e.g. rax, rcx, rdi)", true},
-		 {"max_instructions", "number", "Maximum instructions to process (default 5000)", false}},
-		true,
-		[](const json& params) -> tool_result_t {
-			std::string start_str = params.value("start_address", "");
-			std::string end_str = params.value("end_address", "");
-			std::string reg = params.value("target_register", "");
-			diag::log_tagged_fmt("analysis", "symbolic_slice_function entry start=%s end=%s reg=%s",
-				start_str.c_str(), end_str.c_str(), reg.c_str());
-			if (start_str.empty() || end_str.empty() || reg.empty()) {
-				diag::log_tagged("analysis", "symbolic_slice_function refused missing_params");
-				return tool_result_t::error("start_address, end_address, and target_register are required");
-			}
-
-			uint64_t start = std::strtoull(start_str.c_str(), nullptr, 16);
-			uint64_t end = std::strtoull(end_str.c_str(), nullptr, 16);
-			uint32_t max_insns = static_cast<uint32_t>(params.value("max_instructions", 5000));
-			diag::log_tagged_fmt("analysis", "symbolic_slice_function running start=0x%llX end=0x%llX reg=%s max_insns=%u",
-				static_cast<unsigned long long>(start), static_cast<unsigned long long>(end),
-				reg.c_str(), max_insns);
-
-			auto result = symbolic_engine::slice_to_register(start, end, max_insns, reg);
-			diag::log_tagged_fmt("analysis", "symbolic_slice_function complete total=%u effective=%u removed=%u",
-				result.total_instructions, result.effective_count,
-				result.total_instructions - result.effective_count);
-
-			json out;
-			out["target_register"] = reg;
-			out["total_instructions"] = result.total_instructions;
-			out["effective_instructions"] = result.effective_count;
-			out["removed_count"] = result.total_instructions - result.effective_count;
-
-			json insns = json::array();
-			for (auto& ti : result.effective_instructions) {
-				json obj;
-				char abuf[32];
-				std::snprintf(abuf, sizeof(abuf), "0x%llX", static_cast<unsigned long long>(ti.address));
-				obj["address"] = abuf;
-				obj["disasm"] = ti.disasm;
-				insns.push_back(obj);
-			}
-			out["instructions"] = insns;
-
-			return tool_result_t::ok(out);
-		}
-	});
-
-	srv.register_tool({
-		"symbolic_solve_path",
-		"Use Z3 constraint solver to find concrete register values that force execution to reach a specific target address from a start address. Returns SAT/UNSAT and the required register values.",
-		{{"start_address", "string", "Starting address of execution (hex)", true},
-		 {"target_address", "string", "Target address to reach (hex)", true},
-		 {"symbolic_registers", "string", "Comma-separated register names to make symbolic (e.g. rax,rcx)", true},
-		 {"max_instructions", "number", "Maximum instructions to process (default 5000)", false}},
-		true,
-		[](const json& params) -> tool_result_t {
-			std::string start_str = params.value("start_address", "");
-			std::string target_str = params.value("target_address", "");
-			std::string regs_str = params.value("symbolic_registers", "");
-			diag::log_tagged_fmt("analysis", "symbolic_solve_path entry start=%s target=%s regs=%s",
-				start_str.c_str(), target_str.c_str(), regs_str.c_str());
-			if (start_str.empty() || target_str.empty() || regs_str.empty()) {
-				diag::log_tagged("analysis", "symbolic_solve_path refused missing_params");
-				return tool_result_t::error("start_address, target_address, and symbolic_registers are required");
-			}
-
-			uint64_t start = std::strtoull(start_str.c_str(), nullptr, 16);
-			uint64_t target = std::strtoull(target_str.c_str(), nullptr, 16);
-			uint32_t max_insns = static_cast<uint32_t>(params.value("max_instructions", 5000));
-
-			std::vector<std::string> sym_regs;
-			{
-				std::istringstream iss(regs_str);
-				std::string tok;
-				while (std::getline(iss, tok, ',')) {
-					while (!tok.empty() && tok.front() == ' ') tok.erase(tok.begin());
-					while (!tok.empty() && tok.back() == ' ') tok.pop_back();
-					if (!tok.empty())
-						sym_regs.push_back(tok);
-				}
-			}
-
-			diag::log_tagged_fmt("analysis", "symbolic_solve_path running start=0x%llX target=0x%llX sym_regs=%zu max_insns=%u",
-				static_cast<unsigned long long>(start), static_cast<unsigned long long>(target),
-				sym_regs.size(), max_insns);
-			auto result = symbolic_engine::solve_for_path(start, target, max_insns, sym_regs);
-			diag::log_tagged_fmt("analysis", "symbolic_solve_path complete satisfiable=%d solving_time_ms=%u",
-				result.satisfiable ? 1 : 0, result.solving_time_ms);
-
-			json out;
-			out["satisfiable"] = result.satisfiable;
-			out["solving_time_ms"] = result.solving_time_ms;
-
-			if (result.satisfiable) {
-				json vars = json::object();
-				for (auto& [name, val] : result.variable_values) {
-					char vbuf[32];
-					std::snprintf(vbuf, sizeof(vbuf), "0x%llX", static_cast<unsigned long long>(val));
-					vars[name] = vbuf;
-				}
-				out["solution"] = vars;
-			}
-
-			return tool_result_t::ok(out);
-		}
-	});
 
 	srv.register_tool({
 		"taint_trace_register",
@@ -1277,821 +1391,101 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 	});
 
 	srv.register_tool({
-		"enable_stealth_context",
-		"Install anti-debug hooks in the target process: PEB flag spoofing, RDTSC timing patch, and optional debug context scrubbing. Hides hardware breakpoints from anti-cheat context inspection. Call this before setting hardware breakpoints to ensure the target cannot detect analysis.",
-		{{"pid", "string", "Target process PID as decimal string. Leave empty to use the currently attached PID.", false},
-		 {"spoof_peb", "boolean", "Patch PEB BeingDebugged / NtGlobalFlag (default: true)", false},
-		 {"hook_rdtsc", "boolean", "Install RDTSC trampoline hooks for timing-based detection (default: true)", false},
-		 {"scrub_context", "boolean", "Zero DR0-DR7 on all target threads (default: false)", false}},
+		"fuzzer_manage",
+		"Manage snapshot-based function fuzzing. Actions: start, stop, results.",
+		{{"action", "string", "start|stop|results", true},
+		 {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted.", false},
+		 {"target_address", "string", "Hex address of the function to fuzz", false},
+		 {"end_address", "string", "Hex address where execution should stop", false},
+		 {"input_address", "string", "Hex address of the input buffer in target memory", false},
+		 {"input_size", "integer", "Size of input buffer in bytes", false},
+		 {"max_iterations", "integer", "Maximum fuzzing iterations", false}},
 		false,
 		[](const json& params) -> tool_result_t {
-			uint32_t pid = 0;
-			std::string pid_str = params.value("pid", "");
-			if (!pid_str.empty())
-				pid = static_cast<uint32_t>(std::strtoul(pid_str.c_str(), nullptr, 10));
-			if (pid == 0)
-				pid = driver_bridge::attached_pid();
-			if (pid == 0) {
-				diag::log_tagged("stealth", "mcp_enable_reject reason=no_pid");
-				return tool_result_t::error("no target PID: attach driver first or provide pid parameter");
-			}
-
-			if (stealth_engine::is_active_for_pid(pid))
-				return tool_result_t::ok(json{{"status", stealth_engine::get_status()}, {"already_active", true}});
-			if (stealth_engine::is_active()) {
-				auto active = stealth_engine::get_session_info();
-				json out;
-				out["requested_pid"] = pid;
-				out["active_pid"] = active.pid;
-				out["status"] = stealth_engine::get_status();
-				return tool_result_t{false, "stealth context is already active for a different PID", out};
-			}
-
-			stealth_engine::stealth_options_t opts;
-			opts.spoof_peb = params.value("spoof_peb", true);
-			opts.hook_rdtsc = params.value("hook_rdtsc", true);
-			opts.scrub_context = params.value("scrub_context", false);
-			diag::log_tagged_fmt("stealth",
-				"mcp_enable_request pid=%u peb=%d rdtsc=%d ctx=%d",
-				pid, opts.spoof_peb ? 1 : 0,
-				opts.hook_rdtsc ? 1 : 0, opts.scrub_context ? 1 : 0);
-			const bool enabled = stealth_engine::enable_stealth(pid, opts);
-
-			json out;
-			out["pid"] = pid;
-			out["status"] = stealth_engine::get_status();
-			out["active"] = stealth_engine::is_active();
-			out["enabled"] = enabled;
-			{
-				std::lock_guard<std::mutex> lk(stealth_engine::g_state.mutex);
-				out["peb_spoofed"] = stealth_engine::g_state.session.peb_spoofed;
-				out["rdtsc_hooks"] = static_cast<int>(stealth_engine::g_state.session.hooks.size());
-				out["context_scrubbed"] = stealth_engine::g_state.session.context_hooked;
-			}
-			return enabled ? tool_result_t::ok(out) : tool_result_t{false, "stealth context could not be fully enabled", out};
+			const std::string action = compat_action_name(params);
+			const json p = compat_action_payload(params);
+			if (action == "start") return fuzzer_manage_start(p);
+			if (action == "stop") return fuzzer_manage_stop(p);
+			if (action == "results") return fuzzer_manage_results(p);
+			return compat_unknown_action("fuzzer_manage", action);
 		}
 	});
 
 	srv.register_tool({
-		"disable_stealth_context",
-		"Remove all stealth hooks installed by enable_stealth_context and restore original bytes. Safe to call even if stealth is not active.",
-		{},
-		false,
-		[](const json&) -> tool_result_t {
-			diag::log_tagged("analysis", "disable_stealth_context entry");
-			if (!stealth_engine::is_active()) {
-				diag::log_tagged("analysis", "disable_stealth_context skipped not_active");
-				return tool_result_t::ok(json{{"status", "stealth was not active"}, {"hooks_removed", 0}});
-			}
-
-			int hook_count = 0;
-			{
-				std::lock_guard<std::mutex> lk(stealth_engine::g_state.mutex);
-				hook_count = static_cast<int>(stealth_engine::g_state.session.hooks.size());
-			}
-			diag::log_tagged_fmt("analysis", "disable_stealth_context removing hooks=%d", hook_count);
-
-			stealth_engine::disable_stealth();
-
-			json out;
-			out["status"] = stealth_engine::get_status();
-			out["hooks_removed"] = hook_count;
-			out["active"] = stealth_engine::is_active();
-			diag::log_tagged_fmt("analysis", "disable_stealth_context complete hooks_removed=%d active=%d",
-				hook_count, stealth_engine::is_active() ? 1 : 0);
-			return tool_result_t::ok(out);
-		}
-	});
-
-	srv.register_tool({
-		"analysis_get_imports",
-		"List the IAT imports of the attached process's main module (module, function name, ordinal, IAT virtual address, bound address).",
-		{{"max_entries", "integer", "Maximum imports to return (default 512, max 4096)", false},
-		 {"timeout_ms", "integer", "Maximum parse time before returning partial results (default 2500, max 10000)", false}},
-		true,
-		[](const json& params) -> tool_result_t {
-			diag::log_tagged("analysis", "analysis_get_imports entry");
-			if (driver_bridge::attached_pid() == 0) {
-				diag::log_tagged("analysis", "analysis_get_imports refused no_process");
-				return tool_result_t::error("No process is attached; call driver_attach first.");
-			}
-			auto modules = driver_bridge::enumerate_modules();
-			if (modules.empty()) {
-				diag::log_tagged("analysis", "analysis_get_imports failed no_modules");
-				return tool_result_t::error("Module enumeration returned no entries.");
-			}
-			pe_parser::pe_info_t pe;
-			if (!pe_parser::parse(modules.front().base, pe, false)) {
-				diag::log_tagged("analysis", "analysis_get_imports failed pe_parse_failed");
-				return tool_result_t::error("pe_parser::parse failed on the main module.");
-			}
-			size_t max_entries = bounded_size_param(params, "max_entries", 512, 1, 4096);
-			uint32_t timeout_ms = bounded_u32_param(params, "timeout_ms", 2500, 100, 10000);
-			auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-			bool truncated = false;
-			bool parsed = pe_parser::parse_imports(modules.front().base, pe, pe.imports, max_entries, &deadline, &truncated);
-			if (!parsed)
-				truncated = true;
-			json arr = json::array();
-			char buf[32];
-			for (const auto& imp : pe.imports) {
-				json o;
-				o["module"]   = imp.module_name;
-				o["function"] = imp.function_name;
-				o["ordinal"]  = imp.ordinal;
-				o["hint"]     = imp.hint;
-				std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(imp.iat_address));
-				o["iat_address"]   = buf;
-				std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(imp.bound_address));
-				o["bound_address"] = buf;
-				arr.push_back(std::move(o));
-			}
-			json result;
-			result["module"] = modules.front().name;
-			result["count"]  = arr.size();
-			result["truncated"] = truncated;
-			result["parse_complete"] = parsed && !truncated;
-			result["max_entries"] = max_entries;
-			result["timeout_ms"] = timeout_ms;
-			result["imports"] = std::move(arr);
-			diag::log_tagged_fmt("analysis", "analysis_get_imports complete module=%s count=%zu truncated=%d parsed=%d",
-				modules.front().name.c_str(), static_cast<size_t>(result["count"].get<size_t>()),
-				static_cast<int>(truncated), static_cast<int>(parsed));
-			return tool_result_t::ok(result);
-		}
-	});
-
-	srv.register_tool({
-		"analysis_get_exports",
-		"List the exports of the attached process's main module or selected loaded module (ordinal, name, RVA, absolute address, forwarder info).",
-		{{"max_entries", "integer", "Maximum exports to return (default 512, max 4096)", false},
-		 {"timeout_ms", "integer", "Maximum parse time before returning partial results (default 2500, max 10000)", false},
-		 {"module_name", "string", "Optional loaded module name or path suffix to parse instead of the main module", false}},
-		true,
-		[](const json& params) -> tool_result_t {
-			diag::log_tagged("analysis", "analysis_get_exports entry");
-			if (driver_bridge::attached_pid() == 0) {
-				diag::log_tagged("analysis", "analysis_get_exports refused no_process");
-				return tool_result_t::error("No process is attached; call driver_attach first.");
-			}
-			auto modules = driver_bridge::enumerate_modules();
-			if (modules.empty()) {
-				diag::log_tagged("analysis", "analysis_get_exports failed no_modules");
-				return tool_result_t::error("Module enumeration returned no entries.");
-			}
-			const std::string requested_module = params.value("module_name", std::string());
-			const driver_bridge::module_info_t* selected = select_module_by_name(modules, requested_module);
-			if (!selected) {
-				diag::log_tagged_fmt("analysis", "analysis_get_exports failed module_not_found requested=%s module_count=%zu",
-					requested_module.c_str(), modules.size());
-				return tool_result_t::error("Requested module was not found in the attached process.");
-			}
-			pe_parser::pe_info_t pe;
-			if (!pe_parser::parse(selected->base, pe, false)) {
-				diag::log_tagged_fmt("analysis", "analysis_get_exports failed pe_parse_failed module=%s base=0x%llX",
-					selected->name.c_str(), static_cast<unsigned long long>(selected->base));
-				return tool_result_t::error("pe_parser::parse failed on the selected module.");
-			}
-			size_t max_entries = bounded_size_param(params, "max_entries", 512, 1, 4096);
-			uint32_t timeout_ms = bounded_u32_param(params, "timeout_ms", 2500, 100, 10000);
-			auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-			bool truncated = false;
-			bool parsed = pe_parser::parse_exports(selected->base, pe, pe.exports, max_entries, &deadline, &truncated);
-			if (!parsed)
-				truncated = true;
-			json arr = json::array();
-			char buf[32];
-			for (const auto& exp : pe.exports) {
-				json o;
-				o["ordinal"] = exp.ordinal;
-				o["name"]    = exp.name;
-				std::snprintf(buf, sizeof(buf), "0x%X", exp.rva);
-				o["rva"]     = buf;
-				std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(exp.address));
-				o["address"] = buf;
-				if (exp.is_forwarded) {
-					o["forwarded"] = true;
-					o["forward_to"] = exp.forward_name;
-				}
-				arr.push_back(std::move(o));
-			}
-			json result;
-			result["module"]  = selected->name;
-			result["module_path"] = selected->path;
-			std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(selected->base));
-			result["module_base"] = buf;
-			result["count"]   = arr.size();
-			result["truncated"] = truncated;
-			result["parse_complete"] = parsed && !truncated;
-			result["max_entries"] = max_entries;
-			result["timeout_ms"] = timeout_ms;
-			result["exports"] = std::move(arr);
-			diag::log_tagged_fmt("analysis", "analysis_get_exports complete module=%s count=%zu truncated=%d parsed=%d",
-				selected->name.c_str(), static_cast<size_t>(result["count"].get<size_t>()),
-				static_cast<int>(truncated), static_cast<int>(parsed));
-			return tool_result_t::ok(result);
-		}
-	});
-
-	srv.register_tool({
-		"analysis_get_types",
-		"List user-defined types (structs, unions, enums) discovered in any loaded module's PDB. Supports a case-insensitive substring filter on the type name.",
-		{{"filter", "string", "Optional substring filter (case-insensitive)", false},
-		 {"limit",  "number", "Maximum types to return (default 200, max 5000)", false}},
-		true,
-		[](const json& params) -> tool_result_t {
-			diag::log_tagged("analysis", "analysis_get_types entry");
-			std::string filter;
-			if (params.contains("filter") && params["filter"].is_string()) {
-				filter = params["filter"].get<std::string>();
-				std::transform(filter.begin(), filter.end(), filter.begin(), [](unsigned char c) {
-					return static_cast<char>(std::tolower(c));
-				});
-			}
-			size_t limit = 200;
-			if (params.contains("limit") && params["limit"].is_number_unsigned()) {
-				size_t v = params["limit"].get<size_t>();
-				if (v > 0 && v <= 5000) limit = v;
-			}
-			json arr = json::array();
-			size_t total = 0;
-			{
-				std::lock_guard<std::mutex> lk(symbol_store::g_state.mutex);
-				for (const auto& kv : symbol_store::g_state.modules) {
-					const auto& mod = kv.second;
-					for (const auto& s : mod.pdb.structs) {
-						std::string lname = s.name;
-						std::transform(lname.begin(), lname.end(), lname.begin(),
-							[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-						if (!filter.empty() && lname.find(filter) == std::string::npos)
-							continue;
-						++total;
-						if (arr.size() >= limit) continue;
-						json o;
-						o["module"] = mod.module_name;
-						o["name"]   = s.name;
-						o["kind"]   = s.is_union ? "union" : "struct";
-						o["size"]   = s.size;
-						o["member_count"] = s.members.size();
-						arr.push_back(std::move(o));
-					}
-					for (const auto& e : mod.pdb.enums) {
-						std::string lname = e.name;
-						std::transform(lname.begin(), lname.end(), lname.begin(),
-							[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-						if (!filter.empty() && lname.find(filter) == std::string::npos)
-							continue;
-						++total;
-						if (arr.size() >= limit) continue;
-						json o;
-						o["module"] = mod.module_name;
-						o["name"]   = e.name;
-						o["kind"]   = "enum";
-						o["member_count"] = e.members.size();
-						arr.push_back(std::move(o));
-					}
-				}
-			}
-			json result;
-			result["total"]    = total;
-			result["returned"] = arr.size();
-			result["types"]    = std::move(arr);
-			diag::log_tagged_fmt("analysis", "analysis_get_types complete total=%zu returned=%zu filter=%s",
-				total, static_cast<size_t>(result["returned"].get<size_t>()), filter.c_str());
-			return tool_result_t::ok(result);
-		}
-	});
-
-	srv.register_tool({
-		"analysis_get_type_definition",
-		"Return the full member layout of a struct/union/enum loaded from any module's PDB.",
-		{{"name",   "string", "Type name (exact, case-sensitive match preferred)", true},
-		 {"module", "string", "Optional module name to narrow the lookup", false}},
-		true,
-		[](const json& params) -> tool_result_t {
-			std::string want_name = (params.contains("name") && params["name"].is_string()) ? params["name"].get<std::string>() : "";
-			diag::log_tagged_fmt("analysis", "analysis_get_type_definition entry name=%s", want_name.c_str());
-			if (!params.contains("name") || !params["name"].is_string()) {
-				diag::log_tagged("analysis", "analysis_get_type_definition refused no_name");
-				return tool_result_t::error("'name' is required.");
-			}
-			std::string want = params["name"].get<std::string>();
-			std::string want_module;
-			if (params.contains("module") && params["module"].is_string())
-				want_module = params["module"].get<std::string>();
-
-			std::lock_guard<std::mutex> lk(symbol_store::g_state.mutex);
-			for (const auto& kv : symbol_store::g_state.modules) {
-				const auto& mod = kv.second;
-				if (!want_module.empty() && mod.module_name != want_module) continue;
-				for (const auto& s : mod.pdb.structs) {
-					if (s.name != want) continue;
-					json members = json::array();
-					for (const auto& m : s.members) {
-						json mj;
-						mj["name"]    = m.name;
-						mj["type"]    = m.type_name;
-						mj["offset"]  = m.offset;
-						mj["size"]    = m.size;
-						if (m.is_pointer) {
-							mj["pointer"]       = true;
-							mj["pointer_depth"] = m.pointer_depth;
-						}
-						if (m.is_array) {
-							mj["array"]       = true;
-							mj["array_count"] = m.array_count;
-						}
-						if (m.bit_offset >= 0) mj["bit_offset"] = m.bit_offset;
-						if (m.bit_size   >= 0) mj["bit_size"]   = m.bit_size;
-						members.push_back(std::move(mj));
-					}
-					json result;
-					result["module"]  = mod.module_name;
-					result["name"]    = s.name;
-					result["kind"]    = s.is_union ? "union" : "struct";
-					result["size"]    = s.size;
-					result["members"] = std::move(members);
-					return tool_result_t::ok(result);
-				}
-				for (const auto& e : mod.pdb.enums) {
-					if (e.name != want) continue;
-					json members = json::array();
-					for (const auto& em : e.members) {
-						json mj;
-						mj["name"]  = em.name;
-						mj["value"] = em.value;
-						members.push_back(std::move(mj));
-					}
-					json result;
-					result["module"]  = mod.module_name;
-					result["name"]    = e.name;
-					result["kind"]    = "enum";
-					result["members"] = std::move(members);
-					return tool_result_t::ok(result);
-				}
-			}
-			diag::log_tagged_fmt("analysis", "analysis_get_type_definition not_found name=%s", want.c_str());
-			if (want == "HANDLE") {
-				json result;
-				result["module"] = "builtin";
-				result["name"] = "HANDLE";
-				result["kind"] = "typedef";
-				result["type"] = "void*";
-				result["size"] = sizeof(void*);
-				result["members"] = json::array();
-				return tool_result_t::ok(result);
-			}
-			return tool_result_t::error("Type not found in any loaded module's PDB.");
-		}
-	});
-
-	srv.register_tool({
-		"analysis_get_pdb_symbols",
-		"List PDB symbols across all loaded modules (function and data). Supports a case-insensitive substring filter on the symbol name.",
-		{{"filter", "string", "Optional substring filter (case-insensitive)", false},
-		 {"module", "string", "Optional module-name filter", false},
-		 {"functions_only", "boolean", "If true return only function symbols", false},
-		 {"limit",  "number", "Maximum symbols to return (default 500, max 10000)", false}},
-		true,
-		[](const json& params) -> tool_result_t {
-			diag::log_tagged("analysis", "analysis_get_pdb_symbols entry");
-			std::string filter;
-			if (params.contains("filter") && params["filter"].is_string()) {
-				filter = params["filter"].get<std::string>();
-				std::transform(filter.begin(), filter.end(), filter.begin(),
-					[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-			}
-			std::string want_module;
-			if (params.contains("module") && params["module"].is_string())
-				want_module = params["module"].get<std::string>();
-			bool funcs_only = false;
-			if (params.contains("functions_only") && params["functions_only"].is_boolean())
-				funcs_only = params["functions_only"].get<bool>();
-			size_t limit = 500;
-			if (params.contains("limit") && params["limit"].is_number_unsigned()) {
-				size_t v = params["limit"].get<size_t>();
-				if (v > 0 && v <= 10000) limit = v;
-			}
-
-			json arr = json::array();
-			size_t total = 0;
-			char buf[32];
-			{
-				std::lock_guard<std::mutex> lk(symbol_store::g_state.mutex);
-				for (const auto& kv : symbol_store::g_state.modules) {
-					const auto& mod = kv.second;
-					if (!want_module.empty() && mod.module_name != want_module) continue;
-					for (const auto& sym : mod.pdb.symbols) {
-						if (funcs_only && !sym.is_function) continue;
-						if (!filter.empty()) {
-							std::string ln = sym.name;
-							std::transform(ln.begin(), ln.end(), ln.begin(),
-								[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-							if (ln.find(filter) == std::string::npos) continue;
-						}
-						++total;
-						if (arr.size() >= limit) continue;
-						json o;
-						o["module"] = mod.module_name;
-						o["name"]   = sym.name;
-						std::snprintf(buf, sizeof(buf), "0x%llX",
-							static_cast<unsigned long long>(mod.base + sym.rva));
-						o["address"]     = buf;
-						std::snprintf(buf, sizeof(buf), "0x%llX",
-							static_cast<unsigned long long>(sym.rva));
-						o["rva"]         = buf;
-						o["size"]        = sym.size;
-						o["is_function"] = sym.is_function;
-						arr.push_back(std::move(o));
-					}
-				}
-			}
-
-			json result;
-			result["total"]    = total;
-			result["returned"] = arr.size();
-			result["symbols"]  = std::move(arr);
-			diag::log_tagged_fmt("analysis", "analysis_get_pdb_symbols complete total=%zu returned=%zu filter=%s module=%s",
-				total, static_cast<size_t>(result["returned"].get<size_t>()),
-				filter.c_str(), want_module.c_str());
-			return tool_result_t::ok(result);
-		}
-	});
-
-	srv.register_tool({
-		"analysis_get_binary_map_overview",
-		"Generate the binary map overview (top functions, globals, sections, imports/exports) used by the Binary Map panel and return it as JSON.",
-		{{"max_functions", "number", "Maximum functions to include (default 24)", false},
-		 {"max_globals",   "number", "Maximum globals to include (default 12)", false},
-		 {"include_imports", "boolean", "Include import summaries (default false for MCP speed)", false},
-		 {"include_exports", "boolean", "Include export summaries (default false for MCP speed)", false},
-		 {"include_xrefs", "boolean", "Include cached xref scoring/callees/globals (default false for MCP speed)", false},
-		 {"fast_summary", "boolean", "Return header and section summary without expensive map scans", false}},
-		true,
-		[](const json& params) -> tool_result_t {
-			diag::log_tagged("analysis", "analysis_get_binary_map_overview entry");
-			aida::binary_map::map_options_t opts;
-			opts.max_functions = 24;
-			opts.max_globals = 12;
-			opts.max_callees_per_function = 2;
-			opts.include_imports = false;
-			opts.include_exports = false;
-			opts.include_xrefs = false;
-			if (params.contains("max_functions") && params["max_functions"].is_number_integer())
-				opts.max_functions = params["max_functions"].get<int>();
-			if (params.contains("max_globals") && params["max_globals"].is_number_integer())
-				opts.max_globals = params["max_globals"].get<int>();
-			if (params.contains("include_imports") && params["include_imports"].is_boolean())
-				opts.include_imports = params["include_imports"].get<bool>();
-			if (params.contains("include_exports") && params["include_exports"].is_boolean())
-				opts.include_exports = params["include_exports"].get<bool>();
-			if (params.contains("include_xrefs") && params["include_xrefs"].is_boolean())
-				opts.include_xrefs = params["include_xrefs"].get<bool>();
-			if (params.value("fast_summary", false)) {
-				const uint32_t attached_pid = driver_bridge::attached_pid();
-				diag::log_tagged_fmt("analysis", "analysis_get_binary_map_overview fast_summary_modules_begin pid=%u", attached_pid);
-				auto modules = enumerate_modules_toolhelp(attached_pid);
-				diag::log_tagged_fmt("analysis", "analysis_get_binary_map_overview fast_summary_toolhelp_modules count=%zu pid=%u",
-					modules.size(), attached_pid);
-				if (modules.empty()) {
-					diag::log_tagged("analysis", "analysis_get_binary_map_overview fast_summary_driver_modules_begin");
-					modules = driver_bridge::enumerate_modules();
-					diag::log_tagged_fmt("analysis", "analysis_get_binary_map_overview fast_summary_driver_modules count=%zu", modules.size());
-				}
-				if (modules.empty())
-					return tool_result_t::error("no modules available for binary map summary");
-				std::string process_name = driver_bridge::attached_process_name();
-				std::transform(process_name.begin(), process_name.end(), process_name.begin(),
-					[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-				const driver_bridge::module_info_t* selected = &modules.front();
-				if (!process_name.empty()) {
-					for (const auto& mod : modules) {
-						std::string name = mod.name;
-						std::transform(name.begin(), name.end(), name.begin(),
-							[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-						if (name == process_name) {
-							selected = &mod;
-							break;
-						}
-					}
-				}
-				char buf[32];
-				json sections = json::array();
-				pe_parser::pe_info_t pe;
-				diag::log_tagged_fmt("analysis", "analysis_get_binary_map_overview fast_summary_parse_begin module=%s base=0x%llX size=0x%X",
-					selected->name.c_str(),
-					static_cast<unsigned long long>(selected->base),
-					selected->size);
-				bool parsed = pe_parser::parse(selected->base, pe, false);
-				diag::log_tagged_fmt("analysis", "analysis_get_binary_map_overview fast_summary_parse_done parsed=%d sections=%zu module=%s",
-					parsed ? 1 : 0, pe.sections.size(), selected->name.c_str());
-				if (parsed) {
-					for (const auto& s : pe.sections) {
-						json o;
-						o["name"] = s.name;
-						std::snprintf(buf, sizeof(buf), "0x%llX",
-							static_cast<unsigned long long>(selected->base + s.virtual_address));
-						o["va"] = buf;
-						o["size"] = s.virtual_size;
-						o["executable"] = (s.characteristics & 0x20000000u) != 0;
-						o["readable"] = (s.characteristics & 0x40000000u) != 0;
-						o["writable"] = (s.characteristics & 0x80000000u) != 0;
-						sections.push_back(std::move(o));
-					}
-				}
-				json result;
-				result["module_name"] = selected->name;
-				result["module_path"] = selected->path;
-				result["architecture"] = parsed && pe.is_64bit ? "x64" : "unknown";
-				result["format"] = "PE";
-				std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(selected->base));
-				result["image_base"] = buf;
-				result["image_size"] = parsed && pe.size_of_image != 0 ? pe.size_of_image : selected->size;
-				result["sections"] = std::move(sections);
-				json functions = json::array();
-				if (g_disasm.file.loaded && !g_disasm.file.sections.empty() &&
-					g_disasm.file.image_base != 0) {
-					bool rebuild = false;
-					{
-						auto& c = function_index::detail::cache();
-						std::shared_lock<std::shared_mutex> lk(c.mutex);
-						rebuild = c.sorted_starts.empty() ||
-							c.cached_module_base != g_disasm.file.image_base;
-						diag::log_tagged_fmt("analysis",
-							"binary_map_fast function_cache pre sorted=%zu cached_base=0x%llX file_base=0x%llX rebuild=%d",
-							c.sorted_starts.size(),
-							static_cast<unsigned long long>(c.cached_module_base),
-							static_cast<unsigned long long>(g_disasm.file.image_base),
-							rebuild ? 1 : 0);
-					}
-					if (rebuild)
-						diag::log_tagged("analysis", "binary_map_fast function_cache_rebuild_skipped");
-					auto& c = function_index::detail::cache();
-					std::shared_lock<std::shared_mutex> lk(c.mutex);
-					int emitted = 0;
-					for (uint64_t s : c.sorted_starts) {
-						if (emitted >= opts.max_functions) break;
-						auto it = c.by_start.find(s);
-						json fn;
-						std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(s));
-						fn["va"] = buf;
-						if (it != c.by_start.end()) {
-							fn["name"] = it->second.display_name.empty()
-								? function_index::synthetic_name(s)
-								: it->second.display_name;
-							if (!it->second.section.empty()) fn["section"] = it->second.section;
-							fn["size"] = it->second.end > s ? it->second.end - s : 0;
-						} else {
-							fn["name"] = function_index::synthetic_name(s);
-							fn["size"] = 0;
-						}
-						functions.push_back(std::move(fn));
-						++emitted;
-					}
-					diag::log_tagged_fmt("analysis",
-						"binary_map_fast function_cache post sorted=%zu emitted=%d",
-						c.sorted_starts.size(),
-						emitted);
-				}
-				if (functions.empty() && parsed && pe.entry_point != 0 && opts.max_functions > 0) {
-					const uint64_t image_size = pe.size_of_image != 0 ? pe.size_of_image : selected->size;
-					if (pe.entry_point >= selected->base && image_size != 0 && pe.entry_point < selected->base + image_size) {
-						std::string ep_section;
-						const uint64_t rva = pe.entry_point - selected->base;
-						for (const auto& s : pe.sections) {
-							const uint64_t sec_size = s.virtual_size != 0 ? s.virtual_size : s.raw_size;
-							if (rva >= s.virtual_address && rva < static_cast<uint64_t>(s.virtual_address) + sec_size) {
-								ep_section = s.name;
-								break;
-							}
-						}
-						json fn;
-						std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(pe.entry_point));
-						fn["va"] = buf;
-						fn["name"] = "entry_point";
-						fn["size"] = 1;
-						fn["source"] = "entry_point_fallback";
-						if (!ep_section.empty()) fn["section"] = ep_section;
-						functions.push_back(std::move(fn));
-						diag::log_tagged_fmt("analysis",
-							"binary_map_fast synthesized_entry_point va=0x%llX image_base=0x%llX image_size=0x%llX",
-							static_cast<unsigned long long>(pe.entry_point),
-							static_cast<unsigned long long>(selected->base),
-							static_cast<unsigned long long>(image_size));
-					}
-				}
-				result["functions"] = std::move(functions);
-				result["globals"] = json::array();
-				result["imports"] = json::array();
-				result["exports"] = json::array();
-				result["fast_summary"] = true;
-				return tool_result_t::ok(result);
-			}
-			diag::log_tagged_fmt("analysis", "analysis_get_binary_map_overview generating max_funcs=%d max_globals=%d imports=%d exports=%d xrefs=%d",
-				opts.max_functions, opts.max_globals,
-				opts.include_imports ? 1 : 0,
-				opts.include_exports ? 1 : 0,
-				opts.include_xrefs ? 1 : 0);
-
-			aida::binary_map::map_t m;
-			if (!aida::binary_map::generate(opts, m)) {
-				diag::log_tagged_fmt("analysis", "analysis_get_binary_map_overview failed err=%s",
-					aida::binary_map::last_error().c_str());
-				return tool_result_t::error(aida::binary_map::last_error());
-			}
-
-			char buf[32];
-			json sections = json::array();
-			for (const auto& s : m.sections) {
-				json o;
-				o["name"] = s.name;
-				std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(s.va));
-				o["va"]   = buf;
-				o["size"] = s.size;
-				o["executable"] = s.executable;
-				o["readable"]   = s.readable;
-				o["writable"]   = s.writable;
-				sections.push_back(std::move(o));
-			}
-			json functions = json::array();
-			for (const auto& f : m.functions) {
-				json o;
-				std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(f.va));
-				o["va"]   = buf;
-				o["name"] = f.name;
-				o["xref_count"]   = f.xref_count;
-				o["callee_count"] = f.callee_count;
-				if (!f.section_name.empty()) o["section"] = f.section_name;
-				if (!f.top_callees.empty()) o["top_callees"] = f.top_callees;
-				if (f.pinned) o["pinned"] = true;
-				functions.push_back(std::move(o));
-			}
-			json globals = json::array();
-			for (const auto& g : m.globals) {
-				json o;
-				std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(g.va));
-				o["va"]   = buf;
-				o["name"] = g.name;
-				o["xref_count"] = g.xref_count;
-				o["writable"]   = g.writable;
-				if (!g.section_name.empty()) o["section"] = g.section_name;
-				globals.push_back(std::move(o));
-			}
-
-			json result;
-			result["module_name"]  = m.module_name;
-			result["module_path"]  = m.module_path;
-			result["architecture"] = m.architecture;
-			result["format"]       = m.format;
-			std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(m.image_base));
-			result["image_base"]   = buf;
-			result["image_size"]   = m.image_size;
-			result["sections"]     = std::move(sections);
-			result["functions"]    = std::move(functions);
-			result["globals"]      = std::move(globals);
-			result["imports"]      = m.imports;
-			result["exports"]      = m.exports;
-			diag::log_tagged_fmt("analysis", "analysis_get_binary_map_overview complete module=%s sections=%zu funcs=%zu globals=%zu",
-				m.module_name.c_str(), m.sections.size(), m.functions.size(), m.globals.size());
-			return tool_result_t::ok(result);
-		}
-	});
-
-	srv.register_tool({
-		"analysis_get_xref_db_stats",
-		"Return aggregate statistics from the xref_db (per-module xref counts, indexed flag, total xrefs across all modules).",
-		{},
-		true,
-		[](const json&) -> tool_result_t {
-			diag::log_tagged("analysis", "analysis_get_xref_db_stats entry");
-			std::lock_guard<std::mutex> lk(xref_db::g_state.mutex);
-			json arr = json::array();
-			size_t total = 0;
-			size_t built = 0;
-			for (const auto& kv : xref_db::g_state.modules) {
-				const auto& mod = kv.second;
-				json o;
-				o["module"]      = mod.name;
-				o["base"]        = mod.base;
-				o["size"]        = mod.size;
-				o["total_xrefs"] = mod.total_xrefs;
-				o["built"]       = mod.built;
-				arr.push_back(std::move(o));
-				if (mod.built) {
-					++built;
-					total += mod.total_xrefs;
-				}
-			}
-			json result;
-			result["module_count"] = xref_db::g_state.modules.size();
-			result["modules_built"] = built;
-			result["total_xrefs"]  = total;
-			result["building"]     = xref_db::g_state.building.load();
-			result["progress"]     = xref_db::g_state.progress.load();
-			result["modules"]      = std::move(arr);
-			diag::log_tagged_fmt("analysis", "analysis_get_xref_db_stats complete modules=%zu built=%zu total_xrefs=%zu building=%d",
-				static_cast<size_t>(xref_db::g_state.modules.size()), built, total,
-				xref_db::g_state.building.load() ? 1 : 0);
-			return tool_result_t::ok(result);
-		}
-	});
-
-	srv.register_tool({
-		"crypto_scanner_run",
-		"Trigger a fresh crypto-constant scan over the attached process memory (AES S-Box, SHA, MD5, CRC32, Blowfish, ChaCha20, Base64, etc.). Blocks until the scan worker finishes or the timeout expires.",
-		{
-			{"module_filter", "string", "Optional case-insensitive module name substring to scan", false},
-			{"max_regions", "integer", "Maximum committed readable regions to scan (default 4096)", false},
-			{"max_bytes", "integer", "Maximum bytes to scan before stopping (0 = unlimited)", false},
-			{"max_hits", "integer", "Maximum hits before stopping (0 = unlimited)", false},
-			{"timeout_ms", "integer", "Maximum scan time before cancellation (default 4500, max 60000)", false}
-		},
+		"live_monitor_manage",
+		"Manage live struct monitoring. Actions: start, stop, status.",
+		{{"action", "string", "start|stop|status", true},
+		 {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted.", false},
+		 {"address", "string", "Base address of the struct in hex", false},
+		 {"size", "integer", "Size of the struct in bytes", false},
+		 {"name", "string", "Name for the struct", false},
+		 {"backend", "string", "Backend preference: auto, page_guard, polling, hardware_breakpoint", false},
+		 {"timeout_ms", "integer", "Maximum backend startup wait in milliseconds", false},
+		 {"require_captures", "boolean", "Return an error if no accesses were captured", false}},
 		false,
 		[](const json& params) -> tool_result_t {
-			crypto_scanner::process_scan_config_t cfg;
-			cfg.module_filter = params.value("module_filter", std::string());
-			cfg.max_regions = params.value("max_regions", static_cast<size_t>(4096));
-			cfg.max_bytes = params.value("max_bytes", static_cast<uint64_t>(0));
-			cfg.max_hits = params.value("max_hits", static_cast<size_t>(0));
-			cfg.timeout_ms = bounded_u32_param(params, "timeout_ms", 4500, 100, 60000);
-			cfg.label_references = false;
-			diag::log_tagged_fmt("analysis", "crypto_scanner_run entry module_filter='%s' max_regions=%zu max_bytes=%llu max_hits=%zu timeout_ms=%u",
-				cfg.module_filter.c_str(),
-				cfg.max_regions,
-				static_cast<unsigned long long>(cfg.max_bytes),
-				cfg.max_hits,
-				cfg.timeout_ms);
-			if (crypto_scanner::g_state.scanning.load()) {
-				diag::log_tagged("analysis", "crypto_scanner_run refused already_scanning");
-				return tool_result_t::error("A crypto scan is already in progress.");
-			}
-			crypto_scanner::scan_process(cfg);
-			diag::log_tagged("analysis", "crypto_scanner_run scan_process called waiting");
-			int wait = 0;
-			int max_wait = static_cast<int>((cfg.timeout_ms + 49) / 50);
-			while (crypto_scanner::g_state.scanning.load() && wait < max_wait) {
-				Sleep(50);
-				++wait;
-			}
-			bool timed_out = crypto_scanner::g_state.scanning.load();
-			if (timed_out) {
-				crypto_scanner::cancel();
-				for (int stop_wait = 0; crypto_scanner::g_state.scanning.load() && stop_wait < 10; ++stop_wait)
-					Sleep(50);
-			}
-			std::lock_guard<std::mutex> lk(crypto_scanner::g_state.mutex);
-			json result;
-			bool still_running = crypto_scanner::g_state.scanning.load();
-			result["status"] = still_running ? "still_running" : "complete";
-			result["count"]  = crypto_scanner::g_state.results.size();
-			result["timed_out"] = timed_out;
-			diag::log_tagged_fmt("analysis", "crypto_scanner_run complete status=%s count=%zu timed_out=%d",
-				still_running ? "still_running" : "complete",
-				crypto_scanner::g_state.results.size(),
-				timed_out ? 1 : 0);
-			if (timed_out || still_running)
-				return tool_result_t{false, "Crypto scanner did not complete within the timeout.", result};
-			return tool_result_t::ok(result);
+			const std::string action = compat_action_name(params);
+			const json p = compat_action_payload(params);
+			if (action == "start") return live_monitor_manage_start(p);
+			if (action == "stop") return live_monitor_manage_stop(p);
+			if (action == "status") return live_monitor_snapshot(false);
+			return compat_unknown_action("live_monitor_manage", action);
 		}
 	});
 
 	srv.register_tool({
-		"crypto_scanner_get_results",
-		"Return the cached results of the most recent crypto-constant scan.",
-		{{"limit", "number", "Maximum hits to return (default 500, max 5000)", false}},
+		"symbolic_execution",
+		"Run symbolic analysis actions. Actions: deobfuscate, slice_function, solve_path.",
+		{{"action", "string", "deobfuscate|slice_function|solve_path", true},
+		 {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted.", false},
+		 {"entry_address", "string", "Entry address for deobfuscation", false},
+		 {"start_address", "string", "Start address for slicing or path solving", false},
+		 {"end_address", "string", "End address for slicing", false},
+		 {"target_address", "string", "Target address for path solving", false},
+		 {"target_register", "string", "Target register for slicing", false},
+		 {"symbolic_registers", "string", "Comma-separated symbolic registers", false},
+		 {"max_instructions", "number", "Maximum instructions to process", false}},
 		true,
 		[](const json& params) -> tool_result_t {
-			size_t limit = 500;
-			if (params.contains("limit") && params["limit"].is_number_unsigned()) {
-				size_t v = params["limit"].get<size_t>();
-				if (v > 0 && v <= 5000) limit = v;
-			}
-			diag::log_tagged_fmt("analysis", "crypto_scanner_get_results entry limit=%zu", limit);
-			std::lock_guard<std::mutex> lk(crypto_scanner::g_state.mutex);
-			json arr = json::array();
-			char buf[32];
-			size_t n = std::min(crypto_scanner::g_state.results.size(), limit);
-			for (size_t i = 0; i < n; ++i) {
-				const auto& r = crypto_scanner::g_state.results[i];
-				json o;
-				o["signature"] = r.signature_name;
-				o["algorithm"] = r.algorithm;
-				o["category"]  = crypto_scanner::category_name(r.category);
-				std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(r.address));
-				o["address"]   = buf;
-				o["module"]    = r.module_name;
-				std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(r.module_offset));
-				o["module_offset"]      = buf;
-				o["reference_count"]    = r.referencing_functions.size();
-				arr.push_back(std::move(o));
-			}
-			json result;
-			result["total"]    = crypto_scanner::g_state.results.size();
-			result["returned"] = n;
-			result["results"]  = std::move(arr);
-			diag::log_tagged_fmt("analysis", "crypto_scanner_get_results complete total=%zu returned=%zu",
-				crypto_scanner::g_state.results.size(), n);
-			return tool_result_t::ok(result);
+			const std::string action = compat_action_name(params);
+			const json p = compat_action_payload(params);
+			if (action == "deobfuscate") return symbolic_manage_deobfuscate(p);
+			if (action == "slice_function") return symbolic_manage_slice(p);
+			if (action == "solve_path") return symbolic_manage_solve_path(p);
+			return compat_unknown_action("symbolic_execution", action);
+		}
+	});
+
+	srv.register_tool({
+		"analysis_query",
+		"Query binary analysis metadata. Actions: imports, exports, types, type_definition, pdb_symbols, binary_map_overview, xref_db_stats.",
+		{{"action", "string", "imports|exports|types|type_definition|pdb_symbols|binary_map_overview|xref_db_stats", true},
+		 {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted.", false},
+		 {"module_name", "string", "Optional loaded module name or path suffix", false},
+		 {"name", "string", "Type name for type_definition", false},
+		 {"module", "string", "Optional module filter", false},
+		 {"filter", "string", "Optional substring filter", false},
+		 {"limit", "number", "Maximum rows to return", false},
+		 {"max_entries", "integer", "Maximum import/export rows to return", false},
+		 {"timeout_ms", "integer", "Maximum parse time before returning partial results", false},
+		 {"functions_only", "boolean", "Return only function PDB symbols", false},
+		 {"max_functions", "number", "Maximum binary-map functions", false},
+		 {"max_globals", "number", "Maximum binary-map globals", false},
+		 {"include_imports", "boolean", "Include imports in binary-map overview", false},
+		 {"include_exports", "boolean", "Include exports in binary-map overview", false},
+		 {"include_xrefs", "boolean", "Include xref summaries in binary-map overview", false}},
+		true,
+		[](const json& params) -> tool_result_t {
+			const std::string action = compat_action_name(params);
+			const json p = compat_action_payload(params);
+			if (action == "imports") return analysis_query_imports(p);
+			if (action == "exports") return analysis_query_exports(p);
+			if (action == "types") return analysis_query_types(p);
+			if (action == "type_definition") return analysis_query_type_definition(p);
+			if (action == "pdb_symbols") return analysis_query_pdb_symbols(p);
+			if (action == "binary_map_overview") return analysis_query_binary_map_overview(p);
+			if (action == "xref_db_stats") return analysis_query_xref_db_stats(p);
+			return compat_unknown_action("analysis_query", action);
 		}
 	});
 }

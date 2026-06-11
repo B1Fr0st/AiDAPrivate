@@ -697,15 +697,10 @@ server_t::~server_t() { stop(); }
 static bool is_camoufox_reverse_tool_name(const std::string& name)
 {
     static const char* const names[] = {
-        "launch_browser", "close_browser", "list_pages", "new_page", "select_page", "close_page",
-        "navigate", "reload", "take_screenshot", "take_snapshot",
-        "click", "type_text", "wait_for", "get_page_info", "reset_browser_state", "evaluate_js",
-        "hook_function", "add_init_script", "inject_hook_preset", "remove_hooks", "get_console_logs",
-        "network_capture", "list_network_requests", "get_network_request", "get_request_initiator",
-        "intercept_request", "scripts", "search_code", "cookies", "get_storage", "export_state",
-        "import_state", "hook_jsvmp_interpreter", "compare_env", "instrumentation", "check_environment",
-        "verify_signer_offline", "trace_property_access", "list_trace_files", "query_trace_file",
-        "analyze_cookie_sources"
+        "browser_lifecycle", "browser_navigation", "browser_interaction", "browser_inspect", "browser_state",
+        "browser_network", "browser_hooks", "browser_instrumentation",
+        "get_console_logs", "scripts", "search_code", "compare_env",
+        "verify_signer_offline", "analyze_cookie_sources"
     };
     for (const char* n : names)
     {
@@ -775,7 +770,7 @@ bool server_t::register_tool(tool_def_t tool)
         tool.params.push_back(tool_param_t{
             "binary_id",
             "string",
-            "Optional session id to target (returned by sessions_list). When omitted the active session is used.",
+            "Optional session id to target (returned by `sessions_manage` action=list). When omitted the active session is used.",
             false
         });
     }
@@ -998,13 +993,13 @@ json server_t::handle_initialize(const json& id, const json&)
         "- Attach to or detach from running processes when runtime access is required\n"
         "- Execute untrusted binaries in Windows Sandbox when explicitly requested\n"
         "- Convert integers, endian bytes, ASCII, signed/unsigned views, IEEE-754 values, alignment, VA, RVA, module-relative, and PE file-offset references\n"
-        "- Use bundled Camoufox reverse-engineering browser tools such as launch_browser, navigate, evaluate_js, network_capture, and hook_function\n\n"
+        "- Use bundled Camoufox reverse-engineering browser tools through grouped actions exposed as `browser_lifecycle`, `browser_navigation`, `browser_interaction`, `browser_inspect`, `browser_state`, `browser_network`, `browser_hooks`, and `browser_instrumentation`\n\n"
         "## First-use workflow\n"
         "- Use `get_tool_descriptions` with `names`, `prefix`, or `query` for only the tools you plan to call; do not spam broad discovery calls\n"
-        "- For standalone static binaries, use `sessions_open_file`, then `analysis_get_binary_map_overview` or `disasm_get_section_info`, `disasm_list_functions`, and targeted disassembly/decompilation tools\n"
-        "- For live runtime work, use `sessions_attach_pid` when a session workflow is appropriate, or `driver_status`, `driver_load`, and `driver_attach` for direct driver-backed flows\n"
+        "- For standalone static binaries, use `sessions_manage` action `open_file`, then `analysis_query` action `binary_map_overview` or `disasm_get_section_info`, `disasm_list_functions`, and targeted disassembly/decompilation tools\n"
+        "- For live runtime work, use `sessions_manage` action `attach_pid` for session attachment, then memory/disassembly tools.\n"
         "- When a VM bridge is active, pass `target: \"guest\"` or `target: \"host\"` explicitly whenever host/VM memory matters\n"
-        "- Custom QEMU, VirtualBox, VMware, and Windows Sandbox workflows use the normal AiDA MCP tools such as `list_processes`, `driver_attach`, `read_memory`, `read_string`, `query_memory`, `enumerate_modules`, `enumerate_threads`, and `disassemble_address`\n"
+        "- Custom QEMU, VirtualBox, VMware, and Windows Sandbox workflows use the normal AiDA MCP tools such as `list_processes`, `sessions_manage` action `attach_pid`, `read_memory`, `query_memory`, `dbg_get_modules_detail`, and `disassemble_zydis`\n"
         "- For custom VM workflows, keep AiDAStandalone.exe on the host and run only the sample plus MCP client or guest agent in the VM through an authenticated host bridge or tunnel that terminates at AiDA's localhost MCP endpoint\n"
         "- Cache session IDs, binary IDs, module bases, function bounds, xrefs, scan state, and decompiler output; avoid duplicate calls with identical parameters\n"
         "- Prefer batch or paginated tools over repeated one-off calls; set limits before large scans\n\n"
@@ -1018,12 +1013,11 @@ json server_t::handle_initialize(const json& id, const json&)
         "- Only call mutating tools when the user asked for that action and the target is clear\n"
         "- Runtime, debugger, sandbox, browser interception, and filesystem tools are local trust-boundary tools even though the server binds to localhost\n\n"
         "## Browser/runtime shortcuts\n"
-        "- For browser tasks, call `launch_browser` first when no Camoufox session is running, then call `navigate` with the fully-qualified URL\n"
-        "- Do not call `driver_status` before browser-only work unless the user asks for diagnostics or driver-backed runtime access\n"
-        "- Call `driver_status` first only for kernel driver, live process memory, debugger, or driver-backed disassembly tasks\n"
-        "- Call `driver_load` when kernel backend is not active and deep runtime access is required\n"
-        "- Call `driver_attach` with a PID or process name before memory operations\n"
-        "- Use `disassemble_address` for live memory; `disassemble_file` for PE files\n"
+        "- For browser tasks, call `browser_lifecycle` with `action=launch` first when no Camoufox session is running, then call `browser_navigation` with `action=navigate` and a fully-qualified URL\n"
+        "- Do not call session/driver attach or list helpers before browser-only work unless the user asks for diagnostics or runtime access\n"
+        "- For runtime inspection, open or verify the process target with `sessions_manage` (`action=list` or `action=attach_pid`) and then use `query_memory`, `read_memory`, or `disassemble_zydis` as needed\n"
+        "- Use `list_processes` if you need PID and process context before `sessions_manage` attachment\n"
+        "- Use `disassemble_zydis` for live memory; `disassemble_file` for PE files\n"
         "- Use `sandbox_execute` for running untrusted binaries safely when the user requests execution\n";
 
     json result;
@@ -1291,7 +1285,7 @@ json server_t::handle_prompts_get(const json& id, const json& params)
 
         std::string prompt =
             "Disassemble the code at address " + addr + " in the attached process.\n"
-            "Use the disassemble_address tool, then:\n"
+            "Use the disassemble_zydis tool, then:\n"
             "1. Identify the function's purpose\n"
             "2. Analyze control flow (branches, loops, calls)\n"
             "3. Note any system calls, API calls, or string references\n"

@@ -753,128 +753,9 @@ static tool_result_t handle_get_results(const json& params) {
 	return tool_result_t::ok(results_to_json(limit));
 }
 
-static tool_result_t handle_scan_mem_start(const json& params) {
-	memory_scanner::scan_config_t cfg;
-	std::string value_type = params.value("value_type", "exact");
-	if (value_type == "unknown") {
-		cfg.scan_mode = memory_scanner::scan_mode_t::unknown_initial;
-	} else {
-		cfg.scan_mode = memory_scanner::scan_mode_t::exact;
-	}
-	cfg.value_type = parse_value_type(value_type);
-	if (params.contains("value") && params["value"].is_string())
-		cfg.value_text = params["value"].get<std::string>();
-	if (cfg.scan_mode != memory_scanner::scan_mode_t::unknown_initial && cfg.value_text.empty())
-		return tool_result_t::error(OBFSTR("'value' is required unless value_type is 'unknown'."));
-	if (params.contains("alignment") && params["alignment"].is_number_integer()) {
-		int alignment = params["alignment"].get<int>();
-		if (alignment > 0)
-			cfg.alignment = static_cast<size_t>(alignment);
-	}
-	if (params.contains("region_filter") && params["region_filter"].is_string())
-		apply_region_filter(cfg, params["region_filter"].get<std::string>());
-	if (params.contains("writable_only") && params["writable_only"].is_boolean())
-		cfg.writable_only = params["writable_only"].get<bool>();
-	if (params.contains("executable_exclude") && params["executable_exclude"].is_boolean())
-		cfg.executable_exclude = params["executable_exclude"].get<bool>();
-	if (params.contains("hex") && params["hex"].is_boolean())
-		cfg.hex_input = params["hex"].get<bool>();
-	parse_u64_param(params, "range_base", cfg.range_base);
-	parse_u64_param(params, "range_size", cfg.range_size);
 
-	const int wait_ms = clamp_wait_ms(params, 30000);
-	const uint64_t session_id = next_scan_session_id();
-	if (!memory_scanner::first_scan(cfg))
-		return tool_result_t::error(OBFSTR("Scanner busy or not attached to a process."));
-	g_active_scan_session.store(session_id, std::memory_order_relaxed);
-	const bool completed = wait_for_scan_idle(wait_ms);
-	json result = scan_summary_json(limit_param(params, 100, 10000));
-	result["session_id"] = session_id;
-	result["completed"] = completed;
-	result["wait_ms"] = wait_ms;
-	if (!completed && wait_budget_active(wait_ms)) {
-		diag::log_tagged_fmt("scanner",
-			"mcp scan_mem_start timeout session=%llu total=%zu scan_count=%d scanning=%d wait_ms=%d",
-			static_cast<unsigned long long>(session_id),
-			memory_scanner::g_state.total_found,
-			memory_scanner::g_state.scan_count,
-			memory_scanner::g_state.scanning.load() ? 1 : 0,
-			wait_ms);
-		memory_scanner::reset_scan();
-		g_active_scan_session.store(0, std::memory_order_relaxed);
-		result["scanning"] = false;
-		return tool_result_t{false, OBFSTR("Memory scan did not complete within the wait budget."), result};
-	}
-	return tool_result_t::ok(result);
-}
 
-static tool_result_t handle_scan_mem_next(const json& params) {
-	if (g_active_scan_session.load(std::memory_order_relaxed) == 0)
-		return tool_result_t::error(OBFSTR("No active scan session. Call scan_mem_start first."));
-	std::string compare_type = params.value("compare_type", "exact");
-	auto mode = parse_scan_mode(compare_type);
-	std::string value;
-	if (params.contains("value") && params["value"].is_string())
-		value = params["value"].get<std::string>();
-	if ((mode == memory_scanner::scan_mode_t::exact ||
-		 mode == memory_scanner::scan_mode_t::bigger_than ||
-		 mode == memory_scanner::scan_mode_t::smaller_than ||
-		 mode == memory_scanner::scan_mode_t::value_between) && value.empty())
-		return tool_result_t::error(OBFSTR("'value' is required for this compare_type."));
-	if (!memory_scanner::next_scan(mode, value))
-		return tool_result_t::error(OBFSTR("Scanner busy or no initial scan performed."));
-	const int wait_ms = clamp_wait_ms(params, 30000);
-	const bool completed = wait_for_scan_idle(wait_ms);
-	json result = scan_summary_json(limit_param(params, 100, 10000));
-	result["completed"] = completed;
-	result["compare_type"] = compare_type;
-	result["wait_ms"] = wait_ms;
-	if (!completed && wait_budget_active(wait_ms)) {
-		diag::log_tagged_fmt("scanner",
-			"mcp scan_mem_next timeout session=%llu total=%zu scan_count=%d scanning=%d wait_ms=%d",
-			static_cast<unsigned long long>(g_active_scan_session.load(std::memory_order_relaxed)),
-			memory_scanner::g_state.total_found,
-			memory_scanner::g_state.scan_count,
-			memory_scanner::g_state.scanning.load() ? 1 : 0,
-			wait_ms);
-		memory_scanner::reset_scan();
-		g_active_scan_session.store(0, std::memory_order_relaxed);
-		result["scanning"] = false;
-		return tool_result_t{false, OBFSTR("Next memory scan did not complete within the wait budget."), result};
-	}
-	return tool_result_t::ok(result);
-}
 
-static tool_result_t handle_scan_mem_results(const json& params) {
-	const size_t limit = limit_param(params, 100, 10000);
-	const int wait_ms = clamp_wait_ms(params, params.value("wait", false) ? 30000 : 0);
-	if (params.value("wait", false) || wait_ms > 0) {
-		const bool completed = wait_for_scan_idle(wait_ms);
-		if (!completed && wait_budget_active(wait_ms)) {
-			json result = scan_summary_json(limit);
-			result["completed"] = false;
-			result["wait_ms"] = wait_ms;
-			diag::log_tagged_fmt("scanner",
-				"mcp scan_mem_results timeout session=%llu total=%zu scan_count=%d scanning=%d wait_ms=%d",
-				static_cast<unsigned long long>(g_active_scan_session.load(std::memory_order_relaxed)),
-				memory_scanner::g_state.total_found,
-				memory_scanner::g_state.scan_count,
-				memory_scanner::g_state.scanning.load() ? 1 : 0,
-				wait_ms);
-			return tool_result_t{false, OBFSTR("Memory scan did not complete within the wait budget."), result};
-		}
-	}
-	return tool_result_t::ok(scan_summary_json(limit));
-}
-
-static tool_result_t handle_scan_mem_reset(const json&) {
-	memory_scanner::reset_scan();
-	g_active_scan_session.store(0, std::memory_order_relaxed);
-	json result;
-	result["reset"] = true;
-	result["session_id"] = nullptr;
-	return tool_result_t::ok(result);
-}
 
 static tool_result_t handle_reset_scan(const json&) {
 	memory_scanner::reset_scan();
@@ -936,34 +817,6 @@ static tool_result_t handle_freeze_address(const json& params) {
 		enable = params["enable"].get<bool>();
 	memory_scanner::freeze_address(idx, enable);
 	return tool_result_t::ok(enable ? OBFSTR("Address frozen.") : OBFSTR("Address unfrozen."));
-}
-
-static tool_result_t handle_read_value(const json& params) {
-	if (!params.contains("address"))
-		return tool_result_t::error(OBFSTR("Missing 'address' parameter."));
-
-	uint64_t addr = 0;
-	auto& v = params["address"];
-	if (v.is_string()) {
-		auto parsed = sa_parse_address(v.get<std::string>());
-		if (!parsed) return tool_result_t::error(OBFSTR("Invalid address format."));
-		addr = *parsed;
-	} else if (v.is_number()) {
-		addr = v.get<uint64_t>();
-	}
-
-	auto vtype = memory_scanner::value_type_t::int32_val;
-	if (params.contains("value_type"))
-		vtype = parse_value_type(params["value_type"].get<std::string>());
-
-	std::string result = memory_scanner::read_value_string(addr, vtype);
-	json obj;
-	char abuf[20];
-	snprintf(abuf, sizeof(abuf), "0x%" PRIX64, addr);
-	obj["address"] = abuf;
-	obj["type"] = memory_scanner::value_type_name(vtype);
-	obj["value"] = result;
-	return tool_result_t::ok(obj.dump(2));
 }
 
 static tool_result_t handle_get_address_list(const json&) {
@@ -1091,67 +944,7 @@ static tool_result_t handle_pointer_scan(const json& params) {
 	return tool_result_t::ok(result);
 }
 
-static tool_result_t handle_pointer_scan_start(const json& params) {
-	if (!params.contains("target_address") || !params["target_address"].is_string())
-		return tool_result_t::error(OBFSTR("'target_address' is required."));
-	auto target = sa_parse_address(params["target_address"].get<std::string>());
-	if (!target)
-		return tool_result_t::error(OBFSTR("Invalid target_address."));
-	if (memory_scanner::g_state.pointer_scanning.load())
-		return tool_result_t::error(OBFSTR("Pointer scan already running."));
-	int max_depth = params.value("max_depth", 4);
-	int max_offset = params.value("max_offset", 0x1000);
-	if (max_depth < 1) max_depth = 1;
-	if (max_depth > 7) max_depth = 7;
-	if (max_offset < 0x10) max_offset = 0x10;
-	if (max_offset > 0x100000) max_offset = 0x100000;
-	uint64_t scan_base = 0;
-	uint64_t scan_size = 0;
-	parse_u64_param(params, "range_base", scan_base);
-	parse_u64_param(params, "range_size", scan_size);
-	const uint64_t session_id = next_pointer_session_id();
-	g_active_pointer_session.store(session_id, std::memory_order_relaxed);
-	const bool started = memory_scanner::start_pointer_scan(*target, max_depth, max_offset, scan_base, scan_size);
-	if (!started) {
-		g_active_pointer_session.store(0, std::memory_order_relaxed);
-		return tool_result_t::error(OBFSTR("Pointer scan did not start. Ensure the driver is loaded and a process is attached."));
-	}
-	json result;
-	result["session_id"] = session_id;
-	result["target_address"] = sa_format_address(*target);
-	result["max_depth"] = max_depth;
-	result["max_offset"] = max_offset;
-	result["range_base"] = sa_format_address(scan_base);
-	result["range_size"] = scan_size;
-	result["scanning"] = memory_scanner::g_state.pointer_scanning.load();
-	result["completed"] = !memory_scanner::g_state.pointer_scanning.load();
-	{
-		std::lock_guard<std::mutex> lk(memory_scanner::g_state.pointer_mutex);
-		result["current_total"] = memory_scanner::g_state.pointer_results.size();
-	}
-	return tool_result_t::ok(result);
-}
 
-static tool_result_t handle_pointer_scan_results(const json& params) {
-	const size_t limit = limit_param(params, 100, 10000);
-	const int wait_ms = clamp_wait_ms(params, 30000);
-	if (params.value("wait", false)) {
-		const bool completed = wait_for_pointer_idle(wait_ms);
-		if (!completed && wait_budget_active(wait_ms)) {
-			json result = pointer_results_json(limit);
-			result["wait_ms"] = wait_ms;
-			diag::log_tagged_fmt("scanner",
-				"mcp pointer_scan_results timeout session=%llu total=%zu scanning=%d wait_ms=%d",
-				static_cast<unsigned long long>(g_active_pointer_session.load(std::memory_order_relaxed)),
-				memory_scanner::g_state.pointer_results.size(),
-				memory_scanner::g_state.pointer_scanning.load() ? 1 : 0,
-				wait_ms);
-			memory_scanner::cancel_pointer_scan();
-			return tool_result_t{false, OBFSTR("Pointer scan did not complete within the wait budget."), result};
-		}
-	}
-	return tool_result_t::ok(pointer_results_json(limit));
-}
 
 static tool_result_t handle_find_what_accesses(const json& params) {
 	if (!params.contains("address") || !params["address"].is_string())
@@ -1697,52 +1490,6 @@ static tool_result_t handle_write_value(const json& params) {
 
 void register_scanner_tools(mcp_standalone::server_t& srv) {
 
-	register_compat(srv, {OBFSTR("scan_mem_start"), OBFSTR("memory_scanner"),
-		OBFSTR("Start a Cheat Engine-style stateful memory scan over the attached process. Use value_type exact, unknown, float, double, string, aob, byte, int16, int32, or int64. Returns a scan session id and initial matches."),
-		{{OBFSTR("value_type"), OBFSTR("string"), OBFSTR("Scan type: exact, unknown, float, double, string, aob, byte, int16, int32, int64"), true},
-		 {OBFSTR("value"), OBFSTR("string"), OBFSTR("Value to scan for; omit only for value_type=unknown"), false},
-		 {OBFSTR("alignment"), OBFSTR("number"), OBFSTR("Scan alignment in bytes"), false},
-		 {OBFSTR("region_filter"), OBFSTR("string"), OBFSTR("Region filter: writable, all, non_executable, executable"), false},
-		 {OBFSTR("range_base"), OBFSTR("string"), OBFSTR("Optional scan range base address"), false},
-		 {OBFSTR("range_size"), OBFSTR("number"), OBFSTR("Optional scan range size in bytes"), false},
-		 {OBFSTR("hex"), OBFSTR("boolean"), OBFSTR("Interpret numeric value as hexadecimal"), false},
-		 {OBFSTR("wait_ms"), OBFSTR("number"), OBFSTR("Maximum wait for initial scan completion, default 30000"), false},
-		 {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum results to return, default 100"), false}},
-		handle_scan_mem_start, false});
-
-	register_compat(srv, {OBFSTR("scan_mem_next"), OBFSTR("memory_scanner"),
-		OBFSTR("Refine the active stateful memory scan after the target value changes. compare_type supports increased, decreased, unchanged, changed, exact, bigger, smaller, and between."),
-		{{OBFSTR("compare_type"), OBFSTR("string"), OBFSTR("Comparison: increased, decreased, unchanged, changed, exact, bigger, smaller, between"), true},
-		 {OBFSTR("value"), OBFSTR("string"), OBFSTR("Value for exact/bigger/smaller/between comparisons"), false},
-		 {OBFSTR("wait_ms"), OBFSTR("number"), OBFSTR("Maximum wait for refinement completion, default 30000"), false},
-		 {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum results to return, default 100"), false}},
-		handle_scan_mem_next, false});
-
-	register_compat(srv, {OBFSTR("scan_mem_results"), OBFSTR("memory_scanner"),
-		OBFSTR("Return current stateful memory scan matches with addresses, current values, previous values, and module offsets."),
-		{{OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum results to return, default 100"), false}},
-		handle_scan_mem_results, true});
-
-	register_compat(srv, {OBFSTR("scan_mem_reset"), OBFSTR("memory_scanner"),
-		OBFSTR("Clear the active stateful memory scan session and free scan result memory."),
-		{}, handle_scan_mem_reset, false});
-
-	register_compat(srv, {OBFSTR("pointer_scan_start"), OBFSTR("memory_scanner"),
-		OBFSTR("Start a background pointer scan for static module pointer paths to a dynamic address. Use pointer_scan_results to poll discovered paths."),
-		{{OBFSTR("target_address"), OBFSTR("string"), OBFSTR("Dynamic address to resolve to stable pointer paths"), true},
-		 {OBFSTR("max_depth"), OBFSTR("number"), OBFSTR("Maximum pointer chain depth, 1-7, default 4"), false},
-		 {OBFSTR("max_offset"), OBFSTR("number"), OBFSTR("Maximum pointer offset, default 0x1000"), false},
-		 {OBFSTR("range_base"), OBFSTR("string"), OBFSTR("Optional pointer-slot scan range base address"), false},
-		 {OBFSTR("range_size"), OBFSTR("number"), OBFSTR("Optional pointer-slot scan range size in bytes"), false}},
-		handle_pointer_scan_start, false});
-
-	register_compat(srv, {OBFSTR("pointer_scan_results"), OBFSTR("memory_scanner"),
-		OBFSTR("Return current pointer scan paths such as module+offset followed by pointer offsets. Can optionally wait for scan completion."),
-		{{OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum pointer paths to return, default 100"), false},
-		 {OBFSTR("wait"), OBFSTR("boolean"), OBFSTR("Wait for pointer scan completion before returning"), false},
-		 {OBFSTR("wait_ms"), OBFSTR("number"), OBFSTR("Maximum wait when wait=true, default 30000"), false}},
-		handle_pointer_scan_results, true});
-
 	register_compat(srv, {OBFSTR("find_what_accesses"), OBFSTR("memory_scanner"),
 		OBFSTR("Monitor reads, writes, or executes touching an address range using the page-guard backend. Returns access RIP, fault address, captured exception-context registers, and payload preview."),
 		{{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address to monitor"), true},
@@ -1797,37 +1544,23 @@ void register_scanner_tools(mcp_standalone::server_t& srv) {
 		{{OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum results to return (default 100)"), false}},
 		handle_get_results, true});
 
-	register_compat(srv, {OBFSTR("scanner_reset"), OBFSTR("memory_scanner"),
-		OBFSTR("Reset the scanner, clearing all results and scan history."),
-		{}, handle_reset_scan, false});
-
 	register_compat(srv, {OBFSTR("scanner_undo"), OBFSTR("memory_scanner"),
 		OBFSTR("Undo the last scan refinement, restoring previous results."),
 		{}, handle_undo_scan, false});
 
-	register_compat(srv, {OBFSTR("scanner_add_address"), OBFSTR("memory_scanner"),
-		OBFSTR("Add an address to the watch/address list for monitoring."),
-		{{OBFSTR("address"), OBFSTR("string"), OBFSTR("Memory address (hex)"), true},
-		 {OBFSTR("description"), OBFSTR("string"), OBFSTR("Description label"), false},
-		 {OBFSTR("value_type"), OBFSTR("string"), OBFSTR("Type: byte/int16/int32/int64/float/double/ascii/utf16"), false}},
-		handle_add_address, false});
-
-	register_compat(srv, {OBFSTR("scanner_remove_address"), OBFSTR("memory_scanner"),
-		OBFSTR("Remove an address from the watch list by index."),
-		{{OBFSTR("index"), OBFSTR("number"), OBFSTR("Index in the address list"), true}},
-		handle_remove_address, false});
-
-	register_compat(srv, {OBFSTR("scanner_freeze_address"), OBFSTR("memory_scanner"),
-		OBFSTR("Freeze or unfreeze an address to keep its value constant."),
-		{{OBFSTR("index"), OBFSTR("number"), OBFSTR("Index in the address list"), true},
-		 {OBFSTR("enable"), OBFSTR("boolean"), OBFSTR("True to freeze, false to unfreeze"), false}},
-		handle_freeze_address, false});
-
-	register_compat(srv, {OBFSTR("scanner_read_value"), OBFSTR("memory_scanner"),
-		OBFSTR("Read the current value at a memory address."),
-		{{OBFSTR("address"), OBFSTR("string"), OBFSTR("Memory address (hex)"), true},
-		 {OBFSTR("value_type"), OBFSTR("string"), OBFSTR("Type: byte/int16/int32/int64/float/double/ascii/utf16"), false}},
-		handle_read_value, true});
+	register_compat(srv, {OBFSTR("scanner_address_list_manage"), OBFSTR("memory_scanner"),
+		OBFSTR("Manage the scanner address watch list. Actions: add, remove, freeze, list."),
+		{{OBFSTR("action"), OBFSTR("string"), OBFSTR("add|remove|freeze|list"), true},
+		 {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
+		[](const json& params) -> tool_result_t {
+			const std::string action = compat_action_name(params);
+			const json p = compat_action_payload(params);
+			if (action == "add") return handle_add_address(p);
+			if (action == "remove") return handle_remove_address(p);
+			if (action == "freeze") return handle_freeze_address(p);
+			if (action == "list") return handle_get_address_list(p);
+			return compat_unknown_action("scanner_address_list_manage", action);
+		}, false});
 
 	register_compat(srv, {OBFSTR("scanner_write_value"), OBFSTR("memory_scanner"),
 		OBFSTR("Write a value to a memory address in the attached process."),
@@ -1836,10 +1569,6 @@ void register_scanner_tools(mcp_standalone::server_t& srv) {
 		 {OBFSTR("value_type"), OBFSTR("string"), OBFSTR("Type: byte/int16/int32/int64/float/double"), false},
 		 {OBFSTR("hex"), OBFSTR("boolean"), OBFSTR("Interpret value as hex"), false}},
 		handle_write_value, false});
-
-	register_compat(srv, {OBFSTR("scanner_get_address_list"), OBFSTR("memory_scanner"),
-		OBFSTR("Get all entries in the address watch list with current values."),
-		{}, handle_get_address_list, true});
 
 	register_compat(srv, {OBFSTR("scanner_pointer_scan"), OBFSTR("memory_scanner"),
 		OBFSTR("Perform a pointer scan to find pointer chains that lead to the target address. Useful for finding stable pointers. Operates on the currently active binary_id session; pass binary_id explicitly in multi-target sessions."),
@@ -1860,11 +1589,7 @@ void register_scanner_tools(mcp_standalone::server_t& srv) {
 			return tool_result_t::ok(OBFSTR("Pointer scan cancelled."));
 		}, false});
 
-	register_compat(srv, {OBFSTR("scanner_define_struct"), OBFSTR("memory_scanner"),
-		OBFSTR("Define a new structure for memory analysis at a base address."),
-		{{OBFSTR("name"), OBFSTR("string"), OBFSTR("Structure name"), true},
-		 {OBFSTR("base_address"), OBFSTR("string"), OBFSTR("Base address for live reading (hex)"), true}},
-		[](const json& params) -> tool_result_t {
+	auto scanner_define_struct = [](const json& params) -> tool_result_t {
 			if (!params.contains("name") || !params["name"].is_string())
 				return tool_result_t::error(OBFSTR("'name' is required."));
 			if (!params.contains("base_address") || !params["base_address"].is_string())
@@ -1885,15 +1610,9 @@ void register_scanner_tools(mcp_standalone::server_t& srv) {
 			result["base_address"] = sa_format_address(*addr);
 			return tool_result_t::ok(
 				OBFSTR("Structure '") + params["name"].get<std::string>() + OBFSTR("' created at index ") + std::to_string(idx), result);
-		}, false});
+		};
 
-	register_compat(srv, {OBFSTR("scanner_add_struct_field"), OBFSTR("memory_scanner"),
-		OBFSTR("Add a field to a structure definition."),
-		{{OBFSTR("struct_index"), OBFSTR("number"), OBFSTR("Index of the structure to modify"), true},
-		 {OBFSTR("name"), OBFSTR("string"), OBFSTR("Field name"), true},
-		 {OBFSTR("offset"), OBFSTR("number"), OBFSTR("Offset from struct base in bytes"), true},
-		 {OBFSTR("field_type"), OBFSTR("string"), OBFSTR("Type: int8/uint8/int16/uint16/int32/uint32/int64/uint64/float32/float64/pointer/ascii_string/utf16_string/byte_array/padding"), true}},
-		[](const json& params) -> tool_result_t {
+	auto scanner_add_struct_field = [](const json& params) -> tool_result_t {
 			if (!params.contains("struct_index") || !params["struct_index"].is_number())
 				return tool_result_t::error(OBFSTR("'struct_index' is required."));
 			if (!params.contains("name") || !params["name"].is_string())
@@ -1935,12 +1654,9 @@ void register_scanner_tools(mcp_standalone::server_t& srv) {
 			result["type"] = type_str;
 			return tool_result_t::ok(
 				OBFSTR("Field '") + fld.name + OBFSTR("' added at offset ") + std::to_string(fld.offset), result);
-		}, false});
+		};
 
-	register_compat(srv, {OBFSTR("scanner_get_struct"), OBFSTR("memory_scanner"),
-		OBFSTR("Get a structure definition with live values read from memory."),
-		{{OBFSTR("struct_index"), OBFSTR("number"), OBFSTR("Index of the structure"), true}},
-		[](const json& params) -> tool_result_t {
+	auto scanner_get_struct = [](const json& params) -> tool_result_t {
 			if (!params.contains("struct_index") || !params["struct_index"].is_number())
 				return tool_result_t::error(OBFSTR("'struct_index' is required."));
 			int si = params["struct_index"].get<int>();
@@ -1974,12 +1690,9 @@ void register_scanner_tools(mcp_standalone::server_t& srv) {
 			result["fields"] = std::move(fields_arr);
 			return tool_result_t::ok(
 				OBFSTR("Struct '") + sd.name + OBFSTR("': ") + std::to_string(sd.fields.size()) + OBFSTR(" field(s)."), result);
-		}, true});
+		};
 
-	register_compat(srv, {OBFSTR("scanner_export_struct_c"), OBFSTR("memory_scanner"),
-		OBFSTR("Export a structure definition as C source code."),
-		{{OBFSTR("struct_index"), OBFSTR("number"), OBFSTR("Index of the structure to export"), true}},
-		[](const json& params) -> tool_result_t {
+	auto scanner_export_struct_c = [](const json& params) -> tool_result_t {
 			if (!params.contains("struct_index") || !params["struct_index"].is_number())
 				return tool_result_t::error(OBFSTR("'struct_index' is required."));
 			int si = params["struct_index"].get<int>();
@@ -1989,7 +1702,21 @@ void register_scanner_tools(mcp_standalone::server_t& srv) {
 			json result;
 			result["c_code"] = code;
 			return tool_result_t::ok(code, result);
-		}, true});
+		};
+
+	register_compat(srv, {OBFSTR("scanner_struct_manage"), OBFSTR("memory_scanner"),
+		OBFSTR("Manage scanner structure definitions. Actions: define, add_field, get, export_c."),
+		{{OBFSTR("action"), OBFSTR("string"), OBFSTR("define|add_field|get|export_c"), true},
+		 {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
+		[scanner_define_struct, scanner_add_struct_field, scanner_get_struct, scanner_export_struct_c](const json& params) -> tool_result_t {
+			const std::string action = compat_action_name(params);
+			const json p = compat_action_payload(params);
+			if (action == "define") return scanner_define_struct(p);
+			if (action == "add_field") return scanner_add_struct_field(p);
+			if (action == "get") return scanner_get_struct(p);
+			if (action == "export_c") return scanner_export_struct_c(p);
+			return compat_unknown_action("scanner_struct_manage", action);
+		}, false});
 
 }
 

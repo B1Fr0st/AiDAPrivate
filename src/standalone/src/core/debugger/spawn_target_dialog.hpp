@@ -499,7 +499,7 @@ inline void render() {
 			ImGui::BulletText("For QEMU, VirtualBox, or VMware, keep AiDAStandalone.exe on the host. Do not copy AiDAStandalone.exe into the guest VM.");
 			ImGui::BulletText("Run only the target sample and your MCP client or guest agent in the guest VM. Route that client through an authenticated host bridge or tunnel that terminates at AiDA's localhost MCP endpoint.");
 			ImGui::BulletText("Do not bind AiDA's MCP endpoint directly to a guest, LAN, or untrusted adapter. MCP tools can mutate host files, sessions, debugger state, and process memory.");
-			ImGui::BulletText("Custom VM workflows use the normal AiDA MCP tools with explicit target selection, including list_processes, driver_attach, read_memory, query_memory, enumerate_modules, enumerate_threads, and disassemble_address.");
+			ImGui::BulletText("Custom VM workflows use the normal AiDA MCP tools with explicit target selection, including list_processes, sessions_manage action=attach_pid, read_memory, query_memory, dbg_get_modules_detail, and disassemble_zydis.");
 			ImGui::BulletText("Download for full VM fallback: VMware Workstation Pro or Oracle VirtualBox, then a Windows evaluation ISO.");
 			ImGui::BulletText("BIOS/UEFI: enable Intel VT-x or AMD-V/SVM, then boot back into Windows.");
 			ImGui::BulletText("Admin PowerShell: Enable-WindowsOptionalFeature -Online -FeatureName Containers-DisposableClientVM -All");

@@ -345,81 +345,36 @@ void register_target_tools(mcp_standalone::server_t& srv)
         sitemap_send_to, false});
 
     register_compat(srv, {
-        "burp_scope_add", "burp",
-        "Add a scope rule. Body is the rule object with kind ('include'|'exclude'), protocol, host_pattern (literal/regex/suffix), port (0=any), path_prefix, enabled.",
-        {
-            {"kind",         "string", "'include' or 'exclude'",      false},
-            {"protocol",     "string", "https/http/*",                false},
-            {"host_pattern", "string", ".example.com or regex",       true},
-            {"port",         "number", "0=any",                       false},
-            {"path_prefix",  "string", "/api/",                       false},
-            {"enabled",      "boolean","Initial enabled state",       false}
+        "burp_scope_manage", "burp",
+        "Manage Burp scope rules. Actions: add, remove, list, check.",
+        {{"action", "string", "add|remove|list|check", true},
+         {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted.", false}},
+        [](const json& params) -> tool_result_t {
+            const std::string action = compat_action_name(params);
+            const json p = compat_action_payload(params);
+            if (action == "add") return scope_add(p);
+            if (action == "remove") return scope_remove(p);
+            if (action == "list") return scope_list(p);
+            if (action == "check") return scope_check(p);
+            return compat_unknown_action("burp_scope_manage", action);
         },
-        scope_add, false});
+        false});
 
     register_compat(srv, {
-        "burp_scope_remove", "burp",
-        "Remove a scope rule by numeric id.",
-        {
-            {"rule_id", "number", "Rule id returned by burp_scope_add or burp_scope_list", true}
+        "burp_cookie_manage", "burp",
+        "Manage the Burp cookie jar. Actions: list, set, delete, export_netscape.",
+        {{"action", "string", "list|set|delete|export_netscape", true},
+         {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted.", false}},
+        [](const json& params) -> tool_result_t {
+            const std::string action = compat_action_name(params);
+            const json p = compat_action_payload(params);
+            if (action == "list") return cookie_list(p);
+            if (action == "set") return cookie_set(p);
+            if (action == "delete") return cookie_delete(p);
+            if (action == "export_netscape") return cookie_export_netscape(p);
+            return compat_unknown_action("burp_cookie_manage", action);
         },
-        scope_remove, false});
-
-    register_compat(srv, {
-        "burp_scope_list", "burp",
-        "List all configured scope rules.",
-        {},
-        scope_list, true});
-
-    register_compat(srv, {
-        "burp_scope_check", "burp",
-        "Test whether a URL is currently in scope.",
-        {
-            {"url", "string", "Absolute URL to test, e.g. https://example.com/api/v1", true}
-        },
-        scope_check, true});
-
-    register_compat(srv, {
-        "burp_cookie_list", "burp",
-        "List cookies in the cookie jar. If 'host' is omitted, lists all cookies across all hosts.",
-        {
-            {"host", "string", "Filter to one host (optional)", false}
-        },
-        cookie_list, true});
-
-    register_compat(srv, {
-        "burp_cookie_set", "burp",
-        "Set or update a cookie in the jar.",
-        {
-            {"host",            "string", "Host this cookie belongs to",                       true},
-            {"name",            "string", "Cookie name",                                       true},
-            {"value",           "string", "Cookie value",                                      false},
-            {"domain",          "string", "Domain attribute (default = host)",                 false},
-            {"path",            "string", "Path attribute (default /)",                        false},
-            {"secure",          "boolean","Secure flag",                                       false},
-            {"http_only",       "boolean","HttpOnly flag",                                     false},
-            {"same_site",       "string", "Lax|Strict|None|Unset",                             false},
-            {"expires_unix_ms", "number", "Unix epoch milliseconds (omit for session cookie)", false}
-        },
-        cookie_set, false});
-
-    register_compat(srv, {
-        "burp_cookie_delete", "burp",
-        "Delete a cookie by host and name (and optionally path).",
-        {
-            {"host", "string", "Host",       true},
-            {"name", "string", "Cookie name",true},
-            {"path", "string", "Match path", false}
-        },
-        cookie_delete, false});
-
-    register_compat(srv, {
-        "burp_cookie_export_netscape", "burp",
-        "Export the cookie jar as a Netscape-format cookies.txt file (curl-compatible).",
-        {
-            {"file_path", "string", "Absolute path to the output cookies.txt file", true}
-        },
-        cookie_export_netscape, false});
+        false});
 
     diag::log_tagged("burp", "target_mcp_tools_registered");
 }
