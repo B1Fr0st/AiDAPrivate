@@ -1990,6 +1990,7 @@ namespace self_analysis
         auto* query = reinterpret_cast<NtQuerySystemInformation_t>(
             GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation"));
         handle_report_t out{};
+        const ULONGLONG scan_start_ms = GetTickCount64();
         if (!query)
             return out;
         ULONG buf_size = 1u << 20;
@@ -2032,6 +2033,9 @@ namespace self_analysis
             DWORD fileless_parent_pid = detail::fileless_bootstrap_context_active() ?
                 detail::current_parent_pid() : 0;
             PVOID self_process_object = nullptr;
+            ULONG_PTR interesting_count = 0;
+            ULONG_PTR self_object_match_count = 0;
+            ULONG_PTR duplicate_probe_count = 0;
             HANDLE self_process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, my_pid);
             if (self_process)
             {
@@ -2059,13 +2063,23 @@ namespace self_analysis
                     PROCESS_CREATE_THREAD | PROCESS_DUP_HANDLE;
                 if ((h.GrantedAccess & interesting_access) == 0)
                     continue;
+                ++interesting_count;
                 bool targets_self = self_process_object != nullptr && h.Object == self_process_object;
-                if (!targets_self)
+                if (targets_self)
+                {
+                    ++self_object_match_count;
+                }
+                else if (self_process_object != nullptr)
+                {
+                    continue;
+                }
+                else
                 {
                     HANDLE source = OpenProcess(PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, owner_pid);
                     if (!source)
                         continue;
                     HANDLE dup_handle = nullptr;
+                    ++duplicate_probe_count;
                     BOOL duplicated = DuplicateHandle(
                         source,
                         reinterpret_cast<HANDLE>(h.HandleValue),
@@ -2257,6 +2271,25 @@ namespace self_analysis
                 if (out.vm_write || out.vm_operation || out.create_thread)
                     break;
             }
+            diag::log_tagged_critical_fmt("guard",
+                "ai_tool_posture_handle_scan_done handles=%llu interesting=%llu self_object=%d self_matches=%llu duplicate_probes=%llu observed=%u trusted_ignored=%u fileless_parent_ignored=%u elapsed_ms=%llu",
+                static_cast<unsigned long long>(info->NumberOfHandles),
+                static_cast<unsigned long long>(interesting_count),
+                self_process_object ? 1 : 0,
+                static_cast<unsigned long long>(self_object_match_count),
+                static_cast<unsigned long long>(duplicate_probe_count),
+                out.observed_handle_count,
+                out.trusted_system_ignored_count,
+                out.fileless_bootstrap_parent_ignored_count,
+                static_cast<unsigned long long>(GetTickCount64() - scan_start_ms));
+        }
+        else
+        {
+            diag::log_tagged_critical_fmt("guard",
+                "ai_tool_posture_handle_scan_query_failed status=0x%08lX buf_size=%lu elapsed_ms=%llu",
+                static_cast<unsigned long>(st),
+                static_cast<unsigned long>(buf_size),
+                static_cast<unsigned long long>(GetTickCount64() - scan_start_ms));
         }
         std::free(buf);
         return out;
@@ -2363,18 +2396,52 @@ namespace combined
 
     inline threat_report_t full_scan()
     {
+        const ULONGLONG scan_start_ms = GetTickCount64();
         threat_report_t report{};
+        diag::log_tagged_critical("guard", "ai_tool_posture_full_scan_collect_processes_pre");
         auto processes = detail::collect_processes();
+        diag::log_tagged_critical_fmt("guard",
+            "ai_tool_posture_full_scan_collect_processes_post count=%zu elapsed_ms=%llu",
+            processes.size(),
+            static_cast<unsigned long long>(GetTickCount64() - scan_start_ms));
+        const ULONGLONG classify_start_ms = GetTickCount64();
+        diag::log_tagged_critical("guard", "ai_tool_posture_full_scan_classify_pre");
         auto process_evidence = detail::classify_processes(processes);
+        diag::log_tagged_critical_fmt("guard",
+            "ai_tool_posture_full_scan_classify_post evidence_count=%u elapsed_ms=%llu total_elapsed_ms=%llu",
+            process_evidence.evidence_count,
+            static_cast<unsigned long long>(GetTickCount64() - classify_start_ms),
+            static_cast<unsigned long long>(GetTickCount64() - scan_start_ms));
         uint64_t pipe_hash = 0;
+        const ULONGLONG pipe_start_ms = GetTickCount64();
+        diag::log_tagged_critical("guard", "ai_tool_posture_full_scan_pipes_pre");
         report.mcp_pipe_detected = mcp_detect::scan_named_pipes(&pipe_hash);
+        diag::log_tagged_critical_fmt("guard",
+            "ai_tool_posture_full_scan_pipes_post detected=%d elapsed_ms=%llu total_elapsed_ms=%llu",
+            report.mcp_pipe_detected ? 1 : 0,
+            static_cast<unsigned long long>(GetTickCount64() - pipe_start_ms),
+            static_cast<unsigned long long>(GetTickCount64() - scan_start_ms));
         report.mcp_process_detected = process_evidence.mcp_process;
         report.mcp_command_server_detected = process_evidence.mcp_command_server;
+        const ULONGLONG ports_start_ms = GetTickCount64();
+        diag::log_tagged_critical("guard", "ai_tool_posture_full_scan_ports_pre");
         auto port_report = detail::scan_mcp_ports(&processes);
+        diag::log_tagged_critical_fmt("guard",
+            "ai_tool_posture_full_scan_ports_post active=%d elapsed_ms=%llu total_elapsed_ms=%llu",
+            port_report.active ? 1 : 0,
+            static_cast<unsigned long long>(GetTickCount64() - ports_start_ms),
+            static_cast<unsigned long long>(GetTickCount64() - scan_start_ms));
         report.mcp_port_detected = port_report.active;
         report.mcp_detected = report.mcp_pipe_detected || report.mcp_process_detected ||
             report.mcp_port_detected || report.mcp_command_server_detected;
+        const ULONGLONG llm_start_ms = GetTickCount64();
+        diag::log_tagged_critical("guard", "ai_tool_posture_full_scan_llm_pre");
         report.local_llm_detected = process_evidence.llm_tool || llm_detect::scan_ollama_api();
+        diag::log_tagged_critical_fmt("guard",
+            "ai_tool_posture_full_scan_llm_post detected=%d elapsed_ms=%llu total_elapsed_ms=%llu",
+            report.local_llm_detected ? 1 : 0,
+            static_cast<unsigned long long>(GetTickCount64() - llm_start_ms),
+            static_cast<unsigned long long>(GetTickCount64() - scan_start_ms));
         report.ai_tool_detected = process_evidence.ai_tool;
         report.memory_scanner_detected = process_evidence.memory_scanner;
         report.re_tool_detected = process_evidence.re_tool;
@@ -2382,7 +2449,15 @@ namespace combined
         report.dump_tool_detected = process_evidence.dump_tool;
         report.dump_tool_hash = process_evidence.dump_tool_hash;
         report.offensive_mcp_tool_detected = process_evidence.offensive_mcp_tool;
+        const ULONGLONG handles_start_ms = GetTickCount64();
+        diag::log_tagged_critical("guard", "ai_tool_posture_full_scan_handles_pre");
         auto handle_report = self_analysis::detect_handle_to_us_report(&processes);
+        diag::log_tagged_critical_fmt("guard",
+            "ai_tool_posture_full_scan_handles_post any=%d observed=%u elapsed_ms=%llu total_elapsed_ms=%llu",
+            handle_report.any ? 1 : 0,
+            handle_report.observed_handle_count,
+            static_cast<unsigned long long>(GetTickCount64() - handles_start_ms),
+            static_cast<unsigned long long>(GetTickCount64() - scan_start_ms));
         report.handle_to_us_detected = handle_report.any;
         report.foreign_vm_read_handle = handle_report.vm_read;
         report.foreign_vm_write_handle = handle_report.vm_write;
@@ -2418,9 +2493,23 @@ namespace combined
         report.fileless_bootstrap_parent_handle_owner_hash = handle_report.fileless_bootstrap_parent_owner_hash;
         report.fileless_bootstrap_parent_handle_owner_image = handle_report.fileless_bootstrap_parent_owner_image;
         report.fileless_bootstrap_parent_handle_owner_path = handle_report.fileless_bootstrap_parent_owner_path;
+        const ULONGLONG clipboard_start_ms = GetTickCount64();
+        diag::log_tagged_critical("guard", "ai_tool_posture_full_scan_clipboard_pre");
         auto clipboard = detail::scan_clipboard_monitoring(&processes);
+        diag::log_tagged_critical_fmt("guard",
+            "ai_tool_posture_full_scan_clipboard_post suspicious=%d elapsed_ms=%llu total_elapsed_ms=%llu",
+            clipboard.suspicious ? 1 : 0,
+            static_cast<unsigned long long>(GetTickCount64() - clipboard_start_ms),
+            static_cast<unsigned long long>(GetTickCount64() - scan_start_ms));
         report.clipboard_monitored = clipboard.suspicious;
+        const ULONGLONG windows_start_ms = GetTickCount64();
+        diag::log_tagged_critical("guard", "ai_tool_posture_full_scan_windows_pre");
         auto window_target = detail::scan_windows_for_aida_targeting(processes);
+        diag::log_tagged_critical_fmt("guard",
+            "ai_tool_posture_full_scan_windows_post targeted=%d elapsed_ms=%llu total_elapsed_ms=%llu",
+            window_target.targeted ? 1 : 0,
+            static_cast<unsigned long long>(GetTickCount64() - windows_start_ms),
+            static_cast<unsigned long long>(GetTickCount64() - scan_start_ms));
         report.tool_targets_aida = process_evidence.targets_aida || handle_report.owner_targets_aida || window_target.targeted;
         report.llm_detected = report.local_llm_detected && (report.mcp_detected ||
             report.ai_tool_detected || report.memory_scanner_detected ||

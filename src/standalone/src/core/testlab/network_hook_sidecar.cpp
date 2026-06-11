@@ -6,11 +6,15 @@
 #include <Windows.h>
 #include <WS2tcpip.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <new>
 #include <string>
+#include <utility>
 #include <vector>
 
 #pragma comment(lib, "ws2_32.lib")
@@ -39,13 +43,16 @@ struct handles_t {
 };
 
 struct socket_pair_t {
-    SOCKET listener = INVALID_SOCKET;
-    SOCKET client = INVALID_SOCKET;
-    SOCKET accepted = INVALID_SOCKET;
+    std::atomic<SOCKET> listener{INVALID_SOCKET};
+    std::atomic<SOCKET> client{INVALID_SOCKET};
+    std::atomic<SOCKET> accepted{INVALID_SOCKET};
     HANDLE accept_thread = nullptr;
-    volatile LONG stop = 0;
+    std::atomic<bool> stop{false};
+    std::atomic<bool> accept_exited{false};
     unsigned short port = 0;
 };
+
+using socket_pair_ptr = std::shared_ptr<socket_pair_t>;
 
 volatile LONG g_stop = 0;
 
@@ -196,14 +203,38 @@ void close_events(handles_t& h) {
     h = {};
 }
 
+void close_socket_slot(std::atomic<SOCKET>& slot) {
+    const SOCKET s = slot.exchange(INVALID_SOCKET, std::memory_order_acq_rel);
+    if (s != INVALID_SOCKET) {
+        shutdown(s, SD_BOTH);
+        closesocket(s);
+    }
+}
+
 DWORD WINAPI accept_thread_proc(void* p) {
-    auto* pair = static_cast<socket_pair_t*>(p);
-    pair->accepted = accept(pair->listener, nullptr, nullptr);
-    if (pair->accepted == INVALID_SOCKET)
+    std::unique_ptr<socket_pair_ptr> owner(static_cast<socket_pair_ptr*>(p));
+    socket_pair_ptr pair;
+    if (owner)
+        pair = std::move(*owner);
+    if (!pair)
         return 1;
+    const SOCKET listener = pair->listener.load(std::memory_order_acquire);
+    SOCKET accepted = INVALID_SOCKET;
+    if (listener != INVALID_SOCKET)
+        accepted = accept(listener, nullptr, nullptr);
+    pair->accepted.store(accepted, std::memory_order_release);
+    if (accepted == INVALID_SOCKET) {
+        const int err = listener == INVALID_SOCKET ? WSAENOTSOCK : WSAGetLastError();
+        pair->accept_exited.store(true, std::memory_order_release);
+        std::printf("[loopback] accept_failed err=%d stop=%d\n",
+            err,
+            pair->stop.load(std::memory_order_acquire) ? 1 : 0);
+        std::fflush(stdout);
+        return 1;
+    }
     char buf[512];
-    while (!pair->stop) {
-        const int n = recv(pair->accepted, buf, static_cast<int>(sizeof(buf)), 0);
+    while (!pair->stop.load(std::memory_order_acquire)) {
+        const int n = recv(accepted, buf, static_cast<int>(sizeof(buf)), 0);
         if (n == 0)
             break;
         if (n == SOCKET_ERROR) {
@@ -213,59 +244,74 @@ DWORD WINAPI accept_thread_proc(void* p) {
             break;
         }
     }
+    close_socket_slot(pair->accepted);
+    pair->accept_exited.store(true, std::memory_order_release);
     return 0;
 }
 
-bool setup_loopback(socket_pair_t& pair) {
-    pair.listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (pair.listener == INVALID_SOCKET)
+bool setup_loopback(const socket_pair_ptr& pair) {
+    if (!pair)
+        return false;
+    SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    pair->listener.store(listener, std::memory_order_release);
+    if (listener == INVALID_SOCKET)
         return false;
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = 0;
-    if (bind(pair.listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR)
+    if (bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR)
         return false;
-    if (listen(pair.listener, 1) == SOCKET_ERROR)
+    if (listen(listener, 1) == SOCKET_ERROR)
         return false;
 
     int len = sizeof(addr);
-    if (getsockname(pair.listener, reinterpret_cast<sockaddr*>(&addr), &len) == SOCKET_ERROR)
+    if (getsockname(listener, reinterpret_cast<sockaddr*>(&addr), &len) == SOCKET_ERROR)
         return false;
-    pair.port = ntohs(addr.sin_port);
-    pair.accept_thread = CreateThread(nullptr, 0, accept_thread_proc, &pair, 0, nullptr);
-    if (!pair.accept_thread)
+    pair->port = ntohs(addr.sin_port);
+    auto* thread_state = new (std::nothrow) socket_pair_ptr(pair);
+    if (!thread_state)
         return false;
+    pair->accept_thread = CreateThread(nullptr, 0, accept_thread_proc, thread_state, 0, nullptr);
+    if (!pair->accept_thread) {
+        delete thread_state;
+        return false;
+    }
 
-    pair.client = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (pair.client == INVALID_SOCKET)
+    SOCKET client = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    pair->client.store(client, std::memory_order_release);
+    if (client == INVALID_SOCKET)
         return false;
-    if (connect(pair.client, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR)
+    if (connect(client, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR)
         return false;
     return true;
 }
 
-void close_socket_pair(socket_pair_t& pair) {
-    InterlockedExchange(&pair.stop, 1);
-    if (pair.client != INVALID_SOCKET) {
-        shutdown(pair.client, SD_BOTH);
-        closesocket(pair.client);
+void close_socket_pair(const socket_pair_ptr& pair) {
+    if (!pair)
+        return;
+    pair->stop.store(true, std::memory_order_release);
+    close_socket_slot(pair->client);
+    close_socket_slot(pair->accepted);
+    close_socket_slot(pair->listener);
+    if (pair->accept_thread) {
+        const DWORD wr = WaitForSingleObject(pair->accept_thread, 2000);
+        const DWORD wait_err = wr == WAIT_FAILED ? GetLastError() : 0;
+        const bool exited = wr == WAIT_OBJECT_0 || pair->accept_exited.load(std::memory_order_acquire);
+        std::printf("[loopback] accept_thread_wait result=0x%08lX exited=%d stop=%d err=%lu listener=0x%llX client=0x%llX accepted=0x%llX retained=%d\n",
+            static_cast<unsigned long>(wr),
+            exited ? 1 : 0,
+            pair->stop.load(std::memory_order_acquire) ? 1 : 0,
+            static_cast<unsigned long>(wait_err),
+            static_cast<unsigned long long>(pair->listener.load(std::memory_order_acquire)),
+            static_cast<unsigned long long>(pair->client.load(std::memory_order_acquire)),
+            static_cast<unsigned long long>(pair->accepted.load(std::memory_order_acquire)),
+            exited ? 0 : 1);
+        std::fflush(stdout);
+        CloseHandle(pair->accept_thread);
+        pair->accept_thread = nullptr;
     }
-    if (pair.accepted != INVALID_SOCKET) {
-        shutdown(pair.accepted, SD_BOTH);
-        closesocket(pair.accepted);
-    }
-    if (pair.listener != INVALID_SOCKET)
-        closesocket(pair.listener);
-    if (pair.accept_thread) {
-        WaitForSingleObject(pair.accept_thread, 2000);
-        CloseHandle(pair.accept_thread);
-    }
-    pair = {};
-    pair.listener = INVALID_SOCKET;
-    pair.client = INVALID_SOCKET;
-    pair.accepted = INVALID_SOCKET;
 }
 
 void mutate_guard_region(std::uint8_t* region, int iteration) {
@@ -342,10 +388,7 @@ int run_sidecar(const config_t& cfg) {
     std::memset(region, 0, k_guard_region_size);
     std::memcpy(region, "AIDA_PG_SNIFF_READY", 19);
 
-    socket_pair_t sockets{};
-    sockets.listener = INVALID_SOCKET;
-    sockets.client = INVALID_SOCKET;
-    sockets.accepted = INVALID_SOCKET;
+    auto sockets = std::make_shared<socket_pair_t>();
     if (!setup_loopback(sockets)) {
         close_socket_pair(sockets);
         VirtualFree(region, 0, MEM_RELEASE);
@@ -379,7 +422,7 @@ int run_sidecar(const config_t& cfg) {
     std::printf("[sidecar] pg_buffer=0x%llX pg_size=%llu loopback_port=%u\n",
         static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(region)),
         static_cast<unsigned long long>(k_guard_region_size),
-        static_cast<unsigned>(sockets.port));
+        static_cast<unsigned>(sockets->port));
     std::fflush(stdout);
 
     SetEvent(events.ready);
@@ -406,7 +449,7 @@ int run_sidecar(const config_t& cfg) {
     int network_failures = 0;
     for (int i = 0; i < cfg.iterations && !g_stop; ++i) {
         mutate_guard_region(region, i);
-        if (!emit_send_payloads(sockets.client, i))
+        if (!emit_send_payloads(sockets->client.load(std::memory_order_acquire), i))
             ++network_failures;
         if (cfg.verbose) {
             std::printf("[sidecar] iteration=%d guard_first=\"%.64s\" send_marker=AIDA_PRE_ENCRYPT_SEND wsasend_marker=AIDA_PRE_ENCRYPT_WSASEND_A network_failures=%d\n",

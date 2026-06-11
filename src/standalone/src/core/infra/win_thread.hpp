@@ -42,11 +42,20 @@ inline DWORD WINAPI entry(void* arg)
         tls_ready ? 1 : 0,
         static_cast<unsigned long>(GetCurrentThreadId()),
         arg);
+    if (!arg) {
+        diag::log_tagged_fmt("win_thread", "thread_entry_null_state tid=%lu", static_cast<unsigned long>(GetCurrentThreadId()));
+        return 0;
+    }
     std::unique_ptr<thread_state_t> state(static_cast<thread_state_t*>(arg));
     try {
         state->fn();
+        diag::log_tagged_fmt("win_thread", "thread_fn_return tid=%lu state=%p", static_cast<unsigned long>(GetCurrentThreadId()), arg);
+    } catch (const std::exception& ex) {
+        diag::log_tagged_fmt("win_thread", "thread_fn_exception tid=%lu state=%p err=%s", static_cast<unsigned long>(GetCurrentThreadId()), arg, ex.what());
     } catch (...) {
+        diag::log_tagged_fmt("win_thread", "thread_fn_exception tid=%lu state=%p err=unknown", static_cast<unsigned long>(GetCurrentThreadId()), arg);
     }
+    diag::log_tagged_fmt("win_thread", "thread_exit_pre tid=%lu state=%p", static_cast<unsigned long>(GetCurrentThreadId()), arg);
     return 0;
 }
 

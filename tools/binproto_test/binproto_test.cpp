@@ -23,11 +23,13 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -83,11 +85,49 @@ struct mock_server_state_t
     std::atomic<bool> running{false};
     std::atomic<bool> stop_flag{false};
     std::thread accept_thread;
+    std::mutex client_mutex;
+    std::condition_variable clients_cv;
+    std::vector<std::thread> client_threads;
+    std::vector<SOCKET> client_sockets;
+    std::atomic<int> active_clients{0};
+    std::mutex payload_mutex;
     std::vector<uint8_t> spki_hash;
     std::vector<uint8_t> last_response_check_payload;
     std::vector<uint8_t> last_request_decrypted;
     std::atomic<int> requests_handled{0};
     std::atomic<int> auth_failures{0};
+};
+
+struct mock_client_scope_t
+{
+    std::shared_ptr<mock_server_state_t> state;
+    SOCKET socket = INVALID_SOCKET;
+    SSL* ssl = nullptr;
+    bool tls_established = false;
+
+    ~mock_client_scope_t()
+    {
+        if (state && socket != INVALID_SOCKET)
+        {
+            std::lock_guard<std::mutex> lock(state->client_mutex);
+            auto it = std::find(state->client_sockets.begin(), state->client_sockets.end(), socket);
+            if (it != state->client_sockets.end())
+                state->client_sockets.erase(it);
+        }
+        if (ssl)
+        {
+            if (tls_established)
+                SSL_shutdown(ssl);
+            SSL_free(ssl);
+        }
+        if (socket != INVALID_SOCKET)
+            closesocket(socket);
+        if (state)
+        {
+            state->active_clients.fetch_sub(1);
+            state->clients_cv.notify_all();
+        }
+    }
 };
 
 static bool generate_self_signed_rsa(EVP_PKEY*& pkey_out, X509*& cert_out)
@@ -303,22 +343,20 @@ static bool chacha_encrypt(const uint8_t key[32], const uint8_t nonce[12],
     return ok;
 }
 
-static void server_handle_connection(mock_server_state_t* state, SOCKET client)
+static void server_handle_connection(std::shared_ptr<mock_server_state_t> state, SOCKET client)
 {
-    SSL* ssl = SSL_new(state->ctx);
-    if (!ssl)
-    {
-        closesocket(client);
+    mock_client_scope_t scope{state, client, nullptr, false};
+    scope.ssl = SSL_new(state->ctx);
+    if (!scope.ssl)
         return;
-    }
-    SSL_set_fd(ssl, static_cast<int>(client));
-    if (SSL_accept(ssl) != 1)
+
+    SSL_set_fd(scope.ssl, static_cast<int>(client));
+    if (SSL_accept(scope.ssl) != 1)
     {
-        SSL_free(ssl);
-        closesocket(client);
         ++state->auth_failures;
         return;
     }
+    scope.tls_established = true;
 
     std::vector<uint8_t> raw;
     raw.reserve(8192);
@@ -326,7 +364,7 @@ static void server_handle_connection(mock_server_state_t* state, SOCKET client)
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     while (std::chrono::steady_clock::now() < deadline)
     {
-        int n = SSL_read(ssl, buf, sizeof(buf));
+        int n = SSL_read(scope.ssl, buf, sizeof(buf));
         if (n > 0)
         {
             raw.insert(raw.end(), buf, buf + n);
@@ -347,7 +385,7 @@ static void server_handle_connection(mock_server_state_t* state, SOCKET client)
         }
         else
         {
-            int err = SSL_get_error(ssl, n);
+            int err = SSL_get_error(scope.ssl, n);
             if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
             {
                 Sleep(1);
@@ -360,39 +398,21 @@ static void server_handle_connection(mock_server_state_t* state, SOCKET client)
     auto crlf2 = std::search(raw.begin(), raw.end(),
                              std::begin("\r\n\r\n"), std::end("\r\n\r\n") - 1);
     if (crlf2 == raw.end())
-    {
-        SSL_shutdown(ssl);
-        SSL_free(ssl);
-        closesocket(client);
         return;
-    }
+
     size_t header_end = static_cast<size_t>(crlf2 - raw.begin()) + 4;
     if (raw.size() < header_end + sizeof(anti_tamper::binary_protocol::binary_request_header_t))
-    {
-        SSL_shutdown(ssl);
-        SSL_free(ssl);
-        closesocket(client);
         return;
-    }
 
     const uint8_t* body = raw.data() + header_end;
     anti_tamper::binary_protocol::binary_request_header_t req_hdr = {};
     std::memcpy(&req_hdr, body, sizeof(req_hdr));
     if (req_hdr.magic != anti_tamper::binary_protocol::BINARY_REQUEST_MAGIC)
-    {
-        SSL_shutdown(ssl);
-        SSL_free(ssl);
-        closesocket(client);
         return;
-    }
 
     if (sizeof(req_hdr) + req_hdr.payload_len > raw.size() - header_end)
-    {
-        SSL_shutdown(ssl);
-        SSL_free(ssl);
-        closesocket(client);
         return;
-    }
+
     const uint8_t* enc_body = body + sizeof(req_hdr);
     size_t enc_len = req_hdr.payload_len - 16;
     const uint8_t* recv_tag = enc_body + enc_len;
@@ -419,13 +439,13 @@ static void server_handle_connection(mock_server_state_t* state, SOCKET client)
     if (!dec_ok)
     {
         ++state->auth_failures;
-        SSL_shutdown(ssl);
-        SSL_free(ssl);
-        closesocket(client);
         return;
     }
 
-    state->last_request_decrypted = plain_req;
+    {
+        std::lock_guard<std::mutex> lock(state->payload_mutex);
+        state->last_request_decrypted = plain_req;
+    }
 
     std::vector<uint8_t> plain_resp;
     {
@@ -458,7 +478,10 @@ static void server_handle_connection(mock_server_state_t* state, SOCKET client)
         plain_resp.insert(plain_resp.end(), tag16, tag16 + 16);
     }
 
-    state->last_response_check_payload = plain_resp;
+    {
+        std::lock_guard<std::mutex> lock(state->payload_mutex);
+        state->last_response_check_payload = plain_resp;
+    }
 
     uint8_t resp_key[32] = {};
     derive_protocol_key(test_constants::kSessionToken, test_constants::kHwid, resp_key);
@@ -479,12 +502,7 @@ static void server_handle_connection(mock_server_state_t* state, SOCKET client)
                                  resp_ct, resp_tag);
     SecureZeroMemory(resp_key, sizeof(resp_key));
     if (!enc_ok)
-    {
-        SSL_shutdown(ssl);
-        SSL_free(ssl);
-        closesocket(client);
         return;
-    }
 
     std::vector<uint8_t> wire_payload;
     wire_payload.reserve(resp_ct.size() + 16);
@@ -516,119 +534,182 @@ static void server_handle_connection(mock_server_state_t* state, SOCKET client)
                    reinterpret_cast<const uint8_t*>(&resp_hdr) + sizeof(resp_hdr));
     out_buf.insert(out_buf.end(), wire_payload.begin(), wire_payload.end());
 
-    send_full_tls(ssl, out_buf.data(), out_buf.size());
-    SSL_shutdown(ssl);
-    SSL_free(ssl);
-    closesocket(client);
+    send_full_tls(scope.ssl, out_buf.data(), out_buf.size());
     ++state->requests_handled;
 }
 
-static void server_accept_loop(mock_server_state_t* state)
+static void server_accept_loop(std::shared_ptr<mock_server_state_t> state)
 {
     state->running.store(true);
     while (!state->stop_flag.load())
     {
+        SOCKET listen_sock = state->listen_sock;
+        if (listen_sock == INVALID_SOCKET)
+            break;
         fd_set rfds;
         FD_ZERO(&rfds);
-        FD_SET(state->listen_sock, &rfds);
+        FD_SET(listen_sock, &rfds);
         timeval tv = { 0, 200000 };
         int sel = select(0, &rfds, nullptr, nullptr, &tv);
         if (sel < 0) break;
         if (sel == 0) continue;
         sockaddr_in client_addr = {};
         int client_len = sizeof(client_addr);
-        SOCKET client = accept(state->listen_sock,
-                               reinterpret_cast<sockaddr*>(&client_addr), &client_len);
+        SOCKET client = accept(listen_sock, reinterpret_cast<sockaddr*>(&client_addr), &client_len);
         if (client == INVALID_SOCKET) continue;
-        std::thread(server_handle_connection, state, client).detach();
+        bool spawned = false;
+        bool counted = false;
+        {
+            std::lock_guard<std::mutex> lock(state->client_mutex);
+            if (!state->stop_flag.load())
+            {
+                try
+                {
+                    state->client_sockets.push_back(client);
+                    state->active_clients.fetch_add(1);
+                    counted = true;
+                    state->client_threads.emplace_back(server_handle_connection, state, client);
+                    spawned = true;
+                }
+                catch (...)
+                {
+                    auto it = std::find(state->client_sockets.begin(), state->client_sockets.end(), client);
+                    if (it != state->client_sockets.end())
+                        state->client_sockets.erase(it);
+                    if (counted)
+                        state->active_clients.fetch_sub(1);
+                    state->clients_cv.notify_all();
+                }
+            }
+        }
+        if (!spawned)
+            closesocket(client);
     }
     state->running.store(false);
 }
 
-static bool start_mock_server(mock_server_state_t& state)
+static bool start_mock_server(const std::shared_ptr<mock_server_state_t>& state)
 {
-    if (!generate_self_signed_rsa(state.pkey, state.cert))
+    if (!state)
+        return false;
+    if (!generate_self_signed_rsa(state->pkey, state->cert))
     {
         std::printf("server: cert generation failed\n");
         return false;
     }
-    state.spki_hash.resize(32);
-    if (!spki_hash_from_x509(state.cert, state.spki_hash.data()))
+    state->spki_hash.resize(32);
+    if (!spki_hash_from_x509(state->cert, state->spki_hash.data()))
     {
         std::printf("server: spki hash failed\n");
         return false;
     }
 
-    state.ctx = SSL_CTX_new(TLS_server_method());
-    if (!state.ctx)
+    state->ctx = SSL_CTX_new(TLS_server_method());
+    if (!state->ctx)
     {
         std::printf("server: SSL_CTX_new failed\n");
         return false;
     }
-    if (SSL_CTX_use_certificate(state.ctx, state.cert) != 1)
+    if (SSL_CTX_use_certificate(state->ctx, state->cert) != 1)
     {
         std::printf("server: use_certificate failed\n");
         return false;
     }
-    if (SSL_CTX_use_PrivateKey(state.ctx, state.pkey) != 1)
+    if (SSL_CTX_use_PrivateKey(state->ctx, state->pkey) != 1)
     {
         std::printf("server: use_PrivateKey failed\n");
         return false;
     }
-    SSL_CTX_set_min_proto_version(state.ctx, TLS1_2_VERSION);
+    SSL_CTX_set_min_proto_version(state->ctx, TLS1_2_VERSION);
 
-    state.listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (state.listen_sock == INVALID_SOCKET)
+    state->listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (state->listen_sock == INVALID_SOCKET)
     {
         std::printf("server: socket() failed wsa=%d\n", WSAGetLastError());
         return false;
     }
     BOOL reuse = TRUE;
-    setsockopt(state.listen_sock, SOL_SOCKET, SO_REUSEADDR,
+    setsockopt(state->listen_sock, SOL_SOCKET, SO_REUSEADDR,
                reinterpret_cast<const char*>(&reuse), sizeof(reuse));
 
     sockaddr_in bind_addr = {};
     bind_addr.sin_family = AF_INET;
     bind_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     bind_addr.sin_port = 0;
-    if (bind(state.listen_sock, reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr)) != 0)
+    if (bind(state->listen_sock, reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr)) != 0)
     {
         std::printf("server: bind() failed wsa=%d\n", WSAGetLastError());
         return false;
     }
     int bind_len = sizeof(bind_addr);
-    if (getsockname(state.listen_sock, reinterpret_cast<sockaddr*>(&bind_addr), &bind_len) != 0)
+    if (getsockname(state->listen_sock, reinterpret_cast<sockaddr*>(&bind_addr), &bind_len) != 0)
     {
         std::printf("server: getsockname() failed\n");
         return false;
     }
-    state.port = ntohs(bind_addr.sin_port);
-    if (listen(state.listen_sock, 4) != 0)
+    state->port = ntohs(bind_addr.sin_port);
+    if (listen(state->listen_sock, 4) != 0)
     {
         std::printf("server: listen() failed\n");
         return false;
     }
 
-    state.accept_thread = std::thread(server_accept_loop, &state);
+    state->accept_thread = std::thread(server_accept_loop, state);
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (!state.running.load() && std::chrono::steady_clock::now() < deadline)
+    while (!state->running.load() && std::chrono::steady_clock::now() < deadline)
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    return state.running.load();
+    return state->running.load();
 }
 
-static void stop_mock_server(mock_server_state_t& state)
+static void stop_mock_server(const std::shared_ptr<mock_server_state_t>& state)
 {
-    state.stop_flag.store(true);
-    if (state.accept_thread.joinable())
-        state.accept_thread.join();
-    if (state.listen_sock != INVALID_SOCKET)
+    if (!state)
+        return;
+
+    state->stop_flag.store(true);
+    SOCKET listen_sock = state->listen_sock;
+    if (listen_sock != INVALID_SOCKET)
     {
-        closesocket(state.listen_sock);
-        state.listen_sock = INVALID_SOCKET;
+        shutdown(listen_sock, SD_BOTH);
+        closesocket(listen_sock);
     }
-    if (state.ctx) { SSL_CTX_free(state.ctx); state.ctx = nullptr; }
-    if (state.cert) { X509_free(state.cert); state.cert = nullptr; }
-    if (state.pkey) { EVP_PKEY_free(state.pkey); state.pkey = nullptr; }
+    {
+        std::lock_guard<std::mutex> lock(state->client_mutex);
+        for (SOCKET client : state->client_sockets)
+            shutdown(client, SD_BOTH);
+    }
+    if (state->accept_thread.joinable())
+        state->accept_thread.join();
+    state->listen_sock = INVALID_SOCKET;
+    {
+        std::lock_guard<std::mutex> lock(state->client_mutex);
+        for (SOCKET client : state->client_sockets)
+            shutdown(client, SD_BOTH);
+    }
+    bool drained = false;
+    {
+        std::unique_lock<std::mutex> lock(state->client_mutex);
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(12);
+        drained = state->clients_cv.wait_until(lock, deadline, [&]() {
+            return state->active_clients.load() == 0;
+        });
+        if (!drained)
+            std::printf("server: waiting for %d active client(s) before OpenSSL cleanup\n",
+                        state->active_clients.load());
+    }
+    std::vector<std::thread> client_threads;
+    {
+        std::lock_guard<std::mutex> lock(state->client_mutex);
+        client_threads.swap(state->client_threads);
+    }
+    for (std::thread& client_thread : client_threads)
+    {
+        if (client_thread.joinable())
+            client_thread.join();
+    }
+    if (state->ctx) { SSL_CTX_free(state->ctx); state->ctx = nullptr; }
+    if (state->cert) { X509_free(state->cert); state->cert = nullptr; }
+    if (state->pkey) { EVP_PKEY_free(state->pkey); state->pkey = nullptr; }
 }
 
 int main()
@@ -645,23 +726,24 @@ int main()
 
     section("BINPROTO TEST");
 
-    mock_server_state_t server;
+    auto server = std::make_shared<mock_server_state_t>();
     bool started = start_mock_server(server);
     check_true("mock server starts", started);
     if (!started)
     {
+        stop_mock_server(server);
         WSACleanup();
         std::printf("FATAL: mock server did not start\n");
         return 2;
     }
-    std::printf("  mock server listening on 127.0.0.1:%d, SPKI hash bytes: ", server.port);
-    for (int i = 0; i < 8; ++i) std::printf("%02x", server.spki_hash[i]);
+    std::printf("  mock server listening on 127.0.0.1:%d, SPKI hash bytes: ", server->port);
+    for (int i = 0; i < 8; ++i) std::printf("%02x", server->spki_hash[i]);
     std::printf("...\n");
 
     section("PIN ACCEPTANCE PATH");
     {
         anti_tamper::binary_protocol::clear_pinned_spki();
-        bool pin_set = anti_tamper::binary_protocol::set_pinned_spki_sha256(server.spki_hash.data());
+        bool pin_set = anti_tamper::binary_protocol::set_pinned_spki_sha256(server->spki_hash.data());
         check_true("set_pinned_spki_sha256 returns true", pin_set);
 
         std::vector<uint8_t> resp_payload;
@@ -675,7 +757,7 @@ int main()
             test_constants::kPageIndex,
             test_constants::kIssuedAt,
             "127.0.0.1",
-            server.port,
+            server->port,
             "/api/download/arc/page-binary/" + std::to_string(test_constants::kPageIndex),
             10,
             resp_payload,
@@ -687,7 +769,15 @@ int main()
         check_true("response status == OK",
                    status == anti_tamper::binary_protocol::BINARY_STATUS_OK);
 
-        bool payload_match = (resp_payload == server.last_response_check_payload);
+        std::vector<uint8_t> server_response_payload;
+        std::vector<uint8_t> server_request_payload;
+        {
+            std::lock_guard<std::mutex> lock(server->payload_mutex);
+            server_response_payload = server->last_response_check_payload;
+            server_request_payload = server->last_request_decrypted;
+        }
+
+        bool payload_match = (resp_payload == server_response_payload);
         check_true("client decrypted payload matches server", payload_match);
         if (resp_payload.size() >= 16)
         {
@@ -711,16 +801,16 @@ int main()
         }
 
         bool req_round_trip = false;
-        if (server.last_request_decrypted.size() > 0)
+        if (server_request_payload.size() > 0)
         {
-            const uint8_t* p = server.last_request_decrypted.data();
+            const uint8_t* p = server_request_payload.data();
             size_t off = 0;
             auto read_str = [&](std::string& out) -> bool {
-                if (off + 4 > server.last_request_decrypted.size()) return false;
+                if (off + 4 > server_request_payload.size()) return false;
                 uint32_t len = 0;
                 std::memcpy(&len, p + off, 4);
                 off += 4;
-                if (off + len > server.last_request_decrypted.size()) return false;
+                if (off + len > server_request_payload.size()) return false;
                 out.assign(reinterpret_cast<const char*>(p + off), len);
                 off += len;
                 return true;
@@ -733,7 +823,7 @@ int main()
             uint32_t pidx = 0;
             uint64_t issued = 0;
             bool e = false;
-            if (a && b && c && d && off + 12 <= server.last_request_decrypted.size())
+            if (a && b && c && d && off + 12 <= server_request_payload.size())
             {
                 std::memcpy(&pidx, p + off, 4);
                 off += 4;
@@ -770,7 +860,7 @@ int main()
             test_constants::kPageIndex,
             test_constants::kIssuedAt,
             "127.0.0.1",
-            server.port,
+            server->port,
             "/api/download/arc/page-binary/" + std::to_string(test_constants::kPageIndex),
             5,
             resp_payload,

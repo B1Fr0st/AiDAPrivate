@@ -1742,6 +1742,39 @@ void helpers::render_title()
 	bool loading = !bg_completed || globals::ui::load_timer < 3.0f;
 
 	g_render_section = loading ? "loading_screen" : "post_loading";
+	{
+		static bool s_loading_wait_logged = false;
+		static float s_loading_wait_last_log = 0.f;
+		if (loading && globals::ui::load_timer >= 5.0f &&
+		    (!s_loading_wait_logged || (globals::ui::load_timer - s_loading_wait_last_log) >= 5.0f)) {
+			s_loading_wait_logged = true;
+			s_loading_wait_last_log = globals::ui::load_timer;
+			auto& rt = anti_tamper::state::get();
+			bool bg_done_value = globals::ui::bg_init_done &&
+				globals::ui::bg_init_done->load(std::memory_order_acquire);
+			diag::log_tagged_critical_fmt("render",
+				"loading_screen_wait timer=%.2f bg_completed=%d bg_done_ptr=%d bg_done=%d bg_step=%d bg_total=%d license_validated=%d canonical_valid=%d arc_loaded=%d arc_downloading=%d pending_activation=%d at_initialized=%d driver_hardening=%d hardening_active=%d violation=%d",
+				globals::ui::load_timer,
+				bg_completed ? 1 : 0,
+				globals::ui::bg_init_done ? 1 : 0,
+				bg_done_value ? 1 : 0,
+				globals::ui::bg_init_step.load(std::memory_order_acquire),
+				globals::ui::bg_init_total.load(std::memory_order_acquire),
+				license::validated ? 1 : 0,
+				standalone_license::is_valid() ? 1 : 0,
+				standalone_license::is_arc_loaded() ? 1 : 0,
+				standalone_license::is_arc_download_in_progress() ? 1 : 0,
+				rt.license_pending_activation.load(std::memory_order_acquire) ? 1 : 0,
+				rt.initialized.load(std::memory_order_acquire) ? 1 : 0,
+				rt.driver_hardening_done.load(std::memory_order_acquire) ? 1 : 0,
+				rt.driver_hardening_active.load(std::memory_order_acquire) ? 1 : 0,
+				rt.violation_latched.load(std::memory_order_acquire) ? 1 : 0);
+		}
+		if (!loading) {
+			s_loading_wait_logged = false;
+			s_loading_wait_last_log = globals::ui::load_timer;
+		}
+	}
 
 	if (!loading)
 	{

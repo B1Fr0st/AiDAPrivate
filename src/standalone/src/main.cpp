@@ -3348,10 +3348,8 @@ int main(int, char**)
         {
             aida_tracer::mark_render_phase("peek_message_call");
             DWORD queue_status_before = ::GetQueueStatus(QS_ALLINPUT);
-            const UINT peek_remove_flags = fileless_customer_launch
-                ? static_cast<UINT>(PM_REMOVE | PM_QS_INPUT | PM_QS_POSTMESSAGE | PM_QS_PAINT)
-                : static_cast<UINT>(PM_REMOVE);
-            HWND peek_filter = fileless_customer_launch ? hwnd : nullptr;
+            const UINT peek_remove_flags = static_cast<UINT>(PM_REMOVE);
+            HWND peek_filter = nullptr;
             ::SetLastError(0);
             aida_tracer::set_peek_state(queue_status_before, 0);
             aida_tracer::set_peek_call_shape(peek_remove_flags, peek_filter);
@@ -3376,20 +3374,6 @@ int main(int, char**)
             aida_tracer::g_peek_return_count.fetch_add(1, std::memory_order_acq_rel);
             DWORD peek_gle = ::GetLastError();
             uint64_t peek_elapsed = static_cast<uint64_t>(GetTickCount64()) - peek_start;
-            if (!has_message && fileless_customer_launch) {
-                HWND thread_filter = reinterpret_cast<HWND>(static_cast<INT_PTR>(-1));
-                aida_tracer::set_peek_call_shape(peek_remove_flags, thread_filter);
-                ::SetLastError(0);
-                uint64_t thread_peek_start = static_cast<uint64_t>(GetTickCount64());
-                aida_tracer::g_peek_call_count.fetch_add(1, std::memory_order_acq_rel);
-                has_message = ::PeekMessage(&msg, thread_filter, 0U, 0U, peek_remove_flags);
-                aida_tracer::g_peek_return_count.fetch_add(1, std::memory_order_acq_rel);
-                DWORD thread_peek_gle = ::GetLastError();
-                uint64_t thread_peek_elapsed = static_cast<uint64_t>(GetTickCount64()) - thread_peek_start;
-                peek_filter = thread_filter;
-                peek_gle = thread_peek_gle;
-                peek_elapsed += thread_peek_elapsed;
-            }
             aida_tracer::set_peek_state(queue_status_before, peek_gle);
             if (peek_elapsed >= 50) {
                 diag::log_tagged_critical_fmt("msgpump",

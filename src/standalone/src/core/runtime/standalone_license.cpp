@@ -6431,14 +6431,85 @@ namespace
                 driver_bridge::using_kernel_driver() ? 1 : 0,
                 anti_tamper_initialized ? 1 : 0,
                 driver_hardening_done ? 1 : 0);
+            const uint64_t at_started = GetTickCount64();
+            auto at_watch_done = std::make_shared<std::atomic<bool>>(false);
+            struct pre_arc_at_watch_done_t
+            {
+                std::shared_ptr<std::atomic<bool>> done;
+                uint64_t started;
+                uint32_t attempt;
+                ~pre_arc_at_watch_done_t()
+                {
+                    if (done)
+                        done->store(true, std::memory_order_release);
+                    lic_log_fmt("pre_arc_anti_tamper_initialize_wait_done attempt=%u elapsed_ms=%llu",
+                        attempt,
+                        static_cast<unsigned long long>(GetTickCount64() - started));
+                }
+            } at_watch_done_guard{ at_watch_done, at_started, attempt_number };
+            try
+            {
+                std::thread([at_watch_done,
+                             attempt_number,
+                             at_started,
+                             anti_tamper_initialized,
+                             driver_hardening_done,
+                             driver_live_for_at]() {
+                    const DWORD checkpoints[] = { 5000u, 15000u, 30000u, 60000u };
+                    DWORD previous = 0;
+                    for (DWORD checkpoint : checkpoints)
+                    {
+                        if (checkpoint > previous)
+                            Sleep(checkpoint - previous);
+                        previous = checkpoint;
+                        if (at_watch_done->load(std::memory_order_acquire))
+                            return;
+                        auto& rt = anti_tamper::state::get();
+                        const uint64_t now = GetTickCount64();
+                        const uint64_t hardening_started =
+                            rt.driver_hardening_started_ms.load(std::memory_order_acquire);
+                        const uint64_t hardening_elapsed =
+                            hardening_started != 0 && now >= hardening_started ? now - hardening_started : 0;
+                        lic_log_fmt("pre_arc_anti_tamper_initialize_still_waiting attempt=%u elapsed_ms=%llu initial_initialized=%d initial_driver_hardening=%d initial_driver_live=%d initialized=%d driver_hardening=%d hardening_active=%d hardening_elapsed_ms=%llu violation=%d pending_activation=%d",
+                            attempt_number,
+                            static_cast<unsigned long long>(now - at_started),
+                            anti_tamper_initialized ? 1 : 0,
+                            driver_hardening_done ? 1 : 0,
+                            driver_live_for_at ? 1 : 0,
+                            rt.initialized.load(std::memory_order_acquire) ? 1 : 0,
+                            rt.driver_hardening_done.load(std::memory_order_acquire) ? 1 : 0,
+                            rt.driver_hardening_active.load(std::memory_order_acquire) ? 1 : 0,
+                            static_cast<unsigned long long>(hardening_elapsed),
+                            rt.violation_latched.load(std::memory_order_acquire) ? 1 : 0,
+                            rt.license_pending_activation.load(std::memory_order_acquire) ? 1 : 0);
+                    }
+                }).detach();
+            }
+            catch (...)
+            {
+                lic_log_fmt("pre_arc_anti_tamper_initialize_watchdog_start_failed attempt=%u", attempt_number);
+            }
             bool at_ok = false;
             try
             {
+                lic_log_fmt("pre_arc_anti_tamper_initialize_call_enter attempt=%u tid=%lu tick=%llu",
+                    attempt_number,
+                    GetCurrentThreadId(),
+                    static_cast<unsigned long long>(at_started));
                 at_ok = anti_tamper::initialize();
+                lic_log_fmt("pre_arc_anti_tamper_initialize_call_exit attempt=%u ok=%d elapsed_ms=%llu initialized=%d driver_hardening=%d violation=%d",
+                    attempt_number,
+                    at_ok ? 1 : 0,
+                    static_cast<unsigned long long>(GetTickCount64() - at_started),
+                    at_rt.initialized.load(std::memory_order_acquire) ? 1 : 0,
+                    at_rt.driver_hardening_done.load(std::memory_order_acquire) ? 1 : 0,
+                    at_rt.violation_latched.load(std::memory_order_acquire) ? 1 : 0);
             }
             catch (const std::exception& ex)
             {
-                lic_log_fmt("pre_arc_anti_tamper_initialize_exception what=%.160s", ex.what());
+                lic_log_fmt("pre_arc_anti_tamper_initialize_exception elapsed_ms=%llu what=%.160s",
+                    static_cast<unsigned long long>(GetTickCount64() - at_started),
+                    ex.what());
                 anti_tamper::enforce_violation_id(
                     aida::reason_ids::reason_id_from_string("pre_arc_anti_tamper_initialize_exception"),
                     ex.what());
@@ -6446,7 +6517,8 @@ namespace
             }
             catch (...)
             {
-                lic_log("pre_arc_anti_tamper_initialize_unknown_exception");
+                lic_log_fmt("pre_arc_anti_tamper_initialize_unknown_exception elapsed_ms=%llu",
+                    static_cast<unsigned long long>(GetTickCount64() - at_started));
                 anti_tamper::enforce_violation_id(
                     aida::reason_ids::reason_id_from_string("pre_arc_anti_tamper_initialize_exception"),
                     "unknown");

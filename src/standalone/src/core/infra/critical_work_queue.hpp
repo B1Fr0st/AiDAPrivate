@@ -199,8 +199,19 @@ inline void shutdown(std::uint32_t timeout_ms) {
         }
         if (w.join_for(wait_ms))
             continue;
-        else
-            w.detach();
+        std::size_t pending = 0;
+        {
+            std::lock_guard<std::mutex> lk(p.mtx);
+            pending = p.tasks.size();
+        }
+        diag::log_tagged_fmt("critical_work_queue",
+            "shutdown_join_timeout timeout_ms=%lu active=%u pending=%zu started=%llu finished=%llu",
+            static_cast<unsigned long>(wait_ms),
+            static_cast<unsigned>(p.active_tasks.load(std::memory_order_acquire)),
+            pending,
+            static_cast<unsigned long long>(p.started_tasks.load(std::memory_order_acquire)),
+            static_cast<unsigned long long>(p.finished_tasks.load(std::memory_order_acquire)));
+        w.join();
 #else
         w.join();
 #endif

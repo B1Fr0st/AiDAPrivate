@@ -14,6 +14,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -23,6 +24,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace page_guard_engine {
@@ -549,6 +551,8 @@ struct pg_session_t {
 
     std::mutex                      captures_mutex;
     std::mutex                      drain_mutex;
+    std::mutex                      poll_wait_mutex;
+    std::condition_variable         poll_cv;
     std::queue<pg_capture_record_t> captures;
 
     std::atomic<bool>          polling{false};
@@ -571,9 +575,10 @@ struct pg_session_t {
 
     pg_session_t() = default;
     ~pg_session_t() {
-        polling.store(false);
+        polling.store(false, std::memory_order_release);
+        poll_cv.notify_all();
         for (int i = 0; i < 2000; ++i) {
-            if (exited.load())
+            if (exited.load(std::memory_order_acquire))
                 break;
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
@@ -632,9 +637,25 @@ class pg_engine_t {
 public:
     pg_engine_t() = default;
     ~pg_engine_t() {
-        std::lock_guard<std::mutex> lk(sessions_mutex_);
-        sessions_.clear();
-        retired_sessions_.clear();
+        std::vector<std::shared_ptr<pg_session_t>> snapshot;
+        {
+            std::lock_guard<std::mutex> lk(sessions_mutex_);
+            snapshot.reserve(sessions_.size() + retired_sessions_.size());
+            for (auto& [sid, sess] : sessions_) {
+                (void)sid;
+                if (sess)
+                    snapshot.push_back(sess);
+            }
+            for (auto& sess : retired_sessions_) {
+                if (sess)
+                    snapshot.push_back(sess);
+            }
+            sessions_.clear();
+            retired_sessions_.clear();
+        }
+        for (auto& sess : snapshot) {
+            stop_session_poller(sess, 2000, "engine_destroy");
+        }
     }
 
     pg_engine_t(const pg_engine_t&)            = delete;
@@ -822,9 +843,8 @@ public:
         uint32_t sid = next_id_++;
         session->session_id = sid;
 
-        auto* sess_ptr = session.get();
-        if (!work_queue::post([this, sess_ptr]() {
-            poll_ring(sess_ptr);
+        if (!work_queue::post([worker_session = session]() mutable {
+            poll_ring(std::move(worker_session));
         })) {
             diag::log_tagged_fmt("pg_sniff", "install_failed reason=poll_worker_post pid=%u target=0x%llX",
                 pid, static_cast<unsigned long long>(target_addr));
@@ -933,12 +953,7 @@ public:
             static_cast<unsigned long long>(sess->region_size),
             sess->exited.load() ? 1 : 0);
 
-        sess->polling.store(false);
-        bool poller_exited = sess->exited.load();
-        for (int i = 0; i < 200 && !poller_exited; ++i) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
-            poller_exited = sess->exited.load();
-        }
+        bool poller_exited = stop_session_poller(sess, 1000, "uninstall");
         diag::log_tagged_fmt("pg_sniff", "uninstall_poller_state sid=%u exited=%d elapsed_ms=%llu",
             session_id,
             poller_exited ? 1 : 0,
@@ -979,7 +994,7 @@ public:
                 session_id,
                 static_cast<unsigned long long>(GetTickCount64() - cleanup_start));
 
-            poller_exited = sess->exited.load();
+            poller_exited = sess->exited.load(std::memory_order_acquire);
             if (active_ok && poller_exited) {
                 diag::log_tagged_fmt("pg_sniff", "uninstall_free_begin sid=%u sc=0x%llX ring=0x%llX elapsed_ms=%llu",
                     session_id,
@@ -1024,7 +1039,8 @@ public:
         for (auto& sess : snapshot) {
             if (!sess)
                 continue;
-            sess->polling.store(false);
+            sess->polling.store(false, std::memory_order_release);
+            sess->poll_cv.notify_all();
             ++signalled;
             diag::log_tagged_fmt("pg_sniff", "signal_stop sid=%u pid=%u target=0x%llX",
                 sess->session_id,
@@ -1077,19 +1093,54 @@ public:
 private:
     std::vector<std::shared_ptr<pg_session_t>> retired_sessions_;
 
-    void poll_ring(pg_session_t* sess) {
-        while (sess->polling.load()) {
-            if (driver_bridge::using_kernel_driver()) {
-                drain_ring(sess);
-            }
-
-            if (sess->polling.load())
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    static bool stop_session_poller(const std::shared_ptr<pg_session_t>& sess, DWORD timeout_ms, const char* reason) {
+        if (!sess)
+            return true;
+        const ULONGLONG stop_start = GetTickCount64();
+        sess->polling.store(false, std::memory_order_release);
+        sess->poll_cv.notify_all();
+        bool poller_exited = sess->exited.load(std::memory_order_acquire);
+        while (!poller_exited && GetTickCount64() - stop_start < timeout_ms) {
+            std::unique_lock<std::mutex> lk(sess->poll_wait_mutex);
+            sess->poll_cv.wait_for(lk, std::chrono::milliseconds(5), [&sess]() {
+                return sess->exited.load(std::memory_order_acquire);
+            });
+            poller_exited = sess->exited.load(std::memory_order_acquire);
         }
-        sess->exited.store(true);
+        diag::log_tagged_fmt("pg_sniff", "poller_stop reason=%s sid=%u pid=%u exited=%d elapsed_ms=%llu",
+            reason ? reason : "unknown",
+            sess->session_id,
+            sess->pid,
+            poller_exited ? 1 : 0,
+            static_cast<unsigned long long>(GetTickCount64() - stop_start));
+        return poller_exited;
     }
 
-    void drain_ring(pg_session_t* sess) {
+    static void poll_ring(std::shared_ptr<pg_session_t> sess) {
+        if (!sess)
+            return;
+        while (sess->polling.load(std::memory_order_acquire)) {
+            if (driver_bridge::using_kernel_driver()) {
+                drain_ring(sess.get());
+            }
+
+            if (sess->polling.load(std::memory_order_acquire)) {
+                std::unique_lock<std::mutex> lk(sess->poll_wait_mutex);
+                sess->poll_cv.wait_for(lk, std::chrono::milliseconds(50), [&sess]() {
+                    return !sess->polling.load(std::memory_order_acquire);
+                });
+            }
+        }
+        sess->exited.store(true, std::memory_order_release);
+        sess->poll_cv.notify_all();
+        diag::log_tagged_fmt("pg_sniff", "poller_exit sid=%u pid=%u ring=0x%llX sc=0x%llX",
+            sess->session_id,
+            sess->pid,
+            static_cast<unsigned long long>(sess->ring_addr),
+            static_cast<unsigned long long>(sess->sc_addr));
+    }
+
+    static void drain_ring(pg_session_t* sess) {
         const ULONGLONG t0 = GetTickCount64();
         std::unique_lock<std::mutex> drain_lk(sess->drain_mutex, std::try_to_lock);
         if (!drain_lk.owns_lock()) {
@@ -1276,7 +1327,7 @@ private:
         }
     }
 
-    pg_capture_record_t build_capture_record(pg_session_t* sess, const pg_capture_t& entry, bool include_payload = true) {
+    static pg_capture_record_t build_capture_record(pg_session_t* sess, const pg_capture_t& entry, bool include_payload = true) {
         pg_capture_record_t record;
         record.metadata = entry;
         record.payload_addr = choose_payload_address(sess, entry, record.payload_source);

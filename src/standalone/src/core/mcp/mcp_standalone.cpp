@@ -32,6 +32,7 @@
 #include <cstdlib>
 #include <exception>
 #include <memory>
+#include <map>
 #include <thread>
 
 namespace mcp_standalone
@@ -50,6 +51,60 @@ namespace
     std::atomic<bool> g_cached_health_ready{false};
     thread_local std::uint64_t tls_http_request_id = 0;
     thread_local std::uint64_t tls_http_request_start_tick = 0;
+
+    struct server_worker_lifetime_t {
+        aida::infra::win_thread::joinable_thread_t thread;
+        std::mutex mtx;
+        std::condition_variable cv;
+        bool start_completed = false;
+        bool start_succeeded = false;
+    };
+
+    std::mutex g_server_worker_lifetime_mtx;
+    std::map<server_t*, std::shared_ptr<server_worker_lifetime_t>> g_server_worker_lifetimes;
+
+    static std::shared_ptr<server_worker_lifetime_t> find_server_worker_lifetime(server_t* owner)
+    {
+        std::lock_guard<std::mutex> lk(g_server_worker_lifetime_mtx);
+        auto it = g_server_worker_lifetimes.find(owner);
+        return it == g_server_worker_lifetimes.end() ? nullptr : it->second;
+    }
+
+    static bool install_server_worker_lifetime(server_t* owner, const std::shared_ptr<server_worker_lifetime_t>& state)
+    {
+        std::lock_guard<std::mutex> lk(g_server_worker_lifetime_mtx);
+        auto inserted = g_server_worker_lifetimes.emplace(owner, state);
+        return inserted.second;
+    }
+
+    static void erase_server_worker_lifetime(server_t* owner, const std::shared_ptr<server_worker_lifetime_t>& state)
+    {
+        std::lock_guard<std::mutex> lk(g_server_worker_lifetime_mtx);
+        auto it = g_server_worker_lifetimes.find(owner);
+        if (it != g_server_worker_lifetimes.end() && it->second == state)
+            g_server_worker_lifetimes.erase(it);
+    }
+
+    static void mark_server_worker_start(const std::shared_ptr<server_worker_lifetime_t>& state, bool succeeded)
+    {
+        if (!state)
+            return;
+        {
+            std::lock_guard<std::mutex> lk(state->mtx);
+            state->start_succeeded = succeeded;
+            state->start_completed = true;
+        }
+        state->cv.notify_all();
+    }
+
+    static bool wait_server_worker_start(const std::shared_ptr<server_worker_lifetime_t>& state)
+    {
+        if (!state)
+            return false;
+        std::unique_lock<std::mutex> lk(state->mtx);
+        state->cv.wait(lk, [state]() { return state->start_completed; });
+        return state->start_succeeded;
+    }
 
     static std::uint64_t mcp_now_ms()
     {
@@ -145,16 +200,15 @@ namespace
             auto state = _state;
             state->shutdown.store(true, std::memory_order_release);
             std::unique_lock<std::mutex> lk(state->mtx);
-            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
             while (state->pending.load(std::memory_order_acquire) != 0) {
-                if (state->cv.wait_until(lk, deadline, [state]() {
+                if (state->cv.wait_for(lk, std::chrono::seconds(10), [state]() {
                     return state->pending.load(std::memory_order_acquire) == 0;
                 })) {
                     break;
                 }
                 diag::log_tagged_fmt("mcp_srv", "http_task_queue shutdown timeout pending=%zu",
                     state->pending.load(std::memory_order_acquire));
-                break;
+                log_work_queue_stats("http_task_queue shutdown waiting");
             }
             log_work_queue_stats("http_task_queue shutdown");
         }
@@ -1411,6 +1465,20 @@ bool server_t::start(int port)
         return true;
     }
 
+    if (auto prior = find_server_worker_lifetime(this)) {
+        if (!_server_done.load(std::memory_order_acquire)) {
+            diag::log_tagged_fmt("mcp_srv", "start rejected server worker already starting port=%d", port);
+            return false;
+        }
+        if (prior->thread.joinable() && !prior->thread.join_for(10000)) {
+            diag::log_tagged_fmt("mcp_srv", "start prior worker join timeout worker_tid=%u running=%d",
+                static_cast<unsigned>(_server_worker_tid.load(std::memory_order_acquire)),
+                _running.load(std::memory_order_acquire) ? 1 : 0);
+            prior->thread.join();
+        }
+        erase_server_worker_lifetime(this, prior);
+    }
+
     _stop_requested = false;
     _port = 0;
 
@@ -1420,9 +1488,16 @@ bool server_t::start(int port)
         return false;
     }
 
+    auto worker_lifetime = std::make_shared<server_worker_lifetime_t>();
     _server_done.store(false, std::memory_order_release);
-    log_work_queue_stats("start before post");
-    const bool posted = critical_work_queue::post([this, port]() {
+    if (!install_server_worker_lifetime(this, worker_lifetime)) {
+        _server_done.store(true, std::memory_order_release);
+        diag::log_tagged_fmt("mcp_srv", "start rejected server worker lifetime already installed port=%d", port);
+        return false;
+    }
+
+    std::string worker_err;
+    const bool started = worker_lifetime->thread.start([this, port]() {
         const DWORD tid = GetCurrentThreadId();
         _server_worker_tid.store(static_cast<std::uint32_t>(tid), std::memory_order_release);
         diag::log_tagged_fmt("mcp_srv", "server_worker starting port=%d tid=%lu", port, static_cast<unsigned long>(tid));
@@ -1439,14 +1514,15 @@ bool server_t::start(int port)
         diag::log_tagged_fmt("mcp_srv", "server_worker exited port=%d tid=%lu", port, static_cast<unsigned long>(GetCurrentThreadId()));
         _server_worker_tid.store(0, std::memory_order_release);
         _server_done.store(true, std::memory_order_release);
-    });
-    if (!posted) {
-        diag::log_tagged("mcp_srv", "start critical_queue post failed");
-        log_work_queue_stats("start post_failed");
+    }, &worker_err, aida::infra::win_thread::default_stack_reserve, "mcp_server_worker");
+    mark_server_worker_start(worker_lifetime, started);
+    if (!started) {
+        diag::log_tagged_fmt("mcp_srv", "start server worker start failed err='%s'", worker_err.empty() ? "<none>" : worker_err.c_str());
+        erase_server_worker_lifetime(this, worker_lifetime);
         _server_done.store(true, std::memory_order_release);
         return false;
     }
-    diag::log_tagged_fmt("mcp_srv", "start critical_queue post ok port=%d", port);
+    diag::log_tagged_fmt("mcp_srv", "start server worker thread ok port=%d", port);
 
     for (int i = 0; i < 500 && !_running.load() && !_server_done.load(std::memory_order_acquire) && !_stop_requested.load(); ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -1462,6 +1538,15 @@ void server_t::stop()
     const bool on_server_worker = _server_worker_tid.load(std::memory_order_acquire) == static_cast<std::uint32_t>(GetCurrentThreadId());
     if (!_running.load() && _server_done.load(std::memory_order_acquire))
     {
+        if (auto worker_lifetime = find_server_worker_lifetime(this)) {
+            if (worker_lifetime->thread.joinable() && !worker_lifetime->thread.join_for(10000)) {
+                diag::log_tagged_fmt("mcp_srv", "stop already_stopped join timeout worker_tid=%u running=%d",
+                    static_cast<unsigned>(_server_worker_tid.load(std::memory_order_acquire)),
+                    _running.load(std::memory_order_acquire) ? 1 : 0);
+                worker_lifetime->thread.join();
+            }
+            erase_server_worker_lifetime(this, worker_lifetime);
+        }
         diag::log_tagged_fmt("mcp_srv", "stop already stopped");
         return;
     }
@@ -1471,22 +1556,38 @@ void server_t::stop()
         if (_active_server)
             static_cast<httplib::Server*>(_active_server)->stop();
     }
-    if (!on_server_worker) {
+    auto worker_lifetime = find_server_worker_lifetime(this);
+    if (!worker_lifetime) {
         const std::uint64_t wait_start = mcp_now_ms();
         while (!_server_done.load(std::memory_order_acquire)) {
             const std::uint64_t elapsed = mcp_now_ms() - wait_start;
-            if (elapsed > 10000) {
-                diag::log_tagged_fmt("mcp_srv", "stop wait timeout elapsed_ms=%llu worker_tid=%u running=%d",
+            if ((elapsed % 10000) < 2) {
+                diag::log_tagged_fmt("mcp_srv", "stop waiting_no_worker elapsed_ms=%llu worker_tid=%u running=%d",
                     static_cast<unsigned long long>(elapsed),
                     static_cast<unsigned>(_server_worker_tid.load(std::memory_order_acquire)),
                     _running.load(std::memory_order_acquire) ? 1 : 0);
-                log_work_queue_stats("stop wait timeout");
-                break;
+                log_work_queue_stats("stop waiting_no_worker");
             }
-            if (elapsed == 1000 || elapsed == 3000 || elapsed == 5000)
-                log_work_queue_stats("stop waiting");
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
+        diag::log_tagged_fmt("mcp_srv", "stop done");
+        return;
+    }
+    const bool started = wait_server_worker_start(worker_lifetime);
+    if (!started) {
+        erase_server_worker_lifetime(this, worker_lifetime);
+        diag::log_tagged_fmt("mcp_srv", "stop done worker_not_started");
+        return;
+    }
+    if (!on_server_worker && worker_lifetime->thread.joinable()) {
+        if (!worker_lifetime->thread.join_for(10000)) {
+            diag::log_tagged_fmt("mcp_srv", "stop join timeout worker_tid=%u running=%d",
+                static_cast<unsigned>(_server_worker_tid.load(std::memory_order_acquire)),
+                _running.load(std::memory_order_acquire) ? 1 : 0);
+            log_work_queue_stats("stop join timeout");
+            worker_lifetime->thread.join();
+        }
+        erase_server_worker_lifetime(this, worker_lifetime);
     }
     diag::log_tagged_fmt("mcp_srv", "stop done");
 }

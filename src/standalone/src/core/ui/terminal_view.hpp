@@ -5,7 +5,7 @@
 #define NOMINMAX
 #include <windows.h>
 
-#include "work_queue.hpp"
+#include "../infra/win_thread.hpp"
 #include "imgui/imgui.h"
 #include "theme.hpp"
 #include "clock.hpp"
@@ -18,7 +18,6 @@
 #include <deque>
 #include <mutex>
 #include <string>
-#include <thread>
 #include <vector>
 
 namespace terminal_view
@@ -43,7 +42,7 @@ struct TerminalSession
     HANDLE               hThread      = INVALID_HANDLE_VALUE;
 
 
-    std::thread          reader_thread;
+    aida::infra::win_thread::joinable_thread_t reader_thread;
     std::atomic<bool>    stop_reader{false};
     std::atomic<bool>    reader_done{true};
 
@@ -70,7 +69,7 @@ struct TerminalSession
 
 
     std::string          title = "Terminal";
-    bool                 alive = false;
+    std::atomic<bool>    alive{false};
 
 
     char                 input_buf[4096] = {};
@@ -344,16 +343,21 @@ inline void process_output(TerminalSession& s, const char* data, size_t len)
 
 inline void reader_thread_func(TerminalSession* s)
 {
+    if (!s)
+        return;
     char buf[4096];
-    while (!s->stop_reader.load(std::memory_order_acquire)) {
-        DWORD bytes_read = 0;
-        BOOL ok = ReadFile(s->hPipeIn, buf, sizeof(buf), &bytes_read, nullptr);
-        if (!ok || bytes_read == 0) {
-
-            s->alive = false;
-            break;
+    try {
+        while (!s->stop_reader.load(std::memory_order_acquire)) {
+            DWORD bytes_read = 0;
+            BOOL ok = ReadFile(s->hPipeIn, buf, sizeof(buf), &bytes_read, nullptr);
+            if (!ok || bytes_read == 0) {
+                s->alive.store(false, std::memory_order_release);
+                break;
+            }
+            process_output(*s, buf, bytes_read);
         }
-        process_output(*s, buf, bytes_read);
+    } catch (...) {
+        s->alive.store(false, std::memory_order_release);
     }
     s->reader_done.store(true, std::memory_order_release);
 }
@@ -441,13 +445,42 @@ inline bool create_session(TerminalSession& s, const wchar_t* shell = nullptr)
 
     s.hProcess = pi.hProcess;
     s.hThread  = pi.hThread;
-    s.alive    = true;
+    s.alive.store(true, std::memory_order_release);
 
 
-    s.stop_reader.store(false);
+    s.stop_reader.store(false, std::memory_order_release);
     s.reader_done.store(false, std::memory_order_release);
-    s.reader_thread = {};
-    work_queue::post([&s]() { reader_thread_func(&s); });
+    std::string reader_err;
+    if (!s.reader_thread.start([&s]() { reader_thread_func(&s); },
+            &reader_err,
+            aida::infra::win_thread::default_stack_reserve,
+            "terminal_reader")) {
+        s.stop_reader.store(true, std::memory_order_release);
+        s.reader_done.store(true, std::memory_order_release);
+        s.alive.store(false, std::memory_order_release);
+        if (s.hPC != INVALID_HANDLE_VALUE) {
+            ClosePseudoConsole(s.hPC);
+            s.hPC = INVALID_HANDLE_VALUE;
+        }
+        if (s.hPipeIn != INVALID_HANDLE_VALUE) {
+            CloseHandle(s.hPipeIn);
+            s.hPipeIn = INVALID_HANDLE_VALUE;
+        }
+        if (s.hPipeOut != INVALID_HANDLE_VALUE) {
+            CloseHandle(s.hPipeOut);
+            s.hPipeOut = INVALID_HANDLE_VALUE;
+        }
+        if (s.hProcess != INVALID_HANDLE_VALUE) {
+            TerminateProcess(s.hProcess, 1);
+            CloseHandle(s.hProcess);
+            s.hProcess = INVALID_HANDLE_VALUE;
+        }
+        if (s.hThread != INVALID_HANDLE_VALUE) {
+            CloseHandle(s.hThread);
+            s.hThread = INVALID_HANDLE_VALUE;
+        }
+        return false;
+    }
 
     return true;
 }
@@ -455,7 +488,7 @@ inline bool create_session(TerminalSession& s, const wchar_t* shell = nullptr)
 
 inline void send_input(TerminalSession& s, const char* data, size_t len)
 {
-    if (s.hPipeOut == INVALID_HANDLE_VALUE || !s.alive)
+    if (s.hPipeOut == INVALID_HANDLE_VALUE || !s.alive.load(std::memory_order_acquire))
         return;
     DWORD written = 0;
     WriteFile(s.hPipeOut, data, static_cast<DWORD>(len), &written, nullptr);
@@ -496,7 +529,23 @@ inline void resize_pty(TerminalSession& s, int cols, int rows)
 inline void destroy_session(TerminalSession& s)
 {
     s.stop_reader.store(true, std::memory_order_release);
-    s.alive = false;
+    s.alive.store(false, std::memory_order_release);
+
+    unsigned reader_tid = 0;
+    const HANDLE log_pipe_in = s.hPipeIn;
+    const HANDLE log_pipe_out = s.hPipeOut;
+    const HPCON log_hpc = s.hPC;
+    const HANDLE log_process = s.hProcess;
+    if (s.reader_thread.joinable()) {
+        reader_tid = s.reader_thread.id();
+        if (reader_tid != 0) {
+            HANDLE hThread = OpenThread(THREAD_TERMINATE, FALSE, static_cast<DWORD>(reader_tid));
+            if (hThread) {
+                CancelSynchronousIo(hThread);
+                CloseHandle(hThread);
+            }
+        }
+    }
 
     if (s.hPipeOut != INVALID_HANDLE_VALUE) {
         CloseHandle(s.hPipeOut);
@@ -506,17 +555,28 @@ inline void destroy_session(TerminalSession& s)
         CloseHandle(s.hPipeIn);
         s.hPipeIn = INVALID_HANDLE_VALUE;
     }
-    if (s.reader_thread.joinable())
-        s.reader_thread.join();
-    while (!s.reader_done.load(std::memory_order_acquire)) {
-        Sleep(1);
-    }
     if (s.hPC != INVALID_HANDLE_VALUE) {
         ClosePseudoConsole(s.hPC);
         s.hPC = INVALID_HANDLE_VALUE;
     }
-    if (s.hProcess != INVALID_HANDLE_VALUE) {
+    if (s.hProcess != INVALID_HANDLE_VALUE)
         TerminateProcess(s.hProcess, 0);
+    if (s.reader_thread.joinable()) {
+        if (!s.reader_thread.join_for(10000)) {
+            diag::log_tagged_fmt("terminal",
+                "reader_join_timeout tid=%u pipe_in=%p pipe_out=%p hpc=%p process=%p",
+                reader_tid,
+                log_pipe_in,
+                log_pipe_out,
+                log_hpc,
+                log_process);
+            s.reader_thread.join();
+        }
+    }
+    while (!s.reader_done.load(std::memory_order_acquire)) {
+        Sleep(1);
+    }
+    if (s.hProcess != INVALID_HANDLE_VALUE) {
         CloseHandle(s.hProcess);
         s.hProcess = INVALID_HANDLE_VALUE;
     }
@@ -674,7 +734,7 @@ inline void render_terminal(TerminalSession& s, const ImVec2& size, ImU32 bg_col
         }
 
 
-        if (s.alive && s.cursor_row >= start_line && s.cursor_row < start_line + vis_rows) {
+        if (s.alive.load(std::memory_order_acquire) && s.cursor_row >= start_line && s.cursor_row < start_line + vis_rows) {
             const float cx = origin.x + s.cursor_col * char_width;
             const float cy = origin.y + (s.cursor_row - start_line) * line_height;
             float blink_alpha = 0.85f;
