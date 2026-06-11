@@ -681,6 +681,12 @@ namespace detail
     using jit_hook_fn = bool(*)(vm_state_t&, const uint8_t*, uint32_t);
     inline jit_hook_fn g_jit_hook = nullptr;
 
+    inline std::recursive_mutex& vm_execution_mutex()
+    {
+        static std::recursive_mutex m;
+        return m;
+    }
+
     inline bool verify_handler_pool();
     inline bool verify_handler_pool(handler_pool_t& pool);
     inline void build_handler_pool(const uint8_t* reverse_map, uint64_t pool_seed);
@@ -3245,6 +3251,9 @@ namespace detail
 
     inline void build_handler_pool(handler_pool_t& pool, const uint8_t* reverse_map, uint64_t pool_seed)
     {
+        pool.poly_initialized = false;
+        pool.handler_set.initialized = false;
+
         handler_fn base_handlers[OP_MAX] = {};
         base_handlers[OP_NOP]       = h_nop;
         base_handlers[OP_LOAD_IMM]  = h_load_imm;
@@ -3377,6 +3386,7 @@ namespace detail
         pool.pool_seed = pool_seed;
         pool.generation++;
         memcpy(pool.reverse_map, reverse_map, 256);
+        pool.handler_set.initialized = false;
     }
 
     inline void build_handler_pool(const uint8_t* reverse_map, uint64_t pool_seed)
@@ -3401,6 +3411,8 @@ namespace detail
 
     inline void init_vm(vm_state_t& vm, uint64_t seed, handler_pool_t* pool)
     {
+        std::lock_guard<std::recursive_mutex> guard(vm_execution_mutex());
+
         memset(&vm, 0, sizeof(vm));
         vm.stack_size = 4096;
         vm.stack = new uint8_t[vm.stack_size];
@@ -3511,6 +3523,8 @@ namespace detail
 
     inline uint64_t vm_execute(vm_state_t& vm, const uint8_t* bytecode, uint32_t bc_size)
     {
+        std::lock_guard<std::recursive_mutex> guard(vm_execution_mutex());
+
         if (dag_active(vm))
         {
             vm.dag_node = 0;
@@ -4082,6 +4096,8 @@ inline uint64_t g_server_poly_seed = 0;
 
 inline void reseed_from_server(uint64_t server_nonce)
 {
+    std::lock_guard<std::recursive_mutex> guard(detail::vm_execution_mutex());
+
     uint8_t nonce_hex[17];
     for (int i = 0; i < 8; ++i)
     {

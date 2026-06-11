@@ -2265,7 +2265,7 @@ namespace
 
     arc_loader::loaded_module_t  s_arc_module{};
     std::timed_mutex             s_arc_mtx;
-    bool                         s_arc_loaded = false;
+    std::atomic<bool>            s_arc_loaded{false};
     std::atomic<bool>            s_arc_fetch_deferred{false};
     std::atomic<bool>            s_arc_download_in_progress{false};
     std::atomic<uint64_t>        s_activation_completed_at_ms{0};
@@ -2470,6 +2470,22 @@ namespace
             return ERROR_INVALID_PARAMETER;
         __try {
             *out = fn();
+            return ERROR_SUCCESS;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return GetExceptionCode();
+        }
+    }
+
+    __declspec(noinline) DWORD arc_call_comm_bridge_callback_seh(standalone_license::arc_comm_bridge_callback_t callback,
+                                                                 const arc_comm_vtable_t* bridge,
+                                                                 void* ctx,
+                                                                 BOOL* out_ok)
+    {
+        if (out_ok) *out_ok = FALSE;
+        if (!callback || !bridge || !out_ok)
+            return ERROR_INVALID_PARAMETER;
+        __try {
+            *out_ok = callback(bridge, ctx) ? TRUE : FALSE;
             return ERROR_SUCCESS;
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             return GetExceptionCode();
@@ -2750,7 +2766,7 @@ namespace
             *missing_out += name;
         };
 
-        if (!s_arc_loaded)
+        if (!s_arc_loaded.load(std::memory_order_acquire))
         {
             add_missing("arc_not_loaded");
             return false;
@@ -3099,7 +3115,8 @@ namespace
 
     bool attempt_deferred_arc_fetch(settings_sa_t& settings, const std::string& hwid)
     {
-        if (!s_arc_fetch_deferred.load(std::memory_order_acquire) || s_arc_loaded)
+        if (!s_arc_fetch_deferred.load(std::memory_order_acquire) ||
+            s_arc_loaded.load(std::memory_order_acquire))
             return false;
         if (defer_arc_fetch_if_full_test_running("arc_deferred_fetch"))
             return false;
@@ -3252,7 +3269,7 @@ namespace
         uint64_t c = s_state_c.load(std::memory_order_acquire);
         uint64_t magic = s_magic.load(std::memory_order_acquire);
         uint64_t arc_magic = s_arc_magic.load(std::memory_order_acquire);
-        bool arc_loaded_snapshot = s_arc_loaded;
+        bool arc_loaded_snapshot = s_arc_loaded.load(std::memory_order_acquire);
         bool arc_grace_snapshot = arc_grace_active();
         uint64_t arc_state = (arc_loaded_snapshot || arc_grace_snapshot)
             ? s_arc_state.load(std::memory_order_acquire)
@@ -5298,7 +5315,7 @@ namespace
                     char dbg_arc[256];
                     _snprintf_s(dbg_arc, sizeof(dbg_arc), _TRUNCATE,
                         "heartbeat_compose_arc loaded=%d fn_set=%d ex_fn_set=%d invoked=%d valid=%d proof_token_set=%d",
-                        s_arc_loaded ? 1 : 0,
+                        s_arc_loaded.load(std::memory_order_acquire) ? 1 : 0,
                         s_fn_arc_heartbeat ? 1 : 0,
                         s_fn_arc_heartbeat_ex ? 1 : 0,
                         arc_hb_invoked ? 1 : 0,
@@ -5800,7 +5817,7 @@ namespace
             lic_log_fmt("apply_valid_response_envelope_rejected pending_activation=%d current_valid=%d arc_loaded=%d",
                 pending_activation ? 1 : 0,
                 check_obfuscated_valid() ? 1 : 0,
-                s_arc_loaded ? 1 : 0);
+                s_arc_loaded.load(std::memory_order_acquire) ? 1 : 0);
             if (!pending_activation && check_obfuscated_valid())
             {
                 anti_tamper::enforce_violation_id(
@@ -6003,7 +6020,7 @@ namespace
             lic_log("apply_valid_response_session_token_changed_resetting_gate_session");
             aida::gate_tokens::clear_session();
             ratchet_clear();
-            if (s_arc_loaded)
+            if (s_arc_loaded.load(std::memory_order_acquire))
             {
                 lic_log_fmt("apply_valid_response_session_token_changed_arc_reseed_begin session_len=%zu session_hash=0x%016llX",
                     settings.license_session_token.size(),
@@ -6063,7 +6080,7 @@ namespace
         lic_log("apply_valid_response_post_validity_commit");
 
         lic_log("apply_valid_response_pre_save");
-        const bool arc_cache_ok = s_arc_loaded;
+        const bool arc_cache_ok = s_arc_loaded.load(std::memory_order_acquire);
         settings.license_arc_load_ok = arc_cache_ok;
         settings.save();
         lic_log("apply_valid_response_post_save");
@@ -6412,7 +6429,8 @@ namespace
         if (defer_arc_fetch_if_full_test_running("arc_download"))
             return false;
 
-        if (!s_arc_loaded && !arc_driver_ready_for_load("arc_download"))
+        if (!s_arc_loaded.load(std::memory_order_acquire) &&
+            !arc_driver_ready_for_load("arc_download"))
         {
             if (!ensure_driver_server_token_relay(settings, "arc_download_ready_recover") ||
                 !arc_driver_ready_for_load("arc_download_recovered"))
@@ -6540,7 +6558,7 @@ namespace
         {
             lic_log_fmt("arc_lock_timeout attempt=%u loaded=%d downloading=%d",
                 attempt_number,
-                s_arc_loaded ? 1 : 0,
+                s_arc_loaded.load(std::memory_order_acquire) ? 1 : 0,
                 s_arc_download_in_progress.load(std::memory_order_acquire) ? 1 : 0);
             arc_loader::mark_error_fatal(
                 "ARC state lock timed out during activation. Please restart AiDAStandalone.exe and try again.");
@@ -6548,10 +6566,10 @@ namespace
         }
         lic_log_fmt("arc_lock_acquired attempt=%u loaded=%d",
             attempt_number,
-            s_arc_loaded ? 1 : 0);
+            s_arc_loaded.load(std::memory_order_acquire) ? 1 : 0);
 
 
-        if (s_arc_loaded)
+        if (s_arc_loaded.load(std::memory_order_acquire))
         {
             log_arc_status("arc_reseed_already_loaded_begin");
             if (settings.license_session_token.empty() || hwid.empty())
@@ -7679,7 +7697,7 @@ namespace
                 log_arc_status(dbg);
             }
 
-            s_arc_loaded = true;
+            s_arc_loaded.store(true, std::memory_order_release);
             set_arc_obfuscated_state(true);
 
             lk.unlock();
@@ -7769,7 +7787,7 @@ namespace
                 s_arc_unloading.store(false, std::memory_order_release);
             return;
         }
-        if (s_arc_loaded && s_fn_arc_cleanup) {
+        if (s_arc_loaded.load(std::memory_order_acquire) && s_fn_arc_cleanup) {
             DWORD cleanup_seh = arc_call_cleanup_seh(s_fn_arc_cleanup);
             if (cleanup_seh != ERROR_SUCCESS)
                 lic_log_fmt("unload_arc_cleanup_seh code=0x%08lX", static_cast<unsigned long>(cleanup_seh));
@@ -7786,7 +7804,7 @@ namespace
         s_fn_arc_set_key_seed = nullptr;
         s_fn_arc_unseal_feature = nullptr;
         s_fn_arc_copy_last_status = nullptr;
-        s_arc_loaded = false;
+        s_arc_loaded.store(false, std::memory_order_release);
         set_arc_obfuscated_state(false);
         {
             std::string state_err;
@@ -7844,7 +7862,7 @@ namespace
                 : err_copy;
             return false;
         }
-        settings.license_arc_load_ok = s_arc_loaded;
+        settings.license_arc_load_ok = s_arc_loaded.load(std::memory_order_acquire);
         settings.save();
 
         payload = json::parse(settings.license_sig_payload, nullptr, false);
@@ -7950,7 +7968,8 @@ namespace
             return false;
         }
 
-        if (s_arc_loaded && !try_load_arc_with_retries(settings, reval_hwid))
+        if (s_arc_loaded.load(std::memory_order_acquire) &&
+            !try_load_arc_with_retries(settings, reval_hwid))
         {
             lic_log("heartbeat_revalidation_before_pending_arc_reseed_failed");
             const std::string arc_error = arc_loader::last_error();
@@ -7958,7 +7977,7 @@ namespace
                 pending_error = arc_error;
             return false;
         }
-        if (!s_arc_loaded)
+        if (!s_arc_loaded.load(std::memory_order_acquire))
         {
             if (s_activation_completed_at_ms.load(std::memory_order_acquire) == 0)
                 mark_activation_completed();
@@ -8171,7 +8190,7 @@ namespace
                         }
                         if (s_activation_completed_at_ms.load(std::memory_order_acquire) == 0)
                             mark_activation_completed();
-                        if (!s_arc_loaded)
+                        if (!s_arc_loaded.load(std::memory_order_acquire))
                         {
                             lic_diag::thread_canary("pre_attempt_deferred_arc_fetch_after_revalidation");
                             attempt_deferred_arc_fetch(*settings, s_cached_hwid);
@@ -8220,7 +8239,7 @@ namespace
             lic_diag::thread_canary("post_apply_valid_response");
             if (s_activation_completed_at_ms.load(std::memory_order_acquire) == 0)
                 mark_activation_completed();
-            if (!s_arc_loaded)
+            if (!s_arc_loaded.load(std::memory_order_acquire))
             {
                 lic_diag::thread_canary("pre_attempt_deferred_arc_fetch");
                 attempt_deferred_arc_fetch(*settings, s_cached_hwid);
@@ -8765,6 +8784,39 @@ namespace standalone_license
         return user_facing_license_error(s_error);
     }
 
+    void invalidate_for_enforcement(const char* reason)
+    {
+        const char* reason_text = (reason && *reason) ? reason : "enforcement";
+        lic_log_fmt("enforcement_license_invalidate_begin reason=%.128s loaded=%d unloading=%d inflight=%lld",
+            reason_text,
+            s_arc_loaded.load(std::memory_order_acquire) ? 1 : 0,
+            s_arc_unloading.load(std::memory_order_acquire) ? 1 : 0,
+            static_cast<long long>(s_arc_call_inflight.load(std::memory_order_acquire)));
+        s_worker_epoch.fetch_add(1, std::memory_order_acq_rel);
+        s_stop.store(true, std::memory_order_release);
+        wait_for_worker_done(s_heartbeat_done, "heartbeat_enforcement", 2000);
+        wait_for_worker_done(s_srv_refresh_done, "srv_refresh_enforcement", 2000);
+        cancel_silent_kill();
+        reset_arc_fetch_state();
+        reset_activation_completed_at();
+        reset_license_clients();
+        s_proof_hash.store(0, std::memory_order_release);
+        s_heartbeat_counter.store(0, std::memory_order_release);
+        s_replay_request_seq.store(0, std::memory_order_release);
+        s_magic.store(S_MAGIC_INIT, std::memory_order_release);
+        set_obfuscated_valid(false);
+        anti_tamper::state::get().license_pending_activation.store(true, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lk(s_state_mtx);
+            s_error = std::string("Runtime enforcement invalidated license state: ") + reason_text;
+        }
+        lic_log_fmt("enforcement_license_invalidate_done reason=%.128s loaded=%d unloading=%d inflight=%lld",
+            reason_text,
+            s_arc_loaded.load(std::memory_order_acquire) ? 1 : 0,
+            s_arc_unloading.load(std::memory_order_acquire) ? 1 : 0,
+            static_cast<long long>(s_arc_call_inflight.load(std::memory_order_acquire)));
+    }
+
     void shutdown()
     {
         s_worker_epoch.fetch_add(1, std::memory_order_acq_rel);
@@ -9197,7 +9249,7 @@ namespace standalone_license
 
     bool is_arc_loaded()
     {
-        return s_arc_loaded;
+        return s_arc_loaded.load(std::memory_order_acquire);
     }
 
     bool is_arc_download_in_progress()
@@ -9228,25 +9280,37 @@ namespace standalone_license
         return s_activation_completed_at_ms.load(std::memory_order_acquire);
     }
 
-    const arc_comm_vtable_t* get_arc_comm_bridge()
+    bool with_arc_comm_bridge(arc_comm_bridge_callback_t callback, void* ctx)
     {
+        if (!callback)
+            return false;
         arc_call_guard_t guard;
         if (!guard.live())
-            return nullptr;
+            return false;
         if (!check_obfuscated_valid())
-            return nullptr;
+            return false;
         if (!anti_tamper::state::get().activation_hardening_done.load(std::memory_order_acquire))
-            return nullptr;
+            return false;
         if (!arc_required_exports_ready() || !s_fn_arc_get_comm_bridge)
-            return nullptr;
+            return false;
         const arc_comm_vtable_t* bridge = nullptr;
-        DWORD seh = arc_call_get_comm_bridge_seh(s_fn_arc_get_comm_bridge, &bridge);
+        const arc_get_comm_bridge_fn get_bridge = s_fn_arc_get_comm_bridge;
+        DWORD seh = arc_call_get_comm_bridge_seh(get_bridge, &bridge);
         if (seh != ERROR_SUCCESS)
         {
             lic_log_fmt("arc_get_comm_bridge_seh code=0x%08lX", static_cast<unsigned long>(seh));
-            return nullptr;
+            return false;
         }
-        return bridge;
+        if (!bridge)
+            return false;
+        BOOL callback_ok = FALSE;
+        DWORD callback_seh = arc_call_comm_bridge_callback_seh(callback, bridge, ctx, &callback_ok);
+        if (callback_seh != ERROR_SUCCESS)
+        {
+            lic_log_fmt("arc_comm_bridge_callback_seh code=0x%08lX", static_cast<unsigned long>(callback_seh));
+            return false;
+        }
+        return callback_ok == TRUE;
     }
 
     uint64_t arc_validate_tool(uint64_t tool_name_hash, uint64_t gate_token)

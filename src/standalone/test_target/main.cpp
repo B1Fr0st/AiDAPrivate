@@ -20,6 +20,9 @@
 #include "http_server_tests.h"
 #include "traffic_generator.h"
 #include "resident_state.h"
+#include "re_domain_fixtures.h"
+#include "protocol_re_tests.h"
+#include "protected_re_fixtures.h"
 #include "test_log.h"
 
 static std::atomic<bool> g_running{ true };
@@ -272,6 +275,10 @@ struct cli_args_t {
     uint32_t net_rate_ms;
     bool     no_external;
     bool     absorb_external_single_step;
+    bool     re_fixtures;
+    bool     re_fixture_window;
+    bool     proto_re_fixtures;
+    bool     protected_re_fixtures;
 };
 
 static cli_args_t parse_args(int argc, char* argv[]) {
@@ -284,6 +291,10 @@ static cli_args_t parse_args(int argc, char* argv[]) {
     args.net_rate_ms = 1000;
     args.no_external = false;
     args.absorb_external_single_step = false;
+    args.re_fixtures = true;
+    args.re_fixture_window = false;
+    args.proto_re_fixtures = true;
+    args.protected_re_fixtures = true;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
@@ -305,6 +316,18 @@ static cli_args_t parse_args(int argc, char* argv[]) {
             args.absorb_external_single_step = true;
         } else if (strcmp(argv[i], "--disable-single-step-absorber") == 0) {
             args.absorb_external_single_step = false;
+        } else if (strcmp(argv[i], "--disable-re-fixtures") == 0) {
+            args.re_fixtures = false;
+            args.proto_re_fixtures = false;
+            args.protected_re_fixtures = false;
+        } else if (strcmp(argv[i], "--disable-re-domain-fixtures") == 0) {
+            args.re_fixtures = false;
+        } else if (strcmp(argv[i], "--enable-re-window") == 0) {
+            args.re_fixture_window = true;
+        } else if (strcmp(argv[i], "--disable-proto-re-fixtures") == 0) {
+            args.proto_re_fixtures = false;
+        } else if (strcmp(argv[i], "--disable-protected-re-fixtures") == 0) {
+            args.protected_re_fixtures = false;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("AiDA Test Target - CLI test surface for AiDAStandalone.exe\n");
             printf("Usage: AiDA_TestTarget.exe [options]\n");
@@ -317,6 +340,11 @@ static cli_args_t parse_args(int argc, char* argv[]) {
             printf("  --no-external     Disable opportunistic external DNS/HTTP attempts (loopback only)\n");
             printf("  --absorb-external-single-step  Enable hostile external SINGLE_STEP absorption\n");
             printf("  --disable-single-step-absorber Keep external SINGLE_STEP absorption disabled (default)\n");
+            printf("  --disable-re-fixtures Disable all reverse-engineering fixtures\n");
+            printf("  --disable-re-domain-fixtures Disable RE domain memory/DX/RTTI fixtures\n");
+            printf("  --enable-re-window Create a small RE fixture target window/frame producer\n");
+            printf("  --disable-proto-re-fixtures Disable protocol RE loopback UDP fixture\n");
+            printf("  --disable-protected-re-fixtures Disable protected RE executable/SMC fixtures\n");
             printf("  --help, -h        Show this help\n");
             exit(0);
         }
@@ -561,6 +589,39 @@ int main(int argc, char* argv[]) {
         test_target::resident::init(rcfg, g_running);
     }
 
+    if (args.re_fixtures) {
+        test_target::re_fixtures::config_t rfcfg{};
+        rfcfg.verbose = args.verbose;
+        rfcfg.enable_window = args.re_fixture_window;
+        test_target::re_fixtures::init(rfcfg, g_running);
+    }
+
+    if (args.proto_re_fixtures) {
+        test_target::protocol_re::config_t pcfg{};
+        pcfg.verbose = args.verbose;
+        pcfg.enabled = true;
+        pcfg.rate_ms = args.net_rate_ms;
+        test_target::protocol_re::init(pcfg, g_running);
+    } else {
+        test_target::protocol_re::config_t pcfg{};
+        pcfg.verbose = args.verbose;
+        pcfg.enabled = false;
+        pcfg.rate_ms = args.net_rate_ms;
+        test_target::protocol_re::init(pcfg, g_running);
+    }
+
+    if (args.protected_re_fixtures) {
+        test_target::protected_re::config_t prcfg{};
+        prcfg.verbose = args.verbose;
+        prcfg.enabled = true;
+        test_target::protected_re::init(prcfg, g_running);
+    } else {
+        test_target::protected_re::config_t prcfg{};
+        prcfg.verbose = args.verbose;
+        prcfg.enabled = false;
+        test_target::protected_re::init(prcfg, g_running);
+    }
+
     HANDLE orchestrator_thread = CreateThread(nullptr, 0, workload_orchestrator, nullptr, 0, nullptr);
     if (orchestrator_thread) {
         printf("[MAIN] Workload orchestrator dispatched on background thread handle=%p\n", orchestrator_thread);
@@ -680,6 +741,10 @@ int main(int argc, char* argv[]) {
             g_debugger_veh_handle = nullptr;
         }
 
+        test_target::protocol_re::shutdown_all();
+        test_target::protected_re::shutdown_all();
+        test_target::re_fixtures::shutdown_all();
+
         if (h_ready_local) CloseHandle(h_ready_local);
         if (h_done_local) CloseHandle(h_done_local);
         if (h_ready_global) CloseHandle(h_ready_global);
@@ -715,6 +780,9 @@ int main(int argc, char* argv[]) {
     test_target::traffic::shutdown_all();
     test_target::http_server::shutdown_all();
     test_target::resident::shutdown_all();
+    test_target::protocol_re::shutdown_all();
+    test_target::protected_re::shutdown_all();
+    test_target::re_fixtures::shutdown_all();
 
     if (h_ready_local) CloseHandle(h_ready_local);
     if (h_done_local) CloseHandle(h_done_local);

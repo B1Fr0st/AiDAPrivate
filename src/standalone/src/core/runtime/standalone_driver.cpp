@@ -41,23 +41,11 @@ namespace
     std::mutex      g_state_mtx;
     HANDLE          g_process = nullptr;
 
-
-    const arc_comm_vtable_t* get_arc_vtable()
-    {
-        return standalone_license::get_arc_comm_bridge();
-    }
-
     using arc_set_process_id_fn = void (*)(uint32_t);
     using arc_solve_dtb_fn = uint64_t (*)();
     using arc_get_dtb_fn = uint64_t (*)();
     using arc_find_image_fn = uint64_t (*)();
     using arc_set_base_address_fn = void (*)(uint64_t);
-
-    struct guarded_arc_vtable_t
-    {
-        const arc_comm_vtable_t* table = nullptr;
-        DWORD exception_code = 0;
-    };
 
     struct arc_vtable_slots_t
     {
@@ -68,18 +56,6 @@ namespace
         arc_set_base_address_fn set_base_address = nullptr;
         DWORD exception_code = 0;
     };
-
-    __declspec(noinline) guarded_arc_vtable_t get_arc_vtable_guarded()
-    {
-        guarded_arc_vtable_t result{};
-        __try {
-            result.table = get_arc_vtable();
-        } __except(EXCEPTION_EXECUTE_HANDLER) {
-            result.table = nullptr;
-            result.exception_code = GetExceptionCode();
-        }
-        return result;
-    }
 
     __declspec(noinline) arc_vtable_slots_t read_arc_vtable_slots_guarded(const arc_comm_vtable_t* table)
     {
@@ -171,6 +147,313 @@ namespace
     {
         return static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(fn));
     }
+
+    struct arc_attach_resolution_t
+    {
+        uint32_t pid = 0;
+        ULONGLONG started_ms = 0;
+        uint64_t dtb = 0;
+        uint64_t image_base = 0;
+        bool solved = false;
+    };
+
+    bool arc_bridge_attach_resolution(arc_attach_resolution_t& ctx)
+    {
+        return standalone_license::with_arc_comm_bridge(
+            [](const arc_comm_vtable_t* table, void* user) -> bool {
+                auto* c = static_cast<arc_attach_resolution_t*>(user);
+                diag::log_tagged_critical_fmt("driver",
+                    "attach_post_get_arc_vtable vtable=%p exc=0x%08lX elapsed_ms=%llu",
+                    table,
+                    0ul,
+                    static_cast<unsigned long long>(GetTickCount64() - c->started_ms));
+                const arc_vtable_slots_t arc_slots = read_arc_vtable_slots_guarded(table);
+                diag::log_tagged_critical_fmt("driver",
+                    "attach_arc_vtable_slots exc=0x%08lX set=0x%llX solve=0x%llX get=0x%llX image=0x%llX base=0x%llX",
+                    static_cast<unsigned long>(arc_slots.exception_code),
+                    fn_bits(arc_slots.set_process_id),
+                    fn_bits(arc_slots.solve_dtb),
+                    fn_bits(arc_slots.get_dtb),
+                    fn_bits(arc_slots.find_image),
+                    fn_bits(arc_slots.set_base_address));
+                if (!arc_slots.set_process_id || !arc_slots.solve_dtb || !arc_slots.get_dtb ||
+                    !arc_slots.find_image || !arc_slots.set_base_address || arc_slots.exception_code != 0)
+                    return false;
+
+                diag::log_tagged_critical("driver", "attach_arc_vtable_pre_set_process_id");
+                const DWORD set_pid_exc = call_arc_set_process_id_guarded(arc_slots.set_process_id, c->pid);
+                diag::log_tagged_critical_fmt("driver",
+                    "attach_arc_vtable_post_set_process_id exc=0x%08lX",
+                    static_cast<unsigned long>(set_pid_exc));
+                diag::log_tagged_critical("driver", "attach_arc_vtable_pre_solve_dtb");
+                DWORD solve_exc = 0;
+                uint64_t dtb = (set_pid_exc == 0)
+                    ? call_arc_u64_guarded(arc_slots.solve_dtb, &solve_exc)
+                    : 0;
+                diag::log_tagged_critical_fmt("driver",
+                    "attach_arc_vtable_post_solve_dtb dtb=0x%llX exc=0x%08lX",
+                    static_cast<unsigned long long>(dtb),
+                    static_cast<unsigned long>(solve_exc));
+                if (dtb == 0 && set_pid_exc == 0 && solve_exc == 0) {
+                    DWORD get_exc = 0;
+                    diag::log_tagged_critical("driver", "attach_arc_vtable_pre_get_dtb");
+                    dtb = call_arc_get_dtb_guarded(arc_slots.get_dtb, &get_exc);
+                    diag::log_tagged_critical_fmt("driver",
+                        "attach_arc_vtable_post_get_dtb dtb=0x%llX exc=0x%08lX",
+                        static_cast<unsigned long long>(dtb),
+                        static_cast<unsigned long>(get_exc));
+                }
+                if (dtb == 0 || set_pid_exc != 0 || solve_exc != 0)
+                    return false;
+
+                c->dtb = dtb;
+                c->solved = true;
+                diag::log_tagged_critical("driver", "attach_arc_vtable_pre_find_image");
+                DWORD find_exc = 0;
+                const uint64_t image_base = call_arc_find_image_guarded(arc_slots.find_image, &find_exc);
+                diag::log_tagged_critical_fmt("driver",
+                    "attach_arc_vtable_post_find_image base=0x%llX exc=0x%08lX",
+                    static_cast<unsigned long long>(image_base),
+                    static_cast<unsigned long>(find_exc));
+                if (image_base != 0 && find_exc == 0) {
+                    c->image_base = image_base;
+                    const DWORD base_exc = call_arc_set_base_address_guarded(arc_slots.set_base_address, image_base);
+                    diag::log_tagged_critical_fmt("driver",
+                        "attach_arc_vtable_post_set_base_address base=0x%llX exc=0x%08lX",
+                        static_cast<unsigned long long>(image_base),
+                        static_cast<unsigned long>(base_exc));
+                }
+                return true;
+            },
+            &ctx);
+    }
+
+    bool arc_bridge_set_process_id(uint32_t pid)
+    {
+        struct ctx_t { uint32_t pid; } ctx{pid};
+        return standalone_license::with_arc_comm_bridge(
+            [](const arc_comm_vtable_t* table, void* user) -> bool {
+                auto* c = static_cast<ctx_t*>(user);
+                if (!table->set_process_id)
+                    return false;
+                table->set_process_id(c->pid);
+                return true;
+            },
+            &ctx);
+    }
+
+    uint64_t arc_bridge_solve_dtb(bool require_get_dtb)
+    {
+        struct ctx_t { bool require_get_dtb; uint64_t value; } ctx{require_get_dtb, 0};
+        standalone_license::with_arc_comm_bridge(
+            [](const arc_comm_vtable_t* table, void* user) -> bool {
+                auto* c = static_cast<ctx_t*>(user);
+                if (!table->solve_dtb || (c->require_get_dtb && !table->get_dtb))
+                    return false;
+                c->value = table->solve_dtb();
+                return true;
+            },
+            &ctx);
+        return ctx.value;
+    }
+
+    uint64_t arc_bridge_find_image()
+    {
+        struct ctx_t { uint64_t value; } ctx{};
+        standalone_license::with_arc_comm_bridge(
+            [](const arc_comm_vtable_t* table, void* user) -> bool {
+                auto* c = static_cast<ctx_t*>(user);
+                if (!table->find_image)
+                    return false;
+                c->value = table->find_image();
+                return true;
+            },
+            &ctx);
+        return ctx.value;
+    }
+
+    bool arc_bridge_set_base_address(uint64_t base)
+    {
+        struct ctx_t { uint64_t base; } ctx{base};
+        return standalone_license::with_arc_comm_bridge(
+            [](const arc_comm_vtable_t* table, void* user) -> bool {
+                auto* c = static_cast<ctx_t*>(user);
+                if (!table->set_base_address)
+                    return false;
+                table->set_base_address(c->base);
+                return true;
+            },
+            &ctx);
+    }
+
+    uint32_t arc_bridge_find_process(const char* name)
+    {
+        if (!name || !*name)
+            return 0;
+        struct ctx_t { const char* name; uint32_t pid; } ctx{name, 0};
+        standalone_license::with_arc_comm_bridge(
+            [](const arc_comm_vtable_t* table, void* user) -> bool {
+                auto* c = static_cast<ctx_t*>(user);
+                if (!table->find_process)
+                    return false;
+                c->pid = table->find_process(c->name);
+                return true;
+            },
+            &ctx);
+        return ctx.pid;
+    }
+
+    bool arc_bridge_clear_process_context()
+    {
+        return standalone_license::with_arc_comm_bridge(
+            [](const arc_comm_vtable_t* table, void*) -> bool {
+                if (!table->clear_process_context)
+                    return false;
+                table->clear_process_context();
+                return true;
+            },
+            nullptr);
+    }
+
+    size_t arc_bridge_read_raw(uint64_t address, void* buffer, size_t size, bool* invoked = nullptr)
+    {
+        if (invoked)
+            *invoked = false;
+        if (!buffer || size == 0)
+            return 0;
+        struct ctx_t { uint64_t address; void* buffer; size_t size; size_t bytes; bool invoked; } ctx{address, buffer, size, 0, false};
+        standalone_license::with_arc_comm_bridge(
+            [](const arc_comm_vtable_t* table, void* user) -> bool {
+                auto* c = static_cast<ctx_t*>(user);
+                if (!table->read_raw)
+                    return false;
+                c->invoked = true;
+                c->bytes = table->read_raw(c->address, c->buffer, c->size);
+                return true;
+            },
+            &ctx);
+        if (invoked)
+            *invoked = ctx.invoked;
+        return ctx.bytes;
+    }
+
+    size_t arc_bridge_write_raw(uint64_t address, const void* buffer, size_t size)
+    {
+        if (!buffer || size == 0)
+            return 0;
+        struct ctx_t { uint64_t address; const void* buffer; size_t size; size_t bytes; } ctx{address, buffer, size, 0};
+        standalone_license::with_arc_comm_bridge(
+            [](const arc_comm_vtable_t* table, void* user) -> bool {
+                auto* c = static_cast<ctx_t*>(user);
+                if (!table->write_raw)
+                    return false;
+                c->bytes = table->write_raw(c->address, c->buffer, c->size);
+                return true;
+            },
+            &ctx);
+        return ctx.bytes;
+    }
+
+    bool arc_bridge_enumerate_threads(void (*callback)(const arc_comm_vtable_t::thread_info_t*, void*),
+                                      void* callback_ctx,
+                                      uint32_t* out_count)
+    {
+        if (out_count)
+            *out_count = 0;
+        if (!callback)
+            return false;
+        struct ctx_t {
+            void (*callback)(const arc_comm_vtable_t::thread_info_t*, void*);
+            void* callback_ctx;
+            uint32_t count;
+        } ctx{callback, callback_ctx, 0};
+        bool ok = standalone_license::with_arc_comm_bridge(
+            [](const arc_comm_vtable_t* table, void* user) -> bool {
+                auto* c = static_cast<ctx_t*>(user);
+                if (!table->enumerate_threads)
+                    return false;
+                c->count = table->enumerate_threads(c->callback, c->callback_ctx);
+                return true;
+            },
+            &ctx);
+        if (out_count)
+            *out_count = ctx.count;
+        return ok;
+    }
+
+    bool arc_bridge_enumerate_memory_regions(void (*callback)(const arc_comm_vtable_t::memory_region_info_t*, void*),
+                                             void* callback_ctx,
+                                             uint32_t* out_count)
+    {
+        if (out_count)
+            *out_count = 0;
+        if (!callback)
+            return false;
+        struct ctx_t {
+            void (*callback)(const arc_comm_vtable_t::memory_region_info_t*, void*);
+            void* callback_ctx;
+            uint32_t count;
+        } ctx{callback, callback_ctx, 0};
+        bool ok = standalone_license::with_arc_comm_bridge(
+            [](const arc_comm_vtable_t* table, void* user) -> bool {
+                auto* c = static_cast<ctx_t*>(user);
+                if (!table->enumerate_memory_regions)
+                    return false;
+                c->count = table->enumerate_memory_regions(c->callback, c->callback_ctx);
+                return true;
+            },
+            &ctx);
+        if (out_count)
+            *out_count = ctx.count;
+        return ok;
+    }
+
+    bool arc_bridge_query_memory(uint64_t address, arc_comm_vtable_t::memory_region_info_t* out)
+    {
+        if (!out)
+            return false;
+        struct ctx_t { uint64_t address; arc_comm_vtable_t::memory_region_info_t* out; bool result; } ctx{address, out, false};
+        bool ok = standalone_license::with_arc_comm_bridge(
+            [](const arc_comm_vtable_t* table, void* user) -> bool {
+                auto* c = static_cast<ctx_t*>(user);
+                if (!table->query_memory)
+                    return false;
+                c->result = table->query_memory(c->address, c->out);
+                return true;
+            },
+            &ctx);
+        return ok && ctx.result;
+    }
+
+    bool arc_bridge_remote_call(uint64_t function_address,
+                                uint64_t arg1,
+                                uint64_t arg2,
+                                uint64_t arg3,
+                                uint64_t arg4,
+                                uint64_t& result)
+    {
+        struct ctx_t {
+            uint64_t function_address;
+            uint64_t arg1;
+            uint64_t arg2;
+            uint64_t arg3;
+            uint64_t arg4;
+            uint64_t result;
+        } ctx{function_address, arg1, arg2, arg3, arg4, 0};
+        bool ok = standalone_license::with_arc_comm_bridge(
+            [](const arc_comm_vtable_t* table, void* user) -> bool {
+                auto* c = static_cast<ctx_t*>(user);
+                if (!table->remote_call)
+                    return false;
+                c->result = table->remote_call(c->function_address, c->arg1, c->arg2, c->arg3, c->arg4);
+                return true;
+            },
+            &ctx);
+        if (ok)
+            result = ctx.result;
+        return ok;
+    }
+
     uint32_t        g_pid = 0;
     std::string     g_process_name;
     std::string     g_last_error;
@@ -1498,71 +1781,24 @@ namespace driver_bridge
 
             const ULONGLONG arc_bridge_t0 = GetTickCount64();
             diag::log_tagged_critical("driver", "attach_pre_get_arc_vtable");
-            const guarded_arc_vtable_t arc_bridge = get_arc_vtable_guarded();
-            const auto* vtable = arc_bridge.table;
+            arc_attach_resolution_t arc_attach_ctx{};
+            arc_attach_ctx.pid = pid;
+            arc_attach_ctx.started_ms = arc_bridge_t0;
+            const bool arc_bridge_ok = arc_bridge_attach_resolution(arc_attach_ctx);
             diag::log_tagged_critical_fmt("driver",
-                "attach_post_get_arc_vtable vtable=%p exc=0x%08lX elapsed_ms=%llu",
-                vtable,
-                static_cast<unsigned long>(arc_bridge.exception_code),
+                "attach_arc_vtable_wrapper_result ok=%d solved=%d dtb=0x%llX image=0x%llX elapsed_ms=%llu",
+                arc_bridge_ok ? 1 : 0,
+                arc_attach_ctx.solved ? 1 : 0,
+                static_cast<unsigned long long>(arc_attach_ctx.dtb),
+                static_cast<unsigned long long>(arc_attach_ctx.image_base),
                 static_cast<unsigned long long>(GetTickCount64() - arc_bridge_t0));
-            const arc_vtable_slots_t arc_slots = read_arc_vtable_slots_guarded(vtable);
-            diag::log_tagged_critical_fmt("driver",
-                "attach_arc_vtable_slots exc=0x%08lX set=0x%llX solve=0x%llX get=0x%llX image=0x%llX base=0x%llX",
-                static_cast<unsigned long>(arc_slots.exception_code),
-                fn_bits(arc_slots.set_process_id),
-                fn_bits(arc_slots.solve_dtb),
-                fn_bits(arc_slots.get_dtb),
-                fn_bits(arc_slots.find_image),
-                fn_bits(arc_slots.set_base_address));
-            bool vtable_solved = false;
-            if (vtable && arc_slots.exception_code == 0 && arc_slots.set_process_id &&
-                arc_slots.solve_dtb && arc_slots.get_dtb && arc_slots.find_image &&
-                arc_slots.set_base_address) {
-                diag::log_tagged_critical("driver", "attach_arc_vtable_pre_set_process_id");
-                const DWORD set_pid_exc = call_arc_set_process_id_guarded(arc_slots.set_process_id, pid);
-                diag::log_tagged_critical_fmt("driver",
-                    "attach_arc_vtable_post_set_process_id exc=0x%08lX",
-                    static_cast<unsigned long>(set_pid_exc));
-                diag::log_tagged_critical("driver", "attach_arc_vtable_pre_solve_dtb");
-                DWORD solve_exc = 0;
-                uint64_t dtb = (set_pid_exc == 0)
-                    ? call_arc_u64_guarded(arc_slots.solve_dtb, &solve_exc)
-                    : 0;
-                diag::log_tagged_critical_fmt("driver",
-                    "attach_arc_vtable_post_solve_dtb dtb=0x%llX exc=0x%08lX",
-                    (unsigned long long)dtb,
-                    static_cast<unsigned long>(solve_exc));
-                if (dtb == 0 && set_pid_exc == 0 && solve_exc == 0) {
-                    DWORD get_exc = 0;
-                    diag::log_tagged_critical("driver", "attach_arc_vtable_pre_get_dtb");
-                    dtb = call_arc_get_dtb_guarded(arc_slots.get_dtb, &get_exc);
-                    diag::log_tagged_critical_fmt("driver",
-                        "attach_arc_vtable_post_get_dtb dtb=0x%llX exc=0x%08lX",
-                        (unsigned long long)dtb,
-                        static_cast<unsigned long>(get_exc));
-                }
-                if (dtb != 0 && set_pid_exc == 0 && solve_exc == 0) {
-                    vtable_solved = true;
-                    diag::log_tagged_critical("driver", "attach_arc_vtable_pre_find_image");
-                    DWORD find_exc = 0;
-                    const auto image_base = call_arc_find_image_guarded(arc_slots.find_image, &find_exc);
-                    diag::log_tagged_critical_fmt("driver",
-                        "attach_arc_vtable_post_find_image base=0x%llX exc=0x%08lX",
-                        (unsigned long long)image_base,
-                        static_cast<unsigned long>(find_exc));
-                    if (image_base != 0 && find_exc == 0) {
-                        const DWORD base_exc = call_arc_set_base_address_guarded(arc_slots.set_base_address, image_base);
-                        diag::log_tagged_critical_fmt("driver",
-                            "attach_arc_vtable_post_set_base_address base=0x%llX exc=0x%08lX",
-                            (unsigned long long)image_base,
-                            static_cast<unsigned long>(base_exc));
-                    }
-                    diag::log_tagged_critical("driver", "attach_pre_device_solve_dtb_after_vtable");
-                    device->solve_dtb();
-                    diag::log_tagged_critical("driver", "attach_post_device_solve_dtb_after_vtable");
-                    if (image_base != 0 && find_exc == 0)
-                        device->set_base_address(image_base);
-                }
+            bool vtable_solved = arc_bridge_ok && arc_attach_ctx.solved;
+            if (vtable_solved) {
+                diag::log_tagged_critical("driver", "attach_pre_device_solve_dtb_after_vtable");
+                device->solve_dtb();
+                diag::log_tagged_critical("driver", "attach_post_device_solve_dtb_after_vtable");
+                if (arc_attach_ctx.image_base != 0)
+                    device->set_base_address(arc_attach_ctx.image_base);
             }
 
             if (!vtable_solved) {
@@ -1652,12 +1888,9 @@ namespace driver_bridge
         {
             std::lock_guard<std::mutex> lk(g_state_mtx);
             if (g_kernel_mode && device && device->is_connected()) {
-                const auto* vtable = get_arc_vtable();
-                if (vtable && vtable->find_process) {
-                    kernel_pid = vtable->find_process(process_name.c_str());
-                } else {
+                kernel_pid = arc_bridge_find_process(process_name.c_str());
+                if (kernel_pid == 0)
                     kernel_pid = device->find_process(process_name.c_str());
-                }
             }
         }
         if (kernel_pid != 0)
@@ -1693,12 +1926,8 @@ namespace driver_bridge
         g_has_vm_read = false;
         g_kernel_attached = false;
         if (g_kernel_mode && device && device->is_connected()) {
-            const auto* vtable = get_arc_vtable();
-            if (vtable && vtable->clear_process_context) {
-                vtable->clear_process_context();
-            } else {
+            if (!arc_bridge_clear_process_context())
                 device->clear_process_context();
-            }
         }
         if (prev_pid != 0) {
             auto it = g_processes.find(prev_pid);
@@ -1762,14 +1991,10 @@ namespace driver_bridge
             return false;
         }
 
-        const auto* vtable = get_arc_vtable();
-        if (vtable && vtable->set_process_id)
-            vtable->set_process_id(pid);
+        arc_bridge_set_process_id(pid);
         device->set_process_id(pid);
 
-        uint64_t arc_dtb = 0;
-        if (vtable && vtable->solve_dtb)
-            arc_dtb = vtable->solve_dtb();
+        uint64_t arc_dtb = arc_bridge_solve_dtb(false);
 
         device->solve_dtb();
         if (device->get_dtb() == 0 && arc_dtb != 0)
@@ -1785,17 +2010,14 @@ namespace driver_bridge
         ctx.cached_dtb = device->get_dtb();
 
         if (ctx.cached_image_base == 0) {
-            uint64_t image_base = 0;
-            if (vtable && vtable->find_image)
-                image_base = vtable->find_image();
+            uint64_t image_base = arc_bridge_find_image();
             if (image_base == 0)
                 image_base = device->find_image();
             ctx.cached_image_base = image_base;
         }
         if (ctx.cached_image_base != 0) {
             device->set_base_address(ctx.cached_image_base);
-            if (vtable && vtable->set_base_address)
-                vtable->set_base_address(ctx.cached_image_base);
+            arc_bridge_set_base_address(ctx.cached_image_base);
         }
 
         if (ctx.cached_kernel_dtb != 0) {
@@ -1890,10 +2112,7 @@ namespace driver_bridge
             g_has_vm_read = false;
             g_kernel_attached = false;
             if (g_kernel_mode && device && device->is_connected()) {
-                const auto* vtable = get_arc_vtable();
-                if (vtable && vtable->clear_process_context)
-                    vtable->clear_process_context();
-                else
+                if (!arc_bridge_clear_process_context())
                     device->clear_process_context();
             }
         } else {
@@ -1930,10 +2149,7 @@ namespace driver_bridge
         g_has_vm_read = false;
         g_kernel_attached = false;
         if (g_kernel_mode && device && device->is_connected()) {
-            const auto* vtable = get_arc_vtable();
-            if (vtable && vtable->clear_process_context)
-                vtable->clear_process_context();
-            else
+            if (!arc_bridge_clear_process_context())
                 device->clear_process_context();
         }
         return true;
@@ -2270,11 +2486,11 @@ namespace driver_bridge
             return result;
         }
 
-        const auto* vtable = get_arc_vtable();
-        if (vtable && vtable->enumerate_threads) {
+        {
             struct enum_ctx { std::vector<thread_info_t>* out; uint32_t pid; };
             enum_ctx ctx{&result, pid};
-            vtable->enumerate_threads(
+            uint32_t arc_count = 0;
+            const bool arc_ok = arc_bridge_enumerate_threads(
                 [](const arc_comm_vtable_t::thread_info_t* info, void* user) {
                     auto* c = static_cast<enum_ctx*>(user);
                     thread_info_t t;
@@ -2285,18 +2501,26 @@ namespace driver_bridge
                     t.rip = info->rip;
                     c->out->push_back(t);
                 },
-                &ctx);
-        } else {
-            auto kernel_threads = device->enumerate_threads();
-            result.reserve(kernel_threads.size());
-            for (const auto& kt : kernel_threads) {
-                thread_info_t t;
-                t.tid = kt.tid;
-                t.owner_pid = pid;
-                t.priority = 0;
-                t.state = kt.state;
-                t.rip = kt.rip;
-                result.push_back(t);
+                &ctx,
+                &arc_count);
+            if (arc_ok) {
+                diag::log_tagged_fmt("driver",
+                    "enumerate_threads_arc_bridge pid=%u count=%u result=%zu",
+                    pid,
+                    arc_count,
+                    result.size());
+            } else {
+                auto kernel_threads = device->enumerate_threads();
+                result.reserve(kernel_threads.size());
+                for (const auto& kt : kernel_threads) {
+                    thread_info_t t;
+                    t.tid = kt.tid;
+                    t.owner_pid = pid;
+                    t.priority = 0;
+                    t.state = kt.state;
+                    t.rip = kt.rip;
+                    result.push_back(t);
+                }
             }
         }
 
@@ -2337,11 +2561,11 @@ namespace driver_bridge
         }
 
         if (kernel_mode) {
-            const auto* vtable = get_arc_vtable();
-            if (vtable && vtable->enumerate_memory_regions) {
+            {
                 struct enum_ctx { std::vector<memory_region_t>* out; size_t max; };
                 enum_ctx ctx{&result, max_regions};
-                vtable->enumerate_memory_regions(
+                uint32_t arc_count = 0;
+                const bool arc_ok = arc_bridge_enumerate_memory_regions(
                     [](const arc_comm_vtable_t::memory_region_info_t* info, void* user) {
                         auto* c = static_cast<enum_ctx*>(user);
                         if (c->out->size() >= c->max) return;
@@ -2353,19 +2577,27 @@ namespace driver_bridge
                         region.type    = info->type;
                         c->out->push_back(region);
                     },
-                    &ctx);
-            } else {
-                const auto regions = device->enumerate_memory_regions(0, 0, false);
-                for (const auto& src : regions) {
-                    memory_region_t region;
-                    region.base = src.base;
-                    region.size = src.size;
-                    region.state = src.state;
-                    region.protect = src.protect;
-                    region.type = src.type;
-                    result.push_back(region);
-                    if (result.size() >= max_regions)
-                        break;
+                    &ctx,
+                    &arc_count);
+                if (arc_ok) {
+                    diag::log_tagged_fmt("driver",
+                        "enumerate_memory_regions_arc_bridge max=%zu count=%u result=%zu",
+                        max_regions,
+                        arc_count,
+                        result.size());
+                } else {
+                    const auto regions = device->enumerate_memory_regions(0, 0, false);
+                    for (const auto& src : regions) {
+                        memory_region_t region;
+                        region.base = src.base;
+                        region.size = src.size;
+                        region.state = src.state;
+                        region.protect = src.protect;
+                        region.type = src.type;
+                        result.push_back(region);
+                        if (result.size() >= max_regions)
+                            break;
+                    }
                 }
             }
             return result;
@@ -2403,11 +2635,8 @@ namespace driver_bridge
         }
 
         if (kernel_mode) {
-            const auto* vtable = get_arc_vtable();
-            if (vtable && vtable->query_memory) {
-                arc_comm_vtable_t::memory_region_info_t arc_info{};
-                if (!vtable->query_memory(address, &arc_info))
-                    return false;
+            arc_comm_vtable_t::memory_region_info_t arc_info{};
+            if (arc_bridge_query_memory(address, &arc_info)) {
                 region.base    = arc_info.base;
                 region.size    = arc_info.size;
                 region.state   = arc_info.state;
@@ -2485,60 +2714,56 @@ namespace driver_bridge
                 if (s_skip_kernel_log++ < 10)
                     logf("read_memory: SKIPPING kernel path (not kernel_attached), falling through to RPM\n");
             } else {
-            out.resize(size);
-            size_t bytes_read = 0;
-            const auto* vtable = get_arc_vtable();
-            if (vtable && vtable->read_raw) {
-                bytes_read = vtable->read_raw(address, out.data(), size);
-            }
+                out.resize(size);
+                size_t bytes_read = 0;
+                bool arc_read_invoked = false;
+                bytes_read = arc_bridge_read_raw(address, out.data(), size, &arc_read_invoked);
 
-            if (bytes_read == 0 && device && device->get_dtb() != 0) {
-                bytes_read = device->read_raw(address, out.data(), size);
-            }
-
-            {
-                static int s_read_log_count = 0;
-                if (s_read_log_count < 50) {
-                    s_read_log_count++;
-                    logf("read_memory: addr=0x%llX sz=%llu kernel=%d vtable=%d dtb=0x%llX bytes=%llu\n",
-                        (unsigned long long)address, (unsigned long long)size,
-                        kernel_mode ? 1 : 0,
-                        (vtable && vtable->read_raw) ? 1 : 0,
-                        device ? (unsigned long long)device->get_dtb() : 0ULL,
-                        (unsigned long long)bytes_read);
+                if (bytes_read == 0 && device && device->get_dtb() != 0) {
+                    bytes_read = device->read_raw(address, out.data(), size);
                 }
-            }
 
-            if (bytes_read == 0) {
-                bool re_resolved = false;
                 {
-                    std::lock_guard<std::mutex> lk(g_state_mtx);
-                    if (device) {
-                        device->solve_dtb();
-                        re_resolved = (device->get_dtb() != 0);
-                    }
-                    if (!re_resolved && vtable && vtable->solve_dtb && vtable->get_dtb) {
-                        uint64_t new_dtb = vtable->solve_dtb();
-                        re_resolved = (new_dtb != 0);
+                    static int s_read_log_count = 0;
+                    if (s_read_log_count < 50) {
+                        s_read_log_count++;
+                        logf("read_memory: addr=0x%llX sz=%llu kernel=%d vtable=%d dtb=0x%llX bytes=%llu\n",
+                            (unsigned long long)address, (unsigned long long)size,
+                            kernel_mode ? 1 : 0,
+                            arc_read_invoked ? 1 : 0,
+                            device ? (unsigned long long)device->get_dtb() : 0ULL,
+                            (unsigned long long)bytes_read);
                     }
                 }
 
-                if (re_resolved) {
-                    std::memset(out.data(), 0, size);
-                    if (vtable && vtable->read_raw) {
-                        bytes_read = vtable->read_raw(address, out.data(), size);
+                if (bytes_read == 0) {
+                    bool re_resolved = false;
+                    {
+                        std::lock_guard<std::mutex> lk(g_state_mtx);
+                        if (device) {
+                            device->solve_dtb();
+                            re_resolved = (device->get_dtb() != 0);
+                        }
+                        if (!re_resolved) {
+                            uint64_t new_dtb = arc_bridge_solve_dtb(true);
+                            re_resolved = (new_dtb != 0);
+                        }
                     }
-                    if (bytes_read == 0) {
-                        bytes_read = device->read_raw(address, out.data(), size);
+
+                    if (re_resolved) {
+                        std::memset(out.data(), 0, size);
+                        bytes_read = arc_bridge_read_raw(address, out.data(), size);
+                        if (bytes_read == 0) {
+                            bytes_read = device->read_raw(address, out.data(), size);
+                        }
                     }
                 }
-            }
 
-            if (bytes_read > 0) {
-                out.resize(bytes_read);
-                return true;
-            }
-            out.clear();
+                if (bytes_read > 0) {
+                    out.resize(bytes_read);
+                    return true;
+                }
+                out.clear();
             }
         }
 
@@ -2590,10 +2815,7 @@ namespace driver_bridge
 
         if (kernel_mode) {
             size_t bytes_written = 0;
-            const auto* vtable = get_arc_vtable();
-            if (vtable && vtable->write_raw) {
-                bytes_written = vtable->write_raw(address, data.data(), data.size());
-            }
+            bytes_written = arc_bridge_write_raw(address, data.data(), data.size());
 
             if (bytes_written != data.size() && device && device->get_dtb() != 0) {
                 const size_t direct_written = device->write_raw(address, data.data(), data.size());
@@ -2609,18 +2831,16 @@ namespace driver_bridge
                         device->solve_dtb();
                         re_resolved = (device->get_dtb() != 0);
                     }
-                    if (!re_resolved && vtable && vtable->solve_dtb && vtable->get_dtb) {
-                        uint64_t new_dtb = vtable->solve_dtb();
+                    if (!re_resolved) {
+                        uint64_t new_dtb = arc_bridge_solve_dtb(true);
                         re_resolved = (new_dtb != 0);
                     }
                 }
 
                 if (re_resolved) {
-                    if (vtable && vtable->write_raw) {
-                        const size_t retry_written = vtable->write_raw(address, data.data(), data.size());
-                        if (retry_written > bytes_written)
-                            bytes_written = retry_written;
-                    }
+                    const size_t retry_written = arc_bridge_write_raw(address, data.data(), data.size());
+                    if (retry_written > bytes_written)
+                        bytes_written = retry_written;
                     if (bytes_written != data.size() && device) {
                         const size_t retry_direct_written = device->write_raw(address, data.data(), data.size());
                         if (retry_direct_written > bytes_written)
@@ -3588,9 +3808,9 @@ namespace driver_bridge
             return 0;
         }
 
-        const auto* vtable = get_arc_vtable();
-        if (vtable && vtable->remote_call)
-            return vtable->remote_call(function_address, arg1, arg2, arg3, arg4);
+        uint64_t arc_result = 0;
+        if (arc_bridge_remote_call(function_address, arg1, arg2, arg3, arg4, arc_result))
+            return arc_result;
 
         return device->call_function(function_address, arg1, arg2, arg3, arg4);
     }

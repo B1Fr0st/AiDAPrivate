@@ -533,7 +533,7 @@ inline void enforce_violation(const char* reason, const std::string& extra = "")
 
     webhook::send_violation_alert(reason ? reason : "standalone_tamper", extra);
 
-    standalone_license::shutdown();
+    standalone_license::invalidate_for_enforcement(reason ? reason : "standalone_tamper");
 
     if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver())
     {

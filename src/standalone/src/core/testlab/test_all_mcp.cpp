@@ -17,6 +17,7 @@
 #include "../analysis/stealth_engine.hpp"
 #include "../analysis/xref_db.hpp"
 #include "../analysis/xref_engine.hpp"
+#include "../re/re_common.hpp"
 #include "../debugger/debugger_engine.hpp"
 #include "../debugger/page_guard_engine.hpp"
 #include "../disasm/disasm_view.hpp"
@@ -64,6 +65,7 @@
 #include <functional>
 #include <iomanip>
 #include <initializer_list>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -409,7 +411,31 @@ namespace {
 
     bool is_destructive_mcp_tool(const std::string& name) {
         static const std::set<std::string> exact = {
-            "driver_call_function"
+            "driver_call_function",
+            "dx_hook_manage",
+            "dx_dump_render_targets",
+            "vmt_hook_manage",
+            "vmt_copy",
+            "offsets_manage",
+            "heap_track_manage",
+            "sigs_manage",
+            "struct_observe",
+            "gameproto_detect",
+            "gameproto_replay",
+            "thread_classify",
+            "thread_watch_rip",
+            "net_proto_trace_serializer",
+            "net_udp_session_reassemble",
+            "net_replay_mutate",
+            "opaque_predicate_patch",
+            "drv_hook_manage",
+            "drv_send_ioctl",
+            "smc_manage",
+            "pack_find_oep",
+            "pack_iat_manage",
+            "network_capture_manage",
+            "network_pre_encrypt_hook",
+            "network_pg_sniff"
         };
         return exact.find(lower_copy(name)) != exact.end();
     }
@@ -1169,8 +1195,23 @@ namespace {
             return "debugger";
         if (name.rfind("network_", 0) == 0 || name == "mitm_status")
             return "network";
+        if (name.rfind("gameproto_", 0) == 0 || name.rfind("net_proto_", 0) == 0 ||
+            name.rfind("net_udp_", 0) == 0 || name.rfind("net_replay_", 0) == 0)
+            return "protocol";
         if (name.rfind("scanner_", 0) == 0 || name.rfind("memory_", 0) == 0)
             return "scanner";
+        if (name.rfind("dx_", 0) == 0 || name.rfind("vmt_", 0) == 0 ||
+            name.rfind("rtti_", 0) == 0 || name.rfind("encptr_", 0) == 0 ||
+            name.rfind("offsets_", 0) == 0 || name.rfind("heap_track_", 0) == 0 ||
+            name.rfind("sigs_", 0) == 0 || name.rfind("struct_", 0) == 0)
+            return "reverse-engineering";
+        if (name.rfind("vm_", 0) == 0 || name.rfind("cff_", 0) == 0 ||
+            name.rfind("mba_", 0) == 0 || name.rfind("opaque_", 0) == 0 ||
+            name.rfind("bogus_", 0) == 0 || name.rfind("drv_", 0) == 0 ||
+            name.rfind("smc_", 0) == 0 || name.rfind("pack_", 0) == 0)
+            return "protected-re";
+        if (name.rfind("thread_", 0) == 0)
+            return "thread";
         if (name.rfind("analysis_", 0) == 0 || name.rfind("disasm_", 0) == 0 ||
             name.find("decompile") != std::string::npos)
             return "analysis";
@@ -3639,12 +3680,17 @@ namespace {
         return nullptr;
     }
 
-    bool tool_has_param(const mcp_standalone::tool_def_t& tool, const char* param_name) {
+    bool tool_has_param(const mcp_standalone::tool_def_t& tool, const char* param_name, bool* required_out = nullptr) {
+        if (required_out)
+            *required_out = false;
         if (!param_name)
             return false;
         for (const auto& p : tool.params) {
-            if (p.name == param_name)
+            if (p.name == param_name) {
+                if (required_out)
+                    *required_out = p.required;
                 return true;
+            }
         }
         return false;
     }
@@ -3676,8 +3722,15 @@ namespace {
             return;
         }
         for (const char* param : required_params) {
-            if (!tool_has_param(*tool, param)) {
+            bool param_required = false;
+            if (!tool_has_param(*tool, param, &param_required)) {
                 log_msg(hf, tag, "FAIL -- tool \"%s\" schema missing parameter \"%s\"", tool_name, param ? param : "<null>");
+                record_tool_status(tool_name_s, mcp_tool_call_status_t::failed);
+                failed.fetch_add(1);
+                return;
+            }
+            if (!param_required) {
+                log_msg(hf, tag, "FAIL -- tool \"%s\" schema parameter \"%s\" is not marked required", tool_name, param ? param : "<null>");
                 record_tool_status(tool_name_s, mcp_tool_call_status_t::failed);
                 failed.fetch_add(1);
                 return;
@@ -3686,6 +3739,88 @@ namespace {
         log_msg(hf, tag, "CONTRACT-PASS -- tool \"%s\" contract read_only=%d params=%zu functional_run=0", tool_name, tool->read_only ? 1 : 0, tool->params.size());
         record_tool_status(tool_name_s, mcp_tool_call_status_t::passed);
         passed.fetch_add(1);
+    }
+
+    void test_todo_mcp_tool_contracts(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped, bool(*cancelled)()) {
+        const char* tag = "mcp.todo_contract";
+        auto* srv = get_server();
+        if (!srv) {
+            log_msg(hf, tag, "FAIL -- no server instance for TODO MCP contract coverage");
+            failed.fetch_add(1);
+            return;
+        }
+        set_progress_step("mcp todo contract coverage");
+        log_msg(hf, tag, "BEGIN -- contract_only=1 functional_run=0");
+        auto contract = [&](const char* tool_name, bool expected_read_only, std::initializer_list<const char*> required_params) {
+            if (!cancelled || !cancelled())
+                test_tool_contract_only(hf, tag, srv, tool_name, expected_read_only, required_params, passed, failed, skipped);
+        };
+
+        contract("dx_find_device_vtable", true, {});
+        contract("dx_hook_manage", false, {"action", "process_id"});
+        contract("dx_list_bound_cbuffers", true, {"process_id"});
+        contract("dx_identify_bone_buffer", true, {"process_id"});
+        contract("dx_map_resource_to_va", true, {"resource_handle", "process_id"});
+        contract("dx_dump_render_targets", false, {"process_id"});
+        contract("dx_find_view_matrix", true, {"process_id"});
+        contract("vmt_read", true, {"address"});
+        contract("vmt_hook_manage", false, {"action"});
+        contract("vmt_copy", false, {"object_va"});
+        contract("vmt_find_slot_by_signature", true, {"vtable_va", "pattern"});
+        contract("vmt_scan_objects", true, {"vtable_va"});
+        contract("rtti_scan", true, {});
+        contract("rtti_find_type", true, {"pattern"});
+        contract("rtti_list_hierarchy", true, {"type_name_or_va"});
+        contract("rtti_find_constructor", true, {"vtable_va"});
+        contract("encptr_scan_chain", true, {"source_va", "target_va"});
+        contract("encptr_detect_transform", true, {"raw_value", "expected_next"});
+        contract("encptr_emit_resolver", true, {"chain"});
+        contract("encptr_verify_stable", true, {"chain"});
+        contract("offsets_manage", false, {"action"});
+        contract("heap_track_manage", false, {"action"});
+        contract("sigs_manage", false, {"action"});
+        contract("struct_observe", false, {"base_va"});
+        contract("struct_correlate", true, {"field_addresses"});
+        contract("struct_array_detect", true, {"base_va", "suspected_size"});
+        contract("struct_compare_snapshots", true, {"snapshot_a_id", "snapshot_b_id", "base_va"});
+        contract("gameproto_detect", false, {"pid"});
+        contract("gameproto_enet_decode", true, {"packet_hex"});
+        contract("gameproto_decode_heuristic", true, {"payload_hex"});
+        contract("gameproto_replay", false, {"operation"});
+        contract("thread_classify", false, {});
+        contract("thread_watch_rip", false, {"tid"});
+        contract("vm_identify", true, {"address"});
+        contract("vm_trace_bytecode", true, {"entry_va"});
+        contract("vm_classify_handler", true, {"handler_va"});
+        contract("vm_build_opcode_map", true, {"handler_table_va"});
+        contract("vm_lift_to_il", true, {"trace", "opcode_map"});
+        contract("vm_recover_cfg", true, {"optimized_il"});
+        contract("vm_emit_pseudocode", true, {"cfg"});
+        contract("cff_detect", true, {"address"});
+        contract("cff_recover_cfg", true, {"address"});
+        contract("mba_simplify", true, {"address"});
+        contract("opaque_predicate_detect", true, {"address"});
+        contract("opaque_predicate_patch", false, {"predicates"});
+        contract("bogus_block_remove", true, {"address"});
+        contract("drv_find_dispatch_table", true, {});
+        contract("drv_decode_irp_handlers", true, {"dispatch_table"});
+        contract("drv_find_ioctl_dispatch", true, {"device_control_handler_va"});
+        contract("drv_enumerate_ioctls", true, {"ioctl_handlers"});
+        contract("drv_find_device_names", true, {});
+        contract("drv_check_buffer_safety", true, {"ioctl_handlers"});
+        contract("drv_hook_manage", false, {"action"});
+        contract("drv_send_ioctl", false, {"device_symlink", "ioctl_code"});
+        contract("smc_manage", false, {"action"});
+        contract("smc_scan_encrypted_regions", true, {});
+        contract("smc_find_decryptor", true, {"target_va", "target_size"});
+        contract("pack_detect", true, {});
+        contract("pack_find_oep", false, {});
+        contract("pack_iat_manage", false, {"action"});
+        contract("net_proto_find_sendrecv", true, {});
+        contract("net_proto_trace_serializer", false, {"serializer_va", "buffer_reg"});
+        contract("net_udp_session_reassemble", false, {});
+        contract("net_replay_mutate", false, {"session_id", "target_ip", "target_port"});
+        log_msg(hf, tag, "END -- contract_cases=64 functional_run=0");
     }
 
     bool require_tool_read_only_metadata(HANDLE hf, const char* tag, const char* tool_name, bool expected_read_only, std::atomic<int>& failed) {
@@ -4429,6 +4564,651 @@ namespace {
         return test_tool_call(hf, tag, get_server(), tool_name, args, passed, failed, skipped, skip_on_error, out_result);
     }
 
+    using test_todo_protected_re_domains_11_15_validator_t = std::function<bool(const invoke_result_t&, std::string&)>;
+
+    bool test_todo_protected_re_domains_11_15_expect(HANDLE hf,
+                                                     const char* tag,
+                                                     const char* tool_name,
+                                                     mcp_standalone::json args,
+                                                     bool expected_read_only,
+                                                     bool expect_success,
+                                                     const test_todo_protected_re_domains_11_15_validator_t& validator,
+                                                     std::atomic<int>& passed,
+                                                     std::atomic<int>& failed) {
+        const std::string tool = tool_name ? std::string(tool_name) : std::string();
+        g_invoked_tools.insert(tool);
+        const int seq = g_mcp_tool_sequence.fetch_add(1, std::memory_order_acq_rel) + 1;
+        char step[256];
+        _snprintf_s(step, sizeof(step), _TRUNCATE, "mcp protected re #%d: %s", seq, tool_name ? tool_name : "<null>");
+        set_progress_step(step);
+        if (!args.is_object())
+            args = mcp_standalone::json::object();
+        const auto* def = find_registered_tool(get_server(), tool_name);
+        if (!def) {
+            log_msg(hf, tag, "FAIL -- protected RE tool \"%s\" is not registered", tool_name ? tool_name : "<null>");
+            record_tool_status(tool, mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return false;
+        }
+        if (def->read_only != expected_read_only) {
+            log_msg(hf, tag, "FAIL -- protected RE tool \"%s\" read_only=%d expected=%d",
+                tool_name ? tool_name : "<null>",
+                def->read_only ? 1 : 0,
+                expected_read_only ? 1 : 0);
+            record_tool_status(tool, mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return false;
+        }
+        log_msg(hf, tag, "START -- tool=%s seq=%d expect_success=%d read_only=%d args=%s",
+            tool_name ? tool_name : "<null>",
+            seq,
+            expect_success ? 1 : 0,
+            expected_read_only ? 1 : 0,
+            compact_json(args, 900).c_str());
+        auto timed = invoke_tool_bounded(get_server(), tool, args, tool_timeout_ms(tool), hf, tag, seq);
+        const invoke_result_t& ir = timed.result;
+        log_mcp_result_detail("protected_re_completed", seq, tool, args, ir, timed.elapsed_ms, "");
+        if (timed.timed_out) {
+            log_msg(hf, tag, "FAIL -- tool=%s timed out elapsed_ms=%lld", tool.c_str(), timed.elapsed_ms);
+            record_tool_status(tool, mcp_tool_call_status_t::timed_out);
+            failed.fetch_add(1);
+            return false;
+        }
+        if (!ir.found || ir.threw) {
+            log_msg(hf, tag, "FAIL -- tool=%s found=%d threw=%d err=%s",
+                tool.c_str(),
+                ir.found ? 1 : 0,
+                ir.threw ? 1 : 0,
+                compact_text(ir.exception_msg, 700).c_str());
+            record_tool_status(tool, mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return false;
+        }
+        if (ir.success != expect_success) {
+            log_msg(hf, tag, "FAIL -- tool=%s success=%d expected=%d text=%s data=%s",
+                tool.c_str(),
+                ir.success ? 1 : 0,
+                expect_success ? 1 : 0,
+                compact_text(ir.text, 700).c_str(),
+                compact_json(ir.data, 900).c_str());
+            record_tool_status(tool, mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return false;
+        }
+        std::string reason;
+        if (validator && !validator(ir, reason)) {
+            log_msg(hf, tag, "FAIL -- tool=%s semantic validation failed reason=%s text=%s data=%s",
+                tool.c_str(),
+                reason.empty() ? "<empty>" : compact_text(reason, 700).c_str(),
+                compact_text(ir.text, 700).c_str(),
+                compact_json(ir.data, 900).c_str());
+            record_tool_status(tool, mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return false;
+        }
+        log_msg(hf, tag, "PASS -- tool=%s success=%d elapsed_ms=%lld data=%s",
+            tool.c_str(),
+            ir.success ? 1 : 0,
+            timed.elapsed_ms,
+            compact_json(ir.data, 900).c_str());
+        record_tool_status(tool, mcp_tool_call_status_t::passed);
+        passed.fetch_add(1);
+        return true;
+    }
+
+    bool test_todo_protected_re_domains_11_15_payload_contains(const invoke_result_t& ir, std::initializer_list<const char*> needles, std::string& reason) {
+        const std::string combined = lower_copy(ir.text + " " + compact_json(ir.data, 4000));
+        for (const char* needle : needles) {
+            if (!needle || !*needle)
+                continue;
+            if (combined.find(lower_copy(needle)) == std::string::npos) {
+                reason = std::string("expected payload fragment missing: ") + needle;
+                return false;
+            }
+        }
+        return true;
+    }
+
+    std::vector<uint8_t> test_todo_protected_re_domains_11_15_pe_image(bool packed) {
+        std::vector<uint8_t> image(0x3000, 0);
+        IMAGE_DOS_HEADER dos{};
+        dos.e_magic = IMAGE_DOS_SIGNATURE;
+        dos.e_lfanew = 0x80;
+        std::memcpy(image.data(), &dos, sizeof(dos));
+        IMAGE_NT_HEADERS64 nt{};
+        nt.Signature = IMAGE_NT_SIGNATURE;
+        nt.FileHeader.Machine = IMAGE_FILE_MACHINE_AMD64;
+        nt.FileHeader.NumberOfSections = 1;
+        nt.FileHeader.SizeOfOptionalHeader = static_cast<WORD>(sizeof(IMAGE_OPTIONAL_HEADER64));
+        nt.FileHeader.Characteristics = IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_LARGE_ADDRESS_AWARE;
+        nt.OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+        nt.OptionalHeader.AddressOfEntryPoint = 0x1000;
+        nt.OptionalHeader.ImageBase = 0x140000000ULL;
+        nt.OptionalHeader.SectionAlignment = 0x1000;
+        nt.OptionalHeader.FileAlignment = 0x200;
+        nt.OptionalHeader.MajorSubsystemVersion = 6;
+        nt.OptionalHeader.SizeOfImage = 0x3000;
+        nt.OptionalHeader.SizeOfHeaders = 0x400;
+        nt.OptionalHeader.Subsystem = IMAGE_SUBSYSTEM_WINDOWS_CUI;
+        nt.OptionalHeader.NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+        std::memcpy(image.data() + dos.e_lfanew, &nt, sizeof(nt));
+        IMAGE_SECTION_HEADER sh{};
+        const char* name = packed ? "UPX0" : ".text";
+        std::memcpy(sh.Name, name, std::strlen(name));
+        sh.Misc.VirtualSize = 0x1000;
+        sh.VirtualAddress = 0x1000;
+        sh.SizeOfRawData = 0x1000;
+        sh.PointerToRawData = 0x1000;
+        sh.Characteristics = IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ;
+        std::memcpy(image.data() + dos.e_lfanew + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER) + sizeof(IMAGE_OPTIONAL_HEADER64), &sh, sizeof(sh));
+        if (packed) {
+            uint32_t state = 0xA17A5EEDu;
+            for (size_t i = 0x1000; i < 0x2000; ++i) {
+                state = state * 1664525u + 1013904223u;
+                image[i] = static_cast<uint8_t>((state >> 24) & 0xFFu);
+            }
+        } else {
+            std::fill(image.begin() + 0x1000, image.begin() + 0x2000, 0x90);
+            image[0x1000] = 0xC3;
+        }
+        return image;
+    }
+
+    void test_todo_protected_re_domains_11_15_driver_tools(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        const char* tag = "mcp.todo_protected_re.drv";
+        test_todo_protected_re_domains_11_15_expect(hf, tag, "drv_enumerate_ioctls",
+            mcp_standalone::json{{"ioctl_handlers", mcp_standalone::json::array({mcp_standalone::json{{"ioctl_code", "0x222000"}, {"handler_va", "0x140001000"}}})}},
+            true, true,
+            [](const invoke_result_t& ir, std::string& reason) {
+                if (!ir.data.is_array() || ir.data.empty()) {
+                    reason = "decoded IOCTL array missing or empty";
+                    return false;
+                }
+                return test_todo_protected_re_domains_11_15_payload_contains(ir, {"BUFFERED", "device_type", "function"}, reason);
+            },
+            passed, failed);
+
+        test_todo_protected_re_domains_11_15_expect(hf, tag, "drv_check_buffer_safety",
+            mcp_standalone::json{{"ioctl_handlers", mcp_standalone::json::array({mcp_standalone::json{{"ioctl_code", "0x222003"}, {"handler_va", "0x140001000"}}})}},
+            true, true,
+            [](const invoke_result_t& ir, std::string& reason) {
+                if (!ir.data.is_array() || ir.data.empty()) {
+                    reason = "buffer-safety issue array missing or empty";
+                    return false;
+                }
+                return test_todo_protected_re_domains_11_15_payload_contains(ir, {"method_neither_without_obvious_probe", "missing_obvious_length_validation"}, reason);
+            },
+            passed, failed);
+
+        test_todo_protected_re_domains_11_15_expect(hf, tag, "drv_decode_irp_handlers",
+            mcp_standalone::json{{"dispatch_table", mcp_standalone::json{{"assignments", mcp_standalone::json::array({mcp_standalone::json{{"irp_code", 14}, {"irp_name", "IRP_MJ_DEVICE_CONTROL"}, {"handler_va", "0x140001000"}}})}}}},
+            true, true,
+            [](const invoke_result_t& ir, std::string& reason) {
+                if (!ir.data.is_array()) {
+                    reason = "decoded IRP handler array missing";
+                    return false;
+                }
+                return test_todo_protected_re_domains_11_15_payload_contains(ir, {"IRP_MJ_DEVICE_CONTROL", "handler_va"}, reason);
+            },
+            passed, failed);
+
+        test_todo_protected_re_domains_11_15_expect(hf, tag, "drv_find_ioctl_dispatch",
+            mcp_standalone::json{{"device_control_handler_va", "0x140001000"}},
+            true, true,
+            [](const invoke_result_t& ir, std::string& reason) {
+                return test_todo_protected_re_domains_11_15_payload_contains(ir, {"dispatch_type", "ioctl_handlers"}, reason);
+            },
+            passed, failed);
+
+        test_todo_protected_re_domains_11_15_expect(hf, tag, "drv_hook_manage",
+            mcp_standalone::json{{"action", "status"}},
+            false, true,
+            [](const invoke_result_t& ir, std::string& reason) {
+                return test_todo_protected_re_domains_11_15_payload_contains(ir, {"fail_closed_state_only", "fail_closed_no_kernel_dispatch_mutation"}, reason);
+            },
+            passed, failed);
+
+        for (const char* action : { "install", "start" }) {
+            mcp_standalone::json args;
+            args["action"] = action;
+            args["driver_name"] = "\\Driver\\AidaMissing";
+            args["irp_code"] = 14;
+            args["callback_va"] = "0x140001000";
+            args["confirm_unsafe"] = true;
+            test_todo_protected_re_domains_11_15_expect(hf, tag, "drv_hook_manage",
+                args,
+                false, false,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    return test_todo_protected_re_domains_11_15_payload_contains(ir, {"safe_backend_available", "fail_closed_no_kernel_dispatch_mutation", "mutation"}, reason);
+                },
+                passed, failed);
+        }
+
+        test_todo_protected_re_domains_11_15_expect(hf, tag, "drv_hook_manage",
+            mcp_standalone::json{{"action", "stop"}, {"hook_id", "aida-missing-hook"}},
+            false, false,
+            [](const invoke_result_t& ir, std::string& reason) {
+                return test_todo_protected_re_domains_11_15_payload_contains(ir, {"hook_id not found", "fail_closed_no_kernel_dispatch_mutation", "mutation"}, reason);
+            },
+            passed, failed);
+
+        test_todo_protected_re_domains_11_15_expect(hf, tag, "drv_find_device_names",
+            mcp_standalone::json{{"driver_name", "aida_missing_driver_for_testlab_0000.sys"}, {"max_modules", 1}},
+            true, false,
+            [](const invoke_result_t& ir, std::string& reason) {
+                return test_todo_protected_re_domains_11_15_payload_contains(ir, {"no module matched"}, reason);
+            },
+            passed, failed);
+    }
+
+    void test_todo_protected_re_domains_11_15_smc_tools(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        const char* tag = "mcp.todo_protected_re.smc";
+        uint64_t snapshot_addr = 0;
+        std::vector<uint8_t> snapshot_bytes(4096, 0x90);
+        snapshot_bytes[0] = 0x48;
+        snapshot_bytes[1] = 0x31;
+        snapshot_bytes[2] = 0xC0;
+        snapshot_bytes[3] = 0xC3;
+        if (!ensure_mcp_private_bytes(hf, tag, snapshot_addr, snapshot_bytes.size(), snapshot_bytes)) {
+            record_fixture_failed_tool("smc_manage", failed);
+            record_fixture_failed_tool("smc_find_decryptor", failed);
+            record_fixture_failed_tool("smc_scan_encrypted_regions", failed);
+            return;
+        }
+        const uint32_t pid = g_mcp_target_pid;
+        mcp_standalone::json smc_start_args;
+        smc_start_args["action"] = "start";
+        smc_start_args["process_id"] = pid;
+        smc_start_args["watch_va"] = hex_u64(snapshot_addr);
+        smc_start_args["watch_size"] = 4096;
+        test_todo_protected_re_domains_11_15_expect(hf, tag, "smc_manage",
+            smc_start_args,
+            false, false,
+            [](const invoke_result_t& ir, std::string& reason) {
+                return test_todo_protected_re_domains_11_15_payload_contains(ir, {"confirm_unsafe", "PAGE_GUARD"}, reason);
+            },
+            passed, failed);
+
+        test_todo_protected_re_domains_11_15_expect(hf, tag, "smc_manage",
+            mcp_standalone::json{{"action", "captures"}, {"session_id", "smc-missing-session"}},
+            false, false,
+            [](const invoke_result_t& ir, std::string& reason) {
+                return test_todo_protected_re_domains_11_15_payload_contains(ir, {"session_id not found"}, reason);
+            },
+            passed, failed);
+
+        uint64_t decrypt_code = 0;
+        std::vector<uint8_t> seed(4096, 0x90);
+        if (!ensure_mcp_private_bytes(hf, tag, decrypt_code, seed.size(), seed)) {
+            driver_bridge::free_memory(snapshot_addr);
+            record_fixture_failed_tool("smc_find_decryptor", failed);
+            return;
+        }
+        std::vector<uint8_t> code(4096, 0x90);
+        code[0] = 0x48;
+        code[1] = 0xB8;
+        std::memcpy(code.data() + 2, &snapshot_addr, sizeof(snapshot_addr));
+        code[10] = 0x80;
+        code[11] = 0x30;
+        code[12] = 0x5A;
+        code[13] = 0xC3;
+        if (!ensure_mcp_private_bytes(hf, tag, decrypt_code, code.size(), code)) {
+            driver_bridge::free_memory(decrypt_code);
+            driver_bridge::free_memory(snapshot_addr);
+            record_fixture_failed_tool("smc_find_decryptor", failed);
+            return;
+        }
+        mcp_standalone::json dec_args;
+        dec_args["process_id"] = pid;
+        dec_args["target_va"] = hex_u64(snapshot_addr);
+        dec_args["target_size"] = 64;
+        dec_args["scan_base"] = hex_u64(decrypt_code);
+        dec_args["scan_size"] = 64;
+        test_todo_protected_re_domains_11_15_expect(hf, tag, "smc_find_decryptor",
+            dec_args,
+            true, true,
+            [](const invoke_result_t& ir, std::string& reason) {
+                uint64_t count = 0;
+                if (!payload_u64_field(ir.data, "count", count) || count == 0) {
+                    reason = "decryptor count missing or zero";
+                    return false;
+                }
+                return test_todo_protected_re_domains_11_15_payload_contains(ir, {"explicit_scan_range", "decryptor_va"}, reason);
+            },
+            passed, failed);
+
+        uint64_t smc_pe = 0;
+        std::vector<uint8_t> smc_pe_bytes = test_todo_protected_re_domains_11_15_pe_image(true);
+        if (!ensure_mcp_private_bytes(hf, tag, smc_pe, smc_pe_bytes.size(), smc_pe_bytes)) {
+            record_fixture_failed_tool("smc_scan_encrypted_regions", failed);
+        } else {
+            mcp_standalone::json detect_args;
+            detect_args["process_id"] = pid;
+            detect_args["module_base"] = hex_u64(smc_pe);
+            detect_args["module_size"] = smc_pe_bytes.size();
+            detect_args["include_all"] = true;
+            test_todo_protected_re_domains_11_15_expect(hf, tag, "smc_scan_encrypted_regions",
+                detect_args,
+                true, true,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.data.is_object() || !ir.data.contains("regions")) {
+                        reason = "regions array missing";
+                        return false;
+                    }
+                    return test_todo_protected_re_domains_11_15_payload_contains(ir, {"high_entropy_executable", "UPX0"}, reason);
+                },
+                passed, failed);
+        }
+
+        if (smc_pe)
+            driver_bridge::free_memory(smc_pe);
+        driver_bridge::free_memory(decrypt_code);
+        driver_bridge::free_memory(snapshot_addr);
+    }
+
+    void test_todo_protected_re_domains_11_15_vm_and_obf_tools(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        const char* tag = "mcp.todo_protected_re.vm_obf";
+        uint64_t vm_addr = 0;
+        std::vector<uint8_t> seed(4096, 0x90);
+        if (!ensure_mcp_private_bytes(hf, tag, vm_addr, seed.size(), seed)) {
+            record_fixture_failed_tool("vm_identify", failed);
+            record_fixture_failed_tool("vm_build_opcode_map", failed);
+            record_fixture_failed_tool("mba_simplify", failed);
+            return;
+        }
+        const uint64_t handler = vm_addr + 0x800;
+        const uint64_t opaque = vm_addr + 0x820;
+        std::vector<uint8_t> vm_bytes(4096, 0x90);
+        vm_bytes[0] = 0xFF;
+        vm_bytes[1] = 0x25;
+        vm_bytes[2] = 0x00;
+        vm_bytes[3] = 0x00;
+        vm_bytes[4] = 0x00;
+        vm_bytes[5] = 0x00;
+        for (size_t i = 0; i < 128; ++i)
+            std::memcpy(vm_bytes.data() + 6 + i * sizeof(handler), &handler, sizeof(handler));
+        vm_bytes[0x800] = 0x48;
+        vm_bytes[0x801] = 0x31;
+        vm_bytes[0x802] = 0xC0;
+        vm_bytes[0x803] = 0xC3;
+        vm_bytes[0x820] = 0x31;
+        vm_bytes[0x821] = 0xC0;
+        vm_bytes[0x822] = 0x74;
+        vm_bytes[0x823] = 0x02;
+        vm_bytes[0x824] = 0x90;
+        vm_bytes[0x825] = 0xC3;
+        vm_bytes[0x826] = 0xC3;
+        if (!ensure_mcp_private_bytes(hf, tag, vm_addr, vm_bytes.size(), vm_bytes)) {
+            driver_bridge::free_memory(vm_addr);
+            record_fixture_failed_tool("vm_identify", failed);
+            record_fixture_failed_tool("vm_build_opcode_map", failed);
+            record_fixture_failed_tool("mba_simplify", failed);
+            return;
+        }
+        const uint32_t pid = g_mcp_target_pid;
+        mcp_standalone::json detect_args;
+        detect_args["process_id"] = pid;
+        detect_args["address"] = hex_u64(vm_addr);
+        test_todo_protected_re_domains_11_15_expect(hf, tag, "vm_identify",
+            detect_args,
+            true, true,
+            [](const invoke_result_t& ir, std::string& reason) {
+                return test_todo_protected_re_domains_11_15_payload_contains(ir, {"handler_table", "indirect_dispatches"}, reason);
+            },
+            passed, failed);
+
+        mcp_standalone::json map_args;
+        map_args["process_id"] = pid;
+        map_args["handler_table_va"] = hex_u64(vm_addr + 6);
+        map_args["handler_count"] = 16;
+        test_todo_protected_re_domains_11_15_expect(hf, tag, "vm_build_opcode_map",
+            map_args,
+            true, true,
+            [](const invoke_result_t& ir, std::string& reason) {
+                return test_todo_protected_re_domains_11_15_payload_contains(ir, {"opcode_map", "classified_count"}, reason);
+            },
+            passed, failed);
+
+        mcp_standalone::json lift_args;
+        lift_args["trace"] = mcp_standalone::json::object({{"steps", mcp_standalone::json::array({mcp_standalone::json{{"vopcode", "0x01"}, {"handler_va", hex_u64(handler)}, {"side_effects", mcp_standalone::json::object()}}})}});
+        lift_args["opcode_map"] = mcp_standalone::json::object({{"0x01", mcp_standalone::json{{"semantic", "XOR"}, {"handler_va", hex_u64(handler)}, {"operand_roles", mcp_standalone::json{{"dst", "rax"}, {"src1", "rax"}, {"src2", "rax"}}}}}});
+        lift_args["optimize"] = true;
+        test_todo_protected_re_domains_11_15_expect(hf, tag, "vm_lift_to_il",
+            lift_args,
+            true, true,
+            [](const invoke_result_t& ir, std::string& reason) {
+                return test_todo_protected_re_domains_11_15_payload_contains(ir, {"il_instructions", "constant_folds"}, reason);
+            },
+            passed, failed);
+
+        mcp_standalone::json obf_args;
+        obf_args["process_id"] = pid;
+        obf_args["address"] = hex_u64(handler);
+        obf_args["size"] = 32;
+        test_todo_protected_re_domains_11_15_expect(hf, tag, "mba_simplify",
+            obf_args,
+            true, true,
+            [](const invoke_result_t& ir, std::string& reason) {
+                uint64_t count = 0;
+                if (!payload_u64_field(ir.data, "count", count) || count == 0) {
+                    reason = "MBA simplification count missing or zero";
+                    return false;
+                }
+                return test_todo_protected_re_domains_11_15_payload_contains(ir, {"deterministic_register_identity", "simplifications"}, reason);
+            },
+            passed, failed);
+
+        mcp_standalone::json cff_args;
+        cff_args["process_id"] = pid;
+        cff_args["address"] = hex_u64(vm_addr);
+        cff_args["size"] = 4096;
+        test_todo_protected_re_domains_11_15_expect(hf, tag, "cff_detect",
+            cff_args,
+            true, true,
+            [](const invoke_result_t& ir, std::string& reason) {
+                return test_todo_protected_re_domains_11_15_payload_contains(ir, {"block_count", "confidence"}, reason);
+            },
+            passed, failed);
+
+        test_todo_protected_re_domains_11_15_expect(hf, tag, "cff_recover_cfg",
+            cff_args,
+            true, true,
+            [](const invoke_result_t& ir, std::string& reason) {
+                return test_todo_protected_re_domains_11_15_payload_contains(ir, {"recovered_blocks", "cfg_dot", "pseudocode"}, reason);
+            },
+            passed, failed);
+
+        mcp_standalone::json opaque_args;
+        opaque_args["process_id"] = pid;
+        opaque_args["address"] = hex_u64(opaque);
+        opaque_args["size"] = 32;
+        test_todo_protected_re_domains_11_15_expect(hf, tag, "opaque_predicate_detect",
+            opaque_args,
+            true, true,
+            [](const invoke_result_t& ir, std::string& reason) {
+                uint64_t count = 0;
+                if (!payload_u64_field(ir.data, "count", count) || count == 0) {
+                    reason = "opaque predicate count missing or zero";
+                    return false;
+                }
+                return test_todo_protected_re_domains_11_15_payload_contains(ir, {"always_true", "syntactic_identity"}, reason);
+            },
+            passed, failed);
+
+        test_todo_protected_re_domains_11_15_expect(hf, tag, "bogus_block_remove",
+            opaque_args,
+            true, true,
+            [](const invoke_result_t& ir, std::string& reason) {
+                return test_todo_protected_re_domains_11_15_payload_contains(ir, {"opaque_guard"}, reason);
+            },
+            passed, failed);
+
+        driver_bridge::free_memory(vm_addr);
+    }
+
+    void test_todo_protected_re_domains_11_15_pack_tools(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        const char* tag = "mcp.todo_protected_re.pack";
+        uint64_t unpacked_addr = 0;
+        uint64_t packed_addr = 0;
+        std::vector<uint8_t> unpacked = test_todo_protected_re_domains_11_15_pe_image(false);
+        std::vector<uint8_t> packed = test_todo_protected_re_domains_11_15_pe_image(true);
+        if (!ensure_mcp_private_bytes(hf, tag, unpacked_addr, unpacked.size(), unpacked) ||
+            !ensure_mcp_private_bytes(hf, tag, packed_addr, packed.size(), packed)) {
+            record_fixture_failed_tool("pack_detect", failed);
+            record_fixture_failed_tool("pack_iat_manage", failed);
+            if (unpacked_addr) driver_bridge::free_memory(unpacked_addr);
+            if (packed_addr) driver_bridge::free_memory(packed_addr);
+            return;
+        }
+        const uint32_t pid = g_mcp_target_pid;
+        mcp_standalone::json unpacked_args;
+        unpacked_args["process_id"] = pid;
+        unpacked_args["module_base"] = hex_u64(unpacked_addr);
+        unpacked_args["module_size"] = unpacked.size();
+        test_todo_protected_re_domains_11_15_expect(hf, tag, "pack_detect",
+            unpacked_args,
+            true, true,
+            [](const invoke_result_t& ir, std::string& reason) {
+                bool likely = true;
+                if (!payload_bool_field(ir.data, "likely_packed", likely)) {
+                    reason = "likely_packed missing";
+                    return false;
+                }
+                if (likely) {
+                    reason = "unpacked synthetic PE reported as packed";
+                    return false;
+                }
+                return test_todo_protected_re_domains_11_15_payload_contains(ir, {"entropy_map", ".text"}, reason);
+            },
+            passed, failed);
+
+        mcp_standalone::json packed_args;
+        packed_args["process_id"] = pid;
+        packed_args["module_base"] = hex_u64(packed_addr);
+        packed_args["module_size"] = packed.size();
+        test_todo_protected_re_domains_11_15_expect(hf, tag, "pack_detect",
+            packed_args,
+            true, true,
+            [](const invoke_result_t& ir, std::string& reason) {
+                bool likely = false;
+                if (!payload_bool_field(ir.data, "likely_packed", likely) || !likely) {
+                    reason = "packed synthetic PE was not reported as packed";
+                    return false;
+                }
+                return test_todo_protected_re_domains_11_15_payload_contains(ir, {"UPX", "entropy_map"}, reason);
+            },
+            passed, failed);
+
+        mcp_standalone::json iat_args = unpacked_args;
+        iat_args["max_entries"] = 8;
+        iat_args["action"] = "start";
+        test_todo_protected_re_domains_11_15_expect(hf, tag, "pack_iat_manage",
+            iat_args,
+            false, false,
+            [](const invoke_result_t& ir, std::string& reason) {
+                return test_todo_protected_re_domains_11_15_payload_contains(ir, {"confirm_unsafe", "hardware breakpoint"}, reason);
+            },
+            passed, failed);
+
+        test_todo_protected_re_domains_11_15_expect(hf, tag, "pack_iat_manage",
+            mcp_standalone::json{{"action", "results"}, {"session_id", "iat-missing-session"}},
+            false, false,
+            [](const invoke_result_t& ir, std::string& reason) {
+                return test_todo_protected_re_domains_11_15_payload_contains(ir, {"session_id not found"}, reason);
+            },
+            passed, failed);
+
+        mcp_standalone::json oep_args;
+        oep_args["process_id"] = pid;
+        oep_args["module_base"] = hex_u64(packed_addr);
+        oep_args["module_size"] = packed.size();
+        oep_args["strategy"] = "tail_jump";
+        oep_args["timeout_ms"] = 100;
+        test_todo_protected_re_domains_11_15_expect(hf, tag, "pack_find_oep",
+            oep_args,
+            false, false,
+            [](const invoke_result_t& ir, std::string& reason) {
+                return test_todo_protected_re_domains_11_15_payload_contains(ir, {"confirm_unsafe", "allow_unsafe"}, reason);
+            },
+            passed, failed);
+
+        driver_bridge::free_memory(unpacked_addr);
+        driver_bridge::free_memory(packed_addr);
+    }
+
+    void test_todo_protected_re_domains_11_15_edge_cases(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        const char* tag = "mcp.todo_protected_re.edges";
+        test_todo_protected_re_domains_11_15_expect(hf, tag, "drv_send_ioctl",
+            mcp_standalone::json{{"device_symlink", "\\\\.\\AidaMissingDevice"}, {"ioctl_code", 0x222003}, {"input_buffer_hex", "GG"}, {"confirm_unsafe", true}},
+            false, false,
+            [](const invoke_result_t& ir, std::string& reason) {
+                return test_todo_protected_re_domains_11_15_payload_contains(ir, {"invalid character", "input_buffer_hex_valid"}, reason);
+            },
+            passed, failed);
+
+        test_todo_protected_re_domains_11_15_expect(hf, tag, "vm_lift_to_il",
+            mcp_standalone::json{{"trace", "not-a-trace"}, {"opcode_map", mcp_standalone::json::object()}},
+            true, false,
+            [](const invoke_result_t& ir, std::string& reason) {
+                return test_todo_protected_re_domains_11_15_payload_contains(ir, {"trace object or array is required"}, reason);
+            },
+            passed, failed);
+
+        test_todo_protected_re_domains_11_15_expect(hf, tag, "vm_recover_cfg",
+            mcp_standalone::json{{"optimized_il", mcp_standalone::json{{"il_instructions", mcp_standalone::json::array({mcp_standalone::json{{"op", "RET"}, {"handler_va", "0x140001000"}}})}}}},
+            true, true,
+            [](const invoke_result_t& ir, std::string& reason) {
+                return test_todo_protected_re_domains_11_15_payload_contains(ir, {"nodes", "node_count"}, reason);
+            },
+            passed, failed);
+
+        test_todo_protected_re_domains_11_15_expect(hf, tag, "vm_emit_pseudocode",
+            mcp_standalone::json{{"cfg", mcp_standalone::json{{"nodes", mcp_standalone::json::array({mcp_standalone::json{{"id", 0}, {"il_instructions", mcp_standalone::json::array({mcp_standalone::json{{"op", "RET"}}})}, {"successors", mcp_standalone::json::array()}}})}}}},
+            true, true,
+            [](const invoke_result_t& ir, std::string& reason) {
+                return test_todo_protected_re_domains_11_15_payload_contains(ir, {"recovered_vm_function", "pseudocode"}, reason);
+            },
+            passed, failed);
+
+        test_todo_protected_re_domains_11_15_expect(hf, tag, "mba_simplify",
+            mcp_standalone::json::object(),
+            true, false,
+            [](const invoke_result_t& ir, std::string& reason) {
+                return test_todo_protected_re_domains_11_15_payload_contains(ir, {"address is required"}, reason);
+            },
+            passed, failed);
+
+        test_todo_protected_re_domains_11_15_expect(hf, tag, "opaque_predicate_patch",
+            mcp_standalone::json{{"predicates", mcp_standalone::json::array({mcp_standalone::json{{"va", "0x140001020"}, {"result", "always_true"}, {"dead_branch_va", "0x140001030"}}})}},
+            false, false,
+            [](const invoke_result_t& ir, std::string& reason) {
+                return test_todo_protected_re_domains_11_15_payload_contains(ir, {"confirm_unsafe", "allow_unsafe"}, reason);
+            },
+            passed, failed);
+
+        test_todo_protected_re_domains_11_15_expect(hf, tag, "pack_detect",
+            mcp_standalone::json{{"process_id", g_mcp_target_pid}, {"module_name", "aida_missing_module_for_pack_detect_0000.dll"}},
+            true, false,
+            [](const invoke_result_t& ir, std::string& reason) {
+                return test_todo_protected_re_domains_11_15_payload_contains(ir, {"no module matched"}, reason);
+            },
+            passed, failed);
+    }
+
+    void test_todo_protected_re_domains_11_15_run(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped, bool(*cancelled)()) {
+        (void)skipped;
+        const char* tag = "mcp.todo_protected_re.domains_11_15";
+        log_msg(hf, tag, "BEGIN -- protected RE Domains 11-15 functional coverage");
+        if (!cancelled()) test_todo_protected_re_domains_11_15_driver_tools(hf, passed, failed);
+        if (!cancelled()) test_todo_protected_re_domains_11_15_smc_tools(hf, passed, failed);
+        if (!cancelled()) test_todo_protected_re_domains_11_15_vm_and_obf_tools(hf, passed, failed);
+        if (!cancelled()) test_todo_protected_re_domains_11_15_pack_tools(hf, passed, failed);
+        if (!cancelled()) test_todo_protected_re_domains_11_15_edge_cases(hf, passed, failed);
+        log_msg(hf, tag, "END -- protected RE Domains 11-15 functional coverage pass=%d fail=%d",
+            passed.load(std::memory_order_acquire),
+            failed.load(std::memory_order_acquire));
+    }
+
 
     uint64_t g_mcp_xref_from_addr = 0x0000000141DA3000ULL;
     uint64_t g_mcp_xref_to_addr = 0x0000000141DA3010ULL;
@@ -4731,6 +5511,1637 @@ namespace {
         BOOL ok = WriteFile(h, content.data(), static_cast<DWORD>(content.size()), &wrote, nullptr);
         CloseHandle(h);
         return ok && static_cast<size_t>(wrote) == content.size();
+    }
+
+    struct test_todo_domains_1_8_re_descriptor_t {
+        std::uint32_t magic = 0;
+        std::uint16_t version = 0;
+        std::uint16_t size = 0;
+        std::uint64_t module_base_va = 0;
+        std::uint64_t descriptor_va = 0;
+        std::uint64_t matrix_buffer_va = 0;
+        std::uint32_t matrix_count = 0;
+        std::uint32_t matrix_stride = 0;
+        std::uint64_t resource_object_va = 0;
+        std::uint64_t resource_backing_va = 0;
+        std::uint32_t resource_size = 0;
+        std::uint32_t resource_stride = 0;
+        std::uint64_t struct_base_va = 0;
+        std::uint64_t struct_array_va = 0;
+        std::uint32_t struct_count = 0;
+        std::uint32_t struct_size = 0;
+        std::uint64_t rtti_instance_va = 0;
+        std::uint64_t rtti_vtable_va = 0;
+        std::uint64_t heap_burst_fn_va = 0;
+        std::uint64_t heap_burst_first_va = 0;
+        std::uint32_t heap_burst_count = 0;
+        std::uint32_t heap_burst_stride = 0;
+        std::uint64_t mutate_struct_fn_va = 0;
+        std::uint64_t frame_tick_fn_va = 0;
+        std::uint64_t window_hwnd = 0;
+        std::uint64_t frame_counter_va = 0;
+        std::uint64_t d3d11_module_va = 0;
+        std::uint64_t dxgi_module_va = 0;
+        std::uint64_t reserved[8] = {};
+    };
+
+    using test_todo_domains_1_8_validator_t = std::function<bool(const invoke_result_t&, std::string&)>;
+
+    struct test_todo_domains_1_8_param_t {
+        const char* name;
+        bool required;
+    };
+
+    struct scoped_todo_domains_1_8_temp_file_t {
+        std::string path;
+        explicit scoped_todo_domains_1_8_temp_file_t(const char* name)
+            : path(temp_file_narrow(name)) {
+            if (!path.empty())
+                DeleteFileA(path.c_str());
+        }
+        ~scoped_todo_domains_1_8_temp_file_t() {
+            if (!path.empty())
+                DeleteFileA(path.c_str());
+        }
+    };
+
+    struct scoped_todo_domains_1_8_file_restore_t {
+        std::filesystem::path path;
+        std::vector<std::uint8_t> bytes;
+        bool existed = false;
+        HANDLE hf = nullptr;
+        const char* tag = nullptr;
+
+        scoped_todo_domains_1_8_file_restore_t(HANDLE file, const char* log_tag, std::filesystem::path p)
+            : path(std::move(p)), hf(file), tag(log_tag) {
+            std::error_code ec;
+            existed = std::filesystem::exists(path, ec) && !ec;
+            if (!existed)
+                return;
+            std::ifstream in(path, std::ios::binary);
+            if (!in)
+                return;
+            bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        }
+
+        ~scoped_todo_domains_1_8_file_restore_t() {
+            std::error_code ec;
+            if (existed) {
+                const auto parent = path.parent_path();
+                if (!parent.empty())
+                    std::filesystem::create_directories(parent, ec);
+                std::ofstream out(path, std::ios::binary | std::ios::trunc);
+                if (out && !bytes.empty())
+                    out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+                if (hf)
+                    log_msg(hf, tag ? tag : "mcp.todo.domains_1_8", "STORE-RESTORE -- path=%s existed=1 restored_bytes=%zu ok=%d",
+                        path_to_utf8(path).c_str(), bytes.size(), out.good() ? 1 : 0);
+            } else {
+                std::filesystem::remove(path, ec);
+                if (hf)
+                    log_msg(hf, tag ? tag : "mcp.todo.domains_1_8", "STORE-RESTORE -- path=%s existed=0 removed=%d ec=%d",
+                        path_to_utf8(path).c_str(), ec ? 0 : 1, ec.value());
+            }
+        }
+    };
+
+    struct scoped_todo_domains_1_8_remote_region_t {
+        HANDLE hf = nullptr;
+        const char* tag = nullptr;
+        std::uint64_t addr = 0;
+        std::size_t size = 0;
+
+        scoped_todo_domains_1_8_remote_region_t(HANDLE file, const char* log_tag)
+            : hf(file), tag(log_tag) {
+        }
+
+        ~scoped_todo_domains_1_8_remote_region_t() {
+            if (addr == 0)
+                return;
+            if (g_mcp_target_pid != 0 && driver_bridge::attached_pid() != g_mcp_target_pid)
+                restore_mcp_target(hf, tag);
+            const bool freed = driver_bridge::free_memory(addr);
+            if (hf)
+                log_msg(hf, tag ? tag : "mcp.todo.domains_1_8", "REMOTE-FREE -- addr=0x%016llX size=%zu freed=%d status=%s error=%s",
+                    static_cast<unsigned long long>(addr), size, freed ? 1 : 0, driver_bridge::status().c_str(), driver_bridge::last_error().c_str());
+            addr = 0;
+            size = 0;
+        }
+
+        bool allocate(const std::vector<std::uint8_t>& bytes, std::size_t requested_size, std::uint32_t final_protect = PAGE_EXECUTE_READWRITE) {
+            size = std::max<std::size_t>(requested_size, bytes.size());
+            if (size == 0)
+                size = 4096;
+            if (!ensure_mcp_private_bytes(hf, tag, addr, size, bytes))
+                return false;
+            if (final_protect != PAGE_EXECUTE_READWRITE) {
+                std::uint32_t old_protect = 0;
+                const std::uint32_t pid = g_mcp_target_pid != 0 ? g_mcp_target_pid : driver_bridge::attached_pid();
+                const bool ok = driver_bridge::protect_memory_for(pid, addr, size, final_protect, &old_protect);
+                if (hf)
+                    log_msg(hf, tag ? tag : "mcp.todo.domains_1_8", "REMOTE-PROTECT -- addr=0x%016llX size=%zu new=0x%08X old=0x%08X ok=%d",
+                        static_cast<unsigned long long>(addr), size, final_protect, old_protect, ok ? 1 : 0);
+                return ok;
+            }
+            return true;
+        }
+
+        bool rewrite(const std::vector<std::uint8_t>& bytes) {
+            if (addr == 0)
+                return false;
+            const std::uint32_t pid = g_mcp_target_pid != 0 ? g_mcp_target_pid : driver_bridge::attached_pid();
+            return driver_bridge::write_memory_for(pid, addr, bytes);
+        }
+    };
+
+    std::string test_todo_domains_1_8_hex_ptr(std::uint64_t value) {
+        return hex_u64(value);
+    }
+
+    bool test_todo_domains_1_8_payload_has_any(const invoke_result_t& ir, std::initializer_list<const char*> markers) {
+        for (const char* marker : markers) {
+            if (marker && payload_text_contains(ir, lower_copy(marker)))
+                return true;
+        }
+        return false;
+    }
+
+    bool test_todo_domains_1_8_expect_error_any(const invoke_result_t& ir, std::initializer_list<const char*> markers, std::string& reason) {
+        if (ir.success) {
+            reason = "expected error but success=true data=" + compact_json(ir.data, 420);
+            return false;
+        }
+        if (ir.threw) {
+            reason = "handler threw: " + ir.exception_msg;
+            return false;
+        }
+        if (test_todo_domains_1_8_payload_has_any(ir, markers))
+            return true;
+        reason = "error envelope lacked expected marker text=" + compact_text(ir.text, 360) + " data=" + compact_json(ir.data, 460);
+        return false;
+    }
+
+    bool test_todo_domains_1_8_schema(HANDLE hf,
+                                      const char* tag,
+                                      const char* tool_name,
+                                      bool expected_read_only,
+                                      std::initializer_list<test_todo_domains_1_8_param_t> params,
+                                      std::atomic<int>& passed,
+                                      std::atomic<int>& failed) {
+        const std::string tool = tool_name ? std::string(tool_name) : std::string();
+        if (tool.empty())
+            return false;
+        g_invoked_tools.insert(tool);
+        const auto* def = find_registered_tool(get_server(), tool.c_str());
+        if (!def) {
+            log_msg(hf, tag, "FAIL -- schema tool=\"%s\" not registered", tool.c_str());
+            record_tool_status(tool, mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return false;
+        }
+        if (def->read_only != expected_read_only) {
+            log_msg(hf, tag, "FAIL -- schema tool=\"%s\" read_only=%d expected=%d",
+                tool.c_str(), def->read_only ? 1 : 0, expected_read_only ? 1 : 0);
+            record_tool_status(tool, mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return false;
+        }
+        for (const auto& param : params) {
+            bool required = false;
+            if (!tool_has_param(*def, param.name, &required) || required != param.required) {
+                log_msg(hf, tag, "FAIL -- schema tool=\"%s\" param=%s required=%d expected=%d",
+                    tool.c_str(), param.name ? param.name : "<null>", required ? 1 : 0, param.required ? 1 : 0);
+                record_tool_status(tool, mcp_tool_call_status_t::failed);
+                failed.fetch_add(1);
+                return false;
+            }
+        }
+        log_msg(hf, tag, "PASS -- schema tool=\"%s\" read_only=%d params=%zu",
+            tool.c_str(), def->read_only ? 1 : 0, def->params.size());
+        record_tool_status(tool, mcp_tool_call_status_t::passed);
+        passed.fetch_add(1);
+        return true;
+    }
+
+    bool test_todo_domains_1_8_case(HANDLE hf,
+                                    const char* tag,
+                                    const char* tool_name,
+                                    const char* case_name,
+                                    mcp_standalone::json args,
+                                    long long timeout_ms,
+                                    const test_todo_domains_1_8_validator_t& validator,
+                                    std::atomic<int>& passed,
+                                    std::atomic<int>& failed,
+                                    invoke_result_t* out_result = nullptr) {
+        const std::string tool = tool_name ? std::string(tool_name) : std::string();
+        if (tool.empty())
+            return false;
+        if (!args.is_object())
+            args = mcp_standalone::json::object();
+        g_invoked_tools.insert(tool);
+        const int seq = g_mcp_tool_sequence.fetch_add(1, std::memory_order_acq_rel) + 1;
+        char step[256];
+        _snprintf_s(step, sizeof(step), _TRUNCATE, "mcp todo domains 1-8 #%d: %s", seq, tool.c_str());
+        set_progress_step(step);
+        if (!tool_registered(get_server(), tool.c_str())) {
+            log_msg(hf, tag, "FAIL -- case=%s tool=\"%s\" not registered", case_name ? case_name : "<null>", tool.c_str());
+            record_tool_status(tool, mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return false;
+        }
+        log_msg(hf, tag, "START -- case=%s tool=\"%s\" seq=%d timeout_ms=%lld args=%s",
+            case_name ? case_name : "<null>", tool.c_str(), seq, timeout_ms, compact_json(args, 900).c_str());
+        auto timed = invoke_tool_bounded(get_server(), tool, args, timeout_ms, hf, tag, seq);
+        invoke_result_t ir = std::move(timed.result);
+        if (out_result)
+            *out_result = ir;
+        log_mcp_result_detail("todo_domains_1_8", seq, tool, args, ir, timed.elapsed_ms, case_name ? case_name : "");
+        auto fail_case = [&](const std::string& why, mcp_tool_call_status_t status = mcp_tool_call_status_t::failed) {
+            log_msg(hf, tag, "FAIL -- case=%s tool=\"%s\" seq=%d reason=%s elapsed_ms=%lld success=%d data=%s",
+                case_name ? case_name : "<null>",
+                tool.c_str(),
+                seq,
+                compact_text(why, 700).c_str(),
+                timed.elapsed_ms,
+                ir.success ? 1 : 0,
+                compact_json(ir.data, 900).c_str());
+            record_tool_status(tool, status);
+            failed.fetch_add(1);
+            if (g_mcp_target_pid != 0)
+                restore_mcp_target(hf, tag);
+            return false;
+        };
+        if (timed.timed_out) {
+            cancel_timed_out_tool(hf, tag, tool);
+            return fail_case("watchdog timeout", mcp_tool_call_status_t::timed_out);
+        }
+        if (!ir.found)
+            return fail_case("tool not found during dispatch");
+        if (ir.threw)
+            return fail_case("handler threw: " + ir.exception_msg);
+        std::string reason;
+        if (!validator(ir, reason))
+            return fail_case(reason.empty() ? "validator rejected result" : reason);
+        log_msg(hf, tag, "PASS -- case=%s tool=\"%s\" seq=%d success=%d elapsed_ms=%lld data=%s",
+            case_name ? case_name : "<null>",
+            tool.c_str(),
+            seq,
+            ir.success ? 1 : 0,
+            timed.elapsed_ms,
+            mcp_payload_summary(ir.data).c_str());
+        record_tool_status(tool, mcp_tool_call_status_t::passed);
+        passed.fetch_add(1);
+        if (g_mcp_target_pid != 0)
+            restore_mcp_target(hf, tag);
+        return true;
+    }
+
+    void test_todo_domains_1_8_fixture_fail(HANDLE hf,
+                                            const char* tag,
+                                            const char* tool_name,
+                                            const std::string& reason,
+                                            std::atomic<int>& failed) {
+        log_msg(hf, tag, "FAIL -- fixture dependency unavailable for tool=\"%s\" reason=%s",
+            tool_name ? tool_name : "<null>", compact_text(reason, 900).c_str());
+        record_fixture_failed_tool(tool_name, failed);
+    }
+
+    bool test_todo_domains_1_8_read_descriptor_at(std::uint32_t pid,
+                                                  std::uint64_t va,
+                                                  test_todo_domains_1_8_re_descriptor_t& out,
+                                                  std::string& reason) {
+        std::vector<std::uint8_t> bytes;
+        if (!driver_bridge::read_memory_for(pid, va, sizeof(out), bytes) || bytes.size() < sizeof(out)) {
+            reason = "read_memory_for descriptor failed va=" + test_todo_domains_1_8_hex_ptr(va) + " status=" + driver_bridge::status() + " error=" + driver_bridge::last_error();
+            return false;
+        }
+        std::memcpy(&out, bytes.data(), sizeof(out));
+        if (out.magic != 0x41494452u || out.version != 1 || out.size < 128 || out.descriptor_va == 0) {
+            reason = "descriptor validation failed va=" + test_todo_domains_1_8_hex_ptr(va) +
+                " magic=" + std::to_string(out.magic) +
+                " version=" + std::to_string(out.version) +
+                " size=" + std::to_string(out.size) +
+                " descriptor_va=" + test_todo_domains_1_8_hex_ptr(out.descriptor_va);
+            return false;
+        }
+        return true;
+    }
+
+    bool test_todo_domains_1_8_find_re_descriptor(HANDLE hf,
+                                                  const char* tag,
+                                                  test_todo_domains_1_8_re_descriptor_t& out,
+                                                  std::string& reason) {
+        const std::uint32_t pid = g_mcp_target_pid != 0 ? g_mcp_target_pid : driver_bridge::attached_pid();
+        if (pid == 0) {
+            reason = "no current MCP target PID";
+            return false;
+        }
+        if (g_mcp_target_pid != 0 && driver_bridge::attached_pid() != g_mcp_target_pid && !restore_mcp_target(hf, tag)) {
+            reason = "failed to restore MCP target before descriptor lookup";
+            return false;
+        }
+        const auto modules = driver_bridge::enumerate_modules_for(pid);
+        std::string first_export_error;
+        for (const auto& mod : modules) {
+            if (mod.base == 0)
+                continue;
+            const std::uint64_t descriptor_va = driver_bridge::resolve_export(mod.base, "aida_test_re_descriptor");
+            if (descriptor_va == 0)
+                continue;
+            test_todo_domains_1_8_re_descriptor_t candidate{};
+            std::string read_reason;
+            if (test_todo_domains_1_8_read_descriptor_at(pid, descriptor_va, candidate, read_reason)) {
+                out = candidate;
+                log_msg(hf, tag, "FIXTURE -- re descriptor resolved module=%s base=0x%016llX descriptor=0x%016llX matrix=0x%016llX resource=0x%016llX struct=0x%016llX rtti_vtable=0x%016llX heap_fn=0x%016llX window=0x%016llX d3d11=0x%016llX dxgi=0x%016llX",
+                    mod.name.c_str(),
+                    static_cast<unsigned long long>(mod.base),
+                    static_cast<unsigned long long>(candidate.descriptor_va),
+                    static_cast<unsigned long long>(candidate.matrix_buffer_va),
+                    static_cast<unsigned long long>(candidate.resource_object_va),
+                    static_cast<unsigned long long>(candidate.struct_array_va ? candidate.struct_array_va : candidate.struct_base_va),
+                    static_cast<unsigned long long>(candidate.rtti_vtable_va),
+                    static_cast<unsigned long long>(candidate.heap_burst_fn_va),
+                    static_cast<unsigned long long>(candidate.window_hwnd),
+                    static_cast<unsigned long long>(candidate.d3d11_module_va),
+                    static_cast<unsigned long long>(candidate.dxgi_module_va));
+                return true;
+            }
+            if (first_export_error.empty())
+                first_export_error = read_reason;
+        }
+        reason = modules.empty() ? "module enumeration returned no modules for target PID " + std::to_string(pid) :
+            "export aida_test_re_descriptor was not resolved in target modules";
+        if (!first_export_error.empty())
+            reason += "; first_export_error=" + first_export_error;
+        return false;
+    }
+
+    bool test_todo_domains_1_8_refresh_re_descriptor(HANDLE hf,
+                                                     const char* tag,
+                                                     test_todo_domains_1_8_re_descriptor_t& desc) {
+        const std::uint32_t pid = g_mcp_target_pid != 0 ? g_mcp_target_pid : driver_bridge::attached_pid();
+        std::string reason;
+        test_todo_domains_1_8_re_descriptor_t refreshed{};
+        if (pid == 0 || desc.descriptor_va == 0 || !test_todo_domains_1_8_read_descriptor_at(pid, desc.descriptor_va, refreshed, reason)) {
+            log_msg(hf, tag, "WARN -- descriptor refresh failed reason=%s", compact_text(reason, 700).c_str());
+            return false;
+        }
+        desc = refreshed;
+        return true;
+    }
+
+    mcp_standalone::json test_todo_domains_1_8_safe_args() {
+        mcp_standalone::json args = mcp_standalone::json::object();
+        args["confirm_unsafe"] = true;
+        args["allow_unsafe"] = true;
+        args[k_test_lab_safe_fixture_flag] = true;
+        return args;
+    }
+
+    bool test_todo_domains_1_8_json_has_resolved_dx_slot(const mcp_standalone::json& obj) {
+        if (!obj.is_object())
+            return false;
+        if (obj.contains("slot_map") && obj["slot_map"].is_object()) {
+            for (auto it = obj["slot_map"].begin(); it != obj["slot_map"].end(); ++it) {
+                const auto& slot = it.value();
+                if (slot.is_object() && slot.contains("address") && slot["address"].is_string() && !slot["address"].get<std::string>().empty())
+                    return true;
+            }
+        }
+        if (obj.contains("apis") && obj["apis"].is_array()) {
+            for (const auto& api : obj["apis"]) {
+                if (test_todo_domains_1_8_json_has_resolved_dx_slot(api))
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    bool test_todo_domains_1_8_first_array_item(const mcp_standalone::json& data, const char* key, mcp_standalone::json& out) {
+        if (!data.is_object() || !key || !data.contains(key) || !data[key].is_array() || data[key].empty())
+            return false;
+        out = data[key][0];
+        return true;
+    }
+
+    void test_todo_domains_1_8_dx_tools(HANDLE hf,
+                                        const test_todo_domains_1_8_re_descriptor_t& desc,
+                                        bool have_desc,
+                                        const std::string& descriptor_reason,
+                                        std::atomic<int>& passed,
+                                        std::atomic<int>& failed,
+                                        bool(*cancelled)()) {
+        const char* tag = "mcp.todo.domains_1_8.dx";
+        set_progress_step("mcp todo domains 1-8: dx tools");
+        const std::uint32_t pid = g_mcp_target_pid != 0 ? g_mcp_target_pid : driver_bridge::attached_pid();
+
+        {
+            mcp_standalone::json args;
+            args["process_id"] = pid;
+            args["api"] = "auto";
+            test_todo_domains_1_8_case(hf, tag, "dx_find_device_vtable", "find_device_vtable_resolves_target_slot", args, 6000,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success) {
+                        reason = "expected DX discovery success text=" + compact_text(ir.text, 300);
+                        return false;
+                    }
+                    if (!test_todo_domains_1_8_json_has_resolved_dx_slot(ir.data)) {
+                        reason = "DX discovery returned no resolved target slot data=" + compact_json(ir.data, 700);
+                        return false;
+                    }
+                    return true;
+                }, passed, failed);
+        }
+
+        {
+            mcp_standalone::json args;
+            args["action"] = "present";
+            args["process_id"] = pid;
+            args[k_test_lab_safe_fixture_flag] = true;
+            test_todo_domains_1_8_case(hf, tag, "dx_hook_manage", "present_hook_requires_confirm", args, 2500,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    return test_todo_domains_1_8_expect_error_any(ir, {"confirm_unsafe", "Unsafe operation"}, reason);
+                }, passed, failed);
+        }
+
+        {
+            mcp_standalone::json args = test_todo_domains_1_8_safe_args();
+            args["action"] = "present";
+            args["process_id"] = pid;
+            args["api"] = "auto";
+            args["callback_mode"] = "snapshot";
+            args["max_captures"] = 2;
+            test_todo_domains_1_8_case(hf, tag, "dx_hook_manage", "present_hook_safe_fixture", args, 7000,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success) {
+                        reason = "DX hook install failed text=" + compact_text(ir.text, 360) + " data=" + compact_json(ir.data, 500);
+                        return false;
+                    }
+                    std::string hook_id;
+                    if (!payload_string_field(ir.data, "hook_id", hook_id) || hook_id.empty()) {
+                        reason = "hook_id missing";
+                        return false;
+                    }
+                    return true;
+                }, passed, failed);
+        }
+
+        {
+            mcp_standalone::json args;
+            args["process_id"] = pid;
+            args["api"] = "auto";
+            test_todo_domains_1_8_case(hf, tag, "dx_list_bound_cbuffers", "list_bound_cbuffers_after_safe_hook", args, 4000,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success) {
+                        reason = "list_bound_cbuffers failed text=" + compact_text(ir.text, 300);
+                        return false;
+                    }
+                    uint64_t count = 0;
+                    if (!payload_u64_field(ir.data, "count", count) || count == 0) {
+                        reason = "no cbuffer captures available; DX fixture hook did not seed bounded cbuffer evidence";
+                        return false;
+                    }
+                    return true;
+                }, passed, failed);
+        }
+
+        if (have_desc && desc.matrix_buffer_va != 0 && desc.matrix_count >= 4 && desc.matrix_stride != 0) {
+            mcp_standalone::json bone_args;
+            bone_args["process_id"] = pid;
+            bone_args["min_bones"] = 4;
+            bone_args["max_bones"] = std::max<std::uint32_t>(desc.matrix_count, 4);
+            test_todo_domains_1_8_case(hf, tag, "dx_identify_bone_buffer", "identify_fixture_matrix_buffer", bone_args, 6000,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success) {
+                        reason = "bone buffer scan failed text=" + compact_text(ir.text, 300);
+                        return false;
+                    }
+                    uint64_t count = 0;
+                    if (!payload_u64_field(ir.data, "count", count))
+                        count = ir.data.contains("candidates") && ir.data["candidates"].is_array() ? static_cast<uint64_t>(ir.data["candidates"].size()) : 0;
+                    if (count == 0 && (!ir.data.contains("best") || ir.data["best"].is_null())) {
+                        reason = "fixture matrix buffer was not identified data=" + compact_json(ir.data, 700);
+                        return false;
+                    }
+                    return true;
+                }, passed, failed);
+
+            mcp_standalone::json matrix_args;
+            matrix_args["process_id"] = pid;
+            matrix_args["scan_cbuffers_only"] = false;
+            test_todo_domains_1_8_case(hf, tag, "dx_find_view_matrix", "find_fixture_view_matrix", matrix_args, 6000,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success) {
+                        reason = "view matrix scan failed text=" + compact_text(ir.text, 300);
+                        return false;
+                    }
+                    uint64_t count = 0;
+                    if (!payload_u64_field(ir.data, "count", count) || count == 0) {
+                        reason = "view matrix count missing or zero data=" + compact_json(ir.data, 700);
+                        return false;
+                    }
+                    return true;
+                }, passed, failed);
+        } else {
+            test_todo_domains_1_8_fixture_fail(hf, tag, "dx_identify_bone_buffer", "RE descriptor missing matrix_buffer_va: " + descriptor_reason, failed);
+            test_todo_domains_1_8_fixture_fail(hf, tag, "dx_find_view_matrix", "RE descriptor missing matrix_buffer_va: " + descriptor_reason, failed);
+        }
+
+        if (have_desc && desc.resource_object_va != 0 && desc.resource_backing_va != 0) {
+            mcp_standalone::json args;
+            args["process_id"] = pid;
+            args["resource_handle"] = test_todo_domains_1_8_hex_ptr(desc.resource_object_va);
+            test_todo_domains_1_8_case(hf, tag, "dx_map_resource_to_va", "map_fixture_resource_backing_va", args, 4000,
+                [expected = desc.resource_backing_va](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success) {
+                        reason = "resource mapping failed text=" + compact_text(ir.text, 300);
+                        return false;
+                    }
+                    if (!test_todo_domains_1_8_payload_has_any(ir, {test_todo_domains_1_8_hex_ptr(expected).c_str()})) {
+                        uint64_t count = 0;
+                        if (!payload_u64_field(ir.data, "count", count))
+                            count = ir.data.contains("candidates") && ir.data["candidates"].is_array() ? static_cast<uint64_t>(ir.data["candidates"].size()) : 0;
+                        if (count == 0) {
+                            reason = "resource mapping returned no readable pointer candidates data=" + compact_json(ir.data, 700);
+                            return false;
+                        }
+                    }
+                    return true;
+                }, passed, failed);
+        } else {
+            test_todo_domains_1_8_fixture_fail(hf, tag, "dx_map_resource_to_va", "RE descriptor missing resource_object_va/resource_backing_va: " + descriptor_reason, failed);
+        }
+
+        scoped_todo_domains_1_8_temp_file_t render_path("aida_todo_dx_render.rgba");
+        {
+            mcp_standalone::json args;
+            args["process_id"] = pid;
+            args["format"] = "rgba";
+            args["output_path"] = render_path.path;
+            args[k_test_lab_safe_fixture_flag] = true;
+            test_todo_domains_1_8_case(hf, tag, "dx_dump_render_targets", "dump_render_targets_requires_confirm", args, 3000,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    return test_todo_domains_1_8_expect_error_any(ir, {"confirm_unsafe", "Unsafe operation"}, reason);
+                }, passed, failed);
+        }
+        {
+            mcp_standalone::json args = test_todo_domains_1_8_safe_args();
+            args["process_id"] = pid;
+            args["format"] = "rgba";
+            args["output_path"] = render_path.path;
+            test_todo_domains_1_8_case(hf, tag, "dx_dump_render_targets", "dump_render_targets_safe_fixture", args, 7000,
+                [&render_path](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success) {
+                        reason = "render target capture failed text=" + compact_text(ir.text, 360) + " data=" + compact_json(ir.data, 700);
+                        return false;
+                    }
+                    bool captured = false;
+                    uint64_t bytes = 0;
+                    if (!payload_bool_field(ir.data, "captured", captured) || !captured ||
+                        !payload_u64_field(ir.data, "bytes", bytes) || bytes == 0 ||
+                        !file_exists_narrow(render_path.path)) {
+                        reason = "capture result missing captured=true, bytes, or temp output file";
+                        return false;
+                    }
+                    return true;
+                }, passed, failed);
+        }
+
+        {
+            mcp_standalone::json cleanup = test_todo_domains_1_8_safe_args();
+            cleanup["action"] = "remove";
+            cleanup["process_id"] = pid;
+            bounded_finalizer_call(hf, "todo_dx_hook_remove", 5000, [&]() {
+                auto timed = invoke_tool_bounded(get_server(), "dx_hook_manage", cleanup, 5000, hf, tag, 0);
+                return !timed.timed_out && timed.result.found && !timed.result.threw && timed.result.success;
+            });
+        }
+
+        (void)cancelled;
+    }
+
+    bool test_todo_domains_1_8_prepare_vmt_fixture(HANDLE hf,
+                                                   const char* tag,
+                                                   scoped_todo_domains_1_8_remote_region_t& code,
+                                                   scoped_todo_domains_1_8_remote_region_t& table,
+                                                   scoped_todo_domains_1_8_remote_region_t& object,
+                                                   std::string& reason) {
+        std::vector<std::uint8_t> code_bytes(4096, 0x90);
+        const std::uint8_t fn0[] = {0x48, 0x31, 0xC0, 0xC3};
+        const std::uint8_t fn1[] = {0x48, 0x83, 0xC0, 0x01, 0xC3};
+        std::memcpy(code_bytes.data(), fn0, sizeof(fn0));
+        std::memcpy(code_bytes.data() + 0x20, fn1, sizeof(fn1));
+        if (!code.allocate(code_bytes, code_bytes.size(), PAGE_EXECUTE_READWRITE)) {
+            reason = "failed to allocate executable VMT code fixture";
+            return false;
+        }
+        std::vector<std::uint8_t> table_bytes(4096, 0);
+        const std::uint64_t fn0_va = code.addr;
+        const std::uint64_t fn1_va = code.addr + 0x20;
+        std::memcpy(table_bytes.data(), &fn0_va, sizeof(fn0_va));
+        std::memcpy(table_bytes.data() + 8, &fn1_va, sizeof(fn1_va));
+        if (!table.allocate(table_bytes, table_bytes.size(), PAGE_READWRITE)) {
+            reason = "failed to allocate VMT table fixture";
+            return false;
+        }
+        std::vector<std::uint8_t> object_bytes(4096, 0);
+        std::memcpy(object_bytes.data(), &table.addr, sizeof(table.addr));
+        if (!object.allocate(object_bytes, object_bytes.size(), PAGE_READWRITE)) {
+            reason = "failed to allocate VMT object fixture";
+            return false;
+        }
+        log_msg(hf, tag, "FIXTURE -- vmt object=0x%016llX table=0x%016llX fn0=0x%016llX fn1=0x%016llX",
+            static_cast<unsigned long long>(object.addr),
+            static_cast<unsigned long long>(table.addr),
+            static_cast<unsigned long long>(fn0_va),
+            static_cast<unsigned long long>(fn1_va));
+        return true;
+    }
+
+    void test_todo_domains_1_8_cleanup_vmt_hook(HANDLE hf, const char* tag, const std::string& hook_id) {
+        if (hook_id.empty())
+            return;
+        mcp_standalone::json args = test_todo_domains_1_8_safe_args();
+        args["action"] = "remove";
+        args["hook_id"] = hook_id;
+        bounded_finalizer_call(hf, "todo_vmt_hook_remove", 5000, [&]() {
+            auto timed = invoke_tool_bounded(get_server(), "vmt_hook_manage", args, 5000, hf, tag, 0);
+            return !timed.timed_out && timed.result.found && !timed.result.threw && timed.result.success;
+        });
+    }
+
+    void test_todo_domains_1_8_vmt_tools(HANDLE hf,
+                                         std::atomic<int>& passed,
+                                         std::atomic<int>& failed,
+                                         bool(*cancelled)()) {
+        const char* tag = "mcp.todo.domains_1_8.vmt";
+        set_progress_step("mcp todo domains 1-8: vmt tools");
+        scoped_todo_domains_1_8_remote_region_t code(hf, tag);
+        scoped_todo_domains_1_8_remote_region_t table(hf, tag);
+        scoped_todo_domains_1_8_remote_region_t object(hf, tag);
+        std::string fixture_reason;
+        if (!test_todo_domains_1_8_prepare_vmt_fixture(hf, tag, code, table, object, fixture_reason)) {
+            test_todo_domains_1_8_fixture_fail(hf, tag, "vmt_read", fixture_reason, failed);
+            test_todo_domains_1_8_fixture_fail(hf, tag, "vmt_hook_manage", fixture_reason, failed);
+            test_todo_domains_1_8_fixture_fail(hf, tag, "vmt_copy", fixture_reason, failed);
+            test_todo_domains_1_8_fixture_fail(hf, tag, "vmt_find_slot_by_signature", fixture_reason, failed);
+            test_todo_domains_1_8_fixture_fail(hf, tag, "vmt_scan_objects", fixture_reason, failed);
+            return;
+        }
+        const std::uint32_t pid = g_mcp_target_pid != 0 ? g_mcp_target_pid : driver_bridge::attached_pid();
+
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["process_id"] = pid;
+            args["address"] = test_todo_domains_1_8_hex_ptr(object.addr);
+            args["max_slots"] = 2;
+            test_todo_domains_1_8_case(hf, tag, "vmt_read", "read_synthetic_object_vtable", args, 3000,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success) {
+                        reason = "vmt_read failed text=" + compact_text(ir.text, 300);
+                        return false;
+                    }
+                    uint64_t returned = 0;
+                    if (!payload_u64_field(ir.data, "returned", returned) || returned < 2) {
+                        reason = "returned slots missing or <2";
+                        return false;
+                    }
+                    return true;
+                }, passed, failed);
+        }
+
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["process_id"] = pid;
+            args["vtable_va"] = test_todo_domains_1_8_hex_ptr(table.addr);
+            args["pattern"] = "48 31 C0 C3";
+            args["max_slots"] = 2;
+            test_todo_domains_1_8_case(hf, tag, "vmt_find_slot_by_signature", "find_slot_by_fixture_prologue", args, 3000,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success) {
+                        reason = "vmt_find_slot_by_signature failed text=" + compact_text(ir.text, 300);
+                        return false;
+                    }
+                    uint64_t slot = 99;
+                    if (!payload_u64_field(ir.data, "slot", slot) || slot != 0) {
+                        reason = "expected slot 0 match data=" + compact_json(ir.data, 500);
+                        return false;
+                    }
+                    return true;
+                }, passed, failed);
+        }
+
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["process_id"] = pid;
+            args["vtable_va"] = test_todo_domains_1_8_hex_ptr(table.addr);
+            args["max_results"] = 8;
+            test_todo_domains_1_8_case(hf, tag, "vmt_scan_objects", "scan_object_pointing_to_fixture_vtable", args, 4000,
+                [object_va = object.addr](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success) {
+                        reason = "vmt_scan_objects failed text=" + compact_text(ir.text, 300);
+                        return false;
+                    }
+                    if (!test_todo_domains_1_8_payload_has_any(ir, {test_todo_domains_1_8_hex_ptr(object_va).c_str()})) {
+                        reason = "object address not present in scan results data=" + compact_json(ir.data, 700);
+                        return false;
+                    }
+                    return true;
+                }, passed, failed);
+        }
+
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["action"] = "install";
+            args["process_id"] = pid;
+            args["object_va"] = test_todo_domains_1_8_hex_ptr(object.addr);
+            args["vtable_va"] = test_todo_domains_1_8_hex_ptr(table.addr);
+            args["callback_va"] = test_todo_domains_1_8_hex_ptr(code.addr + 0x20);
+            args["slot"] = 0;
+            args["method"] = "patch_object";
+            args[k_test_lab_safe_fixture_flag] = true;
+            test_todo_domains_1_8_case(hf, tag, "vmt_hook_manage", "install_requires_confirm", args, 2500,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    return test_todo_domains_1_8_expect_error_any(ir, {"confirm_unsafe", "Unsafe operation"}, reason);
+                }, passed, failed);
+        }
+
+        std::string installed_hook_id;
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args = test_todo_domains_1_8_safe_args();
+            args["action"] = "install";
+            args["process_id"] = pid;
+            args["object_va"] = test_todo_domains_1_8_hex_ptr(object.addr);
+            args["vtable_va"] = test_todo_domains_1_8_hex_ptr(table.addr);
+            args["callback_va"] = test_todo_domains_1_8_hex_ptr(code.addr + 0x20);
+            args["slot"] = 0;
+            args["method"] = "patch_object";
+            invoke_result_t out;
+            test_todo_domains_1_8_case(hf, tag, "vmt_hook_manage", "install_patch_object_safe_fixture", args, 4000,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success) {
+                        reason = "vmt hook install failed text=" + compact_text(ir.text, 300);
+                        return false;
+                    }
+                    std::string hook_id;
+                    if (!payload_string_field(ir.data, "hook_id", hook_id) || hook_id.empty()) {
+                        reason = "hook_id missing";
+                        return false;
+                    }
+                    return true;
+                }, passed, failed, &out);
+            if (out.success)
+                payload_string_field(out.data, "hook_id", installed_hook_id);
+        }
+        test_todo_domains_1_8_cleanup_vmt_hook(hf, tag, installed_hook_id);
+
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["process_id"] = pid;
+            args["object_va"] = test_todo_domains_1_8_hex_ptr(object.addr);
+            args[k_test_lab_safe_fixture_flag] = true;
+            test_todo_domains_1_8_case(hf, tag, "vmt_copy", "copy_requires_confirm", args, 2500,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    return test_todo_domains_1_8_expect_error_any(ir, {"confirm_unsafe", "Unsafe operation"}, reason);
+                }, passed, failed);
+        }
+
+        std::string copy_hook_id;
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args = test_todo_domains_1_8_safe_args();
+            args["process_id"] = pid;
+            args["object_va"] = test_todo_domains_1_8_hex_ptr(object.addr);
+            args["max_slots"] = 2;
+            invoke_result_t out;
+            test_todo_domains_1_8_case(hf, tag, "vmt_copy", "copy_object_vtable_safe_fixture", args, 4000,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success) {
+                        reason = "vmt_copy failed text=" + compact_text(ir.text, 300);
+                        return false;
+                    }
+                    std::string hook_id;
+                    uint64_t slots = 0;
+                    if (!payload_string_field(ir.data, "hook_id", hook_id) || hook_id.empty() ||
+                        !payload_u64_field(ir.data, "slots_copied", slots) || slots == 0) {
+                        reason = "hook_id or slots_copied missing";
+                        return false;
+                    }
+                    return true;
+                }, passed, failed, &out);
+            if (out.success)
+                payload_string_field(out.data, "hook_id", copy_hook_id);
+        }
+        test_todo_domains_1_8_cleanup_vmt_hook(hf, tag, copy_hook_id);
+    }
+
+    void test_todo_domains_1_8_rtti_tools(HANDLE hf,
+                                          const test_todo_domains_1_8_re_descriptor_t& desc,
+                                          bool have_desc,
+                                          const std::string& descriptor_reason,
+                                          std::atomic<int>& passed,
+                                          std::atomic<int>& failed,
+                                          bool(*cancelled)()) {
+        const char* tag = "mcp.todo.domains_1_8.rtti";
+        set_progress_step("mcp todo domains 1-8: rtti tools");
+        const std::uint32_t pid = g_mcp_target_pid != 0 ? g_mcp_target_pid : driver_bridge::attached_pid();
+        if (!have_desc || desc.rtti_vtable_va == 0) {
+            test_todo_domains_1_8_fixture_fail(hf, tag, "rtti_scan", "RE descriptor missing RTTI fixture: " + descriptor_reason, failed);
+            test_todo_domains_1_8_fixture_fail(hf, tag, "rtti_find_type", "RE descriptor missing RTTI fixture: " + descriptor_reason, failed);
+            test_todo_domains_1_8_fixture_fail(hf, tag, "rtti_list_hierarchy", "RE descriptor missing RTTI fixture: " + descriptor_reason, failed);
+            test_todo_domains_1_8_fixture_fail(hf, tag, "rtti_find_constructor", "RE descriptor missing RTTI fixture: " + descriptor_reason, failed);
+            return;
+        }
+
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["process_id"] = pid;
+            args["filter"] = "fixture_rtti";
+            args["max_results"] = 16;
+            test_todo_domains_1_8_case(hf, tag, "rtti_scan", "scan_fixture_rtti_types", args, 6000,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success) {
+                        reason = "rtti_scan failed text=" + compact_text(ir.text, 300);
+                        return false;
+                    }
+                    uint64_t returned = 0;
+                    if (!payload_u64_field(ir.data, "returned", returned) || returned == 0 || !payload_text_contains(ir, "fixture_rtti")) {
+                        reason = "fixture RTTI type not returned data=" + compact_json(ir.data, 700);
+                        return false;
+                    }
+                    return true;
+                }, passed, failed);
+        }
+
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["process_id"] = pid;
+            args["pattern"] = "fixture_rtti_entity";
+            test_todo_domains_1_8_case(hf, tag, "rtti_find_type", "find_fixture_rtti_entity", args, 6000,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success) {
+                        reason = "rtti_find_type failed text=" + compact_text(ir.text, 300);
+                        return false;
+                    }
+                    uint64_t count = 0;
+                    if (!payload_u64_field(ir.data, "count", count) || count == 0 || !payload_text_contains(ir, "fixture_rtti_entity")) {
+                        reason = "fixture_rtti_entity match missing data=" + compact_json(ir.data, 700);
+                        return false;
+                    }
+                    return true;
+                }, passed, failed);
+        }
+
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["process_id"] = pid;
+            args["type_name_or_va"] = "fixture_rtti_entity";
+            test_todo_domains_1_8_case(hf, tag, "rtti_list_hierarchy", "list_fixture_rtti_hierarchy", args, 6000,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success) {
+                        reason = "rtti_list_hierarchy failed text=" + compact_text(ir.text, 300);
+                        return false;
+                    }
+                    if (!ir.data.contains("hierarchy") || !ir.data["hierarchy"].is_array()) {
+                        reason = "hierarchy array missing data=" + compact_json(ir.data, 700);
+                        return false;
+                    }
+                    return true;
+                }, passed, failed);
+        }
+
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["process_id"] = pid;
+            args["vtable_va"] = test_todo_domains_1_8_hex_ptr(desc.rtti_vtable_va);
+            test_todo_domains_1_8_case(hf, tag, "rtti_find_constructor", "find_fixture_rtti_constructor_refs", args, 7000,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success) {
+                        reason = "rtti_find_constructor failed text=" + compact_text(ir.text, 300);
+                        return false;
+                    }
+                    uint64_t count = 0;
+                    if (!payload_u64_field(ir.data, "count", count) || count == 0) {
+                        reason = "constructor candidate count is zero data=" + compact_json(ir.data, 700);
+                        return false;
+                    }
+                    return true;
+                }, passed, failed);
+        }
+    }
+
+    void test_todo_domains_1_8_encptr_tools(HANDLE hf,
+                                            std::atomic<int>& passed,
+                                            std::atomic<int>& failed,
+                                            bool(*cancelled)()) {
+        const char* tag = "mcp.todo.domains_1_8.encptr";
+        set_progress_step("mcp todo domains 1-8: encoded pointer tools");
+        scoped_todo_domains_1_8_remote_region_t target(hf, tag);
+        scoped_todo_domains_1_8_remote_region_t source(hf, tag);
+        std::vector<std::uint8_t> target_bytes(4096, 0x41);
+        if (!target.allocate(target_bytes, target_bytes.size(), PAGE_READWRITE)) {
+            test_todo_domains_1_8_fixture_fail(hf, tag, "encptr_scan_chain", "failed to allocate target pointer fixture", failed);
+            test_todo_domains_1_8_fixture_fail(hf, tag, "encptr_detect_transform", "failed to allocate target pointer fixture", failed);
+            test_todo_domains_1_8_fixture_fail(hf, tag, "encptr_emit_resolver", "failed to allocate target pointer fixture", failed);
+            test_todo_domains_1_8_fixture_fail(hf, tag, "encptr_verify_stable", "failed to allocate target pointer fixture", failed);
+            return;
+        }
+        const std::uint64_t key = 0xA1DA55AA33CC7700ull;
+        const std::uint64_t raw = target.addr ^ key;
+        std::vector<std::uint8_t> source_bytes(4096, 0);
+        std::memcpy(source_bytes.data(), &raw, sizeof(raw));
+        if (!source.allocate(source_bytes, source_bytes.size(), PAGE_READWRITE)) {
+            test_todo_domains_1_8_fixture_fail(hf, tag, "encptr_scan_chain", "failed to allocate encoded source fixture", failed);
+            test_todo_domains_1_8_fixture_fail(hf, tag, "encptr_detect_transform", "failed to allocate encoded source fixture", failed);
+            test_todo_domains_1_8_fixture_fail(hf, tag, "encptr_emit_resolver", "failed to allocate encoded source fixture", failed);
+            test_todo_domains_1_8_fixture_fail(hf, tag, "encptr_verify_stable", "failed to allocate encoded source fixture", failed);
+            return;
+        }
+        const std::uint32_t pid = g_mcp_target_pid != 0 ? g_mcp_target_pid : driver_bridge::attached_pid();
+
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["raw_value"] = test_todo_domains_1_8_hex_ptr(raw);
+            args["expected_next"] = test_todo_domains_1_8_hex_ptr(target.addr);
+            test_todo_domains_1_8_case(hf, tag, "encptr_detect_transform", "detect_known_xor_transform", args, 2500,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success) {
+                        reason = "detect_transform failed text=" + compact_text(ir.text, 300);
+                        return false;
+                    }
+                    std::string type;
+                    if (!payload_string_field(ir.data, "transform_type", type) || type != "xor") {
+                        reason = "expected transform_type=xor data=" + compact_json(ir.data, 500);
+                        return false;
+                    }
+                    return true;
+                }, passed, failed);
+        }
+
+        mcp_standalone::json chain;
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["process_id"] = pid;
+            args["source_va"] = test_todo_domains_1_8_hex_ptr(source.addr);
+            args["target_va"] = test_todo_domains_1_8_hex_ptr(target.addr);
+            args["max_hops"] = 1;
+            args["max_offset"] = 0;
+            args["max_results"] = 1;
+            args["test_xor"] = true;
+            args["test_rol"] = false;
+            args["test_add"] = false;
+            args["xor_keys"] = mcp_standalone::json::array({test_todo_domains_1_8_hex_ptr(key)});
+            invoke_result_t out;
+            test_todo_domains_1_8_case(hf, tag, "encptr_scan_chain", "scan_known_xor_chain", args, 4000,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success) {
+                        reason = "scan_chain failed text=" + compact_text(ir.text, 300);
+                        return false;
+                    }
+                    uint64_t count = 0;
+                    if (!payload_u64_field(ir.data, "count", count) || count == 0) {
+                        reason = "chain count missing or zero data=" + compact_json(ir.data, 700);
+                        return false;
+                    }
+                    return true;
+                }, passed, failed, &out);
+            if (out.success)
+                test_todo_domains_1_8_first_array_item(out.data, "paths", chain);
+        }
+
+        if (chain.is_object() && (!cancelled || !cancelled())) {
+            mcp_standalone::json args;
+            args["chain"] = chain;
+            args["function_name"] = "resolve_aida_todo_xor_chain";
+            args["base_symbol"] = "module_base";
+            test_todo_domains_1_8_case(hf, tag, "encptr_emit_resolver", "emit_resolver_for_scanned_chain", args, 2500,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success) {
+                        reason = "emit_resolver failed text=" + compact_text(ir.text, 300);
+                        return false;
+                    }
+                    std::string source;
+                    if (!payload_string_field(ir.data, "cpp_source", source) || source.find("resolve_aida_todo_xor_chain") == std::string::npos || source.find("read64") == std::string::npos) {
+                        reason = "resolver source missing function/read64 evidence";
+                        return false;
+                    }
+                    return true;
+                }, passed, failed);
+        } else {
+            test_todo_domains_1_8_fixture_fail(hf, tag, "encptr_emit_resolver", "scan_chain did not return a usable chain", failed);
+        }
+
+        if (chain.is_object() && (!cancelled || !cancelled())) {
+            mcp_standalone::json args;
+            args["process_id"] = pid;
+            args["chain"] = chain;
+            args["samples"] = 3;
+            args["interval_ms"] = 0;
+            test_todo_domains_1_8_case(hf, tag, "encptr_verify_stable", "verify_scanned_chain_stability", args, 2500,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success) {
+                        reason = "verify_stable failed text=" + compact_text(ir.text, 300);
+                        return false;
+                    }
+                    uint64_t ok = 0;
+                    std::string stability;
+                    if (!payload_u64_field(ir.data, "samples_ok", ok) || ok < 3 ||
+                        !payload_string_field(ir.data, "stability", stability) || stability != "always_same") {
+                        reason = "expected samples_ok=3 and always_same data=" + compact_json(ir.data, 700);
+                        return false;
+                    }
+                    return true;
+                }, passed, failed);
+        } else {
+            test_todo_domains_1_8_fixture_fail(hf, tag, "encptr_verify_stable", "scan_chain did not return a usable chain", failed);
+        }
+    }
+
+    void test_todo_domains_1_8_offsets_and_sigs(HANDLE hf,
+                                                const test_todo_domains_1_8_re_descriptor_t& desc,
+                                                bool have_desc,
+                                                const std::string& descriptor_reason,
+                                                std::atomic<int>& passed,
+                                                std::atomic<int>& failed,
+                                                bool(*cancelled)()) {
+        const char* tag = "mcp.todo.domains_1_8.persist";
+        set_progress_step("mcp todo domains 1-8: offsets and signatures");
+        scoped_todo_domains_1_8_file_restore_t offsets_restore(hf, tag, re::appdata_re_dir() / "offsets.json");
+        scoped_todo_domains_1_8_file_restore_t sigs_restore(hf, tag, re::appdata_re_dir() / "signatures.json");
+        scoped_todo_domains_1_8_temp_file_t offsets_export("aida_todo_offsets_export.hpp");
+        scoped_todo_domains_1_8_temp_file_t sigs_export("aida_todo_sigs_export.json");
+        scoped_todo_domains_1_8_remote_region_t fallback_region(hf, tag);
+        scoped_todo_domains_1_8_remote_region_t sig_region(hf, tag);
+        const std::vector<std::uint8_t> sig_bytes = {0x41, 0x69, 0x44, 0x41, 0xD1, 0x08, 0x44, 0x22, 0x19, 0x88, 0x33, 0x77, 0x55, 0xAA, 0x10, 0x40};
+        std::uint64_t fixture_va = have_desc ? desc.matrix_buffer_va : 0;
+        if (fixture_va == 0) {
+            if (fallback_region.allocate(sig_bytes, 4096, PAGE_READWRITE))
+                fixture_va = fallback_region.addr;
+        }
+        if (fixture_va == 0) {
+            test_todo_domains_1_8_fixture_fail(hf, tag, "offsets_manage", "no descriptor matrix buffer and synthetic fallback allocation failed: " + descriptor_reason, failed);
+            test_todo_domains_1_8_fixture_fail(hf, tag, "sigs_manage", "no descriptor matrix buffer and synthetic fallback allocation failed: " + descriptor_reason, failed);
+            return;
+        }
+        const bool sig_region_ready = sig_region.allocate(sig_bytes, 4096, PAGE_READWRITE);
+        const std::uint32_t pid = g_mcp_target_pid != 0 ? g_mcp_target_pid : driver_bridge::attached_pid();
+        const std::string category = "aida_todo_domains_1_8";
+        const std::string offset_name = "aida_todo_fixture_matrix";
+        const std::string sig_name = "aida_todo_fixture_pattern";
+
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["action"] = "record";
+            args["process_id"] = pid;
+            args["name"] = offset_name;
+            args["category"] = category;
+            args["va"] = test_todo_domains_1_8_hex_ptr(fixture_va);
+            args[k_test_lab_safe_fixture_flag] = true;
+            test_todo_domains_1_8_case(hf, tag, "offsets_manage", "record_requires_confirm", args, 2500,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    return test_todo_domains_1_8_expect_error_any(ir, {"confirm_unsafe", "Unsafe operation"}, reason);
+                }, passed, failed);
+        }
+
+        std::string offset_id;
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args = test_todo_domains_1_8_safe_args();
+            args["action"] = "record";
+            args["process_id"] = pid;
+            args["name"] = offset_name;
+            args["category"] = category;
+            args["notes"] = "testlab_domains_1_8";
+            args["rtti_path"] = "fixture_rtti_entity.matrix";
+            args["xref_context"] = "aida_test_re_descriptor.matrix_buffer_va";
+            args["va"] = test_todo_domains_1_8_hex_ptr(fixture_va);
+            invoke_result_t out;
+            test_todo_domains_1_8_case(hf, tag, "offsets_manage", "record_fixture_offset", args, 3000,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success) {
+                        reason = "offset record failed text=" + compact_text(ir.text, 300);
+                        return false;
+                    }
+                    std::string id;
+                    if (!payload_string_field(ir.data, "offset_id", id) || id.empty()) {
+                        reason = "offset_id missing";
+                        return false;
+                    }
+                    return true;
+                }, passed, failed, &out);
+            if (out.success)
+                payload_string_field(out.data, "offset_id", offset_id);
+        }
+
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["action"] = "list";
+            args["category"] = category;
+            test_todo_domains_1_8_case(hf, tag, "offsets_manage", "list_fixture_offset", args, 2500,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success) {
+                        reason = "offset list failed text=" + compact_text(ir.text, 300);
+                        return false;
+                    }
+                    uint64_t count = 0;
+                    if (!payload_u64_field(ir.data, "count", count) || count == 0 || !payload_text_contains(ir, "aida_todo_fixture_matrix")) {
+                        reason = "recorded offset not present in list data=" + compact_json(ir.data, 700);
+                        return false;
+                    }
+                    return true;
+                }, passed, failed);
+        }
+
+        if (!offset_id.empty() && (!cancelled || !cancelled())) {
+            mcp_standalone::json args = test_todo_domains_1_8_safe_args();
+            args["action"] = "reverify";
+            args["process_id"] = pid;
+            args["offset_id"] = offset_id;
+            test_todo_domains_1_8_case(hf, tag, "offsets_manage", "reverify_fixture_offset", args, 4000,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success) {
+                        reason = "offset reverify failed text=" + compact_text(ir.text, 300);
+                        return false;
+                    }
+                    size_t valid = 0;
+                    if (!payload_array_count(ir.data, "valid", valid) || valid == 0) {
+                        reason = "valid array missing or empty data=" + compact_json(ir.data, 700);
+                        return false;
+                    }
+                    return true;
+                }, passed, failed);
+        } else if (offset_id.empty()) {
+            test_todo_domains_1_8_fixture_fail(hf, tag, "offsets_manage", "offset record did not produce offset_id for reverify", failed);
+        }
+
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args = test_todo_domains_1_8_safe_args();
+            args["action"] = "export";
+            args["output_path"] = offsets_export.path;
+            args["namespace_name"] = "AiDATodoOffsets";
+            args["use_rva"] = false;
+            test_todo_domains_1_8_case(hf, tag, "offsets_manage", "export_fixture_offsets_to_temp", args, 3000,
+                [&offsets_export](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success) {
+                        reason = "offset export failed text=" + compact_text(ir.text, 300);
+                        return false;
+                    }
+                    uint64_t count = 0;
+                    if (!payload_u64_field(ir.data, "count", count) || count == 0 || !file_exists_narrow(offsets_export.path)) {
+                        reason = "export count missing/zero or output file missing";
+                        return false;
+                    }
+                    std::ifstream in(offsets_export.path, std::ios::binary);
+                    const std::string body((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                    if (body.find("aida_todo_fixture_matrix") == std::string::npos) {
+                        reason = "export output missing fixture offset symbol";
+                        return false;
+                    }
+                    return true;
+                }, passed, failed);
+        }
+
+        if (!sig_region_ready) {
+            test_todo_domains_1_8_fixture_fail(hf, tag, "sigs_manage", "failed to allocate synthetic signature pattern region", failed);
+            return;
+        }
+
+        const std::string pattern = "41 69 44 41 D1 08 44 22 19 88 33 77 55 AA 10 40";
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["action"] = "save";
+            args["name"] = sig_name;
+            args["pattern"] = pattern;
+            args["category"] = category;
+            args[k_test_lab_safe_fixture_flag] = true;
+            test_todo_domains_1_8_case(hf, tag, "sigs_manage", "save_requires_confirm", args, 2500,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    return test_todo_domains_1_8_expect_error_any(ir, {"confirm_unsafe", "Unsafe operation"}, reason);
+                }, passed, failed);
+        }
+
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args = test_todo_domains_1_8_safe_args();
+            args["action"] = "save";
+            args["name"] = sig_name;
+            args["pattern"] = pattern;
+            args["category"] = category;
+            args["notes"] = "testlab_domains_1_8";
+            test_todo_domains_1_8_case(hf, tag, "sigs_manage", "save_fixture_signature", args, 3000,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success) {
+                        reason = "signature save failed text=" + compact_text(ir.text, 300);
+                        return false;
+                    }
+                    std::string id;
+                    if (!payload_string_field(ir.data, "id", id) || id.empty()) {
+                        reason = "signature id missing";
+                        return false;
+                    }
+                    return true;
+                }, passed, failed);
+        }
+
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["action"] = "list";
+            args["category"] = category;
+            test_todo_domains_1_8_case(hf, tag, "sigs_manage", "list_fixture_signature", args, 2500,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success) {
+                        reason = "signature list failed text=" + compact_text(ir.text, 300);
+                        return false;
+                    }
+                    uint64_t count = 0;
+                    if (!payload_u64_field(ir.data, "count", count) || count == 0 || !payload_text_contains(ir, "aida_todo_fixture_pattern")) {
+                        reason = "saved signature not present in list data=" + compact_json(ir.data, 700);
+                        return false;
+                    }
+                    return true;
+                }, passed, failed);
+        }
+
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args = test_todo_domains_1_8_safe_args();
+            args["action"] = "scan_all";
+            args["process_id"] = pid;
+            test_todo_domains_1_8_case(hf, tag, "sigs_manage", "scan_all_fixture_signature", args, 5000,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success) {
+                        reason = "signature scan_all failed text=" + compact_text(ir.text, 300);
+                        return false;
+                    }
+                    uint64_t count = 0;
+                    if (!payload_u64_field(ir.data, "count", count) || count == 0 || !payload_text_contains(ir, "aida_todo_fixture_pattern")) {
+                        reason = "scan results missing fixture signature evidence data=" + compact_json(ir.data, 900);
+                        return false;
+                    }
+                    return true;
+                }, passed, failed);
+        }
+
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args = test_todo_domains_1_8_safe_args();
+            args["action"] = "export";
+            args["output_path"] = sigs_export.path;
+            args["format"] = "json";
+            args["category"] = category;
+            test_todo_domains_1_8_case(hf, tag, "sigs_manage", "export_fixture_signatures_to_temp", args, 3000,
+                [&sigs_export](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success) {
+                        reason = "signature export failed text=" + compact_text(ir.text, 300);
+                        return false;
+                    }
+                    uint64_t count = 0;
+                    if (!payload_u64_field(ir.data, "count", count) || count == 0 || !file_exists_narrow(sigs_export.path)) {
+                        reason = "signature export count missing/zero or output file missing";
+                        return false;
+                    }
+                    std::ifstream in(sigs_export.path, std::ios::binary);
+                    const std::string body((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                    if (body.find("aida_todo_fixture_pattern") == std::string::npos) {
+                        reason = "signature export output missing fixture signature";
+                        return false;
+                    }
+                    return true;
+                }, passed, failed);
+        }
+    }
+
+    void test_todo_domains_1_8_heap_tools(HANDLE hf,
+                                          test_todo_domains_1_8_re_descriptor_t& desc,
+                                          bool have_desc,
+                                          const std::string& descriptor_reason,
+                                          std::atomic<int>& passed,
+                                          std::atomic<int>& failed,
+                                          bool(*cancelled)()) {
+        const char* tag = "mcp.todo.domains_1_8.heap";
+        set_progress_step("mcp todo domains 1-8: heap tracking");
+        const std::uint32_t pid = g_mcp_target_pid != 0 ? g_mcp_target_pid : driver_bridge::attached_pid();
+
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["action"] = "start";
+            args["process_id"] = pid;
+            args["backend"] = "snapshot_diff";
+            args["max_captures"] = 32;
+            args[k_test_lab_safe_fixture_flag] = true;
+            test_todo_domains_1_8_case(hf, tag, "heap_track_manage", "start_requires_confirm", args, 2500,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    return test_todo_domains_1_8_expect_error_any(ir, {"confirm_unsafe", "Unsafe operation"}, reason);
+                }, passed, failed);
+        }
+
+        if (!have_desc || desc.heap_burst_fn_va == 0) {
+            test_todo_domains_1_8_fixture_fail(hf, tag, "heap_track_manage", "RE descriptor missing heap_burst_fn_va: " + descriptor_reason, failed);
+            return;
+        }
+
+        std::string session_id;
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args = test_todo_domains_1_8_safe_args();
+            args["action"] = "start";
+            args["process_id"] = pid;
+            args["backend"] = "snapshot_diff";
+            args["min_size"] = 64;
+            args["max_size"] = 4096;
+            args["max_captures"] = 64;
+            invoke_result_t out;
+            test_todo_domains_1_8_case(hf, tag, "heap_track_manage", "start_snapshot_diff_safe_fixture", args, 4000,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success) {
+                        reason = "heap start failed text=" + compact_text(ir.text, 300);
+                        return false;
+                    }
+                    std::string id;
+                    if (!payload_string_field(ir.data, "session_id", id) || id.empty()) {
+                        reason = "session_id missing";
+                        return false;
+                    }
+                    return true;
+                }, passed, failed, &out);
+            if (out.success)
+                payload_string_field(out.data, "session_id", session_id);
+        }
+
+        if (!session_id.empty()) {
+            const std::uint64_t first = page_guard_engine::remote_thread_call(pid, desc.heap_burst_fn_va, 12, 160, 0, 0, 5000, "aida_test_re_heap_burst");
+            log_msg(hf, tag, "FIXTURE -- heap_burst result=0x%016llX fn=0x%016llX",
+                static_cast<unsigned long long>(first),
+                static_cast<unsigned long long>(desc.heap_burst_fn_va));
+            test_todo_domains_1_8_refresh_re_descriptor(hf, tag, desc);
+        }
+
+        if (!session_id.empty() && (!cancelled || !cancelled())) {
+            mcp_standalone::json args;
+            args["action"] = "results";
+            args["session_id"] = session_id;
+            args["limit"] = 64;
+            test_todo_domains_1_8_case(hf, tag, "heap_track_manage", "results_after_fixture_heap_burst", args, 4000,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success) {
+                        reason = "heap results failed text=" + compact_text(ir.text, 300);
+                        return false;
+                    }
+                    uint64_t returned = 0;
+                    if (!payload_u64_field(ir.data, "returned", returned) || returned == 0) {
+                        reason = "heap results returned zero allocation events; fixture heap burst did not appear in tracker data=" + compact_json(ir.data, 900);
+                        return false;
+                    }
+                    return true;
+                }, passed, failed);
+        } else if (session_id.empty()) {
+            test_todo_domains_1_8_fixture_fail(hf, tag, "heap_track_manage", "heap start did not produce session_id for results", failed);
+        }
+
+        if (!session_id.empty() && (!cancelled || !cancelled())) {
+            mcp_standalone::json args = test_todo_domains_1_8_safe_args();
+            args["action"] = "stop";
+            args["session_id"] = session_id;
+            test_todo_domains_1_8_case(hf, tag, "heap_track_manage", "stop_heap_session_safe_fixture", args, 3000,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success) {
+                        reason = "heap stop failed text=" + compact_text(ir.text, 300);
+                        return false;
+                    }
+                    bool stopped = false;
+                    if (!payload_bool_field(ir.data, "stopped", stopped) || !stopped) {
+                        reason = "stopped=true missing";
+                        return false;
+                    }
+                    return true;
+                }, passed, failed);
+        }
+
+        if (!session_id.empty()) {
+            mcp_standalone::json cleanup = test_todo_domains_1_8_safe_args();
+            cleanup["action"] = "stop";
+            cleanup["session_id"] = session_id;
+            bounded_finalizer_call(hf, "todo_heap_stop", 4000, [&]() {
+                auto timed = invoke_tool_bounded(get_server(), "heap_track_manage", cleanup, 4000, hf, tag, 0);
+                return timed.timed_out || !timed.result.found || timed.result.threw || timed.result.success || timed.result.text.find("Unknown heap tracking session") != std::string::npos;
+            });
+        }
+        if (desc.heap_burst_fn_va != 0)
+            page_guard_engine::remote_thread_call(pid, desc.heap_burst_fn_va, 1, 64, 0, 0, 3000, "aida_test_re_heap_burst_cleanup");
+    }
+
+    void test_todo_domains_1_8_struct_tools(HANDLE hf,
+                                            test_todo_domains_1_8_re_descriptor_t& desc,
+                                            bool have_desc,
+                                            const std::string& descriptor_reason,
+                                            std::atomic<int>& passed,
+                                            std::atomic<int>& failed,
+                                            bool(*cancelled)()) {
+        const char* tag = "mcp.todo.domains_1_8.struct";
+        set_progress_step("mcp todo domains 1-8: struct tools");
+        const std::uint32_t pid = g_mcp_target_pid != 0 ? g_mcp_target_pid : driver_bridge::attached_pid();
+        if (!have_desc || desc.struct_base_va == 0 || desc.struct_array_va == 0 || desc.struct_size == 0 || desc.struct_count < 3) {
+            test_todo_domains_1_8_fixture_fail(hf, tag, "struct_observe", "RE descriptor missing struct fixture: " + descriptor_reason, failed);
+            test_todo_domains_1_8_fixture_fail(hf, tag, "struct_correlate", "RE descriptor missing struct fixture: " + descriptor_reason, failed);
+            test_todo_domains_1_8_fixture_fail(hf, tag, "struct_array_detect", "RE descriptor missing struct fixture: " + descriptor_reason, failed);
+            test_todo_domains_1_8_fixture_fail(hf, tag, "struct_compare_snapshots", "RE descriptor missing struct fixture: " + descriptor_reason, failed);
+            return;
+        }
+        const std::uint64_t observed_struct_va = desc.struct_array_va;
+
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["process_id"] = pid;
+            args["base_va"] = test_todo_domains_1_8_hex_ptr(observed_struct_va);
+            args["size"] = desc.struct_size;
+            args["duration_sec"] = 1;
+            args[k_test_lab_safe_fixture_flag] = true;
+            test_todo_domains_1_8_case(hf, tag, "struct_observe", "observe_requires_confirm", args, 2500,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    return test_todo_domains_1_8_expect_error_any(ir, {"confirm_unsafe", "Unsafe operation"}, reason);
+                }, passed, failed);
+        }
+
+        auto observe_case = [&](const char* case_name, std::uint32_t index, std::uint32_t delta, std::string& snapshot_id) {
+            if (cancelled && cancelled())
+                return;
+            std::thread stim([pid, fn = desc.mutate_struct_fn_va, index, delta]() {
+                for (std::uint32_t i = 0; i < 5; ++i) {
+                    Sleep(200);
+                    if (fn != 0)
+                        page_guard_engine::remote_thread_call(pid, fn, index, delta + i, 0, 0, 3000, "aida_test_re_mutate_struct_observe");
+                }
+            });
+            mcp_standalone::json args = test_todo_domains_1_8_safe_args();
+            args["process_id"] = pid;
+            args["base_va"] = test_todo_domains_1_8_hex_ptr(observed_struct_va);
+            args["size"] = desc.struct_size;
+            args["duration_sec"] = 1;
+            invoke_result_t out;
+            test_todo_domains_1_8_case(hf, tag, "struct_observe", case_name, args, 5000,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success) {
+                        reason = "struct_observe failed text=" + compact_text(ir.text, 300);
+                        return false;
+                    }
+                    std::string id;
+                    uint64_t fields = 0;
+                    if (!payload_string_field(ir.data, "snapshot_id", id) || id.empty()) {
+                        reason = "snapshot_id missing";
+                        return false;
+                    }
+                    if (!payload_u64_field(ir.data, "field_count", fields) || fields == 0) {
+                        reason = "field_count missing or zero; fixture access stimulus did not produce inferred fields data=" + compact_json(ir.data, 800);
+                        return false;
+                    }
+                    return true;
+                }, passed, failed, &out);
+            if (stim.joinable())
+                stim.join();
+            if (out.success)
+                payload_string_field(out.data, "snapshot_id", snapshot_id);
+        };
+
+        std::string snapshot_a;
+        std::string snapshot_b;
+        observe_case("observe_fixture_struct_before_mutation", 0, 3, snapshot_a);
+        page_guard_engine::remote_thread_call(pid, desc.mutate_struct_fn_va, 0, 9, 0, 0, 3000, "aida_test_re_mutate_struct_between_snapshots");
+        observe_case("observe_fixture_struct_after_mutation", 0, 11, snapshot_b);
+
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["process_id"] = pid;
+            args["max_span"] = desc.struct_size;
+            args["field_addresses"] = mcp_standalone::json::array({
+                mcp_standalone::json{{"name", "id"}, {"va", test_todo_domains_1_8_hex_ptr(observed_struct_va)}},
+                mcp_standalone::json{{"name", "owner"}, {"va", test_todo_domains_1_8_hex_ptr(observed_struct_va + 8)}},
+                mcp_standalone::json{{"name", "health"}, {"va", test_todo_domains_1_8_hex_ptr(observed_struct_va + 40)}},
+                mcp_standalone::json{{"name", "name"}, {"va", test_todo_domains_1_8_hex_ptr(observed_struct_va + 48)}}
+            });
+            test_todo_domains_1_8_case(hf, tag, "struct_correlate", "correlate_fixture_field_addresses", args, 3000,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success) {
+                        reason = "struct_correlate failed text=" + compact_text(ir.text, 300);
+                        return false;
+                    }
+                    size_t fields = 0;
+                    if (!payload_array_count(ir.data, "fields", fields) || fields < 4) {
+                        reason = "fields array missing or too small data=" + compact_json(ir.data, 700);
+                        return false;
+                    }
+                    return true;
+                }, passed, failed);
+        }
+
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["process_id"] = pid;
+            args["base_va"] = test_todo_domains_1_8_hex_ptr(desc.struct_array_va);
+            args["suspected_size"] = desc.struct_size;
+            args["max_elements"] = std::min<std::uint32_t>(desc.struct_count, 16);
+            test_todo_domains_1_8_case(hf, tag, "struct_array_detect", "detect_fixture_struct_array", args, 3000,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success) {
+                        reason = "struct_array_detect failed text=" + compact_text(ir.text, 300);
+                        return false;
+                    }
+                    bool is_array = false;
+                    uint64_t elements = 0;
+                    if (!payload_bool_field(ir.data, "is_array", is_array) || !is_array ||
+                        !payload_u64_field(ir.data, "element_count", elements) || elements < 3) {
+                        reason = "expected is_array=true and element_count>=3 data=" + compact_json(ir.data, 700);
+                        return false;
+                    }
+                    return true;
+                }, passed, failed);
+        }
+
+        if (!snapshot_a.empty() && !snapshot_b.empty() && (!cancelled || !cancelled())) {
+            mcp_standalone::json args;
+            args["snapshot_a_id"] = snapshot_a;
+            args["snapshot_b_id"] = snapshot_b;
+            args["base_va"] = test_todo_domains_1_8_hex_ptr(observed_struct_va);
+            args["struct_size"] = desc.struct_size;
+            test_todo_domains_1_8_case(hf, tag, "struct_compare_snapshots", "compare_fixture_struct_snapshots", args, 3000,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success) {
+                        reason = "struct_compare_snapshots failed text=" + compact_text(ir.text, 300);
+                        return false;
+                    }
+                    uint64_t changes = 0;
+                    if (!payload_u64_field(ir.data, "change_count", changes) || changes == 0) {
+                        reason = "change_count missing or zero data=" + compact_json(ir.data, 700);
+                        return false;
+                    }
+                    return true;
+                }, passed, failed);
+        } else {
+            test_todo_domains_1_8_fixture_fail(hf, tag, "struct_compare_snapshots", "struct_observe did not return two snapshot IDs", failed);
+        }
+    }
+
+    void test_todo_domains_1_8_schema_block(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        const char* tag = "mcp.todo.domains_1_8.schema";
+        test_todo_domains_1_8_schema(hf, tag, "dx_find_device_vtable", true, {{"api", false}, {"process_id", false}}, passed, failed);
+        test_todo_domains_1_8_schema(hf, tag, "dx_hook_manage", false, {{"action", true}, {"process_id", true}, {"confirm_unsafe", false}}, passed, failed);
+        test_todo_domains_1_8_schema(hf, tag, "dx_list_bound_cbuffers", true, {{"process_id", true}}, passed, failed);
+        test_todo_domains_1_8_schema(hf, tag, "dx_identify_bone_buffer", true, {{"process_id", true}}, passed, failed);
+        test_todo_domains_1_8_schema(hf, tag, "dx_map_resource_to_va", true, {{"resource_handle", true}, {"process_id", true}}, passed, failed);
+        test_todo_domains_1_8_schema(hf, tag, "dx_dump_render_targets", false, {{"process_id", true}, {"confirm_unsafe", false}}, passed, failed);
+        test_todo_domains_1_8_schema(hf, tag, "dx_find_view_matrix", true, {{"process_id", true}}, passed, failed);
+        test_todo_domains_1_8_schema(hf, tag, "vmt_read", true, {{"address", true}}, passed, failed);
+        test_todo_domains_1_8_schema(hf, tag, "vmt_hook_manage", false, {{"action", true}, {"confirm_unsafe", false}}, passed, failed);
+        test_todo_domains_1_8_schema(hf, tag, "vmt_copy", false, {{"object_va", true}, {"confirm_unsafe", false}}, passed, failed);
+        test_todo_domains_1_8_schema(hf, tag, "vmt_find_slot_by_signature", true, {{"vtable_va", true}, {"pattern", true}}, passed, failed);
+        test_todo_domains_1_8_schema(hf, tag, "vmt_scan_objects", true, {{"vtable_va", true}}, passed, failed);
+        test_todo_domains_1_8_schema(hf, tag, "rtti_scan", true, {{"process_id", false}}, passed, failed);
+        test_todo_domains_1_8_schema(hf, tag, "rtti_find_type", true, {{"pattern", true}}, passed, failed);
+        test_todo_domains_1_8_schema(hf, tag, "rtti_list_hierarchy", true, {{"type_name_or_va", true}}, passed, failed);
+        test_todo_domains_1_8_schema(hf, tag, "rtti_find_constructor", true, {{"vtable_va", true}}, passed, failed);
+        test_todo_domains_1_8_schema(hf, tag, "encptr_scan_chain", true, {{"source_va", true}, {"target_va", true}}, passed, failed);
+        test_todo_domains_1_8_schema(hf, tag, "encptr_detect_transform", true, {{"raw_value", true}, {"expected_next", true}}, passed, failed);
+        test_todo_domains_1_8_schema(hf, tag, "encptr_emit_resolver", true, {{"chain", true}}, passed, failed);
+        test_todo_domains_1_8_schema(hf, tag, "encptr_verify_stable", true, {{"chain", true}}, passed, failed);
+        test_todo_domains_1_8_schema(hf, tag, "offsets_manage", false, {{"action", true}, {"confirm_unsafe", false}}, passed, failed);
+        test_todo_domains_1_8_schema(hf, tag, "heap_track_manage", false, {{"action", true}, {"confirm_unsafe", false}}, passed, failed);
+        test_todo_domains_1_8_schema(hf, tag, "sigs_manage", false, {{"action", true}, {"confirm_unsafe", false}}, passed, failed);
+        test_todo_domains_1_8_schema(hf, tag, "struct_observe", false, {{"base_va", true}, {"confirm_unsafe", false}}, passed, failed);
+        test_todo_domains_1_8_schema(hf, tag, "struct_correlate", true, {{"field_addresses", true}}, passed, failed);
+        test_todo_domains_1_8_schema(hf, tag, "struct_array_detect", true, {{"base_va", true}, {"suspected_size", true}}, passed, failed);
+        test_todo_domains_1_8_schema(hf, tag, "struct_compare_snapshots", true, {{"snapshot_a_id", true}, {"snapshot_b_id", true}, {"base_va", true}}, passed, failed);
+    }
+
+    void test_todo_domains_1_8_functional(HANDLE hf,
+                                          std::atomic<int>& passed,
+                                          std::atomic<int>& failed,
+                                          std::atomic<int>& skipped,
+                                          bool(*cancelled)()) {
+        (void)skipped;
+        const char* tag = "mcp.todo.domains_1_8";
+        set_progress_step("mcp todo domains 1-8: functional coverage");
+        log_msg(hf, tag, "BEGIN -- target_pid=%u active_pid=%u driver_connected=%d",
+            g_mcp_target_pid,
+            driver_bridge::attached_pid(),
+            driver_bridge::is_loaded() ? 1 : 0);
+        if (!cancelled || !cancelled())
+            test_todo_domains_1_8_schema_block(hf, passed, failed);
+        test_todo_domains_1_8_re_descriptor_t desc{};
+        std::string descriptor_reason;
+        const bool have_desc = test_todo_domains_1_8_find_re_descriptor(hf, tag, desc, descriptor_reason);
+        if (!have_desc)
+            log_msg(hf, tag, "FIXTURE -- RE descriptor unavailable reason=%s", compact_text(descriptor_reason, 1000).c_str());
+        if (!cancelled || !cancelled())
+            test_todo_domains_1_8_dx_tools(hf, desc, have_desc, descriptor_reason, passed, failed, cancelled);
+        if (!cancelled || !cancelled())
+            test_todo_domains_1_8_vmt_tools(hf, passed, failed, cancelled);
+        if (!cancelled || !cancelled())
+            test_todo_domains_1_8_rtti_tools(hf, desc, have_desc, descriptor_reason, passed, failed, cancelled);
+        if (!cancelled || !cancelled())
+            test_todo_domains_1_8_encptr_tools(hf, passed, failed, cancelled);
+        if (!cancelled || !cancelled())
+            test_todo_domains_1_8_offsets_and_sigs(hf, desc, have_desc, descriptor_reason, passed, failed, cancelled);
+        if (!cancelled || !cancelled())
+            test_todo_domains_1_8_heap_tools(hf, desc, have_desc, descriptor_reason, passed, failed, cancelled);
+        if (!cancelled || !cancelled())
+            test_todo_domains_1_8_struct_tools(hf, desc, have_desc, descriptor_reason, passed, failed, cancelled);
+        log_msg(hf, tag, "END -- pass=%d fail=%d skip=%d",
+            passed.load(std::memory_order_acquire),
+            failed.load(std::memory_order_acquire),
+            skipped.load(std::memory_order_acquire));
     }
 
     std::string quote_arg_narrow(const std::string& arg) {
@@ -12677,10 +15088,10 @@ void test_tool_api_monitor_start(HANDLE hf, std::atomic<int>& passed, std::atomi
             find_payload_key_recursive(result.data, "private_key_pem");
         if (payload_bool_field(result.data, "private_key_exported", private_exported) &&
             !private_exported && !has_private_material) {
-            log_msg(hf, "mcp.cert_manage.generate_ca.guard", "PASS -- cert_manage action=generate_ca returned public certificate only");
+            log_msg(hf, "mcp.cert_generate_ca.guard", "PASS -- cert_manage action=generate_ca returned public certificate only");
             return;
         }
-        log_msg(hf, "mcp.cert_manage.generate_ca.guard", "FAIL -- cert_manage action=generate_ca exposed private key material or omitted private_key_exported=false");
+        log_msg(hf, "mcp.cert_generate_ca.guard", "FAIL -- cert_manage action=generate_ca exposed private key material or omitted private_key_exported=false");
         failed.fetch_add(1);
     }
 
@@ -12782,8 +15193,14 @@ void test_tool_firefox_profile_launch(HANDLE hf, std::atomic<int>& passed, std::
                 payload_bool_field(result.data, "trust_readiness_verified", trust_verified);
                 payload_bool_field(result.data, "firefox_detected", firefox_detected);
                 payload_bool_field(result.data, "prepared", prepared);
+                log_msg(hf, "mcp.firefox_profile_status.guard",
+                    "PROOF -- dependency status prepared=%d profile_valid=%d firefox_detected=%d trust_verified=%d",
+                    prepared ? 1 : 0,
+                    profile_files_valid ? 1 : 0,
+                    firefox_detected ? 1 : 0,
+                    trust_verified ? 1 : 0);
                 if (profile_files_valid && (!trust_verified || !firefox_detected || !prepared)) {
-                    log_msg(hf, "mcp.firefox_profile_launch",
+                    log_msg(hf, "mcp.firefox_profile_launch.guard",
                         "PASS -- Firefox launch correctly stopped before browser start because dependency proof is unavailable firefox_detected=%d trust=%d prepared=%d text=%s",
                         firefox_detected ? 1 : 0,
                         trust_verified ? 1 : 0,
@@ -12819,13 +15236,20 @@ void test_tool_firefox_profile_launch(HANDLE hf, std::atomic<int>& passed, std::
         payload_bool_field(result.data, "profile_files_valid", profile_files_valid);
         payload_bool_field(result.data, "trust_readiness_verified", trust_verified);
         payload_bool_field(result.data, "post_launch_profile_validated", post_launch_validated);
+        log_msg(hf, "mcp.firefox_profile_status.guard",
+            "PROOF -- launch status profile_valid=%d trust_verified=%d post_launch_validated=%d runtime_validation_performed=%d firefox_detected=%d",
+            profile_files_valid ? 1 : 0,
+            trust_verified ? 1 : 0,
+            post_launch_validated ? 1 : 0,
+            post_launch_validated ? 1 : 0,
+            firefox_detected ? 1 : 0);
         uint32_t exit_code = 0;
         const bool alive = launched_pid != 0 && process_alive_by_pid(launched_pid, &exit_code);
         const std::string result_text_lc = lower_copy(result.text);
         const bool validate_only_note = result_text_lc.find("validation only") != std::string::npos ||
             result_text_lc.find("without starting") != std::string::npos;
         if (!launched || launched_pid == 0 || !alive || !firefox_detected || !profile_files_valid || !trust_verified || !post_launch_validated || validate_only_note) {
-            log_msg(hf, "mcp.firefox_profile_launch",
+            log_msg(hf, "mcp.firefox_profile_launch.guard",
                 "FAIL -- Firefox profile launch lacked real launch proof launched=%d pid=%u alive=%d exit_or_err=0x%08X firefox_detected=%d profile_files_valid=%d trust_verified=%d post_launch_validated=%d validate_only_note=%d payload=%s",
                 launched ? 1 : 0,
                 launched_pid,
@@ -12842,7 +15266,7 @@ void test_tool_firefox_profile_launch(HANDLE hf, std::atomic<int>& passed, std::
             cleanup_firefox(launched_pid);
             return;
         }
-        log_msg(hf, "mcp.firefox_profile_launch", "PROOF -- Firefox profile launched pid=%u profile_valid=%d trust_verified=%d post_launch_validated=%d",
+        log_msg(hf, "mcp.firefox_profile_launch.guard", "PROOF -- Firefox profile launched pid=%u profile_valid=%d trust_verified=%d post_launch_validated=%d",
             launched_pid,
             profile_files_valid ? 1 : 0,
             trust_verified ? 1 : 0,
@@ -14620,6 +17044,732 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
         test_tool_action_call(hf, "mcp.burp_comparer_manage.diff", "burp_comparer_manage", "diff", args, passed, failed, skipped);
     }
 
+    struct test_todo_net_thread_domains_9_10_16_param_t {
+        const char* name;
+        bool required;
+    };
+
+    using test_todo_net_thread_domains_9_10_16_validator_t = std::function<bool(const invoke_result_t&, std::string&)>;
+
+    std::string test_todo_net_thread_domains_9_10_16_resolve_tool(HANDLE hf,
+                                                                  const char* tag,
+                                                                  const char* preferred_name,
+                                                                  const char* registered_name,
+                                                                  std::atomic<int>& failed) {
+        auto* srv = get_server();
+        if (!srv) {
+            log_msg(hf, tag, "FAIL -- no server instance while resolving preferred=%s registered=%s",
+                preferred_name ? preferred_name : "<null>",
+                registered_name ? registered_name : "<null>");
+            failed.fetch_add(1);
+            return {};
+        }
+        if (preferred_name && tool_registered(srv, preferred_name))
+            return preferred_name;
+        if (registered_name && tool_registered(srv, registered_name)) {
+            if (preferred_name && std::string(preferred_name) != registered_name) {
+                log_msg(hf, tag, "ALIAS-FALLBACK -- preferred tool \"%s\" is not registered; exercising consolidated tool \"%s\"",
+                    preferred_name,
+                    registered_name);
+            }
+            return registered_name;
+        }
+        log_msg(hf, tag, "FAIL -- neither preferred tool \"%s\" nor consolidated tool \"%s\" is registered",
+            preferred_name ? preferred_name : "<null>",
+            registered_name ? registered_name : "<null>");
+        failed.fetch_add(1);
+        return {};
+    }
+
+    bool test_todo_net_thread_domains_9_10_16_payload_has_any(const invoke_result_t& ir,
+                                                              std::initializer_list<const char*> markers) {
+        for (const char* marker : markers) {
+            if (marker && payload_text_contains(ir, lower_copy(marker)))
+                return true;
+        }
+        return false;
+    }
+
+    bool test_todo_net_thread_domains_9_10_16_known_driver_fail_closed(const invoke_result_t& ir) {
+        return test_todo_net_thread_domains_9_10_16_payload_has_any(ir, {
+            "driver bridge is not connected",
+            "process_id is required",
+            "failed to attach",
+            "failed to set active process",
+            "failed to activate process",
+            "failed to start packet capture",
+            "failed to start udp capture",
+            "failed to start serializer trace",
+            "capture failed",
+            "tid does not belong",
+            "tid owner does not match"
+        });
+    }
+
+    bool test_todo_net_thread_domains_9_10_16_expect_error_any(const invoke_result_t& ir,
+                                                               std::initializer_list<const char*> markers,
+                                                               std::string& reason) {
+        if (ir.success) {
+            reason = "expected_error_but_success=true";
+            return false;
+        }
+        if (ir.threw) {
+            reason = "handler_threw=" + ir.exception_msg;
+            return false;
+        }
+        if (test_todo_net_thread_domains_9_10_16_payload_has_any(ir, markers))
+            return true;
+        reason = "error envelope did not contain expected marker text=" + compact_text(ir.text, 300) +
+            " data=" + compact_json(ir.data, 360);
+        return false;
+    }
+
+    bool test_todo_net_thread_domains_9_10_16_schema(HANDLE hf,
+                                                     const char* tag,
+                                                     const std::string& tool_name,
+                                                     bool expected_read_only,
+                                                     std::initializer_list<test_todo_net_thread_domains_9_10_16_param_t> params,
+                                                     std::atomic<int>& passed,
+                                                     std::atomic<int>& failed) {
+        if (tool_name.empty())
+            return false;
+        g_invoked_tools.insert(tool_name);
+        const auto* tool = find_registered_tool(get_server(), tool_name.c_str());
+        if (!tool) {
+            log_msg(hf, tag, "FAIL -- tool \"%s\" is not registered for domain schema validation", tool_name.c_str());
+            record_tool_status(tool_name, mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return false;
+        }
+        if (tool->read_only != expected_read_only) {
+            log_msg(hf, tag, "FAIL -- tool \"%s\" read_only=%d expected=%d",
+                tool_name.c_str(),
+                tool->read_only ? 1 : 0,
+                expected_read_only ? 1 : 0);
+            record_tool_status(tool_name, mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return false;
+        }
+        for (const auto& param : params) {
+            bool required = false;
+            if (!tool_has_param(*tool, param.name, &required)) {
+                log_msg(hf, tag, "FAIL -- tool \"%s\" schema missing parameter \"%s\"",
+                    tool_name.c_str(),
+                    param.name ? param.name : "<null>");
+                record_tool_status(tool_name, mcp_tool_call_status_t::failed);
+                failed.fetch_add(1);
+                return false;
+            }
+            if (required != param.required) {
+                log_msg(hf, tag, "FAIL -- tool \"%s\" schema parameter \"%s\" required=%d expected=%d",
+                    tool_name.c_str(),
+                    param.name ? param.name : "<null>",
+                    required ? 1 : 0,
+                    param.required ? 1 : 0);
+                record_tool_status(tool_name, mcp_tool_call_status_t::failed);
+                failed.fetch_add(1);
+                return false;
+            }
+        }
+        log_msg(hf, tag, "PASS -- schema tool=\"%s\" read_only=%d params=%zu",
+            tool_name.c_str(),
+            tool->read_only ? 1 : 0,
+            tool->params.size());
+        record_tool_status(tool_name, mcp_tool_call_status_t::passed);
+        passed.fetch_add(1);
+        return true;
+    }
+
+    bool test_todo_net_thread_domains_9_10_16_case(HANDLE hf,
+                                                   const char* tag,
+                                                   const std::string& tool_name,
+                                                   const char* case_name,
+                                                   const mcp_standalone::json& args,
+                                                   long long timeout_ms,
+                                                   const test_todo_net_thread_domains_9_10_16_validator_t& validator,
+                                                   std::atomic<int>& passed,
+                                                   std::atomic<int>& failed) {
+        if (tool_name.empty())
+            return false;
+        mcp_standalone::json call_args = args.is_null() ? mcp_standalone::json::object() : args;
+        g_invoked_tools.insert(tool_name);
+        const int seq = g_mcp_tool_sequence.fetch_add(1, std::memory_order_acq_rel) + 1;
+        char step[256];
+        _snprintf_s(step, sizeof(step), _TRUNCATE, "mcp todo domains 9/10/16 #%d: %s", seq, tool_name.c_str());
+        set_progress_step(step);
+        log_msg(hf, tag, "START -- case=%s tool=\"%s\" seq=%d timeout_ms=%lld args=%s",
+            case_name ? case_name : "<null>",
+            tool_name.c_str(),
+            seq,
+            timeout_ms,
+            compact_json(call_args, 900).c_str());
+        auto timed = invoke_tool_bounded(get_server(), tool_name, call_args, timeout_ms, hf, tag, seq);
+        auto ir = std::move(timed.result);
+        log_mcp_result_detail("todo_domains_9_10_16", seq, tool_name, call_args, ir, timed.elapsed_ms, case_name ? case_name : "");
+        auto fail_case = [&](const std::string& why, mcp_tool_call_status_t status = mcp_tool_call_status_t::failed) {
+            log_msg(hf, tag, "FAIL -- case=%s tool=\"%s\" seq=%d reason=%s elapsed_ms=%lld",
+                case_name ? case_name : "<null>",
+                tool_name.c_str(),
+                seq,
+                compact_text(why, 600).c_str(),
+                timed.elapsed_ms);
+            record_tool_status(tool_name, status);
+            failed.fetch_add(1);
+            return false;
+        };
+        if (timed.timed_out)
+            return fail_case("watchdog timeout", mcp_tool_call_status_t::timed_out);
+        if (!ir.found)
+            return fail_case("tool not found during dispatch");
+        if (ir.threw)
+            return fail_case("handler threw: " + ir.exception_msg);
+        std::string reason;
+        if (!validator(ir, reason))
+            return fail_case(reason.empty() ? "validator rejected result" : reason);
+        log_msg(hf, tag, "PASS -- case=%s tool=\"%s\" seq=%d success=%d elapsed_ms=%lld data=%s",
+            case_name ? case_name : "<null>",
+            tool_name.c_str(),
+            seq,
+            ir.success ? 1 : 0,
+            timed.elapsed_ms,
+            mcp_payload_summary(ir.data).c_str());
+        record_tool_status(tool_name, mcp_tool_call_status_t::passed);
+        passed.fetch_add(1);
+        return true;
+    }
+
+    void test_todo_net_thread_domains_9_10_16_game_protocol(HANDLE hf,
+                                                            std::atomic<int>& passed,
+                                                            std::atomic<int>& failed,
+                                                            bool(*cancelled)()) {
+        const char* tag = "mcp.todo.domains_9_10_16.gameproto";
+        set_progress_step("mcp todo domains 9/10/16: game protocol");
+        const std::string enet_tool = test_todo_net_thread_domains_9_10_16_resolve_tool(hf, tag, "gameproto_decode_enet", "gameproto_enet_decode", failed);
+        const std::string entity_tool = test_todo_net_thread_domains_9_10_16_resolve_tool(hf, tag, "gameproto_find_entity_snapshots", "gameproto_decode_heuristic", failed);
+        const std::string replay_tool = test_todo_net_thread_domains_9_10_16_resolve_tool(hf, tag, "gameproto_replay_packet", "gameproto_replay", failed);
+        const std::string detect_tool = test_todo_net_thread_domains_9_10_16_resolve_tool(hf, tag, "gameproto_detect_custom", "gameproto_detect", failed);
+
+        if (!enet_tool.empty())
+            test_todo_net_thread_domains_9_10_16_schema(hf, tag, enet_tool, true, {{"packet_hex", true}, {"channel_id", false}}, passed, failed);
+        if (!entity_tool.empty())
+            test_todo_net_thread_domains_9_10_16_schema(hf, tag, entity_tool, true, {{"payload_hex", true}, {"context_hint", false}}, passed, failed);
+        if (!replay_tool.empty())
+            test_todo_net_thread_domains_9_10_16_schema(hf, tag, replay_tool, false, {{"operation", true}, {"session_id", false}, {"allow_unsafe", false}, {"confirm_unsafe", false}}, passed, failed);
+        if (!detect_tool.empty())
+            test_todo_net_thread_domains_9_10_16_schema(hf, tag, detect_tool, false, {{"pid", true}, {"capture_sec", false}, {"max_packets", false}, {"protocol", false}}, passed, failed);
+
+        auto enet_shape = [](const invoke_result_t& ir, std::string& reason) {
+            if (!ir.success) {
+                reason = "expected ENet decode success text=" + compact_text(ir.text, 300);
+                return false;
+            }
+            bool valid = false;
+            uint64_t parsed = 0;
+            size_t commands = 0;
+            if (!payload_bool_field(ir.data, "valid", valid) || !valid) {
+                reason = "valid=false";
+                return false;
+            }
+            if (!payload_u64_field(ir.data, "parsed_command_count", parsed) || parsed == 0) {
+                reason = "parsed_command_count missing or zero";
+                return false;
+            }
+            if (!payload_array_count(ir.data, "commands", commands) || commands == 0) {
+                reason = "commands missing or empty";
+                return false;
+            }
+            if (!payload_text_contains(ir, "send_reliable") || !payload_text_contains(ir, "414243")) {
+                reason = "send_reliable payload evidence missing";
+                return false;
+            }
+            return true;
+        };
+
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["packet_hex"] = "00011234060000010003414243";
+            test_todo_net_thread_domains_9_10_16_case(hf, tag, enet_tool, "enet_send_reliable_compact_hex", args, 1500, enet_shape, passed, failed);
+        }
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["packet_hex"] = "00:01 12-34 06_00 00 01 00 03 41 42 43";
+            args["channel_id"] = 0;
+            test_todo_net_thread_domains_9_10_16_case(hf, tag, enet_tool, "enet_send_reliable_separator_hex_round_trip", args, 1500, enet_shape, passed, failed);
+        }
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["packet_hex"] = "ABC";
+            test_todo_net_thread_domains_9_10_16_case(hf, tag, enet_tool, "enet_invalid_odd_hex", args, 1500,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    return test_todo_net_thread_domains_9_10_16_expect_error_any(ir, {"odd length", "invalid packet_hex", "invalid hex"}, reason);
+                }, passed, failed);
+        }
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["packet_hex"] = "";
+            test_todo_net_thread_domains_9_10_16_case(hf, tag, enet_tool, "enet_empty_packet_shape", args, 1500,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success) {
+                        reason = "empty packet decode should return structured invalid packet shape";
+                        return false;
+                    }
+                    bool valid = true;
+                    uint64_t packet_size = 1;
+                    if (!payload_bool_field(ir.data, "valid", valid) || valid) {
+                        reason = "empty packet valid flag not false";
+                        return false;
+                    }
+                    if (!payload_u64_field(ir.data, "packet_size", packet_size) || packet_size != 0) {
+                        reason = "empty packet_size missing or nonzero";
+                        return false;
+                    }
+                    if (!payload_text_contains(ir, "packet too small")) {
+                        reason = "packet too small evidence missing";
+                        return false;
+                    }
+                    return true;
+                }, passed, failed);
+        }
+
+        auto heuristic_shape = [](const invoke_result_t& ir, std::string& reason) {
+            if (!ir.success) {
+                reason = "expected heuristic decode success text=" + compact_text(ir.text, 300);
+                return false;
+            }
+            uint64_t payload_size = 0;
+            uint64_t field_count = 0;
+            if (!payload_u64_field(ir.data, "payload_size", payload_size) || payload_size == 0) {
+                reason = "payload_size missing or zero";
+                return false;
+            }
+            if (!payload_u64_field(ir.data, "field_count", field_count) || field_count == 0) {
+                reason = "field_count missing or zero";
+                return false;
+            }
+            if (!payload_text_contains(ir, "entity_update") || !payload_text_contains(ir, "protobuf")) {
+                reason = "entity/protobuf evidence missing";
+                return false;
+            }
+            return true;
+        };
+
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["payload_hex"] = "08960112066176617461721D0000803F2500000040";
+            args["context_hint"] = "entity_update";
+            test_todo_net_thread_domains_9_10_16_case(hf, tag, entity_tool, "entity_snapshot_protobuf_field_decode", args, 1500, heuristic_shape, passed, failed);
+        }
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["payload_hex"] = "AQID==";
+            args["context_hint"] = "entity_update";
+            test_todo_net_thread_domains_9_10_16_case(hf, tag, entity_tool, "entity_snapshot_base64_rejected_as_hex", args, 1500,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    return test_todo_net_thread_domains_9_10_16_expect_error_any(ir, {"invalid hex character", "invalid payload_hex"}, reason);
+                }, passed, failed);
+        }
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["operation"] = "list";
+            test_todo_net_thread_domains_9_10_16_case(hf, tag, replay_tool, "replay_list_sessions_safe", args, 1500,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success) {
+                        reason = "expected replay list success text=" + compact_text(ir.text, 300);
+                        return false;
+                    }
+                    size_t sessions = 0;
+                    uint64_t count = 0;
+                    if (!payload_array_count(ir.data, "sessions", sessions)) {
+                        reason = "sessions array missing";
+                        return false;
+                    }
+                    if (!payload_u64_field(ir.data, "count", count) || count != sessions) {
+                        reason = "count does not match sessions array size";
+                        return false;
+                    }
+                    return true;
+                }, passed, failed);
+        }
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["operation"] = "replay";
+            args["session_id"] = "missing";
+            args["target_ip"] = "127.0.0.1";
+            args["target_port"] = 9;
+            args["max_packets"] = 1;
+            args["payload_cap"] = 64;
+            args["allow_unsafe"] = false;
+            args["confirm_unsafe"] = false;
+            test_todo_net_thread_domains_9_10_16_case(hf, tag, replay_tool, "replay_packet_requires_dual_unsafe_gate", args, 1500,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    return test_todo_net_thread_domains_9_10_16_expect_error_any(ir, {"allow_unsafe=true", "confirm_unsafe=true"}, reason);
+                }, passed, failed);
+        }
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["action"] = "delete_session";
+            test_todo_net_thread_domains_9_10_16_case(hf, tag, replay_tool, "replay_unknown_action_guard", args, 1500,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    return test_todo_net_thread_domains_9_10_16_expect_error_any(ir, {"unknown action", "gameproto_replay"}, reason);
+                }, passed, failed);
+        }
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["pid"] = static_cast<std::uint32_t>(GetCurrentProcessId());
+            args["capture_sec"] = 0.1;
+            args["max_packets"] = 1;
+            args["protocol"] = "udp";
+            test_todo_net_thread_domains_9_10_16_case(hf, tag, detect_tool, "detect_custom_bounded_empty_or_driver_unavailable", args, 2500,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success)
+                        return test_todo_net_thread_domains_9_10_16_known_driver_fail_closed(ir) ||
+                            test_todo_net_thread_domains_9_10_16_expect_error_any(ir, {"driver bridge is not connected", "capture failed"}, reason);
+                    uint64_t pid = 0;
+                    uint64_t packet_count = 0;
+                    if (!payload_u64_field(ir.data, "pid", pid) || pid == 0) {
+                        reason = "pid missing";
+                        return false;
+                    }
+                    if (!payload_u64_field(ir.data, "packet_count", packet_count)) {
+                        reason = "packet_count missing";
+                        return false;
+                    }
+                    if (!ir.data.contains("detected_packets") || !ir.data["detected_packets"].is_array()) {
+                        reason = "detected_packets missing";
+                        return false;
+                    }
+                    return true;
+                }, passed, failed);
+        }
+    }
+
+    void test_todo_net_thread_domains_9_10_16_net_protocol(HANDLE hf,
+                                                           std::atomic<int>& passed,
+                                                           std::atomic<int>& failed,
+                                                           bool(*cancelled)()) {
+        const char* tag = "mcp.todo.domains_9_10_16.net_proto";
+        set_progress_step("mcp todo domains 9/10/16: network protocol");
+        const std::string find_tool = test_todo_net_thread_domains_9_10_16_resolve_tool(hf, tag, "net_proto_find_sendrecv", "net_proto_find_sendrecv", failed);
+        const std::string trace_tool = test_todo_net_thread_domains_9_10_16_resolve_tool(hf, tag, "net_proto_trace_session", "net_proto_trace_serializer", failed);
+        const std::string reassemble_tool = test_todo_net_thread_domains_9_10_16_resolve_tool(hf, tag, "net_proto_reassemble_stream", "net_udp_session_reassemble", failed);
+        const std::string mutate_tool = test_todo_net_thread_domains_9_10_16_resolve_tool(hf, tag, "net_proto_mutate_packet", "net_replay_mutate", failed);
+
+        if (!find_tool.empty())
+            test_todo_net_thread_domains_9_10_16_schema(hf, tag, find_tool, true, {{"process_id", false}, {"max_results", false}, {"max_modules", false}}, passed, failed);
+        if (!trace_tool.empty())
+            test_todo_net_thread_domains_9_10_16_schema(hf, tag, trace_tool, false, {{"serializer_va", true}, {"buffer_reg", true}, {"process_id", false}, {"sample_ms", false}}, passed, failed);
+        if (!reassemble_tool.empty())
+            test_todo_net_thread_domains_9_10_16_schema(hf, tag, reassemble_tool, false, {{"pid", false}, {"capture_sec", false}, {"max_packets", false}, {"max_payload", false}}, passed, failed);
+        if (!mutate_tool.empty())
+            test_todo_net_thread_domains_9_10_16_schema(hf, tag, mutate_tool, false, {{"session_id", true}, {"target_ip", true}, {"target_port", true}, {"allow_unsafe", false}, {"confirm_unsafe", false}}, passed, failed);
+
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["process_id"] = g_mcp_target_pid != 0 ? g_mcp_target_pid : static_cast<std::uint32_t>(GetCurrentProcessId());
+            args["max_results"] = 4;
+            args["max_modules"] = 1;
+            args["max_scan_bytes"] = 65536;
+            test_todo_net_thread_domains_9_10_16_case(hf, tag, find_tool, "sendrecv_bounded_scan_or_unavailable", args, 3500,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success)
+                        return test_todo_net_thread_domains_9_10_16_known_driver_fail_closed(ir);
+                    if (!ir.data.contains("results") || !ir.data["results"].is_array()) {
+                        reason = "results array missing";
+                        return false;
+                    }
+                    uint64_t pid = 0;
+                    if (!payload_u64_field(ir.data, "process_id", pid) || pid == 0) {
+                        reason = "process_id missing";
+                        return false;
+                    }
+                    if (!ir.data.contains("limitations") || !ir.data["limitations"].is_array()) {
+                        reason = "limitations missing";
+                        return false;
+                    }
+                    return true;
+                }, passed, failed);
+        }
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["process_id"] = 4294967294u;
+            args["max_results"] = 1;
+            args["max_modules"] = 1;
+            args["max_scan_bytes"] = 4096;
+            test_todo_net_thread_domains_9_10_16_case(hf, tag, find_tool, "sendrecv_invalid_process_id", args, 2500,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    return test_todo_net_thread_domains_9_10_16_expect_error_any(ir,
+                        {"driver bridge is not connected", "failed to attach", "process"}, reason);
+                }, passed, failed);
+        }
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["buffer_reg"] = "rdx";
+            test_todo_net_thread_domains_9_10_16_case(hf, tag, trace_tool, "trace_session_missing_serializer_va", args, 1500,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    return test_todo_net_thread_domains_9_10_16_expect_error_any(ir, {"serializer_va", "required"}, reason);
+                }, passed, failed);
+        }
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["serializer_va"] = "not_an_address";
+            args["buffer_reg"] = "rdx";
+            test_todo_net_thread_domains_9_10_16_case(hf, tag, trace_tool, "trace_session_invalid_serializer_va", args, 1500,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    return test_todo_net_thread_domains_9_10_16_expect_error_any(ir, {"invalid serializer_va"}, reason);
+                }, passed, failed);
+        }
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["process_id"] = g_mcp_target_pid != 0 ? g_mcp_target_pid : 0u;
+            args["serializer_va"] = "0x1";
+            args["buffer_reg"] = "notareg";
+            args["size_reg"] = "badreg";
+            args["sample_ms"] = 100;
+            args["max_captures"] = 1;
+            test_todo_net_thread_domains_9_10_16_case(hf, tag, trace_tool, "trace_session_invalid_registers_bounded", args, 3000,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success)
+                        return test_todo_net_thread_domains_9_10_16_known_driver_fail_closed(ir);
+                    uint64_t capture_count = 0;
+                    if (!payload_u64_field(ir.data, "capture_count", capture_count)) {
+                        reason = "capture_count missing";
+                        return false;
+                    }
+                    if (!ir.data.contains("captures") || !ir.data["captures"].is_array()) {
+                        reason = "captures missing";
+                        return false;
+                    }
+                    return true;
+                }, passed, failed);
+        }
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["pid"] = g_mcp_target_pid != 0 ? g_mcp_target_pid : static_cast<std::uint32_t>(GetCurrentProcessId());
+            args["capture_sec"] = -10.0;
+            args["max_packets"] = 1;
+            args["max_payload"] = 64;
+            test_todo_net_thread_domains_9_10_16_case(hf, tag, reassemble_tool, "reassemble_stream_negative_capture_clamped", args, 2500,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success)
+                        return test_todo_net_thread_domains_9_10_16_known_driver_fail_closed(ir);
+                    uint64_t capture_ms = 0;
+                    uint64_t packet_count = 0;
+                    uint64_t session_count = 0;
+                    if (!payload_u64_field(ir.data, "capture_ms", capture_ms) || capture_ms < 100 || capture_ms > 15000) {
+                        reason = "capture_ms missing or outside clamp";
+                        return false;
+                    }
+                    if (!payload_u64_field(ir.data, "packet_count", packet_count)) {
+                        reason = "packet_count missing";
+                        return false;
+                    }
+                    if (!payload_u64_field(ir.data, "session_count", session_count)) {
+                        reason = "session_count missing";
+                        return false;
+                    }
+                    if (!ir.data.contains("sessions") || !ir.data["sessions"].is_array()) {
+                        reason = "sessions missing";
+                        return false;
+                    }
+                    return true;
+                }, passed, failed);
+        }
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["session_id"] = "missing";
+            args["target_ip"] = "127.0.0.1";
+            args["target_port"] = 9;
+            args["allow_unsafe"] = false;
+            args["confirm_unsafe"] = false;
+            test_todo_net_thread_domains_9_10_16_case(hf, tag, mutate_tool, "mutate_packet_requires_dual_unsafe_gate", args, 1500,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    return test_todo_net_thread_domains_9_10_16_expect_error_any(ir, {"allow_unsafe=true", "confirm_unsafe=true"}, reason);
+                }, passed, failed);
+        }
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["session_id"] = "missing";
+            args["target_ip"] = "999.1.1.1";
+            args["target_port"] = 9;
+            args["allow_unsafe"] = true;
+            args["confirm_unsafe"] = true;
+            args["max_mutations"] = 1;
+            args["payload_cap"] = 64;
+            args["response_wait_ms"] = 0;
+            test_todo_net_thread_domains_9_10_16_case(hf, tag, mutate_tool, "mutate_packet_invalid_target_ip_or_driver_unavailable", args, 2000,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    return test_todo_net_thread_domains_9_10_16_expect_error_any(ir,
+                        {"target_ip must be an ipv4 literal", "driver bridge is not connected"}, reason);
+                }, passed, failed);
+        }
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["session_id"] = "missing";
+            args["target_ip"] = "8.8.8.8";
+            args["target_port"] = 9;
+            args["allow_unsafe"] = true;
+            args["confirm_unsafe"] = true;
+            args["allow_non_loopback"] = false;
+            args["max_mutations"] = 1;
+            args["payload_cap"] = 64;
+            args["response_wait_ms"] = 0;
+            test_todo_net_thread_domains_9_10_16_case(hf, tag, mutate_tool, "mutate_packet_non_loopback_guard_or_driver_unavailable", args, 2000,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    return test_todo_net_thread_domains_9_10_16_expect_error_any(ir,
+                        {"non-loopback mutation replay requires allow_non_loopback=true", "driver bridge is not connected"}, reason);
+                }, passed, failed);
+        }
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["action"] = "drop";
+            args["session_id"] = "missing";
+            test_todo_net_thread_domains_9_10_16_case(hf, tag, mutate_tool, "mutate_packet_unknown_action_guard", args, 1500,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    return test_todo_net_thread_domains_9_10_16_expect_error_any(ir, {"unknown action", "net_replay_mutate"}, reason);
+                }, passed, failed);
+        }
+    }
+
+    void test_todo_net_thread_domains_9_10_16_thread_intel(HANDLE hf,
+                                                           std::atomic<int>& passed,
+                                                           std::atomic<int>& failed,
+                                                           bool(*cancelled)()) {
+        const char* tag = "mcp.todo.domains_9_10_16.thread";
+        set_progress_step("mcp todo domains 9/10/16: thread intelligence");
+        const std::string classify_tool = test_todo_net_thread_domains_9_10_16_resolve_tool(hf, tag, "thread_classify", "thread_classify", failed);
+        const std::string watch_tool = test_todo_net_thread_domains_9_10_16_resolve_tool(hf, tag, "thread_watch_rip", "thread_watch_rip", failed);
+
+        if (!classify_tool.empty())
+            test_todo_net_thread_domains_9_10_16_schema(hf, tag, classify_tool, false, {{"process_id", false}, {"sample_sec", false}, {"interval_ms", false}, {"max_threads", false}}, passed, failed);
+        if (!watch_tool.empty())
+            test_todo_net_thread_domains_9_10_16_schema(hf, tag, watch_tool, false, {{"tid", true}, {"process_id", false}, {"samples", false}, {"interval_ms", false}}, passed, failed);
+
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["process_id"] = g_mcp_target_pid != 0 ? g_mcp_target_pid : 0u;
+            args["sample_sec"] = 0.1;
+            args["interval_ms"] = 100;
+            args["max_threads"] = 8;
+            test_todo_net_thread_domains_9_10_16_case(hf, tag, classify_tool, "classify_bounded_target_or_unavailable", args, 2500,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success)
+                        return test_todo_net_thread_domains_9_10_16_known_driver_fail_closed(ir);
+                    uint64_t pid = 0;
+                    uint64_t thread_count = 0;
+                    if (!payload_u64_field(ir.data, "process_id", pid) || pid == 0) {
+                        reason = "process_id missing";
+                        return false;
+                    }
+                    if (!payload_u64_field(ir.data, "thread_count", thread_count)) {
+                        reason = "thread_count missing";
+                        return false;
+                    }
+                    if (!ir.data.contains("threads") || !ir.data["threads"].is_array()) {
+                        reason = "threads missing";
+                        return false;
+                    }
+                    return true;
+                }, passed, failed);
+        }
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["process_id"] = 4294967294u;
+            args["sample_sec"] = 0.1;
+            args["interval_ms"] = 100;
+            args["max_threads"] = 1;
+            test_todo_net_thread_domains_9_10_16_case(hf, tag, classify_tool, "classify_invalid_process_id", args, 2500,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    return test_todo_net_thread_domains_9_10_16_expect_error_any(ir,
+                        {"driver bridge is not connected", "failed to attach", "process"}, reason);
+                }, passed, failed);
+        }
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            test_todo_net_thread_domains_9_10_16_case(hf, tag, watch_tool, "watch_rip_missing_tid", args, 1500,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    return test_todo_net_thread_domains_9_10_16_expect_error_any(ir, {"tid", "required"}, reason);
+                }, passed, failed);
+        }
+        if (!cancelled || !cancelled()) {
+            mcp_standalone::json args;
+            args["tid"] = -1;
+            args["address"] = "0x0";
+            args["range"] = "not-a-range";
+            test_todo_net_thread_domains_9_10_16_case(hf, tag, watch_tool, "watch_rip_invalid_tid_and_watch_range", args, 1500,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    return test_todo_net_thread_domains_9_10_16_expect_error_any(ir, {"invalid tid"}, reason);
+                }, passed, failed);
+        }
+
+        uint32_t sample_pid = g_mcp_target_pid != 0 ? g_mcp_target_pid : driver_bridge::attached_pid();
+        uint32_t sample_tid = 0;
+        if (sample_pid != 0 && driver_bridge::using_kernel_driver()) {
+            auto threads = driver_bridge::enumerate_threads_for(sample_pid);
+            for (const auto& th : threads) {
+                if (th.tid != 0) {
+                    sample_tid = th.tid;
+                    break;
+                }
+            }
+        }
+        if ((!cancelled || !cancelled()) && sample_pid != 0 && sample_tid != 0) {
+            mcp_standalone::json args;
+            args["process_id"] = sample_pid;
+            args["tid"] = sample_tid;
+            args["samples"] = 2;
+            args["interval_ms"] = 1;
+            test_todo_net_thread_domains_9_10_16_case(hf, tag, watch_tool, "watch_rip_bounded_target_thread", args, 2500,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success)
+                        return test_todo_net_thread_domains_9_10_16_known_driver_fail_closed(ir);
+                    uint64_t tid = 0;
+                    uint64_t requested = 0;
+                    if (!payload_u64_field(ir.data, "tid", tid) || tid == 0) {
+                        reason = "tid missing";
+                        return false;
+                    }
+                    if (!payload_u64_field(ir.data, "samples_requested", requested) || requested == 0) {
+                        reason = "samples_requested missing";
+                        return false;
+                    }
+                    if (!ir.data.contains("hot_paths") || !ir.data["hot_paths"].is_array()) {
+                        reason = "hot_paths missing";
+                        return false;
+                    }
+                    return true;
+                }, passed, failed);
+        } else {
+            log_msg(hf, tag, "INFO -- bounded watch_rip live sampling not attempted sample_pid=%u sample_tid=%u driver_connected=%d",
+                sample_pid,
+                sample_tid,
+                driver_bridge::using_kernel_driver() ? 1 : 0);
+        }
+    }
+
+    void test_todo_net_thread_domains_9_10_16_protocol_thread_tools(HANDLE hf,
+                                                                    std::atomic<int>& passed,
+                                                                    std::atomic<int>& failed,
+                                                                    std::atomic<int>& skipped,
+                                                                    bool(*cancelled)()) {
+        (void)skipped;
+        const char* tag = "mcp.todo.domains_9_10_16";
+        set_progress_step("mcp todo domains 9/10/16: protocol and thread tools");
+        log_msg(hf, tag, "BEGIN -- target_pid=%u attached_pid=%u driver_connected=%d",
+            g_mcp_target_pid,
+            driver_bridge::attached_pid(),
+            driver_bridge::using_kernel_driver() ? 1 : 0);
+        if (!cancelled || !cancelled())
+            test_todo_net_thread_domains_9_10_16_game_protocol(hf, passed, failed, cancelled);
+        if (!cancelled || !cancelled())
+            test_todo_net_thread_domains_9_10_16_net_protocol(hf, passed, failed, cancelled);
+        if (!cancelled || !cancelled())
+            test_todo_net_thread_domains_9_10_16_thread_intel(hf, passed, failed, cancelled);
+        log_msg(hf, tag, "END -- pass=%d fail=%d skip=%d",
+            passed.load(std::memory_order_acquire),
+            failed.load(std::memory_order_acquire),
+            skipped.load(std::memory_order_acquire));
+    }
+
 }
 void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& global_skipped, bool(*cancelled)()) {
     log_msg(hf, "mcp_phase", "=== MCP TOOL TESTS START (AI/agent tools excluded from counters) ===");
@@ -15106,6 +18256,10 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_burp_comparer_manage_diff(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_comparer_manage_remove_slot(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_comparer_manage_clear(hf, passed, failed, skipped);
+    if (!cancelled()) test_todo_domains_1_8_functional(hf, passed, failed, skipped, cancelled);
+    if (!cancelled()) test_todo_net_thread_domains_9_10_16_protocol_thread_tools(hf, passed, failed, skipped, cancelled);
+    if (!cancelled()) test_todo_protected_re_domains_11_15_run(hf, passed, failed, skipped, cancelled);
+    if (!cancelled()) test_todo_mcp_tool_contracts(hf, passed, failed, skipped, cancelled);
     if (!cancelled()) {
         set_progress_step("mcp finalization: network cleanup before coverage audit");
         cleanup_mcp_network_state(hf, "before MCP coverage audit");

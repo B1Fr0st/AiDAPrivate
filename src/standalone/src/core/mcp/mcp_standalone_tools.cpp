@@ -2152,10 +2152,15 @@ namespace mcp_standalone
 
         driver_tools::register_driver_tools(srv);
         network_tools::register_network_tools(srv);
+        gameproto_tools::register_gameproto_tools(srv);
+        net_proto_tools::register_net_proto_tools(srv);
         net_security_tools::register_net_security_tools(srv);
         emulation_tools::register_emulation_tools(srv);
         debugger_tools::register_debugger_tools(srv);
+        thread_intel_tools::register_thread_intel_tools(srv);
         coding_tools::register_coding_tools(srv);
+        re_tools::register_re_tools(srv);
+        protected_re_tools::register_protected_re_tools(srv);
         workflow_tools::register_workflow_tools(srv);
         scanner_tools::register_scanner_tools(srv);
         analysis_tools::register_analysis_tools(srv);

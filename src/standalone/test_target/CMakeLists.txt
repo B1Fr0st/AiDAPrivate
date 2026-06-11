@@ -25,6 +25,9 @@ add_executable(AiDA_TestTarget
     "${CMAKE_CURRENT_SOURCE_DIR}/http_server_tests.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/traffic_generator.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/resident_state.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/re_domain_fixtures.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/protocol_re_tests.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/protected_re_fixtures.cpp"
 )
 
 target_include_directories(AiDA_TestTarget PRIVATE

@@ -628,8 +628,8 @@ inline void enforce_violation_id(uint64_t reason_id, const std::string& extra = 
     }
     CFF_STATE(ev_cff, 2)
     {
-        diag::log_tagged_critical("enforce", "ev_cff_state_2_calling_license_shutdown");
-        standalone_license::shutdown();
+        diag::log_tagged_critical("enforce", "ev_cff_state_2_calling_license_invalidate_for_enforcement");
+        standalone_license::invalidate_for_enforcement(extra.empty() ? reason_short : extra.c_str());
         diag::log_tagged_critical("enforce", "ev_cff_state_2_done_goto_3");
         CFF_GOTO(ev_cff, 3);
     }

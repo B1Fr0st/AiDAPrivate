@@ -1,6 +1,5 @@
 #pragma once
 
-#include <atomic>
 #include <cstdint>
 #include <string>
 
@@ -17,6 +16,7 @@ namespace standalone_license
     std::string plan();
     std::string last_error();
     void shutdown();
+    void invalidate_for_enforcement(const char* reason);
 
 
     bool check_subscription_tier();
@@ -103,7 +103,8 @@ namespace standalone_license
     bool is_arc_download_in_progress();
     bool validate_arc_required_exports(std::string& missing_out);
     uint64_t activation_completed_at();
-    const arc_comm_vtable_t* get_arc_comm_bridge();
+    using arc_comm_bridge_callback_t = bool (*)(const arc_comm_vtable_t*, void*);
+    bool with_arc_comm_bridge(arc_comm_bridge_callback_t callback, void* ctx);
     uint64_t arc_validate_tool(uint64_t tool_name_hash, uint64_t gate_token);
     bool verify_tool_runtime(gate_slot_t slot, uint64_t gate_token, const std::string& tool_name);
     arc_heartbeat_result_t arc_heartbeat();

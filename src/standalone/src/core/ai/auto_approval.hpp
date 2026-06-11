@@ -271,47 +271,98 @@ enum class tool_category_t
 
 inline tool_category_t categorize_tool(const std::string& tool_name)
 {
-    if (tool_name == "switch_agent")
+    const bool mcp_tool = tool_name.size() > 5 && tool_name.compare(0, 5, "mcp::") == 0;
+    const std::string name = mcp_tool ? tool_name.substr(5) : tool_name;
+
+    if (name == "switch_agent")
         return tool_category_t::mode_switch;
-    if (tool_name == "task")
+    if (name == "task")
         return tool_category_t::subtask;
-    if (tool_name == "ask_followup_question")
+    if (name == "ask_followup_question")
         return tool_category_t::followup;
-    if (tool_name == "update_todo_list" || tool_name == "skill" ||
-        tool_name == "get_tool_descriptions" || tool_name == "convert_number" ||
-        tool_name == "attempt_completion")
+    if (name == "update_todo_list" || name == "skill" ||
+        name == "get_tool_descriptions" || name == "convert_number" ||
+        name == "attempt_completion")
         return tool_category_t::always_auto;
 
-    if (tool_name == "execute_command" || tool_name == "sandbox_execute" ||
-        tool_name == "read_command_output")
+    if (name == "execute_command" || name == "sandbox_execute" ||
+        name == "read_command_output")
         return tool_category_t::execute;
-
-    if (tool_name.size() > 5 && tool_name.substr(0, 5) == "mcp::")
-        return tool_category_t::mcp;
-
-        if (tool_name == "list_directory" || tool_name == "read_file" ||
-        tool_name == "read_file_content" || tool_name == "search_files" ||
-        tool_name == "get_file_info" || tool_name == "grep_in_files" ||
-        tool_name == "codebase_search" || tool_name == "web_search" ||
-        tool_name == "read_memory" || tool_name == "read_memory_string" ||
-        tool_name == "disassemble_zydis" || tool_name == "disassemble_file" ||
-        tool_name == "get_imports" || tool_name == "get_exports" ||
-        tool_name == "get_sections" || tool_name == "get_pe_header" ||
-        tool_name == "hex_dump" || tool_name == "hex_dump_file" ||
-        tool_name == "list_checkpoints" || tool_name == "list_processes" ||
-        tool_name == "dbg_get_modules_detail")
-        return tool_category_t::read_only;
 
     auto has_prefix = [&](const char* p) {
         size_t plen = std::strlen(p);
-        return tool_name.size() > plen && tool_name.compare(0, plen, p) == 0;
+        return name.size() > plen && name.compare(0, plen, p) == 0;
     };
+    auto contains = [&](const char* p) {
+        return name.find(p) != std::string::npos;
+    };
+    auto equals_any = [&](const char* const* values, size_t count) {
+        for (size_t i = 0; i < count; ++i) {
+            if (name == values[i])
+                return true;
+        }
+        return false;
+    };
+
+    static const char* const mutating_tools[] = {
+        "sessions_manage",
+        "dx_hook_manage",
+        "dx_dump_render_targets",
+        "vmt_hook_manage",
+        "vmt_copy",
+        "offsets_manage",
+        "heap_track_manage",
+        "sigs_manage",
+        "struct_observe",
+        "gameproto_detect",
+        "gameproto_replay",
+        "thread_classify",
+        "thread_watch_rip",
+        "net_proto_trace_serializer",
+        "net_udp_session_reassemble",
+        "net_replay_mutate",
+        "opaque_predicate_patch",
+        "drv_hook_manage",
+        "drv_send_ioctl",
+        "smc_manage",
+        "pack_find_oep",
+        "pack_iat_manage"
+    };
+    if (equals_any(mutating_tools, sizeof(mutating_tools) / sizeof(mutating_tools[0])) ||
+        contains("hook") || contains("capture") || contains("suspend"))
+        return tool_category_t::write;
+
+    if (name == "list_directory" || name == "read_file" ||
+        name == "read_file_content" || name == "search_files" ||
+        name == "get_file_info" || name == "grep_in_files" ||
+        name == "codebase_search" || name == "web_search" ||
+        name == "read_memory" || name == "read_memory_string" ||
+        name == "disassemble_zydis" || name == "disassemble_file" ||
+        name == "get_imports" || name == "get_exports" ||
+        name == "get_sections" || name == "get_pe_header" ||
+        name == "hex_dump" || name == "hex_dump_file" ||
+        name == "list_checkpoints" || name == "list_processes" ||
+        name == "dbg_get_modules_detail")
+        return tool_category_t::read_only;
+
     if (has_prefix("disasm_get_") || has_prefix("disasm_list_") ||
-        has_prefix("disasm_search_") || tool_name == "analysis_query" ||
+        has_prefix("disasm_search_") || name == "analysis_query" ||
         has_prefix("debugger_get_") ||
         has_prefix("network_get_") ||
-        tool_name == "decompile_function" || tool_name == "get_xrefs")
+        name == "decompile_function" || name == "get_xrefs")
         return tool_category_t::read_only;
+
+    if (has_prefix("dx_") || has_prefix("vmt_") || has_prefix("rtti_") ||
+        has_prefix("encptr_") || has_prefix("struct_") || has_prefix("gameproto_") ||
+        has_prefix("vm_") || has_prefix("cff_") ||
+        has_prefix("drv_") || has_prefix("smc_") || has_prefix("pack_") ||
+        has_prefix("net_proto_") || has_prefix("net_udp_") ||
+        name == "mba_simplify" || name == "opaque_predicate_detect" ||
+        name == "bogus_block_remove")
+        return tool_category_t::read_only;
+
+    if (mcp_tool)
+        return tool_category_t::mcp;
 
     return tool_category_t::write;
 }

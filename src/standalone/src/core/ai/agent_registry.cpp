@@ -209,6 +209,20 @@ You are running inside the AiDA standalone IDE â€” an IDA-Pro-class reverse
 - get_imports / get_exports / get_sections / get_pe_header â€” PE introspection.
 - hex_dump / hex_dump_file â€” hex view of memory or file regions.
 
+## Specialized reverse-engineering domains
+
+- dx_* - DirectX/DXGI/Vulkan vtable discovery, constant-buffer analysis, view-matrix search, and guarded draw/present capture management.
+- vmt_* - C++ virtual table reading, signature slot lookup, object scans, and guarded VMT hook/copy management.
+- rtti_* - MSVC RTTI type scans, type lookup, hierarchy inspection, and constructor xref recovery.
+- encptr_* - encrypted pointer-chain scanning, transform detection, resolver emission, and stability checks.
+- offsets_manage / sigs_manage - persisted offset and signature metadata workflows.
+- heap_track_manage - guarded heap allocation tracking sessions.
+- struct_* - advanced struct observation, correlation, array detection, and snapshot comparison.
+- gameproto_* / net_proto_* / net_udp_* - game/network protocol detection, decode, serializer tracing, UDP session reassembly, and guarded replay/mutation.
+- thread_* - render/network/logic thread classification and RIP hot-path sampling.
+- vm_* / cff_* / mba_simplify / opaque_* / bogus_block_remove - VM and control-flow deobfuscation, MBA simplification, opaque predicate detection, and guarded patching.
+- drv_* / smc_* / pack_* - kernel-driver analysis, self-modifying-code capture, packer detection, guarded OEP finding, and guarded IAT monitoring.
+
 ## Sandbox / isolation
 
 - sandbox_execute â€” run a binary inside Windows Sandbox and collect artifacts.
@@ -534,6 +548,7 @@ Rules:
 				over.push_back({"execute_command", "**", permission_rule_t::action_t::deny});
 				over.push_back({"read_command_output", "**", permission_rule_t::action_t::deny});
 				over.push_back({"driver_write", "**", permission_rule_t::action_t::deny});
+				over.push_back({"network", "**", permission_rule_t::action_t::deny});
 				over.push_back({"scanner_write_value", "**", permission_rule_t::action_t::deny});
 				over.push_back({"driver_allocate_memory", "**", permission_rule_t::action_t::deny});
 				over.push_back({"driver_free_memory", "**", permission_rule_t::action_t::deny});
@@ -1031,61 +1046,151 @@ Rules:
 
 	std::string permission_key_for_tool(const std::string& tool_name)
 	{
-		if (tool_name == "edit" || tool_name == "edit_file" ||
-		    tool_name == "write" || tool_name == "write_file" ||
-		    tool_name == "create_file" || tool_name == "delete_file" ||
-		    tool_name == "rename_path" || tool_name == "delete_path" ||
-		    tool_name == "patch_bytes" || tool_name == "apply_diff" ||
-		    tool_name == "apply_patch")
-			return "edit";
-		if (tool_name == "read" || tool_name == "read_file" ||
-		    tool_name == "read_file_content" || tool_name == "hex_dump" ||
-		    tool_name == "hex_dump_file")
-			return "read";
-		if (tool_name == "bash" || tool_name == "execute_command" ||
-		    tool_name == "sandbox_execute" || tool_name == "read_command_output")
-			return "bash";
-		if (tool_name == "glob" || tool_name == "search_files")
-			return "glob";
-		if (tool_name == "grep" || tool_name == "grep_in_files")
-			return "grep";
-		if (tool_name == "list" || tool_name == "list_directory")
-			return "list";
-		if (tool_name == "codesearch" || tool_name == "codebase_search")
-			return "codesearch";
-		if (tool_name == "webfetch" || tool_name == "web_fetch")
-			return "webfetch";
-		if (tool_name == "websearch" || tool_name == "web_search")
-			return "websearch";
-		if (tool_name == "todowrite" || tool_name == "update_todo_list")
-			return "todowrite";
-		if (tool_name == "skill")
-			return "skill";
-		if (tool_name == "task")
-			return "task";
-		if (tool_name == "switch_agent")
-			return "agent_switch";
-		if (tool_name == "save_checkpoint" || tool_name == "restore_checkpoint" ||
-		    tool_name == "list_checkpoints")
-			return "checkpoint";
-		if (tool_name == "ask_followup_question")
-			return "question";
-		if (tool_name == "attempt_completion")
-			return "attempt_completion";
-		if (tool_name == "plan_enter")
-			return "plan_enter";
-		if (tool_name == "plan_exit")
-			return "plan_exit";
-		if (tool_name.rfind("driver_write", 0) == 0 ||
-		    tool_name == "driver_allocate_memory" || tool_name == "driver_free_memory")
+		const bool mcp_tool = tool_name.size() > 5 && tool_name.compare(0, 5, "mcp::") == 0;
+		const std::string name = mcp_tool ? tool_name.substr(5) : tool_name;
+		auto has_prefix = [&](const char* p) {
+			const size_t len = std::char_traits<char>::length(p);
+			return name.size() > len && name.compare(0, len, p) == 0;
+		};
+		auto equals_any = [&](const char* const* values, size_t count) {
+			for (size_t i = 0; i < count; ++i) {
+				if (name == values[i])
+					return true;
+			}
+			return false;
+		};
+
+		static const char* const driver_write_tools[] = {
+			"dx_hook_manage",
+			"dx_dump_render_targets",
+			"vmt_hook_manage",
+			"vmt_copy",
+			"heap_track_manage",
+			"struct_observe",
+			"thread_classify",
+			"thread_watch_rip",
+			"opaque_predicate_patch",
+			"drv_hook_manage",
+			"drv_send_ioctl",
+			"smc_manage",
+			"pack_find_oep",
+			"pack_iat_manage"
+		};
+		if (equals_any(driver_write_tools, sizeof(driver_write_tools) / sizeof(driver_write_tools[0])))
 			return "driver_write";
-		if (tool_name.rfind("driver_", 0) == 0)
-			return "driver_read";
-		if (tool_name.rfind("disassemble", 0) == 0 ||
-		    tool_name == "query_memory" || tool_name == "read_memory" ||
-		    tool_name == "read_string")
+
+		static const char* const network_write_tools[] = {
+			"gameproto_detect",
+			"gameproto_replay",
+			"net_proto_trace_serializer",
+			"net_udp_session_reassemble",
+			"net_replay_mutate"
+		};
+		if (equals_any(network_write_tools, sizeof(network_write_tools) / sizeof(network_write_tools[0])))
+			return "network";
+
+		static const char* const metadata_write_tools[] = {
+			"offsets_manage",
+			"sigs_manage"
+		};
+		if (equals_any(metadata_write_tools, sizeof(metadata_write_tools) / sizeof(metadata_write_tools[0])))
+			return "edit";
+
+		static const char* const re_read_tools[] = {
+			"dx_find_device_vtable",
+			"dx_list_bound_cbuffers",
+			"dx_identify_bone_buffer",
+			"dx_map_resource_to_va",
+			"dx_find_view_matrix",
+			"vmt_read",
+			"vmt_find_slot_by_signature",
+			"vmt_scan_objects",
+			"rtti_scan",
+			"rtti_find_type",
+			"rtti_list_hierarchy",
+			"rtti_find_constructor",
+			"encptr_scan_chain",
+			"encptr_detect_transform",
+			"encptr_emit_resolver",
+			"encptr_verify_stable",
+			"struct_correlate",
+			"struct_array_detect",
+			"struct_compare_snapshots",
+			"gameproto_enet_decode",
+			"gameproto_decode_heuristic",
+			"mba_simplify",
+			"opaque_predicate_detect",
+			"bogus_block_remove",
+			"drv_find_dispatch_table",
+			"drv_decode_irp_handlers",
+			"drv_find_ioctl_dispatch",
+			"drv_enumerate_ioctls",
+			"drv_find_device_names",
+			"drv_check_buffer_safety",
+			"smc_scan_encrypted_regions",
+			"smc_find_decryptor",
+			"pack_detect",
+			"net_proto_find_sendrecv"
+		};
+		if (equals_any(re_read_tools, sizeof(re_read_tools) / sizeof(re_read_tools[0])) ||
+		    has_prefix("vm_") || has_prefix("cff_"))
 			return "read";
-		return tool_name;
+
+		if (name == "edit" || name == "edit_file" ||
+		    name == "write" || name == "write_file" ||
+		    name == "create_file" || name == "delete_file" ||
+		    name == "rename_path" || name == "delete_path" ||
+		    name == "patch_bytes" || name == "apply_diff" ||
+		    name == "apply_patch")
+			return "edit";
+		if (name == "read" || name == "read_file" ||
+		    name == "read_file_content" || name == "hex_dump" ||
+		    name == "hex_dump_file")
+			return "read";
+		if (name == "bash" || name == "execute_command" ||
+		    name == "sandbox_execute" || name == "read_command_output")
+			return "bash";
+		if (name == "glob" || name == "search_files")
+			return "glob";
+		if (name == "grep" || name == "grep_in_files")
+			return "grep";
+		if (name == "list" || name == "list_directory")
+			return "list";
+		if (name == "codesearch" || name == "codebase_search")
+			return "codesearch";
+		if (name == "webfetch" || name == "web_fetch")
+			return "webfetch";
+		if (name == "websearch" || name == "web_search")
+			return "websearch";
+		if (name == "todowrite" || name == "update_todo_list")
+			return "todowrite";
+		if (name == "skill")
+			return "skill";
+		if (name == "task")
+			return "task";
+		if (name == "switch_agent")
+			return "agent_switch";
+		if (name == "save_checkpoint" || name == "restore_checkpoint" ||
+		    name == "list_checkpoints")
+			return "checkpoint";
+		if (name == "ask_followup_question")
+			return "question";
+		if (name == "attempt_completion")
+			return "attempt_completion";
+		if (name == "plan_enter")
+			return "plan_enter";
+		if (name == "plan_exit")
+			return "plan_exit";
+		if (name.rfind("driver_write", 0) == 0 ||
+		    name == "driver_allocate_memory" || name == "driver_free_memory")
+			return "driver_write";
+		if (name.rfind("driver_", 0) == 0)
+			return "driver_read";
+		if (name.rfind("disassemble", 0) == 0 ||
+		    name == "query_memory" || name == "read_memory" ||
+		    name == "read_string")
+			return "read";
+		return name;
 	}
 
 	bool tool_allowed(const agent_info_t& agent, const std::string& tool_name)
