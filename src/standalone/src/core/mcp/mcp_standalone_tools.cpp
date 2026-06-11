@@ -502,6 +502,14 @@ tool_result_t ensure_attached()
             if (read_le_value(bytes, v)) out["value"] = v;
             return out;
         }
+        if (type == "uint32") {
+            uint32_t v = 0;
+            if (read_le_value(bytes, v)) {
+                out["value"] = v;
+                out["hex_value"] = hex_addr(v);
+            }
+            return out;
+        }
         if (type == "int64") {
             int64_t v = 0;
             if (read_le_value(bytes, v)) out["value"] = v;

@@ -13340,9 +13340,9 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
         mcp_standalone::json args; args["file_path"] = temp_file_narrow("aida_mcp_cookies.txt");
         test_tool_action_call(hf, "mcp.burp_cookie_manage.export_netscape", "burp_cookie_manage", "export_netscape", args, passed, failed, skipped);
     }
-    void test_tool_burp_dom_xss_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const char* tag = "mcp.burp_dom_xss_status";
-        set_progress_step("mcp precheck: burp_dom_xss_status");
+    void test_tool_burp_dom_xss_manage_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        const char* tag = "mcp.burp_dom_xss_manage.status";
+        set_progress_step("mcp precheck: burp_dom_xss_manage status");
         std::string dependency_reason;
         const bool dependency_ready = camoufox_dependencies_ready_for_test(hf, tag, dependency_reason);
         log_msg(hf, tag, "PRECHECK -- dependency_ready=%d reason=%s",
@@ -13351,63 +13351,63 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
         if (!dependency_ready) {
             g_burp_dom_xss_browser_infra_failed = true;
             g_burp_dom_xss_dependency_reason = dependency_reason;
-            record_camoufox_dependency_guard_pass(hf, tag, "burp_dom_xss_status", dependency_reason, passed, failed);
+            record_camoufox_dependency_guard_pass(hf, tag, "burp_dom_xss_manage", dependency_reason, passed, failed);
             return;
         }
         std::string bridge_reason;
-        if (!ensure_mcp_camoufox_bridge_ready_for_tool(hf, tag, "burp_dom_xss_status", failed, &bridge_reason)) {
+        if (!ensure_mcp_camoufox_bridge_ready_for_tool(hf, tag, "burp_dom_xss_manage", failed, &bridge_reason)) {
             g_burp_dom_xss_browser_infra_failed = true;
             g_burp_dom_xss_dependency_reason = bridge_reason;
-            log_msg(hf, tag, "FAIL -- burp_dom_xss_status not dispatched because Camoufox bridge proof failed: %s",
+            log_msg(hf, tag, "FAIL -- burp_dom_xss_manage status not dispatched because Camoufox bridge proof failed: %s",
                 bridge_reason.empty() ? "<empty>" : compact_text(bridge_reason, 900).c_str());
             return;
         }
         mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, tag, get_server(), "burp_dom_xss_status", {}, passed, failed, skipped, false, &result);
+        auto status = test_tool_action_call(hf, tag, "burp_dom_xss_manage", "status", {}, passed, failed, skipped, false, &result);
         bool camoufox_ready = false;
         payload_bool_field(result.data, "camoufox_ready", camoufox_ready);
         if (!dependency_ready || status != mcp_tool_call_status_t::passed || !camoufox_ready)
             g_burp_dom_xss_browser_infra_failed = true;
     }
-    void test_tool_burp_dom_xss_test_payload(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_dom_xss_manage_test_payload(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         if (g_burp_dom_xss_browser_infra_failed) {
             if (!g_burp_dom_xss_dependency_reason.empty()) {
-                record_camoufox_dependency_guard_pass(hf, "mcp.burp_dom_xss_test_payload", "burp_dom_xss_test_payload", g_burp_dom_xss_dependency_reason, passed, failed);
+                record_camoufox_dependency_guard_pass(hf, "mcp.burp_dom_xss_manage.test_payload", "burp_dom_xss_manage", g_burp_dom_xss_dependency_reason, passed, failed);
                 return;
             }
-            log_msg(hf, "mcp.burp_dom_xss_test_payload", "FAIL -- not executed because burp_dom_xss_status did not prove Camoufox readiness");
-            record_fixture_failed_tool("burp_dom_xss_test_payload", failed);
+            log_msg(hf, "mcp.burp_dom_xss_manage.test_payload", "FAIL -- not executed because burp_dom_xss_manage status did not prove Camoufox readiness");
+            record_fixture_failed_tool("burp_dom_xss_manage", failed);
             return;
         }
-        mcp_standalone::json args; args["target_url"] = burp_fixture_url(hf, "mcp.burp_dom_xss_test_payload", "/?q=test"); args["payload"] = R"(<img src=x onerror="try{{CANARY_FN}('test')}catch(e){};try{console.log('AIDA_DOM_XSS_CANARY:'+JSON.stringify({id:'img:{CANARY}',src:'test',token:'{CANARY}'}))}catch(e){}">)";
+        mcp_standalone::json args; args["target_url"] = burp_fixture_url(hf, "mcp.burp_dom_xss_manage.test_payload", "/?q=test"); args["payload_template"] = R"(<img src=x onerror="try{{CANARY_FN}('test')}catch(e){};try{console.log('AIDA_DOM_XSS_CANARY:'+JSON.stringify({id:'img:{CANARY}',src:'test',token:'{CANARY}'}))}catch(e){}">)";
         args["timeout_ms"] = 30000;
         args["capture_screenshot"] = false;
         mcp_standalone::tool_result_t result;
-        auto status = test_tool_call(hf, "mcp.burp_dom_xss_test_payload", get_server(), "burp_dom_xss_test_payload", args, passed, failed, skipped, false, &result);
+        auto status = test_tool_action_call(hf, "mcp.burp_dom_xss_manage.test_payload", "burp_dom_xss_manage", "test_payload", args, passed, failed, skipped, false, &result);
         if (status == mcp_tool_call_status_t::timed_out ||
             (status != mcp_tool_call_status_t::passed && browser_infrastructure_text(result.text)))
             g_burp_dom_xss_browser_infra_failed = true;
     }
-    void test_tool_burp_dom_xss_scan(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_tool_burp_dom_xss_manage_scan(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         (void)skipped;
         if (g_burp_dom_xss_browser_infra_failed) {
             if (!g_burp_dom_xss_dependency_reason.empty()) {
-                record_camoufox_dependency_guard_pass(hf, "mcp.burp_dom_xss_scan", "burp_dom_xss_scan", g_burp_dom_xss_dependency_reason, passed, failed);
+                record_camoufox_dependency_guard_pass(hf, "mcp.burp_dom_xss_manage.scan", "burp_dom_xss_manage", g_burp_dom_xss_dependency_reason, passed, failed);
                 return;
             }
-            log_msg(hf, "mcp.burp_dom_xss_scan", "FAIL -- browser infrastructure already failed in burp_dom_xss_test_payload");
-            record_tool_status("burp_dom_xss_scan", mcp_tool_call_status_t::failed);
+            log_msg(hf, "mcp.burp_dom_xss_manage.scan", "FAIL -- browser infrastructure already failed in burp_dom_xss_manage test_payload");
+            record_tool_status("burp_dom_xss_manage", mcp_tool_call_status_t::failed);
             failed.fetch_add(1);
             return;
         }
-        mcp_standalone::json args; args["target_url"] = burp_fixture_url(hf, "mcp.burp_dom_xss_scan", "/?q=test");
+        mcp_standalone::json args; args["target_url"] = burp_fixture_url(hf, "mcp.burp_dom_xss_manage.scan", "/?q=test");
         args["include_polyglot"] = false;
         args["include_standard"] = true;
         args["include_dom_only"] = false;
         args["max_payloads_per_point"] = 1;
         args["per_payload_timeout_ms"] = 6000;
         args["scan_timeout_ms"] = 35000;
-        test_tool_call(hf, "mcp.burp_dom_xss_scan", get_server(), "burp_dom_xss_scan", args, passed, failed, skipped);
+        test_tool_action_call(hf, "mcp.burp_dom_xss_manage.scan", "burp_dom_xss_manage", "scan", args, passed, failed, skipped);
     }
     void test_tool_burp_crawler_manage_start(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["start_urls"] = mcp_standalone::json::array({burp_fixture_url(hf, "mcp.burp_crawler_manage.start")}); args["max_depth"] = 1; args["max_pages"] = 2; args["concurrency"] = 1; args["respect_robots"] = false;
@@ -14786,18 +14786,14 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_dbg_start_trace(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_stop_trace(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_get_trace(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_dbg_set_comment(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_set_label(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_toggle_bookmark(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_find_strings(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_add_hw_breakpoint(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_toggle_breakpoint(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_clear_all_breakpoints(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_dbg_get_comment(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_get_label(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_get_bookmarks(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_dbg_get_xrefs_to(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_dbg_get_xrefs_from(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_scan_xrefs(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_build_cfg(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_get_cfg(hf, passed, failed, skipped);
@@ -14815,7 +14811,7 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_scanner_address_list_manage_freeze(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_scanner_address_list_manage_list(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_scanner_address_list_manage_remove(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_scanner_read_value(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_read_memory_typed_value(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_scanner_write_value(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_scanner_pointer_scan(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_scanner_cancel_pointer_scan(hf, passed, failed, skipped);
@@ -14856,11 +14852,11 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_disasm_get_function_bounds(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_disasm_get_function_disassembly(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_disasm_list_functions(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_disasm_get_xrefs_to(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_disasm_get_xrefs_from(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_disasm_set_comment(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_disasm_get_comment(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_disasm_rename_function(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_get_xrefs_to(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_get_xrefs_from(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_disasm_annotations_manage_set_comment(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_disasm_annotations_manage_get_comment(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_disasm_annotations_manage_rename_function(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_disasm_get_section_info(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_disasm_search_bytes(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_disasm_get_strings(hf, passed, failed, skipped);
@@ -14975,10 +14971,10 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_burp_scanner_manage_cancel(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_scanner_manage_list_issues(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_scanner_manage_get_issue(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_scanner_passive_status(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_scanner_list_modules(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_scanner_manage_passive_status(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_scanner_manage_list_modules(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_scanner_manage_clear_issues(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_scanner_passive_enable(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_scanner_manage_passive_enable(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_sitemap_list_hosts(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_sitemap_list_paths(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_sitemap_get_exchange(hf, passed, failed, skipped);
@@ -14991,9 +14987,9 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_burp_cookie_manage_set(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_cookie_manage_delete(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_cookie_manage_export_netscape(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_dom_xss_status(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_dom_xss_test_payload(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_burp_dom_xss_scan(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_dom_xss_manage_status(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_dom_xss_manage_test_payload(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_burp_dom_xss_manage_scan(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_crawler_manage_start(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_crawler_manage_status(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_burp_crawler_manage_stop(hf, passed, failed, skipped);

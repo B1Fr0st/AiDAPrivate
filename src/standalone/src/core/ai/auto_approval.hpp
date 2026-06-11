@@ -310,7 +310,7 @@ inline tool_category_t categorize_tool(const std::string& tool_name)
         has_prefix("disasm_search_") || tool_name == "analysis_query" ||
         has_prefix("debugger_get_") ||
         has_prefix("network_get_") ||
-        tool_name == "decompile_function" || tool_name == "disasm_get_comment")
+        tool_name == "decompile_function" || tool_name == "get_xrefs")
         return tool_category_t::read_only;
 
     return tool_category_t::write;
