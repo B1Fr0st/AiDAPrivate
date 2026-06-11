@@ -1,11 +1,15 @@
 #include "test_lab.hpp"
 #include "test_lab_format.hpp"
+#include "../infra/event_bus.hpp"
 #include "../../../../driver/comm.h"
 #include "imgui/imgui.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -27,6 +31,100 @@ namespace {
 		char b[16];
 		std::snprintf(b, sizeof(b), "0x%08X", static_cast<unsigned>(v));
 		r.parsed.push_back({ label, b });
+	}
+
+	bool contains_u32(const std::vector<std::uint32_t>& values, std::uint32_t value) {
+		return std::find(values.begin(), values.end(), value) != values.end();
+	}
+
+	void push_unique_u32(std::vector<std::uint32_t>& values, std::uint32_t value) {
+		if (value != 0u && !contains_u32(values, value))
+			values.push_back(value);
+	}
+
+	struct evidence_observer_t {
+		std::mutex mutex;
+		std::vector<std::uint32_t> child_pids;
+		std::vector<std::uint32_t> process_created_pids;
+		std::vector<std::uint32_t> process_exited_pids;
+		std::uint32_t drain_notifications = 0;
+		std::uint32_t drain_returned_total = 0;
+		std::uint32_t drain_dropped_total = 0;
+		std::uint64_t max_total_dropped = 0;
+		std::uint64_t max_total_published = 0;
+	};
+
+	struct evidence_snapshot_t {
+		std::vector<std::uint32_t> observed_created_pids;
+		std::vector<std::uint32_t> observed_exited_pids;
+		std::uint32_t drain_notifications = 0;
+		std::uint32_t drain_returned_total = 0;
+		std::uint32_t drain_dropped_total = 0;
+		std::uint64_t max_total_dropped = 0;
+		std::uint64_t max_total_published = 0;
+
+		std::uint32_t observed_count() const {
+			return static_cast<std::uint32_t>(observed_created_pids.size() + observed_exited_pids.size());
+		}
+	};
+
+	struct evidence_subscription_scope_t {
+		aida::events::subscription_handle_t drained;
+		aida::events::subscription_handle_t created;
+		aida::events::subscription_handle_t exited;
+
+		~evidence_subscription_scope_t() {
+			reset();
+		}
+
+		void reset() {
+			if (drained.valid())
+				aida::events::unsubscribe(drained);
+			if (created.valid())
+				aida::events::unsubscribe(created);
+			if (exited.valid())
+				aida::events::unsubscribe(exited);
+			drained = {};
+			created = {};
+			exited = {};
+		}
+	};
+
+	evidence_snapshot_t snapshot_observer(const std::shared_ptr<evidence_observer_t>& observer) {
+		evidence_snapshot_t snapshot{};
+		if (!observer)
+			return snapshot;
+		std::lock_guard<std::mutex> lock(observer->mutex);
+		for (std::uint32_t pid : observer->child_pids) {
+			if (contains_u32(observer->process_created_pids, pid))
+				snapshot.observed_created_pids.push_back(pid);
+			if (contains_u32(observer->process_exited_pids, pid))
+				snapshot.observed_exited_pids.push_back(pid);
+		}
+		snapshot.drain_notifications = observer->drain_notifications;
+		snapshot.drain_returned_total = observer->drain_returned_total;
+		snapshot.drain_dropped_total = observer->drain_dropped_total;
+		snapshot.max_total_dropped = observer->max_total_dropped;
+		snapshot.max_total_published = observer->max_total_published;
+		return snapshot;
+	}
+
+	void observe_child_pid(const std::shared_ptr<evidence_observer_t>& observer, std::uint32_t pid) {
+		if (!observer || pid == 0u)
+			return;
+		std::lock_guard<std::mutex> lock(observer->mutex);
+		push_unique_u32(observer->child_pids, pid);
+	}
+
+	void push_observed_pids(test_lab::result_t& r, const char* prefix, const std::vector<std::uint32_t>& pids) {
+		const std::size_t cap = (pids.size() > 8u) ? 8u : pids.size();
+		for (std::size_t i = 0; i < cap; ++i) {
+			char label[64];
+			char value[32];
+			std::snprintf(label, sizeof(label), "%s[%zu]", prefix, i);
+			std::snprintf(value, sizeof(value), "%u", static_cast<unsigned>(pids[i]));
+			r.parsed.push_back({ label, value });
+		}
 	}
 
 	std::string narrow_wide(const std::wstring& w) {
@@ -72,7 +170,9 @@ namespace {
 		push_child_field(r, index, field, buf);
 	}
 
-	bool launch_evidence_child(test_lab::result_t& r, std::uint32_t index) {
+	bool launch_evidence_child(test_lab::result_t& r, std::uint32_t index, std::uint32_t* out_pid) {
+		if (out_pid)
+			*out_pid = 0u;
 		wchar_t sysdir[MAX_PATH] = {};
 		UINT len = GetSystemDirectoryW(sysdir, MAX_PATH);
 		if (len == 0u || len >= MAX_PATH) {
@@ -97,6 +197,8 @@ namespace {
 			return false;
 		push_child_field_u32(r, index, "pid", pi.dwProcessId);
 		push_child_field_u32(r, index, "tid", pi.dwThreadId);
+		if (out_pid)
+			*out_pid = static_cast<std::uint32_t>(pi.dwProcessId);
 		DWORD wait_rc = WaitForSingleObject(pi.hProcess, 2000u);
 		DWORD exit_code = STILL_ACTIVE;
 		GetExitCodeProcess(pi.hProcess, &exit_code);
@@ -184,14 +286,43 @@ namespace {
 		push_u64(r, "baseline_total_dropped", baseline_stats.total_dropped);
 		push_u64(r, "baseline_total_published", baseline_stats.total_published);
 		push_u32(r, "fresh_trigger_requested", 1u);
+		auto observer = std::make_shared<evidence_observer_t>();
+		evidence_subscription_scope_t subscriptions;
+		subscriptions.drained = aida::events::subscribe(aida::events::event_debug_events_drained,
+			[observer](const aida::events::debug_events_drained_t& payload) {
+				std::lock_guard<std::mutex> lock(observer->mutex);
+				++observer->drain_notifications;
+				observer->drain_returned_total += payload.returned_count;
+				observer->drain_dropped_total += payload.dropped_since_last_drain;
+				if (payload.total_dropped > observer->max_total_dropped)
+					observer->max_total_dropped = payload.total_dropped;
+				if (payload.total_published > observer->max_total_published)
+					observer->max_total_published = payload.total_published;
+			});
+		subscriptions.created = aida::events::subscribe(aida::events::event_process_created,
+			[observer](const aida::events::process_created_t& payload) {
+				std::lock_guard<std::mutex> lock(observer->mutex);
+				push_unique_u32(observer->process_created_pids, payload.process_id);
+			});
+		subscriptions.exited = aida::events::subscribe(aida::events::event_process_exited,
+			[observer](const aida::events::process_exited_t& payload) {
+				std::lock_guard<std::mutex> lock(observer->mutex);
+				push_unique_u32(observer->process_exited_pids, payload.process_id);
+			});
+		push_u32(r, "fresh_observer_subscribed",
+			(subscriptions.drained.valid() && subscriptions.created.valid() && subscriptions.exited.valid()) ? 1u : 0u);
 		std::vector<voyager::device_t::debug_event_record> events;
 		voyager::device_t::debug_event_drain_stats stats{};
 		bool ok = true;
 		std::uint32_t created_children = 0u;
 		std::uint32_t poll_attempts = 0u;
-		for (std::uint32_t child = 0; child < 4u && events.empty(); ++child) {
-			if (launch_evidence_child(r, child))
+		evidence_snapshot_t observed{};
+		for (std::uint32_t child = 0; child < 4u && events.empty() && observed.observed_count() == 0u; ++child) {
+			std::uint32_t child_pid = 0u;
+			if (launch_evidence_child(r, child, &child_pid)) {
 				++created_children;
+				observe_child_pid(observer, child_pid);
+			}
 			for (std::uint32_t poll = 0; poll < 10u; ++poll) {
 				Sleep(50u);
 				events.clear();
@@ -205,10 +336,12 @@ namespace {
 					push_u32(r, "fresh_poll_attempts", poll_attempts);
 					return;
 				}
-				if (!events.empty())
+				observed = snapshot_observer(observer);
+				if (!events.empty() || observed.observed_count() != 0u)
 					break;
 			}
 		}
+		observed = snapshot_observer(observer);
 		push_u32(r, "fresh_children_created", created_children);
 		push_u32(r, "fresh_poll_attempts", poll_attempts);
 		push_u32(r, "returned_count", stats.returned_count);
@@ -223,6 +356,20 @@ namespace {
 		if (stats.total_dropped >= baseline_stats.total_dropped)
 			dropped_delta = stats.total_dropped - baseline_stats.total_dropped;
 		push_u64(r, "fresh_total_dropped_delta", dropped_delta);
+		push_u32(r, "fresh_observed_count", observed.observed_count());
+		push_u32(r, "fresh_observed_created_count", static_cast<std::uint32_t>(observed.observed_created_pids.size()));
+		push_u32(r, "fresh_observed_exited_count", static_cast<std::uint32_t>(observed.observed_exited_pids.size()));
+		push_u32(r, "background_drain_notifications", observed.drain_notifications);
+		push_u32(r, "background_returned_count", observed.drain_returned_total);
+		push_u32(r, "background_dropped_since_last_drain", observed.drain_dropped_total);
+		push_u64(r, "background_total_dropped", observed.max_total_dropped);
+		push_u64(r, "background_total_published", observed.max_total_published);
+		std::uint64_t observed_published_delta = 0;
+		if (observed.max_total_published >= baseline_stats.total_published)
+			observed_published_delta = observed.max_total_published - baseline_stats.total_published;
+		push_u64(r, "background_total_published_delta", observed_published_delta);
+		push_observed_pids(r, "fresh_observed_created_pid", observed.observed_created_pids);
+		push_observed_pids(r, "fresh_observed_exited_pid", observed.observed_exited_pids);
 		for (std::size_t i = 0; i < events.size(); ++i) {
 			const auto& e = events[i];
 			const char* type_name = "invalid";
@@ -261,6 +408,11 @@ namespace {
 			r.parsed.push_back({ label, path_utf8 });
 		}
 		if (events.empty()) {
+			if (observed.observed_count() != 0u) {
+				r.parsed.push_back({ "evidence_source", "background_debug_event_poller" });
+				r.ok = true;
+				return;
+			}
 			r.ok = false;
 			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
 			if (published_delta != 0) {

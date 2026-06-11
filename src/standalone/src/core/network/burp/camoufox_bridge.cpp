@@ -76,6 +76,9 @@ struct singleton_t
     uint64_t                                last_nav_ms        = 0;
     uint64_t                                last_cleanup_ms    = 0;
     uint64_t                                last_verified_ms   = 0;
+    uint64_t                                auto_restart_block_until_ms = 0;
+    uint64_t                                auto_restart_block_generation = 0;
+    std::string                             auto_restart_block_reason;
     std::atomic<bool>                       stop_requested{false};
     std::atomic<uint64_t>                   stop_epoch{0};
     std::atomic<uint32_t>                   tracked_child_pid{0};
@@ -145,14 +148,14 @@ bool post_bridge_task(const char* name, std::function<void()> task)
     bool posted = false;
     try
     {
-        posted = work_queue::post(std::move(task));
+        posted = work_queue::post_service(std::move(task));
     }
     catch (...)
     {
         posted = false;
     }
-    const auto st = work_queue::stats();
-    diag::log_tagged_fmt("camoufox", "work_queue_post name=%s posted=%d alive=%d shutting_down=%d workers=%zu pending=%zu active=%lu elapsed_ms=%llu",
+    const auto st = work_queue::service_stats();
+    diag::log_tagged_fmt("camoufox", "service_queue_post name=%s posted=%d alive=%d shutting_down=%d workers=%zu pending=%zu active=%lu elapsed_ms=%llu",
         name ? name : "<null>",
         posted ? 1 : 0,
         st.alive ? 1 : 0,
@@ -173,12 +176,13 @@ constexpr int kToolListWaitMaxMs = 5000;
 constexpr int kLaunchWaitMinMs = 5000;
 constexpr int kLaunchWaitMaxMs = 120000;
 constexpr int kBundledVisibleLaunchWaitMinMs = 70000;
-constexpr int kTestLabLaunchWaitDefaultMs = 15000;
-constexpr int kTestLabLaunchWaitMaxMs = 15000;
+constexpr int kTestLabLaunchWaitDefaultMs = 70000;
+constexpr int kTestLabLaunchWaitMaxMs = 70000;
 constexpr int kReadinessProbeTimeoutMs = 10000;
 constexpr int kNavigationWaitMaxMs = 50000;
 constexpr uint64_t kPythonDiscoveryBudgetMs = 15000;
 constexpr uint64_t kActivityDrainWaitMs = 45000;
+constexpr uint64_t kAutoRestartBlockMs = 120000;
 thread_local uint32_t g_bridge_activity_depth = 0;
 
 const char* safe_reason(const char* reason)
@@ -1604,6 +1608,47 @@ void clear_page_state_locked()
     sg().last_verified_ms = 0;
 }
 
+void clear_auto_restart_block_locked(const char* reason)
+{
+    if (sg().auto_restart_block_until_ms == 0)
+        return;
+    diag::log_tagged_fmt("camoufox", "auto_restart_block_clear reason=%s blocked_reason=%s generation=%llu remaining_ms=%llu",
+        safe_reason(reason), sg().auto_restart_block_reason.c_str(),
+        static_cast<unsigned long long>(sg().auto_restart_block_generation),
+        static_cast<unsigned long long>(sg().auto_restart_block_until_ms > now_ms() ? sg().auto_restart_block_until_ms - now_ms() : 0));
+    sg().auto_restart_block_until_ms = 0;
+    sg().auto_restart_block_generation = 0;
+    sg().auto_restart_block_reason.clear();
+}
+
+void block_auto_restart_locked(const std::string& reason, uint64_t generation, uint64_t duration_ms)
+{
+    const uint64_t until_ms = now_ms() + duration_ms;
+    sg().auto_restart_block_until_ms = until_ms;
+    sg().auto_restart_block_generation = generation;
+    sg().auto_restart_block_reason = reason;
+    diag::log_tagged_fmt("camoufox", "auto_restart_block_set reason=%s generation=%llu duration_ms=%llu until_ms=%llu state=%d child_pid=%lu browser_open=%d page_verified=%d",
+        reason.c_str(), static_cast<unsigned long long>(generation),
+        static_cast<unsigned long long>(duration_ms), static_cast<unsigned long long>(until_ms),
+        static_cast<int>(sg().state), static_cast<unsigned long>(sg().child_pid),
+        sg().browser_open ? 1 : 0, sg().page_verified ? 1 : 0);
+}
+
+bool auto_restart_blocked_locked(uint64_t now, std::string& reason, uint64_t& remaining_ms, uint64_t& generation)
+{
+    if (sg().auto_restart_block_until_ms == 0)
+        return false;
+    if (now >= sg().auto_restart_block_until_ms)
+    {
+        clear_auto_restart_block_locked("expired");
+        return false;
+    }
+    reason = sg().auto_restart_block_reason;
+    remaining_ms = sg().auto_restart_block_until_ms - now;
+    generation = sg().auto_restart_block_generation;
+    return true;
+}
+
 int clamp_launch_wait_ms(int requested)
 {
     int wait_ms = requested > 0 ? requested : kLaunchWaitMaxMs;
@@ -2717,6 +2762,7 @@ call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::j
         std::shared_ptr<mcp_client::client_t> timed_out_client;
         uint32_t timed_out_child_pid = 0;
         uint64_t timed_out_generation = 0;
+        bool retained_timed_out_client = false;
         state->cancelled = true;
         timed_out_child_pid = state->child_pid;
         timed_out_generation = state->generation;
@@ -2725,20 +2771,36 @@ call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::j
             std::lock_guard<std::recursive_mutex> g(sg().mtx);
             if (sg().client == cli)
             {
-                timed_out_client = sg().client;
-                sg().client.reset();
-                diag::log_tagged_fmt("camoufox", "call_with_deadline phase=%s request_id=%llu timeout_ms=%d tool=%s failure_phase=mcp_response_wait action=detach_client generation=%llu child_pid=%lu",
-                    cancelled_by_stop ? "cancel" : "timeout", static_cast<unsigned long long>(request_id), timeout_ms, tool_name.c_str(), static_cast<unsigned long long>(sg().generation),
-                    static_cast<unsigned long>(sg().child_pid));
-                sg().state           = bridge_state_t::error;
-                sg().last_error      = cancelled_by_stop
-                    ? std::string("call_tool cancelled by stop request: ") + tool_name
-                    : std::string("call_tool timeout: ") + tool_name;
-                clear_page_state_locked();
-                mark_cleanup_started_locked(sg().generation, sg().child_pid, std::string(cancelled_by_stop ? "cancel_" : "timeout_") + tool_name);
-                timed_out_child_pid = sg().child_pid;
-                timed_out_generation = sg().generation;
-                sg().child_pid       = 0;
+                if (!cancelled_by_stop && sg().child_pid != 0 && process_alive(sg().child_pid))
+                {
+                    retained_timed_out_client = true;
+                    sg().state = bridge_state_t::error;
+                    sg().last_error = std::string("call_tool timeout: ") + tool_name;
+                    block_auto_restart_locked(std::string("timeout_") + tool_name, sg().generation, kAutoRestartBlockMs);
+                    timed_out_child_pid = sg().child_pid;
+                    timed_out_generation = sg().generation;
+                    diag::log_tagged_fmt("camoufox", "call_with_deadline phase=timeout request_id=%llu timeout_ms=%d tool=%s failure_phase=mcp_response_wait action=retain_client_block_restart generation=%llu child_pid=%lu browser_open=%d page_verified=%d",
+                        static_cast<unsigned long long>(request_id), timeout_ms, tool_name.c_str(),
+                        static_cast<unsigned long long>(sg().generation), static_cast<unsigned long>(sg().child_pid),
+                        sg().browser_open ? 1 : 0, sg().page_verified ? 1 : 0);
+                }
+                else
+                {
+                    timed_out_client = sg().client;
+                    sg().client.reset();
+                    diag::log_tagged_fmt("camoufox", "call_with_deadline phase=%s request_id=%llu timeout_ms=%d tool=%s failure_phase=mcp_response_wait action=detach_client generation=%llu child_pid=%lu",
+                        cancelled_by_stop ? "cancel" : "timeout", static_cast<unsigned long long>(request_id), timeout_ms, tool_name.c_str(), static_cast<unsigned long long>(sg().generation),
+                        static_cast<unsigned long>(sg().child_pid));
+                    sg().state           = bridge_state_t::error;
+                    sg().last_error      = cancelled_by_stop
+                        ? std::string("call_tool cancelled by stop request: ") + tool_name
+                        : std::string("call_tool timeout: ") + tool_name;
+                    clear_page_state_locked();
+                    mark_cleanup_started_locked(sg().generation, sg().child_pid, std::string(cancelled_by_stop ? "cancel_" : "timeout_") + tool_name);
+                    timed_out_child_pid = sg().child_pid;
+                    timed_out_generation = sg().generation;
+                    sg().child_pid       = 0;
+                }
             }
             else
             {
@@ -2747,7 +2809,11 @@ call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::j
             }
         }
         if (timed_out_client)
-            cleanup_client_async(timed_out_client, timed_out_child_pid, std::string(cancelled_by_stop ? "cancel_" : "timeout_") + tool_name, timed_out_generation);
+            cleanup_client_reap_now_detach_disconnect(timed_out_client, timed_out_child_pid, std::string(cancelled_by_stop ? "cancel_" : "timeout_") + tool_name, timed_out_generation);
+        else if (retained_timed_out_client)
+            diag::log_tagged_fmt("camoufox", "call_with_deadline retained_timeout request_id=%llu tool=%s generation=%llu child_pid=%lu",
+                static_cast<unsigned long long>(request_id), tool_name.c_str(),
+                static_cast<unsigned long long>(timed_out_generation), static_cast<unsigned long>(timed_out_child_pid));
         publish_state(bridge_state_t::error, std::string(cancelled_by_stop ? "cancelled " : "timeout on ") + tool_name);
         sg().total_errors.fetch_add(1, std::memory_order_relaxed);
         fail.error = cancelled_by_stop
@@ -3755,6 +3821,7 @@ bool start_bridge(const launch_config_t& cfg)
         static_cast<int>(sg().client != nullptr), static_cast<int>(sg().browser_open),
         static_cast<int>(sg().page_verified), static_cast<unsigned long>(sg().child_pid),
         static_cast<int>(sg().cleanup_pending));
+    clear_auto_restart_block_locked("start_bridge");
     if (sg().cleanup_pending)
     {
         const uint64_t wait_start = now_ms();
@@ -3821,14 +3888,18 @@ bool start_bridge(const launch_config_t& cfg)
             sg().last_error.c_str());
         auto stale_client = sg().client;
         const uint32_t stale_pid = sg().child_pid;
-        if (stale_client)
-            stale_client->disconnect();
-        if (stale_pid != 0)
-            terminate_process_tree_sync(stale_pid, "start_bridge_unverified_ready");
         sg().client.reset();
         clear_page_state_locked();
         sg().child_pid = 0;
         sg().state = bridge_state_t::error;
+        if (stale_pid != 0 && sg().tracked_child_pid.load(std::memory_order_acquire) == stale_pid)
+            sg().tracked_child_pid.store(0, std::memory_order_release);
+        lk.unlock();
+        if (stale_pid != 0)
+            terminate_process_tree_sync(stale_pid, "start_bridge_unverified_ready");
+        if (stale_client)
+            disconnect_client_async(stale_client, "start_bridge_unverified_ready");
+        lk.lock();
     }
     if (sg().state == bridge_state_t::starting)
     {
@@ -3840,12 +3911,29 @@ bool start_bridge(const launch_config_t& cfg)
 
     if (sg().client)
     {
+        auto stale_client = sg().client;
+        const uint32_t stale_pid = sg().child_pid;
         diag::log_tagged_fmt("camoufox", "start_bridge disconnecting_stale_client state=%d browser_open=%d",
             static_cast<int>(sg().state), static_cast<int>(sg().browser_open));
-        sg().client->disconnect();
-        sg().client.reset();
+        if (stale_pid != 0)
+        {
+            lk.unlock();
+            terminate_process_tree_sync(stale_pid, "start_bridge_stale_client");
+            lk.lock();
+        }
+        if (sg().client == stale_client)
+            sg().client.reset();
         clear_page_state_locked();
-        sg().child_pid = 0;
+        if (sg().child_pid == stale_pid)
+            sg().child_pid = 0;
+        if (stale_pid != 0 && sg().tracked_child_pid.load(std::memory_order_acquire) == stale_pid)
+            sg().tracked_child_pid.store(0, std::memory_order_release);
+        if (stale_client)
+        {
+            lk.unlock();
+            disconnect_client_async(stale_client, "start_bridge_stale_client");
+            lk.lock();
+        }
     }
     if (sg().stop_epoch.load(std::memory_order_acquire) != start_stop_epoch)
     {
@@ -4241,6 +4329,8 @@ bool start_bridge(const launch_config_t& cfg)
                 : std::string("launch_browser timeout after ") + std::to_string(launch_wait_ms) + "ms";
             sg().last_launch_ms = now_ms() - bridge_start_ms;
             const std::string cleanup_reason = launch_cancelled_by_stop ? "launch_browser_cancelled" : "launch_browser_timeout";
+            if (!launch_cancelled_by_stop)
+                block_auto_restart_locked(cleanup_reason, start_generation, kAutoRestartBlockMs);
             mark_cleanup_started_locked(start_generation, timed_out_pid, cleanup_reason);
             const std::string timeout_tree = timed_out_pid == 0 ? std::string() : compact_process_tree(enumerate_process_tree(timed_out_pid));
             const std::string debug_tail = read_file_tail_for_log(child_debug_log, 6000);
@@ -4255,8 +4345,11 @@ bool start_bridge(const launch_config_t& cfg)
                 debug_phase.empty() ? "<none>" : debug_phase.c_str(),
                 timeout_tree.empty() ? "<empty>" : timeout_tree.c_str(),
                 debug_tail.size(), debug_tail.c_str());
+            const std::string state_error = sg().last_error;
+            lk.unlock();
             cleanup_client_reap_now_detach_disconnect(timed_out_client, timed_out_pid, cleanup_reason, start_generation);
-            publish_state(bridge_state_t::error, sg().last_error);
+            lk.lock();
+            publish_state(bridge_state_t::error, state_error);
             return false;
         }
         launch = std::move(launch_state->result);
@@ -4554,6 +4647,7 @@ bool stop_bridge(const char* reason)
             diag::log_tagged_fmt("camoufox", "stop_bridge already_stopped reason=%s", stop_reason);
             sg().client.reset();
             clear_page_state_locked();
+            clear_auto_restart_block_locked("stop_bridge_already_stopped");
             sg().child_pid = 0;
             sg().cleanup_pending = false;
             sg().last_cleanup_ms = now_ms() - stop_start_ms;
@@ -4568,53 +4662,13 @@ bool stop_bridge(const char* reason)
         sg().child_pid = 0;
         sg().state = bridge_state_t::stopped;
         sg().last_error.clear();
+        clear_auto_restart_block_locked("stop_bridge");
         mark_cleanup_started_locked(stop_generation, child_pid, std::string("stop_bridge:") + stop_reason);
     }
-    if (cli && browser_open)
-    {
-        diag::log_tagged_fmt("camoufox", "stop_bridge scheduling_cleanup reason=%s generation=%llu child_pid=%lu close_browser=1",
-            stop_reason, static_cast<unsigned long long>(stop_generation), static_cast<unsigned long>(child_pid));
-        auto close_task = [cli]() {
-            const std::string tool_name = "close_browser";
-            const nlohmann::json args = nlohmann::json::object();
-            mcp_client::call_result_t r;
-            guarded_mcp_call_context_t call_ctx;
-            call_ctx.client = cli.get();
-            call_ctx.tool_name = &tool_name;
-            call_ctx.args = &args;
-            call_ctx.result = &r;
-            DWORD guard_status = guarded_mcp_call(&call_ctx);
-            if (guard_status != ERROR_SUCCESS)
-            {
-                r = guarded_mcp_failure_result(tool_name, call_ctx, guard_status);
-                diag::log_tagged_critical_fmt("camoufox", "stop_bridge close_browser guarded_failure status=0x%08lX native=%d cpp=%d err=%s",
-                    static_cast<unsigned long>(guard_status), static_cast<int>(call_ctx.native_exception),
-                    static_cast<int>(call_ctx.cpp_exception), r.text.c_str());
-                if (result_has_native_exception(r))
-                {
-                    std::lock_guard<std::recursive_mutex> g(sg().mtx);
-                    quarantine_client_locked(cli, "stop_bridge_close_browser_native_exception");
-                    return;
-                }
-            }
-            cli->disconnect();
-        };
-        if (!post_bridge_task("camoufox.close", close_task)) {
-            diag::log_tagged("camoufox", "stop_bridge close_browser_post_failed");
-            close_task();
-        }
-        cleanup_client_async(nullptr, child_pid, std::string("stop_bridge:") + stop_reason, stop_generation);
-    }
-    else if (cli)
-    {
-        diag::log_tagged_fmt("camoufox", "stop_bridge scheduling_cleanup reason=%s generation=%llu child_pid=%lu close_browser=0",
-            stop_reason, static_cast<unsigned long long>(stop_generation), static_cast<unsigned long>(child_pid));
-        cleanup_client_async(cli, child_pid, std::string("stop_bridge:") + stop_reason, stop_generation);
-    }
-    else
-    {
-        cleanup_client_async(nullptr, child_pid, std::string("stop_bridge:") + stop_reason, stop_generation);
-    }
+    diag::log_tagged_fmt("camoufox", "stop_bridge cleanup_sync reason=%s generation=%llu child_pid=%lu client=%d browser_open=%d",
+        stop_reason, static_cast<unsigned long long>(stop_generation), static_cast<unsigned long>(child_pid),
+        cli ? 1 : 0, browser_open ? 1 : 0);
+    cleanup_client_reap_now_detach_disconnect(cli, child_pid, std::string("stop_bridge:") + stop_reason, stop_generation);
     publish_state(bridge_state_t::stopped, std::string());
     diag::log_tagged_fmt("camoufox", "bridge stopped reason=%s generation=%llu elapsed_ms=%llu",
         stop_reason, static_cast<unsigned long long>(stop_generation), static_cast<unsigned long long>(now_ms() - stop_start_ms));
@@ -4669,6 +4723,7 @@ bool force_cleanup(const char* reason)
         sg().child_pid = 0;
         sg().state = bridge_state_t::stopped;
         sg().last_error.clear();
+        clear_auto_restart_block_locked("force_cleanup");
         if (child_pid != 0 || cli)
         {
             mark_cleanup_started_locked(generation, child_pid, std::string("force_cleanup:") + cleanup_reason);
@@ -4813,6 +4868,25 @@ bool ensure_ready()
         diag::log_tagged_fmt("camoufox", "ensure_ready already_ready elapsed_ms=%llu",
             static_cast<unsigned long long>(now_ms() - t0));
         return true;
+    }
+    {
+        std::lock_guard<std::recursive_mutex> lk(sg().mtx);
+        std::string blocked_reason;
+        uint64_t remaining_ms = 0;
+        uint64_t blocked_generation = 0;
+        if (sg().state == bridge_state_t::error && auto_restart_blocked_locked(now_ms(), blocked_reason, remaining_ms, blocked_generation))
+        {
+            sg().last_error = std::string("camoufox automatic restart suppressed after ") + blocked_reason;
+            diag::log_tagged_fmt("camoufox", "ensure_ready auto_restart_blocked generation=%llu current_generation=%llu child_pid=%lu remaining_ms=%llu reason=%s browser_open=%d page_verified=%d",
+                static_cast<unsigned long long>(blocked_generation),
+                static_cast<unsigned long long>(sg().generation),
+                static_cast<unsigned long>(sg().child_pid),
+                static_cast<unsigned long long>(remaining_ms),
+                blocked_reason.c_str(),
+                sg().browser_open ? 1 : 0,
+                sg().page_verified ? 1 : 0);
+            return false;
+        }
     }
     install::status_t st = install::get_status();
     if (st.state == install::install_state_t::unknown ||
@@ -5063,11 +5137,12 @@ call_result_t managed_call_with_deadline(const std::shared_ptr<managed_session_t
             session->state = bridge_state_t::error;
             session->last_error = std::string("camoufox managed call timeout: ") + tool_name;
             session->client.reset();
+            session->child_pid = 0;
             session->browser_open = false;
             session->page_verified = false;
         }
         if (timed_out_pid != 0)
-            terminate_process_id_async(timed_out_pid, std::string("managed_timeout_") + session->session_id + "_" + tool_name);
+            terminate_process_tree_sync(timed_out_pid, std::string("managed_timeout_") + session->session_id + "_" + tool_name);
         session->total_errors.fetch_add(1, std::memory_order_relaxed);
         fail.error = std::string("camoufox managed call timeout: ") + tool_name;
         return fail;
@@ -5352,8 +5427,8 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
     if (!wait_for_tool_listed(cli.get(), "launch_browser", tool_wait_ms))
     {
         const uint32_t pid = cli->child_process_id();
+        terminate_process_tree_sync(pid, std::string("managed_launch_tool_missing_") + sid);
         cli->disconnect();
-        terminate_process_id_async(pid, std::string("managed_launch_tool_missing_") + sid);
         std::lock_guard<std::recursive_mutex> lk(session->mtx);
         session->client.reset();
         session->child_pid = 0;
@@ -5367,8 +5442,8 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
     if (!launch.ok)
     {
         const uint32_t pid = cli->child_process_id();
+        terminate_process_tree_sync(pid, std::string("managed_launch_failed_") + sid);
         cli->disconnect();
-        terminate_process_id_async(pid, std::string("managed_launch_failed_") + sid);
         std::lock_guard<std::recursive_mutex> lk(session->mtx);
         session->client.reset();
         session->child_pid = 0;
@@ -5380,8 +5455,8 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
     if (!page.ok || !page.data.is_object() || !page.data.contains("url") || !page.data["url"].is_string())
     {
         const uint32_t pid = cli->child_process_id();
+        terminate_process_tree_sync(pid, std::string("managed_readiness_failed_") + sid);
         cli->disconnect();
-        terminate_process_id_async(pid, std::string("managed_readiness_failed_") + sid);
         std::lock_guard<std::recursive_mutex> lk(session->mtx);
         session->client.reset();
         session->child_pid = 0;
@@ -5441,7 +5516,7 @@ bool stop_managed_bridge(const std::string& session_id, const char* reason)
         session->last_cleanup_ms = 0;
     }
     if (child_pid != 0)
-        terminate_process_id_async(child_pid, std::string("managed_stop_") + sid + "_" + stop_reason);
+        terminate_process_tree_sync(child_pid, std::string("managed_stop_") + sid + "_" + stop_reason);
     {
         std::lock_guard<std::recursive_mutex> lk(session->mtx);
         session->last_cleanup_ms = now_ms() - t0;

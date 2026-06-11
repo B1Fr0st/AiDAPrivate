@@ -54,6 +54,7 @@ struct config_t {
     bool seed_provided = false;
     bool watermark_provided = false;
     bool target_arc = false;
+    bool preserve_loader_relocations = false;
     uint64_t seed = 0;
     uint32_t tamper_response_level = 0;
     uint8_t  license_hash[16] = {0};
@@ -110,6 +111,8 @@ static void print_usage(std::FILE* out) {
         "Targets:\n"
         "  --target-arc                ARC mode (aida_core.dll): forces the hardened ARC profile,\n"
         "                              tighter flatten band, tamper-level 4. Validates input is aida_core.dll.\n"
+        "  --preserve-loader-relocations\n"
+        "                              Preserve loader relocation metadata for DLLs hosted by another process.\n"
         "\n"
         "Pack-section encryption depth:\n"
         "  --matryoshka-layers <1|3>   1 = legacy single AES-256-CTR layer.\n"
@@ -325,6 +328,8 @@ inline config_t parse_args(int argc, char** argv) {
             cfg.bind_machine = true;
         } else if (arg == "--target-arc") {
             cfg.target_arc = true;
+        } else if (arg == "--preserve-loader-relocations") {
+            cfg.preserve_loader_relocations = true;
         } else if (arg == "--tamper-level") {
             if (i + 1 >= argc) {
                 std::fprintf(stderr, "Error: --tamper-level requires a value\n");
@@ -1067,6 +1072,7 @@ inline int run(const config_t& cfg) {
     opt.symexec_bombs = cfg.symexec_bombs;
     opt.llm_poison = cfg.llm_poison;
     opt.jit = cfg.jit;
+    opt.preserve_loader_relocations = cfg.preserve_loader_relocations;
     opt.tamper_response_level = cfg.tamper_response_level;
     opt.matryoshka_layers = cfg.matryoshka_layers;
     std::memcpy(opt.license_hash, cfg.license_hash, 16);

@@ -43,6 +43,32 @@ For serious crash, hang, Test Lab, MCP startup, Runtime Integrity Lock, anti-tam
 - For crashes, BSODs, hangs, startup stalls, loader stalls, Runtime Integrity Lock failures, and any other not-working report, do not diagnose from code structure, intuition, or PDB/symbol guesses alone. Treat logs, dumps, and explicit breadcrumbs as the source of truth. If the existing logs do not identify the exact failing call and state, first add narrow, extremely comprehensive debug logging around the confirmed evidence window, rebuild, and ask the user to reproduce with the rebuilt binary.
 - Crash logging must capture entry/exit, PID, TID, timestamps, elapsed durations, phase/step names, module base/end, VA/RVA/size/protection/state for memory operations, Win32 last-error/NTSTATUS values, IOCTL inputs/results, and before/after state for guard pages, `VirtualProtect`/`NtProtectVirtualMemory`, driver calls, anti-tamper gates, and background work items.
 - Do not claim root cause for crashes unless the logs or dump prove it. Use "first confirmed failure marker" or "current evidence window" when the evidence is not yet conclusive, and keep adding breadcrumbs until the failing call is proven.
+- AiDA is not officially released yet. Debug logs and diagnostic breadcrumbs are not vulnerabilities by themselves and must not be removed, reduced, hidden, or treated as security debt unless the user explicitly asks for that cleanup. Preserve diagnostic fields, state snapshots, protocol evidence, and payload context needed to diagnose failures.
+
+## Session Change Discipline
+
+Every session must be careful with every change. Treat the existing worktree as shared state, assume unrelated modifications are intentional, and keep edits narrowly scoped to the requested objective.
+
+- Inspect the relevant files and current worktree before editing. Do not overwrite, normalize, reformat, revert, or regenerate unrelated files.
+- Identify whether a touched path affects license, ARC, anti-tamper, driver, protector, bootstrap, MCP, auth/session state, network protocol, deployment, or generated assets before changing it.
+- For security-sensitive changes, prefer the strictest correct behavior. AiDA must maximize security even when that behavior is extremely strict, inconvenient, or likely to expose false positives during development.
+- Never replace a strict security check with a weaker convenience path. If a false positive is proven, narrow the allow rule with evidence and keep equal or stronger enforcement elsewhere.
+- If a requested implementation conflicts with fail-closed licensing, ARC enforcement, driver integrity, anti-tamper, protector guarantees, or the customer fileless launch model, stop and report the conflict before editing.
+- Keep changes auditable. A future reviewer should be able to tell which invariant was preserved, what evidence justified the edit, and which verification proved it.
+
+## Auth And License Design Discipline
+
+The rules from `RULES.MD` apply to AiDA's real architecture: C++ clients, Node/Express server authority, ARC distribution, driver-backed checks, and protected binaries. For any nontrivial license, authentication, session, HWID, attestation, ARC, protocol, or anti-reversing change, perform this reasoning before implementation and verify it after implementation.
+
+- Enumerate the realistic attack surface first: static analysis in IDA/Ghidra, dynamic debugging, memory patching, server emulation, traffic replay, MITM, protocol reversing, cryptographic misuse, HWID spoofing, timing or content oracles, endpoint injection, rate-limit bypass, and offline validation attempts.
+- Uphold the core invariant: the server is the sole authority. The client must never contain the final word on whether a license, session, ARC activation, or subscription is valid.
+- Design handshakes so every message is replay-safe, tamper-evident, session-bound, and opaque to passive observers where possible. Preserve pinning, nonce freshness, ratchets, fixed-shape failures, rate limits, and timing-safe comparisons.
+- Avoid single-patch bypasses. Authenticated state must not collapse to one boolean, one branch, one pointer, one memory address, or one function return that can be flipped to unlock AiDA.
+- Treat HWID and device binding as security controls. Default to strict server-controlled policy; any tolerance for legitimate hardware drift must be explicit, bounded, auditable, and not usable as an offline bypass.
+- Keep secrets server-side whenever possible. Client-embedded public keys, pins, fingerprints, or protocol constants must be the minimum required and hardened through the existing obfuscation, protector, ARC, and anti-tamper layers.
+- Server endpoints must not leak validation or key-space information through response shape, timing, status text, retries, or differential errors. Preserve canonical auth failure envelopes and timing budgets.
+- Implement complete production behavior. Do not add stubs, placeholders, TODOs, legacy fallbacks, offline bypasses, or "temporary" auth shortcuts.
+- Red-team the finished change before reporting it complete: inspect whether a reverser can quickly find the auth path, NOP one function, patch one result, watch one address, extract useful keys, replay a session, spoof HWID, build an emulator, or trigger fail-open behavior. Fix every weakness that is not an explicitly documented residual risk.
 
 ## User Operating Preferences
 
@@ -51,6 +77,7 @@ For serious crash, hang, Test Lab, MCP startup, Runtime Integrity Lock, anti-tam
 - When the problem is broad or high-stakes, dispatch a GPT-5.5 xhigh subagent specifically for comprehensive debug logging or implementation, then the host reviews, patches if needed, and builds.
 - Creating small local test apps, focused repro harnesses, or API-behavior probes is encouraged when it can safely validate a low-level change before touching the protected app. Keep these tests focused, do not weaken protections, and do not run driver/anti-tamper paths casually.
 - The user wants AiDA to be extremely stable and secure at the same time. Never trade anti-tamper, license, ARC, driver, or protector strength for convenience or to make tests pass.
+- Debug logs are intentionally retained during pre-release development. They are evidence, not a vulnerability category. When adding debug logs, prefer complete diagnostic capture over cosmetic sanitization; do not remove or weaken logs merely because they include sensitive state or payload context needed to prove a failure. Keep raw credentials, private keys, signing keys, KMS/HSM material, OAuth bearer tokens, and API keys out of logs unless the user explicitly directs a controlled local diagnostic capture.
 
 ## Confirmed Diagnostics Lessons
 
@@ -84,7 +111,8 @@ Use Context7 for library/API documentation:
 ## Security Rules
 
 - Never edit secrets, private keys, `.env` production values, KMS/HSM material, ARC secrets, Ed25519 private keys, admin/bot keys, SSH keys, OAuth tokens, license keys, session tokens, webhook secrets, or API keys.
-- Never expose keys or sensitive user/server data in chat, logs, commits, docs, tests, or generated files. Redact secrets if they appear in command output.
+- Never expose raw credentials, private keys, signing keys, KMS/HSM material, OAuth bearer tokens, API keys, or full license keys in chat, commits, docs, tests, or generated files. If command output contains them, do not repeat the values in chat. Debug logs may preserve security-relevant state, protocol evidence, and payload context during pre-release diagnostics when needed to prove behavior.
+- Default to maximum security and fail-closed behavior, even if strict. Do not relax licensing, ARC, anti-tamper, driver, protector, MCP trust-boundary, or bootstrap enforcement for convenience.
 - Never weaken driver/security/license checks just to make tests pass.
 - Never trade protection for build speed. Do not lower crypto/protection optimization or hardening flags such as `/Qspectre`, `/sdl`, `/guard:cf`, `/guard:ehcont`, or `/guard:xfg`.
 - No license fallback paths. License, HWID, ARC activation, and subscription enforcement must use the canonical online path. Do not add offline, legacy, or secondary bypass behavior.

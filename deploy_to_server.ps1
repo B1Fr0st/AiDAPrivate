@@ -370,7 +370,7 @@ function Get-CamoufoxSidecarInputs([string]$ReleaseDir) {
         BrowserDir = $browser
         BrowserExe = if ($browser) { Join-Path $browser "camoufox.exe" } else { "" }
         McpExe = $mcp
-        ExeRel = "deps\$browserName\camoufox.exe"
+        ExeRel = "deps/$browserName/camoufox.exe"
         PythonRel = ""
     }
 }
@@ -407,9 +407,13 @@ function Publish-CamoufoxMcpPatch([string]$ReleaseDir, [string]$DeployId, [hasht
     Assert-CamoufoxMcpPatchInputs $inputs
     $mcpSha = Get-FileSha256Lower $inputs.McpExe
     $mcpSize = (Get-Item -LiteralPath $inputs.McpExe).Length
-    $mcpRel = "deps\AiDA_CamoufoxReverseMcp.exe"
+    $mcpRel = "deps/AiDA_CamoufoxReverseMcp.exe"
     $currentSha = if ($RemoteEnv.ContainsKey("AIDA_CAMOUFOX_MCP_SHA256")) { ([string]$RemoteEnv["AIDA_CAMOUFOX_MCP_SHA256"]).ToLowerInvariant() } else { "" }
     $currentSize = if ($RemoteEnv.ContainsKey("AIDA_CAMOUFOX_MCP_SIZE")) { [string]$RemoteEnv["AIDA_CAMOUFOX_MCP_SIZE"] } else { "" }
+    $currentMcpRel = if ($RemoteEnv.ContainsKey("AIDA_CAMOUFOX_MCP_REL")) { [string]$RemoteEnv["AIDA_CAMOUFOX_MCP_REL"] } else { "" }
+    $currentExeRel = if ($RemoteEnv.ContainsKey("AIDA_CAMOUFOX_SIDECAR_EXE_REL")) { [string]$RemoteEnv["AIDA_CAMOUFOX_SIDECAR_EXE_REL"] } else { "" }
+    $currentPythonRel = if ($RemoteEnv.ContainsKey("AIDA_CAMOUFOX_SIDECAR_PYTHON_REL")) { [string]$RemoteEnv["AIDA_CAMOUFOX_SIDECAR_PYTHON_REL"] } else { "" }
+    $metadataCurrent = $currentMcpRel -eq $mcpRel -and $currentExeRel -eq $inputs.ExeRel -and $currentPythonRel -eq $inputs.PythonRel
     if (-not $Force -and $currentSha -eq $mcpSha -and $currentSize -eq [string]$mcpSize) {
         $currentUrl = if ($RemoteEnv.ContainsKey("AIDA_CAMOUFOX_MCP_URL")) { [string]$RemoteEnv["AIDA_CAMOUFOX_MCP_URL"] } else { "" }
         $mcpLive = $false
@@ -420,6 +424,11 @@ function Publish-CamoufoxMcpPatch([string]$ReleaseDir, [string]$DeployId, [hasht
             $mcpLive = $probe.ExitCode -eq 0 -and ($status -eq "200" -or $status -eq "206")
         }
         if ($mcpLive) {
+            if (-not $metadataCurrent) {
+                $currentVersion = if ($RemoteEnv.ContainsKey("AIDA_CAMOUFOX_MCP_VERSION")) { [string]$RemoteEnv["AIDA_CAMOUFOX_MCP_VERSION"] } else { (Get-Date -Format "yyyyMMddHHmmss") }
+                Write-Warn "Camoufox MCP executable unchanged; repairing slash-safe bootstrap metadata"
+                return [pscustomobject]@{ Changed = $true; Url = ""; PackageName = ""; Sha = ""; Size = 0; Version = $currentVersion; ExeRel = $inputs.ExeRel; PythonRel = $inputs.PythonRel; McpUrl = $currentUrl; McpPackageName = [IO.Path]::GetFileName($currentUrl); McpSha = $mcpSha; McpSize = [int64]$mcpSize; McpRel = $mcpRel }
+            }
             Write-Ok "Camoufox MCP patch unchanged: $mcpSha"
             return [pscustomobject]@{ Changed = $false; Url = ""; PackageName = ""; Sha = ""; Size = 0; Version = ""; ExeRel = $inputs.ExeRel; PythonRel = $inputs.PythonRel; McpUrl = $currentUrl; McpPackageName = [IO.Path]::GetFileName($currentUrl); McpSha = $mcpSha; McpSize = [int64]$mcpSize; McpRel = $mcpRel }
         }
@@ -502,11 +511,13 @@ function Update-CamoufoxMcpPatchMetadata([pscustomobject]$Sidecar) {
 set -euo pipefail
 cd /home/ruarr/aida-server
 cp .env ".env.bak.camoufox.__VERSION__"
-AIDA_NEW_CAMOUFOX_MCP_URL='__MCP_URL__' AIDA_NEW_CAMOUFOX_MCP_SHA256='__MCP_SHA__' AIDA_NEW_CAMOUFOX_MCP_VERSION='__VERSION__' AIDA_NEW_CAMOUFOX_MCP_SIZE='__MCP_SIZE__' AIDA_NEW_CAMOUFOX_MCP_REL='__MCP_REL__' node <<'NODE'
+AIDA_NEW_CAMOUFOX_MCP_URL='__MCP_URL__' AIDA_NEW_CAMOUFOX_MCP_SHA256='__MCP_SHA__' AIDA_NEW_CAMOUFOX_MCP_VERSION='__VERSION__' AIDA_NEW_CAMOUFOX_MCP_SIZE='__MCP_SIZE__' AIDA_NEW_CAMOUFOX_MCP_REL='__MCP_REL__' AIDA_NEW_CAMOUFOX_SIDECAR_EXE_REL='__EXE_REL__' AIDA_NEW_CAMOUFOX_SIDECAR_PYTHON_REL='__PYTHON_REL__' node <<'NODE'
 const fs = require('fs');
 const p = '.env';
 let s = fs.readFileSync(p, 'utf8');
 const updates = {
+  AIDA_CAMOUFOX_SIDECAR_EXE_REL: process.env.AIDA_NEW_CAMOUFOX_SIDECAR_EXE_REL,
+  AIDA_CAMOUFOX_SIDECAR_PYTHON_REL: process.env.AIDA_NEW_CAMOUFOX_SIDECAR_PYTHON_REL || '',
   AIDA_CAMOUFOX_MCP_URL: process.env.AIDA_NEW_CAMOUFOX_MCP_URL,
   AIDA_CAMOUFOX_MCP_SHA256: process.env.AIDA_NEW_CAMOUFOX_MCP_SHA256,
   AIDA_CAMOUFOX_MCP_VERSION: process.env.AIDA_NEW_CAMOUFOX_MCP_VERSION,
@@ -522,13 +533,15 @@ for (const pair of Object.entries(updates)) {
 }
 fs.writeFileSync(p, s, { mode: 0o600 });
 NODE
-awk -F= '/^AIDA_CAMOUFOX_MCP_URL=|^AIDA_CAMOUFOX_MCP_VERSION=|^AIDA_CAMOUFOX_MCP_SIZE=|^AIDA_CAMOUFOX_MCP_REL=/{print}' .env
+awk -F= '/^AIDA_CAMOUFOX_SIDECAR_EXE_REL=|^AIDA_CAMOUFOX_SIDECAR_PYTHON_REL=|^AIDA_CAMOUFOX_MCP_URL=|^AIDA_CAMOUFOX_MCP_VERSION=|^AIDA_CAMOUFOX_MCP_SIZE=|^AIDA_CAMOUFOX_MCP_REL=/{print}' .env
 '@
     $script = $script.Replace("__VERSION__", [string]$Sidecar.Version).
         Replace("__MCP_URL__", [string]$Sidecar.McpUrl).
         Replace("__MCP_SHA__", [string]$Sidecar.McpSha).
         Replace("__MCP_SIZE__", [string]$Sidecar.McpSize).
-        Replace("__MCP_REL__", [string]$Sidecar.McpRel)
+        Replace("__MCP_REL__", [string]$Sidecar.McpRel).
+        Replace("__EXE_REL__", [string]$Sidecar.ExeRel).
+        Replace("__PYTHON_REL__", [string]$Sidecar.PythonRel)
     $output = Invoke-RemoteBash $script
     foreach ($line in $output) {
         Write-Host "  $line"

@@ -602,7 +602,6 @@ static int idaapi finish_populating_widget_popup(
         "ai_assistant:copy_context",
         "ai_assistant:save_database_context",
         "ai_assistant:fix_analysis",
-        "ai_assistant:toggle_mcp",
     };
 
     const std::string menu_root = OBFSTR("AiDA/");
@@ -667,203 +666,63 @@ static int idaapi self_analysis_watchdog(void *)
     return 30000;
 }
 
-aida_plugin_t::aida_plugin_t()
+aida_plugin_t::aida_plugin_t(bool standalone_verified, const std::string& standalone_failure)
 {
-    ida_utils::compute_self_identity();
-
     msg(OBFSTR_C("--- Plugin Loading (v%s) ---\n"), AIDA_VERSION);
 
-#ifdef __NT__
-    if (!driver_loader::is_driver_loaded())
-        msg(OBFSTR_C("AiDA Driver: Warning - kernel driver trust state was lost after initialization.\n"));
-    if (!aida_ipc::start_standalone_watchdog())
-        msg(OBFSTR_C("AiDA standalone watchdog worker unavailable.\n"));
-#endif
-
-    g_settings.load(this);
-    aida_db::AnalysisDB::instance().load();
-    agent_tools::initialize_all_tools();
-    analysis_fixer::install_hexrays_fixups();
     register_actions();
-    hook_event_listener(HT_UI, &ui_listener);
 
-    if (g_settings.mcp_enabled)
-        start_mcp_server();
-
-    msg(OBFSTR_C("--- Plugin Loaded Successfully ---\n"));
-
-
-    std::string bin_hash = aida_db::AnalysisDB::instance().get_binary_hash();
-    if (!bin_hash.empty())
+    if (!standalone_verified)
     {
-        try
-        {
-            std::thread([bin_hash]() {
-                graphrag::load_graph(bin_hash);
-            }).detach();
-        }
-        catch (const std::exception& ex)
-        {
-            msg(OBFSTR_C("AiDA GraphRAG load worker unavailable: %s\n"), ex.what());
-        }
-        catch (...)
-        {
-            msg(OBFSTR_C("AiDA GraphRAG load worker unavailable.\n"));
-        }
+        set_disabled(std::string("AiDAStandalone.exe is not reachable or not authenticated: ")
+            + (standalone_failure.empty() ? "verification failed" : standalone_failure));
+        msg(OBFSTR_C("AiDA: plugin loaded in disabled mode. %s\n"), disabled_detail.c_str());
+        return;
     }
+
+    if (!initialize_operational(true))
+        msg(OBFSTR_C("AiDA: plugin loaded in disabled mode. %s\n"), disabled_detail.c_str());
 }
 
-aida_plugin_t::~aida_plugin_t()
+void aida_plugin_t::set_disabled(const std::string& reason)
+{
+    disabled_detail = reason.empty() ? std::string("standalone verification failed") : reason;
+    features_initialized = false;
+}
+
+bool aida_plugin_t::is_operational() const
+{
+    return features_initialized;
+}
+
+const std::string& aida_plugin_t::disabled_reason() const
+{
+    return disabled_detail;
+}
+
+bool aida_plugin_t::ensure_operational(bool interactive)
+{
+    if (features_initialized)
+        return true;
+    return initialize_operational(interactive);
+}
+
+bool aida_plugin_t::initialize_operational(bool interactive)
 {
 #ifdef __NT__
-    aida_ipc::shutdown();
-#endif
-
-    std::string bin_hash = aida_db::AnalysisDB::instance().get_binary_hash();
-    if (!bin_hash.empty())
-        graphrag::save_graph(bin_hash);
-    aida_db::AnalysisDB::instance().save();
-
-    stop_mcp_server();
-    ::unhook_event_listener(HT_UI, &ui_listener);
-    analysis_fixer::uninstall_hexrays_fixups();
-    unregister_actions();
-    msg(OBFSTR_C("--- Plugin has been unloaded ---\n"));
-}
-
-bool idaapi aida_plugin_t::run(size_t)
-{
-    auto& license = license_manager_t::instance();
-    if (!license.is_valid() || license.get_runtime_nonce() == 0)
-    {
-        warning(OBFSTR_C("License validation failed. Please restart IDA and enter a valid license key."));
-        return false;
-    }
-
-    info(OBFSTR_C("Plugin is active. Use the right-click context menu in a code view or the Tools menu."));
-    return true;
-}
-
-void aida_plugin_t::start_mcp_server()
-{
-    if (!g_settings.mcp_enabled)
-        return;
-
-    if (ida_utils::is_self_target_database())
-    {
-        msg(OBFSTR_C("MCP: disabled while AiDA itself is the active analysis target.\n"));
-        return;
-    }
-
-    if (mcp_server && mcp_server->is_running())
-        return;
-
-    mcp_server = std::make_unique<mcp_server_t>();
-    if (!mcp_server->start(g_settings.mcp_port))
-    {
-        msg(OBFSTR_C("MCP: Could not start server on port %d.\n"), g_settings.mcp_port);
-        mcp_server.reset();
-        return;
-    }
-
-    mcp_server->write_mcp_client_configs();
-}
-
-void aida_plugin_t::stop_mcp_server()
-{
-    if (mcp_server)
-    {
-        mcp_server->stop();
-        mcp_server.reset();
-    }
-}
-
-void aida_plugin_t::toggle_mcp_server()
-{
-    if (mcp_server && mcp_server->is_running())
-    {
-        stop_mcp_server();
-        g_settings.mcp_enabled = false;
-        g_settings.save();
-        msg(OBFSTR_C("MCP: Server stopped and disabled.\n"));
-    }
-    else
-    {
-        g_settings.mcp_enabled = true;
-        g_settings.save();
-        start_mcp_server();
-    }
-}
-
-void aida_plugin_t::register_actions()
-{
-    struct rt_action_def_t {
-        std::string name;
-        std::string label;
-        action_handler::action_func_t handler;
-        const char* shortcut;
-    };
-
-    const rt_action_def_t action_definitions[] = {
-        {OBFSTR("ai_assistant:copy_context"), OBFSTR("Copy function contents"), handle_copy_context, "Ctrl+Alt+X"},
-        {OBFSTR("ai_assistant:save_database_context"), OBFSTR("Save database context to file..."), handle_save_database_context, ""},
-        {OBFSTR("ai_assistant:fix_analysis"), OBFSTR("Fix Analysis (Clean Decompilation)"), handle_fix_analysis, "Ctrl+Alt+F"},
-        {OBFSTR("ai_assistant:toggle_mcp"), OBFSTR("Start MCP Server"), handle_toggle_mcp, ""},
-    };
-
-    const std::string menu_root = OBFSTR("AiDA/");
-
-    for (const auto& def : action_definitions)
-    {
-        actions_list.push_back() = def.name.c_str();
-        action_desc_t adesc = ACTION_DESC_LITERAL_PLUGMOD(
-            def.name.c_str(),
-            def.label.c_str(),
-            new action_handler(def.handler, this),
-            this,
-            def.shortcut,
-            nullptr,
-            -1);
-        adesc.flags |= ADF_OWN_HANDLER;
-
-        if (!register_action(adesc))
-        {
-            msg(OBFSTR_C("Failed to register action %s\n"), def.name.c_str());
-            continue;
-        }
-        attach_action_to_menu(menu_root.c_str(), def.name.c_str(), SETMENU_APP);
-    }
-}
-
-void aida_plugin_t::unregister_actions()
-{
-    for (const auto& action_name : actions_list)
-    {
-        unregister_action(action_name.c_str());
-    }
-    actions_list.clear();
-}
-
-static plugmod_t* idaapi init()
-{
-#ifdef __NT__
-    if (!has_expected_plugin_filename())
-    {
-        msg(OBFSTR_C("AiDA: plugin filename mismatch. Expected exact name: AiDA.dll\n"));
-        return PLUGIN_SKIP;
-    }
-
-    plugin_vm_guard();
-    plugin_kd_test_signing_guard();
-
     std::string standalone_failure;
     if (!aida_ipc::verify_standalone_runtime(&standalone_failure))
     {
-        msg(OBFSTR_C("AiDA: AiDAStandalone.exe must be running, authenticated, and ARC-verified before AiDA.dll can load. detail=%s\n"),
-            standalone_failure.empty() ? "verification failed" : standalone_failure.c_str());
-        __fastfail(0xA1DA1DA1u);
-        return PLUGIN_SKIP;
+        set_disabled(std::string("AiDAStandalone.exe must be running, authenticated, and ARC-verified. detail=")
+            + (standalone_failure.empty() ? "verification failed" : standalone_failure));
+        if (interactive)
+            warning(OBFSTR_C("AiDA is disabled: %s"), disabled_detail.c_str());
+        else
+            msg(OBFSTR_C("AiDA: %s\n"), disabled_detail.c_str());
+        return false;
     }
+    if (!aida_ipc::start_standalone_watchdog())
+        msg(OBFSTR_C("AiDA standalone watchdog worker unavailable.\n"));
 #endif
 
     g_settings.load_from_file();
@@ -872,8 +731,9 @@ static plugmod_t* idaapi init()
     {
         if (!show_eula_dialog())
         {
-            msg(OBFSTR_C("AiDA: End User License Agreement was declined. Plugin will not load.\n"));
-            return PLUGIN_SKIP;
+            set_disabled("End User License Agreement was declined");
+            msg(OBFSTR_C("AiDA: End User License Agreement was declined. Plugin remains disabled.\n"));
+            return false;
         }
         g_settings.eula_accepted = true;
         g_settings.save();
@@ -882,19 +742,25 @@ static plugmod_t* idaapi init()
 #ifdef __NT__
     if (!driver_loader::initialize_and_load())
     {
-        msg(OBFSTR_C("AiDA: kernel driver attestation is required and could not be initialized.\n"));
-        return PLUGIN_SKIP;
+        set_disabled("kernel driver attestation is required and could not be initialized");
+        msg(OBFSTR_C("AiDA: %s.\n"), disabled_detail.c_str());
+        return false;
     }
+
+    if (!driver_loader::is_driver_loaded())
+        msg(OBFSTR_C("AiDA Driver: Warning - kernel driver trust state was lost after initialization.\n"));
 
     if (!anti_re::initialize())
         msg(OBFSTR_C("AiDA: kernel-backed runtime attestation warm-up failed; runtime checks will retry on demand.\n"));
 #endif
 
-
     ida_utils::compute_self_identity();
     if (ida_utils::is_self_target_database())
-        return PLUGIN_SKIP;
-
+    {
+        set_disabled("disabled while AiDA itself is the active analysis target");
+        msg(OBFSTR_C("AiDA: %s.\n"), disabled_detail.c_str());
+        return false;
+    }
 
     try
     {
@@ -908,8 +774,6 @@ static plugmod_t* idaapi init()
     {
         msg(OBFSTR_C("AiDA public IP worker unavailable.\n"));
     }
-
-    register_timer(10000, self_analysis_watchdog, nullptr);
 
     auto& license = license_manager_t::instance();
 
@@ -937,8 +801,9 @@ static plugmod_t* idaapi init()
 
         if (!activated || !license.is_valid())
         {
-            msg(OBFSTR_C("Plugin requires a valid license to operate.\n"));
-            return PLUGIN_SKIP;
+            set_disabled("Plugin requires a valid license to operate");
+            msg(OBFSTR_C("AiDA: %s.\n"), disabled_detail.c_str());
+            return false;
         }
     }
 
@@ -958,7 +823,205 @@ static plugmod_t* idaapi init()
     anti_re::arm_destructive_enforcement();
 #endif
 
-    return new aida_plugin_t();
+    g_settings.load(this);
+    aida_db::AnalysisDB::instance().load();
+    agent_tools::initialize_all_tools();
+
+    g_settings.mcp_enabled = true;
+    g_settings.save();
+
+    if (!start_mcp_server())
+    {
+        set_disabled("MCP server could not start");
+        return false;
+    }
+
+    analysis_fixer::install_hexrays_fixups();
+    if (hook_event_listener(HT_UI, &ui_listener))
+        ui_listener_hooked = true;
+
+    register_timer(10000, self_analysis_watchdog, nullptr);
+
+    features_initialized = true;
+    disabled_detail.clear();
+
+    msg(OBFSTR_C("--- Plugin Loaded Successfully ---\n"));
+
+    std::string bin_hash = aida_db::AnalysisDB::instance().get_binary_hash();
+    if (!bin_hash.empty())
+    {
+        try
+        {
+            std::thread([bin_hash]() {
+                graphrag::load_graph(bin_hash);
+            }).detach();
+        }
+        catch (const std::exception& ex)
+        {
+            msg(OBFSTR_C("AiDA GraphRAG load worker unavailable: %s\n"), ex.what());
+        }
+        catch (...)
+        {
+            msg(OBFSTR_C("AiDA GraphRAG load worker unavailable.\n"));
+        }
+    }
+
+    return true;
+}
+
+aida_plugin_t::~aida_plugin_t()
+{
+#ifdef __NT__
+    aida_ipc::shutdown();
+#endif
+
+    if (features_initialized)
+    {
+        std::string bin_hash = aida_db::AnalysisDB::instance().get_binary_hash();
+        if (!bin_hash.empty())
+            graphrag::save_graph(bin_hash);
+        aida_db::AnalysisDB::instance().save();
+
+        stop_mcp_server();
+        if (ui_listener_hooked)
+            ::unhook_event_listener(HT_UI, &ui_listener);
+        analysis_fixer::uninstall_hexrays_fixups();
+    }
+    unregister_actions();
+    msg(OBFSTR_C("--- Plugin has been unloaded ---\n"));
+}
+
+bool idaapi aida_plugin_t::run(size_t)
+{
+    if (!ensure_operational(true))
+    {
+        warning(OBFSTR_C("AiDA is loaded but disabled: %s"), disabled_detail.c_str());
+        return false;
+    }
+
+    auto& license = license_manager_t::instance();
+    if (!license.is_valid() || license.get_runtime_nonce() == 0)
+    {
+        warning(OBFSTR_C("License validation failed. Please restart IDA and enter a valid license key."));
+        return false;
+    }
+
+    info(OBFSTR_C("Plugin is active. Use the right-click context menu in a code view or the Tools menu."));
+    return true;
+}
+
+bool aida_plugin_t::start_mcp_server()
+{
+    if (ida_utils::is_self_target_database())
+    {
+        msg(OBFSTR_C("MCP: disabled while AiDA itself is the active analysis target.\n"));
+        return false;
+    }
+
+    if (mcp_server && mcp_server->is_running())
+        return true;
+
+    mcp_server = std::make_unique<mcp_server_t>();
+    if (!mcp_server->start(g_settings.mcp_port))
+    {
+        msg(OBFSTR_C("MCP: Could not start server on port %d.\n"), g_settings.mcp_port);
+        mcp_server.reset();
+        return false;
+    }
+
+    mcp_server->write_mcp_client_configs();
+    return true;
+}
+
+void aida_plugin_t::stop_mcp_server()
+{
+    if (mcp_server)
+    {
+        mcp_server->stop();
+        mcp_server.reset();
+    }
+}
+
+void aida_plugin_t::register_actions()
+{
+    if (actions_registered)
+        return;
+
+    struct rt_action_def_t {
+        std::string name;
+        std::string label;
+        action_handler::action_func_t handler;
+        const char* shortcut;
+    };
+
+    const rt_action_def_t action_definitions[] = {
+        {OBFSTR("ai_assistant:copy_context"), OBFSTR("Copy function contents"), handle_copy_context, "Ctrl+Alt+X"},
+        {OBFSTR("ai_assistant:save_database_context"), OBFSTR("Save database context to file..."), handle_save_database_context, ""},
+        {OBFSTR("ai_assistant:fix_analysis"), OBFSTR("Fix Analysis (Clean Decompilation)"), handle_fix_analysis, "Ctrl+Alt+F"},
+    };
+
+    const std::string menu_root = OBFSTR("AiDA/");
+
+    for (const auto& def : action_definitions)
+    {
+        actions_list.push_back() = def.name.c_str();
+        action_desc_t adesc = ACTION_DESC_LITERAL_PLUGMOD(
+            def.name.c_str(),
+            def.label.c_str(),
+            new action_handler(def.handler, this),
+            this,
+            def.shortcut,
+            nullptr,
+            -1);
+        adesc.flags |= ADF_OWN_HANDLER;
+
+        if (!register_action(adesc))
+        {
+            msg(OBFSTR_C("Failed to register action %s\n"), def.name.c_str());
+            continue;
+        }
+        attach_action_to_menu(menu_root.c_str(), def.name.c_str(), SETMENU_APP);
+    }
+    actions_registered = true;
+}
+
+void aida_plugin_t::unregister_actions()
+{
+    if (!actions_registered)
+        return;
+
+    for (const auto& action_name : actions_list)
+    {
+        unregister_action(action_name.c_str());
+    }
+    actions_list.clear();
+    actions_registered = false;
+}
+
+static plugmod_t* idaapi init()
+{
+    std::string standalone_failure;
+    bool standalone_verified = true;
+
+#ifdef __NT__
+    if (!has_expected_plugin_filename())
+    {
+        msg(OBFSTR_C("AiDA: plugin filename mismatch. Expected exact name: AiDA.dll\n"));
+        return PLUGIN_SKIP;
+    }
+
+    plugin_vm_guard();
+    plugin_kd_test_signing_guard();
+
+    standalone_verified = aida_ipc::verify_standalone_runtime(&standalone_failure);
+    if (!standalone_verified)
+    {
+        msg(OBFSTR_C("AiDA: standalone verification failed; plugin will load disabled. detail=%s\n"),
+            standalone_failure.empty() ? "verification failed" : standalone_failure.c_str());
+    }
+#endif
+
+    return new aida_plugin_t(standalone_verified, standalone_failure);
 }
 
 plugin_t PLUGIN =

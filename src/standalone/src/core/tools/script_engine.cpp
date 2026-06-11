@@ -11,12 +11,16 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <utility>
+#include <vector>
 
 namespace script_engine {
 
@@ -479,36 +483,158 @@ static std::string format_lua_number(double value) {
     return std::string(buf);
 }
 
-template <typename LuaValue>
-static std::string lua_value_to_string(const LuaValue& v) {
-    switch (v.get_type()) {
-        case sol::type::string: {
-            sol::optional<std::string> s = v.as<sol::optional<std::string>>();
-            return s ? *s : std::string();
+static std::string lua_escape_string(const char* data, size_t len) {
+    std::string out;
+    out.reserve(len + 2);
+    out.push_back('"');
+    for (size_t i = 0; i < len; ++i) {
+        unsigned char ch = static_cast<unsigned char>(data[i]);
+        switch (ch) {
+            case '\\': out += "\\\\"; break;
+            case '"':  out += "\\\""; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            case '\b': out += "\\b"; break;
+            case '\f': out += "\\f"; break;
+            default:
+                if (ch < 0x20) {
+                    char buf[5];
+                    snprintf(buf, sizeof(buf), "\\x%02X", static_cast<unsigned int>(ch));
+                    out += buf;
+                } else {
+                    out.push_back(static_cast<char>(ch));
+                }
+                break;
         }
-        case sol::type::number: {
-            sol::optional<double> d = v.as<sol::optional<double>>();
-            return d ? format_lua_number(*d) : std::string("0");
+    }
+    out.push_back('"');
+    return out;
+}
+
+static bool lua_simple_key(const char* data, size_t len) {
+    if (!data || len == 0)
+        return false;
+    unsigned char first = static_cast<unsigned char>(data[0]);
+    if (!(std::isalpha(first) || first == '_'))
+        return false;
+    for (size_t i = 1; i < len; ++i) {
+        unsigned char ch = static_cast<unsigned char>(data[i]);
+        if (!(std::isalnum(ch) || ch == '_'))
+            return false;
+    }
+    return true;
+}
+
+static const char* lua_type_name(lua_State* L, int index) {
+    const char* name = lua_typename(L, lua_type(L, index));
+    return name ? name : "unknown";
+}
+
+static std::string lua_value_to_string_at(lua_State* L, int index, int depth,
+                                          std::vector<const void*>& seen,
+                                          bool quote_strings);
+
+static std::string lua_key_to_string_at(lua_State* L, int index, int depth,
+                                        std::vector<const void*>& seen) {
+    int type = lua_type(L, index);
+    if (type == LUA_TSTRING) {
+        size_t len = 0;
+        const char* data = lua_tolstring(L, index, &len);
+        if (lua_simple_key(data, len))
+            return std::string(data, len);
+        return "[" + lua_escape_string(data ? data : "", len) + "]";
+    }
+    return "[" + lua_value_to_string_at(L, index, depth, seen, true) + "]";
+}
+
+static std::string lua_table_to_string_at(lua_State* L, int index, int depth,
+                                          std::vector<const void*>& seen) {
+    if (depth >= 6)
+        return "{...}";
+    int abs_index = lua_absindex(L, index);
+    const void* ptr = lua_topointer(L, abs_index);
+    if (ptr) {
+        if (std::find(seen.begin(), seen.end(), ptr) != seen.end())
+            return "{...}";
+        seen.push_back(ptr);
+    }
+    std::string out = "{";
+    bool first = true;
+    int emitted = 0;
+    lua_pushnil(L);
+    while (lua_next(L, abs_index) != 0) {
+        if (emitted >= 64) {
+            if (!first)
+                out += ", ";
+            out += "...";
+            lua_pop(L, 2);
+            break;
         }
-        case sol::type::boolean: {
-            sol::optional<bool> b = v.as<sol::optional<bool>>();
-            return (b && *b) ? std::string("true") : std::string("false");
+        int key_index = lua_absindex(L, -2);
+        int value_index = lua_absindex(L, -1);
+        if (!first)
+            out += ", ";
+        out += lua_key_to_string_at(L, key_index, depth + 1, seen);
+        out += "=";
+        out += lua_value_to_string_at(L, value_index, depth + 1, seen, true);
+        first = false;
+        ++emitted;
+        lua_pop(L, 1);
+    }
+    if (ptr)
+        seen.pop_back();
+    out += "}";
+    return out;
+}
+
+static std::string lua_value_to_string_at(lua_State* L, int index, int depth,
+                                          std::vector<const void*>& seen,
+                                          bool quote_strings) {
+    switch (lua_type(L, index)) {
+        case LUA_TSTRING: {
+            size_t len = 0;
+            const char* data = lua_tolstring(L, index, &len);
+            if (!data)
+                return std::string();
+            return quote_strings ? lua_escape_string(data, len) : std::string(data, len);
         }
-        case sol::type::lua_nil:
-        case sol::type::none:
+        case LUA_TNUMBER:
+            if (lua_isinteger(L, index)) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(lua_tointeger(L, index)));
+                return std::string(buf);
+            }
+            return format_lua_number(static_cast<double>(lua_tonumber(L, index)));
+        case LUA_TBOOLEAN:
+            return lua_toboolean(L, index) ? std::string("true") : std::string("false");
+        case LUA_TNIL:
+        case LUA_TNONE:
             return std::string("nil");
-        case sol::type::table:
-            return std::string("table");
-        case sol::type::function:
+        case LUA_TTABLE:
+            return lua_table_to_string_at(L, index, depth, seen);
+        case LUA_TFUNCTION:
             return std::string("function");
-        case sol::type::thread:
+        case LUA_TTHREAD:
             return std::string("thread");
-        case sol::type::userdata:
-        case sol::type::lightuserdata:
+        case LUA_TUSERDATA:
+        case LUA_TLIGHTUSERDATA:
             return std::string("userdata");
         default:
-            return std::string("value");
+            return std::string(lua_type_name(L, index));
     }
+}
+
+template <typename LuaValue>
+static std::string lua_value_to_string(const LuaValue& v) {
+    lua_State* L = v.lua_state();
+    if (!L)
+        return std::string("nil");
+    int pushed = v.push();
+    std::vector<const void*> seen;
+    std::string out = lua_value_to_string_at(L, -1, 0, seen, false);
+    lua_pop(L, pushed);
+    return out;
 }
 
 static int hook_type_index(const std::string& name) {
@@ -1054,16 +1180,80 @@ size_t registered_hook_count() {
 }
 
 
-static std::string stringify_result(const sol::protected_function_result& result) {
-    int count = result.return_count();
-    if (count <= 0) return std::string();
-    std::string out;
-    for (int i = 0; i < count; ++i) {
-        sol::object obj = result.get<sol::object>(i);
-        if (i > 0) out += "\t";
-        out += lua_value_to_string(obj);
+static bool starts_with_lua_return_keyword(const std::string& text) {
+    if (text.size() < 6 || text.compare(0, 6, "return") != 0)
+        return false;
+    if (text.size() == 6)
+        return true;
+    unsigned char next = static_cast<unsigned char>(text[6]);
+    return !(std::isalnum(next) || next == '_');
+}
+
+struct lua_console_result {
+    bool ok = false;
+    bool load_error = false;
+    int return_count = 0;
+    std::string first_type;
+    std::string output;
+    std::string error;
+};
+
+static std::string lua_error_to_string(lua_State* L, int index) {
+    size_t len = 0;
+    const char* data = lua_tolstring(L, index, &len);
+    if (data)
+        return std::string(data, len);
+    return std::string(lua_type_name(L, index));
+}
+
+static lua_console_result execute_lua_chunk(sol::state& lua, const std::string& chunk) {
+    lua_console_result result;
+    lua_State* L = lua.lua_state();
+    if (!L) {
+        result.error = "engine not initialized";
+        return result;
     }
-    return out;
+
+    int base = lua_gettop(L);
+    try {
+        int load_status = luaL_loadbufferx(L, chunk.data(), chunk.size(), "=(console)", "t");
+        if (load_status != LUA_OK) {
+            result.load_error = true;
+            result.error = lua_error_to_string(L, -1);
+            lua_settop(L, base);
+            return result;
+        }
+
+        int call_status = lua_pcall(L, 0, LUA_MULTRET, 0);
+        if (call_status != LUA_OK) {
+            result.error = lua_error_to_string(L, -1);
+            lua_settop(L, base);
+            return result;
+        }
+
+        int top = lua_gettop(L);
+        result.return_count = top - base;
+        if (result.return_count > 0)
+            result.first_type = lua_type_name(L, base + 1);
+
+        std::vector<const void*> seen;
+        for (int i = 0; i < result.return_count; ++i) {
+            if (i > 0)
+                result.output += "\t";
+            result.output += lua_value_to_string_at(L, base + 1 + i, 0, seen, false);
+        }
+        lua_settop(L, base);
+        result.ok = true;
+        return result;
+    } catch (const std::exception& ex) {
+        lua_settop(L, base);
+        result.error = ex.what();
+        return result;
+    } catch (...) {
+        lua_settop(L, base);
+        result.error = "unknown C++ exception during script execution";
+        return result;
+    }
 }
 
 std::string execute(const std::string& code) {
@@ -1086,39 +1276,31 @@ std::string execute(const std::string& code) {
     current_script_context = "console";
     add_log("console", log_level::command, trimmed);
 
-    sol::load_result expr_chunk = g_lua->load("return " + trimmed);
-    bool used_expr = expr_chunk.valid();
-
-    sol::protected_function_result result;
-    if (used_expr) {
-        sol::protected_function expr_fn = expr_chunk;
-        result = expr_fn();
+    lua_console_result result;
+    if (starts_with_lua_return_keyword(trimmed)) {
+        result = execute_lua_chunk(*g_lua, trimmed);
     } else {
-        sol::load_result stmt_chunk = g_lua->load(trimmed);
-        if (!stmt_chunk.valid()) {
-            sol::error err = stmt_chunk;
-            std::string msg = std::string("[error: ") + err.what() + "]";
-            add_log("console", log_level::error, msg);
-            current_script_context = saved_context;
-            return msg;
+        lua_console_result expr_result = execute_lua_chunk(*g_lua, "return " + trimmed);
+        if (expr_result.ok || !expr_result.load_error) {
+            result = std::move(expr_result);
+        } else {
+            result = execute_lua_chunk(*g_lua, trimmed);
         }
-        sol::protected_function stmt_fn = stmt_chunk;
-        result = stmt_fn();
     }
 
-    if (!result.valid()) {
-        sol::error err = result;
-        std::string msg = std::string("[error: ") + err.what() + "]";
+    if (!result.ok) {
+        std::string msg = std::string("[error: ") + result.error + "]";
         add_log("console", log_level::error, msg);
         current_script_context = saved_context;
         return msg;
     }
 
-    std::string out = stringify_result(result);
+    std::string out = result.output;
     if (!out.empty())
         add_log("console", log_level::output, out);
 
-    diag::log_tagged_fmt("script_eng", "execute ok out_len=%zu", out.size());
+    diag::log_tagged_fmt("script_eng", "execute ok returns=%d first_type=%s out_len=%zu",
+        result.return_count, result.first_type.c_str(), out.size());
     current_script_context = saved_context;
     return out;
 }

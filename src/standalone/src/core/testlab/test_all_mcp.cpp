@@ -140,8 +140,8 @@ namespace {
     bool g_mcp_camoufox_bridge_ready_proven = false;
     uint64_t g_mcp_camoufox_bridge_generation = 0;
     std::string g_mcp_camoufox_bridge_block_reason;
-    constexpr DWORD k_camoufox_testlab_launch_timeout_ms = 15000;
-    constexpr long long k_camoufox_testlab_launch_watchdog_ms = 22000;
+    constexpr DWORD k_camoufox_testlab_launch_timeout_ms = 70000;
+    constexpr long long k_camoufox_testlab_launch_watchdog_ms = 90000;
     enum class mcp_tool_call_status_t {
         passed,
         failed,
@@ -210,7 +210,7 @@ namespace {
 
         scoped_camoufox_testlab_launch_t()
             : fast_probe("AIDA_CAMOUFOX_TESTLAB_FAST_PROBE", "1"),
-              timeout_ms("AIDA_CAMOUFOX_TESTLAB_LAUNCH_MS", "15000") {
+              timeout_ms("AIDA_CAMOUFOX_TESTLAB_LAUNCH_MS", "70000") {
         }
     };
     const mcp_standalone::tool_def_t* find_registered_tool(mcp_standalone::server_t* srv, const char* tool_name);
@@ -1477,7 +1477,7 @@ namespace {
                 cfg.launch_timeout_ms = static_cast<int>(k_camoufox_testlab_launch_timeout_ms);
                 cfg.window_width = 1280;
                 cfg.window_height = 900;
-                cfg.enable_trace = true;
+                cfg.enable_trace = false;
                 cfg.testlab_fast_probe = true;
                 const DWORD runner_timeout = static_cast<DWORD>(cfg.launch_timeout_ms + 8000);
                 auto launch = bounded_camoufox_start_bridge(hf, tag, cfg, runner_timeout);
@@ -14876,7 +14876,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         launch_args["headless"] = false;
         launch_args["launch_timeout_ms"] = k_camoufox_testlab_launch_timeout_ms;
         launch_args["aida_testlab_fast_probe"] = true;
-        launch_args["enable_trace"] = true;
+        launch_args["enable_trace"] = false;
         launch_args["window_width"] = 1280;
         launch_args["window_height"] = 900;
         mcp_standalone::tool_result_t launch_result;

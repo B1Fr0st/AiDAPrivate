@@ -19,7 +19,6 @@ struct action_handler : public action_handler_t
 void handle_copy_context(action_activation_ctx_t* ctx, aida_plugin_t* plugin);
 void handle_save_database_context(action_activation_ctx_t* ctx, aida_plugin_t* plugin);
 void handle_fix_analysis(action_activation_ctx_t* ctx, aida_plugin_t* plugin);
-void handle_toggle_mcp(action_activation_ctx_t* ctx, aida_plugin_t* plugin);
 
 namespace analysis_fixer {
     bool install_hexrays_fixups();

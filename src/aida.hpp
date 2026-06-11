@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <string>
 #include <vector>
 
 #include <ida.hpp>
@@ -25,15 +26,24 @@ public:
     ui_event_listener_t ui_listener;
     std::unique_ptr<mcp_server_t> mcp_server;
 
-    aida_plugin_t();
+    aida_plugin_t(bool standalone_verified, const std::string& standalone_failure);
     ~aida_plugin_t() override;
 
     bool idaapi run(size_t arg) override;
-    void start_mcp_server();
+    bool start_mcp_server();
     void stop_mcp_server();
-    void toggle_mcp_server();
+    bool ensure_operational(bool interactive);
+    bool is_operational() const;
+    const std::string& disabled_reason() const;
 
 private:
     void register_actions();
     void unregister_actions();
+    void set_disabled(const std::string& reason);
+    bool initialize_operational(bool interactive);
+
+    bool features_initialized = false;
+    bool ui_listener_hooked = false;
+    bool actions_registered = false;
+    std::string disabled_detail;
 };

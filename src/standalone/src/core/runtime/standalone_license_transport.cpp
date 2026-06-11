@@ -106,6 +106,34 @@ winhttp_api_t g_api;
 pin_state_t g_pins;
 pubkey_provider_fn g_pubkey_provider = nullptr;
 
+const char* winhttp_error_name(DWORD gle) noexcept
+{
+    switch (gle) {
+    case ERROR_WINHTTP_TIMEOUT:
+        return "ERROR_WINHTTP_TIMEOUT";
+    case ERROR_WINHTTP_NAME_NOT_RESOLVED:
+        return "ERROR_WINHTTP_NAME_NOT_RESOLVED";
+    case ERROR_WINHTTP_CANNOT_CONNECT:
+        return "ERROR_WINHTTP_CANNOT_CONNECT";
+    case ERROR_WINHTTP_CONNECTION_ERROR:
+        return "ERROR_WINHTTP_CONNECTION_ERROR";
+    case ERROR_WINHTTP_SECURE_FAILURE:
+        return "ERROR_WINHTTP_SECURE_FAILURE";
+    default:
+        return "WINHTTP_ERROR";
+    }
+}
+
+std::string format_winhttp_error(const char* stage, DWORD gle)
+{
+    char buf[160];
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%s gle=%lu name=%s",
+        stage ? stage : "winhttp_failed",
+        static_cast<unsigned long>(gle),
+        winhttp_error_name(gle));
+    return std::string(buf);
+}
+
 void trans_log(const char* step)
 {
     static char s_log_path[MAX_PATH] = {};
@@ -581,9 +609,10 @@ bool send_once(const winhttp_api_t& api,
                                      WINHTTP_NO_PROXY_BYPASS,
                                      0);
     if (!h_session) {
-        last_error = "winhttp_open_failed";
+        const DWORD gle = GetLastError();
+        last_error = format_winhttp_error("winhttp_open_failed", gle);
         trans_log_fmt("send_once_open_session_failed gle=%lu elapsed_ms=%llu",
-            static_cast<unsigned long>(GetLastError()),
+            static_cast<unsigned long>(gle),
             static_cast<unsigned long long>(GetTickCount64() - t0));
         return false;
     }
@@ -613,9 +642,10 @@ bool send_once(const winhttp_api_t& api,
     HINTERNET h_connect = api.p_connect(h_session, wired_host.c_str(),
                                         INTERNET_DEFAULT_HTTPS_PORT, 0);
     if (!h_connect) {
-        last_error = "winhttp_connect_failed";
+        const DWORD gle = GetLastError();
+        last_error = format_winhttp_error("winhttp_connect_failed", gle);
         trans_log_fmt("send_once_connect_failed gle=%lu elapsed_ms=%llu",
-            static_cast<unsigned long>(GetLastError()),
+            static_cast<unsigned long>(gle),
             static_cast<unsigned long long>(GetTickCount64() - t0));
         api.p_close_handle(h_session);
         return false;
@@ -633,9 +663,10 @@ bool send_once(const winhttp_api_t& api,
                                          WINHTTP_DEFAULT_ACCEPT_TYPES,
                                          WINHTTP_FLAG_SECURE);
     if (!h_req) {
-        last_error = "winhttp_open_request_failed";
+        const DWORD gle = GetLastError();
+        last_error = format_winhttp_error("winhttp_open_request_failed", gle);
         trans_log_fmt("send_once_open_request_failed gle=%lu elapsed_ms=%llu",
-            static_cast<unsigned long>(GetLastError()),
+            static_cast<unsigned long>(gle),
             static_cast<unsigned long long>(GetTickCount64() - t0));
         api.p_close_handle(h_connect);
         api.p_close_handle(h_session);
@@ -685,7 +716,7 @@ bool send_once(const winhttp_api_t& api,
 
     if (!send_ok) {
         trans_log_fmt("send_failed gle=%lu", static_cast<unsigned long>(send_gle));
-        last_error = "winhttp_send_failed";
+        last_error = format_winhttp_error("winhttp_send_failed", send_gle);
         api.p_close_handle(h_req);
         api.p_close_handle(h_connect);
         api.p_close_handle(h_session);
@@ -705,7 +736,7 @@ bool send_once(const winhttp_api_t& api,
 
     if (!recv_ok) {
         trans_log_fmt("recv_failed gle=%lu", static_cast<unsigned long>(recv_gle));
-        last_error = "winhttp_recv_failed";
+        last_error = format_winhttp_error("winhttp_recv_failed", recv_gle);
         api.p_close_handle(h_req);
         api.p_close_handle(h_connect);
         api.p_close_handle(h_session);
@@ -717,9 +748,10 @@ bool send_once(const winhttp_api_t& api,
     trans_log_fmt("send_once_phase=query_cert elapsed_ms=%llu",
         static_cast<unsigned long long>(GetTickCount64() - t0));
     if (!api.p_query_option(h_req, WINHTTP_OPTION_SERVER_CERT_CONTEXT, &leaf_cert, &cert_size) || !leaf_cert) {
-        last_error = "winhttp_cert_query_failed";
+        const DWORD gle = GetLastError();
+        last_error = format_winhttp_error("winhttp_cert_query_failed", gle);
         trans_log_fmt("send_once_cert_query_failed gle=%lu cert_size=%lu elapsed_ms=%llu",
-            static_cast<unsigned long>(GetLastError()), static_cast<unsigned long>(cert_size),
+            static_cast<unsigned long>(gle), static_cast<unsigned long>(cert_size),
             static_cast<unsigned long long>(GetTickCount64() - t0));
         api.p_close_handle(h_req);
         api.p_close_handle(h_connect);
@@ -761,7 +793,7 @@ bool send_once(const winhttp_api_t& api,
                              WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
                              WINHTTP_HEADER_NAME_BY_INDEX,
                              &status_code, &scode_size, WINHTTP_NO_HEADER_INDEX)) {
-        last_error = "winhttp_status_query_failed";
+        last_error = format_winhttp_error("winhttp_status_query_failed", GetLastError());
         api.p_close_handle(h_req);
         api.p_close_handle(h_connect);
         api.p_close_handle(h_session);

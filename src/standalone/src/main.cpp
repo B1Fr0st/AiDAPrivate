@@ -2262,6 +2262,11 @@ static LONG CALLBACK aida_diagnostic_veh(EXCEPTION_POINTERS* ep)
 {
     if (!ep || !ep->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
     DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code == STATUS_SINGLE_STEP &&
+        anti_tamper::anti_dump::read_intercept::consume_pending_single_step(ep, "diagnostic_veh"))
+    {
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     if (code == 0x40010006u || code == 0x4001000Au || code == DBG_PRINTEXCEPTION_C ||
         code == DBG_PRINTEXCEPTION_WIDE_C ||
         code == 0x406D1388u ||
@@ -2341,6 +2346,10 @@ static void log_fileless_startup_state(const char* phase)
     char fileless[32] = {};
     char no_disk[32] = {};
     char payload_trace[32] = {};
+    char camoufox_exe[MAX_PATH] = {};
+    char camoufox_mcp[MAX_PATH] = {};
+    char camoufox_python[MAX_PATH] = {};
+    char camoufox_setup[32] = {};
     GetModuleFileNameA(nullptr, module, static_cast<DWORD>(sizeof(module)));
     GetCurrentDirectoryA(static_cast<DWORD>(sizeof(cwd)), cwd);
     GetEnvironmentVariableA("AIDA_FILELESS_LAUNCH", fileless, static_cast<DWORD>(sizeof(fileless)));
@@ -2351,6 +2360,10 @@ static void log_fileless_startup_state(const char* phase)
     GetEnvironmentVariableA("AIDA_FILELESS_IMAGE_BASE", mapped_base, static_cast<DWORD>(sizeof(mapped_base)));
     GetEnvironmentVariableA("AIDA_FILELESS_IMAGE_SIZE", mapped_size, static_cast<DWORD>(sizeof(mapped_size)));
     GetEnvironmentVariableA("AIDA_FILELESS_ENTRY_RVA", entry_rva, static_cast<DWORD>(sizeof(entry_rva)));
+    GetEnvironmentVariableA("AIDA_CAMOUFOX_EXECUTABLE", camoufox_exe, static_cast<DWORD>(sizeof(camoufox_exe)));
+    GetEnvironmentVariableA("AIDA_CAMOUFOX_MCP_EXECUTABLE", camoufox_mcp, static_cast<DWORD>(sizeof(camoufox_mcp)));
+    GetEnvironmentVariableA("AIDA_CAMOUFOX_PYTHON", camoufox_python, static_cast<DWORD>(sizeof(camoufox_python)));
+    GetEnvironmentVariableA("AIDA_CAMOUFOX_ALLOW_SETUP_BOOTSTRAP", camoufox_setup, static_cast<DWORD>(sizeof(camoufox_setup)));
 
     std::uintptr_t teb = 0;
     std::uintptr_t peb = 0;
@@ -2370,7 +2383,7 @@ static void log_fileless_startup_state(const char* phase)
         VirtualQuery(image, &mbi, sizeof(mbi));
 
     diag::log_tagged_critical_fmt("main",
-        "fileless_startup_state phase=%s pid=%lu tid=%lu fileless=%s no_disk_write=%s payload_trace=%s module=%s cwd=%s debug_log=%s bootstrap_log=%s mapped_base_env=%s mapped_size_env=%s entry_rva_env=%s image_base=0x%016llX alloc_base=0x%016llX mbi_base=0x%016llX mbi_size=0x%llX mbi_state=0x%08lX mbi_protect=0x%08lX teb=0x%016llX peb=0x%016llX tls_vector=0x%016llX tls_slot51=0x%016llX",
+        "fileless_startup_state phase=%s pid=%lu tid=%lu fileless=%s no_disk_write=%s payload_trace=%s module=%s cwd=%s debug_log=%s bootstrap_log=%s mapped_base_env=%s mapped_size_env=%s entry_rva_env=%s camoufox_exe=%s camoufox_mcp=%s camoufox_python=%s camoufox_setup=%s image_base=0x%016llX alloc_base=0x%016llX mbi_base=0x%016llX mbi_size=0x%llX mbi_state=0x%08lX mbi_protect=0x%08lX teb=0x%016llX peb=0x%016llX tls_vector=0x%016llX tls_slot51=0x%016llX",
         phase ? phase : "",
         GetCurrentProcessId(),
         GetCurrentThreadId(),
@@ -2384,6 +2397,10 @@ static void log_fileless_startup_state(const char* phase)
         mapped_base,
         mapped_size,
         entry_rva,
+        camoufox_exe,
+        camoufox_mcp,
+        camoufox_python,
+        camoufox_setup,
         static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(image)),
         static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(mbi.AllocationBase)),
         static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(mbi.BaseAddress)),
@@ -2535,6 +2552,13 @@ int main(int, char**)
     crash_log_write("arc_import_cache_primed");
 
     SetUnhandledExceptionFilter([](EXCEPTION_POINTERS* ep) -> LONG {
+        if (ep && ep->ExceptionRecord &&
+            ep->ExceptionRecord->ExceptionCode == STATUS_SINGLE_STEP &&
+            anti_tamper::anti_dump::read_intercept::consume_pending_single_step(ep, "unhandled_filter"))
+        {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
         standalone_anti_dump::handle_strip::clear_critical_flags();
 
         char buf[4096];
@@ -3265,6 +3289,7 @@ int main(int, char**)
     bool done = false;
     static int prev_state = -1;
     static uint64_t frame_number = 0;
+    const bool fileless_customer_launch = fileless_launch_active();
     while (!done)
     {
         aida_tracer::render_pulse(frame_number);
@@ -3394,24 +3419,39 @@ int main(int, char**)
         static bool ide_resize_applied = false;
         if (g_ResizeWidth != 0 && g_ResizeHeight != 0)
         {
-            diag::log_tagged_critical_fmt("render", "resize_pre w=%d h=%d frame=%llu",
-                g_ResizeWidth, g_ResizeHeight, (unsigned long long)frame_number);
-            CleanupRenderTarget();
-            g_pSwapChain->ResizeBuffers(0, g_ResizeWidth, g_ResizeHeight, DXGI_FORMAT_UNKNOWN, 0);
-
-            if (ide_resize_applied) {
-                globals::ui::window_w = (float)g_ResizeWidth;
-                globals::ui::window_h = (float)g_ResizeHeight;
-            }
-            if (globals::ui::maximized) {
-                SetWindowRgn(hwnd, nullptr, TRUE);
+            const UINT resize_w = g_ResizeWidth;
+            const UINT resize_h = g_ResizeHeight;
+            diag::log_tagged_critical_fmt("render", "resize_pre w=%u h=%u frame=%llu",
+                resize_w, resize_h, (unsigned long long)frame_number);
+            if ((int)resize_w == prev_w && (int)resize_h == prev_h) {
+                g_ResizeWidth = g_ResizeHeight = 0;
+                diag::log_tagged_critical_fmt("render",
+                    "resize_skip_redundant w=%u h=%u prev_w=%d prev_h=%d frame=%llu",
+                    resize_w,
+                    resize_h,
+                    prev_w,
+                    prev_h,
+                    (unsigned long long)frame_number);
             } else {
-                HRGN rgn = CreateRoundRectRgn(0, 0, g_ResizeWidth, g_ResizeHeight, 16, 16);
-                SetWindowRgn(hwnd, rgn, TRUE);
+                CleanupRenderTarget();
+                g_pSwapChain->ResizeBuffers(0, resize_w, resize_h, DXGI_FORMAT_UNKNOWN, 0);
+
+                if (ide_resize_applied) {
+                    globals::ui::window_w = (float)resize_w;
+                    globals::ui::window_h = (float)resize_h;
+                }
+                if (globals::ui::maximized) {
+                    SetWindowRgn(hwnd, nullptr, TRUE);
+                } else {
+                    HRGN rgn = CreateRoundRectRgn(0, 0, resize_w, resize_h, 16, 16);
+                    SetWindowRgn(hwnd, rgn, TRUE);
+                }
+                g_ResizeWidth = g_ResizeHeight = 0;
+                CreateRenderTarget();
+                prev_w = static_cast<int>(resize_w);
+                prev_h = static_cast<int>(resize_h);
+                diag::log_tagged_critical("render", "resize_post_create_target_done");
             }
-            g_ResizeWidth = g_ResizeHeight = 0;
-            CreateRenderTarget();
-            diag::log_tagged_critical("render", "resize_post_create_target_done");
         }
 
         int iw = (int)globals::ui::window_w;
@@ -3426,6 +3466,20 @@ int main(int, char**)
         if (globals::ui::welcome_done && license_ready) cur_state = 3;
         bool state_changed = (cur_state != prev_state);
         if (state_changed) prev_state = cur_state;
+        static uint64_t fileless_ide_first_frame = 0;
+        static bool fileless_services_deferred_logged = false;
+        if (fileless_customer_launch && cur_state == 3 && fileless_ide_first_frame == 0) {
+            fileless_ide_first_frame = frame_number;
+            diag::log_tagged_critical_fmt("render",
+                "fileless_ide_first_frame frame=%llu w=%d h=%d prev_w=%d prev_h=%d",
+                (unsigned long long)frame_number,
+                iw,
+                ih,
+                prev_w,
+                prev_h);
+        }
+        const bool fileless_ide_settled = !fileless_customer_launch ||
+            (fileless_ide_first_frame != 0 && frame_number >= fileless_ide_first_frame + 18ULL);
 
         static bool s_arc_startup_gate_passed = false;
         if (!s_arc_startup_gate_passed && cur_state == 3 && standalone_license::is_arc_loaded())
@@ -3466,7 +3520,16 @@ int main(int, char**)
             s_arc_startup_gate_passed = true;
             globals::ui::arc_unseal_phase.store(2, std::memory_order_release);
         }
-        if (s_arc_startup_gate_passed && license_ready) {
+        if (s_arc_startup_gate_passed && license_ready && !fileless_ide_settled && !fileless_services_deferred_logged) {
+            fileless_services_deferred_logged = true;
+            startup_log_critical_fmt("fileless_authorized_services_deferred first_frame=%llu frame=%llu settle_frames=18 pid=%lu tid=%lu tick=%llu",
+                static_cast<unsigned long long>(fileless_ide_first_frame),
+                static_cast<unsigned long long>(frame_number),
+                GetCurrentProcessId(),
+                GetCurrentThreadId(),
+                static_cast<unsigned long long>(GetTickCount64()));
+        }
+        if (s_arc_startup_gate_passed && license_ready && fileless_ide_settled) {
             if (!g_authorized_features_initialized.load(std::memory_order_acquire) &&
                 !g_authorized_features_posted.exchange(true, std::memory_order_acq_rel))
             {
@@ -3527,8 +3590,14 @@ int main(int, char**)
             }
         }
 
+        static bool fileless_ide_region_applied = false;
+        static bool fileless_ide_region_defer_logged = false;
         if (iw != prev_w || ih != prev_h)
         {
+            const bool defer_fileless_ide_region = fileless_customer_launch &&
+                cur_state == 3 &&
+                !fileless_ide_region_applied &&
+                !fileless_ide_settled;
             diag::log_tagged_critical_fmt("render",
                 "second_resize_pre iw=%d ih=%d prev_w=%d prev_h=%d cur_state=%d ide_resize_applied=%d frame=%llu",
                 iw, ih, prev_w, prev_h, cur_state, ide_resize_applied ? 1 : 0,
@@ -3543,16 +3612,32 @@ int main(int, char**)
 
                     int cx = (screen_w - iw) / 2;
                     int cy = (screen_h - ih) / 2;
-                    SetWindowPos(hwnd, nullptr, cx, cy, iw, ih, SWP_NOZORDER);
+                    UINT flags = SWP_NOZORDER;
+                    if (fileless_customer_launch)
+                        flags |= SWP_NOACTIVATE;
+                    SetWindowPos(hwnd, nullptr, cx, cy, iw, ih, flags);
                 } else {
 
-                    SetWindowPos(hwnd, nullptr, 0, 0, iw, ih, SWP_NOZORDER | SWP_NOMOVE);
+                    UINT flags = SWP_NOZORDER | SWP_NOMOVE;
+                    if (fileless_customer_launch)
+                        flags |= SWP_NOACTIVATE;
+                    SetWindowPos(hwnd, nullptr, 0, 0, iw, ih, flags);
                 }
             }
             if (cur_state == 3 && iw >= 1000 && ih >= 600)
                 ide_resize_applied = true;
 
-            if (globals::ui::maximized) {
+            if (defer_fileless_ide_region) {
+                SetWindowRgn(hwnd, nullptr, TRUE);
+                if (!fileless_ide_region_defer_logged) {
+                    fileless_ide_region_defer_logged = true;
+                    diag::log_tagged_critical_fmt("render",
+                        "fileless_ide_region_deferred frame=%llu iw=%d ih=%d settled=0",
+                        (unsigned long long)frame_number,
+                        iw,
+                        ih);
+                }
+            } else if (globals::ui::maximized) {
                 SetWindowRgn(hwnd, nullptr, TRUE);
                 DWM_WINDOW_CORNER_PREFERENCE cp = DWMWCP_DONOTROUND;
                 DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cp, sizeof(cp));
@@ -3562,12 +3647,40 @@ int main(int, char**)
                 DWM_WINDOW_CORNER_PREFERENCE cp = DWMWCP_ROUND;
                 DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cp, sizeof(cp));
             }
+            if (!defer_fileless_ide_region && fileless_customer_launch && cur_state == 3)
+                fileless_ide_region_applied = true;
             CleanupRenderTarget();
             g_pSwapChain->ResizeBuffers(0, iw, ih, DXGI_FORMAT_UNKNOWN, 0);
             CreateRenderTarget();
             prev_w = iw;
             prev_h = ih;
             diag::log_tagged_critical("render", "second_resize_post");
+        }
+
+        {
+            if (fileless_customer_launch &&
+                cur_state == 3 &&
+                ide_resize_applied &&
+                fileless_ide_settled &&
+                !fileless_ide_region_applied) {
+                if (globals::ui::maximized) {
+                    SetWindowRgn(hwnd, nullptr, TRUE);
+                    DWM_WINDOW_CORNER_PREFERENCE cp = DWMWCP_DONOTROUND;
+                    DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cp, sizeof(cp));
+                } else {
+                    HRGN rgn = CreateRoundRectRgn(0, 0, iw, ih, 16, 16);
+                    SetWindowRgn(hwnd, rgn, TRUE);
+                    DWM_WINDOW_CORNER_PREFERENCE cp = DWMWCP_ROUND;
+                    DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cp, sizeof(cp));
+                }
+                fileless_ide_region_applied = true;
+                diag::log_tagged_critical_fmt("render",
+                    "fileless_ide_region_late_applied frame=%llu iw=%d ih=%d maximized=%d",
+                    (unsigned long long)frame_number,
+                    iw,
+                    ih,
+                    globals::ui::maximized ? 1 : 0);
+            }
         }
 
         if (frame_number < 5)

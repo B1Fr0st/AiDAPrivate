@@ -108,6 +108,41 @@ namespace anti_debug {
         return index != 0;
     }
 
+    __forceinline bool image_file_name_equals_ascii(const UCHAR* image_name, const char* target)
+    {
+        if (!image_name || !target)
+            return false;
+
+        ULONG index = 0;
+        __try {
+            for (; index < 15; ++index) {
+                char lhs = lowercase_ascii_char(static_cast<char>(image_name[index]));
+                char rhs = lowercase_ascii_char(target[index]);
+                if (rhs == '\0')
+                    return lhs == '\0';
+                if (lhs == '\0' || lhs != rhs)
+                    return false;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+
+        return target[index] == '\0';
+    }
+
+    __forceinline bool image_file_name_is_supported_ida_host(const UCHAR* image_name)
+    {
+        static const char* supported_ida_hosts[] = {
+            "ida.exe", "ida64.exe", "idaq.exe", "idaq64.exe",
+            "idat.exe", "idat64.exe", "idaw.exe", "idaw64.exe"
+        };
+        for (int i = 0; i < static_cast<int>(sizeof(supported_ida_hosts) / sizeof(supported_ida_hosts[0])); ++i) {
+            if (image_file_name_equals_ascii(image_name, supported_ida_hosts[i]))
+                return true;
+        }
+        return false;
+    }
+
     __forceinline NTSTATUS hide_thread_object_from_debugger(PETHREAD thread)
     {
         if (!thread || !_ObOpenObjectByPointer || !_ZwSetInformationThread ||
@@ -577,6 +612,13 @@ namespace anti_debug {
                     bool matched = false;
                     UCHAR* image_name = PsGetProcessImageFileName(process);
                     if (image_name) {
+                        if (image_file_name_is_supported_ida_host(image_name)) {
+                            WW_LOG("[ADBG] supported_ida_host_ignored pid=%llu image=%.15s",
+                                (UINT64)(ULONG_PTR)info->UniqueProcessId,
+                                image_name);
+                            ObDereferenceObject(process);
+                            continue;
+                        }
                         for (int n = 0; n < num_names; ++n) {
                             if (image_file_name_matches_ascii_prefix(image_name, debugger_names[n])) {
                                 *out_debugger_pid = (UINT64)(ULONG_PTR)info->UniqueProcessId;
@@ -861,7 +903,7 @@ namespace anti_debug {
                 WW_LOG("[INSTR-DUMP] noncanonical cb ignored for pid=%u build=%lu cur_tag=0x%08X",
                     pid, osver.dwBuildNumber, cur_tag);
             } else if (cur != nullptr && cur != g_instrumentation_callback) {
-                WW_LOG("[INSTR-DUMP] WOULD_CLEAR pid=%u cur_tag=0x%08X own_tag=0x%08X",
+                WW_LOG("[INSTR-DUMP] foreign cb observed inspect_only pid=%u cur_tag=0x%08X own_tag=0x%08X",
                     pid, cur_tag, own_tag);
             } else {
                 WW_LOG("[INSTR-DUMP] no foreign cb at 0x460 for pid=%u present=%d", pid, cur != nullptr ? 1 : 0);
@@ -920,7 +962,7 @@ namespace continuous_anti_debug {
 
         if ((cycle % 3) == 0) {
             anti_debug::clear_debug_objects(pid);
-            WW_LOG("[CONT-ADBG] cycle=%llu calling clear_instrumentation_callback_eprocess pid=%u", cycle, pid);
+            WW_LOG("[CONT-ADBG] cycle=%llu calling inspect_instrumentation_callback_eprocess pid=%u", cycle, pid);
             anti_debug::clear_instrumentation_callback_eprocess(pid);
         }
 

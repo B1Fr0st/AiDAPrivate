@@ -295,6 +295,7 @@ namespace detail {
             streq_ci(image, "csrss.exe") ||
             streq_ci(image, "wininit.exe") ||
             streq_ci(image, "services.exe") ||
+            streq_ci(image, "svchost.exe") ||
             streq_ci(image, "winlogon.exe") ||
             streq_ci(image, "smss.exe");
         if (!core_image)
@@ -1282,13 +1283,12 @@ namespace detail {
             !confirmed && trusted_system && passive_system_access;
         const bool suppress_unconfirmed_fileless_terminal =
             !confirmed && trusted_fileless_terminal;
-        const bool enforce = confirmed ||
-            (!suppress_unconfirmed_system && !suppress_unconfirmed_fileless_terminal);
+        const bool enforce = confirmed;
         const char* decision = confirmed ? "enforce_confirmed_kernel_evidence" :
             (suppress_unconfirmed_system ? "suppress_unconfirmed_trusted_system_handle" :
              (suppress_unconfirmed_fileless_terminal ? "suppress_unconfirmed_fileless_terminal_handle" :
-             (kernel_ready ? "enforce_unconfirmed_non_system_handle" :
-              "enforce_no_kernel_confirmation_path")));
+              (kernel_ready && query_ok && scan_ok ? "suppress_unconfirmed_kernel_clean_foreign_handle" :
+               "suppress_unconfirmed_foreign_handle")));
         const std::string flags = obs.valid ? format_handle_access_flags(obs.access) : "none";
 
         char buf[1152];

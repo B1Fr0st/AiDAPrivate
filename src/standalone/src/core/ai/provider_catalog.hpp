@@ -85,7 +85,7 @@ namespace catalog {
 	std::vector<const model_info_t*> closest(const std::string& provider_id, const std::vector<std::string>& query_terms);
 	const model_info_t* get_small_model(const std::string& provider_id);
 	const model_info_t* default_model(const std::string& provider_id);
-	const std::string& last_error();
+	std::string last_error();
 
 }
 

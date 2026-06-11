@@ -2160,13 +2160,36 @@ __declspec(noinline) static bool finalize_call_anti_dump_init_cpp()
     return false;
 }
 
+__declspec(noinline) static int finalize_anti_dump_init_exception_filter(EXCEPTION_POINTERS* ep)
+{
+    const DWORD code = (ep && ep->ExceptionRecord) ? ep->ExceptionRecord->ExceptionCode : 0;
+    if (code == STATUS_SINGLE_STEP)
+    {
+        const bool consumed = anti_dump::read_intercept::consume_pending_single_step(ep, "anti_dump_init_seh");
+        if (ep && ep->ContextRecord)
+            ep->ContextRecord->EFlags &= ~0x100u;
+        webhook::write_log_critical_fmt("init",
+            "anti_dump_init_SEH_single_step_continued consumed=%d addr=0x%016llX rip=0x%016llX tid=%lu",
+            consumed ? 1 : 0,
+            static_cast<unsigned long long>((ep && ep->ExceptionRecord) ? reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress) : 0),
+            static_cast<unsigned long long>((ep && ep->ContextRecord) ? ep->ContextRecord->Rip : 0),
+            GetCurrentThreadId());
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    webhook::write_log_critical_fmt("init",
+        "anti_dump_init_SEH code=0x%08X addr=0x%016llX rip=0x%016llX tid=%lu",
+        code,
+        static_cast<unsigned long long>((ep && ep->ExceptionRecord) ? reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress) : 0),
+        static_cast<unsigned long long>((ep && ep->ContextRecord) ? ep->ContextRecord->Rip : 0),
+        GetCurrentThreadId());
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 __declspec(noinline) static bool finalize_call_anti_dump_init_seh()
 {
     bool ok = false;
     __try { ok = finalize_call_anti_dump_init_cpp(); }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        webhook::write_log_critical_fmt("init",
-            "anti_dump_init_SEH code=0x%08X", GetExceptionCode());
+    __except (finalize_anti_dump_init_exception_filter(GetExceptionInformation())) {
         ok = false;
     }
     return ok;

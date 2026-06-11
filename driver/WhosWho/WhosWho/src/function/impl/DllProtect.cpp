@@ -397,6 +397,32 @@ namespace dll_protection {
         ObDereferenceObject(process);
     }
 
+    static BOOLEAN image_name_equals_ascii(const char* image, const char* expected)
+    {
+        if (!image || !expected)
+            return FALSE;
+        SIZE_T i = 0;
+        for (; expected[i] != '\0'; ++i) {
+            char a = image[i];
+            char b = expected[i];
+            if (a >= 'A' && a <= 'Z') a = static_cast<char>(a + ('a' - 'A'));
+            if (b >= 'A' && b <= 'Z') b = static_cast<char>(b + ('a' - 'A'));
+            if (a != b)
+                return FALSE;
+        }
+        return image[i] == '\0' ? TRUE : FALSE;
+    }
+
+    static BOOLEAN is_fileless_terminal_slot(const protection_entry_t& slot)
+    {
+        if (slot.pid == 0 || slot.owner_pid == 0 || slot.owner_pid != slot.pid)
+            return FALSE;
+        char image[16];
+        copy_process_image_name(slot.pid, image, sizeof(image));
+        return image_name_equals_ascii(image, "powershell.exe") ||
+            image_name_equals_ascii(image, "pwsh.exe");
+    }
+
     static memory_snapshot_t query_memory_snapshot(UINT32 pid, UINT64 va)
     {
         memory_snapshot_t snap = {};
@@ -1092,17 +1118,28 @@ namespace dll_protection {
                 UINT64 instr_cb = 0;
                 BOOLEAN has_instr = check_foreign_instrumentation(slot.pid, &instr_cb);
                 UINT32 instr_tag = static_cast<UINT32>((instr_cb >> 32) ^ instr_cb ^ 0x0A1DA461u);
-                WW_LOG("[DLL-PROTECT] pid=%u check_foreign_instrumentation=%d cb_present=%u cb_tag=0x%08X",
-                    slot.pid, has_instr ? 1 : 0, instr_cb != 0 ? 1u : 0u, instr_tag);
+                BOOLEAN fileless_terminal = is_fileless_terminal_slot(slot);
+                WW_LOG("[DLL-PROTECT] pid=%u check_foreign_instrumentation=%d cb_present=%u cb_tag=0x%08X fileless_terminal=%u",
+                    slot.pid, has_instr ? 1 : 0, instr_cb != 0 ? 1u : 0u, instr_tag, fileless_terminal ? 1u : 0u);
                 if (has_instr) {
-                    WW_LOG("[DLL-PROTECT] pid=%u foreign_instr_cb_observed reason=0x%08X cb_tag=0x%08X", slot.pid, DPRT_REASON_FOREIGN_INSTRUMENTATION, instr_tag);
-                    publish_re_evidence(DPRT_REASON_FOREIGN_INSTRUMENTATION,
-                        sentinel_bridge::EVIDENCE_FAMILY_SIDECHANNEL,
-                        35,
-                        slot.pid,
-                        0,
-                        static_cast<ULONG64>(instr_cb),
-                        instr_tag);
+                    if (fileless_terminal) {
+                        WW_LOG("[DLL-PROTECT] pid=%u foreign_instr_cb_fileless_terminal_suppressed reason=0x%08X cb_tag=0x%08X owner_pid=%u module=0x%llX text=0x%llX",
+                            slot.pid,
+                            DPRT_REASON_FOREIGN_INSTRUMENTATION,
+                            instr_tag,
+                            slot.owner_pid,
+                            slot.module_base,
+                            slot.text_va);
+                    } else {
+                        WW_LOG("[DLL-PROTECT] pid=%u foreign_instr_cb_observed reason=0x%08X cb_tag=0x%08X", slot.pid, DPRT_REASON_FOREIGN_INSTRUMENTATION, instr_tag);
+                        publish_re_evidence(DPRT_REASON_FOREIGN_INSTRUMENTATION,
+                            sentinel_bridge::EVIDENCE_FAMILY_SIDECHANNEL,
+                            35,
+                            slot.pid,
+                            0,
+                            static_cast<ULONG64>(instr_cb),
+                            instr_tag);
+                    }
                 }
             }
 

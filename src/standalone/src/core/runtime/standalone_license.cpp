@@ -4617,16 +4617,22 @@ namespace
         return result;
     }
 
-    bool fetch_challenge(challenge_material_t& out)
+    bool fetch_challenge(challenge_material_t& out, std::string* error_out = nullptr)
     {
         lic_log("fetch_challenge_enter");
         std::string host = get_cloud_function_host();
-        auto resp = raw_https_request("GET", host + "/api/license/challenge");
+        const std::string url = host + "/api/license/challenge";
+        auto resp = raw_https_request("GET", url);
         if (!resp.ok) {
             char buf[256];
             _snprintf_s(buf, sizeof(buf), _TRUNCATE,
                 "fetch_challenge_fail winhttp err=%s", resp.error.c_str());
             lic_log(buf);
+            if (error_out)
+                *error_out = resp.error.empty()
+                    ? std::string("License activation challenge unavailable.")
+                    : std::string("License activation challenge unavailable: ") + resp.error;
+            schedule_async_network_diagnosis(url);
             return false;
         }
         if (resp.status != 200) {
@@ -4639,6 +4645,8 @@ namespace
                     _snprintf_s(buf, sizeof(buf), _TRUNCATE,
                         "fetch_challenge_http_retry_fail status=%d", resp.status);
                     lic_log(buf);
+                    if (error_out)
+                        *error_out = "License activation challenge unavailable.";
                     return false;
                 }
             } else {
@@ -4646,16 +4654,26 @@ namespace
                 _snprintf_s(buf, sizeof(buf), _TRUNCATE,
                     "fetch_challenge_http status=%d", resp.status);
                 lic_log(buf);
+                if (error_out)
+                    *error_out = "License activation challenge unavailable.";
                 return false;
             }
         }
 
         auto j = json::parse(resp.body, nullptr, false);
-        if (j.is_discarded() || !j.is_object()) return false;
+        if (j.is_discarded() || !j.is_object()) {
+            if (error_out)
+                *error_out = "License service returned invalid challenge JSON.";
+            return false;
+        }
 
         std::string cid = j.value("challenge_id", "");
         std::string cnonce = j.value("challenge_nonce", "");
-        if (cid.empty() || cnonce.empty()) return false;
+        if (cid.empty() || cnonce.empty()) {
+            if (error_out)
+                *error_out = "License service returned an incomplete challenge.";
+            return false;
+        }
 
         out.id = std::move(cid);
         out.nonce = std::move(cnonce);
@@ -4753,9 +4771,12 @@ namespace
     {
         std::unique_lock<std::mutex> endpoint_lk(s_validation_endpoint_mtx);
         challenge_material_t challenge;
-        if (!fetch_challenge(challenge)) {
-            lic_log("endpoint_once_challenge_unavailable");
-            error_out = "License activation challenge unavailable.";
+        std::string challenge_error;
+        if (!fetch_challenge(challenge, &challenge_error)) {
+            lic_log_fmt("endpoint_once_challenge_unavailable err=%.160s", challenge_error.c_str());
+            error_out = challenge_error.empty()
+                ? std::string("License activation challenge unavailable.")
+                : challenge_error;
             response_out = json::object({{"ok", false}, {"error", "challenge_unavailable"}});
             return false;
         }
@@ -7881,6 +7902,18 @@ namespace
 
     std::string user_facing_license_error(const std::string& error)
     {
+        auto contains = [&error](const char* token) {
+            return token && error.find(token) != std::string::npos;
+        };
+        if (contains("ERROR_WINHTTP_NAME_NOT_RESOLVED") || contains("gle=12007"))
+            return "AiDA could not resolve api.aidapro.net.\nWindows reported WinHTTP DNS/name resolution error 12007.\nCheck your DNS, VPN, firewall, or internet connection and press Activate again.";
+        if (contains("ERROR_WINHTTP_TIMEOUT") || contains("gle=12002"))
+            return "AiDA could not reach the license server before the network timeout.\nCheck your internet connection, VPN, or firewall and press Activate again.";
+        if (contains("ERROR_WINHTTP_CANNOT_CONNECT") || contains("ERROR_WINHTTP_CONNECTION_ERROR") ||
+            contains("winhttp_connect_failed") || contains("winhttp_send_failed") || contains("winhttp_recv_failed"))
+            return "AiDA could not reach the license server.\nThis was a network transport failure, not a license rejection.\nCheck your internet connection, DNS, VPN, or firewall and press Activate again.";
+        if (error == "License activation challenge unavailable.")
+            return "AiDA could not fetch the activation challenge from the license server.\nCheck your internet connection, DNS, VPN, or firewall and press Activate again.";
         if (error == "not_found")
             return "License key was not found on the server.\nRe-enter your active key and press Activate.";
         if (error == "revoked")

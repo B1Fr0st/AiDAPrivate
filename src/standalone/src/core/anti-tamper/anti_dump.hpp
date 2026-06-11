@@ -982,11 +982,182 @@ namespace read_intercept
     inline PVOID veh_handle = nullptr;
     inline std::atomic<uint64_t> trap_page_base{0};
     inline std::atomic<uint32_t> trap_page_size{0};
-    inline thread_local uint64_t pending_iat_page_base = 0;
-    inline thread_local uint32_t pending_iat_page_size = 0;
-    inline thread_local uint64_t pending_trap_page_base = 0;
-    inline thread_local uint32_t pending_trap_page_size = 0;
-    inline thread_local bool pending_text_guard_step = false;
+    enum : uint32_t
+    {
+        pending_step_iat = 0x1u,
+        pending_step_trap = 0x2u,
+        pending_step_text = 0x4u
+    };
+
+    struct pending_step_slot
+    {
+        std::atomic<DWORD> tid;
+        std::atomic<uint64_t> iat_page_base;
+        std::atomic<uint32_t> iat_page_size;
+        std::atomic<uint64_t> trap_page_base;
+        std::atomic<uint32_t> trap_page_size;
+        std::atomic<uint32_t> flags;
+        std::atomic<uint64_t> tick;
+
+        pending_step_slot() noexcept
+            : tid(0),
+              iat_page_base(0),
+              iat_page_size(0),
+              trap_page_base(0),
+              trap_page_size(0),
+              flags(0),
+              tick(0)
+        {
+        }
+    };
+
+    inline pending_step_slot* pending_step_slots()
+    {
+        static pending_step_slot slots[64];
+        return slots;
+    }
+
+    inline std::atomic<uint64_t>& iat_gpv_count()
+    {
+        static std::atomic<uint64_t> v{0};
+        return v;
+    }
+
+    inline std::atomic<uint64_t>& iat_rearm_count()
+    {
+        static std::atomic<uint64_t> v{0};
+        return v;
+    }
+
+    inline pending_step_slot* find_pending_step_slot(DWORD tid)
+    {
+        pending_step_slot* slots = pending_step_slots();
+        for (size_t i = 0; i < 64; ++i)
+        {
+            if (slots[i].tid.load(std::memory_order_acquire) == tid)
+                return &slots[i];
+        }
+        return nullptr;
+    }
+
+    inline pending_step_slot& reserve_pending_step_slot(DWORD tid)
+    {
+        pending_step_slot* existing = find_pending_step_slot(tid);
+        if (existing)
+            return *existing;
+
+        pending_step_slot* slots = pending_step_slots();
+        for (size_t i = 0; i < 64; ++i)
+        {
+            DWORD expected = 0;
+            if (slots[i].tid.compare_exchange_strong(expected, tid, std::memory_order_acq_rel))
+            {
+                slots[i].iat_page_base.store(0, std::memory_order_release);
+                slots[i].iat_page_size.store(0, std::memory_order_release);
+                slots[i].trap_page_base.store(0, std::memory_order_release);
+                slots[i].trap_page_size.store(0, std::memory_order_release);
+                slots[i].flags.store(0, std::memory_order_release);
+                slots[i].tick.store(static_cast<uint64_t>(GetTickCount64()), std::memory_order_release);
+                return slots[i];
+            }
+        }
+
+        pending_step_slot& slot = slots[tid % 64u];
+        slot.flags.store(0, std::memory_order_release);
+        slot.iat_page_base.store(0, std::memory_order_release);
+        slot.iat_page_size.store(0, std::memory_order_release);
+        slot.trap_page_base.store(0, std::memory_order_release);
+        slot.trap_page_size.store(0, std::memory_order_release);
+        slot.tick.store(static_cast<uint64_t>(GetTickCount64()), std::memory_order_release);
+        slot.tid.store(tid, std::memory_order_release);
+        return slot;
+    }
+
+    inline void mark_iat_pending(uint64_t page_base, uint32_t page_size)
+    {
+        pending_step_slot& slot = reserve_pending_step_slot(GetCurrentThreadId());
+        slot.iat_page_base.store(page_base, std::memory_order_release);
+        slot.iat_page_size.store(page_size, std::memory_order_release);
+        slot.tick.store(static_cast<uint64_t>(GetTickCount64()), std::memory_order_release);
+        slot.flags.fetch_or(pending_step_iat, std::memory_order_acq_rel);
+    }
+
+    inline void mark_trap_pending(uint64_t page_base, uint32_t page_size)
+    {
+        pending_step_slot& slot = reserve_pending_step_slot(GetCurrentThreadId());
+        slot.trap_page_base.store(page_base, std::memory_order_release);
+        slot.trap_page_size.store(page_size, std::memory_order_release);
+        slot.tick.store(static_cast<uint64_t>(GetTickCount64()), std::memory_order_release);
+        slot.flags.fetch_or(pending_step_trap, std::memory_order_acq_rel);
+    }
+
+    inline void mark_text_pending()
+    {
+        pending_step_slot& slot = reserve_pending_step_slot(GetCurrentThreadId());
+        slot.tick.store(static_cast<uint64_t>(GetTickCount64()), std::memory_order_release);
+        slot.flags.fetch_or(pending_step_text, std::memory_order_acq_rel);
+    }
+
+    inline bool consume_pending_single_step(EXCEPTION_POINTERS* ep, const char* source)
+    {
+        if (!ep || !ep->ExceptionRecord || ep->ExceptionRecord->ExceptionCode != STATUS_SINGLE_STEP || !ep->ContextRecord)
+            return false;
+
+        const DWORD tid = GetCurrentThreadId();
+        pending_step_slot* slot = find_pending_step_slot(tid);
+        if (!slot)
+            return false;
+
+        const uint32_t flags = slot->flags.exchange(0, std::memory_order_acq_rel);
+        if (flags == 0)
+            return false;
+
+        const uint64_t iat_base = slot->iat_page_base.exchange(0, std::memory_order_acq_rel);
+        const uint32_t iat_size = slot->iat_page_size.exchange(0, std::memory_order_acq_rel);
+        const uint64_t trap_base = slot->trap_page_base.exchange(0, std::memory_order_acq_rel);
+        const uint32_t trap_size = slot->trap_page_size.exchange(0, std::memory_order_acq_rel);
+        const uint64_t age_ms = static_cast<uint64_t>(GetTickCount64()) - slot->tick.load(std::memory_order_acquire);
+
+        bool handled = false;
+        if ((flags & pending_step_iat) != 0 && iat_base != 0 && iat_size != 0)
+        {
+            bool rearm_ok = iat_guard::rearm_guard_page(iat_base, iat_size);
+            uint64_t n = iat_rearm_count().fetch_add(1, std::memory_order_relaxed) + 1;
+            if (!rearm_ok || n <= 3)
+            {
+                char dbg[320];
+                _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                    "iat_guard_rearm_page #%llu ok=%d source=%s rip=0x%llX tid=%lu page=0x%llX size=0x%X age_ms=%llu",
+                    n, rearm_ok ? 1 : 0, source ? source : "veh",
+                    ep->ContextRecord->Rip, tid, iat_base, iat_size,
+                    static_cast<unsigned long long>(age_ms));
+                webhook::write_log("veh", dbg);
+            }
+            handled = true;
+        }
+
+        if ((flags & pending_step_trap) != 0 && trap_base != 0 && trap_size != 0)
+        {
+            DWORD old_prot = 0;
+            VirtualProtect(reinterpret_cast<void*>(trap_base), trap_size,
+                PAGE_EXECUTE_READ | PAGE_GUARD, &old_prot);
+            handled = true;
+        }
+
+        if ((flags & pending_step_text) != 0)
+            handled = true;
+
+        slot->tid.store(0, std::memory_order_release);
+
+        if (handled)
+        {
+            ep->ContextRecord->EFlags &= ~0x100u;
+            return true;
+        }
+
+        return false;
+    }
+
     inline void*& trap_page_allocation()
     {
         static void* p = nullptr;
@@ -995,9 +1166,6 @@ namespace read_intercept
 
     inline LONG CALLBACK guard_page_handler(EXCEPTION_POINTERS* ep)
     {
-        static std::atomic<uint64_t> s_iat_gpv_count{0};
-        static std::atomic<uint64_t> s_iat_rearm_count{0};
-
         if (ep->ExceptionRecord->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION)
         {
             uint64_t fault_addr = static_cast<uint64_t>(
@@ -1011,9 +1179,8 @@ namespace read_intercept
                 uint32_t page_size = 0;
                 if (iat_guard::page_for_fault(fault_addr, page_base, page_size))
                 {
-                    pending_iat_page_base = page_base;
-                    pending_iat_page_size = page_size;
-                    uint64_t n = s_iat_gpv_count.fetch_add(1, std::memory_order_relaxed) + 1;
+                    mark_iat_pending(page_base, page_size);
+                    uint64_t n = iat_gpv_count().fetch_add(1, std::memory_order_relaxed) + 1;
                     if (n == 1)
                     {
                         char dbg[256];
@@ -1030,7 +1197,7 @@ namespace read_intercept
             if (text_guard::address_in_range(fault_addr))
             {
                 text_guard::register_hit();
-                pending_text_guard_step = true;
+                mark_text_pending();
                 ep->ContextRecord->EFlags |= 0x100;
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
@@ -1040,8 +1207,7 @@ namespace read_intercept
 
             if (base != 0 && fault_addr >= base && fault_addr < base + size)
             {
-                pending_trap_page_base = base;
-                pending_trap_page_size = size;
+                mark_trap_pending(base, size);
                 ep->ContextRecord->EFlags |= 0x100;
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
@@ -1049,47 +1215,8 @@ namespace read_intercept
 
         if (ep->ExceptionRecord->ExceptionCode == STATUS_SINGLE_STEP)
         {
-            bool handled = false;
-            if (pending_iat_page_base != 0 && pending_iat_page_size != 0)
-            {
-                bool rearm_ok = iat_guard::rearm_guard_page(pending_iat_page_base, pending_iat_page_size);
-                uint64_t n = s_iat_rearm_count.fetch_add(1, std::memory_order_relaxed) + 1;
-                if (!rearm_ok || n == 1)
-                {
-                    char dbg[256];
-                    _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                        "iat_guard_rearm_page #%llu ok=%d rip=0x%llX tid=%lu page=0x%llX size=0x%X",
-                        n, rearm_ok ? 1 : 0, ep->ContextRecord->Rip, GetCurrentThreadId(),
-                        pending_iat_page_base, pending_iat_page_size);
-                    webhook::write_log("veh", dbg);
-                }
-                pending_iat_page_base = 0;
-                pending_iat_page_size = 0;
-                handled = true;
-            }
-
-            if (pending_trap_page_base != 0 && pending_trap_page_size != 0)
-            {
-                DWORD old_prot;
-                VirtualProtect(reinterpret_cast<void*>(pending_trap_page_base), pending_trap_page_size,
-                    PAGE_EXECUTE_READ | PAGE_GUARD, &old_prot);
-                pending_trap_page_base = 0;
-                pending_trap_page_size = 0;
-                handled = true;
-            }
-
-            if (pending_text_guard_step)
-            {
-                pending_text_guard_step = false;
-                handled = true;
-            }
-
-            if (handled)
-            {
-                if (ep->ContextRecord)
-                    ep->ContextRecord->EFlags &= ~0x100u;
+            if (consume_pending_single_step(ep, "veh"))
                 return EXCEPTION_CONTINUE_EXECUTION;
-            }
         }
 
         return EXCEPTION_CONTINUE_SEARCH;

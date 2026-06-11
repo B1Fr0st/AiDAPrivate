@@ -119,19 +119,20 @@ void refresh_decompilation(ea_t func_ea)
 
 int idaapi action_handler::activate(action_activation_ctx_t* ctx)
 {
+    if (plugin == nullptr || !plugin->is_operational())
+    {
+        if (plugin != nullptr)
+            warning(OBFSTR_C("AiDA is loaded but disabled: %s"), plugin->disabled_reason().c_str());
+        return 1;
+    }
     action_func(ctx, plugin);
     return 1;
 }
 
 action_state_t idaapi action_handler::update(action_update_ctx_t* ctx)
 {
-    if (action_func == handle_toggle_mcp)
-    {
-        bool is_running = plugin->mcp_server && plugin->mcp_server->is_running();
-        update_action_label(OBFSTR_C("ai_assistant:toggle_mcp"),
-            is_running ? OBFSTR_C("Stop MCP Server") : OBFSTR_C("Start MCP Server"));
-        return AST_ENABLE_ALWAYS;
-    }
+    if (plugin == nullptr || !plugin->is_operational())
+        return AST_DISABLE;
 
     if (action_func == handle_save_database_context)
         return AST_ENABLE_ALWAYS;
@@ -313,11 +314,4 @@ void handle_fix_analysis(action_activation_ctx_t* ctx, aida_plugin_t*)
     qstring func_name;
     get_func_name(&func_name, func_ea);
     msg(OBFSTR_C("AiDA: Cleaned decompilation for %s (0x%a).\n"), func_name.c_str(), func_ea);
-}
-
-void handle_toggle_mcp(action_activation_ctx_t*, aida_plugin_t* plugin)
-{
-    if (!plugin)
-        return;
-    plugin->toggle_mcp_server();
 }

@@ -1434,6 +1434,7 @@ struct protect_options_t {
     bool symexec_bombs = false;
     bool llm_poison = false;
     bool jit = false;
+    bool preserve_loader_relocations = false;
     uint32_t tamper_response_level = 0;
     uint8_t  license_hash[16] = {0};
     uint32_t matryoshka_layers = 3u;
@@ -2493,6 +2494,8 @@ inline packed_section_layout_t build_packed_section(pe_file::pe_image_t& pe,
     hdr.aux_offset = layout.aux_offset;
     hdr.aux_size = static_cast<uint32_t>(sizeof(aux_block_t));
     std::memcpy(hdr.bind_salt, bind_salt, 16);
+    hdr.reserved[1] = static_cast<uint32_t>(pe.optional_header.ImageBase & 0xFFFFFFFFull);
+    hdr.reserved[2] = static_cast<uint32_t>((pe.optional_header.ImageBase >> 32) & 0xFFFFFFFFull);
     std::memcpy(buf.data(), &hdr, sizeof(hdr));
 
     for (size_t i = 0; i < blobs.size(); ++i) {
@@ -3874,7 +3877,20 @@ inline transform_result_t protect_pe(pe_file::pe_image_t& pe, const protect_opti
                 }
             }
         }
-        pe.optional_header.DllCharacteristics &= static_cast<uint16_t>(~0x4160u);
+        if (opt.preserve_loader_relocations) {
+            pe.optional_header.DllCharacteristics &= static_cast<uint16_t>(~IMAGE_DLLCHARACTERISTICS_GUARD_CF);
+            if (pe.data_directories[IMAGE_DIRECTORY_ENTRY_BASERELOC].rva != 0u &&
+                pe.data_directories[IMAGE_DIRECTORY_ENTRY_BASERELOC].size != 0u) {
+                pe.file_header.Characteristics &= static_cast<uint16_t>(~IMAGE_FILE_RELOCS_STRIPPED);
+            } else {
+                pe.optional_header.DllCharacteristics &= static_cast<uint16_t>(
+                    ~(IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA |
+                      IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE));
+                pe.file_header.Characteristics |= IMAGE_FILE_RELOCS_STRIPPED;
+            }
+        } else {
+            pe.optional_header.DllCharacteristics &= static_cast<uint16_t>(~0x4160u);
+        }
         if (opt.encrypt_imports) {
             pe.data_directories[1].rva = 0;
             pe.data_directories[1].size = 0;
@@ -3893,11 +3909,13 @@ inline transform_result_t protect_pe(pe_file::pe_image_t& pe, const protect_opti
         pe.data_directories[6].size = 0;
         pe.optional_header.DataDirectory[6].VirtualAddress = 0;
         pe.optional_header.DataDirectory[6].Size = 0;
-        pe.data_directories[5].rva = 0;
-        pe.data_directories[5].size = 0;
-        pe.optional_header.DataDirectory[5].VirtualAddress = 0;
-        pe.optional_header.DataDirectory[5].Size = 0;
-        pe.file_header.Characteristics |= 0x0001u;
+        if (!opt.preserve_loader_relocations) {
+            pe.data_directories[5].rva = 0;
+            pe.data_directories[5].size = 0;
+            pe.optional_header.DataDirectory[5].VirtualAddress = 0;
+            pe.optional_header.DataDirectory[5].Size = 0;
+            pe.file_header.Characteristics |= 0x0001u;
+        }
     }
 
     result.imports = std::move(imports);
@@ -4032,6 +4050,85 @@ inline void redirect_entry_point(pe_file::pe_image_t& pe, uint32_t new_entry_rva
     pe.optional_header.AddressOfEntryPoint = new_entry_rva;
 }
 
+inline bool add_dir64_base_relocations(pe_file::pe_image_t& pe, const std::vector<uint32_t>& rvas) {
+    if (rvas.empty()) {
+        return true;
+    }
+    if (pe.data_directories[IMAGE_DIRECTORY_ENTRY_BASERELOC].rva == 0u) {
+        return false;
+    }
+    pe_file::section_t* reloc_sec = pe.section_from_rva(pe.data_directories[IMAGE_DIRECTORY_ENTRY_BASERELOC].rva);
+    if (reloc_sec == nullptr) {
+        return false;
+    }
+
+    std::vector<pe_file::relocation_block_t> blocks = pe.relocations;
+    for (uint32_t rva : rvas) {
+        if (rva == 0u) {
+            continue;
+        }
+        const uint32_t page = rva & 0xFFFFF000u;
+        const uint16_t entry = static_cast<uint16_t>((IMAGE_REL_BASED_DIR64 << 12) | (rva & 0x0FFFu));
+        auto it = std::find_if(blocks.begin(), blocks.end(),
+            [page](const pe_file::relocation_block_t& block) {
+                return block.page_rva == page;
+            });
+        if (it == blocks.end()) {
+            pe_file::relocation_block_t block{};
+            block.page_rva = page;
+            block.entries.push_back(entry);
+            blocks.push_back(std::move(block));
+            continue;
+        }
+        if (std::find(it->entries.begin(), it->entries.end(), entry) == it->entries.end()) {
+            it->entries.push_back(entry);
+        }
+    }
+
+    std::sort(blocks.begin(), blocks.end(),
+        [](const pe_file::relocation_block_t& a, const pe_file::relocation_block_t& b) {
+            return a.page_rva < b.page_rva;
+        });
+
+    std::vector<uint8_t> serialized;
+    for (auto& block : blocks) {
+        if (block.entries.empty()) {
+            continue;
+        }
+        std::sort(block.entries.begin(), block.entries.end());
+        block.entries.erase(std::unique(block.entries.begin(), block.entries.end()), block.entries.end());
+        std::vector<uint16_t> entries = block.entries;
+        if ((entries.size() & 1u) != 0u) {
+            entries.push_back(0u);
+        }
+        const uint32_t block_size = static_cast<uint32_t>(8u + entries.size() * sizeof(uint16_t));
+        const size_t off = serialized.size();
+        serialized.resize(off + block_size);
+        std::memcpy(serialized.data() + off, &block.page_rva, sizeof(block.page_rva));
+        std::memcpy(serialized.data() + off + 4u, &block_size, sizeof(block_size));
+        std::memcpy(serialized.data() + off + 8u, entries.data(), entries.size() * sizeof(uint16_t));
+        block.entries = std::move(entries);
+    }
+
+    if (serialized.empty()) {
+        return false;
+    }
+
+    const uint32_t serialized_size = static_cast<uint32_t>(serialized.size());
+    const uint32_t raw_size = pe_file::align_up(serialized_size, pe.file_alignment());
+    serialized.resize(raw_size, 0u);
+    reloc_sec->data = std::move(serialized);
+    reloc_sec->virtual_size = serialized_size;
+    reloc_sec->raw_size = raw_size;
+    pe.relocations = std::move(blocks);
+    pe.data_directories[IMAGE_DIRECTORY_ENTRY_BASERELOC].size = serialized_size;
+    pe.optional_header.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress =
+        pe.data_directories[IMAGE_DIRECTORY_ENTRY_BASERELOC].rva;
+    pe.optional_header.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size = serialized_size;
+    pe_file::recalculate_headers(pe);
+    return true;
+}
+
 inline bool install_tls_callback(pe_file::pe_image_t& pe,
                                  uint32_t tls_stub_rva,
                                  uint32_t callback_list_rva,
@@ -4086,6 +4183,16 @@ inline bool install_tls_callback(pe_file::pe_image_t& pe,
             return false;
         }
         std::memcpy(tls_dir + 24u, &new_list_va, sizeof(new_list_va));
+        std::vector<uint32_t> reloc_rvas;
+        reloc_rvas.push_back(pe.data_directories[IMAGE_DIRECTORY_ENTRY_TLS].rva + 24u);
+        for (size_t i = 0; i < new_list.size(); ++i) {
+            if (new_list[i] != 0u) {
+                reloc_rvas.push_back(list_rva + static_cast<uint32_t>(i * 8u));
+            }
+        }
+        if (!add_dir64_base_relocations(pe, reloc_rvas)) {
+            return false;
+        }
         pe.tls.address_of_callbacks = new_list_va;
         pe.tls.callback_rvas.assign(new_list.begin(), new_list.end());
         pe.tls.callback_rvas.pop_back();

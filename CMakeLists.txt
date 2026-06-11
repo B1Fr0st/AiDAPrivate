@@ -2986,7 +2986,7 @@ if(BUILD_PROTECTOR)
         add_custom_command(TARGET AiDA POST_BUILD
             COMMAND ${CMAKE_COMMAND}
                 "-DRETRY_LABEL=AiDA.dll-protect"
-                "-DRETRY_CMD=$<TARGET_FILE:AiDAProtector>;--input;$<TARGET_FILE:AiDA>;--output;$<TARGET_FILE:AiDA>;--all;--no-encrypt-imports;--tamper-level;2;--no-jit;--no-llm-poison;--verbose"
+                "-DRETRY_CMD=$<TARGET_FILE:AiDAProtector>;--input;$<TARGET_FILE:AiDA>;--output;$<TARGET_FILE:AiDA>;--all;--no-encrypt-imports;--tamper-level;2;--no-jit;--no-llm-poison;--preserve-loader-relocations;--verbose"
                 -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
             COMMENT "Protecting AiDA.dll (with AV/indexer retry)..."
             VERBATIM

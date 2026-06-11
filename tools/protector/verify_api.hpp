@@ -376,7 +376,14 @@ inline probe_result_t probe_p14(const context_t& c) {
 
 inline probe_result_t probe_p15(const context_t& c) {
     uint16_t dll = c.pe.optional_header.DllCharacteristics;
-    uint16_t bad = dll & 0x4160u;
+    const bool loader_relocs_preserved =
+        (c.pe.file_header.Characteristics & IMAGE_FILE_DLL) != 0u &&
+        (c.pe.file_header.Characteristics & IMAGE_FILE_RELOCS_STRIPPED) == 0u &&
+        c.pe.data_directories[IMAGE_DIRECTORY_ENTRY_BASERELOC].rva != 0u &&
+        c.pe.data_directories[IMAGE_DIRECTORY_ENTRY_BASERELOC].size != 0u;
+    uint16_t bad = dll & (loader_relocs_preserved
+        ? static_cast<uint16_t>(IMAGE_DLLCHARACTERISTICS_GUARD_CF)
+        : static_cast<uint16_t>(0x4160u));
     bool ok = (bad == 0);
     char buf[96];
     std::snprintf(buf, sizeof(buf), "DllCharacteristics=0x%04X (masked bits=0x%04X)", dll, bad);
@@ -386,7 +393,12 @@ inline probe_result_t probe_p15(const context_t& c) {
 
 inline probe_result_t probe_p16(const context_t& c) {
     uint16_t ch = c.pe.file_header.Characteristics;
-    bool ok = (ch & 0x0001u) != 0u;
+    const bool loader_relocs_preserved =
+        (ch & IMAGE_FILE_DLL) != 0u &&
+        (ch & IMAGE_FILE_RELOCS_STRIPPED) == 0u &&
+        c.pe.data_directories[IMAGE_DIRECTORY_ENTRY_BASERELOC].rva != 0u &&
+        c.pe.data_directories[IMAGE_DIRECTORY_ENTRY_BASERELOC].size != 0u;
+    bool ok = ((ch & IMAGE_FILE_RELOCS_STRIPPED) != 0u) || loader_relocs_preserved;
     char buf[96];
     std::snprintf(buf, sizeof(buf), "FileHeader.Characteristics=0x%04X", ch);
     return { "P16", "IMAGE_FILE_RELOCS_STRIPPED set", ok, buf };

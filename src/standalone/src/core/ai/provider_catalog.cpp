@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -31,15 +32,46 @@ namespace {
 
 	std::mutex s_mtx;
 	std::string s_last_error;
-	std::vector<provider_info_t> s_providers;
-	std::vector<model_info_t> s_models;
-	bool s_loaded = false;
 	std::atomic<bool> s_init_started{false};
 	std::atomic<bool> s_refresh_inflight{false};
 
+	struct catalog_snapshot_t
+	{
+		std::vector<provider_info_t> providers;
+		std::vector<model_info_t> models;
+		bool loaded = false;
+	};
+
+	std::shared_ptr<const catalog_snapshot_t>& current_snapshot_ref()
+	{
+		static std::shared_ptr<const catalog_snapshot_t> s = std::make_shared<catalog_snapshot_t>();
+		return s;
+	}
+
+	std::vector<std::shared_ptr<const catalog_snapshot_t>>& retained_snapshots()
+	{
+		static std::vector<std::shared_ptr<const catalog_snapshot_t>> s;
+		return s;
+	}
+
+	std::shared_ptr<const catalog_snapshot_t> current_snapshot()
+	{
+		auto& snapshot_ref = current_snapshot_ref();
+		auto snapshot = std::atomic_load_explicit(&snapshot_ref, std::memory_order_acquire);
+		if (snapshot)
+			return snapshot;
+		return std::make_shared<catalog_snapshot_t>();
+	}
+
 	void set_error(const std::string& msg)
 	{
+		std::lock_guard<std::mutex> lk(s_mtx);
 		s_last_error = msg;
+	}
+
+	void clear_error_locked()
+	{
+		s_last_error.clear();
 	}
 
 	std::filesystem::path cache_path()
@@ -69,15 +101,17 @@ namespace {
 		return model_info_t::status_t::active;
 	}
 
-	void parse_models_dev_json(const nlohmann::json& root)
+	void parse_models_dev_json(const nlohmann::json& root,
+	                           std::vector<provider_info_t>& providers,
+	                           std::vector<model_info_t>& models)
 	{
-		s_providers.clear();
-		s_models.clear();
+		providers.clear();
+		models.clear();
 
 		if (!root.is_object())
 			return;
 
-		s_providers.reserve(root.size());
+		providers.reserve(root.size());
 
 		for (auto it = root.begin(); it != root.end(); ++it) {
 			const std::string& provider_id = it.key();
@@ -200,29 +234,46 @@ namespace {
 						mi.variants = mj["variants"];
 
 					pi.model_ids.push_back(model_id);
-					s_models.push_back(std::move(mi));
+					models.push_back(std::move(mi));
 				}
 			}
 
 			std::sort(pi.model_ids.begin(), pi.model_ids.end());
-			s_providers.push_back(std::move(pi));
+			providers.push_back(std::move(pi));
 		}
 
-		std::sort(s_providers.begin(), s_providers.end(),
+		std::sort(providers.begin(), providers.end(),
 			[](const provider_info_t& a, const provider_info_t& b) { return a.id < b.id; });
 	}
 
-	bool parse_and_replace(const std::string& body)
+	bool parse_catalog_body(const std::string& body,
+	                        std::vector<provider_info_t>& providers,
+	                        std::vector<model_info_t>& models,
+	                        std::string& error)
 	{
 		auto parsed = nlohmann::json::parse(body, nullptr, false);
 		if (parsed.is_discarded() || !parsed.is_object()) {
-			set_error("models.dev returned malformed JSON");
+			error = "models.dev returned malformed JSON";
 			return false;
 		}
-		parse_models_dev_json(parsed);
-		s_loaded = true;
-		s_last_error.clear();
+		parse_models_dev_json(parsed, providers, models);
 		return true;
+	}
+
+	void publish_snapshot(std::vector<provider_info_t>&& providers, std::vector<model_info_t>&& models)
+	{
+		auto next = std::make_shared<catalog_snapshot_t>();
+		next->providers = std::move(providers);
+		next->models = std::move(models);
+		next->loaded = true;
+		std::shared_ptr<const catalog_snapshot_t> published = next;
+		{
+			std::lock_guard<std::mutex> lk(s_mtx);
+			retained_snapshots().push_back(published);
+			clear_error_locked();
+		}
+		auto& snapshot_ref = current_snapshot_ref();
+		std::atomic_store_explicit(&snapshot_ref, published, std::memory_order_release);
 	}
 
 	bool write_cache_file(const std::string& body)
@@ -263,9 +314,11 @@ namespace {
 		return diff;
 	}
 
-	const model_info_t* find_model_locked(const std::string& provider_id, const std::string& model_id)
+	const model_info_t* find_model(const catalog_snapshot_t& snapshot,
+	                               const std::string& provider_id,
+	                               const std::string& model_id)
 	{
-		for (const auto& m : s_models) {
+		for (const auto& m : snapshot.models) {
 			if (m.provider_id == provider_id && m.id == model_id)
 				return &m;
 		}
@@ -283,8 +336,6 @@ namespace {
 
 bool fetch_and_cache(int timeout_ms)
 {
-	std::lock_guard<std::mutex> lk(s_mtx);
-
 	const int timeout_secs = (timeout_ms / 1000) > 0 ? (timeout_ms / 1000) : 14;
 
 	aida::auth::http::header_list_t headers;
@@ -314,8 +365,15 @@ bool fetch_and_cache(int timeout_ms)
 		return false;
 	}
 
-	if (!parse_and_replace(res.body))
+	std::vector<provider_info_t> providers;
+	std::vector<model_info_t> models;
+	std::string parse_error;
+	if (!parse_catalog_body(res.body, providers, models, parse_error)) {
+		set_error(parse_error);
 		return false;
+	}
+
+	publish_snapshot(std::move(providers), std::move(models));
 
 	if (!write_cache_file(res.body)) {
 		set_error("failed to write models cache file");
@@ -326,16 +384,18 @@ bool fetch_and_cache(int timeout_ms)
 
 bool load_cached_or_fetch(int max_age_seconds)
 {
-	{
-		std::lock_guard<std::mutex> lk(s_mtx);
-		const auto path = cache_path();
-		std::error_code ec;
-		if (std::filesystem::exists(path, ec)) {
-			const int64_t age = cache_age_seconds();
-			if (age >= 0 && age <= max_age_seconds) {
-				std::string body;
-				if (read_cache_file(body) && parse_and_replace(body))
-					return true;
+	const auto path = cache_path();
+	std::error_code ec;
+	if (std::filesystem::exists(path, ec)) {
+		const int64_t age = cache_age_seconds();
+		if (age >= 0 && age <= max_age_seconds) {
+			std::string body;
+			std::vector<provider_info_t> providers;
+			std::vector<model_info_t> models;
+			std::string parse_error;
+			if (read_cache_file(body) && parse_catalog_body(body, providers, models, parse_error)) {
+				publish_snapshot(std::move(providers), std::move(models));
+				return true;
 			}
 		}
 	}
@@ -349,54 +409,52 @@ void initialize_async(int max_age_seconds)
 	if (!s_init_started.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
 		return;
 
-	{
-		std::lock_guard<std::mutex> lk(s_mtx);
+	bool posted = work_queue::post([max_age_seconds]() {
 		const auto path = cache_path();
 		std::error_code ec;
+		bool cache_fresh = false;
 		if (std::filesystem::exists(path, ec)) {
-			std::string body;
-			if (read_cache_file(body))
-				(void)parse_and_replace(body);
-		}
-	}
-
-	bool needs_refresh = true;
-	{
-		std::lock_guard<std::mutex> lk(s_mtx);
-		const auto path = cache_path();
-		std::error_code ec;
-		if (s_loaded && std::filesystem::exists(path, ec)) {
 			const int64_t age = cache_age_seconds();
 			if (age >= 0 && age <= max_age_seconds)
-				needs_refresh = false;
+				cache_fresh = true;
+			std::string body;
+			std::vector<provider_info_t> providers;
+			std::vector<model_info_t> models;
+			std::string parse_error;
+			if (read_cache_file(body) && parse_catalog_body(body, providers, models, parse_error))
+				publish_snapshot(std::move(providers), std::move(models));
+			else if (!parse_error.empty())
+				set_error(parse_error);
 		}
-	}
 
-	if (!needs_refresh)
-		return;
+		auto snapshot = current_snapshot();
+		if (snapshot && snapshot->loaded && cache_fresh)
+			return;
 
-	bool refresh_expected = false;
-	if (!s_refresh_inflight.compare_exchange_strong(refresh_expected, true, std::memory_order_acq_rel))
-		return;
+		bool refresh_expected = false;
+		if (!s_refresh_inflight.compare_exchange_strong(refresh_expected, true, std::memory_order_acq_rel))
+			return;
 
-	work_queue::post([]() {
 		(void)fetch_and_cache();
 		s_refresh_inflight.store(false, std::memory_order_release);
 	});
+	if (!posted) {
+		s_init_started.store(false, std::memory_order_release);
+		set_error("failed to schedule models catalog initialization");
+	}
 }
 
 const std::vector<provider_info_t>& list_providers()
 {
 	initialize_async();
-	std::lock_guard<std::mutex> lk(s_mtx);
-	return s_providers;
+	return current_snapshot()->providers;
 }
 
 const provider_info_t* get_provider(const std::string& provider_id)
 {
 	initialize_async();
-	std::lock_guard<std::mutex> lk(s_mtx);
-	for (const auto& p : s_providers) {
+	auto snapshot = current_snapshot();
+	for (const auto& p : snapshot->providers) {
 		if (p.id == provider_id)
 			return &p;
 	}
@@ -406,21 +464,21 @@ const provider_info_t* get_provider(const std::string& provider_id)
 const model_info_t* get_model(const std::string& provider_id, const std::string& model_id)
 {
 	initialize_async();
-	std::lock_guard<std::mutex> lk(s_mtx);
-	return find_model_locked(provider_id, model_id);
+	auto snapshot = current_snapshot();
+	return find_model(*snapshot, provider_id, model_id);
 }
 
 std::vector<const model_info_t*> closest(const std::string& provider_id, const std::vector<std::string>& query_terms)
 {
 	initialize_async();
-	std::lock_guard<std::mutex> lk(s_mtx);
+	auto snapshot = current_snapshot();
 	std::vector<const model_info_t*> result;
 	if (query_terms.empty())
 		return result;
 
 	for (const auto& term : query_terms) {
 		const std::string lt = lower(term);
-		for (const auto& m : s_models) {
+		for (const auto& m : snapshot->models) {
 			if (m.provider_id != provider_id)
 				continue;
 			const std::string lid = lower(m.id);
@@ -444,7 +502,7 @@ std::vector<const model_info_t*> closest(const std::string& provider_id, const s
 const model_info_t* get_small_model(const std::string& provider_id)
 {
 	initialize_async();
-	std::lock_guard<std::mutex> lk(s_mtx);
+	auto snapshot = current_snapshot();
 
 	std::vector<std::string> priority = {
 		"claude-haiku-4-5",
@@ -464,7 +522,7 @@ const model_info_t* get_small_model(const std::string& provider_id)
 	}
 
 	const provider_info_t* prov = nullptr;
-	for (const auto& p : s_providers) {
+	for (const auto& p : snapshot->providers) {
 		if (p.id == provider_id) { prov = &p; break; }
 	}
 	if (!prov)
@@ -474,7 +532,7 @@ const model_info_t* get_small_model(const std::string& provider_id)
 		if (provider_id == "amazon-bedrock") {
 			const std::vector<std::string> cross_region_prefixes = { "global.", "us.", "eu." };
 			std::vector<const model_info_t*> candidates;
-			for (const auto& m : s_models) {
+			for (const auto& m : snapshot->models) {
 				if (m.provider_id != provider_id) continue;
 				if (m.id.find(token) != std::string::npos)
 					candidates.push_back(&m);
@@ -492,7 +550,7 @@ const model_info_t* get_small_model(const std::string& provider_id)
 					return c;
 			}
 		} else {
-			for (const auto& m : s_models) {
+			for (const auto& m : snapshot->models) {
 				if (m.provider_id != provider_id) continue;
 				if (m.id.find(token) != std::string::npos)
 					return &m;
@@ -502,7 +560,7 @@ const model_info_t* get_small_model(const std::string& provider_id)
 
 	const model_info_t* best = nullptr;
 	int64_t best_score = 0;
-	for (const auto& m : s_models) {
+	for (const auto& m : snapshot->models) {
 		if (m.provider_id != provider_id) continue;
 		const int64_t score = context_cost_score(m);
 		if (best == nullptr || score < best_score) {
@@ -516,7 +574,7 @@ const model_info_t* get_small_model(const std::string& provider_id)
 const model_info_t* default_model(const std::string& provider_id)
 {
 	initialize_async();
-	std::lock_guard<std::mutex> lk(s_mtx);
+	auto snapshot = current_snapshot();
 
 	static const std::vector<std::string> priority = {
 		"gpt-5",
@@ -526,7 +584,7 @@ const model_info_t* default_model(const std::string& provider_id)
 	};
 
 	for (const auto& token : priority) {
-		for (const auto& m : s_models) {
+		for (const auto& m : snapshot->models) {
 			if (m.provider_id != provider_id) continue;
 			if (m.id.find(token) != std::string::npos)
 				return &m;
@@ -534,7 +592,7 @@ const model_info_t* default_model(const std::string& provider_id)
 	}
 
 	const model_info_t* first = nullptr;
-	for (const auto& m : s_models) {
+	for (const auto& m : snapshot->models) {
 		if (m.provider_id != provider_id) continue;
 		if (!first || m.id < first->id)
 			first = &m;
@@ -542,7 +600,7 @@ const model_info_t* default_model(const std::string& provider_id)
 	return first;
 }
 
-const std::string& last_error()
+std::string last_error()
 {
 	std::lock_guard<std::mutex> lk(s_mtx);
 	return s_last_error;

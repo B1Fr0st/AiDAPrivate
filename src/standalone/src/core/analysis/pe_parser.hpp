@@ -165,56 +165,19 @@ inline bool parse_exports(uint64_t module_base, const pe_info_t& pe, std::vector
 	if (num_names > num_functions)
 		num_names = num_functions;
 
-	const bool bounded = max_entries != (std::numeric_limits<size_t>::max)();
-	uint32_t names_to_read = num_names;
-	if (bounded) {
-		size_t name_cap = max_entries * 4;
-		if (name_cap < max_entries)
-			name_cap = max_entries;
-		if (name_cap > 4096)
-			name_cap = 4096;
-		if (names_to_read > name_cap) {
-			names_to_read = static_cast<uint32_t>(name_cap);
-			if (truncated) *truncated = true;
-		}
-	}
-
 	std::vector<uint32_t> addr_table(num_functions);
 	if (!detail::read_mem(module_base + addr_table_rva, addr_table.data(), num_functions * 4))
 		return false;
 
-	std::vector<uint32_t> name_ptrs(names_to_read);
-	std::vector<uint16_t> ordinals(names_to_read);
-	if (names_to_read > 0) {
-		if (!detail::read_mem(module_base + name_table_rva, name_ptrs.data(), names_to_read * 4))
-			return false;
-		if (!detail::read_mem(module_base + ordinal_table_rva, ordinals.data(), names_to_read * 2))
-			return false;
-	}
-
-	std::vector<std::string> name_lookup(num_functions);
-	for (uint32_t i = 0; i < names_to_read; ++i) {
-		if (detail::deadline_expired(deadline)) {
-			if (truncated) *truncated = true;
-			return true;
-		}
-		if (ordinals[i] < num_functions) {
-			std::string fname;
-			detail::read_string_at(module_base + name_ptrs[i], 512, fname);
-			name_lookup[ordinals[i]] = std::move(fname);
-		}
-	}
-
 	uint32_t exp_start = pe.export_dir_rva;
 	uint32_t exp_end = pe.export_dir_rva + pe.export_dir_size;
+	if (exp_end < exp_start)
+		exp_end = (std::numeric_limits<uint32_t>::max)();
 
 	out.reserve(std::min<size_t>(num_functions, max_entries));
+	std::vector<int32_t> ordinal_to_output(num_functions, -1);
 	for (uint32_t i = 0; i < num_functions; ++i) {
 		if (out.size() >= max_entries) {
-			if (truncated) *truncated = true;
-			break;
-		}
-		if (detail::deadline_expired(deadline)) {
 			if (truncated) *truncated = true;
 			break;
 		}
@@ -225,14 +188,54 @@ inline bool parse_exports(uint64_t module_base, const pe_info_t& pe, std::vector
 		entry.ordinal = static_cast<uint16_t>(ordinal_base + i);
 		entry.rva = addr_table[i];
 		entry.address = module_base + addr_table[i];
-		entry.name = name_lookup[i];
+		entry.is_forwarded = addr_table[i] >= exp_start && addr_table[i] < exp_end;
 
-		if (addr_table[i] >= exp_start && addr_table[i] < exp_end) {
-			entry.is_forwarded = true;
-			detail::read_string_at(module_base + addr_table[i], 512, entry.forward_name);
-		}
-
+		ordinal_to_output[i] = static_cast<int32_t>(out.size());
 		out.push_back(std::move(entry));
+	}
+
+	if (num_names == 0 || out.empty() || name_table_rva == 0 || ordinal_table_rva == 0)
+		return true;
+	if (detail::deadline_expired(deadline)) {
+		if (truncated) *truncated = true;
+		return true;
+	}
+
+	std::vector<uint32_t> name_ptrs(num_names);
+	std::vector<uint16_t> ordinals(num_names);
+	if (!detail::read_mem(module_base + name_table_rva, name_ptrs.data(), num_names * 4)) {
+		if (truncated) *truncated = true;
+		return true;
+	}
+	if (!detail::read_mem(module_base + ordinal_table_rva, ordinals.data(), num_names * 2)) {
+		if (truncated) *truncated = true;
+		return true;
+	}
+
+	for (uint32_t i = 0; i < num_names; ++i) {
+		if (detail::deadline_expired(deadline)) {
+			if (truncated) *truncated = true;
+			return true;
+		}
+		uint16_t ord = ordinals[i];
+		if (ord >= num_functions)
+			continue;
+		int32_t out_index = ordinal_to_output[ord];
+		if (out_index < 0)
+			continue;
+		std::string fname;
+		if (detail::read_string_at(module_base + name_ptrs[i], 512, fname) && !fname.empty())
+			out[static_cast<size_t>(out_index)].name = std::move(fname);
+	}
+
+	for (auto& entry : out) {
+		if (!entry.is_forwarded)
+			continue;
+		if (detail::deadline_expired(deadline)) {
+			if (truncated) *truncated = true;
+			break;
+		}
+		detail::read_string_at(module_base + entry.rva, 512, entry.forward_name);
 	}
 
 	return true;

@@ -12,6 +12,48 @@ namespace anti_dump_kernel {
 
     inline volatile LONG g_permitted_pids[8] = {};
 
+    __forceinline char lowercase_ascii_char(char ch)
+    {
+        if (ch >= 'A' && ch <= 'Z')
+            return static_cast<char>(ch + ('a' - 'A'));
+        return ch;
+    }
+
+    __forceinline bool image_file_name_equals_ascii(const UCHAR* image_name, const char* target)
+    {
+        if (!image_name || !target)
+            return false;
+
+        ULONG index = 0;
+        __try {
+            for (; index < 15; ++index) {
+                char lhs = lowercase_ascii_char(static_cast<char>(image_name[index]));
+                char rhs = lowercase_ascii_char(target[index]);
+                if (rhs == '\0')
+                    return lhs == '\0';
+                if (lhs == '\0' || lhs != rhs)
+                    return false;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+
+        return target[index] == '\0';
+    }
+
+    __forceinline bool image_file_name_is_supported_ida_host(const UCHAR* image_name)
+    {
+        static const char* supported_ida_hosts[] = {
+            "ida.exe", "ida64.exe", "idaq.exe", "idaq64.exe",
+            "idat.exe", "idat64.exe", "idaw.exe", "idaw64.exe"
+        };
+        for (int i = 0; i < static_cast<int>(sizeof(supported_ida_hosts) / sizeof(supported_ida_hosts[0])); ++i) {
+            if (image_file_name_equals_ascii(image_name, supported_ida_hosts[i]))
+                return true;
+        }
+        return false;
+    }
+
     inline NTSTATUS hide_thread_object_from_debugger(PETHREAD thread)
     {
         if (!thread || !_ObOpenObjectByPointer || !_ZwSetInformationThread ||
@@ -443,6 +485,12 @@ namespace anti_dump_kernel {
 
                 UCHAR* name = PsGetProcessImageFileName(proc);
                 if (!name || !_MmIsAddressValid(name)) continue;
+
+                if (image_file_name_is_supported_ida_host(name)) {
+                    WW_LOG("anti_dump: supported IDA host ignored pid=%u name=%.15s",
+                        (UINT32)(ULONG_PTR)proc_pid, name);
+                    continue;
+                }
 
                 for (int t = 0; t < num_tools; ++t) {
                     const char* target = dump_tools[t];

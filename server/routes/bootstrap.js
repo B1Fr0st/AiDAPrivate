@@ -24,6 +24,9 @@ const MAX_CAMOUFOX_MCP_BYTES = positiveIntEnv('AIDA_CAMOUFOX_MCP_MAX_BYTES', 256
 const EAUTH_BODY = JSON.stringify({ ok: false, error_code: 'EAUTH' });
 const EAUTH_LENGTH = Buffer.byteLength(EAUTH_BODY, 'utf8');
 const ENCRYPTED_PACKAGE_FORMAT = 'encrypted-cbc-hmac-v1';
+const CAMOUFOX_BROWSER_DIR = 'camoufox-135.0.1-beta.24-win.x86_64';
+const DEFAULT_CAMOUFOX_SIDECAR_EXE_REL = `deps\\${CAMOUFOX_BROWSER_DIR}\\camoufox.exe`;
+const DEFAULT_CAMOUFOX_MCP_REL = 'deps\\AiDA_CamoufoxReverseMcp.exe';
 
 let s_schemaPromise = null;
 let s_tokenKey = null;
@@ -297,8 +300,18 @@ function validSignerThumbprint(value) {
     return /^[0-9a-f]{40}$/i.test(String(value || '').replace(/\s+/g, ''));
 }
 
+function repairKnownMangledSidecarRelativePath(value) {
+    const raw = String(value || '').trim();
+    const compact = raw.replace(/[\\/]/g, '');
+    if (compact === `deps${CAMOUFOX_BROWSER_DIR}camoufox.exe`) return DEFAULT_CAMOUFOX_SIDECAR_EXE_REL;
+    if (compact === 'depsAiDA_CamoufoxReverseMcp.exe') return DEFAULT_CAMOUFOX_MCP_REL;
+    if (compact === 'depscamoufox-reverse-mcp.exe') return 'deps\\camoufox-reverse-mcp.exe';
+    if (compact === 'depscamoufox_reverse_mcp.exe') return 'deps\\camoufox_reverse_mcp.exe';
+    return raw;
+}
+
 function safeSidecarRelativePath(value) {
-    const raw = String(value || '').trim().replace(/\//g, '\\');
+    const raw = repairKnownMangledSidecarRelativePath(value).replace(/\//g, '\\');
     if (!raw || raw.length > 220 || raw.includes(':') || path.isAbsolute(raw)) {
         return '';
     }
@@ -317,7 +330,7 @@ function getCamoufoxSidecarConfig() {
     const sha256 = String(process.env.AIDA_CAMOUFOX_SIDECAR_SHA256 || '').trim().toLowerCase();
     const version = String(process.env.AIDA_CAMOUFOX_SIDECAR_VERSION || 'current').trim();
     const size = Number(process.env.AIDA_CAMOUFOX_SIDECAR_SIZE || 0);
-    const executableRel = safeSidecarRelativePath(process.env.AIDA_CAMOUFOX_SIDECAR_EXE_REL || 'deps\\camoufox-135.0.1-beta.24-win.x86_64\\camoufox.exe');
+    const executableRel = safeSidecarRelativePath(process.env.AIDA_CAMOUFOX_SIDECAR_EXE_REL || DEFAULT_CAMOUFOX_SIDECAR_EXE_REL);
     const pythonRelRaw = String(process.env.AIDA_CAMOUFOX_SIDECAR_PYTHON_REL || '').trim();
     const pythonRel = pythonRelRaw ? safeSidecarRelativePath(pythonRelRaw) : '';
     let parsed;
@@ -376,7 +389,7 @@ function getCamoufoxMcpPatchConfig() {
     const sha256 = String(process.env.AIDA_CAMOUFOX_MCP_SHA256 || '').trim().toLowerCase();
     const version = String(process.env.AIDA_CAMOUFOX_MCP_VERSION || 'current').trim();
     const size = Number(process.env.AIDA_CAMOUFOX_MCP_SIZE || 0);
-    const rel = safeSidecarRelativePath(process.env.AIDA_CAMOUFOX_MCP_REL || 'deps\\AiDA_CamoufoxReverseMcp.exe');
+    const rel = safeSidecarRelativePath(process.env.AIDA_CAMOUFOX_MCP_REL || DEFAULT_CAMOUFOX_MCP_REL);
     let parsed;
     try {
         parsed = new URL(urlRaw);
@@ -812,6 +825,7 @@ function buildBootstrapScript() {
         'function Write-AidaStatus([string]$Message) { Write-AidaBootstrapLog ("status " + $Message); Write-Host ("[{0}] {1}" -f (Get-Date -Format "HH:mm:ss"), $Message) -ForegroundColor Cyan }',
         'function Set-AidaProcessEnvValue([string]$Name,$Value) { [Environment]::SetEnvironmentVariable($Name, $Value, "Process"); if ($null -eq $Value) { Remove-Item -Path ("Env:\\" + $Name) -ErrorAction SilentlyContinue } else { Set-Item -Path ("Env:\\" + $Name) -Value $Value } }',
         'function Get-AidaDesktopDirectory { $d = [Environment]::GetFolderPath("DesktopDirectory"); if (-not $d) { $up = [Environment]::GetEnvironmentVariable("USERPROFILE"); if ($up) { $d = Join-Path $up "Desktop" } }; if (-not $d) { throw "AiDA fileless debug log desktop path is unavailable." }; if (-not [IO.Directory]::Exists($d)) { [IO.Directory]::CreateDirectory($d) | Out-Null }; return $d }',
+        'function Get-AidaLocalAppDataDirectory { $d = [Environment]::GetFolderPath("LocalApplicationData"); if (-not $d) { $d = [Environment]::GetEnvironmentVariable("LOCALAPPDATA") }; if (-not $d) { throw "LOCALAPPDATA is unavailable for AiDA Camoufox setup." }; if (-not [IO.Directory]::Exists($d)) { [IO.Directory]::CreateDirectory($d) | Out-Null }; return $d }',
         'function Initialize-AidaFilelessDebugLog([string]$ArtifactHash,[int64]$ImageBytes) { $dir = Get-AidaDesktopDirectory; $path = Join-Path $dir "aida_debug_fileless.log"; $hostExe = ""; try { $hostExe = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName } catch { }; $prefix = ""; if ($ArtifactHash) { $prefix = $ArtifactHash.Substring(0, [Math]::Min(16, $ArtifactHash.Length)) }; $line = "AiDA fileless debug log started {0:O} pid={1} tid={2} host_exe={3} bootstrap_log={4} image_bytes={5} artifact_sha256_prefix={6} no_disk_write=1{7}" -f [DateTimeOffset]::UtcNow, $PID, [System.Threading.Thread]::CurrentThread.ManagedThreadId, $hostExe, $AidaBootstrapLogPath, $ImageBytes, $prefix, [Environment]::NewLine; [IO.File]::WriteAllText($path, $line, [Text.Encoding]::UTF8); Write-AidaBootstrapLog ("fileless_debug_log_ready path=" + $path + " bytes=" + $ImageBytes); return $path }',
         'function Test-AidaNoStandaloneDiskArtifact([string]$Stage,[int64]$ExpectedSize) { $roots = @([IO.Path]::GetTempPath(), [Environment]::CurrentDirectory, (Get-AidaDesktopDirectory)) | Where-Object { $_ } | Select-Object -Unique; $cutoff = $script:AidaBootstrapStartUtc.UtcDateTime.AddSeconds(-2); $checked = 0; foreach ($root in $roots) { if (-not [IO.Directory]::Exists($root)) { continue }; foreach ($candidate in [IO.Directory]::EnumerateFiles($root, "AiDAStandalone.exe", [IO.SearchOption]::TopDirectoryOnly)) { $checked++; $fi = New-Object IO.FileInfo($candidate); $fresh = ($fi.LastWriteTimeUtc -ge $cutoff -or $fi.CreationTimeUtc -ge $cutoff); $sizeMatch = ($ExpectedSize -le 0 -or $fi.Length -eq $ExpectedSize); if ($fresh -and $sizeMatch) { Write-AidaBootstrapLog ("no_disk_write_validation_failed stage={0} path={1} len={2} last_write={3:O}" -f $Stage,$candidate,$fi.Length,$fi.LastWriteTimeUtc); throw "AiDA fileless no-disk-write validation failed." } } }; Write-AidaBootstrapLog ("no_disk_write_validation stage={0} checked={1} expected_size={2} fresh_matches=0" -f $Stage,$checked,$ExpectedSize) }',
         'function ConvertTo-AidaHex([byte[]]$Bytes) { -join ($Bytes | ForEach-Object { $_.ToString("x2") }) }',
@@ -916,41 +930,64 @@ function buildBootstrapScript() {
         '    if ($Uri.Scheme -ne "https") { throw "AiDA Camoufox sidecar URL must use HTTPS." }',
         '    if ($ExpectedSize -le 0 -or $ExpectedSize -gt $AidaMaxSidecarBytes) { throw "AiDA Camoufox sidecar size is not allowed." }',
         '    if (-not $ExpectedSha256 -or $ExpectedSha256 -notmatch "^[0-9a-fA-F]{64}$") { throw "AiDA Camoufox sidecar SHA-256 metadata is invalid." }',
-        '    $req = $null; $resp = $null; $stream = $null; $fs = $null; $sha = $null; $buf = New-Object byte[] 1048576; $ok = $false',
+        '    $req = $null; $resp = $null; $stream = $null; $fs = $null; $sha = $null; $readFs = $null; $buf = New-Object byte[] 1048576; $ok = $false; $done = [int64]0; $attempt = 0; $maxAttempts = 10; $progressNext = [int64]0; $sw = [Diagnostics.Stopwatch]::StartNew()',
         '    try {',
         '        if ([IO.File]::Exists($Path)) { [IO.File]::Delete($Path) }',
-        '        $req = [Net.HttpWebRequest]::Create($Uri.AbsoluteUri)',
-        '        $req.Method = "GET"',
-        '        $req.UserAgent = "AiDA Bootstrap"',
-        '        $req.AllowAutoRedirect = $false',
-        '        $req.Timeout = 600000',
-        '        $req.ReadWriteTimeout = 600000',
-        '        try { $req.AllowReadStreamBuffering = $false } catch { }',
-        '        $resp = $req.GetResponse()',
-        '        Write-AidaBootstrapLog ("camoufox_sidecar_download_response status=" + [int]$resp.StatusCode + " content_length=" + $resp.ContentLength)',
-        '        if ([int]$resp.StatusCode -ne 200) { throw "AiDA Camoufox sidecar download failed." }',
-        '        if ($resp.ContentLength -ge 0 -and [int64]$resp.ContentLength -ne $ExpectedSize) { throw "AiDA Camoufox sidecar size mismatch." }',
-        '        $stream = $resp.GetResponseStream()',
-        '        $fs = [IO.File]::Open($Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)',
-        '        $sha = [Security.Cryptography.SHA256]::Create()',
-        '        $done = [int64]0',
-        '        while (($read = $stream.Read($buf, 0, $buf.Length)) -gt 0) {',
-        '            $done += $read',
-        '            if ($done -gt $ExpectedSize) { throw "AiDA Camoufox sidecar exceeded expected size." }',
-        '            $null = $sha.TransformBlock($buf, 0, $read, $buf, 0)',
-        '            $fs.Write($buf, 0, $read)',
-        '            $pct = [Math]::Min(100, [Math]::Round(($done * 100.0) / $ExpectedSize, 1))',
-        '            Write-Progress -Activity "Downloading Camoufox sidecar" -Status ("{0:N1} MB / {1:N1} MB" -f ($done / 1MB), ($ExpectedSize / 1MB)) -PercentComplete $pct',
+        '        while ($done -lt $ExpectedSize) {',
+        '            $attempt++',
+        '            $before = $done',
+        '            try {',
+        '                $req = [Net.HttpWebRequest]::Create($Uri.AbsoluteUri)',
+        '                $req.Method = "GET"',
+        '                $req.UserAgent = "AiDA Bootstrap"',
+        '                $req.AllowAutoRedirect = $false',
+        '                $req.Timeout = 900000',
+        '                $req.ReadWriteTimeout = 900000',
+        '                try { $req.AllowReadStreamBuffering = $false } catch { }',
+        '                if ($done -gt 0) { try { $req.AddRange([int64]$done) } catch { $req.Headers["Range"] = ("bytes={0}-" -f $done) } }',
+        '                Write-AidaBootstrapLog ("camoufox_sidecar_download_attempt attempt={0} offset={1}" -f $attempt,$done)',
+        '                $resp = $req.GetResponse()',
+        '                $status = [int]$resp.StatusCode',
+        '                Write-AidaBootstrapLog ("camoufox_sidecar_download_response attempt={0} status={1} content_length={2} range={3}" -f $attempt,$status,$resp.ContentLength,$resp.Headers["Content-Range"])',
+        '                if ($done -eq 0) { if ($status -ne 200 -and $status -ne 206) { throw "AiDA Camoufox sidecar download failed." }; if ($status -eq 200 -and $resp.ContentLength -ge 0 -and [int64]$resp.ContentLength -ne $ExpectedSize) { throw "AiDA Camoufox sidecar size mismatch." } }',
+        '                else { if ($status -eq 200) { Write-AidaBootstrapLog ("camoufox_sidecar_range_unsupported_restart attempt={0} old_offset={1}" -f $attempt,$done); $done = 0; $before = 0; $progressNext = 0 } elseif ($status -ne 206) { throw "AiDA Camoufox sidecar resume failed." } }',
+        '                $stream = $resp.GetResponseStream()',
+        '                $fs = [IO.File]::Open($Path, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::Write, [IO.FileShare]::None)',
+        '                $fs.SetLength($done)',
+        '                $null = $fs.Seek($done, [IO.SeekOrigin]::Begin)',
+        '                while (($read = $stream.Read($buf, 0, $buf.Length)) -gt 0) {',
+        '                    if ($done + $read -gt $ExpectedSize) { throw "AiDA Camoufox sidecar exceeded expected size." }',
+        '                    $fs.Write($buf, 0, $read)',
+        '                    $done += $read',
+        '                    $pct = [Math]::Min(100, [Math]::Round(($done * 100.0) / $ExpectedSize, 1))',
+        '                    if ($done -ge $progressNext -or $done -eq $ExpectedSize) { $elapsedMs = [Math]::Max(1, [int64]$sw.ElapsedMilliseconds); $rate = [int64](($done * 1000.0) / $elapsedMs); Write-AidaBootstrapLog ("camoufox_sidecar_download_progress bytes={0} expected={1} pct={2} elapsed_ms={3} rate_bps={4} attempt={5}" -f $done,$ExpectedSize,$pct,$elapsedMs,$rate,$attempt); $progressNext = $done + 5242880 }',
+        '                    Write-Progress -Activity "Downloading Camoufox sidecar" -Status ("{0:N1} MB / {1:N1} MB" -f ($done / 1MB), ($ExpectedSize / 1MB)) -PercentComplete $pct',
+        '                }',
+        '                if ($fs) { $fs.Dispose(); $fs = $null }',
+        '                if ($stream) { $stream.Dispose(); $stream = $null }',
+        '                if ($resp) { $resp.Dispose(); $resp = $null }',
+        '                if ($done -lt $ExpectedSize) { Write-AidaBootstrapLog ("camoufox_sidecar_download_attempt_incomplete attempt={0} before={1} after={2} expected={3}" -f $attempt,$before,$done,$ExpectedSize) }',
+        '            } catch {',
+        '                Write-AidaBootstrapLog ("camoufox_sidecar_download_attempt_error attempt={0} bytes={1} expected={2} elapsed_ms={3} error={4}: {5}" -f $attempt,$done,$ExpectedSize,[int64]$sw.ElapsedMilliseconds,$_.Exception.GetType().FullName,$_.Exception.Message)',
+        '                if ($attempt -ge $maxAttempts) { throw }',
+        '            } finally {',
+        '                if ($fs) { $fs.Dispose(); $fs = $null }',
+        '                if ($stream) { $stream.Dispose(); $stream = $null }',
+        '                if ($resp) { $resp.Dispose(); $resp = $null }',
+        '            }',
+        '            if ($done -lt $ExpectedSize) { if ($attempt -ge $maxAttempts) { throw "AiDA Camoufox sidecar download size mismatch." }; Start-Sleep -Seconds ([Math]::Min(20, 2 * $attempt)) }',
         '        }',
-        '        if ($done -ne $ExpectedSize) { throw "AiDA Camoufox sidecar download size mismatch." }',
-        '        $empty = New-Object byte[] 0',
-        '        $null = $sha.TransformFinalBlock($empty, 0, 0)',
-        '        $actualSha256 = ConvertTo-AidaHex $sha.Hash',
+        '        $item = Get-Item -LiteralPath $Path -ErrorAction Stop',
+        '        if ([int64]$item.Length -ne [int64]$ExpectedSize) { Write-AidaBootstrapLog ("camoufox_sidecar_download_file_size_mismatch bytes={0} expected={1}" -f $item.Length,$ExpectedSize); throw "AiDA Camoufox sidecar download size mismatch." }',
+        '        $sha = [Security.Cryptography.SHA256]::Create()',
+        '        $readFs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)',
+        '        $actualSha256 = ConvertTo-AidaHex ($sha.ComputeHash($readFs))',
         '        if (-not (Test-AidaHexEqual $actualSha256 $ExpectedSha256)) { throw "AiDA Camoufox sidecar SHA-256 verification failed." }',
-        '        Write-AidaBootstrapLog ("camoufox_sidecar_download_complete bytes=" + $done + " sha256=" + $actualSha256)',
+        '        Write-AidaBootstrapLog ("camoufox_sidecar_download_complete bytes={0} elapsed_ms={1} sha256={2} attempts={3}" -f $done,[int64]$sw.ElapsedMilliseconds,$actualSha256,$attempt)',
         '        $ok = $true',
         '        return $Path',
-        '    } catch { Write-AidaBootstrapLog ("camoufox_sidecar_download_error error=" + $_.Exception.GetType().FullName + ": " + $_.Exception.Message); throw } finally {',
+        '    } catch { Write-AidaBootstrapLog ("camoufox_sidecar_download_error bytes={0} expected={1} elapsed_ms={2} attempts={3} error={4}: {5}" -f $done,$ExpectedSize,[int64]$sw.ElapsedMilliseconds,$attempt,$_.Exception.GetType().FullName,$_.Exception.Message); throw } finally {',
+        '        if ($readFs) { $readFs.Dispose() }',
         '        if ($sha) { $sha.Dispose() }',
         '        if ($fs) { $fs.Dispose() }',
         '        if ($stream) { $stream.Dispose() }',
@@ -959,6 +996,18 @@ function buildBootstrapScript() {
         '        if (-not $ok) { try { if ([IO.File]::Exists($Path)) { [IO.File]::Delete($Path) } } catch { } }',
         '        Write-Progress -Activity "Downloading Camoufox sidecar" -Completed',
         '    }',
+        '}',
+        'function Test-AidaVerifiedSidecarFile([string]$Path, [long]$ExpectedSize, [string]$ExpectedSha256) {',
+        '    if (-not $Path -or -not [IO.File]::Exists($Path) -or $ExpectedSize -le 0 -or -not $ExpectedSha256 -or $ExpectedSha256 -notmatch "^[0-9a-fA-F]{64}$") { return $false }',
+        '    $fs = $null; $sha = $null',
+        '    try {',
+        '        $item = Get-Item -LiteralPath $Path -ErrorAction Stop',
+        '        if ([int64]$item.Length -ne [int64]$ExpectedSize) { return $false }',
+        '        $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)',
+        '        $sha = [Security.Cryptography.SHA256]::Create()',
+        '        $actual = ConvertTo-AidaHex ($sha.ComputeHash($fs))',
+        '        return (Test-AidaHexEqual $actual $ExpectedSha256)',
+        '    } catch { return $false } finally { if ($sha) { $sha.Dispose() }; if ($fs) { $fs.Dispose() } }',
         '}',
         'function Find-AidaCamoufoxMcpExecutable([string]$Root) {',
         '    $rels = @("deps\\AiDA_CamoufoxReverseMcp.exe","deps\\camoufox-reverse-mcp.exe","deps\\camoufox_reverse_mcp.exe","deps\\camoufox-reverse-mcp\\AiDA_CamoufoxReverseMcp.exe","deps\\camoufox-reverse-mcp\\camoufox-reverse-mcp.exe","AiDA_CamoufoxReverseMcp.exe","camoufox-reverse-mcp.exe","camoufox_reverse_mcp.exe")',
@@ -996,6 +1045,7 @@ function buildBootstrapScript() {
         '    $expectedSha256 = [string]$m.sha256',
         '    $targetRel = if ([string]$m.rel) { [string]$m.rel } else { "deps\\AiDA_CamoufoxReverseMcp.exe" }',
         '    $target = Join-AidaSafeChildPath $Root $targetRel',
+        '    if ((Test-AidaVerifiedSidecarFile $target $expectedSize $expectedSha256) -and (Test-AidaCamoufoxMcpExecutable $target $ExePath $Root)) { Write-AidaBootstrapLog ("camoufox_mcp_patch_current_ok path=" + $target + " bytes=" + $expectedSize + " sha256=" + $expectedSha256); return $target }',
         '    $tmp = Join-Path ([IO.Path]::GetTempPath()) ("aida-camoufox-mcp-" + [Guid]::NewGuid().ToString("N") + ".exe")',
         '    try {',
         '        Write-AidaStatus "Updating Camoufox bridge executable..."',
@@ -1039,16 +1089,16 @@ function buildBootstrapScript() {
         '    $expectedSha256 = [string]$c.sha256',
         '    $exeRel = [string]$c.executable_rel',
         '    $pythonRel = [string]$c.python_rel',
-        '    $tempRoot = [IO.Path]::GetTempPath(); if (-not $tempRoot) { $tempRoot = $env:TEMP }; if (-not $tempRoot) { throw "TEMP is unavailable for AiDA Camoufox setup." }',
-        '    $root = Join-Path $tempRoot "AiDA\\camoufox"',
+        '    $localRoot = Join-Path (Get-AidaLocalAppDataDirectory) "AiDA\\Standalone"',
+        '    $root = Join-Path $localRoot "camoufox"',
         '    $current = Join-Path $root "current"',
         '    $stampPath = Join-Path $current "aida-camoufox-sidecar.json"',
         '    $exePath = Join-AidaSafeChildPath $current $exeRel',
         '    $pythonPath = if ($pythonRel) { Join-AidaSafeChildPath $current $pythonRel } else { "" }',
         '    $mcpPath = if ([IO.Directory]::Exists($current)) { Find-AidaCamoufoxMcpExecutable $current } else { "" }',
         '    $cached = $false',
+        '    if ([IO.File]::Exists($exePath)) { $patchedMcp = Install-AidaCamoufoxMcpPatch $Manifest $current $exePath; if ($patchedMcp) { $mcpPath = $patchedMcp } }',
         '    if (Test-AidaCamoufoxSidecarInstalled $current $exePath $pythonPath $mcpPath) { Set-AidaCamoufoxEnvironment $exePath $pythonPath $mcpPath; Write-AidaStatus "Camoufox sidecar ready."; Write-AidaBootstrapLog ("camoufox_sidecar_existing_usable exe=" + $exePath + " mcp=" + $mcpPath); return }',
-        '    if ([IO.File]::Exists($exePath)) { try { $patchedMcp = Install-AidaCamoufoxMcpPatch $Manifest $current $exePath; if ($patchedMcp) { $mcpPath = $patchedMcp } } catch { Write-AidaBootstrapLog ("camoufox_mcp_patch_existing_failed " + $_.Exception.GetType().FullName + ": " + $_.Exception.Message) }; if (Test-AidaCamoufoxSidecarInstalled $current $exePath $pythonPath $mcpPath) { Set-AidaCamoufoxEnvironment $exePath $pythonPath $mcpPath; Write-AidaStatus "Camoufox sidecar ready."; Write-AidaBootstrapLog ("camoufox_sidecar_existing_repaired exe=" + $exePath + " mcp=" + $mcpPath); return } }',
         '    if ([IO.File]::Exists($stampPath)) { try { $stamp = Get-Content -LiteralPath $stampPath -Raw | ConvertFrom-Json; $cached = ([string]$stamp.sha256).ToLowerInvariant() -eq $expectedSha256.ToLowerInvariant() -and [string]$stamp.version -eq [string]$c.version -and [string]$stamp.executable_rel -eq $exeRel -and [string]$stamp.python_rel -eq $pythonRel } catch { $cached = $false } }',
         '    if ($cached -and (Test-AidaCamoufoxSidecarInstalled $current $exePath $pythonPath $mcpPath)) { Set-AidaCamoufoxEnvironment $exePath $pythonPath $mcpPath; Write-AidaStatus "Camoufox sidecar ready."; Write-AidaBootstrapLog ("camoufox_sidecar_cached exe=" + $exePath + " mcp=" + $mcpPath); return }',
         '    Write-AidaStatus "Preparing verified Camoufox sidecar..."',
@@ -1064,8 +1114,8 @@ function buildBootstrapScript() {
         '        Expand-Archive -LiteralPath $zipPath -DestinationPath $staging -Force',
         '        $stageExe = Join-AidaSafeChildPath $staging $exeRel',
         '        $stagePython = if ($pythonRel) { Join-AidaSafeChildPath $staging $pythonRel } else { "" }',
-        '        $stageMcp = Find-AidaCamoufoxMcpExecutable $staging',
-        '        if (-not (Test-AidaCamoufoxSidecarInstalled $staging $stageExe $stagePython $stageMcp)) { $patchedStageMcp = Install-AidaCamoufoxMcpPatch $Manifest $staging $stageExe; if ($patchedStageMcp) { $stageMcp = $patchedStageMcp } }',
+        '        $stageMcp = Install-AidaCamoufoxMcpPatch $Manifest $staging $stageExe',
+        '        if (-not $stageMcp) { $stageMcp = Find-AidaCamoufoxMcpExecutable $staging }',
         '        if (-not (Test-AidaCamoufoxSidecarInstalled $staging $stageExe $stagePython $stageMcp)) { throw "AiDA Camoufox sidecar contents are incomplete." }',
         '        $stamp = [pscustomobject]@{ sha256 = $expectedSha256; version = [string]$c.version; executable_rel = $exeRel; python_rel = $pythonRel; installed_at = [DateTimeOffset]::UtcNow.ToString("O") } | ConvertTo-Json -Depth 4 -Compress',
         '        [IO.File]::WriteAllText((Join-Path $staging "aida-camoufox-sidecar.json"), $stamp, [Text.Encoding]::UTF8)',

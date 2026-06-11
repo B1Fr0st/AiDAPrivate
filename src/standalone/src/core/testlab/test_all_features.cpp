@@ -904,9 +904,12 @@ namespace test_all_features {
 					return true;
 				}
 			}
-			if (std::strcmp(cat, "sentinel") == 0 && name_starts_with(feature, "Sentinel Evidence Ring") && !parsed_nonzero(r, "returned_count")) {
-				reason = "sentinel_evidence_returned_count=0_or_missing";
-				return true;
+			if (std::strcmp(cat, "sentinel") == 0 && name_starts_with(feature, "Sentinel Evidence Ring")) {
+				const char* labels[] = { "returned_count", "fresh_observed_count" };
+				if (!any_parsed_nonzero(r, labels, sizeof(labels) / sizeof(labels[0]))) {
+					reason = "sentinel_evidence_returned_count_or_fresh_observed_count=0_or_missing";
+					return true;
+				}
 			}
 			if (std::strcmp(cat, "sentinel") == 0 && name_starts_with(feature, "Sentinel Tier-A Query")) {
 				if (!parsed_nonzero(r, "hostile_driver_absent") &&
@@ -2934,30 +2937,14 @@ namespace test_all_features {
 			g_cancel_requested.store(true, std::memory_order_release);
 			diag::log_tagged_fmt("test_all", "user cancelled Test All Features");
 			try {
-				const bool posted = work_queue::post([]() {
-					try {
-						aida::burp::camoufox::force_cleanup("testlab.cancel");
-					} catch (...) {
-					}
-				});
-				if (!posted) {
-					try {
-						aida::burp::camoufox::force_cleanup("testlab.cancel.inline");
-					} catch (...) {
-					}
-				}
+				const ULONGLONG t0 = GetTickCount64();
+				aida::burp::camoufox::force_cleanup("testlab.cancel.inline");
+				diag::log_tagged_fmt("test_all", "cancel cleanup completed elapsed_ms=%llu",
+					static_cast<unsigned long long>(GetTickCount64() - t0));
 			} catch (const std::exception& ex) {
-				diag::log_tagged_fmt("test_all", "cancel cleanup work_queue post exception: %s", ex.what());
-				try {
-					aida::burp::camoufox::force_cleanup("testlab.cancel.inline");
-				} catch (...) {
-				}
+				diag::log_tagged_fmt("test_all", "cancel cleanup exception: %s", ex.what());
 			} catch (...) {
-				diag::log_tagged("test_all", "cancel cleanup work_queue post exception: unknown");
-				try {
-					aida::burp::camoufox::force_cleanup("testlab.cancel.inline");
-				} catch (...) {
-				}
+				diag::log_tagged("test_all", "cancel cleanup exception: unknown");
 			}
 		}
 

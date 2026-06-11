@@ -1759,26 +1759,46 @@ void helpers::render_title()
 
 
 		static bool initial_grow_done = false;
+		static bool fileless_initial_geometry_logged = false;
 		if (!initial_grow_done) {
 			if (globals::ui::welcome_done && runtime_ready) {
 				initial_grow_done = true;
-				globals::ui::maximized = true;
 				MONITORINFO mi2 = { sizeof(mi2) };
 				GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &mi2);
 				float mw = static_cast<float>(mi2.rcWork.right - mi2.rcWork.left);
 				float mh = static_cast<float>(mi2.rcWork.bottom - mi2.rcWork.top);
-				globals::ui::pre_max_x = static_cast<float>(mi2.rcWork.left) + (mw - mw * 0.75f) * 0.5f;
-				globals::ui::pre_max_y = static_cast<float>(mi2.rcWork.top) + (mh - mh * 0.75f) * 0.5f;
-				globals::ui::pre_max_w = mw * 0.75f;
-				globals::ui::pre_max_h = mh * 0.75f;
-				globals::ui::window_w = mw;
-				globals::ui::window_h = mh;
-				SetWindowPos(g_hwnd, nullptr,
-					mi2.rcWork.left, mi2.rcWork.top,
-					static_cast<int>(mw), static_cast<int>(mh), SWP_NOZORDER);
-				SetWindowRgn(g_hwnd, nullptr, TRUE);
-				DWM_WINDOW_CORNER_PREFERENCE cp = DWMWCP_DONOTROUND;
-				DwmSetWindowAttribute(g_hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cp, sizeof(cp));
+				float normal_w = mw * 0.75f;
+				float normal_h = mh * 0.75f;
+				if (normal_w < 1000.f && mw >= 1000.f) normal_w = (std::min)(mw, 1000.f);
+				if (normal_h < 600.f && mh >= 600.f) normal_h = (std::min)(mh, 600.f);
+				globals::ui::pre_max_x = static_cast<float>(mi2.rcWork.left) + (mw - normal_w) * 0.5f;
+				globals::ui::pre_max_y = static_cast<float>(mi2.rcWork.top) + (mh - normal_h) * 0.5f;
+				globals::ui::pre_max_w = normal_w;
+				globals::ui::pre_max_h = normal_h;
+				if (diag::env_flag_enabled("AIDA_FILELESS_LAUNCH")) {
+					globals::ui::maximized = false;
+					globals::ui::window_w = normal_w;
+					globals::ui::window_h = normal_h;
+					if (!fileless_initial_geometry_logged) {
+						fileless_initial_geometry_logged = true;
+						diag::log_tagged_critical_fmt("render",
+							"fileless_initial_ide_geometry target=%d,%d work=%d,%d maximized=0",
+							static_cast<int>(normal_w),
+							static_cast<int>(normal_h),
+							static_cast<int>(mw),
+							static_cast<int>(mh));
+					}
+				} else {
+					globals::ui::maximized = true;
+					globals::ui::window_w = mw;
+					globals::ui::window_h = mh;
+					SetWindowPos(g_hwnd, nullptr,
+						mi2.rcWork.left, mi2.rcWork.top,
+						static_cast<int>(mw), static_cast<int>(mh), SWP_NOZORDER);
+					SetWindowRgn(g_hwnd, nullptr, TRUE);
+					DWM_WINDOW_CORNER_PREFERENCE cp = DWMWCP_DONOTROUND;
+					DwmSetWindowAttribute(g_hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cp, sizeof(cp));
+				}
 			} else {
 				float spd = 12.f;
 				float dw = tw - globals::ui::window_w;

@@ -214,6 +214,29 @@ test('camoufox MCP patch config is optional but fails closed when configured uns
     process.env.AIDA_CAMOUFOX_MCP_SHA256 = prevSha;
 });
 
+test('camoufox relative paths preserve separators across slash-safe and legacy metadata', () => {
+    const prevExeRel = process.env.AIDA_CAMOUFOX_SIDECAR_EXE_REL;
+    const prevMcpRel = process.env.AIDA_CAMOUFOX_MCP_REL;
+    try {
+        process.env.AIDA_CAMOUFOX_SIDECAR_EXE_REL = 'deps/camoufox-135.0.1-beta.24-win.x86_64/camoufox.exe';
+        process.env.AIDA_CAMOUFOX_MCP_REL = 'deps/AiDA_CamoufoxReverseMcp.exe';
+        let cfg = bootstrap.getCamoufoxSidecarConfig();
+        assert.equal(cfg.ok, true);
+        assert.equal(cfg.executable_rel, 'deps\\camoufox-135.0.1-beta.24-win.x86_64\\camoufox.exe');
+        assert.equal(cfg.mcp.rel, 'deps\\AiDA_CamoufoxReverseMcp.exe');
+
+        process.env.AIDA_CAMOUFOX_SIDECAR_EXE_REL = 'depscamoufox-135.0.1-beta.24-win.x86_64camoufox.exe';
+        process.env.AIDA_CAMOUFOX_MCP_REL = 'depsAiDA_CamoufoxReverseMcp.exe';
+        cfg = bootstrap.getCamoufoxSidecarConfig();
+        assert.equal(cfg.ok, true);
+        assert.equal(cfg.executable_rel, 'deps\\camoufox-135.0.1-beta.24-win.x86_64\\camoufox.exe');
+        assert.equal(cfg.mcp.rel, 'deps\\AiDA_CamoufoxReverseMcp.exe');
+    } finally {
+        process.env.AIDA_CAMOUFOX_SIDECAR_EXE_REL = prevExeRel;
+        process.env.AIDA_CAMOUFOX_MCP_REL = prevMcpRel;
+    }
+});
+
 test('release config rejects oversized encrypted packages', () => {
     const prevSize = process.env.AIDA_BOOTSTRAP_PACKAGE_SIZE;
     const prevMax = process.env.AIDA_BOOTSTRAP_PACKAGE_MAX_BYTES;
@@ -464,17 +487,34 @@ test('bootstrap script contains encrypted package verification and parses as Pow
     assert.match(script, /FeatureSettingsOverride/);
     assert.match(script, /Parsec/);
     assert.match(script, /Save-AidaVerifiedSidecarFile/);
+    assert.match(script, /Test-AidaVerifiedSidecarFile/);
     assert.match(script, /camoufox_sidecar_hash_required/);
     assert.match(script, /camoufox_mcp_hash_required/);
+    assert.match(script, /camoufox_mcp_patch_current_ok/);
     assert.match(script, /camoufox_mcp_patch_installed/);
     assert.match(script, /Downloading Camoufox sidecar/);
+    assert.match(script, /camoufox_sidecar_download_attempt attempt=/);
+    assert.match(script, /camoufox_sidecar_download_attempt_incomplete/);
+    assert.match(script, /camoufox_sidecar_download_attempt_error/);
+    assert.match(script, /camoufox_sidecar_download_progress bytes=/);
+    assert.match(script, /camoufox_sidecar_range_unsupported_restart/);
+    assert.match(script, /camoufox_sidecar_download_complete bytes=.*attempts=/);
     assert.match(script, /Expand-Archive/);
-    assert.match(script, /\$root = Join-Path \$tempRoot "AiDA\\camoufox"/);
+    assert.match(script, /Get-AidaLocalAppDataDirectory/);
+    assert.match(script, /\$localRoot = Join-Path \(Get-AidaLocalAppDataDirectory\) "AiDA\\Standalone"/);
+    assert.match(script, /\$root = Join-Path \$localRoot "camoufox"/);
+    assert.doesNotMatch(script, /\$root = Join-Path \$tempRoot "AiDA\\camoufox"/);
     assert.match(script, /Find-AidaCamoufoxMcpExecutable/);
     assert.match(script, /AIDA_CAMOUFOX_MCP_EXECUTABLE/);
     assert.match(script, /AIDA_CAMOUFOX_EXECUTABLE/);
     assert.match(script, /AIDA_CAMOUFOX_ALLOW_SYSTEM_PYTHON/);
     assert.match(script, /AIDA_CAMOUFOX_ALLOW_SETUP_BOOTSTRAP/);
+    const existingPatch = script.indexOf('$patchedMcp = Install-AidaCamoufoxMcpPatch $Manifest $current $exePath');
+    const existingAccept = script.indexOf('camoufox_sidecar_existing_usable exe=');
+    const freshPatch = script.indexOf('$stageMcp = Install-AidaCamoufoxMcpPatch $Manifest $staging $stageExe');
+    const freshValidate = script.indexOf('AiDA Camoufox sidecar contents are incomplete.');
+    assert.ok(existingPatch >= 0 && existingAccept > existingPatch);
+    assert.ok(freshPatch >= 0 && freshValidate > freshPatch);
     assert.match(script, /Downloading and verifying encrypted package/);
     assert.match(script, /\$req\.ReadWriteTimeout = 900000/);
     assert.match(script, /package_download_progress bytes=/);

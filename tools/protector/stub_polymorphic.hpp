@@ -459,17 +459,18 @@ inline generated_stub_t generate(const stub_config_t& cfg) {
     a.add(x86::rax, static_cast<int32_t>(aida_payload::kEntryOffset));
     a.call(x86::rax);
 
-    a.mov(rBase, x86::qword_ptr(x86::rsp, 0x20));
-    a.lea(x86::rax, x86::ptr(rBase, static_cast<int32_t>(cfg.original_entry_rva)));
-
     uint32_t tail_variant = rng.range(4u);
-    if (tail_variant == 1u || tail_variant == 3u) {
-        a.mov(x86::qword_ptr(lSlot), x86::rax);
-    }
 
     emit_opaque_predicate(a, rTmp2, rng);
 
     emit_overlap_dispatch(a, rng);
+
+    a.mov(rBase, x86::qword_ptr(x86::rsp, 0x20));
+    a.lea(x86::rax, x86::ptr(rBase, static_cast<int32_t>(cfg.original_entry_rva)));
+
+    if (tail_variant == 1u || tail_variant == 3u) {
+        a.mov(x86::qword_ptr(lSlot), x86::rax);
+    }
 
     a.add(x86::rsp, 0x28);
     for (size_t i = push_order.size(); i > 0; --i) {

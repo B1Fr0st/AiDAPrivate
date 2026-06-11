@@ -187,11 +187,23 @@ void mark_recv_worker_started(connection_t& c)
         c.recv_worker_tid.store(GetCurrentThreadId(), std::memory_order_release);
         c.recv_worker_alive.store(true, std::memory_order_release);
     }
+    diag::log_tagged_fmt("ws_edit", "receive_worker_started conn_id=%llu tid=%lu sock=0x%llX ssl=%p",
+        static_cast<unsigned long long>(c.id),
+        static_cast<unsigned long>(GetCurrentThreadId()),
+        static_cast<unsigned long long>(c.sock),
+        c.ssl);
     c.recv_worker_cv.notify_all();
 }
 
 void mark_recv_worker_stopped(connection_t& c)
 {
+    diag::log_tagged_fmt("ws_edit", "receive_worker_stopping conn_id=%llu tid=%lu running=%d connected=%d sock=0x%llX ssl=%p",
+        static_cast<unsigned long long>(c.id),
+        static_cast<unsigned long>(GetCurrentThreadId()),
+        c.running.load(std::memory_order_acquire) ? 1 : 0,
+        c.connected.load(std::memory_order_acquire) ? 1 : 0,
+        static_cast<unsigned long long>(c.sock),
+        c.ssl);
     {
         std::lock_guard<std::mutex> lk(c.recv_worker_mtx);
         c.recv_worker_alive.store(false, std::memory_order_release);
@@ -413,7 +425,14 @@ bool stream_read_some(connection_t& c, uint8_t* buf, size_t cap, size_t& out_n, 
         }
         return false;
     }
-    if (!wait_socket(c.sock, timeout_ms, false)) return false;
+    if (!wait_socket(c.sock, timeout_ms, false)) {
+        if (c.running.load(std::memory_order_acquire) &&
+            c.connected.load(std::memory_order_acquire) &&
+            c.sock != INVALID_SOCKET) {
+            return true;
+        }
+        return false;
+    }
     int n = recv(c.sock, reinterpret_cast<char*>(buf), static_cast<int>(cap), 0);
     if (n <= 0) {
         int err = WSAGetLastError();
@@ -578,7 +597,7 @@ void receive_loop(std::shared_ptr<connection_t> cptr)
     auto& c = *cptr;
     const uint64_t t0 = now_steady_ms();
     recv_worker_lifetime_t worker(c);
-    diag::log_tagged_fmt("ws_edit", "receive_loop entry mode=work_queue conn_id=%llu sock=0x%llX ssl=%p tid=%lu",
+    diag::log_tagged_fmt("ws_edit", "receive_loop entry mode=service_queue conn_id=%llu sock=0x%llX ssl=%p tid=%lu",
         static_cast<unsigned long long>(c.id),
         static_cast<unsigned long long>(c.sock),
         c.ssl,
@@ -884,7 +903,7 @@ uint64_t connect(const ws_connection_config_t& cfg)
     cptr->recv_worker_alive.store(true, std::memory_order_release);
     bool recv_posted = false;
     try {
-        recv_posted = work_queue::post([cptr]() { receive_loop(cptr); });
+        recv_posted = work_queue::post_service([cptr]() { receive_loop(cptr); });
     } catch (...) {
         recv_posted = false;
     }

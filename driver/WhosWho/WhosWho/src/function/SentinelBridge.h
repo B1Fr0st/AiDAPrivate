@@ -164,6 +164,29 @@ namespace sentinel_bridge {
     inline volatile LONG g_challenge_keys_valid = 0;
     inline volatile LONG64 g_last_seen_challenge_counter = 0;
 
+    __forceinline void log_watchdog_bugcheck_intent(const char* path,
+                                                    ULONG code,
+                                                    ULONG cmd,
+                                                    ULONG param,
+                                                    ULONG raw_cmd,
+                                                    ULONG raw_param,
+                                                    LONG64 sentinel_tsc,
+                                                    LONG64 last_tsc,
+                                                    LONG64 elapsed)
+    {
+        WW_LOG("watchdog_dpc: BUGCHECK_INTENT path=%s code=0x%lx cmd=%lu param=0x%lx raw_cmd=0x%lx raw_param=0x%lx bridge=%p sentinel_tsc=%lld last=%lld elapsed=%lld",
+            path ? path : "unknown",
+            code,
+            cmd,
+            param,
+            raw_cmd,
+            raw_param,
+            &g_bridge,
+            sentinel_tsc,
+            last_tsc,
+            elapsed);
+    }
+
     __forceinline UINT64 derive_bridge_key() {
         int cpu[4] = {};
         __cpuid(cpu, 1);
@@ -592,10 +615,28 @@ namespace sentinel_bridge {
                             current_sentinel_tsc,
                             last,
                             elapsed);
+                        log_watchdog_bugcheck_intent("dma_canary",
+                            BUGCHECK_DMA_CANARY_HIT,
+                            cmd,
+                            param,
+                            raw_cmd,
+                            raw_param,
+                            current_sentinel_tsc,
+                            last,
+                            elapsed);
                         if (_KeBugCheckEx)
                             _KeBugCheckEx(BUGCHECK_DMA_CANARY_HIT, cmd, param, 0, 0);
                     }
                     else if (cmd == BRIDGE_CMD_INTEGRITY_FAIL) {
+                        log_watchdog_bugcheck_intent("integrity_fail",
+                            BUGCHECK_RE_USERMODE_CONFIRMED,
+                            cmd,
+                            param,
+                            raw_cmd,
+                            raw_param,
+                            current_sentinel_tsc,
+                            last,
+                            elapsed);
                         if (_KeBugCheckEx)
                             _KeBugCheckEx(BUGCHECK_RE_USERMODE_CONFIRMED, cmd, param, 0, 0);
                     }
@@ -605,17 +646,44 @@ namespace sentinel_bridge {
 
                         if (evidence_accumulator::is_direct_bsod_reason(param)) {
                             WW_LOG("watchdog_dpc: direct BSOD reason=0x%lx", param);
+                            log_watchdog_bugcheck_intent("re_evidence_direct",
+                                BUGCHECK_RE_USERMODE_CONFIRMED,
+                                cmd,
+                                param,
+                                raw_cmd,
+                                raw_param,
+                                current_sentinel_tsc,
+                                last,
+                                elapsed);
                             if (_KeBugCheckEx)
                                 _KeBugCheckEx(BUGCHECK_RE_USERMODE_CONFIRMED, cmd, param, 0, 0);
                         }
                         else if (evidence_accumulator::should_bugcheck()) {
                             WW_LOG("watchdog_dpc: accumulator quorum met, BSOD");
+                            log_watchdog_bugcheck_intent("re_evidence_quorum",
+                                BUGCHECK_RE_USERMODE_CONFIRMED,
+                                cmd,
+                                param,
+                                raw_cmd,
+                                raw_param,
+                                current_sentinel_tsc,
+                                last,
+                                elapsed);
                             if (_KeBugCheckEx)
                                 _KeBugCheckEx(BUGCHECK_RE_USERMODE_CONFIRMED, cmd, param, 0, 0);
                         }
                     }
                     else if (cmd == BRIDGE_CMD_DEBUGGER_FOUND || cmd == BRIDGE_CMD_DUMP_TOOL_FOUND ||
                              cmd == BRIDGE_CMD_CALLBACK_REMOVED) {
+                        log_watchdog_bugcheck_intent("debug_dump_callback",
+                            BUGCHECK_RE_USERMODE_CONFIRMED,
+                            cmd,
+                            param,
+                            raw_cmd,
+                            raw_param,
+                            current_sentinel_tsc,
+                            last,
+                            elapsed);
                         if (_KeBugCheckEx)
                             _KeBugCheckEx(BUGCHECK_RE_USERMODE_CONFIRMED, cmd, param, 0, 0);
                     }

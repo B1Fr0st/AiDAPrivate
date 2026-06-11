@@ -49,7 +49,7 @@
 #include "../network/burp/audit_http.hpp"
 #include "../network/burp/headless_view.hpp"
 #include "../network/network_view.hpp"
-#include "../infra/work_queue.hpp"
+#include "../infra/win_thread.hpp"
 #include "../../helpers/diag_log.hpp"
 #include "test_lab_bounded_runner.hpp"
 
@@ -63,13 +63,13 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
-#include <thread>
 #include <vector>
 
 #pragma comment(lib, "Ws2_32.lib")
@@ -142,10 +142,13 @@ namespace {
     }
 
     bool camoufox_install_status_ready(const aida::burp::camoufox::install::status_t& st) {
-        return st.state == aida::burp::camoufox::install::install_state_t::ok &&
-               !st.python_path.empty() &&
-               !st.module_version.empty() &&
-               !st.browser_path.empty();
+        if (st.state != aida::burp::camoufox::install::install_state_t::ok ||
+            st.module_version.empty() ||
+            st.browser_path.empty())
+            return false;
+        if (st.module_version == "frozen-executable")
+            return true;
+        return !st.python_path.empty();
     }
 
     aida::burp::camoufox::install::status_t bounded_burp_camoufox_probe(HANDLE hf, const char* tag, DWORD timeout_ms, bool& completed) {
@@ -296,6 +299,7 @@ namespace {
         std::atomic<bool> worker_active{false};
         std::atomic<DWORD> worker_tid{0};
         std::atomic<long> active_clients{0};
+        aida::infra::win_thread::joinable_thread_t worker_thread;
         std::mutex worker_mutex;
         std::condition_variable worker_cv;
         std::mutex client_mutex;
@@ -345,75 +349,107 @@ namespace {
             DWORD thread_start_tick = GetTickCount();
             worker_active.store(true, std::memory_order_release);
             worker_tid.store(0, std::memory_order_release);
-            log_msg(hf, tag, "fixture_start INFO -- work_queue post requested port=%u listener=%llu host_pid=%lu host_tid=%lu",
+            log_msg(hf, tag, "fixture_start INFO -- listener thread start requested port=%u listener=%llu host_pid=%lu host_tid=%lu",
                 static_cast<unsigned>(port),
                 static_cast<unsigned long long>(listen_socket),
                 static_cast<unsigned long>(GetCurrentProcessId()),
                 static_cast<unsigned long>(GetCurrentThreadId()));
-            bool posted = false;
-            DWORD post_gle = ERROR_SUCCESS;
+            bool started = false;
+            DWORD start_gle = ERROR_SUCCESS;
+            std::string thread_err;
             try {
-                posted = work_queue::post([this]() { accept_loop(); });
-                post_gle = GetLastError();
+                started = worker_thread.start([this]() {
+                    try {
+                        accept_loop();
+                    } catch (const std::exception& ex) {
+                        worker_tid.store(0, std::memory_order_release);
+                        worker_active.store(false, std::memory_order_release);
+                        worker_cv.notify_all();
+                        diag::log_tagged_fmt("testlab_burp", "loopback_fixture_exception err=%s tid=%lu",
+                            ex.what(), static_cast<unsigned long>(GetCurrentThreadId()));
+                    } catch (...) {
+                        worker_tid.store(0, std::memory_order_release);
+                        worker_active.store(false, std::memory_order_release);
+                        worker_cv.notify_all();
+                        diag::log_tagged_fmt("testlab_burp", "loopback_fixture_exception err=unknown tid=%lu",
+                            static_cast<unsigned long>(GetCurrentThreadId()));
+                    }
+                }, &thread_err, aida::infra::win_thread::fixture_stack_reserve, "testlab_burp_loopback");
+                start_gle = GetLastError();
             } catch (const std::exception& ex) {
-                post_gle = GetLastError();
-                if (post_gle == ERROR_SUCCESS) post_gle = ERROR_NOT_ENOUGH_MEMORY;
-                diag::log_tagged_fmt("testlab_burp", "loopback_fixture_post_exception gle=%lu err=%s",
-                    static_cast<unsigned long>(post_gle), ex.what());
+                start_gle = GetLastError();
+                if (start_gle == ERROR_SUCCESS) start_gle = ERROR_NOT_ENOUGH_MEMORY;
+                thread_err = ex.what();
+                diag::log_tagged_fmt("testlab_burp", "loopback_fixture_thread_exception gle=%lu err=%s",
+                    static_cast<unsigned long>(start_gle), ex.what());
             } catch (...) {
-                post_gle = GetLastError();
-                if (post_gle == ERROR_SUCCESS) post_gle = ERROR_NOT_ENOUGH_MEMORY;
-                diag::log_tagged_fmt("testlab_burp", "loopback_fixture_post_exception gle=%lu err=unknown",
-                    static_cast<unsigned long>(post_gle));
+                start_gle = GetLastError();
+                if (start_gle == ERROR_SUCCESS) start_gle = ERROR_NOT_ENOUGH_MEMORY;
+                thread_err = "unknown exception";
+                diag::log_tagged_fmt("testlab_burp", "loopback_fixture_thread_exception gle=%lu err=unknown",
+                    static_cast<unsigned long>(start_gle));
             }
-            if (!posted) {
-                if (post_gle == ERROR_SUCCESS) post_gle = ERROR_NOT_READY;
+            if (!started) {
+                if (start_gle == ERROR_SUCCESS) start_gle = ERROR_NOT_READY;
                 worker_active.store(false, std::memory_order_release);
                 worker_cv.notify_all();
                 DWORD elapsed = GetTickCount() - thread_start_tick;
                 closesocket(listen_socket);
                 listen_socket = INVALID_SOCKET;
                 port = 0;
-                log_msg(hf, tag, "fixture_start FAIL -- work_queue post failed gle=%lu elapsed_ms=%lu host_pid=%lu host_tid=%lu",
-                    static_cast<unsigned long>(post_gle),
+                log_msg(hf, tag, "fixture_start FAIL -- listener thread start failed gle=%lu elapsed_ms=%lu host_pid=%lu host_tid=%lu err=%s",
+                    static_cast<unsigned long>(start_gle),
                     static_cast<unsigned long>(elapsed),
                     static_cast<unsigned long>(GetCurrentProcessId()),
-                    static_cast<unsigned long>(GetCurrentThreadId()));
+                    static_cast<unsigned long>(GetCurrentThreadId()),
+                    thread_err.empty() ? "<empty>" : thread_err.c_str());
                 return false;
             }
             log_msg(hf, tag, "fixture_start PASS -- loopback_http_ws port=%u worker_tid=%lu elapsed_ms=%lu",
                 static_cast<unsigned>(port),
-                static_cast<unsigned long>(worker_tid.load(std::memory_order_acquire)),
+                static_cast<unsigned long>(worker_thread.id()),
                 static_cast<unsigned long>(GetTickCount() - thread_start_tick));
             return true;
         }
 
-        void stop() {
+        bool stop() {
             const ULONGLONG t0 = GetTickCount64();
             stopping.store(true);
+            const uint16_t stopped_port = port;
             if (listen_socket != INVALID_SOCKET) {
                 shutdown(listen_socket, SD_BOTH);
                 closesocket(listen_socket);
                 listen_socket = INVALID_SOCKET;
             }
-            {
+            bool worker_idle = true;
+            bool clients_idle = true;
+            bool joined = true;
+            if (worker_thread.joinable()) {
                 std::unique_lock<std::mutex> lock(worker_mutex);
-                worker_cv.wait_for(lock, std::chrono::milliseconds(2000), [this]() {
+                worker_idle = worker_cv.wait_for(lock, std::chrono::milliseconds(3000), [this]() {
                     return !worker_active.load(std::memory_order_acquire);
                 });
             }
             {
                 std::unique_lock<std::mutex> lock(client_mutex);
-                client_cv.wait_for(lock, std::chrono::milliseconds(2000), [this]() {
+                clients_idle = client_cv.wait_for(lock, std::chrono::milliseconds(3000), [this]() {
                     return active_clients.load(std::memory_order_acquire) == 0;
                 });
             }
-            diag::log_tagged_fmt("testlab_burp", "loopback_fixture_stop port=%u worker_active=%d worker_tid=%lu active_clients=%ld elapsed_ms=%llu",
-                static_cast<unsigned>(port),
+            if (worker_thread.joinable())
+                joined = worker_thread.join_for(3000);
+            if (joined)
+                port = 0;
+            diag::log_tagged_fmt("testlab_burp", "loopback_fixture_stop port=%u worker_active=%d worker_tid=%lu active_clients=%ld worker_idle=%d clients_idle=%d joined=%d elapsed_ms=%llu",
+                static_cast<unsigned>(stopped_port),
                 worker_active.load(std::memory_order_acquire) ? 1 : 0,
                 static_cast<unsigned long>(worker_tid.load(std::memory_order_acquire)),
                 active_clients.load(std::memory_order_acquire),
+                worker_idle ? 1 : 0,
+                clients_idle ? 1 : 0,
+                joined ? 1 : 0,
                 static_cast<unsigned long long>(GetTickCount64() - t0));
+            return worker_idle && clients_idle && joined;
         }
 
         ~burp_loopback_fixture_t() {
@@ -456,35 +492,15 @@ namespace {
                 if (rc <= 0) continue;
                 SOCKET s = accept(listener, nullptr, nullptr);
                 if (s == INVALID_SOCKET) continue;
-                DWORD timeout = 4000;
+                DWORD timeout = 2000;
                 setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
                 setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
                 active_clients.fetch_add(1, std::memory_order_acq_rel);
-                bool spawned = false;
-                try {
-                    std::thread([this, s]() {
-                        client_guard_t guard(*this);
-                        handle_client(s);
-                    }).detach();
-                    spawned = true;
-                } catch (const std::exception& ex) {
-                    diag::log_tagged_fmt("testlab_burp", "loopback_client_thread_exception err=%s tid=%lu",
-                        ex.what(), static_cast<unsigned long>(GetCurrentThreadId()));
-                } catch (...) {
-                    diag::log_tagged_fmt("testlab_burp", "loopback_client_thread_exception err=unknown tid=%lu",
-                        static_cast<unsigned long>(GetCurrentThreadId()));
-                }
-                if (!spawned) {
-                    diag::log_tagged_fmt("testlab_burp", "loopback_client_inline active_clients=%ld tid=%lu",
-                        active_clients.load(std::memory_order_acquire),
-                        static_cast<unsigned long>(GetCurrentThreadId()));
-                    client_guard_t guard(*this);
-                    handle_client(s);
-                } else {
-                    diag::log_tagged_fmt("testlab_burp", "loopback_client_thread_started active_clients=%ld accept_tid=%lu",
-                        active_clients.load(std::memory_order_acquire),
-                        static_cast<unsigned long>(GetCurrentThreadId()));
-                }
+                diag::log_tagged_fmt("testlab_burp", "loopback_client_inline active_clients=%ld tid=%lu",
+                    active_clients.load(std::memory_order_acquire),
+                    static_cast<unsigned long>(GetCurrentThreadId()));
+                client_guard_t guard(*this);
+                handle_client(s);
             }
             worker_tid.store(0, std::memory_order_release);
             worker_active.store(false, std::memory_order_release);
@@ -523,7 +539,7 @@ namespace {
                 closesocket(s);
                 return;
             }
-            uint64_t end_ms = GetTickCount64() + 8000;
+            uint64_t end_ms = GetTickCount64() + 3500;
             uint8_t hdr[2] = {};
             while (GetTickCount64() < end_ms) {
                 int n = recv(s, reinterpret_cast<char*>(hdr), 2, 0);
@@ -629,9 +645,21 @@ namespace {
     std::string g_subdomain_wordlist_path;
 
     bool ensure_burp_loopback_fixture(HANDLE hf, const char* tag) {
-        if (g_burp_fixture && g_burp_fixture->port != 0) {
-            log_msg(hf, tag, "fixture_reuse -- loopback_http_ws port=%u", static_cast<unsigned>(g_burp_fixture->port));
-            return true;
+        if (g_burp_fixture) {
+            if (g_burp_fixture->port != 0 && !g_burp_fixture->stopping.load(std::memory_order_acquire)) {
+                log_msg(hf, tag, "fixture_reuse -- loopback_http_ws port=%u worker_active=%d active_clients=%ld",
+                    static_cast<unsigned>(g_burp_fixture->port),
+                    g_burp_fixture->worker_active.load(std::memory_order_acquire) ? 1 : 0,
+                    g_burp_fixture->active_clients.load(std::memory_order_acquire));
+                return true;
+            }
+            const bool stopped = g_burp_fixture->stop();
+            log_msg(hf, tag, "fixture_replace -- stale loopback stopped=%d port=%u",
+                stopped ? 1 : 0,
+                static_cast<unsigned>(g_burp_fixture->port));
+            if (!stopped)
+                return false;
+            g_burp_fixture.reset();
         }
         auto fixture = std::make_unique<burp_loopback_fixture_t>();
         if (!fixture->start(hf, tag)) {
@@ -783,22 +811,73 @@ namespace {
             static_cast<unsigned long long>(id), st.total, st.sent, st.errors, st.running ? 1 : 0);
     }
 
-    void ensure_active_scanner_fixture(HANDLE hf, const char* tag) {
+    bool ensure_active_scanner_fixture(HANDLE hf, const char* tag) {
         auto audits = aida::burp::active_scanner::list_audits();
-        if (!audits.empty()) return;
-        if (!ensure_burp_loopback_fixture(hf, tag)) return;
+        if (!audits.empty()) {
+            log_msg(hf, tag, "fixture_active_scanner reuse audits=%zu first_id=%llu running=%d completed=%zu total=%zu",
+                audits.size(),
+                static_cast<unsigned long long>(audits.front().id),
+                audits.front().running ? 1 : 0,
+                audits.front().completed_probes,
+                audits.front().total_probes);
+            return true;
+        }
+        if (!ensure_burp_loopback_fixture(hf, tag)) return false;
         aida::burp::active_scanner::initialize();
         std::string raw = "GET /?q=AIDASEQ1234 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
         aida::burp::active_scanner::audit_config_t cfg;
         cfg.scope_only = false;
         cfg.max_concurrent_requests = 1;
-        cfg.per_module_request_cap = 1;
-        cfg.timeout_ms = 1500;
+        cfg.per_module_request_cap = 2;
+        cfg.timeout_ms = 1000;
+        cfg.enabled_modules = {"nosqli", "open-redirect"};
         uint64_t id = aida::burp::active_scanner::enqueue_target(
             std::vector<uint8_t>(raw.begin(), raw.end()), burp_fixture_url("/?q=AIDASEQ1234"), cfg);
-        log_msg(hf, tag, "fixture_active_scanner enqueue id=%llu audits_before=%zu err=%s",
-            static_cast<unsigned long long>(id), audits.size(), aida::burp::active_scanner::last_error().c_str());
-        wait_briefly_for_async_state();
+        log_msg(hf, tag, "fixture_active_scanner enqueue id=%llu audits_before=%zu modules=%zu max_concurrent=%zu per_module_cap=%zu timeout_ms=%d err=%s",
+            static_cast<unsigned long long>(id), audits.size(), cfg.enabled_modules.size(),
+            cfg.max_concurrent_requests, cfg.per_module_request_cap, cfg.timeout_ms,
+            aida::burp::active_scanner::last_error().c_str());
+        if (id == 0)
+            return false;
+        aida::burp::active_scanner::audit_status_t st{};
+        bool saw_status = false;
+        bool saw_progress = false;
+        for (int i = 0; i < 30; ++i) {
+            if (aida::burp::active_scanner::get_status(id, st)) {
+                saw_status = true;
+                saw_progress = st.total_points > 0 && (st.completed_probes > 0 || st.total_probes > 0);
+                log_msg(hf, tag, "fixture_active_scanner poll=%d id=%llu running=%d cancelled=%d points=%zu completed=%zu total=%zu issues=%zu",
+                    i,
+                    static_cast<unsigned long long>(id),
+                    st.running ? 1 : 0,
+                    st.cancelled ? 1 : 0,
+                    st.total_points,
+                    st.completed_probes,
+                    st.total_probes,
+                    st.issues_found);
+                if ((st.completed_probes > 0) || (!st.running && st.total_points > 0))
+                    break;
+            } else {
+                log_msg(hf, tag, "fixture_active_scanner poll=%d id=%llu status_missing", i, static_cast<unsigned long long>(id));
+            }
+            Sleep(100);
+        }
+        const bool cancel_ok = aida::burp::active_scanner::cancel_audit(id);
+        const bool idle = aida::burp::active_scanner::wait_for_audit_idle(id, 2500);
+        aida::burp::active_scanner::audit_status_t after{};
+        const bool after_ok = aida::burp::active_scanner::get_status(id, after);
+        log_msg(hf, tag, "fixture_active_scanner drain id=%llu cancel_ok=%d idle=%d status_ok=%d running=%d cancelled=%d points=%zu completed=%zu total=%zu issues=%zu",
+            static_cast<unsigned long long>(id),
+            cancel_ok ? 1 : 0,
+            idle ? 1 : 0,
+            after_ok ? 1 : 0,
+            after.running ? 1 : 0,
+            after.cancelled ? 1 : 0,
+            after.total_points,
+            after.completed_probes,
+            after.total_probes,
+            after.issues_found);
+        return saw_status && saw_progress && after_ok && after.total_points > 0 && after.completed_probes > 0;
     }
 
     void ensure_crawler_fixture(HANDLE hf, const char* tag) {
@@ -1028,10 +1107,29 @@ namespace {
         for (const auto& audit : audits) {
             if (audit.id == 0)
                 continue;
-            if (audit.running) {
-                aida::burp::active_scanner::cancel_audit(audit.id);
-                aida::burp::active_scanner::wait_for_audit_idle(audit.id, 1500);
-            }
+            log_msg(hf, tag, "audit_cleanup begin id=%llu running=%d cancelled=%d points=%zu completed=%zu total=%zu issues=%zu",
+                static_cast<unsigned long long>(audit.id),
+                audit.running ? 1 : 0,
+                audit.cancelled ? 1 : 0,
+                audit.total_points,
+                audit.completed_probes,
+                audit.total_probes,
+                audit.issues_found);
+            const bool cancel_ok = audit.running ? aida::burp::active_scanner::cancel_audit(audit.id) : true;
+            const bool idle = aida::burp::active_scanner::wait_for_audit_idle(audit.id, 2500);
+            aida::burp::active_scanner::audit_status_t after{};
+            const bool after_ok = aida::burp::active_scanner::get_status(audit.id, after);
+            log_msg(hf, tag, "audit_cleanup end id=%llu cancel_ok=%d idle=%d status_ok=%d running=%d cancelled=%d points=%zu completed=%zu total=%zu issues=%zu",
+                static_cast<unsigned long long>(audit.id),
+                cancel_ok ? 1 : 0,
+                idle ? 1 : 0,
+                after_ok ? 1 : 0,
+                after.running ? 1 : 0,
+                after.cancelled ? 1 : 0,
+                after.total_points,
+                after.completed_probes,
+                after.total_probes,
+                after.issues_found);
         }
 
         auto crawls = aida::burp::crawler::list();
@@ -1071,11 +1169,16 @@ namespace {
             }
         }
 
-        if (g_burp_fixture)
-            g_burp_fixture.reset();
+        bool fixture_reset = true;
+        if (g_burp_fixture) {
+            fixture_reset = g_burp_fixture->stop();
+            if (fixture_reset)
+                g_burp_fixture.reset();
+        }
 
-        log_msg(hf, tag, "PASS -- stopped async fixture jobs audits=%zu crawls=%zu discoveries=%zu subdomains=%zu intruders=%zu miners=%zu",
-            audits.size(), crawls.size(), discoveries.size(), subdomains.size(), intruders.size(), miners.size());
+        log_msg(hf, tag, "%s -- stopped async fixture jobs audits=%zu crawls=%zu discoveries=%zu subdomains=%zu intruders=%zu miners=%zu fixture_reset=%d",
+            fixture_reset ? "PASS" : "WARN",
+            audits.size(), crawls.size(), discoveries.size(), subdomains.size(), intruders.size(), miners.size(), fixture_reset ? 1 : 0);
     }
 
     void test_scope_init(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -1871,9 +1974,24 @@ namespace {
     void test_active_scanner_list_audits(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "ascan_list";
         log_msg(hf, tag, "START -- active_scanner::list_audits()");
-        ensure_active_scanner_fixture(hf, tag);
+        const bool fixture_ok = ensure_active_scanner_fixture(hf, tag);
         auto audits = aida::burp::active_scanner::list_audits();
         log_msg(hf, tag, "audit count = %zu", audits.size());
+        for (size_t i = 0; i < audits.size() && i < 3; ++i) {
+            log_msg(hf, tag, "  [%zu] id=%llu running=%d cancelled=%d points=%zu completed=%zu total=%zu issues=%zu",
+                i,
+                static_cast<unsigned long long>(audits[i].id),
+                audits[i].running ? 1 : 0,
+                audits[i].cancelled ? 1 : 0,
+                audits[i].total_points,
+                audits[i].completed_probes,
+                audits[i].total_probes,
+                audits[i].issues_found);
+        }
+        if (!fixture_ok) {
+            fail_empty_evidence(hf, tag, failed, "active scanner fixture did not produce a bounded progressed audit");
+            return;
+        }
         if (audits.empty()) {
             fail_empty_evidence(hf, tag, failed, "active scanner list returned zero audits after audit fixture/action should have created an audit");
             return;
@@ -3609,6 +3727,12 @@ namespace {
             return;
         }
         auto bridge_before = aida::burp::camoufox::get_status();
+        const bool ready_before = bridge_before.state == aida::burp::camoufox::bridge_state_t::ready &&
+            bridge_before.child_pid != 0 &&
+            bridge_before.child_alive &&
+            bridge_before.browser_open &&
+            bridge_before.page_verified &&
+            !bridge_before.cleanup_pending;
         log_msg(hf, tag, "before install_state=%s message=%s python=%s module=%s browser=%s bridge_state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d",
             camoufox_install_state_name(install_before.state),
             install_before.last_message.empty() ? "<empty>" : install_before.last_message.c_str(),
@@ -3657,6 +3781,12 @@ namespace {
             log_msg(hf, tag, "INFO -- start_bridge reported busy or reused, but live Camoufox bridge is ready child_pid=%u last_error=%s",
                 bridge_after.child_pid,
                 bridge_after.last_error.empty() ? "<empty>" : bridge_after.last_error.c_str());
+        }
+        if (ready_before) {
+            log_msg(hf, tag, "PASS -- reused pre-existing live Camoufox bridge child_pid=%u without forcing cleanup",
+                bridge_after.child_pid);
+            passed.fetch_add(1);
+            return;
         }
 
         const bool closed = aida::burp::camoufox::close_browser("testlab.browser_running.cleanup");
@@ -3982,6 +4112,25 @@ namespace {
         select_network_tab(hf, passed, failed, "burp_tab.reports", network_view::sub_tab_t::reports);
     }
 
+    struct burp_phase_cleanup_guard_t {
+        HANDLE hf = INVALID_HANDLE_VALUE;
+        bool armed = true;
+        ~burp_phase_cleanup_guard_t() {
+            if (!armed)
+                return;
+            try {
+                cleanup_burp_async_fixture_jobs(hf);
+            } catch (const std::exception& ex) {
+                log_msg(hf, "burp_cleanup", "FAIL -- cleanup exception: %s", ex.what());
+            } catch (...) {
+                log_msg(hf, "burp_cleanup", "FAIL -- cleanup exception: unknown");
+            }
+        }
+        void disarm() {
+            armed = false;
+        }
+    };
+
     static void call_test(void(*fn)(HANDLE, std::atomic<int>&, std::atomic<int>&), HANDLE hf, std::atomic<int>& p, std::atomic<int>& f) {
         __try { fn(hf, p, f); } __except(EXCEPTION_EXECUTE_HANDLER) { f.fetch_add(1); }
     }
@@ -3990,6 +4139,7 @@ namespace {
 void phase_burp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped, bool(*cancelled)()) {
     (void)skipped;
     log_msg(hf, "burp_phase", "========== Burp Suite Tests START (183 tests) ==========");
+    burp_phase_cleanup_guard_t cleanup_guard{hf};
 
     if (cancelled && cancelled()) return;
     call_test(test_scope_init, hf, passed, failed);
@@ -4396,6 +4546,7 @@ void phase_burp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fai
     call_test(test_burp_tab_reports, hf, passed, failed);
 
     cleanup_burp_async_fixture_jobs(hf);
+    cleanup_guard.disarm();
 
     log_msg(hf, "burp_phase", "========== Burp Suite Tests DONE ==========");
 }

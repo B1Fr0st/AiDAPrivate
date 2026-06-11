@@ -2066,11 +2066,43 @@ static void decrypt_resources(uint8_t* image_base,
     }
 }
 
-static void apply_relocations(uint8_t* image_base, const resolved_t* r) {
+static int relocation_target_in_unpacked_section(uint32_t target_rva,
+                                                 uint32_t width,
+                                                 uint8_t* packed_base,
+                                                 const packed_header_t* hdr) {
+    if (packed_base == 0 || hdr == 0 || hdr->section_count == 0u ||
+        hdr->section_table_offset == 0u || width == 0u) {
+        return 0;
+    }
+    section_descriptor_t* descs = (section_descriptor_t*)(packed_base + hdr->section_table_offset);
+    uint64_t target_start = (uint64_t)target_rva;
+    uint64_t target_end = target_start + (uint64_t)width;
+    for (uint32_t i = 0; i < hdr->section_count; ++i) {
+        section_descriptor_t* d = &descs[i];
+        if (d->original_virtual_size == 0u || d->encrypted_size == 0u) {
+            continue;
+        }
+        uint64_t section_start = (uint64_t)d->original_rva;
+        uint64_t section_end = section_start + (uint64_t)d->original_virtual_size;
+        if (target_start >= section_start && target_end <= section_end) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void apply_relocations(uint8_t* image_base,
+                              uint8_t* packed_base,
+                              const packed_header_t* hdr,
+                              const resolved_t* r) {
     uint32_t e_lfanew = *(uint32_t*)(image_base + 0x3C);
     uint8_t* nt = image_base + e_lfanew;
     uint64_t preferred = *(uint64_t*)(nt + 0x18 + 24);
     uint64_t actual = (uint64_t)(uintptr_t)image_base;
+    uint64_t packed_preferred = ((uint64_t)hdr->reserved[2] << 32) | (uint64_t)hdr->reserved[1];
+    if (packed_preferred != 0u) {
+        preferred = packed_preferred;
+    }
     if (preferred == actual) {
         return;
     }
@@ -2094,6 +2126,11 @@ static void apply_relocations(uint8_t* image_base, const resolved_t* r) {
             uint16_t e = entries[i];
             uint32_t type = (uint32_t)(e >> 12);
             uint32_t off = (uint32_t)(e & 0x0FFFu);
+            uint32_t width = type == 10u ? 8u : (type == 3u ? 4u : 0u);
+            uint32_t target_rva = page_rva + off;
+            if (!relocation_target_in_unpacked_section(target_rva, width, packed_base, hdr)) {
+                continue;
+            }
             uint8_t* tgt = image_base + page_rva + off;
             if (type == 10u) {
                 uint32_t old = 0;
@@ -2698,7 +2735,7 @@ void __cdecl aida_unpack(void* image_base_arg) {
     decrypt_resources(image_base, packed_base, hdr, &r);
     payload_log_event(APL_EVENT_PHASE_EXIT, 4u, hdr->resource_fixup_count, 0u);
     payload_log_event(APL_EVENT_PHASE_ENTER, 5u, 0u, 0u);
-    apply_relocations(image_base, &r);
+    apply_relocations(image_base, packed_base, hdr, &r);
     payload_log_event(APL_EVENT_PHASE_EXIT, 5u, 0u, 0u);
     hdr->reserved[0] = IMG_UNPACK_DONE;
     payload_log_event(APL_EVENT_UNPACK_DONE, (uint64_t)(uintptr_t)image_base, (uint64_t)(uintptr_t)packed_base, 0u);

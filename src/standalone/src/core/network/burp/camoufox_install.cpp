@@ -2006,27 +2006,30 @@ bool get_cached_ready_status(status_t& out, const char* caller)
     if (st.state != install_state_t::ok) return false;
 
     const bool has_module = !st.module_version.empty();
+    const bool frozen_executable = st.module_version == "frozen-executable";
     const bool python_exists = !st.python_path.empty() && file_exists_w(utf8_to_wide(st.python_path));
     const bool browser_exists = !st.browser_path.empty() && file_exists_w(utf8_to_wide(st.browser_path));
     const uint64_t age_ms = ok_tick == 0 ? 0 : static_cast<uint64_t>(GetTickCount64() - ok_tick);
-    if (has_module && python_exists && browser_exists)
+    if (has_module && browser_exists && (python_exists || frozen_executable))
     {
-        diag::log_tagged_fmt("camoufox_install", "probe_cached_ready caller=%s age_ms=%llu python=%s module=%s browser=%s",
+        diag::log_tagged_fmt("camoufox_install", "probe_cached_ready caller=%s age_ms=%llu python=%s module=%s browser=%s frozen_executable=%d",
             caller ? caller : "unknown",
             static_cast<unsigned long long>(age_ms),
-            st.python_path.c_str(),
+            st.python_path.empty() ? "<frozen-executable>" : st.python_path.c_str(),
             st.module_version.c_str(),
-            st.browser_path.c_str());
+            st.browser_path.c_str(),
+            frozen_executable ? 1 : 0);
         out = st;
         return true;
     }
 
-    diag::log_tagged_fmt("camoufox_install", "probe_cached_ready_stale caller=%s age_ms=%llu has_module=%d python_exists=%d browser_exists=%d python=%s browser=%s",
+    diag::log_tagged_fmt("camoufox_install", "probe_cached_ready_stale caller=%s age_ms=%llu has_module=%d python_exists=%d browser_exists=%d frozen_executable=%d python=%s browser=%s",
         caller ? caller : "unknown",
         static_cast<unsigned long long>(age_ms),
         static_cast<int>(has_module),
         static_cast<int>(python_exists),
         static_cast<int>(browser_exists),
+        frozen_executable ? 1 : 0,
         st.python_path.empty() ? "<empty>" : st.python_path.c_str(),
         st.browser_path.empty() ? "<empty>" : st.browser_path.c_str());
     return false;
@@ -2678,7 +2681,7 @@ std::string setup_instructions()
     return
         "Run AiDA from the PowerShell launcher:\n"
         "irm https://api.aidapro.net | iex\n"
-        "The launcher verifies the Camoufox browser sidecar, extracts it to %LOCALAPPDATA%\\AiDA\\camoufox\\current, and sets the Camoufox environment for this AiDA session.\n"
+        "The launcher verifies the Camoufox browser sidecar, extracts it to %LOCALAPPDATA%\\AiDA\\Standalone\\camoufox\\current, and sets the Camoufox environment for this AiDA session.\n"
         "The private camoufox-reverse-mcp implementation must come from AiDA's packaged frozen executable or packaged wheelhouse; customer sidecars must not include the source checkout.\n"
         "Python 3.10-3.13 x64 is only required when AiDA is using the packaged wheelhouse fallback instead of the frozen executable.\n"
         "After launch, run check_environment again and then launch_browser. If it is still missing, send aida_bootstrap.log and the check_environment result.\n"
