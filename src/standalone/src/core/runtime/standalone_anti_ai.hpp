@@ -936,6 +936,63 @@ namespace detail
             trusted_camoufox_runtime_python_path_w(probe.image_lower);
     }
 
+    inline bool has_trusted_aida_internal_camoufox_mcp_ancestor(const process_probe_t& probe,
+                                                               const std::vector<process_probe_t>& probes)
+    {
+        DWORD parent = probe.parent_pid;
+        for (uint32_t depth = 0; depth < 16 && parent != 0; ++depth)
+        {
+            const process_probe_t* ancestor = find_probe(probes, parent);
+            if (!ancestor)
+                return false;
+            if (is_trusted_aida_internal_camoufox_mcp_process(*ancestor))
+                return true;
+            if (ancestor->parent_pid == parent)
+                return false;
+            parent = ancestor->parent_pid;
+        }
+        return false;
+    }
+
+    inline bool is_trusted_aida_internal_camoufox_descendant_process(const process_probe_t& probe,
+                                                                    const std::vector<process_probe_t>& probes)
+    {
+        if (!has_trusted_aida_internal_camoufox_mcp_ancestor(probe, probes))
+            return false;
+        static const wchar_t* const reverse_mcp_names[] = {
+            L"aida_camoufoxreversemcp.exe", L"camoufox-reverse-mcp.exe", L"camoufox_reverse_mcp.exe"
+        };
+        if (basename_equals_any(probe, reverse_mcp_names))
+            return env_path_equals_w(probe.image_lower, L"AIDA_CAMOUFOX_MCP_EXECUTABLE") ||
+                path_under_current_module_subdir_w(probe.image_lower, L"deps") ||
+                path_under_current_module_subdir_w(probe.image_lower, L"camoufox-reverse-mcp") ||
+                path_under_trusted_camoufox_runtime_root_w(probe.image_lower);
+        static const wchar_t* const browser_names[] = {
+            L"camoufox.exe", L"firefox.exe"
+        };
+        if (basename_equals_any(probe, browser_names))
+            return path_under_trusted_camoufox_runtime_root_w(probe.image_lower) ||
+                path_under_current_module_subdir_w(probe.image_lower, L"camoufox") ||
+                path_under_current_module_subdir_w(probe.image_lower, L"deps\\camoufox");
+        static const wchar_t* const script_hosts[] = {
+            L"node.exe", L"python.exe", L"pythonw.exe"
+        };
+        if (!basename_equals_any(probe, script_hosts))
+            return false;
+        return has_mcp_command_evidence(probe) ||
+            contains_w(probe.command_lower, L"camoufox") ||
+            path_under_trusted_camoufox_runtime_root_w(probe.image_lower) ||
+            path_under_current_module_subdir_w(probe.image_lower, L"deps\\camoufox-runtime") ||
+            path_under_current_module_subdir_w(probe.image_lower, L"camoufox-runtime");
+    }
+
+    inline bool is_trusted_aida_internal_camoufox_tree_process(const process_probe_t& probe,
+                                                               const std::vector<process_probe_t>& probes)
+    {
+        return is_trusted_aida_internal_camoufox_mcp_process(probe) ||
+            is_trusted_aida_internal_camoufox_descendant_process(probe, probes);
+    }
+
     inline bool trusted_aida_build_command_context(const process_probe_t& probe)
     {
         if (probe.command_lower.empty())
@@ -1360,7 +1417,12 @@ namespace detail
             const bool debugger_tool = is_debugger_tool(probe);
             const bool dump_tool = is_dump_tool(probe);
             const bool high_value_tool = mcp_evidence || ai_tool || memory_tool || re_tool || debugger_tool || dump_tool;
-            const bool trusted_internal_camoufox = is_trusted_aida_internal_camoufox_mcp_process(probe);
+            const bool trusted_internal_camoufox =
+                !memory_tool &&
+                !re_tool &&
+                !debugger_tool &&
+                !dump_tool &&
+                is_trusted_aida_internal_camoufox_tree_process(probe, probes);
             const bool supported_ida_host = is_supported_ida_host_observation(probe);
             if (trusted_internal_camoufox)
             {
@@ -1562,6 +1624,8 @@ namespace detail
                 }
                 if (!probe)
                     continue;
+                if (probes && is_trusted_aida_internal_camoufox_tree_process(*probe, *probes))
+                    continue;
                 bool mcp_named = has_mcp_command_evidence(*probe);
                 bool host = is_shell_or_interpreter(*probe);
                 if ((mcp_named && host) || (is_mcp_specific_port(local_port) && host))
@@ -1620,6 +1684,8 @@ namespace detail
             }
             if (!probe)
                 continue;
+            if (probes && is_trusted_aida_internal_camoufox_tree_process(*probe, *probes))
+                continue;
             if (is_ai_coding_tool(*probe) || has_mcp_command_evidence(*probe) ||
                 is_memory_scanner_tool(*probe) || is_re_tool(*probe) || is_debugger_tool(*probe))
             {
@@ -1659,8 +1725,11 @@ namespace detail
         const process_probe_t* probe = ctx->probes ? find_probe(*ctx->probes, pid) : nullptr;
         if (!probe)
             return TRUE;
-        if (is_ai_coding_tool(*probe) || has_mcp_command_evidence(*probe) ||
-            is_memory_scanner_tool(*probe) || is_re_tool(*probe) ||
+        if (ctx->probes && is_trusted_aida_internal_camoufox_tree_process(*probe, *ctx->probes))
+            return TRUE;
+        if (is_supported_ida_host_observation(*probe))
+            return TRUE;
+        if (is_memory_scanner_tool(*probe) || is_re_tool(*probe) ||
             is_debugger_tool(*probe) || is_dump_tool(*probe))
         {
             ctx->targeted = true;

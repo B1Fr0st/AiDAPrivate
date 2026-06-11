@@ -726,6 +726,9 @@ namespace aida_tracer {
     inline std::atomic<LONG_PTR> g_dispatch_lparam{0};
     inline std::atomic<DWORD> g_peek_queue_status{0};
     inline std::atomic<DWORD> g_peek_last_error{0};
+    inline std::atomic<UINT> g_peek_remove_flags{PM_REMOVE};
+    inline std::atomic<UINT_PTR> g_peek_filter_hwnd{0};
+    inline std::atomic<uint64_t> g_peek_fileless_send_only_defers{0};
     inline std::atomic<const char*> g_wndproc_stage{"<idle>"};
     inline std::atomic<UINT> g_wndproc_msg{0};
     inline std::atomic<UINT_PTR> g_wndproc_hwnd{0};
@@ -883,6 +886,21 @@ namespace aida_tracer {
     inline void set_peek_state(DWORD queue_status, DWORD last_error) {
         g_peek_queue_status.store(queue_status, std::memory_order_release);
         g_peek_last_error.store(last_error, std::memory_order_release);
+    }
+
+    inline void set_peek_call_shape(UINT remove_flags, HWND filter_hwnd) {
+        g_peek_remove_flags.store(remove_flags, std::memory_order_release);
+        g_peek_filter_hwnd.store(reinterpret_cast<UINT_PTR>(filter_hwnd), std::memory_order_release);
+    }
+
+    inline DWORD queue_status_bits(DWORD queue_status) {
+        return static_cast<DWORD>(LOWORD(queue_status)) | static_cast<DWORD>(HIWORD(queue_status));
+    }
+
+    inline bool fileless_send_only_queue(DWORD queue_status) {
+        constexpr DWORD queued_mask = QS_INPUT | QS_POSTMESSAGE | QS_ALLPOSTMESSAGE | QS_HOTKEY | QS_TIMER | QS_PAINT;
+        DWORD bits = queue_status_bits(queue_status);
+        return (bits & QS_SENDMESSAGE) != 0 && (bits & queued_mask) == 0;
     }
 
     inline void set_wndproc_state(const char* stage, HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -1302,7 +1320,7 @@ namespace aida_tracer {
                 stall_streak++;
                 if (stall_streak == 1 || (stall_streak % 20ULL) == 0ULL) {
                     diag::log_tagged_critical_fmt("tracer",
-                        "RENDER_STALL streak=%llu frame=%llu age_ms=%llu phase=%s section=%s phase_id=%llu render_tid=%lu attach=%s attach_id=%llu peek_qs=0x%08lX peek_gle=%lu dispatch=%s msg=%s(0x%04X) hwnd=0x%llX wp=0x%llX lp=0x%llX wndproc=%s msg=%s(0x%04X) hwnd=0x%llX wp=0x%llX lp=0x%llX dx_frame=%llu dx_age_ms=%llu dx_dd=0x%llX dx_dev=0x%llX dx_ctx=0x%llX dx_rtv=0x%llX dx_lists=%llu dx_draw_cmds=%llu dx_vtx=%llu dx_idx=%llu dx_callbacks=%llu dx_reset_callbacks=%llu dx_first_cb=0x%llX dx_cb_data=0x%llX dx_first_tex=0x%llX dx_tex_hash=0x%016llX dx_max_elem=%llu dx_bad=0x%08lX dx_bad_at=%d,%d dx_disp1000=%d,%d dx_fb1000=%d,%d dx_removed=0x%08lX present_frame=%llu present_age_ms=%llu present_sc=0x%llX present_hr=0x%08lX tracer_tid=%lu",
+                        "RENDER_STALL streak=%llu frame=%llu age_ms=%llu phase=%s section=%s phase_id=%llu render_tid=%lu attach=%s attach_id=%llu peek_qs=0x%08lX peek_gle=%lu peek_flags=0x%08X peek_filter=0x%llX fileless_send_defers=%llu dispatch=%s msg=%s(0x%04X) hwnd=0x%llX wp=0x%llX lp=0x%llX wndproc=%s msg=%s(0x%04X) hwnd=0x%llX wp=0x%llX lp=0x%llX dx_frame=%llu dx_age_ms=%llu dx_dd=0x%llX dx_dev=0x%llX dx_ctx=0x%llX dx_rtv=0x%llX dx_lists=%llu dx_draw_cmds=%llu dx_vtx=%llu dx_idx=%llu dx_callbacks=%llu dx_reset_callbacks=%llu dx_first_cb=0x%llX dx_cb_data=0x%llX dx_first_tex=0x%llX dx_tex_hash=0x%016llX dx_max_elem=%llu dx_bad=0x%08lX dx_bad_at=%d,%d dx_disp1000=%d,%d dx_fb1000=%d,%d dx_removed=0x%08lX present_frame=%llu present_age_ms=%llu present_sc=0x%llX present_hr=0x%08lX tracer_tid=%lu",
                         (unsigned long long)stall_streak,
                         (unsigned long long)frame,
                         (unsigned long long)age_ms,
@@ -1314,6 +1332,9 @@ namespace aida_tracer {
                         (unsigned long long)attach_phase_id,
                         static_cast<unsigned long>(peek_status),
                         static_cast<unsigned long>(peek_error),
+                        g_peek_remove_flags.load(std::memory_order_acquire),
+                        static_cast<unsigned long long>(g_peek_filter_hwnd.load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(g_peek_fileless_send_only_defers.load(std::memory_order_acquire)),
                         dispatch_stage ? dispatch_stage : "<null>",
                         message_name(dispatch_msg),
                         dispatch_msg,
@@ -3327,23 +3348,59 @@ int main(int, char**)
         {
             aida_tracer::mark_render_phase("peek_message_call");
             DWORD queue_status_before = ::GetQueueStatus(QS_ALLINPUT);
+            const UINT peek_remove_flags = fileless_customer_launch
+                ? static_cast<UINT>(PM_REMOVE | PM_QS_INPUT | PM_QS_POSTMESSAGE | PM_QS_PAINT)
+                : static_cast<UINT>(PM_REMOVE);
+            HWND peek_filter = fileless_customer_launch ? hwnd : nullptr;
             ::SetLastError(0);
             aida_tracer::set_peek_state(queue_status_before, 0);
+            aida_tracer::set_peek_call_shape(peek_remove_flags, peek_filter);
+            if (fileless_customer_launch && aida_tracer::fileless_send_only_queue(queue_status_before)) {
+                uint64_t defer_count = aida_tracer::g_peek_fileless_send_only_defers.fetch_add(1, std::memory_order_acq_rel) + 1;
+                if (defer_count == 1 || (defer_count % 120ULL) == 0ULL) {
+                    diag::log_tagged_critical_fmt("msgpump",
+                        "fileless_send_only_deferred frame=%llu count=%llu qs=0x%08lX bits=0x%08lX flags=0x%08X hwnd=0x%llX tid=%lu",
+                        (unsigned long long)frame_number,
+                        (unsigned long long)defer_count,
+                        static_cast<unsigned long>(queue_status_before),
+                        static_cast<unsigned long>(aida_tracer::queue_status_bits(queue_status_before)),
+                        peek_remove_flags,
+                        (unsigned long long)reinterpret_cast<UINT_PTR>(peek_filter),
+                        GetCurrentThreadId());
+                }
+                break;
+            }
             uint64_t peek_start = static_cast<uint64_t>(GetTickCount64());
             aida_tracer::g_peek_call_count.fetch_add(1, std::memory_order_acq_rel);
-            BOOL has_message = ::PeekMessage(&msg, nullptr, 0U, 0U, PM_REMOVE);
+            BOOL has_message = ::PeekMessage(&msg, peek_filter, 0U, 0U, peek_remove_flags);
             aida_tracer::g_peek_return_count.fetch_add(1, std::memory_order_acq_rel);
             DWORD peek_gle = ::GetLastError();
             uint64_t peek_elapsed = static_cast<uint64_t>(GetTickCount64()) - peek_start;
+            if (!has_message && fileless_customer_launch) {
+                HWND thread_filter = reinterpret_cast<HWND>(static_cast<INT_PTR>(-1));
+                aida_tracer::set_peek_call_shape(peek_remove_flags, thread_filter);
+                ::SetLastError(0);
+                uint64_t thread_peek_start = static_cast<uint64_t>(GetTickCount64());
+                aida_tracer::g_peek_call_count.fetch_add(1, std::memory_order_acq_rel);
+                has_message = ::PeekMessage(&msg, thread_filter, 0U, 0U, peek_remove_flags);
+                aida_tracer::g_peek_return_count.fetch_add(1, std::memory_order_acq_rel);
+                DWORD thread_peek_gle = ::GetLastError();
+                uint64_t thread_peek_elapsed = static_cast<uint64_t>(GetTickCount64()) - thread_peek_start;
+                peek_filter = thread_filter;
+                peek_gle = thread_peek_gle;
+                peek_elapsed += thread_peek_elapsed;
+            }
             aida_tracer::set_peek_state(queue_status_before, peek_gle);
             if (peek_elapsed >= 50) {
                 diag::log_tagged_critical_fmt("msgpump",
-                    "peek_slow frame=%llu elapsed_ms=%llu has_message=%d qs=0x%08lX gle=%lu msg=%s(0x%04X) hwnd=0x%llX wp=0x%llX lp=0x%llX",
+                    "peek_slow frame=%llu elapsed_ms=%llu has_message=%d qs=0x%08lX gle=%lu flags=0x%08X filter=0x%llX msg=%s(0x%04X) hwnd=0x%llX wp=0x%llX lp=0x%llX",
                     (unsigned long long)frame_number,
                     (unsigned long long)peek_elapsed,
                     has_message ? 1 : 0,
                     static_cast<unsigned long>(queue_status_before),
                     static_cast<unsigned long>(peek_gle),
+                    peek_remove_flags,
+                    (unsigned long long)reinterpret_cast<UINT_PTR>(peek_filter),
                     has_message ? aida_tracer::message_name(msg.message) : "<none>",
                     has_message ? msg.message : 0,
                     has_message ? (unsigned long long)reinterpret_cast<UINT_PTR>(msg.hwnd) : 0ull,

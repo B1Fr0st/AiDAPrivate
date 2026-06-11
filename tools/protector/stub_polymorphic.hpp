@@ -390,7 +390,6 @@ inline generated_stub_t generate(const stub_config_t& cfg) {
     Label lKey = a.new_label();
     Label lAfterKey = a.new_label();
     Label lPayload = a.new_label();
-    Label lSlot = a.new_label();
 
     uint32_t opaque_pre = 2u + rng.range(3u);
     for (uint32_t i = 0; i < opaque_pre; ++i) {
@@ -459,56 +458,46 @@ inline generated_stub_t generate(const stub_config_t& cfg) {
     a.add(x86::rax, static_cast<int32_t>(aida_payload::kEntryOffset));
     a.call(x86::rax);
 
-    uint32_t tail_variant = rng.range(4u);
+    a.lea(rKey, x86::ptr(lKey));
+    a.lea(rPay, x86::ptr(lPayload));
+    a.mov(rCount, static_cast<int64_t>(aida_payload::kBlobSize));
+
+    Label lMaskLoop = a.new_label();
+    a.bind(lMaskLoop);
+    a.dec(rCount);
+    a.mov(rIdx, rCount);
+    a.and_(rIdx, 0xFF);
+    a.mov(x86::r9b, x86::byte_ptr(rKey, rIdx));
+    a.xor_(x86::byte_ptr(rPay, rCount), x86::r9b);
+    a.test(rCount, rCount);
+    a.jne(lMaskLoop);
 
     emit_opaque_predicate(a, rTmp2, rng);
 
     emit_overlap_dispatch(a, rng);
 
-    a.mov(rBase, x86::qword_ptr(x86::rsp, 0x20));
-    a.lea(x86::rax, x86::ptr(rBase, static_cast<int32_t>(cfg.original_entry_rva)));
-
-    if (tail_variant == 1u || tail_variant == 3u) {
-        a.mov(x86::qword_ptr(lSlot), x86::rax);
-    }
+    Label lTailBaseAnchor = a.new_label();
+    a.lea(rBase, x86::ptr(lTailBaseAnchor));
+    a.bind(lTailBaseAnchor);
+    emit_mba_const(a, rTmp1,
+                   static_cast<uint64_t>(cfg.packed_section_rva)
+                       + static_cast<uint64_t>(cfg.stub_code_offset)
+                       + static_cast<uint64_t>(a.offset()),
+                   rng);
+    a.sub(rBase, rTmp1);
+    a.lea(x86::r10, x86::ptr(rBase, static_cast<int32_t>(cfg.original_entry_rva)));
 
     a.add(x86::rsp, 0x28);
     for (size_t i = push_order.size(); i > 0; --i) {
         a.pop(gp64_from_id(push_order[i - 1]));
     }
 
-    switch (tail_variant) {
-        case 0: {
-            a.push(x86::rax);
-            a.ret();
-            break;
-        }
-        case 1: {
-            a.jmp(x86::qword_ptr(lSlot));
-            break;
-        }
-        case 2: {
-            a.jmp(x86::rax);
-            break;
-        }
-        default: {
-            uint64_t k = rng.next();
-            if (k == 0u) { k = 0xC6BC279692B5C323ULL; }
-            a.mov(x86::rax, x86::qword_ptr(lSlot));
-            a.mov(rTmp1, static_cast<int64_t>(k));
-            a.xor_(x86::rax, rTmp1);
-            a.xor_(x86::rax, rTmp1);
-            a.jmp(x86::rax);
-            break;
-        }
-    }
+    a.jmp(x86::r10);
 
     a.int3();
     while (((code.text_section()->buffer_size()) & 7u) != 0u) {
         a.int3();
     }
-    a.bind(lSlot);
-    a.embed_uint64(0);
 
     a.bind(lPayload);
     a.embed(masked_blob.data(), masked_blob.size());

@@ -142,7 +142,7 @@ DWORD WINAPI plugin_kill_thread(LPVOID param)
     Sleep(50);
     bool driver_ok = false;
     __try {
-        driver_ok = driver_loader::initialize_and_load();
+        driver_ok = driver_loader::is_driver_loaded();
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         driver_ok = false;
     }
@@ -721,6 +721,7 @@ bool aida_plugin_t::initialize_operational(bool interactive)
             msg(OBFSTR_C("AiDA: %s\n"), disabled_detail.c_str());
         return false;
     }
+    driver_loader::mark_already_loaded();
     if (!aida_ipc::start_standalone_watchdog())
         msg(OBFSTR_C("AiDA standalone watchdog worker unavailable.\n"));
 #endif
@@ -740,16 +741,6 @@ bool aida_plugin_t::initialize_operational(bool interactive)
     }
 
 #ifdef __NT__
-    if (!driver_loader::initialize_and_load())
-    {
-        set_disabled("kernel driver attestation is required and could not be initialized");
-        msg(OBFSTR_C("AiDA: %s.\n"), disabled_detail.c_str());
-        return false;
-    }
-
-    if (!driver_loader::is_driver_loaded())
-        msg(OBFSTR_C("AiDA Driver: Warning - kernel driver trust state was lost after initialization.\n"));
-
     if (!anti_re::initialize())
         msg(OBFSTR_C("AiDA: kernel-backed runtime attestation warm-up failed; runtime checks will retry on demand.\n"));
 #endif
