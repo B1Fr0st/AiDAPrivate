@@ -1702,48 +1702,301 @@ namespace detail
         const std::vector<process_probe_t>* probes = nullptr;
         bool targeted = false;
         uint64_t owner_hash = 0;
+        ULONGLONG scan_start_ms = 0;
+        uint32_t visited = 0;
+        uint32_t visible = 0;
+        uint32_t owner_checked = 0;
+        uint32_t trusted_skipped = 0;
+        uint32_t candidate_windows = 0;
+        uint32_t title_reads = 0;
+        uint32_t title_failures = 0;
+        uint32_t title_timeouts = 0;
+        uint32_t api_exceptions = 0;
+        uint32_t enum_failed = 0;
+        DWORD enum_gle = ERROR_SUCCESS;
+        DWORD last_pid = 0;
+        uint64_t last_owner_hash = 0;
+        uint64_t last_class_hash = 0;
+        uint64_t last_title_hash = 0;
+        ULONGLONG last_title_elapsed_ms = 0;
     };
+
+    inline bool safe_is_window_visible(HWND hwnd, DWORD* gle)
+    {
+        if (gle)
+            *gle = ERROR_SUCCESS;
+        BOOL visible = FALSE;
+        __try
+        {
+            SetLastError(ERROR_SUCCESS);
+            visible = IsWindowVisible(hwnd);
+            if (gle)
+                *gle = GetLastError();
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            if (gle)
+                *gle = GetExceptionCode();
+            return false;
+        }
+        return visible != FALSE;
+    }
+
+    inline bool safe_get_window_pid(HWND hwnd, DWORD* owner_tid, DWORD* pid, DWORD* gle)
+    {
+        if (owner_tid)
+            *owner_tid = 0;
+        if (pid)
+            *pid = 0;
+        if (gle)
+            *gle = ERROR_SUCCESS;
+        DWORD local_pid = 0;
+        DWORD local_tid = 0;
+        __try
+        {
+            SetLastError(ERROR_SUCCESS);
+            local_tid = GetWindowThreadProcessId(hwnd, &local_pid);
+            if (gle)
+                *gle = GetLastError();
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            if (gle)
+                *gle = GetExceptionCode();
+            return false;
+        }
+        if (owner_tid)
+            *owner_tid = local_tid;
+        if (pid)
+            *pid = local_pid;
+        return local_pid != 0;
+    }
+
+    inline int safe_get_window_class(HWND hwnd, wchar_t* buffer, int cch, DWORD* gle)
+    {
+        if (buffer && cch > 0)
+            buffer[0] = 0;
+        if (gle)
+            *gle = ERROR_SUCCESS;
+        int copied = 0;
+        __try
+        {
+            SetLastError(ERROR_SUCCESS);
+            copied = GetClassNameW(hwnd, buffer, cch);
+            if (gle)
+                *gle = GetLastError();
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            if (gle)
+                *gle = GetExceptionCode();
+            return -1;
+        }
+        return copied;
+    }
+
+    inline int safe_get_window_text_timeout(HWND hwnd, wchar_t* buffer, int cch, DWORD timeout_ms,
+        DWORD* gle, bool* timeout, ULONGLONG* elapsed_ms)
+    {
+        if (buffer && cch > 0)
+            buffer[0] = 0;
+        if (gle)
+            *gle = ERROR_SUCCESS;
+        if (timeout)
+            *timeout = false;
+        if (elapsed_ms)
+            *elapsed_ms = 0;
+        DWORD_PTR result = 0;
+        LRESULT ok = 0;
+        const ULONGLONG start = GetTickCount64();
+        __try
+        {
+            SetLastError(ERROR_SUCCESS);
+            ok = SendMessageTimeoutW(hwnd, WM_GETTEXT, static_cast<WPARAM>(cch),
+                reinterpret_cast<LPARAM>(buffer),
+                SMTO_ABORTIFHUNG | SMTO_BLOCK | SMTO_ERRORONEXIT,
+                timeout_ms, &result);
+            if (gle)
+                *gle = GetLastError();
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            if (elapsed_ms)
+                *elapsed_ms = GetTickCount64() - start;
+            if (gle)
+                *gle = GetExceptionCode();
+            return -1;
+        }
+        if (elapsed_ms)
+            *elapsed_ms = GetTickCount64() - start;
+        if (ok == 0)
+        {
+            const DWORD local_gle = gle ? *gle : GetLastError();
+            if (timeout && local_gle == ERROR_TIMEOUT)
+                *timeout = true;
+            return -1;
+        }
+        return static_cast<int>(result);
+    }
 
     inline BOOL CALLBACK enum_windows_target_proc(HWND hwnd, LPARAM lparam)
     {
         auto* ctx = reinterpret_cast<window_scan_context_t*>(lparam);
-        if (!ctx || ctx->targeted || !IsWindowVisible(hwnd))
+        if (!ctx || ctx->targeted)
             return TRUE;
-        wchar_t title[512] = {};
-        if (GetWindowTextW(hwnd, title, static_cast<int>(sizeof(title) / sizeof(title[0]))) <= 0)
+        ++ctx->visited;
+        DWORD visible_gle = ERROR_SUCCESS;
+        if (!safe_is_window_visible(hwnd, &visible_gle))
             return TRUE;
-        std::wstring lower_title = lower_copy(title);
-        static const wchar_t* const title_tokens[] = {
-            L"aidastandalone", L"aida.exe", L"aidaprivate", L"aida_core", L"aida_debug.log"
-        };
-        if (!contains_any_w(lower_title, title_tokens))
-            return TRUE;
+        ++ctx->visible;
         DWORD pid = 0;
-        GetWindowThreadProcessId(hwnd, &pid);
+        DWORD owner_tid = 0;
+        DWORD pid_gle = ERROR_SUCCESS;
+        if (!safe_get_window_pid(hwnd, &owner_tid, &pid, &pid_gle))
+            return TRUE;
+        ++ctx->owner_checked;
+        ctx->last_pid = pid;
         if (pid == 0 || pid == GetCurrentProcessId())
             return TRUE;
         const process_probe_t* probe = ctx->probes ? find_probe(*ctx->probes, pid) : nullptr;
         if (!probe)
             return TRUE;
         if (ctx->probes && is_trusted_aida_internal_camoufox_tree_process(*probe, *ctx->probes))
-            return TRUE;
-        if (is_supported_ida_host_observation(*probe))
-            return TRUE;
-        if (is_memory_scanner_tool(*probe) || is_re_tool(*probe) ||
-            is_debugger_tool(*probe) || is_dump_tool(*probe))
         {
-            ctx->targeted = true;
-            ctx->owner_hash = probe->basename_hash;
-            return FALSE;
+            ++ctx->trusted_skipped;
+            return TRUE;
         }
-        return TRUE;
+        if (is_supported_ida_host_observation(*probe))
+        {
+            ++ctx->trusted_skipped;
+            return TRUE;
+        }
+        const bool high_risk_owner = is_memory_scanner_tool(*probe) || is_re_tool(*probe) ||
+            is_debugger_tool(*probe) || is_dump_tool(*probe);
+        if (!high_risk_owner)
+            return TRUE;
+        ++ctx->candidate_windows;
+        ctx->last_owner_hash = probe->basename_hash;
+        wchar_t class_name[128] = {};
+        DWORD class_gle = ERROR_SUCCESS;
+        const int class_len = safe_get_window_class(hwnd, class_name,
+            static_cast<int>(sizeof(class_name) / sizeof(class_name[0])), &class_gle);
+        if (class_len < 0)
+            ++ctx->api_exceptions;
+        else if (class_len > 0)
+            ctx->last_class_hash = hash_wide_lower(class_name);
+        wchar_t title[512] = {};
+        DWORD title_gle = ERROR_SUCCESS;
+        bool title_timeout = false;
+        ULONGLONG title_elapsed_ms = 0;
+        const int title_len = safe_get_window_text_timeout(hwnd, title,
+            static_cast<int>(sizeof(title) / sizeof(title[0])), 75, &title_gle,
+            &title_timeout, &title_elapsed_ms);
+        ++ctx->title_reads;
+        ctx->last_title_elapsed_ms = title_elapsed_ms;
+        if (title_len <= 0)
+        {
+            ++ctx->title_failures;
+            if (title_timeout)
+                ++ctx->title_timeouts;
+            if (title_len < 0 && title_gle != ERROR_TIMEOUT)
+                ++ctx->api_exceptions;
+            if (ctx->title_failures <= 8)
+            {
+                diag::log_tagged_critical_fmt("guard",
+                    "ai_tool_posture_window_title_probe_failed hwnd=0x%p owner_tid=%lu pid=%lu owner_hash=0x%016llX class_hash=0x%016llX gle=0x%08lX timeout=%d elapsed_ms=%llu class_gle=0x%08lX",
+                    hwnd,
+                    static_cast<unsigned long>(owner_tid),
+                    static_cast<unsigned long>(pid),
+                    static_cast<unsigned long long>(probe->basename_hash),
+                    static_cast<unsigned long long>(ctx->last_class_hash),
+                    static_cast<unsigned long>(title_gle),
+                    title_timeout ? 1 : 0,
+                    static_cast<unsigned long long>(title_elapsed_ms),
+                    static_cast<unsigned long>(class_gle));
+            }
+            return TRUE;
+        }
+        ctx->last_title_hash = hash_wide_lower(title);
+        std::wstring lower_title = lower_copy(title);
+        static const wchar_t* const title_tokens[] = {
+            L"aidastandalone", L"aida.exe", L"aidaprivate", L"aida_core", L"aida_debug.log"
+        };
+        if (!contains_any_w(lower_title, title_tokens))
+            return TRUE;
+        ctx->targeted = true;
+        ctx->owner_hash = probe->basename_hash;
+        diag::log_tagged_critical_fmt("guard",
+            "ai_tool_posture_window_targeted hwnd=0x%p owner_tid=%lu pid=%lu owner_hash=0x%016llX class_hash=0x%016llX title_hash=0x%016llX elapsed_ms=%llu",
+            hwnd,
+            static_cast<unsigned long>(owner_tid),
+            static_cast<unsigned long>(pid),
+            static_cast<unsigned long long>(probe->basename_hash),
+            static_cast<unsigned long long>(ctx->last_class_hash),
+            static_cast<unsigned long long>(ctx->last_title_hash),
+            static_cast<unsigned long long>(title_elapsed_ms));
+        return FALSE;
+    }
+
+    inline BOOL safe_enum_windows_target_proc(HWND hwnd, LPARAM lparam)
+    {
+        BOOL keep_going = TRUE;
+        __try
+        {
+            keep_going = enum_windows_target_proc(hwnd, lparam);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            auto* ctx = reinterpret_cast<window_scan_context_t*>(lparam);
+            if (ctx)
+            {
+                ++ctx->api_exceptions;
+                diag::log_tagged_critical_fmt("guard",
+                    "ai_tool_posture_window_enum_callback_exception code=0x%08lX visited=%u visible=%u owner_checked=%u candidate=%u last_pid=%lu last_owner_hash=0x%016llX",
+                    static_cast<unsigned long>(GetExceptionCode()),
+                    ctx->visited,
+                    ctx->visible,
+                    ctx->owner_checked,
+                    ctx->candidate_windows,
+                    static_cast<unsigned long>(ctx->last_pid),
+                    static_cast<unsigned long long>(ctx->last_owner_hash));
+            }
+        }
+        return keep_going;
     }
 
     inline window_scan_context_t scan_windows_for_aida_targeting(const std::vector<process_probe_t>& probes)
     {
         window_scan_context_t ctx{};
         ctx.probes = &probes;
-        EnumWindows(enum_windows_target_proc, reinterpret_cast<LPARAM>(&ctx));
+        ctx.scan_start_ms = GetTickCount64();
+        SetLastError(ERROR_SUCCESS);
+        if (!EnumWindows(safe_enum_windows_target_proc, reinterpret_cast<LPARAM>(&ctx)))
+        {
+            ctx.enum_gle = GetLastError();
+            if (!ctx.targeted)
+                ctx.enum_failed = 1;
+        }
+        diag::log_tagged_critical_fmt("guard",
+            "ai_tool_posture_window_scan_summary targeted=%d visited=%u visible=%u owners=%u trusted_skipped=%u candidates=%u title_reads=%u title_failures=%u title_timeouts=%u api_exceptions=%u enum_failed=%u enum_gle=0x%08lX last_pid=%lu last_owner_hash=0x%016llX last_class_hash=0x%016llX last_title_hash=0x%016llX last_title_elapsed_ms=%llu elapsed_ms=%llu",
+            ctx.targeted ? 1 : 0,
+            ctx.visited,
+            ctx.visible,
+            ctx.owner_checked,
+            ctx.trusted_skipped,
+            ctx.candidate_windows,
+            ctx.title_reads,
+            ctx.title_failures,
+            ctx.title_timeouts,
+            ctx.api_exceptions,
+            ctx.enum_failed,
+            static_cast<unsigned long>(ctx.enum_gle),
+            static_cast<unsigned long>(ctx.last_pid),
+            static_cast<unsigned long long>(ctx.last_owner_hash),
+            static_cast<unsigned long long>(ctx.last_class_hash),
+            static_cast<unsigned long long>(ctx.last_title_hash),
+            static_cast<unsigned long long>(ctx.last_title_elapsed_ms),
+            static_cast<unsigned long long>(GetTickCount64() - ctx.scan_start_ms));
         return ctx;
     }
 
@@ -1993,21 +2246,58 @@ namespace self_analysis
         const ULONGLONG scan_start_ms = GetTickCount64();
         if (!query)
             return out;
-        ULONG buf_size = 1u << 20;
-        auto* buf = static_cast<uint8_t*>(std::malloc(buf_size));
-        if (!buf)
-            return out;
         constexpr ULONG kSystemExtendedHandleInformation = 64;
-        NTSTATUS st = query(kSystemExtendedHandleInformation, buf, buf_size, &buf_size);
         constexpr NTSTATUS status_info_length_mismatch = static_cast<NTSTATUS>(0xC0000004u);
         constexpr NTSTATUS status_buffer_too_small = static_cast<NTSTATUS>(0xC0000023u);
-        if (st == status_info_length_mismatch || st == status_buffer_too_small)
+        constexpr NTSTATUS status_buffer_overflow = static_cast<NTSTATUS>(0x80000005u);
+        constexpr ULONG kMaxHandleQueryBuffer = 64u << 20;
+        ULONG buf_size = 1u << 20;
+        auto* buf = static_cast<uint8_t*>(nullptr);
+        NTSTATUS st = status_info_length_mismatch;
+        ULONG return_length = 0;
+        unsigned attempt = 0;
+        for (; attempt < 10; ++attempt)
         {
-            std::free(buf);
-            buf = static_cast<uint8_t*>(std::malloc(buf_size));
-            if (!buf)
+            auto* next_buf = static_cast<uint8_t*>(std::realloc(buf, buf_size));
+            if (!next_buf)
+            {
+                std::free(buf);
+                diag::log_tagged_critical_fmt("guard",
+                    "ai_tool_posture_handle_scan_alloc_failed attempt=%u buf_size=%lu elapsed_ms=%llu",
+                    attempt + 1,
+                    static_cast<unsigned long>(buf_size),
+                    static_cast<unsigned long long>(GetTickCount64() - scan_start_ms));
                 return out;
-            st = query(kSystemExtendedHandleInformation, buf, buf_size, &buf_size);
+            }
+            buf = next_buf;
+            return_length = 0;
+            st = query(kSystemExtendedHandleInformation, buf, buf_size, &return_length);
+            if (st >= 0)
+                break;
+            if (st != status_info_length_mismatch &&
+                st != status_buffer_too_small &&
+                st != status_buffer_overflow)
+                break;
+            ULONG next_size = 0;
+            if (return_length > buf_size)
+                next_size = return_length;
+            else if (buf_size < (kMaxHandleQueryBuffer / 2))
+                next_size = buf_size * 2;
+            else
+                next_size = kMaxHandleQueryBuffer;
+            if (next_size > kMaxHandleQueryBuffer)
+                next_size = kMaxHandleQueryBuffer;
+            diag::log_tagged_critical_fmt("guard",
+                "ai_tool_posture_handle_scan_retry status=0x%08lX attempt=%u buf_size=%lu return_length=%lu next_size=%lu elapsed_ms=%llu",
+                static_cast<unsigned long>(st),
+                attempt + 1,
+                static_cast<unsigned long>(buf_size),
+                static_cast<unsigned long>(return_length),
+                static_cast<unsigned long>(next_size),
+                static_cast<unsigned long long>(GetTickCount64() - scan_start_ms));
+            if (next_size <= buf_size)
+                break;
+            buf_size = next_size;
         }
         if (st >= 0)
         {
@@ -2285,10 +2575,13 @@ namespace self_analysis
         }
         else
         {
+            const unsigned attempts_done = attempt >= 10 ? 10 : attempt + 1;
             diag::log_tagged_critical_fmt("guard",
-                "ai_tool_posture_handle_scan_query_failed status=0x%08lX buf_size=%lu elapsed_ms=%llu",
+                "ai_tool_posture_handle_scan_query_failed status=0x%08lX attempts=%u buf_size=%lu return_length=%lu elapsed_ms=%llu",
                 static_cast<unsigned long>(st),
+                attempts_done,
                 static_cast<unsigned long>(buf_size),
+                static_cast<unsigned long>(return_length),
                 static_cast<unsigned long long>(GetTickCount64() - scan_start_ms));
         }
         std::free(buf);
@@ -2506,8 +2799,17 @@ namespace combined
         diag::log_tagged_critical("guard", "ai_tool_posture_full_scan_windows_pre");
         auto window_target = detail::scan_windows_for_aida_targeting(processes);
         diag::log_tagged_critical_fmt("guard",
-            "ai_tool_posture_full_scan_windows_post targeted=%d elapsed_ms=%llu total_elapsed_ms=%llu",
+            "ai_tool_posture_full_scan_windows_post targeted=%d visited=%u visible=%u owners=%u candidates=%u title_reads=%u title_failures=%u title_timeouts=%u api_exceptions=%u enum_failed=%u elapsed_ms=%llu total_elapsed_ms=%llu",
             window_target.targeted ? 1 : 0,
+            window_target.visited,
+            window_target.visible,
+            window_target.owner_checked,
+            window_target.candidate_windows,
+            window_target.title_reads,
+            window_target.title_failures,
+            window_target.title_timeouts,
+            window_target.api_exceptions,
+            window_target.enum_failed,
             static_cast<unsigned long long>(GetTickCount64() - windows_start_ms),
             static_cast<unsigned long long>(GetTickCount64() - scan_start_ms));
         report.tool_targets_aida = process_evidence.targets_aida || handle_report.owner_targets_aida || window_target.targeted;

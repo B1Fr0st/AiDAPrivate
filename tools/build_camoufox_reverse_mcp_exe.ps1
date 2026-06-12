@@ -56,6 +56,46 @@ function Resolve-CamoufoxBrowser {
     return ""
 }
 
+function Resolve-PatchedCamoufoxPackage {
+    param([string]$RepoRoot)
+    $candidates = @(
+        (Join-Path $RepoRoot ".deps\camoufox-runtime\Lib\site-packages\camoufox"),
+        (Join-Path $RepoRoot "build-ninja\deps\camoufox-runtime\Lib\site-packages\camoufox"),
+        (Join-Path $RepoRoot "camoufox-runtime\Lib\site-packages\camoufox")
+    )
+    foreach ($candidate in $candidates) {
+        $fingerprints = Join-Path $candidate "fingerprints.py"
+        if ($candidate -and [IO.Directory]::Exists($candidate) -and [IO.File]::Exists($fingerprints)) {
+            if (Select-String -LiteralPath $fingerprints -Pattern "def generate_context_fingerprint" -Quiet) {
+                return (Resolve-Path -LiteralPath $candidate).Path
+            }
+        }
+    }
+    throw "AiDA patched Camoufox package with generate_context_fingerprint was not found."
+}
+
+function Install-PatchedCamoufoxPackage {
+    param(
+        [string]$VenvPython,
+        [string]$RepoRoot
+    )
+    $package = Resolve-PatchedCamoufoxPackage $RepoRoot
+    $sitePackages = (& $VenvPython -c "import site; print(site.getsitepackages()[0])")
+    if ($LASTEXITCODE -ne 0 -or -not $sitePackages) {
+        throw "Failed to resolve venv site-packages."
+    }
+    $sitePackages = [string]$sitePackages
+    if (-not [IO.Directory]::Exists($sitePackages)) {
+        throw "Resolved venv site-packages directory does not exist: $sitePackages"
+    }
+    $dest = Join-Path $sitePackages "camoufox"
+    if ([IO.Directory]::Exists($dest)) {
+        Remove-Item -LiteralPath $dest -Recurse -Force
+    }
+    Copy-Item -LiteralPath $package -Destination $dest -Recurse -Force
+    Write-Output "patched_camoufox_package=$package"
+}
+
 function Invoke-FrozenMcpSmoke {
     param(
         [string]$Executable,
@@ -168,10 +208,11 @@ try {
     & $Python -m venv $venv
     if ($LASTEXITCODE -ne 0) { throw "venv creation failed" }
     $venvPython = Join-Path $venv "Scripts\python.exe"
-    & $venvPython -m pip install --upgrade pip wheel setuptools nuitka zstandard ordered-set pyinstaller
+    & $venvPython -m pip install --upgrade pip wheel setuptools nuitka zstandard ordered-set pyinstaller rich rich-click
     if ($LASTEXITCODE -ne 0) { throw "build dependency install failed" }
     & $venvPython -m pip install $SourceRoot
     if ($LASTEXITCODE -ne 0) { throw "camoufox-reverse-mcp dependency install failed" }
+    Install-PatchedCamoufoxPackage -VenvPython $venvPython -RepoRoot $repoRoot
     $entry = Join-Path $workRoot "aida_camoufox_reverse_mcp_launcher.py"
     @'
 import asyncio

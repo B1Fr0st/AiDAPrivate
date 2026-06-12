@@ -2048,54 +2048,85 @@ void register_network_tools(mcp_standalone::server_t& srv) {
         network_inject_packet, false});
 
     register_compat(srv, {
-        OBFSTR("network_list_mod_rules"), OBFSTR("network"),
-        OBFSTR("List all active packet modification rules. Shows rule ID, direction, protocol, port/pid filters, "
-               "match count, and active status."),
-        {},
-        network_list_mod_rules, true});
+        OBFSTR("network_packet_mod_manage"), OBFSTR("network"),
+        OBFSTR("Manage packet modification rules. Actions: add, remove, clear, list."),
+        {{OBFSTR("action"), OBFSTR("string"), OBFSTR("add|remove|clear|list"), true},
+         {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
+        [](const json& params) -> tool_result_t {
+            const std::string action = compat_action_name(params);
+            json p = compat_action_payload(params);
+            if (action == "list") return network_list_mod_rules(p);
+            if (action == "add" || action == "remove" || action == "clear") {
+                p["operation"] = action;
+                return network_modify_packet_rule(p);
+            }
+            return compat_unknown_action("network_packet_mod_manage", action);
+        },
+        false});
 
     register_compat(srv, {
-        OBFSTR("network_list_redirect_rules"), OBFSTR("network"),
-        OBFSTR("List all active traffic redirect rules with match counts and status."),
-        {},
-        network_list_redirect_rules, true});
+        OBFSTR("network_redirect_manage"), OBFSTR("network"),
+        OBFSTR("Manage traffic redirect rules. Actions: add, remove, clear, list."),
+        {{OBFSTR("action"), OBFSTR("string"), OBFSTR("add|remove|clear|list"), true},
+         {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
+        [](const json& params) -> tool_result_t {
+            const std::string action = compat_action_name(params);
+            json p = compat_action_payload(params);
+            if (action == "list") return network_list_redirect_rules(p);
+            if (action == "add" || action == "remove" || action == "clear") {
+                p["operation"] = action;
+                return network_redirect_traffic(p);
+            }
+            return compat_unknown_action("network_redirect_manage", action);
+        },
+        false});
 
     register_compat(srv, {
-        OBFSTR("network_get_held_packets"), OBFSTR("network"),
-        OBFSTR("Retrieve packets currently held by the interceptor. Returns hold_id, timestamp, direction, "
-               "protocol, src/dst endpoints, pid, and payload (hex dump + ASCII). Use hold_id with "
-               "network_release_packet to decide each packet's fate."),
-        {},
-        network_get_held_packets, true});
+        OBFSTR("network_intercept_manage"), OBFSTR("network"),
+        OBFSTR("Manage packet interception and held-packet decisions. Actions: enable, disable, list, release, drop, modify."),
+        {{OBFSTR("action"), OBFSTR("string"), OBFSTR("enable|disable|list|release|drop|modify"), true},
+         {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
+        [](const json& params) -> tool_result_t {
+            const std::string action = compat_action_name(params);
+            json p = compat_action_payload(params);
+            if (action == "enable" || action == "disable") {
+                p["operation"] = action;
+                return network_intercept(p);
+            }
+            if (action == "list") return network_get_held_packets(p);
+            if (action == "release" || action == "drop" || action == "modify") {
+                p["action"] = action;
+                return network_release_packet(p);
+            }
+            return compat_unknown_action("network_intercept_manage", action);
+        },
+        false});
 
     register_compat(srv, {
-        OBFSTR("network_release_packet"), OBFSTR("network"),
-        OBFSTR("Release a held packet from the interceptor. Actions: 'release' (forward as-is, default), "
-               "'drop' (discard silently), 'modify' (replace payload then forward). For 'modify', provide "
-               "new payload as hex or text. Like Fiddler's 'Run to Completion' / 'Drop' / 'Edit & Reissue'."),
-        {{OBFSTR("hold_id"), OBFSTR("number"), OBFSTR("Held packet ID from network_get_held_packets"), true},
-         {OBFSTR("action"), OBFSTR("string"), OBFSTR("'release', 'drop', or 'modify' (default: release)"), false},
-         {OBFSTR("payload_hex"), OBFSTR("string"), OBFSTR("For modify: new payload as hex string"), false},
-         {OBFSTR("payload_text"), OBFSTR("string"), OBFSTR("For modify: new payload as ASCII text"), false}},
-        network_release_packet, false});
-
-    register_compat(srv, {
-        OBFSTR("network_spoof_dns"), OBFSTR("network"),
-        OBFSTR("Manage kernel-level DNS spoofing rules. 'add' creates a rule to intercept DNS queries for a domain "
-               "and return a spoofed A/AAAA record. 'remove' deletes by rule ID. 'clear' removes all. Like a kernel "
-               "hosts file - intercepts at the WFP layer before packets leave. Max 32 rules."),
-        {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("'add', 'remove', or 'clear'"), true},
-         {OBFSTR("domain"), OBFSTR("string"), OBFSTR("For add: domain name to intercept (e.g. 'example.com')"), false},
-         {OBFSTR("spoof_ip"), OBFSTR("string"), OBFSTR("For add: IP address to return in DNS response"), false},
-         {OBFSTR("ttl"), OBFSTR("number"), OBFSTR("For add: TTL in seconds for spoofed response (default: 300)"), false},
-         {OBFSTR("rule_id"), OBFSTR("number"), OBFSTR("For remove: rule ID"), false}},
-        network_spoof_dns, false});
-
-    register_compat(srv, {
-        OBFSTR("network_list_dns_spoof_rules"), OBFSTR("network"),
-        OBFSTR("List all active DNS spoof rules with domain, spoof address, TTL, match counts, and status."),
-        {},
-        network_list_dns_spoof_rules, true});
+        OBFSTR("network_dns_manage"), OBFSTR("network"),
+        OBFSTR("Manage DNS diagnostics and spoofing rules. Actions: log, add_spoof, remove_spoof, clear_spoof, list_spoof."),
+        {{OBFSTR("action"), OBFSTR("string"), OBFSTR("log|add_spoof|remove_spoof|clear_spoof|list_spoof"), true},
+         {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
+        [](const json& params) -> tool_result_t {
+            const std::string action = compat_action_name(params);
+            json p = compat_action_payload(params);
+            if (action == "log") return network_dns_log(p);
+            if (action == "list_spoof") return network_list_dns_spoof_rules(p);
+            if (action == "add_spoof") {
+                p["operation"] = "add";
+                return network_spoof_dns(p);
+            }
+            if (action == "remove_spoof") {
+                p["operation"] = "remove";
+                return network_spoof_dns(p);
+            }
+            if (action == "clear_spoof") {
+                p["operation"] = "clear";
+                return network_spoof_dns(p);
+            }
+            return compat_unknown_action("network_dns_manage", action);
+        },
+        false});
 
     register_compat(srv, {
         OBFSTR("network_os_fingerprint"), OBFSTR("network"),

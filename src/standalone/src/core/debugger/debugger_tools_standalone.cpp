@@ -2078,6 +2078,113 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
     });
 
     register_compat(srv, {
+        OBFSTR("debugger_get_memory_map"), OBFSTR("debugger"),
+        OBFSTR("Enumerate the attached process memory map with base, end, size, protection, state, type, module, and region info."),
+        {{OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum regions to return, default 2048, cap 4096"), false},
+         {OBFSTR("executable_only"), OBFSTR("boolean"), OBFSTR("Return only executable regions."), false},
+         {OBFSTR("target_pid"), OBFSTR("number"), OBFSTR("Optional PID override. Switches the active attach context for this call."), false}},
+        [](const json& params) -> tool_result_t {
+            diag::log_tagged_fmt("dbg_tools", "debugger_get_memory_map: entry");
+            if (auto err = ensure_attached(params)) return *err;
+            const int limit = int_param_clamped(params, "limit", 2048, 1, 4096);
+            const bool executable_only = params.value("executable_only", false);
+            auto regions = debugger_engine::get_memory_map();
+            json arr = json::array();
+            bool truncated = false;
+            uint64_t total_bytes = 0;
+            for (const auto& r : regions) {
+                const DWORD page_protect = r.protect & 0xffu;
+                const bool executable =
+                    page_protect == PAGE_EXECUTE ||
+                    page_protect == PAGE_EXECUTE_READ ||
+                    page_protect == PAGE_EXECUTE_READWRITE ||
+                    page_protect == PAGE_EXECUTE_WRITECOPY;
+                if (executable_only && !executable)
+                    continue;
+                if (static_cast<int>(arr.size()) >= limit) {
+                    truncated = true;
+                    break;
+                }
+                total_bytes += r.size;
+                json o;
+                o["base"] = sa_format_address(r.base);
+                o["end"] = sa_format_address(r.base + r.size);
+                o["size"] = r.size;
+                o["protect"] = r.protect;
+                o["protect_text"] = debugger_engine::format_protect(r.protect);
+                o["state"] = r.state;
+                o["type"] = r.type;
+                if (!r.module_name.empty()) o["module"] = r.module_name;
+                if (!r.info.empty()) o["info"] = r.info;
+                arr.push_back(std::move(o));
+            }
+            json result;
+            result["count"] = arr.size();
+            result["total_regions"] = regions.size();
+            result["total_returned_bytes"] = total_bytes;
+            result["truncated"] = truncated;
+            result["executable_only"] = executable_only;
+            result["regions"] = std::move(arr);
+            diag::log_tagged_fmt("dbg_tools", "debugger_get_memory_map: returning count=%zu total=%zu truncated=%d",
+                result["count"].get<size_t>(),
+                regions.size(),
+                truncated ? 1 : 0);
+            return tool_result_t::ok(result);
+        }, true});
+
+    register_compat(srv, {
+        OBFSTR("debugger_execution_manage"), OBFSTR("debugger"),
+        OBFSTR("Manage debugger execution state. Actions: continue, pause, status."),
+        {{OBFSTR("action"), OBFSTR("string"), OBFSTR("continue|pause|status"), true},
+         {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
+        [](const json& params) -> tool_result_t {
+            const std::string action = compat_action_name(params);
+            const json p = compat_action_payload(params);
+            auto status_name = [](debugger_engine::dbg_status_t s) -> const char* {
+                switch (s) {
+                    case debugger_engine::dbg_status_t::idle: return "idle";
+                    case debugger_engine::dbg_status_t::running: return "running";
+                    case debugger_engine::dbg_status_t::paused: return "paused";
+                    case debugger_engine::dbg_status_t::stepping: return "stepping";
+                    case debugger_engine::dbg_status_t::terminated: return "terminated";
+                    default: return "unknown";
+                }
+            };
+            auto make_status = [&]() -> json {
+                json result;
+                result["driver_connected"] = device->is_connected();
+                result["pid"] = driver_bridge::attached_pid();
+                result["active_tid"] = debugger_engine::g_state.active_tid;
+                result["status"] = status_name(debugger_engine::g_state.status.load(std::memory_order_acquire));
+                uint32_t exit_code = 0;
+                result["alive"] = driver_bridge::attached_process_alive(&exit_code);
+                result["exit_code"] = exit_code;
+                return result;
+            };
+            diag::log_tagged_fmt("dbg_tools", "debugger_execution_manage: action=%s", action.c_str());
+            if (action == "status")
+                return tool_result_t::ok(make_status());
+            if (auto err = ensure_attached(p)) return *err;
+            if (action == "continue") {
+                const bool ok = debugger_engine::run_target();
+                json result = make_status();
+                result["operation_ok"] = ok;
+                if (!ok)
+                    return tool_result_t::error(debugger_engine::last_error().empty() ? OBFSTR("continue failed.") : debugger_engine::last_error());
+                return tool_result_t::ok(OBFSTR("Target continued."), result);
+            }
+            if (action == "pause") {
+                const bool ok = debugger_engine::pause_target();
+                json result = make_status();
+                result["operation_ok"] = ok;
+                if (!ok)
+                    return tool_result_t::error(debugger_engine::last_error().empty() ? OBFSTR("pause failed.") : debugger_engine::last_error());
+                return tool_result_t::ok(OBFSTR("Target paused."), result);
+            }
+            return compat_unknown_action("debugger_execution_manage", action);
+        }, false});
+
+    register_compat(srv, {
         OBFSTR("debugger_set_register"), OBFSTR("debugger"),
         OBFSTR("Set a CPU register for a specific target thread. Accepts 64-bit GPR names, RIP, RSP, RBP, and RFLAGS."),
         {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID"), true},

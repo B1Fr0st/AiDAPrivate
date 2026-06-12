@@ -29,6 +29,48 @@ def replace_once(text: str, old: str, new: str, label: str) -> str:
     return text.replace(old, new, 1)
 
 
+def replace_browser_already_running_summary(text: str) -> str:
+    pattern = re.compile(
+        r'(?P<i>[ \t]+)pages_info = \{\}\n'
+        r'(?P=i)for name, p in self\.pages\.items\(\):\n'
+        r'(?P=i)    try:\n'
+        r'(?P=i)        pages_info\[name\] = p\.url\n'
+        r'(?P=i)    except Exception:\n'
+        r'(?P=i)        pages_info\[name\] = "unknown"\n'
+        r'(?P=i)active_page = self\.pages\.get\(self\.active_page_name or ""\)\n'
+        r'(?P=i)active_bounds = await self\._page_bounds_limited\(active_page\) if active_page else \{\}\n'
+    )
+    match = pattern.search(text)
+    if not match:
+        fail("missing anchor browser already running page summaries")
+    indent = match.group("i")
+    replacement = (
+        f"{indent}pages_info = await self.list_pages()\n"
+        f"{indent}active_page = await self.resolve_page(None)\n"
+        f"{indent}active_bounds = await self._page_bounds_limited(active_page) if active_page else {{}}\n"
+    )
+    return text[:match.start()] + replacement + text[match.end():]
+
+
+def replace_browser_already_running_fields(text: str) -> str:
+    pattern = re.compile(
+        r'(?P<i>[ \t]+)"active_page": self\.active_page_name,\n'
+        r'(?P=i)"pages": pages_info,\n'
+    )
+    match = pattern.search(text)
+    if not match:
+        fail("missing anchor browser already running result fields")
+    indent = match.group("i")
+    replacement = (
+        f"{indent}\"session_id\": self.session_id,\n"
+        f"{indent}\"active_page\": self.active_page_id or self.active_page_name,\n"
+        f"{indent}\"active_page_id\": self.active_page_id or self.active_page_name,\n"
+        f"{indent}\"page_count\": len(self.pages),\n"
+        f"{indent}\"pages\": pages_info,\n"
+    )
+    return text[:match.start()] + replacement + text[match.end():]
+
+
 def patch_navigation_capture(path: pathlib.Path, text: str) -> str:
     if "capture_from_start: bool = False" not in text:
         with_page = (
@@ -74,6 +116,46 @@ def patch_navigation_capture(path: pathlib.Path, text: str) -> str:
     return text
 
 
+def patch_navigation_launch_params(path: pathlib.Path, text: str) -> str:
+    if "profile_dir: str | None = None" not in text:
+        text = replace_once(
+            text,
+            "    launch_timeout_ms: int = 30000,\n) -> dict:\n",
+            "    launch_timeout_ms: int = 30000,\n"
+            "    persistent_context: bool = False,\n"
+            "    profile_dir: str | None = None,\n"
+            "    user_data_dir: str | None = None,\n"
+            ") -> dict:\n",
+            f"navigation launch persistent signature {path}",
+        )
+    if "config[\"persistent_context\"] = True" not in text:
+        text = replace_once(
+            text,
+            "        if ff_version is not None:\n"
+            "            try:\n"
+            "                config[\"ff_version\"] = int(ff_version)\n"
+            "            except (TypeError, ValueError):\n"
+            "                pass\n"
+            "        if proxy:\n",
+            "        if ff_version is not None:\n"
+            "            try:\n"
+            "                config[\"ff_version\"] = int(ff_version)\n"
+            "            except (TypeError, ValueError):\n"
+            "                pass\n"
+            "        if persistent_context or profile_dir or user_data_dir:\n"
+            "            config[\"persistent_context\"] = True\n"
+            "        if profile_dir:\n"
+            "            config[\"profile_dir\"] = profile_dir\n"
+            "        if user_data_dir:\n"
+            "            config[\"user_data_dir\"] = user_data_dir\n"
+            "        if proxy:\n",
+            f"navigation launch persistent config {path}",
+        )
+    if "profile_dir: str | None = None" not in text or "config[\"persistent_context\"] = True" not in text:
+        fail(f"navigation launch persistent validation failed {path}")
+    return text
+
+
 def patch_browser(path: pathlib.Path) -> None:
     text = read_text(path)
     if "self._aida_multipage_patch = 4" in text:
@@ -97,13 +179,13 @@ def patch_browser(path: pathlib.Path) -> None:
             "        except Exception:\n"
             "            self._discard_pending_page_id(requested_context_id, page_id)\n"
             "            raise\n"
-            "        privacy_info = await _verify_private_page(page)\n"
+            "        privacy_info = await _verify_page_privacy(page, self._context_plan)\n"
             "        privacy_page_id = self.page_id_for(page) or (page_id or \"\")\n"
             "        _camoufox_debug(\"page_privacy_verified\", session_id=self.session_id, page_id=privacy_page_id, **privacy_info)\n"
-            "        if not privacy_info.get(\"webrtc_disabled\"):\n"
+            "        if not privacy_info.get(\"webrtc_blocked\") or not privacy_info.get(\"ice_probe_ok\") or privacy_info.get(\"ice_candidate_leak_detected\"):\n"
             "            with contextlib.suppress(Exception):\n"
             "                await page.close()\n"
-            "            raise RuntimeError(\"Camoufox privacy verification failed: WebRTC is still exposed\")\n"
+            "            raise RuntimeError(\"Camoufox privacy verification failed\")\n"
             "        pid = self._register_page(page, page_id, make_active, \"new_page\", requested_context_id)\n"
             "        self._discard_pending_page_id(requested_context_id, page_id)\n",
         )
@@ -111,13 +193,13 @@ def patch_browser(path: pathlib.Path) -> None:
             updated = replace_once(
                 updated,
                 "        pid = self._register_page(page, page_id, make_active, \"new_page\", requested_context_id)\n",
-                "        privacy_info = await _verify_private_page(page)\n"
+                "        privacy_info = await _verify_page_privacy(page, self._context_plan)\n"
                 "        privacy_page_id = self.page_id_for(page) or (page_id or \"\")\n"
                 "        _camoufox_debug(\"page_privacy_verified\", session_id=self.session_id, page_id=privacy_page_id, **privacy_info)\n"
-                "        if not privacy_info.get(\"webrtc_disabled\"):\n"
+                "        if not privacy_info.get(\"webrtc_blocked\") or not privacy_info.get(\"ice_probe_ok\") or privacy_info.get(\"ice_candidate_leak_detected\"):\n"
                 "            with contextlib.suppress(Exception):\n"
                 "                await page.close()\n"
-                "            raise RuntimeError(\"Camoufox privacy verification failed: WebRTC is still exposed\")\n"
+                "            raise RuntimeError(\"Camoufox privacy verification failed\")\n"
                 "        pid = self._register_page(page, page_id, make_active, \"new_page\", requested_context_id)\n",
                 "browser v4 page privacy guard",
             )
@@ -145,13 +227,13 @@ def patch_browser(path: pathlib.Path) -> None:
             "        except Exception:\n"
             "            self._discard_pending_page_id(requested_context_id, page_id)\n"
             "            raise\n"
-            "        privacy_info = await _verify_private_page(page)\n"
+            "        privacy_info = await _verify_page_privacy(page, self._context_plan)\n"
             "        privacy_page_id = self.page_id_for(page) or (page_id or \"\")\n"
             "        _camoufox_debug(\"page_privacy_verified\", session_id=self.session_id, page_id=privacy_page_id, **privacy_info)\n"
-            "        if not privacy_info.get(\"webrtc_disabled\"):\n"
+            "        if not privacy_info.get(\"webrtc_blocked\") or not privacy_info.get(\"ice_probe_ok\") or privacy_info.get(\"ice_candidate_leak_detected\"):\n"
             "            with contextlib.suppress(Exception):\n"
             "                await page.close()\n"
-            "            raise RuntimeError(\"Camoufox privacy verification failed: WebRTC is still exposed\")\n"
+            "            raise RuntimeError(\"Camoufox privacy verification failed\")\n"
             "        pid = self._register_page(page, page_id, make_active, \"new_page\", requested_context_id)\n"
             "        self._discard_pending_page_id(requested_context_id, page_id)\n",
         )
@@ -159,13 +241,13 @@ def patch_browser(path: pathlib.Path) -> None:
             updated = replace_once(
                 updated,
                 "        pid = self._register_page(page, page_id, make_active, \"new_page\", requested_context_id)\n",
-                "        privacy_info = await _verify_private_page(page)\n"
+                "        privacy_info = await _verify_page_privacy(page, self._context_plan)\n"
                 "        privacy_page_id = self.page_id_for(page) or (page_id or \"\")\n"
                 "        _camoufox_debug(\"page_privacy_verified\", session_id=self.session_id, page_id=privacy_page_id, **privacy_info)\n"
-                "        if not privacy_info.get(\"webrtc_disabled\"):\n"
+                "        if not privacy_info.get(\"webrtc_blocked\") or not privacy_info.get(\"ice_probe_ok\") or privacy_info.get(\"ice_candidate_leak_detected\"):\n"
                 "            with contextlib.suppress(Exception):\n"
                 "                await page.close()\n"
-                "            raise RuntimeError(\"Camoufox privacy verification failed: WebRTC is still exposed\")\n"
+                "            raise RuntimeError(\"Camoufox privacy verification failed\")\n"
                 "        pid = self._register_page(page, page_id, make_active, \"new_page\", requested_context_id)\n",
                 "browser v3 page privacy guard",
             )
@@ -225,13 +307,13 @@ def patch_browser(path: pathlib.Path) -> None:
             "        except Exception:\n"
             "            self._discard_pending_page_id(requested_context_id, page_id)\n"
             "            raise\n"
-            "        privacy_info = await _verify_private_page(page)\n"
+            "        privacy_info = await _verify_page_privacy(page, self._context_plan)\n"
             "        privacy_page_id = self.page_id_for(page) or (page_id or \"\")\n"
             "        _camoufox_debug(\"page_privacy_verified\", session_id=self.session_id, page_id=privacy_page_id, **privacy_info)\n"
-            "        if not privacy_info.get(\"webrtc_disabled\"):\n"
+            "        if not privacy_info.get(\"webrtc_blocked\") or not privacy_info.get(\"ice_probe_ok\") or privacy_info.get(\"ice_candidate_leak_detected\"):\n"
             "            with contextlib.suppress(Exception):\n"
             "                await page.close()\n"
-            "            raise RuntimeError(\"Camoufox privacy verification failed: WebRTC is still exposed\")\n"
+            "            raise RuntimeError(\"Camoufox privacy verification failed\")\n"
             "        pid = self._register_page(page, page_id, make_active, \"new_page\", requested_context_id)\n"
             "        self._discard_pending_page_id(requested_context_id, page_id)\n",
         )
@@ -265,41 +347,16 @@ def patch_browser(path: pathlib.Path) -> None:
         "        self._nav_responses_by_page: dict[str, list[dict]] = {}",
         "browser nav response state",
     )
-    text = replace_once(
-        text,
-        "            pages_info = {}\n"
-        "            for name, p in self.pages.items():\n"
-        "                try:\n"
-        "                    pages_info[name] = p.url\n"
-        "                except Exception:\n"
-        "                    pages_info[name] = \"unknown\"\n"
-        "            active_page = self.pages.get(self.active_page_name or \"\")\n"
-        "            active_bounds = await self._page_bounds_limited(active_page) if active_page else {}\n",
-        "            pages_info = await self.list_pages()\n"
-        "            active_page = await self.resolve_page(None)\n"
-        "            active_bounds = await self._page_bounds_limited(active_page) if active_page else {}\n",
-        "browser already running page summaries",
-    )
-    text = replace_once(
-        text,
-        "                \"active_page\": self.active_page_name,\n"
-        "                \"pages\": pages_info,\n",
-        "                \"session_id\": self.session_id,\n"
-        "                \"active_page\": self.active_page_id or self.active_page_name,\n"
-        "                \"active_page_id\": self.active_page_id or self.active_page_name,\n"
-        "                \"page_count\": len(self.pages),\n"
-        "                \"pages\": pages_info,\n",
-        "browser already running result fields",
-    )
-    text = replace_once(
-        text,
-        "            self.contexts[\"default\"] = ctx\n\n"
-        "            if os_type != host_os:",
-        "            self.contexts[\"default\"] = ctx\n"
-        "            self._register_context(\"default\", ctx)\n\n"
-        "            if os_type != host_os:",
-        "browser launch context register",
-    )
+    text = replace_browser_already_running_summary(text)
+    text = replace_browser_already_running_fields(text)
+    if "self._register_context(\"default\", ctx)" not in text:
+        text = replace_once(
+            text,
+            "            self.contexts[\"default\"] = ctx\n",
+            "            self.contexts[\"default\"] = ctx\n"
+            "            self._register_context(\"default\", ctx)\n",
+            "browser launch context register",
+        )
     text = replace_once(
         text,
         "            self._attach_listeners(page)\n"
@@ -541,13 +598,13 @@ def patch_browser(path: pathlib.Path) -> None:
         except Exception:
             self._discard_pending_page_id(requested_context_id, page_id)
             raise
-        privacy_info = await _verify_private_page(page)
+        privacy_info = await _verify_page_privacy(page, self._context_plan)
         privacy_page_id = self.page_id_for(page) or (page_id or "")
         _camoufox_debug("page_privacy_verified", session_id=self.session_id, page_id=privacy_page_id, **privacy_info)
-        if not privacy_info.get("webrtc_disabled"):
+        if not privacy_info.get("webrtc_blocked") or not privacy_info.get("ice_probe_ok") or privacy_info.get("ice_candidate_leak_detected"):
             with contextlib.suppress(Exception):
                 await page.close()
-            raise RuntimeError("Camoufox privacy verification failed: WebRTC is still exposed")
+            raise RuntimeError("Camoufox privacy verification failed")
         pid = self._register_page(page, page_id, make_active, "new_page", requested_context_id)
         self._discard_pending_page_id(requested_context_id, page_id)
         if url:
@@ -709,21 +766,44 @@ def patch_browser(path: pathlib.Path) -> None:
         "        return list(self._nav_responses)\n",
         "browser nav response methods",
     )
-    text = replace_once(
-        text,
-        "        self.contexts[name] = ctx\n"
-        "        page = await ctx.new_page()\n"
-        "        self._attach_listeners(page)\n"
-        "        self.pages[name] = page\n"
-        "        self.active_page_name = name\n"
-        "        return {\"status\": \"created\", \"context\": name, \"mode\": mode}\n",
-        "        self.contexts[name] = ctx\n"
-        "        self._register_context(name, ctx)\n"
-        "        page = await ctx.new_page()\n"
-        "        page_id = self._register_page(page, name, True, \"create_context\", name)\n"
-        "        return {\"status\": \"created\", \"context\": name, \"mode\": mode, \"page_id\": page_id, \"active_page_id\": self.active_page_id, \"page_count\": len(self.pages)}\n",
-        "browser create_context page register",
-    )
+    if "return {\"status\": \"created\", \"context\": name, \"mode\": mode, \"page_id\": page_id" not in text:
+        current_create_context = (
+            "        self.contexts[name] = ctx\n"
+            "        page = await _await_no_cancel_wait(ctx.new_page(), timeout=30.0)\n"
+            "        if self._context_plan:\n"
+            "            await _verify_page_privacy(page, self._context_plan)\n"
+            "        self._attach_listeners(page)\n"
+            "        self.pages[name] = page\n"
+            "        self.active_page_name = name\n"
+            "        return {\"status\": \"created\", \"context\": name, \"mode\": mode}\n"
+        )
+        patched_create_context = (
+            "        self.contexts[name] = ctx\n"
+            "        self._register_context(name, ctx)\n"
+            "        page = await _await_no_cancel_wait(ctx.new_page(), timeout=30.0)\n"
+            "        if self._context_plan:\n"
+            "            await _verify_page_privacy(page, self._context_plan)\n"
+            "        page_id = self._register_page(page, name, True, \"create_context\", name)\n"
+            "        return {\"status\": \"created\", \"context\": name, \"mode\": mode, \"page_id\": page_id, \"active_page_id\": self.active_page_id, \"page_count\": len(self.pages)}\n"
+        )
+        if current_create_context in text:
+            text = text.replace(current_create_context, patched_create_context, 1)
+        else:
+            text = replace_once(
+                text,
+                "        self.contexts[name] = ctx\n"
+                "        page = await ctx.new_page()\n"
+                "        self._attach_listeners(page)\n"
+                "        self.pages[name] = page\n"
+                "        self.active_page_name = name\n"
+                "        return {\"status\": \"created\", \"context\": name, \"mode\": mode}\n",
+                "        self.contexts[name] = ctx\n"
+                "        self._register_context(name, ctx)\n"
+                "        page = await ctx.new_page()\n"
+                "        page_id = self._register_page(page, name, True, \"create_context\", name)\n"
+                "        return {\"status\": \"created\", \"context\": name, \"mode\": mode, \"page_id\": page_id, \"active_page_id\": self.active_page_id, \"page_count\": len(self.pages)}\n",
+                "browser create_context page register",
+            )
     text = replace_once(
         text,
         "        if self.active_page_name and self.active_page_name in self.pages:\n"
@@ -755,6 +835,7 @@ def patch_browser(path: pathlib.Path) -> None:
 
 def patch_navigation(path: pathlib.Path) -> None:
     text = read_text(path)
+    text = patch_navigation_launch_params(path, text)
     if "async def list_pages(" in text and "page_id: str | None = None" in text:
         text = patch_navigation_capture(path, text)
         text = patch_navigation_diagnostics(path, text)

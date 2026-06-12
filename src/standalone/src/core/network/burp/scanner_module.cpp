@@ -7,7 +7,6 @@
 #include <chrono>
 #include <cstring>
 #include <mutex>
-#include <random>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -36,6 +35,20 @@ uint64_t now_ms()
 {
     using namespace std::chrono;
     return static_cast<uint64_t>(duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count());
+}
+
+uint64_t tick_entropy()
+{
+    using namespace std::chrono;
+    return static_cast<uint64_t>(steady_clock::now().time_since_epoch().count());
+}
+
+uint64_t mix64(uint64_t v)
+{
+    v += 0x9E3779B97F4A7C15ull;
+    v = (v ^ (v >> 30)) * 0xBF58476D1CE4E5B9ull;
+    v = (v ^ (v >> 27)) * 0x94D049BB133111EBull;
+    return v ^ (v >> 31);
 }
 
 std::string base36(uint64_t v)
@@ -112,15 +125,21 @@ size_t count()
 std::string random_marker(const std::string& prefix)
 {
     static std::atomic<uint64_t> s_counter{0};
-    static std::mt19937_64 s_rng{std::random_device{}()};
-    static std::mutex s_mtx;
-    uint64_t c = s_counter.fetch_add(1, std::memory_order_relaxed);
-    uint64_t r;
-    { std::lock_guard<std::mutex> lk(s_mtx); r = s_rng(); }
+    uint64_t c = s_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+    uint64_t t = tick_entropy();
+    uint64_t w = now_ms();
+    uint64_t seed = t ^ (w << 7) ^ (c * 0xD6E8FEB86659FD93ull) ^
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&s_counter));
+    uint64_t r = mix64(seed);
     std::ostringstream os;
-    os << prefix << base36(now_ms()) << base36(c) << base36(r & 0xFFFFFFFFu);
+    os << prefix << base36(w) << base36(c) << base36(r);
     std::string marker = os.str();
-    diag::log_tagged_fmt("scanner", "random_marker prefix=%s result=%s", prefix.c_str(), marker.c_str());
+    diag::log_tagged_fmt("scanner", "random_marker prefix=%s counter=%llu tick=0x%llX mixed=0x%llX result=%s",
+        prefix.c_str(),
+        static_cast<unsigned long long>(c),
+        static_cast<unsigned long long>(t),
+        static_cast<unsigned long long>(r),
+        marker.c_str());
     return marker;
 }
 

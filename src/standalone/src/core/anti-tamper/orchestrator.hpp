@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -269,6 +270,65 @@ inline uint64_t driver_crc_text_hash_seh(const void* data, size_t len, bool& ok)
 inline bool kernel_adbg_thread_walk_optional_error(DWORD err)
 {
     return err == ERROR_NOT_SUPPORTED || err == ERROR_INVALID_FUNCTION;
+}
+
+inline std::atomic<bool> g_kernel_clear_process_dr_unsupported{false};
+inline std::atomic<bool> g_kernel_hide_all_threads_unsupported{false};
+
+struct seh_capture_t
+{
+    DWORD code = 0;
+    void* address = nullptr;
+    DWORD flags = 0;
+    DWORD parameters = 0;
+    ULONG_PTR info[EXCEPTION_MAXIMUM_PARAMETERS] = {};
+};
+
+static int capture_seh_exception(EXCEPTION_POINTERS* ep, seh_capture_t* out)
+{
+    if (out && ep && ep->ExceptionRecord)
+    {
+        out->code = ep->ExceptionRecord->ExceptionCode;
+        out->address = ep->ExceptionRecord->ExceptionAddress;
+        out->flags = ep->ExceptionRecord->ExceptionFlags;
+        out->parameters = ep->ExceptionRecord->NumberParameters;
+        const DWORD count = out->parameters < EXCEPTION_MAXIMUM_PARAMETERS ? out->parameters : EXCEPTION_MAXIMUM_PARAMETERS;
+        for (DWORD i = 0; i < count; ++i)
+            out->info[i] = ep->ExceptionRecord->ExceptionInformation[i];
+    }
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+__declspec(noinline) static DWORD seh_canary_register(void* canary,
+                                                      SIZE_T size,
+                                                      BOOL* out_registered,
+                                                      DWORD* out_error,
+                                                      seh_capture_t* out_exception)
+{
+    if (out_registered)
+        *out_registered = FALSE;
+    if (out_error)
+        *out_error = ERROR_SUCCESS;
+    if (out_exception)
+        *out_exception = {};
+    __try
+    {
+        SetLastError(ERROR_SUCCESS);
+        const bool registered = driver_bridge::canary_register(canary, size);
+        const DWORD err = registered ? ERROR_SUCCESS : GetLastError();
+        if (out_registered)
+            *out_registered = registered ? TRUE : FALSE;
+        if (out_error)
+            *out_error = err;
+    }
+    __except (capture_seh_exception(GetExceptionInformation(), out_exception))
+    {
+        const DWORD code = out_exception ? out_exception->code : GetExceptionCode();
+        if (out_error)
+            *out_error = GetLastError() != ERROR_SUCCESS ? GetLastError() : ERROR_UNHANDLED_EXCEPTION;
+        return code;
+    }
+    return 0;
 }
 
 inline bool kernel_adbg_hard_flags_present(uint32_t flags)
@@ -1013,6 +1073,7 @@ inline bool ensure_driver_hardening(const char* phase)
     bool hide_threads_required = hide_threads_ok || !kernel_adbg_thread_walk_optional_error(hide_threads_err);
     if (!clear_proc_ok && !clear_proc_required)
     {
+        g_kernel_clear_process_dr_unsupported.store(true, std::memory_order_release);
         webhook::write_log_critical_fmt("init",
             "kernel_clear_process_dr_optional_unsupported phase=%s err=%lu pid=%lu",
             phase_name,
@@ -1021,6 +1082,7 @@ inline bool ensure_driver_hardening(const char* phase)
     }
     if (!hide_threads_ok && !hide_threads_required)
     {
+        g_kernel_hide_all_threads_unsupported.store(true, std::memory_order_release);
         webhook::write_log_critical_fmt("init",
             "kernel_hide_all_threads_optional_unsupported phase=%s err=%lu pid=%lu",
             phase_name,
@@ -1259,6 +1321,8 @@ inline bool initialize()
                 4096u);
             bool register_ok = false;
             DWORD register_error = lock_ok ? ERROR_SUCCESS : lock_error;
+            DWORD register_seh = 0;
+            seh_capture_t register_exception{};
             if (lock_ok)
             {
                 uint64_t canary_register_tick = GetTickCount64();
@@ -1269,27 +1333,51 @@ inline bool initialize()
                     static_cast<unsigned long long>(canary_register_tick),
                     canary,
                     4096u);
-                SetLastError(ERROR_SUCCESS);
-                register_ok = driver_bridge::canary_register(canary, 4096);
-                register_error = register_ok ? ERROR_SUCCESS : GetLastError();
+                BOOL register_bool = FALSE;
+                register_seh = seh_canary_register(canary,
+                    4096,
+                    &register_bool,
+                    &register_error,
+                    &register_exception);
+                register_ok = register_seh == 0 && register_bool != FALSE;
                 webhook::write_log_critical_fmt("init",
-                    "canary_register_post ok=%d err=%lu elapsed_ms=%llu va=%p size=0x%X",
+                    "canary_register_post ok=%d err=%lu seh=0x%08lX elapsed_ms=%llu va=%p size=0x%X",
                     register_ok ? 1 : 0,
                     static_cast<unsigned long>(register_error),
+                    static_cast<unsigned long>(register_seh),
                     static_cast<unsigned long long>(GetTickCount64() - canary_register_tick),
                     canary,
                     4096u);
+                if (register_seh != 0)
+                {
+                    webhook::write_log_critical_fmt("init",
+                        "canary_register_seh code=0x%08lX addr=%p flags=0x%08lX params=%lu p0=0x%llX p1=0x%llX p2=0x%llX p3=0x%llX err=%lu va=%p size=0x%X pid=%lu tid=%lu",
+                        static_cast<unsigned long>(register_seh),
+                        register_exception.address,
+                        static_cast<unsigned long>(register_exception.flags),
+                        static_cast<unsigned long>(register_exception.parameters),
+                        static_cast<unsigned long long>(register_exception.info[0]),
+                        static_cast<unsigned long long>(register_exception.info[1]),
+                        static_cast<unsigned long long>(register_exception.info[2]),
+                        static_cast<unsigned long long>(register_exception.info[3]),
+                        static_cast<unsigned long>(register_error),
+                        canary,
+                        4096u,
+                        static_cast<unsigned long>(GetCurrentProcessId()),
+                        static_cast<unsigned long>(GetCurrentThreadId()));
+                }
             }
             {
                 char dbg[256];
-                std::snprintf(dbg, sizeof(dbg), "canary_stage va=%p pid=%lu seed=0x%llx lock=%d lock_err=%lu register=%d register_err=%lu",
+                std::snprintf(dbg, sizeof(dbg), "canary_stage va=%p pid=%lu seed=0x%llx lock=%d lock_err=%lu register=%d register_err=%lu register_seh=0x%08lx",
                     canary,
                     GetCurrentProcessId(),
                     static_cast<unsigned long long>(initial_canary_seed),
                     lock_ok ? 1 : 0,
                     lock_error,
                     register_ok ? 1 : 0,
-                    register_error);
+                    register_error,
+                    static_cast<unsigned long>(register_seh));
                 webhook::write_log("init", dbg);
             }
 
@@ -1345,15 +1433,35 @@ inline bool initialize()
                 }
                 rt.canary_page = canary;
             }
+            else if (lock_ok && register_seh != 0)
+            {
+                MEMORY_BASIC_INFORMATION retained_mbi{};
+                SIZE_T retained_vq = VirtualQuery(canary, &retained_mbi, sizeof(retained_mbi));
+                rt.canary_page = canary;
+                webhook::write_log_critical_fmt("init",
+                    "canary_register_seh_page_retained va=%p size=0x%X err=%lu seh=0x%08lX vq=%llu mbi_base=0x%llX alloc_base=0x%llX region=0x%llX state=0x%lX protect=0x%lX type=0x%lX",
+                    canary,
+                    4096u,
+                    static_cast<unsigned long>(register_error),
+                    static_cast<unsigned long>(register_seh),
+                    static_cast<unsigned long long>(retained_vq),
+                    static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(retained_mbi.BaseAddress)),
+                    static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(retained_mbi.AllocationBase)),
+                    static_cast<unsigned long long>(retained_mbi.RegionSize),
+                    static_cast<unsigned long>(retained_mbi.State),
+                    static_cast<unsigned long>(retained_mbi.Protect),
+                    static_cast<unsigned long>(retained_mbi.Type));
+            }
             else
             {
                 webhook::write_log_critical_fmt("init",
-                    "canary_cleanup_after_failed_stage va=%p lock_ok=%d register_ok=%d lock_err=%lu register_err=%lu",
+                    "canary_cleanup_after_failed_stage va=%p lock_ok=%d register_ok=%d lock_err=%lu register_err=%lu register_seh=0x%08lX",
                     canary,
                     lock_ok ? 1 : 0,
                     register_ok ? 1 : 0,
                     static_cast<unsigned long>(lock_error),
-                    static_cast<unsigned long>(register_error));
+                    static_cast<unsigned long>(register_error),
+                    static_cast<unsigned long>(register_seh));
                 SetLastError(ERROR_SUCCESS);
                 BOOL unlock_ok = VirtualUnlock(canary, 4096);
                 DWORD unlock_err = unlock_ok ? ERROR_SUCCESS : GetLastError();
@@ -3265,25 +3373,33 @@ inline bool guard()
                         static_cast<unsigned long long>(debugger_pid));
                 }
 
-                SetLastError(ERROR_SUCCESS);
-                bool clear_proc_runtime_ok = driver_bridge::kernel_anti_debug_clear_process_dr(GetCurrentProcessId());
-                DWORD clear_proc_runtime_err = clear_proc_runtime_ok ? ERROR_SUCCESS : GetLastError();
-                bool clear_proc_runtime_required = clear_proc_runtime_ok || !kernel_adbg_thread_walk_optional_error(clear_proc_runtime_err);
-                webhook::write_log_critical_fmt("guard",
-                    "kernel_clear_process_dr_runtime_result ok=%d err=%lu required=%d pid=%lu",
-                    clear_proc_runtime_ok ? 1 : 0,
-                    static_cast<unsigned long>(clear_proc_runtime_err),
-                    clear_proc_runtime_required ? 1 : 0,
-                    static_cast<unsigned long>(GetCurrentProcessId()));
-                if (!clear_proc_runtime_ok && clear_proc_runtime_required)
+                if (g_kernel_clear_process_dr_unsupported.load(std::memory_order_acquire))
                 {
-                    webhook::send_debug_log("guard", "kernel_clear_process_dr_runtime_failed", true);
-                    enforce_violation_id(aida::reason_ids::reason_id_kernel_debugger_runtime, "kernel_clear_process_dr_runtime_failed");
-                    CFF_EXIT(guard_cff);
+                    webhook::write_log("guard", "kernel_clear_process_dr_runtime_skipped_unsupported");
                 }
-                if (!clear_proc_runtime_ok)
+                else
                 {
-                    webhook::write_log("guard", "kernel_clear_process_dr_runtime_degraded_unsupported");
+                    SetLastError(ERROR_SUCCESS);
+                    bool clear_proc_runtime_ok = driver_bridge::kernel_anti_debug_clear_process_dr(GetCurrentProcessId());
+                    DWORD clear_proc_runtime_err = clear_proc_runtime_ok ? ERROR_SUCCESS : GetLastError();
+                    bool clear_proc_runtime_required = clear_proc_runtime_ok || !kernel_adbg_thread_walk_optional_error(clear_proc_runtime_err);
+                    webhook::write_log_critical_fmt("guard",
+                        "kernel_clear_process_dr_runtime_result ok=%d err=%lu required=%d pid=%lu",
+                        clear_proc_runtime_ok ? 1 : 0,
+                        static_cast<unsigned long>(clear_proc_runtime_err),
+                        clear_proc_runtime_required ? 1 : 0,
+                        static_cast<unsigned long>(GetCurrentProcessId()));
+                    if (!clear_proc_runtime_ok && clear_proc_runtime_required)
+                    {
+                        webhook::send_debug_log("guard", "kernel_clear_process_dr_runtime_failed", true);
+                        enforce_violation_id(aida::reason_ids::reason_id_kernel_debugger_runtime, "kernel_clear_process_dr_runtime_failed");
+                        CFF_EXIT(guard_cff);
+                    }
+                    if (!clear_proc_runtime_ok)
+                    {
+                        g_kernel_clear_process_dr_unsupported.store(true, std::memory_order_release);
+                        webhook::write_log("guard", "kernel_clear_process_dr_runtime_degraded_unsupported");
+                    }
                 }
             }
         }

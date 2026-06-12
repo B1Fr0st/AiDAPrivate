@@ -524,7 +524,7 @@ int main(int argc, char* argv[]) {
     if (target_log_len > 0 && target_log_len < sizeof(target_log_path))
         aida_target_log_set_file(target_log_path);
     else
-        aida_target_log_set_file("C:\\Users\\Public\\Desktop\\aida_full_test.log");
+        aida_target_log_set_file("C:\\Users\\Public\\Desktop\\aida_test_target.log");
     install_target_crash_handlers();
     s_args = parse_args(argc, argv);
     const cli_args_t& args = s_args;

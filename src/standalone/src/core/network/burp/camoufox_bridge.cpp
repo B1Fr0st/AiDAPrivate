@@ -19,6 +19,7 @@
 
 #include <atomic>
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -64,8 +65,16 @@ struct singleton_t
     std::string                             active_page_title;
     std::vector<page_status_t>              pages;
     std::string                             active_profile_dir;
+    std::string                             effective_ua_policy = "camoufox_native";
+    std::string                             ua_override_string;
+    bool                                    ua_override         = false;
+    bool                                    webrtc_blocked      = false;
+    bool                                    privacy_verified    = false;
+    nlohmann::json                          privacy_diagnostics = nlohmann::json::object();
     bool                                    page_verified      = false;
     bool                                    cleanup_pending    = false;
+    bool                                    active_profile_generated = false;
+    bool                                    cleanup_profile_generated = false;
     uint64_t                                generation         = 0;
     uint64_t                                cleanup_generation = 0;
     uint64_t                                cleanup_started_ms = 0;
@@ -115,6 +124,13 @@ struct managed_session_t
     std::string                           active_page_url;
     std::string                           active_page_title;
     std::string                           active_profile_dir;
+    std::string                           effective_ua_policy = "camoufox_native";
+    std::string                           ua_override_string;
+    bool                                  ua_override = false;
+    bool                                  webrtc_blocked = false;
+    bool                                  privacy_verified = false;
+    nlohmann::json                        privacy_diagnostics = nlohmann::json::object();
+    bool                                  active_profile_generated = false;
     std::vector<page_status_t>            pages;
     uint64_t                              generation = 0;
     uint64_t                              last_launch_ms = 0;
@@ -124,6 +140,9 @@ struct managed_session_t
     std::atomic<bool>                     stop_requested{false};
     launch_config_t                       active_cfg;
 };
+
+void clear_privacy_locked();
+void clear_privacy_locked(managed_session_t& session);
 
 std::recursive_mutex& sessions_mtx()
 {
@@ -207,6 +226,13 @@ bool prewarm_default_disabled()
            _stricmp(value, "no") == 0 ||
            _stricmp(value, "off") == 0 ||
            _stricmp(value, "disabled") == 0;
+}
+
+bool env_flag_enabled_a(const char* name);
+
+bool full_test_running_env()
+{
+    return env_flag_enabled_a("AIDA_FULL_TEST_RUNNING");
 }
 
 bool env_flag_enabled_a(const char* name)
@@ -295,6 +321,117 @@ bool system_python_discovery_allowed()
 void enforce_private_launch_config(launch_config_t& cfg)
 {
     cfg.block_webrtc = true;
+}
+
+std::string trim_launch_token(std::string value)
+{
+    size_t begin = 0;
+    size_t end = value.size();
+    while (begin < end && (value[begin] == ' ' || value[begin] == '\t' || value[begin] == '\r' || value[begin] == '\n' || value[begin] == '"'))
+        ++begin;
+    while (end > begin && (value[end - 1] == ' ' || value[end - 1] == '\t' || value[end - 1] == '\r' || value[end - 1] == '\n' || value[end - 1] == '"'))
+        --end;
+    return value.substr(begin, end - begin);
+}
+
+std::string lower_launch_token(std::string value)
+{
+    value = trim_launch_token(std::move(value));
+    for (char& c : value)
+    {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + 32);
+    }
+    return value;
+}
+
+std::string normalize_default_launch_token(std::string value, const char* fallback)
+{
+    value = lower_launch_token(std::move(value));
+    if (value.empty() || value == "auto")
+        value = fallback && fallback[0] ? std::string(fallback) : std::string("auto");
+    return value;
+}
+
+std::string normalize_launch_path(std::string value)
+{
+    value = lower_launch_token(std::move(value));
+    for (char& c : value)
+    {
+        if (c == '/') c = '\\';
+    }
+    while (!value.empty() && (value.back() == '\\' || value.back() == '/'))
+        value.pop_back();
+    return value;
+}
+
+bool requested_launch_path_matches(const std::string& active, const std::string& requested)
+{
+    const std::string req = normalize_launch_path(requested);
+    if (req.empty())
+        return true;
+    const std::string cur = normalize_launch_path(active);
+    return !cur.empty() && cur == req;
+}
+
+void preserve_resolved_launch_paths(launch_config_t& target, const launch_config_t& active)
+{
+    if (target.python_executable.empty())
+        target.python_executable = active.python_executable;
+    if (target.browser_executable.empty())
+        target.browser_executable = active.browser_executable;
+    if (target.server_executable.empty())
+        target.server_executable = active.server_executable;
+}
+
+std::string privacy_relevant_launch_config_mismatch_reason(const launch_config_t& active, const launch_config_t& requested)
+{
+    if (normalize_default_launch_token(active.session_id, "default") != normalize_default_launch_token(requested.session_id, "default"))
+        return "session_id";
+    if (active.headless != requested.headless)
+        return "headless";
+    if (trim_launch_token(active.proxy) != trim_launch_token(requested.proxy))
+        return "proxy";
+    const std::string requested_os = normalize_default_launch_token(requested.os, "auto");
+    const std::string active_os = normalize_default_launch_token(active.os, "auto");
+    if (requested_os != "auto" && active_os != "auto" && active_os != requested_os)
+        return "os";
+    const std::string requested_locale = normalize_default_launch_token(requested.locale, "auto");
+    const std::string active_locale = normalize_default_launch_token(active.locale, "auto");
+    if (requested_locale != "auto" && active_locale != "auto" && active_locale != requested_locale)
+        return "locale";
+    if (active.humanize != requested.humanize)
+        return "humanize";
+    if (active.geoip != requested.geoip)
+        return "geoip";
+    if (active.block_images != requested.block_images)
+        return "block_images";
+    if (active.block_webrtc != requested.block_webrtc)
+        return "block_webrtc";
+    if (trim_launch_token(active.user_agent) != trim_launch_token(requested.user_agent))
+        return "user_agent";
+    if (normalize_default_launch_token(active.ua_policy, "camoufox_native") != normalize_default_launch_token(requested.ua_policy, "camoufox_native"))
+        return "ua_policy";
+    const bool requested_profile_dir = !trim_launch_token(requested.profile_dir).empty();
+    const bool requested_user_data_dir = !trim_launch_token(requested.user_data_dir).empty();
+    const bool requested_persistent = requested.persistent_context || requested_profile_dir || requested_user_data_dir;
+    if (requested_persistent && active.persistent_context != requested_persistent)
+        return "persistent_context";
+    if (requested_profile_dir && trim_launch_token(active.profile_dir) != trim_launch_token(requested.profile_dir))
+        return "profile_dir";
+    if (requested_user_data_dir && trim_launch_token(active.user_data_dir) != trim_launch_token(requested.user_data_dir))
+        return "user_data_dir";
+    if (active.enable_trace != requested.enable_trace)
+        return "enable_trace";
+    if (!requested_launch_path_matches(active.browser_executable, requested.browser_executable))
+        return "browser_executable";
+    if (!requested_launch_path_matches(active.server_executable, requested.server_executable))
+        return "server_executable";
+    return {};
+}
+
+bool privacy_relevant_launch_config_equal(const launch_config_t& a, const launch_config_t& b)
+{
+    return privacy_relevant_launch_config_mismatch_reason(a, b).empty();
 }
 
 std::string hex64(uint64_t v)
@@ -1518,6 +1655,32 @@ const char* bridge_state_name(bridge_state_t state)
     return "unknown";
 }
 
+bool is_camoufox_browser_process_name(const std::string& exe)
+{
+    std::string name = exe;
+    for (char& c : name)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return name == "camoufox.exe" || name == "firefox.exe" || name.find("camoufox") != std::string::npos;
+}
+
+void populate_process_counts(bridge_status_t& s)
+{
+    s.browser_instance_count = (s.browser_open && s.child_alive && s.child_pid != 0) ? 1u : 0u;
+    s.child_process_count = 0;
+    s.browser_process_count = 0;
+    if (s.child_pid == 0)
+        return;
+    const std::vector<process_tree_entry_t> tree = enumerate_process_tree(s.child_pid);
+    s.child_process_count = static_cast<uint32_t>(tree.size());
+    uint32_t browser_count = 0;
+    for (const auto& entry : tree)
+    {
+        if (is_camoufox_browser_process_name(entry.exe))
+            ++browser_count;
+    }
+    s.browser_process_count = browser_count;
+}
+
 struct action_snapshot_t
 {
     bridge_state_t state = bridge_state_t::stopped;
@@ -1606,6 +1769,7 @@ void clear_page_state_locked()
     sg().pages.clear();
     sg().page_verified = false;
     sg().last_verified_ms = 0;
+    clear_privacy_locked();
 }
 
 void clear_auto_restart_block_locked(const char* reason)
@@ -1914,13 +2078,17 @@ void mark_cleanup_started_locked(uint64_t generation, uint32_t child_pid = 0, co
     sg().cleanup_started_ms = now_ms();
     sg().cleanup_child_pid = child_pid == 0 ? sg().child_pid : child_pid;
     if (!sg().active_profile_dir.empty() || sg().cleanup_profile_dir.empty())
+    {
         sg().cleanup_profile_dir = sg().active_profile_dir;
+        sg().cleanup_profile_generated = sg().active_profile_generated;
+    }
     sg().cleanup_reason = reason;
     const auto tree = sg().cleanup_child_pid == 0 ? std::vector<process_tree_entry_t>() : enumerate_process_tree(sg().cleanup_child_pid);
     const size_t descendant_count = tree.size() > 0 ? tree.size() - 1 : 0;
-    diag::log_tagged_fmt("camoufox", "cleanup_state_begin generation=%llu child_pid=%lu descendants=%zu profile_dir=%s reason=%s state=%d current_generation=%llu pending=%d",
+    diag::log_tagged_fmt("camoufox", "cleanup_state_begin generation=%llu child_pid=%lu descendants=%zu profile_dir=%s profile_generated=%d reason=%s state=%d current_generation=%llu pending=%d",
         static_cast<unsigned long long>(generation), static_cast<unsigned long>(sg().cleanup_child_pid),
         descendant_count, sg().cleanup_profile_dir.empty() ? "<empty>" : sg().cleanup_profile_dir.c_str(),
+        sg().cleanup_profile_generated ? 1 : 0,
         sg().cleanup_reason.c_str(), static_cast<int>(sg().state),
         static_cast<unsigned long long>(sg().generation), static_cast<int>(sg().cleanup_pending));
 }
@@ -1934,6 +2102,7 @@ void mark_cleanup_finished(uint64_t generation, uint64_t elapsed_ms, const std::
     const uint32_t cleanup_pid = sg().cleanup_child_pid;
     const std::string cleanup_reason = sg().cleanup_reason;
     cleanup_profile_dir = sg().cleanup_profile_dir;
+    const bool cleanup_profile_generated = sg().cleanup_profile_generated;
     if (sg().cleanup_generation == generation)
     {
         sg().cleanup_pending = false;
@@ -1941,17 +2110,22 @@ void mark_cleanup_finished(uint64_t generation, uint64_t elapsed_ms, const std::
         sg().cleanup_started_ms = 0;
         sg().cleanup_child_pid = 0;
         sg().cleanup_profile_dir.clear();
+        sg().cleanup_profile_generated = false;
         sg().cleanup_reason.clear();
         if (cleanup_pid != 0 && sg().tracked_child_pid.load(std::memory_order_acquire) == cleanup_pid)
             sg().tracked_child_pid.store(0, std::memory_order_release);
         if (sg().active_profile_dir == cleanup_profile_dir)
+        {
             sg().active_profile_dir.clear();
-        should_purge_profile = true;
+            sg().active_profile_generated = false;
+        }
+        should_purge_profile = cleanup_profile_generated;
     }
-    diag::log_tagged_fmt("camoufox", "cleanup_state_done generation=%llu current_generation=%llu pending=%d child_pid=%lu profile_dir=%s started_age_ms=%llu start_reason=%s reason=%s elapsed_ms=%llu",
+    diag::log_tagged_fmt("camoufox", "cleanup_state_done generation=%llu current_generation=%llu pending=%d child_pid=%lu profile_dir=%s profile_generated=%d started_age_ms=%llu start_reason=%s reason=%s elapsed_ms=%llu",
         static_cast<unsigned long long>(generation), static_cast<unsigned long long>(sg().generation),
         static_cast<int>(sg().cleanup_pending), static_cast<unsigned long>(cleanup_pid),
         cleanup_profile_dir.empty() ? "<empty>" : cleanup_profile_dir.c_str(),
+        should_purge_profile ? 1 : 0,
         static_cast<unsigned long long>(age_ms), cleanup_reason.c_str(), reason.c_str(),
         static_cast<unsigned long long>(elapsed_ms));
     lk.unlock();
@@ -3110,6 +3284,7 @@ bool wait_for_existing_start_bridge_result(const launch_config_t& cfg, uint64_t 
         bool has_client = false;
         bool browser_open = false;
         bool page_verified = false;
+        bool privacy_verified = false;
         bool cleanup_pending = false;
         bool child_alive = false;
         std::string err;
@@ -3125,10 +3300,11 @@ bool wait_for_existing_start_bridge_result(const launch_config_t& cfg, uint64_t 
                 has_client = sg().client != nullptr;
                 browser_open = sg().browser_open;
                 page_verified = sg().page_verified;
+                privacy_verified = sg().privacy_verified;
                 cleanup_pending = sg().cleanup_pending;
                 err = sg().last_error;
                 child_alive = process_alive(child_pid);
-                const bool ready = state == bridge_state_t::ready && has_client && browser_open && page_verified && child_alive &&
+                const bool ready = state == bridge_state_t::ready && has_client && browser_open && page_verified && privacy_verified && child_alive &&
                     !cleanup_pending && !is_driver_closed_error(err);
                 if (ready)
                 {
@@ -3142,20 +3318,20 @@ bool wait_for_existing_start_bridge_result(const launch_config_t& cfg, uint64_t 
                     if (err.empty())
                         err = "camoufox bridge operation finished without ready state";
                     sg().last_error = err;
-                    diag::log_tagged_fmt("camoufox", "start_bridge operation_busy_terminal state=%d generation=%llu child_pid=%lu client=%d browser_open=%d page_verified=%d child_alive=%d elapsed_ms=%llu err=%s",
+                    diag::log_tagged_fmt("camoufox", "start_bridge operation_busy_terminal state=%d generation=%llu child_pid=%lu client=%d browser_open=%d page_verified=%d privacy_verified=%d child_alive=%d elapsed_ms=%llu err=%s",
                         static_cast<int>(state), static_cast<unsigned long long>(generation), static_cast<unsigned long>(child_pid),
                         static_cast<int>(has_client), static_cast<int>(browser_open), static_cast<int>(page_verified),
-                        static_cast<int>(child_alive), static_cast<unsigned long long>(now_ms() - wait_start_ms), err.c_str());
+                        static_cast<int>(privacy_verified), static_cast<int>(child_alive), static_cast<unsigned long long>(now_ms() - wait_start_ms), err.c_str());
                     return false;
                 }
             }
         }
         if (now - last_log_ms >= 1000)
         {
-            diag::log_tagged_fmt("camoufox", "start_bridge operation_busy_wait state=%d generation=%llu child_pid=%lu inspected=%d client=%d browser_open=%d page_verified=%d child_alive=%d cleanup_pending=%d elapsed_ms=%llu limit_ms=%llu err_len=%zu",
+            diag::log_tagged_fmt("camoufox", "start_bridge operation_busy_wait state=%d generation=%llu child_pid=%lu inspected=%d client=%d browser_open=%d page_verified=%d privacy_verified=%d child_alive=%d cleanup_pending=%d elapsed_ms=%llu limit_ms=%llu err_len=%zu",
                 static_cast<int>(state), static_cast<unsigned long long>(generation), static_cast<unsigned long>(child_pid),
                 static_cast<int>(inspected), static_cast<int>(has_client), static_cast<int>(browser_open),
-                static_cast<int>(page_verified), static_cast<int>(child_alive), static_cast<int>(cleanup_pending),
+                static_cast<int>(page_verified), static_cast<int>(privacy_verified), static_cast<int>(child_alive), static_cast<int>(cleanup_pending),
                 static_cast<unsigned long long>(now - wait_start_ms), static_cast<unsigned long long>(wait_limit_ms), err.size());
             last_log_ms = now;
         }
@@ -3165,10 +3341,10 @@ bool wait_for_existing_start_bridge_result(const launch_config_t& cfg, uint64_t 
     }
     std::lock_guard<std::recursive_mutex> lk(sg().mtx);
     sg().last_error = "camoufox bridge operation still busy";
-    diag::log_tagged_fmt("camoufox", "start_bridge operation_busy_wait_timeout state=%d generation=%llu child_pid=%lu client=%d browser_open=%d page_verified=%d cleanup_pending=%d elapsed_ms=%llu",
+    diag::log_tagged_fmt("camoufox", "start_bridge operation_busy_wait_timeout state=%d generation=%llu child_pid=%lu client=%d browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d elapsed_ms=%llu",
         static_cast<int>(sg().state), static_cast<unsigned long long>(sg().generation), static_cast<unsigned long>(sg().child_pid),
         static_cast<int>(sg().client != nullptr), static_cast<int>(sg().browser_open), static_cast<int>(sg().page_verified),
-        static_cast<int>(sg().cleanup_pending), static_cast<unsigned long long>(now_ms() - wait_start_ms));
+        static_cast<int>(sg().privacy_verified), static_cast<int>(sg().cleanup_pending), static_cast<unsigned long long>(now_ms() - wait_start_ms));
     return false;
 }
 
@@ -3217,13 +3393,24 @@ nlohmann::json build_launch_args(const launch_config_t& cfg)
     j["block_images"] = cfg.block_images;
     j["block_webrtc"] = true;
     j["webrtc_policy"] = "disabled";
-    j["ua_policy"] = "camoufox_native";
+    j["privacy_fail_closed"] = true;
+    j["block_service_workers"] = true;
+    j["ua_policy"] = cfg.ua_policy.empty() ? std::string("camoufox_native") : cfg.ua_policy;
+    if (!cfg.user_agent.empty())
+        j["user_agent"] = cfg.user_agent;
     j["enable_trace"] = cfg.enable_trace;
     j["window_width"] = cfg.window_width > 0 ? cfg.window_width : 1280;
     j["window_height"] = cfg.window_height > 0 ? cfg.window_height : 900;
     j["launch_timeout_ms"] = launch_timeout_ms > 2000 ? launch_timeout_ms - 1000 : launch_timeout_ms;
     if (testlab_fast_probe)
         j["aida_testlab_fast_probe"] = true;
+    const bool persistent_context_requested = cfg.persistent_context || !cfg.profile_dir.empty() || !cfg.user_data_dir.empty() || (!cfg.headless && !cfg.browser_executable.empty());
+    if (persistent_context_requested)
+        j["persistent_context"] = true;
+    if (!cfg.profile_dir.empty())
+        j["profile_dir"] = cfg.profile_dir;
+    if (!cfg.user_data_dir.empty())
+        j["user_data_dir"] = cfg.user_data_dir;
     if (!cfg.proxy.empty()) j["proxy"] = cfg.proxy;
     if (!cfg.browser_executable.empty())
     {
@@ -3374,6 +3561,132 @@ bool json_bool_or(const nlohmann::json& j, const char* key, bool fallback)
     auto it = j.find(key);
     if (it == j.end() || !it->is_boolean()) return fallback;
     return it->get<bool>();
+}
+
+bool launch_profile_generated_from_response(const nlohmann::json& parsed)
+{
+    if (!parsed.is_object())
+        return false;
+    auto diagnostics_it = parsed.find("diagnostics");
+    if (diagnostics_it == parsed.end() || !diagnostics_it->is_object())
+        return false;
+    auto profile_it = diagnostics_it->find("profile");
+    if (profile_it == diagnostics_it->end() || !profile_it->is_object())
+        return false;
+    return json_bool_or(*profile_it, "generated", false);
+}
+
+std::string json_string_nested_or(const nlohmann::json& j, const char* key, const char* nested_key, const std::string& fallback)
+{
+    if (!j.is_object()) return fallback;
+    auto it = j.find(key);
+    if (it != j.end() && it->is_string())
+        return it->get<std::string>();
+    if (nested_key)
+    {
+        auto nested = j.find(nested_key);
+        if (nested != j.end() && nested->is_string())
+            return nested->get<std::string>();
+    }
+    return fallback;
+}
+
+nlohmann::json privacy_diagnostics_from_response(const nlohmann::json& parsed)
+{
+    if (!parsed.is_object())
+        return nlohmann::json::object();
+    auto diagnostics_it = parsed.find("diagnostics");
+    if (diagnostics_it != parsed.end() && diagnostics_it->is_object())
+    {
+        auto privacy_it = diagnostics_it->find("privacy");
+        if (privacy_it != diagnostics_it->end() && privacy_it->is_object())
+            return *privacy_it;
+    }
+    auto privacy_it = parsed.find("privacy");
+    if (privacy_it != parsed.end() && privacy_it->is_object())
+        return *privacy_it;
+    return nlohmann::json::object();
+}
+
+void clear_privacy_locked()
+{
+    sg().effective_ua_policy = "camoufox_native";
+    sg().ua_override_string.clear();
+    sg().ua_override = false;
+    sg().webrtc_blocked = false;
+    sg().privacy_verified = false;
+    sg().privacy_diagnostics = nlohmann::json::object();
+}
+
+void clear_privacy_locked(managed_session_t& session)
+{
+    session.effective_ua_policy = "camoufox_native";
+    session.ua_override_string.clear();
+    session.ua_override = false;
+    session.webrtc_blocked = false;
+    session.privacy_verified = false;
+    session.privacy_diagnostics = nlohmann::json::object();
+}
+
+void update_privacy_from_response_locked(const nlohmann::json& parsed, const char* source)
+{
+    nlohmann::json privacy = privacy_diagnostics_from_response(parsed);
+    if (!privacy.is_object() || privacy.empty())
+        return;
+    sg().privacy_diagnostics = privacy;
+    sg().effective_ua_policy = json_string_nested_or(privacy, "effective_ua_policy", "ua_policy", "camoufox_native");
+    sg().ua_override = json_bool_or(privacy, "ua_override", false);
+    sg().ua_override_string = json_string_or(privacy, "ua_override_string", std::string());
+    sg().webrtc_blocked = json_bool_or(privacy, "webrtc_blocked", false);
+    const bool webdriver_ok = json_bool_or(privacy, "webdriver_ok", false);
+    const bool platform_ok = json_bool_or(privacy, "platform_ok", true);
+    const bool oscpu_ok = json_bool_or(privacy, "oscpu_ok", true);
+    const bool ice_ok = json_bool_or(privacy, "ice_probe_ok", false);
+    const bool ice_leak = json_bool_or(privacy, "ice_candidate_leak_detected", true);
+    sg().privacy_verified = sg().webrtc_blocked && webdriver_ok && platform_ok && oscpu_ok && ice_ok && !ice_leak;
+    diag::log_tagged_fmt("camoufox", "privacy_status_update source=%s ua_policy=%s ua_override=%d ua_override_len=%zu webrtc_blocked=%d webdriver_ok=%d platform_ok=%d oscpu_ok=%d ice_ok=%d ice_leak=%d ice_status=%s",
+        source ? source : "unknown",
+        sg().effective_ua_policy.c_str(),
+        sg().ua_override ? 1 : 0,
+        sg().ua_override_string.size(),
+        sg().webrtc_blocked ? 1 : 0,
+        webdriver_ok ? 1 : 0,
+        platform_ok ? 1 : 0,
+        oscpu_ok ? 1 : 0,
+        ice_ok ? 1 : 0,
+        ice_leak ? 1 : 0,
+        json_string_or(privacy, "ice_probe_status", std::string()).c_str());
+}
+
+void update_privacy_from_response_locked(managed_session_t& session, const nlohmann::json& parsed, const char* source)
+{
+    nlohmann::json privacy = privacy_diagnostics_from_response(parsed);
+    if (!privacy.is_object() || privacy.empty())
+        return;
+    session.privacy_diagnostics = privacy;
+    session.effective_ua_policy = json_string_nested_or(privacy, "effective_ua_policy", "ua_policy", "camoufox_native");
+    session.ua_override = json_bool_or(privacy, "ua_override", false);
+    session.ua_override_string = json_string_or(privacy, "ua_override_string", std::string());
+    session.webrtc_blocked = json_bool_or(privacy, "webrtc_blocked", false);
+    const bool webdriver_ok = json_bool_or(privacy, "webdriver_ok", false);
+    const bool platform_ok = json_bool_or(privacy, "platform_ok", true);
+    const bool oscpu_ok = json_bool_or(privacy, "oscpu_ok", true);
+    const bool ice_ok = json_bool_or(privacy, "ice_probe_ok", false);
+    const bool ice_leak = json_bool_or(privacy, "ice_candidate_leak_detected", true);
+    session.privacy_verified = session.webrtc_blocked && webdriver_ok && platform_ok && oscpu_ok && ice_ok && !ice_leak;
+    diag::log_tagged_fmt("camoufox", "privacy_status_update session_id=%s source=%s ua_policy=%s ua_override=%d ua_override_len=%zu webrtc_blocked=%d webdriver_ok=%d platform_ok=%d oscpu_ok=%d ice_ok=%d ice_leak=%d ice_status=%s",
+        session.session_id.c_str(),
+        source ? source : "unknown",
+        session.effective_ua_policy.c_str(),
+        session.ua_override ? 1 : 0,
+        session.ua_override_string.size(),
+        session.webrtc_blocked ? 1 : 0,
+        webdriver_ok ? 1 : 0,
+        platform_ok ? 1 : 0,
+        oscpu_ok ? 1 : 0,
+        ice_ok ? 1 : 0,
+        ice_leak ? 1 : 0,
+        json_string_or(privacy, "ice_probe_status", std::string()).c_str());
 }
 
 size_t json_array_size_or_zero(const nlohmann::json& j, const char* key)
@@ -3859,6 +4172,7 @@ bool start_bridge(const launch_config_t& cfg)
         sg().cleanup_started_ms = 0;
         sg().cleanup_child_pid = 0;
         sg().cleanup_profile_dir.clear();
+        sg().cleanup_profile_generated = false;
         sg().cleanup_reason.clear();
         diag::log_tagged_fmt("camoufox", "start_bridge cleanup_force_clear generation=%llu cleanup_generation=%llu forced_pid=%lu cleanup_age_ms=%llu cleanup_reason=%s",
             static_cast<unsigned long long>(sg().generation), static_cast<unsigned long long>(forced_generation),
@@ -3870,36 +4184,67 @@ bool start_bridge(const launch_config_t& cfg)
         lk.lock();
     }
 
+    bool ready_config_mismatch_handled = false;
     if (sg().state == bridge_state_t::ready && sg().client)
     {
         const bool child_alive = process_alive(sg().child_pid);
-        if (!is_driver_closed_error(sg().last_error) && sg().browser_open && sg().page_verified && child_alive)
+        if (!is_driver_closed_error(sg().last_error) && sg().browser_open && sg().page_verified && sg().privacy_verified && child_alive)
         {
-            diag::log_tagged_fmt("camoufox", "start_bridge already_ready reusing generation=%llu child_pid=%lu active_url_len=%zu title_len=%zu",
-                static_cast<unsigned long long>(sg().generation), static_cast<unsigned long>(sg().child_pid),
-                sg().active_page_url.size(), sg().active_page_title.size());
-            sg().active_cfg = effective_cfg;
-            sg().last_launch_ms = now_ms() - bridge_start_ms;
-            return true;
+            const std::string mismatch_reason = privacy_relevant_launch_config_mismatch_reason(sg().active_cfg, effective_cfg);
+            if (!mismatch_reason.empty())
+            {
+                diag::log_tagged_fmt("camoufox", "start_bridge ready_config_mismatch restarting generation=%llu child_pid=%lu reason=%s",
+                    static_cast<unsigned long long>(sg().generation), static_cast<unsigned long>(sg().child_pid),
+                    mismatch_reason.c_str());
+                auto stale_client = sg().client;
+                const uint32_t stale_pid = sg().child_pid;
+                sg().client.reset();
+                sg().child_pid = 0;
+                sg().browser_open = false;
+                sg().page_verified = false;
+                sg().active_page_url.clear();
+                sg().active_page_title.clear();
+                const std::string restart_reason = "start_bridge_config_mismatch";
+                lk.unlock();
+                if (stale_pid != 0)
+                    terminate_process_tree_sync(stale_pid, restart_reason);
+                if (stale_client)
+                    disconnect_client_sync(stale_client, restart_reason);
+                lk.lock();
+                ready_config_mismatch_handled = true;
+            }
+            else
+            {
+                diag::log_tagged_fmt("camoufox", "start_bridge already_ready reusing generation=%llu child_pid=%lu active_url_len=%zu title_len=%zu",
+                    static_cast<unsigned long long>(sg().generation), static_cast<unsigned long>(sg().child_pid),
+                    sg().active_page_url.size(), sg().active_page_title.size());
+                preserve_resolved_launch_paths(effective_cfg, sg().active_cfg);
+                sg().active_cfg = effective_cfg;
+                sg().last_launch_ms = now_ms() - bridge_start_ms;
+                return true;
+            }
         }
-        diag::log_tagged_fmt("camoufox", "start_bridge invalidating_unverified_ready generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d err=%s",
-            static_cast<unsigned long long>(sg().generation), static_cast<unsigned long>(sg().child_pid),
-            static_cast<int>(child_alive), static_cast<int>(sg().browser_open), static_cast<int>(sg().page_verified),
-            sg().last_error.c_str());
-        auto stale_client = sg().client;
-        const uint32_t stale_pid = sg().child_pid;
-        sg().client.reset();
-        clear_page_state_locked();
-        sg().child_pid = 0;
-        sg().state = bridge_state_t::error;
-        if (stale_pid != 0 && sg().tracked_child_pid.load(std::memory_order_acquire) == stale_pid)
-            sg().tracked_child_pid.store(0, std::memory_order_release);
-        lk.unlock();
-        if (stale_pid != 0)
-            terminate_process_tree_sync(stale_pid, "start_bridge_unverified_ready");
-        if (stale_client)
-            disconnect_client_async(stale_client, "start_bridge_unverified_ready");
-        lk.lock();
+        if (!ready_config_mismatch_handled)
+        {
+            diag::log_tagged_fmt("camoufox", "start_bridge invalidating_unverified_ready generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d err=%s",
+                static_cast<unsigned long long>(sg().generation), static_cast<unsigned long>(sg().child_pid),
+                static_cast<int>(child_alive), static_cast<int>(sg().browser_open), static_cast<int>(sg().page_verified),
+                sg().last_error.c_str());
+            auto stale_client = sg().client;
+            const uint32_t stale_pid = sg().child_pid;
+            sg().client.reset();
+            clear_page_state_locked();
+            sg().child_pid = 0;
+            sg().state = bridge_state_t::error;
+            if (stale_pid != 0 && sg().tracked_child_pid.load(std::memory_order_acquire) == stale_pid)
+                sg().tracked_child_pid.store(0, std::memory_order_release);
+            lk.unlock();
+            if (stale_pid != 0)
+                terminate_process_tree_sync(stale_pid, "start_bridge_unverified_ready");
+            if (stale_client)
+                disconnect_client_async(stale_client, "start_bridge_unverified_ready");
+            lk.lock();
+        }
     }
     if (sg().state == bridge_state_t::starting)
     {
@@ -3954,6 +4299,7 @@ bool start_bridge(const launch_config_t& cfg)
     sg().active_page_id.clear();
     sg().pages.clear();
     sg().active_profile_dir.clear();
+    sg().active_profile_generated = false;
     sg().last_launch_ms = 0;
     publish_state(bridge_state_t::starting, std::string());
 
@@ -3987,6 +4333,15 @@ bool start_bridge(const launch_config_t& cfg)
         developer_python_ready ? 1 : 0,
         python_path.empty() ? "<empty>" : python_path.c_str(),
         server_executable.empty() ? "<empty>" : server_executable.c_str());
+
+    if (env_flag_enabled_a("AIDA_FILELESS_LAUNCH") && !use_server_executable)
+    {
+        sg().last_error = "fileless Camoufox launch requires frozen reverse-MCP executable sidecar";
+        sg().state = bridge_state_t::error;
+        publish_state(bridge_state_t::error, sg().last_error);
+        diag::log_tagged_fmt("camoufox", "start_bridge fileless_missing_reverse_mcp_executable");
+        return false;
+    }
 
     if (!use_server_executable && !python_path.empty())
     {
@@ -4062,6 +4417,8 @@ bool start_bridge(const launch_config_t& cfg)
         publish_state(bridge_state_t::error, sg().last_error);
         return false;
     }
+    if (!effective_cfg.headless && !effective_cfg.browser_executable.empty())
+        effective_cfg.persistent_context = true;
 
     if (use_server_executable)
     {
@@ -4071,6 +4428,8 @@ bool start_bridge(const launch_config_t& cfg)
             publish_state(bridge_state_t::error, sg().last_error);
             return false;
         }
+        if (effective_cfg.server_executable.empty())
+            effective_cfg.server_executable = server_executable;
     }
     else
     {
@@ -4189,12 +4548,18 @@ bool start_bridge(const launch_config_t& cfg)
     sg().active_cfg     = effective_cfg;
 
     nlohmann::json args = build_launch_args(effective_cfg);
-    diag::log_tagged_fmt("camoufox", "launch_browser request headless=%d has_proxy=%d os=%s locale=%s window=%dx%d timeout_ms=%d testlab_fast_probe=%d",
+    diag::log_tagged_fmt("camoufox", "launch_browser request headless=%d has_proxy=%d os=%s locale=%s window=%dx%d timeout_ms=%d testlab_fast_probe=%d ua_policy=%s ua_override_len=%zu persistent_context=%d profile_dir=%d user_data_dir=%d block_webrtc=%d",
         static_cast<int>(effective_cfg.headless), static_cast<int>(!effective_cfg.proxy.empty()),
         (effective_cfg.os.empty() ? "auto" : effective_cfg.os.c_str()),
         (effective_cfg.locale.empty() ? "auto" : effective_cfg.locale.c_str()),
         json_int_or(args, "window_width", -1), json_int_or(args, "window_height", -1),
-        effective_cfg.launch_timeout_ms, testlab_fast_probe ? 1 : 0);
+        effective_cfg.launch_timeout_ms, testlab_fast_probe ? 1 : 0,
+        effective_cfg.ua_policy.empty() ? "camoufox_native" : effective_cfg.ua_policy.c_str(),
+        effective_cfg.user_agent.size(),
+        args.value("persistent_context", false) ? 1 : 0,
+        args.contains("profile_dir") ? 1 : 0,
+        args.contains("user_data_dir") ? 1 : 0,
+        args.value("block_webrtc", true) ? 1 : 0);
     struct launch_state_t
     {
         std::mutex                mtx;
@@ -4387,7 +4752,10 @@ bool start_bridge(const launch_config_t& cfg)
         return false;
     }
     nlohmann::json parsed;
-    parse_text_to_json(launch.text, parsed);
+    if (launch.data.is_object())
+        parsed = launch.data;
+    else
+        parse_text_to_json(launch.text, parsed);
     if (parsed.is_object())
     {
         const nlohmann::json diagnostics = parsed.contains("diagnostics") && parsed["diagnostics"].is_object()
@@ -4399,12 +4767,22 @@ bool start_bridge(const launch_config_t& cfg)
         const nlohmann::json viewport = diagnostics.contains("viewport") && diagnostics["viewport"].is_object()
             ? diagnostics["viewport"] : nlohmann::json::object();
         const std::string parsed_profile_dir = launch_profile_dir_from_response(parsed);
+        const bool parsed_profile_generated = launch_profile_generated_from_response(parsed);
         if (!parsed_profile_dir.empty())
+        {
             sg().active_profile_dir = parsed_profile_dir;
-        diag::log_tagged_fmt("camoufox", "launch_browser parsed status=%s diag_elapsed_ms=%d profile_dir=%s window=%dx%d requested=%dx%d work_area=%dx%d viewport=%dx%d inner=%dx%d outer=%dx%d pos=%d,%d screen=%dx%d avail=%dx%d dpr=%.2f",
+            sg().active_profile_generated = parsed_profile_generated;
+        }
+        else
+        {
+            sg().active_profile_generated = false;
+        }
+        update_privacy_from_response_locked(parsed, "launch_browser");
+        diag::log_tagged_fmt("camoufox", "launch_browser parsed status=%s diag_elapsed_ms=%d profile_dir=%s profile_generated=%d window=%dx%d requested=%dx%d work_area=%dx%d viewport=%dx%d inner=%dx%d outer=%dx%d pos=%d,%d screen=%dx%d avail=%dx%d dpr=%.2f",
             json_string_or(parsed, "status", "unknown").c_str(),
             json_int_or(diagnostics, "elapsed_ms", -1),
             parsed_profile_dir.empty() ? "<empty>" : parsed_profile_dir.c_str(),
+            parsed_profile_generated ? 1 : 0,
             json_int_or(window, "width", -1), json_int_or(window, "height", -1),
             json_int_or(window, "requested_width", -1), json_int_or(window, "requested_height", -1),
             json_int_or(window.contains("work_area") && window["work_area"].is_object() ? window["work_area"] : nlohmann::json::object(), "width", -1),
@@ -4432,6 +4810,24 @@ bool start_bridge(const launch_config_t& cfg)
         sg().last_launch_ms = now_ms() - bridge_start_ms;
         mark_cleanup_started_locked(start_generation, failed_pid, "launch_browser_returned_error");
         cleanup_client_async(failed_client, failed_pid, "launch_browser_returned_error", start_generation);
+        publish_state(bridge_state_t::error, sg().last_error);
+        return false;
+    }
+    if (!sg().privacy_verified)
+    {
+        sg().last_error = "launch_browser privacy verification diagnostics missing or failed";
+        diag::log_tagged_fmt("camoufox", "launch_browser privacy_not_verified generation=%llu child_pid=%lu data_shape=%s response_tail=%.900s",
+            static_cast<unsigned long long>(start_generation), static_cast<unsigned long>(sg().child_pid),
+            json_shape(parsed).c_str(), compact_child_output_tail(launch.text, 900).c_str());
+        auto failed_client = sg().client;
+        const uint32_t failed_pid = sg().child_pid;
+        sg().client.reset();
+        sg().child_pid = 0;
+        sg().state = bridge_state_t::error;
+        clear_page_state_locked();
+        sg().last_launch_ms = now_ms() - bridge_start_ms;
+        mark_cleanup_started_locked(start_generation, failed_pid, "launch_browser_privacy_not_verified");
+        cleanup_client_async(failed_client, failed_pid, "launch_browser_privacy_not_verified", start_generation);
         publish_state(bridge_state_t::error, sg().last_error);
         return false;
     }
@@ -4735,6 +5131,7 @@ bool force_cleanup(const char* reason)
             sg().last_cleanup_ms = now_ms() - t0;
         }
         sg().active_profile_dir.clear();
+        sg().active_profile_generated = false;
         lk.unlock();
     }
 
@@ -4842,6 +5239,7 @@ bool is_ready()
         sg().client != nullptr &&
         sg().browser_open &&
         sg().page_verified &&
+        sg().privacy_verified &&
         child_alive &&
         !is_driver_closed_error(sg().last_error);
     if (sg().state == bridge_state_t::ready && !ready)
@@ -4849,13 +5247,13 @@ bool is_ready()
         sg().state = bridge_state_t::error;
         if (sg().last_error.empty())
             sg().last_error = "camoufox bridge readiness verification failed";
-        if (!child_alive || !sg().browser_open || !sg().page_verified)
+        if (!child_alive || !sg().browser_open || !sg().page_verified || !sg().privacy_verified)
             clear_page_state_locked();
     }
-    diag::log_tagged_fmt("camoufox", "is_ready result=%d state=%d generation=%llu client=%d browser_open=%d page_verified=%d child_pid=%lu child_alive=%d err_len=%zu",
+    diag::log_tagged_fmt("camoufox", "is_ready result=%d state=%d generation=%llu client=%d browser_open=%d page_verified=%d privacy_verified=%d child_pid=%lu child_alive=%d err_len=%zu",
         static_cast<int>(ready), static_cast<int>(sg().state), static_cast<unsigned long long>(sg().generation),
         static_cast<int>(sg().client != nullptr), static_cast<int>(sg().browser_open),
-        static_cast<int>(sg().page_verified), static_cast<unsigned long>(sg().child_pid),
+        static_cast<int>(sg().page_verified), static_cast<int>(sg().privacy_verified), static_cast<unsigned long>(sg().child_pid),
         static_cast<int>(child_alive), sg().last_error.size());
     return ready;
 }
@@ -4961,6 +5359,11 @@ bool ensure_ready()
 bool prewarm_default_async(const char* reason)
 {
     const char* owner = safe_reason(reason);
+    if (full_test_running_env())
+    {
+        diag::log_tagged_fmt("camoufox", "prewarm_default_deferred_full_test reason=%s", owner);
+        return true;
+    }
     if (prewarm_default_disabled())
     {
         diag::log_tagged_fmt("camoufox", "prewarm_default_disabled reason=%s", owner);
@@ -5140,6 +5543,7 @@ call_result_t managed_call_with_deadline(const std::shared_ptr<managed_session_t
             session->child_pid = 0;
             session->browser_open = false;
             session->page_verified = false;
+            clear_privacy_locked(*session);
         }
         if (timed_out_pid != 0)
             terminate_process_tree_sync(timed_out_pid, std::string("managed_timeout_") + session->session_id + "_" + tool_name);
@@ -5196,6 +5600,13 @@ bridge_status_t managed_status(const std::shared_ptr<managed_session_t>& session
     s.active_page_url = session->active_page_url;
     s.active_page_title = session->active_page_title;
     s.active_profile_dir = session->active_profile_dir;
+    s.active_profile_generated = session->active_profile_generated;
+    s.effective_ua_policy = session->effective_ua_policy;
+    s.ua_override_string = session->ua_override_string;
+    s.ua_override = session->ua_override;
+    s.webrtc_blocked = session->webrtc_blocked;
+    s.privacy_verified = session->privacy_verified;
+    s.privacy_diagnostics = session->privacy_diagnostics;
     s.page_verified = session->page_verified;
     s.cleanup_pending = session->cleanup_pending;
     s.generation = session->generation;
@@ -5207,12 +5618,13 @@ bridge_status_t managed_status(const std::shared_ptr<managed_session_t>& session
     s.page_count = static_cast<uint32_t>(session->pages.size());
     s.session_count = managed_session_count();
     s.child_alive = process_alive(s.child_pid);
-    if (s.state == bridge_state_t::ready && (!s.child_alive || !s.browser_open || !s.page_verified))
+    if (s.state == bridge_state_t::ready && (!s.child_alive || !s.browser_open || !s.page_verified || !s.privacy_verified))
     {
         s.state = bridge_state_t::error;
         if (s.last_error.empty())
             s.last_error = "camoufox managed session readiness verification failed";
     }
+    populate_process_counts(s);
     return s;
 }
 
@@ -5237,17 +5649,45 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
         diag::log_tagged_fmt("camoufox", "managed_start forcing_visible session_id=%s requested_headless=1", sid.c_str());
         effective_cfg.headless = false;
     }
+    std::shared_ptr<mcp_client::client_t> stale_reuse_client;
+    uint32_t stale_reuse_pid = 0;
     {
         std::lock_guard<std::recursive_mutex> lk(session->mtx);
-        if (session->state == bridge_state_t::ready && session->client && session->browser_open && session->page_verified && process_alive(session->child_pid))
+        if (session->state == bridge_state_t::ready && session->client && session->browser_open && session->page_verified && session->privacy_verified && process_alive(session->child_pid))
         {
-            session->active_cfg = effective_cfg;
-            session->last_launch_ms = now_ms() - t0;
-            diag::log_tagged_fmt("camoufox", "managed_start reuse_ready session_id=%s child_pid=%lu page_count=%zu",
-                sid.c_str(), static_cast<unsigned long>(session->child_pid), session->pages.size());
-            return true;
+            const std::string mismatch_reason = privacy_relevant_launch_config_mismatch_reason(session->active_cfg, effective_cfg);
+            if (!mismatch_reason.empty())
+            {
+                stale_reuse_client = session->client;
+                stale_reuse_pid = session->child_pid;
+                session->client.reset();
+                session->child_pid = 0;
+                session->browser_open = false;
+                session->page_verified = false;
+                session->pages.clear();
+                clear_privacy_locked(*session);
+                session->active_page_id.clear();
+                session->active_page_url.clear();
+                session->active_page_title.clear();
+                session->last_error.clear();
+                diag::log_tagged_fmt("camoufox", "managed_start ready_config_mismatch restarting session_id=%s child_pid=%lu reason=%s",
+                    sid.c_str(), static_cast<unsigned long>(stale_reuse_pid), mismatch_reason.c_str());
+            }
+            else
+            {
+                preserve_resolved_launch_paths(effective_cfg, session->active_cfg);
+                session->active_cfg = effective_cfg;
+                session->last_launch_ms = now_ms() - t0;
+                diag::log_tagged_fmt("camoufox", "managed_start reuse_ready session_id=%s child_pid=%lu page_count=%zu",
+                    sid.c_str(), static_cast<unsigned long>(session->child_pid), session->pages.size());
+                return true;
+            }
         }
     }
+    if (stale_reuse_pid != 0)
+        terminate_process_tree_sync(stale_reuse_pid, std::string("managed_start_config_mismatch_") + sid);
+    if (stale_reuse_client)
+        stale_reuse_client->disconnect();
     std::string python_path = effective_cfg.python_executable;
     const bool prefer_developer_python = should_prefer_developer_python_runtime(effective_cfg);
     std::string server_executable;
@@ -5266,6 +5706,15 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
         developer_python_ready ? 1 : 0,
         python_path.empty() ? "<empty>" : python_path.c_str(),
         server_executable.empty() ? "<empty>" : server_executable.c_str());
+
+    if (env_flag_enabled_a("AIDA_FILELESS_LAUNCH") && !use_server_executable)
+    {
+        std::lock_guard<std::recursive_mutex> lk(session->mtx);
+        session->state = bridge_state_t::error;
+        session->last_error = "fileless Camoufox launch requires frozen reverse-MCP executable sidecar";
+        diag::log_tagged_fmt("camoufox", "managed_start fileless_missing_reverse_mcp_executable session_id=%s", sid.c_str());
+        return false;
+    }
 
     if (!use_server_executable && !python_path.empty())
     {
@@ -5333,6 +5782,8 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
             sid.c_str(), session->last_error.c_str());
         return false;
     }
+    if (!effective_cfg.headless && !effective_cfg.browser_executable.empty())
+        effective_cfg.persistent_context = true;
     {
         std::lock_guard<std::recursive_mutex> lk(sg().mtx);
         const uint64_t preflight_start_ms = now_ms();
@@ -5355,6 +5806,8 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
                 static_cast<unsigned long long>(now_ms() - t0), session->last_error.c_str());
             return false;
         }
+        if (use_server_executable && effective_cfg.server_executable.empty())
+            effective_cfg.server_executable = server_executable;
         diag::log_tagged_fmt("camoufox", "managed_start preflight_end session_id=%s preflight_elapsed_ms=%llu elapsed_ms=%llu",
             sid.c_str(), static_cast<unsigned long long>(now_ms() - preflight_start_ms),
             static_cast<unsigned long long>(now_ms() - t0));
@@ -5389,6 +5842,9 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
         session->browser_open = false;
         session->page_verified = false;
         session->pages.clear();
+        clear_privacy_locked(*session);
+        session->active_profile_dir.clear();
+        session->active_profile_generated = false;
         session->active_page_id.clear();
         session->generation++;
     }
@@ -5438,6 +5894,14 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
     }
     effective_cfg.launch_timeout_ms = launch_wait_ms;
     nlohmann::json args = build_launch_args(effective_cfg);
+    diag::log_tagged_fmt("camoufox", "managed_start launch_request session_id=%s ua_policy=%s ua_override_len=%zu persistent_context=%d profile_dir=%d user_data_dir=%d block_webrtc=%d",
+        sid.c_str(),
+        effective_cfg.ua_policy.empty() ? "camoufox_native" : effective_cfg.ua_policy.c_str(),
+        effective_cfg.user_agent.size(),
+        args.value("persistent_context", false) ? 1 : 0,
+        args.contains("profile_dir") ? 1 : 0,
+        args.contains("user_data_dir") ? 1 : 0,
+        args.value("block_webrtc", true) ? 1 : 0);
     call_result_t launch = managed_call_with_deadline(session, "launch_browser", args, launch_wait_ms, true);
     if (!launch.ok)
     {
@@ -5449,6 +5913,43 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
         session->child_pid = 0;
         session->state = bridge_state_t::error;
         session->last_error = launch.error.empty() ? std::string("camoufox managed launch_browser failed") : launch.error;
+        return false;
+    }
+    nlohmann::json launch_payload = launch.data;
+    if (!launch_payload.is_object())
+        parse_text_to_json(launch.text, launch_payload);
+    bool managed_privacy_failed = false;
+    uint32_t managed_privacy_failed_pid = 0;
+    {
+        std::lock_guard<std::recursive_mutex> lk(session->mtx);
+        const std::string parsed_profile_dir = launch_profile_dir_from_response(launch_payload);
+        if (!parsed_profile_dir.empty())
+        {
+            session->active_profile_dir = parsed_profile_dir;
+            session->active_profile_generated = launch_profile_generated_from_response(launch_payload);
+        }
+        else
+        {
+            session->active_profile_generated = false;
+        }
+        update_privacy_from_response_locked(*session, launch_payload, "managed_launch_browser");
+        if (!session->privacy_verified)
+        {
+            managed_privacy_failed = true;
+            managed_privacy_failed_pid = cli->child_process_id();
+            session->client.reset();
+            session->child_pid = 0;
+            session->state = bridge_state_t::error;
+            session->last_error = "camoufox managed launch privacy verification diagnostics missing or failed";
+            clear_privacy_locked(*session);
+            session->active_profile_dir.clear();
+            session->active_profile_generated = false;
+        }
+    }
+    if (managed_privacy_failed)
+    {
+        terminate_process_tree_sync(managed_privacy_failed_pid, std::string("managed_launch_privacy_not_verified_") + sid);
+        cli->disconnect();
         return false;
     }
     call_result_t page = managed_call_with_deadline(session, "get_page_info", nlohmann::json::object(), kReadinessProbeTimeoutMs, true);
@@ -5509,6 +6010,7 @@ bool stop_managed_bridge(const std::string& session_id, const char* reason)
         session->browser_open = false;
         session->page_verified = false;
         session->pages.clear();
+        clear_privacy_locked(*session);
         session->active_page_id.clear();
         session->active_page_url.clear();
         session->active_page_title.clear();
@@ -5541,6 +6043,7 @@ bridge_status_t get_status()
         s.session_id = "default";
         s.active_session_id = "default";
         s.session_count = managed_session_count();
+        populate_process_counts(s);
         diag::log_tagged_fmt("camoufox", "get_status busy child_pid=%lu child_alive=%d calls=%llu errors=%llu",
             static_cast<unsigned long>(s.child_pid), s.child_alive ? 1 : 0,
             static_cast<unsigned long long>(s.total_calls),
@@ -5565,6 +6068,13 @@ bridge_status_t get_status()
     s.pages           = sg().pages;
     s.page_count      = static_cast<uint32_t>(sg().pages.size());
     s.active_profile_dir = sg().active_profile_dir;
+    s.active_profile_generated = sg().active_profile_generated;
+    s.effective_ua_policy = sg().effective_ua_policy;
+    s.ua_override_string = sg().ua_override_string;
+    s.ua_override = sg().ua_override;
+    s.webrtc_blocked = sg().webrtc_blocked;
+    s.privacy_verified = sg().privacy_verified;
+    s.privacy_diagnostics = sg().privacy_diagnostics;
     s.page_verified   = sg().page_verified;
     s.cleanup_pending = sg().cleanup_pending;
     s.generation      = sg().generation;
@@ -5583,9 +6093,11 @@ bridge_status_t get_status()
         s.pages.clear();
         s.page_count = 0;
         s.active_profile_dir.clear();
+        s.active_profile_generated = false;
+        s.privacy_verified = false;
         s.page_verified = false;
     }
-    if (s.state == bridge_state_t::ready && (!s.child_alive || !s.browser_open || !s.page_verified))
+    if (s.state == bridge_state_t::ready && (!s.child_alive || !s.browser_open || !s.page_verified || !s.privacy_verified))
     {
         s.state = bridge_state_t::error;
         s.browser_open = false;
@@ -5595,20 +6107,30 @@ bridge_status_t get_status()
         s.pages.clear();
         s.page_count = 0;
         s.active_profile_dir.clear();
+        s.active_profile_generated = false;
+        s.privacy_verified = false;
         s.page_verified = false;
         if (s.last_error.empty())
             s.last_error = "camoufox bridge readiness verification failed";
     }
+    populate_process_counts(s);
     const url_log_t u = summarize_url_for_log(s.active_page_url);
-    diag::log_tagged_fmt("camoufox", "get_status session_id=%s state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu profile_dir=%s active_page_id=%s page_count=%u active_host=%s active_path=%s query=%d url_len=%zu title_len=%zu",
+    diag::log_tagged_fmt("camoufox", "get_status session_id=%s state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d calls=%llu errors=%llu profile_dir=%s profile_generated=%d active_page_id=%s page_count=%u browser_instances=%u child_processes=%u browser_processes=%u ua_policy=%s ua_override=%d webrtc_blocked=%d active_host=%s active_path=%s query=%d url_len=%zu title_len=%zu",
         s.session_id.c_str(),
         static_cast<int>(s.state), static_cast<unsigned long long>(s.generation),
         static_cast<unsigned long>(s.child_pid), static_cast<int>(s.child_alive),
-        static_cast<int>(s.browser_open), static_cast<int>(s.page_verified), static_cast<int>(s.cleanup_pending),
+        static_cast<int>(s.browser_open), static_cast<int>(s.page_verified), static_cast<int>(s.privacy_verified), static_cast<int>(s.cleanup_pending),
         static_cast<unsigned long long>(s.total_calls),
         static_cast<unsigned long long>(s.total_errors),
         s.active_profile_dir.empty() ? "<empty>" : s.active_profile_dir.c_str(),
+        s.active_profile_generated ? 1 : 0,
         s.active_page_id.c_str(), static_cast<unsigned>(s.page_count),
+        static_cast<unsigned>(s.browser_instance_count),
+        static_cast<unsigned>(s.child_process_count),
+        static_cast<unsigned>(s.browser_process_count),
+        s.effective_ua_policy.c_str(),
+        s.ua_override ? 1 : 0,
+        s.webrtc_blocked ? 1 : 0,
         u.host.c_str(), u.path.c_str(),
         static_cast<int>(u.has_query), u.length, s.active_page_title.size());
     return s;

@@ -105,6 +105,38 @@ bool append_signature(std::vector<store::signature_record_t>& records,
     return true;
 }
 
+std::vector<std::uint64_t> scan_pattern_range(std::uint32_t pid,
+                                              const std::vector<parsed_pattern_byte_t>& pattern,
+                                              std::uint64_t start,
+                                              std::uint64_t size,
+                                              std::size_t max_results)
+{
+    std::vector<std::uint64_t> results;
+    if (pattern.empty() || start == 0 || size < pattern.size() || max_results == 0)
+        return results;
+    driver_bridge::memory_region_t region{};
+    if (!query_region(pid, start, region) || !is_readable(region))
+        return results;
+    const std::uint64_t region_end = region.base + region.size;
+    if (region_end <= start)
+        return results;
+    const std::uint64_t read_size64 = std::min<std::uint64_t>(size, region_end - start);
+    if (read_size64 < pattern.size() || read_size64 > 64ull * 1024ull * 1024ull)
+        return results;
+    std::vector<std::uint8_t> bytes;
+    if (!read_bytes(pid, start, static_cast<std::size_t>(read_size64), bytes) || bytes.size() < pattern.size())
+        return results;
+    for (std::size_t i = 0; i + pattern.size() <= bytes.size(); ++i)
+    {
+        if (!pattern_matches(bytes.data() + i, bytes.size() - i, pattern))
+            continue;
+        results.push_back(start + i);
+        if (results.size() >= max_results)
+            break;
+    }
+    return results;
+}
+
 bool parse_ce_line(const std::string& line, std::vector<store::signature_record_t>& records, const json& params)
 {
     const std::string lower = lower_ascii(line);
@@ -167,7 +199,7 @@ bool parse_text_pattern_line(const std::string& line,
     return append_signature(records, name, pattern, {}, params);
 }
 
-json scan_signature(std::uint32_t pid, store::signature_record_t& sig)
+json scan_signature(std::uint32_t pid, store::signature_record_t& sig, const json* params = nullptr)
 {
     json out = store::signature_to_json(sig);
     std::vector<parsed_pattern_byte_t> pattern;
@@ -180,7 +212,20 @@ json scan_signature(std::uint32_t pid, store::signature_record_t& sig)
         out["error"] = err;
         return out;
     }
-    auto matches = scan_pattern(pid, pattern, sig.module_hint, false, 128);
+    std::uint64_t scan_start = 0;
+    std::uint64_t scan_size = 0;
+    std::uint64_t scan_end = 0;
+    if (params && (parse_address_param(*params, "scan_start_va", scan_start) || parse_address_param(*params, "start_va", scan_start) || parse_address_param(*params, "base_va", scan_start)))
+    {
+        if (!parse_address_param(*params, "scan_size", scan_size) && !parse_address_param(*params, "size", scan_size))
+        {
+            if (parse_address_param(*params, "scan_end_va", scan_end) || parse_address_param(*params, "end_va", scan_end))
+                scan_size = scan_end > scan_start ? scan_end - scan_start : 0;
+        }
+    }
+    auto matches = scan_start != 0 && scan_size != 0
+        ? scan_pattern_range(pid, pattern, scan_start, scan_size, 128)
+        : scan_pattern(pid, pattern, sig.module_hint, false, 128);
     sig.last_match_count = static_cast<std::uint32_t>(matches.size());
     if (matches.empty())
         sig.last_va = 0;
@@ -217,6 +262,14 @@ json scan_signature(std::uint32_t pid, store::signature_record_t& sig)
         match_arr.push_back(adjusted ? json(sa_format_address(adjusted)) : json(nullptr));
     }
     out["matches"] = std::move(match_arr);
+    if (scan_start != 0 && scan_size != 0)
+    {
+        out["scan_scope"] = {
+            {"base_va", sa_format_address(scan_start)},
+            {"size", scan_size},
+            {"bounded", true}
+        };
+    }
     return out;
 }
 
@@ -283,7 +336,7 @@ tool_result_t scan_all(const json& params)
     auto records = store::load_signatures();
     json arr = json::array();
     for (auto& sig : records)
-        arr.push_back(scan_signature(scope.pid(), sig));
+        arr.push_back(scan_signature(scope.pid(), sig, &params));
     store::save_signatures(records);
     json result;
     result["process_id"] = scope.pid();

@@ -124,6 +124,18 @@ std::uint64_t rva_to_va(const driver_bridge::module_info_t& module, std::int32_t
     return module.base + static_cast<std::uint32_t>(rva);
 }
 
+std::optional<driver_bridge::module_info_t> find_module_by_base(std::uint32_t pid, std::uint64_t base)
+{
+    if (base == 0)
+        return std::nullopt;
+    for (const auto& module : modules_for(pid))
+    {
+        if (module.base == base)
+            return module;
+    }
+    return std::nullopt;
+}
+
 std::vector<std::string> read_base_classes(std::uint32_t pid,
                                            const driver_bridge::module_info_t& module,
                                            std::uint64_t hierarchy_va,
@@ -297,7 +309,22 @@ std::vector<type_info_t> scan_types(const json& params)
     }
     const std::size_t max_results = static_cast<std::size_t>(numeric_param(params, "max_results", 2000, 1, 20000));
     std::vector<driver_bridge::module_info_t> modules;
-    if (!module_name.empty())
+    std::uint64_t module_base = 0;
+    std::uint64_t hint_va = 0;
+    if (parse_address_param(params, "module_base_va", module_base) || parse_address_param(params, "module_base", module_base))
+    {
+        if (auto module = find_module_by_base(scope.pid(), module_base))
+            modules.push_back(*module);
+    }
+    else if (parse_address_param(params, "vtable_va", hint_va) ||
+             parse_address_param(params, "type_descriptor_va", hint_va) ||
+             parse_address_param(params, "type_va", hint_va) ||
+             parse_address_param(params, "hint_va", hint_va))
+    {
+        if (auto module = find_module_for_address(scope.pid(), hint_va))
+            modules.push_back(*module);
+    }
+    else if (!module_name.empty())
     {
         if (auto module = find_module_by_name(scope.pid(), module_name))
             modules.push_back(*module);
@@ -605,6 +632,7 @@ tool_result_t find_constructor(const json& params)
     std::uint64_t vtable_va = 0;
     if (!parse_address_param(params, "vtable_va", vtable_va) || vtable_va == 0)
         return tool_result_t::error("'vtable_va' is required.");
+    const std::size_t max_scan_bytes = static_cast<std::size_t>(numeric_param(params, "max_scan_bytes", 64ull * 1024ull * 1024ull, 4096, 64ull * 1024ull * 1024ull));
     const auto module = find_module_for_address(scope.pid(), vtable_va);
     if (!module)
         return tool_result_t::error("Could not resolve vtable module.");
@@ -617,8 +645,9 @@ tool_result_t find_constructor(const json& params)
     {
         if ((section.characteristics & IMAGE_SCN_MEM_EXECUTE) == 0 || section.size == 0 || section.size > 64ull * 1024ull * 1024ull)
             continue;
+        const std::size_t read_size = static_cast<std::size_t>(std::min<std::uint64_t>(section.size, max_scan_bytes));
         std::vector<std::uint8_t> bytes;
-        if (!read_bytes(scope.pid(), section.va, static_cast<std::size_t>(section.size), bytes) || bytes.empty())
+        if (!read_bytes(scope.pid(), section.va, read_size, bytes) || bytes.empty())
             continue;
         std::map<std::string, std::uint64_t> reg_values;
         std::set<std::string> this_regs;

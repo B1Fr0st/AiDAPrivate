@@ -689,6 +689,54 @@ static tool_result_t analysis_query_pdb_symbols(const json& params)
 
 static tool_result_t analysis_query_binary_map_overview(const json& params)
 {
+	if (params.value("fast_summary", false) && g_disasm.file.loaded) {
+		const size_t max_functions = bounded_size_param(params, "max_functions", 24, 1, 256);
+		json sections = json::array();
+		char buf[32];
+		for (size_t i = 0; i < g_disasm.file.sections.size(); ++i) {
+			const auto& s = g_disasm.file.sections[i];
+			json o;
+			o["name"] = ".section" + std::to_string(i);
+			std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(s.va));
+			o["va"] = buf;
+			o["size"] = s.bytes.size();
+			o["executable"] = s.is_executable;
+			o["readable"] = true;
+			o["writable"] = false;
+			sections.push_back(std::move(o));
+		}
+		json functions = json::array();
+		uint64_t last_va = 0;
+		for (const auto& ins : g_disasm.file.instrs) {
+			if (functions.size() >= max_functions)
+				break;
+			if (ins.addr == 0 || ins.addr == last_va)
+				continue;
+			last_va = ins.addr;
+			json o;
+			std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(ins.addr));
+			o["va"] = buf;
+			o["name"] = std::string("sub_") + buf + "_" + ins.mnem;
+			o["xref_count"] = 0;
+			o["callee_count"] = 0;
+			functions.push_back(std::move(o));
+		}
+		std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(g_disasm.file.image_base));
+		json result;
+		result["module_name"] = g_disasm.file.filename;
+		result["module_path"] = g_disasm.file.path;
+		result["architecture"] = "x86_64";
+		result["format"] = "PE";
+		result["image_base"] = buf;
+		result["image_size"] = static_analysis::total_image_size(g_disasm.file);
+		result["sections"] = std::move(sections);
+		result["functions"] = std::move(functions);
+		result["globals"] = json::array();
+		result["imports"] = json::array();
+		result["exports"] = json::array();
+		result["fast_summary"] = true;
+		return tool_result_t::ok(result);
+	}
 	aida::binary_map::map_options_t opts;
 	opts.max_functions = params.value("max_functions", 24);
 	opts.max_globals = params.value("max_globals", 12);

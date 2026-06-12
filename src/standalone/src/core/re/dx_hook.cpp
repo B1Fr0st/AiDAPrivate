@@ -536,6 +536,48 @@ void append_unique_candidate(json& arr, const json& candidate, std::set<std::uin
     arr.push_back(candidate);
 }
 
+void collect_explicit_cbuffer_candidates(std::uint32_t pid,
+                                         const json& params,
+                                         json& out,
+                                         std::set<std::uint64_t>& seen,
+                                         std::size_t limit,
+                                         const std::string& source)
+{
+    for (const char* key : {"matrix_buffer_va", "matrix_va", "candidate_va", "cbuffer_va", "buffer_va", "va"})
+    {
+        std::uint64_t va = 0;
+        if (!parse_address_param(params, key, va) || va == 0)
+            continue;
+        auto row = make_cbuffer_candidate(pid, -1, va, 0, 0, source, 0.70);
+        if (row)
+        {
+            (*row)["explicit_param"] = key;
+            append_unique_candidate(out, *row, seen, limit);
+        }
+    }
+    if (!params.contains("candidates") || !params["candidates"].is_array())
+        return;
+    for (const auto& item : params["candidates"])
+    {
+        if (!item.is_object())
+            continue;
+        std::uint64_t va = 0;
+        if (!parse_address_param(item, "va", va) && !parse_address_param(item, "matrix_buffer_va", va) && !parse_address_param(item, "candidate_va", va))
+            continue;
+        auto row = make_cbuffer_candidate(pid, -1, va, 0, 0, source, 0.70);
+        if (row)
+            append_unique_candidate(out, *row, seen, limit);
+    }
+}
+
+json explicit_cbuffer_candidates(std::uint32_t pid, const json& params, std::size_t limit, const std::string& source)
+{
+    json out = json::array();
+    std::set<std::uint64_t> seen;
+    collect_explicit_cbuffer_candidates(pid, params, out, seen, limit, source);
+    return out;
+}
+
 void collect_pointer_candidates(std::uint32_t pid,
                                 std::uint64_t base,
                                 std::size_t bytes_to_read,
@@ -749,7 +791,7 @@ json make_debug_capture(std::uint32_t pid,
     return cap;
 }
 
-json make_snapshot_capture(std::uint32_t pid, const store::dx_hook_record_t& record, const std::string& reason)
+json make_snapshot_capture(std::uint32_t pid, const store::dx_hook_record_t& record, const std::string& reason, const json* params = nullptr)
 {
     json cap;
     cap["event_type"] = "snapshot";
@@ -762,17 +804,22 @@ json make_snapshot_capture(std::uint32_t pid, const store::dx_hook_record_t& rec
     cap["action"] = record.action;
     cap["api"] = record.api;
     cap["reason"] = reason;
-    cap["cbuffers"] = record.capture_cbuffers || record.action == "cbuffer_bind" ? scan_memory_cbuffer_candidates(pid, record.max_captures ? record.max_captures : 32, 1000000.0, 512) : json::array();
+    const std::size_t limit = record.max_captures ? record.max_captures : 32;
+    json explicit_rows = params ? explicit_cbuffer_candidates(pid, *params, limit, "explicit_cbuffer_candidate") : json::array();
+    const bool explicit_used = !explicit_rows.empty();
+    cap["cbuffers"] = json::array();
+    if (record.capture_cbuffers || record.action == "cbuffer_bind")
+        cap["cbuffers"] = explicit_used ? std::move(explicit_rows) : scan_memory_cbuffer_candidates(pid, limit, 1000000.0, 512);
     cap["evidence"] = {
         {"source", "bounded_snapshot_fallback"},
         {"thread_context_captured", false},
-        {"cbuffer_source", "bounded_private_memory_matrix_scan"},
+        {"cbuffer_source", explicit_used ? "explicit_cbuffer_candidate" : "bounded_private_memory_matrix_scan"},
         {"gpu_texture_readback", false}
     };
     return cap;
 }
 
-void refresh_snapshot_records(std::uint32_t pid, const std::string& reason)
+void refresh_snapshot_records(std::uint32_t pid, const std::string& reason, const json* params = nullptr)
 {
     for (auto record : store::list_dx_hooks(pid))
     {
@@ -780,7 +827,7 @@ void refresh_snapshot_records(std::uint32_t pid, const std::string& reason)
             continue;
         if (!record.capture_cbuffers && record.action != "cbuffer_bind")
             continue;
-        append_capture(record, make_snapshot_capture(pid, record, reason));
+        append_capture(record, make_snapshot_capture(pid, record, reason, params));
     }
 }
 
@@ -1395,7 +1442,7 @@ tool_result_t hook_manage(const json& params)
     if (callback_mode != "snapshot" && callback_mode != "polling")
         debug_started = start_dx_debug_loop(scope.pid(), debug_error);
     if (!debug_started)
-        refresh_snapshot_records(scope.pid(), debug_error.empty() ? "snapshot mode requested" : debug_error);
+        refresh_snapshot_records(scope.pid(), debug_error.empty() ? "snapshot mode requested" : debug_error, &p);
     for (const auto& updated : store::list_dx_hooks(scope.pid()))
     {
         if (updated.id == record.id)
@@ -1412,7 +1459,7 @@ tool_result_t hook_manage(const json& params)
         debug_error = "hardware breakpoints could not be armed on any target thread";
         stop_dx_debug_loop(scope.pid());
         debug_started = false;
-        refresh_snapshot_records(scope.pid(), debug_error);
+        refresh_snapshot_records(scope.pid(), debug_error, &p);
         for (const auto& updated : store::list_dx_hooks(scope.pid()))
         {
             if (updated.id == record.id)
@@ -1442,8 +1489,10 @@ tool_result_t list_bound_cbuffers(const json& params)
     active_process_scope_t scope(params);
     if (!scope.ok())
         return tool_result_t::error(scope.error());
-    refresh_snapshot_records(scope.pid(), "list_bound_cbuffers requested current bounded evidence");
+    refresh_snapshot_records(scope.pid(), "list_bound_cbuffers requested current bounded evidence", &params);
     json arr = json::array();
+    std::set<std::uint64_t> seen;
+    collect_explicit_cbuffer_candidates(scope.pid(), params, arr, seen, 128, "explicit_cbuffer_candidate");
     for (const auto& record : store::list_dx_hooks(scope.pid()))
     {
         for (const auto& cap : record.captures)
@@ -1451,7 +1500,7 @@ tool_result_t list_bound_cbuffers(const json& params)
             if (cap.contains("cbuffers") && cap["cbuffers"].is_array())
             {
                 for (const auto& cb : cap["cbuffers"])
-                    arr.push_back(cb);
+                    append_unique_candidate(arr, cb, seen, 128);
             }
         }
     }
@@ -1472,7 +1521,7 @@ tool_result_t identify_bone_buffer(const json& params)
     const double world_max = number_param(params, "world_unit_max", 100000.0, 1.0, 1000000000.0);
     const std::uint32_t min_bones = static_cast<std::uint32_t>(numeric_param(params, "min_bones", 4, 1, 1024));
     const std::uint32_t max_bones = static_cast<std::uint32_t>(numeric_param(params, "max_bones", 256, min_bones, 4096));
-    refresh_snapshot_records(scope.pid(), "identify_bone_buffer requested current bounded evidence");
+    refresh_snapshot_records(scope.pid(), "identify_bone_buffer requested current bounded evidence", &params);
     json candidates = json::array();
     auto evaluate_candidate = [&](const json& source, const std::string& source_name) {
         if (!source.contains("va"))
@@ -1513,6 +1562,13 @@ tool_result_t identify_bone_buffer(const json& params)
         row["evidence"] = source;
         candidates.push_back(std::move(row));
     };
+
+    for (const auto& cb : explicit_cbuffer_candidates(scope.pid(), params, 64, "explicit_cbuffer_candidate"))
+    {
+        if (candidates.size() >= 64)
+            break;
+        evaluate_candidate(cb, "explicit_cbuffer_candidate");
+    }
 
     for (const auto& cb : stored_cbuffer_rows(scope.pid()))
     {
@@ -1583,6 +1639,8 @@ tool_result_t dump_render_targets(const json& params)
     active_process_scope_t scope(params);
     if (!scope.ok())
         return tool_result_t::error(scope.error());
+    if (!unsafe_confirmed(params))
+        return unsafe_required("dx_dump_render_targets");
     std::string format = lower_ascii(string_param(params, "format", "png"));
     if (format != "png" && format != "rgba")
         return tool_result_t::error("'format' must be 'png' or 'rgba'.");
@@ -1675,7 +1733,7 @@ tool_result_t find_view_matrix(const json& params)
     json out = json::array();
     bool used_cbuffer_capture = false;
     bool used_memory_fallback = false;
-    refresh_snapshot_records(scope.pid(), "find_view_matrix requested current bounded evidence");
+    refresh_snapshot_records(scope.pid(), "find_view_matrix requested current bounded evidence", &params);
     auto inspect_candidate = [&](const json& candidate, const std::string& source) {
         if (!candidate.contains("va") || out.size() >= 128)
             return;
@@ -1701,6 +1759,13 @@ tool_result_t find_view_matrix(const json& params)
         row["evidence"] = candidate;
         out.push_back(std::move(row));
     };
+
+    for (const auto& cb : explicit_cbuffer_candidates(scope.pid(), params, 128, "explicit_cbuffer_candidate"))
+    {
+        inspect_candidate(cb, "explicit_cbuffer_candidate");
+        if (out.size() >= 128)
+            break;
+    }
 
     for (const auto& cb : stored_cbuffer_rows(scope.pid()))
     {

@@ -165,6 +165,10 @@ namespace test_all_features {
 			return "C:\\Users\\Public\\Desktop\\aida_full_test.log";
 		}
 
+		const char* target_log_path() {
+			return "C:\\Users\\Public\\Desktop\\aida_test_target.log";
+		}
+
 		constexpr const char* kFullTestEnvName = "AIDA_FULL_TEST_RUNNING";
 		constexpr const char* kTargetArgsText = "--no-external --duration 0 --net-rate 2000 --absorb-external-single-step";
 		constexpr const wchar_t* kTargetArgsWide = L"--no-external --duration 0 --net-rate 2000 --absorb-external-single-step";
@@ -238,6 +242,42 @@ namespace test_all_features {
 
 
 			push_log(s);
+		}
+
+		bool prepare_target_log_file(HANDLE hf) {
+			SetLastError(0);
+			HANDLE ht = CreateFileA(
+				target_log_path(),
+				FILE_APPEND_DATA | SYNCHRONIZE,
+				FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+				nullptr,
+				OPEN_ALWAYS,
+				FILE_ATTRIBUTE_NORMAL,
+				nullptr);
+			DWORD err = ht == INVALID_HANDLE_VALUE ? GetLastError() : 0UL;
+			log_msg(hf, "target-log", "prepare path=%s ok=%d err=%lu handle=%p",
+				target_log_path(),
+				ht != INVALID_HANDLE_VALUE ? 1 : 0,
+				static_cast<unsigned long>(err),
+				ht == INVALID_HANDLE_VALUE ? nullptr : ht);
+			if (ht == INVALID_HANDLE_VALUE)
+				return false;
+
+			char ts[40];
+			format_timestamp(ts, sizeof(ts));
+			char line[512];
+			int n = _snprintf_s(line, sizeof(line), _TRUNCATE,
+				"[%s] [target-log] prepared by full-test harness pid=%lu tid=%lu\n",
+				ts,
+				static_cast<unsigned long>(GetCurrentProcessId()),
+				static_cast<unsigned long>(GetCurrentThreadId()));
+			if (n > 0) {
+				DWORD wrote = 0;
+				WriteFile(ht, line, static_cast<DWORD>(n), &wrote, nullptr);
+				FlushFileBuffers(ht);
+			}
+			CloseHandle(ht);
+			return true;
 		}
 
 		std::uint64_t now_ms_tick() {
@@ -476,6 +516,55 @@ namespace test_all_features {
 				reason ? reason : "",
 				ok ? 1 : 0,
 				static_cast<unsigned long>(err));
+		}
+
+		const char* camoufox_bridge_state_name(aida::burp::camoufox::bridge_state_t state) {
+			using state_t = aida::burp::camoufox::bridge_state_t;
+			switch (state) {
+				case state_t::stopped: return "stopped";
+				case state_t::starting: return "starting";
+				case state_t::ready: return "ready";
+				case state_t::error: return "error";
+			}
+			return "unknown";
+		}
+
+		void cleanup_camoufox_for_full_test_start(HANDLE hf, const char* reason) {
+			auto before = aida::burp::camoufox::get_status();
+			const bool active = before.state != aida::burp::camoufox::bridge_state_t::stopped ||
+				before.child_pid != 0 ||
+				before.cleanup_pending ||
+				before.child_alive ||
+				before.browser_open ||
+				before.page_verified;
+			log_msg(hf, "camoufox-cleanup", "preflight reason=%s active=%d state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d last_error_len=%zu",
+				reason ? reason : "unspecified",
+				active ? 1 : 0,
+				camoufox_bridge_state_name(before.state),
+				before.child_pid,
+				before.child_alive ? 1 : 0,
+				before.browser_open ? 1 : 0,
+				before.page_verified ? 1 : 0,
+				before.cleanup_pending ? 1 : 0,
+				before.last_error.size());
+			if (!active)
+				return;
+			const uint64_t t0 = now_ms_tick();
+			const bool cleaned = aida::burp::camoufox::force_cleanup(reason ? reason : "testlab.start_tests_preflight");
+			const bool idle = aida::burp::camoufox::wait_until_idle(15000, reason ? reason : "testlab.start_tests_preflight");
+			auto after = aida::burp::camoufox::get_status();
+			log_msg(hf, "camoufox-cleanup", "preflight_done reason=%s cleaned=%d idle=%d state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d elapsed_ms=%llu last_error_len=%zu",
+				reason ? reason : "unspecified",
+				cleaned ? 1 : 0,
+				idle ? 1 : 0,
+				camoufox_bridge_state_name(after.state),
+				after.child_pid,
+				after.child_alive ? 1 : 0,
+				after.browser_open ? 1 : 0,
+				after.page_verified ? 1 : 0,
+				after.cleanup_pending ? 1 : 0,
+				static_cast<unsigned long long>(now_ms_tick() - t0),
+				after.last_error.size());
 		}
 
 		void begin_test_guard_impl(const char* source, HANDLE hf = INVALID_HANDLE_VALUE) {
@@ -1337,11 +1426,13 @@ namespace test_all_features {
 			std::uint32_t pid = 0;
 			set_step("launch: spawn_and_attach_target");
 			log_debug_snapshot(hf, "launch", "BEFORE spawn_and_attach_target");
-			BOOL env_ok = SetEnvironmentVariableA("AIDA_TARGET_LOG_PATH", log_path());
+			bool target_log_ready = prepare_target_log_file(hf);
+			BOOL env_ok = SetEnvironmentVariableA("AIDA_TARGET_LOG_PATH", target_log_path());
 			log_msg(hf, "launch", "set AIDA_TARGET_LOG_PATH ok=%d err=%lu path=%s",
 				env_ok ? 1 : 0,
 				env_ok ? 0UL : static_cast<unsigned long>(GetLastError()),
-				log_path());
+				target_log_path());
+			log_msg(hf, "launch", "target log ready=%d", target_log_ready ? 1 : 0);
 			log_msg(hf, "launch", "target args: %s", kTargetArgsText);
 			log_msg(hf, "launch", "CALL spawn_and_attach_target exe=%s work_dir=%s",
 				exe_log.empty() ? "<unavailable>" : exe_log.c_str(),
@@ -2494,6 +2585,7 @@ namespace test_all_features {
 				static_cast<unsigned long long>(this_run),
 				static_cast<unsigned long>(GetCurrentThreadId()),
 				log_path());
+			log_msg(hf, "run", "test_target_log_path=%s", target_log_path());
 			log_debug_snapshot(hf, "run", "initial snapshot");
 
 			const auto& features = test_lab::all_features();
@@ -2861,6 +2953,7 @@ namespace test_all_features {
 			{
 				HANDLE hf = open_log_file();
 				begin_test_guard_impl("start_tests_impl queued", hf);
+				cleanup_camoufox_for_full_test_start(hf, "testlab.start_tests_preflight");
 				if (hf != INVALID_HANDLE_VALUE) {
 					flush_full_test_log(hf);
 					CloseHandle(hf);
@@ -3157,6 +3250,7 @@ namespace test_all_features {
 
 			ImGui::PushStyleColor(ImGuiCol_Text, t.text_dim);
 			ImGui::Text("Log file: %s", log_path());
+			ImGui::Text("Target log: %s", target_log_path());
 			ImGui::PopStyleColor();
 		}
 		ImGui::End();

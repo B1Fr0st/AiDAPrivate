@@ -424,7 +424,42 @@ tool_result_t scan_objects(const json& params)
     const std::size_t max_results = static_cast<std::size_t>(numeric_param(params, "max_results", 512, 1, 10000));
     const auto needle = make_u64_pattern(vtable_va);
     json arr = json::array();
-    for (const auto& region : regions_for(scope.pid(), 8192))
+    std::uint64_t object_va = 0;
+    if (parse_address_param(params, "object_va", object_va) && object_va != 0)
+    {
+        std::uint64_t object_vtable = 0;
+        if (read_u64(scope.pid(), object_va, object_vtable) && object_vtable == vtable_va)
+        {
+            driver_bridge::memory_region_t region{};
+            json obj;
+            obj["object_va"] = sa_format_address(object_va);
+            if (query_region(scope.pid(), object_va, region))
+                obj["region_info"] = region_json(region);
+            arr.push_back(std::move(obj));
+        }
+    }
+    std::vector<driver_bridge::memory_region_t> scan_regions;
+    std::uint64_t range_base = 0;
+    std::uint64_t range_size = 0;
+    if (parse_address_param(params, "range_base", range_base) || parse_address_param(params, "scan_start_va", range_base))
+    {
+        if (!parse_address_param(params, "range_size", range_size) && !parse_address_param(params, "scan_size", range_size))
+            range_size = 0x1000;
+        driver_bridge::memory_region_t region{};
+        if (query_region(scope.pid(), range_base, region) && is_readable(region))
+        {
+            const std::uint64_t region_end = region.base + region.size;
+            if (region_end > range_base)
+            {
+                region.base = range_base;
+                region.size = std::min<std::uint64_t>(range_size, region_end - range_base);
+                scan_regions.push_back(region);
+            }
+        }
+    }
+    if (scan_regions.empty() && arr.empty())
+        scan_regions = regions_for(scope.pid(), 8192);
+    for (const auto& region : scan_regions)
     {
         if (arr.size() >= max_results)
             break;

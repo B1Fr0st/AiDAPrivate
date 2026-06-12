@@ -58,6 +58,9 @@ json status_to_json(const camoufox::bridge_status_t& s)
     j["active_page_title"] = s.active_page_title;
     j["page_count"]       = s.page_count;
     j["session_count"]    = s.session_count;
+    j["browser_instance_count"] = s.browser_instance_count;
+    j["child_process_count"] = s.child_process_count;
+    j["browser_process_count"] = s.browser_process_count;
     j["pages"]            = json::array();
     for (const auto& p : s.pages)
     {
@@ -74,6 +77,13 @@ json status_to_json(const camoufox::bridge_status_t& s)
         });
     }
     j["active_profile_dir"] = s.active_profile_dir;
+    j["active_profile_generated"] = s.active_profile_generated;
+    j["effective_ua_policy"] = s.effective_ua_policy;
+    j["ua_override"] = s.ua_override;
+    j["ua_override_string"] = s.ua_override_string;
+    j["webrtc_blocked"] = s.webrtc_blocked;
+    j["privacy_verified"] = s.privacy_verified;
+    j["privacy_diagnostics"] = s.privacy_diagnostics.is_object() ? s.privacy_diagnostics : json::object();
     j["page_verified"]    = s.page_verified;
     j["child_alive"]      = s.child_alive;
     j["cleanup_pending"]  = s.cleanup_pending;
@@ -82,13 +92,32 @@ json status_to_json(const camoufox::bridge_status_t& s)
     j["last_nav_ms"]      = s.last_nav_ms;
     j["last_cleanup_ms"]  = s.last_cleanup_ms;
     j["last_verified_ms"] = s.last_verified_ms;
-    j["ready"]            = s.state == camoufox::bridge_state_t::ready && s.browser_open && s.page_verified && s.child_alive && !s.cleanup_pending;
+    j["ready"]            = s.state == camoufox::bridge_state_t::ready && s.browser_open && s.page_verified && s.privacy_verified && s.child_alive && !s.cleanup_pending;
     return j;
 }
 
 bool bridge_ready(const camoufox::bridge_status_t& s)
 {
-    return s.state == camoufox::bridge_state_t::ready && s.browser_open && s.page_verified && s.child_alive && !s.cleanup_pending;
+    return s.state == camoufox::bridge_state_t::ready && s.browser_open && s.page_verified && s.privacy_verified && s.child_alive && !s.cleanup_pending;
+}
+
+void attach_privacy_status(tool_result_t& out, const camoufox::bridge_status_t& s)
+{
+    if (!out.data.is_object())
+        out.data = json{{"value", out.data}};
+    json privacy = json::object();
+    privacy["effective_ua_policy"] = s.effective_ua_policy;
+    privacy["ua_override"] = s.ua_override;
+    privacy["ua_override_string"] = s.ua_override_string;
+    privacy["webrtc_blocked"] = s.webrtc_blocked;
+    privacy["privacy_verified"] = s.privacy_verified;
+    privacy["page_verified"] = s.page_verified;
+    privacy["active_profile_generated"] = s.active_profile_generated;
+    privacy["browser_instance_count"] = s.browser_instance_count;
+    privacy["child_process_count"] = s.child_process_count;
+    privacy["browser_process_count"] = s.browser_process_count;
+    privacy["diagnostics"] = s.privacy_diagnostics.is_object() ? s.privacy_diagnostics : json::object();
+    out.data["aida_privacy"] = std::move(privacy);
 }
 
 camoufox::bridge_status_t wait_for_ready_status(int timeout_ms)
@@ -639,6 +668,13 @@ camoufox::launch_config_t launch_config_from_mcp_params(const json& params)
     cfg.block_images = json_bool_param(params, "block_images", cfg.block_images);
     cfg.block_webrtc = json_bool_param(params, "block_webrtc", cfg.block_webrtc);
     cfg.block_webrtc = true;
+    cfg.user_agent = json_string_param(params, "user_agent", json_string_param(params, "userAgent", cfg.user_agent));
+    cfg.ua_policy = json_string_param(params, "ua_policy",
+        json_string_param(params, "user_agent_profile",
+            json_string_param(params, "user_agent_mode", cfg.ua_policy)));
+    cfg.persistent_context = json_bool_param(params, "persistent_context", cfg.persistent_context);
+    cfg.profile_dir = json_string_param(params, "profile_dir", cfg.profile_dir);
+    cfg.user_data_dir = json_string_param(params, "user_data_dir", cfg.user_data_dir);
     cfg.enable_trace = json_bool_param(params, "enable_trace", cfg.enable_trace);
     cfg.python_executable = json_string_param(params, "python_executable", cfg.python_executable);
     cfg.browser_executable = json_string_param(params, "browser_executable", cfg.browser_executable);
@@ -770,6 +806,8 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
         out.data["network_capture"] = capture_info;
     }
     auto after = camoufox::get_status(session_id);
+    if (tool_name == "compare_env" || tool_name == "check_environment")
+        attach_privacy_status(out, after);
     const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start).count();
     std::string failure_phase;
@@ -985,6 +1023,15 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"humanize", "boolean", "Enable humanized mouse movement", false},
              {"geoip", "boolean", "Infer geolocation from proxy IP", false},
              {"block_images", "boolean", "Block image loading", false},
+             {"block_webrtc", "boolean", "Force WebRTC blocking; AiDA enforces this on", false},
+             {"user_agent", "string", "Custom Firefox-family user agent", false},
+             {"userAgent", "string", "Alias for user_agent", false},
+             {"ua_policy", "string", "camoufox_native, firefox_auto, firefox_windows, firefox_macos, firefox_linux, random_firefox_desktop, or custom with user_agent", false},
+             {"user_agent_profile", "string", "Alias for ua_policy", false},
+             {"user_agent_mode", "string", "Alias for ua_policy", false},
+             {"persistent_context", "boolean", "Use a persistent Camoufox browser context", false},
+             {"profile_dir", "string", "Persistent Firefox profile directory", false},
+             {"user_data_dir", "string", "Alias for persistent profile directory", false},
              {"enable_trace", "boolean", "Enable engine-level property access tracing", false},
              {"python_executable", "string", "Optional Python path for developer sessions", false},
              {"browser_executable", "string", "Optional camoufox.exe path", false},
@@ -1028,7 +1075,7 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"selector", "string", "CSS selector for an element screenshot", false},
              {"save_path", "string", "Optional PNG file path", false},
              {"include_base64", "boolean", "Return bounded inline base64", false},
-             {"max_base64_chars", "number", "Maximum inline base64 characters", false}}, true, 60000},
+             {"max_base64_chars", "number", "Maximum inline base64 characters", false}}, false, 60000},
         {"browser_state", "Consolidated Camoufox state operations. Set action to cookies, storage, export, import, or reset.",
             {{"action", "string", "cookies|storage|export|import|reset", true},
              {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted", false},
@@ -1134,6 +1181,8 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"max_results", "number", "Maximum matches", false}}, true, 30000},
         {"compare_env", "Collect browser environment fingerprint data for comparison.",
             {{"properties", "array", "Specific properties to check", false}}, true, 30000},
+        {"check_environment", "Run reverse-MCP dependency, browser, privacy, and runtime state checks.",
+            {{"session_id", "string", "Browser session id", false}}, true, 30000},
         {"verify_signer_offline", "Verify a candidate JavaScript signing function against captured samples offline.",
             {{"signer_code", "string", "Candidate signer source", true},
              {"samples", "array", "Request/signature samples", true},

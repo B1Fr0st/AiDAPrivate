@@ -2,6 +2,42 @@ if(NOT DEFINED AIDA_CAMOUFOX_STAGE_ROOT)
     message(FATAL_ERROR "AIDA_CAMOUFOX_STAGE_ROOT is required")
 endif()
 
+set(AIDA_CAMOUFOX_REPO_MCP_ROOT "${CMAKE_CURRENT_LIST_DIR}/../camoufox-reverse-mcp/src/camoufox_reverse_mcp")
+set(AIDA_CAMOUFOX_STAGE_MCP_ROOTS
+    "${AIDA_CAMOUFOX_STAGE_ROOT}/deps/camoufox-reverse-mcp/src/camoufox_reverse_mcp"
+    "${AIDA_CAMOUFOX_STAGE_ROOT}/deps/camoufox-runtime/Lib/site-packages/camoufox_reverse_mcp"
+)
+set(AIDA_CAMOUFOX_SOURCE_SYNC_FILES
+    "browser.py"
+    "__main__.py"
+    "tools/navigation.py"
+    "tools/environment.py"
+    "tools/storage.py"
+)
+
+foreach(AIDA_CAMOUFOX_SOURCE_SYNC_FILE IN LISTS AIDA_CAMOUFOX_SOURCE_SYNC_FILES)
+    set(AIDA_CAMOUFOX_SOURCE_PATH "${AIDA_CAMOUFOX_REPO_MCP_ROOT}/${AIDA_CAMOUFOX_SOURCE_SYNC_FILE}")
+    if(NOT EXISTS "${AIDA_CAMOUFOX_SOURCE_PATH}")
+        continue()
+    endif()
+    file(READ "${AIDA_CAMOUFOX_SOURCE_PATH}" AIDA_CAMOUFOX_SOURCE_SYNC_CONTENT)
+    string(REPLACE "\r\n" "\n" AIDA_CAMOUFOX_SOURCE_SYNC_CONTENT "${AIDA_CAMOUFOX_SOURCE_SYNC_CONTENT}")
+    string(REPLACE "\r" "\n" AIDA_CAMOUFOX_SOURCE_SYNC_CONTENT "${AIDA_CAMOUFOX_SOURCE_SYNC_CONTENT}")
+    foreach(AIDA_CAMOUFOX_STAGE_MCP_ROOT IN LISTS AIDA_CAMOUFOX_STAGE_MCP_ROOTS)
+        set(AIDA_CAMOUFOX_STAGE_PATH "${AIDA_CAMOUFOX_STAGE_MCP_ROOT}/${AIDA_CAMOUFOX_SOURCE_SYNC_FILE}")
+        if(NOT EXISTS "${AIDA_CAMOUFOX_STAGE_PATH}")
+            continue()
+        endif()
+        file(READ "${AIDA_CAMOUFOX_STAGE_PATH}" AIDA_CAMOUFOX_STAGE_SYNC_CONTENT)
+        string(REPLACE "\r\n" "\n" AIDA_CAMOUFOX_STAGE_SYNC_CONTENT "${AIDA_CAMOUFOX_STAGE_SYNC_CONTENT}")
+        string(REPLACE "\r" "\n" AIDA_CAMOUFOX_STAGE_SYNC_CONTENT "${AIDA_CAMOUFOX_STAGE_SYNC_CONTENT}")
+        if(NOT AIDA_CAMOUFOX_STAGE_SYNC_CONTENT STREQUAL AIDA_CAMOUFOX_SOURCE_SYNC_CONTENT)
+            file(WRITE "${AIDA_CAMOUFOX_STAGE_PATH}" "${AIDA_CAMOUFOX_SOURCE_SYNC_CONTENT}")
+            message(STATUS "Synchronized ${AIDA_CAMOUFOX_STAGE_PATH}")
+        endif()
+    endforeach()
+endforeach()
+
 set(AIDA_CAMOUFOX_PATCH_FILES
     "${AIDA_CAMOUFOX_STAGE_ROOT}/deps/camoufox-reverse-mcp/src/camoufox_reverse_mcp/browser.py"
     "${AIDA_CAMOUFOX_STAGE_ROOT}/deps/camoufox-runtime/Lib/site-packages/camoufox_reverse_mcp/browser.py"
@@ -31,11 +67,6 @@ foreach(AIDA_CAMOUFOX_PATCH_FILE IN LISTS AIDA_CAMOUFOX_PATCH_FILES)
             AIDA_CAMOUFOX_CONTENT "${AIDA_CAMOUFOX_CONTENT}")
     endif()
 
-    string(REPLACE
-        "import subprocess as _subprocess\n"
-        ""
-        AIDA_CAMOUFOX_CONTENT "${AIDA_CAMOUFOX_CONTENT}")
-
     if(NOT AIDA_CAMOUFOX_CONTENT MATCHES "AIDA_CAMOUFOX_EXECUTABLE")
         string(REPLACE
 "        if cfg.get(\"block_webrtc\"):
@@ -43,8 +74,6 @@ foreach(AIDA_CAMOUFOX_PATCH_FILE IN LISTS AIDA_CAMOUFOX_PATCH_FILES)
 
         locale = cfg.get(\"locale\", \"auto\")"
 "        kwargs[\"block_webrtc\"] = True
-        cfg.pop(\"user_agent\", None)
-        cfg.pop(\"userAgent\", None)
 
         executable_path = cfg.get(\"executable_path\") or __import__(\"os\").environ.get(\"AIDA_CAMOUFOX_EXECUTABLE\")
         if executable_path:
@@ -59,26 +88,6 @@ foreach(AIDA_CAMOUFOX_PATCH_FILE IN LISTS AIDA_CAMOUFOX_PATCH_FILES)
                 pass
 
         locale = cfg.get(\"locale\", \"auto\")"
-            AIDA_CAMOUFOX_CONTENT "${AIDA_CAMOUFOX_CONTENT}")
-    endif()
-
-    if(NOT AIDA_CAMOUFOX_CONTENT MATCHES "cfg\\.pop\\(\"userAgent\"")
-        string(REPLACE
-"        if cfg.get(\"block_webrtc\"):
-            kwargs[\"block_webrtc\"] = True"
-"        kwargs[\"block_webrtc\"] = True
-        cfg.pop(\"user_agent\", None)
-        cfg.pop(\"userAgent\", None)"
-            AIDA_CAMOUFOX_CONTENT "${AIDA_CAMOUFOX_CONTENT}")
-        string(REPLACE
-"        kwargs[\"block_webrtc\"] = True
-
-        locale ="
-"        kwargs[\"block_webrtc\"] = True
-        cfg.pop(\"user_agent\", None)
-        cfg.pop(\"userAgent\", None)
-
-        locale ="
             AIDA_CAMOUFOX_CONTENT "${AIDA_CAMOUFOX_CONTENT}")
     endif()
 
@@ -272,7 +281,15 @@ def _write_private_profile_prefs(profile_dir: str | None) -> dict[str, Any]:
         "browser.sessionstore.max_tabs_undo": 0,
         "browser.sessionstore.privacy_level": 2,
         "browser.sessionstore.resume_from_crash": False,
+        "browser.search.geoip.url": "",
+        "browser.search.region": "US",
+        "browser.search.update": False,
+        "browser.search.suggest.enabled": False,
+        "browser.search.separatePrivateDefault": False,
+        "browser.search.separatePrivateDefault.ui.enabled": False,
         "browser.urlbar.speculativeConnect.enabled": False,
+        "browser.urlbar.quicksuggest.enabled": False,
+        "browser.urlbar.suggest.searches": False,
         "datareporting.healthreport.uploadEnabled": False,
         "datareporting.policy.dataSubmissionEnabled": False,
         "dom.push.enabled": False,
@@ -335,26 +352,9 @@ def _write_private_profile_prefs(profile_dir: str | None) -> dict[str, Any]:
 
 
 async def _verify_private_page(page: Page | None) -> dict[str, Any]:
-    out: dict[str, Any] = {"webrtc_disabled": False, "ua_policy": "camoufox_native"}
     if page is None:
-        out["error"] = "missing_page"
-        return out
-    try:
-        state = await page.evaluate("""() => ({
-            rtc: typeof RTCPeerConnection,
-            mozRtc: typeof mozRTCPeerConnection,
-            uaLength: String(navigator.userAgent || "").length
-        })""")
-        rtc_type = str((state or {}).get("rtc", ""))
-        moz_rtc_type = str((state or {}).get("mozRtc", ""))
-        out["rtc_type"] = rtc_type
-        out["moz_rtc_type"] = moz_rtc_type
-        out["ua_length"] = int((state or {}).get("uaLength", 0) or 0)
-        out["webrtc_disabled"] = rtc_type == "undefined" and moz_rtc_type == "undefined"
-    except Exception as exc:
-        out["error_type"] = type(exc).__name__
-        out["error"] = _safe_text(exc, 300)
-    return out]=]
+        return {"webrtc_blocked": False, "ice_probe_ok": False, "ice_candidate_leak_detected": True, "ua_policy": "camoufox_native", "error": "missing_page"}
+    return await _verify_page_privacy(page, {"ua_policy": "camoufox_native", "block_webrtc": True, "privacy_fail_closed": True, "fingerprint_overrides": {}})]=]
             AIDA_CAMOUFOX_CONTENT "${AIDA_CAMOUFOX_CONTENT}")
     endif()
 
@@ -371,7 +371,15 @@ async def _verify_private_page(page: Page | None) -> dict[str, Any]:
         "browser.sessionstore.max_tabs_undo": 0,
         "browser.sessionstore.privacy_level": 2,
         "browser.sessionstore.resume_from_crash": False,
+        "browser.search.geoip.url": "",
+        "browser.search.region": "US",
+        "browser.search.update": False,
+        "browser.search.suggest.enabled": False,
+        "browser.search.separatePrivateDefault": False,
+        "browser.search.separatePrivateDefault.ui.enabled": False,
         "browser.urlbar.speculativeConnect.enabled": False,
+        "browser.urlbar.quicksuggest.enabled": False,
+        "browser.urlbar.suggest.searches": False,
         "datareporting.healthreport.uploadEnabled": False,
         "datareporting.policy.dataSubmissionEnabled": False,
         "dom.push.enabled": False,
@@ -434,26 +442,9 @@ async def _verify_private_page(page: Page | None) -> dict[str, Any]:
 
 
 async def _verify_private_page(page: Page | None) -> dict[str, Any]:
-    out: dict[str, Any] = {"webrtc_disabled": False, "ua_policy": "camoufox_native"}
     if page is None:
-        out["error"] = "missing_page"
-        return out
-    try:
-        state = await page.evaluate("""() => ({
-            rtc: typeof RTCPeerConnection,
-            mozRtc: typeof mozRTCPeerConnection,
-            uaLength: String(navigator.userAgent || "").length
-        })""")
-        rtc_type = str((state or {}).get("rtc", ""))
-        moz_rtc_type = str((state or {}).get("mozRtc", ""))
-        out["rtc_type"] = rtc_type
-        out["moz_rtc_type"] = moz_rtc_type
-        out["ua_length"] = int((state or {}).get("uaLength", 0) or 0)
-        out["webrtc_disabled"] = rtc_type == "undefined" and moz_rtc_type == "undefined"
-    except Exception as exc:
-        out["error_type"] = type(exc).__name__
-        out["error"] = _safe_text(exc, 300)
-    return out
+        return {"webrtc_blocked": False, "ice_probe_ok": False, "ice_candidate_leak_detected": True, "ua_policy": "camoufox_native", "error": "missing_page"}
+    return await _verify_page_privacy(page, {"ua_policy": "camoufox_native", "block_webrtc": True, "privacy_fail_closed": True, "fingerprint_overrides": {}})
 
 
 def _windows_descendant_pids(root_pid: int) -> list[int]:]=]
@@ -484,7 +475,15 @@ def _windows_descendant_pids(root_pid: int) -> list[int]:]=]
         \"browser.sessionstore.max_tabs_undo\": 0,
         \"browser.sessionstore.privacy_level\": 2,
         \"browser.sessionstore.resume_from_crash\": False,
+        \"browser.search.geoip.url\": \"\",
+        \"browser.search.region\": \"US\",
+        \"browser.search.update\": False,
+        \"browser.search.suggest.enabled\": False,
+        \"browser.search.separatePrivateDefault\": False,
+        \"browser.search.separatePrivateDefault.ui.enabled\": False,
         \"browser.urlbar.speculativeConnect.enabled\": False,
+        \"browser.urlbar.quicksuggest.enabled\": False,
+        \"browser.urlbar.suggest.searches\": False,
         \"datareporting.healthreport.uploadEnabled\": False,
         \"datareporting.policy.dataSubmissionEnabled\": False,
         \"dom.push.enabled\": False,
@@ -540,7 +539,15 @@ def _windows_descendant_pids(root_pid: int) -> list[int]:]=]
             prefs[\"browser.sessionstore.max_tabs_undo\"] = 0
             prefs[\"browser.sessionstore.privacy_level\"] = 2
             prefs[\"browser.sessionstore.resume_from_crash\"] = False
+            prefs[\"browser.search.geoip.url\"] = \"\"
+            prefs[\"browser.search.region\"] = \"US\"
+            prefs[\"browser.search.update\"] = False
+            prefs[\"browser.search.suggest.enabled\"] = False
+            prefs[\"browser.search.separatePrivateDefault\"] = False
+            prefs[\"browser.search.separatePrivateDefault.ui.enabled\"] = False
             prefs[\"browser.urlbar.speculativeConnect.enabled\"] = False
+            prefs[\"browser.urlbar.quicksuggest.enabled\"] = False
+            prefs[\"browser.urlbar.suggest.searches\"] = False
             prefs[\"datareporting.healthreport.uploadEnabled\"] = False
             prefs[\"datareporting.policy.dataSubmissionEnabled\"] = False
             prefs[\"dom.push.enabled\"] = False
@@ -572,7 +579,7 @@ def _windows_descendant_pids(root_pid: int) -> list[int]:]=]
     if(NOT AIDA_CAMOUFOX_CONTENT MATCHES "_profile_dir")
         string(REPLACE
             "        self._route_handlers: dict[str, Any] = {}  # 已注册的 route handler 映射"
-            "        self._route_handlers: dict[str, Any] = {}  # 已注册的 route handler 映射\n        self._profile_dir: str | None = None"
+            "        self._route_handlers: dict[str, Any] = {}  # 已注册的 route handler 映射\n        self._profile_dir: str | None = None\n        self._profile_generated = False"
             AIDA_CAMOUFOX_CONTENT "${AIDA_CAMOUFOX_CONTENT}")
     endif()
 
@@ -581,7 +588,8 @@ def _windows_descendant_pids(root_pid: int) -> list[int]:]=]
         self._persistent_traces: dict[str, list] = {}]=]
 [=[        self._persistent_scripts: list[dict] = []
         self._persistent_traces: dict[str, list] = {}
-        self._profile_dir: str | None = None]=]
+        self._profile_dir: str | None = None
+        self._profile_generated = False]=]
             AIDA_CAMOUFOX_CONTENT "${AIDA_CAMOUFOX_CONTENT}")
     endif()
 
@@ -661,10 +669,17 @@ def _profile_snapshot(profile_dir: str | None) -> dict[str, Any]:
             kwargs["locale"] = locale
 
         profile_dir = None
+        profile_info: dict[str, Any] = {}
         if bundled_visible_launch:
-            profile_dir = str(cfg.get("profile_dir") or _new_profile_dir())
-            kwargs["persistent_context"] = True
-            kwargs["user_data_dir"] = profile_dir
+            profile_requested = bool(cfg.get("profile_dir") or cfg.get("user_data_dir") or cfg.get("persistent_context"))
+            if profile_requested:
+                generated_profile = not bool(cfg.get("profile_dir") or cfg.get("user_data_dir"))
+                profile_dir = str(cfg.get("profile_dir") or cfg.get("user_data_dir") or _new_profile_dir())
+                profile_dir, profile_info = _prepare_profile_dir(profile_dir, generated_profile)
+                kwargs["persistent_context"] = True
+                kwargs["user_data_dir"] = profile_dir
+            else:
+                profile_info = {"profile_dir": "", "generated": False, "existed": False, "locks": 0, "lock_names": [], "mode": "non_persistent"}
 
         window_size, window_diag = _resolve_window_size(cfg)
         if not headless:
@@ -712,6 +727,7 @@ def _profile_snapshot(profile_dir: str | None) -> dict[str, Any]:
             if profile_dir and not profile_privacy.get("written"):
                 raise RuntimeError("Camoufox privacy profile preferences were not written")
             self._profile_dir = profile_dir
+            self._profile_generated = bool(profile_info.get("generated"))
             self._cm = AsyncCamoufox(**kwargs)
             _camoufox_debug(
                 "launch_context_enter_begin",
@@ -733,13 +749,13 @@ def _profile_snapshot(profile_dir: str | None) -> dict[str, Any]:
                     ctx = self.browser.contexts[0]
                 else:
                     _camoufox_debug("launch_new_context_begin")
-                    ctx = await asyncio.wait_for(self.browser.new_context(), timeout=max(5.0, launch_timeout_ms / 3000))
+                    ctx = await asyncio.wait_for(self.browser.new_context(), timeout=min(max(8.0, max(5.0, launch_timeout_ms / 1000.0) * 0.50), max(5.0, launch_timeout_ms / 1000.0)))
                     _camoufox_debug("launch_new_context_ok", elapsed_ms=int((time.perf_counter() - launch_started) * 1000))]=]
             AIDA_CAMOUFOX_CONTENT "${AIDA_CAMOUFOX_CONTENT}")
 
         string(REPLACE
             "            page = ctx.pages[0] if ctx.pages else await ctx.new_page()"
-            "            if ctx.pages:\n                page = ctx.pages[0]\n            else:\n                _camoufox_debug(\"launch_new_page_begin\")\n                page = await asyncio.wait_for(ctx.new_page(), timeout=max(5.0, launch_timeout_ms / 3000))\n                _camoufox_debug(\"launch_new_page_ok\", elapsed_ms=int((time.perf_counter() - launch_started) * 1000))\n            privacy_info = await _verify_private_page(page)\n            _camoufox_debug(\"launch_privacy_verified\", **privacy_info)\n            if not privacy_info.get(\"webrtc_disabled\"):\n                raise RuntimeError(\"Camoufox privacy verification failed: WebRTC is still exposed\")"
+            "            if ctx.pages:\n                page = ctx.pages[0]\n            else:\n                _camoufox_debug(\"launch_new_page_begin\")\n                page = await asyncio.wait_for(ctx.new_page(), timeout=min(max(15.0, max(5.0, launch_timeout_ms / 1000.0) * 0.75), max(5.0, launch_timeout_ms / 1000.0)))\n                _camoufox_debug(\"launch_new_page_ok\", elapsed_ms=int((time.perf_counter() - launch_started) * 1000))\n            privacy_info = await _verify_page_privacy(page, self._context_plan)\n            _camoufox_debug(\"launch_privacy_verified\", **privacy_info)\n            if not privacy_info.get(\"webrtc_blocked\") or not privacy_info.get(\"ice_probe_ok\") or privacy_info.get(\"ice_candidate_leak_detected\"):\n                raise RuntimeError(\"Camoufox privacy verification failed\")"
             AIDA_CAMOUFOX_CONTENT "${AIDA_CAMOUFOX_CONTENT}")
 
         string(REPLACE [=[                error_len=len(str(exc)),
@@ -761,7 +777,8 @@ def _profile_snapshot(profile_dir: str | None) -> dict[str, Any]:
             self.active_page_name = None
             self._cm = None
             self._profile_dir = None
-            if profile_dir:
+            self._profile_generated = False
+            if profile_dir and bool(profile_info.get("generated")):
                 try:
                     import shutil
                     shutil.rmtree(profile_dir, ignore_errors=True)
@@ -835,7 +852,8 @@ def _profile_snapshot(profile_dir: str | None) -> dict[str, Any]:
             _camoufox_debug("launch_profile_privacy", **profile_privacy)
             if profile_dir and not profile_privacy.get("written"):
                 raise RuntimeError("Camoufox privacy profile preferences were not written")
-            self._profile_dir = profile_dir]=]
+            self._profile_dir = profile_dir
+            self._profile_generated = bool(profile_info.get("generated"))]=]
             AIDA_CAMOUFOX_CONTENT "${AIDA_CAMOUFOX_CONTENT}")
     endif()
 
@@ -844,18 +862,137 @@ def _profile_snapshot(profile_dir: str | None) -> dict[str, Any]:
                 page = ctx.pages[0]
             else:
                 _camoufox_debug("launch_new_page_begin")
-                page = await asyncio.wait_for(ctx.new_page(), timeout=max(5.0, launch_timeout_ms / 3000))
+                page = await asyncio.wait_for(ctx.new_page(), timeout=min(max(15.0, max(5.0, launch_timeout_ms / 1000.0) * 0.75), max(5.0, launch_timeout_ms / 1000.0)))
                 _camoufox_debug("launch_new_page_ok", elapsed_ms=int((time.perf_counter() - launch_started) * 1000))]=]
 [=[            if ctx.pages:
                 page = ctx.pages[0]
             else:
                 _camoufox_debug("launch_new_page_begin")
-                page = await asyncio.wait_for(ctx.new_page(), timeout=max(5.0, launch_timeout_ms / 3000))
+                page = await asyncio.wait_for(ctx.new_page(), timeout=min(max(15.0, max(5.0, launch_timeout_ms / 1000.0) * 0.75), max(5.0, launch_timeout_ms / 1000.0)))
                 _camoufox_debug("launch_new_page_ok", elapsed_ms=int((time.perf_counter() - launch_started) * 1000))
-            privacy_info = await _verify_private_page(page)
+            privacy_info = await _verify_page_privacy(page, self._context_plan)
             _camoufox_debug("launch_privacy_verified", **privacy_info)
-            if not privacy_info.get("webrtc_disabled"):
-                raise RuntimeError("Camoufox privacy verification failed: WebRTC is still exposed")]=]
+            if not privacy_info.get("webrtc_blocked") or not privacy_info.get("ice_probe_ok") or privacy_info.get("ice_candidate_leak_detected"):
+                raise RuntimeError("Camoufox privacy verification failed")]=]
+            AIDA_CAMOUFOX_CONTENT "${AIDA_CAMOUFOX_CONTENT}")
+    endif()
+
+    if(NOT AIDA_CAMOUFOX_CONTENT MATCHES "launch_existing_page_reuse")
+        string(REPLACE [=[            launch_phase = "new_page"
+            _camoufox_debug("launch_new_page_begin", timeout_s=page_create_timeout_s)
+            try:
+                page = await _await_no_cancel_wait(ctx.new_page(), timeout=page_create_timeout_s)
+            except asyncio.TimeoutError:
+                _camoufox_debug("launch_new_page_timeout", elapsed_ms=int((time.perf_counter() - launch_started) * 1000), timeout_s=page_create_timeout_s)
+                raise
+            _camoufox_debug("launch_new_page_ok", elapsed_ms=int((time.perf_counter() - launch_started) * 1000))]=]
+[=[            launch_phase = "page_select"
+            existing_pages: list[Page] = []
+            try:
+                existing_pages = list(ctx.pages)
+            except Exception as exc:
+                _camoufox_debug(
+                    "launch_existing_pages_snapshot_failed",
+                    elapsed_ms=int((time.perf_counter() - launch_started) * 1000),
+                    error_type=type(exc).__name__,
+                    error_len=len(str(exc)),
+                )
+            page = None
+            for candidate in existing_pages:
+                try:
+                    if not candidate.is_closed():
+                        page = candidate
+                        break
+                except Exception as exc:
+                    _camoufox_debug(
+                        "launch_existing_page_state_failed",
+                        elapsed_ms=int((time.perf_counter() - launch_started) * 1000),
+                        error_type=type(exc).__name__,
+                        error_len=len(str(exc)),
+                    )
+            if page is None and persistent_context:
+                page_wait_timeout_s = min(3.0, max(1.0, page_create_timeout_s * 0.10))
+                _camoufox_debug(
+                    "launch_existing_page_wait_begin",
+                    elapsed_ms=int((time.perf_counter() - launch_started) * 1000),
+                    pages_seen=len(existing_pages),
+                    timeout_s=page_wait_timeout_s,
+                )
+                try:
+                    candidate = await _await_no_cancel_wait(ctx.wait_for_event("page"), timeout=page_wait_timeout_s)
+                    if candidate is not None and not candidate.is_closed():
+                        page = candidate
+                except asyncio.TimeoutError:
+                    _camoufox_debug(
+                        "launch_existing_page_wait_timeout",
+                        elapsed_ms=int((time.perf_counter() - launch_started) * 1000),
+                        timeout_s=page_wait_timeout_s,
+                    )
+                except Exception as exc:
+                    _camoufox_debug(
+                        "launch_existing_page_wait_failed",
+                        elapsed_ms=int((time.perf_counter() - launch_started) * 1000),
+                        error_type=type(exc).__name__,
+                        error_len=len(str(exc)),
+                        error_summary=_safe_text(exc),
+                    )
+            if page is not None:
+                page_url = ""
+                try:
+                    page_url = str(page.url or "")
+                except Exception:
+                    pass
+                _camoufox_debug(
+                    "launch_existing_page_reuse",
+                    elapsed_ms=int((time.perf_counter() - launch_started) * 1000),
+                    pages_seen=len(existing_pages),
+                    url=_safe_text(page_url, 160),
+                )
+            else:
+                launch_phase = "new_page"
+                _camoufox_debug("launch_new_page_begin", timeout_s=page_create_timeout_s)
+                try:
+                    page = await _await_no_cancel_wait(ctx.new_page(), timeout=page_create_timeout_s)
+                except asyncio.TimeoutError:
+                    _camoufox_debug("launch_new_page_timeout", elapsed_ms=int((time.perf_counter() - launch_started) * 1000), timeout_s=page_create_timeout_s)
+                    raise
+                _camoufox_debug("launch_new_page_ok", elapsed_ms=int((time.perf_counter() - launch_started) * 1000))
+            try:
+                current_pages = list(ctx.pages)
+                extras_seen = 0
+                extras_closed = 0
+                extras_kept = 0
+                for extra in current_pages:
+                    if extra is page:
+                        continue
+                    extras_seen += 1
+                    extra_url = ""
+                    try:
+                        extra_url = str(extra.url or "")
+                    except Exception:
+                        pass
+                    if extra_url in {"", "about:blank", "about:newtab"}:
+                        await _await_no_cancel_wait(extra.close(), timeout=5.0)
+                        extras_closed += 1
+                    else:
+                        extras_kept += 1
+                if extras_seen:
+                    _camoufox_debug(
+                        "launch_duplicate_pages_cleanup",
+                        elapsed_ms=int((time.perf_counter() - launch_started) * 1000),
+                        seen=extras_seen,
+                        closed=extras_closed,
+                        kept=extras_kept,
+                        remaining=len(ctx.pages),
+                    )
+            except Exception as exc:
+                _camoufox_debug(
+                    "launch_duplicate_pages_cleanup_failed",
+                    elapsed_ms=int((time.perf_counter() - launch_started) * 1000),
+                    error_type=type(exc).__name__,
+                    error_len=len(str(exc)),
+                    error_summary=_safe_text(exc),
+                )]=]
             AIDA_CAMOUFOX_CONTENT "${AIDA_CAMOUFOX_CONTENT}")
     endif()
 
@@ -1140,6 +1277,7 @@ def _profile_snapshot(profile_dir: str | None) -> dict[str, Any]:
 [=[    async def close(self) -> dict:
         """Close the browser and clean up all resources."""
         profile_dir = self._profile_dir
+        profile_generated = getattr(self, "_profile_generated", False)
         if self._cm is not None:]=]
             AIDA_CAMOUFOX_CONTENT "${AIDA_CAMOUFOX_CONTENT}")
 
@@ -1151,7 +1289,8 @@ def _profile_snapshot(profile_dir: str | None) -> dict[str, Any]:
         self._nav_responses.clear()
         self._route_handlers.clear()
         self._profile_dir = None
-        if profile_dir:
+        self._profile_generated = False
+        if profile_dir and profile_generated:
             try:
                 import shutil
                 shutil.rmtree(profile_dir, ignore_errors=True)
@@ -1169,40 +1308,22 @@ def _profile_snapshot(profile_dir: str | None) -> dict[str, Any]:
         OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "launch_bundled_options"
         OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "_build_camoufox_launch_options"
         OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "AIDA_CAMOUFOX_DEBUG_LOG"
-        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "import ctypes as _ctypes"
-        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "import traceback as _traceback"
-        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "cfg\\.pop\\(\"userAgent\""
-        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "def _write_private_profile_prefs"
-        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "def _verify_private_page"
-        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "media\\.peerconnection\\.enabled"
-        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "prefs\\[\"media\\.peerconnection\\.enabled\"\\] = False"
+        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "def _create_private_context"
+        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "def _verify_page_privacy"
+        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "def _probe_webrtc_ice_leak"
+        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "ice_probe_ok"
+        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "ice_candidate_leak_detected"
+        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "privacy_fail_closed"
+        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "service_workers"
+        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "launch_existing_config_mismatch"
+        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "ua_policy"
+        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "navigator\\.oscpu"
         OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "launch_context_enter_begin"
-        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "launch_context_enter_wait"
-        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "launch_profile_privacy"
         OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "launch_privacy_verified"
-        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "error_traceback"
-        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "def _profile_snapshot"
+        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "launch_timeout_s"
         OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "persistent_context"
         OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "_profile_dir"
-        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "descendant_cleanup_scan_begin"
-        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "descendant_cleanup_scan_end"
-        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "descendant_cleanup_begin"
-        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "descendant_cleanup_process_begin"
-        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "descendant_cleanup_process_open"
-        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "descendant_cleanup_process_wait"
-        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "descendant_cleanup_process_close"
-        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "descendant_cleanup_process"
-        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "OpenProcess"
-        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "TerminateProcess"
-        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "WaitForSingleObject"
-        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "GetExitCodeProcess"
-        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "CloseHandle"
-        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "cleanup_exc"
-        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "close_exc"
-        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "asyncio.wait_for\\(self\\._cm\\.__aexit__"
-        OR AIDA_CAMOUFOX_CONTENT MATCHES "taskkill\\.exe"
-        OR AIDA_CAMOUFOX_CONTENT MATCHES "_subprocess"
-        OR AIDA_CAMOUFOX_CONTENT MATCHES "import subprocess as _subprocess"
+        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "_profile_generated"
         OR AIDA_CAMOUFOX_SHADOWED_ENV_POS GREATER -1)
         message(FATAL_ERROR "Failed to patch ${AIDA_CAMOUFOX_PATCH_FILE}")
     endif()

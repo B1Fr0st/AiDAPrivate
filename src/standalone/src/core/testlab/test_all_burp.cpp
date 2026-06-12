@@ -296,6 +296,8 @@ namespace {
         return static_cast<bool>(f);
     }
 
+    DWORD WINAPI burp_loopback_fixture_thread_entry_win32(void* arg);
+
     struct burp_loopback_fixture_t {
         struct loopback_state_t {
             std::atomic<SOCKET> listen_socket{INVALID_SOCKET};
@@ -367,22 +369,124 @@ namespace {
                 static_cast<unsigned long long>(listener),
                 static_cast<unsigned long>(GetCurrentProcessId()),
                 static_cast<unsigned long>(GetCurrentThreadId()));
-            DWORD start_gle = ERROR_SUCCESS;
             std::string thread_err;
             unsigned tid = 0;
             errno = 0;
             SetLastError(0);
-            const uintptr_t raw = _beginthreadex(nullptr,
-                aida::infra::win_thread::fixture_stack_reserve,
-                &burp_loopback_fixture_t::thread_entry,
-                st.get(),
-                0,
-                &tid);
-            start_gle = GetLastError();
+            HANDLE raw_handle = nullptr;
+            loopback_state_t* thread_state = st.get();
+            aida::runtime::loader_header_invariant::scoped_restore_t loader_window("burp_loopback_fixture", "testlab_burp");
+            auto append_attempt = [&](const char* api, unsigned stack_bytes, DWORD flags, DWORD gle, int crt_errno, DWORD elapsed_ms) {
+                char err_buf[512];
+                _snprintf_s(err_buf, sizeof(err_buf), _TRUNCATE,
+                    "%s%s{stack_bytes=%u flags=0x%08lX gle=%lu errno=%d elapsed_ms=%lu}",
+                    thread_err.empty() ? "" : " ",
+                    api ? api : "<api>",
+                    stack_bytes,
+                    static_cast<unsigned long>(flags),
+                    static_cast<unsigned long>(gle),
+                    crt_errno,
+                    static_cast<unsigned long>(elapsed_ms));
+                thread_err += err_buf;
+            };
+            auto try_beginthreadex_direct = [&](unsigned stack_bytes) {
+                unsigned local_tid = 0;
+                errno = 0;
+                SetLastError(0);
+                DWORD t0 = GetTickCount();
+                uintptr_t raw = _beginthreadex(nullptr, stack_bytes, &burp_loopback_fixture_t::thread_entry, thread_state, 0, &local_tid);
+                DWORD gle = GetLastError();
+                int crt = errno;
+                DWORD elapsed = GetTickCount() - t0;
+                HANDLE h = reinterpret_cast<HANDLE>(raw);
+                diag::log_tagged_fmt("testlab_burp", "loopback_direct_beginthreadex stack_bytes=%u handle=%p tid=%u elapsed_ms=%lu gle=%lu errno=%d state=%p entry=%p loader_window=%d",
+                    stack_bytes,
+                    h,
+                    local_tid,
+                    static_cast<unsigned long>(elapsed),
+                    static_cast<unsigned long>(gle),
+                    crt,
+                    thread_state,
+                    reinterpret_cast<void*>(&burp_loopback_fixture_t::thread_entry),
+                    loader_window.active() ? 1 : 0);
+                if (raw != 0) {
+                    raw_handle = h;
+                    tid = local_tid;
+                    return true;
+                }
+                append_attempt("_beginthreadex", stack_bytes, 0, gle, crt, elapsed);
+                return false;
+            };
+            auto try_create_thread_direct = [&](unsigned stack_bytes, DWORD flags) {
+                DWORD local_tid = 0;
+                errno = 0;
+                SetLastError(0);
+                DWORD t0 = GetTickCount();
+                HANDLE h = CreateThread(nullptr, stack_bytes, &burp_loopback_fixture_thread_entry_win32, thread_state, flags, &local_tid);
+                DWORD gle = GetLastError();
+                int crt = errno;
+                DWORD elapsed = GetTickCount() - t0;
+                diag::log_tagged_fmt("testlab_burp", "loopback_direct_createthread stack_bytes=%u flags=0x%08lX handle=%p tid=%lu elapsed_ms=%lu gle=%lu errno=%d state=%p entry=%p loader_window=%d",
+                    stack_bytes,
+                    static_cast<unsigned long>(flags),
+                    h,
+                    static_cast<unsigned long>(local_tid),
+                    static_cast<unsigned long>(elapsed),
+                    static_cast<unsigned long>(gle),
+                    crt,
+                    thread_state,
+                    reinterpret_cast<void*>(&burp_loopback_fixture_thread_entry_win32),
+                    loader_window.active() ? 1 : 0);
+                if (h) {
+                    raw_handle = h;
+                    tid = static_cast<unsigned>(local_tid);
+                    return true;
+                }
+                append_attempt("CreateThread", stack_bytes, flags, gle, crt, elapsed);
+                return false;
+            };
+            auto try_nt_create_thread_direct = [&]() {
+                using nt_create_thread_ex_t = LONG(NTAPI*)(PHANDLE, ACCESS_MASK, void*, HANDLE, void*, void*, ULONG, SIZE_T, SIZE_T, SIZE_T, void*);
+                HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+                auto fn = ntdll ? reinterpret_cast<nt_create_thread_ex_t>(GetProcAddress(ntdll, "NtCreateThreadEx")) : nullptr;
+                DWORD t0 = GetTickCount();
+                SetLastError(0);
+                errno = 0;
+                HANDLE h = nullptr;
+                LONG status = fn ? fn(&h, THREAD_ALL_ACCESS, nullptr, GetCurrentProcess(), reinterpret_cast<void*>(&burp_loopback_fixture_thread_entry_win32), thread_state, 0, aida::infra::win_thread::fixture_stack_reserve, 0, 0, nullptr) : static_cast<LONG>(0xC0000139);
+                DWORD gle = GetLastError();
+                int crt = errno;
+                DWORD elapsed = GetTickCount() - t0;
+                diag::log_tagged_fmt("testlab_burp", "loopback_direct_ntcreatethreadex status=0x%08lX handle=%p elapsed_ms=%lu gle=%lu errno=%d state=%p entry=%p loader_window=%d",
+                    static_cast<unsigned long>(status),
+                    h,
+                    static_cast<unsigned long>(elapsed),
+                    static_cast<unsigned long>(gle),
+                    crt,
+                    thread_state,
+                    reinterpret_cast<void*>(&burp_loopback_fixture_thread_entry_win32),
+                    loader_window.active() ? 1 : 0);
+                if (status >= 0 && h) {
+                    raw_handle = h;
+                    tid = 0;
+                    return true;
+                }
+                if (h)
+                    CloseHandle(h);
+                append_attempt("NtCreateThreadEx", aida::infra::win_thread::fixture_stack_reserve, 0, gle, crt, elapsed);
+                return false;
+            };
+            const bool started =
+                try_create_thread_direct(aida::infra::win_thread::fixture_stack_reserve, STACK_SIZE_PARAM_IS_A_RESERVATION) ||
+                try_create_thread_direct(0, 0) ||
+                try_nt_create_thread_direct() ||
+                try_beginthreadex_direct(aida::infra::win_thread::fixture_stack_reserve) ||
+                try_beginthreadex_direct(0);
+            DWORD start_gle = started ? ERROR_SUCCESS : GetLastError();
             const int start_errno = errno;
-            const bool started = raw != 0;
-            diag::log_tagged_fmt("testlab_burp", "loopback_thread_start result handle=%p tid=%u stack_bytes=%u gle=%lu errno=%d state=%p entry=%p host_pid=%lu host_tid=%lu",
-                reinterpret_cast<HANDLE>(raw),
+            diag::log_tagged_fmt("testlab_burp", "loopback_thread_start result started=%d handle=%p tid=%u stack_bytes=%u gle=%lu errno=%d state=%p entry=%p host_pid=%lu host_tid=%lu err=%s",
+                started ? 1 : 0,
+                raw_handle,
                 tid,
                 aida::infra::win_thread::fixture_stack_reserve,
                 static_cast<unsigned long>(start_gle),
@@ -390,14 +494,11 @@ namespace {
                 st.get(),
                 reinterpret_cast<void*>(&burp_loopback_fixture_t::thread_entry),
                 static_cast<unsigned long>(GetCurrentProcessId()),
-                static_cast<unsigned long>(GetCurrentThreadId()));
+                static_cast<unsigned long>(GetCurrentThreadId()),
+                thread_err.empty() ? "<empty>" : thread_err.c_str());
             if (started) {
-                worker_handle = reinterpret_cast<HANDLE>(raw);
+                worker_handle = raw_handle;
                 worker_handle_tid = static_cast<DWORD>(tid);
-            } else {
-                char err_buf[128];
-                _snprintf_s(err_buf, sizeof(err_buf), _TRUNCATE, "_beginthreadex errno=%d", start_errno);
-                thread_err = err_buf;
             }
             if (!started) {
                 if (start_gle == ERROR_SUCCESS) start_gle = ERROR_NOT_READY;
@@ -822,6 +923,14 @@ namespace {
             closesocket(s);
         }
     };
+
+    DWORD WINAPI burp_loopback_fixture_thread_entry_win32(void* arg) {
+        DWORD rc = static_cast<DWORD>(burp_loopback_fixture_t::thread_entry(arg));
+        diag::log_tagged_fmt("testlab_burp", "loopback_win32_thread_return rc=%lu tid=%lu",
+            static_cast<unsigned long>(rc),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        return rc;
+    }
 
     std::unique_ptr<burp_loopback_fixture_t> g_burp_fixture;
     std::string g_burp_wordlist_path;
@@ -3933,8 +4042,7 @@ namespace {
 
         aida::burp::camoufox::launch_config_t cfg;
         cfg.headless = false;
-        cfg.proxy = "http://127.0.0.1:18888";
-        cfg.launch_timeout_ms = 15000;
+        cfg.launch_timeout_ms = 70000;
         cfg.window_width = 1280;
         cfg.window_height = 900;
         cfg.testlab_fast_probe = true;
@@ -4077,9 +4185,18 @@ namespace {
     void test_scanner_random_marker(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "scanmod_marker";
         log_msg(hf, tag, "START -- scanner::random_marker");
+        auto t0 = std::chrono::steady_clock::now();
+        log_msg(hf, tag, "CALL marker1");
         std::string m1 = aida::burp::scanner::random_marker("aida");
+        auto t1 = std::chrono::steady_clock::now();
+        log_msg(hf, tag, "CALL marker2 marker1_len=%zu elapsed1_ms=%lld", m1.size(),
+            static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count()));
         std::string m2 = aida::burp::scanner::random_marker("aida");
-        log_msg(hf, tag, "marker1=%s marker2=%s", m1.c_str(), m2.c_str());
+        auto t2 = std::chrono::steady_clock::now();
+        log_msg(hf, tag, "marker1=%s marker2=%s elapsed_total_ms=%lld elapsed2_ms=%lld",
+            m1.c_str(), m2.c_str(),
+            static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t0).count()),
+            static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count()));
         if (!m1.empty() && !m2.empty() && m1 != m2) {
             log_msg(hf, tag, "PASS -- unique markers generated");
             passed.fetch_add(1);

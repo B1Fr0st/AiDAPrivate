@@ -15,6 +15,7 @@
 #include "zydis_disasm.hpp"
 #include "sandbox.hpp"
 #include "../infra/critical_work_queue.hpp"
+#include "../infra/work_queue.hpp"
 #include "../session/analysis_session.hpp"
 #include "../../helpers/diag_log.hpp"
 #include <httplib.h>
@@ -54,6 +55,7 @@ namespace
 
     struct server_worker_lifetime_t {
         aida::infra::win_thread::joinable_thread_t thread;
+        std::atomic<bool> queued_worker{false};
         std::mutex mtx;
         std::condition_variable cv;
         bool start_completed = false;
@@ -128,6 +130,21 @@ namespace
             static_cast<unsigned long long>(st.rejected),
             static_cast<unsigned long long>(st.started),
             static_cast<unsigned long long>(st.finished));
+        const auto svc = work_queue::service_stats();
+        diag::log_tagged_fmt("mcp_srv",
+            "%s service_queue alive=%d shutting_down=%d pool_size=%d workers=%zu pending=%zu active=%u post_attempts=%llu posted=%llu rejected=%llu started=%llu finished=%llu",
+            context ? context : "service_queue",
+            svc.alive ? 1 : 0,
+            svc.shutting_down ? 1 : 0,
+            svc.pool_size,
+            svc.workers,
+            svc.pending,
+            static_cast<unsigned>(svc.active),
+            static_cast<unsigned long long>(svc.post_attempts),
+            static_cast<unsigned long long>(svc.posted),
+            static_cast<unsigned long long>(svc.rejected),
+            static_cast<unsigned long long>(svc.started),
+            static_cast<unsigned long long>(svc.finished));
     }
 
     class work_queue_task_queue final : public httplib::TaskQueue
@@ -1496,12 +1513,17 @@ bool server_t::start(int port)
         return false;
     }
 
-    std::string worker_err;
-    const bool started = worker_lifetime->thread.start([this, port]() {
+    auto worker_body = [this, port]() {
         const DWORD tid = GetCurrentThreadId();
         _server_worker_tid.store(static_cast<std::uint32_t>(tid), std::memory_order_release);
         diag::log_tagged_fmt("mcp_srv", "server_worker starting port=%d tid=%lu", port, static_cast<unsigned long>(tid));
         log_work_queue_stats("server_worker entry");
+        if (_stop_requested.load(std::memory_order_acquire)) {
+            diag::log_tagged_fmt("mcp_srv", "server_worker cancelled before listen port=%d tid=%lu", port, static_cast<unsigned long>(tid));
+            _server_worker_tid.store(0, std::memory_order_release);
+            _server_done.store(true, std::memory_order_release);
+            return;
+        }
         try {
             server_thread_func(port);
         } catch (const std::exception& ex) {
@@ -1514,15 +1536,43 @@ bool server_t::start(int port)
         diag::log_tagged_fmt("mcp_srv", "server_worker exited port=%d tid=%lu", port, static_cast<unsigned long>(GetCurrentThreadId()));
         _server_worker_tid.store(0, std::memory_order_release);
         _server_done.store(true, std::memory_order_release);
-    }, &worker_err, aida::infra::win_thread::default_stack_reserve, "mcp_server_worker");
-    mark_server_worker_start(worker_lifetime, started);
+    };
+    auto post_service_worker = [&](const char* source) -> bool {
+        worker_lifetime->queued_worker.store(true, std::memory_order_release);
+        const bool posted = work_queue::post_service(worker_body);
+        if (posted) {
+            diag::log_tagged_fmt("mcp_srv", "start server worker service queue posted port=%d source=%s", port, source ? source : "unknown");
+        } else {
+            diag::log_tagged_fmt("mcp_srv", "start server worker service queue failed port=%d source=%s", port, source ? source : "unknown");
+            log_work_queue_stats("start service_queue_fallback_failed");
+        }
+        return posted;
+    };
+
+    char fileless_debug_path[MAX_PATH] = {};
+    const bool fileless_host = diag::env_flag_enabled("AIDA_FILELESS_LAUNCH") ||
+        diag::env_value_present("AIDA_FILELESS_DEBUG_LOG_PATH", fileless_debug_path, static_cast<DWORD>(sizeof(fileless_debug_path)));
+    std::string worker_err;
+    bool started = false;
+    if (fileless_host) {
+        diag::log_tagged_fmt("mcp_srv", "start server worker service queue selected port=%d fileless=1", port);
+        started = post_service_worker("fileless");
+    } else {
+        started = worker_lifetime->thread.start(worker_body, &worker_err, aida::infra::win_thread::default_stack_reserve, "mcp_server_worker");
+        if (!started) {
+            diag::log_tagged_fmt("mcp_srv", "start server worker native start failed err='%s'", worker_err.empty() ? "<none>" : worker_err.c_str());
+            log_work_queue_stats("start native_worker_failed");
+            started = post_service_worker("native_fallback");
+        }
+    }
     if (!started) {
-        diag::log_tagged_fmt("mcp_srv", "start server worker start failed err='%s'", worker_err.empty() ? "<none>" : worker_err.c_str());
+        mark_server_worker_start(worker_lifetime, false);
         erase_server_worker_lifetime(this, worker_lifetime);
         _server_done.store(true, std::memory_order_release);
         return false;
     }
-    diag::log_tagged_fmt("mcp_srv", "start server worker thread ok port=%d", port);
+    mark_server_worker_start(worker_lifetime, true);
+    diag::log_tagged_fmt("mcp_srv", "start server worker accepted port=%d queued=%d", port, worker_lifetime->queued_worker.load(std::memory_order_acquire) ? 1 : 0);
 
     for (int i = 0; i < 500 && !_running.load() && !_server_done.load(std::memory_order_acquire) && !_stop_requested.load(); ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -1579,7 +1629,21 @@ void server_t::stop()
         diag::log_tagged_fmt("mcp_srv", "stop done worker_not_started");
         return;
     }
-    if (!on_server_worker && worker_lifetime->thread.joinable()) {
+    if (worker_lifetime->queued_worker.load(std::memory_order_acquire)) {
+        const std::uint64_t wait_start = mcp_now_ms();
+        while (!_server_done.load(std::memory_order_acquire) && !on_server_worker) {
+            const std::uint64_t elapsed = mcp_now_ms() - wait_start;
+            if ((elapsed % 10000) < 2) {
+                diag::log_tagged_fmt("mcp_srv", "stop queued_worker waiting elapsed_ms=%llu worker_tid=%u running=%d",
+                    static_cast<unsigned long long>(elapsed),
+                    static_cast<unsigned>(_server_worker_tid.load(std::memory_order_acquire)),
+                    _running.load(std::memory_order_acquire) ? 1 : 0);
+                log_work_queue_stats("stop queued_worker waiting");
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        erase_server_worker_lifetime(this, worker_lifetime);
+    } else if (!on_server_worker && worker_lifetime->thread.joinable()) {
         if (!worker_lifetime->thread.join_for(10000)) {
             diag::log_tagged_fmt("mcp_srv", "stop join timeout worker_tid=%u running=%d",
                 static_cast<unsigned>(_server_worker_tid.load(std::memory_order_acquire)),

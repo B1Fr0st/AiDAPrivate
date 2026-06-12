@@ -601,6 +601,95 @@ static void startup_log_critical_fmt(const char* fmt, ...)
     startup_log_critical(buf);
 }
 
+static void log_fileless_window_input_state(HWND hwnd, const char* phase, uint64_t frame_number)
+{
+    if (!fileless_launch_active())
+        return;
+    aida::manual_map_tls::ensure_current_thread();
+    RECT wr{};
+    BOOL rect_ok = ::GetWindowRect(hwnd, &wr);
+    DWORD rect_gle = rect_ok ? 0 : ::GetLastError();
+    POINT cursor{};
+    BOOL cursor_ok = ::GetCursorPos(&cursor);
+    DWORD cursor_gle = cursor_ok ? 0 : ::GetLastError();
+    DWORD qs = ::GetQueueStatus(QS_ALLINPUT);
+    DWORD qs_bits = static_cast<DWORD>(LOWORD(qs)) | static_cast<DWORD>(HIWORD(qs));
+    LONG_PTR style = ::GetWindowLongPtrW(hwnd, GWL_STYLE);
+    LONG_PTR exstyle = ::GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    diag::log_tagged_critical_fmt("input",
+        "fileless_window_state phase=%s frame=%llu hwnd=0x%llX visible=%d enabled=%d iconic=%d rect_ok=%d rect=%ld,%ld,%ld,%ld rect_gle=%lu cursor_ok=%d cursor=%ld,%ld cursor_gle=%lu fg=0x%llX active=0x%llX focus=0x%llX capture=0x%llX style=0x%llX exstyle=0x%llX qs=0x%08lX bits=0x%08lX tid=%lu",
+        phase ? phase : "<null>",
+        static_cast<unsigned long long>(frame_number),
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
+        ::IsWindowVisible(hwnd) ? 1 : 0,
+        ::IsWindowEnabled(hwnd) ? 1 : 0,
+        ::IsIconic(hwnd) ? 1 : 0,
+        rect_ok ? 1 : 0,
+        wr.left,
+        wr.top,
+        wr.right,
+        wr.bottom,
+        static_cast<unsigned long>(rect_gle),
+        cursor_ok ? 1 : 0,
+        cursor.x,
+        cursor.y,
+        static_cast<unsigned long>(cursor_gle),
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetForegroundWindow())),
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetActiveWindow())),
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetFocus())),
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetCapture())),
+        static_cast<unsigned long long>(style),
+        static_cast<unsigned long long>(exstyle),
+        static_cast<unsigned long>(qs),
+        static_cast<unsigned long>(qs_bits),
+        ::GetCurrentThreadId());
+}
+
+static void activate_fileless_window(HWND hwnd, const char* reason, uint64_t frame_number)
+{
+    if (!fileless_launch_active() || !::IsWindow(hwnd))
+        return;
+    aida::manual_map_tls::ensure_current_thread();
+    log_fileless_window_input_state(hwnd, reason ? reason : "activate_pre", frame_number);
+    ::SetLastError(0);
+    BOOL show_ok = ::ShowWindow(hwnd, ::IsIconic(hwnd) ? SW_RESTORE : SW_SHOW);
+    DWORD show_gle = ::GetLastError();
+    ::SetLastError(0);
+    BOOL pos_ok = ::SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+    DWORD pos_gle = ::GetLastError();
+    ::SetLastError(0);
+    BOOL bring_ok = ::BringWindowToTop(hwnd);
+    DWORD bring_gle = ::GetLastError();
+    ::SetLastError(0);
+    BOOL fg_ok = ::SetForegroundWindow(hwnd);
+    DWORD fg_gle = ::GetLastError();
+    ::SetLastError(0);
+    HWND prev_active = ::SetActiveWindow(hwnd);
+    DWORD active_gle = ::GetLastError();
+    ::SetLastError(0);
+    HWND prev_focus = ::SetFocus(hwnd);
+    DWORD focus_gle = ::GetLastError();
+    diag::log_tagged_critical_fmt("input",
+        "fileless_activate_window reason=%s frame=%llu hwnd=0x%llX show_prev_visible=%d show_gle=%lu pos_ok=%d pos_gle=%lu bring_ok=%d bring_gle=%lu fg_ok=%d fg_gle=%lu prev_active=0x%llX active_gle=%lu prev_focus=0x%llX focus_gle=%lu",
+        reason ? reason : "<null>",
+        static_cast<unsigned long long>(frame_number),
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
+        show_ok ? 1 : 0,
+        static_cast<unsigned long>(show_gle),
+        pos_ok ? 1 : 0,
+        static_cast<unsigned long>(pos_gle),
+        bring_ok ? 1 : 0,
+        static_cast<unsigned long>(bring_gle),
+        fg_ok ? 1 : 0,
+        static_cast<unsigned long>(fg_gle),
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(prev_active)),
+        static_cast<unsigned long>(active_gle),
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(prev_focus)),
+        static_cast<unsigned long>(focus_gle));
+    log_fileless_window_input_state(hwnd, "activate_post", frame_number);
+}
+
 static HANDLE& single_instance_mutex_handle()
 {
     static HANDLE h = nullptr;
@@ -901,6 +990,52 @@ namespace aida_tracer {
         constexpr DWORD queued_mask = QS_INPUT | QS_POSTMESSAGE | QS_ALLPOSTMESSAGE | QS_HOTKEY | QS_TIMER | QS_PAINT;
         DWORD bits = queue_status_bits(queue_status);
         return (bits & QS_SENDMESSAGE) != 0 && (bits & queued_mask) == 0;
+    }
+
+    inline bool fileless_send_nonurgent_queue(DWORD queue_status) {
+        return fileless_send_only_queue(queue_status);
+    }
+
+    inline UINT fileless_peek_remove_flags() {
+        return static_cast<UINT>(PM_REMOVE | PM_QS_INPUT | PM_QS_POSTMESSAGE | PM_QS_PAINT);
+    }
+
+    inline bool should_log_fileless_input_message(UINT msg) {
+        if (!fileless_launch_active())
+            return false;
+        switch (msg) {
+        case WM_SETFOCUS:
+        case WM_KILLFOCUS:
+        case WM_ACTIVATE:
+        case WM_ACTIVATEAPP:
+        case WM_MOUSEACTIVATE:
+        case WM_LBUTTONDOWN:
+        case WM_LBUTTONUP:
+        case WM_LBUTTONDBLCLK:
+        case WM_NCLBUTTONDOWN:
+        case WM_NCLBUTTONUP:
+        case WM_RBUTTONDOWN:
+        case WM_RBUTTONUP:
+        case WM_MBUTTONDOWN:
+        case WM_MBUTTONUP:
+        case WM_CAPTURECHANGED:
+            return true;
+        case WM_NCHITTEST:
+        case WM_SETCURSOR:
+        {
+            static std::atomic<uint64_t> s_hit_cursor_logs{0};
+            uint64_t n = s_hit_cursor_logs.fetch_add(1, std::memory_order_acq_rel) + 1;
+            return n <= 32 || (n % 300ULL) == 0ULL;
+        }
+        case WM_MOUSEMOVE:
+        {
+            static std::atomic<uint64_t> s_mousemove_logs{0};
+            uint64_t n = s_mousemove_logs.fetch_add(1, std::memory_order_acq_rel) + 1;
+            return n <= 16 || (n % 300ULL) == 0ULL;
+        }
+        default:
+            return false;
+        }
     }
 
     inline void set_wndproc_state(const char* stage, HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -2284,7 +2419,8 @@ static LONG CALLBACK aida_diagnostic_veh(EXCEPTION_POINTERS* ep)
     if (!ep || !ep->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     if (code == STATUS_SINGLE_STEP &&
-        anti_tamper::anti_dump::read_intercept::consume_pending_single_step(ep, "diagnostic_veh"))
+        (anti_tamper::anti_dump::read_intercept::consume_pending_single_step(ep, "diagnostic_veh") ||
+            anti_tamper::anti_dump::read_intercept::consume_orphan_single_step(ep, "diagnostic_veh_orphan")))
     {
         return EXCEPTION_CONTINUE_EXECUTION;
     }
@@ -2575,7 +2711,8 @@ int main(int, char**)
     SetUnhandledExceptionFilter([](EXCEPTION_POINTERS* ep) -> LONG {
         if (ep && ep->ExceptionRecord &&
             ep->ExceptionRecord->ExceptionCode == STATUS_SINGLE_STEP &&
-            anti_tamper::anti_dump::read_intercept::consume_pending_single_step(ep, "unhandled_filter"))
+            (anti_tamper::anti_dump::read_intercept::consume_pending_single_step(ep, "unhandled_filter") ||
+                anti_tamper::anti_dump::read_intercept::consume_orphan_single_step(ep, "unhandled_filter_orphan")))
         {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
@@ -2620,6 +2757,7 @@ int main(int, char**)
             "R8=%016llX R9=%016llX R10=%016llX R11=%016llX\n"
             "R12=%016llX R13=%016llX R14=%016llX R15=%016llX\n"
             "Rip=%016llX\n"
+            "EFlags=%08lX Dr6=%016llX Dr7=%016llX\n"
             "Stack: %s\n"
             "TestAllSnapshot=%s\n"
             "LastError=%lu\n",
@@ -2643,6 +2781,9 @@ int main(int, char**)
             ep->ContextRecord->R12, ep->ContextRecord->R13,
             ep->ContextRecord->R14, ep->ContextRecord->R15,
             ep->ContextRecord->Rip,
+            static_cast<unsigned long>(ep->ContextRecord->EFlags),
+            static_cast<unsigned long long>(ep->ContextRecord->Dr6),
+            static_cast<unsigned long long>(ep->ContextRecord->Dr7),
             stack_buf,
             test_all_snapshot,
             GetLastError());
@@ -2869,6 +3010,7 @@ int main(int, char**)
     startup_log_critical_fmt("show_window_post hwnd=0x%llX last_err=%lu",
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
         static_cast<unsigned long>(GetLastError()));
+    activate_fileless_window(hwnd, "post_show_window", 0);
     crash_log_write("window_shown_acrylic_set");
 
     {
@@ -3348,16 +3490,16 @@ int main(int, char**)
         {
             aida_tracer::mark_render_phase("peek_message_call");
             DWORD queue_status_before = ::GetQueueStatus(QS_ALLINPUT);
-            const UINT peek_remove_flags = static_cast<UINT>(PM_REMOVE);
+            const UINT peek_remove_flags = fileless_customer_launch ? aida_tracer::fileless_peek_remove_flags() : static_cast<UINT>(PM_REMOVE);
             HWND peek_filter = nullptr;
             ::SetLastError(0);
             aida_tracer::set_peek_state(queue_status_before, 0);
             aida_tracer::set_peek_call_shape(peek_remove_flags, peek_filter);
-            if (fileless_customer_launch && aida_tracer::fileless_send_only_queue(queue_status_before)) {
+            if (fileless_customer_launch && aida_tracer::fileless_send_nonurgent_queue(queue_status_before)) {
                 uint64_t defer_count = aida_tracer::g_peek_fileless_send_only_defers.fetch_add(1, std::memory_order_acq_rel) + 1;
                 if (defer_count == 1 || (defer_count % 120ULL) == 0ULL) {
                     diag::log_tagged_critical_fmt("msgpump",
-                        "fileless_send_only_deferred frame=%llu count=%llu qs=0x%08lX bits=0x%08lX flags=0x%08X hwnd=0x%llX tid=%lu",
+                        "fileless_send_nonurgent_deferred frame=%llu count=%llu qs=0x%08lX bits=0x%08lX flags=0x%08X hwnd=0x%llX tid=%lu",
                         (unsigned long long)frame_number,
                         (unsigned long long)defer_count,
                         static_cast<unsigned long>(queue_status_before),
@@ -3398,7 +3540,8 @@ int main(int, char**)
                 msg.message == WM_NCDESTROY || msg.message == WM_QUIT ||
                 msg.message == WM_SYSCOMMAND || msg.message == WM_LBUTTONDOWN ||
                 msg.message == WM_LBUTTONUP || msg.message == WM_NCLBUTTONDOWN ||
-                msg.message == WM_NCLBUTTONUP || msg.message == WM_MOUSEACTIVATE;
+                msg.message == WM_NCLBUTTONUP || msg.message == WM_MOUSEACTIVATE ||
+                aida_tracer::should_log_fileless_input_message(msg.message);
             if (close_related_msg) {
                 POINT cursor{};
                 GetCursorPos(&cursor);
@@ -3633,6 +3776,7 @@ int main(int, char**)
 
         static bool fileless_ide_region_applied = false;
         static bool fileless_ide_region_defer_logged = false;
+        static bool fileless_ide_activation_done = false;
         if (iw != prev_w || ih != prev_h)
         {
             const bool defer_fileless_ide_region = fileless_customer_launch &&
@@ -3722,6 +3866,14 @@ int main(int, char**)
                     ih,
                     globals::ui::maximized ? 1 : 0);
             }
+        }
+
+        if (fileless_customer_launch &&
+            cur_state == 3 &&
+            fileless_ide_region_applied &&
+            !fileless_ide_activation_done) {
+            fileless_ide_activation_done = true;
+            activate_fileless_window(hwnd, "fileless_ide_region_ready", frame_number);
         }
 
         if (frame_number < 5)
@@ -4053,7 +4205,8 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         if (elapsed >= 50 || msg == WM_CLOSE || msg == WM_DESTROY || msg == WM_NCDESTROY ||
             msg == WM_SYSCOMMAND || msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP ||
             msg == WM_NCLBUTTONDOWN || msg == WM_NCLBUTTONUP || msg == WM_MOUSEACTIVATE ||
-            msg == WM_DPICHANGED || msg == WM_SETTINGCHANGE) {
+            msg == WM_DPICHANGED || msg == WM_SETTINGCHANGE ||
+            aida_tracer::should_log_fileless_input_message(msg)) {
             POINT cursor{};
             GetCursorPos(&cursor);
             diag::log_tagged_critical_fmt("wndproc",

@@ -43,6 +43,42 @@ void add_capture(std::vector<store::heap_capture_t>& out,
         out.push_back(std::move(cap));
 }
 
+bool append_focus_captures(store::heap_session_t& session, const json& params)
+{
+    std::uint64_t va = 0;
+    if (!parse_address_param(params, "focus_va", va) && !parse_address_param(params, "capture_va", va) && !parse_address_param(params, "allocation_va", va))
+        return false;
+    std::uint64_t size = numeric_param(params, "focus_size", 0, 0, 0x7FFFFFFF);
+    if (size == 0)
+        size = numeric_param(params, "allocation_size", 0, 0, 0x7FFFFFFF);
+    if (size == 0)
+    {
+        driver_bridge::memory_region_t region{};
+        if (query_region(session.pid, va, region) && region.base + region.size > va)
+            size = region.base + region.size - va;
+    }
+    const std::uint32_t count = static_cast<std::uint32_t>(numeric_param(params, "focus_count", 1, 1, 4096));
+    std::uint64_t stride = numeric_param(params, "focus_stride", size, 0, 0x7FFFFFFF);
+    if (stride == 0)
+        stride = size;
+    std::set<std::uint64_t> existing;
+    for (const auto& cap : session.captures)
+        existing.insert(cap.va);
+    const std::size_t before = session.captures.size();
+    for (std::uint32_t i = 0; i < count && session.captures.size() < session.max_captures; ++i)
+    {
+        const std::uint64_t current = va + static_cast<std::uint64_t>(i) * stride;
+        if (current == 0 || existing.count(current) != 0)
+            continue;
+        driver_bridge::memory_region_t region{};
+        if (!query_region(session.pid, current, region) || !is_readable(region))
+            continue;
+        existing.insert(current);
+        add_capture(session.captures, session, current, size);
+    }
+    return session.captures.size() > before;
+}
+
 std::vector<store::heap_capture_t> sample_heap(std::uint32_t pid, const store::heap_session_t& session, std::size_t max_entries)
 {
     std::vector<store::heap_capture_t> out;
@@ -637,7 +673,9 @@ tool_result_t start_session(const json& params)
     session.started_ms = unix_time_ms();
     session.rtl_allocate_heap = resolve_rtl_allocate_heap(scope.pid());
     session.hw_slot = snapshot_backend_requested(backend) ? -1 : static_cast<int>(numeric_param(params, "hw_slot", 2, 0, 3));
-    session.baseline = sample_heap(scope.pid(), session, session.max_captures);
+    const bool skip_initial_snapshot = bool_param(params, "skip_initial_snapshot", false) || bool_param(params, "empty_baseline", false);
+    if (!skip_initial_snapshot)
+        session.baseline = sample_heap(scope.pid(), session, session.max_captures);
 
     const bool require_event = event_backend_required(backend);
     if (!snapshot_backend_requested(backend) && session.rtl_allocate_heap == 0)
@@ -700,7 +738,8 @@ tool_result_t start_session(const json& params)
         {"rtl_allocate_heap_resolved", session.rtl_allocate_heap != 0},
         {"debug_event_consumer", event_started},
         {"return_value_capture", event_started},
-        {"snapshot_baseline_count", session.baseline.size()}
+        {"snapshot_baseline_count", session.baseline.size()},
+        {"snapshot_baseline_skipped", skip_initial_snapshot}
     };
     return tool_result_t::ok(event_started ? "Heap tracking session started with RtlAllocateHeap return capture." : "Heap tracking session started in snapshot-diff mode.", result);
 }
@@ -717,8 +756,15 @@ tool_result_t results_session(const json& params)
     if (!scope.ok())
         return tool_result_t::error(scope.error());
 
+    const bool focus_only = bool_param(params, "focus_only", false) || bool_param(params, "bounded_only", false);
+    const bool focused = append_focus_captures(session, params);
     if (session.hw_slot < 0 || session.tids.empty())
-        append_snapshot_diff(session);
+    {
+        if (!focus_only)
+            append_snapshot_diff(session);
+        else
+            store::update_heap_session(session);
+    }
     else
         store::find_heap_session(id, session);
 
@@ -735,7 +781,9 @@ tool_result_t results_session(const json& params)
         {"snapshot_diff_baseline_count", session.baseline.size()},
         {"allocation_size_estimates", true},
         {"heap_membership_checked", true},
-        {"synthetic_breakpoint_events", false}
+        {"synthetic_breakpoint_events", false},
+        {"bounded_focus_capture", focused},
+        {"bounded_focus_only", focus_only}
     };
     return tool_result_t::ok(result);
 }

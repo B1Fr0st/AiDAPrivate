@@ -15,6 +15,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -155,6 +156,41 @@ void ensure_dir(const std::string& dir)
 {
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
+}
+
+bool reset_store_after_load_failure(const std::string& path, const char* reason)
+{
+    auto& s = state();
+    const uint64_t stamp = now_ms();
+    std::string quarantine_path;
+    std::error_code ec;
+    if (std::filesystem::exists(path, ec)) {
+        quarantine_path = path + ".bad." + std::to_string(stamp);
+        std::filesystem::rename(path, quarantine_path, ec);
+        if (ec) {
+            std::error_code copy_ec;
+            std::filesystem::copy_file(path, quarantine_path, std::filesystem::copy_options::overwrite_existing, copy_ec);
+            if (!copy_ec) {
+                std::error_code remove_ec;
+                std::filesystem::remove(path, remove_ec);
+                ec = remove_ec;
+            }
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(s.mtx);
+        s.items.clear();
+        s.dedupe_keys.clear();
+        s.next_id.store(1);
+    }
+    set_err(std::string("issue_store.load: ") + (reason ? reason : "invalid store"));
+    diag::log_tagged_fmt("issue", "load_from_disk reset_store reason=%s quarantine=%s quarantine_err=%s",
+        reason ? reason : "<null>",
+        quarantine_path.empty() ? "<none>" : quarantine_path.c_str(),
+        ec ? ec.message().c_str() : "<none>");
+    bool saved = save_to_disk();
+    diag::log_tagged_fmt("issue", "load_from_disk reset_store_saved=%d", saved ? 1 : 0);
+    return saved;
 }
 
 nlohmann::json evidence_to_json(const evidence_t& e)
@@ -478,67 +514,88 @@ bool load_from_disk()
     std::string raw((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     if (raw.empty()) {
         diag::log_tagged_fmt("issue", "load_from_disk file_empty");
-        return false;
+        return reset_store_after_load_failure(path, "empty file");
     }
     diag::log_tagged_fmt("issue", "load_from_disk raw_bytes=%zu", raw.size());
-    nlohmann::json doc;
-    try { doc = nlohmann::json::parse(raw); }
-    catch (...) {
-        diag::log_tagged_fmt("issue", "load_from_disk parse_failed");
-        set_err("issue_store.load: parse failed");
-        return false;
-    }
-    if (!doc.is_object() || !doc.contains("issues") || !doc["issues"].is_array()) {
-        diag::log_tagged_fmt("issue", "load_from_disk invalid_schema");
-        return false;
-    }
-    std::vector<issue_t> loaded;
-    std::unordered_set<std::string> keys;
-    for (const auto& j : doc["issues"]) {
-        if (!j.is_object()) continue;
-        issue_t it;
-        if (j.contains("id") && j["id"].is_number_unsigned()) it.id = j["id"].get<uint64_t>();
-        if (j.contains("type_key") && j["type_key"].is_string()) it.type_key = j["type_key"].get<std::string>();
-        if (j.contains("name") && j["name"].is_string()) it.name = j["name"].get<std::string>();
-        if (j.contains("description") && j["description"].is_string()) it.description = j["description"].get<std::string>();
-        if (j.contains("remediation") && j["remediation"].is_string()) it.remediation = j["remediation"].get<std::string>();
-        if (j.contains("cwe") && j["cwe"].is_array()) {
-            for (const auto& c : j["cwe"]) if (c.is_string()) it.cwe.push_back(c.get<std::string>());
+    try {
+        nlohmann::json doc = nlohmann::json::parse(raw);
+        if (!doc.is_object() || !doc.contains("issues") || !doc["issues"].is_array()) {
+            diag::log_tagged_fmt("issue", "load_from_disk invalid_schema");
+            return reset_store_after_load_failure(path, "invalid schema");
         }
-        if (j.contains("severity")   && j["severity"].is_string())   parse_severity(j["severity"].get<std::string>(), it.severity);
-        if (j.contains("confidence") && j["confidence"].is_string()) parse_confidence(j["confidence"].get<std::string>(), it.confidence);
-        if (j.contains("scheme") && j["scheme"].is_string()) it.scheme = j["scheme"].get<std::string>();
-        if (j.contains("host")   && j["host"].is_string())   it.host   = j["host"].get<std::string>();
-        if (j.contains("port")   && j["port"].is_number_unsigned()) it.port = static_cast<uint16_t>(j["port"].get<unsigned int>());
-        if (j.contains("path")   && j["path"].is_string()) it.path = j["path"].get<std::string>();
-        if (j.contains("parameter")       && j["parameter"].is_string())       it.parameter       = j["parameter"].get<std::string>();
-        if (j.contains("insertion_point") && j["insertion_point"].is_string()) it.insertion_point = j["insertion_point"].get<std::string>();
-        if (j.contains("seen_ms")         && j["seen_ms"].is_number_unsigned()) it.seen_ms        = j["seen_ms"].get<uint64_t>();
-        if (j.contains("src_exchange_id") && j["src_exchange_id"].is_number_unsigned()) it.src_exchange_id = j["src_exchange_id"].get<uint64_t>();
-        if (j.contains("audit_id")        && j["audit_id"].is_number_unsigned()) it.audit_id = j["audit_id"].get<uint64_t>();
-        if (j.contains("evidence") && j["evidence"].is_array()) {
-            for (const auto& je : j["evidence"]) {
-                evidence_t ev;
-                if (evidence_from_json(je, ev)) it.evidence.push_back(std::move(ev));
+        std::vector<issue_t> loaded;
+        std::unordered_set<std::string> keys;
+        size_t skipped = 0;
+        for (const auto& j : doc["issues"]) {
+            if (!j.is_object()) {
+                ++skipped;
+                continue;
+            }
+            try {
+                issue_t it;
+                if (j.contains("id") && j["id"].is_number_unsigned()) it.id = j["id"].get<uint64_t>();
+                if (j.contains("type_key") && j["type_key"].is_string()) it.type_key = j["type_key"].get<std::string>();
+                if (j.contains("name") && j["name"].is_string()) it.name = j["name"].get<std::string>();
+                if (j.contains("description") && j["description"].is_string()) it.description = j["description"].get<std::string>();
+                if (j.contains("remediation") && j["remediation"].is_string()) it.remediation = j["remediation"].get<std::string>();
+                if (j.contains("cwe") && j["cwe"].is_array()) {
+                    for (const auto& c : j["cwe"]) if (c.is_string()) it.cwe.push_back(c.get<std::string>());
+                }
+                if (j.contains("severity")   && j["severity"].is_string())   parse_severity(j["severity"].get<std::string>(), it.severity);
+                if (j.contains("confidence") && j["confidence"].is_string()) parse_confidence(j["confidence"].get<std::string>(), it.confidence);
+                if (j.contains("scheme") && j["scheme"].is_string()) it.scheme = j["scheme"].get<std::string>();
+                if (j.contains("host")   && j["host"].is_string())   it.host   = j["host"].get<std::string>();
+                if (j.contains("port")   && j["port"].is_number_unsigned()) {
+                    const auto port = j["port"].get<uint64_t>();
+                    if (port <= 65535ull) it.port = static_cast<uint16_t>(port);
+                }
+                if (j.contains("path")   && j["path"].is_string()) it.path = j["path"].get<std::string>();
+                if (j.contains("parameter")       && j["parameter"].is_string())       it.parameter       = j["parameter"].get<std::string>();
+                if (j.contains("insertion_point") && j["insertion_point"].is_string()) it.insertion_point = j["insertion_point"].get<std::string>();
+                if (j.contains("seen_ms")         && j["seen_ms"].is_number_unsigned()) it.seen_ms        = j["seen_ms"].get<uint64_t>();
+                if (j.contains("src_exchange_id") && j["src_exchange_id"].is_number_unsigned()) it.src_exchange_id = j["src_exchange_id"].get<uint64_t>();
+                if (j.contains("audit_id")        && j["audit_id"].is_number_unsigned()) it.audit_id = j["audit_id"].get<uint64_t>();
+                if (j.contains("evidence") && j["evidence"].is_array()) {
+                    for (const auto& je : j["evidence"]) {
+                        evidence_t ev;
+                        try {
+                            if (evidence_from_json(je, ev)) it.evidence.push_back(std::move(ev));
+                        } catch (...) {
+                            diag::log_tagged_fmt("issue", "load_from_disk evidence_skipped");
+                        }
+                    }
+                }
+                keys.insert(build_dedupe_key(it));
+                loaded.push_back(std::move(it));
+            } catch (const std::exception& ex) {
+                ++skipped;
+                diag::log_tagged_fmt("issue", "load_from_disk issue_skipped exception=%s", ex.what());
+            } catch (...) {
+                ++skipped;
+                diag::log_tagged_fmt("issue", "load_from_disk issue_skipped exception=unknown");
             }
         }
-        keys.insert(build_dedupe_key(it));
-        loaded.push_back(std::move(it));
+        uint64_t next = 1;
+        if (doc.contains("next_id") && doc["next_id"].is_number_unsigned()) next = doc["next_id"].get<uint64_t>();
+        for (const auto& it : loaded) if (it.id >= next) next = it.id + 1;
+        diag::log_tagged_fmt("issue", "load_from_disk parsed_count=%zu skipped=%zu next_id=%llu", loaded.size(), skipped, static_cast<unsigned long long>(next));
+        {
+            std::lock_guard<std::mutex> lk(s.mtx);
+            s.items = std::move(loaded);
+            s.dedupe_keys = std::move(keys);
+            s.next_id.store(next);
+        }
+        diag::log_tagged_fmt("burp", "issue_store loaded count=%zu next_id=%llu",
+            s.items.size(), static_cast<unsigned long long>(next));
+        diag::log_tagged_fmt("issue", "load_from_disk ok count=%zu next_id=%llu", s.items.size(), static_cast<unsigned long long>(next));
+        return true;
+    } catch (const std::exception& ex) {
+        diag::log_tagged_fmt("issue", "load_from_disk parse_or_schema_exception=%s", ex.what());
+        return reset_store_after_load_failure(path, "parse or schema exception");
+    } catch (...) {
+        diag::log_tagged_fmt("issue", "load_from_disk parse_or_schema_exception=unknown");
+        return reset_store_after_load_failure(path, "parse or schema exception");
     }
-    uint64_t next = 1;
-    if (doc.contains("next_id") && doc["next_id"].is_number_unsigned()) next = doc["next_id"].get<uint64_t>();
-    for (const auto& it : loaded) if (it.id >= next) next = it.id + 1;
-    diag::log_tagged_fmt("issue", "load_from_disk parsed_count=%zu next_id=%llu", loaded.size(), static_cast<unsigned long long>(next));
-    {
-        std::lock_guard<std::mutex> lk(s.mtx);
-        s.items = std::move(loaded);
-        s.dedupe_keys = std::move(keys);
-        s.next_id.store(next);
-    }
-    diag::log_tagged_fmt("burp", "issue_store loaded count=%zu next_id=%llu",
-        s.items.size(), static_cast<unsigned long long>(next));
-    diag::log_tagged_fmt("issue", "load_from_disk ok count=%zu next_id=%llu", s.items.size(), static_cast<unsigned long long>(next));
-    return true;
 }
 
 std::string last_error()

@@ -19,6 +19,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <exception>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -56,14 +57,15 @@ struct state_t
     std::atomic<uint64_t>                                                 next_id{1};
     std::atomic<size_t>                                                   global_in_flight{0};
     std::atomic<bool>                                                     initialized{false};
+    std::atomic<bool>                                                     shutting_down{false};
     std::mutex                                                            err_mtx;
     std::string                                                           last_error;
 };
 
 state_t& state()
 {
-    static state_t s;
-    return s;
+    static state_t* s = new state_t();
+    return *s;
 }
 
 void set_err(const std::string& msg)
@@ -358,9 +360,11 @@ bool initialize()
     auto& s = state();
     bool expected = false;
     if (!s.initialized.compare_exchange_strong(expected, true)) {
-        diag::log_tagged_fmt("scanner", "active_scanner already_initialized");
-        return true;
+        const bool stopping = s.shutting_down.load(std::memory_order_acquire);
+        diag::log_tagged_fmt("scanner", "active_scanner already_initialized shutting_down=%d", stopping ? 1 : 0);
+        return !stopping;
     }
+    s.shutting_down.store(false, std::memory_order_release);
     diag::log_tagged_fmt("scanner", "active_scanner initialize success");
     return true;
 }
@@ -373,6 +377,11 @@ void shutdown()
         diag::log_tagged_fmt("scanner", "active_scanner shutdown skipped not_initialized");
         return;
     }
+    bool expected = false;
+    if (!s.shutting_down.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        diag::log_tagged_fmt("scanner", "active_scanner shutdown skipped already_shutting_down");
+        return;
+    }
     std::vector<std::shared_ptr<audit_runtime_t>> alive;
     {
         std::lock_guard<std::mutex> lk(s.audits_mtx);
@@ -381,8 +390,9 @@ void shutdown()
     diag::log_tagged_fmt("scanner", "active_scanner shutdown cancelling %zu audits", alive.size());
     for (auto& rt : alive) rt->cancel_flag.store(true);
     auto t0 = std::chrono::steady_clock::now();
+    bool all_done = false;
     while (true) {
-        bool all_done = true;
+        all_done = true;
         for (auto& rt : alive) {
             std::lock_guard<std::mutex> lk(rt->status_mtx);
             if (rt->status.running) { all_done = false; break; }
@@ -394,6 +404,14 @@ void shutdown()
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
+    if (all_done) {
+        std::lock_guard<std::mutex> lk(s.audits_mtx);
+        s.audits.clear();
+        s.initialized.store(false, std::memory_order_release);
+        s.shutting_down.store(false, std::memory_order_release);
+    } else {
+        diag::log_tagged_fmt("scanner", "active_scanner shutdown incomplete audits=%zu", alive.size());
+    }
     diag::log_tagged_fmt("scanner", "active_scanner shutdown complete");
 }
 
@@ -404,7 +422,16 @@ uint64_t enqueue_target(const std::vector<uint8_t>& raw_request,
     diag::log_tagged_fmt("scanner", "enqueue_target url=%s req_len=%zu scope_only=%d timeout=%d modules=%zu",
         url.c_str(), raw_request.size(), cfg.scope_only ? 1 : 0, cfg.timeout_ms, cfg.enabled_modules.size());
     auto& s = state();
-    if (!s.initialized.load()) initialize();
+    if (!s.initialized.load() && !initialize()) {
+        diag::log_tagged_fmt("scanner", "enqueue_target rejected initialize_failed");
+        set_err("active_scanner.enqueue: initialization failed");
+        return 0;
+    }
+    if (s.shutting_down.load(std::memory_order_acquire)) {
+        diag::log_tagged_fmt("scanner", "enqueue_target rejected shutting_down");
+        set_err("active_scanner.enqueue: scanner is shutting down");
+        return 0;
+    }
     if (raw_request.empty() || url.empty()) {
         diag::log_tagged_fmt("scanner", "enqueue_target rejected empty_request=%d empty_url=%d",
             raw_request.empty() ? 1 : 0, url.empty() ? 1 : 0);
@@ -434,16 +461,48 @@ uint64_t enqueue_target(const std::vector<uint8_t>& raw_request,
     rt->status.tls = (scheme == "https");
     rt->status.running = true;
     rt->status.started_ms = now_ms();
-    {
+    try {
         std::lock_guard<std::mutex> lk(s.audits_mtx);
-        s.audits[rt->status.id] = rt;
+        auto inserted = s.audits.emplace(rt->status.id, rt);
+        if (!inserted.second) {
+            diag::log_tagged_fmt("scanner", "enqueue_target rejected duplicate_id=%llu", static_cast<unsigned long long>(rt->status.id));
+            set_err("active_scanner.enqueue: duplicate audit id");
+            return 0;
+        }
+    } catch (const std::exception& ex) {
+        diag::log_tagged_fmt("scanner", "enqueue_target audit_map_insert_exception id=%llu err=%s",
+            static_cast<unsigned long long>(rt->status.id), ex.what());
+        set_err("active_scanner.enqueue: audit registration failed");
+        return 0;
+    } catch (...) {
+        diag::log_tagged_fmt("scanner", "enqueue_target audit_map_insert_exception id=%llu err=unknown",
+            static_cast<unsigned long long>(rt->status.id));
+        set_err("active_scanner.enqueue: audit registration failed");
+        return 0;
     }
 
     diag::log_tagged_fmt("scanner", "enqueue_target queued audit_id=%llu host=%s port=%u tls=%d",
         static_cast<unsigned long long>(rt->status.id), host.c_str(), port, rt->status.tls ? 1 : 0);
 
     std::shared_ptr<audit_runtime_t> captured = rt;
-    work_queue::post([captured]() { run_audit(captured); });
+    const bool posted = work_queue::post([captured]() { run_audit(captured); });
+    if (!posted) {
+        {
+            std::lock_guard<std::mutex> lk(rt->status_mtx);
+            rt->status.running = false;
+            rt->status.cancelled = true;
+            rt->status.ended_ms = now_ms();
+        }
+        rt->cancel_flag.store(true, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lk(s.audits_mtx);
+            s.audits.erase(rt->status.id);
+        }
+        diag::log_tagged_fmt("scanner", "enqueue_target worker_post_failed audit_id=%llu",
+            static_cast<unsigned long long>(rt->status.id));
+        set_err("active_scanner.enqueue: worker queue unavailable");
+        return 0;
+    }
 
     return rt->status.id;
 }

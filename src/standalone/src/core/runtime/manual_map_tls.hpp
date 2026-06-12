@@ -33,6 +33,33 @@ inline INIT_ONCE g_layout_once = INIT_ONCE_STATIC_INIT;
 inline layout_t g_layout;
 inline INIT_ONCE g_fls_once = INIT_ONCE_STATIC_INIT;
 inline DWORD g_fls_index = FLS_OUT_OF_INDEXES;
+constexpr std::uintptr_t block_magic = 0x41494441544C5331ull;
+constexpr SIZE_T block_alignment = 64;
+
+struct block_header_t
+{
+    std::uintptr_t magic = block_magic;
+    void* allocation = nullptr;
+    SIZE_T data_size = 0;
+    SIZE_T allocation_size = 0;
+};
+
+inline SIZE_T align_up(SIZE_T value, SIZE_T alignment) noexcept
+{
+    if (alignment == 0)
+        return value;
+    SIZE_T mask = alignment - 1;
+    if ((alignment & mask) != 0)
+        return value;
+    if (value > (std::numeric_limits<SIZE_T>::max)() - mask)
+        return 0;
+    return (value + mask) & ~mask;
+}
+
+inline SIZE_T data_offset() noexcept
+{
+    return align_up(sizeof(block_header_t), block_alignment);
+}
 
 inline BOOL CALLBACK initialize_layout_once(PINIT_ONCE, PVOID, PVOID*) noexcept
 {
@@ -155,49 +182,65 @@ inline bool read_pointer(void* address, void** value) noexcept
 #endif
 }
 
-inline void* allocation_from_tls_data(void* value) noexcept
+inline block_header_t* header_from_tls_data(void* value) noexcept
 {
     if (!value || poison_pointer(value))
         return nullptr;
     auto data = reinterpret_cast<std::uintptr_t>(value);
-    if (data < sizeof(void*))
+    SIZE_T offset = data_offset();
+    if (offset == 0 || data < offset)
         return nullptr;
-    auto* header = reinterpret_cast<void*>(data - sizeof(void*));
-    if (!committed_readable(header, sizeof(void*)))
+    auto* header = reinterpret_cast<block_header_t*>(data - offset);
+    if (!committed_readable(header, sizeof(block_header_t)))
         return nullptr;
-    void* allocation = nullptr;
-    if (!read_pointer(header, &allocation) || !allocation || poison_pointer(allocation))
+    if (header->magic != block_magic)
         return nullptr;
-    auto alloc = reinterpret_cast<std::uintptr_t>(allocation);
-    if (data < alloc || data - alloc != sizeof(void*))
+    if (!header->allocation || poison_pointer(header->allocation))
         return nullptr;
-    return allocation;
+    if (header->allocation != header)
+        return nullptr;
+    if (header->data_size == 0 || header->allocation_size < offset)
+        return nullptr;
+    if (header->data_size > (std::numeric_limits<SIZE_T>::max)() - offset)
+        return nullptr;
+    if (header->allocation_size < offset + header->data_size)
+        return nullptr;
+    return header;
+}
+
+inline void* allocation_from_tls_data(void* value) noexcept
+{
+    block_header_t* header = header_from_tls_data(value);
+    return header ? header->allocation : nullptr;
 }
 
 inline bool valid_tls_block(void* value, SIZE_T size) noexcept
 {
     if (!committed_readable(value, size))
         return false;
-    void* allocation = allocation_from_tls_data(value);
-    if (!allocation)
+    block_header_t* header = header_from_tls_data(value);
+    if (!header || header->data_size < size)
         return false;
-    HANDLE heap = GetProcessHeap();
-    return heap && HeapValidate(heap, 0, allocation);
+    return true;
 }
 
 inline void* allocate_tls_block(const layout_t& layout) noexcept
 {
-    if (layout.total_size > std::numeric_limits<SIZE_T>::max() - sizeof(void*))
+    SIZE_T offset = data_offset();
+    if (offset == 0)
         return nullptr;
-    HANDLE heap = GetProcessHeap();
-    if (!heap)
+    if (layout.total_size > (std::numeric_limits<SIZE_T>::max)() - offset)
         return nullptr;
-    auto bytes = layout.total_size + sizeof(void*);
-    auto* allocation = static_cast<unsigned char*>(HeapAlloc(heap, HEAP_ZERO_MEMORY, bytes));
+    SIZE_T bytes = offset + layout.total_size;
+    auto* allocation = static_cast<unsigned char*>(VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
     if (!allocation)
         return nullptr;
-    *reinterpret_cast<void**>(allocation) = allocation;
-    auto* data = allocation + sizeof(void*);
+    auto* header = reinterpret_cast<block_header_t*>(allocation);
+    header->magic = block_magic;
+    header->allocation = allocation;
+    header->data_size = layout.total_size;
+    header->allocation_size = bytes;
+    auto* data = allocation + offset;
     if (layout.raw && layout.raw_size)
         std::memcpy(data, layout.raw, layout.raw_size);
     return data;
@@ -205,10 +248,42 @@ inline void* allocate_tls_block(const layout_t& layout) noexcept
 
 inline void NTAPI cleanup(void* value) noexcept
 {
-    void* allocation = allocation_from_tls_data(value);
-    HANDLE heap = GetProcessHeap();
-    if (allocation && heap && HeapValidate(heap, 0, allocation))
-        HeapFree(heap, 0, allocation);
+    DWORD fls = g_fls_index;
+    if (fls != FLS_OUT_OF_INDEXES)
+    {
+#if defined(_MSC_VER)
+        __try
+        {
+            if (FlsGetValue(fls) == value)
+                FlsSetValue(fls, nullptr);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+#else
+        if (FlsGetValue(fls) == value)
+            FlsSetValue(fls, nullptr);
+#endif
+    }
+    block_header_t* header = nullptr;
+#if defined(_MSC_VER)
+    __try
+    {
+        header = header_from_tls_data(value);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        header = nullptr;
+    }
+#else
+    header = header_from_tls_data(value);
+#endif
+    if (!header)
+        return;
+    void* allocation = header->allocation;
+    header->magic = 0;
+    if (allocation)
+        VirtualFree(allocation, 0, MEM_RELEASE);
 }
 
 inline bool read_vector_slot(void** vector, DWORD index, void** value) noexcept

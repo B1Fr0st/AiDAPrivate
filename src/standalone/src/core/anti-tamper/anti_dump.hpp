@@ -1029,6 +1029,125 @@ namespace read_intercept
         return v;
     }
 
+    inline std::atomic<uint64_t>& orphan_single_step_grace_until_ms()
+    {
+        static std::atomic<uint64_t> v{0};
+        return v;
+    }
+
+    inline std::atomic<uint64_t>& orphan_single_step_count()
+    {
+        static std::atomic<uint64_t> v{0};
+        return v;
+    }
+
+    inline void arm_orphan_single_step_grace(uint64_t duration_ms)
+    {
+        if (duration_ms == 0)
+            return;
+        const uint64_t now = static_cast<uint64_t>(GetTickCount64());
+        const uint64_t until = now + duration_ms;
+        auto& slot = orphan_single_step_grace_until_ms();
+        uint64_t cur = slot.load(std::memory_order_acquire);
+        while (cur < until &&
+            !slot.compare_exchange_weak(cur, until, std::memory_order_acq_rel, std::memory_order_acquire))
+        {
+        }
+    }
+
+    inline bool address_in_current_image(uint64_t address)
+    {
+        HMODULE mod = GetModuleHandleW(nullptr);
+        if (!mod)
+            return false;
+
+        auto* base = reinterpret_cast<uint8_t*>(mod);
+        __try
+        {
+            auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+            if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+                return false;
+            if (dos->e_lfanew <= 0 || static_cast<uint32_t>(dos->e_lfanew) > 0x10000u)
+                return false;
+            auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+            if (nt->Signature != IMAGE_NT_SIGNATURE)
+                return false;
+            const uint64_t image_base = reinterpret_cast<uint64_t>(base);
+            const uint64_t image_size = nt->OptionalHeader.SizeOfImage;
+            return image_size != 0 && address >= image_base && address < image_base + image_size;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
+    inline bool address_in_trusted_system_image(uint64_t address)
+    {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(reinterpret_cast<void*>(address), &mbi, sizeof(mbi)) == 0)
+            return false;
+        if (mbi.State != MEM_COMMIT || mbi.Type != MEM_IMAGE)
+            return false;
+        const DWORD protect = mbi.Protect & 0xFFu;
+        if ((mbi.Protect & PAGE_GUARD) != 0 || protect == PAGE_NOACCESS)
+            return false;
+        const DWORD writable = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        if ((protect & writable) != 0)
+            return false;
+
+        HMODULE mod = nullptr;
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(address), &mod) || !mod)
+            return false;
+
+        wchar_t path[MAX_PATH] = {};
+        DWORD len = GetModuleFileNameW(mod, path, MAX_PATH);
+        if (len == 0 || len >= MAX_PATH)
+            return false;
+
+        wchar_t system_dir[MAX_PATH] = {};
+        DWORD system_len = GetSystemDirectoryW(system_dir, MAX_PATH);
+        if (system_len == 0 || system_len >= MAX_PATH || len <= system_len)
+            return false;
+        if (CompareStringOrdinal(path, static_cast<int>(system_len), system_dir, static_cast<int>(system_len), TRUE) != CSTR_EQUAL)
+            return false;
+        if (path[system_len] != L'\\' && path[system_len] != L'/')
+            return false;
+
+        const wchar_t* name = path;
+        for (DWORD i = 0; i < len; ++i)
+        {
+            if (path[i] == L'\\' || path[i] == L'/')
+                name = path + i + 1;
+        }
+        return lstrcmpiW(name, L"user32.dll") == 0 ||
+            lstrcmpiW(name, L"win32u.dll") == 0 ||
+            lstrcmpiW(name, L"ntdll.dll") == 0 ||
+            lstrcmpiW(name, L"kernelbase.dll") == 0;
+    }
+
+    inline bool stack_has_current_image_return(uint64_t rsp)
+    {
+        if (rsp == 0)
+            return false;
+        for (uint32_t i = 0; i < 32; ++i)
+        {
+            uint64_t value = 0;
+            __try
+            {
+                value = *(reinterpret_cast<const uint64_t*>(rsp) + i);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                return false;
+            }
+            if (address_in_current_image(value))
+                return true;
+        }
+        return false;
+    }
+
     inline pending_step_slot* find_pending_step_slot(DWORD tid)
     {
         pending_step_slot* slots = pending_step_slots();
@@ -1075,6 +1194,7 @@ namespace read_intercept
 
     inline void mark_iat_pending(uint64_t page_base, uint32_t page_size)
     {
+        arm_orphan_single_step_grace(5000);
         pending_step_slot& slot = reserve_pending_step_slot(GetCurrentThreadId());
         slot.iat_page_base.store(page_base, std::memory_order_release);
         slot.iat_page_size.store(page_size, std::memory_order_release);
@@ -1084,6 +1204,7 @@ namespace read_intercept
 
     inline void mark_trap_pending(uint64_t page_base, uint32_t page_size)
     {
+        arm_orphan_single_step_grace(5000);
         pending_step_slot& slot = reserve_pending_step_slot(GetCurrentThreadId());
         slot.trap_page_base.store(page_base, std::memory_order_release);
         slot.trap_page_size.store(page_size, std::memory_order_release);
@@ -1093,6 +1214,7 @@ namespace read_intercept
 
     inline void mark_text_pending()
     {
+        arm_orphan_single_step_grace(5000);
         pending_step_slot& slot = reserve_pending_step_slot(GetCurrentThreadId());
         slot.tick.store(static_cast<uint64_t>(GetTickCount64()), std::memory_order_release);
         slot.flags.fetch_or(pending_step_text, std::memory_order_acq_rel);
@@ -1158,6 +1280,76 @@ namespace read_intercept
         return false;
     }
 
+    inline bool consume_orphan_single_step(EXCEPTION_POINTERS* ep, const char* source)
+    {
+        if (!ep || !ep->ExceptionRecord || ep->ExceptionRecord->ExceptionCode != STATUS_SINGLE_STEP || !ep->ContextRecord)
+            return false;
+
+        const uint64_t now = static_cast<uint64_t>(GetTickCount64());
+        const uint64_t grace_until = orphan_single_step_grace_until_ms().load(std::memory_order_acquire);
+        if (grace_until == 0 || now > grace_until)
+            return false;
+
+        const bool active =
+            iat_guard::iat_base().load(std::memory_order_acquire) != 0 ||
+            trap_page_base.load(std::memory_order_acquire) != 0 ||
+            text_guard::text_base().load(std::memory_order_acquire) != 0;
+        if (!active)
+            return false;
+
+        if (IsDebuggerPresent())
+            return false;
+        BOOL remote_debugger = FALSE;
+        if (CheckRemoteDebuggerPresent(GetCurrentProcess(), &remote_debugger) && remote_debugger)
+            return false;
+
+        const uint64_t dr6 = static_cast<uint64_t>(ep->ContextRecord->Dr6);
+        if ((dr6 & 0xFULL) != 0)
+            return false;
+        const uint64_t dr7 = static_cast<uint64_t>(ep->ContextRecord->Dr7);
+        if ((dr7 & 0xFFULL) != 0)
+            return false;
+
+        const uint64_t rip = static_cast<uint64_t>(ep->ContextRecord->Rip);
+        const bool rip_current_image = address_in_current_image(rip);
+        const bool rip_trusted_system_with_app_stack =
+            !rip_current_image &&
+            address_in_trusted_system_image(rip) &&
+            stack_has_current_image_return(static_cast<uint64_t>(ep->ContextRecord->Rsp));
+        if (!rip_current_image && !rip_trusted_system_with_app_stack)
+            return false;
+
+        const DWORD tid = GetCurrentThreadId();
+        const DWORD old_eflags = ep->ContextRecord->EFlags;
+        ep->ContextRecord->EFlags &= ~0x100u;
+        ep->ContextRecord->Dr6 = 0;
+
+        const uint64_t n = orphan_single_step_count().fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 16 || (n % 128ULL) == 0ULL)
+        {
+            char dbg[448];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "orphan_single_step_consumed #%llu source=%s rip=0x%llX scope=%s tid=%lu dr6=0x%llX dr7=0x%llX old_eflags=0x%08lX remaining_ms=%llu iat=0x%llX/0x%X trap=0x%llX/0x%X text=0x%llX/0x%X",
+                static_cast<unsigned long long>(n),
+                source ? source : "veh",
+                static_cast<unsigned long long>(rip),
+                rip_current_image ? "current_image" : "trusted_system_app_stack",
+                tid,
+                static_cast<unsigned long long>(dr6),
+                static_cast<unsigned long long>(dr7),
+                static_cast<unsigned long>(old_eflags),
+                static_cast<unsigned long long>(grace_until >= now ? grace_until - now : 0),
+                static_cast<unsigned long long>(iat_guard::iat_base().load(std::memory_order_acquire)),
+                iat_guard::iat_size().load(std::memory_order_acquire),
+                static_cast<unsigned long long>(trap_page_base.load(std::memory_order_acquire)),
+                trap_page_size.load(std::memory_order_acquire),
+                static_cast<unsigned long long>(text_guard::text_base().load(std::memory_order_acquire)),
+                text_guard::text_size().load(std::memory_order_acquire));
+            webhook::write_log("veh", dbg);
+        }
+        return true;
+    }
+
     inline void*& trap_page_allocation()
     {
         static void* p = nullptr;
@@ -1216,6 +1408,8 @@ namespace read_intercept
         if (ep->ExceptionRecord->ExceptionCode == STATUS_SINGLE_STEP)
         {
             if (consume_pending_single_step(ep, "veh"))
+                return EXCEPTION_CONTINUE_EXECUTION;
+            if (consume_orphan_single_step(ep, "veh_orphan"))
                 return EXCEPTION_CONTINUE_EXECUTION;
         }
 
