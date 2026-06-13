@@ -74,6 +74,161 @@ static std::string protocol_name(std::uint32_t proto) {
     }
 }
 
+static std::string hex_u64(std::uint64_t value) {
+    std::ostringstream os;
+    os << "0x" << std::hex << std::uppercase << value;
+    return os.str();
+}
+
+static bool ensure_network_script_engine_initialized(const char* action, json& out, std::string& error) {
+    const uint64_t started = GetTickCount64();
+    const bool before = script_engine::is_initialized();
+    out = json::object();
+    out["action"] = action ? action : "script";
+    out["initialized_before"] = before;
+    out["caller_tid"] = static_cast<unsigned long>(GetCurrentThreadId());
+    out["backend"] = "script_engine_initialize";
+    if (before) {
+        out["initialized_after"] = true;
+        out["init_attempted"] = false;
+        out["elapsed_ms"] = 0;
+        out["success"] = true;
+        return true;
+    }
+
+    bool init_ok = false;
+    bool threw = false;
+    std::string exception_text;
+    try {
+        init_ok = script_engine::initialize();
+    } catch (const std::exception& e) {
+        threw = true;
+        exception_text = e.what();
+    } catch (...) {
+        threw = true;
+        exception_text = "unknown exception";
+    }
+
+    const bool after = script_engine::is_initialized();
+    out["initialized_after"] = after;
+    out["init_attempted"] = true;
+    out["init_returned"] = init_ok;
+    out["threw"] = threw;
+    out["elapsed_ms"] = static_cast<unsigned long long>(GetTickCount64() - started);
+    out["success"] = after;
+    if (threw)
+        out["exception"] = exception_text;
+    diag::log_tagged_fmt("net_tools", "network_script_ensure action=%s before=%d init_ok=%d after=%d threw=%d elapsed_ms=%llu",
+        action ? action : "script",
+        before ? 1 : 0,
+        init_ok ? 1 : 0,
+        after ? 1 : 0,
+        threw ? 1 : 0,
+        static_cast<unsigned long long>(GetTickCount64() - started));
+    if (after)
+        return true;
+    error = threw
+        ? std::string("Script engine initialization threw: ") + exception_text
+        : "Script engine is not initialized and could not be initialized within the bounded startup path.";
+    out["error"] = error;
+    return false;
+}
+
+static std::uint32_t pre_encrypt_armed_thread_count_locked() {
+    std::uint32_t count = 0;
+    for (const auto& t : pre_encrypt_hook::g_state.targets)
+        count += static_cast<std::uint32_t>(t.armed_tids.size());
+    return count;
+}
+
+static json pre_encrypt_arm_results_json_locked(const pre_encrypt_hook::hook_target_t& target, std::uint32_t& failures) {
+    json arr = json::array();
+    failures = 0;
+    for (const auto& item : target.arm_results) {
+        json r;
+        r["timestamp"] = item.timestamp;
+        r["tid"] = item.tid;
+        r["bp_slot"] = item.bp_index;
+        r["address"] = hex_u64(item.address);
+        r["ok"] = item.ok;
+        r["win32_error"] = static_cast<unsigned long>(item.win32_error);
+        if (!item.driver_error.empty())
+            r["driver_error"] = item.driver_error;
+        if (!item.ok)
+            ++failures;
+        arr.push_back(std::move(r));
+    }
+    return arr;
+}
+
+static json pre_encrypt_hook_summary_locked() {
+    json hooks = json::array();
+    for (const auto& t : pre_encrypt_hook::g_state.targets) {
+        json h;
+        std::uint32_t arm_failures = 0;
+        h["name"] = t.function_name;
+        h["address"] = hex_u64(t.address);
+        h["hooked"] = t.active;
+        h["bp_slot"] = t.bp_index;
+        h["armed_thread_count"] = static_cast<int>(t.armed_tids.size());
+        h["armed_tids"] = t.armed_tids;
+        h["buffer_reg"] = t.buffer_reg;
+        h["size_reg"] = t.size_reg;
+        h["arm_results"] = pre_encrypt_arm_results_json_locked(t, arm_failures);
+        h["arm_result_count"] = static_cast<int>(t.arm_results.size());
+        h["arm_failure_count"] = arm_failures;
+        hooks.push_back(std::move(h));
+    }
+    return hooks;
+}
+
+static json pre_encrypt_status_payload(std::uint32_t pid = 0) {
+    json r;
+    std::lock_guard<std::mutex> lock(pre_encrypt_hook::g_state.mutex);
+    const std::uint32_t state_pid = pre_encrypt_hook::g_state.attached_pid;
+    r["pid"] = pid != 0 ? pid : state_pid;
+    r["active"] = pre_encrypt_hook::g_state.active.load();
+    r["debug_attached"] = pre_encrypt_hook::g_state.debug_attached.load();
+    r["debug_loop_running"] = pre_encrypt_hook::g_state.debug_loop_running.load();
+    r["debugger_error"] = static_cast<unsigned long>(pre_encrypt_hook::g_state.debugger_error.load());
+    r["debug_loop_tid"] = static_cast<unsigned long>(pre_encrypt_hook::g_state.debug_loop_tid.load());
+    r["hook_count"] = static_cast<int>(pre_encrypt_hook::g_state.targets.size());
+    r["capture_count"] = static_cast<int>(pre_encrypt_hook::g_state.captures.size());
+    r["armed_thread_count"] = pre_encrypt_armed_thread_count_locked();
+    r["hooks"] = pre_encrypt_hook_summary_locked();
+    return r;
+}
+
+static bool pre_encrypt_find_hook(std::uint64_t address, json& out) {
+    std::lock_guard<std::mutex> lock(pre_encrypt_hook::g_state.mutex);
+    for (const auto& t : pre_encrypt_hook::g_state.targets) {
+        if (t.address != address)
+            continue;
+        out["address"] = hex_u64(t.address);
+        out["name"] = t.function_name;
+        out["hooked"] = t.active;
+        out["bp_slot"] = t.bp_index;
+        out["armed_thread_count"] = static_cast<int>(t.armed_tids.size());
+        out["armed_tids"] = t.armed_tids;
+        out["buffer_reg"] = t.buffer_reg;
+        out["size_reg"] = t.size_reg;
+        std::uint32_t arm_failures = 0;
+        out["arm_results"] = pre_encrypt_arm_results_json_locked(t, arm_failures);
+        out["arm_result_count"] = static_cast<int>(t.arm_results.size());
+        out["arm_failure_count"] = arm_failures;
+        return true;
+    }
+    return false;
+}
+
+static void add_driver_request_fields(json& r, bool ok, DWORD gle = GetLastError()) {
+    const DWORD effective_gle = ok ? ERROR_SUCCESS : gle;
+    r["driver_request_ok"] = ok;
+    r["driver_status"] = driver_bridge::status();
+    r["driver_last_error"] = driver_bridge::last_error();
+    r["win32_error"] = static_cast<unsigned long>(effective_gle);
+}
+
 static bool process_exists(std::uint32_t pid) {
     if (pid == 0 || pid == 4)
         return false;
@@ -422,6 +577,7 @@ tool_result_t network_add_filter(const json& params)
     diag::log_tagged_fmt("net_tools", "network_add_filter action=%u direction=%u protocol=%u pid=%u port=%u", action, direction, protocol, pid, port);
     bool ok = driver_bridge::add_filter_rule(action, direction, protocol, pid, port,
         ip_addr, ip_mask, &rule_id);
+    const DWORD gle = GetLastError();
     diag::log_tagged_fmt("net_tools", "network_add_filter result=%d rule_id=%u", (int)ok, rule_id);
 
     if (!ok)
@@ -435,6 +591,8 @@ tool_result_t network_add_filter(const json& params)
     if (pid) result["pid"] = pid;
     if (port) result["port"] = port;
     if (params.contains("ip")) result["ip"] = params["ip"];
+    result["operation"] = "add";
+    add_driver_request_fields(result, ok, gle);
 
     return tool_result_t::ok(OBFSTR("Filter rule added (ID: ") + std::to_string(rule_id) + ")", result);
 }
@@ -451,11 +609,20 @@ tool_result_t network_remove_filter(const json& params)
     std::uint32_t rule_id = params["rule_id"].get<std::uint32_t>();
     diag::log_tagged_fmt("net_tools", "network_remove_filter rule_id=%u", rule_id);
     bool ok = driver_bridge::remove_filter_rule(rule_id);
+    const DWORD gle = GetLastError();
     diag::log_tagged_fmt("net_tools", "network_remove_filter result=%d", (int)ok);
     if (!ok)
         return tool_result_t::error(OBFSTR("Failed to remove filter rule ") + std::to_string(rule_id));
 
-    return tool_result_t::ok(OBFSTR("Filter rule ") + std::to_string(rule_id) + OBFSTR(" removed"));
+    driver_bridge::network_stats_t after{};
+    const bool after_ok = driver_bridge::get_network_stats(after);
+    json result;
+    result["operation"] = "remove";
+    result["rule_id"] = rule_id;
+    result["remaining_count"] = after_ok ? after.active_filter_rules : 0;
+    result["stats_after_ok"] = after_ok;
+    add_driver_request_fields(result, ok, gle);
+    return tool_result_t::ok(OBFSTR("Filter rule ") + std::to_string(rule_id) + OBFSTR(" removed"), result);
 }
 
 tool_result_t network_clear_filters(const json&)
@@ -468,6 +635,7 @@ tool_result_t network_clear_filters(const json&)
     driver_bridge::network_stats_t after{};
     const bool before_ok = driver_bridge::get_network_stats(before);
     bool ok = driver_bridge::clear_filter_rules();
+    const DWORD gle = GetLastError();
     const bool after_ok = driver_bridge::get_network_stats(after);
     diag::log_tagged_fmt("net_tools", "network_clear_filters result=%d before_ok=%d before_rules=%llu after_ok=%d after_rules=%llu",
         (int)ok, before_ok ? 1 : 0, static_cast<unsigned long long>(before.active_filter_rules),
@@ -482,6 +650,9 @@ tool_result_t network_clear_filters(const json&)
     result["stats_after_ok"] = after_ok;
     result["cleared_count"] = before_ok && before.active_filter_rules >= after.active_filter_rules ?
         before.active_filter_rules - after.active_filter_rules : 0;
+    result["operation"] = "clear";
+    result["remaining_count"] = after_ok ? after.active_filter_rules : 0;
+    add_driver_request_fields(result, ok, gle);
     return tool_result_t::ok(OBFSTR("All filter rules cleared"), result);
 }
 
@@ -571,6 +742,7 @@ tool_result_t network_block_ip(const json& params)
     std::uint32_t rule_id = 0;
     diag::log_tagged_fmt("net_tools", "network_block_ip ip=%s direction=%u", params["ip"].get<std::string>().c_str(), direction);
     bool block_ok = driver_bridge::add_filter_rule(1, direction, 0, 0, 0, ip, mask, &rule_id);
+    const DWORD gle = GetLastError();
     diag::log_tagged_fmt("net_tools", "network_block_ip result=%d rule_id=%u", (int)block_ok, rule_id);
     if (!block_ok)
         return tool_result_t::error(OBFSTR("Failed to add block rule"));
@@ -579,6 +751,8 @@ tool_result_t network_block_ip(const json& params)
     result["rule_id"] = rule_id;
     result["blocked_ip"] = params["ip"];
     result["direction"] = (direction == 0) ? "inbound" : (direction == 1) ? "outbound" : "both";
+    result["operation"] = "block_ip";
+    add_driver_request_fields(result, block_ok, gle);
     return tool_result_t::ok(OBFSTR("IP blocked: ") + params["ip"].get<std::string>(), result);
 }
 
@@ -602,6 +776,7 @@ tool_result_t network_block_port(const json& params)
     std::uint32_t rule_id = 0;
     diag::log_tagged_fmt("net_tools", "network_block_port port=%u protocol=%u", port, protocol);
     bool port_ok = driver_bridge::add_filter_rule(1, 2, protocol, 0, port, nullptr, nullptr, &rule_id);
+    const DWORD gle = GetLastError();
     diag::log_tagged_fmt("net_tools", "network_block_port result=%d rule_id=%u", (int)port_ok, rule_id);
     if (!port_ok)
         return tool_result_t::error(OBFSTR("Failed to add port block rule"));
@@ -610,6 +785,8 @@ tool_result_t network_block_port(const json& params)
     result["rule_id"] = rule_id;
     result["blocked_port"] = port;
     if (protocol) result["protocol"] = protocol_name(protocol);
+    result["operation"] = "block_port";
+    add_driver_request_fields(result, port_ok, gle);
     return tool_result_t::ok(OBFSTR("Port blocked: ") + std::to_string(port), result);
 }
 
@@ -631,6 +808,7 @@ tool_result_t network_block_process(const json& params)
 
     std::uint32_t rule_id = 0;
     bool proc_ok = driver_bridge::add_filter_rule(1, 2, 0, pid, 0, nullptr, nullptr, &rule_id);
+    const DWORD gle = GetLastError();
     diag::log_tagged_fmt("net_tools", "network_block_process result=%d rule_id=%u", (int)proc_ok, rule_id);
     if (!proc_ok)
         return tool_result_t::error(OBFSTR("Failed to add process block rule"));
@@ -638,6 +816,9 @@ tool_result_t network_block_process(const json& params)
     json result;
     result["rule_id"] = rule_id;
     result["blocked_pid"] = pid;
+    result["pid"] = pid;
+    result["operation"] = "block_process";
+    add_driver_request_fields(result, proc_ok, gle);
     return tool_result_t::ok(OBFSTR("All network traffic blocked for PID ") + std::to_string(pid), result);
 }
 
@@ -1347,21 +1528,45 @@ tool_result_t network_modify_packet_rule(const json& params)
             pattern.data(), static_cast<std::uint32_t>(pattern.size()),
             replacement.empty() ? nullptr : replacement.data(), static_cast<std::uint32_t>(replacement.size()),
             &rule_id);
+        const DWORD gle = GetLastError();
         diag::log_tagged_fmt("net_tools", "network_modify_packet_rule add result=%d rule_id=%u", (int)ok, rule_id);
         if (!ok) return tool_result_t::error(OBFSTR("Failed to add modification rule. Max 32 rules."));
-        json r; r["rule_id"] = rule_id;
+        auto remaining = driver_bridge::list_packet_mod_rules();
+        json r;
+        r["operation"] = "add";
+        r["rule_id"] = rule_id;
+        r["remaining_count"] = remaining.size();
+        r["direction"] = (direction == 0) ? "inbound" : (direction == 1) ? "outbound" : "both";
+        r["protocol"] = protocol_name(protocol);
+        r["port"] = port;
+        r["pid"] = pid;
+        add_driver_request_fields(r, ok, gle);
         return tool_result_t::ok(OBFSTR("Packet modification rule added (ID: ") + std::to_string(rule_id) + ")", r);
     } else if (op == "remove") {
         if (!params.contains("rule_id") || !params["rule_id"].is_number())
             return tool_result_t::error(OBFSTR("Missing required parameter: rule_id"));
         std::uint32_t rule_id = params["rule_id"].get<std::uint32_t>();
         bool ok = driver_bridge::packet_mod_rule_op(1, rule_id);
+        const DWORD gle = GetLastError();
         if (!ok) return tool_result_t::error(OBFSTR("Failed to remove modification rule."));
-        return tool_result_t::ok(OBFSTR("Modification rule ") + std::to_string(rule_id) + OBFSTR(" removed"));
+        auto remaining = driver_bridge::list_packet_mod_rules();
+        json r;
+        r["operation"] = "remove";
+        r["rule_id"] = rule_id;
+        r["remaining_count"] = remaining.size();
+        add_driver_request_fields(r, ok, gle);
+        return tool_result_t::ok(OBFSTR("Modification rule ") + std::to_string(rule_id) + OBFSTR(" removed"), r);
     } else if (op == "clear") {
         bool ok = driver_bridge::packet_mod_rule_op(3);
+        const DWORD gle = GetLastError();
         if (!ok) return tool_result_t::error(OBFSTR("Failed to clear modification rules."));
-        return tool_result_t::ok(OBFSTR("All packet modification rules cleared"));
+        auto remaining = driver_bridge::list_packet_mod_rules();
+        json r;
+        r["operation"] = "clear";
+        r["remaining_count"] = remaining.size();
+        r["cleared"] = remaining.empty();
+        add_driver_request_fields(r, ok, gle);
+        return tool_result_t::ok(OBFSTR("All packet modification rules cleared"), r);
     }
     return tool_result_t::error(OBFSTR("Invalid operation. Use 'add', 'remove', or 'clear'."));
 }
@@ -1413,20 +1618,43 @@ tool_result_t network_redirect_traffic(const json& params)
 
         std::uint32_t rule_id = 0;
         bool ok = driver_bridge::traffic_redirect_op(0, 0, protocol, match_port, match_addr, redirect_port, redirect_addr, af, &rule_id);
+        const DWORD gle = GetLastError();
         if (!ok) return tool_result_t::error(OBFSTR("Failed to add redirect rule. Max 16 rules."));
-        json r; r["rule_id"] = rule_id;
+        auto remaining = driver_bridge::list_redirect_rules();
+        json r;
+        r["operation"] = "add";
+        r["rule_id"] = rule_id;
+        r["remaining_count"] = remaining.size();
+        r["protocol"] = protocol_name(protocol);
+        r["match_port"] = match_port;
+        r["redirect_port"] = redirect_port;
+        add_driver_request_fields(r, ok, gle);
         return tool_result_t::ok(OBFSTR("Traffic redirect rule added (ID: ") + std::to_string(rule_id) + ")", r);
     } else if (op == "remove") {
         if (!params.contains("rule_id") || !params["rule_id"].is_number())
             return tool_result_t::error(OBFSTR("Missing required parameter: rule_id"));
         std::uint32_t rule_id = params["rule_id"].get<std::uint32_t>();
         bool ok = driver_bridge::traffic_redirect_op(1, rule_id);
+        const DWORD gle = GetLastError();
         if (!ok) return tool_result_t::error(OBFSTR("Failed to remove redirect rule."));
-        return tool_result_t::ok(OBFSTR("Redirect rule ") + std::to_string(rule_id) + OBFSTR(" removed"));
+        auto remaining = driver_bridge::list_redirect_rules();
+        json r;
+        r["operation"] = "remove";
+        r["rule_id"] = rule_id;
+        r["remaining_count"] = remaining.size();
+        add_driver_request_fields(r, ok, gle);
+        return tool_result_t::ok(OBFSTR("Redirect rule ") + std::to_string(rule_id) + OBFSTR(" removed"), r);
     } else if (op == "clear") {
         bool ok = driver_bridge::traffic_redirect_op(3);
+        const DWORD gle = GetLastError();
         if (!ok) return tool_result_t::error(OBFSTR("Failed to clear redirect rules."));
-        return tool_result_t::ok(OBFSTR("All traffic redirect rules cleared"));
+        auto remaining = driver_bridge::list_redirect_rules();
+        json r;
+        r["operation"] = "clear";
+        r["remaining_count"] = remaining.size();
+        r["cleared"] = remaining.empty();
+        add_driver_request_fields(r, ok, gle);
+        return tool_result_t::ok(OBFSTR("All traffic redirect rules cleared"), r);
     }
     return tool_result_t::error(OBFSTR("Invalid operation. Use 'add', 'remove', or 'clear'."));
 }
@@ -1475,15 +1703,30 @@ tool_result_t network_intercept(const json& params)
         std::uint32_t held_count = 0; bool active = false;
         diag::log_tagged_fmt("net_tools", "network_intercept enable pid=%u port=%u proto=%u", filter_pid, filter_port, filter_protocol);
         bool ok = driver_bridge::intercept_op(0, filter_pid, filter_port, filter_protocol, 0, nullptr, 0, &held_count, &active);
+        const DWORD gle = GetLastError();
         diag::log_tagged_fmt("net_tools", "network_intercept enable result=%d active=%d held=%u", (int)ok, (int)active, held_count);
         if (!ok) return tool_result_t::error(OBFSTR("Failed to enable packet interception."));
-        json r; r["active"] = active; r["held_count"] = held_count;
+        json r;
+        r["operation"] = "enable";
+        r["active"] = active;
+        r["held_count"] = held_count;
+        r["pid"] = filter_pid;
+        r["port"] = filter_port;
+        r["protocol"] = filter_protocol == 0 ? "any" : protocol_name(filter_protocol);
+        add_driver_request_fields(r, ok, gle);
         return tool_result_t::ok(OBFSTR("Packet interception enabled. Matching packets will be held for inspection."), r);
     } else if (op == "disable") {
         bool ok = driver_bridge::intercept_op(1, 0, 0, 0, 0, nullptr, 0, nullptr, nullptr);
+        const DWORD gle = GetLastError();
         diag::log_tagged_fmt("net_tools", "network_intercept disable result=%d", (int)ok);
         if (!ok) return tool_result_t::error(OBFSTR("Failed to disable packet interception."));
-        return tool_result_t::ok(OBFSTR("Packet interception disabled. All held packets released."));
+        auto remaining = driver_bridge::get_held_packets();
+        json r;
+        r["operation"] = "disable";
+        r["active"] = false;
+        r["remaining_held_count"] = remaining.size();
+        add_driver_request_fields(r, ok, gle);
+        return tool_result_t::ok(OBFSTR("Packet interception disabled. All held packets released."), r);
     }
     return tool_result_t::error(OBFSTR("Invalid operation. Use 'enable' or 'disable'."));
 }
@@ -1556,11 +1799,20 @@ tool_result_t network_release_packet(const json& params)
     bool ok = driver_bridge::intercept_op(operation, 0, 0, 0, hold_id,
         modify_payload.empty() ? nullptr : modify_payload.data(),
         static_cast<std::uint32_t>(modify_payload.size()), nullptr, nullptr);
+    const DWORD gle = GetLastError();
     diag::log_tagged_fmt("net_tools", "network_release_packet result=%d operation=%u", (int)ok, operation);
     if (!ok) return tool_result_t::error(OBFSTR("Failed to release/process held packet."));
 
     std::string action_str = (operation == 4) ? "dropped" : (operation == 5) ? "modified and released" : "released";
-    return tool_result_t::ok(OBFSTR("Packet ") + action_str);
+    auto remaining = driver_bridge::get_held_packets();
+    json r;
+    r["action"] = params.value("action", std::string("release"));
+    r["operation"] = operation;
+    r["hold_id"] = hold_id;
+    r["remaining_held_count"] = remaining.size();
+    r["modified_payload_size"] = modify_payload.size();
+    add_driver_request_fields(r, ok, gle);
+    return tool_result_t::ok(OBFSTR("Packet ") + action_str, r);
 }
 
 tool_result_t network_kill_connection(const json& params)
@@ -1596,9 +1848,21 @@ tool_result_t network_kill_connection(const json& params)
 
     diag::log_tagged_fmt("net_tools", "network_kill_connection protocol=%u src_port=%u dst_port=%u pid=%u", protocol, src_port, dst_port, pid);
     bool ok = driver_bridge::kill_connection(protocol, af, src_port, dst_port, src_addr, dst_addr, pid);
+    const DWORD gle = GetLastError();
     diag::log_tagged_fmt("net_tools", "network_kill_connection result=%d", (int)ok);
     if (!ok) return tool_result_t::error(OBFSTR("Failed to kill connection. Tries socket close + RST injection."));
-    return tool_result_t::ok(OBFSTR("Connection killed successfully"));
+    json r;
+    r["action"] = "kill_connection";
+    r["pid"] = pid;
+    r["protocol"] = protocol_name(protocol);
+    r["src_ip"] = params.value("src_ip", std::string());
+    r["src_port"] = src_port;
+    r["dst_ip"] = params.value("dst_ip", std::string());
+    r["dst_port"] = dst_port;
+    r["tuple"] = r["src_ip"].get<std::string>() + ":" + std::to_string(src_port) + " -> " +
+        r["dst_ip"].get<std::string>() + ":" + std::to_string(dst_port);
+    add_driver_request_fields(r, ok, gle);
+    return tool_result_t::ok(OBFSTR("Connection killed successfully"), r);
 }
 
 tool_result_t network_spoof_dns(const json& params)
@@ -1626,21 +1890,47 @@ tool_result_t network_spoof_dns(const json& params)
         std::uint32_t rule_id = 0;
         diag::log_tagged_fmt("net_tools", "network_spoof_dns add domain=%s ttl=%u", domain.c_str(), ttl);
         bool ok = driver_bridge::dns_spoof_op(0, 0, domain.c_str(), spoof_addr, 2, ttl, &rule_id);
+        const DWORD gle = GetLastError();
         diag::log_tagged_fmt("net_tools", "network_spoof_dns add result=%d rule_id=%u", (int)ok, rule_id);
         if (!ok) return tool_result_t::error(OBFSTR("Failed to add DNS spoof rule. Max 32 rules."));
-        json r; r["rule_id"] = rule_id; r["domain"] = domain;
+        auto remaining = driver_bridge::list_dns_spoof_rules();
+        json r;
+        r["operation"] = "add";
+        r["action"] = "add_spoof";
+        r["rule_id"] = rule_id;
+        r["domain"] = domain;
+        r["spoof_ip"] = params["spoof_ip"].get<std::string>();
+        r["ttl"] = ttl;
+        r["remaining_count"] = remaining.size();
+        add_driver_request_fields(r, ok, gle);
         return tool_result_t::ok(OBFSTR("DNS spoof rule added: ") + domain + OBFSTR(" -> ") + params["spoof_ip"].get<std::string>(), r);
     } else if (op == "remove") {
         if (!params.contains("rule_id") || !params["rule_id"].is_number())
             return tool_result_t::error(OBFSTR("Missing required parameter: rule_id"));
         std::uint32_t rule_id = params["rule_id"].get<std::uint32_t>();
         bool ok = driver_bridge::dns_spoof_op(1, rule_id, nullptr, nullptr, 2, 0, nullptr);
+        const DWORD gle = GetLastError();
         if (!ok) return tool_result_t::error(OBFSTR("Failed to remove DNS spoof rule."));
-        return tool_result_t::ok(OBFSTR("DNS spoof rule ") + std::to_string(rule_id) + OBFSTR(" removed"));
+        auto remaining = driver_bridge::list_dns_spoof_rules();
+        json r;
+        r["operation"] = "remove";
+        r["action"] = "remove_spoof";
+        r["rule_id"] = rule_id;
+        r["remaining_count"] = remaining.size();
+        add_driver_request_fields(r, ok, gle);
+        return tool_result_t::ok(OBFSTR("DNS spoof rule ") + std::to_string(rule_id) + OBFSTR(" removed"), r);
     } else if (op == "clear") {
         bool ok = driver_bridge::dns_spoof_op(3, 0, nullptr, nullptr, 2, 0, nullptr);
+        const DWORD gle = GetLastError();
         if (!ok) return tool_result_t::error(OBFSTR("Failed to clear DNS spoof rules."));
-        return tool_result_t::ok(OBFSTR("All DNS spoof rules cleared"));
+        auto remaining = driver_bridge::list_dns_spoof_rules();
+        json r;
+        r["operation"] = "clear";
+        r["action"] = "clear_spoof";
+        r["remaining_count"] = remaining.size();
+        r["cleared"] = remaining.empty();
+        add_driver_request_fields(r, ok, gle);
+        return tool_result_t::ok(OBFSTR("All DNS spoof rules cleared"), r);
     }
     return tool_result_t::error(OBFSTR("Invalid operation. Use 'add', 'remove', or 'clear'."));
 }
@@ -1886,7 +2176,13 @@ tool_result_t api_monitor_start(const json& params)
     std::string error;
     if (!api_monitor::start(pid, apis, log_callstack, capture_buffer, max_capture_bytes, max_events, summary, error)) {
         diag::log_tagged_fmt("net_tools", "api_monitor_start failed pid=%u error=%s", pid, error.c_str());
-        return tool_result_t::error(error);
+        if (!summary.is_object())
+            summary = json::object();
+        summary["success"] = false;
+        summary["error"] = error;
+        if (!summary.contains("status"))
+            summary["status"] = api_monitor::status_json();
+        return tool_result_t::error(error, summary);
     }
 
     const int resolved_count = summary.contains("resolved") && summary["resolved"].is_array()
@@ -1911,6 +2207,8 @@ tool_result_t api_monitor_results(const json& params)
     const int count = result.value("count", 0);
     if (count == 0) {
         diag::log_tagged_fmt("net_tools", "api_monitor_results empty stop=%d clear=%d", stop_after ? 1 : 0, clear_after ? 1 : 0);
+        if (stop_after)
+            return tool_result_t::ok(OBFSTR("API monitor stopped with no captured events."), result);
         return tool_result_t::error(OBFSTR("No API monitor events captured."), result);
     }
     return tool_result_t::ok(std::to_string(count) + OBFSTR(" API monitor event(s)"), result);
@@ -2307,6 +2605,10 @@ void register_network_tools(mcp_standalone::server_t& srv) {
         [](const json& args) -> tool_result_t {
             std::string name = args.value("name", "");
             diag::log_tagged_fmt("net_tools", "network_script_load entry name=%s", name.c_str());
+            json init_diag;
+            std::string init_error;
+            if (!ensure_network_script_engine_initialized("load", init_diag, init_error))
+                return tool_result_t::error(init_error, init_diag);
             bool ok = false;
             if (args.contains("source") && args["source"].is_string()) {
                 std::string src = args["source"].get<std::string>();
@@ -2323,7 +2625,18 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 return tool_result_t::error("Either 'path' or 'source' required");
             }
             diag::log_tagged_fmt("net_tools", "network_script_load result=%d name=%s", (int)ok, name.c_str());
-            return ok ? tool_result_t::ok("Script '" + name + "' loaded") : tool_result_t::error("Failed to load script");
+            auto scripts = script_engine::get_scripts();
+            json r;
+            r["action"] = "load";
+            r["name"] = name;
+            r["loaded"] = ok;
+            r["success"] = ok;
+            r["script_count"] = scripts.size();
+            r["hook_count"] = script_engine::registered_hook_count();
+            r["initialization"] = std::move(init_diag);
+            if (!ok)
+                return tool_result_t::error("Failed to load script", r);
+            return tool_result_t::ok("Script '" + name + "' loaded", r);
         }, false});
 
     register_compat(srv, {
@@ -2335,11 +2648,30 @@ void register_network_tools(mcp_standalone::server_t& srv) {
             diag::log_tagged_fmt("net_tools", "network_script_unload name=%s", name.c_str());
             if (name.empty())
                 return tool_result_t::error("Missing required parameter: name");
+            json init_diag;
+            std::string init_error;
+            if (!ensure_network_script_engine_initialized("unload", init_diag, init_error))
+                return tool_result_t::error(init_error, init_diag);
             if (!script_engine::unload_script(name)) {
                 diag::log_tagged_fmt("net_tools", "network_script_unload not_loaded name=%s", name.c_str());
-                return tool_result_t::error("Script '" + name + "' is not loaded");
+                json r;
+                r["action"] = "unload";
+                r["name"] = name;
+                r["success"] = false;
+                r["initialization"] = std::move(init_diag);
+                return tool_result_t::error("Script '" + name + "' is not loaded", r);
             }
-            return tool_result_t::ok("Script '" + name + "' unloaded");
+            auto scripts = script_engine::get_scripts();
+            json r;
+            r["action"] = "unload";
+            r["name"] = name;
+            r["unloaded"] = true;
+            r["loaded"] = false;
+            r["success"] = true;
+            r["script_count"] = scripts.size();
+            r["hook_count"] = script_engine::registered_hook_count();
+            r["initialization"] = std::move(init_diag);
+            return tool_result_t::ok("Script '" + name + "' unloaded", r);
         }, false});
 
     register_compat(srv, {
@@ -2350,10 +2682,24 @@ void register_network_tools(mcp_standalone::server_t& srv) {
         [](const json& args) -> tool_result_t {
             std::string code = args.value("code", "");
             diag::log_tagged_fmt("net_tools", "network_script_execute code_len=%zu", code.size());
+            json init_diag;
+            std::string init_error;
+            if (!ensure_network_script_engine_initialized("execute", init_diag, init_error))
+                return tool_result_t::error(init_error, init_diag);
             std::string result = script_engine::execute(code);
             diag::log_tagged_fmt("net_tools", "network_script_execute result_len=%zu", result.size());
             json r;
+            r["action"] = "execute";
             r["output"] = result;
+            r["script_count"] = script_engine::get_scripts().size();
+            r["hook_count"] = script_engine::registered_hook_count();
+            r["initialization"] = std::move(init_diag);
+            if (result == "[error: engine not initialized]") {
+                r["success"] = false;
+                r["error"] = "script engine not initialized";
+                return tool_result_t::error("Script engine is not initialized.", r);
+            }
+            r["success"] = true;
             return tool_result_t::ok(result.empty() ? "(no output)" : result, r);
         }, false});
 
@@ -2362,6 +2708,10 @@ void register_network_tools(mcp_standalone::server_t& srv) {
         OBFSTR("List all loaded Lua scripts with their enabled/disabled status."),
         {},
         [](const json&) -> tool_result_t {
+            json init_diag;
+            std::string init_error;
+            if (!ensure_network_script_engine_initialized("list", init_diag, init_error))
+                return tool_result_t::error(init_error, init_diag);
             auto scripts = script_engine::get_scripts();
             json arr = json::array();
             for (const auto& s : scripts) {
@@ -2375,6 +2725,8 @@ void register_network_tools(mcp_standalone::server_t& srv) {
             json r;
             r["scripts"] = arr;
             r["count"] = scripts.size();
+            r["success"] = true;
+            r["initialization"] = std::move(init_diag);
             return tool_result_t::ok(std::to_string(scripts.size()) + " scripts loaded", r);
         }, true});
 
@@ -2384,6 +2736,10 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                "functions, hook types, and data structures."),
         {},
         [](const json&) -> tool_result_t {
+            json init_diag;
+            std::string init_error;
+            if (!ensure_network_script_engine_initialized("api", init_diag, init_error))
+                return tool_result_t::error(init_error, init_diag);
             auto funcs = script_engine::get_api_listing();
             json arr = json::array();
             std::string text;
@@ -2397,6 +2753,8 @@ void register_network_tools(mcp_standalone::server_t& srv) {
             }
             json r;
             r["api"] = arr;
+            r["success"] = true;
+            r["initialization"] = std::move(init_diag);
             return tool_result_t::ok(text, r);
         }, true});
 
@@ -2801,32 +3159,28 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                     diag::log_tagged_fmt("net_tools", "network_pre_encrypt_hook auto_hook failed pid=%u", pid);
                     return tool_result_t::error("Failed to auto-hook encryption functions in PID " + std::to_string(pid));
                 }
-                if (!pre_encrypt_hook::start_polling()) {
+                const bool started_polling = pre_encrypt_hook::start_polling();
+                if (!started_polling) {
                     DWORD err = pre_encrypt_hook::g_state.debugger_error.load();
+                    json r = pre_encrypt_status_payload(pid);
+                    r["operation"] = "auto_hook";
+                    r["started_polling"] = false;
+                    r["hooked"] = false;
+                    r["start_error"] = static_cast<unsigned long>(err);
                     pre_encrypt_hook::unhook_all();
                     return tool_result_t::error("Failed to start authorized debug capture for PID " + std::to_string(pid) +
-                                                ", error=" + std::to_string(static_cast<unsigned long>(err)));
+                                                ", error=" + std::to_string(static_cast<unsigned long>(err)), r);
                 }
-                json r;
-                std::lock_guard<std::mutex> lock(pre_encrypt_hook::g_state.mutex);
-                diag::log_tagged_fmt("net_tools", "network_pre_encrypt_hook auto_hook hooks=%zu", pre_encrypt_hook::g_state.targets.size());
-                r["hooks_installed"] = static_cast<int>(pre_encrypt_hook::g_state.targets.size());
-                uint32_t armed_thread_breakpoints = 0;
-                json hooks = json::array();
-                for (const auto& t : pre_encrypt_hook::g_state.targets) {
-                    armed_thread_breakpoints += static_cast<uint32_t>(t.armed_tids.size());
-                    if (t.active) {
-                        json h;
-                        h["name"] = t.function_name;
-                        h["address"] = (std::ostringstream() << "0x" << std::hex << t.address).str();
-                        h["bp_slot"] = t.bp_index;
-                        h["armed_threads"] = static_cast<int>(t.armed_tids.size());
-                        hooks.push_back(h);
-                    }
-                }
-                r["armed_thread_breakpoints"] = armed_thread_breakpoints;
-                r["hooks"] = hooks;
-                return tool_result_t::ok("Hooked " + std::to_string(hooks.size()) + " encryption functions", r);
+                json r = pre_encrypt_status_payload(pid);
+                r["operation"] = "auto_hook";
+                r["started_polling"] = started_polling;
+                r["hooked"] = r.value("hook_count", 0) > 0;
+                r["hooks_installed"] = r["hook_count"];
+                diag::log_tagged_fmt("net_tools", "network_pre_encrypt_hook auto_hook hooks=%d armed=%u captures=%d",
+                    r.value("hook_count", 0),
+                    r.value("armed_thread_count", 0u),
+                    r.value("capture_count", 0));
+                return tool_result_t::ok("Hooked " + std::to_string(r.value("hook_count", 0)) + " encryption functions", r);
             }
             if (op == "hook_address") {
                 std::string addr_str = args.value("address", "");
@@ -2857,17 +3211,44 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 uint32_t sz_reg = args.value("size_reg", static_cast<uint32_t>(2));
                 if (!pre_encrypt_hook::hook_address(addr, name, buf_reg, sz_reg))
                     return tool_result_t::error("Failed to hook address " + addr_str);
-                if (!pre_encrypt_hook::start_polling()) {
+                const bool started_polling = pre_encrypt_hook::start_polling();
+                if (!started_polling) {
                     DWORD err = pre_encrypt_hook::g_state.debugger_error.load();
+                    json r = pid == 0 ? pre_encrypt_status_payload() : pre_encrypt_status_payload(pid);
+                    r["operation"] = "hook_address";
+                    r["address"] = hex_u64(addr);
+                    r["name"] = name;
+                    r["started_polling"] = false;
+                    r["hooked"] = false;
+                    r["start_error"] = static_cast<unsigned long>(err);
                     pre_encrypt_hook::unhook_all();
                     return tool_result_t::error("Failed to start authorized debug capture for address " + addr_str +
-                                                ", error=" + std::to_string(static_cast<unsigned long>(err)));
+                                                ", error=" + std::to_string(static_cast<unsigned long>(err)), r);
                 }
-                return tool_result_t::ok("Hooked " + name + " at " + addr_str);
+                json r = pid == 0 ? pre_encrypt_status_payload() : pre_encrypt_status_payload(pid);
+                json hook;
+                const bool found = pre_encrypt_find_hook(addr, hook);
+                r["operation"] = "hook_address";
+                r["address"] = hex_u64(addr);
+                r["name"] = name;
+                r["hooked"] = found && hook.value("hooked", false);
+                r["bp_slot"] = found ? hook.value("bp_slot", 0u) : 0u;
+                r["started_polling"] = started_polling;
+                if (found)
+                    r["hook"] = std::move(hook);
+                return tool_result_t::ok("Hooked " + name + " at " + addr_str, r);
             }
             if (op == "unhook_all") {
-                pre_encrypt_hook::unhook_all();
-                return tool_result_t::ok("All pre-encryption hooks removed");
+                json before = pre_encrypt_status_payload();
+                const uint32_t removed = pre_encrypt_hook::unhook_all();
+                json r = pre_encrypt_status_payload();
+                r["operation"] = "unhook_all";
+                r["unhooked_count"] = removed;
+                r["removed_hook_count"] = removed;
+                r["hook_count_before"] = before.value("hook_count", 0);
+                r["capture_count_before"] = before.value("capture_count", 0);
+                r["hooked"] = false;
+                return tool_result_t::ok("All pre-encryption hooks removed", r);
             }
             if (op == "get_captures") {
                 size_t max_count = args.value("max_count", 64);
@@ -2903,22 +3284,18 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 return tool_result_t::ok(std::to_string(caps.size()) + " plaintext captures", arr);
             }
             if (op == "clear") {
-                pre_encrypt_hook::clear_captures();
-                return tool_result_t::ok("Pre-encryption captures cleared");
+                const size_t cleared = pre_encrypt_hook::clear_captures();
+                json r = pre_encrypt_status_payload();
+                r["operation"] = "clear";
+                r["cleared_count"] = cleared;
+                r["clear_count"] = cleared;
+                r["hooked"] = r.value("hook_count", 0) > 0;
+                return tool_result_t::ok("Pre-encryption captures cleared", r);
             }
             if (op == "status") {
-                json r;
-                r["active"] = pre_encrypt_hook::is_active();
-                r["debug_attached"] = pre_encrypt_hook::g_state.debug_attached.load();
-                r["debug_loop_running"] = pre_encrypt_hook::g_state.debug_loop_running.load();
-                r["debugger_error"] = static_cast<unsigned long>(pre_encrypt_hook::g_state.debugger_error.load());
-                std::lock_guard<std::mutex> lock(pre_encrypt_hook::g_state.mutex);
-                r["hook_count"] = static_cast<int>(pre_encrypt_hook::g_state.targets.size());
-                r["capture_count"] = static_cast<int>(pre_encrypt_hook::g_state.captures.size());
-                uint32_t armed_thread_breakpoints = 0;
-                for (const auto& t : pre_encrypt_hook::g_state.targets)
-                    armed_thread_breakpoints += static_cast<uint32_t>(t.armed_tids.size());
-                r["armed_thread_breakpoints"] = armed_thread_breakpoints;
+                json r = pre_encrypt_status_payload();
+                r["operation"] = "status";
+                r["hooked"] = r.value("hook_count", 0) > 0;
                 return tool_result_t::ok(pre_encrypt_hook::is_active() ? "Active" : "Inactive", r);
             }
             return tool_result_t::error("Unknown operation '" + op + "'. Use auto_hook|hook_address|unhook_all|get_captures|clear|status");

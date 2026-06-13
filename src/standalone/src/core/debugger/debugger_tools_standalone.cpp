@@ -393,6 +393,164 @@ static std::optional<tool_result_t> reject_full_test_system_mutation(std::uint64
         OBFSTR("Full Test Lab refuses to mutate system module memory. Use a private target fixture address instead."));
 }
 
+static bool is_hardware_breakpoint(debugger_engine::bp_type_t type)
+{
+    return type == debugger_engine::bp_type_t::hardware_execute ||
+           type == debugger_engine::bp_type_t::hardware_write ||
+           type == debugger_engine::bp_type_t::hardware_read;
+}
+
+static const char* breakpoint_type_name(debugger_engine::bp_type_t type)
+{
+    switch (type) {
+    case debugger_engine::bp_type_t::software: return "software";
+    case debugger_engine::bp_type_t::hardware_execute: return "hardware_execute";
+    case debugger_engine::bp_type_t::hardware_write: return "hardware_write";
+    case debugger_engine::bp_type_t::hardware_read: return "hardware_read";
+    case debugger_engine::bp_type_t::memory_access: return "memory_access";
+    default: return "unknown";
+    }
+}
+
+static const char* breakpoint_state_name(debugger_engine::bp_state_t state)
+{
+    switch (state) {
+    case debugger_engine::bp_state_t::disabled: return "disabled";
+    case debugger_engine::bp_state_t::enabled: return "enabled";
+    case debugger_engine::bp_state_t::one_shot: return "one_shot";
+    default: return "unknown";
+    }
+}
+
+static const char* debugger_status_name(debugger_engine::dbg_status_t status)
+{
+    switch (status) {
+    case debugger_engine::dbg_status_t::idle: return "idle";
+    case debugger_engine::dbg_status_t::running: return "running";
+    case debugger_engine::dbg_status_t::paused: return "paused";
+    case debugger_engine::dbg_status_t::stepping: return "stepping";
+    case debugger_engine::dbg_status_t::terminated: return "terminated";
+    default: return "unknown";
+    }
+}
+
+static json breakpoint_entry_json(const debugger_engine::breakpoint_t& bp, std::size_t index)
+{
+    const bool hardware = is_hardware_breakpoint(bp.type);
+    const bool enabled = bp.state != debugger_engine::bp_state_t::disabled;
+    json e;
+    e["index"] = static_cast<int>(index);
+    e["address"] = sa_format_address(bp.address);
+    e["type"] = static_cast<int>(bp.type);
+    e["type_name"] = breakpoint_type_name(bp.type);
+    e["state"] = static_cast<int>(bp.state);
+    e["state_name"] = breakpoint_state_name(bp.state);
+    e["enabled"] = enabled;
+    e["one_shot"] = bp.state == debugger_engine::bp_state_t::one_shot;
+    e["hardware"] = hardware;
+    e["hw_slot"] = bp.hw_slot;
+    e["hw_slot_active"] = hardware && enabled && bp.hw_slot >= 0;
+    e["size"] = bp.size;
+    e["hit_count"] = bp.hit_count;
+    e["byte_written"] = bp.byte_written;
+    e["original_byte"] = static_cast<unsigned>(bp.original_byte);
+    e["name"] = bp.name;
+    if (!bp.condition.empty()) e["condition"] = bp.condition;
+    if (!bp.log_text.empty()) e["log_text"] = bp.log_text;
+    e["auto_continue"] = bp.auto_continue;
+    e["internal"] = bp.is_internal;
+    return e;
+}
+
+static std::size_t breakpoint_count()
+{
+    std::lock_guard<std::mutex> lk(debugger_engine::g_state.bp_mutex);
+    return debugger_engine::g_state.breakpoints.size();
+}
+
+static bool breakpoint_entry_by_index(int index, json& out)
+{
+    std::lock_guard<std::mutex> lk(debugger_engine::g_state.bp_mutex);
+    if (index < 0 || index >= static_cast<int>(debugger_engine::g_state.breakpoints.size()))
+        return false;
+    out = breakpoint_entry_json(debugger_engine::g_state.breakpoints[static_cast<std::size_t>(index)], static_cast<std::size_t>(index));
+    return true;
+}
+
+static std::size_t watch_count()
+{
+    std::lock_guard<std::mutex> lk(debugger_engine::g_state.watch_mutex);
+    return debugger_engine::g_state.watches.size();
+}
+
+static bool watch_entry_by_index(int index, json& out)
+{
+    std::lock_guard<std::mutex> lk(debugger_engine::g_state.watch_mutex);
+    if (index < 0 || index >= static_cast<int>(debugger_engine::g_state.watches.size()))
+        return false;
+    const auto& w = debugger_engine::g_state.watches[static_cast<std::size_t>(index)];
+    out["index"] = index;
+    out["expression"] = w.expression;
+    out["value"] = w.value;
+    out["type"] = w.type;
+    out["valid"] = w.valid;
+    out["error"] = w.error;
+    return true;
+}
+
+static std::size_t bookmark_count()
+{
+    std::lock_guard<std::mutex> lk(debugger_engine::g_state.anno_mutex);
+    return debugger_engine::g_state.bookmarks.size();
+}
+
+static bool bookmark_present(std::uint64_t address)
+{
+    std::lock_guard<std::mutex> lk(debugger_engine::g_state.anno_mutex);
+    const auto& bookmarks = debugger_engine::g_state.bookmarks;
+    return std::find(bookmarks.begin(), bookmarks.end(), address) != bookmarks.end();
+}
+
+static std::size_t patch_count()
+{
+    std::lock_guard<std::mutex> lk(code_patcher::g_state.mtx);
+    return code_patcher::g_state.patches.size();
+}
+
+static std::size_t active_patch_count()
+{
+    std::lock_guard<std::mutex> lk(code_patcher::g_state.mtx);
+    std::size_t count = 0;
+    for (const auto& p : code_patcher::g_state.patches)
+        if (p.active)
+            ++count;
+    return count;
+}
+
+static bool patch_entry_by_index(int index, json& out)
+{
+    std::lock_guard<std::mutex> lk(code_patcher::g_state.mtx);
+    if (index < 0 || index >= static_cast<int>(code_patcher::g_state.patches.size()))
+        return false;
+    const auto& p = code_patcher::g_state.patches[static_cast<std::size_t>(index)];
+    out["index"] = index;
+    out["address"] = sa_format_address(p.address);
+    out["description"] = p.description;
+    out["active"] = p.active;
+    out["timestamp"] = p.timestamp;
+    out["original_bytes"] = code_patcher::format_bytes(p.original_bytes);
+    out["patched_bytes"] = code_patcher::format_bytes(p.patched_bytes);
+    out["size"] = p.patched_bytes.size();
+    return true;
+}
+
+static void add_debugger_action_context(json& result, const char* action)
+{
+    result["action"] = action;
+    result["target_pid"] = driver_bridge::attached_pid();
+    result["active_tid"] = debugger_engine::g_state.active_tid;
+}
+
 static std::string trim_ascii(std::string s)
 {
     auto is_ws = [](char c) {
@@ -1992,6 +2150,18 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             else if (params.contains("wait") && params["wait"].is_boolean())
                 wait = params["wait"].get<bool>();
             uint32_t timeout_ms = static_cast<uint32_t>(int_param_clamped(params, "timeout_ms", 30000, 1, 300000));
+            const uint64_t started_ms = GetTickCount64();
+            const uint32_t pid_before = driver_bridge::attached_pid();
+            const uint32_t tid_before = debugger_engine::g_state.active_tid;
+            const auto status_before = debugger_engine::g_state.status.load(std::memory_order_acquire);
+            debugger_engine::register_set_t regs_before{};
+            bool regs_before_valid = false;
+            if (wait && tid_before != 0) {
+                regs_before = debugger_engine::get_registers();
+                regs_before_valid = true;
+            }
+            const bool already_reached = wait && regs_before_valid &&
+                (regs_before.rip == *addr || regs_before.rip == (*addr + 1));
             diag::log_tagged_fmt("dbg_tools", "dbg_run_to_address: running to 0x%llX wait=%d timeout_ms=%u attached_pid=%u active_tid=%u",
                 (unsigned long long)*addr,
                 wait ? 1 : 0,
@@ -1999,6 +2169,16 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 static_cast<unsigned>(driver_bridge::attached_pid()),
                 static_cast<unsigned>(debugger_engine::g_state.active_tid));
             bool ok = debugger_engine::run_to_address(*addr, wait, timeout_ms);
+            const uint64_t elapsed_ms = GetTickCount64() - started_ms;
+            const uint32_t pid_after = driver_bridge::attached_pid();
+            const uint32_t tid_after = debugger_engine::g_state.active_tid;
+            const auto status_after = debugger_engine::g_state.status.load(std::memory_order_acquire);
+            debugger_engine::register_set_t regs_after{};
+            bool regs_after_valid = false;
+            if (wait && tid_after != 0) {
+                regs_after = debugger_engine::get_registers();
+                regs_after_valid = true;
+            }
             diag::log_tagged_fmt("dbg_tools", "dbg_run_to_address: run_to_address returned ok=%d attached_pid=%u active_tid=%u last_error=%s",
                 (int)ok,
                 static_cast<unsigned>(driver_bridge::attached_pid()),
@@ -2006,7 +2186,34 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 debugger_engine::last_error().empty() ? "(empty)" : debugger_engine::last_error().c_str());
             if (!ok)
                 return tool_result_t::error(debugger_engine::last_error().empty() ? OBFSTR("run_to_address failed.") : debugger_engine::last_error());
-            return tool_result_t::ok(OBFSTR("Running to ") + sa_format_address(*addr));
+            json result;
+            result["pid"] = pid_after;
+            result["pid_before"] = pid_before;
+            result["address"] = sa_format_address(*addr);
+            result["tid"] = tid_after;
+            result["tid_before"] = tid_before;
+            result["status"] = debugger_status_name(status_after);
+            result["status_before"] = debugger_status_name(status_before);
+            result["already_reached"] = already_reached;
+            result["wait_for_completion"] = wait;
+            result["timeout_ms"] = timeout_ms;
+            result["elapsed_ms"] = elapsed_ms;
+            if (regs_before_valid)
+                result["rip_before"] = sa_format_address(regs_before.rip);
+            if (regs_after_valid)
+                result["rip_after"] = sa_format_address(regs_after.rip);
+            result["success"] = true;
+            result["engine_status"] = wait ? (already_reached ? "already_reached" : "reached") : "armed";
+            diag::log_tagged_fmt("dbg_tools",
+                "dbg_run_to_address: success pid=%u tid=%u status=%s already_reached=%d elapsed_ms=%llu rip_before=0x%llX rip_after=0x%llX",
+                static_cast<unsigned>(pid_after),
+                static_cast<unsigned>(tid_after),
+                debugger_status_name(status_after),
+                already_reached ? 1 : 0,
+                static_cast<unsigned long long>(elapsed_ms),
+                static_cast<unsigned long long>(regs_before_valid ? regs_before.rip : 0),
+                static_cast<unsigned long long>(regs_after_valid ? regs_after.rip : 0));
+            return tool_result_t::ok(OBFSTR("Running to ") + sa_format_address(*addr), result);
         }, false});
 
     srv.register_tool({
@@ -2226,25 +2433,16 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             json arr = json::array();
             for (size_t i = 0; i < debugger_engine::g_state.breakpoints.size(); ++i) {
                 const auto& bp = debugger_engine::g_state.breakpoints[i];
-                json e;
-                e["index"]   = static_cast<int>(i);
-                e["address"] = sa_format_address(bp.address);
-                e["type"]    = static_cast<int>(bp.type);
-                e["state"]   = static_cast<int>(bp.state);
-                e["size"]    = bp.size;
-                e["hit_count"] = bp.hit_count;
-                e["byte_written"] = bp.byte_written;
-                e["original_byte"] = static_cast<unsigned>(bp.original_byte);
-                if (!bp.name.empty())      e["name"]      = bp.name;
-                if (!bp.condition.empty()) e["condition"] = bp.condition;
-                if (!bp.log_text.empty())  e["log_text"]  = bp.log_text;
-                arr.push_back(std::move(e));
+                arr.push_back(breakpoint_entry_json(bp, i));
             }
             diag::log_tagged_fmt("dbg_tools", "debugger_get_breakpoints: returning %zu breakpoints", arr.size());
             json result;
+            result["target_pid"] = driver_bridge::attached_pid();
+            result["active_tid"] = debugger_engine::g_state.active_tid;
             result["count"]       = arr.size();
             result["breakpoints"] = std::move(arr);
-            return tool_result_t::ok(result);
+            return tool_result_t::ok(
+                std::to_string(result["count"].get<std::size_t>()) + OBFSTR(" breakpoint(s)."), result);
         }
     });
 
@@ -2359,8 +2557,11 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             diag::log_tagged_fmt("dbg_tools", "debugger_get_patches: entry");
             std::lock_guard<std::mutex> lk(code_patcher::g_state.mtx);
             json arr = json::array();
+            std::size_t active_count = 0;
             for (size_t i = 0; i < code_patcher::g_state.patches.size(); ++i) {
                 const auto& p = code_patcher::g_state.patches[i];
+                if (p.active)
+                    ++active_count;
                 json o;
                 o["index"]          = static_cast<int>(i);
                 o["address"]        = sa_format_address(p.address);
@@ -2373,9 +2574,13 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 arr.push_back(std::move(o));
             }
             json result;
+            result["target_pid"] = driver_bridge::attached_pid();
+            result["active_tid"] = debugger_engine::g_state.active_tid;
             result["count"]   = arr.size();
+            result["active_count"] = active_count;
             result["patches"] = std::move(arr);
-            return tool_result_t::ok(result);
+            return tool_result_t::ok(
+                std::to_string(result["count"].get<std::size_t>()) + OBFSTR(" patch(es)."), result);
         }
     });
 
@@ -2386,12 +2591,12 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
          {"type",    "string", "exec (software), read, write, access (default exec)", false},
          {"size",    "number", "Breakpoint size 1/2/4/8 (default 1)", false},
          {"name",    "string", "Optional label", false},
-         {"condition", "string", "Optional condition expression", false}},
+         {"condition", "string", "Optional condition expression", false},
+         {"target_pid", "number", "Optional PID override. Switches the active attach context for this call.", false}},
         false,
         [](const json& params) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "debugger_set_breakpoint: entry");
-            if (!device->is_connected())
-                return tool_result_t::error("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first.");
+            if (auto err = ensure_attached(params)) return *err;
             uint64_t addr = 0;
             if (params.contains("address") && params["address"].is_string()) {
                 auto p = sa_parse_address(params["address"].get<std::string>());
@@ -2419,6 +2624,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             std::string cond;
             if (params.contains("condition") && params["condition"].is_string())
                 cond = params["condition"].get<std::string>();
+            const std::size_t before_count = breakpoint_count();
             diag::log_tagged_fmt("dbg_tools", "debugger_set_breakpoint: addr=0x%llX type=%s size=%d", (unsigned long long)addr, type_str.c_str(), size);
             int idx = debugger_engine::add_breakpoint(addr, bp_type, name, cond, size);
             if (idx < 0) {
@@ -2428,11 +2634,25 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             }
             diag::log_tagged_fmt("dbg_tools", "debugger_set_breakpoint: BP set at 0x%llX idx=%d", (unsigned long long)addr, idx);
             json result;
+            add_debugger_action_context(result, "debugger_set_breakpoint");
+            result["success"] = true;
             result["index"]   = idx;
             result["address"] = sa_format_address(addr);
             result["type"]    = type_str;
+            result["type_name"] = breakpoint_type_name(bp_type);
             result["size"]    = size;
-            return tool_result_t::ok(result);
+            result["breakpoint_count_before"] = before_count;
+            result["breakpoint_count_after"] = breakpoint_count();
+            json entry;
+            if (breakpoint_entry_by_index(idx, entry)) {
+                result["enabled"] = entry.value("enabled", true);
+                result["hardware"] = entry.value("hardware", false);
+                result["hw_slot"] = entry.value("hw_slot", -1);
+                result["hw_slot_active"] = entry.value("hw_slot_active", false);
+                result["breakpoint"] = std::move(entry);
+            }
+            return tool_result_t::ok(
+                OBFSTR("Breakpoint set at ") + sa_format_address(addr), result);
         }
     });
 
@@ -2440,10 +2660,12 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         "debugger_remove_breakpoint",
         "Remove a breakpoint tracked by the debugger engine by index OR by address.",
         {{"index",   "number", "Breakpoint index from debugger_get_breakpoints", false},
-         {"address", "string", "Breakpoint address (hex). Used when index is absent.", false}},
+         {"address", "string", "Breakpoint address (hex). Used when index is absent.", false},
+         {"target_pid", "number", "Optional PID override. Switches the active attach context for this call.", false}},
         false,
         [](const json& params) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "debugger_remove_breakpoint: entry");
+            if (auto err = ensure_attached(params)) return *err;
             int idx = -1;
             if (params.contains("index") && params["index"].is_number_integer()) {
                 idx = params["index"].get<int>();
@@ -2461,6 +2683,10 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             } else {
                 return tool_result_t::error("Provide 'index' or 'address'.");
             }
+            const std::size_t before_count = breakpoint_count();
+            json removed_entry;
+            if (!breakpoint_entry_by_index(idx, removed_entry))
+                return tool_result_t::error("Breakpoint index is out of range.");
             diag::log_tagged_fmt("dbg_tools", "debugger_remove_breakpoint: removing idx=%d", idx);
             if (!debugger_engine::remove_breakpoint(idx)) {
                 diag::log_tagged_fmt("dbg_tools", "debugger_remove_breakpoint: remove failed: %s", debugger_engine::last_error().c_str());
@@ -2469,9 +2695,19 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             }
             diag::log_tagged_fmt("dbg_tools", "debugger_remove_breakpoint: removed idx=%d", idx);
             json result;
-            result["index"]  = idx;
+            add_debugger_action_context(result, "debugger_remove_breakpoint");
+            result["success"] = true;
+            result["index"] = idx;
+            result["address"] = removed_entry.value("address", std::string{});
+            result["enabled"] = removed_entry.value("enabled", false);
+            result["hardware"] = removed_entry.value("hardware", false);
+            result["hw_slot"] = removed_entry.value("hw_slot", -1);
+            result["hw_slot_active"] = false;
+            result["breakpoint_count_before"] = before_count;
+            result["breakpoint_count_after"] = breakpoint_count();
+            result["removed"] = std::move(removed_entry);
             result["status"] = "removed";
-            return tool_result_t::ok(result);
+            return tool_result_t::ok(OBFSTR("Breakpoint removed."), result);
         }
     });
 
@@ -2558,10 +2794,21 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 return tool_result_t::error(OBFSTR("'expression' is required."));
             const std::string expr = params["expression"].get<std::string>();
             diag::log_tagged_fmt("dbg_tools", "dbg_add_watch: expr=%s", expr.c_str());
-            debugger_engine::add_watch(expr);
+            const std::size_t before_count = watch_count();
+            const int idx = debugger_engine::add_watch(expr);
             debugger_engine::refresh_watches();
             diag::log_tagged_fmt("dbg_tools", "dbg_add_watch: watch added and refreshed");
-            return tool_result_t::ok(OBFSTR("Watch added."));
+            json result;
+            add_debugger_action_context(result, "dbg_add_watch");
+            result["success"] = idx >= 0;
+            result["index"] = idx;
+            result["expression"] = expr;
+            result["watch_count_before"] = before_count;
+            result["watch_count_after"] = watch_count();
+            json entry;
+            if (idx >= 0 && watch_entry_by_index(idx, entry))
+                result["watch"] = std::move(entry);
+            return tool_result_t::ok(OBFSTR("Watch added."), result);
         }, false});
 
     register_compat(srv, {
@@ -2574,9 +2821,21 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 return tool_result_t::error(OBFSTR("'index' required."));
             int idx = params["index"].get<int>();
             diag::log_tagged_fmt("dbg_tools", "dbg_remove_watch: removing watch idx=%d", idx);
-            debugger_engine::remove_watch(idx);
+            const std::size_t before_count = watch_count();
+            json removed_entry;
+            const bool had_entry = watch_entry_by_index(idx, removed_entry);
+            if (!debugger_engine::remove_watch(idx))
+                return tool_result_t::error(OBFSTR("Watch index is out of range."));
             diag::log_tagged_fmt("dbg_tools", "dbg_remove_watch: removed");
-            return tool_result_t::ok(OBFSTR("Watch removed."));
+            json result;
+            add_debugger_action_context(result, "dbg_remove_watch");
+            result["success"] = true;
+            result["index"] = idx;
+            result["watch_count_before"] = before_count;
+            result["watch_count_after"] = watch_count();
+            if (had_entry)
+                result["removed"] = std::move(removed_entry);
+            return tool_result_t::ok(OBFSTR("Watch removed."), result);
         }, false});
 
     register_compat(srv, {
@@ -2619,9 +2878,20 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             auto addr = sa_parse_address(params["address"].get<std::string>());
             if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
             diag::log_tagged_fmt("dbg_tools", "dbg_toggle_bookmark: addr=0x%llX", (unsigned long long)*addr);
+            const std::size_t before_count = bookmark_count();
+            const bool enabled_before = bookmark_present(*addr);
             debugger_engine::toggle_bookmark(*addr);
+            const bool enabled_after = bookmark_present(*addr);
             diag::log_tagged_fmt("dbg_tools", "dbg_toggle_bookmark: toggled");
-            return tool_result_t::ok(OBFSTR("Bookmark toggled at ") + sa_format_address(*addr));
+            json result;
+            add_debugger_action_context(result, "dbg_toggle_bookmark");
+            result["success"] = true;
+            result["address"] = sa_format_address(*addr);
+            result["enabled_before"] = enabled_before;
+            result["enabled"] = enabled_after;
+            result["bookmark_count_before"] = before_count;
+            result["bookmark_count_after"] = bookmark_count();
+            return tool_result_t::ok(OBFSTR("Bookmark toggled at ") + sa_format_address(*addr), result);
         }, false});
 
     register_compat(srv, {
@@ -2684,13 +2954,32 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             if (size != 1 && size != 2 && size != 4 && size != 8)
                 return tool_result_t::error(OBFSTR("'size' must be 1, 2, 4, or 8."));
             diag::log_tagged_fmt("dbg_tools", "dbg_add_hw_breakpoint: addr=0x%llX type=%s size=%d", (unsigned long long)*addr, type_str.c_str(), size);
+            const std::size_t before_count = breakpoint_count();
             int idx = debugger_engine::add_breakpoint(*addr, bpt, "", "", size);
             if (idx < 0) {
                 diag::log_tagged_fmt("dbg_tools", "dbg_add_hw_breakpoint: add_breakpoint failed: %s", debugger_engine::last_error().c_str());
                 return tool_result_t::error(debugger_engine::last_error());
             }
             diag::log_tagged_fmt("dbg_tools", "dbg_add_hw_breakpoint: HW BP set at 0x%llX idx=%d", (unsigned long long)*addr, idx);
-            return tool_result_t::ok(OBFSTR("Hardware breakpoint set at ") + sa_format_address(*addr));
+            json result;
+            add_debugger_action_context(result, "dbg_add_hw_breakpoint");
+            result["success"] = true;
+            result["index"] = idx;
+            result["address"] = sa_format_address(*addr);
+            result["type"] = type_str;
+            result["type_name"] = breakpoint_type_name(bpt);
+            result["size"] = size;
+            result["breakpoint_count_before"] = before_count;
+            result["breakpoint_count_after"] = breakpoint_count();
+            json entry;
+            if (breakpoint_entry_by_index(idx, entry)) {
+                result["enabled"] = entry.value("enabled", true);
+                result["hardware"] = entry.value("hardware", true);
+                result["hw_slot"] = entry.value("hw_slot", -1);
+                result["hw_slot_active"] = entry.value("hw_slot_active", false);
+                result["breakpoint"] = std::move(entry);
+            }
+            return tool_result_t::ok(OBFSTR("Hardware breakpoint set at ") + sa_format_address(*addr), result);
         }, false});
 
 
@@ -2700,9 +2989,15 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         {},
         [](const json&) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "dbg_clear_all_breakpoints: entry");
+            const std::size_t before_count = breakpoint_count();
             debugger_engine::clear_all_breakpoints();
             diag::log_tagged_fmt("dbg_tools", "dbg_clear_all_breakpoints: all breakpoints cleared");
-            return tool_result_t::ok(OBFSTR("All breakpoints cleared."));
+            json result;
+            add_debugger_action_context(result, "dbg_clear_all_breakpoints");
+            result["success"] = true;
+            result["breakpoint_count_before"] = before_count;
+            result["breakpoint_count_after"] = breakpoint_count();
+            return tool_result_t::ok(OBFSTR("All breakpoints cleared."), result);
         }, false});
 
 
@@ -2866,8 +3161,15 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 mj["name"] = m.name;
                 mj["base"] = sa_format_address(m.base);
                 mj["size"] = m.size;
+                mj["max_exports"] = max_exports;
+                mj["max_imports"] = max_imports;
+                mj["exports_requested"] = max_exports > 0;
+                mj["imports_requested"] = max_imports > 0;
+                mj["exports_omitted_by_request"] = false;
+                mj["imports_omitted_by_request"] = false;
                 pe_parser::pe_info_t pe;
                 if (pe_parser::parse(m.base, pe, false)) {
+                    mj["pe_parsed"] = true;
                     mj["entry_point"] = sa_format_address(pe.entry_point);
                     mj["is_64bit"] = pe.is_64bit;
                     json sections = json::array();
@@ -2900,6 +3202,8 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                     } else {
                         mj["export_count"] = 0;
                         mj["exports_truncated"] = false;
+                        mj["exports_omitted_by_request"] = true;
+                        mj["exports_omitted_reason"] = "max_exports_zero";
                     }
                     mj["exports"] = std::move(exp_arr);
                     json imp_arr = json::array();
@@ -2922,8 +3226,22 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                     } else {
                         mj["import_count"] = 0;
                         mj["imports_truncated"] = false;
+                        mj["imports_omitted_by_request"] = true;
+                        mj["imports_omitted_reason"] = "max_imports_zero";
                     }
                     mj["imports"] = std::move(imp_arr);
+                } else {
+                    mj["pe_parsed"] = false;
+                    mj["export_count"] = 0;
+                    mj["import_count"] = 0;
+                    mj["exports_truncated"] = false;
+                    mj["imports_truncated"] = false;
+                    mj["exports_omitted_by_request"] = max_exports == 0;
+                    mj["imports_omitted_by_request"] = max_imports == 0;
+                    mj["exports_omitted_reason"] = max_exports == 0 ? "max_exports_zero" : "pe_parse_failed";
+                    mj["imports_omitted_reason"] = max_imports == 0 ? "max_imports_zero" : "pe_parse_failed";
+                    mj["exports"] = json::array();
+                    mj["imports"] = json::array();
                 }
                 arr.push_back(std::move(mj));
             }
@@ -2937,6 +3255,14 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             result["max_exports"] = max_exports;
             result["max_imports"] = max_imports;
             result["timeout_ms"] = timeout_ms;
+            result["request"] = {
+                {"module_name", filter},
+                {"max_modules", max_modules},
+                {"max_exports", max_exports},
+                {"max_imports", max_imports},
+                {"timeout_ms", timeout_ms},
+                {"allow_partial", allow_partial}
+            };
             result["modules"] = std::move(arr);
             diag::log_tagged_fmt("dbg_tools", "dbg_get_modules_detail: returning %zu modules truncated=%d timed_out=%d",
                 count, truncated ? 1 : 0, timed_out ? 1 : 0);
@@ -2969,6 +3295,8 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 label = params["label"].get<std::string>();
             if (auto reject = reject_full_test_system_mutation(*addr, static_cast<std::uint64_t>(patched.size()), "dbg_add_patch"))
                 return *reject;
+            const std::size_t before_count = patch_count();
+            const std::size_t before_active_count = active_patch_count();
             diag::log_tagged_fmt("dbg_tools", "dbg_add_patch: addr=0x%llX size=%zu label=%s", (unsigned long long)*addr, patched.size(), label.c_str());
             int idx = code_patcher::create_patch(*addr, patched, label);
             if (idx < 0) {
@@ -2980,13 +3308,36 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 return tool_result_t::error(OBFSTR("Patch created but failed to apply."));
             }
             diag::log_tagged_fmt("dbg_tools", "dbg_add_patch: patch applied at 0x%llX idx=%d", (unsigned long long)*addr, idx);
+            std::vector<std::uint8_t> readback;
+            const bool readback_ok = driver_bridge::read_memory(*addr, patched.size(), readback) && readback.size() >= patched.size();
+            if (readback.size() > patched.size())
+                readback.resize(patched.size());
+            const bool verified = readback_ok && readback == patched;
             json result;
+            add_debugger_action_context(result, "dbg_add_patch");
+            result["success"] = !readback_ok || verified;
             result["index"] = idx;
             result["address"] = sa_format_address(*addr);
             result["size"] = patched.size();
             result["bytes"] = code_patcher::format_bytes(patched);
-            return tool_result_t::ok(
-                OBFSTR("Patch applied at ") + sa_format_address(*addr) + OBFSTR(" (") + std::to_string(patched.size()) + OBFSTR(" bytes)."), result);
+            result["bytes_written"] = patched.size();
+            result["patch_count_before"] = before_count;
+            result["patch_count_after"] = patch_count();
+            result["active_patch_count_before"] = before_active_count;
+            result["active_patch_count_after"] = active_patch_count();
+            result["readback_ok"] = readback_ok;
+            result["verified"] = verified;
+            if (readback_ok)
+                result["readback"] = code_patcher::format_bytes(readback);
+            json entry;
+            if (patch_entry_by_index(idx, entry)) {
+                result["active"] = entry.value("active", true);
+                result["patch"] = std::move(entry);
+            }
+            const std::string summary = OBFSTR("Patch applied at ") + sa_format_address(*addr) + OBFSTR(" (") + std::to_string(patched.size()) + OBFSTR(" bytes).");
+            if (readback_ok && !verified)
+                return tool_result_t{false, OBFSTR("Patch write verification failed."), result};
+            return tool_result_t::ok(summary, result);
         }, false});
 
     register_compat(srv, {
@@ -2999,16 +3350,80 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 return tool_result_t::error(OBFSTR("'index' is required."));
             int idx = params["index"].get<int>();
             diag::log_tagged_fmt("dbg_tools", "dbg_remove_patch: reverting and removing idx=%d", idx);
+            const std::size_t before_count = patch_count();
+            const std::size_t before_active_count = active_patch_count();
+            std::uint64_t patch_address = 0;
+            std::vector<std::uint8_t> original_bytes;
+            std::vector<std::uint8_t> patched_bytes;
+            json removed_entry;
+            {
+                std::lock_guard<std::mutex> lk(code_patcher::g_state.mtx);
+                if (idx < 0 || idx >= static_cast<int>(code_patcher::g_state.patches.size()))
+                    return tool_result_t::error(OBFSTR("Patch index is out of range."));
+                const auto& p = code_patcher::g_state.patches[static_cast<std::size_t>(idx)];
+                patch_address = p.address;
+                original_bytes = p.original_bytes;
+                patched_bytes = p.patched_bytes;
+                removed_entry["index"] = idx;
+                removed_entry["address"] = sa_format_address(p.address);
+                removed_entry["description"] = p.description;
+                removed_entry["active"] = p.active;
+                removed_entry["timestamp"] = p.timestamp;
+                removed_entry["original_bytes"] = code_patcher::format_bytes(p.original_bytes);
+                removed_entry["patched_bytes"] = code_patcher::format_bytes(p.patched_bytes);
+                removed_entry["size"] = p.patched_bytes.size();
+            }
             if (!code_patcher::revert_patch(idx)) {
                 diag::log_tagged_fmt("dbg_tools", "dbg_remove_patch: revert_patch failed for idx=%d", idx);
                 return tool_result_t::error(OBFSTR("Failed to revert patch."));
+            }
+            std::vector<std::uint8_t> readback;
+            const bool readback_ok = !original_bytes.empty() &&
+                driver_bridge::read_memory(patch_address, original_bytes.size(), readback) &&
+                readback.size() >= original_bytes.size();
+            if (readback.size() > original_bytes.size())
+                readback.resize(original_bytes.size());
+            const bool verified = readback_ok && readback == original_bytes;
+            if (readback_ok && !verified) {
+                json result;
+                add_debugger_action_context(result, "dbg_remove_patch");
+                result["success"] = false;
+                result["index"] = idx;
+                result["address"] = sa_format_address(patch_address);
+                result["bytes_written"] = original_bytes.size();
+                result["readback_ok"] = readback_ok;
+                result["verified"] = false;
+                result["readback"] = code_patcher::format_bytes(readback);
+                result["expected"] = code_patcher::format_bytes(original_bytes);
+                result["patch_count_before"] = before_count;
+                result["patch_count_after"] = patch_count();
+                result["active_patch_count_before"] = before_active_count;
+                result["active_patch_count_after"] = active_patch_count();
+                result["removed"] = std::move(removed_entry);
+                return tool_result_t{false, OBFSTR("Patch revert verification failed."), result};
             }
             if (!code_patcher::remove_patch(idx)) {
                 diag::log_tagged_fmt("dbg_tools", "dbg_remove_patch: remove_patch failed for idx=%d", idx);
                 return tool_result_t::error(OBFSTR("Failed to remove patch."));
             }
             diag::log_tagged_fmt("dbg_tools", "dbg_remove_patch: patch removed idx=%d", idx);
-            return tool_result_t::ok(OBFSTR("Patch removed."));
+            json result;
+            add_debugger_action_context(result, "dbg_remove_patch");
+            result["success"] = true;
+            result["index"] = idx;
+            result["address"] = sa_format_address(patch_address);
+            result["size"] = patched_bytes.size();
+            result["bytes_written"] = original_bytes.size();
+            result["patch_count_before"] = before_count;
+            result["patch_count_after"] = patch_count();
+            result["active_patch_count_before"] = before_active_count;
+            result["active_patch_count_after"] = active_patch_count();
+            result["readback_ok"] = readback_ok;
+            result["verified"] = verified;
+            if (readback_ok)
+                result["readback"] = code_patcher::format_bytes(readback);
+            result["removed"] = std::move(removed_entry);
+            return tool_result_t::ok(OBFSTR("Patch removed."), result);
         }, false});
 
 
@@ -3032,20 +3447,47 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             if (auto reject = reject_full_test_system_mutation(*addr, static_cast<std::uint64_t>(size), "dbg_nop_fill"))
                 return *reject;
             diag::log_tagged_fmt("dbg_tools", "dbg_nop_fill: addr=0x%llX size=%d", (unsigned long long)*addr, size);
-            if (!code_patcher::nop_region(*addr, static_cast<size_t>(size), OBFSTR("NOP fill"))) {
+            const std::size_t before_count = patch_count();
+            const std::size_t before_active_count = active_patch_count();
+            std::vector<std::uint8_t> nops(static_cast<std::size_t>(size), 0x90);
+            int idx = code_patcher::create_patch(*addr, nops, OBFSTR("NOP fill"));
+            if (idx < 0) {
                 diag::log_tagged_fmt("dbg_tools", "dbg_nop_fill: nop_region failed at 0x%llX", (unsigned long long)*addr);
                 return tool_result_t::error(OBFSTR("Failed to NOP-fill region."));
             }
-            int idx = static_cast<int>(code_patcher::count()) - 1;
             if (!code_patcher::apply_patch(idx))
                 return tool_result_t::error(OBFSTR("NOP patch created but failed to apply."));
+            std::vector<std::uint8_t> readback;
+            const bool readback_ok = driver_bridge::read_memory(*addr, nops.size(), readback) && readback.size() >= nops.size();
+            if (readback.size() > nops.size())
+                readback.resize(nops.size());
+            const bool verified = readback_ok && readback == nops;
             json result;
+            add_debugger_action_context(result, "dbg_nop_fill");
+            result["success"] = !readback_ok || verified;
             result["index"] = idx;
             result["address"] = sa_format_address(*addr);
             result["size"] = size;
+            result["bytes"] = code_patcher::format_bytes(nops);
+            result["bytes_written"] = nops.size();
+            result["patch_count_before"] = before_count;
+            result["patch_count_after"] = patch_count();
+            result["active_patch_count_before"] = before_active_count;
+            result["active_patch_count_after"] = active_patch_count();
+            result["readback_ok"] = readback_ok;
+            result["verified"] = verified;
+            if (readback_ok)
+                result["readback"] = code_patcher::format_bytes(readback);
+            json entry;
+            if (patch_entry_by_index(idx, entry)) {
+                result["active"] = entry.value("active", true);
+                result["patch"] = std::move(entry);
+            }
             diag::log_tagged_fmt("dbg_tools", "dbg_nop_fill: NOP-filled %d bytes at 0x%llX", size, (unsigned long long)*addr);
-            return tool_result_t::ok(
-                OBFSTR("NOP-filled ") + std::to_string(size) + OBFSTR(" bytes at ") + sa_format_address(*addr), result);
+            const std::string summary = OBFSTR("NOP-filled ") + std::to_string(size) + OBFSTR(" bytes at ") + sa_format_address(*addr);
+            if (readback_ok && !verified)
+                return tool_result_t{false, OBFSTR("NOP fill verification failed."), result};
+            return tool_result_t::ok(summary, result);
         }, false});
 
     register_compat(srv, {
@@ -3111,15 +3553,30 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
             std::string cond = params["condition"].get<std::string>();
             diag::log_tagged_fmt("dbg_tools", "dbg_conditional_breakpoint: addr=0x%llX cond=%s", (unsigned long long)*addr, cond.c_str());
+            const std::size_t before_count = breakpoint_count();
             int bp_idx = debugger_engine::add_breakpoint(*addr, debugger_engine::bp_type_t::software, "", cond);
             if (bp_idx < 0) {
                 diag::log_tagged_fmt("dbg_tools", "dbg_conditional_breakpoint: add_breakpoint failed: %s", debugger_engine::last_error().c_str());
                 return tool_result_t::error(OBFSTR("Failed to add breakpoint."));
             }
             json result;
+            add_debugger_action_context(result, "dbg_conditional_breakpoint");
+            result["success"] = true;
             result["index"] = bp_idx;
             result["address"] = sa_format_address(*addr);
             result["condition"] = cond;
+            result["type"] = "software";
+            result["type_name"] = breakpoint_type_name(debugger_engine::bp_type_t::software);
+            result["breakpoint_count_before"] = before_count;
+            result["breakpoint_count_after"] = breakpoint_count();
+            json entry;
+            if (breakpoint_entry_by_index(bp_idx, entry)) {
+                result["enabled"] = entry.value("enabled", true);
+                result["hardware"] = entry.value("hardware", false);
+                result["hw_slot"] = entry.value("hw_slot", -1);
+                result["hw_slot_active"] = entry.value("hw_slot_active", false);
+                result["breakpoint"] = std::move(entry);
+            }
             diag::log_tagged_fmt("dbg_tools", "dbg_conditional_breakpoint: BP set at 0x%llX idx=%d cond=%s", (unsigned long long)*addr, bp_idx, cond.c_str());
             return tool_result_t::ok(
                 OBFSTR("Conditional breakpoint set at ") + sa_format_address(*addr) + OBFSTR(" [condition: ") + cond + OBFSTR("]"), result);

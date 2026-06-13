@@ -1,5 +1,6 @@
 #include "test_lab.hpp"
 #include "test_lab_format.hpp"
+#include "../runtime/standalone_driver.hpp"
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include "../../../../driver/comm.h"
@@ -48,6 +49,12 @@ namespace {
 	std::string format_dec_i32(std::int32_t v) {
 		char buf[16];
 		std::snprintf(buf, sizeof(buf), "%d", v);
+		return std::string(buf);
+	}
+
+	std::string format_dec_u64(std::uint64_t v) {
+		char buf[32];
+		std::snprintf(buf, sizeof(buf), "%llu", static_cast<unsigned long long>(v));
 		return std::string(buf);
 	}
 
@@ -205,6 +212,46 @@ namespace {
 		r.parsed.push_back({ label, format_dec_i32(fx.recv_bytes) });
 		std::snprintf(label, sizeof(label), "%s_recv_error", prefix);
 		r.parsed.push_back({ label, format_dec_i32(fx.recv_error) });
+	}
+
+	bool send_ihld_logged(const char* step,
+		voyager::detail::intercept_request& req,
+		std::uint32_t& bytes_returned,
+		DWORD& gle_out,
+		std::uint64_t& elapsed_ms_out)
+	{
+		const std::uint32_t attached_pid = driver_bridge::attached_pid();
+		const ULONGLONG start = GetTickCount64();
+		bytes_returned = 0;
+		SetLastError(ERROR_SUCCESS);
+		bool ok = device->send_ioctl_raw(ioctl_codes::IHLD(), &req,
+			static_cast<std::uint32_t>(sizeof(req)), bytes_returned);
+		gle_out = ok ? ERROR_SUCCESS : GetLastError();
+		elapsed_ms_out = static_cast<std::uint64_t>(GetTickCount64() - start);
+		const std::int32_t synthetic_ntstatus = ok ? 0 : static_cast<std::int32_t>(0xC0000001u);
+		test_lab_format::testlab_diag_log_step("module", "IHLD", step,
+			"status=%s ok=%d gle=%lu synthetic_ntstatus=0x%08X bytes_returned=%u op=%u filter_pid=%u filter_protocol=%u filter_port=%u hold_id=%llu attached_pid=%u intercepting=%u held_count=%u modify_payload_size=%u elapsed_ms=%llu",
+			ok ? "success" : "ioctl_failed",
+			ok ? 1 : 0,
+			static_cast<unsigned long>(gle_out),
+			static_cast<unsigned>(synthetic_ntstatus),
+			bytes_returned,
+			req.operation,
+			req.filter_pid,
+			req.filter_protocol,
+			req.filter_port,
+			static_cast<unsigned long long>(req.hold_id),
+			attached_pid,
+			req.intercepting,
+			req.held_count,
+			req.modify_payload_size,
+			static_cast<unsigned long long>(elapsed_ms_out));
+		if (!ok) {
+			const std::string bridge_error = driver_bridge::last_error();
+			test_lab_format::testlab_diag_log_step("module", "IHLD", step,
+				"driver_last_error=\"%s\"", bridge_error.c_str());
+		}
+		return ok;
 	}
 
 	void render_inputs_pmod(test_lab::state_t& s) {
@@ -678,16 +725,36 @@ namespace {
 				return;
 			}
 			const std::uint32_t self_pid = static_cast<std::uint32_t>(GetCurrentProcessId());
+			const std::uint32_t attached_pid = driver_bridge::attached_pid();
 			r.parsed.push_back({ "requested_pid_filter", format_dec_u32(s.pid) });
 			r.parsed.push_back({ "requested_protocol_filter", format_dec_u32(s.u32_b) });
 			r.parsed.push_back({ "requested_port_filter", format_dec_u32(s.size) });
 			r.parsed.push_back({ "stimulus_pid", format_dec_u32(self_pid) });
+			r.parsed.push_back({ "attached_pid", format_dec_u32(attached_pid) });
+			test_lab_format::testlab_diag_log_step("module", "IHLD", "deterministic_begin",
+				"stimulus_pid=%u attached_pid=%u requested_filter_pid=%u requested_filter_protocol=%u requested_filter_port=%llu",
+				self_pid,
+				attached_pid,
+				s.pid,
+				s.u32_b,
+				static_cast<unsigned long long>(s.size));
 			loopback_tcp_fixture_t fx;
 			std::string fixture_diag;
+			const ULONGLONG fixture_start = GetTickCount64();
 			bool fixture_ok = open_loopback_tcp_fixture(fx, fixture_diag);
+			const std::uint64_t fixture_elapsed = static_cast<std::uint64_t>(GetTickCount64() - fixture_start);
 			r.parsed.push_back({ "loopback_fixture_ok", fixture_ok ? "1" : "0" });
 			r.parsed.push_back({ "loopback_fixture_diag", fixture_diag });
+			r.parsed.push_back({ "loopback_fixture_elapsed_ms", format_dec_u64(fixture_elapsed) });
 			append_loopback_fields(r, fx, "loopback_before_intercept");
+			test_lab_format::testlab_diag_log_step("module", "IHLD", "loopback_open",
+				"ok=%d diag=\"%s\" listen_port=%u client_port=%u setup_wsa_error=%d elapsed_ms=%llu",
+				fixture_ok ? 1 : 0,
+				fixture_diag.c_str(),
+				fx.listen_port,
+				fx.client_port,
+				fx.setup_wsa_error,
+				static_cast<unsigned long long>(fixture_elapsed));
 			if (!fixture_ok) {
 				r.error = "loopback TCP fixture failed before IHLD intercept start";
 				r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
@@ -697,10 +764,13 @@ namespace {
 			voyager::detail::intercept_request clear_req{};
 			clear_req.operation = 1u;
 			std::uint32_t clear_bytes = 0;
-			bool clear_ok = device->send_ioctl_raw(ioctl_codes::IHLD(), &clear_req,
-				static_cast<std::uint32_t>(sizeof(clear_req)), clear_bytes);
+			DWORD clear_gle = ERROR_SUCCESS;
+			std::uint64_t clear_elapsed = 0;
+			bool clear_ok = send_ihld_logged("preclear", clear_req, clear_bytes, clear_gle, clear_elapsed);
 			r.parsed.push_back({ "intercept_preclear_ok", clear_ok ? "1" : "0" });
 			r.parsed.push_back({ "intercept_preclear_bytes", format_dec_u32(clear_bytes) });
+			r.parsed.push_back({ "intercept_preclear_gle", format_dec_u32(static_cast<std::uint32_t>(clear_gle)) });
+			r.parsed.push_back({ "intercept_preclear_elapsed_ms", format_dec_u64(clear_elapsed) });
 			if (!clear_ok) {
 				r.error = "IHLD preclear failed before deterministic intercept start";
 				r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
@@ -712,10 +782,13 @@ namespace {
 			start_req.filter_pid = self_pid;
 			start_req.filter_protocol = 6u;
 			std::uint32_t start_bytes = 0;
-			bool start_ok = device->send_ioctl_raw(ioctl_codes::IHLD(), &start_req,
-				static_cast<std::uint32_t>(sizeof(start_req)), start_bytes);
+			DWORD start_gle = ERROR_SUCCESS;
+			std::uint64_t start_elapsed = 0;
+			bool start_ok = send_ihld_logged("start", start_req, start_bytes, start_gle, start_elapsed);
 			r.parsed.push_back({ "intercept_start_ok", start_ok ? "1" : "0" });
 			r.parsed.push_back({ "intercept_start_bytes", format_dec_u32(start_bytes) });
+			r.parsed.push_back({ "intercept_start_gle", format_dec_u32(static_cast<std::uint32_t>(start_gle)) });
+			r.parsed.push_back({ "intercept_start_elapsed_ms", format_dec_u64(start_elapsed) });
 			r.parsed.push_back({ "intercepting_after_start", format_dec_u32(start_req.intercepting) });
 			if (!start_ok) {
 				r.error = "IHLD deterministic intercept start failed";
@@ -723,27 +796,50 @@ namespace {
 				r.ok = false;
 				return;
 			}
+			const ULONGLONG traffic_start = GetTickCount64();
 			bool traffic_ok = emit_loopback_http(fx, "ihld");
+			const std::uint64_t traffic_elapsed = static_cast<std::uint64_t>(GetTickCount64() - traffic_start);
 			r.parsed.push_back({ "loopback_traffic_ok", traffic_ok ? "1" : "0" });
+			r.parsed.push_back({ "loopback_traffic_elapsed_ms", format_dec_u64(traffic_elapsed) });
 			append_loopback_fields(r, fx, "loopback_after_send");
+			test_lab_format::testlab_diag_log_step("module", "IHLD", "loopback_emit",
+				"ok=%d listen_port=%u client_port=%u sent_bytes=%d send_error=%d recv_bytes=%d recv_error=%d response_sent_bytes=%d response_recv_bytes=%d elapsed_ms=%llu",
+				traffic_ok ? 1 : 0,
+				fx.listen_port,
+				fx.client_port,
+				fx.sent_bytes,
+				fx.send_error,
+				fx.recv_bytes,
+				fx.recv_error,
+				fx.response_sent_bytes,
+				fx.response_recv_bytes,
+				static_cast<unsigned long long>(traffic_elapsed));
 			Sleep(250);
 			auto req = std::make_unique<voyager::detail::intercept_request>();
 			std::memset(req.get(), 0, sizeof(*req));
 			req->operation = 2u;
 			std::uint32_t bytes_returned = 0;
-			bool ok = device->send_ioctl_raw(ioctl_codes::IHLD(), req.get(),
-				static_cast<std::uint32_t>(sizeof(*req)), bytes_returned);
+			DWORD list_gle = ERROR_SUCCESS;
+			std::uint64_t list_elapsed = 0;
+			bool ok = send_ihld_logged("list", *req, bytes_returned, list_gle, list_elapsed);
 			r.bytes_returned = bytes_returned;
+			r.parsed.push_back({ "intercept_list_gle", format_dec_u32(static_cast<std::uint32_t>(list_gle)) });
+			r.parsed.push_back({ "intercept_list_elapsed_ms", format_dec_u64(list_elapsed) });
 			constexpr std::size_t kRawHeaderBytes = 48;
 			r.raw.resize(kRawHeaderBytes);
 			std::memcpy(r.raw.data(), req.get(), kRawHeaderBytes);
 			voyager::detail::intercept_request stop_req{};
 			stop_req.operation = 1u;
 			std::uint32_t stop_bytes = 0;
-			bool stop_ok = device->send_ioctl_raw(ioctl_codes::IHLD(), &stop_req,
-				static_cast<std::uint32_t>(sizeof(stop_req)), stop_bytes);
+			DWORD stop_gle = ERROR_SUCCESS;
+			std::uint64_t stop_elapsed = 0;
+			bool stop_ok = send_ihld_logged("stop", stop_req, stop_bytes, stop_gle, stop_elapsed);
 			r.parsed.push_back({ "intercept_stop_ok", stop_ok ? "1" : "0" });
 			r.parsed.push_back({ "intercept_stop_bytes", format_dec_u32(stop_bytes) });
+			r.parsed.push_back({ "intercept_stop_gle", format_dec_u32(static_cast<std::uint32_t>(stop_gle)) });
+			r.parsed.push_back({ "intercept_stop_elapsed_ms", format_dec_u64(stop_elapsed) });
+			r.parsed.push_back({ "intercepting_after_stop", format_dec_u32(stop_req.intercepting) });
+			r.parsed.push_back({ "held_count_after_stop", format_dec_u32(stop_req.held_count) });
 			if (!ok) {
 				r.error = "send_ioctl_raw returned false";
 				r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
@@ -779,6 +875,17 @@ namespace {
 				r.parsed.push_back({ label, buf });
 			}
 			r.parsed.push_back({ "held_matching_self_pid", format_dec_u32(matching_self_pid) });
+			test_lab_format::testlab_diag_log_step("module", "IHLD", "list_summary",
+				"ok=%d gle=%lu bytes_returned=%u held_count=%u output_cap=%u matching_self_pid=%u intercepting=%u attached_pid=%u elapsed_ms=%llu",
+				ok ? 1 : 0,
+				static_cast<unsigned long>(list_gle),
+				bytes_returned,
+				req->held_count,
+				cap,
+				matching_self_pid,
+				req->intercepting,
+				driver_bridge::attached_pid(),
+				static_cast<unsigned long long>(list_elapsed));
 			if (req->held_count == 0u || matching_self_pid == 0u) {
 				r.error = "IHLD list did not return a self-PID held packet after deterministic intercept and loopback HTTP stimulus";
 				r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
@@ -809,9 +916,13 @@ namespace {
 			req->modify_payload_size = mod_written;
 		}
 		std::uint32_t bytes_returned = 0;
-		bool ok = device->send_ioctl_raw(ioctl_codes::IHLD(), req.get(),
-			static_cast<std::uint32_t>(sizeof(*req)), bytes_returned);
+		DWORD gle = ERROR_SUCCESS;
+		std::uint64_t elapsed = 0;
+		bool ok = send_ihld_logged("manual", *req, bytes_returned, gle, elapsed);
 		r.bytes_returned = bytes_returned;
+		r.parsed.push_back({ "ioctl_gle", format_dec_u32(static_cast<std::uint32_t>(gle)) });
+		r.parsed.push_back({ "ioctl_elapsed_ms", format_dec_u64(elapsed) });
+		r.parsed.push_back({ "attached_pid", format_dec_u32(driver_bridge::attached_pid()) });
 		constexpr std::size_t kRawHeaderBytes = 48;
 		r.raw.resize(kRawHeaderBytes);
 		std::memcpy(r.raw.data(), req.get(), kRawHeaderBytes);
@@ -846,6 +957,19 @@ namespace {
 				h.src_port, h.dst_port, h.pid, h.payload_size, h.address_family);
 			r.parsed.push_back({ label, buf });
 		}
+		test_lab_format::testlab_diag_log_step("module", "IHLD", "manual_summary",
+			"ok=%d gle=%lu bytes_returned=%u op=%u held_count=%u output_cap=%u intercepting=%u filter_pid=%u filter_protocol=%u filter_port=%u elapsed_ms=%llu",
+			ok ? 1 : 0,
+			static_cast<unsigned long>(gle),
+			bytes_returned,
+			req->operation,
+			req->held_count,
+			cap,
+			req->intercepting,
+			req->filter_pid,
+			req->filter_protocol,
+			req->filter_port,
+			static_cast<unsigned long long>(elapsed));
 		r.ok = true;
 	}
 

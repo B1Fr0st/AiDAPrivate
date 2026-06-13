@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cwctype>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -28,6 +29,7 @@
 #include <regex>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -76,37 +78,99 @@ namespace
         return value;
     }
 
-    fs::path resolve_workspace_path(const std::string& raw)
+    fs::path active_workspace_root()
     {
-        fs::path p(raw);
-        if (!p.is_absolute() && !file_browser::current_dir.empty())
-            p = fs::path(file_browser::current_dir) / p;
+        std::string root = g_sa_settings.workspace.root_path.empty()
+            ? file_browser::current_dir
+            : g_sa_settings.workspace.root_path;
+        if (root.empty())
+            return {};
         std::error_code ec;
-        auto canonical = fs::weakly_canonical(p, ec);
+        auto canonical = fs::weakly_canonical(fs::u8path(root), ec);
         if (!ec)
             return canonical;
-        return p.lexically_normal();
+        return fs::u8path(root).lexically_normal();
+    }
+
+    std::wstring normalized_path_key(const fs::path& p)
+    {
+        std::wstring s = p.lexically_normal().wstring();
+        for (wchar_t& c : s) {
+            if (c == L'/')
+                c = L'\\';
+        }
+        while (s.size() > 3 && (s.back() == L'\\' || s.back() == L'/'))
+            s.pop_back();
+        std::transform(s.begin(), s.end(), s.begin(),
+            [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
+        return s;
+    }
+
+    bool path_within_workspace_root(const fs::path& p, const fs::path& workspace)
+    {
+        if (workspace.empty())
+            return false;
+        auto ws_str = normalized_path_key(workspace);
+        auto p_str = normalized_path_key(p);
+        if (ws_str == p_str)
+            return true;
+        if (!ws_str.empty() && ws_str.back() != L'\\')
+            ws_str.push_back(L'\\');
+        return p_str.rfind(ws_str, 0) == 0;
+    }
+
+    bool resolve_workspace_path_checked(const std::string& raw, fs::path& out, fs::path* workspace_out, std::string& err)
+    {
+        if (raw.empty()) {
+            err = "Path is empty.";
+            return false;
+        }
+        if (raw.find('\0') != std::string::npos) {
+            err = "Path contains an embedded NUL byte.";
+            return false;
+        }
+        fs::path workspace = active_workspace_root();
+        if (workspace.empty()) {
+            err = "No active workspace is open.";
+            return false;
+        }
+        fs::path requested = fs::u8path(raw);
+        if (requested.has_root_name() && !requested.is_absolute()) {
+            err = "Drive-relative paths are not accepted.";
+            return false;
+        }
+        fs::path candidate = requested.is_absolute() ? requested : workspace / requested;
+        std::error_code ec;
+        fs::path resolved = fs::weakly_canonical(candidate, ec);
+        if (ec) {
+            ec.clear();
+            resolved = fs::absolute(candidate, ec);
+            if (ec)
+                resolved = candidate;
+            resolved = resolved.lexically_normal();
+        }
+        if (!path_within_workspace_root(resolved, workspace)) {
+            err = "Path is outside the active workspace.";
+            return false;
+        }
+        out = resolved;
+        if (workspace_out)
+            *workspace_out = workspace;
+        return true;
+    }
+
+    fs::path resolve_workspace_path(const std::string& raw)
+    {
+        fs::path resolved;
+        std::string err;
+        if (resolve_workspace_path_checked(raw, resolved, nullptr, err))
+            return resolved;
+        return fs::u8path(raw).lexically_normal();
     }
 
     bool path_within_current_workspace(const fs::path& p)
     {
-        if (file_browser::current_dir.empty())
-            return true;
-        std::error_code ec;
-        auto ws = fs::weakly_canonical(fs::path(file_browser::current_dir), ec);
-        if (ec)
-            return false;
-        auto ws_str = ws.lexically_normal().wstring();
-        auto p_str = p.lexically_normal().wstring();
-        std::transform(ws_str.begin(), ws_str.end(), ws_str.begin(),
-            [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
-        std::transform(p_str.begin(), p_str.end(), p_str.begin(),
-            [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
-        if (ws_str == p_str)
-            return true;
-        if (!ws_str.empty() && ws_str.back() != L'\\' && ws_str.back() != L'/')
-            ws_str.push_back(L'\\');
-        return p_str.rfind(ws_str, 0) == 0;
+        return path_within_workspace_root(p, active_workspace_root());
     }
 
     std::string trim(std::string text)
@@ -189,6 +253,107 @@ namespace
     std::string path_to_utf8(const fs::path& path)
     {
         return wide_to_utf8_lossy(path.native());
+    }
+
+    std::string current_cwd_utf8()
+    {
+        std::error_code ec;
+        fs::path cwd = fs::current_path(ec);
+        return ec ? std::string() : path_to_utf8(cwd);
+    }
+
+    size_t bounded_size_param(const json& params, const char* name, size_t fallback, size_t minimum, size_t maximum)
+    {
+        size_t value = fallback;
+        auto it = params.find(name);
+        if (it != params.end()) {
+            if (it->is_number_unsigned()) {
+                value = it->get<size_t>();
+            } else if (it->is_number_integer()) {
+                const int64_t signed_value = it->get<int64_t>();
+                if (signed_value >= 0)
+                    value = static_cast<size_t>(signed_value);
+            }
+        }
+        if (value < minimum)
+            return minimum;
+        if (value > maximum)
+            return maximum;
+        return value;
+    }
+
+    uint32_t bounded_u32_param(const json& params, const char* name, uint32_t fallback, uint32_t minimum, uint32_t maximum)
+    {
+        uint32_t value = fallback;
+        auto it = params.find(name);
+        if (it != params.end()) {
+            if (it->is_number_unsigned()) {
+                const uint64_t unsigned_value = it->get<uint64_t>();
+                value = unsigned_value > maximum ? maximum : static_cast<uint32_t>(unsigned_value);
+            } else if (it->is_number_integer()) {
+                const int64_t signed_value = it->get<int64_t>();
+                if (signed_value >= 0)
+                    value = signed_value > static_cast<int64_t>(maximum) ? maximum : static_cast<uint32_t>(signed_value);
+            }
+        }
+        if (value < minimum)
+            return minimum;
+        if (value > maximum)
+            return maximum;
+        return value;
+    }
+
+    bool glob_has_wildcards(const std::string& pattern)
+    {
+        return pattern.find('*') != std::string::npos || pattern.find('?') != std::string::npos;
+    }
+
+    bool glob_match_ci(const std::string& text_raw, const std::string& pattern_raw)
+    {
+        std::string text = to_lower(text_raw);
+        std::string pattern = to_lower(pattern_raw);
+        std::replace(text.begin(), text.end(), '\\', '/');
+        std::replace(pattern.begin(), pattern.end(), '\\', '/');
+        if (!glob_has_wildcards(pattern))
+            pattern = "*" + pattern + "*";
+
+        size_t t = 0;
+        size_t p = 0;
+        size_t star = std::string::npos;
+        size_t match = 0;
+        while (t < text.size()) {
+            if (p < pattern.size() && (pattern[p] == '?' || pattern[p] == text[t])) {
+                ++t;
+                ++p;
+            } else if (p < pattern.size() && pattern[p] == '*') {
+                star = p++;
+                match = t;
+            } else if (star != std::string::npos) {
+                p = star + 1;
+                t = ++match;
+            } else {
+                return false;
+            }
+        }
+        while (p < pattern.size() && pattern[p] == '*')
+            ++p;
+        return p == pattern.size();
+    }
+
+    bool file_content_looks_binary(const std::string& content)
+    {
+        if (content.empty())
+            return false;
+        size_t control = 0;
+        const size_t sample = (std::min)(content.size(), static_cast<size_t>(4096));
+        for (size_t i = 0; i < sample; ++i) {
+            const unsigned char c = static_cast<unsigned char>(content[i]);
+            if (c == 0)
+                return true;
+            if (c < 0x09 || (c > 0x0D && c < 0x20))
+                ++control;
+        }
+        return sample >= 128 && control * 100 > sample * 20;
     }
 
     std::string prot_string(uint32_t protect)
@@ -1384,11 +1549,47 @@ tool_result_t ensure_attached()
         diag::log_tagged_fmt("mcp_tools", "handle_create_directory entry");
         if (!params.contains("path") || !params["path"].is_string())
             return error("Missing required parameter: path");
+        const std::string raw = params["path"].get<std::string>();
+        fs::path workspace;
+        fs::path path;
+        std::string resolve_error;
+        if (!resolve_workspace_path_checked(raw, path, &workspace, resolve_error)) {
+            json data{{"raw_path", raw},
+                {"workspace", path_to_utf8(workspace)},
+                {"cwd", current_cwd_utf8()},
+                {"error", resolve_error}};
+            diag::log_tagged_fmt("mcp_tools",
+                "handle_create_directory reject raw='%s' workspace='%s' cwd='%s' err='%s'",
+                raw.c_str(),
+                path_to_utf8(workspace).c_str(),
+                current_cwd_utf8().c_str(),
+                resolve_error.c_str());
+            return tool_result_t::error(resolve_error, data);
+        }
         std::error_code ec;
-        fs::create_directories(params["path"].get<std::string>(), ec);
+        const bool existed_before = fs::exists(path, ec);
+        ec.clear();
+        const bool created = fs::create_directories(path, ec);
+        json data{{"raw_path", raw},
+            {"resolved_path", path_to_utf8(path)},
+            {"workspace", path_to_utf8(workspace)},
+            {"cwd", current_cwd_utf8()},
+            {"existed_before", existed_before},
+            {"created", created},
+            {"error", ec ? ec.message() : std::string()}};
+        diag::log_tagged_fmt("mcp_tools",
+            "handle_create_directory done raw='%s' resolved='%s' workspace='%s' cwd='%s' existed=%d created=%d ec=%d err='%s'",
+            raw.c_str(),
+            path_to_utf8(path).c_str(),
+            path_to_utf8(workspace).c_str(),
+            current_cwd_utf8().c_str(),
+            existed_before ? 1 : 0,
+            created ? 1 : 0,
+            ec ? 1 : 0,
+            ec ? ec.message().c_str() : "");
         if (ec)
-            return error("Failed to create the requested directory.");
-        return tool_result_t::ok("Created directory.");
+            return tool_result_t::error("Failed to create the requested directory.", data);
+        return tool_result_t::ok("Created directory.", data);
     }
 
     tool_result_t handle_list_directory(const json& params)
@@ -1419,48 +1620,146 @@ tool_result_t ensure_attached()
             !params.contains("pattern") || !params["pattern"].is_string())
             return error("Provide root and pattern.");
 
-        const fs::path root = fs::u8path(params["root"].get<std::string>());
-        const std::string needle = to_lower(params["pattern"].get<std::string>());
-        const size_t limit = static_cast<size_t>(params.value("limit", 100));
-        diag::log_tagged_fmt("mcp_tools", "handle_search_files root='%s' pattern='%s' limit=%zu",
-            path_to_utf8(root).c_str(), needle.c_str(), limit);
+        const std::string raw_root = params["root"].get<std::string>();
+        const std::string pattern = params["pattern"].get<std::string>();
+        fs::path workspace;
+        fs::path root;
+        std::string resolve_error;
+        if (!resolve_workspace_path_checked(raw_root, root, &workspace, resolve_error)) {
+            json data{{"raw_root", raw_root},
+                {"pattern", pattern},
+                {"workspace", path_to_utf8(workspace)},
+                {"cwd", current_cwd_utf8()},
+                {"error", resolve_error}};
+            diag::log_tagged_fmt("mcp_tools",
+                "handle_search_files reject raw_root='%s' pattern='%s' workspace='%s' cwd='%s' err='%s'",
+                raw_root.c_str(), pattern.c_str(), path_to_utf8(workspace).c_str(),
+                current_cwd_utf8().c_str(), resolve_error.c_str());
+            return tool_result_t::error(resolve_error, data);
+        }
+
+        const size_t limit = bounded_size_param(params, "limit", 100, 1, 10000);
+        const size_t max_visited = bounded_size_param(params, "max_visited", 200000, 1, 1000000);
+        const uint32_t timeout_ms = bounded_u32_param(params, "timeout_ms", 5000, 100, 60000);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        diag::log_tagged_fmt("mcp_tools",
+            "handle_search_files root_raw='%s' root='%s' workspace='%s' cwd='%s' pattern='%s' limit=%zu max_visited=%zu timeout_ms=%u",
+            raw_root.c_str(), path_to_utf8(root).c_str(), path_to_utf8(workspace).c_str(),
+            current_cwd_utf8().c_str(), pattern.c_str(), limit, max_visited,
+            static_cast<unsigned>(timeout_ms));
         json matches = json::array();
+        json errors = json::array();
         std::error_code ec;
         size_t visited = 0;
         size_t conversion_failures = 0;
-        for (const auto& entry : fs::recursive_directory_iterator(root, ec)) {
+        size_t outside_workspace_skips = 0;
+        bool timed_out = false;
+        bool cancelled = false;
+        bool visit_limit_reached = false;
+        bool match_limit_reached = false;
+        if (!fs::exists(root, ec) || !fs::is_directory(root, ec)) {
+            json data{{"raw_root", raw_root},
+                {"resolved_root", path_to_utf8(root)},
+                {"workspace", path_to_utf8(workspace)},
+                {"cwd", current_cwd_utf8()},
+                {"pattern", pattern},
+                {"error", ec ? ec.message() : std::string("Directory does not exist.")}};
+            return tool_result_t::error("Directory does not exist.", data);
+        }
+        ec.clear();
+        fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec);
+        fs::recursive_directory_iterator end;
+        if (ec) {
+            errors.push_back(ec.message());
+            ec.clear();
+        }
+        while (it != end) {
+            if (mcp_standalone::current_call_cancelled()) {
+                cancelled = true;
+                break;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                timed_out = true;
+                break;
+            }
+            if (visited >= max_visited) {
+                visit_limit_reached = true;
+                break;
+            }
             if (ec) {
                 diag::log_tagged_fmt("mcp_tools", "handle_search_files iterator_error after=%zu err=%s",
                     visited, ec.message().c_str());
-                break;
+                errors.push_back(ec.message());
+                ec.clear();
+                it.increment(ec);
+                continue;
             }
+            const auto entry = *it;
             ++visited;
+            fs::path resolved_entry = fs::weakly_canonical(entry.path(), ec);
+            if (ec) {
+                resolved_entry = entry.path().lexically_normal();
+                errors.push_back(ec.message());
+                ec.clear();
+            }
+            if (!path_within_workspace_root(resolved_entry, workspace)) {
+                ++outside_workspace_skips;
+                it.increment(ec);
+                continue;
+            }
             std::string filename = path_to_utf8(entry.path().filename());
             std::string full_path = path_to_utf8(entry.path());
+            std::string relative_path;
+            std::error_code rel_ec;
+            relative_path = path_to_utf8(fs::relative(resolved_entry, workspace, rel_ec));
+            if (rel_ec)
+                relative_path = filename;
             if (filename.empty() && !entry.path().filename().empty()) {
                 ++conversion_failures;
                 diag::log_tagged_fmt("mcp_tools", "handle_search_files path_conversion_empty visited=%zu native_len=%zu",
                     visited, entry.path().native().size());
                 continue;
             }
-            if (to_lower(filename).find(needle) != std::string::npos) {
-                matches.push_back(full_path);
+            if (glob_match_ci(filename, pattern) || glob_match_ci(relative_path, pattern)) {
+                matches.push_back(json{{"path", full_path}, {"resolved_path", path_to_utf8(resolved_entry)}, {"relative_path", relative_path}});
                 diag::log_tagged_fmt("mcp_tools", "handle_search_files match[%zu]='%s'",
                     matches.size(), full_path.c_str());
             }
-            if (matches.size() >= limit)
+            if (matches.size() >= limit) {
+                match_limit_reached = true;
                 break;
+            }
+            it.increment(ec);
         }
         if (ec) {
             diag::log_tagged_fmt("mcp_tools", "handle_search_files final_iterator_error visited=%zu matches=%zu err=%s",
                 visited, matches.size(), ec.message().c_str());
+            errors.push_back(ec.message());
         }
-        diag::log_tagged_fmt("mcp_tools", "handle_search_files done visited=%zu matches=%zu conversion_failures=%zu",
-            visited, matches.size(), conversion_failures);
+        diag::log_tagged_fmt("mcp_tools",
+            "handle_search_files done root='%s' workspace='%s' cwd='%s' visited=%zu matches=%zu conversion_failures=%zu outside_workspace=%zu errors=%zu timed_out=%d cancelled=%d visit_limit=%d match_limit=%d",
+            path_to_utf8(root).c_str(), path_to_utf8(workspace).c_str(), current_cwd_utf8().c_str(),
+            visited, matches.size(), conversion_failures, outside_workspace_skips, errors.size(),
+            timed_out ? 1 : 0, cancelled ? 1 : 0, visit_limit_reached ? 1 : 0, match_limit_reached ? 1 : 0);
         return tool_result_t::ok("Searched files.", json{
+            {"raw_root", raw_root},
+            {"resolved_root", path_to_utf8(root)},
+            {"workspace", path_to_utf8(workspace)},
+            {"cwd", current_cwd_utf8()},
+            {"pattern", pattern},
             {"matches", matches},
             {"visited", visited},
-            {"conversion_failures", conversion_failures}
+            {"matched_count", matches.size()},
+            {"conversion_failures", conversion_failures},
+            {"outside_workspace_skips", outside_workspace_skips},
+            {"limit", limit},
+            {"max_visited", max_visited},
+            {"timeout_ms", timeout_ms},
+            {"timed_out", timed_out},
+            {"cancelled", cancelled},
+            {"visit_limit_reached", visit_limit_reached},
+            {"match_limit_reached", match_limit_reached},
+            {"errors", errors}
         });
     }
 
@@ -1471,38 +1770,212 @@ tool_result_t ensure_attached()
             !params.contains("pattern") || !params["pattern"].is_string())
             return error("Provide root and pattern.");
 
-        const fs::path root = params["root"].get<std::string>();
-        const std::regex rx(params["pattern"].get<std::string>(), std::regex::icase);
+        const std::string raw_root = params["root"].get<std::string>();
+        const std::string pattern = params["pattern"].get<std::string>();
+        const std::string file_pattern = params.value("file_pattern", std::string("*"));
+        fs::path workspace;
+        fs::path root;
+        std::string resolve_error;
+        if (!resolve_workspace_path_checked(raw_root, root, &workspace, resolve_error)) {
+            json data{{"raw_root", raw_root},
+                {"pattern", pattern},
+                {"file_pattern", file_pattern},
+                {"workspace", path_to_utf8(workspace)},
+                {"cwd", current_cwd_utf8()},
+                {"error", resolve_error}};
+            diag::log_tagged_fmt("mcp_tools",
+                "handle_grep_in_files reject raw_root='%s' workspace='%s' cwd='%s' err='%s'",
+                raw_root.c_str(), path_to_utf8(workspace).c_str(), current_cwd_utf8().c_str(), resolve_error.c_str());
+            return tool_result_t::error(resolve_error, data);
+        }
+        std::regex rx;
+        try {
+            rx = std::regex(pattern, std::regex::icase);
+        } catch (const std::regex_error& e) {
+            json data{{"raw_root", raw_root},
+                {"resolved_root", path_to_utf8(root)},
+                {"workspace", path_to_utf8(workspace)},
+                {"cwd", current_cwd_utf8()},
+                {"pattern", pattern},
+                {"regex_error", e.what()}};
+            return tool_result_t::error("Invalid regular expression.", data);
+        }
+        const size_t limit = bounded_size_param(params, "limit", 100, 1, 10000);
+        const size_t max_visited = bounded_size_param(params, "max_visited", 100000, 1, 1000000);
+        const size_t max_file_size = bounded_size_param(params, "max_file_size", 1024 * 1024, 1, 32 * 1024 * 1024);
+        const uint32_t timeout_ms = bounded_u32_param(params, "timeout_ms", 5000, 100, 60000);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
         json matches = json::array();
+        json errors = json::array();
 
         std::error_code ec;
-        for (const auto& entry : fs::recursive_directory_iterator(root, ec)) {
-            if (ec)
+        size_t visited = 0;
+        size_t files_considered = 0;
+        size_t files_read = 0;
+        size_t files_matched = 0;
+        size_t binary_skips = 0;
+        size_t oversized_skips = 0;
+        size_t outside_workspace_skips = 0;
+        size_t file_pattern_skips = 0;
+        bool timed_out = false;
+        bool cancelled = false;
+        bool visit_limit_reached = false;
+        bool match_limit_reached = false;
+        if (!fs::exists(root, ec) || !fs::is_directory(root, ec)) {
+            json data{{"raw_root", raw_root},
+                {"resolved_root", path_to_utf8(root)},
+                {"workspace", path_to_utf8(workspace)},
+                {"cwd", current_cwd_utf8()},
+                {"pattern", pattern},
+                {"error", ec ? ec.message() : std::string("Directory does not exist.")}};
+            return tool_result_t::error("Directory does not exist.", data);
+        }
+        ec.clear();
+        fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec);
+        fs::recursive_directory_iterator end;
+        if (ec) {
+            errors.push_back(ec.message());
+            ec.clear();
+        }
+        while (it != end) {
+            if (mcp_standalone::current_call_cancelled()) {
+                cancelled = true;
                 break;
-            if (!entry.is_regular_file(ec))
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                timed_out = true;
+                break;
+            }
+            if (visited >= max_visited) {
+                visit_limit_reached = true;
+                break;
+            }
+            if (ec) {
+                errors.push_back(ec.message());
+                ec.clear();
+                it.increment(ec);
                 continue;
+            }
+            const auto entry = *it;
+            ++visited;
+            if (!entry.is_regular_file(ec))
+            {
+                ec.clear();
+                it.increment(ec);
+                continue;
+            }
+            ++files_considered;
+            fs::path resolved_entry = fs::weakly_canonical(entry.path(), ec);
+            if (ec) {
+                resolved_entry = entry.path().lexically_normal();
+                errors.push_back(ec.message());
+                ec.clear();
+            }
+            if (!path_within_workspace_root(resolved_entry, workspace)) {
+                ++outside_workspace_skips;
+                it.increment(ec);
+                continue;
+            }
+            std::string filename = path_to_utf8(entry.path().filename());
+            std::string relative_path;
+            std::error_code rel_ec;
+            relative_path = path_to_utf8(fs::relative(resolved_entry, workspace, rel_ec));
+            if (rel_ec)
+                relative_path = filename;
+            if (!glob_match_ci(filename, file_pattern) && !glob_match_ci(relative_path, file_pattern)) {
+                ++file_pattern_skips;
+                it.increment(ec);
+                continue;
+            }
+            uintmax_t size = entry.file_size(ec);
+            if (ec) {
+                errors.push_back(ec.message());
+                ec.clear();
+                it.increment(ec);
+                continue;
+            }
+            if (size > max_file_size) {
+                ++oversized_skips;
+                it.increment(ec);
+                continue;
+            }
             const auto content = file_to_utf8(entry.path());
+            if (size != 0 && content.empty()) {
+                errors.push_back("read failed: " + path_to_utf8(entry.path()));
+                it.increment(ec);
+                continue;
+            }
+            if (file_content_looks_binary(content)) {
+                ++binary_skips;
+                it.increment(ec);
+                continue;
+            }
+            ++files_read;
             std::smatch match;
             std::string::const_iterator search_start(content.cbegin());
             size_t line = 1;
             size_t offset = 0;
+            bool file_had_match = false;
             while (std::regex_search(search_start, content.cend(), match, rx)) {
                 offset = static_cast<size_t>(match.position(0) + std::distance(content.cbegin(), search_start));
                 line = 1 + static_cast<size_t>(std::count(content.begin(), content.begin() + static_cast<long long>(offset), '\n'));
                 matches.push_back({
-                    {"path", entry.path().string()},
+                    {"path", path_to_utf8(entry.path())},
+                    {"resolved_path", path_to_utf8(resolved_entry)},
+                    {"relative_path", relative_path},
                     {"line", line},
                     {"match", match.str(0)}
                 });
+                file_had_match = true;
                 search_start = match.suffix().first;
-                if (matches.size() >= static_cast<size_t>(params.value("limit", 100)))
+                if (matches.size() >= limit) {
+                    match_limit_reached = true;
                     break;
+                }
             }
-            if (matches.size() >= static_cast<size_t>(params.value("limit", 100)))
+            if (file_had_match)
+                ++files_matched;
+            if (match_limit_reached)
                 break;
+            it.increment(ec);
         }
 
-        return tool_result_t::ok("Searched file contents.", json{{"matches", matches}});
+        if (ec)
+            errors.push_back(ec.message());
+        diag::log_tagged_fmt("mcp_tools",
+            "handle_grep_in_files done root='%s' workspace='%s' cwd='%s' visited=%zu considered=%zu read=%zu file_matches=%zu matches=%zu binary_skips=%zu oversized_skips=%zu outside_workspace=%zu file_pattern_skips=%zu errors=%zu timed_out=%d cancelled=%d visit_limit=%d match_limit=%d max_file_size=%zu",
+            path_to_utf8(root).c_str(), path_to_utf8(workspace).c_str(), current_cwd_utf8().c_str(),
+            visited, files_considered, files_read, files_matched, matches.size(), binary_skips,
+            oversized_skips, outside_workspace_skips, file_pattern_skips, errors.size(),
+            timed_out ? 1 : 0, cancelled ? 1 : 0, visit_limit_reached ? 1 : 0,
+            match_limit_reached ? 1 : 0, max_file_size);
+        return tool_result_t::ok("Searched file contents.", json{
+            {"raw_root", raw_root},
+            {"resolved_root", path_to_utf8(root)},
+            {"workspace", path_to_utf8(workspace)},
+            {"cwd", current_cwd_utf8()},
+            {"pattern", pattern},
+            {"file_pattern", file_pattern},
+            {"matches", matches},
+            {"visited", visited},
+            {"files_considered", files_considered},
+            {"files_read", files_read},
+            {"files_matched", files_matched},
+            {"matched_count", matches.size()},
+            {"binary_skips", binary_skips},
+            {"oversized_skips", oversized_skips},
+            {"outside_workspace_skips", outside_workspace_skips},
+            {"file_pattern_skips", file_pattern_skips},
+            {"limit", limit},
+            {"max_visited", max_visited},
+            {"max_file_size", max_file_size},
+            {"timeout_ms", timeout_ms},
+            {"timed_out", timed_out},
+            {"cancelled", cancelled},
+            {"visit_limit_reached", visit_limit_reached},
+            {"match_limit_reached", match_limit_reached},
+            {"errors", errors}
+        });
     }
 
     tool_result_t handle_web_search(const json& params)
@@ -2131,11 +2604,11 @@ namespace mcp_standalone
             true, handle_convert_number});
         srv.register_tool({"delete_file", "Delete a file on disk.", {{"path", "string", "Target path", true}}, false, handle_delete_file, mcp_standalone::tool_visibility_t::internal_only});
         srv.register_tool({"create_directory", "Create a directory tree on disk.", {{"path", "string", "Target path", true}}, false, handle_create_directory, mcp_standalone::tool_visibility_t::internal_only});
-        srv.register_tool({"search_files", "Search for file names under a root directory.",
-            {{"root", "string", "Root directory", true}, {"pattern", "string", "Substring to search for", true}, {"limit", "number", "Maximum matches", false}},
+        srv.register_tool({"search_files", "Search for file names under a workspace-relative root directory with case-insensitive glob matching.",
+            {{"root", "string", "Workspace-relative root directory", true}, {"pattern", "string", "Case-insensitive glob using * and ?", true}, {"limit", "number", "Maximum matches", false}, {"max_visited", "number", "Maximum entries to visit", false}, {"timeout_ms", "number", "Traversal deadline in milliseconds", false}},
             true, handle_search_files, mcp_standalone::tool_visibility_t::internal_only});
-        srv.register_tool({"grep_in_files", "Search file contents with a regular expression.",
-            {{"root", "string", "Root directory", true}, {"pattern", "string", "Regex pattern", true}, {"limit", "number", "Maximum matches", false}},
+        srv.register_tool({"grep_in_files", "Search workspace file contents with a regular expression, bounded traversal, file glob filtering, and binary-file skips.",
+            {{"root", "string", "Workspace-relative root directory", true}, {"pattern", "string", "Regex pattern", true}, {"file_pattern", "string", "Case-insensitive file glob using * and ?", false}, {"limit", "number", "Maximum matches", false}, {"max_visited", "number", "Maximum entries to visit", false}, {"max_file_size", "number", "Maximum file size to read", false}, {"timeout_ms", "number", "Traversal deadline in milliseconds", false}},
             true, handle_grep_in_files, mcp_standalone::tool_visibility_t::internal_only});
         srv.register_tool({"web_search", "Search the web through the bundled Camoufox browser and extract visible result links from rendered search pages.",
             {{"query", "string", "Search query text", true}, {"max_results", "number", "Maximum results to return (default 5)", false}, {"timeout", "number", "Browser navigation timeout in seconds (1-60, default 8)", false}},

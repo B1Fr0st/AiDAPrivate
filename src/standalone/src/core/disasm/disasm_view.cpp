@@ -276,6 +276,10 @@ void bump_format_generation() {
     s_format_gen.fetch_add(1u, std::memory_order_release);
 }
 
+uint32_t format_generation() {
+    return s_format_gen.load(std::memory_order_acquire);
+}
+
 struct line_layout_t {
     std::vector<int>      start_row;
     std::vector<int>      before_extent;

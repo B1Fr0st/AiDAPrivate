@@ -3,6 +3,7 @@
 #include "test_all_features.hpp"
 #include "../disasm/disasm_view.hpp"
 #include "../disasm/pseudocode_view.hpp"
+#include "../disasm/decompiler_engine.hpp"
 #include "../disasm/function_index.hpp"
 #include "../disasm/xref_index.hpp"
 #include "../disasm/comment_store.hpp"
@@ -19,6 +20,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -123,15 +125,18 @@ namespace {
         return 0;
     }
 
-    uint64_t resolve_ntclose() {
+    uint64_t resolve_ntdll_export(const char* name) {
+        if (!name || name[0] == '\0')
+            return 0;
+
         const uint64_t remote_ntdll = resolve_remote_module_base("ntdll.dll");
         if (remote_ntdll != 0) {
-            const uint64_t resolved = driver_bridge::resolve_export(remote_ntdll, "NtClose");
+            const uint64_t resolved = driver_bridge::resolve_export(remote_ntdll, name);
             if (resolved != 0)
                 return resolved;
 
             HMODULE local_ntdll = GetModuleHandleW(L"ntdll.dll");
-            FARPROC local_fn = local_ntdll ? GetProcAddress(local_ntdll, "NtClose") : nullptr;
+            FARPROC local_fn = local_ntdll ? GetProcAddress(local_ntdll, name) : nullptr;
             if (local_ntdll && local_fn) {
                 const uint64_t offset =
                     reinterpret_cast<uintptr_t>(local_fn) - reinterpret_cast<uintptr_t>(local_ntdll);
@@ -141,9 +146,13 @@ namespace {
 
         HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
         if (!ntdll) return 0;
-        FARPROC fn = GetProcAddress(ntdll, "NtClose");
+        FARPROC fn = GetProcAddress(ntdll, name);
         if (!fn) return 0;
         return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(fn));
+    }
+
+    uint64_t resolve_ntclose() {
+        return resolve_ntdll_export("NtClose");
     }
 
     bool string_signals_error(const std::string& s) {
@@ -267,6 +276,101 @@ namespace {
             Sleep(step_ms);
             waited += step_ms;
         }
+    }
+
+    bool snapshot_tab_for_addr(uint64_t addr, pseudocode_view::tab_info_t& out, size_t* total_out = nullptr) {
+        auto tabs = pseudocode_view::snapshot_tabs();
+        if (total_out)
+            *total_out = tabs.size();
+        for (const auto& t : tabs) {
+            if (t.addr == addr) {
+                out = t;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    size_t count_pseudocode_lines(const std::string& text) {
+        if (text.empty())
+            return 0;
+        size_t lines = 1;
+        for (char ch : text) {
+            if (ch == '\n')
+                ++lines;
+        }
+        if (!text.empty() && text.back() == '\n' && lines > 0)
+            --lines;
+        return lines;
+    }
+
+    bool pseudocode_metrics_for_addr(uint64_t addr, size_t& bytes_out, size_t& lines_out,
+                                     bool& complete_out, bool& error_out, std::string& source_out) {
+        bytes_out = 0;
+        lines_out = 0;
+        complete_out = false;
+        error_out = false;
+        source_out.clear();
+        std::lock_guard<std::mutex> lk(decompiler_engine::g_state.mutex);
+        auto apply = [&](const decompiler_engine::decompile_result_t& r, const char* source) {
+            bytes_out = r.pseudocode.size();
+            lines_out = count_pseudocode_lines(r.pseudocode);
+            complete_out = r.complete;
+            error_out = r.is_error;
+            source_out = source ? source : "";
+            return true;
+        };
+        if (decompiler_engine::g_state.current.function_addr == addr &&
+            decompiler_engine::g_state.current.complete) {
+            return apply(decompiler_engine::g_state.current, "current");
+        }
+        auto it = decompiler_engine::g_state.cache.find(addr);
+        if (it != decompiler_engine::g_state.cache.end() && it->second.complete) {
+            return apply(it->second, "cache");
+        }
+        return false;
+    }
+
+    void log_pseudocode_tab_evidence(HANDLE hf, const char* tag, const char* phase, uint64_t addr) {
+        pseudocode_view::tab_info_t tab{};
+        size_t total = 0;
+        const bool found = snapshot_tab_for_addr(addr, tab, &total);
+        size_t pseudocode_bytes = 0;
+        size_t pseudocode_lines = 0;
+        bool complete = false;
+        bool is_error = false;
+        std::string source;
+        const bool metrics = pseudocode_metrics_for_addr(addr, pseudocode_bytes, pseudocode_lines,
+            complete, is_error, source);
+        log_msg(hf, tag,
+            "STATE -- %s addr=0x%016llX found=%d total_tabs=%zu loaded=%d decompiling=%d is_error=%d function=\"%s\" metrics=%d source=\"%s\" complete=%d engine_error=%d pseudocode_bytes=%zu pseudocode_lines=%zu active=0x%016llX cancel=%d next_pending=%d decompiling_engine=%d",
+            phase,
+            (unsigned long long)addr,
+            (int)found,
+            total,
+            found ? (int)tab.loaded : 0,
+            found ? (int)tab.decompiling : 0,
+            found ? (int)tab.is_error : 0,
+            found ? tab.function_name.c_str() : "",
+            (int)metrics,
+            source.c_str(),
+            (int)complete,
+            (int)is_error,
+            pseudocode_bytes,
+            pseudocode_lines,
+            (unsigned long long)pseudocode_view::active_tab_address(),
+            decompiler_engine::g_state.cancel.load(std::memory_order_acquire) ? 1 : 0,
+            decompiler_engine::g_state.next_pending.load(std::memory_order_acquire) ? 1 : 0,
+            decompiler_engine::g_state.decompiling.load(std::memory_order_acquire) ? 1 : 0);
+    }
+
+    bool pseudocode_refresh_state_ok(const pseudocode_view::tab_info_t& tab, uint64_t addr,
+                                     size_t line_count, bool metrics_present) {
+        if (tab.addr != addr)
+            return false;
+        if (tab.decompiling)
+            return true;
+        return tab.loaded && !tab.is_error && metrics_present && line_count > 0;
     }
 
     void validate_decompile(HANDLE hf, const char* tag, const char* sym, uint64_t addr, bool force,
@@ -407,11 +511,44 @@ namespace {
     void test_bump_format_generation(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "disasm.bump_format";
         try {
-            log_msg(hf, tag, "INPUT -- invoking bump_format_generation()");
+            const uint64_t before_sig = disasm_view::g_state.layout_signature;
+            const int before_n = disasm_view::g_state.layout_n;
+            const uint32_t before_gen = disasm_view::format_generation();
+            const bool before_show_bytes = disasm_view::g_state.show_bytes;
+            const disasm_view::addr_format_t before_format = disasm_view::g_state.addr_format;
+            log_msg(hf, tag, "INPUT -- invoking bump_format_generation() before generation=%u layout_sig=0x%016llX layout_n=%d show_bytes=%d format=%s(%d)",
+                before_gen,
+                (unsigned long long)before_sig,
+                before_n,
+                before_show_bytes ? 1 : 0,
+                addr_format_name(before_format),
+                static_cast<int>(before_format));
             disasm_view::bump_format_generation();
-            log_msg(hf, tag, "OUTPUT -- bump_format_generation returned");
-            log_msg(hf, tag, "PASS -- bump_format_generation executed without crash");
-            passed.fetch_add(1);
+            const uint32_t after_gen = disasm_view::format_generation();
+            const uint64_t after_sig = disasm_view::g_state.layout_signature;
+            const int after_n = disasm_view::g_state.layout_n;
+            const bool after_show_bytes = disasm_view::g_state.show_bytes;
+            const disasm_view::addr_format_t after_format = disasm_view::g_state.addr_format;
+            const bool generation_changed = after_gen != before_gen && after_gen == before_gen + 1u;
+            const bool layout_changed = before_sig != after_sig || before_n != after_n;
+            log_msg(hf, tag, "OUTPUT -- generation=%u generation_changed=%d layout_sig=0x%016llX layout_n=%d show_bytes=%d format=%s(%d) layout_changed=%d",
+                after_gen,
+                generation_changed ? 1 : 0,
+                (unsigned long long)after_sig,
+                after_n,
+                after_show_bytes ? 1 : 0,
+                addr_format_name(after_format),
+                static_cast<int>(after_format),
+                layout_changed ? 1 : 0);
+            if (generation_changed) {
+                log_msg(hf, tag, "PASS -- bump_format_generation advanced actual format generation from %u to %u (layout_changed=%d)",
+                    before_gen, after_gen, layout_changed ? 1 : 0);
+                passed.fetch_add(1);
+            } else {
+                log_msg(hf, tag, "FAIL -- bump_format_generation did not advance actual format generation (before=%u after=%u layout_changed=%d)",
+                    before_gen, after_gen, layout_changed ? 1 : 0);
+                failed.fetch_add(1);
+            }
         } catch (...) {
             log_msg(hf, tag, "FAIL -- exception in bump_format_generation");
             failed.fetch_add(1);
@@ -888,13 +1025,105 @@ namespace {
 
     void test_pseudocode_cancel_active(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "pseudo.cancel_active";
+        const uint64_t addr = 0x000001A1DA0CACE1ULL;
         try {
-            log_msg(hf, tag, "INPUT -- invoking cancel_active_decompile()");
+            const bool idle = decompiler_engine::wait_for_idle(3000, 25);
+            log_msg(hf, tag, "INPUT -- controlled queued decompile addr=0x%016llX idle_before=%d", (unsigned long long)addr, idle ? 1 : 0);
+            if (!idle) {
+                log_msg(hf, tag, "FAIL -- decompiler engine was not idle, refusing to disturb an uncontrolled active decompile");
+                failed.fetch_add(1);
+                return;
+            }
+            pseudocode_view::close_tab_by_addr(addr);
+            decompiler_engine::g_state.cancel.store(false, std::memory_order_release);
+            decompiler_engine::g_state.next_pending.store(false, std::memory_order_release);
+            decompiler_engine::g_state.next_addr.store(0, std::memory_order_release);
+            decompiler_engine::g_state.next_file.store(nullptr, std::memory_order_release);
+            decompiler_engine::g_state.decompiling.store(true, std::memory_order_release);
+
+            pseudocode_view::request_decompile(addr, nullptr, true);
+            log_pseudocode_tab_evidence(hf, tag, "after_request", addr);
+
+            pseudocode_view::tab_info_t before_tab{};
+            size_t before_total = 0;
+            const bool before_found = snapshot_tab_for_addr(addr, before_tab, &before_total);
+            const uint64_t active_before = pseudocode_view::active_tab_address();
+            const bool queued_before = decompiler_engine::g_state.next_pending.load(std::memory_order_acquire) &&
+                decompiler_engine::g_state.next_addr.load(std::memory_order_acquire) == addr;
+            log_msg(hf, tag, "STATE -- before_cancel found=%d total_tabs=%zu active=0x%016llX queued=%d loaded=%d decompiling=%d is_error=%d",
+                before_found ? 1 : 0,
+                before_total,
+                (unsigned long long)active_before,
+                queued_before ? 1 : 0,
+                before_found ? (int)before_tab.loaded : 0,
+                before_found ? (int)before_tab.decompiling : 0,
+                before_found ? (int)before_tab.is_error : 0);
+
             pseudocode_view::cancel_active_decompile();
-            log_msg(hf, tag, "OUTPUT -- cancel_active_decompile() returned");
-            log_msg(hf, tag, "PASS -- cancel_active_decompile() executed without crash");
-            passed.fetch_add(1);
+            log_pseudocode_tab_evidence(hf, tag, "after_cancel", addr);
+
+            pseudocode_view::tab_info_t after_tab{};
+            size_t after_total = 0;
+            const bool after_found = snapshot_tab_for_addr(addr, after_tab, &after_total);
+            const uint64_t active_after = pseudocode_view::active_tab_address();
+            const bool cancel_after = decompiler_engine::g_state.cancel.load(std::memory_order_acquire);
+            const bool queued_after = decompiler_engine::g_state.next_pending.load(std::memory_order_acquire);
+            const bool ok = before_found &&
+                before_tab.addr == addr &&
+                before_tab.decompiling &&
+                active_before == addr &&
+                queued_before &&
+                after_found &&
+                after_tab.addr == addr &&
+                active_after == addr &&
+                !after_tab.decompiling &&
+                !after_tab.loaded &&
+                after_tab.is_error &&
+                cancel_after &&
+                !queued_after;
+
+            decompiler_engine::g_state.decompiling.store(false, std::memory_order_release);
+            decompiler_engine::g_state.cancel.store(false, std::memory_order_release);
+            decompiler_engine::g_state.next_pending.store(false, std::memory_order_release);
+            decompiler_engine::g_state.next_addr.store(0, std::memory_order_release);
+            decompiler_engine::g_state.next_file.store(nullptr, std::memory_order_release);
+            pseudocode_view::close_tab_by_addr(addr);
+            decompiler_engine::g_state.decompiling.store(false, std::memory_order_release);
+            decompiler_engine::g_state.cancel.store(false, std::memory_order_release);
+            decompiler_engine::g_state.next_pending.store(false, std::memory_order_release);
+            decompiler_engine::g_state.next_addr.store(0, std::memory_order_release);
+            decompiler_engine::g_state.next_file.store(nullptr, std::memory_order_release);
+
+            if (ok) {
+                log_msg(hf, tag, "PASS -- cancel reached active tab and engine flags (queued cleared, cancel observed)");
+                passed.fetch_add(1);
+            } else {
+                log_msg(hf, tag, "FAIL -- cancel evidence incomplete before_found=%d before_decompiling=%d active_before=0x%016llX queued_before=%d after_found=%d after_loaded=%d after_decompiling=%d after_error=%d active_after=0x%016llX cancel_after=%d queued_after=%d",
+                    before_found ? 1 : 0,
+                    before_found ? (int)before_tab.decompiling : 0,
+                    (unsigned long long)active_before,
+                    queued_before ? 1 : 0,
+                    after_found ? 1 : 0,
+                    after_found ? (int)after_tab.loaded : 0,
+                    after_found ? (int)after_tab.decompiling : 0,
+                    after_found ? (int)after_tab.is_error : 0,
+                    (unsigned long long)active_after,
+                    cancel_after ? 1 : 0,
+                    queued_after ? 1 : 0);
+                failed.fetch_add(1);
+            }
         } catch (...) {
+            decompiler_engine::g_state.decompiling.store(false, std::memory_order_release);
+            decompiler_engine::g_state.cancel.store(false, std::memory_order_release);
+            decompiler_engine::g_state.next_pending.store(false, std::memory_order_release);
+            decompiler_engine::g_state.next_addr.store(0, std::memory_order_release);
+            decompiler_engine::g_state.next_file.store(nullptr, std::memory_order_release);
+            pseudocode_view::close_tab_by_addr(addr);
+            decompiler_engine::g_state.decompiling.store(false, std::memory_order_release);
+            decompiler_engine::g_state.cancel.store(false, std::memory_order_release);
+            decompiler_engine::g_state.next_pending.store(false, std::memory_order_release);
+            decompiler_engine::g_state.next_addr.store(0, std::memory_order_release);
+            decompiler_engine::g_state.next_file.store(nullptr, std::memory_order_release);
             log_msg(hf, tag, "FAIL -- exception in cancel_active_decompile");
             failed.fetch_add(1);
         }
@@ -1001,14 +1230,74 @@ namespace {
     void test_hexview_last_error(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "hexview.last_error";
         try {
-            log_msg(hf, tag, "INPUT -- querying hex_view::last_error()");
-            std::string err = hex_view::last_error();
-            log_msg(hf, tag, "OUTPUT -- last_error() = \"%s\" (len=%zu)", err.c_str(), err.size());
-            if (err.empty()) {
-                log_msg(hf, tag, "PASS -- last_error() reports no pending error (empty)");
+            char tmp_dir[MAX_PATH] = {};
+            char valid_path[MAX_PATH] = {};
+            DWORD tmp_len = GetTempPathA(static_cast<DWORD>(sizeof(tmp_dir)), tmp_dir);
+            if (tmp_len == 0 || tmp_len >= static_cast<DWORD>(sizeof(tmp_dir)) ||
+                GetTempFileNameA(tmp_dir, "aid", 0, valid_path) == 0) {
+                DWORD gle = GetLastError();
+                log_msg(hf, tag, "FAIL -- unable to create temp path for valid load probe gle=%lu", (unsigned long)gle);
+                failed.fetch_add(1);
+                return;
+            }
+
+            std::string missing_path = std::string(tmp_dir) + "aida_missing_hex_error_probe_7F4A2B1C.bin";
+            DeleteFileA(missing_path.c_str());
+            log_msg(hf, tag, "INPUT -- invalid load_from_file(path=\"%s\", offset=0, size=16)", missing_path.c_str());
+            hex_view::load_from_file(missing_path, 0, 16);
+            std::string err_bad = hex_view::last_error();
+            log_msg(hf, tag, "OUTPUT -- invalid load last_error=\"%s\" len=%zu", err_bad.c_str(), err_bad.size());
+
+            std::vector<uint8_t> bytes(32);
+            for (size_t i = 0; i < bytes.size(); ++i)
+                bytes[i] = static_cast<uint8_t>(0x30u + i);
+            {
+                std::ofstream out(valid_path, std::ios::binary | std::ios::trunc);
+                out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+            }
+
+            log_msg(hf, tag, "INPUT -- valid load_from_file(path=\"%s\", offset=4, size=12)", valid_path);
+            hex_view::load_from_file(valid_path, 4, 12);
+            std::string err_good = hex_view::last_error();
+            const size_t active_bytes = hex_view::g_state.data.size();
+            const uint64_t active_base = hex_view::g_state.base_addr;
+            const std::string active_source = hex_view::g_state.source_name;
+            const bool active = hex_view::g_state.active;
+            bool data_ok = active_bytes == 12;
+            if (data_ok) {
+                for (size_t i = 0; i < 12; ++i) {
+                    if (hex_view::g_state.data[i] != bytes[i + 4]) {
+                        data_ok = false;
+                        break;
+                    }
+                }
+            }
+            DeleteFileA(valid_path);
+
+            log_msg(hf, tag, "OUTPUT -- valid load last_error=\"%s\" len=%zu active=%d bytes=%zu base=0x%016llX source=\"%s\" data_ok=%d first=0x%02X last=0x%02X",
+                err_good.c_str(),
+                err_good.size(),
+                active ? 1 : 0,
+                active_bytes,
+                (unsigned long long)active_base,
+                active_source.c_str(),
+                data_ok ? 1 : 0,
+                active_bytes > 0 ? hex_view::g_state.data.front() : 0,
+                active_bytes > 0 ? hex_view::g_state.data.back() : 0);
+
+            if (!err_bad.empty() && err_good.empty() && active && data_ok &&
+                active_base == 4 && !active_source.empty()) {
+                log_msg(hf, tag, "PASS -- invalid load set an error, valid load cleared it and populated active buffer evidence");
                 passed.fetch_add(1);
             } else {
-                log_msg(hf, tag, "FAIL -- last_error() reports a pending error: \"%s\"", err.c_str());
+                log_msg(hf, tag, "FAIL -- err_bad_len=%zu err_good_len=%zu active=%d data_ok=%d bytes=%zu base=0x%016llX source_len=%zu",
+                    err_bad.size(),
+                    err_good.size(),
+                    active ? 1 : 0,
+                    data_ok ? 1 : 0,
+                    active_bytes,
+                    (unsigned long long)active_base,
+                    active_source.size());
                 failed.fetch_add(1);
             }
         } catch (...) {
@@ -1526,12 +1815,82 @@ namespace {
 
     void test_pseudocode_refresh_active_tab(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "pseudo.refresh_active";
+        uint64_t addr = resolve_ntdll_export("NtClose");
+        if (addr == 0) {
+            log_msg(hf, tag, "SKIP -- NtClose not resolved");
+            skipped.fetch_add(1);
+            return;
+        }
         try {
-            log_msg(hf, tag, "INPUT -- invoking refresh_active_tab()");
+            const bool idle = decompiler_engine::wait_for_idle(5000, 25);
+            log_msg(hf, tag, "INPUT -- seed active tab addr=0x%016llX idle_before=%d", (unsigned long long)addr, idle ? 1 : 0);
+            if (!idle) {
+                log_msg(hf, tag, "FAIL -- decompiler engine was not idle before refresh_active_tab");
+                failed.fetch_add(1);
+                return;
+            }
+            pseudocode_view::close_tab_by_addr(addr);
+            pseudocode_view::request_decompile(addr, nullptr, false);
+            pseudocode_view::activate_tab_by_addr(addr);
+            log_pseudocode_tab_evidence(hf, tag, "before_refresh", addr);
+
             pseudocode_view::refresh_active_tab();
-            log_msg(hf, tag, "OUTPUT -- refresh_active_tab() returned");
-            log_msg(hf, tag, "PASS -- refresh_active_tab() executed without crash");
-            passed.fetch_add(1);
+            log_pseudocode_tab_evidence(hf, tag, "after_refresh_immediate", addr);
+
+            pseudocode_view::tab_info_t tab{};
+            size_t total = 0;
+            bool found = snapshot_tab_for_addr(addr, tab, &total);
+            size_t pseudocode_bytes = 0;
+            size_t pseudocode_lines = 0;
+            bool complete = false;
+            bool engine_error = false;
+            std::string source;
+            bool metrics = pseudocode_metrics_for_addr(addr, pseudocode_bytes, pseudocode_lines,
+                complete, engine_error, source);
+            bool state_ok = found &&
+                pseudocode_view::active_tab_address() == addr &&
+                pseudocode_refresh_state_ok(tab, addr, pseudocode_lines, metrics);
+
+            if (!state_ok && !tab.decompiling) {
+                bool loaded = false;
+                bool is_error = false;
+                std::string fn;
+                wait_for_decompile_tab(hf, tag, addr, 8000, loaded, is_error, fn);
+                log_pseudocode_tab_evidence(hf, tag, "after_refresh_wait", addr);
+                found = snapshot_tab_for_addr(addr, tab, &total);
+                metrics = pseudocode_metrics_for_addr(addr, pseudocode_bytes, pseudocode_lines,
+                    complete, engine_error, source);
+                state_ok = found &&
+                    pseudocode_view::active_tab_address() == addr &&
+                    pseudocode_refresh_state_ok(tab, addr, pseudocode_lines, metrics);
+            }
+
+            if (state_ok) {
+                log_msg(hf, tag, "PASS -- active refresh preserved addr=0x%016llX tabs=%zu loaded=%d decompiling=%d lines=%zu metrics=%d source=\"%s\"",
+                    (unsigned long long)addr,
+                    total,
+                    (int)tab.loaded,
+                    (int)tab.decompiling,
+                    pseudocode_lines,
+                    metrics ? 1 : 0,
+                    source.c_str());
+                passed.fetch_add(1);
+            } else {
+                log_msg(hf, tag, "FAIL -- refresh_active evidence invalid found=%d active=0x%016llX expected=0x%016llX tabs=%zu loaded=%d decompiling=%d is_error=%d metrics=%d complete=%d engine_error=%d bytes=%zu lines=%zu",
+                    found ? 1 : 0,
+                    (unsigned long long)pseudocode_view::active_tab_address(),
+                    (unsigned long long)addr,
+                    total,
+                    found ? (int)tab.loaded : 0,
+                    found ? (int)tab.decompiling : 0,
+                    found ? (int)tab.is_error : 0,
+                    metrics ? 1 : 0,
+                    complete ? 1 : 0,
+                    engine_error ? 1 : 0,
+                    pseudocode_bytes,
+                    pseudocode_lines);
+                failed.fetch_add(1);
+            }
         } catch (...) {
             log_msg(hf, tag, "FAIL -- exception in refresh_active_tab");
             failed.fetch_add(1);
@@ -1540,14 +1899,106 @@ namespace {
 
     void test_pseudocode_refresh_all_tabs(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "pseudo.refresh_all";
+        uint64_t addr1 = resolve_ntdll_export("NtClose");
+        uint64_t addr2 = resolve_ntdll_export("NtCreateFile");
+        if (addr2 == 0 || addr2 == addr1)
+            addr2 = resolve_ntdll_export("NtReadFile");
+        if (addr2 == 0 || addr2 == addr1)
+            addr2 = resolve_ntdll_export("NtOpenFile");
+        if (addr1 == 0 || addr2 == 0 || addr1 == addr2) {
+            log_msg(hf, tag, "SKIP -- could not resolve two distinct ntdll exports addr1=0x%016llX addr2=0x%016llX",
+                (unsigned long long)addr1, (unsigned long long)addr2);
+            skipped.fetch_add(1);
+            return;
+        }
         try {
-            int count = pseudocode_view::tab_count();
-            log_msg(hf, tag, "INPUT -- invoking refresh_all_tabs() with tab_count=%d", count);
+            const bool idle = decompiler_engine::wait_for_idle(5000, 25);
+            log_msg(hf, tag, "INPUT -- seed tabs addr1=0x%016llX addr2=0x%016llX idle_before=%d",
+                (unsigned long long)addr1,
+                (unsigned long long)addr2,
+                idle ? 1 : 0);
+            if (!idle) {
+                log_msg(hf, tag, "FAIL -- decompiler engine was not idle before refresh_all_tabs");
+                failed.fetch_add(1);
+                return;
+            }
+
+            pseudocode_view::close_tab_by_addr(addr1);
+            pseudocode_view::close_tab_by_addr(addr2);
+            pseudocode_view::request_decompile(addr1, nullptr, false);
+            pseudocode_view::request_decompile(addr2, nullptr, false);
+            pseudocode_view::activate_tab_by_addr(addr1);
+            log_pseudocode_tab_evidence(hf, tag, "before_refresh_addr1", addr1);
+            log_pseudocode_tab_evidence(hf, tag, "before_refresh_addr2", addr2);
+
             pseudocode_view::refresh_all_tabs();
-            log_msg(hf, tag, "OUTPUT -- refresh_all_tabs() returned, tab_count=%d",
-                pseudocode_view::tab_count());
-            log_msg(hf, tag, "PASS -- refresh_all_tabs() executed without crash");
-            passed.fetch_add(1);
+            log_pseudocode_tab_evidence(hf, tag, "after_refresh_addr1", addr1);
+            log_pseudocode_tab_evidence(hf, tag, "after_refresh_addr2", addr2);
+
+            pseudocode_view::tab_info_t tab1{};
+            pseudocode_view::tab_info_t tab2{};
+            size_t total1 = 0;
+            size_t total2 = 0;
+            const bool found1 = snapshot_tab_for_addr(addr1, tab1, &total1);
+            const bool found2 = snapshot_tab_for_addr(addr2, tab2, &total2);
+
+            size_t bytes1 = 0;
+            size_t lines1 = 0;
+            bool complete1 = false;
+            bool error1 = false;
+            std::string source1;
+            const bool metrics1 = pseudocode_metrics_for_addr(addr1, bytes1, lines1, complete1, error1, source1);
+
+            size_t bytes2 = 0;
+            size_t lines2 = 0;
+            bool complete2 = false;
+            bool error2 = false;
+            std::string source2;
+            const bool metrics2 = pseudocode_metrics_for_addr(addr2, bytes2, lines2, complete2, error2, source2);
+
+            const bool addr1_ok = found1 && pseudocode_refresh_state_ok(tab1, addr1, lines1, metrics1);
+            const bool addr2_ok = found2 && pseudocode_refresh_state_ok(tab2, addr2, lines2, metrics2);
+            const bool active_preserved = pseudocode_view::active_tab_address() == addr1;
+            if (addr1_ok && addr2_ok && active_preserved) {
+                log_msg(hf, tag, "PASS -- refresh_all preserved tabs addr1=0x%016llX state(loaded=%d decompiling=%d lines=%zu metrics=%d) addr2=0x%016llX state(loaded=%d decompiling=%d lines=%zu metrics=%d) total=%zu",
+                    (unsigned long long)addr1,
+                    (int)tab1.loaded,
+                    (int)tab1.decompiling,
+                    lines1,
+                    metrics1 ? 1 : 0,
+                    (unsigned long long)addr2,
+                    (int)tab2.loaded,
+                    (int)tab2.decompiling,
+                    lines2,
+                    metrics2 ? 1 : 0,
+                    total1);
+                passed.fetch_add(1);
+            } else {
+                log_msg(hf, tag, "FAIL -- refresh_all evidence invalid found1=%d state1(loaded=%d decompiling=%d error=%d metrics=%d complete=%d engine_error=%d bytes=%zu lines=%zu) found2=%d state2(loaded=%d decompiling=%d error=%d metrics=%d complete=%d engine_error=%d bytes=%zu lines=%zu) active=0x%016llX expected=0x%016llX totals=%zu/%zu",
+                    found1 ? 1 : 0,
+                    found1 ? (int)tab1.loaded : 0,
+                    found1 ? (int)tab1.decompiling : 0,
+                    found1 ? (int)tab1.is_error : 0,
+                    metrics1 ? 1 : 0,
+                    complete1 ? 1 : 0,
+                    error1 ? 1 : 0,
+                    bytes1,
+                    lines1,
+                    found2 ? 1 : 0,
+                    found2 ? (int)tab2.loaded : 0,
+                    found2 ? (int)tab2.decompiling : 0,
+                    found2 ? (int)tab2.is_error : 0,
+                    metrics2 ? 1 : 0,
+                    complete2 ? 1 : 0,
+                    error2 ? 1 : 0,
+                    bytes2,
+                    lines2,
+                    (unsigned long long)pseudocode_view::active_tab_address(),
+                    (unsigned long long)addr1,
+                    total1,
+                    total2);
+                failed.fetch_add(1);
+            }
         } catch (...) {
             log_msg(hf, tag, "FAIL -- exception in refresh_all_tabs");
             failed.fetch_add(1);

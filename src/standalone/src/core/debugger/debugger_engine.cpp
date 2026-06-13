@@ -238,6 +238,39 @@ bool suspend_contextable_thread(state_t& st, driver_bridge::thread_context_t& ct
 	return false;
 }
 
+std::vector<driver_bridge::thread_info_t> hardware_breakpoint_threads(state_t& st, const char* reason) {
+	std::vector<driver_bridge::thread_info_t> selected;
+	if (st.target_pid == 0)
+		return selected;
+	auto threads = driver_bridge::enumerate_threads();
+	if (st.active_tid != 0) {
+		for (const auto& t : threads) {
+			if (t.owner_pid == st.target_pid && t.tid == st.active_tid) {
+				selected.push_back(t);
+				diag::log_tagged_fmt("dbg_engine",
+					"hwbp_thread_scope reason=%s pid=%u active_tid=%u selected=1 enumerated=%zu",
+					reason ? reason : "hwbp",
+					static_cast<unsigned>(st.target_pid),
+					static_cast<unsigned>(st.active_tid),
+					threads.size());
+				return selected;
+			}
+		}
+	}
+	for (const auto& t : threads) {
+		if (t.owner_pid == st.target_pid)
+			selected.push_back(t);
+	}
+	diag::log_tagged_fmt("dbg_engine",
+		"hwbp_thread_scope reason=%s pid=%u active_tid=%u selected=%zu enumerated=%zu",
+		reason ? reason : "hwbp",
+		static_cast<unsigned>(st.target_pid),
+		static_cast<unsigned>(st.active_tid),
+		selected.size(),
+		threads.size());
+	return selected;
+}
+
 register_set_t capture_registers_from_context(const driver_bridge::thread_context_t& src) {
 	register_set_t dst{};
 	dst.rax = src.rax; dst.rbx = src.rbx;
@@ -489,9 +522,8 @@ int add_breakpoint(uint64_t address, bp_type_t type, const std::string& name,
 		bool any_applied = false;
 		bool any_failed  = false;
 		if (st.target_pid != 0) {
-			auto threads = driver_bridge::enumerate_threads();
+			auto threads = hardware_breakpoint_threads(st, "add_breakpoint");
 			for (const auto& t : threads) {
-				if (t.owner_pid != st.target_pid) continue;
 				if (driver_bridge::set_hardware_breakpoint(t.tid, slot, address, hw_type, len_bits))
 					any_applied = true;
 				else
@@ -541,9 +573,8 @@ bool remove_breakpoint(int index) {
 	}
 
 	if (bp.hw_slot >= 0 && bp.hw_slot < 4 && st.target_pid != 0) {
-		auto threads = driver_bridge::enumerate_threads();
+		auto threads = hardware_breakpoint_threads(st, "remove_breakpoint");
 		for (const auto& t : threads) {
-			if (t.owner_pid != st.target_pid) continue;
 			driver_bridge::clear_hardware_breakpoint(t.tid, bp.hw_slot);
 		}
 	}
@@ -592,9 +623,8 @@ bool toggle_breakpoint(int index) {
 		bp.type == bp_type_t::hardware_read) {
 		if (!will_enable) {
 			if (bp.hw_slot >= 0 && bp.hw_slot < 4 && st.target_pid != 0) {
-				auto threads = driver_bridge::enumerate_threads();
+				auto threads = hardware_breakpoint_threads(st, "toggle_breakpoint_off");
 				for (const auto& t : threads) {
-					if (t.owner_pid != st.target_pid) continue;
 					driver_bridge::clear_hardware_breakpoint(t.tid, bp.hw_slot);
 				}
 			}
@@ -635,9 +665,8 @@ bool toggle_breakpoint(int index) {
 			}
 
 			if (st.target_pid != 0) {
-				auto threads = driver_bridge::enumerate_threads();
+				auto threads = hardware_breakpoint_threads(st, "toggle_breakpoint_on");
 				for (const auto& t : threads) {
-					if (t.owner_pid != st.target_pid) continue;
 					driver_bridge::set_hardware_breakpoint(t.tid, slot, bp.address, hw_type, len_bits);
 				}
 			}
@@ -2437,10 +2466,51 @@ void enumerate_handles() {
 void find_strings(size_t min_length) {
 	auto& st = g_state;
 	sync_attached_state();
-	if (st.target_pid == 0) return;
+	if (st.target_pid == 0) {
+		diag::log_tagged_fmt("debugger_strings",
+			"find_strings skipped_no_target min_length=%zu",
+			min_length);
+		return;
+	}
 
-	auto regions = driver_bridge::enumerate_memory_regions(4096);
+	const uint32_t scan_pid = st.target_pid;
+	auto enum_regions_logged = [&](const char* phase, size_t retry_index) {
+		auto regs = driver_bridge::enumerate_memory_regions(4096);
+		diag::log_tagged_fmt("debugger_strings",
+			"find_strings_regions phase=%s retry=%zu pid=%u count=%zu",
+			phase,
+			retry_index,
+			scan_pid,
+			regs.size());
+		return regs;
+	};
+
+	auto regions = enum_regions_logged("initial", 0);
+	size_t region_retry_count = 0;
+	while (regions.empty() && region_retry_count < 2) {
+		uint32_t exit_code = 0;
+		const bool alive = driver_bridge::attached_process_alive(&exit_code);
+		diag::log_tagged_fmt("debugger_strings",
+			"find_strings_zero_regions_suspicious pid=%u retry=%zu alive=%d exit_code_or_err=0x%08X",
+			scan_pid,
+			region_retry_count + 1,
+			alive ? 1 : 0,
+			exit_code);
+		if (!alive)
+			break;
+		std::this_thread::sleep_for(std::chrono::milliseconds(60));
+		++region_retry_count;
+		regions = enum_regions_logged("retry", region_retry_count);
+	}
+
 	auto modules = driver_bridge::enumerate_modules();
+	diag::log_tagged_fmt("debugger_strings",
+		"find_strings_begin pid=%u min_length=%zu regions=%zu retries=%zu modules=%zu",
+		scan_pid,
+		min_length,
+		regions.size(),
+		region_retry_count,
+		modules.size());
 
 	std::vector<string_ref_t> found;
 	st.strings_pages_scanned.store(0, std::memory_order_release);
@@ -2556,10 +2626,20 @@ void find_strings(size_t min_length) {
 		if (found.size() >= max_strings) break;
 	}
 
+	const size_t final_found_count = found.size();
 	{
 		std::lock_guard<std::mutex> lk(st.strings_mutex);
 		st.strings = std::move(found);
 	}
+	diag::log_tagged_fmt("debugger_strings",
+		"find_strings_complete pid=%u regions=%zu retries=%zu modules=%zu pages_scanned=%llu found=%zu cancelled=%d",
+		scan_pid,
+		regions.size(),
+		region_retry_count,
+		modules.size(),
+		static_cast<unsigned long long>(st.strings_pages_scanned.load(std::memory_order_acquire)),
+		final_found_count,
+		st.strings_cancel.load(std::memory_order_acquire) ? 1 : 0);
 }
 
 

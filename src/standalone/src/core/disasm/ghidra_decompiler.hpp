@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -126,6 +127,46 @@ inline bool buffer_is_zero_padding(const std::vector<uint8_t>& bytes)
 		}
 	}
 	return longest >= 256 || (bytes.size() >= 256 && zero_count * 100 >= bytes.size() * 90);
+}
+
+inline bool decompile_protect_executable(uint32_t protect)
+{
+	switch (protect & 0xFFu) {
+	case PAGE_EXECUTE:
+	case PAGE_EXECUTE_READ:
+	case PAGE_EXECUTE_READWRITE:
+	case PAGE_EXECUTE_WRITECOPY:
+		return true;
+	default:
+		return false;
+	}
+}
+
+inline bool decompile_section_executable(uint32_t characteristics)
+{
+	return (characteristics & 0x20000000u) != 0 || (characteristics & 0x00000020u) != 0;
+}
+
+inline void decompile_zero_window_stats(const std::vector<uint8_t>& bytes,
+                                        size_t offset,
+                                        size_t size,
+                                        size_t& zero_count,
+                                        size_t& longest_zero_run)
+{
+	zero_count = 0;
+	longest_zero_run = 0;
+	size_t current = 0;
+	const size_t end = (std::min)(bytes.size(), offset + size);
+	for (size_t i = offset; i < end; ++i) {
+		if (bytes[i] == 0) {
+			++zero_count;
+			++current;
+			if (current > longest_zero_run)
+				longest_zero_run = current;
+		} else {
+			current = 0;
+		}
+	}
 }
 
 inline bool profile_pe_image_header(const std::vector<uint8_t>& bytes, preload_diagnostics_t& diag)
@@ -797,28 +838,204 @@ inline ghidra_result_t decompile_function(uint64_t entry_addr,
 		}
 	}
 
-	constexpr size_t PREREAD_SIZE = 0x40000;
-	std::vector<uint8_t> mem;
-	driver_bridge::read_memory(entry_addr, PREREAD_SIZE, mem);
+	const uint32_t attached_pid = driver_bridge::attached_pid();
+	auto modules = driver_bridge::enumerate_modules();
+	driver_bridge::module_info_t selected_module{};
+	bool module_found = false;
+	for (const auto& m : modules) {
+		const uint64_t end = m.base + static_cast<uint64_t>(m.size);
+		if (end <= m.base)
+			continue;
+		if (entry_addr >= m.base && entry_addr < end) {
+			if (!module_found || m.size < selected_module.size) {
+				selected_module = m;
+				module_found = true;
+			}
+		}
+	}
 
-	if (mem.empty()) {
+	pe_parser::pe_info_t pe;
+	bool pe_ok = false;
+	pe_parser::section_info_t selected_section{};
+	bool section_found = false;
+	bool section_executable = false;
+	uint64_t module_base = module_found ? selected_module.base : 0;
+	uint64_t module_size = module_found ? selected_module.size : 0;
+	uint64_t section_start = 0;
+	uint64_t section_end = 0;
+	if (module_found) {
+		pe_ok = pe_parser::parse(selected_module.base, pe, false);
+		if (pe_ok) {
+			const uint64_t rva = entry_addr >= selected_module.base ? entry_addr - selected_module.base : 0;
+			for (const auto& s : pe.sections) {
+				const uint64_t size = (std::max)(static_cast<uint64_t>(s.virtual_size), static_cast<uint64_t>(s.raw_size));
+				if (size == 0)
+					continue;
+				const uint64_t start = static_cast<uint64_t>(s.virtual_address);
+				const uint64_t end = start + size;
+				if (end <= start)
+					continue;
+				if (rva >= start && rva < end) {
+					selected_section = s;
+					section_found = true;
+					section_executable = decompile_section_executable(s.characteristics);
+					section_start = selected_module.base + start;
+					section_end = selected_module.base + end;
+					const uint64_t module_end = selected_module.base + static_cast<uint64_t>(selected_module.size);
+					if (module_end > selected_module.base && section_end > module_end)
+						section_end = module_end;
+					break;
+				}
+			}
+		}
+	}
+
+	driver_bridge::memory_region_t region{};
+	const bool region_ok = driver_bridge::query_memory(entry_addr, region);
+	const bool region_executable = region_ok && decompile_protect_executable(region.protect);
+	const bool region_committed = region_ok && region.state == MEM_COMMIT;
+	if (!section_found && region_ok) {
+		module_base = module_found ? selected_module.base : region.base;
+		module_size = module_found ? selected_module.size : region.size;
+		section_start = region.base;
+		section_end = region.base + region.size;
+		section_found = true;
+		section_executable = region_executable;
+	}
+
+	diag::log_tagged_fmt("ghidra",
+		"decompile_function_resolve addr=0x%llX pid=%u module_found=%d module=%s module_base=0x%llX module_size=0x%llX pe_ok=%d section_found=%d section=%s section_start=0x%llX section_end=0x%llX section_exec=%d region_ok=%d region_base=0x%llX region_size=0x%llX region_state=0x%08X region_protect=0x%08X region_type=0x%08X region_exec=%d",
+		static_cast<unsigned long long>(entry_addr),
+		static_cast<unsigned>(attached_pid),
+		module_found ? 1 : 0,
+		module_found ? selected_module.name.c_str() : "<none>",
+		static_cast<unsigned long long>(module_base),
+		static_cast<unsigned long long>(module_size),
+		pe_ok ? 1 : 0,
+		section_found ? 1 : 0,
+		section_found ? selected_section.name.c_str() : "<none>",
+		static_cast<unsigned long long>(section_start),
+		static_cast<unsigned long long>(section_end),
+		section_executable ? 1 : 0,
+		region_ok ? 1 : 0,
+		static_cast<unsigned long long>(region.base),
+		static_cast<unsigned long long>(region.size),
+		static_cast<unsigned>(region.state),
+		static_cast<unsigned>(region.protect),
+		static_cast<unsigned>(region.type),
+		region_executable ? 1 : 0);
+
+	if (!section_found || section_end <= section_start || entry_addr < section_start || entry_addr >= section_end) {
 		result.is_error = true;
-		result.error_text = "failed to read memory at target address";
+		result.error_text = "failed to resolve an executable module section for the target address";
 		return result;
 	}
-	if (buffer_is_zero_padding(mem)) {
+	if (!section_executable) {
 		result.is_error = true;
-		result.error_text = "selected address resolves to zero-filled padding, not executable function bytes";
+		result.error_text = "target address is not inside an executable section";
 		return result;
 	}
+	if (region_ok) {
+		if (!region_committed || (region.protect & PAGE_GUARD) != 0 || (region.protect & PAGE_NOACCESS) != 0) {
+			result.is_error = true;
+			result.error_text = "target address is not in readable committed executable memory";
+			return result;
+		}
+		const uint64_t region_end = region.base + region.size;
+		if (region.base <= entry_addr && region_end > entry_addr) {
+			if (section_start < region.base)
+				section_start = region.base;
+			if (section_end > region_end)
+				section_end = region_end;
+		}
+	}
+
+	constexpr size_t MAX_DECOMPILE_READ = 0x20000;
+	uint64_t read_base = section_start;
+	if (entry_addr - read_base >= MAX_DECOMPILE_READ) {
+		read_base = entry_addr & ~0xFFFULL;
+		if (read_base < section_start)
+			read_base = section_start;
+	}
+	uint64_t read_end = section_end;
+	if (read_end - read_base > MAX_DECOMPILE_READ)
+		read_end = read_base + MAX_DECOMPILE_READ;
+	if (entry_addr >= read_end) {
+		read_base = entry_addr & ~0xFFFULL;
+		if (read_base < section_start)
+			read_base = section_start;
+		read_end = (std::min)(section_end, read_base + static_cast<uint64_t>(MAX_DECOMPILE_READ));
+	}
+	const size_t read_size = read_end > read_base ? static_cast<size_t>(read_end - read_base) : 0;
+	if (read_size == 0 || entry_addr < read_base || entry_addr >= read_end) {
+		result.is_error = true;
+		result.error_text = "resolved executable read window does not contain the target address";
+		return result;
+	}
+
+	std::vector<uint8_t> mem;
+	SetLastError(ERROR_SUCCESS);
+	const bool read_ok = driver_bridge::read_memory(read_base, read_size, mem);
+	const DWORD read_gle = read_ok ? ERROR_SUCCESS : GetLastError();
+	if (mem.size() > read_size)
+		mem.resize(read_size);
+	const size_t entry_offset = entry_addr >= read_base ? static_cast<size_t>(entry_addr - read_base) : mem.size();
+	const size_t entry_window = entry_offset < mem.size() ? (std::min)(static_cast<size_t>(256), mem.size() - entry_offset) : 0;
+	size_t entry_zero_count = 0;
+	size_t entry_longest_zero_run = 0;
+	decompile_zero_window_stats(mem, entry_offset, entry_window, entry_zero_count, entry_longest_zero_run);
+	const bool entry_window_zero = entry_window == 0 || entry_zero_count == entry_window;
+	diag::log_tagged_fmt("ghidra",
+		"decompile_function_read addr=0x%llX read_base=0x%llX read_size=%zu read_ok=%d bytes=%zu gle=%lu entry_offset=%zu entry_window=%zu entry_zero=%zu entry_nonzero=%zu entry_longest_zero=%zu module_base=0x%llX module_size=0x%llX section_start=0x%llX section_end=0x%llX region_state=0x%08X region_protect=0x%08X",
+		static_cast<unsigned long long>(entry_addr),
+		static_cast<unsigned long long>(read_base),
+		read_size,
+		read_ok ? 1 : 0,
+		mem.size(),
+		static_cast<unsigned long>(read_gle),
+		entry_offset,
+		entry_window,
+		entry_zero_count,
+		entry_window >= entry_zero_count ? entry_window - entry_zero_count : 0,
+		entry_longest_zero_run,
+		static_cast<unsigned long long>(module_base),
+		static_cast<unsigned long long>(module_size),
+		static_cast<unsigned long long>(section_start),
+		static_cast<unsigned long long>(section_end),
+		static_cast<unsigned>(region.state),
+		static_cast<unsigned>(region.protect));
+
+	if (!read_ok || mem.empty() || entry_offset >= mem.size()) {
+		result.is_error = true;
+		result.error_text = "failed to read executable bytes at target address";
+		return result;
+	}
+	if (entry_window_zero) {
+		result.is_error = true;
+		result.error_text = "selected address resolves to zero-filled entry bytes, not executable function bytes";
+		return result;
+	}
+
+	DisasmFile context;
+	context.path = module_found ? selected_module.path : std::string("live://memory_region");
+	context.filename = module_found ? selected_module.name : std::string("memory_region");
+	context.image_base = module_base;
+	context.entry_point = pe_ok ? pe.entry_point : 0;
+	context.text_va = read_base;
+	context.loaded = true;
+	PESection ps;
+	ps.va = read_base;
+	ps.bytes = mem;
+	ps.is_executable = true;
+	context.sections.push_back(std::move(ps));
 
 	auto arch_desc = aida_ghidra::detect_arch_default_x64();
 
 	try {
-		detail::prepared_arch_t ta(mem.data(), mem.size(), entry_addr,
-		                           nullptr, cancel,
+		detail::prepared_arch_t ta(mem.data(), mem.size(), read_base,
+		                           &context, cancel,
 		                           arch_desc.sleigh_id);
-		detail::populate_symbols(*ta.arch, mem.data(), mem.size(), entry_addr, nullptr);
+		detail::populate_symbols(*ta.arch, mem.data(), mem.size(), read_base, &context);
 		result = detail::do_decompile(ta.arch.get(), entry_addr, cancel);
 	}
 	catch (ghidra::LowlevelError& err) {

@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -29,6 +30,7 @@ struct udp_reassemble_options_t {
     std::uint32_t capture_ms = 10000;
     std::uint32_t max_packets = 256;
     std::uint32_t max_payload = 1500;
+    std::vector<std::vector<std::uint8_t>> fixture_payloads;
 };
 
 struct replay_mutate_options_t {

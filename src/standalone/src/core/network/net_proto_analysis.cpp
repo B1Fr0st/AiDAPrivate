@@ -6,6 +6,7 @@
 #include "game_protocol.hpp"
 #include "pre_encrypt_hook.hpp"
 #include "standalone_driver.hpp"
+#include "helpers/diag_log.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -549,20 +550,20 @@ int pre_encrypt_arg_index(const std::string& reg)
     return -1;
 }
 
-std::uint32_t driver_reg_index(const std::string& reg)
+bool driver_reg_index_checked(const std::string& reg, std::uint32_t& out)
 {
     const std::string r = lower_copy(reg);
-    if (r == "rax") return 0;
-    if (r == "rcx") return 1;
-    if (r == "rdx") return 2;
-    if (r == "rbx") return 3;
-    if (r == "rsp") return 4;
-    if (r == "rbp") return 5;
-    if (r == "rsi") return 6;
-    if (r == "rdi") return 7;
-    if (r == "r8") return 8;
-    if (r == "r9") return 9;
-    return 2;
+    if (r == "rax") { out = 0; return true; }
+    if (r == "rcx") { out = 1; return true; }
+    if (r == "rdx") { out = 2; return true; }
+    if (r == "rbx") { out = 3; return true; }
+    if (r == "rsp") { out = 4; return true; }
+    if (r == "rbp") { out = 5; return true; }
+    if (r == "rsi") { out = 6; return true; }
+    if (r == "rdi") { out = 7; return true; }
+    if (r == "r8") { out = 8; return true; }
+    if (r == "r9") { out = 9; return true; }
+    return false;
 }
 
 nlohmann::json captures_to_fields(const std::vector<std::vector<std::uint8_t>>& samples)
@@ -801,9 +802,50 @@ bool trace_serializer(const serializer_trace_options_t& input,
 
     const int buf_arg = pre_encrypt_arg_index(options.buffer_reg);
     const int size_arg = pre_encrypt_arg_index(options.size_reg);
+    std::uint32_t driver_buf_reg = 0;
+    std::uint32_t driver_size_reg = 0;
+    if (!driver_reg_index_checked(options.buffer_reg, driver_buf_reg)) {
+        error = "invalid buffer_reg '" + options.buffer_reg + "'";
+        out["negative_contract"] = true;
+        out["invalid_register"] = options.buffer_reg;
+        out["buffer_reg"] = options.buffer_reg;
+        out["size_reg"] = options.size_reg;
+        diag::log_tagged_fmt("net_proto", "trace_serializer invalid_buffer_reg=%s", options.buffer_reg.c_str());
+        return false;
+    }
+    if (!driver_reg_index_checked(options.size_reg, driver_size_reg)) {
+        error = "invalid size_reg '" + options.size_reg + "'";
+        out["negative_contract"] = true;
+        out["invalid_register"] = options.size_reg;
+        out["buffer_reg"] = options.buffer_reg;
+        out["size_reg"] = options.size_reg;
+        diag::log_tagged_fmt("net_proto", "trace_serializer invalid_size_reg=%s", options.size_reg.c_str());
+        return false;
+    }
+    if (lower_copy(options.buffer_reg) == lower_copy(options.size_reg)) {
+        error = "buffer_reg and size_reg must be different registers";
+        out["negative_contract"] = true;
+        out["buffer_reg"] = options.buffer_reg;
+        out["size_reg"] = options.size_reg;
+        diag::log_tagged_fmt("net_proto", "trace_serializer invalid_register_pair reg=%s", options.buffer_reg.c_str());
+        return false;
+    }
     std::vector<std::vector<std::uint8_t>> samples;
     nlohmann::json captures = nlohmann::json::array();
     std::string backend = "pre_encrypt_hook";
+
+    diag::log_tagged_fmt("net_proto",
+        "trace_serializer begin pid=%u serializer=0x%llX buffer_reg=%s size_reg=%s pre_buf=%d pre_size=%d driver_buf=%u driver_size=%u sample_ms=%u max_captures=%u",
+        pid,
+        static_cast<unsigned long long>(options.serializer_va),
+        options.buffer_reg.c_str(),
+        options.size_reg.c_str(),
+        buf_arg,
+        size_arg,
+        driver_buf_reg,
+        driver_size_reg,
+        options.sample_ms,
+        options.max_captures);
 
     if (buf_arg >= 0 && size_arg >= 0 &&
         pre_encrypt_hook::hook_address(options.serializer_va, "net_proto_serializer",
@@ -813,6 +855,10 @@ bool trace_serializer(const serializer_trace_options_t& input,
         std::this_thread::sleep_for(std::chrono::milliseconds(options.sample_ms));
         auto caps = pre_encrypt_hook::get_captures(options.max_captures);
         pre_encrypt_hook::unhook_all();
+        diag::log_tagged_fmt("net_proto",
+            "trace_serializer pre_encrypt_done captures=%zu sample_ms=%u",
+            caps.size(),
+            options.sample_ms);
         for (const auto& cap : caps) {
             samples.push_back(cap.buffer);
             nlohmann::json c;
@@ -828,8 +874,8 @@ bool trace_serializer(const serializer_trace_options_t& input,
         pre_encrypt_hook::unhook_all();
         backend = "driver_sniff_net_buffers";
         if (!driver_bridge::sniff_net_buffers_start(options.serializer_va,
-                driver_reg_index(options.buffer_reg),
-                driver_reg_index(options.size_reg),
+                driver_buf_reg,
+                driver_size_reg,
                 options.max_captures,
                 options.tid,
                 0)) {
@@ -840,6 +886,12 @@ bool trace_serializer(const serializer_trace_options_t& input,
         bool active = false;
         auto caps = driver_bridge::sniff_net_buffers_get(active);
         driver_bridge::sniff_net_buffers_stop();
+        diag::log_tagged_fmt("net_proto",
+            "trace_serializer driver_sniff_done captures=%zu active_after_get=%d sample_ms=%u driver_error=%s",
+            caps.size(),
+            active ? 1 : 0,
+            options.sample_ms,
+            driver_bridge::last_error().c_str());
         for (const auto& cap : caps) {
             samples.push_back(cap.buffer);
             nlohmann::json c;
@@ -868,6 +920,12 @@ bool trace_serializer(const serializer_trace_options_t& input,
     out["evidence"] = samples.empty()
         ? nlohmann::json::array({"no serializer breakpoint hits observed during bounded sample"})
         : nlohmann::json::array({"captured serializer output buffers", "field offsets are inferred from payload bytes and sample variance", "source addresses are not claimed without taint provenance"});
+    diag::log_tagged_fmt("net_proto",
+        "trace_serializer done backend=%s captures=%u fields=%u confidence=%.3f",
+        backend.c_str(),
+        out.value("capture_count", 0u),
+        out.value("field_count", 0u),
+        out.value("confidence", 0.0));
     return true;
 }
 
@@ -877,10 +935,6 @@ bool reassemble_udp_sessions(const udp_reassemble_options_t& input,
 {
     out = nlohmann::json::object();
     error.clear();
-    if (!driver_bridge::using_kernel_driver()) {
-        error = "driver bridge is not connected";
-        return false;
-    }
 
     udp_reassemble_options_t options = input;
     if (options.capture_ms == 0)
@@ -896,13 +950,65 @@ bool reassemble_udp_sessions(const udp_reassemble_options_t& input,
     if (options.max_payload > 4096)
         options.max_payload = 4096;
 
-    if (!driver_bridge::start_capture(options.pid, 0, 17, nullptr, options.max_payload)) {
-        error = driver_bridge::last_error().empty() ? "failed to start UDP capture" : driver_bridge::last_error();
-        return false;
+    std::string backend = "driver_capture";
+    std::vector<driver_bridge::captured_packet_t> packets;
+    if (!options.fixture_payloads.empty()) {
+        backend = "provided_payload";
+        std::uint32_t index = 0;
+        for (const auto& payload : options.fixture_payloads) {
+            if (payload.empty())
+                continue;
+            driver_bridge::captured_packet_t p{};
+            p.pid = options.pid;
+            p.protocol = 17;
+            p.direction = 1;
+            p.address_family = 2;
+            p.local_addr[0] = 127;
+            p.local_addr[3] = 1;
+            p.remote_addr[0] = 127;
+            p.remote_addr[3] = 1;
+            p.local_port = 41000 + index;
+            p.remote_port = 42000 + index;
+            p.payload = payload;
+            p.payload_size = static_cast<std::uint32_t>(p.payload.size());
+            packets.push_back(std::move(p));
+            ++index;
+        }
+        diag::log_tagged_fmt("net_proto",
+            "udp_reassemble provided_payload payloads=%zu packets=%zu pid=%u max_payload=%u",
+            options.fixture_payloads.size(),
+            packets.size(),
+            options.pid,
+            options.max_payload);
+    } else {
+        if (!driver_bridge::using_kernel_driver()) {
+            error = "driver bridge is not connected";
+            return false;
+        }
+
+        diag::log_tagged_fmt("net_proto",
+            "udp_reassemble capture_begin pid=%u capture_ms=%u max_packets=%u max_payload=%u",
+            options.pid,
+            options.capture_ms,
+            options.max_packets,
+            options.max_payload);
+        if (!driver_bridge::start_capture(options.pid, 0, 17, nullptr, options.max_payload)) {
+            error = driver_bridge::last_error().empty() ? "failed to start UDP capture" : driver_bridge::last_error();
+            diag::log_tagged_fmt("net_proto",
+                "udp_reassemble capture_start_failed pid=%u error=%s",
+                options.pid,
+                error.c_str());
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(options.capture_ms));
+        packets = driver_bridge::get_captured_packets(options.max_packets);
+        driver_bridge::stop_capture();
+        diag::log_tagged_fmt("net_proto",
+            "udp_reassemble capture_done pid=%u packets=%zu driver_error=%s",
+            options.pid,
+            packets.size(),
+            driver_bridge::last_error().c_str());
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(options.capture_ms));
-    auto packets = driver_bridge::get_captured_packets(options.max_packets);
-    driver_bridge::stop_capture();
 
     std::map<std::string, udp_session_t> grouped;
     for (const auto& p : packets) {
@@ -958,10 +1064,26 @@ bool reassemble_udp_sessions(const udp_reassemble_options_t& input,
         }
     }
 
+    diag::log_tagged_fmt("net_proto",
+        "udp_reassemble grouping backend=%s packets=%zu groups=%zu sessions=%zu pid=%u",
+        backend.c_str(),
+        packets.size(),
+        grouped.size(),
+        sessions_json.size(),
+        options.pid);
     out["capture_ms"] = options.capture_ms;
+    out["backend"] = backend;
+    out["capture_performed"] = backend == "driver_capture";
+    out["deterministic_input"] = backend == "provided_payload";
+    out["filter_pid"] = options.pid;
+    out["filter_protocol"] = "udp";
+    out["max_packets"] = options.max_packets;
+    out["max_payload"] = options.max_payload;
     out["packet_count"] = packets.size();
     out["sessions"] = std::move(sessions_json);
     out["session_count"] = out["sessions"].size();
+    out["produces_recorded_sessions"] = true;
+    out["replay_tool"] = "net_replay_mutate";
     out["limitations"] = nlohmann::json::array({
         "fragment reassembly is heuristic and recognizes length-prefixed and ENet-like sequence patterns",
         "logical sessions are grouped by endpoint tuple, not application authentication state"
@@ -1084,6 +1206,9 @@ bool replay_mutate(const replay_mutate_options_t& input,
     }
 
     out["session_id"] = options.session_id;
+    out["replay_requires_existing_session"] = true;
+    out["record_operation"] = "net_udp_session_reassemble";
+    out["recorded_message_count"] = session.messages.size();
     out["target"] = options.target_ip + ":" + std::to_string(options.target_port);
     out["mutation_strategy"] = options.mutation_strategy;
     out["max_mutations"] = options.max_mutations;

@@ -68,6 +68,121 @@ namespace {
 		r.parsed.push_back({ label, buf });
 	}
 
+	struct user_context_probe_t {
+		bool attempted = false;
+		bool self_thread = false;
+		bool open_ok = false;
+		bool suspend_ok = false;
+		bool get_ok = false;
+		bool resume_ok = false;
+		bool context_valid = false;
+		DWORD open_gle = ERROR_SUCCESS;
+		DWORD suspend_gle = ERROR_SUCCESS;
+		DWORD get_gle = ERROR_SUCCESS;
+		DWORD resume_gle = ERROR_SUCCESS;
+		DWORD suspend_prev = static_cast<DWORD>(-1);
+		DWORD resume_prev = static_cast<DWORD>(-1);
+		std::uint64_t rip = 0;
+		std::uint64_t rsp = 0;
+		std::uint64_t rbp = 0;
+		std::uint64_t rflags = 0;
+		std::uint64_t dr7 = 0;
+		std::uint64_t elapsed_ms = 0;
+	};
+
+	user_context_probe_t probe_user_context(std::uint32_t tid, DWORD access) {
+		user_context_probe_t out{};
+		out.attempted = true;
+		const DWORD start = GetTickCount();
+		if (tid == GetCurrentThreadId()) {
+			out.self_thread = true;
+			out.open_gle = ERROR_INVALID_PARAMETER;
+			out.elapsed_ms = GetTickCount() - start;
+			SetLastError(ERROR_INVALID_PARAMETER);
+			return out;
+		}
+		SetLastError(ERROR_SUCCESS);
+		HANDLE thread = OpenThread(access, FALSE, tid);
+		out.open_ok = thread != nullptr;
+		out.open_gle = out.open_ok ? ERROR_SUCCESS : GetLastError();
+		if (!thread) {
+			out.elapsed_ms = GetTickCount() - start;
+			SetLastError(out.open_gle);
+			return out;
+		}
+		SetLastError(ERROR_SUCCESS);
+		DWORD suspend_prev = SuspendThread(thread);
+		out.suspend_prev = suspend_prev;
+		out.suspend_ok = suspend_prev != static_cast<DWORD>(-1);
+		out.suspend_gle = out.suspend_ok ? ERROR_SUCCESS : GetLastError();
+		if (out.suspend_ok) {
+			CONTEXT native{};
+			native.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS | CONTEXT_DEBUG_REGISTERS;
+			SetLastError(ERROR_SUCCESS);
+			BOOL got = GetThreadContext(thread, &native);
+			out.get_ok = got != FALSE;
+			out.get_gle = out.get_ok ? ERROR_SUCCESS : GetLastError();
+			if (out.get_ok) {
+				out.rip = native.Rip;
+				out.rsp = native.Rsp;
+				out.rbp = native.Rbp;
+				out.rflags = native.EFlags;
+				out.dr7 = native.Dr7;
+				out.context_valid = out.rip != 0 && out.rsp != 0;
+			}
+			SetLastError(ERROR_SUCCESS);
+			DWORD resume_prev = ResumeThread(thread);
+			out.resume_prev = resume_prev;
+			out.resume_ok = resume_prev != static_cast<DWORD>(-1);
+			out.resume_gle = out.resume_ok ? ERROR_SUCCESS : GetLastError();
+		}
+		CloseHandle(thread);
+		out.elapsed_ms = GetTickCount() - start;
+		return out;
+	}
+
+	void push_user_probe_fields(test_lab::result_t& r, const char* prefix, const user_context_probe_t& p) {
+		char label[80];
+		auto field = [&](const char* suffix, const std::string& value) {
+			std::snprintf(label, sizeof(label), "%s_%s", prefix, suffix);
+			r.parsed.push_back({ label, value });
+		};
+		auto bool_field = [&](const char* suffix, bool value) {
+			field(suffix, value ? "1" : "0");
+		};
+		auto u32_field = [&](const char* suffix, DWORD value) {
+			char buf[32];
+			std::snprintf(buf, sizeof(buf), "%lu (0x%08lX)", static_cast<unsigned long>(value), static_cast<unsigned long>(value));
+			field(suffix, buf);
+		};
+		auto u64_hex_field = [&](const char* suffix, std::uint64_t value) {
+			char buf[32];
+			std::snprintf(buf, sizeof(buf), "0x%016llX", static_cast<unsigned long long>(value));
+			field(suffix, buf);
+		};
+		bool_field("attempted", p.attempted);
+		bool_field("self_thread", p.self_thread);
+		bool_field("open_ok", p.open_ok);
+		u32_field("open_gle", p.open_gle);
+		bool_field("suspend_ok", p.suspend_ok);
+		u32_field("suspend_gle", p.suspend_gle);
+		u32_field("suspend_prev", p.suspend_prev);
+		bool_field("get_context_ok", p.get_ok);
+		u32_field("get_context_gle", p.get_gle);
+		bool_field("resume_ok", p.resume_ok);
+		u32_field("resume_gle", p.resume_gle);
+		u32_field("resume_prev", p.resume_prev);
+		bool_field("context_valid", p.context_valid);
+		u64_hex_field("rip", p.rip);
+		u64_hex_field("rsp", p.rsp);
+		u64_hex_field("rbp", p.rbp);
+		u64_hex_field("rflags", p.rflags);
+		u64_hex_field("dr7", p.dr7);
+		char elapsed[32];
+		std::snprintf(elapsed, sizeof(elapsed), "%llu", static_cast<unsigned long long>(p.elapsed_ms));
+		field("elapsed_ms", elapsed);
+	}
+
 	void copy_context_to_request(voyager::detail::thread_ctx_request& req, const voyager::device_t::thread_context& ctx) {
 		req.rax = ctx.rax; req.rbx = ctx.rbx; req.rcx = ctx.rcx; req.rdx = ctx.rdx;
 		req.rsi = ctx.rsi; req.rdi = ctx.rdi; req.rbp = ctx.rbp; req.rsp = ctx.rsp;
@@ -165,40 +280,61 @@ namespace {
 		device->sync_dynamic_security_state();
 		const std::uint32_t attached_pid = driver_bridge::attached_pid();
 		const std::uint32_t device_pid = device->get_process_id();
+		const std::uint32_t requested_ioctl = ioctl_codes::TCTX();
+		std::uint32_t decoded_offset = 0;
+		const bool decoded_offset_valid = device->decode_ioctl_offset_snapshot(static_cast<DWORD>(requested_ioctl), decoded_offset);
+		const DWORD effective_ioctl = decoded_offset_valid
+			? device->make_ioctl_snapshot(decoded_offset)
+			: static_cast<DWORD>(requested_ioctl);
+		const std::uint32_t ioctl_base = device->compute_ioctl_base_snapshot();
 		driver_bridge::thread_info_t before{};
 		driver_bridge::thread_info_t after{};
 		const bool before_found = find_thread_snapshot(s.pid, s.tid, before);
 		const DWORD thread_access = THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION;
-		SetLastError(ERROR_SUCCESS);
-		HANDLE access_probe = OpenThread(thread_access, FALSE, s.tid);
-		const DWORD access_error = access_probe ? ERROR_SUCCESS : GetLastError();
-		if (access_probe) {
-			CloseHandle(access_probe);
-		}
+		const user_context_probe_t user_probe_before = probe_user_context(s.tid, thread_access);
 		push_u32_field(r, "input_pid", s.pid);
 		push_u32_field(r, "input_tid", s.tid);
 		push_u32_field(r, "attached_pid", attached_pid);
 		push_u32_field(r, "device_pid", device_pid);
-		push_hex_field(r, "ioctl_code", ioctl_codes::TCTX());
-		push_u64_dec_field(r, "request_size", sizeof(voyager::detail::thread_ctx_request));
+		push_hex_field(r, "raw_ioctl_requested_code", requested_ioctl);
+		push_hex_field(r, "raw_ioctl_effective_code", effective_ioctl);
+		push_hex_field(r, "raw_ioctl_base", ioctl_base);
+		push_u32_field(r, "raw_ioctl_decoded_offset", decoded_offset);
+		push_bool_field(r, "raw_ioctl_decoded_offset_valid", decoded_offset_valid);
+		push_bool_field(r, "server_seed_present", device->has_server_seed());
+		push_bool_field(r, "server_ioctl_seed_present", device->has_server_ioctl_seed());
+		push_hex_field(r, "server_ioctl_seed_hash", device->get_server_ioctl_seed_hash());
+		push_u64_dec_field(r, "raw_ioctl_bytes_in", sizeof(voyager::detail::thread_ctx_request));
+		push_u64_dec_field(r, "raw_ioctl_bytes_out_capacity", sizeof(voyager::detail::thread_ctx_request));
 		push_u32_field(r, "request_should_set", 0);
 		push_hex_field(r, "request_register_mask", 0);
 		push_hex_field(r, "thread_access_mask", thread_access);
-		push_bool_field(r, "thread_access_open_ok", access_probe != nullptr);
-		push_u32_field(r, "thread_access_last_error", access_error);
+		push_bool_field(r, "thread_access_open_ok", user_probe_before.open_ok);
+		push_u32_field(r, "thread_access_last_error", user_probe_before.open_gle);
+		push_user_probe_fields(r, "user_probe_before_raw", user_probe_before);
 		push_thread_snapshot(r, "thread_before", before_found, before);
 		::diag::log_tagged_fmt("testlab_tctx",
-			"START pid=%u tid=%u attached_pid=%u device_pid=%u ioctl=0x%08X request_size=%zu should_set=0 register_mask=0x%llX thread_access=0x%08lX access_open=%d access_gle=%lu before_found=%d before_state=%u before_rip=0x%llX",
+			"START pid=%u tid=%u attached_pid=%u device_pid=%u requested_ioctl=0x%08X effective_ioctl=0x%08lX ioctl_base=0x%08X decoded_offset=%u decoded_valid=%d request_size=%zu should_set=0 register_mask=0x%llX thread_access=0x%08lX access_open=%d access_gle=%lu suspend_ok=%d suspend_gle=%lu get_ok=%d get_gle=%lu user_rip=0x%llX user_rsp=0x%llX before_found=%d before_state=%u before_rip=0x%llX",
 			s.pid,
 			s.tid,
 			attached_pid,
 			device_pid,
-			ioctl_codes::TCTX(),
+			requested_ioctl,
+			static_cast<unsigned long>(effective_ioctl),
+			ioctl_base,
+			decoded_offset,
+			decoded_offset_valid ? 1 : 0,
 			sizeof(voyager::detail::thread_ctx_request),
 			0ULL,
 			static_cast<unsigned long>(thread_access),
-			access_probe != nullptr ? 1 : 0,
-			static_cast<unsigned long>(access_error),
+			user_probe_before.open_ok ? 1 : 0,
+			static_cast<unsigned long>(user_probe_before.open_gle),
+			user_probe_before.suspend_ok ? 1 : 0,
+			static_cast<unsigned long>(user_probe_before.suspend_gle),
+			user_probe_before.get_ok ? 1 : 0,
+			static_cast<unsigned long>(user_probe_before.get_gle),
+			static_cast<unsigned long long>(user_probe_before.rip),
+			static_cast<unsigned long long>(user_probe_before.rsp),
 			before_found ? 1 : 0,
 			before.state,
 			static_cast<unsigned long long>(before.rip));
@@ -211,17 +347,22 @@ namespace {
 		std::uint32_t bytes_returned = 0;
 		SetLastError(ERROR_SUCCESS);
 		const std::uint64_t raw_start = static_cast<std::uint64_t>(GetTickCount64());
-		bool ok = device->send_ioctl_raw(ioctl_codes::TCTX(), &req, static_cast<std::uint32_t>(sizeof(req)), bytes_returned);
+		bool ok = device->send_ioctl_raw(requested_ioctl, &req, static_cast<std::uint32_t>(sizeof(req)), bytes_returned);
 		const DWORD raw_error = ok ? ERROR_SUCCESS : GetLastError();
 		const std::uint64_t raw_elapsed = static_cast<std::uint64_t>(GetTickCount64()) - raw_start;
 		const std::uint32_t raw_status = ok ? 0u : static_cast<std::uint32_t>(raw_error);
+		const std::int32_t raw_ntstatus = ok ? 0 : static_cast<std::int32_t>(0xC0000001u);
 		r.bytes_returned = bytes_returned;
 		r.raw.resize(sizeof(req));
 		std::memcpy(r.raw.data(), &req, sizeof(req));
 		const voyager::detail::thread_ctx_request raw_req = req;
 		const bool raw_context_valid = req.rip != 0 && req.rsp != 0;
+		push_hex_field(r, "raw_ioctl_requested_code_post", requested_ioctl);
+		push_hex_field(r, "raw_ioctl_effective_code_post", effective_ioctl);
+		push_u64_dec_field(r, "raw_ioctl_returned_bytes", bytes_returned);
 		push_bool_field(r, "raw_ioctl_ok", ok);
 		push_u32_field(r, "raw_ioctl_status", raw_status);
+		push_hex_field(r, "raw_ioctl_ntstatus", static_cast<std::uint32_t>(raw_ntstatus));
 		push_text_field(r, "raw_ioctl_status_source", "DeviceIoControl/GetLastError");
 		push_u32_field(r, "raw_ioctl_last_error", raw_error);
 		push_u32_field(r, "raw_ioctl_bytes", bytes_returned);
@@ -231,16 +372,25 @@ namespace {
 		push_u32_field(r, "raw_ioctl_tid", s.tid);
 		push_hex_field(r, "raw_ioctl_request_mask", raw_req.register_mask);
 		push_hex_field(r, "raw_ioctl_observed_register_mask", observed_context_mask(raw_req));
+		push_hex_field(r, "raw_ioctl_rip", raw_req.rip);
+		push_hex_field(r, "raw_ioctl_rsp", raw_req.rsp);
+		push_hex_field(r, "raw_ioctl_rflags", raw_req.rflags);
+		push_hex_field(r, "raw_ioctl_dr7", raw_req.dr7);
 		push_bool_field(r, "raw_context_valid", raw_context_valid);
 		::diag::log_tagged_fmt("testlab_tctx",
-			"RAW pid=%u tid=%u attached_pid=%u device_pid=%u ok=%d status=0x%08X gle=%lu bytes=%u elapsed_ms=%llu request_mask=0x%llX observed_mask=0x%llX rip=0x%llX rsp=0x%llX rflags=0x%llX dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX",
+			"RAW pid=%u tid=%u attached_pid=%u device_pid=%u requested_ioctl=0x%08X effective_ioctl=0x%08lX ok=%d status=0x%08X ntstatus=0x%08X gle=%lu bytes_in=%zu bytes_out_capacity=%zu bytes_returned=%u elapsed_ms=%llu request_mask=0x%llX observed_mask=0x%llX rip=0x%llX rsp=0x%llX rflags=0x%llX dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX",
 			s.pid,
 			s.tid,
 			attached_pid,
 			device_pid,
+			requested_ioctl,
+			static_cast<unsigned long>(effective_ioctl),
 			ok ? 1 : 0,
 			raw_status,
+			static_cast<unsigned>(static_cast<std::uint32_t>(raw_ntstatus)),
 			static_cast<unsigned long>(raw_error),
+			sizeof(voyager::detail::thread_ctx_request),
+			sizeof(voyager::detail::thread_ctx_request),
 			bytes_returned,
 			static_cast<unsigned long long>(raw_elapsed),
 			static_cast<unsigned long long>(raw_req.register_mask),
@@ -256,6 +406,7 @@ namespace {
 			static_cast<unsigned long long>(req.dr7));
 		if (!ok || !raw_context_valid) {
 			push_text_field(r, "fallback_reason", ok ? "raw ioctl returned zero RIP/RSP" : "raw ioctl failed");
+			push_text_field(r, "fallback_decision", "evaluating_public_context_fallback");
 			if (s.pid == device_pid && s.pid == attached_pid) {
 				voyager::device_t::thread_context ctx{};
 				SetLastError(ERROR_SUCCESS);
@@ -264,25 +415,35 @@ namespace {
 				const DWORD helper_error = helper_ok ? ERROR_SUCCESS : GetLastError();
 				const std::uint64_t helper_elapsed = static_cast<std::uint64_t>(GetTickCount64()) - helper_start;
 				const bool helper_valid = helper_ok && ctx.rip != 0 && ctx.rsp != 0;
+				push_text_field(r, "fallback_attempt_1_path", "device_t::get_thread_context");
 				push_bool_field(r, "fallback_helper_ok", helper_ok);
 				push_u32_field(r, "fallback_helper_last_error", helper_error);
+				push_hex_field(r, "fallback_helper_ntstatus", helper_ok ? 0u : 0xC0000001u);
 				push_u64_dec_field(r, "fallback_helper_elapsed_ms", helper_elapsed);
 				push_bool_field(r, "fallback_context_valid", helper_valid);
+				push_hex_field(r, "fallback_attempt_1_rip", ctx.rip);
+				push_hex_field(r, "fallback_attempt_1_rsp", ctx.rsp);
+				push_hex_field(r, "fallback_attempt_1_rflags", ctx.rflags);
+				push_hex_field(r, "fallback_attempt_1_dr7", ctx.dr7);
 				push_bool_field(r, "fallback_helper_matches_raw_rip", raw_req.rip != 0 && raw_req.rip == ctx.rip);
 				push_bool_field(r, "fallback_helper_matches_raw_rsp", raw_req.rsp != 0 && raw_req.rsp == ctx.rsp);
 				::diag::log_tagged_fmt("testlab_tctx",
-					"FALLBACK pid=%u tid=%u helper_ok=%d gle=%lu elapsed_ms=%llu rip=0x%llX rsp=0x%llX raw_rip=0x%llX raw_rsp=0x%llX rip_match=%d rsp_match=%d",
+					"FALLBACK_ATTEMPT path=device_t::get_thread_context attempt=1 pid=%u tid=%u helper_ok=%d gle=%lu ntstatus=0x%08X elapsed_ms=%llu rip=0x%llX rsp=0x%llX rflags=0x%llX dr7=0x%llX raw_rip=0x%llX raw_rsp=0x%llX rip_match=%d rsp_match=%d valid=%d",
 					s.pid,
 					s.tid,
 					helper_ok ? 1 : 0,
 					static_cast<unsigned long>(helper_error),
+					helper_ok ? 0u : 0xC0000001u,
 					static_cast<unsigned long long>(helper_elapsed),
 					static_cast<unsigned long long>(ctx.rip),
 					static_cast<unsigned long long>(ctx.rsp),
+					static_cast<unsigned long long>(ctx.rflags),
+					static_cast<unsigned long long>(ctx.dr7),
 					static_cast<unsigned long long>(raw_req.rip),
 					static_cast<unsigned long long>(raw_req.rsp),
 					(raw_req.rip != 0 && raw_req.rip == ctx.rip) ? 1 : 0,
-					(raw_req.rsp != 0 && raw_req.rsp == ctx.rsp) ? 1 : 0);
+					(raw_req.rsp != 0 && raw_req.rsp == ctx.rsp) ? 1 : 0,
+					helper_valid ? 1 : 0);
 				if (helper_valid) {
 					copy_context_to_request(req, ctx);
 					req.pid = s.pid;
@@ -294,10 +455,27 @@ namespace {
 					std::memcpy(r.raw.data(), &req, sizeof(req));
 					push_text_field(r, "tctx_pass_path", "device_get_thread_context_retry");
 					push_bool_field(r, "raw_ioctl_degraded", true);
-					push_text_field(r, "raw_ioctl_result", "raw TCTX IOCTL failed but device_t public fallback returned a valid context");
+					push_text_field(r, "fallback_decision_final", "degraded_public_device_t_context_valid_raw_ioctl_not_proven");
+					push_text_field(r, "raw_ioctl_result", "raw TCTX IOCTL failed or returned invalid context; device_t public fallback returned a valid degraded diagnostic context");
 					push_context_fields(r, req);
 					const bool after_found = find_thread_snapshot(s.pid, s.tid, after);
 					push_thread_snapshot(r, "thread_after", after_found, after);
+					const user_context_probe_t user_probe_after = probe_user_context(s.tid, thread_access);
+					push_user_probe_fields(r, "user_probe_after_fallback", user_probe_after);
+					::diag::log_tagged_fmt("testlab_tctx",
+						"DECISION degraded=1 path=device_t::get_thread_context raw_ok=%d raw_valid=%d pid=%u tid=%u fallback_rip=0x%llX fallback_rsp=0x%llX user_after_valid=%d user_after_rip=0x%llX user_after_rsp=0x%llX after_found=%d after_state=%u after_rip=0x%llX",
+						ok ? 1 : 0,
+						raw_context_valid ? 1 : 0,
+						s.pid,
+						s.tid,
+						static_cast<unsigned long long>(ctx.rip),
+						static_cast<unsigned long long>(ctx.rsp),
+						user_probe_after.context_valid ? 1 : 0,
+						static_cast<unsigned long long>(user_probe_after.rip),
+						static_cast<unsigned long long>(user_probe_after.rsp),
+						after_found ? 1 : 0,
+						after.state,
+						static_cast<unsigned long long>(after.rip));
 					r.ntstatus = 0;
 					r.error.clear();
 					r.ok = true;
@@ -310,25 +488,35 @@ namespace {
 				const DWORD bridge_error = bridge_ok ? ERROR_SUCCESS : GetLastError();
 				const std::uint64_t bridge_elapsed = static_cast<std::uint64_t>(GetTickCount64()) - bridge_start;
 				const bool bridge_valid = bridge_ok && bridge_ctx.rip != 0 && bridge_ctx.rsp != 0;
+				push_text_field(r, "fallback_attempt_2_path", "driver_bridge::get_thread_context");
 				push_bool_field(r, "fallback_bridge_ok", bridge_ok);
 				push_u32_field(r, "fallback_bridge_last_error", bridge_error);
+				push_hex_field(r, "fallback_bridge_ntstatus", bridge_ok ? 0u : 0xC0000001u);
 				push_u64_dec_field(r, "fallback_bridge_elapsed_ms", bridge_elapsed);
 				push_bool_field(r, "fallback_bridge_context_valid", bridge_valid);
+				push_hex_field(r, "fallback_attempt_2_rip", bridge_ctx.rip);
+				push_hex_field(r, "fallback_attempt_2_rsp", bridge_ctx.rsp);
+				push_hex_field(r, "fallback_attempt_2_rflags", bridge_ctx.rflags);
+				push_hex_field(r, "fallback_attempt_2_dr7", bridge_ctx.dr7);
 				push_bool_field(r, "fallback_bridge_matches_raw_rip", raw_req.rip != 0 && raw_req.rip == bridge_ctx.rip);
 				push_bool_field(r, "fallback_bridge_matches_raw_rsp", raw_req.rsp != 0 && raw_req.rsp == bridge_ctx.rsp);
 				::diag::log_tagged_fmt("testlab_tctx",
-					"BRIDGE_FALLBACK pid=%u tid=%u bridge_ok=%d gle=%lu elapsed_ms=%llu rip=0x%llX rsp=0x%llX raw_rip=0x%llX raw_rsp=0x%llX rip_match=%d rsp_match=%d",
+					"FALLBACK_ATTEMPT path=driver_bridge::get_thread_context attempt=2 pid=%u tid=%u bridge_ok=%d gle=%lu ntstatus=0x%08X elapsed_ms=%llu rip=0x%llX rsp=0x%llX rflags=0x%llX dr7=0x%llX raw_rip=0x%llX raw_rsp=0x%llX rip_match=%d rsp_match=%d valid=%d",
 					s.pid,
 					s.tid,
 					bridge_ok ? 1 : 0,
 					static_cast<unsigned long>(bridge_error),
+					bridge_ok ? 0u : 0xC0000001u,
 					static_cast<unsigned long long>(bridge_elapsed),
 					static_cast<unsigned long long>(bridge_ctx.rip),
 					static_cast<unsigned long long>(bridge_ctx.rsp),
+					static_cast<unsigned long long>(bridge_ctx.rflags),
+					static_cast<unsigned long long>(bridge_ctx.dr7),
 					static_cast<unsigned long long>(raw_req.rip),
 					static_cast<unsigned long long>(raw_req.rsp),
 					(raw_req.rip != 0 && raw_req.rip == bridge_ctx.rip) ? 1 : 0,
-					(raw_req.rsp != 0 && raw_req.rsp == bridge_ctx.rsp) ? 1 : 0);
+					(raw_req.rsp != 0 && raw_req.rsp == bridge_ctx.rsp) ? 1 : 0,
+					bridge_valid ? 1 : 0);
 				if (bridge_valid) {
 					copy_context_to_request(req, bridge_ctx);
 					req.pid = s.pid;
@@ -340,10 +528,27 @@ namespace {
 					std::memcpy(r.raw.data(), &req, sizeof(req));
 					push_text_field(r, "tctx_pass_path", "driver_bridge_get_thread_context_retry");
 					push_bool_field(r, "raw_ioctl_degraded", true);
-					push_text_field(r, "raw_ioctl_result", "raw TCTX IOCTL failed but driver_bridge public fallback returned a valid context");
+					push_text_field(r, "fallback_decision_final", "degraded_public_driver_bridge_context_valid_raw_ioctl_not_proven");
+					push_text_field(r, "raw_ioctl_result", "raw TCTX IOCTL failed or returned invalid context; driver_bridge public fallback returned a valid degraded diagnostic context");
 					push_context_fields(r, req);
 					const bool after_found = find_thread_snapshot(s.pid, s.tid, after);
 					push_thread_snapshot(r, "thread_after", after_found, after);
+					const user_context_probe_t user_probe_after = probe_user_context(s.tid, thread_access);
+					push_user_probe_fields(r, "user_probe_after_fallback", user_probe_after);
+					::diag::log_tagged_fmt("testlab_tctx",
+						"DECISION degraded=1 path=driver_bridge::get_thread_context raw_ok=%d raw_valid=%d pid=%u tid=%u fallback_rip=0x%llX fallback_rsp=0x%llX user_after_valid=%d user_after_rip=0x%llX user_after_rsp=0x%llX after_found=%d after_state=%u after_rip=0x%llX",
+						ok ? 1 : 0,
+						raw_context_valid ? 1 : 0,
+						s.pid,
+						s.tid,
+						static_cast<unsigned long long>(bridge_ctx.rip),
+						static_cast<unsigned long long>(bridge_ctx.rsp),
+						user_probe_after.context_valid ? 1 : 0,
+						static_cast<unsigned long long>(user_probe_after.rip),
+						static_cast<unsigned long long>(user_probe_after.rsp),
+						after_found ? 1 : 0,
+						after.state,
+						static_cast<unsigned long long>(after.rip));
 					r.ntstatus = 0;
 					r.error.clear();
 					r.ok = true;
@@ -354,15 +559,48 @@ namespace {
 			}
 			const bool after_found = find_thread_snapshot(s.pid, s.tid, after);
 			push_thread_snapshot(r, "thread_after", after_found, after);
+			const user_context_probe_t user_probe_after = probe_user_context(s.tid, thread_access);
+			push_user_probe_fields(r, "user_probe_after_failure", user_probe_after);
+			push_text_field(r, "fallback_decision_final", "failed_no_valid_raw_or_public_context");
+			::diag::log_tagged_fmt("testlab_tctx",
+				"DECISION degraded=0 fail pid=%u tid=%u raw_ok=%d raw_valid=%d raw_gle=%lu raw_ntstatus=0x%08X user_after_valid=%d user_after_rip=0x%llX user_after_rsp=0x%llX after_found=%d after_state=%u after_rip=0x%llX",
+				s.pid,
+				s.tid,
+				ok ? 1 : 0,
+				raw_context_valid ? 1 : 0,
+				static_cast<unsigned long>(raw_error),
+				static_cast<unsigned>(static_cast<std::uint32_t>(raw_ntstatus)),
+				user_probe_after.context_valid ? 1 : 0,
+				static_cast<unsigned long long>(user_probe_after.rip),
+				static_cast<unsigned long long>(user_probe_after.rsp),
+				after_found ? 1 : 0,
+				after.state,
+				static_cast<unsigned long long>(after.rip));
 			r.error = ok ? "TCTX returned an invalid zero RIP/RSP context" : "send_ioctl_raw returned false";
 			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
 			r.ok = false;
 			return;
 		}
 		push_text_field(r, "tctx_pass_path", "raw_ioctl");
+		push_bool_field(r, "raw_ioctl_degraded", false);
+		push_text_field(r, "fallback_decision_final", "raw_ioctl_valid_no_public_fallback_needed");
 		push_context_fields(r, req);
 		const bool after_found = find_thread_snapshot(s.pid, s.tid, after);
 		push_thread_snapshot(r, "thread_after", after_found, after);
+		const user_context_probe_t user_probe_after = probe_user_context(s.tid, thread_access);
+		push_user_probe_fields(r, "user_probe_after_raw", user_probe_after);
+		::diag::log_tagged_fmt("testlab_tctx",
+			"DECISION degraded=0 path=raw_ioctl pid=%u tid=%u rip=0x%llX rsp=0x%llX user_after_valid=%d user_after_rip=0x%llX user_after_rsp=0x%llX after_found=%d after_state=%u after_rip=0x%llX",
+			s.pid,
+			s.tid,
+			static_cast<unsigned long long>(req.rip),
+			static_cast<unsigned long long>(req.rsp),
+			user_probe_after.context_valid ? 1 : 0,
+			static_cast<unsigned long long>(user_probe_after.rip),
+			static_cast<unsigned long long>(user_probe_after.rsp),
+			after_found ? 1 : 0,
+			after.state,
+			static_cast<unsigned long long>(after.rip));
 		r.ntstatus = 0;
 		r.ok = true;
 	}

@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <map>
 #include <system_error>
 #include <utility>
 
@@ -72,42 +73,77 @@ std::mutex                          g_skills_mtx;
 std::string                         g_workspace_root;
 
 
+std::string active_workspace_root()
+{
+    std::string root = g_sa_settings.workspace.root_path.empty()
+        ? file_browser::current_dir
+        : g_sa_settings.workspace.root_path;
+    if (root.empty())
+        return {};
+
+    std::error_code ec;
+    auto canonical = fs::weakly_canonical(fs::path(root), ec);
+    if (!ec)
+        return canonical.string();
+    return fs::path(root).lexically_normal().string();
+}
+
 std::string sanitize_workspace_path(const std::string& raw)
 {
+    if (raw.empty() || raw.find('\0') != std::string::npos)
+        return {};
+    std::string root = active_workspace_root();
+    if (root.empty())
+        return {};
     std::string p = raw;
     for (char& c : p) { if (c == '/') c = '\\'; }
 
-    if (!file_browser::current_dir.empty() && !p.empty() && p[0] != '\\' &&
-        (p.size() < 2 || p[1] != ':'))
-    {
-        p = file_browser::current_dir + "\\" + p;
-    }
+    fs::path requested(p);
+    if (requested.has_root_name() && !requested.is_absolute())
+        return {};
+    fs::path candidate = requested.is_absolute() ? requested : fs::path(root) / requested;
 
     std::error_code ec;
-    auto canonical = fs::weakly_canonical(fs::path(p), ec);
-    if (ec) return raw;
+    auto canonical = fs::weakly_canonical(candidate, ec);
+    if (ec) {
+        ec.clear();
+        canonical = fs::absolute(candidate, ec);
+        if (ec)
+            canonical = candidate;
+        canonical = canonical.lexically_normal();
+    }
     return canonical.string();
 }
 
 
+std::string normalized_workspace_key(std::string value)
+{
+    for (char& c : value) {
+        if (c == '/')
+            c = '\\';
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    while (value.size() > 3 && (value.back() == '\\' || value.back() == '/'))
+        value.pop_back();
+    return value;
+}
+
 bool path_within_workspace(const std::string& canonical_path)
 {
-    if (file_browser::current_dir.empty())
+    if (canonical_path.empty())
+        return false;
+
+    std::string workspace = active_workspace_root();
+    if (workspace.empty())
+        return false;
+
+    auto ws_str = normalized_workspace_key(workspace);
+    auto p_str = normalized_workspace_key(canonical_path);
+    if (p_str == ws_str)
         return true;
-
-    std::error_code ec;
-    auto ws = fs::weakly_canonical(fs::path(file_browser::current_dir), ec);
-    if (ec) return false;
-
-    auto ws_str = ws.string();
-    auto p_str  = canonical_path;
-
-    std::transform(ws_str.begin(), ws_str.end(), ws_str.begin(),
-        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    std::transform(p_str.begin(), p_str.end(), p_str.begin(),
-        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-
-    return p_str.find(ws_str) == 0;
+    if (!ws_str.empty() && ws_str.back() != '\\')
+        ws_str.push_back('\\');
+    return p_str.rfind(ws_str, 0) == 0;
 }
 
 std::vector<code_index::search_result_t> direct_codebase_search(const std::string& query, const std::string& directory, int top_k)
@@ -631,6 +667,9 @@ tool_result_t handle_apply_patch(const json& params)
     }
 
     std::string patch_text = params["patch"].get<std::string>();
+    const std::string workspace_root = active_workspace_root();
+    if (workspace_root.empty())
+        return tool_result_t::error("No active workspace is open.");
 
     auto parsed = apply_patch::parse(patch_text);
     if (parsed.empty())
@@ -647,31 +686,80 @@ tool_result_t handle_apply_patch(const json& params)
         }
     }
 
-    auto read_fn = [](const std::string& path) -> std::string {
-        std::ifstream ifs(path);
-        if (!ifs) return "";
+    std::vector<std::string> callback_errors;
+    auto resolve_callback_path = [&](const std::string& raw, const char* purpose, std::string& out) -> bool {
+        out = sanitize_workspace_path(raw);
+        if (!path_within_workspace(out)) {
+            std::string err = std::string(purpose) + " path outside workspace: " + raw;
+            callback_errors.push_back(err);
+            diag::log_tagged_fmt("workflow", "apply_patch callback_reject purpose=%s raw='%s' resolved='%s' workspace='%s'",
+                purpose, raw.c_str(), out.c_str(), workspace_root.c_str());
+            return false;
+        }
+        return true;
+    };
+
+    auto read_fn = [&](const std::string& path) -> std::string {
+        std::string resolved;
+        if (!resolve_callback_path(path, "read", resolved))
+            return "";
+        std::ifstream ifs(resolved, std::ios::binary);
+        if (!ifs) {
+            callback_errors.push_back("read failed: " + resolved);
+            diag::log_tagged_fmt("workflow", "apply_patch callback_read_failed raw='%s' resolved='%s'",
+                path.c_str(), resolved.c_str());
+            return "";
+        }
         return std::string((std::istreambuf_iterator<char>(ifs)),
                             std::istreambuf_iterator<char>());
     };
 
-    auto write_fn = [](const std::string& path, const std::string& content) -> bool {
+    auto write_fn = [&](const std::string& path, const std::string& content) -> bool {
+        std::string resolved;
+        if (!resolve_callback_path(path, "write", resolved))
+            return false;
         std::error_code ec;
-        fs::create_directories(fs::path(path).parent_path(), ec);
-        std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
-        if (!ofs) return false;
+        fs::create_directories(fs::path(resolved).parent_path(), ec);
+        if (ec) {
+            callback_errors.push_back("create parent failed: " + resolved + ": " + ec.message());
+            return false;
+        }
+        std::ofstream ofs(resolved, std::ios::binary | std::ios::trunc);
+        if (!ofs) {
+            callback_errors.push_back("write failed: " + resolved);
+            return false;
+        }
         ofs << content;
         return true;
     };
 
-    auto delete_fn = [](const std::string& path) -> bool {
+    auto delete_fn = [&](const std::string& path) -> bool {
+        std::string resolved;
+        if (!resolve_callback_path(path, "delete", resolved))
+            return false;
         std::error_code ec;
-        return fs::remove(path, ec);
+        const bool removed = fs::remove(resolved, ec);
+        if (!removed || ec)
+            callback_errors.push_back("delete failed: " + resolved + (ec ? ": " + ec.message() : std::string()));
+        return removed && !ec;
     };
 
-    auto move_fn = [](const std::string& from, const std::string& to) -> bool {
+    auto move_fn = [&](const std::string& from, const std::string& to) -> bool {
+        std::string resolved_from;
+        std::string resolved_to;
+        if (!resolve_callback_path(from, "move_from", resolved_from))
+            return false;
+        if (!resolve_callback_path(to, "move_to", resolved_to))
+            return false;
         std::error_code ec;
-        fs::create_directories(fs::path(to).parent_path(), ec);
-        fs::rename(from, to, ec);
+        fs::create_directories(fs::path(resolved_to).parent_path(), ec);
+        if (ec) {
+            callback_errors.push_back("move parent failed: " + resolved_to + ": " + ec.message());
+            return false;
+        }
+        fs::rename(resolved_from, resolved_to, ec);
+        if (ec)
+            callback_errors.push_back("move failed: " + resolved_from + " -> " + resolved_to + ": " + ec.message());
         return !ec;
     };
 
@@ -679,12 +767,41 @@ tool_result_t handle_apply_patch(const json& params)
 
     if (!result.success) {
         diag::log_tagged_fmt("workflow", "apply_patch failed err='%s'", result.error.c_str());
-        return tool_result_t::error("Patch application failed: " + result.error);
+        json data;
+        data["workspace"] = workspace_root;
+        data["callback_errors"] = callback_errors;
+        return tool_result_t::error("Patch application failed: " + result.error, data);
     }
 
     int files_modified = static_cast<int>(result.modified_files.size());
     int files_deleted = static_cast<int>(result.deleted_files.size());
     int files_moved = static_cast<int>(result.moved_files.size());
+
+    json modified = json::array();
+    for (const auto& kv : result.modified_files) {
+        std::string resolved = sanitize_workspace_path(kv.first);
+        modified.push_back(json{{"path", kv.first}, {"resolved_path", resolved}, {"bytes", kv.second.size()}});
+    }
+    json deleted = json::array();
+    for (const auto& path : result.deleted_files) {
+        deleted.push_back(json{{"path", path}, {"resolved_path", sanitize_workspace_path(path)}});
+    }
+    json moved = json::array();
+    for (const auto& kv : result.moved_files) {
+        moved.push_back(json{{"from", kv.first},
+            {"to", kv.second},
+            {"resolved_from", sanitize_workspace_path(kv.first)},
+            {"resolved_to", sanitize_workspace_path(kv.second)}});
+    }
+    json data;
+    data["workspace"] = workspace_root;
+    data["modified_count"] = files_modified;
+    data["deleted_count"] = files_deleted;
+    data["moved_count"] = files_moved;
+    data["modified_files"] = std::move(modified);
+    data["deleted_files"] = std::move(deleted);
+    data["moved_files"] = std::move(moved);
+    data["callback_errors"] = callback_errors;
 
     std::string msg = "Patch applied: " +
                      std::to_string(files_modified) + " modified, " +
@@ -693,7 +810,7 @@ tool_result_t handle_apply_patch(const json& params)
     diag::log_tagged_fmt("workflow", "apply_patch ok modified=%d deleted=%d moved=%d",
         files_modified, files_deleted, files_moved);
     output_log::push(bottom_tab_t::output, "[patch] " + msg);
-    return tool_result_t::ok(msg);
+    return tool_result_t::ok(msg, data);
 }
 
 

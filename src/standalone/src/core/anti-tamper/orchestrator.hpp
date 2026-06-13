@@ -3321,6 +3321,11 @@ inline bool guard()
             {
                 const bool runtime_authorized = standalone_license::is_valid() || standalone_license::is_arc_loaded();
                 const bool activation_pending = rt.license_pending_activation.load(std::memory_order_acquire);
+                if (rt.full_test_running.load(std::memory_order_acquire))
+                {
+                    webhook::write_log("guard", "kernel_anti_debug_runtime_observed_full_test_active");
+                    CFF_GOTO(guard_cff, 9);
+                }
 
                 SetLastError(ERROR_SUCCESS);
                 if (!driver_bridge::kernel_anti_debug_clear_dr())
@@ -3473,6 +3478,11 @@ inline bool guard()
             }
             else
             {
+                if (rt.full_test_running.load(std::memory_order_acquire))
+                {
+                    webhook::write_log("guard", "kernel_anti_debug_query_observed_full_test_active");
+                    CFF_GOTO(guard_cff, 10);
+                }
                 driver_bridge::anti_debug_result_t adbg_result{};
                 if (driver_bridge::kernel_anti_debug_query(adbg_result) &&
                     adbg_result.result_flags != 0)

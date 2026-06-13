@@ -111,6 +111,57 @@ json disc_status_to_json(const content_discovery::disc_status_t& s)
     return j;
 }
 
+bool crawler_phase_active(crawler::crawl_status_phase_t phase)
+{
+    return phase == crawler::crawl_status_phase_t::pending
+        || phase == crawler::crawl_status_phase_t::running
+        || phase == crawler::crawl_status_phase_t::stopping;
+}
+
+bool disc_phase_active(content_discovery::disc_phase_t phase)
+{
+    return phase == content_discovery::disc_phase_t::pending
+        || phase == content_discovery::disc_phase_t::calibrating
+        || phase == content_discovery::disc_phase_t::running
+        || phase == content_discovery::disc_phase_t::stopping;
+}
+
+json crawler_stop_state_to_json(const crawler::crawl_status_t& s)
+{
+    json j = crawler_status_to_json(s);
+    j["running"] = s.id != 0 && crawler_phase_active(s.phase);
+    j["target_count"] = s.id != 0 ? s.config.max_pages : 0;
+    j["start_url_count"] = s.id != 0 ? static_cast<uint64_t>(s.config.start_urls.size()) : 0;
+    j["collected_count"] = s.id != 0 ? s.urls_found : 0;
+    j["discovered_count"] = s.id != 0 ? static_cast<uint64_t>(s.discovered.size()) : 0;
+    j["fetched_count"] = s.id != 0 ? s.pages_visited : 0;
+    return j;
+}
+
+json disc_stop_state_to_json(const content_discovery::disc_status_t& s)
+{
+    json j = disc_status_to_json(s);
+    j["running"] = s.id != 0 && disc_phase_active(s.phase);
+    j["target_count"] = s.total;
+    j["collected_count"] = s.hits;
+    j["hit_count"] = static_cast<uint64_t>(s.hits_list.size());
+    return j;
+}
+
+json crawler_ids_json(const std::vector<crawler::crawl_status_t>& jobs)
+{
+    json arr = json::array();
+    for (const auto& job : jobs) arr.push_back(job.id);
+    return arr;
+}
+
+json disc_ids_json(const std::vector<content_discovery::disc_status_t>& jobs)
+{
+    json arr = json::array();
+    for (const auto& job : jobs) arr.push_back(job.id);
+    return arr;
+}
+
 json sub_status_to_json(const subdomain_enum::enum_status_t& s)
 {
     json j;
@@ -224,9 +275,31 @@ tool_result_t crawler_stop_(const json& p)
     uint64_t id = get_or<uint64_t>(p, "crawl_id", 0);
     diag::log_tagged_fmt("mcp_burp", "crawler_stop crawl_id=%llu", static_cast<unsigned long long>(id));
     if (id == 0) return tool_result_t::error("crawl_id required");
+    auto before = crawler::status(id);
+    auto before_list = crawler::list();
     if (!crawler::stop(id)) { diag::log_tagged_fmt("mcp_burp", "crawler_stop failed err=%s", crawler::last_error().c_str()); return tool_result_t::error(crawler::last_error()); }
+    auto after = crawler::status(id);
+    auto after_list = crawler::list();
+    json out;
+    out["id"] = id;
+    out["crawl_id"] = id;
+    out["stop_requested"] = true;
+    out["stopped"] = after.id != 0 && !crawler_phase_active(after.phase);
+    out["before_running"] = before.id != 0 && crawler_phase_active(before.phase);
+    out["after_running"] = after.id != 0 && crawler_phase_active(after.phase);
+    out["target_count_before"] = before.id != 0 ? before.config.max_pages : 0;
+    out["target_count_after"] = after.id != 0 ? after.config.max_pages : 0;
+    out["collected_count_before"] = before.id != 0 ? before.urls_found : 0;
+    out["collected_count_after"] = after.id != 0 ? after.urls_found : 0;
+    out["queue_depth_before"] = before.id != 0 ? before.queue_depth : 0;
+    out["queue_depth_after"] = after.id != 0 ? after.queue_depth : 0;
+    out["before_job_count"] = static_cast<uint64_t>(before_list.size());
+    out["remaining_job_count"] = static_cast<uint64_t>(after_list.size());
+    out["remaining_ids"] = crawler_ids_json(after_list);
+    out["before"] = crawler_stop_state_to_json(before);
+    out["after"] = crawler_stop_state_to_json(after);
     diag::log_tagged_fmt("mcp_burp", "crawler_stop ok id=%llu", static_cast<unsigned long long>(id));
-    return tool_result_t::ok("stop requested");
+    return tool_result_t::ok("stop requested", out);
 }
 
 tool_result_t crawler_list_(const json&)
@@ -330,9 +403,31 @@ tool_result_t cd_stop_(const json& p)
     uint64_t id = get_or<uint64_t>(p, "disc_id", 0);
     diag::log_tagged_fmt("mcp_burp", "content_discovery_stop disc_id=%llu", static_cast<unsigned long long>(id));
     if (id == 0) return tool_result_t::error("disc_id required");
+    auto before = content_discovery::status(id);
+    auto before_list = content_discovery::list();
     if (!content_discovery::stop(id)) { diag::log_tagged_fmt("mcp_burp", "content_discovery_stop failed err=%s", content_discovery::last_error().c_str()); return tool_result_t::error(content_discovery::last_error()); }
+    auto after = content_discovery::status(id);
+    auto after_list = content_discovery::list();
+    json out;
+    out["id"] = id;
+    out["disc_id"] = id;
+    out["stop_requested"] = true;
+    out["stopped"] = after.id != 0 && !disc_phase_active(after.phase);
+    out["before_running"] = before.id != 0 && disc_phase_active(before.phase);
+    out["after_running"] = after.id != 0 && disc_phase_active(after.phase);
+    out["target_count_before"] = before.id != 0 ? before.total : 0;
+    out["target_count_after"] = after.id != 0 ? after.total : 0;
+    out["collected_count_before"] = before.id != 0 ? before.hits : 0;
+    out["collected_count_after"] = after.id != 0 ? after.hits : 0;
+    out["attempt_count_before"] = before.id != 0 ? before.attempts : 0;
+    out["attempt_count_after"] = after.id != 0 ? after.attempts : 0;
+    out["before_job_count"] = static_cast<uint64_t>(before_list.size());
+    out["remaining_job_count"] = static_cast<uint64_t>(after_list.size());
+    out["remaining_ids"] = disc_ids_json(after_list);
+    out["before"] = disc_stop_state_to_json(before);
+    out["after"] = disc_stop_state_to_json(after);
     diag::log_tagged_fmt("mcp_burp", "content_discovery_stop ok id=%llu", static_cast<unsigned long long>(id));
-    return tool_result_t::ok("stop requested");
+    return tool_result_t::ok("stop requested", out);
 }
 
 tool_result_t sub_start(const json& p)

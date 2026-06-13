@@ -307,6 +307,88 @@ static std::string bytes_hex_preview(const std::vector<uint8_t>& bytes, size_t l
 	return os.str();
 }
 
+static json scanner_activity_json() {
+	auto& st = memory_scanner::g_state;
+	json state;
+	state["target_pid"] = driver_bridge::attached_pid();
+	state["scan_session_id"] = g_active_scan_session.load(std::memory_order_relaxed);
+	state["pointer_session_id"] = g_active_pointer_session.load(std::memory_order_relaxed);
+	state["scanning"] = st.scanning.load();
+	state["pointer_scanning"] = st.pointer_scanning.load();
+	state["scan_progress"] = st.scan_progress.load();
+	state["pointer_progress"] = st.pointer_progress.load();
+	{
+		std::lock_guard<std::mutex> lk(st.results_mutex);
+		state["scan_results"] = st.results.size();
+		state["total_found"] = st.total_found;
+	}
+	{
+		std::lock_guard<std::mutex> lk(st.pointer_mutex);
+		state["pointer_results"] = st.pointer_results.size();
+	}
+	return state;
+}
+
+static json address_entry_json(const memory_scanner::address_entry_t& e, size_t index) {
+	json obj;
+	obj["index"] = index;
+	obj["address"] = sa_format_address(e.address);
+	obj["description"] = e.description;
+	obj["value_type"] = memory_scanner::value_type_name(e.value_type);
+	obj["type"] = memory_scanner::value_type_name(e.value_type);
+	obj["frozen"] = e.frozen;
+	obj["value"] = memory_scanner::format_value(e.last_value, e.value_type);
+	obj["last_value_size"] = e.last_value.size();
+	obj["freeze_value_size"] = e.freeze_value.size();
+	if (!e.last_value.empty())
+		obj["last_value_hex"] = bytes_hex_preview(e.last_value, 256);
+	if (!e.freeze_value.empty())
+		obj["freeze_value_hex"] = bytes_hex_preview(e.freeze_value, 256);
+	return obj;
+}
+
+static size_t address_list_count() {
+	auto& st = memory_scanner::g_state;
+	std::lock_guard<std::mutex> lk(st.address_mutex);
+	return st.address_list.size();
+}
+
+static std::optional<size_t> address_index_by_address(uint64_t address) {
+	auto& st = memory_scanner::g_state;
+	std::lock_guard<std::mutex> lk(st.address_mutex);
+	for (size_t i = 0; i < st.address_list.size(); ++i) {
+		if (st.address_list[i].address == address)
+			return i;
+	}
+	return std::nullopt;
+}
+
+static bool address_entry_by_index(size_t index, json& out) {
+	auto& st = memory_scanner::g_state;
+	std::lock_guard<std::mutex> lk(st.address_mutex);
+	if (index >= st.address_list.size())
+		return false;
+	out = address_entry_json(st.address_list[index], index);
+	return true;
+}
+
+static bool read_memory_exact(uint64_t address, size_t size, std::vector<uint8_t>& out) {
+	out.clear();
+	if (size == 0)
+		return true;
+	if (!driver_bridge::read_memory(address, size, out) || out.size() < size)
+		return false;
+	if (out.size() > size)
+		out.resize(size);
+	return true;
+}
+
+static void add_scanner_action_context(json& result, const char* action) {
+	result["action"] = action;
+	result["target_pid"] = driver_bridge::attached_pid();
+	result["active_scan_state"] = scanner_activity_json();
+}
+
 static bool parse_field_type(const std::string& text, struct_dissector::field_type_t& out) {
 	const std::string v = lower_copy(text);
 	if (v == "int8" || v == "i8") { out = struct_dissector::field_type_t::int8; return true; }
@@ -772,51 +854,136 @@ static tool_result_t handle_undo_scan(const json&) {
 }
 
 static tool_result_t handle_add_address(const json& params) {
-	if (!params.contains("address"))
-		return tool_result_t::error(OBFSTR("Missing 'address' parameter."));
-
 	uint64_t addr = 0;
-	auto& v = params["address"];
-	if (v.is_string()) {
-		auto parsed = sa_parse_address(v.get<std::string>());
-		if (!parsed) return tool_result_t::error(OBFSTR("Invalid address format."));
-		addr = *parsed;
-	} else if (v.is_number()) {
-		addr = v.get<uint64_t>();
-	}
+	std::string error;
+	if (!parse_address_param(params, "address", addr, error))
+		return tool_result_t::error(error);
 
 	std::string desc;
-	if (params.contains("description"))
+	if (params.contains("description") && params["description"].is_string())
 		desc = params["description"].get<std::string>();
 
 	auto vtype = memory_scanner::value_type_t::int32_val;
-	if (params.contains("value_type"))
+	if (params.contains("value_type") && params["value_type"].is_string())
 		vtype = parse_value_type(params["value_type"].get<std::string>());
 
+	const size_t before_count = address_list_count();
+	const auto existing_index = address_index_by_address(addr);
 	memory_scanner::add_address(addr, desc, vtype);
+	const size_t after_count = address_list_count();
+	const auto after_index = address_index_by_address(addr);
+	const bool added = !existing_index.has_value() && after_index.has_value() && after_count > before_count;
+	const bool present = after_index.has_value();
 
-	char buf[20];
-	snprintf(buf, sizeof(buf), "0x%" PRIX64, addr);
-	return tool_result_t::ok(std::string(OBFSTR("Address ")) + buf + OBFSTR(" added to list."));
+	std::vector<uint8_t> readback;
+	const size_t read_size = memory_scanner::value_type_size(vtype);
+	const bool readback_ok = read_memory_exact(addr, read_size, readback);
+
+	json result;
+	add_scanner_action_context(result, "scanner_address_list_add");
+	result["success"] = present;
+	result["added"] = added;
+	result["duplicate"] = existing_index.has_value();
+	result["address"] = sa_format_address(addr);
+	result["index"] = after_index.has_value() ? json(*after_index) : json(nullptr);
+	result["list_count_before"] = before_count;
+	result["list_count_after"] = after_count;
+	result["value_type"] = memory_scanner::value_type_name(vtype);
+	result["frozen"] = false;
+	result["bytes_written"] = 0;
+	result["cancel_requested"] = false;
+	result["readback_ok"] = readback_ok;
+	result["verified"] = present;
+	if (readback_ok) {
+		result["readback"] = memory_scanner::format_value(readback, vtype);
+		result["readback_hex"] = bytes_hex_preview(readback, 256);
+	}
+	if (after_index.has_value()) {
+		json entry;
+		if (address_entry_by_index(*after_index, entry)) {
+			result["frozen"] = entry.value("frozen", false);
+			result["entry"] = std::move(entry);
+		}
+	}
+	const std::string text = added
+		? OBFSTR("Address ") + sa_format_address(addr) + OBFSTR(" added to list.")
+		: OBFSTR("Address ") + sa_format_address(addr) + OBFSTR(" already in list.");
+	return tool_result_t::ok(text, result);
 }
 
 static tool_result_t handle_remove_address(const json& params) {
 	if (!params.contains("index"))
 		return tool_result_t::error(OBFSTR("Missing 'index' parameter."));
-	size_t idx = params["index"].get<size_t>();
+	if (!params["index"].is_number_integer())
+		return tool_result_t::error(OBFSTR("'index' must be an integer."));
+	const auto raw_index = params["index"].get<int64_t>();
+	if (raw_index < 0)
+		return tool_result_t::error(OBFSTR("'index' must be non-negative."));
+	size_t idx = static_cast<size_t>(raw_index);
+	const size_t before_count = address_list_count();
+	json removed_entry;
+	if (!address_entry_by_index(idx, removed_entry))
+		return tool_result_t::error(OBFSTR("Address index is out of range."));
 	memory_scanner::remove_address(idx);
-	return tool_result_t::ok(OBFSTR("Address removed."));
+	const size_t after_count = address_list_count();
+	const bool removed = after_count < before_count;
+	json result;
+	add_scanner_action_context(result, "scanner_address_list_remove");
+	result["success"] = removed;
+	result["index"] = idx;
+	result["address"] = removed_entry.value("address", std::string{});
+	result["list_count_before"] = before_count;
+	result["list_count_after"] = after_count;
+	result["frozen"] = removed_entry.value("frozen", false);
+	result["value_type"] = removed_entry.value("value_type", std::string{});
+	result["bytes_written"] = 0;
+	result["cancel_requested"] = false;
+	result["readback_ok"] = false;
+	result["verified"] = removed;
+	result["removed"] = std::move(removed_entry);
+	return tool_result_t::ok(OBFSTR("Address removed."), result);
 }
 
 static tool_result_t handle_freeze_address(const json& params) {
 	if (!params.contains("index"))
 		return tool_result_t::error(OBFSTR("Missing 'index' parameter."));
-	size_t idx = params["index"].get<size_t>();
+	if (!params["index"].is_number_integer())
+		return tool_result_t::error(OBFSTR("'index' must be an integer."));
+	const auto raw_index = params["index"].get<int64_t>();
+	if (raw_index < 0)
+		return tool_result_t::error(OBFSTR("'index' must be non-negative."));
+	size_t idx = static_cast<size_t>(raw_index);
 	bool enable = true;
 	if (params.contains("enable") && params["enable"].is_boolean())
 		enable = params["enable"].get<bool>();
+	const size_t before_count = address_list_count();
+	json before_entry;
+	if (!address_entry_by_index(idx, before_entry))
+		return tool_result_t::error(OBFSTR("Address index is out of range."));
 	memory_scanner::freeze_address(idx, enable);
-	return tool_result_t::ok(enable ? OBFSTR("Address frozen.") : OBFSTR("Address unfrozen."));
+	const size_t after_count = address_list_count();
+	json after_entry;
+	const bool have_after = address_entry_by_index(idx, after_entry);
+	const bool frozen_after = have_after && after_entry.value("frozen", false);
+	const bool freeze_success = have_after && frozen_after == enable;
+	json result;
+	add_scanner_action_context(result, "scanner_address_list_freeze");
+	result["success"] = freeze_success;
+	result["index"] = idx;
+	result["address"] = before_entry.value("address", std::string{});
+	result["list_count_before"] = before_count;
+	result["list_count_after"] = after_count;
+	result["frozen_before"] = before_entry.value("frozen", false);
+	result["frozen"] = frozen_after;
+	result["value_type"] = before_entry.value("value_type", std::string{});
+	result["bytes_written"] = 0;
+	result["cancel_requested"] = false;
+	result["readback_ok"] = false;
+	result["verified"] = freeze_success;
+	result["before"] = std::move(before_entry);
+	if (have_after)
+		result["after"] = std::move(after_entry);
+	return tool_result_t::ok(enable ? OBFSTR("Address frozen.") : OBFSTR("Address unfrozen."), result);
 }
 
 static tool_result_t handle_get_address_list(const json&) {
@@ -826,19 +993,16 @@ static tool_result_t handle_get_address_list(const json&) {
 	std::lock_guard<std::mutex> lk(st.address_mutex);
 	json arr = json::array();
 	for (size_t i = 0; i < st.address_list.size(); ++i) {
-		auto& e = st.address_list[i];
-		json obj;
-		obj["index"] = i;
-		char buf[20];
-		snprintf(buf, sizeof(buf), "0x%" PRIX64, e.address);
-		obj["address"] = buf;
-		obj["description"] = e.description;
-		obj["type"] = memory_scanner::value_type_name(e.value_type);
-		obj["frozen"] = e.frozen;
-		obj["value"] = memory_scanner::format_value(e.last_value, e.value_type);
-		arr.push_back(std::move(obj));
+		arr.push_back(address_entry_json(st.address_list[i], i));
 	}
-	return tool_result_t::ok(arr.dump(2));
+	json result;
+	result["action"] = "scanner_address_list_list";
+	result["target_pid"] = driver_bridge::attached_pid();
+	result["count"] = arr.size();
+	result["addresses"] = std::move(arr);
+	result["active_scan_state"] = scanner_activity_json();
+	return tool_result_t::ok(
+		std::to_string(result["count"].get<size_t>()) + OBFSTR(" address(es)."), result);
 }
 
 static tool_result_t handle_pointer_scan(const json& params) {
@@ -910,34 +1074,52 @@ static tool_result_t handle_pointer_scan(const json& params) {
 	}
 
 	auto& st = memory_scanner::g_state;
-	std::lock_guard<std::mutex> lk(st.pointer_mutex);
-	diag::log_tagged_fmt("scanner", "mcp pointer_scan collect timed_out=%d total=%zu scanning=%d",
-		timed_out ? 1 : 0, st.pointer_results.size(), st.pointer_scanning.load() ? 1 : 0);
-
 	json arr = json::array();
-	size_t n = std::min(st.pointer_results.size(), static_cast<size_t>(200));
-	for (size_t i = 0; i < n; ++i) {
-		auto& p = st.pointer_results[i];
-		json obj;
-		char buf[20];
-		snprintf(buf, sizeof(buf), "0x%" PRIX64, p.base_address);
-		obj["base"] = buf;
-		if (!p.module_name.empty()) {
-			snprintf(buf, sizeof(buf), "0x%" PRIX64, p.module_offset);
-			obj["module"] = p.module_name + "+" + buf;
+	size_t total_results = 0;
+	size_t n = 0;
+	bool pointer_scanning_now = false;
+	{
+		std::lock_guard<std::mutex> lk(st.pointer_mutex);
+		total_results = st.pointer_results.size();
+		pointer_scanning_now = st.pointer_scanning.load();
+		diag::log_tagged_fmt("scanner", "mcp pointer_scan collect timed_out=%d total=%zu scanning=%d",
+			timed_out ? 1 : 0, total_results, pointer_scanning_now ? 1 : 0);
+
+		n = std::min(total_results, static_cast<size_t>(200));
+		for (size_t i = 0; i < n; ++i) {
+			auto& p = st.pointer_results[i];
+			json obj;
+			char buf[20];
+			snprintf(buf, sizeof(buf), "0x%" PRIX64, p.base_address);
+			obj["base"] = buf;
+			if (!p.module_name.empty()) {
+				snprintf(buf, sizeof(buf), "0x%" PRIX64, p.module_offset);
+				obj["module"] = p.module_name + "+" + buf;
+			}
+			json offsets = json::array();
+			for (auto off : p.offsets)
+				offsets.push_back(off);
+			obj["offsets"] = std::move(offsets);
+			arr.push_back(std::move(obj));
 		}
-		json offsets = json::array();
-		for (auto off : p.offsets)
-			offsets.push_back(off);
-		obj["offsets"] = std::move(offsets);
-		arr.push_back(std::move(obj));
 	}
 
 	json result;
-	result["total"] = st.pointer_results.size();
+	add_scanner_action_context(result, "scanner_pointer_scan");
+	result["total"] = total_results;
 	result["showing"] = n;
 	result["timed_out"] = timed_out && !allow_partial;
 	result["partial"] = timed_out;
+	result["target_address"] = sa_format_address(addr);
+	result["target_pid"] = driver_bridge::attached_pid();
+	result["max_depth"] = max_depth;
+	result["max_offset"] = max_offset;
+	result["range_base"] = scan_base == 0 ? json(nullptr) : json(sa_format_address(scan_base));
+	result["range_size"] = scan_size;
+	result["timeout_ms"] = timeout_ms;
+	result["cancel_requested"] = timed_out;
+	result["pointer_scanning"] = pointer_scanning_now;
+	result["active_pointer_session"] = g_active_pointer_session.load(std::memory_order_relaxed);
 	result["results"] = std::move(arr);
 	if (timed_out && !allow_partial)
 		return tool_result_t{false, OBFSTR("Pointer scan did not complete within the timeout."), result};
@@ -1461,19 +1643,16 @@ static tool_result_t handle_assert_memory_type(const json& params) {
 static tool_result_t handle_write_value(const json& params) {
 	if (!params.contains("address") || !params.contains("value"))
 		return tool_result_t::error(OBFSTR("Missing 'address' or 'value' parameter."));
+	if (!params["value"].is_string())
+		return tool_result_t::error(OBFSTR("'value' must be a string."));
 
 	uint64_t addr = 0;
-	auto& v = params["address"];
-	if (v.is_string()) {
-		auto parsed = sa_parse_address(v.get<std::string>());
-		if (!parsed) return tool_result_t::error(OBFSTR("Invalid address format."));
-		addr = *parsed;
-	} else if (v.is_number()) {
-		addr = v.get<uint64_t>();
-	}
+	std::string error;
+	if (!parse_address_param(params, "address", addr, error))
+		return tool_result_t::error(error);
 
 	auto vtype = memory_scanner::value_type_t::int32_val;
-	if (params.contains("value_type"))
+	if (params.contains("value_type") && params["value_type"].is_string())
 		vtype = parse_value_type(params["value_type"].get<std::string>());
 
 	bool hex = false;
@@ -1481,10 +1660,61 @@ static tool_result_t handle_write_value(const json& params) {
 		hex = params["hex"].get<bool>();
 
 	std::string val_str = params["value"].get<std::string>();
+	std::vector<uint8_t> bytes = memory_scanner::parse_value(val_str, vtype, hex);
+	if (bytes.empty())
+		return tool_result_t::error(OBFSTR("Failed to parse value for the requested value_type."));
 
-	memory_scanner::write_value(addr, vtype, val_str, hex);
+	const size_t before_count = address_list_count();
+	const auto list_index = address_index_by_address(addr);
+	std::vector<uint8_t> before_bytes;
+	const bool before_read_ok = read_memory_exact(addr, bytes.size(), before_bytes);
+	const bool write_ok = driver_bridge::write_memory(addr, bytes);
+	std::vector<uint8_t> readback;
+	const bool readback_ok = read_memory_exact(addr, bytes.size(), readback);
+	const bool verified = readback_ok && readback == bytes;
+	if (write_ok && list_index.has_value())
+		memory_scanner::refresh_address_list();
+	const size_t after_count = address_list_count();
 
-	return tool_result_t::ok(OBFSTR("Value written successfully."));
+	json result;
+	add_scanner_action_context(result, "scanner_write_value");
+	result["success"] = write_ok && (!readback_ok || verified);
+	result["address"] = sa_format_address(addr);
+	result["index"] = list_index.has_value() ? json(*list_index) : json(nullptr);
+	result["list_count_before"] = before_count;
+	result["list_count_after"] = after_count;
+	result["value_type"] = memory_scanner::value_type_name(vtype);
+	result["hex"] = hex;
+	result["requested_value"] = val_str;
+	result["requested_bytes"] = bytes_hex_preview(bytes, 256);
+	result["requested_size"] = bytes.size();
+	result["bytes_written"] = write_ok ? bytes.size() : 0;
+	result["cancel_requested"] = false;
+	result["before_read_ok"] = before_read_ok;
+	if (before_read_ok) {
+		result["before"] = memory_scanner::format_value(before_bytes, vtype);
+		result["before_hex"] = bytes_hex_preview(before_bytes, 256);
+	}
+	result["readback_ok"] = readback_ok;
+	result["verified"] = verified;
+	if (readback_ok) {
+		result["readback"] = memory_scanner::format_value(readback, vtype);
+		result["readback_hex"] = bytes_hex_preview(readback, 256);
+	}
+	if (list_index.has_value()) {
+		json entry;
+		if (address_entry_by_index(*list_index, entry)) {
+			result["frozen"] = entry.value("frozen", false);
+			result["entry"] = std::move(entry);
+		}
+	} else {
+		result["frozen"] = false;
+	}
+	if (!write_ok)
+		return tool_result_t{false, OBFSTR("Value write failed."), result};
+	if (readback_ok && !verified)
+		return tool_result_t{false, OBFSTR("Value write verification failed."), result};
+	return tool_result_t::ok(OBFSTR("Value written successfully."), result);
 }
 
 
@@ -1585,8 +1815,31 @@ void register_scanner_tools(mcp_standalone::server_t& srv) {
 		OBFSTR("Cancel a running pointer scan."),
 		{},
 		[](const json&) -> tool_result_t {
+			const size_t before_count = address_list_count();
+			const bool was_active = memory_scanner::g_state.pointer_scanning.load();
+			json before_state = scanner_activity_json();
 			memory_scanner::cancel_pointer_scan();
-			return tool_result_t::ok(OBFSTR("Pointer scan cancelled."));
+			const bool stopped = wait_for_pointer_idle(500);
+			const size_t after_count = address_list_count();
+			json result;
+			add_scanner_action_context(result, "scanner_cancel_pointer_scan");
+			result["success"] = stopped;
+			result["cancel_requested"] = true;
+			result["address"] = nullptr;
+			result["index"] = nullptr;
+			result["list_count_before"] = before_count;
+			result["list_count_after"] = after_count;
+			result["frozen"] = false;
+			result["value_type"] = nullptr;
+			result["bytes_written"] = 0;
+			result["readback_ok"] = false;
+			result["verified"] = stopped;
+			result["was_active"] = was_active;
+			result["pointer_scanning_before"] = before_state.value("pointer_scanning", false);
+			result["pointer_scanning_after"] = memory_scanner::g_state.pointer_scanning.load();
+			result["active_pointer_session"] = g_active_pointer_session.load(std::memory_order_relaxed);
+			result["before_state"] = std::move(before_state);
+			return tool_result_t::ok(OBFSTR("Pointer scan cancelled."), result);
 		}, false});
 
 	auto scanner_define_struct = [](const json& params) -> tool_result_t {

@@ -3,6 +3,7 @@
 
 #include "standalone_compat.hpp"
 #include "net_proto_analysis.hpp"
+#include "game_protocol.hpp"
 #include "obfuscation.hpp"
 #include "helpers/diag_log.hpp"
 
@@ -86,7 +87,7 @@ tool_result_t handle_trace_serializer(const json& raw_params)
     json result;
     std::string error;
     if (!net_proto_analysis::trace_serializer(options, result, error))
-        return tool_result_t::error(error.empty() ? OBFSTR("serializer trace failed") : error);
+        return tool_result_t::error(error.empty() ? OBFSTR("serializer trace failed") : error, result);
     result["serializer_va_normalized"] = sa_format_address(*va);
     return tool_result_t::ok(OBFSTR("Serializer sampling completed with bounded captures."), result);
 }
@@ -104,6 +105,24 @@ tool_result_t handle_udp_reassemble(const json& raw_params)
     options.capture_ms = static_cast<std::uint32_t>(capture_sec * 1000.0);
     options.max_packets = params.value("max_packets", 256u);
     options.max_payload = params.value("max_payload", 1500u);
+    if (params.contains("payload_hex") && params["payload_hex"].is_string()) {
+        std::string error;
+        auto bytes = game_protocol::hex_to_bytes(params["payload_hex"].get<std::string>(), &error, options.max_payload);
+        if (bytes.empty() && !params["payload_hex"].get<std::string>().empty())
+            return tool_result_t::error(error.empty() ? OBFSTR("invalid payload_hex") : error);
+        options.fixture_payloads.push_back(std::move(bytes));
+    }
+    if (params.contains("payloads_hex") && params["payloads_hex"].is_array()) {
+        for (const auto& item : params["payloads_hex"]) {
+            if (!item.is_string())
+                continue;
+            std::string error;
+            auto bytes = game_protocol::hex_to_bytes(item.get<std::string>(), &error, options.max_payload);
+            if (bytes.empty() && !item.get<std::string>().empty())
+                return tool_result_t::error(error.empty() ? OBFSTR("invalid payloads_hex entry") : error);
+            options.fixture_payloads.push_back(std::move(bytes));
+        }
+    }
 
     json result;
     std::string error;
@@ -172,7 +191,9 @@ void register_net_proto_tools(mcp_standalone::server_t& srv)
         {{OBFSTR("pid"), OBFSTR("number"), OBFSTR("Optional PID filter."), false},
          {OBFSTR("capture_sec"), OBFSTR("number"), OBFSTR("Capture duration in seconds, default 10, max 15."), false},
          {OBFSTR("max_packets"), OBFSTR("number"), OBFSTR("Packet cap, default 256, max 512."), false},
-         {OBFSTR("max_payload"), OBFSTR("number"), OBFSTR("Payload capture cap, default 1500, max 4096."), false}},
+         {OBFSTR("max_payload"), OBFSTR("number"), OBFSTR("Payload capture cap, default 1500, max 4096."), false},
+         {OBFSTR("payload_hex"), OBFSTR("string"), OBFSTR("Optional single UDP payload for deterministic local reassembly analysis."), false},
+         {OBFSTR("payloads_hex"), OBFSTR("array"), OBFSTR("Optional UDP payload list for deterministic local reassembly analysis."), false}},
         handle_udp_reassemble, false});
 
     register_compat(srv, {

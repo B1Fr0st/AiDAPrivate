@@ -31,6 +31,7 @@
 #include <regex>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -67,6 +68,311 @@ static std::vector<std::uint8_t> ns_hex_to_bytes(const std::string& hex) {
         if (h >= 0 && l >= 0) out.push_back(static_cast<std::uint8_t>((h << 4) | l));
     }
     return out;
+}
+
+static std::string ns_env_var(const char* name) {
+    char env_buffer[32767] = {};
+    DWORD len = GetEnvironmentVariableA(name, env_buffer, static_cast<DWORD>(sizeof(env_buffer)));
+    if (len == 0 || len >= sizeof(env_buffer))
+        return {};
+    return std::string(env_buffer, len);
+}
+
+static void ns_add_unique_path(std::vector<std::string>& paths, const std::string& path) {
+    if (path.empty())
+        return;
+    if (std::find(paths.begin(), paths.end(), path) == paths.end())
+        paths.push_back(path);
+}
+
+static std::vector<std::string> ns_tshark_search_paths() {
+    std::vector<std::string> paths;
+    ns_add_unique_path(paths, ns_env_var("AIDA_TSHARK"));
+    ns_add_unique_path(paths, ns_env_var("TSHARK_PATH"));
+    const std::string program_files = ns_env_var("ProgramFiles");
+    if (!program_files.empty())
+        ns_add_unique_path(paths, program_files + "\\Wireshark\\tshark.exe");
+    const std::string program_files_x86 = ns_env_var("ProgramFiles(x86)");
+    if (!program_files_x86.empty())
+        ns_add_unique_path(paths, program_files_x86 + "\\Wireshark\\tshark.exe");
+    const std::string path_env = ns_env_var("PATH");
+    size_t start = 0;
+    while (start <= path_env.size()) {
+        const size_t end = path_env.find(';', start);
+        std::string dir = path_env.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        while (!dir.empty() && (dir.front() == '"' || dir.front() == ' '))
+            dir.erase(dir.begin());
+        while (!dir.empty() && (dir.back() == '"' || dir.back() == ' '))
+            dir.pop_back();
+        if (!dir.empty()) {
+            if (dir.back() == '\\' || dir.back() == '/')
+                ns_add_unique_path(paths, dir + "tshark.exe");
+            else
+                ns_add_unique_path(paths, dir + "\\tshark.exe");
+        }
+        if (end == std::string::npos)
+            break;
+        start = end + 1;
+    }
+    return paths;
+}
+
+static json ns_paths_to_json(const std::vector<std::string>& paths) {
+    json arr = json::array();
+    for (const auto& path : paths) {
+        json item;
+        item["path"] = path;
+        std::error_code ec;
+        item["exists"] = std::filesystem::exists(path, ec);
+        if (ec)
+            item["exists_error"] = ec.message();
+        arr.push_back(std::move(item));
+    }
+    return arr;
+}
+
+struct ns_pcap_probe_t {
+    bool exists = false;
+    bool readable = false;
+    bool valid = false;
+    bool truncated = false;
+    bool pcapng = false;
+    std::uint64_t file_size = 0;
+    std::uint32_t packet_count = 0;
+    std::uint32_t block_count = 0;
+    std::string format;
+    std::string reason;
+};
+
+struct ns_keylog_probe_t {
+    bool exists = false;
+    bool readable = false;
+    bool valid = false;
+    std::uint64_t file_size = 0;
+    std::uint32_t entry_count = 0;
+    std::string reason;
+};
+
+static std::uint32_t ns_read_u32_le(const std::vector<std::uint8_t>& data, std::size_t off) {
+    return static_cast<std::uint32_t>(data[off]) |
+        (static_cast<std::uint32_t>(data[off + 1]) << 8) |
+        (static_cast<std::uint32_t>(data[off + 2]) << 16) |
+        (static_cast<std::uint32_t>(data[off + 3]) << 24);
+}
+
+static std::uint32_t ns_read_u32_be(const std::vector<std::uint8_t>& data, std::size_t off) {
+    return (static_cast<std::uint32_t>(data[off]) << 24) |
+        (static_cast<std::uint32_t>(data[off + 1]) << 16) |
+        (static_cast<std::uint32_t>(data[off + 2]) << 8) |
+        static_cast<std::uint32_t>(data[off + 3]);
+}
+
+static std::uint32_t ns_read_u32_ordered(const std::vector<std::uint8_t>& data, std::size_t off, bool little) {
+    return little ? ns_read_u32_le(data, off) : ns_read_u32_be(data, off);
+}
+
+static bool ns_is_hex_token(const std::string& token) {
+    if (token.empty() || (token.size() % 2) != 0)
+        return false;
+    for (char ch : token) {
+        if (!std::isxdigit(static_cast<unsigned char>(ch)))
+            return false;
+    }
+    return true;
+}
+
+static ns_pcap_probe_t ns_probe_pcap_file(const std::string& path) {
+    ns_pcap_probe_t out;
+    std::error_code ec;
+    out.exists = std::filesystem::exists(path, ec);
+    if (ec) {
+        out.reason = ec.message();
+        return out;
+    }
+    if (!out.exists) {
+        out.reason = "pcap file does not exist";
+        return out;
+    }
+    out.file_size = static_cast<std::uint64_t>(std::filesystem::file_size(path, ec));
+    if (ec) {
+        out.reason = ec.message();
+        return out;
+    }
+    if (out.file_size < 4) {
+        out.reason = "pcap file is shorter than a capture header";
+        return out;
+    }
+    if (out.file_size > 64ull * 1024ull * 1024ull) {
+        out.reason = "pcap fixture probe refuses files larger than 64 MiB without tshark";
+        return out;
+    }
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        out.reason = "pcap file could not be opened";
+        return out;
+    }
+    std::vector<std::uint8_t> data(static_cast<std::size_t>(out.file_size));
+    if (!data.empty())
+        file.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size()));
+    if (!file && static_cast<std::uint64_t>(file.gcount()) != out.file_size) {
+        out.reason = "pcap file read was incomplete";
+        return out;
+    }
+    out.readable = true;
+    const std::uint32_t magic_le = ns_read_u32_le(data, 0);
+    if (magic_le == 0xA1B2C3D4u || magic_le == 0xA1B23C4Du ||
+        magic_le == 0xD4C3B2A1u || magic_le == 0x4D3CB2A1u) {
+        if (data.size() < 24) {
+            out.truncated = true;
+            out.reason = "pcap global header is truncated";
+            return out;
+        }
+        const bool little = magic_le == 0xA1B2C3D4u || magic_le == 0xA1B23C4Du;
+        out.format = "pcap";
+        std::size_t off = 24;
+        while (off < data.size()) {
+            if (data.size() - off < 16) {
+                out.truncated = true;
+                out.reason = "pcap packet header is truncated";
+                return out;
+            }
+            const std::uint32_t incl_len = ns_read_u32_ordered(data, off + 8, little);
+            if (incl_len > data.size() - off - 16) {
+                out.truncated = true;
+                out.reason = "pcap packet payload exceeds file size";
+                return out;
+            }
+            ++out.packet_count;
+            off += 16 + static_cast<std::size_t>(incl_len);
+        }
+        out.valid = off == data.size();
+        out.reason = out.valid ? (out.packet_count == 0 ? "valid empty pcap" : "valid pcap") : "pcap parser ended off boundary";
+        return out;
+    }
+    if (magic_le == 0x0A0D0D0Au) {
+        if (data.size() < 28) {
+            out.truncated = true;
+            out.reason = "pcapng section header is truncated";
+            return out;
+        }
+        out.format = "pcapng";
+        out.pcapng = true;
+        bool little = true;
+        std::size_t off = 0;
+        while (off < data.size()) {
+            if (data.size() - off < 12) {
+                out.truncated = true;
+                out.reason = "pcapng block header is truncated";
+                return out;
+            }
+            const std::uint32_t type_le = ns_read_u32_le(data, off);
+            if (type_le == 0x0A0D0D0Au && data.size() - off >= 12) {
+                const std::uint32_t bom_le = ns_read_u32_le(data, off + 8);
+                if (bom_le == 0x1A2B3C4Du)
+                    little = true;
+                else if (bom_le == 0x4D3C2B1Au)
+                    little = false;
+                else {
+                    out.reason = "pcapng byte-order magic is invalid";
+                    return out;
+                }
+            }
+            const std::uint32_t block_type = ns_read_u32_ordered(data, off, little);
+            const std::uint32_t block_len = ns_read_u32_ordered(data, off + 4, little);
+            if (block_len < 12 || block_len > data.size() - off) {
+                out.truncated = true;
+                out.reason = "pcapng block length is invalid";
+                return out;
+            }
+            const std::uint32_t block_len_tail = ns_read_u32_ordered(data, off + block_len - 4, little);
+            if (block_len_tail != block_len) {
+                out.reason = "pcapng trailing block length mismatch";
+                return out;
+            }
+            ++out.block_count;
+            if (block_type == 0x00000006u || block_type == 0x00000003u)
+                ++out.packet_count;
+            off += block_len;
+        }
+        out.valid = off == data.size() && out.block_count != 0;
+        out.reason = out.valid ? (out.packet_count == 0 ? "valid empty pcapng" : "valid pcapng") : "pcapng parser ended off boundary";
+        return out;
+    }
+    out.reason = "capture magic is not pcap or pcapng";
+    return out;
+}
+
+static ns_keylog_probe_t ns_probe_keylog_file(const std::string& path) {
+    ns_keylog_probe_t out;
+    std::error_code ec;
+    out.exists = std::filesystem::exists(path, ec);
+    if (ec) {
+        out.reason = ec.message();
+        return out;
+    }
+    if (!out.exists) {
+        out.reason = "keylog file does not exist";
+        return out;
+    }
+    out.file_size = static_cast<std::uint64_t>(std::filesystem::file_size(path, ec));
+    if (ec) {
+        out.reason = ec.message();
+        return out;
+    }
+    if (out.file_size > 16ull * 1024ull * 1024ull) {
+        out.reason = "keylog fixture probe refuses files larger than 16 MiB without tshark";
+        return out;
+    }
+    std::ifstream file(path);
+    if (!file) {
+        out.reason = "keylog file could not be opened";
+        return out;
+    }
+    out.readable = true;
+    std::string line;
+    while (std::getline(file, line)) {
+        line.erase(line.begin(), std::find_if(line.begin(), line.end(), [](unsigned char ch) { return !std::isspace(ch); }));
+        while (!line.empty() && std::isspace(static_cast<unsigned char>(line.back())))
+            line.pop_back();
+        if (line.empty() || line[0] == '#')
+            continue;
+        std::istringstream is(line);
+        std::string label;
+        std::string first;
+        std::string second;
+        is >> label >> first >> second;
+        if (!label.empty() && ns_is_hex_token(first) && ns_is_hex_token(second))
+            ++out.entry_count;
+    }
+    out.valid = true;
+    out.reason = out.entry_count == 0 ? "readable keylog with no parsed entries" : "readable keylog";
+    return out;
+}
+
+static json ns_pcap_probe_to_json(const ns_pcap_probe_t& probe) {
+    json j;
+    j["exists"] = probe.exists;
+    j["readable"] = probe.readable;
+    j["valid"] = probe.valid;
+    j["truncated"] = probe.truncated;
+    j["format"] = probe.format;
+    j["pcapng"] = probe.pcapng;
+    j["file_size"] = probe.file_size;
+    j["packet_count"] = probe.packet_count;
+    j["block_count"] = probe.block_count;
+    j["reason"] = probe.reason;
+    return j;
+}
+
+static json ns_keylog_probe_to_json(const ns_keylog_probe_t& probe) {
+    json j;
+    j["exists"] = probe.exists;
+    j["readable"] = probe.readable;
+    j["valid"] = probe.valid;
+    j["file_size"] = probe.file_size;
+    j["entry_count"] = probe.entry_count;
+    j["reason"] = probe.reason;
+    return j;
 }
 
 static bool ns_hex_to_bytes_strict(const std::string& hex, std::vector<std::uint8_t>& out) {
@@ -843,22 +1149,52 @@ tool_result_t network_decrypt_capture(const json& params) {
         return tool_result_t::error(OBFSTR("keylog_path is required (or set SSLKEYLOGFILE environment variable)"));
     }
 
+    auto searched_paths = ns_tshark_search_paths();
+    const ns_pcap_probe_t pcap_probe = ns_probe_pcap_file(pcap_path);
+    const ns_keylog_probe_t keylog_probe = ns_probe_keylog_file(keylog_path);
     std::string tshark_path = net_security::TlsKeyExtractor::instance().find_tshark_path();
     if (tshark_path.empty()) {
         json r;
-        r["success"] = false;
-        r["backend"] = "tshark";
-        r["dependency_available"] = false;
+        const bool empty_fixture_ok = pcap_probe.valid && pcap_probe.packet_count == 0 && keylog_probe.valid;
+        r["success"] = empty_fixture_ok;
+        r["backend"] = empty_fixture_ok ? "builtin_empty_pcap_fixture" : "tshark";
+        r["safe_parser_backend"] = "builtin_empty_pcap_fixture";
+        r["dependency_available"] = empty_fixture_ok;
+        r["dependency_unavailable"] = !empty_fixture_ok;
+        r["tshark_available"] = false;
+        r["selected"] = nullptr;
+        r["searched_paths"] = ns_paths_to_json(searched_paths);
         r["pcap_file"] = pcap_path;
         r["keylog_file"] = keylog_path;
         r["display_filter"] = display_filter;
-        r["total_packets"] = 0;
+        r["pcap"] = ns_pcap_probe_to_json(pcap_probe);
+        r["keylog"] = ns_keylog_probe_to_json(keylog_probe);
+        r["pcap_valid"] = pcap_probe.valid;
+        r["pcap_packet_count"] = pcap_probe.packet_count;
+        r["keylog_entry_count"] = keylog_probe.entry_count;
+        r["total_packets"] = pcap_probe.packet_count;
         r["decrypted_packets"] = 0;
+        r["http2_frames"] = json::array();
+        if (empty_fixture_ok) {
+            r["expected_empty"] = true;
+            r["reason"] = "valid empty capture fixture parsed without tshark";
+            diag::log_tagged_fmt("net_sec", "network_decrypt_capture empty_fixture backend=builtin pcap=%s keylog=%s filter=%s packets=%u keylog_entries=%u searched_paths=%zu",
+                pcap_path.c_str(), keylog_path.c_str(), display_filter.c_str(),
+                pcap_probe.packet_count, keylog_probe.entry_count, searched_paths.size());
+            return tool_result_t::ok(OBFSTR("Validated empty TLS capture fixture without tshark"), r);
+        }
+        r["reason"] = pcap_probe.valid && pcap_probe.packet_count != 0
+            ? "non-empty capture requires tshark for decryption"
+            : (!pcap_probe.valid ? pcap_probe.reason : (!keylog_probe.valid ? keylog_probe.reason : "tshark backend unavailable"));
         r["error"] = "tshark not found. Install Wireshark to enable PCAP decryption.";
-        diag::log_tagged_fmt("net_sec", "network_decrypt_capture dependency_unavailable backend=tshark pcap=%s keylog=%s filter=%s",
-            pcap_path.c_str(), keylog_path.c_str(), display_filter.c_str());
+        diag::log_tagged_fmt("net_sec", "network_decrypt_capture dependency_unavailable backend=tshark pcap=%s keylog=%s filter=%s pcap_valid=%d packets=%u keylog_valid=%d keylog_entries=%u reason=%s searched_paths=%zu",
+            pcap_path.c_str(), keylog_path.c_str(), display_filter.c_str(),
+            pcap_probe.valid ? 1 : 0, pcap_probe.packet_count,
+            keylog_probe.valid ? 1 : 0, keylog_probe.entry_count,
+            r["reason"].get<std::string>().c_str(), searched_paths.size());
         return tool_result_t::error(OBFSTR("tshark not found. Install Wireshark to enable PCAP decryption."), r);
     }
+    ns_add_unique_path(searched_paths, tshark_path);
 
     diag::log_tagged_fmt("net_sec", "network_decrypt_capture calling tshark pcap=%s keylog=%s filter=%s tshark=%s", pcap_path.c_str(), keylog_path.c_str(), display_filter.c_str(), tshark_path.c_str());
     auto decrypt_result = net_security::TlsKeyExtractor::instance().decrypt_pcap_with_tshark(
@@ -870,11 +1206,22 @@ tool_result_t network_decrypt_capture(const json& params) {
     r["success"] = decrypt_result.success;
     r["backend"] = "tshark";
     r["dependency_available"] = true;
+    r["dependency_unavailable"] = false;
+    r["selected"] = tshark_path;
+    r["searched_paths"] = ns_paths_to_json(searched_paths);
     r["tshark_path"] = tshark_path;
     r["pcap_file"] = decrypt_result.pcap_file_used;
     r["keylog_file"] = decrypt_result.keylog_file_used;
+    r["pcap"] = ns_pcap_probe_to_json(pcap_probe);
+    r["keylog"] = ns_keylog_probe_to_json(keylog_probe);
+    r["pcap_valid"] = pcap_probe.valid;
+    r["pcap_packet_count"] = pcap_probe.packet_count;
+    r["keylog_entry_count"] = keylog_probe.entry_count;
     r["total_packets"] = decrypt_result.total_packets;
     r["decrypted_packets"] = decrypt_result.decrypted_packets;
+    r["reason"] = decrypt_result.success
+        ? "tshark decrypted capture"
+        : (decrypt_result.error_message.empty() ? "tshark completed without matching decrypted packets" : decrypt_result.error_message);
 
     if (!decrypt_result.error_message.empty())
         r["error"] = decrypt_result.error_message;

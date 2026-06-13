@@ -291,6 +291,395 @@ std::map<std::string, std::uint32_t> d3d11_context_slots()
     };
 }
 
+std::string dx_protection_name(std::uint32_t protect)
+{
+    switch (protect & 0xFFu)
+    {
+    case PAGE_NOACCESS: return "NOACCESS";
+    case PAGE_READONLY: return "READONLY";
+    case PAGE_READWRITE: return "READWRITE";
+    case PAGE_WRITECOPY: return "WRITECOPY";
+    case PAGE_EXECUTE: return "EXECUTE";
+    case PAGE_EXECUTE_READ: return "EXECUTE_READ";
+    case PAGE_EXECUTE_READWRITE: return "EXECUTE_READWRITE";
+    case PAGE_EXECUTE_WRITECOPY: return "EXECUTE_WRITECOPY";
+    default: return sa_format_address(protect);
+    }
+}
+
+bool parse_first_address_param(const json& params, const std::vector<const char*>& keys, std::uint64_t& out)
+{
+    for (const char* key : keys)
+    {
+        if (parse_address_param(params, key, out) && out != 0)
+            return true;
+    }
+    out = 0;
+    return false;
+}
+
+std::vector<std::uint32_t> fixture_slot_indices_param(const json& params)
+{
+    std::vector<std::uint32_t> out;
+    auto add_value = [&](const json& value) {
+        std::uint64_t v = 0;
+        if (parse_u64_value(value, v) && v <= 512)
+        {
+            const auto idx = static_cast<std::uint32_t>(v);
+            if (std::find(out.begin(), out.end(), idx) == out.end())
+                out.push_back(idx);
+        }
+    };
+    for (const char* key : { "fixture_slot", "fixture_slot_index", "slot_index", "slot" })
+    {
+        auto it = params.find(key);
+        if (it == params.end())
+            continue;
+        if (it->is_array())
+        {
+            for (const auto& value : *it)
+                add_value(value);
+        }
+        else
+        {
+            add_value(*it);
+        }
+    }
+    return out;
+}
+
+std::vector<std::string> fixture_slot_names_param(const json& params)
+{
+    std::vector<std::string> out;
+    auto add_name = [&](std::string value) {
+        value = trim_ascii(value);
+        if (value.empty())
+            return;
+        if (std::find(out.begin(), out.end(), value) == out.end())
+            out.push_back(std::move(value));
+    };
+    for (const char* key : { "fixture_slot_name", "slot_name", "method", "slot_method" })
+    {
+        auto it = params.find(key);
+        if (it == params.end())
+            continue;
+        if (it->is_array())
+        {
+            for (const auto& value : *it)
+            {
+                if (value.is_string())
+                    add_name(value.get<std::string>());
+            }
+        }
+        else if (it->is_string())
+        {
+            add_name(it->get<std::string>());
+        }
+    }
+    return out;
+}
+
+bool read_remote_u64_array(std::uint32_t pid, std::uint64_t address, std::uint32_t count, std::vector<std::uint64_t>& out, json& evidence)
+{
+    out.clear();
+    evidence = json{{"address", address ? json(sa_format_address(address)) : json(nullptr)}, {"requested_entries", count}, {"read_ok", false}, {"entries_read", 0}};
+    if (address == 0 || count == 0)
+    {
+        evidence["reason"] = "missing_address_or_count";
+        return false;
+    }
+    count = std::min<std::uint32_t>(count, 512);
+    std::vector<std::uint8_t> bytes;
+    const std::size_t bytes_requested = static_cast<std::size_t>(count) * sizeof(std::uint64_t);
+    evidence["bytes_requested"] = bytes_requested;
+    const bool ok = read_bytes(pid, address, bytes_requested, bytes);
+    const std::uint32_t entries_read = static_cast<std::uint32_t>(bytes.size() / sizeof(std::uint64_t));
+    evidence["read_ok"] = ok && entries_read != 0;
+    evidence["bytes_read"] = bytes.size();
+    evidence["entries_read"] = entries_read;
+    if (entries_read == 0)
+    {
+        evidence["reason"] = ok ? "empty_read" : "read_failed";
+        return false;
+    }
+    out.resize(entries_read);
+    std::memcpy(out.data(), bytes.data(), static_cast<std::size_t>(entries_read) * sizeof(std::uint64_t));
+    return true;
+}
+
+std::string read_remote_string(std::uint32_t pid, std::uint64_t address, std::size_t max_len, bool& read_ok)
+{
+    read_ok = false;
+    if (address == 0 || max_len == 0)
+        return {};
+    std::vector<std::uint8_t> bytes;
+    if (!read_bytes(pid, address, max_len, bytes) || bytes.empty())
+        return {};
+    read_ok = true;
+    const auto nul = std::find(bytes.begin(), bytes.end(), 0);
+    const std::size_t len = static_cast<std::size_t>(nul - bytes.begin());
+    return std::string(reinterpret_cast<const char*>(bytes.data()), len);
+}
+
+json module_owner_for_address(std::uint32_t pid, std::uint64_t address)
+{
+    auto mod = find_module_for_address(pid, address);
+    if (!mod)
+        return json{{"found", false}};
+    json owner = module_json(*mod);
+    owner["found"] = true;
+    owner["end"] = sa_format_address(mod->base + static_cast<std::uint64_t>(mod->size));
+    owner["rva"] = address >= mod->base ? json(sa_format_address(address - mod->base)) : json(nullptr);
+    return owner;
+}
+
+json memory_region_for_address(std::uint32_t pid, std::uint64_t address, bool& region_ok)
+{
+    region_ok = false;
+    driver_bridge::memory_region_t region{};
+    if (address == 0 || !query_region(pid, address, region))
+        return json{{"found", false}};
+    region_ok = true;
+    json out = region_json(region);
+    out["found"] = true;
+    out["protect_name"] = dx_protection_name(region.protect);
+    out["committed"] = is_committed(region);
+    out["readable"] = is_readable(region);
+    out["writable"] = is_writable(region);
+    out["executable"] = is_executable(region);
+    out["guarded"] = is_guarded(region);
+    return out;
+}
+
+tool_result_t find_device_vtable_static_fixture(const json& params, std::uint32_t pid, const std::string& api, std::uint64_t started_ms)
+{
+    std::uint64_t vtable_va = 0;
+    if (!parse_first_address_param(params, { "fixture_vtable_va", "vtable_va" }, vtable_va))
+    {
+        json out{{"fixture_args_accepted", false}, {"reason", "fixture_vtable_va is required for static fixture discovery"}};
+        return tool_result_t::error("fixture_vtable_va is required for static fixture discovery", out);
+    }
+
+    std::uint64_t slot_names_va = 0;
+    std::uint64_t slot_addresses_va = 0;
+    parse_first_address_param(params, { "fixture_slot_names_va", "slot_names_va" }, slot_names_va);
+    parse_first_address_param(params, { "fixture_slot_addresses_va", "slot_addresses_va" }, slot_addresses_va);
+    std::uint64_t slot_count_u64 = 0;
+    if (params.contains("fixture_slot_count"))
+        parse_u64_value(params["fixture_slot_count"], slot_count_u64);
+    if (slot_count_u64 == 0 && params.contains("slot_count"))
+        parse_u64_value(params["slot_count"], slot_count_u64);
+    std::uint32_t slot_count = static_cast<std::uint32_t>(std::clamp<std::uint64_t>(slot_count_u64 ? slot_count_u64 : 64, 1, 128));
+    const std::string fixture_kind = string_param(params, "fixture_kind", "static_fixture");
+    auto requested_indices = fixture_slot_indices_param(params);
+    auto requested_names = fixture_slot_names_param(params);
+    const auto d3d_slots = d3d11_context_slots();
+
+    json names_read;
+    json addresses_read;
+    std::vector<std::uint64_t> name_ptrs;
+    std::vector<std::uint64_t> compact_addresses;
+    read_remote_u64_array(pid, slot_names_va, slot_names_va ? slot_count : 0, name_ptrs, names_read);
+    read_remote_u64_array(pid, slot_addresses_va, slot_addresses_va ? slot_count : 0, compact_addresses, addresses_read);
+
+    struct compact_slot_t
+    {
+        std::uint32_t compact_index = 0;
+        std::uint32_t slot_index = 0;
+        std::string name;
+        std::uint64_t name_va = 0;
+        std::uint64_t compact_address = 0;
+        bool name_read_ok = false;
+    };
+
+    std::vector<compact_slot_t> compact_slots;
+    const std::uint32_t compact_limit = std::max<std::uint32_t>(slot_count, static_cast<std::uint32_t>(std::max(name_ptrs.size(), compact_addresses.size())));
+    for (std::uint32_t i = 0; i < compact_limit && i < 128; ++i)
+    {
+        compact_slot_t s;
+        s.compact_index = i;
+        s.slot_index = i;
+        if (i < name_ptrs.size())
+        {
+            s.name_va = name_ptrs[i];
+            s.name = read_remote_string(pid, s.name_va, 128, s.name_read_ok);
+        }
+        if (s.name.empty())
+            s.name = "slot_" + std::to_string(i);
+        auto known = d3d_slots.find(s.name);
+        if (known != d3d_slots.end())
+            s.slot_index = known->second;
+        if (i < compact_addresses.size())
+            s.compact_address = compact_addresses[i];
+        compact_slots.push_back(std::move(s));
+    }
+
+    for (const std::string& name : requested_names)
+    {
+        auto known = d3d_slots.find(name);
+        if (known != d3d_slots.end() && std::find(requested_indices.begin(), requested_indices.end(), known->second) == requested_indices.end())
+            requested_indices.push_back(known->second);
+    }
+
+    auto slot_requested = [&](const compact_slot_t& slot) {
+        if (requested_indices.empty() && requested_names.empty())
+            return true;
+        if (std::find(requested_indices.begin(), requested_indices.end(), slot.slot_index) != requested_indices.end())
+            return true;
+        const std::string slot_lower = lower_ascii(slot.name);
+        for (const auto& name : requested_names)
+        {
+            if (slot_lower == lower_ascii(name))
+                return true;
+        }
+        return false;
+    };
+
+    std::uint32_t max_slot_index = 0;
+    bool have_candidate = false;
+    for (const auto& s : compact_slots)
+    {
+        if (!slot_requested(s))
+            continue;
+        max_slot_index = std::max(max_slot_index, s.slot_index);
+        have_candidate = true;
+    }
+    for (std::uint32_t idx : requested_indices)
+    {
+        max_slot_index = std::max(max_slot_index, idx);
+        have_candidate = true;
+    }
+    if (!have_candidate)
+        max_slot_index = slot_count > 0 ? slot_count - 1 : 0;
+    max_slot_index = std::min<std::uint32_t>(max_slot_index, 511);
+
+    json vtable_read;
+    std::vector<std::uint64_t> vtable_entries;
+    read_remote_u64_array(pid, vtable_va, max_slot_index + 1, vtable_entries, vtable_read);
+
+    bool vtable_region_ok = false;
+    const json vtable_region = memory_region_for_address(pid, vtable_va, vtable_region_ok);
+    json slot_map = json::object();
+    json slots = json::array();
+    std::size_t resolved = 0;
+
+    auto append_slot = [&](std::uint32_t slot_index, const std::string& slot_name, std::uint32_t compact_index, std::uint64_t name_va, bool name_read_ok, std::uint64_t compact_address) {
+        const bool have_vtable_value = slot_index < vtable_entries.size();
+        const std::uint64_t vtable_value = have_vtable_value ? vtable_entries[slot_index] : 0;
+        const std::uint64_t slot_va = vtable_value ? vtable_value : compact_address;
+        bool region_ok = false;
+        json region = memory_region_for_address(pid, slot_va, region_ok);
+        json owner = module_owner_for_address(pid, slot_va);
+        const std::string owner_name = owner.value("name", std::string("unknown"));
+        std::vector<std::uint8_t> prologue;
+        std::string prologue_hex;
+        std::string prologue_text = "unreadable";
+        if (slot_va != 0 && read_bytes(pid, slot_va, 16, prologue) && !prologue.empty())
+        {
+            prologue_hex = bytes_to_hex(prologue, 16);
+            AsmInstr ins = zydis_decode_one(prologue.data(), static_cast<int>(std::min<std::size_t>(prologue.size(), 16)), slot_va);
+            prologue_text = classify_instruction_hint(ins) + ":" + disasm_text(ins);
+        }
+        const bool executable = region_ok && region.value("executable", false) && !region.value("guarded", false);
+        const bool validated = slot_va != 0 && executable && !prologue_hex.empty();
+        if (slot_va != 0)
+            ++resolved;
+        json row;
+        row["slot"] = slot_index;
+        row["slot_index"] = slot_index;
+        row["slot_name"] = slot_name;
+        row["compact_index"] = compact_index;
+        row["address"] = slot_va ? json(sa_format_address(slot_va)) : json(nullptr);
+        row["slot_va"] = slot_va ? json(sa_format_address(slot_va)) : json(nullptr);
+        row["module"] = owner_name;
+        row["module_owner"] = owner;
+        row["memory_region"] = region;
+        row["memory_protection"] = region.value("protect_name", std::string("unknown"));
+        row["target_executable"] = executable;
+        row["validated"] = validated;
+        row["target_prologue"] = prologue_text;
+        row["target_prologue_bytes"] = prologue_hex;
+        row["vtable_slot_entry_va"] = sa_format_address(vtable_va + static_cast<std::uint64_t>(slot_index) * sizeof(std::uint64_t));
+        row["vtable_value"] = vtable_value ? json(sa_format_address(vtable_value)) : json(nullptr);
+        row["fixture_address_array_value"] = compact_address ? json(sa_format_address(compact_address)) : json(nullptr);
+        row["fixture_name_va"] = name_va ? json(sa_format_address(name_va)) : json(nullptr);
+        row["fixture_name_read_ok"] = name_read_ok;
+        row["vtable_read_value_available"] = have_vtable_value;
+        row["vtable_matches_address_array"] = vtable_value != 0 && compact_address != 0 ? json(vtable_value == compact_address) : json(nullptr);
+        row["evidence"] = json{{"fixture_kind", fixture_kind},
+                                {"slot_index", slot_index},
+                                {"slot_name", slot_name},
+                                {"slot_va", slot_va ? json(sa_format_address(slot_va)) : json(nullptr)},
+                                {"module_owner", owner},
+                                {"memory_region", region},
+                                {"memory_protection", region.value("protect_name", std::string("unknown"))},
+                                {"vtable_slot_entry_va", sa_format_address(vtable_va + static_cast<std::uint64_t>(slot_index) * sizeof(std::uint64_t))},
+                                {"vtable_value", vtable_value ? json(sa_format_address(vtable_value)) : json(nullptr)},
+                                {"target_first_instruction", prologue_text},
+                                {"target_first_16_bytes", prologue_hex}};
+        slots.push_back(row);
+        slot_map[slot_name] = std::move(row);
+    };
+
+    std::vector<std::uint32_t> emitted_indices;
+    for (const auto& s : compact_slots)
+    {
+        if (!slot_requested(s))
+            continue;
+        append_slot(s.slot_index, s.name, s.compact_index, s.name_va, s.name_read_ok, s.compact_address);
+        emitted_indices.push_back(s.slot_index);
+    }
+    for (std::uint32_t idx : requested_indices)
+    {
+        if (std::find(emitted_indices.begin(), emitted_indices.end(), idx) != emitted_indices.end())
+            continue;
+        std::string name = "slot_" + std::to_string(idx);
+        for (const auto& kv : d3d_slots)
+        {
+            if (kv.second == idx)
+            {
+                name = kv.first;
+                break;
+            }
+        }
+        append_slot(idx, name, idx, 0, false, 0);
+    }
+
+    json result;
+    result["process_id"] = pid;
+    result["api"] = api;
+    result["fixture_static_mode"] = true;
+    result["fixture_args_accepted"] = true;
+    result["fixture_kind"] = fixture_kind;
+    result["fixture_vtable_va"] = sa_format_address(vtable_va);
+    result["fixture_slot_names_va"] = slot_names_va ? json(sa_format_address(slot_names_va)) : json(nullptr);
+    result["fixture_slot_addresses_va"] = slot_addresses_va ? json(sa_format_address(slot_addresses_va)) : json(nullptr);
+    result["fixture_slot_count"] = slot_count;
+    result["requested_slot_indices"] = requested_indices;
+    result["requested_slot_names"] = requested_names;
+    result["vtable_read"] = vtable_read;
+    result["vtable_read_status"] = vtable_read.value("read_ok", false) ? "ok" : "failed";
+    result["vtable_region"] = vtable_region;
+    result["slot_map"] = std::move(slot_map);
+    result["slots"] = std::move(slots);
+    result["count"] = result["slots"].size();
+    result["resolved"] = resolved;
+    result["names_array_read"] = names_read;
+    result["addresses_array_read"] = addresses_read;
+    result["elapsed_ms"] = GetTickCount64() - started_ms;
+    diag::log_tagged_fmt("dx_hook",
+                         "find_device_vtable static_fixture_exit pid=%u api=%s kind=%s vtable=%s read_ok=%d slots=%zu resolved=%zu elapsed_ms=%llu",
+                         pid,
+                         api.c_str(),
+                         fixture_kind.c_str(),
+                         sa_format_address(vtable_va).c_str(),
+                         vtable_read.value("read_ok", false) ? 1 : 0,
+                         result["slots"].size(),
+                         resolved,
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
+    return tool_result_t::ok("DX static fixture vtable discovery completed", result);
+}
+
 std::size_t resolved_slot_count(const std::vector<slot_entry_t>& slots)
 {
     std::size_t resolved = 0;
@@ -1944,6 +2333,8 @@ tool_result_t find_device_vtable(const json& params)
         return tool_result_t::error(scope.error());
     const std::string api = api_param(params);
     diag::log_tagged_fmt("dx_hook", "find_device_vtable enter pid=%u api=%s", scope.pid(), api.c_str());
+    if (params.contains("fixture_vtable_va") || params.contains("vtable_va"))
+        return find_device_vtable_static_fixture(params, scope.pid(), api, started_ms);
     if (api == "auto")
     {
         json apis = json::array();

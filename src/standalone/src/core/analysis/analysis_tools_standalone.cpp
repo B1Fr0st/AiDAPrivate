@@ -29,6 +29,7 @@
 #include <atomic>
 #include <cctype>
 #include <cinttypes>
+#include <map>
 #include <sstream>
 #include <shared_mutex>
 #include <string>
@@ -172,10 +173,49 @@ static bool fast_section_writable(uint32_t characteristics)
 	return (characteristics & 0x80000000u) != 0;
 }
 
+static json fast_import_lines_json(const std::vector<pe_parser::import_entry_t>& imports)
+{
+	std::map<std::string, std::vector<std::string>> by_module;
+	for (const auto& imp : imports) {
+		if (!imp.module_name.empty())
+			by_module[imp.module_name].push_back(imp.function_name.empty() ? ("#" + std::to_string(imp.ordinal)) : imp.function_name);
+	}
+	json out = json::array();
+	for (auto& kv : by_module) {
+		std::sort(kv.second.begin(), kv.second.end());
+		kv.second.erase(std::unique(kv.second.begin(), kv.second.end()), kv.second.end());
+		std::string line = kv.first + ": ";
+		for (size_t i = 0; i < kv.second.size(); ++i) {
+			if (i != 0)
+				line += ", ";
+			line += kv.second[i];
+		}
+		out.push_back(std::move(line));
+	}
+	return out;
+}
+
+static json fast_export_names_json(const std::vector<pe_parser::export_entry_t>& exports)
+{
+	std::vector<std::string> names;
+	names.reserve(exports.size());
+	for (const auto& exp : exports) {
+		if (!exp.is_forwarded && !exp.name.empty())
+			names.push_back(exp.name);
+	}
+	std::sort(names.begin(), names.end());
+	names.erase(std::unique(names.begin(), names.end()), names.end());
+	json out = json::array();
+	for (auto& name : names)
+		out.push_back(std::move(name));
+	return out;
+}
+
 static tool_result_t analysis_query_binary_map_fast_summary(const json& params)
 {
 	const uint64_t start_ms = GetTickCount64();
 	json phases = json::object();
+	json phase_details = json::object();
 	auto mark_phase = [&](const char* name, uint64_t phase_start) {
 		const uint64_t elapsed = GetTickCount64() - phase_start;
 		phases[name] = elapsed;
@@ -184,16 +224,38 @@ static tool_result_t analysis_query_binary_map_fast_summary(const json& params)
 			static_cast<unsigned long long>(elapsed),
 			static_cast<unsigned long long>(GetTickCount64() - start_ms));
 	};
+	auto cancelled_result = [&](const char* phase) {
+		json out;
+		out["cancelled"] = true;
+		out["cancel_phase"] = phase;
+		out["phase_timings_ms"] = phases;
+		out["phase_details"] = phase_details;
+		out["elapsed_ms"] = GetTickCount64() - start_ms;
+		diag::log_tagged_fmt("analysis",
+			"binary_map_fast_summary_cancelled phase=%s elapsed_ms=%llu",
+			phase,
+			static_cast<unsigned long long>(GetTickCount64() - start_ms));
+		return tool_result_t::error("analysis_query binary_map_overview fast_summary cancelled", out);
+	};
 	const size_t max_functions = bounded_size_param(params, "max_functions", 24, 1, 256);
+	const size_t max_imports = bounded_size_param(params, "max_imports", 512, 1, 4096);
+	const size_t max_exports = bounded_size_param(params, "max_exports", 512, 1, 4096);
+	const uint32_t timeout_ms = bounded_u32_param(params, "timeout_ms", 2500, 100, 10000);
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
 	const std::string requested_module = params.value("module_name", std::string());
+	const bool include_imports = params.value("include_imports", false);
+	const bool include_exports = params.value("include_exports", false);
 	char buf[32];
 
 	diag::log_tagged_fmt("analysis",
-		"binary_map_fast_summary_enter static_loaded=%d attached_pid=%u module_filter=%s max_functions=%zu",
+		"binary_map_fast_summary_enter static_loaded=%d attached_pid=%u module_filter=%s max_functions=%zu include_imports=%d include_exports=%d timeout_ms=%u",
 		g_disasm.file.loaded ? 1 : 0,
 		driver_bridge::attached_pid(),
 		requested_module.c_str(),
-		max_functions);
+		max_functions,
+		include_imports ? 1 : 0,
+		include_exports ? 1 : 0,
+		static_cast<unsigned>(timeout_ms));
 
 	if (g_disasm.file.loaded) {
 		uint64_t phase_start = GetTickCount64();
@@ -211,6 +273,8 @@ static tool_result_t analysis_query_binary_map_fast_summary(const json& params)
 			sections.push_back(std::move(o));
 		}
 		mark_phase("static_sections", phase_start);
+		if (mcp_standalone::current_call_cancelled())
+			return cancelled_result("static_sections");
 
 		phase_start = GetTickCount64();
 		json functions = json::array();
@@ -231,6 +295,8 @@ static tool_result_t analysis_query_binary_map_fast_summary(const json& params)
 			functions.push_back(std::move(o));
 		}
 		mark_phase("static_functions", phase_start);
+		if (mcp_standalone::current_call_cancelled())
+			return cancelled_result("static_functions");
 
 		std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(g_disasm.file.image_base));
 		json result;
@@ -245,8 +311,12 @@ static tool_result_t analysis_query_binary_map_fast_summary(const json& params)
 		result["globals"] = json::array();
 		result["imports"] = json::array();
 		result["exports"] = json::array();
+		result["imports_parse_complete"] = !include_imports;
+		result["exports_parse_complete"] = !include_exports;
+		result["imports_exports_source"] = include_imports || include_exports ? "static_loaded_sections_no_pe_directory_cache" : "not_requested";
 		result["fast_summary"] = true;
 		result["phase_timings_ms"] = phases;
+		result["phase_details"] = phase_details;
 		result["elapsed_ms"] = GetTickCount64() - start_ms;
 		diag::log_tagged_fmt("analysis",
 			"binary_map_fast_summary_exit ok=1 source=static sections=%zu functions=%zu elapsed_ms=%llu",
@@ -261,6 +331,8 @@ static tool_result_t analysis_query_binary_map_fast_summary(const json& params)
 	if (attached_pid == 0)
 		return tool_result_t::error("No process is attached and no static binary is loaded.");
 	mark_phase("attached_pid", phase_start);
+	if (mcp_standalone::current_call_cancelled())
+		return cancelled_result("attached_pid");
 
 	phase_start = GetTickCount64();
 	auto modules = driver_bridge::enumerate_modules();
@@ -275,12 +347,16 @@ static tool_result_t analysis_query_binary_map_fast_summary(const json& params)
 		modules.size());
 	if (modules.empty())
 		return tool_result_t::error("Module enumeration returned no entries.");
+	if (mcp_standalone::current_call_cancelled())
+		return cancelled_result("module_enumeration");
 
 	phase_start = GetTickCount64();
 	const driver_bridge::module_info_t* selected = select_module_by_name(modules, requested_module);
 	mark_phase("module_select", phase_start);
 	if (!selected)
 		return tool_result_t::error("Requested module was not found in the attached process.");
+	if (mcp_standalone::current_call_cancelled())
+		return cancelled_result("module_select");
 
 	phase_start = GetTickCount64();
 	pe_parser::pe_info_t pe;
@@ -288,6 +364,8 @@ static tool_result_t analysis_query_binary_map_fast_summary(const json& params)
 	mark_phase("pe_parse_headers", phase_start);
 	if (!pe_ok)
 		return tool_result_t::error("pe_parser::parse failed on the selected module.");
+	if (mcp_standalone::current_call_cancelled())
+		return cancelled_result("pe_parse_headers");
 
 	phase_start = GetTickCount64();
 	json sections = json::array();
@@ -303,6 +381,8 @@ static tool_result_t analysis_query_binary_map_fast_summary(const json& params)
 		sections.push_back(std::move(o));
 	}
 	mark_phase("sections", phase_start);
+	if (mcp_standalone::current_call_cancelled())
+		return cancelled_result("sections");
 
 	phase_start = GetTickCount64();
 	json functions = json::array();
@@ -323,7 +403,7 @@ static tool_result_t analysis_query_binary_map_fast_summary(const json& params)
 		functions.push_back(std::move(o));
 	};
 	if (pe.entry_point != 0)
-		emit_function(selected->base + pe.entry_point, "entry_point", "pe_entry_point");
+		emit_function(pe.entry_point, "entry_point", "pe_entry_point");
 	for (const auto& s : pe.sections) {
 		if (functions.size() >= max_functions)
 			break;
@@ -333,6 +413,41 @@ static tool_result_t analysis_query_binary_map_fast_summary(const json& params)
 		emit_function(selected->base + s.virtual_address, name, "executable_section");
 	}
 	mark_phase("functions", phase_start);
+	if (mcp_standalone::current_call_cancelled())
+		return cancelled_result("functions");
+
+	json imports = json::array();
+	json exports = json::array();
+	bool imports_truncated = false;
+	bool exports_truncated = false;
+	bool imports_parse_complete = !include_imports;
+	bool exports_parse_complete = !include_exports;
+	if (include_exports) {
+		phase_start = GetTickCount64();
+		std::vector<pe_parser::export_entry_t> parsed_exports;
+		const bool parsed = pe_parser::parse_exports(selected->base, pe, parsed_exports, max_exports, &deadline, &exports_truncated);
+		exports_parse_complete = parsed && !exports_truncated;
+		exports = fast_export_names_json(parsed_exports);
+		phase_details["exports_requested"] = true;
+		phase_details["exports_truncated"] = exports_truncated;
+		phase_details["exports_returned"] = exports.size();
+		mark_phase("exports", phase_start);
+		if (mcp_standalone::current_call_cancelled())
+			return cancelled_result("exports");
+	}
+	if (include_imports) {
+		phase_start = GetTickCount64();
+		std::vector<pe_parser::import_entry_t> parsed_imports;
+		const bool parsed = pe_parser::parse_imports(selected->base, pe, parsed_imports, max_imports, &deadline, &imports_truncated);
+		imports_parse_complete = parsed && !imports_truncated;
+		imports = fast_import_lines_json(parsed_imports);
+		phase_details["imports_requested"] = true;
+		phase_details["imports_truncated"] = imports_truncated;
+		phase_details["imports_returned"] = imports.size();
+		mark_phase("imports", phase_start);
+		if (mcp_standalone::current_call_cancelled())
+			return cancelled_result("imports");
+	}
 
 	std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(selected->base));
 	json result;
@@ -345,27 +460,40 @@ static tool_result_t analysis_query_binary_map_fast_summary(const json& params)
 	result["sections"] = std::move(sections);
 	result["functions"] = std::move(functions);
 	result["globals"] = json::array();
-	result["imports"] = json::array();
-	result["exports"] = json::array();
+	result["imports"] = std::move(imports);
+	result["exports"] = std::move(exports);
+	result["imports_parse_complete"] = imports_parse_complete;
+	result["exports_parse_complete"] = exports_parse_complete;
+	result["imports_truncated"] = imports_truncated;
+	result["exports_truncated"] = exports_truncated;
+	result["imports_exports_source"] = include_imports || include_exports ? "live_pe_directory_parse" : "not_requested";
+	result["max_imports"] = max_imports;
+	result["max_exports"] = max_exports;
+	result["timeout_ms"] = timeout_ms;
 	result["fast_summary"] = true;
 	result["phase_timings_ms"] = phases;
+	result["phase_details"] = phase_details;
 	result["elapsed_ms"] = GetTickCount64() - start_ms;
 	diag::log_tagged_fmt("analysis",
-		"binary_map_fast_summary_exit ok=1 source=live pid=%u module=%s sections=%zu functions=%zu elapsed_ms=%llu",
+		"binary_map_fast_summary_exit ok=1 source=live pid=%u module=%s sections=%zu functions=%zu imports=%zu exports=%zu elapsed_ms=%llu cheap_path=1",
 		attached_pid,
 		selected->name.c_str(),
 		result["sections"].size(),
 		result["functions"].size(),
+		result["imports"].size(),
+		result["exports"].size(),
 		static_cast<unsigned long long>(GetTickCount64() - start_ms));
 	return tool_result_t::ok(result);
 }
 
 static tool_result_t fuzzer_manage_start(const json& params)
 {
+	const uint64_t handler_start_ms = GetTickCount64();
 	std::string target = params.value("target_address", "");
 	std::string end = params.value("end_address", "");
 	std::string input = params.value("input_address", "");
-	diag::log_tagged_fmt("analysis", "fuzzer_manage start target=%s end=%s input=%s",
+	diag::log_tagged_fmt("analysis", "fuzzer_manage start tick=%llu target=%s end=%s input=%s",
+		static_cast<unsigned long long>(handler_start_ms),
 		target.c_str(), end.c_str(), input.c_str());
 	if (target.empty())
 		return tool_result_t::error("target_address is required");
@@ -415,25 +543,125 @@ static tool_result_t fuzzer_manage_start(const json& params)
 	result["max_iterations"] = cfg.max_iterations;
 	result["setup_complete"] = fuzzer_engine::g_state.setup_complete.load();
 	result["setup_success"] = fuzzer_engine::g_state.setup_success.load();
+	result["handler_start_tick_ms"] = handler_start_ms;
+	result["handler_end_tick_ms"] = GetTickCount64();
+	diag::log_tagged_fmt("analysis",
+		"fuzzer_manage start_done start_tick=%llu end_tick=%llu pid=%u tid=%u max_iterations=%u setup_complete=%d setup_success=%d",
+		static_cast<unsigned long long>(handler_start_ms),
+		static_cast<unsigned long long>(GetTickCount64()),
+		static_cast<unsigned>(cfg.pid),
+		static_cast<unsigned>(cfg.tid),
+		static_cast<unsigned>(cfg.max_iterations),
+		fuzzer_engine::g_state.setup_complete.load() ? 1 : 0,
+		fuzzer_engine::g_state.setup_success.load() ? 1 : 0);
 	return tool_result_t::ok(result);
+}
+
+static uint64_t fuzzer_computed_eps(uint64_t total_executions, double elapsed_seconds)
+{
+	if (total_executions == 0 || elapsed_seconds <= 0.0)
+		return 0;
+	uint64_t computed = static_cast<uint64_t>(static_cast<double>(total_executions) / elapsed_seconds);
+	return computed == 0 ? 1 : computed;
+}
+
+static uint64_t fuzzer_effective_eps(uint64_t total_executions, double elapsed_seconds, uint64_t stored_eps)
+{
+	return stored_eps != 0 ? stored_eps : fuzzer_computed_eps(total_executions, elapsed_seconds);
+}
+
+static std::string fuzzer_exit_reason(bool running, bool worker_active, bool cancel_requested, bool setup_success, const std::string& setup_error, uint64_t total_executions, uint32_t max_iterations)
+{
+	if (running || worker_active)
+		return "worker_active";
+	if (!setup_error.empty())
+		return "setup_or_worker_error";
+	if (cancel_requested)
+		return "stop_requested";
+	if (setup_success && max_iterations != 0 && total_executions >= max_iterations)
+		return "max_iterations_reached";
+	if (setup_success && total_executions != 0)
+		return "completed";
+	return "idle";
 }
 
 static tool_result_t fuzzer_manage_stop(const json&)
 {
-	diag::log_tagged("analysis", "fuzzer_manage stop");
+	const uint64_t start_tick = GetTickCount64();
+	const bool running_before = fuzzer_engine::g_state.running.load();
+	const bool worker_before = fuzzer_engine::g_state.worker_active.load();
+	diag::log_tagged_fmt("analysis", "fuzzer_manage stop_start tick=%llu running=%d worker_active=%d cancel=%d",
+		static_cast<unsigned long long>(start_tick),
+		running_before ? 1 : 0,
+		worker_before ? 1 : 0,
+		fuzzer_engine::g_state.cancel.load() ? 1 : 0);
 	fuzzer_engine::stop_fuzzing();
-	return tool_result_t::ok("Fuzzer stop requested.");
+	const uint64_t end_tick = GetTickCount64();
+	std::lock_guard<std::mutex> lk(fuzzer_engine::g_state.mutex);
+	auto& stats = fuzzer_engine::g_state.stats;
+	const uint64_t computed_eps = fuzzer_computed_eps(stats.total_executions, stats.elapsed_seconds);
+	const uint64_t effective_eps = fuzzer_effective_eps(stats.total_executions, stats.elapsed_seconds, stats.executions_per_second);
+	const bool running_after = fuzzer_engine::g_state.running.load();
+	const bool worker_after = fuzzer_engine::g_state.worker_active.load();
+	const std::string reason = fuzzer_exit_reason(running_after, worker_after, fuzzer_engine::g_state.cancel.load(),
+		fuzzer_engine::g_state.setup_success.load(), fuzzer_engine::g_state.setup_error,
+		stats.total_executions, fuzzer_engine::g_state.config.max_iterations);
+	json result;
+	result["status"] = "stop_requested";
+	result["handler_start_tick_ms"] = start_tick;
+	result["handler_end_tick_ms"] = end_tick;
+	result["running_before"] = running_before;
+	result["worker_active_before"] = worker_before;
+	result["running"] = running_after;
+	result["worker_active"] = worker_after;
+	result["cancel_requested"] = fuzzer_engine::g_state.cancel.load();
+	result["total_executions"] = stats.total_executions;
+	result["stored_executions_per_second"] = stats.executions_per_second;
+	result["computed_executions_per_second"] = computed_eps;
+	result["executions_per_second"] = effective_eps;
+	result["elapsed_seconds"] = stats.elapsed_seconds;
+	result["total_crashes"] = stats.total_crashes;
+	result["unique_crashes"] = stats.total_unique_crashes;
+	result["setup_complete"] = fuzzer_engine::g_state.setup_complete.load();
+	result["setup_success"] = fuzzer_engine::g_state.setup_success.load();
+	result["setup_error"] = fuzzer_engine::g_state.setup_error;
+	result["worker_exit_reason"] = reason;
+	diag::log_tagged_fmt("analysis",
+		"fuzzer_manage stop_done start_tick=%llu end_tick=%llu running_before=%d worker_before=%d running_after=%d worker_after=%d total_exec=%llu stored_eps=%llu computed_eps=%llu effective_eps=%llu elapsed_s=%.3f worker_exit_reason=%s",
+		static_cast<unsigned long long>(start_tick),
+		static_cast<unsigned long long>(end_tick),
+		running_before ? 1 : 0,
+		worker_before ? 1 : 0,
+		running_after ? 1 : 0,
+		worker_after ? 1 : 0,
+		static_cast<unsigned long long>(stats.total_executions),
+		static_cast<unsigned long long>(stats.executions_per_second),
+		static_cast<unsigned long long>(computed_eps),
+		static_cast<unsigned long long>(effective_eps),
+		stats.elapsed_seconds,
+		reason.c_str());
+	return tool_result_t::ok("Fuzzer stop requested.", result);
 }
 
 static tool_result_t fuzzer_manage_results(const json&)
 {
-	diag::log_tagged("analysis", "fuzzer_manage results");
+	const uint64_t start_tick = GetTickCount64();
+	diag::log_tagged_fmt("analysis", "fuzzer_manage results_start tick=%llu", static_cast<unsigned long long>(start_tick));
 	std::lock_guard<std::mutex> lk(fuzzer_engine::g_state.mutex);
 	auto& stats = fuzzer_engine::g_state.stats;
+	const uint64_t computed_eps = fuzzer_computed_eps(stats.total_executions, stats.elapsed_seconds);
+	const uint64_t effective_eps = fuzzer_effective_eps(stats.total_executions, stats.elapsed_seconds, stats.executions_per_second);
+	const bool running = fuzzer_engine::g_state.running.load();
+	const bool worker_active = fuzzer_engine::g_state.worker_active.load();
+	const std::string reason = fuzzer_exit_reason(running, worker_active, fuzzer_engine::g_state.cancel.load(),
+		fuzzer_engine::g_state.setup_success.load(), fuzzer_engine::g_state.setup_error,
+		stats.total_executions, fuzzer_engine::g_state.config.max_iterations);
 	json result;
-	result["running"] = fuzzer_engine::g_state.running.load();
+	result["running"] = running;
 	result["total_executions"] = stats.total_executions;
-	result["executions_per_second"] = stats.executions_per_second;
+	result["executions_per_second"] = effective_eps;
+	result["stored_executions_per_second"] = stats.executions_per_second;
+	result["computed_executions_per_second"] = computed_eps;
 	result["total_crashes"] = stats.total_crashes;
 	result["unique_crashes"] = stats.total_unique_crashes;
 	result["edge_coverage"] = stats.edge_coverage;
@@ -441,9 +669,13 @@ static tool_result_t fuzzer_manage_results(const json&)
 	result["corpus_size"] = stats.corpus_size;
 	result["elapsed_seconds"] = stats.elapsed_seconds;
 	result["setup_error"] = fuzzer_engine::g_state.setup_error;
-	result["worker_active"] = fuzzer_engine::g_state.worker_active.load();
+	result["worker_active"] = worker_active;
+	result["cancel_requested"] = fuzzer_engine::g_state.cancel.load();
 	result["setup_complete"] = fuzzer_engine::g_state.setup_complete.load();
 	result["setup_success"] = fuzzer_engine::g_state.setup_success.load();
+	result["worker_exit_reason"] = reason;
+	result["handler_start_tick_ms"] = start_tick;
+	result["handler_end_tick_ms"] = GetTickCount64();
 	json crashes_arr = json::array();
 	for (auto& c : fuzzer_engine::g_state.unique_crashes) {
 		json cobj;
@@ -455,6 +687,20 @@ static tool_result_t fuzzer_manage_results(const json&)
 		crashes_arr.push_back(cobj);
 	}
 	result["crashes"] = crashes_arr;
+	diag::log_tagged_fmt("analysis",
+		"fuzzer_manage results_done start_tick=%llu end_tick=%llu running=%d worker_active=%d total_exec=%llu stored_eps=%llu computed_eps=%llu effective_eps=%llu elapsed_s=%.3f crashes=%llu unique=%llu worker_exit_reason=%s",
+		static_cast<unsigned long long>(start_tick),
+		static_cast<unsigned long long>(GetTickCount64()),
+		running ? 1 : 0,
+		worker_active ? 1 : 0,
+		static_cast<unsigned long long>(stats.total_executions),
+		static_cast<unsigned long long>(stats.executions_per_second),
+		static_cast<unsigned long long>(computed_eps),
+		static_cast<unsigned long long>(effective_eps),
+		stats.elapsed_seconds,
+		static_cast<unsigned long long>(stats.total_crashes),
+		static_cast<unsigned long long>(stats.total_unique_crashes),
+		reason.c_str());
 	return tool_result_t::ok(result);
 }
 
@@ -892,24 +1138,83 @@ static tool_result_t analysis_query_pdb_symbols(const json& params)
 
 static tool_result_t analysis_query_binary_map_overview(const json& params)
 {
+	const uint64_t start_ms = GetTickCount64();
+	json phases = json::object();
+	json phase_details = json::object();
+	auto mark_phase = [&](const char* name, uint64_t phase_start) {
+		const uint64_t elapsed = GetTickCount64() - phase_start;
+		phases[name] = elapsed;
+		diag::log_tagged_fmt("analysis",
+			"binary_map_overview_phase phase=%s elapsed_ms=%llu total_ms=%llu",
+			name,
+			static_cast<unsigned long long>(elapsed),
+			static_cast<unsigned long long>(GetTickCount64() - start_ms));
+	};
+	auto cancelled_result = [&](const char* phase) {
+		json out;
+		out["cancelled"] = true;
+		out["cancel_phase"] = phase;
+		out["phase_timings_ms"] = phases;
+		out["phase_details"] = phase_details;
+		out["elapsed_ms"] = GetTickCount64() - start_ms;
+		diag::log_tagged_fmt("analysis",
+			"binary_map_overview_cancelled phase=%s elapsed_ms=%llu",
+			phase,
+			static_cast<unsigned long long>(GetTickCount64() - start_ms));
+		return tool_result_t::error("analysis_query binary_map_overview cancelled", out);
+	};
 	if (params.value("fast_summary", false) &&
-		!params.value("include_imports", false) &&
-		!params.value("include_exports", false) &&
 		!params.value("include_xrefs", false)) {
+		diag::log_tagged("analysis", "binary_map_overview_delegate_fast_summary");
 		return analysis_query_binary_map_fast_summary(params);
 	}
+	uint64_t phase_start = GetTickCount64();
 	aida::binary_map::map_options_t opts;
-	opts.max_functions = params.value("max_functions", 24);
-	opts.max_globals = params.value("max_globals", 12);
+	opts.max_functions = static_cast<int>(bounded_size_param(params, "max_functions", 24, 1, 256));
+	opts.max_globals = static_cast<int>(bounded_size_param(params, "max_globals", 12, 1, 256));
 	opts.max_callees_per_function = 2;
 	opts.include_imports = params.value("include_imports", false);
 	opts.include_exports = params.value("include_exports", false);
 	opts.include_xrefs = params.value("include_xrefs", false);
 	opts.include_entropy = !params.value("fast_summary", false);
+	phase_details["request_options"] = json{{"max_functions", opts.max_functions},
+		{"max_globals", opts.max_globals},
+		{"max_callees_per_function", opts.max_callees_per_function},
+		{"include_imports", opts.include_imports},
+		{"include_exports", opts.include_exports},
+		{"include_xrefs", opts.include_xrefs},
+		{"include_entropy", opts.include_entropy}};
+	mark_phase("request_options", phase_start);
+	phase_start = GetTickCount64();
+	if (mcp_standalone::current_call_cancelled())
+		return cancelled_result("pre_generate");
+	mark_phase("cancellation_check_pre_generate", phase_start);
+
+	for (const char* delegated : { "module_resolution", "pe_parse", "sections", "entropy", "exports_imports", "function_discovery", "xref_callee_work" }) {
+		phase_details[delegated] = json{{"status", "delegated_to_binary_map_generate"}, {"timed_by", "binary_map_generate_total"}};
+		diag::log_tagged_fmt("analysis",
+			"binary_map_overview_phase phase=%s status=delegated_to_binary_map_generate",
+			delegated);
+	}
+
+	phase_start = GetTickCount64();
 	aida::binary_map::map_t m;
-	if (!aida::binary_map::generate(opts, m))
-		return tool_result_t::error(aida::binary_map::last_error());
+	if (!aida::binary_map::generate(opts, m)) {
+		mark_phase("binary_map_generate_total", phase_start);
+		json out;
+		out["phase_timings_ms"] = phases;
+		out["phase_details"] = phase_details;
+		out["elapsed_ms"] = GetTickCount64() - start_ms;
+		out["binary_map_error"] = aida::binary_map::last_error();
+		return tool_result_t::error(aida::binary_map::last_error(), out);
+	}
+	mark_phase("binary_map_generate_total", phase_start);
+	phase_start = GetTickCount64();
+	if (mcp_standalone::current_call_cancelled())
+		return cancelled_result("post_generate");
+	mark_phase("cancellation_check_post_generate", phase_start);
 	char buf[32];
+	phase_start = GetTickCount64();
 	json sections = json::array();
 	for (const auto& s : m.sections) {
 		json o;
@@ -920,8 +1225,19 @@ static tool_result_t analysis_query_binary_map_overview(const json& params)
 		o["executable"] = s.executable;
 		o["readable"] = s.readable;
 		o["writable"] = s.writable;
+		if (opts.include_entropy) {
+			o["entropy"] = s.entropy;
+			o["sampled_bytes"] = s.sampled_bytes;
+		}
 		sections.push_back(std::move(o));
 	}
+	phase_details["sections_serialized"] = sections.size();
+	mark_phase("serialization_sections", phase_start);
+	phase_start = GetTickCount64();
+	if (mcp_standalone::current_call_cancelled())
+		return cancelled_result("post_sections_serialization");
+	mark_phase("cancellation_check_post_sections", phase_start);
+	phase_start = GetTickCount64();
 	json functions = json::array();
 	for (const auto& f : m.functions) {
 		json o;
@@ -935,6 +1251,13 @@ static tool_result_t analysis_query_binary_map_overview(const json& params)
 		if (f.pinned) o["pinned"] = true;
 		functions.push_back(std::move(o));
 	}
+	phase_details["functions_serialized"] = functions.size();
+	mark_phase("serialization_functions", phase_start);
+	phase_start = GetTickCount64();
+	if (mcp_standalone::current_call_cancelled())
+		return cancelled_result("post_functions_serialization");
+	mark_phase("cancellation_check_post_functions", phase_start);
+	phase_start = GetTickCount64();
 	json globals = json::array();
 	for (const auto& g : m.globals) {
 		json o;
@@ -946,6 +1269,13 @@ static tool_result_t analysis_query_binary_map_overview(const json& params)
 		if (!g.section_name.empty()) o["section"] = g.section_name;
 		globals.push_back(std::move(o));
 	}
+	phase_details["globals_serialized"] = globals.size();
+	mark_phase("serialization_globals", phase_start);
+	phase_start = GetTickCount64();
+	phase_details["imports_serialized"] = m.imports.size();
+	phase_details["exports_serialized"] = m.exports.size();
+	mark_phase("serialization_imports_exports", phase_start);
+	phase_start = GetTickCount64();
 	std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(m.image_base));
 	json result;
 	result["module_name"] = m.module_name;
@@ -960,6 +1290,22 @@ static tool_result_t analysis_query_binary_map_overview(const json& params)
 	result["imports"] = m.imports;
 	result["exports"] = m.exports;
 	result["fast_summary"] = params.value("fast_summary", false);
+	result["phase_timings_ms"] = phases;
+	result["phase_details"] = phase_details;
+	result["elapsed_ms"] = GetTickCount64() - start_ms;
+	result["cancelled"] = false;
+	mark_phase("serialization_result", phase_start);
+	result["phase_timings_ms"] = phases;
+	result["elapsed_ms"] = GetTickCount64() - start_ms;
+	diag::log_tagged_fmt("analysis",
+		"binary_map_overview_exit ok=1 module=%s sections=%zu functions=%zu globals=%zu imports=%zu exports=%zu elapsed_ms=%llu",
+		m.module_name.c_str(),
+		result["sections"].size(),
+		result["functions"].size(),
+		result["globals"].size(),
+		m.imports.size(),
+		m.exports.size(),
+		static_cast<unsigned long long>(GetTickCount64() - start_ms));
 	return tool_result_t::ok(result);
 }
 
@@ -1425,6 +1771,7 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 
 			std::lock_guard<std::mutex> lk(integrity_hunter::g_state.mutex);
 			auto& nodes = integrity_hunter::g_state.nodes;
+			auto& events = integrity_hunter::g_state.event_log;
 
 			json arr = json::array();
 			for (size_t i = 0; i < nodes.size(); ++i) {
@@ -1447,15 +1794,68 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 				arr.push_back(obj);
 			}
 
+			json event_samples = json::array();
+			std::map<uint64_t, uint64_t> rip_counts;
+			for (size_t i = 0; i < events.size(); ++i) {
+				const auto& ev = events[i];
+				++rip_counts[ev.rip];
+				if (event_samples.size() < 16) {
+					char rbuf[32];
+					char fbuf[32];
+					std::snprintf(rbuf, sizeof(rbuf), "0x%llX", static_cast<unsigned long long>(ev.rip));
+					std::snprintf(fbuf, sizeof(fbuf), "0x%llX", static_cast<unsigned long long>(ev.fault_addr));
+					event_samples.push_back(json{{"index", static_cast<int>(i)},
+						{"rip", rbuf},
+						{"fault_addr", fbuf},
+						{"timestamp", ev.timestamp},
+						{"access_type", ev.access_type}});
+				}
+			}
+			std::vector<std::pair<uint64_t, uint64_t>> top_rips(rip_counts.begin(), rip_counts.end());
+			std::sort(top_rips.begin(), top_rips.end(), [](const auto& a, const auto& b) {
+				if (a.second != b.second)
+					return a.second > b.second;
+				return a.first < b.first;
+			});
+			json top_reader_samples = json::array();
+			for (size_t i = 0; i < top_rips.size() && i < 16; ++i) {
+				char rbuf[32];
+				std::snprintf(rbuf, sizeof(rbuf), "0x%llX", static_cast<unsigned long long>(top_rips[i].first));
+				json sample{{"reader_rip", rbuf}, {"capture_count", top_rips[i].second}};
+				for (const auto& n : nodes) {
+					if (n.reader_rip == top_rips[i].first) {
+						sample["module"] = n.module_name;
+						sample["disasm"] = n.disasm_text;
+						sample["node_read_count"] = n.read_count;
+						break;
+					}
+				}
+				top_reader_samples.push_back(std::move(sample));
+			}
+
+			const uint64_t total_reads = integrity_hunter::g_state.total_reads.load();
+			const bool stimulus_observed = total_reads != 0 || !events.empty();
 			json result;
 			result["count"] = nodes.size();
-			result["total_reads"] = integrity_hunter::g_state.total_reads.load();
+			result["total_reads"] = total_reads;
+			result["capture_event_count"] = events.size();
+			result["read_capture_count"] = events.size();
+			result["unique_reader_count"] = rip_counts.size();
+			result["node_threshold_min_reads"] = 2;
+			result["stimulus_observed"] = stimulus_observed;
+			result["stimulus_state"] = stimulus_observed ? (nodes.empty() ? "captures_below_node_threshold" : "captures_promoted_to_nodes") : "no_read_stimulus_captured";
+			if (!stimulus_observed)
+				result["no_stimulus_reason"] = "page guard installed but no read/access captures were observed during duration_ms";
+			if (stimulus_observed && nodes.empty())
+				result["node_suppression_reason"] = "captured readers did not reach the repeated-read threshold required for integrity nodes";
 			result["install_complete"] = integrity_hunter::g_state.install_complete.load();
 			result["install_success"] = integrity_hunter::g_state.install_success.load();
 			result["worker_idle"] = idle;
 			result["target_address"] = addr_str;
 			result["target_size"] = size;
 			result["duration_ms"] = duration;
+			result["top_event_samples"] = std::move(event_samples);
+			result["top_reader_samples"] = std::move(top_reader_samples);
 			result["nodes"] = arr;
 			return tool_result_t::ok(result);
 		}
@@ -1682,6 +2082,9 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 		 {"functions_only", "boolean", "Return only function PDB symbols", false},
 		 {"max_functions", "number", "Maximum binary-map functions", false},
 		 {"max_globals", "number", "Maximum binary-map globals", false},
+		 {"max_imports", "number", "Maximum binary-map imports on fast summary", false},
+		 {"max_exports", "number", "Maximum binary-map exports on fast summary", false},
+		 {"fast_summary", "boolean", "Use cheap binary-map summary without xref generation", false},
 		 {"include_imports", "boolean", "Include imports in binary-map overview", false},
 		 {"include_exports", "boolean", "Include exports in binary-map overview", false},
 		 {"include_xrefs", "boolean", "Include xref summaries in binary-map overview", false}},

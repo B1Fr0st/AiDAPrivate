@@ -3821,24 +3821,47 @@ NTSTATUS functions::handle_net_dns_get(p_net_dns_get request) {
     KeAcquireSpinLock(&net_capture::g_dns_lock, &old_irql);
 
     UINT32 available = (UINT32)net_capture::g_dns_count;
+    LONG head_snapshot = net_capture::g_dns_head;
+    LONG tail_snapshot = net_capture::g_dns_tail;
+    UINT32 scanned = 0;
+    UINT32 matched = 0;
+    LONG first_slot = -1;
+    LONG last_slot = -1;
 
     UINT32 out_idx = 0;
-    LONG local_tail = net_capture::g_dns_tail;
-    LONG local_count = available;
-    for (UINT32 i = 0; i < (UINT32)local_count && out_idx < NET_DNS_GET_MAX; i++) {
-        NET_DNS_ENTRY* src = &net_capture::g_dns_ring[local_tail];
+    LONG local_idx = (head_snapshot + DNS_RING_SIZE - 1) % DNS_RING_SIZE;
+    for (UINT32 i = 0; i < available; i++) {
+        NET_DNS_ENTRY* src = &net_capture::g_dns_ring[local_idx];
+        scanned++;
 
         if (request->filter_pid == 0 || src->pid == request->filter_pid) {
-            strong::kmemcpy(&request->entries[out_idx], src, sizeof(NET_DNS_ENTRY));
-            out_idx++;
+            matched++;
+            if (out_idx < NET_DNS_GET_MAX) {
+                strong::kmemcpy(&request->entries[out_idx], src, sizeof(NET_DNS_ENTRY));
+                if (first_slot < 0) first_slot = local_idx;
+                last_slot = local_idx;
+                out_idx++;
+            }
         }
 
-        local_tail = (local_tail + 1) % DNS_RING_SIZE;
+        local_idx = (local_idx + DNS_RING_SIZE - 1) % DNS_RING_SIZE;
     }
 
     request->entry_count = out_idx;
 
     KeReleaseSpinLock(&net_capture::g_dns_lock, old_irql);
+
+    WW_LOG("handle_net_dns_get filter_pid=%u available=%u scanned=%u matched=%u returned=%u head=%ld tail=%ld newest_slot=%ld oldest_returned_slot=%ld total_dns=%ld",
+        request->filter_pid,
+        available,
+        scanned,
+        matched,
+        out_idx,
+        head_snapshot,
+        tail_snapshot,
+        first_slot,
+        last_slot,
+        net_capture::g_total_dns);
 
     return STATUS_SUCCESS;
 }
@@ -6939,6 +6962,12 @@ namespace net_intercept {
     inline volatile LONG g_held_count = 0;
     inline volatile LONG g_intercepting = 0;
     inline volatile LONG g_next_hold_id = 1;
+    inline volatile LONG g_reject_inactive = 0;
+    inline volatile LONG g_reject_pid = 0;
+    inline volatile LONG g_reject_port = 0;
+    inline volatile LONG g_reject_protocol = 0;
+    inline volatile LONG g_reject_full = 0;
+    inline volatile LONG g_reject_no_slot = 0;
     inline UINT32 g_filter_pid = 0;
     inline UINT32 g_filter_port = 0;
     inline UINT32 g_filter_protocol = 0;
@@ -6958,16 +6987,29 @@ namespace net_intercept {
                             const UINT8* src_addr, const UINT8* dst_addr,
                             UINT32 af, UINT32 pid,
                             const UINT8* payload, UINT32 payload_len) {
-        if (!g_intercepting) return FALSE;
-        if (g_filter_pid != 0 && pid != g_filter_pid) return FALSE;
-        if (g_filter_port != 0 && src_port != g_filter_port && dst_port != g_filter_port) return FALSE;
-        if (g_filter_protocol != 0 && protocol != g_filter_protocol) return FALSE;
+        if (!g_intercepting) {
+            _InterlockedIncrement(&g_reject_inactive);
+            return FALSE;
+        }
+        if (g_filter_pid != 0 && pid != g_filter_pid) {
+            _InterlockedIncrement(&g_reject_pid);
+            return FALSE;
+        }
+        if (g_filter_port != 0 && src_port != g_filter_port && dst_port != g_filter_port) {
+            _InterlockedIncrement(&g_reject_port);
+            return FALSE;
+        }
+        if (g_filter_protocol != 0 && protocol != g_filter_protocol) {
+            _InterlockedIncrement(&g_reject_protocol);
+            return FALSE;
+        }
 
         KIRQL irql;
         KeAcquireSpinLock(&g_intercept_lock, &irql);
 
         if (g_held_count >= INTERCEPT_MAX_HELD) {
             KeReleaseSpinLock(&g_intercept_lock, irql);
+            _InterlockedIncrement(&g_reject_full);
             return FALSE;
         }
 
@@ -6997,6 +7039,7 @@ namespace net_intercept {
         }
 
         KeReleaseSpinLock(&g_intercept_lock, irql);
+        _InterlockedIncrement(&g_reject_no_slot);
         return FALSE;
     }
 
@@ -7007,17 +7050,35 @@ namespace net_intercept {
         case 0: {
             if (request->filter_pid == 0 && request->filter_port == 0 &&
                 request->filter_protocol == 0) {
+                WW_LOG("net_intercept::handle op=0 rejected wildcard status=0x%08X held_count=%ld intercepting=%ld",
+                    (UINT32)STATUS_INVALID_PARAMETER,
+                    g_held_count,
+                    g_intercepting);
                 return STATUS_INVALID_PARAMETER;
             }
             g_filter_pid = request->filter_pid;
             g_filter_port = request->filter_port;
             g_filter_protocol = request->filter_protocol;
+            _InterlockedExchange(&g_reject_inactive, 0);
+            _InterlockedExchange(&g_reject_pid, 0);
+            _InterlockedExchange(&g_reject_port, 0);
+            _InterlockedExchange(&g_reject_protocol, 0);
+            _InterlockedExchange(&g_reject_full, 0);
+            _InterlockedExchange(&g_reject_no_slot, 0);
             _InterlockedExchange(&g_intercepting, 1);
             request->intercepting = 1;
             request->held_count = g_held_count;
+            WW_LOG("net_intercept::handle op=0 start filter_pid=%u filter_protocol=%u filter_port=%u held_count=%u intercepting=%u status=0x%08X",
+                request->filter_pid,
+                request->filter_protocol,
+                request->filter_port,
+                request->held_count,
+                request->intercepting,
+                (UINT32)STATUS_SUCCESS);
             return STATUS_SUCCESS;
         }
         case 1: {
+            LONG held_before = g_held_count;
             _InterlockedExchange(&g_intercepting, 0);
             g_filter_pid = 0;
             g_filter_port = 0;
@@ -7032,11 +7093,23 @@ namespace net_intercept {
             KeReleaseSpinLock(&g_intercept_lock, irql);
             request->intercepting = 0;
             request->held_count = 0;
+            WW_LOG("net_intercept::handle op=1 stop held_before=%ld held_after=%u intercepting=%u status=0x%08X rejects inactive=%ld pid=%ld port=%ld protocol=%ld full=%ld no_slot=%ld",
+                held_before,
+                request->held_count,
+                request->intercepting,
+                (UINT32)STATUS_SUCCESS,
+                g_reject_inactive,
+                g_reject_pid,
+                g_reject_port,
+                g_reject_protocol,
+                g_reject_full,
+                g_reject_no_slot);
             return STATUS_SUCCESS;
         }
         case 2: {
             KIRQL irql;
             KeAcquireSpinLock(&g_intercept_lock, &irql);
+            LONG held_before = g_held_count;
             request->held_count = 0;
             for (UINT32 i = 0; i < INTERCEPT_MAX_HELD; i++) {
                 if (g_held[i].hold_id != 0 && request->held_count < INTERCEPT_MAX_HELD) {
@@ -7047,6 +7120,20 @@ namespace net_intercept {
             }
             request->intercepting = g_intercepting;
             KeReleaseSpinLock(&g_intercept_lock, irql);
+            WW_LOG("net_intercept::handle op=2 list filter_pid=%u filter_protocol=%u filter_port=%u held_before=%ld output_count=%u intercepting=%u status=0x%08X rejects inactive=%ld pid=%ld port=%ld protocol=%ld full=%ld no_slot=%ld",
+                g_filter_pid,
+                g_filter_protocol,
+                g_filter_port,
+                held_before,
+                request->held_count,
+                request->intercepting,
+                (UINT32)STATUS_SUCCESS,
+                g_reject_inactive,
+                g_reject_pid,
+                g_reject_port,
+                g_reject_protocol,
+                g_reject_full,
+                g_reject_no_slot);
             return STATUS_SUCCESS;
         }
         case 3: {
@@ -7054,8 +7141,10 @@ namespace net_intercept {
             KeAcquireSpinLock(&g_intercept_lock, &irql);
             packet_inject_request inj = {};
             BOOLEAN do_inject = FALSE;
+            BOOLEAN found = FALSE;
             for (UINT32 i = 0; i < INTERCEPT_MAX_HELD; i++) {
                 if (g_held[i].hold_id == request->hold_id) {
+                    found = TRUE;
 
                     if (net_inject::g_inject_handle_v4 && g_held[i].payload_size > 0) {
                         inj.direction = g_held[i].direction;
@@ -7077,16 +7166,26 @@ namespace net_intercept {
             }
             request->held_count = g_held_count;
             KeReleaseSpinLock(&g_intercept_lock, irql);
+            NTSTATUS inject_status = STATUS_NOT_FOUND;
             if (do_inject) {
-                net_inject::inject_packet(&inj);
+                inject_status = net_inject::inject_packet(&inj);
             }
+            WW_LOG("net_intercept::handle op=3 forward hold_id=%llu found=%u injected=%u inject_status=0x%08X held_count=%u status=0x%08X",
+                (ULONGLONG)request->hold_id,
+                found ? 1u : 0u,
+                do_inject ? 1u : 0u,
+                (UINT32)inject_status,
+                request->held_count,
+                (UINT32)STATUS_SUCCESS);
             return STATUS_SUCCESS;
         }
         case 4: {
             KIRQL irql;
             KeAcquireSpinLock(&g_intercept_lock, &irql);
+            BOOLEAN found = FALSE;
             for (UINT32 i = 0; i < INTERCEPT_MAX_HELD; i++) {
                 if (g_held[i].hold_id == request->hold_id) {
+                    found = TRUE;
                     g_held[i].hold_id = 0;
                     strong::kmemset(&g_held[i], 0, sizeof(HELD_PACKET));
                     if (g_held_count > 0) g_held_count--;
@@ -7095,6 +7194,11 @@ namespace net_intercept {
             }
             request->held_count = g_held_count;
             KeReleaseSpinLock(&g_intercept_lock, irql);
+            WW_LOG("net_intercept::handle op=4 drop hold_id=%llu found=%u held_count=%u status=0x%08X",
+                (ULONGLONG)request->hold_id,
+                found ? 1u : 0u,
+                request->held_count,
+                (UINT32)STATUS_SUCCESS);
             return STATUS_SUCCESS;
         }
         case 5: {
@@ -7102,8 +7206,10 @@ namespace net_intercept {
             KeAcquireSpinLock(&g_intercept_lock, &irql);
             packet_inject_request inj = {};
             BOOLEAN do_inject = FALSE;
+            BOOLEAN found = FALSE;
             for (UINT32 i = 0; i < INTERCEPT_MAX_HELD; i++) {
                 if (g_held[i].hold_id == request->hold_id) {
+                    found = TRUE;
 
                     if (net_inject::g_inject_handle_v4 && request->modify_payload_size > 0 &&
                         request->modify_payload_size <= INTERCEPT_MAX_PAYLOAD) {
@@ -7126,12 +7232,26 @@ namespace net_intercept {
             }
             request->held_count = g_held_count;
             KeReleaseSpinLock(&g_intercept_lock, irql);
+            NTSTATUS inject_status = STATUS_NOT_FOUND;
             if (do_inject) {
-                net_inject::inject_packet(&inj);
+                inject_status = net_inject::inject_packet(&inj);
             }
+            WW_LOG("net_intercept::handle op=5 modify hold_id=%llu found=%u injected=%u inject_status=0x%08X modify_size=%u held_count=%u status=0x%08X",
+                (ULONGLONG)request->hold_id,
+                found ? 1u : 0u,
+                do_inject ? 1u : 0u,
+                (UINT32)inject_status,
+                request->modify_payload_size,
+                request->held_count,
+                (UINT32)STATUS_SUCCESS);
             return STATUS_SUCCESS;
         }
         default:
+            WW_LOG("net_intercept::handle invalid op=%u status=0x%08X held_count=%ld intercepting=%ld",
+                request->operation,
+                (UINT32)STATUS_INVALID_PARAMETER,
+                g_held_count,
+                g_intercepting);
             return STATUS_INVALID_PARAMETER;
         }
     }
@@ -7141,6 +7261,12 @@ namespace net_intercept {
         g_filter_pid = 0;
         g_filter_port = 0;
         g_filter_protocol = 0;
+        _InterlockedExchange(&g_reject_inactive, 0);
+        _InterlockedExchange(&g_reject_pid, 0);
+        _InterlockedExchange(&g_reject_port, 0);
+        _InterlockedExchange(&g_reject_protocol, 0);
+        _InterlockedExchange(&g_reject_full, 0);
+        _InterlockedExchange(&g_reject_no_slot, 0);
 
         KIRQL irql;
         KeAcquireSpinLock(&g_intercept_lock, &irql);

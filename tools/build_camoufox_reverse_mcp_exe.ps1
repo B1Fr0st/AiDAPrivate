@@ -125,6 +125,63 @@ function ConvertTo-CompactLogText {
     return "..." + $value.Substring($value.Length - $Limit)
 }
 
+function Stop-ProcessTreeAndWait {
+    param(
+        [System.Diagnostics.Process]$Process,
+        [int]$TimeoutMs = 15000
+    )
+    if ($null -eq $Process) {
+        return
+    }
+    try {
+        if (-not $Process.HasExited) {
+            $processIdToKill = $Process.Id
+            try {
+                & taskkill.exe /PID $processIdToKill /T /F *> $null
+            } catch {
+            }
+            try {
+                [void]$Process.WaitForExit($TimeoutMs)
+            } catch {
+            }
+            if (-not $Process.HasExited) {
+                try {
+                    $Process.Kill($true)
+                } catch {
+                    try { $Process.Kill() } catch {}
+                }
+                try {
+                    [void]$Process.WaitForExit($TimeoutMs)
+                } catch {
+                }
+            }
+        }
+    } finally {
+        try { $Process.Dispose() } catch {}
+    }
+}
+
+function Remove-FileWithRetry {
+    param(
+        [string]$Path,
+        [int]$Attempts = 20,
+        [int]$DelayMs = 500
+    )
+    $lastError = $null
+    for ($attempt = 0; $attempt -lt $Attempts; $attempt++) {
+        try {
+            Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+            return
+        } catch {
+            $lastError = $_
+            Start-Sleep -Milliseconds $DelayMs
+        }
+    }
+    if ($lastError) {
+        throw $lastError
+    }
+}
+
 function Add-McpJsonMessage {
     param(
         [System.Collections.ArrayList]$Messages,
@@ -361,7 +418,7 @@ function Invoke-FrozenMcpSmoke {
         throw "Frozen MCP smoke process failed to start."
     }
     if (-not $proc.WaitForExit(90000)) {
-        try { $proc.Kill() } catch {}
+        Stop-ProcessTreeAndWait -Process $proc -TimeoutMs 15000
         throw "Frozen MCP smoke timed out after 90000 ms."
     }
     $stdout = $proc.StandardOutput.ReadToEnd()
@@ -393,7 +450,7 @@ function Invoke-FrozenMcpSmoke {
         throw "Frozen MCP live smoke process failed to start."
     }
     if (-not $liveProc.WaitForExit(180000)) {
-        try { $liveProc.Kill() } catch {}
+        Stop-ProcessTreeAndWait -Process $liveProc -TimeoutMs 15000
         throw "Frozen MCP live smoke timed out after 180000 ms."
     }
     $liveStdout = $liveProc.StandardOutput.ReadToEnd()
@@ -436,7 +493,7 @@ if ([IO.File]::Exists($target) -and -not $Force) {
         exit 0
     } catch {
         Write-Warning "existing_frozen_mcp_contract_failed=$($_.Exception.Message)"
-        Remove-Item -LiteralPath $target -Force -ErrorAction Stop
+        Remove-FileWithRetry -Path $target
     }
 }
 

@@ -73,6 +73,7 @@ extern "C" {
 #include <set>
 #include <atomic>
 #include <exception>
+#include <functional>
 #include <cwchar>
 #include <cstring>
 #include <cstdint>
@@ -980,24 +981,6 @@ namespace aida_tracer {
     inline void set_peek_call_shape(UINT remove_flags, HWND filter_hwnd) {
         g_peek_remove_flags.store(remove_flags, std::memory_order_release);
         g_peek_filter_hwnd.store(reinterpret_cast<UINT_PTR>(filter_hwnd), std::memory_order_release);
-    }
-
-    inline DWORD queue_status_bits(DWORD queue_status) {
-        return static_cast<DWORD>(LOWORD(queue_status)) | static_cast<DWORD>(HIWORD(queue_status));
-    }
-
-    inline bool fileless_send_only_queue(DWORD queue_status) {
-        constexpr DWORD queued_mask = QS_INPUT | QS_POSTMESSAGE | QS_ALLPOSTMESSAGE | QS_HOTKEY | QS_TIMER | QS_PAINT;
-        DWORD bits = queue_status_bits(queue_status);
-        return (bits & QS_SENDMESSAGE) != 0 && (bits & queued_mask) == 0;
-    }
-
-    inline bool fileless_send_nonurgent_queue(DWORD queue_status) {
-        return fileless_send_only_queue(queue_status);
-    }
-
-    inline UINT fileless_peek_remove_flags() {
-        return static_cast<UINT>(PM_REMOVE | PM_QS_INPUT | PM_QS_POSTMESSAGE | PM_QS_PAINT);
     }
 
     inline bool should_log_fileless_input_message(UINT msg) {
@@ -2120,8 +2103,9 @@ __declspec(noinline) static DWORD seh_script_engine_initialize()
         GetCurrentProcessId(),
         GetCurrentThreadId(),
         static_cast<unsigned long long>(started));
+    bool ok = false;
     __try {
-        script_engine::initialize();
+        ok = script_engine::initialize();
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         startup_log_critical_fmt("seh_script_engine_initialize_exception code=0x%08X elapsed_ms=%llu last_err=%lu",
             GetExceptionCode(),
@@ -2129,15 +2113,100 @@ __declspec(noinline) static DWORD seh_script_engine_initialize()
             static_cast<unsigned long>(GetLastError()));
         return GetExceptionCode();
     }
-    startup_log_critical_fmt("seh_script_engine_initialize_exit elapsed_ms=%llu last_err=%lu",
+    startup_log_critical_fmt("seh_script_engine_initialize_exit ok=%d initialized=%d elapsed_ms=%llu last_err=%lu",
+        ok ? 1 : 0,
+        script_engine::is_initialized() ? 1 : 0,
         static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started),
         static_cast<unsigned long>(GetLastError()));
-    return 0;
+    return ok ? 0 : ERROR_NOT_READY;
 }
 
 static std::atomic<bool> g_authorized_features_initialized{false};
 static std::atomic<bool> g_authorized_features_posted{false};
 static std::atomic<bool> g_camoufox_prewarm_posted{false};
+static std::atomic<bool> g_script_engine_startup_init_posted{false};
+
+static void post_script_engine_startup_initialize()
+{
+    if (script_engine::is_initialized()) {
+        startup_log_critical_fmt("script_engine_startup_async_skip already_initialized=1 pid=%lu tid=%lu tick=%llu",
+            GetCurrentProcessId(),
+            GetCurrentThreadId(),
+            static_cast<unsigned long long>(GetTickCount64()));
+        return;
+    }
+
+    bool expected = false;
+    if (!g_script_engine_startup_init_posted.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        startup_log_critical_fmt("script_engine_startup_async_skip already_posted=1 initialized=%d pid=%lu tid=%lu tick=%llu",
+            script_engine::is_initialized() ? 1 : 0,
+            GetCurrentProcessId(),
+            GetCurrentThreadId(),
+            static_cast<unsigned long long>(GetTickCount64()));
+        return;
+    }
+
+    const uint64_t queued_at = static_cast<uint64_t>(GetTickCount64());
+    startup_log_critical_fmt("script_engine_startup_async_posting pid=%lu tid=%lu tick=%llu",
+        GetCurrentProcessId(),
+        GetCurrentThreadId(),
+        static_cast<unsigned long long>(queued_at));
+    std::function<void()> init_task = [queued_at]() {
+        const uint64_t started = static_cast<uint64_t>(GetTickCount64());
+        startup_log_critical_fmt("script_engine_startup_async_enter pid=%lu tid=%lu queued_ms=%llu tick=%llu",
+            GetCurrentProcessId(),
+            GetCurrentThreadId(),
+            static_cast<unsigned long long>(started - queued_at),
+            static_cast<unsigned long long>(started));
+        DWORD seh = seh_script_engine_initialize();
+        startup_log_critical_fmt("script_engine_startup_async_exit seh=0x%08X initialized=%d elapsed_ms=%llu last_err=%lu",
+            seh,
+            script_engine::is_initialized() ? 1 : 0,
+            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started),
+            static_cast<unsigned long>(GetLastError()));
+        if (seh != 0 && !script_engine::is_initialized())
+            g_script_engine_startup_init_posted.store(false, std::memory_order_release);
+    };
+
+    bool posted_service = false;
+    bool posted_work = false;
+    try {
+        posted_service = work_queue::post_service(init_task);
+        if (!posted_service)
+            posted_work = work_queue::post(init_task);
+        startup_log_critical_fmt("script_engine_startup_async_posted pid=%lu tid=%lu service=%d work=%d elapsed_ms=%llu",
+            GetCurrentProcessId(),
+            GetCurrentThreadId(),
+            posted_service ? 1 : 0,
+            posted_work ? 1 : 0,
+            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - queued_at));
+    } catch (const std::exception& e) {
+        g_script_engine_startup_init_posted.store(false, std::memory_order_release);
+        startup_log_critical_fmt("script_engine_startup_async_post_exception elapsed_ms=%llu what=%.160s",
+            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - queued_at),
+            e.what());
+    } catch (...) {
+        g_script_engine_startup_init_posted.store(false, std::memory_order_release);
+        startup_log_critical_fmt("script_engine_startup_async_post_exception elapsed_ms=%llu what=<unknown>",
+            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - queued_at));
+    }
+
+    if (!posted_service && !posted_work && !script_engine::is_initialized()) {
+        const uint64_t inline_started = static_cast<uint64_t>(GetTickCount64());
+        startup_log_critical_fmt("script_engine_startup_inline_fallback_enter pid=%lu tid=%lu queued_ms=%llu",
+            GetCurrentProcessId(),
+            GetCurrentThreadId(),
+            static_cast<unsigned long long>(inline_started - queued_at));
+        DWORD seh = seh_script_engine_initialize();
+        startup_log_critical_fmt("script_engine_startup_inline_fallback_exit seh=0x%08X initialized=%d elapsed_ms=%llu last_err=%lu",
+            seh,
+            script_engine::is_initialized() ? 1 : 0,
+            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - inline_started),
+            static_cast<unsigned long>(GetLastError()));
+        if (seh != 0 && !script_engine::is_initialized())
+            g_script_engine_startup_init_posted.store(false, std::memory_order_release);
+    }
+}
 
 static void run_authorized_feature_initializers(const char* source)
 {
@@ -2196,7 +2265,13 @@ static void run_authorized_feature_initializers(const char* source)
     ok = run("network_view_init", seh_network_view_initialize) && ok;
     ok = run("memory_scanner_init", seh_memory_scanner_initialize) && ok;
     ok = run("mitm_proxy_pre_init", seh_mitm_proxy_pre_initialize) && ok;
-    ok = run("script_engine_init", seh_script_engine_initialize) && ok;
+    startup_log_critical_fmt("authorized_feature_phase_async_post source=%s phase=script_engine_init pid=%lu tid=%lu tick=%llu",
+        source ? source : "unknown",
+        GetCurrentProcessId(),
+        GetCurrentThreadId(),
+        static_cast<unsigned long long>(GetTickCount64()));
+    diag::log_tagged_fmt("bg_init", "script_engine_init_async_start source=%s", source ? source : "unknown");
+    post_script_engine_startup_initialize();
     g_authorized_features_initialized.store(ok, std::memory_order_release);
     if (!ok)
         g_authorized_features_posted.store(false, std::memory_order_release);
@@ -3239,8 +3314,15 @@ int main(int, char**)
             run_step("mitm_proxy_pre_init_start", "mitm_proxy_pre_init", "mitm_proxy_pre_init_ok", 4,
                 []() { return seh_mitm_proxy_pre_initialize(); });
 
-            run_step("script_engine_init_start", "script_engine_init", "script_engine_init_ok", 5,
-                []() { return seh_script_engine_initialize(); });
+            startup_log_critical_fmt("bg_init_script_engine_async_pre phase=script_engine_init target_step=5 target_label=%s pid=%lu tid=%lu tick=%llu",
+                startup_bg_phase_label(5),
+                GetCurrentProcessId(),
+                GetCurrentThreadId(),
+                static_cast<unsigned long long>(GetTickCount64()));
+            diag::log_tagged("bg_init", "script_engine_init_async_start");
+            post_script_engine_startup_initialize();
+            startup_store_bg_step(5, "bg_init_worker", "script_engine_init_async_posted");
+            diag::log_tagged("bg_init", "script_engine_init_async_posted");
             g_authorized_features_initialized.store(true, std::memory_order_release);
             g_authorized_features_posted.store(true, std::memory_order_release);
         }
@@ -3490,26 +3572,11 @@ int main(int, char**)
         {
             aida_tracer::mark_render_phase("peek_message_call");
             DWORD queue_status_before = ::GetQueueStatus(QS_ALLINPUT);
-            const UINT peek_remove_flags = fileless_customer_launch ? aida_tracer::fileless_peek_remove_flags() : static_cast<UINT>(PM_REMOVE);
+            const UINT peek_remove_flags = static_cast<UINT>(PM_REMOVE);
             HWND peek_filter = nullptr;
             ::SetLastError(0);
             aida_tracer::set_peek_state(queue_status_before, 0);
             aida_tracer::set_peek_call_shape(peek_remove_flags, peek_filter);
-            if (fileless_customer_launch && aida_tracer::fileless_send_nonurgent_queue(queue_status_before)) {
-                uint64_t defer_count = aida_tracer::g_peek_fileless_send_only_defers.fetch_add(1, std::memory_order_acq_rel) + 1;
-                if (defer_count == 1 || (defer_count % 120ULL) == 0ULL) {
-                    diag::log_tagged_critical_fmt("msgpump",
-                        "fileless_send_nonurgent_deferred frame=%llu count=%llu qs=0x%08lX bits=0x%08lX flags=0x%08X hwnd=0x%llX tid=%lu",
-                        (unsigned long long)frame_number,
-                        (unsigned long long)defer_count,
-                        static_cast<unsigned long>(queue_status_before),
-                        static_cast<unsigned long>(aida_tracer::queue_status_bits(queue_status_before)),
-                        peek_remove_flags,
-                        (unsigned long long)reinterpret_cast<UINT_PTR>(peek_filter),
-                        GetCurrentThreadId());
-                }
-                break;
-            }
             uint64_t peek_start = static_cast<uint64_t>(GetTickCount64());
             aida_tracer::g_peek_call_count.fetch_add(1, std::memory_order_acq_rel);
             BOOL has_message = ::PeekMessage(&msg, peek_filter, 0U, 0U, peek_remove_flags);

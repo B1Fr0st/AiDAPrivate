@@ -8131,17 +8131,20 @@ namespace
             if (!check_obfuscated_valid() || settings->license_key.empty() || settings->license_session_token.empty())
                 continue;
 
-            if (test_all_features::is_running()) {
-                lic_log("heartbeat_full_test_running_no_defer");
+            const bool full_test_running = test_all_features::is_running();
+            if (full_test_running) {
+                lic_log("heartbeat_full_test_running_reduced_diagnostics");
             }
 
             const std::string nonce = generate_nonce();
             std::string error;
             json response;
             lic_log("heartbeat_calling");
-            lic_diag::dump_pe_self("pre_heartbeat_call");
-            lic_diag::dump_mitigation("pre_heartbeat_call");
-            lic_diag::thread_canary("pre_heartbeat_call");
+            if (!full_test_running) {
+                lic_diag::dump_pe_self("pre_heartbeat_call");
+                lic_diag::dump_mitigation("pre_heartbeat_call");
+                lic_diag::thread_canary("pre_heartbeat_call");
+            }
             std::string hb_session_token = select_heartbeat_session_token(*settings);
             const bool hb_ok = call_validation_endpoint(*settings, "heartbeat", settings->license_key,
                                           s_cached_hwid, hb_session_token,
@@ -8243,18 +8246,22 @@ namespace
             consecutive_failures = 0;
             cancel_silent_kill();
             lic_log("heartbeat_success_applying");
-            lic_diag::dump_pe_self("post_heartbeat_call");
-            lic_diag::dump_mitigation("post_heartbeat_call");
-            lic_diag::thread_canary("post_heartbeat_call");
+            if (!full_test_running) {
+                lic_diag::dump_pe_self("post_heartbeat_call");
+                lic_diag::dump_mitigation("post_heartbeat_call");
+                lic_diag::thread_canary("post_heartbeat_call");
+            }
             if (!apply_valid_response(*settings, settings->license_key, s_cached_hwid, response))
             {
                 lic_log("heartbeat_apply_response_failed");
                 enter_pending_activation(*settings, std::string("heartbeat_apply_failed"));
                 break;
             }
-            lic_diag::dump_pe_self("post_apply_valid_response");
-            lic_diag::dump_mitigation("post_apply_valid_response");
-            lic_diag::thread_canary("post_apply_valid_response");
+            if (!full_test_running) {
+                lic_diag::dump_pe_self("post_apply_valid_response");
+                lic_diag::dump_mitigation("post_apply_valid_response");
+                lic_diag::thread_canary("post_apply_valid_response");
+            }
             if (s_activation_completed_at_ms.load(std::memory_order_acquire) == 0)
                 mark_activation_completed();
             if (!s_arc_loaded.load(std::memory_order_acquire))
@@ -8294,8 +8301,19 @@ namespace
                 continue;
             }
 
-            if (test_all_features::is_running()) {
-                lic_log("srv_refresh_full_test_running_no_defer");
+            const bool full_test_running = test_all_features::is_running();
+            if (full_test_running) {
+                uint64_t cached_proof = 0;
+                uint64_t cached_age_ms = 0;
+                std::string cached_nonce;
+                if (load_driver_proof_cache(&cached_proof, &cached_nonce, &cached_age_ms) &&
+                    cached_proof != 0 &&
+                    cached_nonce == settings->license_server_nonce) {
+                    lic_log_fmt("srv_refresh_full_test_cached_proof age_ms=%llu",
+                        static_cast<unsigned long long>(cached_age_ms));
+                    continue;
+                }
+                lic_log("srv_refresh_full_test_running_cache_miss");
             }
 
             const bool driver_loaded = driver_bridge::is_loaded();

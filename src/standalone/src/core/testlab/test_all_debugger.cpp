@@ -124,6 +124,49 @@ static std::vector<uint32_t> attached_target_tids() {
     return result;
 }
 
+static std::vector<uint32_t> bounded_hardware_breakpoint_tids(std::size_t limit) {
+    std::vector<uint32_t> result;
+    auto candidates = attached_target_tids();
+    for (uint32_t tid : candidates) {
+        if (tid == 0)
+            continue;
+        bool seen = false;
+        for (uint32_t existing : result) {
+            if (existing == tid) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen)
+            result.push_back(tid);
+        if (result.size() >= limit)
+            break;
+    }
+    return result;
+}
+
+static bool select_hardware_breakpoint_tid(HANDLE hf, const char* tag, uint32_t& tid, driver_bridge::thread_context_t* out_ctx) {
+    auto candidates = attached_target_tids();
+    for (uint32_t candidate : candidates) {
+        driver_bridge::thread_context_t ctx{};
+        if (!driver_bridge::get_thread_context(candidate, ctx) || ctx.rip == 0 || ctx.rsp == 0)
+            continue;
+        tid = candidate;
+        debugger_engine::g_state.active_tid = candidate;
+        if (out_ctx)
+            *out_ctx = ctx;
+        log_msg(hf, tag, "selected hardware breakpoint thread tid=%u rip=0x%llX rsp=0x%llX dr7=0x%llX candidates=%zu",
+            static_cast<unsigned>(candidate),
+            static_cast<unsigned long long>(ctx.rip),
+            static_cast<unsigned long long>(ctx.rsp),
+            static_cast<unsigned long long>(ctx.dr7),
+            candidates.size());
+        return true;
+    }
+    log_msg(hf, tag, "FAIL -- no contextable target thread available for hardware breakpoint test (candidates=%zu)", candidates.size());
+    return false;
+}
+
 struct controlled_step_fixture_t {
     uint32_t tid = 0;
     uint32_t original_suspend_count = 0;
@@ -308,16 +351,15 @@ static void scrub_target_hardware_breakpoints(HANDLE hf, const char* reason) {
     debugger_engine::clear_all_breakpoints();
 
     const uint32_t pid = driver_bridge::attached_pid();
-    auto threads = driver_bridge::enumerate_threads();
+    auto tids = bounded_hardware_breakpoint_tids(2);
     int target_threads = 0;
     int clear_ok = 0;
     int clear_fail = 0;
 
-    for (const auto& t : threads) {
-        if (t.owner_pid != pid) continue;
+    for (uint32_t tid : tids) {
         ++target_threads;
         for (int slot = 0; slot < 4; ++slot) {
-            if (driver_bridge::clear_hardware_breakpoint(t.tid, slot))
+            if (driver_bridge::clear_hardware_breakpoint(tid, slot))
                 ++clear_ok;
             else
                 ++clear_fail;
@@ -336,17 +378,16 @@ static void scrub_target_hardware_breakpoints(HANDLE hf, const char* reason) {
 
 static bool verify_target_hardware_breakpoints_cleared(HANDLE hf, const char* reason) {
     const uint32_t pid = driver_bridge::attached_pid();
-    auto threads = driver_bridge::enumerate_threads();
+    auto tids = bounded_hardware_breakpoint_tids(2);
     int target_threads = 0;
     int context_ok = 0;
     int context_fail = 0;
     int enabled_residual = 0;
 
-    for (const auto& t : threads) {
-        if (t.owner_pid != pid) continue;
+    for (uint32_t tid : tids) {
         ++target_threads;
         driver_bridge::thread_context_t ctx{};
-        if (!driver_bridge::get_thread_context(t.tid, ctx)) {
+        if (!driver_bridge::get_thread_context(tid, ctx)) {
             ++context_fail;
             continue;
         }
@@ -356,7 +397,7 @@ static bool verify_target_hardware_breakpoints_cleared(HANDLE hf, const char* re
             log_msg(hf, "dbg_hwclr",
                 "RESIDUAL -- reason=%s tid=%u dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX",
                 reason ? reason : "unspecified",
-                static_cast<unsigned>(t.tid),
+                static_cast<unsigned>(tid),
                 static_cast<unsigned long long>(ctx.dr0),
                 static_cast<unsigned long long>(ctx.dr1),
                 static_cast<unsigned long long>(ctx.dr2),
@@ -391,6 +432,13 @@ static void test_add_remove_hw_bp_common(HANDLE hf,
 
     scrub_target_hardware_breakpoints(hf, tag);
 
+    uint32_t selected_tid = 0;
+    driver_bridge::thread_context_t selected_before{};
+    if (!select_hardware_breakpoint_tid(hf, tag, selected_tid, &selected_before)) {
+        failed.fetch_add(1);
+        return;
+    }
+
     uint64_t addr = alloc_target_bp_region(64);
     if (addr == 0) {
         log_msg(hf, tag, "FAIL -- alloc_target_bp_region returned 0 (no driver attach?)");
@@ -406,30 +454,49 @@ static void test_add_remove_hw_bp_common(HANDLE hf,
         (unsigned)driver_bridge::attached_pid());
 
     int idx = debugger_engine::add_breakpoint(addr, type, bp_name ? bp_name : "test_hw_bp", "", size);
+    int hw_slot = -1;
+    if (idx >= 0) {
+        std::lock_guard<std::mutex> lk(debugger_engine::g_state.bp_mutex);
+        if (idx < static_cast<int>(debugger_engine::g_state.breakpoints.size()))
+            hw_slot = debugger_engine::g_state.breakpoints[static_cast<std::size_t>(idx)].hw_slot;
+    }
+    driver_bridge::thread_context_t armed_ctx{};
+    bool armed_ctx_ok = selected_tid != 0 && driver_bridge::get_thread_context(selected_tid, armed_ctx);
+    bool armed = armed_ctx_ok && hw_slot >= 0 && hw_slot < 4 && ((armed_ctx.dr7 & (1ULL << (hw_slot * 2))) != 0);
     bool removed = false;
     if (idx >= 0)
         removed = debugger_engine::remove_breakpoint(idx);
 
-    scrub_target_hardware_breakpoints(hf, tag);
-    bool regs_clear = verify_target_hardware_breakpoints_cleared(hf, tag);
+    driver_bridge::thread_context_t clear_ctx{};
+    bool clear_ctx_ok = selected_tid != 0 && driver_bridge::get_thread_context(selected_tid, clear_ctx);
+    bool regs_clear = clear_ctx_ok && (hw_slot < 0 || (clear_ctx.dr7 & (1ULL << (hw_slot * 2))) == 0);
+    if (!regs_clear)
+        scrub_target_hardware_breakpoints(hf, tag);
     bool freed = driver_bridge::free_memory(addr);
 
     diag::log_tagged_fmt("test_dbg_detail",
-        "%s result: private_target_addr=0x%llX add_breakpoint=>idx=%d remove_breakpoint=>%d regs_clear=>%d free=>%d",
+        "%s result: private_target_addr=0x%llX selected_tid=%u add_breakpoint=>idx=%d hw_slot=%d armed=>%d remove_breakpoint=>%d regs_clear=>%d free=>%d before_dr7=0x%llX armed_dr7=0x%llX clear_dr7=0x%llX",
         tag,
         (unsigned long long)addr,
+        static_cast<unsigned>(selected_tid),
         idx,
+        hw_slot,
+        (int)armed,
         (int)removed,
         (int)regs_clear,
-        (int)freed);
+        (int)freed,
+        static_cast<unsigned long long>(selected_before.dr7),
+        static_cast<unsigned long long>(armed_ctx.dr7),
+        static_cast<unsigned long long>(clear_ctx.dr7));
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    if (idx >= 0 && removed && regs_clear && freed) {
-        log_msg(hf, tag, "PASS -- %s idx=%d, removed ok (elapsed %lld ms)", label, idx, (long long)ms);
+    if (idx >= 0 && hw_slot >= 0 && armed && removed && regs_clear && freed) {
+        log_msg(hf, tag, "PASS -- %s idx=%d slot=%d tid=%u armed and removed ok (elapsed %lld ms)",
+            label, idx, hw_slot, static_cast<unsigned>(selected_tid), (long long)ms);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, tag, "FAIL -- idx=%d (<0 means add failed) removed=%d regs_clear=%d free=%d (elapsed %lld ms)",
-            idx, (int)removed, (int)regs_clear, (int)freed, (long long)ms);
+        log_msg(hf, tag, "FAIL -- idx=%d hw_slot=%d armed=%d armed_ctx=%d removed=%d clear_ctx=%d regs_clear=%d free=%d (elapsed %lld ms)",
+            idx, hw_slot, (int)armed, (int)armed_ctx_ok, (int)removed, (int)clear_ctx_ok, (int)regs_clear, (int)freed, (long long)ms);
         failed.fetch_add(1);
     }
 }

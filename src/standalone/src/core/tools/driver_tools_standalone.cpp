@@ -6237,7 +6237,15 @@ tool_result_t driver_sniff_network_buffers(const json& params)
         if (op == "stop") {
             if (!device->sniff_net_buffers_stop())
                 return tool_result_t::error(OBFSTR("Failed to stop sniff session"));
-            return tool_result_t::ok(OBFSTR("Sniff session stopped"), json::object());
+            bool active = false;
+            auto captures = device->sniff_net_buffers_get(active);
+            json result;
+            result["operation"] = "stop";
+            result["stopped"] = true;
+            result["active"] = active;
+            result["capture_count"] = captures.size();
+            result["driver_error"] = driver_bridge::last_error();
+            return tool_result_t::ok(OBFSTR("Sniff session stopped"), result);
         }
         if (op == "get" || op == "results") {
             bool active = false;

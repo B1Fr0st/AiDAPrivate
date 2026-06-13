@@ -1214,6 +1214,41 @@ namespace
     std::atomic<bool> g_event_poller_started{false};
     std::atomic<bool> g_event_poller_stop{false};
     std::atomic<uint64_t> g_event_poller_epoch{0};
+    std::atomic<uint64_t> g_tctx_kernel_bypass_until_ms{0};
+    std::atomic<uint32_t> g_tctx_kernel_failures{0};
+    constexpr uint64_t kTctxKernelBypassMs = 120000;
+    constexpr uint64_t kTctxSlowFailureMs = 250;
+
+    bool tctx_kernel_bypass_active()
+    {
+        const uint64_t until = g_tctx_kernel_bypass_until_ms.load(std::memory_order_acquire);
+        return until != 0 && static_cast<uint64_t>(GetTickCount64()) < until;
+    }
+
+    void note_tctx_kernel_success()
+    {
+        g_tctx_kernel_failures.store(0, std::memory_order_release);
+    }
+
+    void note_tctx_kernel_failure(const char* op, DWORD gle, uint64_t elapsed_ms)
+    {
+        const uint32_t failures = g_tctx_kernel_failures.fetch_add(1, std::memory_order_acq_rel) + 1;
+        const bool proven_unavailable = gle == ERROR_PROC_NOT_FOUND || gle == ERROR_INVALID_FUNCTION || gle == ERROR_CALL_NOT_IMPLEMENTED;
+        if (proven_unavailable || elapsed_ms >= kTctxSlowFailureMs || failures >= 2) {
+            const uint64_t now = static_cast<uint64_t>(GetTickCount64());
+            const uint64_t until = now + kTctxKernelBypassMs;
+            const uint64_t previous = g_tctx_kernel_bypass_until_ms.exchange(until, std::memory_order_acq_rel);
+            if (previous < now) {
+                diag::log_tagged_fmt("driver",
+                    "tctx_kernel_bypass_armed op=%s gle=%lu elapsed_ms=%llu failures=%u bypass_ms=%llu",
+                    op ? op : "tctx",
+                    static_cast<unsigned long>(gle),
+                    static_cast<unsigned long long>(elapsed_ms),
+                    failures,
+                    static_cast<unsigned long long>(kTctxKernelBypassMs));
+            }
+        }
+    }
     constexpr int kEventPollerPeriodMs = 250;
     constexpr size_t kEventPollerDrainBatch = 64;
 
@@ -2554,39 +2589,65 @@ namespace driver_bridge
         std::vector<memory_region_t> result;
         HANDLE process = nullptr;
         bool kernel_mode = false;
+        bool kernel_attached = false;
+        uint32_t pid = 0;
         {
             std::lock_guard<std::mutex> lk(g_state_mtx);
             process = g_process;
             kernel_mode = g_kernel_mode && device && device->is_connected();
+            kernel_attached = g_kernel_attached;
+            pid = g_pid;
         }
 
         if (kernel_mode) {
             {
                 struct enum_ctx { std::vector<memory_region_t>* out; size_t max; };
-                enum_ctx ctx{&result, max_regions};
                 uint32_t arc_count = 0;
-                const bool arc_ok = arc_bridge_enumerate_memory_regions(
-                    [](const arc_comm_vtable_t::memory_region_info_t* info, void* user) {
-                        auto* c = static_cast<enum_ctx*>(user);
-                        if (c->out->size() >= c->max) return;
-                        memory_region_t region;
-                        region.base    = info->base;
-                        region.size    = info->size;
-                        region.state   = info->state;
-                        region.protect = info->protect;
-                        region.type    = info->type;
-                        c->out->push_back(region);
-                    },
-                    &ctx,
-                    &arc_count);
-                if (arc_ok) {
+                uint32_t retry_count = 0;
+                bool arc_ok = false;
+                auto run_arc_enum = [&](const char* phase) {
+                    result.clear();
+                    arc_count = 0;
+                    enum_ctx ctx{&result, max_regions};
+                    const bool ok = arc_bridge_enumerate_memory_regions(
+                        [](const arc_comm_vtable_t::memory_region_info_t* info, void* user) {
+                            auto* c = static_cast<enum_ctx*>(user);
+                            if (c->out->size() >= c->max) return;
+                            memory_region_t region;
+                            region.base    = info->base;
+                            region.size    = info->size;
+                            region.state   = info->state;
+                            region.protect = info->protect;
+                            region.type    = info->type;
+                            c->out->push_back(region);
+                        },
+                        &ctx,
+                        &arc_count);
                     diag::log_tagged_fmt("driver",
-                        "enumerate_memory_regions_arc_bridge max=%zu count=%u result=%zu",
+                        "enumerate_memory_regions_arc_bridge phase=%s pid=%u max=%zu arc_ok=%d arc_count=%u result=%zu kernel_attached=%d dtb=0x%llX",
+                        phase,
+                        pid,
                         max_regions,
+                        ok ? 1 : 0,
                         arc_count,
-                        result.size());
-                } else {
+                        result.size(),
+                        kernel_attached ? 1 : 0,
+                        static_cast<unsigned long long>((device && device->is_connected()) ? device->get_dtb() : 0));
+                    return ok;
+                };
+                auto run_direct_enum = [&](const char* reason, DWORD& gle_out, size_t& raw_count_out) {
+                    result.clear();
+                    raw_count_out = 0;
+                    gle_out = ERROR_SUCCESS;
+                    if (!device) {
+                        gle_out = ERROR_DEVICE_NOT_CONNECTED;
+                        SetLastError(gle_out);
+                        return;
+                    }
+                    SetLastError(ERROR_SUCCESS);
                     const auto regions = device->enumerate_memory_regions(0, 0, false);
+                    gle_out = GetLastError();
+                    raw_count_out = regions.size();
                     for (const auto& src : regions) {
                         memory_region_t region;
                         region.base = src.base;
@@ -2598,7 +2659,44 @@ namespace driver_bridge
                         if (result.size() >= max_regions)
                             break;
                     }
+                    diag::log_tagged_fmt("driver",
+                        "enumerate_memory_regions_direct reason=%s pid=%u max=%zu raw_count=%zu copied=%zu gle=%lu kernel_attached=%d dtb=0x%llX",
+                        reason,
+                        pid,
+                        max_regions,
+                        raw_count_out,
+                        result.size(),
+                        static_cast<unsigned long>(gle_out),
+                        kernel_attached ? 1 : 0,
+                        static_cast<unsigned long long>((device && device->is_connected()) ? device->get_dtb() : 0));
+                };
+                arc_ok = run_arc_enum("initial");
+                while (arc_ok && result.empty() && pid != 0 && max_regions != 0 && retry_count < 2) {
+                    ++retry_count;
+                    Sleep(35);
+                    char phase[32];
+                    std::snprintf(phase, sizeof(phase), "retry%u", retry_count);
+                    arc_ok = run_arc_enum(phase);
                 }
+                DWORD fallback_gle = ERROR_SUCCESS;
+                size_t fallback_raw_count = 0;
+                bool used_fallback = false;
+                if (!arc_ok || (pid != 0 && max_regions != 0 && result.empty())) {
+                    used_fallback = true;
+                    run_direct_enum(arc_ok ? "arc_zero_regions" : "arc_failed", fallback_gle, fallback_raw_count);
+                }
+                diag::log_tagged_fmt("driver",
+                    "enumerate_memory_regions_summary pid=%u max=%zu arc_ok=%d arc_count=%u retries=%u used_fallback=%d fallback_raw_count=%zu fallback_result=%zu fallback_gle=%lu final_count=%zu",
+                    pid,
+                    max_regions,
+                    arc_ok ? 1 : 0,
+                    arc_count,
+                    retry_count,
+                    used_fallback ? 1 : 0,
+                    fallback_raw_count,
+                    used_fallback ? result.size() : 0,
+                    static_cast<unsigned long>(fallback_gle),
+                    result.size());
             }
             return result;
         }
@@ -3234,23 +3332,28 @@ namespace driver_bridge
             std::lock_guard<std::mutex> lk(g_state_mtx);
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
-        if (!kernel_mode) {
+        if (!kernel_mode || tctx_kernel_bypass_active()) {
             return usermode_get_thread_context(tid, ctx, "get_thread_context.no_kernel");
         }
 
         voyager::device_t::thread_context kctx{};
+        const uint64_t kernel_t0 = static_cast<uint64_t>(GetTickCount64());
         if (!device->get_thread_context(tid, kctx)) {
             DWORD gle = GetLastError();
+            const uint64_t elapsed_ms = static_cast<uint64_t>(GetTickCount64()) - kernel_t0;
+            note_tctx_kernel_failure("get_thread_context", gle, elapsed_ms);
             diag::log_tagged_fmt("driver",
-                "get_thread_context_kernel_failed tid=%u gle=%lu attached_pid=%u fallback=user",
+                "get_thread_context_kernel_failed tid=%u gle=%lu attached_pid=%u elapsed_ms=%llu fallback=user",
                 tid,
                 gle,
-                attached_pid());
+                attached_pid(),
+                static_cast<unsigned long long>(elapsed_ms));
             if (usermode_get_thread_context(tid, ctx, "get_thread_context.kernel_failed"))
                 return true;
             SetLastError(gle);
             return false;
         }
+        note_tctx_kernel_success();
 
         ctx.rax = kctx.rax;  ctx.rbx = kctx.rbx;  ctx.rcx = kctx.rcx;  ctx.rdx = kctx.rdx;
         ctx.rsi = kctx.rsi;  ctx.rdi = kctx.rdi;  ctx.rbp = kctx.rbp;  ctx.rsp = kctx.rsp;
@@ -3286,7 +3389,7 @@ namespace driver_bridge
             std::lock_guard<std::mutex> lk(g_state_mtx);
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
-        if (!kernel_mode) {
+        if (!kernel_mode || tctx_kernel_bypass_active()) {
             return usermode_set_thread_context(tid, ctx, register_mask, "set_thread_context.no_kernel");
         }
 
@@ -3299,22 +3402,27 @@ namespace driver_bridge
         kctx.cs  = ctx.cs;   kctx.ss  = ctx.ss;
         kctx.dr0 = ctx.dr0;  kctx.dr1 = ctx.dr1;  kctx.dr2 = ctx.dr2;  kctx.dr3 = ctx.dr3;
         kctx.dr6 = ctx.dr6;  kctx.dr7 = ctx.dr7;
+        const uint64_t kernel_t0 = static_cast<uint64_t>(GetTickCount64());
         bool ok = device->set_thread_context(tid, kctx, register_mask);
         if (!ok) {
             DWORD gle = GetLastError();
+            const uint64_t elapsed_ms = static_cast<uint64_t>(GetTickCount64()) - kernel_t0;
+            note_tctx_kernel_failure("set_thread_context", gle, elapsed_ms);
             diag::log_tagged_fmt("driver",
-                "set_thread_context_KERNEL_FAILED tid=%u mask=0x%llX rip=0x%llX rsp=0x%llX attached_pid=%u kernel_mode=%d gle=%lu fallback=user",
+                "set_thread_context_KERNEL_FAILED tid=%u mask=0x%llX rip=0x%llX rsp=0x%llX attached_pid=%u kernel_mode=%d gle=%lu elapsed_ms=%llu fallback=user",
                 tid,
                 static_cast<unsigned long long>(register_mask),
                 static_cast<unsigned long long>(ctx.rip),
                 static_cast<unsigned long long>(ctx.rsp),
                 attached_pid(),
                 kernel_mode ? 1 : 0,
-                gle);
+                gle,
+                static_cast<unsigned long long>(elapsed_ms));
             if (usermode_set_thread_context(tid, ctx, register_mask, "set_thread_context.kernel_failed"))
                 return true;
             SetLastError(gle);
         } else {
+            note_tctx_kernel_success();
             diag::log_tagged_fmt("driver",
                 "set_thread_context_kernel_ok tid=%u mask=0x%llX rip=0x%llX rsp=0x%llX dr7=0x%llX",
                 tid,
@@ -3840,24 +3948,30 @@ namespace driver_bridge
             std::lock_guard<std::mutex> lk(g_state_mtx);
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
-        if (!kernel_mode) {
+        if (!kernel_mode || tctx_kernel_bypass_active()) {
             return usermode_set_hardware_breakpoint(tid, index, address, type, size);
         }
 
+        const uint64_t kernel_t0 = static_cast<uint64_t>(GetTickCount64());
         bool ok = device->set_hardware_breakpoint(tid, index, address, type, size);
         if (!ok) {
             DWORD gle = GetLastError();
+            const uint64_t elapsed_ms = static_cast<uint64_t>(GetTickCount64()) - kernel_t0;
+            note_tctx_kernel_failure("set_hardware_breakpoint", gle, elapsed_ms);
             diag::log_tagged_fmt("driver",
-                "set_hardware_breakpoint_kernel_failed tid=%u index=%d addr=0x%llX type=%d size=%d gle=%lu fallback=user",
+                "set_hardware_breakpoint_kernel_failed tid=%u index=%d addr=0x%llX type=%d size=%d gle=%lu elapsed_ms=%llu fallback=user",
                 tid,
                 index,
                 static_cast<unsigned long long>(address),
                 type,
                 size,
-                gle);
+                gle,
+                static_cast<unsigned long long>(elapsed_ms));
             if (usermode_set_hardware_breakpoint(tid, index, address, type, size))
                 return true;
             SetLastError(gle);
+        } else {
+            note_tctx_kernel_success();
         }
         return ok;
     }
@@ -3869,21 +3983,27 @@ namespace driver_bridge
             std::lock_guard<std::mutex> lk(g_state_mtx);
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
-        if (!kernel_mode) {
+        if (!kernel_mode || tctx_kernel_bypass_active()) {
             return usermode_clear_hardware_breakpoint(tid, index);
         }
 
+        const uint64_t kernel_t0 = static_cast<uint64_t>(GetTickCount64());
         bool ok = device->clear_hardware_breakpoint(tid, index);
         if (!ok) {
             DWORD gle = GetLastError();
+            const uint64_t elapsed_ms = static_cast<uint64_t>(GetTickCount64()) - kernel_t0;
+            note_tctx_kernel_failure("clear_hardware_breakpoint", gle, elapsed_ms);
             diag::log_tagged_fmt("driver",
-                "clear_hardware_breakpoint_kernel_failed tid=%u index=%d gle=%lu fallback=user",
+                "clear_hardware_breakpoint_kernel_failed tid=%u index=%d gle=%lu elapsed_ms=%llu fallback=user",
                 tid,
                 index,
-                gle);
+                gle,
+                static_cast<unsigned long long>(elapsed_ms));
             if (usermode_clear_hardware_breakpoint(tid, index))
                 return true;
             SetLastError(gle);
+        } else {
+            note_tctx_kernel_success();
         }
         return ok;
     }

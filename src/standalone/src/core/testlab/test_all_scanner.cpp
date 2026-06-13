@@ -2370,30 +2370,141 @@ static void test_write_value(HANDLE hf, std::atomic<int>& passed, std::atomic<in
         return;
     }
 
+    size_t list_before_cleanup = 0;
+    bool scratch_listed_before = false;
+    bool scratch_frozen_before = false;
+    size_t scratch_index = 0;
+    {
+        std::lock_guard<std::mutex> lk(memory_scanner::g_state.address_mutex);
+        list_before_cleanup = memory_scanner::g_state.address_list.size();
+        for (size_t i = 0; i < memory_scanner::g_state.address_list.size(); ++i) {
+            const auto& e = memory_scanner::g_state.address_list[i];
+            if (e.address == g_anchor.addr_scratch) {
+                scratch_listed_before = true;
+                scratch_frozen_before = e.frozen;
+                scratch_index = i;
+                break;
+            }
+        }
+    }
+    log_msg(hf, "scan_wrv", "PRECHECK address_list_count=%zu scratch_listed=%d scratch_frozen=%d scratch_index=%zu scratch_addr=0x%llX",
+        list_before_cleanup,
+        static_cast<int>(scratch_listed_before),
+        static_cast<int>(scratch_frozen_before),
+        scratch_index,
+        (unsigned long long)g_anchor.addr_scratch);
+    if (scratch_listed_before) {
+        if (scratch_frozen_before)
+            memory_scanner::freeze_address(scratch_index, false);
+        memory_scanner::remove_address(scratch_index);
+        Sleep(80);
+    }
+    size_t list_after_cleanup = 0;
+    bool scratch_listed_after = false;
+    bool scratch_frozen_after = false;
+    {
+        std::lock_guard<std::mutex> lk(memory_scanner::g_state.address_mutex);
+        list_after_cleanup = memory_scanner::g_state.address_list.size();
+        for (const auto& e : memory_scanner::g_state.address_list) {
+            if (e.address == g_anchor.addr_scratch) {
+                scratch_listed_after = true;
+                scratch_frozen_after = e.frozen;
+                break;
+            }
+        }
+    }
+    log_msg(hf, "scan_wrv", "FREEZE_CLEANUP removed=%d was_frozen=%d address_list_before=%zu after=%zu scratch_still_listed=%d scratch_still_frozen=%d",
+        static_cast<int>(scratch_listed_before),
+        static_cast<int>(scratch_frozen_before),
+        list_before_cleanup,
+        list_after_cleanup,
+        static_cast<int>(scratch_listed_after),
+        static_cast<int>(scratch_frozen_after));
+    if (scratch_frozen_after) {
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        log_msg(hf, "scan_wrv", "FAIL -- scratch address still frozen after cleanup (elapsed %lld ms)", (long long)ms);
+        failed.fetch_add(1);
+        return;
+    }
+
+    uint64_t write_addr = driver_bridge::allocate_memory(0x1000);
+    if (write_addr == 0) {
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        log_msg(hf, "scan_wrv", "FAIL -- allocate_memory for isolated write_value page returned 0 (elapsed %lld ms)", (long long)ms);
+        failed.fetch_add(1);
+        return;
+    }
+
+    size_t list_before_write = 0;
+    bool write_addr_listed = false;
+    bool write_addr_frozen = false;
+    {
+        std::lock_guard<std::mutex> lk(memory_scanner::g_state.address_mutex);
+        list_before_write = memory_scanner::g_state.address_list.size();
+        for (const auto& e : memory_scanner::g_state.address_list) {
+            if (e.address == write_addr) {
+                write_addr_listed = true;
+                write_addr_frozen = e.frozen;
+                break;
+            }
+        }
+    }
+
+    int32_t baseline_val = 0x13572468;
+    std::vector<uint8_t> baseline_bytes(reinterpret_cast<uint8_t*>(&baseline_val),
+        reinterpret_cast<uint8_t*>(&baseline_val) + sizeof(baseline_val));
+    bool baseline_write_ok = driver_bridge::write_memory(write_addr, baseline_bytes);
+    std::vector<uint8_t> baseline_rb;
+    bool baseline_read_ok = driver_bridge::read_memory(write_addr, 4, baseline_rb);
+    int32_t baseline_got = 0;
+    if (baseline_rb.size() >= 4) std::memcpy(&baseline_got, baseline_rb.data(), 4);
+
     int32_t target_val = 0x2468ACE0;
     char text[32];
     std::snprintf(text, sizeof(text), "%d", target_val);
-    log_msg(hf, "scan_wrv", "INPUT write_value addr=0x%llX type=Int32 value='%s'",
-        (unsigned long long)g_anchor.addr_scratch, text);
+    log_msg(hf, "scan_wrv", "INPUT write_value addr=0x%llX type=Int32 value='%s' address_list_count=%zu addr_listed=%d addr_frozen=%d baseline_write_ok=%d baseline_read_ok=%d baseline=0x%08X read=0x%08X",
+        (unsigned long long)write_addr,
+        text,
+        list_before_write,
+        static_cast<int>(write_addr_listed),
+        static_cast<int>(write_addr_frozen),
+        static_cast<int>(baseline_write_ok),
+        static_cast<int>(baseline_read_ok),
+        static_cast<unsigned>(baseline_val),
+        static_cast<unsigned>(baseline_got));
 
-    memory_scanner::write_value(g_anchor.addr_scratch, memory_scanner::value_type_t::int32_val, text, false);
+    memory_scanner::write_value(write_addr, memory_scanner::value_type_t::int32_val, text, false);
 
     std::vector<uint8_t> rb;
-    bool read_ok = driver_bridge::read_memory(g_anchor.addr_scratch, 4, rb);
+    bool read_ok = driver_bridge::read_memory(write_addr, 4, rb);
     int32_t got = 0;
     if (rb.size() >= 4) std::memcpy(&got, rb.data(), 4);
 
+    bool freed = driver_bridge::free_memory(write_addr);
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "scan_wrv", "RESULT read_ok=%d wrote=%d read=%d",
-        static_cast<int>(read_ok), target_val, got);
+    log_msg(hf, "scan_wrv", "RESULT read_ok=%d wrote=%d read=%d baseline_write_ok=%d baseline_read_ok=%d baseline_read=%d freed=%d elapsed_ms=%lld",
+        static_cast<int>(read_ok),
+        target_val,
+        got,
+        static_cast<int>(baseline_write_ok),
+        static_cast<int>(baseline_read_ok),
+        baseline_got,
+        static_cast<int>(freed),
+        (long long)ms);
 
-    if (read_ok && got == target_val) {
-        log_msg(hf, "scan_wrv", "PASS -- write_value wrote 0x%08X and read back identical (elapsed %lld ms)",
-            static_cast<unsigned>(target_val), (long long)ms);
+    if (baseline_write_ok && baseline_read_ok && baseline_got == baseline_val && read_ok && got == target_val && freed) {
+        log_msg(hf, "scan_wrv", "PASS -- isolated write_value wrote 0x%08X and read back identical after baseline 0x%08X (elapsed %lld ms)",
+            static_cast<unsigned>(target_val), static_cast<unsigned>(baseline_val), (long long)ms);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "scan_wrv", "FAIL -- write_value mismatch (wrote 0x%08X read 0x%08X read_ok=%d) (elapsed %lld ms)",
-            static_cast<unsigned>(target_val), static_cast<unsigned>(got), static_cast<int>(read_ok), (long long)ms);
+        log_msg(hf, "scan_wrv", "FAIL -- isolated write_value mismatch (baseline_ok=%d/%d wrote 0x%08X read 0x%08X read_ok=%d freed=%d) (elapsed %lld ms)",
+            static_cast<int>(baseline_write_ok),
+            static_cast<int>(baseline_read_ok && baseline_got == baseline_val),
+            static_cast<unsigned>(target_val),
+            static_cast<unsigned>(got),
+            static_cast<int>(read_ok),
+            static_cast<int>(freed),
+            (long long)ms);
         failed.fetch_add(1);
     }
 }

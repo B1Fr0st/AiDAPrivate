@@ -21,6 +21,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cctype>
 #include <cstdio>
@@ -2260,6 +2261,109 @@ inline std::string irp_name(std::uint32_t code)
     return code < names.size() ? names[code] : "IRP_MJ_UNKNOWN";
 }
 
+inline json target_module_json(const target_module_t& mod)
+{
+    return json{{"name", mod.name},
+                {"path", mod.path},
+                {"base", sa_format_address(mod.base)},
+                {"size", mod.size},
+                {"end", sa_format_address(mod.base + mod.size)},
+                {"kernel", mod.kernel}};
+}
+
+inline json mapped_section_json(const mapped_section_t& sec)
+{
+    return json{{"name", sec.name},
+                {"va", sa_format_address(sec.va)},
+                {"virtual_size", sec.virtual_size},
+                {"raw_size", sec.raw_size},
+                {"characteristics", sa_format_address(sec.characteristics)},
+                {"executable", executable_characteristics(sec.characteristics)}};
+}
+
+inline const mapped_section_t* section_for_absolute_va(const pe_layout_t& pe, std::uint64_t va)
+{
+    for (const auto& sec : pe.sections) {
+        const std::uint64_t size = std::max<std::uint64_t>(sec.virtual_size, sec.raw_size);
+        if (size && va >= sec.va && va < sec.va + size)
+            return &sec;
+    }
+    return nullptr;
+}
+
+inline json section_evidence_for_va(const pe_layout_t& pe, std::uint64_t va)
+{
+    const mapped_section_t* sec = section_for_absolute_va(pe, va);
+    if (!sec)
+        return json{{"found", false}};
+    json out = mapped_section_json(*sec);
+    out["found"] = true;
+    out["rva"] = va >= pe.base ? json(sa_format_address(va - pe.base)) : json(nullptr);
+    out["offset"] = sa_format_address(va - sec->va);
+    return out;
+}
+
+inline json memory_protection_evidence(std::uint32_t pid, std::uint64_t va)
+{
+    if (va == 0)
+        return json{{"queried", false}, {"reason", "zero_address"}};
+    if (is_kernel_address(va))
+        return json{{"queried", false}, {"reason", "kernel_address_not_queryable_from_user_mode"}, {"protect", "unknown"}};
+    driver_bridge::memory_region_t region{};
+    if (!driver_bridge::query_memory_for(pid, va, region))
+        return json{{"queried", false}, {"reason", "query_failed"}, {"protect", "unknown"}};
+    return json{{"queried", true},
+                {"base", sa_format_address(region.base)},
+                {"size", region.size},
+                {"state", sa_format_address(region.state)},
+                {"protect", protection_name(region.protect)},
+                {"protect_raw", sa_format_address(region.protect)},
+                {"type", sa_format_address(region.type)},
+                {"executable", executable_protect(region.protect)}};
+}
+
+inline bool module_is_ntoskrnl(const target_module_t& mod)
+{
+    const std::string name = lower_ascii(mod.name);
+    const std::string path = lower_ascii(mod.path);
+    return name.find("ntoskrnl") != std::string::npos || path.find("ntoskrnl") != std::string::npos;
+}
+
+inline json handler_plausibility(std::uint32_t pid, const target_module_t& mod, const pe_layout_t& pe, std::uint64_t handler)
+{
+    json out;
+    out["handler_va"] = handler ? json(sa_format_address(handler)) : json(nullptr);
+    if (handler == 0) {
+        out["plausible"] = false;
+        out["reason"] = "unresolved_handler";
+        return out;
+    }
+    const std::uint64_t module_end = mod.base + std::max<std::uint64_t>(mod.size, pe.size_of_image);
+    const bool inside_module = handler >= mod.base && handler < module_end;
+    out["inside_selected_module"] = inside_module;
+    out["section"] = section_evidence_for_va(pe, handler);
+    out["protection"] = memory_protection_evidence(pid, handler);
+    if (!inside_module) {
+        out["plausible"] = false;
+        out["reason"] = "handler_outside_selected_driver_module";
+        return out;
+    }
+    const mapped_section_t* sec = section_for_absolute_va(pe, handler);
+    if (!sec) {
+        out["plausible"] = false;
+        out["reason"] = "handler_not_in_any_pe_section";
+        return out;
+    }
+    if (!executable_characteristics(sec->characteristics)) {
+        out["plausible"] = false;
+        out["reason"] = "handler_section_not_executable";
+        return out;
+    }
+    out["plausible"] = true;
+    out["reason"] = "handler_inside_executable_driver_section";
+    return out;
+}
+
 inline std::optional<std::uint64_t> resolve_last_register_value(const std::map<std::string, std::uint64_t>& regs, const std::string& reg)
 {
     auto it = regs.find(lower_ascii(reg));
@@ -2268,10 +2372,14 @@ inline std::optional<std::uint64_t> resolve_last_register_value(const std::map<s
     return it->second;
 }
 
-inline bool parse_driver_entry_assignments(std::uint32_t pid, const pe_layout_t& pe, json& assignments)
+inline bool parse_driver_entry_assignments(std::uint32_t pid, const target_module_t& mod, const pe_layout_t& pe, json& assignments, json& diagnostics)
 {
     assignments = json::array();
+    diagnostics = json::object();
+    diagnostics["scan_window"] = json{{"base", sa_format_address(pe.entry)}, {"size", 0x8000}, {"end", sa_format_address(pe.entry + 0x8000)}};
+    diagnostics["candidates"] = json::array();
     auto insns = disassemble_target(pid, pe.entry, 0x8000, 4096);
+    diagnostics["instructions_decoded"] = insns.size();
     std::map<std::string, std::uint64_t> reg_values;
     for (const auto& ins : insns) {
         const std::string m = mnemonic_of(ins);
@@ -2309,11 +2417,22 @@ inline bool parse_driver_entry_assignments(std::uint32_t pid, const pe_layout_t&
         a["assignment_va"] = sa_format_address(ins.addr);
         a["irp_code"] = code;
         a["irp_name"] = irp_name(code);
-        a["handler_va"] = handler ? sa_format_address(handler) : "unknown";
+        a["handler_va"] = handler ? json(sa_format_address(handler)) : json(nullptr);
         a["driver_object_offset"] = sa_format_address(static_cast<std::uint64_t>(disp));
         a["evidence"] = instruction_to_json(ins);
-        assignments.push_back(std::move(a));
+        a["handler_plausibility"] = handler_plausibility(pid, mod, pe, handler);
+        const bool plausible = a["handler_plausibility"].value("plausible", false);
+        a["accepted"] = plausible;
+        if (!plausible)
+            a["rejection_reason"] = a["handler_plausibility"].value("reason", std::string("handler_rejected"));
+        diagnostics["candidates"].push_back(a);
+        if (plausible)
+            assignments.push_back(std::move(a));
     }
+    diagnostics["candidate_count"] = diagnostics["candidates"].size();
+    diagnostics["accepted_assignment_count"] = assignments.size();
+    if (assignments.empty())
+        diagnostics["rejection_reason"] = diagnostics["candidate_count"].get<std::size_t>() == 0 ? "no_major_function_assignments_in_scan_window" : "all_major_function_candidates_rejected";
     return !assignments.empty();
 }
 
@@ -2326,19 +2445,53 @@ inline tool_result_t drv_find_dispatch_table(const json& params)
     auto mod = select_module(params, true, &err);
     if (!mod)
         return tool_result_t::error(err.empty() ? "Kernel module could not be selected" : err);
+    json base_out;
+    base_out["driver_name"] = mod->name;
+    base_out["selected_module"] = target_module_json(*mod);
+    base_out["module_base"] = sa_format_address(mod->base);
+    base_out["module_size"] = mod->size;
+    base_out["module_path"] = mod->path;
     pe_layout_t pe;
-    if (!read_pe_layout(0, mod->base, pe))
-        return tool_result_t::error("Could not parse PE headers for " + mod->name + " at " + sa_format_address(mod->base));
+    if (!read_pe_layout(0, mod->base, pe)) {
+        base_out["pe_parse_ok"] = false;
+        base_out["rejection_reason"] = "pe_header_parse_failed";
+        return tool_result_t::error("Could not parse PE headers for " + mod->name + " at " + sa_format_address(mod->base), base_out);
+    }
+    base_out["pe_parse_ok"] = true;
+    base_out["pe"] = json{{"entry_rva", pe.entry >= pe.base ? sa_format_address(pe.entry - pe.base) : "unknown"},
+                          {"entry_va", sa_format_address(pe.entry)},
+                          {"size_of_image", pe.size_of_image},
+                          {"is_64", pe.is_64},
+                          {"section_count", pe.sections.size()}};
+    base_out["entry_section"] = section_evidence_for_va(pe, pe.entry);
+    base_out["entry_protection"] = memory_protection_evidence(0, pe.entry);
+    if (module_is_ntoskrnl(*mod)) {
+        base_out["dispatch_table_va"] = nullptr;
+        base_out["assignments"] = json::array();
+        base_out["candidate_count"] = 0;
+        base_out["confidence"] = 0.0;
+        base_out["contract"] = "wdm_driver_module_required";
+        base_out["rejection_reason"] = "selected_module_is_ntoskrnl_kernel_image_not_wdm_driver_module";
+        base_out["note"] = "ntoskrnl is the Windows kernel image and is not a WDM driver dispatch fixture target for this read-only scan.";
+        return tool_result_t::error("Selected module is ntoskrnl, not a WDM driver module dispatch fixture.", base_out);
+    }
     json assignments;
-    parse_driver_entry_assignments(0, pe, assignments);
-    json out;
-    out["driver_name"] = mod->name;
-    out["module_base"] = sa_format_address(mod->base);
+    json diagnostics;
+    parse_driver_entry_assignments(0, *mod, pe, assignments, diagnostics);
+    json out = base_out;
     out["driver_entry_va"] = sa_format_address(pe.entry);
+    out["driver_entry_rva"] = pe.entry >= pe.base ? json(sa_format_address(pe.entry - pe.base)) : json(nullptr);
     out["dispatch_table_va"] = "driver_object+0x70";
     out["assignments"] = assignments;
+    out["candidate_count"] = diagnostics.value("candidate_count", 0);
+    out["accepted_assignment_count"] = diagnostics.value("accepted_assignment_count", 0);
+    out["scan_window"] = diagnostics["scan_window"];
+    out["diagnostics"] = diagnostics;
+    out["handler_plausibility_policy"] = "handler must resolve inside an executable section of the selected driver image";
     out["confidence"] = assignments.empty() ? 0.25 : std::min(0.95, 0.45 + assignments.size() * 0.04);
-    out["note"] = assignments.empty() ? "No MajorFunction assignments were found in the bounded DriverEntry scan." : "dispatch_table_va is expressed relative to the runtime DRIVER_OBJECT because the object pointer is not exposed by this read-only analysis path.";
+    out["note"] = assignments.empty() ? "No accepted MajorFunction assignments were found in the bounded DriverEntry scan; inspect diagnostics.candidates for rejected evidence." : "dispatch_table_va is expressed relative to the runtime DRIVER_OBJECT because the object pointer is not exposed by this read-only analysis path.";
+    if (assignments.empty())
+        out["rejection_reason"] = diagnostics.value("rejection_reason", std::string("no_accepted_dispatch_handlers"));
     return tool_result_t::ok("Driver dispatch assignment scan completed", out);
 }
 
@@ -2612,40 +2765,57 @@ inline std::map<std::string, drv_hook_state_t>& drv_hook_states()
     return s;
 }
 
+inline json drv_hook_fail_closed_contract(const std::string& reason)
+{
+    return json{{"backend", "fail_closed_state_only"},
+                {"fail_closed_state_only", true},
+                {"safe_backend_available", false},
+                {"raw_dispatch_patching_allowed", false},
+                {"count", 0},
+                {"reason", reason},
+                {"security_contract", "fail_closed_no_kernel_dispatch_mutation"}};
+}
+
 inline tool_result_t drv_hook_manage(const json& params)
 {
     const std::string action = lower_ascii(compat_action_name(params));
     const json p = compat_action_payload(params);
     if (action == "list" || action == "status" || action.empty()) {
-        json arr = json::array();
         std::lock_guard<std::mutex> lk(drv_hook_mutex());
-        for (const auto& it : drv_hook_states())
-            arr.push_back(json{{"hook_id", it.second.hook_id}, {"driver_name", it.second.driver_name}, {"irp_code", it.second.irp_code}, {"irp_name", irp_name(it.second.irp_code)}, {"callback_va", sa_format_address(it.second.callback_va)}, {"installed", it.second.installed}});
-        return tool_result_t::ok(json{{"hooks", arr}, {"count", arr.size()}, {"backend", "fail_closed_state_only"}, {"safe_backend_available", false}, {"raw_dispatch_patching_allowed", false}, {"security_contract", "fail_closed_no_kernel_dispatch_mutation"}});
+        drv_hook_states().clear();
+        json out = drv_hook_fail_closed_contract("raw_dispatch_patching_disabled_no_safe_kernel_backend");
+        out["hooks"] = json::array();
+        return tool_result_t::ok(out);
     }
     if (action == "remove" || action == "stop") {
         const std::string id = p.value("hook_id", std::string());
-        if (id.empty())
-            return tool_result_t::error("hook_id is required for " + action, json{{"stopped", false}, {"mutation", "none"}, {"backend", "fail_closed_state_only"}, {"security_contract", "fail_closed_no_kernel_dispatch_mutation"}});
+        if (id.empty()) {
+            json out = drv_hook_fail_closed_contract("hook_id_required_no_kernel_mutation_performed");
+            out["stopped"] = false;
+            out["mutation"] = "none";
+            return tool_result_t::error("hook_id is required for " + action, out);
+        }
         std::lock_guard<std::mutex> lk(drv_hook_mutex());
         const auto erased = drv_hook_states().erase(id);
-        return erased ? tool_result_t::ok(json{{"removed", true}, {"stopped", true}, {"hook_id", id}, {"mutation", "state_only_no_kernel_patch"}, {"security_contract", "fail_closed_no_kernel_dispatch_mutation"}}) : tool_result_t::error("hook_id not found", json{{"hook_id", id}, {"stopped", false}, {"mutation", "none"}, {"backend", "fail_closed_state_only"}, {"security_contract", "fail_closed_no_kernel_dispatch_mutation"}});
+        json out = drv_hook_fail_closed_contract(erased ? "state_only_record_removed_no_kernel_mutation" : "hook_id_not_found_no_kernel_mutation_performed");
+        out["hook_id"] = id;
+        out["removed"] = erased != 0;
+        out["stopped"] = erased != 0;
+        out["mutation"] = erased ? "state_only_no_kernel_patch" : "none";
+        out["hooks"] = json::array();
+        return erased ? tool_result_t::ok(out) : tool_result_t::error("hook_id not found", out);
     }
     if (action == "install" || action == "start") {
-        json out;
+        json out = drv_hook_fail_closed_contract("unsupported_without_existing_safe_kernel_backend");
         out["installed"] = false;
         out["started"] = false;
-        out["reason"] = "unsupported_without_existing_safe_kernel_backend";
         out["mutation"] = "none";
         out["driver_name"] = p.value("driver_name", std::string());
         out["irp_code"] = p.value("irp_code", 0);
         out["irp_name"] = irp_name(p.value("irp_code", 0));
         out["callback_va"] = p.value("callback_va", std::string());
-        out["safe_backend_available"] = false;
-        out["raw_dispatch_patching_allowed"] = false;
         out["confirm_unsafe_received"] = unsafe_confirmed(params) || unsafe_confirmed(p);
         out["required_capability"] = "signed_kernel_irp_observer_backend_with_restore_and_audit";
-        out["security_contract"] = "fail_closed_no_kernel_dispatch_mutation";
         return tool_result_t::error("Kernel IRP hook installation is unsupported in this scope because no safe backend is exposed.", out);
     }
     return compat_unknown_action("drv_hook_manage", action);
@@ -3086,6 +3256,124 @@ inline void update_register_constants(const AsmInstr& ins, const std::string& mn
         reg_values.erase(dst);
 }
 
+inline std::vector<AsmInstr> disassemble_linear_bytes(std::uint64_t base, const std::vector<std::uint8_t>& bytes, std::uint32_t max_insns)
+{
+    std::vector<AsmInstr> out;
+    if (bytes.empty() || max_insns == 0)
+        return out;
+    std::size_t off = 0;
+    while (off < bytes.size() && out.size() < max_insns) {
+        const int avail = static_cast<int>(std::min<std::size_t>(15, bytes.size() - off));
+        AsmInstr ins = zydis_decode_one(bytes.data() + off, avail, base + off);
+        if (ins.len <= 0)
+            ins.len = 1;
+        out.push_back(ins);
+        off += static_cast<std::size_t>(ins.len);
+    }
+    return out;
+}
+
+inline std::string base_register_from_memory_operand(std::string op)
+{
+    op = lower_ascii(op);
+    for (const char* prefix : { "qword ptr ", "dword ptr ", "word ptr ", "byte ptr ", "ptr " }) {
+        const std::string p(prefix);
+        const std::size_t pos = op.find(p);
+        if (pos != std::string::npos)
+            op.erase(pos, p.size());
+    }
+    const std::size_t open = op.find('[');
+    const std::size_t close = op.find(']');
+    if (open == std::string::npos || close == std::string::npos || close <= open + 1)
+        return {};
+    std::string inner = trim_ascii(op.substr(open + 1, close - open - 1));
+    for (char& c : inner) {
+        if (c == '+' || c == '-' || c == '*' || c == ',') {
+            c = ' ';
+            break;
+        }
+    }
+    std::istringstream is(inner);
+    std::string token;
+    is >> token;
+    return reg_from_operand(token);
+}
+
+inline std::optional<std::int64_t> displacement_from_memory_operand_text(std::string op)
+{
+    op = lower_ascii(op);
+    const std::size_t open = op.find('[');
+    const std::size_t close = op.find(']');
+    if (open == std::string::npos || close == std::string::npos || close <= open + 1)
+        return std::nullopt;
+    const std::string inner = op.substr(open + 1, close - open - 1);
+    std::size_t pos = inner.find("+0x");
+    int sign = 1;
+    if (pos == std::string::npos) {
+        pos = inner.find("-0x");
+        sign = -1;
+    }
+    if (pos == std::string::npos)
+        return 0;
+    std::size_t hex_start = pos + 1;
+    std::size_t hex_end = hex_start + 2;
+    while (hex_end < inner.size() && std::isxdigit(static_cast<unsigned char>(inner[hex_end])))
+        ++hex_end;
+    auto parsed = sa_parse_address(inner.substr(hex_start, hex_end - hex_start));
+    if (!parsed)
+        return std::nullopt;
+    if (*parsed > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))
+        return std::nullopt;
+    return static_cast<std::int64_t>(*parsed) * sign;
+}
+
+inline std::uint64_t memory_operand_text_target(const std::vector<std::string>& ops, const std::map<std::string, std::uint64_t>& reg_values, std::string& source, json& evidence)
+{
+    evidence = json{{"resolver", "operand_text_register_flow"}, {"resolved", false}};
+    source.clear();
+    if (ops.empty() || !operand_is_memory(ops[0]))
+        return 0;
+    const std::string base_reg = base_register_from_memory_operand(ops[0]);
+    evidence["base_register"] = base_reg;
+    if (base_reg.empty()) {
+        evidence["reason"] = "no_base_register_in_memory_operand";
+        return 0;
+    }
+    auto base = resolve_last_register_value(reg_values, base_reg);
+    if (!base) {
+        evidence["reason"] = "base_register_not_tracked";
+        return 0;
+    }
+    evidence["base_value"] = sa_format_address(*base);
+    auto disp = displacement_from_memory_operand_text(ops[0]);
+    if (!disp) {
+        evidence["reason"] = "displacement_parse_failed";
+        return 0;
+    }
+    std::uint64_t target = 0;
+    if (!add_signed_offset(*base, *disp, target)) {
+        evidence["reason"] = "target_overflow";
+        return 0;
+    }
+    source = "operand_text_tracked_register:" + base_reg;
+    evidence["resolved"] = true;
+    evidence["displacement"] = *disp;
+    evidence["target"] = sa_format_address(target);
+    return target;
+}
+
+inline std::string bytes_window_hex(const std::vector<std::uint8_t>& bytes, std::size_t center, std::size_t before, std::size_t after)
+{
+    if (bytes.empty())
+        return {};
+    const std::size_t begin = center > before ? center - before : 0;
+    const std::size_t end = std::min<std::size_t>(bytes.size(), center + after);
+    if (end <= begin)
+        return {};
+    std::vector<std::uint8_t> window(bytes.begin() + static_cast<std::ptrdiff_t>(begin), bytes.begin() + static_cast<std::ptrdiff_t>(end));
+    return bytes_to_hex(window, window.size());
+}
+
 inline tool_result_t smc_find_decryptor(const json& params)
 {
     auto chk = require_driver();
@@ -3101,15 +3389,45 @@ inline tool_result_t smc_find_decryptor(const json& params)
     const std::uint64_t end = *target > max_u64 - bounded_target_size ? max_u64 : *target + bounded_target_size;
     const ULONGLONG started = GetTickCount64();
     json candidates = json::array();
+    json scan_ranges = json::array();
+    json decision_samples = json::array();
     std::uint64_t scanned = 0;
     bool cancelled = false;
+    auto target_contains = [&](std::uint64_t value) {
+        return value >= *target && value < end;
+    };
     auto scan_code_range = [&](std::uint64_t scan_base, std::uint32_t scan_size, const std::string& source) -> bool {
         if (mcp_standalone::current_call_cancelled()) {
             cancelled = true;
             return false;
         }
+        const std::uint32_t requested_scan_size = scan_size;
         scan_size = std::clamp<std::uint32_t>(scan_size, 1, 0x100000);
-        auto insns = disassemble_target(pid, scan_base, scan_size, 65536);
+        json range_diag;
+        range_diag["source"] = source;
+        range_diag["scan_base"] = sa_format_address(scan_base);
+        range_diag["scan_size_requested"] = requested_scan_size;
+        range_diag["scan_size_initial"] = scan_size;
+        range_diag["safe_context_expanded"] = false;
+        driver_bridge::memory_region_t region{};
+        if (!is_kernel_address(scan_base) && driver_bridge::query_memory_for(pid, scan_base, region) && region.base + region.size > scan_base) {
+            const std::uint64_t available = region.base + region.size - scan_base;
+            const std::uint32_t expanded = static_cast<std::uint32_t>(std::min<std::uint64_t>(available, 0x100));
+            if (expanded > scan_size) {
+                scan_size = std::min<std::uint32_t>(expanded, 0x100000);
+                range_diag["safe_context_expanded"] = true;
+            }
+            range_diag["region"] = json{{"base", sa_format_address(region.base)}, {"size", region.size}, {"protect", protection_name(region.protect)}, {"protect_raw", sa_format_address(region.protect)}, {"executable", executable_protect(region.protect)}};
+        }
+        range_diag["scan_size_effective"] = scan_size;
+        std::vector<std::uint8_t> raw;
+        const bool raw_ok = read_target_memory(pid, scan_base, scan_size, raw);
+        range_diag["read_ok"] = raw_ok;
+        range_diag["bytes_read"] = raw.size();
+        range_diag["marker_bytes_head"] = bytes_to_hex(raw, 64);
+        auto insns = raw_ok && !raw.empty() ? disassemble_linear_bytes(scan_base, raw, 65536) : disassemble_target(pid, scan_base, scan_size, 65536);
+        range_diag["instructions_decoded"] = insns.size();
+        scan_ranges.push_back(std::move(range_diag));
         scanned += insns.size();
         std::map<std::string, std::uint64_t> reg_values;
         for (std::size_t ii = 0; ii < insns.size(); ++ii) {
@@ -3126,17 +3444,62 @@ inline tool_result_t smc_find_decryptor(const json& params)
             bool match = false;
             std::string ref_source;
             const std::uint64_t ref = memory_reference_target_with_registers(ins, reg_values, &ref_source);
-            if (ref)
-                match = ref >= *target && ref < end;
             const bool memory_write = !ops.empty() && operand_is_memory(ops[0]);
-            if (!match && ins.has_imm && memory_write) {
-                match = ins.imm_unsigned >= *target && ins.imm_unsigned < end;
-                if (match)
-                    ref_source = "write_immediate";
+            std::string operand_ref_source;
+            json operand_ref_evidence;
+            std::uint64_t operand_ref = 0;
+            if (memory_write)
+                operand_ref = memory_operand_text_target(ops, reg_values, operand_ref_source, operand_ref_evidence);
+            std::uint64_t chosen_ref = 0;
+            std::string chosen_source;
+            if (ref && target_contains(ref)) {
+                chosen_ref = ref;
+                chosen_source = ref_source.empty() ? "decoded_memory_metadata" : ref_source;
+                match = true;
+            } else if (operand_ref && target_contains(operand_ref)) {
+                chosen_ref = operand_ref;
+                chosen_source = operand_ref_source.empty() ? "operand_text_register_flow" : operand_ref_source;
+                match = true;
             }
+            if (!match && ins.has_imm && memory_write) {
+                match = target_contains(ins.imm_unsigned);
+                if (match) {
+                    chosen_ref = ins.imm_unsigned;
+                    chosen_source = "immediate_operand_value";
+                }
+            }
+            json decision;
+            decision["instruction"] = instruction_to_json(ins);
+            decision["memory_write"] = memory_write;
+            decision["decoded_memory_ref"] = ref ? json(sa_format_address(ref)) : json(nullptr);
+            decision["decoded_memory_source"] = ref_source.empty() ? "none" : ref_source;
+            decision["operand_text_ref"] = operand_ref ? json(sa_format_address(operand_ref)) : json(nullptr);
+            decision["operand_text_source"] = operand_ref_source.empty() ? "none" : operand_ref_source;
+            decision["operand_text_evidence"] = operand_ref_evidence.is_null() ? json::object() : operand_ref_evidence;
+            decision["target_range"] = json{{"base", sa_format_address(*target)}, {"end", sa_format_address(end)}, {"size", bounded_target_size}};
+            decision["chosen_memory_target"] = chosen_ref ? json(sa_format_address(chosen_ref)) : json(nullptr);
+            decision["chosen_source"] = chosen_source.empty() ? "none" : chosen_source;
+            decision["matched_target_range"] = match;
+            decision["tracked_registers"] = reg_values.size();
+            if (decision_samples.size() < 32)
+                decision_samples.push_back(decision);
             if (!match)
                 continue;
-            candidates.push_back(json{{"decryptor_va", sa_format_address(ins.addr)}, {"write_instruction_va", sa_format_address(ins.addr)}, {"memory_reference_va", ref ? sa_format_address(ref) : sa_format_address(ins.imm_unsigned)}, {"memory_reference_source", ref_source.empty() ? "unknown" : ref_source}, {"key_register", ops.size() > 1 ? reg_from_operand(ops.back()) : "unknown"}, {"estimated_algo", estimate_algo_from_mnemonic(mnem)}, {"evidence", instruction_to_json(ins)}, {"source", source}, {"tracked_register_count", reg_values.size()}, {"confidence", ref_source.rfind("tracked_register:", 0) == 0 ? 0.72 : 0.55}});
+            const std::size_t raw_offset = (ins.addr >= scan_base && ins.addr - scan_base < raw.size()) ? static_cast<std::size_t>(ins.addr - scan_base) : 0;
+            const std::string marker_bytes = bytes_window_hex(raw, raw_offset, 16, 24);
+            candidates.push_back(json{{"decryptor_va", sa_format_address(ins.addr)},
+                                      {"write_instruction_va", sa_format_address(ins.addr)},
+                                      {"memory_reference_va", chosen_ref ? sa_format_address(chosen_ref) : sa_format_address(ins.imm_unsigned)},
+                                      {"memory_reference_source", chosen_source.empty() ? "unknown" : chosen_source},
+                                      {"key_register", ops.size() > 1 ? reg_from_operand(ops.back()) : "unknown"},
+                                      {"key_operand", ops.size() > 1 ? ops.back() : std::string()},
+                                      {"estimated_algo", estimate_algo_from_mnemonic(mnem)},
+                                      {"evidence", instruction_to_json(ins)},
+                                      {"decision", decision},
+                                      {"source", source},
+                                      {"tracked_register_count", reg_values.size()},
+                                      {"marker_bytes_hex", marker_bytes},
+                                      {"confidence", chosen_source.rfind("operand_text_tracked_register:", 0) == 0 ? 0.78 : (chosen_source.rfind("tracked_register:", 0) == 0 ? 0.74 : 0.58)}});
             if (candidates.size() >= 128)
                 break;
         }
@@ -3148,7 +3511,12 @@ inline tool_result_t smc_find_decryptor(const json& params)
         const std::uint32_t bounded_scan = static_cast<std::uint32_t>(std::min<std::uint64_t>(scan_size.value_or(0x10000), 0x100000));
         const std::uint32_t effective_scan = bounded_scan == 0 ? 0x10000 : bounded_scan;
         scan_code_range(*scan_base, effective_scan, "explicit_scan_range");
-        json out{{"decryptors", candidates}, {"count", candidates.size()}, {"instructions_scanned", scanned}, {"explicit_scan_mode", true}, {"module_scan_skipped", true}, {"scan_base", sa_format_address(*scan_base)}, {"scan_size_requested", scan_size.value_or(0x10000)}, {"scan_size_effective", effective_scan}, {"target_va", sa_format_address(*target)}, {"target_size_effective", bounded_target_size}, {"cancelled", cancelled}, {"elapsed_ms", GetTickCount64() - started}};
+        std::uint64_t reported_effective = effective_scan;
+        if (!scan_ranges.empty() && scan_ranges.back().contains("scan_size_effective") && scan_ranges.back()["scan_size_effective"].is_number_unsigned())
+            reported_effective = scan_ranges.back()["scan_size_effective"].get<std::uint64_t>();
+        json out{{"decryptors", candidates}, {"count", candidates.size()}, {"instructions_scanned", scanned}, {"explicit_scan_mode", true}, {"module_scan_skipped", true}, {"scan_base", sa_format_address(*scan_base)}, {"scan_size_requested", scan_size.value_or(0x10000)}, {"scan_size_effective", reported_effective}, {"target_va", sa_format_address(*target)}, {"target_size_effective", bounded_target_size}, {"scan_ranges", scan_ranges}, {"decision_samples", decision_samples}, {"cancelled", cancelled}, {"elapsed_ms", GetTickCount64() - started}};
+        if (candidates.empty())
+            out["no_match_reason"] = scanned == 0 ? "no_instructions_decoded" : "no_memory_write_resolved_into_target_range";
         if (cancelled)
             return tool_result_t::error("SMC decryptor explicit scan cancelled", out);
         return tool_result_t::ok(out);
@@ -3176,7 +3544,9 @@ inline tool_result_t smc_find_decryptor(const json& params)
         if (cancelled)
             break;
     }
-    json out{{"decryptors", candidates}, {"count", candidates.size()}, {"instructions_scanned", scanned}, {"explicit_scan_mode", false}, {"module_scan_skipped", false}, {"cancelled", cancelled}, {"elapsed_ms", GetTickCount64() - started}};
+    json out{{"decryptors", candidates}, {"count", candidates.size()}, {"instructions_scanned", scanned}, {"explicit_scan_mode", false}, {"module_scan_skipped", false}, {"scan_ranges", scan_ranges}, {"decision_samples", decision_samples}, {"cancelled", cancelled}, {"elapsed_ms", GetTickCount64() - started}};
+    if (candidates.empty())
+        out["no_match_reason"] = scanned == 0 ? "no_instructions_decoded" : "no_memory_write_resolved_into_target_range";
     if (cancelled)
         return tool_result_t::error("SMC decryptor scan cancelled", out);
     return tool_result_t::ok(out);

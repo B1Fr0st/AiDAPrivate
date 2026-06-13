@@ -183,6 +183,7 @@ void navigate_back();
 void navigate_forward();
 
 void bump_format_generation();
+uint32_t format_generation();
 
 uint64_t enclosing_function_start(uint64_t addr, const DisasmFile& file);
 

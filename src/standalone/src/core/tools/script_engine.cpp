@@ -28,6 +28,7 @@ namespace script_engine {
 static std::mutex                    g_mutex;
 static std::unique_ptr<sol::state>   g_lua;
 static std::atomic<bool>             g_initialized{false};
+static std::atomic<bool>             g_initializing{false};
 static std::map<std::string, script_info> g_scripts;
 static std::deque<log_entry>         g_log;
 static constexpr size_t              MAX_LOG_ENTRIES = 4096;
@@ -859,35 +860,189 @@ static void rebuild_hook_table_locked() {
 
 
 bool initialize() {
-    diag::log_tagged_fmt("script_eng", "initialize entry");
-    std::lock_guard<std::mutex> lock(g_mutex);
-    if (g_initialized.load())
+    const uint64_t started = now_ms();
+    const DWORD tid = GetCurrentThreadId();
+    diag::log_tagged_fmt("script_eng", "initialize entry tid=%lu initialized=%d initializing=%d",
+        tid,
+        g_initialized.load(std::memory_order_acquire) ? 1 : 0,
+        g_initializing.load(std::memory_order_acquire) ? 1 : 0);
+    if (g_initialized.load(std::memory_order_acquire))
     {
-        diag::log_tagged_fmt("script_eng", "initialize already done");
+        diag::log_tagged_fmt("script_eng", "initialize already done tid=%lu elapsed_ms=%llu",
+            tid,
+            static_cast<unsigned long long>(now_ms() - started));
         return true;
     }
 
-    g_lua = std::make_unique<sol::state>();
-    g_lua->open_libraries(
-        sol::lib::base,
-        sol::lib::string,
-        sol::lib::table,
-        sol::lib::math,
-        sol::lib::utf8,
-        sol::lib::os
-    );
-
-    register_usertypes(*g_lua);
-    register_api(*g_lua);
-    apply_sandbox(*g_lua);
-    reset_hook_table();
-
-    g_initialized.store(true);
-    diag::log_tagged_fmt("script_eng", "initialize done lua_state=%p", (void*)g_lua->lua_state());
-    if (!g_init_logged) {
-        add_log("engine", log_level::info, "Script engine initialized (Lua 5.4 + sol2)");
-        g_init_logged = true;
+    bool expected = false;
+    if (!g_initializing.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+    {
+        diag::log_tagged_fmt("script_eng", "initialize already in progress tid=%lu elapsed_ms=%llu",
+            tid,
+            static_cast<unsigned long long>(now_ms() - started));
+        for (int attempt = 0; attempt < 40; ++attempt) {
+            if (g_initialized.load(std::memory_order_acquire)) {
+                diag::log_tagged_fmt("script_eng", "initialize observed complete tid=%lu wait_ms=%llu attempts=%d",
+                    tid,
+                    static_cast<unsigned long long>(now_ms() - started),
+                    attempt + 1);
+                return true;
+            }
+            Sleep(25);
+        }
+        diag::log_tagged_fmt("script_eng", "initialize still in progress tid=%lu wait_ms=%llu initialized=%d",
+            tid,
+            static_cast<unsigned long long>(now_ms() - started),
+            g_initialized.load(std::memory_order_acquire) ? 1 : 0);
+        return g_initialized.load(std::memory_order_acquire);
     }
+
+    const char* phase = "local_alloc";
+    std::unique_ptr<sol::state> local_lua;
+    void* published_lua_state = nullptr;
+    try {
+        diag::log_tagged_fmt("script_eng", "initialize_phase_pre phase=%s tid=%lu elapsed_ms=%llu",
+            phase,
+            tid,
+            static_cast<unsigned long long>(now_ms() - started));
+        local_lua = std::make_unique<sol::state>();
+        diag::log_tagged_fmt("script_eng", "initialize_phase_post phase=%s tid=%lu lua_state=%p elapsed_ms=%llu",
+            phase,
+            tid,
+            local_lua ? (void*)local_lua->lua_state() : nullptr,
+            static_cast<unsigned long long>(now_ms() - started));
+
+        phase = "open_libraries";
+        diag::log_tagged_fmt("script_eng", "initialize_phase_pre phase=%s tid=%lu elapsed_ms=%llu",
+            phase,
+            tid,
+            static_cast<unsigned long long>(now_ms() - started));
+        local_lua->open_libraries(
+            sol::lib::base,
+            sol::lib::string,
+            sol::lib::table,
+            sol::lib::math,
+            sol::lib::utf8,
+            sol::lib::os
+        );
+        diag::log_tagged_fmt("script_eng", "initialize_phase_post phase=%s tid=%lu elapsed_ms=%llu",
+            phase,
+            tid,
+            static_cast<unsigned long long>(now_ms() - started));
+
+        phase = "register_usertypes";
+        diag::log_tagged_fmt("script_eng", "initialize_phase_pre phase=%s tid=%lu elapsed_ms=%llu",
+            phase,
+            tid,
+            static_cast<unsigned long long>(now_ms() - started));
+        register_usertypes(*local_lua);
+        diag::log_tagged_fmt("script_eng", "initialize_phase_post phase=%s tid=%lu elapsed_ms=%llu",
+            phase,
+            tid,
+            static_cast<unsigned long long>(now_ms() - started));
+
+        phase = "register_api";
+        diag::log_tagged_fmt("script_eng", "initialize_phase_pre phase=%s tid=%lu elapsed_ms=%llu",
+            phase,
+            tid,
+            static_cast<unsigned long long>(now_ms() - started));
+        register_api(*local_lua);
+        diag::log_tagged_fmt("script_eng", "initialize_phase_post phase=%s tid=%lu elapsed_ms=%llu",
+            phase,
+            tid,
+            static_cast<unsigned long long>(now_ms() - started));
+
+        phase = "apply_sandbox";
+        diag::log_tagged_fmt("script_eng", "initialize_phase_pre phase=%s tid=%lu elapsed_ms=%llu",
+            phase,
+            tid,
+            static_cast<unsigned long long>(now_ms() - started));
+        apply_sandbox(*local_lua);
+        diag::log_tagged_fmt("script_eng", "initialize_phase_post phase=%s tid=%lu elapsed_ms=%llu",
+            phase,
+            tid,
+            static_cast<unsigned long long>(now_ms() - started));
+
+        phase = "reset_hook_table";
+        diag::log_tagged_fmt("script_eng", "initialize_phase_pre phase=%s tid=%lu elapsed_ms=%llu",
+            phase,
+            tid,
+            static_cast<unsigned long long>(now_ms() - started));
+        (*local_lua)["_hooks"] = local_lua->create_table();
+        diag::log_tagged_fmt("script_eng", "initialize_phase_post phase=%s tid=%lu elapsed_ms=%llu",
+            phase,
+            tid,
+            static_cast<unsigned long long>(now_ms() - started));
+
+        phase = "publish_wait";
+        diag::log_tagged_fmt("script_eng", "initialize_phase_pre phase=%s tid=%lu elapsed_ms=%llu",
+            phase,
+            tid,
+            static_cast<unsigned long long>(now_ms() - started));
+        std::unique_lock<std::mutex> lock(g_mutex);
+        diag::log_tagged_fmt("script_eng", "initialize_phase_post phase=%s tid=%lu elapsed_ms=%llu",
+            phase,
+            tid,
+            static_cast<unsigned long long>(now_ms() - started));
+        if (g_initialized.load(std::memory_order_acquire))
+        {
+            g_initializing.store(false, std::memory_order_release);
+            diag::log_tagged_fmt("script_eng", "initialize publish skipped already_initialized tid=%lu elapsed_ms=%llu",
+                tid,
+                static_cast<unsigned long long>(now_ms() - started));
+            return true;
+        }
+
+        phase = "publish_state";
+        diag::log_tagged_fmt("script_eng", "initialize_phase_pre phase=%s tid=%lu elapsed_ms=%llu",
+            phase,
+            tid,
+            static_cast<unsigned long long>(now_ms() - started));
+        g_lua = std::move(local_lua);
+        g_hook_counts.fill(0);
+        g_initialized.store(true, std::memory_order_release);
+        published_lua_state = g_lua ? (void*)g_lua->lua_state() : nullptr;
+        diag::log_tagged_fmt("script_eng", "initialize_phase_post phase=%s tid=%lu lua_state=%p elapsed_ms=%llu",
+            phase,
+            tid,
+            published_lua_state,
+            static_cast<unsigned long long>(now_ms() - started));
+
+        phase = "add_log";
+        diag::log_tagged_fmt("script_eng", "initialize_phase_pre phase=%s tid=%lu elapsed_ms=%llu",
+            phase,
+            tid,
+            static_cast<unsigned long long>(now_ms() - started));
+        if (!g_init_logged) {
+            add_log("engine", log_level::info, "Script engine initialized (Lua 5.4 + sol2)");
+            g_init_logged = true;
+        }
+        diag::log_tagged_fmt("script_eng", "initialize_phase_post phase=%s tid=%lu elapsed_ms=%llu",
+            phase,
+            tid,
+            static_cast<unsigned long long>(now_ms() - started));
+    } catch (const std::exception& e) {
+        g_initializing.store(false, std::memory_order_release);
+        diag::log_tagged_fmt("script_eng", "initialize_exception phase=%s tid=%lu elapsed_ms=%llu what=%.160s",
+            phase,
+            tid,
+            static_cast<unsigned long long>(now_ms() - started),
+            e.what());
+        return false;
+    } catch (...) {
+        g_initializing.store(false, std::memory_order_release);
+        diag::log_tagged_fmt("script_eng", "initialize_exception phase=%s tid=%lu elapsed_ms=%llu what=<unknown>",
+            phase,
+            tid,
+            static_cast<unsigned long long>(now_ms() - started));
+        return false;
+    }
+
+    g_initializing.store(false, std::memory_order_release);
+    diag::log_tagged_fmt("script_eng", "initialize done tid=%lu lua_state=%p elapsed_ms=%llu",
+        tid,
+        published_lua_state,
+        static_cast<unsigned long long>(now_ms() - started));
     return true;
 }
 
@@ -910,7 +1065,7 @@ void shutdown() {
 }
 
 bool is_initialized() {
-    return g_initialized.load();
+    return g_initialized.load(std::memory_order_acquire);
 }
 
 static bool install_script_locked(const std::string& name, const std::string& path,

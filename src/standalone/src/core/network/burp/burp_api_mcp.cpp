@@ -159,6 +159,85 @@ std::string base64_encode_bytes(const uint8_t* data, size_t len)
     return out;
 }
 
+json api_collection_ids_json(const std::vector<api_definition::api_collection_t>& cols)
+{
+    json arr = json::array();
+    for (const auto& c : cols) arr.push_back(c.id);
+    return arr;
+}
+
+json ws_status_to_json(const ws_editor::ws_status_t& s)
+{
+    json j;
+    j["id"] = s.id;
+    j["conn_id"] = s.id;
+    j["url"] = s.url;
+    j["connected"] = s.connected;
+    j["frames_sent"] = static_cast<uint64_t>(s.frames_sent);
+    j["frames_received"] = static_cast<uint64_t>(s.frames_received);
+    j["opened_ms"] = s.opened_ms;
+    j["last_error"] = s.last_error;
+    return j;
+}
+
+json count_or_null(bool available, size_t value)
+{
+    return available ? json(static_cast<uint64_t>(value)) : json(nullptr);
+}
+
+json bool_or_null(bool available, bool value)
+{
+    return available ? json(value) : json(nullptr);
+}
+
+json ws_status_or_null(bool available, const ws_editor::ws_status_t& s)
+{
+    return available ? ws_status_to_json(s) : json(nullptr);
+}
+
+json ws_send_result_to_json(uint64_t id,
+                            const std::string& type,
+                            int opcode,
+                            size_t byte_count,
+                            bool before_available,
+                            const ws_editor::ws_status_t& before,
+                            size_t before_recorded_count,
+                            bool after_available,
+                            const ws_editor::ws_status_t& after,
+                            size_t after_recorded_count)
+{
+    json out;
+    out["conn_id"] = id;
+    out["connection_id"] = id;
+    out["sent"] = true;
+    out["type"] = type;
+    out["opcode"] = opcode;
+    out["byte_count"] = static_cast<uint64_t>(byte_count);
+    out["connected_before"] = bool_or_null(before_available, before.connected);
+    out["connected_after"] = bool_or_null(after_available, after.connected);
+    out["frame_count_before"] = count_or_null(before_available, before.frames_sent);
+    out["frame_count_after"] = count_or_null(after_available, after.frames_sent);
+    out["frames_sent_before"] = count_or_null(before_available, before.frames_sent);
+    out["frames_sent_after"] = count_or_null(after_available, after.frames_sent);
+    out["frames_received_before"] = count_or_null(before_available, before.frames_received);
+    out["frames_received_after"] = count_or_null(after_available, after.frames_received);
+    out["recorded_frame_count_before"] = count_or_null(before_available, before_recorded_count);
+    out["recorded_frame_count_after"] = count_or_null(after_available, after_recorded_count);
+    if (before_available && after_available)
+    {
+        out["frame_count_delta"] = static_cast<int64_t>(after.frames_sent) - static_cast<int64_t>(before.frames_sent);
+        out["recorded_frame_count_delta"] = static_cast<int64_t>(after_recorded_count) - static_cast<int64_t>(before_recorded_count);
+    }
+    else
+    {
+        out["frame_count_delta"] = nullptr;
+        out["recorded_frame_count_delta"] = nullptr;
+    }
+    out["before"] = ws_status_or_null(before_available, before);
+    out["after"] = ws_status_or_null(after_available, after);
+    return out;
+}
+
 tool_result_t tool_api_import(const json& params)
 {
     diag::log_tagged_fmt("mcp_burp", "api_import format=%s source_len=%zu", params.value("format", std::string("auto")).c_str(), params.value("source", std::string()).size());
@@ -238,14 +317,28 @@ tool_result_t tool_api_remove(const json& params)
 {
     uint64_t id = params.value("collection_id", 0ull);
     diag::log_tagged_fmt("mcp_burp", "api_remove collection_id=%llu", static_cast<unsigned long long>(id));
+    auto before = api_definition::list_collections();
+    api_definition::api_collection_t removed_collection;
+    bool had_collection = api_definition::get_collection(id, removed_collection);
     bool ok = api_definition::remove_collection(id);
     if (!ok)
     {
         diag::log_tagged_fmt("mcp_burp", "api_remove not_found id=%llu", static_cast<unsigned long long>(id));
         return tool_result_t::error("collection not found");
     }
+    auto after = api_definition::list_collections();
+    json out;
+    out["collection_id"] = id;
+    out["id"] = id;
+    out["collection_name"] = had_collection ? removed_collection.name : std::string();
+    out["removed"] = true;
+    out["before_count"] = static_cast<uint64_t>(before.size());
+    out["after_count"] = static_cast<uint64_t>(after.size());
+    out["remaining_count"] = static_cast<uint64_t>(after.size());
+    out["remaining_ids"] = api_collection_ids_json(after);
+    if (had_collection) out["collection"] = api_definition::collection_to_json(removed_collection);
     diag::log_tagged_fmt("mcp_burp", "api_remove ok id=%llu", static_cast<unsigned long long>(id));
-    return tool_result_t::ok("removed");
+    return tool_result_t::ok("removed", out);
 }
 
 tool_result_t tool_api_send(const json& params)
@@ -514,14 +607,38 @@ tool_result_t tool_ws_disconnect(const json& params)
 {
     uint64_t id = params.value("conn_id", 0ull);
     diag::log_tagged_fmt("mcp_burp", "ws_disconnect conn_id=%llu", static_cast<unsigned long long>(id));
+    ws_editor::ws_status_t before;
+    bool before_available = ws_editor::get_status(id, before);
+    size_t before_recorded_count = before_available ? ws_editor::frame_count(id) : 0;
     if (!ws_editor::disconnect(id))
     {
         std::string err = ws_editor::last_error();
         diag::log_tagged_fmt("mcp_burp", "ws_disconnect failed err=%s", err.c_str());
         return tool_result_t::error(err);
     }
+    ws_editor::ws_status_t after;
+    bool after_available = ws_editor::get_status(id, after);
+    size_t after_recorded_count = after_available ? ws_editor::frame_count(id) : 0;
+    json out;
+    out["conn_id"] = id;
+    out["connection_id"] = id;
+    out["disconnected"] = true;
+    out["connected_before"] = bool_or_null(before_available, before.connected);
+    out["connected_after"] = after_available ? json(after.connected) : json(false);
+    out["record_available_before"] = before_available;
+    out["record_available_after"] = after_available;
+    out["frame_count_before"] = count_or_null(before_available, before.frames_sent);
+    out["frame_count_after"] = count_or_null(after_available, after.frames_sent);
+    out["frames_sent_before"] = count_or_null(before_available, before.frames_sent);
+    out["frames_sent_after"] = count_or_null(after_available, after.frames_sent);
+    out["frames_received_before"] = count_or_null(before_available, before.frames_received);
+    out["frames_received_after"] = count_or_null(after_available, after.frames_received);
+    out["recorded_frame_count_before"] = count_or_null(before_available, before_recorded_count);
+    out["recorded_frame_count_after"] = count_or_null(after_available, after_recorded_count);
+    out["before"] = ws_status_or_null(before_available, before);
+    out["after"] = ws_status_or_null(after_available, after);
     diag::log_tagged_fmt("mcp_burp", "ws_disconnect ok conn_id=%llu", static_cast<unsigned long long>(id));
-    return tool_result_t::ok("disconnected");
+    return tool_result_t::ok("disconnected", out);
 }
 
 tool_result_t tool_ws_send_text(const json& params)
@@ -529,14 +646,21 @@ tool_result_t tool_ws_send_text(const json& params)
     uint64_t id = params.value("conn_id", 0ull);
     std::string msg = params.value("msg", std::string());
     diag::log_tagged_fmt("mcp_burp", "ws_send_text conn_id=%llu msg_len=%zu", static_cast<unsigned long long>(id), msg.size());
+    ws_editor::ws_status_t before;
+    bool before_available = ws_editor::get_status(id, before);
+    size_t before_recorded_count = before_available ? ws_editor::frame_count(id) : 0;
     if (!ws_editor::send_text(id, msg))
     {
         std::string err = ws_editor::last_error();
         diag::log_tagged_fmt("mcp_burp", "ws_send_text failed err=%s", err.c_str());
         return tool_result_t::error(err);
     }
+    ws_editor::ws_status_t after;
+    bool after_available = ws_editor::get_status(id, after);
+    size_t after_recorded_count = after_available ? ws_editor::frame_count(id) : 0;
+    json out = ws_send_result_to_json(id, "text", 1, msg.size(), before_available, before, before_recorded_count, after_available, after, after_recorded_count);
     diag::log_tagged_fmt("mcp_burp", "ws_send_text ok conn_id=%llu", static_cast<unsigned long long>(id));
-    return tool_result_t::ok("sent");
+    return tool_result_t::ok("sent", out);
 }
 
 tool_result_t tool_ws_send_binary(const json& params)
@@ -545,14 +669,21 @@ tool_result_t tool_ws_send_binary(const json& params)
     std::string b64 = params.value("data_b64", std::string());
     diag::log_tagged_fmt("mcp_burp", "ws_send_binary conn_id=%llu b64_len=%zu", static_cast<unsigned long long>(id), b64.size());
     auto bin = base64_decode(b64);
+    ws_editor::ws_status_t before;
+    bool before_available = ws_editor::get_status(id, before);
+    size_t before_recorded_count = before_available ? ws_editor::frame_count(id) : 0;
     if (!ws_editor::send_binary(id, bin))
     {
         std::string err = ws_editor::last_error();
         diag::log_tagged_fmt("mcp_burp", "ws_send_binary failed err=%s", err.c_str());
         return tool_result_t::error(err);
     }
+    ws_editor::ws_status_t after;
+    bool after_available = ws_editor::get_status(id, after);
+    size_t after_recorded_count = after_available ? ws_editor::frame_count(id) : 0;
+    json out = ws_send_result_to_json(id, "binary", 2, bin.size(), before_available, before, before_recorded_count, after_available, after, after_recorded_count);
     diag::log_tagged_fmt("mcp_burp", "ws_send_binary ok conn_id=%llu bytes=%zu", static_cast<unsigned long long>(id), bin.size());
-    return tool_result_t::ok("sent");
+    return tool_result_t::ok("sent", out);
 }
 
 tool_result_t tool_ws_send_raw(const json& params)
@@ -564,14 +695,23 @@ tool_result_t tool_ws_send_raw(const json& params)
     std::string b64 = params.value("payload_b64", std::string());
     diag::log_tagged_fmt("mcp_burp", "ws_send_raw conn_id=%llu opcode=%d fin=%d masked=%d", static_cast<unsigned long long>(id), opcode, (int)fin, (int)masked);
     auto bin = base64_decode(b64);
+    ws_editor::ws_status_t before;
+    bool before_available = ws_editor::get_status(id, before);
+    size_t before_recorded_count = before_available ? ws_editor::frame_count(id) : 0;
     if (!ws_editor::send_raw_frame(id, static_cast<uint8_t>(opcode), fin, masked, bin))
     {
         std::string err = ws_editor::last_error();
         diag::log_tagged_fmt("mcp_burp", "ws_send_raw failed err=%s", err.c_str());
         return tool_result_t::error(err);
     }
+    ws_editor::ws_status_t after;
+    bool after_available = ws_editor::get_status(id, after);
+    size_t after_recorded_count = after_available ? ws_editor::frame_count(id) : 0;
+    json out = ws_send_result_to_json(id, "raw", opcode, bin.size(), before_available, before, before_recorded_count, after_available, after, after_recorded_count);
+    out["fin"] = fin;
+    out["masked"] = masked;
     diag::log_tagged_fmt("mcp_burp", "ws_send_raw ok conn_id=%llu bytes=%zu", static_cast<unsigned long long>(id), bin.size());
-    return tool_result_t::ok("sent");
+    return tool_result_t::ok("sent", out);
 }
 
 tool_result_t tool_ws_list(const json& params)

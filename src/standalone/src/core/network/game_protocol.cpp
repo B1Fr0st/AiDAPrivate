@@ -5,6 +5,7 @@
 
 #include "protocol_parser.hpp"
 #include "protobuf_codec.hpp"
+#include "helpers/diag_log.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -432,8 +433,19 @@ bool capture_packets_bounded(const capture_options_t& input,
 {
     out.clear();
     error.clear();
+    const std::uint64_t t0 = static_cast<std::uint64_t>(GetTickCount64());
+    diag::log_tagged_fmt("gameproto",
+        "capture_begin pid=%u protocol=%u capture_ms=%u max_packets=%u max_payload=%u driver=%d",
+        input.pid,
+        input.protocol,
+        input.capture_ms,
+        input.max_packets,
+        input.max_payload,
+        driver_bridge::using_kernel_driver() ? 1 : 0);
     if (!driver_bridge::using_kernel_driver()) {
         error = "driver bridge is not connected";
+        diag::log_tagged_fmt("gameproto", "capture_failed reason=driver_unavailable elapsed_ms=%llu",
+            static_cast<unsigned long long>(GetTickCount64() - t0));
         return false;
     }
 
@@ -453,6 +465,12 @@ bool capture_packets_bounded(const capture_options_t& input,
 
     if (!driver_bridge::start_capture(options.pid, 0, options.protocol, nullptr, options.max_payload)) {
         error = driver_bridge::last_error().empty() ? "failed to start packet capture" : driver_bridge::last_error();
+        diag::log_tagged_fmt("gameproto",
+            "capture_failed reason=start_capture pid=%u protocol=%u error=%s elapsed_ms=%llu",
+            options.pid,
+            options.protocol,
+            error.c_str(),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
         return false;
     }
 
@@ -461,6 +479,7 @@ bool capture_packets_bounded(const capture_options_t& input,
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     out = driver_bridge::get_captured_packets(options.max_packets);
+    const size_t raw_count = out.size();
     driver_bridge::stop_capture();
 
     if (options.pid != 0 || options.protocol != 0) {
@@ -478,6 +497,14 @@ bool capture_packets_bounded(const capture_options_t& input,
 
     if (out.size() > options.max_packets)
         out.resize(options.max_packets);
+    diag::log_tagged_fmt("gameproto",
+        "capture_done pid=%u protocol=%u raw_count=%zu filtered_count=%zu capture_ms=%u elapsed_ms=%llu",
+        options.pid,
+        options.protocol,
+        raw_count,
+        out.size(),
+        options.capture_ms,
+        static_cast<unsigned long long>(GetTickCount64() - t0));
     return true;
 }
 
@@ -945,8 +972,19 @@ nlohmann::json record_replay_session(const capture_options_t& options,
         out["session_id"] = session.id;
         out["packet_count"] = session.packets.size();
         out["detection"] = session.detection;
+        out["backend"] = "driver_capture";
+        out["filter_pid"] = options.pid;
+        out["filter_protocol"] = options.protocol;
+        out["capture_ms"] = options.capture_ms;
+        out["requires_recorded_session"] = true;
         map[session.id] = std::move(session);
     }
+    diag::log_tagged_fmt("gameproto",
+        "record_replay_session session_id=%s packets=%u pid=%u protocol=%u",
+        out.value("session_id", std::string()).c_str(),
+        out.value("packet_count", 0u),
+        options.pid,
+        options.protocol);
     return out;
 }
 
@@ -982,8 +1020,14 @@ nlohmann::json stop_replay_recording(const std::string& requested_session_id,
         out["session_id"] = session.id;
         out["packet_count"] = session.packets.size();
         out["detection"] = session.detection;
+        out["backend"] = "driver_capture_stop";
+        out["requires_recorded_session"] = true;
         map[session.id] = std::move(session);
     }
+    diag::log_tagged_fmt("gameproto",
+        "stop_replay_recording session_id=%s packets=%u",
+        out.value("session_id", std::string()).c_str(),
+        out.value("packet_count", 0u));
     return out;
 }
 
@@ -1004,6 +1048,8 @@ nlohmann::json list_replay_sessions()
     nlohmann::json out;
     out["sessions"] = std::move(arr);
     out["count"] = out["sessions"].size();
+    out["requires_recorded_session"] = true;
+    out["record_operation"] = "record";
     return out;
 }
 
@@ -1145,6 +1191,8 @@ bool replay_session(const replay_options_t& input,
     }
 
     out["session_id"] = options.session_id;
+    out["recorded_packet_count"] = session.packets.size();
+    out["replay_requires_existing_session"] = true;
     out["attempted_or_sent"] = sent;
     out["max_packets"] = options.max_packets;
     out["payload_cap"] = options.payload_cap;
