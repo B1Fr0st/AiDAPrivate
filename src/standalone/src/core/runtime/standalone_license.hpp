@@ -117,6 +117,13 @@ namespace standalone_license
     uint64_t get_server_nonce_hash();
     std::string get_session_token();
     std::string get_arc_bind_token();
+    bool build_ida_plugin_auth_proof(const std::string& challenge_hex,
+                                     uint32_t plugin_pid,
+                                     uint32_t mcp_port,
+                                     bool lifecycle_ready,
+                                     bool exports_verified,
+                                     std::string& out_json,
+                                     std::string& error_out);
 }
 
 

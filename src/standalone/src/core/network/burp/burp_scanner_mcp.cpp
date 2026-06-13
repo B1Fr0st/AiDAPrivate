@@ -78,6 +78,15 @@ bool extract_request_payload(const json& params, std::vector<uint8_t>& out_raw, 
     return false;
 }
 
+size_t issue_count_for_audit(uint64_t audit_id)
+{
+    issue_store::initialize();
+    issue_filter_t filter;
+    filter.has_audit_id = true;
+    filter.audit_id = audit_id;
+    return issue_store::list(filter).size();
+}
+
 tool_result_t tool_start_audit(const json& p)
 {
     diag::log_tagged_fmt("mcp_burp", "tool_start_audit url=%s", p.contains("url") && p["url"].is_string() ? p["url"].get<std::string>().c_str() : "<missing>");
@@ -124,6 +133,8 @@ tool_result_t tool_audit_status(const json& p)
     uint64_t id = p["audit_id"].get<uint64_t>();
     active_scanner::audit_status_t st;
     if (!active_scanner::get_status(id, st)) { diag::log_tagged_fmt("mcp_burp", "tool_audit_status not_found id=%llu", static_cast<unsigned long long>(id)); return tool_result_t::error("audit not found"); }
+    const size_t stored_issues = issue_count_for_audit(id);
+    const size_t issues_found = std::max(st.issues_found, stored_issues);
     json data;
     data["id"] = st.id;
     data["url"] = st.url;
@@ -133,12 +144,12 @@ tool_result_t tool_audit_status(const json& p)
     data["total_points"] = st.total_points;
     data["total_probes"] = st.total_probes;
     data["completed_probes"] = st.completed_probes;
-    data["issues_found"] = st.issues_found;
+    data["issues_found"] = issues_found;
     data["running"] = st.running;
     data["cancelled"] = st.cancelled;
     data["started_ms"] = st.started_ms;
     data["ended_ms"] = st.ended_ms;
-    diag::log_tagged_fmt("mcp_burp", "tool_audit_status ok id=%llu running=%d issues=%zu", static_cast<unsigned long long>(id), (int)st.running, st.issues_found);
+    diag::log_tagged_fmt("mcp_burp", "tool_audit_status ok id=%llu running=%d runtime_issues=%zu stored_issues=%zu reported_issues=%zu", static_cast<unsigned long long>(id), (int)st.running, st.issues_found, stored_issues, issues_found);
     return tool_result_t::ok(data);
 }
 
@@ -148,6 +159,8 @@ tool_result_t tool_list_audits(const json&)
     auto v = active_scanner::list_audits();
     json arr = json::array();
     for (const auto& st : v) {
+        const size_t stored_issues = issue_count_for_audit(st.id);
+        const size_t issues_found = std::max(st.issues_found, stored_issues);
         json e;
         e["id"] = st.id;
         e["url"] = st.url;
@@ -156,7 +169,7 @@ tool_result_t tool_list_audits(const json&)
         e["tls"] = st.tls;
         e["total_probes"] = st.total_probes;
         e["completed_probes"] = st.completed_probes;
-        e["issues_found"] = st.issues_found;
+        e["issues_found"] = issues_found;
         e["running"] = st.running;
         e["cancelled"] = st.cancelled;
         e["started_ms"] = st.started_ms;

@@ -1,6 +1,10 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <chrono>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -188,51 +192,308 @@ struct dbghelp_api_t {
 inline dbghelp_api_t g_api;
 inline std::mutex g_api_mutex;
 inline std::mutex g_dbghelp_call_mutex;
+inline std::mutex g_last_error_mutex;
+inline std::string g_last_error;
+
+inline constexpr uint64_t k_dbghelp_load_watchdog_ms = 30000;
+
+struct dbghelp_load_state_t {
+	bool in_progress = false;
+	bool stuck = false;
+	DWORD thread_id = 0;
+	uint64_t started_ms = 0;
+	uint64_t attempt = 0;
+	std::string path;
+};
+
+inline dbghelp_load_state_t g_dbghelp_load_state;
+
+struct dbghelp_load_watchdog_context_t {
+	DWORD thread_id = 0;
+	uint64_t started_ms = 0;
+	uint64_t attempt = 0;
+	std::string path;
+};
+
+inline void set_last_error_text(const std::string& text)
+{
+	std::lock_guard<std::mutex> lk(g_last_error_mutex);
+	g_last_error = text;
+}
+
+inline std::string last_error()
+{
+	std::lock_guard<std::mutex> lk(g_last_error_mutex);
+	return g_last_error;
+}
+
+inline std::string dbghelp_wide_to_utf8(const std::wstring& value)
+{
+	if (value.empty()) return {};
+	int len = WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, nullptr, 0, nullptr, nullptr);
+	if (len <= 1) return {};
+	std::string out(static_cast<size_t>(len - 1), '\0');
+	WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, out.data(), len, nullptr, nullptr);
+	return out;
+}
+
+inline std::wstring resolve_dbghelp_path()
+{
+	wchar_t sys_dir[MAX_PATH] = {};
+	UINT len = GetSystemDirectoryW(sys_dir, MAX_PATH);
+	if (len == 0 || len >= MAX_PATH)
+		return L"C:\\Windows\\System32\\dbghelp.dll";
+	std::wstring path(sys_dir, sys_dir + len);
+	if (!path.empty() && path.back() != L'\\')
+		path.push_back(L'\\');
+	path += L"dbghelp.dll";
+	return path;
+}
+
+inline void log_dbghelp_prestate(DWORD tid, const std::wstring& dbghelp_path, const std::string& dbghelp_path_log)
+{
+	SetLastError(ERROR_SUCCESS);
+	HMODULE existing = GetModuleHandleW(L"dbghelp.dll");
+	DWORD existing_gle = GetLastError();
+	wchar_t existing_path[MAX_PATH] = {};
+	DWORD existing_len = 0;
+	DWORD existing_path_gle = ERROR_SUCCESS;
+	if (existing) {
+		SetLastError(ERROR_SUCCESS);
+		existing_len = GetModuleFileNameW(existing, existing_path, MAX_PATH);
+		existing_path_gle = GetLastError();
+	}
+	WIN32_FILE_ATTRIBUTE_DATA attrs{};
+	SetLastError(ERROR_SUCCESS);
+	BOOL attrs_ok = GetFileAttributesExW(dbghelp_path.c_str(), GetFileExInfoStandard, &attrs);
+	DWORD attrs_gle = GetLastError();
+	ULARGE_INTEGER size{};
+	if (attrs_ok) {
+		size.HighPart = attrs.nFileSizeHigh;
+		size.LowPart = attrs.nFileSizeLow;
+	}
+	const std::string existing_path_log = existing_len ? dbghelp_wide_to_utf8(std::wstring(existing_path, existing_path + existing_len)) : std::string();
+	diag::log_tagged_fmt("pdb",
+		"load_dbghelp_prestate tid=%lu requested_path='%s' existing_hmod=%p existing_gle=%lu existing_path='%s' existing_path_len=%lu existing_path_gle=%lu attrs_ok=%d attrs=0x%08lX size=%llu attrs_gle=%lu",
+		tid,
+		dbghelp_path_log.c_str(),
+		existing,
+		existing_gle,
+		existing_path_log.c_str(),
+		existing_len,
+		existing_path_gle,
+		attrs_ok ? 1 : 0,
+		attrs_ok ? attrs.dwFileAttributes : 0,
+		static_cast<unsigned long long>(size.QuadPart),
+		attrs_gle);
+}
+
+inline void CALLBACK dbghelp_load_watchdog_cb(PVOID param, BOOLEAN) noexcept
+{
+	auto* ctx = static_cast<dbghelp_load_watchdog_context_t*>(param);
+	if (!ctx)
+		return;
+	uint64_t elapsed = GetTickCount64() - ctx->started_ms;
+	bool marked = false;
+	{
+		std::lock_guard<std::mutex> lk(g_api_mutex);
+		if (g_dbghelp_load_state.in_progress &&
+			g_dbghelp_load_state.attempt == ctx->attempt &&
+			g_dbghelp_load_state.thread_id == ctx->thread_id) {
+			g_dbghelp_load_state.stuck = true;
+			marked = true;
+		}
+	}
+	if (marked) {
+		char detail[512];
+		std::snprintf(detail, sizeof(detail),
+			"DbgHelp LoadLibraryExW still has not returned after %llu ms for %s on tid %lu",
+			static_cast<unsigned long long>(elapsed),
+			ctx->path.c_str(),
+			ctx->thread_id);
+		set_last_error_text(detail);
+		diag::log_tagged_fmt("pdb",
+			"load_dbghelp_watchdog_stuck tid=%lu attempt=%llu path='%s' elapsed_ms=%llu",
+			ctx->thread_id,
+			static_cast<unsigned long long>(ctx->attempt),
+			ctx->path.c_str(),
+			static_cast<unsigned long long>(elapsed));
+	}
+}
 
 inline bool load_dbghelp()
 {
-	std::lock_guard<std::mutex> lk(g_api_mutex);
-	if (g_api.loaded) return true;
+	const DWORD tid = GetCurrentThreadId();
+	uint64_t wait_start = GetTickCount64();
+	const std::wstring dbghelp_path = resolve_dbghelp_path();
+	const std::string dbghelp_path_log = dbghelp_wide_to_utf8(dbghelp_path);
+	uint64_t attempt = 0;
+	diag::log_tagged_fmt("pdb", "load_dbghelp_enter tid=%lu path='%s'", tid, dbghelp_path_log.c_str());
+	log_dbghelp_prestate(tid, dbghelp_path, dbghelp_path_log);
+	{
+		std::unique_lock<std::mutex> lk(g_api_mutex);
+		diag::log_tagged_fmt("pdb", "load_dbghelp_locked tid=%lu wait_ms=%llu cached=%d hmod=%p in_progress=%d stuck=%d owner_tid=%lu owner_elapsed_ms=%llu",
+			tid,
+			static_cast<unsigned long long>(GetTickCount64() - wait_start),
+			g_api.loaded ? 1 : 0,
+			g_api.hmod,
+			g_dbghelp_load_state.in_progress ? 1 : 0,
+			g_dbghelp_load_state.stuck ? 1 : 0,
+			g_dbghelp_load_state.thread_id,
+			g_dbghelp_load_state.in_progress ? static_cast<unsigned long long>(GetTickCount64() - g_dbghelp_load_state.started_ms) : 0ULL);
+		if (g_api.loaded) {
+			set_last_error_text({});
+			return true;
+		}
+		if (g_dbghelp_load_state.in_progress) {
+			const uint64_t owner_elapsed = GetTickCount64() - g_dbghelp_load_state.started_ms;
+			if (owner_elapsed >= k_dbghelp_load_watchdog_ms)
+				g_dbghelp_load_state.stuck = true;
+			char detail[512];
+			std::snprintf(detail, sizeof(detail),
+				"DbgHelp loader is already %s on tid %lu for %llu ms while loading %s",
+				g_dbghelp_load_state.stuck ? "stuck" : "in progress",
+				g_dbghelp_load_state.thread_id,
+				static_cast<unsigned long long>(owner_elapsed),
+				g_dbghelp_load_state.path.c_str());
+			set_last_error_text(detail);
+			diag::log_tagged_fmt("pdb",
+				"load_dbghelp_busy tid=%lu owner_tid=%lu owner_elapsed_ms=%llu owner_attempt=%llu stuck=%d path='%s'",
+				tid,
+				g_dbghelp_load_state.thread_id,
+				static_cast<unsigned long long>(owner_elapsed),
+				static_cast<unsigned long long>(g_dbghelp_load_state.attempt),
+				g_dbghelp_load_state.stuck ? 1 : 0,
+				g_dbghelp_load_state.path.c_str());
+			return false;
+		}
+		g_dbghelp_load_state.in_progress = true;
+		g_dbghelp_load_state.stuck = false;
+		g_dbghelp_load_state.thread_id = tid;
+		g_dbghelp_load_state.started_ms = GetTickCount64();
+		g_dbghelp_load_state.path = dbghelp_path_log;
+		attempt = ++g_dbghelp_load_state.attempt;
+	}
 
-	g_api.hmod = LoadLibraryW(L"dbghelp.dll");
-	if (!g_api.hmod) {
-		DWORD err = GetLastError();
+	auto* watchdog_ctx = new dbghelp_load_watchdog_context_t{};
+	watchdog_ctx->thread_id = tid;
+	watchdog_ctx->started_ms = GetTickCount64();
+	watchdog_ctx->attempt = attempt;
+	watchdog_ctx->path = dbghelp_path_log;
+	HANDLE watchdog_timer = nullptr;
+	SetLastError(ERROR_SUCCESS);
+	BOOL watchdog_ok = CreateTimerQueueTimer(&watchdog_timer, nullptr, dbghelp_load_watchdog_cb, watchdog_ctx,
+		static_cast<DWORD>(k_dbghelp_load_watchdog_ms), 0, WT_EXECUTEDEFAULT);
+	DWORD watchdog_gle = GetLastError();
+	diag::log_tagged_fmt("pdb",
+		"load_dbghelp_watchdog_schedule tid=%lu attempt=%llu ok=%d timer=%p timeout_ms=%llu gle=%lu",
+		tid,
+		static_cast<unsigned long long>(attempt),
+		watchdog_ok ? 1 : 0,
+		watchdog_timer,
+		static_cast<unsigned long long>(k_dbghelp_load_watchdog_ms),
+		watchdog_gle);
+
+	const uint64_t load_start = GetTickCount64();
+	diag::log_tagged_fmt("pdb", "load_dbghelp_LoadLibrary_begin tid=%lu path='%s'", tid, dbghelp_path_log.c_str());
+	SetLastError(ERROR_SUCCESS);
+	HMODULE loaded_hmod = LoadLibraryExW(dbghelp_path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+	DWORD load_gle = GetLastError();
+	diag::log_tagged_fmt("pdb", "load_dbghelp_LoadLibrary_end tid=%lu path='%s' hmod=%p gle=%lu elapsed_ms=%llu",
+		tid, dbghelp_path_log.c_str(), loaded_hmod, load_gle,
+		static_cast<unsigned long long>(GetTickCount64() - load_start));
+	if (watchdog_ok) {
+		SetLastError(ERROR_SUCCESS);
+		BOOL deleted = DeleteTimerQueueTimer(nullptr, watchdog_timer, INVALID_HANDLE_VALUE);
+		DWORD delete_gle = GetLastError();
 		diag::log_tagged_fmt("pdb",
-			"load_dbghelp failed reason='LoadLibrary' err=%lu", err);
+			"load_dbghelp_watchdog_delete tid=%lu attempt=%llu ok=%d gle=%lu",
+			tid,
+			static_cast<unsigned long long>(attempt),
+			deleted ? 1 : 0,
+			delete_gle);
+	}
+	delete watchdog_ctx;
+	if (!loaded_hmod) {
+		{
+			std::lock_guard<std::mutex> lk(g_api_mutex);
+			if (g_dbghelp_load_state.attempt == attempt) {
+				g_dbghelp_load_state.in_progress = false;
+				g_dbghelp_load_state.thread_id = 0;
+			}
+		}
+		char detail[512];
+		std::snprintf(detail, sizeof(detail), "LoadLibraryExW(%s) failed with Win32 error %lu", dbghelp_path_log.c_str(), load_gle);
+		set_last_error_text(detail);
+		diag::log_tagged_fmt("pdb",
+			"load_dbghelp failed reason='LoadLibraryExW' path='%s' err=%lu elapsed_ms=%llu",
+			dbghelp_path_log.c_str(), load_gle,
+			static_cast<unsigned long long>(GetTickCount64() - wait_start));
 		return false;
 	}
 
+	dbghelp_api_t candidate{};
+	candidate.hmod = loaded_hmod;
 	auto gp = [&](const char* name) -> FARPROC {
-		return GetProcAddress(g_api.hmod, name);
+		const uint64_t export_start = GetTickCount64();
+		SetLastError(ERROR_SUCCESS);
+		FARPROC proc = GetProcAddress(loaded_hmod, name);
+		DWORD export_gle = GetLastError();
+		diag::log_tagged_fmt("pdb",
+			"load_dbghelp_export name=%s ok=%d elapsed_ms=%llu gle=%lu",
+			name,
+			proc ? 1 : 0,
+			static_cast<unsigned long long>(GetTickCount64() - export_start),
+			export_gle);
+		return proc;
 	};
 
-	g_api.pSymInitializeW    = reinterpret_cast<fn_SymInitializeW>(gp("SymInitializeW"));
-	g_api.pSymCleanup        = reinterpret_cast<fn_SymCleanup>(gp("SymCleanup"));
-	g_api.pSymLoadModuleExW  = reinterpret_cast<fn_SymLoadModuleExW>(gp("SymLoadModuleExW"));
-	g_api.pSymUnloadModule64 = reinterpret_cast<fn_SymUnloadModule64>(gp("SymUnloadModule64"));
-	g_api.pSymSetSearchPathW = reinterpret_cast<fn_SymSetSearchPathW>(gp("SymSetSearchPathW"));
-	g_api.pSymSetOptions     = reinterpret_cast<fn_SymSetOptions>(gp("SymSetOptions"));
-	g_api.pSymGetOptions     = reinterpret_cast<fn_SymGetOptions>(gp("SymGetOptions"));
-	g_api.pSymEnumSymbolsExW = reinterpret_cast<fn_SymEnumSymbolsExW>(gp("SymEnumSymbolsExW"));
-	g_api.pSymGetTypeInfo    = reinterpret_cast<fn_SymGetTypeInfo>(gp("SymGetTypeInfo"));
-	g_api.pSymEnumTypesW     = reinterpret_cast<fn_SymEnumTypesW>(gp("SymEnumTypesW"));
+	candidate.pSymInitializeW    = reinterpret_cast<fn_SymInitializeW>(gp("SymInitializeW"));
+	candidate.pSymCleanup        = reinterpret_cast<fn_SymCleanup>(gp("SymCleanup"));
+	candidate.pSymLoadModuleExW  = reinterpret_cast<fn_SymLoadModuleExW>(gp("SymLoadModuleExW"));
+	candidate.pSymUnloadModule64 = reinterpret_cast<fn_SymUnloadModule64>(gp("SymUnloadModule64"));
+	candidate.pSymSetSearchPathW = reinterpret_cast<fn_SymSetSearchPathW>(gp("SymSetSearchPathW"));
+	candidate.pSymSetOptions     = reinterpret_cast<fn_SymSetOptions>(gp("SymSetOptions"));
+	candidate.pSymGetOptions     = reinterpret_cast<fn_SymGetOptions>(gp("SymGetOptions"));
+	candidate.pSymEnumSymbolsExW = reinterpret_cast<fn_SymEnumSymbolsExW>(gp("SymEnumSymbolsExW"));
+	candidate.pSymGetTypeInfo    = reinterpret_cast<fn_SymGetTypeInfo>(gp("SymGetTypeInfo"));
+	candidate.pSymEnumTypesW     = reinterpret_cast<fn_SymEnumTypesW>(gp("SymEnumTypesW"));
 
-	if (!g_api.pSymInitializeW || !g_api.pSymCleanup || !g_api.pSymLoadModuleExW ||
-	    !g_api.pSymEnumSymbolsExW || !g_api.pSymGetTypeInfo) {
-		FreeLibrary(g_api.hmod);
-		g_api.hmod = nullptr;
+	if (!candidate.pSymInitializeW || !candidate.pSymCleanup || !candidate.pSymLoadModuleExW ||
+	    !candidate.pSymEnumSymbolsExW || !candidate.pSymGetTypeInfo) {
+		FreeLibrary(loaded_hmod);
 		diag::log_tagged_fmt("pdb",
 			"load_dbghelp failed reason='missing_export' init=%d cleanup=%d loadmod=%d enumsym=%d gettypeinfo=%d",
-			g_api.pSymInitializeW    ? 1 : 0,
-			g_api.pSymCleanup        ? 1 : 0,
-			g_api.pSymLoadModuleExW  ? 1 : 0,
-			g_api.pSymEnumSymbolsExW ? 1 : 0,
-			g_api.pSymGetTypeInfo    ? 1 : 0);
+			candidate.pSymInitializeW    ? 1 : 0,
+			candidate.pSymCleanup        ? 1 : 0,
+			candidate.pSymLoadModuleExW  ? 1 : 0,
+			candidate.pSymEnumSymbolsExW ? 1 : 0,
+			candidate.pSymGetTypeInfo    ? 1 : 0);
+		{
+			std::lock_guard<std::mutex> lk(g_api_mutex);
+			if (g_dbghelp_load_state.attempt == attempt) {
+				g_dbghelp_load_state.in_progress = false;
+				g_dbghelp_load_state.thread_id = 0;
+			}
+		}
+		set_last_error_text("DbgHelp was loaded but required Sym* exports were missing");
 		return false;
 	}
 
-	g_api.loaded = true;
-	diag::log_tagged_fmt("pdb", "load_dbghelp ok");
+	candidate.loaded = true;
+	{
+		std::lock_guard<std::mutex> lk(g_api_mutex);
+		g_api = candidate;
+		if (g_dbghelp_load_state.attempt == attempt) {
+			g_dbghelp_load_state.in_progress = false;
+			g_dbghelp_load_state.stuck = false;
+			g_dbghelp_load_state.thread_id = 0;
+		}
+	}
+	set_last_error_text({});
+	diag::log_tagged_fmt("pdb", "load_dbghelp ok path='%s' elapsed_ms=%llu",
+		dbghelp_path_log.c_str(),
+		static_cast<unsigned long long>(GetTickCount64() - wait_start));
 	return true;
 }
 
@@ -526,21 +787,49 @@ inline bool parse_pdb(const std::string& pdb_path,
                       std::atomic<bool>* cancel = nullptr)
 {
 	uint64_t t_begin = GetTickCount64();
+	const DWORD tid = GetCurrentThreadId();
 	uint64_t pdb_bytes = 0;
 	{
 		std::error_code ec;
 		auto sz = std::filesystem::file_size(pdb_path, ec);
 		if (!ec) pdb_bytes = static_cast<uint64_t>(sz);
 	}
+	diag::log_tagged_fmt("pdb",
+		"parse_pdb_entry tid=%lu path='%s' bytes=%llu search_len=%zu cancel_ptr=%p",
+		tid, pdb_path.c_str(), static_cast<unsigned long long>(pdb_bytes),
+		symbol_search_path.size(), static_cast<void*>(cancel));
+	set_last_error_text({});
 
 	if (!load_dbghelp()) {
+		const std::string detail = last_error();
 		diag::log_tagged_fmt("pdb",
-			"parse_pdb_failed reason='dbghelp_load' path='%s'",
-			pdb_path.c_str());
+			"parse_pdb_failed reason='dbghelp_load' path='%s' detail='%s'",
+			pdb_path.c_str(), detail.c_str());
 		return false;
 	}
 
-	std::lock_guard<std::mutex> dbghelp_lk(g_dbghelp_call_mutex);
+	uint64_t dbghelp_wait_start = GetTickCount64();
+	diag::log_tagged_fmt("pdb", "parse_pdb_dbghelp_mutex_wait tid=%lu path='%s'", tid, pdb_path.c_str());
+	std::unique_lock<std::mutex> dbghelp_lk(g_dbghelp_call_mutex, std::defer_lock);
+	while (!dbghelp_lk.try_lock()) {
+		const uint64_t waited = GetTickCount64() - dbghelp_wait_start;
+		if (waited >= 30000) {
+			char detail[512];
+			std::snprintf(detail, sizeof(detail), "DbgHelp call mutex was not acquired after %llu ms for %s",
+				static_cast<unsigned long long>(waited),
+				pdb_path.c_str());
+			set_last_error_text(detail);
+			diag::log_tagged_fmt("pdb",
+				"parse_pdb_failed reason='dbghelp_mutex_timeout' tid=%lu wait_ms=%llu path='%s'",
+				tid,
+				static_cast<unsigned long long>(waited),
+				pdb_path.c_str());
+			return false;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(25));
+	}
+	diag::log_tagged_fmt("pdb", "parse_pdb_dbghelp_mutex_acquired tid=%lu wait_ms=%llu path='%s'",
+		tid, static_cast<unsigned long long>(GetTickCount64() - dbghelp_wait_start), pdb_path.c_str());
 
 	out = {};
 	out.file_path = pdb_path;
@@ -550,34 +839,104 @@ inline bool parse_pdb(const std::string& pdb_path,
 
 	HANDLE hFakeProc = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(GetCurrentProcessId() ^ 0xABCD0000));
 
+	std::string search_lower = symbol_search_path;
+	std::transform(search_lower.begin(), search_lower.end(), search_lower.begin(),
+		[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+	const bool local_only_search = !symbol_search_path.empty() &&
+		search_lower.find("srv*") == std::string::npos &&
+		search_lower.find("symsrv") == std::string::npos;
 	DWORD opts = g_api.pSymGetOptions ? g_api.pSymGetOptions() : 0;
+	const DWORD old_opts = opts;
 	opts |= 0x00000004;
 	opts |= 0x00000010;
 	opts |= 0x00000200;
+	if (local_only_search) {
+		opts |= 0x00001000;
+		opts |= 0x00020000;
+		opts |= 0x00080000;
+		opts |= 0x02000000;
+		opts |= 0x40000000;
+	}
 	opts &= ~0x00000001;
-	if (g_api.pSymSetOptions) g_api.pSymSetOptions(opts);
+	DWORD applied_opts = opts;
+	if (g_api.pSymSetOptions)
+		applied_opts = g_api.pSymSetOptions(opts);
+	diag::log_tagged_fmt("pdb",
+		"parse_pdb_SymSetOptions tid=%lu old=0x%08lX requested=0x%08lX applied=0x%08lX local_only=%d",
+		tid,
+		old_opts,
+		opts,
+		applied_opts,
+		local_only_search ? 1 : 0);
 
 	std::wstring wSearchPath = detail::utf8_to_wstr(symbol_search_path);
-	if (!g_api.pSymInitializeW(hFakeProc, wSearchPath.empty() ? nullptr : wSearchPath.c_str(), FALSE)) {
-		DWORD err = GetLastError();
+	uint64_t phase_start = GetTickCount64();
+	diag::log_tagged_fmt("pdb", "parse_pdb_SymInitialize_begin tid=%lu fake_proc=%p search_len=%zu",
+		tid, hFakeProc, wSearchPath.size());
+	SetLastError(ERROR_SUCCESS);
+	BOOL init_ok = g_api.pSymInitializeW(hFakeProc, wSearchPath.empty() ? nullptr : wSearchPath.c_str(), FALSE);
+	DWORD init_err = GetLastError();
+	diag::log_tagged_fmt("pdb",
+		"parse_pdb_SymInitialize_end tid=%lu ok=%d fake_proc=%p gle=%lu elapsed_ms=%llu",
+		tid,
+		init_ok ? 1 : 0,
+		hFakeProc,
+		init_err,
+		static_cast<unsigned long long>(GetTickCount64() - phase_start));
+	if (!init_ok) {
+		char detail[512];
+		std::snprintf(detail, sizeof(detail), "SymInitializeW failed with Win32 error %lu for %s", init_err, pdb_path.c_str());
+		set_last_error_text(detail);
 		diag::log_tagged_fmt("pdb",
 			"parse_pdb_failed reason='SymInitializeW' path='%s' err=%lu",
-			pdb_path.c_str(), err);
+			pdb_path.c_str(), init_err);
 		return false;
 	}
+	diag::log_tagged_fmt("pdb", "parse_pdb_SymInitialize_ok tid=%lu fake_proc=%p", tid, hFakeProc);
 
-	if (!wSearchPath.empty() && g_api.pSymSetSearchPathW)
-		g_api.pSymSetSearchPathW(hFakeProc, wSearchPath.c_str());
+	if (!wSearchPath.empty() && g_api.pSymSetSearchPathW) {
+		phase_start = GetTickCount64();
+		diag::log_tagged_fmt("pdb", "parse_pdb_SymSetSearchPath_begin tid=%lu search_len=%zu",
+			tid, wSearchPath.size());
+		SetLastError(ERROR_SUCCESS);
+		BOOL search_ok = g_api.pSymSetSearchPathW(hFakeProc, wSearchPath.c_str());
+		DWORD search_gle = GetLastError();
+		diag::log_tagged_fmt("pdb",
+			"parse_pdb_SymSetSearchPath_end tid=%lu ok=%d gle=%lu elapsed_ms=%llu",
+			tid,
+			search_ok ? 1 : 0,
+			search_gle,
+			static_cast<unsigned long long>(GetTickCount64() - phase_start));
+	}
 
 	std::wstring wPdbPath = detail::utf8_to_wstr(pdb_path);
+	phase_start = GetTickCount64();
+	diag::log_tagged_fmt("pdb", "parse_pdb_SymLoadModule_begin tid=%lu path='%s'", tid, pdb_path.c_str());
+	SetLastError(ERROR_SUCCESS);
 	DWORD64 modBase = g_api.pSymLoadModuleExW(hFakeProc, nullptr, wPdbPath.c_str(), nullptr,
 	                                           0x10000000, 0x01000000, nullptr, 0);
+	DWORD load_module_gle = GetLastError();
+	diag::log_tagged_fmt("pdb", "parse_pdb_SymLoadModule_end tid=%lu modBase=0x%llX gle=%lu elapsed_ms=%llu",
+		tid,
+		static_cast<unsigned long long>(modBase),
+		load_module_gle,
+		static_cast<unsigned long long>(GetTickCount64() - phase_start));
 	if (!modBase) {
-		DWORD err = GetLastError();
+		char detail[512];
+		std::snprintf(detail, sizeof(detail), "SymLoadModuleExW failed with Win32 error %lu for %s", load_module_gle, pdb_path.c_str());
+		set_last_error_text(detail);
 		diag::log_tagged_fmt("pdb",
 			"parse_pdb_failed reason='SymLoadModuleExW' path='%s' err=%lu",
-			pdb_path.c_str(), err);
+			pdb_path.c_str(), load_module_gle);
+		phase_start = GetTickCount64();
+		diag::log_tagged_fmt("pdb", "parse_pdb_cleanup_after_load_failure_begin tid=%lu", tid);
+		SetLastError(ERROR_SUCCESS);
 		g_api.pSymCleanup(hFakeProc);
+		diag::log_tagged_fmt("pdb",
+			"parse_pdb_cleanup_after_load_failure_end tid=%lu gle=%lu elapsed_ms=%llu",
+			tid,
+			GetLastError(),
+			static_cast<unsigned long long>(GetTickCount64() - phase_start));
 		return false;
 	}
 
@@ -594,12 +953,32 @@ inline bool parse_pdb(const std::string& pdb_path,
 	symCtx.modBase = modBase;
 	symCtx.symbols = &out.symbols;
 
-	g_api.pSymEnumSymbolsExW(hFakeProc, modBase, L"*", detail::sym_enum_callback, &symCtx, 0);
+	phase_start = GetTickCount64();
+	diag::log_tagged_fmt("pdb", "parse_pdb_SymEnumSymbols_begin tid=%lu modBase=0x%llX",
+		tid, static_cast<unsigned long long>(modBase));
+	SetLastError(ERROR_SUCCESS);
+	BOOL enum_symbols_ok = g_api.pSymEnumSymbolsExW(hFakeProc, modBase, L"*", detail::sym_enum_callback, &symCtx, 0);
+	DWORD enum_symbols_gle = GetLastError();
+	diag::log_tagged_fmt("pdb", "parse_pdb_SymEnumSymbols_end tid=%lu ok=%d symbols=%zu gle=%lu elapsed_ms=%llu",
+		tid,
+		enum_symbols_ok ? 1 : 0,
+		out.symbols.size(),
+		enum_symbols_gle,
+		static_cast<unsigned long long>(GetTickCount64() - phase_start));
 
 	if (progress) progress->store(0.4f);
 	if (cancel && cancel->load()) {
+		phase_start = GetTickCount64();
+		diag::log_tagged_fmt("pdb", "parse_pdb_cancel_cleanup_begin tid=%lu modBase=0x%llX",
+			tid, static_cast<unsigned long long>(modBase));
+		SetLastError(ERROR_SUCCESS);
 		g_api.pSymUnloadModule64(hFakeProc, modBase);
 		g_api.pSymCleanup(hFakeProc);
+		diag::log_tagged_fmt("pdb", "parse_pdb_cancel_cleanup_end tid=%lu gle=%lu elapsed_ms=%llu",
+			tid,
+			GetLastError(),
+			static_cast<unsigned long long>(GetTickCount64() - phase_start));
+		set_last_error_text("PDB parse was cancelled by caller");
 		diag::log_tagged_fmt("pdb",
 			"parse_pdb_cancelled path='%s' syms=%zu",
 			pdb_path.c_str(), out.symbols.size());
@@ -617,14 +996,31 @@ inline bool parse_pdb(const std::string& pdb_path,
 	typeCtx.hProc = hFakeProc;
 	typeCtx.modBase = modBase;
 
-	if (g_api.pSymEnumTypesW)
-		g_api.pSymEnumTypesW(hFakeProc, modBase, detail::type_enum_callback, &typeCtx);
+	if (g_api.pSymEnumTypesW) {
+		phase_start = GetTickCount64();
+		diag::log_tagged_fmt("pdb", "parse_pdb_SymEnumTypes_begin tid=%lu modBase=0x%llX",
+			tid, static_cast<unsigned long long>(modBase));
+		SetLastError(ERROR_SUCCESS);
+		BOOL enum_types_ok = g_api.pSymEnumTypesW(hFakeProc, modBase, detail::type_enum_callback, &typeCtx);
+		DWORD enum_types_gle = GetLastError();
+		diag::log_tagged_fmt("pdb", "parse_pdb_SymEnumTypes_end tid=%lu ok=%d udt=%zu enums=%zu gle=%lu elapsed_ms=%llu",
+			tid,
+			enum_types_ok ? 1 : 0,
+			typeCtx.udt_indices.size(),
+			typeCtx.enum_indices.size(),
+			enum_types_gle,
+			static_cast<unsigned long long>(GetTickCount64() - phase_start));
+	} else {
+		diag::log_tagged_fmt("pdb", "parse_pdb_SymEnumTypes_missing tid=%lu", tid);
+	}
 
 	if (progress) progress->store(0.6f);
 
 	size_t total_types = typeCtx.udt_indices.size() + typeCtx.enum_indices.size();
 	size_t processed = 0;
 
+	phase_start = GetTickCount64();
+	diag::log_tagged_fmt("pdb", "parse_pdb_import_udt_begin tid=%lu total=%zu", tid, typeCtx.udt_indices.size());
 	for (ULONG ti : typeCtx.udt_indices) {
 		if (cancel && cancel->load()) break;
 
@@ -657,7 +1053,14 @@ inline bool parse_pdb(const std::string& pdb_path,
 		if (progress && total_types > 0)
 			progress->store(0.6f + 0.35f * (static_cast<float>(processed) / static_cast<float>(total_types)));
 	}
+	diag::log_tagged_fmt("pdb", "parse_pdb_import_udt_end tid=%lu structs=%zu processed=%zu elapsed_ms=%llu",
+		tid,
+		out.structs.size(),
+		processed,
+		static_cast<unsigned long long>(GetTickCount64() - phase_start));
 
+	phase_start = GetTickCount64();
+	diag::log_tagged_fmt("pdb", "parse_pdb_import_enum_begin tid=%lu total=%zu", tid, typeCtx.enum_indices.size());
 	for (ULONG ti : typeCtx.enum_indices) {
 		if (cancel && cancel->load()) break;
 
@@ -677,12 +1080,35 @@ inline bool parse_pdb(const std::string& pdb_path,
 		if (progress && total_types > 0)
 			progress->store(0.6f + 0.35f * (static_cast<float>(processed) / static_cast<float>(total_types)));
 	}
+	diag::log_tagged_fmt("pdb", "parse_pdb_import_enum_end tid=%lu enums=%zu processed=%zu elapsed_ms=%llu",
+		tid,
+		out.enums.size(),
+		processed,
+		static_cast<unsigned long long>(GetTickCount64() - phase_start));
 
-	g_api.pSymUnloadModule64(hFakeProc, modBase);
-	g_api.pSymCleanup(hFakeProc);
+	phase_start = GetTickCount64();
+	diag::log_tagged_fmt("pdb", "parse_pdb_cleanup_begin tid=%lu modBase=0x%llX", tid, static_cast<unsigned long long>(modBase));
+	SetLastError(ERROR_SUCCESS);
+	BOOL unload_ok = g_api.pSymUnloadModule64(hFakeProc, modBase);
+	DWORD unload_gle = GetLastError();
+	diag::log_tagged_fmt("pdb", "parse_pdb_SymUnloadModule_end tid=%lu ok=%d gle=%lu elapsed_ms=%llu",
+		tid,
+		unload_ok ? 1 : 0,
+		unload_gle,
+		static_cast<unsigned long long>(GetTickCount64() - phase_start));
+	phase_start = GetTickCount64();
+	SetLastError(ERROR_SUCCESS);
+	BOOL cleanup_ok = g_api.pSymCleanup(hFakeProc);
+	DWORD cleanup_gle = GetLastError();
+	diag::log_tagged_fmt("pdb", "parse_pdb_cleanup_end tid=%lu ok=%d gle=%lu elapsed_ms=%llu",
+		tid,
+		cleanup_ok ? 1 : 0,
+		cleanup_gle,
+		static_cast<unsigned long long>(GetTickCount64() - phase_start));
 
 	out.loaded = true;
 	if (progress) progress->store(1.f);
+	set_last_error_text({});
 
 	uint64_t elapsed_ms = GetTickCount64() - t_begin;
 	bool cancelled = (cancel && cancel->load());

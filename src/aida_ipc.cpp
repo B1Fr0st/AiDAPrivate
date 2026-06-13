@@ -10,14 +10,21 @@
 #include "aida_pro.hpp"
 
 #include <windows.h>
+#include <bcrypt.h>
+#pragma comment(lib, "bcrypt.lib")
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cstdint>
 #include <cstdlib>
+#include <ctime>
 #include <fstream>
+#include <iomanip>
 #include <iterator>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -37,6 +44,216 @@ namespace
     std::atomic<int>  g_verified_port{0};
     std::mutex        g_state_mutex;
     std::string       g_last_failure;
+
+    std::string bytes_to_hex(const unsigned char* data, size_t size)
+    {
+        static const char digits[] = "0123456789abcdef";
+        std::string out(size * 2, '\0');
+        for (size_t i = 0; i < size; ++i)
+        {
+            out[(i * 2) + 0] = digits[(data[i] >> 4) & 0x0F];
+            out[(i * 2) + 1] = digits[data[i] & 0x0F];
+        }
+        return out;
+    }
+
+    std::vector<unsigned char> base64_decode(const std::string& text)
+    {
+        static const signed char table[256] = {
+            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
+            52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
+            -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+            15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+            -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+            41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
+            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
+        };
+        std::vector<unsigned char> out;
+        int val = 0;
+        int valb = -8;
+        for (unsigned char c : text)
+        {
+            if (c == '=')
+                break;
+            if (std::isspace(c))
+                continue;
+            int d = table[c];
+            if (d < 0)
+                return {};
+            val = (val << 6) | d;
+            valb += 6;
+            if (valb >= 0)
+            {
+                out.push_back(static_cast<unsigned char>((val >> valb) & 0xFF));
+                valb -= 8;
+            }
+        }
+        return out;
+    }
+
+    bool constant_time_equal(const std::string& a, const std::string& b)
+    {
+        if (a.size() != b.size())
+            return false;
+        unsigned char diff = 0;
+        for (size_t i = 0; i < a.size(); ++i)
+            diff |= static_cast<unsigned char>(a[i] ^ b[i]);
+        return diff == 0;
+    }
+
+    std::string sha256_hex(const std::string& text)
+    {
+        BCRYPT_ALG_HANDLE alg = nullptr;
+        BCRYPT_HASH_HANDLE hash = nullptr;
+        unsigned char digest[32] = {};
+        if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0)
+            return {};
+        if (BCryptCreateHash(alg, &hash, nullptr, 0, nullptr, 0, 0) != 0)
+        {
+            BCryptCloseAlgorithmProvider(alg, 0);
+            return {};
+        }
+        bool ok = BCryptHashData(hash,
+            reinterpret_cast<PUCHAR>(const_cast<char*>(text.data())),
+            static_cast<ULONG>(text.size()),
+            0) == 0 &&
+            BCryptFinishHash(hash, digest, sizeof(digest), 0) == 0;
+        BCryptDestroyHash(hash);
+        BCryptCloseAlgorithmProvider(alg, 0);
+        if (!ok)
+        {
+            SecureZeroMemory(digest, sizeof(digest));
+            return {};
+        }
+        std::string out = bytes_to_hex(digest, sizeof(digest));
+        SecureZeroMemory(digest, sizeof(digest));
+        return out;
+    }
+
+    std::string hmac_sha256_hex(const std::vector<unsigned char>& key, const std::string& data)
+    {
+        if (key.empty())
+            return {};
+        BCRYPT_ALG_HANDLE alg = nullptr;
+        BCRYPT_HASH_HANDLE hash = nullptr;
+        unsigned char digest[32] = {};
+        if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG) != 0)
+            return {};
+        if (BCryptCreateHash(alg, &hash, nullptr, 0,
+                const_cast<PUCHAR>(key.data()), static_cast<ULONG>(key.size()), 0) != 0)
+        {
+            BCryptCloseAlgorithmProvider(alg, 0);
+            return {};
+        }
+        bool ok = BCryptHashData(hash,
+            reinterpret_cast<PUCHAR>(const_cast<char*>(data.data())),
+            static_cast<ULONG>(data.size()),
+            0) == 0 &&
+            BCryptFinishHash(hash, digest, sizeof(digest), 0) == 0;
+        BCryptDestroyHash(hash);
+        BCryptCloseAlgorithmProvider(alg, 0);
+        if (!ok)
+        {
+            SecureZeroMemory(digest, sizeof(digest));
+            return {};
+        }
+        std::string out = bytes_to_hex(digest, sizeof(digest));
+        SecureZeroMemory(digest, sizeof(digest));
+        return out;
+    }
+
+    std::string generate_challenge_hex()
+    {
+        unsigned char challenge[32] = {};
+        if (BCryptGenRandom(nullptr, challenge, sizeof(challenge), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0)
+            return {};
+        std::string out = bytes_to_hex(challenge, sizeof(challenge));
+        SecureZeroMemory(challenge, sizeof(challenge));
+        return out;
+    }
+
+    bool json_u32(const nlohmann::json& j, const char* key, uint32_t& out)
+    {
+        if (!j.contains(key))
+            return false;
+        if (j[key].is_number_unsigned())
+        {
+            out = j[key].get<uint32_t>();
+            return true;
+        }
+        if (j[key].is_number_integer())
+        {
+            int64_t v = j[key].get<int64_t>();
+            if (v >= 0 && v <= 0xFFFFFFFFll)
+            {
+                out = static_cast<uint32_t>(v);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool json_u64(const nlohmann::json& j, const char* key, uint64_t& out)
+    {
+        if (!j.contains(key))
+            return false;
+        if (j[key].is_number_unsigned())
+        {
+            out = j[key].get<uint64_t>();
+            return true;
+        }
+        if (j[key].is_number_integer())
+        {
+            int64_t v = j[key].get<int64_t>();
+            if (v >= 0)
+            {
+                out = static_cast<uint64_t>(v);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    std::string ida_plugin_proof_canonical(const nlohmann::json& proof)
+    {
+        uint32_t plugin_pid = 0;
+        uint32_t standalone_pid = 0;
+        uint32_t mcp_port = 0;
+        uint64_t issued_tick = 0;
+        uint64_t expires_tick = 0;
+        uint64_t server_nonce_hash = 0;
+        json_u32(proof, "plugin_pid", plugin_pid);
+        json_u32(proof, "standalone_pid", standalone_pid);
+        json_u32(proof, "mcp_port", mcp_port);
+        json_u64(proof, "issued_tick_ms", issued_tick);
+        json_u64(proof, "expires_tick_ms", expires_tick);
+        json_u64(proof, "server_nonce_hash", server_nonce_hash);
+
+        std::ostringstream ss;
+        ss << "AIDA_IDA_PLUGIN_AUTH_V1\n";
+        ss << "challenge=" << proof.value("challenge", std::string()) << "\n";
+        ss << "plugin_pid=" << plugin_pid << "\n";
+        ss << "standalone_pid=" << standalone_pid << "\n";
+        ss << "mcp_port=" << mcp_port << "\n";
+        ss << "issued_tick_ms=" << issued_tick << "\n";
+        ss << "expires_tick_ms=" << expires_tick << "\n";
+        ss << "validated=" << (proof.value("validated", false) ? 1 : 0) << "\n";
+        ss << "arc_loaded=" << (proof.value("arc_loaded", false) ? 1 : 0) << "\n";
+        ss << "lifecycle_ready=" << (proof.value("lifecycle_ready", false) ? 1 : 0) << "\n";
+        ss << "exports_verified=" << (proof.value("exports_verified", false) ? 1 : 0) << "\n";
+        ss << "server_nonce_hash=" << server_nonce_hash << "\n";
+        ss << "signed_payload_sha256=" << proof.value("signed_payload_sha256", std::string()) << "\n";
+        return ss.str();
+    }
 
     bool valid_port(int port)
     {
@@ -152,6 +369,173 @@ namespace
         return _wcsicmp(base, L"AiDAStandalone.exe") == 0;
     }
 
+    bool verify_ida_plugin_auth_proof(const nlohmann::json& proof,
+                                      const std::string& challenge,
+                                      int expected_port,
+                                      std::string& failure)
+    {
+        if (!proof.is_object())
+        {
+            failure = "auth proof response was not JSON object";
+            return false;
+        }
+        if (proof.value("status", std::string()) != "ok" ||
+            proof.value("proof_version", 0) != 1 ||
+            proof.value("server", std::string()) != "aida-pro-mcp")
+        {
+            failure = "auth proof identity mismatch";
+            return false;
+        }
+        if (proof.value("challenge", std::string()) != challenge)
+        {
+            failure = "auth proof challenge mismatch";
+            return false;
+        }
+
+        uint32_t plugin_pid = 0;
+        uint32_t standalone_pid = 0;
+        uint32_t proof_port = 0;
+        uint64_t issued_tick = 0;
+        uint64_t expires_tick = 0;
+        if (!json_u32(proof, "plugin_pid", plugin_pid) ||
+            !json_u32(proof, "standalone_pid", standalone_pid) ||
+            !json_u32(proof, "mcp_port", proof_port) ||
+            !json_u64(proof, "issued_tick_ms", issued_tick) ||
+            !json_u64(proof, "expires_tick_ms", expires_tick))
+        {
+            failure = "auth proof numeric fields missing";
+            return false;
+        }
+        if (plugin_pid != GetCurrentProcessId())
+        {
+            failure = "auth proof plugin pid mismatch";
+            return false;
+        }
+        if (proof_port != static_cast<uint32_t>(expected_port))
+        {
+            failure = "auth proof port mismatch";
+            return false;
+        }
+        if (!process_basename_is_standalone(standalone_pid))
+        {
+            failure = "auth proof process identity mismatch";
+            return false;
+        }
+        if (!proof.value("validated", false) ||
+            !proof.value("arc_loaded", false) ||
+            !proof.value("lifecycle_ready", false) ||
+            !proof.value("exports_verified", false))
+        {
+            failure = "auth proof runtime state is not authorized";
+            return false;
+        }
+
+        const uint64_t now_tick = static_cast<uint64_t>(GetTickCount64());
+        if (expires_tick <= issued_tick ||
+            expires_tick < now_tick ||
+            issued_tick > now_tick + 5000ull ||
+            expires_tick > now_tick + 60000ull)
+        {
+            failure = "auth proof lifetime invalid";
+            return false;
+        }
+
+        const std::string server_payload_b64 = proof.value("server_payload_b64", std::string());
+        const std::string server_sig_b64 = proof.value("server_sig_b64", std::string());
+        const int server_kid = proof.value("server_kid", 0);
+        const std::string signed_payload_sha256 = proof.value("signed_payload_sha256", std::string());
+        const std::string proof_mac = proof.value("proof_mac", std::string());
+        if (server_payload_b64.empty() || server_sig_b64.empty() || server_kid <= 0 ||
+            signed_payload_sha256.size() != 64 || proof_mac.size() != 64)
+        {
+            failure = "auth proof signed session fields missing";
+            return false;
+        }
+
+        std::vector<unsigned char> payload_bytes = base64_decode(server_payload_b64);
+        std::vector<unsigned char> sig_bytes = base64_decode(server_sig_b64);
+        if (payload_bytes.empty() || sig_bytes.size() != 64)
+        {
+            if (!payload_bytes.empty())
+                SecureZeroMemory(payload_bytes.data(), payload_bytes.size());
+            if (!sig_bytes.empty())
+                SecureZeroMemory(sig_bytes.data(), sig_bytes.size());
+            failure = "auth proof signed session decode failed";
+            return false;
+        }
+
+        std::string signed_payload(reinterpret_cast<const char*>(payload_bytes.data()), payload_bytes.size());
+        SecureZeroMemory(payload_bytes.data(), payload_bytes.size());
+        const std::string computed_payload_hash = sha256_hex(signed_payload);
+        if (!constant_time_equal(computed_payload_hash, signed_payload_sha256))
+        {
+            SecureZeroMemory(signed_payload.data(), signed_payload.size());
+            SecureZeroMemory(sig_bytes.data(), sig_bytes.size());
+            failure = "auth proof signed payload hash mismatch";
+            return false;
+        }
+
+        std::string sig_hex = bytes_to_hex(sig_bytes.data(), sig_bytes.size());
+        SecureZeroMemory(sig_bytes.data(), sig_bytes.size());
+        if (!license_manager_t::instance().verify_server_signature_with_kid(signed_payload, sig_hex, server_kid))
+        {
+            SecureZeroMemory(signed_payload.data(), signed_payload.size());
+            SecureZeroMemory(sig_hex.data(), sig_hex.size());
+            failure = "auth proof server signature invalid";
+            return false;
+        }
+        SecureZeroMemory(sig_hex.data(), sig_hex.size());
+
+        nlohmann::json signed_json = nlohmann::json::parse(signed_payload, nullptr, false);
+        if (signed_json.is_discarded() || !signed_json.is_object())
+        {
+            SecureZeroMemory(signed_payload.data(), signed_payload.size());
+            failure = "auth proof signed payload parse failed";
+            return false;
+        }
+
+        const std::string auth_key_b64 = signed_json.value("auth_hmac_key_b64", std::string());
+        const std::string session_token = signed_json.value("session_token", std::string());
+        const int signed_kid = signed_json.value("kid", 0);
+        const int64_t issued_at = signed_json.value("issued_at", int64_t{0});
+        const int64_t ttl = signed_json.value("ttl", int64_t{0});
+        const int64_t now_epoch = static_cast<int64_t>(std::time(nullptr));
+        if (signed_json.value("status", std::string()) != "valid" ||
+            signed_kid != server_kid ||
+            auth_key_b64.empty() ||
+            session_token.size() < 16 ||
+            issued_at <= 0 ||
+            ttl <= 0 ||
+            now_epoch < issued_at - 60 ||
+            now_epoch > issued_at + ttl + 60)
+        {
+            SecureZeroMemory(signed_payload.data(), signed_payload.size());
+            failure = "auth proof signed payload is not current";
+            return false;
+        }
+
+        std::vector<unsigned char> auth_key = base64_decode(auth_key_b64);
+        if (auth_key.size() != 32)
+        {
+            SecureZeroMemory(signed_payload.data(), signed_payload.size());
+            if (!auth_key.empty())
+                SecureZeroMemory(auth_key.data(), auth_key.size());
+            failure = "auth proof key invalid";
+            return false;
+        }
+
+        const std::string canonical = ida_plugin_proof_canonical(proof);
+        const std::string computed_mac = hmac_sha256_hex(auth_key, canonical);
+        SecureZeroMemory(auth_key.data(), auth_key.size());
+        SecureZeroMemory(signed_payload.data(), signed_payload.size());
+        if (computed_mac.empty() || !constant_time_equal(computed_mac, proof_mac))
+        {
+            failure = "auth proof MAC invalid";
+            return false;
+        }
+        return true;
+    }
+
     bool verify_health_payload(const nlohmann::json& health, std::string& failure)
     {
         if (!health.is_object())
@@ -254,6 +638,37 @@ namespace
             }
             nlohmann::json health = nlohmann::json::parse(health_res->body, nullptr, false);
             if (!verify_health_payload(health, failure))
+                return false;
+
+            std::string challenge = generate_challenge_hex();
+            if (challenge.empty())
+            {
+                failure = "auth challenge generation failed";
+                return false;
+            }
+
+            nlohmann::json auth_req;
+            auth_req["challenge"] = challenge;
+            auth_req["plugin_pid"] = static_cast<uint32_t>(GetCurrentProcessId());
+            auth_req["plugin_version"] = AIDA_VERSION;
+
+            httplib::Headers auth_headers = {
+                {"Content-Type", "application/json"},
+                {"Accept", "application/json"}
+            };
+            auto auth_res = client.Post("/ida-plugin-auth", auth_headers, json_dump_safe(auth_req), "application/json");
+            if (!auth_res)
+            {
+                failure = "no standalone auth proof response on port " + std::to_string(port);
+                return false;
+            }
+            if (auth_res->status != 200)
+            {
+                failure = "standalone auth proof returned HTTP " + std::to_string(auth_res->status);
+                return false;
+            }
+            nlohmann::json auth_json = nlohmann::json::parse(auth_res->body, nullptr, false);
+            if (!verify_ida_plugin_auth_proof(auth_json, challenge, port, failure))
                 return false;
 
             nlohmann::json init_req;

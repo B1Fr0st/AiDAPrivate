@@ -96,11 +96,248 @@ function Install-PatchedCamoufoxPackage {
     Write-Output "patched_camoufox_package=$package"
 }
 
+function Get-RequiredFrozenMcpTools {
+    return @(
+        "launch_browser",
+        "close_browser",
+        "list_pages",
+        "new_page",
+        "select_page",
+        "close_page",
+        "evaluate_js",
+        "navigate",
+        "get_page_info"
+    )
+}
+
+function ConvertTo-CompactLogText {
+    param(
+        [string]$Text,
+        [int]$Limit = 1600
+    )
+    if (-not $Text) {
+        return ""
+    }
+    $value = $Text.Trim() -replace "[`r`n`t]+", " "
+    if ($value.Length -le $Limit) {
+        return $value
+    }
+    return "..." + $value.Substring($value.Length - $Limit)
+}
+
+function Add-McpJsonMessage {
+    param(
+        [System.Collections.ArrayList]$Messages,
+        [string]$JsonText
+    )
+    if (-not $JsonText) {
+        return
+    }
+    $trimmed = $JsonText.Trim()
+    if (-not $trimmed.StartsWith("{")) {
+        return
+    }
+    try {
+        [void]$Messages.Add(($trimmed | ConvertFrom-Json -ErrorAction Stop))
+    } catch {
+    }
+}
+
+function ConvertFrom-McpOutput {
+    param([string]$Text)
+    $messages = [System.Collections.ArrayList]::new()
+    if (-not $Text) {
+        return ,$messages
+    }
+    $offset = 0
+    while ($offset -lt $Text.Length) {
+        $header = $Text.IndexOf("Content-Length:", $offset, [System.StringComparison]::OrdinalIgnoreCase)
+        if ($header -lt 0) {
+            break
+        }
+        $separator = $Text.IndexOf("`r`n`r`n", $header, [System.StringComparison]::Ordinal)
+        $separatorLength = 4
+        if ($separator -lt 0) {
+            $separator = $Text.IndexOf("`n`n", $header, [System.StringComparison]::Ordinal)
+            $separatorLength = 2
+        }
+        if ($separator -lt 0) {
+            break
+        }
+        $headerText = $Text.Substring($header, $separator - $header)
+        if ($headerText -match "Content-Length:\s*(\d+)") {
+            $length = [int]$matches[1]
+            $bodyStart = $separator + $separatorLength
+            if ($length -gt 0 -and $bodyStart + $length -le $Text.Length) {
+                Add-McpJsonMessage -Messages $messages -JsonText $Text.Substring($bodyStart, $length)
+                $offset = $bodyStart + $length
+                continue
+            }
+        }
+        $offset = $separator + $separatorLength
+    }
+    foreach ($line in [System.Text.RegularExpressions.Regex]::Split($Text, "`r`n|`n|`r")) {
+        Add-McpJsonMessage -Messages $messages -JsonText $line
+    }
+    return ,$messages
+}
+
+function Test-McpErrorProperty {
+    param($Message)
+    $prop = $Message.PSObject.Properties["error"]
+    return $null -ne $prop -and $null -ne $prop.Value
+}
+
+function Write-McpStdioFrame {
+    param(
+        [System.IO.StreamWriter]$Writer,
+        [string]$JsonText
+    )
+    $Writer.WriteLine($JsonText)
+    $Writer.Flush()
+}
+
+function Invoke-FrozenMcpToolContract {
+    param(
+        [string]$Executable,
+        [string]$RepoRoot
+    )
+    $browser = Resolve-CamoufoxBrowser $RepoRoot
+    if (-not $browser) {
+        throw "Camoufox browser executable for frozen MCP stdio smoke was not found."
+    }
+    $smokeLog = Join-Path $env:TEMP "aida_camoufox_frozen_mcp_stdio_smoke.log"
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $Executable
+    $psi.WorkingDirectory = $RepoRoot
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.Environment["AIDA_CAMOUFOX_EXECUTABLE"] = $browser
+    $psi.Environment["AIDA_CAMOUFOX_DEBUG_LOG"] = $smokeLog
+    $psi.Environment["AIDA_CAMOUFOX_DEBUG_STDERR"] = "0"
+    $psi.Environment["PYTHONIOENCODING"] = "utf-8"
+    $proc = [System.Diagnostics.Process]::new()
+    $proc.StartInfo = $psi
+    if (-not $proc.Start()) {
+        throw "Frozen MCP stdio smoke process failed to start."
+    }
+    $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+    $stderrTask = $proc.StandardError.ReadToEndAsync()
+    $init = @{
+        jsonrpc = "2.0"
+        id = 1
+        method = "initialize"
+        params = @{
+            protocolVersion = "2025-06-18"
+            capabilities = @{}
+            clientInfo = @{
+                name = "aida-frozen-camoufox-smoke"
+                version = "1.0.0"
+            }
+        }
+    } | ConvertTo-Json -Compress -Depth 12
+    $initialized = @{
+        jsonrpc = "2.0"
+        method = "notifications/initialized"
+        params = @{}
+    } | ConvertTo-Json -Compress -Depth 12
+    $toolsList = @{
+        jsonrpc = "2.0"
+        id = 2
+        method = "tools/list"
+    } | ConvertTo-Json -Compress -Depth 12
+    Write-McpStdioFrame -Writer $proc.StandardInput -JsonText $init
+    Write-McpStdioFrame -Writer $proc.StandardInput -JsonText $initialized
+    Write-McpStdioFrame -Writer $proc.StandardInput -JsonText $toolsList
+    $proc.StandardInput.Close()
+    if (-not $proc.WaitForExit(45000)) {
+        try { $proc.Kill() } catch {}
+        throw "Frozen MCP stdio smoke timed out after 45000 ms."
+    }
+    $stdout = $stdoutTask.GetAwaiter().GetResult()
+    $stderr = $stderrTask.GetAwaiter().GetResult()
+    if ($proc.ExitCode -ne 0) {
+        throw "Frozen MCP stdio smoke exited with $($proc.ExitCode). stdout=[$(ConvertTo-CompactLogText $stdout)] stderr=[$(ConvertTo-CompactLogText $stderr)]"
+    }
+    $messages = ConvertFrom-McpOutput $stdout
+    $initSeen = $false
+    $toolsSeen = $false
+    $toolNames = @()
+    foreach ($message in $messages) {
+        $idProp = $message.PSObject.Properties["id"]
+        if ($null -eq $idProp) {
+            continue
+        }
+        $id = [string]$idProp.Value
+        if ($id -eq "1") {
+            if (Test-McpErrorProperty $message) {
+                throw "Frozen MCP initialize returned error: $($message.error | ConvertTo-Json -Compress -Depth 8)"
+            }
+            $resultProp = $message.PSObject.Properties["result"]
+            if ($null -eq $resultProp -or $null -eq $resultProp.Value) {
+                throw "Frozen MCP initialize response was missing result."
+            }
+            $initSeen = $true
+        } elseif ($id -eq "2") {
+            if (Test-McpErrorProperty $message) {
+                throw "Frozen MCP tools/list returned error: $($message.error | ConvertTo-Json -Compress -Depth 8)"
+            }
+            $resultProp = $message.PSObject.Properties["result"]
+            if ($null -eq $resultProp -or $null -eq $resultProp.Value) {
+                throw "Frozen MCP tools/list response was missing result."
+            }
+            $toolsProp = $resultProp.Value.PSObject.Properties["tools"]
+            if ($null -eq $toolsProp -or $null -eq $toolsProp.Value) {
+                throw "Frozen MCP tools/list response was missing tools."
+            }
+            foreach ($tool in @($toolsProp.Value)) {
+                $nameProp = $tool.PSObject.Properties["name"]
+                if ($null -ne $nameProp -and $nameProp.Value) {
+                    $toolNames += [string]$nameProp.Value
+                }
+            }
+            $toolsSeen = $true
+        }
+    }
+    if (-not $initSeen) {
+        throw "Frozen MCP stdio smoke did not receive initialize response. stdout=[$(ConvertTo-CompactLogText $stdout)] stderr=[$(ConvertTo-CompactLogText $stderr)]"
+    }
+    if (-not $toolsSeen) {
+        throw "Frozen MCP stdio smoke did not receive tools/list response. stdout=[$(ConvertTo-CompactLogText $stdout)] stderr=[$(ConvertTo-CompactLogText $stderr)]"
+    }
+    $toolSet = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::Ordinal)
+    foreach ($name in $toolNames) {
+        [void]$toolSet.Add($name)
+    }
+    $missing = @()
+    foreach ($required in Get-RequiredFrozenMcpTools) {
+        if (-not $toolSet.Contains($required)) {
+            $missing += $required
+        }
+    }
+    $inventory = @()
+    foreach ($name in $toolSet) {
+        $inventory += $name
+    }
+    $inventory = $inventory | Sort-Object
+    if ($missing.Count -gt 0) {
+        throw "Frozen MCP stdio tool contract missing required tools: missing=$($missing -join ',') inventory=$($inventory -join ',')"
+    }
+    Write-Output "frozen_mcp_stdio_smoke=ok"
+    Write-Output "frozen_mcp_stdio_tools=$($inventory -join ',')"
+    Write-Output "frozen_mcp_stdio_smoke_browser=$browser"
+    Write-Output "frozen_mcp_stdio_smoke_log=$smokeLog"
+}
+
 function Invoke-FrozenMcpSmoke {
     param(
         [string]$Executable,
         [string]$RepoRoot
     )
+    Invoke-FrozenMcpToolContract -Executable $Executable -RepoRoot $RepoRoot
     $browser = Resolve-CamoufoxBrowser $RepoRoot
     if (-not $browser) {
         throw "Camoufox browser executable for frozen MCP smoke was not found."
@@ -193,9 +430,14 @@ if ($Jobs -lt 1) {
 }
 $target = Join-Path $OutputDir "AiDA_CamoufoxReverseMcp.exe"
 if ([IO.File]::Exists($target) -and -not $Force) {
-    Invoke-FrozenMcpSmoke -Executable $target -RepoRoot $repoRoot
-    Write-Output "frozen_mcp_exists=$target"
-    exit 0
+    try {
+        Invoke-FrozenMcpSmoke -Executable $target -RepoRoot $repoRoot
+        Write-Output "frozen_mcp_exists=$target"
+        exit 0
+    } catch {
+        Write-Warning "existing_frozen_mcp_contract_failed=$($_.Exception.Message)"
+        Remove-Item -LiteralPath $target -Force -ErrorAction Stop
+    }
 }
 
 $stamp = Get-Date -Format "yyyyMMddHHmmss"

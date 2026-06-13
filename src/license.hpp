@@ -22,6 +22,11 @@ public:
     void snapshot_function_prologues();
     bool verify_function_prologues() const;
     bool verify_nonce_consistency() const;
+    bool verify_server_signature(const std::string& response_body,
+                                 const std::string& signature) const;
+    bool verify_server_signature_with_kid(const std::string& response_body,
+                                          const std::string& signature,
+                                          int kid) const;
     bool perform_heartbeat();
     bool is_hwid_banned() const;
     bool is_ip_banned() const;
@@ -65,11 +70,6 @@ private:
     uint64_t derive_sig_binding_tag(const std::string& sig, uint64_t nonce) const;
     std::string compute_hmac(const std::string& key,
                              const unsigned char* data, size_t len) const;
-    bool verify_server_signature(const std::string& response_body,
-                                 const std::string& signature) const;
-    bool verify_server_signature_with_kid(const std::string& response_body,
-                                          const std::string& signature,
-                                          int kid) const;
     void secure_clear_string(std::string& s) const;
 
     std::atomic<bool> m_valid{false};

@@ -20,6 +20,7 @@
 #include "../disasm/comment_store.hpp"
 #include "../disasm/rename_store.hpp"
 #include "../editor/expression_eval.hpp"
+#include "../infra/critical_work_queue.hpp"
 #include "../../helpers/diag_log.hpp"
 
 #include <Windows.h>
@@ -28,6 +29,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <utility>
@@ -172,6 +174,199 @@ static std::vector<uint8_t> symbolic_branch_fixture() {
         0xB8, 0x01, 0x00, 0x00, 0x00,
         0xC3
     };
+}
+
+struct source_recon_fixture_t {
+    uint64_t address = 0;
+    size_t size = 0;
+    bool release_on_reset = true;
+
+    source_recon_fixture_t() = default;
+    source_recon_fixture_t(const source_recon_fixture_t&) = delete;
+    source_recon_fixture_t& operator=(const source_recon_fixture_t&) = delete;
+    source_recon_fixture_t(source_recon_fixture_t&& other) noexcept {
+        address = other.address;
+        size = other.size;
+        release_on_reset = other.release_on_reset;
+        other.address = 0;
+        other.size = 0;
+        other.release_on_reset = true;
+    }
+    source_recon_fixture_t& operator=(source_recon_fixture_t&& other) noexcept {
+        if (this != &other) {
+            reset();
+            address = other.address;
+            size = other.size;
+            release_on_reset = other.release_on_reset;
+            other.address = 0;
+            other.size = 0;
+            other.release_on_reset = true;
+        }
+        return *this;
+    }
+    ~source_recon_fixture_t() {
+        reset();
+    }
+    void disarm() {
+        release_on_reset = false;
+    }
+    void reset() {
+        if (address != 0 && release_on_reset)
+            driver_bridge::free_memory(address);
+        address = 0;
+        size = 0;
+        release_on_reset = true;
+    }
+};
+
+static void put_u16(std::vector<uint8_t>& b, size_t off, uint16_t v) {
+    if (off + sizeof(v) <= b.size())
+        std::memcpy(b.data() + off, &v, sizeof(v));
+}
+
+static void put_u32(std::vector<uint8_t>& b, size_t off, uint32_t v) {
+    if (off + sizeof(v) <= b.size())
+        std::memcpy(b.data() + off, &v, sizeof(v));
+}
+
+static void put_u64(std::vector<uint8_t>& b, size_t off, uint64_t v) {
+    if (off + sizeof(v) <= b.size())
+        std::memcpy(b.data() + off, &v, sizeof(v));
+}
+
+static std::vector<uint8_t> make_source_recon_pe_image(uint64_t image_base) {
+    std::vector<uint8_t> image(0x2000, 0);
+    image[0] = 'M';
+    image[1] = 'Z';
+    put_u32(image, 0x3C, 0x80);
+
+    const size_t nt = 0x80;
+    put_u32(image, nt, 0x00004550);
+    put_u16(image, nt + 4, 0x8664);
+    put_u16(image, nt + 6, 1);
+    put_u32(image, nt + 8, 0x66550000);
+    put_u16(image, nt + 20, 0xF0);
+    put_u16(image, nt + 22, 0x0022);
+
+    const size_t opt = nt + 24;
+    put_u16(image, opt + 0, 0x020B);
+    image[opt + 2] = 14;
+    put_u32(image, opt + 4, 0x200);
+    put_u32(image, opt + 16, 0x1000);
+    put_u32(image, opt + 20, 0x1000);
+    put_u64(image, opt + 24, image_base);
+    put_u32(image, opt + 32, 0x1000);
+    put_u32(image, opt + 36, 0x200);
+    put_u16(image, opt + 48, 6);
+    put_u16(image, opt + 50, 0);
+    put_u16(image, opt + 64, 3);
+    put_u32(image, opt + 56, static_cast<uint32_t>(image.size()));
+    put_u32(image, opt + 60, 0x400);
+    put_u16(image, opt + 68, 3);
+    put_u64(image, opt + 72, 0x100000);
+    put_u64(image, opt + 80, 0x1000);
+    put_u64(image, opt + 88, 0x100000);
+    put_u64(image, opt + 96, 0x1000);
+    put_u32(image, opt + 108, 16);
+
+    const size_t sec = opt + 0xF0;
+    const char text_name[8] = { '.', 't', 'e', 'x', 't', 0, 0, 0 };
+    std::memcpy(image.data() + sec, text_name, sizeof(text_name));
+    put_u32(image, sec + 8, 0x200);
+    put_u32(image, sec + 12, 0x1000);
+    put_u32(image, sec + 16, 0x200);
+    put_u32(image, sec + 20, 0x400);
+    put_u32(image, sec + 36, 0x60000020);
+
+    const size_t entry = 0x1000;
+    const uint64_t call_src = image_base + 0x1000;
+    const uint64_t call_dst = image_base + 0x1010;
+    const int32_t rel = static_cast<int32_t>(call_dst - (call_src + 5));
+    image[entry + 0] = 0xE8;
+    std::memcpy(image.data() + entry + 1, &rel, sizeof(rel));
+    image[entry + 5] = 0xC3;
+    const uint8_t fn[] = {
+        0x48, 0x83, 0xEC, 0x28,
+        0xB8, 0x2A, 0x00, 0x00, 0x00,
+        0x48, 0x83, 0xC4, 0x28,
+        0xC3
+    };
+    std::memcpy(image.data() + 0x1010, fn, sizeof(fn));
+    return image;
+}
+
+static source_recon_fixture_t make_source_recon_fixture(HANDLE hf, const char* tag) {
+    source_recon_fixture_t fx;
+    fx.size = 0x2000;
+    fx.address = driver_bridge::allocate_memory(fx.size);
+    if (fx.address == 0) {
+        log_msg(hf, tag, "FAIL -- allocate_memory returned 0 for source reconstruction fixture");
+        fx.size = 0;
+        return fx;
+    }
+
+    std::vector<uint8_t> image = make_source_recon_pe_image(fx.address);
+    if (!driver_bridge::write_memory(fx.address, image)) {
+        log_msg(hf, tag, "FAIL -- write_memory failed for source reconstruction fixture addr=0x%016llX size=%zu",
+            static_cast<unsigned long long>(fx.address), image.size());
+        fx.reset();
+        return fx;
+    }
+
+    uint32_t old_protect = 0;
+    if (!driver_bridge::protect_memory(fx.address, fx.size, PAGE_EXECUTE_READWRITE, &old_protect)) {
+        log_msg(hf, tag, "FAIL -- protect_memory failed for source reconstruction fixture addr=0x%016llX size=%zu",
+            static_cast<unsigned long long>(fx.address), fx.size);
+        fx.reset();
+        return fx;
+    }
+
+    log_msg(hf, tag, "fixture addr=0x%016llX size=%zu old_protect=0x%08X",
+        static_cast<unsigned long long>(fx.address), fx.size, old_protect);
+    return fx;
+}
+
+static std::string source_recon_output_dir() {
+    char tmp[MAX_PATH + 1] = {};
+    DWORD len = GetTempPathA(MAX_PATH, tmp);
+    std::string base = (len > 0 && len < MAX_PATH) ? std::string(tmp, len) : std::string(".\\");
+    if (!base.empty()) {
+        char last = base.back();
+        if (last != '\\' && last != '/')
+            base.push_back('\\');
+    }
+    char suffix[160];
+    _snprintf_s(suffix, sizeof(suffix), _TRUNCATE, "AiDA_TestLab\\source_recon_%lu_%llu",
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        static_cast<unsigned long long>(GetTickCount64()));
+    return base + suffix;
+}
+
+static bool file_exists_nonempty(const std::string& path, unsigned long long* size_out = nullptr) {
+    HANDLE h = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+        return false;
+    LARGE_INTEGER sz{};
+    bool ok = GetFileSizeEx(h, &sz) && sz.QuadPart > 0;
+    if (size_out)
+        *size_out = GetFileSizeEx(h, &sz) ? static_cast<unsigned long long>(sz.QuadPart) : 0ULL;
+    CloseHandle(h);
+    return ok;
+}
+
+static bool read_text_file_limited(const std::string& path, std::string& out, size_t limit) {
+    out.clear();
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs)
+        return false;
+    std::vector<char> buf(limit);
+    ifs.read(buf.data(), static_cast<std::streamsize>(buf.size()));
+    std::streamsize got = ifs.gcount();
+    if (got <= 0)
+        return false;
+    out.assign(buf.data(), static_cast<size_t>(got));
+    return true;
 }
 
 static aida::binary_map::map_t make_binary_map_fixture() {
@@ -1073,12 +1268,199 @@ static void test_source_reconstructor_last_result(HANDLE hf, std::atomic<int>& p
     log_msg(hf, "srcrecon_lr", "START -- source reconstructor get_last_result");
     auto t0 = std::chrono::steady_clock::now();
 
-    auto& result = source_reconstructor::get_last_result();
+    if (source_reconstructor::is_running()) {
+        const ULONGLONG wait_start = GetTickCount64();
+        while (source_reconstructor::is_running() && GetTickCount64() - wait_start < 10000)
+            Sleep(25);
+        if (source_reconstructor::is_running()) {
+            float progress = source_reconstructor::get_progress();
+            std::string status = source_reconstructor::get_status();
+            auto stats = work_queue::stats();
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+            log_msg(hf, "srcrecon_lr", "FAIL -- previous reconstruction still running progress=%.2f status=\"%s\" queue_alive=%d queue_pending=%zu queue_active=%u elapsed=%lld ms",
+                progress, status.c_str(), stats.alive ? 1 : 0, stats.pending, stats.active, (long long)ms);
+            failed.fetch_add(1);
+            return;
+        }
+    }
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "srcrecon_lr", "PASS -- success=%d total_funcs=%d decompiled=%d modules=%d files=%zu (elapsed %lld ms)",
-        result.success, result.total_functions, result.decompiled_functions,
-        result.modules_created, result.files_created.size(), (long long)ms);
+    source_recon_fixture_t fx = make_source_recon_fixture(hf, "srcrecon_lr");
+    if (fx.address == 0 || fx.size == 0) {
+        failed.fetch_add(1);
+        return;
+    }
+
+    source_reconstructor::reconstruction_config_t config;
+    config.project_name = "aida_test_recon";
+    config.output_dir = source_recon_output_dir();
+    config.module_name = "aida_sr_fixture.exe";
+    config.module_base = fx.address;
+    config.module_size = static_cast<uint32_t>(fx.size);
+    config.include_imports = false;
+    config.include_exports = true;
+    config.generate_cmake = true;
+    config.use_ai_refinement = false;
+    config.max_functions = 1;
+
+    log_msg(hf, "srcrecon_lr", "RUN -- reconstruct base=0x%016llX size=%u output=\"%s\" max_functions=%d",
+        static_cast<unsigned long long>(config.module_base),
+        static_cast<unsigned>(config.module_size),
+        config.output_dir.c_str(),
+        config.max_functions);
+
+    source_reconstructor::reconstruct(config);
+    if (!source_reconstructor::is_running()) {
+        source_reconstructor::reconstruction_result_t immediate{};
+        {
+            std::lock_guard<std::mutex> lk(source_reconstructor::g_state.mutex);
+            immediate = source_reconstructor::g_state.last_result;
+        }
+        log_msg(hf, "srcrecon_lr", "FAIL -- reconstruct returned without entering running state success=%d error=\"%s\" total_funcs=%d files=%zu",
+            immediate.success ? 1 : 0,
+            immediate.error.c_str(),
+            immediate.total_functions,
+            immediate.files_created.size());
+        failed.fetch_add(1);
+        return;
+    }
+
+    const ULONGLONG run_start = GetTickCount64();
+    ULONGLONG next_log = run_start + 500;
+    bool timed_out = false;
+    while (source_reconstructor::is_running()) {
+        ULONGLONG now = GetTickCount64();
+        if (now >= next_log) {
+            auto stats = work_queue::stats();
+            log_msg(hf, "srcrecon_lr", "WAIT -- elapsed_ms=%llu progress=%.2f stage=%d status=\"%s\" queue_pending=%zu queue_active=%u",
+                static_cast<unsigned long long>(now - run_start),
+                source_reconstructor::get_progress(),
+                static_cast<int>(source_reconstructor::get_stage()),
+                source_reconstructor::get_status().c_str(),
+                stats.pending,
+                stats.active);
+            next_log = now + 500;
+        }
+        if (now - run_start >= 16000) {
+            timed_out = true;
+            break;
+        }
+        Sleep(25);
+    }
+
+    if (timed_out) {
+        source_reconstructor::cancel();
+        const ULONGLONG cancel_start = GetTickCount64();
+        while (source_reconstructor::is_running() && GetTickCount64() - cancel_start < 5000)
+            Sleep(25);
+        const ULONGLONG cancel_elapsed = GetTickCount64() - cancel_start;
+        if (source_reconstructor::is_running())
+            fx.disarm();
+        source_reconstructor::reconstruction_result_t result{};
+        {
+            std::lock_guard<std::mutex> lk(source_reconstructor::g_state.mutex);
+            result = source_reconstructor::g_state.last_result;
+        }
+        auto stats = work_queue::stats();
+        auto svc_stats = work_queue::service_stats();
+        auto critical_stats = critical_work_queue::stats();
+        ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        log_msg(hf, "srcrecon_lr", "FAIL -- reconstruction timeout cancel_wait_ms=%llu running=%d progress=%.2f stage=%d status=\"%s\" success=%d error=\"%s\" total_funcs=%d decompiled=%d modules=%d files=%zu preload_read=%zu work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu critical_pending=%zu critical_active=%u critical_rejected=%llu elapsed=%lld ms",
+            static_cast<unsigned long long>(cancel_elapsed),
+            source_reconstructor::is_running() ? 1 : 0,
+            source_reconstructor::get_progress(),
+            static_cast<int>(source_reconstructor::get_stage()),
+            source_reconstructor::get_status().c_str(),
+            result.success ? 1 : 0,
+            result.error.c_str(),
+            result.total_functions,
+            result.decompiled_functions,
+            result.modules_created,
+            result.files_created.size(),
+            result.preload.total_read,
+            stats.pending,
+            stats.active,
+            static_cast<unsigned long long>(stats.rejected),
+            svc_stats.pending,
+            svc_stats.active,
+            static_cast<unsigned long long>(svc_stats.rejected),
+            critical_stats.pending,
+            critical_stats.active,
+            static_cast<unsigned long long>(critical_stats.rejected),
+            (long long)ms);
+        failed.fetch_add(1);
+        return;
+    }
+
+    source_reconstructor::reconstruction_result_t result{};
+    {
+        std::lock_guard<std::mutex> lk(source_reconstructor::g_state.mutex);
+        result = source_reconstructor::g_state.last_result;
+    }
+
+    size_t existing_files = 0;
+    size_t source_files = 0;
+    unsigned long long total_bytes = 0;
+    bool source_content_ok = false;
+    for (const auto& path : result.files_created) {
+        unsigned long long file_size = 0;
+        if (file_exists_nonempty(path, &file_size)) {
+            ++existing_files;
+            total_bytes += file_size;
+        }
+        if (path.size() >= 4 && _stricmp(path.c_str() + path.size() - 4, ".cpp") == 0) {
+            ++source_files;
+            std::string text;
+            if (read_text_file_limited(path, text, 65536) &&
+                (text.find("sub_") != std::string::npos ||
+                 text.find("__asm") != std::string::npos ||
+                 text.find("void ") != std::string::npos)) {
+                source_content_ok = true;
+            }
+        }
+    }
+
+    ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    const bool ok = result.success && result.total_functions > 0 &&
+        result.modules_created > 0 && !result.files_created.empty() &&
+        existing_files == result.files_created.size() && source_files > 0 &&
+        source_content_ok && result.preload.total_read > 0 &&
+        result.preload.mz && result.preload.pe_header_ok;
+
+    if (!ok) {
+        log_msg(hf, "srcrecon_lr", "FAIL -- reconstruction result success=%d error=\"%s\" total_funcs=%d decompiled=%d modules=%d files=%zu existing=%zu source_files=%zu source_content=%d bytes=%llu preload_read=%zu mz=%d pe=%d chunks_ok=%zu chunks_failed=%zu output=\"%s\" (elapsed %lld ms)",
+            result.success ? 1 : 0,
+            result.error.c_str(),
+            result.total_functions,
+            result.decompiled_functions,
+            result.modules_created,
+            result.files_created.size(),
+            existing_files,
+            source_files,
+            source_content_ok ? 1 : 0,
+            total_bytes,
+            result.preload.total_read,
+            result.preload.mz ? 1 : 0,
+            result.preload.pe_header_ok ? 1 : 0,
+            result.preload.chunks_ok,
+            result.preload.chunks_failed,
+            result.output_dir.c_str(),
+            (long long)ms);
+        failed.fetch_add(1);
+        return;
+    }
+
+    log_msg(hf, "srcrecon_lr", "PASS -- success=%d total_funcs=%d decompiled=%d fallback_only=%d modules=%d files=%zu bytes=%llu preload_read=%zu output=\"%s\" (elapsed %lld ms)",
+        result.success ? 1 : 0,
+        result.total_functions,
+        result.decompiled_functions,
+        result.decompiled_functions == 0 ? 1 : 0,
+        result.modules_created,
+        result.files_created.size(),
+        total_bytes,
+        result.preload.total_read,
+        result.output_dir.c_str(),
+        (long long)ms);
     passed.fetch_add(1);
 }
 
@@ -1121,15 +1503,33 @@ static void test_xref_db_state(HANDLE hf, std::atomic<int>& passed, std::atomic<
     log_msg(hf, "xrefdb_st", "START -- xref_db state check");
     auto t0 = std::chrono::steady_clock::now();
 
+    uint64_t from = 0x140001020;
+    uint64_t addr = 0x140002000;
+    seed_xref_db_fixture(from, addr);
     bool building = xref_db::g_state.building.load();
     size_t module_count = 0;
+    size_t built_count = 0;
+    size_t total_xrefs = 0;
     {
         std::lock_guard<std::mutex> lk(xref_db::g_state.mutex);
         module_count = xref_db::g_state.modules.size();
+        for (const auto& kv : xref_db::g_state.modules) {
+            if (kv.second.built) {
+                ++built_count;
+                total_xrefs += kv.second.total_xrefs;
+            }
+        }
     }
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "xrefdb_st", "PASS -- building=%d modules=%zu (elapsed %lld ms)", building, module_count, (long long)ms);
+    if (!building && (module_count == 0 || built_count == 0 || total_xrefs == 0)) {
+        log_msg(hf, "xrefdb_st", "FAIL -- xref_db idle with empty fixture state modules=%zu built=%zu total_xrefs=%zu (elapsed %lld ms)",
+            module_count, built_count, total_xrefs, (long long)ms);
+        failed.fetch_add(1);
+        return;
+    }
+    log_msg(hf, "xrefdb_st", "PASS -- building=%d modules=%zu built=%zu total_xrefs=%zu (elapsed %lld ms)",
+        building, module_count, built_count, total_xrefs, (long long)ms);
     passed.fetch_add(1);
 }
 
@@ -1704,6 +2104,7 @@ using analysis_test_fn_t = void (*)(HANDLE, std::atomic<int>&, std::atomic<int>&
 struct analysis_test_entry_t {
     const char* name;
     analysis_test_fn_t fn;
+    DWORD timeout_ms = 5000;
 };
 
 static void run_analysis_test_seh(HANDLE hf, const analysis_test_entry_t& test, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -1828,7 +2229,7 @@ void phase_analysis_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>&
         { "binary_map_render_text",      test_binary_map_render_text      },
         { "source_reconstructor_status", test_source_reconstructor_status },
         { "source_recon_running",        test_source_reconstructor_running },
-        { "source_recon_last_result",    test_source_reconstructor_last_result },
+        { "source_recon_last_result",    test_source_reconstructor_last_result, 22000 },
         { "xref_find",                   test_xref_find                   },
         { "xref_engine_scan_state",      test_xref_engine_scan_state      },
         { "xref_type_names",             test_xref_type_names             },
@@ -1893,7 +2294,7 @@ void phase_analysis_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>&
         const ULONGLONG t0 = GetTickCount64();
         const int pass_before = passed.load(std::memory_order_acquire);
         const int fail_before = failed.load(std::memory_order_acquire);
-        run_analysis_test_bounded(hf, tests[i], passed, failed, 5000);
+        run_analysis_test_bounded(hf, tests[i], passed, failed, tests[i].timeout_ms);
         log_msg(hf, "analysis", "[%d/%d] END %s elapsed_ms=%llu pass_delta=%d fail_delta=%d",
             i + 1, total, tests[i].name,
             static_cast<unsigned long long>(GetTickCount64() - t0),

@@ -38,6 +38,14 @@ struct descriptor_t {
     std::uint64_t mba_entry_fn_va;
     std::uint64_t opaque_entry_fn_va;
     std::uint64_t smc_helper_fn_va;
+    std::uint64_t smc_helper_range_va;
+    std::uint32_t smc_helper_range_size;
+    std::uint32_t smc_expected_result;
+    std::uint64_t smc_decryptor_range_va;
+    std::uint32_t smc_decryptor_range_size;
+    std::uint32_t smc_decryptor_marker_size;
+    std::uint64_t smc_decryptor_marker_va;
+    std::uint64_t smc_state_va;
     std::uint64_t reserved[8];
 };
 

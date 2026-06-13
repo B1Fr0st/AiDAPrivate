@@ -157,6 +157,209 @@ static std::vector<driver_bridge::module_info_t> enumerate_modules_toolhelp(uint
 	return result;
 }
 
+static bool fast_section_executable(uint32_t characteristics)
+{
+	return (characteristics & 0x20000000u) != 0;
+}
+
+static bool fast_section_readable(uint32_t characteristics)
+{
+	return (characteristics & 0x40000000u) != 0;
+}
+
+static bool fast_section_writable(uint32_t characteristics)
+{
+	return (characteristics & 0x80000000u) != 0;
+}
+
+static tool_result_t analysis_query_binary_map_fast_summary(const json& params)
+{
+	const uint64_t start_ms = GetTickCount64();
+	json phases = json::object();
+	auto mark_phase = [&](const char* name, uint64_t phase_start) {
+		const uint64_t elapsed = GetTickCount64() - phase_start;
+		phases[name] = elapsed;
+		diag::log_tagged_fmt("analysis", "binary_map_fast_summary_phase phase=%s elapsed_ms=%llu total_ms=%llu",
+			name,
+			static_cast<unsigned long long>(elapsed),
+			static_cast<unsigned long long>(GetTickCount64() - start_ms));
+	};
+	const size_t max_functions = bounded_size_param(params, "max_functions", 24, 1, 256);
+	const std::string requested_module = params.value("module_name", std::string());
+	char buf[32];
+
+	diag::log_tagged_fmt("analysis",
+		"binary_map_fast_summary_enter static_loaded=%d attached_pid=%u module_filter=%s max_functions=%zu",
+		g_disasm.file.loaded ? 1 : 0,
+		driver_bridge::attached_pid(),
+		requested_module.c_str(),
+		max_functions);
+
+	if (g_disasm.file.loaded) {
+		uint64_t phase_start = GetTickCount64();
+		json sections = json::array();
+		for (size_t i = 0; i < g_disasm.file.sections.size(); ++i) {
+			const auto& s = g_disasm.file.sections[i];
+			json o;
+			o["name"] = ".section" + std::to_string(i);
+			std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(s.va));
+			o["va"] = buf;
+			o["size"] = s.bytes.size();
+			o["executable"] = s.is_executable;
+			o["readable"] = true;
+			o["writable"] = false;
+			sections.push_back(std::move(o));
+		}
+		mark_phase("static_sections", phase_start);
+
+		phase_start = GetTickCount64();
+		json functions = json::array();
+		uint64_t last_va = 0;
+		for (const auto& ins : g_disasm.file.instrs) {
+			if (functions.size() >= max_functions)
+				break;
+			if (ins.addr == 0 || ins.addr == last_va)
+				continue;
+			last_va = ins.addr;
+			json o;
+			std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(ins.addr));
+			o["va"] = buf;
+			o["name"] = std::string("sub_") + buf + "_" + ins.mnem;
+			o["xref_count"] = 0;
+			o["callee_count"] = 0;
+			o["source"] = "static_disasm";
+			functions.push_back(std::move(o));
+		}
+		mark_phase("static_functions", phase_start);
+
+		std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(g_disasm.file.image_base));
+		json result;
+		result["module_name"] = g_disasm.file.filename;
+		result["module_path"] = g_disasm.file.path;
+		result["architecture"] = "x86_64";
+		result["format"] = "PE";
+		result["image_base"] = buf;
+		result["image_size"] = static_analysis::total_image_size(g_disasm.file);
+		result["sections"] = std::move(sections);
+		result["functions"] = std::move(functions);
+		result["globals"] = json::array();
+		result["imports"] = json::array();
+		result["exports"] = json::array();
+		result["fast_summary"] = true;
+		result["phase_timings_ms"] = phases;
+		result["elapsed_ms"] = GetTickCount64() - start_ms;
+		diag::log_tagged_fmt("analysis",
+			"binary_map_fast_summary_exit ok=1 source=static sections=%zu functions=%zu elapsed_ms=%llu",
+			result["sections"].size(),
+			result["functions"].size(),
+			static_cast<unsigned long long>(GetTickCount64() - start_ms));
+		return tool_result_t::ok(result);
+	}
+
+	uint64_t phase_start = GetTickCount64();
+	const uint32_t attached_pid = driver_bridge::attached_pid();
+	if (attached_pid == 0)
+		return tool_result_t::error("No process is attached and no static binary is loaded.");
+	mark_phase("attached_pid", phase_start);
+
+	phase_start = GetTickCount64();
+	auto modules = driver_bridge::enumerate_modules();
+	const size_t driver_module_count = modules.size();
+	if (modules.empty())
+		modules = enumerate_modules_toolhelp(attached_pid);
+	mark_phase("module_enumeration", phase_start);
+	diag::log_tagged_fmt("analysis",
+		"binary_map_fast_summary_modules pid=%u driver_count=%zu final_count=%zu",
+		attached_pid,
+		driver_module_count,
+		modules.size());
+	if (modules.empty())
+		return tool_result_t::error("Module enumeration returned no entries.");
+
+	phase_start = GetTickCount64();
+	const driver_bridge::module_info_t* selected = select_module_by_name(modules, requested_module);
+	mark_phase("module_select", phase_start);
+	if (!selected)
+		return tool_result_t::error("Requested module was not found in the attached process.");
+
+	phase_start = GetTickCount64();
+	pe_parser::pe_info_t pe;
+	const bool pe_ok = pe_parser::parse(selected->base, pe, false);
+	mark_phase("pe_parse_headers", phase_start);
+	if (!pe_ok)
+		return tool_result_t::error("pe_parser::parse failed on the selected module.");
+
+	phase_start = GetTickCount64();
+	json sections = json::array();
+	for (const auto& s : pe.sections) {
+		json o;
+		o["name"] = s.name;
+		std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(selected->base + s.virtual_address));
+		o["va"] = buf;
+		o["size"] = s.virtual_size;
+		o["executable"] = fast_section_executable(s.characteristics);
+		o["readable"] = fast_section_readable(s.characteristics);
+		o["writable"] = fast_section_writable(s.characteristics);
+		sections.push_back(std::move(o));
+	}
+	mark_phase("sections", phase_start);
+
+	phase_start = GetTickCount64();
+	json functions = json::array();
+	std::vector<uint64_t> emitted;
+	auto emit_function = [&](uint64_t va, const std::string& name, const char* source) {
+		if (va == 0 || functions.size() >= max_functions)
+			return;
+		if (std::find(emitted.begin(), emitted.end(), va) != emitted.end())
+			return;
+		emitted.push_back(va);
+		json o;
+		std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(va));
+		o["va"] = buf;
+		o["name"] = name;
+		o["xref_count"] = 0;
+		o["callee_count"] = 0;
+		o["source"] = source;
+		functions.push_back(std::move(o));
+	};
+	if (pe.entry_point != 0)
+		emit_function(selected->base + pe.entry_point, "entry_point", "pe_entry_point");
+	for (const auto& s : pe.sections) {
+		if (functions.size() >= max_functions)
+			break;
+		if (!fast_section_executable(s.characteristics))
+			continue;
+		std::string name = s.name.empty() ? "executable_section_start" : ("section_start_" + s.name);
+		emit_function(selected->base + s.virtual_address, name, "executable_section");
+	}
+	mark_phase("functions", phase_start);
+
+	std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(selected->base));
+	json result;
+	result["module_name"] = selected->name;
+	result["module_path"] = selected->path;
+	result["architecture"] = pe.is_64bit ? "x86_64" : "x86";
+	result["format"] = "PE";
+	result["image_base"] = buf;
+	result["image_size"] = pe.size_of_image != 0 ? pe.size_of_image : selected->size;
+	result["sections"] = std::move(sections);
+	result["functions"] = std::move(functions);
+	result["globals"] = json::array();
+	result["imports"] = json::array();
+	result["exports"] = json::array();
+	result["fast_summary"] = true;
+	result["phase_timings_ms"] = phases;
+	result["elapsed_ms"] = GetTickCount64() - start_ms;
+	diag::log_tagged_fmt("analysis",
+		"binary_map_fast_summary_exit ok=1 source=live pid=%u module=%s sections=%zu functions=%zu elapsed_ms=%llu",
+		attached_pid,
+		selected->name.c_str(),
+		result["sections"].size(),
+		result["functions"].size(),
+		static_cast<unsigned long long>(GetTickCount64() - start_ms));
+	return tool_result_t::ok(result);
+}
+
 static tool_result_t fuzzer_manage_start(const json& params)
 {
 	std::string target = params.value("target_address", "");
@@ -689,53 +892,11 @@ static tool_result_t analysis_query_pdb_symbols(const json& params)
 
 static tool_result_t analysis_query_binary_map_overview(const json& params)
 {
-	if (params.value("fast_summary", false) && g_disasm.file.loaded) {
-		const size_t max_functions = bounded_size_param(params, "max_functions", 24, 1, 256);
-		json sections = json::array();
-		char buf[32];
-		for (size_t i = 0; i < g_disasm.file.sections.size(); ++i) {
-			const auto& s = g_disasm.file.sections[i];
-			json o;
-			o["name"] = ".section" + std::to_string(i);
-			std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(s.va));
-			o["va"] = buf;
-			o["size"] = s.bytes.size();
-			o["executable"] = s.is_executable;
-			o["readable"] = true;
-			o["writable"] = false;
-			sections.push_back(std::move(o));
-		}
-		json functions = json::array();
-		uint64_t last_va = 0;
-		for (const auto& ins : g_disasm.file.instrs) {
-			if (functions.size() >= max_functions)
-				break;
-			if (ins.addr == 0 || ins.addr == last_va)
-				continue;
-			last_va = ins.addr;
-			json o;
-			std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(ins.addr));
-			o["va"] = buf;
-			o["name"] = std::string("sub_") + buf + "_" + ins.mnem;
-			o["xref_count"] = 0;
-			o["callee_count"] = 0;
-			functions.push_back(std::move(o));
-		}
-		std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(g_disasm.file.image_base));
-		json result;
-		result["module_name"] = g_disasm.file.filename;
-		result["module_path"] = g_disasm.file.path;
-		result["architecture"] = "x86_64";
-		result["format"] = "PE";
-		result["image_base"] = buf;
-		result["image_size"] = static_analysis::total_image_size(g_disasm.file);
-		result["sections"] = std::move(sections);
-		result["functions"] = std::move(functions);
-		result["globals"] = json::array();
-		result["imports"] = json::array();
-		result["exports"] = json::array();
-		result["fast_summary"] = true;
-		return tool_result_t::ok(result);
+	if (params.value("fast_summary", false) &&
+		!params.value("include_imports", false) &&
+		!params.value("include_exports", false) &&
+		!params.value("include_xrefs", false)) {
+		return analysis_query_binary_map_fast_summary(params);
 	}
 	aida::binary_map::map_options_t opts;
 	opts.max_functions = params.value("max_functions", 24);
@@ -744,6 +905,7 @@ static tool_result_t analysis_query_binary_map_overview(const json& params)
 	opts.include_imports = params.value("include_imports", false);
 	opts.include_exports = params.value("include_exports", false);
 	opts.include_xrefs = params.value("include_xrefs", false);
+	opts.include_entropy = !params.value("fast_summary", false);
 	aida::binary_map::map_t m;
 	if (!aida::binary_map::generate(opts, m))
 		return tool_result_t::error(aida::binary_map::last_error());
@@ -797,6 +959,7 @@ static tool_result_t analysis_query_binary_map_overview(const json& params)
 	result["globals"] = std::move(globals);
 	result["imports"] = m.imports;
 	result["exports"] = m.exports;
+	result["fast_summary"] = params.value("fast_summary", false);
 	return tool_result_t::ok(result);
 }
 

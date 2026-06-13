@@ -493,15 +493,29 @@ tool_result_t network_stats(const json&)
 
     driver_bridge::network_stats_t stats{};
     bool ok = driver_bridge::get_network_stats(stats);
-    diag::log_tagged_fmt("net_tools", "network_stats result=%d bytes_sent=%llu bytes_recv=%llu captured=%llu dropped=%llu", (int)ok, static_cast<unsigned long long>(stats.bytes_sent), static_cast<unsigned long long>(stats.bytes_received), static_cast<unsigned long long>(stats.total_captured), static_cast<unsigned long long>(stats.total_dropped));
     if (!ok)
         return tool_result_t::error(OBFSTR("Failed to get network stats."));
+
+    std::uint32_t enumerated_active = 0;
+    bool active_connections_degraded = false;
+    if (stats.active_connections == 0) {
+        auto enumerated = driver_bridge::enumerate_connections(0, 0);
+        if (!enumerated.empty()) {
+            enumerated_active = enumerated.size() > 0xFFFFFFFFull ? 0xFFFFFFFFu : static_cast<std::uint32_t>(enumerated.size());
+            stats.active_connections = enumerated_active;
+            active_connections_degraded = true;
+        }
+    }
+    diag::log_tagged_fmt("net_tools", "network_stats result=%d active_connections=%u enumerated_active=%u degraded=%d bytes_sent=%llu bytes_recv=%llu captured=%llu dropped=%llu", (int)ok, stats.active_connections, enumerated_active, active_connections_degraded ? 1 : 0, static_cast<unsigned long long>(stats.bytes_sent), static_cast<unsigned long long>(stats.bytes_received), static_cast<unsigned long long>(stats.total_captured), static_cast<unsigned long long>(stats.total_dropped));
 
     json result;
     result["bytes_sent"] = stats.bytes_sent;
     result["bytes_received"] = stats.bytes_received;
     result["packets_sent"] = stats.packets_sent;
     result["packets_received"] = stats.packets_received;
+    result["active_connections"] = stats.active_connections;
+    result["active_connections_enumerated"] = enumerated_active;
+    result["active_connections_degraded"] = active_connections_degraded;
     result["capture_active"] = stats.capture_active != 0;
     result["total_captured"] = stats.total_captured;
     result["total_dropped"] = stats.total_dropped;
@@ -1895,6 +1909,10 @@ tool_result_t api_monitor_results(const json& params)
 
     json result = api_monitor::results(limit, filter_api, clear_after, stop_after);
     const int count = result.value("count", 0);
+    if (count == 0) {
+        diag::log_tagged_fmt("net_tools", "api_monitor_results empty stop=%d clear=%d", stop_after ? 1 : 0, clear_after ? 1 : 0);
+        return tool_result_t::error(OBFSTR("No API monitor events captured."), result);
+    }
     return tool_result_t::ok(std::to_string(count) + OBFSTR(" API monitor event(s)"), result);
 }
 
@@ -1949,10 +1967,36 @@ void register_network_tools(mcp_standalone::server_t& srv) {
          {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
         [](const json& params) -> tool_result_t {
             const std::string action = compat_action_name(params);
-            const json p = compat_action_payload(params);
-            if (action == "monitor") return network_bandwidth_monitor(p);
-            if (action == "per_process") return network_bandwidth_per_process(p);
-            if (action == "stats") return network_stats(p);
+            json p = params.is_object() ? params : json::object();
+            if (params.contains("payload") && params["payload"].is_object()) {
+                for (auto it = params["payload"].begin(); it != params["payload"].end(); ++it)
+                    p[it.key()] = it.value();
+            }
+            p.erase("action");
+            p.erase("payload");
+            const std::string operation = p.contains("operation") && p["operation"].is_string()
+                ? p["operation"].get<std::string>()
+                : std::string();
+            diag::log_tagged_fmt("net_tools",
+                "network_bandwidth_manage dispatch action=%s operation=%s preserved_operation=%d payload_keys=%zu",
+                action.c_str(),
+                operation.c_str(),
+                operation.empty() ? 0 : 1,
+                p.is_object() ? p.size() : 0);
+            auto finish = [&](const char* mapped, tool_result_t result) -> tool_result_t {
+                diag::log_tagged_fmt("net_tools",
+                    "network_bandwidth_manage result action=%s operation=%s mapped=%s success=%d data_object=%d text=%s",
+                    action.c_str(),
+                    operation.c_str(),
+                    mapped,
+                    result.success ? 1 : 0,
+                    result.data.is_object() ? 1 : 0,
+                    result.text.c_str());
+                return result;
+            };
+            if (action == "monitor") return finish("network_bandwidth_monitor", network_bandwidth_monitor(p));
+            if (action == "per_process") return finish("network_bandwidth_per_process", network_bandwidth_per_process(p));
+            if (action == "stats") return finish("network_stats", network_stats(p));
             return compat_unknown_action("network_bandwidth_manage", action);
         },
         false});

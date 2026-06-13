@@ -101,6 +101,34 @@ static std::vector<uint8_t> build_default_request(const std::string& host, uint1
     return std::vector<uint8_t>(req.begin(), req.end());
 }
 
+static size_t prune_empty_failed_collections_locked(uint64_t now, uint64_t min_age_ms)
+{
+    size_t pruned = 0;
+    for (auto it = g_reg.collections.begin(); it != g_reg.collections.end(); ) {
+        const auto& coll = it->second;
+        const uint64_t started = coll ? coll->started_ms : 0;
+        const uint64_t age = now >= started ? now - started : 0;
+        const bool stale_failed_empty =
+            coll &&
+            coll->error_flag.load() &&
+            !coll->running.load() &&
+            coll->in_flight.load() == 0 &&
+            coll->collected.load() == 0 &&
+            coll->last_sample_ms.load() == 0 &&
+            age >= min_age_ms;
+        if (stale_failed_empty) {
+            diag::log_tagged_fmt("sequencer", "prune_empty_failed_collection id=%llu age_ms=%llu",
+                static_cast<unsigned long long>(coll->id),
+                static_cast<unsigned long long>(age));
+            it = g_reg.collections.erase(it);
+            ++pruned;
+        } else {
+            ++it;
+        }
+    }
+    return pruned;
+}
+
 static bool perform_one_request(const collection_config_t& cfg, const std::regex& re, std::string& out_token, std::string& out_err)
 {
     diag::log_tagged_fmt("sequencer", "perform_one_request entry host=%s port=%u tls=%d url=%s",
@@ -191,6 +219,7 @@ static void collection_worker(std::shared_ptr<collection_t> coll)
             coll->error_message = "invalid_regex";
         }
         coll->error_flag.store(true);
+        set_last_error("invalid_regex");
         coll->running.store(false);
         ::diag::log_tagged_fmt("sequencer", "collection_failed id=%llu reason=invalid_regex",
             static_cast<unsigned long long>(coll->id));
@@ -216,6 +245,7 @@ static void collection_worker(std::shared_ptr<collection_t> coll)
                 std::lock_guard<std::mutex> lk(coll->err_mtx);
                 if (coll->error_message.empty()) coll->error_message = "attempt_cap_reached";
             }
+            coll->error_flag.store(true);
             break;
         }
 
@@ -233,7 +263,7 @@ static void collection_worker(std::shared_ptr<collection_t> coll)
         collection_config_t cfg_snapshot = coll->config;
         std::shared_ptr<collection_t> coll_ref = coll;
         std::regex re_copy = re;
-        work_queue::post([coll_ref, cfg_snapshot, re_copy]() {
+        auto sample_task = [coll_ref, cfg_snapshot, re_copy]() {
             std::string token;
             std::string err;
             bool ok = perform_one_request(cfg_snapshot, re_copy, token, err);
@@ -249,15 +279,37 @@ static void collection_worker(std::shared_ptr<collection_t> coll)
                     std::lock_guard<std::mutex> lk(coll_ref->err_mtx);
                     if (coll_ref->error_message.empty()) coll_ref->error_message = err;
                 }
+                if (!err.empty()) set_last_error(err);
             }
             coll_ref->in_flight.fetch_sub(1);
-        });
+        };
+        bool posted = false;
+        try {
+            posted = work_queue::post(sample_task);
+        } catch (...) {
+            posted = false;
+        }
+        if (!posted) {
+            diag::log_tagged_fmt("sequencer", "collection_sample_post_failed id=%llu attempt=%zu in_flight=%zu",
+                static_cast<unsigned long long>(coll->id),
+                total_attempts,
+                coll->in_flight.load());
+            sample_task();
+        }
     }
 
     while (coll->in_flight.load() > 0) {
         Sleep(20);
     }
 
+    if (coll->error_flag.load()) {
+        std::string err;
+        {
+            std::lock_guard<std::mutex> lk(coll->err_mtx);
+            err = coll->error_message;
+        }
+        if (!err.empty()) set_last_error(err);
+    }
     coll->running.store(false);
     ::diag::log_tagged_fmt("sequencer", "collection_done id=%llu collected=%zu target=%zu",
         static_cast<unsigned long long>(coll->id),
@@ -612,13 +664,41 @@ uint64_t start_collection(const collection_config_t& cfg)
     coll->started_ms = now_ms();
     {
         std::lock_guard<std::mutex> lk(g_reg.mtx);
+        const size_t pruned = prune_empty_failed_collections_locked(coll->started_ms, 30000);
+        if (pruned > 0) {
+            ::diag::log_tagged_fmt("sequencer", "start_collection pruned_empty_failed=%zu new_id=%llu",
+                pruned,
+                static_cast<unsigned long long>(coll->id));
+        }
         g_reg.collections[coll->id] = coll;
     }
 
     std::shared_ptr<collection_t> coll_ref = coll;
-    work_queue::post([coll_ref]() {
-        collection_worker(coll_ref);
-    });
+    bool posted = false;
+    try {
+        posted = work_queue::post([coll_ref]() {
+            collection_worker(coll_ref);
+        });
+    } catch (...) {
+        posted = false;
+    }
+    if (!posted) {
+        {
+            std::lock_guard<std::mutex> lk(coll->err_mtx);
+            coll->error_message = "collection_worker_queue_failed";
+        }
+        coll->error_flag.store(true);
+        coll->running.store(false);
+        set_last_error("collection_worker_queue_failed");
+        ::diag::log_tagged_fmt("sequencer", "collection_worker_post_failed id=%llu url='%s'",
+            static_cast<unsigned long long>(coll->id),
+            cfg.url.c_str());
+        {
+            std::lock_guard<std::mutex> lk(g_reg.mtx);
+            g_reg.collections.erase(coll->id);
+        }
+        return 0;
+    }
 
     ::diag::log_tagged_fmt("sequencer", "collection_started id=%llu url='%s' target=%zu concurrency=%zu",
         static_cast<unsigned long long>(coll->id),

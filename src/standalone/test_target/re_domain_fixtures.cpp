@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstring>
 #include <new>
+#include <typeinfo>
 
 namespace test_target {
 namespace re_fixtures {
@@ -17,6 +18,8 @@ constexpr std::uint32_t kMatrixCount = 64;
 constexpr std::uint32_t kMatrixStride = 64;
 constexpr std::uint32_t kStructCount = 16;
 constexpr std::uint32_t kMaxHeapBlocks = 128;
+constexpr std::uint32_t kDxStaticSlotCount = 5;
+constexpr std::uint32_t kDxStaticFixtureKind = 1;
 
 struct matrix4x4_t {
     float v[16];
@@ -55,12 +58,26 @@ public:
 
 class fixture_rtti_entity final : public fixture_rtti_base {
 public:
-    std::uint32_t id = 0x7001u;
-    std::uint32_t flags = 0x41u;
-    std::uint64_t payload = 0xA1DA700100000002ull;
+    __declspec(noinline) fixture_rtti_entity() noexcept;
+    __declspec(noinline) explicit fixture_rtti_entity(std::uint32_t seed) noexcept;
+    std::uint32_t id;
+    std::uint32_t flags;
+    std::uint64_t payload;
     std::uint32_t kind() const noexcept override { return 0xBEEF7001u; }
     std::uint64_t value() const noexcept override { return payload ^ id; }
 };
+
+fixture_rtti_entity::fixture_rtti_entity() noexcept
+    : fixture_rtti_entity(0x7001u)
+{
+}
+
+fixture_rtti_entity::fixture_rtti_entity(std::uint32_t seed) noexcept
+    : id(0x70010000u ^ seed),
+      flags(0x41u | (seed & 0xFFu)),
+      payload(0xA1DA700100000002ull ^ (static_cast<std::uint64_t>(seed) << 17u))
+{
+}
 
 std::atomic<bool>* g_running = nullptr;
 config_t g_cfg{};
@@ -69,6 +86,8 @@ fixture_struct_t* g_struct_array = nullptr;
 fixture_struct_t g_struct_base{};
 resource_like_object_t g_resource{};
 fixture_rtti_entity g_rtti_entity{};
+alignas(fixture_rtti_entity) unsigned char g_rtti_factory_storage[sizeof(fixture_rtti_entity)] = {};
+fixture_rtti_entity* g_rtti_factory_entity = nullptr;
 HMODULE g_d3d11 = nullptr;
 HMODULE g_dxgi = nullptr;
 HANDLE g_window_thread = nullptr;
@@ -81,6 +100,20 @@ std::uint32_t g_heap_stride = 0;
 CRITICAL_SECTION g_heap_lock;
 bool g_heap_lock_ready = false;
 std::atomic<bool> g_local_running{false};
+std::uint64_t g_dx_static_slot_accumulator = 0;
+volatile std::uint64_t g_analysis_sink = 0;
+
+const char* g_dx_static_slot_names[kDxStaticSlotCount] = {
+    "VSSetConstantBuffers",
+    "DrawIndexed",
+    "DrawIndexedInstanced",
+    "PSSetShaderResources",
+    "IASetVertexBuffers"
+};
+
+const char g_dx_static_fixture_label[] = "static_dummy_d3d11_context_vtable";
+void* g_dx_static_vtable[64] = {};
+void* g_dx_static_slot_addresses[kDxStaticSlotCount] = {};
 
 extern "C" __declspec(noinline) std::uint64_t aida_re_resource_slot_zero() noexcept
 {
@@ -96,6 +129,82 @@ void* g_resource_vtable[] = {
     reinterpret_cast<void*>(&aida_re_resource_slot_zero),
     reinterpret_cast<void*>(&aida_re_resource_slot_one)
 };
+
+void initialize_dx_static_vtable()
+{
+    std::memset(g_dx_static_vtable, 0, sizeof(g_dx_static_vtable));
+    g_dx_static_vtable[7] = reinterpret_cast<void*>(&aida_test_re_dx_static_vs_set_constant_buffers);
+    g_dx_static_vtable[12] = reinterpret_cast<void*>(&aida_test_re_dx_static_draw_indexed);
+    g_dx_static_vtable[14] = reinterpret_cast<void*>(&aida_test_re_dx_static_draw_indexed_instanced);
+    g_dx_static_vtable[25] = reinterpret_cast<void*>(&aida_test_re_dx_static_ps_set_shader_resources);
+    g_dx_static_vtable[54] = reinterpret_cast<void*>(&aida_test_re_dx_static_ia_set_vertex_buffers);
+    g_dx_static_slot_addresses[0] = g_dx_static_vtable[7];
+    g_dx_static_slot_addresses[1] = g_dx_static_vtable[12];
+    g_dx_static_slot_addresses[2] = g_dx_static_vtable[14];
+    g_dx_static_slot_addresses[3] = g_dx_static_vtable[25];
+    g_dx_static_slot_addresses[4] = g_dx_static_vtable[54];
+}
+
+std::uint64_t min_nonzero_va(std::uint64_t a, std::uint64_t b)
+{
+    if (a == 0)
+        return b;
+    if (b == 0)
+        return a;
+    return a < b ? a : b;
+}
+
+std::uint64_t max_va(std::uint64_t a, std::uint64_t b)
+{
+    return a > b ? a : b;
+}
+
+std::uint64_t probe_u64(const void* ptr)
+{
+    std::uint64_t value = 0;
+    __try {
+        std::memcpy(&value, ptr, sizeof(value));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        value = 0;
+    }
+    return value;
+}
+
+std::uint64_t resolve_type_descriptor_from_col(std::uint64_t col_va)
+{
+    struct col_t {
+        std::uint32_t signature;
+        std::uint32_t offset;
+        std::uint32_t cd_offset;
+        std::uint32_t type_descriptor_rva;
+        std::uint32_t class_descriptor_rva;
+        std::uint32_t self_rva;
+    };
+    if (!col_va)
+        return 0;
+    col_t col{};
+    __try {
+        std::memcpy(&col, reinterpret_cast<const void*>(col_va), sizeof(col));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+    if (col.signature == 1u && col.self_rva != 0)
+        return (col_va - col.self_rva) + col.type_descriptor_rva;
+    return static_cast<std::uint64_t>(col.type_descriptor_rva);
+}
+
+void update_analysis_range_fields()
+{
+    const std::uint64_t branch = reinterpret_cast<std::uint64_t>(&aida_test_re_analysis_branch);
+    const std::uint64_t callgraph = reinterpret_cast<std::uint64_t>(&aida_test_re_analysis_callgraph);
+    const std::uint64_t dispatch = reinterpret_cast<std::uint64_t>(&aida_test_re_analysis_dispatch);
+    std::uint64_t lo = min_nonzero_va(branch, callgraph);
+    lo = min_nonzero_va(lo, dispatch);
+    std::uint64_t hi = max_va(branch, callgraph);
+    hi = max_va(hi, dispatch);
+    aida_test_re_descriptor.analysis_range_va = lo;
+    aida_test_re_descriptor.analysis_range_size = hi >= lo ? static_cast<std::uint32_t>((hi - lo) + 512u) : 0u;
+}
 
 bool running_now()
 {
@@ -129,7 +238,7 @@ void fill_structs()
     std::memset(&g_struct_base, 0, sizeof(g_struct_base));
     g_struct_base.id = 0xA1DA1000u;
     g_struct_base.flags = 0x100u;
-    g_struct_base.owner = reinterpret_cast<std::uint64_t>(&g_rtti_entity);
+    g_struct_base.owner = reinterpret_cast<std::uint64_t>(g_rtti_factory_entity ? g_rtti_factory_entity : &g_rtti_entity);
     g_struct_base.position[0] = 10.0f;
     g_struct_base.position[1] = 20.0f;
     g_struct_base.position[2] = 30.0f;
@@ -179,6 +288,29 @@ void fill_resource()
     g_resource.aliases[1] = g_struct_array;
     g_resource.aliases[2] = &g_struct_base;
     g_resource.aliases[3] = &g_rtti_entity;
+    g_resource.aliases[4] = g_rtti_factory_entity;
+}
+
+void* construct_rtti_entity_impl(void* storage, std::uint32_t seed) noexcept
+{
+    void* target = storage ? storage : static_cast<void*>(g_rtti_factory_storage);
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(target, &mbi, sizeof(mbi)) != sizeof(mbi) ||
+        (mbi.State & MEM_COMMIT) == 0 ||
+        (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0 ||
+        (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY)) == 0)
+        return nullptr;
+    if (target == static_cast<void*>(g_rtti_factory_storage) && g_rtti_factory_entity)
+        g_rtti_factory_entity->~fixture_rtti_entity();
+    fixture_rtti_entity* entity = new(target) fixture_rtti_entity(seed);
+    if (target == static_cast<void*>(g_rtti_factory_storage))
+        g_rtti_factory_entity = entity;
+    return entity;
+}
+
+void* factory_rtti_entity_impl(std::uint32_t seed) noexcept
+{
+    return construct_rtti_entity_impl(static_cast<void*>(g_rtti_factory_storage), seed);
 }
 
 void free_heap_blocks_locked()
@@ -266,7 +398,11 @@ void update_descriptor()
     aida_test_re_descriptor.struct_count = kStructCount;
     aida_test_re_descriptor.struct_size = sizeof(fixture_struct_t);
     std::uint64_t rtti_vtable = 0;
-    std::memcpy(&rtti_vtable, &g_rtti_entity, sizeof(rtti_vtable));
+    const char* rtti_name = typeid(g_rtti_entity).name();
+    (void)rtti_name;
+    const void* rtti_instance_bytes = static_cast<const void*>(&g_rtti_entity);
+    std::memcpy(&rtti_vtable, rtti_instance_bytes, sizeof(rtti_vtable));
+    const std::uint64_t col_va = rtti_vtable ? probe_u64(reinterpret_cast<const void*>(rtti_vtable - sizeof(std::uint64_t))) : 0;
     aida_test_re_descriptor.rtti_instance_va = reinterpret_cast<std::uint64_t>(&g_rtti_entity);
     aida_test_re_descriptor.rtti_vtable_va = rtti_vtable;
     aida_test_re_descriptor.heap_burst_fn_va = reinterpret_cast<std::uint64_t>(&aida_test_re_heap_burst);
@@ -275,6 +411,22 @@ void update_descriptor()
     aida_test_re_descriptor.frame_counter_va = reinterpret_cast<std::uint64_t>(&g_frame_counter);
     aida_test_re_descriptor.d3d11_module_va = reinterpret_cast<std::uint64_t>(g_d3d11);
     aida_test_re_descriptor.dxgi_module_va = reinterpret_cast<std::uint64_t>(g_dxgi);
+    aida_test_re_descriptor.dx_static_vtable_va = reinterpret_cast<std::uint64_t>(g_dx_static_vtable);
+    aida_test_re_descriptor.dx_static_slot_names_va = reinterpret_cast<std::uint64_t>(g_dx_static_slot_names);
+    aida_test_re_descriptor.dx_static_slot_addresses_va = reinterpret_cast<std::uint64_t>(g_dx_static_slot_addresses);
+    aida_test_re_descriptor.dx_static_slot_count = kDxStaticSlotCount;
+    aida_test_re_descriptor.dx_static_fixture_kind = kDxStaticFixtureKind;
+    aida_test_re_descriptor.dx_static_fixture_label_va = reinterpret_cast<std::uint64_t>(g_dx_static_fixture_label);
+    aida_test_re_descriptor.rtti_factory_fn_va = reinterpret_cast<std::uint64_t>(&aida_test_re_factory_rtti_entity);
+    aida_test_re_descriptor.rtti_constructor_fn_va = reinterpret_cast<std::uint64_t>(&aida_test_re_construct_rtti_entity);
+    aida_test_re_descriptor.rtti_factory_instance_va = reinterpret_cast<std::uint64_t>(g_rtti_factory_entity);
+    aida_test_re_descriptor.rtti_complete_object_locator_va = col_va;
+    aida_test_re_descriptor.rtti_type_descriptor_va = resolve_type_descriptor_from_col(col_va);
+    aida_test_re_descriptor.analysis_branch_fn_va = reinterpret_cast<std::uint64_t>(&aida_test_re_analysis_branch);
+    aida_test_re_descriptor.analysis_callgraph_fn_va = reinterpret_cast<std::uint64_t>(&aida_test_re_analysis_callgraph);
+    aida_test_re_descriptor.analysis_dispatch_fn_va = reinterpret_cast<std::uint64_t>(&aida_test_re_analysis_dispatch);
+    aida_test_re_descriptor.analysis_export_count = 3;
+    update_analysis_range_fields();
 }
 
 }
@@ -297,6 +449,8 @@ void init(const config_t& cfg, std::atomic<bool>& running)
     }
 
     refresh_matrices(0);
+    initialize_dx_static_vtable();
+    factory_rtti_entity_impl(0x7101u);
     fill_structs();
     fill_resource();
 
@@ -321,6 +475,16 @@ void init(const config_t& cfg, std::atomic<bool>& running)
                g_d3d11,
                g_dxgi,
                cfg.enable_window ? 1 : 0);
+        printf("[re-fixture] dx_static_vtable=%p slots=%u rtti_factory=%p rtti_ctor=%p col=0x%llX type=0x%llX analysis_branch=%p analysis_callgraph=%p analysis_dispatch=%p\n",
+               g_dx_static_vtable,
+               aida_test_re_descriptor.dx_static_slot_count,
+               reinterpret_cast<void*>(aida_test_re_descriptor.rtti_factory_fn_va),
+               reinterpret_cast<void*>(aida_test_re_descriptor.rtti_constructor_fn_va),
+               static_cast<unsigned long long>(aida_test_re_descriptor.rtti_complete_object_locator_va),
+               static_cast<unsigned long long>(aida_test_re_descriptor.rtti_type_descriptor_va),
+               reinterpret_cast<void*>(aida_test_re_descriptor.analysis_branch_fn_va),
+               reinterpret_cast<void*>(aida_test_re_descriptor.analysis_callgraph_fn_va),
+               reinterpret_cast<void*>(aida_test_re_descriptor.analysis_dispatch_fn_va));
         fflush(stdout);
     }
 }
@@ -358,6 +522,10 @@ void shutdown_all()
     if (g_dxgi) {
         FreeLibrary(g_dxgi);
         g_dxgi = nullptr;
+    }
+    if (g_rtti_factory_entity) {
+        g_rtti_factory_entity->~fixture_rtti_entity();
+        g_rtti_factory_entity = nullptr;
     }
 
     update_descriptor();
@@ -458,3 +626,115 @@ extern "C" __declspec(dllexport) __declspec(noinline) std::uint64_t aida_test_re
 {
     return test_target::re_fixtures::frame_tick_impl(frame_index);
 }
+
+extern "C" __declspec(dllexport) __declspec(noinline) std::uint64_t aida_test_re_dx_static_vs_set_constant_buffers(std::uint32_t start_slot, std::uint64_t buffer_va, std::uint32_t count) noexcept
+{
+    const std::uint64_t result = (static_cast<std::uint64_t>(start_slot) << 48u) ^ (static_cast<std::uint64_t>(count) << 32u) ^ buffer_va ^ 0xA1DAD31100000007ull;
+    test_target::re_fixtures::g_dx_static_slot_accumulator ^= result;
+    return test_target::re_fixtures::g_dx_static_slot_accumulator;
+}
+
+extern "C" __declspec(dllexport) __declspec(noinline) std::uint64_t aida_test_re_dx_static_draw_indexed(std::uint32_t index_count, std::uint32_t start_index, std::int32_t base_vertex) noexcept
+{
+    const std::uint64_t result = (static_cast<std::uint64_t>(index_count) * 1315423911ull) ^ (static_cast<std::uint64_t>(start_index) << 17u) ^ static_cast<std::uint32_t>(base_vertex) ^ 0xA1DAD3110000000Cull;
+    test_target::re_fixtures::g_dx_static_slot_accumulator += result;
+    return result;
+}
+
+extern "C" __declspec(dllexport) __declspec(noinline) std::uint64_t aida_test_re_dx_static_draw_indexed_instanced(std::uint32_t index_count, std::uint32_t instance_count, std::uint32_t start_index) noexcept
+{
+    const std::uint64_t result = (static_cast<std::uint64_t>(index_count) << 32u) | (static_cast<std::uint64_t>(instance_count) << 16u) | start_index;
+    test_target::re_fixtures::g_dx_static_slot_accumulator ^= (result + 0xA1DAD3110000000Eull);
+    return test_target::re_fixtures::g_dx_static_slot_accumulator;
+}
+
+extern "C" __declspec(dllexport) __declspec(noinline) std::uint64_t aida_test_re_dx_static_ps_set_shader_resources(std::uint32_t start_slot, std::uint64_t resource_va, std::uint32_t count) noexcept
+{
+    const std::uint64_t result = resource_va + static_cast<std::uint64_t>(start_slot * 257u + count * 4099u) + 0xA1DAD31100000019ull;
+    test_target::re_fixtures::g_dx_static_slot_accumulator = (test_target::re_fixtures::g_dx_static_slot_accumulator << 3u) ^ result;
+    return result;
+}
+
+extern "C" __declspec(dllexport) __declspec(noinline) std::uint64_t aida_test_re_dx_static_ia_set_vertex_buffers(std::uint32_t start_slot, std::uint64_t buffer_va, std::uint32_t stride) noexcept
+{
+    const std::uint64_t result = buffer_va ^ (static_cast<std::uint64_t>(stride) << 24u) ^ start_slot ^ 0xA1DAD31100000036ull;
+    test_target::re_fixtures::g_dx_static_slot_accumulator += (result | 1ull);
+    return test_target::re_fixtures::g_dx_static_slot_accumulator;
+}
+
+extern "C" __declspec(dllexport) __declspec(noinline) void* aida_test_re_construct_rtti_entity(void* storage, std::uint32_t seed) noexcept
+{
+    return test_target::re_fixtures::construct_rtti_entity_impl(storage, seed);
+}
+
+extern "C" __declspec(dllexport) __declspec(noinline) void* aida_test_re_factory_rtti_entity(std::uint32_t seed) noexcept
+{
+    return test_target::re_fixtures::factory_rtti_entity_impl(seed);
+}
+
+#pragma optimize("", off)
+extern "C" __declspec(dllexport) __declspec(noinline) std::uint32_t aida_test_re_analysis_branch(std::uint32_t x, std::uint32_t y) noexcept
+{
+    std::uint32_t acc = 0xA1DA3001u ^ x;
+    if ((x & 1u) != 0)
+        acc += y * 3u;
+    else
+        acc ^= y + 0x13572468u;
+    if (x > y)
+        acc = (acc << 5u) | (acc >> 27u);
+    else if (x == y)
+        acc += 0x11111111u;
+    else
+        acc = (acc >> 3u) | (acc << 29u);
+    for (std::uint32_t i = 0; i < 6u; ++i) {
+        acc ^= (x + i) * 33u;
+        if ((acc & 0x80u) != 0)
+            acc += y ^ i;
+    }
+    test_target::re_fixtures::g_analysis_sink ^= acc;
+    return acc;
+}
+
+extern "C" __declspec(dllexport) __declspec(noinline) std::uint32_t aida_test_re_analysis_callgraph(std::uint32_t seed) noexcept
+{
+    std::uint32_t total = 0;
+    for (std::uint32_t i = 0; i < 4u; ++i)
+        total += aida_test_re_analysis_branch(seed + i, seed ^ (i * 17u));
+    total ^= aida_test_re_analysis_dispatch(seed & 7u, total);
+    test_target::re_fixtures::g_analysis_sink += total;
+    return total;
+}
+
+extern "C" __declspec(dllexport) __declspec(noinline) std::uint32_t aida_test_re_analysis_dispatch(std::uint32_t opcode, std::uint32_t value) noexcept
+{
+    std::uint32_t out = value;
+    switch (opcode & 7u) {
+    case 0u:
+        out += 0x101u;
+        break;
+    case 1u:
+        out ^= 0xA5A5A5A5u;
+        break;
+    case 2u:
+        out = (out << 7u) | (out >> 25u);
+        break;
+    case 3u:
+        out *= 33u;
+        break;
+    case 4u:
+        out = aida_test_re_analysis_branch(value & 0xFFu, opcode + 9u);
+        break;
+    case 5u:
+        out -= 0x51515151u;
+        break;
+    case 6u:
+        out ^= (out >> 11u);
+        break;
+    default:
+        out += aida_test_re_analysis_branch(opcode, value);
+        break;
+    }
+    test_target::re_fixtures::g_analysis_sink ^= out;
+    return out;
+}
+#pragma optimize("", on)

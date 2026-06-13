@@ -766,42 +766,6 @@ bool aida_plugin_t::initialize_operational(bool interactive)
         msg(OBFSTR_C("AiDA public IP worker unavailable.\n"));
     }
 
-    auto& license = license_manager_t::instance();
-
-    bool license_ok = license.validate();
-
-    if (!license_ok || !license.is_valid())
-    {
-        bool activated = false;
-        for (int attempt = 0; attempt < 3; ++attempt)
-        {
-            if (license.show_activation_dialog())
-            {
-                activated = true;
-                break;
-            }
-
-            if (attempt < 2)
-            {
-                int choice = ask_yn(ASKBTN_YES,
-                    OBFSTR_C("License validation failed. Try again?"));
-                if (choice != ASKBTN_YES)
-                    break;
-            }
-        }
-
-        if (!activated || !license.is_valid())
-        {
-            set_disabled("Plugin requires a valid license to operate");
-            msg(OBFSTR_C("AiDA: %s.\n"), disabled_detail.c_str());
-            return false;
-        }
-    }
-
-    license.start_revalidation_timer();
-
-    license.snapshot_function_prologues();
-
 #ifdef __NT__
     check_input_for_self_target();
     anti_re::start_pipe_monitor();
@@ -887,13 +851,6 @@ bool idaapi aida_plugin_t::run(size_t)
     if (!ensure_operational(true))
     {
         warning(OBFSTR_C("AiDA is loaded but disabled: %s"), disabled_detail.c_str());
-        return false;
-    }
-
-    auto& license = license_manager_t::instance();
-    if (!license.is_valid() || license.get_runtime_nonce() == 0)
-    {
-        warning(OBFSTR_C("License validation failed. Please restart IDA and enter a valid license key."));
         return false;
     }
 

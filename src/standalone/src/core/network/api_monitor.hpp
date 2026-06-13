@@ -4,6 +4,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <tlhelp32.h>
 
 #include "standalone_driver.hpp"
 #include "../infra/work_queue.hpp"
@@ -22,12 +23,17 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <exception>
+#include <future>
 #include <functional>
 #include <iomanip>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -162,6 +168,351 @@ struct state_t {
 };
 
 inline state_t g_state;
+
+inline nlohmann::json status_json();
+
+inline void log_phase_state(const char* event, const char* phase, uint32_t pid, DWORD tid, uint64_t elapsed_ms, uint32_t timeout_ms) {
+    const auto q = work_queue::stats();
+    const auto sq = work_queue::service_stats();
+    diag::log_tagged_fmt("api_monitor",
+        "phase_state event=%s phase=%s pid=%u tid=%lu elapsed_ms=%llu timeout_ms=%u active=%d polling=%d debug_loop=%d attached=%d cleanup=%d q_alive=%d q_shutdown=%d q_workers=%zu q_pending=%zu q_active=%u q_posted=%llu q_rejected=%llu q_started=%llu q_finished=%llu svc_alive=%d svc_shutdown=%d svc_workers=%zu svc_pending=%zu svc_active=%u svc_posted=%llu svc_rejected=%llu svc_started=%llu svc_finished=%llu",
+        event ? event : "unknown",
+        phase ? phase : "unknown",
+        pid,
+        tid,
+        static_cast<unsigned long long>(elapsed_ms),
+        timeout_ms,
+        g_state.active.load() ? 1 : 0,
+        g_state.polling.load() ? 1 : 0,
+        g_state.debug_loop_running.load() ? 1 : 0,
+        g_state.debug_attached.load() ? 1 : 0,
+        g_state.cleanup_running.load() ? 1 : 0,
+        q.alive ? 1 : 0,
+        q.shutting_down ? 1 : 0,
+        q.workers,
+        q.pending,
+        q.active,
+        static_cast<unsigned long long>(q.posted),
+        static_cast<unsigned long long>(q.rejected),
+        static_cast<unsigned long long>(q.started),
+        static_cast<unsigned long long>(q.finished),
+        sq.alive ? 1 : 0,
+        sq.shutting_down ? 1 : 0,
+        sq.workers,
+        sq.pending,
+        sq.active,
+        static_cast<unsigned long long>(sq.posted),
+        static_cast<unsigned long long>(sq.rejected),
+        static_cast<unsigned long long>(sq.started),
+        static_cast<unsigned long long>(sq.finished));
+}
+
+template <typename T>
+struct phase_result_t {
+    bool completed = false;
+    bool threw = false;
+    DWORD gle = ERROR_SUCCESS;
+    int exception_code = 0;
+    uint64_t elapsed_ms = 0;
+    T value{};
+    std::string exception;
+    std::string exception_category;
+};
+
+template <typename T, typename Fn>
+inline phase_result_t<T> run_phase_with_timeout(const char* phase,
+                                                uint32_t pid,
+                                                uint32_t timeout_ms,
+                                                Fn&& fn) {
+    const uint64_t started_ms = GetTickCount64();
+    const DWORD caller_tid = GetCurrentThreadId();
+    diag::log_tagged_fmt("api_monitor",
+        "phase_begin phase=%s pid=%u caller_tid=%lu timeout_ms=%u",
+        phase,
+        pid,
+        caller_tid,
+        timeout_ms);
+    log_phase_state("begin", phase, pid, caller_tid, 0, timeout_ms);
+
+    std::future<phase_result_t<T>> future;
+    try {
+        auto promise = std::make_shared<std::promise<phase_result_t<T>>>();
+        auto fn_copy = std::make_shared<typename std::decay<Fn>::type>(std::forward<Fn>(fn));
+        future = promise->get_future();
+        std::thread worker([promise, fn_copy, phase, pid, started_ms]() mutable {
+            phase_result_t<T> result;
+            result.completed = true;
+            try {
+                SetLastError(ERROR_SUCCESS);
+                result.value = (*fn_copy)();
+                result.gle = GetLastError();
+            } catch (const std::system_error& ex) {
+                result.threw = true;
+                result.exception = ex.what();
+                result.exception_code = ex.code().value();
+                result.exception_category = ex.code().category().name();
+                result.gle = GetLastError();
+            } catch (const std::exception& ex) {
+                result.threw = true;
+                result.exception = ex.what();
+                result.gle = GetLastError();
+            } catch (...) {
+                result.threw = true;
+                result.exception = "unknown exception";
+                result.gle = GetLastError();
+            }
+            result.elapsed_ms = GetTickCount64() - started_ms;
+            diag::log_tagged_fmt("api_monitor",
+                "phase_worker_exit phase=%s pid=%u worker_tid=%lu elapsed_ms=%llu gle=%lu threw=%d code=%d category=%s",
+                phase,
+                pid,
+                GetCurrentThreadId(),
+                static_cast<unsigned long long>(result.elapsed_ms),
+                result.gle,
+                result.threw ? 1 : 0,
+                result.exception_code,
+                result.exception_category.c_str());
+            try {
+                promise->set_value(std::move(result));
+            } catch (...) {
+            }
+        });
+        diag::log_tagged_fmt("api_monitor",
+            "phase_thread_started phase=%s pid=%u caller_tid=%lu worker_id_hash=%llu active=%d polling=%d debug_loop=%d attached=%d cleanup=%d hw_threads=%u",
+            phase,
+            pid,
+            caller_tid,
+            static_cast<unsigned long long>(std::hash<std::thread::id>{}(worker.get_id())),
+            g_state.active.load() ? 1 : 0,
+            g_state.polling.load() ? 1 : 0,
+            g_state.debug_loop_running.load() ? 1 : 0,
+            g_state.debug_attached.load() ? 1 : 0,
+            g_state.cleanup_running.load() ? 1 : 0,
+            std::thread::hardware_concurrency());
+        log_phase_state("thread_started", phase, pid, caller_tid, GetTickCount64() - started_ms, timeout_ms);
+        worker.detach();
+    } catch (const std::system_error& ex) {
+        phase_result_t<T> failed;
+        failed.completed = false;
+        failed.threw = true;
+        failed.gle = GetLastError();
+        failed.exception = ex.what();
+        failed.exception_code = ex.code().value();
+        failed.exception_category = ex.code().category().name();
+        failed.elapsed_ms = GetTickCount64() - started_ms;
+        diag::log_tagged_fmt("api_monitor",
+            "phase_fail phase=%s pid=%u caller_tid=%lu reason=thread_create_system_error elapsed_ms=%llu gle=%lu code=%d category=%s message=%s active=%d polling=%d debug_loop=%d attached=%d cleanup=%d hw_threads=%u",
+            phase,
+            pid,
+            caller_tid,
+            static_cast<unsigned long long>(failed.elapsed_ms),
+            failed.gle,
+            failed.exception_code,
+            failed.exception_category.c_str(),
+            failed.exception.c_str(),
+            g_state.active.load() ? 1 : 0,
+            g_state.polling.load() ? 1 : 0,
+            g_state.debug_loop_running.load() ? 1 : 0,
+            g_state.debug_attached.load() ? 1 : 0,
+            g_state.cleanup_running.load() ? 1 : 0,
+            std::thread::hardware_concurrency());
+        log_phase_state("thread_create_system_error", phase, pid, caller_tid, failed.elapsed_ms, timeout_ms);
+        return failed;
+    } catch (const std::exception& ex) {
+        phase_result_t<T> failed;
+        failed.completed = false;
+        failed.threw = true;
+        failed.gle = GetLastError();
+        failed.exception = ex.what();
+        failed.elapsed_ms = GetTickCount64() - started_ms;
+        diag::log_tagged_fmt("api_monitor",
+            "phase_fail phase=%s pid=%u caller_tid=%lu reason=thread_create_exception elapsed_ms=%llu gle=%lu message=%s active=%d polling=%d debug_loop=%d attached=%d cleanup=%d hw_threads=%u",
+            phase,
+            pid,
+            caller_tid,
+            static_cast<unsigned long long>(failed.elapsed_ms),
+            failed.gle,
+            failed.exception.c_str(),
+            g_state.active.load() ? 1 : 0,
+            g_state.polling.load() ? 1 : 0,
+            g_state.debug_loop_running.load() ? 1 : 0,
+            g_state.debug_attached.load() ? 1 : 0,
+            g_state.cleanup_running.load() ? 1 : 0,
+            std::thread::hardware_concurrency());
+        log_phase_state("thread_create_exception", phase, pid, caller_tid, failed.elapsed_ms, timeout_ms);
+        return failed;
+    } catch (...) {
+        phase_result_t<T> failed;
+        failed.completed = false;
+        failed.threw = true;
+        failed.gle = GetLastError();
+        failed.exception = "unknown thread creation exception";
+        failed.elapsed_ms = GetTickCount64() - started_ms;
+        diag::log_tagged_fmt("api_monitor",
+            "phase_fail phase=%s pid=%u caller_tid=%lu reason=thread_create_unknown elapsed_ms=%llu gle=%lu active=%d polling=%d debug_loop=%d attached=%d cleanup=%d hw_threads=%u",
+            phase,
+            pid,
+            caller_tid,
+            static_cast<unsigned long long>(failed.elapsed_ms),
+            failed.gle,
+            g_state.active.load() ? 1 : 0,
+            g_state.polling.load() ? 1 : 0,
+            g_state.debug_loop_running.load() ? 1 : 0,
+            g_state.debug_attached.load() ? 1 : 0,
+            g_state.cleanup_running.load() ? 1 : 0,
+            std::thread::hardware_concurrency());
+        log_phase_state("thread_create_unknown", phase, pid, caller_tid, failed.elapsed_ms, timeout_ms);
+        return failed;
+    }
+
+    if (future.wait_for(std::chrono::milliseconds(timeout_ms)) != std::future_status::ready) {
+        phase_result_t<T> timed_out;
+        timed_out.completed = false;
+        timed_out.gle = WAIT_TIMEOUT;
+        timed_out.elapsed_ms = GetTickCount64() - started_ms;
+        diag::log_tagged_fmt("api_monitor",
+            "phase_timeout phase=%s pid=%u caller_tid=%lu elapsed_ms=%llu timeout_ms=%u",
+            phase,
+            pid,
+            caller_tid,
+            static_cast<unsigned long long>(timed_out.elapsed_ms),
+            timeout_ms);
+        log_phase_state("timeout", phase, pid, caller_tid, timed_out.elapsed_ms, timeout_ms);
+        return timed_out;
+    }
+
+    try {
+        phase_result_t<T> result = future.get();
+        if (result.threw) {
+            diag::log_tagged_fmt("api_monitor",
+                "phase_fail phase=%s pid=%u caller_tid=%lu reason=worker_exception elapsed_ms=%llu gle=%lu code=%d category=%s message=%s",
+                phase,
+                pid,
+                caller_tid,
+                static_cast<unsigned long long>(result.elapsed_ms),
+                result.gle,
+                result.exception_code,
+                result.exception_category.c_str(),
+                result.exception.c_str());
+            log_phase_state("worker_exception", phase, pid, caller_tid, result.elapsed_ms, timeout_ms);
+        } else {
+            diag::log_tagged_fmt("api_monitor",
+                "phase_complete phase=%s pid=%u caller_tid=%lu elapsed_ms=%llu gle=%lu",
+                phase,
+                pid,
+                caller_tid,
+                static_cast<unsigned long long>(result.elapsed_ms),
+                result.gle);
+            log_phase_state("complete", phase, pid, caller_tid, result.elapsed_ms, timeout_ms);
+        }
+        return result;
+    } catch (const std::system_error& ex) {
+        phase_result_t<T> failed;
+        failed.completed = false;
+        failed.threw = true;
+        failed.gle = GetLastError();
+        failed.exception = ex.what();
+        failed.exception_code = ex.code().value();
+        failed.exception_category = ex.code().category().name();
+        failed.elapsed_ms = GetTickCount64() - started_ms;
+        diag::log_tagged_fmt("api_monitor",
+            "phase_fail phase=%s pid=%u caller_tid=%lu reason=future_get_system_error elapsed_ms=%llu gle=%lu code=%d category=%s message=%s",
+            phase,
+            pid,
+            caller_tid,
+            static_cast<unsigned long long>(failed.elapsed_ms),
+            failed.gle,
+            failed.exception_code,
+            failed.exception_category.c_str(),
+            failed.exception.c_str());
+        log_phase_state("future_get_system_error", phase, pid, caller_tid, failed.elapsed_ms, timeout_ms);
+        return failed;
+    } catch (const std::exception& ex) {
+        phase_result_t<T> failed;
+        failed.completed = false;
+        failed.threw = true;
+        failed.gle = GetLastError();
+        failed.exception = ex.what();
+        failed.elapsed_ms = GetTickCount64() - started_ms;
+        diag::log_tagged_fmt("api_monitor",
+            "phase_fail phase=%s pid=%u caller_tid=%lu reason=future_get_exception elapsed_ms=%llu gle=%lu message=%s",
+            phase,
+            pid,
+            caller_tid,
+            static_cast<unsigned long long>(failed.elapsed_ms),
+            failed.gle,
+            failed.exception.c_str());
+        log_phase_state("future_get_exception", phase, pid, caller_tid, failed.elapsed_ms, timeout_ms);
+        return failed;
+    } catch (...) {
+        phase_result_t<T> failed;
+        failed.completed = false;
+        failed.threw = true;
+        failed.gle = GetLastError();
+        failed.exception = "unknown future retrieval exception";
+        failed.elapsed_ms = GetTickCount64() - started_ms;
+        diag::log_tagged_fmt("api_monitor",
+            "phase_fail phase=%s pid=%u caller_tid=%lu reason=future_get_unknown elapsed_ms=%llu gle=%lu",
+            phase,
+            pid,
+            caller_tid,
+            static_cast<unsigned long long>(failed.elapsed_ms),
+            failed.gle);
+        log_phase_state("future_get_unknown", phase, pid, caller_tid, failed.elapsed_ms, timeout_ms);
+        return failed;
+    }
+}
+
+struct driver_attach_phase_result_t {
+    bool ok = false;
+    bool kernel = false;
+    uint32_t attached_pid_before = 0;
+    uint32_t attached_pid_after = 0;
+    size_t attached_count = 0;
+    std::string error;
+};
+
+struct resolve_phase_result_t {
+    std::vector<api_target_t> targets;
+    nlohmann::json resolved = nlohmann::json::array();
+    nlohmann::json unresolved = nlohmann::json::array();
+    uint32_t resolved_count = 0;
+    size_t module_count = 0;
+};
+
+struct process_probe_result_t {
+    bool alive = false;
+    bool rejected_reserved_pid = false;
+    bool open_ok = false;
+    bool exit_code_ok = false;
+    bool snapshot_ok = false;
+    bool snapshot_found = false;
+    DWORD open_gle = ERROR_SUCCESS;
+    DWORD exit_code_gle = ERROR_SUCCESS;
+    DWORD snapshot_gle = ERROR_SUCCESS;
+    DWORD exit_code = 0;
+    uint32_t pid = 0;
+    uint32_t parent_pid = 0;
+    uint32_t thread_count = 0;
+};
+
+inline nlohmann::json process_probe_to_json(const process_probe_result_t& p) {
+    nlohmann::json j;
+    j["pid"] = p.pid;
+    j["alive"] = p.alive;
+    j["rejected_reserved_pid"] = p.rejected_reserved_pid;
+    j["open_ok"] = p.open_ok;
+    j["open_gle"] = static_cast<unsigned long>(p.open_gle);
+    j["exit_code_ok"] = p.exit_code_ok;
+    j["exit_code_gle"] = static_cast<unsigned long>(p.exit_code_gle);
+    j["exit_code"] = static_cast<unsigned long>(p.exit_code);
+    j["snapshot_ok"] = p.snapshot_ok;
+    j["snapshot_gle"] = static_cast<unsigned long>(p.snapshot_gle);
+    j["snapshot_found"] = p.snapshot_found;
+    j["parent_pid"] = p.parent_pid;
+    j["thread_count"] = p.thread_count;
+    return j;
+}
 
 inline std::string trim(std::string text) {
     const auto first = text.find_first_not_of(" \t\r\n");
@@ -732,6 +1083,7 @@ inline bool resolve_request(uint32_t pid,
                             const api_request_t& request,
                             const std::vector<driver_bridge::module_info_t>& modules,
                             api_target_t& out) {
+    const uint64_t started_ms = GetTickCount64();
     uint64_t manual_address = 0;
     if (parse_u64(request.original, manual_address) && manual_address != 0) {
         out.request = request;
@@ -740,32 +1092,83 @@ inline bool resolve_request(uint32_t pid,
         out.module_base = 0;
         out.module_offset = 0;
         out.active = true;
+        diag::log_tagged_fmt("api_monitor",
+                             "resolve_request manual pid=%u api=%s address=%s elapsed_ms=%llu",
+                             pid,
+                             request.original.c_str(),
+                             hex_addr(manual_address).c_str(),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
         return true;
     }
 
     bool resolved = false;
     uint64_t address = 0;
     std::string module_name;
-    with_active_pid(pid, [&]() -> bool {
-        for (const auto& m : modules) {
-            if (!module_name_matches(m, request.module_name))
-                continue;
-            const uint64_t candidate = driver_bridge::resolve_export(m.base, request.function_name.c_str());
-            if (candidate == 0)
-                continue;
-            address = candidate;
-            module_name = !m.name.empty() ? m.name : basename_of(m.path);
-            resolved = true;
-            return true;
-        }
-        return true;
-    });
 
-    if (!resolved && !request.module_name.empty())
+    if (!request.module_name.empty()) {
+        const uint64_t local_start_ms = GetTickCount64();
         resolved = local_export_rva_fallback(request.module_name, request.function_name, modules, address, module_name);
+        diag::log_tagged_fmt("api_monitor",
+                             "resolve_request local_export pid=%u module=%s function=%s ok=%d address=%s resolved_module=%s elapsed_ms=%llu",
+                             pid,
+                             request.module_name.c_str(),
+                             request.function_name.c_str(),
+                             resolved ? 1 : 0,
+                             resolved ? hex_addr(address).c_str() : "0x0",
+                             module_name.c_str(),
+                             static_cast<unsigned long long>(GetTickCount64() - local_start_ms));
+    }
 
-    if (!resolved)
+    if (!resolved) {
+        with_active_pid(pid, [&]() -> bool {
+            for (const auto& m : modules) {
+                if (!module_name_matches(m, request.module_name))
+                    continue;
+                const uint64_t module_start_ms = GetTickCount64();
+                const uint64_t candidate = driver_bridge::resolve_export(m.base, request.function_name.c_str());
+                const uint64_t elapsed_ms = GetTickCount64() - module_start_ms;
+                if (elapsed_ms >= 250 || candidate != 0) {
+                    const std::string candidate_module = !m.name.empty() ? m.name : basename_of(m.path);
+                    diag::log_tagged_fmt("api_monitor",
+                                         "resolve_request driver_export pid=%u module=%s base=%s function=%s ok=%d address=%s elapsed_ms=%llu",
+                                         pid,
+                                         candidate_module.c_str(),
+                                         hex_addr(m.base).c_str(),
+                                         request.function_name.c_str(),
+                                         candidate != 0 ? 1 : 0,
+                                         candidate != 0 ? hex_addr(candidate).c_str() : "0x0",
+                                         static_cast<unsigned long long>(elapsed_ms));
+                }
+                if (candidate == 0)
+                    continue;
+                address = candidate;
+                module_name = !m.name.empty() ? m.name : basename_of(m.path);
+                resolved = true;
+                return true;
+            }
+            return true;
+        });
+    }
+
+    if (!resolved) {
+        diag::log_tagged_fmt("api_monitor",
+                             "resolve_request failed pid=%u module=%s function=%s elapsed_ms=%llu module_count=%zu",
+                             pid,
+                             request.module_name.c_str(),
+                             request.function_name.c_str(),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms),
+                             modules.size());
         return false;
+    }
+
+    diag::log_tagged_fmt("api_monitor",
+                         "resolve_request resolved pid=%u module=%s function=%s address=%s resolved_module=%s elapsed_ms=%llu",
+                         pid,
+                         request.module_name.c_str(),
+                         request.function_name.c_str(),
+                         hex_addr(address).c_str(),
+                         module_name.c_str(),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
 
     out.request = request;
     out.address = address;
@@ -846,16 +1249,84 @@ inline bool parse_request_json(const nlohmann::json& value, api_request_t& out, 
     return true;
 }
 
-inline bool process_exists(uint32_t pid) {
-    if (pid == 0 || pid == 4)
-        return false;
+inline process_probe_result_t process_exists_probe(uint32_t pid) {
+    const uint64_t start_ms = GetTickCount64();
+    process_probe_result_t result;
+    result.pid = pid;
+    if (pid == 0 || pid == 4) {
+        result.rejected_reserved_pid = true;
+        result.open_gle = ERROR_INVALID_PARAMETER;
+        result.snapshot_gle = ERROR_INVALID_PARAMETER;
+        diag::log_tagged_fmt("api_monitor",
+            "process_exists_probe pid=%u rejected_reserved=1 elapsed_ms=%llu",
+            pid,
+            static_cast<unsigned long long>(GetTickCount64() - start_ms));
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return result;
+    }
+
+    SetLastError(ERROR_SUCCESS);
     HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!h)
-        return false;
-    DWORD exit_code = 0;
-    const bool alive = GetExitCodeProcess(h, &exit_code) && exit_code == STILL_ACTIVE;
-    CloseHandle(h);
-    return alive;
+    result.open_ok = h != nullptr;
+    result.open_gle = h ? ERROR_SUCCESS : GetLastError();
+    if (h) {
+        SetLastError(ERROR_SUCCESS);
+        result.exit_code_ok = GetExitCodeProcess(h, &result.exit_code) != FALSE;
+        result.exit_code_gle = result.exit_code_ok ? ERROR_SUCCESS : GetLastError();
+        result.alive = result.exit_code_ok && result.exit_code == STILL_ACTIVE;
+        CloseHandle(h);
+    }
+
+    SetLastError(ERROR_SUCCESS);
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    result.snapshot_ok = snapshot != INVALID_HANDLE_VALUE;
+    result.snapshot_gle = result.snapshot_ok ? ERROR_SUCCESS : GetLastError();
+    if (result.snapshot_ok) {
+        PROCESSENTRY32W pe{};
+        pe.dwSize = sizeof(pe);
+        if (Process32FirstW(snapshot, &pe)) {
+            do {
+                if (pe.th32ProcessID == pid) {
+                    result.snapshot_found = true;
+                    result.parent_pid = pe.th32ParentProcessID;
+                    result.thread_count = pe.cntThreads;
+                    break;
+                }
+            } while (Process32NextW(snapshot, &pe));
+        } else {
+            result.snapshot_gle = GetLastError();
+        }
+        CloseHandle(snapshot);
+    }
+
+    diag::log_tagged_fmt("api_monitor",
+        "process_exists_probe pid=%u alive=%d open_ok=%d open_gle=%lu exit_ok=%d exit_gle=%lu exit_code=%lu snapshot_ok=%d snapshot_gle=%lu snapshot_found=%d parent_pid=%u thread_count=%u elapsed_ms=%llu",
+        pid,
+        result.alive ? 1 : 0,
+        result.open_ok ? 1 : 0,
+        result.open_gle,
+        result.exit_code_ok ? 1 : 0,
+        result.exit_code_gle,
+        result.exit_code,
+        result.snapshot_ok ? 1 : 0,
+        result.snapshot_gle,
+        result.snapshot_found ? 1 : 0,
+        result.parent_pid,
+        result.thread_count,
+        static_cast<unsigned long long>(GetTickCount64() - start_ms));
+
+    if (!result.open_ok) {
+        SetLastError(result.open_gle);
+    } else if (!result.exit_code_ok) {
+        SetLastError(result.exit_code_gle);
+    } else {
+        SetLastError(ERROR_SUCCESS);
+    }
+    return result;
+}
+
+inline bool process_exists(uint32_t pid) {
+    return process_exists_probe(pid).alive;
 }
 
 inline bool target_is_x64(uint32_t pid) {
@@ -1412,7 +1883,7 @@ inline void close_debug_event_handles(const DEBUG_EVENT& evt) {
 inline void debug_event_loop() {
     const uint32_t pid = pid_snapshot();
     diag::log_tagged_fmt("api_monitor",
-        "debug_loop_enter pid=%u host_tid=%lu kernel=%d",
+        "polling_entry pid=%u host_tid=%lu kernel=%d",
         pid,
         GetCurrentThreadId(),
         driver_bridge::using_kernel_driver() ? 1 : 0);
@@ -1527,9 +1998,13 @@ inline void debug_event_loop() {
     }
     g_state.debug_loop_running.store(false);
     diag::log_tagged_fmt("api_monitor",
-        "debug_loop_exit pid=%u events=%llu",
+        "polling_exit pid=%u events=%llu active=%d polling=%d attached=%d debugger_error=%lu",
         pid,
-        static_cast<unsigned long long>(event_count));
+        static_cast<unsigned long long>(event_count),
+        g_state.active.load() ? 1 : 0,
+        g_state.polling.load() ? 1 : 0,
+        g_state.debug_attached.load() ? 1 : 0,
+        g_state.debugger_error.load());
 }
 
 inline void stop() {
@@ -1591,26 +2066,54 @@ inline void stop() {
 }
 
 inline bool start_polling(std::string& error) {
+    const uint64_t start_ms = GetTickCount64();
+    diag::log_tagged_fmt("api_monitor",
+        "start_polling_enter pid=%u caller_tid=%lu active=%d polling=%d debug_loop=%d attached=%d",
+        pid_snapshot(),
+        GetCurrentThreadId(),
+        g_state.active.load() ? 1 : 0,
+        g_state.polling.load() ? 1 : 0,
+        g_state.debug_loop_running.load() ? 1 : 0,
+        g_state.debug_attached.load() ? 1 : 0);
     if (!g_state.active.load()) {
         error = "No active API monitor targets.";
+        diag::log_tagged_fmt("api_monitor",
+            "start_polling_exit ok=0 reason=no_active elapsed_ms=%llu",
+            static_cast<unsigned long long>(GetTickCount64() - start_ms));
         return false;
     }
     if (g_state.debug_loop_running.exchange(true)) {
         if (g_state.debug_attached.load()) {
             arm_existing_threads();
+            diag::log_tagged_fmt("api_monitor",
+                "start_polling_exit ok=1 reason=already_attached elapsed_ms=%llu",
+                static_cast<unsigned long long>(GetTickCount64() - start_ms));
             return true;
         }
         error = "API monitor debug loop is already starting.";
+        diag::log_tagged_fmt("api_monitor",
+            "start_polling_exit ok=0 reason=already_starting elapsed_ms=%llu",
+            static_cast<unsigned long long>(GetTickCount64() - start_ms));
         return false;
     }
 
     g_state.polling.store(true);
     bool posted = false;
+    diag::log_tagged_fmt("api_monitor",
+        "start_polling_post_begin pid=%u caller_tid=%lu",
+        pid_snapshot(),
+        GetCurrentThreadId());
     try {
         posted = work_queue::post([]() { debug_event_loop(); });
     } catch (...) {
         posted = false;
     }
+    diag::log_tagged_fmt("api_monitor",
+        "start_polling_post_end pid=%u posted=%d elapsed_ms=%llu gle=%lu",
+        pid_snapshot(),
+        posted ? 1 : 0,
+        static_cast<unsigned long long>(GetTickCount64() - start_ms),
+        GetLastError());
     if (!posted) {
         g_state.polling.store(false);
         g_state.debug_loop_running.store(false);
@@ -1622,18 +2125,37 @@ inline bool start_polling(std::string& error) {
     diag::log_tagged_fmt("api_monitor", "start_polling_worker_posted");
 
     for (int i = 0; i < 60; ++i) {
-        if (g_state.debug_attached.load())
+        if (g_state.debug_attached.load()) {
+            diag::log_tagged_fmt("api_monitor",
+                "start_polling_exit ok=1 reason=attached elapsed_ms=%llu iterations=%d",
+                static_cast<unsigned long long>(GetTickCount64() - start_ms),
+                i);
             return true;
+        }
         if (!g_state.debug_loop_running.load()) {
             error = "DebugActiveProcess failed, error=" + std::to_string(static_cast<unsigned long>(g_state.debugger_error.load()));
+            diag::log_tagged_fmt("api_monitor",
+                "start_polling_exit ok=0 reason=debug_loop_stopped elapsed_ms=%llu iterations=%d debugger_error=%lu",
+                static_cast<unsigned long long>(GetTickCount64() - start_ms),
+                i,
+                g_state.debugger_error.load());
             return false;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(25));
     }
 
-    if (g_state.debug_attached.load())
+    if (g_state.debug_attached.load()) {
+        diag::log_tagged_fmt("api_monitor",
+            "start_polling_exit ok=1 reason=attached_after_wait elapsed_ms=%llu",
+            static_cast<unsigned long long>(GetTickCount64() - start_ms));
         return true;
+    }
     error = "Timed out waiting for API monitor debug attach.";
+    diag::log_tagged_fmt("api_monitor",
+        "start_polling_exit ok=0 reason=attach_timeout elapsed_ms=%llu timeout_ms=1500 debug_loop=%d debugger_error=%lu",
+        static_cast<unsigned long long>(GetTickCount64() - start_ms),
+        g_state.debug_loop_running.load() ? 1 : 0,
+        g_state.debugger_error.load());
     return false;
 }
 
@@ -1645,70 +2167,274 @@ inline bool start(uint32_t requested_pid,
                   size_t max_events,
                   nlohmann::json& summary,
                   std::string& error) {
+    const uint64_t start_ms = GetTickCount64();
+    diag::log_tagged_fmt("api_monitor",
+        "start_enter requested_pid=%u apis=%zu caller_tid=%lu active=%d polling=%d debug_loop=%d attached=%d cleanup=%d",
+        requested_pid,
+        apis.size(),
+        GetCurrentThreadId(),
+        g_state.active.load() ? 1 : 0,
+        g_state.polling.load() ? 1 : 0,
+        g_state.debug_loop_running.load() ? 1 : 0,
+        g_state.debug_attached.load() ? 1 : 0,
+        g_state.cleanup_running.load() ? 1 : 0);
+    log_phase_state("start_enter", "start", requested_pid, GetCurrentThreadId(), 0, 0);
     if (apis.empty()) {
         error = "apis must contain at least one API name.";
+        diag::log_tagged_fmt("api_monitor",
+            "start_exit ok=0 reason=no_apis elapsed_ms=%llu",
+            static_cast<unsigned long long>(GetTickCount64() - start_ms));
         return false;
     }
     if (apis.size() > 4) {
         error = "api_monitor_start supports up to 4 APIs per session because it uses DR0-DR3 hardware execute breakpoints.";
+        diag::log_tagged_fmt("api_monitor",
+            "start_exit ok=0 reason=too_many_apis elapsed_ms=%llu apis=%zu",
+            static_cast<unsigned long long>(GetTickCount64() - start_ms),
+            apis.size());
         return false;
     }
 
     stop();
+    diag::log_tagged_fmt("api_monitor",
+        "start_after_stop elapsed_ms=%llu",
+        static_cast<unsigned long long>(GetTickCount64() - start_ms));
 
     uint32_t pid = requested_pid;
     if (pid == 0)
         pid = driver_bridge::attached_pid();
     if (pid == 0) {
         error = "Missing pid and no driver target is attached.";
+        diag::log_tagged_fmt("api_monitor",
+            "start_exit ok=0 reason=no_pid elapsed_ms=%llu",
+            static_cast<unsigned long long>(GetTickCount64() - start_ms));
         return false;
     }
     if (pid == GetCurrentProcessId()) {
         error = "Refusing to debug the AiDA process itself.";
+        diag::log_tagged_fmt("api_monitor",
+            "start_exit ok=0 reason=self_pid pid=%u elapsed_ms=%llu",
+            pid,
+            static_cast<unsigned long long>(GetTickCount64() - start_ms));
         return false;
     }
-    if (!process_exists(pid)) {
-        error = "Target PID " + std::to_string(pid) + " is not running.";
+    auto exists_phase = run_phase_with_timeout<process_probe_result_t>("process_exists", pid, 1500, [pid]() {
+        return process_exists_probe(pid);
+    });
+    if (exists_phase.threw) {
+        error = "Exception while checking target PID " + std::to_string(pid) + ": " + exists_phase.exception;
+        summary["failed_phase"] = "process_exists";
+        summary["exception"] = exists_phase.exception;
+        summary["exception_code"] = exists_phase.exception_code;
+        summary["exception_category"] = exists_phase.exception_category;
+        summary["status"] = status_json();
+        log_phase_state("start_exit_process_exists_exception", "start", pid, GetCurrentThreadId(), GetTickCount64() - start_ms, 0);
         return false;
     }
-    if (!target_is_x64(pid)) {
+    if (!exists_phase.completed) {
+        error = "Timed out checking whether target PID " + std::to_string(pid) + " is running.";
+        summary["failed_phase"] = "process_exists";
+        summary["elapsed_ms"] = exists_phase.elapsed_ms;
+        summary["last_error"] = static_cast<unsigned long>(exists_phase.gle);
+        summary["status"] = status_json();
+        diag::log_tagged_fmt("api_monitor",
+            "start_exit ok=0 reason=process_exists_timeout pid=%u elapsed_ms=%llu",
+            pid,
+            static_cast<unsigned long long>(GetTickCount64() - start_ms));
+        log_phase_state("start_exit_process_exists_timeout", "start", pid, GetCurrentThreadId(), GetTickCount64() - start_ms, 0);
+        return false;
+    }
+    const process_probe_result_t& process_probe = exists_phase.value;
+    summary["process_probe"] = process_probe_to_json(process_probe);
+    diag::log_tagged_fmt("api_monitor",
+        "start_process_exists_result pid=%u alive=%d open_ok=%d open_gle=%lu exit_ok=%d exit_gle=%lu exit_code=%lu snapshot_ok=%d snapshot_gle=%lu snapshot_found=%d elapsed_ms=%llu phase_gle=%lu",
+        pid,
+        process_probe.alive ? 1 : 0,
+        process_probe.open_ok ? 1 : 0,
+        process_probe.open_gle,
+        process_probe.exit_code_ok ? 1 : 0,
+        process_probe.exit_code_gle,
+        process_probe.exit_code,
+        process_probe.snapshot_ok ? 1 : 0,
+        process_probe.snapshot_gle,
+        process_probe.snapshot_found ? 1 : 0,
+        static_cast<unsigned long long>(exists_phase.elapsed_ms),
+        exists_phase.gle);
+    if (!process_probe.alive) {
+        summary["failed_phase"] = "process_exists";
+        summary["status"] = status_json();
+        if (!process_probe.open_ok && process_probe.snapshot_found) {
+            error = "Target PID " + std::to_string(pid) + " is present in the process snapshot but OpenProcess liveness check failed, last_error=" + std::to_string(static_cast<unsigned long>(process_probe.open_gle)) + ".";
+        } else if (process_probe.open_ok && !process_probe.exit_code_ok) {
+            error = "Target PID " + std::to_string(pid) + " opened but GetExitCodeProcess failed, last_error=" + std::to_string(static_cast<unsigned long>(process_probe.exit_code_gle)) + ".";
+        } else {
+            error = "Target PID " + std::to_string(pid) + " is not running.";
+        }
+        log_phase_state("start_exit_process_exists_false", "start", pid, GetCurrentThreadId(), GetTickCount64() - start_ms, 0);
+        return false;
+    }
+    auto x64_phase = run_phase_with_timeout<bool>("target_is_x64", pid, 1500, [pid]() {
+        return target_is_x64(pid);
+    });
+    if (x64_phase.threw) {
+        error = "Exception while checking target architecture for PID " + std::to_string(pid) + ": " + x64_phase.exception;
+        summary["failed_phase"] = "target_is_x64";
+        summary["exception"] = x64_phase.exception;
+        summary["exception_code"] = x64_phase.exception_code;
+        summary["exception_category"] = x64_phase.exception_category;
+        return false;
+    }
+    if (!x64_phase.completed) {
+        error = "Timed out checking target architecture for PID " + std::to_string(pid) + ".";
+        summary["failed_phase"] = "target_is_x64";
+        summary["elapsed_ms"] = x64_phase.elapsed_ms;
+        summary["last_error"] = static_cast<unsigned long>(x64_phase.gle);
+        return false;
+    }
+    diag::log_tagged_fmt("api_monitor",
+        "start_target_is_x64_result pid=%u ok=%d elapsed_ms=%llu gle=%lu",
+        pid,
+        x64_phase.value ? 1 : 0,
+        static_cast<unsigned long long>(x64_phase.elapsed_ms),
+        x64_phase.gle);
+    if (!x64_phase.value) {
         error = "API monitor requires a native x64 target process.";
         return false;
     }
-    if (!ensure_driver_attached(pid, error))
+    auto attach_phase = run_phase_with_timeout<driver_attach_phase_result_t>("driver_attach", pid, 7000, [pid]() {
+        driver_attach_phase_result_t result;
+        result.kernel = driver_bridge::using_kernel_driver();
+        result.attached_pid_before = driver_bridge::attached_pid();
+        const auto attached = driver_bridge::attached_pids();
+        result.attached_count = attached.size();
+        std::string phase_error;
+        result.ok = ensure_driver_attached(pid, phase_error);
+        result.error = phase_error;
+        result.attached_pid_after = driver_bridge::attached_pid();
+        return result;
+    });
+    if (attach_phase.threw) {
+        error = "Exception during driver attach for PID " + std::to_string(pid) + ": " + attach_phase.exception;
+        summary["failed_phase"] = "driver_attach";
+        summary["exception"] = attach_phase.exception;
+        summary["exception_code"] = attach_phase.exception_code;
+        summary["exception_category"] = attach_phase.exception_category;
         return false;
+    }
+    if (!attach_phase.completed) {
+        error = "Timed out attaching/selecting target PID " + std::to_string(pid) + " through driver bridge.";
+        summary["failed_phase"] = "driver_attach";
+        summary["elapsed_ms"] = attach_phase.elapsed_ms;
+        summary["last_error"] = static_cast<unsigned long>(attach_phase.gle);
+        return false;
+    }
+    diag::log_tagged_fmt("api_monitor",
+        "start_driver_attach_result pid=%u ok=%d kernel=%d before=%u after=%u attached_count=%zu elapsed_ms=%llu gle=%lu error=%s",
+        pid,
+        attach_phase.value.ok ? 1 : 0,
+        attach_phase.value.kernel ? 1 : 0,
+        attach_phase.value.attached_pid_before,
+        attach_phase.value.attached_pid_after,
+        attach_phase.value.attached_count,
+        static_cast<unsigned long long>(attach_phase.elapsed_ms),
+        attach_phase.gle,
+        attach_phase.value.error.c_str());
+    if (!attach_phase.value.ok) {
+        error = attach_phase.value.error.empty()
+            ? ("Failed to attach/select target PID " + std::to_string(pid) + " through driver bridge.")
+            : attach_phase.value.error;
+        return false;
+    }
 
-    auto modules = driver_bridge::enumerate_modules_for(pid);
+    auto modules_phase = run_phase_with_timeout<std::vector<driver_bridge::module_info_t>>("module_enumeration", pid, 7000, [pid]() {
+        return driver_bridge::enumerate_modules_for(pid);
+    });
+    if (modules_phase.threw) {
+        error = "Exception while enumerating modules for PID " + std::to_string(pid) + ": " + modules_phase.exception;
+        summary["failed_phase"] = "module_enumeration";
+        summary["exception"] = modules_phase.exception;
+        summary["exception_code"] = modules_phase.exception_code;
+        summary["exception_category"] = modules_phase.exception_category;
+        return false;
+    }
+    if (!modules_phase.completed) {
+        error = "Timed out enumerating modules for PID " + std::to_string(pid) + ".";
+        summary["failed_phase"] = "module_enumeration";
+        summary["elapsed_ms"] = modules_phase.elapsed_ms;
+        summary["last_error"] = static_cast<unsigned long>(modules_phase.gle);
+        return false;
+    }
+    auto modules = std::move(modules_phase.value);
+    diag::log_tagged_fmt("api_monitor",
+        "start_module_enumeration_result pid=%u count=%zu elapsed_ms=%llu gle=%lu",
+        pid,
+        modules.size(),
+        static_cast<unsigned long long>(modules_phase.elapsed_ms),
+        modules_phase.gle);
     if (modules.empty()) {
         error = "Failed to enumerate modules for PID " + std::to_string(pid) + ".";
         return false;
     }
 
-    std::vector<api_target_t> targets;
-    nlohmann::json resolved = nlohmann::json::array();
-    nlohmann::json unresolved = nlohmann::json::array();
-    uint32_t slot = 0;
-    for (const auto& request : apis) {
-        api_target_t target;
-        if (resolve_request(pid, request, modules, target)) {
-            target.bp_index = slot++;
-            targets.push_back(target);
-            nlohmann::json item;
-            item["api"] = request.original;
-            item["address"] = hex_addr(target.address);
-            item["module"] = target.resolved_module;
-            item["module_offset"] = hex_addr(target.module_offset);
-            item["bp_slot"] = target.bp_index;
-            item["kind"] = kind_name(target.request.kind);
-            resolved.push_back(item);
-        } else {
-            unresolved.push_back(request.original);
+    const auto apis_copy = apis;
+    const auto modules_copy = modules;
+    auto resolve_phase = run_phase_with_timeout<resolve_phase_result_t>("api_resolve", pid, 9000, [pid, apis_copy, modules_copy]() {
+        resolve_phase_result_t result;
+        result.module_count = modules_copy.size();
+        uint32_t slot = 0;
+        for (const auto& request : apis_copy) {
+            api_target_t target;
+            if (resolve_request(pid, request, modules_copy, target)) {
+                target.bp_index = slot++;
+                result.targets.push_back(target);
+                nlohmann::json item;
+                item["api"] = request.original;
+                item["address"] = hex_addr(target.address);
+                item["module"] = target.resolved_module;
+                item["module_offset"] = hex_addr(target.module_offset);
+                item["bp_slot"] = target.bp_index;
+                item["kind"] = kind_name(target.request.kind);
+                result.resolved.push_back(item);
+            } else {
+                result.unresolved.push_back(request.original);
+            }
         }
+        result.resolved_count = static_cast<uint32_t>(result.targets.size());
+        return result;
+    });
+    if (resolve_phase.threw) {
+        error = "Exception while resolving requested APIs for PID " + std::to_string(pid) + ": " + resolve_phase.exception;
+        summary["failed_phase"] = "api_resolve";
+        summary["exception"] = resolve_phase.exception;
+        summary["exception_code"] = resolve_phase.exception_code;
+        summary["exception_category"] = resolve_phase.exception_category;
+        return false;
     }
+    if (!resolve_phase.completed) {
+        error = "Timed out resolving requested API exports for PID " + std::to_string(pid) + ".";
+        summary["failed_phase"] = "api_resolve";
+        summary["elapsed_ms"] = resolve_phase.elapsed_ms;
+        summary["module_count"] = modules.size();
+        summary["last_error"] = static_cast<unsigned long>(resolve_phase.gle);
+        return false;
+    }
+
+    auto targets = std::move(resolve_phase.value.targets);
+    nlohmann::json resolved = std::move(resolve_phase.value.resolved);
+    nlohmann::json unresolved = std::move(resolve_phase.value.unresolved);
+    diag::log_tagged_fmt("api_monitor",
+        "start_api_resolve_result pid=%u resolved=%u unresolved=%zu module_count=%zu elapsed_ms=%llu gle=%lu",
+        pid,
+        resolve_phase.value.resolved_count,
+        unresolved.is_array() ? unresolved.size() : 0,
+        resolve_phase.value.module_count,
+        static_cast<unsigned long long>(resolve_phase.elapsed_ms),
+        resolve_phase.gle);
 
     if (targets.empty()) {
         error = "No requested APIs resolved in the target process.";
         summary["unresolved"] = unresolved;
+        summary["failed_phase"] = "api_resolve";
         return false;
     }
 
@@ -1721,6 +2447,15 @@ inline bool start(uint32_t requested_pid,
     if (max_events > 16384)
         max_events = 16384;
 
+    diag::log_tagged_fmt("api_monitor",
+        "state_setup_begin pid=%u targets=%zu modules=%zu max_events=%zu max_capture_bytes=%u",
+        pid,
+        targets.size(),
+        modules.size(),
+        max_events,
+        max_capture_bytes);
+    const size_t target_count_for_state = targets.size();
+    const size_t module_count_for_state = modules.size();
     {
         std::lock_guard<std::mutex> lock(g_state.mutex);
         g_state.pid = pid;
@@ -1735,20 +2470,60 @@ inline bool start(uint32_t requested_pid,
         g_state.max_events = max_events;
         g_state.next_sequence = 1;
     }
+    diag::log_tagged_fmt("api_monitor",
+        "state_setup_end pid=%u targets=%zu modules=%zu elapsed_ms=%llu",
+        pid,
+        target_count_for_state,
+        module_count_for_state,
+        static_cast<unsigned long long>(GetTickCount64() - start_ms));
     g_state.total_hits.store(0, std::memory_order_relaxed);
     g_state.debugger_error.store(0);
     g_state.active.store(true);
 
     if (!start_polling(error)) {
+        summary["failed_phase"] = "start_polling";
+        summary["status"] = status_json();
         stop();
         return false;
     }
 
     uint32_t armed_thread_breakpoints = 0;
-    {
-        std::lock_guard<std::mutex> lock(g_state.mutex);
-        for (const auto& target : g_state.targets)
-            armed_thread_breakpoints += static_cast<uint32_t>(target.armed_tids.size());
+    const uint64_t arm_wait_start = GetTickCount64();
+    for (int i = 0; i < 80; ++i) {
+        {
+            std::lock_guard<std::mutex> lock(g_state.mutex);
+            armed_thread_breakpoints = 0;
+            for (const auto& target : g_state.targets)
+                armed_thread_breakpoints += static_cast<uint32_t>(target.armed_tids.size());
+        }
+        if (armed_thread_breakpoints != 0 || !g_state.debug_loop_running.load())
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    diag::log_tagged_fmt("api_monitor",
+        "breakpoint_arming_wait_done pid=%u armed_thread_breakpoints=%u elapsed_ms=%llu active=%d polling=%d debug_loop=%d attached=%d",
+        pid,
+        armed_thread_breakpoints,
+        static_cast<unsigned long long>(GetTickCount64() - arm_wait_start),
+        g_state.active.load() ? 1 : 0,
+        g_state.polling.load() ? 1 : 0,
+        g_state.debug_loop_running.load() ? 1 : 0,
+        g_state.debug_attached.load() ? 1 : 0);
+
+    if (!g_state.active.load() || !g_state.debug_attached.load() || !g_state.debug_loop_running.load()) {
+        error = "API monitor debug attach did not remain active after startup.";
+        summary["failed_phase"] = "breakpoint_arming";
+        summary["status"] = status_json();
+        stop();
+        return false;
+    }
+
+    if (armed_thread_breakpoints == 0) {
+        error = "API monitor debug attach completed but no thread hardware breakpoints were armed.";
+        summary["failed_phase"] = "breakpoint_arming";
+        summary["status"] = status_json();
+        stop();
+        return false;
     }
 
     summary["pid"] = pid;
@@ -1760,7 +2535,18 @@ inline bool start(uint32_t requested_pid,
     summary["resolved"] = resolved;
     summary["unresolved"] = unresolved;
     summary["armed_thread_breakpoints"] = armed_thread_breakpoints;
-    summary["active"] = true;
+    summary["active"] = g_state.active.load();
+    summary["debug_attached"] = g_state.debug_attached.load();
+    summary["debug_loop_running"] = g_state.debug_loop_running.load();
+    summary["startup_elapsed_ms"] = GetTickCount64() - start_ms;
+    diag::log_tagged_fmt("api_monitor",
+        "start_exit ok=1 pid=%u resolved=%zu unresolved=%zu armed_thread_breakpoints=%u elapsed_ms=%llu",
+        pid,
+        resolved.is_array() ? resolved.size() : 0,
+        unresolved.is_array() ? unresolved.size() : 0,
+        armed_thread_breakpoints,
+        static_cast<unsigned long long>(GetTickCount64() - start_ms));
+    log_phase_state("start_exit_success", "start", pid, GetCurrentThreadId(), GetTickCount64() - start_ms, 0);
     return true;
 }
 
@@ -1856,6 +2642,7 @@ inline nlohmann::json status_json() {
             armed += static_cast<uint32_t>(target.armed_tids.size());
     }
     j["active"] = g_state.active.load();
+    j["polling"] = g_state.polling.load();
     j["debug_attached"] = g_state.debug_attached.load();
     j["debug_loop_running"] = g_state.debug_loop_running.load();
     j["cleanup_running"] = g_state.cleanup_running.load();

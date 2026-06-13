@@ -2220,6 +2220,9 @@ namespace
 
     std::string s_cached_session_token;
     std::string s_cached_arc_bind_token;
+    std::string s_cached_server_payload_b64;
+    std::string s_cached_server_sig_b64;
+    int         s_cached_server_kid = 0;
 
     std::atomic<uint64_t> s_proof_hash{0};
 
@@ -4892,6 +4895,9 @@ namespace
                 error_out = "License service returned invalid signed JSON.";
                 return false;
             }
+            signed_payload["_server_payload_b64"] = payload_b64;
+            signed_payload["_server_sig_b64"] = sig_b64;
+            signed_payload["_server_kid"] = kid_raw;
             response_out = std::move(signed_payload);
             lic_log_fmt("endpoint_once_envelope_sig_ok kid=%d", kid_raw);
         }
@@ -5918,6 +5924,9 @@ namespace
             s_cached_hwid = hwid;
             s_cached_session_token = settings.license_session_token;
             s_cached_arc_bind_token = settings.license_session_token;
+            s_cached_server_payload_b64 = response.value("_server_payload_b64", std::string());
+            s_cached_server_sig_b64 = response.value("_server_sig_b64", std::string());
+            s_cached_server_kid = response.value("_server_kid", settings.license_signing_kid);
         }
         update_proof_hash(settings.license_session_token, hwid);
         configure_telemetry_from_settings(settings, "apply_valid_response");
@@ -7875,6 +7884,8 @@ namespace
         settings.license_session_token = payload.value("session_token", settings.license_session_token);
         settings.license_server_nonce = payload.value("server_nonce", settings.license_server_nonce);
         settings.license_client_nonce = payload.value("client_nonce", settings.license_client_nonce);
+        settings.license_auth_hmac_key_b64 = payload.value("auth_hmac_key_b64", settings.license_auth_hmac_key_b64);
+        settings.license_signing_kid = payload.value("kid", settings.license_signing_kid);
         settings.license_hwid = hwid;
         settings.license_issued_at = payload.value("issued_at", settings.license_issued_at);
         settings.license_ttl = payload.value("ttl", settings.license_ttl);
@@ -7885,6 +7896,9 @@ namespace
             s_cached_hwid = hwid;
             s_cached_session_token = settings.license_session_token;
             s_cached_arc_bind_token = settings.license_session_token;
+            s_cached_server_payload_b64 = payload.value("_server_payload_b64", std::string());
+            s_cached_server_sig_b64 = payload.value("_server_sig_b64", std::string());
+            s_cached_server_kid = payload.value("_server_kid", settings.license_signing_kid);
         }
         update_proof_hash(settings.license_session_token, hwid);
 
@@ -8062,6 +8076,7 @@ namespace
         settings.license_client_nonce.clear();
         settings.license_key_seed.clear();
         settings.license_bind_proof.clear();
+        settings.license_auth_hmac_key_b64.clear();
         settings.license_issued_at = 0;
         settings.license_ttl = 3600;
         settings.license_arc_load_ok = false;
@@ -8071,6 +8086,9 @@ namespace
             s_cached_hwid.clear();
             s_cached_session_token.clear();
             s_cached_arc_bind_token.clear();
+            s_cached_server_payload_b64.clear();
+            s_cached_server_sig_b64.clear();
+            s_cached_server_kid = 0;
         }
         s_proof_hash.store(0, std::memory_order_release);
         s_heartbeat_counter.store(0, std::memory_order_release);
@@ -8808,6 +8826,12 @@ namespace standalone_license
         anti_tamper::state::get().license_pending_activation.store(true, std::memory_order_release);
         {
             std::lock_guard<std::mutex> lk(s_state_mtx);
+            s_cached_hwid.clear();
+            s_cached_session_token.clear();
+            s_cached_arc_bind_token.clear();
+            s_cached_server_payload_b64.clear();
+            s_cached_server_sig_b64.clear();
+            s_cached_server_kid = 0;
             s_error = std::string("Runtime enforcement invalidated license state: ") + reason_text;
         }
         lic_log_fmt("enforcement_license_invalidate_done reason=%.128s loaded=%d unloading=%d inflight=%lld",
@@ -8827,6 +8851,15 @@ namespace standalone_license
         reset_activation_completed_at();
         reset_license_clients();
         unload_arc();
+        {
+            std::lock_guard<std::mutex> lk(s_state_mtx);
+            s_cached_hwid.clear();
+            s_cached_session_token.clear();
+            s_cached_arc_bind_token.clear();
+            s_cached_server_payload_b64.clear();
+            s_cached_server_sig_b64.clear();
+            s_cached_server_kid = 0;
+        }
     }
 
 
@@ -9421,6 +9454,166 @@ namespace standalone_license
             return false;
         }
         return ok == TRUE;
+    }
+
+    static bool ida_plugin_challenge_valid(const std::string& challenge)
+    {
+        if (challenge.size() < 32 || challenge.size() > 128 || (challenge.size() % 2) != 0)
+            return false;
+        return std::all_of(challenge.begin(), challenge.end(), [](unsigned char c) {
+            return std::isxdigit(c) != 0;
+        });
+    }
+
+    static std::string ida_plugin_proof_canonical(const json& proof)
+    {
+        std::ostringstream ss;
+        ss << "AIDA_IDA_PLUGIN_AUTH_V1\n";
+        ss << "challenge=" << proof.value("challenge", std::string()) << "\n";
+        ss << "plugin_pid=" << proof.value("plugin_pid", 0u) << "\n";
+        ss << "standalone_pid=" << proof.value("standalone_pid", 0u) << "\n";
+        ss << "mcp_port=" << proof.value("mcp_port", 0u) << "\n";
+        ss << "issued_tick_ms=" << proof.value("issued_tick_ms", 0ull) << "\n";
+        ss << "expires_tick_ms=" << proof.value("expires_tick_ms", 0ull) << "\n";
+        ss << "validated=" << (proof.value("validated", false) ? 1 : 0) << "\n";
+        ss << "arc_loaded=" << (proof.value("arc_loaded", false) ? 1 : 0) << "\n";
+        ss << "lifecycle_ready=" << (proof.value("lifecycle_ready", false) ? 1 : 0) << "\n";
+        ss << "exports_verified=" << (proof.value("exports_verified", false) ? 1 : 0) << "\n";
+        ss << "server_nonce_hash=" << proof.value("server_nonce_hash", 0ull) << "\n";
+        ss << "signed_payload_sha256=" << proof.value("signed_payload_sha256", std::string()) << "\n";
+        return ss.str();
+    }
+
+    bool build_ida_plugin_auth_proof(const std::string& challenge_hex,
+                                     uint32_t plugin_pid,
+                                     uint32_t mcp_port,
+                                     bool lifecycle_ready,
+                                     bool exports_verified,
+                                     std::string& out_json,
+                                     std::string& error_out)
+    {
+        out_json.clear();
+        error_out.clear();
+        if (!ida_plugin_challenge_valid(challenge_hex))
+        {
+            error_out = "invalid_challenge";
+            return false;
+        }
+        if (plugin_pid == 0 || plugin_pid == GetCurrentProcessId())
+        {
+            error_out = "invalid_plugin_pid";
+            return false;
+        }
+        if (!lifecycle_ready || !exports_verified || !is_valid() || !is_arc_loaded())
+        {
+            error_out = "runtime_not_authorized";
+            return false;
+        }
+        std::string missing_exports;
+        if (!validate_arc_required_exports(missing_exports))
+        {
+            error_out = missing_exports.empty() ? "arc_exports_missing" : ("arc_exports_missing:" + missing_exports);
+            return false;
+        }
+
+        std::string server_payload_b64;
+        std::string server_sig_b64;
+        int server_kid = 0;
+        uint64_t server_nonce_hash = 0;
+        {
+            std::lock_guard<std::mutex> lk(s_state_mtx);
+            server_payload_b64 = s_cached_server_payload_b64;
+            server_sig_b64 = s_cached_server_sig_b64;
+            server_kid = s_cached_server_kid;
+            server_nonce_hash = s_magic.load(std::memory_order_acquire);
+        }
+        if (server_payload_b64.empty() || server_sig_b64.empty() || server_kid <= 0)
+        {
+            error_out = "server_signed_session_unavailable";
+            return false;
+        }
+
+        std::vector<uint8_t> payload_bytes = base64_decode(server_payload_b64);
+        if (payload_bytes.empty())
+        {
+            error_out = "server_payload_decode_failed";
+            return false;
+        }
+        std::string signed_payload(reinterpret_cast<const char*>(payload_bytes.data()), payload_bytes.size());
+        SecureZeroMemory(payload_bytes.data(), payload_bytes.size());
+
+        json payload = json::parse(signed_payload, nullptr, false);
+        if (payload.is_discarded() || !payload.is_object())
+        {
+            SecureZeroMemory(signed_payload.data(), signed_payload.size());
+            error_out = "server_payload_parse_failed";
+            return false;
+        }
+
+        const std::string auth_key_b64 = payload.value("auth_hmac_key_b64", std::string());
+        const std::string session_token = payload.value("session_token", std::string());
+        const int64_t issued_at = payload.value("issued_at", int64_t{0});
+        const int64_t ttl = payload.value("ttl", int64_t{0});
+        const int64_t now_epoch = static_cast<int64_t>(std::time(nullptr));
+        if (payload.value("status", std::string()) != "valid" ||
+            auth_key_b64.empty() ||
+            session_token.size() < 16 ||
+            issued_at <= 0 ||
+            ttl <= 0 ||
+            now_epoch < issued_at - 60 ||
+            now_epoch > issued_at + ttl + 60)
+        {
+            SecureZeroMemory(signed_payload.data(), signed_payload.size());
+            error_out = "server_payload_not_current";
+            return false;
+        }
+
+        std::vector<uint8_t> auth_key = base64_decode(auth_key_b64);
+        if (auth_key.size() != 32)
+        {
+            SecureZeroMemory(signed_payload.data(), signed_payload.size());
+            if (!auth_key.empty())
+                SecureZeroMemory(auth_key.data(), auth_key.size());
+            error_out = "auth_key_invalid";
+            return false;
+        }
+
+        const uint64_t now_tick = static_cast<uint64_t>(GetTickCount64());
+        json proof;
+        proof["status"] = "ok";
+        proof["proof_version"] = 1;
+        proof["server"] = "aida-pro-mcp";
+        proof["challenge"] = challenge_hex;
+        proof["plugin_pid"] = plugin_pid;
+        proof["standalone_pid"] = static_cast<uint32_t>(GetCurrentProcessId());
+        proof["mcp_port"] = mcp_port;
+        proof["issued_tick_ms"] = now_tick;
+        proof["expires_tick_ms"] = now_tick + 15000ull;
+        proof["validated"] = true;
+        proof["arc_loaded"] = true;
+        proof["lifecycle_ready"] = lifecycle_ready;
+        proof["exports_verified"] = exports_verified;
+        proof["server_nonce_hash"] = server_nonce_hash;
+        proof["server_payload_b64"] = server_payload_b64;
+        proof["server_sig_b64"] = server_sig_b64;
+        proof["server_kid"] = server_kid;
+        proof["signed_payload_sha256"] = sha256_hex(signed_payload);
+
+        const std::string canonical = ida_plugin_proof_canonical(proof);
+        std::vector<uint8_t> mac = hmac_sha256_block(
+            auth_key.data(), auth_key.size(),
+            reinterpret_cast<const uint8_t*>(canonical.data()), canonical.size());
+        SecureZeroMemory(auth_key.data(), auth_key.size());
+        SecureZeroMemory(signed_payload.data(), signed_payload.size());
+        if (mac.size() != 32)
+        {
+            error_out = "proof_mac_failed";
+            return false;
+        }
+        proof["proof_mac"] = bytes_to_hex(mac.data(), mac.size());
+        SecureZeroMemory(mac.data(), mac.size());
+        out_json = proof.dump();
+        return true;
     }
 
     uint64_t get_server_nonce_hash()

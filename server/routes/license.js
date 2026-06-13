@@ -388,6 +388,27 @@ function decryptSessionRow(row) {
     return row;
 }
 
+function sessionAuthHmacKeyBase64(session) {
+    if (!session) return '';
+    const raw = session.auth_hmac_key;
+    if (Buffer.isBuffer(raw)) {
+        return raw.length === 32 ? raw.toString('base64') : '';
+    }
+    if (typeof raw === 'string') {
+        const text = raw.trim();
+        if (/^[0-9a-fA-F]{64}$/.test(text)) {
+            return Buffer.from(text, 'hex').toString('base64');
+        }
+        try {
+            const decoded = Buffer.from(text, 'base64');
+            return decoded.length === 32 ? decoded.toString('base64') : '';
+        } catch (_) {
+            return '';
+        }
+    }
+    return '';
+}
+
 function encryptSessionToken(uuid, plaintext) {
     return columnCrypt.encrypt(uuid, 'sessions/session_token', plaintext);
 }
@@ -2346,9 +2367,11 @@ async function handleHeartbeat(body, clientIp) {
         status: 'valid',
         alive: true,
         license_key,
+        session_token,
         hwid: anomalyEffectiveHwid,
         plan: lookup.data.plan || 'standard',
         ttl: SESSION_TTL_SECONDS,
+        issued_at: now,
         heartbeat_nonce: heartbeatNonce,
         server_nonce: serverNonce,
         rotated_heartbeat_nonce: rotatedHbNonce,
@@ -2360,6 +2383,8 @@ async function handleHeartbeat(body, clientIp) {
         ratchet_counter: counter,
         ttl_grace_factor: SESSION_TTL_GRACE_FACTOR,
         nonce_replay_ttl: NONCE_REPLAY_TTL_SECONDS,
+        auth_hmac_key_b64: sessionAuthHmacKeyBase64(session),
+        session_key_fingerprint: session.session_key_fingerprint || '',
     };
     if (nextChallenge) {
         sigPayload.next_challenge_id = nextChallenge.challenge_id;

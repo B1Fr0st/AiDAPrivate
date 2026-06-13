@@ -682,6 +682,57 @@ namespace {
 		return ok;
 	}
 
+	bool bw_totals_nonzero(const voyager::detail::bw_monitor_request& req) {
+		return req.total_bytes_sent != 0u || req.total_bytes_recv != 0u ||
+			req.total_packets_sent != 0u || req.total_packets_recv != 0u;
+	}
+
+	bool bw_process_entry_nonzero(const voyager::detail::bw_process_entry& p) {
+		return p.bytes_sent != 0u || p.bytes_recv != 0u ||
+			p.packets_sent != 0u || p.packets_recv != 0u;
+	}
+
+	std::uint32_t count_matching_bw_processes(const voyager::detail::bw_monitor_request& req,
+		std::uint32_t expected_pid,
+		std::uint32_t& nonzero_entries)
+	{
+		nonzero_entries = 0u;
+		std::uint32_t matches = 0u;
+		std::uint32_t cap = req.process_count;
+		if (cap > voyager::detail::BW_MAX_PROCESSES)
+			cap = voyager::detail::BW_MAX_PROCESSES;
+		for (std::uint32_t i = 0; i < cap; ++i) {
+			const auto& p = req.processes[i];
+			if (bw_process_entry_nonzero(p))
+				++nonzero_entries;
+			if (expected_pid == 0u || p.pid == expected_pid)
+				++matches;
+		}
+		return matches;
+	}
+
+	void append_bw_process_entries(test_lab::result_t& r, const voyager::detail::bw_monitor_request& req) {
+		std::uint32_t cap = req.process_count;
+		if (cap > voyager::detail::BW_MAX_PROCESSES)
+			cap = voyager::detail::BW_MAX_PROCESSES;
+		push_u32(r, "Process count", cap);
+		char label[32];
+		char value[160];
+		for (std::uint32_t i = 0; i < cap; ++i) {
+			const auto& p = req.processes[i];
+			std::snprintf(label, sizeof(label), "Process #%u", i);
+			std::snprintf(value, sizeof(value),
+				"pid=%u sent=%llu recv=%llu pkts_s=%llu pkts_r=%llu last_activity=0x%016llX",
+				p.pid,
+				static_cast<unsigned long long>(p.bytes_sent),
+				static_cast<unsigned long long>(p.bytes_recv),
+				static_cast<unsigned long long>(p.packets_sent),
+				static_cast<unsigned long long>(p.packets_recv),
+				static_cast<unsigned long long>(p.last_activity_time));
+			r.parsed.push_back({ std::string(label), std::string(value) });
+		}
+	}
+
 	bool bwmn_drive_udp_fixture(std::string& err, std::uint32_t& sent_packets) {
 		sent_packets = 0u;
 		SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -1456,7 +1507,7 @@ namespace {
 		if (sel == 0) {
 			ImGui::InputScalar("Filter PID (0 = totals only)",
 				ImGuiDataType_U64, &s.u64_a, nullptr, nullptr, "%llu");
-			ImGui::TextDisabled("Issues GET (op=2): totals + per-process counters via WhosWho bandwidth monitor.");
+			ImGui::TextDisabled("Queries aggregate totals with op=2 and per-process counters with op=4.");
 		}
 		else {
 			ImGui::InputScalar("Interface index (informational)",
@@ -1467,6 +1518,7 @@ namespace {
 
 	void run_bwmn(test_lab::state_t& s, test_lab::result_t& r) {
 		if (!ensure_driver(r)) return;
+		const std::uint32_t self_pid = static_cast<std::uint32_t>(GetCurrentProcessId());
 		if (s.u32_a == 3u) {
 			wsa_guard_t wsa;
 			if (!wsa.ok) {
@@ -1494,38 +1546,60 @@ namespace {
 			std::uint32_t fixture_packets = 0u;
 			const bool fixture_ok = bwmn_drive_udp_fixture(fixture_err, fixture_packets);
 			test_lab_format::testlab_diag_log_step("network-action", "BWMN", "udp_fixture",
-				"ok=%d packets=%u err=\"%s\"",
+				"ok=%d packets=%u err=\"%s\" stimulus_pid=%u",
 				fixture_ok ? 1 : 0,
 				fixture_packets,
-				fixture_err.c_str());
+				fixture_err.c_str(),
+				self_pid);
 			Sleep(250);
-			voyager::detail::bw_monitor_request query{};
-			query.operation = 2u;
-			query.filter_pid = 0u;
-			const bool query_ok = bwmn_send("lifecycle_query", query, bytes_returned);
+			voyager::detail::bw_monitor_request aggregate{};
+			aggregate.operation = 2u;
+			aggregate.filter_pid = 0u;
+			std::uint32_t aggregate_bytes_returned = 0u;
+			const bool aggregate_ok = bwmn_send("lifecycle_query_aggregate", aggregate, aggregate_bytes_returned);
+			voyager::detail::bw_monitor_request per_process{};
+			per_process.operation = 4u;
+			per_process.filter_pid = self_pid;
+			std::uint32_t per_process_bytes_returned = 0u;
+			const bool per_process_ok = bwmn_send("lifecycle_query_per_process", per_process, per_process_bytes_returned);
 			voyager::detail::bw_monitor_request stop{};
 			stop.operation = 1u;
-			const bool stop_ok = bwmn_send("lifecycle_stop", stop, bytes_returned);
+			std::uint32_t stop_bytes_returned = 0u;
+			const bool stop_ok = bwmn_send("lifecycle_stop", stop, stop_bytes_returned);
 			voyager::detail::bw_monitor_request cleanup{};
 			cleanup.operation = 3u;
-			(void)bwmn_send("lifecycle_reset_after", cleanup, bytes_returned);
-			r.bytes_returned = bytes_returned;
-			r.raw.resize(sizeof(query));
-			std::memcpy(r.raw.data(), &query, sizeof(query));
-			push_text(r, "Operation", "Lifecycle reset/start/traffic/query/stop/reset");
+			std::uint32_t cleanup_bytes_returned = 0u;
+			(void)bwmn_send("lifecycle_reset_after", cleanup, cleanup_bytes_returned);
+			r.bytes_returned = per_process_bytes_returned;
+			r.raw.resize(sizeof(per_process));
+			std::memcpy(r.raw.data(), &per_process, sizeof(per_process));
+			std::uint32_t nonzero_process_entries = 0u;
+			const std::uint32_t matching_self_pid = count_matching_bw_processes(per_process, self_pid, nonzero_process_entries);
+			push_text(r, "Operation", "Lifecycle reset/start/traffic/aggregate/per-process/stop/reset");
+			push_text(r, "Coverage", "aggregate_and_per_process");
+			push_u32(r, "Stimulus PID", self_pid);
 			push_u32(r, "Start active", start.monitoring_active);
 			push_u32(r, "Fixture UDP ok", fixture_ok ? 1u : 0u);
 			push_u32(r, "Fixture UDP packets", fixture_packets);
-			push_u32(r, "Query IOCTL ok", query_ok ? 1u : 0u);
+			push_u32(r, "Aggregate IOCTL ok", aggregate_ok ? 1u : 0u);
+			push_u32(r, "Per-process IOCTL ok", per_process_ok ? 1u : 0u);
 			push_u32(r, "Stop IOCTL ok", stop_ok ? 1u : 0u);
-			push_u32(r, "Monitoring active at query", query.monitoring_active);
-			push_hex64(r, "Total bytes sent", query.total_bytes_sent);
-			push_hex64(r, "Total bytes recv", query.total_bytes_recv);
-			push_hex64(r, "Total packets sent", query.total_packets_sent);
-			push_hex64(r, "Total packets recv", query.total_packets_recv);
-			push_u32(r, "Process count", query.process_count);
-			if (!query_ok) {
-				fail_result(r, "BWMN lifecycle query send_ioctl_raw returned false");
+			push_u32(r, "Monitoring active at aggregate query", aggregate.monitoring_active);
+			push_hex64(r, "Total bytes sent", aggregate.total_bytes_sent);
+			push_hex64(r, "Total bytes recv", aggregate.total_bytes_recv);
+			push_hex64(r, "Total packets sent", aggregate.total_packets_sent);
+			push_hex64(r, "Total packets recv", aggregate.total_packets_recv);
+			push_hex64(r, "Bytes/sec out", aggregate.bytes_per_second_out);
+			push_hex64(r, "Bytes/sec in", aggregate.bytes_per_second_in);
+			push_u32(r, "Matching stimulus PID entries", matching_self_pid);
+			push_u32(r, "Nonzero process entries", nonzero_process_entries);
+			append_bw_process_entries(r, per_process);
+			if (!aggregate_ok) {
+				fail_result(r, "BWMN lifecycle aggregate query send_ioctl_raw returned false");
+				return;
+			}
+			if (!per_process_ok) {
+				fail_result(r, "BWMN lifecycle per-process query send_ioctl_raw returned false");
 				return;
 			}
 			if (!stop_ok) {
@@ -1537,68 +1611,108 @@ namespace {
 					loopback_resource_precondition(fixture_err) ? 0xC000009Au : 0xC0000001u);
 				return;
 			}
-			if (query.monitoring_active == 0u) {
-				fail_result(r, "BWMN lifecycle query reported monitoring inactive after start");
+			if (aggregate.monitoring_active == 0u) {
+				fail_result(r, "BWMN lifecycle aggregate query reported monitoring inactive after start");
 				return;
 			}
-			if (query.total_bytes_sent == 0u && query.total_bytes_recv == 0u &&
-				query.total_packets_sent == 0u && query.total_packets_recv == 0u &&
-				query.process_count == 0u) {
-				fail_result(r, "BWMN lifecycle query returned zero counters after UDP fixture traffic");
+			if (!bw_totals_nonzero(aggregate)) {
+				fail_result(r, "BWMN lifecycle aggregate query returned zero counters after UDP fixture traffic");
+				return;
+			}
+			if (per_process.process_count == 0u) {
+				fail_result(r, "BWMN lifecycle per-process query returned zero process entries after UDP fixture traffic");
+				return;
+			}
+			if (matching_self_pid == 0u) {
+				fail_result(r, "BWMN lifecycle per-process query returned entries but none matched the stimulus PID");
+				return;
+			}
+			if (nonzero_process_entries == 0u) {
+				fail_result(r, "BWMN lifecycle per-process query returned only zero process counters after UDP fixture traffic");
 				return;
 			}
 			r.ok = true;
 			return;
 		}
-		voyager::detail::bw_monitor_request req{};
-		req.operation = 2u;
-		req.filter_pid = (s.u32_a == 0u)
-			? static_cast<std::uint32_t>(s.u64_a & 0xFFFFFFFFull)
-			: 0u;
-		req.process_count = 0u;
 		std::uint32_t bytes_returned = 0;
-		bool ok = bwmn_send("query_result", req, bytes_returned);
-		r.bytes_returned = bytes_returned;
-		r.raw.resize(sizeof(req));
-		std::memcpy(r.raw.data(), &req, sizeof(req));
-		if (!ok) {
-			r.error = "send_ioctl_raw returned false";
-			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
-			r.ok = false;
+		if (s.u32_a == 1u) {
+			voyager::detail::bw_monitor_request aggregate{};
+			aggregate.operation = 2u;
+			aggregate.filter_pid = 0u;
+			bool ok = bwmn_send("query_aggregate_only", aggregate, bytes_returned);
+			r.bytes_returned = bytes_returned;
+			r.raw.resize(sizeof(aggregate));
+			std::memcpy(r.raw.data(), &aggregate, sizeof(aggregate));
+			if (!ok) {
+				fail_result(r, "BWMN aggregate-only query send_ioctl_raw returned false");
+				return;
+			}
+			push_text(r, "Scope", "interface_aggregate_only");
+			push_text(r, "Coverage", "aggregate_only_per_process_not_claimed");
+			push_u32(r, "Monitoring active", aggregate.monitoring_active);
+			push_hex64(r, "Total bytes sent", aggregate.total_bytes_sent);
+			push_hex64(r, "Total bytes recv", aggregate.total_bytes_recv);
+			push_hex64(r, "Total packets sent", aggregate.total_packets_sent);
+			push_hex64(r, "Total packets recv", aggregate.total_packets_recv);
+			push_hex64(r, "Bytes/sec out", aggregate.bytes_per_second_out);
+			push_hex64(r, "Bytes/sec in", aggregate.bytes_per_second_in);
+			push_text(r, "Per-process coverage", "not_claimed_for_interface_scope");
+			if (!bw_totals_nonzero(aggregate)) {
+				fail_result(r, "BWMN aggregate-only query returned zero aggregate counters");
+				return;
+			}
+			r.ok = true;
 			return;
 		}
-		push_text(r, "Scope", (s.u32_a == 1u) ? "interface" : "conn/pid");
-		push_u32(r, "Filter PID", req.filter_pid);
-		push_u32(r, "Monitoring active", req.monitoring_active);
-		push_hex64(r, "Total bytes sent", req.total_bytes_sent);
-		push_hex64(r, "Total bytes recv", req.total_bytes_recv);
-		push_hex64(r, "Total packets sent", req.total_packets_sent);
-		push_hex64(r, "Total packets recv", req.total_packets_recv);
-		push_hex64(r, "Bytes/sec out", req.bytes_per_second_out);
-		push_hex64(r, "Bytes/sec in", req.bytes_per_second_in);
-		std::uint32_t cap = req.process_count;
-		if (cap > voyager::detail::BW_MAX_PROCESSES) {
-			cap = voyager::detail::BW_MAX_PROCESSES;
+		const std::uint32_t filter_pid = static_cast<std::uint32_t>(s.u64_a & 0xFFFFFFFFull);
+		voyager::detail::bw_monitor_request aggregate{};
+		aggregate.operation = 2u;
+		aggregate.filter_pid = 0u;
+		bool aggregate_ok = bwmn_send("query_per_process_aggregate", aggregate, bytes_returned);
+		voyager::detail::bw_monitor_request per_process{};
+		per_process.operation = 4u;
+		per_process.filter_pid = filter_pid;
+		bool per_process_ok = bwmn_send("query_per_process_entries", per_process, bytes_returned);
+		r.bytes_returned = bytes_returned;
+		r.raw.resize(sizeof(per_process));
+		std::memcpy(r.raw.data(), &per_process, sizeof(per_process));
+		if (!aggregate_ok) {
+			fail_result(r, "BWMN per-process aggregate query send_ioctl_raw returned false");
+			return;
 		}
-		push_u32(r, "Process count", cap);
-		char label[32];
-		char value[160];
-		for (std::uint32_t i = 0; i < cap; ++i) {
-			const auto& p = req.processes[i];
-			std::snprintf(label, sizeof(label), "Process #%u", i);
-			std::snprintf(value, sizeof(value),
-				"pid=%u sent=%llu recv=%llu pkts_s=%llu pkts_r=%llu last_activity=0x%016llX",
-				p.pid,
-				static_cast<unsigned long long>(p.bytes_sent),
-				static_cast<unsigned long long>(p.bytes_recv),
-				static_cast<unsigned long long>(p.packets_sent),
-				static_cast<unsigned long long>(p.packets_recv),
-				static_cast<unsigned long long>(p.last_activity_time));
-			r.parsed.push_back({ std::string(label), std::string(value) });
+		if (!per_process_ok) {
+			fail_result(r, "BWMN per-process entry query send_ioctl_raw returned false");
+			return;
 		}
-		if (req.total_bytes_sent == 0u && req.total_bytes_recv == 0u &&
-			req.total_packets_sent == 0u && req.total_packets_recv == 0u && cap == 0u) {
-			fail_result(r, "BWMN query returned zero totals and zero per-process entries after the network fixture/action expected bandwidth evidence");
+		std::uint32_t nonzero_process_entries = 0u;
+		const std::uint32_t matching_filter_pid = count_matching_bw_processes(per_process, filter_pid, nonzero_process_entries);
+		push_text(r, "Scope", "per_process");
+		push_text(r, "Coverage", "aggregate_and_per_process");
+		push_u32(r, "Filter PID", filter_pid);
+		push_u32(r, "Monitoring active", aggregate.monitoring_active);
+		push_hex64(r, "Total bytes sent", aggregate.total_bytes_sent);
+		push_hex64(r, "Total bytes recv", aggregate.total_bytes_recv);
+		push_hex64(r, "Total packets sent", aggregate.total_packets_sent);
+		push_hex64(r, "Total packets recv", aggregate.total_packets_recv);
+		push_hex64(r, "Bytes/sec out", aggregate.bytes_per_second_out);
+		push_hex64(r, "Bytes/sec in", aggregate.bytes_per_second_in);
+		push_u32(r, "Matching filter PID entries", matching_filter_pid);
+		push_u32(r, "Nonzero process entries", nonzero_process_entries);
+		append_bw_process_entries(r, per_process);
+		if (!bw_totals_nonzero(aggregate)) {
+			fail_result(r, "BWMN per-process scope aggregate query returned zero aggregate counters");
+			return;
+		}
+		if (per_process.process_count == 0u) {
+			fail_result(r, "BWMN per-process scope returned zero process entries");
+			return;
+		}
+		if (filter_pid != 0u && matching_filter_pid == 0u) {
+			fail_result(r, "BWMN per-process scope returned entries but none matched the requested PID filter");
+			return;
+		}
+		if (nonzero_process_entries == 0u) {
+			fail_result(r, "BWMN per-process scope returned only zero process counters");
 			return;
 		}
 		r.ok = true;
@@ -1802,7 +1916,7 @@ TESTLAB_REGISTER(g_reg_dnss, "network-action", test_lab::driver_e::whoswho, "DNS
 	&render_inputs_dnss, &run_dnss);
 
 TESTLAB_REGISTER(g_reg_bwmn, "network-action", test_lab::driver_e::whoswho, "BWMN",
-	"Bandwidth monitor: totals + per-process counters from the WhosWho BW ring.",
+	"Bandwidth monitor: op=2 aggregate totals and op=4 per-process counters from the WhosWho BW ring.",
 	&render_inputs_bwmn, &run_bwmn);
 
 TESTLAB_REGISTER(g_reg_pcex, "network-action", test_lab::driver_e::whoswho, "PCEX",

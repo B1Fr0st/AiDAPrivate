@@ -11,9 +11,63 @@ set(AIDA_CAMOUFOX_SOURCE_SYNC_FILES
     "browser.py"
     "__main__.py"
     "tools/navigation.py"
+    "tools/debugging.py"
     "tools/environment.py"
     "tools/storage.py"
 )
+
+set(AIDA_CAMOUFOX_REQUIRED_REVERSE_TOOLS
+    "launch_browser"
+    "close_browser"
+    "list_pages"
+    "new_page"
+    "select_page"
+    "close_page"
+    "evaluate_js"
+    "navigate"
+    "get_page_info"
+)
+
+set(AIDA_CAMOUFOX_REPO_BROWSER_PATH "${AIDA_CAMOUFOX_REPO_MCP_ROOT}/browser.py")
+set(AIDA_CAMOUFOX_REPO_NAV_PATH "${AIDA_CAMOUFOX_REPO_MCP_ROOT}/tools/navigation.py")
+set(AIDA_CAMOUFOX_REPO_DEBUGGING_PATH "${AIDA_CAMOUFOX_REPO_MCP_ROOT}/tools/debugging.py")
+set(AIDA_CAMOUFOX_REPO_MULTIPAGE_SOURCE_READY FALSE)
+if(EXISTS "${AIDA_CAMOUFOX_REPO_BROWSER_PATH}" AND EXISTS "${AIDA_CAMOUFOX_REPO_NAV_PATH}")
+    file(READ "${AIDA_CAMOUFOX_REPO_BROWSER_PATH}" AIDA_CAMOUFOX_REPO_BROWSER_CONTENT)
+    file(READ "${AIDA_CAMOUFOX_REPO_NAV_PATH}" AIDA_CAMOUFOX_REPO_NAV_CONTENT)
+    if(EXISTS "${AIDA_CAMOUFOX_REPO_DEBUGGING_PATH}")
+        file(READ "${AIDA_CAMOUFOX_REPO_DEBUGGING_PATH}" AIDA_CAMOUFOX_REPO_DEBUGGING_CONTENT)
+    else()
+        set(AIDA_CAMOUFOX_REPO_DEBUGGING_CONTENT "")
+    endif()
+    string(REPLACE "\r\n" "\n" AIDA_CAMOUFOX_REPO_BROWSER_CONTENT "${AIDA_CAMOUFOX_REPO_BROWSER_CONTENT}")
+    string(REPLACE "\r" "\n" AIDA_CAMOUFOX_REPO_BROWSER_CONTENT "${AIDA_CAMOUFOX_REPO_BROWSER_CONTENT}")
+    string(REPLACE "\r\n" "\n" AIDA_CAMOUFOX_REPO_NAV_CONTENT "${AIDA_CAMOUFOX_REPO_NAV_CONTENT}")
+    string(REPLACE "\r" "\n" AIDA_CAMOUFOX_REPO_NAV_CONTENT "${AIDA_CAMOUFOX_REPO_NAV_CONTENT}")
+    string(REPLACE "\r\n" "\n" AIDA_CAMOUFOX_REPO_DEBUGGING_CONTENT "${AIDA_CAMOUFOX_REPO_DEBUGGING_CONTENT}")
+    string(REPLACE "\r" "\n" AIDA_CAMOUFOX_REPO_DEBUGGING_CONTENT "${AIDA_CAMOUFOX_REPO_DEBUGGING_CONTENT}")
+    set(AIDA_CAMOUFOX_REPO_TOOL_CONTENT "${AIDA_CAMOUFOX_REPO_NAV_CONTENT}\n${AIDA_CAMOUFOX_REPO_DEBUGGING_CONTENT}")
+    foreach(AIDA_CAMOUFOX_REQUIRED_REVERSE_TOOL IN LISTS AIDA_CAMOUFOX_REQUIRED_REVERSE_TOOLS)
+        string(FIND "${AIDA_CAMOUFOX_REPO_TOOL_CONTENT}" "async def ${AIDA_CAMOUFOX_REQUIRED_REVERSE_TOOL}(" AIDA_CAMOUFOX_REQUIRED_TOOL_POS)
+        if(AIDA_CAMOUFOX_REQUIRED_TOOL_POS EQUAL -1)
+            message(FATAL_ERROR "Root Camoufox reverse-MCP source is missing required tool ${AIDA_CAMOUFOX_REQUIRED_REVERSE_TOOL}: ${AIDA_CAMOUFOX_REPO_MCP_ROOT}")
+        endif()
+    endforeach()
+    foreach(AIDA_CAMOUFOX_REQUIRED_BROWSER_MARKER IN ITEMS
+        "self._aida_multipage_patch = 4"
+        "async def list_pages"
+        "async def new_page"
+        "async def select_page"
+        "async def close_page"
+        "async def resolve_page"
+        "async def page_envelope")
+        string(FIND "${AIDA_CAMOUFOX_REPO_BROWSER_CONTENT}" "${AIDA_CAMOUFOX_REQUIRED_BROWSER_MARKER}" AIDA_CAMOUFOX_REQUIRED_BROWSER_MARKER_POS)
+        if(AIDA_CAMOUFOX_REQUIRED_BROWSER_MARKER_POS EQUAL -1)
+            message(FATAL_ERROR "Root Camoufox reverse-MCP browser source is missing required marker ${AIDA_CAMOUFOX_REQUIRED_BROWSER_MARKER}: ${AIDA_CAMOUFOX_REPO_BROWSER_PATH}")
+        endif()
+    endforeach()
+    set(AIDA_CAMOUFOX_REPO_MULTIPAGE_SOURCE_READY TRUE)
+endif()
 
 foreach(AIDA_CAMOUFOX_SOURCE_SYNC_FILE IN LISTS AIDA_CAMOUFOX_SOURCE_SYNC_FILES)
     set(AIDA_CAMOUFOX_SOURCE_PATH "${AIDA_CAMOUFOX_REPO_MCP_ROOT}/${AIDA_CAMOUFOX_SOURCE_SYNC_FILE}")
@@ -844,6 +898,314 @@ def _profile_snapshot(profile_dir: str | None) -> dict[str, Any]:
             AIDA_CAMOUFOX_CONTENT "${AIDA_CAMOUFOX_CONTENT}")
     endif()
 
+    if(NOT AIDA_CAMOUFOX_CONTENT MATCHES "launch_options_build_ok")
+        string(REPLACE [=[def _build_camoufox_launch_options(headless: bool, kwargs: dict[str, Any]) -> dict[str, Any]:
+    from camoufox.utils import launch_options as _cfx_launch_options
+    return _cfx_launch_options(headless=headless, **{
+        k: v for k, v in kwargs.items() if k not in ("headless", "from_options", "persistent_context")
+    })]=]
+[=[def _build_camoufox_launch_options(headless: bool, kwargs: dict[str, Any]) -> dict[str, Any]:
+    _launch_options_started = time.perf_counter()
+    _launch_keys = sorted(str(k) for k in kwargs.keys())
+    _camoufox_debug(
+        "launch_options_begin",
+        headless=bool(headless),
+        keys=_launch_keys,
+        has_executable=bool(kwargs.get("executable_path")),
+        has_prefs=bool(kwargs.get("firefox_user_prefs")),
+        has_user_data_dir=bool(kwargs.get("user_data_dir")),
+    )
+    try:
+        _camoufox_debug("launch_options_import_begin")
+        from camoufox.utils import launch_options as _cfx_launch_options
+        _camoufox_debug(
+            "launch_options_import_ok",
+            elapsed_ms=int((time.perf_counter() - _launch_options_started) * 1000),
+        )
+    except Exception as exc:
+        _camoufox_debug(
+            "launch_options_import_fail",
+            elapsed_ms=int((time.perf_counter() - _launch_options_started) * 1000),
+            error_type=type(exc).__name__,
+            error_len=len(str(exc)),
+            error_summary=_safe_text(exc),
+            error_traceback=_safe_text("".join(_traceback.format_exception(type(exc), exc, exc.__traceback__)), 4000),
+        )
+        raise
+    try:
+        _camoufox_debug(
+            "launch_options_build_begin",
+            elapsed_ms=int((time.perf_counter() - _launch_options_started) * 1000),
+            key_count=len(_launch_keys),
+        )
+        _options = _cfx_launch_options(headless=headless, **{
+            k: v for k, v in kwargs.items() if k not in ("headless", "from_options", "persistent_context")
+        })
+        _camoufox_debug(
+            "launch_options_build_ok",
+            elapsed_ms=int((time.perf_counter() - _launch_options_started) * 1000),
+            option_keys=sorted(str(k) for k in _options.keys()) if isinstance(_options, dict) else [],
+            from_options_has_executable=bool(_options.get("executable_path")) if isinstance(_options, dict) else False,
+            from_options_args=len(_options.get("args") or []) if isinstance(_options, dict) else 0,
+            from_options_has_env=bool(_options.get("env")) if isinstance(_options, dict) else False,
+        )
+        return _options
+    except Exception as exc:
+        _camoufox_debug(
+            "launch_options_build_fail",
+            elapsed_ms=int((time.perf_counter() - _launch_options_started) * 1000),
+            error_type=type(exc).__name__,
+            error_len=len(str(exc)),
+            error_summary=_safe_text(exc),
+            error_traceback=_safe_text("".join(_traceback.format_exception(type(exc), exc, exc.__traceback__)), 4000),
+        )
+        raise]=]
+            AIDA_CAMOUFOX_CONTENT "${AIDA_CAMOUFOX_CONTENT}")
+        string(REPLACE [=[def _build_camoufox_launch_options(headless: bool, kwargs: dict[str, Any]) -> dict[str, Any]:
+    from camoufox.utils import launch_options as _cfx_launch_options
+    return _cfx_launch_options(headless=headless, **{
+        k: v for k, v in kwargs.items() if k not in ("headless", "from_options")
+    })]=]
+[=[def _build_camoufox_launch_options(headless: bool, kwargs: dict[str, Any]) -> dict[str, Any]:
+    _launch_options_started = time.perf_counter()
+    _launch_keys = sorted(str(k) for k in kwargs.keys())
+    _camoufox_debug(
+        "launch_options_begin",
+        headless=bool(headless),
+        keys=_launch_keys,
+        has_executable=bool(kwargs.get("executable_path")),
+        has_prefs=bool(kwargs.get("firefox_user_prefs")),
+        has_user_data_dir=bool(kwargs.get("user_data_dir")),
+    )
+    try:
+        _camoufox_debug("launch_options_import_begin")
+        from camoufox.utils import launch_options as _cfx_launch_options
+        _camoufox_debug(
+            "launch_options_import_ok",
+            elapsed_ms=int((time.perf_counter() - _launch_options_started) * 1000),
+        )
+    except Exception as exc:
+        _camoufox_debug(
+            "launch_options_import_fail",
+            elapsed_ms=int((time.perf_counter() - _launch_options_started) * 1000),
+            error_type=type(exc).__name__,
+            error_len=len(str(exc)),
+            error_summary=_safe_text(exc),
+            error_traceback=_safe_text("".join(_traceback.format_exception(type(exc), exc, exc.__traceback__)), 4000),
+        )
+        raise
+    try:
+        _camoufox_debug(
+            "launch_options_build_begin",
+            elapsed_ms=int((time.perf_counter() - _launch_options_started) * 1000),
+            key_count=len(_launch_keys),
+        )
+        _options = _cfx_launch_options(headless=headless, **{
+            k: v for k, v in kwargs.items() if k not in ("headless", "from_options", "persistent_context")
+        })
+        _camoufox_debug(
+            "launch_options_build_ok",
+            elapsed_ms=int((time.perf_counter() - _launch_options_started) * 1000),
+            option_keys=sorted(str(k) for k in _options.keys()) if isinstance(_options, dict) else [],
+            from_options_has_executable=bool(_options.get("executable_path")) if isinstance(_options, dict) else False,
+            from_options_args=len(_options.get("args") or []) if isinstance(_options, dict) else 0,
+            from_options_has_env=bool(_options.get("env")) if isinstance(_options, dict) else False,
+        )
+        return _options
+    except Exception as exc:
+        _camoufox_debug(
+            "launch_options_build_fail",
+            elapsed_ms=int((time.perf_counter() - _launch_options_started) * 1000),
+            error_type=type(exc).__name__,
+            error_len=len(str(exc)),
+            error_summary=_safe_text(exc),
+            error_traceback=_safe_text("".join(_traceback.format_exception(type(exc), exc, exc.__traceback__)), 4000),
+        )
+        raise]=]
+            AIDA_CAMOUFOX_CONTENT "${AIDA_CAMOUFOX_CONTENT}")
+        string(REPLACE [=[def _build_camoufox_launch_options(headless: bool, kwargs: dict[str, Any]) -> dict[str, Any]:
+    started = time.perf_counter()
+    options_kwargs = {
+        k: v for k, v in kwargs.items() if k not in ("headless", "from_options", "persistent_context")
+    }
+    _camoufox_debug(
+        "launch_options_begin",
+        headless=bool(headless),
+        keys=sorted(options_kwargs.keys()),
+        has_executable=bool(options_kwargs.get("executable_path")),
+        has_prefs=bool(options_kwargs.get("firefox_user_prefs")),
+        has_user_data_dir=bool(options_kwargs.get("user_data_dir")),
+    )
+    import_started = time.perf_counter()
+    _camoufox_debug("launch_options_import_begin")
+    from camoufox.utils import launch_options as _cfx_launch_options
+    _camoufox_debug("launch_options_import_ok", elapsed_ms=int((time.perf_counter() - import_started) * 1000))
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        result = _cfx_launch_options(headless=headless, **options_kwargs)
+    stdout = out.getvalue()
+    if stdout:
+        _camoufox_debug("launch_options_stdout", summary=_safe_text(stdout), length=len(stdout))
+    _camoufox_debug(
+        "launch_options_built",
+        elapsed_ms=int((time.perf_counter() - started) * 1000),
+        args=len(result.get("args") or []),
+        env_keys=len(result.get("env") or {}),
+        has_executable=bool(result.get("executable_path")),
+        has_proxy=bool(result.get("proxy")),
+        has_prefs=bool(result.get("firefox_user_prefs")),
+    )
+    return result]=]
+[=[def _build_camoufox_launch_options(headless: bool, kwargs: dict[str, Any]) -> dict[str, Any]:
+    _launch_options_started = time.perf_counter()
+    options_kwargs = {
+        k: v for k, v in kwargs.items() if k not in ("headless", "from_options", "persistent_context")
+    }
+    _launch_keys = sorted(str(k) for k in options_kwargs.keys())
+    _camoufox_debug(
+        "launch_options_begin",
+        headless=bool(headless),
+        keys=_launch_keys,
+        has_executable=bool(options_kwargs.get("executable_path")),
+        has_prefs=bool(options_kwargs.get("firefox_user_prefs")),
+        has_user_data_dir=bool(options_kwargs.get("user_data_dir")),
+    )
+    try:
+        _camoufox_debug("launch_options_import_begin")
+        from camoufox.utils import launch_options as _cfx_launch_options
+        _camoufox_debug(
+            "launch_options_import_ok",
+            elapsed_ms=int((time.perf_counter() - _launch_options_started) * 1000),
+        )
+    except Exception as exc:
+        _camoufox_debug(
+            "launch_options_import_fail",
+            elapsed_ms=int((time.perf_counter() - _launch_options_started) * 1000),
+            error_type=type(exc).__name__,
+            error_len=len(str(exc)),
+            error_summary=_safe_text(exc),
+            error_traceback=_safe_text("".join(_traceback.format_exception(type(exc), exc, exc.__traceback__)), 4000),
+        )
+        raise
+    try:
+        _camoufox_debug(
+            "launch_options_build_begin",
+            elapsed_ms=int((time.perf_counter() - _launch_options_started) * 1000),
+            key_count=len(_launch_keys),
+        )
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            result = _cfx_launch_options(headless=headless, **options_kwargs)
+        stdout = out.getvalue()
+        if stdout:
+            _camoufox_debug("launch_options_stdout", summary=_safe_text(stdout), length=len(stdout))
+        _camoufox_debug(
+            "launch_options_build_ok",
+            elapsed_ms=int((time.perf_counter() - _launch_options_started) * 1000),
+            option_keys=sorted(str(k) for k in result.keys()) if isinstance(result, dict) else [],
+            from_options_has_executable=bool(result.get("executable_path")) if isinstance(result, dict) else False,
+            from_options_args=len(result.get("args") or []) if isinstance(result, dict) else 0,
+            from_options_has_env=bool(result.get("env")) if isinstance(result, dict) else False,
+        )
+        return result
+    except Exception as exc:
+        _camoufox_debug(
+            "launch_options_build_fail",
+            elapsed_ms=int((time.perf_counter() - _launch_options_started) * 1000),
+            error_type=type(exc).__name__,
+            error_len=len(str(exc)),
+            error_summary=_safe_text(exc),
+            error_traceback=_safe_text("".join(_traceback.format_exception(type(exc), exc, exc.__traceback__)), 4000),
+        )
+        raise]=]
+            AIDA_CAMOUFOX_CONTENT "${AIDA_CAMOUFOX_CONTENT}")
+        string(REPLACE [=[def _build_camoufox_launch_options(headless: bool, kwargs: dict[str, Any]) -> dict[str, Any]:
+    from camoufox.utils import launch_options as _cfx_launch_options
+    started = time.perf_counter()
+    out = io.StringIO()
+    options_kwargs = {
+        k: v for k, v in kwargs.items() if k not in ("headless", "from_options", "persistent_context")
+    }
+    with contextlib.redirect_stdout(out):
+        result = _cfx_launch_options(headless=headless, **options_kwargs)
+    stdout = out.getvalue()
+    if stdout:
+        _camoufox_debug("launch_options_stdout", summary=_safe_text(stdout), length=len(stdout))
+    _camoufox_debug(
+        "launch_options_built",
+        elapsed_ms=int((time.perf_counter() - started) * 1000),
+        args=len(result.get("args") or []),
+        env_keys=len(result.get("env") or {}),
+        has_executable=bool(result.get("executable_path")),
+        has_proxy=bool(result.get("proxy")),
+        has_prefs=bool(result.get("firefox_user_prefs")),
+    )
+    return result]=]
+[=[def _build_camoufox_launch_options(headless: bool, kwargs: dict[str, Any]) -> dict[str, Any]:
+    _launch_options_started = time.perf_counter()
+    options_kwargs = {
+        k: v for k, v in kwargs.items() if k not in ("headless", "from_options", "persistent_context")
+    }
+    _launch_keys = sorted(str(k) for k in options_kwargs.keys())
+    _camoufox_debug(
+        "launch_options_begin",
+        headless=bool(headless),
+        keys=_launch_keys,
+        has_executable=bool(options_kwargs.get("executable_path")),
+        has_prefs=bool(options_kwargs.get("firefox_user_prefs")),
+        has_user_data_dir=bool(options_kwargs.get("user_data_dir")),
+    )
+    try:
+        _camoufox_debug("launch_options_import_begin")
+        from camoufox.utils import launch_options as _cfx_launch_options
+        _camoufox_debug(
+            "launch_options_import_ok",
+            elapsed_ms=int((time.perf_counter() - _launch_options_started) * 1000),
+        )
+    except Exception as exc:
+        _camoufox_debug(
+            "launch_options_import_fail",
+            elapsed_ms=int((time.perf_counter() - _launch_options_started) * 1000),
+            error_type=type(exc).__name__,
+            error_len=len(str(exc)),
+            error_summary=_safe_text(exc),
+            error_traceback=_safe_text("".join(_traceback.format_exception(type(exc), exc, exc.__traceback__)), 4000),
+        )
+        raise
+    try:
+        _camoufox_debug(
+            "launch_options_build_begin",
+            elapsed_ms=int((time.perf_counter() - _launch_options_started) * 1000),
+            key_count=len(_launch_keys),
+        )
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            result = _cfx_launch_options(headless=headless, **options_kwargs)
+        stdout = out.getvalue()
+        if stdout:
+            _camoufox_debug("launch_options_stdout", summary=_safe_text(stdout), length=len(stdout))
+        _camoufox_debug(
+            "launch_options_build_ok",
+            elapsed_ms=int((time.perf_counter() - _launch_options_started) * 1000),
+            option_keys=sorted(str(k) for k in result.keys()) if isinstance(result, dict) else [],
+            from_options_has_executable=bool(result.get("executable_path")) if isinstance(result, dict) else False,
+            from_options_args=len(result.get("args") or []) if isinstance(result, dict) else 0,
+            from_options_has_env=bool(result.get("env")) if isinstance(result, dict) else False,
+        )
+        return result
+    except Exception as exc:
+        _camoufox_debug(
+            "launch_options_build_fail",
+            elapsed_ms=int((time.perf_counter() - _launch_options_started) * 1000),
+            error_type=type(exc).__name__,
+            error_len=len(str(exc)),
+            error_summary=_safe_text(exc),
+            error_traceback=_safe_text("".join(_traceback.format_exception(type(exc), exc, exc.__traceback__)), 4000),
+        )
+        raise]=]
+            AIDA_CAMOUFOX_CONTENT "${AIDA_CAMOUFOX_CONTENT}")
+    endif()
+
     if(NOT AIDA_CAMOUFOX_CONTENT MATCHES "launch_profile_privacy")
         string(REPLACE [=[        try:
             self._profile_dir = profile_dir]=]
@@ -1671,28 +2033,32 @@ endforeach()
 
 set(AIDA_CAMOUFOX_MULTIPAGE_PATCHER "${CMAKE_CURRENT_LIST_DIR}/aida_camoufox_reverse_mcp_multipage.py")
 set(AIDA_CAMOUFOX_PATCH_PYTHON "${AIDA_CAMOUFOX_STAGE_ROOT}/deps/camoufox-runtime/python.exe")
-if(NOT EXISTS "${AIDA_CAMOUFOX_PATCH_PYTHON}")
-    find_program(AIDA_CAMOUFOX_PATCH_PYTHON_FALLBACK NAMES python3 python)
-    if(AIDA_CAMOUFOX_PATCH_PYTHON_FALLBACK)
-        set(AIDA_CAMOUFOX_PATCH_PYTHON "${AIDA_CAMOUFOX_PATCH_PYTHON_FALLBACK}")
+if(AIDA_CAMOUFOX_REPO_MULTIPAGE_SOURCE_READY)
+    message(STATUS "Camoufox reverse-MCP multipage source synchronized from root")
+else()
+    if(NOT EXISTS "${AIDA_CAMOUFOX_PATCH_PYTHON}")
+        find_program(AIDA_CAMOUFOX_PATCH_PYTHON_FALLBACK NAMES python3 python)
+        if(AIDA_CAMOUFOX_PATCH_PYTHON_FALLBACK)
+            set(AIDA_CAMOUFOX_PATCH_PYTHON "${AIDA_CAMOUFOX_PATCH_PYTHON_FALLBACK}")
+        endif()
     endif()
-endif()
-if(NOT EXISTS "${AIDA_CAMOUFOX_MULTIPAGE_PATCHER}")
-    message(FATAL_ERROR "Missing Camoufox multipage patcher: ${AIDA_CAMOUFOX_MULTIPAGE_PATCHER}")
-endif()
-if(NOT AIDA_CAMOUFOX_PATCH_PYTHON)
-    message(FATAL_ERROR "Python interpreter required for Camoufox multipage patcher")
-endif()
-execute_process(
-    COMMAND "${AIDA_CAMOUFOX_PATCH_PYTHON}" "${AIDA_CAMOUFOX_MULTIPAGE_PATCHER}" "${AIDA_CAMOUFOX_STAGE_ROOT}"
-    RESULT_VARIABLE AIDA_CAMOUFOX_MULTIPAGE_PATCH_RESULT
-    OUTPUT_VARIABLE AIDA_CAMOUFOX_MULTIPAGE_PATCH_OUT
-    ERROR_VARIABLE AIDA_CAMOUFOX_MULTIPAGE_PATCH_ERR
-)
-if(NOT AIDA_CAMOUFOX_MULTIPAGE_PATCH_RESULT EQUAL 0)
-    message(FATAL_ERROR "Camoufox multipage patch failed: ${AIDA_CAMOUFOX_MULTIPAGE_PATCH_OUT} ${AIDA_CAMOUFOX_MULTIPAGE_PATCH_ERR}")
-endif()
-if(AIDA_CAMOUFOX_MULTIPAGE_PATCH_OUT)
-    string(STRIP "${AIDA_CAMOUFOX_MULTIPAGE_PATCH_OUT}" AIDA_CAMOUFOX_MULTIPAGE_PATCH_OUT_STRIPPED)
-    message(STATUS "${AIDA_CAMOUFOX_MULTIPAGE_PATCH_OUT_STRIPPED}")
+    if(NOT EXISTS "${AIDA_CAMOUFOX_MULTIPAGE_PATCHER}")
+        message(FATAL_ERROR "Missing Camoufox multipage patcher: ${AIDA_CAMOUFOX_MULTIPAGE_PATCHER}")
+    endif()
+    if(NOT AIDA_CAMOUFOX_PATCH_PYTHON)
+        message(FATAL_ERROR "Python interpreter required for Camoufox multipage patcher")
+    endif()
+    execute_process(
+        COMMAND "${AIDA_CAMOUFOX_PATCH_PYTHON}" "${AIDA_CAMOUFOX_MULTIPAGE_PATCHER}" "${AIDA_CAMOUFOX_STAGE_ROOT}"
+        RESULT_VARIABLE AIDA_CAMOUFOX_MULTIPAGE_PATCH_RESULT
+        OUTPUT_VARIABLE AIDA_CAMOUFOX_MULTIPAGE_PATCH_OUT
+        ERROR_VARIABLE AIDA_CAMOUFOX_MULTIPAGE_PATCH_ERR
+    )
+    if(NOT AIDA_CAMOUFOX_MULTIPAGE_PATCH_RESULT EQUAL 0)
+        message(FATAL_ERROR "Camoufox multipage patch failed: ${AIDA_CAMOUFOX_MULTIPAGE_PATCH_OUT} ${AIDA_CAMOUFOX_MULTIPAGE_PATCH_ERR}")
+    endif()
+    if(AIDA_CAMOUFOX_MULTIPAGE_PATCH_OUT)
+        string(STRIP "${AIDA_CAMOUFOX_MULTIPAGE_PATCH_OUT}" AIDA_CAMOUFOX_MULTIPAGE_PATCH_OUT_STRIPPED)
+        message(STATUS "${AIDA_CAMOUFOX_MULTIPAGE_PATCH_OUT_STRIPPED}")
+    endif()
 endif()

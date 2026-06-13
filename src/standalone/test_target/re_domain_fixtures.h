@@ -49,6 +49,23 @@ struct descriptor_t {
     std::uint64_t frame_counter_va;
     std::uint64_t d3d11_module_va;
     std::uint64_t dxgi_module_va;
+    std::uint64_t dx_static_vtable_va;
+    std::uint64_t dx_static_slot_names_va;
+    std::uint64_t dx_static_slot_addresses_va;
+    std::uint32_t dx_static_slot_count;
+    std::uint32_t dx_static_fixture_kind;
+    std::uint64_t dx_static_fixture_label_va;
+    std::uint64_t rtti_factory_fn_va;
+    std::uint64_t rtti_constructor_fn_va;
+    std::uint64_t rtti_factory_instance_va;
+    std::uint64_t rtti_complete_object_locator_va;
+    std::uint64_t rtti_type_descriptor_va;
+    std::uint64_t analysis_branch_fn_va;
+    std::uint64_t analysis_callgraph_fn_va;
+    std::uint64_t analysis_dispatch_fn_va;
+    std::uint64_t analysis_range_va;
+    std::uint32_t analysis_range_size;
+    std::uint32_t analysis_export_count;
     std::uint64_t reserved[8];
 };
 
@@ -63,3 +80,13 @@ extern "C" AIDA_TEST_TARGET_FIXTURE_API __declspec(noinline) const test_target::
 extern "C" AIDA_TEST_TARGET_FIXTURE_API __declspec(noinline) std::uint64_t aida_test_re_heap_burst(std::uint32_t count, std::uint32_t payload_size) noexcept;
 extern "C" AIDA_TEST_TARGET_FIXTURE_API __declspec(noinline) std::uint64_t aida_test_re_mutate_struct(std::uint32_t index, std::uint32_t delta) noexcept;
 extern "C" AIDA_TEST_TARGET_FIXTURE_API __declspec(noinline) std::uint64_t aida_test_re_frame_tick(std::uint32_t frame_index) noexcept;
+extern "C" AIDA_TEST_TARGET_FIXTURE_API __declspec(noinline) std::uint64_t aida_test_re_dx_static_vs_set_constant_buffers(std::uint32_t start_slot, std::uint64_t buffer_va, std::uint32_t count) noexcept;
+extern "C" AIDA_TEST_TARGET_FIXTURE_API __declspec(noinline) std::uint64_t aida_test_re_dx_static_draw_indexed(std::uint32_t index_count, std::uint32_t start_index, std::int32_t base_vertex) noexcept;
+extern "C" AIDA_TEST_TARGET_FIXTURE_API __declspec(noinline) std::uint64_t aida_test_re_dx_static_draw_indexed_instanced(std::uint32_t index_count, std::uint32_t instance_count, std::uint32_t start_index) noexcept;
+extern "C" AIDA_TEST_TARGET_FIXTURE_API __declspec(noinline) std::uint64_t aida_test_re_dx_static_ps_set_shader_resources(std::uint32_t start_slot, std::uint64_t resource_va, std::uint32_t count) noexcept;
+extern "C" AIDA_TEST_TARGET_FIXTURE_API __declspec(noinline) std::uint64_t aida_test_re_dx_static_ia_set_vertex_buffers(std::uint32_t start_slot, std::uint64_t buffer_va, std::uint32_t stride) noexcept;
+extern "C" AIDA_TEST_TARGET_FIXTURE_API __declspec(noinline) void* aida_test_re_construct_rtti_entity(void* storage, std::uint32_t seed) noexcept;
+extern "C" AIDA_TEST_TARGET_FIXTURE_API __declspec(noinline) void* aida_test_re_factory_rtti_entity(std::uint32_t seed) noexcept;
+extern "C" AIDA_TEST_TARGET_FIXTURE_API __declspec(noinline) std::uint32_t aida_test_re_analysis_branch(std::uint32_t x, std::uint32_t y) noexcept;
+extern "C" AIDA_TEST_TARGET_FIXTURE_API __declspec(noinline) std::uint32_t aida_test_re_analysis_callgraph(std::uint32_t seed) noexcept;
+extern "C" AIDA_TEST_TARGET_FIXTURE_API __declspec(noinline) std::uint32_t aida_test_re_analysis_dispatch(std::uint32_t opcode, std::uint32_t value) noexcept;

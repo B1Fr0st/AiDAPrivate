@@ -40,6 +40,8 @@ SOCKET g_sender = INVALID_SOCKET;
 HANDLE g_worker = nullptr;
 DWORD g_worker_tid = 0;
 bool g_wsa_started = false;
+std::uint64_t g_last_send_tick = 0;
+std::uint64_t g_last_recv_tick = 0;
 
 bool running_now()
 {
@@ -131,6 +133,11 @@ std::uint32_t emit_capture_impl(void* raw_ctx, std::uint8_t* buffer, std::uint32
     return off + 2u;
 }
 
+std::uint32_t serialize_frame_impl(void* ctx, std::uint8_t* buffer, std::uint32_t size) noexcept
+{
+    return emit_capture_impl(ctx, buffer, size);
+}
+
 std::uint32_t build_enet_packet(std::uint8_t* buffer, std::uint32_t size, std::uint32_t sequence)
 {
     if (!buffer || size < 96)
@@ -173,10 +180,8 @@ void drain_receiver()
         return;
 
     std::uint8_t scratch[768];
-    sockaddr_in from{};
-    int from_len = sizeof(from);
     for (;;) {
-        const int got = recvfrom(g_receiver, reinterpret_cast<char*>(scratch), sizeof(scratch), 0, reinterpret_cast<sockaddr*>(&from), &from_len);
+        const int got = aida_test_proto_recv_wrapper(static_cast<std::uintptr_t>(g_receiver), scratch, static_cast<std::uint32_t>(sizeof(scratch)));
         if (got <= 0)
             break;
     }
@@ -196,30 +201,21 @@ void interruptible_sleep(std::uint32_t ms)
 
 DWORD WINAPI worker_thread(LPVOID)
 {
-    sockaddr_in dst{};
-    dst.sin_family = AF_INET;
-    dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    dst.sin_port = htons(static_cast<u_short>(aida_test_proto_re_descriptor.listen_port));
-
     std::uint8_t buffer[kMaxPacket] = {};
     while (running_now()) {
-        std::uint32_t emitted = emit_capture_impl(&g_context, buffer, sizeof(buffer));
+        std::uint32_t emitted = aida_test_proto_serialize_frame(&g_context, buffer, sizeof(buffer));
         if (emitted != 0) {
-            const int sent = sendto(g_sender, reinterpret_cast<const char*>(buffer), emitted, 0, reinterpret_cast<const sockaddr*>(&dst), sizeof(dst));
+            const int sent = aida_test_proto_send_wrapper(static_cast<std::uintptr_t>(g_sender), buffer, emitted, aida_test_proto_re_descriptor.listen_port);
             if (sent > 0) {
-                ++aida_test_proto_re_descriptor.packets_sent;
                 ++aida_test_proto_re_descriptor.framed_packets_sent;
-                aida_test_proto_re_descriptor.bytes_sent += static_cast<std::uint64_t>(sent);
             }
         }
 
         emitted = build_enet_packet(buffer, sizeof(buffer), g_context.sequence);
         if (emitted != 0) {
-            const int sent = sendto(g_sender, reinterpret_cast<const char*>(buffer), emitted, 0, reinterpret_cast<const sockaddr*>(&dst), sizeof(dst));
+            const int sent = aida_test_proto_send_wrapper(static_cast<std::uintptr_t>(g_sender), buffer, emitted, aida_test_proto_re_descriptor.listen_port);
             if (sent > 0) {
-                ++aida_test_proto_re_descriptor.packets_sent;
                 ++aida_test_proto_re_descriptor.enet_packets_sent;
-                aida_test_proto_re_descriptor.bytes_sent += static_cast<std::uint64_t>(sent);
             }
         }
 
@@ -241,6 +237,38 @@ void reset_descriptor()
     aida_test_proto_re_descriptor.marker_va = reinterpret_cast<std::uint64_t>(kMarker);
     aida_test_proto_re_descriptor.marker_size = static_cast<std::uint32_t>(sizeof(kMarker) - 1u);
     aida_test_proto_re_descriptor.emit_fn_va = reinterpret_cast<std::uint64_t>(&aida_test_proto_emit_capture);
+    aida_test_proto_re_descriptor.packets_sent = 0;
+    aida_test_proto_re_descriptor.framed_packets_sent = 0;
+    aida_test_proto_re_descriptor.enet_packets_sent = 0;
+    aida_test_proto_re_descriptor.bytes_sent = 0;
+    aida_test_proto_re_descriptor.packets_received = 0;
+    aida_test_proto_re_descriptor.bytes_received = 0;
+    aida_test_proto_re_descriptor.send_wrapper_fn_va = reinterpret_cast<std::uint64_t>(&aida_test_proto_send_wrapper);
+    aida_test_proto_re_descriptor.recv_wrapper_fn_va = reinterpret_cast<std::uint64_t>(&aida_test_proto_recv_wrapper);
+    aida_test_proto_re_descriptor.serializer_fn_va = reinterpret_cast<std::uint64_t>(&aida_test_proto_serialize_frame);
+    aida_test_proto_re_descriptor.deserializer_fn_va = reinterpret_cast<std::uint64_t>(&aida_test_proto_recv_wrapper);
+    aida_test_proto_re_descriptor.deterministic_emit_fn_va = reinterpret_cast<std::uint64_t>(&aida_test_proto_emit_deterministic);
+    std::uint64_t lo = aida_test_proto_re_descriptor.send_wrapper_fn_va;
+    if (aida_test_proto_re_descriptor.recv_wrapper_fn_va < lo)
+        lo = aida_test_proto_re_descriptor.recv_wrapper_fn_va;
+    if (aida_test_proto_re_descriptor.serializer_fn_va < lo)
+        lo = aida_test_proto_re_descriptor.serializer_fn_va;
+    if (aida_test_proto_re_descriptor.deterministic_emit_fn_va < lo)
+        lo = aida_test_proto_re_descriptor.deterministic_emit_fn_va;
+    std::uint64_t hi = aida_test_proto_re_descriptor.send_wrapper_fn_va;
+    if (aida_test_proto_re_descriptor.recv_wrapper_fn_va > hi)
+        hi = aida_test_proto_re_descriptor.recv_wrapper_fn_va;
+    if (aida_test_proto_re_descriptor.serializer_fn_va > hi)
+        hi = aida_test_proto_re_descriptor.serializer_fn_va;
+    if (aida_test_proto_re_descriptor.deterministic_emit_fn_va > hi)
+        hi = aida_test_proto_re_descriptor.deterministic_emit_fn_va;
+    aida_test_proto_re_descriptor.scan_range_va = lo;
+    aida_test_proto_re_descriptor.scan_range_size = hi >= lo ? static_cast<std::uint32_t>((hi - lo) + 768u) : 0u;
+    aida_test_proto_re_descriptor.expected_packets_per_emit = 2;
+    g_last_send_tick = 0;
+    g_last_recv_tick = 0;
+    aida_test_proto_re_descriptor.last_send_tick_va = reinterpret_cast<std::uint64_t>(&g_last_send_tick);
+    aida_test_proto_re_descriptor.last_recv_tick_va = reinterpret_cast<std::uint64_t>(&g_last_recv_tick);
 }
 
 }
@@ -250,8 +278,8 @@ void init(const config_t& cfg, std::atomic<bool>& running)
     g_cfg = cfg;
     if (g_cfg.rate_ms < 50)
         g_cfg.rate_ms = 50;
-    if (g_cfg.rate_ms > 5000)
-        g_cfg.rate_ms = 5000;
+    if (g_cfg.rate_ms > 50)
+        g_cfg.rate_ms = 50;
     g_running = &running;
     reset_descriptor();
     aida_test_proto_re_descriptor.rate_ms = g_cfg.rate_ms;
@@ -298,28 +326,45 @@ void init(const config_t& cfg, std::atomic<bool>& running)
     send_addr.sin_family = AF_INET;
     send_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     send_addr.sin_port = 0;
-    bind(g_sender, reinterpret_cast<const sockaddr*>(&send_addr), sizeof(send_addr));
+    if (bind(g_sender, reinterpret_cast<const sockaddr*>(&send_addr), sizeof(send_addr)) == SOCKET_ERROR) {
+        shutdown_all();
+        return;
+    }
     sockaddr_in send_actual{};
     int send_actual_len = sizeof(send_actual);
-    getsockname(g_sender, reinterpret_cast<sockaddr*>(&send_actual), &send_actual_len);
+    if (getsockname(g_sender, reinterpret_cast<sockaddr*>(&send_actual), &send_actual_len) == SOCKET_ERROR) {
+        shutdown_all();
+        return;
+    }
 
     u_long nonblock = 1;
-    ioctlsocket(g_receiver, FIONBIO, &nonblock);
+    if (ioctlsocket(g_receiver, FIONBIO, &nonblock) == SOCKET_ERROR) {
+        shutdown_all();
+        return;
+    }
 
     aida_test_proto_re_descriptor.listen_port = ntohs(actual.sin_port);
     aida_test_proto_re_descriptor.send_port = ntohs(send_actual.sin_port);
     g_local_running.store(true, std::memory_order_release);
+    (void)aida_test_proto_emit_deterministic(3);
     g_worker = CreateThread(nullptr, 0, worker_thread, nullptr, 0, &g_worker_tid);
     if (g_worker)
         aida_test_proto_re_descriptor.worker_thread_id = g_worker_tid;
 
     if (cfg.verbose) {
-        printf("[proto-re] descriptor=%p ctx=%p listen=127.0.0.1:%u sender_port=%u worker=%lu\n",
+        printf("[proto-re] descriptor=%p ctx=%p listen=127.0.0.1:%u sender_port=%u worker=%lu send_wrapper=%p recv_wrapper=%p serializer=%p scan=0x%llX/%u packets=%llu recv=%llu\n",
                &aida_test_proto_re_descriptor,
                &g_context,
                aida_test_proto_re_descriptor.listen_port,
                aida_test_proto_re_descriptor.send_port,
-               static_cast<unsigned long>(g_worker_tid));
+               static_cast<unsigned long>(g_worker_tid),
+               reinterpret_cast<void*>(aida_test_proto_re_descriptor.send_wrapper_fn_va),
+               reinterpret_cast<void*>(aida_test_proto_re_descriptor.recv_wrapper_fn_va),
+               reinterpret_cast<void*>(aida_test_proto_re_descriptor.serializer_fn_va),
+               static_cast<unsigned long long>(aida_test_proto_re_descriptor.scan_range_va),
+               aida_test_proto_re_descriptor.scan_range_size,
+               static_cast<unsigned long long>(aida_test_proto_re_descriptor.packets_sent),
+               static_cast<unsigned long long>(aida_test_proto_re_descriptor.packets_received));
         fflush(stdout);
     }
 }
@@ -357,6 +402,39 @@ std::uint32_t emit_capture_public_impl(void* ctx, std::uint8_t* buffer, std::uin
     return emit_capture_impl(ctx, buffer, size);
 }
 
+std::uint32_t emit_deterministic_impl(std::uint32_t burst_count) noexcept
+{
+    if (g_sender == INVALID_SOCKET || g_receiver == INVALID_SOCKET)
+        return 0;
+    if (burst_count == 0)
+        burst_count = 1;
+    if (burst_count > 64)
+        burst_count = 64;
+
+    std::uint32_t sent_packets = 0;
+    std::uint8_t buffer[kMaxPacket] = {};
+    for (std::uint32_t i = 0; i < burst_count; ++i) {
+        std::uint32_t emitted = aida_test_proto_serialize_frame(&g_context, buffer, sizeof(buffer));
+        if (emitted != 0) {
+            const int sent = aida_test_proto_send_wrapper(static_cast<std::uintptr_t>(g_sender), buffer, emitted, aida_test_proto_re_descriptor.listen_port);
+            if (sent > 0) {
+                ++aida_test_proto_re_descriptor.framed_packets_sent;
+                ++sent_packets;
+            }
+        }
+        emitted = build_enet_packet(buffer, sizeof(buffer), g_context.sequence + i);
+        if (emitted != 0) {
+            const int sent = aida_test_proto_send_wrapper(static_cast<std::uintptr_t>(g_sender), buffer, emitted, aida_test_proto_re_descriptor.listen_port);
+            if (sent > 0) {
+                ++aida_test_proto_re_descriptor.enet_packets_sent;
+                ++sent_packets;
+            }
+        }
+        drain_receiver();
+    }
+    return sent_packets;
+}
+
 }
 }
 
@@ -375,3 +453,49 @@ extern "C" __declspec(dllexport) __declspec(noinline) std::uint32_t aida_test_pr
 {
     return test_target::protocol_re::emit_capture_public_impl(ctx, buffer, size);
 }
+
+#pragma code_seg(push, ".text$aa")
+extern "C" __declspec(dllexport) __declspec(noinline) std::uint32_t aida_test_proto_serialize_frame(void* ctx, std::uint8_t* buffer, std::uint32_t size) noexcept
+{
+    return test_target::protocol_re::serialize_frame_impl(ctx, buffer, size);
+}
+
+extern "C" __declspec(dllexport) __declspec(noinline) int aida_test_proto_send_wrapper(std::uintptr_t socket_value, const std::uint8_t* buffer, std::uint32_t size, std::uint32_t port) noexcept
+{
+    const SOCKET s = static_cast<SOCKET>(socket_value);
+    if (s == INVALID_SOCKET || !buffer || size == 0)
+        return SOCKET_ERROR;
+    sockaddr_in dst{};
+    dst.sin_family = AF_INET;
+    dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    dst.sin_port = htons(static_cast<u_short>(port));
+    const int sent = sendto(s, reinterpret_cast<const char*>(buffer), static_cast<int>(size), 0, reinterpret_cast<const sockaddr*>(&dst), sizeof(dst));
+    if (sent > 0) {
+        ++aida_test_proto_re_descriptor.packets_sent;
+        aida_test_proto_re_descriptor.bytes_sent += static_cast<std::uint64_t>(sent);
+        test_target::protocol_re::g_last_send_tick = GetTickCount64();
+    }
+    return sent;
+}
+
+extern "C" __declspec(dllexport) __declspec(noinline) int aida_test_proto_recv_wrapper(std::uintptr_t socket_value, std::uint8_t* buffer, std::uint32_t size) noexcept
+{
+    const SOCKET s = static_cast<SOCKET>(socket_value);
+    if (s == INVALID_SOCKET || !buffer || size == 0)
+        return SOCKET_ERROR;
+    sockaddr_in from{};
+    int from_len = sizeof(from);
+    const int got = recvfrom(s, reinterpret_cast<char*>(buffer), static_cast<int>(size), 0, reinterpret_cast<sockaddr*>(&from), &from_len);
+    if (got > 0) {
+        ++aida_test_proto_re_descriptor.packets_received;
+        aida_test_proto_re_descriptor.bytes_received += static_cast<std::uint64_t>(got);
+        test_target::protocol_re::g_last_recv_tick = GetTickCount64();
+    }
+    return got;
+}
+
+extern "C" __declspec(dllexport) __declspec(noinline) std::uint32_t aida_test_proto_emit_deterministic(std::uint32_t burst_count) noexcept
+{
+    return test_target::protocol_re::emit_deterministic_impl(burst_count);
+}
+#pragma code_seg(pop)

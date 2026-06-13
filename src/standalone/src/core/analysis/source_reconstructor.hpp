@@ -22,6 +22,7 @@
 #include "pe_parser.hpp"
 #include "ghidra_decompiler.hpp"
 #include "zydis_disasm.hpp"
+#include "../../helpers/diag_log.hpp"
 
 #include <Zydis/Zydis.h>
 
@@ -688,7 +689,11 @@ inline void generate_module_map_json(
 }
 
 inline void reconstruct(const reconstruction_config_t& config) {
-	if (g_state.running.load(std::memory_order_acquire)) return;
+	if (g_state.running.load(std::memory_order_acquire)) {
+		diag::log_tagged_fmt("source_recon", "reconstruct_rejected reason=already_running module=%s base=%s",
+			config.module_name.c_str(), detail::to_hex(config.module_base).c_str());
+		return;
+	}
 
 	g_state.running.store(true, std::memory_order_release);
 	g_state.cancel_requested.store(false, std::memory_order_release);
@@ -705,7 +710,15 @@ inline void reconstruct(const reconstruction_config_t& config) {
 		g_state.last_result.module_size = config.module_size;
 	}
 
-	work_queue::post([config]() {
+	const bool posted = work_queue::post([config]() {
+		const uint64_t worker_start_ms = GetTickCount64();
+		diag::log_tagged_fmt("source_recon",
+			"worker_enter module=%s base=%s size=%u max_functions=%d tid=%lu",
+			config.module_name.c_str(),
+			detail::to_hex(config.module_base).c_str(),
+			static_cast<unsigned>(config.module_size),
+			config.max_functions,
+			GetCurrentThreadId());
 		reconstruction_result_t result;
 		result.output_dir = config.output_dir;
 		result.module_name = config.module_name;
@@ -715,6 +728,16 @@ inline void reconstruct(const reconstruction_config_t& config) {
 		auto finish = [&](bool success, const std::string& err = "") {
 			result.success = success;
 			result.error = err;
+			diag::log_tagged_fmt("source_recon",
+				"worker_finish success=%d error='%s' total=%d decompiled=%d modules=%d files=%zu elapsed_ms=%llu cancel=%d",
+				success ? 1 : 0,
+				err.c_str(),
+				result.total_functions,
+				result.decompiled_functions,
+				result.modules_created,
+				result.files_created.size(),
+				static_cast<unsigned long long>(GetTickCount64() - worker_start_ms),
+				g_state.cancel_requested.load(std::memory_order_acquire) ? 1 : 0);
 			{
 				std::lock_guard<std::mutex> lk(g_state.mutex);
 				g_state.last_result = result;
@@ -725,6 +748,7 @@ inline void reconstruct(const reconstruction_config_t& config) {
 			g_state.running.store(false, std::memory_order_release);
 		};
 
+		try {
 		std::filesystem::path out_dir(config.output_dir);
 		{
 			std::error_code mkdir_ec;
@@ -801,6 +825,18 @@ inline void reconstruct(const reconstruction_config_t& config) {
 			std::lock_guard<std::mutex> lk(g_state.mutex);
 			g_state.last_result.preload = preload_diag;
 		}
+		diag::log_tagged_fmt("source_recon",
+			"preload_exit ok=%d base=%s size=%u bytes=%zu chunks_ok=%zu chunks_failed=%zu query_failed=%zu mz=%d pe=%d elapsed_ms=%llu",
+			preloaded ? 1 : 0,
+			detail::to_hex(config.module_base).c_str(),
+			static_cast<unsigned>(config.module_size),
+			preload_diag.total_read,
+			preload_diag.chunks_ok,
+			preload_diag.chunks_failed,
+			preload_diag.query_failed,
+			preload_diag.mz ? 1 : 0,
+			preload_diag.pe_header_ok ? 1 : 0,
+			static_cast<unsigned long long>(GetTickCount64() - worker_start_ms));
 
 		if (!preloaded) {
 			char preload_msg[512];
@@ -821,6 +857,8 @@ inline void reconstruct(const reconstruction_config_t& config) {
 
 		if (detail::cancelled()) { finish(false, "Cancelled."); return; }
 
+		detail::set_status("Preloaded module memory. Preparing decompile batch...");
+		g_state.progress.store(0.065f);
 
 		std::vector<uint64_t> entries;
 		entries.reserve(funcs.size());
@@ -828,52 +866,161 @@ inline void reconstruct(const reconstruction_config_t& config) {
 			entries.push_back(fi.address);
 
 
-		std::atomic<int> decompile_count{0};
+		auto decompile_count = std::make_shared<std::atomic<int>>(0);
 		const int total = static_cast<int>(funcs.size());
 
 
-		std::atomic<bool> progress_done{false};
-		std::thread progress_thread([&]() {
-			while (!progress_done.load(std::memory_order_acquire)) {
-				int done = decompile_count.load(std::memory_order_relaxed);
-				float pct = 0.07f + 0.63f * (static_cast<float>(done) / static_cast<float>(total));
-				g_state.progress.store(pct);
-
-				char dmsg[256];
-				snprintf(dmsg, sizeof(dmsg), "Decompiling %d / %d (parallel)", done, total);
-				detail::set_status(dmsg);
-
-				{
-					std::lock_guard<std::mutex> lk(g_state.mutex);
-					g_state.last_result.decompiled_functions = done;
-				}
-
-				std::this_thread::sleep_for(std::chrono::milliseconds(50));
+		auto progress_done = std::make_shared<std::atomic<bool>>(false);
+		struct progress_done_guard_t {
+			std::shared_ptr<std::atomic<bool>> done;
+			~progress_done_guard_t() {
+				if (done)
+					done->store(true, std::memory_order_release);
 			}
-		});
+		} progress_guard{progress_done};
+		auto publish_progress = [decompile_count, total]() {
+			int done = decompile_count->load(std::memory_order_relaxed);
+			float pct = 0.07f + 0.63f * (static_cast<float>(done) / static_cast<float>(total));
+			g_state.progress.store(pct);
+
+			char dmsg[256];
+			snprintf(dmsg, sizeof(dmsg), "Decompiling %d / %d (parallel)", done, total);
+			detail::set_status(dmsg);
+			{
+				std::lock_guard<std::mutex> lk(g_state.mutex);
+				g_state.last_result.decompiled_functions = done;
+			}
+		};
+		auto make_progress_task = [progress_done, decompile_count, total]() {
+			return [progress_done, decompile_count, total]() {
+				while (!progress_done->load(std::memory_order_acquire)) {
+					int done = decompile_count->load(std::memory_order_relaxed);
+					float pct = 0.07f + 0.63f * (static_cast<float>(done) / static_cast<float>(total));
+					g_state.progress.store(pct);
+
+					char dmsg[256];
+					snprintf(dmsg, sizeof(dmsg), "Decompiling %d / %d (parallel)", done, total);
+					detail::set_status(dmsg);
+					{
+						std::lock_guard<std::mutex> lk(g_state.mutex);
+						g_state.last_result.decompiled_functions = done;
+					}
+					std::this_thread::sleep_for(std::chrono::milliseconds(50));
+				}
+			};
+		};
+		auto wq_before_progress = work_queue::stats();
+		auto sq_before_progress = work_queue::service_stats();
+		diag::log_tagged_fmt("source_recon",
+			"progress_updater_schedule_begin total=%d work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu",
+			total,
+			wq_before_progress.pending,
+			wq_before_progress.active,
+			static_cast<unsigned long long>(wq_before_progress.rejected),
+			sq_before_progress.pending,
+			sq_before_progress.active,
+			static_cast<unsigned long long>(sq_before_progress.rejected));
+		bool progress_posted = false;
+		const char* progress_queue = "none";
+		try {
+			progress_posted = work_queue::post_service(make_progress_task());
+			if (progress_posted)
+				progress_queue = "service";
+		} catch (const std::exception& ex) {
+			diag::log_tagged_fmt("source_recon",
+				"progress_updater_schedule_exception queue=service total=%d err=%s",
+				total,
+				ex.what());
+		} catch (...) {
+			diag::log_tagged_fmt("source_recon",
+				"progress_updater_schedule_exception queue=service total=%d err=<unknown>",
+				total);
+		}
+		if (!progress_posted) {
+			try {
+				progress_posted = work_queue::post(make_progress_task());
+				if (progress_posted)
+					progress_queue = "work";
+			} catch (const std::exception& ex) {
+				diag::log_tagged_fmt("source_recon",
+					"progress_updater_schedule_exception queue=work total=%d err=%s",
+					total,
+					ex.what());
+			} catch (...) {
+				diag::log_tagged_fmt("source_recon",
+					"progress_updater_schedule_exception queue=work total=%d err=<unknown>",
+					total);
+			}
+		}
+		auto wq_after_progress = work_queue::stats();
+		auto sq_after_progress = work_queue::service_stats();
+		diag::log_tagged_fmt("source_recon",
+			"progress_updater_schedule_end posted=%d queue=%s total=%d work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu",
+			progress_posted ? 1 : 0,
+			progress_queue,
+			total,
+			wq_after_progress.pending,
+			wq_after_progress.active,
+			static_cast<unsigned long long>(wq_after_progress.rejected),
+			sq_after_progress.pending,
+			sq_after_progress.active,
+			static_cast<unsigned long long>(sq_after_progress.rejected));
+		if (!progress_posted) {
+			diag::log_tagged_fmt("source_recon",
+				"progress_updater_inline_fallback total=%d work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu",
+				total,
+				wq_after_progress.pending,
+				wq_after_progress.active,
+				static_cast<unsigned long long>(wq_after_progress.rejected),
+				sq_after_progress.pending,
+				sq_after_progress.active,
+				static_cast<unsigned long long>(sq_after_progress.rejected));
+			publish_progress();
+		}
 
 
 		std::vector<ghidra_decompiler::ghidra_result_t> batch_results;
+		diag::log_tagged_fmt("source_recon",
+			"batch_decompile_enter entries=%zu buffer_size=%zu base=%s decompiled_before=%d cancel=%d",
+			entries.size(),
+			module_mem.size(),
+			detail::to_hex(config.module_base).c_str(),
+			decompile_count->load(std::memory_order_relaxed),
+			g_state.cancel_requested.load(std::memory_order_acquire) ? 1 : 0);
 		ghidra_decompiler::batch_decompile(
 			module_mem.data(), module_mem.size(), config.module_base,
-			entries, batch_results, &decompile_count, &g_state.cancel_requested);
+			entries, batch_results, decompile_count.get(), &g_state.cancel_requested);
+		diag::log_tagged_fmt("source_recon",
+			"batch_decompile_exit entries=%zu results=%zu decompile_count=%d cancel=%d elapsed_ms=%llu",
+			entries.size(),
+			batch_results.size(),
+			decompile_count->load(std::memory_order_relaxed),
+			g_state.cancel_requested.load(std::memory_order_acquire) ? 1 : 0,
+			static_cast<unsigned long long>(GetTickCount64() - worker_start_ms));
 
-		progress_done.store(true, std::memory_order_release);
-		if (progress_thread.joinable())
-			progress_thread.join();
+		progress_done->store(true, std::memory_order_release);
+		if (!progress_posted)
+			publish_progress();
 
-
-		for (size_t i = 0; i < funcs.size() && i < batch_results.size(); ++i) {
-			auto& r = batch_results[i];
-			if (r.complete && !r.is_error && !r.pseudocode.empty()) {
+		int successful_decompiles = 0;
+		int failed_decompiles = 0;
+		for (size_t i = 0; i < funcs.size(); ++i) {
+			const bool has_result = i < batch_results.size();
+			if (has_result &&
+				batch_results[i].complete &&
+				!batch_results[i].is_error &&
+				!batch_results[i].pseudocode.empty()) {
+				auto& r = batch_results[i];
 				funcs[i].pseudocode = std::move(r.pseudocode);
 				funcs[i].decompiled = true;
+				++successful_decompiles;
 				if (!r.function_name.empty() && r.function_name.find("FUN_") != 0)
 					funcs[i].name = detail::sanitize_name(r.function_name);
 			} else {
 
 				funcs[i].hostile = true;
 				funcs[i].decompiled = false;
+				++failed_decompiles;
 
 				std::vector<uint8_t> asm_mem;
 
@@ -922,14 +1069,26 @@ inline void reconstruct(const reconstruction_config_t& config) {
 
 		{
 			std::lock_guard<std::mutex> lk(g_state.mutex);
-			g_state.last_result.decompiled_functions = static_cast<int>(funcs.size());
+			g_state.last_result.decompiled_functions = successful_decompiles;
 		}
+		diag::log_tagged_fmt("source_recon",
+			"batch_decompile_accounted total=%zu success=%d failed=%d missing_results=%zu",
+			funcs.size(),
+			successful_decompiles,
+			failed_decompiles,
+			batch_results.size() < funcs.size() ? funcs.size() - batch_results.size() : 0);
 
 		if (detail::cancelled()) { finish(false, "Cancelled."); return; }
 
-		result.decompiled_functions = 0;
-		for (auto& fi : funcs)
-			if (fi.decompiled) result.decompiled_functions++;
+		result.decompiled_functions = successful_decompiles;
+		if (result.decompiled_functions <= 0) {
+			detail::set_status("Ghidra produced fallback-only reconstruction.");
+			diag::log_tagged_fmt("source_recon",
+				"batch_decompile_fallback_only total=%zu failed=%d missing_results=%zu",
+				funcs.size(),
+				failed_decompiles,
+				batch_results.size() < funcs.size() ? funcs.size() - batch_results.size() : 0);
+		}
 
 		detail::set_stage(stage_t::cluster);
 		detail::set_status("Extracting call graph...");
@@ -1022,7 +1181,52 @@ inline void reconstruct(const reconstruction_config_t& config) {
 		result.total_functions = static_cast<int>(funcs.size());
 
 		finish(true);
+		} catch (const std::exception& ex) {
+			diag::log_tagged_fmt("source_recon",
+				"worker_exception kind=std module=%s base=%s size=%u stage=%d progress=%.3f elapsed_ms=%llu err=%s",
+				config.module_name.c_str(),
+				detail::to_hex(config.module_base).c_str(),
+				static_cast<unsigned>(config.module_size),
+				g_state.stage.load(std::memory_order_acquire),
+				static_cast<double>(g_state.progress.load(std::memory_order_acquire)),
+				static_cast<unsigned long long>(GetTickCount64() - worker_start_ms),
+				ex.what());
+			try {
+				finish(false, std::string("Unhandled reconstruction exception: ") + ex.what());
+			} catch (...) {
+				detail::set_stage(stage_t::failed);
+				g_state.running.store(false, std::memory_order_release);
+			}
+		} catch (...) {
+			diag::log_tagged_fmt("source_recon",
+				"worker_exception kind=unknown module=%s base=%s size=%u stage=%d progress=%.3f elapsed_ms=%llu",
+				config.module_name.c_str(),
+				detail::to_hex(config.module_base).c_str(),
+				static_cast<unsigned>(config.module_size),
+				g_state.stage.load(std::memory_order_acquire),
+				static_cast<double>(g_state.progress.load(std::memory_order_acquire)),
+				static_cast<unsigned long long>(GetTickCount64() - worker_start_ms));
+			try {
+				finish(false, "Unhandled reconstruction exception.");
+			} catch (...) {
+				detail::set_stage(stage_t::failed);
+				g_state.running.store(false, std::memory_order_release);
+			}
+		}
 	});
+	if (!posted) {
+		diag::log_tagged_fmt("source_recon",
+			"reconstruct_post_failed module=%s base=%s size=%u",
+			config.module_name.c_str(),
+			detail::to_hex(config.module_base).c_str(),
+			static_cast<unsigned>(config.module_size));
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		g_state.last_result.success = false;
+		g_state.last_result.error = "Failed to schedule reconstruction worker.";
+		g_state.status_text = "Failed: Failed to schedule reconstruction worker.";
+		g_state.stage.store(static_cast<int>(stage_t::failed), std::memory_order_release);
+		g_state.running.store(false, std::memory_order_release);
+	}
 }
 
 }

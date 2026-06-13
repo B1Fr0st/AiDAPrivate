@@ -360,11 +360,32 @@ static void ZeroUninitializedSectionsSelf(PVOID self_anchor)
     }
 }
 
+namespace whoswho_build_identity {
+    constexpr unsigned long long fnv1a64(const char* text) {
+        unsigned long long h = 14695981039346656037ull;
+        while (*text) {
+            h ^= static_cast<unsigned char>(*text);
+            h *= 1099511628211ull;
+            ++text;
+        }
+        return h;
+    }
+
+    constexpr unsigned long long kHash = fnv1a64("WhosWho|" __DATE__ "|" __TIME__ "|" __FILE__);
+}
+
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
 
     dbg_capture::write_immediate_formatted("[WW-EARLY] DriverEntry entered driver_object_present=%u registry_path_present=%u\n",
         DriverObject != nullptr ? 1u : 0u,
         RegistryPath != nullptr ? 1u : 0u);
+    dbg_capture::write_immediate_formatted("[WW-EARLY] build_identity hash=0x%llX date=%s time=%s msc=%u cpp=%lu entry=%p\n",
+        whoswho_build_identity::kHash,
+        __DATE__,
+        __TIME__,
+        (unsigned)_MSC_VER,
+        (unsigned long)__cplusplus,
+        reinterpret_cast<PVOID>(&DriverEntry));
     ZeroUninitializedSectionsSelf(reinterpret_cast<PVOID>(&DriverEntry));
     dbg_capture::write_immediate_formatted("[WW-EARLY] SetupFunctions begin\n");
 
@@ -378,6 +399,15 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     dbg_capture::initialize();
 
     WW_LOG("DriverEntry: SetupFunctions OK");
+    WW_LOG("DriverEntry: build_identity hash=0x%llX date=%s time=%s msc=%u cpp=%lu entry=%p driver_object=%p registry_path_present=%u",
+        whoswho_build_identity::kHash,
+        __DATE__,
+        __TIME__,
+        (unsigned)_MSC_VER,
+        (unsigned long)__cplusplus,
+        reinterpret_cast<PVOID>(&DriverEntry),
+        DriverObject,
+        RegistryPath != nullptr ? 1u : 0u);
 
     if (!device_names::initialize_names()) {
         WW_LOG("DriverEntry: initialize_names FAILED");
@@ -451,7 +481,11 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     if (DriverObject->DriverSection) {
         auto ldr = static_cast<PLDR_DATA_TABLE_ENTRY>(DriverObject->DriverSection);
         PVOID base = ldr->DllBase;
-        WW_LOG("DriverEntry: DriverSection base_present=%u SizeOfImage=0x%lx", base != nullptr ? 1u : 0u, ldr->SizeOfImage);
+        WW_LOG("DriverEntry: DriverSection base_present=%u SizeOfImage=0x%lx build_hash=0x%llX image_base=%p",
+            base != nullptr ? 1u : 0u,
+            ldr->SizeOfImage,
+            whoswho_build_identity::kHash,
+            base);
         if (base && _MmIsAddressValid(base)) {
             PIMAGE_DOS_HEADER dos = static_cast<PIMAGE_DOS_HEADER>(base);
             if (dos->e_magic == IMAGE_DOS_SIGNATURE) {

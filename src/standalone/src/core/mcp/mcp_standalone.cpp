@@ -1851,6 +1851,88 @@ void server_t::server_thread_func(int port)
         res.set_content("{}", "application/json");
     });
 
+    svr.Post("/ida-plugin-auth", [this](const httplib::Request& req, httplib::Response& res) {
+        const std::uint64_t t0 = mcp_now_ms();
+        diag::log_tagged_fmt("mcp_srv",
+            "ida_plugin_auth_entry remote=%s pid=%lu tid=%lu body_len=%zu",
+            remote_endpoint(req).c_str(),
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            req.body.size());
+
+        json request = json::parse(req.body, nullptr, false);
+        if (request.is_discarded() || !request.is_object())
+        {
+            res.status = 400;
+            res.set_content(R"({"status":"error","reason":"invalid_json"})", "application/json");
+            return;
+        }
+
+        uint32_t plugin_pid = 0;
+        if (request.contains("plugin_pid") && request["plugin_pid"].is_number_unsigned())
+            plugin_pid = request["plugin_pid"].get<uint32_t>();
+        else if (request.contains("plugin_pid") && request["plugin_pid"].is_number_integer())
+        {
+            int64_t signed_pid = request["plugin_pid"].get<int64_t>();
+            if (signed_pid > 0 && signed_pid <= 0xFFFFFFFFll)
+                plugin_pid = static_cast<uint32_t>(signed_pid);
+        }
+
+        std::string reason;
+        const bool lifecycle_ready = lifecycle_authorized(&reason);
+        std::string missing_exports;
+        const bool exports_ok = standalone_license::is_arc_loaded()
+            && standalone_license::validate_arc_required_exports(missing_exports);
+        if (!lifecycle_ready || !exports_ok)
+        {
+            json deny;
+            deny["status"] = "error";
+            deny["reason"] = !reason.empty() ? reason : (missing_exports.empty() ? "runtime_not_authorized" : missing_exports);
+            deny["validated"] = standalone_license::is_valid();
+            deny["arc_loaded"] = standalone_license::is_arc_loaded();
+            deny["lifecycle_ready"] = g_ide_lifecycle_ready.load(std::memory_order_acquire);
+            deny["exports_verified"] = exports_ok;
+            res.status = 403;
+            res.set_content(json_dump_safe(deny), "application/json");
+            diag::log_tagged_fmt("mcp_srv",
+                "ida_plugin_auth_denied reason=%.160s elapsed_ms=%llu",
+                deny.value("reason", std::string()).c_str(),
+                static_cast<unsigned long long>(mcp_now_ms() - t0));
+            return;
+        }
+
+        std::string proof_json;
+        std::string proof_error;
+        if (!standalone_license::build_ida_plugin_auth_proof(
+                request.value("challenge", std::string()),
+                plugin_pid,
+                static_cast<uint32_t>(_port),
+                g_ide_lifecycle_ready.load(std::memory_order_acquire),
+                exports_ok,
+                proof_json,
+                proof_error))
+        {
+            json deny;
+            deny["status"] = "error";
+            deny["reason"] = proof_error.empty() ? "proof_unavailable" : proof_error;
+            res.status = 403;
+            res.set_content(json_dump_safe(deny), "application/json");
+            diag::log_tagged_fmt("mcp_srv",
+                "ida_plugin_auth_proof_failed reason=%.160s elapsed_ms=%llu",
+                deny.value("reason", std::string()).c_str(),
+                static_cast<unsigned long long>(mcp_now_ms() - t0));
+            return;
+        }
+
+        res.status = 200;
+        res.set_content(proof_json, "application/json");
+        diag::log_tagged_fmt("mcp_srv",
+            "ida_plugin_auth_exit status=%d elapsed_ms=%llu remote=%s",
+            res.status,
+            static_cast<unsigned long long>(mcp_now_ms() - t0),
+            remote_endpoint(req).c_str());
+    });
+
     svr.Get("/health", [this](const httplib::Request& req, httplib::Response& res) {
         const std::uint64_t t0 = mcp_now_ms();
         diag::log_tagged_fmt("mcp_srv",

@@ -1,6 +1,9 @@
 #include "aida_pro.hpp"
 #include "ida_utils.hpp"
 #include "instance_registry.hpp"
+#ifdef __NT__
+#include "aida_ipc.hpp"
+#endif
 
 #include <queue>
 #include <deque>
@@ -2114,14 +2117,13 @@ int mcp_server_t::get_port() const
 
 bool mcp_server_t::start(int port)
 {
+#ifdef __NT__
+    if (!aida_ipc::is_standalone_alive())
     {
-        auto& lm = license_manager_t::instance();
-        if (!lm.is_valid() || lm.get_runtime_nonce() == 0)
-        {
-            msg(OBFSTR_C("AiDA MCP: Cannot start — license not active.\n"));
-            return false;
-        }
+        msg(OBFSTR_C("AiDA MCP: Cannot start - AiDAStandalone.exe is not authenticated.\n"));
+        return false;
     }
+#endif
 
     if (_running.load())
     {

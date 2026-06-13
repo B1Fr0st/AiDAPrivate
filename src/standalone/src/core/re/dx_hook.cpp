@@ -2,6 +2,7 @@
 
 #include "artifact_store.hpp"
 #include "../infra/work_queue.hpp"
+#include "../../helpers/diag_log.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -22,6 +23,8 @@
 #include <thread>
 
 #pragma comment(lib, "gdiplus.lib")
+
+extern ID3D11Device* g_pd3dDevice;
 
 namespace re::dx_hook
 {
@@ -55,23 +58,95 @@ std::string api_param(const json& params)
     return api;
 }
 
-std::uint64_t module_base_local(const char* name)
+std::uint64_t module_base_local(const char* name, bool allow_load = true)
 {
+    const std::uint64_t started_ms = GetTickCount64();
+    diag::log_tagged_fmt("dx_hook", "module_base_local enter pid=%lu tid=%lu module=%s allow_load=%d",
+                         static_cast<unsigned long>(GetCurrentProcessId()),
+                         static_cast<unsigned long>(GetCurrentThreadId()),
+                         name ? name : "",
+                         allow_load ? 1 : 0);
     HMODULE mod = GetModuleHandleA(name);
+    diag::log_tagged_fmt("dx_hook", "module_base_local getmodule pid=%lu tid=%lu module=%s base=%s gle=%lu elapsed_ms=%llu",
+                         static_cast<unsigned long>(GetCurrentProcessId()),
+                         static_cast<unsigned long>(GetCurrentThreadId()),
+                         name ? name : "",
+                         sa_format_address(reinterpret_cast<std::uint64_t>(mod)).c_str(),
+                         static_cast<unsigned long>(GetLastError()),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     if (!mod)
+    {
+        if (!allow_load)
+        {
+            diag::log_tagged_fmt("dx_hook", "module_base_local no_load pid=%lu tid=%lu module=%s elapsed_ms=%llu",
+                                 static_cast<unsigned long>(GetCurrentProcessId()),
+                                 static_cast<unsigned long>(GetCurrentThreadId()),
+                                 name ? name : "",
+                                 static_cast<unsigned long long>(GetTickCount64() - started_ms));
+            return 0;
+        }
+        SetLastError(ERROR_SUCCESS);
+        diag::log_tagged_fmt("dx_hook", "module_base_local load_begin pid=%lu tid=%lu module=%s elapsed_ms=%llu",
+                             static_cast<unsigned long>(GetCurrentProcessId()),
+                             static_cast<unsigned long>(GetCurrentThreadId()),
+                             name ? name : "",
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
         mod = LoadLibraryA(name);
+        diag::log_tagged_fmt("dx_hook", "module_base_local load_end pid=%lu tid=%lu module=%s base=%s gle=%lu elapsed_ms=%llu",
+                             static_cast<unsigned long>(GetCurrentProcessId()),
+                             static_cast<unsigned long>(GetCurrentThreadId()),
+                             name ? name : "",
+                             sa_format_address(reinterpret_cast<std::uint64_t>(mod)).c_str(),
+                             static_cast<unsigned long>(GetLastError()),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+    }
     return reinterpret_cast<std::uint64_t>(mod);
 }
 
-std::uint64_t map_local_to_target(std::uint32_t pid, const char* module_name, std::uint64_t local_va)
+std::uint64_t map_local_to_target(std::uint32_t pid, const char* module_name, std::uint64_t local_va, bool allow_local_load = true)
 {
-    const std::uint64_t local_base = module_base_local(module_name);
+    const std::uint64_t started_ms = GetTickCount64();
+    diag::log_tagged_fmt("dx_hook", "map_local_to_target enter pid=%u tid=%lu module=%s local_va=%s allow_local_load=%d",
+                         pid,
+                         static_cast<unsigned long>(GetCurrentThreadId()),
+                         module_name ? module_name : "",
+                         sa_format_address(local_va).c_str(),
+                         allow_local_load ? 1 : 0);
+    const std::uint64_t local_base = module_base_local(module_name, allow_local_load);
     if (local_base == 0 || local_va < local_base)
+    {
+        diag::log_tagged_fmt("dx_hook", "map_local_to_target local_invalid pid=%u module=%s local_base=%s local_va=%s elapsed_ms=%llu",
+                             pid,
+                             module_name ? module_name : "",
+                             sa_format_address(local_base).c_str(),
+                             sa_format_address(local_va).c_str(),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
         return 0;
+    }
     auto target_module = find_module_by_name(pid, module_name);
     if (!target_module)
+    {
+        diag::log_tagged_fmt("dx_hook", "map_local_to_target target_module_missing pid=%u module=%s local_base=%s local_va=%s rva=%s elapsed_ms=%llu",
+                             pid,
+                             module_name ? module_name : "",
+                             sa_format_address(local_base).c_str(),
+                             sa_format_address(local_va).c_str(),
+                             sa_format_address(local_va - local_base).c_str(),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
         return 0;
-    return target_module->base + (local_va - local_base);
+    }
+    const std::uint64_t rva = local_va - local_base;
+    const std::uint64_t target = target_module->base + rva;
+    diag::log_tagged_fmt("dx_hook", "map_local_to_target exit pid=%u module=%s local_base=%s target_base=%s target_end=%s rva=%s target_va=%s elapsed_ms=%llu",
+                         pid,
+                         module_name ? module_name : "",
+                         sa_format_address(local_base).c_str(),
+                         sa_format_address(target_module->base).c_str(),
+                         sa_format_address(target_module->base + static_cast<std::uint64_t>(target_module->size)).c_str(),
+                         sa_format_address(rva).c_str(),
+                         sa_format_address(target).c_str(),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
+    return target;
 }
 
 std::string local_prologue_hint(std::uint64_t local_va)
@@ -90,30 +165,92 @@ std::string local_prologue_hint(std::uint64_t local_va)
 
 void finalize_slot(std::uint32_t pid, slot_entry_t& entry)
 {
+    const std::uint64_t started_ms = GetTickCount64();
+    diag::log_tagged_fmt("dx_hook", "finalize_slot enter pid=%u tid=%lu name=%s slot=%u module=%s local_va=%s target_va=%s",
+                         pid,
+                         static_cast<unsigned long>(GetCurrentThreadId()),
+                         entry.name.c_str(),
+                         entry.slot,
+                         entry.module_name.c_str(),
+                         sa_format_address(entry.local_va).c_str(),
+                         sa_format_address(entry.target_va).c_str());
     entry.local_prologue = local_prologue_hint(entry.local_va);
     entry.hint = entry.local_prologue;
     if (entry.target_va == 0)
     {
         entry.validated = false;
+        diag::log_tagged_fmt("dx_hook", "finalize_slot no_target pid=%u name=%s slot=%u local_hint=%s elapsed_ms=%llu",
+                             pid,
+                             entry.name.c_str(),
+                             entry.slot,
+                             entry.local_prologue.c_str(),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
         return;
     }
     auto mod = find_module_by_name(pid, entry.module_name);
     if (mod && entry.target_va >= mod->base && entry.target_va < mod->base + static_cast<std::uint64_t>(mod->size))
         entry.target_rva = entry.target_va - mod->base;
+    diag::log_tagged_fmt("dx_hook", "finalize_slot module pid=%u name=%s module=%s module_found=%d module_base=%s module_end=%s target_rva=%s",
+                         pid,
+                         entry.name.c_str(),
+                         entry.module_name.c_str(),
+                         mod ? 1 : 0,
+                         mod ? sa_format_address(mod->base).c_str() : "0x0",
+                         mod ? sa_format_address(mod->base + static_cast<std::uint64_t>(mod->size)).c_str() : "0x0",
+                         entry.target_rva ? sa_format_address(entry.target_rva).c_str() : "0x0");
     driver_bridge::memory_region_t region{};
+    diag::log_tagged_fmt("dx_hook", "finalize_slot query_begin pid=%u name=%s target_va=%s",
+                         pid,
+                         entry.name.c_str(),
+                         sa_format_address(entry.target_va).c_str());
     entry.target_executable = query_region(pid, entry.target_va, region) && is_committed(region) && is_executable(region) && !is_guarded(region);
+    diag::log_tagged_fmt("dx_hook", "finalize_slot query_end pid=%u name=%s target_va=%s region_base=%s region_size=%llu protect=0x%08lX state=0x%08lX type=0x%08lX executable=%d",
+                         pid,
+                         entry.name.c_str(),
+                         sa_format_address(entry.target_va).c_str(),
+                         sa_format_address(region.base).c_str(),
+                         static_cast<unsigned long long>(region.size),
+                         static_cast<unsigned long>(region.protect),
+                         static_cast<unsigned long>(region.state),
+                         static_cast<unsigned long>(region.type),
+                         entry.target_executable ? 1 : 0);
     std::vector<std::uint8_t> bytes;
+    diag::log_tagged_fmt("dx_hook", "finalize_slot read_begin pid=%u name=%s target_va=%s bytes=16",
+                         pid,
+                         entry.name.c_str(),
+                         sa_format_address(entry.target_va).c_str());
     if (read_bytes(pid, entry.target_va, 16, bytes) && !bytes.empty())
     {
         entry.target_bytes = bytes_to_hex(bytes, 16);
         AsmInstr ins = zydis_decode_one(bytes.data(), static_cast<int>(std::min<std::size_t>(bytes.size(), 16)), entry.target_va);
         entry.target_prologue = classify_instruction_hint(ins) + ":" + disasm_text(ins);
+        diag::log_tagged_fmt("dx_hook", "finalize_slot read_decode pid=%u name=%s target_va=%s bytes_read=%zu prologue=%s raw=%s",
+                             pid,
+                             entry.name.c_str(),
+                             sa_format_address(entry.target_va).c_str(),
+                             bytes.size(),
+                             entry.target_prologue.c_str(),
+                             entry.target_bytes.c_str());
     }
     else
     {
         entry.target_prologue = "unreadable";
+        diag::log_tagged_fmt("dx_hook", "finalize_slot read_failed pid=%u name=%s target_va=%s bytes_read=%zu",
+                             pid,
+                             entry.name.c_str(),
+                             sa_format_address(entry.target_va).c_str(),
+                             bytes.size());
     }
     entry.validated = entry.target_executable && !entry.target_bytes.empty() && entry.target_prologue.find("unknown:") != 0;
+    diag::log_tagged_fmt("dx_hook", "finalize_slot exit pid=%u name=%s slot=%u target_va=%s target_rva=%s executable=%d validated=%d elapsed_ms=%llu",
+                         pid,
+                         entry.name.c_str(),
+                         entry.slot,
+                         sa_format_address(entry.target_va).c_str(),
+                         entry.target_rva ? sa_format_address(entry.target_rva).c_str() : "0x0",
+                         entry.target_executable ? 1 : 0,
+                         entry.validated ? 1 : 0,
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
 }
 
 void push_slot(json& map, const slot_entry_t& slot)
@@ -143,46 +280,263 @@ void push_slot(json& map, const slot_entry_t& slot)
     map[slot.name] = std::move(obj);
 }
 
-std::vector<slot_entry_t> discover_d3d11(std::uint32_t pid)
+std::map<std::string, std::uint32_t> d3d11_context_slots()
 {
-    std::vector<slot_entry_t> slots;
-    HMODULE d3d11 = LoadLibraryA("d3d11.dll");
-    if (!d3d11)
-        return slots;
-    auto create_device = reinterpret_cast<pfn_d3d11_create_device_t>(GetProcAddress(d3d11, "D3D11CreateDevice"));
-    if (!create_device)
-        return slots;
-    ID3D11Device* device = nullptr;
-    ID3D11DeviceContext* context = nullptr;
-    D3D_FEATURE_LEVEL level{};
-    HRESULT hr = create_device(nullptr, D3D_DRIVER_TYPE_NULL, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &device, &level, &context);
-    if (FAILED(hr) || !device || !context)
-    {
-        if (context) context->Release();
-        if (device) device->Release();
-        return slots;
-    }
-    auto vtable = *reinterpret_cast<std::uint64_t**>(context);
-    std::map<std::string, std::uint32_t> wanted = {
+    return {
         {"VSSetConstantBuffers", 7},
         {"DrawIndexed", 12},
         {"DrawIndexedInstanced", 14},
         {"PSSetShaderResources", 25},
         {"IASetVertexBuffers", 54}
     };
-    for (const auto& [name, index] : wanted)
+}
+
+std::size_t resolved_slot_count(const std::vector<slot_entry_t>& slots)
+{
+    std::size_t resolved = 0;
+    for (const auto& slot : slots)
+    {
+        if (slot.target_va != 0)
+            ++resolved;
+    }
+    return resolved;
+}
+
+std::vector<slot_entry_t> discover_d3d11_from_live_context(std::uint32_t pid)
+{
+    const std::uint64_t started_ms = GetTickCount64();
+    std::vector<slot_entry_t> slots;
+    ID3D11Device* device = g_pd3dDevice;
+    diag::log_tagged_fmt("dx_hook", "discover_d3d11_live enter pid=%u tid=%lu device=%p",
+                         pid,
+                         static_cast<unsigned long>(GetCurrentThreadId()),
+                         device);
+    if (!device)
+    {
+        diag::log_tagged_fmt("dx_hook", "discover_d3d11_live no_device pid=%u elapsed_ms=%llu",
+                             pid,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        return slots;
+    }
+
+    device->AddRef();
+    ID3D11DeviceContext* context = nullptr;
+    diag::log_tagged_fmt("dx_hook", "discover_d3d11_live get_context_begin pid=%u device=%p", pid, device);
+    device->GetImmediateContext(&context);
+    diag::log_tagged_fmt("dx_hook", "discover_d3d11_live get_context_end pid=%u context=%p elapsed_ms=%llu",
+                         pid,
+                         context,
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
+    if (!context)
+    {
+        device->Release();
+        diag::log_tagged_fmt("dx_hook", "discover_d3d11_live no_context pid=%u elapsed_ms=%llu",
+                             pid,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        return slots;
+    }
+
+    auto vtable = *reinterpret_cast<std::uint64_t**>(context);
+    diag::log_tagged_fmt("dx_hook", "discover_d3d11_live vtable pid=%u context=%p vtable=%p",
+                         pid,
+                         context,
+                         vtable);
+    if (vtable)
+    {
+        for (const auto& [name, index] : d3d11_context_slots())
+        {
+            slot_entry_t entry;
+            entry.name = name;
+            entry.slot = index;
+            entry.local_va = vtable[index];
+            entry.module_name = "d3d11.dll";
+            diag::log_tagged_fmt("dx_hook", "discover_d3d11_live slot_begin pid=%u name=%s index=%u local_va=%s",
+                                 pid,
+                                 entry.name.c_str(),
+                                 entry.slot,
+                                 sa_format_address(entry.local_va).c_str());
+            entry.target_va = map_local_to_target(pid, "d3d11.dll", entry.local_va, false);
+            finalize_slot(pid, entry);
+            diag::log_tagged_fmt("dx_hook", "discover_d3d11_live slot_end pid=%u name=%s index=%u target_va=%s validated=%d hint=%s",
+                                 pid,
+                                 entry.name.c_str(),
+                                 entry.slot,
+                                 sa_format_address(entry.target_va).c_str(),
+                                 entry.validated ? 1 : 0,
+                                 entry.hint.c_str());
+            slots.push_back(std::move(entry));
+        }
+    }
+    context->Release();
+    device->Release();
+    diag::log_tagged_fmt("dx_hook", "discover_d3d11_live cleanup pid=%u context=%p device=%p slots=%zu resolved=%zu elapsed_ms=%llu",
+                         pid,
+                         context,
+                         device,
+                         slots.size(),
+                         resolved_slot_count(slots),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
+    return slots;
+}
+
+std::vector<slot_entry_t> discover_d3d11(std::uint32_t pid, bool allow_dummy_device = true)
+{
+    const std::uint64_t started_ms = GetTickCount64();
+    diag::log_tagged_fmt("dx_hook", "discover_d3d11 enter pid=%u tid=%lu allow_dummy_device=%d",
+                         pid,
+                         static_cast<unsigned long>(GetCurrentThreadId()),
+                         allow_dummy_device ? 1 : 0);
+    std::vector<slot_entry_t> slots;
+    auto live_slots = discover_d3d11_from_live_context(pid);
+    if (!live_slots.empty() && resolved_slot_count(live_slots) != 0)
+    {
+        diag::log_tagged_fmt("dx_hook", "discover_d3d11 live_exit pid=%u slots=%zu resolved=%zu elapsed_ms=%llu",
+                             pid,
+                             live_slots.size(),
+                             resolved_slot_count(live_slots),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        return live_slots;
+    }
+    if (!live_slots.empty())
+        slots = std::move(live_slots);
+    if (!allow_dummy_device)
+    {
+        diag::log_tagged_fmt("dx_hook", "discover_d3d11 dummy_skipped pid=%u slots=%zu resolved=%zu elapsed_ms=%llu",
+                             pid,
+                             slots.size(),
+                             resolved_slot_count(slots),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        return slots;
+    }
+    SetLastError(ERROR_SUCCESS);
+    diag::log_tagged_fmt("dx_hook", "discover_d3d11 load_begin pid=%u module=d3d11.dll elapsed_ms=%llu",
+                         pid,
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
+    HMODULE d3d11 = LoadLibraryA("d3d11.dll");
+    diag::log_tagged_fmt("dx_hook", "discover_d3d11 load_end pid=%u module=d3d11.dll base=%s gle=%lu elapsed_ms=%llu",
+                         pid,
+                         sa_format_address(reinterpret_cast<std::uint64_t>(d3d11)).c_str(),
+                         static_cast<unsigned long>(GetLastError()),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
+    if (!d3d11)
+    {
+        diag::log_tagged_fmt("dx_hook", "discover_d3d11 load_failed pid=%u gle=%lu elapsed_ms=%llu",
+                             pid,
+                             static_cast<unsigned long>(GetLastError()),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        return slots;
+    }
+    SetLastError(ERROR_SUCCESS);
+    diag::log_tagged_fmt("dx_hook", "discover_d3d11 proc_begin pid=%u proc=D3D11CreateDevice elapsed_ms=%llu",
+                         pid,
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
+    auto create_device = reinterpret_cast<pfn_d3d11_create_device_t>(GetProcAddress(d3d11, "D3D11CreateDevice"));
+    diag::log_tagged_fmt("dx_hook", "discover_d3d11 proc_end pid=%u proc=D3D11CreateDevice addr=%p gle=%lu elapsed_ms=%llu",
+                         pid,
+                         reinterpret_cast<void*>(create_device),
+                         static_cast<unsigned long>(GetLastError()),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
+    if (!create_device)
+    {
+        diag::log_tagged_fmt("dx_hook", "discover_d3d11 proc_missing pid=%u gle=%lu elapsed_ms=%llu",
+                             pid,
+                             static_cast<unsigned long>(GetLastError()),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        return slots;
+    }
+    ID3D11Device* device = nullptr;
+    ID3D11DeviceContext* context = nullptr;
+    D3D_FEATURE_LEVEL level{};
+    const std::uint64_t create_start_ms = GetTickCount64();
+    diag::log_tagged_fmt("dx_hook", "discover_d3d11 dummy_create_begin pid=%u driver_type=%u elapsed_ms=%llu",
+                         pid,
+                         static_cast<unsigned>(D3D_DRIVER_TYPE_NULL),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
+    HRESULT hr = create_device(nullptr, D3D_DRIVER_TYPE_NULL, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &device, &level, &context);
+    const std::uint64_t create_elapsed_ms = GetTickCount64() - create_start_ms;
+    diag::log_tagged_fmt("dx_hook", "discover_d3d11 dummy_create_end pid=%u hr=0x%08lX device=%p context=%p feature=0x%08X create_ms=%llu elapsed_ms=%llu",
+                         pid,
+                         static_cast<unsigned long>(hr),
+                         device,
+                         context,
+                         static_cast<unsigned>(level),
+                         static_cast<unsigned long long>(create_elapsed_ms),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
+    if (FAILED(hr) || !device || !context)
+    {
+        diag::log_tagged_fmt("dx_hook", "discover_d3d11 create_failed pid=%u hr=0x%08lX device=%d context=%d create_ms=%llu elapsed_ms=%llu",
+                             pid,
+                             static_cast<unsigned long>(hr),
+                             device ? 1 : 0,
+                             context ? 1 : 0,
+                             static_cast<unsigned long long>(create_elapsed_ms),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        if (context) context->Release();
+        if (device) device->Release();
+        return slots;
+    }
+    auto vtable = *reinterpret_cast<std::uint64_t**>(context);
+    diag::log_tagged_fmt("dx_hook", "discover_d3d11 dummy_vtable pid=%u context=%p vtable=%p",
+                         pid,
+                         context,
+                         vtable);
+    if (!vtable)
+    {
+        diag::log_tagged_fmt("dx_hook", "discover_d3d11 dummy_vtable_missing pid=%u context=%p elapsed_ms=%llu",
+                             pid,
+                             context,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        diag::log_tagged_fmt("dx_hook", "discover_d3d11 cleanup_begin pid=%u context=%p device=%p",
+                             pid,
+                             context,
+                             device);
+        context->Release();
+        device->Release();
+        diag::log_tagged_fmt("dx_hook", "discover_d3d11 exit pid=%u slots=%zu create_ms=%llu elapsed_ms=%llu",
+                             pid,
+                             slots.size(),
+                             static_cast<unsigned long long>(create_elapsed_ms),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        return slots;
+    }
+    slots.clear();
+    for (const auto& [name, index] : d3d11_context_slots())
     {
         slot_entry_t entry;
         entry.name = name;
         entry.slot = index;
         entry.local_va = vtable[index];
+        diag::log_tagged_fmt("dx_hook", "discover_d3d11 dummy_slot_begin pid=%u name=%s index=%u local_va=%s",
+                             pid,
+                             entry.name.c_str(),
+                             entry.slot,
+                             sa_format_address(entry.local_va).c_str());
         entry.target_va = map_local_to_target(pid, "d3d11.dll", entry.local_va);
         entry.module_name = "d3d11.dll";
         finalize_slot(pid, entry);
+        diag::log_tagged_fmt("dx_hook", "discover_d3d11 dummy_slot_end pid=%u name=%s index=%u target_va=%s validated=%d hint=%s",
+                             pid,
+                             entry.name.c_str(),
+                             entry.slot,
+                             sa_format_address(entry.target_va).c_str(),
+                             entry.validated ? 1 : 0,
+                             entry.hint.c_str());
         slots.push_back(std::move(entry));
     }
+    diag::log_tagged_fmt("dx_hook", "discover_d3d11 cleanup_begin pid=%u context=%p device=%p",
+                         pid,
+                         context,
+                         device);
     context->Release();
     device->Release();
+    diag::log_tagged_fmt("dx_hook", "discover_d3d11 cleanup_end pid=%u elapsed_ms=%llu",
+                         pid,
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
+    diag::log_tagged_fmt("dx_hook", "discover_d3d11 exit pid=%u slots=%zu create_ms=%llu elapsed_ms=%llu",
+                         pid,
+                         slots.size(),
+                         static_cast<unsigned long long>(create_elapsed_ms),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     return slots;
 }
 
@@ -234,9 +588,31 @@ std::vector<slot_entry_t> discover_d3d12(std::uint32_t pid)
 
 std::vector<slot_entry_t> discover_dxgi_present(std::uint32_t pid)
 {
+    const std::uint64_t started_ms = GetTickCount64();
+    diag::log_tagged_fmt("dx_hook", "discover_dxgi_present enter pid=%u tid=%lu",
+                         pid,
+                         static_cast<unsigned long>(GetCurrentThreadId()));
     std::vector<slot_entry_t> slots;
+    SetLastError(ERROR_SUCCESS);
+    diag::log_tagged_fmt("dx_hook", "discover_dxgi_present load_begin pid=%u module=d3d11.dll elapsed_ms=%llu",
+                         pid,
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     HMODULE d3d11 = LoadLibraryA("d3d11.dll");
+    diag::log_tagged_fmt("dx_hook", "discover_dxgi_present load_end pid=%u module=d3d11.dll base=%s gle=%lu elapsed_ms=%llu",
+                         pid,
+                         sa_format_address(reinterpret_cast<std::uint64_t>(d3d11)).c_str(),
+                         static_cast<unsigned long>(GetLastError()),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
+    SetLastError(ERROR_SUCCESS);
+    diag::log_tagged_fmt("dx_hook", "discover_dxgi_present proc_begin pid=%u proc=D3D11CreateDeviceAndSwapChain elapsed_ms=%llu",
+                         pid,
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     auto create_swap_chain = d3d11 ? reinterpret_cast<pfn_d3d11_create_device_and_swap_chain_t>(GetProcAddress(d3d11, "D3D11CreateDeviceAndSwapChain")) : nullptr;
+    diag::log_tagged_fmt("dx_hook", "discover_dxgi_present proc_end pid=%u proc=D3D11CreateDeviceAndSwapChain addr=%p gle=%lu elapsed_ms=%llu",
+                         pid,
+                         reinterpret_cast<void*>(create_swap_chain),
+                         static_cast<unsigned long>(GetLastError()),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     slot_entry_t entry;
     entry.name = "IDXGISwapChain::Present";
     entry.slot = 8;
@@ -248,8 +624,29 @@ std::vector<slot_entry_t> discover_dxgi_present(std::uint32_t pid)
         wc.lpfnWndProc = DefWindowProcA;
         wc.hInstance = GetModuleHandleA(nullptr);
         wc.lpszClassName = cls;
-        RegisterClassA(&wc);
+        SetLastError(ERROR_SUCCESS);
+        diag::log_tagged_fmt("dx_hook", "discover_dxgi_present register_class_begin pid=%u class=%s hinst=%p",
+                             pid,
+                             cls,
+                             wc.hInstance);
+        const ATOM atom = RegisterClassA(&wc);
+        diag::log_tagged_fmt("dx_hook", "discover_dxgi_present register_class_end pid=%u class=%s atom=%u gle=%lu elapsed_ms=%llu",
+                             pid,
+                             cls,
+                             static_cast<unsigned>(atom),
+                             static_cast<unsigned long>(GetLastError()),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        SetLastError(ERROR_SUCCESS);
+        diag::log_tagged_fmt("dx_hook", "discover_dxgi_present window_create_begin pid=%u class=%s elapsed_ms=%llu",
+                             pid,
+                             cls,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
         HWND hwnd = CreateWindowExA(0, cls, cls, WS_OVERLAPPEDWINDOW, 0, 0, 16, 16, nullptr, nullptr, wc.hInstance, nullptr);
+        diag::log_tagged_fmt("dx_hook", "discover_dxgi_present window_create_end pid=%u hwnd=%p gle=%lu elapsed_ms=%llu",
+                             pid,
+                             hwnd,
+                             static_cast<unsigned long>(GetLastError()),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
         if (hwnd)
         {
             DXGI_SWAP_CHAIN_DESC desc{};
@@ -269,7 +666,19 @@ std::vector<slot_entry_t> discover_dxgi_present(std::uint32_t pid)
             const D3D_DRIVER_TYPE drivers[] = {D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP, D3D_DRIVER_TYPE_REFERENCE};
             for (D3D_DRIVER_TYPE driver_type : drivers)
             {
+                const std::uint64_t create_start_ms = GetTickCount64();
+                diag::log_tagged_fmt("dx_hook", "discover_dxgi_present create_begin pid=%u driver_type=%u hwnd=%p elapsed_ms=%llu",
+                                     pid,
+                                     static_cast<unsigned>(driver_type),
+                                     hwnd,
+                                     static_cast<unsigned long long>(GetTickCount64() - started_ms));
                 HRESULT hr = create_swap_chain(nullptr, driver_type, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &desc, &swap, &device, &level, &context);
+                diag::log_tagged_fmt("dx_hook", "discover_dxgi_present create_attempt pid=%u driver_type=%u hr=0x%08lX swap=%d elapsed_ms=%llu",
+                                     pid,
+                                     static_cast<unsigned>(driver_type),
+                                     static_cast<unsigned long>(hr),
+                                     swap ? 1 : 0,
+                                     static_cast<unsigned long long>(GetTickCount64() - create_start_ms));
                 if (SUCCEEDED(hr) && swap)
                     break;
                 if (context) { context->Release(); context = nullptr; }
@@ -279,19 +688,71 @@ std::vector<slot_entry_t> discover_dxgi_present(std::uint32_t pid)
             if (swap)
             {
                 auto vtable = *reinterpret_cast<std::uint64_t**>(swap);
-                entry.local_va = vtable[8];
-                entry.target_va = map_local_to_target(pid, "dxgi.dll", entry.local_va);
-                finalize_slot(pid, entry);
+                diag::log_tagged_fmt("dx_hook", "discover_dxgi_present vtable pid=%u swap=%p vtable=%p slot=%u",
+                                     pid,
+                                     swap,
+                                     vtable,
+                                     entry.slot);
+                if (vtable)
+                {
+                    entry.local_va = vtable[8];
+                    diag::log_tagged_fmt("dx_hook", "discover_dxgi_present slot_map_begin pid=%u local_va=%s module=dxgi.dll",
+                                         pid,
+                                         sa_format_address(entry.local_va).c_str());
+                    entry.target_va = map_local_to_target(pid, "dxgi.dll", entry.local_va);
+                    finalize_slot(pid, entry);
+                    diag::log_tagged_fmt("dx_hook", "discover_dxgi_present slot_map_end pid=%u local_va=%s target_va=%s validated=%d hint=%s",
+                                         pid,
+                                         sa_format_address(entry.local_va).c_str(),
+                                         sa_format_address(entry.target_va).c_str(),
+                                         entry.validated ? 1 : 0,
+                                         entry.hint.c_str());
+                }
+                else
+                {
+                    diag::log_tagged_fmt("dx_hook", "discover_dxgi_present vtable_missing pid=%u swap=%p elapsed_ms=%llu",
+                                         pid,
+                                         swap,
+                                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
+                }
             }
+            diag::log_tagged_fmt("dx_hook", "discover_dxgi_present cleanup_com_begin pid=%u context=%p device=%p swap=%p",
+                                 pid,
+                                 context,
+                                 device,
+                                 swap);
             if (context) context->Release();
             if (device) device->Release();
             if (swap) swap->Release();
+            diag::log_tagged_fmt("dx_hook", "discover_dxgi_present cleanup_window_begin pid=%u hwnd=%p", pid, hwnd);
             DestroyWindow(hwnd);
+            diag::log_tagged_fmt("dx_hook", "discover_dxgi_present cleanup_window_end pid=%u hwnd=%p gle=%lu elapsed_ms=%llu",
+                                 pid,
+                                 hwnd,
+                                 static_cast<unsigned long>(GetLastError()),
+                                 static_cast<unsigned long long>(GetTickCount64() - started_ms));
         }
-        UnregisterClassA(cls, wc.hInstance);
+        SetLastError(ERROR_SUCCESS);
+        diag::log_tagged_fmt("dx_hook", "discover_dxgi_present unregister_class_begin pid=%u class=%s hinst=%p",
+                             pid,
+                             cls,
+                             wc.hInstance);
+        const BOOL unregistered = UnregisterClassA(cls, wc.hInstance);
+        diag::log_tagged_fmt("dx_hook", "discover_dxgi_present unregister_class_end pid=%u class=%s ok=%d gle=%lu elapsed_ms=%llu",
+                             pid,
+                             cls,
+                             unregistered ? 1 : 0,
+                             static_cast<unsigned long>(GetLastError()),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
     }
     if (entry.local_va == 0 || entry.target_va == 0)
         entry.hint = "dummy_swapchain_present_unavailable";
+    diag::log_tagged_fmt("dx_hook", "discover_dxgi_present exit pid=%u local_va=%s target_va=%s hint=%s elapsed_ms=%llu",
+                         pid,
+                         sa_format_address(entry.local_va).c_str(),
+                         sa_format_address(entry.target_va).c_str(),
+                         entry.hint.c_str(),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     slots.push_back(std::move(entry));
     return slots;
 }
@@ -331,13 +792,13 @@ json slots_to_result(std::uint32_t pid, const std::string& api, const std::vecto
     return result;
 }
 
-std::vector<slot_entry_t> discover_api(std::uint32_t pid, const std::string& api)
+std::vector<slot_entry_t> discover_api(std::uint32_t pid, const std::string& api, bool allow_dummy_device = true)
 {
-    if (api == "d3d11") return discover_d3d11(pid);
+    if (api == "d3d11") return discover_d3d11(pid, allow_dummy_device);
     if (api == "d3d12") return discover_d3d12(pid);
     if (api == "vulkan") return discover_vulkan(pid);
     std::vector<slot_entry_t> out;
-    auto d3d11 = discover_d3d11(pid);
+    auto d3d11 = discover_d3d11(pid, allow_dummy_device);
     auto d3d12 = discover_d3d12(pid);
     auto vk = discover_vulkan(pid);
     out.insert(out.end(), d3d11.begin(), d3d11.end());
@@ -346,22 +807,176 @@ std::vector<slot_entry_t> discover_api(std::uint32_t pid, const std::string& api
     return out;
 }
 
-std::optional<slot_entry_t> choose_hook_target(std::uint32_t pid, const std::string& api, const std::string& action)
+std::optional<slot_entry_t> export_marker_target(std::uint32_t pid,
+                                                 const std::string& module_name,
+                                                 const std::string& export_name,
+                                                 const std::string& action)
 {
+    const std::uint64_t started_ms = GetTickCount64();
+    diag::log_tagged_fmt("dx_hook", "export_marker enter pid=%u action=%s module=%s export=%s",
+                         pid,
+                         action.c_str(),
+                         module_name.c_str(),
+                         export_name.c_str());
+    auto module = find_module_by_name(pid, module_name);
+    if (!module)
+    {
+        diag::log_tagged_fmt("dx_hook", "export_marker module_missing pid=%u module=%s export=%s elapsed_ms=%llu",
+                             pid,
+                             module_name.c_str(),
+                             export_name.c_str(),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        return std::nullopt;
+    }
+    const std::uint64_t target = driver_bridge::resolve_export(module->base, export_name.c_str());
+    diag::log_tagged_fmt("dx_hook", "export_marker resolved pid=%u module=%s base=%s end=%s export=%s target=%s elapsed_ms=%llu",
+                         pid,
+                         module_name.c_str(),
+                         sa_format_address(module->base).c_str(),
+                         sa_format_address(module->base + static_cast<std::uint64_t>(module->size)).c_str(),
+                         export_name.c_str(),
+                         sa_format_address(target).c_str(),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
+    if (target == 0)
+        return std::nullopt;
+    slot_entry_t entry;
+    entry.name = "snapshot_marker::" + export_name;
+    entry.slot = 0;
+    entry.target_va = target;
+    entry.module_name = module_name;
+    finalize_slot(pid, entry);
+    entry.hint = "snapshot_export_marker:" + export_name + ":" + entry.target_prologue;
+    diag::log_tagged_fmt("dx_hook", "export_marker exit pid=%u action=%s module=%s export=%s target=%s validated=%d elapsed_ms=%llu",
+                         pid,
+                         action.c_str(),
+                         module_name.c_str(),
+                         export_name.c_str(),
+                         sa_format_address(entry.target_va).c_str(),
+                         entry.validated ? 1 : 0,
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
+    return entry;
+}
+
+std::optional<slot_entry_t> snapshot_marker_target(std::uint32_t pid, const std::string& api, const std::string& action)
+{
+    const std::uint64_t started_ms = GetTickCount64();
+    diag::log_tagged_fmt("dx_hook", "snapshot_marker enter pid=%u api=%s action=%s",
+                         pid,
+                         api.c_str(),
+                         action.c_str());
+    std::vector<std::pair<std::string, std::string>> candidates;
+    if (action == "present")
+    {
+        candidates.push_back({"dxgi.dll", "CreateDXGIFactory2"});
+        candidates.push_back({"dxgi.dll", "CreateDXGIFactory1"});
+        candidates.push_back({"dxgi.dll", "CreateDXGIFactory"});
+        candidates.push_back({"d3d11.dll", "D3D11CreateDevice"});
+    }
+    else
+    {
+        candidates.push_back({"d3d11.dll", "D3D11CreateDevice"});
+    }
+    if (api == "vulkan")
+        candidates.insert(candidates.begin(), {"vulkan-1.dll", "vkQueuePresentKHR"});
+    for (const auto& candidate : candidates)
+    {
+        auto target = export_marker_target(pid, candidate.first, candidate.second, action);
+        if (target && target->target_va != 0)
+        {
+            diag::log_tagged_fmt("dx_hook", "snapshot_marker exit pid=%u api=%s action=%s module=%s export=%s target=%s elapsed_ms=%llu",
+                                 pid,
+                                 api.c_str(),
+                                 action.c_str(),
+                                 candidate.first.c_str(),
+                                 candidate.second.c_str(),
+                                 sa_format_address(target->target_va).c_str(),
+                                 static_cast<unsigned long long>(GetTickCount64() - started_ms));
+            return target;
+        }
+    }
+    diag::log_tagged_fmt("dx_hook", "snapshot_marker miss pid=%u api=%s action=%s elapsed_ms=%llu",
+                         pid,
+                         api.c_str(),
+                         action.c_str(),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
+    return std::nullopt;
+}
+
+std::optional<slot_entry_t> choose_hook_target(std::uint32_t pid, const std::string& api, const std::string& action, bool snapshot_only = false)
+{
+    const std::uint64_t started_ms = GetTickCount64();
+    diag::log_tagged_fmt("dx_hook", "choose_hook_target enter pid=%u api=%s action=%s snapshot_only=%d",
+                         pid,
+                         api.c_str(),
+                         action.c_str(),
+                         snapshot_only ? 1 : 0);
+    if (snapshot_only)
+    {
+        auto marker = snapshot_marker_target(pid, api, action);
+        if (marker && marker->target_va != 0)
+        {
+            diag::log_tagged_fmt("dx_hook", "choose_hook_target snapshot_marker pid=%u api=%s action=%s target=%s elapsed_ms=%llu",
+                                 pid,
+                                 api.c_str(),
+                                 action.c_str(),
+                                 sa_format_address(marker->target_va).c_str(),
+                                 static_cast<unsigned long long>(GetTickCount64() - started_ms));
+            return marker;
+        }
+        diag::log_tagged_fmt("dx_hook", "choose_hook_target snapshot_marker_missing pid=%u api=%s action=%s elapsed_ms=%llu",
+                             pid,
+                             api.c_str(),
+                             action.c_str(),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        return std::nullopt;
+    }
     if (action == "present")
     {
         auto present = discover_dxgi_present(pid);
         if (!present.empty() && present.front().target_va != 0)
+        {
+            diag::log_tagged_fmt("dx_hook", "choose_hook_target present_exact pid=%u api=%s target=%s elapsed_ms=%llu",
+                                 pid,
+                                 api.c_str(),
+                                 sa_format_address(present.front().target_va).c_str(),
+                                 static_cast<unsigned long long>(GetTickCount64() - started_ms));
             return present.front();
+        }
     }
     auto slots = discover_api(pid, api);
+    diag::log_tagged_fmt("dx_hook", "choose_hook_target slots pid=%u api=%s action=%s slots=%zu resolved=%zu elapsed_ms=%llu",
+                         pid,
+                         api.c_str(),
+                         action.c_str(),
+                         slots.size(),
+                         resolved_slot_count(slots),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     for (const auto& slot : slots)
     {
         if (action == "draw" && (slot.name == "DrawIndexed" || slot.name == "DrawIndexedInstanced" || slot.name == "DrawIndexedInstanced"))
+        {
+            diag::log_tagged_fmt("dx_hook", "choose_hook_target draw_slot pid=%u name=%s target=%s elapsed_ms=%llu",
+                                 pid,
+                                 slot.name.c_str(),
+                                 sa_format_address(slot.target_va).c_str(),
+                                 static_cast<unsigned long long>(GetTickCount64() - started_ms));
             return slot;
+        }
         if (action == "present" && slot.name.find("Present") != std::string::npos)
+        {
+            diag::log_tagged_fmt("dx_hook", "choose_hook_target present_slot pid=%u name=%s target=%s elapsed_ms=%llu",
+                                 pid,
+                                 slot.name.c_str(),
+                                 sa_format_address(slot.target_va).c_str(),
+                                 static_cast<unsigned long long>(GetTickCount64() - started_ms));
             return slot;
+        }
     }
+    diag::log_tagged_fmt("dx_hook", "choose_hook_target miss pid=%u api=%s action=%s elapsed_ms=%llu",
+                         pid,
+                         api.c_str(),
+                         action.c_str(),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     return std::nullopt;
 }
 
@@ -1323,14 +1938,16 @@ bool write_png_file(const std::filesystem::path& path, const std::vector<std::ui
 
 tool_result_t find_device_vtable(const json& params)
 {
+    const std::uint64_t started_ms = GetTickCount64();
     active_process_scope_t scope(params);
     if (!scope.ok())
         return tool_result_t::error(scope.error());
     const std::string api = api_param(params);
+    diag::log_tagged_fmt("dx_hook", "find_device_vtable enter pid=%u api=%s", scope.pid(), api.c_str());
     if (api == "auto")
     {
         json apis = json::array();
-        apis.push_back(slots_to_result(scope.pid(), "d3d11", discover_d3d11(scope.pid())));
+        apis.push_back(slots_to_result(scope.pid(), "d3d11", discover_d3d11(scope.pid(), false)));
         apis.push_back(slots_to_result(scope.pid(), "d3d12", discover_d3d12(scope.pid())));
         apis.push_back(slots_to_result(scope.pid(), "dxgi", discover_dxgi_present(scope.pid())));
         apis.push_back(slots_to_result(scope.pid(), "vulkan", discover_vulkan(scope.pid())));
@@ -1338,27 +1955,51 @@ tool_result_t find_device_vtable(const json& params)
         result["process_id"] = scope.pid();
         result["api"] = "auto";
         result["apis"] = std::move(apis);
+        diag::log_tagged_fmt("dx_hook", "find_device_vtable exit pid=%u api=auto elapsed_ms=%llu",
+                             scope.pid(),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
         return tool_result_t::ok(result);
     }
-    if (api == "dxgi")
-        return tool_result_t::ok(slots_to_result(scope.pid(), api, discover_dxgi_present(scope.pid())));
-    return tool_result_t::ok(slots_to_result(scope.pid(), api, discover_api(scope.pid(), api)));
+    auto slots = api == "dxgi" ? discover_dxgi_present(scope.pid()) : discover_api(scope.pid(), api, false);
+    std::size_t resolved = 0;
+    for (const auto& slot : slots)
+    {
+        if (slot.target_va != 0)
+            ++resolved;
+    }
+    diag::log_tagged_fmt("dx_hook", "find_device_vtable exit pid=%u api=%s slots=%zu resolved=%zu elapsed_ms=%llu",
+                         scope.pid(),
+                         api.c_str(),
+                         slots.size(),
+                         resolved,
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
+    return tool_result_t::ok(slots_to_result(scope.pid(), api, slots));
 }
 
 tool_result_t hook_manage(const json& params)
 {
+    const std::uint64_t started_ms = GetTickCount64();
     const std::string action = compat_action_name(params);
     const json p = compat_action_payload(params);
     if (action == "remove")
     {
+        diag::log_tagged_fmt("dx_hook", "hook_manage remove_enter action=%s", action.c_str());
         if (!unsafe_confirmed(p))
             return unsafe_required("dx_hook_manage remove");
         active_process_scope_t scope(p);
         if (!scope.ok())
             return tool_result_t::error(scope.error());
+        diag::log_tagged_fmt("dx_hook", "hook_manage remove_scope pid=%u", scope.pid());
         std::size_t cleared = 0;
         for (const auto& record : store::list_dx_hooks(scope.pid()))
         {
+            diag::log_tagged_fmt("dx_hook", "hook_manage remove_record pid=%u hook_id=%s action=%s target=%s tids=%zu hw_slot=%d",
+                                 scope.pid(),
+                                 record.id.c_str(),
+                                 record.action.c_str(),
+                                 sa_format_address(record.target_va).c_str(),
+                                 record.tids.size(),
+                                 record.hw_slot);
             for (auto tid : record.tids)
             {
                 if (driver_bridge::clear_hardware_breakpoint(tid, record.hw_slot))
@@ -1367,6 +2008,11 @@ tool_result_t hook_manage(const json& params)
         }
         const std::size_t removed = store::remove_dx_hooks(scope.pid());
         stop_dx_debug_loop(scope.pid());
+        diag::log_tagged_fmt("dx_hook", "hook_manage remove_exit pid=%u removed=%zu cleared=%zu elapsed_ms=%llu",
+                             scope.pid(),
+                             removed,
+                             cleared,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
         json result;
         result["process_id"] = scope.pid();
         result["removed_count"] = removed;
@@ -1384,12 +2030,27 @@ tool_result_t hook_manage(const json& params)
         return tool_result_t::error(scope.error());
 
     const std::string api = api_param(p);
-    const auto target = choose_hook_target(scope.pid(), api, action);
+    const std::string callback_mode = lower_ascii(string_param(p, "callback_mode", "hw_bp"));
+    const bool snapshot_only = callback_mode == "snapshot" || callback_mode == "polling";
+    diag::log_tagged_fmt("dx_hook", "hook_manage enter pid=%u action=%s api=%s callback_mode=%s snapshot_only=%d",
+                         scope.pid(),
+                         action.c_str(),
+                         api.c_str(),
+                         callback_mode.c_str(),
+                         snapshot_only ? 1 : 0);
+    const std::uint64_t target_start_ms = GetTickCount64();
+    const auto target = choose_hook_target(scope.pid(), api, action, snapshot_only);
+    diag::log_tagged_fmt("dx_hook", "hook_manage target pid=%u action=%s ok=%d name=%s target_va=%s elapsed_ms=%llu",
+                         scope.pid(),
+                         action.c_str(),
+                         target && target->target_va != 0 ? 1 : 0,
+                         target ? target->name.c_str() : "",
+                         target && target->target_va != 0 ? sa_format_address(target->target_va).c_str() : "0x0",
+                         static_cast<unsigned long long>(GetTickCount64() - target_start_ms));
     if (!target || target->target_va == 0)
         return tool_result_t::error("Could not resolve a hook target for requested API/action.");
 
     const int hw_slot = static_cast<int>(numeric_param(p, "hw_slot", action == "draw" ? 1 : 0, 0, 3));
-    const std::string callback_mode = lower_ascii(string_param(p, "callback_mode", "hw_bp"));
     store::dx_hook_record_t record;
     record.id = store::next_id("dx");
     record.pid = scope.pid();
@@ -1401,17 +2062,36 @@ tool_result_t hook_manage(const json& params)
     record.capture_vertex_buffers = bool_param(p, "capture_vertex_buffers", false);
     record.max_captures = static_cast<std::uint32_t>(numeric_param(p, "max_captures", 16, 1, 1024));
     record.created_ms = unix_time_ms();
-    for (const auto& th : threads_for(scope.pid()))
+    std::size_t primary_threads_seen = 0;
+    if (!snapshot_only)
     {
-        if (driver_bridge::set_hardware_breakpoint(th.tid, hw_slot, target->target_va, 0, 0))
-            record.tids.push_back(th.tid);
+        for (const auto& th : threads_for(scope.pid()))
+        {
+            ++primary_threads_seen;
+            if (driver_bridge::set_hardware_breakpoint(th.tid, hw_slot, target->target_va, 0, 0))
+                record.tids.push_back(th.tid);
+        }
     }
+    diag::log_tagged_fmt("dx_hook", "hook_manage primary_record pid=%u action=%s target_va=%s snapshot_only=%d threads_seen=%zu armed=%zu",
+                         scope.pid(),
+                         action.c_str(),
+                         sa_format_address(target->target_va).c_str(),
+                         snapshot_only ? 1 : 0,
+                         primary_threads_seen,
+                         record.tids.size());
     store::add_dx_hook(record);
 
     json auxiliary = nullptr;
-    if (action == "draw" && record.capture_cbuffers)
+    if (action == "draw" && record.capture_cbuffers && !snapshot_only)
     {
+        const std::uint64_t bind_start_ms = GetTickCount64();
         auto bind_target = choose_cbuffer_target(scope.pid(), api);
+        diag::log_tagged_fmt("dx_hook", "hook_manage cbuffer_target pid=%u ok=%d name=%s target_va=%s elapsed_ms=%llu",
+                             scope.pid(),
+                             bind_target && bind_target->target_va != 0 ? 1 : 0,
+                             bind_target ? bind_target->name.c_str() : "",
+                             bind_target && bind_target->target_va != 0 ? sa_format_address(bind_target->target_va).c_str() : "0x0",
+                             static_cast<unsigned long long>(GetTickCount64() - bind_start_ms));
         if (bind_target && bind_target->target_va != 0)
         {
             store::dx_hook_record_t bind_record;
@@ -1425,11 +2105,18 @@ tool_result_t hook_manage(const json& params)
             bind_record.capture_vertex_buffers = false;
             bind_record.max_captures = record.max_captures;
             bind_record.created_ms = unix_time_ms();
+            std::size_t bind_threads_seen = 0;
             for (const auto& th : threads_for(scope.pid()))
             {
+                ++bind_threads_seen;
                 if (driver_bridge::set_hardware_breakpoint(th.tid, bind_record.hw_slot, bind_target->target_va, 0, 0))
                     bind_record.tids.push_back(th.tid);
             }
+            diag::log_tagged_fmt("dx_hook", "hook_manage cbuffer_record pid=%u target_va=%s threads_seen=%zu armed=%zu",
+                                 scope.pid(),
+                                 sa_format_address(bind_target->target_va).c_str(),
+                                 bind_threads_seen,
+                                 bind_record.tids.size());
             store::add_dx_hook(bind_record);
             auxiliary = dx_record_json(bind_record);
             auxiliary["target_name"] = bind_target->name;
@@ -1439,7 +2126,7 @@ tool_result_t hook_manage(const json& params)
 
     std::string debug_error;
     bool debug_started = false;
-    if (callback_mode != "snapshot" && callback_mode != "polling")
+    if (!snapshot_only)
         debug_started = start_dx_debug_loop(scope.pid(), debug_error);
     if (!debug_started)
         refresh_snapshot_records(scope.pid(), debug_error.empty() ? "snapshot mode requested" : debug_error, &p);
@@ -1481,6 +2168,13 @@ tool_result_t hook_manage(const json& params)
     result["armed_threads"] = total_armed_threads;
     result["auxiliary_cbuffer_hook"] = std::move(auxiliary);
     result["snapshot_capture_seeded"] = !debug_started;
+    diag::log_tagged_fmt("dx_hook", "hook_manage exit pid=%u action=%s hook_id=%s debug_started=%d armed_threads=%zu elapsed_ms=%llu",
+                         scope.pid(),
+                         action.c_str(),
+                         record.id.c_str(),
+                         debug_started ? 1 : 0,
+                         total_armed_threads,
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     return tool_result_t::ok(debug_started ? "DX hook armed with debug-event capture." : "DX hook recorded with bounded snapshot fallback.", result);
 }
 

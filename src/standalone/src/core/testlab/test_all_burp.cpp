@@ -7,11 +7,11 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <Windows.h>
-#include <process.h>
 
 #include "test_all_burp.h"
 #include "test_all_features.hpp"
 #include "../infra/event_bus.hpp"
+#include "../infra/work_queue.hpp"
 #include "../network/burp/scope.hpp"
 #include "../network/burp/cookie_jar.hpp"
 #include "../network/burp/match_replace.hpp"
@@ -50,7 +50,6 @@
 #include "../network/burp/audit_http.hpp"
 #include "../network/burp/headless_view.hpp"
 #include "../network/network_view.hpp"
-#include "../infra/win_thread.hpp"
 #include "../runtime/manual_map_tls.hpp"
 #include "../../helpers/diag_log.hpp"
 #include "test_lab_bounded_runner.hpp"
@@ -59,7 +58,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cctype>
@@ -296,16 +294,22 @@ namespace {
         return static_cast<bool>(f);
     }
 
-    DWORD WINAPI burp_loopback_fixture_thread_entry_win32(void* arg);
-
     struct burp_loopback_fixture_t {
         struct loopback_state_t {
             std::atomic<SOCKET> listen_socket{INVALID_SOCKET};
             std::atomic<uint16_t> port{0};
             std::atomic<bool> stopping{false};
+            std::atomic<bool> worker_posted{false};
             std::atomic<bool> worker_active{false};
+            std::atomic<bool> worker_entered{false};
+            std::atomic<bool> worker_exited{false};
             std::atomic<DWORD> worker_tid{0};
             std::atomic<long> active_clients{0};
+            std::atomic<uint64_t> accept_count{0};
+            std::atomic<uint64_t> request_count{0};
+            std::atomic<uint64_t> response_count{0};
+            std::atomic<int> last_wsa_error{0};
+            std::atomic<DWORD> last_win32_error{0};
             std::mutex worker_mutex;
             std::condition_variable worker_cv;
             std::mutex client_mutex;
@@ -313,8 +317,6 @@ namespace {
         };
 
         std::shared_ptr<loopback_state_t> state = std::make_shared<loopback_state_t>();
-        HANDLE worker_handle = nullptr;
-        DWORD worker_handle_tid = 0;
 
         bool start(HANDLE hf, const char* tag) {
             auto st = state;
@@ -360,167 +362,163 @@ namespace {
             st->listen_socket.store(listener, std::memory_order_release);
             st->port.store(ntohs(bound.sin_port), std::memory_order_release);
             st->stopping.store(false, std::memory_order_release);
-            st->active_clients.store(0, std::memory_order_release);
-            DWORD thread_start_tick = GetTickCount();
-            st->worker_active.store(true, std::memory_order_release);
+            st->worker_posted.store(false, std::memory_order_release);
+            st->worker_active.store(false, std::memory_order_release);
+            st->worker_entered.store(false, std::memory_order_release);
+            st->worker_exited.store(false, std::memory_order_release);
             st->worker_tid.store(0, std::memory_order_release);
-            log_msg(hf, tag, "fixture_start INFO -- listener thread start requested port=%u listener=%llu host_pid=%lu host_tid=%lu",
+            st->active_clients.store(0, std::memory_order_release);
+            st->accept_count.store(0, std::memory_order_release);
+            st->request_count.store(0, std::memory_order_release);
+            st->response_count.store(0, std::memory_order_release);
+            st->last_wsa_error.store(0, std::memory_order_release);
+            st->last_win32_error.store(0, std::memory_order_release);
+            const ULONGLONG start_tick = GetTickCount64();
+            const auto q_before = work_queue::stats();
+            log_msg(hf, tag, "fixture_start INFO -- listener work_queue post requested port=%u listener=%llu host_pid=%lu host_tid=%lu wq_alive=%d wq_shutting=%d wq_pending=%zu wq_active=%u wq_posted=%llu wq_finished=%llu",
                 static_cast<unsigned>(st->port.load(std::memory_order_acquire)),
                 static_cast<unsigned long long>(listener),
                 static_cast<unsigned long>(GetCurrentProcessId()),
-                static_cast<unsigned long>(GetCurrentThreadId()));
-            std::string thread_err;
-            unsigned tid = 0;
-            errno = 0;
-            SetLastError(0);
-            HANDLE raw_handle = nullptr;
-            loopback_state_t* thread_state = st.get();
-            aida::runtime::loader_header_invariant::scoped_restore_t loader_window("burp_loopback_fixture", "testlab_burp");
-            auto append_attempt = [&](const char* api, unsigned stack_bytes, DWORD flags, DWORD gle, int crt_errno, DWORD elapsed_ms) {
-                char err_buf[512];
-                _snprintf_s(err_buf, sizeof(err_buf), _TRUNCATE,
-                    "%s%s{stack_bytes=%u flags=0x%08lX gle=%lu errno=%d elapsed_ms=%lu}",
-                    thread_err.empty() ? "" : " ",
-                    api ? api : "<api>",
-                    stack_bytes,
-                    static_cast<unsigned long>(flags),
-                    static_cast<unsigned long>(gle),
-                    crt_errno,
-                    static_cast<unsigned long>(elapsed_ms));
-                thread_err += err_buf;
-            };
-            auto try_beginthreadex_direct = [&](unsigned stack_bytes) {
-                unsigned local_tid = 0;
-                errno = 0;
-                SetLastError(0);
-                DWORD t0 = GetTickCount();
-                uintptr_t raw = _beginthreadex(nullptr, stack_bytes, &burp_loopback_fixture_t::thread_entry, thread_state, 0, &local_tid);
-                DWORD gle = GetLastError();
-                int crt = errno;
-                DWORD elapsed = GetTickCount() - t0;
-                HANDLE h = reinterpret_cast<HANDLE>(raw);
-                diag::log_tagged_fmt("testlab_burp", "loopback_direct_beginthreadex stack_bytes=%u handle=%p tid=%u elapsed_ms=%lu gle=%lu errno=%d state=%p entry=%p loader_window=%d",
-                    stack_bytes,
-                    h,
-                    local_tid,
-                    static_cast<unsigned long>(elapsed),
-                    static_cast<unsigned long>(gle),
-                    crt,
-                    thread_state,
-                    reinterpret_cast<void*>(&burp_loopback_fixture_t::thread_entry),
-                    loader_window.active() ? 1 : 0);
-                if (raw != 0) {
-                    raw_handle = h;
-                    tid = local_tid;
-                    return true;
-                }
-                append_attempt("_beginthreadex", stack_bytes, 0, gle, crt, elapsed);
-                return false;
-            };
-            auto try_create_thread_direct = [&](unsigned stack_bytes, DWORD flags) {
-                DWORD local_tid = 0;
-                errno = 0;
-                SetLastError(0);
-                DWORD t0 = GetTickCount();
-                HANDLE h = CreateThread(nullptr, stack_bytes, &burp_loopback_fixture_thread_entry_win32, thread_state, flags, &local_tid);
-                DWORD gle = GetLastError();
-                int crt = errno;
-                DWORD elapsed = GetTickCount() - t0;
-                diag::log_tagged_fmt("testlab_burp", "loopback_direct_createthread stack_bytes=%u flags=0x%08lX handle=%p tid=%lu elapsed_ms=%lu gle=%lu errno=%d state=%p entry=%p loader_window=%d",
-                    stack_bytes,
-                    static_cast<unsigned long>(flags),
-                    h,
-                    static_cast<unsigned long>(local_tid),
-                    static_cast<unsigned long>(elapsed),
-                    static_cast<unsigned long>(gle),
-                    crt,
-                    thread_state,
-                    reinterpret_cast<void*>(&burp_loopback_fixture_thread_entry_win32),
-                    loader_window.active() ? 1 : 0);
-                if (h) {
-                    raw_handle = h;
-                    tid = static_cast<unsigned>(local_tid);
-                    return true;
-                }
-                append_attempt("CreateThread", stack_bytes, flags, gle, crt, elapsed);
-                return false;
-            };
-            auto try_nt_create_thread_direct = [&]() {
-                using nt_create_thread_ex_t = LONG(NTAPI*)(PHANDLE, ACCESS_MASK, void*, HANDLE, void*, void*, ULONG, SIZE_T, SIZE_T, SIZE_T, void*);
-                HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-                auto fn = ntdll ? reinterpret_cast<nt_create_thread_ex_t>(GetProcAddress(ntdll, "NtCreateThreadEx")) : nullptr;
-                DWORD t0 = GetTickCount();
-                SetLastError(0);
-                errno = 0;
-                HANDLE h = nullptr;
-                LONG status = fn ? fn(&h, THREAD_ALL_ACCESS, nullptr, GetCurrentProcess(), reinterpret_cast<void*>(&burp_loopback_fixture_thread_entry_win32), thread_state, 0, aida::infra::win_thread::fixture_stack_reserve, 0, 0, nullptr) : static_cast<LONG>(0xC0000139);
-                DWORD gle = GetLastError();
-                int crt = errno;
-                DWORD elapsed = GetTickCount() - t0;
-                diag::log_tagged_fmt("testlab_burp", "loopback_direct_ntcreatethreadex status=0x%08lX handle=%p elapsed_ms=%lu gle=%lu errno=%d state=%p entry=%p loader_window=%d",
-                    static_cast<unsigned long>(status),
-                    h,
-                    static_cast<unsigned long>(elapsed),
-                    static_cast<unsigned long>(gle),
-                    crt,
-                    thread_state,
-                    reinterpret_cast<void*>(&burp_loopback_fixture_thread_entry_win32),
-                    loader_window.active() ? 1 : 0);
-                if (status >= 0 && h) {
-                    raw_handle = h;
-                    tid = 0;
-                    return true;
-                }
-                if (h)
-                    CloseHandle(h);
-                append_attempt("NtCreateThreadEx", aida::infra::win_thread::fixture_stack_reserve, 0, gle, crt, elapsed);
-                return false;
-            };
-            const bool started =
-                try_create_thread_direct(aida::infra::win_thread::fixture_stack_reserve, STACK_SIZE_PARAM_IS_A_RESERVATION) ||
-                try_create_thread_direct(0, 0) ||
-                try_nt_create_thread_direct() ||
-                try_beginthreadex_direct(aida::infra::win_thread::fixture_stack_reserve) ||
-                try_beginthreadex_direct(0);
-            DWORD start_gle = started ? ERROR_SUCCESS : GetLastError();
-            const int start_errno = errno;
-            diag::log_tagged_fmt("testlab_burp", "loopback_thread_start result started=%d handle=%p tid=%u stack_bytes=%u gle=%lu errno=%d state=%p entry=%p host_pid=%lu host_tid=%lu err=%s",
-                started ? 1 : 0,
-                raw_handle,
-                tid,
-                aida::infra::win_thread::fixture_stack_reserve,
-                static_cast<unsigned long>(start_gle),
-                start_errno,
-                st.get(),
-                reinterpret_cast<void*>(&burp_loopback_fixture_t::thread_entry),
-                static_cast<unsigned long>(GetCurrentProcessId()),
                 static_cast<unsigned long>(GetCurrentThreadId()),
-                thread_err.empty() ? "<empty>" : thread_err.c_str());
-            if (started) {
-                worker_handle = raw_handle;
-                worker_handle_tid = static_cast<DWORD>(tid);
+                q_before.alive ? 1 : 0,
+                q_before.shutting_down ? 1 : 0,
+                q_before.pending,
+                static_cast<unsigned>(q_before.active),
+                static_cast<unsigned long long>(q_before.posted),
+                static_cast<unsigned long long>(q_before.finished));
+            SetLastError(0);
+            bool posted = false;
+            DWORD post_gle = ERROR_SUCCESS;
+            try {
+                posted = work_queue::post([st]() {
+                    burp_loopback_fixture_t::worker_entry(st, "work_queue");
+                });
+                post_gle = GetLastError();
+            } catch (const std::exception& ex) {
+                post_gle = GetLastError();
+                if (post_gle == ERROR_SUCCESS)
+                    post_gle = ERROR_NOT_ENOUGH_MEMORY;
+                diag::log_tagged_fmt("testlab_burp", "loopback_work_queue_post_exception port=%u listener=%llu err=%s gle=%lu state=%p",
+                    static_cast<unsigned>(st->port.load(std::memory_order_acquire)),
+                    static_cast<unsigned long long>(listener),
+                    ex.what(),
+                    static_cast<unsigned long>(post_gle),
+                    st.get());
+            } catch (...) {
+                post_gle = GetLastError();
+                if (post_gle == ERROR_SUCCESS)
+                    post_gle = ERROR_NOT_ENOUGH_MEMORY;
+                diag::log_tagged_fmt("testlab_burp", "loopback_work_queue_post_exception port=%u listener=%llu err=unknown gle=%lu state=%p",
+                    static_cast<unsigned>(st->port.load(std::memory_order_acquire)),
+                    static_cast<unsigned long long>(listener),
+                    static_cast<unsigned long>(post_gle),
+                    st.get());
             }
-            if (!started) {
-                if (start_gle == ERROR_SUCCESS) start_gle = ERROR_NOT_READY;
+            const auto q_after = work_queue::stats();
+            st->worker_posted.store(posted, std::memory_order_release);
+            diag::log_tagged_fmt("testlab_burp", "loopback_work_queue_post_result posted=%d gle=%lu state=%p port=%u listener=%llu wq_alive=%d wq_shutting=%d wq_pending=%zu wq_active=%u wq_posted=%llu wq_rejected=%llu wq_started=%llu wq_finished=%llu elapsed_ms=%llu",
+                posted ? 1 : 0,
+                static_cast<unsigned long>(post_gle),
+                st.get(),
+                static_cast<unsigned>(st->port.load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(listener),
+                q_after.alive ? 1 : 0,
+                q_after.shutting_down ? 1 : 0,
+                q_after.pending,
+                static_cast<unsigned>(q_after.active),
+                static_cast<unsigned long long>(q_after.posted),
+                static_cast<unsigned long long>(q_after.rejected),
+                static_cast<unsigned long long>(q_after.started),
+                static_cast<unsigned long long>(q_after.finished),
+                static_cast<unsigned long long>(GetTickCount64() - start_tick));
+            if (!posted) {
+                if (post_gle == ERROR_SUCCESS)
+                    post_gle = ERROR_NOT_READY;
+                st->last_win32_error.store(post_gle, std::memory_order_release);
+                st->worker_exited.store(true, std::memory_order_release);
                 st->worker_active.store(false, std::memory_order_release);
                 st->worker_cv.notify_all();
-                DWORD elapsed = GetTickCount() - thread_start_tick;
                 SOCKET s = st->listen_socket.exchange(INVALID_SOCKET, std::memory_order_acq_rel);
-                if (s != INVALID_SOCKET)
+                if (s != INVALID_SOCKET) {
+                    shutdown(s, SD_BOTH);
                     closesocket(s);
+                }
                 st->port.store(0, std::memory_order_release);
-                log_msg(hf, tag, "fixture_start FAIL -- listener thread start failed gle=%lu elapsed_ms=%lu host_pid=%lu host_tid=%lu err=%s",
-                    static_cast<unsigned long>(start_gle),
-                    static_cast<unsigned long>(elapsed),
+                log_msg(hf, tag, "fixture_start FAIL -- listener work_queue post failed gle=%lu elapsed_ms=%llu host_pid=%lu host_tid=%lu wq_alive=%d wq_shutting=%d wq_pending=%zu wq_active=%u wq_rejected=%llu",
+                    static_cast<unsigned long>(post_gle),
+                    static_cast<unsigned long long>(GetTickCount64() - start_tick),
                     static_cast<unsigned long>(GetCurrentProcessId()),
                     static_cast<unsigned long>(GetCurrentThreadId()),
-                    thread_err.empty() ? "<empty>" : thread_err.c_str());
+                    q_after.alive ? 1 : 0,
+                    q_after.shutting_down ? 1 : 0,
+                    q_after.pending,
+                    static_cast<unsigned>(q_after.active),
+                    static_cast<unsigned long long>(q_after.rejected));
                 return false;
             }
-            log_msg(hf, tag, "fixture_start PASS -- loopback_http_ws port=%u worker_tid=%lu elapsed_ms=%lu",
+            bool entered = false;
+            bool exited = false;
+            {
+                std::unique_lock<std::mutex> lk(st->worker_mutex);
+                st->worker_cv.wait_for(lk, std::chrono::milliseconds(5000), [st]() {
+                    return st->worker_entered.load(std::memory_order_acquire) ||
+                        st->worker_exited.load(std::memory_order_acquire);
+                });
+                entered = st->worker_entered.load(std::memory_order_acquire);
+                exited = st->worker_exited.load(std::memory_order_acquire);
+            }
+            if (!entered || exited) {
+                st->stopping.store(true, std::memory_order_release);
+                wake_listener(st->port.load(std::memory_order_acquire));
+                SOCKET s = st->listen_socket.exchange(INVALID_SOCKET, std::memory_order_acq_rel);
+                if (s != INVALID_SOCKET) {
+                    shutdown(s, SD_BOTH);
+                    closesocket(s);
+                }
+                st->port.store(0, std::memory_order_release);
+                bool drained = false;
+                {
+                    std::unique_lock<std::mutex> lk(st->worker_mutex);
+                    drained = st->worker_cv.wait_for(lk, std::chrono::milliseconds(1000), [st]() {
+                        return st->worker_exited.load(std::memory_order_acquire);
+                    });
+                }
+                const auto q_late = work_queue::stats();
+                log_msg(hf, tag, "fixture_start FAIL -- listener work_queue worker did not enter port=%u entered=%d exited=%d drained=%d worker_tid=%lu accept_count=%llu request_count=%llu response_count=%llu last_wsa=%d last_gle=%lu elapsed_ms=%llu wq_pending=%zu wq_active=%u wq_started=%llu wq_finished=%llu",
+                    static_cast<unsigned>(ntohs(bound.sin_port)),
+                    entered ? 1 : 0,
+                    exited ? 1 : 0,
+                    drained ? 1 : 0,
+                    static_cast<unsigned long>(st->worker_tid.load(std::memory_order_acquire)),
+                    static_cast<unsigned long long>(st->accept_count.load(std::memory_order_acquire)),
+                    static_cast<unsigned long long>(st->request_count.load(std::memory_order_acquire)),
+                    static_cast<unsigned long long>(st->response_count.load(std::memory_order_acquire)),
+                    st->last_wsa_error.load(std::memory_order_acquire),
+                    static_cast<unsigned long>(st->last_win32_error.load(std::memory_order_acquire)),
+                    static_cast<unsigned long long>(GetTickCount64() - start_tick),
+                    q_late.pending,
+                    static_cast<unsigned>(q_late.active),
+                    static_cast<unsigned long long>(q_late.started),
+                    static_cast<unsigned long long>(q_late.finished));
+                diag::log_tagged_fmt("testlab_burp", "loopback_work_queue_start_not_ready port=%u entered=%d exited=%d drained=%d worker_tid=%lu state=%p elapsed_ms=%llu wq_pending=%zu wq_active=%u",
+                    static_cast<unsigned>(ntohs(bound.sin_port)),
+                    entered ? 1 : 0,
+                    exited ? 1 : 0,
+                    drained ? 1 : 0,
+                    static_cast<unsigned long>(st->worker_tid.load(std::memory_order_acquire)),
+                    st.get(),
+                    static_cast<unsigned long long>(GetTickCount64() - start_tick),
+                    q_late.pending,
+                    static_cast<unsigned>(q_late.active));
+                return false;
+            }
+            log_msg(hf, tag, "fixture_start PASS -- loopback_http_ws port=%u worker_tid=%lu elapsed_ms=%llu accept_count=%llu request_count=%llu response_count=%llu",
                 static_cast<unsigned>(st->port.load(std::memory_order_acquire)),
-                static_cast<unsigned long>(worker_handle_tid),
-                static_cast<unsigned long>(GetTickCount() - thread_start_tick));
+                static_cast<unsigned long>(st->worker_tid.load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(GetTickCount64() - start_tick),
+                static_cast<unsigned long long>(st->accept_count.load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(st->request_count.load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(st->response_count.load(std::memory_order_acquire)));
             return true;
         }
 
@@ -532,15 +530,31 @@ namespace {
             st->stopping.store(true, std::memory_order_release);
             const uint16_t stopped_port = st->port.load(std::memory_order_acquire);
             const SOCKET stopped_listener = st->listen_socket.load(std::memory_order_acquire);
+            diag::log_tagged_fmt("testlab_burp", "loopback_fixture_stop_request port=%u listener=%llu worker_posted=%d worker_active=%d worker_entered=%d worker_exited=%d worker_tid=%lu active_clients=%ld accept_count=%llu request_count=%llu response_count=%llu",
+                static_cast<unsigned>(stopped_port),
+                static_cast<unsigned long long>(stopped_listener),
+                st->worker_posted.load(std::memory_order_acquire) ? 1 : 0,
+                st->worker_active.load(std::memory_order_acquire) ? 1 : 0,
+                st->worker_entered.load(std::memory_order_acquire) ? 1 : 0,
+                st->worker_exited.load(std::memory_order_acquire) ? 1 : 0,
+                static_cast<unsigned long>(st->worker_tid.load(std::memory_order_acquire)),
+                st->active_clients.load(std::memory_order_acquire),
+                static_cast<unsigned long long>(st->accept_count.load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(st->request_count.load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(st->response_count.load(std::memory_order_acquire)));
             if (stopped_listener != INVALID_SOCKET)
                 wake_listener(stopped_port);
+            SOCKET s = st->listen_socket.exchange(INVALID_SOCKET, std::memory_order_acq_rel);
+            if (s != INVALID_SOCKET) {
+                shutdown(s, SD_BOTH);
+                closesocket(s);
+            }
             bool worker_idle = true;
             bool clients_idle = true;
-            bool joined = true;
-            if (worker_joinable()) {
+            if (st->worker_posted.load(std::memory_order_acquire) && !st->worker_exited.load(std::memory_order_acquire)) {
                 std::unique_lock<std::mutex> lock(st->worker_mutex);
                 worker_idle = st->worker_cv.wait_for(lock, std::chrono::milliseconds(3000), [st]() {
-                    return !st->worker_active.load(std::memory_order_acquire);
+                    return st->worker_exited.load(std::memory_order_acquire);
                 });
             }
             {
@@ -549,72 +563,31 @@ namespace {
                     return st->active_clients.load(std::memory_order_acquire) == 0;
                 });
             }
-            const DWORD stop_tid = GetCurrentThreadId();
-            const DWORD observed_worker_tid = st->worker_tid.load(std::memory_order_acquire);
-            const DWORD join_tid = observed_worker_tid != 0 ? observed_worker_tid : worker_handle_tid;
-            bool self_join = false;
-            if (worker_joinable()) {
-                if (join_tid != 0 && join_tid == stop_tid) {
-                    self_join = true;
-                    joined = false;
-                    close_worker_handle();
-                } else {
-                    joined = join_worker_for(3000);
-                }
-            }
-            SOCKET s = st->listen_socket.exchange(INVALID_SOCKET, std::memory_order_acq_rel);
-            if (s != INVALID_SOCKET) {
-                shutdown(s, SD_BOTH);
-                closesocket(s);
-            }
-            if (joined)
-                st->port.store(0, std::memory_order_release);
-            diag::log_tagged_fmt("testlab_burp", "loopback_fixture_stop port=%u listener=%llu worker_active=%d worker_tid=%lu active_clients=%ld worker_idle=%d clients_idle=%d joined=%d self_join=%d elapsed_ms=%llu",
+            st->port.store(0, std::memory_order_release);
+            if (worker_idle)
+                st->worker_posted.store(false, std::memory_order_release);
+            diag::log_tagged_fmt("testlab_burp", "loopback_fixture_stop port=%u listener=%llu worker_posted=%d worker_active=%d worker_entered=%d worker_exited=%d worker_tid=%lu active_clients=%ld worker_idle=%d clients_idle=%d accept_count=%llu request_count=%llu response_count=%llu last_wsa=%d last_gle=%lu elapsed_ms=%llu",
                 static_cast<unsigned>(stopped_port),
                 static_cast<unsigned long long>(stopped_listener),
+                st->worker_posted.load(std::memory_order_acquire) ? 1 : 0,
                 st->worker_active.load(std::memory_order_acquire) ? 1 : 0,
+                st->worker_entered.load(std::memory_order_acquire) ? 1 : 0,
+                st->worker_exited.load(std::memory_order_acquire) ? 1 : 0,
                 static_cast<unsigned long>(st->worker_tid.load(std::memory_order_acquire)),
                 st->active_clients.load(std::memory_order_acquire),
                 worker_idle ? 1 : 0,
                 clients_idle ? 1 : 0,
-                joined ? 1 : 0,
-                self_join ? 1 : 0,
+                static_cast<unsigned long long>(st->accept_count.load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(st->request_count.load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(st->response_count.load(std::memory_order_acquire)),
+                st->last_wsa_error.load(std::memory_order_acquire),
+                static_cast<unsigned long>(st->last_win32_error.load(std::memory_order_acquire)),
                 static_cast<unsigned long long>(GetTickCount64() - t0));
-            return worker_idle && clients_idle && joined;
+            return worker_idle && clients_idle;
         }
 
         ~burp_loopback_fixture_t() {
-            if (!stop() && worker_joinable()) {
-                diag::log_tagged_fmt("testlab_burp", "loopback_fixture_destructor_join_begin handle=%p tid=%lu",
-                    worker_handle,
-                    static_cast<unsigned long>(worker_handle_tid));
-                join_worker_for(INFINITE);
-            }
-        }
-
-        bool worker_joinable() const {
-            return worker_handle != nullptr;
-        }
-
-        bool join_worker_for(DWORD timeout_ms) {
-            HANDLE h = worker_handle;
-            if (!h)
-                return true;
-            DWORD rc = WaitForSingleObject(h, timeout_ms);
-            if (rc != WAIT_OBJECT_0)
-                return false;
-            CloseHandle(h);
-            worker_handle = nullptr;
-            worker_handle_tid = 0;
-            return true;
-        }
-
-        void close_worker_handle() {
-            if (!worker_handle)
-                return;
-            CloseHandle(worker_handle);
-            worker_handle = nullptr;
-            worker_handle_tid = 0;
+            stop();
         }
 
         uint16_t current_port() const {
@@ -629,7 +602,7 @@ namespace {
 
         bool worker_is_active() const {
             auto st = state;
-            return st && st->worker_active.load(std::memory_order_acquire);
+            return st && st->worker_active.load(std::memory_order_acquire) && !st->worker_exited.load(std::memory_order_acquire);
         }
 
         long current_active_clients() const {
@@ -637,12 +610,29 @@ namespace {
             return st ? st->active_clients.load(std::memory_order_acquire) : 0;
         }
 
+        uint64_t current_accept_count() const {
+            auto st = state;
+            return st ? st->accept_count.load(std::memory_order_acquire) : 0;
+        }
+
+        uint64_t current_request_count() const {
+            auto st = state;
+            return st ? st->request_count.load(std::memory_order_acquire) : 0;
+        }
+
+        uint64_t current_response_count() const {
+            auto st = state;
+            return st ? st->response_count.load(std::memory_order_acquire) : 0;
+        }
+
         struct client_guard_t {
             loopback_state_t* owner = nullptr;
-            explicit client_guard_t(loopback_state_t* fixture) : owner(fixture) {
+            uint64_t accept_idx = 0;
+            explicit client_guard_t(loopback_state_t* fixture, uint64_t idx) : owner(fixture), accept_idx(idx) {
                 if (!owner)
                     return;
-                diag::log_tagged_fmt("testlab_burp", "loopback_client_enter active_clients=%ld tid=%lu",
+                diag::log_tagged_fmt("testlab_burp", "loopback_client_enter accept=%llu active_clients=%ld tid=%lu",
+                    static_cast<unsigned long long>(accept_idx),
                     owner->active_clients.load(std::memory_order_acquire),
                     static_cast<unsigned long>(GetCurrentThreadId()));
             }
@@ -651,70 +641,96 @@ namespace {
                     return;
                 long remaining = owner->active_clients.fetch_sub(1, std::memory_order_acq_rel) - 1;
                 owner->client_cv.notify_all();
-                diag::log_tagged_fmt("testlab_burp", "loopback_client_exit active_clients=%ld tid=%lu",
+                diag::log_tagged_fmt("testlab_burp", "loopback_client_exit accept=%llu active_clients=%ld tid=%lu",
+                    static_cast<unsigned long long>(accept_idx),
                     remaining,
                     static_cast<unsigned long>(GetCurrentThreadId()));
             }
         };
 
-        struct worker_completion_t {
-            loopback_state_t* owner = nullptr;
-            explicit worker_completion_t(loopback_state_t* fixture) : owner(fixture) {}
-            ~worker_completion_t() {
-                if (!owner)
-                    return;
-                owner->worker_tid.store(0, std::memory_order_release);
-                owner->worker_active.store(false, std::memory_order_release);
-                owner->worker_cv.notify_all();
+        static void worker_entry(std::shared_ptr<loopback_state_t> held_state, const char* mode) {
+            auto* st = held_state.get();
+            const ULONGLONG t0 = GetTickCount64();
+            const DWORD tid = GetCurrentThreadId();
+            diag::log_tagged_fmt("testlab_burp", "loopback_worker_raw_entry mode=%s state=%p tid=%lu",
+                mode ? mode : "",
+                st,
+                static_cast<unsigned long>(tid));
+            if (!st) {
+                diag::log_tagged_fmt("testlab_burp", "loopback_worker_exit mode=%s reason=state_null elapsed_ms=%llu tid=%lu",
+                    mode ? mode : "",
+                    static_cast<unsigned long long>(GetTickCount64() - t0),
+                    static_cast<unsigned long>(tid));
+                return;
             }
-        };
-
-        static unsigned __stdcall thread_entry(void* arg) {
+            st->worker_tid.store(tid, std::memory_order_release);
+            st->worker_active.store(true, std::memory_order_release);
+            st->worker_entered.store(true, std::memory_order_release);
+            st->worker_cv.notify_all();
+            std::string exit_reason = "normal";
+            diag::log_tagged_fmt("testlab_burp", "loopback_worker_tls_enter mode=%s state=%p tid=%lu port=%u listener=%llu",
+                mode ? mode : "",
+                st,
+                static_cast<unsigned long>(tid),
+                static_cast<unsigned>(st->port.load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(st->listen_socket.load(std::memory_order_acquire)));
             const bool tls_ready = aida::manual_map_tls::ensure_current_thread();
-            auto* st = static_cast<loopback_state_t*>(arg);
-            diag::log_tagged_fmt("testlab_burp", "loopback_thread_entry tls_ready=%d state=%p tid=%lu",
+            diag::log_tagged_fmt("testlab_burp", "loopback_worker_tls_exit mode=%s tls_ready=%d state=%p tid=%lu elapsed_ms=%llu",
+                mode ? mode : "",
                 tls_ready ? 1 : 0,
                 st,
-                static_cast<unsigned long>(GetCurrentThreadId()));
+                static_cast<unsigned long>(tid),
+                static_cast<unsigned long long>(GetTickCount64() - t0));
             try {
-                accept_loop(st);
+                exit_reason = accept_loop(st, mode);
             } catch (const std::exception& ex) {
-                if (st) {
-                    st->worker_tid.store(0, std::memory_order_release);
-                    st->worker_active.store(false, std::memory_order_release);
-                    st->worker_cv.notify_all();
-                }
+                exit_reason = "exception";
+                st->last_win32_error.store(GetLastError(), std::memory_order_release);
                 diag::log_tagged_fmt("testlab_burp", "loopback_fixture_exception err=%s tid=%lu",
-                    ex.what(), static_cast<unsigned long>(GetCurrentThreadId()));
+                    ex.what(), static_cast<unsigned long>(tid));
             } catch (...) {
-                if (st) {
-                    st->worker_tid.store(0, std::memory_order_release);
-                    st->worker_active.store(false, std::memory_order_release);
-                    st->worker_cv.notify_all();
-                }
+                exit_reason = "unknown_exception";
+                st->last_win32_error.store(GetLastError(), std::memory_order_release);
                 diag::log_tagged_fmt("testlab_burp", "loopback_fixture_exception err=unknown tid=%lu",
-                    static_cast<unsigned long>(GetCurrentThreadId()));
+                    static_cast<unsigned long>(tid));
             }
-            diag::log_tagged_fmt("testlab_burp", "loopback_thread_exit_pre state=%p tid=%lu",
-                st,
-                static_cast<unsigned long>(GetCurrentThreadId()));
-            return 0;
+            diag::log_tagged_fmt("testlab_burp", "loopback_worker_exit mode=%s reason=%s port=%u listener=%llu active_clients=%ld accept_count=%llu request_count=%llu response_count=%llu stop=%d last_wsa=%d last_gle=%lu elapsed_ms=%llu tid=%lu",
+                mode ? mode : "",
+                exit_reason.c_str(),
+                static_cast<unsigned>(st->port.load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(st->listen_socket.load(std::memory_order_acquire)),
+                st->active_clients.load(std::memory_order_acquire),
+                static_cast<unsigned long long>(st->accept_count.load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(st->request_count.load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(st->response_count.load(std::memory_order_acquire)),
+                st->stopping.load(std::memory_order_acquire) ? 1 : 0,
+                st->last_wsa_error.load(std::memory_order_acquire),
+                static_cast<unsigned long>(st->last_win32_error.load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(GetTickCount64() - t0),
+                static_cast<unsigned long>(tid));
+            st->worker_tid.store(0, std::memory_order_release);
+            st->worker_active.store(false, std::memory_order_release);
+            st->worker_exited.store(true, std::memory_order_release);
+            st->worker_cv.notify_all();
         }
 
-        static void accept_loop(loopback_state_t* st) {
+        static std::string accept_loop(loopback_state_t* st, const char* mode) {
             if (!st)
-                return;
+                return "state_null";
             const DWORD tid = GetCurrentThreadId();
-            st->worker_tid.store(tid, std::memory_order_release);
-            worker_completion_t completion(st);
-            diag::log_tagged_fmt("testlab_burp", "loopback_fixture_enter port=%u listener=%llu tid=%lu",
+            const ULONGLONG t0 = GetTickCount64();
+            std::string exit_reason = "stop_requested";
+            diag::log_tagged_fmt("testlab_burp", "loopback_accept_loop_enter mode=%s port=%u listener=%llu tid=%lu",
+                mode ? mode : "",
                 static_cast<unsigned>(st->port.load(std::memory_order_acquire)),
                 static_cast<unsigned long long>(st->listen_socket.load(std::memory_order_acquire)),
                 static_cast<unsigned long>(tid));
             while (!st->stopping.load(std::memory_order_acquire)) {
                 SOCKET listener = st->listen_socket.load(std::memory_order_acquire);
-                if (listener == INVALID_SOCKET)
+                if (listener == INVALID_SOCKET) {
+                    exit_reason = "listener_invalid";
                     break;
+                }
                 fd_set rfds;
                 FD_ZERO(&rfds);
                 FD_SET(listener, &rfds);
@@ -723,50 +739,85 @@ namespace {
                 int rc = select(0, &rfds, nullptr, nullptr, &tv);
                 if (rc == SOCKET_ERROR) {
                     int err = WSAGetLastError();
+                    st->last_wsa_error.store(err, std::memory_order_release);
                     if (!st->stopping.load(std::memory_order_acquire))
-                        diag::log_tagged_fmt("testlab_burp", "loopback_select_error port=%u listener=%llu wsa=%d tid=%lu",
+                        diag::log_tagged_fmt("testlab_burp", "loopback_select_error port=%u listener=%llu wsa=%d tid=%lu elapsed_ms=%llu",
                             static_cast<unsigned>(st->port.load(std::memory_order_acquire)),
                             static_cast<unsigned long long>(listener),
                             err,
-                            static_cast<unsigned long>(GetCurrentThreadId()));
-                    if (err == WSAENOTSOCK || st->stopping.load(std::memory_order_acquire))
+                            static_cast<unsigned long>(GetCurrentThreadId()),
+                            static_cast<unsigned long long>(GetTickCount64() - t0));
+                    if (err == WSAENOTSOCK) {
+                        exit_reason = "select_wsaenotsock";
                         break;
+                    }
+                    if (st->stopping.load(std::memory_order_acquire)) {
+                        exit_reason = "select_stop";
+                        break;
+                    }
                     continue;
                 }
                 if (rc == 0)
                     continue;
-                if (st->stopping.load(std::memory_order_acquire))
+                if (st->stopping.load(std::memory_order_acquire)) {
+                    exit_reason = "stop_after_select";
                     break;
+                }
                 SOCKET s = accept(listener, nullptr, nullptr);
                 if (s == INVALID_SOCKET) {
                     int err = WSAGetLastError();
+                    st->last_wsa_error.store(err, std::memory_order_release);
                     if (!st->stopping.load(std::memory_order_acquire))
-                        diag::log_tagged_fmt("testlab_burp", "loopback_accept_error port=%u listener=%llu wsa=%d tid=%lu",
+                        diag::log_tagged_fmt("testlab_burp", "loopback_accept_error port=%u listener=%llu wsa=%d tid=%lu elapsed_ms=%llu",
                             static_cast<unsigned>(st->port.load(std::memory_order_acquire)),
                             static_cast<unsigned long long>(listener),
                             err,
-                            static_cast<unsigned long>(GetCurrentThreadId()));
+                            static_cast<unsigned long>(GetCurrentThreadId()),
+                            static_cast<unsigned long long>(GetTickCount64() - t0));
+                    if (st->stopping.load(std::memory_order_acquire)) {
+                        exit_reason = "accept_stop";
+                        break;
+                    }
                     continue;
                 }
+                uint64_t accept_idx = st->accept_count.fetch_add(1, std::memory_order_acq_rel) + 1;
+                diag::log_tagged_fmt("testlab_burp", "loopback_accept_ok port=%u accept=%llu socket=%llu active_clients=%ld request_count=%llu response_count=%llu tid=%lu elapsed_ms=%llu",
+                    static_cast<unsigned>(st->port.load(std::memory_order_acquire)),
+                    static_cast<unsigned long long>(accept_idx),
+                    static_cast<unsigned long long>(s),
+                    st->active_clients.load(std::memory_order_acquire),
+                    static_cast<unsigned long long>(st->request_count.load(std::memory_order_acquire)),
+                    static_cast<unsigned long long>(st->response_count.load(std::memory_order_acquire)),
+                    static_cast<unsigned long>(GetCurrentThreadId()),
+                    static_cast<unsigned long long>(GetTickCount64() - t0));
                 if (st->stopping.load(std::memory_order_acquire)) {
                     shutdown(s, SD_BOTH);
                     closesocket(s);
+                    exit_reason = "stop_after_accept";
                     break;
                 }
                 DWORD timeout = 2000;
                 setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
                 setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
                 st->active_clients.fetch_add(1, std::memory_order_acq_rel);
-                diag::log_tagged_fmt("testlab_burp", "loopback_client_inline active_clients=%ld tid=%lu",
+                diag::log_tagged_fmt("testlab_burp", "loopback_client_inline accept=%llu active_clients=%ld tid=%lu",
+                    static_cast<unsigned long long>(accept_idx),
                     st->active_clients.load(std::memory_order_acquire),
                     static_cast<unsigned long>(GetCurrentThreadId()));
-                client_guard_t guard(st);
-                handle_client(s);
+                client_guard_t guard(st, accept_idx);
+                handle_client(st, s, accept_idx);
             }
-            diag::log_tagged_fmt("testlab_burp", "loopback_fixture_exit port=%u active_clients=%ld tid=%lu",
+            diag::log_tagged_fmt("testlab_burp", "loopback_accept_loop_exit mode=%s reason=%s port=%u active_clients=%ld accept_count=%llu request_count=%llu response_count=%llu tid=%lu elapsed_ms=%llu",
+                mode ? mode : "",
+                exit_reason.c_str(),
                 static_cast<unsigned>(st->port.load(std::memory_order_acquire)),
                 st->active_clients.load(std::memory_order_acquire),
-                static_cast<unsigned long>(tid));
+                static_cast<unsigned long long>(st->accept_count.load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(st->request_count.load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(st->response_count.load(std::memory_order_acquire)),
+                static_cast<unsigned long>(tid),
+                static_cast<unsigned long long>(GetTickCount64() - t0));
+            return exit_reason;
         }
 
         static void wake_listener(uint16_t port) {
@@ -795,39 +846,109 @@ namespace {
                 static_cast<unsigned long>(GetCurrentThreadId()));
         }
 
-        static void handle_client(SOCKET s) {
+        static void handle_client(loopback_state_t* st, SOCKET s, uint64_t accept_idx) {
             std::string request;
             char buf[4096];
+            const ULONGLONG t0 = GetTickCount64();
             while (request.find("\r\n\r\n") == std::string::npos && request.size() < 65536) {
                 int n = recv(s, buf, sizeof(buf), 0);
-                if (n <= 0) break;
+                if (n <= 0) {
+                    int err = WSAGetLastError();
+                    if (st)
+                        st->last_wsa_error.store(err, std::memory_order_release);
+                    diag::log_tagged_fmt("testlab_burp", "loopback_recv_end accept=%llu recv=%d wsa=%d request_bytes=%zu tid=%lu elapsed_ms=%llu",
+                        static_cast<unsigned long long>(accept_idx),
+                        n,
+                        err,
+                        request.size(),
+                        static_cast<unsigned long>(GetCurrentThreadId()),
+                        static_cast<unsigned long long>(GetTickCount64() - t0));
+                    break;
+                }
                 request.append(buf, buf + n);
             }
+            const bool header_complete = request.find("\r\n\r\n") != std::string::npos;
+            uint64_t request_idx = 0;
+            if (st && !request.empty())
+                request_idx = st->request_count.fetch_add(1, std::memory_order_acq_rel) + 1;
+            diag::log_tagged_fmt("testlab_burp", "loopback_handle_client accept=%llu request=%llu request_bytes=%zu header_complete=%d elapsed_ms=%llu active_clients=%ld tid=%lu",
+                static_cast<unsigned long long>(accept_idx),
+                static_cast<unsigned long long>(request_idx),
+                request.size(),
+                header_complete ? 1 : 0,
+                static_cast<unsigned long long>(GetTickCount64() - t0),
+                st ? st->active_clients.load(std::memory_order_acquire) : static_cast<long>(-1),
+                static_cast<unsigned long>(GetCurrentThreadId()));
             if (request.empty()) {
                 closesocket(s);
                 return;
             }
             std::string upgrade = fixture_lower(header_value_ci(request, "Upgrade"));
             if (upgrade == "websocket") {
-                handle_websocket(s, request);
+                diag::log_tagged_fmt("testlab_burp", "loopback_handle_client websocket accept=%llu request=%llu request_bytes=%zu tid=%lu",
+                    static_cast<unsigned long long>(accept_idx),
+                    static_cast<unsigned long long>(request_idx),
+                    request.size(),
+                    static_cast<unsigned long>(GetCurrentThreadId()));
+                handle_websocket(st, s, request, accept_idx, request_idx);
                 return;
             }
-            handle_http(s, request);
+            diag::log_tagged_fmt("testlab_burp", "loopback_handle_client http accept=%llu request=%llu request_bytes=%zu target=%s tid=%lu",
+                static_cast<unsigned long long>(accept_idx),
+                static_cast<unsigned long long>(request_idx),
+                request.size(),
+                request_target_from_raw(request).c_str(),
+                static_cast<unsigned long>(GetCurrentThreadId()));
+            handle_http(st, s, request, accept_idx, request_idx);
         }
 
-        static void handle_websocket(SOCKET s, const std::string& request) {
+        static void handle_websocket(loopback_state_t* st, SOCKET s, const std::string& request, uint64_t accept_idx, uint64_t request_idx) {
             std::string key = header_value_ci(request, "Sec-WebSocket-Key");
             std::string accept = websocket_accept_for_key(key);
             std::string resp = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n";
+            diag::log_tagged_fmt("testlab_burp", "loopback_websocket_handshake accept=%llu request=%llu key_len=%zu accept_len=%zu tid=%lu",
+                static_cast<unsigned long long>(accept_idx),
+                static_cast<unsigned long long>(request_idx),
+                key.size(),
+                accept.size(),
+                static_cast<unsigned long>(GetCurrentThreadId()));
             if (!send_all_fixture(s, resp)) {
+                int err = WSAGetLastError();
+                if (st)
+                    st->last_wsa_error.store(err, std::memory_order_release);
+                diag::log_tagged_fmt("testlab_burp", "loopback_websocket_handshake_send_failed accept=%llu request=%llu wsa=%d tid=%lu",
+                    static_cast<unsigned long long>(accept_idx),
+                    static_cast<unsigned long long>(request_idx),
+                    err,
+                    static_cast<unsigned long>(GetCurrentThreadId()));
                 closesocket(s);
                 return;
             }
+            uint64_t response_idx = st ? st->response_count.fetch_add(1, std::memory_order_acq_rel) + 1 : 0;
+            diag::log_tagged_fmt("testlab_burp", "loopback_websocket_handshake_sent accept=%llu request=%llu response=%llu bytes=%zu tid=%lu",
+                static_cast<unsigned long long>(accept_idx),
+                static_cast<unsigned long long>(request_idx),
+                static_cast<unsigned long long>(response_idx),
+                resp.size(),
+                static_cast<unsigned long>(GetCurrentThreadId()));
             uint64_t end_ms = GetTickCount64() + 3500;
             uint8_t hdr[2] = {};
+            size_t frames_seen = 0;
             while (GetTickCount64() < end_ms) {
                 int n = recv(s, reinterpret_cast<char*>(hdr), 2, 0);
-                if (n <= 0) break;
+                if (n <= 0) {
+                    int err = WSAGetLastError();
+                    if (st)
+                        st->last_wsa_error.store(err, std::memory_order_release);
+                    diag::log_tagged_fmt("testlab_burp", "loopback_websocket_recv_end accept=%llu request=%llu recv=%d wsa=%d frames=%zu tid=%lu",
+                        static_cast<unsigned long long>(accept_idx),
+                        static_cast<unsigned long long>(request_idx),
+                        n,
+                        err,
+                        frames_seen,
+                        static_cast<unsigned long>(GetCurrentThreadId()));
+                    break;
+                }
                 if (n < 2) continue;
                 size_t len = hdr[1] & 0x7F;
                 if (len == 126) {
@@ -856,6 +977,15 @@ namespace {
                     for (size_t i = 0; i < payload.size(); ++i) payload[i] ^= mask[i % 4];
                 }
                 uint8_t opcode = hdr[0] & 0x0F;
+                ++frames_seen;
+                diag::log_tagged_fmt("testlab_burp", "loopback_websocket_frame accept=%llu request=%llu opcode=0x%02X len=%zu masked=%d frames=%zu tid=%lu",
+                    static_cast<unsigned long long>(accept_idx),
+                    static_cast<unsigned long long>(request_idx),
+                    static_cast<unsigned>(opcode),
+                    payload.size(),
+                    masked ? 1 : 0,
+                    frames_seen,
+                    static_cast<unsigned long>(GetCurrentThreadId()));
                 if (opcode == 0x8) break;
                 if (opcode == 0x1 || opcode == 0x2) {
                     std::string frame;
@@ -868,13 +998,36 @@ namespace {
                         frame.push_back(static_cast<char>(payload.size() & 0xFF));
                     }
                     frame.append(reinterpret_cast<const char*>(payload.data()), payload.size());
-                    send_all_fixture(s, frame);
+                    if (send_all_fixture(s, frame)) {
+                        response_idx = st ? st->response_count.fetch_add(1, std::memory_order_acq_rel) + 1 : 0;
+                        diag::log_tagged_fmt("testlab_burp", "loopback_websocket_frame_sent accept=%llu request=%llu response=%llu frame_bytes=%zu tid=%lu",
+                            static_cast<unsigned long long>(accept_idx),
+                            static_cast<unsigned long long>(request_idx),
+                            static_cast<unsigned long long>(response_idx),
+                            frame.size(),
+                            static_cast<unsigned long>(GetCurrentThreadId()));
+                    } else {
+                        int err = WSAGetLastError();
+                        if (st)
+                            st->last_wsa_error.store(err, std::memory_order_release);
+                        diag::log_tagged_fmt("testlab_burp", "loopback_websocket_frame_send_failed accept=%llu request=%llu wsa=%d frame_bytes=%zu tid=%lu",
+                            static_cast<unsigned long long>(accept_idx),
+                            static_cast<unsigned long long>(request_idx),
+                            err,
+                            frame.size(),
+                            static_cast<unsigned long>(GetCurrentThreadId()));
+                    }
                 }
             }
+            diag::log_tagged_fmt("testlab_burp", "loopback_websocket_close accept=%llu request=%llu frames=%zu tid=%lu",
+                static_cast<unsigned long long>(accept_idx),
+                static_cast<unsigned long long>(request_idx),
+                frames_seen,
+                static_cast<unsigned long>(GetCurrentThreadId()));
             closesocket(s);
         }
 
-        static void handle_http(SOCKET s, const std::string& request) {
+        static void handle_http(loopback_state_t* st, SOCKET s, const std::string& request, uint64_t accept_idx, uint64_t request_idx) {
             std::string target = request_target_from_raw(request);
             std::string path = target;
             std::string query;
@@ -885,15 +1038,19 @@ namespace {
             }
             std::string body;
             std::string content_type = "text/html";
+            const char* route = "html";
             if (path == "/token") {
                 content_type = "application/json";
                 body = "{\"access_token\":\"aida-local-access\",\"refresh_token\":\"aida-local-refresh\",\"token_type\":\"Bearer\",\"expires_in\":3600}";
+                route = "token";
             } else if (path == "/graphql") {
                 content_type = "application/json";
                 body = "{\"data\":{\"viewer\":{\"login\":\"aida-fixture\"}},\"extensions\":{\"fixture\":\"graphql\"}}";
+                route = "graphql";
             } else if (path == "/aida-fixture.js") {
                 content_type = "application/javascript";
                 body = "window.aidaFixtureLoaded=true;console.log('aida-fixture-js');";
+                route = "script";
             } else {
                 std::ostringstream os;
                 os << "<!doctype html><html><head><meta name=\"generator\" content=\"WordPress 6.4\">"
@@ -918,40 +1075,147 @@ namespace {
                  << "Content-Length: " << body.size() << "\r\n"
                  << "Connection: close\r\n\r\n"
                  << body;
-            send_all_fixture(s, resp.str());
+            std::string response = resp.str();
+            const bool sent = send_all_fixture(s, response);
+            int err = sent ? 0 : WSAGetLastError();
+            if (st && err != 0)
+                st->last_wsa_error.store(err, std::memory_order_release);
+            uint64_t response_idx = sent && st ? st->response_count.fetch_add(1, std::memory_order_acq_rel) + 1 : 0;
+            diag::log_tagged_fmt("testlab_burp", "loopback_http_response accept=%llu request=%llu response=%llu route=%s status=200 path=%s query_len=%zu body=%zu bytes=%zu sent=%d wsa=%d tid=%lu",
+                static_cast<unsigned long long>(accept_idx),
+                static_cast<unsigned long long>(request_idx),
+                static_cast<unsigned long long>(response_idx),
+                route,
+                path.c_str(),
+                query.size(),
+                body.size(),
+                response.size(),
+                sent ? 1 : 0,
+                err,
+                static_cast<unsigned long>(GetCurrentThreadId()));
             shutdown(s, SD_BOTH);
             closesocket(s);
         }
     };
 
-    DWORD WINAPI burp_loopback_fixture_thread_entry_win32(void* arg) {
-        DWORD rc = static_cast<DWORD>(burp_loopback_fixture_t::thread_entry(arg));
-        diag::log_tagged_fmt("testlab_burp", "loopback_win32_thread_return rc=%lu tid=%lu",
-            static_cast<unsigned long>(rc),
-            static_cast<unsigned long>(GetCurrentThreadId()));
-        return rc;
-    }
-
     std::unique_ptr<burp_loopback_fixture_t> g_burp_fixture;
     std::string g_burp_wordlist_path;
     std::string g_subdomain_wordlist_path;
+
+    bool probe_burp_loopback_fixture(uint16_t port, std::string& detail) {
+        const ULONGLONG t0 = GetTickCount64();
+        detail.clear();
+        if (port == 0) {
+            detail = "port_zero";
+            diag::log_tagged_fmt("testlab_burp", "loopback_probe_result port=%u ok=0 detail=%s elapsed_ms=%llu",
+                static_cast<unsigned>(port),
+                detail.c_str(),
+                static_cast<unsigned long long>(GetTickCount64() - t0));
+            return false;
+        }
+        if (!ensure_burp_fixture_wsa()) {
+            detail = "wsa_startup_failed";
+            diag::log_tagged_fmt("testlab_burp", "loopback_probe_result port=%u ok=0 detail=%s elapsed_ms=%llu",
+                static_cast<unsigned>(port),
+                detail.c_str(),
+                static_cast<unsigned long long>(GetTickCount64() - t0));
+            return false;
+        }
+        SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (s == INVALID_SOCKET) {
+            detail = "socket_failed:" + std::to_string(WSAGetLastError());
+            diag::log_tagged_fmt("testlab_burp", "loopback_probe_result port=%u ok=0 detail=%s elapsed_ms=%llu",
+                static_cast<unsigned>(port),
+                detail.c_str(),
+                static_cast<unsigned long long>(GetTickCount64() - t0));
+            return false;
+        }
+        DWORD timeout = 750;
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = htons(port);
+        if (connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR) {
+            int err = WSAGetLastError();
+            closesocket(s);
+            detail = "connect_failed:" + std::to_string(err);
+            diag::log_tagged_fmt("testlab_burp", "loopback_probe_result port=%u ok=0 detail=%s elapsed_ms=%llu",
+                static_cast<unsigned>(port),
+                detail.c_str(),
+                static_cast<unsigned long long>(GetTickCount64() - t0));
+            return false;
+        }
+        std::string req = "GET /__aida_fixture_probe HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(static_cast<unsigned>(port)) + "\r\nConnection: close\r\n\r\n";
+        if (!send_all_fixture(s, req)) {
+            int err = WSAGetLastError();
+            closesocket(s);
+            detail = "send_failed:" + std::to_string(err);
+            diag::log_tagged_fmt("testlab_burp", "loopback_probe_result port=%u ok=0 detail=%s elapsed_ms=%llu",
+                static_cast<unsigned>(port),
+                detail.c_str(),
+                static_cast<unsigned long long>(GetTickCount64() - t0));
+            return false;
+        }
+        char buf[512] = {};
+        int n = recv(s, buf, sizeof(buf), 0);
+        int err = n <= 0 ? WSAGetLastError() : 0;
+        closesocket(s);
+        if (n <= 0) {
+            detail = "recv_failed:" + std::to_string(err);
+            diag::log_tagged_fmt("testlab_burp", "loopback_probe_result port=%u ok=0 detail=%s elapsed_ms=%llu",
+                static_cast<unsigned>(port),
+                detail.c_str(),
+                static_cast<unsigned long long>(GetTickCount64() - t0));
+            return false;
+        }
+        std::string response_prefix(buf, buf + n);
+        if (response_prefix.find("HTTP/1.1 200") == std::string::npos &&
+            response_prefix.find("HTTP/1.0 200") == std::string::npos) {
+            detail = "unexpected_response:" + std::to_string(n);
+            diag::log_tagged_fmt("testlab_burp", "loopback_probe_result port=%u ok=0 detail=%s elapsed_ms=%llu",
+                static_cast<unsigned>(port),
+                detail.c_str(),
+                static_cast<unsigned long long>(GetTickCount64() - t0));
+            return false;
+        }
+        detail = "ok:" + std::to_string(n);
+        diag::log_tagged_fmt("testlab_burp", "loopback_probe_result port=%u ok=1 detail=%s elapsed_ms=%llu",
+            static_cast<unsigned>(port),
+            detail.c_str(),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        return true;
+    }
 
     bool ensure_burp_loopback_fixture(HANDLE hf, const char* tag) {
         if (g_burp_fixture) {
             const uint16_t existing_port = g_burp_fixture->current_port();
             const bool existing_worker_active = g_burp_fixture->worker_is_active();
-            if (existing_port != 0 && !g_burp_fixture->is_stopping() && existing_worker_active) {
-                log_msg(hf, tag, "fixture_reuse -- loopback_http_ws port=%u worker_active=%d active_clients=%ld",
+            std::string probe_detail;
+            const bool reusable = existing_port != 0 && !g_burp_fixture->is_stopping() && existing_worker_active &&
+                probe_burp_loopback_fixture(existing_port, probe_detail);
+            if (reusable) {
+                log_msg(hf, tag, "fixture_reuse -- loopback_http_ws port=%u worker_active=%d active_clients=%ld accept_count=%llu request_count=%llu response_count=%llu probe=%s",
                     static_cast<unsigned>(existing_port),
                     existing_worker_active ? 1 : 0,
-                    g_burp_fixture->current_active_clients());
+                    g_burp_fixture->current_active_clients(),
+                    static_cast<unsigned long long>(g_burp_fixture->current_accept_count()),
+                    static_cast<unsigned long long>(g_burp_fixture->current_request_count()),
+                    static_cast<unsigned long long>(g_burp_fixture->current_response_count()),
+                    probe_detail.c_str());
                 return true;
             }
             const uint16_t stale_port = existing_port;
             const bool stopped = g_burp_fixture->stop();
-            log_msg(hf, tag, "fixture_replace -- stale loopback stopped=%d port=%u",
+            log_msg(hf, tag, "fixture_replace -- stale loopback stopped=%d port=%u worker_active=%d accept_count=%llu request_count=%llu response_count=%llu probe=%s",
                 stopped ? 1 : 0,
-                static_cast<unsigned>(stale_port));
+                static_cast<unsigned>(stale_port),
+                existing_worker_active ? 1 : 0,
+                static_cast<unsigned long long>(g_burp_fixture->current_accept_count()),
+                static_cast<unsigned long long>(g_burp_fixture->current_request_count()),
+                static_cast<unsigned long long>(g_burp_fixture->current_response_count()),
+                probe_detail.empty() ? "<not_run>" : probe_detail.c_str());
             if (!stopped)
                 return false;
             g_burp_fixture.reset();
@@ -960,6 +1224,17 @@ namespace {
         if (!fixture->start(hf, tag)) {
             return false;
         }
+        std::string probe_detail;
+        if (!probe_burp_loopback_fixture(fixture->current_port(), probe_detail)) {
+            log_msg(hf, tag, "fixture_start_probe_failed -- loopback_http_ws port=%u probe=%s",
+                static_cast<unsigned>(fixture->current_port()),
+                probe_detail.c_str());
+            fixture->stop();
+            return false;
+        }
+        log_msg(hf, tag, "fixture_start_probe_ok -- loopback_http_ws port=%u probe=%s",
+            static_cast<unsigned>(fixture->current_port()),
+            probe_detail.c_str());
         g_burp_fixture = std::move(fixture);
         return true;
     }
@@ -1050,10 +1325,10 @@ namespace {
         Sleep(500);
     }
 
-    void ensure_sequencer_fixture(HANDLE hf, const char* tag) {
+    bool ensure_sequencer_fixture(HANDLE hf, const char* tag) {
         auto cols = aida::burp::sequencer::list_collections();
-        if (!cols.empty()) return;
-        if (!ensure_burp_loopback_fixture(hf, tag)) return;
+        if (!cols.empty()) return true;
+        if (!ensure_burp_loopback_fixture(hf, tag)) return false;
         aida::burp::sequencer::collection_config_t cfg;
         cfg.url = burp_fixture_url("/?q=AIDASEQ1234");
         cfg.host = "127.0.0.1";
@@ -1069,19 +1344,22 @@ namespace {
         log_msg(hf, tag, "fixture_sequencer start id=%llu url=%s port=%u err=%s",
             static_cast<unsigned long long>(id), cfg.url.c_str(), static_cast<unsigned>(cfg.port),
             aida::burp::sequencer::last_error().c_str());
-        for (int i = 0; i < 20; ++i) {
+        if (id == 0)
+            return false;
+        for (int i = 0; i < 80; ++i) {
             auto st = aida::burp::sequencer::status(id);
             log_msg(hf, tag, "fixture_sequencer poll=%d id=%llu collected=%zu target=%zu running=%d error=%d err=%s",
                 i, static_cast<unsigned long long>(id), st.collected, st.target, st.running ? 1 : 0, st.error ? 1 : 0, st.error_message.c_str());
-            if (st.collected > 0 || (!st.running && st.id != 0)) break;
+            if (st.collected >= st.target || (st.error && !st.error_message.empty()) || (!st.running && st.id != 0 && st.collected > 0)) break;
             Sleep(150);
         }
+        return true;
     }
 
-    void ensure_intruder_fixture(HANDLE hf, const char* tag) {
+    bool ensure_intruder_fixture(HANDLE hf, const char* tag) {
         auto jobs = aida::burp::intruder::list_jobs();
-        if (!jobs.empty()) return;
-        if (!ensure_burp_loopback_fixture(hf, tag)) return;
+        if (!jobs.empty()) return true;
+        if (!ensure_burp_loopback_fixture(hf, tag)) return false;
         std::string raw = "GET /?q=FUZZ HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
         size_t pos = raw.find("FUZZ");
         aida::burp::intruder::config_t cfg;
@@ -1100,10 +1378,13 @@ namespace {
         log_msg(hf, tag, "fixture_intruder start id=%llu port=%u pos=%zu err=%s",
             static_cast<unsigned long long>(id), static_cast<unsigned>(cfg.port), pos,
             aida::burp::intruder::last_error().c_str());
+        if (id == 0)
+            return false;
         wait_briefly_for_async_state();
         auto st = aida::burp::intruder::status(id);
         log_msg(hf, tag, "fixture_intruder status id=%llu total=%zu sent=%zu errors=%zu running=%d",
             static_cast<unsigned long long>(id), st.total, st.sent, st.errors, st.running ? 1 : 0);
+        return true;
     }
 
     bool ensure_active_scanner_fixture(HANDLE hf, const char* tag) {
@@ -1175,10 +1456,10 @@ namespace {
         return saw_status && saw_progress && after_ok && after.total_points > 0 && after.completed_probes > 0;
     }
 
-    void ensure_crawler_fixture(HANDLE hf, const char* tag) {
+    bool ensure_crawler_fixture(HANDLE hf, const char* tag) {
         auto crawls = aida::burp::crawler::list();
-        if (!crawls.empty()) return;
-        if (!ensure_burp_loopback_fixture(hf, tag)) return;
+        if (!crawls.empty()) return true;
+        if (!ensure_burp_loopback_fixture(hf, tag)) return false;
         aida::burp::crawler::initialize();
         aida::burp::crawler::crawl_config_t cfg;
         cfg.start_urls = {burp_fixture_url("/")};
@@ -1191,7 +1472,10 @@ namespace {
         uint64_t id = aida::burp::crawler::start(cfg);
         log_msg(hf, tag, "fixture_crawler start id=%llu url=%s err=%s",
             static_cast<unsigned long long>(id), cfg.start_urls[0].c_str(), aida::burp::crawler::last_error().c_str());
+        if (id == 0)
+            return false;
         wait_briefly_for_async_state();
+        return true;
     }
 
     void ensure_report_fixture(HANDLE hf, const char* tag) {
@@ -1302,30 +1586,51 @@ namespace {
         log_msg(hf, tag, "fixture_collab_result interactions=%zu tokens=%zu", after.size(), aida::burp::collaborator::list_tokens().size());
     }
 
-    void ensure_ws_fixture(HANDLE hf, const char* tag) {
+    bool ensure_ws_fixture(HANDLE hf, const char* tag) {
         auto conns = aida::burp::ws_editor::list_connections();
-        if (!conns.empty()) return;
-        if (!ensure_burp_loopback_fixture(hf, tag)) return;
-        aida::burp::ws_editor::initialize();
-        aida::burp::ws_editor::ws_connection_config_t cfg;
-        cfg.scheme = "ws";
-        cfg.host = "127.0.0.1";
-        cfg.port = burp_fixture_port();
-        cfg.path = "/ws";
-        cfg.verify_tls = false;
-        cfg.connect_timeout_ms = 1500;
-        cfg.read_timeout_ms = 4000;
-        uint64_t id = aida::burp::ws_editor::connect(cfg);
-        bool sent = id != 0 && aida::burp::ws_editor::send_text(id, "aida-ws-fixture");
-        log_msg(hf, tag, "fixture_ws connect id=%llu sent=%d port=%u err=%s",
-            static_cast<unsigned long long>(id), sent ? 1 : 0, static_cast<unsigned>(cfg.port), aida::burp::ws_editor::last_error().c_str());
-        Sleep(250);
+        if (!conns.empty()) return true;
+        for (int attempt = 1; attempt <= 2; ++attempt) {
+            if (!ensure_burp_loopback_fixture(hf, tag)) return false;
+            aida::burp::ws_editor::initialize();
+            aida::burp::ws_editor::ws_connection_config_t cfg;
+            cfg.scheme = "ws";
+            cfg.host = "127.0.0.1";
+            cfg.port = burp_fixture_port();
+            cfg.path = "/ws";
+            cfg.verify_tls = false;
+            cfg.connect_timeout_ms = 5000;
+            cfg.read_timeout_ms = 4000;
+            uint64_t id = aida::burp::ws_editor::connect(cfg);
+            bool sent = id != 0 && aida::burp::ws_editor::send_text(id, "aida-ws-fixture");
+            log_msg(hf, tag, "fixture_ws connect attempt=%d id=%llu sent=%d port=%u active_clients=%ld worker_active=%d err=%s",
+                attempt,
+                static_cast<unsigned long long>(id),
+                sent ? 1 : 0,
+                static_cast<unsigned>(cfg.port),
+                g_burp_fixture ? g_burp_fixture->current_active_clients() : static_cast<long>(-1),
+                g_burp_fixture && g_burp_fixture->worker_is_active() ? 1 : 0,
+                aida::burp::ws_editor::last_error().c_str());
+            Sleep(250);
+            conns = aida::burp::ws_editor::list_connections();
+            if (!conns.empty()) return true;
+            if (g_burp_fixture) {
+                const uint16_t stale_port = g_burp_fixture->current_port();
+                const bool stopped = g_burp_fixture->stop();
+                log_msg(hf, tag, "fixture_ws retry_replace attempt=%d stopped=%d stale_port=%u",
+                    attempt,
+                    stopped ? 1 : 0,
+                    static_cast<unsigned>(stale_port));
+                if (!stopped) return false;
+                g_burp_fixture.reset();
+            }
+        }
+        return false;
     }
 
-    void ensure_content_discovery_fixture(HANDLE hf, const char* tag) {
+    bool ensure_content_discovery_fixture(HANDLE hf, const char* tag) {
         auto jobs = aida::burp::content_discovery::list();
-        if (!jobs.empty()) return;
-        if (!ensure_burp_loopback_fixture(hf, tag)) return;
+        if (!jobs.empty()) return true;
+        if (!ensure_burp_loopback_fixture(hf, tag)) return false;
         aida::burp::content_discovery::initialize();
         aida::burp::content_discovery::config_t cfg;
         cfg.target_url = burp_fixture_url("/FUZZ");
@@ -1338,10 +1643,13 @@ namespace {
         log_msg(hf, tag, "fixture_content_discovery start id=%llu target=%s wordlist=%s err=%s",
             static_cast<unsigned long long>(id), cfg.target_url.c_str(), cfg.wordlist_file.c_str(),
             aida::burp::content_discovery::last_error().c_str());
+        if (id == 0)
+            return false;
         wait_briefly_for_async_state();
         auto st = aida::burp::content_discovery::status(id);
         log_msg(hf, tag, "fixture_content_discovery status id=%llu attempts=%d total=%d hits=%d errors=%d",
             static_cast<unsigned long long>(id), st.attempts, st.total, st.hits, st.errors);
+        return true;
     }
 
     void ensure_subdomain_fixture(HANDLE hf, const char* tag) {
@@ -1369,10 +1677,10 @@ namespace {
         }
     }
 
-    void ensure_param_miner_fixture(HANDLE hf, const char* tag) {
+    bool ensure_param_miner_fixture(HANDLE hf, const char* tag) {
         auto jobs = aida::burp::param_miner::list_jobs();
-        if (!jobs.empty()) return;
-        if (!ensure_burp_loopback_fixture(hf, tag)) return;
+        if (!jobs.empty()) return true;
+        if (!ensure_burp_loopback_fixture(hf, tag)) return false;
         aida::burp::param_miner::config_t cfg;
         cfg.target_url = burp_fixture_url("/");
         cfg.location = aida::burp::param_miner::location_t::query;
@@ -1385,6 +1693,8 @@ namespace {
         uint64_t id = aida::burp::param_miner::start(cfg);
         log_msg(hf, tag, "fixture_param_miner start id=%llu target=%s err=%s",
             static_cast<unsigned long long>(id), cfg.target_url.c_str(), aida::burp::param_miner::last_error().c_str());
+        if (id == 0)
+            return false;
         for (int i = 0; i < 20; ++i) {
             auto st = aida::burp::param_miner::status(id);
             log_msg(hf, tag, "fixture_param_miner poll=%d id=%llu total=%zu tried=%zu hits=%zu running=%d",
@@ -1392,6 +1702,7 @@ namespace {
             if (!st.running && st.tried > 0) break;
             Sleep(100);
         }
+        return true;
     }
 
     void cleanup_burp_async_fixture_jobs(HANDLE hf) {
@@ -2112,7 +2423,11 @@ namespace {
     void test_sequencer_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "seq_list";
         log_msg(hf, tag, "START -- sequencer::list_collections()");
-        ensure_sequencer_fixture(hf, tag);
+        const bool fixture_ok = ensure_sequencer_fixture(hf, tag);
+        if (!fixture_ok) {
+            fail_empty_evidence(hf, tag, failed, "sequencer fixture setup failed before list_collections; startup/probe/action evidence is above");
+            return;
+        }
         auto cols = aida::burp::sequencer::list_collections();
         log_msg(hf, tag, "collection count = %zu", cols.size());
         if (cols.empty()) {
@@ -2135,7 +2450,11 @@ namespace {
     void test_intruder_list_jobs(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "intruder_list";
         log_msg(hf, tag, "START -- intruder::list_jobs()");
-        ensure_intruder_fixture(hf, tag);
+        const bool fixture_ok = ensure_intruder_fixture(hf, tag);
+        if (!fixture_ok) {
+            fail_empty_evidence(hf, tag, failed, "intruder fixture setup failed before list_jobs; startup/probe/action evidence is above");
+            return;
+        }
         auto jobs = aida::burp::intruder::list_jobs();
         log_msg(hf, tag, "job count = %zu", jobs.size());
         if (jobs.empty()) {
@@ -2270,6 +2589,10 @@ namespace {
         const char* tag = "ascan_list";
         log_msg(hf, tag, "START -- active_scanner::list_audits()");
         const bool fixture_ok = ensure_active_scanner_fixture(hf, tag);
+        if (!fixture_ok) {
+            fail_empty_evidence(hf, tag, failed, "active scanner fixture setup failed before list_audits; startup/probe/action evidence is above");
+            return;
+        }
         auto audits = aida::burp::active_scanner::list_audits();
         log_msg(hf, tag, "audit count = %zu", audits.size());
         for (size_t i = 0; i < audits.size() && i < 3; ++i) {
@@ -2282,10 +2605,6 @@ namespace {
                 audits[i].completed_probes,
                 audits[i].total_probes,
                 audits[i].issues_found);
-        }
-        if (!fixture_ok) {
-            fail_empty_evidence(hf, tag, failed, "active scanner fixture did not produce a bounded progressed audit");
-            return;
         }
         if (audits.empty()) {
             fail_empty_evidence(hf, tag, failed, "active scanner list returned zero audits after audit fixture/action should have created an audit");
@@ -2312,7 +2631,11 @@ namespace {
     void test_crawler_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "crawler_list";
         log_msg(hf, tag, "START -- crawler::list()");
-        ensure_crawler_fixture(hf, tag);
+        const bool fixture_ok = ensure_crawler_fixture(hf, tag);
+        if (!fixture_ok) {
+            fail_empty_evidence(hf, tag, failed, "crawler fixture setup failed before list; startup/probe/action evidence is above");
+            return;
+        }
         auto crawls = aida::burp::crawler::list();
         log_msg(hf, tag, "crawl count = %zu", crawls.size());
         if (crawls.empty()) {
@@ -2584,7 +2907,11 @@ namespace {
     void test_ws_list_connections(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "ws_list";
         log_msg(hf, tag, "START -- ws_editor::list_connections()");
-        ensure_ws_fixture(hf, tag);
+        const bool fixture_ok = ensure_ws_fixture(hf, tag);
+        if (!fixture_ok) {
+            fail_empty_evidence(hf, tag, failed, "websocket fixture setup failed before list_connections; startup/probe/action evidence is above");
+            return;
+        }
         auto conns = aida::burp::ws_editor::list_connections();
         log_msg(hf, tag, "connection count = %zu", conns.size());
         for (size_t i = 0; i < conns.size() && i < 5; ++i) {
@@ -3419,7 +3746,11 @@ namespace {
     void test_content_discovery_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "cd_list";
         log_msg(hf, tag, "START -- content_discovery::list()");
-        ensure_content_discovery_fixture(hf, tag);
+        const bool fixture_ok = ensure_content_discovery_fixture(hf, tag);
+        if (!fixture_ok) {
+            fail_empty_evidence(hf, tag, failed, "content discovery fixture setup failed before list; startup/probe/action evidence is above");
+            return;
+        }
         auto jobs = aida::burp::content_discovery::list();
         log_msg(hf, tag, "job count = %zu", jobs.size());
         if (jobs.empty()) {
@@ -3623,7 +3954,11 @@ namespace {
     void test_param_miner_list_jobs(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "pm_list";
         log_msg(hf, tag, "START -- param_miner::list_jobs()");
-        ensure_param_miner_fixture(hf, tag);
+        const bool fixture_ok = ensure_param_miner_fixture(hf, tag);
+        if (!fixture_ok) {
+            fail_empty_evidence(hf, tag, failed, "param miner fixture setup failed before list_jobs; startup/probe/action evidence is above");
+            return;
+        }
         auto jobs = aida::burp::param_miner::list_jobs();
         log_msg(hf, tag, "job count = %zu", jobs.size());
         if (jobs.empty()) {

@@ -14,6 +14,7 @@
 #include "../analysis/code_patcher.hpp"
 #include "../debugger/page_guard_engine.hpp"
 #include "../disasm/zydis_disasm.hpp"
+#include "../../helpers/diag_log.hpp"
 
 #include <algorithm>
 #include <array>
@@ -655,8 +656,30 @@ inline std::string reg_from_operand(const std::string& op)
         "rax","rbx","rcx","rdx","rsi","rdi","rbp","rsp","r8","r9","r10","r11","r12","r13","r14","r15"
     };
     for (const char* r : regs) {
-        if (s == r || s == std::string("e") + (r + 1))
+        if (s == r)
             return r;
+    }
+    static const std::array<std::pair<const char*, const char*>, 52> aliases = {{
+        {"eax","rax"},{"ax","rax"},{"al","rax"},{"ah","rax"},
+        {"ebx","rbx"},{"bx","rbx"},{"bl","rbx"},{"bh","rbx"},
+        {"ecx","rcx"},{"cx","rcx"},{"cl","rcx"},{"ch","rcx"},
+        {"edx","rdx"},{"dx","rdx"},{"dl","rdx"},{"dh","rdx"},
+        {"esi","rsi"},{"si","rsi"},{"sil","rsi"},
+        {"edi","rdi"},{"di","rdi"},{"dil","rdi"},
+        {"ebp","rbp"},{"bp","rbp"},{"bpl","rbp"},
+        {"esp","rsp"},{"sp","rsp"},{"spl","rsp"},
+        {"r8d","r8"},{"r8w","r8"},{"r8b","r8"},
+        {"r9d","r9"},{"r9w","r9"},{"r9b","r9"},
+        {"r10d","r10"},{"r10w","r10"},{"r10b","r10"},
+        {"r11d","r11"},{"r11w","r11"},{"r11b","r11"},
+        {"r12d","r12"},{"r12w","r12"},{"r12b","r12"},
+        {"r13d","r13"},{"r13w","r13"},{"r13b","r13"},
+        {"r14d","r14"},{"r14w","r14"},{"r14b","r14"},
+        {"r15d","r15"},{"r15w","r15"},{"r15b","r15"}
+    }};
+    for (const auto& alias : aliases) {
+        if (s == alias.first)
+            return alias.second;
     }
     return s;
 }
@@ -1681,6 +1704,35 @@ inline tool_result_t cff_recover_cfg(const json& params)
     return tool_result_t::ok("Recovered a heuristic CFG from flattened control flow", out);
 }
 
+inline json z3_backend_state()
+{
+    json state;
+    HMODULE mod = GetModuleHandleW(L"libz3.dll");
+    state["module_loaded"] = mod != nullptr;
+    state["module_handle"] = mod ? sa_format_address(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(mod))) : "0x0";
+    if (mod) {
+        char path[MAX_PATH] = {};
+        DWORD len = GetModuleFileNameA(mod, path, MAX_PATH);
+        state["module_path"] = len ? std::string(path, path + len) : std::string();
+        const bool has_cfg = GetProcAddress(mod, "Z3_mk_config") != nullptr;
+        const bool has_ctx = GetProcAddress(mod, "Z3_mk_context") != nullptr;
+        const bool has_solver = GetProcAddress(mod, "Z3_mk_solver") != nullptr;
+        const bool has_check = GetProcAddress(mod, "Z3_solver_check") != nullptr;
+        state["api_mk_config"] = has_cfg;
+        state["api_mk_context"] = has_ctx;
+        state["api_mk_solver"] = has_solver;
+        state["api_solver_check"] = has_check;
+        state["api_available"] = has_cfg && has_ctx && has_solver && has_check;
+    } else {
+        wchar_t preload_dir[MAX_PATH] = {};
+        DWORD preload_len = GetEnvironmentVariableW(L"AIDA_Z3_PRELOAD_DIR", preload_dir, MAX_PATH);
+        state["module_path"] = "";
+        state["api_available"] = false;
+        state["preload_env_present"] = preload_len > 0 && preload_len < MAX_PATH;
+    }
+    return state;
+}
+
 inline tool_result_t mba_simplify(const json& params)
 {
     auto chk = require_driver();
@@ -1691,34 +1743,90 @@ inline tool_result_t mba_simplify(const json& params)
         return tool_result_t::error("address is required");
     const std::uint32_t pid = requested_pid(params);
     const std::uint32_t size = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(parse_param_u64(params, "size").value_or(4096)), 16, 65536);
-    const bool use_z3 = params.value("use_z3", true);
+    const bool use_z3 = params.value("use_z3", false);
+    const bool z3_explicit = params.contains("use_z3");
+    const json z3_state = z3_backend_state();
     auto insns = disassemble_target(pid, *address, size, 4096);
     json out = json::array();
+    std::uint64_t deterministic_count = 0;
+    std::uint64_t heuristic_count = 0;
+    bool solver_required = false;
     for (std::size_t i = 0; i < insns.size(); ++i) {
         const auto& ins = insns[i];
         const std::string m = mnemonic_of(ins);
         auto ops = split_operands(ins.ops);
         if ((m == "xor" || m == "sub") && ops.size() >= 2 && lower_ascii(ops[0]) == lower_ascii(ops[1])) {
-            out.push_back(json{{"original_va", sa_format_address(ins.addr)}, {"original_expr", std::string(ins.mnem) + " " + ins.ops}, {"simplified_expr", ops[0] + " = 0"}, {"verified", true}, {"proof_method", "deterministic_register_identity"}, {"z3_used", false}});
+            ++deterministic_count;
+            out.push_back(json{{"original_va", sa_format_address(ins.addr)}, {"original_expr", std::string(ins.mnem) + " " + ins.ops}, {"simplified_expr", ops[0] + " = 0"}, {"verified", true}, {"proof_method", "deterministic_register_identity"}, {"solver_required", false}, {"solver_invoked", false}, {"solver_selection_reason", "deterministic_identity"}, {"z3_used", false}});
         } else if (m == "shl" && ops.size() >= 2 && (ops[1] == "1" || ops[1] == "0x1")) {
-            out.push_back(json{{"original_va", sa_format_address(ins.addr)}, {"original_expr", std::string(ins.mnem) + " " + ins.ops}, {"simplified_expr", ops[0] + " = " + ops[0] + " * 2"}, {"verified", true}, {"proof_method", "deterministic_shift_identity"}, {"z3_used", false}});
+            ++deterministic_count;
+            out.push_back(json{{"original_va", sa_format_address(ins.addr)}, {"original_expr", std::string(ins.mnem) + " " + ins.ops}, {"simplified_expr", ops[0] + " = " + ops[0] + " * 2"}, {"verified", true}, {"proof_method", "deterministic_shift_identity"}, {"solver_required", false}, {"solver_invoked", false}, {"solver_selection_reason", "deterministic_identity"}, {"z3_used", false}});
         } else if (m == "not" && i + 1 < insns.size()) {
             const auto next_ops = split_operands(insns[i + 1].ops);
-            if (mnemonic_of(insns[i + 1]) == "add" && next_ops.size() >= 2 && lower_ascii(next_ops[0]) == lower_ascii(ops.empty() ? "" : ops[0]) && (next_ops[1] == "1" || next_ops[1] == "0x1"))
-                out.push_back(json{{"original_va", sa_format_address(ins.addr)}, {"original_expr", std::string("not/add ") + (ops.empty() ? "" : ops[0])}, {"simplified_expr", (ops.empty() ? std::string("x") : ops[0]) + " = -" + (ops.empty() ? std::string("x") : ops[0])}, {"verified", true}, {"proof_method", "deterministic_twos_complement_identity"}, {"z3_used", false}});
+            if (mnemonic_of(insns[i + 1]) == "add" && next_ops.size() >= 2 && lower_ascii(next_ops[0]) == lower_ascii(ops.empty() ? "" : ops[0]) && (next_ops[1] == "1" || next_ops[1] == "0x1")) {
+                ++deterministic_count;
+                out.push_back(json{{"original_va", sa_format_address(ins.addr)}, {"original_expr", std::string("not/add ") + (ops.empty() ? "" : ops[0])}, {"simplified_expr", (ops.empty() ? std::string("x") : ops[0]) + " = -" + (ops.empty() ? std::string("x") : ops[0])}, {"verified", true}, {"proof_method", "deterministic_twos_complement_identity"}, {"solver_required", false}, {"solver_invoked", false}, {"solver_selection_reason", "deterministic_identity"}, {"z3_used", false}});
+            }
         } else if ((m == "xor" || m == "and") && i + 2 < insns.size()) {
             const std::string m1 = mnemonic_of(insns[i + 1]);
             const std::string m2 = mnemonic_of(insns[i + 2]);
-            if ((m == "xor" && m1 == "and" && (m2 == "lea" || m2 == "add")) || (m == "and" && m1 == "xor" && (m2 == "lea" || m2 == "add")))
-                out.push_back(json{{"original_va", sa_format_address(ins.addr)}, {"original_expr", "xor/and/add MBA window"}, {"simplified_expr", "candidate_addition_or_bit_blend"}, {"verified", false}, {"proof_method", use_z3 ? "unverified_mba_heuristic_z3_not_invoked" : "unverified_mba_heuristic"}, {"z3_used", false}});
+            if ((m == "xor" && m1 == "and" && (m2 == "lea" || m2 == "add")) || (m == "and" && m1 == "xor" && (m2 == "lea" || m2 == "add"))) {
+                ++heuristic_count;
+                solver_required = true;
+                const bool z3_api_available = z3_state.value("api_available", false);
+                const std::string reason = !use_z3 ? "z3_not_requested" : (!z3_api_available ? "z3_backend_unavailable" : "z3_backend_available_no_owned_mba_solver_adapter");
+                out.push_back(json{{"original_va", sa_format_address(ins.addr)}, {"original_expr", "xor/and/add MBA window"}, {"simplified_expr", "candidate_addition_or_bit_blend"}, {"verified", false}, {"proof_method", use_z3 ? "unverified_mba_heuristic_z3_not_invoked" : "unverified_mba_heuristic"}, {"solver_required", true}, {"solver_invoked", false}, {"solver_selection_reason", reason}, {"z3_skip_reason", reason}, {"z3_used", false}});
+            }
         }
     }
+    const bool z3_api_available = z3_state.value("api_available", false);
+    const bool solver_invoked = false;
+    std::string selection_reason;
+    std::string skip_reason;
+    if (!use_z3) {
+        selection_reason = "z3_not_requested";
+        skip_reason = "z3_not_requested";
+    } else if (!solver_required) {
+        selection_reason = "deterministic_identities_do_not_require_solver";
+        skip_reason = "solver_not_required_for_detected_identities";
+    } else if (!z3_api_available) {
+        selection_reason = "z3_backend_unavailable";
+        skip_reason = "z3_backend_unavailable";
+    } else {
+        selection_reason = "z3_backend_available_no_owned_mba_solver_adapter";
+        skip_reason = "z3_backend_available_no_owned_mba_solver_adapter";
+    }
+    const bool z3_requested = use_z3 && solver_required;
+    diag::log_tagged_fmt("protected_re",
+        "mba_simplify_backend pid=%u address=0x%llX size=%u z3_requested=%d z3_preference=%d z3_explicit=%d z3_module_loaded=%d z3_api_available=%d solver_required=%d solver_invoked=%d deterministic=%llu heuristic=%llu instructions=%zu reason=%s",
+        pid,
+        static_cast<unsigned long long>(*address),
+        size,
+        z3_requested ? 1 : 0,
+        use_z3 ? 1 : 0,
+        z3_explicit ? 1 : 0,
+        z3_state.value("module_loaded", false) ? 1 : 0,
+        z3_api_available ? 1 : 0,
+        solver_required ? 1 : 0,
+        solver_invoked ? 1 : 0,
+        static_cast<unsigned long long>(deterministic_count),
+        static_cast<unsigned long long>(heuristic_count),
+        insns.size(),
+        selection_reason.c_str());
     json result;
     result["simplifications"] = out;
     result["count"] = out.size();
-    result["z3_requested"] = use_z3;
+    result["z3_requested"] = z3_requested;
+    result["z3_preference_requested"] = use_z3;
+    result["z3_request_explicit"] = z3_explicit;
     result["z3_used"] = false;
-    result["proof_backend"] = "deterministic_local_identities_only";
+    result["z3_backend"] = z3_state;
+    result["solver_required"] = solver_required;
+    result["solver_invoked"] = solver_invoked;
+    result["solver_selection_reason"] = selection_reason;
+    result["z3_skip_reason"] = skip_reason;
+    result["expression_complexity"] = json{{"instructions_decoded", insns.size()}, {"deterministic_identity_count", deterministic_count}, {"heuristic_candidate_count", heuristic_count}, {"solver_candidate_count", heuristic_count}, {"scan_size", size}};
+    result["proof_backend"] = solver_required ? "deterministic_local_identities_with_unverified_solver_candidates" : "deterministic_local_identities_only";
     result["confidence"] = out.empty() ? 0.0 : 0.65;
     return tool_result_t::ok("MBA simplification scan completed", result);
 }
@@ -2826,6 +2934,158 @@ inline std::uint64_t memory_reference_target(const AsmInstr& ins)
     return static_cast<std::uint64_t>(disp);
 }
 
+inline const char* zydis_gpr_name(std::uint16_t reg)
+{
+    switch (static_cast<ZydisRegister>(reg)) {
+    case ZYDIS_REGISTER_RAX: case ZYDIS_REGISTER_EAX: case ZYDIS_REGISTER_AX: case ZYDIS_REGISTER_AL: case ZYDIS_REGISTER_AH: return "rax";
+    case ZYDIS_REGISTER_RBX: case ZYDIS_REGISTER_EBX: case ZYDIS_REGISTER_BX: case ZYDIS_REGISTER_BL: case ZYDIS_REGISTER_BH: return "rbx";
+    case ZYDIS_REGISTER_RCX: case ZYDIS_REGISTER_ECX: case ZYDIS_REGISTER_CX: case ZYDIS_REGISTER_CL: case ZYDIS_REGISTER_CH: return "rcx";
+    case ZYDIS_REGISTER_RDX: case ZYDIS_REGISTER_EDX: case ZYDIS_REGISTER_DX: case ZYDIS_REGISTER_DL: case ZYDIS_REGISTER_DH: return "rdx";
+    case ZYDIS_REGISTER_RSI: case ZYDIS_REGISTER_ESI: case ZYDIS_REGISTER_SI: case ZYDIS_REGISTER_SIL: return "rsi";
+    case ZYDIS_REGISTER_RDI: case ZYDIS_REGISTER_EDI: case ZYDIS_REGISTER_DI: case ZYDIS_REGISTER_DIL: return "rdi";
+    case ZYDIS_REGISTER_RBP: case ZYDIS_REGISTER_EBP: case ZYDIS_REGISTER_BP: case ZYDIS_REGISTER_BPL: return "rbp";
+    case ZYDIS_REGISTER_RSP: case ZYDIS_REGISTER_ESP: case ZYDIS_REGISTER_SP: case ZYDIS_REGISTER_SPL: return "rsp";
+    case ZYDIS_REGISTER_R8: case ZYDIS_REGISTER_R8D: case ZYDIS_REGISTER_R8W: case ZYDIS_REGISTER_R8B: return "r8";
+    case ZYDIS_REGISTER_R9: case ZYDIS_REGISTER_R9D: case ZYDIS_REGISTER_R9W: case ZYDIS_REGISTER_R9B: return "r9";
+    case ZYDIS_REGISTER_R10: case ZYDIS_REGISTER_R10D: case ZYDIS_REGISTER_R10W: case ZYDIS_REGISTER_R10B: return "r10";
+    case ZYDIS_REGISTER_R11: case ZYDIS_REGISTER_R11D: case ZYDIS_REGISTER_R11W: case ZYDIS_REGISTER_R11B: return "r11";
+    case ZYDIS_REGISTER_R12: case ZYDIS_REGISTER_R12D: case ZYDIS_REGISTER_R12W: case ZYDIS_REGISTER_R12B: return "r12";
+    case ZYDIS_REGISTER_R13: case ZYDIS_REGISTER_R13D: case ZYDIS_REGISTER_R13W: case ZYDIS_REGISTER_R13B: return "r13";
+    case ZYDIS_REGISTER_R14: case ZYDIS_REGISTER_R14D: case ZYDIS_REGISTER_R14W: case ZYDIS_REGISTER_R14B: return "r14";
+    case ZYDIS_REGISTER_R15: case ZYDIS_REGISTER_R15D: case ZYDIS_REGISTER_R15W: case ZYDIS_REGISTER_R15B: return "r15";
+    default: return "";
+    }
+}
+
+inline bool add_signed_offset(std::uint64_t base, std::int64_t disp, std::uint64_t& out)
+{
+    if (disp >= 0) {
+        const auto udisp = static_cast<std::uint64_t>(disp);
+        if (base > std::numeric_limits<std::uint64_t>::max() - udisp)
+            return false;
+        out = base + udisp;
+        return true;
+    }
+    const auto magnitude = static_cast<std::uint64_t>(-(disp + 1)) + 1;
+    if (base < magnitude)
+        return false;
+    out = base - magnitude;
+    return true;
+}
+
+inline std::uint64_t memory_reference_target_with_registers(const AsmInstr& ins, const std::map<std::string, std::uint64_t>& reg_values, std::string* source)
+{
+    if (source)
+        source->clear();
+    if (!ins.has_mem_op)
+        return 0;
+    const auto none = static_cast<std::uint16_t>(ZYDIS_REGISTER_NONE);
+    const std::int64_t disp = ins.mem_op.has_disp ? ins.mem_op.disp : 0;
+    if (ins.mem_op.base_reg == static_cast<std::uint16_t>(ZYDIS_REGISTER_RIP)) {
+        std::uint64_t target = 0;
+        if (!add_signed_offset(ins.addr + static_cast<std::uint64_t>(std::max(ins.len, 1)), disp, target))
+            return 0;
+        if (source)
+            *source = "rip_relative";
+        return target;
+    }
+    if (ins.mem_op.base_reg == none && ins.mem_op.index_reg == none && ins.mem_op.has_disp) {
+        if (source)
+            *source = "absolute_displacement";
+        return static_cast<std::uint64_t>(disp);
+    }
+    if (ins.mem_op.base_reg != none && ins.mem_op.index_reg == none) {
+        const char* base_name = zydis_gpr_name(ins.mem_op.base_reg);
+        if (base_name && *base_name) {
+            if (auto base_value = resolve_last_register_value(reg_values, base_name)) {
+                std::uint64_t target = 0;
+                if (add_signed_offset(*base_value, disp, target)) {
+                    if (source)
+                        *source = std::string("tracked_register:") + base_name;
+                    return target;
+                }
+            }
+        }
+    }
+    const std::uint64_t direct = memory_reference_target(ins);
+    if (direct && source)
+        *source = "direct_displacement";
+    return direct;
+}
+
+inline bool resolve_assignment_constant(const AsmInstr& ins, const std::string& mnem, const std::vector<std::string>& ops, const std::map<std::string, std::uint64_t>& reg_values, std::uint64_t& value)
+{
+    if (ins.branch_target) {
+        value = ins.branch_target;
+        return true;
+    }
+    if (ins.has_imm) {
+        value = ins.imm_unsigned;
+        return true;
+    }
+    if (ops.size() >= 2) {
+        if (auto h = parse_hex_in_text(ops[1])) {
+            value = *h;
+            return true;
+        }
+    }
+    if (mnem == "lea" && ins.has_mem_op) {
+        std::string source;
+        const std::uint64_t ref = memory_reference_target_with_registers(ins, reg_values, &source);
+        if (ref) {
+            value = ref;
+            return true;
+        }
+    }
+    return false;
+}
+
+inline void update_register_constants(const AsmInstr& ins, const std::string& mnem, const std::vector<std::string>& ops, std::map<std::string, std::uint64_t>& reg_values)
+{
+    if (ops.empty() || operand_is_memory(ops[0]))
+        return;
+    const std::string dst = reg_from_operand(ops[0]);
+    if (dst.empty())
+        return;
+    if ((mnem == "xor" || mnem == "sub") && ops.size() >= 2 && lower_ascii(ops[0]) == lower_ascii(ops[1])) {
+        reg_values[dst] = 0;
+        return;
+    }
+    if (mnem == "mov" || mnem == "movabs" || mnem == "lea") {
+        std::uint64_t value = 0;
+        if (resolve_assignment_constant(ins, mnem, ops, reg_values, value))
+            reg_values[dst] = value;
+        else
+            reg_values.erase(dst);
+        return;
+    }
+    if ((mnem == "add" || mnem == "sub") && ops.size() >= 2) {
+        auto cur = resolve_last_register_value(reg_values, dst);
+        std::uint64_t rhs = 0;
+        bool have_rhs = ins.has_imm;
+        if (have_rhs)
+            rhs = ins.imm_unsigned;
+        else if (auto h = parse_hex_in_text(ops[1])) {
+            rhs = *h;
+            have_rhs = true;
+        }
+        if (cur && have_rhs && rhs <= static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+            std::uint64_t updated = 0;
+            const std::int64_t delta = mnem == "sub" ? -static_cast<std::int64_t>(rhs) : static_cast<std::int64_t>(rhs);
+            if (add_signed_offset(*cur, delta, updated)) {
+                reg_values[dst] = updated;
+                return;
+            }
+        }
+        reg_values.erase(dst);
+        return;
+    }
+    if (mnem == "and" || mnem == "or" || mnem == "imul" || mnem == "mul" || mnem == "div" ||
+        mnem == "idiv" || mnem == "shl" || mnem == "shr" || mnem == "sar" || mnem == "rol" ||
+        mnem == "ror" || mnem == "not" || mnem == "neg" || mnem == "xchg")
+        reg_values.erase(dst);
+}
+
 inline tool_result_t smc_find_decryptor(const json& params)
 {
     auto chk = require_driver();
@@ -2836,39 +3096,69 @@ inline tool_result_t smc_find_decryptor(const json& params)
     if (!target || !size || *size == 0)
         return tool_result_t::error("target_va and target_size are required");
     const std::uint32_t pid = requested_pid(params);
-    const std::uint64_t end = *target + std::min<std::uint64_t>(*size, 16ull * 1024ull * 1024ull);
+    const std::uint64_t bounded_target_size = std::min<std::uint64_t>(*size, 16ull * 1024ull * 1024ull);
+    const std::uint64_t max_u64 = std::numeric_limits<std::uint64_t>::max();
+    const std::uint64_t end = *target > max_u64 - bounded_target_size ? max_u64 : *target + bounded_target_size;
+    const ULONGLONG started = GetTickCount64();
     json candidates = json::array();
     std::uint64_t scanned = 0;
-    auto scan_code_range = [&](std::uint64_t scan_base, std::uint32_t scan_size, const std::string& source) {
+    bool cancelled = false;
+    auto scan_code_range = [&](std::uint64_t scan_base, std::uint32_t scan_size, const std::string& source) -> bool {
+        if (mcp_standalone::current_call_cancelled()) {
+            cancelled = true;
+            return false;
+        }
         scan_size = std::clamp<std::uint32_t>(scan_size, 1, 0x100000);
         auto insns = disassemble_target(pid, scan_base, scan_size, 65536);
         scanned += insns.size();
-        for (const auto& ins : insns) {
+        std::map<std::string, std::uint64_t> reg_values;
+        for (std::size_t ii = 0; ii < insns.size(); ++ii) {
+            if ((ii & 0x3FF) == 0 && mcp_standalone::current_call_cancelled()) {
+                cancelled = true;
+                return false;
+            }
+            const auto& ins = insns[ii];
             const std::string mnem = mnemonic_of(ins);
-            if (mnem != "mov" && mnem != "movabs" && mnem != "xor" && mnem != "add" && mnem != "sub" && mnem != "rol" && mnem != "ror")
+            auto ops = split_operands(ins.ops);
+            update_register_constants(ins, mnem, ops, reg_values);
+            if (mnem != "mov" && mnem != "movabs" && mnem != "lea" && mnem != "xor" && mnem != "add" && mnem != "sub" && mnem != "rol" && mnem != "ror")
                 continue;
             bool match = false;
-            const std::uint64_t ref = memory_reference_target(ins);
+            std::string ref_source;
+            const std::uint64_t ref = memory_reference_target_with_registers(ins, reg_values, &ref_source);
             if (ref)
                 match = ref >= *target && ref < end;
-            if (!match && ins.has_imm)
+            const bool memory_write = !ops.empty() && operand_is_memory(ops[0]);
+            if (!match && ins.has_imm && memory_write) {
                 match = ins.imm_unsigned >= *target && ins.imm_unsigned < end;
+                if (match)
+                    ref_source = "write_immediate";
+            }
             if (!match)
                 continue;
-            auto ops = split_operands(ins.ops);
-            candidates.push_back(json{{"decryptor_va", sa_format_address(ins.addr)}, {"write_instruction_va", sa_format_address(ins.addr)}, {"key_register", ops.size() > 1 ? reg_from_operand(ops.back()) : "unknown"}, {"estimated_algo", estimate_algo_from_mnemonic(mnem)}, {"evidence", instruction_to_json(ins)}, {"source", source}, {"confidence", 0.55}});
+            candidates.push_back(json{{"decryptor_va", sa_format_address(ins.addr)}, {"write_instruction_va", sa_format_address(ins.addr)}, {"memory_reference_va", ref ? sa_format_address(ref) : sa_format_address(ins.imm_unsigned)}, {"memory_reference_source", ref_source.empty() ? "unknown" : ref_source}, {"key_register", ops.size() > 1 ? reg_from_operand(ops.back()) : "unknown"}, {"estimated_algo", estimate_algo_from_mnemonic(mnem)}, {"evidence", instruction_to_json(ins)}, {"source", source}, {"tracked_register_count", reg_values.size()}, {"confidence", ref_source.rfind("tracked_register:", 0) == 0 ? 0.72 : 0.55}});
             if (candidates.size() >= 128)
                 break;
         }
+        return !cancelled;
     };
     auto scan_base = parse_param_u64(params, "scan_base");
     auto scan_size = parse_param_u64(params, "scan_size");
     if (scan_base) {
         const std::uint32_t bounded_scan = static_cast<std::uint32_t>(std::min<std::uint64_t>(scan_size.value_or(0x10000), 0x100000));
-        scan_code_range(*scan_base, bounded_scan == 0 ? 0x10000 : bounded_scan, "explicit_scan_range");
+        const std::uint32_t effective_scan = bounded_scan == 0 ? 0x10000 : bounded_scan;
+        scan_code_range(*scan_base, effective_scan, "explicit_scan_range");
+        json out{{"decryptors", candidates}, {"count", candidates.size()}, {"instructions_scanned", scanned}, {"explicit_scan_mode", true}, {"module_scan_skipped", true}, {"scan_base", sa_format_address(*scan_base)}, {"scan_size_requested", scan_size.value_or(0x10000)}, {"scan_size_effective", effective_scan}, {"target_va", sa_format_address(*target)}, {"target_size_effective", bounded_target_size}, {"cancelled", cancelled}, {"elapsed_ms", GetTickCount64() - started}};
+        if (cancelled)
+            return tool_result_t::error("SMC decryptor explicit scan cancelled", out);
+        return tool_result_t::ok(out);
     }
     auto mods = user_modules(pid);
     for (const auto& m : mods) {
+        if (mcp_standalone::current_call_cancelled()) {
+            cancelled = true;
+            break;
+        }
         if (candidates.size() >= 128)
             break;
         pe_layout_t pe;
@@ -2878,12 +3168,18 @@ inline tool_result_t smc_find_decryptor(const json& params)
             if (!executable_characteristics(sec.characteristics))
                 continue;
             const std::uint32_t sec_size = std::min<std::uint32_t>(sec.virtual_size ? sec.virtual_size : sec.raw_size, 0x100000);
-            scan_code_range(sec.va, sec_size, m.name + ":" + sec.name);
+            if (!scan_code_range(sec.va, sec_size, m.name + ":" + sec.name))
+                break;
             if (candidates.size() >= 128)
                 break;
         }
+        if (cancelled)
+            break;
     }
-    return tool_result_t::ok(json{{"decryptors", candidates}, {"count", candidates.size()}, {"instructions_scanned", scanned}});
+    json out{{"decryptors", candidates}, {"count", candidates.size()}, {"instructions_scanned", scanned}, {"explicit_scan_mode", false}, {"module_scan_skipped", false}, {"cancelled", cancelled}, {"elapsed_ms", GetTickCount64() - started}};
+    if (cancelled)
+        return tool_result_t::error("SMC decryptor scan cancelled", out);
+    return tool_result_t::ok(out);
 }
 
 inline std::optional<target_module_t> select_user_main_module(const json& params, std::string* err)

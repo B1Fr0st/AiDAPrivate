@@ -20,6 +20,8 @@
 #include <algorithm>
 #include <chrono>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 namespace aida {
@@ -133,6 +135,34 @@ json sub_status_to_json(const subdomain_enum::enum_status_t& s)
     j["domain"] = s.config.domain;
     j["results_count"] = static_cast<int>(s.results.size());
     return j;
+}
+
+bool sub_status_can_settle(const subdomain_enum::enum_status_t& s)
+{
+    return s.id != 0 &&
+        s.results.empty() &&
+        s.phase != subdomain_enum::enum_phase_t::complete &&
+        s.phase != subdomain_enum::enum_phase_t::error &&
+        s.phase != subdomain_enum::enum_phase_t::stopping;
+}
+
+subdomain_enum::enum_status_t settle_subdomain_status(uint64_t id, subdomain_enum::enum_status_t s)
+{
+    for (int poll = 0; poll < 10 && sub_status_can_settle(s); ++poll) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        auto next = subdomain_enum::status(id);
+        if (next.id == 0) break;
+        diag::log_tagged_fmt("mcp_burp", "subdomain_enum_status settle id=%llu poll=%d phase=%d prev_results=%zu next_results=%zu prev_resolved=%zu next_resolved=%zu",
+            static_cast<unsigned long long>(id),
+            poll + 1,
+            static_cast<int>(next.phase),
+            s.results.size(),
+            next.results.size(),
+            static_cast<size_t>(std::max(0, s.brute_resolved)),
+            static_cast<size_t>(std::max(0, next.brute_resolved)));
+        s = std::move(next);
+    }
+    return s;
 }
 
 tool_result_t crawler_start(const json& p)
@@ -335,7 +365,8 @@ tool_result_t sub_status_(const json& p)
     if (id == 0) return tool_result_t::error("sub_id required");
     auto s = subdomain_enum::status(id);
     if (s.id == 0) { diag::log_tagged_fmt("mcp_burp", "subdomain_enum_status not_found id=%llu", static_cast<unsigned long long>(id)); return tool_result_t::error("not found"); }
-    diag::log_tagged_fmt("mcp_burp", "subdomain_enum_status ok id=%llu passive=%zu brute_resolved=%zu", static_cast<unsigned long long>(id), s.passive_count, s.brute_resolved);
+    s = settle_subdomain_status(id, std::move(s));
+    diag::log_tagged_fmt("mcp_burp", "subdomain_enum_status ok id=%llu passive=%zu brute_resolved=%zu", static_cast<unsigned long long>(id), static_cast<size_t>(std::max(0, s.passive_count)), static_cast<size_t>(std::max(0, s.brute_resolved)));
     return tool_result_t::ok("subdomain status id=" + std::to_string(id) + " results=" + std::to_string(s.results.size()) + " resolved=" + std::to_string(s.brute_resolved), sub_status_to_json(s));
 }
 

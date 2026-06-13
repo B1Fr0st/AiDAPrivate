@@ -49,6 +49,7 @@ namespace binary_map {
 		bool   include_imports = true;
 		bool   include_exports = true;
 		bool   include_xrefs = true;
+		bool   include_entropy = true;
 	};
 
 	struct map_t

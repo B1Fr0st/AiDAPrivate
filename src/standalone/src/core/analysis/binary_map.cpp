@@ -951,7 +951,10 @@ namespace binary_map {
 				ms.readable = is_section_readable(s.characteristics);
 				out.sections.push_back(std::move(ms));
 			}
-			populate_section_entropy_static(out.sections);
+			if (opts.include_entropy)
+				populate_section_entropy_static(out.sections);
+			else
+				diag::log_tagged_fmt("binary_map", "entropy_static skipped sections=%zu", out.sections.size());
 
 			std::unordered_map<uint64_t, std::string> import_name_lookup;
 			if (opts.include_imports) {
@@ -1227,7 +1230,10 @@ namespace binary_map {
 				ms.readable = is_section_readable(s.characteristics);
 				out.sections.push_back(std::move(ms));
 			}
-			populate_section_entropy_live(out.sections);
+			if (opts.include_entropy)
+				populate_section_entropy_live(out.sections);
+			else
+				diag::log_tagged_fmt("binary_map", "entropy_live skipped sections=%zu", out.sections.size());
 
 			std::unordered_map<uint64_t, std::string> import_name_lookup;
 			if (opts.include_imports) {
@@ -1655,13 +1661,14 @@ namespace binary_map {
 		const auto dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 			end_us - start_us).count();
 		diag::log_tagged_fmt("binary_map",
-			"generate ok module='%s' base=0x%llX size=%llu sections=%zu funcs=%zu globals=%zu imports=%zu exports=%zu duration_ms=%lld",
+			"generate ok module='%s' base=0x%llX size=%llu sections=%zu funcs=%zu globals=%zu imports=%zu exports=%zu entropy=%d duration_ms=%lld",
 			fresh.module_name.c_str(),
 			static_cast<unsigned long long>(fresh.image_base),
 			static_cast<unsigned long long>(fresh.image_size),
 			fresh.sections.size(), fresh.functions.size(),
 			fresh.globals.size(), fresh.imports.size(),
 			fresh.exports.size(),
+			opts.include_entropy ? 1 : 0,
 			static_cast<long long>(dur_ms));
 		{
 			size_t sampled_count = 0;
@@ -1690,10 +1697,12 @@ namespace binary_map {
 		}
 
 		out = fresh;
-		slot.hash = new_hash;
-		slot.map = std::move(fresh);
-		slot.valid = true;
-		slot.stored_unix = static_cast<int64_t>(now_unix_seconds());
+		if (opts.include_entropy) {
+			slot.hash = new_hash;
+			slot.map = std::move(fresh);
+			slot.valid = true;
+			slot.stored_unix = static_cast<int64_t>(now_unix_seconds());
+		}
 		return true;
 	}
 

@@ -24,6 +24,7 @@
 #include "standalone_ai_client.hpp"
 #include "standalone_settings.hpp"
 #include "../infra/critical_work_queue.hpp"
+#include "../../helpers/diag_log.hpp"
 #include "imgui/imgui.h"
 
 #include <nlohmann/json.hpp>
@@ -1069,21 +1070,57 @@ inline decoded_access_t analyze_captured_rip(uint64_t rip, uint64_t fault_addr, 
 
 inline void monitor_with_hwbp(uint64_t base_address, int struct_size, const std::string& name)
 {
-	if (g_state.monitoring.load()) return;
+	const uint64_t request_ms = GetTickCount64();
+	if (g_state.monitoring.load()) {
+		diag::log_tagged_fmt("struct_recon", "monitor_request_rejected base=0x%llX size=%d name=%s monitoring=1 progress=%.3f",
+			static_cast<unsigned long long>(base_address),
+			struct_size,
+			name.c_str(),
+			static_cast<double>(g_state.progress.load()));
+		return;
+	}
+	diag::log_tagged_fmt("struct_recon", "monitor_request base=0x%llX size=%d name=%s pid=%u tid=%lu",
+		static_cast<unsigned long long>(base_address),
+		struct_size,
+		name.c_str(),
+		driver_bridge::attached_pid(),
+		static_cast<unsigned long>(GetCurrentThreadId()));
 	g_state.monitoring.store(true);
 	g_state.cancel.store(false);
 	g_state.progress.store(0.f);
 
-	work_queue::post([base_address, struct_size, name]() {
+	const bool posted = work_queue::post([base_address, struct_size, name, request_ms]() {
+		const uint64_t worker_start_ms = GetTickCount64();
+		diag::log_tagged_fmt("struct_recon", "monitor_worker_enter base=0x%llX size=%d name=%s pid=%u tid=%lu queued_ms=%llu",
+			static_cast<unsigned long long>(base_address),
+			struct_size,
+			name.c_str(),
+			driver_bridge::attached_pid(),
+			static_cast<unsigned long>(GetCurrentThreadId()),
+			static_cast<unsigned long long>(worker_start_ms - request_ms));
 		reconstructed_struct_t result;
 		result.base_address = base_address;
 		result.total_size = struct_size;
 		result.name = name.empty() ? "struct_t" : name;
 
 		std::vector<uint8_t> data;
+		diag::log_tagged_fmt("struct_recon", "monitor_initial_read_begin base=0x%llX size=%d pid=%u",
+			static_cast<unsigned long long>(base_address),
+			struct_size,
+			driver_bridge::attached_pid());
 		driver_bridge::read_memory(base_address, static_cast<size_t>(struct_size), data);
+		diag::log_tagged_fmt("struct_recon", "monitor_initial_read_end base=0x%llX size=%d bytes=%zu status=%s error=%s elapsed_ms=%llu",
+			static_cast<unsigned long long>(base_address),
+			struct_size,
+			data.size(),
+			driver_bridge::status().c_str(),
+			driver_bridge::last_error().c_str(),
+			static_cast<unsigned long long>(GetTickCount64() - worker_start_ms));
 		if (data.empty()) {
 			g_state.monitoring.store(false);
+			diag::log_tagged_fmt("struct_recon", "monitor_worker_exit_empty_read base=0x%llX elapsed_ms=%llu",
+				static_cast<unsigned long long>(base_address),
+				static_cast<unsigned long long>(GetTickCount64() - worker_start_ms));
 			return;
 		}
 
@@ -1108,8 +1145,17 @@ inline void monitor_with_hwbp(uint64_t base_address, int struct_size, const std:
 			offset += field_size;
 			g_state.progress.store(static_cast<float>(offset) / static_cast<float>(struct_size) * 0.2f);
 		}
+		diag::log_tagged_fmt("struct_recon", "monitor_seed_fields_done base=0x%llX fields=%zu data_bytes=%zu elapsed_ms=%llu",
+			static_cast<unsigned long long>(base_address),
+			field_map.size(),
+			data.size(),
+			static_cast<unsigned long long>(GetTickCount64() - worker_start_ms));
 
 		detail::detect_vtable(base_address, struct_size, result.fields);
+		diag::log_tagged_fmt("struct_recon", "monitor_detect_vtable_done base=0x%llX vtable_fields=%zu elapsed_ms=%llu",
+			static_cast<unsigned long long>(base_address),
+			result.fields.size(),
+			static_cast<unsigned long long>(GetTickCount64() - worker_start_ms));
 
 		for (auto& [off, field] : field_map) {
 			bool already_has = false;
@@ -1127,6 +1173,11 @@ inline void monitor_with_hwbp(uint64_t base_address, int struct_size, const std:
 			g_state.current = result;
 			g_state.active = true;
 		}
+		diag::log_tagged_fmt("struct_recon", "monitor_post_initial_result base=0x%llX fields=%zu has_vtable=%d elapsed_ms=%llu",
+			static_cast<unsigned long long>(base_address),
+			result.fields.size(),
+			result.has_vtable ? 1 : 0,
+			static_cast<unsigned long long>(GetTickCount64() - worker_start_ms));
 		g_state.progress.store(0.25f);
 
 		uint32_t pid = driver_bridge::attached_pid();
@@ -1136,13 +1187,28 @@ inline void monitor_with_hwbp(uint64_t base_address, int struct_size, const std:
 
 		std::vector<uint32_t> tids;
 		bool use_hwbp_fallback = false;
+		diag::log_tagged_fmt("struct_recon", "monitor_backend_select base=0x%llX pid=%u using_kernel=%d use_page_guard_initial=%d",
+			static_cast<unsigned long long>(base_address),
+			pid,
+			driver_bridge::using_kernel_driver() ? 1 : 0,
+			use_page_guard ? 1 : 0);
 
 		if (use_page_guard) {
 			uint64_t page_base = base_address & ~0xFFFULL;
 			uint64_t page_end = (base_address + static_cast<uint64_t>(struct_size) + 0xFFF) & ~0xFFFULL;
 			uint64_t region_size = page_end - page_base;
 
+			diag::log_tagged_fmt("struct_recon", "monitor_page_guard_install_begin pid=%u base=0x%llX page_base=0x%llX region_size=0x%llX",
+				pid,
+				static_cast<unsigned long long>(base_address),
+				static_cast<unsigned long long>(page_base),
+				static_cast<unsigned long long>(region_size));
 			pg_session_id = page_guard_engine::g_pg_engine.install(pid, page_base, region_size);
+			diag::log_tagged_fmt("struct_recon", "monitor_page_guard_install_end pid=%u base=0x%llX sid=%u elapsed_ms=%llu",
+				pid,
+				static_cast<unsigned long long>(base_address),
+				pg_session_id,
+				static_cast<unsigned long long>(GetTickCount64() - worker_start_ms));
 			if (pg_session_id == 0) {
 				use_page_guard = false;
 				use_hwbp_fallback = true;
@@ -1150,10 +1216,21 @@ inline void monitor_with_hwbp(uint64_t base_address, int struct_size, const std:
 		} else {
 			use_hwbp_fallback = true;
 		}
+		diag::log_tagged_fmt("struct_recon", "monitor_backend_chosen base=0x%llX pid=%u page_guard=%d sid=%u hwbp=%d",
+			static_cast<unsigned long long>(base_address),
+			pid,
+			use_page_guard ? 1 : 0,
+			pg_session_id,
+			use_hwbp_fallback ? 1 : 0);
 
 		if (use_hwbp_fallback) {
+			diag::log_tagged_fmt("struct_recon", "monitor_hwbp_enum_begin pid=%u base=0x%llX", pid, static_cast<unsigned long long>(base_address));
 			auto threads = driver_bridge::enumerate_threads();
 			for (auto& t : threads) tids.push_back(t.tid);
+			diag::log_tagged_fmt("struct_recon", "monitor_hwbp_enum_end pid=%u base=0x%llX threads=%zu",
+				pid,
+				static_cast<unsigned long long>(base_address),
+				tids.size());
 
 			int hwbp_offsets[] = {0, 8, 16, 32};
 			int num_slots = (std::min)(4, static_cast<int>(std::size(hwbp_offsets)));
@@ -1162,7 +1239,15 @@ inline void monitor_with_hwbp(uint64_t base_address, int struct_size, const std:
 					if (g_state.cancel.load()) break;
 					if (hwbp_offsets[i] >= struct_size) continue;
 					uint64_t watch_addr = base_address + static_cast<uint64_t>(hwbp_offsets[i]);
-					driver_bridge::set_hardware_breakpoint(tids[0], i, watch_addr, 1, 3);
+					const bool armed = driver_bridge::set_hardware_breakpoint(tids[0], i, watch_addr, 1, 3);
+					diag::log_tagged_fmt("struct_recon", "monitor_hwbp_set pid=%u tid=%u slot=%d addr=0x%llX armed=%d status=%s error=%s",
+						pid,
+						tids[0],
+						i,
+						static_cast<unsigned long long>(watch_addr),
+						armed ? 1 : 0,
+						driver_bridge::status().c_str(),
+						driver_bridge::last_error().c_str());
 				}
 			}
 		}
@@ -1172,6 +1257,13 @@ inline void monitor_with_hwbp(uint64_t base_address, int struct_size, const std:
 		std::map<uint64_t, insn_analysis::decoded_access_t> rip_cache;
 		std::map<uint64_t, access_record_t> offset_access_map;
 		int sample_count = g_state.config.sample_count;
+		diag::log_tagged_fmt("struct_recon", "monitor_sample_loop_begin base=0x%llX pid=%u samples=%d page_guard=%d sid=%u hwbp=%d",
+			static_cast<unsigned long long>(base_address),
+			pid,
+			sample_count,
+			use_page_guard ? 1 : 0,
+			pg_session_id,
+			use_hwbp_fallback ? 1 : 0);
 
 		for (int sample = 0; sample < sample_count && !g_state.cancel.load(); ++sample) {
 			std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -1181,6 +1273,15 @@ inline void monitor_with_hwbp(uint64_t base_address, int struct_size, const std:
 
 			if (use_page_guard && pg_session_id != 0) {
 				auto captures = page_guard_engine::g_pg_engine.get_captures(pg_session_id);
+				if (!captures.empty() || sample == 0 || sample + 1 == sample_count) {
+					diag::log_tagged_fmt("struct_recon", "monitor_sample_captures pid=%u sid=%u sample=%d captures=%zu offsets=%zu elapsed_ms=%llu",
+						pid,
+						pg_session_id,
+						sample,
+						captures.size(),
+						offset_access_map.size(),
+						static_cast<unsigned long long>(GetTickCount64() - worker_start_ms));
+				}
 				for (auto& cap : captures) {
 					if (cap.fault_addr < base_address ||
 					    cap.fault_addr >= base_address + static_cast<uint64_t>(struct_size))
@@ -1212,11 +1313,27 @@ inline void monitor_with_hwbp(uint64_t base_address, int struct_size, const std:
 				}
 			}
 		}
+		diag::log_tagged_fmt("struct_recon", "monitor_sample_loop_end base=0x%llX pid=%u cancelled=%d offsets=%zu rip_cache=%zu elapsed_ms=%llu",
+			static_cast<unsigned long long>(base_address),
+			pid,
+			g_state.cancel.load() ? 1 : 0,
+			offset_access_map.size(),
+			rip_cache.size(),
+			static_cast<unsigned long long>(GetTickCount64() - worker_start_ms));
 
 		g_state.progress.store(0.8f);
 
 		if (use_page_guard && pg_session_id != 0) {
+			diag::log_tagged_fmt("struct_recon", "monitor_final_captures_begin pid=%u sid=%u offsets=%zu",
+				pid,
+				pg_session_id,
+				offset_access_map.size());
 			auto final_caps = page_guard_engine::g_pg_engine.get_captures(pg_session_id);
+			diag::log_tagged_fmt("struct_recon", "monitor_final_captures_end pid=%u sid=%u captures=%zu elapsed_ms=%llu",
+				pid,
+				pg_session_id,
+				final_caps.size(),
+				static_cast<unsigned long long>(GetTickCount64() - worker_start_ms));
 			for (auto& cap : final_caps) {
 				if (cap.fault_addr < base_address ||
 				    cap.fault_addr >= base_address + static_cast<uint64_t>(struct_size))
@@ -1246,17 +1363,32 @@ inline void monitor_with_hwbp(uint64_t base_address, int struct_size, const std:
 					oa_it->second.hit_count++;
 				}
 			}
+			diag::log_tagged_fmt("struct_recon", "monitor_page_guard_uninstall_begin pid=%u sid=%u", pid, pg_session_id);
 			page_guard_engine::g_pg_engine.uninstall(pg_session_id);
+			diag::log_tagged_fmt("struct_recon", "monitor_page_guard_uninstall_end pid=%u sid=%u elapsed_ms=%llu",
+				pid,
+				pg_session_id,
+				static_cast<unsigned long long>(GetTickCount64() - worker_start_ms));
 		}
 
 		if (use_hwbp_fallback && !tids.empty()) {
 			for (int i = 0; i < 4; ++i) {
-				driver_bridge::clear_hardware_breakpoint(tids[0], i);
+				const bool cleared = driver_bridge::clear_hardware_breakpoint(tids[0], i);
+				diag::log_tagged_fmt("struct_recon", "monitor_hwbp_clear pid=%u tid=%u slot=%d cleared=%d",
+					pid,
+					tids[0],
+					i,
+					cleared ? 1 : 0);
 			}
 		}
 
 		g_state.progress.store(0.85f);
 
+		diag::log_tagged_fmt("struct_recon", "monitor_inference_begin base=0x%llX offsets=%zu rip_cache=%zu elapsed_ms=%llu",
+			static_cast<unsigned long long>(base_address),
+			offset_access_map.size(),
+			rip_cache.size(),
+			static_cast<unsigned long long>(GetTickCount64() - worker_start_ms));
 		{
 			std::lock_guard<std::mutex> lk(g_state.mutex);
 			g_state.access_log.clear();
@@ -1327,11 +1459,29 @@ inline void monitor_with_hwbp(uint64_t base_address, int struct_size, const std:
 			                              g_state.current.fields[0].type == field_type_t::vtable_ptr;
 
 			g_state.history.push_back(g_state.current);
+			diag::log_tagged_fmt("struct_recon", "monitor_inference_state base=0x%llX fields=%zu access_log=%zu history=%zu has_vtable=%d",
+				static_cast<unsigned long long>(base_address),
+				g_state.current.fields.size(),
+				g_state.access_log.size(),
+				g_state.history.size(),
+				g_state.current.has_vtable ? 1 : 0);
 		}
 
 		g_state.progress.store(1.f);
 		g_state.monitoring.store(false);
+		diag::log_tagged_fmt("struct_recon", "monitor_worker_exit base=0x%llX pid=%u cancelled=%d elapsed_ms=%llu",
+			static_cast<unsigned long long>(base_address),
+			pid,
+			g_state.cancel.load() ? 1 : 0,
+			static_cast<unsigned long long>(GetTickCount64() - worker_start_ms));
 	});
+	if (!posted) {
+		g_state.monitoring.store(false);
+		diag::log_tagged_fmt("struct_recon", "monitor_post_failed base=0x%llX size=%d name=%s",
+			static_cast<unsigned long long>(base_address),
+			struct_size,
+			name.c_str());
+	}
 }
 
 inline std::string export_as_cpp(const reconstructed_struct_t& s)

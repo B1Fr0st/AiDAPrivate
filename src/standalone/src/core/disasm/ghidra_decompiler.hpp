@@ -1017,11 +1017,24 @@ inline void batch_decompile(const uint8_t* buffer, size_t buf_size, uint64_t bas
                             std::atomic<bool>* cancel = nullptr,
                             const DisasmFile* file_fallback = nullptr)
 {
+	const uint64_t batch_start_ms = GetTickCount64();
+	diag::log_tagged_fmt("ghidra",
+		"batch_decompile_enter base=0x%llX buf_size=%zu entries=%zu progress_ptr=%p cancel_ptr=%p initialized=%d",
+		static_cast<unsigned long long>(base),
+		buf_size,
+		entries.size(),
+		static_cast<void*>(progress),
+		static_cast<void*>(cancel),
+		g_state.initialized.load() ? 1 : 0);
 	results.clear();
 	results.resize(entries.size());
 
-	if (entries.empty())
+	if (entries.empty()) {
+		diag::log_tagged_fmt("ghidra",
+			"batch_decompile_exit reason=empty elapsed_ms=%llu",
+			static_cast<unsigned long long>(GetTickCount64() - batch_start_ms));
 		return;
+	}
 
 	if (!g_state.initialized.load()) {
 		if (!init()) {
@@ -1029,6 +1042,10 @@ inline void batch_decompile(const uint8_t* buffer, size_t buf_size, uint64_t bas
 				r.is_error = true;
 				r.error_text = "ghidra decompiler not initialized";
 			}
+			diag::log_tagged_fmt("ghidra",
+				"batch_decompile_exit reason=init_failed entries=%zu elapsed_ms=%llu",
+				entries.size(),
+				static_cast<unsigned long long>(GetTickCount64() - batch_start_ms));
 			return;
 		}
 	}
@@ -1048,12 +1065,39 @@ inline void batch_decompile(const uint8_t* buffer, size_t buf_size, uint64_t bas
 		: aida_ghidra::detect_arch_default_x64();
 
 	std::atomic<unsigned int> workers_remaining{num_threads};
+	diag::log_tagged_fmt("ghidra",
+		"batch_decompile_workers base=0x%llX entries=%zu workers=%u sleigh=%s",
+		static_cast<unsigned long long>(base),
+		entries.size(),
+		num_threads,
+		arch_desc.sleigh_id.c_str());
 
 	for (unsigned int t = 0; t < num_threads; ++t) {
 		if (!work_queue::post([&, t]() {
+			const uint64_t worker_start_ms = GetTickCount64();
 			auto& my_indices = partitions[t];
-			if (my_indices.empty())
+			auto finish_worker = [&](const char* reason) {
+				const unsigned int before = workers_remaining.fetch_sub(1, std::memory_order_acq_rel);
+				diag::log_tagged_fmt("ghidra",
+					"batch_worker_exit worker=%u reason=%s assigned=%zu remaining_before=%u remaining_after=%u progress=%d cancel=%d elapsed_ms=%llu",
+					t,
+					reason,
+					my_indices.size(),
+					before,
+					before == 0 ? 0 : before - 1,
+					progress ? progress->load(std::memory_order_relaxed) : -1,
+					(cancel && cancel->load(std::memory_order_acquire)) ? 1 : 0,
+					static_cast<unsigned long long>(GetTickCount64() - worker_start_ms));
+			};
+			diag::log_tagged_fmt("ghidra",
+				"batch_worker_enter worker=%u assigned=%zu tid=%lu",
+				t,
+				my_indices.size(),
+				GetCurrentThreadId());
+			if (my_indices.empty()) {
+				finish_worker("empty");
 				return;
+			}
 
 			std::unique_ptr<detail::prepared_arch_t> ta;
 			try {
@@ -1063,6 +1107,10 @@ inline void batch_decompile(const uint8_t* buffer, size_t buf_size, uint64_t bas
 				detail::populate_symbols(*ta->arch, buffer, buf_size, base, file_fallback);
 			}
 			catch (...) {
+				diag::log_tagged_fmt("ghidra",
+					"batch_worker_arch_failed worker=%u assigned=%zu",
+					t,
+					my_indices.size());
 				for (size_t idx : my_indices) {
 					results[idx].function_addr = entries[idx];
 					results[idx].is_error = true;
@@ -1071,14 +1119,18 @@ inline void batch_decompile(const uint8_t* buffer, size_t buf_size, uint64_t bas
 				if (progress)
 					progress->fetch_add(static_cast<int>(my_indices.size()),
 					                    std::memory_order_relaxed);
+				finish_worker("arch_init_failed");
 				return;
 			}
 
+			size_t ok_count = 0;
+			size_t error_count = 0;
 			for (size_t idx : my_indices) {
 				if (cancel && cancel->load(std::memory_order_acquire)) {
 					results[idx].function_addr = entries[idx];
 					results[idx].is_error = true;
 					results[idx].error_text = "cancelled";
+					++error_count;
 					if (progress)
 						progress->fetch_add(1, std::memory_order_relaxed);
 					continue;
@@ -1086,35 +1138,82 @@ inline void batch_decompile(const uint8_t* buffer, size_t buf_size, uint64_t bas
 
 				try {
 					results[idx] = detail::do_decompile(ta->arch.get(), entries[idx], cancel);
+					if (results[idx].complete && !results[idx].is_error && !results[idx].pseudocode.empty())
+						++ok_count;
+					else
+						++error_count;
 				}
 				catch (ghidra::LowlevelError& err) {
 					results[idx].function_addr = entries[idx];
 					results[idx].is_error = true;
 					results[idx].error_text = err.explain;
+					++error_count;
 				}
 				catch (ghidra::DecoderError& err) {
 					results[idx].function_addr = entries[idx];
 					results[idx].is_error = true;
 					results[idx].error_text = err.explain;
+					++error_count;
 				}
 				catch (...) {
 					results[idx].function_addr = entries[idx];
 					results[idx].is_error = true;
 					results[idx].error_text = "unknown error";
+					++error_count;
 				}
 
 				if (progress)
 					progress->fetch_add(1, std::memory_order_relaxed);
 			}
-			workers_remaining.fetch_sub(1, std::memory_order_acq_rel);
+			diag::log_tagged_fmt("ghidra",
+				"batch_worker_counts worker=%u ok=%zu errors=%zu assigned=%zu",
+				t,
+				ok_count,
+				error_count,
+				my_indices.size());
+			finish_worker((cancel && cancel->load(std::memory_order_acquire)) ? "cancelled_or_done" : "done");
 		}))
 		{
-			workers_remaining.fetch_sub(1, std::memory_order_acq_rel);
+			const unsigned int before = workers_remaining.fetch_sub(1, std::memory_order_acq_rel);
+			diag::log_tagged_fmt("ghidra",
+				"batch_worker_post_failed worker=%u assigned=%zu remaining_before=%u remaining_after=%u",
+				t,
+				partitions[t].size(),
+				before,
+				before == 0 ? 0 : before - 1);
 		}
 	}
 
-	while (workers_remaining.load(std::memory_order_acquire) > 0)
+	uint64_t next_wait_log_ms = GetTickCount64() + 1000;
+	while (workers_remaining.load(std::memory_order_acquire) > 0) {
+		const uint64_t now_ms = GetTickCount64();
+		if (now_ms >= next_wait_log_ms) {
+			diag::log_tagged_fmt("ghidra",
+				"batch_decompile_wait remaining=%u progress=%d cancel=%d elapsed_ms=%llu",
+				workers_remaining.load(std::memory_order_acquire),
+				progress ? progress->load(std::memory_order_relaxed) : -1,
+				(cancel && cancel->load(std::memory_order_acquire)) ? 1 : 0,
+				static_cast<unsigned long long>(now_ms - batch_start_ms));
+			next_wait_log_ms = now_ms + 1000;
+		}
 		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+	int ok_total = 0;
+	int err_total = 0;
+	for (const auto& r : results) {
+		if (r.complete && !r.is_error && !r.pseudocode.empty())
+			++ok_total;
+		else
+			++err_total;
+	}
+	diag::log_tagged_fmt("ghidra",
+		"batch_decompile_exit reason=done entries=%zu ok=%d errors=%d progress=%d cancel=%d elapsed_ms=%llu",
+		entries.size(),
+		ok_total,
+		err_total,
+		progress ? progress->load(std::memory_order_relaxed) : -1,
+		(cancel && cancel->load(std::memory_order_acquire)) ? 1 : 0,
+		static_cast<unsigned long long>(GetTickCount64() - batch_start_ms));
 }
 
 inline std::string last_error() {

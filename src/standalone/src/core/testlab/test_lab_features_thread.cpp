@@ -121,6 +121,35 @@ namespace {
 		push_hex_field(r, "DR7", req.dr7);
 	}
 
+	std::uint64_t observed_context_mask(const voyager::detail::thread_ctx_request& req) {
+		std::uint64_t mask = 0;
+		if (req.rax) mask |= (1ULL << 0);
+		if (req.rbx) mask |= (1ULL << 1);
+		if (req.rcx) mask |= (1ULL << 2);
+		if (req.rdx) mask |= (1ULL << 3);
+		if (req.rsi) mask |= (1ULL << 4);
+		if (req.rdi) mask |= (1ULL << 5);
+		if (req.rbp) mask |= (1ULL << 6);
+		if (req.rsp) mask |= (1ULL << 7);
+		if (req.r8) mask |= (1ULL << 8);
+		if (req.r9) mask |= (1ULL << 9);
+		if (req.r10) mask |= (1ULL << 10);
+		if (req.r11) mask |= (1ULL << 11);
+		if (req.r12) mask |= (1ULL << 12);
+		if (req.r13) mask |= (1ULL << 13);
+		if (req.r14) mask |= (1ULL << 14);
+		if (req.r15) mask |= (1ULL << 15);
+		if (req.rip) mask |= (1ULL << 16);
+		if (req.rflags) mask |= (1ULL << 17);
+		if (req.dr0) mask |= (1ULL << 18);
+		if (req.dr1) mask |= (1ULL << 19);
+		if (req.dr2) mask |= (1ULL << 20);
+		if (req.dr3) mask |= (1ULL << 21);
+		if (req.dr6) mask |= (1ULL << 22);
+		if (req.dr7) mask |= (1ULL << 23);
+		return mask;
+	}
+
 	void render_inputs_tctx(test_lab::state_t& s) {
 		ImGui::InputScalar("PID", ImGuiDataType_U32, &s.pid, nullptr, nullptr, "%u");
 		ImGui::InputScalar("TID", ImGuiDataType_U32, &s.tid, nullptr, nullptr, "%u");
@@ -152,18 +181,21 @@ namespace {
 		push_u32_field(r, "device_pid", device_pid);
 		push_hex_field(r, "ioctl_code", ioctl_codes::TCTX());
 		push_u64_dec_field(r, "request_size", sizeof(voyager::detail::thread_ctx_request));
+		push_u32_field(r, "request_should_set", 0);
+		push_hex_field(r, "request_register_mask", 0);
 		push_hex_field(r, "thread_access_mask", thread_access);
 		push_bool_field(r, "thread_access_open_ok", access_probe != nullptr);
 		push_u32_field(r, "thread_access_last_error", access_error);
 		push_thread_snapshot(r, "thread_before", before_found, before);
 		::diag::log_tagged_fmt("testlab_tctx",
-			"START pid=%u tid=%u attached_pid=%u device_pid=%u ioctl=0x%08X request_size=%zu thread_access=0x%08lX access_open=%d access_gle=%lu before_found=%d before_state=%u before_rip=0x%llX",
+			"START pid=%u tid=%u attached_pid=%u device_pid=%u ioctl=0x%08X request_size=%zu should_set=0 register_mask=0x%llX thread_access=0x%08lX access_open=%d access_gle=%lu before_found=%d before_state=%u before_rip=0x%llX",
 			s.pid,
 			s.tid,
 			attached_pid,
 			device_pid,
 			ioctl_codes::TCTX(),
 			sizeof(voyager::detail::thread_ctx_request),
+			0ULL,
 			static_cast<unsigned long>(thread_access),
 			access_probe != nullptr ? 1 : 0,
 			static_cast<unsigned long>(access_error),
@@ -182,26 +214,46 @@ namespace {
 		bool ok = device->send_ioctl_raw(ioctl_codes::TCTX(), &req, static_cast<std::uint32_t>(sizeof(req)), bytes_returned);
 		const DWORD raw_error = ok ? ERROR_SUCCESS : GetLastError();
 		const std::uint64_t raw_elapsed = static_cast<std::uint64_t>(GetTickCount64()) - raw_start;
+		const std::uint32_t raw_status = ok ? 0u : static_cast<std::uint32_t>(raw_error);
 		r.bytes_returned = bytes_returned;
 		r.raw.resize(sizeof(req));
 		std::memcpy(r.raw.data(), &req, sizeof(req));
 		const voyager::detail::thread_ctx_request raw_req = req;
 		const bool raw_context_valid = req.rip != 0 && req.rsp != 0;
 		push_bool_field(r, "raw_ioctl_ok", ok);
+		push_u32_field(r, "raw_ioctl_status", raw_status);
+		push_text_field(r, "raw_ioctl_status_source", "DeviceIoControl/GetLastError");
 		push_u32_field(r, "raw_ioctl_last_error", raw_error);
 		push_u32_field(r, "raw_ioctl_bytes", bytes_returned);
 		push_u64_dec_field(r, "raw_ioctl_elapsed_ms", raw_elapsed);
+		push_u32_field(r, "raw_ioctl_attached_pid", attached_pid);
+		push_u32_field(r, "raw_ioctl_device_pid", device_pid);
+		push_u32_field(r, "raw_ioctl_tid", s.tid);
+		push_hex_field(r, "raw_ioctl_request_mask", raw_req.register_mask);
+		push_hex_field(r, "raw_ioctl_observed_register_mask", observed_context_mask(raw_req));
 		push_bool_field(r, "raw_context_valid", raw_context_valid);
 		::diag::log_tagged_fmt("testlab_tctx",
-			"RAW pid=%u tid=%u ok=%d gle=%lu bytes=%u elapsed_ms=%llu rip=0x%llX rsp=0x%llX",
+			"RAW pid=%u tid=%u attached_pid=%u device_pid=%u ok=%d status=0x%08X gle=%lu bytes=%u elapsed_ms=%llu request_mask=0x%llX observed_mask=0x%llX rip=0x%llX rsp=0x%llX rflags=0x%llX dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX",
 			s.pid,
 			s.tid,
+			attached_pid,
+			device_pid,
 			ok ? 1 : 0,
+			raw_status,
 			static_cast<unsigned long>(raw_error),
 			bytes_returned,
 			static_cast<unsigned long long>(raw_elapsed),
+			static_cast<unsigned long long>(raw_req.register_mask),
+			static_cast<unsigned long long>(observed_context_mask(raw_req)),
 			static_cast<unsigned long long>(req.rip),
-			static_cast<unsigned long long>(req.rsp));
+			static_cast<unsigned long long>(req.rsp),
+			static_cast<unsigned long long>(req.rflags),
+			static_cast<unsigned long long>(req.dr0),
+			static_cast<unsigned long long>(req.dr1),
+			static_cast<unsigned long long>(req.dr2),
+			static_cast<unsigned long long>(req.dr3),
+			static_cast<unsigned long long>(req.dr6),
+			static_cast<unsigned long long>(req.dr7));
 		if (!ok || !raw_context_valid) {
 			push_text_field(r, "fallback_reason", ok ? "raw ioctl returned zero RIP/RSP" : "raw ioctl failed");
 			if (s.pid == device_pid && s.pid == attached_pid) {

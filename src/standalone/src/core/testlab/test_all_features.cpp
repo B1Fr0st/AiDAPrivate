@@ -896,6 +896,30 @@ namespace test_all_features {
 			return parsed_u64(r, label, value) && value != 0;
 		}
 
+		bool parsed_truthy(const std::string& value) {
+			std::string v = value;
+			while (!v.empty() && (v.front() == ' ' || v.front() == '\t'))
+				v.erase(v.begin());
+			while (!v.empty() && (v.back() == ' ' || v.back() == '\t' || v.back() == '\r' || v.back() == '\n'))
+				v.pop_back();
+			std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+			return v == "1" || v == "true" || v == "yes" || v == "on";
+		}
+
+		bool parsed_key_degraded_true(const test_lab::result_t& r, std::string& key) {
+			for (const auto& item : r.parsed) {
+				const std::string& k = item.label;
+				const std::string suffix = "_degraded";
+				if (k.size() >= suffix.size() &&
+					std::equal(suffix.rbegin(), suffix.rend(), k.rbegin()) &&
+					parsed_truthy(item.value)) {
+					key = k;
+					return true;
+				}
+			}
+			return false;
+		}
+
 		bool any_parsed_nonzero(const test_lab::result_t& r, const char* const* labels, std::size_t count) {
 			for (std::size_t i = 0; i < count; ++i) {
 				if (parsed_nonzero(r, labels[i]))
@@ -915,6 +939,11 @@ namespace test_all_features {
 			const char* feature = name ? name : "";
 			if (r.bytes_returned == 0 && r.raw.empty() && r.parsed.empty()) {
 				reason = "empty_result_without_evidence";
+				return true;
+			}
+			std::string degraded_key;
+			if (parsed_key_degraded_true(r, degraded_key)) {
+				reason = degraded_key + "=1";
 				return true;
 			}
 			if (std::strcmp(cat, "module") == 0 && name_starts_with(feature, "PMOD") && !parsed_nonzero(r, "rule_count")) {
@@ -2469,9 +2498,21 @@ namespace test_all_features {
 					aida::burp::camoufox::force_cleanup("testlab.cleanup_guard");
 				} catch (...) {
 				}
-				cleanup_network_runtime(h, "abnormal/early exit");
+				try {
+					cleanup_network_runtime(h, "abnormal/early exit");
+				} catch (const std::exception& ex) {
+					log_msg(h, "cleanup", "abnormal/early exit network cleanup threw: %s", ex.what());
+				} catch (...) {
+					log_msg(h, "cleanup", "abnormal/early exit network cleanup threw: <unknown>");
+				}
 				if (target_pid) {
-					phase_stop_target(h, *target_pid);
+					try {
+						phase_stop_target(h, *target_pid);
+					} catch (const std::exception& ex) {
+						log_msg(h, "cleanup", "abnormal/early exit target cleanup threw: %s", ex.what());
+					} catch (...) {
+						log_msg(h, "cleanup", "abnormal/early exit target cleanup threw: <unknown>");
+					}
 				}
 				if (hf && *hf != INVALID_HANDLE_VALUE) {
 					CloseHandle(*hf);
@@ -2765,7 +2806,11 @@ namespace test_all_features {
 				const int converted = raw_skips - kExpectedDestructiveSkips;
 				g_skipped.fetch_sub(converted, std::memory_order_acq_rel);
 				g_failed.fetch_add(converted, std::memory_order_acq_rel);
-				log_msg(hf, "summary", "FAIL -- converted %d non-destructive skip(s) into failures; only the six destructive guards may remain skipped", converted);
+				log_msg(hf, "summary", "FAIL -- converted %d non-destructive skip(s) into failures; exactly six destructive guards may remain skipped", converted);
+			} else if (raw_skips < kExpectedDestructiveSkips) {
+				const int missing = kExpectedDestructiveSkips - raw_skips;
+				g_failed.fetch_add(1, std::memory_order_acq_rel);
+				log_msg(hf, "summary", "FAIL -- destructive skip accounting expected exactly six destructive guards but observed %d; missing=%d", raw_skips, missing);
 			}
 			int p = g_passed.load();
 			int f = g_failed.load();
@@ -2846,10 +2891,23 @@ namespace test_all_features {
 				aida::burp::camoufox::force_cleanup("testlab.worker_exception_escape");
 			} catch (...) {
 			}
-			cleanup_network_runtime(hf, "worker exception escape");
+			try {
+				cleanup_network_runtime(hf, "worker exception escape");
+			} catch (const std::exception& ex) {
+				log_msg(hf, "cleanup", "worker exception network cleanup threw: %s", ex.what());
+			} catch (...) {
+				log_msg(hf, "cleanup", "worker exception network cleanup threw: <unknown>");
+			}
 			std::uint32_t pid = g_target_pid.load(std::memory_order_acquire);
-			if (pid != 0)
-				phase_stop_target(hf, pid);
+			if (pid != 0) {
+				try {
+					phase_stop_target(hf, pid);
+				} catch (const std::exception& ex) {
+					log_msg(hf, "cleanup", "worker exception target cleanup threw: %s", ex.what());
+				} catch (...) {
+					log_msg(hf, "cleanup", "worker exception target cleanup threw: <unknown>");
+				}
+			}
 			g_running.store(false, std::memory_order_release);
 			if (hf != INVALID_HANDLE_VALUE) {
 				flush_full_test_log(hf);

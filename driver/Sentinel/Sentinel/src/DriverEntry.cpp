@@ -450,6 +450,20 @@ static VOID DeleteDriverOnDisk(PUNICODE_STRING RegistryPath) {
     ExFreePoolWithTag(kvInfo, TAG_DEL);
 }
 
+namespace sentinel_build_identity {
+    constexpr unsigned long long fnv1a64(const char* text) {
+        unsigned long long h = 14695981039346656037ull;
+        while (*text) {
+            h ^= static_cast<unsigned char>(*text);
+            h *= 1099511628211ull;
+            ++text;
+        }
+        return h;
+    }
+
+    constexpr unsigned long long kHash = fnv1a64("Sentinel|" __DATE__ "|" __TIME__ "|" __FILE__);
+}
+
 
 static void NTAPI init_thread_routine(PVOID ) {
 
@@ -820,6 +834,15 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     dbg_capture::initialize();
 
     SN_LOG("DriverEntry: SetupFunctions OK");
+    SN_LOG("DriverEntry: build_identity hash=0x%llX date=%s time=%s msc=%u cpp=%lu entry=%p driver_object=%p registry_path_present=%u",
+        sentinel_build_identity::kHash,
+        __DATE__,
+        __TIME__,
+        (unsigned)_MSC_VER,
+        (unsigned long)__cplusplus,
+        reinterpret_cast<PVOID>(&DriverEntry),
+        DriverObject,
+        RegistryPath != nullptr ? 1u : 0u);
 
     g_sentinel_driver_object = DriverObject;
 
@@ -856,7 +879,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
         own_base = ldr->DllBase;
     }
 
-    SN_LOG("DriverEntry: own_base=%p", own_base);
+    SN_LOG("DriverEntry: own_base=%p build_hash=0x%llX", own_base, sentinel_build_identity::kHash);
 
     if (own_base) {
         find_text_section(own_base, &own_text, &own_text_size);

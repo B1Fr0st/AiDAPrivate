@@ -1,4 +1,5 @@
 #include "rtti.hpp"
+#include "../../helpers/diag_log.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -174,6 +175,112 @@ std::vector<std::string> read_base_classes(std::uint32_t pid,
     return bases;
 }
 
+bool type_from_vtable(std::uint32_t pid,
+                      const driver_bridge::module_info_t& module,
+                      std::uint64_t vtable_va,
+                      type_info_t& out)
+{
+    const std::uint64_t started_ms = GetTickCount64();
+    diag::log_tagged_fmt("rtti",
+                         "type_from_vtable enter pid=%u module=%s base=%s vtable=%s",
+                         pid,
+                         (!module.name.empty() ? module.name : module.path).c_str(),
+                         sa_format_address(module.base).c_str(),
+                         sa_format_address(vtable_va).c_str());
+    if (vtable_va < 8)
+        return false;
+    std::uint64_t col_va = 0;
+    if (!read_u64(pid, vtable_va - 8, col_va) || col_va == 0)
+    {
+        diag::log_tagged_fmt("rtti",
+                             "type_from_vtable col_read_failed pid=%u vtable=%s elapsed_ms=%llu",
+                             pid,
+                             sa_format_address(vtable_va).c_str(),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        return false;
+    }
+    driver_bridge::memory_region_t col_region{};
+    if (!query_region(pid, col_va, col_region) || !is_readable(col_region))
+    {
+        diag::log_tagged_fmt("rtti",
+                             "type_from_vtable col_unreadable pid=%u vtable=%s col=%s elapsed_ms=%llu",
+                             pid,
+                             sa_format_address(vtable_va).c_str(),
+                             sa_format_address(col_va).c_str(),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        return false;
+    }
+    std::uint32_t signature = 0;
+    std::int32_t td_rva = 0;
+    std::int32_t chd_rva = 0;
+    std::int32_t self_rva = 0;
+    if (!read_u32(pid, col_va, signature) ||
+        !read_i32(pid, col_va + 12, td_rva) ||
+        !read_i32(pid, col_va + 16, chd_rva) ||
+        !read_i32(pid, col_va + 20, self_rva))
+    {
+        diag::log_tagged_fmt("rtti",
+                             "type_from_vtable col_fields_failed pid=%u vtable=%s col=%s elapsed_ms=%llu",
+                             pid,
+                             sa_format_address(vtable_va).c_str(),
+                             sa_format_address(col_va).c_str(),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        return false;
+    }
+    const std::uint64_t self_va = rva_to_va(module, self_rva);
+    const std::uint64_t td_va = rva_to_va(module, td_rva);
+    const std::uint64_t hierarchy_va = rva_to_va(module, chd_rva);
+    if (signature != 1 || td_va == 0)
+    {
+        diag::log_tagged_fmt("rtti",
+                             "type_from_vtable invalid_col pid=%u vtable=%s col=%s signature=%u td_rva=%d chd_rva=%d self=%s elapsed_ms=%llu",
+                             pid,
+                             sa_format_address(vtable_va).c_str(),
+                             sa_format_address(col_va).c_str(),
+                             signature,
+                             td_rva,
+                             chd_rva,
+                             sa_format_address(self_va).c_str(),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        return false;
+    }
+    std::string decorated;
+    std::vector<std::uint8_t> name_bytes;
+    if (!read_bytes(pid, td_va + 16, 256, name_bytes) || !read_c_string_from_buffer(name_bytes, 0, decorated))
+    {
+        diag::log_tagged_fmt("rtti",
+                             "type_from_vtable name_failed pid=%u vtable=%s td=%s bytes=%zu elapsed_ms=%llu",
+                             pid,
+                             sa_format_address(vtable_va).c_str(),
+                             sa_format_address(td_va).c_str(),
+                             name_bytes.size(),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        return false;
+    }
+    out = {};
+    out.decorated_name = decorated;
+    out.name = undecorate_rtti_name(decorated);
+    out.type_descriptor_va = td_va;
+    out.vtable_va = vtable_va;
+    out.col_va = col_va;
+    out.hierarchy_descriptor_va = hierarchy_va;
+    out.base_classes = read_base_classes(pid, module, hierarchy_va, 64);
+    out.module_name = module.name;
+    diag::log_tagged_fmt("rtti",
+                         "type_from_vtable exit pid=%u type=%s decorated=%s vtable=%s col=%s td=%s hierarchy=%s bases=%zu self_match=%d elapsed_ms=%llu",
+                         pid,
+                         out.name.c_str(),
+                         out.decorated_name.c_str(),
+                         sa_format_address(out.vtable_va).c_str(),
+                         sa_format_address(out.col_va).c_str(),
+                         sa_format_address(out.type_descriptor_va).c_str(),
+                         sa_format_address(out.hierarchy_descriptor_va).c_str(),
+                         out.base_classes.size(),
+                         self_va == 0 || self_va == col_va ? 1 : 0,
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
+    return true;
+}
+
 std::uint64_t find_vtable_for_col(std::uint32_t pid,
                                   const std::vector<module_section_t>& sections,
                                   std::uint64_t col_va)
@@ -290,6 +397,7 @@ std::vector<type_info_t> scan_module(std::uint32_t pid,
 
 std::vector<type_info_t> scan_types(const json& params)
 {
+    const std::uint64_t started_ms = GetTickCount64();
     active_process_scope_t scope(params);
     if (!scope.ok())
         return {};
@@ -333,14 +441,37 @@ std::vector<type_info_t> scan_types(const json& params)
     {
         modules = modules_for(scope.pid());
     }
+    diag::log_tagged_fmt("rtti",
+                         "scan_types enter pid=%u module_name=%s module_count=%zu filter=%s max_results=%zu hint_va=%s elapsed_ms=%llu",
+                         scope.pid(),
+                         module_name.c_str(),
+                         modules.size(),
+                         filter_text.c_str(),
+                         max_results,
+                         hint_va ? sa_format_address(hint_va).c_str() : "0x0",
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     std::vector<type_info_t> out;
     for (const auto& module : modules)
     {
+        const std::uint64_t module_started_ms = GetTickCount64();
         auto partial = scan_module(scope.pid(), module, filter, max_results - out.size());
+        diag::log_tagged_fmt("rtti",
+                             "scan_types module pid=%u name=%s base=%s size=%llu count=%zu elapsed_ms=%llu",
+                             scope.pid(),
+                             (!module.name.empty() ? module.name : module.path).c_str(),
+                             sa_format_address(module.base).c_str(),
+                             static_cast<unsigned long long>(module.size),
+                             partial.size(),
+                             static_cast<unsigned long long>(GetTickCount64() - module_started_ms));
         out.insert(out.end(), partial.begin(), partial.end());
         if (out.size() >= max_results)
             break;
     }
+    diag::log_tagged_fmt("rtti",
+                         "scan_types exit pid=%u count=%zu elapsed_ms=%llu",
+                         scope.pid(),
+                         out.size(),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     return out;
 }
 
@@ -584,6 +715,7 @@ tool_result_t find_type(const json& params)
 
 tool_result_t list_hierarchy(const json& params)
 {
+    const std::uint64_t started_ms = GetTickCount64();
     active_process_scope_t scope(params);
     if (!scope.ok())
         return tool_result_t::error(scope.error());
@@ -595,7 +727,59 @@ tool_result_t list_hierarchy(const json& params)
     const bool query_is_va = parsed_va.has_value();
     if (parsed_va)
         va = *parsed_va;
-    auto types = scan_types(params);
+    std::uint64_t vtable_hint = 0;
+    if (parse_address_param(params, "vtable_va", vtable_hint) && vtable_hint != 0)
+    {
+        if (auto module = find_module_for_address(scope.pid(), vtable_hint))
+        {
+            type_info_t hinted;
+            if (type_from_vtable(scope.pid(), *module, vtable_hint, hinted))
+            {
+                const std::string query_lower = lower_ascii(query);
+                const bool match = query_is_va ? (hinted.vtable_va == va || hinted.type_descriptor_va == va) :
+                    (lower_ascii(hinted.name).find(query_lower) != std::string::npos ||
+                     lower_ascii(hinted.decorated_name).find(query_lower) != std::string::npos);
+                diag::log_tagged_fmt("rtti",
+                                     "list_hierarchy vtable_hint pid=%u query=%s match=%d type=%s bases=%zu elapsed_ms=%llu",
+                                     scope.pid(),
+                                     query.c_str(),
+                                     match ? 1 : 0,
+                                     hinted.name.c_str(),
+                                     hinted.base_classes.size(),
+                                     static_cast<unsigned long long>(GetTickCount64() - started_ms));
+                if (match)
+                {
+                    json result = type_to_json(hinted);
+                    json hierarchy = json::array();
+                    for (std::size_t i = 0; i < hinted.base_classes.size(); ++i)
+                    {
+                        json row;
+                        row["order"] = i;
+                        row["name"] = hinted.base_classes[i];
+                        row["vtable_va"] = nullptr;
+                        row["type_descriptor_va"] = nullptr;
+                        hierarchy.push_back(std::move(row));
+                    }
+                    result["hierarchy"] = std::move(hierarchy);
+                    result["resolution"] = "vtable_hint_col";
+                    return tool_result_t::ok(result);
+                }
+            }
+        }
+    }
+    json scan_params = params;
+    if (!query_is_va && !scan_params.contains("filter"))
+        scan_params["filter"] = query;
+    if (!scan_params.contains("max_results"))
+        scan_params["max_results"] = 256;
+    auto types = scan_types(scan_params);
+    diag::log_tagged_fmt("rtti",
+                         "list_hierarchy scanned pid=%u query=%s query_is_va=%d types=%zu elapsed_ms=%llu",
+                         scope.pid(),
+                         query.c_str(),
+                         query_is_va ? 1 : 0,
+                         types.size(),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     for (const auto& type : types)
     {
         const bool match = query_is_va ? (type.vtable_va == va || type.type_descriptor_va == va) :
@@ -619,13 +803,27 @@ tool_result_t list_hierarchy(const json& params)
             hierarchy.push_back(std::move(row));
         }
         result["hierarchy"] = std::move(hierarchy);
+        diag::log_tagged_fmt("rtti",
+                             "list_hierarchy match pid=%u query=%s type=%s bases=%zu elapsed_ms=%llu",
+                             scope.pid(),
+                             query.c_str(),
+                             type.name.c_str(),
+                             type.base_classes.size(),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
         return tool_result_t::ok(result);
     }
+    diag::log_tagged_fmt("rtti",
+                         "list_hierarchy miss pid=%u query=%s types=%zu elapsed_ms=%llu",
+                         scope.pid(),
+                         query.c_str(),
+                         types.size(),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     return tool_result_t::error("RTTI type not found.");
 }
 
 tool_result_t find_constructor(const json& params)
 {
+    const std::uint64_t started_ms = GetTickCount64();
     active_process_scope_t scope(params);
     if (!scope.ok())
         return tool_result_t::error(scope.error());
@@ -633,29 +831,80 @@ tool_result_t find_constructor(const json& params)
     if (!parse_address_param(params, "vtable_va", vtable_va) || vtable_va == 0)
         return tool_result_t::error("'vtable_va' is required.");
     const std::size_t max_scan_bytes = static_cast<std::size_t>(numeric_param(params, "max_scan_bytes", 64ull * 1024ull * 1024ull, 4096, 64ull * 1024ull * 1024ull));
+    const std::uint64_t timeout_ms = numeric_param(params, "timeout_ms", 5500, 500, 60000);
     const auto module = find_module_for_address(scope.pid(), vtable_va);
     if (!module)
         return tool_result_t::error("Could not resolve vtable module.");
     module_layout_t layout;
     if (!load_module_layout(scope.pid(), *module, layout))
         return tool_result_t::error("Could not read module sections.");
+    diag::log_tagged_fmt("rtti",
+                         "find_constructor enter pid=%u vtable=%s module=%s base=%s sections=%zu max_scan_bytes=%zu elapsed_ms=%llu",
+                         scope.pid(),
+                         sa_format_address(vtable_va).c_str(),
+                         (!module->name.empty() ? module->name : module->path).c_str(),
+                         sa_format_address(module->base).c_str(),
+                         layout.sections.size(),
+                         max_scan_bytes,
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
+    type_info_t hinted_type;
+    const bool has_hinted_type = type_from_vtable(scope.pid(), *module, vtable_va, hinted_type);
     json candidates = json::array();
     std::set<std::uint64_t> seen;
-    for (const auto& section : layout.sections)
-    {
-        if ((section.characteristics & IMAGE_SCN_MEM_EXECUTE) == 0 || section.size == 0 || section.size > 64ull * 1024ull * 1024ull)
-            continue;
-        const std::size_t read_size = static_cast<std::size_t>(std::min<std::uint64_t>(section.size, max_scan_bytes));
-        std::vector<std::uint8_t> bytes;
-        if (!read_bytes(scope.pid(), section.va, read_size, bytes) || bytes.empty())
-            continue;
+    bool deadline_hit = false;
+    std::size_t total_reference_hits = 0;
+    std::size_t total_windows = 0;
+    std::size_t total_decoded = 0;
+    auto timed_out = [&]() -> bool {
+        if (GetTickCount64() - started_ms < timeout_ms)
+            return false;
+        deadline_hit = true;
+        return true;
+    };
+    auto append_candidate = [&](const AsmInstr& ins,
+                                std::uint64_t fn_start,
+                                const char* confidence,
+                                const char* phase) {
+        if (!seen.insert(fn_start).second)
+            return;
+        json row;
+        row["constructor_candidate_va"] = sa_format_address(fn_start);
+        row["write_va"] = sa_format_address(ins.addr);
+        row["object_offset"] = ins.mem_op.disp;
+        row["confidence"] = confidence;
+        row["phase"] = phase;
+        row["write_instruction"] = disasm_text(ins);
+        row["preview"] = disasm_preview(scope.pid(), fn_start, 8);
+        candidates.push_back(std::move(row));
+    };
+    auto add_window = [](std::vector<std::pair<std::size_t, std::size_t>>& windows,
+                         std::size_t begin,
+                         std::size_t end) {
+        if (begin >= end)
+            return;
+        for (const auto& existing : windows)
+        {
+            if (existing.first == begin && existing.second == end)
+                return;
+        }
+        windows.push_back({begin, end});
+    };
+    auto decode_range = [&](const module_section_t& section,
+                            const std::vector<std::uint8_t>& bytes,
+                            std::size_t begin,
+                            std::size_t end,
+                            const char* phase) -> std::size_t {
+        std::size_t decoded_count = 0;
         std::map<std::string, std::uint64_t> reg_values;
         std::set<std::string> this_regs;
         this_regs.insert("rcx");
-        for (std::size_t i = 0; i < bytes.size();)
+        for (std::size_t i = begin; i < end && candidates.size() < 64;)
         {
-            const int avail = static_cast<int>(std::min<std::size_t>(16, bytes.size() - i));
+            if (timed_out())
+                break;
+            const int avail = static_cast<int>(std::min<std::size_t>(16, end - i));
             AsmInstr ins = zydis_decode_one(bytes.data() + i, avail, section.va + i);
+            ++decoded_count;
             const std::string m = lower_ascii(ins.mnem);
             const auto operands = split_operands(lower_ascii(ins.ops));
             if ((m == "mov" || m == "lea") && operands.size() >= 2 && object_storage_destination(ins, operands[0], this_regs))
@@ -664,33 +913,148 @@ tool_result_t find_constructor(const json& params)
                 if (value && *value == vtable_va)
                 {
                     const std::uint64_t fn_start = approximate_function_start(scope.pid(), ins.addr);
-                    if (seen.insert(fn_start).second)
-                    {
-                        json row;
-                        row["constructor_candidate_va"] = sa_format_address(fn_start);
-                        row["write_va"] = sa_format_address(ins.addr);
-                        row["object_offset"] = ins.mem_op.disp;
-                        row["confidence"] = "high";
-                        row["write_instruction"] = disasm_text(ins);
-                        row["preview"] = disasm_preview(scope.pid(), fn_start, 8);
-                        candidates.push_back(std::move(row));
-                        if (candidates.size() >= 64)
-                            break;
-                    }
+                    append_candidate(ins, fn_start, "high", phase);
+                    if (candidates.size() >= 64)
+                        break;
                 }
             }
             update_this_aliases(ins, operands, this_regs);
             update_value_registers(scope.pid(), ins, operands, reg_values);
             i += static_cast<std::size_t>(std::max(1, ins.len));
         }
-        if (candidates.size() >= 64)
+        return decoded_count;
+    };
+    for (const auto& section : layout.sections)
+    {
+        if ((section.characteristics & IMAGE_SCN_MEM_EXECUTE) == 0 || section.size == 0 || section.size > 64ull * 1024ull * 1024ull)
+            continue;
+        if (timed_out())
+            break;
+        const std::uint64_t section_started_ms = GetTickCount64();
+        const std::size_t candidates_before = candidates.size();
+        std::size_t decoded_count = 0;
+        const std::size_t read_size = static_cast<std::size_t>(std::min<std::uint64_t>(section.size, max_scan_bytes));
+        std::vector<std::uint8_t> bytes;
+        if (!read_bytes(scope.pid(), section.va, read_size, bytes) || bytes.empty())
+        {
+            diag::log_tagged_fmt("rtti",
+                                 "find_constructor section_read_failed pid=%u section=%s va=%s read_size=%zu elapsed_ms=%llu",
+                                 scope.pid(),
+                                 section.name.c_str(),
+                                 sa_format_address(section.va).c_str(),
+                                 read_size,
+                                 static_cast<unsigned long long>(GetTickCount64() - section_started_ms));
+            continue;
+        }
+        std::vector<std::size_t> references;
+        const auto needle = u64_to_le(vtable_va);
+        for (std::size_t i = 0; i < bytes.size(); ++i)
+        {
+            if (i + needle.size() <= bytes.size() && std::memcmp(bytes.data() + i, needle.data(), needle.size()) == 0)
+                references.push_back(i);
+            if (i + 7 <= bytes.size() && (bytes[i] & 0xF0u) == 0x40u && (bytes[i + 1] == 0x8D || bytes[i + 1] == 0x8B) && (bytes[i + 2] & 0xC7u) == 0x05u)
+            {
+                std::int32_t disp = 0;
+                std::memcpy(&disp, bytes.data() + i + 3, sizeof(disp));
+                const std::uint64_t target = static_cast<std::uint64_t>(static_cast<std::int64_t>(section.va + i + 7) + disp);
+                if (target == vtable_va)
+                    references.push_back(i);
+            }
+            if (i + 6 <= bytes.size() && bytes[i] == 0x8D && (bytes[i + 1] & 0xC7u) == 0x05u)
+            {
+                std::int32_t disp = 0;
+                std::memcpy(&disp, bytes.data() + i + 2, sizeof(disp));
+                const std::uint64_t target = static_cast<std::uint64_t>(static_cast<std::int64_t>(section.va + i + 6) + disp);
+                if (target == vtable_va)
+                    references.push_back(i);
+            }
+            if (i + 10 <= bytes.size() && (bytes[i] & 0xF8u) == 0x48u && bytes[i + 1] >= 0xB8 && bytes[i + 1] <= 0xBF)
+            {
+                std::uint64_t imm = 0;
+                std::memcpy(&imm, bytes.data() + i + 2, sizeof(imm));
+                if (imm == vtable_va)
+                    references.push_back(i);
+            }
+        }
+        std::sort(references.begin(), references.end());
+        references.erase(std::unique(references.begin(), references.end()), references.end());
+        total_reference_hits += references.size();
+        std::vector<std::pair<std::size_t, std::size_t>> windows;
+        const std::size_t max_windows = static_cast<std::size_t>(numeric_param(params, "max_reference_windows", 128, 1, 4096));
+        for (std::size_t ref_index = 0; ref_index < references.size() && windows.size() < max_windows; ++ref_index)
+        {
+            const std::size_t ref = references[ref_index];
+            const std::size_t begin = ref > 192 ? ref - 192 : 0;
+            const std::size_t end = std::min<std::size_t>(bytes.size(), ref + 320);
+            add_window(windows, begin, end);
+            add_window(windows, ref, end);
+        }
+        if (references.empty())
+            add_window(windows, 0, std::min<std::size_t>(bytes.size(), 256 * 1024));
+        diag::log_tagged_fmt("rtti",
+                             "find_constructor section_prefilter pid=%u section=%s va=%s bytes=%zu refs=%zu windows=%zu elapsed_ms=%llu total_elapsed_ms=%llu",
+                             scope.pid(),
+                             section.name.c_str(),
+                             sa_format_address(section.va).c_str(),
+                             bytes.size(),
+                             references.size(),
+                             windows.size(),
+                             static_cast<unsigned long long>(GetTickCount64() - section_started_ms),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        for (const auto& window : windows)
+        {
+            if (timed_out() || candidates.size() >= 64)
+                break;
+            ++total_windows;
+            for (std::size_t shift = 0; shift < 16 && window.first + shift < window.second && candidates.size() < 64; ++shift)
+            {
+                if (timed_out())
+                    break;
+                decoded_count += decode_range(section, bytes, window.first + shift, window.second, references.empty() ? "bounded_fallback_window" : "vtable_reference_window");
+            }
+        }
+        total_decoded += decoded_count;
+        diag::log_tagged_fmt("rtti",
+                             "find_constructor section_done pid=%u section=%s va=%s bytes=%zu decoded=%zu refs=%zu windows=%zu new_candidates=%zu total_candidates=%zu deadline=%d elapsed_ms=%llu total_elapsed_ms=%llu",
+                             scope.pid(),
+                             section.name.c_str(),
+                             sa_format_address(section.va).c_str(),
+                             bytes.size(),
+                             decoded_count,
+                             references.size(),
+                             windows.size(),
+                             candidates.size() - candidates_before,
+                             candidates.size(),
+                             deadline_hit ? 1 : 0,
+                             static_cast<unsigned long long>(GetTickCount64() - section_started_ms),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        if (candidates.size() >= 64 || deadline_hit)
             break;
     }
     json result;
     result["process_id"] = scope.pid();
     result["vtable_va"] = sa_format_address(vtable_va);
+    result["module_name"] = !module->name.empty() ? module->name : module->path;
+    result["timeout_ms"] = timeout_ms;
+    result["deadline_hit"] = deadline_hit;
+    result["reference_hits"] = total_reference_hits;
+    result["decode_windows"] = total_windows;
+    result["decoded_instructions"] = total_decoded;
+    if (has_hinted_type)
+        result["type"] = type_to_json(hinted_type);
     result["candidates"] = std::move(candidates);
-    result["count"] = result["candidates"].size();
+    const std::size_t candidate_count = result["candidates"].size();
+    result["count"] = candidate_count;
+    diag::log_tagged_fmt("rtti",
+                         "find_constructor exit pid=%u vtable=%s count=%zu refs=%zu windows=%zu decoded=%zu deadline=%d elapsed_ms=%llu",
+                         scope.pid(),
+                         sa_format_address(vtable_va).c_str(),
+                         candidate_count,
+                         total_reference_hits,
+                         total_windows,
+                         total_decoded,
+                         deadline_hit ? 1 : 0,
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     return tool_result_t::ok(result);
 }
 }

@@ -3912,20 +3912,64 @@ NTSTATUS functions::handle_net_filter_rule(p_net_filter_rule request) {
 NTSTATUS functions::handle_net_stats(p_net_stats request) {
     if (!request) { NET_ERR("handle_net_stats: NULL request"); return STATUS_INVALID_PARAMETER; }
 
+    LARGE_INTEGER stats_freq = {};
+    LARGE_INTEGER stats_start = KeQueryPerformanceCounter(&stats_freq);
+    NTSTATUS active_status = STATUS_UNSUCCESSFUL;
+    UINT32 active_count = 0;
+    UINT32 active_degraded = 0;
+
+    if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
+        p_net_enum_conn conn_request = static_cast<p_net_enum_conn>(
+            ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(net_enum_conn), 'tSNW'));
+        if (conn_request) {
+            strong::kmemset(conn_request, 0, sizeof(net_enum_conn));
+            conn_request->filter_pid = request->filter_pid;
+            conn_request->filter_protocol = 0;
+            active_status = net_enum::enumerate_connections(conn_request);
+            if (NT_SUCCESS(active_status)) {
+                active_count = conn_request->connection_count;
+            } else {
+                active_degraded = 1;
+            }
+            ExFreePoolWithTag(conn_request, 'tSNW');
+        } else {
+            active_status = STATUS_INSUFFICIENT_RESOURCES;
+            active_degraded = 1;
+        }
+    } else {
+        active_status = STATUS_INVALID_DEVICE_STATE;
+        active_degraded = 1;
+    }
+
+    LARGE_INTEGER stats_end = KeQueryPerformanceCounter(nullptr);
+    ULONGLONG active_elapsed_ms = 0;
+    if (stats_freq.QuadPart > 0 && stats_end.QuadPart >= stats_start.QuadPart) {
+        active_elapsed_ms = static_cast<ULONGLONG>(
+            ((stats_end.QuadPart - stats_start.QuadPart) * 1000) / stats_freq.QuadPart);
+    }
+
     request->bytes_sent = (UINT64)net_capture::g_global_bytes_sent;
     request->bytes_received = (UINT64)net_capture::g_global_bytes_recv;
     request->packets_sent = (UINT64)net_capture::g_global_pkts_sent;
     request->packets_received = (UINT64)net_capture::g_global_pkts_recv;
-    request->active_connections = 0;
+    request->active_connections = active_count;
     request->capture_active = (UINT32)net_capture::g_capture_active;
     request->total_captured = (UINT32)net_capture::g_total_captured;
     request->total_dropped = (UINT32)net_capture::g_total_dropped;
     request->total_dns_logged = (UINT32)net_capture::g_total_dns;
     request->active_filter_rules = (UINT32)net_capture::g_active_rule_count;
 
-    NET_DBG("handle_net_stats: sent=%llu recv=%llu pkts_s=%llu pkts_r=%llu cap=%u captured=%u dropped=%u wfp_init=%d",
+    NET_DBG("handle_net_stats: active_source=NCON status=0x%08x count=%u degraded=%u elapsed_ms=%llu filter_pid=%u irql=%u",
+            active_status,
+            active_count,
+            active_degraded,
+            active_elapsed_ms,
+            request->filter_pid,
+            (UINT32)KeGetCurrentIrql());
+    NET_DBG("handle_net_stats: sent=%llu recv=%llu pkts_s=%llu pkts_r=%llu active=%u cap=%u captured=%u dropped=%u wfp_init=%d",
             request->bytes_sent, request->bytes_received,
             request->packets_sent, request->packets_received,
+            request->active_connections,
             request->capture_active, request->total_captured, request->total_dropped,
             (int)net_capture::g_wfp_initialized);
     return STATUS_SUCCESS;

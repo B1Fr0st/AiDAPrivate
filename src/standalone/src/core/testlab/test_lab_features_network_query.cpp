@@ -315,6 +315,253 @@ namespace {
 		r.parsed.push_back({ label, format_dec_i32(fx.recv_error) });
 	}
 
+	bool send_ncap_ctrl_logged(const char* feature,
+		const char* step,
+		std::uint32_t operation,
+		std::uint32_t filter_pid,
+		std::uint32_t filter_protocol,
+		std::uint32_t max_packet_bytes,
+		voyager::detail::net_cap_ctrl_request& req,
+		std::uint32_t& bytes_returned)
+	{
+		std::memset(&req, 0, sizeof(req));
+		req.operation = operation;
+		req.filter_pid = filter_pid;
+		req.filter_protocol = filter_protocol;
+		req.max_packet_bytes = max_packet_bytes;
+		bytes_returned = 0;
+		SetLastError(ERROR_SUCCESS);
+		bool ok = device->send_ioctl_raw(ioctl_codes::NCAP(), &req,
+			static_cast<std::uint32_t>(sizeof(req)), bytes_returned);
+		DWORD gle = ok ? ERROR_SUCCESS : GetLastError();
+		test_lab_format::testlab_diag_log_step("network-query", feature, step,
+			"ok=%d gle=%lu bytes_returned=%u op=%u filter_pid=%u filter_protocol=%u active=%u captured=%u dropped=%u",
+			ok ? 1 : 0,
+			static_cast<unsigned long>(gle),
+			bytes_returned,
+			req.operation,
+			req.filter_pid,
+			req.filter_protocol,
+			req.capture_active,
+			req.packets_captured,
+			req.packets_dropped);
+		return ok;
+	}
+
+	bool query_nsts_logged(const char* feature,
+		const char* step,
+		voyager::detail::net_stats_request& req,
+		std::uint32_t& bytes_returned)
+	{
+		std::memset(&req, 0, sizeof(req));
+		bytes_returned = 0;
+		SetLastError(ERROR_SUCCESS);
+		bool ok = device->send_ioctl_raw(ioctl_codes::NSTS(), &req,
+			static_cast<std::uint32_t>(sizeof(req)), bytes_returned);
+		DWORD gle = ok ? ERROR_SUCCESS : GetLastError();
+		test_lab_format::testlab_diag_log_step("network-query", feature, step,
+			"ok=%d gle=%lu bytes_returned=%u capture_active=%u total_captured=%u total_dropped=%u total_dns_logged=%u active_filter_rules=%u",
+			ok ? 1 : 0,
+			static_cast<unsigned long>(gle),
+			bytes_returned,
+			req.capture_active,
+			req.total_captured,
+			req.total_dropped,
+			req.total_dns_logged,
+			req.active_filter_rules);
+		return ok;
+	}
+
+	bool query_ndns_logged(const char* step,
+		std::uint32_t filter_pid,
+		voyager::detail::net_dns_get_request* req,
+		std::uint32_t& bytes_returned)
+	{
+		std::memset(req, 0, sizeof(*req));
+		req->filter_pid = filter_pid;
+		bytes_returned = 0;
+		SetLastError(ERROR_SUCCESS);
+		bool ok = device->send_ioctl_raw(ioctl_codes::NDNS(), req,
+			static_cast<std::uint32_t>(sizeof(*req)), bytes_returned);
+		DWORD gle = ok ? ERROR_SUCCESS : GetLastError();
+		test_lab_format::testlab_diag_log_step("network-query", "NDNS", step,
+			"ok=%d gle=%lu bytes_returned=%u filter_pid=%u entry_count=%u",
+			ok ? 1 : 0,
+			static_cast<unsigned long>(gle),
+			bytes_returned,
+			req->filter_pid,
+			req->entry_count);
+		return ok;
+	}
+
+	bool build_dns_query_packet(const std::string& name, char* packet, std::size_t cap, int& packet_len) {
+		packet_len = 0;
+		if (packet == nullptr || cap < 32u || name.empty())
+			return false;
+		std::size_t pos = 0;
+		auto put8 = [&](std::uint8_t v) -> bool {
+			if (pos >= cap) return false;
+			packet[pos++] = static_cast<char>(v);
+			return true;
+		};
+		auto put16 = [&](std::uint16_t v) -> bool {
+			return put8(static_cast<std::uint8_t>((v >> 8) & 0xFFu)) &&
+				put8(static_cast<std::uint8_t>(v & 0xFFu));
+		};
+		const std::uint16_t txid = static_cast<std::uint16_t>(GetTickCount64() & 0xFFFFu);
+		if (!put16(txid) ||
+			!put16(static_cast<std::uint16_t>(0x0100u)) ||
+			!put16(static_cast<std::uint16_t>(1u)) ||
+			!put16(static_cast<std::uint16_t>(0u)) ||
+			!put16(static_cast<std::uint16_t>(0u)) ||
+			!put16(static_cast<std::uint16_t>(0u)))
+			return false;
+		std::size_t label_start = 0;
+		while (label_start < name.size()) {
+			std::size_t label_end = name.find('.', label_start);
+			if (label_end == std::string::npos)
+				label_end = name.size();
+			const std::size_t label_len = label_end - label_start;
+			if (label_len == 0u || label_len > 63u || pos + 1u + label_len >= cap)
+				return false;
+			if (!put8(static_cast<std::uint8_t>(label_len)))
+				return false;
+			std::memcpy(packet + pos, name.data() + label_start, label_len);
+			pos += label_len;
+			label_start = label_end + 1u;
+		}
+		if (!put8(0u) || !put16(1u) || !put16(1u))
+			return false;
+		packet_len = static_cast<int>(pos);
+		return true;
+	}
+
+	struct dns_udp_fixture_result_t {
+		std::uint32_t attempted = 0;
+		std::uint32_t sent = 0;
+		int last_error = 0;
+		int last_send_bytes = 0;
+		int packet_len = 0;
+		int bind_error = 0;
+	};
+
+	bool drive_dns_udp_fixture(const std::string& expected_name, dns_udp_fixture_result_t& fx) {
+		char packet[512];
+		if (!build_dns_query_packet(expected_name, packet, sizeof(packet), fx.packet_len)) {
+			fx.last_error = WSAEINVAL;
+			return false;
+		}
+		SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+		if (s == INVALID_SOCKET) {
+			fx.last_error = WSAGetLastError();
+			return false;
+		}
+		configure_loopback_socket(s);
+		sockaddr_in local{};
+		local.sin_family = AF_INET;
+		local.sin_port = 0;
+		local.sin_addr.s_addr = htonl(0x7f000001u);
+		if (bind(s, reinterpret_cast<sockaddr*>(&local), sizeof(local)) == SOCKET_ERROR) {
+			fx.bind_error = WSAGetLastError();
+		}
+		sockaddr_in dst{};
+		dst.sin_family = AF_INET;
+		dst.sin_port = htons(53);
+		dst.sin_addr.s_addr = htonl(0x7f000001u);
+		for (std::uint32_t i = 0; i < 8u; ++i) {
+			++fx.attempted;
+			int rc = sendto(s, packet, fx.packet_len, 0,
+				reinterpret_cast<const sockaddr*>(&dst), sizeof(dst));
+			if (rc == SOCKET_ERROR) {
+				fx.last_error = WSAGetLastError();
+				fx.last_send_bytes = SOCKET_ERROR;
+			} else {
+				fx.last_error = 0;
+				fx.last_send_bytes = rc;
+				++fx.sent;
+			}
+			Sleep(20);
+		}
+		closesocket(s);
+		return fx.sent > 0u;
+	}
+
+	std::uint32_t count_ndns_name_matches(const voyager::detail::net_dns_get_request& req,
+		const std::string& expected_name,
+		std::uint32_t expected_pid,
+		std::uint32_t& pid_matches)
+	{
+		pid_matches = 0;
+		std::uint32_t name_matches = 0;
+		std::uint32_t cap = req.entry_count;
+		if (cap > static_cast<std::uint32_t>(voyager::detail::NET_DNS_GET_MAX))
+			cap = static_cast<std::uint32_t>(voyager::detail::NET_DNS_GET_MAX);
+		for (std::uint32_t i = 0; i < cap; ++i) {
+			char dom[261];
+			std::memcpy(dom, req.entries[i].domain, 260);
+			dom[260] = '\0';
+			if (std::strcmp(dom, expected_name.c_str()) == 0) {
+				++name_matches;
+				if (req.entries[i].pid == expected_pid)
+					++pid_matches;
+			}
+		}
+		return name_matches;
+	}
+
+	bool send_nfpr_logged(const char* step,
+		voyager::detail::net_fingerprint_request& req,
+		std::uint32_t& bytes_returned)
+	{
+		bytes_returned = 0;
+		SetLastError(ERROR_SUCCESS);
+		bool ok = device->send_ioctl_raw(ioctl_codes::NFPR(), &req,
+			static_cast<std::uint32_t>(sizeof(req)), bytes_returned);
+		DWORD gle = ok ? ERROR_SUCCESS : GetLastError();
+		test_lab_format::testlab_diag_log_step("network-query", "NFPR", step,
+			"ok=%d gle=%lu bytes_returned=%u op=%u result_count=%u",
+			ok ? 1 : 0,
+			static_cast<unsigned long>(gle),
+			bytes_returned,
+			req.operation,
+			req.result_count);
+		return ok;
+	}
+
+	std::uint32_t count_loopback_fingerprints(const voyager::detail::net_fingerprint_request& req) {
+		std::uint32_t matches = 0;
+		std::uint32_t cap = req.result_count;
+		if (cap > voyager::detail::FINGERPRINT_MAX)
+			cap = voyager::detail::FINGERPRINT_MAX;
+		for (std::uint32_t i = 0; i < cap; ++i) {
+			const auto& e = req.entries[i];
+			if (e.address_family == 2u && e.remote_addr[0] == 127u)
+				++matches;
+		}
+		return matches;
+	}
+
+	void append_nfpr_entries(test_lab::result_t& r, const voyager::detail::net_fingerprint_request& req) {
+		std::uint32_t total = req.result_count;
+		if (total > voyager::detail::FINGERPRINT_MAX) total = voyager::detail::FINGERPRINT_MAX;
+		const std::uint32_t cap = (total > 50u) ? 50u : total;
+		for (std::uint32_t i = 0; i < cap; ++i) {
+			const auto& e = req.entries[i];
+			char label[24];
+			std::snprintf(label, sizeof(label), "Fp[%u]", i);
+			char os_buf[65];
+			std::memcpy(os_buf, e.os_guess, 64);
+			os_buf[64] = '\0';
+			char val[512];
+			std::snprintf(val, sizeof(val),
+				"%s ttl=%u win=%u mss=%u wscale=%u df=%u sack=%u nops=%u os=%s",
+				format_ip(e.remote_addr, e.address_family).c_str(),
+				e.ttl, e.window_size, e.mss, e.window_scale, e.df_flag, e.sack_permitted, e.nop_count,
+				os_buf);
+			r.parsed.push_back({ std::string(label), std::string(val) });
+		}
+	}
+
 	void render_inputs_ncon(test_lab::state_t& s) {
 		const char* items[] = { "All", "TCP only", "UDP only" };
 		int cur = static_cast<int>(s.u32_a);
@@ -539,6 +786,21 @@ namespace {
 
 	void run_ndns(test_lab::state_t& s, test_lab::result_t& r) {
 		if (!ensure_driver(r)) return;
+		if (!ensure_netq_winsock_ready()) {
+			r.ok = false;
+			r.error = "WSAStartup failed before NDNS stimulus";
+			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
+			return;
+		}
+		const std::uint32_t self_pid = static_cast<std::uint32_t>(GetCurrentProcessId());
+		char expected_buf[96];
+		std::snprintf(expected_buf, sizeof(expected_buf), "aida-ndns-%lu-%llu.invalid",
+			static_cast<unsigned long>(self_pid),
+			static_cast<unsigned long long>(GetTickCount64()));
+		const std::string expected_name(expected_buf);
+		r.parsed.push_back({ "target_pid", format_dec_u32(s.pid) });
+		r.parsed.push_back({ "stimulus_pid", format_dec_u32(self_pid) });
+		r.parsed.push_back({ "expected_name", expected_name });
 		voyager::detail::net_dns_get_request* req =
 			static_cast<voyager::detail::net_dns_get_request*>(std::calloc(1, sizeof(voyager::detail::net_dns_get_request)));
 		if (req == nullptr) {
@@ -547,19 +809,96 @@ namespace {
 			r.ntstatus = static_cast<std::int32_t>(0xC000009Au);
 			return;
 		}
-		req->filter_pid = 0;
 		std::uint32_t bytes_returned = 0;
-		bool ok = device->send_ioctl_raw(ioctl_codes::NDNS(), req, static_cast<std::uint32_t>(sizeof(*req)), bytes_returned);
-		capture_raw_struct(r, req, sizeof(*req));
-		r.bytes_returned = bytes_returned;
-		if (!ok) {
-			set_fail_from_ioctl(r, bytes_returned);
+		voyager::detail::net_stats_request stats_before{};
+		std::uint32_t stats_before_bytes = 0;
+		const bool stats_before_ok = query_nsts_logged("NDNS", "stats_before", stats_before, stats_before_bytes);
+		r.parsed.push_back({ "stats_before_ok", stats_before_ok ? "1" : "0" });
+		r.parsed.push_back({ "stats_before_dns_logged", format_dec_u32(stats_before.total_dns_logged) });
+		bool baseline_ok = query_ndns_logged("baseline_query", 0u, req, bytes_returned);
+		const std::uint32_t baseline_entry_count = baseline_ok ? req->entry_count : 0u;
+		r.parsed.push_back({ "baseline_query_ok", baseline_ok ? "1" : "0" });
+		r.parsed.push_back({ "baseline_entry_count", format_dec_u32(baseline_entry_count) });
+		voyager::detail::net_cap_ctrl_request stop_before{};
+		std::uint32_t stop_before_bytes = 0;
+		const bool stop_before_ok = send_ncap_ctrl_logged("NDNS", "capture_stop_before", 1u, self_pid, 17u, 512u, stop_before, stop_before_bytes);
+		r.parsed.push_back({ "capture_stop_before_ok", stop_before_ok ? "1" : "0" });
+		voyager::detail::net_cap_ctrl_request start_req{};
+		std::uint32_t start_bytes = 0;
+		const bool start_ok = send_ncap_ctrl_logged("NDNS", "capture_start", 0u, self_pid, 17u, 512u, start_req, start_bytes);
+		r.parsed.push_back({ "capture_start_ok", start_ok ? "1" : "0" });
+		r.parsed.push_back({ "capture_start_active", format_dec_u32(start_req.capture_active) });
+		if (!start_ok) {
+			r.ok = false;
+			r.error = "NCAP start failed before NDNS deterministic DNS stimulus";
+			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
 			std::free(req);
 			return;
 		}
-		const std::uint32_t total = req->entry_count;
-		r.parsed.push_back({ "entry_count", format_dec_u32(total) });
-		std::uint32_t cap = total;
+		dns_udp_fixture_result_t fixture{};
+		const bool fixture_ok = drive_dns_udp_fixture(expected_name, fixture);
+		test_lab_format::testlab_diag_log_step("network-query", "NDNS", "dns_udp_fixture",
+			"ok=%d expected=\"%s\" attempted=%u sent=%u packet_len=%d bind_error=%d last_error=%d last_send_bytes=%d target_pid=%u stimulus_pid=%u",
+			fixture_ok ? 1 : 0,
+			expected_name.c_str(),
+			fixture.attempted,
+			fixture.sent,
+			fixture.packet_len,
+			fixture.bind_error,
+			fixture.last_error,
+			fixture.last_send_bytes,
+			s.pid,
+			self_pid);
+		r.parsed.push_back({ "stimulus_attempted", format_dec_u32(fixture.attempted) });
+		r.parsed.push_back({ "stimulus_sent", format_dec_u32(fixture.sent) });
+		r.parsed.push_back({ "stimulus_packet_len", format_dec_i32(fixture.packet_len) });
+		r.parsed.push_back({ "stimulus_bind_error", format_dec_i32(fixture.bind_error) });
+		r.parsed.push_back({ "stimulus_last_error", format_dec_i32(fixture.last_error) });
+		voyager::detail::net_stats_request stats_after_stimulus{};
+		std::uint32_t stats_after_stimulus_bytes = 0;
+		const bool stats_after_stimulus_ok = query_nsts_logged("NDNS", "stats_after_stimulus", stats_after_stimulus, stats_after_stimulus_bytes);
+		r.parsed.push_back({ "stats_after_stimulus_ok", stats_after_stimulus_ok ? "1" : "0" });
+		r.parsed.push_back({ "stats_after_stimulus_dns_logged", format_dec_u32(stats_after_stimulus.total_dns_logged) });
+		bool query_ok = false;
+		std::uint32_t name_matches = 0;
+		std::uint32_t pid_matches = 0;
+		std::uint32_t final_entry_count = 0;
+		std::uint32_t poll_count = 0;
+		const ULONGLONG poll_start = GetTickCount64();
+		ULONGLONG elapsed_ms = 0;
+		do {
+			++poll_count;
+			query_ok = query_ndns_logged("poll_query", 0u, req, bytes_returned);
+			if (!query_ok)
+				break;
+			final_entry_count = req->entry_count;
+			name_matches = count_ndns_name_matches(*req, expected_name, self_pid, pid_matches);
+			if (name_matches > 0u)
+				break;
+			Sleep(100);
+			elapsed_ms = GetTickCount64() - poll_start;
+		} while (elapsed_ms < 3000ull);
+		elapsed_ms = GetTickCount64() - poll_start;
+		voyager::detail::net_cap_ctrl_request stop_req{};
+		std::uint32_t stop_bytes = 0;
+		const bool stop_ok = send_ncap_ctrl_logged("NDNS", "capture_stop_after", 1u, self_pid, 17u, 512u, stop_req, stop_bytes);
+		voyager::detail::net_stats_request stats_after{};
+		std::uint32_t stats_after_bytes = 0;
+		const bool stats_after_ok = query_nsts_logged("NDNS", "stats_after", stats_after, stats_after_bytes);
+		r.bytes_returned = bytes_returned;
+		capture_raw_struct(r, req, sizeof(*req));
+		r.parsed.push_back({ "poll_count", format_dec_u32(poll_count) });
+		r.parsed.push_back({ "timeout_elapsed_ms", format_dec_u64(static_cast<std::uint64_t>(elapsed_ms)) });
+		r.parsed.push_back({ "poll_query_ok", query_ok ? "1" : "0" });
+		r.parsed.push_back({ "capture_stop_ok", stop_ok ? "1" : "0" });
+		r.parsed.push_back({ "capture_stop_captured", format_dec_u32(stop_req.packets_captured) });
+		r.parsed.push_back({ "capture_stop_dropped", format_dec_u32(stop_req.packets_dropped) });
+		r.parsed.push_back({ "stats_after_ok", stats_after_ok ? "1" : "0" });
+		r.parsed.push_back({ "stats_after_dns_logged", format_dec_u32(stats_after.total_dns_logged) });
+		r.parsed.push_back({ "entry_count", format_dec_u32(final_entry_count) });
+		r.parsed.push_back({ "expected_name_matches", format_dec_u32(name_matches) });
+		r.parsed.push_back({ "expected_pid_matches", format_dec_u32(pid_matches) });
+		std::uint32_t cap = final_entry_count;
 		if (cap > 50u) cap = 50u;
 		if (cap > static_cast<std::uint32_t>(voyager::detail::NET_DNS_GET_MAX)) {
 			cap = static_cast<std::uint32_t>(voyager::detail::NET_DNS_GET_MAX);
@@ -581,6 +920,39 @@ namespace {
 				dom,
 				format_ip(e.resolved_addr, 2u).c_str());
 			r.parsed.push_back({ std::string(label), std::string(val) });
+		}
+		if (!fixture_ok) {
+			r.ok = false;
+			r.error = "NDNS DNS UDP fixture failed before query; expected name was not provably emitted";
+			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
+			std::free(req);
+			return;
+		}
+		if (!query_ok) {
+			set_fail_from_ioctl(r, bytes_returned);
+			std::free(req);
+			return;
+		}
+		if (!stop_ok) {
+			r.ok = false;
+			r.error = "NCAP stop failed after NDNS deterministic DNS stimulus";
+			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
+			std::free(req);
+			return;
+		}
+		if (final_entry_count == 0u) {
+			r.ok = false;
+			r.error = "NDNS returned zero DNS entries after NCAP start and deterministic DNS UDP stimulus";
+			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
+			std::free(req);
+			return;
+		}
+		if (name_matches == 0u) {
+			r.ok = false;
+			r.error = "NDNS did not return the deterministic DNS fixture name after polling";
+			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
+			std::free(req);
+			return;
 		}
 		r.ntstatus = 0;
 		r.ok = true;
@@ -758,6 +1130,27 @@ namespace {
 		r.parsed.push_back({ "total_dropped", format_dec_u32(req.total_dropped) });
 		r.parsed.push_back({ "total_dns_logged", format_dec_u32(req.total_dns_logged) });
 		r.parsed.push_back({ "active_filter_rules", format_dec_u32(req.active_filter_rules) });
+		if (req.active_connections == 0u) {
+			voyager::detail::net_enum_conn_request* con =
+				static_cast<voyager::detail::net_enum_conn_request*>(std::calloc(1, sizeof(voyager::detail::net_enum_conn_request)));
+			if (con != nullptr) {
+				std::uint32_t con_bytes = 0;
+				con->filter_pid = 0u;
+				con->filter_protocol = 0u;
+				SetLastError(ERROR_SUCCESS);
+				bool con_ok = device->send_ioctl_raw(ioctl_codes::NCON(), con, static_cast<std::uint32_t>(sizeof(*con)), con_bytes);
+				DWORD con_gle = con_ok ? ERROR_SUCCESS : GetLastError();
+				r.parsed.push_back({ "active_connections_ncon_crosscheck_ok", con_ok ? "1" : "0" });
+				r.parsed.push_back({ "active_connections_ncon_crosscheck_last_error", format_dec_u32(static_cast<std::uint32_t>(con_gle)) });
+				r.parsed.push_back({ "active_connections_ncon_crosscheck_bytes", format_dec_u32(con_bytes) });
+				r.parsed.push_back({ "active_connections_ncon_crosscheck_count", format_dec_u32(con_ok ? con->connection_count : 0u) });
+				r.parsed.push_back({ "active_connections_degraded", con_ok && con->connection_count > 0u ? "1" : "0" });
+				std::free(con);
+			} else {
+				r.parsed.push_back({ "active_connections_ncon_crosscheck_ok", "0" });
+				r.parsed.push_back({ "active_connections_ncon_crosscheck_error", "calloc_failed" });
+			}
+		}
 		r.ntstatus = 0;
 		r.ok = true;
 	}
@@ -1166,27 +1559,16 @@ namespace {
 
 	void run_nfpr(test_lab::state_t& s, test_lab::result_t& r) {
 		if (!ensure_driver(r)) return;
-		voyager::detail::net_fingerprint_request* req =
-			static_cast<voyager::detail::net_fingerprint_request*>(std::calloc(1, sizeof(voyager::detail::net_fingerprint_request)));
-		if (req == nullptr) {
+		if (!ensure_netq_winsock_ready()) {
 			r.ok = false;
-			r.error = "calloc failed for net_fingerprint_request";
-			r.ntstatus = static_cast<std::int32_t>(0xC000009Au);
+			r.error = "WSAStartup failed before NFPR stimulus";
+			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
 			return;
 		}
-		req->operation = s.u32_b;
+		const std::uint32_t self_pid = static_cast<std::uint32_t>(GetCurrentProcessId());
 		std::uint8_t parsed_ip[4] = { 0, 0, 0, 0 };
 		std::uint32_t parsed_port = s.u32_a;
 		bool ip_valid = parse_dotted_quad(s.text_a.c_str(), parsed_ip, &parsed_port);
-		std::uint32_t bytes_returned = 0;
-		bool ok = device->send_ioctl_raw(ioctl_codes::NFPR(), req, static_cast<std::uint32_t>(sizeof(*req)), bytes_returned);
-		capture_raw_struct(r, req, sizeof(*req));
-		r.bytes_returned = bytes_returned;
-		if (!ok) {
-			set_fail_from_ioctl(r, bytes_returned);
-			std::free(req);
-			return;
-		}
 		char endpoint[64];
 		if (ip_valid) {
 			std::snprintf(endpoint, sizeof(endpoint), "%u.%u.%u.%u:%u",
@@ -1195,29 +1577,118 @@ namespace {
 			std::snprintf(endpoint, sizeof(endpoint), "(unparsed) port=%u", parsed_port);
 		}
 		r.parsed.push_back({ "endpoint_input", std::string(endpoint) });
-		r.parsed.push_back({ "operation", format_dec_u32(s.u32_b) });
-		r.parsed.push_back({ "result_count", format_dec_u32(req->result_count) });
-		std::uint32_t total = req->result_count;
-		if (total > voyager::detail::FINGERPRINT_MAX) total = voyager::detail::FINGERPRINT_MAX;
-		const std::uint32_t cap = (total > 50u) ? 50u : total;
-		for (std::uint32_t i = 0; i < cap; ++i) {
-			const auto& e = req->entries[i];
-			char label[24];
-			std::snprintf(label, sizeof(label), "Fp[%u]", i);
-			char os_buf[65];
-			std::memcpy(os_buf, e.os_guess, 64);
-			os_buf[64] = '\0';
-			char val[512];
-			std::snprintf(val, sizeof(val),
-				"%s ttl=%u win=%u mss=%u wscale=%u df=%u sack=%u nops=%u os=%s",
-				format_ip(e.remote_addr, e.address_family).c_str(),
-				e.ttl, e.window_size, e.mss, e.window_scale, e.df_flag, e.sack_permitted, e.nop_count,
-				os_buf);
-			r.parsed.push_back({ std::string(label), std::string(val) });
+		r.parsed.push_back({ "requested_operation", format_dec_u32(s.u32_b) });
+		r.parsed.push_back({ "target_pid", format_dec_u32(s.pid) });
+		r.parsed.push_back({ "stimulus_pid", format_dec_u32(self_pid) });
+		std::uint32_t bytes_returned = 0;
+		voyager::detail::net_fingerprint_request stop_before{};
+		stop_before.operation = 1u;
+		const bool stop_before_ok = send_nfpr_logged("stop_before", stop_before, bytes_returned);
+		r.parsed.push_back({ "stop_before_ok", stop_before_ok ? "1" : "0" });
+		voyager::detail::net_fingerprint_request baseline{};
+		baseline.operation = 2u;
+		const bool baseline_ok = send_nfpr_logged("baseline_query", baseline, bytes_returned);
+		const std::uint32_t baseline_loopback = count_loopback_fingerprints(baseline);
+		r.parsed.push_back({ "baseline_query_ok", baseline_ok ? "1" : "0" });
+		r.parsed.push_back({ "baseline_result_count", format_dec_u32(baseline_ok ? baseline.result_count : 0u) });
+		r.parsed.push_back({ "baseline_loopback_matches", format_dec_u32(baseline_loopback) });
+		voyager::detail::net_fingerprint_request start{};
+		start.operation = 0u;
+		const bool start_ok = send_nfpr_logged("start_capture", start, bytes_returned);
+		r.parsed.push_back({ "start_ok", start_ok ? "1" : "0" });
+		if (!start_ok) {
+			r.bytes_returned = bytes_returned;
+			capture_raw_struct(r, &start, sizeof(start));
+			r.ok = false;
+			r.error = "NFPR start failed before deterministic TCP SYN stimulus";
+			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
+			return;
+		}
+		loopback_tcp_fixture_t fx;
+		std::string fixture_diag;
+		const bool fixture_ok = open_loopback_tcp_fixture(fx, fixture_diag);
+		test_lab_format::testlab_diag_log_step("network-query", "NFPR", "tcp_syn_fixture",
+			"ok=%d diag=\"%s\" target_pid=%u stimulus_pid=%u listen_port=%u client_port=%u setup_wsa_error=%d",
+			fixture_ok ? 1 : 0,
+			fixture_diag.c_str(),
+			s.pid,
+			self_pid,
+			fx.listen_port,
+			fx.client_port,
+			fx.setup_wsa_error);
+		r.parsed.push_back({ "loopback_fixture_ok", fixture_ok ? "1" : "0" });
+		r.parsed.push_back({ "loopback_fixture_diag", fixture_diag });
+		append_loopback_fields(r, fx, "loopback_after_connect");
+		bool traffic_ok = false;
+		if (fixture_ok) {
+			Sleep(80);
+			traffic_ok = emit_loopback_http(fx, "nfpr");
+			append_loopback_fields(r, fx, "loopback_after_send");
+		}
+		r.parsed.push_back({ "loopback_traffic_ok", traffic_ok ? "1" : "0" });
+		voyager::detail::net_fingerprint_request query{};
+		bool query_ok = false;
+		std::uint32_t query_bytes_returned = 0;
+		std::uint32_t loopback_matches = 0;
+		std::uint32_t poll_count = 0;
+		const ULONGLONG poll_start = GetTickCount64();
+		ULONGLONG elapsed_ms = 0;
+		do {
+			++poll_count;
+			std::memset(&query, 0, sizeof(query));
+			query.operation = 2u;
+			query_ok = send_nfpr_logged("poll_query", query, query_bytes_returned);
+			if (!query_ok)
+				break;
+			loopback_matches = count_loopback_fingerprints(query);
+			if (query.result_count > 0u && loopback_matches > 0u)
+				break;
+			Sleep(100);
+			elapsed_ms = GetTickCount64() - poll_start;
+		} while (elapsed_ms < 3000ull);
+		elapsed_ms = GetTickCount64() - poll_start;
+		voyager::detail::net_fingerprint_request stop_after{};
+		stop_after.operation = 1u;
+		const bool stop_after_ok = send_nfpr_logged("stop_after", stop_after, bytes_returned);
+		r.bytes_returned = query_bytes_returned;
+		capture_raw_struct(r, &query, sizeof(query));
+		r.parsed.push_back({ "poll_count", format_dec_u32(poll_count) });
+		r.parsed.push_back({ "timeout_elapsed_ms", format_dec_u64(static_cast<std::uint64_t>(elapsed_ms)) });
+		r.parsed.push_back({ "poll_query_ok", query_ok ? "1" : "0" });
+		r.parsed.push_back({ "stop_after_ok", stop_after_ok ? "1" : "0" });
+		r.parsed.push_back({ "result_count", format_dec_u32(query_ok ? query.result_count : 0u) });
+		r.parsed.push_back({ "loopback_fingerprint_matches", format_dec_u32(loopback_matches) });
+		append_nfpr_entries(r, query);
+		if (!fixture_ok) {
+			r.ok = false;
+			r.error = "NFPR loopback TCP SYN fixture failed after start; no deterministic fingerprint stimulus was proven";
+			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
+			return;
+		}
+		if (!query_ok) {
+			set_fail_from_ioctl(r, query_bytes_returned);
+			return;
+		}
+		if (!stop_after_ok) {
+			r.ok = false;
+			r.error = "NFPR stop failed after deterministic TCP SYN stimulus";
+			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
+			return;
+		}
+		if (query.result_count == 0u) {
+			r.ok = false;
+			r.error = "NFPR result_count remained zero after start and deterministic TCP SYN stimulus";
+			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
+			return;
+		}
+		if (loopback_matches == 0u) {
+			r.ok = false;
+			r.error = "NFPR returned fingerprints but none matched the loopback TCP SYN fixture address";
+			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
+			return;
 		}
 		r.ntstatus = 0;
 		r.ok = true;
-		std::free(req);
 	}
 
 }
@@ -1249,8 +1720,8 @@ TESTLAB_REGISTER(g_reg_ncpg_netq,
 TESTLAB_REGISTER(g_reg_ndns_netq,
 	"network-query",
 	test_lab::driver_e::whoswho,
-	"NDNS - drain DNS query log",
-	"ioctl_codes::NDNS() with net_dns_get_request. Up to NET_DNS_GET_MAX (64) entries.",
+	"NDNS - DNS query log stimulus",
+	"ioctl_codes::NDNS() with net_dns_get_request after NCAP start and deterministic DNS UDP fixture.",
 	&render_inputs_ndns,
 	&run_ndns)
 
@@ -1314,6 +1785,6 @@ TESTLAB_REGISTER(g_reg_nfpr_netq,
 	"network-query",
 	test_lab::driver_e::whoswho,
 	"NFPR - passive TCP/IP fingerprint",
-	"ioctl_codes::NFPR() with net_fingerprint_request. Operation 0=start, 1=stop, 2=query. Endpoint text_a is informational (kernel collects globally).",
+	"ioctl_codes::NFPR() lifecycle start, loopback TCP SYN fixture, poll query, stop cleanup.",
 	&render_inputs_nfpr,
 	&run_nfpr)

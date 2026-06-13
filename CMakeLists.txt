@@ -538,6 +538,32 @@ if(MSVC AND TARGET Zycore)
         set_target_properties(Zycore PROPERTIES COMPILE_OPTIONS "${_zycore_priv_scoped}")
     endif()
 endif()
+if(MSVC AND TARGET Zydis)
+    get_target_property(_zydis_opts Zydis INTERFACE_COMPILE_OPTIONS)
+    if(_zydis_opts)
+        set(_zydis_opts_scoped)
+        foreach(_opt IN LISTS _zydis_opts)
+            if(_opt STREQUAL "/wd4201" OR _opt MATCHES "^/wd[0-9]+$" OR _opt MATCHES "^/W[0-9]$" OR _opt STREQUAL "/WX")
+                list(APPEND _zydis_opts_scoped "$<$<COMPILE_LANGUAGE:C,CXX>:${_opt}>")
+            else()
+                list(APPEND _zydis_opts_scoped "${_opt}")
+            endif()
+        endforeach()
+        set_target_properties(Zydis PROPERTIES INTERFACE_COMPILE_OPTIONS "${_zydis_opts_scoped}")
+    endif()
+    get_target_property(_zydis_priv Zydis COMPILE_OPTIONS)
+    if(_zydis_priv)
+        set(_zydis_priv_scoped)
+        foreach(_opt IN LISTS _zydis_priv)
+            if(_opt STREQUAL "/wd4201" OR _opt MATCHES "^/wd[0-9]+$" OR _opt MATCHES "^/W[0-9]$" OR _opt STREQUAL "/WX")
+                list(APPEND _zydis_priv_scoped "$<$<COMPILE_LANGUAGE:C,CXX>:${_opt}>")
+            else()
+                list(APPEND _zydis_priv_scoped "${_opt}")
+            endif()
+        endforeach()
+        set_target_properties(Zydis PROPERTIES COMPILE_OPTIONS "${_zydis_priv_scoped}")
+    endif()
+endif()
 set(UNICORN_BUILD_SHARED OFF CACHE BOOL "" FORCE)
 set(UNICORN_ARCH "x86" CACHE STRING "" FORCE)
 set(UNICORN_INSTALL OFF CACHE BOOL "" FORCE)
@@ -2032,6 +2058,55 @@ if(WIN32)
             endif()
         endforeach()
 
+        set(AIDA_CAMOUFOX_REVERSE_MCP_BUILD_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/tools/build_camoufox_reverse_mcp_exe.ps1")
+        set(AIDA_CAMOUFOX_REVERSE_MCP_SOURCE_DIR "")
+        set(AIDA_CAMOUFOX_REVERSE_MCP_SOURCE_CANDIDATES
+            "${CMAKE_CURRENT_SOURCE_DIR}/camoufox-reverse-mcp"
+            "${CMAKE_CURRENT_SOURCE_DIR}/.deps/camoufox-reverse-mcp"
+        )
+        foreach(AIDA_CAMOUFOX_REVERSE_MCP_SOURCE_CANDIDATE IN LISTS AIDA_CAMOUFOX_REVERSE_MCP_SOURCE_CANDIDATES)
+            if(NOT AIDA_CAMOUFOX_REVERSE_MCP_SOURCE_DIR AND EXISTS "${AIDA_CAMOUFOX_REVERSE_MCP_SOURCE_CANDIDATE}/pyproject.toml")
+                set(AIDA_CAMOUFOX_REVERSE_MCP_SOURCE_DIR "${AIDA_CAMOUFOX_REVERSE_MCP_SOURCE_CANDIDATE}")
+            endif()
+        endforeach()
+        set(AIDA_CAMOUFOX_REVERSE_MCP_CANONICAL_EXE "${CMAKE_CURRENT_SOURCE_DIR}/.deps/AiDA_CamoufoxReverseMcp.exe")
+        set(AIDA_CAMOUFOX_REVERSE_MCP_BUILD_TARGET_READY OFF)
+        if(EXISTS "${AIDA_CAMOUFOX_REVERSE_MCP_BUILD_SCRIPT}" AND AIDA_CAMOUFOX_REVERSE_MCP_SOURCE_DIR)
+            find_program(AIDA_POWERSHELL_EXECUTABLE NAMES powershell.exe powershell pwsh.exe pwsh)
+            if(NOT AIDA_POWERSHELL_EXECUTABLE)
+                message(FATAL_ERROR "AiDA Camoufox frozen reverse MCP contract staging requires PowerShell")
+            endif()
+            file(GLOB_RECURSE AIDA_CAMOUFOX_REVERSE_MCP_SOURCE_DEPS CONFIGURE_DEPENDS
+                "${AIDA_CAMOUFOX_REVERSE_MCP_SOURCE_DIR}/pyproject.toml"
+                "${AIDA_CAMOUFOX_REVERSE_MCP_SOURCE_DIR}/src/*.py"
+                "${AIDA_CAMOUFOX_REVERSE_MCP_SOURCE_DIR}/src/*.json"
+                "${AIDA_CAMOUFOX_REVERSE_MCP_SOURCE_DIR}/src/*.js"
+            )
+            set(AIDA_CAMOUFOX_REVERSE_MCP_BUILD_DEPS
+                "${AIDA_CAMOUFOX_REVERSE_MCP_BUILD_SCRIPT}"
+                ${AIDA_CAMOUFOX_REVERSE_MCP_SOURCE_DEPS}
+            )
+            set(AIDA_CAMOUFOX_REVERSE_MCP_STAMP "${CMAKE_CURRENT_BINARY_DIR}/aida_camoufox_reverse_mcp_contract.stamp")
+            add_custom_command(
+                OUTPUT "${AIDA_CAMOUFOX_REVERSE_MCP_STAMP}"
+                COMMAND "${AIDA_POWERSHELL_EXECUTABLE}" -NoProfile -ExecutionPolicy Bypass
+                    -File "${AIDA_CAMOUFOX_REVERSE_MCP_BUILD_SCRIPT}"
+                    -SourceRoot "${AIDA_CAMOUFOX_REVERSE_MCP_SOURCE_DIR}"
+                    -OutputDir "${CMAKE_CURRENT_SOURCE_DIR}/.deps"
+                COMMAND ${CMAKE_COMMAND} -E touch "${AIDA_CAMOUFOX_REVERSE_MCP_STAMP}"
+                BYPRODUCTS "${AIDA_CAMOUFOX_REVERSE_MCP_CANONICAL_EXE}"
+                DEPENDS ${AIDA_CAMOUFOX_REVERSE_MCP_BUILD_DEPS}
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+                COMMENT "Verifying app-local frozen Camoufox reverse MCP executable contract..."
+                VERBATIM
+                USES_TERMINAL
+            )
+            add_custom_target(aida_camoufox_reverse_mcp_exe
+                DEPENDS "${AIDA_CAMOUFOX_REVERSE_MCP_STAMP}"
+            )
+            set(AIDA_CAMOUFOX_REVERSE_MCP_BUILD_TARGET_READY ON)
+        endif()
+
         set(AIDA_CAMOUFOX_REVERSE_MCP_EXE_CANDIDATES
             "${CMAKE_CURRENT_SOURCE_DIR}/.deps/AiDA_CamoufoxReverseMcp.exe"
             "${CMAKE_CURRENT_SOURCE_DIR}/.deps/camoufox-reverse-mcp.exe"
@@ -2041,11 +2116,15 @@ if(WIN32)
             "${CMAKE_CURRENT_SOURCE_DIR}/camoufox-reverse-mcp.exe"
         )
         set(AIDA_CAMOUFOX_REVERSE_MCP_EXE "")
-        foreach(AIDA_CAMOUFOX_REVERSE_MCP_EXE_CANDIDATE IN LISTS AIDA_CAMOUFOX_REVERSE_MCP_EXE_CANDIDATES)
-            if(NOT AIDA_CAMOUFOX_REVERSE_MCP_EXE AND EXISTS "${AIDA_CAMOUFOX_REVERSE_MCP_EXE_CANDIDATE}")
-                set(AIDA_CAMOUFOX_REVERSE_MCP_EXE "${AIDA_CAMOUFOX_REVERSE_MCP_EXE_CANDIDATE}")
-            endif()
-        endforeach()
+        if(AIDA_CAMOUFOX_REVERSE_MCP_BUILD_TARGET_READY)
+            set(AIDA_CAMOUFOX_REVERSE_MCP_EXE "${AIDA_CAMOUFOX_REVERSE_MCP_CANONICAL_EXE}")
+        else()
+            foreach(AIDA_CAMOUFOX_REVERSE_MCP_EXE_CANDIDATE IN LISTS AIDA_CAMOUFOX_REVERSE_MCP_EXE_CANDIDATES)
+                if(NOT AIDA_CAMOUFOX_REVERSE_MCP_EXE AND EXISTS "${AIDA_CAMOUFOX_REVERSE_MCP_EXE_CANDIDATE}")
+                    set(AIDA_CAMOUFOX_REVERSE_MCP_EXE "${AIDA_CAMOUFOX_REVERSE_MCP_EXE_CANDIDATE}")
+                endif()
+            endforeach()
+        endif()
 
         set(AIDA_BUNDLED_PYTHON_CANDIDATES
             "${CMAKE_CURRENT_SOURCE_DIR}/.deps/camoufox-runtime"
@@ -2086,6 +2165,10 @@ if(WIN32)
         endif()
 
         if(AIDA_CAMOUFOX_STAGE_EFFECTIVE)
+            if(AIDA_CAMOUFOX_REVERSE_MCP_BUILD_TARGET_READY)
+                add_dependencies(AiDAStandalone aida_camoufox_reverse_mcp_exe)
+            endif()
+
             if(AIDA_CAMOUFOX_STAGE_REVERSE_MCP_SOURCE)
                 add_custom_command(TARGET AiDAStandalone POST_BUILD
                     COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:AiDAStandalone>/deps"
