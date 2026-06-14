@@ -306,7 +306,6 @@ struct cert_diagnostics_ui_t {
     std::vector<cert_intercept::provider_status_t> providers;
     std::string status;
     std::string handoff_status;
-    cert_intercept::profiles::firefox_profile_status_t firefox_status;
 };
 static cert_diagnostics_ui_t s_cert_diag_ui;
 
@@ -2330,18 +2329,10 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
             ok ? toast_notification::toast_type_t::success : toast_notification::toast_type_t::error);
     }
     ImGui::SameLine();
-    if (aida::ui::button("Prepare Firefox profile", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
-        bool ok = cert_generator::initialize();
-        if (ok && cert_generator::is_ready()) {
-            uint16_t proxy_port = state.proxy_port > 0 && state.proxy_port <= 65535
-                ? static_cast<uint16_t>(state.proxy_port)
-                : static_cast<uint16_t>(8443);
-            s_cert_diag_ui.firefox_status = cert_intercept::profiles::prepare_firefox_profile(
-                cert_generator::get_root_ca(), state.proxy_bind_addr, proxy_port);
-            ok = s_cert_diag_ui.firefox_status.ok;
-        }
-        toast_notification::push(ok ? "Firefox profile prepared." : "Firefox profile preparation failed.",
-            ok ? toast_notification::toast_type_t::success : toast_notification::toast_type_t::error);
+    if (aida::ui::button("Open Camoufox controls", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+        state.prev_tab = state.active_tab;
+        state.active_tab = sub_tab_t::browser;
+        toast_notification::push("Camoufox is the only supported browser.", toast_notification::toast_type_t::info);
     }
     if (cert_pin_bypass::is_bypass_active()) {
         auto active_bypasses = cert_pin_bypass::get_active_bypasses();
@@ -2389,10 +2380,6 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
         ImGui::SameLine();
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
             "%s", s_cert_diag_ui.status.c_str());
-    }
-    if (s_cert_diag_ui.firefox_status.prepared) {
-        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
-            "Firefox profile: %s", s_cert_diag_ui.firefox_status.launch_arguments.c_str());
     }
     if (s_cert_diag_ui.has_report) {
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),

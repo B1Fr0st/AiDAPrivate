@@ -262,6 +262,42 @@ inline bool resolve_temp_log_dir(char* out, size_t out_size)
     return ensure_dir_exists(out);
 }
 
+inline void archive_existing_debug_log_once(const char* file_name, const char* path)
+{
+    if (!is_debug_log_name(file_name) || !path || path[0] == '\0')
+        return;
+    if (env_flag_enabled("AIDA_DISABLE_LOG_ARCHIVE"))
+        return;
+
+    DWORD attr = GetFileAttributesA(path);
+    if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY))
+        return;
+
+    HANDLE existing = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (existing == INVALID_HANDLE_VALUE)
+        return;
+
+    LARGE_INTEGER size{};
+    const BOOL sized = GetFileSizeEx(existing, &size);
+    CloseHandle(existing);
+    if (!sized || size.QuadPart <= 0)
+        return;
+
+    static std::atomic<bool> archived{ false };
+    bool expected = false;
+    if (!archived.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        return;
+
+    char archive[MAX_PATH] = {};
+    _snprintf_s(archive, sizeof(archive), _TRUNCATE, "%s.previous", path);
+    if (archive[0] == '\0')
+        return;
+
+    DeleteFileA(archive);
+    CopyFileA(path, archive, FALSE);
+}
+
 inline HANDLE open_log_handle(const char* file_name, DWORD desired_access, DWORD creation, DWORD flags)
 {
     constexpr DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
@@ -273,6 +309,7 @@ inline HANDLE open_log_handle(const char* file_name, DWORD desired_access, DWORD
     if (fileless &&
         is_debug_log_name(file_name) &&
         resolve_env_log_path("AIDA_FILELESS_DEBUG_LOG_PATH", path, sizeof(path))) {
+        archive_existing_debug_log_once(file_name, path);
         HANDLE hf = CreateFileA(path, desired_access, share, nullptr, creation, flags, nullptr);
         if (hf != INVALID_HANDLE_VALUE) {
             remember_log_source("fileless_debug_env", true);
@@ -283,6 +320,7 @@ inline HANDLE open_log_handle(const char* file_name, DWORD desired_access, DWORD
     const char* exe_dir = resolve_log_dir();
     if (exe_dir && exe_dir[0] != '\0') {
         _snprintf_s(path, sizeof(path), _TRUNCATE, "%s%s", exe_dir, file_name);
+        archive_existing_debug_log_once(file_name, path);
         HANDLE hf = CreateFileA(path, desired_access, share, nullptr, creation, flags, nullptr);
         if (hf != INVALID_HANDLE_VALUE) {
             remember_log_path(path);
@@ -293,6 +331,7 @@ inline HANDLE open_log_handle(const char* file_name, DWORD desired_access, DWORD
     char dir[MAX_PATH] = {};
     if (resolve_local_log_dir(dir, sizeof(dir))) {
         _snprintf_s(path, sizeof(path), _TRUNCATE, "%s\\%s", dir, file_name);
+        archive_existing_debug_log_once(file_name, path);
         HANDLE hf = CreateFileA(path, desired_access, share, nullptr, creation, flags, nullptr);
         if (hf != INVALID_HANDLE_VALUE) {
             remember_log_source(fileless ? "fileless_localappdata" : "localappdata", fileless);
@@ -303,6 +342,7 @@ inline HANDLE open_log_handle(const char* file_name, DWORD desired_access, DWORD
 
     if (resolve_temp_log_dir(dir, sizeof(dir))) {
         _snprintf_s(path, sizeof(path), _TRUNCATE, "%s\\%s", dir, file_name);
+        archive_existing_debug_log_once(file_name, path);
         HANDLE hf = CreateFileA(path, desired_access, share, nullptr, creation, flags, nullptr);
         if (hf != INVALID_HANDLE_VALUE) {
             remember_log_source(fileless ? "fileless_temp" : "temp", fileless);
@@ -311,6 +351,7 @@ inline HANDLE open_log_handle(const char* file_name, DWORD desired_access, DWORD
         }
     }
 
+    archive_existing_debug_log_once(file_name, file_name);
     HANDLE hf = CreateFileA(file_name, desired_access, share, nullptr, creation, flags, nullptr);
     if (hf != INVALID_HANDLE_VALUE) {
         remember_log_source(fileless ? "fileless_cwd" : "cwd", fileless);

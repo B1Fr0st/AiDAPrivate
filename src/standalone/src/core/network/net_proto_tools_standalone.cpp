@@ -40,11 +40,12 @@ tool_result_t handle_find_sendrecv(const json& raw_params)
     options.max_results = params.value("max_results", 64u);
     options.max_modules = params.value("max_modules", 32u);
     options.max_scan_bytes = params.value("max_scan_bytes", static_cast<std::uint64_t>(67108864));
+    options.timeout_ms = params.value("timeout_ms", 3500u);
 
     json result;
     std::string error;
     if (!net_proto_analysis::find_sendrecv_handlers(options, result, error))
-        return tool_result_t::error(error.empty() ? OBFSTR("send/recv scan failed") : error);
+        return tool_result_t::error(error.empty() ? OBFSTR("send/recv scan failed") : error, result);
     return tool_result_t::ok(OBFSTR("Socket send/recv callsite scan completed."), result);
 }
 
@@ -170,7 +171,8 @@ void register_net_proto_tools(mcp_standalone::server_t& srv)
         {{OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Target process ID. Defaults to attached process."), false},
          {OBFSTR("max_results"), OBFSTR("number"), OBFSTR("Maximum findings, default 64, max 128."), false},
          {OBFSTR("max_modules"), OBFSTR("number"), OBFSTR("Maximum non-system modules to scan."), false},
-         {OBFSTR("max_scan_bytes"), OBFSTR("number"), OBFSTR("Global byte scan cap."), false}},
+         {OBFSTR("max_scan_bytes"), OBFSTR("number"), OBFSTR("Global byte scan cap."), false},
+         {OBFSTR("timeout_ms"), OBFSTR("number"), OBFSTR("Internal scan deadline in milliseconds, default 3500."), false}},
         handle_find_sendrecv, true});
 
     register_compat(srv, {

@@ -721,12 +721,17 @@ struct ui_state_guard_t {
         std::memcpy(include, workspace_search::g_search.include_buf, sizeof(include));
         std::memcpy(exclude, workspace_search::g_search.exclude_buf, sizeof(exclude));
         find_match_positions = globals::ui::find_match_positions;
-        std::lock_guard<std::mutex> lk(workspace_search::g_search.results_mtx);
-        results = workspace_search::g_search.results;
-        for (int i = 0; i < static_cast<int>(bottom_tab_t::COUNT); ++i) {
-            log_lines[static_cast<std::size_t>(i)] = output_log::lines[i];
-            log_auto_scroll[static_cast<std::size_t>(i)] = output_log::auto_scroll[i];
-            log_select_all[static_cast<std::size_t>(i)] = output_log::select_all[i];
+        {
+            std::lock_guard<std::mutex> lk(workspace_search::g_search.results_mtx);
+            results = workspace_search::g_search.results;
+        }
+        {
+            std::lock_guard<std::mutex> log_lk(output_log::mutex);
+            for (int i = 0; i < static_cast<int>(bottom_tab_t::COUNT); ++i) {
+                log_lines[static_cast<std::size_t>(i)] = output_log::lines[i];
+                log_auto_scroll[static_cast<std::size_t>(i)] = output_log::auto_scroll[i];
+                log_select_all[static_cast<std::size_t>(i)] = output_log::select_all[i];
+            }
         }
     }
 
@@ -781,10 +786,14 @@ struct ui_state_guard_t {
         file_tabs::active_tab = active_tab;
         hex_view::g_state = hex_state;
         code_editor_widget::cancel_agent_edit();
-        for (int i = 0; i < static_cast<int>(bottom_tab_t::COUNT); ++i) {
-            output_log::lines[i] = log_lines[static_cast<std::size_t>(i)];
-            output_log::auto_scroll[i] = log_auto_scroll[static_cast<std::size_t>(i)];
-            output_log::select_all[i] = log_select_all[static_cast<std::size_t>(i)];
+        {
+            std::lock_guard<std::mutex> log_lk(output_log::mutex);
+            for (int i = 0; i < static_cast<int>(bottom_tab_t::COUNT); ++i) {
+                output_log::lines[i] = log_lines[static_cast<std::size_t>(i)];
+                output_log::auto_scroll[i] = log_auto_scroll[static_cast<std::size_t>(i)];
+                output_log::select_all[i] = log_select_all[static_cast<std::size_t>(i)];
+                ++output_log::version[i];
+            }
         }
     }
 };
@@ -1797,15 +1806,20 @@ static void test_bottom_log_tabs(HANDLE hf, std::atomic<int>& passed, std::atomi
     output_log::push(bottom_tab_t::sandbox_log, "sandbox ui log");
     output_log::push(bottom_tab_t::terminal, "terminal must not enter output_log");
     globals::ui::active_bottom_tab = bottom_tab_t::driver_log;
-    output_log::select_all[static_cast<int>(bottom_tab_t::driver_log)] = true;
+    output_log::set_select_all(bottom_tab_t::driver_log, true);
     output_log::clear(bottom_tab_t::driver_log);
 
-    bool lines_ok = output_log::lines[static_cast<int>(bottom_tab_t::output)].size() == 1
-        && output_log::lines[static_cast<int>(bottom_tab_t::mcp_log)].size() == 1
-        && output_log::lines[static_cast<int>(bottom_tab_t::driver_log)].empty()
-        && output_log::lines[static_cast<int>(bottom_tab_t::sandbox_log)].size() == 1
-        && output_log::lines[static_cast<int>(bottom_tab_t::terminal)].empty();
-    bool clear_ok = !output_log::select_all[static_cast<int>(bottom_tab_t::driver_log)];
+    size_t output_count = output_log::size(bottom_tab_t::output);
+    size_t mcp_count = output_log::size(bottom_tab_t::mcp_log);
+    size_t driver_count = output_log::size(bottom_tab_t::driver_log);
+    size_t sandbox_count = output_log::size(bottom_tab_t::sandbox_log);
+    size_t terminal_count = output_log::size(bottom_tab_t::terminal);
+    bool lines_ok = output_count == 1
+        && mcp_count == 1
+        && driver_count == 0
+        && sandbox_count == 1
+        && terminal_count == 0;
+    bool clear_ok = !output_log::is_select_all(bottom_tab_t::driver_log);
     bool tab_ok = globals::ui::panel_bottom_visible && globals::ui::active_bottom_tab == bottom_tab_t::driver_log;
 
     if (lines_ok && clear_ok && tab_ok) {
@@ -1815,11 +1829,11 @@ static void test_bottom_log_tabs(HANDLE hf, std::atomic<int>& passed, std::atomi
             lines_ok ? 1 : 0,
             clear_ok ? 1 : 0,
             tab_ok ? 1 : 0,
-            output_log::lines[static_cast<int>(bottom_tab_t::output)].size(),
-            output_log::lines[static_cast<int>(bottom_tab_t::mcp_log)].size(),
-            output_log::lines[static_cast<int>(bottom_tab_t::driver_log)].size(),
-            output_log::lines[static_cast<int>(bottom_tab_t::sandbox_log)].size(),
-            output_log::lines[static_cast<int>(bottom_tab_t::terminal)].size());
+            output_count,
+            mcp_count,
+            driver_count,
+            sandbox_count,
+            terminal_count);
     }
 }
 

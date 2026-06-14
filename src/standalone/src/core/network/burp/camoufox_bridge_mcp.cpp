@@ -492,7 +492,16 @@ void enrich_evaluate_js_response(tool_result_t& out)
     out.data["mcp_arguments"] = json::array({"expression", "await_promise", "session_id", "page_id"});
 }
 
-json camoufox_args(const json& params)
+bool reverse_tool_needs_action(const std::string& tool_name)
+{
+    return tool_name == "network_capture" ||
+        tool_name == "cookies" ||
+        tool_name == "instrumentation" ||
+        tool_name == "intercept_request" ||
+        tool_name == "scripts";
+}
+
+json camoufox_args(const json& params, bool preserve_action)
 {
     json args = params.is_object() ? params : json::object();
     args.erase("binary_id");
@@ -503,7 +512,8 @@ json camoufox_args(const json& params)
     args.erase("browser_executable");
     args.erase("server_executable");
     args.erase("server_module");
-    args.erase("action");
+    if (!preserve_action)
+        args.erase("action");
     args.erase("operation");
     args.erase("payload");
     return args;
@@ -729,7 +739,7 @@ tool_result_t tool_close_browser(const json& params)
 
 tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json& params, int default_timeout_ms)
 {
-    json args = camoufox_args(params);
+    json args = camoufox_args(params, reverse_tool_needs_action(tool_name));
     int timeout_ms = camoufox_timeout_ms(params, default_timeout_ms);
     const std::string session_id = json_string_param(params, "session_id", "default");
     auto before = camoufox::get_status(session_id);
@@ -1024,13 +1034,13 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"geoip", "boolean", "Infer geolocation from proxy IP", false},
              {"block_images", "boolean", "Block image loading", false},
              {"block_webrtc", "boolean", "Force WebRTC blocking; AiDA enforces this on", false},
-             {"user_agent", "string", "Custom Firefox-family user agent", false},
+             {"user_agent", "string", "Custom Camoufox user agent", false},
              {"userAgent", "string", "Alias for user_agent", false},
-             {"ua_policy", "string", "camoufox_native, firefox_auto, firefox_windows, firefox_macos, firefox_linux, random_firefox_desktop, or custom with user_agent", false},
+             {"ua_policy", "string", "camoufox_native, camoufox_auto, camoufox_windows, camoufox_macos, camoufox_linux, random_camoufox_desktop, or custom with user_agent", false},
              {"user_agent_profile", "string", "Alias for ua_policy", false},
              {"user_agent_mode", "string", "Alias for ua_policy", false},
              {"persistent_context", "boolean", "Use a persistent Camoufox browser context", false},
-             {"profile_dir", "string", "Persistent Firefox profile directory", false},
+             {"profile_dir", "string", "Persistent Camoufox profile directory", false},
              {"user_data_dir", "string", "Alias for persistent profile directory", false},
              {"enable_trace", "boolean", "Enable engine-level property access tracing", false},
              {"python_executable", "string", "Optional Python path for developer sessions", false},
@@ -1180,7 +1190,7 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"context_lines", "number", "Lines of context around matches", false},
              {"max_results", "number", "Maximum matches", false}}, true, 30000},
         {"compare_env", "Collect browser environment fingerprint data for comparison.",
-            {{"properties", "array", "Specific properties to check", false}}, true, 30000},
+            {{"properties", "array", "Specific properties to check", false}}, true, 65000},
         {"check_environment", "Run reverse-MCP dependency, browser, privacy, and runtime state checks.",
             {{"session_id", "string", "Browser session id", false}}, true, 30000},
         {"verify_signer_offline", "Verify a candidate JavaScript signing function against captured samples offline.",

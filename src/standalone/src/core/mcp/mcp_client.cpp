@@ -16,6 +16,7 @@
 #include "anti-tamper/webhook.hpp"
 #include "../anti-tamper/mcp_posture.hpp"
 #include "../infra/work_queue.hpp"
+#include "../network/burp/camoufox_bridge.hpp"
 #include "../../helpers/diag_log.hpp"
 
 #include <httplib.h>
@@ -467,16 +468,19 @@ static bool ensure_winsock()
 
 static bool open_browser(const std::string& url)
 {
-    const int wlen = MultiByteToWideChar(CP_UTF8, 0, url.c_str(),
-        static_cast<int>(url.size()), nullptr, 0);
-    if (wlen <= 0)
+    if (url.empty())
         return false;
-    std::wstring wurl(static_cast<size_t>(wlen), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, url.c_str(), static_cast<int>(url.size()),
-        wurl.data(), wlen);
-    HINSTANCE rc = ShellExecuteW(nullptr, L"open", wurl.c_str(), nullptr,
-        nullptr, SW_SHOWNORMAL);
-    return reinterpret_cast<INT_PTR>(rc) > 32;
+    if (!aida::burp::camoufox::ensure_ready()) {
+        anti_tamper::webhook::write_log("mcp.oauth",
+            "[mcp.oauth] Camoufox ensure_ready failed; refusing default-browser fallback");
+        return false;
+    }
+    const bool opened = aida::burp::camoufox::navigate(url, "domcontentloaded", 45000);
+    anti_tamper::webhook::write_log("mcp.oauth",
+        opened
+            ? "[mcp.oauth] authorization_url opened in Camoufox"
+            : "[mcp.oauth] Camoufox navigate failed; refusing default-browser fallback");
+    return opened;
 }
 
 
@@ -3058,7 +3062,7 @@ bool start_auth(const std::string& server_name, oauth_state_t& out_state)
 
     if (!open_browser(out_state.authorization_url)) {
         anti_tamper::webhook::write_log("mcp.oauth",
-            "[mcp.oauth] ShellExecuteW open browser failed; user must open authorization_url manually");
+            "[mcp.oauth] Camoufox open failed; non-Camoufox browser fallback is disabled");
     }
 
     set_global_last_error({});

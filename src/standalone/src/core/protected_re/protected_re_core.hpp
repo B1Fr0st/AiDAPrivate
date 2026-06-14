@@ -2372,16 +2372,221 @@ inline std::optional<std::uint64_t> resolve_last_register_value(const std::map<s
     return it->second;
 }
 
-inline bool parse_driver_entry_assignments(std::uint32_t pid, const target_module_t& mod, const pe_layout_t& pe, json& assignments, json& diagnostics)
+struct drv_dispatch_scan_limits_t {
+    std::uint32_t timeout_ms = 5000;
+    std::uint32_t max_entry_bytes = 0x8000;
+    std::uint32_t max_entry_instructions = 4096;
+    std::size_t max_candidates = 64;
+    std::size_t max_breadcrumbs = 160;
+};
+
+struct drv_dispatch_scan_context_t {
+    drv_dispatch_scan_limits_t limits;
+    ULONGLONG started = GetTickCount64();
+    bool deadline_hit = false;
+    bool cancelled = false;
+    bool stop_logged = false;
+    std::string stage = "entry";
+    json breadcrumbs = json::array();
+
+    explicit drv_dispatch_scan_context_t(const drv_dispatch_scan_limits_t& in_limits)
+        : limits(in_limits)
+    {
+    }
+
+    ULONGLONG elapsed_ms() const
+    {
+        return GetTickCount64() - started;
+    }
+
+    bool should_stop(const char* next_stage)
+    {
+        if (next_stage)
+            stage = next_stage;
+        if (!cancelled && mcp_standalone::current_call_cancelled())
+            cancelled = true;
+        if (!deadline_hit && limits.timeout_ms != 0 && elapsed_ms() >= limits.timeout_ms)
+            deadline_hit = true;
+        if ((deadline_hit || cancelled) && !stop_logged) {
+            stop_logged = true;
+            diag::log_tagged_fmt("protected_re",
+                "drv_dispatch budget_exit stage=%s elapsed_ms=%llu timeout_ms=%u deadline_hit=%d cancelled=%d",
+                stage.c_str(),
+                static_cast<unsigned long long>(elapsed_ms()),
+                limits.timeout_ms,
+                deadline_hit ? 1 : 0,
+                cancelled ? 1 : 0);
+        }
+        return deadline_hit || cancelled;
+    }
+
+    void record(const char* event, json data)
+    {
+        data["event"] = event ? event : "";
+        data["stage"] = stage;
+        data["elapsed_ms"] = elapsed_ms();
+        data["deadline_hit"] = deadline_hit;
+        data["cancelled"] = cancelled;
+        if (breadcrumbs.size() < limits.max_breadcrumbs)
+            breadcrumbs.push_back(std::move(data));
+    }
+
+    json status() const
+    {
+        return json{{"timeout_ms", limits.timeout_ms},
+                    {"elapsed_ms", elapsed_ms()},
+                    {"deadline_hit", deadline_hit},
+                    {"cancelled", cancelled},
+                    {"stage", stage},
+                    {"max_entry_bytes", limits.max_entry_bytes},
+                    {"max_entry_instructions", limits.max_entry_instructions},
+                    {"max_candidates", limits.max_candidates}};
+    }
+};
+
+inline drv_dispatch_scan_limits_t drv_dispatch_limits_from_params(const json& params)
+{
+    drv_dispatch_scan_limits_t limits;
+    if (auto v = parse_param_u64(params, "timeout_ms"))
+        limits.timeout_ms = static_cast<std::uint32_t>(std::clamp<std::uint64_t>(*v, 250, 30000));
+    if (auto v = parse_param_u64(params, "max_entry_bytes"))
+        limits.max_entry_bytes = static_cast<std::uint32_t>(std::clamp<std::uint64_t>(*v, 0x1000, 0x10000));
+    else if (auto v = parse_param_u64(params, "entry_scan_bytes"))
+        limits.max_entry_bytes = static_cast<std::uint32_t>(std::clamp<std::uint64_t>(*v, 0x1000, 0x10000));
+    if (auto v = parse_param_u64(params, "max_entry_instructions"))
+        limits.max_entry_instructions = static_cast<std::uint32_t>(std::clamp<std::uint64_t>(*v, 64, 8192));
+    if (auto v = parse_param_u64(params, "max_candidates"))
+        limits.max_candidates = static_cast<std::size_t>(std::clamp<std::uint64_t>(*v, 1, 512));
+    return limits;
+}
+
+inline bool read_pe_layout_with_dispatch_diag(std::uint32_t pid,
+                                              const target_module_t& mod,
+                                              pe_layout_t& pe,
+                                              drv_dispatch_scan_context_t& ctx,
+                                              json& summary)
+{
+    summary["pe_read_start_elapsed_ms"] = ctx.elapsed_ms();
+    ctx.record("pe_read_start", json{{"module", mod.name}, {"base", sa_format_address(mod.base)}, {"size", mod.size}, {"path", mod.path}});
+    diag::log_tagged_fmt("protected_re",
+        "drv_dispatch pe_read_start module=%s base=0x%llX size=%llu path=%s elapsed_ms=%llu",
+        mod.name.c_str(),
+        static_cast<unsigned long long>(mod.base),
+        static_cast<unsigned long long>(mod.size),
+        mod.path.c_str(),
+        static_cast<unsigned long long>(ctx.elapsed_ms()));
+    if (ctx.should_stop("pe_read_before")) {
+        summary["pe_read_ok"] = false;
+        summary["rejection_reason"] = ctx.cancelled ? "cancelled_before_pe_read" : "deadline_before_pe_read";
+        return false;
+    }
+    const ULONGLONG t0 = GetTickCount64();
+    const bool ok = read_pe_layout(pid, mod.base, pe);
+    const ULONGLONG elapsed = GetTickCount64() - t0;
+    summary["pe_read_ok"] = ok;
+    summary["pe_read_elapsed_ms"] = elapsed;
+    if (ok) {
+        summary["entry_va"] = sa_format_address(pe.entry);
+        summary["size_of_image"] = pe.size_of_image;
+        summary["section_count"] = pe.sections.size();
+    }
+    diag::log_tagged_fmt("protected_re",
+        "drv_dispatch pe_read_end module=%s ok=%d pe_elapsed_ms=%llu entry=0x%llX sections=%zu total_elapsed_ms=%llu",
+        mod.name.c_str(),
+        ok ? 1 : 0,
+        static_cast<unsigned long long>(elapsed),
+        static_cast<unsigned long long>(ok ? pe.entry : 0),
+        ok ? pe.sections.size() : 0,
+        static_cast<unsigned long long>(ctx.elapsed_ms()));
+    ctx.record("pe_read_end", json{{"module", mod.name}, {"ok", ok}, {"pe_elapsed_ms", elapsed}, {"entry_va", ok ? json(sa_format_address(pe.entry)) : json(nullptr)}, {"section_count", ok ? pe.sections.size() : 0}});
+    ctx.should_stop("pe_read_after");
+    return ok;
+}
+
+inline std::vector<AsmInstr> disassemble_driver_entry_bounded(std::uint32_t pid,
+                                                              const target_module_t& mod,
+                                                              const pe_layout_t& pe,
+                                                              drv_dispatch_scan_context_t& ctx,
+                                                              json& diagnostics)
+{
+    std::vector<AsmInstr> out;
+    const std::uint32_t bytes_to_read = std::clamp<std::uint32_t>(ctx.limits.max_entry_bytes, 0x1000, 0x10000);
+    const std::uint32_t max_insns = std::clamp<std::uint32_t>(ctx.limits.max_entry_instructions, 64, 8192);
+    diagnostics["scan_window"] = json{{"base", sa_format_address(pe.entry)}, {"size", bytes_to_read}, {"end", sa_format_address(pe.entry + bytes_to_read)}};
+    diagnostics["disassembly"] = json{{"max_entry_bytes", bytes_to_read}, {"max_entry_instructions", max_insns}};
+    ctx.record("disassembly_start", json{{"module", mod.name}, {"entry", sa_format_address(pe.entry)}, {"bytes", bytes_to_read}, {"max_insns", max_insns}});
+    diag::log_tagged_fmt("protected_re",
+        "drv_dispatch disasm_start module=%s entry=0x%llX bytes=%u max_insns=%u elapsed_ms=%llu",
+        mod.name.c_str(),
+        static_cast<unsigned long long>(pe.entry),
+        bytes_to_read,
+        max_insns,
+        static_cast<unsigned long long>(ctx.elapsed_ms()));
+    if (ctx.should_stop("driver_entry_disasm_before_read"))
+        return out;
+    std::vector<std::uint8_t> raw;
+    const ULONGLONG read_t0 = GetTickCount64();
+    const bool read_ok = read_target_memory(pid, pe.entry, bytes_to_read, raw);
+    const ULONGLONG read_elapsed = GetTickCount64() - read_t0;
+    diagnostics["disassembly"]["read_ok"] = read_ok;
+    diagnostics["disassembly"]["read_elapsed_ms"] = read_elapsed;
+    diagnostics["disassembly"]["bytes_read"] = raw.size();
+    if (!read_ok || raw.empty()) {
+        diagnostics["disassembly"]["rejection_reason"] = read_ok ? "entry_read_empty" : "entry_read_failed";
+        ctx.record("disassembly_read_failed", json{{"module", mod.name}, {"read_ok", read_ok}, {"bytes_read", raw.size()}, {"read_elapsed_ms", read_elapsed}});
+        diag::log_tagged_fmt("protected_re",
+            "drv_dispatch disasm_read_failed module=%s read_ok=%d bytes_read=%zu read_elapsed_ms=%llu total_elapsed_ms=%llu",
+            mod.name.c_str(),
+            read_ok ? 1 : 0,
+            raw.size(),
+            static_cast<unsigned long long>(read_elapsed),
+            static_cast<unsigned long long>(ctx.elapsed_ms()));
+        ctx.should_stop("driver_entry_disasm_after_read_failed");
+        return out;
+    }
+    if (ctx.should_stop("driver_entry_disasm_after_read"))
+        return out;
+    std::size_t off = 0;
+    while (off < raw.size() && out.size() < max_insns) {
+        if ((out.size() & 0x7fu) == 0 && ctx.should_stop("driver_entry_disasm_loop"))
+            break;
+        const int avail = static_cast<int>(std::min<std::size_t>(15, raw.size() - off));
+        AsmInstr ins = zydis_decode_one(raw.data() + off, avail, pe.entry + off);
+        if (ins.len <= 0)
+            ins.len = 1;
+        out.push_back(ins);
+        off += static_cast<std::size_t>(ins.len);
+    }
+    diagnostics["disassembly"]["instructions_decoded"] = out.size();
+    diagnostics["disassembly"]["bytes_consumed"] = off;
+    diagnostics["disassembly"]["instruction_limit_hit"] = out.size() >= max_insns;
+    diagnostics["disassembly"]["deadline_hit"] = ctx.deadline_hit;
+    diagnostics["disassembly"]["cancelled"] = ctx.cancelled;
+    ctx.record("disassembly_end", json{{"module", mod.name}, {"instructions_decoded", out.size()}, {"bytes_consumed", off}, {"instruction_limit_hit", out.size() >= max_insns}});
+    diag::log_tagged_fmt("protected_re",
+        "drv_dispatch disasm_end module=%s decoded=%zu bytes_consumed=%zu limit_hit=%d deadline_hit=%d cancelled=%d elapsed_ms=%llu",
+        mod.name.c_str(),
+        out.size(),
+        off,
+        out.size() >= max_insns ? 1 : 0,
+        ctx.deadline_hit ? 1 : 0,
+        ctx.cancelled ? 1 : 0,
+        static_cast<unsigned long long>(ctx.elapsed_ms()));
+    return out;
+}
+
+inline bool parse_driver_entry_assignments(std::uint32_t pid, const target_module_t& mod, const pe_layout_t& pe, json& assignments, json& diagnostics, drv_dispatch_scan_context_t& ctx)
 {
     assignments = json::array();
     diagnostics = json::object();
-    diagnostics["scan_window"] = json{{"base", sa_format_address(pe.entry)}, {"size", 0x8000}, {"end", sa_format_address(pe.entry + 0x8000)}};
     diagnostics["candidates"] = json::array();
-    auto insns = disassemble_target(pid, pe.entry, 0x8000, 4096);
+    auto insns = disassemble_driver_entry_bounded(pid, mod, pe, ctx, diagnostics);
     diagnostics["instructions_decoded"] = insns.size();
     std::map<std::string, std::uint64_t> reg_values;
+    std::size_t candidate_index = 0;
     for (const auto& ins : insns) {
+        if ((candidate_index & 0x3fu) == 0 && ctx.should_stop("dispatch_assignment_loop"))
+            break;
         const std::string m = mnemonic_of(ins);
         auto ops = split_operands(ins.ops);
         if ((m == "lea" || m == "mov") && ops.size() >= 2 && !operand_is_memory(ops[0])) {
@@ -2404,6 +2609,11 @@ inline bool parse_driver_entry_assignments(std::uint32_t pid, const target_modul
         const std::int64_t disp = ins.mem_op.disp;
         if (disp < 0x70 || disp >= 0x70 + 28 * 8 || ((disp - 0x70) % 8) != 0)
             continue;
+        if (candidate_index >= ctx.limits.max_candidates) {
+            diagnostics["candidate_limit_hit"] = true;
+            ctx.stage = "dispatch_candidate_limit";
+            break;
+        }
         const std::uint32_t code = static_cast<std::uint32_t>((disp - 0x70) / 8);
         std::uint64_t handler = 0;
         if (ins.has_imm)
@@ -2425,39 +2635,225 @@ inline bool parse_driver_entry_assignments(std::uint32_t pid, const target_modul
         a["accepted"] = plausible;
         if (!plausible)
             a["rejection_reason"] = a["handler_plausibility"].value("reason", std::string("handler_rejected"));
+        a["candidate_index"] = candidate_index;
+        const std::string reason = plausible ? std::string("accepted") : a.value("rejection_reason", std::string("handler_rejected"));
+        ctx.record(plausible ? "assignment_accepted" : "assignment_rejected",
+            json{{"module", mod.name}, {"candidate_index", candidate_index}, {"assignment_va", sa_format_address(ins.addr)}, {"irp_code", code}, {"handler_va", handler ? json(sa_format_address(handler)) : json(nullptr)}, {"reason", reason}});
+        diag::log_tagged_fmt("protected_re",
+            "drv_dispatch assignment_%s module=%s candidate=%llu irp=%u assignment=0x%llX handler=0x%llX reason=%s elapsed_ms=%llu",
+            plausible ? "accepted" : "rejected",
+            mod.name.c_str(),
+            static_cast<unsigned long long>(candidate_index),
+            code,
+            static_cast<unsigned long long>(ins.addr),
+            static_cast<unsigned long long>(handler),
+            reason.c_str(),
+            static_cast<unsigned long long>(ctx.elapsed_ms()));
+        ++candidate_index;
         diagnostics["candidates"].push_back(a);
         if (plausible)
             assignments.push_back(std::move(a));
     }
     diagnostics["candidate_count"] = diagnostics["candidates"].size();
     diagnostics["accepted_assignment_count"] = assignments.size();
+    diagnostics["deadline_hit"] = ctx.deadline_hit;
+    diagnostics["cancelled"] = ctx.cancelled;
+    diagnostics["elapsed_ms"] = ctx.elapsed_ms();
+    diagnostics["budget"] = ctx.status();
     if (assignments.empty())
-        diagnostics["rejection_reason"] = diagnostics["candidate_count"].get<std::size_t>() == 0 ? "no_major_function_assignments_in_scan_window" : "all_major_function_candidates_rejected";
+        diagnostics["rejection_reason"] = ctx.cancelled ? "scan_cancelled" : (ctx.deadline_hit ? "scan_deadline_hit" : (diagnostics["candidate_count"].get<std::size_t>() == 0 ? "no_major_function_assignments_in_scan_window" : "all_major_function_candidates_rejected"));
     return !assignments.empty();
 }
 
 inline tool_result_t drv_find_dispatch_table(const json& params)
 {
     auto chk = require_driver();
-    if (!chk.success)
-        return chk;
+    const drv_dispatch_scan_limits_t limits = drv_dispatch_limits_from_params(params);
+    drv_dispatch_scan_context_t scan_ctx(limits);
+    if (!chk.success) {
+        json out;
+        out["dependency_unavailable"] = true;
+        out["root_cause"] = "driver_bridge_not_connected";
+        out["target_required"] = false;
+        out["using_kernel_driver"] = driver_bridge::using_kernel_driver();
+        out["attached_pid"] = driver_bridge::attached_pid();
+        out["attached_pids"] = driver_bridge::attached_pids();
+        out["auto_select_wdm_driver"] = params.value("auto_select_wdm_driver", false);
+        out["budget"] = scan_ctx.status();
+        out["breadcrumbs"] = scan_ctx.breadcrumbs;
+        diag::log_tagged_fmt("protected_re",
+            "drv_dispatch dependency_failed using_driver=%d attached_pid=%u target_required=0 error=%s",
+            driver_bridge::using_kernel_driver() ? 1 : 0,
+            driver_bridge::attached_pid(),
+            chk.text.c_str());
+        return tool_result_t::error(chk.text.empty() ? "Driver bridge is not connected" : chk.text, out);
+    }
     std::string err;
-    auto mod = select_module(params, true, &err);
-    if (!mod)
-        return tool_result_t::error(err.empty() ? "Kernel module could not be selected" : err);
+    std::optional<target_module_t> mod;
+    pe_layout_t preselected_pe;
+    json preselected_assignments;
+    json preselected_diagnostics;
+    bool have_preselected_analysis = false;
+    bool auto_selected = false;
+    std::size_t auto_modules_scanned = 0;
+    json auto_select_candidates = json::array();
+    std::size_t max_auto_modules = 64;
+    if (params.contains("max_auto_modules") && params["max_auto_modules"].is_number_unsigned())
+        max_auto_modules = (std::min<std::size_t>)(params["max_auto_modules"].get<std::size_t>(), 256);
+    else if (params.contains("max_auto_modules") && params["max_auto_modules"].is_number_integer())
+        max_auto_modules = (std::min<std::size_t>)(static_cast<std::size_t>((std::max<std::int64_t>)(params["max_auto_modules"].get<std::int64_t>(), 1)), 256);
+    const bool explicit_module =
+        params.contains("module_base") || params.contains("base") ||
+        params.contains("driver_name") || params.contains("module") ||
+        params.contains("module_name") || params.contains("name");
+    diag::log_tagged_fmt("protected_re",
+        "drv_dispatch entry auto_select=%d explicit_module=%d max_auto_modules=%llu timeout_ms=%u max_entry_bytes=%u max_entry_insns=%u max_candidates=%llu attached_pid=%u",
+        params.value("auto_select_wdm_driver", false) ? 1 : 0,
+        explicit_module ? 1 : 0,
+        static_cast<unsigned long long>(max_auto_modules),
+        limits.timeout_ms,
+        limits.max_entry_bytes,
+        limits.max_entry_instructions,
+        static_cast<unsigned long long>(limits.max_candidates),
+        driver_bridge::attached_pid());
+    if (params.value("auto_select_wdm_driver", false) && !explicit_module) {
+        std::string qerr;
+        scan_ctx.stage = "kernel_module_enumeration";
+        auto mods = kernel_modules(&qerr);
+        scan_ctx.record("kernel_modules_enumerated", json{{"module_count", mods.size()}, {"error", qerr}});
+        diag::log_tagged_fmt("protected_re",
+            "drv_dispatch kernel_modules count=%zu error=%s elapsed_ms=%llu",
+            mods.size(),
+            qerr.c_str(),
+            static_cast<unsigned long long>(scan_ctx.elapsed_ms()));
+        std::size_t candidate_index = 0;
+        for (const auto& candidate : mods) {
+            if (scan_ctx.should_stop("auto_select_candidate_loop"))
+                break;
+            if (auto_modules_scanned >= max_auto_modules)
+                break;
+            if (module_is_ntoskrnl(candidate))
+                continue;
+            ++auto_modules_scanned;
+            pe_layout_t candidate_pe;
+            json candidate_summary = json{{"candidate_index", candidate_index}, {"name", candidate.name}, {"base", sa_format_address(candidate.base)}, {"size", candidate.size}, {"path", candidate.path}};
+            scan_ctx.record("candidate_begin", candidate_summary);
+            diag::log_tagged_fmt("protected_re",
+                "drv_dispatch candidate_begin index=%llu name=%s base=0x%llX size=%llu path=%s elapsed_ms=%llu",
+                static_cast<unsigned long long>(candidate_index),
+                candidate.name.c_str(),
+                static_cast<unsigned long long>(candidate.base),
+                static_cast<unsigned long long>(candidate.size),
+                candidate.path.c_str(),
+                static_cast<unsigned long long>(scan_ctx.elapsed_ms()));
+            ++candidate_index;
+            if (!read_pe_layout_with_dispatch_diag(0, candidate, candidate_pe, scan_ctx, candidate_summary)) {
+                if (!candidate_summary.contains("rejection_reason"))
+                    candidate_summary["rejection_reason"] = "pe_header_parse_failed";
+                if (auto_select_candidates.size() < 16)
+                    auto_select_candidates.push_back(std::move(candidate_summary));
+                if (scan_ctx.should_stop("auto_select_after_pe_read"))
+                    break;
+                continue;
+            }
+            json candidate_assignments;
+            json candidate_diagnostics;
+            parse_driver_entry_assignments(0, candidate, candidate_pe, candidate_assignments, candidate_diagnostics, scan_ctx);
+            candidate_summary["candidate_count"] = candidate_diagnostics.value("candidate_count", 0);
+            candidate_summary["accepted_assignment_count"] = candidate_diagnostics.value("accepted_assignment_count", 0);
+            candidate_summary["deadline_hit"] = scan_ctx.deadline_hit;
+            candidate_summary["cancelled"] = scan_ctx.cancelled;
+            candidate_summary["elapsed_ms"] = scan_ctx.elapsed_ms();
+            if (candidate_assignments.empty()) {
+                candidate_summary["rejection_reason"] = candidate_diagnostics.value("rejection_reason", std::string("no_accepted_dispatch_handlers"));
+                if (auto_select_candidates.size() < 16)
+                    auto_select_candidates.push_back(std::move(candidate_summary));
+                if (scan_ctx.should_stop("auto_select_after_candidate_analysis"))
+                    break;
+                continue;
+            }
+            mod = candidate;
+            preselected_pe = std::move(candidate_pe);
+            preselected_assignments = std::move(candidate_assignments);
+            preselected_diagnostics = std::move(candidate_diagnostics);
+            have_preselected_analysis = true;
+            auto_selected = true;
+            if (auto_select_candidates.size() < 16)
+                auto_select_candidates.push_back(std::move(candidate_summary));
+            break;
+        }
+        if (!mod) {
+            json out;
+            out["auto_select_wdm_driver"] = true;
+            out["auto_modules_scanned"] = auto_modules_scanned;
+            out["max_auto_modules"] = max_auto_modules;
+            out["candidates"] = auto_select_candidates;
+            out["budget"] = scan_ctx.status();
+            out["breadcrumbs"] = scan_ctx.breadcrumbs;
+            out["deadline_hit"] = scan_ctx.deadline_hit;
+            out["cancelled"] = scan_ctx.cancelled;
+            out["target_required"] = false;
+            out["dependency_state"] = json{{"using_kernel_driver", driver_bridge::using_kernel_driver()}, {"attached_pid", driver_bridge::attached_pid()}, {"attached_pids", driver_bridge::attached_pids()}};
+            out["rejection_reason"] = scan_ctx.cancelled ? "scan_cancelled" : (scan_ctx.deadline_hit ? "scan_deadline_hit" : (mods.empty() ? (qerr.empty() ? "no_kernel_modules_available" : qerr) : "no_loaded_wdm_driver_with_accepted_major_function_assignments"));
+            diag::log_tagged_fmt("protected_re",
+                "drv_dispatch auto_select_failed scanned=%llu max=%llu deadline_hit=%d cancelled=%d reason=%s elapsed_ms=%llu",
+                static_cast<unsigned long long>(auto_modules_scanned),
+                static_cast<unsigned long long>(max_auto_modules),
+                scan_ctx.deadline_hit ? 1 : 0,
+                scan_ctx.cancelled ? 1 : 0,
+                out["rejection_reason"].get<std::string>().c_str(),
+                static_cast<unsigned long long>(scan_ctx.elapsed_ms()));
+            return tool_result_t::error("No loaded WDM driver with accepted MajorFunction assignments was found in the bounded kernel-module scan.", out);
+        }
+    } else {
+        mod = select_module(params, true, &err);
+    }
+    if (!mod) {
+        json out;
+        out["dependency_unavailable"] = false;
+        out["target_required"] = false;
+        out["root_cause"] = "kernel_module_selection_failed";
+        out["error"] = err.empty() ? "Kernel module could not be selected" : err;
+        out["budget"] = scan_ctx.status();
+        out["breadcrumbs"] = scan_ctx.breadcrumbs;
+        out["dependency_state"] = json{{"using_kernel_driver", driver_bridge::using_kernel_driver()}, {"attached_pid", driver_bridge::attached_pid()}, {"attached_pids", driver_bridge::attached_pids()}};
+        return tool_result_t::error(err.empty() ? "Kernel module could not be selected" : err, out);
+    }
     json base_out;
     base_out["driver_name"] = mod->name;
     base_out["selected_module"] = target_module_json(*mod);
     base_out["module_base"] = sa_format_address(mod->base);
     base_out["module_size"] = mod->size;
     base_out["module_path"] = mod->path;
-    pe_layout_t pe;
-    if (!read_pe_layout(0, mod->base, pe)) {
+    base_out["auto_selected_wdm_driver"] = auto_selected;
+    base_out["auto_modules_scanned"] = auto_modules_scanned;
+    base_out["target_required"] = false;
+    base_out["dependency_state"] = json{{"using_kernel_driver", driver_bridge::using_kernel_driver()}, {"attached_pid", driver_bridge::attached_pid()}, {"attached_pids", driver_bridge::attached_pids()}};
+    base_out["budget"] = scan_ctx.status();
+    if (!auto_select_candidates.empty())
+        base_out["auto_select_candidates"] = auto_select_candidates;
+    pe_layout_t pe = have_preselected_analysis ? preselected_pe : pe_layout_t{};
+    json selected_pe_summary = json{{"name", mod->name}, {"base", sa_format_address(mod->base)}, {"size", mod->size}, {"path", mod->path}};
+    if (!have_preselected_analysis && !read_pe_layout_with_dispatch_diag(0, *mod, pe, scan_ctx, selected_pe_summary)) {
         base_out["pe_parse_ok"] = false;
-        base_out["rejection_reason"] = "pe_header_parse_failed";
+        base_out["rejection_reason"] = scan_ctx.cancelled ? "scan_cancelled" : (scan_ctx.deadline_hit ? "scan_deadline_hit" : "pe_header_parse_failed");
+        base_out["pe_read"] = selected_pe_summary;
+        base_out["budget"] = scan_ctx.status();
+        base_out["breadcrumbs"] = scan_ctx.breadcrumbs;
+        base_out["deadline_hit"] = scan_ctx.deadline_hit;
+        base_out["cancelled"] = scan_ctx.cancelled;
+        diag::log_tagged_fmt("protected_re",
+            "drv_dispatch selected_pe_failed module=%s reason=%s deadline_hit=%d cancelled=%d elapsed_ms=%llu",
+            mod->name.c_str(),
+            base_out["rejection_reason"].get<std::string>().c_str(),
+            scan_ctx.deadline_hit ? 1 : 0,
+            scan_ctx.cancelled ? 1 : 0,
+            static_cast<unsigned long long>(scan_ctx.elapsed_ms()));
         return tool_result_t::error("Could not parse PE headers for " + mod->name + " at " + sa_format_address(mod->base), base_out);
     }
     base_out["pe_parse_ok"] = true;
+    if (!have_preselected_analysis)
+        base_out["pe_read"] = selected_pe_summary;
     base_out["pe"] = json{{"entry_rva", pe.entry >= pe.base ? sa_format_address(pe.entry - pe.base) : "unknown"},
                           {"entry_va", sa_format_address(pe.entry)},
                           {"size_of_image", pe.size_of_image},
@@ -2475,9 +2871,10 @@ inline tool_result_t drv_find_dispatch_table(const json& params)
         base_out["note"] = "ntoskrnl is the Windows kernel image and is not a WDM driver dispatch fixture target for this read-only scan.";
         return tool_result_t::error("Selected module is ntoskrnl, not a WDM driver module dispatch fixture.", base_out);
     }
-    json assignments;
-    json diagnostics;
-    parse_driver_entry_assignments(0, *mod, pe, assignments, diagnostics);
+    json assignments = have_preselected_analysis ? std::move(preselected_assignments) : json::array();
+    json diagnostics = have_preselected_analysis ? std::move(preselected_diagnostics) : json::object();
+    if (!have_preselected_analysis)
+        parse_driver_entry_assignments(0, *mod, pe, assignments, diagnostics, scan_ctx);
     json out = base_out;
     out["driver_entry_va"] = sa_format_address(pe.entry);
     out["driver_entry_rva"] = pe.entry >= pe.base ? json(sa_format_address(pe.entry - pe.base)) : json(nullptr);
@@ -2487,11 +2884,25 @@ inline tool_result_t drv_find_dispatch_table(const json& params)
     out["accepted_assignment_count"] = diagnostics.value("accepted_assignment_count", 0);
     out["scan_window"] = diagnostics["scan_window"];
     out["diagnostics"] = diagnostics;
+    out["budget"] = scan_ctx.status();
+    out["breadcrumbs"] = scan_ctx.breadcrumbs;
+    out["deadline_hit"] = scan_ctx.deadline_hit;
+    out["cancelled"] = scan_ctx.cancelled;
     out["handler_plausibility_policy"] = "handler must resolve inside an executable section of the selected driver image";
     out["confidence"] = assignments.empty() ? 0.25 : std::min(0.95, 0.45 + assignments.size() * 0.04);
-    out["note"] = assignments.empty() ? "No accepted MajorFunction assignments were found in the bounded DriverEntry scan; inspect diagnostics.candidates for rejected evidence." : "dispatch_table_va is expressed relative to the runtime DRIVER_OBJECT because the object pointer is not exposed by this read-only analysis path.";
+    out["note"] = assignments.empty() ? "No accepted MajorFunction assignments were found in the bounded DriverEntry scan; inspect diagnostics.candidates and breadcrumbs for rejected or bounded evidence." : "dispatch_table_va is expressed relative to the runtime DRIVER_OBJECT because the object pointer is not exposed by this read-only analysis path.";
     if (assignments.empty())
         out["rejection_reason"] = diagnostics.value("rejection_reason", std::string("no_accepted_dispatch_handlers"));
+    diag::log_tagged_fmt("protected_re",
+        "drv_dispatch exit module=%s accepted=%u candidates=%u auto_selected=%d deadline_hit=%d cancelled=%d elapsed_ms=%llu reason=%s",
+        mod->name.c_str(),
+        out.value("accepted_assignment_count", 0u),
+        out.value("candidate_count", 0u),
+        auto_selected ? 1 : 0,
+        scan_ctx.deadline_hit ? 1 : 0,
+        scan_ctx.cancelled ? 1 : 0,
+        static_cast<unsigned long long>(scan_ctx.elapsed_ms()),
+        assignments.empty() ? out.value("rejection_reason", std::string("none")).c_str() : "accepted");
     return tool_result_t::ok("Driver dispatch assignment scan completed", out);
 }
 

@@ -867,14 +867,12 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_boringssl(std::uint32_t pid
     std::vector<tls_session_key_t> keys;
     if (!device || !device->is_connected()) return keys;
 
-    std::uint64_t chrome_base = 0;
-    std::uint32_t chrome_size = 0;
-    bool has_chrome = find_module_in_process(pid, "chrome.dll", chrome_base, chrome_size) ||
-                      find_module_in_process(pid, "msedge.dll", chrome_base, chrome_size) ||
-                      find_module_in_process(pid, "electron.exe", chrome_base, chrome_size) ||
-                      find_module_in_process(pid, "libcef.dll", chrome_base, chrome_size);
+    std::uint64_t boringssl_base = 0;
+    std::uint32_t boringssl_size = 0;
+    bool has_boringssl = find_module_in_process(pid, "electron.exe", boringssl_base, boringssl_size) ||
+                         find_module_in_process(pid, "libcef.dll", boringssl_base, boringssl_size);
 
-    if (!has_chrome) return keys;
+    if (!has_boringssl) return keys;
 
 
     std::vector<std::string> keylog_paths;
@@ -2450,7 +2448,6 @@ std::string pin_method_name(pin_bypass_method method) {
     case pin_bypass_method::windows_trust: return "windows_trust";
     case pin_bypass_method::windows_chain_policy: return "windows_chain_policy";
     case pin_bypass_method::windows_tls: return "windows_tls";
-    case pin_bypass_method::chromium_browser: return "chromium_browser";
     case pin_bypass_method::managed_dotnet: return "managed_dotnet";
     default: return "all";
     }
@@ -2462,7 +2459,6 @@ std::vector<std::string> requested_pin_methods(pin_bypass_method method) {
         pin_method_name(pin_bypass_method::windows_trust),
         pin_method_name(pin_bypass_method::windows_chain_policy),
         pin_method_name(pin_bypass_method::windows_tls),
-        pin_method_name(pin_bypass_method::chromium_browser),
         pin_method_name(pin_bypass_method::managed_dotnet)
     };
 }
@@ -2487,9 +2483,9 @@ pin_bypass_result_t CertPinBypasser::bypass_pins(const pin_bypass_config_t& conf
         "managed_runtime_flag_rewrites"
     };
     result.diagnostic_summary = pid == 0
-        ? "No target process was selected; normal certificate interception uses proxy, trust, profile, and provider diagnostics"
+        ? "No target process was selected; normal certificate interception uses proxy, trust, Camoufox, and provider diagnostics"
         : "Legacy in-process certificate validation modification is disabled for normal builds";
-    result.recommended_action = "Use cert_intercept diagnostics, controlled browser profiles, Firefox profile preparation, or script handoff for explicit authorized analysis";
+    result.recommended_action = "Use cert_intercept diagnostics, controlled Camoufox launch, or script handoff for explicit authorized analysis";
     return result;
 }
 

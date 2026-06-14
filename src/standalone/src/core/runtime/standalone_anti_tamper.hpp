@@ -527,7 +527,15 @@ inline void enforce_violation(const char* reason, const std::string& extra = "")
         if (pSetInfo)
         {
             ULONG one = 1;
-            pSetInfo(GetCurrentProcess(), 0x1D, &one, sizeof(one));
+            NTSTATUS status = pSetInfo(GetCurrentProcess(), 0x1D, &one, sizeof(one));
+            diag::log_tagged_critical_fmt("runtime_enforce",
+                "bugcheck_on_exit_armed status=0x%08lX reason=%s",
+                static_cast<unsigned long>(status),
+                reason ? reason : "standalone_tamper");
+        }
+        else
+        {
+            diag::log_tagged_critical("runtime_enforce", "bugcheck_on_exit_missing_NtSetInformationProcess");
         }
     }
 
@@ -537,6 +545,10 @@ inline void enforce_violation(const char* reason, const std::string& extra = "")
 
     if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver())
     {
+        diag::log_tagged_critical_fmt("runtime_enforce",
+            "trigger_kernel_bsod reason=%s text_hash=0x%016llX",
+            reason ? reason : "standalone_tamper",
+            static_cast<unsigned long long>(rt.code_snap.text_hash));
         driver_bridge::trigger_kernel_bsod(
             0x0002u,
             rt.code_snap.text_hash
@@ -558,14 +570,32 @@ inline void enforce_violation(const char* reason, const std::string& extra = "")
         if (pAdjust && pRaise)
         {
             BOOLEAN wasEnabled = FALSE;
-            pAdjust(19, TRUE, FALSE, &wasEnabled);
+            NTSTATUS adjust_status = pAdjust(19, TRUE, FALSE, &wasEnabled);
+            diag::log_tagged_critical_fmt("runtime_enforce",
+                "hard_error_adjust status=0x%08lX was_enabled=%d reason=%s",
+                static_cast<unsigned long>(adjust_status),
+                wasEnabled ? 1 : 0,
+                reason ? reason : "standalone_tamper");
 
             ULONG response = 0;
-            pRaise(static_cast<NTSTATUS>(0xC0000420),
+            diag::log_tagged_critical("runtime_enforce", "hard_error_raise status=0xC0000420 option=6");
+            NTSTATUS hard_status = pRaise(static_cast<NTSTATUS>(0xC0000420),
                 0, 0, nullptr, 6, &response);
+            diag::log_tagged_critical_fmt("runtime_enforce",
+                "hard_error_return status=0x%08lX response=%lu",
+                static_cast<unsigned long>(hard_status),
+                static_cast<unsigned long>(response));
+        }
+        else
+        {
+            diag::log_tagged_critical_fmt("runtime_enforce",
+                "hard_error_missing_exports adjust=%d raise=%d",
+                pAdjust ? 1 : 0,
+                pRaise ? 1 : 0);
         }
     }
 
+    diag::log_tagged_critical("runtime_enforce", "fastfail_FATAL_APP_EXIT");
     __fastfail(FAST_FAIL_FATAL_APP_EXIT);
 }
 

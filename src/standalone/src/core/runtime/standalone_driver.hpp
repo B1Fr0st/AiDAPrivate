@@ -337,6 +337,9 @@ namespace driver_bridge
     std::vector<thread_info_t>   enumerate_threads_for(uint32_t pid);
     std::vector<memory_region_t> enumerate_memory_regions_for(uint32_t pid, size_t max_regions = 512);
     bool read_peb_for(uint32_t pid, peb_info_t& out);
+    uint64_t resolve_export_for(uint32_t pid, uint64_t module_base, const char* export_name);
+    uint64_t allocate_memory_for(uint32_t pid, size_t size);
+    bool free_memory_for(uint32_t pid, uint64_t address);
 
     bool read_kernel_memory(uint64_t address, size_t size, std::vector<uint8_t>& out);
     bool write_kernel_memory(uint64_t address, const std::vector<uint8_t>& data);

@@ -94,7 +94,7 @@ module_summary_t summarize_module(const driver_bridge::module_info_t& module) {
     const std::string joined = name + " " + path;
 
     out.browser_runtime = contains_any(joined, {
-        "chrome.exe", "msedge.exe", "firefox.exe", "chromium", "webview2", "electron"
+        "camoufox.exe", "camoufox"
     });
     out.system_tls = contains_any(joined, {
         "crypt32.dll", "schannel.dll", "secur32.dll", "winhttp.dll", "wininet.dll"
@@ -106,7 +106,7 @@ module_summary_t summarize_module(const driver_bridge::module_info_t& module) {
         "clr.dll", "coreclr.dll", "system.net.security", "system.private.corelib", "mscorlib"
     });
     out.quic_capable = contains_any(joined, {
-        "msquic", "quic", "chrome.exe", "msedge.exe", "firefox.exe"
+        "msquic", "quic"
     });
     out.proxy_aware = contains_any(joined, {
         "winhttp.dll", "wininet.dll", "urlmon.dll", "libcurl", "curl"
@@ -114,7 +114,7 @@ module_summary_t summarize_module(const driver_bridge::module_info_t& module) {
     out.stable_export_candidate = contains_any(joined, {
         "libssl", "libcrypto", "openssl"
     }) && !contains_any(joined, {
-        "boringssl", "chrome.dll", "msedge.dll"
+        "boringssl"
     });
 
     if (out.browser_runtime) out.evidence.push_back("browser_runtime");

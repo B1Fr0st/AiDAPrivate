@@ -387,20 +387,65 @@ static tool_result_t analysis_query_binary_map_fast_summary(const json& params)
 	phase_start = GetTickCount64();
 	json functions = json::array();
 	std::vector<uint64_t> emitted;
-	auto emit_function = [&](uint64_t va, const std::string& name, const char* source) {
-		if (va == 0 || functions.size() >= max_functions)
-			return;
-		if (std::find(emitted.begin(), emitted.end(), va) != emitted.end())
-			return;
+	auto emitted_index = [&](uint64_t va) -> size_t {
+		for (size_t i = 0; i < emitted.size(); ++i) {
+			if (emitted[i] == va)
+				return i;
+		}
+		return static_cast<size_t>(-1);
+	};
+	auto emit_function = [&](uint64_t va, const std::string& name, const char* source, uint32_t rva = 0, bool prefer_existing_name = false) -> bool {
+		if (va == 0)
+			return false;
+		const size_t existing_index = emitted_index(va);
+		if (existing_index != static_cast<size_t>(-1)) {
+			if (prefer_existing_name && !name.empty()) {
+				functions[existing_index]["name"] = name;
+				functions[existing_index]["source"] = source;
+				if (rva != 0) {
+					char rva_buf[32];
+					std::snprintf(rva_buf, sizeof(rva_buf), "0x%X", rva);
+					functions[existing_index]["rva"] = rva_buf;
+				}
+				return true;
+			}
+			return false;
+		}
+		if (functions.size() >= max_functions)
+			return false;
 		emitted.push_back(va);
 		json o;
 		std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(va));
 		o["va"] = buf;
+		if (rva != 0) {
+			char rva_buf[32];
+			std::snprintf(rva_buf, sizeof(rva_buf), "0x%X", rva);
+			o["rva"] = rva_buf;
+		}
 		o["name"] = name;
 		o["xref_count"] = 0;
 		o["callee_count"] = 0;
 		o["source"] = source;
 		functions.push_back(std::move(o));
+		return true;
+	};
+	auto export_address_executable = [&](uint64_t va) -> bool {
+		for (const auto& s : pe.sections) {
+			if (!fast_section_executable(s.characteristics))
+				continue;
+			const uint64_t start = selected->base + s.virtual_address;
+			if (start < selected->base)
+				continue;
+			const uint64_t section_size = s.virtual_size != 0 ? s.virtual_size : s.raw_size;
+			if (section_size == 0)
+				continue;
+			uint64_t end = start + section_size;
+			if (end < start)
+				end = UINT64_MAX;
+			if (va >= start && va < end)
+				return true;
+		}
+		return false;
 	};
 	if (pe.entry_point != 0)
 		emit_function(pe.entry_point, "entry_point", "pe_entry_point");
@@ -426,11 +471,33 @@ static tool_result_t analysis_query_binary_map_fast_summary(const json& params)
 		phase_start = GetTickCount64();
 		std::vector<pe_parser::export_entry_t> parsed_exports;
 		const bool parsed = pe_parser::parse_exports(selected->base, pe, parsed_exports, max_exports, &deadline, &exports_truncated);
-		exports_parse_complete = parsed && !exports_truncated;
 		exports = fast_export_names_json(parsed_exports);
+		size_t export_functions_promoted = 0;
+		size_t export_functions_non_executable = 0;
+		bool export_function_promotion_timed_out = false;
+		for (const auto& exp : parsed_exports) {
+			if (std::chrono::steady_clock::now() >= deadline) {
+				export_function_promotion_timed_out = true;
+				exports_truncated = true;
+				break;
+			}
+			if (exp.is_forwarded || exp.address == 0 || exp.name.empty())
+				continue;
+			if (!export_address_executable(exp.address)) {
+				++export_functions_non_executable;
+				continue;
+			}
+			if (emit_function(exp.address, exp.name, "pe_export", exp.rva, true))
+				++export_functions_promoted;
+		}
+		exports_parse_complete = parsed && !exports_truncated;
 		phase_details["exports_requested"] = true;
 		phase_details["exports_truncated"] = exports_truncated;
 		phase_details["exports_returned"] = exports.size();
+		phase_details["export_functions_promoted"] = export_functions_promoted;
+		phase_details["export_functions_non_executable"] = export_functions_non_executable;
+		phase_details["export_function_promotion_timed_out"] = export_function_promotion_timed_out;
+		phase_details["functions_after_export_promotion"] = functions.size();
 		mark_phase("exports", phase_start);
 		if (mcp_standalone::current_call_cancelled())
 			return cancelled_result("exports");

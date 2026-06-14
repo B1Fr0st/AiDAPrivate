@@ -738,8 +738,11 @@ def _profile_snapshot(profile_dir: str | None) -> dict[str, Any]:
         window_size, window_diag = _resolve_window_size(cfg)
         if not headless:
             kwargs["window"] = window_size
-        launch_timeout_floor_ms = 32000 if bundled_visible_launch else 5000
-        launch_timeout_ms = min(max(_int_config(cfg.get("launch_timeout_ms"), 30000), launch_timeout_floor_ms), 120000)]=]
+        fast_probe = bool(cfg.get("aida_testlab_fast_probe") or cfg.get("testlab_fast_probe")) or str(_os.environ.get("AIDA_CAMOUFOX_TESTLAB_FAST_PROBE", "")).lower() in {"1", "true", "yes", "on"}
+        launch_timeout_floor_ms = 5000
+        launch_timeout_ceiling_ms = 15000 if bundled_visible_launch else (70000 if fast_probe else 120000)
+        launch_timeout_default_ms = 15000 if bundled_visible_launch else (70000 if fast_probe else 30000)
+        launch_timeout_ms = min(max(_int_config(cfg.get("launch_timeout_ms"), launch_timeout_default_ms), launch_timeout_floor_ms), launch_timeout_ceiling_ms)]=]
             AIDA_CAMOUFOX_CONTENT "${AIDA_CAMOUFOX_CONTENT}")
     endif()
 

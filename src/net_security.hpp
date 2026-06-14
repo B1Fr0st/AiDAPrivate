@@ -61,7 +61,6 @@ enum class pin_bypass_method {
     windows_trust,
     windows_chain_policy,
     windows_tls,
-    chromium_browser,
     managed_dotnet,
     all
 };

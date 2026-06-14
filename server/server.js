@@ -75,6 +75,7 @@ const stolenBytesRoutes = require('./routes/stolen_bytes');
 const attestationRoutes = require('./routes/attestation');
 const serverInfoRoutes = require('./routes/server_info');
 const bootstrapRoutes = require('./routes/bootstrap');
+const customerDownloadRoutes = require('./routes/customer_download');
 const tlsExporter = require('./crypto/tls_exporter');
 const killSwitch = require('./middleware/kill_switch');
 
@@ -168,6 +169,7 @@ app.use('/api/license', killSwitch.middleware);
 app.use('/api/download', killSwitch.middleware);
 app.use('/api/arc', killSwitch.middleware);
 app.use('/api/bootstrap', killSwitch.middleware);
+app.use('/api/customer-download', killSwitch.middleware);
 app.use('/validateLicense', killSwitch.middleware);
 
 app.use('/api/', tlsExporter.middleware);
@@ -254,6 +256,7 @@ app.use('/api/stolen_bytes', stolenBytesRoutes);
 app.use('/api/attestation', attestationRoutes);
 app.use('/api/server_info', serverInfoRoutes);
 app.use('/api/bootstrap', bootstrapApiLimiter, bootstrapRoutes.router);
+app.use('/api/customer-download', customerDownloadRoutes.router);
 const bootstrapScriptRoutes = bootstrapRoutes.getScriptRouteConfig();
 if (bootstrapScriptRoutes.root_content_negotiation) {
     app.get('/', bootstrapScriptLimiter, bootstrapRoutes.rootScriptHandler);
@@ -265,6 +268,7 @@ if (bootstrapScriptRoutes.legacy_route_enabled) {
     app.get(bootstrapScriptRoutes.legacy_path, bootstrapScriptLimiter, bootstrapRoutes.scriptHandler);
 }
 app.get('/bootstrap-artifacts/:name', bootstrapArtifactLimiter, bootstrapRoutes.artifactHandler);
+app.get('/d/a/:token', customerDownloadRoutes.landingHandler);
 
 
 app.use('/api/download', downloadRoutes);

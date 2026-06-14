@@ -196,9 +196,11 @@ uint64_t next_request_id()
 constexpr int kToolListWaitMaxMs = 5000;
 constexpr int kLaunchWaitMinMs = 5000;
 constexpr int kLaunchWaitMaxMs = 120000;
-constexpr int kBundledVisibleLaunchWaitMinMs = 70000;
-constexpr int kTestLabLaunchWaitDefaultMs = 120000;
-constexpr int kTestLabLaunchWaitMaxMs = 120000;
+constexpr int kBundledVisibleLaunchWaitMinMs = 45000;
+constexpr int kBundledVisibleLaunchWaitMaxMs = 45000;
+constexpr int kTestLabLaunchWaitDefaultMs = 45000;
+constexpr int kTestLabLaunchWaitMaxMs = 45000;
+constexpr DWORD kDependencyProbeTimeoutMs = 9000;
 constexpr int kReadinessProbeTimeoutMs = 10000;
 constexpr int kNavigationWaitMaxMs = 50000;
 constexpr uint64_t kPythonDiscoveryBudgetMs = 15000;
@@ -336,6 +338,13 @@ std::string trim_launch_token(std::string value)
     return value.substr(begin, end - begin);
 }
 
+bool explicit_persistent_context_requested(const launch_config_t& cfg)
+{
+    return cfg.persistent_context ||
+        !trim_launch_token(cfg.profile_dir).empty() ||
+        !trim_launch_token(cfg.user_data_dir).empty();
+}
+
 std::string lower_launch_token(std::string value)
 {
     value = trim_launch_token(std::move(value));
@@ -385,6 +394,12 @@ void preserve_resolved_launch_paths(launch_config_t& target, const launch_config
         target.server_executable = active.server_executable;
 }
 
+void normalize_fast_visible_launch_policy(launch_config_t& cfg)
+{
+    if (cfg.ua_policy.empty() || cfg.ua_policy == "camoufox_native")
+        cfg.ua_policy = "camoufox_macos";
+}
+
 std::string privacy_relevant_launch_config_mismatch_reason(const launch_config_t& active, const launch_config_t& requested)
 {
     if (normalize_default_launch_token(active.session_id, "default") != normalize_default_launch_token(requested.session_id, "default"))
@@ -415,7 +430,7 @@ std::string privacy_relevant_launch_config_mismatch_reason(const launch_config_t
         return "ua_policy";
     const bool requested_profile_dir = !trim_launch_token(requested.profile_dir).empty();
     const bool requested_user_data_dir = !trim_launch_token(requested.user_data_dir).empty();
-    const bool requested_persistent = requested.persistent_context || requested_profile_dir || requested_user_data_dir;
+    const bool requested_persistent = explicit_persistent_context_requested(requested);
     if (requested_persistent && active.persistent_context != requested_persistent)
         return "persistent_context";
     if (requested_profile_dir && trim_launch_token(active.profile_dir) != trim_launch_token(requested.profile_dir))
@@ -1897,7 +1912,7 @@ bool is_camoufox_browser_process_name(const std::string& exe)
     std::string name = exe;
     for (char& c : name)
         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return name == "camoufox.exe" || name == "firefox.exe" || name.find("camoufox") != std::string::npos;
+    return name == "camoufox.exe" || name.find("camoufox") != std::string::npos;
 }
 
 void populate_process_counts(bridge_status_t& s)
@@ -2094,6 +2109,8 @@ int effective_launch_wait_ms(const launch_config_t& cfg, bool bundled_visible_la
     int wait_ms = clamp_launch_wait_ms(cfg.launch_timeout_ms);
     if (bundled_visible_launch && wait_ms < kBundledVisibleLaunchWaitMinMs)
         wait_ms = kBundledVisibleLaunchWaitMinMs;
+    if (bundled_visible_launch && wait_ms > kBundledVisibleLaunchWaitMaxMs)
+        wait_ms = kBundledVisibleLaunchWaitMaxMs;
     return wait_ms;
 }
 
@@ -2111,11 +2128,11 @@ bool query_python_version(const std::string& python_path, int& major, int& minor
     major = 0;
     minor = 0;
     detail.clear();
-    diag::log_tagged_fmt("camoufox", "python_version_probe begin path=%s timeout_ms=3000",
-        python_path.c_str());
+    diag::log_tagged_fmt("camoufox", "python_version_probe begin path=%s timeout_ms=%lu",
+        python_path.c_str(), static_cast<unsigned long>(kDependencyProbeTimeoutMs));
     DWORD code = 0;
     std::string captured;
-    if (!spawn_python_capture(python_path, L"-I -S -c \"import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')\"", 3000, code, captured, "python_version_probe"))
+    if (!spawn_python_capture(python_path, L"-I -S -c \"import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')\"", kDependencyProbeTimeoutMs, code, captured, "python_version_probe"))
     {
         detail = "version probe timed out or failed to spawn";
         diag::log_tagged_fmt("camoufox", "python_version_probe spawn_failed path=%s elapsed_ms=%llu detail=%s",
@@ -2739,11 +2756,15 @@ call_result_t to_bridge_result(const mcp_client::call_result_t& r)
     if (!r.success)
     {
         out.error = r.text;
+        if (out.error.empty())
+            out.error = "Camoufox reverse MCP call failed without an error message";
     }
     else if (out.data.is_object() && out.data.contains("error") && out.data["error"].is_string())
     {
         out.ok    = false;
         out.error = out.data["error"].get<std::string>();
+        if (out.error.empty())
+            out.error = "Camoufox reverse MCP returned an empty error field";
     }
     diag::log_tagged_fmt("camoufox", "mcp_result_shape success=%d text_len=%zu data_shape=%s error_len=%zu",
         static_cast<int>(r.success), r.text.size(), json_shape(out.data).c_str(), out.error.size());
@@ -3546,10 +3567,11 @@ void log_required_reverse_tools_missing_launch_skip(
 
 bool probe_module_installed_locked(const std::string& python_path)
 {
-    diag::log_tagged_fmt("camoufox", "module_probe start python=%s module=camoufox_reverse_mcp", python_path.c_str());
+    diag::log_tagged_fmt("camoufox", "module_probe start python=%s module=camoufox_reverse_mcp timeout_ms=%lu",
+        python_path.c_str(), static_cast<unsigned long>(kDependencyProbeTimeoutMs));
     DWORD code = 0;
     std::string captured;
-    if (!spawn_python_capture(python_path, L"-I -c \"import camoufox_reverse_mcp\"", 3000, code, captured, "module_probe"))
+    if (!spawn_python_capture(python_path, L"-I -c \"import camoufox_reverse_mcp\"", kDependencyProbeTimeoutMs, code, captured, "module_probe"))
     {
         std::string detail = compact_child_output_tail(captured, 600);
         sg().last_error = detail.empty()
@@ -3785,16 +3807,20 @@ nlohmann::json build_launch_args(const launch_config_t& cfg)
     j["webrtc_policy"] = "disabled";
     j["privacy_fail_closed"] = true;
     j["block_service_workers"] = true;
-    j["ua_policy"] = cfg.ua_policy.empty() ? std::string("camoufox_native") : cfg.ua_policy;
+    const std::string ua_policy = (cfg.ua_policy.empty() || cfg.ua_policy == "camoufox_native")
+        ? std::string("camoufox_macos")
+        : cfg.ua_policy;
+    j["ua_policy"] = ua_policy;
+    j["aida_fast_visible_launch"] = true;
     if (!cfg.user_agent.empty())
         j["user_agent"] = cfg.user_agent;
     j["enable_trace"] = cfg.enable_trace;
     j["window_width"] = cfg.window_width > 0 ? cfg.window_width : 1280;
     j["window_height"] = cfg.window_height > 0 ? cfg.window_height : 900;
-    j["launch_timeout_ms"] = launch_timeout_ms > 2000 ? launch_timeout_ms - 1000 : launch_timeout_ms;
+    j["launch_timeout_ms"] = launch_timeout_ms;
     if (testlab_fast_probe)
         j["aida_testlab_fast_probe"] = true;
-    const bool persistent_context_requested = cfg.persistent_context || !cfg.profile_dir.empty() || !cfg.user_data_dir.empty() || (!cfg.headless && !cfg.browser_executable.empty());
+    const bool persistent_context_requested = explicit_persistent_context_requested(cfg);
     if (persistent_context_requested)
         j["persistent_context"] = true;
     if (!cfg.profile_dir.empty())
@@ -4663,6 +4689,7 @@ bool start_bridge(const launch_config_t& cfg)
     const uint64_t start_stop_epoch = sg().stop_epoch.load(std::memory_order_acquire);
     launch_config_t effective_cfg = cfg;
     enforce_private_launch_config(effective_cfg);
+    normalize_fast_visible_launch_policy(effective_cfg);
     if (effective_cfg.session_id.empty())
         effective_cfg.session_id = "default";
     if (effective_cfg.headless)
@@ -5014,8 +5041,16 @@ bool start_bridge(const launch_config_t& cfg)
         publish_state(bridge_state_t::error, sg().last_error);
         return false;
     }
-    if (!effective_cfg.headless && !effective_cfg.browser_executable.empty())
-        effective_cfg.persistent_context = true;
+    {
+        const bool bundled_visible_launch = !effective_cfg.headless && !effective_cfg.browser_executable.empty();
+        diag::log_tagged_fmt("camoufox", "start_bridge persistent_context_policy generation=%llu bundled_visible=%d explicit_persistent=%d cfg_persistent=%d profile_dir=%d user_data_dir=%d default_nonpersistent=1",
+            static_cast<unsigned long long>(start_generation),
+            bundled_visible_launch ? 1 : 0,
+            explicit_persistent_context_requested(effective_cfg) ? 1 : 0,
+            effective_cfg.persistent_context ? 1 : 0,
+            trim_launch_token(effective_cfg.profile_dir).empty() ? 0 : 1,
+            trim_launch_token(effective_cfg.user_data_dir).empty() ? 0 : 1);
+    }
 
     if (use_server_executable)
     {
@@ -5412,6 +5447,9 @@ bool start_bridge(const launch_config_t& cfg)
             ? diagnostics["page_bounds"] : nlohmann::json::object();
         const nlohmann::json viewport = diagnostics.contains("viewport") && diagnostics["viewport"].is_object()
             ? diagnostics["viewport"] : nlohmann::json::object();
+        const int browser_ready_ms = json_int_or(diagnostics, "browser_ready_ms", json_int_or(parsed, "browser_ready_ms", -1));
+        const int camoufox_launch_ms = json_int_or(diagnostics, "camoufox_launch_ms", json_int_or(parsed, "camoufox_launch_ms", browser_ready_ms));
+        const int diag_elapsed_ms = json_int_or(diagnostics, "elapsed_ms", -1);
         const std::string parsed_profile_dir = launch_profile_dir_from_response(parsed);
         const bool parsed_profile_generated = launch_profile_generated_from_response(parsed);
         if (!parsed_profile_dir.empty())
@@ -5424,9 +5462,11 @@ bool start_bridge(const launch_config_t& cfg)
             sg().active_profile_generated = false;
         }
         update_privacy_from_response_locked(parsed, "launch_browser");
-        diag::log_tagged_fmt("camoufox", "launch_browser parsed status=%s diag_elapsed_ms=%d profile_dir=%s profile_generated=%d window=%dx%d requested=%dx%d work_area=%dx%d viewport=%dx%d inner=%dx%d outer=%dx%d pos=%d,%d screen=%dx%d avail=%dx%d dpr=%.2f",
+        diag::log_tagged_fmt("camoufox", "launch_browser parsed status=%s browser_ready_ms=%d camoufox_launch_ms=%d diag_elapsed_ms=%d profile_dir=%s profile_generated=%d window=%dx%d requested=%dx%d work_area=%dx%d viewport=%dx%d inner=%dx%d outer=%dx%d pos=%d,%d screen=%dx%d avail=%dx%d dpr=%.2f",
             json_string_or(parsed, "status", "unknown").c_str(),
-            json_int_or(diagnostics, "elapsed_ms", -1),
+            browser_ready_ms,
+            camoufox_launch_ms,
+            diag_elapsed_ms,
             parsed_profile_dir.empty() ? "<empty>" : parsed_profile_dir.c_str(),
             parsed_profile_generated ? 1 : 0,
             json_int_or(window, "width", -1), json_int_or(window, "height", -1),
@@ -5440,6 +5480,25 @@ bool start_bridge(const launch_config_t& cfg)
             json_int_or(bounds, "screenWidth", -1), json_int_or(bounds, "screenHeight", -1),
             json_int_or(bounds, "availWidth", -1), json_int_or(bounds, "availHeight", -1),
             json_double_or(bounds, "devicePixelRatio", 0.0));
+        const int launch_timing_budget_ms = launch_wait_ms > 0 ? launch_wait_ms : kBundledVisibleLaunchWaitMaxMs;
+        if (bundled_visible_launch && (camoufox_launch_ms <= 0 || camoufox_launch_ms > launch_timing_budget_ms || diag_elapsed_ms <= 0 || diag_elapsed_ms > launch_timing_budget_ms))
+        {
+            sg().last_error = "launch_browser exceeded Camoufox launch timing budget";
+            diag::log_tagged_fmt("camoufox", "launch_browser timing_budget_failed generation=%llu child_pid=%lu browser_ready_ms=%d camoufox_launch_ms=%d max_camoufox_ms=%d diag_elapsed_ms=%d max_ready_ms=%d data_shape=%s response_tail=%.900s",
+                static_cast<unsigned long long>(start_generation), static_cast<unsigned long>(sg().child_pid),
+                browser_ready_ms, camoufox_launch_ms, launch_timing_budget_ms, diag_elapsed_ms, launch_timing_budget_ms, json_shape(parsed).c_str(), compact_child_output_tail(launch.text, 900).c_str());
+            auto failed_client = sg().client;
+            const uint32_t failed_pid = sg().child_pid;
+            sg().client.reset();
+            sg().child_pid = 0;
+            sg().state = bridge_state_t::error;
+            clear_page_state_locked();
+            sg().last_launch_ms = now_ms() - bridge_start_ms;
+            mark_cleanup_started_locked(start_generation, failed_pid, "launch_browser_timing_budget_failed");
+            cleanup_client_async(failed_client, failed_pid, "launch_browser_timing_budget_failed", start_generation);
+            publish_state(bridge_state_t::error, sg().last_error);
+            return false;
+        }
     }
     if (parsed.is_object() && parsed.contains("error") && parsed["error"].is_string())
     {
@@ -6289,6 +6348,7 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
     }
     launch_config_t effective_cfg = cfg;
     enforce_private_launch_config(effective_cfg);
+    normalize_fast_visible_launch_policy(effective_cfg);
     effective_cfg.session_id = sid;
     if (effective_cfg.headless)
     {
@@ -6500,8 +6560,16 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
             sid.c_str(), session->last_error.c_str());
         return false;
     }
-    if (!effective_cfg.headless && !effective_cfg.browser_executable.empty())
-        effective_cfg.persistent_context = true;
+    {
+        const bool bundled_visible_launch = !effective_cfg.headless && !effective_cfg.browser_executable.empty();
+        diag::log_tagged_fmt("camoufox", "managed_start persistent_context_policy session_id=%s bundled_visible=%d explicit_persistent=%d cfg_persistent=%d profile_dir=%d user_data_dir=%d default_nonpersistent=1",
+            sid.c_str(),
+            bundled_visible_launch ? 1 : 0,
+            explicit_persistent_context_requested(effective_cfg) ? 1 : 0,
+            effective_cfg.persistent_context ? 1 : 0,
+            trim_launch_token(effective_cfg.profile_dir).empty() ? 0 : 1,
+            trim_launch_token(effective_cfg.user_data_dir).empty() ? 0 : 1);
+    }
     {
         std::lock_guard<std::recursive_mutex> lk(sg().mtx);
         const uint64_t preflight_start_ms = now_ms();

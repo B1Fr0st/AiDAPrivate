@@ -538,6 +538,119 @@ static inline void serialize_payload_fields(Json& out, const pg_capture_record_t
     out["plaintext_preview"] = payload_plaintext_preview(record.payload);
 }
 
+static inline const wchar_t* local_system_module_name(const char* module_name) noexcept {
+    if (!module_name)
+        return nullptr;
+    if (_stricmp(module_name, "ntdll.dll") == 0)
+        return L"ntdll.dll";
+    if (_stricmp(module_name, "kernelbase.dll") == 0)
+        return L"kernelbase.dll";
+    if (_stricmp(module_name, "kernel32.dll") == 0)
+        return L"kernel32.dll";
+    return nullptr;
+}
+
+static inline uint64_t resolve_system_export_for_pid(uint32_t pid,
+                                                     uint64_t module_base,
+                                                     uint64_t module_size,
+                                                     const char* module_name,
+                                                     const char* function_name,
+                                                     const char* phase,
+                                                     ULONGLONG phase_start) {
+    const ULONGLONG t0 = GetTickCount64();
+    uint64_t va = driver_bridge::resolve_export_for(pid, module_base, function_name);
+    diag::log_tagged_fmt("pg_sniff",
+        "export_resolve_driver phase=%s pid=%u active_pid=%u module=%s base=0x%llX function=%s va=0x%llX elapsed_ms=%llu phase_elapsed_ms=%llu outcome=%s",
+        phase ? phase : "",
+        pid,
+        driver_bridge::attached_pid(),
+        module_name ? module_name : "",
+        static_cast<unsigned long long>(module_base),
+        function_name ? function_name : "",
+        static_cast<unsigned long long>(va),
+        static_cast<unsigned long long>(GetTickCount64() - t0),
+        static_cast<unsigned long long>(GetTickCount64() - phase_start),
+        va != 0 ? "resolved" : "zero");
+    if (va != 0)
+        return va;
+
+    const wchar_t* local_name = local_system_module_name(module_name);
+    HMODULE local_mod = local_name ? GetModuleHandleW(local_name) : nullptr;
+    FARPROC local_fn = local_mod && function_name ? GetProcAddress(local_mod, function_name) : nullptr;
+    uint64_t local_rva = 0;
+    uint64_t fallback = 0;
+    if (local_mod && local_fn) {
+        const uintptr_t local_base = reinterpret_cast<uintptr_t>(local_mod);
+        const uintptr_t local_addr = reinterpret_cast<uintptr_t>(local_fn);
+        if (local_addr > local_base) {
+            local_rva = static_cast<uint64_t>(local_addr - local_base);
+            if (local_rva != 0 && (module_size == 0 || local_rva < module_size))
+                fallback = module_base + local_rva;
+        }
+    }
+    diag::log_tagged_fmt("pg_sniff",
+        "export_resolve_local_rva phase=%s pid=%u active_pid=%u module=%s base=0x%llX size=0x%llX function=%s local_module=%p local_fn=%p rva=0x%llX va=0x%llX elapsed_ms=%llu phase_elapsed_ms=%llu outcome=%s",
+        phase ? phase : "",
+        pid,
+        driver_bridge::attached_pid(),
+        module_name ? module_name : "",
+        static_cast<unsigned long long>(module_base),
+        static_cast<unsigned long long>(module_size),
+        function_name ? function_name : "",
+        local_mod,
+        local_fn,
+        static_cast<unsigned long long>(local_rva),
+        static_cast<unsigned long long>(fallback),
+        static_cast<unsigned long long>(GetTickCount64() - t0),
+        static_cast<unsigned long long>(GetTickCount64() - phase_start),
+        fallback != 0 ? "resolved" : "fail_closed");
+    return fallback;
+}
+
+static inline uint64_t remove_vectored_exception_handler_remote(uint32_t pid,
+                                                                uint64_t module_base,
+                                                                uint64_t remove_fn,
+                                                                uint64_t veh_handle,
+                                                                const char* phase,
+                                                                ULONGLONG phase_start) {
+    const ULONGLONG t0 = GetTickCount64();
+    diag::log_tagged_fmt("pg_sniff",
+        "remove_veh_remote_begin phase=%s pid=%u active_pid=%u module=ntdll.dll base=0x%llX function=RtlRemoveVectoredExceptionHandler va=0x%llX handle=0x%llX elapsed_ms=%llu",
+        phase ? phase : "",
+        pid,
+        driver_bridge::attached_pid(),
+        static_cast<unsigned long long>(module_base),
+        static_cast<unsigned long long>(remove_fn),
+        static_cast<unsigned long long>(veh_handle),
+        static_cast<unsigned long long>(GetTickCount64() - phase_start));
+    if (pid == 0 || remove_fn == 0 || veh_handle == 0) {
+        diag::log_tagged_fmt("pg_sniff",
+            "remove_veh_remote_skip phase=%s pid=%u active_pid=%u module=ntdll.dll base=0x%llX function=RtlRemoveVectoredExceptionHandler va=0x%llX handle=0x%llX elapsed_ms=%llu outcome=invalid_args",
+            phase ? phase : "",
+            pid,
+            driver_bridge::attached_pid(),
+            static_cast<unsigned long long>(module_base),
+            static_cast<unsigned long long>(remove_fn),
+            static_cast<unsigned long long>(veh_handle),
+            static_cast<unsigned long long>(GetTickCount64() - phase_start));
+        return 0;
+    }
+    const uint64_t removed = remote_thread_call(pid, remove_fn, veh_handle, 0, 0, 0, 5000, "RtlRemoveVectoredExceptionHandler");
+    diag::log_tagged_fmt("pg_sniff",
+        "remove_veh_remote_done phase=%s pid=%u active_pid=%u module=ntdll.dll base=0x%llX function=RtlRemoveVectoredExceptionHandler va=0x%llX handle=0x%llX result=0x%llX ok=%d elapsed_ms=%llu phase_elapsed_ms=%llu",
+        phase ? phase : "",
+        pid,
+        driver_bridge::attached_pid(),
+        static_cast<unsigned long long>(module_base),
+        static_cast<unsigned long long>(remove_fn),
+        static_cast<unsigned long long>(veh_handle),
+        static_cast<unsigned long long>(removed),
+        removed != 0 ? 1 : 0,
+        static_cast<unsigned long long>(GetTickCount64() - t0),
+        static_cast<unsigned long long>(GetTickCount64() - phase_start));
+    return removed;
+}
+
 
 struct pg_session_t {
     uint32_t session_id    = 0;
@@ -548,6 +661,9 @@ struct pg_session_t {
     uint64_t sc_addr       = 0;
     uint32_t orig_protect  = 0;
     uint64_t veh_handle    = 0;
+    uint64_t ntdll_base    = 0;
+    uint64_t ntdll_size    = 0;
+    uint64_t rtl_remove_veh_fn = 0;
 
     std::mutex                      captures_mutex;
     std::mutex                      drain_mutex;
@@ -557,6 +673,9 @@ struct pg_session_t {
 
     std::atomic<bool>          polling{false};
     std::atomic<bool>          exited{false};
+    std::atomic<bool>          teardown_requested{false};
+    std::atomic<bool>          protection_restored{false};
+    std::atomic<bool>          veh_removed{false};
 
 
     uint32_t prev_write_idx     = 0;
@@ -663,6 +782,7 @@ public:
 
 
     uint32_t install(uint32_t pid, uint64_t target_addr, uint64_t region_size, bool capture_payloads = true, uint32_t max_records_per_drain = 0) {
+        const ULONGLONG install_start = GetTickCount64();
         diag::log_tagged_fmt("pg_sniff", "install_start pid=%u target=0x%llX size=0x%llX kernel=%d attached=%u payloads=%d max_drain=%u",
             pid,
             static_cast<unsigned long long>(target_addr),
@@ -705,28 +825,30 @@ public:
         uint32_t orig_protect = mri.protect;
 
 
-        uint64_t kbase_base = find_module_base(pid, "kernelbase.dll");
-        uint64_t k32_base = find_module_base(pid, "kernel32.dll");
-        uint64_t virt_protect_fn = kbase_base != 0 ? driver_bridge::resolve_export(kbase_base, "VirtualProtect") : 0;
+        driver_bridge::module_info_t kbase_mod = find_module_info(pid, "kernelbase.dll");
+        driver_bridge::module_info_t k32_mod = find_module_info(pid, "kernel32.dll");
+        uint64_t virt_protect_fn = kbase_mod.base != 0
+            ? resolve_system_export_for_pid(pid, kbase_mod.base, kbase_mod.size, "kernelbase.dll", "VirtualProtect", "install_virtualprotect_kernelbase", install_start)
+            : 0;
         const char* virt_protect_module = virt_protect_fn != 0 ? "kernelbase.dll" : "kernel32.dll";
-        if (virt_protect_fn == 0 && k32_base != 0)
-            virt_protect_fn = driver_bridge::resolve_export(k32_base, "VirtualProtect");
+        if (virt_protect_fn == 0 && k32_mod.base != 0)
+            virt_protect_fn = resolve_system_export_for_pid(pid, k32_mod.base, k32_mod.size, "kernel32.dll", "VirtualProtect", "install_virtualprotect_kernel32", install_start);
         if (virt_protect_fn == 0) {
             diag::log_tagged_fmt("pg_sniff", "install_failed reason=virtualprotect_missing pid=%u kernelbase=0x%llX kernel32=0x%llX",
                 pid,
-                static_cast<unsigned long long>(kbase_base),
-                static_cast<unsigned long long>(k32_base));
+                static_cast<unsigned long long>(kbase_mod.base),
+                static_cast<unsigned long long>(k32_mod.base));
             return 0;
         }
         diag::log_tagged_fmt("pg_sniff", "install_virtualprotect pid=%u module=%s addr=0x%llX kernelbase=0x%llX kernel32=0x%llX",
             pid,
             virt_protect_module,
             static_cast<unsigned long long>(virt_protect_fn),
-            static_cast<unsigned long long>(kbase_base),
-            static_cast<unsigned long long>(k32_base));
+            static_cast<unsigned long long>(kbase_mod.base),
+            static_cast<unsigned long long>(k32_mod.base));
 
 
-        uint64_t ring_addr = driver_bridge::allocate_memory(RING_TOTAL_SIZE + 16);
+        uint64_t ring_addr = driver_bridge::allocate_memory_for(pid, RING_TOTAL_SIZE + 16);
         if (ring_addr == 0) {
             diag::log_tagged_fmt("pg_sniff", "install_failed reason=ring_alloc pid=%u bytes=%u last_error=%s",
                 pid, RING_TOTAL_SIZE + 16, driver_bridge::last_error().c_str());
@@ -735,15 +857,15 @@ public:
         if (driver_bridge::attached_pid() != pid) {
             diag::log_tagged_fmt("pg_sniff", "install_failed reason=post_ring_active_mismatch requested=%u attached=%u ring=0x%llX",
                 pid, driver_bridge::attached_pid(), static_cast<unsigned long long>(ring_addr));
-            driver_bridge::free_memory(ring_addr);
+            driver_bridge::free_memory_for(pid, ring_addr);
             return 0;
         }
 
-        uint64_t sc_addr = driver_bridge::allocate_memory(SHELLCODE_SIZE + 16);
+        uint64_t sc_addr = driver_bridge::allocate_memory_for(pid, SHELLCODE_SIZE + 16);
         if (sc_addr == 0) {
             diag::log_tagged_fmt("pg_sniff", "install_failed reason=shellcode_alloc pid=%u bytes=%zu ring=0x%llX last_error=%s",
                 pid, SHELLCODE_SIZE + 16, static_cast<unsigned long long>(ring_addr), driver_bridge::last_error().c_str());
-            driver_bridge::free_memory(ring_addr);
+            driver_bridge::free_memory_for(pid, ring_addr);
             return 0;
         }
 
@@ -752,8 +874,8 @@ public:
         if (!driver_bridge::write_memory_for(pid, ring_addr, zeroes)) {
             diag::log_tagged_fmt("pg_sniff", "install_failed reason=ring_zero_write pid=%u ring=0x%llX last_error=%s",
                 pid, static_cast<unsigned long long>(ring_addr), driver_bridge::last_error().c_str());
-            driver_bridge::free_memory(sc_addr);
-            driver_bridge::free_memory(ring_addr);
+            driver_bridge::free_memory_for(pid, sc_addr);
+            driver_bridge::free_memory_for(pid, ring_addr);
             return 0;
         }
 
@@ -764,8 +886,8 @@ public:
         if (!driver_bridge::write_memory_for(pid, sc_addr, sc)) {
             diag::log_tagged_fmt("pg_sniff", "install_failed reason=shellcode_write pid=%u sc=0x%llX bytes=%zu last_error=%s",
                 pid, static_cast<unsigned long long>(sc_addr), sc.size(), driver_bridge::last_error().c_str());
-            driver_bridge::free_memory(sc_addr);
-            driver_bridge::free_memory(ring_addr);
+            driver_bridge::free_memory_for(pid, sc_addr);
+            driver_bridge::free_memory_for(pid, ring_addr);
             return 0;
         }
         uint32_t old_sc_protect = 0;
@@ -773,26 +895,53 @@ public:
                                                PAGE_EXECUTE_READ, &old_sc_protect)) {
             diag::log_tagged_fmt("pg_sniff", "install_failed reason=shellcode_protect pid=%u sc=0x%llX last_error=%s",
                 pid, static_cast<unsigned long long>(sc_addr), driver_bridge::last_error().c_str());
-            driver_bridge::free_memory(sc_addr);
-            driver_bridge::free_memory(ring_addr);
+            driver_bridge::free_memory_for(pid, sc_addr);
+            driver_bridge::free_memory_for(pid, ring_addr);
             return 0;
         }
 
 
-        uint64_t ntdll_base_install = find_module_base(pid, "ntdll.dll");
-        if (ntdll_base_install == 0) {
+        driver_bridge::module_info_t ntdll_mod_install = find_module_info(pid, "ntdll.dll");
+        if (ntdll_mod_install.base == 0) {
             diag::log_tagged_fmt("pg_sniff", "install_failed reason=ntdll_missing pid=%u", pid);
-            driver_bridge::free_memory(sc_addr);
-            driver_bridge::free_memory(ring_addr);
+            driver_bridge::free_memory_for(pid, sc_addr);
+            driver_bridge::free_memory_for(pid, ring_addr);
             return 0;
         }
-        uint64_t rtl_add_fn = driver_bridge::resolve_export(ntdll_base_install,
-                                                      "RtlAddVectoredExceptionHandler");
+        uint64_t rtl_add_fn = resolve_system_export_for_pid(pid,
+                                                            ntdll_mod_install.base,
+                                                            ntdll_mod_install.size,
+                                                            "ntdll.dll",
+                                                            "RtlAddVectoredExceptionHandler",
+                                                            "install_rtladdveh",
+                                                            install_start);
         if (rtl_add_fn == 0) {
             diag::log_tagged_fmt("pg_sniff", "install_failed reason=rtladdveh_missing pid=%u ntdll=0x%llX",
-                pid, static_cast<unsigned long long>(ntdll_base_install));
-            driver_bridge::free_memory(sc_addr);
-            driver_bridge::free_memory(ring_addr);
+                pid, static_cast<unsigned long long>(ntdll_mod_install.base));
+            driver_bridge::free_memory_for(pid, sc_addr);
+            driver_bridge::free_memory_for(pid, ring_addr);
+            return 0;
+        }
+        uint64_t rtl_remove_fn = resolve_system_export_for_pid(pid,
+                                                               ntdll_mod_install.base,
+                                                               ntdll_mod_install.size,
+                                                               "ntdll.dll",
+                                                               "RtlRemoveVectoredExceptionHandler",
+                                                               "install_cache_rtlremoveveh",
+                                                               install_start);
+        diag::log_tagged_fmt("pg_sniff",
+            "install_cache_rtlremoveveh pid=%u active_pid=%u module=ntdll.dll base=0x%llX function=RtlRemoveVectoredExceptionHandler va=0x%llX elapsed_ms=%llu outcome=%s",
+            pid,
+            driver_bridge::attached_pid(),
+            static_cast<unsigned long long>(ntdll_mod_install.base),
+            static_cast<unsigned long long>(rtl_remove_fn),
+            static_cast<unsigned long long>(GetTickCount64() - install_start),
+            rtl_remove_fn != 0 ? "cached" : "fail_closed");
+        if (rtl_remove_fn == 0) {
+            diag::log_tagged_fmt("pg_sniff", "install_failed reason=rtlremoveveh_missing pid=%u ntdll=0x%llX",
+                pid, static_cast<unsigned long long>(ntdll_mod_install.base));
+            driver_bridge::free_memory_for(pid, sc_addr);
+            driver_bridge::free_memory_for(pid, ring_addr);
             return 0;
         }
 
@@ -800,8 +949,8 @@ public:
         if (veh_handle == 0) {
             diag::log_tagged_fmt("pg_sniff", "veh_register_failed pid=%u handler=0x%llX",
                 pid, static_cast<unsigned long long>(sc_addr));
-            driver_bridge::free_memory(sc_addr);
-            driver_bridge::free_memory(ring_addr);
+            driver_bridge::free_memory_for(pid, sc_addr);
+            driver_bridge::free_memory_for(pid, ring_addr);
             return 0;
         }
 
@@ -814,16 +963,17 @@ public:
                 static_cast<unsigned long long>(region_size),
                 orig_protect,
                 driver_bridge::last_error().c_str());
-            uint64_t rtl_rm = driver_bridge::resolve_export(ntdll_base_install,
-                                                      "RtlRemoveVectoredExceptionHandler");
-            if (rtl_rm) {
-                uint64_t removed = remote_thread_call(pid, rtl_rm, veh_handle, 0, 0, 0, 5000, "RtlRemoveVectoredExceptionHandler");
-                if (removed == 0)
-                    diag::log_tagged_fmt("pg_sniff", "veh_remove_failed pid=%u handle=0x%llX",
-                        pid, static_cast<unsigned long long>(veh_handle));
-            }
-            driver_bridge::free_memory(sc_addr);
-            driver_bridge::free_memory(ring_addr);
+            uint64_t removed = remove_vectored_exception_handler_remote(pid,
+                                                                         ntdll_mod_install.base,
+                                                                         rtl_remove_fn,
+                                                                         veh_handle,
+                                                                         "install_guard_cleanup",
+                                                                         install_start);
+            if (removed == 0)
+                diag::log_tagged_fmt("pg_sniff", "veh_remove_failed pid=%u handle=0x%llX",
+                    pid, static_cast<unsigned long long>(veh_handle));
+            driver_bridge::free_memory_for(pid, sc_addr);
+            driver_bridge::free_memory_for(pid, ring_addr);
             return 0;
         }
 
@@ -836,6 +986,9 @@ public:
         session->sc_addr     = sc_addr;
         session->orig_protect= orig_protect;
         session->veh_handle  = veh_handle;
+        session->ntdll_base   = ntdll_mod_install.base;
+        session->ntdll_size   = ntdll_mod_install.size;
+        session->rtl_remove_veh_fn = rtl_remove_fn;
         session->polling.store(true);
         session->capture_payloads.store(capture_payloads, std::memory_order_release);
         session->max_records_per_drain.store(max_records_per_drain, std::memory_order_release);
@@ -848,13 +1001,28 @@ public:
         })) {
             diag::log_tagged_fmt("pg_sniff", "install_failed reason=poll_worker_post pid=%u target=0x%llX",
                 pid, static_cast<unsigned long long>(target_addr));
-            uint64_t rtl_rm = driver_bridge::resolve_export(ntdll_base_install,
-                                                      "RtlRemoveVectoredExceptionHandler");
-            if (rtl_rm)
-                remote_thread_call(pid, rtl_rm, veh_handle, 0, 0, 0, 5000, "RtlRemoveVectoredExceptionHandler");
-            driver_bridge::protect_memory_for(pid, target_addr, region_size, orig_protect, nullptr);
-            driver_bridge::free_memory(sc_addr);
-            driver_bridge::free_memory(ring_addr);
+            uint32_t cleanup_old_protect = 0;
+            const bool cleanup_restored = driver_bridge::protect_memory_for(pid, target_addr, region_size, orig_protect, &cleanup_old_protect);
+            bool cleanup_removed = false;
+            if (cleanup_restored && rtl_remove_fn)
+                cleanup_removed = remove_vectored_exception_handler_remote(pid,
+                                                                           ntdll_mod_install.base,
+                                                                           rtl_remove_fn,
+                                                                           veh_handle,
+                                                                           "install_worker_post_cleanup",
+                                                                           install_start) != 0;
+            diag::log_tagged_fmt("pg_sniff", "install_failed_cleanup pid=%u restored=%d old=0x%08X rtl_rm=0x%llX removed=%d sc=0x%llX ring=0x%llX",
+                pid,
+                cleanup_restored ? 1 : 0,
+                cleanup_old_protect,
+                static_cast<unsigned long long>(rtl_remove_fn),
+                cleanup_removed ? 1 : 0,
+                static_cast<unsigned long long>(sc_addr),
+                static_cast<unsigned long long>(ring_addr));
+            if (cleanup_restored && cleanup_removed) {
+                driver_bridge::free_memory_for(pid, sc_addr);
+                driver_bridge::free_memory_for(pid, ring_addr);
+            }
             session->polling.store(false);
             session->exited.store(true);
             return 0;
@@ -946,6 +1114,7 @@ public:
 
 
         const ULONGLONG cleanup_start = GetTickCount64();
+        sess->teardown_requested.store(true, std::memory_order_release);
         diag::log_tagged_fmt("pg_sniff", "uninstall_start sid=%u pid=%u target=0x%llX size=0x%llX exited=%d",
             session_id,
             sess->pid,
@@ -968,49 +1137,135 @@ public:
                 driver_bridge::attached_pid(),
                 static_cast<unsigned long long>(GetTickCount64() - cleanup_start));
 
-            if (active_ok && sess->veh_handle) {
-                uint64_t ntdll_base = find_module_base(sess->pid, "ntdll.dll");
-                if (ntdll_base) {
-                    uint64_t rtl_rm = driver_bridge::resolve_export(ntdll_base,
-                                                              "RtlRemoveVectoredExceptionHandler");
-                    if (rtl_rm) {
-                        uint64_t removed = remote_thread_call(sess->pid, rtl_rm, sess->veh_handle, 0, 0, 0, 5000, "RtlRemoveVectoredExceptionHandler");
-                        if (removed == 0)
-                            diag::log_tagged_fmt("pg_sniff", "veh_remove_failed pid=%u handle=0x%llX",
-                                sess->pid, static_cast<unsigned long long>(sess->veh_handle));
-                    }
-                }
+            driver_bridge::memory_region_t before_restore{};
+            const bool before_query_ok = active_ok && driver_bridge::query_memory_for(sess->pid, sess->target_addr, before_restore);
+            diag::log_tagged_fmt("pg_sniff", "uninstall_region_before_restore sid=%u query_ok=%d base=0x%llX size=0x%llX state=0x%08X protect=0x%08X type=0x%08X elapsed_ms=%llu",
+                session_id,
+                before_query_ok ? 1 : 0,
+                static_cast<unsigned long long>(before_restore.base),
+                static_cast<unsigned long long>(before_restore.size),
+                before_restore.state,
+                before_restore.protect,
+                before_restore.type,
+                static_cast<unsigned long long>(GetTickCount64() - cleanup_start));
+
+            bool restore_ok = false;
+            uint32_t old_restore_protect = 0;
+            if (active_ok) {
+                diag::log_tagged_fmt("pg_sniff", "uninstall_restore_protect_begin sid=%u target=0x%llX size=0x%llX orig=0x%08X elapsed_ms=%llu",
+                    session_id,
+                    static_cast<unsigned long long>(sess->target_addr),
+                    static_cast<unsigned long long>(sess->region_size),
+                    sess->orig_protect,
+                    static_cast<unsigned long long>(GetTickCount64() - cleanup_start));
+                restore_ok = driver_bridge::protect_memory_for(sess->pid, sess->target_addr, sess->region_size,
+                                                               sess->orig_protect, &old_restore_protect);
+                sess->protection_restored.store(restore_ok, std::memory_order_release);
+                diag::log_tagged_fmt("pg_sniff", "uninstall_restore_protect_done sid=%u ok=%d old=0x%08X elapsed_ms=%llu last_error=%s",
+                    session_id,
+                    restore_ok ? 1 : 0,
+                    old_restore_protect,
+                    static_cast<unsigned long long>(GetTickCount64() - cleanup_start),
+                    driver_bridge::last_error().c_str());
             }
 
-            diag::log_tagged_fmt("pg_sniff", "uninstall_restore_protect_begin sid=%u target=0x%llX size=0x%llX orig=0x%08X elapsed_ms=%llu",
+            driver_bridge::memory_region_t after_restore{};
+            const bool after_query_ok = active_ok && driver_bridge::query_memory_for(sess->pid, sess->target_addr, after_restore);
+            diag::log_tagged_fmt("pg_sniff", "uninstall_region_after_restore sid=%u query_ok=%d base=0x%llX size=0x%llX state=0x%08X protect=0x%08X type=0x%08X elapsed_ms=%llu",
                 session_id,
-                static_cast<unsigned long long>(sess->target_addr),
-                static_cast<unsigned long long>(sess->region_size),
-                sess->orig_protect,
-                static_cast<unsigned long long>(GetTickCount64() - cleanup_start));
-            driver_bridge::protect_memory_for(sess->pid, sess->target_addr, sess->region_size,
-                                              sess->orig_protect, nullptr);
-            diag::log_tagged_fmt("pg_sniff", "uninstall_restore_protect_done sid=%u elapsed_ms=%llu",
-                session_id,
+                after_query_ok ? 1 : 0,
+                static_cast<unsigned long long>(after_restore.base),
+                static_cast<unsigned long long>(after_restore.size),
+                after_restore.state,
+                after_restore.protect,
+                after_restore.type,
                 static_cast<unsigned long long>(GetTickCount64() - cleanup_start));
 
+            const bool guard_cleared = restore_ok || (after_query_ok && ((after_restore.protect & PAGE_GUARD) == 0));
+            if (restore_ok && before_query_ok && (before_restore.protect & PAGE_GUARD))
+                Sleep(25);
+
+            bool veh_removed = sess->veh_handle == 0;
+            if (active_ok && sess->veh_handle && guard_cleared) {
+                uint64_t ntdll_base = sess->ntdll_base;
+                uint64_t ntdll_size = sess->ntdll_size;
+                if (ntdll_base == 0) {
+                    driver_bridge::module_info_t ntdll_mod = find_module_info(sess->pid, "ntdll.dll");
+                    ntdll_base = ntdll_mod.base;
+                    ntdll_size = ntdll_mod.size;
+                }
+                uint64_t rtl_rm = sess->rtl_remove_veh_fn;
+                diag::log_tagged_fmt("pg_sniff", "uninstall_remove_veh_cached sid=%u pid=%u active_pid=%u handle=0x%llX ntdll=0x%llX function=RtlRemoveVectoredExceptionHandler va=0x%llX elapsed_ms=%llu outcome=%s",
+                    session_id,
+                    sess->pid,
+                    driver_bridge::attached_pid(),
+                    static_cast<unsigned long long>(sess->veh_handle),
+                    static_cast<unsigned long long>(ntdll_base),
+                    static_cast<unsigned long long>(rtl_rm),
+                    static_cast<unsigned long long>(GetTickCount64() - cleanup_start),
+                    rtl_rm != 0 ? "hit" : "miss");
+                if (rtl_rm == 0 && ntdll_base != 0) {
+                    rtl_rm = resolve_system_export_for_pid(sess->pid,
+                                                           ntdll_base,
+                                                           ntdll_size,
+                                                           "ntdll.dll",
+                                                           "RtlRemoveVectoredExceptionHandler",
+                                                           "uninstall_fallback_rtlremoveveh",
+                                                           cleanup_start);
+                }
+                if (ntdll_base != 0 && rtl_rm != 0) {
+                    uint64_t removed = remove_vectored_exception_handler_remote(sess->pid,
+                                                                                 ntdll_base,
+                                                                                 rtl_rm,
+                                                                                 sess->veh_handle,
+                                                                                 "uninstall",
+                                                                                 cleanup_start);
+                    veh_removed = removed != 0;
+                    sess->veh_removed.store(veh_removed, std::memory_order_release);
+                    if (!veh_removed)
+                        diag::log_tagged_fmt("pg_sniff", "veh_remove_failed pid=%u handle=0x%llX",
+                            sess->pid, static_cast<unsigned long long>(sess->veh_handle));
+                } else {
+                    diag::log_tagged_fmt("pg_sniff", "uninstall_remove_veh_fail_closed sid=%u pid=%u active_pid=%u handle=0x%llX ntdll=0x%llX function=RtlRemoveVectoredExceptionHandler va=0x%llX elapsed_ms=%llu",
+                        session_id,
+                        sess->pid,
+                        driver_bridge::attached_pid(),
+                        static_cast<unsigned long long>(sess->veh_handle),
+                        static_cast<unsigned long long>(ntdll_base),
+                        static_cast<unsigned long long>(rtl_rm),
+                        static_cast<unsigned long long>(GetTickCount64() - cleanup_start));
+                }
+            } else if (active_ok && sess->veh_handle) {
+                diag::log_tagged_fmt("pg_sniff", "uninstall_remove_veh_skipped sid=%u handle=0x%llX guard_cleared=%d restore_ok=%d after_query_ok=%d after_protect=0x%08X elapsed_ms=%llu",
+                    session_id,
+                    static_cast<unsigned long long>(sess->veh_handle),
+                    guard_cleared ? 1 : 0,
+                    restore_ok ? 1 : 0,
+                    after_query_ok ? 1 : 0,
+                    after_restore.protect,
+                    static_cast<unsigned long long>(GetTickCount64() - cleanup_start));
+            }
+
             poller_exited = sess->exited.load(std::memory_order_acquire);
-            if (active_ok && poller_exited) {
+            if (active_ok && poller_exited && veh_removed && guard_cleared) {
                 diag::log_tagged_fmt("pg_sniff", "uninstall_free_begin sid=%u sc=0x%llX ring=0x%llX elapsed_ms=%llu",
                     session_id,
                     static_cast<unsigned long long>(sess->sc_addr),
                     static_cast<unsigned long long>(sess->ring_addr),
                     static_cast<unsigned long long>(GetTickCount64() - cleanup_start));
-                if (sess->sc_addr) driver_bridge::free_memory(sess->sc_addr);
-                if (sess->ring_addr) driver_bridge::free_memory(sess->ring_addr);
+                if (sess->sc_addr) driver_bridge::free_memory_for(sess->pid, sess->sc_addr);
+                if (sess->ring_addr) driver_bridge::free_memory_for(sess->pid, sess->ring_addr);
                 diag::log_tagged_fmt("pg_sniff", "uninstall_free_done sid=%u elapsed_ms=%llu",
                     session_id,
                     static_cast<unsigned long long>(GetTickCount64() - cleanup_start));
             } else {
-                diag::log_tagged_fmt("pg_sniff", "uninstall_retired sid=%u active_ok=%d exited=%d sc=0x%llX ring=0x%llX elapsed_ms=%llu",
+                diag::log_tagged_fmt("pg_sniff", "uninstall_retired sid=%u active_ok=%d exited=%d veh_removed=%d restore_ok=%d guard_cleared=%d sc=0x%llX ring=0x%llX elapsed_ms=%llu",
                     session_id,
                     active_ok ? 1 : 0,
                     poller_exited ? 1 : 0,
+                    veh_removed ? 1 : 0,
+                    restore_ok ? 1 : 0,
+                    guard_cleared ? 1 : 0,
                     static_cast<unsigned long long>(sess->sc_addr),
                     static_cast<unsigned long long>(sess->ring_addr),
                     static_cast<unsigned long long>(GetTickCount64() - cleanup_start));
@@ -1078,16 +1333,20 @@ public:
     }
 
 
-    static uint64_t find_module_base(uint32_t pid, const char* name_lower) noexcept {
+    static driver_bridge::module_info_t find_module_info(uint32_t pid, const char* name_lower) noexcept {
         auto modules = driver_bridge::enumerate_modules_for(pid);
         for (const auto& m : modules) {
             std::string lower_name = m.name;
             for (char& c : lower_name)
                 c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
             if (lower_name == name_lower)
-                return m.base;
+                return m;
         }
-        return 0;
+        return {};
+    }
+
+    static uint64_t find_module_base(uint32_t pid, const char* name_lower) noexcept {
+        return find_module_info(pid, name_lower).base;
     }
 
 private:
@@ -1299,7 +1558,8 @@ private:
     }
 
     static void rearm_guard(pg_session_t* sess) {
-        if (!sess->polling.load())
+        if (!sess->polling.load(std::memory_order_acquire) ||
+            sess->teardown_requested.load(std::memory_order_acquire))
             return;
         ++sess->rearm_attempts;
         uint32_t old_protect = 0;

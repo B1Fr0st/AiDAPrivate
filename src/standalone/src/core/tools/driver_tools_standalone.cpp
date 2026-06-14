@@ -6224,6 +6224,36 @@ static std::string reg_index_to_name(std::uint32_t idx) {
     return "reg" + std::to_string(idx);
 }
 
+static json sniff_captures_to_json(const std::vector<voyager::device_t::sniff_result>& captures)
+{
+    json arr = json::array();
+    for (const auto& cap : captures) {
+        json c;
+        c["timestamp"] = cap.timestamp;
+        c["thread_id"] = sa_format_address(static_cast<uint64_t>(cap.thread_id));
+        c["size"] = cap.buffer.size();
+        std::string hex;
+        std::size_t show = (cap.buffer.size() < 256) ? cap.buffer.size() : 256;
+        for (std::size_t i = 0; i < show; i++) {
+            char hb[4];
+            qsnprintf(hb, sizeof(hb), "%02X ", cap.buffer[i]);
+            hex += hb;
+            if ((i + 1) % 16 == 0) hex += "\n";
+        }
+        if (show < cap.buffer.size())
+            hex += "... (" + std::to_string(cap.buffer.size() - show) + " more)";
+        c["hex_dump"] = hex;
+        std::string ascii;
+        for (std::size_t i = 0; i < show; i++) {
+            char ch = static_cast<char>(cap.buffer[i]);
+            ascii += (ch >= 0x20 && ch < 0x7F) ? ch : '.';
+        }
+        c["ascii"] = ascii;
+        arr.push_back(std::move(c));
+    }
+    return arr;
+}
+
 tool_result_t driver_sniff_network_buffers(const json& params)
 {
     diag::log_tagged_fmt("drv_tools", "driver_sniff_network_buffers entry");
@@ -6235,17 +6265,64 @@ tool_result_t driver_sniff_network_buffers(const json& params)
         std::string op = params["operation"].get<std::string>();
 
         if (op == "stop") {
+            bool active_before = false;
+            auto captures = device->sniff_net_buffers_get(active_before);
             if (!device->sniff_net_buffers_stop())
                 return tool_result_t::error(OBFSTR("Failed to stop sniff session"));
-            bool active = false;
-            auto captures = device->sniff_net_buffers_get(active);
+            bool active_after = false;
+            (void)device->sniff_net_buffers_get(active_after);
             json result;
             result["operation"] = "stop";
             result["stopped"] = true;
-            result["active"] = active;
+            result["active"] = active_after;
+            result["active_before_stop"] = active_before;
             result["capture_count"] = captures.size();
+            result["captures"] = sniff_captures_to_json(captures);
             result["driver_error"] = driver_bridge::last_error();
             return tool_result_t::ok(OBFSTR("Sniff session stopped"), result);
+        }
+        if (op == "store") {
+            const json* bytes_value = nullptr;
+            if (params.contains("bytes")) bytes_value = &params["bytes"];
+            else if (params.contains("data")) bytes_value = &params["data"];
+            else if (params.contains("hex")) bytes_value = &params["hex"];
+            if (!bytes_value)
+                return tool_result_t::error(OBFSTR("'bytes', 'data', or 'hex' is required for store operation"));
+            std::vector<std::uint8_t> bytes;
+            std::string parse_error;
+            if (!parse_byte_sequence(*bytes_value, bytes, parse_error))
+                return tool_result_t::error(OBFSTR("Invalid capture bytes: ") + parse_error);
+            std::uint64_t timestamp = GetTickCount64();
+            if (params.contains("timestamp")) {
+                if (params["timestamp"].is_number_unsigned())
+                    timestamp = params["timestamp"].get<std::uint64_t>();
+                else if (params["timestamp"].is_number_integer())
+                    timestamp = static_cast<std::uint64_t>(params["timestamp"].get<std::int64_t>());
+                else if (params["timestamp"].is_string())
+                    timestamp = sa_parse_address(params["timestamp"].get<std::string>()).value_or(timestamp);
+            }
+            std::uint64_t thread_id = GetCurrentThreadId();
+            if (params.contains("thread_id")) {
+                if (params["thread_id"].is_number_unsigned())
+                    thread_id = params["thread_id"].get<std::uint64_t>();
+                else if (params["thread_id"].is_number_integer())
+                    thread_id = static_cast<std::uint64_t>(params["thread_id"].get<std::int64_t>());
+                else if (params["thread_id"].is_string())
+                    thread_id = sa_parse_address(params["thread_id"].get<std::string>()).value_or(thread_id);
+            }
+            if (!device->sniff_net_buffers_store(timestamp, thread_id, bytes.data(), static_cast<std::uint32_t>(bytes.size())))
+                return tool_result_t::error(OBFSTR("Failed to store sniff capture"));
+            bool active = false;
+            auto captures = device->sniff_net_buffers_get(active);
+            json result;
+            result["operation"] = "store";
+            result["stored"] = true;
+            result["active"] = active;
+            result["capture_count"] = captures.size();
+            result["stored_size"] = bytes.size();
+            result["captures"] = sniff_captures_to_json(captures);
+            result["driver_error"] = driver_bridge::last_error();
+            return tool_result_t::ok(OBFSTR("Sniff capture stored"), result);
         }
         if (op == "get" || op == "results") {
             bool active = false;
@@ -6256,36 +6333,7 @@ tool_result_t driver_sniff_network_buffers(const json& params)
             json result;
             result["active"] = active;
             result["capture_count"] = captures.size();
-            json arr = json::array();
-            for (const auto& cap : captures) {
-                json c;
-                c["timestamp"] = cap.timestamp;
-                c["thread_id"] = sa_format_address(static_cast<uint64_t>(cap.thread_id));
-                c["size"] = cap.buffer.size();
-
-
-                std::string hex;
-                std::size_t show = (cap.buffer.size() < 256) ? cap.buffer.size() : 256;
-                for (std::size_t i = 0; i < show; i++) {
-                    char hb[4];
-                    qsnprintf(hb, sizeof(hb), "%02X ", cap.buffer[i]);
-                    hex += hb;
-                    if ((i + 1) % 16 == 0) hex += "\n";
-                }
-                if (show < cap.buffer.size())
-                    hex += "... (" + std::to_string(cap.buffer.size() - show) + " more)";
-                c["hex_dump"] = hex;
-
-
-                std::string ascii;
-                for (std::size_t i = 0; i < show; i++) {
-                    char ch = static_cast<char>(cap.buffer[i]);
-                    ascii += (ch >= 0x20 && ch < 0x7F) ? ch : '.';
-                }
-                c["ascii"] = ascii;
-                arr.push_back(std::move(c));
-            }
-            result["captures"] = std::move(arr);
+            result["captures"] = sniff_captures_to_json(captures);
 
             return tool_result_t::ok(
                 std::to_string(captures.size()) + OBFSTR(" capture(s) retrieved"), result);
@@ -8975,8 +9023,18 @@ void register_driver_tools(mcp_standalone::server_t& srv)
          {OBFSTR("max_packets"), OBFSTR("number"),
           OBFSTR("Max captures before auto-stop (default 1, max 16)"), false},
          {OBFSTR("operation"), OBFSTR("string"),
-          OBFSTR("'start' (default), 'stop', 'get'/'results'"), false, {},
-          {OBFSTR("start"), OBFSTR("stop"), OBFSTR("get"), OBFSTR("results")}},
+          OBFSTR("'start' (default), 'store', 'get'/'results', 'stop'"), false, {},
+          {OBFSTR("start"), OBFSTR("store"), OBFSTR("stop"), OBFSTR("get"), OBFSTR("results")}},
+         {OBFSTR("bytes"), OBFSTR("string"),
+          OBFSTR("Capture bytes for operation='store' as hex bytes, hex string, or text"), false},
+         {OBFSTR("data"), OBFSTR("string"),
+          OBFSTR("Alias for bytes when operation='store'"), false},
+         {OBFSTR("hex"), OBFSTR("string"),
+          OBFSTR("Alias for bytes when operation='store'"), false},
+         {OBFSTR("timestamp"), OBFSTR("number"),
+          OBFSTR("Capture timestamp for operation='store' (defaults to GetTickCount64)"), false},
+         {OBFSTR("thread_id"), OBFSTR("number"),
+          OBFSTR("Capture thread id for operation='store' (defaults to current thread)"), false},
          {OBFSTR("tid"), OBFSTR("number"),
           OBFSTR("Thread ID for breakpoint (default: 0 = first thread)"), false},
          {OBFSTR("bp_index"), OBFSTR("number"),

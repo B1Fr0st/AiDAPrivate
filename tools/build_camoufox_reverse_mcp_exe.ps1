@@ -438,8 +438,8 @@ function Invoke-FrozenMcpSmoke {
     $livePsi.RedirectStandardOutput = $true
     $livePsi.RedirectStandardError = $true
     $livePsi.Environment["AIDA_CAMOUFOX_LIVE_SMOKE"] = "1"
-    $livePsi.Environment["AIDA_CAMOUFOX_LIVE_SMOKE_TIMEOUT_MS"] = "70000"
-    $livePsi.Environment["AIDA_CAMOUFOX_TESTLAB_FAST_PROBE"] = "1"
+    $livePsi.Environment["AIDA_CAMOUFOX_LIVE_SMOKE_TIMEOUT_MS"] = "30000"
+    $livePsi.Environment["AIDA_CAMOUFOX_TESTLAB_FAST_PROBE"] = "0"
     $livePsi.Environment["AIDA_CAMOUFOX_EXECUTABLE"] = $browser
     $livePsi.Environment["AIDA_CAMOUFOX_DEBUG_LOG"] = $smokeLog
     $livePsi.Environment["AIDA_CAMOUFOX_DEBUG_STDERR"] = "0"
@@ -599,13 +599,13 @@ async def _run_live_smoke_async():
         executable = os.path.abspath(os.path.expandvars(os.path.expanduser(executable)))
     if not executable or not os.path.isfile(executable):
         raise FileNotFoundError(f"Camoufox executable is not available: {executable}")
-    timeout_ms = _int_env("AIDA_CAMOUFOX_LIVE_SMOKE_TIMEOUT_MS", 45000)
+    timeout_ms = _int_env("AIDA_CAMOUFOX_LIVE_SMOKE_TIMEOUT_MS", 30000)
     config = {
         "headless": False,
         "executable_path": executable,
         "ff_version": _int_env("AIDA_CAMOUFOX_FF_VERSION", 135),
         "launch_timeout_ms": timeout_ms,
-        "aida_testlab_fast_probe": True,
+        "aida_testlab_fast_probe": False,
         "block_webrtc": True,
         "window_width": 960,
         "window_height": 700,
@@ -622,6 +622,23 @@ async def _run_live_smoke_async():
         launch = await browser_manager.launch(config)
         if launch.get("status") not in ("launched", "already_running"):
             raise RuntimeError(f"launch_status={launch.get('status')} payload={launch}")
+        diagnostics = launch.get("diagnostics") if isinstance(launch, dict) else {}
+        if not isinstance(diagnostics, dict):
+            diagnostics = {}
+        browser_ready_ms = int(diagnostics.get("browser_ready_ms") or launch.get("browser_ready_ms") or 0)
+        camoufox_launch_ms = int(diagnostics.get("camoufox_launch_ms") or launch.get("camoufox_launch_ms") or browser_ready_ms)
+        launch_elapsed_ms = int(diagnostics.get("elapsed_ms") or 0)
+        privacy = diagnostics.get("privacy") if isinstance(diagnostics.get("privacy"), dict) else {}
+        if camoufox_launch_ms <= 0 or camoufox_launch_ms > 15000:
+            raise RuntimeError(f"camoufox_launch_ms={camoufox_launch_ms} exceeds 15000")
+        if launch_elapsed_ms <= 0 or launch_elapsed_ms > timeout_ms:
+            raise RuntimeError(f"launch_elapsed_ms={launch_elapsed_ms} exceeds {timeout_ms}")
+        if not privacy.get("webrtc_blocked") or not privacy.get("ice_probe_ok") or privacy.get("ice_candidate_leak_detected"):
+            raise RuntimeError(f"webrtc privacy proof failed: {privacy}")
+        if privacy.get("ua_override") and not (
+            privacy.get("ua_ok") and privacy.get("app_version_ok") and privacy.get("platform_ok") and privacy.get("oscpu_ok")
+        ):
+            raise RuntimeError(f"ua privacy proof failed: {privacy}")
         page = await browser_manager.get_active_page()
         proof = await _await_no_cancel_wait(
             page.evaluate("() => ({title: document.title, href: location.href, webdriver: String(navigator.webdriver)})"),

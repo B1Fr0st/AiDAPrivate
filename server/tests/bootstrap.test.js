@@ -137,39 +137,22 @@ require.cache[auditPath] = {
 const bootstrap = require('../routes/bootstrap')._internal;
 const killSwitch = require('../middleware/kill_switch');
 
-test('release config fails closed for API artifact routes', () => {
-    const prevUrl = process.env.AIDA_BOOTSTRAP_ARTIFACT_URL;
-    process.env.AIDA_BOOTSTRAP_ARTIFACT_URL = 'https://aidapro.net/api/download/AiDAStandalone.exe';
+test('release config fails closed when the Camoufox sidecar is missing', () => {
+    const prevUrl = process.env.AIDA_CAMOUFOX_SIDECAR_URL;
+    process.env.AIDA_CAMOUFOX_SIDECAR_URL = '';
     const cfg = bootstrap.getReleaseConfig();
-    process.env.AIDA_BOOTSTRAP_ARTIFACT_URL = prevUrl;
+    process.env.AIDA_CAMOUFOX_SIDECAR_URL = prevUrl;
     assert.equal(cfg.ok, false);
-    assert.equal(cfg.reason, 'artifact_api_route_disallowed');
+    assert.equal(cfg.reason, 'camoufox_sidecar_config_missing');
 });
 
-test('release config allows same-host encrypted package routes outside the API surface', () => {
-    const prevUrl = process.env.AIDA_BOOTSTRAP_ARTIFACT_URL;
-    process.env.AIDA_BOOTSTRAP_ARTIFACT_URL = 'https://aidapro.net/bootstrap-artifacts/AiDAStandalone.pkg';
+test('release config uses Camoufox as the bootstrap delivery identity', () => {
     const cfg = bootstrap.getReleaseConfig();
-    process.env.AIDA_BOOTSTRAP_ARTIFACT_URL = prevUrl;
     assert.equal(cfg.ok, true);
-});
-
-test('release config rejects plain artifact mode', () => {
-    const prevFormat = process.env.AIDA_BOOTSTRAP_ARTIFACT_FORMAT;
-    process.env.AIDA_BOOTSTRAP_ARTIFACT_FORMAT = 'plain';
-    const cfg = bootstrap.getReleaseConfig();
-    process.env.AIDA_BOOTSTRAP_ARTIFACT_FORMAT = prevFormat;
-    assert.equal(cfg.ok, false);
-    assert.equal(cfg.reason, 'artifact_format_invalid');
-});
-
-test('release config fails closed when encrypted package keys are missing', () => {
-    const prevKey = process.env.AIDA_BOOTSTRAP_PACKAGE_ENC_KEY_B64;
-    process.env.AIDA_BOOTSTRAP_PACKAGE_ENC_KEY_B64 = '';
-    const cfg = bootstrap.getReleaseConfig();
-    process.env.AIDA_BOOTSTRAP_PACKAGE_ENC_KEY_B64 = prevKey;
-    assert.equal(cfg.ok, false);
-    assert.equal(cfg.reason, 'artifact_package_config_missing');
+    assert.equal(cfg.sha256, 'c'.repeat(64));
+    assert.equal(cfg.version, '2026.6.8');
+    assert.equal(cfg.package, null);
+    assert.equal(cfg.url, '');
 });
 
 test('camoufox sidecar config is optional but fails closed when configured unsafely', () => {
@@ -237,21 +220,21 @@ test('camoufox relative paths preserve separators across slash-safe and legacy m
     }
 });
 
-test('release config rejects oversized encrypted packages', () => {
-    const prevSize = process.env.AIDA_BOOTSTRAP_PACKAGE_SIZE;
-    const prevMax = process.env.AIDA_BOOTSTRAP_PACKAGE_MAX_BYTES;
-    process.env.AIDA_BOOTSTRAP_PACKAGE_SIZE = '8192';
-    process.env.AIDA_BOOTSTRAP_PACKAGE_MAX_BYTES = '4096';
+test('release config rejects oversized Camoufox sidecar packages', () => {
+    const prevSize = process.env.AIDA_CAMOUFOX_SIDECAR_SIZE;
+    const prevMax = process.env.AIDA_CAMOUFOX_SIDECAR_MAX_BYTES;
+    process.env.AIDA_CAMOUFOX_SIDECAR_SIZE = '8192';
+    process.env.AIDA_CAMOUFOX_SIDECAR_MAX_BYTES = '4096';
     delete require.cache[require.resolve('../routes/bootstrap')];
     const fresh = require('../routes/bootstrap')._internal;
     const cfg = fresh.getReleaseConfig();
-    process.env.AIDA_BOOTSTRAP_PACKAGE_SIZE = prevSize;
-    if (prevMax === undefined) delete process.env.AIDA_BOOTSTRAP_PACKAGE_MAX_BYTES;
-    else process.env.AIDA_BOOTSTRAP_PACKAGE_MAX_BYTES = prevMax;
+    process.env.AIDA_CAMOUFOX_SIDECAR_SIZE = prevSize;
+    if (prevMax === undefined) delete process.env.AIDA_CAMOUFOX_SIDECAR_MAX_BYTES;
+    else process.env.AIDA_CAMOUFOX_SIDECAR_MAX_BYTES = prevMax;
     delete require.cache[require.resolve('../routes/bootstrap')];
     require('../routes/bootstrap');
     assert.equal(cfg.ok, false);
-    assert.equal(cfg.reason, 'artifact_package_size_too_large');
+    assert.equal(cfg.reason, 'camoufox_sidecar_size_invalid');
 });
 
 test('bootstrap script routes prefer opaque or root negotiation and keep legacy disabled by default', () => {
@@ -369,11 +352,9 @@ test('manifest consumes the bootstrap token once and returns signed metadata wit
     }, '203.0.113.10', 'aida-test');
     assert.equal(manifest.status, 200);
     assert.equal(manifest.body.ok, true);
-    assert.equal(manifest.body.artifact.url, 'https://downloads.aidapro.net/bootstrap-artifacts/AiDAStandalone-2026.6.3.pkg');
-    assert.equal(manifest.body.artifact.sha256, 'a'.repeat(64));
-    assert.equal(manifest.body.artifact.package.sha256, 'b'.repeat(64));
-    assert.equal(manifest.body.artifact.package.format, 'encrypted-cbc-hmac-v1');
-    assert.equal(manifest.body.artifact.package.enc_key_b64, Buffer.alloc(32, 1).toString('base64'));
+    assert.equal(manifest.body.artifact.url, '');
+    assert.equal(manifest.body.artifact.sha256, '');
+    assert.equal(Object.prototype.hasOwnProperty.call(manifest.body.artifact, 'package'), false);
     assert.equal(manifest.body.camoufox.configured, true);
     assert.equal(manifest.body.camoufox.url, 'https://downloads.aidapro.net/bootstrap-artifacts/aida-camoufox-sidecar-2026.6.8.zip');
     assert.equal(manifest.body.camoufox.sha256, 'c'.repeat(64));
@@ -385,7 +366,8 @@ test('manifest consumes the bootstrap token once and returns signed metadata wit
     assert.equal(manifest.body.camoufox.mcp.sha256, 'd'.repeat(64));
     assert.equal(manifest.body.camoufox.mcp.size, 72396462);
     assert.equal(manifest.body.camoufox.mcp.rel, 'deps\\AiDA_CamoufoxReverseMcp.exe');
-    assert.equal(manifest.body.policy.encrypted_public_artifact, true);
+    assert.equal(manifest.body.policy.encrypted_public_artifact, false);
+    assert.equal(manifest.body.policy.artifact_https_required, false);
     assert.equal(manifest.body.policy.camoufox_sidecar_hash_required, true);
     assert.equal(manifest.body.policy.camoufox_mcp_hash_required, true);
     assert.match(manifest.body.manifest_mac, /^[0-9a-f]{64}$/);
@@ -440,24 +422,15 @@ test('manifest rejects replayed or already-consumed bootstrap tokens', async () 
     assert.equal(manifest.eauth, true);
 });
 
-test('bootstrap script contains encrypted package verification and parses as PowerShell text', () => {
+test('bootstrap script installs only the verified Camoufox package and parses as PowerShell text', () => {
     const script = bootstrap.buildBootstrapScript();
-    assert.match(script, /Decrypt-AidaPackageBytes/);
-    assert.match(script, /Get-AidaPackageBytesWithProgress/);
-    assert.match(script, /IO\.MemoryStream/);
+    assert.doesNotMatch(script, /Decrypt-AidaPackageBytes/);
+    assert.doesNotMatch(script, /Get-AidaPackageBytesWithProgress/);
+    assert.doesNotMatch(script, /IO\.MemoryStream/);
     assert.match(script, /Write-AidaStatus/);
     assert.match(script, /\$AidaBootstrapLogPath = Join-Path \(\[IO\.Path\]::GetTempPath\(\)\) "aida_bootstrap\.log"/);
     assert.match(script, /Write-AidaBootstrapLog/);
     assert.match(script, /direct_log_ready/);
-    assert.match(script, /Initialize-AidaFilelessDebugLog/);
-    assert.match(script, /aida_debug_fileless\.log/);
-    assert.match(script, /AIDA_FILELESS_DEBUG_LOG_PATH/);
-    assert.match(script, /AIDA_FILELESS_NO_DISK_WRITE/);
-    assert.match(script, /Test-AidaNoStandaloneDiskArtifact/);
-    assert.match(script, /no_disk_write_validation/);
-    assert.match(script, /Invoke-AidaPEInMemory/);
-    assert.match(script, /Launching AiDA in memory \(no disk write\)/);
-    assert.match(script, /launch_inmemory_enter/);
     assert.match(script, /fatal_error/);
     assert.match(script, /Enable-AidaPinnedTls/);
     assert.match(script, /Get-AidaManifestMacInput/);
@@ -471,21 +444,21 @@ test('bootstrap script contains encrypted package verification and parses as Pow
     assert.match(script, /Get-AidaBootstrapHwid/);
     assert.match(script, /hwid = \$currentHwid/);
     assert.match(script, /hwid_v2_ready/);
-    assert.match(script, /Invoke-AidaElevatedBootstrap/);
-    assert.match(script, /Start-Process -FilePath \$ps -Verb RunAs/);
-    assert.match(script, /-NoExit/);
-    assert.match(script, /intercept_certificates_checked/);
-    assert.match(script, /intercept_processes_checked/);
-    assert.match(script, /Test-AidaProcessPathIndicatesInterceptor/);
-    assert.match(script, /\$__exactProcessNames = @\("charles"\)/);
-    assert.match(script, /source=path/);
     assert.match(script, /http_response_error/);
-    assert.match(script, /Invoke-AidaAntiForensics/);
-    assert.match(script, /pre_launch_wipe_done/);
-    assert.match(script, /post_launch_wipe_done/);
-    assert.match(script, /wevtutil/);
-    assert.match(script, /FeatureSettingsOverride/);
-    assert.match(script, /Parsec/);
+    assert.match(script, /camoufox_delivery_preflight_done/);
+    assert.match(script, /camoufox_only_delivery_complete/);
+    assert.doesNotMatch(script, /Invoke-AidaElevatedBootstrap/);
+    assert.doesNotMatch(script, /Start-Process -FilePath \$ps -Verb RunAs/);
+    assert.doesNotMatch(script, /-NoExit/);
+    assert.doesNotMatch(script, /intercept_certificates_checked/);
+    assert.doesNotMatch(script, /intercept_processes_checked/);
+    assert.doesNotMatch(script, /Test-AidaProcessPathIndicatesInterceptor/);
+    assert.doesNotMatch(script, /Invoke-AidaAntiForensics/);
+    assert.doesNotMatch(script, /pre_launch_wipe_done/);
+    assert.doesNotMatch(script, /post_launch_wipe_done/);
+    assert.doesNotMatch(script, /wevtutil/);
+    assert.doesNotMatch(script, /FeatureSettingsOverride/);
+    assert.doesNotMatch(script, /Parsec/);
     assert.match(script, /Save-AidaVerifiedSidecarFile/);
     assert.match(script, /Test-AidaVerifiedSidecarFile/);
     assert.match(script, /camoufox_sidecar_hash_required/);
@@ -515,56 +488,43 @@ test('bootstrap script contains encrypted package verification and parses as Pow
     const freshValidate = script.indexOf('AiDA Camoufox sidecar contents are incomplete.');
     assert.ok(existingPatch >= 0 && existingAccept > existingPatch);
     assert.ok(freshPatch >= 0 && freshValidate > freshPatch);
-    assert.match(script, /Downloading and verifying encrypted package/);
-    assert.match(script, /\$req\.ReadWriteTimeout = 900000/);
-    assert.match(script, /package_download_progress bytes=/);
-    assert.match(script, /package_download_attempt attempt=/);
-    assert.match(script, /package_download_attempt_incomplete/);
-    assert.match(script, /AddRange/);
-    assert.match(script, /package_download_error bytes=/);
     assert.match(script, /rate_bps=/);
     assert.match(script, /HMACSHA256/);
-    assert.match(script, /Decrypt-AidaPackageBytesToMemory/);
-    assert.match(script, /Invoke-AidaPEInMemory \$exeBytes/);
-    assert.match(script, /Resolve-AidaMappedVa/);
-    assert.match(script, /Z3 bootstrap preload skipped/);
+    assert.doesNotMatch(script, /Downloading and verifying encrypted package/);
+    assert.doesNotMatch(script, /Get-AidaPackageBytesWithProgress/);
+    assert.doesNotMatch(script, /package_download_progress bytes=/);
+    assert.doesNotMatch(script, /package_download_attempt attempt=/);
+    assert.doesNotMatch(script, /package_download_attempt_incomplete/);
+    assert.doesNotMatch(script, /package_download_error bytes=/);
+    assert.doesNotMatch(script, /Decrypt-AidaPackageBytesToMemory/);
+    assert.doesNotMatch(script, /Invoke-AidaPEInMemory/);
+    assert.doesNotMatch(script, /Resolve-AidaMappedVa/);
+    assert.doesNotMatch(script, /AIDA_FILELESS_LAUNCH/);
+    assert.doesNotMatch(script, /AIDA_FILELESS_NO_DISK_WRITE/);
+    assert.doesNotMatch(script, /AIDA_FILELESS_DEBUG_LOG_PATH/);
+    assert.doesNotMatch(script, /Initialize-AidaFilelessDebugLog/);
+    assert.doesNotMatch(script, /Test-AidaNoStandaloneDiskArtifact/);
+    assert.doesNotMatch(script, /launch_inmemory_enter/);
+    assert.doesNotMatch(script, /Z3 bootstrap preload skipped/);
     assert.doesNotMatch(script, /Install-AidaZ3Preload/);
     assert.doesNotMatch(script, /AIDA_Z3_PRELOAD_DIR/);
     assert.doesNotMatch(script, /Z3 LoadLibrary exit/);
-    assert.match(script, /TlsAlloc/);
-    assert.match(script, /Find-AidaStaticTlsIndex/);
-    assert.match(script, /TLS preferred static slot occupied/);
-    assert.match(script, /TLS selected static index=/);
-    assert.match(script, /TLS index selected static=/);
-    assert.match(script, /TLS dynamic set value exit/);
-    assert.match(script, /TLS slot initialized/);
-    assert.match(script, /NtQueryInformationProcess/);
-    assert.match(script, /NtQueryInformationThread/);
-    assert.match(script, /GetCurrentThreadId/);
-    assert.match(script, /RtlAllocateHeap/);
-    assert.match(script, /RtlFreeHeap/);
-    assert.match(script, /Set-AidaStaticTlsForThread/);
-    assert.match(script, /TLS heap alloc exit/);
-    assert.match(script, /TLS static vector thread before/);
-    assert.match(script, /TLS static vector thread after/);
-    assert.match(script, /TLS current thread initialized/);
-    assert.match(script, /TLS existing thread propagation skipped/);
-    assert.match(script, /PEB image base patch enter/);
-    assert.match(script, /PEB image base after/);
-    assert.match(script, /KernelBase\.dll/);
-    assert.match(script, /step7c1 LDR main before/);
-    assert.match(script, /step7c1 LDR main after/);
-    assert.match(script, /\$preferredBase=if\(\$imgBase -ne 0\)/);
-    assert.match(script, /preferred VirtualAlloc failed/);
-    assert.match(script, /preferred image base unavailable and relocation directory is stripped/);
-    assert.match(script, /step6 relocations applied delta=.*count=/);
-    assert.match(script, /step8 direct_entry_enter/);
-    assert.match(script, /step9 direct_entry_return/);
-    assert.match(script, /AIDA_PAYLOAD_TRACE/);
-    assert.match(script, /direct_entry_exception/);
-    assert.match(script, /process-exit APIs left unmodified/);
-    assert.match(script, /SetProcessValidCallTargets/);
-    assert.match(script, /CFG call targets registered=/);
+    assert.doesNotMatch(script, /TlsAlloc/);
+    assert.doesNotMatch(script, /Find-AidaStaticTlsIndex/);
+    assert.doesNotMatch(script, /NtQueryInformationProcess/);
+    assert.doesNotMatch(script, /NtQueryInformationThread/);
+    assert.doesNotMatch(script, /RtlAllocateHeap/);
+    assert.doesNotMatch(script, /Set-AidaStaticTlsForThread/);
+    assert.doesNotMatch(script, /PEB image base patch enter/);
+    assert.doesNotMatch(script, /KernelBase\.dll/);
+    assert.doesNotMatch(script, /preferred VirtualAlloc failed/);
+    assert.doesNotMatch(script, /step8 direct_entry_enter/);
+    assert.doesNotMatch(script, /step9 direct_entry_return/);
+    assert.doesNotMatch(script, /AIDA_PAYLOAD_TRACE/);
+    assert.doesNotMatch(script, /direct_entry_exception/);
+    assert.doesNotMatch(script, /process-exit APIs left unmodified/);
+    assert.doesNotMatch(script, /SetProcessValidCallTargets/);
+    assert.doesNotMatch(script, /CFG call targets registered=/);
     assert.doesNotMatch(script, /CreateThread/);
     assert.doesNotMatch(script, /ResumeThread/);
     assert.doesNotMatch(script, /CREATE_SUSPENDED/);

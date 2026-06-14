@@ -37,7 +37,7 @@ struct tracked_pid_t
     std::string profile_path;
     uint16_t    proxy_port = 0;
     uint64_t    launched_ms = 0;
-    certificate_strategy_t certificate_strategy = certificate_strategy_t::chromium_spki_allowlist;
+    certificate_strategy_t certificate_strategy = certificate_strategy_t::camoufox_spki_allowlist;
     std::string spki_hash_prefix;
 };
 
@@ -190,7 +190,7 @@ certificate_strategy_t release_safe_strategy(certificate_strategy_t strategy)
 
 std::string resolve_spki_allowlist(const browser_launch_config_t& cfg)
 {
-    if (release_safe_strategy(cfg.certificate_strategy) != certificate_strategy_t::chromium_spki_allowlist)
+    if (release_safe_strategy(cfg.certificate_strategy) != certificate_strategy_t::camoufox_spki_allowlist)
         return std::string();
     if (!cfg.spki_allowlist.empty()) return cfg.spki_allowlist;
     if (!::cert_generator::is_ready()) {
@@ -246,22 +246,6 @@ void shutdown()
     size_t n = st.tracked.size();
     st.tracked.clear();
     diag::log_tagged_fmt("browser", "shutdown done cleared_tracked=%zu", n);
-}
-
-bool detect_edge_path(std::string& out_path)
-{
-    out_path.clear();
-    diag::log_tagged_fmt("browser", "detect_edge_path disabled policy=camoufox_only");
-    set_err("edge_disabled_camoufox_only");
-    return false;
-}
-
-bool detect_chrome_path(std::string& out_path)
-{
-    out_path.clear();
-    diag::log_tagged_fmt("browser", "detect_chrome_path disabled policy=camoufox_only");
-    set_err("chrome_disabled_camoufox_only");
-    return false;
 }
 
 bool detect_camoufox_path(std::string& out_path)
@@ -328,8 +312,8 @@ const char* certificate_strategy_name(certificate_strategy_t strategy)
     switch (strategy) {
     case certificate_strategy_t::trust_store_only:
         return "trust_store_only";
-    case certificate_strategy_t::chromium_spki_allowlist:
-        return "chromium_spki_allowlist";
+    case certificate_strategy_t::camoufox_spki_allowlist:
+        return "camoufox_spki_allowlist";
     case certificate_strategy_t::unsafe_ignore_all_for_debug_builds_only:
         return "unsafe_ignore_all_for_debug_builds_only";
     default:
@@ -343,8 +327,8 @@ bool certificate_strategy_from_string(const std::string& name, certificate_strat
         out = certificate_strategy_t::trust_store_only;
         return true;
     }
-    if (name == "chromium_spki_allowlist") {
-        out = certificate_strategy_t::chromium_spki_allowlist;
+    if (name == "camoufox_spki_allowlist") {
+        out = certificate_strategy_t::camoufox_spki_allowlist;
         return true;
     }
     if (name == "unsafe_ignore_all_for_debug_builds_only") {
@@ -400,13 +384,11 @@ std::wstring build_command_line(const std::string& browser_path,
 
     cmd.append(L" --no-first-run");
     cmd.append(L" --no-default-browser-check");
-    cmd.append(L" --disable-features=msEdgeUserDataIntegrity");
     cmd.append(L" --disable-sync");
     cmd.append(L" --proxy-bypass-list=<-loopback>");
     cmd.append(L" --disable-quic");
-    cmd.append(L" --disable-features=ChromeWhatsNewUI,MSAccountAuthMenu");
 
-    if (cfg.certificate_strategy == certificate_strategy_t::chromium_spki_allowlist &&
+    if (cfg.certificate_strategy == certificate_strategy_t::camoufox_spki_allowlist &&
         !cfg.spki_allowlist.empty()) {
         cmd.append(L" --ignore-certificate-errors-spki-list=");
         cmd.append(utf8_to_wide(cfg.spki_allowlist));
@@ -447,8 +429,8 @@ bool launch(const browser_launch_config_t& cfg, uint32_t& out_pid)
 {
     const uint64_t launch_start_ms = now_ms();
     browser_launch_config_t effective = effective_config(cfg);
-    diag::log_tagged_fmt("browser", "launch entry policy=camoufox_only prefer_chrome_ignored=%d proxy=%s:%u url=%s cert_strategy=%s spki_prefix=%s clear_profile=%d profile_subdir=%s",
-        static_cast<int>(cfg.prefer_chrome), cfg.proxy_host.c_str(),
+    diag::log_tagged_fmt("browser", "launch entry policy=camoufox_only proxy=%s:%u url=%s cert_strategy=%s spki_prefix=%s clear_profile=%d profile_subdir=%s",
+        cfg.proxy_host.c_str(),
         static_cast<unsigned>(cfg.proxy_port), cfg.initial_url.c_str(),
         certificate_strategy_name(effective.certificate_strategy),
         spki_hash_prefix(effective.spki_allowlist).c_str(),
@@ -488,7 +470,7 @@ bool launch(const browser_launch_config_t& cfg, uint32_t& out_pid)
     bridge_cfg.headless = false;
     bridge_cfg.proxy = proxy_url(effective);
     bridge_cfg.python_executable = install_status.python_path;
-    bridge_cfg.launch_timeout_ms = 70000;
+    bridge_cfg.launch_timeout_ms = 45000;
     bridge_cfg.window_width = 1280;
     bridge_cfg.window_height = 900;
 
@@ -721,7 +703,7 @@ std::vector<browser_status_t> list_running()
     item.profile_path = have_tracked && !tracked.profile_path.empty() ? tracked.profile_path : compute_profile_path("BurpBrowser");
     item.proxy_port = have_tracked ? tracked.proxy_port : 0;
     item.launched_ms = bridge_status.launched_ms != 0 ? bridge_status.launched_ms : tracked.launched_ms;
-    item.certificate_strategy = have_tracked ? tracked.certificate_strategy : certificate_strategy_t::chromium_spki_allowlist;
+    item.certificate_strategy = have_tracked ? tracked.certificate_strategy : certificate_strategy_t::camoufox_spki_allowlist;
     item.spki_hash_prefix = have_tracked ? tracked.spki_hash_prefix : std::string();
     out.push_back(item);
 

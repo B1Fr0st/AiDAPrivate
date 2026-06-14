@@ -36,6 +36,7 @@
 #include "chat_render.hpp"
 #include "standalone_driver.hpp"
 #include "mcp_client.hpp"
+#include "../core/auth/auth_browser_launch.hpp"
 #include "sandbox.hpp"
 #include "workspace_search.hpp"
 #include "terminal_view.hpp"
@@ -2815,7 +2816,7 @@ void helpers::render_title()
 				ImVec2((disc_a.x + disc_b.x) * 0.5f - dts.x * 0.5f, (disc_a.y + disc_b.y) * 0.5f - dts.y * 0.5f),
 				aida::ui::with_alpha(th.text_primary, la), "Get a key");
 			if (disc_clk) {
-				ShellExecuteA(nullptr, "open", "https://discord.gg/aida", nullptr, nullptr, SW_SHOWNORMAL);
+				aida::auth::open_url_external("https://discord.gg/aida");
 			}
 		}
 
@@ -8000,14 +8001,17 @@ void helpers::render_title()
 
 	g_render_section = "bottom_panel";
 	if (bottom_h > 5.f) {
+		g_render_section = "bottom_panel_layout";
 		float right_gap_bp = (right_w > 1.f) ? (right_w + gap) : 0.f;
 		float bp_x = pad;
 		float bp_y = content_top + total_h + gap;
 		float bp_w = ww - pad * 2.f - right_gap_bp;
 
 		ImGui::SetCursorPos(ImVec2(bp_x, bp_y));
+		g_render_section = "bottom_panel_begin_child";
 		begin_child("##bottom_panel", ImVec2(bp_x, bp_y), ImVec2(bp_w, bottom_h), a);
 		{
+			g_render_section = "bottom_panel_tabs";
 			ImDrawList* bdl = ImGui::GetWindowDrawList();
 			ImVec2 bwp = ImGui::GetWindowPos();
 			float bfw = ImGui::GetWindowWidth();
@@ -8078,6 +8082,7 @@ void helpers::render_title()
 
 
 			{
+				g_render_section = "bottom_panel_actions";
 				const char* clr = "Clear";
 				ImVec2 cts = ImGui::CalcTextSize(clr);
 				ImVec2 cmin(bwp.x + bfw - cts.x - 16.f, bwp.y + 4.f);
@@ -8133,8 +8138,9 @@ void helpers::render_title()
 								ImGui::SetClipboardText(all_text.c_str());
 						}
 					} else {
-						int tab_idx_cpy = static_cast<int>(globals::ui::active_bottom_tab);
-						auto& log_lines_cpy = output_log::lines[tab_idx_cpy];
+						int tab_idx_cpy = output_log::tab_index(globals::ui::active_bottom_tab);
+						std::deque<std::string> log_lines_cpy;
+						output_log::snapshot_all(static_cast<bottom_tab_t>(tab_idx_cpy), log_lines_cpy);
 						std::string all_text;
 						all_text.reserve(log_lines_cpy.size() * 80);
 						for (const auto& ln : log_lines_cpy) {
@@ -8155,9 +8161,11 @@ void helpers::render_title()
 			float log_y = btab_h + 4.f;
 			ImGui::SetCursorPos(ImVec2(0.f, log_y));
 			ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
+			g_render_section = "bottom_panel_scroll_begin";
 			ImGui::BeginChild("##bottom_scroll", ImVec2(bfw, bfh - log_y), false, ImGuiWindowFlags_NoBackground);
 			{
 			if (globals::ui::active_bottom_tab == bottom_tab_t::terminal) {
+				g_render_section = "bottom_panel_terminal";
 
 				static bool s_term_select_all = false;
 
@@ -8255,51 +8263,61 @@ void helpers::render_title()
 				}
 			} else {
 
-				int tab_idx = static_cast<int>(globals::ui::active_bottom_tab);
-				auto& log_lines = output_log::lines[tab_idx];
+				int tab_idx = output_log::tab_index(globals::ui::active_bottom_tab);
+				static uint64_t s_log_last_version[static_cast<int>(bottom_tab_t::COUNT)] = { 0, 0, 0, 0, 0 };
+				static std::vector<std::string> s_log_snapshot[static_cast<int>(bottom_tab_t::COUNT)];
+				static size_t s_log_total_lines[static_cast<int>(bottom_tab_t::COUNT)] = { 0, 0, 0, 0, 0 };
+				static ULONGLONG s_log_last_slow_report[static_cast<int>(bottom_tab_t::COUNT)] = { 0, 0, 0, 0, 0 };
 
-				static std::string s_log_joined[static_cast<int>(bottom_tab_t::COUNT)];
-				static size_t s_log_last_size[static_cast<int>(bottom_tab_t::COUNT)] = { 0, 0, 0, 0, 0 };
-				static size_t s_log_last_back_hash[static_cast<int>(bottom_tab_t::COUNT)] = { 0, 0, 0, 0, 0 };
-
-				size_t cur_size = log_lines.size();
-				size_t back_hash = log_lines.empty() ? 0u : std::hash<std::string>{}(log_lines.back());
-				if (cur_size != s_log_last_size[tab_idx] || back_hash != s_log_last_back_hash[tab_idx]) {
-					s_log_joined[tab_idx].clear();
-					s_log_joined[tab_idx].reserve(cur_size * 80);
-					for (const auto& ln : log_lines) {
-						s_log_joined[tab_idx] += ln;
-						s_log_joined[tab_idx] += '\n';
-					}
-					s_log_last_size[tab_idx] = cur_size;
-					s_log_last_back_hash[tab_idx] = back_hash;
+				ULONGLONG log_render_start = GetTickCount64();
+				g_render_section = "bottom_panel_log_snapshot";
+				uint64_t cur_version = output_log::current_version(static_cast<bottom_tab_t>(tab_idx));
+				if (cur_version != s_log_last_version[tab_idx]) {
+					size_t cur_total = 0;
+					output_log::snapshot_tail(static_cast<bottom_tab_t>(tab_idx), output_log::MAX_RENDER_LINES,
+						s_log_snapshot[tab_idx], &cur_total, &cur_version);
+					s_log_last_version[tab_idx] = cur_version;
+					s_log_total_lines[tab_idx] = cur_total;
 				}
 
 				ImVec2 mt_size(bfw - 4.f, bfh - log_y - 4.f);
 				ImGui::PushFont(aida::ui::fonts::code());
-				ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(0, 0, 0, 0));
-				ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, IM_COL32(0, 0, 0, 0));
-				ImGui::PushStyleColor(ImGuiCol_FrameBgActive, IM_COL32(0, 0, 0, 0));
-				ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(0, 0, 0, 0));
 				ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(th_lp.text_secondary, a));
-				ImGui::PushStyleColor(ImGuiCol_TextSelectedBg, aida::ui::with_alpha(th_lp.selection_strong, a * 0.75f));
-				ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.f);
-				ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.f, 4.f));
-
-				std::string& buf = s_log_joined[tab_idx];
-				size_t cap = buf.size() + 1;
-				ImGui::InputTextMultiline("##log_view", const_cast<char*>(buf.c_str()),
-					cap, mt_size,
-					ImGuiInputTextFlags_ReadOnly | ImGuiInputTextFlags_NoUndoRedo);
-
-				ImGui::PopStyleVar(2);
-				ImGui::PopStyleColor(6);
+				g_render_section = "bottom_panel_log_render";
+				const auto& view_lines = s_log_snapshot[tab_idx];
+				float line_h = ImGui::GetTextLineHeightWithSpacing();
+				bool near_bottom = ImGui::GetScrollY() >= (ImGui::GetScrollMaxY() - line_h * 2.f);
+				ImGuiListClipper clipper;
+				clipper.Begin(static_cast<int>(view_lines.size()), line_h);
+				while (clipper.Step()) {
+					for (int li = clipper.DisplayStart; li < clipper.DisplayEnd; ++li) {
+						const std::string& line = view_lines[static_cast<size_t>(li)];
+						ImGui::TextUnformatted(line.c_str(), line.c_str() + line.size());
+					}
+				}
+				if (output_log::is_auto_scroll(static_cast<bottom_tab_t>(tab_idx)) && near_bottom)
+					ImGui::SetScrollHereY(1.0f);
+				ULONGLONG log_render_elapsed = GetTickCount64() - log_render_start;
+				if (log_render_elapsed > 50 && GetTickCount64() - s_log_last_slow_report[tab_idx] > 2000) {
+					s_log_last_slow_report[tab_idx] = GetTickCount64();
+					diag::log_tagged_fmt("ui",
+						"BOTTOM_LOG_SLOW tab=%d elapsed_ms=%llu total=%zu rendered=%zu version=%llu w=%.1f h=%.1f",
+						tab_idx,
+						static_cast<unsigned long long>(log_render_elapsed),
+						s_log_total_lines[tab_idx],
+						view_lines.size(),
+						static_cast<unsigned long long>(s_log_last_version[tab_idx]),
+						mt_size.x,
+						mt_size.y);
+				}
+				ImGui::PopStyleColor();
 				ImGui::PopFont();
 			}
 			}
 			ImGui::EndChild();
 			ImGui::PopStyleVar();
 		}
+		g_render_section = "bottom_panel_end_child";
 		end_child();
 	}
 

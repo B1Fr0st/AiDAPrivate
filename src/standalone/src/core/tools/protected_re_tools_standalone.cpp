@@ -122,6 +122,12 @@ void register_protected_re_tools(mcp_standalone::server_t& srv)
         "Locate DRIVER_OBJECT MajorFunction assignments in a selected kernel driver's DriverEntry.",
         {{"driver_name", "string", "Kernel driver name or path filter", false},
          {"module_base", "string", "Kernel module base", false},
+         {"auto_select_wdm_driver", "boolean", "Select a loaded non-ntoskrnl WDM driver with accepted MajorFunction assignments", false},
+         {"max_auto_modules", "number", "Maximum loaded kernel modules to scan during auto-selection", false},
+         {"timeout_ms", "number", "Internal dispatch scan budget in milliseconds", false},
+         {"max_candidates", "number", "Maximum MajorFunction assignment candidates to inspect", false},
+         {"max_entry_bytes", "number", "Maximum DriverEntry bytes to read and disassemble", false},
+         {"max_entry_instructions", "number", "Maximum DriverEntry instructions to decode", false},
          {"process_id", "number", "Reserved for compatibility", false}},
         protected_re::drv_find_dispatch_table, true});
 

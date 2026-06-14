@@ -29,6 +29,7 @@ if ($publishCamoufoxMcpPatch -and $SkipCamoufoxSidecar.IsPresent) {
 if (-not $publishCamoufoxMcpPatch) {
     $SkipCamoufoxSidecar = [switch]::Present
 }
+$SkipStandalone = [switch]::Present
 
 $RepoRoot = $PSScriptRoot
 $Server = "ruarr@23.88.62.199"
@@ -37,6 +38,7 @@ $RemoteRoot = "/home/ruarr/aida-server"
 $RemoteArcPath = "$RemoteRoot/arc/aida_core.bin"
 $RemoteArcShaPath = "$RemoteRoot/arc/aida_core.sha256"
 $RemoteArtifactDir = "$RemoteRoot/bootstrap_artifacts"
+$RemotePrivateStandalonePath = "$RemoteRoot/private/AiDAStandalone.base.exe"
 $SshOptions = @("-o", "StrictHostKeyChecking=yes", "-o", "IdentitiesOnly=yes", "-o", "PasswordAuthentication=no", "-i", $SshKey)
 
 function Write-Step([string]$Message) {
@@ -269,7 +271,7 @@ stat -c 'arc_size=%s' '/home/ruarr/aida-server/arc/aida_core.bin'
 
 function Publish-StandalonePackage([string]$StandalonePath, [string]$DeployId, [hashtable]$RemoteEnv) {
     if ($SkipStandalone) {
-        Write-Warn "Skipping standalone package publish because -SkipStandalone was specified"
+        Write-Warn "Skipping standalone package publish because bootstrap delivery is Camoufox-only"
         return [pscustomobject]@{ Changed = $false; Url = ""; PackageName = ""; PlainSha = ""; PackageSha = ""; PlainSize = 0; PackageSize = 0; Version = "" }
     }
     if (-not (Test-Path -LiteralPath $StandalonePath -PathType Leaf)) {
@@ -346,6 +348,80 @@ exit $rc
         PackageSize = [int64]$metadata.package_size
         Version = $version
     }
+}
+
+function Publish-StandalonePrivateBase([string]$StandalonePath, [string]$DeployId, [hashtable]$RemoteEnv) {
+    if (-not (Test-Path -LiteralPath $StandalonePath -PathType Leaf)) {
+        Stop-Deploy "AiDAStandalone.exe not found: $StandalonePath"
+    }
+    $plainSha = Get-FileSha256Lower $StandalonePath
+    $plainSize = (Get-Item -LiteralPath $StandalonePath).Length
+    $currentSha = if ($RemoteEnv.ContainsKey("AIDA_STANDALONE_BASE_SHA256")) { ([string]$RemoteEnv["AIDA_STANDALONE_BASE_SHA256"]).ToLowerInvariant() } else { "" }
+    $currentPath = if ($RemoteEnv.ContainsKey("AIDA_STANDALONE_BASE_EXE")) { [string]$RemoteEnv["AIDA_STANDALONE_BASE_EXE"] } else { "" }
+    $remoteHash = ""
+    if ($currentPath -eq $RemotePrivateStandalonePath) {
+        $pathLit = ConvertTo-RemoteShellLiteral $RemotePrivateStandalonePath
+        $probe = Invoke-RemoteSoft "if [ -f $pathLit ]; then sha256sum $pathLit | awk '{print `$1}'; else echo missing; fi"
+        if ($probe.Output) { $remoteHash = ([string]($probe.Output | Select-Object -First 1)).Trim().ToLowerInvariant() }
+    }
+    if (-not $Force -and $currentSha -eq $plainSha -and $remoteHash -eq $plainSha) {
+        Write-Ok "Private standalone base unchanged: $plainSha"
+        return [pscustomobject]@{ Changed = $false; Sha = $plainSha; Size = $plainSize; Version = "" }
+    }
+    Write-Step "Publishing private standalone base"
+    if ($PlanOnly) {
+        Write-Ok "Plan only: would upload private base sha256=$plainSha size=$plainSize to $RemotePrivateStandalonePath"
+        return [pscustomobject]@{ Changed = $true; Sha = $plainSha; Size = $plainSize; Version = $DeployId }
+    }
+    $remoteTmp = "/tmp/AiDAStandalone_private_base_$DeployId.exe"
+    Copy-ToRemote $StandalonePath $remoteTmp
+    $script = @'
+set -euo pipefail
+cd /home/ruarr/aida-server
+install -d -m 700 private
+install -m 600 '__REMOTE_TMP__' '__REMOTE_BASE__'
+rm -f '__REMOTE_TMP__'
+actual=$(sha256sum '__REMOTE_BASE__' | awk '{print $1}')
+if [ "$actual" != '__SHA__' ]; then
+  echo "private standalone base sha mismatch: $actual" >&2
+  exit 1
+fi
+cp .env ".env.bak.private-standalone.__VERSION__"
+AIDA_STANDALONE_BASE_EXE_NEW='__REMOTE_BASE__' AIDA_STANDALONE_BASE_SHA256_NEW='__SHA__' AIDA_STANDALONE_BASE_SIZE_NEW='__SIZE__' AIDA_STANDALONE_BASE_VERSION_NEW='__VERSION__' node <<'NODE'
+const fs = require('fs');
+const p = '.env';
+let s = fs.readFileSync(p, 'utf8');
+const updates = {
+  AIDA_STANDALONE_BASE_EXE: process.env.AIDA_STANDALONE_BASE_EXE_NEW,
+  AIDA_STANDALONE_BASE_SHA256: process.env.AIDA_STANDALONE_BASE_SHA256_NEW,
+  AIDA_STANDALONE_BASE_SIZE: process.env.AIDA_STANDALONE_BASE_SIZE_NEW,
+  AIDA_STANDALONE_BASE_VERSION: process.env.AIDA_STANDALONE_BASE_VERSION_NEW
+};
+for (const pair of Object.entries(updates)) {
+  const key = pair[0];
+  const value = pair[1];
+  const line = key + '=' + value;
+  const re = new RegExp('^' + key + '=.*$', 'm');
+  s = re.test(s) ? s.replace(re, line) : s.replace(/\s*$/, '') + '\n' + line + '\n';
+}
+fs.writeFileSync(p, s, { mode: 0o600 });
+NODE
+stat -c 'private_standalone_size=%s' '__REMOTE_BASE__'
+'@
+    $script = $script.Replace("__REMOTE_TMP__", $remoteTmp).
+        Replace("__REMOTE_BASE__", $RemotePrivateStandalonePath).
+        Replace("__SHA__", $plainSha).
+        Replace("__SIZE__", [string]$plainSize).
+        Replace("__VERSION__", $DeployId)
+    $output = Invoke-RemoteBash $script
+    foreach ($line in $output) {
+        $text = [string]$line
+        if ($text -match "^private_standalone_size=") {
+            Write-Host "  $text"
+        }
+    }
+    Write-Ok "Private standalone base published sha256=$plainSha"
+    return [pscustomobject]@{ Changed = $true; Sha = $plainSha; Size = $plainSize; Version = $DeployId }
 }
 
 function Get-CamoufoxSidecarInputs([string]$ReleaseDir) {
@@ -553,7 +629,7 @@ awk -F= '/^AIDA_CAMOUFOX_SIDECAR_EXE_REL=|^AIDA_CAMOUFOX_SIDECAR_PYTHON_REL=|^AI
 function Restart-And-Verify([bool]$ShouldRestart, [pscustomobject]$Package, [pscustomobject]$Sidecar) {
     Write-Step "Verifying server"
     if ($PlanOnly) {
-        Write-Ok "Plan only: would restart API if needed and verify health/package/sidecar/bootstrap"
+        Write-Ok "Plan only: would restart API if needed and verify health/Camoufox/bootstrap"
         return
     }
     $restart = if ($ShouldRestart) { "1" } else { "0" }
@@ -581,15 +657,6 @@ if ! echo "$health" | grep -q '"status":"ok"'; then
   pm2 logs aida-api --lines 80 --nostream || true
   exit 1
 fi
-pkg_url="__PACKAGE_URL__"
-if [ -z "$pkg_url" ]; then
-  pkg_url="${AIDA_BOOTSTRAP_ARTIFACT_URL:-}"
-fi
-if [ -n "$pkg_url" ]; then
-  pkg_code=$(curl -s -r 0-0 -o /dev/null -w '%{http_code}' "$pkg_url" || echo 000)
-  echo "package_http=$pkg_code url=$pkg_url"
-  case "$pkg_code" in 200|206) ;; *) exit 1 ;; esac
-fi
 sidecar_url="__SIDECAR_URL__"
 if [ -z "$sidecar_url" ]; then
   sidecar_url="${AIDA_CAMOUFOX_SIDECAR_URL:-}"
@@ -612,7 +679,7 @@ script_code=$(curl -s -H 'Accept: application/vnd.aida.bootstrap' -o /tmp/aida_b
 echo "bootstrap_script_http=$script_code"
 if [ "$script_code" != "200" ]; then exit 1; fi
 verify_path=/tmp/aida_bootstrap_verify_stage0.ps1
-if ! grep -q 'AIDA_FILELESS_LAUNCH' "$verify_path"; then
+if ! grep -q 'Install-AidaCamoufoxSidecar' "$verify_path"; then
   stage_url=$(sed -n "s/^\$u = '\([^']*\)'.*/\1/p" "$verify_path" | head -1)
   stage_hash=$(sed -n "s/^\$h = '\([^']*\)'.*/\1/p" "$verify_path" | head -1)
   if [ -n "$stage_url" ]; then
@@ -627,11 +694,15 @@ if ! grep -q 'AIDA_FILELESS_LAUNCH' "$verify_path"; then
     verify_path=/tmp/aida_bootstrap_verify_stage1.ps1
   fi
 fi
-grep -q 'AIDA_FILELESS_LAUNCH' "$verify_path"
 grep -q 'AIDA_CAMOUFOX_EXECUTABLE' "$verify_path"
 grep -q 'AIDA_CAMOUFOX_MCP_EXECUTABLE' "$verify_path"
 grep -q 'Install-AidaCamoufoxMcpPatch' "$verify_path"
 grep -q 'camoufox_mcp_hash_required' "$verify_path"
+grep -q 'camoufox_only_delivery_complete' "$verify_path"
+if grep -qE 'AIDA_FILELESS_LAUNCH|Invoke-AidaPEInMemory|Get-AidaPackageBytesWithProgress|Decrypt-AidaPackageBytes|Downloading and verifying encrypted package|launch_inmemory_enter' "$verify_path"; then
+  echo "bootstrap still contains standalone launch markers" >&2
+  exit 1
+fi
 rm -f /tmp/aida_bootstrap_verify_stage0.ps1 /tmp/aida_bootstrap_verify_stage1.ps1
 '@
     $script = $script.Replace("__RESTART__", $restart).Replace("__PACKAGE_URL__", $packageUrl).Replace("__SIDECAR_URL__", $sidecarUrl).Replace("__MCP_URL__", $mcpUrl)
@@ -639,7 +710,7 @@ rm -f /tmp/aida_bootstrap_verify_stage0.ps1 /tmp/aida_bootstrap_verify_stage1.ps
     foreach ($line in $output) {
         Write-Host "  $line"
     }
-    Write-Ok "Server health, package, Camoufox artifacts, and bootstrap script verified"
+    Write-Ok "Server health, Camoufox artifacts, and Camoufox-only bootstrap script verified"
 }
 
 if (-not (Test-Path -LiteralPath $SshKey -PathType Leaf)) {
@@ -657,6 +728,7 @@ Write-Host "AiDA deployment" -ForegroundColor Cyan
 Write-Host "  BuildDir:       $releaseDir"
 Write-Host "  Server:         $Server"
 Write-Host "  PublicBaseUrl:  $PublicBaseUrl"
+Write-Host "  Standalone:     disabled (Discord/manual distribution)"
 Write-Host ("  Camoufox:       {0}" -f ($(if ($SkipCamoufoxSidecar) { "skip (use --camoufox to publish MCP patch only)" } else { "publish MCP patch only" })))
 if ($PlanOnly) { Write-Host "  Mode:           PlanOnly" -ForegroundColor Yellow }
 
@@ -667,6 +739,8 @@ if ($arcChanged) { $restartNeeded = $true }
 $package = Publish-StandalonePackage $standaloneExe $deployId $remoteEnv
 $metadataChanged = Update-BootstrapMetadata $package
 if ($metadataChanged) { $restartNeeded = $true }
+$privateBase = Publish-StandalonePrivateBase $standaloneExe $deployId $remoteEnv
+if ($privateBase.Changed) { $restartNeeded = $true }
 $sidecar = Publish-CamoufoxMcpPatch $releaseDir $deployId $remoteEnv
 $sidecarMetadataChanged = Update-CamoufoxMcpPatchMetadata $sidecar
 if ($sidecarMetadataChanged) { $restartNeeded = $true }
@@ -678,5 +752,6 @@ Write-Host "  DEPLOY COMPLETE" -ForegroundColor Green
 Write-Host "============================================" -ForegroundColor Green
 Write-Host ("  ARC:         {0}" -f ($(if ($SkipArc) { "skipped" } elseif ($arcChanged) { "published" } else { "unchanged" }))) -ForegroundColor White
 Write-Host ("  Standalone:  {0}" -f ($(if ($SkipStandalone) { "skipped" } elseif ($package.Changed) { $package.Url } else { "unchanged" }))) -ForegroundColor White
+Write-Host ("  PrivateBase: {0}" -f ($(if ($privateBase.Changed) { $privateBase.Sha } else { "unchanged" }))) -ForegroundColor White
 Write-Host ("  Camoufox:    {0}" -f ($(if ($SkipCamoufoxSidecar) { "skipped" } elseif ($sidecar.Changed) { "MCP patch " + $sidecar.McpUrl } else { "unchanged" }))) -ForegroundColor White
 Write-Host "============================================" -ForegroundColor Green

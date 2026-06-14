@@ -230,6 +230,7 @@ void register_re_tools(mcp_standalone::server_t& srv)
         {{"base_va", "string", "Struct base address", true},
          {"size", "number", "Struct size", false},
          {"duration_sec", "number", "Observation duration", false},
+         {"timeout_ms", "number", "Maximum observation wait time", false},
          {"process_id", "number", "Target process id", false},
          {"confirm_unsafe", "boolean", "Required to arm observation breakpoints", false},
          {"allow_unsafe", "boolean", "Alias of confirm_unsafe", false}},

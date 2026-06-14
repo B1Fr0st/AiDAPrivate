@@ -4248,30 +4248,6 @@ namespace {
         }
     }
 
-    void test_browser_detect_edge(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-        const char* tag = "browser_edge";
-        (void)failed;
-        log_msg(hf, tag, "START -- browser::detect_edge_path() non-launching legacy discovery audit");
-        std::string path;
-        bool found = aida::burp::browser::detect_edge_path(path);
-        std::string err = aida::burp::browser::last_error();
-        log_msg(hf, tag, "found=%s path=%s last_error=%s", found ? "true" : "false", path.c_str(), err.c_str());
-        log_msg(hf, tag, "PASS -- detect_edge_path completed without launch; Camoufox remains the only Test Lab browser launch backend");
-        passed.fetch_add(1);
-    }
-
-    void test_browser_detect_chrome(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-        const char* tag = "browser_chrome";
-        (void)failed;
-        log_msg(hf, tag, "START -- browser::detect_chrome_path() non-launching legacy discovery audit");
-        std::string path;
-        bool found = aida::burp::browser::detect_chrome_path(path);
-        std::string err = aida::burp::browser::last_error();
-        log_msg(hf, tag, "found=%s path=%s last_error=%s", found ? "true" : "false", path.c_str(), err.c_str());
-        log_msg(hf, tag, "PASS -- detect_chrome_path completed without launch; Camoufox remains the only Test Lab browser launch backend");
-        passed.fetch_add(1);
-    }
-
     void test_browser_profile_root(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "browser_profile";
         log_msg(hf, tag, "START -- browser::profile_root()");
@@ -4293,7 +4269,7 @@ namespace {
         cfg.proxy_host = "127.0.0.1";
         cfg.proxy_port = 18888;
         cfg.initial_url = "https://example.com/";
-        cfg.certificate_strategy = aida::burp::browser::certificate_strategy_t::chromium_spki_allowlist;
+        cfg.certificate_strategy = aida::burp::browser::certificate_strategy_t::camoufox_spki_allowlist;
         cfg.spki_allowlist = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
         std::wstring cmd = aida::burp::browser::build_command_line_for_test(
             "C:\\Program Files\\Browser\\browser.exe",
@@ -4305,7 +4281,7 @@ namespace {
         bool lacks_global = cmd.find(L" --ignore-certificate-errors ") == std::wstring::npos &&
             cmd.find(L"--test-type") == std::wstring::npos;
         if (has_proxy && has_profile && has_spki && lacks_global) {
-            log_msg(hf, tag, "PASS -- SPKI command line emitted scoped flag and omitted global ignore flags");
+            log_msg(hf, tag, "PASS -- Camoufox SPKI command line emitted scoped flag and omitted global ignore flags");
             passed.fetch_add(1);
         } else {
             log_msg(hf, tag, "FAIL -- proxy=%s profile=%s spki=%s lacks_global=%s",
@@ -4321,20 +4297,6 @@ namespace {
         const char* tag = "browser_running";
         log_msg(hf, tag, "START -- Camoufox-only bridge launch/ready/cleanup validation");
         const uint64_t t0 = GetTickCount64();
-
-        std::string edge_path;
-        std::string chrome_path;
-        bool edge_found = aida::burp::browser::detect_edge_path(edge_path);
-        std::string edge_err = aida::burp::browser::last_error();
-        bool chrome_found = aida::burp::browser::detect_chrome_path(chrome_path);
-        std::string chrome_err = aida::burp::browser::last_error();
-        log_msg(hf, tag, "legacy_discovery edge_found=%d edge_path=%s edge_error=%s chrome_found=%d chrome_path=%s chrome_error=%s",
-            edge_found ? 1 : 0,
-            edge_path.empty() ? "<empty>" : edge_path.c_str(),
-            edge_err.empty() ? "<empty>" : edge_err.c_str(),
-            chrome_found ? 1 : 0,
-            chrome_path.empty() ? "<empty>" : chrome_path.c_str(),
-            chrome_err.empty() ? "<empty>" : chrome_err.c_str());
 
         aida::burp::camoufox::install::status_t install_before;
         std::string dependency_reason;
@@ -4374,13 +4336,19 @@ namespace {
             bridge_before.child_alive ? 1 : 0,
             bridge_before.browser_open ? 1 : 0,
             bridge_before.page_verified ? 1 : 0);
+        if (ready_before) {
+            log_msg(hf, tag, "PASS -- reused pre-existing live Camoufox bridge child_pid=%u without forcing a cold launch",
+                bridge_before.child_pid);
+            passed.fetch_add(1);
+            return;
+        }
 
         aida::burp::camoufox::launch_config_t cfg;
         cfg.headless = false;
-        cfg.launch_timeout_ms = 70000;
+        cfg.launch_timeout_ms = 45000;
         cfg.window_width = 1280;
         cfg.window_height = 900;
-        cfg.testlab_fast_probe = true;
+        cfg.testlab_fast_probe = false;
         bool launched = aida::burp::camoufox::start_bridge(cfg);
         auto bridge_after = aida::burp::camoufox::get_status();
         const bool ready = bridge_after.state == aida::burp::camoufox::bridge_state_t::ready &&
@@ -4402,7 +4370,7 @@ namespace {
             bridge_after.last_error.empty() ? "<empty>" : bridge_after.last_error.c_str(),
             static_cast<unsigned long long>(GetTickCount64() - t0));
         if (!ready) {
-            fail_empty_evidence(hf, tag, failed, "Camoufox browser did not launch into a ready live state; Edge/Chrome fallback is not allowed");
+            fail_empty_evidence(hf, tag, failed, "Camoufox browser did not launch into a ready live state");
             aida::burp::camoufox::close_browser("testlab.browser_running.launch_failed");
             return;
         }
@@ -4411,29 +4379,10 @@ namespace {
                 bridge_after.child_pid,
                 bridge_after.last_error.empty() ? "<empty>" : bridge_after.last_error.c_str());
         }
-        if (ready_before) {
-            log_msg(hf, tag, "PASS -- reused pre-existing live Camoufox bridge child_pid=%u without forcing cleanup",
-                bridge_after.child_pid);
-            passed.fetch_add(1);
-            return;
-        }
-
-        const bool closed = aida::burp::camoufox::close_browser("testlab.browser_running.cleanup");
-        auto bridge_closed = aida::burp::camoufox::get_status();
-        log_msg(hf, tag, "cleanup closed=%d bridge_state=%s child_pid=%u child_alive=%d browser_open=%d cleanup_pending=%d last_error=%s elapsed_ms=%llu",
-            closed ? 1 : 0,
-            camoufox_bridge_state_name(bridge_closed.state),
-            bridge_closed.child_pid,
-            bridge_closed.child_alive ? 1 : 0,
-            bridge_closed.browser_open ? 1 : 0,
-            bridge_closed.cleanup_pending ? 1 : 0,
-            bridge_closed.last_error.empty() ? "<empty>" : bridge_closed.last_error.c_str(),
+        log_msg(hf, tag, "PASS -- Camoufox-only browser ready child_pid=%u launched=%d retained_for_downstream=1 elapsed_ms=%llu",
+            bridge_after.child_pid,
+            launched ? 1 : 0,
             static_cast<unsigned long long>(GetTickCount64() - t0));
-        if (!closed) {
-            fail_empty_evidence(hf, tag, failed, "Camoufox browser launched but close_browser failed child_pid=%u", bridge_after.child_pid);
-            return;
-        }
-        log_msg(hf, tag, "PASS -- Camoufox-only browser ready child_pid=%u launched=%d cleanup completed", bridge_after.child_pid, launched ? 1 : 0);
         passed.fetch_add(1);
     }
 
@@ -5113,10 +5062,6 @@ void phase_burp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fai
 
     if (cancelled && cancelled()) return;
     call_test(test_browser_init, hf, passed, failed);
-    if (cancelled && cancelled()) return;
-    call_test(test_browser_detect_edge, hf, passed, failed);
-    if (cancelled && cancelled()) return;
-    call_test(test_browser_detect_chrome, hf, passed, failed);
     if (cancelled && cancelled()) return;
     call_test(test_browser_profile_root, hf, passed, failed);
     if (cancelled && cancelled()) return;

@@ -933,6 +933,40 @@ namespace test_all_features {
 			return value != nullptr && text_contains_ascii_ci(*value, needle);
 		}
 
+		bool parsed_label_truthy(const test_lab::result_t& r, const char* label) {
+			const std::string* value = parsed_value(r, label);
+			return value != nullptr && parsed_truthy(*value);
+		}
+
+		bool thread_tctx_raw_ioctl_degraded_has_public_fallback_evidence(const char* category, const char* name, const test_lab::result_t& r, const std::string& degraded_key) {
+			const char* cat = category ? category : "";
+			const char* feature = name ? name : "";
+			if (std::strcmp(cat, "thread") != 0 || !name_starts_with(feature, "TCTX") || degraded_key != "raw_ioctl_degraded")
+				return false;
+			const std::string* raw_ok = parsed_value(r, "raw_ioctl_ok");
+			const bool raw_failure_evidence =
+				(raw_ok != nullptr && !parsed_truthy(*raw_ok)) ||
+				parsed_value_contains(r, "fallback_reason", "raw ioctl failed") ||
+				parsed_value_contains(r, "fallback_decision_final", "raw_ioctl_not_proven");
+			const bool fallback_ok =
+				(parsed_label_truthy(r, "fallback_bridge_ok") || parsed_label_truthy(r, "fallback_helper_ok")) &&
+				(parsed_label_truthy(r, "fallback_bridge_context_valid") || parsed_label_truthy(r, "fallback_context_valid")) &&
+				parsed_value_contains(r, "tctx_pass_path", "get_thread_context_retry");
+			const bool probe_ok =
+				parsed_label_truthy(r, "user_probe_before_raw_context_valid") ||
+				parsed_label_truthy(r, "user_probe_after_fallback_context_valid");
+			const char* const rip_rsp_labels[] = {
+				"fallback_bridge_rip",
+				"fallback_bridge_rsp",
+				"fallback_attempt_2_rip",
+				"fallback_attempt_2_rsp",
+				"user_probe_after_fallback_rip",
+				"user_probe_after_fallback_rsp"
+			};
+			return raw_failure_evidence && fallback_ok && probe_ok &&
+				any_parsed_nonzero(r, rip_rsp_labels, sizeof(rip_rsp_labels) / sizeof(rip_rsp_labels[0]));
+		}
+
 		bool feature_evidence_failure_reason(const char* category, const char* name, const test_lab::result_t& r, std::string& reason) {
 			reason.clear();
 			const char* cat = category ? category : "";
@@ -943,6 +977,8 @@ namespace test_all_features {
 			}
 			std::string degraded_key;
 			if (parsed_key_degraded_true(r, degraded_key)) {
+				if (thread_tctx_raw_ioctl_degraded_has_public_fallback_evidence(category, name, r, degraded_key))
+					return false;
 				reason = degraded_key + "=1";
 				return true;
 			}
@@ -3138,6 +3174,22 @@ namespace test_all_features {
 
 	void format_debug_snapshot(char* out, std::size_t cap) {
 		format_debug_snapshot_impl(out, cap);
+	}
+
+	void log_external_session_event(const char* source, unsigned msg, std::uintptr_t wparam, std::intptr_t lparam) {
+		HANDLE hf = open_log_file();
+		log_msg(hf, "session", "external_session_event source=%s msg=0x%04X wparam=0x%016llX lparam=0x%016llX running=%d cancel=%d",
+			source ? source : "unknown",
+			msg,
+			static_cast<unsigned long long>(wparam),
+			static_cast<unsigned long long>(static_cast<std::uintptr_t>(lparam)),
+			g_running.load(std::memory_order_acquire) ? 1 : 0,
+			g_cancel_requested.load(std::memory_order_acquire) ? 1 : 0);
+		log_debug_snapshot(hf, "session", source ? source : "external session event");
+		if (hf != INVALID_HANDLE_VALUE) {
+			flush_full_test_log(hf);
+			CloseHandle(hf);
+		}
 	}
 
 	void render_overlay(float vw, float vh) {

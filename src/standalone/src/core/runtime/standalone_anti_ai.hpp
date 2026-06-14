@@ -968,7 +968,7 @@ namespace detail
                 path_under_current_module_subdir_w(probe.image_lower, L"camoufox-reverse-mcp") ||
                 path_under_trusted_camoufox_runtime_root_w(probe.image_lower);
         static const wchar_t* const browser_names[] = {
-            L"camoufox.exe", L"firefox.exe"
+            L"camoufox.exe"
         };
         if (basename_equals_any(probe, browser_names))
             return path_under_trusted_camoufox_runtime_root_w(probe.image_lower) ||

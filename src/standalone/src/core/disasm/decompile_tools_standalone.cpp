@@ -142,12 +142,28 @@ static tool_result_t handle_decompile_function(const json& params)
                                         ? std::string("Decompilation failed.")
                                         : r.error_text);
         }
+        if (r.pseudocode.find_first_not_of(" \t\r\n") == std::string::npos) {
+            diag::log_tagged_fmt("decomp_tools", "decompile_function_empty_pseudocode addr=0x%llX func=%s elapsed_ms=%lld",
+                static_cast<unsigned long long>(r.function_addr),
+                r.function_name.c_str(),
+                static_cast<long long>(r.elapsed_ms));
+            return tool_result_t::error("Decompilation produced no pseudocode.");
+        }
+        const size_t mapped_line_count = r.line_to_address.size();
+        size_t pseudocode_line_count = 0;
+        for (char ch : r.pseudocode) {
+            if (ch == '\n')
+                ++pseudocode_line_count;
+        }
+        if (!r.pseudocode.empty() && r.pseudocode.back() != '\n')
+            ++pseudocode_line_count;
+        const size_t reported_line_count = mapped_line_count != 0 ? mapped_line_count : pseudocode_line_count;
         diag::log_tagged_fmt("decomp_tools",
-            "decompile_function_success addr=0x%llX func=%s sleigh=%s elapsed_ms=%lld lines=%zu callees=%zu pseudocode_bytes=%zu",
+            "decompile_function_success addr=0x%llX func=%s sleigh=%s elapsed_ms=%lld lines=%zu mapped_lines=%zu text_lines=%zu callees=%zu pseudocode_bytes=%zu",
             static_cast<unsigned long long>(r.function_addr),
             r.function_name.c_str(), r.sleigh_id.c_str(),
             static_cast<long long>(r.elapsed_ms),
-            r.line_to_address.size(), r.callees.size(), r.pseudocode.size());
+            reported_line_count, mapped_line_count, pseudocode_line_count, r.callees.size(), r.pseudocode.size());
         json result;
         result["address"]      = hex_u64(r.function_addr);
         result["function_name"]= r.function_name.empty()
@@ -166,7 +182,9 @@ static tool_result_t handle_decompile_function(const json& params)
             callees.push_back(std::move(o));
         }
         result["callees"] = std::move(callees);
-        result["line_count"] = r.line_to_address.size();
+        result["line_count"] = reported_line_count;
+        result["mapped_line_count"] = mapped_line_count;
+        result["pseudocode_line_count"] = pseudocode_line_count;
         return tool_result_t::ok(result);
     }
 }

@@ -92,6 +92,262 @@ function fixedLengthTimingSafeEqual(a, b) {
     return crypto.timingSafeEqual(padded_a, padded_b);
 }
 
+const STANDALONE_CAPSULE_SECRET_LABEL = 'standalone_capsule_secret/v1';
+const STANDALONE_CAPSULE_PROOF_PREFIX = 'aida-standalone-capsule-proof/v1';
+
+function truthyDbFlag(value) {
+    if (value === true) return true;
+    if (value === false || value === null || value === undefined) return false;
+    if (typeof value === 'number') return value !== 0;
+    if (typeof value === 'bigint') return value !== 0n;
+    if (typeof value === 'string') {
+        const v = value.trim().toLowerCase();
+        return v === '1' || v === 'true' || v === 't' || v === 'yes' || v === 'y' || v === 'on';
+    }
+    return false;
+}
+
+function normalizeCapsuleHex(value) {
+    if (typeof value !== 'string') return '';
+    const v = value.trim().toLowerCase();
+    return /^[0-9a-f]{64}$/.test(v) ? v : '';
+}
+
+function normalizeCapsuleId(value) {
+    if (typeof value !== 'string') return '';
+    const v = value.trim();
+    if (v.length < 8 || v.length > 128) return '';
+    return /^[A-Za-z0-9_.:-]+$/.test(v) ? v : '';
+}
+
+function normalizeCapsuleNonce(value) {
+    if (typeof value !== 'string') return '';
+    const v = value.trim().toLowerCase();
+    return /^[0-9a-f]{16,128}$/.test(v) ? v : '';
+}
+
+function normalizeCapsuleProofTs(value) {
+    let n = 0;
+    if (typeof value === 'number' && Number.isFinite(value)) n = Math.floor(value);
+    else if (typeof value === 'bigint') n = Number(value);
+    else if (typeof value === 'string' && value.trim() !== '') n = Math.floor(Number(value.trim()));
+    return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+function parseCapsuleProof(value) {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    if (/^[0-9a-fA-F]{64}$/.test(trimmed)) return Buffer.from(trimmed, 'hex');
+    if (/^[A-Za-z0-9+/=_-]{43,88}$/.test(trimmed)) {
+        try {
+            const b64 = trimmed.replace(/-/g, '+').replace(/_/g, '/');
+            const decoded = Buffer.from(b64, 'base64');
+            return decoded.length === 32 ? decoded : null;
+        } catch (_) {
+            return null;
+        }
+    }
+    return null;
+}
+
+function parseWrappedCapsuleSecret(value) {
+    if (Buffer.isBuffer(value)) return value;
+    if (value && value.type === 'Buffer' && Array.isArray(value.data)) return Buffer.from(value.data);
+    if (typeof value !== 'string') return null;
+    const v = value.trim();
+    if (v.startsWith('\\x') && /^[\\]x[0-9a-fA-F]+$/.test(v) && v.length % 2 === 0) {
+        return Buffer.from(v.slice(2), 'hex');
+    }
+    if (/^[0-9a-fA-F]{56,}$/.test(v) && v.length % 2 === 0) return Buffer.from(v, 'hex');
+    try {
+        const decoded = Buffer.from(v, 'base64');
+        return decoded.length >= 28 ? decoded : null;
+    } catch (_) {
+        return null;
+    }
+}
+
+function pickCapsuleSecretWrapped(row) {
+    if (!row || typeof row !== 'object') return null;
+    return row.secret_wrapped
+        || row.capsule_secret_wrapped
+        || row.proof_secret_wrapped
+        || row.hmac_secret_wrapped
+        || row.standalone_capsule_secret_wrapped
+        || null;
+}
+
+function capsuleRowRevoked(row) {
+    if (!row || typeof row !== 'object') return true;
+    if (truthyDbFlag(row.revoked)) return true;
+    if (truthyDbFlag(row.is_revoked)) return true;
+    if (row.active !== undefined && !truthyDbFlag(row.active)) return true;
+    if (row.status !== undefined) {
+        const status = String(row.status || '').trim().toLowerCase();
+        if (status && status !== 'active') return true;
+    }
+    return false;
+}
+
+function capsuleRowExpired(row, nowSeconds = Math.floor(Date.now() / 1000)) {
+    if (!row || typeof row !== 'object') return true;
+    const candidates = [
+        row.expires_epoch,
+        row.expires_at_epoch,
+        row.expiry_epoch,
+        row.not_after_epoch,
+    ];
+    for (const candidate of candidates) {
+        const epoch = normalizeExpiryEpoch(candidate);
+        if (epoch > 0) return nowSeconds > epoch;
+    }
+    for (const candidate of [row.expires_at, row.expiry, row.not_after]) {
+        if (!candidate) continue;
+        const parsed = Date.parse(candidate);
+        if (Number.isFinite(parsed)) return Date.now() > parsed;
+    }
+    return false;
+}
+
+function capsuleRowActive(row) {
+    return !!row && !capsuleRowRevoked(row) && !capsuleRowExpired(row);
+}
+
+function isMissingCapsuleSchemaError(err) {
+    const code = err && err.code ? String(err.code) : '';
+    if (code === '42P01' || code === '42703' || code === '42883') return true;
+    const msg = err && err.message ? String(err.message).toLowerCase() : '';
+    return msg.includes('standalone_customer_capsules')
+        && (msg.includes('does not exist') || msg.includes('no such table') || msg.includes('unknown column') || msg.includes('no such column'));
+}
+
+async function fetchStandaloneCapsuleRows(licenseKey) {
+    try {
+        const { rows } = await pool.query(
+            'SELECT * FROM standalone_customer_capsules WHERE license_key = $1',
+            [licenseKey]
+        );
+        return { ok: true, rows: rows || [] };
+    } catch (err) {
+        if (isMissingCapsuleSchemaError(err)) return { ok: false, missing_schema: true, rows: [] };
+        throw err;
+    }
+}
+
+function buildStandaloneCapsuleProofMessage(action, fields) {
+    const parts = [
+        STANDALONE_CAPSULE_PROOF_PREFIX,
+        String(action || ''),
+        String(fields.license_key || ''),
+    ];
+    if (action === 'validate') {
+        parts.push(
+            String(fields.hwid || ''),
+            String(fields.client_nonce || '')
+        );
+    } else if (action === 'heartbeat') {
+        parts.push(
+            String(fields.session_token || ''),
+            String(fields.hwid || ''),
+            String(fields.heartbeat_nonce || ''),
+            String(fields.heartbeat_count || ''),
+            String(fields.req_seq || '')
+        );
+    } else {
+        parts.push(String(fields.hwid || ''));
+    }
+    parts.push(
+        String(fields.capsule_id || ''),
+        String(fields.base_sha256 || ''),
+        String(fields.capsule_sha256 || ''),
+        String(fields.proof_nonce || ''),
+        String(fields.proof_ts || '')
+    );
+    return parts.join('\n');
+}
+
+function verifyStandaloneCapsuleProof(secret, action, fields, proofBuf) {
+    if (!Buffer.isBuffer(secret) || secret.length < 16 || !Buffer.isBuffer(proofBuf) || proofBuf.length !== 32) {
+        if (Buffer.isBuffer(proofBuf) && proofBuf.length === 32) {
+            crypto.timingSafeEqual(Buffer.alloc(32), proofBuf);
+        }
+        return false;
+    }
+    const expected = crypto.createHmac('sha256', secret)
+        .update(buildStandaloneCapsuleProofMessage(action, fields), 'utf8')
+        .digest();
+    return crypto.timingSafeEqual(expected, proofBuf);
+}
+
+async function enforceStandaloneCapsuleProof(action, licenseRow, body, context = {}) {
+    const normalizedLicenseKey = context.license_key || (licenseRow && licenseRow.key) || (body && body.license_key) || '';
+    const licenseRequiresCapsule = truthyDbFlag(licenseRow && licenseRow.standalone_capsule_required);
+    const fetched = await fetchStandaloneCapsuleRows(normalizedLicenseKey);
+    if (!fetched.ok && fetched.missing_schema) {
+        return licenseRequiresCapsule
+            ? { ok: false, reason: 'capsule_schema_missing' }
+            : { ok: true, enforced: false, reason: 'capsule_schema_absent' };
+    }
+    const rows = fetched.rows || [];
+    const activeRows = rows.filter(capsuleRowActive);
+    const proof = body && body.standalone_capsule && typeof body.standalone_capsule === 'object'
+        ? body.standalone_capsule
+        : null;
+    const mustEnforce = licenseRequiresCapsule || activeRows.length > 0 || rows.length > 0;
+    if (!mustEnforce) return { ok: true, enforced: false, reason: 'capsule_not_required' };
+    if (!proof) return { ok: false, reason: 'capsule_missing' };
+
+    const capsuleId = normalizeCapsuleId(proof.capsule_id);
+    const baseSha = normalizeCapsuleHex(proof.base_sha256);
+    const capsuleSha = normalizeCapsuleHex(proof.capsule_sha256);
+    const proofNonce = normalizeCapsuleNonce(proof.proof_nonce);
+    const proofTs = normalizeCapsuleProofTs(proof.proof_ts);
+    const proofBuf = parseCapsuleProof(proof.proof);
+    if (!capsuleId || !baseSha || !capsuleSha || !proofNonce || !proofTs || !proofBuf) {
+        return { ok: false, reason: 'capsule_proof_format' };
+    }
+    const drift = Math.abs(Math.floor(Date.now() / 1000) - proofTs);
+    if (drift > 300) return { ok: false, reason: 'capsule_proof_stale' };
+
+    const row = rows.find(r => normalizeCapsuleId(r && r.capsule_id) === capsuleId);
+    if (!row) return { ok: false, reason: 'capsule_id_mismatch' };
+    if (capsuleRowRevoked(row)) return { ok: false, reason: 'capsule_revoked' };
+    if (capsuleRowExpired(row)) return { ok: false, reason: 'capsule_expired' };
+    if (normalizeCapsuleHex(row.base_sha256) !== baseSha) return { ok: false, reason: 'capsule_base_mismatch' };
+    if (normalizeCapsuleHex(row.capsule_sha256) !== capsuleSha) return { ok: false, reason: 'capsule_hash_mismatch' };
+
+    const wrapped = parseWrappedCapsuleSecret(pickCapsuleSecretWrapped(row));
+    if (!wrapped) return { ok: false, reason: 'capsule_secret_missing' };
+    let secret;
+    try {
+        secret = kwWrap.unwrap(wrapped, STANDALONE_CAPSULE_SECRET_LABEL);
+    } catch (_) {
+        return { ok: false, reason: 'capsule_secret_unwrap' };
+    }
+
+    const heartbeatCount = action === 'heartbeat'
+        ? String(Math.max(0, Math.floor(Number(body.heartbeat_count || 0))))
+        : '';
+    const fields = {
+        license_key: normalizedLicenseKey,
+        hwid: context.hwid || body.hwid || '',
+        client_nonce: body.client_nonce || '',
+        session_token: body.session_token || '',
+        heartbeat_nonce: body.heartbeat_nonce || '',
+        heartbeat_count: heartbeatCount,
+        req_seq: action === 'heartbeat' ? String(body.req_seq || '') : '',
+        capsule_id: capsuleId,
+        base_sha256: baseSha,
+        capsule_sha256: capsuleSha,
+        proof_nonce: proofNonce,
+        proof_ts: String(proofTs),
+    };
+    const ok = verifyStandaloneCapsuleProof(secret, action, fields, proofBuf);
+    secret.fill(0);
+    if (!ok) return { ok: false, reason: 'capsule_proof_mismatch' };
+    return { ok: true, enforced: true, capsule_id: capsuleId };
+}
+
 async function applyTimingBudget(startMs) {
     const elapsed = Date.now() - startMs;
     const remaining = HANDLER_TIMING_BUDGET_MS - elapsed;
@@ -1656,6 +1912,14 @@ async function handleValidate(body, clientIp) {
         return collapseInvalid('hwid:' + (hwidResult.reason || 'unknown'), normalizedLicenseKey, hwid, clientIp);
     }
 
+    const capsuleResult = await enforceStandaloneCapsuleProof('validate', lookup.data, body, {
+        license_key: normalizedLicenseKey,
+        hwid,
+    });
+    if (!capsuleResult.ok) {
+        return collapseInvalid('capsule:' + (capsuleResult.reason || 'invalid'), normalizedLicenseKey, hwid, clientIp);
+    }
+
     try {
         const peerState = await peerCodeHash.getSessionPeerState(normalizedLicenseKey);
         if (peerState && Number(peerState.peer_attest_divergence_streak || 0) >= 5) {
@@ -2030,6 +2294,15 @@ async function handleHeartbeat(body, clientIp) {
         dbgHb('hwid_mismatch', { body_hwid: maskToken(hwid), session_hwid: maskToken(session.hwid) });
         await replayCounter.recordHwidMismatch(license_key, session_token, { body_hwid_prefix: (hwid || '').slice(0, 16), session_hwid_prefix: (session.hwid || '').slice(0, 16) });
         return collapseHeartbeatDeny('hwid_mismatch', license_key, hwid, clientIp);
+    }
+
+    const capsuleResult = await enforceStandaloneCapsuleProof('heartbeat', lookup.data, body, {
+        license_key,
+        hwid: hwid || session.hwid || '',
+    });
+    if (!capsuleResult.ok) {
+        dbgHb('capsule_reject', { reason: capsuleResult.reason || 'invalid' });
+        return collapseHeartbeatDeny('capsule:' + (capsuleResult.reason || 'invalid'), license_key, hwid, clientIp);
     }
 
     const sessionStoredHbNonce = typeof session.heartbeat_nonce === 'string' ? session.heartbeat_nonce.trim().toLowerCase() : '';
@@ -3704,6 +3977,9 @@ router._internal = {
     applyAnomalyDecision,
     persistTpmAttestation,
     buildTpmSealedPayload,
+    buildStandaloneCapsuleProofMessage,
+    enforceStandaloneCapsuleProof,
+    verifyStandaloneCapsuleProof,
     sendSlackAlert,
     storeSession,
 };

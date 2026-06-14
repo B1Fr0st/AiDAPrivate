@@ -27,7 +27,10 @@ bool valid_pointer(std::uint32_t pid, std::uint64_t value)
     if ((value & 0x7ull) != 0 || value < 0x10000 || value >= 0x0000800000000000ULL)
         return false;
     driver_bridge::memory_region_t region{};
-    return query_region(pid, value, region) && is_readable(region);
+    if (query_region(pid, value, region) && is_readable(region))
+        return true;
+    std::vector<std::uint8_t> probe;
+    return read_bytes(pid, value, 1, probe) && !probe.empty();
 }
 
 bool canonical_address(std::uint64_t value)
@@ -45,7 +48,10 @@ bool valid_address(std::uint32_t pid, std::uint64_t value)
     if (!canonical_address(value))
         return false;
     driver_bridge::memory_region_t region{};
-    return query_region(pid, value, region) && is_readable(region);
+    if (query_region(pid, value, region) && is_readable(region))
+        return true;
+    std::vector<std::uint8_t> probe;
+    return read_bytes(pid, value, 1, probe) && !probe.empty();
 }
 
 bool add_signed(std::uint64_t value, std::int64_t delta, std::uint64_t& out)

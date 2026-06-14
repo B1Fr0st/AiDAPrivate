@@ -151,9 +151,17 @@ namespace enforcement_detail {
             log_destructive_enforcement_suppressed("kill_path_kernel");
             return;
         }
+        diag::log_tagged_critical_fmt("enforce",
+            "kill_path_kernel_entry driver_loaded=%d using_kernel=%d full_test=%d",
+            driver_bridge::is_loaded() ? 1 : 0,
+            driver_bridge::using_kernel_driver() ? 1 : 0,
+            anti_tamper::state::get().full_test_running.load(std::memory_order_acquire) ? 1 : 0);
         if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver())
         {
             auto& rt = state::get();
+            diag::log_tagged_critical_fmt("enforce",
+                "kill_path_kernel_trigger reason=0x0002 text_hash=0x%016llX",
+                static_cast<unsigned long long>(rt.code_snap.text_hash));
             driver_bridge::trigger_kernel_bsod(
                 0x0002u,
                 rt.code_snap.text_hash
@@ -170,12 +178,25 @@ namespace enforcement_detail {
         if (syscall::is_initialized())
         {
             BOOLEAN wasEnabled = FALSE;
-            syscall::RtlAdjustPrivilege()(19, TRUE, FALSE, &wasEnabled);
+            NTSTATUS adjust_status = syscall::RtlAdjustPrivilege()(19, TRUE, FALSE, &wasEnabled);
+            diag::log_tagged_critical_fmt("enforce",
+                "kill_path_hard_error_adjust status=0x%08lX was_enabled=%d",
+                static_cast<unsigned long>(adjust_status),
+                wasEnabled ? 1 : 0);
 
             ULONG response = 0;
-            syscall::NtRaiseHardError()(
+            diag::log_tagged_critical("enforce", "kill_path_hard_error_raise status=0xC0000420 option=6");
+            NTSTATUS hard_status = syscall::NtRaiseHardError()(
                 static_cast<NTSTATUS>(0xC0000420),
                 0, 0, nullptr, 6, &response);
+            diag::log_tagged_critical_fmt("enforce",
+                "kill_path_hard_error_return status=0x%08lX response=%lu",
+                static_cast<unsigned long>(hard_status),
+                static_cast<unsigned long>(response));
+        }
+        else
+        {
+            diag::log_tagged_critical("enforce", "kill_path_hard_error_skipped syscall_not_initialized");
         }
     }
 
@@ -208,9 +229,15 @@ namespace enforcement_detail {
         using NtSetInformationProcess_t = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG);
         auto pSet = reinterpret_cast<NtSetInformationProcess_t>(
             GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtSetInformationProcess"));
-        if (!pSet) return;
+        if (!pSet) {
+            diag::log_tagged_critical("enforce", "arm_bugcheck_on_exit_missing_NtSetInformationProcess");
+            return;
+        }
         ULONG one = 1;
-        pSet(GetCurrentProcess(), 0x1D, &one, sizeof(one));
+        NTSTATUS status = pSet(GetCurrentProcess(), 0x1D, &one, sizeof(one));
+        diag::log_tagged_critical_fmt("enforce",
+            "arm_bugcheck_on_exit status=0x%08lX",
+            static_cast<unsigned long>(status));
     }
 
     inline __declspec(noinline) void execute_all_kill_paths()
@@ -220,6 +247,7 @@ namespace enforcement_detail {
             return;
         }
         webhook::write_log("enforce", "EXECUTING_ALL_KILL_PATHS");
+        diag::log_tagged_critical("enforce", "execute_all_kill_paths_entry");
         arm_bugcheck_on_exit();
         kill_path_kernel();
         kill_path_hard_error();

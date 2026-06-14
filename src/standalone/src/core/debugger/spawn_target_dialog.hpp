@@ -28,6 +28,7 @@
 #include "../helpers/win32_dialog.hpp"
 #include "../runtime/run_target.hpp"
 #include "../ui/toast_notification.hpp"
+#include "../auth/auth_browser_launch.hpp"
 
 extern HWND g_hwnd;
 
@@ -225,7 +226,12 @@ inline std::string trim(const char* s) {
 
 inline void open_url(const wchar_t* url) {
 	if (!url || !*url) return;
-	ShellExecuteW(g_hwnd, L"open", url, nullptr, nullptr, SW_SHOWNORMAL);
+	const int len = WideCharToMultiByte(CP_UTF8, 0, url, -1, nullptr, 0, nullptr, nullptr);
+	if (len <= 1) return;
+	std::string utf8(static_cast<size_t>(len), '\0');
+	WideCharToMultiByte(CP_UTF8, 0, url, -1, utf8.data(), len, nullptr, nullptr);
+	if (!utf8.empty() && utf8.back() == '\0') utf8.pop_back();
+	aida::auth::open_url_external(utf8);
 }
 
 inline bool prepare_launch_result(bool host_mode) {

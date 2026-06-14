@@ -20,6 +20,9 @@
 
 namespace integrity_hunter {
 
+inline constexpr uint32_t k_integrity_hunter_max_records_per_drain = 16;
+inline constexpr size_t k_integrity_hunter_stop_batch_limit = 64;
+
 struct integrity_node_t {
 	uint64_t reader_rip = 0;
 	uint64_t hash_compare_addr = 0;
@@ -284,7 +287,12 @@ inline bool start_hunt(uint64_t target_address, uint64_t target_size)
 			return;
 		}
 
-		uint32_t pg_session = page_guard_engine::g_pg_engine.install(pid, page_base, region_size);
+		uint32_t pg_session = page_guard_engine::g_pg_engine.install(
+			pid,
+			page_base,
+			region_size,
+			true,
+			k_integrity_hunter_max_records_per_drain);
 		if (pg_session == 0) {
 			diag::log_tagged_fmt("integrity_hunter",
 				"page_guard_install_fail gen=%llu target=0x%llX page_base=0x%llX size=0x%llX cancelled=%d",
@@ -319,12 +327,50 @@ inline bool start_hunt(uint64_t target_address, uint64_t target_size)
 		uint64_t total = 0;
 		auto start_time = std::chrono::steady_clock::now();
 
-		while (!g_state.cancel.load()) {
+		while (true) {
 			std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
+			const bool capture_hunting_before = g_state.hunting.load(std::memory_order_acquire);
+			const bool capture_worker_before = g_state.worker_active.load(std::memory_order_acquire);
+			const bool capture_cancel_before = g_state.cancel.load(std::memory_order_acquire);
+			const uint64_t capture_total_before = total;
+			const auto capture_t0 = std::chrono::steady_clock::now();
+			diag::log_tagged_fmt("integrity_hunter",
+				"get_captures_begin gen=%llu session=%u hunting=%d worker_active=%d cancel=%d total_before=%llu",
+				static_cast<unsigned long long>(generation),
+				pg_session,
+				capture_hunting_before ? 1 : 0,
+				capture_worker_before ? 1 : 0,
+				capture_cancel_before ? 1 : 0,
+				static_cast<unsigned long long>(capture_total_before));
 			auto captures = page_guard_engine::g_pg_engine.get_captures(pg_session);
+			const auto capture_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+				std::chrono::steady_clock::now() - capture_t0).count();
+			diag::log_tagged_fmt("integrity_hunter",
+				"get_captures_done gen=%llu session=%u captures=%zu elapsed_ms=%lld hunting=%d worker_active=%d cancel=%d total_before=%llu",
+				static_cast<unsigned long long>(generation),
+				pg_session,
+				captures.size(),
+				static_cast<long long>(capture_elapsed),
+				g_state.hunting.load(std::memory_order_acquire) ? 1 : 0,
+				g_state.worker_active.load(std::memory_order_acquire) ? 1 : 0,
+				g_state.cancel.load(std::memory_order_acquire) ? 1 : 0,
+				static_cast<unsigned long long>(capture_total_before));
+			const bool cancel_seen = g_state.cancel.load(std::memory_order_acquire);
+			if (cancel_seen) {
+				diag::log_tagged_fmt("integrity_hunter",
+					"worker_cancel_seen gen=%llu session=%u pending_captures=%zu total_before=%llu",
+					static_cast<unsigned long long>(generation),
+					pg_session,
+					captures.size(),
+					static_cast<unsigned long long>(total));
+			}
 
+			size_t processed_this_cycle = 0;
 			for (auto& cap : captures) {
+				if (cancel_seen && processed_this_cycle >= k_integrity_hunter_stop_batch_limit)
+					break;
+				++processed_this_cycle;
 				if (cap.fault_addr < target_address ||
 				    cap.fault_addr >= target_address + target_size)
 					continue;
@@ -376,6 +422,7 @@ inline bool start_hunt(uint64_t target_address, uint64_t target_size)
 			auto now = std::chrono::steady_clock::now();
 			auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
 
+			size_t node_count_after = 0;
 			{
 				std::lock_guard<std::mutex> lk(g_state.mutex);
 				g_state.nodes.clear();
@@ -407,10 +454,54 @@ inline bool start_hunt(uint64_t target_address, uint64_t target_size)
 
 				g_state.status_text = "Monitoring: " + std::to_string(total) + " reads, " +
 				    std::to_string(g_state.nodes.size()) + " unique readers";
+				node_count_after = g_state.nodes.size();
+			}
+			if (cancel_seen) {
+				diag::log_tagged_fmt("integrity_hunter",
+					"worker_cancel_drain_done gen=%llu session=%u processed=%zu total_after=%llu nodes=%zu",
+					static_cast<unsigned long long>(generation),
+					pg_session,
+					processed_this_cycle,
+					static_cast<unsigned long long>(total),
+					node_count_after);
+				break;
 			}
 		}
 
-		page_guard_engine::g_pg_engine.uninstall(pg_session);
+		size_t nodes_before_uninstall = 0;
+		size_t events_before_uninstall = 0;
+		{
+			std::lock_guard<std::mutex> lk(g_state.mutex);
+			nodes_before_uninstall = g_state.nodes.size();
+			events_before_uninstall = g_state.event_log.size();
+		}
+		const auto uninstall_t0 = std::chrono::steady_clock::now();
+		diag::log_tagged_fmt("integrity_hunter",
+			"uninstall_begin gen=%llu session=%u hunting=%d worker_active=%d cancel=%d install_complete=%d install_success=%d nodes=%zu events=%zu total_reads=%llu",
+			static_cast<unsigned long long>(generation),
+			pg_session,
+			g_state.hunting.load(std::memory_order_acquire) ? 1 : 0,
+			g_state.worker_active.load(std::memory_order_acquire) ? 1 : 0,
+			g_state.cancel.load(std::memory_order_acquire) ? 1 : 0,
+			g_state.install_complete.load(std::memory_order_acquire) ? 1 : 0,
+			g_state.install_success.load(std::memory_order_acquire) ? 1 : 0,
+			nodes_before_uninstall,
+			events_before_uninstall,
+			static_cast<unsigned long long>(g_state.total_reads.load(std::memory_order_acquire)));
+		const bool uninstall_ok = page_guard_engine::g_pg_engine.uninstall(pg_session);
+		const auto uninstall_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::steady_clock::now() - uninstall_t0).count();
+		diag::log_tagged_fmt("integrity_hunter",
+			"uninstall_done gen=%llu session=%u ok=%d elapsed_ms=%lld hunting=%d worker_active=%d cancel=%d install_complete=%d install_success=%d",
+			static_cast<unsigned long long>(generation),
+			pg_session,
+			uninstall_ok ? 1 : 0,
+			static_cast<long long>(uninstall_elapsed),
+			g_state.hunting.load(std::memory_order_acquire) ? 1 : 0,
+			g_state.worker_active.load(std::memory_order_acquire) ? 1 : 0,
+			g_state.cancel.load(std::memory_order_acquire) ? 1 : 0,
+			g_state.install_complete.load(std::memory_order_acquire) ? 1 : 0,
+			g_state.install_success.load(std::memory_order_acquire) ? 1 : 0);
 
 		size_t final_nodes = 0;
 		uint64_t final_reads = g_state.total_reads.load();
@@ -422,12 +513,23 @@ inline bool start_hunt(uint64_t target_address, uint64_t target_size)
 		}
 
 		diag::log_tagged_fmt("integrity_hunter",
-			"hunt_done gen=%llu nodes=%zu total_reads=%llu",
+			"hunt_done gen=%llu nodes=%zu total_reads=%llu uninstall_ok=%d",
 			static_cast<unsigned long long>(generation),
-			final_nodes, static_cast<unsigned long long>(final_reads));
+			final_nodes, static_cast<unsigned long long>(final_reads),
+			uninstall_ok ? 1 : 0);
 
 		g_state.worker_active.store(false);
 		g_state.hunting.store(false);
+		diag::log_tagged_fmt("integrity_hunter",
+			"worker_state_cleared gen=%llu session=%u hunting=%d worker_active=%d cancel=%d install_complete=%d install_success=%d uninstall_ok=%d",
+			static_cast<unsigned long long>(generation),
+			pg_session,
+			g_state.hunting.load(std::memory_order_acquire) ? 1 : 0,
+			g_state.worker_active.load(std::memory_order_acquire) ? 1 : 0,
+			g_state.cancel.load(std::memory_order_acquire) ? 1 : 0,
+			g_state.install_complete.load(std::memory_order_acquire) ? 1 : 0,
+			g_state.install_success.load(std::memory_order_acquire) ? 1 : 0,
+			uninstall_ok ? 1 : 0);
 	};
 	const bool run_install_inline = target_size <= 4096;
 	if (run_install_inline) {

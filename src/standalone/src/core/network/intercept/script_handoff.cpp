@@ -27,9 +27,7 @@ std::string lower_ascii(std::string value) {
 bool openssl_export_template_candidate(const module_summary_t& module) {
     const std::string joined = lower_ascii(module.name + " " + module.path);
     return module.stable_export_candidate
-        && joined.find("boringssl") == std::string::npos
-        && joined.find("chrome.dll") == std::string::npos
-        && joined.find("msedge.dll") == std::string::npos;
+        && joined.find("boringssl") == std::string::npos;
 }
 
 std::string timestamp_token() {

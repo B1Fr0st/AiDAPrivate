@@ -4270,6 +4270,7 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
     auto finish = [&](const char* path, LRESULT result) -> LRESULT {
         uint64_t elapsed = static_cast<uint64_t>(GetTickCount64()) - wnd_start;
         if (elapsed >= 50 || msg == WM_CLOSE || msg == WM_DESTROY || msg == WM_NCDESTROY ||
+            msg == WM_QUERYENDSESSION || msg == WM_ENDSESSION ||
             msg == WM_SYSCOMMAND || msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP ||
             msg == WM_NCLBUTTONDOWN || msg == WM_NCLBUTTONUP || msg == WM_MOUSEACTIVATE ||
             msg == WM_DPICHANGED || msg == WM_SETTINGCHANGE ||
@@ -4294,6 +4295,42 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         aida_tracer::clear_wndproc_state();
         return result;
     };
+
+    auto log_session_shutdown = [&](const char* source) {
+        char snapshot[2200] = {};
+        test_all_features::format_debug_snapshot(snapshot, sizeof(snapshot));
+        const bool full_test_running = test_all_features::is_running();
+        diag::log_tagged_critical_fmt("session",
+            "%s msg=%s(0x%04X) hwnd=0x%llX wp=0x%llX lp=0x%llX full_test_running=%d shutdown=%d closeapp=%d critical=%d logoff=%d snapshot=%s",
+            source ? source : "session_event",
+            aida_tracer::message_name(msg),
+            msg,
+            (unsigned long long)reinterpret_cast<UINT_PTR>(hWnd),
+            (unsigned long long)static_cast<UINT_PTR>(wParam),
+            (unsigned long long)static_cast<LONG_PTR>(lParam),
+            full_test_running ? 1 : 0,
+            wParam ? 1 : 0,
+            (lParam & ENDSESSION_CLOSEAPP) ? 1 : 0,
+            (lParam & ENDSESSION_CRITICAL) ? 1 : 0,
+            (lParam & ENDSESSION_LOGOFF) ? 1 : 0,
+            snapshot);
+        if (full_test_running)
+            test_all_features::log_external_session_event(source, msg,
+                static_cast<std::uintptr_t>(wParam),
+                static_cast<std::intptr_t>(lParam));
+    };
+
+    if (msg == WM_QUERYENDSESSION) {
+        aida_tracer::set_wndproc_state("queryendsession", hWnd, msg, wParam, lParam);
+        log_session_shutdown("WM_QUERYENDSESSION");
+        return finish("queryendsession_allow", TRUE);
+    }
+
+    if (msg == WM_ENDSESSION) {
+        aida_tracer::set_wndproc_state("endsession", hWnd, msg, wParam, lParam);
+        log_session_shutdown(wParam ? "WM_ENDSESSION_COMMIT" : "WM_ENDSESSION_CANCEL");
+        return finish("endsession", 0);
+    }
 
     aida_tracer::set_wndproc_state("imgui_enter", hWnd, msg, wParam, lParam);
     if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))

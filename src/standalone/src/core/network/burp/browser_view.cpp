@@ -28,8 +28,7 @@ struct view_state_t
 {
     char        initial_url[512] = "about:blank";
     char        profile_subdir[128] = "BurpBrowser";
-    bool        prefer_chrome = false;
-    int         certificate_strategy = static_cast<int>(certificate_strategy_t::chromium_spki_allowlist);
+    int         certificate_strategy = static_cast<int>(certificate_strategy_t::camoufox_spki_allowlist);
     bool        clear_profile_first = false;
     int         proxy_port_override = 0;
     bool        use_proxy_override = false;
@@ -81,7 +80,7 @@ certificate_strategy_t selected_certificate_strategy(view_state_t& st)
     certificate_strategy_t strategy = static_cast<certificate_strategy_t>(st.certificate_strategy);
     if (strategy == certificate_strategy_t::unsafe_ignore_all_for_debug_builds_only &&
         !certificate_strategy_debug_only_available()) {
-        strategy = certificate_strategy_t::chromium_spki_allowlist;
+        strategy = certificate_strategy_t::camoufox_spki_allowlist;
         st.certificate_strategy = static_cast<int>(strategy);
     }
     return strategy;
@@ -172,12 +171,12 @@ void render(float pos_x, float pos_y, float width, float height,
 
     const char* strategy_names[] = {
         "trust_store_only",
-        "chromium_spki_allowlist",
+        "camoufox_spki_allowlist",
         "unsafe_ignore_all_for_debug_builds_only"
     };
     int strategy_values[] = {
         static_cast<int>(certificate_strategy_t::trust_store_only),
-        static_cast<int>(certificate_strategy_t::chromium_spki_allowlist),
+        static_cast<int>(certificate_strategy_t::camoufox_spki_allowlist),
         static_cast<int>(certificate_strategy_t::unsafe_ignore_all_for_debug_builds_only)
     };
     int strategy_count = certificate_strategy_debug_only_available() ? 3 : 2;
@@ -212,7 +211,6 @@ void render(float pos_x, float pos_y, float width, float height,
         browser_launch_config_t cfg;
         cfg.initial_url = std::string(st.initial_url);
         cfg.profile_subdir = std::string(st.profile_subdir);
-        cfg.prefer_chrome = false;
         cfg.certificate_strategy = selected_certificate_strategy(st);
         cfg.clear_profile_first = st.clear_profile_first;
         cfg.proxy_host = "127.0.0.1";

@@ -53,7 +53,7 @@ Every session must be careful with every change. Treat the existing worktree as 
 - Identify whether a touched path affects license, ARC, anti-tamper, driver, protector, bootstrap, MCP, auth/session state, network protocol, deployment, or generated assets before changing it.
 - For security-sensitive changes, prefer the strictest correct behavior. AiDA must maximize security even when that behavior is extremely strict, inconvenient, or likely to expose false positives during development.
 - Never replace a strict security check with a weaker convenience path. If a false positive is proven, narrow the allow rule with evidence and keep equal or stronger enforcement elsewhere.
-- If a requested implementation conflicts with fail-closed licensing, ARC enforcement, driver integrity, anti-tamper, protector guarantees, or the customer fileless launch model, stop and report the conflict before editing.
+- If a requested implementation conflicts with fail-closed licensing, ARC enforcement, driver integrity, anti-tamper, protector guarantees, or the customer disk-backed launch model, stop and report the conflict before editing.
 - Keep changes auditable. A future reviewer should be able to tell which invariant was preserved, what evidence justified the edit, and which verification proved it.
 
 ## Auth And License Design Discipline
@@ -150,16 +150,18 @@ Server: `ruarr@23.88.62.199`, SSH key path: `~/.ssh/aida_server`. Do not expose 
 
 ## Launch and Camoufox Distribution Model
 
-AiDA has two supported launch modes and they must stay separate:
+AiDA has one supported production launch model plus a developer convenience path. The old fileless/in-memory AiDA loader is removed and must not be restored. It did not improve AiDA security and created unnecessary loader, trust-boundary, detection, and reliability risk.
 
-- **Customer/user launch is canonical**: users run `irm https://api.aidapro.net | iex` in PowerShell. This path must load the encrypted AiDAStandalone package without dumping `AiDAStandalone.exe` to disk. Only non-sensitive sidecar dependencies may be written to `%TEMP%`.
+- **Customer/user launch is canonical**: users run the approved installer/bootstrap flow, including `irm https://api.aidapro.net | iex` if that route remains enabled. This path is a disk-backed install/update/launch path for the protected AiDA binary, not an in-memory PE loader. It may download and verify encrypted artifacts, but it must stage and launch a normal protected executable or installer-owned binary from an approved app/runtime directory.
 - **Developer launch is secondary**: double-clicking `AiDAStandalone.exe` in Explorer is for developers only. Developer Camoufox discovery must check the repo-local bundle first, especially `C:\Users\ruar1337\AiDAPrivate\camoufox-135.0.1-beta.24-win.x86_64\camoufox.exe`, then existing build/dependency fallbacks.
-- Customer fileless launch must stage Camoufox only under `%TEMP%\AiDA\camoufox\current` or its staging/backup siblings. It must not write the standalone executable to disk.
+- **Camoufox is the only supported browser for AiDA.** Do not add, restore, or prefer Chrome, Edge, Firefox, system-default browser, Playwright-managed stock browser, or any other browser fallback for browser automation, web search, interception, privacy, or reverse-MCP workflows. Camoufox is mandatory for anti-WebRTC and user-agent privacy guarantees; every developer and customer launch path must keep Camoufox fully functional. Legacy browser probes may only verify disabled/fail-closed behavior and must never launch or depend on a non-Camoufox browser.
+- Do not add, restore, or preserve fileless loader code, in-memory PowerShell PE mapping, direct entrypoint invocation, `AIDA_FILELESS_LAUNCH`, `Invoke-AidaPEInMemory`, or special trust for a PowerShell-hosted AiDA process.
+- Customer sidecars may be staged by the installer/bootstrap only as non-sensitive runtime dependencies in approved app/runtime directories. Do not treat `%TEMP%` staging as a security boundary.
 - Customer sidecars must include the Camoufox browser bundle and a frozen reverse-MCP executable such as `deps\AiDA_CamoufoxReverseMcp.exe`. They must not include the `camoufox-reverse-mcp` source checkout, the `camoufox_reverse_mcp` Python package directory, loose reverse-MCP `.py`/`.pyc` files, or reverse-MCP wheels.
-- The bootstrap script must set `AIDA_FILELESS_LAUNCH=1`, `AIDA_CAMOUFOX_EXECUTABLE`, and `AIDA_CAMOUFOX_MCP_EXECUTABLE` before launching AiDA in customer mode. `AIDA_CAMOUFOX_PYTHON` is only valid when an intentional sidecar Python runtime exists; otherwise the frozen MCP executable path is the authority.
-- Runtime integrity and anti-tamper code must recognize the fileless PowerShell host as a valid customer bootstrap state without weakening license, ARC, or anti-tamper enforcement.
-- `.\deploy_to_server.ps1` is responsible for publishing the encrypted standalone package, ARC blob, and Camoufox customer sidecar metadata after a build. Deployment verification must prove the public package URL, public sidecar URL, and generated bootstrap script are live, and the generated script must contain the Camoufox executable and reverse-MCP environment handoff.
-- If Camoufox works from developer double-click but fails from `irm https://api.aidapro.net | iex`, inspect the live bootstrap metadata and sidecar artifact first: missing `AIDA_CAMOUFOX_SIDECAR_*` values, missing `AIDA_CAMOUFOX_MCP_EXECUTABLE`, or a sidecar containing only browser/Python source content means the customer bridge cannot exist.
+- The bootstrap or installer must set `AIDA_CAMOUFOX_EXECUTABLE` and `AIDA_CAMOUFOX_MCP_EXECUTABLE` only after the verified sidecar exists. `AIDA_CAMOUFOX_PYTHON` is only valid when an intentional sidecar Python runtime exists; otherwise the frozen MCP executable path is the authority.
+- Runtime integrity and anti-tamper code must enforce the normal protected process, license, ARC, and driver invariants. Do not add PowerShell/fileless-host exceptions.
+- `.\deploy_to_server.ps1` is responsible for publishing the encrypted standalone package, ARC blob, and Camoufox customer sidecar metadata after a build. Deployment verification must prove the approved bootstrap/install path and Camoufox sidecar handoff are live, and the generated script must not contain fileless loader markers.
+- If Camoufox works from developer double-click but fails from the customer bootstrap path, inspect the live bootstrap metadata and staged sidecar artifact first: missing `AIDA_CAMOUFOX_SIDECAR_*` values, missing `AIDA_CAMOUFOX_MCP_EXECUTABLE`, or a sidecar containing only browser/Python source content means the customer bridge cannot exist.
 
 ## Key Patterns and Conventions
 
@@ -282,7 +284,7 @@ Key files:
 
 Rules:
 - Windows-first C++ with many Win32 APIs, `#pragma comment(lib, ...)` dependencies, and header-heavy modules.
-- Preserve the dual launch model: customer fileless PowerShell launch uses the `%TEMP%` Camoufox sidecar and frozen reverse-MCP executable, while Explorer double-click uses developer-local dependencies.
+- Preserve the launch split: customer bootstrap/installer launch is disk-backed and uses the verified Camoufox sidecar plus frozen reverse-MCP executable, while Explorer double-click uses developer-local dependencies.
 - Use existing `work_queue` for background work; startup intentionally offloads chat, network, scanner, MITM, script engine, code hashes, anti-tamper, session health, and driver bridge work.
 - Preserve SEH wrappers and diagnostic logging patterns around render/init calls.
 - UI state is largely global. Prefer extending existing `globals::ui`, `helpers`, and `core/ui` patterns instead of adding parallel state systems.

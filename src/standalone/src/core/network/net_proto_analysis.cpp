@@ -49,6 +49,47 @@ struct udp_session_t {
     std::vector<udp_message_t> messages;
 };
 
+struct scan_deadline_t {
+    std::chrono::steady_clock::time_point started;
+    std::chrono::steady_clock::time_point deadline;
+    std::uint32_t timeout_ms = 0;
+    bool hit = false;
+    std::string stage = "entry";
+
+    explicit scan_deadline_t(std::uint32_t ms)
+        : started(std::chrono::steady_clock::now()),
+          deadline(started + std::chrono::milliseconds(ms)),
+          timeout_ms(ms)
+    {
+    }
+
+    bool expired(const char* next_stage)
+    {
+        stage = next_stage ? next_stage : stage;
+        if (hit)
+            return true;
+        if (std::chrono::steady_clock::now() < deadline)
+            return false;
+        hit = true;
+        return true;
+    }
+
+    std::uint64_t elapsed_ms() const
+    {
+        return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count());
+    }
+
+    std::uint64_t remaining_ms() const
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline)
+            return 0;
+        return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - now).count());
+    }
+};
+
 std::mutex& udp_mutex()
 {
     static std::mutex m;
@@ -228,6 +269,77 @@ bool is_socket_module(const std::string& lower_name)
            lower_name.find("wsock32") != std::string::npos;
 }
 
+const wchar_t* socket_module_dll_name(const std::string& lower_name)
+{
+    if (lower_name.find("ws2_32") != std::string::npos)
+        return L"ws2_32.dll";
+    if (lower_name.find("mswsock") != std::string::npos)
+        return L"mswsock.dll";
+    if (lower_name.find("wsock32") != std::string::npos)
+        return L"wsock32.dll";
+    return nullptr;
+}
+
+std::uint64_t local_image_size(HMODULE module)
+{
+    if (!module)
+        return 0;
+    const auto base = reinterpret_cast<const std::uint8_t*>(module);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 || dos->e_lfanew > 0x100000)
+        return 0;
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE)
+        return 0;
+    return nt->OptionalHeader.SizeOfImage;
+}
+
+std::uint64_t resolve_local_export_rva(const std::string& lower_module_name,
+                                       const char* export_name,
+                                       nlohmann::json& diag)
+{
+    diag = nlohmann::json::object();
+    diag["export"] = export_name ? export_name : "";
+    diag["source"] = "local_rva";
+    const wchar_t* dll = socket_module_dll_name(lower_module_name);
+    if (!dll) {
+        diag["ok"] = false;
+        diag["reason"] = "not_a_known_socket_module";
+        return 0;
+    }
+    HMODULE module = GetModuleHandleW(dll);
+    bool loaded_for_lookup = false;
+    if (!module) {
+        module = LoadLibraryExW(dll, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32 | DONT_RESOLVE_DLL_REFERENCES);
+        loaded_for_lookup = module != nullptr;
+    }
+    if (!module) {
+        diag["ok"] = false;
+        diag["reason"] = "local_module_unavailable";
+        diag["gle"] = GetLastError();
+        return 0;
+    }
+    const auto base = reinterpret_cast<std::uint64_t>(module);
+    const std::uint64_t size = local_image_size(module);
+    FARPROC proc = export_name ? GetProcAddress(module, export_name) : nullptr;
+    std::uint64_t rva = 0;
+    if (proc && size) {
+        const std::uint64_t addr = reinterpret_cast<std::uint64_t>(proc);
+        if (addr >= base && addr < base + size)
+            rva = addr - base;
+    }
+    diag["ok"] = rva != 0;
+    diag["module_size"] = size;
+    diag["loaded_for_lookup"] = loaded_for_lookup;
+    if (rva)
+        diag["rva"] = fmt_addr(rva);
+    else
+        diag["reason"] = proc ? "local_export_forwarded_or_outside_module" : "local_export_missing";
+    if (loaded_for_lookup)
+        FreeLibrary(module);
+    return rva;
+}
+
 bool skip_scan_module(const driver_bridge::module_info_t& module)
 {
     const std::string name = lower_copy(module.name);
@@ -243,7 +355,9 @@ bool skip_scan_module(const driver_bridge::module_info_t& module)
     return false;
 }
 
-std::vector<api_target_t> resolve_socket_apis(const std::vector<driver_bridge::module_info_t>& modules)
+std::vector<api_target_t> resolve_socket_apis(const std::vector<driver_bridge::module_info_t>& modules,
+                                              scan_deadline_t& deadline,
+                                              nlohmann::json& diagnostics)
 {
     static const struct {
         const char* name;
@@ -258,16 +372,59 @@ std::vector<api_target_t> resolve_socket_apis(const std::vector<driver_bridge::m
     };
 
     std::vector<api_target_t> apis;
+    diagnostics = nlohmann::json::object();
+    diagnostics["socket_modules"] = nlohmann::json::array();
+    diagnostics["export_resolution"] = nlohmann::json::array();
+    diagnostics["local_rva_hits"] = 0;
+    diagnostics["remote_fallback_attempts"] = 0;
+    diagnostics["remote_fallback_hits"] = 0;
     for (const auto& module : modules) {
-        if (!is_socket_module(lower_copy(module.name)))
+        if (deadline.expired("resolve_socket_exports_module"))
+            break;
+        const std::string lower_name = lower_copy(module.name);
+        if (!is_socket_module(lower_name))
             continue;
+        if (diagnostics["socket_modules"].size() < 8)
+            diagnostics["socket_modules"].push_back(nlohmann::json{{"name", module.name}, {"base", fmt_addr(module.base)}, {"size", module.size}, {"path", module.path}});
         for (const auto& n : names) {
-            const std::uint64_t va = driver_bridge::resolve_export(module.base, n.name);
+            if (deadline.expired("resolve_socket_exports_export"))
+                break;
+            nlohmann::json rdiag;
+            const std::uint64_t rva = resolve_local_export_rva(lower_name, n.name, rdiag);
+            std::uint64_t va = 0;
+            if (rva != 0 && (module.size == 0 || rva < module.size)) {
+                va = module.base + rva;
+                rdiag["remote_va"] = fmt_addr(va);
+                diagnostics["local_rva_hits"] = diagnostics.value("local_rva_hits", 0) + 1;
+            } else {
+                if (rva != 0)
+                    rdiag["reason"] = "local_rva_outside_remote_module_size";
+                if (deadline.remaining_ms() > 100) {
+                    diagnostics["remote_fallback_attempts"] = diagnostics.value("remote_fallback_attempts", 0) + 1;
+                    const ULONGLONG t0 = GetTickCount64();
+                    va = driver_bridge::resolve_export(module.base, n.name);
+                    rdiag["remote_fallback_elapsed_ms"] = GetTickCount64() - t0;
+                    rdiag["remote_fallback_va"] = va ? nlohmann::json(fmt_addr(va)) : nlohmann::json(nullptr);
+                    if (va)
+                        diagnostics["remote_fallback_hits"] = diagnostics.value("remote_fallback_hits", 0) + 1;
+                } else {
+                    rdiag["remote_fallback_skipped"] = true;
+                    rdiag["remote_fallback_skip_reason"] = "deadline_remaining_too_small";
+                }
+            }
+            rdiag["module"] = module.name;
+            rdiag["module_base"] = fmt_addr(module.base);
+            rdiag["deadline_hit"] = deadline.hit;
+            if (diagnostics["export_resolution"].size() < 32)
+                diagnostics["export_resolution"].push_back(std::move(rdiag));
             if (va == 0)
                 continue;
             apis.push_back({n.name, n.direction, va});
         }
     }
+    diagnostics["api_count"] = apis.size();
+    diagnostics["deadline_hit"] = deadline.hit;
+    diagnostics["stage"] = deadline.stage;
     return apis;
 }
 
@@ -653,8 +810,40 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
     out = nlohmann::json::object();
     error.clear();
     std::uint32_t pid = 0;
-    if (!ensure_process_context(input.process_id, pid, error))
+    if (!ensure_process_context(input.process_id, pid, error)) {
+        const std::string lower_error = lower_copy(error);
+        std::string root_cause = "process_context_unavailable";
+        if (lower_error.find("process_id is required") != std::string::npos)
+            root_cause = "missing_target_process";
+        else if (lower_error.find("driver bridge") != std::string::npos)
+            root_cause = "driver_bridge_not_connected";
+        else if (lower_error.find("openprocess failed") != std::string::npos)
+            root_cause = "target_process_open_failed";
+        out["dependency_unavailable"] = true;
+        out["root_cause"] = root_cause;
+        out["requested_process_id"] = input.process_id;
+        out["attached_pid"] = driver_bridge::attached_pid();
+        out["using_kernel_driver"] = driver_bridge::using_kernel_driver();
+        out["attached_pids"] = driver_bridge::attached_pids();
+        out["results"] = nlohmann::json::array();
+        out["result_count"] = 0;
+        out["count"] = 0;
+        out["deadline_hit"] = false;
+        out["elapsed_ms"] = 0;
+        out["scanned_modules"] = nlohmann::json::array();
+        out["scanned_module_count"] = 0;
+        out["scanned_bytes"] = 0;
+        out["stage"] = "dependency_check";
+        out["limitations"] = nlohmann::json::array({"send/recv scan requires a live target process and connected driver bridge"});
+        diag::log_tagged_fmt("net_proto",
+            "find_sendrecv dependency_failed requested_pid=%u attached_pid=%u using_driver=%d root=%s error=%s",
+            input.process_id,
+            driver_bridge::attached_pid(),
+            driver_bridge::using_kernel_driver() ? 1 : 0,
+            root_cause.c_str(),
+            error.c_str());
         return false;
+    }
 
     sendrecv_scan_options_t options = input;
     if (options.max_results == 0)
@@ -669,13 +858,52 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
         options.max_scan_bytes = 67108864;
     if (options.max_scan_bytes > 134217728)
         options.max_scan_bytes = 134217728;
+    if (options.timeout_ms == 0)
+        options.timeout_ms = 3500;
+    if (options.timeout_ms < 250)
+        options.timeout_ms = 250;
+    if (options.timeout_ms > 30000)
+        options.timeout_ms = 30000;
 
+    scan_deadline_t deadline(options.timeout_ms);
+    diag::log_tagged_fmt("net_proto",
+        "find_sendrecv begin pid=%u max_results=%u max_modules=%u max_scan_bytes=%llu timeout_ms=%u",
+        pid,
+        options.max_results,
+        options.max_modules,
+        static_cast<unsigned long long>(options.max_scan_bytes),
+        options.timeout_ms);
+    deadline.stage = "enumerate_modules";
     auto modules = driver_bridge::enumerate_modules_for(pid);
-    const auto apis = resolve_socket_apis(modules);
+    nlohmann::json socket_resolution = nlohmann::json::object();
+    if (!deadline.expired("resolve_socket_exports"))
+        socket_resolution["module_count"] = modules.size();
+    const auto apis = deadline.hit ? std::vector<api_target_t>() : resolve_socket_apis(modules, deadline, socket_resolution);
     if (apis.empty()) {
         out["process_id"] = pid;
         out["results"] = nlohmann::json::array();
+        out["result_count"] = 0;
+        out["count"] = 0;
+        out["deadline_hit"] = deadline.hit;
+        out["elapsed_ms"] = deadline.elapsed_ms();
+        out["timeout_ms"] = options.timeout_ms;
+        out["scanned_modules"] = nlohmann::json::array();
+        out["scanned_module_count"] = 0;
+        out["scanned_bytes"] = 0;
+        out["stage"] = deadline.stage;
+        out["socket_api_count"] = 0;
+        out["diagnostics"] = nlohmann::json{{"socket_resolution", socket_resolution}};
         out["evidence"] = nlohmann::json::array({"socket API exports not resolved in loaded modules"});
+        out["limitations"] = nlohmann::json::array({
+            "socket API export resolution stopped before scanning application modules",
+            "no send/recv callsite results are fabricated when socket exports are unavailable"
+        });
+        diag::log_tagged_fmt("net_proto",
+            "find_sendrecv done pid=%u results=0 apis=0 scanned_modules=0 scanned_bytes=0 deadline_hit=%d elapsed_ms=%llu stage=%s",
+            pid,
+            deadline.hit ? 1 : 0,
+            static_cast<unsigned long long>(deadline.elapsed_ms()),
+            deadline.stage.c_str());
         return true;
     }
 
@@ -688,23 +916,65 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
 
     nlohmann::json results = nlohmann::json::array();
     nlohmann::json scanned_modules = nlohmann::json::array();
+    nlohmann::json module_diagnostics = nlohmann::json::array();
     std::set<std::uint64_t> seen_callsites;
     std::uint64_t scanned_bytes = 0;
     std::uint32_t scanned_count = 0;
+    std::string stop_reason;
+    bool stopped = false;
+    auto stop_scan = [&](const char* reason, const char* stage) {
+        stopped = true;
+        if (reason && stop_reason.empty())
+            stop_reason = reason;
+        deadline.expired(stage);
+    };
 
     for (const auto& module : modules) {
+        if (deadline.expired("module_loop")) {
+            stop_scan("deadline_before_module", "module_loop");
+            break;
+        }
         if (results.size() >= options.max_results)
             break;
-        if (scanned_count >= options.max_modules || scanned_bytes >= options.max_scan_bytes)
+        if (scanned_count >= options.max_modules || scanned_bytes >= options.max_scan_bytes) {
+            stop_reason = scanned_count >= options.max_modules ? "max_modules_reached" : "max_scan_bytes_reached";
             break;
+        }
         if (skip_scan_module(module) || module.base == 0 || module.size < 16)
             continue;
 
         const std::uint64_t remaining = options.max_scan_bytes - scanned_bytes;
         const std::size_t to_read = static_cast<std::size_t>((std::min<std::uint64_t>)(module.size, (std::min<std::uint64_t>)(remaining, 16777216)));
         std::vector<std::uint8_t> bytes;
-        if (!driver_bridge::read_memory_for(pid, module.base, to_read, bytes) || bytes.size() < 16)
+        nlohmann::json module_diag;
+        module_diag["name"] = module.name;
+        module_diag["base"] = fmt_addr(module.base);
+        module_diag["size"] = module.size;
+        module_diag["path"] = module.path;
+        module_diag["requested_read_bytes"] = to_read;
+        deadline.stage = "module_read";
+        const ULONGLONG read_t0 = GetTickCount64();
+        const bool read_ok = driver_bridge::read_memory_for(pid, module.base, to_read, bytes);
+        module_diag["read_ok"] = read_ok;
+        module_diag["read_elapsed_ms"] = GetTickCount64() - read_t0;
+        module_diag["bytes_read"] = bytes.size();
+        if (!read_ok || bytes.size() < 16) {
+            module_diag["rejection_reason"] = read_ok ? "read_too_small" : "read_failed";
+            if (module_diagnostics.size() < 32)
+                module_diagnostics.push_back(std::move(module_diag));
+            if (deadline.expired("after_module_read")) {
+                stop_scan("deadline_after_module_read", "after_module_read");
+                break;
+            }
             continue;
+        }
+        if (deadline.expired("after_module_read")) {
+            module_diag["deadline_hit_after_read"] = true;
+            if (module_diagnostics.size() < 32)
+                module_diagnostics.push_back(std::move(module_diag));
+            stop_scan("deadline_after_module_read", "after_module_read");
+            break;
+        }
 
         ++scanned_count;
         scanned_bytes += bytes.size();
@@ -712,14 +982,29 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
 
         std::map<std::uint64_t, const api_target_t*> import_slots;
         for (std::size_t i = 0; i + 8 <= bytes.size(); i += 1) {
+            if ((i & 0x3fffu) == 0 && deadline.expired("scan_import_slots")) {
+                stop_scan("deadline_import_slot_scan", "scan_import_slots");
+                break;
+            }
             const std::uint64_t ptr = le64(bytes.data() + i);
             auto it = api_by_address.find(ptr);
             if (it != api_by_address.end())
                 import_slots[module.base + i] = it->second;
         }
+        module_diag["import_slot_count"] = import_slots.size();
+        if (stopped) {
+            module_diag["stop_reason"] = stop_reason;
+            if (module_diagnostics.size() < 32)
+                module_diagnostics.push_back(std::move(module_diag));
+            break;
+        }
 
         std::map<std::uint64_t, const api_target_t*> thunks;
         for (std::size_t i = 0; i + 6 <= bytes.size(); ++i) {
+            if ((i & 0x3fffu) == 0 && deadline.expired("scan_import_thunks")) {
+                stop_scan("deadline_import_thunk_scan", "scan_import_thunks");
+                break;
+            }
             if (bytes[i] != 0xff || bytes[i + 1] != 0x25)
                 continue;
             std::int32_t rel = 0;
@@ -731,8 +1016,19 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
         }
         for (const auto& t : thunks)
             excluded_targets.insert(t.first);
+        module_diag["import_thunk_count"] = thunks.size();
+        if (stopped) {
+            module_diag["stop_reason"] = stop_reason;
+            if (module_diagnostics.size() < 32)
+                module_diagnostics.push_back(std::move(module_diag));
+            break;
+        }
 
         for (std::size_t i = 0; i + 6 <= bytes.size() && results.size() < options.max_results; ++i) {
+            if ((i & 0x3fffu) == 0 && deadline.expired("scan_callsites")) {
+                stop_scan("deadline_callsite_scan", "scan_callsites");
+                break;
+            }
             const api_target_t* api = nullptr;
             bool iat = false;
             std::uint64_t callsite = module.base + i;
@@ -760,19 +1056,50 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
             const std::uint64_t handler = find_probable_function_start(bytes, i, module.base);
             add_sendrecv_result(results, seen_callsites, module, bytes, *api, callsite, handler, 0, iat, excluded_targets, options.max_results);
         }
+        module_diag["results_after_module"] = results.size();
+        module_diag["deadline_hit"] = deadline.hit;
+        module_diag["elapsed_ms"] = deadline.elapsed_ms();
+        if (module_diagnostics.size() < 32)
+            module_diagnostics.push_back(std::move(module_diag));
+        if (stopped)
+            break;
     }
 
     out["process_id"] = pid;
     out["results"] = std::move(results);
     out["result_count"] = out["results"].size();
+    out["count"] = out["result_count"];
+    out["deadline_hit"] = deadline.hit;
+    out["elapsed_ms"] = deadline.elapsed_ms();
+    out["timeout_ms"] = options.timeout_ms;
     out["scanned_modules"] = std::move(scanned_modules);
+    out["scanned_module_count"] = scanned_count;
     out["scanned_bytes"] = scanned_bytes;
     out["socket_api_count"] = apis.size();
+    out["stage"] = deadline.hit ? deadline.stage : (stop_reason.empty() ? "complete" : stop_reason);
+    out["diagnostics"] = nlohmann::json{
+        {"socket_resolution", socket_resolution},
+        {"module_diagnostics", module_diagnostics},
+        {"stop_reason", stop_reason.empty() ? "complete" : stop_reason},
+        {"seen_callsite_count", seen_callsites.size()}
+    };
     out["limitations"] = nlohmann::json::array({
         "IAT and direct relative calls are detected; custom syscall wrappers may require manual follow-up",
         "serializer and deserializer addresses are nearest-call heuristics unless a dedicated trace confirms writes",
-        "system modules are skipped to focus on application handlers"
+        "system modules are skipped to focus on application handlers",
+        "bounded deadline returns partial diagnostics without inventing send/recv handlers"
     });
+    diag::log_tagged_fmt("net_proto",
+        "find_sendrecv done pid=%u results=%u apis=%zu scanned_modules=%u scanned_bytes=%llu deadline_hit=%d elapsed_ms=%llu stage=%s stop=%s",
+        pid,
+        static_cast<unsigned>(out["result_count"].get<std::size_t>()),
+        apis.size(),
+        scanned_count,
+        static_cast<unsigned long long>(scanned_bytes),
+        deadline.hit ? 1 : 0,
+        static_cast<unsigned long long>(deadline.elapsed_ms()),
+        out["stage"].get<std::string>().c_str(),
+        stop_reason.empty() ? "complete" : stop_reason.c_str());
     return true;
 }
 

@@ -11,7 +11,7 @@ namespace browser {
 enum class certificate_strategy_t : uint8_t
 {
     trust_store_only = 0,
-    chromium_spki_allowlist = 1,
+    camoufox_spki_allowlist = 1,
     unsafe_ignore_all_for_debug_builds_only = 2
 };
 
@@ -21,8 +21,7 @@ struct browser_launch_config_t
     uint16_t    proxy_port = 8443;
     std::string profile_subdir = "BurpBrowser";
     std::string initial_url;
-    bool        prefer_chrome = false;
-    certificate_strategy_t certificate_strategy = certificate_strategy_t::chromium_spki_allowlist;
+    certificate_strategy_t certificate_strategy = certificate_strategy_t::camoufox_spki_allowlist;
     std::string spki_allowlist;
     bool        clear_profile_first = false;
 };
@@ -35,7 +34,7 @@ struct browser_status_t
     std::string profile_path;
     uint16_t    proxy_port = 0;
     uint64_t    launched_ms = 0;
-    certificate_strategy_t certificate_strategy = certificate_strategy_t::chromium_spki_allowlist;
+    certificate_strategy_t certificate_strategy = certificate_strategy_t::camoufox_spki_allowlist;
     std::string spki_hash_prefix;
 };
 
@@ -49,8 +48,6 @@ bool kill_all();
 std::vector<browser_status_t> list_running();
 void                          register_browser_pid(uint32_t pid);
 
-bool        detect_edge_path(std::string& out_path);
-bool        detect_chrome_path(std::string& out_path);
 bool        detect_camoufox_path(std::string& out_path);
 std::string profile_root();
 std::string compute_profile_path(const std::string& subdir);

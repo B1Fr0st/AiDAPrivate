@@ -35,6 +35,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <filesystem>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -1677,11 +1678,11 @@ namespace {
         }
     }
 
-    void test_cert_profile_manager_firefox(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    void test_cert_profile_manager_public_ca_export(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         (void)skipped;
-        const char* tag = "cert_profile_fx";
+        const char* tag = "cert_profile_ca";
         const ULONGLONG start = GetTickCount64();
-        log_msg(hf, tag, "START -- Firefox cert profile preparation pid=%lu tid=%lu",
+        log_msg(hf, tag, "START -- public CA export validation for Camoufox proxy trust artifacts pid=%lu tid=%lu",
             static_cast<unsigned long>(GetCurrentProcessId()),
             static_cast<unsigned long>(GetCurrentThreadId()));
         log_msg(hf, tag, "PHASE -- ca_initialize begin ready=%s timeout_ms=15000",
@@ -1721,7 +1722,7 @@ namespace {
             ca.cert.get(),
             static_cast<unsigned long long>(GetTickCount64() - start));
         if (!ok || !ca.valid) {
-            log_msg(hf, tag, "FAIL -- Firefox profile preparation unavailable because CA initialization returned ok=%s", ok ? "true" : "false");
+            log_msg(hf, tag, "FAIL -- public CA export unavailable because CA initialization returned ok=%s", ok ? "true" : "false");
             failed.fetch_add(1);
             return;
         }
@@ -1757,79 +1758,36 @@ namespace {
                 trust_result.timed_out ? 1 : 0,
                 trust_result.threw ? 1 : 0);
         }
-        log_msg(hf, tag, "PHASE -- prepare_firefox_profile begin proxy=127.0.0.1:18443 manager_timeout_ms=12000");
-        auto status = cert_intercept::profiles::prepare_firefox_profile(ca, "127.0.0.1", 18443);
-        const ULONGLONG after_prepare = GetTickCount64();
-        log_msg(hf, tag, "PHASE -- prepare_firefox_profile end ok=%d prepared=%d files=%d ca_nonempty=%d ca_exported=%d trust=%d trust_verified=%d firefox=%d timeout=%d status_elapsed_ms=%llu test_elapsed_ms=%llu gle=%lu op=%s error=%s",
-            status.ok ? 1 : 0,
-            status.prepared ? 1 : 0,
-            status.profile_files_valid ? 1 : 0,
-            status.ca_files_nonempty ? 1 : 0,
-            status.ca_exported ? 1 : 0,
-            status.current_user_ca_trusted ? 1 : 0,
-            status.trust_readiness_verified ? 1 : 0,
-            status.firefox_detected ? 1 : 0,
-            status.timed_out ? 1 : 0,
-            static_cast<unsigned long long>(status.elapsed_ms),
-            static_cast<unsigned long long>(after_prepare >= start ? after_prepare - start : 0),
-            static_cast<unsigned long>(status.last_win32_error),
-            status.last_operation.c_str(),
-            status.error.c_str());
-        log_msg(hf, tag, "PHASE -- prepare_firefox_profile paths profile=%s user_js=%s policies=%s pem=%s der=%s firefox_path=%s",
-            status.profile_path.u8string().c_str(),
-            status.user_js_path.u8string().c_str(),
-            status.policies_path.u8string().c_str(),
-            status.ca_pem_path.u8string().c_str(),
-            status.ca_der_path.u8string().c_str(),
-            status.firefox_path.c_str());
-        bool profile_files_ready =
-            !status.ca_pem_path.empty() && !status.ca_der_path.empty() &&
-            !status.user_js_path.empty() && !status.policies_path.empty() &&
-            status.ca_files_nonempty && status.profile_files_valid &&
-            status.proxy_configured && status.http3_disabled &&
-            status.launch_arguments.find("--profile") != std::string::npos;
-        bool profile_ready = profile_files_ready &&
-            !status.runtime_validation_performed &&
-            !status.runtime_validation_valid &&
-            status.prepared &&
-            status.trust_readiness_verified &&
-            status.ok;
-        if (profile_ready) {
-            log_msg(hf, tag, "PASS -- Firefox profile readiness profile=%s firefox_detected=%s trust=%s trust_verified=%s prepared=%s elapsed_ms=%llu",
-                status.profile_path.u8string().c_str(),
-                status.firefox_detected ? "true" : "false",
-                status.current_user_ca_trusted ? "true" : "false",
-                status.trust_readiness_verified ? "true" : "false",
-                status.prepared ? "true" : "false",
-                static_cast<unsigned long long>(GetTickCount64() - start));
+        log_msg(hf, tag, "PHASE -- export_public_ca_files begin");
+        auto exported = cert_intercept::profiles::export_public_ca_files(ca);
+        const bool pem_exists = !exported.pem_path.empty() && std::filesystem::exists(exported.pem_path);
+        const bool der_exists = !exported.der_path.empty() && std::filesystem::exists(exported.der_path);
+        const auto pem_size = pem_exists ? std::filesystem::file_size(exported.pem_path) : 0ULL;
+        const auto der_size = der_exists ? std::filesystem::file_size(exported.der_path) : 0ULL;
+        log_msg(hf, tag, "PHASE -- export_public_ca_files end ok=%d dir=%s pem=%s der=%s pem_exists=%d der_exists=%d pem_size=%llu der_size=%llu error=%s elapsed_ms=%llu",
+            exported.ok ? 1 : 0,
+            exported.directory.u8string().c_str(),
+            exported.pem_path.u8string().c_str(),
+            exported.der_path.u8string().c_str(),
+            pem_exists ? 1 : 0,
+            der_exists ? 1 : 0,
+            static_cast<unsigned long long>(pem_size),
+            static_cast<unsigned long long>(der_size),
+            exported.error.c_str(),
+            static_cast<unsigned long long>(GetTickCount64() - start));
+        if (exported.ok && pem_exists && der_exists && pem_size > 0 && der_size > 0) {
+            log_msg(hf, tag, "PASS -- public CA export artifacts are ready for Camoufox proxy trust handoff");
             passed.fetch_add(1);
-        } else if (profile_files_ready && (!status.trust_readiness_verified || !status.prepared || !status.ok)) {
-            log_msg(hf, tag, "FAIL -- Firefox profile files exist but full interception readiness is not proven profile=%s trust=%s trust_verified=%s prepared=%s firefox_detected=%s runtime_checked=%s timeout=%s op=%s error=%s elapsed_ms=%llu",
-                status.profile_path.u8string().c_str(),
-                status.current_user_ca_trusted ? "true" : "false",
-                status.trust_readiness_verified ? "true" : "false",
-                status.prepared ? "true" : "false",
-                status.firefox_detected ? "true" : "false",
-                status.runtime_validation_performed ? "true" : "false",
-                status.timed_out ? "true" : "false",
-                status.last_operation.c_str(),
-                status.error.c_str(),
-                static_cast<unsigned long long>(GetTickCount64() - start));
-            failed.fetch_add(1);
-        } else {
-            log_msg(hf, tag, "FAIL -- Firefox profile readiness invalid error=%s files=%s trust=%s prepared=%s firefox_detected=%s runtime_checked=%s ok=%s timeout=%s op=%s elapsed_ms=%llu",
-                status.error.c_str(),
-                status.profile_files_valid ? "true" : "false",
-                status.current_user_ca_trusted ? "true" : "false",
-                status.prepared ? "true" : "false",
-                status.firefox_detected ? "true" : "false",
-                status.runtime_validation_performed ? "true" : "false",
-                status.ok ? "true" : "false",
-                status.timed_out ? "true" : "false",
-                status.last_operation.c_str(),
-                static_cast<unsigned long long>(GetTickCount64() - start));
-            failed.fetch_add(1);
+            return;
         }
+        log_msg(hf, tag, "FAIL -- public CA export artifacts were not fully written ok=%d pem_exists=%d der_exists=%d pem_size=%llu der_size=%llu error=%s",
+            exported.ok ? 1 : 0,
+            pem_exists ? 1 : 0,
+            der_exists ? 1 : 0,
+            static_cast<unsigned long long>(pem_size),
+            static_cast<unsigned long long>(der_size),
+            exported.error.c_str());
+        failed.fetch_add(1);
     }
 
     void test_cert_generator_server_cert(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -2097,8 +2055,8 @@ namespace {
 
         std::vector<driver_bridge::module_info_t> browser_modules;
         driver_bridge::module_info_t browser;
-        browser.name = "firefox.exe";
-        browser.path = "C:\\Program Files\\Mozilla Firefox\\firefox.exe";
+        browser.name = "camoufox.exe";
+        browser.path = "C:\\Users\\ruar1337\\AiDAPrivate\\camoufox-135.0.1-beta.24-win.x86_64\\camoufox.exe";
         browser_modules.push_back(browser);
         context.browser_trust_policy_or_ct_block = true;
         auto browser_policy = cert_intercept::classify_modules(105, browser_modules, context);
@@ -3616,7 +3574,7 @@ void phase_network_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& 
     call_test(test_cert_generator_spki_hash, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
-    call_test_s(test_cert_profile_manager_firefox, hf, passed, failed, skipped);
+    call_test_s(test_cert_profile_manager_public_ca_export, hf, passed, failed, skipped);
 
     if (cancelled && cancelled()) return;
     call_test(test_cert_generator_server_cert, hf, passed, failed);

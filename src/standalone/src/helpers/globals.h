@@ -15,6 +15,7 @@
 #include <atomic>
 #include <mutex>
 #include <chrono>
+#include <algorithm>
 #include <unordered_map>
 #include <filesystem>
 #include <fstream>
@@ -77,18 +78,79 @@ enum class bottom_tab_t : int {
 namespace output_log {
 	inline std::deque<std::string> lines[static_cast<int>(bottom_tab_t::COUNT)];
 	inline constexpr size_t MAX_LINES = 4096;
+	inline constexpr size_t MAX_RENDER_LINES = MAX_LINES;
+	inline std::mutex mutex;
+	inline uint64_t version[static_cast<int>(bottom_tab_t::COUNT)] = {};
 	inline bool auto_scroll[static_cast<int>(bottom_tab_t::COUNT)] = { true, true, true, true, true };
 	inline bool select_all[static_cast<int>(bottom_tab_t::COUNT)] = { false, false, false, false, false };
 
+	inline int tab_index(bottom_tab_t tab) {
+		int idx = static_cast<int>(tab);
+		if (idx < 0 || idx >= static_cast<int>(bottom_tab_t::COUNT))
+			return static_cast<int>(bottom_tab_t::output);
+		return idx;
+	}
 	inline void push(bottom_tab_t tab, const std::string& line) {
 		if (tab == bottom_tab_t::terminal) return;
-		auto& q = lines[static_cast<int>(tab)];
+		int idx = tab_index(tab);
+		std::lock_guard<std::mutex> lk(mutex);
+		auto& q = lines[idx];
 		q.push_back(line);
-		if (q.size() > MAX_LINES) q.pop_front();
+		while (q.size() > MAX_LINES) q.pop_front();
+		++version[idx];
 	}
 	inline void clear(bottom_tab_t tab) {
-		lines[static_cast<int>(tab)].clear();
-		select_all[static_cast<int>(tab)] = false;
+		int idx = tab_index(tab);
+		std::lock_guard<std::mutex> lk(mutex);
+		lines[idx].clear();
+		select_all[idx] = false;
+		++version[idx];
+	}
+	inline void set_select_all(bottom_tab_t tab, bool enabled) {
+		std::lock_guard<std::mutex> lk(mutex);
+		select_all[tab_index(tab)] = enabled;
+	}
+	inline bool is_select_all(bottom_tab_t tab) {
+		std::lock_guard<std::mutex> lk(mutex);
+		return select_all[tab_index(tab)];
+	}
+	inline bool is_auto_scroll(bottom_tab_t tab) {
+		std::lock_guard<std::mutex> lk(mutex);
+		return auto_scroll[tab_index(tab)];
+	}
+	inline size_t size(bottom_tab_t tab) {
+		std::lock_guard<std::mutex> lk(mutex);
+		return lines[tab_index(tab)].size();
+	}
+	inline bool empty(bottom_tab_t tab) {
+		std::lock_guard<std::mutex> lk(mutex);
+		return lines[tab_index(tab)].empty();
+	}
+	inline uint64_t current_version(bottom_tab_t tab) {
+		std::lock_guard<std::mutex> lk(mutex);
+		return version[tab_index(tab)];
+	}
+	inline void snapshot_all(bottom_tab_t tab, std::deque<std::string>& out, uint64_t* out_version = nullptr) {
+		int idx = tab_index(tab);
+		std::lock_guard<std::mutex> lk(mutex);
+		out = lines[idx];
+		if (out_version) *out_version = version[idx];
+	}
+	inline void snapshot_tail(bottom_tab_t tab, size_t max_lines, std::vector<std::string>& out, size_t* total_lines = nullptr, uint64_t* out_version = nullptr) {
+		int idx = tab_index(tab);
+		std::lock_guard<std::mutex> lk(mutex);
+		const auto& q = lines[idx];
+		size_t total = q.size();
+		size_t count = (std::min)(total, max_lines);
+		size_t skip = total - count;
+		out.clear();
+		out.reserve(count);
+		size_t pos = 0;
+		for (const auto& line : q) {
+			if (pos++ >= skip) out.push_back(line);
+		}
+		if (total_lines) *total_lines = total;
+		if (out_version) *out_version = version[idx];
 	}
 }
 

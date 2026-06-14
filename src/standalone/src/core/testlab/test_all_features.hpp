@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 
 namespace test_all_features {
 
@@ -12,6 +13,7 @@ namespace test_all_features {
 	bool is_running();
 	void set_progress_step(const char* label);
 	void format_debug_snapshot(char* out, std::size_t cap);
+	void log_external_session_event(const char* source, unsigned msg, std::uintptr_t wparam, std::intptr_t lparam);
 	void run_parser_proof_smoke();
 	void write_full_test_log_line(void* hf, const char* data, std::size_t size, bool force_flush = false);
 	void flush_full_test_log(void* hf);

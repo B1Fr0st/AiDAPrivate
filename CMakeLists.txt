@@ -1294,6 +1294,7 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/ai/standalone_ai_client.cpp"
             "${STANDALONE_ROOT}/core/ai/standalone_chat.cpp"
             "${STANDALONE_ROOT}/core/runtime/standalone_license.cpp"
+            "${STANDALONE_ROOT}/core/runtime/customer_capsule.cpp"
             "${STANDALONE_ROOT}/core/runtime/standalone_license_transport.cpp"
             "${STANDALONE_ROOT}/core/runtime/license_state.cpp"
             "${STANDALONE_ROOT}/core/runtime/gate_tokens.cpp"
@@ -1545,11 +1546,9 @@ if(WIN32)
                 "patch_wintrust"
                 "patch_crypt32"
                 "patch_schannel_validation"
-                "patch_chrome_pins"
                 "patch_dotnet_callback"
                 "Pin bypass applied"
                 "Bypass certificate pinning in a target process by patching"
-                "Chrome-PKP"
                 "DotNet-SCH_CRED"
                 "SChannel-CertValidation")
         foreach(_aida_cert_guard_file IN LISTS AIDA_CERT_PIN_BYPASS_GUARD_FILES)
@@ -1568,10 +1567,8 @@ if(WIN32)
                 "target_process_modified"
                 "mcp.cert_generate_ca.guard"
                 "private_key_exported"
-                "mcp.firefox_profile_status.guard"
-                "mcp.firefox_profile_launch.guard"
                 "validate_only"
-                "runtime_validation_performed")
+                "legacy_patching_disabled")
             string(FIND "${AIDA_CERT_TESTLAB_MCP_TEXT}" "${_aida_required_cert_test_token}" _aida_required_cert_test_pos)
             if(_aida_required_cert_test_pos EQUAL -1)
                 message(FATAL_ERROR "AiDA: certificate interception regression guard missing MCP test token: ${_aida_required_cert_test_token}")
@@ -1582,8 +1579,8 @@ if(WIN32)
         foreach(_aida_required_cert_network_token IN ITEMS
                 "openssl_attach_rejected"
                 "sni_authority_mismatch"
-                "runtime_validation_performed"
-                "current_user_ca_trusted")
+                "export_public_ca_files"
+                "public CA export")
             string(FIND "${AIDA_CERT_TESTLAB_NETWORK_TEXT}" "${_aida_required_cert_network_token}" _aida_required_cert_network_pos)
             if(_aida_required_cert_network_pos EQUAL -1)
                 message(FATAL_ERROR "AiDA: certificate interception regression guard missing network test token: ${_aida_required_cert_network_token}")
@@ -2030,6 +2027,7 @@ if(WIN32)
 
         option(AIDA_CAMOUFOX_STAGE_SIDECAR_DEPS "Stage Camoufox runtime sidecars beside AiDAStandalone for development" OFF)
         option(AIDA_CAMOUFOX_STAGE_REVERSE_MCP_SOURCE "Stage private camoufox-reverse-mcp source beside AiDAStandalone for local development" OFF)
+        option(AIDA_CAMOUFOX_BUILD_REVERSE_MCP_EXE "Build the frozen Camoufox reverse MCP executable during the CMake build" OFF)
 
         set(AIDA_CAMOUFOX_MCP_DIR "")
         if(AIDA_CAMOUFOX_STAGE_REVERSE_MCP_SOURCE)
@@ -2071,7 +2069,7 @@ if(WIN32)
         endforeach()
         set(AIDA_CAMOUFOX_REVERSE_MCP_CANONICAL_EXE "${CMAKE_CURRENT_SOURCE_DIR}/.deps/AiDA_CamoufoxReverseMcp.exe")
         set(AIDA_CAMOUFOX_REVERSE_MCP_BUILD_TARGET_READY OFF)
-        if(EXISTS "${AIDA_CAMOUFOX_REVERSE_MCP_BUILD_SCRIPT}" AND AIDA_CAMOUFOX_REVERSE_MCP_SOURCE_DIR)
+        if(AIDA_CAMOUFOX_BUILD_REVERSE_MCP_EXE AND EXISTS "${AIDA_CAMOUFOX_REVERSE_MCP_BUILD_SCRIPT}" AND AIDA_CAMOUFOX_REVERSE_MCP_SOURCE_DIR)
             find_program(AIDA_POWERSHELL_EXECUTABLE NAMES powershell.exe powershell pwsh.exe pwsh)
             if(NOT AIDA_POWERSHELL_EXECUTABLE)
                 message(FATAL_ERROR "AiDA Camoufox frozen reverse MCP contract staging requires PowerShell")
@@ -2105,6 +2103,8 @@ if(WIN32)
                 DEPENDS "${AIDA_CAMOUFOX_REVERSE_MCP_STAMP}"
             )
             set(AIDA_CAMOUFOX_REVERSE_MCP_BUILD_TARGET_READY ON)
+        elseif(EXISTS "${AIDA_CAMOUFOX_REVERSE_MCP_BUILD_SCRIPT}" AND AIDA_CAMOUFOX_REVERSE_MCP_SOURCE_DIR)
+            message(STATUS "AiDA Camoufox reverse MCP source detected; frozen executable build is opt-in via AIDA_CAMOUFOX_BUILD_REVERSE_MCP_EXE=ON")
         endif()
 
         set(AIDA_CAMOUFOX_REVERSE_MCP_EXE_CANDIDATES
@@ -2160,8 +2160,7 @@ if(WIN32)
                 message(FATAL_ERROR "AiDA Camoufox sidecar staging enabled but neither frozen reverse MCP executable nor camoufox-runtime/python.exe was found")
             endif()
         elseif(AIDA_CAMOUFOX_BROWSER_DIR AND (AIDA_BUNDLED_PYTHON_DIR OR AIDA_CAMOUFOX_REVERSE_MCP_EXE))
-            set(AIDA_CAMOUFOX_STAGE_EFFECTIVE ON)
-            message(STATUS "AiDA Camoufox app-local sidecar assets detected; staging beside AiDAStandalone")
+            message(STATUS "AiDA Camoufox app-local sidecar assets detected; staging is opt-in via AIDA_CAMOUFOX_STAGE_SIDECAR_DEPS=ON")
         endif()
 
         if(AIDA_CAMOUFOX_STAGE_EFFECTIVE)

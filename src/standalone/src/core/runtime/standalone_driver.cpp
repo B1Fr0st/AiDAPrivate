@@ -3171,6 +3171,105 @@ namespace driver_bridge
         return read_peb(out);
     }
 
+    uint64_t resolve_export_for(uint32_t pid, uint64_t module_base, const char* export_name)
+    {
+        const ULONGLONG t0 = GetTickCount64();
+        driver_bridge_pid_call::pid_scope_t scope;
+        if (!driver_bridge_pid_call::enter(scope, pid)) {
+            diag::log_tagged_fmt("driver_bridge",
+                "resolve_export_for_enter_failed pid=%u active_pid=%u module=0x%llX export=%s status=%s last_error=%s elapsed_ms=%llu",
+                pid,
+                attached_pid(),
+                static_cast<unsigned long long>(module_base),
+                export_name ? export_name : "(null)",
+                status().c_str(),
+                last_error().c_str(),
+                static_cast<unsigned long long>(GetTickCount64() - t0));
+            return 0;
+        }
+        const uint32_t active = attached_pid();
+        const uint64_t resolved = resolve_export(module_base, export_name);
+        diag::log_tagged_fmt("driver_bridge",
+            "resolve_export_for pid=%u active_pid=%u module=0x%llX export=%s result=0x%llX elapsed_ms=%llu",
+            pid,
+            active,
+            static_cast<unsigned long long>(module_base),
+            export_name ? export_name : "(null)",
+            static_cast<unsigned long long>(resolved),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        return resolved;
+    }
+
+    uint64_t allocate_memory_for(uint32_t pid, size_t size)
+    {
+        const ULONGLONG t0 = GetTickCount64();
+        if (size == 0) {
+            diag::log_tagged_fmt("driver_bridge",
+                "allocate_memory_for_reject pid=%u size=%zu reason=zero elapsed_ms=%llu",
+                pid,
+                size,
+                static_cast<unsigned long long>(GetTickCount64() - t0));
+            return 0;
+        }
+        driver_bridge_pid_call::pid_scope_t scope;
+        if (!driver_bridge_pid_call::enter(scope, pid)) {
+            diag::log_tagged_fmt("driver_bridge",
+                "allocate_memory_for_enter_failed pid=%u active_pid=%u size=%zu status=%s last_error=%s elapsed_ms=%llu",
+                pid,
+                attached_pid(),
+                size,
+                status().c_str(),
+                last_error().c_str(),
+                static_cast<unsigned long long>(GetTickCount64() - t0));
+            return 0;
+        }
+        const uint32_t active = attached_pid();
+        const uint64_t remote = allocate_memory(size);
+        diag::log_tagged_fmt("driver_bridge",
+            "allocate_memory_for pid=%u active_pid=%u size=%zu result=0x%llX elapsed_ms=%llu",
+            pid,
+            active,
+            size,
+            static_cast<unsigned long long>(remote),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        return remote;
+    }
+
+    bool free_memory_for(uint32_t pid, uint64_t address)
+    {
+        const ULONGLONG t0 = GetTickCount64();
+        if (address == 0) {
+            diag::log_tagged_fmt("driver_bridge",
+                "free_memory_for_reject pid=%u addr=0x%llX reason=zero elapsed_ms=%llu",
+                pid,
+                static_cast<unsigned long long>(address),
+                static_cast<unsigned long long>(GetTickCount64() - t0));
+            return false;
+        }
+        driver_bridge_pid_call::pid_scope_t scope;
+        if (!driver_bridge_pid_call::enter(scope, pid)) {
+            diag::log_tagged_fmt("driver_bridge",
+                "free_memory_for_enter_failed pid=%u active_pid=%u addr=0x%llX status=%s last_error=%s elapsed_ms=%llu",
+                pid,
+                attached_pid(),
+                static_cast<unsigned long long>(address),
+                status().c_str(),
+                last_error().c_str(),
+                static_cast<unsigned long long>(GetTickCount64() - t0));
+            return false;
+        }
+        const uint32_t active = attached_pid();
+        const bool ok = free_memory(address);
+        diag::log_tagged_fmt("driver_bridge",
+            "free_memory_for pid=%u active_pid=%u addr=0x%llX ok=%d elapsed_ms=%llu",
+            pid,
+            active,
+            static_cast<unsigned long long>(address),
+            ok ? 1 : 0,
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        return ok;
+    }
+
 
     bool read_kernel_memory(uint64_t address, size_t size, std::vector<uint8_t>& out)
     {
@@ -3179,9 +3278,17 @@ namespace driver_bridge
             return false;
 
         bool kernel_mode = false;
+        uint64_t current_dtb = 0;
+        uint64_t current_kernel_dtb = 0;
+        uint32_t current_pid = 0;
         {
             std::lock_guard<std::mutex> lk(g_state_mtx);
             kernel_mode = g_kernel_mode && device && device->is_connected();
+            current_pid = g_pid;
+            if (device) {
+                current_dtb = device->get_dtb();
+                current_kernel_dtb = device->get_kernel_dtb();
+            }
         }
         if (!kernel_mode) {
             require_kernel_fail("read_kernel_memory");
@@ -3191,6 +3298,18 @@ namespace driver_bridge
         out.resize(size);
         const size_t bytes_read = device->read_kernel_raw(address, out.data(), size);
         if (bytes_read == 0) {
+            static std::atomic<int> s_kernel_read_fail_logs{0};
+            const int log_index = s_kernel_read_fail_logs.fetch_add(1);
+            if (log_index < 160) {
+                diag::log_tagged_fmt("driver_bridge",
+                    "read_kernel_memory_failed addr=0x%llX size=%llu pid=%u dtb=0x%llX kdtb=0x%llX connected=%d",
+                    static_cast<unsigned long long>(address),
+                    static_cast<unsigned long long>(size),
+                    current_pid,
+                    static_cast<unsigned long long>(current_dtb),
+                    static_cast<unsigned long long>(current_kernel_dtb),
+                    device && device->is_connected() ? 1 : 0);
+            }
             out.clear();
             return false;
         }
@@ -3539,6 +3658,132 @@ namespace driver_bridge
         return true;
     }
 
+    bool usermode_module_base(uint64_t module_base)
+    {
+        return module_base != 0 && module_base < 0x0000800000000000ULL;
+    }
+
+    bool read_process_exact(uint64_t address, void* buffer, size_t size)
+    {
+        if (address == 0 || !buffer || size == 0)
+            return false;
+        std::vector<uint8_t> bytes;
+        if (!read_memory(address, size, bytes) || bytes.size() < size)
+            return false;
+        std::memcpy(buffer, bytes.data(), size);
+        return true;
+    }
+
+    std::string read_process_c_string(uint64_t address, size_t max_len)
+    {
+        if (address == 0 || max_len == 0 || max_len > 4096)
+            return {};
+        std::vector<uint8_t> bytes;
+        if (!read_memory(address, max_len, bytes) || bytes.empty())
+            return {};
+        std::string out;
+        out.reserve((std::min<size_t>)(bytes.size(), max_len));
+        for (uint8_t b : bytes) {
+            if (b == 0)
+                break;
+            if (b < 0x20 || b > 0x7E)
+                return {};
+            out.push_back(static_cast<char>(b));
+            if (out.size() >= max_len)
+                break;
+        }
+        return out;
+    }
+
+    uint64_t resolve_export_usermode_pe(uint64_t module_base, const char* export_name, uint32_t* ordinal_out)
+    {
+        if (!usermode_module_base(module_base) || !export_name || !*export_name)
+            return 0;
+
+        IMAGE_DOS_HEADER dos{};
+        if (!read_process_exact(module_base, &dos, sizeof(dos)) || dos.e_magic != IMAGE_DOS_SIGNATURE)
+            return 0;
+        if (dos.e_lfanew <= 0 || dos.e_lfanew > 0x100000)
+            return 0;
+
+        const uint64_t nt_va = module_base + static_cast<uint32_t>(dos.e_lfanew);
+        DWORD sig = 0;
+        if (!read_process_exact(nt_va, &sig, sizeof(sig)) || sig != IMAGE_NT_SIGNATURE)
+            return 0;
+
+        IMAGE_FILE_HEADER fh{};
+        if (!read_process_exact(nt_va + sizeof(DWORD), &fh, sizeof(fh)))
+            return 0;
+        if (fh.NumberOfSections == 0 || fh.NumberOfSections > 128)
+            return 0;
+
+        const uint64_t opt_va = nt_va + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER);
+        WORD magic = 0;
+        if (!read_process_exact(opt_va, &magic, sizeof(magic)))
+            return 0;
+
+        DWORD export_rva = 0;
+        DWORD export_size = 0;
+        if (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+            IMAGE_OPTIONAL_HEADER64 opt{};
+            if (!read_process_exact(opt_va, &opt, sizeof(opt)))
+                return 0;
+            if (IMAGE_DIRECTORY_ENTRY_EXPORT >= opt.NumberOfRvaAndSizes)
+                return 0;
+            export_rva = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+            export_size = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+        } else if (magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
+            IMAGE_OPTIONAL_HEADER32 opt{};
+            if (!read_process_exact(opt_va, &opt, sizeof(opt)))
+                return 0;
+            if (IMAGE_DIRECTORY_ENTRY_EXPORT >= opt.NumberOfRvaAndSizes)
+                return 0;
+            export_rva = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+            export_size = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+        } else {
+            return 0;
+        }
+
+        if (export_rva == 0 || export_size < sizeof(IMAGE_EXPORT_DIRECTORY))
+            return 0;
+
+        IMAGE_EXPORT_DIRECTORY exp{};
+        if (!read_process_exact(module_base + export_rva, &exp, sizeof(exp)))
+            return 0;
+        if (exp.NumberOfNames == 0 || exp.NumberOfFunctions == 0 ||
+            exp.AddressOfNames == 0 || exp.AddressOfNameOrdinals == 0 || exp.AddressOfFunctions == 0)
+            return 0;
+
+        const DWORD name_count = (std::min<DWORD>)(exp.NumberOfNames, 65536u);
+        for (DWORD i = 0; i < name_count; ++i) {
+            DWORD name_rva = 0;
+            WORD ordinal_index = 0;
+            if (!read_process_exact(module_base + exp.AddressOfNames + static_cast<uint64_t>(i) * sizeof(DWORD),
+                                    &name_rva, sizeof(name_rva)) || name_rva == 0)
+                continue;
+            if (!read_process_exact(module_base + exp.AddressOfNameOrdinals + static_cast<uint64_t>(i) * sizeof(WORD),
+                                    &ordinal_index, sizeof(ordinal_index)))
+                continue;
+            if (ordinal_index >= exp.NumberOfFunctions)
+                continue;
+            const std::string candidate = read_process_c_string(module_base + name_rva, 512);
+            if (candidate != export_name)
+                continue;
+
+            DWORD func_rva = 0;
+            if (!read_process_exact(module_base + exp.AddressOfFunctions + static_cast<uint64_t>(ordinal_index) * sizeof(DWORD),
+                                    &func_rva, sizeof(func_rva)) || func_rva == 0)
+                return 0;
+            if (func_rva >= export_rva && func_rva < export_rva + export_size)
+                return 0;
+            if (ordinal_out)
+                *ordinal_out = exp.Base + ordinal_index;
+            return module_base + func_rva;
+        }
+
+        return 0;
+    }
+
     uint64_t resolve_export(uint64_t module_base, const char* export_name)
     {
         if (module_base == 0 || !export_name || !*export_name)
@@ -3550,11 +3795,34 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
+            uint32_t ordinal = 0;
+            const uint64_t fallback = resolve_export_usermode_pe(module_base, export_name, &ordinal);
+            if (fallback != 0)
+                return fallback;
             require_kernel_fail("resolve_export");
             return 0;
         }
 
-        return device->resolve_export(module_base, export_name);
+        const uint64_t resolved = device->resolve_export(module_base, export_name);
+        if (resolved != 0)
+            return resolved;
+        if (!usermode_module_base(module_base))
+            return 0;
+
+        uint32_t ordinal = 0;
+        const uint64_t fallback = resolve_export_usermode_pe(module_base, export_name, &ordinal);
+        static std::atomic<int> s_export_fallback_logs{0};
+        const int log_index = s_export_fallback_logs.fetch_add(1);
+        if (log_index < 160) {
+            diag::log_tagged_fmt("driver_bridge",
+                "resolve_export_user_fallback module=0x%llX export=%s result=0x%llX ordinal=%u kernel_mode=%d",
+                static_cast<unsigned long long>(module_base),
+                export_name,
+                static_cast<unsigned long long>(fallback),
+                ordinal,
+                kernel_mode ? 1 : 0);
+        }
+        return fallback;
     }
 
     uint64_t virtual_to_physical(uint64_t virtual_address)

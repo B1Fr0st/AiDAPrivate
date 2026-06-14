@@ -74,9 +74,184 @@ static void log_msg(HANDLE hf, const char* tag, const char* fmt, ...) {
     test_all_features::mirror_full_test_log_line(tag, detail, s.c_str());
 }
 
+static int driver_attached_flag(uint32_t pid) {
+    return (pid != 0 && driver_bridge::using_kernel_driver()) ? 1 : 0;
+}
+
+static bool require_attached_live_target(HANDLE hf, const char* tag, std::atomic<int>& failed) {
+    uint32_t pid = driver_bridge::attached_pid();
+    const int driver_attached = driver_attached_flag(pid);
+    if (pid == 0) {
+        log_msg(hf, tag, "FAIL -- root dependency unavailable: no active attached test target PID (target_pid=0 driver_attached=%d status=\"%s\" last_error=\"%s\")",
+            driver_attached,
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str());
+        failed.fetch_add(1);
+        return false;
+    }
+    uint32_t exit_code = 0;
+    if (!driver_bridge::attached_process_alive(&exit_code)) {
+        log_msg(hf, tag, "FAIL -- root dependency unavailable: attached test target is not alive (target_pid=%u driver_attached=%d exit_code_or_error=0x%08X status=\"%s\" last_error=\"%s\")",
+            (unsigned)pid,
+            driver_attached,
+            (unsigned)exit_code,
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str());
+        failed.fetch_add(1);
+        return false;
+    }
+    if (!driver_attached) {
+        log_msg(hf, tag, "FAIL -- root dependency unavailable: kernel driver bridge is not attached for live target (target_pid=%u driver_attached=0 status=\"%s\" last_error=\"%s\")",
+            (unsigned)pid,
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str());
+        failed.fetch_add(1);
+        return false;
+    }
+    return true;
+}
+
 static long long elapsed_us_since(std::chrono::steady_clock::time_point t0) {
     return static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - t0).count());
+}
+
+struct integrity_hunter_fixture_t {
+    uint32_t pid = 0;
+    uint64_t address = 0;
+    size_t size = 0;
+
+    integrity_hunter_fixture_t() = default;
+    integrity_hunter_fixture_t(const integrity_hunter_fixture_t&) = delete;
+    integrity_hunter_fixture_t& operator=(const integrity_hunter_fixture_t&) = delete;
+    integrity_hunter_fixture_t(integrity_hunter_fixture_t&& other) noexcept {
+        pid = other.pid;
+        address = other.address;
+        size = other.size;
+        other.pid = 0;
+        other.address = 0;
+        other.size = 0;
+    }
+    integrity_hunter_fixture_t& operator=(integrity_hunter_fixture_t&& other) noexcept {
+        if (this != &other) {
+            reset();
+            pid = other.pid;
+            address = other.address;
+            size = other.size;
+            other.pid = 0;
+            other.address = 0;
+            other.size = 0;
+        }
+        return *this;
+    }
+    ~integrity_hunter_fixture_t() {
+        reset();
+    }
+    void reset() {
+        if (address != 0) {
+            if (pid != 0)
+                driver_bridge::free_memory_for(pid, address);
+            else
+                driver_bridge::free_memory(address);
+            pid = 0;
+            address = 0;
+            size = 0;
+        }
+    }
+};
+
+static uint64_t resolve_attached_ntdll_export(uint32_t pid, const char* name, std::string& module_name) {
+    if (pid == 0)
+        return 0;
+    for (const auto& mod : driver_bridge::enumerate_modules_for(pid)) {
+        if (mod.base == 0)
+            continue;
+        const bool is_ntdll = _stricmp(mod.name.c_str(), "ntdll.dll") == 0 ||
+            mod.name.find("ntdll") != std::string::npos ||
+            mod.path.find("ntdll") != std::string::npos;
+        if (!is_ntdll)
+            continue;
+        uint64_t fn = driver_bridge::resolve_export_for(pid, mod.base, name);
+        if (fn != 0) {
+            module_name = mod.name.empty() ? mod.path : mod.name;
+            return fn;
+        }
+        HMODULE local_ntdll = GetModuleHandleW(L"ntdll.dll");
+        FARPROC local_fn = local_ntdll ? GetProcAddress(local_ntdll, name) : nullptr;
+        if (local_ntdll && local_fn) {
+            const uint64_t offset = reinterpret_cast<uintptr_t>(local_fn) - reinterpret_cast<uintptr_t>(local_ntdll);
+            if (offset != 0 && (mod.size == 0 || offset < mod.size)) {
+                module_name = mod.name.empty() ? mod.path : mod.name;
+                return mod.base + offset;
+            }
+        }
+    }
+    return 0;
+}
+
+static integrity_hunter_fixture_t make_integrity_hunter_fixture(HANDLE hf, const char* tag) {
+    integrity_hunter_fixture_t fx;
+    fx.pid = driver_bridge::attached_pid();
+    fx.size = 4096;
+    if (fx.pid == 0) {
+        log_msg(hf, tag, "FAIL -- root dependency unavailable: cannot allocate integrity fixture without attached target PID (target_pid=0 driver_attached=%d status=\"%s\" last_error=\"%s\")",
+            driver_attached_flag(fx.pid),
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str());
+        return fx;
+    }
+    fx.address = driver_bridge::allocate_memory_for(fx.pid, fx.size);
+    if (fx.address == 0) {
+        log_msg(hf, tag, "FAIL -- allocate_memory_for returned 0 for integrity hunter fixture (target_pid=%u driver_attached=%d status=\"%s\" last_error=\"%s\")",
+            (unsigned)fx.pid,
+            driver_attached_flag(fx.pid),
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str());
+        return fx;
+    }
+
+    std::vector<uint8_t> bytes(fx.size);
+    for (size_t i = 0; i < bytes.size(); ++i)
+        bytes[i] = static_cast<uint8_t>((i * 31u + 0x53u) & 0xFFu);
+
+    if (!driver_bridge::write_memory_for(fx.pid, fx.address, bytes)) {
+        log_msg(hf, tag, "FAIL -- write_memory_for failed for integrity hunter fixture target_pid=%u addr=0x%016llX size=%zu status=\"%s\" last_error=\"%s\"",
+            (unsigned)fx.pid,
+            (unsigned long long)fx.address,
+            fx.size,
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str());
+        fx.reset();
+        return fx;
+    }
+
+    uint32_t old_protect = 0;
+    if (!driver_bridge::protect_memory_for(fx.pid, fx.address, fx.size, PAGE_READWRITE, &old_protect)) {
+        log_msg(hf, tag, "FAIL -- protect_memory_for failed for integrity hunter fixture target_pid=%u addr=0x%016llX size=%zu status=\"%s\" last_error=\"%s\"",
+            (unsigned)fx.pid,
+            (unsigned long long)fx.address,
+            fx.size,
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str());
+        fx.reset();
+        return fx;
+    }
+
+    driver_bridge::memory_region_t region{};
+    const bool query_ok = driver_bridge::query_memory_for(fx.pid, fx.address, region);
+    log_msg(hf, tag, "fixture target_pid=%u driver_attached=%d addr=0x%016llX size=%zu old_protect=0x%08X query_ok=%d base=0x%016llX region_size=0x%016llX state=0x%08X protect=0x%08X type=0x%08X",
+        (unsigned)fx.pid,
+        driver_attached_flag(fx.pid),
+        (unsigned long long)fx.address,
+        fx.size,
+        old_protect,
+        query_ok ? 1 : 0,
+        (unsigned long long)region.base,
+        (unsigned long long)region.size,
+        (unsigned)region.state,
+        (unsigned)region.protect,
+        (unsigned)region.type);
+    return fx;
 }
 
 struct symbolic_fixture_t {
@@ -1122,8 +1297,49 @@ static void test_integrity_hunter_start_stop(HANDLE hf, std::atomic<int>& passed
     log_msg(hf, "integ_ss", "START -- integrity hunter start/stop hunt");
     auto t0 = std::chrono::steady_clock::now();
 
-    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-    uint64_t addr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(ntdll));
+    if (!require_attached_live_target(hf, "integ_ss", failed))
+        return;
+
+    integrity_hunter::stop_hunt();
+    const bool pre_idle = integrity_hunter::wait_until_idle(12000);
+    const bool pre_hunting = integrity_hunter::g_state.hunting.load();
+    const bool pre_worker = integrity_hunter::g_state.worker_active.load();
+    const uint32_t pre_session = integrity_hunter::g_state.pg_session_id.load();
+    if (!pre_idle || pre_hunting || pre_worker) {
+        auto ms_pre = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        log_msg(hf, "integ_ss", "FAIL -- stale integrity hunter state before start/stop test: pre_idle=%d hunting=%d worker=%d session=%u target_pid=%u driver_attached=%d status=\"%s\" last_error=\"%s\" (elapsed %lld ms)",
+            pre_idle ? 1 : 0,
+            pre_hunting ? 1 : 0,
+            pre_worker ? 1 : 0,
+            pre_session,
+            (unsigned)driver_bridge::attached_pid(),
+            driver_attached_flag(driver_bridge::attached_pid()),
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str(),
+            (long long)ms_pre);
+        failed.fetch_add(1);
+        return;
+    }
+
+    const uint32_t target_pid = driver_bridge::attached_pid();
+    uint64_t addr = 0;
+    for (const auto& mod : driver_bridge::enumerate_modules_for(target_pid)) {
+        if (_stricmp(mod.name.c_str(), "ntdll.dll") == 0) {
+            addr = mod.base;
+            break;
+        }
+    }
+    if (addr == 0) {
+        auto ms_mod = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        log_msg(hf, "integ_ss", "FAIL -- root dependency unavailable: target ntdll module not found (target_pid=%u driver_attached=%d status=\"%s\" last_error=\"%s\" elapsed %lld ms)",
+            (unsigned)target_pid,
+            driver_attached_flag(target_pid),
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str(),
+            (long long)ms_mod);
+        failed.fetch_add(1);
+        return;
+    }
 
     bool started = integrity_hunter::start_hunt(addr, 4096);
 
@@ -1139,33 +1355,275 @@ static void test_integrity_hunter_start_stop(HANDLE hf, std::atomic<int>& passed
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (started && idle && !hunting && !worker) {
-        log_msg(hf, "integ_ss", "PASS -- started=%d idle=%d hunting_after_stop=%d worker=%d install_complete=%d install_success=%d (elapsed %lld ms)",
+        log_msg(hf, "integ_ss", "PASS -- target_pid=%u driver_attached=%d target=0x%016llX started=%d idle=%d hunting_after_stop=%d worker=%d install_complete=%d install_success=%d (elapsed %lld ms)",
+            (unsigned)target_pid, driver_attached_flag(target_pid), (unsigned long long)addr,
             started ? 1 : 0, idle ? 1 : 0, hunting ? 1 : 0, worker ? 1 : 0,
             install_complete ? 1 : 0, install_success ? 1 : 0, (long long)ms);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "integ_ss", "FAIL -- started=%d idle=%d hunting_after_stop=%d worker=%d install_complete=%d install_success=%d (elapsed %lld ms)",
+        log_msg(hf, "integ_ss", "FAIL -- target_pid=%u driver_attached=%d target=0x%016llX started=%d idle=%d hunting_after_stop=%d worker=%d install_complete=%d install_success=%d status=\"%s\" last_error=\"%s\" (elapsed %lld ms)",
+            (unsigned)target_pid, driver_attached_flag(target_pid), (unsigned long long)addr,
             started ? 1 : 0, idle ? 1 : 0, hunting ? 1 : 0, worker ? 1 : 0,
-            install_complete ? 1 : 0, install_success ? 1 : 0, (long long)ms);
+            install_complete ? 1 : 0, install_success ? 1 : 0,
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str(),
+            (long long)ms);
         failed.fetch_add(1);
     }
 }
 
 static void test_integrity_hunter_nodes(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-    log_msg(hf, "integ_nd", "START -- integrity hunter node list");
+    log_msg(hf, "integ_nd", "START -- integrity hunter node list with deterministic page-guard stimulus");
     auto t0 = std::chrono::steady_clock::now();
+
+    if (!require_attached_live_target(hf, "integ_nd", failed))
+        return;
+
+    integrity_hunter::stop_hunt();
+    const bool pre_idle = integrity_hunter::wait_until_idle(12000);
+    const bool pre_hunting = integrity_hunter::g_state.hunting.load();
+    const bool pre_worker = integrity_hunter::g_state.worker_active.load();
+    const bool pre_install_complete = integrity_hunter::g_state.install_complete.load();
+    const bool pre_install_success = integrity_hunter::g_state.install_success.load();
+    const uint32_t pre_session = integrity_hunter::g_state.pg_session_id.load();
+    std::string pre_status_text;
+    size_t pre_nodes = 0;
+    size_t pre_events = 0;
+    {
+        std::lock_guard<std::mutex> lk(integrity_hunter::g_state.mutex);
+        pre_status_text = integrity_hunter::g_state.status_text;
+        pre_nodes = integrity_hunter::g_state.nodes.size();
+        pre_events = integrity_hunter::g_state.event_log.size();
+    }
+    if (!pre_idle || pre_hunting || pre_worker) {
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        diag::log_tagged_fmt("test_analysis_detail",
+            "integ_nd stale_pre_idle: pid=%u pre_idle=%d hunting=%d worker=%d install_complete=%d install_success=%d session=%u nodes=%zu events=%zu total_reads=%llu status='%s' bridge_status='%s' bridge_last_error='%s' elapsed_ms=%lld",
+            (unsigned)driver_bridge::attached_pid(),
+            pre_idle ? 1 : 0,
+            pre_hunting ? 1 : 0,
+            pre_worker ? 1 : 0,
+            pre_install_complete ? 1 : 0,
+            pre_install_success ? 1 : 0,
+            pre_session,
+            pre_nodes,
+            pre_events,
+            (unsigned long long)integrity_hunter::g_state.total_reads.load(),
+            pre_status_text.c_str(),
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str(),
+            (long long)ms);
+        log_msg(hf, "integ_nd", "FAIL -- stale integrity hunter state before node test: pre_idle=%d hunting=%d worker=%d install_complete=%d install_success=%d session=%u nodes=%zu events=%zu total_reads=%llu status=\"%s\" bridge_status=\"%s\" last_error=\"%s\" (elapsed %lld ms)",
+            pre_idle ? 1 : 0,
+            pre_hunting ? 1 : 0,
+            pre_worker ? 1 : 0,
+            pre_install_complete ? 1 : 0,
+            pre_install_success ? 1 : 0,
+            pre_session,
+            pre_nodes,
+            pre_events,
+            (unsigned long long)integrity_hunter::g_state.total_reads.load(),
+            pre_status_text.c_str(),
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str(),
+            (long long)ms);
+        failed.fetch_add(1);
+        return;
+    }
+
+    integrity_hunter_fixture_t fixture = make_integrity_hunter_fixture(hf, "integ_nd");
+    if (fixture.address == 0) {
+        failed.fetch_add(1);
+        return;
+    }
+    const uint32_t target_pid = fixture.pid;
+
+    driver_bridge::memory_region_t before_region{};
+    const bool before_query = driver_bridge::query_memory_for(target_pid, fixture.address, before_region);
+
+    std::string read_module;
+    uint64_t target_read_fn = resolve_attached_ntdll_export(target_pid, "RtlCompareMemory", read_module);
+    const char* target_read_kind = "RtlCompareMemory";
+    if (target_read_fn == 0) {
+        target_read_fn = resolve_attached_ntdll_export(target_pid, "RtlComputeCrc32", read_module);
+        target_read_kind = "RtlComputeCrc32";
+    }
+
+    if (target_read_fn == 0) {
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        log_msg(hf, "integ_nd", "FAIL -- no target-side ntdll read function resolved for integrity fixture pid=%u addr=0x%016llX before_query=%d before_protect=0x%08X status=\"%s\" last_error=\"%s\" (elapsed %lld ms)",
+            (unsigned)target_pid,
+            (unsigned long long)fixture.address,
+            before_query ? 1 : 0,
+            (unsigned)before_region.protect,
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str(),
+            (long long)ms);
+        failed.fetch_add(1);
+        return;
+    }
+
+    const bool started = integrity_hunter::start_hunt(fixture.address, 128);
+    bool install_seen = false;
+    const DWORD install_start = GetTickCount();
+    while (GetTickCount() - install_start < 6500) {
+        if (integrity_hunter::g_state.install_complete.load()) {
+            install_seen = true;
+            break;
+        }
+        if (!integrity_hunter::g_state.hunting.load() && !integrity_hunter::g_state.worker_active.load())
+            break;
+        Sleep(25);
+    }
+
+    const bool install_complete = integrity_hunter::g_state.install_complete.load();
+    const bool install_success = integrity_hunter::g_state.install_success.load();
+    const uint32_t pg_session = integrity_hunter::g_state.pg_session_id.load();
+
+    driver_bridge::memory_region_t guard_region{};
+    const bool guard_query = driver_bridge::query_memory_for(target_pid, fixture.address, guard_region);
+    const bool guard_set = guard_query && ((guard_region.protect & PAGE_GUARD) != 0);
+
+    uint32_t target_read_attempts = 0;
+    uint32_t target_read_ok = 0;
+    uint64_t target_read_result = 0;
+    if (started && install_seen && install_success) {
+        for (uint32_t i = 0; i < 8; ++i) {
+            ++target_read_attempts;
+            target_read_result = std::strcmp(target_read_kind, "RtlCompareMemory") == 0
+                ? page_guard_engine::remote_thread_call(target_pid, target_read_fn, fixture.address, fixture.address, 128, 0, 2500, "testlab_integrity_RtlCompareMemory")
+                : page_guard_engine::remote_thread_call(target_pid, target_read_fn, i, fixture.address, 128, 0, 2500, "testlab_integrity_RtlComputeCrc32");
+            if (target_read_result != 0)
+                ++target_read_ok;
+            Sleep(75);
+        }
+    }
+
+    std::vector<uint8_t> readback;
+    const bool driver_read_ok = driver_bridge::read_memory_for(target_pid, fixture.address, 128, readback) && !readback.empty();
+    std::vector<uint8_t> writeback = readback;
+    if (!writeback.empty())
+        writeback[0] ^= 0x5Au;
+    const bool driver_write_ok = !writeback.empty() && driver_bridge::write_memory_for(target_pid, fixture.address, writeback);
+
+    integrity_hunter::stop_hunt();
+    const bool idle = integrity_hunter::wait_until_idle(12000);
 
     size_t node_count = 0;
     size_t event_count = 0;
+    uint64_t first_reader = 0;
+    uint64_t first_fault = 0;
+    uint32_t first_access = 0;
+    int first_node_reads = 0;
+    std::string status_text;
     {
         std::lock_guard<std::mutex> lk(integrity_hunter::g_state.mutex);
         node_count = integrity_hunter::g_state.nodes.size();
         event_count = integrity_hunter::g_state.event_log.size();
+        if (!integrity_hunter::g_state.event_log.empty()) {
+            first_reader = integrity_hunter::g_state.event_log.front().rip;
+            first_fault = integrity_hunter::g_state.event_log.front().fault_addr;
+            first_access = integrity_hunter::g_state.event_log.front().access_type;
+        }
+        if (!integrity_hunter::g_state.nodes.empty()) {
+            first_node_reads = integrity_hunter::g_state.nodes.front().read_count;
+        }
+        status_text = integrity_hunter::g_state.status_text;
     }
+    const uint64_t total_reads = integrity_hunter::g_state.total_reads.load();
+
+    driver_bridge::memory_region_t after_region{};
+    const bool after_query = driver_bridge::query_memory_for(target_pid, fixture.address, after_region);
+    const bool after_guard = after_query && ((after_region.protect & PAGE_GUARD) != 0);
+
+    diag::log_tagged_fmt("test_analysis_detail", "integ_nd result: pid=%u addr=0x%llX started=%d install_seen=%d install_complete=%d install_success=%d idle=%d pg_session=%u before_query=%d before_protect=0x%08X guard_query=%d guard_state=%d guard_protect=0x%08X after_query=%d after_guard=%d after_protect=0x%08X driver_read_ok=%d read_bytes=%zu driver_write_ok=%d target_read_kind=%s target_read_module=%s target_read_fn=0x%llX target_read_attempts=%u target_read_ok=%u target_read_result=0x%llX nodes=%zu events=%zu total_reads=%llu first_reader=0x%llX first_fault=0x%llX first_access=%u first_node_reads=%d status='%s'",
+        (unsigned)target_pid,
+        (unsigned long long)fixture.address,
+        started ? 1 : 0,
+        install_seen ? 1 : 0,
+        install_complete ? 1 : 0,
+        install_success ? 1 : 0,
+        idle ? 1 : 0,
+        pg_session,
+        before_query ? 1 : 0,
+        (unsigned)before_region.protect,
+        guard_query ? 1 : 0,
+        guard_set ? 1 : 0,
+        (unsigned)guard_region.protect,
+        after_query ? 1 : 0,
+        after_guard ? 1 : 0,
+        (unsigned)after_region.protect,
+        driver_read_ok ? 1 : 0,
+        readback.size(),
+        driver_write_ok ? 1 : 0,
+        target_read_kind,
+        read_module.empty() ? "<none>" : read_module.c_str(),
+        (unsigned long long)target_read_fn,
+        target_read_attempts,
+        target_read_ok,
+        (unsigned long long)target_read_result,
+        node_count,
+        event_count,
+        (unsigned long long)total_reads,
+        (unsigned long long)first_reader,
+        (unsigned long long)first_fault,
+        first_access,
+        first_node_reads,
+        status_text.c_str());
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "integ_nd", "PASS -- nodes=%zu events=%zu (elapsed %lld ms)", node_count, event_count, (long long)ms);
-    passed.fetch_add(1);
+    if (started && install_seen && install_complete && install_success && idle && guard_query && guard_set && target_read_ok > 0 && total_reads > 0 && event_count > 0 && node_count > 0) {
+        log_msg(hf, "integ_nd", "PASS -- fixture=0x%016llX guard_state=%d read_ok=%d write_ok=%d target_read=%s module=%s attempts=%u ok=%u nodes=%zu events=%zu total_reads=%llu first_reader=0x%016llX first_fault=0x%016llX node_reads=%d status=\"%s\" (elapsed %lld ms)",
+            (unsigned long long)fixture.address,
+            guard_set ? 1 : 0,
+            driver_read_ok ? 1 : 0,
+            driver_write_ok ? 1 : 0,
+            target_read_kind,
+            read_module.empty() ? "<none>" : read_module.c_str(),
+            target_read_attempts,
+            target_read_ok,
+            node_count,
+            event_count,
+            (unsigned long long)total_reads,
+            (unsigned long long)first_reader,
+            (unsigned long long)first_fault,
+            first_node_reads,
+            status_text.c_str(),
+            (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "integ_nd", "FAIL -- integrity hunter evidence insufficient: fixture=0x%016llX started=%d install_seen=%d install_complete=%d install_success=%d idle=%d pg_session=%u guard_query=%d guard_state=%d guard_protect=0x%08X read_ok=%d read_bytes=%zu write_ok=%d target_read=%s module=%s attempts=%u ok=%u result=0x%016llX nodes=%zu events=%zu total_reads=%llu first_reader=0x%016llX first_fault=0x%016llX first_access=%u node_reads=%d status=\"%s\" status_bridge=\"%s\" last_error=\"%s\" (elapsed %lld ms)",
+            (unsigned long long)fixture.address,
+            started ? 1 : 0,
+            install_seen ? 1 : 0,
+            install_complete ? 1 : 0,
+            install_success ? 1 : 0,
+            idle ? 1 : 0,
+            pg_session,
+            guard_query ? 1 : 0,
+            guard_set ? 1 : 0,
+            (unsigned)guard_region.protect,
+            driver_read_ok ? 1 : 0,
+            readback.size(),
+            driver_write_ok ? 1 : 0,
+            target_read_kind,
+            read_module.empty() ? "<none>" : read_module.c_str(),
+            target_read_attempts,
+            target_read_ok,
+            (unsigned long long)target_read_result,
+            node_count,
+            event_count,
+            (unsigned long long)total_reads,
+            (unsigned long long)first_reader,
+            (unsigned long long)first_fault,
+            first_access,
+            first_node_reads,
+            status_text.c_str(),
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str(),
+            (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_binary_map_options(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {

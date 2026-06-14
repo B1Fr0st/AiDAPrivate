@@ -18,12 +18,10 @@ const EAUTH_JITTER_MS = parseInt(process.env.BOOTSTRAP_EAUTH_JITTER_MS || '20', 
 const TOKEN_TTL_SECONDS = parseInt(process.env.BOOTSTRAP_TOKEN_TTL_SECONDS || '180', 10) || 180;
 const TIMESTAMP_WINDOW_MS = parseInt(process.env.BOOTSTRAP_TIMESTAMP_WINDOW_MS || '60000', 10) || 60000;
 const IP_BIND_ENABLED = (process.env.BOOTSTRAP_TOKEN_BIND_IP || '1') !== '0';
-const MAX_PACKAGE_BYTES = positiveIntEnv('AIDA_BOOTSTRAP_PACKAGE_MAX_BYTES', 512 * 1024 * 1024);
 const MAX_CAMOUFOX_SIDECAR_BYTES = positiveIntEnv('AIDA_CAMOUFOX_SIDECAR_MAX_BYTES', 1024 * 1024 * 1024);
 const MAX_CAMOUFOX_MCP_BYTES = positiveIntEnv('AIDA_CAMOUFOX_MCP_MAX_BYTES', 256 * 1024 * 1024);
 const EAUTH_BODY = JSON.stringify({ ok: false, error_code: 'EAUTH' });
 const EAUTH_LENGTH = Buffer.byteLength(EAUTH_BODY, 'utf8');
-const ENCRYPTED_PACKAGE_FORMAT = 'encrypted-cbc-hmac-v1';
 const CAMOUFOX_BROWSER_DIR = 'camoufox-135.0.1-beta.24-win.x86_64';
 const DEFAULT_CAMOUFOX_SIDECAR_EXE_REL = `deps\\${CAMOUFOX_BROWSER_DIR}\\camoufox.exe`;
 const DEFAULT_CAMOUFOX_MCP_REL = 'deps\\AiDA_CamoufoxReverseMcp.exe';
@@ -284,22 +282,6 @@ function validHexSha256(value) {
     return /^[0-9a-f]{64}$/i.test(String(value || ''));
 }
 
-function decodeFixedBase64(value, size) {
-    const raw = String(value || '').trim();
-    if (!raw) return null;
-    let out = null;
-    try {
-        out = Buffer.from(raw, 'base64');
-    } catch (_) {
-        return null;
-    }
-    return out && out.length === size ? raw : null;
-}
-
-function validSignerThumbprint(value) {
-    return /^[0-9a-f]{40}$/i.test(String(value || '').replace(/\s+/g, ''));
-}
-
 function repairKnownMangledSidecarRelativePath(value) {
     const raw = String(value || '').trim();
     const compact = raw.replace(/[\\/]/g, '');
@@ -426,22 +408,14 @@ function getCamoufoxMcpPatchConfig() {
 }
 
 function getReleaseConfig() {
-    const urlRaw = String(process.env.AIDA_BOOTSTRAP_ARTIFACT_URL || '').trim();
-    const sha256 = String(process.env.AIDA_BOOTSTRAP_ARTIFACT_SHA256 || '').trim().toLowerCase();
-    const version = String(process.env.AIDA_BOOTSTRAP_ARTIFACT_VERSION || 'current').trim();
-    const fileName = String(process.env.AIDA_BOOTSTRAP_ARTIFACT_NAME || 'AiDAStandalone.exe').trim();
-    const signerThumbprint = String(process.env.AIDA_BOOTSTRAP_SIGNER_THUMBPRINT || '').replace(/\s+/g, '').toUpperCase();
-    const format = String(process.env.AIDA_BOOTSTRAP_ARTIFACT_FORMAT || ENCRYPTED_PACKAGE_FORMAT).trim().toLowerCase();
     const certSha256 = String(process.env.AIDA_BOOTSTRAP_TLS_CERT_SHA256 || '').trim().toLowerCase();
     const spkiSha256 = String(process.env.LICENSE_SERVER_SPKI_PIN_HEX || process.env.AIDA_BOOTSTRAP_TLS_SPKI_SHA256 || '').trim().toLowerCase();
-    const requireAuthenticode = false;
-    const acceptPinnedPrivateCa = process.env.AIDA_BOOTSTRAP_ACCEPT_PINNED_PRIVATE_CA_SIGNER === '1';
-    const allowSameHost = process.env.AIDA_BOOTSTRAP_ALLOW_SAME_HOST_ARTIFACT === '1';
-    const allowHttp = process.env.AIDA_BOOTSTRAP_ALLOW_HTTP_ARTIFACT === '1';
-    const origin = publicOrigin();
     const camoufox = getCamoufoxSidecarConfig();
     if (!camoufox.ok) {
         return { ok: false, reason: camoufox.reason };
+    }
+    if (!camoufox.configured) {
+        return { ok: false, reason: 'camoufox_sidecar_config_missing' };
     }
     const z3 = {
         configured: false,
@@ -451,79 +425,52 @@ function getReleaseConfig() {
         size: '',
         dll_rel: '',
     };
-    if (!urlRaw || !validHexSha256(sha256) || !version || !fileName) {
-        return { ok: false, reason: 'artifact_config_missing' };
-    }
-    let parsed;
-    try {
-        parsed = new URL(urlRaw);
-    } catch (_) {
-        return { ok: false, reason: 'artifact_url_invalid' };
-    }
-    if (parsed.protocol !== 'https:' && !(allowHttp && parsed.hostname === 'localhost')) {
-        return { ok: false, reason: 'artifact_url_not_https' };
-    }
-    try {
-        const originUrl = new URL(origin);
-        if (!allowSameHost && format !== ENCRYPTED_PACKAGE_FORMAT && parsed.hostname.toLowerCase() === originUrl.hostname.toLowerCase()) {
-            return { ok: false, reason: 'artifact_same_host_disallowed' };
-        }
-    } catch (_) { }
-    if (/\/api\//i.test(parsed.pathname)) {
-        return { ok: false, reason: 'artifact_api_route_disallowed' };
-    }
-    if (format !== ENCRYPTED_PACKAGE_FORMAT) {
-        return { ok: false, reason: 'artifact_format_invalid' };
-    }
-    if (requireAuthenticode && !validSignerThumbprint(signerThumbprint)) {
-        return { ok: false, reason: 'artifact_signer_thumbprint_missing' };
-    }
-    const size = Number(process.env.AIDA_BOOTSTRAP_ARTIFACT_SIZE || 0);
-    if (process.env.AIDA_BOOTSTRAP_ARTIFACT_SIZE && (!Number.isFinite(size) || size <= 0)) {
-        return { ok: false, reason: 'artifact_size_invalid' };
-    }
-    let pkg = null;
-    if (format === ENCRYPTED_PACKAGE_FORMAT) {
-        const pkgSha256 = String(process.env.AIDA_BOOTSTRAP_PACKAGE_SHA256 || '').trim().toLowerCase();
-        const pkgSize = Number(process.env.AIDA_BOOTSTRAP_PACKAGE_SIZE || 0);
-        const encKey = decodeFixedBase64(process.env.AIDA_BOOTSTRAP_PACKAGE_ENC_KEY_B64, 32);
-        const macKey = decodeFixedBase64(process.env.AIDA_BOOTSTRAP_PACKAGE_MAC_KEY_B64, 32);
-        if (!validHexSha256(pkgSha256) || !encKey || !macKey) {
-            return { ok: false, reason: 'artifact_package_config_missing' };
-        }
-        if (!Number.isFinite(pkgSize) || pkgSize <= 0) {
-            return { ok: false, reason: 'artifact_package_size_invalid' };
-        }
-        if (pkgSize > MAX_PACKAGE_BYTES) {
-            return { ok: false, reason: 'artifact_package_size_too_large' };
-        }
-        if (!/\.pkg$/i.test(parsed.pathname)) {
-            return { ok: false, reason: 'artifact_package_extension_invalid' };
-        }
-        pkg = {
-            format,
-            sha256: pkgSha256,
-            size: Math.floor(pkgSize),
-            enc_key_b64: encKey,
-            mac_key_b64: macKey,
-        };
-    }
     return {
         ok: true,
-        url: parsed.toString(),
-        sha256,
-        version,
-        file_name: fileName,
-        size: size > 0 ? Math.floor(size) : null,
-        package: pkg,
-        require_authenticode: requireAuthenticode,
-        signer_thumbprint: signerThumbprint,
-        accept_pinned_private_ca_signer: acceptPinnedPrivateCa,
+        url: '',
+        sha256: camoufox.sha256,
+        version: camoufox.version,
+        file_name: '',
+        size: null,
+        package: null,
+        require_authenticode: false,
+        signer_thumbprint: '',
+        accept_pinned_private_ca_signer: false,
         tls_spki_sha256: validHexSha256(spkiSha256) ? spkiSha256 : '',
         tls_cert_sha256: validHexSha256(certSha256) ? certSha256 : '',
         camoufox,
         z3,
     };
+}
+
+function pruneStandaloneLaunchScriptLines(lines) {
+    const ranges = [
+        ['function Test-AidaIsAdministrator', 'if ($PSVersionTable.PSEdition'],
+        ['function Initialize-AidaFilelessDebugLog', 'function ConvertTo-AidaHex'],
+        ['function Get-AidaPackageBytesWithProgress', 'function Join-AidaSafeChildPath'],
+        ['function Decrypt-AidaPackageBytesToMemory', 'function Invoke-AidaAntiForensics'],
+        ['function Invoke-AidaAntiForensics', 'try { [Net.ServicePointManager]::SecurityProtocol'],
+    ];
+    const result = [];
+    let endPrefix = '';
+    for (const line of lines) {
+        if (endPrefix) {
+            if (!line.startsWith(endPrefix)) {
+                continue;
+            }
+            endPrefix = '';
+        }
+        const range = ranges.find(([start]) => line.startsWith(start));
+        if (range) {
+            endPrefix = range[1];
+            continue;
+        }
+        if (line.startsWith('$AidaMaxPackageBytes')) {
+            continue;
+        }
+        result.push(line);
+    }
+    return result;
 }
 
 async function ensureSchema() {
@@ -722,15 +669,15 @@ async function manifestRequest(body, clientIp, userAgent) {
         expires_at: expiresAt,
         token_id: parsed.token_id,
         artifact: {
-            name: release.file_name,
-            version: release.version,
-            url: release.url,
-            sha256: release.sha256,
-            size: release.size,
+            name: '',
+            version: '',
+            url: '',
+            sha256: '',
+            size: '',
             authenticode: {
-                required: release.require_authenticode,
-                signer_thumbprint: release.signer_thumbprint,
-                accept_pinned_private_ca: release.accept_pinned_private_ca_signer,
+                required: false,
+                signer_thumbprint: '',
+                accept_pinned_private_ca: false,
             },
         },
         camoufox: {
@@ -762,17 +709,14 @@ async function manifestRequest(body, clientIp, userAgent) {
             one_time_token: true,
             token_bound_to_client_nonce: true,
             token_bound_to_source_ip: IP_BIND_ENABLED,
-            artifact_https_required: true,
+            artifact_https_required: false,
             no_public_binary_route: true,
-            encrypted_public_artifact: !!release.package,
+            encrypted_public_artifact: false,
             camoufox_sidecar_hash_required: release.camoufox.configured === true,
             camoufox_mcp_hash_required: !!(release.camoufox.mcp && release.camoufox.mcp.configured),
             z3_sidecar_hash_required: release.z3.configured === true,
         },
     };
-    if (release.package) {
-        payload.artifact.package = Object.assign({}, release.package);
-    }
     const sig = dualSignPayload(payload);
     const manifestMac = createManifestMac(parsed.secret, payload);
     const manifestSigP256 = signBootstrapP256String(manifestMacInput(payload));
@@ -793,8 +737,6 @@ function buildBootstrapScript() {
     const tlsCert = validHexSha256(tlsCertRaw) ? tlsCertRaw : '';
     const requireTlsPin = (process.env.AIDA_BOOTSTRAP_REQUIRE_TLS_PIN || (process.env.NODE_ENV === 'production' ? '1' : '0')) !== '0';
     const release = getReleaseConfig();
-    const signerThumbprint = release.ok ? release.signer_thumbprint : String(process.env.AIDA_BOOTSTRAP_SIGNER_THUMBPRINT || '').replace(/\s+/g, '').toUpperCase();
-    const acceptPrivateCa = release.ok ? release.accept_pinned_private_ca_signer : process.env.AIDA_BOOTSTRAP_ACCEPT_PINNED_PRIVATE_CA_SIGNER === '1';
     let p256 = { x: '', y: '' };
     try {
         p256 = getBootstrapP256PublicHex();
@@ -818,7 +760,6 @@ function buildBootstrapScript() {
         '$AidaPinnedSpkiSha256 = ' + psQuote(tlsSpki),
         '$AidaPinnedCertSha256 = ' + psQuote(tlsCert),
         '$AidaRequireTlsPin = $' + (requireTlsPin ? 'true' : 'false'),
-        '$AidaMaxPackageBytes = ' + String(MAX_PACKAGE_BYTES),
         '$AidaMaxSidecarBytes = ' + String(MAX_CAMOUFOX_SIDECAR_BYTES),
         '$AidaManifestP256X = ' + psQuote(p256.x),
         '$AidaManifestP256Y = ' + psQuote(p256.y),
@@ -1648,15 +1589,8 @@ function buildBootstrapScript() {
         'Assert-AidaTlsPin',
         'Enable-AidaPinnedTls',
         'Write-AidaStatus "Secure connection verified."',
-        'Write-AidaStatus "Preparing system environment..."',
-        'Invoke-AidaSystemPrep',
-        'Write-AidaBootstrapLog "system_prep_done"',
-        'Write-AidaStatus "Checking for monitoring tools..."',
-        'Assert-AidaNoInterceptors',
-        'Invoke-AidaAntiForensics',
-        'Write-AidaBootstrapLog "pre_launch_wipe_done"',
-        '$packageBytes = $null',
-        '$exeBytes = $null',
+        'Write-AidaStatus "Preparing Camoufox delivery..."',
+        'Write-AidaBootstrapLog "camoufox_delivery_preflight_done"',
         '$licenseKey = $null',
         '$currentHwid = $null',
         'try {',
@@ -1674,7 +1608,7 @@ function buildBootstrapScript() {
         'Write-AidaStatus "Fetching signed release manifest..."',
         '$manifest = Invoke-AidaJson "/api/bootstrap/manifest" @{ token = $auth.token; client_nonce = $clientNonce; timestamp = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }',
         '$auth.token = $null',
-        'if (-not $manifest.ok -or -not $manifest.artifact -or -not $manifest.artifact.url -or -not $manifest.artifact.sha256) { throw "AiDA bootstrap manifest failed." }',
+        'if (-not $manifest.ok -or -not $manifest.camoufox -or -not $manifest.camoufox.configured) { throw "AiDA Camoufox manifest failed." }',
         'if ([string]$manifest.token_id -ne $tokenParts.id) { throw "AiDA bootstrap manifest token mismatch." }',
         'if ([int64]$manifest.expires_at -lt [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) { throw "AiDA bootstrap manifest expired." }',
         '$expectedManifestMac = Get-AidaHmacHex $tokenParts.secret (Get-AidaManifestMacInput $manifest)',
@@ -1682,35 +1616,14 @@ function buildBootstrapScript() {
         'if ([string]$manifest.manifest_sig_alg -ne "ECDSA_P256_SHA256_P1363" -or -not $manifest.manifest_sig_p256) { throw "AiDA bootstrap manifest signature is missing." }',
         'if (-not (Test-AidaP256Signature (Get-AidaManifestMacInput $manifest) ([string]$manifest.manifest_sig_p256))) { throw "AiDA bootstrap manifest signature verification failed." }',
         '$tokenParts.secret = $null',
-        'if (-not $manifest.policy.one_time_token -or -not $manifest.policy.token_bound_to_client_nonce -or -not $manifest.policy.token_bound_to_source_ip -or -not $manifest.policy.artifact_https_required -or -not $manifest.policy.no_public_binary_route -or -not $manifest.policy.encrypted_public_artifact -or ($manifest.camoufox.configured -and -not $manifest.policy.camoufox_sidecar_hash_required) -or ($manifest.camoufox.mcp.configured -and -not $manifest.policy.camoufox_mcp_hash_required)) { throw "AiDA bootstrap manifest policy is invalid." }',
-        'try { Install-AidaCamoufoxSidecar $manifest } catch { Write-AidaBootstrapLog ("camoufox_sidecar_skipped " + $_.Exception.GetType().FullName + ": " + $_.Exception.Message); Write-AidaStatus ("Camoufox setup skipped: " + $_.Exception.Message) }',
-        '$artifactUri = [Uri]$manifest.artifact.url',
-        'if ($artifactUri.Scheme -ne "https") { throw "AiDA artifact URL must use HTTPS." }',
-        'if (-not $manifest.artifact.package) { throw "AiDA encrypted package metadata is required." }',
-        '$packageSize = [int64]0; try { $packageSize = [int64]$manifest.artifact.package.size } catch { $packageSize = 0 }',
-        '$packageSizeText = if ($packageSize -gt 0) { "{0:N1} MB" -f ($packageSize / 1MB) } else { "unknown size" }',
-        'Write-AidaStatus ("Downloading and verifying encrypted package ({0})..." -f $packageSizeText)',
-        '$packageBytes = Get-AidaPackageBytesWithProgress $artifactUri $packageSize ([string]$manifest.artifact.package.sha256)',
-        'Write-AidaStatus "Decrypting package in memory..."',
-        '$exeBytes = Decrypt-AidaPackageBytesToMemory $packageBytes $manifest.artifact.package',
-        '[Array]::Clear($packageBytes, 0, $packageBytes.Length); $packageBytes = $null',
-        'Write-AidaStatus "Verifying artifact hash..."',
-        '$sha256 = [Security.Cryptography.SHA256]::Create()',
-        '$actualHash = ConvertTo-AidaHex ($sha256.ComputeHash($exeBytes)); $sha256.Dispose(); $sha256 = $null',
-        'if (-not (Test-AidaHexEqual $actualHash ([string]$manifest.artifact.sha256))) { throw "AiDA artifact SHA-256 verification failed." }',
-        'Write-AidaStatus "Launching AiDA in memory (no disk write)..."',
-        '$script:AidaFilelessDebugLogPath = Initialize-AidaFilelessDebugLog $actualHash $exeBytes.Length',
-        'Test-AidaNoStandaloneDiskArtifact "pre_entry" $exeBytes.Length',
-        'Write-AidaBootstrapLog ("launch_inmemory_enter bytes=" + $exeBytes.Length + " debug_log=" + $script:AidaFilelessDebugLogPath)',
-        'Invoke-AidaPEInMemory $exeBytes',
-        'Write-AidaBootstrapLog "launch_inmemory_returned"',
-        'try { Invoke-AidaAntiForensics } catch { Write-AidaBootstrapLog ("post_launch_wipe_error " + $_.Exception.Message) }',
-        'Write-AidaBootstrapLog "post_launch_wipe_done"',
-        '[Array]::Clear($exeBytes, 0, $exeBytes.Length); $exeBytes = $null',
-        'Write-AidaStatus "Done."',
-        '} catch { Write-AidaBootstrapLog ("fatal_error " + $_.Exception.GetType().FullName + ": " + $_.Exception.Message); Write-Host ("AiDA bootstrap failed: " + $_.Exception.Message) -ForegroundColor Red; $global:LASTEXITCODE = 1; return } finally { Write-AidaBootstrapLog "cleanup_enter"; if ($licenseKey) { $licenseKey = $null }; if ($currentHwid) { $currentHwid = $null }; if ($auth -and $auth.token) { $auth.token = $null }; if ($tokenParts -and $tokenParts.secret) { $tokenParts.secret = $null }; if ($null -ne $packageBytes) { [Array]::Clear($packageBytes, 0, $packageBytes.Length); $packageBytes = $null }; if ($null -ne $exeBytes) { [Array]::Clear($exeBytes, 0,$exeBytes.Length); $exeBytes = $null }; try { Invoke-AidaAntiForensics } catch { }; Write-AidaBootstrapLog "cleanup_exit" }',
+        'if (-not $manifest.policy.one_time_token -or -not $manifest.policy.token_bound_to_client_nonce -or -not $manifest.policy.token_bound_to_source_ip -or -not $manifest.policy.no_public_binary_route -or -not $manifest.policy.camoufox_sidecar_hash_required -or ($manifest.policy.encrypted_public_artifact) -or ($manifest.artifact -and ($manifest.artifact.url -or $manifest.artifact.package)) -or ($manifest.camoufox.mcp.configured -and -not $manifest.policy.camoufox_mcp_hash_required)) { throw "AiDA bootstrap manifest policy is invalid." }',
+        'Write-AidaStatus "Preparing verified Camoufox package..."',
+        'Install-AidaCamoufoxSidecar $manifest',
+        'Write-AidaBootstrapLog "camoufox_only_delivery_complete"',
+        'Write-AidaStatus "Camoufox package ready."',
+        '} catch { Write-AidaBootstrapLog ("fatal_error " + $_.Exception.GetType().FullName + ": " + $_.Exception.Message); Write-Host ("AiDA bootstrap failed: " + $_.Exception.Message) -ForegroundColor Red; $global:LASTEXITCODE = 1; return } finally { Write-AidaBootstrapLog "cleanup_enter"; if ($licenseKey) { $licenseKey = $null }; if ($currentHwid) { $currentHwid = $null }; if ($auth -and $auth.token) { $auth.token = $null }; if ($tokenParts -and $tokenParts.secret) { $tokenParts.secret = $null }; Write-AidaBootstrapLog "cleanup_exit" }',
     ];
-    return lines.join('\r\n') + '\r\n';
+    return pruneStandaloneLaunchScriptLines(lines).join('\r\n') + '\r\n';
 }
 
 function sha256Hex(text) {
@@ -1773,15 +1686,6 @@ async function rootScriptHandler(req, res, next) {
     return res.status(200).send(buildBootstrapStage0Script());
 }
 
-function expectedArtifactFileName(release) {
-    try {
-        const url = new URL(release.url);
-        return path.basename(url.pathname);
-    } catch (_) {
-        return '';
-    }
-}
-
 function expectedCamoufoxSidecarFileName(release) {
     try {
         if (!release.camoufox || !release.camoufox.configured) return '';
@@ -1805,15 +1709,13 @@ function expectedCamoufoxMcpFileName(release) {
 async function artifactHandler(req, res) {
     const release = getReleaseConfig();
     const requested = String(req.params && req.params.name || '');
-    if (!release.ok || !release.package || !/^[A-Za-z0-9._-]{1,160}\.(?:pkg|zip|exe)$/i.test(requested)) {
+    if (!release.ok || !/^[A-Za-z0-9._-]{1,160}\.(?:zip|exe)$/i.test(requested)) {
         return res.status(404).json({ status: 'error', reason: 'not_found' });
     }
-    const expectedPackage = expectedArtifactFileName(release);
     const expectedSidecar = expectedCamoufoxSidecarFileName(release);
     const expectedMcp = expectedCamoufoxMcpFileName(release);
     let expectedSize = 0;
-    if (requested === expectedPackage) expectedSize = release.package.size;
-    else if (requested === expectedSidecar) expectedSize = release.camoufox.size;
+    if (requested === expectedSidecar) expectedSize = release.camoufox.size;
     else if (requested === expectedMcp) expectedSize = release.camoufox.mcp.size;
     if (!expectedSize) {
         return res.status(404).json({ status: 'error', reason: 'not_found' });

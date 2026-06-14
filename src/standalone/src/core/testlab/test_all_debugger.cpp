@@ -1681,33 +1681,114 @@ static void test_trace_with_depth(HANDLE hf, std::atomic<int>& passed, std::atom
 }
 
 static void test_trace_result_inspection(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-    log_msg(hf, "dbg_tri", "START -- trace result buffer inspection");
+    log_msg(hf, "dbg_tri", "START -- trace result buffer inspection with controlled step evidence");
     auto t0 = std::chrono::steady_clock::now();
 
-    debugger_engine::stop_trace();
-    diag::log_tagged_fmt("test_dbg_detail", "dbg_tri inputs: start_trace(500) then inspect g_state.trace_log");
+    if (!require_attached_live_target(hf, "dbg_tri", failed))
+        return;
 
-    bool started = debugger_engine::start_trace(500);
-    Sleep(100);
+    controlled_step_fixture_t fixture;
+    std::vector<uint8_t> code{0x90, 0x90, 0x90, 0xC3};
+    if (!prepare_controlled_step_fixture(hf, "dbg_tri", fixture, code, false)) {
+        failed.fetch_add(1);
+        return;
+    }
+
+    const uint32_t active_tid = debugger_engine::g_state.active_tid;
+    const uint64_t fixture_va = fixture.code;
+    const uint64_t fixture_expected_rip = fixture.expected_rip;
+    driver_bridge::memory_region_t region{};
+    const bool region_ok = driver_bridge::query_memory_for(driver_bridge::attached_pid(), fixture_va, region);
+
+    debugger_engine::stop_trace();
+    auto before = debugger_engine::get_registers();
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_tri inputs: active_tid=%u fixture_va=0x%llX expected=0x%llX region_ok=%d region_base=0x%llX region_size=0x%llX region_state=0x%08X region_protect=0x%08X start_trace(16) step_into()",
+        (unsigned)active_tid,
+        (unsigned long long)fixture_va,
+        (unsigned long long)fixture_expected_rip,
+        (int)region_ok,
+        (unsigned long long)region.base,
+        (unsigned long long)region.size,
+        (unsigned)region.state,
+        (unsigned)region.protect);
+
+    bool started = debugger_engine::start_trace(16);
+    bool stepped = started ? debugger_engine::step_into() : false;
     bool stopped = debugger_engine::stop_trace();
+    auto after = debugger_engine::get_registers();
+    std::string err = debugger_engine::last_error();
 
     auto& state = debugger_engine::g_state;
     size_t trace_count = 0;
+    uint64_t first_rip = 0;
+    uint64_t last_rip = 0;
+    std::string first_disasm;
+    std::string last_disasm;
     {
         std::lock_guard<std::mutex> lk(state.trace_mutex);
         trace_count = state.trace_log.size();
+        if (!state.trace_log.empty()) {
+            first_rip = state.trace_log.front().address;
+            last_rip = state.trace_log.back().address;
+            first_disasm = state.trace_log.front().disasm_text;
+            last_disasm = state.trace_log.back().disasm_text;
+        }
     }
-    diag::log_tagged_fmt("test_dbg_detail", "dbg_tri result: start=>%d stop=>%d trace_log_size=%zu",
-        (int)started, (int)stopped, trace_count);
+
+    bool restored = false;
+    bool freed_code = false;
+    bool freed_stack = false;
+    cleanup_controlled_step_fixture(fixture, &restored, &freed_code, &freed_stack);
+
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_tri result: active_tid=%u fixture_va=0x%llX region_protect=0x%08X before_rip=0x%llX after_rip=0x%llX expected=0x%llX start=%d step=%d stop=%d trace_count=%zu first_rip=0x%llX last_rip=0x%llX restored=%d free_code=%d last_error='%s' first_disasm='%s' last_disasm='%s'",
+        (unsigned)active_tid,
+        (unsigned long long)fixture_va,
+        (unsigned)region.protect,
+        (unsigned long long)before.rip,
+        (unsigned long long)after.rip,
+        (unsigned long long)fixture_expected_rip,
+        (int)started,
+        (int)stepped,
+        (int)stopped,
+        trace_count,
+        (unsigned long long)first_rip,
+        (unsigned long long)last_rip,
+        (int)restored,
+        (int)freed_code,
+        err.empty() ? "(none)" : err.c_str(),
+        first_disasm.c_str(),
+        last_disasm.c_str());
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    if (started && stopped) {
-        log_msg(hf, "dbg_tri", "PASS -- trace engaged and buffer accessible: %zu records (0 expected without stepping) (elapsed %lld ms)",
-            trace_count, (long long)ms);
+    if (started && stepped && stopped && trace_count > 0 && after.rip == fixture_expected_rip && restored && freed_code) {
+        log_msg(hf, "dbg_tri", "PASS -- trace recorded %zu controlled step record(s): tid=%u fixture=0x%llX protect=0x%08X first_rip=0x%llX last_rip=0x%llX last_error=\"%s\" (elapsed %lld ms)",
+            trace_count,
+            (unsigned)active_tid,
+            (unsigned long long)fixture_va,
+            (unsigned)region.protect,
+            (unsigned long long)first_rip,
+            (unsigned long long)last_rip,
+            err.empty() ? "(none)" : err.c_str(),
+            (long long)ms);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "dbg_tri", "FAIL -- trace control failed: start=%d stop=%d (elapsed %lld ms)",
-            (int)started, (int)stopped, (long long)ms);
+        log_msg(hf, "dbg_tri", "FAIL -- trace evidence missing or controlled step failed: tid=%u fixture=0x%llX protect=0x%08X start=%d step=%d stop=%d before_rip=0x%llX after_rip=0x%llX expected=0x%llX trace_count=%zu first_rip=0x%llX last_rip=0x%llX restored=%d free_code=%d last_error=\"%s\" (elapsed %lld ms)",
+            (unsigned)active_tid,
+            (unsigned long long)fixture_va,
+            (unsigned)region.protect,
+            (int)started,
+            (int)stepped,
+            (int)stopped,
+            (unsigned long long)before.rip,
+            (unsigned long long)after.rip,
+            (unsigned long long)fixture_expected_rip,
+            trace_count,
+            (unsigned long long)first_rip,
+            (unsigned long long)last_rip,
+            (int)restored,
+            (int)freed_code,
+            err.empty() ? "(none)" : err.c_str(),
+            (long long)ms);
         failed.fetch_add(1);
     }
 }

@@ -71,6 +71,7 @@ const {
     Routes,
     EmbedBuilder,
     MessageFlags,
+    InteractionContextType,
 } = require('discord.js');
 const { v4: uuidv4 } = require('uuid');
 const crypto = require('crypto');
@@ -85,6 +86,8 @@ const ADMIN_API_BASE     = process.env.AIDA_ADMIN_API_BASE     || '';
 const ADMIN_HMAC_KEY     = process.env.AIDA_ADMIN_HMAC_KEY     || '';
 const ADMIN_API_KEY      = process.env.AIDA_ADMIN_API_KEY      || '';
 const BOT_ED25519_PRIV_B64 = process.env.BOT_ED25519_PRIVATE_KEY_B64 || '';
+const DISCORD_CUSTOMER_ROLE_ID = (process.env.DISCORD_CUSTOMER_ROLE_ID || '1515754127110438922').trim();
+const DISCORD_CUSTOMER_GUILD_ID = (process.env.DISCORD_CUSTOMER_GUILD_ID || '').trim();
 
 let _botPrivKey = null;
 function getBotPrivateKey() {
@@ -119,16 +122,24 @@ function signBotPayload(payload) {
     return crypto.sign(null, Buffer.from(canonical, 'utf8'), key).toString('base64');
 }
 
+function buildApiUrl(apiPath) {
+    const base = ADMIN_API_BASE.trim().replace(/\/+$/, '');
+    const path = String(apiPath || '').replace(/^\/+/, '').replace(/^api\//i, '');
+    if (!base || !path) return '';
+    if (/\/api\/license$/i.test(base)) {
+        return base.replace(/\/license$/i, '') + '/' + path;
+    }
+    if (/\/api$/i.test(base)) {
+        return base + '/' + path;
+    }
+    return base + '/api/' + path;
+}
+
 async function callServerAction(action, fields) {
     if (!ADMIN_API_BASE) {
         return { ok: false, reason: 'admin_api_base_not_configured' };
     }
-    const base = ADMIN_API_BASE.trim().replace(/\/+$/, '');
-    const url = /\/api\/license$/i.test(base)
-        ? base + '/' + encodeURIComponent(action)
-        : /\/api$/i.test(base)
-            ? base + '/license/' + encodeURIComponent(action)
-            : base + '/api/license/' + encodeURIComponent(action);
+    const url = buildApiUrl('license/' + encodeURIComponent(action));
     const payload = Object.assign({
         action,
         nonce: crypto.randomBytes(16).toString('hex'),
@@ -140,6 +151,45 @@ async function callServerAction(action, fields) {
     const sig = signBotPayload(payload);
     const headers = { 'Content-Type': 'application/json' };
     if (sig) headers['x-bot-signature'] = sig;
+    try {
+        const resp = await fetch(url, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(payload),
+        });
+        const text = await resp.text();
+        let body = null;
+        try { body = JSON.parse(text); } catch { body = { raw: text }; }
+        return { ok: resp.ok, status: resp.status, body };
+    } catch (err) {
+        return { ok: false, reason: 'network_error', error: err && err.message ? err.message : String(err) };
+    }
+}
+
+async function callCustomerDownloadIssue(interaction) {
+    if (!ADMIN_API_BASE) {
+        return { ok: false, reason: 'admin_api_base_not_configured' };
+    }
+    const url = buildApiUrl('customer-download/issue');
+    if (!url) {
+        return { ok: false, reason: 'admin_api_base_not_configured' };
+    }
+    const payload = {
+        action: 'discord_download_ticket',
+        nonce: crypto.randomBytes(16).toString('hex'),
+        ts: Math.floor(Date.now() / 1000),
+        discord_id: interaction.user.id,
+        discord_username: discordUsernameForPayload(interaction.user),
+        guild_id: interaction.guildId || '',
+        customer_role_id: DISCORD_CUSTOMER_ROLE_ID,
+        interaction_id: interaction.id,
+    };
+    const sig = signBotPayload(payload);
+    if (!sig) {
+        return { ok: false, reason: 'bot_signing_key_not_configured' };
+    }
+    const headers = { 'Content-Type': 'application/json' };
+    headers['x-bot-signature'] = sig;
     try {
         const resp = await fetch(url, {
             method: 'POST',
@@ -173,6 +223,61 @@ function serverActionFailure(result) {
     if (!parts.length && result && result.error) parts.push(String(result.error));
     if (result && result.status) parts.push('HTTP ' + result.status);
     return parts.length ? parts.join(' / ') : 'unknown';
+}
+
+function firstStringField(body, names) {
+    if (!body || typeof body !== 'object') return '';
+    for (const name of names) {
+        const value = body[name];
+        if (typeof value === 'string' && value.trim()) return value.trim();
+    }
+    return '';
+}
+
+function customerDownloadUrl(body) {
+    const direct = firstStringField(body, ['url', 'download_url', 'downloadUrl', 'private_url', 'privateUrl', 'ticket_url', 'ticketUrl']);
+    if (direct) return direct;
+    for (const key of ['download', 'ticket', 'data']) {
+        const nested = body && body[key];
+        const value = firstStringField(nested, ['url', 'download_url', 'downloadUrl', 'private_url', 'privateUrl', 'ticket_url', 'ticketUrl']);
+        if (value) return value;
+    }
+    return '';
+}
+
+function customerDownloadExpiry(body) {
+    const direct = firstStringField(body, ['expires_at', 'expiresAt', 'expires', 'expires_in', 'expiresIn', 'ttl_seconds', 'ttlSeconds']);
+    if (direct) return direct;
+    for (const key of ['download', 'ticket', 'data']) {
+        const nested = body && body[key];
+        const value = firstStringField(nested, ['expires_at', 'expiresAt', 'expires', 'expires_in', 'expiresIn', 'ttl_seconds', 'ttlSeconds']);
+        if (value) return value;
+        if (nested && typeof nested === 'object') {
+            for (const numericKey of ['expires_in', 'expiresIn', 'ttl_seconds', 'ttlSeconds']) {
+                if (Number.isFinite(nested[numericKey])) return String(nested[numericKey]);
+            }
+        }
+    }
+    for (const numericKey of ['expires_in', 'expiresIn', 'ttl_seconds', 'ttlSeconds']) {
+        if (Number.isFinite(body && body[numericKey])) return String(body[numericKey]);
+    }
+    return '';
+}
+
+function customerDownloadReply(body) {
+    const url = customerDownloadUrl(body);
+    if (!url) return '';
+    const instructions = firstStringField(body, ['instructions', 'message']) || 'Use this one-time private download link before it expires. Do not share it.';
+    const expires = customerDownloadExpiry(body);
+    const lines = [
+        instructions.slice(0, 900),
+        '',
+        `Download: ${url}`,
+    ];
+    if (expires) {
+        lines.push(`Expires: ${expires}`);
+    }
+    return lines.join('\n');
 }
 
 function discordUsernameForPayload(user) {
@@ -389,6 +494,24 @@ function isAdminInteraction(interaction) {
         }
         if (Array.isArray(member.roles)) {
             return member.roles.includes(DISCORD_ADMIN_ROLE_ID);
+        }
+    } catch (_) { }
+    return false;
+}
+
+function isCustomerInteraction(interaction) {
+    if (!DISCORD_CUSTOMER_ROLE_ID) return false;
+    if (!interaction || typeof interaction.inGuild !== 'function' || !interaction.inGuild()) return false;
+    if (DISCORD_CUSTOMER_GUILD_ID && interaction.guildId !== DISCORD_CUSTOMER_GUILD_ID) return false;
+    try {
+        const member = interaction.member;
+        if (!member) return false;
+        const roleCache = member.roles && member.roles.cache;
+        if (roleCache && typeof roleCache.has === 'function') {
+            return roleCache.has(DISCORD_CUSTOMER_ROLE_ID);
+        }
+        if (Array.isArray(member.roles)) {
+            return member.roles.some(role => role === DISCORD_CUSTOMER_ROLE_ID || (role && role.id === DISCORD_CUSTOMER_ROLE_ID));
         }
     } catch (_) { }
     return false;
@@ -613,9 +736,23 @@ async function logAudit(interaction, action, target, details) {
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
+function guildOnlyCommand(command) {
+    if (command && typeof command.setContexts === 'function' && InteractionContextType && Object.prototype.hasOwnProperty.call(InteractionContextType, 'Guild')) {
+        return command.setContexts(InteractionContextType.Guild);
+    }
+    if (command && typeof command.setDMPermission === 'function') {
+        return command.setDMPermission(false);
+    }
+    return command;
+}
+
 // ─── Slash Command Definitions ────────────────────────────────────────────────
 
 const commands = [
+
+    guildOnlyCommand(new SlashCommandBuilder()
+        .setName('download')
+        .setDescription('Get your private AiDA download link')),
 
     // /generate
     new SlashCommandBuilder()
@@ -1014,6 +1151,29 @@ client.on('interactionCreate', async (interaction) => {
 
     const { commandName } = interaction;
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+    if (commandName === 'download') {
+        if (!isCustomerInteraction(interaction)) {
+            return interaction.editReply('Unable to issue a private download link for this account.');
+        }
+        const abuseGate = await checkAbuseGate(interaction);
+        if (!abuseGate.ok) {
+            return interaction.editReply(abuseGate.message || 'Unable to issue a private download link right now.');
+        }
+        const result = await callCustomerDownloadIssue(interaction);
+        if (!result.ok) {
+            return interaction.editReply('Unable to issue a private download link right now. Please try again later.');
+        }
+        const reply = customerDownloadReply(result.body);
+        if (!reply) {
+            return interaction.editReply('Unable to issue a private download link right now. Please try again later.');
+        }
+        await logAudit(interaction, 'customer.download_issue', interaction.user.id, {
+            guild_id: interaction.guildId || '',
+            customer_role_id: DISCORD_CUSTOMER_ROLE_ID,
+        });
+        return interaction.editReply(reply);
+    }
 
     const KILL_COMMANDS = new Set(['aida-kill', 'aida-kill-hwid', 'aida-killswitch-global', 'version-kill']);
     if (KILL_COMMANDS.has(commandName)) {
