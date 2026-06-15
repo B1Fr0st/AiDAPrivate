@@ -95,7 +95,7 @@ static void print_usage(std::FILE* out) {
         "  --opaque-predicates         Insert opaque predicates (Phase 6)\n"
         "  --ast-poison                Inject AST-poisoning debug section (Phase B.1)\n"
         "  --symexec-bombs             Inject symbolic-execution state-explosion bombs (Phase B.2)\n"
-        "  --llm-poison                Embed LLM-prompt-injection trap strings in .rdata (Phase B.3)\n"
+        "  --llm-poison                Embed LLM traps in .rdiag/.aiai* plus .aifn function lures (Phase B.3)\n"
         "  --jit                       Declare JIT enclave presence in aux block (runtime must also be JIT-enabled)\n"
         "  --no-jit                    Declare JIT disabled (e.g. for AiDA.dll inside IDA Pro's ACG)\n"
         "\n"

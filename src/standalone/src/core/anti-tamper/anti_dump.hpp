@@ -1041,6 +1041,12 @@ namespace read_intercept
         return v;
     }
 
+    inline std::atomic<uint64_t>& orphan_single_step_reject_count()
+    {
+        static std::atomic<uint64_t> v{0};
+        return v;
+    }
+
     inline void arm_orphan_single_step_grace(uint64_t duration_ms)
     {
         if (duration_ms == 0)
@@ -1124,6 +1130,7 @@ namespace read_intercept
         return lstrcmpiW(name, L"user32.dll") == 0 ||
             lstrcmpiW(name, L"win32u.dll") == 0 ||
             lstrcmpiW(name, L"ntdll.dll") == 0 ||
+            lstrcmpiW(name, L"bcrypt.dll") == 0 ||
             lstrcmpiW(name, L"kernelbase.dll") == 0;
     }
 
@@ -1146,6 +1153,74 @@ namespace read_intercept
                 return true;
         }
         return false;
+    }
+
+    inline void log_orphan_single_step_reject(
+        EXCEPTION_POINTERS* ep,
+        const char* source,
+        const char* reason,
+        uint64_t now,
+        uint64_t grace_until,
+        bool active,
+        bool rip_current_image,
+        bool rip_trusted_system,
+        bool stack_current_image)
+    {
+        const uint64_t n = orphan_single_step_reject_count().fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n > 32 && (n % 128ULL) != 0ULL)
+            return;
+
+        CONTEXT* ctx = ep ? ep->ContextRecord : nullptr;
+        const uint64_t rip = ctx ? static_cast<uint64_t>(ctx->Rip) : 0;
+        const uint64_t rsp = ctx ? static_cast<uint64_t>(ctx->Rsp) : 0;
+        const uint64_t dr6 = ctx ? static_cast<uint64_t>(ctx->Dr6) : 0;
+        const uint64_t dr7 = ctx ? static_cast<uint64_t>(ctx->Dr7) : 0;
+        const DWORD eflags = ctx ? ctx->EFlags : 0;
+
+        MEMORY_BASIC_INFORMATION mbi{};
+        DWORD vq_ok = VirtualQuery(reinterpret_cast<void*>(rip), &mbi, sizeof(mbi)) != 0 ? 1u : 0u;
+        HMODULE mod = nullptr;
+        char mod_path[MAX_PATH] = "<unknown>";
+        if (rip != 0 &&
+            GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<LPCSTR>(rip), &mod) && mod)
+        {
+            GetModuleFileNameA(mod, mod_path, MAX_PATH);
+        }
+
+        char dbg[1024];
+        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+            "orphan_single_step_reject #%llu source=%s reason=%s rip=0x%llX rsp=0x%llX tid=%lu dr6=0x%llX dr7=0x%llX eflags=0x%08lX active=%d grace_until=%llu remaining_ms=%llu current_image=%d trusted_system=%d stack_current_image=%d vq=%lu mbi_base=0x%llX mbi_alloc=0x%llX mbi_size=0x%llX mbi_state=0x%08lX mbi_protect=0x%08lX mbi_type=0x%08lX module=%s iat=0x%llX/0x%X trap=0x%llX/0x%X text=0x%llX/0x%X",
+            static_cast<unsigned long long>(n),
+            source ? source : "veh",
+            reason ? reason : "unknown",
+            static_cast<unsigned long long>(rip),
+            static_cast<unsigned long long>(rsp),
+            GetCurrentThreadId(),
+            static_cast<unsigned long long>(dr6),
+            static_cast<unsigned long long>(dr7),
+            static_cast<unsigned long>(eflags),
+            active ? 1 : 0,
+            static_cast<unsigned long long>(grace_until),
+            static_cast<unsigned long long>(grace_until >= now ? grace_until - now : 0),
+            rip_current_image ? 1 : 0,
+            rip_trusted_system ? 1 : 0,
+            stack_current_image ? 1 : 0,
+            static_cast<unsigned long>(vq_ok),
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(mbi.BaseAddress)),
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(mbi.AllocationBase)),
+            static_cast<unsigned long long>(mbi.RegionSize),
+            mbi.State,
+            mbi.Protect,
+            mbi.Type,
+            mod_path,
+            static_cast<unsigned long long>(iat_guard::iat_base().load(std::memory_order_acquire)),
+            iat_guard::iat_size().load(std::memory_order_acquire),
+            static_cast<unsigned long long>(trap_page_base.load(std::memory_order_acquire)),
+            trap_page_size.load(std::memory_order_acquire),
+            static_cast<unsigned long long>(text_guard::text_base().load(std::memory_order_acquire)),
+            text_guard::text_size().load(std::memory_order_acquire));
+        webhook::write_log("veh", dbg);
     }
 
     inline pending_step_slot* find_pending_step_slot(DWORD tid)
@@ -1288,36 +1363,66 @@ namespace read_intercept
         const uint64_t now = static_cast<uint64_t>(GetTickCount64());
         const uint64_t grace_until = orphan_single_step_grace_until_ms().load(std::memory_order_acquire);
         if (grace_until == 0 || now > grace_until)
+        {
+            log_orphan_single_step_reject(ep, source,
+                grace_until == 0 ? "grace_unarmed" : "grace_expired",
+                now, grace_until, false, false, false, false);
             return false;
+        }
 
         const bool active =
             iat_guard::iat_base().load(std::memory_order_acquire) != 0 ||
             trap_page_base.load(std::memory_order_acquire) != 0 ||
             text_guard::text_base().load(std::memory_order_acquire) != 0;
         if (!active)
+        {
+            log_orphan_single_step_reject(ep, source, "guards_inactive",
+                now, grace_until, false, false, false, false);
             return false;
+        }
 
         if (IsDebuggerPresent())
+        {
+            log_orphan_single_step_reject(ep, source, "debugger_present",
+                now, grace_until, active, false, false, false);
             return false;
+        }
         BOOL remote_debugger = FALSE;
         if (CheckRemoteDebuggerPresent(GetCurrentProcess(), &remote_debugger) && remote_debugger)
+        {
+            log_orphan_single_step_reject(ep, source, "remote_debugger_present",
+                now, grace_until, active, false, false, false);
             return false;
+        }
 
         const uint64_t dr6 = static_cast<uint64_t>(ep->ContextRecord->Dr6);
         if ((dr6 & 0xFULL) != 0)
+        {
+            log_orphan_single_step_reject(ep, source, "dr6_breakpoint_bits",
+                now, grace_until, active, false, false, false);
             return false;
+        }
         const uint64_t dr7 = static_cast<uint64_t>(ep->ContextRecord->Dr7);
         if ((dr7 & 0xFFULL) != 0)
+        {
+            log_orphan_single_step_reject(ep, source, "dr7_breakpoint_enabled",
+                now, grace_until, active, false, false, false);
             return false;
+        }
 
         const uint64_t rip = static_cast<uint64_t>(ep->ContextRecord->Rip);
         const bool rip_current_image = address_in_current_image(rip);
-        const bool rip_trusted_system_with_app_stack =
-            !rip_current_image &&
-            address_in_trusted_system_image(rip) &&
+        const bool rip_trusted_system = !rip_current_image && address_in_trusted_system_image(rip);
+        const bool stack_current_image = rip_trusted_system &&
             stack_has_current_image_return(static_cast<uint64_t>(ep->ContextRecord->Rsp));
+        const bool rip_trusted_system_with_app_stack =
+            rip_trusted_system && stack_current_image;
         if (!rip_current_image && !rip_trusted_system_with_app_stack)
+        {
+            log_orphan_single_step_reject(ep, source, "untrusted_rip_or_missing_aida_stack",
+                now, grace_until, active, rip_current_image, rip_trusted_system, stack_current_image);
             return false;
+        }
 
         const DWORD tid = GetCurrentThreadId();
         const DWORD old_eflags = ep->ContextRecord->EFlags;

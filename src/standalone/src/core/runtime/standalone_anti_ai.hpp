@@ -852,7 +852,10 @@ namespace detail
             L"server-mcp", L"stdio-mcp", L"claude mcp", L"codex mcp", L"tools/list",
             L"json-rpc", L"jsonrpc", L"tool-server", L"toolserver", L"cline-mcp",
             L"roo-mcp", L"cursor-mcp", L"windsurf-mcp", L"copilot-mcp", L"qwen-mcp",
-            L"gemini-mcp", L"opencode-mcp", L"aider-mcp", L"mcp-stdio"
+            L"gemini-mcp", L"opencode-mcp", L"aider-mcp", L"mcp-stdio",
+            L"codex-mcp", L"claude-desktop", L"claude_desktop_config", L"mcpservers",
+            L"mcp.json", L"fastmcp", L"mcp-proxy", L"mcp proxy", L"uvx mcp",
+            L"stdio server", L"model context protocol", L"anthropic mcp", L"openai mcp"
         };
         return probe_contains_any(probe, tokens);
     }
@@ -869,7 +872,12 @@ namespace detail
         static const wchar_t* const explicit_target_tokens[] = {
             L"aidastandalone", L"aidastandalone.exe", L"aida.exe",
             L"aida_core", L"aida_core.dll", L"aida_plugin",
-            L"aida_debug.log", L"aida_full_test.log", L"aida_kernel.log"
+            L"aida_debug.log", L"aida_full_test.log", L"aida_kernel.log",
+            L".rdiag", L".aiai", L".aifn", L"aida-anti-ai-tripwire",
+            L"aida-ai-function-lure", L"security_violation_aida_anti_ai",
+            L"confirmed-bypass path", L"exploitability proof",
+            L"license-success validator", L"arc decryptor proof",
+            L"runtime-integrity unlock"
         };
         if (contains_any_w(probe.command_lower, explicit_target_tokens))
             return true;
@@ -1067,7 +1075,12 @@ namespace detail
             L"cursor.exe", L"windsurf", L"aider", L"continue.exe", L"cline",
             L"roo-cline", L"roo.exe", L"claude.exe", L"claude-code", L"codex.exe",
             L"openai-codex", L"codegen", L"devin", L"gemini.exe", L"qwen.exe",
-            L"opencode", L"goose", L"kiro.exe", L"trae.exe", L"copilot"
+            L"opencode", L"goose", L"kiro.exe", L"trae.exe", L"copilot",
+            L"claude-code.exe", L"claude_desktop", L"claude desktop", L"cursor-agent",
+            L"cursor-server", L"windsurf-server", L"aider.exe", L"continue",
+            L"openhands", L"swe-agent", L"sweagent", L"qwen-code", L"gemini-cli",
+            L"sourcegraph cody", L"cody.exe", L"augment", L"junie", L"amp.exe",
+            L"factory-agent", L"replit-agent", L"crush.exe", L"opencode.exe"
         };
         return probe_contains_any(probe, tokens);
     }
@@ -1079,7 +1092,10 @@ namespace detail
             L"koboldcpp", L"text-generation", L"vllm", L"localai", L"lm-studio",
             L"lmstudio", L"jan.exe", L"gpt4all", L"oobabooga", L"tabbyapi",
             L"exllama", L"mlc-chat", L"mlc_llm", L"tgi-server", L"chatd",
-            L"privategpt", L"private-gpt"
+            L"privategpt", L"private-gpt", L"llama-swap", L"llama-server.exe",
+            L"ollama.exe", L"lm studio", L"lmstudio.exe", L"jan", L"gpt4all.exe",
+            L"llamafile.exe", L"tensorrt-llm", L"sglang", L"mistral.rs",
+            L"open-webui", L"anythingllm", L"llama-cpp-python"
         };
         return probe_contains_any(probe, tokens);
     }
@@ -1920,7 +1936,12 @@ namespace detail
         ctx->last_title_hash = hash_wide_lower(title);
         std::wstring lower_title = lower_copy(title);
         static const wchar_t* const title_tokens[] = {
-            L"aidastandalone", L"aida.exe", L"aidaprivate", L"aida_core", L"aida_debug.log"
+            L"aidastandalone", L"aida.exe", L"aidaprivate", L"aida_core", L"aida_debug.log",
+            L".rdiag", L".aiai", L".aifn", L"aida-anti-ai-tripwire",
+            L"aida-ai-function-lure", L"security_violation_aida_anti_ai",
+            L"confirmed-bypass path", L"exploitability proof",
+            L"license-success validator", L"arc decryptor proof",
+            L"runtime-integrity unlock"
         };
         if (!contains_any_w(lower_title, title_tokens))
             return TRUE;
@@ -2218,6 +2239,7 @@ namespace self_analysis
         bool first_owner_tool = false;
         bool first_owner_targets_aida = false;
         bool first_owner_core_system = false;
+        bool first_owner_trusted_system_process = false;
         bool first_owner_mcp = false;
         bool first_owner_ai = false;
         bool first_owner_memory = false;
@@ -2512,11 +2534,13 @@ namespace self_analysis
                 uint64_t owner_hash = 0;
                 bool owner_query_ok = false;
                 bool owner_core_system = false;
+                bool owner_trusted_system_process = false;
                 if (probe)
                 {
                     owner_hash = probe->basename_hash;
                     owner_query_ok = probe->query_ok;
                     owner_core_system = detail::trusted_windows_core_basename_w(probe->exe_lower);
+                    owner_trusted_system_process = detail::trusted_windows_system_process(*probe);
                     owner_memory = detail::is_memory_scanner_tool(*probe);
                     owner_re = detail::is_re_tool(*probe);
                     owner_debugger = detail::is_debugger_tool(*probe);
@@ -2542,6 +2566,7 @@ namespace self_analysis
                     out.first_owner_path = detail::probe_path_for_log(probe);
                     out.first_owner_query_ok = owner_query_ok;
                     out.first_owner_core_system = owner_core_system;
+                    out.first_owner_trusted_system_process = owner_trusted_system_process;
                     out.first_owner_mcp = owner_mcp;
                     out.first_owner_ai = owner_ai;
                     out.first_owner_memory = owner_memory;
@@ -2638,6 +2663,7 @@ namespace combined
         bool first_handle_owner_tool = false;
         bool first_handle_owner_targets_aida = false;
         bool first_handle_owner_core_system = false;
+        bool first_handle_owner_trusted_system_process = false;
         bool first_handle_owner_mcp = false;
         bool first_handle_owner_ai = false;
         bool first_handle_owner_memory = false;
@@ -2773,6 +2799,7 @@ namespace combined
         report.first_handle_owner_tool = handle_report.first_owner_tool;
         report.first_handle_owner_targets_aida = handle_report.first_owner_targets_aida;
         report.first_handle_owner_core_system = handle_report.first_owner_core_system;
+        report.first_handle_owner_trusted_system_process = handle_report.first_owner_trusted_system_process;
         report.first_handle_owner_mcp = handle_report.first_owner_mcp;
         report.first_handle_owner_ai = handle_report.first_owner_ai;
         report.first_handle_owner_memory = handle_report.first_owner_memory;

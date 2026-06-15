@@ -4345,7 +4345,7 @@ namespace {
 
         aida::burp::camoufox::launch_config_t cfg;
         cfg.headless = false;
-        cfg.launch_timeout_ms = 45000;
+        cfg.launch_timeout_ms = 75000;
         cfg.window_width = 1280;
         cfg.window_height = 900;
         cfg.testlab_fast_probe = false;

@@ -83,6 +83,18 @@ static aida::burp::comparer::diff_mode_t parse_mode(const std::string& s)
     return aida::burp::comparer::diff_mode_t::lines;
 }
 
+static json slot_to_json(const aida::burp::comparer::slot_t& s)
+{
+    json e;
+    e["id"] = s.id;
+    e["slot_id"] = s.id;
+    e["label"] = s.label;
+    e["size"] = static_cast<uint64_t>(s.data.size());
+    e["source_hint"] = s.source_hint;
+    e["created_ms"] = static_cast<uint64_t>(s.created_ms);
+    return e;
+}
+
 tool_result_t handle_add_slot(const json& p)
 {
     std::string label = (p.contains("label") && p["label"].is_string()) ? p["label"].get<std::string>() : "Slot";
@@ -112,13 +124,7 @@ tool_result_t handle_list(const json&)
     auto v = aida::burp::comparer::list_slots();
     json arr = json::array();
     for (const auto& s : v) {
-        json e;
-        e["id"]         = s.id;
-        e["label"]      = s.label;
-        e["size"]       = static_cast<uint64_t>(s.data.size());
-        e["source_hint"] = s.source_hint;
-        e["created_ms"] = static_cast<uint64_t>(s.created_ms);
-        arr.push_back(std::move(e));
+        arr.push_back(slot_to_json(s));
     }
     diag::log_tagged_fmt("mcp_burp", "comparer_list ok count=%zu", v.size());
     json out;
@@ -136,14 +142,25 @@ tool_result_t handle_remove(const json& p)
     }
     const uint64_t sid = p["slot_id"].get<uint64_t>();
     diag::log_tagged_fmt("mcp_burp", "comparer_remove slot_id=%llu", static_cast<unsigned long long>(sid));
+    const auto before = aida::burp::comparer::list_slots();
+    aida::burp::comparer::slot_t removed_slot{};
+    const bool had_slot = aida::burp::comparer::get_slot(sid, removed_slot);
     bool ok = aida::burp::comparer::remove_slot(sid);
     if (!ok)
     {
         diag::log_tagged_fmt("mcp_burp", "comparer_remove not_found id=%llu", static_cast<unsigned long long>(sid));
         return tool_result_t::error("slot not found");
     }
+    const auto after = aida::burp::comparer::list_slots();
+    json out;
+    out["slot_id"] = sid;
+    out["removed"] = true;
+    out["before_count"] = static_cast<uint64_t>(before.size());
+    out["after_count"] = static_cast<uint64_t>(after.size());
+    out["remaining_count"] = static_cast<uint64_t>(after.size());
+    out["removed_slot"] = had_slot ? slot_to_json(removed_slot) : json(nullptr);
     diag::log_tagged_fmt("mcp_burp", "comparer_remove ok slot_id=%llu", static_cast<unsigned long long>(sid));
-    return tool_result_t::ok("slot removed");
+    return tool_result_t::ok("slot removed", out);
 }
 
 tool_result_t handle_clear(const json&)

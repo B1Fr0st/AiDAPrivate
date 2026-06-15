@@ -707,6 +707,71 @@ inline bool run_verification_cycle()
 
         auto ai_report = standalone_anti_ai::combined::full_scan();
 
+        if (ai_report.confirmed_high_risk())
+        {
+            std::string detail = ai_report.summary;
+            const char* viol_reason = "ai_analysis_high_risk";
+            const char* webhook_tag = "anti_ai_high_risk";
+            if (ai_report.offensive_mcp_tool_detected)
+            {
+                viol_reason = "offensive_mcp_tool_detected";
+                webhook_tag = "anti_mcp_offensive";
+            }
+            else if (ai_report.llm_detected)
+            {
+                viol_reason = "local_llm_analysis";
+                webhook_tag = "anti_llm";
+            }
+            else if (ai_report.mcp_detected)
+            {
+                viol_reason = "mcp_bridge_detected";
+                webhook_tag = "anti_mcp";
+            }
+            else if (ai_report.ai_tool_detected && ai_report.tool_targets_aida)
+            {
+                viol_reason = "ai_agent_targeting_aida";
+                webhook_tag = "anti_ai_agent";
+            }
+            else if (ai_report.memory_scanner_detected)
+            {
+                viol_reason = "memory_scanner_attached";
+                webhook_tag = "mem_scanner";
+            }
+            else if (ai_report.re_tool_detected)
+            {
+                viol_reason = "reverse_engineering_tool_detected";
+                webhook_tag = "re_tool_scan";
+            }
+            else if (ai_report.debugger_tool_detected)
+            {
+                viol_reason = "debugger_tool_detected";
+                webhook_tag = "debugger_tool_scan";
+            }
+            else if (ai_report.dump_tool_detected)
+            {
+                viol_reason = "dump_tool_detected";
+                webhook_tag = "dump_tool_scan";
+            }
+            else if (ai_report.foreign_vm_write_handle || ai_report.foreign_vm_operation_handle || ai_report.foreign_create_thread_handle)
+            {
+                viol_reason = "foreign_mutating_handle_detected";
+                webhook_tag = "handle_leak";
+            }
+            else if (ai_report.handle_to_us_detected)
+            {
+                viol_reason = "foreign_handle_detected";
+                webhook_tag = "handle_leak";
+            }
+            else if (ai_report.tool_targets_aida)
+            {
+                viol_reason = "tool_targeting_aida";
+                webhook_tag = "anti_ai_target";
+            }
+            webhook::send_debug_log(webhook_tag, detail, true);
+            enforce_violation(viol_reason, detail);
+            return false;
+        }
+
         if (ai_report.mcp_detected || ai_report.llm_detected
             || ai_report.memory_scanner_detected || ai_report.handle_to_us_detected)
         {

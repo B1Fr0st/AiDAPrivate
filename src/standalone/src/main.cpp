@@ -109,6 +109,9 @@ static ID3D11BlendState* blend_state = nullptr;
 helpers helper;
 HWND g_hwnd = nullptr;
 static constexpr const wchar_t* kAidaWindowTitle = L"AiDA Standalone";
+static constexpr int kAidaFullTestHotkeyId = 0xA1DA;
+static constexpr UINT kAidaQueuedPeekFlags = PM_REMOVE | PM_QS_INPUT | PM_QS_POSTMESSAGE | PM_QS_PAINT;
+static constexpr DWORD kAidaQueuedQueueBits = QS_INPUT | QS_POSTMESSAGE | QS_TIMER | QS_PAINT | QS_HOTKEY | QS_ALLPOSTMESSAGE;
 bool CreateDeviceD3D(HWND hWnd);
 void CleanupDeviceD3D();
 void CreateRenderTarget();
@@ -816,9 +819,10 @@ namespace aida_tracer {
     inline std::atomic<LONG_PTR> g_dispatch_lparam{0};
     inline std::atomic<DWORD> g_peek_queue_status{0};
     inline std::atomic<DWORD> g_peek_last_error{0};
-    inline std::atomic<UINT> g_peek_remove_flags{PM_REMOVE};
+    inline std::atomic<UINT> g_peek_remove_flags{kAidaQueuedPeekFlags};
     inline std::atomic<UINT_PTR> g_peek_filter_hwnd{0};
     inline std::atomic<uint64_t> g_peek_fileless_send_only_defers{0};
+    inline std::atomic<uint64_t> g_peek_send_only_defers{0};
     inline std::atomic<const char*> g_wndproc_stage{"<idle>"};
     inline std::atomic<UINT> g_wndproc_msg{0};
     inline std::atomic<UINT_PTR> g_wndproc_hwnd{0};
@@ -1400,6 +1404,7 @@ namespace aida_tracer {
         uint64_t prev_frame = 0;
         uint64_t prev_render_phase_id = 0;
         uint64_t stall_streak = 0;
+        uint64_t last_peek_rescue_ms = 0;
         const uint64_t kStallThresholdMs = 2000;
         while (!g_stop.load(std::memory_order_acquire)) {
             ::Sleep(250);
@@ -1436,9 +1441,43 @@ namespace aida_tracer {
 
             if (render_stalled) {
                 stall_streak++;
+                const uint64_t peek_calls = g_peek_call_count.load(std::memory_order_acquire);
+                const uint64_t peek_returns = g_peek_return_count.load(std::memory_order_acquire);
+                const bool stuck_in_peek =
+                    phase_name && std::strcmp(phase_name, "peek_message_call") == 0 &&
+                    peek_calls > peek_returns;
+                if (stuck_in_peek && now - last_peek_rescue_ms >= 1000) {
+                    last_peek_rescue_ms = now;
+                    ::SetLastError(0);
+                    BOOL thread_posted = render_tid ? ::PostThreadMessageW(render_tid, WM_NULL, 0, 0) : FALSE;
+                    DWORD thread_gle = ::GetLastError();
+                    BOOL hwnd_posted = FALSE;
+                    DWORD hwnd_gle = 0;
+                    HWND rescue_hwnd = g_hwnd;
+                    if (rescue_hwnd && ::IsWindow(rescue_hwnd)) {
+                        ::SetLastError(0);
+                        hwnd_posted = ::PostMessageW(rescue_hwnd, WM_NULL, 0, 0);
+                        hwnd_gle = ::GetLastError();
+                        ::InvalidateRect(rescue_hwnd, nullptr, FALSE);
+                    }
+                    diag::log_tagged_critical_fmt("tracer",
+                        "peek_rescue frame=%llu age_ms=%llu render_tid=%lu calls=%llu returns=%llu thread_posted=%d thread_gle=%lu hwnd=0x%llX hwnd_posted=%d hwnd_gle=%lu qs=0x%08lX flags=0x%08X",
+                        static_cast<unsigned long long>(frame),
+                        static_cast<unsigned long long>(age_ms),
+                        render_tid,
+                        static_cast<unsigned long long>(peek_calls),
+                        static_cast<unsigned long long>(peek_returns),
+                        thread_posted ? 1 : 0,
+                        static_cast<unsigned long>(thread_gle),
+                        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(rescue_hwnd)),
+                        hwnd_posted ? 1 : 0,
+                        static_cast<unsigned long>(hwnd_gle),
+                        static_cast<unsigned long>(peek_status),
+                        g_peek_remove_flags.load(std::memory_order_acquire));
+                }
                 if (stall_streak == 1 || (stall_streak % 20ULL) == 0ULL) {
                     diag::log_tagged_critical_fmt("tracer",
-                        "RENDER_STALL streak=%llu frame=%llu age_ms=%llu phase=%s section=%s phase_id=%llu render_tid=%lu attach=%s attach_id=%llu peek_qs=0x%08lX peek_gle=%lu peek_flags=0x%08X peek_filter=0x%llX fileless_send_defers=%llu dispatch=%s msg=%s(0x%04X) hwnd=0x%llX wp=0x%llX lp=0x%llX wndproc=%s msg=%s(0x%04X) hwnd=0x%llX wp=0x%llX lp=0x%llX dx_frame=%llu dx_age_ms=%llu dx_dd=0x%llX dx_dev=0x%llX dx_ctx=0x%llX dx_rtv=0x%llX dx_lists=%llu dx_draw_cmds=%llu dx_vtx=%llu dx_idx=%llu dx_callbacks=%llu dx_reset_callbacks=%llu dx_first_cb=0x%llX dx_cb_data=0x%llX dx_first_tex=0x%llX dx_tex_hash=0x%016llX dx_max_elem=%llu dx_bad=0x%08lX dx_bad_at=%d,%d dx_disp1000=%d,%d dx_fb1000=%d,%d dx_removed=0x%08lX present_frame=%llu present_age_ms=%llu present_sc=0x%llX present_hr=0x%08lX tracer_tid=%lu",
+                        "RENDER_STALL streak=%llu frame=%llu age_ms=%llu phase=%s section=%s phase_id=%llu render_tid=%lu attach=%s attach_id=%llu peek_qs=0x%08lX peek_gle=%lu peek_flags=0x%08X peek_filter=0x%llX fileless_send_defers=%llu send_only_defers=%llu dispatch=%s msg=%s(0x%04X) hwnd=0x%llX wp=0x%llX lp=0x%llX wndproc=%s msg=%s(0x%04X) hwnd=0x%llX wp=0x%llX lp=0x%llX dx_frame=%llu dx_age_ms=%llu dx_dd=0x%llX dx_dev=0x%llX dx_ctx=0x%llX dx_rtv=0x%llX dx_lists=%llu dx_draw_cmds=%llu dx_vtx=%llu dx_idx=%llu dx_callbacks=%llu dx_reset_callbacks=%llu dx_first_cb=0x%llX dx_cb_data=0x%llX dx_first_tex=0x%llX dx_tex_hash=0x%016llX dx_max_elem=%llu dx_bad=0x%08lX dx_bad_at=%d,%d dx_disp1000=%d,%d dx_fb1000=%d,%d dx_removed=0x%08lX present_frame=%llu present_age_ms=%llu present_sc=0x%llX present_hr=0x%08lX tracer_tid=%lu",
                         (unsigned long long)stall_streak,
                         (unsigned long long)frame,
                         (unsigned long long)age_ms,
@@ -1453,6 +1492,7 @@ namespace aida_tracer {
                         g_peek_remove_flags.load(std::memory_order_acquire),
                         static_cast<unsigned long long>(g_peek_filter_hwnd.load(std::memory_order_acquire)),
                         static_cast<unsigned long long>(g_peek_fileless_send_only_defers.load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(g_peek_send_only_defers.load(std::memory_order_acquire)),
                         dispatch_stage ? dispatch_stage : "<null>",
                         message_name(dispatch_msg),
                         dispatch_msg,
@@ -3085,6 +3125,14 @@ int main(int, char**)
     startup_log_critical_fmt("show_window_post hwnd=0x%llX last_err=%lu",
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
         static_cast<unsigned long>(GetLastError()));
+    ::SetLastError(0);
+    const BOOL full_test_hotkey_ok = ::RegisterHotKey(hwnd, kAidaFullTestHotkeyId,
+        MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, 'T');
+    startup_log_critical_fmt("hotkey_register ctrl_shift_t ok=%d id=0x%X hwnd=0x%llX gle=%lu",
+        full_test_hotkey_ok ? 1 : 0,
+        kAidaFullTestHotkeyId,
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
+        static_cast<unsigned long>(GetLastError()));
     activate_fileless_window(hwnd, "post_show_window", 0);
     crash_log_write("window_shown_acrylic_set");
 
@@ -3568,15 +3616,45 @@ int main(int, char**)
 
         aida_tracer::mark_render_phase("peek_message_begin");
         MSG msg;
+        static uint64_t send_only_last_log_ms = 0;
         for (;;)
         {
             aida_tracer::mark_render_phase("peek_message_call");
             DWORD queue_status_before = ::GetQueueStatus(QS_ALLINPUT);
-            const UINT peek_remove_flags = static_cast<UINT>(PM_REMOVE);
+            const DWORD queue_changed = LOWORD(queue_status_before);
+            const DWORD queue_current = HIWORD(queue_status_before);
+            const bool send_message_pending = (queue_current & QS_SENDMESSAGE) != 0;
+            const bool queued_message_pending = (queue_current & kAidaQueuedQueueBits) != 0;
+            const UINT peek_remove_flags = kAidaQueuedPeekFlags;
             HWND peek_filter = nullptr;
             ::SetLastError(0);
             aida_tracer::set_peek_state(queue_status_before, 0);
             aida_tracer::set_peek_call_shape(peek_remove_flags, peek_filter);
+            if (send_message_pending && !queued_message_pending) {
+                const uint64_t now_ms = static_cast<uint64_t>(GetTickCount64());
+                const uint64_t defers = aida_tracer::g_peek_send_only_defers.fetch_add(1, std::memory_order_acq_rel) + 1;
+                aida_tracer::mark_render_phase("peek_message_send_only_deferred");
+                if (defers <= 8 || now_ms - send_only_last_log_ms >= 1000) {
+                    send_only_last_log_ms = now_ms;
+                    diag::log_tagged_critical_fmt("msgpump",
+                        "send_only_deferred frame=%llu defers=%llu qs=0x%08lX current=0x%04lX changed=0x%04lX queued_mask=0x%04lX flags=0x%08X hwnd=0x%llX fg=0x%llX active=0x%llX focus=0x%llX full_test=%d fileless=%d tid=%lu",
+                        (unsigned long long)frame_number,
+                        (unsigned long long)defers,
+                        static_cast<unsigned long>(queue_status_before),
+                        static_cast<unsigned long>(queue_current),
+                        static_cast<unsigned long>(queue_changed),
+                        static_cast<unsigned long>(kAidaQueuedQueueBits),
+                        peek_remove_flags,
+                        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
+                        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetForegroundWindow())),
+                        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetActiveWindow())),
+                        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetFocus())),
+                        test_all_features::is_running() ? 1 : 0,
+                        fileless_customer_launch ? 1 : 0,
+                        ::GetCurrentThreadId());
+                }
+                break;
+            }
             uint64_t peek_start = static_cast<uint64_t>(GetTickCount64());
             aida_tracer::g_peek_call_count.fetch_add(1, std::memory_order_acq_rel);
             BOOL has_message = ::PeekMessage(&msg, peek_filter, 0U, 0U, peek_remove_flags);
@@ -4185,6 +4263,11 @@ int main(int, char**)
 
     CleanupDeviceD3D();
     diag::log_tagged_critical("main", "shutdown_d3d_done");
+    ::SetLastError(0);
+    BOOL hotkey_unregistered = ::UnregisterHotKey(hwnd, kAidaFullTestHotkeyId);
+    diag::log_tagged_critical_fmt("main", "shutdown_hotkey_unregister ok=%d gle=%lu",
+        hotkey_unregistered ? 1 : 0,
+        static_cast<unsigned long>(GetLastError()));
     ::DestroyWindow(hwnd);
     diag::log_tagged_critical("main", "shutdown_destroy_window_done");
     ::UnregisterClassW(wc.lpszClassName, wc.hInstance);
@@ -4330,6 +4413,23 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         aida_tracer::set_wndproc_state("endsession", hWnd, msg, wParam, lParam);
         log_session_shutdown(wParam ? "WM_ENDSESSION_COMMIT" : "WM_ENDSESSION_CANCEL");
         return finish("endsession", 0);
+    }
+
+    if (msg == WM_HOTKEY && static_cast<int>(wParam) == kAidaFullTestHotkeyId) {
+        const WORD mods = LOWORD(lParam);
+        const WORD vk = HIWORD(lParam);
+        const bool foreground = aida_focus_monitor::foreground_belongs_to_process(hWnd);
+        diag::log_tagged_critical_fmt("ui",
+            "test_all_start hotkey=WM_HOTKEY id=0x%X mods=0x%04X vk=0x%04X foreground=%d hwnd=0x%llX",
+            static_cast<unsigned>(wParam),
+            static_cast<unsigned>(mods),
+            static_cast<unsigned>(vk),
+            foreground ? 1 : 0,
+            static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hWnd)));
+        if (!foreground)
+            return finish("hotkey_full_test_ignored_foreground", 0);
+        const bool accepted = test_all_features::trigger_from_hotkey("win32_ctrl_shift_t");
+        return finish(accepted ? "hotkey_full_test_accepted" : "hotkey_full_test_rejected", 0);
     }
 
     aida_tracer::set_wndproc_state("imgui_enter", hWnd, msg, wParam, lParam);

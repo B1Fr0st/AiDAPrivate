@@ -2216,6 +2216,17 @@ typedef struct sys_kernel_debugger_info_s {
     uint8_t KernelDebuggerNotPresent;
 } sys_kernel_debugger_info_t;
 
+typedef struct env_system_process_info_s {
+    uint32_t NextEntryOffset;
+    uint32_t NumberOfThreads;
+    uint8_t Reserved1[48];
+    unicode_string_t ImageName;
+    int32_t BasePriority;
+    uint32_t PadPriority;
+    void* UniqueProcessId;
+    void* InheritedFromUniqueProcessId;
+} env_system_process_info_t;
+
 typedef struct apiset_namespace_s {
     uint32_t Version;
     uint32_t Size;
@@ -2247,9 +2258,11 @@ typedef struct apiset_value_s {
 #define ENV_PROCESS_DEBUG_PORT 7u
 #define ENV_PROCESS_DEBUG_OBJECT_HANDLE 30u
 #define ENV_PROCESS_DEBUG_FLAGS 31u
+#define ENV_SYSTEM_PROCESS_INFORMATION 5u
 #define ENV_SYSTEM_KERNEL_DEBUGGER_INFORMATION 23u
 #define ENV_KUSER_SHARED_DATA 0x7FFE0000ULL
 #define ENV_KUSER_KD_DEBUGGER_ENABLED 0x2D4u
+#define ENV_STATUS_INFO_LENGTH_MISMATCH 0xC0000004u
 
 static uint8_t env_lower_byte(uint8_t c) {
     if (c >= 'A' && c <= 'Z') {
@@ -2484,6 +2497,203 @@ static int env_check_xcr0_consistency(void) {
     return 0;
 }
 
+static size_t env_ascii_len(const char* s) {
+    size_t n = 0;
+    if (s == 0) {
+        return 0;
+    }
+    while (s[n] != 0) {
+        ++n;
+    }
+    return n;
+}
+
+static uint16_t env_lower_w(uint16_t c) {
+    if (c >= 'A' && c <= 'Z') {
+        return (uint16_t)(c + 32);
+    }
+    return c;
+}
+
+static int env_wide_contains_ascii_ci(const uint16_t* w, size_t w_chars, const char* a) {
+    size_t a_len = env_ascii_len(a);
+    if (w == 0 || a == 0 || a_len == 0u || w_chars < a_len) {
+        return 0;
+    }
+    for (size_t i = 0; i + a_len <= w_chars; ++i) {
+        int match = 1;
+        for (size_t j = 0; j < a_len; ++j) {
+            uint16_t wc = env_lower_w(w[i + j]);
+            uint8_t ac = env_lower_byte((uint8_t)a[j]);
+            if ((uint8_t)(wc & 0xFFu) != ac) {
+                match = 0;
+                break;
+            }
+        }
+        if (match) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int env_wide_equals_ascii_ci(const uint16_t* w, size_t w_chars, const char* a) {
+    size_t a_len = env_ascii_len(a);
+    if (w == 0 || a == 0 || w_chars != a_len) {
+        return 0;
+    }
+    for (size_t i = 0; i < a_len; ++i) {
+        uint16_t wc = env_lower_w(w[i]);
+        uint8_t ac = env_lower_byte((uint8_t)a[i]);
+        if ((uint8_t)(wc & 0xFFu) != ac) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static uint32_t env_wide_basename_hash_ci(const uint16_t* w, size_t w_chars) {
+    uint32_t h = 2166136261u;
+    if (w == 0) {
+        return h;
+    }
+    for (size_t i = 0; i < w_chars; ++i) {
+        uint16_t c = env_lower_w(w[i]);
+        h ^= (uint32_t)(uint8_t)(c & 0xFFu);
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static int env_process_name_is_trusted_aida_runtime(const uint16_t* w, size_t w_chars) {
+    uint32_t h = env_wide_basename_hash_ci(w, w_chars);
+    return h == 0x7C29C919u ||
+        h == 0x3591B32Eu ||
+        h == 0xCF8F58E9u ||
+        h == 0xB16DF3BDu ||
+        h == 0x82E0E789u ||
+        h == 0x68EA95D7u;
+}
+
+static int env_classify_ai_analysis_process_name(const uint16_t* w, size_t w_chars) {
+    if (env_process_name_is_trusted_aida_runtime(w, w_chars)) {
+        return 0;
+    }
+    uint32_t h = env_wide_basename_hash_ci(w, w_chars);
+    if (h == 0x998793BAu || h == 0xBC92E353u || h == 0xC1BB2F79u ||
+        h == 0xBC28162Du || h == 0x47FDA4FEu || h == 0xEE574591u ||
+        h == 0x2E1CD469u || h == 0x0C1E4AAEu || h == 0x127BCA0Du ||
+        h == 0xB3C1929Fu || h == 0xB21792D4u || h == 0x68B15C9Au ||
+        h == 0x57036600u || h == 0xD1F65FA3u || h == 0x1EA7EFA8u ||
+        h == 0x33BEC556u || h == 0xCFD7AA0Eu || h == 0x98FC359Bu ||
+        h == 0x00CA179Cu || h == 0xB3308085u || h == 0xD5731E3Du ||
+        h == 0xAB51A806u || h == 0x459A00B2u || h == 0x5E94EEC6u ||
+        h == 0x4D32D9D4u || h == 0x28725DA7u || h == 0x9A055BCDu ||
+        h == 0x1C2C194Au || h == 0x2B3168EDu || h == 0xD8A0B50Fu ||
+        h == 0xC44851E7u || h == 0x0A651D4Fu || h == 0x44CF76FBu ||
+        h == 0xBA217B4Eu || h == 0x70A6D2A7u || h == 0xCE7E53B8u ||
+        h == 0x60078823u || h == 0xCFE6DC58u || h == 0xCE68BCA3u ||
+        h == 0x55EFD75Bu || h == 0x65370379u || h == 0x3ED7CBB8u ||
+        h == 0xBD708A0Cu || h == 0x75EE1EA4u || h == 0xC6C2BBEBu ||
+        h == 0xC7240EA8u || h == 0xAAE2C50Du || h == 0xA52993B7u ||
+        h == 0x6F87CED4u || h == 0x77E310F2u || h == 0x2F6AB947u) {
+        return 20;
+    }
+    if (h == 0x1C96081Du || h == 0xC25FAB58u || h == 0x13A1E5DBu ||
+        h == 0x10CAAF7Eu || h == 0x08D7EE87u || h == 0x287404AEu ||
+        h == 0x8F16DDA5u || h == 0x5CD260B8u || h == 0xE974D322u ||
+        h == 0xA2B64A67u || h == 0xB7C6F347u || h == 0xC5008D84u ||
+        h == 0x361D047Du || h == 0x60AC15EFu || h == 0x7E1A8288u ||
+        h == 0x8D64BEBFu || h == 0x7C02A162u || h == 0x026ED200u ||
+        h == 0x578B5A6Bu || h == 0x41337521u || h == 0xE2776E80u ||
+        h == 0xCB9DF10Cu) {
+        return 21;
+    }
+    if (h == 0x2DDAC76Du || h == 0xCC1DE49Fu || h == 0x329BD5F8u ||
+        h == 0xEFCA8C02u || h == 0x7D044744u || h == 0xC3EFDDC5u ||
+        h == 0x9FD54AA6u || h == 0xCE99D1B8u || h == 0xA5E92BC6u ||
+        h == 0xA8356BFBu || h == 0xDFDC3CB2u || h == 0x1EC74213u ||
+        h == 0x035324B6u || h == 0x00D6240Eu || h == 0x466686E4u ||
+        h == 0xF8278E32u || h == 0xD19E04A1u || h == 0x3E96D569u ||
+        h == 0x393A6850u || h == 0x90A38282u || h == 0xF0D2EDB0u ||
+        h == 0x9F9B93C1u || h == 0x323D5123u || h == 0xB36C53CBu ||
+        h == 0xCDE3BC55u || h == 0x1ED0BAFAu || h == 0x133B07F2u ||
+        h == 0xA84E1CF6u || h == 0x5C7CC334u || h == 0xA243D518u ||
+        h == 0x2638A7F6u || h == 0x197AD059u || h == 0xE0C97FF3u ||
+        h == 0x28C7909Au || h == 0xC9653BECu) {
+        return 22;
+    }
+    return 0;
+}
+
+static int env_check_ai_analysis_processes(const resolved_t* r) {
+    if (r == 0 || r->ntdll == 0 || r->NtAllocateVirtualMemory == 0 || r->NtFreeVirtualMemory == 0) {
+        return 0;
+    }
+    nt_query_sys_info_t pNtQuerySystemInformation =
+        (nt_query_sys_info_t)resolve_export(r->ntdll, HASH_NTQUERYSYSINFO, 0, 0, 0);
+    if (pNtQuerySystemInformation == 0) {
+        return 0;
+    }
+    size_t bytes = 1u << 20;
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        void* page = 0;
+        size_t alloc_size = bytes;
+        long ast = r->NtAllocateVirtualMemory((void*)(intptr_t)-1, &page, 0, &alloc_size,
+                                              MEM_COMMIT_RESERVE, PAGE_RW);
+        if (ast < 0 || page == 0) {
+            return 0;
+        }
+        uint32_t ret_len = 0;
+        long qst = pNtQuerySystemInformation(ENV_SYSTEM_PROCESS_INFORMATION, page,
+                                             (uint32_t)bytes, &ret_len);
+        if ((uint32_t)qst == ENV_STATUS_INFO_LENGTH_MISMATCH) {
+            void* free_addr = page;
+            size_t free_sz = 0;
+            r->NtFreeVirtualMemory((void*)(intptr_t)-1, &free_addr, &free_sz, MEM_RELEASE);
+            bytes = (ret_len > bytes) ? ((size_t)ret_len + 0x10000u) : (bytes << 1);
+            continue;
+        }
+        if (qst < 0) {
+            void* free_addr = page;
+            size_t free_sz = 0;
+            r->NtFreeVirtualMemory((void*)(intptr_t)-1, &free_addr, &free_sz, MEM_RELEASE);
+            return 0;
+        }
+        uint8_t* base = (uint8_t*)page;
+        uint32_t offset = 0;
+        int detected = 0;
+        for (uint32_t guard = 0; guard < 16384u; ++guard) {
+            if ((size_t)offset + sizeof(env_system_process_info_t) > bytes) {
+                break;
+            }
+            env_system_process_info_t* spi = (env_system_process_info_t*)(base + offset);
+            if (spi->ImageName.Buffer != 0 && spi->ImageName.Length >= 2u && spi->ImageName.Length <= 520u) {
+                size_t chars = (size_t)spi->ImageName.Length / 2u;
+                detected = env_classify_ai_analysis_process_name(spi->ImageName.Buffer, chars);
+                if (detected != 0) {
+                    break;
+                }
+            }
+            if (spi->NextEntryOffset == 0u) {
+                break;
+            }
+            if (spi->NextEntryOffset < sizeof(env_system_process_info_t)) {
+                break;
+            }
+            offset += spi->NextEntryOffset;
+            if ((size_t)offset >= bytes) {
+                break;
+            }
+        }
+        void* free_addr = page;
+        size_t free_sz = 0;
+        r->NtFreeVirtualMemory((void*)(intptr_t)-1, &free_addr, &free_sz, MEM_RELEASE);
+        return detected;
+    }
+    return 0;
+}
+
 static void env_decrypt_and_run_poison(const resolved_t* r) {
     if (r == 0 || r->NtAllocateVirtualMemory == 0 || r->NtProtectVirtualMemory == 0
         || r->NtFreeVirtualMemory == 0) {
@@ -2528,8 +2738,11 @@ static void env_decrypt_and_run_poison(const resolved_t* r) {
     r->NtFreeVirtualMemory((void*)(intptr_t)-1, &free_addr, &free_sz, MEM_RELEASE);
 }
 
-static int runtime_environment_check(void) {
-    return 0;
+static int runtime_environment_check(const resolved_t* r) {
+    int ai_status = env_check_ai_analysis_processes(r);
+    if (ai_status != 0) {
+        return ai_status;
+    }
     if (env_check_peb_being_debugged()) {
         return 1;
     }
@@ -2651,7 +2864,7 @@ void __cdecl aida_unpack(void* image_base_arg) {
                       (uint64_t)(uintptr_t)r.kernel32,
                       (uint64_t)(uintptr_t)r.kernelbase);
     payload_log_event(APL_EVENT_ENV_ENTER, 0u, 0u, 0u);
-    int env_status = runtime_environment_check();
+    int env_status = runtime_environment_check(&r);
     payload_log_event(APL_EVENT_ENV_EXIT, (uint64_t)(uint32_t)env_status, 0u, 0u);
     if (env_status != 0) {
         payload_log_event(APL_EVENT_HOSTILE, (uint64_t)(uint32_t)env_status, 0u, 0u);

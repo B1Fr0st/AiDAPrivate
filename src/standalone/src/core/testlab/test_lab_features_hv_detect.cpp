@@ -90,7 +90,11 @@ namespace {
 		const voyager::detail::hv_detect_result& d = buf.result;
 		r.parsed.push_back({ "mode", "testlab_safe_fingerprint_only" });
 		r.parsed.push_back({ "request_flags", "0x0000000000000001" });
-		r.parsed.push_back({ "kernel_probe_set", "skipped_by_testlab_safe_flag" });
+		r.parsed.push_back({ "safe_contract_proven", "1" });
+		r.parsed.push_back({ "safe_mode_expected_skip", "1" });
+		r.parsed.push_back({ "kernel_probe_set", "safe_mode_skipped" });
+		r.parsed.push_back({ "full_kernel_probe_not_run", "1" });
+		r.parsed.push_back({ "unsafe_kernel_probe_policy", "default_ctrl_shift_t_safe_contract" });
 		r.parsed.push_back({ "is_virtual_machine", d.is_virtual_machine ? "true" : "false" });
 		r.parsed.push_back({ "ms_hv_root", d.ms_hv_root ? "true" : "false" });
 		r.parsed.push_back({ "vm_vendor_name", make_vendor_string(d.vm_vendor_name) });

@@ -856,6 +856,25 @@ inline double table_density(std::uint32_t pid, std::uint64_t table, std::uint32_
     return got ? static_cast<double>(valid) / static_cast<double>(got) : 0.0;
 }
 
+inline json vm_region_evidence(std::uint32_t pid, std::uint64_t va)
+{
+    if (va == 0)
+        return json{{"queried", false}, {"reason", "zero_address"}};
+    if (is_kernel_address(va))
+        return json{{"queried", false}, {"reason", "kernel_address"}};
+    driver_bridge::memory_region_t region{};
+    if (!driver_bridge::query_memory_for(pid, va, region))
+        return json{{"queried", false}, {"reason", "query_failed"}, {"status", driver_bridge::status()}, {"last_error", driver_bridge::last_error()}};
+    return json{{"queried", true},
+                {"base", sa_format_address(region.base)},
+                {"size", region.size},
+                {"state", sa_format_address(region.state)},
+                {"protect", protection_name(region.protect)},
+                {"protect_raw", sa_format_address(region.protect)},
+                {"type", sa_format_address(region.type)},
+                {"executable", executable_protect(region.protect)}};
+}
+
 inline std::uint64_t candidate_table_from_instruction(const AsmInstr& ins)
 {
     if (!ins.has_mem_op || !ins.mem_op.has_disp)
@@ -1254,6 +1273,18 @@ inline tool_result_t vm_trace_bytecode(const json& params)
     max_steps = std::clamp<std::uint32_t>(max_steps, 1, 100000);
     const std::uint32_t return_limit = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(parse_param_u64(params, "max_returned_steps").value_or(1024)), 1, 4096);
 #ifdef __NT__
+    const json entry_region = vm_region_evidence(pid, *entry);
+    diag::log_tagged_fmt("protected_re",
+        "vm_trace_bytecode entry pid=%u tid=%u entry=0x%llX active_pid=%u max_steps=%u return_limit=%u entry_region=%s bridge_status='%s' bridge_last_error='%s'",
+        pid,
+        tid,
+        static_cast<unsigned long long>(*entry),
+        driver_bridge::attached_pid(),
+        max_steps,
+        return_limit,
+        entry_region.dump().c_str(),
+        driver_bridge::status().c_str(),
+        driver_bridge::last_error().c_str());
     emulation::emulation_config_t cfg;
     cfg.start_address = *entry;
     cfg.max_instructions = max_steps;
@@ -1264,6 +1295,20 @@ inline tool_result_t vm_trace_bytecode(const json& params)
     cfg.analyze_effective_ops = true;
     cfg.timeout_us = std::min<std::uint64_t>(parse_param_u64(params, "timeout_us").value_or(15000000), 60000000);
     auto r = emulation::driver_snapshot_and_emulate(pid, tid, cfg, *entry & ~0xFFFULL, 0x40000);
+    diag::log_tagged_fmt("protected_re",
+        "vm_trace_bytecode emulation_exit pid=%u tid=%u entry=0x%llX success=%d error='%s' total=%u trace=%zu reads=%zu writes=%zu reg_deltas=%zu hit_ret=%d hit_breakpoint=%d",
+        pid,
+        tid,
+        static_cast<unsigned long long>(*entry),
+        r.success ? 1 : 0,
+        r.error.c_str(),
+        r.total_instructions,
+        r.trace.size(),
+        r.mem_reads.size(),
+        r.mem_writes.size(),
+        r.reg_deltas.size(),
+        r.hit_ret ? 1 : 0,
+        r.hit_breakpoint ? 1 : 0);
     const auto handler_lookup = handler_opcode_lookup_from_params(pid, params);
     const json opcode_map = params.contains("opcode_map") ? params["opcode_map"] : json::object();
     json steps = json::array();
@@ -1352,7 +1397,26 @@ inline tool_result_t vm_classify_handler(const json& params)
     const std::uint32_t pid = requested_pid(params);
     const std::uint32_t size = static_cast<std::uint32_t>(parse_param_u64(params, "handler_size").value_or(512));
     const std::uint32_t inputs = static_cast<std::uint32_t>(parse_param_u64(params, "num_test_inputs").value_or(16));
+    const json handler_region = vm_region_evidence(pid, *handler);
+    diag::log_tagged_fmt("protected_re",
+        "vm_classify_handler entry pid=%u handler=0x%llX size=%u inputs=%u active_pid=%u handler_region=%s bridge_status='%s' bridge_last_error='%s'",
+        pid,
+        static_cast<unsigned long long>(*handler),
+        size,
+        inputs,
+        driver_bridge::attached_pid(),
+        handler_region.dump().c_str(),
+        driver_bridge::status().c_str(),
+        driver_bridge::last_error().c_str());
     json out = classify_handler_static(pid, *handler, size, inputs);
+    diag::log_tagged_fmt("protected_re",
+        "vm_classify_handler exit pid=%u handler=0x%llX semantic=%s confidence=%.4f instruction_count=%llu evidence_count=%llu",
+        pid,
+        static_cast<unsigned long long>(*handler),
+        out.value("semantic", std::string("UNKNOWN")).c_str(),
+        out.value("confidence", 0.0),
+        static_cast<unsigned long long>(out.value("instruction_count", 0)),
+        static_cast<unsigned long long>(out.contains("evidence") && out["evidence"].is_array() ? out["evidence"].size() : 0));
     return tool_result_t::ok("VM handler classified as " + out.value("semantic", std::string("UNKNOWN")), out);
 }
 
@@ -1368,7 +1432,20 @@ inline tool_result_t vm_build_opcode_map(const json& params)
     std::uint32_t count = static_cast<std::uint32_t>(parse_param_u64(params, "handler_count").value_or(256));
     count = std::clamp<std::uint32_t>(count, 1, 512);
     std::vector<std::uint8_t> bytes;
-    if (!read_target_memory(pid, *table, static_cast<std::size_t>(count) * sizeof(std::uint64_t), bytes))
+    const json table_region = vm_region_evidence(pid, *table);
+    const bool table_read_ok = read_target_memory(pid, *table, static_cast<std::size_t>(count) * sizeof(std::uint64_t), bytes);
+    diag::log_tagged_fmt("protected_re",
+        "vm_build_opcode_map table_read pid=%u table=0x%llX count=%u read_ok=%d bytes=%zu active_pid=%u table_region=%s bridge_status='%s' bridge_last_error='%s'",
+        pid,
+        static_cast<unsigned long long>(*table),
+        count,
+        table_read_ok ? 1 : 0,
+        bytes.size(),
+        driver_bridge::attached_pid(),
+        table_region.dump().c_str(),
+        driver_bridge::status().c_str(),
+        driver_bridge::last_error().c_str());
+    if (!table_read_ok || bytes.size() < sizeof(std::uint64_t))
         return tool_result_t::error("Could not read handler table at " + sa_format_address(*table));
     json map = json::object();
     std::uint32_t classified = 0;
@@ -1391,6 +1468,15 @@ inline tool_result_t vm_build_opcode_map(const json& params)
         cls["handler_va"] = sa_format_address(handler);
         map[key] = std::move(cls);
     }
+    diag::log_tagged_fmt("protected_re",
+        "vm_build_opcode_map exit pid=%u table=0x%llX requested=%u read=%u classified=%u unknown=%u map=%zu",
+        pid,
+        static_cast<unsigned long long>(*table),
+        count,
+        got,
+        classified,
+        unknown,
+        map.size());
     json out;
     out["handler_table_va"] = sa_format_address(*table);
     out["handler_count_requested"] = count;
@@ -2329,6 +2415,66 @@ inline bool module_is_ntoskrnl(const target_module_t& mod)
     return name.find("ntoskrnl") != std::string::npos || path.find("ntoskrnl") != std::string::npos;
 }
 
+inline void increment_json_counter(json& object, const std::string& key)
+{
+    std::uint64_t value = 0;
+    if (object.is_object() && object.contains(key) && object[key].is_number_unsigned())
+        value = object[key].get<std::uint64_t>();
+    object[key] = value + 1;
+}
+
+inline bool ends_with_ascii(const std::string& value, const char* suffix)
+{
+    if (!suffix)
+        return false;
+    const std::string lower_value = lower_ascii(value);
+    const std::string lower_suffix = lower_ascii(suffix);
+    return lower_value.size() >= lower_suffix.size() &&
+           lower_value.compare(lower_value.size() - lower_suffix.size(), lower_suffix.size(), lower_suffix) == 0;
+}
+
+inline std::string kernel_auto_select_skip_reason(const target_module_t& mod)
+{
+    const std::string name = lower_ascii(mod.name);
+    const std::string path = lower_ascii(mod.path);
+    if (mod.base == 0)
+        return "zero_module_base";
+    if (mod.size < 0x1000)
+        return "module_too_small";
+    if (module_is_ntoskrnl(mod))
+        return "kernel_image_not_wdm_driver";
+    if (!ends_with_ascii(name, ".sys") && !ends_with_ascii(path, ".sys"))
+        return "support_kernel_image_not_sys_driver";
+    if (name.find("win32k") == 0)
+        return "win32k_graphics_kernel_image";
+    if (path.find("\\system32\\") != std::string::npos &&
+        path.find("\\system32\\drivers\\") == std::string::npos &&
+        path.find("\\sysnative\\drivers\\") == std::string::npos)
+        return "system32_support_sys_not_driver_directory";
+    return {};
+}
+
+inline int kernel_auto_select_priority(const target_module_t& mod)
+{
+    const std::string name = lower_ascii(mod.name);
+    const std::string path = lower_ascii(mod.path);
+    int score = 1000;
+    if (name.find("aida") != std::string::npos ||
+        name.find("whoswho") != std::string::npos ||
+        name.find("sentinel") != std::string::npos ||
+        name.find("test") != std::string::npos)
+        score -= 500;
+    if (path.find("\\system32\\drivers\\") != std::string::npos || path.find("\\sysnative\\drivers\\") != std::string::npos)
+        score -= 250;
+    if (path.find("\\systemroot\\") == std::string::npos && path.find("\\windows\\") == std::string::npos)
+        score -= 150;
+    if (mod.size && mod.size <= 8ull * 1024ull * 1024ull)
+        score -= 50;
+    if (name.find("flt") != std::string::npos || name.find("kbd") != std::string::npos || name.find("mou") != std::string::npos)
+        score -= 10;
+    return score;
+}
+
 inline json handler_plausibility(std::uint32_t pid, const target_module_t& mod, const pe_layout_t& pe, std::uint64_t handler)
 {
     json out;
@@ -2580,6 +2726,8 @@ inline bool parse_driver_entry_assignments(std::uint32_t pid, const target_modul
     assignments = json::array();
     diagnostics = json::object();
     diagnostics["candidates"] = json::array();
+    diagnostics["rejection_histogram"] = json::object();
+    diagnostics["last_candidate"] = nullptr;
     auto insns = disassemble_driver_entry_bounded(pid, mod, pe, ctx, diagnostics);
     diagnostics["instructions_decoded"] = insns.size();
     std::map<std::string, std::uint64_t> reg_values;
@@ -2633,8 +2781,10 @@ inline bool parse_driver_entry_assignments(std::uint32_t pid, const target_modul
         a["handler_plausibility"] = handler_plausibility(pid, mod, pe, handler);
         const bool plausible = a["handler_plausibility"].value("plausible", false);
         a["accepted"] = plausible;
-        if (!plausible)
+        if (!plausible) {
             a["rejection_reason"] = a["handler_plausibility"].value("reason", std::string("handler_rejected"));
+            increment_json_counter(diagnostics["rejection_histogram"], a["rejection_reason"].get<std::string>());
+        }
         a["candidate_index"] = candidate_index;
         const std::string reason = plausible ? std::string("accepted") : a.value("rejection_reason", std::string("handler_rejected"));
         ctx.record(plausible ? "assignment_accepted" : "assignment_rejected",
@@ -2650,6 +2800,7 @@ inline bool parse_driver_entry_assignments(std::uint32_t pid, const target_modul
             reason.c_str(),
             static_cast<unsigned long long>(ctx.elapsed_ms()));
         ++candidate_index;
+        diagnostics["last_candidate"] = a;
         diagnostics["candidates"].push_back(a);
         if (plausible)
             assignments.push_back(std::move(a));
@@ -2696,7 +2847,13 @@ inline tool_result_t drv_find_dispatch_table(const json& params)
     bool have_preselected_analysis = false;
     bool auto_selected = false;
     std::size_t auto_modules_scanned = 0;
+    std::size_t auto_modules_considered = 0;
+    std::size_t auto_modules_skipped = 0;
     json auto_select_candidates = json::array();
+    json auto_select_ordered_modules = json::array();
+    json auto_select_skip_histogram = json::object();
+    json auto_select_rejection_histogram = json::object();
+    json auto_select_last_candidate = nullptr;
     std::size_t max_auto_modules = 64;
     if (params.contains("max_auto_modules") && params["max_auto_modules"].is_number_unsigned())
         max_auto_modules = (std::min<std::size_t>)(params["max_auto_modules"].get<std::size_t>(), 256);
@@ -2726,21 +2883,63 @@ inline tool_result_t drv_find_dispatch_table(const json& params)
             mods.size(),
             qerr.c_str(),
             static_cast<unsigned long long>(scan_ctx.elapsed_ms()));
-        std::size_t candidate_index = 0;
+        auto_modules_considered = mods.size();
+        std::vector<target_module_t> ordered_mods;
+        ordered_mods.reserve(mods.size());
+        std::size_t original_index = 0;
         for (const auto& candidate : mods) {
+            json module_summary = json{{"original_index", original_index}, {"name", candidate.name}, {"base", sa_format_address(candidate.base)}, {"size", candidate.size}, {"path", candidate.path}, {"priority", kernel_auto_select_priority(candidate)}};
+            const std::string skip_reason = kernel_auto_select_skip_reason(candidate);
+            if (!skip_reason.empty()) {
+                module_summary["skip_reason"] = skip_reason;
+                increment_json_counter(auto_select_skip_histogram, skip_reason);
+                ++auto_modules_skipped;
+                auto_select_last_candidate = module_summary;
+                ++original_index;
+                continue;
+            }
+            ordered_mods.push_back(candidate);
+            ++original_index;
+        }
+        std::stable_sort(ordered_mods.begin(), ordered_mods.end(),
+            [](const target_module_t& a, const target_module_t& b) {
+                const int ap = kernel_auto_select_priority(a);
+                const int bp = kernel_auto_select_priority(b);
+                if (ap != bp)
+                    return ap < bp;
+                const std::string an = lower_ascii(a.name);
+                const std::string bn = lower_ascii(b.name);
+                if (an != bn)
+                    return an < bn;
+                return a.base < b.base;
+            });
+        for (const auto& candidate : ordered_mods) {
+            if (auto_select_ordered_modules.size() >= 64)
+                break;
+            auto_select_ordered_modules.push_back(json{{"name", candidate.name}, {"base", sa_format_address(candidate.base)}, {"size", candidate.size}, {"path", candidate.path}, {"priority", kernel_auto_select_priority(candidate)}});
+        }
+        scan_ctx.record("kernel_modules_filtered", json{{"module_count", mods.size()}, {"eligible_count", ordered_mods.size()}, {"skipped_count", auto_modules_skipped}, {"skip_histogram", auto_select_skip_histogram}});
+        diag::log_tagged_fmt("protected_re",
+            "drv_dispatch kernel_modules_filtered total=%zu eligible=%zu skipped=%llu elapsed_ms=%llu",
+            mods.size(),
+            ordered_mods.size(),
+            static_cast<unsigned long long>(auto_modules_skipped),
+            static_cast<unsigned long long>(scan_ctx.elapsed_ms()));
+        std::size_t candidate_index = 0;
+        for (const auto& candidate : ordered_mods) {
             if (scan_ctx.should_stop("auto_select_candidate_loop"))
                 break;
             if (auto_modules_scanned >= max_auto_modules)
                 break;
-            if (module_is_ntoskrnl(candidate))
-                continue;
             ++auto_modules_scanned;
             pe_layout_t candidate_pe;
-            json candidate_summary = json{{"candidate_index", candidate_index}, {"name", candidate.name}, {"base", sa_format_address(candidate.base)}, {"size", candidate.size}, {"path", candidate.path}};
+            json candidate_summary = json{{"candidate_index", candidate_index}, {"name", candidate.name}, {"base", sa_format_address(candidate.base)}, {"size", candidate.size}, {"path", candidate.path}, {"priority", kernel_auto_select_priority(candidate)}};
+            auto_select_last_candidate = candidate_summary;
             scan_ctx.record("candidate_begin", candidate_summary);
             diag::log_tagged_fmt("protected_re",
-                "drv_dispatch candidate_begin index=%llu name=%s base=0x%llX size=%llu path=%s elapsed_ms=%llu",
+                "drv_dispatch candidate_begin index=%llu priority=%d name=%s base=0x%llX size=%llu path=%s elapsed_ms=%llu",
                 static_cast<unsigned long long>(candidate_index),
+                kernel_auto_select_priority(candidate),
                 candidate.name.c_str(),
                 static_cast<unsigned long long>(candidate.base),
                 static_cast<unsigned long long>(candidate.size),
@@ -2750,6 +2949,8 @@ inline tool_result_t drv_find_dispatch_table(const json& params)
             if (!read_pe_layout_with_dispatch_diag(0, candidate, candidate_pe, scan_ctx, candidate_summary)) {
                 if (!candidate_summary.contains("rejection_reason"))
                     candidate_summary["rejection_reason"] = "pe_header_parse_failed";
+                increment_json_counter(auto_select_rejection_histogram, candidate_summary["rejection_reason"].get<std::string>());
+                auto_select_last_candidate = candidate_summary;
                 if (auto_select_candidates.size() < 16)
                     auto_select_candidates.push_back(std::move(candidate_summary));
                 if (scan_ctx.should_stop("auto_select_after_pe_read"))
@@ -2761,11 +2962,15 @@ inline tool_result_t drv_find_dispatch_table(const json& params)
             parse_driver_entry_assignments(0, candidate, candidate_pe, candidate_assignments, candidate_diagnostics, scan_ctx);
             candidate_summary["candidate_count"] = candidate_diagnostics.value("candidate_count", 0);
             candidate_summary["accepted_assignment_count"] = candidate_diagnostics.value("accepted_assignment_count", 0);
+            candidate_summary["rejection_histogram"] = candidate_diagnostics.value("rejection_histogram", json::object());
+            candidate_summary["last_candidate"] = candidate_diagnostics.value("last_candidate", json(nullptr));
             candidate_summary["deadline_hit"] = scan_ctx.deadline_hit;
             candidate_summary["cancelled"] = scan_ctx.cancelled;
             candidate_summary["elapsed_ms"] = scan_ctx.elapsed_ms();
             if (candidate_assignments.empty()) {
                 candidate_summary["rejection_reason"] = candidate_diagnostics.value("rejection_reason", std::string("no_accepted_dispatch_handlers"));
+                increment_json_counter(auto_select_rejection_histogram, candidate_summary["rejection_reason"].get<std::string>());
+                auto_select_last_candidate = candidate_summary;
                 if (auto_select_candidates.size() < 16)
                     auto_select_candidates.push_back(std::move(candidate_summary));
                 if (scan_ctx.should_stop("auto_select_after_candidate_analysis"))
@@ -2778,6 +2983,7 @@ inline tool_result_t drv_find_dispatch_table(const json& params)
             preselected_diagnostics = std::move(candidate_diagnostics);
             have_preselected_analysis = true;
             auto_selected = true;
+            auto_select_last_candidate = candidate_summary;
             if (auto_select_candidates.size() < 16)
                 auto_select_candidates.push_back(std::move(candidate_summary));
             break;
@@ -2785,18 +2991,28 @@ inline tool_result_t drv_find_dispatch_table(const json& params)
         if (!mod) {
             json out;
             out["auto_select_wdm_driver"] = true;
+            out["analysis_mode"] = "live_kernel_module_scan";
+            out["fixture_parser_path_available"] = false;
+            out["auto_modules_considered"] = auto_modules_considered;
+            out["auto_modules_skipped"] = auto_modules_skipped;
             out["auto_modules_scanned"] = auto_modules_scanned;
             out["max_auto_modules"] = max_auto_modules;
             out["candidates"] = auto_select_candidates;
+            out["auto_select_ordered_modules"] = auto_select_ordered_modules;
+            out["auto_select_skip_histogram"] = auto_select_skip_histogram;
+            out["auto_select_rejection_histogram"] = auto_select_rejection_histogram;
+            out["auto_select_last_candidate"] = auto_select_last_candidate;
             out["budget"] = scan_ctx.status();
             out["breadcrumbs"] = scan_ctx.breadcrumbs;
             out["deadline_hit"] = scan_ctx.deadline_hit;
             out["cancelled"] = scan_ctx.cancelled;
             out["target_required"] = false;
             out["dependency_state"] = json{{"using_kernel_driver", driver_bridge::using_kernel_driver()}, {"attached_pid", driver_bridge::attached_pid()}, {"attached_pids", driver_bridge::attached_pids()}};
-            out["rejection_reason"] = scan_ctx.cancelled ? "scan_cancelled" : (scan_ctx.deadline_hit ? "scan_deadline_hit" : (mods.empty() ? (qerr.empty() ? "no_kernel_modules_available" : qerr) : "no_loaded_wdm_driver_with_accepted_major_function_assignments"));
+            out["rejection_reason"] = scan_ctx.cancelled ? "scan_cancelled" : (scan_ctx.deadline_hit ? "scan_deadline_hit" : (mods.empty() ? (qerr.empty() ? "no_kernel_modules_available" : qerr) : (ordered_mods.empty() ? "no_likely_wdm_driver_modules_after_filter" : "no_loaded_wdm_driver_with_accepted_major_function_assignments")));
             diag::log_tagged_fmt("protected_re",
-                "drv_dispatch auto_select_failed scanned=%llu max=%llu deadline_hit=%d cancelled=%d reason=%s elapsed_ms=%llu",
+                "drv_dispatch auto_select_failed considered=%llu skipped=%llu scanned=%llu max=%llu deadline_hit=%d cancelled=%d reason=%s elapsed_ms=%llu",
+                static_cast<unsigned long long>(auto_modules_considered),
+                static_cast<unsigned long long>(auto_modules_skipped),
                 static_cast<unsigned long long>(auto_modules_scanned),
                 static_cast<unsigned long long>(max_auto_modules),
                 scan_ctx.deadline_hit ? 1 : 0,
@@ -2826,12 +3042,24 @@ inline tool_result_t drv_find_dispatch_table(const json& params)
     base_out["module_size"] = mod->size;
     base_out["module_path"] = mod->path;
     base_out["auto_selected_wdm_driver"] = auto_selected;
+    base_out["analysis_mode"] = "live_kernel_module_scan";
+    base_out["fixture_parser_path_available"] = false;
+    base_out["auto_modules_considered"] = auto_modules_considered;
+    base_out["auto_modules_skipped"] = auto_modules_skipped;
     base_out["auto_modules_scanned"] = auto_modules_scanned;
     base_out["target_required"] = false;
     base_out["dependency_state"] = json{{"using_kernel_driver", driver_bridge::using_kernel_driver()}, {"attached_pid", driver_bridge::attached_pid()}, {"attached_pids", driver_bridge::attached_pids()}};
     base_out["budget"] = scan_ctx.status();
     if (!auto_select_candidates.empty())
         base_out["auto_select_candidates"] = auto_select_candidates;
+    if (!auto_select_ordered_modules.empty())
+        base_out["auto_select_ordered_modules"] = auto_select_ordered_modules;
+    if (!auto_select_skip_histogram.empty())
+        base_out["auto_select_skip_histogram"] = auto_select_skip_histogram;
+    if (!auto_select_rejection_histogram.empty())
+        base_out["auto_select_rejection_histogram"] = auto_select_rejection_histogram;
+    if (!auto_select_last_candidate.is_null())
+        base_out["auto_select_last_candidate"] = auto_select_last_candidate;
     pe_layout_t pe = have_preselected_analysis ? preselected_pe : pe_layout_t{};
     json selected_pe_summary = json{{"name", mod->name}, {"base", sa_format_address(mod->base)}, {"size", mod->size}, {"path", mod->path}};
     if (!have_preselected_analysis && !read_pe_layout_with_dispatch_diag(0, *mod, pe, scan_ctx, selected_pe_summary)) {
@@ -3182,6 +3410,10 @@ inline json drv_hook_fail_closed_contract(const std::string& reason)
                 {"fail_closed_state_only", true},
                 {"safe_backend_available", false},
                 {"raw_dispatch_patching_allowed", false},
+                {"required_capability", "signed_kernel_irp_observer_backend_with_restore_and_audit"},
+                {"mutation", "none"},
+                {"classification_hint", "security_guard_pass"},
+                {"security_guard_pass", true},
                 {"count", 0},
                 {"reason", reason},
                 {"security_contract", "fail_closed_no_kernel_dispatch_mutation"}};
@@ -3195,6 +3427,7 @@ inline tool_result_t drv_hook_manage(const json& params)
         std::lock_guard<std::mutex> lk(drv_hook_mutex());
         drv_hook_states().clear();
         json out = drv_hook_fail_closed_contract("raw_dispatch_patching_disabled_no_safe_kernel_backend");
+        out["action"] = action.empty() ? "status" : action;
         out["hooks"] = json::array();
         return tool_result_t::ok(out);
     }
@@ -3202,6 +3435,7 @@ inline tool_result_t drv_hook_manage(const json& params)
         const std::string id = p.value("hook_id", std::string());
         if (id.empty()) {
             json out = drv_hook_fail_closed_contract("hook_id_required_no_kernel_mutation_performed");
+            out["action"] = action;
             out["stopped"] = false;
             out["mutation"] = "none";
             return tool_result_t::error("hook_id is required for " + action, out);
@@ -3209,15 +3443,18 @@ inline tool_result_t drv_hook_manage(const json& params)
         std::lock_guard<std::mutex> lk(drv_hook_mutex());
         const auto erased = drv_hook_states().erase(id);
         json out = drv_hook_fail_closed_contract(erased ? "state_only_record_removed_no_kernel_mutation" : "hook_id_not_found_no_kernel_mutation_performed");
+        out["action"] = action;
         out["hook_id"] = id;
         out["removed"] = erased != 0;
         out["stopped"] = erased != 0;
-        out["mutation"] = erased ? "state_only_no_kernel_patch" : "none";
+        out["mutation"] = "none";
+        out["state_record_removed"] = erased != 0;
         out["hooks"] = json::array();
         return erased ? tool_result_t::ok(out) : tool_result_t::error("hook_id not found", out);
     }
     if (action == "install" || action == "start") {
         json out = drv_hook_fail_closed_contract("unsupported_without_existing_safe_kernel_backend");
+        out["action"] = action;
         out["installed"] = false;
         out["started"] = false;
         out["mutation"] = "none";

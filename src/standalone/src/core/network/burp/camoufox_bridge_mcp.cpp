@@ -120,6 +120,125 @@ void attach_privacy_status(tool_result_t& out, const camoufox::bridge_status_t& 
     out.data["aida_privacy"] = std::move(privacy);
 }
 
+std::string json_string_field(const json& obj, const char* key)
+{
+    if (!obj.is_object())
+        return {};
+    auto it = obj.find(key);
+    if (it != obj.end() && it->is_string())
+        return it->get<std::string>();
+    return {};
+}
+
+int json_int_field(const json& obj, const char* key, int fallback = 0)
+{
+    if (!obj.is_object())
+        return fallback;
+    auto it = obj.find(key);
+    if (it == obj.end())
+        return fallback;
+    try
+    {
+        if (it->is_number_integer())
+            return it->get<int>();
+        if (it->is_number())
+            return static_cast<int>(it->get<double>());
+    }
+    catch (...) {}
+    return fallback;
+}
+
+std::string lower_ascii_copy(std::string s);
+
+bool json_error_mentions_timeout(const json& obj)
+{
+    const std::string error = lower_ascii_copy(json_string_field(obj, "error"));
+    const std::string timeout_status = lower_ascii_copy(json_string_field(obj, "timeout_status"));
+    const std::string instrumentation_status = lower_ascii_copy(json_string_field(obj, "instrumentation_status"));
+    return error.find("timeout") != std::string::npos ||
+        timeout_status.find("timeout") != std::string::npos ||
+        instrumentation_status.find("timeout") != std::string::npos;
+}
+
+int compare_env_result_count(const json& data)
+{
+    const int existing = json_int_field(data, "result_property_count", -1);
+    if (existing >= 0)
+        return existing;
+    if (!data.is_object())
+        return 0;
+    int total = 0;
+    const char* keys[] = {"navigator", "screen", "canvas", "webgl", "audio", "timing", "misc", "custom"};
+    for (const char* key : keys)
+    {
+        auto it = data.find(key);
+        if (it != data.end() && it->is_object())
+            total += static_cast<int>(it->size());
+    }
+    return total;
+}
+
+std::string status_string_for_log(const json& data)
+{
+    std::string status = json_string_field(data, "status");
+    if (status.empty())
+        status = json_string_field(data, "instrumentation_status");
+    if (status.empty() && data.is_object() && data.contains("error"))
+        status = "error";
+    if (status.empty())
+        status = "ok";
+    return status;
+}
+
+void annotate_instrumentation_response(const std::string& tool_name, tool_result_t& out, int timeout_ms, long long elapsed_ms)
+{
+    if (!out.data.is_object())
+        out.data = json{{"value", out.data}};
+    out.data["bridge_rpc_timeout_ms"] = timeout_ms;
+    out.data["bridge_rpc_elapsed_ms"] = elapsed_ms;
+    if (tool_name == "compare_env")
+    {
+        out.data["result_property_count"] = compare_env_result_count(out.data);
+        if (json_error_mentions_timeout(out.data))
+        {
+            if (json_string_field(out.data, "status").empty())
+                out.data["status"] = "degraded";
+            out.data["instrumentation_status"] = "timeout";
+            out.data["timeout_status"] = "controlled_timeout";
+        }
+        else if (json_string_field(out.data, "instrumentation_status").empty())
+        {
+            out.data["instrumentation_status"] = "complete";
+        }
+    }
+    else if (tool_name == "check_environment")
+    {
+        if (json_error_mentions_timeout(out.data))
+        {
+            if (json_string_field(out.data, "status").empty())
+                out.data["status"] = "degraded";
+            out.data["instrumentation_status"] = "timeout";
+            out.data["timeout_status"] = "controlled_timeout";
+        }
+        else if (json_string_field(out.data, "instrumentation_status").empty())
+        {
+            out.data["instrumentation_status"] = json_string_field(out.data, "status").empty() ? "complete" : json_string_field(out.data, "status");
+        }
+    }
+    else if (tool_name == "hook_jsvmp_interpreter")
+    {
+        if (json_string_field(out.data, "instrumentation_status").empty())
+            out.data["instrumentation_status"] = json_string_field(out.data, "status").empty() ? "unknown" : json_string_field(out.data, "status");
+    }
+    else if (tool_name == "trace_property_access")
+    {
+        if (json_string_field(out.data, "instrumentation_status").empty())
+            out.data["instrumentation_status"] = json_string_field(out.data, "status") == "js_fallback" ? "js_fallback" : "complete";
+        if (json_string_field(out.data, "fallback_evidence").empty() && json_string_field(out.data, "fallback_trace_file").empty())
+            out.data["fallback_evidence"] = out.data.contains("events") || out.data.contains("by_property") ? "returned_payload" : "none";
+    }
+}
+
 camoufox::bridge_status_t wait_for_ready_status(int timeout_ms)
 {
     if (timeout_ms < 0)
@@ -488,6 +607,18 @@ void enrich_evaluate_js_response(tool_result_t& out)
     out.data["error"] = error.empty() ? std::string("evaluate_js failed") : error;
     if (!out.data.contains("hint") || out.data["hint"].is_null() || (out.data["hint"].is_string() && out.data["hint"].get<std::string>().empty()))
         out.data["hint"] = evaluate_js_hint_for_error(error);
+    const std::string low = lower_ascii_copy(error);
+    if (low.find("timeout") != std::string::npos || low.find("exceeded") != std::string::npos)
+    {
+        out.data["status"] = "degraded";
+        out.data["instrumentation_status"] = "timeout";
+        out.data["timeout_status"] = "controlled_timeout";
+    }
+    else if (!out.data.contains("status"))
+    {
+        out.data["status"] = "error";
+        out.data["instrumentation_status"] = "error";
+    }
     out.data["playwright_evaluate_signature"] = "page.evaluate(expression, arg?)";
     out.data["mcp_arguments"] = json::array({"expression", "await_promise", "session_id", "page_id"});
 }
@@ -744,10 +875,22 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
     const std::string session_id = json_string_param(params, "session_id", "default");
     auto before = camoufox::get_status(session_id);
     const auto start = std::chrono::steady_clock::now();
+    const bool environment_probe = tool_name == "compare_env" || tool_name == "check_environment";
+    const bool instrumentation_probe = environment_probe ||
+        tool_name == "hook_jsvmp_interpreter" ||
+        tool_name == "trace_property_access";
     diag::log_tagged_fmt("mcp_burp", "camoufox_passthrough entry tool=%s timeout_ms=%d args_shape=%s bridge_state=%s child_pid=%lu browser_open=%d page_verified=%d child_alive=%d cleanup_pending=%d",
         tool_name.c_str(), timeout_ms, json_shape(args).c_str(), state_label(before.state),
         static_cast<unsigned long>(before.child_pid), static_cast<int>(before.browser_open),
         static_cast<int>(before.page_verified), static_cast<int>(before.child_alive), static_cast<int>(before.cleanup_pending));
+    if (environment_probe)
+    {
+        const url_log_t active_url = summarize_url_for_log(before.active_page_url);
+        diag::log_tagged_fmt("mcp_burp", "camoufox_environment_probe entry tool=%s session_id=%s timeout_ms=%d active_page_id=%s active_url_host=%s active_url_path=%s active_url_len=%zu page_count=%lu title_len=%zu",
+            tool_name.c_str(), session_id.c_str(), timeout_ms, before.active_page_id.c_str(),
+            active_url.host.c_str(), active_url.path.c_str(), active_url.length,
+            static_cast<unsigned long>(before.page_count), before.active_page_title.size());
+    }
     if (tool_name == "click")
         return tool_camoufox_click(params);
     if (tool_name == "type_text")
@@ -815,11 +958,34 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
             out.data = json::object();
         out.data["network_capture"] = capture_info;
     }
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count();
+    if (instrumentation_probe)
+        annotate_instrumentation_response(tool_name, out, timeout_ms, static_cast<long long>(elapsed_ms));
     auto after = camoufox::get_status(session_id);
     if (tool_name == "compare_env" || tool_name == "check_environment")
         attach_privacy_status(out, after);
-    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - start).count();
+    if (environment_probe)
+    {
+        const url_log_t active_url = summarize_url_for_log(after.active_page_url);
+        diag::log_tagged_fmt("mcp_burp", "camoufox_environment_probe exit tool=%s success=%d elapsed_ms=%lld rpc_timeout_ms=%d status=%s instrumentation_status=%s timeout_status=%s result_property_count=%d active_page_id=%s active_url_host=%s active_url_path=%s active_url_len=%zu page_count=%lu data_shape=%s",
+            tool_name.c_str(), static_cast<int>(out.success), static_cast<long long>(elapsed_ms), timeout_ms,
+            status_string_for_log(out.data).c_str(),
+            json_string_field(out.data, "instrumentation_status").c_str(),
+            json_string_field(out.data, "timeout_status").c_str(),
+            compare_env_result_count(out.data),
+            after.active_page_id.c_str(), active_url.host.c_str(), active_url.path.c_str(), active_url.length,
+            static_cast<unsigned long>(after.page_count), json_shape(out.data).c_str());
+    }
+    else if (instrumentation_probe)
+    {
+        diag::log_tagged_fmt("mcp_burp", "camoufox_instrumentation_probe exit tool=%s success=%d elapsed_ms=%lld rpc_timeout_ms=%d status=%s instrumentation_status=%s timeout_status=%s data_shape=%s",
+            tool_name.c_str(), static_cast<int>(out.success), static_cast<long long>(elapsed_ms), timeout_ms,
+            status_string_for_log(out.data).c_str(),
+            json_string_field(out.data, "instrumentation_status").c_str(),
+            json_string_field(out.data, "timeout_status").c_str(),
+            json_shape(out.data).c_str());
+    }
     std::string failure_phase;
     try
     {

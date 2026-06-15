@@ -2214,6 +2214,8 @@ namespace
     std::atomic<int64_t> s_last_heartbeat_time{0};
     std::atomic<uint32_t> s_heartbeat_counter{0};
     std::atomic<uint64_t> s_replay_request_seq{0};
+    std::atomic<uint64_t> s_license_rate_limited_until_ms{0};
+    std::atomic<uint32_t> s_license_rate_limit_failures{0};
 
     std::atomic<uint32_t> s_gate_bitmap{0};
 
@@ -2705,6 +2707,66 @@ namespace
     uint64_t license_now_ms()
     {
         return static_cast<uint64_t>(GetTickCount64());
+    }
+
+    bool license_rate_limit_cooling_down(const char* action, uint64_t* remaining_out = nullptr)
+    {
+        const uint64_t now = license_now_ms();
+        const uint64_t until = s_license_rate_limited_until_ms.load(std::memory_order_acquire);
+        if (until <= now) {
+            if (remaining_out)
+                *remaining_out = 0;
+            return false;
+        }
+        const uint64_t remaining = until - now;
+        if (remaining_out)
+            *remaining_out = remaining;
+        lic_log_fmt("license_rate_limit_cooldown_active action=%s remaining_ms=%llu until_ms=%llu",
+            action ? action : "unknown",
+            static_cast<unsigned long long>(remaining),
+            static_cast<unsigned long long>(until));
+        return true;
+    }
+
+    void note_license_rate_limited(const char* action, const std::string& error)
+    {
+        std::string lower = error;
+        for (char& ch : lower)
+            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        uint64_t cooldown_ms = 15ull * 60ull * 1000ull;
+        if (lower.find("minute") != std::string::npos)
+            cooldown_ms = 5ull * 60ull * 1000ull;
+        if (lower.find("hour") != std::string::npos)
+            cooldown_ms = 60ull * 60ull * 1000ull;
+        if (lower.find("day") != std::string::npos)
+            cooldown_ms = 60ull * 60ull * 1000ull;
+        const uint32_t failures = s_license_rate_limit_failures.fetch_add(1, std::memory_order_acq_rel) + 1;
+        if (failures >= 2)
+            cooldown_ms = (std::max)(cooldown_ms, (std::min)(60ull * 60ull * 1000ull, 15ull * 60ull * 1000ull * failures));
+        const uint64_t until = license_now_ms() + cooldown_ms;
+        uint64_t observed = s_license_rate_limited_until_ms.load(std::memory_order_acquire);
+        while (observed < until &&
+            !s_license_rate_limited_until_ms.compare_exchange_weak(
+                observed, until, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        }
+        lic_log_fmt("license_rate_limited action=%s err=%.160s cooldown_ms=%llu failures=%u until_ms=%llu",
+            action ? action : "unknown",
+            error.c_str(),
+            static_cast<unsigned long long>(cooldown_ms),
+            static_cast<unsigned>(failures),
+            static_cast<unsigned long long>(until));
+    }
+
+    void clear_license_rate_limit_cooldown(const char* reason)
+    {
+        const uint64_t previous = s_license_rate_limited_until_ms.exchange(0, std::memory_order_acq_rel);
+        const uint32_t failures = s_license_rate_limit_failures.exchange(0, std::memory_order_acq_rel);
+        if (previous != 0 || failures != 0) {
+            lic_log_fmt("license_rate_limit_cooldown_cleared reason=%s previous_until_ms=%llu failures=%u",
+                reason ? reason : "unknown",
+                static_cast<unsigned long long>(previous),
+                static_cast<unsigned>(failures));
+        }
     }
 
     int64_t license_unix_ms()
@@ -4886,6 +4948,8 @@ namespace
         }
         if (resp.status != 200) {
             const std::string canonical = canonical_license_reject_reason(resp.debug_reason);
+            if (canonical == "rate_limited")
+                note_license_rate_limited(action.c_str(), resp.debug_reason.empty() ? canonical : resp.debug_reason);
             error_out = canonical.empty()
                 ? "License service returned HTTP " + std::to_string(resp.status)
                 : canonical;
@@ -5031,6 +5095,7 @@ namespace
             error_out = "License response identity mismatch.";
             return false;
         }
+        clear_license_rate_limit_cooldown(action.c_str());
         return true;
     }
 
@@ -5045,6 +5110,15 @@ namespace
     {
         try {
             lic_log("call_validation_enter");
+            if (action == "heartbeat" && license_rate_limit_cooling_down(action.c_str())) {
+                error_out = "rate_limited";
+                response_out = json::object({
+                    {"ok", false},
+                    {"status", "transient"},
+                    {"reason", "rate_limited_cooldown"}
+                });
+                return false;
+            }
             json body;
             body["action"] = action;
             body["license_key"] = key;
@@ -8008,6 +8082,11 @@ namespace
         lic_log_fmt("heartbeat_revalidation_before_pending reason=%.96s",
             trigger_error.c_str());
 
+        if (license_rate_limit_cooling_down("heartbeat_revalidation_before_pending")) {
+            pending_error = "rate_limited";
+            return false;
+        }
+
         if (!call_validation_endpoint_for_current_hwid(settings, "validate",
                                                        settings.license_key, {},
                                                        reval_nonce, reval_hwid,
@@ -8224,6 +8303,11 @@ namespace
                     schedule_silent_kill(error.c_str());
                 }
 
+                if (error == "rate_limited") {
+                    consecutive_failures = 1;
+                    continue;
+                }
+
                 if (can_revalidate_auth_reject(error)) {
                     std::string pending_error = error;
                     if (refresh_online_session_after_auth_reject(*settings, error, pending_error))
@@ -8247,6 +8331,10 @@ namespace
 
 
                 if (consecutive_failures >= 5) {
+                    if (license_rate_limit_cooling_down("heartbeat_revalidation")) {
+                        consecutive_failures = 1;
+                        continue;
+                    }
                     const std::string reval_nonce = generate_nonce();
                     std::string reval_error;
                     json reval_response;
@@ -8279,6 +8367,10 @@ namespace
                     }
 
                     const std::string effective_error = reval_error.empty() ? error : reval_error;
+                    if (effective_error == "rate_limited") {
+                        consecutive_failures = 1;
+                        continue;
+                    }
                     if (is_reactivation_required_error(effective_error)) {
                         enter_pending_activation(*settings, effective_error);
                         break;

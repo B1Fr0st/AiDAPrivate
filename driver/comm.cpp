@@ -2146,23 +2146,53 @@ bool voyager::device_t::get_thread_context(std::uint32_t tid, thread_context& ct
     req.should_set = 0;
     req.register_mask = 0;
 
+    auto context_sane = [&req]() noexcept {
+        return req.rip != 0 && req.rsp != 0 && req.rflags != 0;
+    };
+
     bool ok = send_request(ioctl_codes::TCTX(), &req, sizeof(req));
     DWORD first_gle = ok ? ERROR_SUCCESS : GetLastError();
-    if (!ok) {
+    bool sane = ok && context_sane();
+    if (!ok || !sane) {
         std::uint32_t prev_count = 0;
         bool suspended = suspend_thread(tid, &prev_count);
         DWORD suspend_gle = suspended ? ERROR_SUCCESS : GetLastError();
         if (suspended) {
+            req = {};
+            req.pid = process_id_;
+            req.tid = tid;
+            req.should_set = 0;
+            req.register_mask = 0;
             ok = send_request(ioctl_codes::TCTX(), &req, sizeof(req));
             first_gle = ok ? ERROR_SUCCESS : GetLastError();
+            sane = ok && context_sane();
             std::uint32_t ignored = 0;
             (void)resume_thread(tid, &ignored);
         } else {
-            RC_UM_DBG("TCTX get suspend_failed pid=%u tid=%u gle=%lu", process_id_, tid, suspend_gle);
+            RC_UM_DBG("TCTX get suspend_failed pid=%u tid=%u initial_ok=%d initial_sane=%d rip=0x%llX rsp=0x%llX rflags=0x%llX gle=%lu",
+                process_id_,
+                tid,
+                ok ? 1 : 0,
+                sane ? 1 : 0,
+                req.rip,
+                req.rsp,
+                req.rflags,
+                suspend_gle);
         }
     }
     if (!ok) {
         RC_UM_DBG("TCTX get send_failed pid=%u tid=%u gle=%lu ioctl=0x%08X", process_id_, tid, first_gle, ioctl_codes::TCTX());
+        return false;
+    }
+    if (!sane) {
+        RC_UM_DBG("TCTX get invalid_zero_context pid=%u tid=%u rip=0x%llX rsp=0x%llX rflags=0x%llX ioctl=0x%08X",
+            process_id_,
+            tid,
+            req.rip,
+            req.rsp,
+            req.rflags,
+            ioctl_codes::TCTX());
+        SetLastError(ERROR_INVALID_DATA);
         return false;
     }
 

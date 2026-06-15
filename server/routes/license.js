@@ -1857,7 +1857,7 @@ async function handleValidate(body, clientIp) {
         }
     }
 
-    const rl = await licenseRateLimit.check(license_key, {});
+    const rl = await licenseRateLimit.check(license_key, { bucket: 'validate' });
     if (!rl.ok) {
         return collapseRateLimited(rl.scope, rl.retry_after, license_key, hwid, clientIp);
     }
@@ -2179,7 +2179,12 @@ async function handleHeartbeat(body, clientIp) {
         return collapseHeartbeatDeny('missing_fields', license_key, hwid, clientIp);
     }
 
-    const perLicenseRl = await licenseRateLimit.check(license_key, {});
+    const perLicenseRl = await licenseRateLimit.check(license_key, {
+        bucket: 'heartbeat',
+        per_minute: licenseRateLimit.DEFAULT_HEARTBEAT_PER_MINUTE,
+        per_hour: licenseRateLimit.DEFAULT_HEARTBEAT_PER_HOUR,
+        per_day: licenseRateLimit.DEFAULT_HEARTBEAT_PER_DAY,
+    });
     if (!perLicenseRl.ok) {
         dbgHb('per_license_rate_limited', { scope: perLicenseRl.scope, retry_after: perLicenseRl.retry_after });
         auditLog.logValidationFailure(REASON_RATE_LIMITED, 'heartbeat_rate_limited:' + (perLicenseRl.scope || ''), license_key, hwid, clientIp, { retry_after: perLicenseRl.retry_after })

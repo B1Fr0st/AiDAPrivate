@@ -1557,12 +1557,16 @@ tool_result_t network_modify_packet_rule(const json& params)
         add_driver_request_fields(r, ok, gle);
         return tool_result_t::ok(OBFSTR("Modification rule ") + std::to_string(rule_id) + OBFSTR(" removed"), r);
     } else if (op == "clear") {
+        auto before = driver_bridge::list_packet_mod_rules();
         bool ok = driver_bridge::packet_mod_rule_op(3);
         const DWORD gle = GetLastError();
         if (!ok) return tool_result_t::error(OBFSTR("Failed to clear modification rules."));
         auto remaining = driver_bridge::list_packet_mod_rules();
         json r;
         r["operation"] = "clear";
+        r["before_count"] = static_cast<uint64_t>(before.size());
+        r["after_count"] = static_cast<uint64_t>(remaining.size());
+        r["cleared_count"] = static_cast<uint64_t>(before.size() >= remaining.size() ? before.size() - remaining.size() : 0);
         r["remaining_count"] = remaining.size();
         r["cleared"] = remaining.empty();
         add_driver_request_fields(r, ok, gle);
@@ -1645,12 +1649,16 @@ tool_result_t network_redirect_traffic(const json& params)
         add_driver_request_fields(r, ok, gle);
         return tool_result_t::ok(OBFSTR("Redirect rule ") + std::to_string(rule_id) + OBFSTR(" removed"), r);
     } else if (op == "clear") {
+        auto before = driver_bridge::list_redirect_rules();
         bool ok = driver_bridge::traffic_redirect_op(3);
         const DWORD gle = GetLastError();
         if (!ok) return tool_result_t::error(OBFSTR("Failed to clear redirect rules."));
         auto remaining = driver_bridge::list_redirect_rules();
         json r;
         r["operation"] = "clear";
+        r["before_count"] = static_cast<uint64_t>(before.size());
+        r["after_count"] = static_cast<uint64_t>(remaining.size());
+        r["cleared_count"] = static_cast<uint64_t>(before.size() >= remaining.size() ? before.size() - remaining.size() : 0);
         r["remaining_count"] = remaining.size();
         r["cleared"] = remaining.empty();
         add_driver_request_fields(r, ok, gle);
@@ -1920,6 +1928,7 @@ tool_result_t network_spoof_dns(const json& params)
         add_driver_request_fields(r, ok, gle);
         return tool_result_t::ok(OBFSTR("DNS spoof rule ") + std::to_string(rule_id) + OBFSTR(" removed"), r);
     } else if (op == "clear") {
+        auto before = driver_bridge::list_dns_spoof_rules();
         bool ok = driver_bridge::dns_spoof_op(3, 0, nullptr, nullptr, 2, 0, nullptr);
         const DWORD gle = GetLastError();
         if (!ok) return tool_result_t::error(OBFSTR("Failed to clear DNS spoof rules."));
@@ -1927,6 +1936,9 @@ tool_result_t network_spoof_dns(const json& params)
         json r;
         r["operation"] = "clear";
         r["action"] = "clear_spoof";
+        r["before_count"] = static_cast<uint64_t>(before.size());
+        r["after_count"] = static_cast<uint64_t>(remaining.size());
+        r["cleared_count"] = static_cast<uint64_t>(before.size() >= remaining.size() ? before.size() - remaining.size() : 0);
         r["remaining_count"] = remaining.size();
         r["cleared"] = remaining.empty();
         add_driver_request_fields(r, ok, gle);
@@ -2682,17 +2694,46 @@ void register_network_tools(mcp_standalone::server_t& srv) {
         [](const json& args) -> tool_result_t {
             std::string code = args.value("code", "");
             diag::log_tagged_fmt("net_tools", "network_script_execute code_len=%zu", code.size());
+            const uint64_t started = GetTickCount64();
             json init_diag;
             std::string init_error;
             if (!ensure_network_script_engine_initialized("execute", init_diag, init_error))
                 return tool_result_t::error(init_error, init_diag);
+            const bool initialized_before = init_diag.value("initialized_before", false);
+            const uint64_t exec_started = GetTickCount64();
             std::string result = script_engine::execute(code);
+            const uint64_t execution_elapsed = GetTickCount64() - exec_started;
             diag::log_tagged_fmt("net_tools", "network_script_execute result_len=%zu", result.size());
+            std::string normalized = code;
+            auto not_space = [](unsigned char c) { return !std::isspace(c); };
+            normalized.erase(normalized.begin(), std::find_if(normalized.begin(), normalized.end(), not_space));
+            normalized.erase(std::find_if(normalized.rbegin(), normalized.rend(), not_space).base(), normalized.end());
             json r;
             r["action"] = "execute";
             r["output"] = result;
+            r["output_len"] = static_cast<uint64_t>(result.size());
+            r["output_empty"] = result.empty();
+            r["output_nontrivial"] = !result.empty() && result != "[error: engine not initialized]";
+            r["initialized_before"] = initialized_before;
+            r["initialized_after"] = script_engine::is_initialized();
             r["script_count"] = script_engine::get_scripts().size();
             r["hook_count"] = script_engine::registered_hook_count();
+            r["elapsed_ms"] = static_cast<unsigned long long>(GetTickCount64() - started);
+            r["execution_elapsed_ms"] = static_cast<unsigned long long>(execution_elapsed);
+            r["expected_output_available"] = false;
+            if (normalized == "return 1") {
+                r["expected_output_available"] = true;
+                r["expected_output"] = "1";
+                r["expected_output_matched"] = result == "1";
+            } else if (normalized == "return true") {
+                r["expected_output_available"] = true;
+                r["expected_output"] = "true";
+                r["expected_output_matched"] = result == "true";
+            } else if (normalized == "return false") {
+                r["expected_output_available"] = true;
+                r["expected_output"] = "false";
+                r["expected_output_matched"] = result == "false";
+            }
             r["initialization"] = std::move(init_diag);
             if (result == "[error: engine not initialized]") {
                 r["success"] = false;

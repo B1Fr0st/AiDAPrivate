@@ -1406,8 +1406,8 @@ struct transform_result_t {
     resource_fixup_table_t resources;
 };
 
-constexpr uint32_t kReservedMainStubSize = 0xC000u;
-constexpr uint32_t kReservedTlsStubSize = 0xC000u;
+constexpr uint32_t kReservedMainStubSize = 0x10000u;
+constexpr uint32_t kReservedTlsStubSize = 0x10000u;
 
 struct protect_options_t {
     uint64_t seed = 0;
@@ -1463,11 +1463,24 @@ struct section_skip_list {
             || name_equals(name, ".gehi")
             || name_equals(name, ".epheme")
             || name_equals(name, ".rdiag")
+            || name_equals(name, ".aifn")
+            || is_ai_poison(name)
             || name_equals(name, ".dseal")
             || name_equals(name, ".dthunk")
             || name_equals(name, ".licbind")
             || name_equals(name, ".feat")
             || name_equals(name, ".aidashr");
+    }
+
+    static bool is_ai_poison(const char name[8]) {
+        return name_equals(name, ".aiai0")
+            || name_equals(name, ".aiai1")
+            || name_equals(name, ".aiai2")
+            || name_equals(name, ".aiai3")
+            || name_equals(name, ".aiai4")
+            || name_equals(name, ".aiai5")
+            || name_equals(name, ".aiai6")
+            || name_equals(name, ".aiai7");
     }
 };
 
@@ -2237,14 +2250,8 @@ inline void randomize_section_names(pe_file::pe_image_t& pe, rng_state_t& rng) {
         'w','x','y','z','0','1','2','3','4','5','6','7','8','9','-','_'
     };
     for (auto& sec : pe.sections) {
-        if (section_skip_list::name_equals(sec.name, ".rsrc") ||
-            section_skip_list::name_equals(sec.name, ".reloc") ||
-            section_skip_list::name_equals(sec.name, ".packed") ||
-            section_skip_list::name_equals(sec.name, ".dseal") ||
-            section_skip_list::name_equals(sec.name, ".dthunk") ||
-            section_skip_list::name_equals(sec.name, ".licbind") ||
-            section_skip_list::name_equals(sec.name, ".feat") ||
-            section_skip_list::name_equals(sec.name, ".aidashr")) {
+        if (section_skip_list::is_skipped(sec.name) ||
+            section_skip_list::name_equals(sec.name, ".packed")) {
             continue;
         }
         char nn[8] = { 0 };
@@ -3683,7 +3690,32 @@ inline transform_result_t protect_pe(pe_file::pe_image_t& pe, const protect_opti
         (void)inject_symexec_bombs(pe, rng_seed ^ 0x5E7EC0BB1E1A7EDAull);
     }
     if (opt.llm_poison) {
-        (void)llm_poison::inject_llm_poison(pe, rng_seed ^ 0x11AB1E1A7EC0FFEEull);
+        llm_poison::llm_poison_result_t poison =
+            llm_poison::inject_llm_poison(pe, rng_seed ^ 0x11AB1E1A7EC0FFEEull);
+        const uint32_t expected_visible = llm_poison::detail::k_visible_poison_count;
+        const uint32_t expected_spread_sections = llm_poison::detail::k_spread_poison_sections;
+        const uint32_t expected_spread_visible = llm_poison::detail::k_spread_poison_count;
+        const uint32_t expected_strings =
+            16u + 16u + 16u + 16u + 10u + 16u + 16u + 16u + 32u + expected_visible + expected_spread_visible;
+        if (!poison.applied ||
+            poison.visible_strings_embedded < expected_visible ||
+            poison.spread_sections_embedded != expected_spread_sections ||
+            poison.spread_visible_strings_embedded < expected_spread_visible ||
+            poison.strings_embedded < expected_strings) {
+            char msg[384];
+            const char* poison_error = llm_poison::last_error();
+            std::snprintf(msg, sizeof(msg),
+                          "llm_poison injection failed: applied=%d strings=%u/%u visible=%u/%u spread_sections=%u/%u spread_visible=%u/%u error=%s",
+                          poison.applied ? 1 : 0,
+                          poison.strings_embedded, expected_strings,
+                          poison.visible_strings_embedded, expected_visible,
+                          poison.spread_sections_embedded, expected_spread_sections,
+                          poison.spread_visible_strings_embedded, expected_spread_visible,
+                          (poison_error != nullptr && poison_error[0] != '\0') ? poison_error : "count contract not satisfied");
+            result.success = false;
+            result.error = msg;
+            return result;
+        }
     }
     if (opt.deep_steal) {
         (void)apply_deep_steal(pe, aux, master, original_exception_rva, original_exception_size);
@@ -3735,6 +3767,52 @@ inline transform_result_t protect_pe(pe_file::pe_image_t& pe, const protect_opti
     std::vector<packed_section_blob_t> blobs;
     if (opt.pack_sections) {
         blobs = pack_sections(pe, master, original_exception_rva, original_exception_size, keep_intact_section_rvas, opt.matryoshka_layers);
+    }
+    if (opt.llm_poison) {
+        std::vector<llm_poison::packed_lure_ref_t> packed_lure_refs;
+        packed_lure_refs.reserve(blobs.size());
+        for (const auto& b : blobs) {
+            llm_poison::packed_lure_ref_t ref{};
+            ref.original_rva = b.original_rva;
+            ref.original_virtual_size = b.original_virtual_size;
+            ref.original_characteristics = b.original_characteristics;
+            ref.section_index = b.section_index;
+            if ((ref.original_characteristics & IMAGE_SCN_MEM_EXECUTE) != 0u ||
+                (ref.original_characteristics & IMAGE_SCN_CNT_CODE) != 0u) {
+                packed_lure_refs.push_back(ref);
+            }
+        }
+        llm_poison::function_lure_result_t lures =
+            llm_poison::inject_function_lures(pe, rng_seed ^ 0xA1F00D31A1DAF00Dull, packed_lure_refs);
+        const uint32_t expected_poison_refs =
+            llm_poison::detail::k_visible_poison_count + llm_poison::detail::k_spread_poison_count;
+        const uint32_t count_sum = lures.exception_records + lures.export_records +
+            lures.tile_records + lures.packed_records;
+        if (!lures.applied ||
+            lures.records_embedded == 0u ||
+            lures.records_embedded != count_sum ||
+            lures.poison_refs < expected_poison_refs ||
+            lures.tile_records == 0u ||
+            lures.packed_records != static_cast<uint32_t>(packed_lure_refs.size())) {
+            char msg[384];
+            const char* poison_error = llm_poison::last_error();
+            std::snprintf(msg, sizeof(msg),
+                          "llm_poison .aifn injection failed: applied=%d records=%u sum=%u exception=%u export=%u tile=%u packed=%u/%u poison_refs=%u/%u error=%s",
+                          lures.applied ? 1 : 0,
+                          lures.records_embedded,
+                          count_sum,
+                          lures.exception_records,
+                          lures.export_records,
+                          lures.tile_records,
+                          lures.packed_records,
+                          static_cast<uint32_t>(packed_lure_refs.size()),
+                          lures.poison_refs,
+                          expected_poison_refs,
+                          (poison_error != nullptr && poison_error[0] != '\0') ? poison_error : "count contract not satisfied");
+            result.success = false;
+            result.error = msg;
+            return result;
+        }
     }
 
     std::vector<uint8_t> stub_code;

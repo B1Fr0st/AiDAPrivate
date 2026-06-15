@@ -1121,10 +1121,16 @@ tool_result_t network_decrypt_capture(const json& params) {
         const bool empty_fixture_ok = pcap_probe.valid && pcap_probe.packet_count == 0 && keylog_probe.valid;
         r["success"] = empty_fixture_ok;
         r["backend"] = empty_fixture_ok ? "builtin_empty_pcap_fixture" : "tshark";
+        r["state_contract"] = empty_fixture_ok ? "valid_empty_pcap_builtin_parse_no_external_decryptor_required" : "non_empty_tls_capture_requires_tshark";
+        r["dependency"] = empty_fixture_ok ? "builtin_empty_pcap_parser" : "tshark";
+        r["external_dependency_required"] = !empty_fixture_ok;
+        r["host_execution_attempted"] = false;
         r["safe_parser_backend"] = "builtin_empty_pcap_fixture";
         r["dependency_available"] = empty_fixture_ok;
         r["dependency_unavailable"] = !empty_fixture_ok;
+        r["dependency_blocked"] = !empty_fixture_ok;
         r["tshark_available"] = false;
+        r["tshark_dependency_available"] = false;
         r["selected"] = nullptr;
         r["searched_paths"] = ns_paths_to_json(searched_paths);
         r["pcap_file"] = pcap_path;
@@ -1149,6 +1155,7 @@ tool_result_t network_decrypt_capture(const json& params) {
         r["reason"] = pcap_probe.valid && pcap_probe.packet_count != 0
             ? "non-empty capture requires tshark for decryption"
             : (!pcap_probe.valid ? pcap_probe.reason : (!keylog_probe.valid ? keylog_probe.reason : "tshark backend unavailable"));
+        r["dependency_unavailable_reason"] = r["reason"];
         r["error"] = "tshark not found. Install Wireshark to enable PCAP decryption.";
         diag::log_tagged_fmt("net_sec", "network_decrypt_capture dependency_unavailable backend=tshark pcap=%s keylog=%s filter=%s pcap_valid=%d packets=%u keylog_valid=%d keylog_entries=%u reason=%s searched_paths=%zu",
             pcap_path.c_str(), keylog_path.c_str(), display_filter.c_str(),
@@ -1168,8 +1175,15 @@ tool_result_t network_decrypt_capture(const json& params) {
     json r;
     r["success"] = decrypt_result.success;
     r["backend"] = "tshark";
+    r["state_contract"] = "tls_capture_decryption_attempted_with_tshark";
+    r["dependency"] = "tshark";
+    r["external_dependency_required"] = true;
     r["dependency_available"] = true;
     r["dependency_unavailable"] = false;
+    r["dependency_blocked"] = false;
+    r["tshark_available"] = true;
+    r["tshark_dependency_available"] = true;
+    r["host_execution_attempted"] = true;
     r["selected"] = tshark_path;
     r["searched_paths"] = ns_paths_to_json(searched_paths);
     r["tshark_path"] = tshark_path;

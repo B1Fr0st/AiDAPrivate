@@ -37,6 +37,8 @@ struct audit_status_t
     size_t        issues_found = 0;
     bool          running = false;
     bool          cancelled = false;
+    bool          cancel_requested = false;
+    bool          drained = false;
     uint64_t      started_ms = 0;
     uint64_t      ended_ms = 0;
 };

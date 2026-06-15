@@ -58,6 +58,11 @@ static void log_msg(HANDLE hf, const char* tag, const char* fmt, ...) {
     test_all_features::mirror_full_test_log_line(tag, detail, s.c_str());
 }
 
+static long long elapsed_us_since(std::chrono::steady_clock::time_point t0) {
+    return static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - t0).count());
+}
+
 static constexpr uint64_t k_marker_u64 = 0xCAFEBABE00000001ULL;
 static constexpr int16_t  k_marker_i16 = static_cast<int16_t>(0x5AA5);
 static constexpr int32_t  k_marker_i32 = static_cast<int32_t>(0x1337C0DE);
@@ -875,22 +880,78 @@ static void test_reset_scan(HANDLE hf, std::atomic<int>& passed, std::atomic<int
     log_msg(hf, "scan_rst", "START -- reset scan clears results");
     auto t0 = std::chrono::steady_clock::now();
 
-    memory_scanner::reset_scan();
-
-    bool empty = false;
     {
         std::lock_guard<std::mutex> lk(memory_scanner::g_state.results_mutex);
-        empty = memory_scanner::g_state.results.empty();
+        memory_scanner::scan_result_t seed;
+        seed.address = 0xA1DA000000001000ULL;
+        seed.current_value = {0x11, 0x22, 0x33, 0x44};
+        seed.previous_value = {0x10, 0x20, 0x30, 0x40};
+        seed.module_name = "test_reset_fixture";
+        seed.module_offset = 0x1000;
+        memory_scanner::g_state.results.clear();
+        memory_scanner::g_state.scan_history.clear();
+        memory_scanner::g_state.results.push_back(seed);
+        memory_scanner::g_state.scan_history.push_back(memory_scanner::g_state.results);
+        memory_scanner::g_state.total_found = memory_scanner::g_state.results.size();
+        memory_scanner::g_state.has_initial_scan = true;
+        memory_scanner::g_state.scan_count = 2;
+        memory_scanner::g_state.scan_progress.store(0.25f, std::memory_order_release);
     }
 
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "scan_rst", "RESULT results_empty=%d", static_cast<int>(empty));
-    if (!empty) {
-        log_msg(hf, "scan_rst", "FAIL -- results not empty after reset_scan (elapsed %lld ms)", (long long)ms);
+    size_t seeded_results = 0;
+    size_t seeded_history = 0;
+    size_t seeded_total = 0;
+    bool seeded_initial = false;
+    int seeded_scan_count = 0;
+    {
+        std::lock_guard<std::mutex> lk(memory_scanner::g_state.results_mutex);
+        seeded_results = memory_scanner::g_state.results.size();
+        seeded_history = memory_scanner::g_state.scan_history.size();
+        seeded_total = memory_scanner::g_state.total_found;
+        seeded_initial = memory_scanner::g_state.has_initial_scan;
+        seeded_scan_count = memory_scanner::g_state.scan_count;
+    }
+    log_msg(hf, "scan_rst", "STATE before_reset results=%zu history=%zu total_found=%zu has_initial=%d scan_count=%d progress=%.3f",
+        seeded_results,
+        seeded_history,
+        seeded_total,
+        seeded_initial ? 1 : 0,
+        seeded_scan_count,
+        static_cast<double>(memory_scanner::g_state.scan_progress.load(std::memory_order_acquire)));
+
+    memory_scanner::reset_scan();
+
+    bool results_empty = false;
+    bool history_empty = false;
+    size_t total_found = 0;
+    bool has_initial = true;
+    int scan_count = -1;
+    {
+        std::lock_guard<std::mutex> lk(memory_scanner::g_state.results_mutex);
+        results_empty = memory_scanner::g_state.results.empty();
+        history_empty = memory_scanner::g_state.scan_history.empty();
+        total_found = memory_scanner::g_state.total_found;
+        has_initial = memory_scanner::g_state.has_initial_scan;
+        scan_count = memory_scanner::g_state.scan_count;
+    }
+    float progress = memory_scanner::g_state.scan_progress.load(std::memory_order_acquire);
+
+    long long us = elapsed_us_since(t0);
+    bool ok = results_empty && history_empty && total_found == 0 && !has_initial && scan_count == 0 && progress == 1.f;
+    log_msg(hf, "scan_rst", "STATE after_reset results_empty=%d history_empty=%d total_found=%zu has_initial=%d scan_count=%d progress=%.3f expected={empty,empty,0,0,0,1.000} elapsed_us=%lld",
+        results_empty ? 1 : 0,
+        history_empty ? 1 : 0,
+        total_found,
+        has_initial ? 1 : 0,
+        scan_count,
+        static_cast<double>(progress),
+        us);
+    if (!ok) {
+        log_msg(hf, "scan_rst", "FAIL -- reset_scan did not clear seeded state ok=%d elapsed_us=%lld", ok ? 1 : 0, us);
         failed.fetch_add(1);
         return;
     }
-    log_msg(hf, "scan_rst", "PASS -- reset_scan cleared results (elapsed %lld ms)", (long long)ms);
+    log_msg(hf, "scan_rst", "PASS -- reset_scan cleared seeded results/history/counters elapsed_us=%lld", us);
     passed.fetch_add(1);
 }
 
@@ -898,9 +959,26 @@ static void test_add_address(HANDLE hf, std::atomic<int>& passed, std::atomic<in
     log_msg(hf, "scan_add", "START -- add address to watch list");
     auto t0 = std::chrono::steady_clock::now();
 
-    uint64_t addr = g_anchor.planted ? g_anchor.addr_u64
-        : static_cast<uint64_t>(reinterpret_cast<uintptr_t>(GetModuleHandleW(L"ntdll.dll")));
-    log_msg(hf, "scan_add", "INPUT addr=0x%llX type=Int64", (unsigned long long)addr);
+    uint64_t addr = 0xA1DAADD000000001ULL;
+    log_msg(hf, "scan_add", "INPUT addr=0x%llX desc=\"test_add_unique\" type=Int64", (unsigned long long)addr);
+
+    auto find_index = [&](uint64_t target, size_t* out_index, std::string* out_desc, memory_scanner::value_type_t* out_type) -> bool {
+        std::lock_guard<std::mutex> lk(memory_scanner::g_state.address_mutex);
+        for (size_t i = 0; i < memory_scanner::g_state.address_list.size(); ++i) {
+            const auto& e = memory_scanner::g_state.address_list[i];
+            if (e.address == target) {
+                if (out_index) *out_index = i;
+                if (out_desc) *out_desc = e.description;
+                if (out_type) *out_type = e.value_type;
+                return true;
+            }
+        }
+        return false;
+    };
+
+    size_t existing_index = 0;
+    while (find_index(addr, &existing_index, nullptr, nullptr))
+        memory_scanner::remove_address(existing_index);
 
     size_t before = 0;
     {
@@ -908,25 +986,66 @@ static void test_add_address(HANDLE hf, std::atomic<int>& passed, std::atomic<in
         before = memory_scanner::g_state.address_list.size();
     }
 
-    memory_scanner::add_address(addr, "test_anchor_u64", memory_scanner::value_type_t::int64_val);
+    memory_scanner::add_address(addr, "test_add_unique", memory_scanner::value_type_t::int64_val);
 
     size_t count = 0;
     bool present = false;
+    size_t added_index = 0;
+    std::string added_desc;
+    memory_scanner::value_type_t added_type = memory_scanner::value_type_t::int32_val;
     {
         std::lock_guard<std::mutex> lk(memory_scanner::g_state.address_mutex);
         count = memory_scanner::g_state.address_list.size();
-        for (auto& e : memory_scanner::g_state.address_list)
-            if (e.address == addr) { present = true; break; }
+        for (size_t i = 0; i < memory_scanner::g_state.address_list.size(); ++i) {
+            const auto& e = memory_scanner::g_state.address_list[i];
+            if (e.address == addr) {
+                present = true;
+                added_index = i;
+                added_desc = e.description;
+                added_type = e.value_type;
+                break;
+            }
+        }
     }
 
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "scan_add", "RESULT before=%zu after=%zu present=%d", before, count, static_cast<int>(present));
-    if (count > before && present) {
-        log_msg(hf, "scan_add", "PASS -- address list now %zu entries, target present (elapsed %lld ms)", count, (long long)ms);
+    if (present)
+        memory_scanner::remove_address(added_index);
+
+    size_t cleanup_count = 0;
+    bool present_after_cleanup = find_index(addr, nullptr, nullptr, nullptr);
+    {
+        std::lock_guard<std::mutex> lk(memory_scanner::g_state.address_mutex);
+        cleanup_count = memory_scanner::g_state.address_list.size();
+    }
+
+    long long us = elapsed_us_since(t0);
+    bool ok = count == before + 1 && present && added_desc == "test_add_unique" &&
+              added_type == memory_scanner::value_type_t::int64_val &&
+              cleanup_count == before && !present_after_cleanup;
+    log_msg(hf, "scan_add", "STATE before=%zu after_add=%zu present=%d added_index=%zu desc=\"%s\" type=%d cleanup_count=%zu present_after_cleanup=%d elapsed_us=%lld",
+        before,
+        count,
+        present ? 1 : 0,
+        added_index,
+        added_desc.c_str(),
+        static_cast<int>(added_type),
+        cleanup_count,
+        present_after_cleanup ? 1 : 0,
+        us);
+    if (ok) {
+        log_msg(hf, "scan_add", "PASS -- add_address inserted exact address/description/type and cleanup restored count elapsed_us=%lld", us);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "scan_add", "FAIL -- add_address did not register addr 0x%llX (before=%zu after=%zu) (elapsed %lld ms)",
-            (unsigned long long)addr, before, count, (long long)ms);
+        log_msg(hf, "scan_add", "FAIL -- add_address evidence mismatch addr=0x%llX before=%zu after=%zu present=%d desc=\"%s\" type=%d cleanup_count=%zu present_after_cleanup=%d elapsed_us=%lld",
+            (unsigned long long)addr,
+            before,
+            count,
+            present ? 1 : 0,
+            added_desc.c_str(),
+            static_cast<int>(added_type),
+            cleanup_count,
+            present_after_cleanup ? 1 : 0,
+            us);
         failed.fetch_add(1);
     }
 }
@@ -935,36 +1054,71 @@ static void test_remove_address(HANDLE hf, std::atomic<int>& passed, std::atomic
     log_msg(hf, "scan_rem", "START -- remove address from watch list");
     auto t0 = std::chrono::steady_clock::now();
 
+    uint64_t addr = 0xA1DAADD000000002ULL;
+    auto find_index = [&](uint64_t target, size_t* out_index) -> bool {
+        std::lock_guard<std::mutex> lk(memory_scanner::g_state.address_mutex);
+        for (size_t i = 0; i < memory_scanner::g_state.address_list.size(); ++i) {
+            if (memory_scanner::g_state.address_list[i].address == target) {
+                if (out_index) *out_index = i;
+                return true;
+            }
+        }
+        return false;
+    };
+
+    size_t existing_index = 0;
+    while (find_index(addr, &existing_index))
+        memory_scanner::remove_address(existing_index);
+
     size_t before = 0;
     {
         std::lock_guard<std::mutex> lk(memory_scanner::g_state.address_mutex);
         before = memory_scanner::g_state.address_list.size();
     }
 
-    if (before == 0) {
-        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-        log_msg(hf, "scan_rem", "FAIL -- watch list empty, nothing to remove (elapsed %lld ms)", (long long)ms);
+    memory_scanner::add_address(addr, "test_remove_unique", memory_scanner::value_type_t::int32_val);
+
+    size_t remove_index = 0;
+    bool present_before_remove = find_index(addr, &remove_index);
+    size_t count_after_add = 0;
+    {
+        std::lock_guard<std::mutex> lk(memory_scanner::g_state.address_mutex);
+        count_after_add = memory_scanner::g_state.address_list.size();
+    }
+
+    if (!present_before_remove) {
+        long long us = elapsed_us_since(t0);
+        log_msg(hf, "scan_rem", "FAIL -- fixture add missing before remove addr=0x%llX before=%zu after_add=%zu elapsed_us=%lld",
+            (unsigned long long)addr, before, count_after_add, us);
         failed.fetch_add(1);
         return;
     }
 
-    memory_scanner::remove_address(0);
+    memory_scanner::remove_address(remove_index);
 
     size_t after = 0;
+    bool present_after = find_index(addr, nullptr);
     {
         std::lock_guard<std::mutex> lk(memory_scanner::g_state.address_mutex);
         after = memory_scanner::g_state.address_list.size();
     }
 
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "scan_rem", "RESULT before=%zu after=%zu", before, after);
-    if (after + 1 == before) {
-        log_msg(hf, "scan_rem", "PASS -- removed one entry (before=%zu after=%zu) (elapsed %lld ms)",
-            before, after, (long long)ms);
+    long long us = elapsed_us_since(t0);
+    bool ok = count_after_add == before + 1 && after == before && !present_after;
+    log_msg(hf, "scan_rem", "STATE before=%zu after_add=%zu remove_index=%zu present_before=%d after_remove=%zu present_after=%d elapsed_us=%lld",
+        before,
+        count_after_add,
+        remove_index,
+        present_before_remove ? 1 : 0,
+        after,
+        present_after ? 1 : 0,
+        us);
+    if (ok) {
+        log_msg(hf, "scan_rem", "PASS -- remove_address removed the seeded address and restored list count elapsed_us=%lld", us);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "scan_rem", "FAIL -- remove_address count mismatch (before=%zu after=%zu) (elapsed %lld ms)",
-            before, after, (long long)ms);
+        log_msg(hf, "scan_rem", "FAIL -- remove_address evidence mismatch before=%zu after_add=%zu after=%zu present_after=%d elapsed_us=%lld",
+            before, count_after_add, after, present_after ? 1 : 0, us);
         failed.fetch_add(1);
     }
 }
@@ -1527,15 +1681,22 @@ static void test_aob_format_signature(HANDLE hf, std::atomic<int>& passed, std::
 
     std::string formatted = aob_generator::format_signature(sig);
     const char* expected = "48 89 5C 24 ?? 57 48 83";
+    aob_generator::signature_t empty_sig;
+    std::string empty_formatted = aob_generator::format_signature(empty_sig);
+    size_t wildcard_count = 0;
+    for (const auto& b : sig.bytes) {
+        if (b.wildcard) ++wildcard_count;
+    }
 
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "aob_fmt", "RESULT formatted=\"%s\" expected=\"%s\"", formatted.c_str(), expected);
-    if (formatted == expected) {
-        log_msg(hf, "aob_fmt", "PASS -- format matches source bytes: \"%s\" (elapsed %lld ms)", formatted.c_str(), (long long)ms);
+    long long us = elapsed_us_since(t0);
+    log_msg(hf, "aob_fmt", "RESULT bytes=%zu wildcards=%zu formatted=\"%s\" expected=\"%s\" empty=\"%s\" expected_empty=\"\" elapsed_us=%lld",
+        sig.bytes.size(), wildcard_count, formatted.c_str(), expected, empty_formatted.c_str(), us);
+    if (formatted == expected && empty_formatted.empty() && wildcard_count == 1) {
+        log_msg(hf, "aob_fmt", "PASS -- signature format and empty edge case match expected output elapsed_us=%lld", us);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "aob_fmt", "FAIL -- format \"%s\" != expected \"%s\" (elapsed %lld ms)",
-            formatted.c_str(), expected, (long long)ms);
+        log_msg(hf, "aob_fmt", "FAIL -- format evidence mismatch formatted=\"%s\" expected=\"%s\" empty_len=%zu wildcards=%zu elapsed_us=%lld",
+            formatted.c_str(), expected, empty_formatted.size(), wildcard_count, us);
         failed.fetch_add(1);
     }
 }
@@ -1552,15 +1713,20 @@ static void test_aob_format_ida(HANDLE hf, std::atomic<int>& passed, std::atomic
 
     std::string ida = aob_generator::format_ida_signature(sig);
     const char* expected = "48 8B ? ? 48";
+    aob_generator::signature_t all_wc;
+    all_wc.bytes = {{0x00, true}, {0x00, true}, {0x00, true}};
+    std::string ida_all_wc = aob_generator::format_ida_signature(all_wc);
+    const char* expected_all_wc = "? ? ?";
 
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "aob_ida", "RESULT ida=\"%s\" expected=\"%s\"", ida.c_str(), expected);
-    if (ida == expected) {
-        log_msg(hf, "aob_ida", "PASS -- IDA format matches source bytes: \"%s\" (elapsed %lld ms)", ida.c_str(), (long long)ms);
+    long long us = elapsed_us_since(t0);
+    log_msg(hf, "aob_ida", "RESULT ida=\"%s\" expected=\"%s\" all_wc=\"%s\" expected_all_wc=\"%s\" elapsed_us=%lld",
+        ida.c_str(), expected, ida_all_wc.c_str(), expected_all_wc, us);
+    if (ida == expected && ida_all_wc == expected_all_wc) {
+        log_msg(hf, "aob_ida", "PASS -- IDA format preserves concrete bytes and wildcard-only edge case elapsed_us=%lld", us);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "aob_ida", "FAIL -- IDA format \"%s\" != expected \"%s\" (elapsed %lld ms)",
-            ida.c_str(), expected, (long long)ms);
+        log_msg(hf, "aob_ida", "FAIL -- IDA format mismatch ida=\"%s\" expected=\"%s\" all_wc=\"%s\" expected_all_wc=\"%s\" elapsed_us=%lld",
+            ida.c_str(), expected, ida_all_wc.c_str(), expected_all_wc, us);
         failed.fetch_add(1);
     }
 }
@@ -1579,21 +1745,26 @@ static void test_aob_format_yara(HANDLE hf, std::atomic<int>& passed, std::atomi
     sig.quality_score = aob_generator::compute_quality_score(sig);
 
     std::string yara = aob_generator::format_yara_rule(sig);
+    aob_generator::signature_t unsafe_name = sig;
+    unsafe_name.name = "123 bad-name";
+    std::string sanitized_yara = aob_generator::format_yara_rule(unsafe_name);
 
     bool has_rule = yara.find("rule test_yara_sig") != std::string::npos;
     bool has_bytes = yara.find("48 89 ?? 57") != std::string::npos;
     bool has_cond = yara.find("$pattern") != std::string::npos;
+    bool has_sanitized_rule = sanitized_yara.find("rule sig_123_bad_name") != std::string::npos;
 
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "aob_yara", "RESULT chars=%zu has_rule=%d has_bytes=%d has_cond=%d",
-        yara.size(), static_cast<int>(has_rule), static_cast<int>(has_bytes), static_cast<int>(has_cond));
-    if (has_rule && has_bytes && has_cond) {
-        log_msg(hf, "aob_yara", "PASS -- YARA rule has name, byte pattern and condition (%zu chars) (elapsed %lld ms)",
-            yara.size(), (long long)ms);
+    long long us = elapsed_us_since(t0);
+    log_msg(hf, "aob_yara", "RESULT chars=%zu sanitized_chars=%zu has_rule=%d has_bytes=%d has_cond=%d has_sanitized_rule=%d elapsed_us=%lld",
+        yara.size(), sanitized_yara.size(), static_cast<int>(has_rule), static_cast<int>(has_bytes),
+        static_cast<int>(has_cond), static_cast<int>(has_sanitized_rule), us);
+    if (has_rule && has_bytes && has_cond && has_sanitized_rule) {
+        log_msg(hf, "aob_yara", "PASS -- YARA rule includes name/pattern/condition and sanitizes unsafe names elapsed_us=%lld", us);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "aob_yara", "FAIL -- YARA rule missing expected content (rule=%d bytes=%d cond=%d) (elapsed %lld ms)",
-            static_cast<int>(has_rule), static_cast<int>(has_bytes), static_cast<int>(has_cond), (long long)ms);
+        log_msg(hf, "aob_yara", "FAIL -- YARA rule missing expected content rule=%d bytes=%d cond=%d sanitized=%d elapsed_us=%lld",
+            static_cast<int>(has_rule), static_cast<int>(has_bytes), static_cast<int>(has_cond),
+            static_cast<int>(has_sanitized_rule), us);
         failed.fetch_add(1);
     }
 }
@@ -1611,17 +1782,22 @@ static void test_aob_quality_score(HANDLE hf, std::atomic<int>& passed, std::ato
 
     float score = aob_generator::compute_quality_score(sig);
     const char* grade = aob_generator::score_grade(score);
+    aob_generator::signature_t duplicate_sig = sig;
+    duplicate_sig.uniqueness_count = 4;
+    float duplicate_score = aob_generator::compute_quality_score(duplicate_sig);
+    const char* duplicate_grade = aob_generator::score_grade(duplicate_score);
 
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "aob_qs", "RESULT quality=%.3f grade=%s (32 concrete bytes, unique)",
-        static_cast<double>(score), grade);
-    if (score >= 0.85f && grade[0] == 'A') {
-        log_msg(hf, "aob_qs", "PASS -- 32 unique concrete bytes graded A (quality=%.3f) (elapsed %lld ms)",
-            static_cast<double>(score), (long long)ms);
+    long long us = elapsed_us_since(t0);
+    log_msg(hf, "aob_qs", "RESULT unique_quality=%.3f unique_grade=%s duplicate_quality=%.3f duplicate_grade=%s bytes=%zu unique_count=%d duplicate_count=%d expected_unique_grade=A elapsed_us=%lld",
+        static_cast<double>(score), grade,
+        static_cast<double>(duplicate_score), duplicate_grade,
+        sig.bytes.size(), sig.uniqueness_count, duplicate_sig.uniqueness_count, us);
+    if (score >= 0.85f && grade[0] == 'A' && duplicate_score < score && duplicate_grade[0] != 'A') {
+        log_msg(hf, "aob_qs", "PASS -- unique concrete signature grades high and duplicate penalty lowers score elapsed_us=%lld", us);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "aob_qs", "FAIL -- expected high quality/grade A, got %.3f/%s (elapsed %lld ms)",
-            static_cast<double>(score), grade, (long long)ms);
+        log_msg(hf, "aob_qs", "FAIL -- expected high unique quality and lower duplicate score, got unique %.3f/%s duplicate %.3f/%s elapsed_us=%lld",
+            static_cast<double>(score), grade, static_cast<double>(duplicate_score), duplicate_grade, us);
         failed.fetch_add(1);
     }
 }
@@ -2861,15 +3037,20 @@ static void test_aob_format_code(HANDLE hf, std::atomic<int>& passed, std::atomi
 
     std::string code = aob_generator::format_code_signature(sig);
     const char* expected = "\"\\x48\\x89\\x00\\x57\", \"xx?x\"";
+    aob_generator::signature_t all_wc;
+    all_wc.bytes = {{0x11, true}, {0x22, true}};
+    std::string all_wc_code = aob_generator::format_code_signature(all_wc);
+    const char* expected_all_wc = "\"\\x00\\x00\", \"??\"";
 
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "aob_code", "RESULT code=\"%s\" expected=\"%s\"", code.c_str(), expected);
-    if (code == expected) {
-        log_msg(hf, "aob_code", "PASS -- code format matches source bytes+mask: \"%s\" (elapsed %lld ms)", code.c_str(), (long long)ms);
+    long long us = elapsed_us_since(t0);
+    log_msg(hf, "aob_code", "RESULT code=\"%s\" expected=\"%s\" all_wc=\"%s\" expected_all_wc=\"%s\" elapsed_us=%lld",
+        code.c_str(), expected, all_wc_code.c_str(), expected_all_wc, us);
+    if (code == expected && all_wc_code == expected_all_wc) {
+        log_msg(hf, "aob_code", "PASS -- code pattern/mask format matches source bytes and all-wildcard edge case elapsed_us=%lld", us);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "aob_code", "FAIL -- code format \"%s\" != expected \"%s\" (elapsed %lld ms)",
-            code.c_str(), expected, (long long)ms);
+        log_msg(hf, "aob_code", "FAIL -- code format mismatch code=\"%s\" expected=\"%s\" all_wc=\"%s\" expected_all_wc=\"%s\" elapsed_us=%lld",
+            code.c_str(), expected, all_wc_code.c_str(), expected_all_wc, us);
         failed.fetch_add(1);
     }
 }
@@ -2908,19 +3089,27 @@ static void test_aob_score_grades(HANDLE hf, std::atomic<int>& passed, std::atom
     const char* grade_c = aob_generator::score_grade(0.55f);
     const char* grade_d = aob_generator::score_grade(0.35f);
     const char* grade_f = aob_generator::score_grade(0.10f);
+    const char* grade_a_floor = aob_generator::score_grade(0.85f);
+    const char* grade_b_floor = aob_generator::score_grade(0.70f);
+    const char* grade_c_floor = aob_generator::score_grade(0.50f);
+    const char* grade_d_floor = aob_generator::score_grade(0.30f);
 
     bool ok = (grade_a[0] == 'A' && grade_b[0] == 'B' && grade_c[0] == 'C' &&
-               grade_d[0] == 'D' && grade_f[0] == 'F');
+               grade_d[0] == 'D' && grade_f[0] == 'F' &&
+               grade_a_floor[0] == 'A' && grade_b_floor[0] == 'B' &&
+               grade_c_floor[0] == 'C' && grade_d_floor[0] == 'D');
 
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "aob_grd", "RESULT A=%s B=%s C=%s D=%s F=%s", grade_a, grade_b, grade_c, grade_d, grade_f);
+    long long us = elapsed_us_since(t0);
+    log_msg(hf, "aob_grd", "RESULT sample_grades={0.90:%s,0.75:%s,0.55:%s,0.35:%s,0.10:%s} floors={0.85:%s,0.70:%s,0.50:%s,0.30:%s} expected={A,B,C,D,F,A,B,C,D} elapsed_us=%lld",
+        grade_a, grade_b, grade_c, grade_d, grade_f,
+        grade_a_floor, grade_b_floor, grade_c_floor, grade_d_floor, us);
     if (ok) {
-        log_msg(hf, "aob_grd", "PASS -- grade boundaries: A=%s B=%s C=%s D=%s F=%s (elapsed %lld ms)",
-            grade_a, grade_b, grade_c, grade_d, grade_f, (long long)ms);
+        log_msg(hf, "aob_grd", "PASS -- grade samples and boundary floors match expected mapping elapsed_us=%lld", us);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "aob_grd", "FAIL -- unexpected grade mapping A=%s B=%s C=%s D=%s F=%s (elapsed %lld ms)",
-            grade_a, grade_b, grade_c, grade_d, grade_f, (long long)ms);
+        log_msg(hf, "aob_grd", "FAIL -- unexpected grade mapping samples={%s,%s,%s,%s,%s} floors={%s,%s,%s,%s} elapsed_us=%lld",
+            grade_a, grade_b, grade_c, grade_d, grade_f,
+            grade_a_floor, grade_b_floor, grade_c_floor, grade_d_floor, us);
         failed.fetch_add(1);
     }
 }
@@ -2936,14 +3125,18 @@ static void test_aob_quality_all_wildcards(HANDLE hf, std::atomic<int>& passed, 
     }
 
     float score = aob_generator::compute_quality_score(sig);
+    const char* grade = aob_generator::score_grade(score);
+    std::string signature_text = aob_generator::format_signature(sig);
 
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "aob_qaw", "RESULT quality=%.3f (expected ~0 for all-wildcard)", static_cast<double>(score));
-    if (score < 0.01f) {
-        log_msg(hf, "aob_qaw", "PASS -- all-wildcard quality=%.3f (~0) (elapsed %lld ms)", static_cast<double>(score), (long long)ms);
+    long long us = elapsed_us_since(t0);
+    log_msg(hf, "aob_qaw", "RESULT bytes=%zu formatted=\"%s\" quality=%.3f grade=%s expected_quality=0 expected_grade=F elapsed_us=%lld",
+        sig.bytes.size(), signature_text.c_str(), static_cast<double>(score), grade, us);
+    if (score == 0.f && grade[0] == 'F' && signature_text.find("??") != std::string::npos) {
+        log_msg(hf, "aob_qaw", "PASS -- all-wildcard quality is zero and grade F with wildcard output elapsed_us=%lld", us);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "aob_qaw", "FAIL -- all-wildcard quality=%.3f should be ~0 (elapsed %lld ms)", static_cast<double>(score), (long long)ms);
+        log_msg(hf, "aob_qaw", "FAIL -- all-wildcard evidence mismatch quality=%.3f grade=%s formatted=\"%s\" elapsed_us=%lld",
+            static_cast<double>(score), grade, signature_text.c_str(), us);
         failed.fetch_add(1);
     }
 }

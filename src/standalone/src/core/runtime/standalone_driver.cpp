@@ -719,13 +719,14 @@ namespace
             return false;
         }
         copy_bridge_context(ctx, native);
-        bool sane = ctx.rip != 0 && ctx.rsp != 0;
+        bool sane = ctx.rip != 0 && ctx.rsp != 0 && ctx.rflags != 0;
         diag::log_tagged_fmt("driver",
-            "%s user_getctx_ok tid=%u rip=0x%llX rsp=0x%llX dr7=0x%llX suspend_prev=%lu resume_prev=%lu sane=%d",
+            "%s user_getctx_ok tid=%u rip=0x%llX rsp=0x%llX rflags=0x%llX dr7=0x%llX suspend_prev=%lu resume_prev=%lu sane=%d",
             source ? source : "thread",
             tid,
             static_cast<unsigned long long>(ctx.rip),
             static_cast<unsigned long long>(ctx.rsp),
+            static_cast<unsigned long long>(ctx.rflags),
             static_cast<unsigned long long>(ctx.dr7),
             prev,
             resume_prev,
@@ -3482,14 +3483,16 @@ namespace driver_bridge
         ctx.cs  = kctx.cs;   ctx.ss  = kctx.ss;
         ctx.dr0 = kctx.dr0;  ctx.dr1 = kctx.dr1;  ctx.dr2 = kctx.dr2;  ctx.dr3 = kctx.dr3;
         ctx.dr6 = kctx.dr6;  ctx.dr7 = kctx.dr7;
-        if (ctx.rip == 0 || ctx.rsp == 0) {
+        if (ctx.rip == 0 || ctx.rsp == 0 || ctx.rflags == 0) {
             diag::log_tagged_fmt("driver",
-                "get_thread_context_REJECTED_ZERO tid=%u rip=0x%llX rsp=0x%llX fallback=user",
+                "get_thread_context_REJECTED_ZERO tid=%u rip=0x%llX rsp=0x%llX rflags=0x%llX fallback=user",
                 tid,
                 static_cast<unsigned long long>(ctx.rip),
-                static_cast<unsigned long long>(ctx.rsp));
+                static_cast<unsigned long long>(ctx.rsp),
+                static_cast<unsigned long long>(ctx.rflags));
             if (usermode_get_thread_context(tid, ctx, "get_thread_context.zero_kernel"))
                 return true;
+            SetLastError(ERROR_INVALID_DATA);
             return false;
         }
         diag::log_tagged_fmt("driver",

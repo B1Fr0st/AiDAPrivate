@@ -342,14 +342,22 @@ void run_audit(std::shared_ptr<audit_runtime_t> rt_ptr)
     {
         std::lock_guard<std::mutex> lk(rt_ptr->status_mtx);
         rt_ptr->status.running = false;
-        rt_ptr->status.cancelled = rt_ptr->cancel_flag.load();
+        const bool cancel_requested = rt_ptr->cancel_flag.load();
+        rt_ptr->status.cancel_requested = rt_ptr->status.cancel_requested || cancel_requested;
+        rt_ptr->status.cancelled = cancel_requested;
+        rt_ptr->status.drained = rt_ptr->active_workers.load(std::memory_order_acquire) == 0 &&
+                                 rt_ptr->in_flight.load(std::memory_order_acquire) == 0;
         rt_ptr->status.ended_ms = now_ms();
     }
     rt_ptr->cancel_cv.notify_all();
-    diag::log_tagged_fmt("burp", "active_scanner audit_end id=%llu issues=%zu cancelled=%d",
+    diag::log_tagged_fmt("burp", "active_scanner audit_end id=%llu issues=%zu cancelled=%d cancel_requested=%d drained=%d active_workers=%zu in_flight=%zu",
         static_cast<unsigned long long>(rt_ptr->status.id),
         rt_ptr->status.issues_found,
-        rt_ptr->status.cancelled ? 1 : 0);
+        rt_ptr->status.cancelled ? 1 : 0,
+        rt_ptr->status.cancel_requested ? 1 : 0,
+        rt_ptr->status.drained ? 1 : 0,
+        rt_ptr->active_workers.load(std::memory_order_acquire),
+        rt_ptr->in_flight.load(std::memory_order_acquire));
 }
 
 }
@@ -491,6 +499,8 @@ uint64_t enqueue_target(const std::vector<uint8_t>& raw_request,
             std::lock_guard<std::mutex> lk(rt->status_mtx);
             rt->status.running = false;
             rt->status.cancelled = true;
+            rt->status.cancel_requested = true;
+            rt->status.drained = true;
             rt->status.ended_ms = now_ms();
         }
         rt->cancel_flag.store(true, std::memory_order_release);
@@ -522,6 +532,10 @@ bool cancel_audit(uint64_t audit_id)
         rt = it->second;
     }
     rt->cancel_flag.store(true);
+    {
+        std::lock_guard<std::mutex> lk(rt->status_mtx);
+        rt->status.cancel_requested = true;
+    }
     rt->cancel_cv.notify_all();
     diag::log_tagged_fmt("scanner", "cancel_audit id=%llu cancel_flag_set", static_cast<unsigned long long>(audit_id));
     return true;
@@ -555,6 +569,10 @@ bool wait_for_audit_idle(uint64_t audit_id, uint32_t timeout_ms)
             running = rt->status.running;
         }
         if (!running && active_workers == 0 && in_flight == 0) {
+            {
+                std::lock_guard<std::mutex> lk(rt->status_mtx);
+                rt->status.drained = true;
+            }
             diag::log_tagged_fmt("scanner", "wait_for_audit_idle id=%llu idle",
                 static_cast<unsigned long long>(audit_id));
             return true;
@@ -582,8 +600,17 @@ std::vector<audit_status_t> list_audits()
         for (auto& kv : s.audits) alive.push_back(kv.second);
     }
     for (auto& rt : alive) {
+        const size_t active_workers = rt->active_workers.load(std::memory_order_acquire);
+        const size_t in_flight = rt->in_flight.load(std::memory_order_acquire);
         std::lock_guard<std::mutex> lk(rt->status_mtx);
-        out.push_back(rt->status);
+        audit_status_t st = rt->status;
+        st.cancel_requested = st.cancel_requested || rt->cancel_flag.load(std::memory_order_acquire);
+        st.drained = !st.running && active_workers == 0 && in_flight == 0;
+        if (st.cancel_requested)
+            rt->status.cancel_requested = true;
+        if (st.drained)
+            rt->status.drained = true;
+        out.push_back(std::move(st));
     }
     std::sort(out.begin(), out.end(), [](const audit_status_t& a, const audit_status_t& b) {
         return a.started_ms > b.started_ms;
@@ -605,11 +632,23 @@ bool get_status(uint64_t audit_id, audit_status_t& out)
         }
         rt = it->second;
     }
+    const size_t active_workers = rt->active_workers.load(std::memory_order_acquire);
+    const size_t in_flight = rt->in_flight.load(std::memory_order_acquire);
     std::lock_guard<std::mutex> lk(rt->status_mtx);
     out = rt->status;
-    diag::log_tagged_fmt("scanner", "get_status id=%llu running=%d issues=%zu completed=%zu total=%zu",
+    out.cancel_requested = out.cancel_requested || rt->cancel_flag.load(std::memory_order_acquire);
+    out.drained = !out.running && active_workers == 0 && in_flight == 0;
+    if (out.drained)
+        rt->status.drained = true;
+    if (out.cancel_requested)
+        rt->status.cancel_requested = true;
+    diag::log_tagged_fmt("scanner", "get_status id=%llu running=%d issues=%zu completed=%zu total=%zu cancel_requested=%d drained=%d active_workers=%zu in_flight=%zu",
         static_cast<unsigned long long>(audit_id), out.running ? 1 : 0,
-        out.issues_found, out.completed_probes, out.total_probes);
+        out.issues_found, out.completed_probes, out.total_probes,
+        out.cancel_requested ? 1 : 0,
+        out.drained ? 1 : 0,
+        active_workers,
+        in_flight);
     return true;
 }
 

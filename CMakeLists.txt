@@ -2830,7 +2830,7 @@ if(BUILD_PROTECTOR)
         add_custom_command(TARGET AiDA_NetworkHookSidecar_Protected POST_BUILD
             COMMAND ${CMAKE_COMMAND}
                 "-DRETRY_LABEL=AiDA_NetworkHookSidecar_Protected.exe-protect"
-                "-DRETRY_CMD=$<TARGET_FILE:AiDAProtector>;--input;$<TARGET_FILE:AiDA_NetworkHookSidecar_Protected>;--output;$<TARGET_FILE:AiDA_NetworkHookSidecar_Protected>;--all;--no-encrypt-imports;--tamper-level;2;--no-llm-poison;--verbose"
+                "-DRETRY_CMD=$<TARGET_FILE:AiDAProtector>;--input;$<TARGET_FILE:AiDA_NetworkHookSidecar_Protected>;--output;$<TARGET_FILE:AiDA_NetworkHookSidecar_Protected>;--all;--no-encrypt-imports;--tamper-level;2;--verbose"
                 -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
             COMMENT "Protecting AiDA_NetworkHookSidecar_Protected.exe..."
             VERBATIM
@@ -2997,7 +2997,7 @@ if(BUILD_PROTECTOR)
                          --output ${CMAKE_BINARY_DIR}/Release/protector_report.json
                          --protector $<TARGET_FILE:AiDAProtector>)
         set_tests_properties(protector_full_matrix PROPERTIES
-            PASS_REGULAR_EXPRESSION "\"probes_passed\": 27")
+            PASS_REGULAR_EXPRESSION "\"probes_passed\": 31")
     endif()
 
     option(BUILD_WBAES_TEST "Build white-box AES-128 self-test executable" ON)
@@ -3027,7 +3027,7 @@ if(BUILD_PROTECTOR)
         add_custom_command(TARGET AiDAStandalone POST_BUILD
             COMMAND ${CMAKE_COMMAND}
                 "-DRETRY_LABEL=AiDAStandalone.exe-protect"
-                "-DRETRY_CMD=$<TARGET_FILE:AiDAProtector>;--input;$<TARGET_FILE:AiDAStandalone>;--output;$<TARGET_FILE:AiDAStandalone>;--all;--no-encrypt-imports;--tamper-level;3;--jit;--no-llm-poison;--verbose"
+                "-DRETRY_CMD=$<TARGET_FILE:AiDAProtector>;--input;$<TARGET_FILE:AiDAStandalone>;--output;$<TARGET_FILE:AiDAStandalone>;--all;--no-encrypt-imports;--tamper-level;3;--jit;--verbose"
                 -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
             COMMENT "Protecting AiDAStandalone.exe (with AV/indexer retry)..."
             VERBATIM
@@ -3053,7 +3053,7 @@ if(BUILD_PROTECTOR)
             add_custom_command(TARGET AiDA_ARC POST_BUILD
                 COMMAND ${CMAKE_COMMAND}
                     "-DRETRY_LABEL=aida_core.dll-protect"
-                    "-DRETRY_CMD=$<TARGET_FILE:AiDAProtector>;--input;$<TARGET_FILE:AiDA_ARC>;--output;$<TARGET_FILE:AiDA_ARC>;--all;--tamper-level;2;--deep-steal;--jit;--no-llm-poison;--target-arc;--watermark;${AIDA_ARC_WATERMARK};--embed-watermark;--verbose"
+                    "-DRETRY_CMD=$<TARGET_FILE:AiDAProtector>;--input;$<TARGET_FILE:AiDA_ARC>;--output;$<TARGET_FILE:AiDA_ARC>;--all;--tamper-level;2;--deep-steal;--jit;--target-arc;--watermark;${AIDA_ARC_WATERMARK};--embed-watermark;--verbose"
                     -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
                 COMMENT "Protecting aida_core.dll (target-arc, encrypt-imports ON, with AV/indexer retry)..."
                 VERBATIM
@@ -3062,7 +3062,7 @@ if(BUILD_PROTECTOR)
             add_custom_command(TARGET AiDA_ARC POST_BUILD
                 COMMAND ${CMAKE_COMMAND}
                     "-DRETRY_LABEL=aida_core.dll-protect"
-                    "-DRETRY_CMD=$<TARGET_FILE:AiDAProtector>;--input;$<TARGET_FILE:AiDA_ARC>;--output;$<TARGET_FILE:AiDA_ARC>;--all;--no-encrypt-imports;--tamper-level;2;--deep-steal;--jit;--no-llm-poison;--target-arc;--watermark;${AIDA_ARC_WATERMARK};--embed-watermark;--verbose"
+                    "-DRETRY_CMD=$<TARGET_FILE:AiDAProtector>;--input;$<TARGET_FILE:AiDA_ARC>;--output;$<TARGET_FILE:AiDA_ARC>;--all;--no-encrypt-imports;--tamper-level;2;--deep-steal;--jit;--target-arc;--watermark;${AIDA_ARC_WATERMARK};--embed-watermark;--verbose"
                     -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
                 COMMENT "Protecting aida_core.dll (target-arc, encrypt-imports OFF, with AV/indexer retry)..."
                 VERBATIM
@@ -3086,7 +3086,7 @@ if(BUILD_PROTECTOR)
         add_custom_command(TARGET AiDA POST_BUILD
             COMMAND ${CMAKE_COMMAND}
                 "-DRETRY_LABEL=AiDA.dll-protect"
-                "-DRETRY_CMD=$<TARGET_FILE:AiDAProtector>;--input;$<TARGET_FILE:AiDA>;--output;$<TARGET_FILE:AiDA>;--all;--no-encrypt-imports;--tamper-level;2;--no-jit;--no-llm-poison;--preserve-loader-relocations;--verbose"
+                "-DRETRY_CMD=$<TARGET_FILE:AiDAProtector>;--input;$<TARGET_FILE:AiDA>;--output;$<TARGET_FILE:AiDA>;--all;--no-encrypt-imports;--tamper-level;2;--no-jit;--preserve-loader-relocations;--verbose"
                 -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
             COMMENT "Protecting AiDA.dll (with AV/indexer retry)..."
             VERBATIM

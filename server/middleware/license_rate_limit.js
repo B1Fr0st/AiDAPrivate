@@ -6,9 +6,17 @@ const MINUTE_SECONDS = 60;
 const HOUR_SECONDS = 3600;
 const DAY_SECONDS = 86400;
 
-const DEFAULT_PER_MINUTE = parseInt(process.env.LICENSE_RL_PER_MINUTE || '30', 10) || 30;
-const DEFAULT_PER_HOUR = parseInt(process.env.LICENSE_RL_PER_HOUR || '100', 10) || 100;
-const DEFAULT_PER_DAY = parseInt(process.env.LICENSE_RL_PER_DAY || '500', 10) || 500;
+function parseLimit(name, fallback) {
+    const value = parseInt(process.env[name] || String(fallback), 10);
+    return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+const DEFAULT_PER_MINUTE = parseLimit('LICENSE_RL_PER_MINUTE', 30);
+const DEFAULT_PER_HOUR = parseLimit('LICENSE_RL_PER_HOUR', 100);
+const DEFAULT_PER_DAY = parseLimit('LICENSE_RL_PER_DAY', 500);
+const DEFAULT_HEARTBEAT_PER_MINUTE = parseLimit('LICENSE_HEARTBEAT_RL_PER_MINUTE', 8);
+const DEFAULT_HEARTBEAT_PER_HOUR = parseLimit('LICENSE_HEARTBEAT_RL_PER_HOUR', 420);
+const DEFAULT_HEARTBEAT_PER_DAY = parseLimit('LICENSE_HEARTBEAT_RL_PER_DAY', 7500);
 
 let s_last_purge_at = 0;
 
@@ -50,6 +58,20 @@ async function bumpAndCheckWindow(licenseKey, kind, now, limit) {
     return { current, limit, exceeded: current > limit, window_start: windowStart };
 }
 
+function normalizeBucket(value) {
+    if (typeof value !== 'string')
+        return 'default';
+    const bucket = value.trim().toLowerCase();
+    if (!/^[a-z0-9_.:-]{1,32}$/.test(bucket))
+        return 'default';
+    return bucket;
+}
+
+function rateKeyFor(licenseKey, bucket) {
+    const normalizedBucket = normalizeBucket(bucket);
+    return normalizedBucket === 'default' ? licenseKey : `${licenseKey}|${normalizedBucket}`;
+}
+
 async function check(licenseKey, options) {
     if (!licenseKey || typeof licenseKey !== 'string') {
         return { ok: true, skipped: true };
@@ -58,6 +80,8 @@ async function check(licenseKey, options) {
     const perMinute = Number.isFinite(opts.per_minute) ? opts.per_minute : DEFAULT_PER_MINUTE;
     const perHour = Number.isFinite(opts.per_hour) ? opts.per_hour : DEFAULT_PER_HOUR;
     const perDay = Number.isFinite(opts.per_day) ? opts.per_day : DEFAULT_PER_DAY;
+    const bucket = normalizeBucket(opts.bucket);
+    const rateKey = rateKeyFor(licenseKey, bucket);
 
     const now = Math.floor(Date.now() / 1000);
     if (now - s_last_purge_at > 300) {
@@ -66,34 +90,37 @@ async function check(licenseKey, options) {
     }
 
     try {
-        const minute = await bumpAndCheckWindow(licenseKey, 'minute', now, perMinute);
+        const minute = await bumpAndCheckWindow(rateKey, 'minute', now, perMinute);
         if (minute.exceeded) {
             return {
                 ok: false,
                 reason: 'rate_limited',
                 scope: 'minute',
+                bucket,
                 retry_after: Math.max(1, (minute.window_start + MINUTE_SECONDS) - now),
             };
         }
-        const hour = await bumpAndCheckWindow(licenseKey, 'hour', now, perHour);
+        const hour = await bumpAndCheckWindow(rateKey, 'hour', now, perHour);
         if (hour.exceeded) {
             return {
                 ok: false,
                 reason: 'rate_limited',
                 scope: 'hour',
+                bucket,
                 retry_after: Math.max(1, (hour.window_start + HOUR_SECONDS) - now),
             };
         }
-        const day = await bumpAndCheckWindow(licenseKey, 'day', now, perDay);
+        const day = await bumpAndCheckWindow(rateKey, 'day', now, perDay);
         if (day.exceeded) {
             return {
                 ok: false,
                 reason: 'rate_limited',
                 scope: 'day',
+                bucket,
                 retry_after: Math.max(1, (day.window_start + DAY_SECONDS) - now),
             };
         }
-        return { ok: true, minute: minute.current, hour: hour.current, day: day.current };
+        return { ok: true, bucket, minute: minute.current, hour: hour.current, day: day.current };
     } catch (err) {
         console.warn('[license_rate_limit] check failed:', err && err.message ? err.message : err);
         if (opts.fail_closed) {
@@ -106,7 +133,11 @@ async function check(licenseKey, options) {
 module.exports = {
     check,
     purgeExpired,
+    rateKeyFor,
     DEFAULT_PER_MINUTE,
     DEFAULT_PER_HOUR,
     DEFAULT_PER_DAY,
+    DEFAULT_HEARTBEAT_PER_MINUTE,
+    DEFAULT_HEARTBEAT_PER_HOUR,
+    DEFAULT_HEARTBEAT_PER_DAY,
 };

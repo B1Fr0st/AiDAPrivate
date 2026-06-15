@@ -14,7 +14,7 @@
 #include <array>
 #include <algorithm>
 #include <random>
-#include <asmjit/asmjit.h>
+#include <asmjit/x86.h>
 #include "stub.hpp"
 #include "payload_blob.hpp"
 

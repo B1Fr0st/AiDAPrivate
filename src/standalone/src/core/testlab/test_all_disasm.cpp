@@ -57,6 +57,52 @@ namespace {
             std::chrono::steady_clock::now() - t0).count());
     }
 
+    struct expr_eval_case_t {
+        const char* label;
+        const char* expression;
+        uint64_t expected;
+    };
+
+    bool run_expr_cases(HANDLE hf, const char* tag, const expression_eval::context_t& ctx,
+                        const expr_eval_case_t* cases, size_t case_count, long long& total_us) {
+        bool all_ok = true;
+        for (size_t i = 0; i < case_count; ++i) {
+            auto t0 = std::chrono::steady_clock::now();
+            log_msg(hf, tag, "INPUT -- case=%zu label=\"%s\" expr=\"%s\" expected=0x%llX ctx={rax=0x%llX rbx=0x%llX rcx=0x%llX rdx=0x%llX rip=0x%llX rflags=0x%llX}",
+                i,
+                cases[i].label,
+                cases[i].expression,
+                (unsigned long long)cases[i].expected,
+                (unsigned long long)ctx.rax,
+                (unsigned long long)ctx.rbx,
+                (unsigned long long)ctx.rcx,
+                (unsigned long long)ctx.rdx,
+                (unsigned long long)ctx.rip,
+                (unsigned long long)ctx.rflags);
+            auto r = expression_eval::evaluate(cases[i].expression, ctx);
+            long long case_us = elapsed_us_since(t0);
+            total_us += case_us;
+            bool matched = r.ok && r.value == cases[i].expected;
+            log_msg(hf, tag, "OUTPUT -- case=%zu ok=%d value=0x%llX expected=0x%llX matched=%d err=\"%s\" elapsed_us=%lld",
+                i,
+                (int)r.ok,
+                (unsigned long long)r.value,
+                (unsigned long long)cases[i].expected,
+                matched ? 1 : 0,
+                r.error.c_str(),
+                case_us);
+            if (!matched)
+                all_ok = false;
+        }
+        return all_ok;
+    }
+
+    template <size_t N>
+    bool run_expr_cases(HANDLE hf, const char* tag, const expression_eval::context_t& ctx,
+                        const expr_eval_case_t (&cases)[N], long long& total_us) {
+        return run_expr_cases(hf, tag, ctx, cases, N, total_us);
+    }
+
     const char* addr_format_name(disasm_view::addr_format_t value) {
         switch (value) {
         case disasm_view::addr_format_t::va: return "va";
@@ -1308,70 +1354,78 @@ namespace {
 
     void test_expr_hex_add(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "expr.hex_add";
+        (void)skipped;
         expression_eval::context_t ctx{};
-        log_msg(hf, tag, "INPUT -- evaluate(\"0x1000 + 0x200\") expected=0x1200");
-        auto r = expression_eval::evaluate("0x1000 + 0x200", ctx);
-        log_msg(hf, tag, "OUTPUT -- ok=%d value=0x%llX err=\"%s\"",
-            (int)r.ok, (unsigned long long)r.value, r.error.c_str());
-        if (r.ok && r.value == 0x1200) {
-            log_msg(hf, tag, "PASS -- 0x1000 + 0x200 = 0x%llX", (unsigned long long)r.value);
+        const expr_eval_case_t cases[] = {
+            {"hex_plus_hex", "0x1000 + 0x200", 0x1200},
+            {"zero_plus_hex", "0 + 0x2A", 0x2A},
+            {"carry_boundary", "0x7FFF + 1", 0x8000},
+        };
+        long long total_us = 0;
+        if (run_expr_cases(hf, tag, ctx, cases, total_us)) {
+            log_msg(hf, tag, "PASS -- %zu addition cases matched expected outputs elapsed_us=%lld", sizeof(cases) / sizeof(cases[0]), total_us);
             passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "FAIL -- expected 0x1200, got ok=%d value=0x%llX err=\"%s\"",
-                (int)r.ok, (unsigned long long)r.value, r.error.c_str());
+            log_msg(hf, tag, "FAIL -- one or more addition cases mismatched elapsed_us=%lld", total_us);
             failed.fetch_add(1);
         }
     }
 
     void test_expr_bitwise_and(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "expr.bitwise_and";
+        (void)skipped;
         expression_eval::context_t ctx{};
-        log_msg(hf, tag, "INPUT -- evaluate(\"0xFF & 0x0F\") expected=0x0F");
-        auto r = expression_eval::evaluate("0xFF & 0x0F", ctx);
-        log_msg(hf, tag, "OUTPUT -- ok=%d value=0x%llX err=\"%s\"",
-            (int)r.ok, (unsigned long long)r.value, r.error.c_str());
-        if (r.ok && r.value == 0x0F) {
-            log_msg(hf, tag, "PASS -- 0xFF & 0x0F = 0x%llX", (unsigned long long)r.value);
+        const expr_eval_case_t cases[] = {
+            {"low_nibble", "0xFF & 0x0F", 0x0F},
+            {"alternating_mask", "0xAA55 & 0x0F0F", 0x0A05},
+            {"zero_mask", "0x1234 & 0", 0},
+        };
+        long long total_us = 0;
+        if (run_expr_cases(hf, tag, ctx, cases, total_us)) {
+            log_msg(hf, tag, "PASS -- %zu bitwise-and cases matched expected outputs elapsed_us=%lld", sizeof(cases) / sizeof(cases[0]), total_us);
             passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "FAIL -- expected 0x0F, got ok=%d value=0x%llX err=\"%s\"",
-                (int)r.ok, (unsigned long long)r.value, r.error.c_str());
+            log_msg(hf, tag, "FAIL -- one or more bitwise-and cases mismatched elapsed_us=%lld", total_us);
             failed.fetch_add(1);
         }
     }
 
     void test_expr_hex_multiply(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "expr.hex_mul";
+        (void)skipped;
         expression_eval::context_t ctx{};
-        log_msg(hf, tag, "INPUT -- evaluate(\"0x10 * 0x10\") expected=0x100");
-        auto r = expression_eval::evaluate("0x10 * 0x10", ctx);
-        log_msg(hf, tag, "OUTPUT -- ok=%d value=0x%llX err=\"%s\"",
-            (int)r.ok, (unsigned long long)r.value, r.error.c_str());
-        if (r.ok && r.value == 0x100) {
-            log_msg(hf, tag, "PASS -- 0x10 * 0x10 = 0x%llX", (unsigned long long)r.value);
+        const expr_eval_case_t cases[] = {
+            {"hex_square", "0x10 * 0x10", 0x100},
+            {"multiply_by_zero", "0x123 * 0", 0},
+            {"decimal_product", "7 * 9", 63},
+        };
+        long long total_us = 0;
+        if (run_expr_cases(hf, tag, ctx, cases, total_us)) {
+            log_msg(hf, tag, "PASS -- %zu multiplication cases matched expected outputs elapsed_us=%lld", sizeof(cases) / sizeof(cases[0]), total_us);
             passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "FAIL -- expected 0x100, got ok=%d value=0x%llX err=\"%s\"",
-                (int)r.ok, (unsigned long long)r.value, r.error.c_str());
+            log_msg(hf, tag, "FAIL -- one or more multiplication cases mismatched elapsed_us=%lld", total_us);
             failed.fetch_add(1);
         }
     }
 
     void test_expr_with_registers(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "expr.registers";
+        (void)skipped;
         expression_eval::context_t ctx{};
         ctx.rax = 0x1000;
         ctx.rbx = 0x200;
-        log_msg(hf, tag, "INPUT -- evaluate(\"rax + rbx\") rax=0x1000 rbx=0x200 expected=0x1200");
-        auto r = expression_eval::evaluate("rax + rbx", ctx);
-        log_msg(hf, tag, "OUTPUT -- ok=%d value=0x%llX err=\"%s\"",
-            (int)r.ok, (unsigned long long)r.value, r.error.c_str());
-        if (r.ok && r.value == 0x1200) {
-            log_msg(hf, tag, "PASS -- rax(0x1000) + rbx(0x200) = 0x%llX", (unsigned long long)r.value);
+        const expr_eval_case_t cases[] = {
+            {"register_add", "rax + rbx", 0x1200},
+            {"register_sub_then_add", "(rax - rbx) + 0x10", 0xE10},
+            {"register_bitwise_or", "rax | rbx", 0x1200},
+        };
+        long long total_us = 0;
+        if (run_expr_cases(hf, tag, ctx, cases, total_us)) {
+            log_msg(hf, tag, "PASS -- %zu register expression cases matched expected outputs elapsed_us=%lld", sizeof(cases) / sizeof(cases[0]), total_us);
             passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "FAIL -- expected 0x1200, got ok=%d value=0x%llX err=\"%s\"",
-                (int)r.ok, (unsigned long long)r.value, r.error.c_str());
+            log_msg(hf, tag, "FAIL -- one or more register expression cases mismatched elapsed_us=%lld", total_us);
             failed.fetch_add(1);
         }
     }
@@ -2161,142 +2215,157 @@ namespace {
 
     void test_expr_subtraction(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "expr.sub";
+        (void)skipped;
         expression_eval::context_t ctx{};
-        log_msg(hf, tag, "INPUT -- evaluate(\"0x2000 - 0x100\") expected=0x1F00");
-        auto r = expression_eval::evaluate("0x2000 - 0x100", ctx);
-        log_msg(hf, tag, "OUTPUT -- ok=%d value=0x%llX err=\"%s\"",
-            (int)r.ok, (unsigned long long)r.value, r.error.c_str());
-        if (r.ok && r.value == 0x1F00) {
-            log_msg(hf, tag, "PASS -- 0x2000 - 0x100 = 0x%llX", (unsigned long long)r.value);
+        const expr_eval_case_t cases[] = {
+            {"hex_minus_hex", "0x2000 - 0x100", 0x1F00},
+            {"subtract_to_zero", "0x100 - 0x100", 0},
+            {"mixed_add_sub", "0x100 + 0x20 - 0x10", 0x110},
+        };
+        long long total_us = 0;
+        if (run_expr_cases(hf, tag, ctx, cases, total_us)) {
+            log_msg(hf, tag, "PASS -- %zu subtraction cases matched expected outputs elapsed_us=%lld", sizeof(cases) / sizeof(cases[0]), total_us);
             passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "FAIL -- expected 0x1F00, got ok=%d value=0x%llX",
-                (int)r.ok, (unsigned long long)r.value);
+            log_msg(hf, tag, "FAIL -- one or more subtraction cases mismatched elapsed_us=%lld", total_us);
             failed.fetch_add(1);
         }
     }
 
     void test_expr_bitwise_or(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "expr.bitwise_or";
+        (void)skipped;
         expression_eval::context_t ctx{};
-        log_msg(hf, tag, "INPUT -- evaluate(\"0xF0 | 0x0F\") expected=0xFF");
-        auto r = expression_eval::evaluate("0xF0 | 0x0F", ctx);
-        log_msg(hf, tag, "OUTPUT -- ok=%d value=0x%llX err=\"%s\"",
-            (int)r.ok, (unsigned long long)r.value, r.error.c_str());
-        if (r.ok && r.value == 0xFF) {
-            log_msg(hf, tag, "PASS -- 0xF0 | 0x0F = 0x%llX", (unsigned long long)r.value);
+        const expr_eval_case_t cases[] = {
+            {"merge_nibbles", "0xF0 | 0x0F", 0xFF},
+            {"preserve_high_bit", "0x8000 | 0x7", 0x8007},
+            {"idempotent_or", "0x1234 | 0x1234", 0x1234},
+        };
+        long long total_us = 0;
+        if (run_expr_cases(hf, tag, ctx, cases, total_us)) {
+            log_msg(hf, tag, "PASS -- %zu bitwise-or cases matched expected outputs elapsed_us=%lld", sizeof(cases) / sizeof(cases[0]), total_us);
             passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "FAIL -- expected 0xFF, got ok=%d value=0x%llX",
-                (int)r.ok, (unsigned long long)r.value);
+            log_msg(hf, tag, "FAIL -- one or more bitwise-or cases mismatched elapsed_us=%lld", total_us);
             failed.fetch_add(1);
         }
     }
 
     void test_expr_bitwise_xor(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "expr.bitwise_xor";
+        (void)skipped;
         expression_eval::context_t ctx{};
-        log_msg(hf, tag, "INPUT -- evaluate(\"0xFF ^ 0xAA\") expected=0x55");
-        auto r = expression_eval::evaluate("0xFF ^ 0xAA", ctx);
-        log_msg(hf, tag, "OUTPUT -- ok=%d value=0x%llX err=\"%s\"",
-            (int)r.ok, (unsigned long long)r.value, r.error.c_str());
-        if (r.ok && r.value == 0x55) {
-            log_msg(hf, tag, "PASS -- 0xFF ^ 0xAA = 0x%llX", (unsigned long long)r.value);
+        const expr_eval_case_t cases[] = {
+            {"xor_mask", "0xFF ^ 0xAA", 0x55},
+            {"xor_word", "0xFFFF ^ 0x0F0F", 0xF0F0},
+            {"xor_self", "0x12345678 ^ 0x12345678", 0},
+        };
+        long long total_us = 0;
+        if (run_expr_cases(hf, tag, ctx, cases, total_us)) {
+            log_msg(hf, tag, "PASS -- %zu bitwise-xor cases matched expected outputs elapsed_us=%lld", sizeof(cases) / sizeof(cases[0]), total_us);
             passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "FAIL -- expected 0x55, got ok=%d value=0x%llX",
-                (int)r.ok, (unsigned long long)r.value);
+            log_msg(hf, tag, "FAIL -- one or more bitwise-xor cases mismatched elapsed_us=%lld", total_us);
             failed.fetch_add(1);
         }
     }
 
     void test_expr_shift_left(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "expr.shl";
+        (void)skipped;
         expression_eval::context_t ctx{};
-        log_msg(hf, tag, "INPUT -- evaluate(\"1 << 16\") expected=0x10000");
-        auto r = expression_eval::evaluate("1 << 16", ctx);
-        log_msg(hf, tag, "OUTPUT -- ok=%d value=0x%llX err=\"%s\"",
-            (int)r.ok, (unsigned long long)r.value, r.error.c_str());
-        if (r.ok && r.value == 0x10000) {
-            log_msg(hf, tag, "PASS -- 1 << 16 = 0x%llX", (unsigned long long)r.value);
+        const expr_eval_case_t cases[] = {
+            {"bit_16", "1 << 16", 0x10000},
+            {"nibble_shift", "0x3 << 4", 0x30},
+            {"zero_shift", "0x1234 << 0", 0x1234},
+        };
+        long long total_us = 0;
+        if (run_expr_cases(hf, tag, ctx, cases, total_us)) {
+            log_msg(hf, tag, "PASS -- %zu shift-left cases matched expected outputs elapsed_us=%lld", sizeof(cases) / sizeof(cases[0]), total_us);
             passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "FAIL -- expected 0x10000, got ok=%d value=0x%llX",
-                (int)r.ok, (unsigned long long)r.value);
+            log_msg(hf, tag, "FAIL -- one or more shift-left cases mismatched elapsed_us=%lld", total_us);
             failed.fetch_add(1);
         }
     }
 
     void test_expr_shift_right(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "expr.shr";
+        (void)skipped;
         expression_eval::context_t ctx{};
-        log_msg(hf, tag, "INPUT -- evaluate(\"0x10000 >> 8\") expected=0x100");
-        auto r = expression_eval::evaluate("0x10000 >> 8", ctx);
-        log_msg(hf, tag, "OUTPUT -- ok=%d value=0x%llX err=\"%s\"",
-            (int)r.ok, (unsigned long long)r.value, r.error.c_str());
-        if (r.ok && r.value == 0x100) {
-            log_msg(hf, tag, "PASS -- 0x10000 >> 8 = 0x%llX", (unsigned long long)r.value);
+        const expr_eval_case_t cases[] = {
+            {"byte_shift", "0x10000 >> 8", 0x100},
+            {"top_bit_to_one", "0x8000000000000000 >> 63", 1},
+            {"zero_shift", "0x1234 >> 0", 0x1234},
+        };
+        long long total_us = 0;
+        if (run_expr_cases(hf, tag, ctx, cases, total_us)) {
+            log_msg(hf, tag, "PASS -- %zu shift-right cases matched expected outputs elapsed_us=%lld", sizeof(cases) / sizeof(cases[0]), total_us);
             passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "FAIL -- expected 0x100, got ok=%d value=0x%llX",
-                (int)r.ok, (unsigned long long)r.value);
+            log_msg(hf, tag, "FAIL -- one or more shift-right cases mismatched elapsed_us=%lld", total_us);
             failed.fetch_add(1);
         }
     }
 
     void test_expr_division(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "expr.div";
+        (void)skipped;
         expression_eval::context_t ctx{};
-        log_msg(hf, tag, "INPUT -- evaluate(\"0x1000 / 0x10\") expected=0x100");
-        auto r = expression_eval::evaluate("0x1000 / 0x10", ctx);
-        log_msg(hf, tag, "OUTPUT -- ok=%d value=0x%llX err=\"%s\"",
-            (int)r.ok, (unsigned long long)r.value, r.error.c_str());
-        if (r.ok && r.value == 0x100) {
-            log_msg(hf, tag, "PASS -- 0x1000 / 0x10 = 0x%llX", (unsigned long long)r.value);
+        const expr_eval_case_t cases[] = {
+            {"hex_division", "0x1000 / 0x10", 0x100},
+            {"integer_truncation", "255 / 10", 25},
+            {"divide_by_one", "0x1234 / 1", 0x1234},
+        };
+        long long total_us = 0;
+        if (run_expr_cases(hf, tag, ctx, cases, total_us)) {
+            log_msg(hf, tag, "PASS -- %zu division cases matched expected outputs elapsed_us=%lld", sizeof(cases) / sizeof(cases[0]), total_us);
             passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "FAIL -- expected 0x100, got ok=%d value=0x%llX",
-                (int)r.ok, (unsigned long long)r.value);
+            log_msg(hf, tag, "FAIL -- one or more division cases mismatched elapsed_us=%lld", total_us);
             failed.fetch_add(1);
         }
     }
 
     void test_expr_modulo(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "expr.mod";
+        (void)skipped;
         expression_eval::context_t ctx{};
-        log_msg(hf, tag, "INPUT -- evaluate(\"0x105 %% 0x100\") expected=0x5");
-        auto r = expression_eval::evaluate("0x105 % 0x100", ctx);
-        log_msg(hf, tag, "OUTPUT -- ok=%d value=0x%llX err=\"%s\"",
-            (int)r.ok, (unsigned long long)r.value, r.error.c_str());
-        if (r.ok && r.value == 0x5) {
-            log_msg(hf, tag, "PASS -- 0x105 %% 0x100 = 0x%llX", (unsigned long long)r.value);
+        const expr_eval_case_t cases[] = {
+            {"hex_modulo", "0x105 % 0x100", 0x5},
+            {"decimal_modulo", "255 % 10", 5},
+            {"zero_remainder", "0x1200 % 0x100", 0},
+        };
+        long long total_us = 0;
+        if (run_expr_cases(hf, tag, ctx, cases, total_us)) {
+            log_msg(hf, tag, "PASS -- %zu modulo cases matched expected outputs elapsed_us=%lld", sizeof(cases) / sizeof(cases[0]), total_us);
             passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "FAIL -- expected 0x5, got ok=%d value=0x%llX",
-                (int)r.ok, (unsigned long long)r.value);
+            log_msg(hf, tag, "FAIL -- one or more modulo cases mismatched elapsed_us=%lld", total_us);
             failed.fetch_add(1);
         }
     }
 
     void test_expr_comparison(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "expr.compare";
+        (void)skipped;
         expression_eval::context_t ctx{};
-        log_msg(hf, tag, "INPUT -- evaluate ==, !=, <, > each expected to yield 1");
-        auto r1 = expression_eval::evaluate("0x100 == 0x100", ctx);
-        auto r2 = expression_eval::evaluate("0x100 != 0x200", ctx);
-        auto r3 = expression_eval::evaluate("0x100 < 0x200", ctx);
-        auto r4 = expression_eval::evaluate("0x200 > 0x100", ctx);
-        log_msg(hf, tag, "OUTPUT -- ==:(ok=%d v=%llu) !=:(ok=%d v=%llu) <:(ok=%d v=%llu) >:(ok=%d v=%llu)",
-            (int)r1.ok, (unsigned long long)r1.value, (int)r2.ok, (unsigned long long)r2.value,
-            (int)r3.ok, (unsigned long long)r3.value, (int)r4.ok, (unsigned long long)r4.value);
-        if (r1.ok && r1.value == 1 && r2.ok && r2.value == 1 &&
-            r3.ok && r3.value == 1 && r4.ok && r4.value == 1) {
-            log_msg(hf, tag, "PASS -- all comparison operators work (==,!=,<,> all returned 1)");
+        const expr_eval_case_t cases[] = {
+            {"eq_true", "0x100 == 0x100", 1},
+            {"eq_false", "0x100 == 0x101", 0},
+            {"ne_true", "0x100 != 0x200", 1},
+            {"lt_true", "0x100 < 0x200", 1},
+            {"lt_false", "0x100 < 0x100", 0},
+            {"gt_true", "0x200 > 0x100", 1},
+            {"le_equal", "0x200 <= 0x200", 1},
+            {"ge_false", "0x10 >= 0x20", 0},
+        };
+        long long total_us = 0;
+        if (run_expr_cases(hf, tag, ctx, cases, total_us)) {
+            log_msg(hf, tag, "PASS -- %zu comparison cases matched expected boolean outputs elapsed_us=%lld", sizeof(cases) / sizeof(cases[0]), total_us);
             passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "FAIL -- comparison mismatch ==:%llu !=:%llu <:%llu >:%llu",
-                (unsigned long long)r1.value, (unsigned long long)r2.value,
-                (unsigned long long)r3.value, (unsigned long long)r4.value);
+            log_msg(hf, tag, "FAIL -- one or more comparison cases mismatched elapsed_us=%lld", total_us);
             failed.fetch_add(1);
         }
     }
@@ -2321,44 +2390,43 @@ namespace {
 
     void test_expr_negation(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "expr.negate";
+        (void)skipped;
         expression_eval::context_t ctx{};
-        auto t0 = std::chrono::steady_clock::now();
-        log_msg(hf, tag, "INPUT -- evaluate(\"~0x0\") expected=0xFFFFFFFFFFFFFFFF");
-        auto r = expression_eval::evaluate("~0x0", ctx);
-        log_msg(hf, tag, "OUTPUT -- ok=%d value=0x%llX err=\"%s\" elapsed_us=%lld",
-            (int)r.ok, (unsigned long long)r.value, r.error.c_str(), elapsed_us_since(t0));
-        if (r.ok && r.value == 0xFFFFFFFFFFFFFFFFULL) {
-            log_msg(hf, tag, "PASS -- ~0x0 = 0x%llX", (unsigned long long)r.value);
+        const expr_eval_case_t cases[] = {
+            {"bitwise_not_zero", "~0x0", 0xFFFFFFFFFFFFFFFFULL},
+            {"double_bitwise_not", "~~0x1234", 0x1234},
+            {"arithmetic_negation", "-1", 0xFFFFFFFFFFFFFFFFULL},
+        };
+        long long total_us = 0;
+        if (run_expr_cases(hf, tag, ctx, cases, total_us)) {
+            log_msg(hf, tag, "PASS -- %zu negation cases matched expected outputs elapsed_us=%lld", sizeof(cases) / sizeof(cases[0]), total_us);
             passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "FAIL -- expected 0xFFFFFFFFFFFFFFFF, got ok=%d value=0x%llX",
-                (int)r.ok, (unsigned long long)r.value);
+            log_msg(hf, tag, "FAIL -- one or more negation cases mismatched elapsed_us=%lld", total_us);
             failed.fetch_add(1);
         }
     }
 
     void test_expr_multiple_registers(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "expr.multi_regs";
+        (void)skipped;
         expression_eval::context_t ctx{};
         ctx.rax = 0x1000;
         ctx.rbx = 0x200;
         ctx.rcx = 0x30;
         ctx.rdx = 0x4;
-        auto t0 = std::chrono::steady_clock::now();
-        log_msg(hf, tag, "INPUT -- evaluate(\"rax + rbx + rcx + rdx\") rax=0x%llX rbx=0x%llX rcx=0x%llX rdx=0x%llX expected=0x1234",
-            (unsigned long long)ctx.rax,
-            (unsigned long long)ctx.rbx,
-            (unsigned long long)ctx.rcx,
-            (unsigned long long)ctx.rdx);
-        auto r = expression_eval::evaluate("rax + rbx + rcx + rdx", ctx);
-        log_msg(hf, tag, "OUTPUT -- ok=%d value=0x%llX err=\"%s\" elapsed_us=%lld",
-            (int)r.ok, (unsigned long long)r.value, r.error.c_str(), elapsed_us_since(t0));
-        if (r.ok && r.value == 0x1234) {
-            log_msg(hf, tag, "PASS -- rax+rbx+rcx+rdx = 0x%llX", (unsigned long long)r.value);
+        const expr_eval_case_t cases[] = {
+            {"four_register_sum", "rax + rbx + rcx + rdx", 0x1234},
+            {"precedence_with_registers", "rax + (rbx * rdx) - rcx", 0x17D0},
+            {"shifted_register_mix", "(rax >> 8) + (rbx << 1) + rcx + rdx", 0x444},
+            {"subregister_aliases", "eax + bx + cl + dl", 0x1234},
+        };
+        long long total_us = 0;
+        if (run_expr_cases(hf, tag, ctx, cases, total_us)) {
+            log_msg(hf, tag, "PASS -- %zu multi-register cases matched expected outputs elapsed_us=%lld", sizeof(cases) / sizeof(cases[0]), total_us);
             passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "FAIL -- expected 0x1234, got ok=%d value=0x%llX",
-                (int)r.ok, (unsigned long long)r.value);
+            log_msg(hf, tag, "FAIL -- one or more multi-register cases mismatched elapsed_us=%lld", total_us);
             failed.fetch_add(1);
         }
     }

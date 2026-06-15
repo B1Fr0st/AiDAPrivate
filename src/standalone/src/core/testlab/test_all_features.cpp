@@ -938,35 +938,6 @@ namespace test_all_features {
 			return value != nullptr && parsed_truthy(*value);
 		}
 
-		bool thread_tctx_raw_ioctl_degraded_has_public_fallback_evidence(const char* category, const char* name, const test_lab::result_t& r, const std::string& degraded_key) {
-			const char* cat = category ? category : "";
-			const char* feature = name ? name : "";
-			if (std::strcmp(cat, "thread") != 0 || !name_starts_with(feature, "TCTX") || degraded_key != "raw_ioctl_degraded")
-				return false;
-			const std::string* raw_ok = parsed_value(r, "raw_ioctl_ok");
-			const bool raw_failure_evidence =
-				(raw_ok != nullptr && !parsed_truthy(*raw_ok)) ||
-				parsed_value_contains(r, "fallback_reason", "raw ioctl failed") ||
-				parsed_value_contains(r, "fallback_decision_final", "raw_ioctl_not_proven");
-			const bool fallback_ok =
-				(parsed_label_truthy(r, "fallback_bridge_ok") || parsed_label_truthy(r, "fallback_helper_ok")) &&
-				(parsed_label_truthy(r, "fallback_bridge_context_valid") || parsed_label_truthy(r, "fallback_context_valid")) &&
-				parsed_value_contains(r, "tctx_pass_path", "get_thread_context_retry");
-			const bool probe_ok =
-				parsed_label_truthy(r, "user_probe_before_raw_context_valid") ||
-				parsed_label_truthy(r, "user_probe_after_fallback_context_valid");
-			const char* const rip_rsp_labels[] = {
-				"fallback_bridge_rip",
-				"fallback_bridge_rsp",
-				"fallback_attempt_2_rip",
-				"fallback_attempt_2_rsp",
-				"user_probe_after_fallback_rip",
-				"user_probe_after_fallback_rsp"
-			};
-			return raw_failure_evidence && fallback_ok && probe_ok &&
-				any_parsed_nonzero(r, rip_rsp_labels, sizeof(rip_rsp_labels) / sizeof(rip_rsp_labels[0]));
-		}
-
 		bool feature_evidence_failure_reason(const char* category, const char* name, const test_lab::result_t& r, std::string& reason) {
 			reason.clear();
 			const char* cat = category ? category : "";
@@ -977,9 +948,29 @@ namespace test_all_features {
 			}
 			std::string degraded_key;
 			if (parsed_key_degraded_true(r, degraded_key)) {
-				if (thread_tctx_raw_ioctl_degraded_has_public_fallback_evidence(category, name, r, degraded_key))
-					return false;
+				if (std::strcmp(cat, "thread") == 0 && name_starts_with(feature, "TCTX") && degraded_key == "raw_ioctl_degraded") {
+					if (parsed_label_truthy(r, "functional_context_pass") &&
+						parsed_label_truthy(r, "functional_context_matches_user_probe") &&
+						parsed_value_contains(r, "tctx_result_classification", "functional_context_pass") &&
+						parsed_nonzero(r, "functional_context_rip") &&
+						parsed_nonzero(r, "functional_context_rsp") &&
+						parsed_nonzero(r, "functional_context_rflags")) {
+						return false;
+					}
+					reason = "TCTX raw_ioctl_degraded=1_without_functional_context_pass";
+					return true;
+				}
 				reason = degraded_key + "=1";
+				return true;
+			}
+			if (parsed_value_contains(r, "kernel_probe_set", "safe_mode_skipped") ||
+				parsed_value_contains(r, "kernel_probe_set", "skipped_by_testlab_safe_flag")) {
+				if (parsed_label_truthy(r, "safe_contract_proven") &&
+					parsed_label_truthy(r, "safe_mode_expected_skip") &&
+					parsed_label_truthy(r, "full_kernel_probe_not_run")) {
+					return false;
+				}
+				reason = "kernel_probe_set=skipped_without_safe_contract";
 				return true;
 			}
 			if (std::strcmp(cat, "module") == 0 && name_starts_with(feature, "PMOD") && !parsed_nonzero(r, "rule_count")) {
@@ -990,8 +981,8 @@ namespace test_all_features {
 				reason = "DPIN result_count=0_or_missing";
 				return true;
 			}
-			if (std::strcmp(cat, "module") == 0 && name_starts_with(feature, "IHLD") && !parsed_nonzero(r, "held_count")) {
-				reason = "IHLD held_count=0_or_missing";
+			if (std::strcmp(cat, "module") == 0 && name_starts_with(feature, "IHLD") && !parsed_nonzero(r, "held_matching_self_pid")) {
+				reason = "IHLD held_matching_self_pid=0_or_missing";
 				return true;
 			}
 			if (std::strcmp(cat, "network-query") == 0 && name_starts_with(feature, "NCAP") && !parsed_nonzero(r, "packets_captured")) {
@@ -1065,7 +1056,7 @@ namespace test_all_features {
 					return true;
 				}
 			}
-			if (std::strcmp(cat, "sentinel") == 0 && name_starts_with(feature, "Sentinel Tier-A Query")) {
+			if (std::strcmp(cat, "sentinel") == 0 && name_starts_with(feature, "Sentinel Tier-A")) {
 				if (!parsed_nonzero(r, "hostile_driver_absent") &&
 					!parsed_nonzero(r, "absence_expected_healthy")) {
 					reason = "sentinel_tier_a_healthy_absence_marker_missing";
@@ -3140,6 +3131,27 @@ namespace test_all_features {
 
 	bool start_tests() {
 		return start_tests_impl();
+	}
+
+	bool trigger_from_hotkey(const char* source) {
+		const char* tag = source && source[0] ? source : "ctrl_shift_t";
+		globals::ui::test_all_visible = true;
+		char snap_before[1200] = {};
+		format_debug_snapshot(snap_before, sizeof(snap_before));
+		diag::log_tagged_fmt("ui", "test_all_start hotkey=%s before={%s}", tag, snap_before);
+		diag::log_tagged_fmt("parser_proof", "%s pressed; starting full Test Lab before={%s}", tag, snap_before);
+		const bool guard_started = !is_running();
+		if (guard_started)
+			begin_test_guard("ctrl_shift_t prestart");
+		run_parser_proof_smoke();
+		bool accepted = start_tests();
+		if (!accepted && guard_started)
+			end_test_guard("ctrl_shift_t rejected", true);
+		char snap_after[1200] = {};
+		format_debug_snapshot(snap_after, sizeof(snap_after));
+		diag::log_tagged_fmt("ui", "test_all_start hotkey=%s accepted=%d after={%s}", tag, accepted ? 1 : 0, snap_after);
+		diag::log_tagged_fmt("parser_proof", "%s start_tests accepted=%d after={%s}", tag, accepted ? 1 : 0, snap_after);
+		return accepted;
 	}
 
 	void begin_test_guard(const char* source) {

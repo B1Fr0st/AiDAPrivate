@@ -1582,6 +1582,8 @@ namespace dispatcher {
         else if (code == ioctl_codes::SRVT()) {
             if (input_size >= sizeof(server_token_relay) && output_size >= sizeof(server_token_relay)) {
                 p_server_token_relay srvt = (p_server_token_relay)buffer;
+                UINT64 caller_pid = handle_to_u64(PsGetCurrentProcessId());
+                UINT64 registered_pid = handle_to_u64(caller_validation::g_registered_client_pid);
 
                 if (srvt->session_key == g_session_key) {
                     LARGE_INTEGER current_time;
@@ -1595,12 +1597,31 @@ namespace dispatcher {
                     _InterlockedExchange64(&g_last_heartbeat_time, current_time.QuadPart);
 
                     srvt->result = 1;
-                    WW_LOG("SRVT: activation accepted server_seed_set=%u ioctl_seed_set=%u",
+                    WW_LOG("SRVT: accepted result=%u expected_bytes=%llu returned_bytes=%llu token_present=%u nonce_present=%u session_present=%u caller_pid=%llu registered_pid=%llu server_seed_set=%u ioctl_seed_set=%u elapsed_us=%llu",
+                        srvt->result,
+                        static_cast<UINT64>(sizeof(server_token_relay)),
+                        static_cast<UINT64>(sizeof(server_token_relay)),
+                        srvt->token_hash != 0 ? 1u : 0u,
+                        srvt->server_nonce != 0 ? 1u : 0u,
+                        srvt->session_key != 0 ? 1u : 0u,
+                        caller_pid,
+                        registered_pid,
                         dynamic_key::g_server_seed != 0 ? 1u : 0u,
-                        ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u);
+                        ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u,
+                        elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq));
                     status = STATUS_SUCCESS;
                 } else {
                     srvt->result = 0;
+                    WW_LOG("SRVT: rejected result=%u expected_bytes=%llu returned_bytes=%llu token_present=%u nonce_present=%u session_present=%u session_match=0 caller_pid=%llu registered_pid=%llu elapsed_us=%llu",
+                        srvt->result,
+                        static_cast<UINT64>(sizeof(server_token_relay)),
+                        static_cast<UINT64>(sizeof(server_token_relay)),
+                        srvt->token_hash != 0 ? 1u : 0u,
+                        srvt->server_nonce != 0 ? 1u : 0u,
+                        srvt->session_key != 0 ? 1u : 0u,
+                        caller_pid,
+                        registered_pid,
+                        elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq));
                     status = STATUS_ACCESS_DENIED;
                 }
                 bytes = sizeof(server_token_relay);
@@ -1733,14 +1754,40 @@ namespace dispatcher {
         else if (code == ioctl_codes::SRV2()) {
             if (input_size >= sizeof(server_token_relay_v2) && output_size >= sizeof(server_token_relay_v2)) {
                 auto* srvt2 = (p_server_token_relay_v2)buffer;
+                UINT64 caller_pid = handle_to_u64(PsGetCurrentProcessId());
+                UINT64 registered_pid = handle_to_u64(caller_validation::g_registered_client_pid);
                 status = functions::handle_server_token_v2(srvt2);
                 if (NT_SUCCESS(status) && srvt2->result == 1) {
                     activate_server_seed_state(srvt2->server_nonce, srvt2->token_hash, srvt2->session_key);
                     _InterlockedExchange(&g_driver_activated, 1);
-                    WW_LOG("SRVT2: activation accepted server_seed_set=%u ioctl_seed_set=%u proof_set=%u",
+                    WW_LOG("SRVT2: accepted result=%u expected_bytes=%llu returned_bytes=%llu token_present=%u nonce_present=%u proof_set=%u session_present=%u caller_pid=%llu registered_pid=%llu action=%u server_seed_set=%u ioctl_seed_set=%u elapsed_us=%llu",
+                        srvt2->result,
+                        static_cast<UINT64>(sizeof(server_token_relay_v2)),
+                        static_cast<UINT64>(sizeof(server_token_relay_v2)),
+                        srvt2->token_hash != 0 ? 1u : 0u,
+                        srvt2->server_nonce != 0 ? 1u : 0u,
+                        srvt2->driver_proof != 0 ? 1u : 0u,
+                        srvt2->session_key != 0 ? 1u : 0u,
+                        caller_pid,
+                        registered_pid,
+                        srvt2->action,
                         dynamic_key::g_server_seed != 0 ? 1u : 0u,
                         ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u,
-                        srvt2->driver_proof != 0 ? 1u : 0u);
+                        elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq));
+                } else {
+                    WW_LOG("SRVT2: rejected status=0x%08lx result=%u expected_bytes=%llu returned_bytes=%llu token_present=%u nonce_present=%u proof_set=%u session_present=%u caller_pid=%llu registered_pid=%llu action=%u elapsed_us=%llu",
+                        status,
+                        srvt2->result,
+                        static_cast<UINT64>(sizeof(server_token_relay_v2)),
+                        static_cast<UINT64>(sizeof(server_token_relay_v2)),
+                        srvt2->token_hash != 0 ? 1u : 0u,
+                        srvt2->server_nonce != 0 ? 1u : 0u,
+                        srvt2->driver_proof != 0 ? 1u : 0u,
+                        srvt2->session_key != 0 ? 1u : 0u,
+                        caller_pid,
+                        registered_pid,
+                        srvt2->action,
+                        elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq));
                 }
 
 
@@ -1850,13 +1897,33 @@ namespace dispatcher {
             if (input_size >= sizeof(phase3_msg::tier_a_query_request_k) &&
                 output_size >= sizeof(phase3_msg::tier_a_query_request_k)) {
                 auto* req = reinterpret_cast<phase3_msg::tier_a_query_request_k*>(buffer);
+                UINT64 caller_pid = handle_to_u64(PsGetCurrentProcessId());
+                UINT64 registered_pid = handle_to_u64(caller_validation::g_registered_client_pid);
                 if (req->session_key != g_session_key) {
                     status = STATUS_ACCESS_DENIED;
+                    WW_LOG("TIRA: rejected expected_bytes=%llu returned_bytes=%llu session_present=%u session_match=0 caller_pid=%llu registered_pid=%llu elapsed_us=%llu",
+                        static_cast<UINT64>(sizeof(phase3_msg::tier_a_query_request_k)),
+                        static_cast<UINT64>(sizeof(phase3_msg::tier_a_query_request_k)),
+                        req->session_key != 0 ? 1u : 0u,
+                        caller_pid,
+                        registered_pid,
+                        elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq));
                 } else {
                     req->present_flag      = anti_dma_canary::query_tier_a_preloaded() ? 1u : 0u;
                     req->tier_mask         = req->present_flag;
                     req->first_driver_base = 0;
                     status = STATUS_SUCCESS;
+                    WW_LOG("TIRA: accepted result=%u expected_bytes=%llu returned_bytes=%llu tier_mask=0x%08X first_base=0x%llX session_present=%u caller_pid=%llu registered_pid=%llu reason=%s elapsed_us=%llu",
+                        req->present_flag,
+                        static_cast<UINT64>(sizeof(phase3_msg::tier_a_query_request_k)),
+                        static_cast<UINT64>(sizeof(phase3_msg::tier_a_query_request_k)),
+                        req->tier_mask,
+                        req->first_driver_base,
+                        req->session_key != 0 ? 1u : 0u,
+                        caller_pid,
+                        registered_pid,
+                        req->present_flag ? "tier_a_present" : "healthy_absent",
+                        elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq));
                 }
                 bytes = sizeof(phase3_msg::tier_a_query_request_k);
             } else { status = STATUS_INFO_LENGTH_MISMATCH; }
@@ -2079,6 +2146,8 @@ namespace dispatcher {
             if (input_size >= sizeof(phase3_msg::latch_targeting_request_k)) {
                 auto* req = reinterpret_cast<phase3_msg::latch_targeting_request_k*>(buffer);
                 ULONG expected_magic = g_session_key ^ dynamic_key::get() ^ 0x1A7C4B2Eu;
+                UINT64 caller_pid = handle_to_u64(PsGetCurrentProcessId());
+                UINT64 registered_pid = handle_to_u64(caller_validation::g_registered_client_pid);
                 if (req->magic == expected_magic && req->session_key == g_session_key) {
                     targeting_latch::latch_targeting(
                         req->reason,
@@ -2086,8 +2155,26 @@ namespace dispatcher {
                         0, 0, 0
                     );
                     status = STATUS_SUCCESS;
+                    WW_LOG("RELA: accepted reason=0x%08X expected_bytes=%llu returned_bytes=%llu magic_match=1 session_present=%u session_match=1 caller_pid=%llu registered_pid=%llu elapsed_us=%llu",
+                        req->reason,
+                        static_cast<UINT64>(sizeof(phase3_msg::latch_targeting_request_k)),
+                        static_cast<UINT64>(sizeof(phase3_msg::latch_targeting_request_k)),
+                        req->session_key != 0 ? 1u : 0u,
+                        caller_pid,
+                        registered_pid,
+                        elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq));
                 } else {
                     status = STATUS_ACCESS_DENIED;
+                    WW_LOG("RELA: rejected reason=0x%08X expected_bytes=%llu returned_bytes=%llu magic_match=%u session_present=%u session_match=%u caller_pid=%llu registered_pid=%llu elapsed_us=%llu",
+                        req->reason,
+                        static_cast<UINT64>(sizeof(phase3_msg::latch_targeting_request_k)),
+                        static_cast<UINT64>(sizeof(phase3_msg::latch_targeting_request_k)),
+                        req->magic == expected_magic ? 1u : 0u,
+                        req->session_key != 0 ? 1u : 0u,
+                        req->session_key == g_session_key ? 1u : 0u,
+                        caller_pid,
+                        registered_pid,
+                        elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq));
                 }
                 bytes = sizeof(phase3_msg::latch_targeting_request_k);
             } else { status = STATUS_INFO_LENGTH_MISMATCH; }
@@ -2415,14 +2502,28 @@ namespace dispatcher {
                         req->present_flag      = anti_dma_canary::query_tier_a_preloaded() ? 1u : 0u;
                         req->tier_mask         = req->present_flag;
                         req->first_driver_base = 0;
-                        WW_LOG("TIRA: accepted stale base query from active client pid=%llu while seeded",
-                            (unsigned long long)(ULONG_PTR)caller_pid);
+                        WW_LOG("TIRA: accepted stale base query result=%u expected_bytes=%llu returned_bytes=%llu tier_mask=0x%08X first_base=0x%llX session_present=%u caller_pid=%llu registered_pid=%llu reason=%s elapsed_us=%llu",
+                            req->present_flag,
+                            static_cast<UINT64>(sizeof(phase3_msg::tier_a_query_request_k)),
+                            static_cast<UINT64>(sizeof(phase3_msg::tier_a_query_request_k)),
+                            req->tier_mask,
+                            req->first_driver_base,
+                            req->session_key != 0 ? 1u : 0u,
+                            (unsigned long long)(ULONG_PTR)caller_pid,
+                            (unsigned long long)(ULONG_PTR)prev_client,
+                            req->present_flag ? "tier_a_present" : "healthy_absent",
+                            elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq));
                         status = STATUS_SUCCESS;
                     } else {
-                        WW_LOG("TIRA: rejected stale base query pid=%llu active_match=%u session_match=%u",
+                        WW_LOG("TIRA: rejected stale base query expected_bytes=%llu returned_bytes=%llu session_present=%u pid=%llu registered_pid=%llu active_match=%u session_match=%u elapsed_us=%llu",
+                            static_cast<UINT64>(sizeof(phase3_msg::tier_a_query_request_k)),
+                            static_cast<UINT64>(sizeof(phase3_msg::tier_a_query_request_k)),
+                            req->session_key != 0 ? 1u : 0u,
                             (unsigned long long)(ULONG_PTR)caller_pid,
+                            (unsigned long long)(ULONG_PTR)prev_client,
                             (prev_client != NULL && prev_client == caller_pid) ? 1u : 0u,
-                            req->session_key == g_session_key ? 1u : 0u);
+                            req->session_key == g_session_key ? 1u : 0u,
+                            elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq));
                         status = STATUS_ACCESS_DENIED;
                     }
                     bytes = sizeof(phase3_msg::tier_a_query_request_k);

@@ -116,6 +116,381 @@ static long long elapsed_us_since(std::chrono::steady_clock::time_point t0) {
         std::chrono::steady_clock::now() - t0).count());
 }
 
+struct ntdll_export_resolution_t {
+    uint64_t address = 0;
+    uint64_t local_rva = 0;
+    std::string module_name;
+    const char* method = "unresolved";
+    bool local_export_ok = false;
+    bool ntdll_seen = false;
+    size_t module_count = 0;
+    uint32_t slow_attempts = 0;
+    long long local_us = 0;
+    long long enum_us = 0;
+    long long slow_us = 0;
+};
+
+static bool contains_ascii_ci(const std::string& text, const char* needle) {
+    if (!needle || !needle[0])
+        return true;
+    const size_t needle_len = std::strlen(needle);
+    if (text.size() < needle_len)
+        return false;
+    for (size_t i = 0; i + needle_len <= text.size(); ++i) {
+        bool match = true;
+        for (size_t j = 0; j < needle_len; ++j) {
+            char a = text[i + j];
+            char b = needle[j];
+            if (a >= 'A' && a <= 'Z') a = static_cast<char>(a + ('a' - 'A'));
+            if (b >= 'A' && b <= 'Z') b = static_cast<char>(b + ('a' - 'A'));
+            if (a != b) {
+                match = false;
+                break;
+            }
+        }
+        if (match)
+            return true;
+    }
+    return false;
+}
+
+static bool module_is_ntdll(const driver_bridge::module_info_t& mod) {
+    return _stricmp(mod.name.c_str(), "ntdll.dll") == 0 ||
+        contains_ascii_ci(mod.name, "ntdll") ||
+        contains_ascii_ci(mod.path, "ntdll");
+}
+
+static std::string wide_to_utf8_lossy(const std::wstring& text) {
+    if (text.empty())
+        return {};
+    int needed = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+    if (needed <= 0)
+        return {};
+    std::string out(static_cast<size_t>(needed), '\0');
+    int wrote = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), out.data(), needed, nullptr, nullptr);
+    if (wrote <= 0)
+        return {};
+    out.resize(static_cast<size_t>(wrote));
+    return out;
+}
+
+static std::string format_win32_error_text(DWORD err) {
+    char* buf = nullptr;
+    DWORD n = FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        nullptr, err, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), reinterpret_cast<LPSTR>(&buf), 0, nullptr);
+    std::string text;
+    if (n != 0 && buf)
+        text.assign(buf, n);
+    if (buf)
+        LocalFree(buf);
+    while (!text.empty() && (text.back() == '\r' || text.back() == '\n' || text.back() == ' ' || text.back() == '\t'))
+        text.pop_back();
+    if (text.empty())
+        text = "unknown error";
+    return text;
+}
+
+static void close_handle_if_open(HANDLE& h) {
+    if (h && h != INVALID_HANDLE_VALUE) {
+        CloseHandle(h);
+        h = nullptr;
+    }
+}
+
+static std::wstring quote_wide_arg(const std::wstring& arg) {
+    std::wstring out;
+    out.reserve(arg.size() + 2);
+    out.push_back(L'"');
+    size_t slashes = 0;
+    for (wchar_t c : arg) {
+        if (c == L'\\') {
+            ++slashes;
+            continue;
+        }
+        if (c == L'"') {
+            out.append(slashes * 2 + 1, L'\\');
+            out.push_back(c);
+            slashes = 0;
+            continue;
+        }
+        if (slashes != 0) {
+            out.append(slashes, L'\\');
+            slashes = 0;
+        }
+        out.push_back(c);
+    }
+    if (slashes != 0)
+        out.append(slashes * 2, L'\\');
+    out.push_back(L'"');
+    return out;
+}
+
+static uint64_t remote_module_base_ci(uint32_t pid, const char* module_fragment) {
+    if (pid == 0 || !module_fragment || !module_fragment[0])
+        return 0;
+    for (const auto& mod : driver_bridge::enumerate_modules_for(pid)) {
+        if (mod.base != 0 && (contains_ascii_ci(mod.name, module_fragment) || contains_ascii_ci(mod.path, module_fragment)))
+            return mod.base;
+    }
+    return 0;
+}
+
+struct integrity_hunter_sidecar_t {
+    HANDLE process = nullptr;
+    HANDLE thread = nullptr;
+    DWORD pid = 0;
+    std::wstring exe;
+    std::wstring command;
+    std::wstring workdir;
+};
+
+static bool integrity_sidecar_exited(const integrity_hunter_sidecar_t& sidecar, DWORD& exit_code) {
+    exit_code = 0;
+    if (!sidecar.process)
+        return true;
+    if (!GetExitCodeProcess(sidecar.process, &exit_code))
+        return true;
+    return exit_code != STILL_ACTIVE;
+}
+
+static bool launch_integrity_hunter_sidecar(HANDLE hf, const char* tag, integrity_hunter_sidecar_t& sidecar) {
+    wchar_t sys_dir[MAX_PATH] = {};
+    UINT sys_len = GetSystemDirectoryW(sys_dir, MAX_PATH);
+    if (sys_len == 0 || sys_len >= MAX_PATH) {
+        const DWORD err = GetLastError();
+        log_msg(hf, tag, "FAIL -- integrity sidecar GetSystemDirectoryW failed err=%lu text=%s",
+            static_cast<unsigned long>(err), format_win32_error_text(err).c_str());
+        return false;
+    }
+
+    sidecar.workdir.assign(sys_dir, sys_len);
+    sidecar.exe = sidecar.workdir;
+    if (!sidecar.exe.empty() && sidecar.exe.back() != L'\\' && sidecar.exe.back() != L'/')
+        sidecar.exe.push_back(L'\\');
+    sidecar.exe += L"cmd.exe";
+    if (GetFileAttributesW(sidecar.exe.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        const DWORD err = GetLastError();
+        log_msg(hf, tag, "FAIL -- integrity sidecar cmd.exe missing path=%s err=%lu text=%s",
+            wide_to_utf8_lossy(sidecar.exe).c_str(),
+            static_cast<unsigned long>(err),
+            format_win32_error_text(err).c_str());
+        return false;
+    }
+
+    sidecar.command = quote_wide_arg(sidecar.exe) + L" /d /c ping -n 30 127.0.0.1 > nul";
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    std::vector<wchar_t> command_mutable(sidecar.command.begin(), sidecar.command.end());
+    command_mutable.push_back(L'\0');
+    SetLastError(0);
+    BOOL ok = CreateProcessW(sidecar.exe.c_str(),
+        command_mutable.data(),
+        nullptr,
+        nullptr,
+        FALSE,
+        CREATE_NO_WINDOW,
+        nullptr,
+        sidecar.workdir.empty() ? nullptr : sidecar.workdir.c_str(),
+        &si,
+        &pi);
+    const DWORD err = ok ? 0 : GetLastError();
+    log_msg(hf, tag, "SIDE-FIXTURE-LAUNCH -- app=%s cmd=%s cwd=%s ok=%d err=%lu text=%s",
+        wide_to_utf8_lossy(sidecar.exe).c_str(),
+        wide_to_utf8_lossy(sidecar.command).c_str(),
+        wide_to_utf8_lossy(sidecar.workdir).c_str(),
+        ok ? 1 : 0,
+        static_cast<unsigned long>(err),
+        ok ? "success" : format_win32_error_text(err).c_str());
+    if (!ok)
+        return false;
+
+    sidecar.process = pi.hProcess;
+    sidecar.thread = pi.hThread;
+    sidecar.pid = pi.dwProcessId;
+    log_msg(hf, tag, "SIDE-FIXTURE-LAUNCHED -- pid=%lu thread=%lu",
+        static_cast<unsigned long>(sidecar.pid),
+        static_cast<unsigned long>(pi.dwThreadId));
+    return true;
+}
+
+static bool select_integrity_hunter_sidecar_pid(HANDLE hf, const char* tag, uint32_t pid) {
+    if (pid == 0)
+        return false;
+    bool known = false;
+    for (uint32_t attached_pid : driver_bridge::attached_pids()) {
+        if (attached_pid == pid) {
+            known = true;
+            break;
+        }
+    }
+    if (!known && !driver_bridge::attach_additional(pid)) {
+        log_msg(hf, tag, "FAIL -- integrity sidecar attach_additional failed pid=%u status=\"%s\" last_error=\"%s\"",
+            (unsigned)pid,
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str());
+        return false;
+    }
+    if (!driver_bridge::set_active_pid(pid)) {
+        log_msg(hf, tag, "FAIL -- integrity sidecar set_active_pid failed pid=%u status=\"%s\" last_error=\"%s\"",
+            (unsigned)pid,
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str());
+        return false;
+    }
+    return true;
+}
+
+static bool wait_integrity_hunter_sidecar_ready(HANDLE hf, const char* tag, const integrity_hunter_sidecar_t& sidecar, DWORD timeout_ms) {
+    const DWORD started = GetTickCount();
+    int attempts = 0;
+    for (;;) {
+        ++attempts;
+        DWORD exit_code = 0;
+        if (integrity_sidecar_exited(sidecar, exit_code)) {
+            log_msg(hf, tag, "FAIL -- integrity sidecar exited before attach ready pid=%lu exit=0x%08lX attempts=%d elapsed_ms=%lu",
+                static_cast<unsigned long>(sidecar.pid),
+                static_cast<unsigned long>(exit_code),
+                attempts,
+                static_cast<unsigned long>(GetTickCount() - started));
+            return false;
+        }
+
+        const bool selected = select_integrity_hunter_sidecar_pid(hf, tag, sidecar.pid);
+        const uint32_t active = driver_bridge::attached_pid();
+        uint32_t bridge_code = 0;
+        const bool bridge_alive = selected && active == sidecar.pid && driver_bridge::attached_process_alive(&bridge_code);
+        const uint64_t ntdll_base = selected ? remote_module_base_ci(sidecar.pid, "ntdll") : 0;
+        const uint64_t kernel32_base = selected ? remote_module_base_ci(sidecar.pid, "kernel32") : 0;
+        const DWORD elapsed = GetTickCount() - started;
+        if (selected && bridge_alive && ntdll_base != 0 && kernel32_base != 0) {
+            log_msg(hf, tag, "SIDE-FIXTURE-READY -- pid=%lu attempts=%d active=%u ntdll=0x%016llX kernel32=0x%016llX bridge_code=0x%08X elapsed_ms=%lu",
+                static_cast<unsigned long>(sidecar.pid),
+                attempts,
+                active,
+                static_cast<unsigned long long>(ntdll_base),
+                static_cast<unsigned long long>(kernel32_base),
+                bridge_code,
+                static_cast<unsigned long>(elapsed));
+            return true;
+        }
+        if (attempts == 1 || (elapsed % 500) < 100) {
+            log_msg(hf, tag, "SIDE-FIXTURE-WAIT -- pid=%lu attempt=%d selected=%d active=%u bridge_alive=%d bridge_code=0x%08X ntdll=0x%016llX kernel32=0x%016llX elapsed_ms=%lu",
+                static_cast<unsigned long>(sidecar.pid),
+                attempts,
+                selected ? 1 : 0,
+                active,
+                bridge_alive ? 1 : 0,
+                bridge_code,
+                static_cast<unsigned long long>(ntdll_base),
+                static_cast<unsigned long long>(kernel32_base),
+                static_cast<unsigned long>(elapsed));
+        }
+        if (elapsed >= timeout_ms) {
+            log_msg(hf, tag, "FAIL -- integrity sidecar attach readiness timeout pid=%lu attempts=%d active=%u status=\"%s\" last_error=\"%s\"",
+                static_cast<unsigned long>(sidecar.pid),
+                attempts,
+                driver_bridge::attached_pid(),
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            return false;
+        }
+        Sleep(100);
+    }
+}
+
+static bool restore_integrity_primary_pid(HANDLE hf, const char* tag, uint32_t primary_pid) {
+    if (primary_pid == 0)
+        return true;
+    bool known = false;
+    for (uint32_t attached_pid : driver_bridge::attached_pids()) {
+        if (attached_pid == primary_pid) {
+            known = true;
+            break;
+        }
+    }
+    if (!known && !driver_bridge::attach_additional(primary_pid)) {
+        log_msg(hf, tag, "WARN -- primary target restore attach_additional failed pid=%u active_now=%u status=\"%s\" last_error=\"%s\"",
+            (unsigned)primary_pid,
+            driver_bridge::attached_pid(),
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str());
+        return false;
+    }
+    const bool restored = driver_bridge::set_active_pid(primary_pid);
+    log_msg(hf, tag, "SIDE-FIXTURE-RESTORE -- primary_pid=%u restored=%d active_now=%u status=\"%s\" last_error=\"%s\"",
+        (unsigned)primary_pid,
+        restored ? 1 : 0,
+        driver_bridge::attached_pid(),
+        driver_bridge::status().c_str(),
+        driver_bridge::last_error().c_str());
+    return restored;
+}
+
+static void close_integrity_hunter_sidecar(HANDLE hf, const char* tag, integrity_hunter_sidecar_t& sidecar, bool force) {
+    DWORD exit_code = 0;
+    const bool exited = integrity_sidecar_exited(sidecar, exit_code);
+    log_msg(hf, tag, "SIDE-FIXTURE-CLOSE -- begin pid=%lu force=%d exited=%d exit=0x%08lX active_pid=%u",
+        static_cast<unsigned long>(sidecar.pid),
+        force ? 1 : 0,
+        exited ? 1 : 0,
+        static_cast<unsigned long>(exit_code),
+        driver_bridge::attached_pid());
+    if (sidecar.process && !exited && force) {
+        SetLastError(0);
+        BOOL term_ok = TerminateProcess(sidecar.process, 0xA1DA);
+        const DWORD term_err = term_ok ? 0 : GetLastError();
+        DWORD wait = WaitForSingleObject(sidecar.process, 1500);
+        const DWORD wait_err = wait == WAIT_FAILED ? GetLastError() : 0;
+        DWORD exit_after = 0;
+        BOOL exit_after_ok = GetExitCodeProcess(sidecar.process, &exit_after);
+        const DWORD exit_after_err = exit_after_ok ? 0 : GetLastError();
+        log_msg(hf, tag, "SIDE-FIXTURE-CLOSE -- terminate pid=%lu ok=%d err=%lu text=%s wait=0x%08lX wait_err=%lu exit_ok=%d exit_err=%lu exit=0x%08lX",
+            static_cast<unsigned long>(sidecar.pid),
+            term_ok ? 1 : 0,
+            static_cast<unsigned long>(term_err),
+            term_ok ? "success" : format_win32_error_text(term_err).c_str(),
+            static_cast<unsigned long>(wait),
+            static_cast<unsigned long>(wait_err),
+            exit_after_ok ? 1 : 0,
+            static_cast<unsigned long>(exit_after_err),
+            exit_after_ok ? static_cast<unsigned long>(exit_after) : 0UL);
+    }
+    close_handle_if_open(sidecar.thread);
+    close_handle_if_open(sidecar.process);
+    if (sidecar.pid != 0) {
+        const bool detached = driver_bridge::detach_one(sidecar.pid);
+        log_msg(hf, tag, "SIDE-FIXTURE-CLOSE -- detached pid=%lu ok=%d active_now=%u",
+            static_cast<unsigned long>(sidecar.pid),
+            detached ? 1 : 0,
+            driver_bridge::attached_pid());
+    }
+    sidecar.pid = 0;
+}
+
+struct integrity_hunter_sidecar_scope_t {
+    HANDLE hf = nullptr;
+    const char* tag = nullptr;
+    uint32_t primary_pid = 0;
+    integrity_hunter_sidecar_t sidecar;
+    bool active = false;
+
+    integrity_hunter_sidecar_scope_t(HANDLE h, const char* t, uint32_t p) : hf(h), tag(t), primary_pid(p) {}
+
+    ~integrity_hunter_sidecar_scope_t() {
+        if (active)
+            close_integrity_hunter_sidecar(hf, tag, sidecar, true);
+        restore_integrity_primary_pid(hf, tag, primary_pid);
+    }
+
+    bool start(DWORD timeout_ms) {
+        if (!launch_integrity_hunter_sidecar(hf, tag, sidecar))
+            return false;
+        active = true;
+        return wait_integrity_hunter_sidecar_ready(hf, tag, sidecar, timeout_ms);
+    }
+};
+
 struct integrity_hunter_fixture_t {
     uint32_t pid = 0;
     uint64_t address = 0;
@@ -160,33 +535,108 @@ struct integrity_hunter_fixture_t {
     }
 };
 
-static uint64_t resolve_attached_ntdll_export(uint32_t pid, const char* name, std::string& module_name) {
-    if (pid == 0)
-        return 0;
-    for (const auto& mod : driver_bridge::enumerate_modules_for(pid)) {
-        if (mod.base == 0)
-            continue;
-        const bool is_ntdll = _stricmp(mod.name.c_str(), "ntdll.dll") == 0 ||
-            mod.name.find("ntdll") != std::string::npos ||
-            mod.path.find("ntdll") != std::string::npos;
-        if (!is_ntdll)
-            continue;
-        uint64_t fn = driver_bridge::resolve_export_for(pid, mod.base, name);
-        if (fn != 0) {
-            module_name = mod.name.empty() ? mod.path : mod.name;
-            return fn;
-        }
-        HMODULE local_ntdll = GetModuleHandleW(L"ntdll.dll");
-        FARPROC local_fn = local_ntdll ? GetProcAddress(local_ntdll, name) : nullptr;
-        if (local_ntdll && local_fn) {
-            const uint64_t offset = reinterpret_cast<uintptr_t>(local_fn) - reinterpret_cast<uintptr_t>(local_ntdll);
-            if (offset != 0 && (mod.size == 0 || offset < mod.size)) {
-                module_name = mod.name.empty() ? mod.path : mod.name;
-                return mod.base + offset;
-            }
+static ntdll_export_resolution_t resolve_attached_ntdll_export(HANDLE hf, const char* tag, uint32_t pid, const char* name) {
+    ntdll_export_resolution_t out;
+    if (pid == 0 || !name || !name[0])
+        return out;
+
+    auto local_t0 = std::chrono::steady_clock::now();
+    HMODULE local_ntdll = GetModuleHandleW(L"ntdll.dll");
+    FARPROC local_fn = local_ntdll ? GetProcAddress(local_ntdll, name) : nullptr;
+    HMODULE owner = nullptr;
+    const bool owner_ok = local_fn &&
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(local_fn), &owner) &&
+        owner == local_ntdll;
+    if (local_ntdll && local_fn && owner_ok) {
+        const uintptr_t local_base = reinterpret_cast<uintptr_t>(local_ntdll);
+        const uintptr_t local_addr = reinterpret_cast<uintptr_t>(local_fn);
+        if (local_addr > local_base) {
+            out.local_rva = static_cast<uint64_t>(local_addr - local_base);
+            out.local_export_ok = true;
         }
     }
-    return 0;
+    out.local_us = elapsed_us_since(local_t0);
+
+    auto enum_t0 = std::chrono::steady_clock::now();
+    const std::vector<driver_bridge::module_info_t> modules = driver_bridge::enumerate_modules_for(pid);
+    out.enum_us = elapsed_us_since(enum_t0);
+    out.module_count = modules.size();
+
+    for (const auto& mod : modules) {
+        if (mod.base == 0 || !module_is_ntdll(mod))
+            continue;
+        out.ntdll_seen = true;
+        if (out.local_export_ok && out.local_rva != 0 && (mod.size == 0 || out.local_rva < mod.size)) {
+            out.address = mod.base + out.local_rva;
+            out.module_name = mod.name.empty() ? mod.path : mod.name;
+            out.method = "local_rva";
+            diag::log_tagged_fmt("test_analysis_detail",
+                "%s resolve_ntdll_export name=%s pid=%u method=%s module=%s base=0x%llX size=0x%llX rva=0x%llX va=0x%llX local_us=%lld enum_us=%lld modules=%zu",
+                tag ? tag : "analysis",
+                name,
+                (unsigned)pid,
+                out.method,
+                out.module_name.empty() ? "<none>" : out.module_name.c_str(),
+                (unsigned long long)mod.base,
+                (unsigned long long)mod.size,
+                (unsigned long long)out.local_rva,
+                (unsigned long long)out.address,
+                out.local_us,
+                out.enum_us,
+                out.module_count);
+            return out;
+        }
+    }
+
+    for (const auto& mod : modules) {
+        if (mod.base == 0 || !module_is_ntdll(mod))
+            continue;
+        auto slow_t0 = std::chrono::steady_clock::now();
+        uint64_t fn = driver_bridge::resolve_export_for(pid, mod.base, name);
+        const long long slow_call_us = elapsed_us_since(slow_t0);
+        out.slow_us += slow_call_us;
+        ++out.slow_attempts;
+        diag::log_tagged_fmt("test_analysis_detail",
+            "%s resolve_ntdll_export_fallback name=%s pid=%u module=%s base=0x%llX size=0x%llX result=0x%llX slow_call_us=%lld slow_total_us=%lld attempts=%u local_export_ok=%d local_rva=0x%llX enum_us=%lld status='%s' last_error='%s'",
+            tag ? tag : "analysis",
+            name,
+            (unsigned)pid,
+            (mod.name.empty() ? mod.path : mod.name).c_str(),
+            (unsigned long long)mod.base,
+            (unsigned long long)mod.size,
+            (unsigned long long)fn,
+            slow_call_us,
+            out.slow_us,
+            out.slow_attempts,
+            out.local_export_ok ? 1 : 0,
+            (unsigned long long)out.local_rva,
+            out.enum_us,
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str());
+        if (fn != 0) {
+            out.address = fn;
+            out.module_name = mod.name.empty() ? mod.path : mod.name;
+            out.method = "driver_resolver";
+            return out;
+        }
+    }
+
+    log_msg(hf, tag ? tag : "analysis",
+        "WARN -- unresolved ntdll export name=%s pid=%u local_export_ok=%d local_rva=0x%016llX ntdll_seen=%d modules=%zu local_us=%lld enum_us=%lld slow_attempts=%u slow_us=%lld status=\"%s\" last_error=\"%s\"",
+        name,
+        (unsigned)pid,
+        out.local_export_ok ? 1 : 0,
+        (unsigned long long)out.local_rva,
+        out.ntdll_seen ? 1 : 0,
+        out.module_count,
+        out.local_us,
+        out.enum_us,
+        out.slow_attempts,
+        out.slow_us,
+        driver_bridge::status().c_str(),
+        driver_bridge::last_error().c_str());
+    return out;
 }
 
 static integrity_hunter_fixture_t make_integrity_hunter_fixture(HANDLE hf, const char* tag) {
@@ -1431,6 +1881,24 @@ static void test_integrity_hunter_nodes(HANDLE hf, std::atomic<int>& passed, std
         return;
     }
 
+    const uint32_t primary_pid = driver_bridge::attached_pid();
+    integrity_hunter_sidecar_scope_t sidecar_scope(hf, "integ_nd", primary_pid);
+    if (!sidecar_scope.start(10000)) {
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        log_msg(hf, "integ_nd", "FAIL -- isolated integrity hunter sidecar was not ready primary_pid=%u active_pid=%u status=\"%s\" last_error=\"%s\" (elapsed %lld ms)",
+            (unsigned)primary_pid,
+            driver_bridge::attached_pid(),
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str(),
+            (long long)ms);
+        failed.fetch_add(1);
+        return;
+    }
+    log_msg(hf, "integ_nd", "SAFE-FIXTURE -- isolated integrity hunter target sidecar_pid=%lu primary_pid=%u active_pid=%u",
+        static_cast<unsigned long>(sidecar_scope.sidecar.pid),
+        (unsigned)primary_pid,
+        driver_bridge::attached_pid());
+
     integrity_hunter_fixture_t fixture = make_integrity_hunter_fixture(hf, "integ_nd");
     if (fixture.address == 0) {
         failed.fetch_add(1);
@@ -1441,21 +1909,33 @@ static void test_integrity_hunter_nodes(HANDLE hf, std::atomic<int>& passed, std
     driver_bridge::memory_region_t before_region{};
     const bool before_query = driver_bridge::query_memory_for(target_pid, fixture.address, before_region);
 
-    std::string read_module;
-    uint64_t target_read_fn = resolve_attached_ntdll_export(target_pid, "RtlCompareMemory", read_module);
-    const char* target_read_kind = "RtlCompareMemory";
+    ntdll_export_resolution_t target_resolve = resolve_attached_ntdll_export(hf, "integ_nd", target_pid, "RtlComputeCrc32");
+    std::string read_module = target_resolve.module_name;
+    uint64_t target_read_fn = target_resolve.address;
+    const char* target_read_kind = "RtlComputeCrc32";
     if (target_read_fn == 0) {
-        target_read_fn = resolve_attached_ntdll_export(target_pid, "RtlComputeCrc32", read_module);
-        target_read_kind = "RtlComputeCrc32";
+        target_resolve = resolve_attached_ntdll_export(hf, "integ_nd", target_pid, "RtlCompareMemory");
+        read_module = target_resolve.module_name;
+        target_read_fn = target_resolve.address;
+        target_read_kind = "RtlCompareMemory";
     }
 
     if (target_read_fn == 0) {
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-        log_msg(hf, "integ_nd", "FAIL -- no target-side ntdll read function resolved for integrity fixture pid=%u addr=0x%016llX before_query=%d before_protect=0x%08X status=\"%s\" last_error=\"%s\" (elapsed %lld ms)",
+        log_msg(hf, "integ_nd", "FAIL -- no target-side ntdll read function resolved for integrity fixture pid=%u addr=0x%016llX before_query=%d before_protect=0x%08X resolve_method=%s local_export_ok=%d local_rva=0x%016llX ntdll_seen=%d modules=%zu local_us=%lld enum_us=%lld slow_attempts=%u slow_us=%lld status=\"%s\" last_error=\"%s\" (elapsed %lld ms)",
             (unsigned)target_pid,
             (unsigned long long)fixture.address,
             before_query ? 1 : 0,
             (unsigned)before_region.protect,
+            target_resolve.method,
+            target_resolve.local_export_ok ? 1 : 0,
+            (unsigned long long)target_resolve.local_rva,
+            target_resolve.ntdll_seen ? 1 : 0,
+            target_resolve.module_count,
+            target_resolve.local_us,
+            target_resolve.enum_us,
+            target_resolve.slow_attempts,
+            target_resolve.slow_us,
             driver_bridge::status().c_str(),
             driver_bridge::last_error().c_str(),
             (long long)ms);
@@ -1536,7 +2016,7 @@ static void test_integrity_hunter_nodes(HANDLE hf, std::atomic<int>& passed, std
     const bool after_query = driver_bridge::query_memory_for(target_pid, fixture.address, after_region);
     const bool after_guard = after_query && ((after_region.protect & PAGE_GUARD) != 0);
 
-    diag::log_tagged_fmt("test_analysis_detail", "integ_nd result: pid=%u addr=0x%llX started=%d install_seen=%d install_complete=%d install_success=%d idle=%d pg_session=%u before_query=%d before_protect=0x%08X guard_query=%d guard_state=%d guard_protect=0x%08X after_query=%d after_guard=%d after_protect=0x%08X driver_read_ok=%d read_bytes=%zu driver_write_ok=%d target_read_kind=%s target_read_module=%s target_read_fn=0x%llX target_read_attempts=%u target_read_ok=%u target_read_result=0x%llX nodes=%zu events=%zu total_reads=%llu first_reader=0x%llX first_fault=0x%llX first_access=%u first_node_reads=%d status='%s'",
+    diag::log_tagged_fmt("test_analysis_detail", "integ_nd result: pid=%u addr=0x%llX started=%d install_seen=%d install_complete=%d install_success=%d idle=%d pg_session=%u before_query=%d before_protect=0x%08X guard_query=%d guard_state=%d guard_protect=0x%08X after_query=%d after_guard=%d after_protect=0x%08X driver_read_ok=%d read_bytes=%zu driver_write_ok=%d target_read_kind=%s target_read_module=%s target_read_fn=0x%llX target_read_resolve_method=%s target_read_rva=0x%llX resolve_local_us=%lld resolve_enum_us=%lld resolve_slow_attempts=%u resolve_slow_us=%lld target_read_attempts=%u target_read_ok=%u target_read_result=0x%llX nodes=%zu events=%zu total_reads=%llu first_reader=0x%llX first_fault=0x%llX first_access=%u first_node_reads=%d status='%s'",
         (unsigned)target_pid,
         (unsigned long long)fixture.address,
         started ? 1 : 0,
@@ -1559,6 +2039,12 @@ static void test_integrity_hunter_nodes(HANDLE hf, std::atomic<int>& passed, std
         target_read_kind,
         read_module.empty() ? "<none>" : read_module.c_str(),
         (unsigned long long)target_read_fn,
+        target_resolve.method,
+        (unsigned long long)target_resolve.local_rva,
+        target_resolve.local_us,
+        target_resolve.enum_us,
+        target_resolve.slow_attempts,
+        target_resolve.slow_us,
         target_read_attempts,
         target_read_ok,
         (unsigned long long)target_read_result,
@@ -1573,13 +2059,19 @@ static void test_integrity_hunter_nodes(HANDLE hf, std::atomic<int>& passed, std
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (started && install_seen && install_complete && install_success && idle && guard_query && guard_set && target_read_ok > 0 && total_reads > 0 && event_count > 0 && node_count > 0) {
-        log_msg(hf, "integ_nd", "PASS -- fixture=0x%016llX guard_state=%d read_ok=%d write_ok=%d target_read=%s module=%s attempts=%u ok=%u nodes=%zu events=%zu total_reads=%llu first_reader=0x%016llX first_fault=0x%016llX node_reads=%d status=\"%s\" (elapsed %lld ms)",
+        log_msg(hf, "integ_nd", "PASS -- fixture=0x%016llX guard_state=%d read_ok=%d write_ok=%d target_read=%s module=%s resolve_method=%s rva=0x%016llX resolve_local_us=%lld resolve_enum_us=%lld resolve_slow_attempts=%u resolve_slow_us=%lld attempts=%u ok=%u nodes=%zu events=%zu total_reads=%llu first_reader=0x%016llX first_fault=0x%016llX node_reads=%d status=\"%s\" (elapsed %lld ms)",
             (unsigned long long)fixture.address,
             guard_set ? 1 : 0,
             driver_read_ok ? 1 : 0,
             driver_write_ok ? 1 : 0,
             target_read_kind,
             read_module.empty() ? "<none>" : read_module.c_str(),
+            target_resolve.method,
+            (unsigned long long)target_resolve.local_rva,
+            target_resolve.local_us,
+            target_resolve.enum_us,
+            target_resolve.slow_attempts,
+            target_resolve.slow_us,
             target_read_attempts,
             target_read_ok,
             node_count,
@@ -1592,7 +2084,7 @@ static void test_integrity_hunter_nodes(HANDLE hf, std::atomic<int>& passed, std
             (long long)ms);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "integ_nd", "FAIL -- integrity hunter evidence insufficient: fixture=0x%016llX started=%d install_seen=%d install_complete=%d install_success=%d idle=%d pg_session=%u guard_query=%d guard_state=%d guard_protect=0x%08X read_ok=%d read_bytes=%zu write_ok=%d target_read=%s module=%s attempts=%u ok=%u result=0x%016llX nodes=%zu events=%zu total_reads=%llu first_reader=0x%016llX first_fault=0x%016llX first_access=%u node_reads=%d status=\"%s\" status_bridge=\"%s\" last_error=\"%s\" (elapsed %lld ms)",
+        log_msg(hf, "integ_nd", "FAIL -- integrity hunter evidence insufficient: fixture=0x%016llX started=%d install_seen=%d install_complete=%d install_success=%d idle=%d pg_session=%u guard_query=%d guard_state=%d guard_protect=0x%08X read_ok=%d read_bytes=%zu write_ok=%d target_read=%s module=%s resolve_method=%s rva=0x%016llX resolve_local_us=%lld resolve_enum_us=%lld resolve_slow_attempts=%u resolve_slow_us=%lld attempts=%u ok=%u result=0x%016llX nodes=%zu events=%zu total_reads=%llu first_reader=0x%016llX first_fault=0x%016llX first_access=%u node_reads=%d status=\"%s\" status_bridge=\"%s\" last_error=\"%s\" (elapsed %lld ms)",
             (unsigned long long)fixture.address,
             started ? 1 : 0,
             install_seen ? 1 : 0,
@@ -1608,6 +2100,12 @@ static void test_integrity_hunter_nodes(HANDLE hf, std::atomic<int>& passed, std
             driver_write_ok ? 1 : 0,
             target_read_kind,
             read_module.empty() ? "<none>" : read_module.c_str(),
+            target_resolve.method,
+            (unsigned long long)target_resolve.local_rva,
+            target_resolve.local_us,
+            target_resolve.enum_us,
+            target_resolve.slow_attempts,
+            target_resolve.slow_us,
             target_read_attempts,
             target_read_ok,
             (unsigned long long)target_read_result,
@@ -1926,12 +2424,60 @@ static void test_xref_engine_scan_state(HANDLE hf, std::atomic<int>& passed, std
     log_msg(hf, "xref_st", "START -- xref engine scanning state");
     auto t0 = std::chrono::steady_clock::now();
 
-    bool scanning = xref_engine::is_scanning();
-    xref_engine::cancel_scan();
+    bool scanning_before = xref_engine::is_scanning();
+    bool cancel_before = xref_engine::g_state.cancel.load(std::memory_order_acquire);
+    float progress_before = xref_engine::g_state.progress.load(std::memory_order_acquire);
+    size_t results_before = 0;
+    {
+        std::lock_guard<std::mutex> lk(xref_engine::g_state.mutex);
+        results_before = xref_engine::g_state.results.size();
+    }
+    log_msg(hf, "xref_st", "STATE before_cancel scanning=%d cancel=%d progress=%.3f results=%zu",
+        scanning_before ? 1 : 0,
+        cancel_before ? 1 : 0,
+        static_cast<double>(progress_before),
+        results_before);
 
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "xref_st", "PASS -- is_scanning=%d (elapsed %lld ms)", scanning, (long long)ms);
-    passed.fetch_add(1);
+    xref_engine::cancel_scan();
+    bool idle_after_cancel = xref_engine::wait_until_idle(scanning_before ? 250 : 1);
+
+    bool scanning_after = xref_engine::is_scanning();
+    bool cancel_after = xref_engine::g_state.cancel.load(std::memory_order_acquire);
+    float progress_after = xref_engine::g_state.progress.load(std::memory_order_acquire);
+    size_t results_after = 0;
+    {
+        std::lock_guard<std::mutex> lk(xref_engine::g_state.mutex);
+        results_after = xref_engine::g_state.results.size();
+    }
+
+    long long us = elapsed_us_since(t0);
+    bool progress_ok = progress_before >= 0.f && progress_before <= 1.f && progress_after >= 0.f && progress_after <= 1.f;
+    log_msg(hf, "xref_st", "STATE after_cancel scanning=%d cancel=%d progress=%.3f results=%zu idle_after_cancel=%d elapsed_us=%lld",
+        scanning_after ? 1 : 0,
+        cancel_after ? 1 : 0,
+        static_cast<double>(progress_after),
+        results_after,
+        idle_after_cancel ? 1 : 0,
+        us);
+    if (progress_ok && idle_after_cancel && (!scanning_before || !scanning_after)) {
+        log_msg(hf, "xref_st", "PASS -- cancel path and state invariants verified before(scanning=%d results=%zu) after(scanning=%d results=%zu) elapsed_us=%lld",
+            scanning_before ? 1 : 0,
+            results_before,
+            scanning_after ? 1 : 0,
+            results_after,
+            us);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "xref_st", "FAIL -- invalid xref scan state progress_ok=%d idle_after_cancel=%d scanning_before=%d scanning_after=%d progress_before=%.3f progress_after=%.3f elapsed_us=%lld",
+            progress_ok ? 1 : 0,
+            idle_after_cancel ? 1 : 0,
+            scanning_before ? 1 : 0,
+            scanning_after ? 1 : 0,
+            static_cast<double>(progress_before),
+            static_cast<double>(progress_after),
+            us);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_xref_type_names(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -1963,11 +2509,31 @@ static void test_xref_db_state(HANDLE hf, std::atomic<int>& passed, std::atomic<
 
     uint64_t from = 0x140001020;
     uint64_t addr = 0x140002000;
+    size_t module_count_before = 0;
+    size_t query_count_before = 0;
+    bool building_before = xref_db::g_state.building.load(std::memory_order_acquire);
+    float progress_before = xref_db::g_state.progress.load(std::memory_order_acquire);
+    {
+        std::lock_guard<std::mutex> lk(xref_db::g_state.mutex);
+        module_count_before = xref_db::g_state.modules.size();
+        query_count_before = xref_db::g_state.query_results.size();
+    }
+    log_msg(hf, "xrefdb_st", "STATE before_seed building=%d progress=%.3f modules=%zu query_results=%zu fixture_from=0x%llX fixture_to=0x%llX",
+        building_before ? 1 : 0,
+        static_cast<double>(progress_before),
+        module_count_before,
+        query_count_before,
+        (unsigned long long)from,
+        (unsigned long long)addr);
+
     seed_xref_db_fixture(from, addr);
     bool building = xref_db::g_state.building.load();
+    float progress_after = xref_db::g_state.progress.load(std::memory_order_acquire);
     size_t module_count = 0;
     size_t built_count = 0;
     size_t total_xrefs = 0;
+    bool fixture_to_found = false;
+    bool fixture_from_found = false;
     {
         std::lock_guard<std::mutex> lk(xref_db::g_state.mutex);
         module_count = xref_db::g_state.modules.size();
@@ -1976,18 +2542,51 @@ static void test_xref_db_state(HANDLE hf, std::atomic<int>& passed, std::atomic<
                 ++built_count;
                 total_xrefs += kv.second.total_xrefs;
             }
+            auto to_it = kv.second.to_index.find(addr);
+            if (to_it != kv.second.to_index.end()) {
+                for (const auto& x : to_it->second) {
+                    if (x.from_addr == from && x.to_addr == addr)
+                        fixture_to_found = true;
+                }
+            }
+            auto from_it = kv.second.from_index.find(from);
+            if (from_it != kv.second.from_index.end()) {
+                for (const auto& x : from_it->second) {
+                    if (x.from_addr == from && x.to_addr == addr)
+                        fixture_from_found = true;
+                }
+            }
         }
     }
 
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    if (!building && (module_count == 0 || built_count == 0 || total_xrefs == 0)) {
-        log_msg(hf, "xrefdb_st", "FAIL -- xref_db idle with empty fixture state modules=%zu built=%zu total_xrefs=%zu (elapsed %lld ms)",
-            module_count, built_count, total_xrefs, (long long)ms);
+    long long us = elapsed_us_since(t0);
+    bool progress_ok = progress_after >= 0.f && progress_after <= 1.f;
+    if (!building && (module_count == 0 || built_count == 0 || total_xrefs == 0 || !fixture_to_found || !fixture_from_found || !progress_ok)) {
+        log_msg(hf, "xrefdb_st", "FAIL -- xref_db fixture state invalid modules=%zu built=%zu total_xrefs=%zu fixture_to=%d fixture_from=%d progress=%.3f progress_ok=%d elapsed_us=%lld",
+            module_count,
+            built_count,
+            total_xrefs,
+            fixture_to_found ? 1 : 0,
+            fixture_from_found ? 1 : 0,
+            static_cast<double>(progress_after),
+            progress_ok ? 1 : 0,
+            us);
         failed.fetch_add(1);
         return;
     }
-    log_msg(hf, "xrefdb_st", "PASS -- building=%d modules=%zu built=%zu total_xrefs=%zu (elapsed %lld ms)",
-        building, module_count, built_count, total_xrefs, (long long)ms);
+    log_msg(hf, "xrefdb_st", "PASS -- before(modules=%zu query=%zu building=%d progress=%.3f) after(building=%d modules=%zu built=%zu total_xrefs=%zu fixture_to=%d fixture_from=%d progress=%.3f) elapsed_us=%lld",
+        module_count_before,
+        query_count_before,
+        building_before ? 1 : 0,
+        static_cast<double>(progress_before),
+        building ? 1 : 0,
+        module_count,
+        built_count,
+        total_xrefs,
+        fixture_to_found ? 1 : 0,
+        fixture_from_found ? 1 : 0,
+        static_cast<double>(progress_after),
+        us);
     passed.fetch_add(1);
 }
 
@@ -2138,20 +2737,86 @@ static void test_fuzzer_state(HANDLE hf, std::atomic<int>& passed, std::atomic<i
 
     bool running = fuzzer_engine::g_state.running.load();
     bool cancel = fuzzer_engine::g_state.cancel.load();
+    bool minimizing = fuzzer_engine::g_state.minimizing.load();
+    bool analyzing_crash = fuzzer_engine::g_state.analyzing_crash.load();
+    bool worker_active = fuzzer_engine::g_state.worker_active.load();
+    bool setup_complete = fuzzer_engine::g_state.setup_complete.load();
+    bool setup_success = fuzzer_engine::g_state.setup_success.load();
+    bool active = false;
 
     uint64_t total_exec = 0;
     uint64_t total_crash = 0;
+    uint64_t unique_crash = 0;
+    uint64_t new_coverage = 0;
+    uint64_t execs_per_second = 0;
+    double elapsed_seconds = 0.0;
+    uint32_t corpus_size_stat = 0;
+    uint32_t edge_coverage = 0;
+    size_t corpus_size = 0;
+    size_t crashes_size = 0;
+    size_t unique_crashes_size = 0;
+    size_t rate_history_size = 0;
+    std::string setup_error;
     {
         std::lock_guard<std::mutex> lk(fuzzer_engine::g_state.mutex);
         total_exec = fuzzer_engine::g_state.stats.total_executions;
         total_crash = fuzzer_engine::g_state.stats.total_crashes;
+        unique_crash = fuzzer_engine::g_state.stats.total_unique_crashes;
+        new_coverage = fuzzer_engine::g_state.stats.new_coverage_finds;
+        execs_per_second = fuzzer_engine::g_state.stats.executions_per_second;
+        elapsed_seconds = fuzzer_engine::g_state.stats.elapsed_seconds;
+        corpus_size_stat = fuzzer_engine::g_state.stats.corpus_size;
+        edge_coverage = fuzzer_engine::g_state.stats.edge_coverage;
+        corpus_size = fuzzer_engine::g_state.corpus.size();
+        crashes_size = fuzzer_engine::g_state.crashes.size();
+        unique_crashes_size = fuzzer_engine::g_state.unique_crashes.size();
+        rate_history_size = fuzzer_engine::g_state.stats.exec_rate_history.size();
+        setup_error = fuzzer_engine::g_state.setup_error;
+        active = fuzzer_engine::g_state.active;
     }
 
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "fuzz_st", "PASS -- running=%d cancel=%d execs=%llu crashes=%llu (elapsed %lld ms)",
-        running, cancel,
-        (unsigned long long)total_exec, (unsigned long long)total_crash, (long long)ms);
-    passed.fetch_add(1);
+    long long us = elapsed_us_since(t0);
+    bool counters_ok = total_crash <= total_exec && unique_crash <= total_crash && crashes_size >= unique_crashes_size;
+    bool lifecycle_ok = running || !worker_active || setup_complete || !setup_error.empty();
+    log_msg(hf, "fuzz_st", "STATE running=%d cancel=%d minimizing=%d analyzing=%d worker_active=%d setup_complete=%d setup_success=%d active=%d execs=%llu crashes=%llu unique=%llu new_cov=%llu eps=%llu elapsed_s=%.3f corpus_stat=%u corpus_size=%zu crashes_size=%zu unique_size=%zu edge_cov=%u rate_history=%zu setup_error_len=%zu elapsed_us=%lld",
+        running ? 1 : 0,
+        cancel ? 1 : 0,
+        minimizing ? 1 : 0,
+        analyzing_crash ? 1 : 0,
+        worker_active ? 1 : 0,
+        setup_complete ? 1 : 0,
+        setup_success ? 1 : 0,
+        active ? 1 : 0,
+        (unsigned long long)total_exec,
+        (unsigned long long)total_crash,
+        (unsigned long long)unique_crash,
+        (unsigned long long)new_coverage,
+        (unsigned long long)execs_per_second,
+        elapsed_seconds,
+        corpus_size_stat,
+        corpus_size,
+        crashes_size,
+        unique_crashes_size,
+        edge_coverage,
+        rate_history_size,
+        setup_error.size(),
+        us);
+    if (counters_ok && lifecycle_ok) {
+        log_msg(hf, "fuzz_st", "PASS -- fuzzer state counters and lifecycle flags are coherent elapsed_us=%lld", us);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "fuzz_st", "FAIL -- fuzzer state incoherent counters_ok=%d lifecycle_ok=%d execs=%llu crashes=%llu unique=%llu worker_active=%d setup_complete=%d setup_error_len=%zu elapsed_us=%lld",
+            counters_ok ? 1 : 0,
+            lifecycle_ok ? 1 : 0,
+            (unsigned long long)total_exec,
+            (unsigned long long)total_crash,
+            (unsigned long long)unique_crash,
+            worker_active ? 1 : 0,
+            setup_complete ? 1 : 0,
+            setup_error.size(),
+            us);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_fuzzer_config(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -2159,18 +2824,44 @@ static void test_fuzzer_config(HANDLE hf, std::atomic<int>& passed, std::atomic<
     auto t0 = std::chrono::steady_clock::now();
 
     fuzzer_engine::fuzz_config_t cfg;
+    bool strategies_ok = cfg.strategies[0] && cfg.strategies[1] && cfg.strategies[2] &&
+                         cfg.strategies[3] && cfg.strategies[4] && !cfg.strategies[5];
     bool ok = (cfg.max_instructions == 100000 &&
                cfg.timeout_ms == 5000 &&
                cfg.max_iterations == 100000 &&
                cfg.input_size == 256 &&
-               cfg.mutation_count == 4);
+               cfg.mutation_count == 4 &&
+               strategies_ok &&
+               cfg.target_address == 0 &&
+               cfg.end_address == 0 &&
+               cfg.pid == 0 &&
+               cfg.tid == 0 &&
+               cfg.input_address == 0);
 
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    long long us = elapsed_us_since(t0);
+    log_msg(hf, "fuzz_cfg", "CONFIG max_instructions=%u timeout_ms=%u max_iterations=%u input_size=%d mutation_count=%d strategies=[%d,%d,%d,%d,%d,%d] target=0x%llX end=0x%llX pid=%u tid=%u input=0x%llX expected={100000,5000,100000,256,4,[1,1,1,1,1,0],zero-targets} elapsed_us=%lld",
+        cfg.max_instructions,
+        cfg.timeout_ms,
+        cfg.max_iterations,
+        cfg.input_size,
+        cfg.mutation_count,
+        cfg.strategies[0] ? 1 : 0,
+        cfg.strategies[1] ? 1 : 0,
+        cfg.strategies[2] ? 1 : 0,
+        cfg.strategies[3] ? 1 : 0,
+        cfg.strategies[4] ? 1 : 0,
+        cfg.strategies[5] ? 1 : 0,
+        (unsigned long long)cfg.target_address,
+        (unsigned long long)cfg.end_address,
+        cfg.pid,
+        cfg.tid,
+        (unsigned long long)cfg.input_address,
+        us);
     if (ok) {
-        log_msg(hf, "fuzz_cfg", "PASS -- config defaults correct (elapsed %lld ms)", (long long)ms);
+        log_msg(hf, "fuzz_cfg", "PASS -- config defaults and strategy bitmap match expected elapsed_us=%lld", us);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "fuzz_cfg", "FAIL -- unexpected config defaults (elapsed %lld ms)", (long long)ms);
+        log_msg(hf, "fuzz_cfg", "FAIL -- unexpected config defaults strategies_ok=%d elapsed_us=%lld", strategies_ok ? 1 : 0, us);
         failed.fetch_add(1);
     }
 }
@@ -2182,20 +2873,40 @@ static void test_stealth_state(HANDLE hf, std::atomic<int>& passed, std::atomic<
     bool active = stealth_engine::g_state.active.load();
     uint32_t attached_pid = driver_bridge::attached_pid();
     bool active_for_attached = attached_pid != 0 && stealth_engine::is_active_for_pid(attached_pid);
+    auto session = stealth_engine::get_session_info();
+    std::string status = stealth_engine::get_status();
+    size_t hook_count = session.hooks.size();
+    size_t alloc_count = session.allocated_regions.size();
+    bool session_coherent = !active || (session.pid != 0 && !status.empty());
+    bool attached_coherent = attached_pid == 0 || !active || active_for_attached;
 
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    if (attached_pid == 0 || active_for_attached) {
-        log_msg(hf, "stealth_st", "PASS -- active=%d attached_pid=%u active_for_attached=%d (elapsed %lld ms)",
-            active ? 1 : 0, attached_pid, active_for_attached ? 1 : 0, (long long)ms);
+    long long us = elapsed_us_since(t0);
+    log_msg(hf, "stealth_st", "STATE active=%d attached_pid=%u active_for_attached=%d session_pid=%u peb=%d context=%d rdtsc=%d hooks=%zu allocs=%zu status_len=%zu status=\"%s\" elapsed_us=%lld",
+        active ? 1 : 0,
+        attached_pid,
+        active_for_attached ? 1 : 0,
+        session.pid,
+        session.peb_spoofed ? 1 : 0,
+        session.context_hooked ? 1 : 0,
+        session.rdtsc_hooked ? 1 : 0,
+        hook_count,
+        alloc_count,
+        status.size(),
+        status.c_str(),
+        us);
+    if (session_coherent && attached_coherent) {
+        log_msg(hf, "stealth_st", "PASS -- stealth state coherent active=%d session_pid=%u attached_pid=%u elapsed_us=%lld",
+            active ? 1 : 0, session.pid, attached_pid, us);
         passed.fetch_add(1);
     } else {
-        auto session = stealth_engine::get_session_info();
-        log_msg(hf, "stealth_st", "FAIL -- attached_pid=%u stealth_active=%d session_pid=%u status=\"%s\" (elapsed %lld ms)",
+        log_msg(hf, "stealth_st", "FAIL -- incoherent stealth state session_coherent=%d attached_coherent=%d attached_pid=%u active=%d session_pid=%u status=\"%s\" elapsed_us=%lld",
+            session_coherent ? 1 : 0,
+            attached_coherent ? 1 : 0,
             attached_pid,
             active ? 1 : 0,
             session.pid,
-            stealth_engine::get_status().c_str(),
-            (long long)ms);
+            status.c_str(),
+            us);
         failed.fetch_add(1);
     }
 }
@@ -2207,12 +2918,21 @@ static void test_stealth_options_default(HANDLE hf, std::atomic<int>& passed, st
     stealth_engine::stealth_options_t opts;
     bool ok = (opts.spoof_peb == true && opts.hook_rdtsc == true && opts.scrub_context == false);
 
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    long long us = elapsed_us_since(t0);
+    log_msg(hf, "stealth_op", "CONFIG spoof_peb=%d hook_rdtsc=%d scrub_context=%d expected={1,1,0} elapsed_us=%lld",
+        opts.spoof_peb ? 1 : 0,
+        opts.hook_rdtsc ? 1 : 0,
+        opts.scrub_context ? 1 : 0,
+        us);
     if (ok) {
-        log_msg(hf, "stealth_op", "PASS -- default options correct (elapsed %lld ms)", (long long)ms);
+        log_msg(hf, "stealth_op", "PASS -- default options match expected strict stealth posture elapsed_us=%lld", us);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "stealth_op", "FAIL -- unexpected defaults (elapsed %lld ms)", (long long)ms);
+        log_msg(hf, "stealth_op", "FAIL -- unexpected defaults spoof_peb=%d hook_rdtsc=%d scrub_context=%d elapsed_us=%lld",
+            opts.spoof_peb ? 1 : 0,
+            opts.hook_rdtsc ? 1 : 0,
+            opts.scrub_context ? 1 : 0,
+            us);
         failed.fetch_add(1);
     }
 }
@@ -2222,12 +2942,46 @@ static void test_struct_recon_state(HANDLE hf, std::atomic<int>& passed, std::at
     auto t0 = std::chrono::steady_clock::now();
 
     bool monitoring = struct_recon::g_state.monitoring.load();
+    bool cancel = struct_recon::g_state.cancel.load();
+    bool ai_naming = struct_recon::g_state.ai_naming.load();
     float progress = struct_recon::g_state.progress.load();
+    bool active = false;
+    size_t field_count = 0;
+    size_t access_count = 0;
+    size_t history_count = 0;
+    size_t saved_count = 0;
+    bool disk_cache_loaded = false;
+    {
+        std::lock_guard<std::mutex> lk(struct_recon::g_state.mutex);
+        active = struct_recon::g_state.active;
+        field_count = struct_recon::g_state.current.fields.size();
+        access_count = struct_recon::g_state.access_log.size();
+        history_count = struct_recon::g_state.history.size();
+        saved_count = struct_recon::g_state.saved_structs.size();
+        disk_cache_loaded = struct_recon::g_state.disk_cache_loaded;
+    }
 
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "strecon_st", "PASS -- monitoring=%d progress=%.2f (elapsed %lld ms)",
-        monitoring, progress, (long long)ms);
-    passed.fetch_add(1);
+    long long us = elapsed_us_since(t0);
+    bool progress_ok = progress >= 0.f && progress <= 1.f;
+    log_msg(hf, "strecon_st", "STATE monitoring=%d cancel=%d ai_naming=%d active=%d progress=%.3f fields=%zu accesses=%zu history=%zu saved=%zu disk_cache=%d elapsed_us=%lld",
+        monitoring ? 1 : 0,
+        cancel ? 1 : 0,
+        ai_naming ? 1 : 0,
+        active ? 1 : 0,
+        static_cast<double>(progress),
+        field_count,
+        access_count,
+        history_count,
+        saved_count,
+        disk_cache_loaded ? 1 : 0,
+        us);
+    if (progress_ok) {
+        log_msg(hf, "strecon_st", "PASS -- struct recon state progress and snapshots are coherent elapsed_us=%lld", us);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "strecon_st", "FAIL -- progress out of range progress=%.3f elapsed_us=%lld", static_cast<double>(progress), us);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_struct_recon_field_types(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -2242,12 +2996,22 @@ static void test_struct_recon_field_types(HANDLE hf, std::atomic<int>& passed, s
                std::strcmp(struct_recon::field_type_name(struct_recon::field_type_t::pointer), "void*") == 0 &&
                std::strcmp(struct_recon::field_type_name(struct_recon::field_type_t::vtable_ptr), "vtable*") == 0);
 
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    long long us = elapsed_us_since(t0);
+    log_msg(hf, "strecon_ft", "TYPES count=%d unknown=%d pointer=%d pointer_name=%s vtable=%d vtable_name=%s utf8_name=%s bool_name=%s expected_count_gt=20 elapsed_us=%lld",
+        count_val,
+        static_cast<int>(struct_recon::field_type_t::unknown),
+        static_cast<int>(struct_recon::field_type_t::pointer),
+        struct_recon::field_type_name(struct_recon::field_type_t::pointer),
+        static_cast<int>(struct_recon::field_type_t::vtable_ptr),
+        struct_recon::field_type_name(struct_recon::field_type_t::vtable_ptr),
+        struct_recon::field_type_name(struct_recon::field_type_t::utf8_string),
+        struct_recon::field_type_name(struct_recon::field_type_t::bool8),
+        us);
     if (ok) {
-        log_msg(hf, "strecon_ft", "PASS -- field_type_t has %d values (elapsed %lld ms)", count_val, (long long)ms);
+        log_msg(hf, "strecon_ft", "PASS -- field_type_t ordinals and names verified count=%d elapsed_us=%lld", count_val, us);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "strecon_ft", "FAIL -- unexpected field_type_t layout (elapsed %lld ms)", (long long)ms);
+        log_msg(hf, "strecon_ft", "FAIL -- unexpected field_type_t layout count=%d elapsed_us=%lld", count_val, us);
         failed.fetch_add(1);
     }
 }
@@ -2257,14 +3021,46 @@ static void test_decrypt_oracle_state(HANDLE hf, std::atomic<int>& passed, std::
     auto t0 = std::chrono::steady_clock::now();
 
     bool scanning = decrypt_oracle::g_state.scanning.load();
+    bool cancel = decrypt_oracle::g_state.cancel.load();
+    bool timed_out = decrypt_oracle::g_state.timed_out.load();
     float progress = decrypt_oracle::g_state.progress.load();
     int total_xrefs = decrypt_oracle::g_state.total_xrefs.load();
     int processed_xrefs = decrypt_oracle::g_state.processed_xrefs.load();
+    size_t result_count = 0;
+    std::string status;
+    {
+        std::lock_guard<std::mutex> lk(decrypt_oracle::g_state.mutex);
+        result_count = decrypt_oracle::g_state.results.size();
+        status = decrypt_oracle::g_state.status_text;
+    }
 
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "decr_st", "PASS -- scanning=%d progress=%.2f total_xrefs=%d processed=%d (elapsed %lld ms)",
-        scanning, progress, total_xrefs, processed_xrefs, (long long)ms);
-    passed.fetch_add(1);
+    long long us = elapsed_us_since(t0);
+    bool progress_ok = progress >= 0.f && progress <= 1.f;
+    bool counts_ok = total_xrefs >= 0 && processed_xrefs >= 0 && (total_xrefs == 0 || processed_xrefs <= total_xrefs);
+    log_msg(hf, "decr_st", "STATE scanning=%d cancel=%d timed_out=%d progress=%.3f total_xrefs=%d processed=%d results=%zu status_len=%zu status=\"%s\" elapsed_us=%lld",
+        scanning ? 1 : 0,
+        cancel ? 1 : 0,
+        timed_out ? 1 : 0,
+        static_cast<double>(progress),
+        total_xrefs,
+        processed_xrefs,
+        result_count,
+        status.size(),
+        status.c_str(),
+        us);
+    if (progress_ok && counts_ok) {
+        log_msg(hf, "decr_st", "PASS -- decrypt oracle state progress and counters are coherent elapsed_us=%lld", us);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "decr_st", "FAIL -- invalid decrypt oracle state progress_ok=%d counts_ok=%d progress=%.3f total=%d processed=%d elapsed_us=%lld",
+            progress_ok ? 1 : 0,
+            counts_ok ? 1 : 0,
+            static_cast<double>(progress),
+            total_xrefs,
+            processed_xrefs,
+            us);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_decrypt_oracle_config(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -2275,14 +3071,24 @@ static void test_decrypt_oracle_config(HANDLE hf, std::atomic<int>& passed, std:
     bool ok = (cfg.max_instructions == 50000 &&
                cfg.timeout_ms == 5000 &&
                cfg.min_string_length == 4 &&
-               cfg.min_printable_ratio > 0.7f);
+               cfg.min_printable_ratio == 0.75f &&
+               cfg.region_address == 0 &&
+               cfg.region_size == 0);
 
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    long long us = elapsed_us_since(t0);
+    log_msg(hf, "decr_cfg", "CONFIG region=0x%llX size=0x%llX max_instructions=%u timeout_ms=%u min_string_length=%d printable_ratio=%.3f expected={0,0,50000,5000,4,0.750} elapsed_us=%lld",
+        (unsigned long long)cfg.region_address,
+        (unsigned long long)cfg.region_size,
+        cfg.max_instructions,
+        cfg.timeout_ms,
+        cfg.min_string_length,
+        static_cast<double>(cfg.min_printable_ratio),
+        us);
     if (ok) {
-        log_msg(hf, "decr_cfg", "PASS -- config defaults correct (elapsed %lld ms)", (long long)ms);
+        log_msg(hf, "decr_cfg", "PASS -- config defaults match expected decrypt-oracle scan limits elapsed_us=%lld", us);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "decr_cfg", "FAIL -- unexpected config defaults (elapsed %lld ms)", (long long)ms);
+        log_msg(hf, "decr_cfg", "FAIL -- unexpected config defaults elapsed_us=%lld", us);
         failed.fetch_add(1);
     }
 }
@@ -2627,6 +3433,15 @@ static bool run_analysis_test_bounded(HANDLE hf, const analysis_test_entry_t& te
     }
 
     if (result.status == test_lab::bounded_run_status_t::timed_out) {
+        if (std::strcmp(test.name, "integrity_hunter_nodes") == 0) {
+            integrity_hunter::stop_hunt();
+            const bool idle = integrity_hunter::wait_until_idle(3000);
+            log_msg(hf, "analysis", "TIMEOUT-CLEANUP -- %s stop_hunt issued idle_after_cleanup=%d hunting=%d worker=%d",
+                test.name,
+                idle ? 1 : 0,
+                integrity_hunter::g_state.hunting.load() ? 1 : 0,
+                integrity_hunter::g_state.worker_active.load() ? 1 : 0);
+        }
         log_msg(hf, "analysis", "FAIL -- %s exceeded %lu ms watchdog; bounded worker still draining",
             test.name, static_cast<unsigned long>(timeout_ms));
         failed.fetch_add(1);
@@ -2679,7 +3494,7 @@ void phase_analysis_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>&
         { "code_patcher_count",          test_code_patcher_count          },
         { "integrity_hunter_state",      test_integrity_hunter_state      },
         { "integrity_hunter_start_stop", test_integrity_hunter_start_stop },
-        { "integrity_hunter_nodes",      test_integrity_hunter_nodes      },
+        { "integrity_hunter_nodes",      test_integrity_hunter_nodes, 45000 },
         { "binary_map_generate",         test_binary_map_generate         },
         { "binary_map_options",          test_binary_map_options          },
         { "binary_map_pin_unpin",        test_binary_map_pin_unpin        },

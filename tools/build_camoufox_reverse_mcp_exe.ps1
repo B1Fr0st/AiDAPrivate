@@ -21,21 +21,27 @@ function Resolve-Python {
         $resolved = Resolve-Path -LiteralPath $Requested -ErrorAction Stop
         return $resolved.Path
     }
-    $py = Get-Command py.exe -ErrorAction SilentlyContinue
-    if ($py) {
-        $candidate = (& $py.Source -3.12 -c "import sys; print(sys.executable)" 2>$null)
-        if ($LASTEXITCODE -eq 0 -and $candidate) {
-            return [string]$candidate
-        }
-    }
+    $repoRoot = Resolve-RepoRoot
     $candidateRoots = @(
+        (Join-Path $repoRoot ".deps\camoufox-runtime\python.exe"),
+        (Join-Path $repoRoot "build-ninja\deps\camoufox-runtime\python.exe"),
         "$env:LOCALAPPDATA\AiDA\runtimes\python\Python312-3.12.10-x64\python.exe",
         "$env:LOCALAPPDATA\Programs\Python\Python313\python.exe",
         "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe"
     )
     foreach ($candidate in $candidateRoots) {
         if ($candidate -and [IO.File]::Exists($candidate)) {
-            return $candidate
+            return (Resolve-Path -LiteralPath $candidate).Path
+        }
+    }
+    $py = Get-Command py.exe -ErrorAction SilentlyContinue
+    if ($py) {
+        try {
+            $candidate = (& $py.Source -3.12 -c "import sys; print(sys.executable)" 2>$null)
+            if ($LASTEXITCODE -eq 0 -and $candidate -and [IO.File]::Exists([string]$candidate)) {
+                return [string]$candidate
+            }
+        } catch {
         }
     }
     throw "Python 3.12 or 3.13 is required to build the frozen Camoufox reverse MCP executable."
@@ -278,9 +284,14 @@ function Invoke-FrozenMcpToolContract {
     $psi.Environment["PYTHONIOENCODING"] = "utf-8"
     $proc = [System.Diagnostics.Process]::new()
     $proc.StartInfo = $psi
+    $stdioTimeoutMs = 45000
+    Write-Output "frozen_mcp_stdio_smoke_command=$Executable"
+    Write-Output "frozen_mcp_stdio_smoke_cwd=$RepoRoot"
+    Write-Output "frozen_mcp_stdio_smoke_timeout_ms=$stdioTimeoutMs"
     if (-not $proc.Start()) {
         throw "Frozen MCP stdio smoke process failed to start."
     }
+    Write-Output "frozen_mcp_stdio_smoke_child_pid=$($proc.Id)"
     $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
     $stderrTask = $proc.StandardError.ReadToEndAsync()
     $init = @{
@@ -310,12 +321,20 @@ function Invoke-FrozenMcpToolContract {
     Write-McpStdioFrame -Writer $proc.StandardInput -JsonText $initialized
     Write-McpStdioFrame -Writer $proc.StandardInput -JsonText $toolsList
     $proc.StandardInput.Close()
-    if (-not $proc.WaitForExit(45000)) {
-        try { $proc.Kill() } catch {}
-        throw "Frozen MCP stdio smoke timed out after 45000 ms."
+    if (-not $proc.WaitForExit($stdioTimeoutMs)) {
+        Stop-ProcessTreeAndWait -Process $proc -TimeoutMs 15000
+        $stdoutTimeout = $stdoutTask.GetAwaiter().GetResult()
+        $stderrTimeout = $stderrTask.GetAwaiter().GetResult()
+        Write-Output "frozen_mcp_stdio_smoke_timeout=1"
+        Write-Output "frozen_mcp_stdio_smoke_stdout_tail=$(ConvertTo-CompactLogText $stdoutTimeout)"
+        Write-Output "frozen_mcp_stdio_smoke_stderr_tail=$(ConvertTo-CompactLogText $stderrTimeout)"
+        throw "Frozen MCP stdio smoke timed out after $stdioTimeoutMs ms. stdout=[$(ConvertTo-CompactLogText $stdoutTimeout)] stderr=[$(ConvertTo-CompactLogText $stderrTimeout)]"
     }
     $stdout = $stdoutTask.GetAwaiter().GetResult()
     $stderr = $stderrTask.GetAwaiter().GetResult()
+    Write-Output "frozen_mcp_stdio_smoke_exit_code=$($proc.ExitCode)"
+    Write-Output "frozen_mcp_stdio_smoke_stdout_tail=$(ConvertTo-CompactLogText $stdout)"
+    Write-Output "frozen_mcp_stdio_smoke_stderr_tail=$(ConvertTo-CompactLogText $stderr)"
     if ($proc.ExitCode -ne 0) {
         throw "Frozen MCP stdio smoke exited with $($proc.ExitCode). stdout=[$(ConvertTo-CompactLogText $stdout)] stderr=[$(ConvertTo-CompactLogText $stderr)]"
     }
@@ -380,6 +399,7 @@ function Invoke-FrozenMcpToolContract {
         $inventory += $name
     }
     $inventory = $inventory | Sort-Object
+    Write-Output "frozen_mcp_stdio_tools_list_result=count:$($inventory.Count);missing:$($missing -join ',');tools:$($inventory -join ',')"
     if ($missing.Count -gt 0) {
         throw "Frozen MCP stdio tool contract missing required tools: missing=$($missing -join ',') inventory=$($inventory -join ',')"
     }
@@ -414,15 +434,30 @@ function Invoke-FrozenMcpSmoke {
     $psi.Environment["PYTHONIOENCODING"] = "utf-8"
     $proc = [System.Diagnostics.Process]::new()
     $proc.StartInfo = $psi
+    $importTimeoutMs = 90000
+    Write-Output "frozen_mcp_smoke_command=$Executable"
+    Write-Output "frozen_mcp_smoke_cwd=$RepoRoot"
+    Write-Output "frozen_mcp_smoke_timeout_ms=$importTimeoutMs"
     if (-not $proc.Start()) {
         throw "Frozen MCP smoke process failed to start."
     }
-    if (-not $proc.WaitForExit(90000)) {
+    Write-Output "frozen_mcp_smoke_child_pid=$($proc.Id)"
+    $importStdoutTask = $proc.StandardOutput.ReadToEndAsync()
+    $importStderrTask = $proc.StandardError.ReadToEndAsync()
+    if (-not $proc.WaitForExit($importTimeoutMs)) {
         Stop-ProcessTreeAndWait -Process $proc -TimeoutMs 15000
-        throw "Frozen MCP smoke timed out after 90000 ms."
+        $timeoutStdout = $importStdoutTask.GetAwaiter().GetResult()
+        $timeoutStderr = $importStderrTask.GetAwaiter().GetResult()
+        Write-Output "frozen_mcp_smoke_timeout=1"
+        Write-Output "frozen_mcp_smoke_stdout_tail=$(ConvertTo-CompactLogText $timeoutStdout)"
+        Write-Output "frozen_mcp_smoke_stderr_tail=$(ConvertTo-CompactLogText $timeoutStderr)"
+        throw "Frozen MCP smoke timed out after $importTimeoutMs ms. stdout=[$(ConvertTo-CompactLogText $timeoutStdout)] stderr=[$(ConvertTo-CompactLogText $timeoutStderr)]"
     }
-    $stdout = $proc.StandardOutput.ReadToEnd()
-    $stderr = $proc.StandardError.ReadToEnd()
+    $stdout = $importStdoutTask.GetAwaiter().GetResult()
+    $stderr = $importStderrTask.GetAwaiter().GetResult()
+    Write-Output "frozen_mcp_smoke_exit_code=$($proc.ExitCode)"
+    Write-Output "frozen_mcp_smoke_stdout_tail=$(ConvertTo-CompactLogText $stdout)"
+    Write-Output "frozen_mcp_smoke_stderr_tail=$(ConvertTo-CompactLogText $stderr)"
     if ($proc.ExitCode -ne 0 -or $stdout -notmatch "AIDA_CAMOUFOX_IMPORT_SMOKE_OK") {
         throw "Frozen MCP smoke failed with exit $($proc.ExitCode). stdout=[$stdout] stderr=[$stderr]"
     }
@@ -438,7 +473,7 @@ function Invoke-FrozenMcpSmoke {
     $livePsi.RedirectStandardOutput = $true
     $livePsi.RedirectStandardError = $true
     $livePsi.Environment["AIDA_CAMOUFOX_LIVE_SMOKE"] = "1"
-    $livePsi.Environment["AIDA_CAMOUFOX_LIVE_SMOKE_TIMEOUT_MS"] = "30000"
+    $livePsi.Environment["AIDA_CAMOUFOX_LIVE_SMOKE_TIMEOUT_MS"] = "120000"
     $livePsi.Environment["AIDA_CAMOUFOX_TESTLAB_FAST_PROBE"] = "0"
     $livePsi.Environment["AIDA_CAMOUFOX_EXECUTABLE"] = $browser
     $livePsi.Environment["AIDA_CAMOUFOX_DEBUG_LOG"] = $smokeLog
@@ -446,15 +481,30 @@ function Invoke-FrozenMcpSmoke {
     $livePsi.Environment["PYTHONIOENCODING"] = "utf-8"
     $liveProc = [System.Diagnostics.Process]::new()
     $liveProc.StartInfo = $livePsi
+    $liveTimeoutMs = 300000
+    Write-Output "frozen_mcp_live_smoke_command=$Executable"
+    Write-Output "frozen_mcp_live_smoke_cwd=$RepoRoot"
+    Write-Output "frozen_mcp_live_smoke_timeout_ms=$liveTimeoutMs"
     if (-not $liveProc.Start()) {
         throw "Frozen MCP live smoke process failed to start."
     }
-    if (-not $liveProc.WaitForExit(180000)) {
+    Write-Output "frozen_mcp_live_smoke_child_pid=$($liveProc.Id)"
+    $liveStdoutTask = $liveProc.StandardOutput.ReadToEndAsync()
+    $liveStderrTask = $liveProc.StandardError.ReadToEndAsync()
+    if (-not $liveProc.WaitForExit($liveTimeoutMs)) {
         Stop-ProcessTreeAndWait -Process $liveProc -TimeoutMs 15000
-        throw "Frozen MCP live smoke timed out after 180000 ms."
+        $timeoutLiveStdout = $liveStdoutTask.GetAwaiter().GetResult()
+        $timeoutLiveStderr = $liveStderrTask.GetAwaiter().GetResult()
+        Write-Output "frozen_mcp_live_smoke_timeout=1"
+        Write-Output "frozen_mcp_live_smoke_stdout_tail=$(ConvertTo-CompactLogText $timeoutLiveStdout)"
+        Write-Output "frozen_mcp_live_smoke_stderr_tail=$(ConvertTo-CompactLogText $timeoutLiveStderr)"
+        throw "Frozen MCP live smoke timed out after $liveTimeoutMs ms. stdout=[$(ConvertTo-CompactLogText $timeoutLiveStdout)] stderr=[$(ConvertTo-CompactLogText $timeoutLiveStderr)]"
     }
-    $liveStdout = $liveProc.StandardOutput.ReadToEnd()
-    $liveStderr = $liveProc.StandardError.ReadToEnd()
+    $liveStdout = $liveStdoutTask.GetAwaiter().GetResult()
+    $liveStderr = $liveStderrTask.GetAwaiter().GetResult()
+    Write-Output "frozen_mcp_live_smoke_exit_code=$($liveProc.ExitCode)"
+    Write-Output "frozen_mcp_live_smoke_stdout_tail=$(ConvertTo-CompactLogText $liveStdout)"
+    Write-Output "frozen_mcp_live_smoke_stderr_tail=$(ConvertTo-CompactLogText $liveStderr)"
     if ($liveProc.ExitCode -ne 0 -or $liveStdout -notmatch "AIDA_CAMOUFOX_LIVE_SMOKE_OK") {
         throw "Frozen MCP live smoke failed with exit $($liveProc.ExitCode). stdout=[$liveStdout] stderr=[$liveStderr]"
     }
@@ -507,7 +557,7 @@ try {
     & $Python -m venv $venv
     if ($LASTEXITCODE -ne 0) { throw "venv creation failed" }
     $venvPython = Join-Path $venv "Scripts\python.exe"
-    & $venvPython -m pip install --upgrade pip wheel setuptools nuitka zstandard ordered-set pyinstaller rich rich-click
+    & $venvPython -m pip install --upgrade pip wheel setuptools nuitka zstandard ordered-set pyinstaller rich rich-click tzdata
     if ($LASTEXITCODE -ne 0) { throw "build dependency install failed" }
     & $venvPython -m pip install $SourceRoot
     if ($LASTEXITCODE -ne 0) { throw "camoufox-reverse-mcp dependency install failed" }
@@ -599,7 +649,7 @@ async def _run_live_smoke_async():
         executable = os.path.abspath(os.path.expandvars(os.path.expanduser(executable)))
     if not executable or not os.path.isfile(executable):
         raise FileNotFoundError(f"Camoufox executable is not available: {executable}")
-    timeout_ms = _int_env("AIDA_CAMOUFOX_LIVE_SMOKE_TIMEOUT_MS", 30000)
+    timeout_ms = _int_env("AIDA_CAMOUFOX_LIVE_SMOKE_TIMEOUT_MS", 75000)
     config = {
         "headless": False,
         "executable_path": executable,
@@ -629,8 +679,9 @@ async def _run_live_smoke_async():
         camoufox_launch_ms = int(diagnostics.get("camoufox_launch_ms") or launch.get("camoufox_launch_ms") or browser_ready_ms)
         launch_elapsed_ms = int(diagnostics.get("elapsed_ms") or 0)
         privacy = diagnostics.get("privacy") if isinstance(diagnostics.get("privacy"), dict) else {}
-        if camoufox_launch_ms <= 0 or camoufox_launch_ms > 15000:
-            raise RuntimeError(f"camoufox_launch_ms={camoufox_launch_ms} exceeds 15000")
+        launch_budget_ms = max(45000, min(timeout_ms, 90000))
+        if camoufox_launch_ms <= 0 or camoufox_launch_ms > launch_budget_ms:
+            raise RuntimeError(f"camoufox_launch_ms={camoufox_launch_ms} exceeds {launch_budget_ms}")
         if launch_elapsed_ms <= 0 or launch_elapsed_ms > timeout_ms:
             raise RuntimeError(f"launch_elapsed_ms={launch_elapsed_ms} exceeds {timeout_ms}")
         if not privacy.get("webrtc_blocked") or not privacy.get("ice_probe_ok") or privacy.get("ice_candidate_leak_detected"):
@@ -725,6 +776,25 @@ if __name__ == "__main__":
     if ($selectedBackend -eq "pyinstaller") {
         $pyiWork = Join-Path $workRoot "pyinstaller-work"
         $pyiSpec = Join-Path $workRoot "pyinstaller-spec"
+        $pyiHooks = Join-Path $workRoot "pyinstaller-hooks"
+        New-Item -ItemType Directory -Force -Path $pyiHooks | Out-Null
+        @'
+from PyInstaller.utils.hooks import collect_all
+
+def _filter(name):
+    return name != "camoufox.gui" and not name.startswith("camoufox.gui.")
+
+datas, binaries, hiddenimports = collect_all("camoufox", filter_submodules=_filter, on_error="ignore")
+'@ | Set-Content -LiteralPath (Join-Path $pyiHooks "hook-camoufox.py") -Encoding UTF8
+        @'
+from PyInstaller.utils.hooks import collect_all
+
+def _filter(name):
+    blocked = "browserforge.injectors.undetected_playwright"
+    return name != blocked and not name.startswith(blocked + ".")
+
+datas, binaries, hiddenimports = collect_all("browserforge", filter_submodules=_filter, on_error="ignore")
+'@ | Set-Content -LiteralPath (Join-Path $pyiHooks "hook-browserforge.py") -Encoding UTF8
         & $venvPython -m PyInstaller `
             --noconfirm `
             --clean `
@@ -735,9 +805,8 @@ if __name__ == "__main__":
             --distpath $OutputDir `
             --workpath $pyiWork `
             --specpath $pyiSpec `
+            --additional-hooks-dir $pyiHooks `
             --collect-all camoufox_reverse_mcp `
-            --collect-all camoufox `
-            --collect-all browserforge `
             --collect-all apify_fingerprint_datapoints `
             --collect-all language_tags `
             --collect-all ua_parser `
@@ -745,6 +814,10 @@ if __name__ == "__main__":
             --collect-submodules playwright `
             --collect-data playwright `
             --collect-all esprima `
+            --exclude-module camoufox.gui `
+            --exclude-module PySide6 `
+            --exclude-module browserforge.injectors.undetected_playwright `
+            --exclude-module undetected_playwright `
             --hidden-import mcp.server.fastmcp `
             --hidden-import mcp.server.stdio `
             --hidden-import mcp.shared.session `

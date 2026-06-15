@@ -2725,21 +2725,38 @@ std::string format_flags(uint64_t rflags) {
 }
 
 std::string format_protect(uint32_t protect) {
-	switch (protect) {
-		case 0x01: return "NOACCESS";
-		case 0x02: return "READONLY";
-		case 0x04: return "READWRITE";
-		case 0x08: return "WRITECOPY";
-		case 0x10: return "EXECUTE";
-		case 0x20: return "EXECUTE_READ";
-		case 0x40: return "EXECUTE_READWRITE";
-		case 0x80: return "EXECUTE_WRITECOPY";
-		default: {
-			char buf[16];
-			snprintf(buf, sizeof(buf), "0x%X", protect);
-			return buf;
-		}
+	uint32_t base = protect & 0xFFu;
+	const char* base_name = nullptr;
+	switch (base) {
+		case 0x01: base_name = "NOACCESS"; break;
+		case 0x02: base_name = "READONLY"; break;
+		case 0x04: base_name = "READWRITE"; break;
+		case 0x08: base_name = "WRITECOPY"; break;
+		case 0x10: base_name = "EXECUTE"; break;
+		case 0x20: base_name = "EXECUTE_READ"; break;
+		case 0x40: base_name = "EXECUTE_READWRITE"; break;
+		case 0x80: base_name = "EXECUTE_WRITECOPY"; break;
+		default: break;
 	}
+	uint32_t modifiers = protect & ~0xFFu;
+	if (base_name && modifiers == 0)
+		return base_name;
+	if (!base_name) {
+		char buf[16];
+		snprintf(buf, sizeof(buf), "0x%X", protect);
+		return buf;
+	}
+	std::string out = base_name;
+	if (modifiers & 0x100u) out += "|GUARD";
+	if (modifiers & 0x200u) out += "|NOCACHE";
+	if (modifiers & 0x400u) out += "|WRITECOMBINE";
+	uint32_t unknown = modifiers & ~0x700u;
+	if (unknown != 0) {
+		char buf[16];
+		snprintf(buf, sizeof(buf), "|0x%X", unknown);
+		out += buf;
+	}
+	return out;
 }
 
 

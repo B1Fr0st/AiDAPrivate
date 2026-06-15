@@ -54,6 +54,11 @@ static void log_msg(HANDLE hf, const char* tag, const char* fmt, ...) {
     test_all_features::mirror_full_test_log_line(tag, detail, s.c_str());
 }
 
+static long long elapsed_us_since(std::chrono::steady_clock::time_point t0) {
+    return static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - t0).count());
+}
+
 static uint64_t get_ntdll_fn(const char* name) {
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     if (!ntdll) return 0;
@@ -700,27 +705,73 @@ static void test_get_registers(HANDLE hf, std::atomic<int>& passed, std::atomic<
     log_msg(hf, "dbg_reg", "START -- get registers");
     auto t0 = std::chrono::steady_clock::now();
 
-    diag::log_tagged_fmt("test_dbg_detail", "dbg_reg inputs: get_registers() driver_loaded=%d attached_pid=%u",
-        (int)driver_bridge::is_loaded(), (unsigned)driver_bridge::attached_pid());
+    uint32_t attached_pid = driver_bridge::attached_pid();
+    bool driver_loaded = driver_bridge::is_loaded();
+    bool kernel_bridge = driver_bridge::using_kernel_driver();
+    std::string status = driver_bridge::status();
+    std::string last_error = driver_bridge::last_error();
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_reg inputs: get_registers() driver_loaded=%d kernel_bridge=%d attached_pid=%u status='%s' last_error='%s'",
+        (int)driver_loaded, kernel_bridge ? 1 : 0, (unsigned)attached_pid, status.c_str(), last_error.c_str());
+    log_msg(hf, "dbg_reg", "INPUT -- get_registers twice driver_loaded=%d kernel_bridge=%d attached_pid=%u status=\"%s\" last_error=\"%s\"",
+        (int)driver_loaded, kernel_bridge ? 1 : 0, attached_pid, status.c_str(), last_error.c_str());
 
     auto regs = debugger_engine::get_registers();
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    long long first_us = elapsed_us_since(t0);
+    auto second_start = std::chrono::steady_clock::now();
+    auto regs2 = debugger_engine::get_registers();
+    long long second_us = elapsed_us_since(second_start);
+    std::string flags_decoded = debugger_engine::format_flags(regs.rflags);
+    std::string flags_decoded2 = debugger_engine::format_flags(regs2.rflags);
+    long long total_us = elapsed_us_since(t0);
 
     diag::log_tagged_fmt("test_dbg_detail",
-        "dbg_reg result: rip=0x%llX rsp=0x%llX rbp=0x%llX cs=0x%llX ss=0x%llX rflags=0x%llX",
+        "dbg_reg result: rip=0x%llX rsp=0x%llX rbp=0x%llX cs=0x%llX ss=0x%llX rflags=0x%llX second_rip=0x%llX second_rsp=0x%llX",
         (unsigned long long)regs.rip, (unsigned long long)regs.rsp, (unsigned long long)regs.rbp,
-        (unsigned long long)regs.cs, (unsigned long long)regs.ss, (unsigned long long)regs.rflags);
+        (unsigned long long)regs.cs, (unsigned long long)regs.ss, (unsigned long long)regs.rflags,
+        (unsigned long long)regs2.rip, (unsigned long long)regs2.rsp);
+    log_msg(hf, "dbg_reg", "OUTPUT -- first rip=0x%llX rsp=0x%llX rbp=0x%llX rflags=0x%llX decoded=\"%s\" cs=0x%llX ss=0x%llX dr7=0x%llX elapsed_us=%lld",
+        (unsigned long long)regs.rip,
+        (unsigned long long)regs.rsp,
+        (unsigned long long)regs.rbp,
+        (unsigned long long)regs.rflags,
+        flags_decoded.c_str(),
+        (unsigned long long)regs.cs,
+        (unsigned long long)regs.ss,
+        (unsigned long long)regs.dr7,
+        first_us);
+    log_msg(hf, "dbg_reg", "OUTPUT -- second rip=0x%llX rsp=0x%llX rbp=0x%llX rflags=0x%llX decoded=\"%s\" cs=0x%llX ss=0x%llX dr7=0x%llX elapsed_us=%lld total_us=%lld",
+        (unsigned long long)regs2.rip,
+        (unsigned long long)regs2.rsp,
+        (unsigned long long)regs2.rbp,
+        (unsigned long long)regs2.rflags,
+        flags_decoded2.c_str(),
+        (unsigned long long)regs2.cs,
+        (unsigned long long)regs2.ss,
+        (unsigned long long)regs2.dr7,
+        second_us,
+        total_us);
 
-    if (regs.rip != 0 && regs.rsp != 0) {
-        log_msg(hf, "dbg_reg", "PASS -- rax=0x%llX rbx=0x%llX rcx=0x%llX rdx=0x%llX rip=0x%llX rsp=0x%llX rflags=0x%llX (elapsed %lld ms)",
+    if (regs.rip != 0 && regs.rsp != 0 && regs2.rip != 0 && regs2.rsp != 0 && regs.cs != 0 && regs.ss != 0) {
+        log_msg(hf, "dbg_reg", "PASS -- rax=0x%llX rbx=0x%llX rcx=0x%llX rdx=0x%llX rip=0x%llX rsp=0x%llX rflags=0x%llX second_rip=0x%llX second_rsp=0x%llX elapsed_us=%lld",
             (unsigned long long)regs.rax, (unsigned long long)regs.rbx,
             (unsigned long long)regs.rcx, (unsigned long long)regs.rdx,
             (unsigned long long)regs.rip, (unsigned long long)regs.rsp,
-            (unsigned long long)regs.rflags, (long long)ms);
+            (unsigned long long)regs.rflags,
+            (unsigned long long)regs2.rip,
+            (unsigned long long)regs2.rsp,
+            total_us);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "dbg_reg", "FAIL -- live thread cannot have rip=0x%llX rsp=0x%llX (both must be non-zero); engine returned empty regs (not attached or context read failed) (elapsed %lld ms)",
-            (unsigned long long)regs.rip, (unsigned long long)regs.rsp, (long long)ms);
+        log_msg(hf, "dbg_reg", "FAIL -- live thread register snapshots invalid first(rip=0x%llX rsp=0x%llX cs=0x%llX ss=0x%llX) second(rip=0x%llX rsp=0x%llX cs=0x%llX ss=0x%llX) elapsed_us=%lld",
+            (unsigned long long)regs.rip,
+            (unsigned long long)regs.rsp,
+            (unsigned long long)regs.cs,
+            (unsigned long long)regs.ss,
+            (unsigned long long)regs2.rip,
+            (unsigned long long)regs2.rsp,
+            (unsigned long long)regs2.cs,
+            (unsigned long long)regs2.ss,
+            total_us);
         failed.fetch_add(1);
     }
 }
@@ -950,19 +1001,25 @@ static void test_set_get_comment(HANDLE hf, std::atomic<int>& passed, std::atomi
 
     uint64_t addr = get_ntdll_fn("NtClose");
     if (addr == 0) { log_msg(hf, "dbg_cmt", "FAIL -- NtClose not found"); failed.fetch_add(1); return; }
-    diag::log_tagged_fmt("test_dbg_detail", "dbg_cmt inputs: addr=0x%llX set_comment='test_comment_12345'", (unsigned long long)addr);
+    std::string before = debugger_engine::get_comment(addr);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_cmt inputs: addr=0x%llX before='%s' set_comment='test_comment_12345'", (unsigned long long)addr, before.c_str());
+    log_msg(hf, "dbg_cmt", "STATE before addr=0x%llX comment=\"%s\" len=%zu", (unsigned long long)addr, before.c_str(), before.size());
 
     debugger_engine::set_comment(addr, "test_comment_12345");
     std::string got = debugger_engine::get_comment(addr);
-    debugger_engine::set_comment(addr, "");
-    diag::log_tagged_fmt("test_dbg_detail", "dbg_cmt result: get_comment=>'%s'", got.c_str());
+    debugger_engine::set_comment(addr, before);
+    std::string restored = debugger_engine::get_comment(addr);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_cmt result: set_get='%s' restored='%s'", got.c_str(), restored.c_str());
 
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    if (got == "test_comment_12345") {
-        log_msg(hf, "dbg_cmt", "PASS -- comment round-trip ok: \"%s\" (elapsed %lld ms)", got.c_str(), (long long)ms);
+    long long us = elapsed_us_since(t0);
+    log_msg(hf, "dbg_cmt", "STATE after_set expected=\"test_comment_12345\" got=\"%s\" restored=\"%s\" restored_matches_before=%d elapsed_us=%lld",
+        got.c_str(), restored.c_str(), restored == before ? 1 : 0, us);
+    if (got == "test_comment_12345" && restored == before) {
+        log_msg(hf, "dbg_cmt", "PASS -- comment round-trip and restore verified elapsed_us=%lld", us);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "dbg_cmt", "FAIL -- expected \"test_comment_12345\" got \"%s\" (elapsed %lld ms)", got.c_str(), (long long)ms);
+        log_msg(hf, "dbg_cmt", "FAIL -- expected set=\"test_comment_12345\" got=\"%s\" before=\"%s\" restored=\"%s\" elapsed_us=%lld",
+            got.c_str(), before.c_str(), restored.c_str(), us);
         failed.fetch_add(1);
     }
 }
@@ -973,19 +1030,25 @@ static void test_set_get_label(HANDLE hf, std::atomic<int>& passed, std::atomic<
 
     uint64_t addr = get_ntdll_fn("NtClose");
     if (addr == 0) { log_msg(hf, "dbg_lbl", "FAIL -- NtClose not found"); failed.fetch_add(1); return; }
-    diag::log_tagged_fmt("test_dbg_detail", "dbg_lbl inputs: addr=0x%llX set_label='test_label_67890'", (unsigned long long)addr);
+    std::string before = debugger_engine::get_label(addr);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_lbl inputs: addr=0x%llX before='%s' set_label='test_label_67890'", (unsigned long long)addr, before.c_str());
+    log_msg(hf, "dbg_lbl", "STATE before addr=0x%llX label=\"%s\" len=%zu", (unsigned long long)addr, before.c_str(), before.size());
 
     debugger_engine::set_label(addr, "test_label_67890");
     std::string got = debugger_engine::get_label(addr);
-    debugger_engine::set_label(addr, "");
-    diag::log_tagged_fmt("test_dbg_detail", "dbg_lbl result: get_label=>'%s'", got.c_str());
+    debugger_engine::set_label(addr, before);
+    std::string restored = debugger_engine::get_label(addr);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_lbl result: set_get='%s' restored='%s'", got.c_str(), restored.c_str());
 
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    if (got == "test_label_67890") {
-        log_msg(hf, "dbg_lbl", "PASS -- label round-trip ok: \"%s\" (elapsed %lld ms)", got.c_str(), (long long)ms);
+    long long us = elapsed_us_since(t0);
+    log_msg(hf, "dbg_lbl", "STATE after_set expected=\"test_label_67890\" got=\"%s\" restored=\"%s\" restored_matches_before=%d elapsed_us=%lld",
+        got.c_str(), restored.c_str(), restored == before ? 1 : 0, us);
+    if (got == "test_label_67890" && restored == before) {
+        log_msg(hf, "dbg_lbl", "PASS -- label round-trip and restore verified elapsed_us=%lld", us);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "dbg_lbl", "FAIL -- expected \"test_label_67890\" got \"%s\" (elapsed %lld ms)", got.c_str(), (long long)ms);
+        log_msg(hf, "dbg_lbl", "FAIL -- expected set=\"test_label_67890\" got=\"%s\" before=\"%s\" restored=\"%s\" elapsed_us=%lld",
+            got.c_str(), before.c_str(), restored.c_str(), us);
         failed.fetch_add(1);
     }
 }
@@ -1007,21 +1070,44 @@ static void test_toggle_bookmark(HANDLE hf, std::atomic<int>& passed, std::atomi
     };
 
     bool before = bookmark_present(addr);
+    size_t count_before = 0;
+    {
+        std::lock_guard<std::mutex> lk(debugger_engine::g_state.anno_mutex);
+        count_before = debugger_engine::g_state.bookmarks.size();
+    }
     debugger_engine::toggle_bookmark(addr);
     bool after_on = bookmark_present(addr);
+    size_t count_after_on = 0;
+    {
+        std::lock_guard<std::mutex> lk(debugger_engine::g_state.anno_mutex);
+        count_after_on = debugger_engine::g_state.bookmarks.size();
+    }
     debugger_engine::toggle_bookmark(addr);
     bool after_off = bookmark_present(addr);
+    size_t count_after_off = 0;
+    {
+        std::lock_guard<std::mutex> lk(debugger_engine::g_state.anno_mutex);
+        count_after_off = debugger_engine::g_state.bookmarks.size();
+    }
     diag::log_tagged_fmt("test_dbg_detail", "dbg_bkm result: before=%d after_on=%d after_off=%d",
         (int)before, (int)after_on, (int)after_off);
 
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    long long us = elapsed_us_since(t0);
+    log_msg(hf, "dbg_bkm", "STATE addr=0x%llX before=%d count_before=%zu after_first=%d count_after_first=%zu after_second=%d count_after_second=%zu elapsed_us=%lld",
+        (unsigned long long)addr,
+        before ? 1 : 0,
+        count_before,
+        after_on ? 1 : 0,
+        count_after_on,
+        after_off ? 1 : 0,
+        count_after_off,
+        us);
     if (after_on != before && after_off == before) {
-        log_msg(hf, "dbg_bkm", "PASS -- bookmark toggled on (present=%d) then off (present=%d) (elapsed %lld ms)",
-            (int)after_on, (int)after_off, (long long)ms);
+        log_msg(hf, "dbg_bkm", "PASS -- bookmark toggled first state and restored original membership elapsed_us=%lld", us);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "dbg_bkm", "FAIL -- toggle did not flip state: before=%d after_on=%d after_off=%d (elapsed %lld ms)",
-            (int)before, (int)after_on, (int)after_off, (long long)ms);
+        log_msg(hf, "dbg_bkm", "FAIL -- toggle did not flip/restore state before=%d after_first=%d after_second=%d elapsed_us=%lld",
+            (int)before, (int)after_on, (int)after_off, us);
         failed.fetch_add(1);
     }
 }
@@ -1104,15 +1190,29 @@ static void test_format_flags(HANDLE hf, std::atomic<int>& passed, std::atomic<i
     uint64_t test_flags = 0x246;
     diag::log_tagged_fmt("test_dbg_detail", "dbg_fmt inputs: format_flags(0x%llX)", (unsigned long long)test_flags);
     std::string formatted = debugger_engine::format_flags(test_flags);
-    diag::log_tagged_fmt("test_dbg_detail", "dbg_fmt result: '%s'", formatted.c_str());
+    std::string expected = "PF ZF IF ";
+    bool has_pf = formatted.find("PF") != std::string::npos;
+    bool has_zf = formatted.find("ZF") != std::string::npos;
+    bool has_if = formatted.find("IF") != std::string::npos;
+    bool has_cf = formatted.find("CF") != std::string::npos;
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_fmt result: '%s' expected='%s'", formatted.c_str(), expected.c_str());
 
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    if (!formatted.empty()) {
-        log_msg(hf, "dbg_fmt", "PASS -- flags 0x%llX => \"%s\" (elapsed %lld ms)",
-            (unsigned long long)test_flags, formatted.c_str(), (long long)ms);
+    long long us = elapsed_us_since(t0);
+    log_msg(hf, "dbg_fmt", "RESULT flags=0x%llX formatted=\"%s\" expected=\"%s\" has_pf=%d has_zf=%d has_if=%d has_cf=%d elapsed_us=%lld",
+        (unsigned long long)test_flags,
+        formatted.c_str(),
+        expected.c_str(),
+        has_pf ? 1 : 0,
+        has_zf ? 1 : 0,
+        has_if ? 1 : 0,
+        has_cf ? 1 : 0,
+        us);
+    if (formatted == expected && has_pf && has_zf && has_if && !has_cf) {
+        log_msg(hf, "dbg_fmt", "PASS -- flags 0x%llX exactly decoded to \"%s\" elapsed_us=%lld",
+            (unsigned long long)test_flags, formatted.c_str(), us);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "dbg_fmt", "FAIL -- format_flags returned empty (elapsed %lld ms)", (long long)ms);
+        log_msg(hf, "dbg_fmt", "FAIL -- expected \"%s\" got \"%s\" elapsed_us=%lld", expected.c_str(), formatted.c_str(), us);
         failed.fetch_add(1);
     }
 }
@@ -1125,15 +1225,19 @@ static void test_format_protect(HANDLE hf, std::atomic<int>& passed, std::atomic
     std::string p1 = debugger_engine::format_protect(PAGE_EXECUTE_READWRITE);
     std::string p2 = debugger_engine::format_protect(PAGE_READONLY);
     std::string p3 = debugger_engine::format_protect(PAGE_READWRITE);
-    diag::log_tagged_fmt("test_dbg_detail", "dbg_prt result: p1='%s' p2='%s' p3='%s'", p1.c_str(), p2.c_str(), p3.c_str());
+    std::string p4 = debugger_engine::format_protect(0x123456u);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_prt result: p1='%s' p2='%s' p3='%s' p4='%s'", p1.c_str(), p2.c_str(), p3.c_str(), p4.c_str());
 
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    if (!p1.empty() && !p2.empty() && !p3.empty()) {
-        log_msg(hf, "dbg_prt", "PASS -- ERW=\"%s\" R=\"%s\" RW=\"%s\" (elapsed %lld ms)",
-            p1.c_str(), p2.c_str(), p3.c_str(), (long long)ms);
+    long long us = elapsed_us_since(t0);
+    bool ok = p1 == "EXECUTE_READWRITE" && p2 == "READONLY" && p3 == "READWRITE" && p4 == "0x123456";
+    log_msg(hf, "dbg_prt", "RESULT ERW=\"%s\" expected=\"EXECUTE_READWRITE\" R=\"%s\" expected=\"READONLY\" RW=\"%s\" expected=\"READWRITE\" unknown=\"%s\" expected=\"0x123456\" elapsed_us=%lld",
+        p1.c_str(), p2.c_str(), p3.c_str(), p4.c_str(), us);
+    if (ok) {
+        log_msg(hf, "dbg_prt", "PASS -- base protection names and unknown fallback match expected outputs elapsed_us=%lld", us);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "dbg_prt", "FAIL -- format_protect returned empty (elapsed %lld ms)", (long long)ms);
+        log_msg(hf, "dbg_prt", "FAIL -- protection format mismatch ERW=\"%s\" R=\"%s\" RW=\"%s\" unknown=\"%s\" elapsed_us=%lld",
+            p1.c_str(), p2.c_str(), p3.c_str(), p4.c_str(), us);
         failed.fetch_add(1);
     }
 }
@@ -1808,6 +1912,13 @@ static void test_comment_multiple_addresses(HANDLE hf, std::atomic<int>& passed,
 
     diag::log_tagged_fmt("test_dbg_detail", "dbg_cmt2 inputs: a1=0x%llX a2=0x%llX a3=0x%llX",
         (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)a3);
+    std::string b1 = debugger_engine::get_comment(a1);
+    std::string b2 = debugger_engine::get_comment(a2);
+    std::string b3 = debugger_engine::get_comment(a3);
+    log_msg(hf, "dbg_cmt2", "STATE before a1=0x%llX c1=\"%s\" a2=0x%llX c2=\"%s\" a3=0x%llX c3=\"%s\"",
+        (unsigned long long)a1, b1.c_str(),
+        (unsigned long long)a2, b2.c_str(),
+        (unsigned long long)a3, b3.c_str());
 
     debugger_engine::set_comment(a1, "comment_alpha");
     debugger_engine::set_comment(a2, "comment_beta");
@@ -1817,18 +1928,25 @@ static void test_comment_multiple_addresses(HANDLE hf, std::atomic<int>& passed,
     std::string c2 = debugger_engine::get_comment(a2);
     std::string c3 = debugger_engine::get_comment(a3);
 
-    debugger_engine::set_comment(a1, "");
-    debugger_engine::set_comment(a2, "");
-    debugger_engine::set_comment(a3, "");
-    diag::log_tagged_fmt("test_dbg_detail", "dbg_cmt2 result: c1='%s' c2='%s' c3='%s'", c1.c_str(), c2.c_str(), c3.c_str());
+    debugger_engine::set_comment(a1, b1);
+    debugger_engine::set_comment(a2, b2);
+    debugger_engine::set_comment(a3, b3);
+    std::string r1 = debugger_engine::get_comment(a1);
+    std::string r2 = debugger_engine::get_comment(a2);
+    std::string r3 = debugger_engine::get_comment(a3);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_cmt2 result: c1='%s' c2='%s' c3='%s' r1='%s' r2='%s' r3='%s'",
+        c1.c_str(), c2.c_str(), c3.c_str(), r1.c_str(), r2.c_str(), r3.c_str());
 
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    if (c1 == "comment_alpha" && c2 == "comment_beta" && c3 == "comment_gamma") {
-        log_msg(hf, "dbg_cmt2", "PASS -- 3 comments set/get round-trip ok (elapsed %lld ms)", (long long)ms);
+    long long us = elapsed_us_since(t0);
+    bool restored = r1 == b1 && r2 == b2 && r3 == b3;
+    log_msg(hf, "dbg_cmt2", "STATE after_set c1=\"%s\" c2=\"%s\" c3=\"%s\" restored=%d r1=\"%s\" r2=\"%s\" r3=\"%s\" elapsed_us=%lld",
+        c1.c_str(), c2.c_str(), c3.c_str(), restored ? 1 : 0, r1.c_str(), r2.c_str(), r3.c_str(), us);
+    if (c1 == "comment_alpha" && c2 == "comment_beta" && c3 == "comment_gamma" && restored) {
+        log_msg(hf, "dbg_cmt2", "PASS -- 3 comments set/get round-trip and restore verified elapsed_us=%lld", us);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "dbg_cmt2", "FAIL -- c1=\"%s\" c2=\"%s\" c3=\"%s\" (elapsed %lld ms)",
-            c1.c_str(), c2.c_str(), c3.c_str(), (long long)ms);
+        log_msg(hf, "dbg_cmt2", "FAIL -- c1=\"%s\" c2=\"%s\" c3=\"%s\" restored=%d elapsed_us=%lld",
+            c1.c_str(), c2.c_str(), c3.c_str(), restored ? 1 : 0, us);
         failed.fetch_add(1);
     }
 }
@@ -1846,6 +1964,10 @@ static void test_label_multiple_addresses(HANDLE hf, std::atomic<int>& passed, s
     }
 
     diag::log_tagged_fmt("test_dbg_detail", "dbg_lbl2 inputs: a1=0x%llX a2=0x%llX", (unsigned long long)a1, (unsigned long long)a2);
+    std::string b1 = debugger_engine::get_label(a1);
+    std::string b2 = debugger_engine::get_label(a2);
+    log_msg(hf, "dbg_lbl2", "STATE before a1=0x%llX l1=\"%s\" a2=0x%llX l2=\"%s\"",
+        (unsigned long long)a1, b1.c_str(), (unsigned long long)a2, b2.c_str());
 
     debugger_engine::set_label(a1, "label_first");
     debugger_engine::set_label(a2, "label_second");
@@ -1853,16 +1975,21 @@ static void test_label_multiple_addresses(HANDLE hf, std::atomic<int>& passed, s
     std::string l1 = debugger_engine::get_label(a1);
     std::string l2 = debugger_engine::get_label(a2);
 
-    debugger_engine::set_label(a1, "");
-    debugger_engine::set_label(a2, "");
-    diag::log_tagged_fmt("test_dbg_detail", "dbg_lbl2 result: l1='%s' l2='%s'", l1.c_str(), l2.c_str());
+    debugger_engine::set_label(a1, b1);
+    debugger_engine::set_label(a2, b2);
+    std::string r1 = debugger_engine::get_label(a1);
+    std::string r2 = debugger_engine::get_label(a2);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_lbl2 result: l1='%s' l2='%s' r1='%s' r2='%s'", l1.c_str(), l2.c_str(), r1.c_str(), r2.c_str());
 
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    if (l1 == "label_first" && l2 == "label_second") {
-        log_msg(hf, "dbg_lbl2", "PASS -- 2 labels set/get round-trip ok (elapsed %lld ms)", (long long)ms);
+    long long us = elapsed_us_since(t0);
+    bool restored = r1 == b1 && r2 == b2;
+    log_msg(hf, "dbg_lbl2", "STATE after_set l1=\"%s\" l2=\"%s\" restored=%d r1=\"%s\" r2=\"%s\" elapsed_us=%lld",
+        l1.c_str(), l2.c_str(), restored ? 1 : 0, r1.c_str(), r2.c_str(), us);
+    if (l1 == "label_first" && l2 == "label_second" && restored) {
+        log_msg(hf, "dbg_lbl2", "PASS -- 2 labels set/get round-trip and restore verified elapsed_us=%lld", us);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "dbg_lbl2", "FAIL -- l1=\"%s\" l2=\"%s\" (elapsed %lld ms)", l1.c_str(), l2.c_str(), (long long)ms);
+        log_msg(hf, "dbg_lbl2", "FAIL -- l1=\"%s\" l2=\"%s\" restored=%d elapsed_us=%lld", l1.c_str(), l2.c_str(), restored ? 1 : 0, us);
         failed.fetch_add(1);
     }
 }
@@ -1873,20 +2000,38 @@ static void test_label_lookup_by_name(HANDLE hf, std::atomic<int>& passed, std::
 
     uint64_t addr = get_ntdll_fn("NtReadFile");
     if (addr == 0) { log_msg(hf, "dbg_llkp", "FAIL -- NtReadFile not found"); failed.fetch_add(1); return; }
-    diag::log_tagged_fmt("test_dbg_detail", "dbg_llkp inputs: addr=0x%llX set_label='label_lookup_test_xyzzy'", (unsigned long long)addr);
+    std::string before = debugger_engine::get_label(addr);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_llkp inputs: addr=0x%llX before='%s' set_label='label_lookup_test_xyzzy'", (unsigned long long)addr, before.c_str());
 
     debugger_engine::set_label(addr, "label_lookup_test_xyzzy");
     std::string got = debugger_engine::get_label(addr);
-    debugger_engine::set_label(addr, "");
-    diag::log_tagged_fmt("test_dbg_detail", "dbg_llkp result: get_label=>'%s'", got.c_str());
+    uint64_t reverse_addr = 0;
+    size_t label_count = 0;
+    {
+        std::lock_guard<std::mutex> lk(debugger_engine::g_state.anno_mutex);
+        label_count = debugger_engine::g_state.labels.size();
+        for (const auto& kv : debugger_engine::g_state.labels) {
+            if (kv.second.text == "label_lookup_test_xyzzy") {
+                reverse_addr = kv.first;
+                break;
+            }
+        }
+    }
+    debugger_engine::set_label(addr, before);
+    std::string restored = debugger_engine::get_label(addr);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_llkp result: get_label='%s' reverse_addr=0x%llX restored='%s'",
+        got.c_str(), (unsigned long long)reverse_addr, restored.c_str());
 
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    if (got == "label_lookup_test_xyzzy") {
-        log_msg(hf, "dbg_llkp", "PASS -- label resolved ok (elapsed %lld ms)", (long long)ms);
+    long long us = elapsed_us_since(t0);
+    log_msg(hf, "dbg_llkp", "STATE expected=\"label_lookup_test_xyzzy\" got=\"%s\" reverse_addr=0x%llX expected_addr=0x%llX labels=%zu restored=\"%s\" restored_matches_before=%d elapsed_us=%lld",
+        got.c_str(), (unsigned long long)reverse_addr, (unsigned long long)addr, label_count,
+        restored.c_str(), restored == before ? 1 : 0, us);
+    if (got == "label_lookup_test_xyzzy" && reverse_addr == addr && restored == before) {
+        log_msg(hf, "dbg_llkp", "PASS -- label get and reverse lookup by name verified elapsed_us=%lld", us);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "dbg_llkp", "FAIL -- expected \"label_lookup_test_xyzzy\" got \"%s\" (elapsed %lld ms)",
-            got.c_str(), (long long)ms);
+        log_msg(hf, "dbg_llkp", "FAIL -- expected label/reverse lookup mismatch got=\"%s\" reverse_addr=0x%llX expected_addr=0x%llX restored_matches=%d elapsed_us=%lld",
+            got.c_str(), (unsigned long long)reverse_addr, (unsigned long long)addr, restored == before ? 1 : 0, us);
         failed.fetch_add(1);
     }
 }
@@ -1907,27 +2052,77 @@ static void test_bookmark_listing(HANDLE hf, std::atomic<int>& passed, std::atom
     diag::log_tagged_fmt("test_dbg_detail", "dbg_bklst inputs: toggle_bookmark a1=0x%llX a2=0x%llX a3=0x%llX",
         (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)a3);
 
-    debugger_engine::toggle_bookmark(a1);
-    debugger_engine::toggle_bookmark(a2);
-    debugger_engine::toggle_bookmark(a3);
+    auto bookmark_present = [&](uint64_t a) -> bool {
+        std::lock_guard<std::mutex> lk(debugger_engine::g_state.anno_mutex);
+        for (uint64_t b : debugger_engine::g_state.bookmarks) {
+            if (b == a) return true;
+        }
+        return false;
+    };
+
+    bool b1 = bookmark_present(a1);
+    bool b2 = bookmark_present(a2);
+    bool b3 = bookmark_present(a3);
+    size_t count_before = 0;
+    {
+        std::lock_guard<std::mutex> lk(debugger_engine::g_state.anno_mutex);
+        count_before = debugger_engine::g_state.bookmarks.size();
+    }
+    log_msg(hf, "dbg_bklst", "STATE before count=%zu a1_present=%d a2_present=%d a3_present=%d",
+        count_before, b1 ? 1 : 0, b2 ? 1 : 0, b3 ? 1 : 0);
+
+    if (!b1) debugger_engine::toggle_bookmark(a1);
+    if (!b2) debugger_engine::toggle_bookmark(a2);
+    if (!b3) debugger_engine::toggle_bookmark(a3);
 
     size_t count = 0;
+    bool p1 = false;
+    bool p2 = false;
+    bool p3 = false;
     {
         std::lock_guard<std::mutex> lk(debugger_engine::g_state.anno_mutex);
         count = debugger_engine::g_state.bookmarks.size();
+        for (uint64_t b : debugger_engine::g_state.bookmarks) {
+            if (b == a1) p1 = true;
+            if (b == a2) p2 = true;
+            if (b == a3) p3 = true;
+        }
     }
 
-    debugger_engine::toggle_bookmark(a1);
-    debugger_engine::toggle_bookmark(a2);
-    debugger_engine::toggle_bookmark(a3);
-    diag::log_tagged_fmt("test_dbg_detail", "dbg_bklst result: bookmark_count_after_3=%zu", count);
+    if (bookmark_present(a1) != b1) debugger_engine::toggle_bookmark(a1);
+    if (bookmark_present(a2) != b2) debugger_engine::toggle_bookmark(a2);
+    if (bookmark_present(a3) != b3) debugger_engine::toggle_bookmark(a3);
 
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    if (count >= 3) {
-        log_msg(hf, "dbg_bklst", "PASS -- %zu bookmarks after adding 3 (elapsed %lld ms)", count, (long long)ms);
+    size_t count_restored = 0;
+    bool r1 = bookmark_present(a1);
+    bool r2 = bookmark_present(a2);
+    bool r3 = bookmark_present(a3);
+    {
+        std::lock_guard<std::mutex> lk(debugger_engine::g_state.anno_mutex);
+        count_restored = debugger_engine::g_state.bookmarks.size();
+    }
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_bklst result: bookmark_count_after_ensure=%zu present=%d/%d/%d restored=%d/%d/%d",
+        count, p1 ? 1 : 0, p2 ? 1 : 0, p3 ? 1 : 0, r1 ? 1 : 0, r2 ? 1 : 0, r3 ? 1 : 0);
+
+    long long us = elapsed_us_since(t0);
+    bool restored = count_restored == count_before && r1 == b1 && r2 == b2 && r3 == b3;
+    log_msg(hf, "dbg_bklst", "STATE after_ensure count=%zu present={%d,%d,%d} restored_count=%zu restored_present={%d,%d,%d} restored=%d elapsed_us=%lld",
+        count,
+        p1 ? 1 : 0,
+        p2 ? 1 : 0,
+        p3 ? 1 : 0,
+        count_restored,
+        r1 ? 1 : 0,
+        r2 ? 1 : 0,
+        r3 ? 1 : 0,
+        restored ? 1 : 0,
+        us);
+    if (p1 && p2 && p3 && count >= count_before && restored) {
+        log_msg(hf, "dbg_bklst", "PASS -- bookmark listing contains all seeded targets and restores original state elapsed_us=%lld", us);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "dbg_bklst", "FAIL -- expected >= 3 bookmarks, got %zu (elapsed %lld ms)", count, (long long)ms);
+        log_msg(hf, "dbg_bklst", "FAIL -- bookmark listing evidence mismatch count=%zu before=%zu present={%d,%d,%d} restored=%d elapsed_us=%lld",
+            count, count_before, p1 ? 1 : 0, p2 ? 1 : 0, p3 ? 1 : 0, restored ? 1 : 0, us);
         failed.fetch_add(1);
     }
 }
@@ -1967,22 +2162,26 @@ static void test_format_protect_guard(HANDLE hf, std::atomic<int>& passed, std::
     log_msg(hf, "dbg_fpg", "START -- format_protect with GUARD pages");
     auto t0 = std::chrono::steady_clock::now();
 
-    diag::log_tagged_fmt("test_dbg_detail", "dbg_fpg inputs: format_protect(EXECUTE_READ, NOACCESS, GUARD|READWRITE, WRITECOPY)");
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_fpg inputs: format_protect(EXECUTE_READ, NOACCESS, GUARD|READWRITE, WRITECOPY, NOCACHE|WRITECOMBINE|READONLY)");
     std::string p1 = debugger_engine::format_protect(PAGE_EXECUTE_READ);
     std::string p2 = debugger_engine::format_protect(PAGE_NOACCESS);
     std::string p3 = debugger_engine::format_protect(PAGE_GUARD | PAGE_READWRITE);
     std::string p4 = debugger_engine::format_protect(PAGE_WRITECOPY);
-    diag::log_tagged_fmt("test_dbg_detail", "dbg_fpg result: p1='%s' p2='%s' p3='%s' p4='%s'",
-        p1.c_str(), p2.c_str(), p3.c_str(), p4.c_str());
+    std::string p5 = debugger_engine::format_protect(PAGE_NOCACHE | PAGE_WRITECOMBINE | PAGE_READONLY);
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_fpg result: p1='%s' p2='%s' p3='%s' p4='%s' p5='%s'",
+        p1.c_str(), p2.c_str(), p3.c_str(), p4.c_str(), p5.c_str());
 
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    if (!p1.empty() && !p2.empty() && !p3.empty() && !p4.empty()) {
-        log_msg(hf, "dbg_fpg", "PASS -- ER=\"%s\" NA=\"%s\" G|RW=\"%s\" WC=\"%s\" (elapsed %lld ms)",
-            p1.c_str(), p2.c_str(), p3.c_str(), p4.c_str(), (long long)ms);
+    long long us = elapsed_us_since(t0);
+    bool ok = p1 == "EXECUTE_READ" && p2 == "NOACCESS" && p3 == "READWRITE|GUARD" &&
+              p4 == "WRITECOPY" && p5 == "READONLY|NOCACHE|WRITECOMBINE";
+    log_msg(hf, "dbg_fpg", "RESULT ER=\"%s\" expected=\"EXECUTE_READ\" NA=\"%s\" expected=\"NOACCESS\" G_RW=\"%s\" expected=\"READWRITE|GUARD\" WC=\"%s\" expected=\"WRITECOPY\" R_NC_WC=\"%s\" expected=\"READONLY|NOCACHE|WRITECOMBINE\" elapsed_us=%lld",
+        p1.c_str(), p2.c_str(), p3.c_str(), p4.c_str(), p5.c_str(), us);
+    if (ok) {
+        log_msg(hf, "dbg_fpg", "PASS -- guarded and modifier protection formatting matches expected outputs elapsed_us=%lld", us);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "dbg_fpg", "FAIL -- format_protect returned empty: p1=\"%s\" p2=\"%s\" p3=\"%s\" p4=\"%s\" (elapsed %lld ms)",
-            p1.c_str(), p2.c_str(), p3.c_str(), p4.c_str(), (long long)ms);
+        log_msg(hf, "dbg_fpg", "FAIL -- format_protect modifier mismatch p1=\"%s\" p2=\"%s\" p3=\"%s\" p4=\"%s\" p5=\"%s\" elapsed_us=%lld",
+            p1.c_str(), p2.c_str(), p3.c_str(), p4.c_str(), p5.c_str(), us);
         failed.fetch_add(1);
     }
 }
@@ -2003,14 +2202,17 @@ static void test_format_flags_zero(HANDLE hf, std::atomic<int>& passed, std::ato
     bool f2_has_zf = f2.find("ZF") != std::string::npos;
     bool f3_has_cf = f3.find("CF") != std::string::npos;
 
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    if (f0.empty() && !f1.empty() && !f2.empty() && !f3.empty() && f1_has_if && f2_has_zf && f3_has_cf) {
-        log_msg(hf, "dbg_ff0", "PASS -- 0x0=\"%s\" 0x202=\"%s\" 0x246=\"%s\" 0x297=\"%s\" (elapsed %lld ms)",
-            f0.c_str(), f1.c_str(), f2.c_str(), f3.c_str(), (long long)ms);
+    long long us = elapsed_us_since(t0);
+    bool ok = f0.empty() && f1 == "IF " && f2 == "PF ZF IF " && f3 == "CF PF AF SF IF " &&
+              f1_has_if && f2_has_zf && f3_has_cf;
+    log_msg(hf, "dbg_ff0", "RESULT 0x0=\"%s\" expected=\"\" 0x202=\"%s\" expected=\"IF \" 0x246=\"%s\" expected=\"PF ZF IF \" 0x297=\"%s\" expected=\"CF PF AF SF IF \" elapsed_us=%lld",
+        f0.c_str(), f1.c_str(), f2.c_str(), f3.c_str(), us);
+    if (ok) {
+        log_msg(hf, "dbg_ff0", "PASS -- zero and multi-flag formatting exactly matched expected outputs elapsed_us=%lld", us);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "dbg_ff0", "FAIL -- format_flags wrong: 0x0=\"%s\"(want empty) 0x202=\"%s\"(want IF) 0x246=\"%s\"(want ZF) 0x297=\"%s\"(want CF) (elapsed %lld ms)",
-            f0.c_str(), f1.c_str(), f2.c_str(), f3.c_str(), (long long)ms);
+        log_msg(hf, "dbg_ff0", "FAIL -- format_flags mismatch 0x0=\"%s\" 0x202=\"%s\" 0x246=\"%s\" 0x297=\"%s\" elapsed_us=%lld",
+            f0.c_str(), f1.c_str(), f2.c_str(), f3.c_str(), us);
         failed.fetch_add(1);
     }
 }

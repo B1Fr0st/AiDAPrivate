@@ -196,10 +196,10 @@ uint64_t next_request_id()
 constexpr int kToolListWaitMaxMs = 5000;
 constexpr int kLaunchWaitMinMs = 5000;
 constexpr int kLaunchWaitMaxMs = 120000;
-constexpr int kBundledVisibleLaunchWaitMinMs = 45000;
-constexpr int kBundledVisibleLaunchWaitMaxMs = 45000;
-constexpr int kTestLabLaunchWaitDefaultMs = 45000;
-constexpr int kTestLabLaunchWaitMaxMs = 45000;
+constexpr int kBundledVisibleLaunchWaitMinMs = 75000;
+constexpr int kBundledVisibleLaunchWaitMaxMs = 90000;
+constexpr int kTestLabLaunchWaitDefaultMs = 75000;
+constexpr int kTestLabLaunchWaitMaxMs = 90000;
 constexpr DWORD kDependencyProbeTimeoutMs = 9000;
 constexpr int kReadinessProbeTimeoutMs = 10000;
 constexpr int kNavigationWaitMaxMs = 50000;
@@ -2772,6 +2772,7 @@ call_result_t to_bridge_result(const mcp_client::call_result_t& r)
 }
 
 call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::json& args, int timeout_ms, uint64_t request_id = 0);
+void update_page_cache_from_json_locked(const nlohmann::json& data, const char* source);
 
 std::string evaluate_result_error(const call_result_t& r)
 {
@@ -3174,6 +3175,46 @@ call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::j
             diag::log_tagged_fmt("camoufox", "call_worker_late_result request_id=%llu tool=%s generation=%llu child_pid=%lu elapsed_ms=%llu",
                 static_cast<unsigned long long>(request_id), tool_name.c_str(), static_cast<unsigned long long>(generation), static_cast<unsigned long>(child_pid),
                 static_cast<unsigned long long>(now_ms() - worker_start));
+            bool recovered = false;
+            bool same_client = false;
+            bool same_generation = false;
+            bool same_child_pid = false;
+            bool child_alive = false;
+            bool browser_open = false;
+            bool page_verified = false;
+            bool cleanup_pending = false;
+            bool stop_requested = sg().stop_requested.load(std::memory_order_acquire);
+            const bool result_ok = r.success && !(r.data.is_object() && r.data.contains("error") && r.data["error"].is_string());
+            if (result_ok)
+            {
+                std::lock_guard<std::recursive_mutex> g(sg().mtx);
+                same_client = sg().client == cli;
+                same_generation = sg().generation == generation;
+                same_child_pid = sg().child_pid == child_pid && child_pid != 0;
+                child_alive = same_child_pid && process_alive(child_pid);
+                browser_open = sg().browser_open;
+                page_verified = sg().page_verified;
+                cleanup_pending = sg().cleanup_pending;
+                const bool health_ok = same_client && same_generation && same_child_pid && child_alive && browser_open && page_verified && !cleanup_pending && !stop_requested;
+                if (health_ok)
+                {
+                    if (r.data.is_object())
+                        update_page_cache_from_json_locked(r.data, tool_name.c_str());
+                    sg().state = bridge_state_t::ready;
+                    sg().last_call_ms = now_ms();
+                    clear_error_locked();
+                    clear_auto_restart_block_locked("late_success_health_proof");
+                    recovered = true;
+                }
+            }
+            diag::log_tagged_fmt("camoufox", "call_worker_late_result_health request_id=%llu tool=%s generation=%llu child_pid=%lu success=%d recovered=%d same_client=%d same_generation=%d same_child_pid=%d child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d stop_requested=%d data_shape=%s",
+                static_cast<unsigned long long>(request_id), tool_name.c_str(),
+                static_cast<unsigned long long>(generation), static_cast<unsigned long>(child_pid),
+                result_ok ? 1 : 0, recovered ? 1 : 0, same_client ? 1 : 0, same_generation ? 1 : 0,
+                same_child_pid ? 1 : 0, child_alive ? 1 : 0, browser_open ? 1 : 0, page_verified ? 1 : 0,
+                cleanup_pending ? 1 : 0, stop_requested ? 1 : 0, json_shape(r.data).c_str());
+            if (recovered)
+                publish_state(bridge_state_t::ready, {});
         }
     });
 
@@ -4233,6 +4274,44 @@ page_status_t page_status_from_json(const nlohmann::json& j)
     return p;
 }
 
+bool page_cache_source_allows_direct_page_fields(const char* source)
+{
+    const std::string s = source ? std::string(source) : std::string();
+    return s == "launch_readiness" ||
+           s == "managed_readiness" ||
+           s == "navigate_response" ||
+           s == "navigate_verify" ||
+           s == "reload_verify" ||
+           s == "get_page_info" ||
+           s == "legacy_page_target_select" ||
+           s == "legacy_page_target_restore" ||
+           s == "launch_browser" ||
+           s == "list_pages" ||
+           s == "new_page" ||
+           s == "select_page" ||
+           s == "close_page" ||
+           s == "navigate" ||
+           s == "reload";
+}
+
+bool page_cache_data_has_page_shape(const nlohmann::json& data, const char* source)
+{
+    if (!data.is_object()) return false;
+    if (page_cache_source_allows_direct_page_fields(source)) return true;
+    auto pages_it = data.find("pages");
+    if (pages_it != data.end() && pages_it->is_array()) return true;
+    auto page_it = data.find("page");
+    if (page_it != data.end() && page_it->is_object()) return true;
+    if (data.contains("active_page_id") && data["active_page_id"].is_string()) return true;
+    if (!data.contains("page_id") || !data["page_id"].is_string()) return false;
+    return (data.contains("title") && data["title"].is_string()) ||
+           (data.contains("active") && data["active"].is_boolean()) ||
+           (data.contains("closed") && data["closed"].is_boolean()) ||
+           (data.contains("guid") && data["guid"].is_string()) ||
+           data.contains("created_ms") ||
+           data.contains("last_used_ms");
+}
+
 void merge_page_locked(const page_status_t& incoming)
 {
     if (incoming.page_id.empty()) return;
@@ -4251,6 +4330,7 @@ void update_page_cache_from_json_locked(const nlohmann::json& data, const char* 
 {
     if (!data.is_object()) return;
     std::vector<page_status_t> parsed_pages;
+    const bool page_shaped_response = page_cache_data_has_page_shape(data, source);
     auto pages_it = data.find("pages");
     if (pages_it != data.end() && pages_it->is_array())
     {
@@ -4268,7 +4348,7 @@ void update_page_cache_from_json_locked(const nlohmann::json& data, const char* 
         if (!p.page_id.empty())
             parsed_pages.push_back(std::move(p));
     }
-    const std::string direct_page_id = json_string_or(data, "page_id", std::string());
+    const std::string direct_page_id = page_shaped_response ? json_string_or(data, "page_id", std::string()) : std::string();
     if (!direct_page_id.empty())
     {
         bool already = false;
@@ -4291,14 +4371,14 @@ void update_page_cache_from_json_locked(const nlohmann::json& data, const char* 
         sg().pages.clear();
     for (const auto& p : parsed_pages)
         merge_page_locked(p);
-    const std::string active_page_id = json_string_or(data, "active_page_id", direct_page_id);
+    const std::string active_page_id = page_shaped_response ? json_string_or(data, "active_page_id", direct_page_id) : std::string();
     if (!active_page_id.empty())
         sg().active_page_id = active_page_id;
     if (sg().active_page_id.empty() && !sg().pages.empty())
         sg().active_page_id = sg().pages.front().page_id;
-    if (data.contains("url") && data["url"].is_string())
+    if (page_shaped_response && data.contains("url") && data["url"].is_string())
         sg().active_page_url = data["url"].get<std::string>();
-    if (data.contains("title") && data["title"].is_string())
+    if (page_shaped_response && data.contains("title") && data["title"].is_string())
         sg().active_page_title = data["title"].get<std::string>();
     for (const auto& p : sg().pages)
     {
@@ -4332,6 +4412,7 @@ void update_page_cache_from_json_locked(managed_session_t& session, const nlohma
 {
     if (!data.is_object()) return;
     std::vector<page_status_t> parsed_pages;
+    const bool page_shaped_response = page_cache_data_has_page_shape(data, source);
     auto pages_it = data.find("pages");
     if (pages_it != data.end() && pages_it->is_array())
     {
@@ -4349,7 +4430,7 @@ void update_page_cache_from_json_locked(managed_session_t& session, const nlohma
         if (!p.page_id.empty())
             parsed_pages.push_back(std::move(p));
     }
-    const std::string direct_page_id = json_string_or(data, "page_id", std::string());
+    const std::string direct_page_id = page_shaped_response ? json_string_or(data, "page_id", std::string()) : std::string();
     if (!direct_page_id.empty())
     {
         bool already = false;
@@ -4372,14 +4453,14 @@ void update_page_cache_from_json_locked(managed_session_t& session, const nlohma
         session.pages.clear();
     for (const auto& p : parsed_pages)
         merge_page_locked(session, p);
-    const std::string active_page_id = json_string_or(data, "active_page_id", direct_page_id);
+    const std::string active_page_id = page_shaped_response ? json_string_or(data, "active_page_id", direct_page_id) : std::string();
     if (!active_page_id.empty())
         session.active_page_id = active_page_id;
     if (session.active_page_id.empty() && !session.pages.empty())
         session.active_page_id = session.pages.front().page_id;
-    if (data.contains("url") && data["url"].is_string())
+    if (page_shaped_response && data.contains("url") && data["url"].is_string())
         session.active_page_url = data["url"].get<std::string>();
-    if (data.contains("title") && data["title"].is_string())
+    if (page_shaped_response && data.contains("title") && data["title"].is_string())
         session.active_page_title = data["title"].get<std::string>();
     for (const auto& p : session.pages)
     {
@@ -6250,8 +6331,28 @@ call_result_t managed_call_with_deadline(const std::shared_ptr<managed_session_t
             session->page_verified = false;
             clear_privacy_locked(*session);
         }
+        const std::string timeout_tree = timed_out_pid == 0 ? std::string() : compact_process_tree(enumerate_process_tree(timed_out_pid));
+        diag::log_tagged_fmt("camoufox", "managed_call_timeout_cleanup_begin session_id=%s request_id=%llu tool=%s generation=%llu child_pid=%lu timeout_ms=%d process_tree=%s",
+            session->session_id.c_str(),
+            static_cast<unsigned long long>(request_id),
+            tool_name.c_str(),
+            static_cast<unsigned long long>(generation),
+            static_cast<unsigned long>(timed_out_pid),
+            timeout_ms,
+            timeout_tree.empty() ? "<empty>" : timeout_tree.c_str());
+        process_tree_reap_result_t reap;
         if (timed_out_pid != 0)
-            terminate_process_tree_sync(timed_out_pid, std::string("managed_timeout_") + session->session_id + "_" + tool_name);
+            reap = terminate_process_tree_sync(timed_out_pid, std::string("managed_timeout_") + session->session_id + "_" + tool_name);
+        diag::log_tagged_fmt("camoufox", "managed_call_timeout_cleanup_done session_id=%s request_id=%llu tool=%s generation=%llu child_pid=%lu descendants_before=%zu alive_after=%zu success=%d elapsed_ms=%llu",
+            session->session_id.c_str(),
+            static_cast<unsigned long long>(request_id),
+            tool_name.c_str(),
+            static_cast<unsigned long long>(generation),
+            static_cast<unsigned long>(timed_out_pid),
+            reap.descendants_before,
+            reap.alive_after,
+            timed_out_pid == 0 || reap.alive_after == 0 ? 1 : 0,
+            static_cast<unsigned long long>(reap.elapsed_ms));
         session->total_errors.fetch_add(1, std::memory_order_relaxed);
         fail.error = std::string("camoufox managed call timeout: ") + tool_name;
         return fail;
@@ -6615,8 +6716,50 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
         scfg.env["AIDA_CAMOUFOX_PYTHON"] = python_path;
     if (!use_server_executable && system_python_discovery_allowed())
         scfg.env["AIDA_CAMOUFOX_ALLOW_SYSTEM_PYTHON"] = "1";
+    uint64_t managed_generation = 0;
     const std::string child_debug_log = camoufox_debug_log_path();
     populate_internal_camoufox_env(scfg, sid, effective_cfg.browser_executable, child_debug_log);
+    auto log_managed_failure_diagnostics = [&](const char* phase, uint32_t pid, const std::string& error, const std::string& response_tail = std::string()) {
+        const std::string tree = pid == 0 ? std::string() : compact_process_tree(enumerate_process_tree(pid));
+        const std::string debug_tail = read_file_tail_for_log(child_debug_log, 6000);
+        const std::string debug_phase = last_camoufox_debug_event_from_tail(debug_tail);
+        const std::string compact_response_tail = compact_child_output_tail(response_tail, 900);
+        diag::log_tagged_fmt("camoufox", "managed_start_failure phase=%s session_id=%s generation=%llu child_pid=%lu elapsed_ms=%llu err_len=%zu response_tail=%.900s debug_phase=%s stderr_tail_len=%zu stderr_tail=%.6000s process_tree=%s",
+            safe_reason(phase),
+            sid.c_str(),
+            static_cast<unsigned long long>(managed_generation),
+            static_cast<unsigned long>(pid),
+            static_cast<unsigned long long>(now_ms() - t0),
+            error.size(),
+            compact_response_tail.c_str(),
+            debug_phase.empty() ? "<none>" : debug_phase.c_str(),
+            debug_tail.size(),
+            debug_tail.c_str(),
+            tree.empty() ? "<empty>" : tree.c_str());
+    };
+    auto cleanup_managed_process = [&](const char* phase, uint32_t pid, const std::string& reason) {
+        const std::string before_tree = pid == 0 ? std::string() : compact_process_tree(enumerate_process_tree(pid));
+        diag::log_tagged_fmt("camoufox", "managed_start_cleanup_begin phase=%s session_id=%s generation=%llu child_pid=%lu reason=%s process_tree=%s",
+            safe_reason(phase),
+            sid.c_str(),
+            static_cast<unsigned long long>(managed_generation),
+            static_cast<unsigned long>(pid),
+            reason.c_str(),
+            before_tree.empty() ? "<empty>" : before_tree.c_str());
+        process_tree_reap_result_t reap;
+        if (pid != 0)
+            reap = terminate_process_tree_sync(pid, reason);
+        diag::log_tagged_fmt("camoufox", "managed_start_cleanup_done phase=%s session_id=%s generation=%llu child_pid=%lu reason=%s descendants_before=%zu alive_after=%zu success=%d elapsed_ms=%llu",
+            safe_reason(phase),
+            sid.c_str(),
+            static_cast<unsigned long long>(managed_generation),
+            static_cast<unsigned long>(pid),
+            reason.c_str(),
+            reap.descendants_before,
+            reap.alive_after,
+            pid == 0 || reap.alive_after == 0 ? 1 : 0,
+            static_cast<unsigned long long>(reap.elapsed_ms));
+    };
     scfg.enabled = true;
     scfg.auto_connect = false;
     scfg.oauth_enabled = false;
@@ -6692,7 +6835,6 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
             bundled_visible_launch ? 1 : 0, testlab_fast_probe ? 1 : 0);
     }
     int tool_wait_ms = std::min<int>(std::max<int>(launch_wait_ms / 4, 5000), kToolListWaitMaxMs);
-    uint64_t managed_generation = 0;
     {
         std::lock_guard<std::recursive_mutex> lk(session->mtx);
         managed_generation = session->generation;
@@ -6722,7 +6864,8 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
             managed_missing_tools,
             managed_tool_inventory,
             managed_inner);
-        terminate_process_tree_sync(pid, std::string("managed_required_reverse_tools_missing_") + sid);
+        log_managed_failure_diagnostics("required_tools_missing", pid, managed_inner, managed_tool_inventory);
+        cleanup_managed_process("required_tools_missing", pid, std::string("managed_required_reverse_tools_missing_") + sid);
         cli->disconnect();
         std::lock_guard<std::recursive_mutex> lk(session->mtx);
         session->client.reset();
@@ -6748,7 +6891,8 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
     if (!launch.ok)
     {
         const uint32_t pid = cli->child_process_id();
-        terminate_process_tree_sync(pid, std::string("managed_launch_failed_") + sid);
+        log_managed_failure_diagnostics("launch_browser_failed", pid, launch.error, launch.text);
+        cleanup_managed_process("launch_browser_failed", pid, std::string("managed_launch_failed_") + sid);
         cli->disconnect();
         std::lock_guard<std::recursive_mutex> lk(session->mtx);
         session->client.reset();
@@ -6790,7 +6934,8 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
     }
     if (managed_privacy_failed)
     {
-        terminate_process_tree_sync(managed_privacy_failed_pid, std::string("managed_launch_privacy_not_verified_") + sid);
+        log_managed_failure_diagnostics("launch_privacy_not_verified", managed_privacy_failed_pid, "privacy verification failed", launch.text);
+        cleanup_managed_process("launch_privacy_not_verified", managed_privacy_failed_pid, std::string("managed_launch_privacy_not_verified_") + sid);
         cli->disconnect();
         return false;
     }
@@ -6798,7 +6943,8 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
     if (!page.ok || !page.data.is_object() || !page.data.contains("url") || !page.data["url"].is_string())
     {
         const uint32_t pid = cli->child_process_id();
-        terminate_process_tree_sync(pid, std::string("managed_readiness_failed_") + sid);
+        log_managed_failure_diagnostics("readiness_failed", pid, page.error, page.text);
+        cleanup_managed_process("readiness_failed", pid, std::string("managed_readiness_failed_") + sid);
         cli->disconnect();
         std::lock_guard<std::recursive_mutex> lk(session->mtx);
         session->client.reset();

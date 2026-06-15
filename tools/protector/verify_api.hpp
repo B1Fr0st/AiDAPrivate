@@ -86,6 +86,132 @@ inline bool range_within(size_t offset, uint64_t size, size_t limit) {
            end <= static_cast<uint64_t>(limit);
 }
 
+inline void section_name_cstr(const char name[8], char out[9]) {
+    std::memcpy(out, name, 8);
+    out[8] = '\0';
+}
+
+inline void spread_ai_section_name(uint32_t index, char out[9]) {
+    std::memset(out, 0, 9);
+    out[0] = '.';
+    out[1] = 'a';
+    out[2] = 'i';
+    out[3] = 'a';
+    out[4] = 'i';
+    out[5] = static_cast<char>('0' + (index % 10u));
+}
+
+inline bool is_spread_ai_section_name(const char* name) {
+    if (name == nullptr) { return false; }
+    for (uint32_t i = 0; i < 8u; ++i) {
+        char expected[9] = {};
+        spread_ai_section_name(i, expected);
+        if (std::strcmp(name, expected) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+inline bool is_function_lure_section_name(const char* name) {
+    return name != nullptr && std::strcmp(name, ".aifn") == 0;
+}
+
+inline uint32_t read_u32_le(const std::vector<uint8_t>& data, size_t offset) {
+    if (offset + 4u > data.size()) { return 0u; }
+    return static_cast<uint32_t>(data[offset]) |
+        (static_cast<uint32_t>(data[offset + 1u]) << 8) |
+        (static_cast<uint32_t>(data[offset + 2u]) << 16) |
+        (static_cast<uint32_t>(data[offset + 3u]) << 24);
+}
+
+inline uint64_t read_u64_le(const std::vector<uint8_t>& data, size_t offset) {
+    if (offset + 8u > data.size()) { return 0ull; }
+    uint64_t v = 0ull;
+    for (uint32_t i = 0; i < 8u; ++i) {
+        v |= static_cast<uint64_t>(data[offset + i]) << (8u * i);
+    }
+    return v;
+}
+
+inline uint32_t fnv1a32_bytes(const uint8_t* data, size_t len, uint32_t h = 2166136261u) {
+    for (size_t i = 0; i < len; ++i) {
+        h ^= static_cast<uint32_t>(data[i]);
+        h *= 16777619u;
+    }
+    return h;
+}
+
+inline uint32_t fnv1a32_u32(uint32_t h, uint32_t v) {
+    uint8_t b[4] = {
+        static_cast<uint8_t>(v & 0xFFu),
+        static_cast<uint8_t>((v >> 8) & 0xFFu),
+        static_cast<uint8_t>((v >> 16) & 0xFFu),
+        static_cast<uint8_t>((v >> 24) & 0xFFu)
+    };
+    return fnv1a32_bytes(b, sizeof(b), h);
+}
+
+inline uint32_t fnv1a32_u64(uint32_t h, uint64_t v) {
+    uint8_t b[8] = {
+        static_cast<uint8_t>(v & 0xFFu),
+        static_cast<uint8_t>((v >> 8) & 0xFFu),
+        static_cast<uint8_t>((v >> 16) & 0xFFu),
+        static_cast<uint8_t>((v >> 24) & 0xFFu),
+        static_cast<uint8_t>((v >> 32) & 0xFFu),
+        static_cast<uint8_t>((v >> 40) & 0xFFu),
+        static_cast<uint8_t>((v >> 48) & 0xFFu),
+        static_cast<uint8_t>((v >> 56) & 0xFFu)
+    };
+    return fnv1a32_bytes(b, sizeof(b), h);
+}
+
+inline uint32_t aifn_record_integrity(uint32_t kind,
+                                      uint32_t flags,
+                                      uint32_t target_rva,
+                                      uint64_t preferred_va,
+                                      uint32_t target_size,
+                                      uint32_t unwind_rva,
+                                      uint32_t source_section_rva,
+                                      uint32_t source_section_index,
+                                      uint32_t poison_section_name_offset,
+                                      uint32_t poison_section_index,
+                                      uint32_t poison_rva,
+                                      uint64_t poison_preferred_va,
+                                      uint32_t poison_ordinal,
+                                      uint32_t label_offset,
+                                      uint32_t bait_text_offset,
+                                      uint64_t lure_id) {
+    uint32_t h = 2166136261u;
+    h = fnv1a32_u32(h, 0xA1F00D31u);
+    h = fnv1a32_u32(h, kind);
+    h = fnv1a32_u32(h, flags);
+    h = fnv1a32_u32(h, target_rva);
+    h = fnv1a32_u64(h, preferred_va);
+    h = fnv1a32_u32(h, target_size);
+    h = fnv1a32_u32(h, unwind_rva);
+    h = fnv1a32_u32(h, source_section_rva);
+    h = fnv1a32_u32(h, source_section_index);
+    h = fnv1a32_u32(h, poison_section_name_offset);
+    h = fnv1a32_u32(h, poison_section_index);
+    h = fnv1a32_u32(h, poison_rva);
+    h = fnv1a32_u64(h, poison_preferred_va);
+    h = fnv1a32_u32(h, poison_ordinal);
+    h = fnv1a32_u32(h, label_offset);
+    h = fnv1a32_u32(h, bait_text_offset);
+    h = fnv1a32_u64(h, lure_id);
+    return h != 0u ? h : 0xA1DAA1DAu;
+}
+
+inline bool poison_section_characteristics_ok(const pe_file::section_t& s) {
+    return (s.characteristics & IMAGE_SCN_CNT_INITIALIZED_DATA) != 0u &&
+        (s.characteristics & IMAGE_SCN_MEM_READ) != 0u &&
+        (s.characteristics & IMAGE_SCN_MEM_WRITE) == 0u &&
+        (s.characteristics & IMAGE_SCN_MEM_EXECUTE) == 0u &&
+        (s.characteristics & IMAGE_SCN_CNT_CODE) == 0u &&
+        (s.characteristics & IMAGE_SCN_MEM_DISCARDABLE) == 0u;
+}
+
 inline bool counted_table_bounds(const std::vector<uint8_t>& data,
                                  uint32_t offset,
                                  uint32_t expected_count,
@@ -214,6 +340,8 @@ inline probe_result_t probe_p03(const context_t& c) {
         std::memcpy(nm, s.name, 8);
         if (std::strcmp(nm, ".reloc") == 0 || std::strcmp(nm, ".rsrc") == 0) { continue; }
         if (std::strcmp(nm, ".gehi") == 0 || std::strcmp(nm, ".epheme") == 0 || std::strcmp(nm, ".rdiag") == 0) { continue; }
+        if (is_spread_ai_section_name(nm)) { continue; }
+        if (is_function_lure_section_name(nm)) { continue; }
         if (std::strcmp(nm, ".dseal") == 0 || std::strcmp(nm, ".dthunk") == 0) { continue; }
         if (std::strcmp(nm, ".licbind") == 0 || std::strcmp(nm, ".feat") == 0) { continue; }
         if (std::strcmp(nm, ".aidashr") == 0) { continue; }
@@ -673,51 +801,129 @@ inline probe_result_t probe_p26(const context_t& c) {
 }
 
 inline probe_result_t probe_p27(const context_t& c) {
+    static const uint8_t k_prefix[] = {
+        'A','I','D','A','-','A','N','T','I','-','A','I','-','T','R','I','P','W','I','R','E'
+    };
+    static constexpr size_t k_prefix_len = sizeof(k_prefix);
+    static constexpr size_t k_required_rdiag_visible = 4096u;
+    static constexpr size_t k_required_spread_visible = 512u;
+    static constexpr size_t k_required_total_visible = 8192u;
+    auto count_prefix = [](const uint8_t* p, size_t n) -> size_t {
+        size_t hits = 0u;
+        if (p == nullptr || n < k_prefix_len) { return 0u; }
+        for (size_t i = 0; i + k_prefix_len <= n; ++i) {
+            if (p[i] == k_prefix[0] && std::memcmp(p + i, k_prefix, k_prefix_len) == 0) {
+                ++hits;
+            }
+        }
+        return hits;
+    };
+    bool llm_declared = c.aux_found && ((c.aux.phase_flags & 0x200u) != 0u);
+    if (!llm_declared) {
+        return { "P27", ".rdiag/.aiai llm_poison corpus (INFO: llm_poison bit not set)",
+                 true, "skipped" };
+    }
     const pe_file::section_t* rdiag = nullptr;
+    size_t rdiag_count = 0u;
     for (const auto& s : c.pe.sections) {
         char nm[9] = { 0 };
-        std::memcpy(nm, s.name, 8);
-        if (std::strcmp(nm, ".rdiag") == 0) { rdiag = &s; break; }
-    }
-    bool llm_declared = c.aux_found && ((c.aux.phase_flags & 0x200u) != 0u);
-    if (rdiag != nullptr) {
-        size_t vsize = static_cast<size_t>(rdiag->virtual_size);
-        size_t data_sz = rdiag->data.size();
-        size_t eff_size = (std::max<size_t>)(vsize, data_sz);
-        double e = (data_sz > 0u) ? shannon_entropy_bits(rdiag->data.data(), data_sz) : 0.0;
-        bool size_ok = (eff_size >= 2048u);
-        bool ent_ok = (data_sz == 0u) ? true : (e >= 7.0);
-        bool ok = size_ok && ent_ok;
-        char buf[192];
-        std::snprintf(buf, sizeof(buf),
-                      ".rdiag vsize=%u data=%zu entropy=%.3f (vsize>=2048; entropy>=7.0 when data present)",
-                      rdiag->virtual_size, data_sz, e);
-        return { "P27", "LLM poison .rdiag section sized (entropy when retained)", ok, buf };
-    }
-    if (!llm_declared) {
-        return { "P27", ".rdiag llm_poison section (INFO: llm_poison bit not set)",
-                 true, "skipped" };
+        section_name_cstr(s.name, nm);
+        if (std::strcmp(nm, ".rdiag") == 0) {
+            rdiag = &s;
+            ++rdiag_count;
+        }
     }
     static const uint8_t k_needle[] = { 'g','_','e','r','r','o','r','_','m','e','s','s','a','g','e','s' };
     const size_t needle_len = sizeof(k_needle);
+    bool legacy_decoy_found = false;
     for (const auto& s : c.pe.sections) {
         if (s.data.size() < needle_len) { continue; }
         const uint8_t* p = s.data.data();
         size_t n = s.data.size();
         for (size_t i = 0; i + needle_len <= n; ++i) {
             if (std::memcmp(p + i, k_needle, needle_len) == 0) {
-                char nm[9] = { 0 };
-                std::memcpy(nm, s.name, 8);
-                char buf[192];
-                std::snprintf(buf, sizeof(buf),
-                              "llm_poison decoy signature found in section %s at offset %zu (merge-absorbed)",
-                              nm, i);
-                return { "P27", "LLM poison decoy signature present (merge-aware)", true, buf };
+                legacy_decoy_found = true;
+                break;
+            }
+        }
+        if (legacy_decoy_found) { break; }
+    }
+    const size_t rdiag_hits = (rdiag != nullptr && !rdiag->data.empty())
+        ? count_prefix(rdiag->data.data(), rdiag->data.size())
+        : 0u;
+    const bool rdiag_exists_once = (rdiag_count == 1u && rdiag != nullptr);
+    const bool rdiag_header_ok = rdiag_exists_once &&
+        rdiag->data.size() >= 8u &&
+        read_u32_le(rdiag->data, 0u) == 0x4C4C4D50u &&
+        read_u32_le(rdiag->data, 4u) == 0x00000002u;
+    const bool rdiag_chars_ok = rdiag_exists_once && poison_section_characteristics_ok(*rdiag);
+    const bool rdiag_count_ok = rdiag_hits >= k_required_rdiag_visible;
+
+    bool spread_all_ok = true;
+    size_t spread_hits_total = 0u;
+    uint32_t spread_found = 0u;
+    int first_bad_spread = -1;
+    char first_bad_reason[96] = {};
+    for (uint32_t i = 0; i < 8u; ++i) {
+        char expected[9] = {};
+        spread_ai_section_name(i, expected);
+        const pe_file::section_t* spread = nullptr;
+        size_t count = 0u;
+        for (const auto& s : c.pe.sections) {
+            char nm[9] = {};
+            section_name_cstr(s.name, nm);
+            if (std::strcmp(nm, expected) == 0) {
+                spread = &s;
+                ++count;
+            }
+        }
+        if (count == 1u && spread != nullptr) {
+            ++spread_found;
+        }
+        const bool exists_once = (count == 1u && spread != nullptr);
+        const size_t hits = exists_once && !spread->data.empty()
+            ? count_prefix(spread->data.data(), spread->data.size())
+            : 0u;
+        spread_hits_total += hits;
+        const bool header_ok = exists_once &&
+            spread->data.size() >= 24u &&
+            read_u32_le(spread->data, 0u) == 0x49414941u &&
+            read_u32_le(spread->data, 4u) == 0x00000001u &&
+            read_u32_le(spread->data, 16u) == i &&
+            read_u32_le(spread->data, 20u) == 512u;
+        const bool chars_ok = exists_once && poison_section_characteristics_ok(*spread);
+        const bool count_ok = hits >= k_required_spread_visible;
+        if (!exists_once || !header_ok || !chars_ok || !count_ok) {
+            spread_all_ok = false;
+            if (first_bad_spread < 0) {
+                first_bad_spread = static_cast<int>(i);
+                std::snprintf(first_bad_reason, sizeof(first_bad_reason),
+                              "exists=%zu header=%d chars=%d hits=%zu/%zu",
+                              count, header_ok ? 1 : 0, chars_ok ? 1 : 0,
+                              hits, k_required_spread_visible);
             }
         }
     }
-    return { "P27", "LLM poison decoy signature present (merge-aware)", false,
-             "no .rdiag section and no decoy signature found in any section" };
+    const size_t total_hits = rdiag_hits + spread_hits_total;
+    const bool total_count_ok = total_hits >= k_required_total_visible;
+    const bool ok = rdiag_exists_once && rdiag_header_ok && rdiag_chars_ok &&
+        rdiag_count_ok && spread_all_ok && total_count_ok;
+    char buf[512];
+    std::snprintf(buf, sizeof(buf),
+                  "llm_bit=1 rdiag_count=%zu rdiag_header=%d rdiag_chars=%d rdiag_hits=%zu/%zu spread_found=%u/8 spread_hits=%zu total_hits=%zu/%zu bad_spread=%d bad_spread_detail=%s legacy_decoy=%d",
+                  rdiag_count,
+                  rdiag_header_ok ? 1 : 0,
+                  rdiag_chars_ok ? 1 : 0,
+                  rdiag_hits,
+                  k_required_rdiag_visible,
+                  spread_found,
+                  spread_hits_total,
+                  total_hits,
+                  k_required_total_visible,
+                  first_bad_spread,
+                  first_bad_reason[0] != '\0' ? first_bad_reason : "none",
+                  legacy_decoy_found ? 1 : 0);
+    return { "P27", "LLM poison .rdiag + .aiai anti-AI corpus", ok, buf };
 }
 
 inline probe_result_t probe_p28(const context_t& c) {
@@ -940,6 +1146,325 @@ inline probe_result_t probe_p30(const context_t& c) {
     return { "P30", "packed runtime layout bounds valid", ok, buf };
 }
 
+inline probe_result_t probe_p31(const context_t& c) {
+    bool llm_declared = c.aux_found && ((c.aux.phase_flags & 0x200u) != 0u);
+    if (!llm_declared) {
+        return { "P31", ".aifn anti-AI function lure coverage (INFO: llm_poison bit not set)",
+                 true, "skipped" };
+    }
+    const pe_file::section_t* aifn = nullptr;
+    size_t aifn_count = 0u;
+    for (const auto& s : c.pe.sections) {
+        char nm[9] = {};
+        section_name_cstr(s.name, nm);
+        if (std::strcmp(nm, ".aifn") == 0) {
+            aifn = &s;
+            ++aifn_count;
+        }
+    }
+    if (aifn_count != 1u || aifn == nullptr) {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "aifn_count=%zu", aifn_count);
+        return { "P31", ".aifn anti-AI function lure coverage", false, buf };
+    }
+    const size_t payload_size = (aifn->virtual_size != 0u && aifn->virtual_size <= aifn->data.size())
+        ? static_cast<size_t>(aifn->virtual_size)
+        : aifn->data.size();
+    const bool chars_ok = poison_section_characteristics_ok(*aifn);
+    const bool header_min_ok = payload_size >= protector::llm_poison::detail::k_aifn_header_size;
+    const uint32_t magic = read_u32_le(aifn->data, 0u);
+    const uint32_t version = read_u32_le(aifn->data, 4u);
+    const uint32_t header_size = read_u32_le(aifn->data, 8u);
+    const uint32_t record_size = read_u32_le(aifn->data, 12u);
+    const uint64_t seed = read_u64_le(aifn->data, 16u);
+    const uint64_t image_base = read_u64_le(aifn->data, 24u);
+    const uint32_t image_size = read_u32_le(aifn->data, 32u);
+    const uint32_t record_count = read_u32_le(aifn->data, 36u);
+    const uint32_t record_table_offset = read_u32_le(aifn->data, 40u);
+    const uint32_t string_pool_offset = read_u32_le(aifn->data, 44u);
+    const uint32_t string_pool_size = read_u32_le(aifn->data, 48u);
+    const uint32_t content_hash = read_u32_le(aifn->data, 52u);
+    const uint32_t exception_count = read_u32_le(aifn->data, 56u);
+    const uint32_t export_count = read_u32_le(aifn->data, 60u);
+    const uint32_t tile_count = read_u32_le(aifn->data, 64u);
+    const uint32_t packed_count = read_u32_le(aifn->data, 68u);
+    const uint32_t poison_ref_count = read_u32_le(aifn->data, 72u);
+    const bool header_ok = header_min_ok &&
+        magic == protector::llm_poison::detail::k_aifn_magic &&
+        version == protector::llm_poison::detail::k_aifn_version &&
+        header_size == protector::llm_poison::detail::k_aifn_header_size &&
+        record_size == protector::llm_poison::detail::k_aifn_record_size &&
+        seed != 0ull &&
+        image_base == c.pe.optional_header.ImageBase &&
+        image_size != 0u &&
+        image_size <= c.pe.optional_header.SizeOfImage;
+    const uint64_t record_table_bytes = static_cast<uint64_t>(record_count) * record_size;
+    const bool table_ok = record_count != 0u &&
+        record_size == protector::llm_poison::detail::k_aifn_record_size &&
+        range_within(record_table_offset, record_table_bytes, payload_size);
+    const bool pool_ok = string_pool_size != 0u &&
+        range_within(string_pool_offset, string_pool_size, payload_size) &&
+        static_cast<uint64_t>(string_pool_offset) >= static_cast<uint64_t>(record_table_offset) + record_table_bytes;
+    const bool count_sum_ok = record_count == exception_count + export_count + tile_count + packed_count;
+    const bool poison_ref_count_ok =
+        poison_ref_count >= protector::llm_poison::detail::k_visible_poison_count +
+            protector::llm_poison::detail::k_spread_poison_count;
+    bool hash_ok = false;
+    if (payload_size >= protector::llm_poison::detail::k_aifn_header_size && content_hash != 0u) {
+        std::vector<uint8_t> tmp(aifn->data.begin(), aifn->data.begin() + payload_size);
+        tmp[52] = 0u;
+        tmp[53] = 0u;
+        tmp[54] = 0u;
+        tmp[55] = 0u;
+        uint32_t computed = fnv1a32_bytes(tmp.data(), tmp.size());
+        if (computed == 0u) { computed = 0xA1F00D31u; }
+        hash_ok = computed == content_hash;
+    }
+    auto section_virtual_span = [](const pe_file::section_t& sec) -> uint32_t {
+        return sec.virtual_size != 0u ? sec.virtual_size : sec.raw_size;
+    };
+    auto executable_section_ok = [](const pe_file::section_t& sec) -> bool {
+        return (sec.characteristics & IMAGE_SCN_MEM_EXECUTE) != 0u ||
+            (sec.characteristics & IMAGE_SCN_CNT_CODE) != 0u;
+    };
+    uint32_t expected_tile_count = 0u;
+    bool expected_tile_ok = true;
+    for (const auto& sec : c.pe.sections) {
+        char nm[9] = {};
+        section_name_cstr(sec.name, nm);
+        if (std::strcmp(nm, ".packed") == 0) { continue; }
+        if (!executable_section_ok(sec)) { continue; }
+        const uint32_t span = section_virtual_span(sec);
+        if (span == 0u) { continue; }
+        const uint64_t tiles = (static_cast<uint64_t>(span) + 0xFFFu) / 0x1000u;
+        if (tiles > 0xFFFFFFFFull - expected_tile_count) {
+            expected_tile_ok = false;
+            break;
+        }
+        expected_tile_count += static_cast<uint32_t>(tiles);
+    }
+    uint32_t expected_packed_count = 0u;
+    bool expected_packed_ok = c.packed_found;
+    const uint64_t expected_section_table_bytes = static_cast<uint64_t>(c.hdr.section_count) *
+        static_cast<uint64_t>(sizeof(protector::section_descriptor_t));
+    if (expected_packed_ok &&
+        range_within(c.hdr.section_table_offset, expected_section_table_bytes, c.packed_data.size())) {
+        for (uint32_t i = 0; i < c.hdr.section_count; ++i) {
+            protector::section_descriptor_t d{};
+            const size_t off = static_cast<size_t>(c.hdr.section_table_offset) +
+                static_cast<size_t>(i) * sizeof(d);
+            std::memcpy(&d, c.packed_data.data() + off, sizeof(d));
+            if ((d.original_characteristics & IMAGE_SCN_MEM_EXECUTE) != 0u ||
+                (d.original_characteristics & IMAGE_SCN_CNT_CODE) != 0u) {
+                ++expected_packed_count;
+            }
+        }
+    } else {
+        expected_packed_ok = false;
+    }
+    const bool counts_ok = count_sum_ok &&
+        tile_count != 0u &&
+        poison_ref_count_ok &&
+        expected_tile_ok &&
+        expected_packed_ok &&
+        tile_count == expected_tile_count &&
+        packed_count == expected_packed_count;
+    auto cstr_ok = [&](uint32_t offset) -> bool {
+        if (!pool_ok || offset < string_pool_offset) { return false; }
+        uint64_t pool_end64 = static_cast<uint64_t>(string_pool_offset) + string_pool_size;
+        if (offset >= pool_end64 || offset >= payload_size) { return false; }
+        const size_t pool_end = static_cast<size_t>((pool_end64 < payload_size) ? pool_end64 : payload_size);
+        for (size_t i = offset; i < pool_end; ++i) {
+            if (aifn->data[i] == 0u) { return i > offset; }
+        }
+        return false;
+    };
+    auto cstr_equals = [&](uint32_t offset, const char* text) -> bool {
+        if (!cstr_ok(offset)) { return false; }
+        const uint8_t* p = aifn->data.data() + offset;
+        size_t i = 0u;
+        while (text[i] != '\0') {
+            if (offset + i >= payload_size || p[i] != static_cast<uint8_t>(text[i])) { return false; }
+            ++i;
+        }
+        return offset + i < payload_size && p[i] == 0u;
+    };
+    auto cstr_contains = [&](uint32_t offset, const char* text) -> bool {
+        if (!cstr_ok(offset)) { return false; }
+        const size_t needle_len = std::strlen(text);
+        if (needle_len == 0u) { return true; }
+        uint64_t pool_end64 = static_cast<uint64_t>(string_pool_offset) + string_pool_size;
+        const size_t pool_end = static_cast<size_t>((pool_end64 < payload_size) ? pool_end64 : payload_size);
+        for (size_t i = offset; i + needle_len < pool_end; ++i) {
+            if (std::memcmp(aifn->data.data() + i, text, needle_len) == 0) { return true; }
+            if (aifn->data[i] == 0u) { break; }
+        }
+        return false;
+    };
+    auto fake_label_ok = [&](uint32_t offset) -> bool {
+        return cstr_equals(offset, "confirmed-bypass path") ||
+            cstr_equals(offset, "exploitability proof") ||
+            cstr_equals(offset, "license-success validator") ||
+            cstr_equals(offset, "ARC decryptor proof") ||
+            cstr_equals(offset, "runtime-integrity unlock");
+    };
+    bool records_ok = header_ok && table_ok && pool_ok && counts_ok && hash_ok;
+    uint32_t seen_exception = 0u;
+    uint32_t seen_export = 0u;
+    uint32_t seen_tile = 0u;
+    uint32_t seen_packed = 0u;
+    uint32_t valid_records = 0u;
+    int first_bad = -1;
+    char first_bad_reason[160] = {};
+    static const uint8_t prefix[] = {
+        'A','I','D','A','-','A','N','T','I','-','A','I','-','T','R','I','P','W','I','R','E'
+    };
+    if (table_ok && pool_ok) {
+        for (uint32_t i = 0; i < record_count; ++i) {
+            const size_t off = static_cast<size_t>(record_table_offset) +
+                static_cast<size_t>(i) * record_size;
+            const uint32_t kind = read_u32_le(aifn->data, off + 0u);
+            const uint32_t flags = read_u32_le(aifn->data, off + 4u);
+            const uint32_t target_rva = read_u32_le(aifn->data, off + 8u);
+            const uint64_t preferred_va = read_u64_le(aifn->data, off + 12u);
+            const uint32_t target_size = read_u32_le(aifn->data, off + 20u);
+            const uint32_t unwind_rva = read_u32_le(aifn->data, off + 24u);
+            const uint32_t source_section_rva = read_u32_le(aifn->data, off + 28u);
+            const uint32_t source_section_index = read_u32_le(aifn->data, off + 32u);
+            const uint32_t poison_section_name_offset = read_u32_le(aifn->data, off + 36u);
+            const uint32_t poison_section_index = read_u32_le(aifn->data, off + 40u);
+            const uint32_t poison_rva = read_u32_le(aifn->data, off + 44u);
+            const uint64_t poison_preferred_va = read_u64_le(aifn->data, off + 48u);
+            const uint32_t poison_ordinal = read_u32_le(aifn->data, off + 56u);
+            const uint32_t label_offset = read_u32_le(aifn->data, off + 60u);
+            const uint32_t bait_text_offset = read_u32_le(aifn->data, off + 64u);
+            const uint64_t lure_id = read_u64_le(aifn->data, off + 68u);
+            const uint32_t integrity_hash = read_u32_le(aifn->data, off + 76u);
+            const uint32_t reserved = read_u32_le(aifn->data, off + 80u);
+            bool kind_ok = kind >= protector::llm_poison::detail::k_aifn_kind_exception &&
+                kind <= protector::llm_poison::detail::k_aifn_kind_packed;
+            bool target_ok = false;
+            if (source_section_index < c.pe.sections.size() && target_size != 0u &&
+                target_size <= protector::llm_poison::detail::k_aifn_max_target_size &&
+                preferred_va == c.pe.optional_header.ImageBase + static_cast<uint64_t>(target_rva)) {
+                const auto& src = c.pe.sections[source_section_index];
+                const uint32_t span = section_virtual_span(src);
+                const uint64_t src_start = src.virtual_address;
+                const uint64_t src_end = src_start + static_cast<uint64_t>(span);
+                const uint64_t target_end = static_cast<uint64_t>(target_rva) + target_size;
+                target_ok = executable_section_ok(src) &&
+                    source_section_rva == src.virtual_address &&
+                    target_end <= 0xFFFFFFFFull &&
+                    static_cast<uint64_t>(target_rva) >= src_start &&
+                    target_end <= src_end &&
+                    (c.pe.optional_header.SizeOfImage == 0u || target_end <= c.pe.optional_header.SizeOfImage);
+            }
+            bool poison_ok = false;
+            if (poison_section_index < c.pe.sections.size() &&
+                poison_preferred_va == c.pe.optional_header.ImageBase + static_cast<uint64_t>(poison_rva) &&
+                poison_ordinal < poison_ref_count) {
+                const auto& ps = c.pe.sections[poison_section_index];
+                char ps_name[9] = {};
+                section_name_cstr(ps.name, ps_name);
+                const uint32_t ps_span = section_virtual_span(ps);
+                const uint64_t ps_start = ps.virtual_address;
+                const uint64_t ps_end = ps_start + static_cast<uint64_t>(ps_span);
+                const uint64_t poison_end = static_cast<uint64_t>(poison_rva) + sizeof(prefix);
+                const bool poison_range_ok = static_cast<uint64_t>(poison_rva) >= ps_start &&
+                    poison_end <= ps_end;
+                uint32_t poison_off = 0u;
+                if (poison_range_ok) {
+                    poison_off = poison_rva - ps.virtual_address;
+                }
+                poison_ok = poison_range_ok &&
+                    (std::strcmp(ps_name, ".rdiag") == 0 || is_spread_ai_section_name(ps_name)) &&
+                    poison_section_characteristics_ok(ps) &&
+                    cstr_equals(poison_section_name_offset, ps_name) &&
+                    poison_off + sizeof(prefix) <= ps.data.size() &&
+                    std::memcmp(ps.data.data() + poison_off, prefix, sizeof(prefix)) == 0;
+            }
+            const uint32_t expected_hash = aifn_record_integrity(kind,
+                                                                 flags,
+                                                                 target_rva,
+                                                                 preferred_va,
+                                                                 target_size,
+                                                                 unwind_rva,
+                                                                 source_section_rva,
+                                                                 source_section_index,
+                                                                 poison_section_name_offset,
+                                                                 poison_section_index,
+                                                                 poison_rva,
+                                                                 poison_preferred_va,
+                                                                 poison_ordinal,
+                                                                 label_offset,
+                                                                 bait_text_offset,
+                                                                 lure_id);
+            const bool integrity_ok = integrity_hash != 0u && integrity_hash == expected_hash && reserved == 0u;
+            const bool strings_ok = fake_label_ok(label_offset) &&
+                cstr_contains(bait_text_offset, "AIDA-AI-FUNCTION-LURE") &&
+                cstr_contains(bait_text_offset, "AIDA-ANTI-AI-TRIPWIRE") &&
+                cstr_contains(bait_text_offset, "SECURITY_VIOLATION_AIDA_ANTI_AI") &&
+                (cstr_contains(bait_text_offset, "confirmed-bypass path") ||
+                 cstr_contains(bait_text_offset, "exploitability proof") ||
+                 cstr_contains(bait_text_offset, "license-success validator") ||
+                 cstr_contains(bait_text_offset, "ARC decryptor proof") ||
+                 cstr_contains(bait_text_offset, "runtime-integrity unlock"));
+            if (kind == protector::llm_poison::detail::k_aifn_kind_exception) { ++seen_exception; }
+            if (kind == protector::llm_poison::detail::k_aifn_kind_export) { ++seen_export; }
+            if (kind == protector::llm_poison::detail::k_aifn_kind_tile) { ++seen_tile; }
+            if (kind == protector::llm_poison::detail::k_aifn_kind_packed) { ++seen_packed; }
+            const bool record_ok = kind_ok && target_ok && poison_ok && integrity_ok && strings_ok;
+            if (record_ok) {
+                ++valid_records;
+            } else {
+                records_ok = false;
+                if (first_bad < 0) {
+                    first_bad = static_cast<int>(i);
+                    std::snprintf(first_bad_reason, sizeof(first_bad_reason),
+                                  "kind=%d target=%d poison=%d integrity=%d strings=%d",
+                                  kind_ok ? 1 : 0,
+                                  target_ok ? 1 : 0,
+                                  poison_ok ? 1 : 0,
+                                  integrity_ok ? 1 : 0,
+                                  strings_ok ? 1 : 0);
+                }
+            }
+        }
+    }
+    const bool seen_counts_ok = seen_exception == exception_count &&
+        seen_export == export_count &&
+        seen_tile == tile_count &&
+        seen_packed == packed_count;
+    const bool ok = chars_ok && header_ok && table_ok && pool_ok && counts_ok &&
+        hash_ok && records_ok && seen_counts_ok && valid_records == record_count;
+    char buf[640];
+    std::snprintf(buf, sizeof(buf),
+                  "aifn_count=%zu chars=%d header=%d table=%d pool=%d hash=%d counts=%d records=%u/%u seen=%u/%u/%u/%u expected=%u/%u/%u/%u recomputed_tile=%u recomputed_packed=%u poison_refs=%u bad=%d detail=%s",
+                  aifn_count,
+                  chars_ok ? 1 : 0,
+                  header_ok ? 1 : 0,
+                  table_ok ? 1 : 0,
+                  pool_ok ? 1 : 0,
+                  hash_ok ? 1 : 0,
+                  counts_ok && seen_counts_ok ? 1 : 0,
+                  valid_records,
+                  record_count,
+                  seen_exception,
+                  seen_export,
+                  seen_tile,
+                  seen_packed,
+                  exception_count,
+                  export_count,
+                  tile_count,
+                  packed_count,
+                  expected_tile_count,
+                  expected_packed_count,
+                  poison_ref_count,
+                  first_bad,
+                  first_bad_reason[0] != '\0' ? first_bad_reason : "none");
+    return { "P31", ".aifn anti-AI function lure coverage", ok, buf };
+}
+
 inline verify_report_t run_probes(const context_t& c) {
     probe_result_t (*probes[])(const context_t&) = {
         probe_p01, probe_p02, probe_p03, probe_p04, probe_p05,
@@ -947,7 +1472,7 @@ inline verify_report_t run_probes(const context_t& c) {
         probe_p11, probe_p12, probe_p13,
         probe_p14, probe_p15, probe_p16, probe_p17, probe_p18, probe_p19, probe_p20,
         probe_p21, probe_p22, probe_p23, probe_p24, probe_p25, probe_p26, probe_p27,
-        probe_p28, probe_p29, probe_p30
+        probe_p28, probe_p29, probe_p30, probe_p31
     };
     verify_report_t rep;
     for (auto fn : probes) {

@@ -147,9 +147,19 @@ tool_result_t tool_audit_status(const json& p)
     data["issues_found"] = issues_found;
     data["running"] = st.running;
     data["cancelled"] = st.cancelled;
+    data["cancel_requested"] = st.cancel_requested;
+    data["drained"] = st.drained;
     data["started_ms"] = st.started_ms;
     data["ended_ms"] = st.ended_ms;
-    diag::log_tagged_fmt("mcp_burp", "tool_audit_status ok id=%llu running=%d runtime_issues=%zu stored_issues=%zu reported_issues=%zu", static_cast<unsigned long long>(id), (int)st.running, st.issues_found, stored_issues, issues_found);
+    diag::log_tagged_fmt("mcp_burp", "tool_audit_status ok id=%llu running=%d cancelled=%d cancel_requested=%d drained=%d runtime_issues=%zu stored_issues=%zu reported_issues=%zu",
+        static_cast<unsigned long long>(id),
+        (int)st.running,
+        st.cancelled ? 1 : 0,
+        st.cancel_requested ? 1 : 0,
+        st.drained ? 1 : 0,
+        st.issues_found,
+        stored_issues,
+        issues_found);
     return tool_result_t::ok(data);
 }
 
@@ -172,6 +182,8 @@ tool_result_t tool_list_audits(const json&)
         e["issues_found"] = issues_found;
         e["running"] = st.running;
         e["cancelled"] = st.cancelled;
+        e["cancel_requested"] = st.cancel_requested;
+        e["drained"] = st.drained;
         e["started_ms"] = st.started_ms;
         e["ended_ms"] = st.ended_ms;
         arr.push_back(std::move(e));
@@ -192,7 +204,7 @@ tool_result_t tool_cancel(const json& p)
     if (!active_scanner::cancel_audit(id)) { diag::log_tagged_fmt("mcp_burp", "tool_cancel not_found id=%llu", static_cast<unsigned long long>(id)); return tool_result_t::error("audit not found"); }
     const bool drained = active_scanner::wait_for_audit_idle(id, 20000);
     diag::log_tagged_fmt("mcp_burp", "tool_cancel ok id=%llu drained=%d", static_cast<unsigned long long>(id), drained ? 1 : 0);
-    json data; data["audit_id"] = id; data["cancelled"] = true; data["drained"] = drained;
+    json data; data["audit_id"] = id; data["cancelled"] = true; data["cancel_requested"] = true; data["drained"] = drained;
     return tool_result_t::ok(std::string("Cancelled audit ") + std::to_string(id), data);
 }
 

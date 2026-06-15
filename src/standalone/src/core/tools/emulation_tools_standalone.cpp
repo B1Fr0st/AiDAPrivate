@@ -48,6 +48,23 @@ static tool_result_t check_driver_for_address(std::uint64_t addr)
     return tool_result_t::ok("", {});
 }
 
+static json emulation_region_evidence(std::uint64_t addr)
+{
+    if (addr == 0)
+        return json{{"queried", false}, {"reason", "zero_address"}};
+    if (is_kernel_address(addr))
+        return json{{"queried", false}, {"reason", "kernel_address"}};
+    driver_bridge::memory_region_t region{};
+    if (!driver_bridge::query_memory(addr, region))
+        return json{{"queried", false}, {"reason", "query_failed"}, {"status", driver_bridge::status()}, {"last_error", driver_bridge::last_error()}};
+    return json{{"queried", true},
+                {"base", sa_format_address(region.base)},
+                {"size", region.size},
+                {"state", sa_format_address(region.state)},
+                {"protect", sa_format_address(region.protect)},
+                {"type", sa_format_address(region.type)}};
+}
+
 static void map_additional_regions(
     emulation::process_snapshot_t& snapshot,
     const json& params,
@@ -293,15 +310,34 @@ tool_result_t driver_snapshot_and_emulate(const json& params)
     if (params.contains("snapshot_size"))
         snap_size = params.value("snapshot_size", 0);
 
+    const json entry_region = emulation_region_evidence(config.start_address);
+    const json snapshot_region = snap_base != 0 ? emulation_region_evidence(snap_base) : json{{"queried", false}, {"reason", "snapshot_base_not_supplied"}};
     diag::log_tagged_fmt("emul_tools",
-        "driver_snapshot_and_emulate running pid=%u tid=%u addr=0x%llx max_insns=%u trace=%u snap_base=0x%llX snap_size=0x%llX timeout_us=%llu",
+        "driver_snapshot_and_emulate running pid=%u tid=%u addr=0x%llx max_insns=%u trace=%u snap_base=0x%llX snap_size=0x%llX timeout_us=%llu entry_region=%s snapshot_region=%s status='%s' last_error='%s'",
         pid, tid, static_cast<unsigned long long>(config.start_address), config.max_instructions,
         config.max_trace_entries,
         static_cast<unsigned long long>(snap_base),
         static_cast<unsigned long long>(snap_size),
-        static_cast<unsigned long long>(config.timeout_us));
+        static_cast<unsigned long long>(config.timeout_us),
+        entry_region.dump().c_str(),
+        snapshot_region.dump().c_str(),
+        driver_bridge::status().c_str(),
+        driver_bridge::last_error().c_str());
     aida::diagnostic_exception_scope::scope_t exception_scope("mcp.driver_snapshot_and_emulate");
     auto result = emulation::driver_snapshot_and_emulate(pid, tid, config, snap_base, snap_size);
+    diag::log_tagged_fmt("emul_tools",
+        "driver_snapshot_and_emulate emulation_exit pid=%u tid=%u addr=0x%llX success=%d err='%s' total=%u trace=%zu reads=%zu writes=%zu reg_deltas=%zu end=0x%llX",
+        pid,
+        tid,
+        static_cast<unsigned long long>(config.start_address),
+        result.success ? 1 : 0,
+        result.error.c_str(),
+        result.total_instructions,
+        result.trace.size(),
+        result.mem_reads.size(),
+        result.mem_writes.size(),
+        result.reg_deltas.size(),
+        static_cast<unsigned long long>(result.end_address));
     if (!result.success)
     {
         diag::log_tagged_fmt("emul_tools",
@@ -474,10 +510,26 @@ tool_result_t trace_execution_unicorn(const json& params)
         if (stop) config.stop_address = *stop;
     }
 
-    diag::log_tagged_fmt("emul_tools", "trace_execution_unicorn emulating addr=0x%llx size=%u kernel=%d",
-        static_cast<unsigned long long>(*addr), size, (int)kernel_mode);
+    const json trace_region = emulation_region_evidence(*addr);
+    diag::log_tagged_fmt("emul_tools", "trace_execution_unicorn emulating addr=0x%llx size=%u kernel=%d code_bytes=%zu snapshot_regions=%zu region=%s status='%s' last_error='%s'",
+        static_cast<unsigned long long>(*addr), size, (int)kernel_mode,
+        code.size(),
+        snapshot.regions.size(),
+        trace_region.dump().c_str(),
+        driver_bridge::status().c_str(),
+        driver_bridge::last_error().c_str());
     aida::diagnostic_exception_scope::scope_t exception_scope("mcp.trace_execution_unicorn");
     auto result = emulation::emulate_from_snapshot(snapshot, config);
+    diag::log_tagged_fmt("emul_tools", "trace_execution_unicorn emulation_exit addr=0x%llX success=%d err='%s' total=%u trace=%zu reads=%zu writes=%zu reg_deltas=%zu end=0x%llX",
+        static_cast<unsigned long long>(*addr),
+        result.success ? 1 : 0,
+        result.error.c_str(),
+        result.total_instructions,
+        result.trace.size(),
+        result.mem_reads.size(),
+        result.mem_writes.size(),
+        result.reg_deltas.size(),
+        static_cast<unsigned long long>(result.end_address));
     if (!result.success)
     {
         diag::log_tagged_fmt("emul_tools", "trace_execution_unicorn failed err='%s'", result.error.c_str());
@@ -629,10 +681,27 @@ tool_result_t analyze_vm_handler(const json& params)
     config.analyze_effective_ops = true;
     config.timeout_us            = params.value("timeout_us", 15000000);
 
-    diag::log_tagged_fmt("emul_tools", "analyze_vm_handler emulating addr=0x%llx size=%u kernel=%d",
-        static_cast<unsigned long long>(*addr), handler_size, (int)kernel_mode);
+    const json handler_region = emulation_region_evidence(*addr);
+    diag::log_tagged_fmt("emul_tools", "analyze_vm_handler emulating addr=0x%llx size=%u kernel=%d code_bytes=%zu decoded=%u snapshot_regions=%zu region=%s status='%s' last_error='%s'",
+        static_cast<unsigned long long>(*addr), handler_size, (int)kernel_mode,
+        code.size(),
+        total_insns,
+        snapshot.regions.size(),
+        handler_region.dump().c_str(),
+        driver_bridge::status().c_str(),
+        driver_bridge::last_error().c_str());
     aida::diagnostic_exception_scope::scope_t exception_scope("mcp.analyze_vm_handler");
     auto emu_result = emulation::emulate_from_snapshot(snapshot, config);
+    diag::log_tagged_fmt("emul_tools", "analyze_vm_handler emulation_exit addr=0x%llX success=%d err='%s' total=%u trace=%zu reads=%zu writes=%zu reg_deltas=%zu end=0x%llX",
+        static_cast<unsigned long long>(*addr),
+        emu_result.success ? 1 : 0,
+        emu_result.error.c_str(),
+        emu_result.total_instructions,
+        emu_result.trace.size(),
+        emu_result.mem_reads.size(),
+        emu_result.mem_writes.size(),
+        emu_result.reg_deltas.size(),
+        static_cast<unsigned long long>(emu_result.end_address));
 
     json out;
     out["handler_address"]   = sa_format_address(*addr);
@@ -755,8 +824,17 @@ tool_result_t emulate_multi_trace(const json& params)
     std::uint64_t code_base_aligned = *addr & ~0xFFFULL;
     std::uint64_t code_region_size = (static_cast<std::uint64_t>(size) + 0xFFF + (*addr & 0xFFF)) & ~0xFFFULL;
 
-    diag::log_tagged_fmt("emul_tools", "emulate_multi_trace addr=0x%llx input_count=%zu kernel=%d",
-        static_cast<unsigned long long>(*addr), params["inputs"].size(), (int)kernel_mode);
+    const json multi_region = emulation_region_evidence(*addr);
+    diag::log_tagged_fmt("emul_tools", "emulate_multi_trace addr=0x%llx input_count=%zu kernel=%d code_bytes=%zu code_region_base=0x%llX code_region_size=0x%llX region=%s status='%s' last_error='%s'",
+        static_cast<unsigned long long>(*addr),
+        params["inputs"].size(),
+        (int)kernel_mode,
+        code.size(),
+        static_cast<unsigned long long>(code_base_aligned),
+        static_cast<unsigned long long>(code_region_size),
+        multi_region.dump().c_str(),
+        driver_bridge::status().c_str(),
+        driver_bridge::last_error().c_str());
     json traces = json::array();
     const auto& inputs = params["inputs"];
 
@@ -805,6 +883,18 @@ tool_result_t emulate_multi_trace(const json& params)
 
         aida::diagnostic_exception_scope::scope_t exception_scope("mcp.emulate_multi_trace");
         auto result = emulation::emulate_from_snapshot(snapshot, config);
+        diag::log_tagged_fmt("emul_tools", "emulate_multi_trace emulation_exit input_index=%zu addr=0x%llX success=%d err='%s' total=%u trace=%zu reads=%zu writes=%zu reg_deltas=%zu end=0x%llX snapshot_regions=%zu",
+            ti,
+            static_cast<unsigned long long>(*addr),
+            result.success ? 1 : 0,
+            result.error.c_str(),
+            result.total_instructions,
+            result.trace.size(),
+            result.mem_reads.size(),
+            result.mem_writes.size(),
+            result.reg_deltas.size(),
+            static_cast<unsigned long long>(result.end_address),
+            snapshot.regions.size());
 
         json trace;
         trace["input_index"] = ti;

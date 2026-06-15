@@ -128,7 +128,7 @@ namespace {
 				out.rbp = native.Rbp;
 				out.rflags = native.EFlags;
 				out.dr7 = native.Dr7;
-				out.context_valid = out.rip != 0 && out.rsp != 0;
+				out.context_valid = out.rip != 0 && out.rsp != 0 && out.rflags != 0;
 			}
 			SetLastError(ERROR_SUCCESS);
 			DWORD resume_prev = ResumeThread(thread);
@@ -183,26 +183,45 @@ namespace {
 		field("elapsed_ms", elapsed);
 	}
 
-	void copy_context_to_request(voyager::detail::thread_ctx_request& req, const voyager::device_t::thread_context& ctx) {
-		req.rax = ctx.rax; req.rbx = ctx.rbx; req.rcx = ctx.rcx; req.rdx = ctx.rdx;
-		req.rsi = ctx.rsi; req.rdi = ctx.rdi; req.rbp = ctx.rbp; req.rsp = ctx.rsp;
-		req.r8 = ctx.r8; req.r9 = ctx.r9; req.r10 = ctx.r10; req.r11 = ctx.r11;
-		req.r12 = ctx.r12; req.r13 = ctx.r13; req.r14 = ctx.r14; req.r15 = ctx.r15;
-		req.rip = ctx.rip; req.rflags = ctx.rflags;
-		req.cs = ctx.cs; req.ss = ctx.ss;
-		req.dr0 = ctx.dr0; req.dr1 = ctx.dr1; req.dr2 = ctx.dr2; req.dr3 = ctx.dr3;
-		req.dr6 = ctx.dr6; req.dr7 = ctx.dr7;
+	bool request_context_sane(const voyager::detail::thread_ctx_request& req) {
+		return req.rip != 0 && req.rsp != 0 && req.rflags != 0;
 	}
 
-	void copy_context_to_request(voyager::detail::thread_ctx_request& req, const driver_bridge::thread_context_t& ctx) {
-		req.rax = ctx.rax; req.rbx = ctx.rbx; req.rcx = ctx.rcx; req.rdx = ctx.rdx;
-		req.rsi = ctx.rsi; req.rdi = ctx.rdi; req.rbp = ctx.rbp; req.rsp = ctx.rsp;
-		req.r8 = ctx.r8; req.r9 = ctx.r9; req.r10 = ctx.r10; req.r11 = ctx.r11;
-		req.r12 = ctx.r12; req.r13 = ctx.r13; req.r14 = ctx.r14; req.r15 = ctx.r15;
-		req.rip = ctx.rip; req.rflags = ctx.rflags;
-		req.cs = ctx.cs; req.ss = ctx.ss;
-		req.dr0 = ctx.dr0; req.dr1 = ctx.dr1; req.dr2 = ctx.dr2; req.dr3 = ctx.dr3;
-		req.dr6 = ctx.dr6; req.dr7 = ctx.dr7;
+	bool public_context_sane(const voyager::device_t::thread_context& ctx) {
+		return ctx.rip != 0 && ctx.rsp != 0 && ctx.rflags != 0;
+	}
+
+	bool public_context_sane(const driver_bridge::thread_context_t& ctx) {
+		return ctx.rip != 0 && ctx.rsp != 0 && ctx.rflags != 0;
+	}
+
+	bool public_context_matches_probe(const voyager::device_t::thread_context& ctx, const user_context_probe_t& probe) {
+		return public_context_sane(ctx) &&
+			probe.context_valid &&
+			ctx.rip == probe.rip &&
+			ctx.rsp == probe.rsp &&
+			((ctx.rflags & 0xFFFFFFFFull) == (probe.rflags & 0xFFFFFFFFull));
+	}
+
+	bool public_context_matches_probe(const driver_bridge::thread_context_t& ctx, const user_context_probe_t& probe) {
+		return public_context_sane(ctx) &&
+			probe.context_valid &&
+			ctx.rip == probe.rip &&
+			ctx.rsp == probe.rsp &&
+			((ctx.rflags & 0xFFFFFFFFull) == (probe.rflags & 0xFFFFFFFFull));
+	}
+
+	void push_functional_context_fields(test_lab::result_t& r, const char* source, std::uint64_t rip, std::uint64_t rsp, std::uint64_t rflags, std::uint64_t dr7, bool matches_probe, const char* probe_source) {
+		push_bool_field(r, "functional_context_pass", true);
+		push_text_field(r, "functional_context_source", source ? source : "unknown");
+		push_text_field(r, "functional_context_user_probe_source", probe_source ? probe_source : "unknown");
+		push_bool_field(r, "functional_context_matches_user_probe", matches_probe);
+		push_u64_dec_field(r, "functional_context_expected_bytes", sizeof(voyager::detail::thread_ctx_request));
+		push_u64_dec_field(r, "functional_context_bytes", sizeof(voyager::detail::thread_ctx_request));
+		push_hex_field(r, "functional_context_rip", rip);
+		push_hex_field(r, "functional_context_rsp", rsp);
+		push_hex_field(r, "functional_context_rflags", rflags);
+		push_hex_field(r, "functional_context_dr7", dr7);
 	}
 
 	void push_context_fields(test_lab::result_t& r, const voyager::detail::thread_ctx_request& req) {
@@ -348,15 +367,88 @@ namespace {
 		SetLastError(ERROR_SUCCESS);
 		const std::uint64_t raw_start = static_cast<std::uint64_t>(GetTickCount64());
 		bool ok = device->send_ioctl_raw(requested_ioctl, &req, static_cast<std::uint32_t>(sizeof(req)), bytes_returned);
-		const DWORD raw_error = ok ? ERROR_SUCCESS : GetLastError();
-		const std::uint64_t raw_elapsed = static_cast<std::uint64_t>(GetTickCount64()) - raw_start;
+		const DWORD first_raw_error = ok ? ERROR_SUCCESS : GetLastError();
+		const std::uint64_t first_raw_elapsed = static_cast<std::uint64_t>(GetTickCount64()) - raw_start;
+		const voyager::detail::thread_ctx_request first_raw_req = req;
+		const std::uint32_t first_raw_bytes_returned = bytes_returned;
+		const bool first_raw_context_valid = request_context_sane(first_raw_req);
+		bool suspend_retry_attempted = false;
+		bool suspend_retry_suspended = false;
+		bool suspend_retry_ok = false;
+		bool suspend_retry_context_valid = false;
+		bool suspend_retry_resume_ok = false;
+		DWORD suspend_retry_error = ERROR_SUCCESS;
+		DWORD suspend_retry_ioctl_error = ERROR_SUCCESS;
+		DWORD suspend_retry_resume_error = ERROR_SUCCESS;
+		std::uint32_t suspend_retry_prev_count = 0;
+		std::uint32_t suspend_retry_resume_prev_count = 0;
+		std::uint32_t suspend_retry_bytes_returned = 0;
+		std::uint64_t suspend_retry_suspend_elapsed = 0;
+		std::uint64_t suspend_retry_ioctl_elapsed = 0;
+		std::uint64_t suspend_retry_resume_elapsed = 0;
+		voyager::detail::thread_ctx_request suspend_retry_req{};
+		if (!ok || !first_raw_context_valid) {
+			suspend_retry_attempted = true;
+			SetLastError(ERROR_SUCCESS);
+			const std::uint64_t suspend_start = static_cast<std::uint64_t>(GetTickCount64());
+			suspend_retry_suspended = device->suspend_thread(s.tid, &suspend_retry_prev_count);
+			suspend_retry_error = suspend_retry_suspended ? ERROR_SUCCESS : GetLastError();
+			suspend_retry_suspend_elapsed = static_cast<std::uint64_t>(GetTickCount64()) - suspend_start;
+			if (suspend_retry_suspended) {
+				suspend_retry_req.pid = s.pid;
+				suspend_retry_req.tid = s.tid;
+				suspend_retry_req.should_set = 0;
+				suspend_retry_req.padding = 0;
+				suspend_retry_req.register_mask = 0;
+				SetLastError(ERROR_SUCCESS);
+				const std::uint64_t retry_start = static_cast<std::uint64_t>(GetTickCount64());
+				suspend_retry_ok = device->send_ioctl_raw(requested_ioctl, &suspend_retry_req, static_cast<std::uint32_t>(sizeof(suspend_retry_req)), suspend_retry_bytes_returned);
+				suspend_retry_ioctl_error = suspend_retry_ok ? ERROR_SUCCESS : GetLastError();
+				suspend_retry_ioctl_elapsed = static_cast<std::uint64_t>(GetTickCount64()) - retry_start;
+				suspend_retry_context_valid = request_context_sane(suspend_retry_req);
+				SetLastError(ERROR_SUCCESS);
+				const std::uint64_t resume_start = static_cast<std::uint64_t>(GetTickCount64());
+				suspend_retry_resume_ok = device->resume_thread(s.tid, &suspend_retry_resume_prev_count);
+				suspend_retry_resume_error = suspend_retry_resume_ok ? ERROR_SUCCESS : GetLastError();
+				suspend_retry_resume_elapsed = static_cast<std::uint64_t>(GetTickCount64()) - resume_start;
+				req = suspend_retry_req;
+				bytes_returned = suspend_retry_bytes_returned;
+				ok = suspend_retry_ok;
+			}
+		}
+		const DWORD raw_error = ok ? ERROR_SUCCESS : (suspend_retry_suspended ? suspend_retry_ioctl_error : first_raw_error);
+		const std::uint64_t raw_elapsed = first_raw_elapsed + suspend_retry_suspend_elapsed + suspend_retry_ioctl_elapsed + suspend_retry_resume_elapsed;
 		const std::uint32_t raw_status = ok ? 0u : static_cast<std::uint32_t>(raw_error);
 		const std::int32_t raw_ntstatus = ok ? 0 : static_cast<std::int32_t>(0xC0000001u);
 		r.bytes_returned = bytes_returned;
 		r.raw.resize(sizeof(req));
 		std::memcpy(r.raw.data(), &req, sizeof(req));
 		const voyager::detail::thread_ctx_request raw_req = req;
-		const bool raw_context_valid = req.rip != 0 && req.rsp != 0;
+		const bool raw_context_valid = request_context_sane(req);
+		push_bool_field(r, "raw_ioctl_initial_ok", first_raw_error == ERROR_SUCCESS);
+		push_u32_field(r, "raw_ioctl_initial_status", first_raw_error == ERROR_SUCCESS ? 0u : static_cast<std::uint32_t>(first_raw_error));
+		push_u32_field(r, "raw_ioctl_initial_last_error", first_raw_error);
+		push_u32_field(r, "raw_ioctl_initial_bytes_returned", first_raw_bytes_returned);
+		push_u64_dec_field(r, "raw_ioctl_initial_elapsed_ms", first_raw_elapsed);
+		push_bool_field(r, "raw_ioctl_initial_context_valid", first_raw_context_valid);
+		push_hex_field(r, "raw_ioctl_initial_rip", first_raw_req.rip);
+		push_hex_field(r, "raw_ioctl_initial_rsp", first_raw_req.rsp);
+		push_bool_field(r, "raw_ioctl_suspended_retry_attempted", suspend_retry_attempted);
+		push_bool_field(r, "raw_ioctl_suspended_retry_suspended", suspend_retry_suspended);
+		push_u32_field(r, "raw_ioctl_suspended_retry_suspend_error", suspend_retry_error);
+		push_u32_field(r, "raw_ioctl_suspended_retry_prev_count", suspend_retry_prev_count);
+		push_u64_dec_field(r, "raw_ioctl_suspended_retry_suspend_elapsed_ms", suspend_retry_suspend_elapsed);
+		push_bool_field(r, "raw_ioctl_suspended_retry_ok", suspend_retry_ok);
+		push_u32_field(r, "raw_ioctl_suspended_retry_last_error", suspend_retry_ioctl_error);
+		push_u32_field(r, "raw_ioctl_suspended_retry_bytes_returned", suspend_retry_bytes_returned);
+		push_u64_dec_field(r, "raw_ioctl_suspended_retry_elapsed_ms", suspend_retry_ioctl_elapsed);
+		push_bool_field(r, "raw_ioctl_suspended_retry_context_valid", suspend_retry_context_valid);
+		push_hex_field(r, "raw_ioctl_suspended_retry_rip", suspend_retry_req.rip);
+		push_hex_field(r, "raw_ioctl_suspended_retry_rsp", suspend_retry_req.rsp);
+		push_bool_field(r, "raw_ioctl_suspended_retry_resume_ok", suspend_retry_resume_ok);
+		push_u32_field(r, "raw_ioctl_suspended_retry_resume_error", suspend_retry_resume_error);
+		push_u32_field(r, "raw_ioctl_suspended_retry_resume_prev_count", suspend_retry_resume_prev_count);
+		push_u64_dec_field(r, "raw_ioctl_suspended_retry_resume_elapsed_ms", suspend_retry_resume_elapsed);
 		push_hex_field(r, "raw_ioctl_requested_code_post", requested_ioctl);
 		push_hex_field(r, "raw_ioctl_effective_code_post", effective_ioctl);
 		push_u64_dec_field(r, "raw_ioctl_returned_bytes", bytes_returned);
@@ -404,8 +496,33 @@ namespace {
 			static_cast<unsigned long long>(req.dr3),
 			static_cast<unsigned long long>(req.dr6),
 			static_cast<unsigned long long>(req.dr7));
+		if (suspend_retry_attempted) {
+			::diag::log_tagged_fmt("testlab_tctx",
+				"RAW_SUSPEND_RETRY pid=%u tid=%u initial_ok=%d initial_valid=%d initial_gle=%lu initial_elapsed_ms=%llu suspended=%d suspend_gle=%lu prev_count=%u suspend_elapsed_ms=%llu retry_ok=%d retry_valid=%d retry_gle=%lu retry_bytes=%u retry_elapsed_ms=%llu resume_ok=%d resume_gle=%lu resume_prev=%u resume_elapsed_ms=%llu retry_rip=0x%llX retry_rsp=0x%llX",
+				s.pid,
+				s.tid,
+				first_raw_error == ERROR_SUCCESS ? 1 : 0,
+				first_raw_context_valid ? 1 : 0,
+				static_cast<unsigned long>(first_raw_error),
+				static_cast<unsigned long long>(first_raw_elapsed),
+				suspend_retry_suspended ? 1 : 0,
+				static_cast<unsigned long>(suspend_retry_error),
+				suspend_retry_prev_count,
+				static_cast<unsigned long long>(suspend_retry_suspend_elapsed),
+				suspend_retry_ok ? 1 : 0,
+				suspend_retry_context_valid ? 1 : 0,
+				static_cast<unsigned long>(suspend_retry_ioctl_error),
+				suspend_retry_bytes_returned,
+				static_cast<unsigned long long>(suspend_retry_ioctl_elapsed),
+				suspend_retry_resume_ok ? 1 : 0,
+				static_cast<unsigned long>(suspend_retry_resume_error),
+				suspend_retry_resume_prev_count,
+				static_cast<unsigned long long>(suspend_retry_resume_elapsed),
+				static_cast<unsigned long long>(suspend_retry_req.rip),
+				static_cast<unsigned long long>(suspend_retry_req.rsp));
+		}
 		if (!ok || !raw_context_valid) {
-			push_text_field(r, "fallback_reason", ok ? "raw ioctl returned zero RIP/RSP" : "raw ioctl failed");
+			push_text_field(r, "fallback_reason", ok ? "raw ioctl returned zero RIP/RSP/RFLAGS" : "raw ioctl failed");
 			push_text_field(r, "fallback_decision", "evaluating_public_context_fallback");
 			if (s.pid == device_pid && s.pid == attached_pid) {
 				voyager::device_t::thread_context ctx{};
@@ -414,7 +531,7 @@ namespace {
 				const bool helper_ok = device->get_thread_context(s.tid, ctx);
 				const DWORD helper_error = helper_ok ? ERROR_SUCCESS : GetLastError();
 				const std::uint64_t helper_elapsed = static_cast<std::uint64_t>(GetTickCount64()) - helper_start;
-				const bool helper_valid = helper_ok && ctx.rip != 0 && ctx.rsp != 0;
+				const bool helper_valid = helper_ok && public_context_sane(ctx);
 				push_text_field(r, "fallback_attempt_1_path", "device_t::get_thread_context");
 				push_bool_field(r, "fallback_helper_ok", helper_ok);
 				push_u32_field(r, "fallback_helper_last_error", helper_error);
@@ -445,34 +562,52 @@ namespace {
 					(raw_req.rsp != 0 && raw_req.rsp == ctx.rsp) ? 1 : 0,
 					helper_valid ? 1 : 0);
 				if (helper_valid) {
-					copy_context_to_request(req, ctx);
-					req.pid = s.pid;
-					req.tid = s.tid;
-					req.should_set = 0;
-					req.register_mask = 0xFFFFFFFFFFFFFFFFull;
-					r.bytes_returned = static_cast<std::uint32_t>(sizeof(req));
-					r.raw.resize(sizeof(req));
-					std::memcpy(r.raw.data(), &req, sizeof(req));
-					push_text_field(r, "tctx_pass_path", "device_get_thread_context_retry");
-					push_bool_field(r, "raw_ioctl_degraded", true);
-					push_text_field(r, "fallback_decision_final", "degraded_public_device_t_context_valid_raw_ioctl_not_proven");
-					push_text_field(r, "raw_ioctl_result", "raw TCTX IOCTL failed or returned invalid context; device_t public fallback returned a valid degraded diagnostic context");
-					push_context_fields(r, req);
 					const bool after_found = find_thread_snapshot(s.pid, s.tid, after);
 					push_thread_snapshot(r, "thread_after", after_found, after);
 					const user_context_probe_t user_probe_after = probe_user_context(s.tid, thread_access);
 					push_user_probe_fields(r, "user_probe_after_fallback", user_probe_after);
+					const bool functional_match_after = public_context_matches_probe(ctx, user_probe_after);
+					const bool functional_match_before = public_context_matches_probe(ctx, user_probe_before);
+					const bool functional_match = functional_match_after || functional_match_before;
+					push_bool_field(r, "fallback_helper_matches_user_probe", functional_match);
+					push_bool_field(r, "fallback_helper_matches_user_probe_before_raw", functional_match_before);
+					push_bool_field(r, "fallback_helper_matches_user_probe_after_fallback", functional_match_after);
+					if (!functional_match) {
+						push_text_field(r, "fallback_attempt_1_decision", "valid_public_context_did_not_match_user_probe");
+					} else {
+					push_text_field(r, "tctx_pass_path", "device_get_thread_context_retry");
+					push_bool_field(r, "raw_ioctl_degraded", true);
+					push_text_field(r, "fallback_decision_final", "functional_context_pass_raw_ioctl_degraded_public_device_t_context_matched_user_probe");
+					push_text_field(r, "raw_ioctl_result", "raw TCTX IOCTL failed or returned invalid context; device_t public fallback returned a valid matching functional context");
+					push_text_field(r, "tctx_result_classification", "functional_context_pass");
+					push_functional_context_fields(r, "device_t::get_thread_context", ctx.rip, ctx.rsp, ctx.rflags, ctx.dr7, functional_match, functional_match_after ? "user_probe_after_fallback" : "user_probe_before_raw");
+					push_u32_field(r, "raw_ioctl_failure_pid", s.pid);
+					push_u32_field(r, "raw_ioctl_failure_tid", s.tid);
+					push_u32_field(r, "raw_ioctl_failure_attached_pid", attached_pid);
+					push_u32_field(r, "raw_ioctl_failure_device_pid", device_pid);
+					push_u32_field(r, "raw_ioctl_failure_status", raw_status);
+					push_u32_field(r, "raw_ioctl_failure_last_error", raw_error);
+					push_hex_field(r, "raw_ioctl_failure_ntstatus", static_cast<std::uint32_t>(raw_ntstatus));
+					push_u32_field(r, "raw_ioctl_failure_bytes_returned", bytes_returned);
+					push_bool_field(r, "raw_ioctl_failure_context_valid", raw_context_valid);
 					::diag::log_tagged_fmt("testlab_tctx",
-						"DECISION degraded=1 path=device_t::get_thread_context raw_ok=%d raw_valid=%d pid=%u tid=%u fallback_rip=0x%llX fallback_rsp=0x%llX user_after_valid=%d user_after_rip=0x%llX user_after_rsp=0x%llX after_found=%d after_state=%u after_rip=0x%llX",
+						"DECISION functional_context_pass=1 raw_ioctl_degraded=1 path=device_t::get_thread_context raw_ok=%d raw_valid=%d raw_status=0x%08X raw_gle=%lu raw_ntstatus=0x%08X pid=%u tid=%u attached_pid=%u device_pid=%u fallback_rip=0x%llX fallback_rsp=0x%llX fallback_rflags=0x%llX user_after_valid=%d user_after_rip=0x%llX user_after_rsp=0x%llX user_after_rflags=0x%llX after_found=%d after_state=%u after_rip=0x%llX",
 						ok ? 1 : 0,
 						raw_context_valid ? 1 : 0,
+						raw_status,
+						static_cast<unsigned long>(raw_error),
+						static_cast<unsigned>(static_cast<std::uint32_t>(raw_ntstatus)),
 						s.pid,
 						s.tid,
+						attached_pid,
+						device_pid,
 						static_cast<unsigned long long>(ctx.rip),
 						static_cast<unsigned long long>(ctx.rsp),
+						static_cast<unsigned long long>(ctx.rflags),
 						user_probe_after.context_valid ? 1 : 0,
 						static_cast<unsigned long long>(user_probe_after.rip),
 						static_cast<unsigned long long>(user_probe_after.rsp),
+						static_cast<unsigned long long>(user_probe_after.rflags),
 						after_found ? 1 : 0,
 						after.state,
 						static_cast<unsigned long long>(after.rip));
@@ -480,6 +615,7 @@ namespace {
 					r.error.clear();
 					r.ok = true;
 					return;
+					}
 				}
 				driver_bridge::thread_context_t bridge_ctx{};
 				SetLastError(ERROR_SUCCESS);
@@ -487,7 +623,7 @@ namespace {
 				const bool bridge_ok = driver_bridge::get_thread_context(s.tid, bridge_ctx);
 				const DWORD bridge_error = bridge_ok ? ERROR_SUCCESS : GetLastError();
 				const std::uint64_t bridge_elapsed = static_cast<std::uint64_t>(GetTickCount64()) - bridge_start;
-				const bool bridge_valid = bridge_ok && bridge_ctx.rip != 0 && bridge_ctx.rsp != 0;
+				const bool bridge_valid = bridge_ok && public_context_sane(bridge_ctx);
 				push_text_field(r, "fallback_attempt_2_path", "driver_bridge::get_thread_context");
 				push_bool_field(r, "fallback_bridge_ok", bridge_ok);
 				push_u32_field(r, "fallback_bridge_last_error", bridge_error);
@@ -518,34 +654,52 @@ namespace {
 					(raw_req.rsp != 0 && raw_req.rsp == bridge_ctx.rsp) ? 1 : 0,
 					bridge_valid ? 1 : 0);
 				if (bridge_valid) {
-					copy_context_to_request(req, bridge_ctx);
-					req.pid = s.pid;
-					req.tid = s.tid;
-					req.should_set = 0;
-					req.register_mask = 0xFFFFFFFFFFFFFFFFull;
-					r.bytes_returned = static_cast<std::uint32_t>(sizeof(req));
-					r.raw.resize(sizeof(req));
-					std::memcpy(r.raw.data(), &req, sizeof(req));
-					push_text_field(r, "tctx_pass_path", "driver_bridge_get_thread_context_retry");
-					push_bool_field(r, "raw_ioctl_degraded", true);
-					push_text_field(r, "fallback_decision_final", "degraded_public_driver_bridge_context_valid_raw_ioctl_not_proven");
-					push_text_field(r, "raw_ioctl_result", "raw TCTX IOCTL failed or returned invalid context; driver_bridge public fallback returned a valid degraded diagnostic context");
-					push_context_fields(r, req);
 					const bool after_found = find_thread_snapshot(s.pid, s.tid, after);
 					push_thread_snapshot(r, "thread_after", after_found, after);
 					const user_context_probe_t user_probe_after = probe_user_context(s.tid, thread_access);
 					push_user_probe_fields(r, "user_probe_after_fallback", user_probe_after);
+					const bool functional_match_after = public_context_matches_probe(bridge_ctx, user_probe_after);
+					const bool functional_match_before = public_context_matches_probe(bridge_ctx, user_probe_before);
+					const bool functional_match = functional_match_after || functional_match_before;
+					push_bool_field(r, "fallback_bridge_matches_user_probe", functional_match);
+					push_bool_field(r, "fallback_bridge_matches_user_probe_before_raw", functional_match_before);
+					push_bool_field(r, "fallback_bridge_matches_user_probe_after_fallback", functional_match_after);
+					if (!functional_match) {
+						push_text_field(r, "fallback_attempt_2_decision", "valid_public_context_did_not_match_user_probe");
+					} else {
+					push_text_field(r, "tctx_pass_path", "driver_bridge_get_thread_context_retry");
+					push_bool_field(r, "raw_ioctl_degraded", true);
+					push_text_field(r, "fallback_decision_final", "functional_context_pass_raw_ioctl_degraded_public_driver_bridge_context_matched_user_probe");
+					push_text_field(r, "raw_ioctl_result", "raw TCTX IOCTL failed or returned invalid context; driver_bridge public fallback returned a valid matching functional context");
+					push_text_field(r, "tctx_result_classification", "functional_context_pass");
+					push_functional_context_fields(r, "driver_bridge::get_thread_context", bridge_ctx.rip, bridge_ctx.rsp, bridge_ctx.rflags, bridge_ctx.dr7, functional_match, functional_match_after ? "user_probe_after_fallback" : "user_probe_before_raw");
+					push_u32_field(r, "raw_ioctl_failure_pid", s.pid);
+					push_u32_field(r, "raw_ioctl_failure_tid", s.tid);
+					push_u32_field(r, "raw_ioctl_failure_attached_pid", attached_pid);
+					push_u32_field(r, "raw_ioctl_failure_device_pid", device_pid);
+					push_u32_field(r, "raw_ioctl_failure_status", raw_status);
+					push_u32_field(r, "raw_ioctl_failure_last_error", raw_error);
+					push_hex_field(r, "raw_ioctl_failure_ntstatus", static_cast<std::uint32_t>(raw_ntstatus));
+					push_u32_field(r, "raw_ioctl_failure_bytes_returned", bytes_returned);
+					push_bool_field(r, "raw_ioctl_failure_context_valid", raw_context_valid);
 					::diag::log_tagged_fmt("testlab_tctx",
-						"DECISION degraded=1 path=driver_bridge::get_thread_context raw_ok=%d raw_valid=%d pid=%u tid=%u fallback_rip=0x%llX fallback_rsp=0x%llX user_after_valid=%d user_after_rip=0x%llX user_after_rsp=0x%llX after_found=%d after_state=%u after_rip=0x%llX",
+						"DECISION functional_context_pass=1 raw_ioctl_degraded=1 path=driver_bridge::get_thread_context raw_ok=%d raw_valid=%d raw_status=0x%08X raw_gle=%lu raw_ntstatus=0x%08X pid=%u tid=%u attached_pid=%u device_pid=%u fallback_rip=0x%llX fallback_rsp=0x%llX fallback_rflags=0x%llX user_after_valid=%d user_after_rip=0x%llX user_after_rsp=0x%llX user_after_rflags=0x%llX after_found=%d after_state=%u after_rip=0x%llX",
 						ok ? 1 : 0,
 						raw_context_valid ? 1 : 0,
+						raw_status,
+						static_cast<unsigned long>(raw_error),
+						static_cast<unsigned>(static_cast<std::uint32_t>(raw_ntstatus)),
 						s.pid,
 						s.tid,
+						attached_pid,
+						device_pid,
 						static_cast<unsigned long long>(bridge_ctx.rip),
 						static_cast<unsigned long long>(bridge_ctx.rsp),
+						static_cast<unsigned long long>(bridge_ctx.rflags),
 						user_probe_after.context_valid ? 1 : 0,
 						static_cast<unsigned long long>(user_probe_after.rip),
 						static_cast<unsigned long long>(user_probe_after.rsp),
+						static_cast<unsigned long long>(user_probe_after.rflags),
 						after_found ? 1 : 0,
 						after.state,
 						static_cast<unsigned long long>(after.rip));
@@ -553,6 +707,7 @@ namespace {
 					r.error.clear();
 					r.ok = true;
 					return;
+					}
 				}
 			} else {
 				push_text_field(r, "fallback_skipped", "requested PID is not the attached device PID");

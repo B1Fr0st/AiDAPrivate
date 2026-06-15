@@ -3,6 +3,8 @@
 #include "../../../../driver/comm.h"
 #include "imgui/imgui.h"
 
+#include <Windows.h>
+
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -72,6 +74,16 @@ namespace {
 		char b[40];
 		std::snprintf(b, sizeof(b), "0x%016llX", static_cast<unsigned long long>(v));
 		r.parsed.push_back({ label, b });
+	}
+
+	void push_u64_dec(test_lab::result_t& r, const char* label, std::uint64_t v) {
+		char b[32];
+		std::snprintf(b, sizeof(b), "%llu", static_cast<unsigned long long>(v));
+		r.parsed.push_back({ label, b });
+	}
+
+	void push_bool(test_lab::result_t& r, const char* label, bool value) {
+		r.parsed.push_back({ label, value ? "1" : "0" });
 	}
 
 	struct abrt_state_t {
@@ -148,18 +160,50 @@ namespace {
 		}
 		std::uint32_t token_hash = fold_bytes_to_u32(bytes);
 		std::uint64_t server_nonce = static_cast<std::uint64_t>(__rdtsc());
+		const std::uint32_t caller_pid = static_cast<std::uint32_t>(GetCurrentProcessId());
+		device->sync_dynamic_security_state();
+		const bool server_seed_before = device->has_server_seed();
+		const bool ioctl_seed_before = device->has_server_ioctl_seed();
+		const std::uint64_t timestamp = static_cast<std::uint64_t>(__rdtsc());
+		const std::uint64_t start_ms = static_cast<std::uint64_t>(GetTickCount64());
 
+		SetLastError(ERROR_SUCCESS);
 		bool ok = device->relay_server_token(token_hash, server_nonce);
+		const DWORD gle = ok ? ERROR_SUCCESS : GetLastError();
+		const std::uint64_t elapsed_ms = static_cast<std::uint64_t>(GetTickCount64()) - start_ms;
+		voyager::detail::server_token_relay evidence{};
+		evidence.token_hash = token_hash;
+		evidence.timestamp = timestamp;
+		evidence.server_nonce = server_nonce;
+		evidence.result = ok ? 1u : 0u;
+		r.bytes_returned = ok ? static_cast<std::uint32_t>(sizeof(evidence)) : 0u;
+		r.raw.resize(sizeof(evidence));
+		std::memcpy(r.raw.data(), &evidence, sizeof(evidence));
 		push_u32_hex(r, "token_hash", token_hash);
 		push_u64_hex(r, "server_nonce", server_nonce);
 		push_u32_hex(r, "token_bytes_consumed", static_cast<std::uint32_t>(bytes.size()));
 		r.parsed.push_back({ "ioctl", "SRVT" });
+		push_bool(r, "accepted", ok);
+		r.parsed.push_back({ "result", ok ? "accepted" : "rejected" });
+		push_u32_hex(r, "last_error", gle);
+		push_u32_hex(r, "expected_bytes", static_cast<std::uint32_t>(sizeof(evidence)));
+		push_u32_hex(r, "returned_bytes", r.bytes_returned);
+		push_u32_hex(r, "caller_pid", caller_pid);
+		push_u32_hex(r, "registered_pid_expected", caller_pid);
+		push_bool(r, "session_present", ok);
+		push_bool(r, "session_presence_inferred_from_acceptance", ok);
+		push_bool(r, "server_seed_present_before", server_seed_before);
+		push_bool(r, "server_ioctl_seed_present_before", ioctl_seed_before);
+		push_bool(r, "server_seed_present", device->has_server_seed());
+		push_bool(r, "server_ioctl_seed_present", device->has_server_ioctl_seed());
+		push_u64_dec(r, "elapsed_ms", elapsed_ms);
 		if (!ok) {
 			r.ok = false;
 			r.error = "relay_server_token returned false (kernel rejected or session_key mismatch)";
+			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
 			return;
 		}
-		r.parsed.push_back({ "result", "accepted (driver activated, last_heartbeat_time updated)" });
+		r.parsed.push_back({ "accepted_effect", "driver activated, last_heartbeat_time updated" });
 		r.ok = true;
 	}
 
@@ -189,22 +233,55 @@ namespace {
 		std::uint32_t token_hash = fold_bytes_to_u32(bytes);
 		std::uint64_t tsc = static_cast<std::uint64_t>(__rdtsc());
 		std::uint64_t server_nonce = (tsc & 0xFFFFFFFF00000000ull) | static_cast<std::uint64_t>(s.u32_a);
+		const std::uint32_t caller_pid = static_cast<std::uint32_t>(GetCurrentProcessId());
+		device->sync_dynamic_security_state();
+		const bool server_seed_before = device->has_server_seed();
+		const bool ioctl_seed_before = device->has_server_ioctl_seed();
+		const std::uint64_t timestamp = static_cast<std::uint64_t>(__rdtsc());
+		const std::uint64_t start_ms = static_cast<std::uint64_t>(GetTickCount64());
 
 		std::uint64_t out_driver_proof = 0;
+		SetLastError(ERROR_SUCCESS);
 		bool ok = device->relay_server_token_v2(token_hash, server_nonce, &out_driver_proof);
+		const DWORD gle = ok ? ERROR_SUCCESS : GetLastError();
+		const std::uint64_t elapsed_ms = static_cast<std::uint64_t>(GetTickCount64()) - start_ms;
+		voyager::detail::server_token_relay_v2 evidence{};
+		evidence.token_hash = token_hash;
+		evidence.timestamp = timestamp;
+		evidence.server_nonce = server_nonce;
+		evidence.driver_proof = out_driver_proof;
+		evidence.result = ok ? 1u : 0u;
+		r.bytes_returned = ok ? static_cast<std::uint32_t>(sizeof(evidence)) : 0u;
+		r.raw.resize(sizeof(evidence));
+		std::memcpy(r.raw.data(), &evidence, sizeof(evidence));
 		push_u32_hex(r, "token_hash",      token_hash);
 		push_u64_hex(r, "server_nonce",    server_nonce);
 		push_u32_hex(r, "epoch",           s.u32_a);
 		push_u64_hex(r, "fold_u64_preview", fold_bytes_to_u64(bytes));
 		r.parsed.push_back({ "ioctl", "SRV2" });
+		push_bool(r, "accepted", ok);
+		r.parsed.push_back({ "result", ok ? "accepted" : "rejected" });
+		push_u32_hex(r, "last_error", gle);
+		push_u32_hex(r, "expected_bytes", static_cast<std::uint32_t>(sizeof(evidence)));
+		push_u32_hex(r, "returned_bytes", r.bytes_returned);
+		push_u32_hex(r, "caller_pid", caller_pid);
+		push_u32_hex(r, "registered_pid_expected", caller_pid);
+		push_bool(r, "session_present", ok);
+		push_bool(r, "session_presence_inferred_from_acceptance", ok);
+		push_bool(r, "server_seed_present_before", server_seed_before);
+		push_bool(r, "server_ioctl_seed_present_before", ioctl_seed_before);
+		push_bool(r, "server_seed_present", device->has_server_seed());
+		push_bool(r, "server_ioctl_seed_present", device->has_server_ioctl_seed());
+		push_bool(r, "driver_proof_present", out_driver_proof != 0);
+		push_u64_dec(r, "elapsed_ms", elapsed_ms);
 		if (!ok) {
 			r.ok = false;
 			push_u64_hex(r, "driver_proof", out_driver_proof);
 			r.error = "relay_server_token_v2 returned false (kernel rejected or session_key mismatch)";
+			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
 			return;
 		}
 		push_u64_hex(r, "driver_proof", out_driver_proof);
-		r.parsed.push_back({ "result", "accepted" });
 		r.ok = true;
 	}
 
@@ -251,15 +328,43 @@ namespace {
 			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
 			return;
 		}
+		const std::uint32_t caller_pid = static_cast<std::uint32_t>(GetCurrentProcessId());
+		device->sync_dynamic_security_state();
+		const bool server_seed_before = device->has_server_seed();
+		const bool ioctl_seed_before = device->has_server_ioctl_seed();
+		const std::uint64_t start_ms = static_cast<std::uint64_t>(GetTickCount64());
+		SetLastError(ERROR_SUCCESS);
 		bool ok = device->latch_targeting_from_usermode(s.u32_a);
+		const DWORD gle = ok ? ERROR_SUCCESS : GetLastError();
+		const std::uint64_t elapsed_ms = static_cast<std::uint64_t>(GetTickCount64()) - start_ms;
+		voyager::detail::latch_targeting_request evidence{};
+		evidence.reason = s.u32_a;
+		r.bytes_returned = ok ? static_cast<std::uint32_t>(sizeof(evidence)) : 0u;
+		r.raw.resize(sizeof(evidence));
+		std::memcpy(r.raw.data(), &evidence, sizeof(evidence));
 		push_u32_hex(r, "reason", s.u32_a);
 		r.parsed.push_back({ "ioctl", "RELA" });
+		push_bool(r, "accepted", ok);
+		r.parsed.push_back({ "result", ok ? "latched" : "rejected" });
+		push_u32_hex(r, "last_error", gle);
+		push_u32_hex(r, "expected_bytes", static_cast<std::uint32_t>(sizeof(evidence)));
+		push_u32_hex(r, "returned_bytes", r.bytes_returned);
+		push_u32_hex(r, "caller_pid", caller_pid);
+		push_u32_hex(r, "registered_pid_expected", caller_pid);
+		push_bool(r, "session_present", ok);
+		push_bool(r, "session_presence_inferred_from_acceptance", ok);
+		push_bool(r, "server_seed_present_before", server_seed_before);
+		push_bool(r, "server_ioctl_seed_present_before", ioctl_seed_before);
+		push_bool(r, "server_seed_present", device->has_server_seed());
+		push_bool(r, "server_ioctl_seed_present", device->has_server_ioctl_seed());
+		push_u64_dec(r, "elapsed_ms", elapsed_ms);
 		if (!ok) {
 			r.ok = false;
 			r.error = "latch_targeting_from_usermode returned false (session_key or magic mismatch)";
+			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
 			return;
 		}
-		r.parsed.push_back({ "result", "latched against registered client PID" });
+		r.parsed.push_back({ "latched_scope", "registered client PID" });
 		r.ok = true;
 	}
 

@@ -883,8 +883,32 @@ tool_result_t ensure_attached()
         diag::log_tagged_fmt("mcp_tools", "handle_sandbox_execute entry");
         if (!params.contains("path") || !params["path"].is_string())
             return error("Missing required parameter: path");
-        if (!g_sa_settings.sandbox.enabled)
-            return error("Windows Sandbox execution is disabled in settings.");
+        const bool settings_enabled = g_sa_settings.sandbox.enabled;
+        const bool feature_available = !sandbox::detail::windows_sandbox_exe().empty();
+        if (!settings_enabled) {
+            json out;
+            out["dependency"] = "windows_sandbox";
+            out["dependency_available"] = false;
+            out["dependency_unavailable"] = true;
+            out["dependency_blocked"] = true;
+            out["settings_enabled"] = false;
+            out["feature_available"] = feature_available;
+            out["host_execution_attempted"] = false;
+            out["reason"] = "sandbox_disabled_in_settings";
+            return tool_result_t::error("Windows Sandbox execution is disabled in settings.", out);
+        }
+        if (!feature_available) {
+            json out;
+            out["dependency"] = "windows_sandbox";
+            out["dependency_available"] = false;
+            out["dependency_unavailable"] = true;
+            out["dependency_blocked"] = true;
+            out["settings_enabled"] = true;
+            out["feature_available"] = false;
+            out["host_execution_attempted"] = false;
+            out["reason"] = "windows_sandbox_feature_unavailable";
+            return tool_result_t::error("Windows Sandbox is unavailable. Enable the Windows Sandbox feature first.", out);
+        }
 
         sandbox::config cfg;
         const auto exe_path = params["path"].get<std::string>();
@@ -913,6 +937,13 @@ tool_result_t ensure_attached()
 
         json out;
         out["success"] = run.success;
+        out["dependency"] = "windows_sandbox";
+        out["dependency_available"] = true;
+        out["dependency_unavailable"] = false;
+        out["dependency_blocked"] = false;
+        out["settings_enabled"] = settings_enabled;
+        out["feature_available"] = feature_available;
+        out["host_execution_attempted"] = true;
         out["exit_code"] = run.exit_code;
         out["pid"] = run.pid;
         out["timed_out"] = run.timed_out;

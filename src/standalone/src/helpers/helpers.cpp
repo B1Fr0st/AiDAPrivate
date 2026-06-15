@@ -1638,22 +1638,7 @@ void helpers::render_title()
 		}
 
 		if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_T, false)) {
-			globals::ui::test_all_visible = true;
-			char snap_before[1200] = {};
-			test_all_features::format_debug_snapshot(snap_before, sizeof(snap_before));
-			diag::log_tagged_fmt("ui", "test_all_start hotkey=Ctrl+Shift+T before={%s}", snap_before);
-			diag::log_tagged_fmt("parser_proof", "Ctrl+Shift+T pressed; starting full Test Lab before={%s}", snap_before);
-			const bool guard_started = !test_all_features::is_running();
-			if (guard_started)
-				test_all_features::begin_test_guard("ctrl_shift_t prestart");
-			test_all_features::run_parser_proof_smoke();
-			bool accepted = test_all_features::start_tests();
-			if (!accepted && guard_started)
-				test_all_features::end_test_guard("ctrl_shift_t rejected", true);
-			char snap_after[1200] = {};
-			test_all_features::format_debug_snapshot(snap_after, sizeof(snap_after));
-			diag::log_tagged_fmt("ui", "test_all_start accepted=%d after={%s}", accepted ? 1 : 0, snap_after);
-			diag::log_tagged_fmt("parser_proof", "Ctrl+Shift+T start_tests accepted=%d after={%s}", accepted ? 1 : 0, snap_after);
+			test_all_features::trigger_from_hotkey("imgui_ctrl_shift_t");
 		}
 
 		if (ImGui::IsKeyPressed(ImGuiKey_F5, false)) {

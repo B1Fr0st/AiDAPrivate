@@ -470,7 +470,7 @@ bool launch(const browser_launch_config_t& cfg, uint32_t& out_pid)
     bridge_cfg.headless = false;
     bridge_cfg.proxy = proxy_url(effective);
     bridge_cfg.python_executable = install_status.python_path;
-    bridge_cfg.launch_timeout_ms = 45000;
+    bridge_cfg.launch_timeout_ms = 75000;
     bridge_cfg.window_width = 1280;
     bridge_cfg.window_height = 900;
 

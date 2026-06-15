@@ -165,12 +165,29 @@ tool_result_t scope_remove(const json& args)
         return tool_result_t::error("Missing 'rule_id'");
     }
     const uint64_t id = args["rule_id"].get<uint64_t>();
+    const auto before = scope::list_rules();
+    json removed_rule = nullptr;
+    for (const auto& rule : before) {
+        if (rule.id == id) {
+            removed_rule = scope::rule_to_json(rule);
+            break;
+        }
+    }
     if (!scope::remove_rule(id)) {
         diag::log_tagged_fmt("mcp_burp", "scope_remove not_found id=%llu", static_cast<unsigned long long>(id));
         return tool_result_t::error("rule_id not found");
     }
+    const auto after = scope::list_rules();
+    json out;
+    out["action"] = "remove";
+    out["rule_id"] = id;
+    out["removed"] = true;
+    out["before_count"] = static_cast<uint64_t>(before.size());
+    out["after_count"] = static_cast<uint64_t>(after.size());
+    out["remaining_count"] = static_cast<uint64_t>(after.size());
+    out["removed_rule"] = removed_rule;
     diag::log_tagged_fmt("mcp_burp", "scope_remove ok id=%llu", static_cast<unsigned long long>(id));
-    return tool_result_t::ok("Scope rule " + std::to_string(id) + " removed");
+    return tool_result_t::ok("Scope rule " + std::to_string(id) + " removed", out);
 }
 
 tool_result_t scope_list(const json&)
@@ -280,12 +297,43 @@ tool_result_t cookie_delete(const json& args)
     const std::string host = args["host"].get<std::string>();
     const std::string name = args["name"].get<std::string>();
     const std::string path = args.value("path", std::string());
+    const auto before = cookie_jar::list_for_host(host);
+    json removed_cookie = nullptr;
+    for (const auto& c : before) {
+        const bool path_ok = path.empty() ? true : (c.path == path);
+        if (c.name == name && path_ok) {
+            json j;
+            j["name"]            = c.name;
+            j["value"]           = c.value;
+            j["domain"]          = c.domain;
+            j["path"]            = c.path;
+            j["expires_unix_ms"] = c.expires_unix_ms;
+            j["has_expires"]     = c.has_expires;
+            j["secure"]          = c.secure;
+            j["http_only"]       = c.http_only;
+            j["host_only"]       = c.host_only;
+            j["same_site"]       = cookie_jar::same_site_str(c.same_site);
+            removed_cookie = std::move(j);
+            break;
+        }
+    }
     if (!cookie_jar::delete_cookie(host, name, path)) {
         diag::log_tagged_fmt("mcp_burp", "cookie_delete not_found host=%s name=%s", host.c_str(), name.c_str());
         return tool_result_t::error("Cookie not found");
     }
+    const auto after = cookie_jar::list_for_host(host);
+    json out;
+    out["action"] = "delete";
+    out["host"] = host;
+    out["name"] = name;
+    out["path"] = path;
+    out["deleted"] = true;
+    out["before_count"] = static_cast<uint64_t>(before.size());
+    out["after_count"] = static_cast<uint64_t>(after.size());
+    out["remaining_count"] = static_cast<uint64_t>(after.size());
+    out["removed_cookie"] = removed_cookie;
     diag::log_tagged_fmt("mcp_burp", "cookie_delete ok host=%s name=%s", host.c_str(), name.c_str());
-    return tool_result_t::ok("Cookie deleted");
+    return tool_result_t::ok("Cookie deleted", out);
 }
 
 tool_result_t cookie_export_netscape(const json& args)

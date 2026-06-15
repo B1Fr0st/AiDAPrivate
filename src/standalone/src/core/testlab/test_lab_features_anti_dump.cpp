@@ -3,9 +3,11 @@
 #include "../../../../driver/comm.h"
 #include "imgui/imgui.h"
 
+#include <Windows.h>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 namespace {
 
@@ -62,6 +64,68 @@ namespace {
 		r.parsed.push_back({ label, b });
 	}
 
+	struct admp_call_result_t {
+		voyager::detail::anti_dump_request req{};
+		std::uint32_t bytes_returned = 0;
+		DWORD gle = ERROR_SUCCESS;
+		std::uint64_t elapsed_ms = 0;
+		bool ok = false;
+	};
+
+	std::string format_dec_u32(std::uint32_t v) {
+		char b[16];
+		std::snprintf(b, sizeof(b), "%u", v);
+		return std::string(b);
+	}
+
+	admp_call_result_t send_admp_request(std::uint32_t operation, std::uint32_t pid) {
+		admp_call_result_t out;
+		out.req.operation = operation;
+		out.req.pid = pid;
+		SetLastError(ERROR_SUCCESS);
+		const ULONGLONG start = GetTickCount64();
+		out.ok = device->send_ioctl_raw(ioctl_codes::ADMP(), &out.req,
+			static_cast<std::uint32_t>(sizeof(out.req)), out.bytes_returned);
+		out.gle = out.ok ? ERROR_SUCCESS : GetLastError();
+		out.elapsed_ms = static_cast<std::uint64_t>(GetTickCount64() - start);
+		return out;
+	}
+
+	void append_admp_call_fields(test_lab::result_t& r, const char* prefix, const admp_call_result_t& call) {
+		char label[80];
+		std::snprintf(label, sizeof(label), "%s_ok", prefix);
+		r.parsed.push_back({ label, call.ok ? "1" : "0" });
+		std::snprintf(label, sizeof(label), "%s_gle", prefix);
+		r.parsed.push_back({ label, format_dec_u32(static_cast<std::uint32_t>(call.gle)) });
+		std::snprintf(label, sizeof(label), "%s_elapsed_ms", prefix);
+		push_u64_dec(r, label, call.elapsed_ms);
+		std::snprintf(label, sizeof(label), "%s_bytes_returned", prefix);
+		r.parsed.push_back({ label, format_dec_u32(call.bytes_returned) });
+		std::snprintf(label, sizeof(label), "%s_operation", prefix);
+		r.parsed.push_back({ label, admp_op_label(call.req.operation) });
+		std::snprintf(label, sizeof(label), "%s_pid", prefix);
+		r.parsed.push_back({ label, format_dec_u32(call.req.pid) });
+		std::snprintf(label, sizeof(label), "%s_result", prefix);
+		r.parsed.push_back({ label, format_dec_u32(call.req.result) });
+		std::snprintf(label, sizeof(label), "%s_blocks_count", prefix);
+		push_u64_dec(r, label, call.req.blocks_count);
+	}
+
+	std::uint32_t choose_non_live_admp_probe_pid() {
+		for (std::uint32_t i = 0; i < 32; ++i) {
+			const std::uint32_t candidate = 0x70000001u + (i * 2u);
+			SetLastError(ERROR_SUCCESS);
+			HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, candidate);
+			if (h) {
+				CloseHandle(h);
+				continue;
+			}
+			if (GetLastError() == ERROR_INVALID_PARAMETER)
+				return candidate;
+		}
+		return 0;
+	}
+
 	void render_inputs_admp(test_lab::state_t& s) {
 		const char* items[] = {
 			"FULL_PROTECT (0)",
@@ -110,35 +174,105 @@ namespace {
 			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
 			return;
 		}
+		const bool pid_required = admp_op_requires_pid(s.u32_a);
+		r.parsed.push_back({ "requested_subcommand", admp_op_label(s.u32_a) });
+		push_u32_hex(r, "requested_operation", s.u32_a);
+		push_u32_hex(r, "requested_pid", s.pid);
+		r.parsed.push_back({ "pid_required_for_subcommand", pid_required ? "1" : "0" });
+		r.parsed.push_back({ "pid_zero_allowed_for_subcommand", (!pid_required && s.pid == 0) ? "1" : "0" });
+		if (s.u32_a == kAdmpOpQuery && s.pid == 0)
+			r.parsed.push_back({ "pid_zero_query_semantics", "pid=0 is valid for QUERY and returns global anti-dump block counters without targeting a process" });
+		else if (s.u32_a == kAdmpOpStopContinuous && s.pid == 0)
+			r.parsed.push_back({ "pid_zero_query_semantics", "pid=0 is valid for STOP_CONTINUOUS because the driver stops the global continuous anti-dump worker" });
+		else if (s.pid == 0)
+			r.parsed.push_back({ "pid_zero_query_semantics", "pid=0 is rejected for this subcommand" });
 		if (admp_op_requires_pid(s.u32_a) && s.pid == 0) {
 			r.ok = false;
 			r.error = "selected subcommand requires a non-zero PID";
+			r.ntstatus = static_cast<std::int32_t>(0xC000000Du);
 			return;
 		}
 
-		voyager::detail::anti_dump_request req{};
-		req.operation = s.u32_a;
-		req.pid       = s.pid;
-
-		std::uint32_t bytes_returned = 0;
-		bool ok = device->send_ioctl_raw(ioctl_codes::ADMP(), &req,
-			static_cast<std::uint32_t>(sizeof(req)), bytes_returned);
-		r.bytes_returned = bytes_returned;
-		r.raw.resize(sizeof(req));
-		std::memcpy(r.raw.data(), &req, sizeof(req));
-		if (!ok) {
+		const admp_call_result_t primary = send_admp_request(s.u32_a, s.pid);
+		r.bytes_returned = primary.bytes_returned;
+		r.raw.resize(sizeof(primary.req));
+		std::memcpy(r.raw.data(), &primary.req, sizeof(primary.req));
+		append_admp_call_fields(r, "primary", primary);
+		test_lab_format::testlab_diag_log_step("anti-dump", "ADMP", "primary",
+			"ok=%d gle=%lu bytes_returned=%u op=%u pid=%u result=%u blocks_count=%llu elapsed_ms=%llu",
+			primary.ok ? 1 : 0,
+			static_cast<unsigned long>(primary.gle),
+			primary.bytes_returned,
+			primary.req.operation,
+			primary.req.pid,
+			primary.req.result,
+			static_cast<unsigned long long>(primary.req.blocks_count),
+			static_cast<unsigned long long>(primary.elapsed_ms));
+		if (!primary.ok) {
 			r.ok = false;
 			r.error = "send_ioctl_raw returned false";
 			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
 			return;
 		}
 
-		r.parsed.push_back({ "subcommand", admp_op_label(req.operation) });
-		push_u32_hex(r, "operation", req.operation);
-		push_u32_hex(r, "pid",       req.pid);
-		push_u64_dec(r, "blocks_count", req.blocks_count);
-		push_u32_hex(r, "result",    req.result);
-		r.parsed.push_back({ "verdict", (req.result == 1u) ? "OK" : "FAILED_OR_PARTIAL" });
+		r.parsed.push_back({ "subcommand", admp_op_label(primary.req.operation) });
+		push_u32_hex(r, "operation", primary.req.operation);
+		push_u32_hex(r, "pid",       primary.req.pid);
+		push_u64_dec(r, "blocks_count", primary.req.blocks_count);
+		push_u32_hex(r, "result",    primary.req.result);
+		r.parsed.push_back({ "verdict", (primary.req.result == 1u) ? "OK" : "FAILED_OR_PARTIAL" });
+		if (primary.req.operation == kAdmpOpQuery) {
+			const std::uint32_t probe_pid = choose_non_live_admp_probe_pid();
+			r.parsed.push_back({ "permit_roundtrip_attempted", probe_pid != 0 ? "1" : "0" });
+			r.parsed.push_back({ "permit_roundtrip_pid", format_dec_u32(probe_pid) });
+			r.parsed.push_back({ "permit_roundtrip_pid_semantics", "synthetic non-live PID selected so permit/unpermit proves the API without allowing a live process" });
+			if (probe_pid == 0) {
+				r.ok = false;
+				r.error = "ADMP query succeeded but safe non-live PID probe selection failed";
+				r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
+				return;
+			}
+			const admp_call_result_t permit = send_admp_request(kAdmpOpPermitPid, probe_pid);
+			admp_call_result_t unpermit = send_admp_request(kAdmpOpUnpermitPid, probe_pid);
+			append_admp_call_fields(r, "permit_roundtrip_permit", permit);
+			append_admp_call_fields(r, "permit_roundtrip_unpermit", unpermit);
+			bool unpermit_retry_attempted = false;
+			admp_call_result_t unpermit_retry;
+			if (permit.ok && permit.req.result == 1u && (!unpermit.ok || unpermit.req.result != 1u)) {
+				unpermit_retry_attempted = true;
+				unpermit_retry = send_admp_request(kAdmpOpUnpermitPid, probe_pid);
+				append_admp_call_fields(r, "permit_roundtrip_unpermit_retry", unpermit_retry);
+			}
+			const bool unpermit_ok = (unpermit.ok && unpermit.req.result == 1u) ||
+				(unpermit_retry_attempted && unpermit_retry.ok && unpermit_retry.req.result == 1u);
+			const bool roundtrip_ok = permit.ok && permit.req.result == 1u && unpermit_ok;
+			r.parsed.push_back({ "permit_roundtrip_unpermit_retry_attempted", unpermit_retry_attempted ? "1" : "0" });
+			r.parsed.push_back({ "permit_roundtrip_ok", roundtrip_ok ? "1" : "0" });
+			test_lab_format::testlab_diag_log_step("anti-dump", "ADMP", "permit_roundtrip",
+				"probe_pid=%u permit_ok=%d permit_gle=%lu permit_result=%u permit_bytes=%u permit_elapsed_ms=%llu unpermit_ok=%d unpermit_gle=%lu unpermit_result=%u unpermit_bytes=%u unpermit_elapsed_ms=%llu unpermit_retry=%d unpermit_retry_ok=%d unpermit_retry_gle=%lu unpermit_retry_result=%u roundtrip_ok=%d",
+				probe_pid,
+				permit.ok ? 1 : 0,
+				static_cast<unsigned long>(permit.gle),
+				permit.req.result,
+				permit.bytes_returned,
+				static_cast<unsigned long long>(permit.elapsed_ms),
+				unpermit.ok ? 1 : 0,
+				static_cast<unsigned long>(unpermit.gle),
+				unpermit.req.result,
+				unpermit.bytes_returned,
+				static_cast<unsigned long long>(unpermit.elapsed_ms),
+				unpermit_retry_attempted ? 1 : 0,
+				unpermit_retry.ok ? 1 : 0,
+				static_cast<unsigned long>(unpermit_retry.gle),
+				unpermit_retry.req.result,
+				roundtrip_ok ? 1 : 0);
+			if (!roundtrip_ok) {
+				r.ok = false;
+				r.error = "ADMP safe permit/unpermit roundtrip failed";
+				r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
+				return;
+			}
+		}
 		r.ok = true;
 	}
 

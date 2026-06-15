@@ -14,7 +14,7 @@
 #include <unordered_set>
 #include <queue>
 
-#include <asmjit/asmjit.h>
+#include <asmjit/x86.h>
 
 #include "stub.hpp"
 #include "stub_polymorphic.hpp"

@@ -18,6 +18,8 @@
 
 namespace {
 
+	constexpr DWORD kLoopbackSocketTimeoutMs = 750u;
+
 	std::uint32_t parse_hex_payload(const std::string& src, std::uint8_t* out, std::uint32_t out_cap) {
 		std::uint32_t written = 0;
 		std::uint8_t nibble = 0;
@@ -74,7 +76,7 @@ namespace {
 	}
 
 	void configure_loopback_socket(SOCKET s) {
-		DWORD timeout_ms = 750u;
+		DWORD timeout_ms = kLoopbackSocketTimeoutMs;
 		setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
 		setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
 		BOOL nodelay = TRUE;
@@ -781,6 +783,12 @@ namespace {
 			start_req.operation = 0u;
 			start_req.filter_pid = self_pid;
 			start_req.filter_protocol = 6u;
+			r.parsed.push_back({ "effective_filter_pid", format_dec_u32(start_req.filter_pid) });
+			r.parsed.push_back({ "effective_filter_protocol", format_dec_u32(start_req.filter_protocol) });
+			r.parsed.push_back({ "effective_filter_protocol_name", proto_label(start_req.filter_protocol) });
+			r.parsed.push_back({ "effective_filter_port", format_dec_u32(start_req.filter_port) });
+			r.parsed.push_back({ "expected_receive_timeout_ms", format_dec_u32(kLoopbackSocketTimeoutMs) });
+			r.parsed.push_back({ "expected_receive_timeout_semantics", "loopback recv timeout is expected while IHLD holds matching TCP traffic; PASS requires held_matching_self_pid > 0" });
 			std::uint32_t start_bytes = 0;
 			DWORD start_gle = ERROR_SUCCESS;
 			std::uint64_t start_elapsed = 0;
@@ -801,9 +809,10 @@ namespace {
 			const std::uint64_t traffic_elapsed = static_cast<std::uint64_t>(GetTickCount64() - traffic_start);
 			r.parsed.push_back({ "loopback_traffic_ok", traffic_ok ? "1" : "0" });
 			r.parsed.push_back({ "loopback_traffic_elapsed_ms", format_dec_u64(traffic_elapsed) });
+			r.parsed.push_back({ "loopback_recv_timeout_expected", fx.recv_error == WSAETIMEDOUT ? "1" : "0" });
 			append_loopback_fields(r, fx, "loopback_after_send");
 			test_lab_format::testlab_diag_log_step("module", "IHLD", "loopback_emit",
-				"ok=%d listen_port=%u client_port=%u sent_bytes=%d send_error=%d recv_bytes=%d recv_error=%d response_sent_bytes=%d response_recv_bytes=%d elapsed_ms=%llu",
+				"ok=%d listen_port=%u client_port=%u sent_bytes=%d send_error=%d recv_bytes=%d recv_error=%d recv_timeout_expected=%d response_sent_bytes=%d response_recv_bytes=%d timeout_ms=%lu elapsed_ms=%llu",
 				traffic_ok ? 1 : 0,
 				fx.listen_port,
 				fx.client_port,
@@ -811,8 +820,10 @@ namespace {
 				fx.send_error,
 				fx.recv_bytes,
 				fx.recv_error,
+				fx.recv_error == WSAETIMEDOUT ? 1 : 0,
 				fx.response_sent_bytes,
 				fx.response_recv_bytes,
+				static_cast<unsigned long>(kLoopbackSocketTimeoutMs),
 				static_cast<unsigned long long>(traffic_elapsed));
 			Sleep(250);
 			auto req = std::make_unique<voyager::detail::intercept_request>();
@@ -876,7 +887,7 @@ namespace {
 			}
 			r.parsed.push_back({ "held_matching_self_pid", format_dec_u32(matching_self_pid) });
 			test_lab_format::testlab_diag_log_step("module", "IHLD", "list_summary",
-				"ok=%d gle=%lu bytes_returned=%u held_count=%u output_cap=%u matching_self_pid=%u intercepting=%u attached_pid=%u elapsed_ms=%llu",
+				"ok=%d gle=%lu bytes_returned=%u held_count=%u output_cap=%u matching_self_pid=%u intercepting=%u attached_pid=%u effective_filter_pid=%u effective_filter_protocol=%u effective_filter_port=%u expected_receive_timeout_ms=%lu elapsed_ms=%llu",
 				ok ? 1 : 0,
 				static_cast<unsigned long>(list_gle),
 				bytes_returned,
@@ -885,6 +896,10 @@ namespace {
 				matching_self_pid,
 				req->intercepting,
 				driver_bridge::attached_pid(),
+				start_req.filter_pid,
+				start_req.filter_protocol,
+				start_req.filter_port,
+				static_cast<unsigned long>(kLoopbackSocketTimeoutMs),
 				static_cast<unsigned long long>(list_elapsed));
 			if (req->held_count == 0u || matching_self_pid == 0u) {
 				r.error = "IHLD list did not return a self-PID held packet after deterministic intercept and loopback HTTP stimulus";

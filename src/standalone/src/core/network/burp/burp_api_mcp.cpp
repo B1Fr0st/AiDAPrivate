@@ -328,6 +328,7 @@ tool_result_t tool_api_remove(const json& params)
     }
     auto after = api_definition::list_collections();
     json out;
+    out["action"] = "remove_collection";
     out["collection_id"] = id;
     out["id"] = id;
     out["collection_name"] = had_collection ? removed_collection.name : std::string();
@@ -338,7 +339,7 @@ tool_result_t tool_api_remove(const json& params)
     out["remaining_ids"] = api_collection_ids_json(after);
     if (had_collection) out["collection"] = api_definition::collection_to_json(removed_collection);
     diag::log_tagged_fmt("mcp_burp", "api_remove ok id=%llu", static_cast<unsigned long long>(id));
-    return tool_result_t::ok("removed", out);
+    return tool_result_t::ok(out.dump(2), out);
 }
 
 tool_result_t tool_api_send(const json& params)
@@ -780,9 +781,17 @@ tool_result_t tool_ws_clear(const json& params)
         diag::log_tagged_fmt("mcp_burp", "ws_clear failed conn_id=%llu err=%s", static_cast<unsigned long long>(id), err.c_str());
         return tool_result_t::error(err);
     }
+    const size_t before_frames = ws_editor::frame_count(id);
     ws_editor::clear_frames(id);
+    const size_t after_frames = ws_editor::frame_count(id);
+    json out;
+    out["conn_id"] = id;
+    out["connection_id"] = id;
+    out["frames_before"] = static_cast<uint64_t>(before_frames);
+    out["frames_after"] = static_cast<uint64_t>(after_frames);
+    out["cleared_count"] = static_cast<uint64_t>(before_frames >= after_frames ? before_frames - after_frames : 0);
     diag::log_tagged_fmt("mcp_burp", "ws_clear ok conn_id=%llu", static_cast<unsigned long long>(id));
-    return tool_result_t::ok("cleared");
+    return tool_result_t::ok("cleared", out);
 }
 
 tool_result_t tool_logger_query(const json& params)
@@ -854,9 +863,15 @@ tool_result_t tool_logger_clear(const json& params)
 {
     (void)params;
     diag::log_tagged_fmt("mcp_burp", "logger_clear entry");
+    const size_t before = logger::total_rows();
     logger::clear();
+    const size_t after = logger::total_rows();
+    json out;
+    out["total_before"] = static_cast<uint64_t>(before);
+    out["total_after"] = static_cast<uint64_t>(after);
+    out["cleared_count"] = static_cast<uint64_t>(before >= after ? before - after : 0);
     diag::log_tagged_fmt("mcp_burp", "logger_clear ok");
-    return tool_result_t::ok("cleared");
+    return tool_result_t::ok("cleared", out);
 }
 
 tool_result_t tool_logger_export_csv(const json& params)

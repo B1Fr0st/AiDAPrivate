@@ -1320,15 +1320,27 @@ std::map<std::string, tls_session_key_t> TlsKeyExtractor::get_seen_keys() const 
 
 std::vector<quic_key_info_t> TlsKeyExtractor::extract_quic_keys(std::uint32_t pid) {
     std::vector<quic_key_info_t> keys;
-    if (!device || !device->is_connected()) return keys;
+    if (!device || !device->is_connected()) {
+        diag::log_tagged("net_sec", "quic_extract_keys backend_unavailable device_not_connected");
+        return keys;
+    }
 
     if (pid == 0) pid = device->get_process_id();
-    if (pid == 0) return keys;
+    if (pid == 0) {
+        diag::log_tagged("net_sec", "quic_extract_keys rejected pid=0");
+        return keys;
+    }
 
 
     std::uint64_t msquic_base = 0;
     std::uint32_t msquic_size = 0;
     bool has_msquic = find_module_in_process(pid, "msquic.dll", msquic_base, msquic_size);
+    diag::log_tagged_fmt("net_sec", "quic_extract_keys scan_start pid=%u has_msquic=%d msquic_base=0x%llX msquic_size=0x%X current_device_pid=%u",
+        pid,
+        has_msquic ? 1 : 0,
+        static_cast<unsigned long long>(msquic_base),
+        msquic_size,
+        device->get_process_id());
 
 
     std::uint32_t saved_pid = device->get_process_id();
@@ -1336,6 +1348,11 @@ std::vector<quic_key_info_t> TlsKeyExtractor::extract_quic_keys(std::uint32_t pi
     device->solve_dtb();
 
     auto regions = device->enumerate_memory_regions(0, 0x7FFFFFFFFFFF, false);
+    diag::log_tagged_fmt("net_sec", "quic_extract_keys regions_enumerated pid=%u count=%zu saved_pid=%u device_pid=%u",
+        pid,
+        regions.size(),
+        saved_pid,
+        device->get_process_id());
 
     static const char* quic_labels[] = {
         "QUIC_CLIENT_HANDSHAKE_TRAFFIC_SECRET ",
@@ -1348,9 +1365,42 @@ std::vector<quic_key_info_t> TlsKeyExtractor::extract_quic_keys(std::uint32_t pi
         "SERVER_TRAFFIC_SECRET_0 ",
     };
 
+    std::size_t regions_seen = 0;
+    std::size_t regions_committed = 0;
+    std::size_t regions_skipped_state = 0;
+    std::size_t regions_skipped_size = 0;
+    std::size_t read_attempts = 0;
+    std::size_t read_short = 0;
+    std::size_t label_hits = 0;
+    std::size_t reject_client_random = 0;
+    std::size_t reject_separator = 0;
+    std::size_t reject_secret = 0;
+    std::size_t region_logs = 0;
+    std::size_t hit_logs = 0;
+    std::size_t reject_logs = 0;
+    std::uint64_t first_short_read_va = 0;
+
     for (const auto& region : regions) {
-        if (region.state != 0x1000) continue;
-        if (region.size > 0x2000000 || region.size < 128) continue;
+        ++regions_seen;
+        if (region.state != 0x1000) {
+            ++regions_skipped_state;
+            continue;
+        }
+        if (region.size > 0x2000000 || region.size < 128) {
+            ++regions_skipped_size;
+            continue;
+        }
+        ++regions_committed;
+        if (region_logs < 16) {
+            diag::log_tagged_fmt("net_sec", "quic_extract_keys region pid=%u index=%zu base=0x%llX size=0x%llX state=0x%X protect=0x%X",
+                pid,
+                regions_seen - 1,
+                static_cast<unsigned long long>(region.base),
+                static_cast<unsigned long long>(region.size),
+                region.state,
+                region.protect);
+            ++region_logs;
+        }
 
         constexpr std::size_t CHUNK = 0x10000;
         std::vector<std::uint8_t> buf(CHUNK);
@@ -1361,8 +1411,14 @@ std::vector<quic_key_info_t> TlsKeyExtractor::extract_quic_keys(std::uint32_t pi
             if (to_read < 128) break;
 
             std::memset(buf.data(), 0, CHUNK);
+            ++read_attempts;
             std::size_t actual = device->read_raw(region.base + off, buf.data(), to_read);
-            if (actual < 128) continue;
+            if (actual < 128) {
+                ++read_short;
+                if (first_short_read_va == 0)
+                    first_short_read_va = region.base + off;
+                continue;
+            }
 
             for (const char* label : quic_labels) {
                 std::size_t label_len = std::strlen(label);
@@ -1373,6 +1429,20 @@ std::vector<quic_key_info_t> TlsKeyExtractor::extract_quic_keys(std::uint32_t pi
                     }
                     if (!match) continue;
 
+                    ++label_hits;
+                    const std::uint64_t hit_va = region.base + off + i;
+                    if (hit_logs < 16) {
+                        diag::log_tagged_fmt("net_sec", "quic_extract_keys label_hit pid=%u va=0x%llX label=%.*s chunk_actual=%zu region_base=0x%llX region_size=0x%llX",
+                            pid,
+                            static_cast<unsigned long long>(hit_va),
+                            static_cast<int>(label_len - 1),
+                            label,
+                            actual,
+                            static_cast<unsigned long long>(region.base),
+                            static_cast<unsigned long long>(region.size));
+                        ++hit_logs;
+                    }
+
                     std::size_t pos = i + label_len;
                     std::string cr_hex;
                     while (pos < actual && cr_hex.size() < 64) {
@@ -1382,9 +1452,41 @@ std::vector<quic_key_info_t> TlsKeyExtractor::extract_quic_keys(std::uint32_t pi
                         else break;
                         pos++;
                     }
-                    if (cr_hex.size() != 64) continue;
+                    if (cr_hex.size() != 64) {
+                        ++reject_client_random;
+                        if (reject_logs < 16) {
+                            diag::log_tagged_fmt("net_sec", "quic_extract_keys reject_client_random pid=%u va=0x%llX label=%.*s chars=%zu pos=%zu actual=%zu",
+                                pid,
+                                static_cast<unsigned long long>(hit_va),
+                                static_cast<int>(label_len - 1),
+                                label,
+                                cr_hex.size(),
+                                pos,
+                                actual);
+                            ++reject_logs;
+                        }
+                        continue;
+                    }
 
-                    while (pos < actual && (buf[pos] == ' ' || buf[pos] == '\t')) pos++;
+                    bool separator_seen = false;
+                    while (pos < actual && (buf[pos] == ' ' || buf[pos] == '\t')) {
+                        separator_seen = true;
+                        pos++;
+                    }
+                    if (!separator_seen) {
+                        ++reject_separator;
+                        if (reject_logs < 16) {
+                            diag::log_tagged_fmt("net_sec", "quic_extract_keys reject_separator pid=%u va=0x%llX label=%.*s pos=%zu actual=%zu",
+                                pid,
+                                static_cast<unsigned long long>(hit_va),
+                                static_cast<int>(label_len - 1),
+                                label,
+                                pos,
+                                actual);
+                            ++reject_logs;
+                        }
+                        continue;
+                    }
 
                     std::string secret_hex;
                     while (pos < actual && secret_hex.size() < 128) {
@@ -1394,7 +1496,21 @@ std::vector<quic_key_info_t> TlsKeyExtractor::extract_quic_keys(std::uint32_t pi
                         else break;
                         pos++;
                     }
-                    if (secret_hex.size() < 64) continue;
+                    if (secret_hex.size() < 64) {
+                        ++reject_secret;
+                        if (reject_logs < 16) {
+                            diag::log_tagged_fmt("net_sec", "quic_extract_keys reject_secret pid=%u va=0x%llX label=%.*s chars=%zu pos=%zu actual=%zu",
+                                pid,
+                                static_cast<unsigned long long>(hit_va),
+                                static_cast<int>(label_len - 1),
+                                label,
+                                secret_hex.size(),
+                                pos,
+                                actual);
+                            ++reject_logs;
+                        }
+                        continue;
+                    }
 
                     quic_key_info_t key;
                     key.label = std::string(label, label_len - 1);
@@ -1403,6 +1519,14 @@ std::vector<quic_key_info_t> TlsKeyExtractor::extract_quic_keys(std::uint32_t pi
                     key.pid = pid;
                     key.library = has_msquic ? "msquic" : "BoringSSL-QUIC";
                     keys.push_back(key);
+                    diag::log_tagged_fmt("net_sec", "quic_extract_keys parsed_key pid=%u va=0x%llX label=%s client_random_len=%zu secret_len=%zu library=%s count=%zu",
+                        pid,
+                        static_cast<unsigned long long>(hit_va),
+                        key.label.c_str(),
+                        key.client_random.size(),
+                        key.secret.size(),
+                        key.library.c_str(),
+                        keys.size());
 
                     if (keys.size() >= 64) goto quic_done;
                 }
@@ -1410,6 +1534,22 @@ std::vector<quic_key_info_t> TlsKeyExtractor::extract_quic_keys(std::uint32_t pi
         }
     }
 quic_done:
+    diag::log_tagged_fmt("net_sec", "quic_extract_keys scan_done pid=%u keys=%zu regions=%zu committed=%zu skipped_state=%zu skipped_size=%zu read_attempts=%zu read_short=%zu first_short_read_va=0x%llX label_hits=%zu reject_client_random=%zu reject_separator=%zu reject_secret=%zu saved_pid=%u restore_needed=%d",
+        pid,
+        keys.size(),
+        regions_seen,
+        regions_committed,
+        regions_skipped_state,
+        regions_skipped_size,
+        read_attempts,
+        read_short,
+        static_cast<unsigned long long>(first_short_read_va),
+        label_hits,
+        reject_client_random,
+        reject_separator,
+        reject_secret,
+        saved_pid,
+        saved_pid != 0 ? 1 : 0);
     device->set_process_id(saved_pid);
     if (saved_pid != 0) device->solve_dtb();
     return keys;

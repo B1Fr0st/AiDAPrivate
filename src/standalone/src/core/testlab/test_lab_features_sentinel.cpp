@@ -4,6 +4,8 @@
 #include "../../../../driver/comm.h"
 #include "imgui/imgui.h"
 
+#include <Windows.h>
+
 #include <algorithm>
 #include <cstdio>
 #include <cstdint>
@@ -30,6 +32,12 @@ namespace {
 	void push_u32_hex(test_lab::result_t& r, const char* label, std::uint32_t v) {
 		char b[16];
 		std::snprintf(b, sizeof(b), "0x%08X", static_cast<unsigned>(v));
+		r.parsed.push_back({ label, b });
+	}
+
+	void push_u64_hex(test_lab::result_t& r, const char* label, std::uint64_t v) {
+		char b[32];
+		std::snprintf(b, sizeof(b), "0x%016llX", static_cast<unsigned long long>(v));
 		r.parsed.push_back({ label, b });
 	}
 
@@ -445,17 +453,49 @@ namespace {
 		bool present = false;
 		std::uint32_t mask = 0;
 		std::uint64_t first_base = 0;
+		const std::uint64_t start_ms = static_cast<std::uint64_t>(GetTickCount64());
+		device->sync_dynamic_security_state();
+		const bool server_seed_before = device->has_server_seed();
+		const bool ioctl_seed_before = device->has_server_ioctl_seed();
 		bool ok = device->tier_a_driver_present_query(present, &mask, &first_base);
+		const std::uint64_t elapsed_ms = static_cast<std::uint64_t>(GetTickCount64()) - start_ms;
 		if (!ok) {
 			r.ok = false;
 			r.error = "tier_a_driver_present_query failed";
+			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
+			push_u32(r, "accepted", 0);
+			push_u32(r, "expected_bytes", static_cast<std::uint32_t>(sizeof(voyager::detail::tier_a_query_request)));
+			push_u32(r, "returned_bytes", 0);
+			push_u32(r, "session_present", 0);
+			push_u64(r, "elapsed_ms", elapsed_ms);
 			return;
 		}
+		voyager::detail::tier_a_query_request evidence{};
+		evidence.present_flag = present ? 1u : 0u;
+		evidence.tier_mask = mask;
+		evidence.first_driver_base = first_base;
+		r.bytes_returned = static_cast<std::uint32_t>(sizeof(evidence));
+		r.raw.resize(sizeof(evidence));
+		std::memcpy(r.raw.data(), &evidence, sizeof(evidence));
+		const std::uint32_t caller_pid = static_cast<std::uint32_t>(GetCurrentProcessId());
+		r.parsed.push_back({ "ioctl", "TIRA" });
+		push_u32(r, "accepted", 1);
+		r.parsed.push_back({ "result", present ? "accepted_present_review_required" : "accepted_healthy_absent" });
+		push_u32(r, "expected_bytes", static_cast<std::uint32_t>(sizeof(evidence)));
+		push_u32(r, "returned_bytes", static_cast<std::uint32_t>(sizeof(evidence)));
+		push_u32(r, "caller_pid", caller_pid);
+		push_u32(r, "registered_pid_expected", caller_pid);
+		push_u32(r, "session_present", 1);
+		push_u32(r, "session_presence_inferred_from_acceptance", 1);
+		push_u32(r, "server_seed_present_before", server_seed_before ? 1u : 0u);
+		push_u32(r, "server_ioctl_seed_present_before", ioctl_seed_before ? 1u : 0u);
+		push_u32(r, "server_seed_present", device->has_server_seed() ? 1u : 0u);
+		push_u32(r, "server_ioctl_seed_present", device->has_server_ioctl_seed() ? 1u : 0u);
+		push_u64(r, "elapsed_ms", elapsed_ms);
 		r.parsed.push_back({ "present_flag", present ? "1" : "0" });
 		push_u32_hex(r, "tier_mask", mask);
-		char b[32];
-		std::snprintf(b, sizeof(b), "0x%016llX", static_cast<unsigned long long>(first_base));
-		r.parsed.push_back({ "first_driver_base", b });
+		push_u64_hex(r, "first_driver_base", first_base);
+		r.parsed.push_back({ "reason", present ? "tier_a_driver_present" : "no_tier_a_hostile_driver_present" });
 		r.parsed.push_back({ "hostile_driver_absent", present ? "0" : "1" });
 		r.parsed.push_back({ "absence_expected_healthy", present ? "0" : "1" });
 		r.parsed.push_back({ "security_interpretation", present ? "tier_a_driver_present_review_required" : "healthy_no_tier_a_driver_present" });
@@ -535,7 +575,11 @@ namespace {
 		const voyager::detail::hv_detect_result& hv = buf.result;
 		r.parsed.push_back({ "mode", "testlab_safe_fingerprint_only" });
 		r.parsed.push_back({ "request_flags", "0x0000000000000001" });
-		r.parsed.push_back({ "kernel_probe_set", "skipped_by_testlab_safe_flag" });
+		r.parsed.push_back({ "safe_contract_proven", "1" });
+		r.parsed.push_back({ "safe_mode_expected_skip", "1" });
+		r.parsed.push_back({ "kernel_probe_set", "safe_mode_skipped" });
+		r.parsed.push_back({ "full_kernel_probe_not_run", "1" });
+		r.parsed.push_back({ "unsafe_kernel_probe_policy", "default_ctrl_shift_t_safe_contract" });
 		r.parsed.push_back({ "is_virtual_machine", hv.is_virtual_machine ? "1" : "0" });
 		r.parsed.push_back({ "ms_hv_root", hv.ms_hv_root ? "1" : "0" });
 		r.parsed.push_back({ "vm_vendor_name", make_hv_vendor_string(hv.vm_vendor_name) });

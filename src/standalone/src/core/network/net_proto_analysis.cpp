@@ -31,6 +31,13 @@ struct api_target_t {
     std::uint64_t address = 0;
 };
 
+enum class socket_module_kind_t {
+    none,
+    ws2_32,
+    wsock32,
+    mswsock
+};
+
 struct udp_message_t {
     std::uint64_t sequence = 0;
     std::vector<std::uint8_t> payload;
@@ -121,6 +128,14 @@ std::string lower_copy(std::string s)
 {
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return s;
+}
+
+void increment_json_counter(nlohmann::json& object, const std::string& key)
+{
+    std::uint64_t value = 0;
+    if (object.is_object() && object.contains(key) && object[key].is_number_unsigned())
+        value = object[key].get<std::uint64_t>();
+    object[key] = value + 1;
 }
 
 std::string fmt_addr(std::uint64_t va)
@@ -262,22 +277,99 @@ bool ensure_process_context(std::uint32_t requested_pid, std::uint32_t& resolved
     return true;
 }
 
+socket_module_kind_t socket_module_kind(const std::string& lower_name)
+{
+    if (lower_name.find("ws2_32") != std::string::npos)
+        return socket_module_kind_t::ws2_32;
+    if (lower_name.find("wsock32") != std::string::npos)
+        return socket_module_kind_t::wsock32;
+    if (lower_name.find("mswsock") != std::string::npos)
+        return socket_module_kind_t::mswsock;
+    return socket_module_kind_t::none;
+}
+
 bool is_socket_module(const std::string& lower_name)
 {
-    return lower_name.find("ws2_32") != std::string::npos ||
-           lower_name.find("mswsock") != std::string::npos ||
-           lower_name.find("wsock32") != std::string::npos;
+    return socket_module_kind(lower_name) != socket_module_kind_t::none;
+}
+
+const char* socket_module_kind_name(socket_module_kind_t kind)
+{
+    switch (kind) {
+    case socket_module_kind_t::ws2_32:
+        return "ws2_32";
+    case socket_module_kind_t::wsock32:
+        return "wsock32";
+    case socket_module_kind_t::mswsock:
+        return "mswsock";
+    default:
+        return "none";
+    }
+}
+
+int socket_module_rank(socket_module_kind_t kind)
+{
+    switch (kind) {
+    case socket_module_kind_t::ws2_32:
+        return 0;
+    case socket_module_kind_t::wsock32:
+        return 1;
+    case socket_module_kind_t::mswsock:
+        return 2;
+    default:
+        return 100;
+    }
+}
+
+bool socket_module_exports_requested_api(socket_module_kind_t kind, const char* export_name)
+{
+    if (!export_name)
+        return false;
+    if (kind == socket_module_kind_t::ws2_32)
+        return std::strcmp(export_name, "send") == 0 ||
+               std::strcmp(export_name, "WSASend") == 0 ||
+               std::strcmp(export_name, "sendto") == 0 ||
+               std::strcmp(export_name, "recv") == 0 ||
+               std::strcmp(export_name, "WSARecv") == 0 ||
+               std::strcmp(export_name, "recvfrom") == 0;
+    if (kind == socket_module_kind_t::wsock32)
+        return std::strcmp(export_name, "send") == 0 ||
+               std::strcmp(export_name, "sendto") == 0 ||
+               std::strcmp(export_name, "recv") == 0 ||
+               std::strcmp(export_name, "recvfrom") == 0;
+    return false;
 }
 
 const wchar_t* socket_module_dll_name(const std::string& lower_name)
 {
-    if (lower_name.find("ws2_32") != std::string::npos)
+    const socket_module_kind_t kind = socket_module_kind(lower_name);
+    if (kind == socket_module_kind_t::ws2_32)
         return L"ws2_32.dll";
-    if (lower_name.find("mswsock") != std::string::npos)
-        return L"mswsock.dll";
-    if (lower_name.find("wsock32") != std::string::npos)
+    if (kind == socket_module_kind_t::wsock32)
         return L"wsock32.dll";
+    if (kind == socket_module_kind_t::mswsock)
+        return L"mswsock.dll";
     return nullptr;
+}
+
+std::uint64_t socket_resolution_app_scan_reserve_ms(const scan_deadline_t& deadline)
+{
+    return (std::max<std::uint64_t>)(100, (std::min<std::uint64_t>)(750, deadline.timeout_ms / 4));
+}
+
+std::string scan_module_skip_reason(const driver_bridge::module_info_t& module)
+{
+    const std::string name = lower_copy(module.name);
+    const std::string path = lower_copy(module.path);
+    if (is_socket_module(name))
+        return "socket_runtime_module";
+    if (name == "ntdll.dll" || name == "kernel32.dll" || name == "kernelbase.dll" ||
+        name == "ucrtbase.dll" || name == "vcruntime140.dll")
+        return "known_runtime_module";
+    if (path.find("\\windows\\system32\\") != std::string::npos ||
+        path.find("\\windows\\syswow64\\") != std::string::npos)
+        return "system_directory_module";
+    return {};
 }
 
 std::uint64_t local_image_size(HMODULE module)
@@ -340,22 +432,8 @@ std::uint64_t resolve_local_export_rva(const std::string& lower_module_name,
     return rva;
 }
 
-bool skip_scan_module(const driver_bridge::module_info_t& module)
-{
-    const std::string name = lower_copy(module.name);
-    const std::string path = lower_copy(module.path);
-    if (is_socket_module(name))
-        return true;
-    if (name == "ntdll.dll" || name == "kernel32.dll" || name == "kernelbase.dll" ||
-        name == "ucrtbase.dll" || name == "vcruntime140.dll")
-        return true;
-    if (path.find("\\windows\\system32\\") != std::string::npos ||
-        path.find("\\windows\\syswow64\\") != std::string::npos)
-        return true;
-    return false;
-}
-
 std::vector<api_target_t> resolve_socket_apis(const std::vector<driver_bridge::module_info_t>& modules,
+                                              std::uint32_t pid,
                                               scan_deadline_t& deadline,
                                               nlohmann::json& diagnostics)
 {
@@ -375,46 +453,120 @@ std::vector<api_target_t> resolve_socket_apis(const std::vector<driver_bridge::m
     diagnostics = nlohmann::json::object();
     diagnostics["socket_modules"] = nlohmann::json::array();
     diagnostics["export_resolution"] = nlohmann::json::array();
+    diagnostics["ordered_socket_modules"] = nlohmann::json::array();
     diagnostics["local_rva_hits"] = 0;
     diagnostics["remote_fallback_attempts"] = 0;
     diagnostics["remote_fallback_hits"] = 0;
+    diagnostics["remote_fallback_skips"] = 0;
+    diagnostics["app_scan_reserve_ms"] = socket_resolution_app_scan_reserve_ms(deadline);
+    std::vector<const driver_bridge::module_info_t*> socket_modules;
+    socket_modules.reserve(4);
     for (const auto& module : modules) {
+        const std::string lower_name = lower_copy(module.name);
+        if (socket_module_kind(lower_name) != socket_module_kind_t::none)
+            socket_modules.push_back(&module);
+    }
+    std::stable_sort(socket_modules.begin(), socket_modules.end(),
+        [](const driver_bridge::module_info_t* a, const driver_bridge::module_info_t* b) {
+            const socket_module_kind_t ak = socket_module_kind(lower_copy(a ? a->name : std::string()));
+            const socket_module_kind_t bk = socket_module_kind(lower_copy(b ? b->name : std::string()));
+            const int ar = socket_module_rank(ak);
+            const int br = socket_module_rank(bk);
+            if (ar != br)
+                return ar < br;
+            const std::string an = lower_copy(a ? a->name : std::string());
+            const std::string bn = lower_copy(b ? b->name : std::string());
+            if (an != bn)
+                return an < bn;
+            return (a ? a->base : 0) < (b ? b->base : 0);
+        });
+    for (const auto* module_ptr : socket_modules) {
         if (deadline.expired("resolve_socket_exports_module"))
             break;
-        const std::string lower_name = lower_copy(module.name);
-        if (!is_socket_module(lower_name))
+        if (!module_ptr)
             continue;
+        const auto& module = *module_ptr;
+        const std::string lower_name = lower_copy(module.name);
+        const socket_module_kind_t kind = socket_module_kind(lower_name);
+        if (diagnostics["ordered_socket_modules"].size() < 16)
+            diagnostics["ordered_socket_modules"].push_back(nlohmann::json{{"name", module.name}, {"kind", socket_module_kind_name(kind)}, {"base", fmt_addr(module.base)}, {"size", module.size}, {"path", module.path}, {"rank", socket_module_rank(kind)}});
         if (diagnostics["socket_modules"].size() < 8)
-            diagnostics["socket_modules"].push_back(nlohmann::json{{"name", module.name}, {"base", fmt_addr(module.base)}, {"size", module.size}, {"path", module.path}});
+            diagnostics["socket_modules"].push_back(nlohmann::json{{"name", module.name}, {"kind", socket_module_kind_name(kind)}, {"base", fmt_addr(module.base)}, {"size", module.size}, {"path", module.path}});
         for (const auto& n : names) {
             if (deadline.expired("resolve_socket_exports_export"))
                 break;
             nlohmann::json rdiag;
+            rdiag["module"] = module.name;
+            rdiag["module_kind"] = socket_module_kind_name(kind);
+            rdiag["module_base"] = fmt_addr(module.base);
+            rdiag["export"] = n.name;
+            rdiag["deadline_remaining_ms"] = deadline.remaining_ms();
+            if (!socket_module_exports_requested_api(kind, n.name)) {
+                rdiag["ok"] = false;
+                rdiag["resolution_source"] = "skipped";
+                rdiag["skip_reason"] = "module_does_not_export_requested_socket_api";
+                if (diagnostics["export_resolution"].size() < 32)
+                    diagnostics["export_resolution"].push_back(std::move(rdiag));
+                continue;
+            }
             const std::uint64_t rva = resolve_local_export_rva(lower_name, n.name, rdiag);
             std::uint64_t va = 0;
             if (rva != 0 && (module.size == 0 || rva < module.size)) {
                 va = module.base + rva;
                 rdiag["remote_va"] = fmt_addr(va);
+                rdiag["resolution_source"] = "local_rva";
                 diagnostics["local_rva_hits"] = diagnostics.value("local_rva_hits", 0) + 1;
             } else {
                 if (rva != 0)
                     rdiag["reason"] = "local_rva_outside_remote_module_size";
-                if (deadline.remaining_ms() > 100) {
+                const std::string local_reason = rdiag.value("reason", std::string());
+                const std::uint64_t remaining_before = deadline.remaining_ms();
+                const std::uint64_t reserve = socket_resolution_app_scan_reserve_ms(deadline);
+                const bool export_absent = local_reason == "local_export_missing";
+                if (export_absent) {
+                    rdiag["remote_fallback_skipped"] = true;
+                    rdiag["remote_fallback_skip_reason"] = "local_export_absent";
+                    rdiag["resolution_source"] = "local_absence";
+                    diagnostics["remote_fallback_skips"] = diagnostics.value("remote_fallback_skips", 0) + 1;
+                } else if (remaining_before > reserve + 75) {
                     diagnostics["remote_fallback_attempts"] = diagnostics.value("remote_fallback_attempts", 0) + 1;
                     const ULONGLONG t0 = GetTickCount64();
-                    va = driver_bridge::resolve_export(module.base, n.name);
-                    rdiag["remote_fallback_elapsed_ms"] = GetTickCount64() - t0;
+                    va = driver_bridge::resolve_export_for(pid, module.base, n.name);
+                    const ULONGLONG fallback_elapsed = GetTickCount64() - t0;
+                    const std::uint64_t remaining_after = deadline.remaining_ms();
+                    const std::string module_base = fmt_addr(module.base);
+                    rdiag["remote_fallback_elapsed_ms"] = fallback_elapsed;
+                    rdiag["deadline_remaining_ms_before_fallback"] = remaining_before;
+                    rdiag["deadline_remaining_ms_after_fallback"] = remaining_after;
                     rdiag["remote_fallback_va"] = va ? nlohmann::json(fmt_addr(va)) : nlohmann::json(nullptr);
+                    rdiag["resolution_source"] = va ? "driver_bridge_pid_bound" : "driver_bridge_pid_bound_miss";
+                    diag::log_tagged_fmt("net_proto",
+                        "socket_export_fallback pid=%u module=%s export=%s base=%s hit=%d elapsed_ms=%llu remaining_before=%llu remaining_after=%llu reserve_ms=%llu",
+                        pid,
+                        module.name.c_str(),
+                        n.name,
+                        module_base.c_str(),
+                        va ? 1 : 0,
+                        static_cast<unsigned long long>(fallback_elapsed),
+                        static_cast<unsigned long long>(remaining_before),
+                        static_cast<unsigned long long>(remaining_after),
+                        static_cast<unsigned long long>(reserve));
                     if (va)
                         diagnostics["remote_fallback_hits"] = diagnostics.value("remote_fallback_hits", 0) + 1;
                 } else {
                     rdiag["remote_fallback_skipped"] = true;
                     rdiag["remote_fallback_skip_reason"] = "deadline_remaining_too_small";
+                    rdiag["deadline_remaining_ms_before_fallback"] = remaining_before;
+                    rdiag["app_scan_reserve_ms"] = reserve;
+                    rdiag["resolution_source"] = "skipped";
+                    diagnostics["remote_fallback_skips"] = diagnostics.value("remote_fallback_skips", 0) + 1;
                 }
             }
             rdiag["module"] = module.name;
+            rdiag["module_kind"] = socket_module_kind_name(kind);
             rdiag["module_base"] = fmt_addr(module.base);
             rdiag["deadline_hit"] = deadline.hit;
+            rdiag["deadline_remaining_ms"] = deadline.remaining_ms();
             if (diagnostics["export_resolution"].size() < 32)
                 diagnostics["export_resolution"].push_back(std::move(rdiag));
             if (va == 0)
@@ -878,7 +1030,7 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
     nlohmann::json socket_resolution = nlohmann::json::object();
     if (!deadline.expired("resolve_socket_exports"))
         socket_resolution["module_count"] = modules.size();
-    const auto apis = deadline.hit ? std::vector<api_target_t>() : resolve_socket_apis(modules, deadline, socket_resolution);
+    const auto apis = deadline.hit ? std::vector<api_target_t>() : resolve_socket_apis(modules, pid, deadline, socket_resolution);
     if (apis.empty()) {
         out["process_id"] = pid;
         out["results"] = nlohmann::json::array();
@@ -888,11 +1040,20 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
         out["elapsed_ms"] = deadline.elapsed_ms();
         out["timeout_ms"] = options.timeout_ms;
         out["scanned_modules"] = nlohmann::json::array();
+        out["app_modules_scanned"] = nlohmann::json::array();
         out["scanned_module_count"] = 0;
         out["scanned_bytes"] = 0;
+        out["candidate_hit_count"] = 0;
         out["stage"] = deadline.stage;
+        out["deadline_stage"] = deadline.stage;
         out["socket_api_count"] = 0;
-        out["diagnostics"] = nlohmann::json{{"socket_resolution", socket_resolution}};
+        out["diagnostics"] = nlohmann::json{
+            {"socket_resolution", socket_resolution},
+            {"app_modules_scanned", nlohmann::json::array()},
+            {"scanned_bytes", 0},
+            {"candidate_hit_count", 0},
+            {"deadline_stage", deadline.stage}
+        };
         out["evidence"] = nlohmann::json::array({"socket API exports not resolved in loaded modules"});
         out["limitations"] = nlohmann::json::array({
             "socket API export resolution stopped before scanning application modules",
@@ -917,8 +1078,11 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
     nlohmann::json results = nlohmann::json::array();
     nlohmann::json scanned_modules = nlohmann::json::array();
     nlohmann::json module_diagnostics = nlohmann::json::array();
+    nlohmann::json app_module_skips = nlohmann::json::array();
+    nlohmann::json app_module_skip_histogram = nlohmann::json::object();
     std::set<std::uint64_t> seen_callsites;
     std::uint64_t scanned_bytes = 0;
+    std::uint64_t candidate_hits = 0;
     std::uint32_t scanned_count = 0;
     std::string stop_reason;
     bool stopped = false;
@@ -940,8 +1104,17 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
             stop_reason = scanned_count >= options.max_modules ? "max_modules_reached" : "max_scan_bytes_reached";
             break;
         }
-        if (skip_scan_module(module) || module.base == 0 || module.size < 16)
+        std::string module_skip = scan_module_skip_reason(module);
+        if (module.base == 0)
+            module_skip = "zero_module_base";
+        else if (module.size < 16)
+            module_skip = "module_too_small";
+        if (!module_skip.empty()) {
+            increment_json_counter(app_module_skip_histogram, module_skip);
+            if (app_module_skips.size() < 32)
+                app_module_skips.push_back(nlohmann::json{{"name", module.name}, {"base", fmt_addr(module.base)}, {"size", module.size}, {"path", module.path}, {"skip_reason", module_skip}});
             continue;
+        }
 
         const std::uint64_t remaining = options.max_scan_bytes - scanned_bytes;
         const std::size_t to_read = static_cast<std::size_t>((std::min<std::uint64_t>)(module.size, (std::min<std::uint64_t>)(remaining, 16777216)));
@@ -952,6 +1125,7 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
         module_diag["size"] = module.size;
         module_diag["path"] = module.path;
         module_diag["requested_read_bytes"] = to_read;
+        module_diag["scan_index"] = scanned_count;
         deadline.stage = "module_read";
         const ULONGLONG read_t0 = GetTickCount64();
         const bool read_ok = driver_bridge::read_memory_for(pid, module.base, to_read, bytes);
@@ -981,6 +1155,7 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
         scanned_modules.push_back(module.name);
 
         std::map<std::uint64_t, const api_target_t*> import_slots;
+        std::uint64_t module_candidate_hits = 0;
         for (std::size_t i = 0; i + 8 <= bytes.size(); i += 1) {
             if ((i & 0x3fffu) == 0 && deadline.expired("scan_import_slots")) {
                 stop_scan("deadline_import_slot_scan", "scan_import_slots");
@@ -1053,9 +1228,12 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
 
             if (!api)
                 continue;
+            ++candidate_hits;
+            ++module_candidate_hits;
             const std::uint64_t handler = find_probable_function_start(bytes, i, module.base);
             add_sendrecv_result(results, seen_callsites, module, bytes, *api, callsite, handler, 0, iat, excluded_targets, options.max_results);
         }
+        module_diag["candidate_hit_count"] = module_candidate_hits;
         module_diag["results_after_module"] = results.size();
         module_diag["deadline_hit"] = deadline.hit;
         module_diag["elapsed_ms"] = deadline.elapsed_ms();
@@ -1073,15 +1251,24 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
     out["elapsed_ms"] = deadline.elapsed_ms();
     out["timeout_ms"] = options.timeout_ms;
     out["scanned_modules"] = std::move(scanned_modules);
+    out["app_modules_scanned"] = out["scanned_modules"];
     out["scanned_module_count"] = scanned_count;
     out["scanned_bytes"] = scanned_bytes;
+    out["candidate_hit_count"] = candidate_hits;
     out["socket_api_count"] = apis.size();
     out["stage"] = deadline.hit ? deadline.stage : (stop_reason.empty() ? "complete" : stop_reason);
+    out["deadline_stage"] = deadline.stage;
     out["diagnostics"] = nlohmann::json{
         {"socket_resolution", socket_resolution},
         {"module_diagnostics", module_diagnostics},
+        {"app_module_skips", app_module_skips},
+        {"app_module_skip_histogram", app_module_skip_histogram},
         {"stop_reason", stop_reason.empty() ? "complete" : stop_reason},
-        {"seen_callsite_count", seen_callsites.size()}
+        {"seen_callsite_count", seen_callsites.size()},
+        {"candidate_hit_count", candidate_hits},
+        {"app_modules_scanned", out["app_modules_scanned"]},
+        {"scanned_bytes", scanned_bytes},
+        {"deadline_stage", deadline.stage}
     };
     out["limitations"] = nlohmann::json::array({
         "IAT and direct relative calls are detected; custom syscall wrappers may require manual follow-up",
@@ -1090,12 +1277,13 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
         "bounded deadline returns partial diagnostics without inventing send/recv handlers"
     });
     diag::log_tagged_fmt("net_proto",
-        "find_sendrecv done pid=%u results=%u apis=%zu scanned_modules=%u scanned_bytes=%llu deadline_hit=%d elapsed_ms=%llu stage=%s stop=%s",
+        "find_sendrecv done pid=%u results=%u apis=%zu scanned_modules=%u scanned_bytes=%llu candidate_hits=%llu deadline_hit=%d elapsed_ms=%llu stage=%s stop=%s",
         pid,
         static_cast<unsigned>(out["result_count"].get<std::size_t>()),
         apis.size(),
         scanned_count,
         static_cast<unsigned long long>(scanned_bytes),
+        static_cast<unsigned long long>(candidate_hits),
         deadline.hit ? 1 : 0,
         static_cast<unsigned long long>(deadline.elapsed_ms()),
         out["stage"].get<std::string>().c_str(),
