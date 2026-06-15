@@ -30,8 +30,27 @@ struct tool_result_t
     bool success = false;
     std::string output;
     nlohmann::json data;
+    // Stable, machine-branchable error code populated by the new error() overload below.
+    // Canonical codes (extensible — agents are expected to treat unknown codes as fatal):
+    //   bad_param | addr_not_in_code | no_function_at_addr | index_empty
+    //   decompile_failed | microcode_failed | taint_no_path | smt_unsat
+    //   timeout | not_implemented | binary_kind_mismatch | analysis_not_settled
+    //   unknown
+    // The legacy single-arg error() leaves this empty for backward compatibility.
+    std::string error_code;
     static tool_result_t ok(const std::string& msg, const nlohmann::json& data = {});
     static tool_result_t error(const std::string& msg);
+    // New overload — defined inline to avoid adding a definition to agent_tools.cpp in Slice A.
+    // Coexists with the single-arg error() so existing callers and the existing .cpp definition
+    // continue to resolve unchanged.
+    static inline tool_result_t error(const std::string& msg, const std::string& code)
+    {
+        tool_result_t r;
+        r.success = false;
+        r.output = msg;
+        r.error_code = code;
+        return r;
+    }
 };
 
 struct tool_param_t
@@ -52,6 +71,27 @@ struct tool_definition_t
     std::vector<tool_param_t> parameters;
     std::function<tool_result_t(const nlohmann::json&)> handler;
     bool read_only = true;
+    // --- Slice A extensions (data-driven tool metadata) -----------------------
+    // JSON Schema describing the shape of tool_result_t::data for this tool.
+    // Empty when shape is variable; non-empty (and non-wildcard) where it is stable
+    // so the agent can validate or strongly type the response.
+    nlohmann::json output_schema;
+    // Replaces the hard-coded is_destructive_tool() string list in mcp_server.cpp.
+    // Destructive = mutates IDB state in a way that cannot be transparently undone
+    // (writes/patches/renames/applies types/deletes). Read-only tools must keep
+    // this false.
+    bool destructive = false;
+    // Replaces the hard-coded is_idempotent_tool() string list in mcp_server.cpp.
+    // Deterministic = same arguments + same IDB state produce identical results.
+    // Gates MCP dedup/cache layers. Tools that observe wall time, external state,
+    // or random scheduling must set this false.
+    bool deterministic = true;
+    // Names of engines (e.g. "graphrag", "taint_engine", "microcode_engine",
+    // "cfg_engine", "kernel_engine", "surface_engine", "symbolic_engine",
+    // "smt_solver") that must be warm before the handler is invoked. Empty means
+    // no precondition. The MCP layer is responsible for warming or short-circuiting
+    // with error_code="index_empty".
+    std::vector<std::string> required_indices;
 };
 
 class ToolRegistry
