@@ -316,9 +316,11 @@ inline phase_result_t<T> run_phase_with_timeout(const char* phase,
 
     auto promise = std::make_shared<std::promise<phase_result_t<T>>>();
     auto fn_copy = std::make_shared<typename std::decay<Fn>::type>(std::forward<Fn>(fn));
+    auto phase_timed_out = std::make_shared<std::atomic_bool>(false);
+    auto timeout_elapsed = std::make_shared<std::atomic<uint64_t>>(0);
     std::future<phase_result_t<T>> future = promise->get_future();
 
-    auto worker_body = [promise, fn_copy, phase, pid, started_ms](const char* backend) mutable {
+    auto worker_body = [promise, fn_copy, phase_timed_out, timeout_elapsed, phase, pid, timeout_ms, started_ms](const char* backend) mutable {
         const DWORD worker_tid = GetCurrentThreadId();
         phase_result_t<T> result;
         result.completed = true;
@@ -342,8 +344,9 @@ inline phase_result_t<T> run_phase_with_timeout(const char* phase,
             result.gle = GetLastError();
         }
         result.elapsed_ms = GetTickCount64() - started_ms;
+        const bool late = phase_timed_out->load(std::memory_order_acquire);
         diag::log_tagged_fmt("api_monitor",
-            "phase_worker_exit phase=%s pid=%u backend=%s worker_tid=%lu elapsed_ms=%llu gle=%lu threw=%d code=%d category=%s",
+            "phase_worker_exit phase=%s pid=%u backend=%s worker_tid=%lu elapsed_ms=%llu gle=%lu threw=%d code=%d category=%s late=%d timeout_elapsed_ms=%llu",
             phase,
             pid,
             backend ? backend : "work_queue",
@@ -352,7 +355,23 @@ inline phase_result_t<T> run_phase_with_timeout(const char* phase,
             result.gle,
             result.threw ? 1 : 0,
             result.exception_code,
-            result.exception_category.c_str());
+            result.exception_category.c_str(),
+            late ? 1 : 0,
+            static_cast<unsigned long long>(timeout_elapsed->load(std::memory_order_acquire)));
+        if (late) {
+            diag::log_tagged_fmt("api_monitor",
+                "phase_late_complete phase=%s pid=%u backend=%s worker_tid=%lu elapsed_ms=%llu timeout_ms=%u timeout_elapsed_ms=%llu gle=%lu threw=%d",
+                phase,
+                pid,
+                backend ? backend : "work_queue",
+                worker_tid,
+                static_cast<unsigned long long>(result.elapsed_ms),
+                timeout_ms,
+                static_cast<unsigned long long>(timeout_elapsed->load(std::memory_order_acquire)),
+                result.gle,
+                result.threw ? 1 : 0);
+            log_phase_state("late_complete", phase, pid, worker_tid, result.elapsed_ms, timeout_ms);
+        }
         try {
             promise->set_value(std::move(result));
         } catch (...) {
@@ -424,15 +443,18 @@ inline phase_result_t<T> run_phase_with_timeout(const char* phase,
         timed_out.completed = false;
         timed_out.gle = WAIT_TIMEOUT;
         timed_out.elapsed_ms = GetTickCount64() - started_ms;
+        timeout_elapsed->store(timed_out.elapsed_ms, std::memory_order_release);
+        phase_timed_out->store(true, std::memory_order_release);
         diag::log_tagged_fmt("api_monitor",
-            "phase_timeout phase=%s pid=%u backend=work_queue caller_tid=%lu elapsed_ms=%llu timeout_ms=%u service=%d work=%d",
+            "phase_timeout phase=%s pid=%u backend=work_queue caller_tid=%lu elapsed_ms=%llu timeout_ms=%u service=%d work=%d current_phase=%s",
             phase,
             pid,
             caller_tid,
             static_cast<unsigned long long>(timed_out.elapsed_ms),
             timeout_ms,
             posted_service ? 1 : 0,
-            posted_work ? 1 : 0);
+            posted_work ? 1 : 0,
+            phase);
         log_phase_state("timeout", phase, pid, caller_tid, timed_out.elapsed_ms, timeout_ms);
         return timed_out;
     }
@@ -554,6 +576,85 @@ struct process_probe_result_t {
     uint32_t thread_count = 0;
 };
 
+struct target_open_process_result_t {
+    HANDLE handle = nullptr;
+    DWORD gle = ERROR_SUCCESS;
+    DWORD seh = 0;
+    uint64_t elapsed_ms = 0;
+};
+
+struct target_native_system_info_result_t {
+    SYSTEM_INFO info{};
+    DWORD gle = ERROR_SUCCESS;
+    DWORD seh = 0;
+    uint64_t elapsed_ms = 0;
+};
+
+struct target_iswow64process_call_result_t {
+    BOOL ok = FALSE;
+    BOOL wow64 = FALSE;
+    DWORD gle = ERROR_SUCCESS;
+    DWORD seh = 0;
+    uint64_t elapsed_ms = 0;
+};
+
+struct target_close_handle_result_t {
+    BOOL ok = FALSE;
+    DWORD gle = ERROR_SUCCESS;
+    DWORD seh = 0;
+    uint64_t elapsed_ms = 0;
+};
+
+struct target_arch_api_cache_t {
+    bool initialized = false;
+    bool ready = false;
+    WORD native_processor_architecture = PROCESSOR_ARCHITECTURE_UNKNOWN;
+    DWORD native_page_size = 0;
+    DWORD native_number_of_processors = 0;
+    bool host_native_amd64 = false;
+    bool direct_iswow64process = false;
+    DWORD native_info_gle = ERROR_SUCCESS;
+    DWORD native_info_seh = 0;
+    uint64_t native_info_elapsed_ms = 0;
+    uint64_t elapsed_ms = 0;
+    const char* resolution_mode = "direct_iswow64process";
+    const char* reason = "";
+};
+
+struct target_arch_probe_result_t {
+    DWORD process_id = 0;
+    DWORD tid = 0;
+    uint32_t target_pid = 0;
+    HANDLE process_handle = nullptr;
+    bool open_ok = false;
+    DWORD open_gle = ERROR_SUCCESS;
+    DWORD open_seh = 0;
+    uint64_t open_elapsed_ms = 0;
+    bool cache_initialized_now = false;
+    target_arch_api_cache_t cache;
+    bool used_fallback_iswow64process = false;
+    BOOL call_ok = FALSE;
+    USHORT process_machine = 0;
+    USHORT native_machine = 0;
+    BOOL wow64 = FALSE;
+    DWORD call_gle = ERROR_SUCCESS;
+    DWORD call_seh = 0;
+    uint64_t call_elapsed_ms = 0;
+    bool close_ok = false;
+    DWORD close_gle = ERROR_SUCCESS;
+    DWORD close_seh = 0;
+    uint64_t close_elapsed_ms = 0;
+    bool ok = false;
+    bool x64 = false;
+    bool uncertain = true;
+    DWORD final_gle = ERROR_SUCCESS;
+    DWORD final_seh = 0;
+    uint64_t elapsed_ms = 0;
+    const char* phase = "entry";
+    const char* decision = "uncertain";
+    const char* failure_reason = "";
+};
+
 inline nlohmann::json process_probe_to_json(const process_probe_result_t& p) {
     nlohmann::json j;
     j["pid"] = p.pid;
@@ -603,6 +704,215 @@ inline std::string hex_addr(uint64_t value) {
     char buf[32];
     std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(value));
     return buf;
+}
+
+inline target_open_process_result_t target_open_process_seh(DWORD access, uint32_t pid) {
+    target_open_process_result_t r;
+    const uint64_t t0 = GetTickCount64();
+    __try {
+        SetLastError(ERROR_SUCCESS);
+        r.handle = OpenProcess(access, FALSE, pid);
+        r.gle = GetLastError();
+    }
+    __except(EXCEPTION_EXECUTE_HANDLER) {
+        r.seh = GetExceptionCode();
+        r.gle = GetLastError();
+        r.handle = nullptr;
+    }
+    r.elapsed_ms = GetTickCount64() - t0;
+    return r;
+}
+
+inline target_native_system_info_result_t target_get_native_system_info_seh() {
+    target_native_system_info_result_t r;
+    const uint64_t t0 = GetTickCount64();
+    __try {
+        SetLastError(ERROR_SUCCESS);
+        GetNativeSystemInfo(&r.info);
+        r.gle = GetLastError();
+    }
+    __except(EXCEPTION_EXECUTE_HANDLER) {
+        r.seh = GetExceptionCode();
+        r.gle = GetLastError();
+        std::memset(&r.info, 0, sizeof(r.info));
+        r.info.wProcessorArchitecture = PROCESSOR_ARCHITECTURE_UNKNOWN;
+    }
+    r.elapsed_ms = GetTickCount64() - t0;
+    return r;
+}
+
+inline target_iswow64process_call_result_t target_call_iswow64process_seh(HANDLE handle) {
+    target_iswow64process_call_result_t r;
+    const uint64_t t0 = GetTickCount64();
+    __try {
+        SetLastError(ERROR_SUCCESS);
+        r.ok = handle ? IsWow64Process(handle, &r.wow64) : FALSE;
+        r.gle = GetLastError();
+    }
+    __except(EXCEPTION_EXECUTE_HANDLER) {
+        r.seh = GetExceptionCode();
+        r.gle = GetLastError();
+        r.ok = FALSE;
+    }
+    r.elapsed_ms = GetTickCount64() - t0;
+    return r;
+}
+
+inline target_close_handle_result_t target_close_handle_seh(HANDLE handle) {
+    target_close_handle_result_t r;
+    const uint64_t t0 = GetTickCount64();
+    __try {
+        SetLastError(ERROR_SUCCESS);
+        r.ok = handle ? CloseHandle(handle) : FALSE;
+        r.gle = GetLastError();
+    }
+    __except(EXCEPTION_EXECUTE_HANDLER) {
+        r.seh = GetExceptionCode();
+        r.gle = GetLastError();
+        r.ok = FALSE;
+    }
+    r.elapsed_ms = GetTickCount64() - t0;
+    return r;
+}
+
+inline target_arch_api_cache_t& target_arch_api_cache() {
+    static target_arch_api_cache_t cache;
+    return cache;
+}
+
+inline std::mutex& target_arch_api_cache_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+inline target_arch_api_cache_t initialize_target_arch_api_cache(uint32_t target_pid, DWORD tid) {
+    target_arch_api_cache_t cache;
+    const DWORD self_pid = GetCurrentProcessId();
+    const uint64_t start_ms = GetTickCount64();
+    diag::log_tagged_fmt("api_monitor",
+        "target_is_x64_direct_probe_cache_init_begin pid=%lu tid=%lu target_pid=%u mode=%s",
+        self_pid,
+        tid,
+        target_pid,
+        cache.resolution_mode);
+
+    diag::log_tagged_fmt("api_monitor",
+        "target_is_x64_getnativesysteminfo_begin pid=%lu tid=%lu target_pid=%u elapsed_ms=%llu",
+        self_pid,
+        tid,
+        target_pid,
+        static_cast<unsigned long long>(GetTickCount64() - start_ms));
+    const target_native_system_info_result_t native = target_get_native_system_info_seh();
+    cache.initialized = true;
+    cache.native_processor_architecture = native.info.wProcessorArchitecture;
+    cache.native_page_size = native.info.dwPageSize;
+    cache.native_number_of_processors = native.info.dwNumberOfProcessors;
+    cache.host_native_amd64 = native.seh == 0 && native.info.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64;
+    cache.direct_iswow64process = true;
+    cache.native_info_gle = native.gle;
+    cache.native_info_seh = native.seh;
+    cache.native_info_elapsed_ms = native.elapsed_ms;
+    cache.ready = cache.host_native_amd64;
+    cache.reason = cache.ready ? "" : (native.seh ? "GetNativeSystemInfo SEH" : "host native architecture is not AMD64");
+    cache.elapsed_ms = GetTickCount64() - start_ms;
+    diag::log_tagged_fmt("api_monitor",
+        "target_is_x64_getnativesysteminfo_done pid=%lu tid=%lu target_pid=%u arch=%u page_size=%lu processors=%lu host_amd64=%d gle=%lu seh=0x%08lX phase_elapsed_ms=%llu elapsed_ms=%llu",
+        self_pid,
+        tid,
+        target_pid,
+        static_cast<unsigned>(cache.native_processor_architecture),
+        static_cast<unsigned long>(cache.native_page_size),
+        static_cast<unsigned long>(cache.native_number_of_processors),
+        cache.host_native_amd64 ? 1 : 0,
+        cache.native_info_gle,
+        cache.native_info_seh,
+        static_cast<unsigned long long>(cache.native_info_elapsed_ms),
+        static_cast<unsigned long long>(cache.elapsed_ms));
+    diag::log_tagged_fmt("api_monitor",
+        "target_is_x64_direct_probe_cache_init_done pid=%lu tid=%lu target_pid=%u ready=%d mode=%s reason=%s elapsed_ms=%llu",
+        self_pid,
+        tid,
+        target_pid,
+        cache.ready ? 1 : 0,
+        cache.resolution_mode,
+        cache.reason,
+        static_cast<unsigned long long>(cache.elapsed_ms));
+    return cache;
+}
+
+inline target_arch_api_cache_t resolve_target_arch_api_cache(uint32_t target_pid, DWORD tid, bool& initialized_now) {
+    initialized_now = false;
+    {
+        std::lock_guard<std::mutex> lock(target_arch_api_cache_mutex());
+        const target_arch_api_cache_t cached = target_arch_api_cache();
+        if (cached.ready)
+            return cached;
+    }
+
+    target_arch_api_cache_t candidate = initialize_target_arch_api_cache(target_pid, tid);
+    {
+        std::lock_guard<std::mutex> lock(target_arch_api_cache_mutex());
+        if (candidate.ready || !target_arch_api_cache().ready)
+            target_arch_api_cache() = candidate;
+        initialized_now = true;
+        return target_arch_api_cache();
+    }
+}
+
+inline nlohmann::json target_arch_probe_to_json(const target_arch_probe_result_t& p) {
+    nlohmann::json j;
+    j["process_id"] = static_cast<unsigned long>(p.process_id);
+    j["tid"] = static_cast<unsigned long>(p.tid);
+    j["target_pid"] = p.target_pid;
+    j["phase"] = p.phase;
+    j["decision"] = p.decision;
+    j["failure_reason"] = p.failure_reason;
+    j["ok"] = p.ok;
+    j["x64"] = p.x64;
+    j["uncertain"] = p.uncertain;
+    j["last_error"] = static_cast<unsigned long>(p.final_gle);
+    j["seh"] = static_cast<unsigned long>(p.final_seh);
+    j["elapsed_ms"] = p.elapsed_ms;
+    j["open"] = nlohmann::json{
+        {"ok", p.open_ok},
+        {"handle", hex_addr(reinterpret_cast<uint64_t>(p.process_handle))},
+        {"gle", static_cast<unsigned long>(p.open_gle)},
+        {"seh", static_cast<unsigned long>(p.open_seh)},
+        {"elapsed_ms", p.open_elapsed_ms}
+    };
+    j["cache_initialized_now"] = p.cache_initialized_now;
+    j["cache"] = nlohmann::json{
+        {"initialized", p.cache.initialized},
+        {"ready", p.cache.ready},
+        {"resolution_mode", p.cache.resolution_mode},
+        {"reason", p.cache.reason},
+        {"native_processor_architecture", static_cast<unsigned>(p.cache.native_processor_architecture)},
+        {"native_page_size", static_cast<unsigned long>(p.cache.native_page_size)},
+        {"native_number_of_processors", static_cast<unsigned long>(p.cache.native_number_of_processors)},
+        {"host_native_amd64", p.cache.host_native_amd64},
+        {"direct_iswow64process", p.cache.direct_iswow64process},
+        {"native_info_gle", static_cast<unsigned long>(p.cache.native_info_gle)},
+        {"native_info_seh", static_cast<unsigned long>(p.cache.native_info_seh)},
+        {"native_info_elapsed_ms", p.cache.native_info_elapsed_ms},
+        {"elapsed_ms", p.cache.elapsed_ms}
+    };
+    j["call"] = nlohmann::json{
+        {"used_fallback_iswow64process", p.used_fallback_iswow64process},
+        {"ok", p.call_ok ? true : false},
+        {"process_machine", static_cast<unsigned>(p.process_machine)},
+        {"native_machine", static_cast<unsigned>(p.native_machine)},
+        {"wow64", p.wow64 ? true : false},
+        {"gle", static_cast<unsigned long>(p.call_gle)},
+        {"seh", static_cast<unsigned long>(p.call_seh)},
+        {"elapsed_ms", p.call_elapsed_ms}
+    };
+    j["close"] = nlohmann::json{
+        {"ok", p.close_ok},
+        {"gle", static_cast<unsigned long>(p.close_gle)},
+        {"seh", static_cast<unsigned long>(p.close_seh)},
+        {"elapsed_ms", p.close_elapsed_ms}
+    };
+    return j;
 }
 
 inline bool parse_u64(const std::string& text, uint64_t& out) {
@@ -1387,28 +1697,199 @@ inline bool process_exists(uint32_t pid) {
     return process_exists_probe(pid).alive;
 }
 
-inline bool target_is_x64(uint32_t pid) {
-    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!h)
-        return false;
+inline target_arch_probe_result_t target_arch_probe(uint32_t pid) {
+    target_arch_probe_result_t result;
+    const uint64_t start_ms = GetTickCount64();
+    result.process_id = GetCurrentProcessId();
+    result.tid = GetCurrentThreadId();
+    result.target_pid = pid;
+    result.phase = "enter";
+    diag::log_tagged_fmt("api_monitor",
+        "target_is_x64_enter pid=%lu tid=%lu target_pid=%u",
+        result.process_id,
+        result.tid,
+        result.target_pid);
 
-    using is_wow64_process2_t = BOOL (WINAPI*)(HANDLE, USHORT*, USHORT*);
-    HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
-    auto fn = kernel32 ? reinterpret_cast<is_wow64_process2_t>(GetProcAddress(kernel32, "IsWow64Process2")) : nullptr;
-    if (fn) {
-        USHORT process_machine = 0;
-        USHORT native_machine = 0;
-        const BOOL ok = fn(h, &process_machine, &native_machine);
-        CloseHandle(h);
-        if (!ok)
-            return false;
-        return process_machine == IMAGE_FILE_MACHINE_UNKNOWN && native_machine == IMAGE_FILE_MACHINE_AMD64;
+    result.phase = "open_process";
+    diag::log_tagged_fmt("api_monitor",
+        "target_is_x64_open_process_begin pid=%lu tid=%lu target_pid=%u access=0x%08lX elapsed_ms=%llu",
+        result.process_id,
+        result.tid,
+        result.target_pid,
+        static_cast<unsigned long>(PROCESS_QUERY_LIMITED_INFORMATION),
+        static_cast<unsigned long long>(GetTickCount64() - start_ms));
+    const target_open_process_result_t open = target_open_process_seh(PROCESS_QUERY_LIMITED_INFORMATION, pid);
+    result.process_handle = open.handle;
+    result.open_ok = open.handle != nullptr;
+    result.open_gle = open.gle;
+    result.open_seh = open.seh;
+    result.open_elapsed_ms = open.elapsed_ms;
+    diag::log_tagged_fmt("api_monitor",
+        "target_is_x64_open_process pid=%lu tid=%lu target_pid=%u handle=%p gle=%lu seh=0x%08lX phase_elapsed_ms=%llu elapsed_ms=%llu",
+        result.process_id,
+        result.tid,
+        result.target_pid,
+        result.process_handle,
+        result.open_gle,
+        result.open_seh,
+        static_cast<unsigned long long>(result.open_elapsed_ms),
+        static_cast<unsigned long long>(GetTickCount64() - start_ms));
+    if (!result.open_ok) {
+        result.ok = false;
+        result.x64 = false;
+        result.uncertain = true;
+        result.final_gle = result.open_seh ? result.open_seh : result.open_gle;
+        result.final_seh = result.open_seh;
+        result.phase = "open_process";
+        result.decision = "fail_closed";
+        result.failure_reason = result.open_seh ? "OpenProcess SEH" : "OpenProcess failed";
+        result.elapsed_ms = GetTickCount64() - start_ms;
+        diag::log_tagged_fmt("api_monitor",
+            "target_is_x64_final pid=%lu tid=%lu target_pid=%u result=0 uncertain=1 phase=%s reason=%s last_error=%lu seh=0x%08lX elapsed_ms=%llu",
+            result.process_id,
+            result.tid,
+            result.target_pid,
+            result.phase,
+            result.failure_reason,
+            result.final_gle,
+            result.final_seh,
+            static_cast<unsigned long long>(result.elapsed_ms));
+        SetLastError(result.final_gle);
+        return result;
     }
 
-    BOOL wow64 = FALSE;
-    const BOOL ok = IsWow64Process(h, &wow64);
-    CloseHandle(h);
-    return ok && !wow64;
+    result.phase = "resolve_cache";
+    bool initialized_now = false;
+    const target_arch_api_cache_t cache = resolve_target_arch_api_cache(pid, result.tid, initialized_now);
+    result.cache_initialized_now = initialized_now;
+    result.cache = cache;
+    result.native_machine = cache.host_native_amd64 ? IMAGE_FILE_MACHINE_AMD64 : 0;
+    diag::log_tagged_fmt("api_monitor",
+        "target_is_x64_resolve_cache_done pid=%lu tid=%lu target_pid=%u initialized_now=%d ready=%d mode=%s native_arch=%u host_amd64=%d reason=%s elapsed_ms=%llu",
+        result.process_id,
+        result.tid,
+        result.target_pid,
+        initialized_now ? 1 : 0,
+        cache.ready ? 1 : 0,
+        cache.resolution_mode,
+        static_cast<unsigned>(cache.native_processor_architecture),
+        cache.host_native_amd64 ? 1 : 0,
+        cache.reason,
+        static_cast<unsigned long long>(GetTickCount64() - start_ms));
+
+    if (!cache.ready) {
+        result.phase = "resolve_cache";
+        result.ok = false;
+        result.x64 = false;
+        result.uncertain = true;
+        result.final_seh = cache.native_info_seh;
+        result.final_gle = result.final_seh ? result.final_seh : (cache.native_info_gle ? cache.native_info_gle : ERROR_NOT_SUPPORTED);
+        result.decision = "fail_closed";
+        result.failure_reason = cache.reason && cache.reason[0] ? cache.reason : "host architecture probe unavailable";
+    } else {
+        result.phase = "IsWow64Process";
+        result.used_fallback_iswow64process = true;
+        diag::log_tagged_fmt("api_monitor",
+            "target_is_x64_iswow64process_begin pid=%lu tid=%lu target_pid=%u handle=%p mode=%s native_arch=%u elapsed_ms=%llu",
+            result.process_id,
+            result.tid,
+            result.target_pid,
+            result.process_handle,
+            cache.resolution_mode,
+            static_cast<unsigned>(cache.native_processor_architecture),
+            static_cast<unsigned long long>(GetTickCount64() - start_ms));
+        const target_iswow64process_call_result_t call = target_call_iswow64process_seh(result.process_handle);
+        result.call_ok = call.ok;
+        result.wow64 = call.wow64;
+        result.process_machine = call.wow64 ? IMAGE_FILE_MACHINE_I386 : IMAGE_FILE_MACHINE_UNKNOWN;
+        result.native_machine = IMAGE_FILE_MACHINE_AMD64;
+        result.call_gle = call.gle;
+        result.call_seh = call.seh;
+        result.call_elapsed_ms = call.elapsed_ms;
+        result.final_seh = call.seh;
+        result.final_gle = call.seh ? call.seh : call.gle;
+        result.ok = call.ok && call.seh == 0;
+#ifdef _WIN64
+        result.x64 = result.ok && cache.host_native_amd64 && !call.wow64;
+#else
+        result.x64 = false;
+#endif
+        result.uncertain = !result.ok;
+        result.decision = result.ok ? (result.x64 ? "native_x64_direct" : "not_native_x64_direct") : "fail_closed";
+        result.failure_reason = result.ok ? (result.x64 ? "" : "direct IsWow64Process reported WOW64 or non-AMD64 host") : (call.seh ? "IsWow64Process SEH" : "IsWow64Process failed");
+        diag::log_tagged_fmt("api_monitor",
+            "target_is_x64_iswow64process_done pid=%lu tid=%lu target_pid=%u handle=%p ok=%d wow64=%d process_machine=0x%04X native_machine=0x%04X seh=0x%08lX call_gle=%lu result=%d uncertain=%d phase_elapsed_ms=%llu elapsed_ms=%llu",
+            result.process_id,
+            result.tid,
+            result.target_pid,
+            result.process_handle,
+            call.ok ? 1 : 0,
+            call.wow64 ? 1 : 0,
+            static_cast<unsigned>(result.process_machine),
+            static_cast<unsigned>(result.native_machine),
+            call.seh,
+            call.gle,
+            result.x64 ? 1 : 0,
+            result.uncertain ? 1 : 0,
+            static_cast<unsigned long long>(call.elapsed_ms),
+            static_cast<unsigned long long>(GetTickCount64() - start_ms));
+    }
+
+    result.phase = result.phase ? result.phase : "close_handle";
+    diag::log_tagged_fmt("api_monitor",
+        "target_is_x64_closehandle_begin pid=%lu tid=%lu target_pid=%u handle=%p elapsed_ms=%llu",
+        result.process_id,
+        result.tid,
+        result.target_pid,
+        result.process_handle,
+        static_cast<unsigned long long>(GetTickCount64() - start_ms));
+    const target_close_handle_result_t close = target_close_handle_seh(result.process_handle);
+    result.close_ok = close.ok != FALSE;
+    result.close_gle = close.gle;
+    result.close_seh = close.seh;
+    result.close_elapsed_ms = close.elapsed_ms;
+    diag::log_tagged_fmt("api_monitor",
+        "target_is_x64_closehandle_done pid=%lu tid=%lu target_pid=%u handle=%p ok=%d gle=%lu seh=0x%08lX phase_elapsed_ms=%llu elapsed_ms=%llu",
+        result.process_id,
+        result.tid,
+        result.target_pid,
+        result.process_handle,
+        result.close_ok ? 1 : 0,
+        result.close_gle,
+        result.close_seh,
+        static_cast<unsigned long long>(result.close_elapsed_ms),
+        static_cast<unsigned long long>(GetTickCount64() - start_ms));
+    if (!result.close_ok && result.final_gle == ERROR_SUCCESS) {
+        result.final_gle = result.close_seh ? result.close_seh : result.close_gle;
+        result.final_seh = result.close_seh;
+    }
+    if (!result.ok && result.final_gle == ERROR_SUCCESS)
+        result.final_gle = ERROR_INVALID_FUNCTION;
+    result.elapsed_ms = GetTickCount64() - start_ms;
+    diag::log_tagged_fmt("api_monitor",
+        "target_is_x64_final pid=%lu tid=%lu target_pid=%u result=%d ok=%d uncertain=%d phase=%s decision=%s reason=%s last_error=%lu seh=0x%08lX elapsed_ms=%llu close_ok=%d close_gle=%lu",
+        result.process_id,
+        result.tid,
+        result.target_pid,
+        result.x64 ? 1 : 0,
+        result.ok ? 1 : 0,
+        result.uncertain ? 1 : 0,
+        result.phase,
+        result.decision,
+        result.failure_reason,
+        result.final_gle,
+        result.final_seh,
+        static_cast<unsigned long long>(result.elapsed_ms),
+        result.close_ok ? 1 : 0,
+        result.close_gle);
+    SetLastError(result.final_gle);
+    return result;
+}
+
+inline bool target_is_x64(uint32_t pid) {
+    const target_arch_probe_result_t probe = target_arch_probe(pid);
+    SetLastError(probe.final_gle);
+    return probe.ok && probe.x64;
 }
 
 inline bool ensure_driver_attached(uint32_t pid, std::string& error) {
@@ -2331,8 +2812,8 @@ inline bool start(uint32_t requested_pid,
         log_phase_state("start_exit_process_exists_false", "start", pid, GetCurrentThreadId(), GetTickCount64() - start_ms, 0);
         return false;
     }
-    auto x64_phase = run_phase_inline<bool>("target_is_x64", pid, 1500, [pid]() {
-        return target_is_x64(pid);
+    auto x64_phase = run_phase_with_timeout<target_arch_probe_result_t>("target_is_x64", pid, 1500, [pid]() {
+        return target_arch_probe(pid);
     });
     if (x64_phase.threw) {
         error = "Exception while checking target architecture for PID " + std::to_string(pid) + ": " + x64_phase.exception;
@@ -2340,6 +2821,17 @@ inline bool start(uint32_t requested_pid,
         summary["exception"] = x64_phase.exception;
         summary["exception_code"] = x64_phase.exception_code;
         summary["exception_category"] = x64_phase.exception_category;
+        summary["elapsed_ms"] = x64_phase.elapsed_ms;
+        summary["last_error"] = static_cast<unsigned long>(x64_phase.gle);
+        summary["status"] = status_json();
+        diag::log_tagged_fmt("api_monitor",
+            "start_target_is_x64_exception pid=%u elapsed_ms=%llu exception_code=0x%08lX category=%s detail=%s",
+            pid,
+            static_cast<unsigned long long>(x64_phase.elapsed_ms),
+            static_cast<unsigned long>(x64_phase.exception_code),
+            x64_phase.exception_category.c_str(),
+            x64_phase.exception.c_str());
+        log_phase_state("start_exit_target_is_x64_exception", "start", pid, GetCurrentThreadId(), GetTickCount64() - start_ms, 0);
         return false;
     }
     if (!x64_phase.completed) {
@@ -2347,16 +2839,45 @@ inline bool start(uint32_t requested_pid,
         summary["failed_phase"] = "target_is_x64";
         summary["elapsed_ms"] = x64_phase.elapsed_ms;
         summary["last_error"] = static_cast<unsigned long>(x64_phase.gle);
+        summary["target_arch_probe"] = nlohmann::json{
+            {"target_pid", pid},
+            {"phase", "target_is_x64_timeout"},
+            {"last_error", static_cast<unsigned long>(x64_phase.gle)},
+            {"elapsed_ms", x64_phase.elapsed_ms},
+            {"decision", "fail_closed"},
+            {"failure_reason", "phase timeout before target architecture decision"}
+        };
+        summary["status"] = status_json();
+        diag::log_tagged_fmt("api_monitor",
+            "start_target_is_x64_timeout pid=%u elapsed_ms=%llu gle=%lu",
+            pid,
+            static_cast<unsigned long long>(x64_phase.elapsed_ms),
+            x64_phase.gle);
+        log_phase_state("start_exit_target_is_x64_timeout", "start", pid, GetCurrentThreadId(), GetTickCount64() - start_ms, 0);
         return false;
     }
+    summary["target_arch_probe"] = target_arch_probe_to_json(x64_phase.value);
     diag::log_tagged_fmt("api_monitor",
-        "start_target_is_x64_result pid=%u ok=%d elapsed_ms=%llu gle=%lu",
+        "start_target_is_x64_result pid=%u ok=%d x64=%d uncertain=%d phase=%s decision=%s elapsed_ms=%llu gle=%lu probe_gle=%lu",
         pid,
-        x64_phase.value ? 1 : 0,
+        x64_phase.value.ok ? 1 : 0,
+        x64_phase.value.x64 ? 1 : 0,
+        x64_phase.value.uncertain ? 1 : 0,
+        x64_phase.value.phase,
+        x64_phase.value.decision,
         static_cast<unsigned long long>(x64_phase.elapsed_ms),
-        x64_phase.gle);
-    if (!x64_phase.value) {
-        error = "API monitor requires a native x64 target process.";
+        x64_phase.gle,
+        x64_phase.value.final_gle);
+    if (!x64_phase.value.ok || !x64_phase.value.x64) {
+        summary["failed_phase"] = "target_is_x64";
+        summary["elapsed_ms"] = x64_phase.elapsed_ms;
+        summary["last_error"] = static_cast<unsigned long>(x64_phase.value.final_gle);
+        summary["status"] = status_json();
+        error = std::string("API monitor requires a native x64 target process; target_is_x64 phase=") +
+            (x64_phase.value.phase ? x64_phase.value.phase : "unknown") +
+            ", decision=" + (x64_phase.value.decision ? x64_phase.value.decision : "unknown") +
+            ", last_error=" + std::to_string(static_cast<unsigned long>(x64_phase.value.final_gle)) + ".";
+        log_phase_state("start_exit_target_is_x64_false", "start", pid, GetCurrentThreadId(), GetTickCount64() - start_ms, 0);
         return false;
     }
     auto attach_phase = run_phase_with_timeout<driver_attach_phase_result_t>("driver_attach", pid, 7000, [pid]() {

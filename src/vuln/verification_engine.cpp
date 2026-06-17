@@ -5,8 +5,10 @@
 #include "microcode_engine.hpp"
 #include "smt_solver.hpp"
 #include "symbolic_engine.hpp"
+#include "vuln_signatures.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstdint>
@@ -24,6 +26,10 @@
 
 #include <funcs.hpp>
 #include <hexrays.hpp>
+#include <kernwin.hpp>
+#include <nalt.hpp>
+#include <netnode.hpp>
+#include <tryblks.hpp>
 
 namespace aida
 {
@@ -37,6 +43,116 @@ namespace
 
 constexpr int    k_default_bv_width = 64;
 constexpr size_t k_max_inputs_in_summary = 16;
+constexpr const char* k_verify_ledger_node = "$ AiDA.verify.ledger";
+constexpr nodeidx_t k_verify_ledger_blob_start = 1;
+constexpr uchar k_verify_ledger_blob_tag = 'V';
+constexpr size_t k_verify_ledger_page_size = 512 * 1024;
+
+std::atomic<bool> g_verify_cancel{false};
+std::atomic<int>  g_verify_in_flight{0};
+
+uint64_t now_ms()
+{
+    auto now = std::chrono::system_clock::now().time_since_epoch();
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
+}
+
+std::string ea_to_hex(ea_t ea)
+{
+    std::ostringstream ss;
+    ss << "0x" << std::hex << std::uppercase << static_cast<uint64_t>(ea);
+    return ss.str();
+}
+
+bool should_cancel()
+{
+    return g_verify_cancel.load(std::memory_order_relaxed) || user_cancelled();
+}
+
+struct inflight_guard_t
+{
+    inflight_guard_t()
+    {
+        int prev = g_verify_in_flight.fetch_add(1, std::memory_order_relaxed);
+        if (prev == 0)
+            g_verify_cancel.store(false, std::memory_order_relaxed);
+    }
+    ~inflight_guard_t()
+    {
+        g_verify_in_flight.fetch_sub(1, std::memory_order_relaxed);
+    }
+};
+
+struct wait_box_guard_t
+{
+    bool shown = false;
+    explicit wait_box_guard_t(const char* text)
+    {
+        show_wait_box("NODELAY\n%s", text);
+        shown = true;
+    }
+    ~wait_box_guard_t()
+    {
+        if (shown)
+            hide_wait_box();
+    }
+};
+
+std::vector<ea_t> collect_cited_eas(const std::vector<symbolic::path_constraint_t>& constraints)
+{
+    std::vector<ea_t> out;
+    std::set<ea_t> seen;
+    for (const auto& c : constraints)
+    {
+        if (c.branch_ea == BADADDR)
+            continue;
+        if (seen.insert(c.branch_ea).second)
+            out.push_back(c.branch_ea);
+    }
+    return out;
+}
+
+bool has_seh_path(const std::vector<symbolic::path_constraint_t>& constraints)
+{
+    for (const auto& c : constraints)
+    {
+        if (c.via_seh_handler)
+            return true;
+    }
+    return false;
+}
+
+std::string binary_md5_hex()
+{
+    uchar md5[16] = {};
+    if (!retrieve_input_file_md5(md5))
+        return "unknown";
+    char buf[33] = {};
+    for (int i = 0; i < 16; ++i)
+        ::qsnprintf(buf + (i * 2), 3, "%02x", md5[i]);
+    return std::string(buf);
+}
+
+std::string cache_key_string(const cache_key_t& k)
+{
+    std::ostringstream ss;
+    ss << std::hex << static_cast<uint64_t>(k.func_ea) << ":"
+       << static_cast<uint64_t>(k.source_ea) << ":"
+       << static_cast<uint64_t>(k.sink_ea) << ":"
+       << std::dec << k.sig_db_rev;
+    return ss.str();
+}
+
+verdict_t smt_result_to_verdict(const smt::solve_result_t& r)
+{
+    if (r.result == smt::result_t::sat)
+        return verdict_t::confirmed;
+    if (r.result == smt::result_t::unsat)
+        return verdict_t::refuted;
+    if (r.reason.find("timeout") != std::string::npos || r.reason.find("canceled") != std::string::npos)
+        return verdict_t::timeout;
+    return verdict_t::inconclusive;
+}
 
 const std::unordered_set<std::string>& smt_keyword_set()
 {
@@ -317,6 +433,34 @@ bool assert_constraints(smt::SmtContext& smt,
     return failure_reason.empty();
 }
 
+void assert_input_shape_constraints(smt::SmtContext& smt,
+                                    const std::vector<smt::model_entry_t>& existing_inputs,
+                                    const exploit_constraints_t& shape)
+{
+    for (const auto& entry : existing_inputs)
+    {
+        if (!entry.is_bitvector || entry.name.empty())
+            continue;
+        int width = entry.bv_width > 0 ? entry.bv_width : 8;
+        if (width <= 0 || width > 64)
+            continue;
+        smt.declare_bv(entry.name, width);
+        uint64_t max_byte = shape.max_byte;
+        if (shape.printable_only)
+        {
+            smt.assert_bv_ugt(entry.name, 0x1Fu, width);
+            if (max_byte > 0x7Eu)
+                max_byte = 0x7Eu;
+        }
+        if (shape.ascii_only && max_byte > 0x7Fu)
+            max_byte = 0x7Fu;
+        if (max_byte < 255u)
+            smt.assert_bv_ult(entry.name, max_byte + 1u, width);
+        if (shape.no_null_bytes)
+            smt.assert_bv_ugt(entry.name, 0u, width);
+    }
+}
+
 bool block_has_back_edge(const mba_t& mba, const mblock_t& blk)
 {
     for (size_t i = 0; i < blk.succset.size(); ++i)
@@ -397,13 +541,31 @@ bool find_induction_lvar(mba_t& mba, int& out_idx, int& out_width_bits)
 
 }
 
+bool cache_key_t::operator==(const cache_key_t& o) const
+{
+    return func_ea == o.func_ea &&
+           sink_ea == o.sink_ea &&
+           source_ea == o.source_ea &&
+           sig_db_rev == o.sig_db_rev;
+}
+
+size_t cache_key_hash_t::operator()(const cache_key_t& k) const noexcept
+{
+    uint64_t h = static_cast<uint64_t>(k.func_ea);
+    h ^= static_cast<uint64_t>(k.sink_ea) + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+    h ^= static_cast<uint64_t>(k.source_ea) + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+    h ^= static_cast<uint64_t>(k.sig_db_rev) + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+    return static_cast<size_t>(h);
+}
+
 struct VerificationEngine::impl_t
 {
     aida::vuln::symbolic::SymbolicEngine        sym;
-    aida::vuln::smt::SmtContext                 smt;
+    aida::vuln::smt::SmtContextPool             smt_pool;
     std::string                                 last_err;
     mutable std::mutex                          mu;
     std::unordered_map<std::string, int>        verdict_counts;
+    std::unordered_map<cache_key_t, path_verification_t, cache_key_hash_t> verdict_cache;
 
     impl_t() = default;
 
@@ -425,9 +587,10 @@ VerificationEngine::VerificationEngine()
         m_impl->last_err = e != nullptr && *e ? std::string("symbolic: ") + e
                                               : std::string("symbolic engine unavailable");
     }
-    if (!m_impl->smt.is_available())
+    auto probe = m_impl->smt_pool.create_context();
+    if (!probe || !probe->is_available())
     {
-        const char* e = m_impl->smt.last_error();
+        const char* e = probe ? probe->last_error() : "";
         if (!m_impl->last_err.empty())
             m_impl->last_err.append("; ");
         m_impl->last_err.append(e != nullptr && *e ? std::string("smt: ") + e
@@ -441,7 +604,8 @@ bool VerificationEngine::is_available() const
 {
     if (!m_impl)
         return false;
-    return m_impl->sym.is_available() && m_impl->smt.is_available();
+    auto probe = m_impl->smt_pool.create_context();
+    return m_impl->sym.is_available() && probe && probe->is_available();
 }
 
 const char* VerificationEngine::last_error() const
@@ -455,7 +619,8 @@ path_verification_t VerificationEngine::verify_taint_path(ea_t source_ea,
                                                           ea_t sink_ea,
                                                           uint32_t timeout_ms)
 {
-    (void)source_ea;
+    inflight_guard_t in_flight;
+    wait_box_guard_t wait("Verifying taint path with SMT");
     path_verification_t out;
     if (!m_impl)
     {
@@ -480,6 +645,22 @@ path_verification_t VerificationEngine::verify_taint_path(ea_t source_ea,
         return out;
     }
 
+    cache_key_t key{pfn->start_ea, sink_ea, source_ea, sig::SIGNATURE_DATABASE_REVISION};
+    {
+        std::lock_guard<std::mutex> lk(m_impl->mu);
+        auto it = m_impl->verdict_cache.find(key);
+        if (it != m_impl->verdict_cache.end())
+            return it->second;
+    }
+
+    if (should_cancel())
+    {
+        out.verdict = verdict_t::timeout;
+        out.rationale = "verification cancelled before symbolic load";
+        m_impl->bump_verdict(out.verdict);
+        return out;
+    }
+
     if (!m_impl->sym.load_function(pfn->start_ea))
     {
         out.verdict = verdict_t::unsupported;
@@ -490,7 +671,12 @@ path_verification_t VerificationEngine::verify_taint_path(ea_t source_ea,
         return out;
     }
 
+    if (source_ea != BADADDR)
+        m_impl->sym.constrain_taint_source_at(source_ea);
+
     out.constraints = m_impl->sym.collect_path_to(sink_ea, 64);
+    out.cited_eas = collect_cited_eas(out.constraints);
+    out.via_seh_handler = has_seh_path(out.constraints);
 
     if (out.constraints.empty())
     {
@@ -498,11 +684,26 @@ path_verification_t VerificationEngine::verify_taint_path(ea_t source_ea,
         out.smt_result = smt::result_t::sat;
         out.adjusted_confidence = confidence_t::likely;
         out.rationale = "no path constraints; sink reachable unconditionally";
+        out.cached_at = now_ms();
+        {
+            std::lock_guard<std::mutex> lk(m_impl->mu);
+            m_impl->verdict_cache[key] = out;
+        }
         m_impl->bump_verdict(out.verdict);
         return out;
     }
 
-    smt::SmtContext local;
+    if (should_cancel())
+    {
+        out.verdict = verdict_t::timeout;
+        out.smt_result = smt::result_t::unknown;
+        out.rationale = "verification cancelled before SMT solve";
+        m_impl->bump_verdict(out.verdict);
+        return out;
+    }
+
+    auto local_ptr = m_impl->smt_pool.create_context();
+    smt::SmtContext& local = *local_ptr;
     if (!local.is_available())
     {
         out.verdict = verdict_t::unsupported;
@@ -567,15 +768,22 @@ path_verification_t VerificationEngine::verify_taint_path(ea_t source_ea,
         break;
     }
 
+    out.cached_at = now_ms();
+    {
+        std::lock_guard<std::mutex> lk(m_impl->mu);
+        m_impl->verdict_cache[key] = out;
+    }
     m_impl->bump_verdict(out.verdict);
     return out;
 }
 
 exploit_input_t VerificationEngine::solve_for_exploit_input(ea_t source_ea,
                                                             ea_t sink_ea,
-                                                            uint32_t timeout_ms)
+                                                            uint32_t timeout_ms,
+                                                            const exploit_constraints_t& input_shape)
 {
-    (void)source_ea;
+    inflight_guard_t in_flight;
+    wait_box_guard_t wait("Solving exploit input with SMT");
     exploit_input_t out;
     if (!m_impl)
     {
@@ -607,9 +815,21 @@ exploit_input_t VerificationEngine::solve_for_exploit_input(ea_t source_ea,
         return out;
     }
 
-    auto constraints = m_impl->sym.collect_path_to(sink_ea, 64);
+    if (source_ea != BADADDR)
+        m_impl->sym.constrain_taint_source_at(source_ea);
 
-    smt::SmtContext local;
+    auto constraints = m_impl->sym.collect_path_to(sink_ea, 64);
+    out.cited_eas = collect_cited_eas(constraints);
+
+    if (should_cancel())
+    {
+        out.found = false;
+        out.rationale = "verification cancelled before SMT solve";
+        return out;
+    }
+
+    auto local_ptr = m_impl->smt_pool.create_context();
+    smt::SmtContext& local = *local_ptr;
     if (!local.is_available())
     {
         out.found = false;
@@ -624,6 +844,15 @@ exploit_input_t VerificationEngine::solve_for_exploit_input(ea_t source_ea,
 
     std::string assert_err;
     assert_constraints(local, constraints, assert_err);
+
+    if (input_shape.alignment > 1)
+    {
+        std::ostringstream align_note;
+        align_note << "alignment=" << input_shape.alignment;
+        if (!assert_err.empty())
+            assert_err.append("; ");
+        assert_err.append(align_note.str());
+    }
 
     smt::solve_result_t r = local.check_with_timeout(timeout_ms);
 
@@ -643,6 +872,24 @@ exploit_input_t VerificationEngine::solve_for_exploit_input(ea_t source_ea,
 
     out.found = true;
     out.inputs = r.model;
+
+    if (input_shape.ascii_only || input_shape.no_null_bytes || input_shape.printable_only || input_shape.max_byte < 255)
+    {
+        smt::SmtContext shaped;
+        if (shaped.is_available())
+        {
+            emit_declarations(shaped, constraints, declared);
+            std::string shaped_err;
+            assert_constraints(shaped, constraints, shaped_err);
+            assert_input_shape_constraints(shaped, out.inputs, input_shape);
+            auto shaped_result = shaped.check_with_timeout(timeout_ms);
+            if (shaped_result.result == smt::result_t::sat)
+            {
+                out.inputs = shaped_result.model;
+                r = shaped_result;
+            }
+        }
+    }
 
     std::vector<const smt::model_entry_t*> input_entries;
     input_entries.reserve(out.inputs.size());
@@ -723,6 +970,8 @@ loop_bound_proof_t VerificationEngine::prove_loop_bound(ea_t loop_func_ea,
                                                         int64_t buffer_size,
                                                         uint32_t timeout_ms)
 {
+    inflight_guard_t in_flight;
+    wait_box_guard_t wait("Proving loop bound with SMT");
     loop_bound_proof_t out;
     out.buffer_size = buffer_size;
 
@@ -794,7 +1043,8 @@ loop_bound_proof_t VerificationEngine::prove_loop_bound(ea_t loop_func_ea,
     }
     std::string ind_name = var_name_ss.str();
 
-    smt::SmtContext local;
+    auto local_ptr = m_impl->smt_pool.create_context();
+    smt::SmtContext& local = *local_ptr;
     if (!local.is_available())
     {
         out.verdict = verdict_t::unsupported;
@@ -831,9 +1081,15 @@ loop_bound_proof_t VerificationEngine::prove_loop_bound(ea_t loop_func_ea,
         local.assert_smtlib2(upper.str());
     }
 
-    (void)timeout_ms;
-    auto max_opt = local.max_value_bv(ind_name, induction_width_bits);
-    auto min_opt = local.min_value_bv(ind_name, induction_width_bits);
+    if (should_cancel())
+    {
+        out.verdict = verdict_t::timeout;
+        out.rationale = "verification cancelled before optimization";
+        return out;
+    }
+
+    auto max_opt = local.max_value_bv(ind_name, induction_width_bits, timeout_ms);
+    auto min_opt = local.min_value_bv(ind_name, induction_width_bits, timeout_ms);
 
     if (!max_opt.has_value())
     {
@@ -883,7 +1139,8 @@ symbolic::alias_proof_t VerificationEngine::prove_pointer_alias(ea_t func_ea,
                                                                 const std::string& ptr2_spec,
                                                                 uint32_t timeout_ms)
 {
-    (void)timeout_ms;
+    inflight_guard_t in_flight;
+    wait_box_guard_t wait("Proving pointer aliasing with SMT");
     symbolic::alias_proof_t out;
     if (!m_impl || !is_available())
     {
@@ -901,7 +1158,15 @@ symbolic::alias_proof_t VerificationEngine::prove_pointer_alias(ea_t func_ea,
         return out;
     }
 
-    return m_impl->sym.prove_alias(ptr1_spec, ptr2_spec);
+    if (should_cancel())
+    {
+        out.verdict = symbolic::alias_proof_t::verdict_t::inconclusive;
+        out.verdict_label = "inconclusive";
+        out.reason = "verification cancelled before alias solve";
+        return out;
+    }
+
+    return m_impl->sym.prove_alias(ptr1_spec, ptr2_spec, timeout_ms);
 }
 
 symbolic::simplification_t VerificationEngine::simplify_function_arithmetic(ea_t func_ea,
@@ -1052,6 +1317,290 @@ smt::solve_result_t VerificationEngine::solve_smtlib2(const std::string& formula
     return out;
 }
 
+triage_result_t VerificationEngine::triage_sink(ea_t source_ea,
+                                                ea_t sink_ea,
+                                                uint32_t cheap_timeout_ms,
+                                                uint32_t deep_timeout_ms,
+                                                const std::string& stop_at)
+{
+    inflight_guard_t in_flight;
+    wait_box_guard_t wait("Triaging sink with symbolic verification");
+    triage_result_t out;
+    out.stage_reached = "sat_check";
+    if (!m_impl || !is_available())
+    {
+        out.final_verdict = verdict_t::unsupported;
+        out.sat_check.result = smt::result_t::unknown;
+        out.sat_check.reason = m_impl ? m_impl->last_err : std::string("verification engine not initialized");
+        return out;
+    }
+    func_t* pfn = get_func(sink_ea);
+    if (pfn == nullptr)
+    {
+        out.final_verdict = verdict_t::unsupported;
+        out.sat_check.result = smt::result_t::unknown;
+        out.sat_check.reason = "no enclosing function for sink";
+        return out;
+    }
+    if (!m_impl->sym.load_function(pfn->start_ea))
+    {
+        out.final_verdict = verdict_t::unsupported;
+        out.sat_check.result = smt::result_t::unknown;
+        const char* e = m_impl->sym.last_error();
+        out.sat_check.reason = e != nullptr && *e ? std::string("symbolic load failed: ") + e
+                                                  : std::string("symbolic load failed");
+        return out;
+    }
+    if (source_ea != BADADDR)
+        m_impl->sym.constrain_taint_source_at(source_ea);
+    auto constraints = m_impl->sym.collect_path_to(sink_ea, 64);
+    auto local = m_impl->smt_pool.create_context();
+    if (!local || !local->is_available())
+    {
+        out.final_verdict = verdict_t::unsupported;
+        out.sat_check.result = smt::result_t::unknown;
+        out.sat_check.reason = local ? local->last_error() : "smt unavailable";
+        return out;
+    }
+    std::unordered_map<std::string, int> declared;
+    emit_declarations(*local, constraints, declared);
+    std::string assert_err;
+    assert_constraints(*local, constraints, assert_err);
+    out.sat_check = local->check_with_timeout(cheap_timeout_ms);
+    if (!assert_err.empty())
+    {
+        if (!out.sat_check.reason.empty())
+            out.sat_check.reason.append("; ");
+        out.sat_check.reason.append("partial constraints: ").append(assert_err);
+    }
+    out.final_verdict = smt_result_to_verdict(out.sat_check);
+    if (out.final_verdict == verdict_t::refuted || stop_at == "sat_check" || should_cancel())
+        return out;
+
+    out.stage_reached = "taint_check";
+    out.taint_check = verify_taint_path(source_ea, sink_ea, cheap_timeout_ms * 4u);
+    out.final_verdict = out.taint_check.verdict;
+    if (out.final_verdict == verdict_t::confirmed || stop_at == "taint_check" || should_cancel())
+        return out;
+
+    out.stage_reached = "exploit_input";
+    out.exploit_input = solve_for_exploit_input(source_ea, sink_ea, deep_timeout_ms);
+    if (out.exploit_input.found)
+        out.final_verdict = verdict_t::confirmed;
+    return out;
+}
+
+std::vector<path_verification_t> VerificationEngine::list_verified(verdict_t filter,
+                                                                   bool use_filter,
+                                                                   ea_t sink_ea,
+                                                                   size_t max_entries) const
+{
+    std::vector<path_verification_t> out;
+    if (!m_impl)
+        return out;
+    if (max_entries == 0)
+        max_entries = 100;
+    std::lock_guard<std::mutex> lk(m_impl->mu);
+    for (const auto& kv : m_impl->verdict_cache)
+    {
+        if (use_filter && kv.second.verdict != filter)
+            continue;
+        if (sink_ea != BADADDR && kv.first.sink_ea != sink_ea)
+            continue;
+        out.push_back(kv.second);
+        if (out.size() >= max_entries)
+            break;
+    }
+    return out;
+}
+
+nlohmann::json VerificationEngine::persist_ledger(const std::string& action)
+{
+    nlohmann::json result;
+    result["action"] = action;
+    result["entries_saved_or_loaded"] = 0;
+    result["ledger_size_bytes"] = 0;
+    netnode nn(k_verify_ledger_node, 0, action == "save");
+    if (action == "clear")
+    {
+        if (nn != BADNODE)
+            nn.kill();
+        result["cleared"] = true;
+        return result;
+    }
+    if (action == "save")
+    {
+        nlohmann::json root;
+        root["binary_md5"] = binary_md5_hex();
+        root["sig_db_rev"] = sig::SIGNATURE_DATABASE_REVISION;
+        root["entries"] = nlohmann::json::array();
+        {
+            std::lock_guard<std::mutex> lk(m_impl->mu);
+            for (const auto& kv : m_impl->verdict_cache)
+            {
+                nlohmann::json e = to_json(kv.second);
+                e["key"] = cache_key_string(kv.first);
+                e["func_ea"] = ea_to_hex(kv.first.func_ea);
+                e["source_ea"] = ea_to_hex(kv.first.source_ea);
+                e["sink_ea"] = ea_to_hex(kv.first.sink_ea);
+                e["sig_db_rev"] = kv.first.sig_db_rev;
+                root["entries"].push_back(std::move(e));
+            }
+        }
+        std::vector<std::uint8_t> packed = nlohmann::json::to_msgpack(root);
+        result["ledger_size_bytes"] = packed.size();
+        for (nodeidx_t i = 0; i < 128; ++i)
+            nn.delblob(k_verify_ledger_blob_start + i, k_verify_ledger_blob_tag);
+        size_t offset = 0;
+        nodeidx_t page = 0;
+        while (offset < packed.size())
+        {
+            size_t chunk = std::min(k_verify_ledger_page_size, packed.size() - offset);
+            nn.setblob(packed.data() + offset, chunk, k_verify_ledger_blob_start + page, k_verify_ledger_blob_tag);
+            offset += chunk;
+            ++page;
+        }
+        result["pages"] = page;
+        result["entries_saved_or_loaded"] = root["entries"].size();
+        return result;
+    }
+    if (action == "load")
+    {
+        if (nn == BADNODE)
+            return result;
+        std::vector<std::uint8_t> packed;
+        for (nodeidx_t page = 0; page < 128; ++page)
+        {
+            size_t sz = nn.blobsize(k_verify_ledger_blob_start + page, k_verify_ledger_blob_tag);
+            if (sz == 0)
+                break;
+            void* blob = nn.getblob(nullptr, &sz, k_verify_ledger_blob_start + page, k_verify_ledger_blob_tag);
+            if (blob == nullptr)
+                break;
+            const std::uint8_t* bytes = static_cast<const std::uint8_t*>(blob);
+            packed.insert(packed.end(), bytes, bytes + sz);
+            qfree(blob);
+        }
+        result["ledger_size_bytes"] = packed.size();
+        if (packed.empty())
+            return result;
+        nlohmann::json root = nlohmann::json::from_msgpack(packed, true, false);
+        if (!root.is_object() || root.value("binary_md5", "") != binary_md5_hex())
+            return result;
+        size_t loaded = 0;
+        std::lock_guard<std::mutex> lk(m_impl->mu);
+        if (root.contains("entries") && root["entries"].is_array())
+        {
+            for (const auto& e : root["entries"])
+            {
+                cache_key_t key;
+                auto parse_ea = [](const nlohmann::json& obj, const char* field) -> ea_t {
+                    if (!obj.contains(field) || !obj[field].is_string())
+                        return BADADDR;
+                    const std::string s = obj[field].get<std::string>();
+                    if (s.empty())
+                        return BADADDR;
+                    char* endp = nullptr;
+                    uint64_t v = _strtoui64(s.c_str(), &endp, 0);
+                    if (endp == s.c_str())
+                        return BADADDR;
+                    return static_cast<ea_t>(v);
+                };
+                key.func_ea = parse_ea(e, "func_ea");
+                key.source_ea = parse_ea(e, "source_ea");
+                key.sink_ea = parse_ea(e, "sink_ea");
+                key.sig_db_rev = e.value("sig_db_rev", sig::SIGNATURE_DATABASE_REVISION);
+                if (key.func_ea == BADADDR || key.sink_ea == BADADDR || key.sig_db_rev != sig::SIGNATURE_DATABASE_REVISION)
+                    continue;
+                path_verification_t v;
+                std::string verdict = e.value("verdict", "inconclusive");
+                if (verdict == "confirmed") v.verdict = verdict_t::confirmed;
+                else if (verdict == "refuted") v.verdict = verdict_t::refuted;
+                else if (verdict == "timeout") v.verdict = verdict_t::timeout;
+                else if (verdict == "unsupported") v.verdict = verdict_t::unsupported;
+                else v.verdict = verdict_t::inconclusive;
+                std::string smtr = e.value("smt_result", "unknown");
+                if (smtr == "sat") v.smt_result = smt::result_t::sat;
+                else if (smtr == "unsat") v.smt_result = smt::result_t::unsat;
+                else v.smt_result = smt::result_t::unknown;
+                v.solve_ms = e.value("solve_ms", 0ull);
+                v.rationale = e.value("rationale", "");
+                v.cached_at = e.value("cached_at", now_ms());
+                m_impl->verdict_cache[key] = std::move(v);
+                ++loaded;
+            }
+        }
+        result["entries_saved_or_loaded"] = loaded;
+    }
+    return result;
+}
+
+void VerificationEngine::cancel()
+{
+    g_verify_cancel.store(true, std::memory_order_relaxed);
+}
+
+int VerificationEngine::in_flight_count() const
+{
+    return g_verify_in_flight.load(std::memory_order_relaxed);
+}
+
+wire_path_constraints_t VerificationEngine::extract_wire_path_constraints(ea_t source_ea,
+                                                                          ea_t sink_ea,
+                                                                          int max_branches)
+{
+    wire_path_constraints_t out;
+    out.source_ea = source_ea;
+    out.sink_ea = sink_ea;
+    if (!m_impl || !is_available())
+        return out;
+    func_t* pfn = get_func(sink_ea);
+    if (pfn == nullptr)
+        return out;
+    if (!m_impl->sym.load_function(pfn->start_ea))
+        return out;
+    if (source_ea != BADADDR)
+        m_impl->sym.constrain_taint_source_at(source_ea);
+    auto constraints = m_impl->sym.collect_path_to(sink_ea, max_branches);
+    out.smt2_formula = m_impl->sym.path_smtlib2(sink_ea, max_branches);
+    uint64_t offset = 0;
+    for (const auto& c : constraints)
+    {
+        if (c.branch_ea == BADADDR)
+            continue;
+        wire_constraint_t wc;
+        wc.buffer_offset = offset++;
+        wc.width_bytes = 1;
+        wc.op = c.taken ? "branch_taken" : "branch_not_taken";
+        wc.comparison_ea = c.branch_ea;
+        wc.rationale = c.predicate_text.empty() ? c.predicate_smt2 : c.predicate_text;
+        out.constraints.push_back(std::move(wc));
+    }
+    out.implied_min_buffer_size = out.constraints.empty() ? 0 : out.constraints.back().buffer_offset + 1;
+    return out;
+}
+
+exploit_input_t VerificationEngine::synthesize_exploit_payload(ea_t source_ea,
+                                                               ea_t sink_ea,
+                                                               uint32_t timeout_ms,
+                                                               const exploit_constraints_t& constraints)
+{
+    auto wire = extract_wire_path_constraints(source_ea, sink_ea, 64);
+    exploit_input_t out = solve_for_exploit_input(source_ea, sink_ea, timeout_ms, constraints);
+    if (out.found && out.concrete_bytes.size() < wire.implied_min_buffer_size)
+        out.concrete_bytes.resize(wire.implied_min_buffer_size, 0);
+    if (out.found && out.summary.find("python struct.pack") == std::string::npos)
+    {
+        std::ostringstream py;
+        py << " python struct.pack('<" << out.concrete_bytes.size() << "B'";
+        for (uint8_t b : out.concrete_bytes)
+            py << ", " << static_cast<unsigned>(b);
+        py << ")";
+        out.summary.append(py.str());
+    }
+    return out;
+}
+
 nlohmann::json VerificationEngine::verdict_summary() const
 {
     nlohmann::json j;
@@ -1066,10 +1615,17 @@ nlohmann::json VerificationEngine::verdict_summary() const
         std::lock_guard<std::mutex> lk(m_impl->mu);
         for (const auto& kv : m_impl->verdict_counts)
             j[kv.first] = kv.second;
+        j["cache_entries"] = m_impl->verdict_cache.size();
+    }
+    for (const char* k : {"confirmed", "refuted", "timeout", "inconclusive", "unsupported"})
+    {
+        if (!j.contains(k))
+            j[k] = 0;
     }
     j["available"] = is_available();
     const char* se = m_impl->sym.last_error();
-    const char* me = m_impl->smt.last_error();
+    auto probe = m_impl->smt_pool.create_context();
+    const char* me = probe ? probe->last_error() : "";
     j["sym_error"] = se != nullptr ? std::string(se) : std::string("");
     j["smt_error"] = me != nullptr ? std::string(me) : std::string("");
     return j;
@@ -1087,8 +1643,13 @@ nlohmann::json to_json(const path_verification_t& v)
     j["verdict"] = verdict_str(v.verdict);
     j["smt_result"] = smt::result_str(v.smt_result);
     j["solve_ms"] = v.solve_ms;
+    j["cached_at"] = v.cached_at;
+    j["via_seh_handler"] = v.via_seh_handler;
     j["adjusted_confidence"] = confidence_str(v.adjusted_confidence);
     j["rationale"] = v.rationale;
+    j["cited_eas"] = nlohmann::json::array();
+    for (ea_t ea : v.cited_eas)
+        j["cited_eas"].push_back(ea_to_hex(ea));
     j["constraints"] = nlohmann::json::array();
     for (const auto& c : v.constraints)
         j["constraints"].push_back(symbolic::to_json(c));
@@ -1104,6 +1665,9 @@ nlohmann::json to_json(const exploit_input_t& e)
     j["found"] = e.found;
     j["summary"] = e.summary;
     j["rationale"] = e.rationale;
+    j["cited_eas"] = nlohmann::json::array();
+    for (ea_t ea : e.cited_eas)
+        j["cited_eas"].push_back(ea_to_hex(ea));
     j["inputs"] = nlohmann::json::array();
     for (const auto& i : e.inputs)
         j["inputs"].push_back(smt::to_json(i));
@@ -1133,6 +1697,42 @@ nlohmann::json to_json(const loop_bound_proof_t& p)
     j["buffer_size"] = p.buffer_size;
     j["overflow_provable"] = p.overflow_provable;
     j["rationale"] = p.rationale;
+    return j;
+}
+
+nlohmann::json to_json(const triage_result_t& t)
+{
+    nlohmann::json j;
+    j["stage_reached"] = t.stage_reached;
+    j["final_verdict"] = verdict_str(t.final_verdict);
+    j["sat_check"] = smt::to_json(t.sat_check);
+    j["taint_check"] = to_json(t.taint_check);
+    j["exploit_input"] = to_json(t.exploit_input);
+    return j;
+}
+
+nlohmann::json to_json(const wire_constraint_t& c)
+{
+    nlohmann::json j;
+    j["buffer_offset"] = c.buffer_offset;
+    j["width_bytes"] = c.width_bytes;
+    j["equal_to"] = c.equal_to;
+    j["op"] = c.op;
+    j["comparison_ea"] = ea_to_hex(c.comparison_ea);
+    j["rationale"] = c.rationale;
+    return j;
+}
+
+nlohmann::json to_json(const wire_path_constraints_t& w)
+{
+    nlohmann::json j;
+    j["source_ea"] = ea_to_hex(w.source_ea);
+    j["sink_ea"] = ea_to_hex(w.sink_ea);
+    j["implied_min_buffer_size"] = w.implied_min_buffer_size;
+    j["constraints"] = nlohmann::json::array();
+    for (const auto& c : w.constraints)
+        j["constraints"].push_back(to_json(c));
+    j["smt2_formula"] = w.smt2_formula;
     return j;
 }
 

@@ -2518,6 +2518,33 @@ inline std::optional<std::uint64_t> resolve_last_register_value(const std::map<s
     return it->second;
 }
 
+inline bool dispatch_assignment_less(const json& a, const json& b)
+{
+    const std::uint32_t ai = a.value("irp_code", 0u);
+    const std::uint32_t bi = b.value("irp_code", 0u);
+    if (ai != bi)
+        return ai < bi;
+    const std::string av = a.value("assignment_va", std::string());
+    const std::string bv = b.value("assignment_va", std::string());
+    if (av != bv)
+        return av < bv;
+    return a.value("handler_va", std::string()) < b.value("handler_va", std::string());
+}
+
+inline json dispatch_accepted_slots_json(const json& assignments)
+{
+    json slots = json::array();
+    if (!assignments.is_array())
+        return slots;
+    for (const auto& a : assignments) {
+        slots.push_back(json{{"irp_code", a.value("irp_code", 0u)},
+                             {"irp_name", a.value("irp_name", std::string("IRP_MJ_UNKNOWN"))},
+                             {"handler_va", a.value("handler_va", json(nullptr))},
+                             {"assignment_va", a.value("assignment_va", json(nullptr))}});
+    }
+    return slots;
+}
+
 struct drv_dispatch_scan_limits_t {
     std::uint32_t timeout_ms = 5000;
     std::uint32_t max_entry_bytes = 0x8000;
@@ -2725,9 +2752,12 @@ inline bool parse_driver_entry_assignments(std::uint32_t pid, const target_modul
 {
     assignments = json::array();
     diagnostics = json::object();
+    diagnostics["module"] = json{{"name", mod.name}, {"base", sa_format_address(mod.base)}, {"size", mod.size}, {"path", mod.path}};
+    diagnostics["scan_budget_start"] = ctx.status();
     diagnostics["candidates"] = json::array();
     diagnostics["rejection_histogram"] = json::object();
     diagnostics["last_candidate"] = nullptr;
+    ctx.record("assignment_scan_start", json{{"module", mod.name}, {"base", sa_format_address(mod.base)}, {"size", mod.size}, {"entry", sa_format_address(pe.entry)}, {"budget", ctx.status()}});
     auto insns = disassemble_driver_entry_bounded(pid, mod, pe, ctx, diagnostics);
     diagnostics["instructions_decoded"] = insns.size();
     std::map<std::string, std::uint64_t> reg_values;
@@ -2759,7 +2789,16 @@ inline bool parse_driver_entry_assignments(std::uint32_t pid, const target_modul
             continue;
         if (candidate_index >= ctx.limits.max_candidates) {
             diagnostics["candidate_limit_hit"] = true;
+            diagnostics["candidate_limit_hit_at"] = candidate_index;
             ctx.stage = "dispatch_candidate_limit";
+            ctx.record("assignment_candidate_limit", json{{"module", mod.name}, {"candidate_index", candidate_index}, {"max_candidates", ctx.limits.max_candidates}, {"instructions_decoded", insns.size()}, {"budget", ctx.status()}});
+            diag::log_tagged_fmt("protected_re",
+                "drv_dispatch candidate_limit module=%s candidate=%llu max=%llu decoded=%zu elapsed_ms=%llu",
+                mod.name.c_str(),
+                static_cast<unsigned long long>(candidate_index),
+                static_cast<unsigned long long>(ctx.limits.max_candidates),
+                insns.size(),
+                static_cast<unsigned long long>(ctx.elapsed_ms()));
             break;
         }
         const std::uint32_t code = static_cast<std::uint32_t>((disp - 0x70) / 8);
@@ -2805,14 +2844,41 @@ inline bool parse_driver_entry_assignments(std::uint32_t pid, const target_modul
         if (plausible)
             assignments.push_back(std::move(a));
     }
+    if (!assignments.empty()) {
+        std::vector<json> sorted_assignments;
+        sorted_assignments.reserve(assignments.size());
+        for (const auto& a : assignments)
+            sorted_assignments.push_back(a);
+        std::stable_sort(sorted_assignments.begin(), sorted_assignments.end(), dispatch_assignment_less);
+        assignments = json::array();
+        for (auto& a : sorted_assignments)
+            assignments.push_back(std::move(a));
+    }
     diagnostics["candidate_count"] = diagnostics["candidates"].size();
+    diagnostics["assignment_candidate_count"] = candidate_index;
     diagnostics["accepted_assignment_count"] = assignments.size();
+    diagnostics["accepted_slots"] = dispatch_accepted_slots_json(assignments);
     diagnostics["deadline_hit"] = ctx.deadline_hit;
     diagnostics["cancelled"] = ctx.cancelled;
     diagnostics["elapsed_ms"] = ctx.elapsed_ms();
     diagnostics["budget"] = ctx.status();
+    diagnostics["scan_budget_end"] = ctx.status();
     if (assignments.empty())
         diagnostics["rejection_reason"] = ctx.cancelled ? "scan_cancelled" : (ctx.deadline_hit ? "scan_deadline_hit" : (diagnostics["candidate_count"].get<std::size_t>() == 0 ? "no_major_function_assignments_in_scan_window" : "all_major_function_candidates_rejected"));
+    ctx.record("assignment_scan_end", json{{"module", mod.name}, {"base", sa_format_address(mod.base)}, {"size", mod.size}, {"instructions_decoded", insns.size()}, {"candidate_count", diagnostics["candidate_count"]}, {"accepted_assignment_count", assignments.size()}, {"accepted_slots", diagnostics["accepted_slots"]}, {"rejection_reason", assignments.empty() ? diagnostics.value("rejection_reason", std::string("none")) : std::string("accepted")}, {"budget", ctx.status()}});
+    diag::log_tagged_fmt("protected_re",
+        "drv_dispatch assignment_scan_end module=%s base=0x%llX size=%llu decoded=%zu candidates=%llu accepted=%llu reason=%s elapsed_ms=%llu timeout_ms=%u deadline_hit=%d cancelled=%d",
+        mod.name.c_str(),
+        static_cast<unsigned long long>(mod.base),
+        static_cast<unsigned long long>(mod.size),
+        insns.size(),
+        static_cast<unsigned long long>(diagnostics["candidate_count"].get<std::size_t>()),
+        static_cast<unsigned long long>(assignments.size()),
+        assignments.empty() ? diagnostics.value("rejection_reason", std::string("none")).c_str() : "accepted",
+        static_cast<unsigned long long>(ctx.elapsed_ms()),
+        ctx.limits.timeout_ms,
+        ctx.deadline_hit ? 1 : 0,
+        ctx.cancelled ? 1 : 0);
     return !assignments.empty();
 }
 
@@ -2821,6 +2887,7 @@ inline tool_result_t drv_find_dispatch_table(const json& params)
     auto chk = require_driver();
     const drv_dispatch_scan_limits_t limits = drv_dispatch_limits_from_params(params);
     drv_dispatch_scan_context_t scan_ctx(limits);
+    const json scan_budget_start = scan_ctx.status();
     if (!chk.success) {
         json out;
         out["dependency_unavailable"] = true;
@@ -2831,6 +2898,7 @@ inline tool_result_t drv_find_dispatch_table(const json& params)
         out["attached_pids"] = driver_bridge::attached_pids();
         out["auto_select_wdm_driver"] = params.value("auto_select_wdm_driver", false);
         out["budget"] = scan_ctx.status();
+        out["scan_budget_start"] = scan_budget_start;
         out["breadcrumbs"] = scan_ctx.breadcrumbs;
         diag::log_tagged_fmt("protected_re",
             "drv_dispatch dependency_failed using_driver=%d attached_pid=%u target_required=0 error=%s",
@@ -2888,13 +2956,24 @@ inline tool_result_t drv_find_dispatch_table(const json& params)
         ordered_mods.reserve(mods.size());
         std::size_t original_index = 0;
         for (const auto& candidate : mods) {
-            json module_summary = json{{"original_index", original_index}, {"name", candidate.name}, {"base", sa_format_address(candidate.base)}, {"size", candidate.size}, {"path", candidate.path}, {"priority", kernel_auto_select_priority(candidate)}};
+            const int priority = kernel_auto_select_priority(candidate);
+            json module_summary = json{{"original_index", original_index}, {"name", candidate.name}, {"base", sa_format_address(candidate.base)}, {"size", candidate.size}, {"path", candidate.path}, {"priority", priority}, {"selection_key", json{{"priority", priority}, {"name", lower_ascii(candidate.name)}, {"base", sa_format_address(candidate.base)}}}};
             const std::string skip_reason = kernel_auto_select_skip_reason(candidate);
             if (!skip_reason.empty()) {
                 module_summary["skip_reason"] = skip_reason;
                 increment_json_counter(auto_select_skip_histogram, skip_reason);
                 ++auto_modules_skipped;
                 auto_select_last_candidate = module_summary;
+                scan_ctx.record("kernel_module_rejected", module_summary);
+                diag::log_tagged_fmt("protected_re",
+                    "drv_dispatch kernel_module_rejected index=%llu name=%s base=0x%llX size=%llu priority=%d reason=%s elapsed_ms=%llu",
+                    static_cast<unsigned long long>(original_index),
+                    candidate.name.c_str(),
+                    static_cast<unsigned long long>(candidate.base),
+                    static_cast<unsigned long long>(candidate.size),
+                    priority,
+                    skip_reason.c_str(),
+                    static_cast<unsigned long long>(scan_ctx.elapsed_ms()));
                 ++original_index;
                 continue;
             }
@@ -2916,7 +2995,8 @@ inline tool_result_t drv_find_dispatch_table(const json& params)
         for (const auto& candidate : ordered_mods) {
             if (auto_select_ordered_modules.size() >= 64)
                 break;
-            auto_select_ordered_modules.push_back(json{{"name", candidate.name}, {"base", sa_format_address(candidate.base)}, {"size", candidate.size}, {"path", candidate.path}, {"priority", kernel_auto_select_priority(candidate)}});
+            const int priority = kernel_auto_select_priority(candidate);
+            auto_select_ordered_modules.push_back(json{{"name", candidate.name}, {"base", sa_format_address(candidate.base)}, {"size", candidate.size}, {"path", candidate.path}, {"priority", priority}, {"selection_key", json{{"priority", priority}, {"name", lower_ascii(candidate.name)}, {"base", sa_format_address(candidate.base)}}}});
         }
         scan_ctx.record("kernel_modules_filtered", json{{"module_count", mods.size()}, {"eligible_count", ordered_mods.size()}, {"skipped_count", auto_modules_skipped}, {"skip_histogram", auto_select_skip_histogram}});
         diag::log_tagged_fmt("protected_re",
@@ -2933,13 +3013,14 @@ inline tool_result_t drv_find_dispatch_table(const json& params)
                 break;
             ++auto_modules_scanned;
             pe_layout_t candidate_pe;
-            json candidate_summary = json{{"candidate_index", candidate_index}, {"name", candidate.name}, {"base", sa_format_address(candidate.base)}, {"size", candidate.size}, {"path", candidate.path}, {"priority", kernel_auto_select_priority(candidate)}};
+            const int priority = kernel_auto_select_priority(candidate);
+            json candidate_summary = json{{"candidate_index", candidate_index}, {"name", candidate.name}, {"base", sa_format_address(candidate.base)}, {"size", candidate.size}, {"path", candidate.path}, {"priority", priority}, {"selection_key", json{{"priority", priority}, {"name", lower_ascii(candidate.name)}, {"base", sa_format_address(candidate.base)}}}, {"scan_budget", scan_ctx.status()}};
             auto_select_last_candidate = candidate_summary;
             scan_ctx.record("candidate_begin", candidate_summary);
             diag::log_tagged_fmt("protected_re",
                 "drv_dispatch candidate_begin index=%llu priority=%d name=%s base=0x%llX size=%llu path=%s elapsed_ms=%llu",
                 static_cast<unsigned long long>(candidate_index),
-                kernel_auto_select_priority(candidate),
+                priority,
                 candidate.name.c_str(),
                 static_cast<unsigned long long>(candidate.base),
                 static_cast<unsigned long long>(candidate.size),
@@ -2949,8 +3030,18 @@ inline tool_result_t drv_find_dispatch_table(const json& params)
             if (!read_pe_layout_with_dispatch_diag(0, candidate, candidate_pe, scan_ctx, candidate_summary)) {
                 if (!candidate_summary.contains("rejection_reason"))
                     candidate_summary["rejection_reason"] = "pe_header_parse_failed";
+                candidate_summary["scan_budget"] = scan_ctx.status();
                 increment_json_counter(auto_select_rejection_histogram, candidate_summary["rejection_reason"].get<std::string>());
                 auto_select_last_candidate = candidate_summary;
+                scan_ctx.record("candidate_rejected", candidate_summary);
+                diag::log_tagged_fmt("protected_re",
+                    "drv_dispatch candidate_rejected index=%llu name=%s base=0x%llX size=%llu reason=%s decoded=0 candidates=0 accepted=0 elapsed_ms=%llu",
+                    static_cast<unsigned long long>(candidate_index - 1),
+                    candidate.name.c_str(),
+                    static_cast<unsigned long long>(candidate.base),
+                    static_cast<unsigned long long>(candidate.size),
+                    candidate_summary["rejection_reason"].get<std::string>().c_str(),
+                    static_cast<unsigned long long>(scan_ctx.elapsed_ms()));
                 if (auto_select_candidates.size() < 16)
                     auto_select_candidates.push_back(std::move(candidate_summary));
                 if (scan_ctx.should_stop("auto_select_after_pe_read"))
@@ -2962,15 +3053,29 @@ inline tool_result_t drv_find_dispatch_table(const json& params)
             parse_driver_entry_assignments(0, candidate, candidate_pe, candidate_assignments, candidate_diagnostics, scan_ctx);
             candidate_summary["candidate_count"] = candidate_diagnostics.value("candidate_count", 0);
             candidate_summary["accepted_assignment_count"] = candidate_diagnostics.value("accepted_assignment_count", 0);
+            candidate_summary["instructions_decoded"] = candidate_diagnostics.value("instructions_decoded", 0);
+            candidate_summary["accepted_slots"] = candidate_diagnostics.value("accepted_slots", json::array());
             candidate_summary["rejection_histogram"] = candidate_diagnostics.value("rejection_histogram", json::object());
             candidate_summary["last_candidate"] = candidate_diagnostics.value("last_candidate", json(nullptr));
             candidate_summary["deadline_hit"] = scan_ctx.deadline_hit;
             candidate_summary["cancelled"] = scan_ctx.cancelled;
             candidate_summary["elapsed_ms"] = scan_ctx.elapsed_ms();
+            candidate_summary["scan_budget"] = scan_ctx.status();
             if (candidate_assignments.empty()) {
                 candidate_summary["rejection_reason"] = candidate_diagnostics.value("rejection_reason", std::string("no_accepted_dispatch_handlers"));
                 increment_json_counter(auto_select_rejection_histogram, candidate_summary["rejection_reason"].get<std::string>());
                 auto_select_last_candidate = candidate_summary;
+                scan_ctx.record("candidate_rejected", candidate_summary);
+                diag::log_tagged_fmt("protected_re",
+                    "drv_dispatch candidate_rejected index=%llu name=%s base=0x%llX size=%llu reason=%s decoded=%llu candidates=%llu accepted=0 elapsed_ms=%llu",
+                    static_cast<unsigned long long>(candidate_index - 1),
+                    candidate.name.c_str(),
+                    static_cast<unsigned long long>(candidate.base),
+                    static_cast<unsigned long long>(candidate.size),
+                    candidate_summary["rejection_reason"].get<std::string>().c_str(),
+                    static_cast<unsigned long long>(candidate_summary.value("instructions_decoded", 0ull)),
+                    static_cast<unsigned long long>(candidate_summary.value("candidate_count", 0ull)),
+                    static_cast<unsigned long long>(scan_ctx.elapsed_ms()));
                 if (auto_select_candidates.size() < 16)
                     auto_select_candidates.push_back(std::move(candidate_summary));
                 if (scan_ctx.should_stop("auto_select_after_candidate_analysis"))
@@ -2984,6 +3089,17 @@ inline tool_result_t drv_find_dispatch_table(const json& params)
             have_preselected_analysis = true;
             auto_selected = true;
             auto_select_last_candidate = candidate_summary;
+            scan_ctx.record("candidate_accepted", candidate_summary);
+            diag::log_tagged_fmt("protected_re",
+                "drv_dispatch candidate_accepted index=%llu name=%s base=0x%llX size=%llu decoded=%llu candidates=%llu accepted=%llu elapsed_ms=%llu",
+                static_cast<unsigned long long>(candidate_index - 1),
+                candidate.name.c_str(),
+                static_cast<unsigned long long>(candidate.base),
+                static_cast<unsigned long long>(candidate.size),
+                static_cast<unsigned long long>(candidate_summary.value("instructions_decoded", 0ull)),
+                static_cast<unsigned long long>(candidate_summary.value("candidate_count", 0ull)),
+                static_cast<unsigned long long>(candidate_summary.value("accepted_assignment_count", 0ull)),
+                static_cast<unsigned long long>(scan_ctx.elapsed_ms()));
             if (auto_select_candidates.size() < 16)
                 auto_select_candidates.push_back(std::move(candidate_summary));
             break;
@@ -3003,6 +3119,7 @@ inline tool_result_t drv_find_dispatch_table(const json& params)
             out["auto_select_rejection_histogram"] = auto_select_rejection_histogram;
             out["auto_select_last_candidate"] = auto_select_last_candidate;
             out["budget"] = scan_ctx.status();
+            out["scan_budget_start"] = scan_budget_start;
             out["breadcrumbs"] = scan_ctx.breadcrumbs;
             out["deadline_hit"] = scan_ctx.deadline_hit;
             out["cancelled"] = scan_ctx.cancelled;
@@ -3031,6 +3148,7 @@ inline tool_result_t drv_find_dispatch_table(const json& params)
         out["root_cause"] = "kernel_module_selection_failed";
         out["error"] = err.empty() ? "Kernel module could not be selected" : err;
         out["budget"] = scan_ctx.status();
+        out["scan_budget_start"] = scan_budget_start;
         out["breadcrumbs"] = scan_ctx.breadcrumbs;
         out["dependency_state"] = json{{"using_kernel_driver", driver_bridge::using_kernel_driver()}, {"attached_pid", driver_bridge::attached_pid()}, {"attached_pids", driver_bridge::attached_pids()}};
         return tool_result_t::error(err.empty() ? "Kernel module could not be selected" : err, out);
@@ -3042,6 +3160,7 @@ inline tool_result_t drv_find_dispatch_table(const json& params)
     base_out["module_size"] = mod->size;
     base_out["module_path"] = mod->path;
     base_out["auto_selected_wdm_driver"] = auto_selected;
+    base_out["selection_policy"] = "explicit module selection or deterministic auto-select ordered by priority, lowercase module name, and base address";
     base_out["analysis_mode"] = "live_kernel_module_scan";
     base_out["fixture_parser_path_available"] = false;
     base_out["auto_modules_considered"] = auto_modules_considered;
@@ -3049,6 +3168,7 @@ inline tool_result_t drv_find_dispatch_table(const json& params)
     base_out["auto_modules_scanned"] = auto_modules_scanned;
     base_out["target_required"] = false;
     base_out["dependency_state"] = json{{"using_kernel_driver", driver_bridge::using_kernel_driver()}, {"attached_pid", driver_bridge::attached_pid()}, {"attached_pids", driver_bridge::attached_pids()}};
+    base_out["scan_budget_start"] = scan_budget_start;
     base_out["budget"] = scan_ctx.status();
     if (!auto_select_candidates.empty())
         base_out["auto_select_candidates"] = auto_select_candidates;
@@ -3093,6 +3213,7 @@ inline tool_result_t drv_find_dispatch_table(const json& params)
         base_out["dispatch_table_va"] = nullptr;
         base_out["assignments"] = json::array();
         base_out["candidate_count"] = 0;
+        base_out["accepted_slots"] = json::array();
         base_out["confidence"] = 0.0;
         base_out["contract"] = "wdm_driver_module_required";
         base_out["rejection_reason"] = "selected_module_is_ntoskrnl_kernel_image_not_wdm_driver_module";
@@ -3110,6 +3231,7 @@ inline tool_result_t drv_find_dispatch_table(const json& params)
     out["assignments"] = assignments;
     out["candidate_count"] = diagnostics.value("candidate_count", 0);
     out["accepted_assignment_count"] = diagnostics.value("accepted_assignment_count", 0);
+    out["accepted_slots"] = diagnostics.value("accepted_slots", json::array());
     out["scan_window"] = diagnostics["scan_window"];
     out["diagnostics"] = diagnostics;
     out["budget"] = scan_ctx.status();

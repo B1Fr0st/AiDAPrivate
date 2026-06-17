@@ -1383,6 +1383,8 @@ json dx_record_json(const store::dx_hook_record_t& record)
     out["max_captures"] = record.max_captures;
     out["created_ms"] = record.created_ms;
     out["thread_count"] = record.tids.size();
+    out["capture_count"] = record.captures.size();
+    out["positive_capture_count"] = record.captures.size();
     out["captures"] = record.captures;
     return out;
 }
@@ -2559,6 +2561,10 @@ tool_result_t hook_manage(const json& params)
     result["armed_threads"] = total_armed_threads;
     result["auxiliary_cbuffer_hook"] = std::move(auxiliary);
     result["snapshot_capture_seeded"] = !debug_started;
+    result["snapshot_capture_count"] = debug_started ? 0 : record.captures.size();
+    result["event_capture_count"] = debug_started ? record.captures.size() : 0;
+    result["functional_snapshot_evidence"] = !debug_started && !record.captures.empty();
+    result["functional_event_evidence"] = debug_started && !record.captures.empty();
     diag::log_tagged_fmt("dx_hook", "hook_manage exit pid=%u action=%s hook_id=%s debug_started=%d armed_threads=%zu elapsed_ms=%llu",
                          scope.pid(),
                          action.c_str(),

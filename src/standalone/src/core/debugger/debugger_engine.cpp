@@ -6,6 +6,7 @@
 #include "standalone_driver.hpp"
 #include "zydis_disasm.hpp"
 #include "stealth_engine.hpp"
+#include "../analysis/symbol_store.hpp"
 #include "../editor/expression_eval.hpp"
 #include "../runtime/run_target.hpp"
 #include "work_queue.hpp"
@@ -24,7 +25,9 @@
 #include <exception>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <thread>
+#include <unordered_map>
 
 namespace {
 
@@ -121,6 +124,458 @@ std::string& last_error_ref() {
 
 void set_last_error(const std::string& msg) {
 	last_error_ref() = msg;
+}
+
+struct call_stack_symbol_resolution_t {
+	uint64_t address = 0;
+	uint64_t module_base = 0;
+	uint64_t module_size = 0;
+	uint64_t module_offset = 0;
+	uint64_t symbol_address = 0;
+	uint64_t symbol_offset = 0;
+	uint64_t elapsed_us = 0;
+	std::string module_name;
+	std::string function_name;
+	std::string source = "none";
+	std::string status = "not_attempted";
+};
+
+constexpr uint64_t k_call_stack_symbol_max_delta = 0x10000ull;
+constexpr uint32_t k_call_stack_export_max_names = 65536u;
+constexpr uint32_t k_call_stack_export_max_functions = 65536u;
+constexpr uint64_t k_call_stack_export_max_array_bytes = 1024ull * 1024ull;
+
+std::mutex& call_stack_resolver_mutex() {
+	static std::mutex m;
+	return m;
+}
+
+std::unordered_map<uint64_t, call_stack_symbol_resolution_t>& call_stack_resolutions() {
+	static std::unordered_map<uint64_t, call_stack_symbol_resolution_t> s;
+	return s;
+}
+
+uint64_t resolver_elapsed_us(std::chrono::steady_clock::time_point t0) {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+		std::chrono::steady_clock::now() - t0).count());
+}
+
+std::string lower_ascii_copy(std::string s) {
+	for (char& c : s)
+		c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+	return s;
+}
+
+bool module_contains_address(const driver_bridge::module_info_t& m, uint64_t address) {
+	return m.base != 0 && m.size != 0 && address >= m.base && (address - m.base) < m.size;
+}
+
+const driver_bridge::module_info_t* find_module_for_stack_address(
+	const std::vector<driver_bridge::module_info_t>& modules,
+	uint64_t address)
+{
+	for (const auto& m : modules) {
+		if (module_contains_address(m, address))
+			return &m;
+	}
+	return nullptr;
+}
+
+std::string symbol_name_with_offset(const std::string& name, uint64_t delta) {
+	if (name.empty() || delta == 0)
+		return name;
+	char suffix[40];
+	std::snprintf(suffix, sizeof(suffix), "+0x%llX", static_cast<unsigned long long>(delta));
+	return name + suffix;
+}
+
+std::string combine_resolver_status(const std::string& pdb_status, const std::string& export_status) {
+	if (pdb_status.empty())
+		return export_status.empty() ? std::string("unresolved") : export_status;
+	if (export_status.empty())
+		return pdb_status;
+	return pdb_status + ";" + export_status;
+}
+
+bool read_target_exact(uint64_t address, void* out, size_t size) {
+	if (address == 0 || out == nullptr || size == 0)
+		return false;
+	std::vector<uint8_t> bytes;
+	if (!driver_bridge::read_memory(address, size, bytes))
+		return false;
+	if (bytes.size() < size)
+		return false;
+	std::memcpy(out, bytes.data(), size);
+	return true;
+}
+
+bool module_rva_span_valid(const driver_bridge::module_info_t& module, uint32_t rva, uint64_t size) {
+	if (module.base == 0 || module.size == 0 || size == 0)
+		return false;
+	if (rva >= module.size)
+		return false;
+	return size <= static_cast<uint64_t>(module.size - rva);
+}
+
+bool read_module_rva_exact(const driver_bridge::module_info_t& module, uint32_t rva, void* out, size_t size) {
+	if (!module_rva_span_valid(module, rva, size))
+		return false;
+	return read_target_exact(module.base + rva, out, size);
+}
+
+template <typename T>
+bool read_module_rva_array(const driver_bridge::module_info_t& module, uint32_t rva, uint32_t count, std::vector<T>& out) {
+	out.clear();
+	if (count == 0)
+		return false;
+	const uint64_t bytes = static_cast<uint64_t>(count) * sizeof(T);
+	if (bytes == 0 || bytes > k_call_stack_export_max_array_bytes)
+		return false;
+	if (!module_rva_span_valid(module, rva, bytes))
+		return false;
+	out.resize(static_cast<size_t>(count));
+	std::vector<uint8_t> raw;
+	if (!driver_bridge::read_memory(module.base + rva, static_cast<size_t>(bytes), raw) || raw.size() < bytes) {
+		out.clear();
+		return false;
+	}
+	std::memcpy(out.data(), raw.data(), static_cast<size_t>(bytes));
+	return true;
+}
+
+std::string read_module_export_name(const driver_bridge::module_info_t& module, uint32_t name_rva) {
+	if (name_rva == 0 || name_rva >= module.size)
+		return {};
+	const size_t max_len = static_cast<size_t>((std::min<uint64_t>)(512ull, static_cast<uint64_t>(module.size - name_rva)));
+	if (max_len == 0)
+		return {};
+	std::vector<uint8_t> bytes;
+	if (!driver_bridge::read_memory(module.base + name_rva, max_len, bytes) || bytes.empty())
+		return {};
+	std::string out;
+	out.reserve(bytes.size());
+	for (uint8_t b : bytes) {
+		if (b == 0)
+			break;
+		if (b < 0x20 || b > 0x7E)
+			return {};
+		out.push_back(static_cast<char>(b));
+	}
+	return out;
+}
+
+bool resolve_stack_symbol_from_pdb(const driver_bridge::module_info_t& module,
+	uint64_t address,
+	call_stack_symbol_resolution_t& out,
+	std::string& status)
+{
+	status.clear();
+	const std::string module_name_l = lower_ascii_copy(module.name);
+	const auto t0 = std::chrono::steady_clock::now();
+	std::lock_guard<std::mutex> lk(symbol_store::g_state.mutex);
+	for (const auto& kv : symbol_store::g_state.modules) {
+		const auto& ms = kv.second;
+		const bool range_match = ms.base != 0 && ms.size != 0 && address >= ms.base && (address - ms.base) < ms.size;
+		const std::string store_module_name = ms.module_name.empty() ? kv.first : ms.module_name;
+		const bool name_base_match = ms.base == module.base && lower_ascii_copy(store_module_name) == module_name_l;
+		if (!range_match && !name_base_match)
+			continue;
+		if (ms.loading) {
+			status = "pdb_loading";
+			return false;
+		}
+		if (ms.failed) {
+			status = "pdb_failed";
+			return false;
+		}
+		if (!ms.pdb.loaded) {
+			status = "pdb_not_loaded";
+			return false;
+		}
+
+		const uint64_t rva = address - ms.base;
+		auto exact = ms.pdb.symbol_by_rva.find(rva);
+		if (exact != ms.pdb.symbol_by_rva.end() && exact->second < ms.pdb.symbols.size()) {
+			const auto& sym = ms.pdb.symbols[exact->second];
+			if (!sym.name.empty()) {
+				out.function_name = sym.name;
+				out.source = "pdb_exact";
+				out.status = "resolved";
+				out.symbol_address = ms.base + sym.rva;
+				out.symbol_offset = 0;
+				status = out.status;
+				return true;
+			}
+		}
+
+		const std::string* best_name = nullptr;
+		uint64_t best_rva = 0;
+		size_t scanned = 0;
+		bool budget_hit = false;
+		for (const auto& sym : ms.pdb.symbols) {
+			if ((++scanned & 0x7FFu) == 0 && resolver_elapsed_us(t0) > 3000) {
+				budget_hit = true;
+				break;
+			}
+			if (!sym.is_function || sym.name.empty() || sym.rva > rva)
+				continue;
+			const uint64_t delta = rva - sym.rva;
+			if (delta >= k_call_stack_symbol_max_delta)
+				continue;
+			if (best_name == nullptr || sym.rva > best_rva) {
+				best_name = &sym.name;
+				best_rva = sym.rva;
+				if (delta == 0)
+					break;
+			}
+		}
+		if (best_name != nullptr) {
+			const uint64_t delta = rva - best_rva;
+			out.function_name = symbol_name_with_offset(*best_name, delta);
+			out.source = delta == 0 ? "pdb_exact" : "pdb_nearest";
+			out.status = budget_hit ? "resolved_pdb_budgeted" : "resolved";
+			out.symbol_address = ms.base + best_rva;
+			out.symbol_offset = delta;
+			status = out.status;
+			return true;
+		}
+		status = budget_hit ? "pdb_scan_budget_exhausted" : "pdb_no_near_symbol";
+		return false;
+	}
+	status = "pdb_module_missing";
+	return false;
+}
+
+bool resolve_stack_symbol_from_exports(const driver_bridge::module_info_t& module,
+	uint64_t address,
+	call_stack_symbol_resolution_t& out,
+	std::string& status)
+{
+	status.clear();
+	if (!module_contains_address(module, address)) {
+		status = "export_module_mismatch";
+		return false;
+	}
+	const uint64_t target_rva64 = address - module.base;
+	if (target_rva64 > 0xFFFFFFFFull) {
+		status = "export_target_rva_out_of_range";
+		return false;
+	}
+	const uint32_t target_rva = static_cast<uint32_t>(target_rva64);
+	IMAGE_DOS_HEADER dos{};
+	if (!read_module_rva_exact(module, 0, &dos, sizeof(dos)) || dos.e_magic != IMAGE_DOS_SIGNATURE) {
+		status = "export_bad_dos_header";
+		return false;
+	}
+	if (dos.e_lfanew <= 0 || static_cast<uint64_t>(dos.e_lfanew) >= module.size) {
+		status = "export_bad_lfanew";
+		return false;
+	}
+	const uint32_t nt_rva = static_cast<uint32_t>(dos.e_lfanew);
+	DWORD signature = 0;
+	if (!read_module_rva_exact(module, nt_rva, &signature, sizeof(signature)) || signature != IMAGE_NT_SIGNATURE) {
+		status = "export_bad_nt_signature";
+		return false;
+	}
+	if (nt_rva > 0xFFFFFFFFu - static_cast<uint32_t>(sizeof(DWORD)) - static_cast<uint32_t>(sizeof(IMAGE_FILE_HEADER))) {
+		status = "export_nt_header_rva_overflow";
+		return false;
+	}
+	const uint32_t file_header_rva = nt_rva + static_cast<uint32_t>(sizeof(DWORD));
+	const uint32_t optional_rva = file_header_rva + static_cast<uint32_t>(sizeof(IMAGE_FILE_HEADER));
+	IMAGE_FILE_HEADER file_header{};
+	if (!read_module_rva_exact(module, file_header_rva, &file_header, sizeof(file_header))) {
+		status = "export_file_header_unreadable";
+		return false;
+	}
+	if (file_header.SizeOfOptionalHeader < static_cast<WORD>(sizeof(WORD))) {
+		status = "export_optional_header_too_small";
+		return false;
+	}
+	WORD magic = 0;
+	if (!read_module_rva_exact(module, optional_rva, &magic, sizeof(magic))) {
+		status = "export_optional_header_unreadable";
+		return false;
+	}
+	DWORD export_rva = 0;
+	DWORD export_size = 0;
+	if (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+		IMAGE_OPTIONAL_HEADER64 opt{};
+		if (!read_module_rva_exact(module, optional_rva, &opt, sizeof(opt))) {
+			status = "export_optional64_unreadable";
+			return false;
+		}
+		if (opt.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_EXPORT) {
+			status = "export_directory_missing";
+			return false;
+		}
+		export_rva = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+		export_size = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+	} else if (magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
+		IMAGE_OPTIONAL_HEADER32 opt{};
+		if (!read_module_rva_exact(module, optional_rva, &opt, sizeof(opt))) {
+			status = "export_optional32_unreadable";
+			return false;
+		}
+		if (opt.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_EXPORT) {
+			status = "export_directory_missing";
+			return false;
+		}
+		export_rva = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+		export_size = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+	} else {
+		status = "export_unknown_optional_magic";
+		return false;
+	}
+	if (export_rva == 0 || export_size < sizeof(IMAGE_EXPORT_DIRECTORY)) {
+		status = "export_directory_absent";
+		return false;
+	}
+	IMAGE_EXPORT_DIRECTORY exp{};
+	if (!read_module_rva_exact(module, export_rva, &exp, sizeof(exp))) {
+		status = "export_directory_unreadable";
+		return false;
+	}
+	if (exp.NumberOfNames == 0 || exp.NumberOfFunctions == 0) {
+		status = "export_no_names";
+		return false;
+	}
+	if (exp.AddressOfNames == 0 || exp.AddressOfNameOrdinals == 0 || exp.AddressOfFunctions == 0) {
+		status = "export_tables_absent";
+		return false;
+	}
+	uint32_t name_count = exp.NumberOfNames;
+	if (name_count > k_call_stack_export_max_names)
+		name_count = k_call_stack_export_max_names;
+	uint32_t function_count = exp.NumberOfFunctions;
+	if (function_count > k_call_stack_export_max_functions)
+		function_count = k_call_stack_export_max_functions;
+
+	std::vector<DWORD> name_rvas;
+	std::vector<WORD> ordinals;
+	std::vector<DWORD> function_rvas;
+	if (!read_module_rva_array(module, exp.AddressOfNames, name_count, name_rvas)) {
+		status = "export_names_unreadable";
+		return false;
+	}
+	if (!read_module_rva_array(module, exp.AddressOfNameOrdinals, name_count, ordinals)) {
+		status = "export_ordinals_unreadable";
+		return false;
+	}
+	if (!read_module_rva_array(module, exp.AddressOfFunctions, function_count, function_rvas)) {
+		status = "export_functions_unreadable";
+		return false;
+	}
+
+	const uint64_t export_end = static_cast<uint64_t>(export_rva) + static_cast<uint64_t>(export_size);
+	const auto t0 = std::chrono::steady_clock::now();
+	uint64_t best_delta = k_call_stack_symbol_max_delta;
+	uint32_t best_rva = 0;
+	std::string best_name;
+	bool budget_hit = false;
+	for (uint32_t i = 0; i < name_count; ++i) {
+		if ((i & 0xFFu) == 0 && i != 0 && resolver_elapsed_us(t0) > 8000) {
+			budget_hit = true;
+			break;
+		}
+		const uint16_t ordinal_index = ordinals[i];
+		if (ordinal_index >= function_count)
+			continue;
+		const uint32_t fn_rva = function_rvas[ordinal_index];
+		if (fn_rva == 0 || fn_rva > target_rva)
+			continue;
+		if (static_cast<uint64_t>(fn_rva) >= export_rva && static_cast<uint64_t>(fn_rva) < export_end)
+			continue;
+		if (fn_rva >= module.size)
+			continue;
+		const uint64_t delta = static_cast<uint64_t>(target_rva - fn_rva);
+		if (delta >= best_delta || delta >= k_call_stack_symbol_max_delta)
+			continue;
+		const std::string candidate_name = read_module_export_name(module, name_rvas[i]);
+		if (candidate_name.empty())
+			continue;
+		best_delta = delta;
+		best_rva = fn_rva;
+		best_name = candidate_name;
+		if (delta == 0)
+			break;
+	}
+	if (!best_name.empty()) {
+		out.function_name = symbol_name_with_offset(best_name, best_delta);
+		out.source = best_delta == 0 ? "export_exact" : "export_nearest";
+		out.status = budget_hit ? "resolved_export_budgeted" : "resolved";
+		out.symbol_address = module.base + best_rva;
+		out.symbol_offset = best_delta;
+		status = out.status;
+		return true;
+	}
+	status = budget_hit ? "export_scan_budget_exhausted" : "export_no_near_name";
+	return false;
+}
+
+void log_call_stack_symbol_resolution(const call_stack_symbol_resolution_t& r) {
+	diag::log_tagged_fmt("dbg_stack_symbol",
+		"resolve addr=0x%llX module=%s base=0x%llX size=0x%llX offset=0x%llX source=%s status=%s function=%s symbol=0x%llX symbol_offset=0x%llX elapsed_us=%llu",
+		static_cast<unsigned long long>(r.address),
+		r.module_name.empty() ? "(none)" : r.module_name.c_str(),
+		static_cast<unsigned long long>(r.module_base),
+		static_cast<unsigned long long>(r.module_size),
+		static_cast<unsigned long long>(r.module_offset),
+		r.source.c_str(),
+		r.status.c_str(),
+		r.function_name.empty() ? "(empty)" : r.function_name.c_str(),
+		static_cast<unsigned long long>(r.symbol_address),
+		static_cast<unsigned long long>(r.symbol_offset),
+		static_cast<unsigned long long>(r.elapsed_us));
+}
+
+call_stack_symbol_resolution_t resolve_call_stack_symbol(
+	uint64_t address,
+	const std::vector<driver_bridge::module_info_t>& modules)
+{
+	const auto t0 = std::chrono::steady_clock::now();
+	call_stack_symbol_resolution_t result;
+	result.address = address;
+	const auto* module = find_module_for_stack_address(modules, address);
+	if (module == nullptr) {
+		result.status = "no_module";
+		result.elapsed_us = resolver_elapsed_us(t0);
+		log_call_stack_symbol_resolution(result);
+		return result;
+	}
+	result.module_name = module->name;
+	result.module_base = module->base;
+	result.module_size = module->size;
+	result.module_offset = address - module->base;
+
+	std::string pdb_status;
+	if (resolve_stack_symbol_from_pdb(*module, address, result, pdb_status)) {
+		result.elapsed_us = resolver_elapsed_us(t0);
+		log_call_stack_symbol_resolution(result);
+		return result;
+	}
+
+	std::string export_status;
+	if (resolve_stack_symbol_from_exports(*module, address, result, export_status)) {
+		result.elapsed_us = resolver_elapsed_us(t0);
+		log_call_stack_symbol_resolution(result);
+		return result;
+	}
+
+	result.source = "none";
+	result.status = combine_resolver_status(pdb_status, export_status);
+	result.elapsed_us = resolver_elapsed_us(t0);
+	log_call_stack_symbol_resolution(result);
+	return result;
+}
+
+void publish_call_stack_resolutions(const std::vector<call_stack_symbol_resolution_t>& records) {
+	std::lock_guard<std::mutex> lk(call_stack_resolver_mutex());
+	auto& cache = call_stack_resolutions();
+	cache.clear();
+	cache.reserve(records.size());
+	for (const auto& r : records)
+		cache[r.address] = r;
 }
 
 expression_eval::context_t build_eval_context(const register_set_t& regs) {
@@ -302,6 +757,26 @@ void release_step_suspend_if_previously_suspended(uint32_t tid, uint32_t previou
 	}
 }
 
+}
+
+std::string call_stack_frame_resolver_evidence(uint64_t address) {
+	std::lock_guard<std::mutex> lk(call_stack_resolver_mutex());
+	const auto& cache = call_stack_resolutions();
+	auto it = cache.find(address);
+	if (it == cache.end())
+		return "source=none status=no_last_resolution";
+	const auto& r = it->second;
+	std::ostringstream oss;
+	oss << "source=" << r.source
+		<< " status=" << r.status
+		<< " module=" << (r.module_name.empty() ? "(none)" : r.module_name)
+		<< " base=0x" << std::hex << std::uppercase << r.module_base
+		<< " address=0x" << r.address
+		<< " offset=0x" << r.module_offset
+		<< " symbol=0x" << r.symbol_address
+		<< " symbol_offset=0x" << r.symbol_offset
+		<< std::dec << " elapsed_us=" << r.elapsed_us;
+	return oss.str();
 }
 
 void sync_attached_state();
@@ -1108,8 +1583,24 @@ bool step_into() {
 		static_cast<unsigned>(previous_suspend_count));
 
 	std::vector<uint8_t> step_code;
-	if (driver_bridge::read_memory(kctx.rip, 16, step_code) && !step_code.empty()) {
+	const bool step_read_ok = driver_bridge::read_memory(kctx.rip, 16, step_code);
+	if (step_read_ok && !step_code.empty()) {
 		auto ins = zydis_decode_one(step_code.data(), static_cast<int>(step_code.size()), kctx.rip);
+		uint32_t first4 = 0;
+		for (size_t i = 0; i < step_code.size() && i < 4; ++i)
+			first4 |= static_cast<uint32_t>(step_code[i]) << (i * 8);
+		diag::log_tagged_fmt("debugger",
+			"step_into_decode_probe pid=%u tid=%u rip=0x%llx read_ok=%d bytes=%zu first4=0x%08X mnem=%s ops=%s len=%u is_nop=%d",
+			static_cast<unsigned>(st.target_pid),
+			static_cast<unsigned>(st.active_tid),
+			static_cast<unsigned long long>(kctx.rip),
+			step_read_ok ? 1 : 0,
+			step_code.size(),
+			static_cast<unsigned>(first4),
+			ins.mnem,
+			ins.ops,
+			static_cast<unsigned>(ins.len),
+			ins.is_nop ? 1 : 0);
 		if (ins.is_nop && ins.len > 0 && ins.len <= 15) {
 			kctx.rip += static_cast<uint64_t>(ins.len);
 			kctx.rflags &= ~0x100ULL;
@@ -1147,6 +1638,14 @@ bool step_into() {
 				static_cast<long long>(step_dur_us));
 			return true;
 		}
+	} else {
+		diag::log_tagged_fmt("debugger",
+			"step_into_decode_probe pid=%u tid=%u rip=0x%llx read_ok=%d bytes=%zu",
+			static_cast<unsigned>(st.target_pid),
+			static_cast<unsigned>(st.active_tid),
+			static_cast<unsigned long long>(kctx.rip),
+			step_read_ok ? 1 : 0,
+			step_code.size());
 	}
 
 	kctx.rflags |= 0x100ULL;
@@ -2044,21 +2543,32 @@ std::vector<stack_frame_t> get_call_stack() {
 	auto regs = get_registers();
 	if (regs.rip == 0 || regs.rsp == 0) {
 		diag::log_tagged_fmt("dbg_engine", "get_call_stack: empty regs (RIP=0 or RSP=0), returning empty");
+		publish_call_stack_resolutions({});
 		return frames;
 	}
 
 	auto modules = driver_bridge::enumerate_modules();
+	std::vector<call_stack_symbol_resolution_t> resolution_records;
+	resolution_records.reserve(65);
 
 	auto resolve = [&](uint64_t addr) -> stack_frame_t {
 		stack_frame_t f;
 		f.address = addr;
-		for (const auto& m : modules) {
-			if (addr >= m.base && addr < m.base + m.size) {
-				f.module_name = m.name;
-				f.module_offset = addr - m.base;
-				break;
-			}
+		auto symbol = resolve_call_stack_symbol(addr, modules);
+		if (symbol.function_name.empty()) {
+			diag::log_tagged_fmt("dbg_engine",
+				"get_call_stack_unresolved_frame addr=0x%llX module=%s offset=0x%llX source=%s status=%s elapsed_us=%llu",
+				static_cast<unsigned long long>(symbol.address),
+				symbol.module_name.empty() ? "(none)" : symbol.module_name.c_str(),
+				static_cast<unsigned long long>(symbol.module_offset),
+				symbol.source.c_str(),
+				symbol.status.c_str(),
+				static_cast<unsigned long long>(symbol.elapsed_us));
 		}
+		f.module_name = symbol.module_name;
+		f.module_offset = symbol.module_offset;
+		f.function_name = symbol.function_name;
+		resolution_records.push_back(std::move(symbol));
 		return f;
 	};
 
@@ -2078,7 +2588,7 @@ std::vector<stack_frame_t> get_call_stack() {
 
 		bool valid = false;
 		for (const auto& m : modules) {
-			if (ret >= m.base && ret < m.base + m.size) {
+			if (module_contains_address(m, ret)) {
 				valid = true;
 				break;
 			}
@@ -2096,6 +2606,7 @@ std::vector<stack_frame_t> get_call_stack() {
 		std::lock_guard<std::mutex> lk(st.stack_mutex);
 		st.call_stack = frames;
 	}
+	publish_call_stack_resolutions(resolution_records);
 
 	diag::log_tagged_fmt("dbg_engine", "get_call_stack: result frames=%zu", frames.size());
 	return frames;

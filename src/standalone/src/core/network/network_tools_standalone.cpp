@@ -2146,6 +2146,7 @@ tool_result_t network_export_pcap(const json& params)
 
 tool_result_t api_monitor_start(const json& params)
 {
+    const uint64_t handler_start_ms = GetTickCount64();
     if (!params.contains("apis") || !params["apis"].is_array())
         return tool_result_t::error(OBFSTR("Missing required parameter: apis"));
 
@@ -2187,11 +2188,19 @@ tool_result_t api_monitor_start(const json& params)
     json summary = json::object();
     std::string error;
     if (!api_monitor::start(pid, apis, log_callstack, capture_buffer, max_capture_bytes, max_events, summary, error)) {
-        diag::log_tagged_fmt("net_tools", "api_monitor_start failed pid=%u error=%s", pid, error.c_str());
+        const uint64_t handler_elapsed_ms = GetTickCount64() - handler_start_ms;
+        diag::log_tagged_fmt("net_tools", "api_monitor_start failed pid=%u elapsed_ms=%llu error=%s", pid, static_cast<unsigned long long>(handler_elapsed_ms), error.c_str());
         if (!summary.is_object())
             summary = json::object();
         summary["success"] = false;
         summary["error"] = error;
+        summary["handler_elapsed_ms"] = handler_elapsed_ms;
+        if (summary.contains("failed_phase") && !summary.contains("phase"))
+            summary["phase"] = summary["failed_phase"];
+        if (!summary.contains("last_error"))
+            summary["last_error"] = static_cast<unsigned long>(GetLastError());
+        if (!summary.contains("elapsed_ms"))
+            summary["elapsed_ms"] = handler_elapsed_ms;
         if (!summary.contains("status"))
             summary["status"] = api_monitor::status_json();
         return tool_result_t::error(error, summary);

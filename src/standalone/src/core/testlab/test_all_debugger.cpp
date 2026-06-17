@@ -10,10 +10,15 @@
 #include <Windows.h>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
+
+namespace debugger_engine {
+std::string call_stack_frame_resolver_evidence(uint64_t address);
+}
 
 namespace test_all_features {
 
@@ -59,6 +64,48 @@ static long long elapsed_us_since(std::chrono::steady_clock::time_point t0) {
         std::chrono::steady_clock::now() - t0).count());
 }
 
+static size_t first_byte_mismatch(const std::vector<uint8_t>& expected, const std::vector<uint8_t>& actual) {
+    const size_t n = expected.size() < actual.size() ? expected.size() : actual.size();
+    for (size_t i = 0; i < n; ++i) {
+        if (expected[i] != actual[i])
+            return i;
+    }
+    return n;
+}
+
+static bool verify_target_bytes(uint64_t address,
+                                const std::vector<uint8_t>& expected,
+                                std::vector<uint8_t>& actual,
+                                size_t& mismatch) {
+    actual.clear();
+    mismatch = 0;
+    if (expected.empty())
+        return false;
+    const bool read_ok = driver_bridge::read_memory(address, expected.size(), actual);
+    mismatch = first_byte_mismatch(expected, actual);
+    return read_ok && actual.size() == expected.size() && mismatch == expected.size();
+}
+
+static std::string dbg_stack_lower_ascii(std::string value) {
+    for (char& c : value)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return value;
+}
+
+static bool dbg_stack_ends_with(const std::string& value, const char* suffix) {
+    const size_t suffix_len = std::strlen(suffix);
+    return value.size() >= suffix_len && value.compare(value.size() - suffix_len, suffix_len, suffix) == 0;
+}
+
+static bool dbg_stack_module_requires_function(const std::string& module_name) {
+    const std::string lower = dbg_stack_lower_ascii(module_name);
+    return lower == "ntdll.dll" ||
+        lower == "kernelbase.dll" ||
+        lower == "kernel32.dll" ||
+        lower.find("aida_testtarget") != std::string::npos ||
+        dbg_stack_ends_with(lower, ".exe");
+}
+
 static uint64_t get_ntdll_fn(const char* name) {
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     if (!ntdll) return 0;
@@ -71,7 +118,25 @@ static uint64_t alloc_target_bp_region(size_t size = 64) {
     if (addr == 0) return 0;
     std::vector<uint8_t> code(size, 0x90);
     code.back() = 0xC3;
-    driver_bridge::write_memory(addr, code);
+    const bool write_ok = driver_bridge::write_memory(addr, code);
+    std::vector<uint8_t> verify;
+    size_t mismatch = 0;
+    const bool verify_ok = write_ok && verify_target_bytes(addr, code, verify, mismatch);
+    if (!verify_ok) {
+        const uint8_t expected = mismatch < code.size() ? code[mismatch] : 0;
+        const uint8_t actual = mismatch < verify.size() ? verify[mismatch] : 0;
+        diag::log_tagged_fmt("test_dbg_detail",
+            "alloc_target_bp_region write_verify_FAILED addr=0x%llX size=%zu write=%d read_bytes=%zu mismatch=%zu expected=0x%02X actual=0x%02X",
+            (unsigned long long)addr,
+            size,
+            write_ok ? 1 : 0,
+            verify.size(),
+            mismatch,
+            (unsigned)expected,
+            (unsigned)actual);
+        driver_bridge::free_memory(addr);
+        return 0;
+    }
     uint32_t old_protect = 0;
     if (!driver_bridge::protect_memory(addr, size, PAGE_EXECUTE_READWRITE, &old_protect)) {
         diag::log_tagged_fmt("test_dbg_detail", "alloc_target_bp_region protect_memory failed addr=0x%llX size=%zu",
@@ -209,10 +274,21 @@ static bool restore_context_and_suspend_count(uint32_t tid,
 static bool cleanup_controlled_step_fixture(controlled_step_fixture_t& fx,
                                             bool* restored,
                                             bool* freed_code,
-                                            bool* freed_stack) {
+                                            bool* freed_stack,
+                                            HANDLE hf = nullptr,
+                                            const char* tag = "dbg_fixture") {
     bool restore_ok = true;
     bool code_ok = true;
     bool stack_ok = true;
+    const uint64_t code_addr = fx.code;
+    const uint64_t stack_addr = fx.stack;
+    driver_bridge::memory_region_t code_before{};
+    driver_bridge::memory_region_t stack_before{};
+    driver_bridge::memory_region_t code_after{};
+    driver_bridge::memory_region_t stack_after{};
+    const uint32_t pid = driver_bridge::attached_pid();
+    const bool code_before_ok = code_addr != 0 && pid != 0 && driver_bridge::query_memory_for(pid, code_addr, code_before);
+    const bool stack_before_ok = stack_addr != 0 && pid != 0 && driver_bridge::query_memory_for(pid, stack_addr, stack_before);
 
     if (fx.context_valid && fx.tid != 0)
         restore_ok = restore_context_and_suspend_count(fx.tid, fx.before, fx.original_suspend_count);
@@ -225,10 +301,58 @@ static bool cleanup_controlled_step_fixture(controlled_step_fixture_t& fx,
         stack_ok = driver_bridge::free_memory(fx.stack);
         fx.stack = 0;
     }
+    const bool code_after_ok = code_addr != 0 && pid != 0 && driver_bridge::query_memory_for(pid, code_addr, code_after);
+    const bool stack_after_ok = stack_addr != 0 && pid != 0 && driver_bridge::query_memory_for(pid, stack_addr, stack_after);
 
     if (restored) *restored = restore_ok;
     if (freed_code) *freed_code = code_ok;
     if (freed_stack) *freed_stack = stack_ok;
+    diag::log_tagged_fmt("test_dbg_detail",
+        "%s controlled_step_cleanup tid=%u context_valid=%d context_entered=%d original_suspend=%u restored=%d code=0x%llX code_before=%d/0x%08X/0x%08X code_after=%d/0x%08X/0x%08X free_code=%d stack=0x%llX stack_before=%d/0x%08X/0x%08X stack_after=%d/0x%08X/0x%08X free_stack=%d",
+        tag ? tag : "dbg_fixture",
+        (unsigned)fx.tid,
+        (int)fx.context_valid,
+        (int)fx.context_entered,
+        (unsigned)fx.original_suspend_count,
+        (int)restore_ok,
+        (unsigned long long)code_addr,
+        (int)code_before_ok,
+        (unsigned)code_before.state,
+        (unsigned)code_before.protect,
+        (int)code_after_ok,
+        (unsigned)code_after.state,
+        (unsigned)code_after.protect,
+        (int)code_ok,
+        (unsigned long long)stack_addr,
+        (int)stack_before_ok,
+        (unsigned)stack_before.state,
+        (unsigned)stack_before.protect,
+        (int)stack_after_ok,
+        (unsigned)stack_after.state,
+        (unsigned)stack_after.protect,
+        (int)stack_ok);
+    if (hf) {
+        log_msg(hf, tag ? tag : "dbg_fixture",
+            "INFO -- controlled step cleanup tid=%u restored=%d code=0x%llX free_code=%d code_before=%d/0x%08X/0x%08X code_after=%d/0x%08X/0x%08X stack=0x%llX free_stack=%d stack_before=%d/0x%08X/0x%08X stack_after=%d/0x%08X/0x%08X",
+            (unsigned)fx.tid,
+            (int)restore_ok,
+            (unsigned long long)code_addr,
+            (int)code_ok,
+            (int)code_before_ok,
+            (unsigned)code_before.state,
+            (unsigned)code_before.protect,
+            (int)code_after_ok,
+            (unsigned)code_after.state,
+            (unsigned)code_after.protect,
+            (unsigned long long)stack_addr,
+            (int)stack_ok,
+            (int)stack_before_ok,
+            (unsigned)stack_before.state,
+            (unsigned)stack_before.protect,
+            (int)stack_after_ok,
+            (unsigned)stack_after.state,
+            (unsigned)stack_after.protect);
+    }
     return restore_ok && code_ok && stack_ok;
 }
 
@@ -278,18 +402,73 @@ static bool prepare_controlled_step_fixture(HANDLE hf,
             std::vector<uint8_t> code(64, 0x90);
             for (size_t i = 0; i < code_bytes.size() && i < code.size(); ++i)
                 code[i] = code_bytes[i];
-            ok = driver_bridge::write_memory(trial.code, code);
+            const bool write_ok = driver_bridge::write_memory(trial.code, code);
+            std::vector<uint8_t> verify;
+            size_t mismatch = 0;
+            const bool verify_ok = write_ok && verify_target_bytes(trial.code, code, verify, mismatch);
+            if (!verify_ok) {
+                driver_bridge::memory_region_t write_region{};
+                const bool region_ok = driver_bridge::query_memory_for(driver_bridge::attached_pid(), trial.code, write_region);
+                const uint8_t expected = mismatch < code.size() ? code[mismatch] : 0;
+                const uint8_t actual = mismatch < verify.size() ? verify[mismatch] : 0;
+                diag::log_tagged_fmt("test_dbg_detail",
+                    "%s controlled_step_code_write_verify_FAILED tid=%u code=0x%llX size=%zu write=%d read_bytes=%zu mismatch=%zu expected=0x%02X actual=0x%02X region_ok=%d state=0x%08X protect=0x%08X",
+                    tag ? tag : "dbg_fixture",
+                    (unsigned)trial.tid,
+                    (unsigned long long)trial.code,
+                    code.size(),
+                    write_ok ? 1 : 0,
+                    verify.size(),
+                    mismatch,
+                    (unsigned)expected,
+                    (unsigned)actual,
+                    region_ok ? 1 : 0,
+                    (unsigned)write_region.state,
+                    (unsigned)write_region.protect);
+            }
+            ok = verify_ok;
         }
         if (ok) {
             uint32_t old_protect = 0;
             ok = driver_bridge::protect_memory(trial.code, 64, PAGE_EXECUTE_READWRITE, &old_protect);
+            driver_bridge::memory_region_t prot_region{};
+            const bool prot_region_ok = driver_bridge::query_memory_for(driver_bridge::attached_pid(), trial.code, prot_region);
+            diag::log_tagged_fmt("test_dbg_detail",
+                "%s controlled_step_code_protect tid=%u code=0x%llX protect_ok=%d old=0x%08X query=%d state=0x%08X protect=0x%08X",
+                tag ? tag : "dbg_fixture",
+                (unsigned)trial.tid,
+                (unsigned long long)trial.code,
+                ok ? 1 : 0,
+                (unsigned)old_protect,
+                prot_region_ok ? 1 : 0,
+                (unsigned)prot_region.state,
+                (unsigned)prot_region.protect);
         }
         if (ok && use_stack_return) {
             trial.expected_rip = trial.code + 0x10;
             trial.rsp = trial.stack + 0x800;
             std::vector<uint8_t> stack_bytes(8, 0);
             std::memcpy(stack_bytes.data(), &trial.expected_rip, sizeof(trial.expected_rip));
-            ok = driver_bridge::write_memory(trial.rsp, stack_bytes);
+            const bool stack_write_ok = driver_bridge::write_memory(trial.rsp, stack_bytes);
+            std::vector<uint8_t> stack_verify;
+            size_t stack_mismatch = 0;
+            const bool stack_verify_ok = stack_write_ok && verify_target_bytes(trial.rsp, stack_bytes, stack_verify, stack_mismatch);
+            if (!stack_verify_ok) {
+                const uint8_t expected = stack_mismatch < stack_bytes.size() ? stack_bytes[stack_mismatch] : 0;
+                const uint8_t actual = stack_mismatch < stack_verify.size() ? stack_verify[stack_mismatch] : 0;
+                diag::log_tagged_fmt("test_dbg_detail",
+                    "%s controlled_step_stack_write_verify_FAILED tid=%u stack=0x%llX rsp=0x%llX write=%d read_bytes=%zu mismatch=%zu expected=0x%02X actual=0x%02X",
+                    tag ? tag : "dbg_fixture",
+                    (unsigned)trial.tid,
+                    (unsigned long long)trial.stack,
+                    (unsigned long long)trial.rsp,
+                    stack_write_ok ? 1 : 0,
+                    stack_verify.size(),
+                    stack_mismatch,
+                    (unsigned)expected,
+                    (unsigned)actual);
+            }
+            ok = stack_verify_ok;
         } else if (ok) {
             trial.expected_rip = trial.code + 1;
         }
@@ -320,7 +499,7 @@ static bool prepare_controlled_step_fixture(HANDLE hf,
             bool restored = false;
             bool freed_code = false;
             bool freed_stack = false;
-            cleanup_controlled_step_fixture(trial, &restored, &freed_code, &freed_stack);
+            cleanup_controlled_step_fixture(trial, &restored, &freed_code, &freed_stack, hf, tag);
             char detail[220];
             std::snprintf(detail, sizeof(detail),
                 "build tid=%u code=0x%llX stack=0x%llX restored=%d free_code=%d free_stack=%d failed",
@@ -816,16 +995,42 @@ static void test_get_call_stack(HANDLE hf, std::atomic<int>& passed, std::atomic
     uint64_t top_addr = frames.empty() ? 0 : frames.front().address;
     diag::log_tagged_fmt("test_dbg_detail", "dbg_stk result: frame_count=%zu top_addr=0x%llX",
         frames.size(), (unsigned long long)top_addr);
-    for (size_t i = 0; i < frames.size() && i < 8; ++i) {
-        log_msg(hf, "dbg_stk", "  frame[%zu]: addr=0x%llX ret=0x%llX module=%s func=%s",
+    size_t known_module_blank_functions = 0;
+    std::string first_blank_evidence;
+    for (size_t i = 0; i < frames.size(); ++i) {
+        const std::string resolver = debugger_engine::call_stack_frame_resolver_evidence(frames[i].address);
+        const bool known_module = dbg_stack_module_requires_function(frames[i].module_name);
+        const bool empty_function = frames[i].function_name.empty();
+        log_msg(hf, "dbg_stk", "  frame[%zu]: addr=0x%llX ret=0x%llX module=%s func=%s offset=0x%llX resolver=%s",
             i, (unsigned long long)frames[i].address, (unsigned long long)frames[i].return_addr,
-            frames[i].module_name.c_str(), frames[i].function_name.c_str());
+            frames[i].module_name.c_str(), empty_function ? "(empty)" : frames[i].function_name.c_str(),
+            (unsigned long long)frames[i].module_offset, resolver.c_str());
+        diag::log_tagged_fmt("test_dbg_detail",
+            "dbg_stk frame index=%zu addr=0x%llX ret=0x%llX module=%s function=%s offset=0x%llX known_module=%d empty_function=%d resolver=%s",
+            i,
+            (unsigned long long)frames[i].address,
+            (unsigned long long)frames[i].return_addr,
+            frames[i].module_name.empty() ? "(empty)" : frames[i].module_name.c_str(),
+            empty_function ? "(empty)" : frames[i].function_name.c_str(),
+            (unsigned long long)frames[i].module_offset,
+            known_module ? 1 : 0,
+            empty_function ? 1 : 0,
+            resolver.c_str());
+        if (known_module && empty_function) {
+            ++known_module_blank_functions;
+            if (first_blank_evidence.empty())
+                first_blank_evidence = resolver;
+        }
     }
 
-    if (!frames.empty() && top_addr != 0) {
+    if (!frames.empty() && top_addr != 0 && known_module_blank_functions == 0) {
         log_msg(hf, "dbg_stk", "PASS -- %zu stack frames, top addr=0x%llX (elapsed %lld ms)",
             frames.size(), (unsigned long long)top_addr, (long long)ms);
         passed.fetch_add(1);
+    } else if (!frames.empty() && top_addr != 0) {
+        log_msg(hf, "dbg_stk", "FAIL -- call stack symbol resolution degraded: known_module_blank_functions=%zu first_blank_resolver=\"%s\" frames=%zu top_addr=0x%llX (elapsed %lld ms)",
+            known_module_blank_functions, first_blank_evidence.c_str(), frames.size(), (unsigned long long)top_addr, (long long)ms);
+        failed.fetch_add(1);
     } else {
         log_msg(hf, "dbg_stk", "FAIL -- call stack empty (frames=%zu top_addr=0x%llX); a live thread always yields >=1 frame at RIP (elapsed %lld ms)",
             frames.size(), (unsigned long long)top_addr, (long long)ms);
@@ -1842,7 +2047,7 @@ static void test_trace_result_inspection(HANDLE hf, std::atomic<int>& passed, st
     bool restored = false;
     bool freed_code = false;
     bool freed_stack = false;
-    cleanup_controlled_step_fixture(fixture, &restored, &freed_code, &freed_stack);
+    cleanup_controlled_step_fixture(fixture, &restored, &freed_code, &freed_stack, hf, "dbg_tri");
 
     diag::log_tagged_fmt("test_dbg_detail", "dbg_tri result: active_tid=%u fixture_va=0x%llX region_protect=0x%08X before_rip=0x%llX after_rip=0x%llX expected=0x%llX start=%d step=%d stop=%d trace_count=%zu first_rip=0x%llX last_rip=0x%llX restored=%d free_code=%d last_error='%s' first_disasm='%s' last_disasm='%s'",
         (unsigned)active_tid,

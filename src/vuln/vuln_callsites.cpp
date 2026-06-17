@@ -1,14 +1,18 @@
 #include "../aida_pro.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <iomanip>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -751,6 +755,1154 @@ bool is_call_arg_literal(const cfunc_t& cf, ea_t call_ea, int arg_idx)
     return false;
 }
 
+namespace
+{
+
+inline std::string ascii_lower_copy(const std::string& s)
+{
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s)
+        out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    return out;
+}
+
+inline bool name_matches_signature_local(const std::string& callee, std::string_view sig)
+{
+    if (callee.empty() || sig.empty())
+        return false;
+    const std::string c = ascii_lower_copy(callee);
+    const std::string stripped = ascii_lower_copy(strip_known_prefixes(callee));
+    const std::string s(sig);
+    const std::string sl = ascii_lower_copy(s);
+    if (c == sl || stripped == sl)
+        return true;
+    if (c.size() > sl.size() && c.compare(c.size() - sl.size(), sl.size(), sl) == 0)
+        return true;
+    if (stripped.size() > sl.size() && stripped.compare(stripped.size() - sl.size(), sl.size(), sl) == 0)
+        return true;
+    return false;
+}
+
+inline bool ea_in_code_segment_local(ea_t ea)
+{
+    if (ea == BADADDR || !is_loaded(ea))
+        return false;
+    segment_t* seg = getseg(ea);
+    return seg != nullptr && seg->type == SEG_CODE;
+}
+
+inline std::string function_name_for_local(ea_t func_ea)
+{
+    if (func_ea == BADADDR)
+        return std::string();
+    qstring nm;
+    if (get_func_name(&nm, func_ea) > 0 && !nm.empty())
+        return std::string(nm.c_str());
+    if (get_name(&nm, func_ea) > 0 && !nm.empty())
+        return std::string(nm.c_str());
+    std::ostringstream ss;
+    ss << "sub_" << std::hex << std::uppercase << static_cast<std::uint64_t>(func_ea);
+    return ss.str();
+}
+
+inline std::string target_name_for_call(const cexpr_t* call_expr)
+{
+    if (call_expr == nullptr || call_expr->op != cot_call || call_expr->x == nullptr)
+        return std::string();
+    const cexpr_t* x = call_expr->x;
+    while (x != nullptr && (x->op == cot_cast || x->op == cot_ref) && x->x != nullptr)
+        x = x->x;
+    if (x == nullptr)
+        return std::string();
+    if (x->op == cot_helper && x->helper != nullptr)
+        return std::string(x->helper);
+    if (x->op == cot_obj && x->obj_ea != BADADDR)
+    {
+        qstring nm;
+        if (get_func_name(&nm, x->obj_ea) > 0 && !nm.empty())
+            return std::string(nm.c_str());
+        if (get_name(&nm, x->obj_ea) > 0 && !nm.empty())
+            return std::string(nm.c_str());
+    }
+    return std::string();
+}
+
+struct func_call_index_cache_t
+{
+    std::string hash;
+    std::unordered_map<ea_t, std::vector<call_index_entry_t>> entries;
+};
+
+func_call_index_cache_t& call_index_cache()
+{
+    static func_call_index_cache_t c;
+    return c;
+}
+
+std::vector<call_index_entry_t> build_function_call_index(ea_t func_ea)
+{
+    std::vector<call_index_entry_t> out;
+    if (func_ea == BADADDR)
+        return out;
+    if (!init_hexrays_plugin())
+        return out;
+    func_t* pfn = get_func(func_ea);
+    if (pfn == nullptr)
+        return out;
+    func_ea = pfn->start_ea;
+    if (!ida_utils::is_safely_decompilable(pfn))
+        return out;
+    cfuncptr_t cf(nullptr);
+    try
+    {
+        cf = decompile_func(pfn, nullptr, DECOMP_NO_WAIT);
+    }
+    catch (const vd_failure_t&)
+    {
+        cf.reset();
+    }
+    catch (...)
+    {
+        cf.reset();
+    }
+    if (!cf)
+        return out;
+    call_visitor_t visitor(cf.operator->(), [&](cexpr_t* e) {
+        if (e == nullptr || e->op != cot_call)
+            return;
+        call_index_entry_t ci;
+        ci.func_ea = func_ea;
+        ci.call_ea = e->ea;
+        ci.callee_ea = resolve_call_target_ea(e);
+        ci.callee_name = target_name_for_call(e);
+        if (ci.callee_name.empty() && ci.callee_ea != BADADDR)
+            ci.callee_name = function_name_for_local(ci.callee_ea);
+        callsite_t tmp;
+        fill_callsite_args(cf.operator->(), e, tmp);
+        ci.arg_is_literal = std::move(tmp.arg_is_literal);
+        out.push_back(std::move(ci));
+    });
+    visitor.apply_to(&cf->body, nullptr);
+    std::sort(out.begin(), out.end(), [](const call_index_entry_t& a, const call_index_entry_t& b) {
+        return a.call_ea < b.call_ea;
+    });
+    return out;
+}
+
+inline void reset_call_index_if_needed()
+{
+    func_call_index_cache_t& c = call_index_cache();
+    const std::string hash = aida_db::AnalysisDB::instance().get_binary_hash();
+    if (c.hash != hash)
+    {
+        c.hash = hash;
+        c.entries.clear();
+    }
+}
+
+template <typename ArrayT>
+void append_source_names(std::vector<std::string>& out, const ArrayT& arr)
+{
+    for (const auto& s : arr)
+        out.emplace_back(s.name);
+}
+
+template <typename ArrayT>
+void append_sink_names(std::vector<std::string>& out, const ArrayT& arr)
+{
+    for (const auto& s : arr)
+        out.emplace_back(s.name);
+}
+
+inline std::vector<std::string> names_for_source_category(const std::string& category)
+{
+    std::vector<std::string> names;
+    const std::string cat = ascii_lower_copy(category.empty() ? std::string("all") : category);
+    if (cat == "all" || cat == "network" || cat == "socket")
+        append_source_names(names, sig::SOCKET_ACCEPT_SOURCES);
+    if (cat == "all" || cat == "network" || cat == "http")
+        append_source_names(names, sig::HTTP_SERVER_SOURCES);
+    if (cat == "all" || cat == "network" || cat == "websocket")
+        append_source_names(names, sig::WEBSOCKET_SOURCES);
+    if (cat == "all" || cat == "rpc")
+        append_source_names(names, sig::RPC_SERVER_SINKS);
+    if (cat == "all" || cat == "com")
+        append_source_names(names, sig::COM_SERVER_SINKS);
+    if (cat == "all" || cat == "alpc")
+        append_source_names(names, sig::ALPC_SOURCES);
+    if (cat == "all" || cat == "pipe" || cat == "named_pipe")
+        append_source_names(names, sig::NAMED_PIPE_SOURCES);
+    if (cat == "all" || cat == "ndis" || cat == "wsk")
+        append_source_names(names, sig::NDIS_WSK_SOURCES);
+    if (cat == "all" || cat == "kernel" || cat == "kernel_irp")
+        append_source_names(names, sig::KERNEL_IRP_SOURCES);
+    if (cat == "all" || cat == "classic_input" || cat == "input")
+        append_source_names(names, sig::INPUT_SOURCES);
+    std::sort(names.begin(), names.end());
+    names.erase(std::unique(names.begin(), names.end()), names.end());
+    return names;
+}
+
+inline std::vector<std::string> names_for_sink_category(const std::string& category)
+{
+    std::vector<std::string> names;
+    const std::string cat = ascii_lower_copy(category.empty() ? std::string("all") : category);
+    if (cat == "all" || cat == "buffer_overflow" || cat == "memory")
+        append_sink_names(names, sig::BUFFER_OVERFLOW_SINKS);
+    if (cat == "all" || cat == "command_injection")
+        append_sink_names(names, sig::COMMAND_INJECTION_SINKS);
+    if (cat == "all" || cat == "path_traversal")
+        append_sink_names(names, sig::PATH_TRAVERSAL_SINKS);
+    if (cat == "all" || cat == "format_string")
+        append_sink_names(names, sig::FORMAT_STRING_FUNCS);
+    if (cat == "all" || cat == "safearray")
+        append_sink_names(names, sig::SAFEARRAY_PARSER_SINKS);
+    if (cat == "all" || cat == "deserialization")
+        append_sink_names(names, sig::DESERIALIZATION_SINKS);
+    std::sort(names.begin(), names.end());
+    names.erase(std::unique(names.begin(), names.end()), names.end());
+    return names;
+}
+
+inline bool call_name_in_array(const std::string& name, const std::vector<std::string>& names)
+{
+    for (const auto& n : names)
+    {
+        if (name_matches_signature_local(name, n))
+            return true;
+    }
+    return false;
+}
+
+struct len_compare_visitor_t : public ctree_visitor_t
+{
+    cfunc_t* cf = nullptr;
+    int count = 0;
+    explicit len_compare_visitor_t(cfunc_t* f) : ctree_visitor_t(CV_FAST), cf(f) {}
+    bool expr_has_len_name(cexpr_t* e)
+    {
+        if (e == nullptr || cf == nullptr)
+            return false;
+        if (e->op == cot_var)
+        {
+            lvars_t* lv = cf->get_lvars();
+            if (lv != nullptr && e->v.idx >= 0 && static_cast<std::size_t>(e->v.idx) < lv->size())
+            {
+                std::string nm = ascii_lower_copy((*lv)[e->v.idx].name.c_str());
+                return nm.find("len") != std::string::npos ||
+                       nm.find("size") != std::string::npos ||
+                       nm.find("count") != std::string::npos ||
+                       nm.find("cb") != std::string::npos ||
+                       nm.find("cch") != std::string::npos;
+            }
+        }
+        if (e->x != nullptr && expr_has_len_name(e->x))
+            return true;
+        if (e->y != nullptr && expr_has_len_name(e->y))
+            return true;
+        return false;
+    }
+    int idaapi visit_expr(cexpr_t* e) override
+    {
+        if (e == nullptr)
+            return 0;
+        if (e->op == cot_sle || e->op == cot_sge || e->op == cot_slt || e->op == cot_sgt ||
+            e->op == cot_ule || e->op == cot_uge || e->op == cot_ult || e->op == cot_ugt)
+        {
+            if (expr_has_len_name(e->x) || expr_has_len_name(e->y))
+                ++count;
+        }
+        return 0;
+    }
+};
+
+inline json callsite_json_with_name(const callsite_t& cs)
+{
+    json j = to_json(cs);
+    j["caller_name"] = function_name_for_local(cs.func_ea);
+    return j;
+}
+
+inline json validator_summary_to_json(const validator_summary_t& s)
+{
+    json j;
+    j["func_ea"] = static_cast<std::uint64_t>(s.func_ea);
+    j["func_name"] = function_name_for_local(s.func_ea);
+    j["length_size_comparisons"] = s.length_size_comparisons;
+    j["validators_seen"] = s.validators_seen;
+    j["auth_gates_seen"] = s.auth_gates_seen;
+    j["integer_math_seen"] = s.integer_math_seen;
+    j["validator_call_eas"] = json::array();
+    for (ea_t e : s.validator_call_eas)
+        j["validator_call_eas"].push_back(static_cast<std::uint64_t>(e));
+    j["auth_gate_call_eas"] = json::array();
+    for (ea_t e : s.auth_gate_call_eas)
+        j["auth_gate_call_eas"].push_back(static_cast<std::uint64_t>(e));
+    j["integer_math_call_eas"] = json::array();
+    for (ea_t e : s.integer_math_call_eas)
+        j["integer_math_call_eas"].push_back(static_cast<std::uint64_t>(e));
+    return j;
+}
+
+inline bool summary_has_validator(const validator_summary_t& s)
+{
+    return !s.validators_seen.empty() || s.length_size_comparisons > 0 || !s.integer_math_seen.empty();
+}
+
+inline bool summary_has_auth(const validator_summary_t& s)
+{
+    return !s.auth_gates_seen.empty();
+}
+
+inline std::uint64_t fnv1a64(const std::string& s)
+{
+    std::uint64_t h = 1469598103934665603ull;
+    for (unsigned char c : s)
+    {
+        h ^= static_cast<std::uint64_t>(c);
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+inline std::string binary_cache_token()
+{
+    std::ostringstream ss;
+    ss << aida_db::AnalysisDB::instance().get_binary_hash()
+       << "|sig=" << sig::SIGNATURE_DATABASE_REVISION
+       << "|schema=" << CACHE_SCHEMA_REVISION;
+    return ss.str();
+}
+
+std::optional<json> finding_cache_lookup(const std::string& type, const std::string& key)
+{
+    const std::string hash = aida_db::AnalysisDB::instance().get_binary_hash();
+    if (hash.empty())
+        return std::nullopt;
+    const ea_t key_ea = static_cast<ea_t>(fnv1a64(binary_cache_token() + "|" + key));
+    auto entries = aida_db::AnalysisDB::instance().get_analysis(hash, key_ea);
+    for (const auto& e : entries)
+    {
+        if (e.analysis_type == type && !e.result.empty())
+        {
+            try
+            {
+                return json::parse(e.result);
+            }
+            catch (...)
+            {
+                return std::nullopt;
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+void finding_cache_store(const std::string& type, const std::string& key, const json& value)
+{
+    const std::string hash = aida_db::AnalysisDB::instance().get_binary_hash();
+    if (hash.empty())
+        return;
+    aida_db::analysis_entry_t entry;
+    entry.address = static_cast<ea_t>(fnv1a64(binary_cache_token() + "|" + key));
+    entry.function_name.clear();
+    entry.analysis_type = type;
+    entry.result = value.dump();
+    entry.model_name = "static";
+    entry.timestamp_ms = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    aida_db::AnalysisDB::instance().add_analysis(hash, entry);
+}
+
+inline std::vector<ea_t> unique_func_eas_from_calls(const std::vector<callsite_t>& calls)
+{
+    std::vector<ea_t> funcs;
+    for (const auto& cs : calls)
+    {
+        if (cs.func_ea != BADADDR)
+            funcs.push_back(cs.func_ea);
+    }
+    std::sort(funcs.begin(), funcs.end());
+    funcs.erase(std::unique(funcs.begin(), funcs.end()), funcs.end());
+    return funcs;
+}
+
+}
+
+std::vector<callsite_t> all_calls_to_public_wrapper(const std::vector<std::string>& target_names,
+                                                    std::size_t limit,
+                                                    std::vector<std::string>* unresolved_names,
+                                                    bool* capped)
+{
+    if (capped != nullptr)
+        *capped = false;
+    if (unresolved_names != nullptr)
+        unresolved_names->clear();
+    if (target_names.empty())
+        return {};
+    std::vector<std::string> names;
+    names.reserve(target_names.size());
+    std::unordered_set<std::string> seen_names;
+    const name_index_t& idx = cached_name_index();
+    for (const auto& raw : target_names)
+    {
+        if (raw.empty())
+            continue;
+        if (!seen_names.insert(raw).second)
+            continue;
+        names.push_back(raw);
+        if (unresolved_names != nullptr && idx.by_name.find(raw) == idx.by_name.end() &&
+            get_name_ea(BADADDR, raw.c_str()) == BADADDR)
+        {
+            unresolved_names->push_back(raw);
+        }
+    }
+    std::vector<callsite_t> calls = all_calls_to(names);
+    if (limit > 0 && calls.size() > limit)
+    {
+        calls.resize(limit);
+        if (capped != nullptr)
+            *capped = true;
+    }
+    return calls;
+}
+
+std::vector<call_index_entry_t> per_function_call_index(ea_t func_ea)
+{
+    if (func_ea == BADADDR)
+        return {};
+    func_t* pfn = get_func(func_ea);
+    if (pfn == nullptr)
+        return {};
+    func_ea = pfn->start_ea;
+    reset_call_index_if_needed();
+    func_call_index_cache_t& c = call_index_cache();
+    auto it = c.entries.find(func_ea);
+    if (it != c.entries.end())
+        return it->second;
+    std::vector<call_index_entry_t> built = build_function_call_index(func_ea);
+    c.entries.emplace(func_ea, built);
+    return built;
+}
+
+validator_summary_t summarize_validators_in_function(ea_t func_ea)
+{
+    validator_summary_t out;
+    func_t* pfn = get_func(func_ea);
+    if (pfn == nullptr)
+        return out;
+    out.func_ea = pfn->start_ea;
+    std::set<std::string> vals;
+    std::set<std::string> auths;
+    std::set<std::string> maths;
+    for (const auto& ci : per_function_call_index(out.func_ea))
+    {
+        for (auto v : sig::LENGTH_VALIDATOR_HELPERS)
+        {
+            if (name_matches_signature_local(ci.callee_name, v))
+            {
+                vals.insert(std::string(v));
+                out.validator_call_eas.push_back(ci.call_ea);
+            }
+        }
+        for (auto v : sig::AUTH_GATE_HELPERS)
+        {
+            if (name_matches_signature_local(ci.callee_name, v))
+            {
+                auths.insert(std::string(v));
+                out.auth_gate_call_eas.push_back(ci.call_ea);
+            }
+        }
+        for (auto v : sig::INTEGER_MATH_HELPERS)
+        {
+            if (name_matches_signature_local(ci.callee_name, v))
+            {
+                maths.insert(std::string(v));
+                out.integer_math_call_eas.push_back(ci.call_ea);
+            }
+        }
+    }
+    out.validators_seen.assign(vals.begin(), vals.end());
+    out.auth_gates_seen.assign(auths.begin(), auths.end());
+    out.integer_math_seen.assign(maths.begin(), maths.end());
+    cfuncptr_t cf(nullptr);
+    if (init_hexrays_plugin() && ida_utils::is_safely_decompilable(pfn))
+    {
+        try
+        {
+            cf = decompile_func(pfn, nullptr, DECOMP_NO_WAIT);
+        }
+        catch (...)
+        {
+            cf.reset();
+        }
+    }
+    if (cf)
+    {
+        len_compare_visitor_t v(cf.operator->());
+        v.apply_to(&cf->body, nullptr);
+        out.length_size_comparisons = v.count;
+    }
+    return out;
+}
+
+nlohmann::json reverse_slice_sink_to_sources(ea_t sink_call_ea,
+                                             int max_depth,
+                                             const std::string& source_category,
+                                             int max_paths,
+                                             bool require_no_validator,
+                                             bool require_pre_auth)
+{
+    if (max_depth <= 0)
+        max_depth = 6;
+    if (max_depth > 12)
+        max_depth = 12;
+    if (max_paths <= 0)
+        max_paths = 8;
+    if (max_paths > 32)
+        max_paths = 32;
+    json data;
+    data["sink_call_ea"] = static_cast<std::uint64_t>(sink_call_ea);
+    data["paths"] = json::array();
+    data["more_paths_truncated"] = false;
+    func_t* sink_func = get_func(sink_call_ea);
+    if (sink_func == nullptr)
+        return data;
+    std::vector<std::string> source_names = names_for_source_category(source_category);
+    std::vector<callsite_t> sources = all_calls_to(source_names);
+    std::unordered_set<ea_t> source_funcs;
+    for (const auto& cs : sources)
+        source_funcs.insert(cs.func_ea);
+    std::deque<std::pair<ea_t, std::vector<ea_t>>> q;
+    std::unordered_set<ea_t> visited;
+    q.push_back({sink_func->start_ea, {sink_func->start_ea}});
+    visited.insert(sink_func->start_ea);
+    while (!q.empty())
+    {
+        auto cur = q.front();
+        q.pop_front();
+        ea_t fea = cur.first;
+        int depth = static_cast<int>(cur.second.size()) - 1;
+        validator_summary_t sum = summarize_validators_in_function(fea);
+        if (source_funcs.count(fea) != 0)
+        {
+            bool passes_validator = summary_has_validator(sum);
+            bool passes_auth = summary_has_auth(sum);
+            for (ea_t hop : cur.second)
+            {
+                if (hop == fea)
+                    continue;
+                validator_summary_t hs = summarize_validators_in_function(hop);
+                passes_validator = passes_validator || summary_has_validator(hs);
+                passes_auth = passes_auth || summary_has_auth(hs);
+            }
+            if ((!require_no_validator || !passes_validator) &&
+                (!require_pre_auth || !passes_auth))
+            {
+                json p;
+                p["functions"] = json::array();
+                for (ea_t hop : cur.second)
+                    p["functions"].push_back(static_cast<std::uint64_t>(hop));
+                p["call_eas"] = json::array({static_cast<std::uint64_t>(sink_call_ea)});
+                p["validators_seen"] = json::array();
+                p["auth_gates_seen"] = json::array();
+                for (ea_t hop : cur.second)
+                {
+                    validator_summary_t hs = summarize_validators_in_function(hop);
+                    for (const auto& v : hs.validators_seen)
+                        p["validators_seen"].push_back(v);
+                    for (const auto& v : hs.integer_math_seen)
+                        p["validators_seen"].push_back(v);
+                    for (const auto& v : hs.auth_gates_seen)
+                        p["auth_gates_seen"].push_back(v);
+                }
+                p["passes_validator"] = passes_validator;
+                p["passes_auth_gate"] = passes_auth;
+                data["paths"].push_back(std::move(p));
+                if (static_cast<int>(data["paths"].size()) >= max_paths)
+                {
+                    data["more_paths_truncated"] = true;
+                    break;
+                }
+            }
+        }
+        if (depth >= max_depth)
+            continue;
+        xrefblk_t xb;
+        for (bool ok = xb.first_to(fea, XREF_ALL); ok; ok = xb.next_to())
+        {
+            if (!xb.iscode || (xb.type != fl_CN && xb.type != fl_CF))
+                continue;
+            func_t* caller = get_func(xb.from);
+            if (caller == nullptr)
+                continue;
+            if (!visited.insert(caller->start_ea).second)
+                continue;
+            std::vector<ea_t> next = cur.second;
+            next.push_back(caller->start_ea);
+            q.push_back({caller->start_ea, std::move(next)});
+        }
+    }
+    data["count"] = data["paths"].size();
+    return data;
+}
+
+nlohmann::json forward_reachability_source_to_sinks(ea_t source_func_ea,
+                                                    int max_depth,
+                                                    const std::string& sink_category,
+                                                    int max_hits,
+                                                    bool require_no_validator)
+{
+    if (max_depth <= 0)
+        max_depth = 6;
+    if (max_depth > 12)
+        max_depth = 12;
+    if (max_hits <= 0)
+        max_hits = 64;
+    if (max_hits > 512)
+        max_hits = 512;
+    json data;
+    data["source_func_ea"] = static_cast<std::uint64_t>(source_func_ea);
+    data["hits"] = json::array();
+    data["truncated"] = false;
+    func_t* start = get_func(source_func_ea);
+    if (start == nullptr)
+        return data;
+    source_func_ea = start->start_ea;
+    std::vector<std::string> sink_names = names_for_sink_category(sink_category);
+    std::vector<callsite_t> sinks = all_calls_to(sink_names);
+    std::unordered_map<ea_t, std::vector<callsite_t>> sinks_by_func;
+    for (const auto& cs : sinks)
+        sinks_by_func[cs.func_ea].push_back(cs);
+    std::deque<std::pair<ea_t, int>> q;
+    std::unordered_set<ea_t> visited;
+    q.push_back({source_func_ea, 0});
+    visited.insert(source_func_ea);
+    while (!q.empty())
+    {
+        auto [cur, depth] = q.front();
+        q.pop_front();
+        validator_summary_t sum = summarize_validators_in_function(cur);
+        auto hit_it = sinks_by_func.find(cur);
+        if (hit_it != sinks_by_func.end())
+        {
+            bool has_val = summary_has_validator(sum);
+            if (!require_no_validator || !has_val)
+            {
+                for (const auto& cs : hit_it->second)
+                {
+                    json h = callsite_json_with_name(cs);
+                    h["depth"] = depth;
+                    h["validator_summary"] = validator_summary_to_json(sum);
+                    h["passes_validator"] = has_val;
+                    data["hits"].push_back(std::move(h));
+                    if (static_cast<int>(data["hits"].size()) >= max_hits)
+                    {
+                        data["truncated"] = true;
+                        data["count"] = data["hits"].size();
+                        return data;
+                    }
+                }
+            }
+        }
+        if (depth >= max_depth)
+            continue;
+        func_t* pfn = get_func(cur);
+        if (pfn == nullptr)
+            continue;
+        func_item_iterator_t fii(pfn);
+        for (bool ok = fii.first(); ok; ok = fii.next_head())
+        {
+            ea_t item = fii.current();
+            xrefblk_t xb;
+            for (bool ix = xb.first_from(item, XREF_ALL); ix; ix = xb.next_from())
+            {
+                if (!xb.iscode || (xb.type != fl_CN && xb.type != fl_CF))
+                    continue;
+                func_t* callee = get_func(xb.to);
+                if (callee == nullptr)
+                    continue;
+                if (!visited.insert(callee->start_ea).second)
+                    continue;
+                q.push_back({callee->start_ea, depth + 1});
+            }
+        }
+    }
+    data["count"] = data["hits"].size();
+    return data;
+}
+
+nlohmann::json protocol_attack_surface_report()
+{
+    const std::string cache_key = "protocol_attack_surface_report";
+    if (auto cached = finding_cache_lookup("vuln_protocol_surface_v1", cache_key); cached.has_value())
+    {
+        (*cached)["cached"] = true;
+        return *cached;
+    }
+    struct family_t { const char* name; std::vector<std::string> names; };
+    std::vector<family_t> fams;
+    fams.push_back({"rpc", names_for_source_category("rpc")});
+    fams.push_back({"com", names_for_source_category("com")});
+    fams.push_back({"alpc", names_for_source_category("alpc")});
+    fams.push_back({"pipe", names_for_source_category("pipe")});
+    fams.push_back({"socket", names_for_source_category("socket")});
+    fams.push_back({"http", names_for_source_category("http")});
+    fams.push_back({"websocket", names_for_source_category("websocket")});
+    fams.push_back({"ndis", names_for_source_category("ndis")});
+    fams.push_back({"kernel_irp", names_for_source_category("kernel_irp")});
+    json data;
+    data["binary_kind"] = "user";
+    if (aida::vuln::kernel_engine::is_kernel_driver())
+        data["binary_kind"] = "kernel_driver";
+    data["families"] = json::object();
+    for (const auto& fam : fams)
+    {
+        json ingress = json::array();
+        std::vector<callsite_t> calls = all_calls_to(fam.names);
+        std::unordered_map<ea_t, std::vector<callsite_t>> by_func;
+        for (const auto& cs : calls)
+            by_func[cs.func_ea].push_back(cs);
+        for (const auto& kv : by_func)
+        {
+            json e;
+            e["func_ea"] = static_cast<std::uint64_t>(kv.first);
+            e["name"] = function_name_for_local(kv.first);
+            e["callsites"] = kv.second.size();
+            e["role"] = aida::vuln::surface_engine::classify_function_role(kv.first);
+            json fw = forward_reachability_source_to_sinks(kv.first, 4, "all", 32, false);
+            e["downstream_sinks"] = fw.value("count", static_cast<std::size_t>(0));
+            e["callsite_eas"] = json::array();
+            for (const auto& cs : kv.second)
+                e["callsite_eas"].push_back(static_cast<std::uint64_t>(cs.call_ea));
+            ingress.push_back(std::move(e));
+        }
+        data["families"][fam.name]["ingress"] = std::move(ingress);
+    }
+    data["cached"] = false;
+    finding_cache_store("vuln_protocol_surface_v1", cache_key, data);
+    return data;
+}
+
+nlohmann::json find_pre_auth_paths(const std::string& source_category,
+                                   const std::string& sink_category,
+                                   int max_depth,
+                                   int max_paths,
+                                   bool require_no_validator)
+{
+    const std::string key = "preauth|" + source_category + "|" + sink_category + "|" +
+                            std::to_string(max_depth) + "|" + std::to_string(max_paths) +
+                            "|" + (require_no_validator ? "1" : "0");
+    if (auto cached = finding_cache_lookup("vuln_preauth_paths_v1", key); cached.has_value())
+    {
+        (*cached)["cached"] = true;
+        return *cached;
+    }
+    if (max_paths <= 0)
+        max_paths = 32;
+    if (max_paths > 128)
+        max_paths = 128;
+    json data;
+    data["paths"] = json::array();
+    data["source_category"] = source_category;
+    data["sink_category"] = sink_category;
+    data["truncated"] = false;
+    std::vector<callsite_t> sources = all_calls_to(names_for_source_category(source_category));
+    std::vector<ea_t> funcs = unique_func_eas_from_calls(sources);
+    for (ea_t fea : funcs)
+    {
+        json fwd = forward_reachability_source_to_sinks(fea, max_depth, sink_category, max_paths, require_no_validator);
+        for (const auto& hit : fwd["hits"])
+        {
+            bool passes_auth = false;
+            if (hit.contains("validator_summary") && hit["validator_summary"].is_object())
+                passes_auth = !hit["validator_summary"].value("auth_gates_seen", json::array()).empty();
+            if (passes_auth)
+                continue;
+            data["paths"].push_back(hit);
+            if (static_cast<int>(data["paths"].size()) >= max_paths)
+            {
+                data["truncated"] = true;
+                break;
+            }
+        }
+        if (data["truncated"].get<bool>())
+            break;
+    }
+    data["count"] = data["paths"].size();
+    data["cached"] = false;
+    finding_cache_store("vuln_preauth_paths_v1", key, data);
+    return data;
+}
+
+nlohmann::json find_dispatch_tables(int min_entries,
+                                    int max_entries,
+                                    bool include_vtables)
+{
+    if (min_entries <= 0)
+        min_entries = 4;
+    if (min_entries > 1024)
+        min_entries = 1024;
+    if (max_entries <= 0)
+        max_entries = 256;
+    if (max_entries > 4096)
+        max_entries = 4096;
+    if (max_entries < min_entries)
+        max_entries = min_entries;
+    const std::string key = "dispatch|" + std::to_string(min_entries) + "|" +
+                            std::to_string(max_entries) + "|" + (include_vtables ? "1" : "0");
+    if (auto cached = finding_cache_lookup("vuln_dispatch_tables_v1", key); cached.has_value())
+    {
+        (*cached)["cached"] = true;
+        return *cached;
+    }
+    const bool is64 = inf_is_64bit();
+    const ea_t step = is64 ? 8 : 4;
+    json tables = json::array();
+    const int qty = get_segm_qty();
+    for (int i = 0; i < qty; ++i)
+    {
+        segment_t* seg = getnseg(i);
+        if (seg == nullptr || seg->start_ea >= seg->end_ea)
+            continue;
+        if (seg->type == SEG_CODE)
+            continue;
+        if (seg->perm != 0 && (seg->perm & SEGPERM_WRITE) != 0)
+            continue;
+        for (ea_t ea = seg->start_ea; ea + step <= seg->end_ea;)
+        {
+            std::vector<ea_t> slots;
+            ea_t cur = ea;
+            while (cur + step <= seg->end_ea && static_cast<int>(slots.size()) < max_entries)
+            {
+                if (!is_loaded(cur))
+                    break;
+                ea_t target = is64 ? static_cast<ea_t>(get_qword(cur))
+                                   : static_cast<ea_t>(get_dword(cur));
+                if (target == 0 || !ea_in_code_segment_local(target))
+                    break;
+                func_t* tf = get_func(target);
+                if (tf == nullptr || tf->start_ea != target)
+                    break;
+                slots.push_back(target);
+                cur += step;
+            }
+            if (static_cast<int>(slots.size()) >= min_entries)
+            {
+                qstring nm;
+                std::string near_name;
+                if (get_name(&nm, ea) > 0 && !nm.empty())
+                    near_name = nm.c_str();
+                bool likely_vtable = near_name.find("vft") != std::string::npos ||
+                                     near_name.find("vtable") != std::string::npos ||
+                                     near_name.find("RTTI") != std::string::npos;
+                if (include_vtables || !likely_vtable)
+                {
+                    json t;
+                    t["table_ea"] = static_cast<std::uint64_t>(ea);
+                    t["entry_count"] = slots.size();
+                    t["pointer_size"] = static_cast<int>(step);
+                    t["near_name"] = near_name;
+                    t["likely_vtable"] = likely_vtable;
+                    t["entries"] = json::array();
+                    for (ea_t s : slots)
+                    {
+                        json e;
+                        e["ea"] = static_cast<std::uint64_t>(s);
+                        e["name"] = function_name_for_local(s);
+                        t["entries"].push_back(std::move(e));
+                    }
+                    tables.push_back(std::move(t));
+                }
+                ea = cur;
+            }
+            else
+            {
+                ea += step;
+            }
+        }
+    }
+    json data;
+    data["count"] = tables.size();
+    data["tables"] = std::move(tables);
+    data["pointer_size"] = static_cast<int>(step);
+    data["cached"] = false;
+    finding_cache_store("vuln_dispatch_tables_v1", key, data);
+    return data;
+}
+
+namespace
+{
+
+struct parser_shape_visitor_t : public ctree_visitor_t
+{
+    cfunc_t* cf = nullptr;
+    int loops = 0;
+    int switches = 0;
+    int max_cases = 0;
+    int idx_nonliteral = 0;
+    int byte_ops = 0;
+    int copy_calls_in_loop = 0;
+    int loop_depth = 0;
+    explicit parser_shape_visitor_t(cfunc_t* f) : ctree_visitor_t(CV_PARENTS), cf(f) {}
+    int idaapi visit_insn(cinsn_t* ins) override
+    {
+        if (ins == nullptr)
+            return 0;
+        if (ins->op == cit_for || ins->op == cit_while || ins->op == cit_do)
+        {
+            ++loops;
+            ++loop_depth;
+        }
+        else if (ins->op == cit_switch && ins->cswitch != nullptr)
+        {
+            ++switches;
+            int cases = 0;
+            for (std::size_t i = 0; i < ins->cswitch->cases.size(); ++i)
+                cases += static_cast<int>(ins->cswitch->cases[i].values.size());
+            if (cases > max_cases)
+                max_cases = cases;
+        }
+        return 0;
+    }
+    int idaapi leave_insn(cinsn_t* ins) override
+    {
+        if (ins != nullptr && (ins->op == cit_for || ins->op == cit_while || ins->op == cit_do) && loop_depth > 0)
+            --loop_depth;
+        return 0;
+    }
+    int idaapi visit_expr(cexpr_t* e) override
+    {
+        if (e == nullptr)
+            return 0;
+        if (e->op == cot_idx && e->y != nullptr)
+        {
+            const cexpr_t* idx = e->y;
+            while (idx != nullptr && (idx->op == cot_cast || idx->op == cot_ref) && idx->x != nullptr)
+                idx = idx->x;
+            if (idx != nullptr && idx->op != cot_num)
+                ++idx_nonliteral;
+        }
+        if (e->op == cot_band || e->op == cot_bor || e->op == cot_xor ||
+            e->op == cot_shl || e->op == cot_sshr || e->op == cot_ushr)
+            ++byte_ops;
+        if (loop_depth > 0 && e->op == cot_call)
+        {
+            std::string nm = target_name_for_call(e);
+            if (name_matches_signature_local(nm, "memcpy") ||
+                name_matches_signature_local(nm, "memmove") ||
+                name_matches_signature_local(nm, "RtlCopyMemory") ||
+                name_matches_signature_local(nm, "RtlMoveMemory"))
+            {
+                ++copy_calls_in_loop;
+            }
+        }
+        return 0;
+    }
+};
+
+struct arith_expr_visitor_t : public ctree_visitor_t
+{
+    bool has_arith = false;
+    arith_expr_visitor_t() : ctree_visitor_t(CV_FAST) {}
+    int idaapi visit_expr(cexpr_t* e) override
+    {
+        if (e != nullptr && (e->op == cot_add || e->op == cot_mul || e->op == cot_shl))
+            has_arith = true;
+        return has_arith ? 1 : 0;
+    }
+};
+
+bool expr_contains_arith(cexpr_t* e)
+{
+    if (e == nullptr)
+        return false;
+    arith_expr_visitor_t v;
+    v.apply_to_exprs(e, nullptr);
+    return v.has_arith;
+}
+
+}
+
+nlohmann::json find_parser_shaped_functions(int top_k, bool only_reachable_from_network)
+{
+    if (top_k <= 0)
+        top_k = 50;
+    if (top_k > 512)
+        top_k = 512;
+    const std::string key = "parser|" + std::to_string(top_k) + "|" +
+                            (only_reachable_from_network ? "1" : "0");
+    if (auto cached = finding_cache_lookup("vuln_parser_shape_v1", key); cached.has_value())
+    {
+        (*cached)["cached"] = true;
+        return *cached;
+    }
+    std::unordered_set<ea_t> reachable;
+    if (only_reachable_from_network)
+    {
+        for (ea_t e : aida::vuln::surface_engine::attacker_reachable_functions())
+            reachable.insert(e);
+    }
+    json rows = json::array();
+    std::vector<std::pair<int, json>> scored;
+    if (init_hexrays_plugin())
+    {
+        const std::size_t fq = get_func_qty();
+        for (std::size_t i = 0; i < fq; ++i)
+        {
+            func_t* pfn = getn_func(i);
+            if (pfn == nullptr)
+                continue;
+            if (only_reachable_from_network && reachable.count(pfn->start_ea) == 0)
+                continue;
+            if (!ida_utils::is_safely_decompilable(pfn))
+                continue;
+            cfuncptr_t cf(nullptr);
+            try
+            {
+                cf = decompile_func(pfn, nullptr, DECOMP_NO_WAIT);
+            }
+            catch (...)
+            {
+                cf.reset();
+            }
+            if (!cf)
+                continue;
+            parser_shape_visitor_t v(cf.operator->());
+            v.apply_to(&cf->body, nullptr);
+            int score = v.loops * 3 + v.idx_nonliteral * 4 + v.copy_calls_in_loop * 5 +
+                        v.switches * 2 + (v.max_cases >= 4 ? v.max_cases : 0) + v.byte_ops;
+            if (score <= 0)
+                continue;
+            json r;
+            r["func_ea"] = static_cast<std::uint64_t>(pfn->start_ea);
+            r["func_name"] = function_name_for_local(pfn->start_ea);
+            r["score"] = score;
+            r["loops"] = v.loops;
+            r["switches"] = v.switches;
+            r["max_cases"] = v.max_cases;
+            r["idx_nonliteral"] = v.idx_nonliteral;
+            r["copy_calls_in_loop"] = v.copy_calls_in_loop;
+            r["byte_ops"] = v.byte_ops;
+            scored.push_back({score, std::move(r)});
+        }
+    }
+    std::sort(scored.begin(), scored.end(), [](const auto& a, const auto& b) {
+        return a.first > b.first;
+    });
+    for (std::size_t i = 0; i < scored.size() && static_cast<int>(i) < top_k; ++i)
+        rows.push_back(std::move(scored[i].second));
+    json data;
+    data["count"] = rows.size();
+    data["functions"] = std::move(rows);
+    data["only_reachable_from_network"] = only_reachable_from_network;
+    data["cached"] = false;
+    finding_cache_store("vuln_parser_shape_v1", key, data);
+    return data;
+}
+
+nlohmann::json find_safearray_misuse(int limit)
+{
+    if (limit <= 0)
+        limit = 64;
+    if (limit > 1024)
+        limit = 1024;
+    std::vector<std::string> names;
+    append_sink_names(names, sig::SAFEARRAY_PARSER_SINKS);
+    std::vector<callsite_t> calls = all_calls_to(names);
+    json findings = json::array();
+    for (const auto& cs : calls)
+    {
+        if (static_cast<int>(findings.size()) >= limit)
+            break;
+        validator_summary_t sum = summarize_validators_in_function(cs.func_ea);
+        bool has_safe_math = !sum.integer_math_seen.empty();
+        if (has_safe_math)
+            continue;
+        json f;
+        f["call_ea"] = static_cast<std::uint64_t>(cs.call_ea);
+        f["func_ea"] = static_cast<std::uint64_t>(cs.func_ea);
+        f["func_name"] = function_name_for_local(cs.func_ea);
+        f["callee"] = cs.callee_name;
+        f["cwe"] = 129;
+        f["confidence"] = "plausible";
+        f["rationale"] = "SAFEARRAY parser call occurs in a function with no recognized checked multiply or bounds helper";
+        findings.push_back(std::move(f));
+    }
+    json data;
+    data["count"] = findings.size();
+    data["findings"] = std::move(findings);
+    data["limit"] = limit;
+    return data;
+}
+
+nlohmann::json find_int_overflow_alloc_from_input(int limit)
+{
+    if (limit <= 0)
+        limit = 64;
+    if (limit > 1024)
+        limit = 1024;
+    std::vector<std::string> allocs;
+    for (auto a : sig::ALLOC_FUNCS)
+        allocs.emplace_back(a);
+    std::vector<callsite_t> calls = all_calls_to(allocs);
+    std::unordered_set<ea_t> input_funcs;
+    for (const auto& cs : input_source_callsites())
+        input_funcs.insert(cs.func_ea);
+    json findings = json::array();
+    decompile_cache_t cache;
+    for (const auto& cs : calls)
+    {
+        if (static_cast<int>(findings.size()) >= limit)
+            break;
+        cfunc_t* cf = cache.fetch(cs.func_ea);
+        if (cf == nullptr)
+            continue;
+        cexpr_t* found = nullptr;
+        call_visitor_t vis(cf, [&](cexpr_t* e) {
+            if (found != nullptr || e == nullptr || e->ea != cs.call_ea || e->a == nullptr)
+                return;
+            found = e;
+        });
+        vis.apply_to(&cf->body, nullptr);
+        if (found == nullptr || found->a == nullptr || found->a->empty())
+            continue;
+        bool arith = false;
+        for (std::size_t i = 0; i < found->a->size(); ++i)
+        {
+            cexpr_t* arg = static_cast<cexpr_t*>(&(*found->a)[i]);
+            if (expr_contains_arith(arg))
+            {
+                arith = true;
+                break;
+            }
+        }
+        if (!arith)
+            continue;
+        validator_summary_t sum = summarize_validators_in_function(cs.func_ea);
+        if (!sum.integer_math_seen.empty())
+            continue;
+        bool near_input = input_funcs.count(cs.func_ea) != 0;
+        json f;
+        f["call_ea"] = static_cast<std::uint64_t>(cs.call_ea);
+        f["func_ea"] = static_cast<std::uint64_t>(cs.func_ea);
+        f["func_name"] = function_name_for_local(cs.func_ea);
+        f["callee"] = cs.callee_name;
+        f["cwe"] = 190;
+        f["near_input_source"] = near_input;
+        f["confidence"] = near_input ? "likely" : "plausible";
+        f["rationale"] = "Allocation size argument contains add/mul/shift arithmetic and no recognized checked integer helper in the function";
+        findings.push_back(std::move(f));
+    }
+    json data;
+    data["count"] = findings.size();
+    data["findings"] = std::move(findings);
+    data["limit"] = limit;
+    return data;
+}
+
 namespace tools
 {
 
@@ -798,6 +1950,52 @@ inline std::string extract_string_param(const json& params, const std::string& k
     if (it->is_string())
         return it->get<std::string>();
     return default_value;
+}
+
+inline bool extract_bool_param(const json& params, const std::string& key, bool default_value)
+{
+    if (!params.is_object())
+        return default_value;
+    auto it = params.find(key);
+    if (it == params.end() || it->is_null())
+        return default_value;
+    if (it->is_boolean())
+        return it->get<bool>();
+    if (it->is_number_integer())
+        return it->get<int>() != 0;
+    if (it->is_string())
+    {
+        const std::string v = ascii_lower_copy(it->get<std::string>());
+        if (v == "true" || v == "1" || v == "yes")
+            return true;
+        if (v == "false" || v == "0" || v == "no")
+            return false;
+    }
+    return default_value;
+}
+
+inline std::vector<std::string> extract_names_param(const json& params, const std::string& key)
+{
+    std::vector<std::string> names;
+    if (!params.is_object())
+        return names;
+    auto it = params.find(key);
+    if (it == params.end() || it->is_null())
+        return names;
+    if (it->is_string())
+    {
+        names.push_back(it->get<std::string>());
+        return names;
+    }
+    if (it->is_array())
+    {
+        for (const auto& v : *it)
+        {
+            if (v.is_string())
+                names.push_back(v.get<std::string>());
+        }
+    }
+    return names;
 }
 
 inline const char* cwe_name(int id)
@@ -1265,21 +2463,6 @@ agent_tools::tool_result_t handle_find_format_string_bugs(const json& params)
     return agent_tools::tool_result_t::ok(msg.str(), data);
 }
 
-namespace
-{
-
-inline int sensitive_arg_index_for(const std::string& sink_name)
-{
-    if (sink_name == "CreateProcessA" || sink_name == "CreateProcessW" ||
-        sink_name == "CreateProcessAsUserA" || sink_name == "CreateProcessAsUserW")
-        return 1;
-    if (sink_name == "ShellExecuteA" || sink_name == "ShellExecuteW")
-        return 2;
-    if (sink_name == "ShellExecuteExA" || sink_name == "ShellExecuteExW")
-        return -1;
-    return 0;
-}
-
 inline std::vector<vuln_finding_t> scan_dangerous_sinks(const std::vector<sink_with_category_t>& sinks,
                                                        const std::string& category_label,
                                                        severity_t default_severity,
@@ -1293,7 +2476,7 @@ inline std::vector<vuln_finding_t> scan_dangerous_sinks(const std::vector<sink_w
         if (findings.size() >= limit)
             break;
         const std::string sink_name(sk.sink->name);
-        const int arg_idx = sensitive_arg_index_for(sink_name);
+        const int arg_idx = sk.sink->sensitive_arg_index;
         std::vector<callsite_t> calls = all_calls_to({sink_name});
         for (const auto& cs : calls)
         {
@@ -1337,6 +2520,10 @@ inline std::vector<vuln_finding_t> scan_dangerous_sinks(const std::vector<sink_w
                 rat << "; sensitive argument [" << arg_idx << "] = " << sensitive_summary;
                 rat << (sensitive_is_literal ? " (literal)" : " (non-literal, may be attacker-controlled)");
             }
+            else if (arg_idx == sig::STRUCT_INDIRECT)
+            {
+                rat << "; sensitive payload is carried through a structure pointer";
+            }
             f.rationale = rat.str();
             f.evidence  = callsite_evidence(cs);
             f.evidence["category"] = category_label;
@@ -1348,8 +2535,6 @@ inline std::vector<vuln_finding_t> scan_dangerous_sinks(const std::vector<sink_w
     }
 
     return findings;
-}
-
 }
 
 agent_tools::tool_result_t handle_find_command_injection_sites(const json& params)
@@ -1400,9 +2585,144 @@ agent_tools::tool_result_t handle_find_path_traversal_sites(const json& params)
     return agent_tools::tool_result_t::ok(msg.str(), data);
 }
 
+agent_tools::tool_result_t handle_find_calls_to(const json& params)
+{
+    std::vector<std::string> names = extract_names_param(params, "names");
+    if (names.empty())
+        names = extract_names_param(params, "name");
+    if (names.empty())
+        return agent_tools::tool_result_t::error(OBFSTR("names must contain at least one symbol"), "bad_param");
+    if (names.size() > 256)
+        return agent_tools::tool_result_t::error(OBFSTR("find_calls_to accepts at most 256 names"), "bad_param");
+    int limit = extract_int_param(params, "limit", 4096);
+    if (limit <= 0)
+        return agent_tools::tool_result_t::error(OBFSTR("limit must be positive"), "bad_param");
+    if (limit > 16384)
+        limit = 16384;
+    std::vector<std::string> unresolved;
+    bool capped = false;
+    std::vector<callsite_t> calls = all_calls_to_public_wrapper(names, static_cast<std::size_t>(limit),
+                                                                &unresolved, &capped);
+    json arr = json::array();
+    for (const auto& cs : calls)
+        arr.push_back(callsite_json_with_name(cs));
+    json data;
+    data["callsites"] = std::move(arr);
+    data["unresolved_names"] = unresolved;
+    data["count"] = calls.size();
+    data["capped"] = capped;
+    return agent_tools::tool_result_t::ok(OBFSTR("Callsites found: ") + std::to_string(calls.size()), data);
+}
+
+agent_tools::tool_result_t handle_summarize_validators_in_function(const json& params)
+{
+    const std::string addr_s = extract_string_param(params, "address", "");
+    auto parsed = agent_tools::helpers::parse_address(addr_s);
+    if (!parsed.has_value())
+        return agent_tools::tool_result_t::error(OBFSTR("address is required"), "bad_param");
+    func_t* pfn = get_func(*parsed);
+    if (pfn == nullptr)
+        return agent_tools::tool_result_t::error(OBFSTR("address does not lie inside a function"), "no_function_at_addr");
+    validator_summary_t s = summarize_validators_in_function(pfn->start_ea);
+    return agent_tools::tool_result_t::ok(OBFSTR("Validator summary"), validator_summary_to_json(s));
+}
+
+agent_tools::tool_result_t handle_reverse_slice_sink_to_sources(const json& params)
+{
+    const std::string sink_s = extract_string_param(params, "sink_call_ea", "");
+    auto parsed = agent_tools::helpers::parse_address(sink_s);
+    if (!parsed.has_value())
+        return agent_tools::tool_result_t::error(OBFSTR("sink_call_ea is required"), "bad_param");
+    json data = reverse_slice_sink_to_sources(*parsed,
+        extract_int_param(params, "max_depth", 6),
+        extract_string_param(params, "source_category", "network"),
+        extract_int_param(params, "max_paths", 8),
+        extract_bool_param(params, "require_no_validator", false),
+        extract_bool_param(params, "require_pre_auth", false));
+    return agent_tools::tool_result_t::ok(OBFSTR("Reverse slice paths: ") +
+                                          std::to_string(data.value("count", static_cast<std::size_t>(0))), data);
+}
+
+agent_tools::tool_result_t handle_forward_reachability_source_to_sinks(const json& params)
+{
+    const std::string src_s = extract_string_param(params, "source_func_ea", "");
+    auto parsed = agent_tools::helpers::parse_address(src_s);
+    if (!parsed.has_value())
+        return agent_tools::tool_result_t::error(OBFSTR("source_func_ea is required"), "bad_param");
+    func_t* pfn = get_func(*parsed);
+    if (pfn == nullptr)
+        return agent_tools::tool_result_t::error(OBFSTR("source_func_ea does not lie inside a function"), "no_function_at_addr");
+    json data = forward_reachability_source_to_sinks(pfn->start_ea,
+        extract_int_param(params, "max_depth", 6),
+        extract_string_param(params, "sink_category", "all"),
+        extract_int_param(params, "max_hits", 64),
+        extract_bool_param(params, "require_no_validator", false));
+    return agent_tools::tool_result_t::ok(OBFSTR("Forward sink reachability: ") +
+                                          std::to_string(data.value("count", static_cast<std::size_t>(0))), data);
+}
+
+agent_tools::tool_result_t handle_protocol_attack_surface_report(const json&)
+{
+    json data = protocol_attack_surface_report();
+    return agent_tools::tool_result_t::ok(OBFSTR("Protocol attack surface report"), data);
+}
+
+agent_tools::tool_result_t handle_find_pre_auth_paths(const json& params)
+{
+    json data = find_pre_auth_paths(
+        extract_string_param(params, "source_category", "network"),
+        extract_string_param(params, "sink_category", "all"),
+        extract_int_param(params, "max_depth", 6),
+        extract_int_param(params, "max_paths", 32),
+        extract_bool_param(params, "require_no_validator", true));
+    return agent_tools::tool_result_t::ok(OBFSTR("Pre-auth paths: ") +
+                                          std::to_string(data.value("count", static_cast<std::size_t>(0))), data);
+}
+
+agent_tools::tool_result_t handle_find_dispatch_tables(const json& params)
+{
+    json data = find_dispatch_tables(
+        extract_int_param(params, "min_entries", 4),
+        extract_int_param(params, "max_entries", 256),
+        extract_bool_param(params, "include_vtables", true));
+    return agent_tools::tool_result_t::ok(OBFSTR("Dispatch tables: ") +
+                                          std::to_string(data.value("count", static_cast<std::size_t>(0))), data);
+}
+
+agent_tools::tool_result_t handle_find_parser_shaped_functions(const json& params)
+{
+    json data = find_parser_shaped_functions(
+        extract_int_param(params, "top_k", 50),
+        extract_bool_param(params, "only_reachable_from_network", true));
+    return agent_tools::tool_result_t::ok(OBFSTR("Parser-shaped functions: ") +
+                                          std::to_string(data.value("count", static_cast<std::size_t>(0))), data);
+}
+
+agent_tools::tool_result_t handle_find_safearray_misuse(const json& params)
+{
+    json data = find_safearray_misuse(extract_int_param(params, "limit", 64));
+    return agent_tools::tool_result_t::ok(OBFSTR("SAFEARRAY misuse candidates: ") +
+                                          std::to_string(data.value("count", static_cast<std::size_t>(0))), data);
+}
+
+agent_tools::tool_result_t handle_find_int_overflow_alloc_from_input(const json& params)
+{
+    json data = find_int_overflow_alloc_from_input(extract_int_param(params, "limit", 64));
+    return agent_tools::tool_result_t::ok(OBFSTR("Integer-overflow allocation candidates: ") +
+                                          std::to_string(data.value("count", static_cast<std::size_t>(0))), data);
+}
+
 void register_tier1_callsite_tools()
 {
     auto& registry = agent_tools::ToolRegistry::instance();
+    auto register_taint_required = [&](agent_tools::tool_definition_t def) {
+        def.required_indices = {OBFSTR("taint_engine")};
+        registry.register_tool(def);
+    };
+    auto register_nondeterministic = [&](agent_tools::tool_definition_t def) {
+        def.deterministic = false;
+        registry.register_tool(def);
+    };
 
     {
         agent_tools::tool_param_t category_param;
@@ -1517,6 +2837,131 @@ void register_tier1_callsite_tools()
             true,
         });
     }
+
+    registry.register_tool({
+        OBFSTR("find_calls_to"),
+        OBFSTR("vuln"),
+        OBFSTR("Resolve up to 256 target names through the cached import/export/function name index and return every code callsite xref with caller, callee, and summarized literal arguments."),
+        {
+            {OBFSTR("names"), OBFSTR("array"), OBFSTR("Target function/import names. Hard cap: 256."), true},
+            {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum callsites to return (default 4096, max 16384)."), false},
+        },
+        handle_find_calls_to,
+        true,
+    });
+
+    registry.register_tool({
+        OBFSTR("summarize_validators_in_function"),
+        OBFSTR("vuln"),
+        OBFSTR("Summarize length validators, integer checked-math helpers, auth gates, and len/size/count comparisons in one function."),
+        {
+            {OBFSTR("address"), OBFSTR("string"), OBFSTR("Address inside the function to summarize."), true},
+        },
+        handle_summarize_validators_in_function,
+        true,
+    });
+
+    register_taint_required({
+        OBFSTR("reverse_slice_sink_to_sources"),
+        OBFSTR("vuln_advanced"),
+        OBFSTR("Reverse BFS from a sink callsite through caller xrefs to protocol/input sources, annotating validators and auth gates seen along each path."),
+        {
+            {OBFSTR("sink_call_ea"), OBFSTR("string"), OBFSTR("Sink callsite address."), true},
+            {OBFSTR("max_depth"), OBFSTR("number"), OBFSTR("Maximum caller depth (default 6, max 12)."), false},
+            {OBFSTR("source_category"), OBFSTR("string"), OBFSTR("Source family: network, rpc, com, alpc, pipe, socket, http, websocket, ndis, kernel_irp, input, all."), false},
+            {OBFSTR("max_paths"), OBFSTR("number"), OBFSTR("Maximum paths (default 8, max 32)."), false},
+            {OBFSTR("require_no_validator"), OBFSTR("boolean"), OBFSTR("Only return paths with no validator evidence."), false},
+            {OBFSTR("require_pre_auth"), OBFSTR("boolean"), OBFSTR("Only return paths with no auth-gate evidence."), false},
+        },
+        handle_reverse_slice_sink_to_sources,
+        true,
+    });
+
+    registry.register_tool({
+        OBFSTR("forward_reachability_source_to_sinks"),
+        OBFSTR("vuln_advanced"),
+        OBFSTR("Forward BFS from a source function to dangerous sinks, returning sink hits and per-function validator annotations."),
+        {
+            {OBFSTR("source_func_ea"), OBFSTR("string"), OBFSTR("Source function address."), true},
+            {OBFSTR("max_depth"), OBFSTR("number"), OBFSTR("Maximum callee depth (default 6, max 12)."), false},
+            {OBFSTR("sink_category"), OBFSTR("string"), OBFSTR("Sink family: all, buffer_overflow, command_injection, path_traversal, format_string, safearray, deserialization."), false},
+            {OBFSTR("max_hits"), OBFSTR("number"), OBFSTR("Maximum sink hits (default 64, max 512)."), false},
+            {OBFSTR("require_no_validator"), OBFSTR("boolean"), OBFSTR("Only include sink functions with no validator evidence."), false},
+        },
+        handle_forward_reachability_source_to_sinks,
+        true,
+    });
+
+    register_nondeterministic({
+        OBFSTR("protocol_attack_surface_report"),
+        OBFSTR("vuln_advanced"),
+        OBFSTR("Survey RPC, COM, ALPC, named pipe, socket, HTTP, WebSocket, NDIS/WSK, and kernel IRP ingress callsites, grouped by handler function with downstream sink counts."),
+        {},
+        handle_protocol_attack_surface_report,
+        true,
+    });
+
+    register_taint_required({
+        OBFSTR("find_pre_auth_paths"),
+        OBFSTR("vuln_advanced"),
+        OBFSTR("Fan out from protocol/input ingress functions to sinks and return paths that do not pass an auth-gate; optionally require no validator evidence."),
+        {
+            {OBFSTR("source_category"), OBFSTR("string"), OBFSTR("Source family (default network)."), false},
+            {OBFSTR("sink_category"), OBFSTR("string"), OBFSTR("Sink family (default all)."), false},
+            {OBFSTR("max_depth"), OBFSTR("number"), OBFSTR("Maximum depth (default 6)."), false},
+            {OBFSTR("max_paths"), OBFSTR("number"), OBFSTR("Maximum paths (default 32)."), false},
+            {OBFSTR("require_no_validator"), OBFSTR("boolean"), OBFSTR("Only return no-validator paths (default true)."), false},
+        },
+        handle_find_pre_auth_paths,
+        true,
+    });
+
+    registry.register_tool({
+        OBFSTR("find_dispatch_tables"),
+        OBFSTR("vuln"),
+        OBFSTR("Structurally scan read-only segments for pointer-sized arrays whose entries all resolve to function starts in code segments. Uses 8-byte slots for 64-bit IDBs and 4-byte slots for 32-bit IDBs."),
+        {
+            {OBFSTR("min_entries"), OBFSTR("number"), OBFSTR("Minimum consecutive function pointers (default 4)."), false},
+            {OBFSTR("max_entries"), OBFSTR("number"), OBFSTR("Maximum entries per table (default 256)."), false},
+            {OBFSTR("include_vtables"), OBFSTR("boolean"), OBFSTR("Include likely vtable-shaped arrays (default true)."), false},
+        },
+        handle_find_dispatch_tables,
+        true,
+    });
+
+    registry.register_tool({
+        OBFSTR("find_parser_shaped_functions"),
+        OBFSTR("vuln_advanced"),
+        OBFSTR("Rank functions by parser-shaped control flow: loops, switch dispatch, non-literal indexing, copy calls inside loops, and byte operations."),
+        {
+            {OBFSTR("top_k"), OBFSTR("number"), OBFSTR("Maximum ranked functions (default 50)."), false},
+            {OBFSTR("only_reachable_from_network"), OBFSTR("boolean"), OBFSTR("Filter to attacker-reachable functions (default true)."), false},
+        },
+        handle_find_parser_shaped_functions,
+        true,
+    });
+
+    registry.register_tool({
+        OBFSTR("find_safearray_misuse"),
+        OBFSTR("vuln_advanced"),
+        OBFSTR("Find SAFEARRAY parser calls in functions lacking recognized checked integer math or bounds helpers."),
+        {
+            {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum findings (default 64)."), false},
+        },
+        handle_find_safearray_misuse,
+        true,
+    });
+
+    registry.register_tool({
+        OBFSTR("find_int_overflow_alloc_from_input"),
+        OBFSTR("vuln_advanced"),
+        OBFSTR("Find allocation calls whose size arguments contain add/mul/shift arithmetic without checked integer helpers, prioritizing input-source functions."),
+        {
+            {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum findings (default 64)."), false},
+        },
+        handle_find_int_overflow_alloc_from_input,
+        true,
+    });
 }
 
 }

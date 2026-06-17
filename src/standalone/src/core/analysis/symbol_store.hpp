@@ -35,6 +35,10 @@ struct module_symbols_t {
 	bool                                      loading = false;
 	bool                                      failed = false;
 	std::string                               status_text;
+	std::string                               pdb_path;
+	uint64_t                                  pdb_file_size = 0;
+	bool                                      parse_completed = false;
+	std::string                               load_failure_detail;
 	std::string                               load_phase;
 	uint64_t                                  load_generation = 0;
 	uint64_t                                  load_started_ms = 0;
@@ -56,6 +60,7 @@ struct state_t {
 
 inline state_t g_state;
 inline std::atomic<uint64_t> g_load_generation{1};
+inline constexpr uint32_t k_explicit_pdb_load_timeout_ms = 120000;
 
 inline uint64_t next_load_generation()
 {
@@ -74,6 +79,7 @@ struct load_timeout_context_t {
 inline void apply_loading_timeout(const load_timeout_context_t& ctx) noexcept
 {
 	try {
+		const std::string parser_diag = pdb_parser::dbghelp_load_diagnostic();
 		aida::events::event_pdb_loaded ev_payload;
 		bool publish_event = false;
 		{
@@ -87,9 +93,11 @@ inline void apply_loading_timeout(const load_timeout_context_t& ctx) noexcept
 			ms.loading = false;
 			ms.downloading = false;
 			ms.failed = true;
+			ms.parse_completed = false;
+			ms.load_failure_detail = parser_diag;
 			ms.load_phase.clear();
-			char buf[160];
-			snprintf(buf, sizeof(buf), "Failed: PDB %s timed out after %u ms", ctx.phase.c_str(), ctx.timeout_ms);
+			char buf[768];
+			snprintf(buf, sizeof(buf), "Failed: PDB %s timed out after %u ms; %s", ctx.phase.c_str(), ctx.timeout_ms, parser_diag.c_str());
 			ms.status_text = buf;
 			ev_payload.module_name = ms.module_name;
 			ev_payload.base = ms.base;
@@ -97,14 +105,17 @@ inline void apply_loading_timeout(const load_timeout_context_t& ctx) noexcept
 			ev_payload.success = false;
 			publish_event = true;
 			diag::log_tagged_fmt("symbol_store",
-				"pdb_load_timeout module=%s generation=%llu phase=%s timeout_ms=%u started_ms=%llu scheduled_ms=%llu fired_ms=%llu",
+				"pdb_load_timeout module=%s generation=%llu phase=%s timeout_ms=%u started_ms=%llu scheduled_ms=%llu fired_ms=%llu path='%s' file_size=%llu parser_diag=\"%s\"",
 				ctx.module_name.c_str(),
 				static_cast<unsigned long long>(ctx.generation),
 				ctx.phase.c_str(),
 				ctx.timeout_ms,
 				static_cast<unsigned long long>(ms.load_started_ms),
 				static_cast<unsigned long long>(ctx.scheduled_ms),
-				static_cast<unsigned long long>(GetTickCount64()));
+				static_cast<unsigned long long>(GetTickCount64()),
+				ms.pdb_path.c_str(),
+				static_cast<unsigned long long>(ms.pdb_file_size),
+				parser_diag.c_str());
 		}
 		if (publish_event)
 			aida::events::publish(aida::events::event_pdb_loaded_def, ev_payload);
@@ -309,6 +320,8 @@ inline void publish_failed_load_result(const std::string& module_name, uint64_t 
 			ms.loading = false;
 			ms.downloading = false;
 			ms.failed = true;
+			ms.parse_completed = false;
+			ms.load_failure_detail = detail_text ? detail_text : "";
 			ms.load_phase.clear();
 			ms.status_text = status_text;
 			ev_payload.module_name = ms.module_name;
@@ -336,9 +349,13 @@ inline void publish_failed_load_result(const std::string& module_name, uint64_t 
 inline std::string pdb_parse_failure_status(const char* prefix)
 {
 	const std::string detail = pdb_parser::last_error();
-	if (detail.empty())
-		return prefix ? std::string(prefix) : std::string("Failed to parse PDB");
-	return (prefix ? std::string(prefix) : std::string("Failed to parse PDB")) + ": " + detail;
+	const std::string loader = pdb_parser::dbghelp_load_diagnostic();
+	std::string out = prefix ? std::string(prefix) : std::string("Failed to parse PDB");
+	if (!detail.empty())
+		out += ": " + detail;
+	if (!loader.empty())
+		out += " [" + loader + "]";
+	return out;
 }
 
 struct snapshot_t {
@@ -822,29 +839,68 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
                                         const std::string& pdb_path)
 {
 	uint64_t generation = next_load_generation();
+	std::error_code path_ec;
+	std::filesystem::path exact_path_fs = std::filesystem::absolute(std::filesystem::path(pdb_path), path_ec);
+	const std::string exact_path = path_ec ? pdb_path : exact_path_fs.string();
+	std::error_code size_ec;
+	uint64_t file_size = 0;
+	auto explicit_size = std::filesystem::file_size(exact_path, size_ec);
+	if (!size_ec)
+		file_size = static_cast<uint64_t>(explicit_size);
+	diag::log_tagged_fmt("symbol_store",
+		"explicit_pdb_request module=%s generation=%llu input_path='%s' exact_path='%s' file_size=%llu file_size_ok=%d file_size_ec=%d base=0x%llX size=0x%llX parser_diag=\"%s\"",
+		module_name.c_str(),
+		static_cast<unsigned long long>(generation),
+		pdb_path.c_str(),
+		exact_path.c_str(),
+		static_cast<unsigned long long>(file_size),
+		size_ec ? 0 : 1,
+		size_ec ? size_ec.value() : 0,
+		static_cast<unsigned long long>(base),
+		static_cast<unsigned long long>(size),
+		pdb_parser::dbghelp_load_diagnostic().c_str());
 	{
 		std::lock_guard<std::mutex> lk(g_state.mutex);
 		auto& ms = g_state.modules[module_name];
 		if (ms.pdb.loaded) {
-			diag::log_tagged_fmt("symbol_store", "explicit_pdb_parse_already_loaded module=%s symbols=%zu structs=%zu enums=%zu status='%s'",
-				module_name.c_str(), ms.pdb.symbols.size(), ms.pdb.structs.size(), ms.pdb.enums.size(), ms.status_text.c_str());
+			diag::log_tagged_fmt("symbol_store", "explicit_pdb_parse_already_loaded module=%s generation=%llu requested_path='%s' loaded_path='%s' file_size=%llu symbols=%zu structs=%zu enums=%zu types=%zu parse_completed=%d status='%s' failure_detail='%s'",
+				module_name.c_str(),
+				static_cast<unsigned long long>(ms.load_generation),
+				exact_path.c_str(),
+				ms.pdb_path.c_str(),
+				static_cast<unsigned long long>(ms.pdb_file_size),
+				ms.pdb.symbols.size(),
+				ms.pdb.structs.size(),
+				ms.pdb.enums.size(),
+				ms.pdb.structs.size() + ms.pdb.enums.size(),
+				ms.parse_completed ? 1 : 0,
+				ms.status_text.c_str(),
+				ms.load_failure_detail.c_str());
 			return;
 		}
 		if (ms.loading) {
 			const uint64_t now = GetTickCount64();
 			const uint64_t elapsed = ms.load_started_ms ? now - ms.load_started_ms : 0;
+			const std::string parser_diag = pdb_parser::dbghelp_load_diagnostic();
 			char status[256];
-			snprintf(status, sizeof(status), "PDB load already in progress (%s, %llu / %u ms); retry after completion or timeout",
+			snprintf(status, sizeof(status), "PDB load already in progress (%s, %llu / %u ms); %s",
 				ms.load_phase.empty() ? "unknown" : ms.load_phase.c_str(),
 				static_cast<unsigned long long>(elapsed),
-				ms.load_timeout_ms);
+				ms.load_timeout_ms,
+				parser_diag.c_str());
 			ms.status_text = status;
-			diag::log_tagged_fmt("symbol_store", "explicit_pdb_parse_already_loading module=%s generation=%llu phase=%s elapsed_ms=%llu timeout_ms=%u status='%s'",
+			ms.load_failure_detail = parser_diag;
+			diag::log_tagged_fmt("symbol_store", "explicit_pdb_parse_already_loading module=%s generation=%llu phase=%s elapsed_ms=%llu timeout_ms=%u requested_path='%s' active_path='%s' file_size=%llu parse_completed=%d parser_diag=\"%s\" status='%s'",
 				module_name.c_str(),
 				static_cast<unsigned long long>(ms.load_generation),
 				ms.load_phase.c_str(),
 				static_cast<unsigned long long>(elapsed),
 				ms.load_timeout_ms,
+				exact_path.c_str(),
+				ms.pdb_path.c_str(),
+				static_cast<unsigned long long>(ms.pdb_file_size),
+				ms.parse_completed ? 1 : 0,
+				parser_diag.c_str(),
 				ms.status_text.c_str());
 			return;
 		}
@@ -853,10 +909,14 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 		ms.size = size;
 		ms.loading = true;
 		ms.failed = false;
+		ms.pdb_path = exact_path;
+		ms.pdb_file_size = file_size;
+		ms.parse_completed = false;
+		ms.load_failure_detail.clear();
 		ms.load_phase = "queue";
 		ms.load_generation = generation;
 		ms.load_started_ms = GetTickCount64();
-		ms.load_timeout_ms = 30000;
+		ms.load_timeout_ms = k_explicit_pdb_load_timeout_ms;
 		ms.downloading = false;
 		ms.download_total = 0;
 		ms.download_received = 0;
@@ -865,33 +925,44 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 	}
 
 	std::string mod_copy = module_name;
-	std::string path_copy = pdb_path;
+	std::string path_copy = exact_path;
+	uint64_t file_size_copy = file_size;
 
-	auto parse_job = [mod_copy, path_copy, generation]() {
+	auto parse_job = [mod_copy, path_copy, file_size_copy, generation]() {
 		uint64_t job_start = GetTickCount64();
+		const DWORD worker_pid = GetCurrentProcessId();
+		const DWORD worker_tid = GetCurrentThreadId();
 		try {
-			diag::log_tagged_fmt("symbol_store", "explicit_pdb_parse_start module=%s path=%s generation=%llu",
-				mod_copy.c_str(), path_copy.c_str(), static_cast<unsigned long long>(generation));
+			diag::log_tagged_fmt("symbol_store", "explicit_pdb_parse_start module=%s path='%s' file_size=%llu generation=%llu worker_pid=%lu worker_tid=%lu parser_diag=\"%s\"",
+				mod_copy.c_str(),
+				path_copy.c_str(),
+				static_cast<unsigned long long>(file_size_copy),
+				static_cast<unsigned long long>(generation),
+				worker_pid,
+				worker_tid,
+				pdb_parser::dbghelp_load_diagnostic().c_str());
 			{
 				std::lock_guard<std::mutex> lk(g_state.mutex);
 				auto& ms = g_state.modules[mod_copy];
 				if (ms.load_generation != generation || !ms.loading) {
-					diag::log_tagged_fmt("symbol_store", "explicit_pdb_parse_stale_before_parse module=%s generation=%llu status='%s'",
-						mod_copy.c_str(), static_cast<unsigned long long>(generation), ms.status_text.c_str());
+					diag::log_tagged_fmt("symbol_store", "explicit_pdb_parse_stale_before_parse module=%s generation=%llu path='%s' status='%s'",
+						mod_copy.c_str(), static_cast<unsigned long long>(generation), path_copy.c_str(), ms.status_text.c_str());
 					return;
 				}
 				ms.load_phase = "parse";
 				ms.load_started_ms = GetTickCount64();
-				ms.load_timeout_ms = 30000;
+				ms.load_timeout_ms = k_explicit_pdb_load_timeout_ms;
 			}
 			auto wq_before_timeout = work_queue::stats();
 			auto sq_before_timeout = work_queue::service_stats();
 			auto cq_before_timeout = critical_work_queue::stats();
 			diag::log_tagged_fmt("symbol_store",
-				"explicit_pdb_timeout_schedule_begin module=%s path=%s generation=%llu phase=parse timeout_ms=30000 work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu critical_pending=%zu critical_active=%u critical_rejected=%llu",
+				"explicit_pdb_timeout_schedule_begin module=%s path='%s' file_size=%llu generation=%llu phase=parse timeout_ms=%u work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu critical_pending=%zu critical_active=%u critical_rejected=%llu",
 				mod_copy.c_str(),
 				path_copy.c_str(),
+				static_cast<unsigned long long>(file_size_copy),
 				static_cast<unsigned long long>(generation),
+				k_explicit_pdb_load_timeout_ms,
 				wq_before_timeout.pending,
 				wq_before_timeout.active,
 				static_cast<unsigned long long>(wq_before_timeout.rejected),
@@ -901,16 +972,18 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 				cq_before_timeout.pending,
 				cq_before_timeout.active,
 				static_cast<unsigned long long>(cq_before_timeout.rejected));
-			const bool parse_timeout_scheduled = schedule_loading_timeout(mod_copy, generation, 30000, "parse");
+			const bool parse_timeout_scheduled = schedule_loading_timeout(mod_copy, generation, k_explicit_pdb_load_timeout_ms, "parse");
 			auto wq_after_timeout = work_queue::stats();
 			auto sq_after_timeout = work_queue::service_stats();
 			auto cq_after_timeout = critical_work_queue::stats();
 			diag::log_tagged_fmt("symbol_store",
-				"explicit_pdb_timeout_schedule_end module=%s path=%s generation=%llu phase=parse scheduled=%d timeout_ms=30000 work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu critical_pending=%zu critical_active=%u critical_rejected=%llu",
+				"explicit_pdb_timeout_schedule_end module=%s path='%s' file_size=%llu generation=%llu phase=parse scheduled=%d timeout_ms=%u work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu critical_pending=%zu critical_active=%u critical_rejected=%llu",
 				mod_copy.c_str(),
 				path_copy.c_str(),
+				static_cast<unsigned long long>(file_size_copy),
 				static_cast<unsigned long long>(generation),
 				parse_timeout_scheduled ? 1 : 0,
+				k_explicit_pdb_load_timeout_ms,
 				wq_after_timeout.pending,
 				wq_after_timeout.active,
 				static_cast<unsigned long long>(wq_after_timeout.rejected),
@@ -924,34 +997,57 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 			std::atomic<float> parse_progress{0.f};
 			std::string search_path = std::filesystem::path(path_copy).parent_path().string();
 			bool parse_ok = pdb_parser::parse_pdb(path_copy, search_path, info, &parse_progress);
-			diag::log_tagged_fmt("symbol_store", "explicit_pdb_parse_done module=%s generation=%llu ok=%d symbols=%zu structs=%zu enums=%zu progress=%.3f elapsed_ms=%llu",
-				mod_copy.c_str(), static_cast<unsigned long long>(generation), parse_ok ? 1 : 0,
-				info.symbols.size(), info.structs.size(),
-				info.enums.size(), static_cast<double>(parse_progress.load()),
-				static_cast<unsigned long long>(GetTickCount64() - job_start));
+			const bool parse_completed = parse_ok && info.loaded;
+			const std::string parser_status = pdb_parser::last_error();
+			const std::string parser_diag = pdb_parser::dbghelp_load_diagnostic();
+			diag::log_tagged_fmt("symbol_store", "explicit_pdb_parse_done module=%s generation=%llu ok=%d parse_completed=%d path='%s' file_size=%llu symbols=%zu structs=%zu enums=%zu types=%zu progress=%.3f elapsed_ms=%llu parser_status='%s' parser_diag=\"%s\"",
+				mod_copy.c_str(),
+				static_cast<unsigned long long>(generation),
+				parse_ok ? 1 : 0,
+				parse_completed ? 1 : 0,
+				path_copy.c_str(),
+				static_cast<unsigned long long>(file_size_copy),
+				info.symbols.size(),
+				info.structs.size(),
+				info.enums.size(),
+				info.structs.size() + info.enums.size(),
+				static_cast<double>(parse_progress.load()),
+				static_cast<unsigned long long>(GetTickCount64() - job_start),
+				parser_status.c_str(),
+				parser_diag.c_str());
 
 			aida::events::event_pdb_loaded ev_payload;
 			{
 				std::lock_guard<std::mutex> lk(g_state.mutex);
 				auto& ms = g_state.modules[mod_copy];
 				if (ms.load_generation != generation || !ms.loading) {
-					diag::log_tagged_fmt("symbol_store", "explicit_pdb_parse_late_result_ignored module=%s generation=%llu ok=%d progress=%.3f elapsed_ms=%llu status='%s'",
+					diag::log_tagged_fmt("symbol_store", "explicit_pdb_parse_late_result_ignored module=%s generation=%llu ok=%d parse_completed=%d path='%s' file_size=%llu progress=%.3f elapsed_ms=%llu status='%s' parser_status='%s' parser_diag=\"%s\"",
 						mod_copy.c_str(),
 						static_cast<unsigned long long>(generation),
 						parse_ok ? 1 : 0,
+						parse_completed ? 1 : 0,
+						path_copy.c_str(),
+						static_cast<unsigned long long>(file_size_copy),
 						static_cast<double>(parse_progress.load()),
 						static_cast<unsigned long long>(GetTickCount64() - job_start),
-						ms.status_text.c_str());
+						ms.status_text.c_str(),
+						parser_status.c_str(),
+						parser_diag.c_str());
 					return;
 				}
 				ms.loading = false;
 				ms.load_phase.clear();
-				if (parse_ok) {
+				if (parse_completed) {
 					ms.pdb = std::move(info);
-					char buf[128];
+					ms.parse_completed = ms.pdb.loaded;
+					ms.failed = false;
+					ms.pdb_path = path_copy;
+					ms.pdb_file_size = file_size_copy;
+					ms.load_failure_detail.clear();
+					char buf[192];
 					snprintf(buf, sizeof(buf), "Loaded from %s: %zu symbols, %zu types",
 					         std::filesystem::path(path_copy).filename().string().c_str(),
-					         ms.pdb.symbols.size(), ms.pdb.structs.size());
+					         ms.pdb.symbols.size(), ms.pdb.structs.size() + ms.pdb.enums.size());
 					ms.status_text = buf;
 					ev_payload.module_name = ms.module_name;
 					ev_payload.base = ms.base;
@@ -962,13 +1058,29 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 					ev_payload.enum_count = static_cast<uint32_t>(ms.pdb.enums.size());
 				} else {
 					ms.failed = true;
+					ms.parse_completed = false;
 					ms.load_phase.clear();
+					ms.load_failure_detail = parser_status.empty() ? parser_diag : parser_status + " | " + parser_diag;
 					ms.status_text = pdb_parse_failure_status("Failed to parse user-supplied PDB");
 					ev_payload.module_name = ms.module_name;
 					ev_payload.base = ms.base;
 					ev_payload.size = ms.size;
 					ev_payload.success = false;
 				}
+				diag::log_tagged_fmt("symbol_store",
+					"explicit_pdb_state_commit module=%s generation=%llu success=%d parse_completed=%d path='%s' file_size=%llu symbols=%zu structs=%zu enums=%zu types=%zu status='%s' failure_detail='%s'",
+					ms.module_name.c_str(),
+					static_cast<unsigned long long>(generation),
+					ev_payload.success ? 1 : 0,
+					ms.parse_completed ? 1 : 0,
+					ms.pdb_path.c_str(),
+					static_cast<unsigned long long>(ms.pdb_file_size),
+					ms.pdb.symbols.size(),
+					ms.pdb.structs.size(),
+					ms.pdb.enums.size(),
+					ms.pdb.structs.size() + ms.pdb.enums.size(),
+					ms.status_text.c_str(),
+					ms.load_failure_detail.c_str());
 			}
 
 			auto parent_dir = std::filesystem::path(path_copy).parent_path().string();
@@ -986,19 +1098,25 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 			aida::events::publish(aida::events::event_pdb_loaded_def, ev_payload);
 		} catch (const std::exception& ex) {
 			char status[512];
-			snprintf(status, sizeof(status), "Failed to parse user-supplied PDB: %s", ex.what());
-			publish_failed_load_result(mod_copy, generation, status, "explicit_pdb_parse_exception", ex.what(), GetTickCount64() - job_start);
+			const std::string parser_diag = pdb_parser::dbghelp_load_diagnostic();
+			snprintf(status, sizeof(status), "Failed to parse user-supplied PDB: %s; %s", ex.what(), parser_diag.c_str());
+			std::string detail = std::string(ex.what()) + " | " + parser_diag;
+			publish_failed_load_result(mod_copy, generation, status, "explicit_pdb_parse_exception", detail.c_str(), GetTickCount64() - job_start);
 		} catch (...) {
-			publish_failed_load_result(mod_copy, generation, "Failed to parse user-supplied PDB: unknown exception", "explicit_pdb_parse_exception", "<unknown>", GetTickCount64() - job_start);
+			const std::string parser_diag = pdb_parser::dbghelp_load_diagnostic();
+			std::string status = "Failed to parse user-supplied PDB: unknown exception; " + parser_diag;
+			std::string detail = "<unknown> | " + parser_diag;
+			publish_failed_load_result(mod_copy, generation, status, "explicit_pdb_parse_exception", detail.c_str(), GetTickCount64() - job_start);
 		}
 	};
 	auto wq_before_post = work_queue::stats();
 	auto sq_before_post = work_queue::service_stats();
 	auto cq_before_post = critical_work_queue::stats();
 	diag::log_tagged_fmt("symbol_store",
-		"explicit_pdb_parse_queue_begin module=%s path=%s generation=%llu work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu critical_pending=%zu critical_active=%u critical_rejected=%llu",
+		"explicit_pdb_parse_queue_begin module=%s path='%s' file_size=%llu generation=%llu work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu critical_pending=%zu critical_active=%u critical_rejected=%llu parser_diag=\"%s\"",
 		mod_copy.c_str(),
 		path_copy.c_str(),
+		static_cast<unsigned long long>(file_size_copy),
 		static_cast<unsigned long long>(generation),
 		wq_before_post.pending,
 		wq_before_post.active,
@@ -1008,7 +1126,8 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 		static_cast<unsigned long long>(sq_before_post.rejected),
 		cq_before_post.pending,
 		cq_before_post.active,
-		static_cast<unsigned long long>(cq_before_post.rejected));
+		static_cast<unsigned long long>(cq_before_post.rejected),
+		pdb_parser::dbghelp_load_diagnostic().c_str());
 	bool posted = false;
 	const char* posted_queue = "none";
 	try {
@@ -1016,11 +1135,11 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 		if (posted)
 			posted_queue = "critical";
 	} catch (const std::exception& ex) {
-		diag::log_tagged_fmt("symbol_store", "explicit_pdb_parse_queue_exception queue=critical module=%s path=%s generation=%llu err=%s",
-			mod_copy.c_str(), path_copy.c_str(), static_cast<unsigned long long>(generation), ex.what());
+		diag::log_tagged_fmt("symbol_store", "explicit_pdb_parse_queue_exception queue=critical module=%s path='%s' file_size=%llu generation=%llu err=%s",
+			mod_copy.c_str(), path_copy.c_str(), static_cast<unsigned long long>(file_size_copy), static_cast<unsigned long long>(generation), ex.what());
 	} catch (...) {
-		diag::log_tagged_fmt("symbol_store", "explicit_pdb_parse_queue_exception queue=critical module=%s path=%s generation=%llu err=<unknown>",
-			mod_copy.c_str(), path_copy.c_str(), static_cast<unsigned long long>(generation));
+		diag::log_tagged_fmt("symbol_store", "explicit_pdb_parse_queue_exception queue=critical module=%s path='%s' file_size=%llu generation=%llu err=<unknown>",
+			mod_copy.c_str(), path_copy.c_str(), static_cast<unsigned long long>(file_size_copy), static_cast<unsigned long long>(generation));
 	}
 	if (!posted) {
 		try {
@@ -1028,20 +1147,21 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 			if (posted)
 				posted_queue = "work";
 		} catch (const std::exception& ex) {
-			diag::log_tagged_fmt("symbol_store", "explicit_pdb_parse_queue_exception queue=work module=%s path=%s generation=%llu err=%s",
-				mod_copy.c_str(), path_copy.c_str(), static_cast<unsigned long long>(generation), ex.what());
+			diag::log_tagged_fmt("symbol_store", "explicit_pdb_parse_queue_exception queue=work module=%s path='%s' file_size=%llu generation=%llu err=%s",
+				mod_copy.c_str(), path_copy.c_str(), static_cast<unsigned long long>(file_size_copy), static_cast<unsigned long long>(generation), ex.what());
 		} catch (...) {
-			diag::log_tagged_fmt("symbol_store", "explicit_pdb_parse_queue_exception queue=work module=%s path=%s generation=%llu err=<unknown>",
-				mod_copy.c_str(), path_copy.c_str(), static_cast<unsigned long long>(generation));
+			diag::log_tagged_fmt("symbol_store", "explicit_pdb_parse_queue_exception queue=work module=%s path='%s' file_size=%llu generation=%llu err=<unknown>",
+				mod_copy.c_str(), path_copy.c_str(), static_cast<unsigned long long>(file_size_copy), static_cast<unsigned long long>(generation));
 		}
 	}
 	auto wq_after_post = work_queue::stats();
 	auto sq_after_post = work_queue::service_stats();
 	auto cq_after_post = critical_work_queue::stats();
 	diag::log_tagged_fmt("symbol_store",
-		"explicit_pdb_parse_queue_end module=%s path=%s generation=%llu posted=%d queue=%s work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu critical_pending=%zu critical_active=%u critical_rejected=%llu",
+		"explicit_pdb_parse_queue_end module=%s path='%s' file_size=%llu generation=%llu posted=%d queue=%s work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu critical_pending=%zu critical_active=%u critical_rejected=%llu parser_diag=\"%s\"",
 		mod_copy.c_str(),
 		path_copy.c_str(),
+		static_cast<unsigned long long>(file_size_copy),
 		static_cast<unsigned long long>(generation),
 		posted ? 1 : 0,
 		posted_queue,
@@ -1053,10 +1173,12 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 		static_cast<unsigned long long>(sq_after_post.rejected),
 		cq_after_post.pending,
 		cq_after_post.active,
-		static_cast<unsigned long long>(cq_after_post.rejected));
+		static_cast<unsigned long long>(cq_after_post.rejected),
+		pdb_parser::dbghelp_load_diagnostic().c_str());
 	if (!posted) {
-		diag::log_tagged_fmt("symbol_store", "explicit_pdb_parse_post_failed module=%s path=%s generation=%llu",
-			mod_copy.c_str(), path_copy.c_str(), static_cast<unsigned long long>(generation));
+		const std::string parser_diag = pdb_parser::dbghelp_load_diagnostic();
+		diag::log_tagged_fmt("symbol_store", "explicit_pdb_parse_post_failed module=%s path='%s' file_size=%llu generation=%llu parser_diag=\"%s\"",
+			mod_copy.c_str(), path_copy.c_str(), static_cast<unsigned long long>(file_size_copy), static_cast<unsigned long long>(generation), parser_diag.c_str());
 		aida::events::event_pdb_loaded ev_payload;
 		{
 			std::lock_guard<std::mutex> lk(g_state.mutex);
@@ -1065,8 +1187,12 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 				return;
 			ms.loading = false;
 			ms.failed = true;
+			ms.parse_completed = false;
+			ms.load_failure_detail = parser_diag;
 			ms.load_phase.clear();
-			ms.status_text = "Failed to queue user-supplied PDB parse";
+			char status[768];
+			snprintf(status, sizeof(status), "Failed to queue user-supplied PDB parse; %s", parser_diag.c_str());
+			ms.status_text = status;
 			ev_payload.module_name = ms.module_name;
 			ev_payload.base = ms.base;
 			ev_payload.size = ms.size;
@@ -1078,10 +1204,12 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 		auto sq_before_timeout = work_queue::service_stats();
 		auto cq_before_timeout = critical_work_queue::stats();
 		diag::log_tagged_fmt("symbol_store",
-			"explicit_pdb_timeout_schedule_begin module=%s path=%s generation=%llu phase=queue timeout_ms=30000 work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu critical_pending=%zu critical_active=%u critical_rejected=%llu",
+			"explicit_pdb_timeout_schedule_begin module=%s path='%s' file_size=%llu generation=%llu phase=queue timeout_ms=%u work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu critical_pending=%zu critical_active=%u critical_rejected=%llu parser_diag=\"%s\"",
 			module_name.c_str(),
 			path_copy.c_str(),
+			static_cast<unsigned long long>(file_size_copy),
 			static_cast<unsigned long long>(generation),
+			k_explicit_pdb_load_timeout_ms,
 			wq_before_timeout.pending,
 			wq_before_timeout.active,
 			static_cast<unsigned long long>(wq_before_timeout.rejected),
@@ -1090,17 +1218,20 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 			static_cast<unsigned long long>(sq_before_timeout.rejected),
 			cq_before_timeout.pending,
 			cq_before_timeout.active,
-			static_cast<unsigned long long>(cq_before_timeout.rejected));
-		const bool queue_timeout_scheduled = schedule_loading_timeout(module_name, generation, 30000, "queue");
+			static_cast<unsigned long long>(cq_before_timeout.rejected),
+			pdb_parser::dbghelp_load_diagnostic().c_str());
+		const bool queue_timeout_scheduled = schedule_loading_timeout(module_name, generation, k_explicit_pdb_load_timeout_ms, "queue");
 		auto wq_after_timeout = work_queue::stats();
 		auto sq_after_timeout = work_queue::service_stats();
 		auto cq_after_timeout = critical_work_queue::stats();
 		diag::log_tagged_fmt("symbol_store",
-			"explicit_pdb_timeout_schedule_end module=%s path=%s generation=%llu phase=queue scheduled=%d timeout_ms=30000 work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu critical_pending=%zu critical_active=%u critical_rejected=%llu",
+			"explicit_pdb_timeout_schedule_end module=%s path='%s' file_size=%llu generation=%llu phase=queue scheduled=%d timeout_ms=%u work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu critical_pending=%zu critical_active=%u critical_rejected=%llu parser_diag=\"%s\"",
 			module_name.c_str(),
 			path_copy.c_str(),
+			static_cast<unsigned long long>(file_size_copy),
 			static_cast<unsigned long long>(generation),
 			queue_timeout_scheduled ? 1 : 0,
+			k_explicit_pdb_load_timeout_ms,
 			wq_after_timeout.pending,
 			wq_after_timeout.active,
 			static_cast<unsigned long long>(wq_after_timeout.rejected),
@@ -1109,7 +1240,8 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 			static_cast<unsigned long long>(sq_after_timeout.rejected),
 			cq_after_timeout.pending,
 			cq_after_timeout.active,
-			static_cast<unsigned long long>(cq_after_timeout.rejected));
+			static_cast<unsigned long long>(cq_after_timeout.rejected),
+			pdb_parser::dbghelp_load_diagnostic().c_str());
 	}
 }
 

@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <atomic>
+#include <cstdint>
 
 #include "network_tests.h"
 #include "memory_tests.h"
@@ -36,6 +37,7 @@ static LONG CALLBACK debugger_exception_veh(EXCEPTION_POINTERS* ep) {
 
     if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP &&
         g_absorb_external_single_step.load(std::memory_order_acquire)) {
+        const DWORD old_eflags = ep->ContextRecord->EFlags;
 #ifdef _M_X64
         ep->ContextRecord->EFlags &= ~0x100UL;
         const unsigned long long ip = static_cast<unsigned long long>(ep->ContextRecord->Rip);
@@ -43,11 +45,25 @@ static LONG CALLBACK debugger_exception_veh(EXCEPTION_POINTERS* ep) {
         ep->ContextRecord->EFlags &= ~0x100UL;
         const unsigned long long ip = static_cast<unsigned long long>(ep->ContextRecord->Eip);
 #endif
+        MEMORY_BASIC_INFORMATION mbi{};
+        const SIZE_T vq = VirtualQuery(reinterpret_cast<LPCVOID>(static_cast<uintptr_t>(ip)), &mbi, sizeof(mbi));
+        const DWORD vq_gle = vq ? 0UL : GetLastError();
         const LONG count = InterlockedIncrement(&g_absorbed_single_step_count);
         if (count <= 32 || (count % 256) == 0) {
-            aida_target_printf("[target-debugger] absorbed external SINGLE_STEP count=%ld ip=0x%llX pid=%lu tid=%lu\n",
+            aida_target_printf("[target-debugger] absorbed external SINGLE_STEP count=%ld ip=0x%llX exception_addr=%p old_eflags=0x%08lX new_eflags=0x%08lX vq=%llu vq_gle=%lu base=%p alloc=%p size=0x%llX state=0x%08lX protect=0x%08lX type=0x%08lX pid=%lu tid=%lu\n",
                 count,
                 ip,
+                ep->ExceptionRecord->ExceptionAddress,
+                static_cast<unsigned long>(old_eflags),
+                static_cast<unsigned long>(ep->ContextRecord->EFlags),
+                static_cast<unsigned long long>(vq),
+                static_cast<unsigned long>(vq_gle),
+                mbi.BaseAddress,
+                mbi.AllocationBase,
+                static_cast<unsigned long long>(mbi.RegionSize),
+                static_cast<unsigned long>(mbi.State),
+                static_cast<unsigned long>(mbi.Protect),
+                static_cast<unsigned long>(mbi.Type),
                 static_cast<unsigned long>(GetCurrentProcessId()),
                 static_cast<unsigned long>(GetCurrentThreadId()));
         }

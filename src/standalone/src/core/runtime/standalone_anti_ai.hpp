@@ -435,6 +435,9 @@ namespace detail
             append_unique_root_w(roots, local + L"\\aida");
             append_unique_root_w(roots, local + L"\\aida\\camoufox\\current");
             append_unique_root_w(roots, local + L"\\aida\\embedded\\camoufox\\current");
+            append_unique_root_w(roots, local + L"\\aida\\standalone");
+            append_unique_root_w(roots, local + L"\\aida\\standalone\\camoufox\\current");
+            append_unique_root_w(roots, local + L"\\aida\\standalone\\embedded\\camoufox\\current");
         }
         const std::wstring temp = temp_dir_lower_w();
         if (!temp.empty())
@@ -2713,6 +2716,20 @@ namespace combined
         report.high_risk_mask |= bit;
     }
 
+    inline bool local_llm_has_confirmed_risk_context(const threat_report_t& report)
+    {
+        return report.memory_scanner_detected ||
+            report.re_tool_detected ||
+            report.debugger_tool_detected ||
+            report.dump_tool_detected ||
+            report.offensive_mcp_tool_detected ||
+            report.foreign_vm_write_handle ||
+            report.foreign_vm_operation_handle ||
+            report.foreign_create_thread_handle ||
+            (report.foreign_vm_read_handle && report.handle_owner_tool) ||
+            report.tool_targets_aida;
+    }
+
     inline threat_report_t full_scan()
     {
         const ULONGLONG scan_start_ms = GetTickCount64();
@@ -2840,11 +2857,23 @@ namespace combined
             static_cast<unsigned long long>(GetTickCount64() - windows_start_ms),
             static_cast<unsigned long long>(GetTickCount64() - scan_start_ms));
         report.tool_targets_aida = process_evidence.targets_aida || handle_report.owner_targets_aida || window_target.targeted;
-        report.llm_detected = report.local_llm_detected && (report.mcp_detected ||
-            report.ai_tool_detected || report.memory_scanner_detected ||
-            report.re_tool_detected || report.debugger_tool_detected ||
-            report.dump_tool_detected || report.handle_to_us_detected ||
-            report.tool_targets_aida);
+        report.llm_detected = report.local_llm_detected && local_llm_has_confirmed_risk_context(report);
+        if (report.local_llm_detected && !report.llm_detected)
+        {
+            diag::log_tagged_critical_fmt("guard",
+                "ai_tool_posture_local_llm_observed_only mcp=%d ai=%d mem=%d re=%d dbg=%d dump=%d offensive_mcp=%d handle_any=%d observed_handles=%u handle_owner_tool=%d target=%d",
+                report.mcp_detected ? 1 : 0,
+                report.ai_tool_detected ? 1 : 0,
+                report.memory_scanner_detected ? 1 : 0,
+                report.re_tool_detected ? 1 : 0,
+                report.debugger_tool_detected ? 1 : 0,
+                report.dump_tool_detected ? 1 : 0,
+                report.offensive_mcp_tool_detected ? 1 : 0,
+                report.handle_to_us_detected ? 1 : 0,
+                report.observed_handle_count,
+                report.handle_owner_tool ? 1 : 0,
+                report.tool_targets_aida ? 1 : 0);
+        }
         report.evidence_hash = process_evidence.evidence_hash;
         if (pipe_hash)
             report.evidence_hash = detail::mix_hash(report.evidence_hash, pipe_hash);
@@ -2937,6 +2966,75 @@ namespace combined
         return report;
     }
 
+}
+
+struct runtime_scan_result_t
+{
+    combined::threat_report_t report;
+    bool cached = false;
+    uint64_t cache_age_ms = 0;
+    uint64_t lock_wait_ms = 0;
+};
+
+inline runtime_scan_result_t full_scan_runtime_cached(uint64_t safe_cache_ms, const char* caller)
+{
+    static std::mutex s_runtime_scan_mutex;
+    static combined::threat_report_t s_last_safe_report{};
+    static uint64_t s_last_safe_ms = 0;
+    static uint64_t s_last_cache_log_ms = 0;
+
+    const uint64_t wait_start_ms = static_cast<uint64_t>(GetTickCount64());
+    std::unique_lock<std::mutex> lock(s_runtime_scan_mutex);
+    const uint64_t locked_ms = static_cast<uint64_t>(GetTickCount64());
+    runtime_scan_result_t result{};
+    result.lock_wait_ms = locked_ms >= wait_start_ms ? locked_ms - wait_start_ms : 0;
+
+    if (s_last_safe_ms != 0 && locked_ms >= s_last_safe_ms)
+    {
+        const uint64_t age_ms = locked_ms - s_last_safe_ms;
+        if (age_ms < safe_cache_ms && !s_last_safe_report.confirmed_high_risk())
+        {
+            result.report = s_last_safe_report;
+            result.cached = true;
+            result.cache_age_ms = age_ms;
+            if (s_last_cache_log_ms == 0 || locked_ms - s_last_cache_log_ms >= 10000ULL)
+            {
+                s_last_cache_log_ms = locked_ms;
+                diag::log_tagged_critical_fmt("guard",
+                    "ai_tool_posture_runtime_cached caller=%s age_ms=%llu wait_ms=%llu summary_hash=0x%016llX category_mask=0x%08X",
+                    caller ? caller : "<null>",
+                    static_cast<unsigned long long>(age_ms),
+                    static_cast<unsigned long long>(result.lock_wait_ms),
+                    static_cast<unsigned long long>(result.report.summary_hash),
+                    result.report.category_mask);
+            }
+            return result;
+        }
+    }
+
+    result.report = combined::full_scan();
+    const uint64_t complete_ms = static_cast<uint64_t>(GetTickCount64());
+    if (!result.report.confirmed_high_risk())
+    {
+        s_last_safe_report = result.report;
+        s_last_safe_ms = complete_ms;
+    }
+    else
+    {
+        s_last_safe_report = combined::threat_report_t{};
+        s_last_safe_ms = 0;
+    }
+    if (result.lock_wait_ms >= 250ULL)
+    {
+        diag::log_tagged_critical_fmt("guard",
+            "ai_tool_posture_runtime_scan_wait caller=%s wait_ms=%llu summary_hash=0x%016llX category_mask=0x%08X high_risk_mask=0x%08X",
+            caller ? caller : "<null>",
+            static_cast<unsigned long long>(result.lock_wait_ms),
+            static_cast<unsigned long long>(result.report.summary_hash),
+            result.report.category_mask,
+            result.report.high_risk_mask);
+    }
+    return result;
 }
 
 inline combined::threat_report_t full_scan()

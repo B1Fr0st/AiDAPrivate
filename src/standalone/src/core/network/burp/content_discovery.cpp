@@ -49,22 +49,23 @@ struct disc_t
 {
     uint64_t                            id = 0;
     config_t                            config;
-    std::mutex                          mtx;
+    std::timed_mutex                    mtx;
     std::atomic<bool>                   stop_flag{false};
     std::atomic<bool>                   finished{false};
-    disc_phase_t                        phase = disc_phase_t::pending;
+    std::atomic<disc_phase_t>           phase{disc_phase_t::pending};
     std::vector<candidate_t>            queue;
     std::unordered_set<std::string>     seen;
     std::vector<hit_t>                  hits_list;
     std::atomic<int>                    attempts{0};
     std::atomic<int>                    errors{0};
     std::atomic<int>                    filtered{0};
+    std::atomic<int>                    hits_count{0};
     std::atomic<int>                    in_flight{0};
-    int                                 total = 0;
-    uint64_t                            started_unix_ms = 0;
-    uint64_t                            finished_unix_ms = 0;
-    size_t                              calibrated_lo = 0;
-    size_t                              calibrated_hi = 0;
+    std::atomic<int>                    total{0};
+    std::atomic<uint64_t>               started_unix_ms{0};
+    std::atomic<uint64_t>               finished_unix_ms{0};
+    std::atomic<size_t>                 calibrated_lo{0};
+    std::atomic<size_t>                 calibrated_hi{0};
     std::string                         last_error;
     std::string                         last_url;
     std::regex                          compiled_filter_words;
@@ -73,7 +74,7 @@ struct disc_t
 
 struct registry_t
 {
-    std::mutex                                           mtx;
+    std::timed_mutex                                     mtx;
     std::unordered_map<uint64_t, std::shared_ptr<disc_t>> by_id;
     std::atomic<uint64_t>                                next_id{1};
     std::atomic<bool>                                    init_done{false};
@@ -82,6 +83,10 @@ struct registry_t
 };
 
 registry_t& reg() { static registry_t r; return r; }
+
+constexpr int kRegistryLockTimeoutMs = 250;
+constexpr int kRunLockTimeoutMs = 250;
+constexpr int kListLockTimeoutMs = 25;
 
 void set_err(const std::string& m)
 {
@@ -418,7 +423,7 @@ void worker_one(std::shared_ptr<disc_t> ctx, candidate_t cand)
     else
     {
         {
-            std::lock_guard<std::mutex> lk(d.mtx);
+            std::lock_guard<std::timed_mutex> lk(d.mtx);
             d.last_url = cand.url;
         }
         bool match = status_in_set(status, d.config.match_status);
@@ -428,9 +433,11 @@ void worker_one(std::shared_ptr<disc_t> ctx, candidate_t cand)
         {
             if (body_bytes >= d.config.filter_size_min && body_bytes <= d.config.filter_size_max) match = false;
         }
-        if (match && d.calibrated_lo > 0 && d.calibrated_hi > 0)
+        const size_t calibrated_lo = d.calibrated_lo.load(std::memory_order_acquire);
+        const size_t calibrated_hi = d.calibrated_hi.load(std::memory_order_acquire);
+        if (match && calibrated_lo > 0 && calibrated_hi > 0)
         {
-            if (body_bytes >= d.calibrated_lo && body_bytes <= d.calibrated_hi) match = false;
+            if (body_bytes >= calibrated_lo && body_bytes <= calibrated_hi) match = false;
         }
         if (match && d.has_filter_words)
         {
@@ -451,8 +458,9 @@ void worker_one(std::shared_ptr<disc_t> ctx, candidate_t cand)
             h.redirect_to = redirect;
             h.depth = cand.depth;
             {
-                std::lock_guard<std::mutex> lk(d.mtx);
+                std::lock_guard<std::timed_mutex> lk(d.mtx);
                 d.hits_list.push_back(std::move(h));
+                d.hits_count.store(static_cast<int>(d.hits_list.size()), std::memory_order_release);
             }
             publish_exchange(cand.url, status, body, content_type, hdr, d.config, lat);
 
@@ -461,33 +469,37 @@ void worker_one(std::shared_ptr<disc_t> ctx, candidate_t cand)
                 std::string next_base = cand.url;
                 if (next_base.back() != '/') next_base += "/";
                 next_base += "FUZZ";
+                auto wl_err = std::string();
+                auto entries = load_wordlist(d.config, wl_err);
+                if (entries.empty() && !wl_err.empty()) {
+                    diag::log_tagged_fmt("content_discovery", "worker_one recurse_wordlist_empty id=%llu url=%s err=%s",
+                        static_cast<unsigned long long>(ctx->id),
+                        cand.url.c_str(),
+                        wl_err.c_str());
+                }
+                if (!entries.empty())
                 {
-                    std::lock_guard<std::mutex> lk(d.mtx);
-                    auto wl_err = std::string();
-                    auto entries = load_wordlist(d.config, wl_err);
-                    if (!entries.empty())
+                    std::lock_guard<std::timed_mutex> lk(d.mtx);
+                    for (auto& e : entries)
                     {
-                        for (auto& e : entries)
+                        if (d.config.extensions.empty())
                         {
-                            if (d.config.extensions.empty())
+                            std::string nu = build_target_url(next_base, e);
+                            if (d.seen.insert(nu).second)
                             {
-                                std::string nu = build_target_url(next_base, e);
+                                candidate_t c; c.url = nu; c.payload = e; c.depth = cand.depth + 1;
+                                d.queue.push_back(std::move(c));
+                            }
+                        }
+                        else
+                        {
+                            for (auto& x : d.config.extensions)
+                            {
+                                std::string nu = build_target_url(next_base, e + x);
                                 if (d.seen.insert(nu).second)
                                 {
-                                    candidate_t c; c.url = nu; c.payload = e; c.depth = cand.depth + 1;
+                                    candidate_t c; c.url = nu; c.payload = e + x; c.depth = cand.depth + 1;
                                     d.queue.push_back(std::move(c));
-                                }
-                            }
-                            else
-                            {
-                                for (auto& x : d.config.extensions)
-                                {
-                                    std::string nu = build_target_url(next_base, e + x);
-                                    if (d.seen.insert(nu).second)
-                                    {
-                                        candidate_t c; c.url = nu; c.payload = e + x; c.depth = cand.depth + 1;
-                                        d.queue.push_back(std::move(c));
-                                    }
                                 }
                             }
                         }
@@ -514,13 +526,13 @@ void run_disc(std::shared_ptr<disc_t> ctx)
     if (d.finished.load()) return;
     if (d.stop_flag.load())
     {
-        std::lock_guard<std::mutex> lk(d.mtx);
+        std::lock_guard<std::timed_mutex> lk(d.mtx);
         d.queue.clear();
     }
     candidate_t next;
     bool has = false;
     {
-        std::lock_guard<std::mutex> lk(d.mtx);
+        std::lock_guard<std::timed_mutex> lk(d.mtx);
         if (!d.queue.empty())
         {
             next = std::move(d.queue.back());
@@ -536,11 +548,11 @@ void run_disc(std::shared_ptr<disc_t> ctx)
     if (d.in_flight.load() == 0)
     {
         if (d.finished.exchange(true)) return;
-        std::lock_guard<std::mutex> lk(d.mtx);
-        d.phase = disc_phase_t::complete;
-        d.finished_unix_ms = now_ms();
+        std::lock_guard<std::timed_mutex> lk(d.mtx);
+        d.phase.store(disc_phase_t::complete, std::memory_order_release);
+        d.finished_unix_ms.store(now_ms(), std::memory_order_release);
         diag::log_tagged_fmt("burp.content_discovery", "disc_finished id=%llu attempts=%d hits=%d errors=%d filtered=%d",
-            static_cast<unsigned long long>(d.id), d.attempts.load(), static_cast<int>(d.hits_list.size()), d.errors.load(), d.filtered.load());
+            static_cast<unsigned long long>(d.id), d.attempts.load(), d.hits_count.load(), d.errors.load(), d.filtered.load());
         return;
     }
     work_queue::post([ctx] { std::this_thread::sleep_for(std::chrono::milliseconds(50)); run_disc(ctx); });
@@ -579,8 +591,8 @@ bool auto_calibrate(disc_t& d)
     size_t hi = sizes.back();
     if (hi > 0) hi += hi / 20 + 8;
     if (lo > 8) lo -= 8;
-    d.calibrated_lo = lo;
-    d.calibrated_hi = hi;
+    d.calibrated_lo.store(lo, std::memory_order_release);
+    d.calibrated_hi.store(hi, std::memory_order_release);
     diag::log_tagged_fmt("content_discovery", "auto_calibrate result id=%llu lo=%zu hi=%zu samples=%zu",
         static_cast<unsigned long long>(d.id), lo, hi, sizes.size());
     return true;
@@ -606,13 +618,19 @@ void shutdown()
 {
     diag::log_tagged_fmt("content_discovery", "shutdown called");
     auto& r = reg();
-    if (!r.init_done.exchange(false)) {
+    if (!r.init_done.load(std::memory_order_acquire)) {
         diag::log_tagged_fmt("content_discovery", "shutdown skipped not_initialized");
         return;
     }
     std::vector<std::shared_ptr<disc_t>> snaps;
     {
-        std::lock_guard<std::mutex> lk(r.mtx);
+        std::unique_lock<std::timed_mutex> lk(r.mtx, std::defer_lock);
+        if (!lk.try_lock_for(std::chrono::milliseconds(kRegistryLockTimeoutMs))) {
+            diag::log_tagged_fmt("content_discovery", "shutdown_registry_lock_timeout phase=snapshot timeout_ms=%d", kRegistryLockTimeoutMs);
+            set_err("registry lock timeout");
+            return;
+        }
+        r.init_done.store(false, std::memory_order_release);
         snaps.reserve(r.by_id.size());
         for (auto& kv : r.by_id) { kv.second->stop_flag.store(true); snaps.push_back(kv.second); }
     }
@@ -625,7 +643,12 @@ void shutdown()
         std::this_thread::sleep_for(std::chrono::milliseconds(25));
     }
     {
-        std::lock_guard<std::mutex> lk(r.mtx);
+        std::unique_lock<std::timed_mutex> lk(r.mtx, std::defer_lock);
+        if (!lk.try_lock_for(std::chrono::milliseconds(kRegistryLockTimeoutMs))) {
+            diag::log_tagged_fmt("content_discovery", "shutdown_registry_lock_timeout phase=clear timeout_ms=%d", kRegistryLockTimeoutMs);
+            set_err("registry lock timeout");
+            return;
+        }
         r.by_id.clear();
     }
     diag::log_tagged_fmt("content_discovery", "shutdown complete");
@@ -655,11 +678,11 @@ uint64_t start(const config_t& cfg)
         try { ctx->compiled_filter_words = std::regex(cfg.filter_words_regex); ctx->has_filter_words = true; }
         catch (...) { ctx->has_filter_words = false; }
     }
-    ctx->phase = disc_phase_t::calibrating;
-    ctx->started_unix_ms = now_ms();
+    ctx->phase.store(disc_phase_t::calibrating, std::memory_order_release);
+    ctx->started_unix_ms.store(now_ms(), std::memory_order_release);
 
     {
-        std::lock_guard<std::mutex> lk(ctx->mtx);
+        std::lock_guard<std::timed_mutex> lk(ctx->mtx);
         for (auto& e : entries)
         {
             if (cfg.extensions.empty())
@@ -684,48 +707,169 @@ uint64_t start(const config_t& cfg)
                 }
             }
         }
-        ctx->total = static_cast<int>(ctx->queue.size());
+        ctx->total.store(static_cast<int>(ctx->queue.size()), std::memory_order_release);
     }
 
     {
-        std::lock_guard<std::mutex> lk(reg().mtx);
+        std::unique_lock<std::timed_mutex> lk(reg().mtx, std::defer_lock);
+        if (!lk.try_lock_for(std::chrono::milliseconds(kRegistryLockTimeoutMs))) {
+            diag::log_tagged_fmt("content_discovery", "start_registry_lock_timeout id=%llu target=%s timeout_ms=%d",
+                static_cast<unsigned long long>(ctx->id),
+                cfg.target_url.c_str(),
+                kRegistryLockTimeoutMs);
+            set_err("registry lock timeout");
+            return 0;
+        }
         reg().by_id[ctx->id] = ctx;
     }
     diag::log_tagged_fmt("burp.content_discovery", "disc_start id=%llu target=%s total=%d conc=%d delay=%d",
-        static_cast<unsigned long long>(ctx->id), cfg.target_url.c_str(), ctx->total, cfg.concurrency, cfg.delay_ms);
+        static_cast<unsigned long long>(ctx->id), cfg.target_url.c_str(), ctx->total.load(std::memory_order_acquire), cfg.concurrency, cfg.delay_ms);
 
-    work_queue::post([ctx] {
+    bool posted = work_queue::post([ctx] {
         if (ctx->config.auto_calibrate) auto_calibrate(*ctx);
         {
-            std::lock_guard<std::mutex> lk(ctx->mtx);
-            ctx->phase = disc_phase_t::running;
+            std::unique_lock<std::timed_mutex> lk(ctx->mtx, std::defer_lock);
+            if (lk.try_lock_for(std::chrono::milliseconds(kRunLockTimeoutMs)))
+                ctx->phase.store(disc_phase_t::running, std::memory_order_release);
+            else
+                diag::log_tagged_fmt("content_discovery", "start_phase_lock_timeout id=%llu timeout_ms=%d",
+                    static_cast<unsigned long long>(ctx->id),
+                    kRunLockTimeoutMs);
         }
         int kick = std::max(1, std::min(ctx->config.concurrency, 64));
+        int posted_kicks = 0;
         for (int i = 0; i < kick; ++i)
-            work_queue::post([ctx] { run_disc(ctx); });
+            if (work_queue::post([ctx] { run_disc(ctx); }))
+                ++posted_kicks;
+        if (posted_kicks == 0) {
+            std::unique_lock<std::timed_mutex> lk(ctx->mtx, std::defer_lock);
+            if (lk.try_lock_for(std::chrono::milliseconds(kRunLockTimeoutMs))) {
+                ctx->phase.store(disc_phase_t::error, std::memory_order_release);
+                ctx->last_error = "work queue post failed";
+                ctx->finished_unix_ms.store(now_ms(), std::memory_order_release);
+            }
+            ctx->finished.store(true, std::memory_order_release);
+            diag::log_tagged_fmt("content_discovery", "start_worker_posts_failed id=%llu kick=%d",
+                static_cast<unsigned long long>(ctx->id),
+                kick);
+        }
     });
+    if (!posted) {
+        {
+            std::unique_lock<std::timed_mutex> lk(ctx->mtx, std::defer_lock);
+            if (lk.try_lock_for(std::chrono::milliseconds(kRunLockTimeoutMs))) {
+                ctx->phase.store(disc_phase_t::error, std::memory_order_release);
+                ctx->last_error = "work queue post failed";
+                ctx->finished_unix_ms.store(now_ms(), std::memory_order_release);
+            }
+        }
+        ctx->finished.store(true, std::memory_order_release);
+        set_err("work queue post failed");
+        diag::log_tagged_fmt("content_discovery", "start_post_failed id=%llu target=%s",
+            static_cast<unsigned long long>(ctx->id),
+            cfg.target_url.c_str());
+        std::unique_lock<std::timed_mutex> reg_lk(reg().mtx, std::defer_lock);
+        if (reg_lk.try_lock_for(std::chrono::milliseconds(kRegistryLockTimeoutMs)))
+            reg().by_id.erase(ctx->id);
+        return 0;
+    }
 
     return ctx->id;
+}
+
+disc_status_t snapshot_contention_status(const std::shared_ptr<disc_t>& ctx, const char* op, int timeout_ms)
+{
+    disc_status_t out;
+    if (!ctx)
+        return out;
+    out.id = ctx->id;
+    out.phase = ctx->phase.load(std::memory_order_acquire);
+    out.attempts = ctx->attempts.load(std::memory_order_acquire);
+    out.total = ctx->total.load(std::memory_order_acquire);
+    out.hits = ctx->hits_count.load(std::memory_order_acquire);
+    out.filtered = ctx->filtered.load(std::memory_order_acquire);
+    out.errors = ctx->errors.load(std::memory_order_acquire);
+    out.started_unix_ms = ctx->started_unix_ms.load(std::memory_order_acquire);
+    out.finished_unix_ms = ctx->finished_unix_ms.load(std::memory_order_acquire);
+    out.calibrated_size_lo = ctx->calibrated_lo.load(std::memory_order_acquire);
+    out.calibrated_size_hi = ctx->calibrated_hi.load(std::memory_order_acquire);
+    out.config = ctx->config;
+    out.last_error = "status snapshot lock timeout";
+    diag::log_tagged_fmt("content_discovery", "status_lock_timeout op=%s id=%llu phase=%d attempts=%d total=%d hits=%d errors=%d filtered=%d in_flight=%d finished=%d stop=%d timeout_ms=%d",
+        op ? op : "<null>",
+        static_cast<unsigned long long>(ctx->id),
+        static_cast<int>(out.phase),
+        out.attempts,
+        out.total,
+        out.hits,
+        out.errors,
+        out.filtered,
+        ctx->in_flight.load(std::memory_order_acquire),
+        ctx->finished.load(std::memory_order_acquire) ? 1 : 0,
+        ctx->stop_flag.load(std::memory_order_acquire) ? 1 : 0,
+        timeout_ms);
+    return out;
+}
+
+void fill_status_locked(const std::shared_ptr<disc_t>& ctx, disc_status_t& out)
+{
+    out.id = ctx->id;
+    out.phase = ctx->phase.load(std::memory_order_acquire);
+    out.attempts = ctx->attempts.load(std::memory_order_acquire);
+    out.total = ctx->total.load(std::memory_order_acquire);
+    out.hits = ctx->hits_count.load(std::memory_order_acquire);
+    out.filtered = ctx->filtered.load(std::memory_order_acquire);
+    out.errors = ctx->errors.load(std::memory_order_acquire);
+    out.started_unix_ms = ctx->started_unix_ms.load(std::memory_order_acquire);
+    out.finished_unix_ms = ctx->finished_unix_ms.load(std::memory_order_acquire);
+    out.calibrated_size_lo = ctx->calibrated_lo.load(std::memory_order_acquire);
+    out.calibrated_size_hi = ctx->calibrated_hi.load(std::memory_order_acquire);
+    out.last_error = ctx->last_error;
+    out.last_url = ctx->last_url;
+    out.config = ctx->config;
+    out.hits_list = ctx->hits_list;
+}
+
+bool try_get_context(uint64_t id, std::shared_ptr<disc_t>& ctx, const char* op)
+{
+    std::unique_lock<std::timed_mutex> lk(reg().mtx, std::defer_lock);
+    if (!lk.try_lock_for(std::chrono::milliseconds(kRegistryLockTimeoutMs)))
+    {
+        diag::log_tagged_fmt("content_discovery", "registry_lock_timeout op=%s id=%llu timeout_ms=%d",
+            op ? op : "<null>",
+            static_cast<unsigned long long>(id),
+            kRegistryLockTimeoutMs);
+        set_err("registry lock timeout");
+        return false;
+    }
+    auto it = reg().by_id.find(id);
+    if (it == reg().by_id.end())
+        return false;
+    ctx = it->second;
+    return true;
 }
 
 bool stop(uint64_t id)
 {
     diag::log_tagged_fmt("content_discovery", "stop id=%llu", static_cast<unsigned long long>(id));
     std::shared_ptr<disc_t> ctx;
-    {
-        std::lock_guard<std::mutex> lk(reg().mtx);
-        auto it = reg().by_id.find(id);
-        if (it == reg().by_id.end()) {
-            diag::log_tagged_fmt("content_discovery", "stop id=%llu not_found", static_cast<unsigned long long>(id));
-            set_err("not found");
-            return false;
-        }
-        ctx = it->second;
+    if (!try_get_context(id, ctx, "stop")) {
+        diag::log_tagged_fmt("content_discovery", "stop id=%llu not_found_or_busy", static_cast<unsigned long long>(id));
+        set_err("not found");
+        return false;
     }
     ctx->stop_flag.store(true);
     {
-        std::lock_guard<std::mutex> lk(ctx->mtx);
-        if (ctx->phase != disc_phase_t::complete) ctx->phase = disc_phase_t::stopping;
+        std::unique_lock<std::timed_mutex> lk(ctx->mtx, std::defer_lock);
+        if (!lk.try_lock_for(std::chrono::milliseconds(kRunLockTimeoutMs))) {
+            diag::log_tagged_fmt("content_discovery", "stop_phase_lock_timeout id=%llu timeout_ms=%d",
+                static_cast<unsigned long long>(id),
+                kRunLockTimeoutMs);
+            diag::log_tagged_fmt("burp.content_discovery", "disc_stop id=%llu phase_deferred=1", static_cast<unsigned long long>(id));
+            return true;
+        }
+        if (ctx->phase.load(std::memory_order_acquire) != disc_phase_t::complete)
+            ctx->phase.store(disc_phase_t::stopping, std::memory_order_release);
     }
     diag::log_tagged_fmt("burp.content_discovery", "disc_stop id=%llu", static_cast<unsigned long long>(id));
     return true;
@@ -735,56 +879,64 @@ disc_status_t status(uint64_t id)
 {
     disc_status_t out;
     std::shared_ptr<disc_t> ctx;
-    {
-        std::lock_guard<std::mutex> lk(reg().mtx);
-        auto it = reg().by_id.find(id);
-        if (it == reg().by_id.end()) return out;
-        ctx = it->second;
-    }
-    std::lock_guard<std::mutex> lk(ctx->mtx);
-    out.id = ctx->id;
-    out.phase = ctx->phase;
-    out.attempts = ctx->attempts.load();
-    out.total = ctx->total;
-    out.hits = static_cast<int>(ctx->hits_list.size());
-    out.filtered = ctx->filtered.load();
-    out.errors = ctx->errors.load();
-    out.started_unix_ms = ctx->started_unix_ms;
-    out.finished_unix_ms = ctx->finished_unix_ms;
-    out.calibrated_size_lo = ctx->calibrated_lo;
-    out.calibrated_size_hi = ctx->calibrated_hi;
-    out.last_error = ctx->last_error;
-    out.last_url = ctx->last_url;
-    out.config = ctx->config;
-    out.hits_list = ctx->hits_list;
+    if (!try_get_context(id, ctx, "status"))
+        return out;
+    std::unique_lock<std::timed_mutex> lk(ctx->mtx, std::defer_lock);
+    if (!lk.try_lock_for(std::chrono::milliseconds(kRunLockTimeoutMs)))
+        return snapshot_contention_status(ctx, "status", kRunLockTimeoutMs);
+    fill_status_locked(ctx, out);
     return out;
 }
 
 std::vector<disc_status_t> list()
 {
-    std::vector<uint64_t> ids;
+    std::vector<std::shared_ptr<disc_t>> snaps;
     {
-        std::lock_guard<std::mutex> lk(reg().mtx);
-        ids.reserve(reg().by_id.size());
-        for (auto& kv : reg().by_id) ids.push_back(kv.first);
+        std::unique_lock<std::timed_mutex> lk(reg().mtx, std::defer_lock);
+        if (!lk.try_lock_for(std::chrono::milliseconds(kListLockTimeoutMs)))
+        {
+            diag::log_tagged_fmt("content_discovery", "registry_lock_timeout op=list timeout_ms=%d", kListLockTimeoutMs);
+            set_err("registry lock timeout");
+            return {};
+        }
+        snaps.reserve(reg().by_id.size());
+        for (auto& kv : reg().by_id) snaps.push_back(kv.second);
     }
-    std::sort(ids.begin(), ids.end());
+    std::sort(snaps.begin(), snaps.end(), [](const std::shared_ptr<disc_t>& a, const std::shared_ptr<disc_t>& b) {
+        const uint64_t aid = a ? a->id : 0;
+        const uint64_t bid = b ? b->id : 0;
+        return aid < bid;
+    });
     std::vector<disc_status_t> out;
-    out.reserve(ids.size());
-    for (auto id : ids) out.push_back(status(id));
+    out.reserve(snaps.size());
+    for (auto& ctx : snaps) {
+        if (!ctx)
+            continue;
+        std::unique_lock<std::timed_mutex> lk(ctx->mtx, std::defer_lock);
+        if (!lk.try_lock_for(std::chrono::milliseconds(kListLockTimeoutMs))) {
+            out.push_back(snapshot_contention_status(ctx, "list", kListLockTimeoutMs));
+            continue;
+        }
+        disc_status_t st;
+        fill_status_locked(ctx, st);
+        out.push_back(std::move(st));
+    }
     return out;
 }
 
 std::vector<hit_t> results(uint64_t id)
 {
     std::shared_ptr<disc_t> ctx;
-    {
-        std::lock_guard<std::mutex> lk(reg().mtx);
-        auto it = reg().by_id.find(id);
-        if (it == reg().by_id.end()) return {};
-        ctx = it->second;
+    if (!try_get_context(id, ctx, "results"))
+        return {};
+    std::unique_lock<std::timed_mutex> lk(ctx->mtx, std::defer_lock);
+    if (!lk.try_lock_for(std::chrono::milliseconds(kRunLockTimeoutMs))) {
+        diag::log_tagged_fmt("content_discovery", "results_lock_timeout id=%llu timeout_ms=%d",
+            static_cast<unsigned long long>(id),
+            kRunLockTimeoutMs);
+        set_err("results lock timeout");
+        return {};
     }
-    std::lock_guard<std::mutex> lk(ctx->mtx);
     return ctx->hits_list;
 }
 
@@ -792,15 +944,10 @@ bool remove(uint64_t id)
 {
     diag::log_tagged_fmt("content_discovery", "remove id=%llu", static_cast<unsigned long long>(id));
     std::shared_ptr<disc_t> ctx;
-    {
-        std::lock_guard<std::mutex> lk(reg().mtx);
-        auto it = reg().by_id.find(id);
-        if (it == reg().by_id.end()) {
-            diag::log_tagged_fmt("content_discovery", "remove id=%llu not_found", static_cast<unsigned long long>(id));
-            set_err("not found");
-            return false;
-        }
-        ctx = it->second;
+    if (!try_get_context(id, ctx, "remove")) {
+        diag::log_tagged_fmt("content_discovery", "remove id=%llu not_found_or_busy", static_cast<unsigned long long>(id));
+        set_err("not found");
+        return false;
     }
     ctx->stop_flag.store(true);
     for (int i = 0; i < 40; ++i)
@@ -809,7 +956,14 @@ bool remove(uint64_t id)
         std::this_thread::sleep_for(std::chrono::milliseconds(25));
     }
     {
-        std::lock_guard<std::mutex> lk(reg().mtx);
+        std::unique_lock<std::timed_mutex> lk(reg().mtx, std::defer_lock);
+        if (!lk.try_lock_for(std::chrono::milliseconds(kRegistryLockTimeoutMs))) {
+            diag::log_tagged_fmt("content_discovery", "remove_registry_lock_timeout id=%llu timeout_ms=%d",
+                static_cast<unsigned long long>(id),
+                kRegistryLockTimeoutMs);
+            set_err("registry lock timeout");
+            return false;
+        }
         reg().by_id.erase(id);
     }
     diag::log_tagged_fmt("content_discovery", "remove id=%llu complete", static_cast<unsigned long long>(id));

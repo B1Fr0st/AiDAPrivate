@@ -13,13 +13,16 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <mutex>
 #include <regex>
 #include <string>
+#include <system_error>
 #include <vector>
 
 namespace aida {
@@ -297,10 +300,65 @@ void clear()
 bool export_csv(const std::string& path, const log_filter_t& f)
 {
     diag::log_tagged_fmt("logger", "export_csv entry path=%s", path.c_str());
+    if (path.empty()) {
+        diag::log_tagged_fmt("logger", "export_csv invalid_path path_empty=1 errno=%d gle=%lu", EINVAL, static_cast<unsigned long>(ERROR_INVALID_PARAMETER));
+        set_err("burp_logger.export_csv path_empty=1 errno=22 gle=87");
+        return false;
+    }
+    const std::filesystem::path fs_path(path);
+    const std::filesystem::path parent = fs_path.parent_path();
+    if (!parent.empty()) {
+        std::error_code parent_ec;
+        const bool parent_exists = std::filesystem::exists(parent, parent_ec);
+        if (parent_ec) {
+            diag::log_tagged_fmt("logger",
+                "export_csv parent_exists_failed path=%s parent=%s ec=%d message=%s errno=%d gle=%lu",
+                path.c_str(),
+                parent.string().c_str(),
+                parent_ec.value(),
+                parent_ec.message().c_str(),
+                errno,
+                static_cast<unsigned long>(GetLastError()));
+            set_err("burp_logger.export_csv parent_exists_failed path=" + path + " parent=" + parent.string() + " ec=" + std::to_string(parent_ec.value()) + " errno=" + std::to_string(errno) + " gle=" + std::to_string(GetLastError()));
+            return false;
+        }
+        if (!parent_exists) {
+            errno = 0;
+            SetLastError(ERROR_SUCCESS);
+            std::error_code mkdir_ec;
+            const bool created = std::filesystem::create_directories(parent, mkdir_ec);
+            const int mkdir_errno = errno;
+            const DWORD mkdir_gle = GetLastError();
+            diag::log_tagged_fmt("logger",
+                "export_csv parent_create path=%s parent=%s created=%d ec=%d message=%s errno=%d gle=%lu",
+                path.c_str(),
+                parent.string().c_str(),
+                created ? 1 : 0,
+                mkdir_ec.value(),
+                mkdir_ec.message().c_str(),
+                mkdir_errno,
+                static_cast<unsigned long>(mkdir_gle));
+            if (mkdir_ec) {
+                set_err("burp_logger.export_csv parent_create_failed path=" + path + " parent=" + parent.string() + " ec=" + std::to_string(mkdir_ec.value()) + " errno=" + std::to_string(mkdir_errno) + " gle=" + std::to_string(mkdir_gle));
+                return false;
+            }
+        } else {
+            diag::log_tagged_fmt("logger", "export_csv parent_ready path=%s parent=%s", path.c_str(), parent.string().c_str());
+        }
+    }
+    errno = 0;
+    SetLastError(ERROR_SUCCESS);
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    const int open_errno = errno;
+    const DWORD open_gle = GetLastError();
     if (!out.is_open()) {
-        diag::log_tagged_fmt("logger", "export_csv open_failed path=%s", path.c_str());
-        set_err("burp_logger.export_csv: cannot open output");
+        diag::log_tagged_fmt("logger",
+            "export_csv open_failed path=%s parent=%s errno=%d gle=%lu",
+            path.c_str(),
+            parent.empty() ? "" : parent.string().c_str(),
+            open_errno,
+            static_cast<unsigned long>(open_gle));
+        set_err("burp_logger.export_csv open_failed path=" + path + " parent=" + (parent.empty() ? std::string() : parent.string()) + " errno=" + std::to_string(open_errno) + " gle=" + std::to_string(open_gle));
         return false;
     }
     out << "id,ts_ms,method,url,host,port,status,req_len,resp_len,latency_ms,mime,source\r\n";
@@ -315,7 +373,44 @@ bool export_csv(const std::string& path, const log_filter_t& f)
             << csv_quote(r.mime_type) << ','
             << csv_quote(source_label(r.source)) << "\r\n";
     }
-    diag::log_tagged_fmt("logger", "export_csv done path=%s rows=%zu", path.c_str(), rows.size());
+    errno = 0;
+    SetLastError(ERROR_SUCCESS);
+    out.flush();
+    const bool flush_ok = out.good();
+    const int flush_errno = errno;
+    const DWORD flush_gle = GetLastError();
+    errno = 0;
+    SetLastError(ERROR_SUCCESS);
+    out.close();
+    const bool close_ok = !out.fail();
+    const int close_errno = errno;
+    const DWORD close_gle = GetLastError();
+    std::error_code size_ec;
+    const auto final_size = std::filesystem::file_size(fs_path, size_ec);
+    diag::log_tagged_fmt("logger",
+        "export_csv done path=%s rows=%zu flush_ok=%d flush_errno=%d flush_gle=%lu close_ok=%d close_errno=%d close_gle=%lu file_size=%llu size_ec=%d size_message=%s",
+        path.c_str(),
+        rows.size(),
+        flush_ok ? 1 : 0,
+        flush_errno,
+        static_cast<unsigned long>(flush_gle),
+        close_ok ? 1 : 0,
+        close_errno,
+        static_cast<unsigned long>(close_gle),
+        static_cast<unsigned long long>(size_ec ? 0 : final_size),
+        size_ec.value(),
+        size_ec.message().c_str());
+    if (!flush_ok || !close_ok || size_ec) {
+        set_err("burp_logger.export_csv write_verify_failed path=" + path +
+            " flush_ok=" + std::to_string(flush_ok ? 1 : 0) +
+            " flush_errno=" + std::to_string(flush_errno) +
+            " flush_gle=" + std::to_string(flush_gle) +
+            " close_ok=" + std::to_string(close_ok ? 1 : 0) +
+            " close_errno=" + std::to_string(close_errno) +
+            " close_gle=" + std::to_string(close_gle) +
+            " size_ec=" + std::to_string(size_ec.value()));
+        return false;
+    }
     return true;
 }
 

@@ -178,6 +178,38 @@ bool write_json_atomic(const fs::path& path, const nlohmann::json& value) {
 	return !ec;
 }
 
+bool ensure_bridge_layout(const fs::path& bridge, std::string* error_out) {
+	if (bridge.empty()) {
+		if (error_out) *error_out = "bridge directory is empty";
+		return false;
+	}
+	std::error_code ec;
+	fs::create_directories(bridge, ec);
+	if (ec) {
+		if (error_out) *error_out = "failed to create bridge directory: " + ec.message();
+		return false;
+	}
+	ec.clear();
+	fs::create_directories(bridge / L"requests", ec);
+	if (ec) {
+		if (error_out) *error_out = "failed to create bridge requests directory: " + ec.message();
+		return false;
+	}
+	ec.clear();
+	fs::create_directories(bridge / L"responses", ec);
+	if (ec) {
+		if (error_out) *error_out = "failed to create bridge responses directory: " + ec.message();
+		return false;
+	}
+	ec.clear();
+	fs::create_directories(bridge / L"artifacts", ec);
+	if (ec) {
+		if (error_out) *error_out = "failed to create bridge artifacts directory: " + ec.message();
+		return false;
+	}
+	return true;
+}
+
 bool read_json_limited(const fs::path& path, nlohmann::json& out, std::string* error_out) {
 	std::error_code ec;
 	uintmax_t size = fs::file_size(path, ec);
@@ -218,25 +250,44 @@ std::string make_request_id() {
 }
 
 void activate(const std::wstring& session_dir, const std::wstring& sample_path) {
+	std::string error;
+	(void)activate_bridge(session_dir, (fs::path(session_dir) / L"output").wstring(), sample_path, "windows_sandbox", &error);
+}
+
+bool activate_bridge(const std::wstring& session_dir,
+                     const std::wstring& bridge_dir,
+                     const std::wstring& sample_path,
+                     const std::string& bridge_kind,
+                     std::string* error_out) {
+	fs::path bridge(bridge_dir);
+	std::string error;
+	if (!ensure_bridge_layout(bridge, &error)) {
+		if (error_out) *error_out = error;
+		diag::log_tagged_fmt("vm_guest_bridge",
+			"activate_failed session_dir='%s' bridge_dir='%s' kind='%s' error='%s'",
+			narrow_utf8(session_dir).c_str(),
+			narrow_utf8(bridge_dir).c_str(),
+			bridge_kind.c_str(),
+			error.c_str());
+		return false;
+	}
 	std::lock_guard<std::mutex> lk(g_mtx);
 	active_session_t next;
 	next.active = true;
 	next.session_dir = session_dir;
-	next.bridge_dir = (fs::path(session_dir) / L"output").wstring();
+	next.bridge_dir = bridge.wstring();
 	next.sample_path = sample_path;
+	next.bridge_kind = bridge_kind.empty() ? "custom" : bridge_kind;
 	next.started_ms = now_ms();
-	std::error_code ec;
-	fs::create_directories(fs::path(next.bridge_dir) / L"requests", ec);
-	ec.clear();
-	fs::create_directories(fs::path(next.bridge_dir) / L"responses", ec);
-	ec.clear();
-	fs::create_directories(fs::path(next.bridge_dir) / L"artifacts", ec);
 	g_session = std::move(next);
 	diag::log_tagged_fmt("vm_guest_bridge",
-		"activated session_dir='%s' bridge_dir='%s' sample='%s'",
+		"activated session_dir='%s' bridge_dir='%s' sample='%s' kind='%s'",
 		narrow_utf8(g_session.session_dir).c_str(),
 		narrow_utf8(g_session.bridge_dir).c_str(),
-		narrow_utf8(g_session.sample_path).c_str());
+		narrow_utf8(g_session.sample_path).c_str(),
+		g_session.bridge_kind.c_str());
+	if (error_out) error_out->clear();
+	return true;
 }
 
 void deactivate() {
@@ -259,6 +310,71 @@ active_session_t current() {
 	return g_session;
 }
 
+bool prepare_bridge_directory(const std::wstring& bridge_dir,
+                              const std::wstring& guest_sample_path,
+                              const std::wstring& guest_args,
+                              std::string* error_out) {
+	fs::path bridge(bridge_dir);
+	std::string error;
+	if (!ensure_bridge_layout(bridge, &error)) {
+		if (error_out) *error_out = error;
+		return false;
+	}
+	nlohmann::json cfg;
+	cfg["sample"] = narrow_utf8(guest_sample_path);
+	cfg["args"] = narrow_utf8(guest_args);
+	cfg["created_host_ms"] = now_ms();
+	cfg["bridge_format"] = 1;
+	cfg["agent"] = "AiDAGuestAgent";
+	if (!write_json_atomic(bridge / L"launch_config.json", cfg)) {
+		if (error_out) *error_out = "failed to write launch_config.json";
+		return false;
+	}
+	if (error_out) error_out->clear();
+	return true;
+}
+
+nlohmann::json status_snapshot() {
+	active_session_t session = current();
+	nlohmann::json out;
+	out["active"] = session.active;
+	out["session_dir"] = narrow_utf8(session.session_dir);
+	out["bridge_dir"] = narrow_utf8(session.bridge_dir);
+	out["sample_path"] = narrow_utf8(session.sample_path);
+	out["bridge_kind"] = session.bridge_kind;
+	out["started_ms"] = session.started_ms;
+	if (!session.active)
+		return out;
+	fs::path bridge(session.bridge_dir);
+	fs::path requests = bridge / L"requests";
+	fs::path responses = bridge / L"responses";
+	fs::path artifacts = bridge / L"artifacts";
+	std::string bridge_error;
+	std::string requests_error;
+	std::string responses_error;
+	std::string artifacts_error;
+	out["bridge_exists"] = exists_clean(bridge, &bridge_error);
+	out["requests_exists"] = exists_clean(requests, &requests_error);
+	out["responses_exists"] = exists_clean(responses, &responses_error);
+	out["artifacts_exists"] = exists_clean(artifacts, &artifacts_error);
+	out["pending_requests"] = count_json_files(requests);
+	out["pending_responses"] = count_json_files(responses);
+	out["bridge_error"] = bridge_error;
+	out["requests_error"] = requests_error;
+	out["responses_error"] = responses_error;
+	out["artifacts_error"] = artifacts_error;
+	nlohmann::json guest_status;
+	std::string status_error;
+	if (read_json_limited(bridge / L"status.json", guest_status, &status_error)) {
+		out["guest_status"] = guest_status;
+		out["guest_status_available"] = true;
+	} else {
+		out["guest_status_available"] = false;
+		out["guest_status_error"] = status_error;
+	}
+	return out;
+}
+
 nlohmann::json request(const std::string& command,
                        const nlohmann::json& params,
                        uint32_t timeout_ms,
@@ -269,7 +385,7 @@ nlohmann::json request(const std::string& command,
 		session = g_session;
 	}
 	if (!session.active) {
-		if (error_out) *error_out = "no active Windows Sandbox VM bridge";
+		if (error_out) *error_out = "no active VM bridge";
 		return {};
 	}
 	if (timeout_ms == 0) timeout_ms = 5000;

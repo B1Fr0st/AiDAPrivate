@@ -84,6 +84,8 @@ public:
 
     std::optional<uint64_t> max_value_bv(const std::string& var, int width);
     std::optional<uint64_t> min_value_bv(const std::string& var, int width);
+    std::optional<uint64_t> max_value_bv(const std::string& var, int width, uint32_t timeout_ms);
+    std::optional<uint64_t> min_value_bv(const std::string& var, int width, uint32_t timeout_ms);
 
     std::string      to_smtlib2() const;
 
@@ -92,6 +94,18 @@ public:
 private:
     struct impl_t;
     std::unique_ptr<impl_t> m_impl;
+};
+
+class SmtContextPool
+{
+public:
+    explicit SmtContextPool(uint32_t default_timeout_ms = 5000);
+
+    std::unique_ptr<SmtContext> create_context() const;
+    uint32_t default_timeout_ms() const;
+
+private:
+    uint32_t m_default_timeout_ms;
 };
 
 nlohmann::json to_json(const solve_result_t& r);

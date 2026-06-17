@@ -20,7 +20,7 @@ struct launch_config_t
     std::string              session_id        = "default";
     bool                     headless           = false;
     std::string              proxy;
-    std::string              os                 = "auto";
+    std::string              os                 = "windows";
     std::string              locale             = "auto";
     bool                     humanize           = false;
     bool                     geoip              = false;
@@ -94,6 +94,7 @@ struct bridge_status_t
     bool           webrtc_blocked  = false;
     bool           privacy_verified = false;
     nlohmann::json privacy_diagnostics;
+    nlohmann::json last_launch_diagnostics;
     bool           page_verified    = false;
     bool           child_alive      = false;
     bool           cleanup_pending  = false;

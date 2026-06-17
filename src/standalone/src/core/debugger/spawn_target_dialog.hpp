@@ -18,6 +18,7 @@
 
 #include <cstring>
 #include <cstdio>
+#include <filesystem>
 #include <string>
 
 #include "imgui/imgui.h"
@@ -27,6 +28,7 @@
 #include "../helpers/diag_log.hpp"
 #include "../helpers/win32_dialog.hpp"
 #include "../runtime/run_target.hpp"
+#include "../runtime/vm_guest_bridge.hpp"
 #include "../ui/toast_notification.hpp"
 #include "../auth/auth_browser_launch.hpp"
 
@@ -65,6 +67,21 @@ inline char* args_buf() {
 }
 
 inline char* cwd_buf() {
+	static char buf[1024] = {};
+	return buf;
+}
+
+inline char* custom_bridge_buf() {
+	static char buf[1024] = {};
+	return buf;
+}
+
+inline char* custom_guest_bridge_buf() {
+	static char buf[1024] = {};
+	return buf;
+}
+
+inline char* custom_guest_sample_buf() {
 	static char buf[1024] = {};
 	return buf;
 }
@@ -159,10 +176,18 @@ inline std::wstring& last_sandbox_dir() {
 	return v;
 }
 
+inline std::wstring& last_custom_bridge_dir() {
+	static std::wstring v;
+	return v;
+}
+
 inline void reset_inputs() {
 	std::memset(exe_buf(), 0, 1024);
 	std::memset(args_buf(), 0, 2048);
 	std::memset(cwd_buf(), 0, 1024);
+	std::memset(custom_bridge_buf(), 0, 1024);
+	std::memset(custom_guest_bridge_buf(), 0, 1024);
+	std::memset(custom_guest_sample_buf(), 0, 1024);
 	isolation_choice() = static_cast<int>(run_target::isolation_t::windows_sandbox);
 	run_mode_choice() = 0;
 	host_confirm_open() = false;
@@ -222,6 +247,151 @@ inline std::string trim(const char* s) {
 	}
 	if (i > 0) out.erase(0, i);
 	return out;
+}
+
+inline std::wstring resolve_guest_agent_exe() {
+	wchar_t module_path[MAX_PATH] = {};
+	DWORD n = GetModuleFileNameW(nullptr, module_path, MAX_PATH);
+	if (n == 0 || n >= MAX_PATH) return {};
+	std::filesystem::path p(module_path);
+	std::filesystem::path agent = p.parent_path() / L"AiDAGuestAgent.exe";
+	std::error_code ec;
+	if (!std::filesystem::exists(agent, ec) || ec) return {};
+	return agent.wstring();
+}
+
+inline std::string join_guest_path(std::string base, const std::string& leaf) {
+	if (base.empty()) return leaf;
+	while (!base.empty() && (base.back() == '\\' || base.back() == '/')) base.pop_back();
+	return base + "\\" + leaf;
+}
+
+inline std::string quote_arg(std::string value) {
+	std::string out;
+	out.reserve(value.size() + 2);
+	out.push_back('"');
+	for (char c : value) {
+		if (c == '"') out += "\\\"";
+		else out.push_back(c);
+	}
+	out.push_back('"');
+	return out;
+}
+
+inline std::string custom_guest_command() {
+	std::string guest_bridge = trim(custom_guest_bridge_buf());
+	if (guest_bridge.empty()) return {};
+	std::string agent = join_guest_path(guest_bridge, "agent\\AiDAGuestAgent.exe");
+	return quote_arg(agent) + " --bridge " + quote_arg(guest_bridge);
+}
+
+inline void open_custom_vm_guide() {
+	std::filesystem::path rel = L"docs\\custom-vm-bridge-guide.md";
+	std::error_code ec;
+	std::filesystem::path candidates[4];
+	candidates[0] = std::filesystem::current_path(ec) / rel;
+	wchar_t module_path[MAX_PATH] = {};
+	DWORD n = GetModuleFileNameW(nullptr, module_path, MAX_PATH);
+	if (n > 0 && n < MAX_PATH) {
+		std::filesystem::path module_dir = std::filesystem::path(module_path).parent_path();
+		candidates[1] = module_dir / rel;
+		candidates[2] = module_dir.parent_path() / rel;
+		candidates[3] = module_dir.parent_path().parent_path() / rel;
+	}
+	for (const auto& candidate : candidates) {
+		ec.clear();
+		if (!candidate.empty() && std::filesystem::exists(candidate, ec) && !ec) {
+			ShellExecuteW(g_hwnd, L"open", candidate.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+			return;
+		}
+	}
+	toast_notification::push("Custom VM guide is in docs\\custom-vm-bridge-guide.md.", toast_notification::toast_type_t::info, 5.0f);
+}
+
+inline bool activate_custom_bridge() {
+	std::string host_bridge_trim = trim(custom_bridge_buf());
+	std::string guest_bridge_trim = trim(custom_guest_bridge_buf());
+	std::string exe_trim = trim(exe_buf());
+	std::string args_trim = trim(args_buf());
+	std::string guest_sample_trim = trim(custom_guest_sample_buf());
+	if (host_bridge_trim.empty()) {
+		toast_notification::push("Choose a host bridge folder first.", toast_notification::toast_type_t::error, 4.0f);
+		return false;
+	}
+	if (guest_bridge_trim.empty()) {
+		toast_notification::push("Enter the guest path for the shared bridge folder.", toast_notification::toast_type_t::error, 4.0f);
+		return false;
+	}
+	std::wstring host_bridge = widen_utf8(host_bridge_trim.c_str());
+	std::wstring guest_sample = widen_utf8(guest_sample_trim.c_str());
+	std::wstring args = widen_utf8(args_trim.c_str());
+	std::filesystem::path host_bridge_path(host_bridge);
+	std::error_code ec;
+	std::filesystem::create_directories(host_bridge_path / L"samples", ec);
+	if (ec) {
+		toast_notification::push("Could not create bridge samples folder: " + ec.message(), toast_notification::toast_type_t::error, 5.0f);
+		return false;
+	}
+	ec.clear();
+	std::filesystem::create_directories(host_bridge_path / L"agent", ec);
+	if (ec) {
+		toast_notification::push("Could not create bridge agent folder: " + ec.message(), toast_notification::toast_type_t::error, 5.0f);
+		return false;
+	}
+	if (!exe_trim.empty()) {
+		std::filesystem::path host_sample(widen_utf8(exe_trim.c_str()));
+		ec.clear();
+		if (!std::filesystem::exists(host_sample, ec) || ec || std::filesystem::is_directory(host_sample, ec)) {
+			toast_notification::push("Host sample path is not a readable file.", toast_notification::toast_type_t::error, 5.0f);
+			return false;
+		}
+		ec.clear();
+		std::filesystem::copy_file(host_sample, host_bridge_path / L"samples" / host_sample.filename(),
+			std::filesystem::copy_options::overwrite_existing, ec);
+		if (ec) {
+			toast_notification::push("Could not stage sample into bridge: " + ec.message(), toast_notification::toast_type_t::error, 5.0f);
+			return false;
+		}
+		if (guest_sample.empty()) {
+			std::wstring host_sample_filename_w = host_sample.filename().wstring();
+			std::string host_sample_filename = narrow_utf8(host_sample_filename_w.c_str());
+			std::string guest_sample_auto = join_guest_path(join_guest_path(guest_bridge_trim, "samples"), host_sample_filename);
+			std::strncpy(custom_guest_sample_buf(), guest_sample_auto.c_str(), 1023);
+			custom_guest_sample_buf()[1023] = '\0';
+			guest_sample = widen_utf8(guest_sample_auto.c_str());
+		}
+	}
+	std::wstring agent_src = resolve_guest_agent_exe();
+	if (agent_src.empty()) {
+		toast_notification::push("AiDAGuestAgent.exe is missing beside AiDAStandalone.exe.", toast_notification::toast_type_t::error, 6.0f);
+		return false;
+	}
+	ec.clear();
+	std::filesystem::copy_file(std::filesystem::path(agent_src), host_bridge_path / L"agent" / L"AiDAGuestAgent.exe",
+		std::filesystem::copy_options::overwrite_existing, ec);
+	if (ec) {
+		toast_notification::push("Could not stage AiDAGuestAgent.exe: " + ec.message(), toast_notification::toast_type_t::error, 5.0f);
+		return false;
+	}
+	std::string error;
+	if (!vm_guest_bridge::prepare_bridge_directory(host_bridge, guest_sample, args, &error)) {
+		toast_notification::push("Bridge setup failed: " + error, toast_notification::toast_type_t::error, 5.0f);
+		return false;
+	}
+	if (!vm_guest_bridge::activate_bridge(host_bridge, host_bridge, guest_sample, "custom_vm", &error)) {
+		toast_notification::push("Bridge activation failed: " + error, toast_notification::toast_type_t::error, 5.0f);
+		return false;
+	}
+	last_custom_bridge_dir() = host_bridge;
+	std::string guest_sample_utf8 = narrow_utf8(guest_sample.c_str());
+	diag::log_tagged_critical_fmt("spawn",
+		"custom_vm_bridge_activated host_bridge='%s' guest_bridge='%s' guest_sample='%s' args_len=%zu",
+		host_bridge_trim.c_str(),
+		guest_bridge_trim.c_str(),
+		guest_sample_utf8.c_str(),
+		args_trim.size());
+	toast_notification::push("Custom VM bridge activated. Start the guest command inside the VM.", toast_notification::toast_type_t::success, 5.0f);
+	return true;
 }
 
 inline void open_url(const wchar_t* url) {
@@ -373,6 +543,26 @@ inline void browse_working_dir() {
 		"spawn_browse_cwd_selected path='%s'", picked.c_str());
 }
 
+inline void browse_custom_bridge_dir() {
+	diag::log_tagged_critical("file_dialog", "spawn_target.browse_custom_bridge invoking show_open_folder_dialog_ex");
+	std::string current = trim(custom_bridge_buf());
+	std::wstring initial = current.empty() ? std::wstring() : widen_utf8(current.c_str());
+	std::string picked;
+	if (!win32_dialog::show_open_folder_dialog_ex(g_hwnd,
+			L"Select host-side custom VM bridge folder",
+			initial.empty() ? nullptr : initial.c_str(),
+			picked,
+			"spawn_target::browse_custom_bridge")) {
+		diag::log_tagged_critical("file_dialog", "spawn_target.browse_custom_bridge cancelled_or_failed");
+		return;
+	}
+	if (picked.empty()) return;
+	std::strncpy(custom_bridge_buf(), picked.c_str(), 1023);
+	custom_bridge_buf()[1023] = '\0';
+	diag::log_tagged_critical_fmt("dialog",
+		"spawn_browse_custom_bridge_selected path='%s'", picked.c_str());
+}
+
 }
 
 inline bool is_open() {
@@ -446,20 +636,21 @@ inline void render() {
 
 		if (caption) ImGui::PushFont(caption);
 		ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(tk.text_secondary),
-		                   "Choose Run in VM or Run in Host every time you launch a sample.");
+		                   "Choose Windows Sandbox, Custom VM, or Host every time you launch a sample.");
 		if (caption) ImGui::PopFont();
 		ImGui::Dummy(ImVec2(0.f, 4.f));
 
 		if (body_font) ImGui::PushFont(body_font);
 
+		const bool top_custom_mode = detail::run_mode_choice() == 1;
 		ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(tk.text_secondary),
-		                   "Executable path");
+		                   top_custom_mode ? "Host sample path (optional, staged into the bridge)" : "Executable path");
 		float browse_btn_w = 96.f;
 		float input_w = ImGui::GetContentRegionAvail().x - browse_btn_w - 10.f;
 		if (input_w < 200.f) input_w = 200.f;
 
 		aida::ui::input_text("##spawn_exe_path", detail::exe_buf(), 1024,
-		                     "C:\\path\\to\\target.exe", false,
+		                     top_custom_mode ? "C:\\samples\\target.exe" : "C:\\path\\to\\target.exe", false,
 		                     ImVec2(input_w, 36.f));
 		ImGui::SameLine();
 		if (aida::ui::button("Browse...", aida::ui::button_kind_t::secondary,
@@ -488,24 +679,27 @@ inline void render() {
 
 		{
 			int& mode = detail::run_mode_choice();
-			ImGui::RadioButton("Run in VM", &mode, 0);
-			ImGui::SameLine(0.f, 28.f);
-			ImGui::RadioButton("Run in Host", &mode, 1);
+			ImGui::RadioButton("Windows Sandbox", &mode, 0);
+			ImGui::SameLine(0.f, 20.f);
+			ImGui::RadioButton("Custom VM", &mode, 1);
+			ImGui::SameLine(0.f, 20.f);
+			ImGui::RadioButton("Host", &mode, 2);
 			detail::isolation_choice() = mode == 0
 				? static_cast<int>(run_target::isolation_t::windows_sandbox)
 				: static_cast<int>(run_target::isolation_t::same_desktop_jobbed);
 		}
 
 		ImGui::Dummy(ImVec2(0.f, 4.f));
-		const bool vm_mode = detail::run_mode_choice() == 0;
-		if (vm_mode) {
+		const bool sandbox_mode = detail::run_mode_choice() == 0;
+		const bool custom_vm_mode = detail::run_mode_choice() == 1;
+		if (sandbox_mode) {
 			if (caption) ImGui::PushFont(caption);
 			ImGui::TextWrapped("First-time setup for Run in VM");
 			ImGui::BulletText("Windows edition: Pro, Enterprise, or Education. Windows Home users need a full VM such as VMware Workstation Pro or VirtualBox.");
 			ImGui::BulletText("For QEMU, VirtualBox, or VMware, keep AiDAStandalone.exe on the host. Do not copy AiDAStandalone.exe into the guest VM.");
 			ImGui::BulletText("Run only the target sample and your MCP client or guest agent in the guest VM. Route that client through an authenticated host bridge or tunnel that terminates at AiDA's localhost MCP endpoint.");
 			ImGui::BulletText("Do not bind AiDA's MCP endpoint directly to a guest, LAN, or untrusted adapter. MCP tools can mutate host files, sessions, debugger state, and process memory.");
-			ImGui::BulletText("Custom VM workflows use the normal AiDA MCP tools with explicit target selection, including list_processes, sessions_manage action=attach_pid, read_memory, query_memory, dbg_get_modules_detail, and disassemble_zydis.");
+			ImGui::BulletText("For VMware, VirtualBox, QEMU, Hyper-V, or a manual Windows VM, use Custom VM mode to activate a shared-folder bridge through AiDAGuestAgent.");
 			ImGui::BulletText("Download for full VM fallback: VMware Workstation Pro or Oracle VirtualBox, then a Windows evaluation ISO.");
 			ImGui::BulletText("BIOS/UEFI: enable Intel VT-x or AMD-V/SVM, then boot back into Windows.");
 			ImGui::BulletText("Admin PowerShell: Enable-WindowsOptionalFeature -Online -FeatureName Containers-DisposableClientVM -All");
@@ -539,6 +733,56 @@ inline void render() {
 			if (aida::ui::button("VirtualBox", aida::ui::button_kind_t::secondary,
 			                     aida::ui::size_t_::sm, ImVec2(108.f, 30.f), false, nullptr, false)) {
 				detail::open_url(L"https://www.virtualbox.org/wiki/Downloads");
+			}
+		} else if (custom_vm_mode) {
+			if (caption) ImGui::PushFont(caption);
+			ImGui::TextWrapped("Custom VM bridge for VMware, VirtualBox, QEMU, Hyper-V, or a manually built Windows VM");
+			ImGui::BulletText("Share one folder between host and guest. AiDA writes requests on the host; AiDAGuestAgent reads them inside the guest.");
+			ImGui::BulletText("AiDAStandalone.exe remains on the host. The guest receives only the selected sample, launch_config.json, and AiDAGuestAgent.exe.");
+			ImGui::BulletText("Keep the shared folder private to this VM. Do not expose AiDA's localhost MCP server to the VM network.");
+			ImGui::BulletText("After activation, copy the guest command below and run it inside the VM.");
+			if (caption) ImGui::PopFont();
+			ImGui::Dummy(ImVec2(0.f, 2.f));
+
+			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(tk.text_secondary),
+			                   "Host bridge folder");
+			float custom_btn_w = 96.f;
+			float custom_input_w = ImGui::GetContentRegionAvail().x - custom_btn_w - 10.f;
+			if (custom_input_w < 200.f) custom_input_w = 200.f;
+			aida::ui::input_text("##custom_bridge_host", detail::custom_bridge_buf(), 1024,
+			                     "C:\\AiDA-VM-Bridge\\case-001", false,
+			                     ImVec2(custom_input_w, 36.f));
+			ImGui::SameLine();
+			if (aida::ui::button("Browse##custom_bridge", aida::ui::button_kind_t::secondary,
+			                     aida::ui::size_t_::md,
+			                     ImVec2(custom_btn_w, 36.f), false, nullptr, false)) {
+				detail::browse_custom_bridge_dir();
+			}
+			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(tk.text_secondary),
+			                   "Guest path to the same shared folder");
+			aida::ui::input_text("##custom_bridge_guest", detail::custom_guest_bridge_buf(), 1024,
+			                     "Z:\\AiDA-VM-Bridge\\case-001", false,
+			                     ImVec2(0.f, 36.f));
+			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(tk.text_secondary),
+			                   "Guest sample path (optional; auto-filled when host sample is staged)");
+			aida::ui::input_text("##custom_guest_sample", detail::custom_guest_sample_buf(), 1024,
+			                     "Z:\\AiDA-VM-Bridge\\case-001\\samples\\sample.exe", false,
+			                     ImVec2(0.f, 36.f));
+			std::string command = detail::custom_guest_command();
+			if (!command.empty()) {
+				if (caption) ImGui::PushFont(caption);
+				ImGui::TextWrapped("Guest command: %s", command.c_str());
+				if (caption) ImGui::PopFont();
+				if (aida::ui::button("Copy command", aida::ui::button_kind_t::secondary,
+				                     aida::ui::size_t_::sm, ImVec2(120.f, 30.f), false, nullptr, false)) {
+					ImGui::SetClipboardText(command.c_str());
+					toast_notification::push("Guest command copied.", toast_notification::toast_type_t::success, 3.0f);
+				}
+				ImGui::SameLine();
+				if (aida::ui::button("Guide", aida::ui::button_kind_t::secondary,
+				                     aida::ui::size_t_::sm, ImVec2(80.f, 30.f), false, nullptr, false)) {
+					detail::open_custom_vm_guide();
+				}
 			}
 		} else {
 			if (caption) ImGui::PushFont(caption);
@@ -619,11 +863,14 @@ inline void render() {
 			float fs_title = warn_font->FontSize;
 			float fs_body = base->FontSize;
 
-			const bool host_mode = detail::run_mode_choice() == 1;
-			const char* warn_title = host_mode ? "Host execution warning" : "Interactive VM sandbox";
+			const bool host_mode = detail::run_mode_choice() == 2;
+			const bool custom_mode = detail::run_mode_choice() == 1;
+			const char* warn_title = host_mode ? "Host execution warning" : (custom_mode ? "Custom VM bridge" : "Interactive VM sandbox");
 			const char* warn_body  = host_mode
 				? "Run in Host starts the selected binary on this Windows installation and may attach AiDA's host driver. Do not use this for malware, cheat loaders, BYOVD samples, unknown drivers, or anything you do not fully trust."
-				: "Run in VM copies the sample into a disposable Windows Sandbox workspace, disables clipboard and device redirection, optionally disables networking, and starts the sample in the sandbox window. AiDAStandalone.exe remains on the host; the sandbox receives only the staged sample and guest bridge.";
+				: (custom_mode
+					? "Custom VM activates a shared-folder bridge for a guest-side AiDAGuestAgent. AiDA never exposes the host MCP listener to the VM; the guest only sees files in the bridge folder you choose."
+					: "Run in VM copies the sample into a disposable Windows Sandbox workspace, disables clipboard and device redirection, optionally disables networking, and starts the sample in the sandbox window. AiDAStandalone.exe remains on the host; the sandbox receives only the staged sample and guest bridge.");
 
 			ImVec2 ts_title = warn_font->CalcTextSizeA(fs_title, FLT_MAX, w - pad_x * 2.f, warn_title);
 			ImVec2 ts_body = base->CalcTextSizeA(fs_body, FLT_MAX, w - pad_x * 2.f, warn_body);
@@ -645,8 +892,12 @@ inline void render() {
 		ImGui::Dummy(ImVec2(0.f, 6.f));
 
 		std::string exe_trim = detail::trim(detail::exe_buf());
-		bool launch_disabled = exe_trim.empty()
-			|| (detail::run_mode_choice() == 0 && !detail::cached_capabilities().has_windows_sandbox);
+		std::string custom_bridge_trim = detail::trim(detail::custom_bridge_buf());
+		std::string custom_guest_bridge_trim = detail::trim(detail::custom_guest_bridge_buf());
+		bool launch_disabled =
+			(detail::run_mode_choice() == 0 && (exe_trim.empty() || !detail::cached_capabilities().has_windows_sandbox))
+			|| (detail::run_mode_choice() == 1 && (custom_bridge_trim.empty() || custom_guest_bridge_trim.empty()))
+			|| (detail::run_mode_choice() == 2 && exe_trim.empty());
 
 		float total_w = ImGui::GetContentRegionAvail().x;
 		float btn_w = 130.f;
@@ -663,7 +914,7 @@ inline void render() {
 			cancel_now = true;
 		}
 		ImGui::SameLine(0.f, gap);
-		const char* launch_label = detail::run_mode_choice() == 0 ? "Open VM" : "Run Host";
+		const char* launch_label = detail::run_mode_choice() == 0 ? "Open VM" : (detail::run_mode_choice() == 1 ? "Activate" : "Run Host");
 		if (aida::ui::button(launch_label, aida::ui::button_kind_t::primary,
 		                     aida::ui::size_t_::md,
 		                     ImVec2(btn_w, 40.f), launch_disabled, nullptr, false)) {
@@ -677,9 +928,11 @@ inline void render() {
 			launch_now = true;
 
 		if (launch_now && !launch_disabled) {
-			if (detail::run_mode_choice() == 1) {
+			if (detail::run_mode_choice() == 2) {
 				detail::host_confirm_open() = true;
 				ImGui::OpenPopup("Confirm Host Run###aida_spawn_host_confirm");
+			} else if (detail::run_mode_choice() == 1) {
+				(void)detail::activate_custom_bridge();
 			} else if (detail::prepare_launch_result(false)) {
 				ImGui::CloseCurrentPopup();
 				detail::open_flag() = false;

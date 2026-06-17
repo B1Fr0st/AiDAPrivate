@@ -49,12 +49,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <cwchar>
 #include <deque>
 #include <exception>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace test_all_features {
@@ -130,6 +132,7 @@ namespace test_all_features {
 
 
 		std::atomic<bool> g_running{ false };
+		std::atomic<bool> g_start_queued{ false };
 		std::atomic<bool> g_cancel_requested{ false };
 		std::atomic<bool> g_target_unavailable{ false };
 
@@ -179,7 +182,7 @@ namespace test_all_features {
 		constexpr int kAnalysisFeatureTests = 77;
 		constexpr int kNetworkFeatureTests = 125;
 		constexpr int kBurpFeatureTests = 184;
-		constexpr int kDisasmFeatureTests = 110;
+		constexpr int kDisasmFeatureTests = 111;
 		constexpr int kMcpFeatureTests = 514;
 		constexpr int kUiFeatureTests = 10;
 		constexpr std::uint64_t kPostFullTestSuppressionMs = 180000;
@@ -1149,16 +1152,6 @@ namespace test_all_features {
 		}
 
 
-		bool probe_candidate(HANDLE hf, const std::wstring& candidate, const char* label) {
-			char narrow[MAX_PATH] = {};
-			WideCharToMultiByte(CP_UTF8, 0, candidate.c_str(), -1, narrow, MAX_PATH, nullptr, nullptr);
-			bool exists = (GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES);
-			log_msg(hf, "find_target", "probe[%s] %s -> %s", label, narrow, exists ? "EXISTS" : "missing");
-			diag::log_tagged_fmt("test_all", "find_test_target probe[%s] %s -> %s",
-				label, narrow, exists ? "EXISTS" : "missing");
-			return exists;
-		}
-
 		std::string wide_to_log_string(const std::wstring& text) {
 			if (text.empty())
 				return {};
@@ -1173,27 +1166,39 @@ namespace test_all_features {
 			return out;
 		}
 
-		bool is_absolute_path_for_launch(const std::wstring& path) {
-			if (path.size() >= 3 && path[1] == L':' && (path[2] == L'\\' || path[2] == L'/'))
-				return true;
-			if (path.size() >= 2 && (path[0] == L'\\' || path[0] == L'/') && (path[1] == L'\\' || path[1] == L'/'))
-				return true;
-			return false;
+		std::wstring ensure_trailing_separator(std::wstring path) {
+			if (!path.empty() && path.back() != L'\\' && path.back() != L'/')
+				path.push_back(L'\\');
+			return path;
+		}
+
+		std::wstring trim_trailing_separators(std::wstring path) {
+			while (path.size() > 3 && (path.back() == L'\\' || path.back() == L'/'))
+				path.pop_back();
+			return path;
+		}
+
+		std::wstring join_path(std::wstring base, const wchar_t* leaf) {
+			if (base.empty())
+				return leaf ? std::wstring(leaf) : std::wstring();
+			base = ensure_trailing_separator(std::move(base));
+			if (leaf && (leaf[0] == L'\\' || leaf[0] == L'/'))
+				return base + (leaf + 1);
+			return base + (leaf ? leaf : L"");
 		}
 
 		std::wstring full_path_for_log(const std::wstring& path) {
 			if (path.empty())
 				return {};
-			if (is_absolute_path_for_launch(path))
+			SetLastError(ERROR_SUCCESS);
+			DWORD needed = GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
+			if (needed == 0)
 				return path;
-			wchar_t cwd_buf[MAX_PATH] = {};
-			DWORD cwd_len = GetCurrentDirectoryW(MAX_PATH, cwd_buf);
-			if (cwd_len == 0 || cwd_len >= MAX_PATH)
+			std::vector<wchar_t> buf(static_cast<std::size_t>(needed) + 2u);
+			DWORD written = GetFullPathNameW(path.c_str(), static_cast<DWORD>(buf.size()), buf.data(), nullptr);
+			if (written == 0 || written >= buf.size())
 				return path;
-			std::wstring base(cwd_buf, cwd_len);
-			if (!base.empty() && base.back() != L'\\' && base.back() != L'/')
-				base.push_back(L'\\');
-			return base + path;
+			return std::wstring(buf.data(), written);
 		}
 
 		std::wstring parent_directory_for_path(const std::wstring& path) {
@@ -1204,11 +1209,15 @@ namespace test_all_features {
 		}
 
 		std::wstring current_directory_for_launch() {
-			wchar_t cwd[MAX_PATH] = {};
-			DWORD cwd_len = GetCurrentDirectoryW(MAX_PATH, cwd);
-			if (cwd_len == 0 || cwd_len >= MAX_PATH)
+			SetLastError(ERROR_SUCCESS);
+			DWORD needed = GetCurrentDirectoryW(0, nullptr);
+			if (needed == 0)
 				return {};
-			return std::wstring(cwd, cwd_len);
+			std::vector<wchar_t> buf(static_cast<std::size_t>(needed) + 2u);
+			DWORD cwd_len = GetCurrentDirectoryW(static_cast<DWORD>(buf.size()), buf.data());
+			if (cwd_len == 0 || cwd_len >= buf.size())
+				return {};
+			return std::wstring(buf.data(), cwd_len);
 		}
 
 		std::wstring normalize_launch_path(const std::wstring& path) {
@@ -1267,12 +1276,192 @@ namespace test_all_features {
 			}
 		}
 
+		std::wstring current_module_path_for_launch(DWORD& len_out, DWORD& err_out) {
+			len_out = 0;
+			err_out = ERROR_SUCCESS;
+			std::vector<wchar_t> buf(MAX_PATH);
+			for (;;) {
+				SetLastError(ERROR_SUCCESS);
+				DWORD len = GetModuleFileNameW(nullptr, buf.data(), static_cast<DWORD>(buf.size()));
+				DWORD err = GetLastError();
+				if (len == 0) {
+					err_out = err;
+					return {};
+				}
+				if (len < buf.size() - 1u) {
+					len_out = len;
+					err_out = err;
+					return std::wstring(buf.data(), len);
+				}
+				if (buf.size() >= 32768u) {
+					len_out = len;
+					err_out = ERROR_INSUFFICIENT_BUFFER;
+					return {};
+				}
+				buf.resize(buf.size() * 2u);
+			}
+		}
+
+		bool read_env_wide(const wchar_t* name, std::wstring& out, DWORD& len_out, DWORD& err_out) {
+			out.clear();
+			len_out = 0;
+			err_out = ERROR_SUCCESS;
+			SetLastError(ERROR_SUCCESS);
+			DWORD needed = GetEnvironmentVariableW(name, nullptr, 0);
+			if (needed == 0) {
+				err_out = GetLastError();
+				return false;
+			}
+			std::vector<wchar_t> buf(static_cast<std::size_t>(needed) + 2u);
+			SetLastError(ERROR_SUCCESS);
+			DWORD len = GetEnvironmentVariableW(name, buf.data(), static_cast<DWORD>(buf.size()));
+			if (len == 0) {
+				err_out = GetLastError();
+				return false;
+			}
+			if (len >= buf.size()) {
+				err_out = ERROR_INSUFFICIENT_BUFFER;
+				len_out = len;
+				return false;
+			}
+			len_out = len;
+			out.assign(buf.data(), len);
+			return true;
+		}
+
+		std::string filetime_to_log_string(const FILETIME& ft) {
+			if (ft.dwLowDateTime == 0 && ft.dwHighDateTime == 0)
+				return "<none>";
+			FILETIME local_ft{};
+			SYSTEMTIME st{};
+			if (!FileTimeToLocalFileTime(&ft, &local_ft) || !FileTimeToSystemTime(&local_ft, &st))
+				return "<invalid>";
+			char buf[64] = {};
+			_snprintf_s(buf, sizeof(buf), _TRUNCATE, "%04u-%02u-%02u %02u:%02u:%02u.%03u",
+				static_cast<unsigned>(st.wYear),
+				static_cast<unsigned>(st.wMonth),
+				static_cast<unsigned>(st.wDay),
+				static_cast<unsigned>(st.wHour),
+				static_cast<unsigned>(st.wMinute),
+				static_cast<unsigned>(st.wSecond),
+				static_cast<unsigned>(st.wMilliseconds));
+			return std::string(buf);
+		}
+
+		struct target_candidate_t {
+			std::string label;
+			std::wstring requested;
+			std::string source_root;
+		};
+
+		struct target_probe_result_t {
+			bool is_file = false;
+			bool is_dir = false;
+			DWORD attrs = INVALID_FILE_ATTRIBUTES;
+			DWORD attr_error = ERROR_SUCCESS;
+			DWORD meta_error = ERROR_SUCCESS;
+			ULONGLONG size = 0;
+			std::string mtime;
+		};
+
+		target_probe_result_t probe_candidate(HANDLE hf, const target_candidate_t& candidate, std::wstring& normalized_out) {
+			normalized_out = normalize_launch_path(candidate.requested);
+			target_probe_result_t result{};
+			WIN32_FILE_ATTRIBUTE_DATA fad{};
+			SetLastError(ERROR_SUCCESS);
+			result.attrs = GetFileAttributesW(normalized_out.c_str());
+			result.attr_error = (result.attrs == INVALID_FILE_ATTRIBUTES) ? GetLastError() : ERROR_SUCCESS;
+			if (result.attrs != INVALID_FILE_ATTRIBUTES) {
+				result.is_dir = (result.attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+				result.is_file = !result.is_dir;
+				SetLastError(ERROR_SUCCESS);
+				if (GetFileAttributesExW(normalized_out.c_str(), GetFileExInfoStandard, &fad)) {
+					result.size = (static_cast<ULONGLONG>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
+					result.mtime = filetime_to_log_string(fad.ftLastWriteTime);
+				} else {
+					result.meta_error = GetLastError();
+					result.mtime = "<metadata-error>";
+				}
+			} else {
+				result.mtime = "<missing>";
+			}
+
+			const std::string requested_log = wide_to_log_string(candidate.requested);
+			const std::string normalized_log = wide_to_log_string(normalized_out);
+			log_msg(hf, "find_target", "candidate label=%s requested=\"%s\" normalized=\"%s\" attrs=0x%08lX last_error=%lu is_file=%d is_dir=%d size=%llu mtime=%s source_root=\"%s\" meta_error=%lu",
+				candidate.label.c_str(),
+				requested_log.empty() ? "<empty>" : requested_log.c_str(),
+				normalized_log.empty() ? "<empty>" : normalized_log.c_str(),
+				result.attrs == INVALID_FILE_ATTRIBUTES ? 0xFFFFFFFFul : static_cast<unsigned long>(result.attrs),
+				static_cast<unsigned long>(result.attr_error),
+				result.is_file ? 1 : 0,
+				result.is_dir ? 1 : 0,
+				static_cast<unsigned long long>(result.size),
+				result.mtime.c_str(),
+				candidate.source_root.empty() ? "<none>" : candidate.source_root.c_str(),
+				static_cast<unsigned long>(result.meta_error));
+			diag::log_tagged_fmt("test_all", "find_test_target candidate label=%s normalized=\"%s\" is_file=%d is_dir=%d err=%lu size=%llu",
+				candidate.label.c_str(),
+				normalized_log.empty() ? "<empty>" : normalized_log.c_str(),
+				result.is_file ? 1 : 0,
+				result.is_dir ? 1 : 0,
+				static_cast<unsigned long>(result.attr_error),
+				static_cast<unsigned long long>(result.size));
+			return result;
+		}
+
+		bool path_is_existing_directory(const std::wstring& path) {
+			if (path.empty())
+				return false;
+			std::wstring normalized = normalize_launch_path(path);
+			SetLastError(ERROR_SUCCESS);
+			DWORD attrs = GetFileAttributesW(normalized.c_str());
+			return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+		}
+
+		void add_target_candidate(std::vector<target_candidate_t>& candidates, const char* label, const std::wstring& requested, const std::string& source_root) {
+			if (requested.empty())
+				return;
+			target_candidate_t c;
+			c.label = label ? label : "candidate";
+			c.requested = requested;
+			c.source_root = source_root;
+			candidates.push_back(std::move(c));
+		}
+
+		void add_root_target_candidates(std::vector<target_candidate_t>& candidates, const std::string& prefix, const std::wstring& root) {
+			if (root.empty())
+				return;
+			const std::wstring normalized_root = ensure_trailing_separator(normalize_launch_path(root));
+			const std::string root_log = wide_to_log_string(normalized_root);
+			add_target_candidate(candidates, (prefix + "/direct").c_str(), join_path(normalized_root, L"AiDA_TestTarget.exe"), root_log);
+			add_target_candidate(candidates, (prefix + "/Release").c_str(), join_path(join_path(normalized_root, L"Release"), L"AiDA_TestTarget.exe"), root_log);
+			add_target_candidate(candidates, (prefix + "/Debug").c_str(), join_path(join_path(normalized_root, L"Debug"), L"AiDA_TestTarget.exe"), root_log);
+			add_target_candidate(candidates, (prefix + "/RelWithDebInfo").c_str(), join_path(join_path(normalized_root, L"RelWithDebInfo"), L"AiDA_TestTarget.exe"), root_log);
+			add_target_candidate(candidates, (prefix + "/build-ninja/Release").c_str(), join_path(join_path(join_path(normalized_root, L"build-ninja"), L"Release"), L"AiDA_TestTarget.exe"), root_log);
+			add_target_candidate(candidates, (prefix + "/build-ninja").c_str(), join_path(join_path(normalized_root, L"build-ninja"), L"AiDA_TestTarget.exe"), root_log);
+			add_target_candidate(candidates, (prefix + "/deps").c_str(), join_path(join_path(normalized_root, L"deps"), L"AiDA_TestTarget.exe"), root_log);
+			add_target_candidate(candidates, (prefix + "/package/deps").c_str(), join_path(join_path(join_path(normalized_root, L"package"), L"deps"), L"AiDA_TestTarget.exe"), root_log);
+		}
+
+		void add_parent_walk_candidates(std::vector<target_candidate_t>& candidates, const std::string& prefix, const std::wstring& start_dir) {
+			std::wstring cursor = ensure_trailing_separator(normalize_launch_path(start_dir));
+			for (int depth = 0; depth < 16 && !cursor.empty(); ++depth) {
+				char label[96] = {};
+				_snprintf_s(label, sizeof(label), _TRUNCATE, "%s/parent_%02d", prefix.c_str(), depth);
+				add_root_target_candidates(candidates, label, cursor);
+				std::wstring trimmed = trim_trailing_separators(cursor);
+				std::wstring parent = parent_directory_for_path(trimmed);
+				if (parent.empty() || _wcsicmp(parent.c_str(), cursor.c_str()) == 0)
+					break;
+				cursor = ensure_trailing_separator(parent);
+			}
+		}
 
 		std::wstring find_test_target(HANDLE hf) {
-			wchar_t self[MAX_PATH] = {};
-			DWORD self_len = GetModuleFileNameW(nullptr, self, MAX_PATH);
-			DWORD self_err = self_len == 0 ? GetLastError() : 0;
-			std::wstring self_path = (self_len > 0 && self_len < MAX_PATH) ? std::wstring(self, self_len) : std::wstring();
+			DWORD self_len = 0;
+			DWORD self_err = ERROR_SUCCESS;
+			std::wstring self_path = current_module_path_for_launch(self_len, self_err);
 			if (!self_path.empty())
 				self_path = normalize_launch_path(self_path);
 			std::wstring module_dir = parent_directory_for_path(self_path);
@@ -1284,65 +1473,272 @@ namespace test_all_features {
 				self_path_log.c_str(),
 				module_dir_log.c_str());
 
-			wchar_t cwd[MAX_PATH] = {};
-			DWORD cwd_len = GetCurrentDirectoryW(MAX_PATH, cwd);
-			std::wstring cwd_dir;
-			if (cwd_len > 0 && cwd_len < MAX_PATH) {
-				cwd_dir.assign(cwd, cwd_len);
-				if (!cwd_dir.empty() && cwd_dir.back() != L'\\' && cwd_dir.back() != L'/')
-					cwd_dir.push_back(L'\\');
+			std::wstring cwd_dir = current_directory_for_launch();
+			if (!cwd_dir.empty())
+				cwd_dir = ensure_trailing_separator(normalize_launch_path(cwd_dir));
+
+			std::vector<target_candidate_t> candidates;
+			std::wstring env_path;
+			DWORD env_len = 0;
+			DWORD env_err = ERROR_SUCCESS;
+			if (read_env_wide(L"AIDA_TEST_TARGET", env_path, env_len, env_err)) {
+				add_target_candidate(candidates, "AIDA_TEST_TARGET", env_path, "AIDA_TEST_TARGET");
+				if (path_is_existing_directory(env_path)) {
+					add_target_candidate(candidates, "AIDA_TEST_TARGET/AiDA_TestTarget.exe", join_path(env_path, L"AiDA_TestTarget.exe"), "AIDA_TEST_TARGET");
+				}
+			} else {
+				log_msg(hf, "find_target", "candidate label=AIDA_TEST_TARGET env_missing len=%lu last_error=%lu",
+					static_cast<unsigned long>(env_len),
+					static_cast<unsigned long>(env_err));
 			}
 
-			wchar_t env_buf[MAX_PATH] = {};
-			DWORD env_len = GetEnvironmentVariableW(L"AIDA_TEST_TARGET", env_buf, MAX_PATH);
-			if (env_len > 0 && env_len < MAX_PATH) {
-				std::wstring env_path(env_buf, env_len);
-				if (probe_candidate(hf, env_path, "AIDA_TEST_TARGET"))
-					return normalize_found_target(env_path);
-			} else {
-				log_msg(hf, "find_target", "probe[AIDA_TEST_TARGET] env var not set");
-			}
-
-			if (!module_dir.empty()) {
-				const std::wstring module_candidate = module_dir + L"AiDA_TestTarget.exe";
-				if (probe_candidate(hf, module_candidate, "module_dir"))
-					return normalize_found_target(module_candidate);
-
-				const std::wstring module_subdir_candidate = module_dir + L"test_target\\AiDA_TestTarget.exe";
-				if (probe_candidate(hf, module_subdir_candidate, "module_dir/test_target"))
-					return normalize_found_target(module_subdir_candidate);
-			} else {
+			if (!module_dir.empty())
+				add_root_target_candidates(candidates, "module_dir", module_dir);
+			else
 				log_msg(hf, "find_target", "probe[module_dir] skipped because module directory is unavailable");
-			}
 
-			if (!cwd_dir.empty()) {
-				const std::wstring cwd_candidate = cwd_dir + L"AiDA_TestTarget.exe";
-				if (probe_candidate(hf, cwd_candidate, "cwd"))
-					return normalize_found_target(cwd_candidate);
-			} else {
+			if (!cwd_dir.empty())
+				add_root_target_candidates(candidates, "cwd", cwd_dir);
+			else
 				log_msg(hf, "find_target", "probe[cwd] working directory unavailable");
+
+			if (!module_dir.empty())
+				add_parent_walk_candidates(candidates, "module_walk", module_dir);
+			if (!cwd_dir.empty())
+				add_parent_walk_candidates(candidates, "cwd_walk", cwd_dir);
+
+			add_target_candidate(candidates, "fallback/build-ninja/Release", L"C:\\Users\\ruar1337\\AiDAPrivate\\build-ninja\\Release\\AiDA_TestTarget.exe", "hardcoded_repo_root");
+			add_target_candidate(candidates, "fallback/build-ninja", L"C:\\Users\\ruar1337\\AiDAPrivate\\build-ninja\\AiDA_TestTarget.exe", "hardcoded_repo_root");
+
+			std::wstring first_file;
+			std::string first_label;
+			for (const auto& candidate : candidates) {
+				std::wstring normalized;
+				target_probe_result_t probe = probe_candidate(hf, candidate, normalized);
+				if (probe.is_file && first_file.empty()) {
+					first_file = normalized;
+					first_label = candidate.label;
+				}
 			}
 
-			const std::wstring fallback = L"C:\\Users\\ruar1337\\AiDAPrivate\\build-ninja\\Release\\AiDA_TestTarget.exe";
-			if (probe_candidate(hf, fallback, "fallback"))
-				return normalize_found_target(fallback);
+			if (!first_file.empty()) {
+				const std::string found_log = wide_to_log_string(first_file);
+				log_msg(hf, "find_target", "selected label=%s path=\"%s\" total_candidates=%zu",
+					first_label.c_str(),
+					found_log.empty() ? "<empty>" : found_log.c_str(),
+					candidates.size());
+				return normalize_found_target(first_file);
+			}
 
-			log_msg(hf, "find_target", "FAIL -- AiDA_TestTarget.exe not found in any candidate path");
+			log_msg(hf, "find_target", "FAIL -- AiDA_TestTarget.exe not found in any candidate path total_candidates=%zu", candidates.size());
 			return {};
 		}
 
 
+		struct child_status_t {
+			bool process_opened = false;
+			DWORD open_error = 0;
+			bool exit_known = false;
+			DWORD exit_code = STILL_ACTIVE;
+			bool alive = false;
+		};
+
+		child_status_t query_child_status(std::uint32_t pid) {
+			child_status_t s{};
+			HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, static_cast<DWORD>(pid));
+			if (!hp) {
+				s.open_error = GetLastError();
+				return s;
+			}
+			s.process_opened = true;
+			s.exit_known = GetExitCodeProcess(hp, &s.exit_code) != FALSE;
+			s.open_error = s.exit_known ? 0 : GetLastError();
+			s.alive = s.exit_known && s.exit_code == STILL_ACTIVE;
+			CloseHandle(hp);
+			return s;
+		}
+
+		bool wait_for_ready_event_with_retry(HANDLE hf, std::uint32_t pid, DWORD total_wait_ms) {
+			const ULONGLONG start = GetTickCount64();
+			DWORD attempt = 0;
+			for (;;) {
+				const ULONGLONG now = GetTickCount64();
+				const DWORD elapsed = now >= start ? static_cast<DWORD>(now - start) : 0u;
+				const DWORD remaining = elapsed >= total_wait_ms ? 0u : total_wait_ms - elapsed;
+				child_status_t child = query_child_status(pid);
+				if (remaining == 0u) {
+					log_msg(hf, "launch", "READY OpenEvent retry budget expired attempts=%lu elapsed_ms=%lu child_open=%d child_exit_known=%d child_exit=0x%08lX child_alive=%d open_err=%lu",
+						static_cast<unsigned long>(attempt),
+						static_cast<unsigned long>(elapsed),
+						child.process_opened ? 1 : 0,
+						child.exit_known ? 1 : 0,
+						static_cast<unsigned long>(child.exit_code),
+						child.alive ? 1 : 0,
+						static_cast<unsigned long>(child.open_error));
+					return false;
+				}
+				if (child.exit_known && child.exit_code != STILL_ACTIVE) {
+					log_msg(hf, "launch", "READY OpenEvent retry stopped because child exited attempts=%lu elapsed_ms=%lu remaining_ms=%lu exit_code=0x%08lX",
+						static_cast<unsigned long>(attempt),
+						static_cast<unsigned long>(elapsed),
+						static_cast<unsigned long>(remaining),
+						static_cast<unsigned long>(child.exit_code));
+					return false;
+				}
+
+				++attempt;
+				struct ready_namespace_t {
+					const wchar_t* wide_name;
+					const char* log_name;
+				};
+				const ready_namespace_t namespaces[] = {
+					{ L"Global\\WhosWhoTestReady", "Global\\WhosWhoTestReady" },
+					{ L"Local\\WhosWhoTestReady", "Local\\WhosWhoTestReady" }
+				};
+				for (const auto& ns : namespaces) {
+					SetLastError(ERROR_SUCCESS);
+					HANDLE hReady = OpenEventW(SYNCHRONIZE, FALSE, ns.wide_name);
+					DWORD gle = hReady ? ERROR_SUCCESS : GetLastError();
+					const ULONGLONG open_now = GetTickCount64();
+					const DWORD open_elapsed = open_now >= start ? static_cast<DWORD>(open_now - start) : 0u;
+					const DWORD open_remaining = open_elapsed >= total_wait_ms ? 0u : total_wait_ms - open_elapsed;
+					log_msg(hf, "launch", "READY OpenEvent attempt=%lu namespace=%s handle=%p gle=%lu elapsed_ms=%lu remaining_ms=%lu child_open=%d child_exit_known=%d child_exit=0x%08lX child_alive=%d child_open_err=%lu",
+						static_cast<unsigned long>(attempt),
+						ns.log_name,
+						hReady,
+						static_cast<unsigned long>(gle),
+						static_cast<unsigned long>(open_elapsed),
+						static_cast<unsigned long>(open_remaining),
+						child.process_opened ? 1 : 0,
+						child.exit_known ? 1 : 0,
+						static_cast<unsigned long>(child.exit_code),
+						child.alive ? 1 : 0,
+						static_cast<unsigned long>(child.open_error));
+					if (!hReady)
+						continue;
+					set_step("launch: wait READY event");
+					DWORD wait = WaitForSingleObject(hReady, open_remaining);
+					DWORD wait_err = (wait == WAIT_FAILED) ? GetLastError() : 0u;
+					CloseHandle(hReady);
+					const ULONGLONG wait_now = GetTickCount64();
+					const DWORD wait_elapsed = wait_now >= start ? static_cast<DWORD>(wait_now - start) : 0u;
+					child_status_t after_child = query_child_status(pid);
+					log_msg(hf, "launch", "READY event wait attempt=%lu namespace=%s wait=0x%08lX wait_err=%lu elapsed_ms=%lu child_open=%d child_exit_known=%d child_exit=0x%08lX child_alive=%d child_open_err=%lu",
+						static_cast<unsigned long>(attempt),
+						ns.log_name,
+						static_cast<unsigned long>(wait),
+						static_cast<unsigned long>(wait_err),
+						static_cast<unsigned long>(wait_elapsed),
+						after_child.process_opened ? 1 : 0,
+						after_child.exit_known ? 1 : 0,
+						static_cast<unsigned long>(after_child.exit_code),
+						after_child.alive ? 1 : 0,
+						static_cast<unsigned long>(after_child.open_error));
+					if (wait == WAIT_OBJECT_0)
+						return true;
+					if (wait == WAIT_FAILED && open_remaining > 0u)
+						continue;
+					return false;
+				}
+				Sleep(50);
+			}
+		}
+
+		void poll_child_liveness_after_ready_event_miss(HANDLE hf, std::uint32_t pid, DWORD total_wait_ms) {
+			const ULONGLONG start = GetTickCount64();
+			for (DWORD attempt = 1; ; ++attempt) {
+				const ULONGLONG now = GetTickCount64();
+				const DWORD elapsed = now >= start ? static_cast<DWORD>(now - start) : 0u;
+				const DWORD remaining = elapsed >= total_wait_ms ? 0u : total_wait_ms - elapsed;
+				child_status_t child = query_child_status(pid);
+				log_msg(hf, "launch", "READY fallback poll attempt=%lu elapsed_ms=%lu remaining_ms=%lu child_open=%d child_exit_known=%d child_exit=0x%08lX child_alive=%d child_open_err=%lu",
+					static_cast<unsigned long>(attempt),
+					static_cast<unsigned long>(elapsed),
+					static_cast<unsigned long>(remaining),
+					child.process_opened ? 1 : 0,
+					child.exit_known ? 1 : 0,
+					static_cast<unsigned long>(child.exit_code),
+					child.alive ? 1 : 0,
+					static_cast<unsigned long>(child.open_error));
+				if (child.alive || remaining == 0u)
+					break;
+				Sleep(50);
+			}
+		}
+
 		bool verify_driver_attach(HANDLE hf, std::uint32_t pid) {
 			set_phase("Verifying driver attach");
 
-			bool kernel = driver_bridge::using_kernel_driver();
-			bool can_read = driver_bridge::can_read_memory();
-			std::uint32_t attached = driver_bridge::attached_pid();
-			std::string drv_status = driver_bridge::status();
-			std::string drv_err = driver_bridge::last_error();
+			const ULONGLONG retry_start = GetTickCount64();
+			const DWORD retry_budget_ms = 5000u;
+			std::vector<driver_bridge::module_info_t> modules;
+			driver_bridge::peb_info_t peb{};
+			bool peb_ok = false;
+			std::uint64_t exe_base = 0;
+			std::string image_name;
+			std::uint64_t ntdll_base = 0;
+			std::uint64_t image_base = 0;
+			std::uint32_t attached = 0;
+			bool kernel = false;
+			bool can_read = false;
+			std::string drv_status;
+			std::string drv_err;
+			DWORD attempt = 0;
 
-			log_msg(hf, "attach", "driver status=\"%s\" using_kernel_driver=%d can_read_memory=%d attached_pid=%u target_pid=%u",
-				drv_status.c_str(), static_cast<int>(kernel), static_cast<int>(can_read), attached, pid);
+			for (;;) {
+				++attempt;
+				const ULONGLONG attempt_start = GetTickCount64();
+				kernel = driver_bridge::using_kernel_driver();
+				can_read = driver_bridge::can_read_memory();
+				attached = driver_bridge::attached_pid();
+				drv_status = driver_bridge::status();
+				drv_err = driver_bridge::last_error();
+				modules = driver_bridge::enumerate_modules_for(pid);
+				exe_base = 0;
+				image_name.clear();
+				ntdll_base = 0;
+				for (const auto& m : modules) {
+					if (m.name.empty()) continue;
+					const char* dot = std::strrchr(m.name.c_str(), '.');
+					bool is_exe = (dot != nullptr) && (_stricmp(dot, ".exe") == 0);
+					if (is_exe && exe_base == 0) {
+						exe_base = m.base;
+						image_name = m.name;
+					}
+					if (ntdll_base == 0 && _stricmp(m.name.c_str(), "ntdll.dll") == 0)
+						ntdll_base = m.base;
+				}
+				peb = {};
+				peb_ok = driver_bridge::read_peb_for(pid, peb);
+				image_base = (peb_ok && peb.image_base != 0) ? peb.image_base : exe_base;
+				const ULONGLONG now = GetTickCount64();
+				const DWORD elapsed = now >= retry_start ? static_cast<DWORD>(now - retry_start) : 0u;
+				const DWORD remaining = elapsed >= retry_budget_ms ? 0u : retry_budget_ms - elapsed;
+				const DWORD attempt_elapsed = now >= attempt_start ? static_cast<DWORD>(now - attempt_start) : 0u;
+				log_msg(hf, "attach", "attach/module attempt=%lu attached_pid=%u target_pid=%u using_kernel_driver=%d can_read_memory=%d modules=%zu peb_ok=%d peb=0x%016llX image_base_peb=0x%016llX ldr=0x%016llX exe_base=0x%016llX ntdll_base=0x%016llX elapsed_ms=%lu attempt_ms=%lu remaining_ms=%lu status=\"%s\" last_error=\"%s\"",
+					static_cast<unsigned long>(attempt),
+					attached,
+					pid,
+					static_cast<int>(kernel),
+					static_cast<int>(can_read),
+					modules.size(),
+					peb_ok ? 1 : 0,
+					static_cast<unsigned long long>(peb.peb_address),
+					static_cast<unsigned long long>(peb.image_base),
+					static_cast<unsigned long long>(peb.ldr_address),
+					static_cast<unsigned long long>(exe_base),
+					static_cast<unsigned long long>(ntdll_base),
+					static_cast<unsigned long>(elapsed),
+					static_cast<unsigned long>(attempt_elapsed),
+					static_cast<unsigned long>(remaining),
+					drv_status.c_str(),
+					drv_err.c_str());
+				if (attached == pid && !modules.empty() && ntdll_base != 0 && image_base != 0)
+					break;
+				if (remaining == 0u)
+					break;
+				Sleep(100);
+			}
 
 			if (attached == 0 || attached != pid) {
 				log_msg(hf, "attach", "FAIL -- driver attached_pid=%u does not match target pid=%u (last_error=\"%s\")",
@@ -1352,27 +1748,7 @@ namespace test_all_features {
 				return false;
 			}
 
-			auto modules = driver_bridge::enumerate_modules_for(pid);
-			std::uint64_t exe_base = 0;
-			std::string image_name;
-			std::uint64_t ntdll_base = 0;
-			for (const auto& m : modules) {
-				if (m.name.empty()) continue;
-				const char* dot = std::strrchr(m.name.c_str(), '.');
-				bool is_exe = (dot != nullptr) && (_stricmp(dot, ".exe") == 0);
-				if (is_exe && exe_base == 0) {
-					exe_base = m.base;
-					image_name = m.name;
-				}
-				if (ntdll_base == 0 && _stricmp(m.name.c_str(), "ntdll.dll") == 0)
-					ntdll_base = m.base;
-			}
-
-			std::uint64_t image_base = exe_base;
-
-			driver_bridge::peb_info_t peb{};
-			if (driver_bridge::read_peb_for(pid, peb) && peb.image_base != 0) {
-				image_base = peb.image_base;
+			if (peb_ok && peb.image_base != 0) {
 				log_msg(hf, "attach", "PEB image_base=0x%016llX peb=0x%016llX",
 					static_cast<unsigned long long>(peb.image_base),
 					static_cast<unsigned long long>(peb.peb_address));
@@ -1426,7 +1802,10 @@ namespace test_all_features {
 					static_cast<unsigned long long>(ntdll_base),
 					static_cast<unsigned long long>(fn_addr));
 			} else {
-				log_msg(hf, "attach", "WARN -- ntdll.dll not found in target module list (functions defaulting to image base)");
+				log_msg(hf, "attach", "WARN -- ntdll.dll not found after retry budget attempts=%lu modules=%zu elapsed_ms=%lu; functions defaulting to image base after budget expiry",
+					static_cast<unsigned long>(attempt),
+					modules.size(),
+					static_cast<unsigned long>(GetTickCount64() - retry_start));
 			}
 
 			g_target_image_base.store(image_base, std::memory_order_release);
@@ -1450,6 +1829,10 @@ namespace test_all_features {
 			std::wstring exe = find_test_target(hf);
 			if (exe.empty()) {
 				log_msg(hf, "launch", "FAIL -- AiDA_TestTarget.exe not found; downstream feature tests will run with no attached target");
+				out_pid = 0;
+				g_target_pid.store(0, std::memory_order_release);
+				g_driver_attached.store(false, std::memory_order_release);
+				g_target_unavailable.store(true, std::memory_order_release);
 				g_failed.fetch_add(1);
 				log_phase_end(hf, "launch target");
 				return false;
@@ -1511,6 +1894,10 @@ namespace test_all_features {
 			if (!ok || pid == 0) {
 				log_msg(hf, "launch", "FAIL -- spawn_and_attach_target returned false pid=%u (elapsed %lld ms) last_error=\"%s\"",
 					pid, (long long)ms, driver_bridge::last_error().c_str());
+				out_pid = 0;
+				g_target_pid.store(0, std::memory_order_release);
+				g_driver_attached.store(false, std::memory_order_release);
+				g_target_unavailable.store(true, std::memory_order_release);
 				g_failed.fetch_add(1);
 				log_phase_end(hf, "launch target");
 				return false;
@@ -1522,55 +1909,23 @@ namespace test_all_features {
 
 
 			set_phase("Waiting for test_target READY");
-			log_msg(hf, "launch", "waiting for WhosWhoTestReady event (8s timeout) ...");
+			log_msg(hf, "launch", "waiting for WhosWhoTestReady event (8s timeout, retrying Global/Local until deadline or child exit) ...");
 
-			HANDLE hReady = OpenEventW(SYNCHRONIZE, FALSE, L"Global\\WhosWhoTestReady");
-			DWORD global_ready_err = hReady ? 0 : GetLastError();
-			log_msg(hf, "launch", "OpenEvent Global\\WhosWhoTestReady handle=%p err=%lu",
-				hReady, static_cast<unsigned long>(global_ready_err));
-			if (!hReady) {
-				hReady = OpenEventW(SYNCHRONIZE, FALSE, L"Local\\WhosWhoTestReady");
-				log_msg(hf, "launch", "OpenEvent Local\\WhosWhoTestReady handle=%p err=%lu",
-					hReady, static_cast<unsigned long>(hReady ? 0 : GetLastError()));
-			}
-			if (hReady) {
-				set_step("launch: wait READY event");
-				DWORD wait = WaitForSingleObject(hReady, 8000);
-				DWORD wait_err = (wait == WAIT_FAILED) ? GetLastError() : 0;
-				CloseHandle(hReady);
-				if (wait == WAIT_OBJECT_0) {
-					log_msg(hf, "launch", "READY event signaled wait=0x%08lX", static_cast<unsigned long>(wait));
-				} else {
-					DWORD exit_code = STILL_ACTIVE;
-					HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
-					BOOL got_exit = hp ? GetExitCodeProcess(hp, &exit_code) : FALSE;
-					DWORD hp_err = hp ? 0 : GetLastError();
-					if (hp) CloseHandle(hp);
-					log_msg(hf, "launch", "READY wait did not signal wait=0x%08lX wait_err=%lu child_handle=%s child_exit_known=%d exit_code=0x%08lX open_err=%lu (proceeding anyway)",
-						static_cast<unsigned long>(wait),
-						static_cast<unsigned long>(wait_err),
-						hp ? "opened" : "null",
-						got_exit ? 1 : 0,
-						static_cast<unsigned long>(exit_code),
-						static_cast<unsigned long>(hp_err));
-				}
+			const bool ready_event_seen = wait_for_ready_event_with_retry(hf, pid, 8000u);
+			if (ready_event_seen) {
+				log_msg(hf, "launch", "READY event signaled within retry budget");
 			} else {
-				log_msg(hf, "launch", "could not open READY event handle, polling child liveness up to 750ms");
-				for (int i = 0; i < 15; ++i) {
-					DWORD exit_code = STILL_ACTIVE;
-					HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-					BOOL alive = hp ? GetExitCodeProcess(hp, &exit_code) : FALSE;
-					if (hp) CloseHandle(hp);
-					if (alive && exit_code == STILL_ACTIVE)
-						break;
-					Sleep(50);
-				}
+				log_msg(hf, "launch", "READY event not observed; falling back to child liveness polling up to 750ms");
+				poll_child_liveness_after_ready_event_miss(hf, pid, 750u);
 			}
 
 			bool attach_ok = verify_driver_attach(hf, pid);
 			if (!attach_ok) {
 				log_msg(hf, "launch", "FAIL -- driver attach verification failed for pid=%u; feature tests cannot trust target reads", pid);
+				g_driver_attached.store(false, std::memory_order_release);
+				g_target_unavailable.store(true, std::memory_order_release);
 			} else {
+				g_target_unavailable.store(false, std::memory_order_release);
 				log_msg(hf, "launch", "PASS -- target launched and driver attach verified pid=%u", pid);
 			}
 
@@ -3111,6 +3466,98 @@ namespace test_all_features {
 			return true;
 		}
 
+		bool queue_start_tests_impl(const char* source) {
+			const char* tag = source && source[0] ? source : "start_tests";
+			if (g_running.load(std::memory_order_acquire)) {
+				char snap[1200] = {};
+				format_debug_snapshot_impl(snap, sizeof(snap));
+				diag::log_tagged_fmt("test_all", "start_tests queue rejected: run already active source=%s | %s", tag, snap);
+				HANDLE hf = open_log_file();
+				log_msg(hf, "start", "REJECTED -- start queue while run active source=%s | %s", tag, snap);
+				if (hf != INVALID_HANDLE_VALUE) {
+					flush_full_test_log(hf);
+					CloseHandle(hf);
+				}
+				return false;
+			}
+			bool expected = false;
+			if (!g_start_queued.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+				char snap[1200] = {};
+				format_debug_snapshot_impl(snap, sizeof(snap));
+				diag::log_tagged_fmt("test_all", "start_tests queue rejected: start already queued source=%s | %s", tag, snap);
+				HANDLE hf = open_log_file();
+				log_msg(hf, "start", "REJECTED -- start already queued source=%s | %s", tag, snap);
+				if (hf != INVALID_HANDLE_VALUE) {
+					flush_full_test_log(hf);
+					CloseHandle(hf);
+				}
+				return false;
+			}
+
+			globals::ui::test_all_visible = true;
+			set_phase("Initializing...");
+			set_step("start_tests queued");
+			const std::uint64_t queued_at = now_ms_tick();
+			std::string tag_copy = tag;
+			HANDLE hf = open_log_file();
+			log_msg(hf, "start", "QUEUED -- full-test startup source=%s tid=%lu", tag, static_cast<unsigned long>(GetCurrentThreadId()));
+			log_work_queue_snapshot(hf, "start", "BEFORE full-test startup queue post");
+			if (hf != INVALID_HANDLE_VALUE) {
+				flush_full_test_log(hf);
+				CloseHandle(hf);
+			}
+
+			auto task = [tag_copy, queued_at]() {
+				const std::uint64_t entered_at = now_ms_tick();
+				HANDLE entry_hf = open_log_file();
+				log_msg(entry_hf, "start", "full-test startup queue worker entry source=%s tid=%lu queue_delay_ms=%llu",
+					tag_copy.c_str(),
+					static_cast<unsigned long>(GetCurrentThreadId()),
+					static_cast<unsigned long long>(entered_at >= queued_at ? entered_at - queued_at : 0));
+				log_work_queue_snapshot(entry_hf, "start", "full-test startup queue worker entry");
+				if (entry_hf != INVALID_HANDLE_VALUE) {
+					flush_full_test_log(entry_hf);
+					CloseHandle(entry_hf);
+				}
+				const bool started = start_tests_impl();
+				g_start_queued.store(false, std::memory_order_release);
+				HANDLE exit_hf = open_log_file();
+				log_msg(exit_hf, "start", "full-test startup queue worker exit source=%s started=%d elapsed_ms=%llu",
+					tag_copy.c_str(),
+					started ? 1 : 0,
+					static_cast<unsigned long long>(now_ms_tick() - entered_at));
+				log_debug_snapshot(exit_hf, "start", "full-test startup queue worker exit");
+				if (exit_hf != INVALID_HANDLE_VALUE) {
+					flush_full_test_log(exit_hf);
+					CloseHandle(exit_hf);
+				}
+			};
+
+			bool posted = work_queue::post_service(task);
+			if (!posted)
+				posted = work_queue::post(task);
+			if (!posted)
+				posted = critical_work_queue::post(std::move(task));
+			if (!posted) {
+				DWORD err = GetLastError();
+				g_start_queued.store(false, std::memory_order_release);
+				set_phase("Idle");
+				set_step("startup queue post failed");
+				HANDLE fail_hf = open_log_file();
+				log_msg(fail_hf, "start", "FAIL -- full-test startup queue post failed source=%s err=%lu", tag, static_cast<unsigned long>(err));
+				log_work_queue_snapshot(fail_hf, "start", "full-test startup queue post failed");
+				log_resource_snapshot(fail_hf, "start", "startup queue post failed", err);
+				if (fail_hf != INVALID_HANDLE_VALUE) {
+					flush_full_test_log(fail_hf);
+					CloseHandle(fail_hf);
+				}
+				diag::log_tagged_fmt("test_all", "full-test startup queue post failed source=%s err=%lu", tag, static_cast<unsigned long>(err));
+				return false;
+			}
+			diag::log_tagged_fmt("test_all", "full-test startup queued source=%s", tag);
+			return true;
+		}
+
 		void cancel_tests_impl() {
 			g_cancel_requested.store(true, std::memory_order_release);
 			diag::log_tagged_fmt("test_all", "user cancelled Test All Features");
@@ -3130,7 +3577,7 @@ namespace test_all_features {
 
 
 	bool start_tests() {
-		return start_tests_impl();
+		return queue_start_tests_impl("ui_start_tests");
 	}
 
 	bool trigger_from_hotkey(const char* source) {
@@ -3140,13 +3587,8 @@ namespace test_all_features {
 		format_debug_snapshot(snap_before, sizeof(snap_before));
 		diag::log_tagged_fmt("ui", "test_all_start hotkey=%s before={%s}", tag, snap_before);
 		diag::log_tagged_fmt("parser_proof", "%s pressed; starting full Test Lab before={%s}", tag, snap_before);
-		const bool guard_started = !is_running();
-		if (guard_started)
-			begin_test_guard("ctrl_shift_t prestart");
 		run_parser_proof_smoke();
-		bool accepted = start_tests();
-		if (!accepted && guard_started)
-			end_test_guard("ctrl_shift_t rejected", true);
+		bool accepted = queue_start_tests_impl(tag);
 		char snap_after[1200] = {};
 		format_debug_snapshot(snap_after, sizeof(snap_after));
 		diag::log_tagged_fmt("ui", "test_all_start hotkey=%s accepted=%d after={%s}", tag, accepted ? 1 : 0, snap_after);
@@ -3177,7 +3619,7 @@ namespace test_all_features {
 	}
 
 	bool is_running() {
-		return g_running.load(std::memory_order_acquire);
+		return g_running.load(std::memory_order_acquire) || g_start_queued.load(std::memory_order_acquire);
 	}
 
 	void set_progress_step(const char* label) {
@@ -3231,7 +3673,7 @@ namespace test_all_features {
 		bool open = globals::ui::test_all_visible;
 		if (ImGui::Begin("Test All Features##test_all_overlay", &open, flags)) {
 
-			bool running = g_running.load(std::memory_order_acquire);
+			bool running = g_running.load(std::memory_order_acquire) || g_start_queued.load(std::memory_order_acquire);
 
 
 			if (running) ImGui::BeginDisabled();

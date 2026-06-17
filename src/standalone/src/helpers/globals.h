@@ -83,6 +83,62 @@ namespace output_log {
 	inline uint64_t version[static_cast<int>(bottom_tab_t::COUNT)] = {};
 	inline bool auto_scroll[static_cast<int>(bottom_tab_t::COUNT)] = { true, true, true, true, true };
 	inline bool select_all[static_cast<int>(bottom_tab_t::COUNT)] = { false, false, false, false, false };
+	inline std::atomic<unsigned long> owner_tid{0};
+	inline std::atomic<unsigned long long> owner_since_ms{0};
+	inline std::atomic<int> owner_tab{-1};
+	inline std::atomic<int> owner_op{0};
+
+	inline const char* op_name(int op) {
+		switch (op) {
+			case 1: return "push";
+			case 2: return "clear";
+			case 3: return "set_select_all";
+			case 4: return "is_select_all";
+			case 5: return "is_auto_scroll";
+			case 6: return "size";
+			case 7: return "empty";
+			case 8: return "current_version";
+			case 9: return "snapshot_all";
+			case 10: return "snapshot_tail";
+			case 11: return "try_snapshot_all";
+			case 12: return "try_snapshot_tail_if_changed";
+			case 13: return "try_is_auto_scroll";
+			case 14: return "state_guard_snapshot";
+			case 15: return "state_guard_restore";
+			case 16: return "try_clear";
+			default: return "unknown";
+		}
+	}
+
+	inline void set_owner(int op, int idx) {
+		owner_op.store(op, std::memory_order_relaxed);
+		owner_tab.store(idx, std::memory_order_relaxed);
+		owner_since_ms.store(GetTickCount64(), std::memory_order_relaxed);
+		owner_tid.store(GetCurrentThreadId(), std::memory_order_release);
+	}
+
+	inline void clear_owner() {
+		owner_tid.store(0, std::memory_order_release);
+		owner_since_ms.store(0, std::memory_order_relaxed);
+		owner_tab.store(-1, std::memory_order_relaxed);
+		owner_op.store(0, std::memory_order_relaxed);
+	}
+
+	struct owner_scope {
+		owner_scope(int op, int idx) { set_owner(op, idx); }
+		~owner_scope() { clear_owner(); }
+		owner_scope(const owner_scope&) = delete;
+		owner_scope& operator=(const owner_scope&) = delete;
+	};
+
+	inline void snapshot_owner(unsigned long& tid, unsigned long long& age_ms, int& tab, int& op) {
+		tid = owner_tid.load(std::memory_order_acquire);
+		op = owner_op.load(std::memory_order_relaxed);
+		tab = owner_tab.load(std::memory_order_relaxed);
+		unsigned long long since = owner_since_ms.load(std::memory_order_relaxed);
+		unsigned long long now = GetTickCount64();
+		age_ms = (tid != 0 && since != 0 && now >= since) ? (now - since) : 0ULL;
+	}
 
 	inline int tab_index(bottom_tab_t tab) {
 		int idx = static_cast<int>(tab);
@@ -94,6 +150,7 @@ namespace output_log {
 		if (tab == bottom_tab_t::terminal) return;
 		int idx = tab_index(tab);
 		std::lock_guard<std::mutex> lk(mutex);
+		owner_scope owner(1, idx);
 		auto& q = lines[idx];
 		q.push_back(line);
 		while (q.size() > MAX_LINES) q.pop_front();
@@ -102,43 +159,58 @@ namespace output_log {
 	inline void clear(bottom_tab_t tab) {
 		int idx = tab_index(tab);
 		std::lock_guard<std::mutex> lk(mutex);
+		owner_scope owner(2, idx);
 		lines[idx].clear();
 		select_all[idx] = false;
 		++version[idx];
 	}
 	inline void set_select_all(bottom_tab_t tab, bool enabled) {
+		int idx = tab_index(tab);
 		std::lock_guard<std::mutex> lk(mutex);
-		select_all[tab_index(tab)] = enabled;
+		owner_scope owner(3, idx);
+		select_all[idx] = enabled;
 	}
 	inline bool is_select_all(bottom_tab_t tab) {
+		int idx = tab_index(tab);
 		std::lock_guard<std::mutex> lk(mutex);
-		return select_all[tab_index(tab)];
+		owner_scope owner(4, idx);
+		return select_all[idx];
 	}
 	inline bool is_auto_scroll(bottom_tab_t tab) {
+		int idx = tab_index(tab);
 		std::lock_guard<std::mutex> lk(mutex);
-		return auto_scroll[tab_index(tab)];
+		owner_scope owner(5, idx);
+		return auto_scroll[idx];
 	}
 	inline size_t size(bottom_tab_t tab) {
+		int idx = tab_index(tab);
 		std::lock_guard<std::mutex> lk(mutex);
-		return lines[tab_index(tab)].size();
+		owner_scope owner(6, idx);
+		return lines[idx].size();
 	}
 	inline bool empty(bottom_tab_t tab) {
+		int idx = tab_index(tab);
 		std::lock_guard<std::mutex> lk(mutex);
-		return lines[tab_index(tab)].empty();
+		owner_scope owner(7, idx);
+		return lines[idx].empty();
 	}
 	inline uint64_t current_version(bottom_tab_t tab) {
+		int idx = tab_index(tab);
 		std::lock_guard<std::mutex> lk(mutex);
-		return version[tab_index(tab)];
+		owner_scope owner(8, idx);
+		return version[idx];
 	}
 	inline void snapshot_all(bottom_tab_t tab, std::deque<std::string>& out, uint64_t* out_version = nullptr) {
 		int idx = tab_index(tab);
 		std::lock_guard<std::mutex> lk(mutex);
+		owner_scope owner(9, idx);
 		out = lines[idx];
 		if (out_version) *out_version = version[idx];
 	}
 	inline void snapshot_tail(bottom_tab_t tab, size_t max_lines, std::vector<std::string>& out, size_t* total_lines = nullptr, uint64_t* out_version = nullptr) {
 		int idx = tab_index(tab);
 		std::lock_guard<std::mutex> lk(mutex);
+		owner_scope owner(10, idx);
 		const auto& q = lines[idx];
 		size_t total = q.size();
 		size_t count = (std::min)(total, max_lines);
@@ -151,6 +223,61 @@ namespace output_log {
 		}
 		if (total_lines) *total_lines = total;
 		if (out_version) *out_version = version[idx];
+	}
+	inline bool try_snapshot_all(bottom_tab_t tab, std::deque<std::string>& out, uint64_t* out_version = nullptr) {
+		int idx = tab_index(tab);
+		std::unique_lock<std::mutex> lk(mutex, std::try_to_lock);
+		if (!lk.owns_lock())
+			return false;
+		owner_scope owner(11, idx);
+		out = lines[idx];
+		if (out_version) *out_version = version[idx];
+		return true;
+	}
+	inline bool try_snapshot_tail_if_changed(bottom_tab_t tab, size_t max_lines, uint64_t& known_version, std::vector<std::string>& out, size_t* total_lines = nullptr, bool* changed = nullptr) {
+		int idx = tab_index(tab);
+		std::unique_lock<std::mutex> lk(mutex, std::try_to_lock);
+		if (!lk.owns_lock())
+			return false;
+		owner_scope owner(12, idx);
+		const auto& q = lines[idx];
+		size_t total = q.size();
+		if (total_lines) *total_lines = total;
+		if (version[idx] == known_version) {
+			if (changed) *changed = false;
+			return true;
+		}
+		size_t count = (std::min)(total, max_lines);
+		size_t skip = total - count;
+		out.clear();
+		out.reserve(count);
+		size_t pos = 0;
+		for (const auto& line : q) {
+			if (pos++ >= skip) out.push_back(line);
+		}
+		known_version = version[idx];
+		if (changed) *changed = true;
+		return true;
+	}
+	inline bool try_is_auto_scroll(bottom_tab_t tab, bool& enabled) {
+		int idx = tab_index(tab);
+		std::unique_lock<std::mutex> lk(mutex, std::try_to_lock);
+		if (!lk.owns_lock())
+			return false;
+		owner_scope owner(13, idx);
+		enabled = auto_scroll[idx];
+		return true;
+	}
+	inline bool try_clear(bottom_tab_t tab) {
+		int idx = tab_index(tab);
+		std::unique_lock<std::mutex> lk(mutex, std::try_to_lock);
+		if (!lk.owns_lock())
+			return false;
+		owner_scope owner(16, idx);
+		lines[idx].clear();
+		select_all[idx] = false;
+		++version[idx];
+		return true;
 	}
 }
 

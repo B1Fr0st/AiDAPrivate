@@ -13,6 +13,7 @@
 #include "../core/ui/fonts.hpp"
 #include "../core/ui/skeleton.hpp"
 #include <d3d11.h>
+#include <atomic>
 
 extern ID3D11Device* g_pd3dDevice;
 
@@ -55,7 +56,31 @@ namespace icon_loader
 }
 
 extern HWND g_hwnd;
-extern const char* g_render_section;
+
+struct render_section_state_t
+{
+	render_section_state_t() noexcept : value("idle") {}
+	render_section_state_t(const render_section_state_t&) = delete;
+	render_section_state_t& operator=(const render_section_state_t&) = delete;
+	render_section_state_t& operator=(const char* section) noexcept
+	{
+		value.store(section ? section : "<null>", std::memory_order_release);
+		return *this;
+	}
+	const char* c_str() const noexcept
+	{
+		const char* section = value.load(std::memory_order_acquire);
+		return section ? section : "<null>";
+	}
+	operator const char*() const noexcept
+	{
+		return c_str();
+	}
+private:
+	std::atomic<const char*> value;
+};
+
+extern render_section_state_t g_render_section;
 
 namespace ui_input_gate
 {

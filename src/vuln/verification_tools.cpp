@@ -134,6 +134,53 @@ std::string extract_string_param(const json& params, const char* key)
     return std::string();
 }
 
+exploit_constraints_t extract_input_shape(const json& params)
+{
+    exploit_constraints_t out;
+    if (!params.contains("input_shape") || !params.at("input_shape").is_object())
+        return out;
+    const auto& s = params.at("input_shape");
+    if (s.contains("ascii_only") && s["ascii_only"].is_boolean())
+        out.ascii_only = s["ascii_only"].get<bool>();
+    if (s.contains("no_null_bytes") && s["no_null_bytes"].is_boolean())
+        out.no_null_bytes = s["no_null_bytes"].get<bool>();
+    if (s.contains("printable_only") && s["printable_only"].is_boolean())
+        out.printable_only = s["printable_only"].get<bool>();
+    if (s.contains("alignment") && s["alignment"].is_number_integer())
+        out.alignment = std::max(1, std::min(4096, s["alignment"].get<int>()));
+    if (s.contains("max_byte"))
+    {
+        if (s["max_byte"].is_number_unsigned())
+            out.max_byte = std::min<uint64_t>(255, s["max_byte"].get<uint64_t>());
+        else if (s["max_byte"].is_number_integer())
+            out.max_byte = static_cast<uint64_t>(std::max(0, std::min(255, s["max_byte"].get<int>())));
+    }
+    return out;
+}
+
+verdict_t parse_verdict_filter(const std::string& s, bool& ok)
+{
+    ok = true;
+    if (s == "confirmed")
+        return verdict_t::confirmed;
+    if (s == "refuted")
+        return verdict_t::refuted;
+    if (s == "timeout")
+        return verdict_t::timeout;
+    if (s == "unsupported")
+        return verdict_t::unsupported;
+    if (s == "inconclusive")
+        return verdict_t::inconclusive;
+    ok = false;
+    return verdict_t::inconclusive;
+}
+
+agent_tools::tool_result_t handle_verify_status(const json&)
+{
+    auto& eng = verify::engine();
+    return agent_tools::tool_result_t::ok(OBFSTR("Verification status retrieved"), eng.verdict_summary());
+}
+
 agent_tools::tool_result_t handle_verify_taint_path(const json& params)
 {
     std::string source_str = extract_string_param(params, "source");
@@ -210,7 +257,7 @@ agent_tools::tool_result_t handle_solve_for_exploit_input(const json& params)
         return agent_tools::tool_result_t::error(detail);
     }
 
-    auto result = eng.solve_for_exploit_input(*source_ea, *sink_ea, static_cast<uint32_t>(timeout_ms));
+    auto result = eng.solve_for_exploit_input(*source_ea, *sink_ea, static_cast<uint32_t>(timeout_ms), extract_input_shape(params));
     json data = verify::to_json(result);
 
     std::ostringstream msg;
@@ -389,6 +436,14 @@ agent_tools::tool_result_t handle_check_path_satisfiability(const json& params)
 
     auto result = eng.check_path_satisfiability(branch_eas, static_cast<uint32_t>(timeout_ms));
     json data = smt::to_json(result);
+    if (result.result == smt::result_t::sat)
+        data["verdict"] = "confirmed";
+    else if (result.result == smt::result_t::unsat)
+        data["verdict"] = "refuted";
+    else if (result.reason.find("timeout") != std::string::npos)
+        data["verdict"] = "timeout";
+    else
+        data["verdict"] = "inconclusive";
 
     std::ostringstream msg;
     msg << OBFSTR("Path satisfiability: ") << smt::result_str(result.result)
@@ -429,11 +484,142 @@ agent_tools::tool_result_t handle_solve_smt_query(const json& params)
     return agent_tools::tool_result_t::ok(msg.str(), data);
 }
 
+agent_tools::tool_result_t handle_triage_sink(const json& params)
+{
+    std::string sink_str = extract_string_param(params, "sink");
+    if (sink_str.empty())
+        return agent_tools::tool_result_t::error(OBFSTR("sink address is required"));
+    auto sink_ea = agent_tools::helpers::parse_address(sink_str);
+    if (!sink_ea)
+        return agent_tools::tool_result_t::error(OBFSTR("invalid sink address: ") + sink_str);
+    ea_t source = BADADDR;
+    std::string source_str = extract_string_param(params, "source");
+    if (!source_str.empty())
+    {
+        auto source_ea = agent_tools::helpers::parse_address(source_str);
+        if (!source_ea)
+            return agent_tools::tool_result_t::error(OBFSTR("invalid source address: ") + source_str);
+        source = *source_ea;
+    }
+    int cheap_timeout = clamp_timeout(params, "cheap_timeout_ms", 250, 5000);
+    int deep_timeout = clamp_timeout(params, "deep_timeout_ms", 10000, 60000);
+    std::string stop_at = extract_string_param(params, "stop_at");
+    if (stop_at.empty())
+        stop_at = "exploit_input";
+    auto result = verify::engine().triage_sink(source, *sink_ea, static_cast<uint32_t>(cheap_timeout), static_cast<uint32_t>(deep_timeout), stop_at);
+    json data = verify::to_json(result);
+    std::ostringstream msg;
+    msg << OBFSTR("Triage sink: ") << verify::verdict_str(result.final_verdict)
+        << OBFSTR(" at stage ") << result.stage_reached;
+    return agent_tools::tool_result_t::ok(msg.str(), data);
+}
+
+agent_tools::tool_result_t handle_list_verified(const json& params)
+{
+    bool use_filter = false;
+    verdict_t filter = verdict_t::inconclusive;
+    std::string verdict = extract_string_param(params, "verdict");
+    if (!verdict.empty())
+        filter = parse_verdict_filter(verdict, use_filter);
+    ea_t sink = BADADDR;
+    std::string sink_str = extract_string_param(params, "sink_ea");
+    if (!sink_str.empty())
+    {
+        auto parsed = agent_tools::helpers::parse_address(sink_str);
+        if (!parsed)
+            return agent_tools::tool_result_t::error(OBFSTR("invalid sink_ea: ") + sink_str);
+        sink = *parsed;
+    }
+    int max_entries = clamp_int_param(params, "max_entries", 100, 1, 1000);
+    auto entries = verify::engine().list_verified(filter, use_filter, sink, static_cast<size_t>(max_entries));
+    json arr = json::array();
+    for (const auto& e : entries)
+        arr.push_back(verify::to_json(e));
+    json data;
+    data["entries"] = std::move(arr);
+    data["total"] = data["entries"].size();
+    return agent_tools::tool_result_t::ok(OBFSTR("Verified verdict cache listed"), data);
+}
+
+agent_tools::tool_result_t handle_verify_ledger_persist(const json& params)
+{
+    std::string action = extract_string_param(params, "action");
+    if (action.empty())
+        action = "save";
+    if (action != "save" && action != "load" && action != "clear")
+        return agent_tools::tool_result_t::error(OBFSTR("action must be save, load, or clear"));
+    json data = verify::engine().persist_ledger(action);
+    return agent_tools::tool_result_t::ok(OBFSTR("Verification ledger operation complete"), data);
+}
+
+agent_tools::tool_result_t handle_cancel_verification(const json&)
+{
+    auto& eng = verify::engine();
+    eng.cancel();
+    json data;
+    data["cancelled"] = true;
+    data["in_flight_count"] = eng.in_flight_count();
+    return agent_tools::tool_result_t::ok(OBFSTR("Verification cancellation requested"), data);
+}
+
+agent_tools::tool_result_t handle_extract_wire_path_constraints(const json& params)
+{
+    std::string source_str = extract_string_param(params, "source");
+    std::string sink_str = extract_string_param(params, "sink");
+    if (sink_str.empty())
+        return agent_tools::tool_result_t::error(OBFSTR("sink address is required"));
+    auto sink_ea = agent_tools::helpers::parse_address(sink_str);
+    if (!sink_ea)
+        return agent_tools::tool_result_t::error(OBFSTR("invalid sink address: ") + sink_str);
+    ea_t source = BADADDR;
+    if (!source_str.empty())
+    {
+        auto source_ea = agent_tools::helpers::parse_address(source_str);
+        if (!source_ea)
+            return agent_tools::tool_result_t::error(OBFSTR("invalid source address: ") + source_str);
+        source = *source_ea;
+    }
+    int max_branches = clamp_int_param(params, "max_branches", 64, 1, 1024);
+    auto result = verify::engine().extract_wire_path_constraints(source, *sink_ea, max_branches);
+    return agent_tools::tool_result_t::ok(OBFSTR("Wire path constraints extracted"), verify::to_json(result));
+}
+
+agent_tools::tool_result_t handle_synthesize_exploit_payload(const json& params)
+{
+    std::string source_str = extract_string_param(params, "source");
+    std::string sink_str = extract_string_param(params, "sink");
+    if (sink_str.empty())
+        return agent_tools::tool_result_t::error(OBFSTR("sink address is required"));
+    auto sink_ea = agent_tools::helpers::parse_address(sink_str);
+    if (!sink_ea)
+        return agent_tools::tool_result_t::error(OBFSTR("invalid sink address: ") + sink_str);
+    ea_t source = BADADDR;
+    if (!source_str.empty())
+    {
+        auto source_ea = agent_tools::helpers::parse_address(source_str);
+        if (!source_ea)
+            return agent_tools::tool_result_t::error(OBFSTR("invalid source address: ") + source_str);
+        source = *source_ea;
+    }
+    int timeout_ms = clamp_timeout(params, "timeout_ms", 10000, 60000);
+    auto result = verify::engine().synthesize_exploit_payload(source, *sink_ea, static_cast<uint32_t>(timeout_ms), extract_input_shape(params));
+    return agent_tools::tool_result_t::ok(OBFSTR("Exploit payload synthesis complete"), verify::to_json(result));
+}
+
 }
 
 void register_verification_tools()
 {
     auto& registry = agent_tools::ToolRegistry::instance();
+
+    registry.register_tool({
+        OBFSTR("verify_status"),
+        OBFSTR("vuln_verify"),
+        OBFSTR("Return verification engine availability, SMT/symbolic errors, verdict counts, and cache size."),
+        {},
+        handle_verify_status,
+        true,
+    });
 
     registry.register_tool({
         OBFSTR("verify_taint_path"),
@@ -467,6 +653,8 @@ void register_verification_tools()
              OBFSTR("Sink EA (0x...) where the exploit lands."), true},
             {OBFSTR("timeout_ms"), OBFSTR("number"),
              OBFSTR("SMT solver timeout in milliseconds (default 10000, max 60000)."), false},
+            {OBFSTR("input_shape"), OBFSTR("object"),
+             OBFSTR("Optional constraints: ascii_only, no_null_bytes, alignment, printable_only, max_byte."), false},
         },
         handle_solve_for_exploit_input,
         true,
@@ -558,6 +746,83 @@ void register_verification_tools()
              OBFSTR("SMT solver timeout in milliseconds (default 5000, max 60000)."), false},
         },
         handle_solve_smt_query,
+        true,
+    });
+
+    {
+        agent_tools::tool_definition_t def;
+        def.name = OBFSTR("triage_sink");
+        def.category = OBFSTR("vuln_verify");
+        def.description = OBFSTR("Run staged sink triage: cheap path satisfiability, taint-path verification, then exploit input solving.");
+        def.parameters.push_back({OBFSTR("source"), OBFSTR("string"), OBFSTR("Optional source EA (0x...)."), false});
+        def.parameters.push_back({OBFSTR("sink"), OBFSTR("string"), OBFSTR("Sink EA (0x...)."), true});
+        def.parameters.push_back({OBFSTR("cheap_timeout_ms"), OBFSTR("number"), OBFSTR("Cheap stage timeout, max 5000."), false});
+        def.parameters.push_back({OBFSTR("deep_timeout_ms"), OBFSTR("number"), OBFSTR("Deep stage timeout, max 60000."), false});
+        def.parameters.push_back({OBFSTR("stop_at"), OBFSTR("string"), OBFSTR("sat_check, taint_check, or exploit_input."), false});
+        def.handler = handle_triage_sink;
+        def.read_only = true;
+        def.destructive = false;
+        def.deterministic = false;
+        registry.register_tool(def);
+    }
+
+    registry.register_tool({
+        OBFSTR("list_verified"),
+        OBFSTR("vuln_verify"),
+        OBFSTR("List cached verification verdicts with optional verdict and sink filters."),
+        {
+            {OBFSTR("verdict"), OBFSTR("string"), OBFSTR("confirmed, refuted, timeout, inconclusive, or unsupported."), false},
+            {OBFSTR("sink_ea"), OBFSTR("string"), OBFSTR("Optional sink EA filter."), false},
+            {OBFSTR("max_entries"), OBFSTR("number"), OBFSTR("Maximum entries, max 1000."), false},
+        },
+        handle_list_verified,
+        true,
+    });
+
+    registry.register_tool({
+        OBFSTR("verify_ledger_persist"),
+        OBFSTR("vuln_verify"),
+        OBFSTR("Save, load, or clear the netnode-backed verification verdict ledger."),
+        {
+            {OBFSTR("action"), OBFSTR("string"), OBFSTR("save, load, or clear."), true},
+        },
+        handle_verify_ledger_persist,
+        false,
+    });
+
+    registry.register_tool({
+        OBFSTR("cancel_verification"),
+        OBFSTR("vuln_verify"),
+        OBFSTR("Request cancellation of in-flight verification work."),
+        {},
+        handle_cancel_verification,
+        true,
+    });
+
+    registry.register_tool({
+        OBFSTR("extract_wire_path_constraints"),
+        OBFSTR("vuln_verify"),
+        OBFSTR("Extract branch constraints on a source-to-sink microcode path and emit SMT-LIB2."),
+        {
+            {OBFSTR("source"), OBFSTR("string"), OBFSTR("Optional source EA (0x...)."), false},
+            {OBFSTR("sink"), OBFSTR("string"), OBFSTR("Sink EA (0x...)."), true},
+            {OBFSTR("max_branches"), OBFSTR("number"), OBFSTR("Maximum branch predicates."), false},
+        },
+        handle_extract_wire_path_constraints,
+        true,
+    });
+
+    registry.register_tool({
+        OBFSTR("synthesize_exploit_payload"),
+        OBFSTR("vuln_verify"),
+        OBFSTR("Solve path constraints and assemble concrete payload bytes with optional input-shape constraints."),
+        {
+            {OBFSTR("source"), OBFSTR("string"), OBFSTR("Optional source EA (0x...)."), false},
+            {OBFSTR("sink"), OBFSTR("string"), OBFSTR("Sink EA (0x...)."), true},
+            {OBFSTR("timeout_ms"), OBFSTR("number"), OBFSTR("SMT timeout, max 60000."), false},
+            {OBFSTR("input_shape"), OBFSTR("object"), OBFSTR("ascii_only, no_null_bytes, alignment, printable_only, max_byte."), false},
+        },
+        handle_synthesize_exploit_payload,
         true,
     });
 }

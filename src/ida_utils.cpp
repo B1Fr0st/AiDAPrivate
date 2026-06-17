@@ -7,6 +7,8 @@
 #include <set>
 #include <list>
 #include <unordered_map>
+#include <netnode.hpp>
+#include "analysis_db.hpp"
 
 namespace {
 
@@ -39,6 +41,11 @@ class rag_cache_impl_t {
     static constexpr int64_t BASE_TTL_SECONDS  = 300;
     static constexpr int64_t BOOST_PER_ACCESS  = 60;
     static constexpr int64_t MAX_TTL_SECONDS   = 900;
+    static constexpr size_t  MAX_PERSISTENT_ENTRIES = 512;
+    static constexpr size_t  MAX_PERSISTENT_BYTES   = 4 * 1024 * 1024;
+    static constexpr size_t  MAX_PERSISTENT_RECORD_BYTES = 512 * 1024;
+    static constexpr uchar   RAG_ENTRY_TAG = 'R';
+    static constexpr uchar   RAG_INDEX_TAG = 'I';
 
     using lru_list_t = std::list<ea_t>;
 
@@ -47,9 +54,17 @@ class rag_cache_impl_t {
         lru_list_t::iterator   lru_it;
     };
 
+    struct persistent_index_entry_t {
+        ea_t      ea = BADADDR;
+        nodeidx_t slot = BADNODE;
+        uint64_t last_access_ms = 0;
+        size_t   bytes = 0;
+    };
+
     std::unordered_map<ea_t, cache_slot_t> _map;
     lru_list_t _lru;
     std::mutex _mtx;
+    std::string _last_binary_hash;
 
     int64_t effective_ttl(uint32_t ac) const
     {
@@ -80,6 +95,285 @@ class rag_cache_impl_t {
         return elapsed > effective_ttl(e.access_count);
     }
 
+    // ---- Slice H1: netnode persistence helpers ------------------------------
+    static std::string current_binary_hash()
+    {
+        try { return aida_db::AnalysisDB::instance().get_binary_hash(); }
+        catch (...) { return {}; }
+    }
+
+    static netnode persistent_netnode(bool create_if_missing)
+    {
+        return netnode("$ AiDA.rag.cache", 0, create_if_missing);
+    }
+
+    static uint64_t hash64(const std::string& s)
+    {
+        uint64_t h = 1469598103934665603ull;
+        for (unsigned char c : s)
+        {
+            h ^= c;
+            h *= 1099511628211ull;
+        }
+        return h;
+    }
+
+    static nodeidx_t slot_for(const std::string& s)
+    {
+        uint64_t h = hash64(s);
+        if (sizeof(nodeidx_t) < sizeof(uint64_t))
+            h = (h ^ (h >> 32)) & 0x7fffffffull;
+        else
+            h &= 0x7fffffffffffffffull;
+        nodeidx_t slot = static_cast<nodeidx_t>(h);
+        if (slot == BADNODE || slot == 0)
+            slot = static_cast<nodeidx_t>(1);
+        return slot;
+    }
+
+    static nodeidx_t entry_slot(const std::string& hash, ea_t ea)
+    {
+        return slot_for(std::string("entry:") + hash + ":" + std::to_string(static_cast<uint64_t>(ea)));
+    }
+
+    static nodeidx_t index_slot(const std::string& hash)
+    {
+        return slot_for(std::string("index:") + hash);
+    }
+
+    static uint64_t epoch_ms()
+    {
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+    }
+
+    // The on-disk record format. Tag MSGPACK + timestamp is in seconds since
+    // epoch (steady_clock cannot be persisted), access_count is preserved.
+    static std::vector<uint8_t> serialize_entry(const std::string& hash, ea_t ea,
+                                                const rag_full_cache_entry_t& e)
+    {
+        nlohmann::json j;
+        j["v"] = 1;
+        j["binary_hash"] = hash;
+        j["ea"] = static_cast<uint64_t>(ea);
+        j["ts_epoch_ms"] = epoch_ms();
+        j["ac"] = e.access_count;
+        j["full_context"] = e.full_context;
+        j["imports_context"] = e.imports_context;
+        j["type_context"] = e.type_context;
+        j["binary_metadata"] = e.binary_metadata;
+        return nlohmann::json::to_msgpack(j);
+    }
+
+    static bool deserialize_entry(const std::vector<uint8_t>& blob,
+                                  const std::string& expected_hash,
+                                  ea_t expected_ea,
+                                  rag_full_cache_entry_t& out_entry,
+                                  uint64_t& out_ts_epoch_ms)
+    {
+        try
+        {
+            auto j = nlohmann::json::from_msgpack(blob);
+            if (!j.contains("v")) return false;
+            if (j.value("binary_hash", std::string()) != expected_hash)
+                return false;
+            if (static_cast<ea_t>(j.value("ea", uint64_t(BADADDR))) != expected_ea)
+                return false;
+            out_ts_epoch_ms = j.value("ts_epoch_ms", uint64_t(0));
+            out_entry.access_count = j.value("ac", uint32_t(0));
+            out_entry.full_context = j.value("full_context", nlohmann::json());
+            out_entry.imports_context = j.value("imports_context", std::string());
+            out_entry.type_context = j.value("type_context", std::string());
+            out_entry.binary_metadata = j.value("binary_metadata", std::string());
+            // Re-anchor steady_clock timestamp so TTL still functions in-session.
+            // We treat any stored entry as "fresh enough" on load — TTL is
+            // session-scoped expiry, not a wall-clock invariant.
+            out_entry.timestamp = std::chrono::steady_clock::now();
+            return true;
+        }
+        catch (...) { return false; }
+    }
+
+    static std::vector<persistent_index_entry_t> load_index(const std::string& hash)
+    {
+        std::vector<persistent_index_entry_t> out;
+        if (hash.empty()) return out;
+        netnode nn = persistent_netnode(false);
+        if (nn == BADNODE) return out;
+        qvector<uchar> blob;
+        if (nn.getblob(&blob, index_slot(hash), RAG_INDEX_TAG) <= 0)
+            return out;
+        try
+        {
+            std::vector<uint8_t> data(blob.begin(), blob.end());
+            auto j = nlohmann::json::from_msgpack(data);
+            if (j.value("binary_hash", std::string()) != hash)
+                return out;
+            if (!j.contains("entries") || !j["entries"].is_array())
+                return out;
+            for (const auto& item : j["entries"])
+            {
+                persistent_index_entry_t e;
+                e.ea = static_cast<ea_t>(item.value("ea", uint64_t(BADADDR)));
+                e.slot = static_cast<nodeidx_t>(item.value("slot", uint64_t(BADNODE)));
+                e.last_access_ms = item.value("last_access_ms", uint64_t(0));
+                e.bytes = item.value("bytes", size_t(0));
+                if (e.ea != BADADDR && e.slot != BADNODE)
+                    out.push_back(e);
+            }
+        }
+        catch (...) { out.clear(); }
+        return out;
+    }
+
+    static void save_index(const std::string& hash,
+                           const std::vector<persistent_index_entry_t>& entries)
+    {
+        if (hash.empty()) return;
+        netnode nn = persistent_netnode(true);
+        if (nn == BADNODE) return;
+        nlohmann::json j;
+        j["v"] = 1;
+        j["binary_hash"] = hash;
+        j["entries"] = nlohmann::json::array();
+        for (const auto& e : entries)
+        {
+            j["entries"].push_back({
+                {"ea", static_cast<uint64_t>(e.ea)},
+                {"slot", static_cast<uint64_t>(e.slot)},
+                {"last_access_ms", e.last_access_ms},
+                {"bytes", e.bytes}
+            });
+        }
+        auto blob = nlohmann::json::to_msgpack(j);
+        if (!blob.empty())
+            nn.setblob(blob.data(), blob.size(), index_slot(hash), RAG_INDEX_TAG);
+    }
+
+    static void remove_index(const std::string& hash)
+    {
+        if (hash.empty()) return;
+        netnode nn = persistent_netnode(false);
+        if (nn == BADNODE) return;
+        nn.delblob(index_slot(hash), RAG_INDEX_TAG);
+    }
+
+    static void touch_persistent_index(const std::string& hash, ea_t ea,
+                                       nodeidx_t slot, size_t bytes)
+    {
+        if (hash.empty()) return;
+        netnode nn = persistent_netnode(true);
+        if (nn == BADNODE) return;
+        auto entries = load_index(hash);
+        bool found = false;
+        uint64_t ts = epoch_ms();
+        for (auto& e : entries)
+        {
+            if (e.ea == ea)
+            {
+                e.slot = slot;
+                e.last_access_ms = ts;
+                e.bytes = bytes;
+                found = true;
+                break;
+            }
+        }
+        if (!found)
+            entries.push_back({ea, slot, ts, bytes});
+
+        auto total_bytes = [] (const std::vector<persistent_index_entry_t>& vec) {
+            size_t total = 0;
+            for (const auto& e : vec) total += e.bytes;
+            return total;
+        };
+
+        while (entries.size() > MAX_PERSISTENT_ENTRIES || total_bytes(entries) > MAX_PERSISTENT_BYTES)
+        {
+            auto victim = std::min_element(entries.begin(), entries.end(),
+                [](const persistent_index_entry_t& a, const persistent_index_entry_t& b) {
+                    return a.last_access_ms < b.last_access_ms;
+                });
+            if (victim == entries.end()) break;
+            nn.delblob(victim->slot, RAG_ENTRY_TAG);
+            entries.erase(victim);
+        }
+        save_index(hash, entries);
+    }
+
+    static void clear_persistent_hash(const std::string& hash)
+    {
+        if (hash.empty()) return;
+        netnode nn = persistent_netnode(false);
+        if (nn == BADNODE) return;
+        auto entries = load_index(hash);
+        for (const auto& e : entries)
+            nn.delblob(e.slot, RAG_ENTRY_TAG);
+        remove_index(hash);
+    }
+
+    void maybe_invalidate_on_hash_change_locked()
+    {
+        std::string h = current_binary_hash();
+        if (h == _last_binary_hash) return;
+        // First-time anchor is not an invalidation.
+        if (!_last_binary_hash.empty())
+        {
+            _map.clear();
+            _lru.clear();
+        }
+        _last_binary_hash = std::move(h);
+    }
+
+    bool persist_load_locked(ea_t ea, cache_slot_t& out_slot)
+    {
+        netnode nn = persistent_netnode(false);
+        if (nn == BADNODE || _last_binary_hash.empty()) return false;
+        qvector<uchar> qblob;
+        nodeidx_t slot = entry_slot(_last_binary_hash, ea);
+        ssize_t got = nn.getblob(&qblob, slot, RAG_ENTRY_TAG);
+        if (got <= 0) return false;
+        std::vector<uint8_t> blob(qblob.begin(), qblob.end());
+        rag_full_cache_entry_t entry;
+        uint64_t ts_epoch_ms = 0;
+        if (!deserialize_entry(blob, _last_binary_hash, ea, entry, ts_epoch_ms)) return false;
+        touch_persistent_index(_last_binary_hash, ea, slot, blob.size());
+        out_slot.entry = std::move(entry);
+        return true;
+    }
+
+    void persist_store_locked(ea_t ea, const rag_full_cache_entry_t& e)
+    {
+        if (_last_binary_hash.empty()) return;
+        netnode nn = persistent_netnode(true);
+        if (nn == BADNODE) return;
+        auto blob = serialize_entry(_last_binary_hash, ea, e);
+        if (blob.empty() || blob.size() > MAX_PERSISTENT_RECORD_BYTES) return;
+        nodeidx_t slot = entry_slot(_last_binary_hash, ea);
+        if (nn.setblob(blob.data(), blob.size(), slot, RAG_ENTRY_TAG))
+            touch_persistent_index(_last_binary_hash, ea, slot, blob.size());
+    }
+
+    void persist_evict_locked(ea_t ea)
+    {
+        if (_last_binary_hash.empty()) return;
+        netnode nn = persistent_netnode(false);
+        if (nn == BADNODE) return;
+        nn.delblob(entry_slot(_last_binary_hash, ea), RAG_ENTRY_TAG);
+        auto entries = load_index(_last_binary_hash);
+        entries.erase(std::remove_if(entries.begin(), entries.end(),
+            [ea](const persistent_index_entry_t& e) { return e.ea == ea; }), entries.end());
+        if (entries.empty())
+            remove_index(_last_binary_hash);
+        else
+            save_index(_last_binary_hash, entries);
+    }
+
+    void persist_clear_locked()
+    {
+        clear_persistent_hash(_last_binary_hash);
+    }
+
 public:
     static rag_cache_impl_t& instance()
     {
@@ -90,8 +384,22 @@ public:
     bool lookup(ea_t ea, std::string& out_imports, std::string& out_types)
     {
         std::lock_guard<std::mutex> lk(_mtx);
+        maybe_invalidate_on_hash_change_locked();
         auto it = _map.find(ea);
-        if (it == _map.end()) return false;
+        if (it == _map.end())
+        {
+            // LRU miss: try persistent backing.
+            cache_slot_t reloaded;
+            if (!persist_load_locked(ea, reloaded)) return false;
+            // Hydrate LRU.
+            while (_map.size() >= MAX_ENTRIES) evict_oldest_locked();
+            _lru.push_front(ea);
+            reloaded.lru_it = _lru.begin();
+            auto [ins_it, _] = _map.emplace(ea, std::move(reloaded));
+            out_imports = ins_it->second.entry.imports_context;
+            out_types   = ins_it->second.entry.type_context;
+            return true;
+        }
 
         if (is_expired_locked(it->second.entry))
         {
@@ -111,8 +419,26 @@ public:
                      std::string& out_metadata)
     {
         std::lock_guard<std::mutex> lk(_mtx);
+        maybe_invalidate_on_hash_change_locked();
         auto it = _map.find(ea);
-        if (it == _map.end()) return false;
+        if (it == _map.end())
+        {
+            // Cross-session reload from netnode.
+            cache_slot_t reloaded;
+            if (!persist_load_locked(ea, reloaded)) return false;
+            if (reloaded.entry.full_context.is_null()
+                || reloaded.entry.full_context.empty()) return false;
+            while (_map.size() >= MAX_ENTRIES) evict_oldest_locked();
+            _lru.push_front(ea);
+            reloaded.lru_it = _lru.begin();
+            auto [ins_it, _] = _map.emplace(ea, std::move(reloaded));
+            auto& e = ins_it->second.entry;
+            out_context  = e.full_context;
+            out_imports  = e.imports_context;
+            out_types    = e.type_context;
+            out_metadata = e.binary_metadata;
+            return true;
+        }
 
         auto& e = it->second.entry;
         if (is_expired_locked(e))
@@ -136,6 +462,7 @@ public:
     void store(ea_t ea, const std::string& imports, const std::string& types)
     {
         std::lock_guard<std::mutex> lk(_mtx);
+        maybe_invalidate_on_hash_change_locked();
         auto it = _map.find(ea);
         if (it != _map.end())
         {
@@ -143,6 +470,7 @@ public:
             it->second.entry.type_context    = types;
             it->second.entry.timestamp = std::chrono::steady_clock::now();
             touch_locked(it);
+            persist_store_locked(ea, it->second.entry);
             return;
         }
 
@@ -156,7 +484,8 @@ public:
         slot.entry.timestamp       = std::chrono::steady_clock::now();
         slot.entry.access_count    = 0;
         slot.lru_it                = _lru.begin();
-        _map.emplace(ea, std::move(slot));
+        auto [ins_it, _] = _map.emplace(ea, std::move(slot));
+        persist_store_locked(ea, ins_it->second.entry);
     }
 
     void store_full(ea_t ea, const nlohmann::json& context,
@@ -164,6 +493,7 @@ public:
                     const std::string& metadata)
     {
         std::lock_guard<std::mutex> lk(_mtx);
+        maybe_invalidate_on_hash_change_locked();
         auto it = _map.find(ea);
         if (it != _map.end())
         {
@@ -174,6 +504,7 @@ public:
             e.binary_metadata = metadata;
             e.timestamp       = std::chrono::steady_clock::now();
             touch_locked(it);
+            persist_store_locked(ea, e);
             return;
         }
 
@@ -189,12 +520,15 @@ public:
         slot.entry.timestamp       = std::chrono::steady_clock::now();
         slot.entry.access_count    = 0;
         slot.lru_it                = _lru.begin();
-        _map.emplace(ea, std::move(slot));
+        auto [ins_it, _] = _map.emplace(ea, std::move(slot));
+        persist_store_locked(ea, ins_it->second.entry);
     }
 
     void evict(ea_t ea)
     {
         std::lock_guard<std::mutex> lk(_mtx);
+        maybe_invalidate_on_hash_change_locked();
+        persist_evict_locked(ea);
         auto it = _map.find(ea);
         if (it != _map.end())
         {
@@ -206,6 +540,8 @@ public:
     void clear()
     {
         std::lock_guard<std::mutex> lk(_mtx);
+        maybe_invalidate_on_hash_change_locked();
+        persist_clear_locked();
         _map.clear();
         _lru.clear();
     }

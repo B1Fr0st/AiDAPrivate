@@ -29,6 +29,7 @@
 #include <cstring>
 #include <filesystem>
 #include <string>
+#include <system_error>
 
 extern HWND g_hwnd;
 
@@ -98,8 +99,9 @@ inline void render_modal()
 		return;
 	}
 
+	const int frame = ImGui::GetFrameCount();
 	if (open_fr < 0) {
-		open_fr = ImGui::GetFrameCount();
+		open_fr = frame;
 		detail::sync_local_options();
 	}
 
@@ -120,7 +122,8 @@ inline void render_modal()
 
 	ImGui::SetNextWindowPos(ImVec2(px, py));
 	ImGui::SetNextWindowSize(ImVec2(sw, sh));
-	ImGui::SetNextWindowFocus();
+	if (open_fr == frame)
+		ImGui::SetNextWindowFocus();
 	const auto& th = aida::ui::resolved();
 	ImGui::PushStyleColor(ImGuiCol_WindowBg, aida::ui::with_alpha(th.bg_elevated, anim * 0.97f));
 	ImGui::PushStyleColor(ImGuiCol_Border, aida::ui::with_alpha(th.border_strong, anim));
@@ -548,8 +551,9 @@ inline void render_local_pdb_modal()
 		return;
 	}
 
+	const int frame = ImGui::GetFrameCount();
 	if (open_fr < 0) {
-		open_fr = ImGui::GetFrameCount();
+		open_fr = frame;
 		{
 			std::lock_guard<std::mutex> lk(st.local_pdb_mtx);
 			std::string seed = st.local_pdb_module_name;
@@ -557,8 +561,14 @@ inline void render_local_pdb_modal()
 			if (dot != std::string::npos) seed = seed.substr(0, dot);
 			if (!seed.empty()) seed += ".pdb";
 			detail::local_pdb_typed_path() = seed;
+			detail::local_pdb_typed_buf().fill(0);
 			std::strncpy(detail::local_pdb_typed_buf().data(), seed.c_str(),
 				detail::local_pdb_typed_buf().size() - 1);
+			diag::log_tagged_fmt("initial_analysis",
+				"local_pdb_modal_open frame=%d module='%s' seed='%s'",
+				open_fr,
+				st.local_pdb_module_name.c_str(),
+				seed.c_str());
 		}
 	}
 
@@ -579,7 +589,8 @@ inline void render_local_pdb_modal()
 
 	ImGui::SetNextWindowPos(ImVec2(px, py));
 	ImGui::SetNextWindowSize(ImVec2(sw, sh));
-	ImGui::SetNextWindowFocus();
+	if (open_fr == frame)
+		ImGui::SetNextWindowFocus();
 	const auto& th = aida::ui::resolved();
 	ImGui::PushStyleColor(ImGuiCol_WindowBg, aida::ui::with_alpha(th.bg_elevated, anim * 0.97f));
 	ImGui::PushStyleColor(ImGuiCol_Border, aida::ui::with_alpha(th.border_strong, anim));
@@ -631,11 +642,23 @@ inline void render_local_pdb_modal()
 		auto& buf = detail::local_pdb_typed_buf();
 		ImGui::PushItemWidth(sw - 44.f - 110.f - 12.f);
 		ImGui::PushFont(aida::ui::fonts::code());
-		if (ImGui::InputText("##ia_local_pdb_path", buf.data(),
+		const bool path_changed = ImGui::InputText("##ia_local_pdb_path", buf.data(),
 			static_cast<int>(buf.size()),
-			ImGuiInputTextFlags_AutoSelectAll))
-		{
+			ImGuiInputTextFlags_AutoSelectAll);
+		const bool path_clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+		const bool path_activated = ImGui::IsItemActivated();
+		const bool path_deactivated = ImGui::IsItemDeactivated();
+		if (path_changed)
 			detail::local_pdb_typed_path() = buf.data();
+		if (path_clicked || path_activated || path_deactivated || path_changed) {
+			diag::log_tagged_fmt("initial_analysis",
+				"local_pdb_input event clicked=%d activated=%d deactivated=%d changed=%d len=%zu path='%s'",
+				path_clicked ? 1 : 0,
+				path_activated ? 1 : 0,
+				path_deactivated ? 1 : 0,
+				path_changed ? 1 : 0,
+				std::strlen(buf.data()),
+				buf.data());
 		}
 		ImGui::PopFont();
 		ImGui::PopItemWidth();
@@ -651,8 +674,12 @@ inline void render_local_pdb_modal()
 			std::string picked = detail::browse_for_pdb_dialog(g_hwnd, seed);
 			if (!picked.empty()) {
 				detail::local_pdb_typed_path() = picked;
+				buf.fill(0);
 				std::strncpy(buf.data(), picked.c_str(), buf.size() - 1);
-				buf[buf.size() - 1] = '\0';
+				diag::log_tagged_fmt("initial_analysis",
+					"local_pdb_browse_selected len=%zu path='%s'",
+					picked.size(),
+					picked.c_str());
 			}
 		}
 	}
@@ -682,8 +709,20 @@ inline void render_local_pdb_modal()
 			                            picked.back() == '\r' || picked.back() == '\n'))
 				picked.pop_back();
 
-			bool path_ok = !picked.empty() && std::filesystem::exists(picked) &&
-				std::filesystem::is_regular_file(picked);
+			std::error_code exists_ec;
+			std::error_code regular_ec;
+			const bool exists_ok = !picked.empty() && std::filesystem::exists(picked, exists_ec);
+			const bool regular_ok = exists_ok && std::filesystem::is_regular_file(picked, regular_ec);
+			bool path_ok = exists_ok && regular_ok && !exists_ec && !regular_ec;
+			diag::log_tagged_fmt("initial_analysis",
+				"local_pdb_load_clicked len=%zu exists_ok=%d regular_ok=%d exists_ec=%d regular_ec=%d path_ok=%d path='%s'",
+				picked.size(),
+				exists_ok ? 1 : 0,
+				regular_ok ? 1 : 0,
+				exists_ec.value(),
+				regular_ec.value(),
+				path_ok ? 1 : 0,
+				picked.c_str());
 			if (path_ok) {
 				initial_analysis::accept_local_pdb_prompt(picked);
 				closing = true;

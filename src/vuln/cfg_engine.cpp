@@ -2,15 +2,18 @@
 
 #include "vuln_tools.hpp"
 #include "microcode_engine.hpp"
+#include "vuln_signatures.hpp"
 
 #include <ida.hpp>
 #include <funcs.hpp>
 #include <bytes.hpp>
 #include <name.hpp>
+#include <nalt.hpp>
 #include <xref.hpp>
 #include <segment.hpp>
 #include <typeinf.hpp>
 #include <gdl.hpp>
+#include <netnode.hpp>
 #include <ua.hpp>
 #include <allins.hpp>
 #include <hexrays.hpp>
@@ -18,12 +21,15 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <deque>
 #include <functional>
 #include <limits>
+#include <mutex>
 #include <optional>
+#include <queue>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -1050,6 +1056,555 @@ std::string build_path_rationale(const qflow_chart_t& fc,
     return r;
 }
 
+std::string md5_token()
+{
+    uchar md5[16] = {};
+    if (!retrieve_input_file_md5(md5))
+        return std::string("no_md5");
+    static const char hex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(32);
+    for (uchar b : md5)
+    {
+        out.push_back(hex[(b >> 4) & 0xF]);
+        out.push_back(hex[b & 0xF]);
+    }
+    return out;
+}
+
+std::string dispatch_cache_key(const std::string& suffix)
+{
+    return md5_token() + "|sig=" + std::to_string(aida::vuln::sig::SIGNATURE_DATABASE_REVISION) +
+           "|chg=" + std::to_string(inf_get_database_change_count()) + "|" + suffix;
+}
+
+std::optional<json> dispatch_cache_get(const std::string& key)
+{
+    netnode n("$ AiDA.dispatch.cache", 0, true);
+    if (n == BADNODE)
+        return std::nullopt;
+    qstring out;
+    if (n.hashstr(&out, key.c_str(), 'D') <= 0)
+        return std::nullopt;
+    try
+    {
+        return json::parse(out.c_str());
+    }
+    catch (...)
+    {
+        return std::nullopt;
+    }
+}
+
+void dispatch_cache_put(const std::string& key, const json& data)
+{
+    netnode n("$ AiDA.dispatch.cache", 0, true);
+    if (n == BADNODE)
+        return;
+    const std::string dump = data.dump();
+    n.hashset(key.c_str(), dump.c_str(), dump.size() + 1, 'D');
+}
+
+bool function_has_call_near(ea_t target)
+{
+    func_t* pfn = get_func(target);
+    if (pfn == nullptr)
+        return false;
+    ea_t cur = target;
+    int seen = 0;
+    while (cur != BADADDR && cur < pfn->end_ea && seen < 48)
+    {
+        insn_t ins;
+        if (decode_insn(&ins, cur) <= 0)
+        {
+            cur = next_head(cur, pfn->end_ea);
+            ++seen;
+            continue;
+        }
+        if (ins.itype == NN_call || ins.itype == NN_callfi || ins.itype == NN_callni)
+            return true;
+        cur = next_head(cur, pfn->end_ea);
+        ++seen;
+    }
+    return false;
+}
+
+json switch_case_to_json(const switch_case_t& c)
+{
+    json j;
+    j["value"] = c.value;
+    j["jump_target_ea"] = fmt_addr(c.jump_target_ea);
+    j["handler_func_ea"] = fmt_addr(c.handler_func_ea);
+    j["handler_name"] = c.handler_name;
+    j["has_call"] = c.has_call;
+    return j;
+}
+
+json switch_dispatch_to_json(const switch_dispatch_t& d)
+{
+    json j;
+    j["jmp_ea"] = fmt_addr(d.jmp_ea);
+    j["switch_kind"] = d.switch_kind;
+    j["ncases"] = d.ncases;
+    j["default_target"] = fmt_addr(d.default_target);
+    j["cases"] = json::array();
+    for (const auto& c : d.cases)
+        j["cases"].push_back(switch_case_to_json(c));
+    return j;
+}
+
+switch_case_t make_switch_case(std::uint64_t value, ea_t target)
+{
+    switch_case_t c;
+    c.value = value;
+    c.jump_target_ea = target;
+    func_t* tf = get_func(target);
+    if (tf != nullptr)
+    {
+        c.handler_func_ea = tf->start_ea;
+        c.handler_name = demangle_or_name(tf->start_ea);
+        c.has_call = function_has_call_near(target);
+    }
+    return c;
+}
+
+void collect_asm_switches_in_func(func_t* pfn, std::vector<switch_dispatch_t>& out)
+{
+    if (pfn == nullptr)
+        return;
+    func_item_iterator_t fii(pfn);
+    for (bool ok = fii.first(); ok; ok = fii.next_head())
+    {
+        ea_t ea = fii.current();
+        insn_t ins;
+        if (decode_insn(&ins, ea) <= 0)
+            continue;
+        if (ins.itype != NN_jmpni && ins.itype != NN_jmpfi)
+            continue;
+        switch_info_t si;
+        if (get_switch_info(&si, ea) <= 0)
+            continue;
+        casevec_t cases;
+        eavec_t targets;
+        if (!calc_switch_cases(&cases, &targets, ea, si))
+            continue;
+        switch_dispatch_t d;
+        d.jmp_ea = ea;
+        d.switch_kind = "asm";
+        d.ncases = static_cast<int>(si.ncases);
+        d.default_target = si.defjump;
+        for (size_t i = 0; i < targets.size(); ++i)
+        {
+            if (i < cases.size())
+            {
+                const svalvec_t& vals = cases[i];
+                if (vals.empty())
+                {
+                    d.cases.push_back(make_switch_case(0, targets[i]));
+                }
+                else
+                {
+                    for (sval_t v : vals)
+                        d.cases.push_back(make_switch_case(static_cast<std::uint64_t>(v), targets[i]));
+                }
+            }
+            else
+            {
+                d.cases.push_back(make_switch_case(static_cast<std::uint64_t>(i), targets[i]));
+            }
+        }
+        if (d.ncases <= 0)
+            d.ncases = static_cast<int>(d.cases.size());
+        out.push_back(std::move(d));
+    }
+}
+
+struct hex_switch_visitor_t : public ctree_visitor_t
+{
+    std::vector<switch_dispatch_t>* out = nullptr;
+    explicit hex_switch_visitor_t(std::vector<switch_dispatch_t>* o) : ctree_visitor_t(CV_FAST), out(o) {}
+    int idaapi visit_insn(cinsn_t* ins) override
+    {
+        if (out == nullptr || ins == nullptr || ins->op != cit_switch || ins->cswitch == nullptr)
+            return 0;
+        switch_dispatch_t d;
+        d.jmp_ea = ins->ea;
+        d.switch_kind = "hexrays";
+        d.default_target = BADADDR;
+        for (size_t i = 0; i < ins->cswitch->cases.size(); ++i)
+        {
+            const ccase_t& cc = ins->cswitch->cases[i];
+            ea_t target = cc.ea;
+            if (cc.values.empty())
+            {
+                d.cases.push_back(make_switch_case(0, target));
+            }
+            else
+            {
+                for (sval_t v : cc.values)
+                    d.cases.push_back(make_switch_case(static_cast<std::uint64_t>(v), target));
+            }
+        }
+        d.ncases = static_cast<int>(d.cases.size());
+        out->push_back(std::move(d));
+        return 0;
+    }
+};
+
+void collect_hex_switches_in_func(func_t* pfn, std::vector<switch_dispatch_t>& out)
+{
+    if (pfn == nullptr || !init_hexrays_plugin() || !ida_utils::is_safely_decompilable(pfn))
+        return;
+    cfuncptr_t cf(nullptr);
+    try
+    {
+        cf = decompile_func(pfn, nullptr, DECOMP_NO_WAIT);
+    }
+    catch (...)
+    {
+        cf.reset();
+    }
+    if (!cf)
+        return;
+    hex_switch_visitor_t v(&out);
+    v.apply_to(&cf->body, nullptr);
+}
+
+std::string lower_string_cfg(const std::string& s)
+{
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s)
+        out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    return out;
+}
+
+bool target_filter_matches(const indirect_call_t& ic, const std::string& filter)
+{
+    if (filter.empty())
+        return true;
+    const std::string f = lower_string_cfg(filter);
+    for (const auto& t : ic.targets)
+    {
+        if (lower_string_cfg(t.name).find(f) != std::string::npos)
+            return true;
+    }
+    return false;
+}
+
+bool indirect_call_is_vtable(const indirect_call_t& ic)
+{
+    if (lower_string_cfg(ic.reason).find("vtable") != std::string::npos)
+        return true;
+    for (const auto& t : ic.targets)
+    {
+        if (lower_string_cfg(t.source).find("vtable") != std::string::npos)
+            return true;
+    }
+    return false;
+}
+
+json vtable_entry_json(ea_t ea)
+{
+    json e;
+    e["ea"] = fmt_addr(ea);
+    e["name"] = demangle_or_name(ea);
+    return e;
+}
+
+void scan_rdata_vtables(int min_entries, int max_entries, json& arr)
+{
+    const bool is64 = inf_is_64bit();
+    const ea_t step = is64 ? 8 : 4;
+    for (int i = 0; i < get_segm_qty(); ++i)
+    {
+        segment_t* seg = getnseg(i);
+        if (seg == nullptr || seg->type == SEG_CODE)
+            continue;
+        if (seg->perm != 0 && (seg->perm & SEGPERM_WRITE) != 0)
+            continue;
+        for (ea_t ea = seg->start_ea; ea + step <= seg->end_ea;)
+        {
+            std::vector<ea_t> entries;
+            ea_t cur = ea;
+            while (cur + step <= seg->end_ea && static_cast<int>(entries.size()) < max_entries)
+            {
+                ea_t target = is64 ? static_cast<ea_t>(get_qword(cur))
+                                   : static_cast<ea_t>(get_dword(cur));
+                if (!ea_in_code_segment(target))
+                    break;
+                func_t* pfn = get_func(target);
+                if (pfn == nullptr || pfn->start_ea != target)
+                    break;
+                entries.push_back(target);
+                cur += step;
+            }
+            if (static_cast<int>(entries.size()) >= min_entries)
+            {
+                qstring nm;
+                std::string name;
+                if (get_name(&nm, ea) > 0 && !nm.empty())
+                    name = nm.c_str();
+                json v;
+                v["vtable_ea"] = fmt_addr(ea);
+                v["name"] = name;
+                v["entry_count"] = entries.size();
+                v["confidence"] = name.find("vft") != std::string::npos || name.find("vtable") != std::string::npos ? "likely" : "plausible";
+                v["source"] = "rdata_pointer_array";
+                v["entries"] = json::array();
+                for (ea_t e : entries)
+                    v["entries"].push_back(vtable_entry_json(e));
+                arr.push_back(std::move(v));
+                ea = cur;
+            }
+            else
+            {
+                ea += step;
+            }
+        }
+    }
+}
+
+struct func_graph_t
+{
+    std::unordered_map<ea_t, std::vector<ea_t>> callees;
+};
+
+func_graph_t build_func_graph()
+{
+    func_graph_t g;
+    const size_t fq = get_func_qty();
+    for (size_t i = 0; i < fq; ++i)
+    {
+        func_t* pfn = getn_func(i);
+        if (pfn == nullptr)
+            continue;
+        std::unordered_set<ea_t> seen;
+        func_item_iterator_t fii(pfn);
+        for (bool ok = fii.first(); ok; ok = fii.next_head())
+        {
+            ea_t item = fii.current();
+            for (ea_t to = get_first_fcref_from(item); to != BADADDR; to = get_next_fcref_from(item, to))
+            {
+                func_t* tf = get_func(to);
+                if (tf == nullptr || tf->start_ea == pfn->start_ea)
+                    continue;
+                if (seen.insert(tf->start_ea).second)
+                    g.callees[pfn->start_ea].push_back(tf->start_ea);
+            }
+        }
+    }
+    return g;
+}
+
+const func_graph_t& cached_cfg_call_graph()
+{
+    static std::mutex mtx;
+    static std::optional<func_graph_t> cache;
+    static uint32 change_count = 0;
+    std::lock_guard<std::mutex> lk(mtx);
+    uint32 cur = inf_get_database_change_count();
+    if (!cache.has_value() || cur != change_count)
+    {
+        cache = build_func_graph();
+        change_count = cur;
+    }
+    return *cache;
+}
+
+bool cfg_bool_param(const json& params, const char* key, bool fallback)
+{
+    if (!params.is_object())
+        return fallback;
+    auto it = params.find(key);
+    if (it == params.end() || it->is_null())
+        return fallback;
+    if (it->is_boolean())
+        return it->get<bool>();
+    if (it->is_number_integer())
+        return it->get<int>() != 0;
+    return fallback;
+}
+
+int cfg_int_param(const json& params, const char* key, int fallback)
+{
+    if (!params.is_object())
+        return fallback;
+    auto it = params.find(key);
+    if (it == params.end() || it->is_null())
+        return fallback;
+    try
+    {
+        if (it->is_number_integer())
+            return it->get<int>();
+        if (it->is_number_unsigned())
+            return static_cast<int>(it->get<std::uint64_t>());
+        if (it->is_number())
+            return static_cast<int>(it->get<double>());
+        if (it->is_string())
+            return std::stoi(it->get<std::string>());
+    }
+    catch (...)
+    {
+        return fallback;
+    }
+    return fallback;
+}
+
+std::vector<ea_t> cfg_addr_array_param(const json& params, const char* key)
+{
+    std::vector<ea_t> out;
+    if (!params.is_object())
+        return out;
+    auto it = params.find(key);
+    if (it == params.end() || it->is_null())
+        return out;
+    auto add_one = [&](const json& v) {
+        if (v.is_string())
+        {
+            auto p = agent_tools::helpers::parse_address(v.get<std::string>());
+            if (p.has_value())
+                out.push_back(*p);
+        }
+        else if (v.is_number_unsigned())
+        {
+            out.push_back(static_cast<ea_t>(v.get<std::uint64_t>()));
+        }
+        else if (v.is_number_integer())
+        {
+            out.push_back(static_cast<ea_t>(v.get<std::int64_t>()));
+        }
+    };
+    if (it->is_array())
+    {
+        for (const auto& v : *it)
+            add_one(v);
+    }
+    else
+    {
+        add_one(*it);
+    }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
+tool_result_t handler_enumerate_switch_dispatch(const json& params)
+{
+    ea_t fea = BADADDR;
+    if (params.is_object() && params.contains("address") && !params["address"].is_null())
+    {
+        if (params["address"].is_string())
+        {
+            const std::string s = params["address"].get<std::string>();
+            if (!s.empty() && s != "all" && s != "ALL")
+            {
+                auto p = agent_tools::helpers::parse_address(s);
+                if (!p.has_value())
+                    return tool_result_t::error(OBFSTR("Invalid address"), "bad_param");
+                fea = *p;
+            }
+        }
+    }
+    std::vector<switch_dispatch_t> v = enumerate_switch_dispatch(fea);
+    json arr = json::array();
+    for (const auto& d : v)
+        arr.push_back(switch_dispatch_to_json(d));
+    json data;
+    data["count"] = arr.size();
+    data["dispatches"] = std::move(arr);
+    sanitize_json_utf8_inplace(data);
+    return tool_result_t::ok(OBFSTR("Switch dispatchers: ") + std::to_string(data["count"].get<size_t>()), data);
+}
+
+tool_result_t handler_list_dispatchers(const json& params)
+{
+    json data = list_dispatchers(cfg_int_param(params, "top_n", 25));
+    sanitize_json_utf8_inplace(data);
+    return tool_result_t::ok(OBFSTR("Dispatchers: ") + std::to_string(data.value("count", static_cast<std::size_t>(0))), data);
+}
+
+tool_result_t handler_resolve_indirect_calls_batched(const json& params)
+{
+    std::vector<ea_t> funcs = cfg_addr_array_param(params, "functions");
+    std::string target_filter;
+    if (params.is_object())
+    {
+        auto it = params.find("target_name_filter");
+        if (it != params.end() && it->is_string())
+            target_filter = it->get<std::string>();
+    }
+    json data = resolve_indirect_calls_batched(funcs,
+        cfg_bool_param(params, "only_unresolved", false),
+        cfg_bool_param(params, "only_vtable", false),
+        target_filter);
+    sanitize_json_utf8_inplace(data);
+    return tool_result_t::ok(OBFSTR("Batched indirect calls: ") + std::to_string(data.value("count", static_cast<std::size_t>(0))), data);
+}
+
+tool_result_t handler_enumerate_vtables(const json& params)
+{
+    json data = enumerate_vtables(cfg_int_param(params, "min_entries", 3),
+                                  cfg_int_param(params, "max_entries", 256));
+    sanitize_json_utf8_inplace(data);
+    return tool_result_t::ok(OBFSTR("Vtables: ") + std::to_string(data.value("count", static_cast<std::size_t>(0))), data);
+}
+
+tool_result_t handler_reachable_under_constraints(const json& params)
+{
+    std::vector<ea_t> sources = cfg_addr_array_param(params, "sources");
+    std::vector<ea_t> sinks = cfg_addr_array_param(params, "sinks");
+    std::vector<ea_t> blocked = cfg_addr_array_param(params, "must_not_cross_funcs");
+    if (sources.empty() || sinks.empty())
+        return tool_result_t::error(OBFSTR("sources and sinks must be non-empty arrays"), "bad_param");
+    for (ea_t& s : sources)
+    {
+        func_t* pfn = get_func(s);
+        if (pfn != nullptr)
+            s = pfn->start_ea;
+    }
+    for (ea_t& s : sinks)
+    {
+        func_t* pfn = get_func(s);
+        if (pfn != nullptr)
+            s = pfn->start_ea;
+    }
+    for (ea_t& s : blocked)
+    {
+        func_t* pfn = get_func(s);
+        if (pfn != nullptr)
+            s = pfn->start_ea;
+    }
+    json data = reachable_under_constraints(sources, sinks, blocked,
+                                            cfg_int_param(params, "max_depth", 6));
+    sanitize_json_utf8_inplace(data);
+    return tool_result_t::ok(OBFSTR("Reachability pairs: ") +
+                             std::to_string(data["pairs_reachable"].size()), data);
+}
+
+tool_result_t handler_postdominates(const json& params)
+{
+    std::vector<ea_t> funcs = cfg_addr_array_param(params, "func_ea");
+    if (funcs.empty())
+        funcs = cfg_addr_array_param(params, "address");
+    if (funcs.empty())
+        return tool_result_t::error(OBFSTR("func_ea is required"), "bad_param");
+    func_t* pfn = get_func(funcs.front());
+    if (pfn == nullptr)
+        return tool_result_t::error(OBFSTR("func_ea does not lie inside a function"), "no_function_at_addr");
+    int from_block = cfg_int_param(params, "from_block", -1);
+    int to_block = cfg_int_param(params, "to_block", -1);
+    if (from_block < 0 || to_block < 0)
+        return tool_result_t::error(OBFSTR("from_block and to_block are required"), "bad_param");
+    bool result = block_post_dominates(pfn->start_ea, from_block, to_block);
+    json data;
+    data["func_ea"] = fmt_addr(pfn->start_ea);
+    data["from_block"] = from_block;
+    data["to_block"] = to_block;
+    data["postdominates"] = result;
+    return tool_result_t::ok(result ? OBFSTR("Postdominates") : OBFSTR("Does not postdominate"), data);
+}
+
 tool_result_t handler_find_indirect_call_targets(const json& params)
 {
     std::string addr_param = params.value("address", std::string());
@@ -1156,6 +1711,225 @@ tool_result_t handler_find_check_bypass_paths(const json& params)
     return tool_result_t::ok(OBFSTR("Bypass paths: ") + std::to_string(result["count"].get<size_t>()), result);
 }
 
+}
+
+std::vector<switch_dispatch_t> enumerate_switch_dispatch(ea_t func_ea)
+{
+    std::vector<switch_dispatch_t> out;
+    if (func_ea == BADADDR)
+    {
+        const size_t fq = get_func_qty();
+        for (size_t i = 0; i < fq && i < kMaxAllFuncsScan; ++i)
+        {
+            func_t* pfn = getn_func(i);
+            if (pfn == nullptr)
+                continue;
+            collect_asm_switches_in_func(pfn, out);
+            collect_hex_switches_in_func(pfn, out);
+        }
+        return out;
+    }
+    func_t* pfn = get_func(func_ea);
+    if (pfn == nullptr)
+        return out;
+    collect_asm_switches_in_func(pfn, out);
+    collect_hex_switches_in_func(pfn, out);
+    return out;
+}
+
+nlohmann::json list_dispatchers(int top_n)
+{
+    if (top_n <= 0)
+        top_n = 25;
+    if (top_n > 256)
+        top_n = 256;
+    const std::string key = dispatch_cache_key("list_dispatchers|" + std::to_string(top_n));
+    if (auto cached = dispatch_cache_get(key); cached.has_value())
+    {
+        (*cached)["cached"] = true;
+        return *cached;
+    }
+    std::vector<switch_dispatch_t> all = enumerate_switch_dispatch(BADADDR);
+    std::sort(all.begin(), all.end(), [](const switch_dispatch_t& a, const switch_dispatch_t& b) {
+        return a.ncases > b.ncases;
+    });
+    json arr = json::array();
+    for (size_t i = 0; i < all.size() && static_cast<int>(i) < top_n; ++i)
+    {
+        json d = switch_dispatch_to_json(all[i]);
+        if (d["cases"].is_array() && d["cases"].size() > 16)
+        {
+            json sample = json::array();
+            for (size_t j = 0; j < 16 && j < d["cases"].size(); ++j)
+                sample.push_back(d["cases"][j]);
+            d["sample_cases"] = std::move(sample);
+            d.erase("cases");
+        }
+        arr.push_back(std::move(d));
+    }
+    json data;
+    data["dispatchers"] = std::move(arr);
+    data["count"] = data["dispatchers"].size();
+    data["total_seen"] = all.size();
+    data["cache_key"] = key;
+    data["cached"] = false;
+    dispatch_cache_put(key, data);
+    return data;
+}
+
+nlohmann::json resolve_indirect_calls_batched(const std::vector<ea_t>& func_eas,
+                                              bool only_unresolved,
+                                              bool only_vtable,
+                                              const std::string& target_name_filter)
+{
+    std::vector<indirect_call_t> calls;
+    if (func_eas.empty())
+    {
+        calls = find_indirect_calls(BADADDR);
+    }
+    else
+    {
+        for (ea_t fea : func_eas)
+        {
+            std::vector<indirect_call_t> v = find_indirect_calls(fea);
+            calls.insert(calls.end(), v.begin(), v.end());
+        }
+    }
+    std::sort(calls.begin(), calls.end(), [](const indirect_call_t& a, const indirect_call_t& b) {
+        if (a.call_ea != b.call_ea)
+            return a.call_ea < b.call_ea;
+        return a.func_ea < b.func_ea;
+    });
+    calls.erase(std::unique(calls.begin(), calls.end(), [](const indirect_call_t& a, const indirect_call_t& b) {
+        return a.call_ea == b.call_ea && a.func_ea == b.func_ea;
+    }), calls.end());
+    json arr = json::array();
+    for (const auto& ic : calls)
+    {
+        if (only_unresolved && !ic.targets.empty())
+            continue;
+        if (only_vtable && !indirect_call_is_vtable(ic))
+            continue;
+        if (!target_filter_matches(ic, target_name_filter))
+            continue;
+        arr.push_back(call_to_json(ic));
+    }
+    json data;
+    data["count"] = arr.size();
+    data["calls"] = std::move(arr);
+    return data;
+}
+
+nlohmann::json enumerate_vtables(int min_entries, int max_entries)
+{
+    if (min_entries <= 0)
+        min_entries = 3;
+    if (max_entries <= 0)
+        max_entries = 256;
+    if (max_entries > 4096)
+        max_entries = 4096;
+    json arr = json::array();
+    const til_t* ti = get_idati();
+    for (const char* name = first_named_type(ti, NTF_TYPE); name != nullptr; name = next_named_type(ti, name, NTF_TYPE))
+    {
+        tinfo_t tif;
+        if (!tif.get_named_type(ti, name))
+            continue;
+        udt_type_data_t udt;
+        if (!tif.get_udt_details(&udt))
+            continue;
+        if (!udt.is_vftable())
+            continue;
+        json v;
+        v["name"] = name;
+        v["vtable_ea"] = fmt_addr(BADADDR);
+        v["entry_count"] = udt.size();
+        v["confidence"] = "likely";
+        v["source"] = "named_type_vftable";
+        v["entries"] = json::array();
+        arr.push_back(std::move(v));
+    }
+    scan_rdata_vtables(min_entries, max_entries, arr);
+    json data;
+    data["count"] = arr.size();
+    data["vtables"] = std::move(arr);
+    return data;
+}
+
+nlohmann::json reachable_under_constraints(const std::vector<ea_t>& sources,
+                                           const std::vector<ea_t>& sinks,
+                                           const std::vector<ea_t>& must_not_cross_funcs,
+                                           int max_depth)
+{
+    if (max_depth <= 0)
+        max_depth = 6;
+    if (max_depth > 32)
+        max_depth = 32;
+    const func_graph_t& g = cached_cfg_call_graph();
+    std::unordered_set<ea_t> sink_set(sinks.begin(), sinks.end());
+    std::unordered_set<ea_t> block_set(must_not_cross_funcs.begin(), must_not_cross_funcs.end());
+    json reachable = json::array();
+    json blocked = json::array();
+    const int expansion_cap = std::max(16, max_depth * 16);
+    struct node_t { ea_t ea; int depth; std::vector<ea_t> path; };
+    for (ea_t src : sources)
+    {
+        func_t* sf = get_func(src);
+        if (sf == nullptr)
+            continue;
+        src = sf->start_ea;
+        std::queue<node_t> q;
+        std::unordered_set<ea_t> visited;
+        q.push({src, 0, {src}});
+        visited.insert(src);
+        int expansions = 0;
+        while (!q.empty() && expansions < expansion_cap)
+        {
+            node_t cur = std::move(q.front());
+            q.pop();
+            ++expansions;
+            if (sink_set.count(cur.ea) != 0)
+            {
+                json r;
+                r["source_ea"] = fmt_addr(src);
+                r["sink_ea"] = fmt_addr(cur.ea);
+                r["length"] = cur.path.size();
+                r["path"] = json::array();
+                for (ea_t p : cur.path)
+                    r["path"].push_back(fmt_addr(p));
+                reachable.push_back(std::move(r));
+                continue;
+            }
+            if (cur.depth >= max_depth)
+                continue;
+            auto it = g.callees.find(cur.ea);
+            if (it == g.callees.end())
+                continue;
+            for (ea_t next : it->second)
+            {
+                if (block_set.count(next) != 0)
+                {
+                    json b;
+                    b["source_ea"] = fmt_addr(src);
+                    b["sink_ea"] = fmt_addr(BADADDR);
+                    b["blocking_func_ea"] = fmt_addr(next);
+                    blocked.push_back(std::move(b));
+                    continue;
+                }
+                if (!visited.insert(next).second)
+                    continue;
+                std::vector<ea_t> np = cur.path;
+                np.push_back(next);
+                q.push({next, cur.depth + 1, std::move(np)});
+            }
+        }
+    }
+    json data;
+    data["pairs_reachable"] = std::move(reachable);
+    data["pairs_blocked_by"] = std::move(blocked);
+    data["max_depth"] = max_depth;
+    data["expansion_cap"] = expansion_cap;
+    return data;
 }
 
 std::vector<indirect_call_t> find_indirect_calls(ea_t func_ea)
@@ -1287,6 +2061,81 @@ void register_tier1_cfg_tools()
             { OBFSTR("max_paths"),     OBFSTR("number"), OBFSTR("Max paths to return (default 8, max 64)"),         false }
         },
         handler_find_check_bypass_paths,
+        true
+    });
+
+    registry.register_tool({
+        OBFSTR("enumerate_switch_dispatch"),
+        OBFSTR("vuln"),
+        OBFSTR("Enumerate switch dispatchers using disassembly switch_info_t/calc_switch_cases and Hex-Rays cit_switch cases. Address may be a function address or 'all'."),
+        {
+            { OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address or 'all' (default all)."), false },
+        },
+        handler_enumerate_switch_dispatch,
+        true
+    });
+
+    registry.register_tool({
+        OBFSTR("list_dispatchers"),
+        OBFSTR("vuln"),
+        OBFSTR("Return the top switch dispatchers by case count from the dispatch cache, rebuilding it from switch_info_t and Hex-Rays switch data when stale."),
+        {
+            { OBFSTR("top_n"), OBFSTR("number"), OBFSTR("Maximum dispatchers to return (default 25, max 256)."), false },
+        },
+        handler_list_dispatchers,
+        true
+    });
+
+    registry.register_tool({
+        OBFSTR("resolve_indirect_calls_batched"),
+        OBFSTR("vuln"),
+        OBFSTR("Batch version of indirect-call target resolution over multiple functions with server-side unresolved, vtable, and target-name filters."),
+        {
+            { OBFSTR("functions"), OBFSTR("array"), OBFSTR("Function addresses. Empty scans every function up to the configured cap."), false },
+            { OBFSTR("only_unresolved"), OBFSTR("boolean"), OBFSTR("Only return indirect calls with no resolved targets."), false },
+            { OBFSTR("only_vtable"), OBFSTR("boolean"), OBFSTR("Only return vtable-derived indirect calls."), false },
+            { OBFSTR("target_name_filter"), OBFSTR("string"), OBFSTR("Case-insensitive substring filter over resolved target names."), false },
+        },
+        handler_resolve_indirect_calls_batched,
+        true
+    });
+
+    registry.register_tool({
+        OBFSTR("enumerate_vtables"),
+        OBFSTR("vuln"),
+        OBFSTR("Enumerate vtables from named vftable types and read-only pointer arrays that resolve to function starts, returning confidence per table."),
+        {
+            { OBFSTR("min_entries"), OBFSTR("number"), OBFSTR("Minimum pointer-array entries (default 3)."), false },
+            { OBFSTR("max_entries"), OBFSTR("number"), OBFSTR("Maximum entries per table (default 256)."), false },
+        },
+        handler_enumerate_vtables,
+        true
+    });
+
+    registry.register_tool({
+        OBFSTR("reachable_under_constraints"),
+        OBFSTR("vuln"),
+        OBFSTR("Inter-procedural callgraph BFS from source functions to sink functions while pruning must_not_cross_funcs, capped at max_depth * 16 expansions per source."),
+        {
+            { OBFSTR("sources"), OBFSTR("array"), OBFSTR("Source function addresses."), true },
+            { OBFSTR("sinks"), OBFSTR("array"), OBFSTR("Sink function addresses."), true },
+            { OBFSTR("must_not_cross_funcs"), OBFSTR("array"), OBFSTR("Functions that block reachability."), false },
+            { OBFSTR("max_depth"), OBFSTR("number"), OBFSTR("Maximum call depth (default 6, max 32)."), false },
+        },
+        handler_reachable_under_constraints,
+        true
+    });
+
+    registry.register_tool({
+        OBFSTR("postdominates"),
+        OBFSTR("vuln"),
+        OBFSTR("Return whether one qflow_chart_t basic block postdominates another in a function."),
+        {
+            { OBFSTR("func_ea"), OBFSTR("string"), OBFSTR("Function address."), true },
+            { OBFSTR("from_block"), OBFSTR("number"), OBFSTR("Block being tested."), true },
+            { OBFSTR("to_block"), OBFSTR("number"), OBFSTR("Candidate postdominator block."), true },
+        },
+        handler_postdominates,
         true
     });
 }

@@ -15,19 +15,16 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
-$publishCamoufoxMcpPatch = $Camoufox.IsPresent
+$explicitCamoufox = $Camoufox.IsPresent
 foreach ($arg in @($ExtraArgs)) {
     if ([string]::Equals($arg, "--camoufox", [StringComparison]::OrdinalIgnoreCase)) {
-        $publishCamoufoxMcpPatch = $true
+        $explicitCamoufox = $true
     } elseif (-not [string]::IsNullOrWhiteSpace($arg)) {
         throw "Unknown argument: $arg"
     }
 }
-if ($publishCamoufoxMcpPatch -and $SkipCamoufoxSidecar.IsPresent) {
+if ($explicitCamoufox -and $SkipCamoufoxSidecar.IsPresent) {
     throw "Use either --camoufox/-Camoufox or -SkipCamoufoxSidecar, not both."
-}
-if (-not $publishCamoufoxMcpPatch) {
-    $SkipCamoufoxSidecar = [switch]::Present
 }
 $SkipStandalone = [switch]::Present
 
@@ -451,7 +448,19 @@ function Get-CamoufoxSidecarInputs([string]$ReleaseDir) {
     }
 }
 
-function Assert-CamoufoxMcpPatchInputs([pscustomobject]$Inputs) {
+function Assert-CamoufoxSidecarInputs([pscustomobject]$Inputs) {
+    if (-not $Inputs.BrowserDir -or -not (Test-Path -LiteralPath $Inputs.BrowserDir -PathType Container)) {
+        Stop-Deploy "Camoufox browser bundle is missing. Expected camoufox-135.0.1-beta.24-win.x86_64 with camoufox.exe."
+    }
+    if (-not $Inputs.BrowserExe -or -not (Test-Path -LiteralPath $Inputs.BrowserExe -PathType Leaf)) {
+        Stop-Deploy "Camoufox browser executable is missing: $($Inputs.BrowserExe)"
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $Inputs.BrowserDir "application.ini") -PathType Leaf)) {
+        Stop-Deploy "Camoufox browser bundle is incomplete: application.ini is missing."
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $Inputs.BrowserDir "browser") -PathType Container)) {
+        Stop-Deploy "Camoufox browser bundle is incomplete: browser directory is missing."
+    }
     if (-not $Inputs.McpExe -or -not (Test-Path -LiteralPath $Inputs.McpExe -PathType Leaf)) {
         Stop-Deploy "Frozen Camoufox reverse MCP executable is missing. Build .deps\AiDA_CamoufoxReverseMcp.exe first."
     }
@@ -473,57 +482,99 @@ function Assert-NoReverseMcpSourceLeak([string]$StageRoot) {
     }
 }
 
-function Publish-CamoufoxMcpPatch([string]$ReleaseDir, [string]$DeployId, [hashtable]$RemoteEnv) {
+function New-CamoufoxSidecarPackage([pscustomobject]$Inputs, [string]$DeployId) {
+    $id = [Guid]::NewGuid().ToString("N")
+    $stageRoot = Join-Path ([IO.Path]::GetTempPath()) "aida-camoufox-sidecar-stage-$id"
+    $zipPath = Join-Path ([IO.Path]::GetTempPath()) "aida-camoufox-sidecar-$DeployId-$id.zip"
+    try {
+        $depsRoot = Join-Path $stageRoot "deps"
+        New-Item -ItemType Directory -Force -Path $depsRoot | Out-Null
+        Copy-Item -LiteralPath $Inputs.BrowserDir -Destination (Join-Path $depsRoot $Inputs.BrowserName) -Recurse -Force
+        Copy-Item -LiteralPath $Inputs.McpExe -Destination (Join-Path $depsRoot "AiDA_CamoufoxReverseMcp.exe") -Force
+        Assert-NoReverseMcpSourceLeak $stageRoot
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
+        [IO.Compression.ZipFile]::CreateFromDirectory($stageRoot, $zipPath, [IO.Compression.CompressionLevel]::Optimal, $false)
+        $sha = Get-FileSha256Lower $zipPath
+        $size = (Get-Item -LiteralPath $zipPath).Length
+        return [pscustomobject]@{ ZipPath = $zipPath; Sha = $sha; Size = [int64]$size }
+    } finally {
+        try {
+            $tempRoot = [IO.Path]::GetTempPath().TrimEnd('\')
+            $resolvedStage = [IO.Path]::GetFullPath($stageRoot).TrimEnd('\')
+            if ($resolvedStage.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase) -and ([IO.Path]::GetFileName($resolvedStage) -like 'aida-camoufox-sidecar-stage-*') -and (Test-Path -LiteralPath $resolvedStage)) {
+                Remove-Item -LiteralPath $resolvedStage -Recurse -Force
+            }
+        } catch { }
+    }
+}
+
+function Test-RemoteHttpArtifactLive([string]$Url) {
+    if (-not $Url) { return $false }
+    $urlLit = ConvertTo-RemoteShellLiteral $Url
+    $probe = Invoke-RemoteSoft "curl -s -r 0-0 -o /dev/null -w '%{http_code}' $urlLit || echo 000"
+    $status = if ($probe.Output) { ([string]($probe.Output | Select-Object -First 1)).Trim() } else { "" }
+    return $probe.ExitCode -eq 0 -and ($status -eq "200" -or $status -eq "206")
+}
+
+function Publish-CamoufoxSidecar([string]$ReleaseDir, [string]$DeployId, [hashtable]$RemoteEnv) {
     if ($SkipCamoufoxSidecar) {
-        Write-Warn "Skipping Camoufox MCP patch publish; pass --camoufox or -Camoufox to publish only the frozen MCP executable"
+        Write-Warn "Skipping Camoufox sidecar publish"
         return [pscustomobject]@{ Changed = $false; Url = ""; PackageName = ""; Sha = ""; Size = 0; Version = ""; ExeRel = ""; PythonRel = ""; McpUrl = ""; McpPackageName = ""; McpSha = ""; McpSize = 0; McpRel = "" }
     }
 
     $inputs = Get-CamoufoxSidecarInputs $ReleaseDir
-    Assert-CamoufoxMcpPatchInputs $inputs
+    Assert-CamoufoxSidecarInputs $inputs
+    $sidecarPackage = New-CamoufoxSidecarPackage $inputs $DeployId
     $mcpSha = Get-FileSha256Lower $inputs.McpExe
     $mcpSize = (Get-Item -LiteralPath $inputs.McpExe).Length
+    $sidecarSha = $sidecarPackage.Sha
+    $sidecarSize = $sidecarPackage.Size
+    $version = (Get-Date -Format "yyyyMMddHHmmss")
+    $sidecarName = "aida-camoufox-sidecar-$($version.Substring(0, 8))-$($version.Substring(8, 6)).zip"
+    $sidecarUrl = ($PublicBaseUrl.TrimEnd("/")) + "/bootstrap-artifacts/" + $sidecarName
+    $mcpName = "AiDA_CamoufoxReverseMcp-$($version.Substring(0, 8))-$($version.Substring(8, 6)).exe"
+    $mcpUrl = ($PublicBaseUrl.TrimEnd("/")) + "/bootstrap-artifacts/" + $mcpName
     $mcpRel = "deps/AiDA_CamoufoxReverseMcp.exe"
+    $currentSidecarUrl = if ($RemoteEnv.ContainsKey("AIDA_CAMOUFOX_SIDECAR_URL")) { [string]$RemoteEnv["AIDA_CAMOUFOX_SIDECAR_URL"] } else { "" }
+    $currentSidecarSha = if ($RemoteEnv.ContainsKey("AIDA_CAMOUFOX_SIDECAR_SHA256")) { ([string]$RemoteEnv["AIDA_CAMOUFOX_SIDECAR_SHA256"]).ToLowerInvariant() } else { "" }
+    $currentSidecarVersion = if ($RemoteEnv.ContainsKey("AIDA_CAMOUFOX_SIDECAR_VERSION")) { [string]$RemoteEnv["AIDA_CAMOUFOX_SIDECAR_VERSION"] } else { "" }
+    $currentSidecarSize = if ($RemoteEnv.ContainsKey("AIDA_CAMOUFOX_SIDECAR_SIZE")) { [string]$RemoteEnv["AIDA_CAMOUFOX_SIDECAR_SIZE"] } else { "" }
     $currentSha = if ($RemoteEnv.ContainsKey("AIDA_CAMOUFOX_MCP_SHA256")) { ([string]$RemoteEnv["AIDA_CAMOUFOX_MCP_SHA256"]).ToLowerInvariant() } else { "" }
     $currentSize = if ($RemoteEnv.ContainsKey("AIDA_CAMOUFOX_MCP_SIZE")) { [string]$RemoteEnv["AIDA_CAMOUFOX_MCP_SIZE"] } else { "" }
     $currentMcpRel = if ($RemoteEnv.ContainsKey("AIDA_CAMOUFOX_MCP_REL")) { [string]$RemoteEnv["AIDA_CAMOUFOX_MCP_REL"] } else { "" }
     $currentExeRel = if ($RemoteEnv.ContainsKey("AIDA_CAMOUFOX_SIDECAR_EXE_REL")) { [string]$RemoteEnv["AIDA_CAMOUFOX_SIDECAR_EXE_REL"] } else { "" }
     $currentPythonRel = if ($RemoteEnv.ContainsKey("AIDA_CAMOUFOX_SIDECAR_PYTHON_REL")) { [string]$RemoteEnv["AIDA_CAMOUFOX_SIDECAR_PYTHON_REL"] } else { "" }
     $metadataCurrent = $currentMcpRel -eq $mcpRel -and $currentExeRel -eq $inputs.ExeRel -and $currentPythonRel -eq $inputs.PythonRel
-    if (-not $Force -and $currentSha -eq $mcpSha -and $currentSize -eq [string]$mcpSize) {
-        $currentUrl = if ($RemoteEnv.ContainsKey("AIDA_CAMOUFOX_MCP_URL")) { [string]$RemoteEnv["AIDA_CAMOUFOX_MCP_URL"] } else { "" }
-        $mcpLive = $false
-        if ($currentUrl) {
-            $urlLit = ConvertTo-RemoteShellLiteral $currentUrl
-            $probe = Invoke-RemoteSoft "curl -s -r 0-0 -o /dev/null -w '%{http_code}' $urlLit || echo 000"
-            $status = if ($probe.Output) { ([string]($probe.Output | Select-Object -First 1)).Trim() } else { "" }
-            $mcpLive = $probe.ExitCode -eq 0 -and ($status -eq "200" -or $status -eq "206")
-        }
-        if ($mcpLive) {
+    $currentMcpUrl = if ($RemoteEnv.ContainsKey("AIDA_CAMOUFOX_MCP_URL")) { [string]$RemoteEnv["AIDA_CAMOUFOX_MCP_URL"] } else { "" }
+    try {
+        $sidecarLive = Test-RemoteHttpArtifactLive $currentSidecarUrl
+        $mcpLive = Test-RemoteHttpArtifactLive $currentMcpUrl
+        $sidecarUnchanged = $currentSidecarSha -eq $sidecarSha -and $currentSidecarSize -eq [string]$sidecarSize
+        $mcpUnchanged = $currentSha -eq $mcpSha -and $currentSize -eq [string]$mcpSize
+        if (-not $Force -and $sidecarUnchanged -and $sidecarLive -and $mcpUnchanged -and $mcpLive) {
             if (-not $metadataCurrent) {
-                $currentVersion = if ($RemoteEnv.ContainsKey("AIDA_CAMOUFOX_MCP_VERSION")) { [string]$RemoteEnv["AIDA_CAMOUFOX_MCP_VERSION"] } else { (Get-Date -Format "yyyyMMddHHmmss") }
-                Write-Warn "Camoufox MCP executable unchanged; repairing slash-safe bootstrap metadata"
-                return [pscustomobject]@{ Changed = $true; Url = ""; PackageName = ""; Sha = ""; Size = 0; Version = $currentVersion; ExeRel = $inputs.ExeRel; PythonRel = $inputs.PythonRel; McpUrl = $currentUrl; McpPackageName = [IO.Path]::GetFileName($currentUrl); McpSha = $mcpSha; McpSize = [int64]$mcpSize; McpRel = $mcpRel }
+                $currentVersion = if ($currentSidecarVersion) { $currentSidecarVersion } else { $version }
+                Write-Warn "Camoufox sidecar unchanged; repairing slash-safe bootstrap metadata"
+                return [pscustomobject]@{ Changed = $true; Url = $currentSidecarUrl; PackageName = [IO.Path]::GetFileName($currentSidecarUrl); Sha = $sidecarSha; Size = [int64]$sidecarSize; Version = $currentVersion; ExeRel = $inputs.ExeRel; PythonRel = $inputs.PythonRel; McpUrl = $currentMcpUrl; McpPackageName = [IO.Path]::GetFileName($currentMcpUrl); McpSha = $mcpSha; McpSize = [int64]$mcpSize; McpRel = $mcpRel }
             }
-            Write-Ok "Camoufox MCP patch unchanged: $mcpSha"
-            return [pscustomobject]@{ Changed = $false; Url = ""; PackageName = ""; Sha = ""; Size = 0; Version = ""; ExeRel = $inputs.ExeRel; PythonRel = $inputs.PythonRel; McpUrl = $currentUrl; McpPackageName = [IO.Path]::GetFileName($currentUrl); McpSha = $mcpSha; McpSize = [int64]$mcpSize; McpRel = $mcpRel }
+            Write-Ok "Camoufox sidecar unchanged: $sidecarSha"
+            return [pscustomobject]@{ Changed = $false; Url = $currentSidecarUrl; PackageName = [IO.Path]::GetFileName($currentSidecarUrl); Sha = $sidecarSha; Size = [int64]$sidecarSize; Version = $currentSidecarVersion; ExeRel = $inputs.ExeRel; PythonRel = $inputs.PythonRel; McpUrl = $currentMcpUrl; McpPackageName = [IO.Path]::GetFileName($currentMcpUrl); McpSha = $mcpSha; McpSize = [int64]$mcpSize; McpRel = $mcpRel }
         }
-        Write-Warn "Camoufox MCP metadata matches local executable, but the patch URL is not live; republishing"
+        Write-Step "Publishing Camoufox sidecar"
+        if ($PlanOnly) {
+            Write-Ok "Plan only: would upload $sidecarName from browser=$($inputs.BrowserDir) mcp=$($inputs.McpExe) sha256=$sidecarSha size=$sidecarSize"
+            Write-Ok "Plan only: would upload $mcpName from mcp=$($inputs.McpExe) sha256=$mcpSha size=$mcpSize"
+            return [pscustomobject]@{ Changed = $true; Url = $sidecarUrl; PackageName = $sidecarName; Sha = $sidecarSha; Size = [int64]$sidecarSize; Version = $version; ExeRel = $inputs.ExeRel; PythonRel = $inputs.PythonRel; McpUrl = $mcpUrl; McpPackageName = $mcpName; McpSha = $mcpSha; McpSize = [int64]$mcpSize; McpRel = $mcpRel }
+        }
+        Copy-ToRemote $sidecarPackage.ZipPath "$RemoteArtifactDir/$sidecarName"
+        Copy-ToRemote $inputs.McpExe "$RemoteArtifactDir/$mcpName"
+        Write-Ok "Camoufox sidecar uploaded: $sidecarName sha256=$sidecarSha size=$sidecarSize"
+        Write-Ok "Camoufox MCP patch uploaded: $mcpName sha256=$mcpSha size=$mcpSize"
+        return [pscustomobject]@{ Changed = $true; Url = $sidecarUrl; PackageName = $sidecarName; Sha = $sidecarSha; Size = [int64]$sidecarSize; Version = $version; ExeRel = $inputs.ExeRel; PythonRel = $inputs.PythonRel; McpUrl = $mcpUrl; McpPackageName = $mcpName; McpSha = $mcpSha; McpSize = [int64]$mcpSize; McpRel = $mcpRel }
+    } finally {
+        try { if ($sidecarPackage -and $sidecarPackage.ZipPath -and (Test-Path -LiteralPath $sidecarPackage.ZipPath)) { Remove-Item -LiteralPath $sidecarPackage.ZipPath -Force } } catch { }
     }
-
-    Write-Step "Publishing Camoufox MCP patch"
-    $version = (Get-Date -Format "yyyyMMddHHmmss")
-    $mcpName = "AiDA_CamoufoxReverseMcp-$($version.Substring(0, 8))-$($version.Substring(8, 6)).exe"
-    $mcpUrl = ($PublicBaseUrl.TrimEnd("/")) + "/bootstrap-artifacts/" + $mcpName
-
-    if ($PlanOnly) {
-        Write-Ok "Plan only: would upload $mcpName from mcp=$($inputs.McpExe) sha256=$mcpSha size=$mcpSize"
-        return [pscustomobject]@{ Changed = $true; Url = ""; PackageName = ""; Sha = ""; Size = 0; Version = $version; ExeRel = $inputs.ExeRel; PythonRel = $inputs.PythonRel; McpUrl = $mcpUrl; McpPackageName = $mcpName; McpSha = $mcpSha; McpSize = [int64]$mcpSize; McpRel = $mcpRel }
-    }
-
-    Copy-ToRemote $inputs.McpExe "$RemoteArtifactDir/$mcpName"
-    Write-Ok "Camoufox MCP patch uploaded: $mcpName sha256=$mcpSha size=$mcpSize"
-    return [pscustomobject]@{ Changed = $true; Url = ""; PackageName = ""; Sha = ""; Size = 0; Version = $version; ExeRel = $inputs.ExeRel; PythonRel = $inputs.PythonRel; McpUrl = $mcpUrl; McpPackageName = $mcpName; McpSha = $mcpSha; McpSize = [int64]$mcpSize; McpRel = $mcpRel }
 }
 
 function Update-BootstrapMetadata([pscustomobject]$Package) {
@@ -576,22 +627,26 @@ awk -F= '/^AIDA_BOOTSTRAP_ARTIFACT_URL=|^AIDA_BOOTSTRAP_ARTIFACT_VERSION=|^AIDA_
     return $true
 }
 
-function Update-CamoufoxMcpPatchMetadata([pscustomobject]$Sidecar) {
+function Update-CamoufoxSidecarMetadata([pscustomobject]$Sidecar) {
     if (-not $Sidecar.Changed) { return $false }
-    Write-Step "Updating Camoufox MCP patch metadata"
+    Write-Step "Updating Camoufox sidecar metadata"
     if ($PlanOnly) {
-        Write-Ok "Plan only: would update Camoufox MCP patch metadata to $($Sidecar.McpUrl)"
+        Write-Ok "Plan only: would update Camoufox sidecar metadata to $($Sidecar.Url)"
         return $true
     }
     $script = @'
 set -euo pipefail
 cd /home/ruarr/aida-server
 cp .env ".env.bak.camoufox.__VERSION__"
-AIDA_NEW_CAMOUFOX_MCP_URL='__MCP_URL__' AIDA_NEW_CAMOUFOX_MCP_SHA256='__MCP_SHA__' AIDA_NEW_CAMOUFOX_MCP_VERSION='__VERSION__' AIDA_NEW_CAMOUFOX_MCP_SIZE='__MCP_SIZE__' AIDA_NEW_CAMOUFOX_MCP_REL='__MCP_REL__' AIDA_NEW_CAMOUFOX_SIDECAR_EXE_REL='__EXE_REL__' AIDA_NEW_CAMOUFOX_SIDECAR_PYTHON_REL='__PYTHON_REL__' node <<'NODE'
+AIDA_NEW_CAMOUFOX_SIDECAR_URL='__SIDECAR_URL__' AIDA_NEW_CAMOUFOX_SIDECAR_SHA256='__SIDECAR_SHA__' AIDA_NEW_CAMOUFOX_SIDECAR_VERSION='__VERSION__' AIDA_NEW_CAMOUFOX_SIDECAR_SIZE='__SIDECAR_SIZE__' AIDA_NEW_CAMOUFOX_MCP_URL='__MCP_URL__' AIDA_NEW_CAMOUFOX_MCP_SHA256='__MCP_SHA__' AIDA_NEW_CAMOUFOX_MCP_VERSION='__VERSION__' AIDA_NEW_CAMOUFOX_MCP_SIZE='__MCP_SIZE__' AIDA_NEW_CAMOUFOX_MCP_REL='__MCP_REL__' AIDA_NEW_CAMOUFOX_SIDECAR_EXE_REL='__EXE_REL__' AIDA_NEW_CAMOUFOX_SIDECAR_PYTHON_REL='__PYTHON_REL__' node <<'NODE'
 const fs = require('fs');
 const p = '.env';
 let s = fs.readFileSync(p, 'utf8');
 const updates = {
+  AIDA_CAMOUFOX_SIDECAR_URL: process.env.AIDA_NEW_CAMOUFOX_SIDECAR_URL,
+  AIDA_CAMOUFOX_SIDECAR_SHA256: process.env.AIDA_NEW_CAMOUFOX_SIDECAR_SHA256,
+  AIDA_CAMOUFOX_SIDECAR_VERSION: process.env.AIDA_NEW_CAMOUFOX_SIDECAR_VERSION,
+  AIDA_CAMOUFOX_SIDECAR_SIZE: process.env.AIDA_NEW_CAMOUFOX_SIDECAR_SIZE,
   AIDA_CAMOUFOX_SIDECAR_EXE_REL: process.env.AIDA_NEW_CAMOUFOX_SIDECAR_EXE_REL,
   AIDA_CAMOUFOX_SIDECAR_PYTHON_REL: process.env.AIDA_NEW_CAMOUFOX_SIDECAR_PYTHON_REL || '',
   AIDA_CAMOUFOX_MCP_URL: process.env.AIDA_NEW_CAMOUFOX_MCP_URL,
@@ -609,9 +664,12 @@ for (const pair of Object.entries(updates)) {
 }
 fs.writeFileSync(p, s, { mode: 0o600 });
 NODE
-awk -F= '/^AIDA_CAMOUFOX_SIDECAR_EXE_REL=|^AIDA_CAMOUFOX_SIDECAR_PYTHON_REL=|^AIDA_CAMOUFOX_MCP_URL=|^AIDA_CAMOUFOX_MCP_VERSION=|^AIDA_CAMOUFOX_MCP_SIZE=|^AIDA_CAMOUFOX_MCP_REL=/{print}' .env
+awk -F= '/^AIDA_CAMOUFOX_SIDECAR_URL=|^AIDA_CAMOUFOX_SIDECAR_SHA256=|^AIDA_CAMOUFOX_SIDECAR_VERSION=|^AIDA_CAMOUFOX_SIDECAR_SIZE=|^AIDA_CAMOUFOX_SIDECAR_EXE_REL=|^AIDA_CAMOUFOX_SIDECAR_PYTHON_REL=|^AIDA_CAMOUFOX_MCP_URL=|^AIDA_CAMOUFOX_MCP_SHA256=|^AIDA_CAMOUFOX_MCP_VERSION=|^AIDA_CAMOUFOX_MCP_SIZE=|^AIDA_CAMOUFOX_MCP_REL=/{print}' .env
 '@
     $script = $script.Replace("__VERSION__", [string]$Sidecar.Version).
+        Replace("__SIDECAR_URL__", [string]$Sidecar.Url).
+        Replace("__SIDECAR_SHA__", [string]$Sidecar.Sha).
+        Replace("__SIDECAR_SIZE__", [string]$Sidecar.Size).
         Replace("__MCP_URL__", [string]$Sidecar.McpUrl).
         Replace("__MCP_SHA__", [string]$Sidecar.McpSha).
         Replace("__MCP_SIZE__", [string]$Sidecar.McpSize).
@@ -622,7 +680,7 @@ awk -F= '/^AIDA_CAMOUFOX_SIDECAR_EXE_REL=|^AIDA_CAMOUFOX_SIDECAR_PYTHON_REL=|^AI
     foreach ($line in $output) {
         Write-Host "  $line"
     }
-    Write-Ok "Camoufox MCP patch metadata updated"
+    Write-Ok "Camoufox sidecar metadata updated"
     return $true
 }
 
@@ -729,7 +787,7 @@ Write-Host "  BuildDir:       $releaseDir"
 Write-Host "  Server:         $Server"
 Write-Host "  PublicBaseUrl:  $PublicBaseUrl"
 Write-Host "  Standalone:     disabled (Discord/manual distribution)"
-Write-Host ("  Camoufox:       {0}" -f ($(if ($SkipCamoufoxSidecar) { "skip (use --camoufox to publish MCP patch only)" } else { "publish MCP patch only" })))
+Write-Host ("  Camoufox:       {0}" -f ($(if ($SkipCamoufoxSidecar) { "skipped" } else { "publish full sidecar + MCP patch" })))
 if ($PlanOnly) { Write-Host "  Mode:           PlanOnly" -ForegroundColor Yellow }
 
 Sync-RemoteDeployScripts
@@ -741,8 +799,8 @@ $metadataChanged = Update-BootstrapMetadata $package
 if ($metadataChanged) { $restartNeeded = $true }
 $privateBase = Publish-StandalonePrivateBase $standaloneExe $deployId $remoteEnv
 if ($privateBase.Changed) { $restartNeeded = $true }
-$sidecar = Publish-CamoufoxMcpPatch $releaseDir $deployId $remoteEnv
-$sidecarMetadataChanged = Update-CamoufoxMcpPatchMetadata $sidecar
+$sidecar = Publish-CamoufoxSidecar $releaseDir $deployId $remoteEnv
+$sidecarMetadataChanged = Update-CamoufoxSidecarMetadata $sidecar
 if ($sidecarMetadataChanged) { $restartNeeded = $true }
 Restart-And-Verify $restartNeeded $package $sidecar
 
@@ -753,5 +811,5 @@ Write-Host "============================================" -ForegroundColor Green
 Write-Host ("  ARC:         {0}" -f ($(if ($SkipArc) { "skipped" } elseif ($arcChanged) { "published" } else { "unchanged" }))) -ForegroundColor White
 Write-Host ("  Standalone:  {0}" -f ($(if ($SkipStandalone) { "skipped" } elseif ($package.Changed) { $package.Url } else { "unchanged" }))) -ForegroundColor White
 Write-Host ("  PrivateBase: {0}" -f ($(if ($privateBase.Changed) { $privateBase.Sha } else { "unchanged" }))) -ForegroundColor White
-Write-Host ("  Camoufox:    {0}" -f ($(if ($SkipCamoufoxSidecar) { "skipped" } elseif ($sidecar.Changed) { "MCP patch " + $sidecar.McpUrl } else { "unchanged" }))) -ForegroundColor White
+Write-Host ("  Camoufox:    {0}" -f ($(if ($SkipCamoufoxSidecar) { "skipped" } elseif ($sidecar.Changed) { $sidecar.Url } else { "unchanged" }))) -ForegroundColor White
 Write-Host "============================================" -ForegroundColor Green

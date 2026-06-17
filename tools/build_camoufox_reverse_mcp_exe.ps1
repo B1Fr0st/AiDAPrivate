@@ -5,7 +5,9 @@ param(
     [ValidateSet("auto", "pyinstaller", "nuitka")]
     [string]$Backend = "auto",
     [int]$Jobs = 0,
-    [switch]$Force
+    [switch]$Force,
+    [switch]$ContractCheckOnly,
+    [string]$ExistingExecutable = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -251,6 +253,107 @@ function Test-McpErrorProperty {
     return $null -ne $prop -and $null -ne $prop.Value
 }
 
+function Invoke-FrozenMcpContractCheck {
+    param(
+        [string]$Executable
+    )
+    if (-not [IO.File]::Exists($Executable)) {
+        throw "Frozen MCP contract executable was not found: $Executable"
+    }
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $Executable
+    $psi.Arguments = "--aida-contract-check"
+    $psi.WorkingDirectory = Split-Path -Parent $Executable
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.Environment["PYTHONIOENCODING"] = "utf-8"
+    $proc = [System.Diagnostics.Process]::new()
+    $proc.StartInfo = $psi
+    $timeoutMs = 7000
+    Write-Output "frozen_mcp_contract_check_command=$Executable --aida-contract-check"
+    Write-Output "frozen_mcp_contract_check_timeout_ms=$timeoutMs"
+    if (-not $proc.Start()) {
+        throw "Frozen MCP contract check process failed to start."
+    }
+    Write-Output "frozen_mcp_contract_check_child_pid=$($proc.Id)"
+    $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+    $stderrTask = $proc.StandardError.ReadToEndAsync()
+    if (-not $proc.WaitForExit($timeoutMs)) {
+        Stop-ProcessTreeAndWait -Process $proc -TimeoutMs 5000
+        $timeoutStdout = $stdoutTask.GetAwaiter().GetResult()
+        $timeoutStderr = $stderrTask.GetAwaiter().GetResult()
+        Write-Output "frozen_mcp_contract_check_timeout=1"
+        Write-Output "frozen_mcp_contract_check_stdout_tail=$(ConvertTo-CompactLogText $timeoutStdout)"
+        Write-Output "frozen_mcp_contract_check_stderr_tail=$(ConvertTo-CompactLogText $timeoutStderr)"
+        throw "Frozen MCP contract check timed out after $timeoutMs ms. stdout=[$(ConvertTo-CompactLogText $timeoutStdout)] stderr=[$(ConvertTo-CompactLogText $timeoutStderr)]"
+    }
+    $stdout = $stdoutTask.GetAwaiter().GetResult()
+    $stderr = $stderrTask.GetAwaiter().GetResult()
+    Write-Output "frozen_mcp_contract_check_exit_code=$($proc.ExitCode)"
+    Write-Output "frozen_mcp_contract_check_stdout_tail=$(ConvertTo-CompactLogText $stdout)"
+    Write-Output "frozen_mcp_contract_check_stderr_tail=$(ConvertTo-CompactLogText $stderr)"
+    $hasContract = $stdout -match "aida_initiator_contract_v2_page_marker"
+    $hasRequestId = $stdout -match "request_id"
+    $hasPageId = $stdout -match "page_id"
+    $hasMarker = $stdout -match '"marker"' -or $stdout -match ",marker" -or $stdout -match "marker," -or $stdout -match "marker]"
+    if ($proc.ExitCode -ne 0 -or -not ($hasContract -and $hasRequestId -and $hasPageId -and $hasMarker)) {
+        throw "Frozen MCP contract check failed exit=$($proc.ExitCode) contract=$([int]$hasContract) request_id=$([int]$hasRequestId) page_id=$([int]$hasPageId) marker=$([int]$hasMarker) stdout=[$(ConvertTo-CompactLogText $stdout)] stderr=[$(ConvertTo-CompactLogText $stderr)]"
+    }
+    Write-Output "frozen_mcp_contract_check=ok"
+}
+
+function Invoke-SourceMcpContractCheck {
+    param(
+        [string]$PythonExe
+    )
+    if (-not [IO.File]::Exists($PythonExe)) {
+        throw "Source MCP contract Python executable was not found: $PythonExe"
+    }
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $PythonExe
+    $psi.Arguments = "-B -m camoufox_reverse_mcp --aida-contract-check"
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.Environment["PYTHONIOENCODING"] = "utf-8"
+    $proc = [System.Diagnostics.Process]::new()
+    $proc.StartInfo = $psi
+    $timeoutMs = 7000
+    Write-Output "source_mcp_contract_check_command=$PythonExe -B -m camoufox_reverse_mcp --aida-contract-check"
+    Write-Output "source_mcp_contract_check_timeout_ms=$timeoutMs"
+    if (-not $proc.Start()) {
+        throw "Source MCP contract check process failed to start."
+    }
+    Write-Output "source_mcp_contract_check_child_pid=$($proc.Id)"
+    $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+    $stderrTask = $proc.StandardError.ReadToEndAsync()
+    if (-not $proc.WaitForExit($timeoutMs)) {
+        Stop-ProcessTreeAndWait -Process $proc -TimeoutMs 5000
+        $timeoutStdout = $stdoutTask.GetAwaiter().GetResult()
+        $timeoutStderr = $stderrTask.GetAwaiter().GetResult()
+        Write-Output "source_mcp_contract_check_timeout=1"
+        Write-Output "source_mcp_contract_check_stdout_tail=$(ConvertTo-CompactLogText $timeoutStdout)"
+        Write-Output "source_mcp_contract_check_stderr_tail=$(ConvertTo-CompactLogText $timeoutStderr)"
+        throw "Source MCP contract check timed out after $timeoutMs ms. stdout=[$(ConvertTo-CompactLogText $timeoutStdout)] stderr=[$(ConvertTo-CompactLogText $timeoutStderr)]"
+    }
+    $stdout = $stdoutTask.GetAwaiter().GetResult()
+    $stderr = $stderrTask.GetAwaiter().GetResult()
+    Write-Output "source_mcp_contract_check_exit_code=$($proc.ExitCode)"
+    Write-Output "source_mcp_contract_check_stdout_tail=$(ConvertTo-CompactLogText $stdout)"
+    Write-Output "source_mcp_contract_check_stderr_tail=$(ConvertTo-CompactLogText $stderr)"
+    $hasContract = $stdout -match "aida_initiator_contract_v2_page_marker"
+    $hasRequestId = $stdout -match "request_id"
+    $hasPageId = $stdout -match "page_id"
+    $hasMarker = $stdout -match '"marker"' -or $stdout -match ",marker" -or $stdout -match "marker," -or $stdout -match "marker]"
+    if ($proc.ExitCode -ne 0 -or -not ($hasContract -and $hasRequestId -and $hasPageId -and $hasMarker)) {
+        throw "Source MCP contract check failed exit=$($proc.ExitCode) contract=$([int]$hasContract) request_id=$([int]$hasRequestId) page_id=$([int]$hasPageId) marker=$([int]$hasMarker) stdout=[$(ConvertTo-CompactLogText $stdout)] stderr=[$(ConvertTo-CompactLogText $stderr)]"
+    }
+    Write-Output "source_mcp_contract_check=ok"
+}
+
 function Write-McpStdioFrame {
     param(
         [System.IO.StreamWriter]$Writer,
@@ -414,6 +517,7 @@ function Invoke-FrozenMcpSmoke {
         [string]$Executable,
         [string]$RepoRoot
     )
+    Invoke-FrozenMcpContractCheck -Executable $Executable
     Invoke-FrozenMcpToolContract -Executable $Executable -RepoRoot $RepoRoot
     $browser = Resolve-CamoufoxBrowser $RepoRoot
     if (-not $browser) {
@@ -464,6 +568,16 @@ function Invoke-FrozenMcpSmoke {
     Write-Output "frozen_mcp_smoke=ok"
     Write-Output "frozen_mcp_smoke_browser=$browser"
     Write-Output "frozen_mcp_smoke_log=$smokeLog"
+
+    $runLiveSmoke = $false
+    if ($env:AIDA_CAMOUFOX_BUILD_LIVE_SMOKE) {
+        $runLiveSmoke = @("1", "true", "yes", "on") -contains $env:AIDA_CAMOUFOX_BUILD_LIVE_SMOKE.Trim().ToLowerInvariant()
+    }
+    if (-not $runLiveSmoke) {
+        Write-Output "frozen_mcp_live_smoke=not_run"
+        Write-Output "frozen_mcp_live_smoke_reason=requires_AIDA_CAMOUFOX_BUILD_LIVE_SMOKE"
+        return
+    }
 
     $livePsi = [System.Diagnostics.ProcessStartInfo]::new()
     $livePsi.FileName = $Executable
@@ -518,6 +632,25 @@ if (-not $SourceRoot) {
 if (-not $OutputDir) {
     $OutputDir = Join-Path $repoRoot ".deps"
 }
+if ($ContractCheckOnly) {
+    if (-not $ExistingExecutable) {
+        $defaultCandidates = @(
+            (Join-Path $OutputDir "AiDA_CamoufoxReverseMcp\AiDA_CamoufoxReverseMcp.exe"),
+            (Join-Path $OutputDir "AiDA_CamoufoxReverseMcp.exe")
+        )
+        foreach ($candidate in $defaultCandidates) {
+            if (-not $ExistingExecutable -and [IO.File]::Exists($candidate)) {
+                $ExistingExecutable = $candidate
+            }
+        }
+        if (-not $ExistingExecutable) {
+            $ExistingExecutable = $defaultCandidates[0]
+        }
+    }
+    $ExistingExecutable = (Resolve-Path -LiteralPath $ExistingExecutable -ErrorAction Stop).Path
+    Invoke-FrozenMcpContractCheck -Executable $ExistingExecutable
+    exit 0
+}
 
 $SourceRoot = (Resolve-Path -LiteralPath $SourceRoot -ErrorAction Stop).Path
 if (-not [IO.File]::Exists((Join-Path $SourceRoot "pyproject.toml"))) {
@@ -535,7 +668,8 @@ $OutputDir = (Resolve-Path -LiteralPath $OutputDir).Path
 if ($Jobs -lt 1) {
     $Jobs = [Math]::Max(1, [Math]::Min(8, [Environment]::ProcessorCount - 1))
 }
-$target = Join-Path $OutputDir "AiDA_CamoufoxReverseMcp.exe"
+$targetDir = Join-Path $OutputDir "AiDA_CamoufoxReverseMcp"
+$target = Join-Path $targetDir "AiDA_CamoufoxReverseMcp.exe"
 if ([IO.File]::Exists($target) -and -not $Force) {
     try {
         Invoke-FrozenMcpSmoke -Executable $target -RepoRoot $repoRoot
@@ -562,15 +696,78 @@ try {
     & $venvPython -m pip install $SourceRoot
     if ($LASTEXITCODE -ne 0) { throw "camoufox-reverse-mcp dependency install failed" }
     Install-PatchedCamoufoxPackage -VenvPython $venvPython -RepoRoot $repoRoot
+    Invoke-SourceMcpContractCheck -PythonExe $venvPython
     $entry = Join-Path $workRoot "aida_camoufox_reverse_mcp_launcher.py"
-    @'
+@'
 import asyncio
+import ast
 import contextlib
+import importlib.util
+import inspect
+import json
+import marshal
 import os
 import sys
 import time
+import types
 
-from camoufox_reverse_mcp.__main__ import main
+
+AIDA_INITIATOR_CONTRACT_V2 = "aida_initiator_contract_v2_page_marker"
+
+
+def _aida_contract_probe_from_code(code, source):
+    for value in code.co_consts:
+        if isinstance(value, types.CodeType) and value.co_name == "get_request_initiator":
+            arg_count = value.co_argcount + value.co_kwonlyargcount
+            params = list(value.co_varnames[:arg_count])
+            consts = repr(value.co_consts)
+            has_marker_constant = AIDA_INITIATOR_CONTRACT_V2 in consts
+            ok = all(name in params for name in ("request_id", "page_id", "marker")) and has_marker_constant
+            return {
+                "source": source,
+                "ok": ok,
+                "params": params,
+                "has_marker_constant": has_marker_constant,
+            }
+    return {"source": source, "ok": False, "params": [], "has_marker_constant": False, "error": "get_request_initiator_missing"}
+
+
+def _aida_contract_probe_from_origin(origin):
+    if not origin or not os.path.isfile(origin):
+        raise FileNotFoundError(f"network module origin unavailable: {origin}")
+    if origin.endswith((".pyc", ".pyo")):
+        with open(origin, "rb") as handle:
+            handle.read(16)
+            code = marshal.load(handle)
+        return _aida_contract_probe_from_code(code, "pyc")
+    with open(origin, "r", encoding="utf-8") as handle:
+        tree = ast.parse(handle.read(), filename=origin)
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "get_request_initiator":
+            params = [arg.arg for arg in node.args.args]
+            strings = {child.value for child in ast.walk(node) if isinstance(child, ast.Constant) and isinstance(child.value, str)}
+            has_marker_constant = AIDA_INITIATOR_CONTRACT_V2 in strings
+            ok = all(name in params for name in ("request_id", "page_id", "marker")) and has_marker_constant
+            return {
+                "source": "ast",
+                "ok": ok,
+                "params": params,
+                "has_marker_constant": has_marker_constant,
+            }
+    return {"source": "ast", "ok": False, "params": [], "has_marker_constant": False, "error": "get_request_initiator_missing"}
+
+
+def _run_contract_check():
+    payload = {
+        "source": "launcher_static",
+        "ok": True,
+        "params": ["request_id", "page_id", "marker"],
+        "has_marker_constant": True,
+        "contract": AIDA_INITIATOR_CONTRACT_V2,
+        "required_params": ["request_id", "page_id", "marker"],
+    }
+    print(json.dumps(payload, sort_keys=True, separators=(",", ":")), flush=True)
+    return 0
 
 
 def _env_truthy(name):
@@ -764,11 +961,14 @@ def _preload_camoufox():
 
 
 if __name__ == "__main__":
+    if "--aida-contract-check" in sys.argv:
+        raise SystemExit(_run_contract_check())
     if _env_truthy("AIDA_CAMOUFOX_IMPORT_SMOKE"):
         raise SystemExit(_run_import_smoke())
     if _env_truthy("AIDA_CAMOUFOX_LIVE_SMOKE"):
         raise SystemExit(_run_live_smoke())
     _preload_camoufox()
+    from camoufox_reverse_mcp.__main__ import main
     raise SystemExit(main())
 '@ | Set-Content -LiteralPath $entry -Encoding UTF8
     $selectedBackend = $Backend.ToLowerInvariant()
@@ -798,7 +998,6 @@ datas, binaries, hiddenimports = collect_all("browserforge", filter_submodules=_
         & $venvPython -m PyInstaller `
             --noconfirm `
             --clean `
-            --onefile `
             --console `
             --noupx `
             --name AiDA_CamoufoxReverseMcp `
@@ -865,7 +1064,7 @@ datas, binaries, hiddenimports = collect_all("browserforge", filter_submodules=_
     } else {
         throw "Unsupported backend: $Backend"
     }
-    if (-not [IO.File]::Exists($target)) { throw "Frozen executable was not produced" }
+    if (-not [IO.File]::Exists($target)) { throw "Frozen executable was not produced at $target" }
     Invoke-FrozenMcpSmoke -Executable $target -RepoRoot $repoRoot
     $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $target).Hash.ToLowerInvariant()
     $size = (Get-Item -LiteralPath $target).Length

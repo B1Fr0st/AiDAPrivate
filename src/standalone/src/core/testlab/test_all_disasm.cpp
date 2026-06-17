@@ -16,6 +16,7 @@
 #include "../../helpers/diag_log.hpp"
 #include "../../helpers/globals.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
@@ -160,41 +161,193 @@ namespace {
             (unsigned long long)last);
     }
 
-    uint64_t resolve_remote_module_base(const char* module_name) {
+    struct remote_module_lookup_t {
+        uint64_t base = 0;
+        uint32_t size = 0;
+        size_t module_count = 0;
+        uint32_t pid = 0;
+        std::string name;
+    };
+
+    remote_module_lookup_t resolve_remote_module_info(const char* module_name) {
+        remote_module_lookup_t out{};
         const uint32_t pid = driver_bridge::attached_pid();
+        out.pid = pid;
         if (pid == 0)
-            return 0;
-        for (const auto& mod : driver_bridge::enumerate_modules_for(pid)) {
-            if (_stricmp(mod.name.c_str(), module_name) == 0)
-                return mod.base;
+            return out;
+        auto modules = driver_bridge::enumerate_modules_for(pid);
+        out.module_count = modules.size();
+        for (const auto& mod : modules) {
+            if (_stricmp(mod.name.c_str(), module_name) == 0) {
+                out.base = mod.base;
+                out.size = mod.size;
+                out.name = mod.name;
+                return out;
+            }
         }
-        return 0;
+        return out;
     }
 
-    uint64_t resolve_ntdll_export(const char* name) {
-        if (!name || name[0] == '\0')
+    remote_module_lookup_t select_live_xref_module() {
+        remote_module_lookup_t out{};
+        const uint32_t pid = driver_bridge::attached_pid();
+        out.pid = pid;
+        if (pid == 0)
+            return out;
+        auto modules = driver_bridge::enumerate_modules_for(pid);
+        out.module_count = modules.size();
+        auto assign = [&](const driver_bridge::module_info_t& mod) {
+            out.base = mod.base;
+            out.size = mod.size;
+            out.name = mod.name;
+        };
+        for (const auto& mod : modules) {
+            if (mod.base != 0 && mod.size != 0 && _stricmp(mod.name.c_str(), "AiDA_TestTarget.exe") == 0) {
+                assign(mod);
+                return out;
+            }
+        }
+        for (const auto& mod : modules) {
+            if (mod.base == 0 || mod.size == 0 || mod.name.empty())
+                continue;
+            const char* dot = std::strrchr(mod.name.c_str(), '.');
+            if (dot && _stricmp(dot, ".exe") == 0) {
+                assign(mod);
+                return out;
+            }
+        }
+        for (const auto& mod : modules) {
+            if (mod.base != 0 && mod.size != 0 && _stricmp(mod.name.c_str(), "ntdll.dll") == 0) {
+                assign(mod);
+                return out;
+            }
+        }
+        for (const auto& mod : modules) {
+            if (mod.base != 0 && mod.size != 0) {
+                assign(mod);
+                return out;
+            }
+        }
+        return out;
+    }
+
+    uint64_t resolve_remote_module_base(const char* module_name) {
+        return resolve_remote_module_info(module_name).base;
+    }
+
+    void log_ntdll_resolve(HANDLE hf, const char* tag, const char* fmt, ...) {
+        char detail[1024];
+        va_list ap;
+        va_start(ap, fmt);
+        _vsnprintf_s(detail, sizeof(detail), _TRUNCATE, fmt, ap);
+        va_end(ap);
+        diag::log_tagged_fmt("disasm_resolve", "%s", detail);
+        if (hf != nullptr && hf != INVALID_HANDLE_VALUE)
+            log_msg(hf, tag ? tag : "disasm.resolve", "%s", detail);
+    }
+
+    bool local_ntdll_export_rva(const char* name, uint64_t& rva_out, uint64_t& local_va_out) {
+        rva_out = 0;
+        local_va_out = 0;
+        HMODULE local_ntdll = GetModuleHandleW(L"ntdll.dll");
+        FARPROC local_fn = local_ntdll ? GetProcAddress(local_ntdll, name) : nullptr;
+        if (!local_ntdll || !local_fn)
+            return false;
+        const uintptr_t local_base = reinterpret_cast<uintptr_t>(local_ntdll);
+        const uintptr_t local_va = reinterpret_cast<uintptr_t>(local_fn);
+        if (local_va < local_base)
+            return false;
+        rva_out = static_cast<uint64_t>(local_va - local_base);
+        local_va_out = static_cast<uint64_t>(local_va);
+        return rva_out != 0;
+    }
+
+    uint64_t resolve_ntdll_export(const char* name, HANDLE hf = nullptr, const char* tag = "disasm.resolve") {
+        if (!name || name[0] == '\0') {
+            log_ntdll_resolve(hf, tag, "resolve_ntdll_export invalid_name");
             return 0;
+        }
 
-        const uint64_t remote_ntdll = resolve_remote_module_base("ntdll.dll");
-        if (remote_ntdll != 0) {
-            const uint64_t resolved = driver_bridge::resolve_export(remote_ntdll, name);
-            if (resolved != 0)
-                return resolved;
+        const auto t0 = std::chrono::steady_clock::now();
+        remote_module_lookup_t remote = resolve_remote_module_info("ntdll.dll");
+        const long long enum_us = elapsed_us_since(t0);
+        uint64_t local_rva = 0;
+        uint64_t local_va = 0;
+        const bool local_ok = local_ntdll_export_rva(name, local_rva, local_va);
+        log_ntdll_resolve(hf, tag,
+            "resolve_ntdll_export phase=module_enum name=%s pid=%u module_count=%zu ntdll_base=0x%016llX ntdll_size=0x%08X local_ok=%d local_rva=0x%016llX local_va=0x%016llX enum_us=%lld status=\"%s\" last_error=\"%s\"",
+            name,
+            remote.pid,
+            remote.module_count,
+            (unsigned long long)remote.base,
+            remote.size,
+            local_ok ? 1 : 0,
+            (unsigned long long)local_rva,
+            (unsigned long long)local_va,
+            enum_us,
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str());
 
-            HMODULE local_ntdll = GetModuleHandleW(L"ntdll.dll");
-            FARPROC local_fn = local_ntdll ? GetProcAddress(local_ntdll, name) : nullptr;
-            if (local_ntdll && local_fn) {
-                const uint64_t offset =
-                    reinterpret_cast<uintptr_t>(local_fn) - reinterpret_cast<uintptr_t>(local_ntdll);
-                return remote_ntdll + offset;
+        if (remote.base != 0 && local_ok) {
+            const uint64_t final_va = remote.base + local_rva;
+            log_ntdll_resolve(hf, tag,
+                "resolve_ntdll_export phase=local_rva_fast_path name=%s module_count=%zu ntdll_base=0x%016llX rva=0x%016llX final_va=0x%016llX total_us=%lld",
+                name,
+                remote.module_count,
+                (unsigned long long)remote.base,
+                (unsigned long long)local_rva,
+                (unsigned long long)final_va,
+                elapsed_us_since(t0));
+            return final_va;
+        }
+
+        uint64_t driver_resolved = 0;
+        if (remote.base != 0) {
+            const auto td = std::chrono::steady_clock::now();
+            log_ntdll_resolve(hf, tag,
+                "resolve_ntdll_export phase=driver_resolve_enter name=%s pid=%u ntdll_base=0x%016llX module_count=%zu",
+                name,
+                remote.pid,
+                (unsigned long long)remote.base,
+                remote.module_count);
+            driver_resolved = driver_bridge::resolve_export_for(remote.pid, remote.base, name);
+            log_ntdll_resolve(hf, tag,
+                "resolve_ntdll_export phase=driver_resolve_exit name=%s pid=%u ntdll_base=0x%016llX result=0x%016llX elapsed_us=%lld status=\"%s\" last_error=\"%s\"",
+                name,
+                remote.pid,
+                (unsigned long long)remote.base,
+                (unsigned long long)driver_resolved,
+                elapsed_us_since(td),
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            if (driver_resolved != 0) {
+                log_ntdll_resolve(hf, tag,
+                    "resolve_ntdll_export phase=final name=%s method=driver_fallback final_va=0x%016llX total_us=%lld",
+                    name,
+                    (unsigned long long)driver_resolved,
+                    elapsed_us_since(t0));
+                return driver_resolved;
             }
         }
 
-        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-        if (!ntdll) return 0;
-        FARPROC fn = GetProcAddress(ntdll, name);
-        if (!fn) return 0;
-        return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(fn));
+        if (local_ok) {
+            log_ntdll_resolve(hf, tag,
+                "resolve_ntdll_export phase=final name=%s method=local_process_fallback final_va=0x%016llX total_us=%lld remote_base=0x%016llX module_count=%zu",
+                name,
+                (unsigned long long)local_va,
+                elapsed_us_since(t0),
+                (unsigned long long)remote.base,
+                remote.module_count);
+            return local_va;
+        }
+
+        log_ntdll_resolve(hf, tag,
+            "resolve_ntdll_export phase=final name=%s method=unresolved final_va=0x0000000000000000 total_us=%lld remote_base=0x%016llX module_count=%zu",
+            name,
+            elapsed_us_since(t0),
+            (unsigned long long)remote.base,
+            remote.module_count);
+        return 0;
     }
 
     uint64_t resolve_ntclose() {
@@ -482,7 +635,7 @@ namespace {
 
     void test_goto_address(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "disasm.goto_address";
-        uint64_t addr = resolve_ntclose();
+        uint64_t addr = resolve_ntdll_export("NtClose", hf, tag);
         if (addr == 0) {
             log_msg(hf, tag, "SKIP -- NtClose not resolved");
             skipped.fetch_add(1);
@@ -803,6 +956,16 @@ namespace {
             xref_index::attach_snapshot(std::move(saved));
         }
     };
+
+    const char* xref_build_state_name(uint32_t s) {
+        switch (static_cast<xref_index::detail::build_state_t>(s)) {
+        case xref_index::detail::build_state_t::idle: return "idle";
+        case xref_index::detail::build_state_t::building: return "building";
+        case xref_index::detail::build_state_t::built: return "built";
+        case xref_index::detail::build_state_t::failed: return "failed";
+        default: return "unknown";
+        }
+    }
 
     void validate_xref_fixture(HANDLE hf, const char* tag, size_t limit,
                                std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -1503,11 +1666,7 @@ namespace {
     }
 
     uint64_t resolve_ntdll_fn(const char* name) {
-        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-        if (!ntdll) return 0;
-        FARPROC fn = GetProcAddress(ntdll, name);
-        if (!fn) return 0;
-        return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(fn));
+        return resolve_ntdll_export(name);
     }
 
     void test_comment_multiple(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -1691,6 +1850,102 @@ namespace {
             passed.fetch_add(1);
         } catch (...) {
             log_msg(hf, tag, "FAIL -- exception in warm_range");
+            failed.fetch_add(1);
+        }
+    }
+
+    void test_xref_live_after_warm_range(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        (void)skipped;
+        const char* tag = "xref.live_after_warm";
+        remote_module_lookup_t module = select_live_xref_module();
+        if (module.pid == 0) {
+            log_msg(hf, tag, "FAIL -- no_attached_pid; live xref proof requires a verified target");
+            failed.fetch_add(1);
+            return;
+        }
+        if (module.base == 0 || module.size == 0) {
+            log_msg(hf, tag, "FAIL -- no_live_module_for_bounded_xref pid=%u module_count=%zu status=\"%s\" last_error=\"%s\"",
+                module.pid,
+                module.module_count,
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            failed.fetch_add(1);
+            return;
+        }
+        auto t0 = std::chrono::steady_clock::now();
+        const uint64_t max_span = 0x100000ull;
+        const uint64_t span = std::min<uint64_t>(module.size, max_span);
+        const uint64_t range_lo = module.base;
+        const uint64_t range_hi = module.base + span;
+        log_msg(hf, tag, "INPUT -- pid=%u module=\"%s\" module_base=0x%016llX module_size=0x%08X module_count=%zu requested_range=[0x%016llX,0x%016llX) span=0x%016llX",
+            module.pid,
+            module.name.empty() ? "<unknown>" : module.name.c_str(),
+            (unsigned long long)module.base,
+            module.size,
+            module.module_count,
+            (unsigned long long)range_lo,
+            (unsigned long long)range_hi,
+            (unsigned long long)span);
+        try {
+            xref_index::warm_range(range_lo, range_hi);
+            xref_index::bounded_live_range_result_t proof = xref_index::build_bounded_live_range(range_lo, range_hi, 2500);
+            const bool proof_source_in_range = proof.proof_source >= proof.clipped_lo && proof.proof_source < proof.clipped_hi;
+            log_msg(hf, tag, "OUTPUT -- ok=%d error=\"%s\" pid=%u module=\"%s\" module_base=0x%016llX module_size=0x%08X requested=[0x%016llX,0x%016llX) clipped=[0x%016llX,0x%016llX) pages_read=%zu pages_failed=%zu bytes_read=%zu targets=%zu xrefs=%zu proof_target=0x%016llX proof_source=0x%016llX proof_source_in_range=%d proof_label=\"%s\" state_before=%s(%u) state_after=%s(%u) table_before=%d table_after=%d rebuild_before=%d rebuild_after=%d elapsed_us=%llu outer_elapsed_us=%lld",
+                proof.ok ? 1 : 0,
+                proof.error.empty() ? "<none>" : proof.error.c_str(),
+                proof.pid,
+                proof.module.empty() ? "<unknown>" : proof.module.c_str(),
+                (unsigned long long)proof.module_base,
+                proof.module_size,
+                (unsigned long long)proof.requested_lo,
+                (unsigned long long)proof.requested_hi,
+                (unsigned long long)proof.clipped_lo,
+                (unsigned long long)proof.clipped_hi,
+                proof.pages_read,
+                proof.pages_failed,
+                proof.bytes_read,
+                proof.targets_found,
+                proof.xrefs_found,
+                (unsigned long long)proof.proof_target,
+                (unsigned long long)proof.proof_source,
+                proof_source_in_range ? 1 : 0,
+                proof.proof_label.c_str(),
+                xref_build_state_name(proof.state_before),
+                proof.state_before,
+                xref_build_state_name(proof.state_after),
+                proof.state_after,
+                proof.table_built_before ? 1 : 0,
+                proof.table_built_after ? 1 : 0,
+                proof.rebuild_in_flight_before ? 1 : 0,
+                proof.rebuild_in_flight_after ? 1 : 0,
+                (unsigned long long)proof.elapsed_us,
+                elapsed_us_since(t0));
+            if (proof.ok && proof.xrefs_found > 0 && proof.proof_target != 0 && proof.proof_source != 0 && proof_source_in_range) {
+                log_msg(hf, tag, "PASS -- deterministic bounded live range produced xref proof target=0x%016llX source=0x%016llX bytes_read=%zu elapsed_us=%llu",
+                    (unsigned long long)proof.proof_target,
+                    (unsigned long long)proof.proof_source,
+                    proof.bytes_read,
+                    (unsigned long long)proof.elapsed_us);
+                passed.fetch_add(1);
+                return;
+            }
+            log_msg(hf, tag, "FAIL -- bounded live range did not produce a valid xref proof error=\"%s\" pid=%u module=\"%s\" pages_read=%zu bytes_read=%zu xrefs=%zu state_before=%s(%u) state_after=%s(%u)",
+                proof.error.empty() ? "<none>" : proof.error.c_str(),
+                proof.pid,
+                proof.module.empty() ? "<unknown>" : proof.module.c_str(),
+                proof.pages_read,
+                proof.bytes_read,
+                proof.xrefs_found,
+                xref_build_state_name(proof.state_before),
+                proof.state_before,
+                xref_build_state_name(proof.state_after),
+                proof.state_after);
+            failed.fetch_add(1);
+        } catch (...) {
+            log_msg(hf, tag, "FAIL -- exception during bounded live xref proof pid=%u module=\"%s\" elapsed_us=%lld",
+                module.pid,
+                module.name.empty() ? "<unknown>" : module.name.c_str(),
+                elapsed_us_since(t0));
             failed.fetch_add(1);
         }
     }
@@ -2703,7 +2958,37 @@ namespace {
         const char* tag = "disasm.snapshot_detach_attach";
         try {
             auto t0 = std::chrono::steady_clock::now();
-            log_msg(hf, tag, "STATE -- before detach nav=%zu nav_pos=%d bookmarks=%zu selected_row=%d show_bytes=%d format=%s(%d) layout_sig=0x%llX layout_n=%d",
+            auto& st = disasm_view::g_state;
+            std::vector<int> saved_nav = st.nav_history;
+            int saved_nav_pos = st.nav_pos;
+            std::vector<disasm_view::bookmark_t> saved_bookmarks = st.bookmarks;
+            int saved_selected_row = st.selected_row;
+            bool saved_show_bytes = st.show_bytes;
+            disasm_view::addr_format_t saved_format = st.addr_format;
+            uint64_t saved_layout_signature = st.layout_signature;
+            int saved_layout_n = st.layout_n;
+
+            st.nav_history.clear();
+            st.nav_history.push_back(0x101);
+            st.nav_history.push_back(0x202);
+            st.nav_history.push_back(0x303);
+            st.nav_pos = 2;
+            st.selected_row = 0x303;
+            st.show_bytes = false;
+            st.addr_format = disasm_view::addr_format_t::rva;
+            st.layout_signature = 0xA1DA5A5AULL;
+            st.layout_n = 3;
+            st.bookmarks.clear();
+            disasm_view::bookmark_t bm1;
+            bm1.addr = 0x7FF700001111ULL;
+            bm1.label = "snapshot_seed_1";
+            disasm_view::bookmark_t bm2;
+            bm2.addr = 0x7FF700002222ULL;
+            bm2.label = "snapshot_seed_2";
+            st.bookmarks.push_back(bm1);
+            st.bookmarks.push_back(bm2);
+
+            log_msg(hf, tag, "STATE -- seeded before detach nav=%zu nav_pos=%d bookmarks=%zu selected_row=%d show_bytes=%d format=%s(%d) layout_sig=0x%llX layout_n=%d",
                 disasm_view::g_state.nav_history.size(),
                 disasm_view::g_state.nav_pos,
                 disasm_view::g_state.bookmarks.size(),
@@ -2730,6 +3015,21 @@ namespace {
                 log_msg(hf, tag, "STATE -- detach returned null snapshot");
             }
             disasm_view::attach_snapshot(std::move(snap));
+            const bool restored_nav = disasm_view::g_state.nav_history.size() == 3 &&
+                disasm_view::g_state.nav_history[0] == 0x101 &&
+                disasm_view::g_state.nav_history[1] == 0x202 &&
+                disasm_view::g_state.nav_history[2] == 0x303 &&
+                disasm_view::g_state.nav_pos == 2 &&
+                disasm_view::g_state.selected_row == 0x303;
+            const bool restored_bookmarks = disasm_view::g_state.bookmarks.size() == 2 &&
+                disasm_view::g_state.bookmarks[0].addr == bm1.addr &&
+                disasm_view::g_state.bookmarks[0].label == bm1.label &&
+                disasm_view::g_state.bookmarks[1].addr == bm2.addr &&
+                disasm_view::g_state.bookmarks[1].label == bm2.label;
+            const bool restored_format = disasm_view::g_state.addr_format == disasm_view::addr_format_t::rva &&
+                !disasm_view::g_state.show_bytes &&
+                disasm_view::g_state.layout_signature == 0xA1DA5A5AULL &&
+                disasm_view::g_state.layout_n == 3;
             log_msg(hf, tag, "STATE -- after attach nav=%zu nav_pos=%d bookmarks=%zu selected_row=%d show_bytes=%d format=%s(%d) layout_sig=0x%llX layout_n=%d",
                 disasm_view::g_state.nav_history.size(),
                 disasm_view::g_state.nav_pos,
@@ -2741,11 +3041,24 @@ namespace {
                 (unsigned long long)disasm_view::g_state.layout_signature,
                 disasm_view::g_state.layout_n);
 
-            if (detached) {
-                log_msg(hf, tag, "PASS -- detach_snapshot/attach_snapshot round-trip elapsed_us=%lld", elapsed_us_since(t0));
+            st.nav_history = std::move(saved_nav);
+            st.nav_pos = saved_nav_pos;
+            st.bookmarks = std::move(saved_bookmarks);
+            st.selected_row = saved_selected_row;
+            st.show_bytes = saved_show_bytes;
+            st.addr_format = saved_format;
+            st.layout_signature = saved_layout_signature;
+            st.layout_n = saved_layout_n;
+
+            if (detached && restored_nav && restored_bookmarks && restored_format) {
+                log_msg(hf, tag, "PASS -- detach_snapshot/attach_snapshot restored seeded nav/bookmark/format state elapsed_us=%lld", elapsed_us_since(t0));
                 passed.fetch_add(1);
             } else {
-                log_msg(hf, tag, "FAIL -- detach_snapshot returned nullptr");
+                log_msg(hf, tag, "FAIL -- snapshot restore mismatch detached=%d restored_nav=%d restored_bookmarks=%d restored_format=%d",
+                    detached ? 1 : 0,
+                    restored_nav ? 1 : 0,
+                    restored_bookmarks ? 1 : 0,
+                    restored_format ? 1 : 0);
                 failed.fetch_add(1);
             }
         } catch (...) {
@@ -2757,15 +3070,44 @@ namespace {
     void test_xref_detach_attach_snapshot(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "xref.snapshot_detach_attach";
         try {
+            xref_fixture_scope_t fixture;
             auto snap = xref_index::detach_snapshot();
             bool detached = (snap != nullptr);
+            size_t detached_modules = snap ? snap->modules.size() : 0;
+            size_t detached_table = snap ? snap->table.size() : 0;
+            bool detached_table_built = snap && snap->table_built.load(std::memory_order_acquire);
+            log_msg(hf, tag, "STATE -- detached fixture snapshot modules=%zu table=%zu table_built=%d target=0x%016llX",
+                detached_modules,
+                detached_table,
+                detached_table_built ? 1 : 0,
+                (unsigned long long)fixture.target);
             xref_index::attach_snapshot(std::move(snap));
+            auto restored = xref_index::query_to(fixture.target, 16);
+            bool saw_code = false;
+            bool saw_data = false;
+            for (const auto& a : restored) {
+                if (a.kind == xref_index::kind_t::code && a.edge == xref_index::edge_t::call_proc && a.source_addr != 0)
+                    saw_code = true;
+                if (a.kind == xref_index::kind_t::data && a.edge == xref_index::edge_t::offset_ref && a.source_addr != 0)
+                    saw_data = true;
+            }
+            log_msg(hf, tag, "STATE -- after attach fixture query returned %zu saw_code=%d saw_data=%d",
+                restored.size(),
+                saw_code ? 1 : 0,
+                saw_data ? 1 : 0);
 
-            if (detached) {
-                log_msg(hf, tag, "PASS -- xref detach/attach round-trip");
+            if (detached && detached_modules == 1 && detached_table == 1 && detached_table_built && restored.size() >= 2 && saw_code && saw_data) {
+                log_msg(hf, tag, "PASS -- xref detach/attach restored seeded fixture registry");
                 passed.fetch_add(1);
             } else {
-                log_msg(hf, tag, "FAIL -- xref detach returned nullptr");
+                log_msg(hf, tag, "FAIL -- xref snapshot restore mismatch detached=%d modules=%zu table=%zu table_built=%d restored=%zu saw_code=%d saw_data=%d",
+                    detached ? 1 : 0,
+                    detached_modules,
+                    detached_table,
+                    detached_table_built ? 1 : 0,
+                    restored.size(),
+                    saw_code ? 1 : 0,
+                    saw_data ? 1 : 0);
                 failed.fetch_add(1);
             }
         } catch (...) {
@@ -3009,6 +3351,7 @@ void phase_disasm_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& f
         { "xref_query_to_zero",                      test_xref_query_to_zero                      },
         { "xref_has_more_zero_limit",                test_xref_has_more_zero_limit                },
         { "xref_warm_range",                         test_xref_warm_range                         },
+        { "xref_live_after_warm_range",              test_xref_live_after_warm_range              },
         { "xref_detach_attach_snapshot",             test_xref_detach_attach_snapshot             },
 
         { "pseudocode_request_decompile",            test_pseudocode_request_decompile            },

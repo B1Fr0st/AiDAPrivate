@@ -34,6 +34,7 @@ std::uint32_t process_id_from_params(const json& params)
 
 tool_result_t handle_find_sendrecv(const json& raw_params)
 {
+    const ULONGLONG started = GetTickCount64();
     const json params = compat_action_payload(raw_params);
     net_proto_analysis::sendrecv_scan_options_t options;
     options.process_id = process_id_from_params(params);
@@ -41,11 +42,36 @@ tool_result_t handle_find_sendrecv(const json& raw_params)
     options.max_modules = params.value("max_modules", 32u);
     options.max_scan_bytes = params.value("max_scan_bytes", static_cast<std::uint64_t>(67108864));
     options.timeout_ms = params.value("timeout_ms", 3500u);
+    diag::log_tagged_fmt("net_proto",
+        "net_proto_find_sendrecv_handler_begin process_id=%u max_results=%u max_modules=%u max_scan_bytes=%llu timeout_ms=%u",
+        options.process_id,
+        options.max_results,
+        options.max_modules,
+        static_cast<unsigned long long>(options.max_scan_bytes),
+        options.timeout_ms);
 
     json result;
     std::string error;
-    if (!net_proto_analysis::find_sendrecv_handlers(options, result, error))
+    if (!net_proto_analysis::find_sendrecv_handlers(options, result, error)) {
+        const ULONGLONG elapsed = GetTickCount64() - started;
+        if (result.is_object() && !result.contains("handler_elapsed_ms"))
+            result["handler_elapsed_ms"] = elapsed;
+        diag::log_tagged_fmt("net_proto",
+            "net_proto_find_sendrecv_handler_done ok=0 process_id=%u elapsed_ms=%llu error=%s",
+            options.process_id,
+            static_cast<unsigned long long>(elapsed),
+            error.c_str());
         return tool_result_t::error(error.empty() ? OBFSTR("send/recv scan failed") : error, result);
+    }
+    if (result.is_object() && !result.contains("handler_elapsed_ms"))
+        result["handler_elapsed_ms"] = GetTickCount64() - started;
+    diag::log_tagged_fmt("net_proto",
+        "net_proto_find_sendrecv_handler_done ok=1 process_id=%u elapsed_ms=%llu result_count=%u deadline_hit=%d stage=%s",
+        options.process_id,
+        static_cast<unsigned long long>(GetTickCount64() - started),
+        result.value("result_count", 0u),
+        result.value("deadline_hit", false) ? 1 : 0,
+        result.value("stage", std::string()).c_str());
     return tool_result_t::ok(OBFSTR("Socket send/recv callsite scan completed."), result);
 }
 

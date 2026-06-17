@@ -817,6 +817,10 @@ static tool_result_t live_monitor_manage_start(const json& params)
 	result["hardware_breakpoint"] = hwbp;
 	result["polling"] = polling;
 	result["total_captures"] = struct_monitor::g_state.total_captures.load();
+	result["positive_capture_count"] = struct_monitor::g_state.total_captures.load();
+	result["stimulus_required"] = true;
+	result["pre_stimulus"] = struct_monitor::g_state.total_captures.load() == 0;
+	result["ready_for_stimulus"] = active && (page_guard || hwbp || polling);
 	if (!active || (!page_guard && !hwbp && !polling)) {
 		struct_monitor::stop();
 		for (int wait = 0; wait < 10 && struct_monitor::g_state.active.load(); ++wait)
@@ -848,11 +852,13 @@ static tool_result_t live_monitor_snapshot(bool require_captures)
 	json result;
 	result["active"] = struct_monitor::g_state.active.load();
 	result["total_captures"] = struct_monitor::g_state.total_captures.load();
+	result["positive_capture_count"] = struct_monitor::g_state.total_captures.load();
 	result["unique_offsets"] = accesses.size();
 	result["page_guard"] = struct_monitor::g_state.session.using_page_guard;
 	result["hardware_breakpoint"] = struct_monitor::g_state.session.using_hwbp;
 	result["polling"] = struct_monitor::g_state.session.using_polling;
 	result["accesses"] = arr;
+	result["functional_monitor_evidence"] = !accesses.empty();
 	if (require_captures && accesses.empty())
 		return tool_result_t::error("live monitor captured no accesses", result);
 	return tool_result_t::ok(result);

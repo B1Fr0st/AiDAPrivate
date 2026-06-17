@@ -150,6 +150,7 @@ struct payload_set_t {
 
 struct state_t {
     bool active = false;
+    std::atomic<uint64_t> last_render_tick_ms{0};
 
     sub_tab_t active_tab = sub_tab_t::connections;
 
@@ -161,6 +162,7 @@ struct state_t {
     uint8_t                       conn_filter_protocol = 0;
     char                          conn_filter_text[128] = {};
     bool                          conn_auto_refresh = true;
+    std::atomic<bool>             conn_auto_refresh_enabled{true};
     std::atomic<bool>             conn_thread_done{true};
     std::atomic<bool>             conn_polling{false};
     std::mutex                    conn_cv_mutex;

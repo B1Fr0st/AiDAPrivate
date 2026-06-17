@@ -100,6 +100,10 @@ namespace {
 		}
 	}
 
+	bool tcp_state_known(std::uint32_t s) {
+		return s >= 1u && s <= 12u;
+	}
+
 	std::string format_ip(const std::uint8_t* addr, std::uint32_t family) {
 		char buf[64];
 		if (family == 23u) {
@@ -299,6 +303,12 @@ namespace {
 
 	void append_loopback_fields(test_lab::result_t& r, const loopback_tcp_fixture_t& fx, const char* prefix) {
 		char label[64];
+		std::snprintf(label, sizeof(label), "%s_listener_socket", prefix);
+		r.parsed.push_back({ label, format_hex_u64(static_cast<std::uint64_t>(fx.listener)) });
+		std::snprintf(label, sizeof(label), "%s_client_socket", prefix);
+		r.parsed.push_back({ label, format_hex_u64(static_cast<std::uint64_t>(fx.client)) });
+		std::snprintf(label, sizeof(label), "%s_accepted_socket", prefix);
+		r.parsed.push_back({ label, format_hex_u64(static_cast<std::uint64_t>(fx.accepted)) });
 		std::snprintf(label, sizeof(label), "%s_listen_port", prefix);
 		r.parsed.push_back({ label, format_dec_u32(fx.listen_port) });
 		std::snprintf(label, sizeof(label), "%s_client_port", prefix);
@@ -313,6 +323,10 @@ namespace {
 		r.parsed.push_back({ label, format_dec_i32(fx.recv_bytes) });
 		std::snprintf(label, sizeof(label), "%s_recv_error", prefix);
 		r.parsed.push_back({ label, format_dec_i32(fx.recv_error) });
+		std::snprintf(label, sizeof(label), "%s_response_sent_bytes", prefix);
+		r.parsed.push_back({ label, format_dec_i32(fx.response_sent_bytes) });
+		std::snprintf(label, sizeof(label), "%s_response_recv_bytes", prefix);
+		r.parsed.push_back({ label, format_dec_i32(fx.response_recv_bytes) });
 	}
 
 	bool send_ncap_ctrl_logged(const char* feature,
@@ -597,6 +611,21 @@ namespace {
 			return;
 		}
 		r.parsed.push_back({ "connection_count", format_dec_u32(req->connection_count) });
+		std::uint32_t unknown_state_count = 0u;
+		std::uint32_t unknown_nonzero_state_count = 0u;
+		const std::uint32_t scan_count = req->connection_count > voyager::detail::MAX_NET_CONNECTIONS
+			? static_cast<std::uint32_t>(voyager::detail::MAX_NET_CONNECTIONS)
+			: req->connection_count;
+		for (std::uint32_t i = 0; i < scan_count; ++i) {
+			const auto& e = req->entries[i];
+			if (e.protocol == 6u && !tcp_state_known(e.state)) {
+				++unknown_state_count;
+				if (e.state != 0u)
+					++unknown_nonzero_state_count;
+			}
+		}
+		r.parsed.push_back({ "unknown_tcp_state_count", format_dec_u32(unknown_state_count) });
+		r.parsed.push_back({ "unknown_nonzero_tcp_state_count", format_dec_u32(unknown_nonzero_state_count) });
 		const std::uint32_t cap = (req->connection_count > 50u) ? 50u : req->connection_count;
 		for (std::uint32_t i = 0; i < cap; ++i) {
 			const auto& e = req->entries[i];
@@ -604,13 +633,15 @@ namespace {
 			std::snprintf(label, sizeof(label), "Conn[%u]", i);
 			char val[512];
 			std::snprintf(val, sizeof(val),
-				"%s %s:%u -> %s:%u state=%s pid=%u",
+				"%s %s:%u -> %s:%u state=%s state_raw=%u state_unknown=%u pid=%u",
 				proto_name(e.protocol),
 				format_ip(e.local_addr, e.address_family).c_str(),
 				e.local_port,
 				format_ip(e.remote_addr, e.address_family).c_str(),
 				e.remote_port,
 				tcp_state_name(e.state),
+				e.state,
+				(e.protocol == 6u && !tcp_state_known(e.state)) ? 1u : 0u,
 				e.pid);
 			r.parsed.push_back({ std::string(label), std::string(val) });
 		}
@@ -1219,15 +1250,45 @@ namespace {
 			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
 			return;
 		}
-		const std::uint32_t self_pid = static_cast<std::uint32_t>(GetCurrentProcessId());
+		const std::uint32_t test_target_pid = s.pid;
+		const std::uint32_t stimulus_pid = static_cast<std::uint32_t>(GetCurrentProcessId());
+		const std::uint32_t actual_ioctl_pid = stimulus_pid;
 		r.parsed.push_back({ "requested_pid_filter", format_dec_u32(s.pid) });
-		r.parsed.push_back({ "stimulus_pid", format_dec_u32(self_pid) });
+		r.parsed.push_back({ "test_target_pid", format_dec_u32(test_target_pid) });
+		r.parsed.push_back({ "stimulus_pid", format_dec_u32(stimulus_pid) });
+		r.parsed.push_back({ "actual_ioctl_pid", format_dec_u32(actual_ioctl_pid) });
 		loopback_tcp_fixture_t fx;
 		std::string fixture_diag;
 		bool fixture_ok = open_loopback_tcp_fixture(fx, fixture_diag);
 		r.parsed.push_back({ "loopback_fixture_ok", fixture_ok ? "1" : "0" });
 		r.parsed.push_back({ "loopback_fixture_diag", fixture_diag });
 		append_loopback_fields(r, fx, "loopback_before_query");
+		bool traffic_ok = false;
+		if (fixture_ok) {
+			traffic_ok = emit_loopback_http(fx, "gskt");
+			append_loopback_fields(r, fx, "loopback_after_stimulus");
+		}
+		r.parsed.push_back({ "loopback_traffic_ok", traffic_ok ? "1" : "0" });
+		test_lab_format::testlab_diag_log_step("network-query", "GSKT", "loopback_fixture",
+			"ok=%d traffic_ok=%d diag=\"%s\" test_target_pid=%u stimulus_pid=%u actual_ioctl_pid=%u listen_port=%u client_port=%u listener=0x%llX client=0x%llX accepted=0x%llX sent=%d recv=%d response_sent=%d response_recv=%d setup_wsa=%d send_err=%d recv_err=%d",
+			fixture_ok ? 1 : 0,
+			traffic_ok ? 1 : 0,
+			fixture_diag.c_str(),
+			test_target_pid,
+			stimulus_pid,
+			actual_ioctl_pid,
+			fx.listen_port,
+			fx.client_port,
+			static_cast<unsigned long long>(fx.listener),
+			static_cast<unsigned long long>(fx.client),
+			static_cast<unsigned long long>(fx.accepted),
+			fx.sent_bytes,
+			fx.recv_bytes,
+			fx.response_sent_bytes,
+			fx.response_recv_bytes,
+			fx.setup_wsa_error,
+			fx.send_error,
+			fx.recv_error);
 		if (!fixture_ok) {
 			r.ok = false;
 			r.error = "loopback TCP fixture failed before GSKT query";
@@ -1242,18 +1303,76 @@ namespace {
 			r.ntstatus = static_cast<std::int32_t>(0xC000009Au);
 			return;
 		}
-		req->target_pid = self_pid;
+		req->target_pid = actual_ioctl_pid;
 		std::uint32_t bytes_returned = 0;
+		SetLastError(ERROR_SUCCESS);
 		bool ok = device->send_ioctl_raw(ioctl_codes::GSKT(), req, static_cast<std::uint32_t>(sizeof(*req)), bytes_returned);
+		const DWORD ioctl_gle = ok ? ERROR_SUCCESS : GetLastError();
 		capture_raw_struct(r, req, sizeof(*req));
 		r.bytes_returned = bytes_returned;
+		r.parsed.push_back({ "raw_ioctl_ok", ok ? "1" : "0" });
+		r.parsed.push_back({ "raw_ioctl_last_error", format_dec_u32(static_cast<std::uint32_t>(ioctl_gle)) });
+		r.parsed.push_back({ "raw_ioctl_bytes_returned", format_dec_u32(bytes_returned) });
+		r.parsed.push_back({ "raw_ioctl_socket_count", format_dec_u32(req->socket_count) });
+		test_lab_format::testlab_diag_log_step("network-query", "GSKT", "ioctl_return",
+			"ok=%d gle=%lu bytes_returned=%u test_target_pid=%u stimulus_pid=%u actual_ioctl_pid=%u socket_count=%u fixture_client=0x%llX fixture_accepted=0x%llX sent=%d recv=%d response_sent=%d response_recv=%d",
+			ok ? 1 : 0,
+			static_cast<unsigned long>(ioctl_gle),
+			bytes_returned,
+			test_target_pid,
+			stimulus_pid,
+			actual_ioctl_pid,
+			req->socket_count,
+			static_cast<unsigned long long>(fx.client),
+			static_cast<unsigned long long>(fx.accepted),
+			fx.sent_bytes,
+			fx.recv_bytes,
+			fx.response_sent_bytes,
+			fx.response_recv_bytes);
 		if (!ok) {
 			set_fail_from_ioctl(r, bytes_returned);
 			std::free(req);
 			return;
 		}
 		r.parsed.push_back({ "socket_count", format_dec_u32(req->socket_count) });
-		const std::uint32_t cap = (req->socket_count > 50u) ? 50u : req->socket_count;
+		const std::uint32_t safe_socket_count = req->socket_count > voyager::detail::MAX_SOCKET_HANDLES
+			? static_cast<std::uint32_t>(voyager::detail::MAX_SOCKET_HANDLES)
+			: req->socket_count;
+		r.parsed.push_back({ "safe_socket_count", format_dec_u32(safe_socket_count) });
+		const std::uint32_t first_cap = (safe_socket_count > 5u) ? 5u : safe_socket_count;
+		for (std::uint32_t i = 0; i < first_cap; ++i) {
+			const auto& e = req->entries[i];
+			test_lab_format::testlab_diag_log_step("network-query", "GSKT", "first_socket_entry",
+				"idx=%u pid=%u handle=0x%llX afd=0x%llX protocol=%u state=%u family=%u local=%s:%u remote=%s:%u",
+				i,
+				e.pid,
+				static_cast<unsigned long long>(e.handle_value),
+				static_cast<unsigned long long>(e.afd_endpoint_addr),
+				e.protocol,
+				e.state,
+				e.address_family,
+				format_ip(e.local_addr, e.address_family).c_str(),
+				e.local_port,
+				format_ip(e.remote_addr, e.address_family).c_str(),
+				e.remote_port);
+			char raw_label[32];
+			std::snprintf(raw_label, sizeof(raw_label), "RawSock[%u]", i);
+			char raw_val[512];
+			std::snprintf(raw_val, sizeof(raw_val),
+				"pid=%u handle=%s afd=%s protocol=%u state=%u family=%u %s:%u -> %s:%u",
+				e.pid,
+				format_hex_u64(e.handle_value).c_str(),
+				format_hex_u64(e.afd_endpoint_addr).c_str(),
+				e.protocol,
+				e.state,
+				e.address_family,
+				format_ip(e.local_addr, e.address_family).c_str(),
+				e.local_port,
+				format_ip(e.remote_addr, e.address_family).c_str(),
+				e.remote_port);
+			r.parsed.push_back({ std::string(raw_label), std::string(raw_val) });
+		}
+		const std::uint32_t cap = (safe_socket_count > 50u) ? 50u : safe_socket_count;
 		for (std::uint32_t i = 0; i < cap; ++i) {
 			const auto& e = req->entries[i];
 			char label[24];
@@ -1457,6 +1576,21 @@ namespace {
 			return;
 		}
 		r.parsed.push_back({ "connection_count", format_dec_u32(req->connection_count) });
+		std::uint32_t unknown_state_count = 0u;
+		std::uint32_t unknown_nonzero_state_count = 0u;
+		const std::uint32_t scan_count = req->connection_count > voyager::detail::MAX_TCPIP_CONNECTIONS
+			? static_cast<std::uint32_t>(voyager::detail::MAX_TCPIP_CONNECTIONS)
+			: req->connection_count;
+		for (std::uint32_t i = 0; i < scan_count; ++i) {
+			const auto& e = req->entries[i];
+			if (e.protocol == 6u && !tcp_state_known(e.state)) {
+				++unknown_state_count;
+				if (e.state != 0u)
+					++unknown_nonzero_state_count;
+			}
+		}
+		r.parsed.push_back({ "unknown_tcp_state_count", format_dec_u32(unknown_state_count) });
+		r.parsed.push_back({ "unknown_nonzero_tcp_state_count", format_dec_u32(unknown_nonzero_state_count) });
 		const std::uint32_t cap = (req->connection_count > 50u) ? 50u : req->connection_count;
 		for (std::uint32_t i = 0; i < cap; ++i) {
 			const auto& e = req->entries[i];
@@ -1464,11 +1598,13 @@ namespace {
 			std::snprintf(label, sizeof(label), "TCB[%u]", i);
 			char val[640];
 			std::snprintf(val, sizeof(val),
-				"tcb=%s pid=%u %s state=%s %s:%u -> %s:%u in=%llu out=%llu mod=%s",
+				"tcb=%s pid=%u %s state=%s state_raw=%u state_unknown=%u %s:%u -> %s:%u in=%llu out=%llu mod=%s",
 				format_hex_u64(e.tcb_address).c_str(),
 				e.pid,
 				proto_name(e.protocol),
 				tcp_state_name(e.state),
+				e.state,
+				(e.protocol == 6u && !tcp_state_known(e.state)) ? 1u : 0u,
 				format_ip(e.local_addr, e.address_family).c_str(),
 				e.local_port,
 				format_ip(e.remote_addr, e.address_family).c_str(),

@@ -17,6 +17,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace aida {
@@ -84,6 +85,7 @@ json status_to_json(const camoufox::bridge_status_t& s)
     j["webrtc_blocked"] = s.webrtc_blocked;
     j["privacy_verified"] = s.privacy_verified;
     j["privacy_diagnostics"] = s.privacy_diagnostics.is_object() ? s.privacy_diagnostics : json::object();
+    j["last_launch_diagnostics"] = s.last_launch_diagnostics.is_object() ? s.last_launch_diagnostics : json::object();
     j["page_verified"]    = s.page_verified;
     j["child_alive"]      = s.child_alive;
     j["cleanup_pending"]  = s.cleanup_pending;
@@ -149,6 +151,7 @@ int json_int_field(const json& obj, const char* key, int fallback = 0)
 }
 
 std::string lower_ascii_copy(std::string s);
+std::string json_shape(const json& j, size_t max_keys = 12);
 
 bool json_error_mentions_timeout(const json& obj)
 {
@@ -188,6 +191,100 @@ std::string status_string_for_log(const json& data)
     if (status.empty())
         status = "ok";
     return status;
+}
+
+bool payload_reports_semantic_failure(const json& data, std::string& reason)
+{
+    reason.clear();
+    if (!data.is_object())
+        return false;
+    auto err = data.find("error");
+    if (err != data.end() && err->is_string() && !err->get<std::string>().empty())
+    {
+        reason = err->get<std::string>();
+        return true;
+    }
+    auto success = data.find("success");
+    if (success != data.end() && success->is_boolean() && !success->get<bool>())
+    {
+        reason = "payload_success_false";
+        return true;
+    }
+    auto ok = data.find("ok");
+    if (ok != data.end() && ok->is_boolean() && !ok->get<bool>())
+    {
+        reason = "payload_ok_false";
+        return true;
+    }
+    const std::string status = lower_ascii_copy(json_string_field(data, "status"));
+    if (status == "failed" || status == "error" || status == "timeout" || status == "cancelled")
+    {
+        reason = std::string("payload_status_") + status;
+        return true;
+    }
+    return false;
+}
+
+void preserve_semantic_failure(tool_result_t& out)
+{
+    std::string reason;
+    if (!out.success || !payload_reports_semantic_failure(out.data, reason))
+        return;
+    out.success = false;
+    if (out.text.empty() || out.text == out.data.dump(2))
+        out.text = reason.empty() ? std::string("camoufox payload reports semantic failure") : reason;
+    if (out.data.is_object())
+    {
+        out.data["semantic_failure"] = true;
+        if (!reason.empty())
+            out.data["semantic_failure_reason"] = reason;
+    }
+}
+
+bool json_has_key(const json& data, const char* key)
+{
+    return data.is_object() && data.find(key) != data.end();
+}
+
+int json_int_param(const json& params, const char* name, int fallback);
+std::string json_string_param(const json& params, const char* name, const std::string& fallback);
+
+tool_result_t annotate_initiator_contract_result(const json& forwarded, tool_result_t out)
+{
+    const std::string requested_page_id = json_string_param(forwarded, "page_id", std::string());
+    const std::string requested_marker = json_string_param(forwarded, "marker", std::string());
+    const bool contract_sensitive = !requested_page_id.empty() || !requested_marker.empty();
+    if (!contract_sensitive)
+        return out;
+    if (!out.data.is_object())
+        out.data = json{{"raw_text_len", out.text.size()}};
+    const bool has_contract_marker = json_string_field(out.data, "initiator_contract") == "aida_initiator_contract_v2_page_marker";
+    const bool has_page_fields = json_has_key(out.data, "request_page_id") && json_has_key(out.data, "resolved_page_id") && json_has_key(out.data, "active_page_id");
+    const bool has_marker_fields = json_has_key(out.data, "request_marker") && json_has_key(out.data, "hook_counts_before") && json_has_key(out.data, "hook_counts_after") && json_has_key(out.data, "fetch_initiator_log_count");
+    if (has_contract_marker && has_page_fields && has_marker_fields)
+        return out;
+    out.success = false;
+    out.text = "stale camoufox reverse MCP sidecar missing browser_network.initiator page_id/marker contract";
+    out.data["success"] = false;
+    out.data["status"] = "failed";
+    out.data["error"] = "stale_camoufox_reverse_mcp_initiator_contract";
+    out.data["initiator_contract_required"] = "aida_initiator_contract_v2_page_marker";
+    out.data["requested_page_id"] = requested_page_id;
+    out.data["requested_marker"] = requested_marker;
+    out.data["has_contract_marker"] = has_contract_marker;
+    out.data["has_page_fields"] = has_page_fields;
+    out.data["has_marker_fields"] = has_marker_fields;
+    out.data["data_shape"] = json_shape(out.data);
+    diag::log_tagged_fmt("mcp_burp", "browser_network_initiator stale_contract request_id=%d page_id=%s marker_len=%zu has_contract=%d has_page_fields=%d has_marker_fields=%d data_shape=%s text_len=%zu",
+        json_int_param(forwarded, "request_id", -1),
+        requested_page_id.c_str(),
+        requested_marker.size(),
+        has_contract_marker ? 1 : 0,
+        has_page_fields ? 1 : 0,
+        has_marker_fields ? 1 : 0,
+        json_shape(out.data).c_str(),
+        out.text.size());
+    return out;
 }
 
 void annotate_instrumentation_response(const std::string& tool_name, tool_result_t& out, int timeout_ms, long long elapsed_ms)
@@ -268,7 +365,7 @@ const char* json_type_name(const json& j)
     return "other";
 }
 
-std::string json_shape(const json& j, size_t max_keys = 12)
+std::string json_shape(const json& j, size_t max_keys)
 {
     std::ostringstream oss;
     oss << json_type_name(j);
@@ -668,16 +765,30 @@ int camoufox_timeout_ms(const json& params, int fallback)
 
 tool_result_t bridge_result_to_tool_result(const camoufox::call_result_t& r)
 {
+    tool_result_t out;
     if (r.ok)
     {
         if (!r.data.is_null())
-            return tool_result_t::ok(r.data);
-        if (!r.text.empty())
-            return tool_result_t::ok(r.text);
-        return tool_result_t::ok(json{{"status", "ok"}});
+        {
+            out.success = true;
+            out.data = r.data;
+            out.text = r.data.dump(2);
+        }
+        else if (!r.text.empty())
+        {
+            out.success = true;
+            out.text = r.text;
+        }
+        else
+        {
+            out.success = true;
+            out.data = json{{"status", "ok"}};
+            out.text = out.data.dump(2);
+        }
+        preserve_semantic_failure(out);
+        return out;
     }
 
-    tool_result_t out;
     out.success = false;
     out.text = r.error.empty() ? (r.text.empty() ? std::string("camoufox tool failed") : r.text) : r.error;
     if (!r.data.is_null())
@@ -803,6 +914,7 @@ camoufox::launch_config_t launch_config_from_mcp_params(const json& params)
     cfg.headless = json_bool_param(params, "headless", cfg.headless);
     cfg.proxy = json_string_param(params, "proxy", cfg.proxy);
     cfg.os = json_string_param(params, "os_type", json_string_param(params, "os", cfg.os));
+    cfg.os = "windows";
     cfg.locale = json_string_param(params, "locale", cfg.locale);
     cfg.humanize = json_bool_param(params, "humanize", cfg.humanize);
     cfg.geoip = json_bool_param(params, "geoip", cfg.geoip);
@@ -965,6 +1077,7 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
     auto after = camoufox::get_status(session_id);
     if (tool_name == "compare_env" || tool_name == "check_environment")
         attach_privacy_status(out, after);
+    preserve_semantic_failure(out);
     if (environment_probe)
     {
         const url_log_t active_url = summarize_url_for_log(after.active_page_url);
@@ -1070,10 +1183,13 @@ tool_result_t dispatch_camoufox_browser_group(
     if (std::string(action_spec->internal_tool) == "close_browser")
         return tool_close_browser(forwarded);
 
-    return tool_camoufox_passthrough(
+    tool_result_t out = tool_camoufox_passthrough(
         action_spec->internal_tool,
         forwarded,
         action_spec->default_timeout_ms);
+    if (std::string(group_name) == "browser_network" && std::string(action_spec->internal_tool) == "get_request_initiator")
+        return annotate_initiator_contract_result(forwarded, std::move(out));
+    return out;
 }
 
 tool_result_t tool_browser_lifecycle(const json& params)
@@ -1193,7 +1309,7 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"url", "string", "Optional URL for a new page", false},
              {"make_active", "boolean", "Make a new page active", false},
              {"headless", "boolean", "Run in headless mode", false},
-             {"os_type", "string", "Spoofed OS: auto, windows, macos, or linux", false},
+             {"os_type", "string", "Windows only; non-Windows values are normalized to windows", false},
              {"locale", "string", "Browser locale such as en-US", false},
              {"proxy", "string", "Proxy URL such as http://127.0.0.1:8443", false},
              {"humanize", "boolean", "Enable humanized mouse movement", false},
@@ -1202,7 +1318,7 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"block_webrtc", "boolean", "Force WebRTC blocking; AiDA enforces this on", false},
              {"user_agent", "string", "Custom Camoufox user agent", false},
              {"userAgent", "string", "Alias for user_agent", false},
-             {"ua_policy", "string", "camoufox_native, camoufox_auto, camoufox_windows, camoufox_macos, camoufox_linux, random_camoufox_desktop, or custom with user_agent", false},
+             {"ua_policy", "string", "camoufox_native, auto, native, or custom with user_agent", false},
              {"user_agent_profile", "string", "Alias for ua_policy", false},
              {"user_agent_mode", "string", "Alias for ua_policy", false},
              {"persistent_context", "boolean", "Use a persistent Camoufox browser context", false},
@@ -1272,6 +1388,7 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted; use payload.action for capture start, stop, clear, or status", false},
              {"session_id", "string", "Browser session id", false},
              {"page_id", "string", "Stable AiDA page id", false},
+             {"marker", "string", "Deterministic request marker used to clear and match hook logs", false},
              {"request_id", "number", "Captured request id", false},
              {"url_pattern", "string", "URL glob pattern", false},
              {"url_filter", "string", "Substring filter for URLs", false},

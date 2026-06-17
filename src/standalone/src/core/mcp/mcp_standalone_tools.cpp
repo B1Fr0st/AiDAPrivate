@@ -250,6 +250,22 @@ namespace
         return out;
     }
 
+    std::wstring utf8_to_wide_lossy(const std::string& text)
+    {
+        if (text.empty())
+            return {};
+        int len = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), nullptr, 0);
+        if (len <= 0) {
+            const DWORD err = GetLastError();
+            diag::log_tagged_fmt("mcp_tools", "utf8_to_wide failed len=%zu err=%lu",
+                text.size(), static_cast<unsigned long>(err));
+            return {};
+        }
+        std::wstring out(static_cast<size_t>(len), L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), out.data(), len);
+        return out;
+    }
+
     std::string path_to_utf8(const fs::path& path)
     {
         return wide_to_utf8_lossy(path.native());
@@ -495,6 +511,128 @@ namespace
         return tool_result_t::ok(message, data);
     }
 
+    std::string quote_guest_cli_arg(const std::string& value)
+    {
+        std::string out;
+        out.reserve(value.size() + 2);
+        out.push_back('"');
+        for (char c : value) {
+            if (c == '"') out += "\\\"";
+            else out.push_back(c);
+        }
+        out.push_back('"');
+        return out;
+    }
+
+    std::string join_guest_cli_path(std::string base, const std::string& leaf)
+    {
+        if (base.empty()) return leaf;
+        while (!base.empty() && (base.back() == '\\' || base.back() == '/')) base.pop_back();
+        return base + "\\" + leaf;
+    }
+
+    fs::path resolve_guest_agent_exe()
+    {
+        wchar_t module_path[MAX_PATH] = {};
+        DWORD n = GetModuleFileNameW(nullptr, module_path, MAX_PATH);
+        if (n == 0 || n >= MAX_PATH)
+            return {};
+        fs::path agent = fs::path(module_path).parent_path() / L"AiDAGuestAgent.exe";
+        std::error_code ec;
+        if (!fs::exists(agent, ec) || ec || fs::is_directory(agent, ec))
+            return {};
+        return agent;
+    }
+
+    bool stage_guest_agent(const fs::path& bridge_dir, std::string* error_out)
+    {
+        std::error_code ec;
+        fs::path agent_dir = bridge_dir / L"agent";
+        fs::create_directories(agent_dir, ec);
+        if (ec) {
+            if (error_out) *error_out = "failed to create bridge agent directory: " + ec.message();
+            return false;
+        }
+        fs::path agent_src = resolve_guest_agent_exe();
+        if (agent_src.empty()) {
+            if (error_out) *error_out = "AiDAGuestAgent.exe is missing beside AiDAStandalone.exe";
+            return false;
+        }
+        fs::copy_file(agent_src, agent_dir / L"AiDAGuestAgent.exe", fs::copy_options::overwrite_existing, ec);
+        if (ec) {
+            if (error_out) *error_out = "failed to stage AiDAGuestAgent.exe: " + ec.message();
+            return false;
+        }
+        if (error_out) error_out->clear();
+        return true;
+    }
+
+    bool stage_host_sample(const fs::path& bridge_dir,
+                           const fs::path& host_sample,
+                           std::string* filename_out,
+                           std::string* error_out)
+    {
+        std::error_code ec;
+        if (!fs::exists(host_sample, ec) || ec || fs::is_directory(host_sample, ec)) {
+            if (error_out) *error_out = "host_sample is not a readable file";
+            return false;
+        }
+        fs::path samples_dir = bridge_dir / L"samples";
+        ec.clear();
+        fs::create_directories(samples_dir, ec);
+        if (ec) {
+            if (error_out) *error_out = "failed to create bridge samples directory: " + ec.message();
+            return false;
+        }
+        fs::path filename = host_sample.filename();
+        if (filename.empty()) {
+            if (error_out) *error_out = "host_sample filename is empty";
+            return false;
+        }
+        ec.clear();
+        fs::copy_file(host_sample, samples_dir / filename, fs::copy_options::overwrite_existing, ec);
+        if (ec) {
+            if (error_out) *error_out = "failed to stage host_sample: " + ec.message();
+            return false;
+        }
+        if (filename_out) *filename_out = path_to_utf8(filename);
+        if (error_out) error_out->clear();
+        return true;
+    }
+
+    json vm_bridge_status_payload()
+    {
+        json data = vm_guest_bridge::status_snapshot();
+        if (data.contains("bridge_dir") && data["bridge_dir"].is_string())
+            data["vm_bridge_dir"] = data["bridge_dir"];
+        return data;
+    }
+
+    std::string vm_bridge_status_value(const json& data)
+    {
+        const bool active = data.contains("active") && data["active"].is_boolean() && data["active"].get<bool>();
+        auto guest_it = data.find("guest_status");
+        if (guest_it != data.end() && guest_it->is_object()) {
+            std::string status = json_string_field(*guest_it, "status");
+            if (!status.empty())
+                return status;
+            status = json_string_field(*guest_it, "state");
+            if (!status.empty())
+                return status;
+        }
+        return active ? "active" : "inactive";
+    }
+
+    void log_vm_bridge_status_action(const char* phase, const json& data)
+    {
+        const bool active = data.contains("active") && data["active"].is_boolean() && data["active"].get<bool>();
+        const std::string bridge_kind = json_string_field(data, "bridge_kind");
+        const std::string bridge_status = vm_bridge_status_value(data);
+        diag::log_tagged_fmt("mcp_tools",
+            "handle_vm_bridge_manage status_%s action=status active=%d bridge_kind='%s' bridge_status='%s'",
+            phase, active ? 1 : 0, bridge_kind.c_str(), bridge_status.c_str());
+    }
+
     bool hex_to_bytes_string(const std::string& hex, std::vector<uint8_t>& out)
     {
         out.clear();
@@ -589,6 +727,103 @@ tool_result_t handle_vm_bridge_attach(const json& params)
     {
         diag::log_tagged_fmt("mcp_tools", "handle_vm_bridge_enumerate_threads entry");
         return vm_bridge_call("threads", params, "Enumerated VM threads.");
+    }
+
+    tool_result_t handle_vm_bridge_manage(const json& params)
+    {
+        diag::log_tagged_fmt("mcp_tools", "handle_vm_bridge_manage entry");
+        std::string action = params.contains("action") && params["action"].is_string()
+            ? to_lower(params["action"].get<std::string>())
+            : std::string("status");
+        if (action == "status") {
+            json data = vm_bridge_status_payload();
+            data["backend"] = "vm_bridge";
+            data["action"] = "status";
+            log_vm_bridge_status_action("entry", data);
+            tool_result_t result = tool_result_t::ok("VM bridge status.", data);
+            log_vm_bridge_status_action("exit", data);
+            return result;
+        }
+        if (action == "activate") {
+            if (!params.contains("bridge_dir") || !params["bridge_dir"].is_string())
+                return error("bridge_dir is required for vm_bridge_manage action=activate");
+            std::wstring bridge_dir = utf8_to_wide_lossy(params["bridge_dir"].get<std::string>());
+            if (bridge_dir.empty())
+                return error("bridge_dir is invalid");
+            const fs::path bridge_path(bridge_dir);
+            const std::string guest_bridge = params.contains("guest_bridge_dir") && params["guest_bridge_dir"].is_string()
+                ? params["guest_bridge_dir"].get<std::string>()
+                : std::string();
+            std::wstring guest_sample;
+            if (params.contains("guest_sample") && params["guest_sample"].is_string())
+                guest_sample = utf8_to_wide_lossy(params["guest_sample"].get<std::string>());
+            else if (params.contains("sample") && params["sample"].is_string())
+                guest_sample = utf8_to_wide_lossy(params["sample"].get<std::string>());
+            std::wstring args;
+            if (params.contains("args") && params["args"].is_string())
+                args = utf8_to_wide_lossy(params["args"].get<std::string>());
+            const bool write_config = json_bool_param(params, "write_launch_config", true);
+            const bool stage_agent = json_bool_param(params, "stage_agent", true);
+            std::string err;
+            std::string staged_sample_name;
+            if (params.contains("host_sample") && params["host_sample"].is_string()) {
+                std::wstring host_sample_w = utf8_to_wide_lossy(params["host_sample"].get<std::string>());
+                if (host_sample_w.empty())
+                    return error("host_sample is invalid");
+                if (!stage_host_sample(bridge_path, fs::path(host_sample_w), &staged_sample_name, &err))
+                    return tool_result_t::error("custom VM sample staging failed: " + err, vm_bridge_status_payload());
+                if (guest_sample.empty() && !guest_bridge.empty()) {
+                    std::string guest_sample_auto = join_guest_cli_path(join_guest_cli_path(guest_bridge, "samples"), staged_sample_name);
+                    guest_sample = utf8_to_wide_lossy(guest_sample_auto);
+                }
+            }
+            if (write_config && !vm_guest_bridge::prepare_bridge_directory(bridge_dir, guest_sample, args, &err))
+                return tool_result_t::error("custom VM bridge setup failed: " + err, vm_bridge_status_payload());
+            if (stage_agent && !stage_guest_agent(bridge_path, &err))
+                return tool_result_t::error("custom VM guest agent staging failed: " + err, vm_bridge_status_payload());
+            if (!vm_guest_bridge::activate_bridge(bridge_dir, bridge_dir, guest_sample, "custom_vm", &err))
+                return tool_result_t::error("custom VM bridge activation failed: " + err, vm_bridge_status_payload());
+            json data = vm_bridge_status_payload();
+            if (!staged_sample_name.empty()) {
+                data["staged_sample"] = true;
+                data["staged_sample_name"] = staged_sample_name;
+            }
+            if (!guest_bridge.empty()) {
+                data["guest_bridge_dir"] = guest_bridge;
+                data["guest_command"] = quote_guest_cli_arg(join_guest_cli_path(guest_bridge, "agent\\AiDAGuestAgent.exe")) +
+                    " --bridge " + quote_guest_cli_arg(guest_bridge);
+            }
+            return tool_result_t::ok("Custom VM bridge activated.", data);
+        }
+        if (action == "deactivate") {
+            vm_guest_bridge::deactivate();
+            return tool_result_t::ok("VM bridge deactivated.", vm_bridge_status_payload());
+        }
+        if (action == "ping" || action == "guest_status")
+            return vm_bridge_call("status", params, "Read VM guest-agent status.");
+        if (action == "attach")
+            return handle_vm_bridge_attach(params);
+        if (action == "detach")
+            return handle_vm_bridge_detach(params);
+        if (action == "list_processes")
+            return handle_vm_bridge_list_processes(params);
+        if (action == "modules")
+            return handle_vm_bridge_enumerate_modules(params);
+        if (action == "threads")
+            return handle_vm_bridge_enumerate_threads(params);
+        if (action == "memory_map")
+            return vm_bridge_call("memory_map", params, "Enumerated VM memory map.");
+        if (action == "query_memory")
+            return handle_vm_bridge_query_memory(params);
+        if (action == "read_memory")
+            return handle_vm_bridge_read_memory(params);
+        if (action == "read_string")
+            return handle_vm_bridge_read_string(params);
+        if (action == "dump_region")
+            return vm_bridge_call("dump_region", params, "Dumped VM memory region.");
+        if (action == "search_memory")
+            return vm_bridge_call("search_memory", params, "Searched VM memory.");
+        return error("vm_bridge_manage unknown action: " + action);
     }
 
 
@@ -2592,6 +2827,25 @@ namespace mcp_standalone
              {"include_schema", "boolean", "Include parameter names, types, and descriptions", false}},
             true,
             [&srv](const json& params) { return srv.describe_tools(params); }});
+
+        srv.register_tool({"vm_bridge_manage", "Activate, inspect, and operate a custom VM shared-folder bridge. Use this for VMware, VirtualBox, QEMU, Hyper-V, or manually managed Windows VMs while keeping AiDAStandalone.exe on the host.",
+            {{"action", "string", "status|activate|deactivate|ping|attach|detach|list_processes|modules|threads|memory_map|query_memory|read_memory|read_string|dump_region|search_memory", false},
+             {"bridge_dir", "string", "Host path to the shared bridge folder for action=activate", false},
+             {"guest_bridge_dir", "string", "Guest-visible path to the same bridge folder; returned in guest_command", false},
+             {"host_sample", "string", "Optional host-side sample path copied into bridge\\samples during activation", false},
+             {"guest_sample", "string", "Optional guest-visible sample path written to launch_config.json", false},
+             {"sample", "string", "Alias for guest_sample", false},
+             {"args", "string", "Optional sample arguments written to launch_config.json", false},
+             {"write_launch_config", "boolean", "Write launch_config.json during activation (default true)", false},
+             {"stage_agent", "boolean", "Copy AiDAGuestAgent.exe into bridge\\agent during activation (default true)", false},
+             {"pid", "number", "Guest process id for attach or memory operations", false},
+             {"process", "string", "Guest process name for action=attach", false},
+             {"address", "string", "Guest process virtual address for memory operations", false},
+             {"size", "number", "Byte count for read_memory or dump_region", false},
+             {"pattern", "string", "Hex byte pattern for search_memory; use ?? wildcards", false},
+             {"target", "string", "Accepted for consistency; VM bridge actions always address the guest", false},
+             {"timeout_ms", "number", "Guest bridge timeout in milliseconds", false}},
+            false, handle_vm_bridge_manage});
 
         srv.register_tool({"list_processes", "Enumerate processes. If a VM bridge is active this lists VM processes by default; pass target='host' for host processes.",
             {{"filter", "string", "Optional substring filter", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "VM bridge timeout", false}}, true, handle_list_processes});

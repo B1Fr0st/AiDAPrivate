@@ -515,6 +515,22 @@ static tool_result_t sessions_run_binary(const json& params)
 			return tool_result_t::error("sessions_run_binary no longer supports host execution. Use windows_sandbox for interactive malware lab runs.");
 	}
 
+	const auto caps = run_target::probe_capabilities();
+	if (!caps.has_windows_sandbox) {
+		json root;
+		root["dependency"] = "windows_sandbox";
+		root["dependency_available"] = false;
+		root["dependency_unavailable"] = true;
+		root["dependency_blocked"] = true;
+		root["feature_available"] = false;
+		root["host_execution_attempted"] = false;
+		root["isolation"] = "windows_sandbox";
+		root["path"] = params["path"].get<std::string>();
+		root["reason"] = "windows_sandbox_feature_unavailable";
+		root["windows_build"] = caps.windows_build;
+		return tool_result_t::error("launch failed: Windows Sandbox is unavailable. Enable Windows Sandbox on Windows Pro, Enterprise, or Education with virtualization enabled. Admin PowerShell: Enable-WindowsOptionalFeature -Online -FeatureName Containers-DisposableClientVM -All", root);
+	}
+
 	run_target::launch_result_t result;
 	bool ok = run_target::launch(opts, result);
 	if (!ok || !result.ok) {

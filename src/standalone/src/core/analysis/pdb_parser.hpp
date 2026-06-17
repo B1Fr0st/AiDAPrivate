@@ -4,9 +4,11 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <mutex>
 #include <string>
@@ -192,18 +194,32 @@ struct dbghelp_api_t {
 inline dbghelp_api_t g_api;
 inline std::mutex g_api_mutex;
 inline std::mutex g_dbghelp_call_mutex;
+inline std::condition_variable g_dbghelp_load_cv;
 inline std::mutex g_last_error_mutex;
 inline std::string g_last_error;
+inline std::atomic<uint64_t> g_parse_generation{1};
 
 inline constexpr uint64_t k_dbghelp_load_watchdog_ms = 30000;
 
 struct dbghelp_load_state_t {
 	bool in_progress = false;
 	bool stuck = false;
+	bool terminal = false;
+	bool last_success = false;
+	DWORD caller_pid = 0;
+	DWORD caller_tid = 0;
+	DWORD worker_pid = 0;
+	DWORD worker_tid = 0;
 	DWORD thread_id = 0;
 	uint64_t started_ms = 0;
+	uint64_t completed_ms = 0;
 	uint64_t attempt = 0;
+	DWORD last_gle = ERROR_SUCCESS;
+	HMODULE last_hmod = nullptr;
+	std::string phase;
 	std::string path;
+	std::string loaded_path;
+	std::string terminal_detail;
 };
 
 inline dbghelp_load_state_t g_dbghelp_load_state;
@@ -227,6 +243,39 @@ inline std::string last_error()
 	return g_last_error;
 }
 
+inline std::string dbghelp_load_state_text_locked(uint64_t now_ms)
+{
+	const uint64_t elapsed_ms = g_dbghelp_load_state.started_ms ? now_ms - g_dbghelp_load_state.started_ms : 0;
+	char buf[1536];
+	std::snprintf(buf, sizeof(buf),
+		"dbghelp loaded=%d in_progress=%d stuck=%d terminal=%d success=%d attempt=%llu caller_pid=%lu caller_tid=%lu worker_pid=%lu worker_tid=%lu elapsed_ms=%llu completed_ms=%llu phase='%s' path='%s' loaded_path='%s' gle=%lu hmod=%p detail='%s'",
+		g_api.loaded ? 1 : 0,
+		g_dbghelp_load_state.in_progress ? 1 : 0,
+		g_dbghelp_load_state.stuck ? 1 : 0,
+		g_dbghelp_load_state.terminal ? 1 : 0,
+		g_dbghelp_load_state.last_success ? 1 : 0,
+		static_cast<unsigned long long>(g_dbghelp_load_state.attempt),
+		g_dbghelp_load_state.caller_pid,
+		g_dbghelp_load_state.caller_tid,
+		g_dbghelp_load_state.worker_pid,
+		g_dbghelp_load_state.worker_tid,
+		static_cast<unsigned long long>(elapsed_ms),
+		static_cast<unsigned long long>(g_dbghelp_load_state.completed_ms),
+		g_dbghelp_load_state.phase.c_str(),
+		g_dbghelp_load_state.path.c_str(),
+		g_dbghelp_load_state.loaded_path.c_str(),
+		g_dbghelp_load_state.last_gle,
+		g_dbghelp_load_state.last_hmod,
+		g_dbghelp_load_state.terminal_detail.c_str());
+	return buf;
+}
+
+inline std::string dbghelp_load_diagnostic()
+{
+	std::lock_guard<std::mutex> lk(g_api_mutex);
+	return dbghelp_load_state_text_locked(GetTickCount64());
+}
+
 inline std::string dbghelp_wide_to_utf8(const std::wstring& value)
 {
 	if (value.empty()) return {};
@@ -235,6 +284,25 @@ inline std::string dbghelp_wide_to_utf8(const std::wstring& value)
 	std::string out(static_cast<size_t>(len - 1), '\0');
 	WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, out.data(), len, nullptr, nullptr);
 	return out;
+}
+
+inline size_t dbghelp_first_nul_pos(const std::wstring& value)
+{
+	return value.find(L'\0');
+}
+
+inline long long dbghelp_first_nul_log_index(const std::wstring& value)
+{
+	const size_t pos = dbghelp_first_nul_pos(value);
+	return pos == std::wstring::npos ? -1LL : static_cast<long long>(pos);
+}
+
+inline std::wstring dbghelp_visible_path(std::wstring path)
+{
+	const size_t pos = dbghelp_first_nul_pos(path);
+	if (pos != std::wstring::npos)
+		path.resize(pos);
+	return path;
 }
 
 inline std::wstring resolve_dbghelp_path()
@@ -250,8 +318,412 @@ inline std::wstring resolve_dbghelp_path()
 	return path;
 }
 
+inline bool get_dbghelp_module_path(HMODULE module, std::wstring& out, DWORD& gle)
+{
+	out.clear();
+	for (DWORD capacity = MAX_PATH;;) {
+		std::wstring path(capacity, L'\0');
+		SetLastError(ERROR_SUCCESS);
+		DWORD len = GetModuleFileNameW(module, &path[0], capacity);
+		gle = GetLastError();
+		if (len == 0)
+			return false;
+		if (len < capacity) {
+			path.resize(len);
+			out = path;
+			return true;
+		}
+		if (capacity == 32768)
+			break;
+		DWORD next_capacity = capacity * 2;
+		if (next_capacity < capacity || next_capacity > 32768)
+			next_capacity = 32768;
+		capacity = next_capacity;
+	}
+	gle = ERROR_INSUFFICIENT_BUFFER;
+	return false;
+}
+
+inline bool dbghelp_is_path_slash(wchar_t ch)
+{
+	return ch == L'\\' || ch == L'/';
+}
+
+inline std::wstring dbghelp_strip_extended_path_prefix(const std::wstring& path)
+{
+	const std::wstring visible_path = dbghelp_visible_path(path);
+	if (visible_path.rfind(L"\\\\?\\UNC\\", 0) == 0)
+		return L"\\\\" + visible_path.substr(8);
+	if (visible_path.rfind(L"\\\\?\\", 0) == 0)
+		return visible_path.substr(4);
+	if (visible_path.rfind(L"\\??\\", 0) == 0)
+		return visible_path.substr(4);
+	return visible_path;
+}
+
+inline std::wstring dbghelp_normalize_path_for_compare(std::wstring path)
+{
+	path = dbghelp_strip_extended_path_prefix(path);
+	for (wchar_t& ch : path) {
+		if (ch == L'/')
+			ch = L'\\';
+	}
+	return path;
+}
+
+inline std::wstring dbghelp_trim_trailing_slashes(std::wstring path)
+{
+	path = dbghelp_normalize_path_for_compare(path);
+	while (path.size() > 3 && dbghelp_is_path_slash(path.back()))
+		path.pop_back();
+	return path;
+}
+
+inline bool dbghelp_path_equal(const std::wstring& lhs, const std::wstring& rhs)
+{
+	const std::wstring lhs_visible = dbghelp_visible_path(lhs);
+	const std::wstring rhs_visible = dbghelp_visible_path(rhs);
+	if (lhs_visible.empty() || rhs_visible.empty())
+		return lhs_visible.empty() && rhs_visible.empty();
+	return CompareStringOrdinal(lhs_visible.c_str(), static_cast<int>(lhs_visible.size()),
+		rhs_visible.c_str(), static_cast<int>(rhs_visible.size()), TRUE) == CSTR_EQUAL;
+}
+
+inline std::wstring dbghelp_parent_path(const std::wstring& path)
+{
+	std::wstring normalized = dbghelp_trim_trailing_slashes(path);
+	const size_t pos = normalized.find_last_of(L'\\');
+	if (pos == std::wstring::npos)
+		return {};
+	return normalized.substr(0, pos);
+}
+
+inline std::wstring dbghelp_file_name(const std::wstring& path)
+{
+	std::wstring normalized = dbghelp_trim_trailing_slashes(path);
+	const size_t pos = normalized.find_last_of(L'\\');
+	if (pos == std::wstring::npos)
+		return normalized;
+	return normalized.substr(pos + 1);
+}
+
+inline std::wstring dbghelp_append_dbghelp_dll(std::wstring directory)
+{
+	if (directory.empty())
+		return L"dbghelp.dll";
+	if (!dbghelp_is_path_slash(directory.back()))
+		directory.push_back(L'\\');
+	directory += L"dbghelp.dll";
+	return directory;
+}
+
+struct dbghelp_file_id_t {
+	DWORD volume_serial = 0;
+	DWORD file_index_high = 0;
+	DWORD file_index_low = 0;
+};
+
+inline bool dbghelp_same_file_id(const dbghelp_file_id_t& lhs, const dbghelp_file_id_t& rhs)
+{
+	return lhs.volume_serial == rhs.volume_serial &&
+	       lhs.file_index_high == rhs.file_index_high &&
+	       lhs.file_index_low == rhs.file_index_low;
+}
+
+struct dbghelp_canonical_path_t {
+	std::wstring full_path;
+	std::wstring final_path;
+	std::wstring canonical_path;
+	dbghelp_file_id_t file_id{};
+	bool full_ok = false;
+	bool open_ok = false;
+	bool info_ok = false;
+	bool final_ok = false;
+	DWORD full_gle = ERROR_SUCCESS;
+	DWORD open_gle = ERROR_SUCCESS;
+	DWORD info_gle = ERROR_SUCCESS;
+	DWORD final_gle = ERROR_SUCCESS;
+};
+
+inline dbghelp_canonical_path_t dbghelp_canonicalize_path(const std::wstring& path)
+{
+	dbghelp_canonical_path_t result{};
+	const std::wstring visible_path = dbghelp_visible_path(path);
+	if (!visible_path.empty()) {
+		SetLastError(ERROR_SUCCESS);
+		DWORD needed = GetFullPathNameW(visible_path.c_str(), 0, nullptr, nullptr);
+		result.full_gle = GetLastError();
+		if (needed > 0) {
+			std::wstring buffer(static_cast<size_t>(needed) + 1, L'\0');
+			SetLastError(ERROR_SUCCESS);
+			DWORD len = GetFullPathNameW(visible_path.c_str(), static_cast<DWORD>(buffer.size()), &buffer[0], nullptr);
+			result.full_gle = GetLastError();
+			if (len > 0 && len < static_cast<DWORD>(buffer.size())) {
+				buffer.resize(len);
+				result.full_path = dbghelp_normalize_path_for_compare(buffer);
+				result.full_ok = true;
+			}
+		}
+
+		SetLastError(ERROR_SUCCESS);
+		HANDLE file = CreateFileW(visible_path.c_str(), FILE_READ_ATTRIBUTES,
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+			OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+		result.open_gle = GetLastError();
+		if (file != INVALID_HANDLE_VALUE) {
+			result.open_ok = true;
+			BY_HANDLE_FILE_INFORMATION info{};
+			SetLastError(ERROR_SUCCESS);
+			if (GetFileInformationByHandle(file, &info)) {
+				result.info_ok = true;
+				result.file_id.volume_serial = info.dwVolumeSerialNumber;
+				result.file_id.file_index_high = info.nFileIndexHigh;
+				result.file_id.file_index_low = info.nFileIndexLow;
+			}
+			result.info_gle = GetLastError();
+
+			std::wstring final_buffer(32768, L'\0');
+			SetLastError(ERROR_SUCCESS);
+			DWORD final_len = GetFinalPathNameByHandleW(file, &final_buffer[0], static_cast<DWORD>(final_buffer.size()),
+				FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+			result.final_gle = GetLastError();
+			if (final_len > 0 && final_len < static_cast<DWORD>(final_buffer.size())) {
+				final_buffer.resize(final_len);
+				result.final_path = dbghelp_normalize_path_for_compare(final_buffer);
+				result.final_ok = true;
+			}
+			CloseHandle(file);
+		}
+	}
+	if (result.final_ok)
+		result.canonical_path = result.final_path;
+	else if (result.full_ok)
+		result.canonical_path = result.full_path;
+	else
+		result.canonical_path = dbghelp_normalize_path_for_compare(visible_path);
+	return result;
+}
+
+struct dbghelp_path_verification_t {
+	bool accepted = false;
+	bool recovered_directory = false;
+	bool file_id_available = false;
+	bool file_id_match = false;
+	bool canonical_match = false;
+	bool actual_in_system32 = false;
+	bool expected_is_system32_dbghelp = false;
+	bool actual_is_dbghelp = false;
+	bool actual_visible_ended_with_slash = false;
+	size_t actual_wchars = 0;
+	size_t actual_visible_wchars = 0;
+	long long actual_first_nul = -1;
+	unsigned int actual_last_wchar_hex = 0;
+	DWORD result_gle = ERROR_SUCCESS;
+	DWORD recovery_probe_gle = ERROR_SUCCESS;
+	std::wstring recovered_actual_path;
+	std::string raw_expected_log;
+	std::string raw_actual_log;
+	std::string visible_expected_log;
+	std::string visible_actual_log;
+	std::string canonical_expected_log;
+	std::string canonical_actual_log;
+	std::string selected_actual_log;
+	std::string reason;
+	dbghelp_canonical_path_t expected;
+	dbghelp_canonical_path_t actual;
+	dbghelp_canonical_path_t expected_dir;
+	dbghelp_canonical_path_t actual_dir_probe;
+};
+
+inline std::string dbghelp_verification_summary(const dbghelp_path_verification_t& result)
+{
+	const std::string actual_dir_probe_log = dbghelp_wide_to_utf8(result.actual_dir_probe.canonical_path);
+	char buf[4096];
+	std::snprintf(buf, sizeof(buf),
+		"actual_wchars=%zu actual_visible_wchars=%zu actual_first_nul=%lld actual_last_wchar_hex=0x%04X actual_visible_ended_with_slash=%d visible_actual='%s' canonical_actual_dir_probe='%s' recovered_directory=%d recovery_probe_gle=%lu recovery_full_ok=%d recovery_full_gle=%lu recovery_open_ok=%d recovery_open_gle=%lu recovery_info_ok=%d recovery_info_gle=%lu recovery_final_ok=%d recovery_final_gle=%lu actual_in_system32=%d actual_dbghelp_name=%d canonical_match=%d file_id_available=%d file_id_match=%d accepted=%d reason='%s' result_gle=%lu",
+		result.actual_wchars,
+		result.actual_visible_wchars,
+		result.actual_first_nul,
+		result.actual_last_wchar_hex,
+		result.actual_visible_ended_with_slash ? 1 : 0,
+		result.visible_actual_log.c_str(),
+		actual_dir_probe_log.c_str(),
+		result.recovered_directory ? 1 : 0,
+		result.recovery_probe_gle,
+		result.actual_dir_probe.full_ok ? 1 : 0,
+		result.actual_dir_probe.full_gle,
+		result.actual_dir_probe.open_ok ? 1 : 0,
+		result.actual_dir_probe.open_gle,
+		result.actual_dir_probe.info_ok ? 1 : 0,
+		result.actual_dir_probe.info_gle,
+		result.actual_dir_probe.final_ok ? 1 : 0,
+		result.actual_dir_probe.final_gle,
+		result.actual_in_system32 ? 1 : 0,
+		result.actual_is_dbghelp ? 1 : 0,
+		result.canonical_match ? 1 : 0,
+		result.file_id_available ? 1 : 0,
+		result.file_id_match ? 1 : 0,
+		result.accepted ? 1 : 0,
+		result.reason.c_str(),
+		result.result_gle);
+	return buf;
+}
+
+inline dbghelp_path_verification_t verify_dbghelp_system_path(const std::wstring& expected_path, const std::wstring& actual_path,
+                                                             bool actual_path_ok, DWORD actual_path_gle,
+                                                             const char* context, uint64_t attempt, HMODULE hmod)
+{
+	dbghelp_path_verification_t result{};
+	const DWORD pid = GetCurrentProcessId();
+	const DWORD tid = GetCurrentThreadId();
+	const std::wstring expected_visible = dbghelp_visible_path(expected_path);
+	const std::wstring actual_visible = dbghelp_visible_path(actual_path);
+	result.actual_wchars = actual_path.size();
+	result.actual_visible_wchars = actual_visible.size();
+	result.actual_first_nul = dbghelp_first_nul_log_index(actual_path);
+	result.actual_last_wchar_hex = actual_path.empty() ? 0U : static_cast<unsigned int>(actual_path.back());
+	result.actual_visible_ended_with_slash = !actual_visible.empty() && dbghelp_is_path_slash(actual_visible.back());
+	result.raw_expected_log = dbghelp_wide_to_utf8(expected_path);
+	result.raw_actual_log = dbghelp_wide_to_utf8(actual_path);
+	result.visible_expected_log = dbghelp_wide_to_utf8(expected_visible);
+	result.visible_actual_log = dbghelp_wide_to_utf8(actual_visible);
+	result.expected = dbghelp_canonicalize_path(expected_visible);
+	const std::wstring expected_parent = dbghelp_parent_path(result.expected.canonical_path);
+	result.expected_dir = dbghelp_canonicalize_path(expected_parent);
+	const bool expected_name_ok = dbghelp_path_equal(dbghelp_file_name(result.expected.canonical_path), L"dbghelp.dll");
+	const bool expected_dir_name_ok = dbghelp_path_equal(dbghelp_file_name(result.expected_dir.canonical_path), L"System32");
+	result.expected_is_system32_dbghelp = expected_name_ok && expected_dir_name_ok && !result.expected.canonical_path.empty();
+	std::wstring candidate_actual = actual_visible;
+	if (!actual_path_ok || actual_visible.empty()) {
+		result.reason = "actual_module_path_unavailable";
+		result.result_gle = actual_path_gle ? actual_path_gle : ERROR_MOD_NOT_FOUND;
+	} else {
+		if (result.actual_visible_ended_with_slash) {
+			const std::wstring actual_dir_path = dbghelp_trim_trailing_slashes(actual_visible);
+			result.actual_dir_probe = dbghelp_canonicalize_path(actual_dir_path);
+			result.recovery_probe_gle = result.actual_dir_probe.final_gle ? result.actual_dir_probe.final_gle :
+				(result.actual_dir_probe.info_gle ? result.actual_dir_probe.info_gle :
+				(result.actual_dir_probe.open_gle ? result.actual_dir_probe.open_gle : result.actual_dir_probe.full_gle));
+			if (!result.expected_dir.canonical_path.empty() &&
+			    dbghelp_path_equal(result.actual_dir_probe.canonical_path, result.expected_dir.canonical_path)) {
+				candidate_actual = dbghelp_append_dbghelp_dll(actual_visible);
+				result.recovered_actual_path = candidate_actual;
+				result.recovered_directory = true;
+			}
+		}
+		result.actual = dbghelp_canonicalize_path(candidate_actual);
+		result.file_id_available = result.expected.info_ok && result.actual.info_ok;
+		result.file_id_match = result.file_id_available && dbghelp_same_file_id(result.expected.file_id, result.actual.file_id);
+		result.canonical_match = !result.expected.canonical_path.empty() &&
+			!result.actual.canonical_path.empty() &&
+			dbghelp_path_equal(result.expected.canonical_path, result.actual.canonical_path);
+		const std::wstring actual_parent = dbghelp_parent_path(result.actual.canonical_path);
+		result.actual_in_system32 = !actual_parent.empty() &&
+			!result.expected_dir.canonical_path.empty() &&
+			dbghelp_path_equal(actual_parent, result.expected_dir.canonical_path);
+		result.actual_is_dbghelp = dbghelp_path_equal(dbghelp_file_name(result.actual.canonical_path), L"dbghelp.dll");
+		if (!result.expected_is_system32_dbghelp) {
+			result.reason = "expected_path_not_system32_dbghelp";
+			result.result_gle = ERROR_INVALID_NAME;
+		} else if (result.actual.canonical_path.empty()) {
+			result.reason = "actual_canonical_path_unavailable";
+			result.result_gle = result.actual.full_gle ? result.actual.full_gle : ERROR_INVALID_NAME;
+		} else if (!result.actual_in_system32) {
+			result.reason = "actual_not_system32_dbghelp";
+			result.result_gle = ERROR_ACCESS_DENIED;
+		} else if (!result.actual_is_dbghelp) {
+			result.reason = "actual_not_dbghelp_dll";
+			result.result_gle = ERROR_ACCESS_DENIED;
+		} else if (result.file_id_available) {
+			if (result.file_id_match) {
+				result.accepted = true;
+				result.reason = result.recovered_directory ? "recovered_system32_directory_file_id_match" : "file_identity_match";
+			} else {
+				result.reason = "file_identity_mismatch";
+				result.result_gle = ERROR_ACCESS_DENIED;
+			}
+		} else if (result.canonical_match) {
+			result.accepted = true;
+			result.reason = result.recovered_directory ? "recovered_system32_directory_canonical_match" : "canonical_path_match";
+		} else {
+			result.reason = "canonical_path_mismatch";
+			result.result_gle = ERROR_ACCESS_DENIED;
+		}
+	}
+	if (result.accepted)
+		result.result_gle = ERROR_SUCCESS;
+	result.canonical_expected_log = dbghelp_wide_to_utf8(result.expected.canonical_path);
+	result.canonical_actual_log = dbghelp_wide_to_utf8(result.actual.canonical_path);
+	result.selected_actual_log = !result.canonical_actual_log.empty()
+		? result.canonical_actual_log
+		: (!result.recovered_actual_path.empty() ? dbghelp_wide_to_utf8(result.recovered_actual_path) : result.raw_actual_log);
+	const std::string recovered_log = dbghelp_wide_to_utf8(result.recovered_actual_path);
+	const std::string expected_dir_log = dbghelp_wide_to_utf8(result.expected_dir.canonical_path);
+	const std::string actual_dir_probe_log = dbghelp_wide_to_utf8(result.actual_dir_probe.canonical_path);
+	diag::log_tagged_fmt("pdb",
+		"load_dbghelp_path_verify context=%s attempt=%llu pid=%lu tid=%lu hmod=%p raw_expected='%s' visible_expected='%s' raw_actual='%s' visible_actual='%s' actual_wchars=%zu actual_visible_wchars=%zu actual_first_nul=%lld actual_last_wchar_hex=0x%04X actual_visible_ended_with_slash=%d actual_path_ok=%d actual_path_gle=%lu canonical_expected='%s' canonical_actual='%s' canonical_expected_dir='%s' canonical_actual_dir_probe='%s' recovered_directory=%d recovered_actual='%s' recovery_probe_gle=%lu recovery_full_ok=%d recovery_full_gle=%lu recovery_open_ok=%d recovery_open_gle=%lu recovery_info_ok=%d recovery_info_gle=%lu recovery_final_ok=%d recovery_final_gle=%lu expected_system32_dbghelp=%d actual_in_system32=%d actual_dbghelp_name=%d canonical_match=%d file_id_available=%d file_id_match=%d expected_full_ok=%d expected_full_gle=%lu expected_open_ok=%d expected_open_gle=%lu expected_info_ok=%d expected_info_gle=%lu expected_final_ok=%d expected_final_gle=%lu actual_full_ok=%d actual_full_gle=%lu actual_open_ok=%d actual_open_gle=%lu actual_info_ok=%d actual_info_gle=%lu actual_final_ok=%d actual_final_gle=%lu accepted=%d reason='%s' result_gle=%lu",
+		context ? context : "<empty>",
+		static_cast<unsigned long long>(attempt),
+		pid,
+		tid,
+		hmod,
+		result.raw_expected_log.c_str(),
+		result.visible_expected_log.c_str(),
+		result.raw_actual_log.c_str(),
+		result.visible_actual_log.c_str(),
+		result.actual_wchars,
+		result.actual_visible_wchars,
+		result.actual_first_nul,
+		result.actual_last_wchar_hex,
+		result.actual_visible_ended_with_slash ? 1 : 0,
+		actual_path_ok ? 1 : 0,
+		actual_path_gle,
+		result.canonical_expected_log.c_str(),
+		result.canonical_actual_log.c_str(),
+		expected_dir_log.c_str(),
+		actual_dir_probe_log.c_str(),
+		result.recovered_directory ? 1 : 0,
+		recovered_log.c_str(),
+		result.recovery_probe_gle,
+		result.actual_dir_probe.full_ok ? 1 : 0,
+		result.actual_dir_probe.full_gle,
+		result.actual_dir_probe.open_ok ? 1 : 0,
+		result.actual_dir_probe.open_gle,
+		result.actual_dir_probe.info_ok ? 1 : 0,
+		result.actual_dir_probe.info_gle,
+		result.actual_dir_probe.final_ok ? 1 : 0,
+		result.actual_dir_probe.final_gle,
+		result.expected_is_system32_dbghelp ? 1 : 0,
+		result.actual_in_system32 ? 1 : 0,
+		result.actual_is_dbghelp ? 1 : 0,
+		result.canonical_match ? 1 : 0,
+		result.file_id_available ? 1 : 0,
+		result.file_id_match ? 1 : 0,
+		result.expected.full_ok ? 1 : 0,
+		result.expected.full_gle,
+		result.expected.open_ok ? 1 : 0,
+		result.expected.open_gle,
+		result.expected.info_ok ? 1 : 0,
+		result.expected.info_gle,
+		result.expected.final_ok ? 1 : 0,
+		result.expected.final_gle,
+		result.actual.full_ok ? 1 : 0,
+		result.actual.full_gle,
+		result.actual.open_ok ? 1 : 0,
+		result.actual.open_gle,
+		result.actual.info_ok ? 1 : 0,
+		result.actual.info_gle,
+		result.actual.final_ok ? 1 : 0,
+		result.actual.final_gle,
+		result.accepted ? 1 : 0,
+		result.reason.c_str(),
+		result.result_gle);
+	return result;
+}
+
 inline void log_dbghelp_prestate(DWORD tid, const std::wstring& dbghelp_path, const std::string& dbghelp_path_log)
 {
+	const DWORD pid = GetCurrentProcessId();
 	SetLastError(ERROR_SUCCESS);
 	HMODULE existing = GetModuleHandleW(L"dbghelp.dll");
 	DWORD existing_gle = GetLastError();
@@ -274,7 +746,8 @@ inline void log_dbghelp_prestate(DWORD tid, const std::wstring& dbghelp_path, co
 	}
 	const std::string existing_path_log = existing_len ? dbghelp_wide_to_utf8(std::wstring(existing_path, existing_path + existing_len)) : std::string();
 	diag::log_tagged_fmt("pdb",
-		"load_dbghelp_prestate tid=%lu requested_path='%s' existing_hmod=%p existing_gle=%lu existing_path='%s' existing_path_len=%lu existing_path_gle=%lu attrs_ok=%d attrs=0x%08lX size=%llu attrs_gle=%lu",
+		"load_dbghelp_prestate pid=%lu tid=%lu requested_path='%s' existing_hmod=%p existing_gle=%lu existing_path='%s' existing_path_len=%lu existing_path_gle=%lu attrs_ok=%d attrs=0x%08lX size=%llu attrs_gle=%lu",
+		pid,
 		tid,
 		dbghelp_path_log.c_str(),
 		existing,
@@ -307,7 +780,7 @@ inline void CALLBACK dbghelp_load_watchdog_cb(PVOID param, BOOLEAN) noexcept
 	if (marked) {
 		char detail[512];
 		std::snprintf(detail, sizeof(detail),
-			"DbgHelp LoadLibraryExW still has not returned after %llu ms for %s on tid %lu",
+			"DbgHelp LoadLibrary still has not returned after %llu ms for %s on tid %lu",
 			static_cast<unsigned long long>(elapsed),
 			ctx->path.c_str(),
 			ctx->thread_id);
@@ -321,130 +794,37 @@ inline void CALLBACK dbghelp_load_watchdog_cb(PVOID param, BOOLEAN) noexcept
 	}
 }
 
-inline bool load_dbghelp()
+inline bool resolve_dbghelp_exports(HMODULE hmod, const char* source, uint64_t attempt, dbghelp_api_t& candidate, std::string& detail)
 {
+	const DWORD pid = GetCurrentProcessId();
 	const DWORD tid = GetCurrentThreadId();
-	uint64_t wait_start = GetTickCount64();
-	const std::wstring dbghelp_path = resolve_dbghelp_path();
-	const std::string dbghelp_path_log = dbghelp_wide_to_utf8(dbghelp_path);
-	uint64_t attempt = 0;
-	diag::log_tagged_fmt("pdb", "load_dbghelp_enter tid=%lu path='%s'", tid, dbghelp_path_log.c_str());
-	log_dbghelp_prestate(tid, dbghelp_path, dbghelp_path_log);
-	{
-		std::unique_lock<std::mutex> lk(g_api_mutex);
-		diag::log_tagged_fmt("pdb", "load_dbghelp_locked tid=%lu wait_ms=%llu cached=%d hmod=%p in_progress=%d stuck=%d owner_tid=%lu owner_elapsed_ms=%llu",
-			tid,
-			static_cast<unsigned long long>(GetTickCount64() - wait_start),
-			g_api.loaded ? 1 : 0,
-			g_api.hmod,
-			g_dbghelp_load_state.in_progress ? 1 : 0,
-			g_dbghelp_load_state.stuck ? 1 : 0,
-			g_dbghelp_load_state.thread_id,
-			g_dbghelp_load_state.in_progress ? static_cast<unsigned long long>(GetTickCount64() - g_dbghelp_load_state.started_ms) : 0ULL);
-		if (g_api.loaded) {
-			set_last_error_text({});
-			return true;
-		}
-		if (g_dbghelp_load_state.in_progress) {
-			const uint64_t owner_elapsed = GetTickCount64() - g_dbghelp_load_state.started_ms;
-			if (owner_elapsed >= k_dbghelp_load_watchdog_ms)
-				g_dbghelp_load_state.stuck = true;
-			char detail[512];
-			std::snprintf(detail, sizeof(detail),
-				"DbgHelp loader is already %s on tid %lu for %llu ms while loading %s",
-				g_dbghelp_load_state.stuck ? "stuck" : "in progress",
-				g_dbghelp_load_state.thread_id,
-				static_cast<unsigned long long>(owner_elapsed),
-				g_dbghelp_load_state.path.c_str());
-			set_last_error_text(detail);
-			diag::log_tagged_fmt("pdb",
-				"load_dbghelp_busy tid=%lu owner_tid=%lu owner_elapsed_ms=%llu owner_attempt=%llu stuck=%d path='%s'",
-				tid,
-				g_dbghelp_load_state.thread_id,
-				static_cast<unsigned long long>(owner_elapsed),
-				static_cast<unsigned long long>(g_dbghelp_load_state.attempt),
-				g_dbghelp_load_state.stuck ? 1 : 0,
-				g_dbghelp_load_state.path.c_str());
-			return false;
-		}
-		g_dbghelp_load_state.in_progress = true;
-		g_dbghelp_load_state.stuck = false;
-		g_dbghelp_load_state.thread_id = tid;
-		g_dbghelp_load_state.started_ms = GetTickCount64();
-		g_dbghelp_load_state.path = dbghelp_path_log;
-		attempt = ++g_dbghelp_load_state.attempt;
-	}
-
-	auto* watchdog_ctx = new dbghelp_load_watchdog_context_t{};
-	watchdog_ctx->thread_id = tid;
-	watchdog_ctx->started_ms = GetTickCount64();
-	watchdog_ctx->attempt = attempt;
-	watchdog_ctx->path = dbghelp_path_log;
-	HANDLE watchdog_timer = nullptr;
-	SetLastError(ERROR_SUCCESS);
-	BOOL watchdog_ok = CreateTimerQueueTimer(&watchdog_timer, nullptr, dbghelp_load_watchdog_cb, watchdog_ctx,
-		static_cast<DWORD>(k_dbghelp_load_watchdog_ms), 0, WT_EXECUTEDEFAULT);
-	DWORD watchdog_gle = GetLastError();
-	diag::log_tagged_fmt("pdb",
-		"load_dbghelp_watchdog_schedule tid=%lu attempt=%llu ok=%d timer=%p timeout_ms=%llu gle=%lu",
-		tid,
-		static_cast<unsigned long long>(attempt),
-		watchdog_ok ? 1 : 0,
-		watchdog_timer,
-		static_cast<unsigned long long>(k_dbghelp_load_watchdog_ms),
-		watchdog_gle);
-
-	const uint64_t load_start = GetTickCount64();
-	diag::log_tagged_fmt("pdb", "load_dbghelp_LoadLibrary_begin tid=%lu path='%s'", tid, dbghelp_path_log.c_str());
-	SetLastError(ERROR_SUCCESS);
-	HMODULE loaded_hmod = LoadLibraryExW(dbghelp_path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-	DWORD load_gle = GetLastError();
-	diag::log_tagged_fmt("pdb", "load_dbghelp_LoadLibrary_end tid=%lu path='%s' hmod=%p gle=%lu elapsed_ms=%llu",
-		tid, dbghelp_path_log.c_str(), loaded_hmod, load_gle,
-		static_cast<unsigned long long>(GetTickCount64() - load_start));
-	if (watchdog_ok) {
-		SetLastError(ERROR_SUCCESS);
-		BOOL deleted = DeleteTimerQueueTimer(nullptr, watchdog_timer, INVALID_HANDLE_VALUE);
-		DWORD delete_gle = GetLastError();
-		diag::log_tagged_fmt("pdb",
-			"load_dbghelp_watchdog_delete tid=%lu attempt=%llu ok=%d gle=%lu",
-			tid,
-			static_cast<unsigned long long>(attempt),
-			deleted ? 1 : 0,
-			delete_gle);
-	}
-	delete watchdog_ctx;
-	if (!loaded_hmod) {
-		{
-			std::lock_guard<std::mutex> lk(g_api_mutex);
-			if (g_dbghelp_load_state.attempt == attempt) {
-				g_dbghelp_load_state.in_progress = false;
-				g_dbghelp_load_state.thread_id = 0;
-			}
-		}
-		char detail[512];
-		std::snprintf(detail, sizeof(detail), "LoadLibraryExW(%s) failed with Win32 error %lu", dbghelp_path_log.c_str(), load_gle);
-		set_last_error_text(detail);
-		diag::log_tagged_fmt("pdb",
-			"load_dbghelp failed reason='LoadLibraryExW' path='%s' err=%lu elapsed_ms=%llu",
-			dbghelp_path_log.c_str(), load_gle,
-			static_cast<unsigned long long>(GetTickCount64() - wait_start));
-		return false;
-	}
-
-	dbghelp_api_t candidate{};
-	candidate.hmod = loaded_hmod;
+	candidate = {};
+	candidate.hmod = hmod;
 	auto gp = [&](const char* name) -> FARPROC {
 		const uint64_t export_start = GetTickCount64();
+		diag::log_tagged_fmt("pdb",
+			"load_dbghelp_api_resolve_begin source=%s attempt=%llu pid=%lu tid=%lu hmod=%p name=%s",
+			source ? source : "<empty>",
+			static_cast<unsigned long long>(attempt),
+			pid,
+			tid,
+			hmod,
+			name);
 		SetLastError(ERROR_SUCCESS);
-		FARPROC proc = GetProcAddress(loaded_hmod, name);
+		FARPROC proc = GetProcAddress(hmod, name);
 		DWORD export_gle = GetLastError();
 		diag::log_tagged_fmt("pdb",
-			"load_dbghelp_export name=%s ok=%d elapsed_ms=%llu gle=%lu",
+			"load_dbghelp_api_resolve_end source=%s attempt=%llu pid=%lu tid=%lu hmod=%p name=%s proc=%p ok=%d gle=%lu elapsed_ms=%llu",
+			source ? source : "<empty>",
+			static_cast<unsigned long long>(attempt),
+			pid,
+			tid,
+			hmod,
 			name,
+			proc,
 			proc ? 1 : 0,
-			static_cast<unsigned long long>(GetTickCount64() - export_start),
-			export_gle);
+			export_gle,
+			static_cast<unsigned long long>(GetTickCount64() - export_start));
 		return proc;
 	};
 
@@ -460,41 +840,538 @@ inline bool load_dbghelp()
 	candidate.pSymEnumTypesW     = reinterpret_cast<fn_SymEnumTypesW>(gp("SymEnumTypesW"));
 
 	if (!candidate.pSymInitializeW || !candidate.pSymCleanup || !candidate.pSymLoadModuleExW ||
-	    !candidate.pSymEnumSymbolsExW || !candidate.pSymGetTypeInfo) {
-		FreeLibrary(loaded_hmod);
-		diag::log_tagged_fmt("pdb",
-			"load_dbghelp failed reason='missing_export' init=%d cleanup=%d loadmod=%d enumsym=%d gettypeinfo=%d",
+	    !candidate.pSymUnloadModule64 || !candidate.pSymEnumSymbolsExW || !candidate.pSymGetTypeInfo) {
+		char buf[512];
+		std::snprintf(buf, sizeof(buf),
+			"DbgHelp missing required exports init=%d cleanup=%d loadmod=%d unload=%d enumsym=%d gettypeinfo=%d enumtypes=%d source=%s",
 			candidate.pSymInitializeW    ? 1 : 0,
 			candidate.pSymCleanup        ? 1 : 0,
 			candidate.pSymLoadModuleExW  ? 1 : 0,
+			candidate.pSymUnloadModule64 ? 1 : 0,
 			candidate.pSymEnumSymbolsExW ? 1 : 0,
-			candidate.pSymGetTypeInfo    ? 1 : 0);
-		{
-			std::lock_guard<std::mutex> lk(g_api_mutex);
-			if (g_dbghelp_load_state.attempt == attempt) {
-				g_dbghelp_load_state.in_progress = false;
-				g_dbghelp_load_state.thread_id = 0;
-			}
-		}
-		set_last_error_text("DbgHelp was loaded but required Sym* exports were missing");
+			candidate.pSymGetTypeInfo    ? 1 : 0,
+			candidate.pSymEnumTypesW     ? 1 : 0,
+			source ? source : "<empty>");
+		detail = buf;
+		diag::log_tagged_fmt("pdb",
+			"load_dbghelp_failed_missing_export source=%s attempt=%llu init=%d cleanup=%d loadmod=%d unload=%d enumsym=%d gettypeinfo=%d enumtypes=%d",
+			source ? source : "<empty>",
+			static_cast<unsigned long long>(attempt),
+			candidate.pSymInitializeW    ? 1 : 0,
+			candidate.pSymCleanup        ? 1 : 0,
+			candidate.pSymLoadModuleExW  ? 1 : 0,
+			candidate.pSymUnloadModule64 ? 1 : 0,
+			candidate.pSymEnumSymbolsExW ? 1 : 0,
+			candidate.pSymGetTypeInfo    ? 1 : 0,
+			candidate.pSymEnumTypesW     ? 1 : 0);
 		return false;
 	}
 
 	candidate.loaded = true;
+	detail.clear();
+	return true;
+}
+
+inline void set_dbghelp_terminal_locked(bool success, bool stuck, const std::string& phase, const std::string& path,
+                                        const std::string& loaded_path, DWORD gle, HMODULE hmod,
+                                        const std::string& detail)
+{
+	g_dbghelp_load_state.in_progress = false;
+	g_dbghelp_load_state.stuck = stuck;
+	g_dbghelp_load_state.terminal = true;
+	g_dbghelp_load_state.last_success = success;
+	g_dbghelp_load_state.completed_ms = GetTickCount64();
+	g_dbghelp_load_state.phase = phase;
+	g_dbghelp_load_state.path = path;
+	g_dbghelp_load_state.loaded_path = loaded_path;
+	g_dbghelp_load_state.last_gle = gle;
+	g_dbghelp_load_state.last_hmod = hmod;
+	g_dbghelp_load_state.terminal_detail = detail;
+	if (success)
+		g_dbghelp_load_state.thread_id = 0;
+}
+
+inline int try_use_preloaded_dbghelp_locked(const std::wstring& dbghelp_path, const std::string& dbghelp_path_log, uint64_t attempt)
+{
+	const DWORD pid = GetCurrentProcessId();
+	const DWORD tid = GetCurrentThreadId();
+	HMODULE existing_by_path = nullptr;
+	SetLastError(ERROR_SUCCESS);
+	BOOL by_path_ok = GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, dbghelp_path.c_str(), &existing_by_path);
+	DWORD by_path_gle = GetLastError();
+	diag::log_tagged_fmt("pdb",
+		"load_dbghelp_preloaded_probe_by_path attempt=%llu pid=%lu tid=%lu path='%s' ok=%d hmod=%p gle=%lu",
+		static_cast<unsigned long long>(attempt),
+		pid,
+		tid,
+		dbghelp_path_log.c_str(),
+		by_path_ok ? 1 : 0,
+		existing_by_path,
+		by_path_gle);
+
+	HMODULE existing = existing_by_path;
+	if (!existing) {
+		SetLastError(ERROR_SUCCESS);
+		existing = GetModuleHandleW(L"dbghelp.dll");
+		DWORD existing_gle = GetLastError();
+		diag::log_tagged_fmt("pdb",
+			"load_dbghelp_preloaded_probe_by_name attempt=%llu pid=%lu tid=%lu hmod=%p gle=%lu",
+			static_cast<unsigned long long>(attempt),
+			pid,
+			tid,
+			existing,
+			existing_gle);
+	}
+	if (!existing)
+		return 0;
+
+	std::wstring loaded_module_path;
+	DWORD loaded_path_gle = ERROR_SUCCESS;
+	const bool loaded_path_ok = get_dbghelp_module_path(existing, loaded_module_path, loaded_path_gle);
+	const dbghelp_path_verification_t path_check = verify_dbghelp_system_path(dbghelp_path, loaded_module_path,
+		loaded_path_ok, loaded_path_gle, "preloaded", attempt, existing);
+	const std::string loaded_module_path_log = path_check.selected_actual_log;
+	const std::string verifier_summary = dbghelp_verification_summary(path_check);
+	diag::log_tagged_fmt("pdb",
+		"load_dbghelp_preloaded_path attempt=%llu pid=%lu tid=%lu expected_path='%s' hmod=%p loaded_path_ok=%d raw_loaded_path='%s' verified_loaded_path='%s' path_gle=%lu accepted=%d reason='%s' verifier=\"%s\"",
+		static_cast<unsigned long long>(attempt),
+		pid,
+		tid,
+		dbghelp_path_log.c_str(),
+		existing,
+		loaded_path_ok ? 1 : 0,
+		path_check.raw_actual_log.c_str(),
+		loaded_module_path_log.c_str(),
+		loaded_path_gle,
+		path_check.accepted ? 1 : 0,
+		path_check.reason.c_str(),
+		verifier_summary.c_str());
+	if (!path_check.accepted) {
+		char detail[768];
+		std::snprintf(detail, sizeof(detail), "DbgHelp was already loaded from unexpected path %s while %s was required; verifier=%s",
+			path_check.raw_actual_log.c_str(), dbghelp_path_log.c_str(), path_check.reason.c_str());
+		set_last_error_text(detail);
+		set_dbghelp_terminal_locked(false, false, "preloaded_rejected", dbghelp_path_log, loaded_module_path_log,
+			path_check.result_gle, existing, detail);
+		diag::log_tagged_fmt("pdb",
+			"load_dbghelp_preloaded_rejected attempt=%llu expected='%s' loaded='%s' canonical_expected='%s' canonical_actual='%s' path_ok=%d path_gle=%lu verifier_gle=%lu recovered_directory=%d file_id_match=%d reason='%s' verifier=\"%s\"",
+			static_cast<unsigned long long>(attempt),
+			dbghelp_path_log.c_str(),
+			loaded_module_path_log.c_str(),
+			path_check.canonical_expected_log.c_str(),
+			path_check.canonical_actual_log.c_str(),
+			loaded_path_ok ? 1 : 0,
+			loaded_path_gle,
+			path_check.result_gle,
+			path_check.recovered_directory ? 1 : 0,
+			path_check.file_id_match ? 1 : 0,
+			path_check.reason.c_str(),
+			verifier_summary.c_str());
+		g_dbghelp_load_cv.notify_all();
+		return -1;
+	}
+
+	dbghelp_api_t candidate{};
+	std::string detail;
+	if (!resolve_dbghelp_exports(existing, "preloaded", attempt, candidate, detail)) {
+		set_last_error_text(detail);
+		set_dbghelp_terminal_locked(false, false, "preloaded_exports", dbghelp_path_log, loaded_module_path_log,
+			ERROR_PROC_NOT_FOUND, existing, detail);
+		g_dbghelp_load_cv.notify_all();
+		return -1;
+	}
+
+	g_api = candidate;
+	set_last_error_text({});
+	set_dbghelp_terminal_locked(true, false, "preloaded_ok", dbghelp_path_log, loaded_module_path_log,
+		ERROR_SUCCESS, existing, "DbgHelp preloaded system module accepted");
+	diag::log_tagged_fmt("pdb",
+		"load_dbghelp_preloaded_ok attempt=%llu pid=%lu tid=%lu hmod=%p loaded_path='%s' verifier=\"%s\"",
+		static_cast<unsigned long long>(attempt),
+		pid,
+		tid,
+		existing,
+		loaded_module_path_log.c_str(),
+		verifier_summary.c_str());
+	g_dbghelp_load_cv.notify_all();
+	return 1;
+}
+
+inline void dbghelp_load_worker(uint64_t attempt, std::wstring dbghelp_path, std::string dbghelp_path_log,
+                                DWORD caller_pid, DWORD caller_tid) noexcept
+{
+	const DWORD worker_pid = GetCurrentProcessId();
+	const DWORD worker_tid = GetCurrentThreadId();
+	const uint64_t worker_start = GetTickCount64();
+	try {
+		{
+			std::lock_guard<std::mutex> lk(g_api_mutex);
+			if (g_dbghelp_load_state.attempt == attempt) {
+				g_dbghelp_load_state.worker_pid = worker_pid;
+				g_dbghelp_load_state.worker_tid = worker_tid;
+				g_dbghelp_load_state.phase = "LoadLibraryW";
+			}
+		}
+		diag::log_tagged_fmt("pdb",
+			"load_dbghelp_worker_enter attempt=%llu caller_pid=%lu caller_tid=%lu worker_pid=%lu worker_tid=%lu path='%s'",
+			static_cast<unsigned long long>(attempt),
+			caller_pid,
+			caller_tid,
+			worker_pid,
+			worker_tid,
+			dbghelp_path_log.c_str());
+		diag::log_tagged_fmt("pdb",
+			"load_dbghelp_LoadLibrary_begin attempt=%llu caller_pid=%lu caller_tid=%lu worker_pid=%lu worker_tid=%lu api=LoadLibraryW path='%s'",
+			static_cast<unsigned long long>(attempt),
+			caller_pid,
+			caller_tid,
+			worker_pid,
+			worker_tid,
+			dbghelp_path_log.c_str());
+		SetLastError(ERROR_SUCCESS);
+		HMODULE loaded_hmod = LoadLibraryW(dbghelp_path.c_str());
+		DWORD load_gle = GetLastError();
+		const uint64_t load_elapsed = GetTickCount64() - worker_start;
+		diag::log_tagged_fmt("pdb",
+			"load_dbghelp_LoadLibrary_end attempt=%llu caller_pid=%lu caller_tid=%lu worker_pid=%lu worker_tid=%lu api=LoadLibraryW path='%s' hmod=%p gle=%lu elapsed_ms=%llu",
+			static_cast<unsigned long long>(attempt),
+			caller_pid,
+			caller_tid,
+			worker_pid,
+			worker_tid,
+			dbghelp_path_log.c_str(),
+			loaded_hmod,
+			load_gle,
+			static_cast<unsigned long long>(load_elapsed));
+		if (!loaded_hmod) {
+			char detail[512];
+			std::snprintf(detail, sizeof(detail), "LoadLibraryW(%s) failed with Win32 error %lu", dbghelp_path_log.c_str(), load_gle);
+			{
+				std::lock_guard<std::mutex> lk(g_api_mutex);
+				if (g_dbghelp_load_state.attempt == attempt)
+					set_dbghelp_terminal_locked(false, false, "LoadLibraryW_failed", dbghelp_path_log, {}, load_gle, loaded_hmod, detail);
+			}
+			set_last_error_text(detail);
+			g_dbghelp_load_cv.notify_all();
+			diag::log_tagged_fmt("pdb",
+				"load_dbghelp_worker_failed attempt=%llu reason='LoadLibraryW' path='%s' gle=%lu elapsed_ms=%llu",
+				static_cast<unsigned long long>(attempt),
+				dbghelp_path_log.c_str(),
+				load_gle,
+				static_cast<unsigned long long>(load_elapsed));
+			return;
+		}
+
+		std::wstring loaded_module_path;
+		DWORD loaded_path_gle = ERROR_SUCCESS;
+		const bool loaded_path_ok = get_dbghelp_module_path(loaded_hmod, loaded_module_path, loaded_path_gle);
+		const dbghelp_path_verification_t path_check = verify_dbghelp_system_path(dbghelp_path, loaded_module_path,
+			loaded_path_ok, loaded_path_gle, "LoadLibraryW", attempt, loaded_hmod);
+		const std::string loaded_module_path_log = path_check.selected_actual_log;
+		const std::string verifier_summary = dbghelp_verification_summary(path_check);
+		diag::log_tagged_fmt("pdb",
+			"load_dbghelp_loaded_path attempt=%llu worker_pid=%lu worker_tid=%lu expected_path='%s' hmod=%p loaded_path_ok=%d raw_loaded_path='%s' verified_loaded_path='%s' path_gle=%lu accepted=%d reason='%s' verifier=\"%s\"",
+			static_cast<unsigned long long>(attempt),
+			worker_pid,
+			worker_tid,
+			dbghelp_path_log.c_str(),
+			loaded_hmod,
+			loaded_path_ok ? 1 : 0,
+			path_check.raw_actual_log.c_str(),
+			loaded_module_path_log.c_str(),
+			loaded_path_gle,
+			path_check.accepted ? 1 : 0,
+			path_check.reason.c_str(),
+			verifier_summary.c_str());
+		if (!path_check.accepted) {
+			FreeLibrary(loaded_hmod);
+			char detail[768];
+			std::snprintf(detail, sizeof(detail), "DbgHelp resolved to unexpected module path %s while %s was required; verifier=%s",
+				path_check.raw_actual_log.c_str(), dbghelp_path_log.c_str(), path_check.reason.c_str());
+			{
+				std::lock_guard<std::mutex> lk(g_api_mutex);
+				if (g_dbghelp_load_state.attempt == attempt)
+					set_dbghelp_terminal_locked(false, false, "unexpected_module_path", dbghelp_path_log, loaded_module_path_log,
+						path_check.result_gle, loaded_hmod, detail);
+			}
+			set_last_error_text(detail);
+			g_dbghelp_load_cv.notify_all();
+			diag::log_tagged_fmt("pdb",
+				"load_dbghelp_worker_failed attempt=%llu reason='unexpected_module_path' expected='%s' loaded='%s' canonical_expected='%s' canonical_actual='%s' path_ok=%d path_gle=%lu verifier_gle=%lu recovered_directory=%d file_id_match=%d verifier_reason='%s' elapsed_ms=%llu verifier=\"%s\"",
+				static_cast<unsigned long long>(attempt),
+				dbghelp_path_log.c_str(),
+				loaded_module_path_log.c_str(),
+				path_check.canonical_expected_log.c_str(),
+				path_check.canonical_actual_log.c_str(),
+				loaded_path_ok ? 1 : 0,
+				loaded_path_gle,
+				path_check.result_gle,
+				path_check.recovered_directory ? 1 : 0,
+				path_check.file_id_match ? 1 : 0,
+				path_check.reason.c_str(),
+				static_cast<unsigned long long>(GetTickCount64() - worker_start),
+				verifier_summary.c_str());
+			return;
+		}
+
+		dbghelp_api_t candidate{};
+		std::string detail;
+		if (!resolve_dbghelp_exports(loaded_hmod, "LoadLibraryW", attempt, candidate, detail)) {
+			FreeLibrary(loaded_hmod);
+			{
+				std::lock_guard<std::mutex> lk(g_api_mutex);
+				if (g_dbghelp_load_state.attempt == attempt)
+					set_dbghelp_terminal_locked(false, false, "missing_export", dbghelp_path_log, loaded_module_path_log,
+						ERROR_PROC_NOT_FOUND, loaded_hmod, detail);
+			}
+			set_last_error_text(detail);
+			g_dbghelp_load_cv.notify_all();
+			return;
+		}
+
+		{
+			std::lock_guard<std::mutex> lk(g_api_mutex);
+			if (g_dbghelp_load_state.attempt == attempt) {
+				const bool completed_after_timeout = g_dbghelp_load_state.stuck || g_dbghelp_load_state.phase == "LoadLibraryW_timeout";
+				g_api = candidate;
+				set_dbghelp_terminal_locked(true, false, "loaded", dbghelp_path_log, loaded_module_path_log,
+					ERROR_SUCCESS, loaded_hmod, "DbgHelp loaded successfully");
+				if (!completed_after_timeout)
+					set_last_error_text({});
+			}
+		}
+		g_dbghelp_load_cv.notify_all();
+		diag::log_tagged_fmt("pdb",
+			"load_dbghelp_worker_ok attempt=%llu path='%s' loaded_path='%s' hmod=%p elapsed_ms=%llu verifier=\"%s\"",
+			static_cast<unsigned long long>(attempt),
+			dbghelp_path_log.c_str(),
+			loaded_module_path_log.c_str(),
+			loaded_hmod,
+			static_cast<unsigned long long>(GetTickCount64() - worker_start),
+			verifier_summary.c_str());
+	} catch (...) {
+		const std::string detail = "DbgHelp loader worker threw an unknown exception";
+		{
+			std::lock_guard<std::mutex> lk(g_api_mutex);
+			if (g_dbghelp_load_state.attempt == attempt)
+				set_dbghelp_terminal_locked(false, false, "worker_exception", dbghelp_path_log, {}, ERROR_UNHANDLED_EXCEPTION, nullptr, detail);
+		}
+		set_last_error_text(detail);
+		g_dbghelp_load_cv.notify_all();
+		diag::log_tagged_fmt("pdb",
+			"load_dbghelp_worker_exception attempt=%llu caller_pid=%lu caller_tid=%lu worker_pid=%lu worker_tid=%lu elapsed_ms=%llu",
+			static_cast<unsigned long long>(attempt),
+			caller_pid,
+			caller_tid,
+			worker_pid,
+			worker_tid,
+			static_cast<unsigned long long>(GetTickCount64() - worker_start));
+	}
+}
+
+inline bool load_dbghelp()
+{
+	const DWORD tid = GetCurrentThreadId();
+	const DWORD pid = GetCurrentProcessId();
+	const uint64_t wait_start = GetTickCount64();
+	const std::wstring dbghelp_path = resolve_dbghelp_path();
+	const std::string dbghelp_path_log = dbghelp_wide_to_utf8(dbghelp_path);
+	uint64_t attempt = 0;
+	bool start_worker = false;
+	diag::log_tagged_fmt("pdb", "load_dbghelp_enter pid=%lu tid=%lu path='%s'", pid, tid, dbghelp_path_log.c_str());
+	log_dbghelp_prestate(tid, dbghelp_path, dbghelp_path_log);
 	{
-		std::lock_guard<std::mutex> lk(g_api_mutex);
-		g_api = candidate;
-		if (g_dbghelp_load_state.attempt == attempt) {
-			g_dbghelp_load_state.in_progress = false;
-			g_dbghelp_load_state.stuck = false;
-			g_dbghelp_load_state.thread_id = 0;
+		std::unique_lock<std::mutex> lk(g_api_mutex);
+		diag::log_tagged_fmt("pdb", "load_dbghelp_locked pid=%lu tid=%lu wait_ms=%llu state=\"%s\"",
+			pid,
+			tid,
+			static_cast<unsigned long long>(GetTickCount64() - wait_start),
+			dbghelp_load_state_text_locked(GetTickCount64()).c_str());
+		if (g_api.loaded) {
+			set_last_error_text({});
+			diag::log_tagged_fmt("pdb", "load_dbghelp_cached_success pid=%lu tid=%lu hmod=%p path='%s'",
+				pid, tid, g_api.hmod, g_dbghelp_load_state.loaded_path.c_str());
+			return true;
+		}
+		if (g_dbghelp_load_state.terminal && !g_dbghelp_load_state.last_success && !g_dbghelp_load_state.in_progress) {
+			const std::string detail = g_dbghelp_load_state.terminal_detail.empty()
+				? dbghelp_load_state_text_locked(GetTickCount64())
+				: g_dbghelp_load_state.terminal_detail;
+			set_last_error_text(detail);
+			diag::log_tagged_fmt("pdb", "load_dbghelp_cached_terminal_failure pid=%lu tid=%lu state=\"%s\"",
+				pid, tid, dbghelp_load_state_text_locked(GetTickCount64()).c_str());
+			return false;
+		}
+		if (g_dbghelp_load_state.in_progress) {
+			const uint64_t owner_elapsed = GetTickCount64() - g_dbghelp_load_state.started_ms;
+			if (owner_elapsed >= k_dbghelp_load_watchdog_ms) {
+				g_dbghelp_load_state.stuck = true;
+				g_dbghelp_load_state.phase = "LoadLibraryW_timeout";
+				if (g_dbghelp_load_state.terminal_detail.empty()) {
+					char stuck_detail[768];
+					std::snprintf(stuck_detail, sizeof(stuck_detail),
+						"DbgHelp LoadLibraryW is stuck after %llu ms; caller_pid=%lu caller_tid=%lu worker_pid=%lu worker_tid=%lu path=%s",
+						static_cast<unsigned long long>(owner_elapsed),
+						g_dbghelp_load_state.caller_pid,
+						g_dbghelp_load_state.caller_tid,
+						g_dbghelp_load_state.worker_pid,
+						g_dbghelp_load_state.worker_tid,
+						g_dbghelp_load_state.path.c_str());
+					g_dbghelp_load_state.terminal_detail = stuck_detail;
+				}
+			}
+			char detail[512];
+			std::snprintf(detail, sizeof(detail),
+				"DbgHelp loader is already %s on caller tid %lu worker tid %lu for %llu ms while loading %s",
+				g_dbghelp_load_state.stuck ? "stuck" : "in progress",
+				g_dbghelp_load_state.caller_tid,
+				g_dbghelp_load_state.worker_tid,
+				static_cast<unsigned long long>(owner_elapsed),
+				g_dbghelp_load_state.path.c_str());
+			set_last_error_text(detail);
+			diag::log_tagged_fmt("pdb",
+				"load_dbghelp_busy pid=%lu tid=%lu owner_pid=%lu owner_tid=%lu worker_pid=%lu worker_tid=%lu owner_elapsed_ms=%llu owner_attempt=%llu stuck=%d path='%s' state=\"%s\"",
+				pid,
+				tid,
+				g_dbghelp_load_state.caller_pid,
+				g_dbghelp_load_state.caller_tid,
+				g_dbghelp_load_state.worker_pid,
+				g_dbghelp_load_state.worker_tid,
+				static_cast<unsigned long long>(owner_elapsed),
+				static_cast<unsigned long long>(g_dbghelp_load_state.attempt),
+				g_dbghelp_load_state.stuck ? 1 : 0,
+				g_dbghelp_load_state.path.c_str(),
+				dbghelp_load_state_text_locked(GetTickCount64()).c_str());
+			return false;
+		}
+
+		attempt = g_dbghelp_load_state.attempt + 1;
+		g_dbghelp_load_state.in_progress = false;
+		g_dbghelp_load_state.stuck = false;
+		g_dbghelp_load_state.terminal = false;
+		g_dbghelp_load_state.last_success = false;
+		g_dbghelp_load_state.caller_pid = pid;
+		g_dbghelp_load_state.caller_tid = tid;
+		g_dbghelp_load_state.worker_pid = 0;
+		g_dbghelp_load_state.worker_tid = 0;
+		g_dbghelp_load_state.thread_id = tid;
+		g_dbghelp_load_state.started_ms = GetTickCount64();
+		g_dbghelp_load_state.completed_ms = 0;
+		g_dbghelp_load_state.path = dbghelp_path_log;
+		g_dbghelp_load_state.loaded_path.clear();
+		g_dbghelp_load_state.terminal_detail.clear();
+		g_dbghelp_load_state.phase = "preloaded_probe";
+		g_dbghelp_load_state.last_gle = ERROR_SUCCESS;
+		g_dbghelp_load_state.last_hmod = nullptr;
+		g_dbghelp_load_state.attempt = attempt;
+		const int preloaded = try_use_preloaded_dbghelp_locked(dbghelp_path, dbghelp_path_log, attempt);
+		if (preloaded > 0)
+			return true;
+		if (preloaded < 0)
+			return false;
+
+		g_dbghelp_load_state.in_progress = true;
+		g_dbghelp_load_state.started_ms = GetTickCount64();
+		g_dbghelp_load_state.phase = "queued";
+		start_worker = true;
+	}
+
+	if (start_worker) {
+		try {
+			std::thread(dbghelp_load_worker, attempt, dbghelp_path, dbghelp_path_log, pid, tid).detach();
+			diag::log_tagged_fmt("pdb",
+				"load_dbghelp_worker_started attempt=%llu caller_pid=%lu caller_tid=%lu wait_timeout_ms=%llu path='%s'",
+				static_cast<unsigned long long>(attempt),
+				pid,
+				tid,
+				static_cast<unsigned long long>(k_dbghelp_load_watchdog_ms),
+				dbghelp_path_log.c_str());
+		} catch (const std::exception& ex) {
+			std::lock_guard<std::mutex> lk(g_api_mutex);
+			char detail[768];
+			std::snprintf(detail, sizeof(detail), "Failed to start DbgHelp loader worker: %s", ex.what());
+			set_dbghelp_terminal_locked(false, false, "worker_start_failed", dbghelp_path_log, {}, GetLastError(), nullptr, detail);
+			set_last_error_text(detail);
+			g_dbghelp_load_cv.notify_all();
+			diag::log_tagged_fmt("pdb",
+				"load_dbghelp_worker_start_failed attempt=%llu caller_pid=%lu caller_tid=%lu err='%s'",
+				static_cast<unsigned long long>(attempt),
+				pid,
+				tid,
+				ex.what());
+			return false;
+		} catch (...) {
+			std::lock_guard<std::mutex> lk(g_api_mutex);
+			const std::string detail = "Failed to start DbgHelp loader worker: unknown exception";
+			set_dbghelp_terminal_locked(false, false, "worker_start_failed", dbghelp_path_log, {}, GetLastError(), nullptr, detail);
+			set_last_error_text(detail);
+			g_dbghelp_load_cv.notify_all();
+			diag::log_tagged_fmt("pdb",
+				"load_dbghelp_worker_start_failed attempt=%llu caller_pid=%lu caller_tid=%lu err='<unknown>'",
+				static_cast<unsigned long long>(attempt),
+				pid,
+				tid);
+			return false;
 		}
 	}
-	set_last_error_text({});
-	diag::log_tagged_fmt("pdb", "load_dbghelp ok path='%s' elapsed_ms=%llu",
-		dbghelp_path_log.c_str(),
-		static_cast<unsigned long long>(GetTickCount64() - wait_start));
-	return true;
+
+	std::unique_lock<std::mutex> wait_lk(g_api_mutex);
+	const bool completed = g_dbghelp_load_cv.wait_for(wait_lk, std::chrono::milliseconds(k_dbghelp_load_watchdog_ms), [attempt]() {
+		return g_api.loaded || !g_dbghelp_load_state.in_progress || g_dbghelp_load_state.attempt != attempt;
+	});
+	const std::string state_text = dbghelp_load_state_text_locked(GetTickCount64());
+	if (g_api.loaded) {
+		set_last_error_text({});
+		diag::log_tagged_fmt("pdb",
+			"load_dbghelp_ok attempt=%llu caller_pid=%lu caller_tid=%lu completed=%d elapsed_ms=%llu state=\"%s\"",
+			static_cast<unsigned long long>(attempt),
+			pid,
+			tid,
+			completed ? 1 : 0,
+			static_cast<unsigned long long>(GetTickCount64() - wait_start),
+			state_text.c_str());
+		return true;
+	}
+
+	if (!completed && g_dbghelp_load_state.attempt == attempt && g_dbghelp_load_state.in_progress) {
+		const uint64_t owner_elapsed = GetTickCount64() - g_dbghelp_load_state.started_ms;
+		g_dbghelp_load_state.stuck = true;
+		g_dbghelp_load_state.phase = "LoadLibraryW_timeout";
+		char detail[512];
+		std::snprintf(detail, sizeof(detail),
+			"DbgHelp LoadLibraryW timed out after %llu ms; caller_pid=%lu caller_tid=%lu worker_pid=%lu worker_tid=%lu path=%s",
+			static_cast<unsigned long long>(owner_elapsed),
+			g_dbghelp_load_state.caller_pid,
+			g_dbghelp_load_state.caller_tid,
+			g_dbghelp_load_state.worker_pid,
+			g_dbghelp_load_state.worker_tid,
+			g_dbghelp_load_state.path.c_str());
+		g_dbghelp_load_state.terminal_detail = detail;
+		g_dbghelp_load_state.last_gle = WAIT_TIMEOUT;
+		set_last_error_text(detail);
+		diag::log_tagged_fmt("pdb",
+			"load_dbghelp_wait_timeout attempt=%llu caller_pid=%lu caller_tid=%lu timeout_ms=%llu state=\"%s\"",
+			static_cast<unsigned long long>(attempt),
+			pid,
+			tid,
+			static_cast<unsigned long long>(k_dbghelp_load_watchdog_ms),
+			dbghelp_load_state_text_locked(GetTickCount64()).c_str());
+		return false;
+	}
+
+	const std::string detail = g_dbghelp_load_state.terminal_detail.empty()
+		? dbghelp_load_state_text_locked(GetTickCount64())
+		: g_dbghelp_load_state.terminal_detail;
+	set_last_error_text(detail);
+	diag::log_tagged_fmt("pdb",
+		"load_dbghelp_failed attempt=%llu caller_pid=%lu caller_tid=%lu completed=%d elapsed_ms=%llu state=\"%s\"",
+		static_cast<unsigned long long>(attempt),
+		pid,
+		tid,
+		completed ? 1 : 0,
+		static_cast<unsigned long long>(GetTickCount64() - wait_start),
+		dbghelp_load_state_text_locked(GetTickCount64()).c_str());
+	return false;
 }
 
 namespace detail {
@@ -787,6 +1664,8 @@ inline bool parse_pdb(const std::string& pdb_path,
                       std::atomic<bool>* cancel = nullptr)
 {
 	uint64_t t_begin = GetTickCount64();
+	const uint64_t parse_generation = g_parse_generation.fetch_add(1, std::memory_order_acq_rel);
+	const DWORD pid = GetCurrentProcessId();
 	const DWORD tid = GetCurrentThreadId();
 	uint64_t pdb_bytes = 0;
 	{
@@ -795,21 +1674,33 @@ inline bool parse_pdb(const std::string& pdb_path,
 		if (!ec) pdb_bytes = static_cast<uint64_t>(sz);
 	}
 	diag::log_tagged_fmt("pdb",
-		"parse_pdb_entry tid=%lu path='%s' bytes=%llu search_len=%zu cancel_ptr=%p",
-		tid, pdb_path.c_str(), static_cast<unsigned long long>(pdb_bytes),
-		symbol_search_path.size(), static_cast<void*>(cancel));
+		"parse_pdb_entry generation=%llu pid=%lu tid=%lu worker_tid=%lu path='%s' bytes=%llu search_len=%zu cancel_ptr=%p loader_state=\"%s\"",
+		static_cast<unsigned long long>(parse_generation),
+		pid,
+		tid,
+		tid,
+		pdb_path.c_str(), static_cast<unsigned long long>(pdb_bytes),
+		symbol_search_path.size(), static_cast<void*>(cancel),
+		dbghelp_load_diagnostic().c_str());
 	set_last_error_text({});
 
 	if (!load_dbghelp()) {
 		const std::string detail = last_error();
 		diag::log_tagged_fmt("pdb",
-			"parse_pdb_failed reason='dbghelp_load' path='%s' detail='%s'",
-			pdb_path.c_str(), detail.c_str());
+			"parse_pdb_failed generation=%llu pid=%lu tid=%lu reason='dbghelp_load' path='%s' detail='%s' loader_state=\"%s\"",
+			static_cast<unsigned long long>(parse_generation),
+			pid,
+			tid,
+			pdb_path.c_str(),
+			detail.c_str(),
+			dbghelp_load_diagnostic().c_str());
+		set_last_error_text(detail);
 		return false;
 	}
 
 	uint64_t dbghelp_wait_start = GetTickCount64();
-	diag::log_tagged_fmt("pdb", "parse_pdb_dbghelp_mutex_wait tid=%lu path='%s'", tid, pdb_path.c_str());
+	diag::log_tagged_fmt("pdb", "parse_pdb_dbghelp_mutex_wait generation=%llu pid=%lu tid=%lu path='%s'",
+		static_cast<unsigned long long>(parse_generation), pid, tid, pdb_path.c_str());
 	std::unique_lock<std::mutex> dbghelp_lk(g_dbghelp_call_mutex, std::defer_lock);
 	while (!dbghelp_lk.try_lock()) {
 		const uint64_t waited = GetTickCount64() - dbghelp_wait_start;
@@ -820,7 +1711,9 @@ inline bool parse_pdb(const std::string& pdb_path,
 				pdb_path.c_str());
 			set_last_error_text(detail);
 			diag::log_tagged_fmt("pdb",
-				"parse_pdb_failed reason='dbghelp_mutex_timeout' tid=%lu wait_ms=%llu path='%s'",
+				"parse_pdb_failed generation=%llu reason='dbghelp_mutex_timeout' pid=%lu tid=%lu wait_ms=%llu path='%s'",
+				static_cast<unsigned long long>(parse_generation),
+				pid,
 				tid,
 				static_cast<unsigned long long>(waited),
 				pdb_path.c_str());
@@ -828,8 +1721,8 @@ inline bool parse_pdb(const std::string& pdb_path,
 		}
 		std::this_thread::sleep_for(std::chrono::milliseconds(25));
 	}
-	diag::log_tagged_fmt("pdb", "parse_pdb_dbghelp_mutex_acquired tid=%lu wait_ms=%llu path='%s'",
-		tid, static_cast<unsigned long long>(GetTickCount64() - dbghelp_wait_start), pdb_path.c_str());
+	diag::log_tagged_fmt("pdb", "parse_pdb_dbghelp_mutex_acquired generation=%llu pid=%lu tid=%lu wait_ms=%llu path='%s'",
+		static_cast<unsigned long long>(parse_generation), pid, tid, static_cast<unsigned long long>(GetTickCount64() - dbghelp_wait_start), pdb_path.c_str());
 
 	out = {};
 	out.file_path = pdb_path;
@@ -862,7 +1755,9 @@ inline bool parse_pdb(const std::string& pdb_path,
 	if (g_api.pSymSetOptions)
 		applied_opts = g_api.pSymSetOptions(opts);
 	diag::log_tagged_fmt("pdb",
-		"parse_pdb_SymSetOptions tid=%lu old=0x%08lX requested=0x%08lX applied=0x%08lX local_only=%d",
+		"parse_pdb_SymSetOptions generation=%llu pid=%lu tid=%lu old=0x%08lX requested=0x%08lX applied=0x%08lX local_only=%d",
+		static_cast<unsigned long long>(parse_generation),
+		pid,
 		tid,
 		old_opts,
 		opts,
@@ -871,13 +1766,15 @@ inline bool parse_pdb(const std::string& pdb_path,
 
 	std::wstring wSearchPath = detail::utf8_to_wstr(symbol_search_path);
 	uint64_t phase_start = GetTickCount64();
-	diag::log_tagged_fmt("pdb", "parse_pdb_SymInitialize_begin tid=%lu fake_proc=%p search_len=%zu",
-		tid, hFakeProc, wSearchPath.size());
+	diag::log_tagged_fmt("pdb", "parse_pdb_SymInitialize_begin generation=%llu pid=%lu tid=%lu fake_proc=%p search_len=%zu",
+		static_cast<unsigned long long>(parse_generation), pid, tid, hFakeProc, wSearchPath.size());
 	SetLastError(ERROR_SUCCESS);
 	BOOL init_ok = g_api.pSymInitializeW(hFakeProc, wSearchPath.empty() ? nullptr : wSearchPath.c_str(), FALSE);
 	DWORD init_err = GetLastError();
 	diag::log_tagged_fmt("pdb",
-		"parse_pdb_SymInitialize_end tid=%lu ok=%d fake_proc=%p gle=%lu elapsed_ms=%llu",
+		"parse_pdb_SymInitialize_end generation=%llu pid=%lu tid=%lu ok=%d fake_proc=%p gle=%lu elapsed_ms=%llu",
+		static_cast<unsigned long long>(parse_generation),
+		pid,
 		tid,
 		init_ok ? 1 : 0,
 		hFakeProc,
@@ -888,21 +1785,24 @@ inline bool parse_pdb(const std::string& pdb_path,
 		std::snprintf(detail, sizeof(detail), "SymInitializeW failed with Win32 error %lu for %s", init_err, pdb_path.c_str());
 		set_last_error_text(detail);
 		diag::log_tagged_fmt("pdb",
-			"parse_pdb_failed reason='SymInitializeW' path='%s' err=%lu",
-			pdb_path.c_str(), init_err);
+			"parse_pdb_failed generation=%llu reason='SymInitializeW' path='%s' err=%lu",
+			static_cast<unsigned long long>(parse_generation), pdb_path.c_str(), init_err);
 		return false;
 	}
-	diag::log_tagged_fmt("pdb", "parse_pdb_SymInitialize_ok tid=%lu fake_proc=%p", tid, hFakeProc);
+	diag::log_tagged_fmt("pdb", "parse_pdb_SymInitialize_ok generation=%llu pid=%lu tid=%lu fake_proc=%p",
+		static_cast<unsigned long long>(parse_generation), pid, tid, hFakeProc);
 
 	if (!wSearchPath.empty() && g_api.pSymSetSearchPathW) {
 		phase_start = GetTickCount64();
-		diag::log_tagged_fmt("pdb", "parse_pdb_SymSetSearchPath_begin tid=%lu search_len=%zu",
-			tid, wSearchPath.size());
+		diag::log_tagged_fmt("pdb", "parse_pdb_SymSetSearchPath_begin generation=%llu pid=%lu tid=%lu search_len=%zu",
+			static_cast<unsigned long long>(parse_generation), pid, tid, wSearchPath.size());
 		SetLastError(ERROR_SUCCESS);
 		BOOL search_ok = g_api.pSymSetSearchPathW(hFakeProc, wSearchPath.c_str());
 		DWORD search_gle = GetLastError();
 		diag::log_tagged_fmt("pdb",
-			"parse_pdb_SymSetSearchPath_end tid=%lu ok=%d gle=%lu elapsed_ms=%llu",
+			"parse_pdb_SymSetSearchPath_end generation=%llu pid=%lu tid=%lu ok=%d gle=%lu elapsed_ms=%llu",
+			static_cast<unsigned long long>(parse_generation),
+			pid,
 			tid,
 			search_ok ? 1 : 0,
 			search_gle,
@@ -911,12 +1811,15 @@ inline bool parse_pdb(const std::string& pdb_path,
 
 	std::wstring wPdbPath = detail::utf8_to_wstr(pdb_path);
 	phase_start = GetTickCount64();
-	diag::log_tagged_fmt("pdb", "parse_pdb_SymLoadModule_begin tid=%lu path='%s'", tid, pdb_path.c_str());
+	diag::log_tagged_fmt("pdb", "parse_pdb_SymLoadModule_begin generation=%llu pid=%lu tid=%lu path='%s'",
+		static_cast<unsigned long long>(parse_generation), pid, tid, pdb_path.c_str());
 	SetLastError(ERROR_SUCCESS);
 	DWORD64 modBase = g_api.pSymLoadModuleExW(hFakeProc, nullptr, wPdbPath.c_str(), nullptr,
 	                                           0x10000000, 0x01000000, nullptr, 0);
 	DWORD load_module_gle = GetLastError();
-	diag::log_tagged_fmt("pdb", "parse_pdb_SymLoadModule_end tid=%lu modBase=0x%llX gle=%lu elapsed_ms=%llu",
+	diag::log_tagged_fmt("pdb", "parse_pdb_SymLoadModule_end generation=%llu pid=%lu tid=%lu modBase=0x%llX gle=%lu elapsed_ms=%llu",
+		static_cast<unsigned long long>(parse_generation),
+		pid,
 		tid,
 		static_cast<unsigned long long>(modBase),
 		load_module_gle,
@@ -926,14 +1829,17 @@ inline bool parse_pdb(const std::string& pdb_path,
 		std::snprintf(detail, sizeof(detail), "SymLoadModuleExW failed with Win32 error %lu for %s", load_module_gle, pdb_path.c_str());
 		set_last_error_text(detail);
 		diag::log_tagged_fmt("pdb",
-			"parse_pdb_failed reason='SymLoadModuleExW' path='%s' err=%lu",
-			pdb_path.c_str(), load_module_gle);
+			"parse_pdb_failed generation=%llu reason='SymLoadModuleExW' path='%s' err=%lu",
+			static_cast<unsigned long long>(parse_generation), pdb_path.c_str(), load_module_gle);
 		phase_start = GetTickCount64();
-		diag::log_tagged_fmt("pdb", "parse_pdb_cleanup_after_load_failure_begin tid=%lu", tid);
+		diag::log_tagged_fmt("pdb", "parse_pdb_cleanup_after_load_failure_begin generation=%llu pid=%lu tid=%lu",
+			static_cast<unsigned long long>(parse_generation), pid, tid);
 		SetLastError(ERROR_SUCCESS);
 		g_api.pSymCleanup(hFakeProc);
 		diag::log_tagged_fmt("pdb",
-			"parse_pdb_cleanup_after_load_failure_end tid=%lu gle=%lu elapsed_ms=%llu",
+			"parse_pdb_cleanup_after_load_failure_end generation=%llu pid=%lu tid=%lu gle=%lu elapsed_ms=%llu",
+			static_cast<unsigned long long>(parse_generation),
+			pid,
 			tid,
 			GetLastError(),
 			static_cast<unsigned long long>(GetTickCount64() - phase_start));
@@ -941,7 +1847,10 @@ inline bool parse_pdb(const std::string& pdb_path,
 	}
 
 	diag::log_tagged_fmt("pdb",
-		"parse_pdb_begin path='%s' bytes=%llu module='%s'",
+		"parse_pdb_begin generation=%llu pid=%lu tid=%lu path='%s' bytes=%llu module='%s'",
+		static_cast<unsigned long long>(parse_generation),
+		pid,
+		tid,
 		pdb_path.c_str(),
 		static_cast<unsigned long long>(pdb_bytes),
 		stem.c_str());
@@ -954,12 +1863,14 @@ inline bool parse_pdb(const std::string& pdb_path,
 	symCtx.symbols = &out.symbols;
 
 	phase_start = GetTickCount64();
-	diag::log_tagged_fmt("pdb", "parse_pdb_SymEnumSymbols_begin tid=%lu modBase=0x%llX",
-		tid, static_cast<unsigned long long>(modBase));
+	diag::log_tagged_fmt("pdb", "parse_pdb_SymEnumSymbols_begin generation=%llu pid=%lu tid=%lu modBase=0x%llX",
+		static_cast<unsigned long long>(parse_generation), pid, tid, static_cast<unsigned long long>(modBase));
 	SetLastError(ERROR_SUCCESS);
 	BOOL enum_symbols_ok = g_api.pSymEnumSymbolsExW(hFakeProc, modBase, L"*", detail::sym_enum_callback, &symCtx, 0);
 	DWORD enum_symbols_gle = GetLastError();
-	diag::log_tagged_fmt("pdb", "parse_pdb_SymEnumSymbols_end tid=%lu ok=%d symbols=%zu gle=%lu elapsed_ms=%llu",
+	diag::log_tagged_fmt("pdb", "parse_pdb_SymEnumSymbols_end generation=%llu pid=%lu tid=%lu ok=%d symbols=%zu gle=%lu elapsed_ms=%llu",
+		static_cast<unsigned long long>(parse_generation),
+		pid,
 		tid,
 		enum_symbols_ok ? 1 : 0,
 		out.symbols.size(),
@@ -969,19 +1880,21 @@ inline bool parse_pdb(const std::string& pdb_path,
 	if (progress) progress->store(0.4f);
 	if (cancel && cancel->load()) {
 		phase_start = GetTickCount64();
-		diag::log_tagged_fmt("pdb", "parse_pdb_cancel_cleanup_begin tid=%lu modBase=0x%llX",
-			tid, static_cast<unsigned long long>(modBase));
+		diag::log_tagged_fmt("pdb", "parse_pdb_cancel_cleanup_begin generation=%llu pid=%lu tid=%lu modBase=0x%llX",
+			static_cast<unsigned long long>(parse_generation), pid, tid, static_cast<unsigned long long>(modBase));
 		SetLastError(ERROR_SUCCESS);
 		g_api.pSymUnloadModule64(hFakeProc, modBase);
 		g_api.pSymCleanup(hFakeProc);
-		diag::log_tagged_fmt("pdb", "parse_pdb_cancel_cleanup_end tid=%lu gle=%lu elapsed_ms=%llu",
+		diag::log_tagged_fmt("pdb", "parse_pdb_cancel_cleanup_end generation=%llu pid=%lu tid=%lu gle=%lu elapsed_ms=%llu",
+			static_cast<unsigned long long>(parse_generation),
+			pid,
 			tid,
 			GetLastError(),
 			static_cast<unsigned long long>(GetTickCount64() - phase_start));
 		set_last_error_text("PDB parse was cancelled by caller");
 		diag::log_tagged_fmt("pdb",
-			"parse_pdb_cancelled path='%s' syms=%zu",
-			pdb_path.c_str(), out.symbols.size());
+			"parse_pdb_cancelled generation=%llu path='%s' syms=%zu",
+			static_cast<unsigned long long>(parse_generation), pdb_path.c_str(), out.symbols.size());
 		return false;
 	}
 
@@ -998,12 +1911,14 @@ inline bool parse_pdb(const std::string& pdb_path,
 
 	if (g_api.pSymEnumTypesW) {
 		phase_start = GetTickCount64();
-		diag::log_tagged_fmt("pdb", "parse_pdb_SymEnumTypes_begin tid=%lu modBase=0x%llX",
-			tid, static_cast<unsigned long long>(modBase));
+		diag::log_tagged_fmt("pdb", "parse_pdb_SymEnumTypes_begin generation=%llu pid=%lu tid=%lu modBase=0x%llX",
+			static_cast<unsigned long long>(parse_generation), pid, tid, static_cast<unsigned long long>(modBase));
 		SetLastError(ERROR_SUCCESS);
 		BOOL enum_types_ok = g_api.pSymEnumTypesW(hFakeProc, modBase, detail::type_enum_callback, &typeCtx);
 		DWORD enum_types_gle = GetLastError();
-		diag::log_tagged_fmt("pdb", "parse_pdb_SymEnumTypes_end tid=%lu ok=%d udt=%zu enums=%zu gle=%lu elapsed_ms=%llu",
+		diag::log_tagged_fmt("pdb", "parse_pdb_SymEnumTypes_end generation=%llu pid=%lu tid=%lu ok=%d udt=%zu enums=%zu gle=%lu elapsed_ms=%llu",
+			static_cast<unsigned long long>(parse_generation),
+			pid,
 			tid,
 			enum_types_ok ? 1 : 0,
 			typeCtx.udt_indices.size(),
@@ -1011,7 +1926,8 @@ inline bool parse_pdb(const std::string& pdb_path,
 			enum_types_gle,
 			static_cast<unsigned long long>(GetTickCount64() - phase_start));
 	} else {
-		diag::log_tagged_fmt("pdb", "parse_pdb_SymEnumTypes_missing tid=%lu", tid);
+		diag::log_tagged_fmt("pdb", "parse_pdb_SymEnumTypes_missing generation=%llu pid=%lu tid=%lu",
+			static_cast<unsigned long long>(parse_generation), pid, tid);
 	}
 
 	if (progress) progress->store(0.6f);
@@ -1020,7 +1936,8 @@ inline bool parse_pdb(const std::string& pdb_path,
 	size_t processed = 0;
 
 	phase_start = GetTickCount64();
-	diag::log_tagged_fmt("pdb", "parse_pdb_import_udt_begin tid=%lu total=%zu", tid, typeCtx.udt_indices.size());
+	diag::log_tagged_fmt("pdb", "parse_pdb_import_udt_begin generation=%llu pid=%lu tid=%lu total=%zu",
+		static_cast<unsigned long long>(parse_generation), pid, tid, typeCtx.udt_indices.size());
 	for (ULONG ti : typeCtx.udt_indices) {
 		if (cancel && cancel->load()) break;
 
@@ -1053,14 +1970,17 @@ inline bool parse_pdb(const std::string& pdb_path,
 		if (progress && total_types > 0)
 			progress->store(0.6f + 0.35f * (static_cast<float>(processed) / static_cast<float>(total_types)));
 	}
-	diag::log_tagged_fmt("pdb", "parse_pdb_import_udt_end tid=%lu structs=%zu processed=%zu elapsed_ms=%llu",
+	diag::log_tagged_fmt("pdb", "parse_pdb_import_udt_end generation=%llu pid=%lu tid=%lu structs=%zu processed=%zu elapsed_ms=%llu",
+		static_cast<unsigned long long>(parse_generation),
+		pid,
 		tid,
 		out.structs.size(),
 		processed,
 		static_cast<unsigned long long>(GetTickCount64() - phase_start));
 
 	phase_start = GetTickCount64();
-	diag::log_tagged_fmt("pdb", "parse_pdb_import_enum_begin tid=%lu total=%zu", tid, typeCtx.enum_indices.size());
+	diag::log_tagged_fmt("pdb", "parse_pdb_import_enum_begin generation=%llu pid=%lu tid=%lu total=%zu",
+		static_cast<unsigned long long>(parse_generation), pid, tid, typeCtx.enum_indices.size());
 	for (ULONG ti : typeCtx.enum_indices) {
 		if (cancel && cancel->load()) break;
 
@@ -1080,18 +2000,23 @@ inline bool parse_pdb(const std::string& pdb_path,
 		if (progress && total_types > 0)
 			progress->store(0.6f + 0.35f * (static_cast<float>(processed) / static_cast<float>(total_types)));
 	}
-	diag::log_tagged_fmt("pdb", "parse_pdb_import_enum_end tid=%lu enums=%zu processed=%zu elapsed_ms=%llu",
+	diag::log_tagged_fmt("pdb", "parse_pdb_import_enum_end generation=%llu pid=%lu tid=%lu enums=%zu processed=%zu elapsed_ms=%llu",
+		static_cast<unsigned long long>(parse_generation),
+		pid,
 		tid,
 		out.enums.size(),
 		processed,
 		static_cast<unsigned long long>(GetTickCount64() - phase_start));
 
 	phase_start = GetTickCount64();
-	diag::log_tagged_fmt("pdb", "parse_pdb_cleanup_begin tid=%lu modBase=0x%llX", tid, static_cast<unsigned long long>(modBase));
+	diag::log_tagged_fmt("pdb", "parse_pdb_cleanup_begin generation=%llu pid=%lu tid=%lu modBase=0x%llX",
+		static_cast<unsigned long long>(parse_generation), pid, tid, static_cast<unsigned long long>(modBase));
 	SetLastError(ERROR_SUCCESS);
 	BOOL unload_ok = g_api.pSymUnloadModule64(hFakeProc, modBase);
 	DWORD unload_gle = GetLastError();
-	diag::log_tagged_fmt("pdb", "parse_pdb_SymUnloadModule_end tid=%lu ok=%d gle=%lu elapsed_ms=%llu",
+	diag::log_tagged_fmt("pdb", "parse_pdb_SymUnloadModule_end generation=%llu pid=%lu tid=%lu ok=%d gle=%lu elapsed_ms=%llu",
+		static_cast<unsigned long long>(parse_generation),
+		pid,
 		tid,
 		unload_ok ? 1 : 0,
 		unload_gle,
@@ -1100,7 +2025,9 @@ inline bool parse_pdb(const std::string& pdb_path,
 	SetLastError(ERROR_SUCCESS);
 	BOOL cleanup_ok = g_api.pSymCleanup(hFakeProc);
 	DWORD cleanup_gle = GetLastError();
-	diag::log_tagged_fmt("pdb", "parse_pdb_cleanup_end tid=%lu ok=%d gle=%lu elapsed_ms=%llu",
+	diag::log_tagged_fmt("pdb", "parse_pdb_cleanup_end generation=%llu pid=%lu tid=%lu ok=%d gle=%lu elapsed_ms=%llu",
+		static_cast<unsigned long long>(parse_generation),
+		pid,
 		tid,
 		cleanup_ok ? 1 : 0,
 		cleanup_gle,
@@ -1113,16 +2040,22 @@ inline bool parse_pdb(const std::string& pdb_path,
 	uint64_t elapsed_ms = GetTickCount64() - t_begin;
 	bool cancelled = (cancel && cancel->load());
 	diag::log_tagged_fmt("pdb",
-		"parse_pdb_done path='%s' bytes=%llu syms=%zu structs=%zu enums=%zu udt=%zu enum_total=%zu cancelled=%d elapsed_ms=%llu",
+		"parse_pdb_done generation=%llu pid=%lu tid=%lu path='%s' bytes=%llu syms=%zu structs=%zu enums=%zu types=%zu udt=%zu enum_total=%zu loaded=%d cancelled=%d elapsed_ms=%llu loader_state=\"%s\"",
+		static_cast<unsigned long long>(parse_generation),
+		pid,
+		tid,
 		pdb_path.c_str(),
 		static_cast<unsigned long long>(pdb_bytes),
 		out.symbols.size(),
 		out.structs.size(),
 		out.enums.size(),
+		out.structs.size() + out.enums.size(),
 		typeCtx.udt_indices.size(),
 		typeCtx.enum_indices.size(),
+		out.loaded ? 1 : 0,
 		cancelled ? 1 : 0,
-		static_cast<unsigned long long>(elapsed_ms));
+		static_cast<unsigned long long>(elapsed_ms),
+		dbghelp_load_diagnostic().c_str());
 
 	return true;
 }

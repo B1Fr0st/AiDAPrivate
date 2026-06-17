@@ -8455,9 +8455,10 @@ namespace
                     cached_nonce == settings->license_server_nonce) {
                     lic_log_fmt("srv_refresh_full_test_cached_proof age_ms=%llu",
                         static_cast<unsigned long long>(cached_age_ms));
-                    continue;
                 }
-                lic_log("srv_refresh_full_test_running_cache_miss");
+                else {
+                    lic_log("srv_refresh_full_test_running_cache_miss");
+                }
             }
 
             const bool driver_loaded = driver_bridge::is_loaded();

@@ -7,10 +7,12 @@
 #include <WS2tcpip.h>
 
 #include <atomic>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <memory>
 #include <new>
 #include <string>
@@ -55,6 +57,27 @@ struct socket_pair_t {
 using socket_pair_ptr = std::shared_ptr<socket_pair_t>;
 
 volatile LONG g_stop = 0;
+ULONGLONG g_started_ms = 0;
+
+ULONGLONG elapsed_ms() {
+    const ULONGLONG now = GetTickCount64();
+    return g_started_ms == 0 ? 0 : now - g_started_ms;
+}
+
+void log_phase_fmt(const char* phase, const char* fmt, ...) {
+    std::printf("[sidecar] phase=%s pid=%lu tid=%lu elapsed_ms=%llu ",
+        phase ? phase : "",
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        static_cast<unsigned long>(GetCurrentThreadId()),
+        static_cast<unsigned long long>(elapsed_ms()));
+    va_list args;
+    va_start(args, fmt);
+    if (fmt)
+        std::vprintf(fmt, args);
+    va_end(args);
+    std::printf("\n");
+    std::fflush(stdout);
+}
 
 std::wstring widen(const char* s) {
     if (!s || !*s)
@@ -91,6 +114,13 @@ std::wstring event_name(const config_t& cfg, const wchar_t* suffix) {
 void log_line(const char* tag, const char* msg) {
     std::printf("[%s] %s\n", tag, msg);
     std::fflush(stdout);
+}
+
+void log_process_args(int argc, char** argv) {
+    const char* cmd = GetCommandLineA();
+    log_phase_fmt("process_entry", "argc=%d command_line=%s", argc, cmd ? cmd : "");
+    for (int i = 0; i < argc; ++i)
+        log_phase_fmt("arg", "index=%d value=%s", i, argv && argv[i] ? argv[i] : "");
 }
 
 void print_usage() {
@@ -175,13 +205,33 @@ bool create_events(const config_t& cfg, handles_t& h) {
     const std::wstring ready = event_name(cfg, L"Ready");
     const std::wstring go = event_name(cfg, L"Go");
     const std::wstring done = event_name(cfg, L"Done");
+    log_phase_fmt("events_create_begin", "ready=%s go=%s done=%s",
+        narrow(ready).c_str(),
+        narrow(go).c_str(),
+        narrow(done).c_str());
+    SetLastError(ERROR_SUCCESS);
     h.ready = CreateEventW(nullptr, TRUE, FALSE, ready.c_str());
+    const DWORD ready_err = h.ready ? ERROR_SUCCESS : GetLastError();
+    SetLastError(ERROR_SUCCESS);
     h.go = CreateEventW(nullptr, TRUE, FALSE, go.c_str());
+    const DWORD go_err = h.go ? ERROR_SUCCESS : GetLastError();
+    SetLastError(ERROR_SUCCESS);
     h.done = CreateEventW(nullptr, TRUE, FALSE, done.c_str());
-    if (h.ready)
-        ResetEvent(h.ready);
-    if (h.done)
-        ResetEvent(h.done);
+    const DWORD done_err = h.done ? ERROR_SUCCESS : GetLastError();
+    BOOL reset_ready = FALSE;
+    DWORD reset_ready_err = ERROR_SUCCESS;
+    BOOL reset_done = FALSE;
+    DWORD reset_done_err = ERROR_SUCCESS;
+    if (h.ready) {
+        SetLastError(ERROR_SUCCESS);
+        reset_ready = ResetEvent(h.ready);
+        reset_ready_err = reset_ready ? ERROR_SUCCESS : GetLastError();
+    }
+    if (h.done) {
+        SetLastError(ERROR_SUCCESS);
+        reset_done = ResetEvent(h.done);
+        reset_done_err = reset_done ? ERROR_SUCCESS : GetLastError();
+    }
     std::printf("[sync] ready=%s go=%s done=%s handles=%p/%p/%p\n",
         narrow(ready).c_str(),
         narrow(go).c_str(),
@@ -190,6 +240,18 @@ bool create_events(const config_t& cfg, handles_t& h) {
         h.go,
         h.done);
     std::fflush(stdout);
+    log_phase_fmt("events_create_end",
+        "ready_handle=%p ready_err=%lu go_handle=%p go_err=%lu done_handle=%p done_err=%lu reset_ready=%d reset_ready_err=%lu reset_done=%d reset_done_err=%lu",
+        h.ready,
+        static_cast<unsigned long>(ready_err),
+        h.go,
+        static_cast<unsigned long>(go_err),
+        h.done,
+        static_cast<unsigned long>(done_err),
+        reset_ready ? 1 : 0,
+        static_cast<unsigned long>(reset_ready_err),
+        reset_done ? 1 : 0,
+        static_cast<unsigned long>(reset_done_err));
     return h.ready && h.go && h.done;
 }
 
@@ -212,12 +274,15 @@ void close_socket_slot(std::atomic<SOCKET>& slot) {
 }
 
 DWORD WINAPI accept_thread_proc(void* p) {
+    log_phase_fmt("accept_thread_enter", "state_ptr=%p", p);
     std::unique_ptr<socket_pair_ptr> owner(static_cast<socket_pair_ptr*>(p));
     socket_pair_ptr pair;
     if (owner)
         pair = std::move(*owner);
-    if (!pair)
+    if (!pair) {
+        log_phase_fmt("accept_thread_exit", "exit_code=1 reason=no_pair");
         return 1;
+    }
     const SOCKET listener = pair->listener.load(std::memory_order_acquire);
     SOCKET accepted = INVALID_SOCKET;
     if (listener != INVALID_SOCKET)
@@ -230,30 +295,57 @@ DWORD WINAPI accept_thread_proc(void* p) {
             err,
             pair->stop.load(std::memory_order_acquire) ? 1 : 0);
         std::fflush(stdout);
+        log_phase_fmt("accept_thread_exit", "exit_code=1 listener=0x%llX accepted=0x%llX err=%d stop=%d",
+            static_cast<unsigned long long>(listener),
+            static_cast<unsigned long long>(accepted),
+            err,
+            pair->stop.load(std::memory_order_acquire) ? 1 : 0);
         return 1;
     }
+    log_phase_fmt("accept_thread_accepted", "listener=0x%llX accepted=0x%llX",
+        static_cast<unsigned long long>(listener),
+        static_cast<unsigned long long>(accepted));
     char buf[512];
+    unsigned long long recv_calls = 0;
+    unsigned long long recv_bytes = 0;
+    int last_recv_error = 0;
     while (!pair->stop.load(std::memory_order_acquire)) {
         const int n = recv(accepted, buf, static_cast<int>(sizeof(buf)), 0);
-        if (n == 0)
+        if (n == 0) {
+            last_recv_error = 0;
             break;
+        }
         if (n == SOCKET_ERROR) {
             const int e = WSAGetLastError();
+            last_recv_error = e;
             if (e == WSAEINTR || e == WSAEWOULDBLOCK)
                 continue;
             break;
         }
+        ++recv_calls;
+        recv_bytes += static_cast<unsigned long long>(n);
     }
     close_socket_slot(pair->accepted);
     pair->accept_exited.store(true, std::memory_order_release);
+    log_phase_fmt("accept_thread_exit", "exit_code=0 recv_calls=%llu recv_bytes=%llu last_recv_error=%d stop=%d",
+        recv_calls,
+        recv_bytes,
+        last_recv_error,
+        pair->stop.load(std::memory_order_acquire) ? 1 : 0);
     return 0;
 }
 
 bool setup_loopback(const socket_pair_ptr& pair) {
     if (!pair)
         return false;
+    log_phase_fmt("socket_setup_begin", "pair=%p", pair.get());
+    SetLastError(ERROR_SUCCESS);
     SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    int wsa_err = listener == INVALID_SOCKET ? WSAGetLastError() : 0;
     pair->listener.store(listener, std::memory_order_release);
+    log_phase_fmt("socket_listener", "socket=0x%llX err=%d",
+        static_cast<unsigned long long>(listener),
+        wsa_err);
     if (listener == INVALID_SOCKET)
         return false;
 
@@ -261,30 +353,70 @@ bool setup_loopback(const socket_pair_ptr& pair) {
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = 0;
-    if (bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR)
+    const int bind_rc = bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    wsa_err = bind_rc == SOCKET_ERROR ? WSAGetLastError() : 0;
+    log_phase_fmt("socket_bind", "socket=0x%llX rc=%d err=%d",
+        static_cast<unsigned long long>(listener),
+        bind_rc,
+        wsa_err);
+    if (bind_rc == SOCKET_ERROR)
         return false;
-    if (listen(listener, 1) == SOCKET_ERROR)
+    const int listen_rc = listen(listener, 1);
+    wsa_err = listen_rc == SOCKET_ERROR ? WSAGetLastError() : 0;
+    log_phase_fmt("socket_listen", "socket=0x%llX rc=%d err=%d backlog=1",
+        static_cast<unsigned long long>(listener),
+        listen_rc,
+        wsa_err);
+    if (listen_rc == SOCKET_ERROR)
         return false;
 
     int len = sizeof(addr);
-    if (getsockname(listener, reinterpret_cast<sockaddr*>(&addr), &len) == SOCKET_ERROR)
+    const int name_rc = getsockname(listener, reinterpret_cast<sockaddr*>(&addr), &len);
+    wsa_err = name_rc == SOCKET_ERROR ? WSAGetLastError() : 0;
+    log_phase_fmt("socket_getsockname_listener", "socket=0x%llX rc=%d err=%d port=%u",
+        static_cast<unsigned long long>(listener),
+        name_rc,
+        wsa_err,
+        name_rc == SOCKET_ERROR ? 0u : static_cast<unsigned>(ntohs(addr.sin_port)));
+    if (name_rc == SOCKET_ERROR)
         return false;
     pair->port = ntohs(addr.sin_port);
     auto* thread_state = new (std::nothrow) socket_pair_ptr(pair);
     if (!thread_state)
         return false;
+    SetLastError(ERROR_SUCCESS);
     pair->accept_thread = CreateThread(nullptr, 0, accept_thread_proc, thread_state, 0, nullptr);
+    const DWORD thread_err = pair->accept_thread ? ERROR_SUCCESS : GetLastError();
+    log_phase_fmt("socket_accept_thread", "handle=%p err=%lu",
+        pair->accept_thread,
+        static_cast<unsigned long>(thread_err));
     if (!pair->accept_thread) {
         delete thread_state;
         return false;
     }
 
     SOCKET client = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    wsa_err = client == INVALID_SOCKET ? WSAGetLastError() : 0;
     pair->client.store(client, std::memory_order_release);
+    log_phase_fmt("socket_client", "socket=0x%llX err=%d",
+        static_cast<unsigned long long>(client),
+        wsa_err);
     if (client == INVALID_SOCKET)
         return false;
-    if (connect(client, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR)
+    const int connect_rc = connect(client, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    wsa_err = connect_rc == SOCKET_ERROR ? WSAGetLastError() : 0;
+    log_phase_fmt("socket_connect", "socket=0x%llX rc=%d err=%d port=%u",
+        static_cast<unsigned long long>(client),
+        connect_rc,
+        wsa_err,
+        static_cast<unsigned>(pair->port));
+    if (connect_rc == SOCKET_ERROR)
         return false;
+    log_phase_fmt("socket_setup_end", "listener=0x%llX client=0x%llX accepted=0x%llX port=%u",
+        static_cast<unsigned long long>(pair->listener.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(pair->client.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(pair->accepted.load(std::memory_order_acquire)),
+        static_cast<unsigned>(pair->port));
     return true;
 }
 
@@ -332,16 +464,40 @@ void mutate_guard_region(std::uint8_t* region, int iteration) {
 }
 
 bool emit_send_payloads(SOCKET s, int iteration) {
+    log_phase_fmt("network_send_begin", "iteration=%d socket=0x%llX",
+        iteration,
+        static_cast<unsigned long long>(s));
     char send_payload[160]{};
     const int send_len = std::snprintf(send_payload, sizeof(send_payload),
         "AIDA_PRE_ENCRYPT_SEND iteration=%03d pid=%lu\r\n",
         iteration,
         static_cast<unsigned long>(GetCurrentProcessId()));
-    if (send_len <= 0)
+    if (send_len <= 0) {
+        log_phase_fmt("network_send_end", "iteration=%d socket=0x%llX send_len=%d sent=%d err=%d wsasend_rc=%d wsasend_err=%d bytes=%lu ok=0",
+            iteration,
+            static_cast<unsigned long long>(s),
+            send_len,
+            0,
+            WSAEINVAL,
+            0,
+            WSAEINVAL,
+            0ul);
         return false;
+    }
     const int sent = send(s, send_payload, send_len, 0);
-    if (sent == SOCKET_ERROR)
+    const int send_err = sent == SOCKET_ERROR ? WSAGetLastError() : 0;
+    if (sent == SOCKET_ERROR) {
+        log_phase_fmt("network_send_end", "iteration=%d socket=0x%llX send_len=%d sent=%d err=%d wsasend_rc=%d wsasend_err=%d bytes=%lu ok=0",
+            iteration,
+            static_cast<unsigned long long>(s),
+            send_len,
+            sent,
+            send_err,
+            0,
+            0,
+            0ul);
         return false;
+    }
 
     char wsa_payload_a[96]{};
     char wsa_payload_b[96]{};
@@ -350,15 +506,42 @@ bool emit_send_payloads(SOCKET s, int iteration) {
     const int len_b = std::snprintf(wsa_payload_b, sizeof(wsa_payload_b),
         "AIDA_PRE_ENCRYPT_WSASEND_B pid=%lu\r\n",
         static_cast<unsigned long>(GetCurrentProcessId()));
-    if (len_a <= 0 || len_b <= 0)
+    if (len_a <= 0 || len_b <= 0) {
+        log_phase_fmt("network_send_end", "iteration=%d socket=0x%llX send_len=%d sent=%d err=%d wsasend_len_a=%d wsasend_len_b=%d wsasend_rc=%d wsasend_err=%d bytes=%lu ok=0",
+            iteration,
+            static_cast<unsigned long long>(s),
+            send_len,
+            sent,
+            send_err,
+            len_a,
+            len_b,
+            0,
+            WSAEINVAL,
+            0ul);
         return false;
+    }
     WSABUF bufs[2]{};
     bufs[0].buf = wsa_payload_a;
     bufs[0].len = static_cast<ULONG>(len_a);
     bufs[1].buf = wsa_payload_b;
     bufs[1].len = static_cast<ULONG>(len_b);
     DWORD bytes = 0;
-    return WSASend(s, bufs, 2, &bytes, 0, nullptr, nullptr) != SOCKET_ERROR;
+    const int wsa_send_rc = WSASend(s, bufs, 2, &bytes, 0, nullptr, nullptr);
+    const int wsa_send_err = wsa_send_rc == SOCKET_ERROR ? WSAGetLastError() : 0;
+    const bool ok = wsa_send_rc != SOCKET_ERROR;
+    log_phase_fmt("network_send_end", "iteration=%d socket=0x%llX send_len=%d sent=%d err=%d wsasend_len_a=%d wsasend_len_b=%d wsasend_rc=%d wsasend_err=%d bytes=%lu ok=%d",
+        iteration,
+        static_cast<unsigned long long>(s),
+        send_len,
+        sent,
+        send_err,
+        len_a,
+        len_b,
+        wsa_send_rc,
+        wsa_send_err,
+        static_cast<unsigned long>(bytes),
+        ok ? 1 : 0);
+    return ok;
 }
 
 const char* build_mode() {
@@ -371,14 +554,45 @@ const char* build_mode() {
 
 int run_sidecar(const config_t& cfg) {
     SetConsoleCtrlHandler(ctrl_handler, TRUE);
+    log_phase_fmt("run_entry", "build_mode=%s requested_mode=%s no_wait=%d iterations=%d interval_ms=%lu wait_ms=%lu event_prefix=%s",
+        build_mode(),
+        cfg.requested_mode.empty() ? "default" : cfg.requested_mode.c_str(),
+        cfg.no_wait ? 1 : 0,
+        cfg.iterations,
+        static_cast<unsigned long>(cfg.interval_ms),
+        static_cast<unsigned long>(cfg.wait_ms),
+        narrow(cfg.event_prefix).c_str());
 
     WSADATA wsa{};
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+    const int wsa_rc = WSAStartup(MAKEWORD(2, 2), &wsa);
+    log_phase_fmt("wsa_startup", "rc=%d version=0x%04X high_version=0x%04X description=%s status=%s",
+        wsa_rc,
+        static_cast<unsigned>(wsa.wVersion),
+        static_cast<unsigned>(wsa.wHighVersion),
+        wsa.szDescription,
+        wsa.szSystemStatus);
+    if (wsa_rc != 0) {
         log_line("error", "WSAStartup failed");
         return 10;
     }
 
+    SetLastError(ERROR_SUCCESS);
     auto* region = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, k_guard_region_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    const DWORD alloc_err = region ? ERROR_SUCCESS : GetLastError();
+    MEMORY_BASIC_INFORMATION mbi{};
+    SIZE_T mbi_size = 0;
+    if (region)
+        mbi_size = VirtualQuery(region, &mbi, sizeof(mbi));
+    log_phase_fmt("guard_alloc", "va=0x%llX size=%llu err=%lu query_size=%llu alloc_base=0x%llX region_size=%llu state=0x%lX protect=0x%lX type=0x%lX",
+        static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(region)),
+        static_cast<unsigned long long>(k_guard_region_size),
+        static_cast<unsigned long>(alloc_err),
+        static_cast<unsigned long long>(mbi_size),
+        static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(mbi.AllocationBase)),
+        static_cast<unsigned long long>(mbi.RegionSize),
+        static_cast<unsigned long>(mbi.State),
+        static_cast<unsigned long>(mbi.Protect),
+        static_cast<unsigned long>(mbi.Type));
     if (!region) {
         WSACleanup();
         log_line("error", "VirtualAlloc failed");
@@ -390,6 +604,11 @@ int run_sidecar(const config_t& cfg) {
 
     auto sockets = std::make_shared<socket_pair_t>();
     if (!setup_loopback(sockets)) {
+        log_phase_fmt("socket_setup_failed", "last_wsa_error=%d listener=0x%llX client=0x%llX accepted=0x%llX",
+            WSAGetLastError(),
+            static_cast<unsigned long long>(sockets ? sockets->listener.load(std::memory_order_acquire) : INVALID_SOCKET),
+            static_cast<unsigned long long>(sockets ? sockets->client.load(std::memory_order_acquire) : INVALID_SOCKET),
+            static_cast<unsigned long long>(sockets ? sockets->accepted.load(std::memory_order_acquire) : INVALID_SOCKET));
         close_socket_pair(sockets);
         VirtualFree(region, 0, MEM_RELEASE);
         WSACleanup();
@@ -399,6 +618,11 @@ int run_sidecar(const config_t& cfg) {
 
     handles_t events{};
     if (!create_events(cfg, events)) {
+        log_phase_fmt("events_create_failed", "ready=%p go=%p done=%p gle=%lu",
+            events.ready,
+            events.go,
+            events.done,
+            static_cast<unsigned long>(GetLastError()));
         close_socket_pair(sockets);
         VirtualFree(region, 0, MEM_RELEASE);
         WSACleanup();
@@ -425,17 +649,68 @@ int run_sidecar(const config_t& cfg) {
         static_cast<unsigned>(sockets->port));
     std::fflush(stdout);
 
-    SetEvent(events.ready);
+    SetLastError(ERROR_SUCCESS);
+    const BOOL ready_set = SetEvent(events.ready);
+    const DWORD ready_set_err = ready_set ? ERROR_SUCCESS : GetLastError();
+    log_phase_fmt("ready_setevent", "handle=%p result=%d err=%lu",
+        events.ready,
+        ready_set ? 1 : 0,
+        static_cast<unsigned long>(ready_set_err));
     log_line("sync", "ready signaled");
 
     if (!cfg.no_wait) {
         const DWORD timeout = cfg.wait_ms == 0 ? INFINITE : cfg.wait_ms;
-        const DWORD wr = WaitForSingleObject(events.go, timeout);
+        log_phase_fmt("go_wait_begin", "handle=%p timeout_ms=%lu",
+            events.go,
+            static_cast<unsigned long>(timeout));
+        const ULONGLONG wait_start = GetTickCount64();
+        ULONGLONG next_progress = wait_start + 1000;
+        DWORD wr = WAIT_TIMEOUT;
+        for (;;) {
+            DWORD slice = 250;
+            if (timeout != INFINITE) {
+                const ULONGLONG now = GetTickCount64();
+                const ULONGLONG elapsed = now - wait_start;
+                if (elapsed >= timeout) {
+                    wr = WAIT_TIMEOUT;
+                    break;
+                }
+                const ULONGLONG remaining = timeout - elapsed;
+                if (remaining < slice)
+                    slice = static_cast<DWORD>(remaining);
+            }
+            wr = WaitForSingleObject(events.go, slice);
+            if (wr != WAIT_TIMEOUT)
+                break;
+            const ULONGLONG now = GetTickCount64();
+            if (now >= next_progress) {
+                const DWORD instant = WaitForSingleObject(events.go, 0);
+                log_phase_fmt("go_wait_progress", "handle=%p elapsed_ms=%llu timeout_ms=%lu instant=0x%08lX stop=%ld",
+                    events.go,
+                    static_cast<unsigned long long>(now - wait_start),
+                    static_cast<unsigned long>(timeout),
+                    static_cast<unsigned long>(instant),
+                    static_cast<long>(InterlockedCompareExchange(&g_stop, 0, 0)));
+                next_progress = now + 1000;
+            }
+        }
+        const DWORD wait_err = wr == WAIT_FAILED ? GetLastError() : ERROR_SUCCESS;
+        log_phase_fmt("go_wait_end", "handle=%p result=0x%08lX err=%lu elapsed_ms=%llu",
+            events.go,
+            static_cast<unsigned long>(wr),
+            static_cast<unsigned long>(wait_err),
+            static_cast<unsigned long long>(GetTickCount64() - wait_start));
         if (wr != WAIT_OBJECT_0) {
             std::printf("[sync] go wait failed result=0x%08lX err=%lu\n",
                 static_cast<unsigned long>(wr),
-                static_cast<unsigned long>(GetLastError()));
-            SetEvent(events.done);
+                static_cast<unsigned long>(wait_err));
+            SetLastError(ERROR_SUCCESS);
+            const BOOL done_set = SetEvent(events.done);
+            const DWORD done_set_err = done_set ? ERROR_SUCCESS : GetLastError();
+            log_phase_fmt("done_setevent", "handle=%p result=%d err=%lu reason=go_wait_failed",
+                events.done,
+                done_set ? 1 : 0,
+                static_cast<unsigned long>(done_set_err));
             close_events(events);
             close_socket_pair(sockets);
             VirtualFree(region, 0, MEM_RELEASE);
@@ -463,7 +738,13 @@ int run_sidecar(const config_t& cfg) {
 
     std::printf("[sidecar] complete iterations=%d network_failures=%d\n", cfg.iterations, network_failures);
     std::fflush(stdout);
-    SetEvent(events.done);
+    SetLastError(ERROR_SUCCESS);
+    const BOOL done_set = SetEvent(events.done);
+    const DWORD done_set_err = done_set ? ERROR_SUCCESS : GetLastError();
+    log_phase_fmt("done_setevent", "handle=%p result=%d err=%lu reason=complete",
+        events.done,
+        done_set ? 1 : 0,
+        static_cast<unsigned long>(done_set_err));
     close_events(events);
     close_socket_pair(sockets);
     VirtualFree(region, 0, MEM_RELEASE);
@@ -471,9 +752,44 @@ int run_sidecar(const config_t& cfg) {
     return network_failures == 0 ? 0 : 20;
 }
 
+int run_sidecar_guarded(const config_t& cfg) {
+    int rc = 255;
+    __try {
+        rc = run_sidecar(cfg);
+        log_phase_fmt("run_exit", "exit_code=%d", rc);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        const DWORD code = GetExceptionCode();
+        log_phase_fmt("seh_exception", "code=0x%08lX exit_code=%d", static_cast<unsigned long>(code), 221);
+        rc = 221;
+    }
+    return rc;
+}
+
 }
 
 int main(int argc, char** argv) {
-    config_t cfg = parse_args(argc, argv);
-    return run_sidecar(cfg);
+    g_started_ms = GetTickCount64();
+    log_process_args(argc, argv);
+    try {
+        config_t cfg = parse_args(argc, argv);
+        log_phase_fmt("args_parsed", "build_mode=%s requested_mode=%s no_wait=%d iterations=%d interval_ms=%lu wait_ms=%lu event_prefix=%s",
+            build_mode(),
+            cfg.requested_mode.empty() ? "default" : cfg.requested_mode.c_str(),
+            cfg.no_wait ? 1 : 0,
+            cfg.iterations,
+            static_cast<unsigned long>(cfg.interval_ms),
+            static_cast<unsigned long>(cfg.wait_ms),
+            narrow(cfg.event_prefix).c_str());
+        const int rc = run_sidecar_guarded(cfg);
+        log_phase_fmt("process_exit", "exit_code=%d", rc);
+        return rc;
+    } catch (const std::exception& ex) {
+        log_phase_fmt("cpp_exception", "what=%s exit_code=%d", ex.what(), 222);
+        log_phase_fmt("process_exit", "exit_code=%d", 222);
+        return 222;
+    } catch (...) {
+        log_phase_fmt("cpp_exception", "what=unknown exit_code=%d", 223);
+        log_phase_fmt("process_exit", "exit_code=%d", 223);
+        return 223;
+    }
 }

@@ -130,6 +130,7 @@ constexpr DWORD kPythonInstallerDownloadDeadlineMs = 180000;
 constexpr DWORD kPythonRuntimeInstallTimeoutMs = 300000;
 constexpr wchar_t kCamoufoxBrowserDirName[] = L"camoufox-135.0.1-beta.24-win.x86_64";
 constexpr char kReverseMcpPackageSpec[] = "camoufox-reverse-mcp";
+constexpr char kReverseMcpInitiatorContractV2[] = "aida_initiator_contract_v2_page_marker";
 
 bool env_flag_enabled(const wchar_t* name)
 {
@@ -262,6 +263,10 @@ void append_camoufox_sidecar_roots(std::vector<std::wstring>& paths)
     {
         append_unique_path(paths, join_path_w(join_path_w(aida_root, L"camoufox"), L"current"));
         append_unique_path(paths, join_path_w(join_path_w(join_path_w(aida_root, L"embedded"), L"camoufox"), L"current"));
+        const std::wstring standalone_root = join_path_w(aida_root, L"Standalone");
+        append_unique_path(paths, standalone_root);
+        append_unique_path(paths, join_path_w(join_path_w(standalone_root, L"camoufox"), L"current"));
+        append_unique_path(paths, join_path_w(join_path_w(join_path_w(standalone_root, L"embedded"), L"camoufox"), L"current"));
     }
     std::vector<wchar_t> temp(32768);
     DWORD temp_len = GetTempPathW(static_cast<DWORD>(temp.size()), temp.data());
@@ -327,6 +332,20 @@ bool fileless_camoufox_browser_path_allowed(const std::wstring& candidate)
 {
     if (!env_flag_enabled(L"AIDA_FILELESS_LAUNCH"))
         return true;
+    std::wstring aida_root = local_appdata_aida_root();
+    if (!aida_root.empty())
+    {
+        const std::wstring standalone_camoufox_root = join_path_w(join_path_w(aida_root, L"Standalone"), L"camoufox");
+        if (path_under_root_w(candidate, join_path_w(standalone_camoufox_root, L"current")) ||
+            path_under_root_w(candidate, join_path_w(standalone_camoufox_root, L"staging")) ||
+            path_under_root_w(candidate, join_path_w(standalone_camoufox_root, L"backup")))
+            return true;
+        const std::wstring legacy_camoufox_root = join_path_w(aida_root, L"camoufox");
+        if (path_under_root_w(candidate, join_path_w(legacy_camoufox_root, L"current")) ||
+            path_under_root_w(candidate, join_path_w(legacy_camoufox_root, L"staging")) ||
+            path_under_root_w(candidate, join_path_w(legacy_camoufox_root, L"backup")))
+            return true;
+    }
     std::vector<wchar_t> temp(32768);
     DWORD temp_len = GetTempPathW(static_cast<DWORD>(temp.size()), temp.data());
     if (temp_len == 0 || temp_len >= static_cast<DWORD>(temp.size()))
@@ -491,9 +510,11 @@ bool discover_configured_reverse_mcp_executable(std::wstring& out_path)
 bool discover_bundled_reverse_mcp_executable(std::wstring& out_path)
 {
     const std::vector<std::wstring> rels = {
+        L".deps\\AiDA_CamoufoxReverseMcp\\AiDA_CamoufoxReverseMcp.exe",
         L".deps\\AiDA_CamoufoxReverseMcp.exe",
         L".deps\\camoufox-reverse-mcp.exe",
         L".deps\\camoufox_reverse_mcp.exe",
+        L"deps\\AiDA_CamoufoxReverseMcp\\AiDA_CamoufoxReverseMcp.exe",
         L"deps\\AiDA_CamoufoxReverseMcp.exe",
         L"deps\\camoufox-reverse-mcp.exe",
         L"deps\\camoufox_reverse_mcp.exe",
@@ -1955,6 +1976,132 @@ std::string compact_log_tail(std::string s, size_t limit)
     return s;
 }
 
+DWORD contract_probe_timeout_ms(DWORD timeout_ms)
+{
+    if (timeout_ms == INFINITE) return 7000;
+    if (timeout_ms < 1000) return timeout_ms;
+    return std::min<DWORD>(timeout_ms, 7000);
+}
+
+bool validate_contract_probe_output(const std::string& captured, std::string& detail)
+{
+    const bool has_contract = captured.find(kReverseMcpInitiatorContractV2) != std::string::npos;
+    const bool has_request_id = captured.find("request_id") != std::string::npos;
+    const bool has_page_id = captured.find("page_id") != std::string::npos;
+    const bool has_marker_param =
+        captured.find("\"marker\"") != std::string::npos ||
+        captured.find(",marker") != std::string::npos ||
+        captured.find("marker,") != std::string::npos ||
+        captured.find("marker]") != std::string::npos;
+    if (has_contract && has_request_id && has_page_id && has_marker_param)
+    {
+        detail = compact_log_tail(captured, 800);
+        return true;
+    }
+    detail = "contract_probe_missing_fields contract=" + std::to_string(has_contract ? 1 : 0) +
+        " request_id=" + std::to_string(has_request_id ? 1 : 0) +
+        " page_id=" + std::to_string(has_page_id ? 1 : 0) +
+        " marker=" + std::to_string(has_marker_param ? 1 : 0) +
+        " tail=" + compact_log_tail(captured, 800);
+    return false;
+}
+
+bool validate_frozen_reverse_mcp_contract(const std::wstring& exe, DWORD timeout_ms, std::string& detail)
+{
+    DWORD code = 0;
+    std::string captured;
+    const DWORD effective_timeout = contract_probe_timeout_ms(timeout_ms);
+    const std::string cmd = quote_arg(wide_to_utf8(exe)) + " --aida-contract-check";
+    const ULONGLONG start_ms = GetTickCount64();
+    diag::log_tagged_fmt("camoufox_install", "reverse_mcp_contract_probe frozen start exe=%s timeout_ms=%lu",
+        wide_to_utf8(exe).c_str(), static_cast<unsigned long>(effective_timeout));
+    if (!spawn_capture_streaming(cmd, effective_timeout, code, captured))
+    {
+        detail = "frozen contract probe spawn/timeout failed: " + compact_log_tail(captured, 1000);
+        diag::log_tagged_fmt("camoufox_install", "reverse_mcp_contract_probe frozen spawn_failed exe=%s elapsed_ms=%llu detail=%.800s",
+            wide_to_utf8(exe).c_str(),
+            static_cast<unsigned long long>(GetTickCount64() - start_ms),
+            detail.c_str());
+        return false;
+    }
+    if (code != 0)
+    {
+        detail = "frozen contract probe exit=" + std::to_string(code) + " tail=" + compact_log_tail(captured, 1000);
+        diag::log_tagged_fmt("camoufox_install", "reverse_mcp_contract_probe frozen bad_exit exe=%s code=%lu elapsed_ms=%llu detail=%.800s",
+            wide_to_utf8(exe).c_str(),
+            static_cast<unsigned long>(code),
+            static_cast<unsigned long long>(GetTickCount64() - start_ms),
+            detail.c_str());
+        return false;
+    }
+    if (!validate_contract_probe_output(captured, detail))
+    {
+        diag::log_tagged_fmt("camoufox_install", "reverse_mcp_contract_probe frozen missing_contract exe=%s elapsed_ms=%llu detail=%.800s",
+            wide_to_utf8(exe).c_str(),
+            static_cast<unsigned long long>(GetTickCount64() - start_ms),
+            detail.c_str());
+        return false;
+    }
+    diag::log_tagged_fmt("camoufox_install", "reverse_mcp_contract_probe frozen ok exe=%s elapsed_ms=%llu detail=%.400s",
+        wide_to_utf8(exe).c_str(),
+        static_cast<unsigned long long>(GetTickCount64() - start_ms),
+        detail.c_str());
+    return true;
+}
+
+bool validate_python_reverse_mcp_contract(const std::string& python, DWORD timeout_ms, std::string& detail)
+{
+    DWORD code = 0;
+    std::string captured;
+    const DWORD effective_timeout = contract_probe_timeout_ms(timeout_ms);
+    const std::string py =
+        "import inspect,sys;"
+        "from camoufox_reverse_mcp.tools import network;"
+        "fn=network.get_request_initiator;"
+        "params=list(inspect.signature(fn).parameters);"
+        "consts=repr(getattr(getattr(fn,'__code__',None),'co_consts',()));"
+        "contract='aida_initiator_contract_v2_page_marker';"
+        "ok=all(x in params for x in ('request_id','page_id','marker')) and contract in consts;"
+        "print('contract='+contract+' ok='+str(ok)+' params='+','.join(params)+' has_marker_constant='+str(contract in consts));"
+        "sys.exit(0 if ok else 2)";
+    const std::string cmd = quote_arg(python) + " -c " + quote_arg(py);
+    const ULONGLONG start_ms = GetTickCount64();
+    diag::log_tagged_fmt("camoufox_install", "reverse_mcp_contract_probe python start python=%s timeout_ms=%lu",
+        python.c_str(), static_cast<unsigned long>(effective_timeout));
+    if (!spawn_capture_streaming(cmd, effective_timeout, code, captured))
+    {
+        detail = "python contract probe spawn/timeout failed: " + compact_log_tail(captured, 1000);
+        diag::log_tagged_fmt("camoufox_install", "reverse_mcp_contract_probe python spawn_failed python=%s elapsed_ms=%llu detail=%.800s",
+            python.c_str(),
+            static_cast<unsigned long long>(GetTickCount64() - start_ms),
+            detail.c_str());
+        return false;
+    }
+    if (code != 0)
+    {
+        detail = "python contract probe exit=" + std::to_string(code) + " tail=" + compact_log_tail(captured, 1000);
+        diag::log_tagged_fmt("camoufox_install", "reverse_mcp_contract_probe python bad_exit python=%s code=%lu elapsed_ms=%llu detail=%.800s",
+            python.c_str(),
+            static_cast<unsigned long>(code),
+            static_cast<unsigned long long>(GetTickCount64() - start_ms),
+            detail.c_str());
+        return false;
+    }
+    if (!validate_contract_probe_output(captured, detail))
+    {
+        diag::log_tagged_fmt("camoufox_install", "reverse_mcp_contract_probe python missing_contract python=%s elapsed_ms=%llu detail=%.800s",
+            python.c_str(),
+            static_cast<unsigned long long>(GetTickCount64() - start_ms),
+            detail.c_str());
+        return false;
+    }
+    diag::log_tagged_fmt("camoufox_install", "reverse_mcp_contract_probe python ok python=%s elapsed_ms=%llu detail=%.400s",
+        python.c_str(),
+        static_cast<unsigned long long>(GetTickCount64() - start_ms),
+        detail.c_str());
+    return true;
+}
+
 void set_status_locked(install_state_t st, const std::string& msg);
 
 bool run_install_command(const std::string& python,
@@ -2282,6 +2429,22 @@ status_t probe_impl(bool allow_when_busy, DWORD timeout_ms)
     std::wstring reverse_mcp_exe;
     if (discover_reverse_mcp_executable(reverse_mcp_exe))
     {
+        std::string contract_detail;
+        if (!validate_frozen_reverse_mcp_contract(reverse_mcp_exe, timeout_ms, contract_detail))
+        {
+            std::lock_guard<std::mutex> lk(sg().mtx);
+            sg().status.python_path.clear();
+            sg().status.module_version.clear();
+            sg().status.browser_path.clear();
+            sg().last_error = "frozen camoufox_reverse_mcp executable has stale initiator contract: " + contract_detail;
+            set_status_locked(install_state_t::missing_module, sg().last_error);
+            diag::log_tagged_fmt("camoufox_install", "probe_step id=%llu frozen_exe_contract_failed mcp=%s elapsed_ms=%llu detail=%.800s",
+                static_cast<unsigned long long>(probe_id),
+                wide_to_utf8(reverse_mcp_exe).c_str(),
+                static_cast<unsigned long long>(GetTickCount64() - probe_start_ms),
+                contract_detail.c_str());
+            return sg().status;
+        }
         {
             std::lock_guard<std::mutex> lk(sg().mtx);
             sg().status.python_path.clear();
@@ -2392,6 +2555,21 @@ status_t probe_impl(bool allow_when_busy, DWORD timeout_ms)
     {
         std::lock_guard<std::mutex> lk(sg().mtx);
         sg().status.module_version = trim_view(captured);
+    }
+    std::string contract_detail;
+    if (!validate_python_reverse_mcp_contract(python, timeout_ms, contract_detail))
+    {
+        std::lock_guard<std::mutex> lk(sg().mtx);
+        sg().status.module_version.clear();
+        sg().status.browser_path.clear();
+        sg().last_error = "camoufox_reverse_mcp has stale initiator contract: " + contract_detail;
+        set_status_locked(install_state_t::missing_module, sg().last_error);
+        diag::log_tagged_fmt("camoufox_install", "probe_step id=%llu module_contract_failed python=%s elapsed_ms=%llu detail=%.800s",
+            static_cast<unsigned long long>(probe_id),
+            python.c_str(),
+            static_cast<unsigned long long>(GetTickCount64() - probe_start_ms),
+            contract_detail.c_str());
+        return sg().status;
     }
 
     std::wstring bundled_browser_dir;

@@ -97,6 +97,13 @@ std::string ascii_lower_copy(std::string s)
     return s;
 }
 
+bool json_string_param(const json& params, const char* key, std::string& out)
+{
+    if (!params.contains(key) || !params[key].is_string()) return false;
+    out = params[key].get<std::string>();
+    return true;
+}
+
 bool is_browser_infrastructure_error(const std::string& msg)
 {
     std::string s = ascii_lower_copy(msg);
@@ -488,18 +495,50 @@ tool_result_t tool_scan(const json& params)
     opts.scheme = scheme;
     opts.host   = host;
     opts.port   = port;
-    diag::log_tagged_fmt("mcp_burp", "dom_xss_scan options polyglot=%d standard=%d dom_only=%d screenshots=%d per_timeout_ms=%d max_payloads=%zu scan_timeout_ms=%d raw_len=%zu",
+
+    std::string requested_kind;
+    std::string requested_name;
+    if (!json_string_param(params, "insertion_point_kind", requested_kind))
+        json_string_param(params, "point_kind", requested_kind);
+    if (!json_string_param(params, "insertion_point_name", requested_name))
+        json_string_param(params, "point_name", requested_name);
+    std::string requested_point;
+    if (json_string_param(params, "insertion_point", requested_point)) {
+        const size_t sep = requested_point.find(':');
+        if (sep != std::string::npos) {
+            if (requested_kind.empty()) requested_kind = requested_point.substr(0, sep);
+            if (requested_name.empty()) requested_name = requested_point.substr(sep + 1);
+        } else if (requested_kind.empty()) {
+            requested_kind = requested_point;
+        }
+    }
+    requested_kind = ascii_lower_copy(requested_kind);
+
+    diag::log_tagged_fmt("mcp_burp", "dom_xss_scan options polyglot=%d standard=%d dom_only=%d screenshots=%d per_timeout_ms=%d max_payloads=%zu scan_timeout_ms=%d raw_len=%zu filter_kind=%s filter_name=%s",
         (int)opts.include_polyglot, (int)opts.include_standard, (int)opts.include_dom_only,
-        (int)opts.capture_screenshots, opts.per_payload_timeout_ms, opts.max_payloads_per_point, scan_timeout_ms, raw_request.size());
+        (int)opts.capture_screenshots, opts.per_payload_timeout_ms, opts.max_payloads_per_point, scan_timeout_ms, raw_request.size(),
+        requested_kind.empty() ? "<none>" : requested_kind.c_str(),
+        requested_name.empty() ? "<none>" : requested_name.c_str());
 
     auto points = insertion_points::analyze(raw_request, target_url);
     diag::log_tagged_fmt("mcp_burp", "dom_xss_scan insertion_points total=%zu host=%s path=%s", points.size(), host.c_str(), safe_path.c_str());
     size_t total_emitted = 0;
     json per_point = json::array();
+    size_t points_candidate = 0;
+    size_t points_filtered = 0;
     for (const auto& ip : points) {
         if (ip.kind != "query" && ip.kind != "path" &&
             ip.kind != "body_form" && ip.kind != "body_json" &&
             ip.kind != "header" && ip.kind != "cookie") continue;
+        ++points_candidate;
+        if (!requested_kind.empty() && ascii_lower_copy(ip.kind) != requested_kind) {
+            ++points_filtered;
+            continue;
+        }
+        if (!requested_name.empty() && ip.name != requested_name) {
+            ++points_filtered;
+            continue;
+        }
         size_t emitted = 0;
         try {
             emitted = dom_xss::scan_insertion_point(ip, opts);
@@ -533,19 +572,42 @@ tool_result_t tool_scan(const json& params)
             return tool_result_t::error(point_error);
         }
     }
+    if ((!requested_kind.empty() || !requested_name.empty()) && per_point.empty()) {
+        last_scan_ms_slot().store(now_ms_wall());
+        total_scans_slot().fetch_add(1);
+        json diag;
+        diag["target_url"] = target_url;
+        diag["points_total"] = points.size();
+        diag["points_candidate"] = points_candidate;
+        diag["points_filtered"] = points_filtered;
+        diag["filter_kind"] = requested_kind;
+        diag["filter_name"] = requested_name;
+        diag["per_point"] = per_point;
+        diag::log_tagged_fmt("mcp_burp", "dom_xss_scan filter_no_match host=%s path=%s points_total=%zu points_candidate=%zu points_filtered=%zu filter_kind=%s filter_name=%s",
+            host.c_str(), safe_path.c_str(), points.size(), points_candidate, points_filtered,
+            requested_kind.empty() ? "<none>" : requested_kind.c_str(),
+            requested_name.empty() ? "<none>" : requested_name.c_str());
+        return tool_result_t::error("DOM-XSS scan insertion point filter matched no candidates", diag);
+    }
     last_scan_ms_slot().store(now_ms_wall());
     total_scans_slot().fetch_add(1);
 
     json data;
     data["target_url"]    = target_url;
     data["points_total"]  = points.size();
+    data["points_candidate"] = points_candidate;
+    data["points_filtered"] = points_filtered;
     data["points_scanned"] = per_point.size();
     data["per_point"]     = per_point;
     data["issues_emitted"] = total_emitted;
+    data["filter_kind"] = requested_kind;
+    data["filter_name"] = requested_name;
     std::string engine_error = dom_xss::last_error();
     data["last_engine_error"] = engine_error;
-    diag::log_tagged_fmt("mcp_burp", "dom_xss_scan ok host=%s path=%s points_total=%zu points_scanned=%zu issues_emitted=%zu engine_error_len=%zu response_shape=%s",
-        host.c_str(), safe_path.c_str(), points.size(), per_point.size(), total_emitted,
+    diag::log_tagged_fmt("mcp_burp", "dom_xss_scan ok host=%s path=%s points_total=%zu points_candidate=%zu points_filtered=%zu points_scanned=%zu issues_emitted=%zu filter_kind=%s filter_name=%s engine_error_len=%zu response_shape=%s",
+        host.c_str(), safe_path.c_str(), points.size(), points_candidate, points_filtered, per_point.size(), total_emitted,
+        requested_kind.empty() ? "<none>" : requested_kind.c_str(),
+        requested_name.empty() ? "<none>" : requested_name.c_str(),
         engine_error.size(), json_shape(data).c_str());
     if (!engine_error.empty() && is_browser_infrastructure_error(engine_error))
         return tool_result_t::error(engine_error);
@@ -569,6 +631,9 @@ void register_dom_xss_tools(mcp_standalone::server_t& srv)
             {"capture_screenshot",  "boolean", "If true and a sink fires, capture a PNG screenshot of the loaded page.", false},
             {"raw_request",             "string",  "Raw HTTP/1.1 textual request (optional - if omitted a synthesized GET is used).", false},
             {"raw_request_b64",         "string",  "Base64-encoded raw request (optional alternative to raw_request).", false},
+            {"insertion_point_kind",    "string",  "Optional scan filter for one insertion point kind such as query, path, header, cookie, body_form, or body_json.", false},
+            {"insertion_point_name",    "string",  "Optional scan filter for one insertion point name such as q or Host.", false},
+            {"insertion_point",         "string",  "Optional combined scan filter in kind:name form.", false},
             {"include_polyglot",        "boolean", "Include polyglot payload set (default true).", false},
             {"include_standard",        "boolean", "Include standard payload set (default true).", false},
             {"include_dom_only",        "boolean", "Include DOM-only fragment/event payload set (default true).", false},

@@ -215,6 +215,72 @@ public:
         return out;
     }
 
+    // -----------------------------------------------------------------------
+    // Slice H13 - per-binary registry. Each hash gets a single record
+    // tracking first_seen_ms, last_seen_ms, derived has_graph/has_vectors,
+    // and a small fingerprint summary object captured from binary_fingerprint.
+    // -----------------------------------------------------------------------
+    struct binary_registry_entry_t
+    {
+        std::string    hash;
+        uint64_t       first_seen_ms = 0;
+        uint64_t       last_seen_ms  = 0;
+        bool           has_graph     = false;
+        bool           has_vectors   = false;
+        nlohmann::json fingerprint_summary;
+    };
+
+    void register_binary(const std::string& hash, const nlohmann::json& fingerprint)
+    {
+        if (hash.empty()) return;
+        std::lock_guard<std::mutex> lk(m_mtx);
+        uint64_t ts = now_ms();
+        auto it = m_binaries.find(hash);
+        if (it == m_binaries.end())
+        {
+            binary_registry_entry_t e;
+            e.hash = hash;
+            e.first_seen_ms = ts;
+            e.last_seen_ms  = ts;
+            e.fingerprint_summary = fingerprint;
+            m_binaries[hash] = std::move(e);
+        }
+        else
+        {
+            it->second.last_seen_ms = ts;
+            if (!fingerprint.is_null() && !fingerprint.empty())
+                it->second.fingerprint_summary = fingerprint;
+        }
+        m_dirty = true;
+    }
+
+    std::vector<binary_registry_entry_t> list_registered_binaries() const
+    {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        std::vector<binary_registry_entry_t> out;
+        out.reserve(m_binaries.size());
+        for (auto& [k, v] : m_binaries) out.push_back(v);
+        return out;
+    }
+
+    // Allow external callers (graphrag/vectors) to flag readiness without
+    // having to re-fingerprint.
+    void mark_binary_capabilities(const std::string& hash, bool has_graph, bool has_vectors)
+    {
+        if (hash.empty()) return;
+        std::lock_guard<std::mutex> lk(m_mtx);
+        auto& e = m_binaries[hash];
+        if (e.hash.empty())
+        {
+            e.hash = hash;
+            e.first_seen_ms = now_ms();
+        }
+        e.last_seen_ms = now_ms();
+        e.has_graph = has_graph;
+        e.has_vectors = has_vectors;
+        m_dirty = true;
+    }
+
 
     bool save()
     {
@@ -246,6 +312,8 @@ private:
     std::vector<rlhf_entry_t> m_rlhf;
     std::unordered_map<std::string, std::vector<chat_entry_t>> m_chat_history;
     std::unordered_map<std::string, std::vector<analysis_entry_t>> m_analysis;
+    // H13 - per-binary registry.
+    std::unordered_map<std::string, binary_registry_entry_t> m_binaries;
 
     std::string get_db_path() const
     {
@@ -270,6 +338,20 @@ private:
         j["rlhf"] = m_rlhf;
         j["chat_history"] = m_chat_history;
         j["analysis"] = m_analysis;
+        // H13 - serialise the registry inline (no ADL serializer needed).
+        nlohmann::json binaries = nlohmann::json::object();
+        for (auto& [k, v] : m_binaries)
+        {
+            nlohmann::json e;
+            e["hash"] = v.hash;
+            e["first_seen_ms"] = v.first_seen_ms;
+            e["last_seen_ms"]  = v.last_seen_ms;
+            e["has_graph"]     = v.has_graph;
+            e["has_vectors"]   = v.has_vectors;
+            e["fingerprint_summary"] = v.fingerprint_summary;
+            binaries[k] = std::move(e);
+        }
+        j["binaries"] = std::move(binaries);
 
         std::string path = get_db_path();
         std::ofstream ofs(path, std::ios::binary);
@@ -295,6 +377,22 @@ private:
                 m_chat_history = j["chat_history"].get<std::unordered_map<std::string, std::vector<chat_entry_t>>>();
             if (j.contains("analysis"))
                 m_analysis = j["analysis"].get<std::unordered_map<std::string, std::vector<analysis_entry_t>>>();
+            if (j.contains("binaries") && j["binaries"].is_object())
+            {
+                m_binaries.clear();
+                for (auto it = j["binaries"].begin(); it != j["binaries"].end(); ++it)
+                {
+                    binary_registry_entry_t e;
+                    auto& src = it.value();
+                    e.hash = src.value("hash", std::string());
+                    e.first_seen_ms = src.value("first_seen_ms", uint64_t(0));
+                    e.last_seen_ms  = src.value("last_seen_ms",  uint64_t(0));
+                    e.has_graph     = src.value("has_graph", false);
+                    e.has_vectors   = src.value("has_vectors", false);
+                    e.fingerprint_summary = src.value("fingerprint_summary", nlohmann::json::object());
+                    m_binaries[it.key()] = std::move(e);
+                }
+            }
             m_dirty = false;
             return true;
         }

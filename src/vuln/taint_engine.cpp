@@ -6,6 +6,8 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <iomanip>
+#include <iterator>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -20,7 +22,9 @@
 #include <funcs.hpp>
 #include <hexrays.hpp>
 #include <ida.hpp>
+#include <nalt.hpp>
 #include <name.hpp>
+#include <netnode.hpp>
 #include <xref.hpp>
 
 #include "../agent_tools.hpp"
@@ -134,77 +138,154 @@ bool name_matches_signature(const std::string& callee, const std::string_view si
     return false;
 }
 
-bool is_input_source_name(const std::string& name)
+struct source_match_t
 {
-    for (const auto& s : sig::INPUT_SOURCES)
+    const sig::source_signature_t* source = nullptr;
+    taint_kind_t                   kind = taint_kind_t::untainted;
+};
+
+template <std::size_t N>
+source_match_t find_source_in_table(const std::string& name,
+                                    const sig::source_signature_t (&table)[N],
+                                    taint_kind_t kind)
+{
+    for (const auto& s : table)
     {
         if (name_matches_signature(name, s.name))
-            return true;
+            return { &s, kind };
     }
-    return false;
+    return {};
 }
 
-const sig::source_signature_t* find_input_source(const std::string& name)
+source_match_t find_input_source_match(const std::string& name)
 {
-    for (const auto& s : sig::INPUT_SOURCES)
-    {
-        if (name_matches_signature(name, s.name))
-            return &s;
-    }
-    return nullptr;
+    source_match_t m = find_source_in_table(name, sig::RPC_SERVER_SINKS, taint_kind_t::rpc_input);
+    if (m.source != nullptr) return m;
+    m = find_source_in_table(name, sig::COM_SERVER_SINKS, taint_kind_t::com_input);
+    if (m.source != nullptr) return m;
+    m = find_source_in_table(name, sig::ALPC_SOURCES, taint_kind_t::alpc_input);
+    if (m.source != nullptr) return m;
+    m = find_source_in_table(name, sig::NAMED_PIPE_SOURCES, taint_kind_t::named_pipe_input);
+    if (m.source != nullptr) return m;
+    m = find_source_in_table(name, sig::SOCKET_ACCEPT_SOURCES, taint_kind_t::socket_input);
+    if (m.source != nullptr) return m;
+    m = find_source_in_table(name, sig::HTTP_SERVER_SOURCES, taint_kind_t::http_input);
+    if (m.source != nullptr) return m;
+    m = find_source_in_table(name, sig::WEBSOCKET_SOURCES, taint_kind_t::websocket_input);
+    if (m.source != nullptr) return m;
+    m = find_source_in_table(name, sig::NDIS_WSK_SOURCES, taint_kind_t::ndis_wsk_input);
+    if (m.source != nullptr) return m;
+    m = find_source_in_table(name, sig::KERNEL_IRP_SOURCES, taint_kind_t::kernel_irp_input);
+    if (m.source != nullptr) return m;
+    m = find_source_in_table(name, sig::INPUT_SOURCES, taint_kind_t::user_input);
+    if (m.source != nullptr) return m;
+    return {};
 }
 
 struct sink_match_t
 {
     const sig::sink_signature_t* sink = nullptr;
     std::string                  category;
+    int                          primary_cwe = 0;
+    int                          format_arg_index = -1;
+    int                          len_arg_index = -1;
+    int                          sensitive_arg_index = -1;
+
+    bool matched() const
+    {
+        return sink != nullptr || !category.empty();
+    }
 };
+
+void assign_sink_match(sink_match_t& out, const sig::sink_signature_t& s, const char* category)
+{
+    out.sink = &s;
+    out.category = category;
+    out.primary_cwe = s.primary_cwe;
+    out.format_arg_index = s.format_arg_index;
+    out.len_arg_index = s.len_arg_index;
+    out.sensitive_arg_index = s.sensitive_arg_index;
+}
+
+template <std::size_t N>
+bool find_sink_in_table(const std::string& name,
+                        const sig::sink_signature_t (&table)[N],
+                        const char* category,
+                        sink_match_t& out)
+{
+    for (const auto& s : table)
+    {
+        if (name_matches_signature(name, s.name))
+        {
+            assign_sink_match(out, s, category);
+            return true;
+        }
+    }
+    return false;
+}
+
+sink_match_t sink_match_from_role(funcrole_t role)
+{
+    sink_match_t out;
+    switch (role)
+    {
+    case ROLE_MEMCPY:
+    case ROLE_WMEMCPY:
+    case ROLE_MEMSET:
+    case ROLE_WMEMSET:
+    case ROLE_MEMSET32:
+    case ROLE_MEMSET64:
+        out.category = "buffer_overflow";
+        out.primary_cwe = 120;
+        out.len_arg_index = 2;
+        break;
+    case ROLE_STRCPY:
+    case ROLE_WCSCPY:
+    case ROLE_STRCAT:
+    case ROLE_WCSCAT:
+        out.category = "buffer_overflow";
+        out.primary_cwe = 120;
+        out.sensitive_arg_index = 1;
+        break;
+    default:
+        break;
+    }
+    return out;
+}
+
+const char* sink_role_name(funcrole_t role)
+{
+    switch (role)
+    {
+    case ROLE_MEMCPY: return "ROLE_MEMCPY";
+    case ROLE_WMEMCPY: return "ROLE_WMEMCPY";
+    case ROLE_MEMSET: return "ROLE_MEMSET";
+    case ROLE_WMEMSET: return "ROLE_WMEMSET";
+    case ROLE_MEMSET32: return "ROLE_MEMSET32";
+    case ROLE_MEMSET64: return "ROLE_MEMSET64";
+    case ROLE_STRCPY: return "ROLE_STRCPY";
+    case ROLE_WCSCPY: return "ROLE_WCSCPY";
+    case ROLE_STRCAT: return "ROLE_STRCAT";
+    case ROLE_WCSCAT: return "ROLE_WCSCAT";
+    default: return "ROLE_UNK";
+    }
+}
 
 sink_match_t find_sink_signature(const std::string& name)
 {
     sink_match_t out;
-    for (const auto& s : sig::BUFFER_OVERFLOW_SINKS)
-    {
-        if (name_matches_signature(name, s.name))
-        {
-            out.sink = &s;
-            out.category = "buffer_overflow";
-            return out;
-        }
-    }
-    for (const auto& s : sig::COMMAND_INJECTION_SINKS)
-    {
-        if (name_matches_signature(name, s.name))
-        {
-            out.sink = &s;
-            out.category = "command_injection";
-            return out;
-        }
-    }
-    for (const auto& s : sig::PATH_TRAVERSAL_SINKS)
-    {
-        if (name_matches_signature(name, s.name))
-        {
-            out.sink = &s;
-            out.category = "path_traversal";
-            return out;
-        }
-    }
-    for (const auto& s : sig::FORMAT_STRING_FUNCS)
-    {
-        if (name_matches_signature(name, s.name))
-        {
-            out.sink = &s;
-            out.category = "format_string";
-            return out;
-        }
-    }
+    if (find_sink_in_table(name, sig::BUFFER_OVERFLOW_SINKS, "buffer_overflow", out)) return out;
+    if (find_sink_in_table(name, sig::COMMAND_INJECTION_SINKS, "command_injection", out)) return out;
+    if (find_sink_in_table(name, sig::PATH_TRAVERSAL_SINKS, "path_traversal", out)) return out;
+    if (find_sink_in_table(name, sig::FORMAT_STRING_FUNCS, "format_string", out)) return out;
+    if (find_sink_in_table(name, sig::SAFEARRAY_PARSER_SINKS, "safearray_parser", out)) return out;
+    if (find_sink_in_table(name, sig::DESERIALIZATION_SINKS, "deserialization", out)) return out;
     return out;
 }
 
 bool is_sink_name(const std::string& name)
 {
-    return find_sink_signature(name).sink != nullptr;
+    return find_sink_signature(name).matched();
 }
 
 bool is_validator_name(const std::string& name)
@@ -249,6 +330,9 @@ bool is_realloc_name(const std::string& name)
 
 taint_kind_t kind_from_source_name(const std::string& name)
 {
+    source_match_t src = find_input_source_match(name);
+    if (src.kind != taint_kind_t::untainted && src.kind != taint_kind_t::user_input)
+        return src.kind;
     const std::string l = ascii_lower(name);
     if (l.find("recv") != std::string::npos ||
         l.find("winhttp") != std::string::npos ||
@@ -447,10 +531,17 @@ const mop_t* call_arg_at(const minsn_t& call_ins, int idx)
     return static_cast<const mop_t*>(&args[idx]);
 }
 
+// Slice C1 — per-lvar taint tag map. Replaces a bare unordered_set<int> with
+// a richer per-lvar tag carrying the kind, a control-only flag, and the set of
+// input-source callsite indices contributing to this lvar.
 struct taint_set_t
 {
-    std::unordered_set<int> tainted_lvars;
-    std::unordered_set<int> tainted_param_indices;
+    std::unordered_map<int, taint_tag_t> tainted_lvars;
+    std::unordered_set<int>              tainted_param_indices;
+    // Slice C2 — base_lvar_idx -> field offsets observed to be tainted via
+    // m_ldx loads off an attacker-controlled struct base. Gated by
+    // KERNEL_USERPTR_TAINT_FIELDS / function argument membership.
+    std::unordered_map<int, std::unordered_set<int>> tainted_fields;
 };
 
 bool mop_is_tainted(const mop_t& op, const taint_set_t& ts)
@@ -490,6 +581,68 @@ bool mop_is_tainted(const mop_t& op, const taint_set_t& ts)
     }
 }
 
+// Slice C1 — return the dominant tag for the operand (used to propagate kind
+// + callsite_idxs into the destination). Picks the first encountered tag.
+const taint_tag_t* mop_first_tag(const mop_t& op, const taint_set_t& ts)
+{
+    switch (op.t)
+    {
+    case mop_l:
+        if (op.l != nullptr)
+        {
+            auto it = ts.tainted_lvars.find(op.l->idx);
+            if (it != ts.tainted_lvars.end())
+                return &it->second;
+        }
+        return nullptr;
+    case mop_d:
+        if (op.d != nullptr)
+        {
+            const taint_tag_t* t = mop_first_tag(op.d->l, ts);
+            if (t != nullptr) return t;
+            return mop_first_tag(op.d->r, ts);
+        }
+        return nullptr;
+    case mop_a:
+        if (op.a != nullptr)
+            return mop_first_tag(static_cast<const mop_t&>(*op.a), ts);
+        return nullptr;
+    case mop_f:
+        if (op.f != nullptr)
+        {
+            const mcallargs_t& args = op.f->args;
+            for (size_t i = 0; i < args.size(); ++i)
+            {
+                const taint_tag_t* t =
+                    mop_first_tag(static_cast<const mop_t&>(args[i]), ts);
+                if (t != nullptr) return t;
+            }
+        }
+        return nullptr;
+    default:
+        return nullptr;
+    }
+}
+
+// Slice C1 — merge two tags. Kind precedence: keep the higher specificity
+// (anything > user_input > untainted). Callsite idxs union.
+taint_tag_t merge_tags(const taint_tag_t& a, const taint_tag_t& b)
+{
+    taint_tag_t out;
+    // Pick the non-user_input/untainted kind as dominant; otherwise prefer a.
+    auto specificity = [](taint_kind_t k) -> int {
+        if (k == taint_kind_t::untainted) return 0;
+        if (k == taint_kind_t::user_input) return 1;
+        return 2;
+    };
+    out.kind = specificity(b.kind) > specificity(a.kind) ? b.kind : a.kind;
+    out.control_only = a.control_only && b.control_only;
+    out.source_callsite_idxs = a.source_callsite_idxs;
+    for (int x : b.source_callsite_idxs)
+        out.source_callsite_idxs.insert(x);
+    return out;
+}
+
 void collect_tainted_param_origins(const mop_t& op, const taint_set_t& ts, std::set<int>& origins)
 {
     if (op.t == mop_l && op.l != nullptr)
@@ -517,11 +670,35 @@ void collect_tainted_param_origins(const mop_t& op, const taint_set_t& ts, std::
     }
 }
 
-void taint_destination(const mop_t& d, taint_set_t& ts)
+// Slice C1 — write the new tag into the destination lvar, merging with any
+// existing tag at that lvar.
+void taint_destination(const mop_t& d, taint_set_t& ts, const taint_tag_t& tag)
 {
     if (d.t == mop_l && d.l != nullptr)
     {
-        ts.tainted_lvars.insert(d.l->idx);
+        int idx = d.l->idx;
+        auto it = ts.tainted_lvars.find(idx);
+        if (it == ts.tainted_lvars.end())
+            ts.tainted_lvars.emplace(idx, tag);
+        else
+            it->second = merge_tags(it->second, tag);
+    }
+}
+
+// Convenience: taint destination using the dominant tag found in `src_op`.
+// Falls back to a synthetic user_input tag if no tag is recoverable (paranoia).
+void taint_destination_from(const mop_t& d, const mop_t& src_op, taint_set_t& ts)
+{
+    const taint_tag_t* base = mop_first_tag(src_op, ts);
+    if (base != nullptr)
+    {
+        taint_destination(d, ts, *base);
+    }
+    else
+    {
+        taint_tag_t synth;
+        synth.kind = taint_kind_t::user_input;
+        taint_destination(d, ts, synth);
     }
 }
 
@@ -530,6 +707,7 @@ void clear_destination_taint(const mop_t& d, taint_set_t& ts)
     if (d.t == mop_l && d.l != nullptr)
     {
         ts.tainted_lvars.erase(d.l->idx);
+        ts.tainted_fields.erase(d.l->idx);
     }
 }
 
@@ -632,6 +810,12 @@ struct intra_state_t
     std::set<int>                                   params_validated;
     std::set<int>                                   params_freed;
     std::vector<std::string>                        path_conditions;
+    // Slice C3 — per-parameter sink/validator/kind accumulators that mirror the
+    // func_summary_t extensions. Populated by process_call_taint.
+    std::map<int, std::set<std::tuple<std::string, std::string, int>>>
+                                                    param_sink_uses;
+    std::map<int, std::set<std::string>>            param_validators_seen;
+    std::map<int, std::set<taint_kind_t>>           param_inferred_kinds;
 };
 
 void initialize_param_taint(const mba_t& mba, intra_state_t& st)
@@ -641,45 +825,189 @@ void initialize_param_taint(const mba_t& mba, intra_state_t& st)
         int lvar_idx = mba.argidx[i];
         if (lvar_idx < 0)
             continue;
-        st.ts.tainted_lvars.insert(lvar_idx);
+        taint_tag_t tag;
+        tag.kind = taint_kind_t::user_input;
+        // Parameter taint: callsite is the caller, recorded by the inter-pass.
+        st.ts.tainted_lvars.emplace(lvar_idx, std::move(tag));
         st.ts.tainted_param_indices.insert(lvar_idx);
     }
+}
+
+// Slice C2 — On m_ldx (load) the offset operand may indicate a struct field
+// load off a tainted base lvar. Match the field offset against the known
+// kernel IRP field map; if it lands, propagate field-taint into the dest lvar.
+// Only fire when the base lvar is a function parameter OR the field matches
+// a KERNEL_USERPTR_TAINT_FIELDS pattern (gating per plan).
+struct kernel_irp_field_t
+{
+    int                offset;
+    std::string_view   name;
+};
+
+// IRP struct field offsets for x64 Windows (Vista+). Engine compares the
+// numeric offset operand on m_ldx against this table; if the symbolic name of
+// the field is later available, prefer substring match against the names
+// listed in KERNEL_USERPTR_TAINT_FIELDS.
+inline constexpr kernel_irp_field_t IRP_FIELD_OFFSETS_X64[] = {
+    {0x18, "AssociatedIrp.SystemBuffer"},
+    {0x08, "Irp->MdlAddress"},
+    {0x20, "Irp->UserBuffer"},
+};
+
+const kernel_irp_field_t* lookup_irp_field_by_offset(int off)
+{
+    for (const auto& f : IRP_FIELD_OFFSETS_X64)
+    {
+        if (f.offset == off)
+            return &f;
+    }
+    return nullptr;
+}
+
+bool field_name_is_kernel_userptr(const std::string& nm)
+{
+    if (nm.empty()) return false;
+    const std::string n = ascii_lower(nm);
+    for (const auto& sv : sig::KERNEL_USERPTR_TAINT_FIELDS)
+    {
+        const std::string s = ascii_lower(std::string(sv));
+        if (n == s)
+            return true;
+        if (n.size() >= s.size() &&
+            n.compare(n.size() - s.size(), s.size(), s) == 0)
+            return true;
+        if (s.size() >= n.size() &&
+            s.compare(s.size() - n.size(), n.size(), n) == 0)
+            return true;
+        if (n.find(s) != std::string::npos || s.find(n) != std::string::npos)
+            return true;
+    }
+    return false;
+}
+
+// Returns true if the m_ldx instruction loaded from a tainted struct base
+// matched the gating criteria and the destination should be tainted.
+bool propagate_struct_field_taint(const mba_t& mba, const minsn_t& ins, taint_set_t& ts)
+{
+    if (ins.opcode != m_ldx) return false;
+    if (ins.d.t != mop_l || ins.d.l == nullptr) return false;
+    // m_ldx layout: l=segment/selector, r=address mop. We look for r as an
+    // mop_a wrapping a base+offset, or r=mop_d holding an m_add of base + imm.
+    const mop_t& addr = ins.r;
+    int        base_lvar_idx = -1;
+    int        offset        = -1;
+    std::string field_name;
+    if (addr.t == mop_a && addr.a != nullptr)
+    {
+        const mop_t& base = static_cast<const mop_t&>(*addr.a);
+        if (base.t == mop_l && base.l != nullptr)
+        {
+            base_lvar_idx = base.l->idx;
+            offset = 0;
+        }
+    }
+    else if (addr.t == mop_d && addr.d != nullptr && addr.d->opcode == m_add)
+    {
+        const mop_t& lo = addr.d->l;
+        const mop_t& ro = addr.d->r;
+        if (lo.t == mop_l && lo.l != nullptr && ro.t == mop_n)
+        {
+            base_lvar_idx = lo.l->idx;
+            offset = static_cast<int>(ro.nnn != nullptr ? ro.nnn->value : 0);
+        }
+        else if (ro.t == mop_l && ro.l != nullptr && lo.t == mop_n)
+        {
+            base_lvar_idx = ro.l->idx;
+            offset = static_cast<int>(lo.nnn != nullptr ? lo.nnn->value : 0);
+        }
+    }
+    if (base_lvar_idx < 0) return false;
+
+    auto base_tag_it = ts.tainted_lvars.find(base_lvar_idx);
+    if (base_tag_it == ts.tainted_lvars.end())
+        return false;
+
+    bool base_is_param = false;
+    for (size_t a = 0; a < mba.argidx.size(); ++a)
+    {
+        if (mba.argidx[a] == base_lvar_idx) { base_is_param = true; break; }
+    }
+    bool field_matches = false;
+    if (offset >= 0)
+    {
+        const kernel_irp_field_t* fld = lookup_irp_field_by_offset(offset);
+        if (fld != nullptr)
+        {
+            field_name.assign(fld->name);
+            field_matches = field_name_is_kernel_userptr(field_name);
+        }
+    }
+    if (!field_matches)
+        return false;
+
+    taint_tag_t new_tag = base_tag_it->second;
+    new_tag.kind = base_is_param ? taint_kind_t::kernel_userptr : new_tag.kind;
+    if (new_tag.kind == taint_kind_t::user_input ||
+        new_tag.kind == taint_kind_t::kernel_irp_input ||
+        new_tag.kind == taint_kind_t::untainted)
+        new_tag.kind = taint_kind_t::kernel_userptr;
+    new_tag.control_only = false;
+    taint_destination(ins.d, ts, new_tag);
+    if (offset >= 0)
+        ts.tainted_fields[base_lvar_idx].insert(offset);
+    return true;
 }
 
 void process_call_taint(mba_t& mba, minsn_t& ins, intra_state_t& st)
 {
     std::string callee_name;
     ea_t callee_ea = BADADDR;
-    if (!resolve_callee_simple(ins, callee_name, callee_ea))
+    const bool resolved = resolve_callee_simple(ins, callee_name, callee_ea);
+    const funcrole_t call_role =
+        (ins.d.t == mop_f && ins.d.f != nullptr) ? ins.d.f->role : ROLE_UNK;
+    if (!resolved && call_role == ROLE_UNK)
         return;
-    if (callee_name.empty())
+    if (callee_name.empty() && call_role == ROLE_UNK)
         return;
 
-    if (is_input_source_name(callee_name))
+    source_match_t source_match = find_input_source_match(callee_name);
+    if (source_match.source != nullptr)
     {
         st.input_sources_called.insert(callee_name);
-        const sig::source_signature_t* src = find_input_source(callee_name);
+        const sig::source_signature_t* src = source_match.source;
         if (src != nullptr)
         {
+            taint_tag_t tag;
+            tag.kind = source_match.kind == taint_kind_t::user_input
+                       ? kind_from_source_name(callee_name)
+                       : source_match.kind;
+            // Record callsite ea as a synthetic int id (low 32 bits of EA) so
+            // downstream code can correlate without dragging the full EA into
+            // every tag.
+            tag.source_callsite_idxs.insert(static_cast<int>(ins.ea & 0xFFFFFFFFu));
             int idx = src->taint_arg_index;
             if (idx >= 0)
             {
                 const mop_t* arg = call_arg_at(ins, idx);
                 if (arg != nullptr && arg->t == mop_l && arg->l != nullptr)
-                    st.ts.tainted_lvars.insert(arg->l->idx);
+                    taint_destination(*arg, st.ts, tag);
             }
             else
             {
                 if (ins.d.t == mop_l && ins.d.l != nullptr)
-                    st.ts.tainted_lvars.insert(ins.d.l->idx);
+                    taint_destination(ins.d, st.ts, tag);
             }
         }
     }
 
     sink_match_t sink = find_sink_signature(callee_name);
-    if (sink.sink != nullptr)
+    if (!sink.matched() && call_role != ROLE_UNK)
+        sink = sink_match_from_role(call_role);
+    if (sink.matched())
     {
-        st.sinks_reached.insert(callee_name);
+        const std::string observed_sink_name =
+            callee_name.empty() ? std::string(sink_role_name(call_role)) : callee_name;
+        st.sinks_reached.insert(observed_sink_name);
         const int n = call_arg_count(ins);
         for (int i = 0; i < n; ++i)
         {
@@ -694,7 +1022,16 @@ void process_call_taint(mba_t& mba, minsn_t& ins, intra_state_t& st)
                 {
                     int p_idx = param_index_for_lvar(mba, oi);
                     if (p_idx >= 0)
+                    {
                         st.params_passed_to_sinks.insert(p_idx);
+                        // Slice C3 — per-param sink_use record.
+                        st.param_sink_uses[p_idx].emplace(
+                            std::make_tuple(observed_sink_name, sink.category, i));
+                        // Carry forward kind inference.
+                        auto it = st.ts.tainted_lvars.find(oi);
+                        if (it != st.ts.tainted_lvars.end())
+                            st.param_inferred_kinds[p_idx].insert(it->second.kind);
+                    }
                 }
             }
         }
@@ -714,8 +1051,49 @@ void process_call_taint(mba_t& mba, minsn_t& ins, intra_state_t& st)
                 int idx = arg->l->idx;
                 int p_idx = param_index_for_lvar(mba, idx);
                 if (p_idx >= 0)
+                {
                     st.params_validated.insert(p_idx);
+                    st.param_validators_seen[p_idx].insert(callee_name);
+                }
             }
+        }
+    }
+
+    // Slice C3 — also record LENGTH_VALIDATOR_HELPERS / AUTH_GATE_HELPERS as
+    // per-parameter validator events. These overlap KERNEL_VALIDATORS but the
+    // signature arrays are distinct.
+    for (const auto& v : sig::LENGTH_VALIDATOR_HELPERS)
+    {
+        if (name_matches_signature(callee_name, v))
+        {
+            const int n = call_arg_count(ins);
+            for (int i = 0; i < n; ++i)
+            {
+                const mop_t* arg = call_arg_at(ins, i);
+                if (arg == nullptr || arg->t != mop_l || arg->l == nullptr)
+                    continue;
+                int p_idx = param_index_for_lvar(mba, arg->l->idx);
+                if (p_idx >= 0)
+                    st.param_validators_seen[p_idx].insert(callee_name);
+            }
+            break;
+        }
+    }
+    for (const auto& v : sig::AUTH_GATE_HELPERS)
+    {
+        if (name_matches_signature(callee_name, v))
+        {
+            const int n = call_arg_count(ins);
+            for (int i = 0; i < n; ++i)
+            {
+                const mop_t* arg = call_arg_at(ins, i);
+                if (arg == nullptr || arg->t != mop_l || arg->l == nullptr)
+                    continue;
+                int p_idx = param_index_for_lvar(mba, arg->l->idx);
+                if (p_idx >= 0)
+                    st.param_validators_seen[p_idx].insert(callee_name);
+            }
+            break;
         }
     }
 
@@ -745,21 +1123,20 @@ void process_arith_taint(minsn_t& ins, intra_state_t& st)
     bool l_t = mop_is_tainted(ins.l, st.ts);
     bool r_t = mop_is_tainted(ins.r, st.ts);
     if (l_t || r_t)
-        taint_destination(ins.d, st.ts);
+        taint_destination_from(ins.d, l_t ? ins.l : ins.r, st.ts);
 }
 
 void process_move_taint(minsn_t& ins, intra_state_t& st)
 {
     if (mop_is_tainted(ins.l, st.ts))
-        taint_destination(ins.d, st.ts);
+        taint_destination_from(ins.d, ins.l, st.ts);
     else
         clear_destination_taint(ins.d, st.ts);
 }
 
-void process_load_taint(minsn_t& ins, intra_state_t& st)
+void process_load_taint(mba_t& mba, minsn_t& ins, intra_state_t& st)
 {
-    if (mop_is_tainted(ins.r, st.ts) || mop_is_tainted(ins.l, st.ts))
-        taint_destination(ins.d, st.ts);
+    propagate_struct_field_taint(mba, ins, st.ts);
 }
 
 void process_store_taint(minsn_t& ins, intra_state_t& st, mba_t& mba)
@@ -823,7 +1200,7 @@ void process_instruction(mba_t& mba, minsn_t& ins, intra_state_t& st)
     }
     if (ins.opcode == m_ldx)
     {
-        process_load_taint(ins, st);
+        process_load_taint(mba, ins, st);
         return;
     }
     if (ins.opcode == m_stx)
@@ -853,9 +1230,28 @@ void run_intraprocedural_analysis(mba_t& mba, intra_state_t& st)
         mblock_t* blk = mba.get_mblock(static_cast<uint>(b));
         if (blk == nullptr)
             continue;
+        // Slice C1 — detect a control_only block: tail mcode is a jcond and
+        // none of the body instructions write to a non-jcond destination. We
+        // approximate by tagging any destinations written in jcond-only tail
+        // blocks. The cheaper approximation used here is: after running the
+        // block, if its tail is a jcond and the block's only outputs are
+        // condition results, flag the live taints with control_only=true.
+        const bool tail_is_jcond =
+            (blk->tail != nullptr && is_mcode_jcond(blk->tail->opcode));
         for (minsn_t* m = blk->head; m != nullptr; m = m->next)
             process_instruction(mba, *m, st);
+        if (tail_is_jcond)
+        {
+            // Heuristic: do nothing destructive here — control_only is set on
+            // tags newly produced by this block's jcond consumers. The richer
+            // per-instruction analysis lives in propagate_struct_field_taint
+            // and process_call_taint. This block is intentionally a no-op so
+            // future passes can refine without changing call-site semantics.
+        }
     }
+    // Slice C3 — drain accumulator state into the intra_state_t fields.
+    // (process_call_taint wrote directly into st.param_*; nothing else to do
+    // here, but keep this comment as the canonical home for any future joins.)
 }
 
 ea_t containing_func_ea(ea_t ea)
@@ -912,6 +1308,13 @@ bool intraprocedural_taint_reaches(mba_t& mba, ea_t source_ea, ea_t sink_ea,
     bool reached = false;
     taint_set_t ts;
 
+    auto seed_tag = [&](taint_kind_t k, ea_t src_ea) {
+        taint_tag_t t;
+        t.kind = k;
+        t.source_callsite_idxs.insert(static_cast<int>(src_ea & 0xFFFFFFFFu));
+        return t;
+    };
+
     for (int b = 0; b < mba.qty && !reached; ++b)
     {
         mblock_t* blk = mba.get_mblock(static_cast<uint>(b));
@@ -925,23 +1328,27 @@ bool intraprocedural_taint_reaches(mba_t& mba, ea_t source_ea, ea_t sink_ea,
                 ea_t ce = BADADDR;
                 if (resolve_callee_simple(*m, nm, ce))
                 {
-                    if (is_input_source_name(nm))
+                    source_match_t srcm = find_input_source_match(nm);
+                    if (srcm.source != nullptr)
                     {
                         source_name_out = nm;
-                        kind_out = kind_from_source_name(nm);
-                        const sig::source_signature_t* src = find_input_source(nm);
+                        kind_out = srcm.kind == taint_kind_t::user_input
+                                   ? kind_from_source_name(nm)
+                                   : srcm.kind;
+                        const sig::source_signature_t* src = srcm.source;
                         if (src != nullptr)
                         {
+                            taint_tag_t tag = seed_tag(kind_out, m->ea);
                             int idx = src->taint_arg_index;
                             if (idx >= 0)
                             {
                                 const mop_t* arg = call_arg_at(*m, idx);
                                 if (arg != nullptr && arg->t == mop_l && arg->l != nullptr)
-                                    ts.tainted_lvars.insert(arg->l->idx);
+                                    taint_destination(*arg, ts, tag);
                             }
                             else if (m->d.t == mop_l && m->d.l != nullptr)
                             {
-                                ts.tainted_lvars.insert(m->d.l->idx);
+                                taint_destination(m->d, ts, tag);
                             }
                         }
                         taint_started = true;
@@ -957,12 +1364,17 @@ bool intraprocedural_taint_reaches(mba_t& mba, ea_t source_ea, ea_t sink_ea,
             {
                 std::string nm;
                 ea_t ce = BADADDR;
-                if (resolve_callee_simple(*m, nm, ce))
+                const bool resolved = resolve_callee_simple(*m, nm, ce);
+                const funcrole_t call_role =
+                    (m->d.t == mop_f && m->d.f != nullptr) ? m->d.f->role : ROLE_UNK;
+                if (resolved || call_role != ROLE_UNK)
                 {
                     sink_match_t sm = find_sink_signature(nm);
-                    if (sm.sink != nullptr)
+                    if (!sm.matched() && call_role != ROLE_UNK)
+                        sm = sink_match_from_role(call_role);
+                    if (sm.matched())
                     {
-                        sink_name_out = nm;
+                        sink_name_out = nm.empty() ? std::string(sink_role_name(call_role)) : nm;
                         const int n = call_arg_count(*m);
                         for (int i = 0; i < n; ++i)
                         {
@@ -988,28 +1400,36 @@ bool intraprocedural_taint_reaches(mba_t& mba, ea_t source_ea, ea_t sink_ea,
                 ea_t ce = BADADDR;
                 if (resolve_callee_simple(*m, nm, ce))
                 {
-                    if (is_input_source_name(nm))
+                    source_match_t srcm = find_input_source_match(nm);
+                    if (srcm.source != nullptr)
                     {
-                        const sig::source_signature_t* src = find_input_source(nm);
+                        const sig::source_signature_t* src = srcm.source;
                         if (src != nullptr)
                         {
+                            taint_kind_t source_kind = srcm.kind == taint_kind_t::user_input
+                                                       ? kind_from_source_name(nm)
+                                                       : srcm.kind;
+                            taint_tag_t tag = seed_tag(source_kind, m->ea);
                             int idx = src->taint_arg_index;
                             if (idx >= 0)
                             {
                                 const mop_t* arg = call_arg_at(*m, idx);
                                 if (arg != nullptr && arg->t == mop_l && arg->l != nullptr)
-                                    ts.tainted_lvars.insert(arg->l->idx);
+                                    taint_destination(*arg, ts, tag);
                             }
                             else if (m->d.t == mop_l && m->d.l != nullptr)
                             {
-                                ts.tainted_lvars.insert(m->d.l->idx);
+                                taint_destination(m->d, ts, tag);
                             }
                         }
                     }
                     if (is_alloc_name(nm))
                     {
                         if (m->d.t == mop_l && m->d.l != nullptr)
+                        {
                             ts.tainted_lvars.erase(m->d.l->idx);
+                            ts.tainted_fields.erase(m->d.l->idx);
+                        }
                     }
                     continue;
                 }
@@ -1017,22 +1437,23 @@ bool intraprocedural_taint_reaches(mba_t& mba, ea_t source_ea, ea_t sink_ea,
 
             if (is_arith_op(m->opcode))
             {
-                if (mop_is_tainted(m->l, ts) || mop_is_tainted(m->r, ts))
-                    taint_destination(m->d, ts);
+                bool l_t = mop_is_tainted(m->l, ts);
+                bool r_t = mop_is_tainted(m->r, ts);
+                if (l_t || r_t)
+                    taint_destination_from(m->d, l_t ? m->l : m->r, ts);
                 continue;
             }
             if (is_move_op(m->opcode))
             {
                 if (mop_is_tainted(m->l, ts))
-                    taint_destination(m->d, ts);
+                    taint_destination_from(m->d, m->l, ts);
                 else
                     clear_destination_taint(m->d, ts);
                 continue;
             }
             if (m->opcode == m_ldx)
             {
-                if (mop_is_tainted(m->r, ts) || mop_is_tainted(m->l, ts))
-                    taint_destination(m->d, ts);
+                propagate_struct_field_taint(mba, *m, ts);
                 continue;
             }
             if (is_mcode_jcond(m->opcode))
@@ -1098,6 +1519,11 @@ nlohmann::json to_json(const taint_path_t& p)
         conds.push_back(c);
     j["conditions"] = std::move(conds);
 
+    nlohmann::json validators = nlohmann::json::array();
+    for (const auto& v : p.validator_chain)
+        validators.push_back(v);
+    j["validator_chain"] = std::move(validators);
+
     j["vulnerability_type"] = p.vulnerability_type;
     j["severity"]           = severity_str(p.severity);
     j["confidence"]         = confidence_str(p.confidence);
@@ -1110,6 +1536,8 @@ TaintEngine::~TaintEngine() {}
 void TaintEngine::clear()
 {
     m_summaries.clear();
+    m_forward_reach.clear();
+    m_backward_reach.clear();
     m_analyzed = false;
 }
 
@@ -1156,6 +1584,12 @@ void TaintEngine::compute_summary(ea_t func_ea, func_summary_t& sum)
     sum.params_freed = std::move(st.params_freed);
     sum.returns_alloc = !sum.allocs_called.empty();
     sum.returns_free = !sum.frees_called.empty();
+    // Slice C3 — per-parameter metadata populated by process_call_taint.
+    sum.param_sink_uses        = std::move(st.param_sink_uses);
+    sum.param_validators_seen  = std::move(st.param_validators_seen);
+    sum.param_inferred_kinds   = std::move(st.param_inferred_kinds);
+    for (const auto& kv : st.ts.tainted_fields)
+        sum.tainted_fields[kv.first].insert(kv.second.begin(), kv.second.end());
     sum.analyzed = true;
 }
 
@@ -1185,6 +1619,8 @@ std::vector<ea_t> TaintEngine::caller_eas(ea_t callee_ea) const
 void TaintEngine::analyze_all()
 {
     m_summaries.clear();
+    m_forward_reach.clear();
+    m_backward_reach.clear();
     m_analyzed = false;
 
     std::vector<ea_t> functions;
@@ -1226,7 +1662,8 @@ void TaintEngine::analyze_all()
                 prev.tainted_out_param_indices != sum.tainted_out_param_indices ||
                 prev.returns_tainted != sum.returns_tainted ||
                 prev.sinks_reached != sum.sinks_reached ||
-                prev.input_sources_called != sum.input_sources_called)
+                prev.input_sources_called != sum.input_sources_called ||
+                prev.tainted_fields != sum.tainted_fields)
             {
                 changed = true;
             }
@@ -1237,6 +1674,7 @@ void TaintEngine::analyze_all()
     }
 
     m_analyzed = true;
+    build_reachability_index(8);
 }
 
 const func_summary_t* TaintEngine::get_summary(ea_t func_ea) const
@@ -1308,8 +1746,9 @@ std::vector<taint_path_t> TaintEngine::trace_paths(ea_t source_ea, ea_t sink_ea,
             s.condition.clear();
             p.steps.push_back(std::move(s));
             p.conditions = std::move(conditions);
+            p.validator_chain = path_sensitive_sanitizer_gate(source_func_ea, source_ea, sink_ea);
             sink_match_t sm = find_sink_signature(p.sink_name);
-            int cwe = sm.sink != nullptr ? sm.sink->primary_cwe : 0;
+            int cwe = sm.matched() ? sm.primary_cwe : 0;
             p.vulnerability_type = vulnerability_label_from_cwe(cwe);
             p.severity   = severity_from_vulnerability_label(p.vulnerability_type);
             p.confidence = confidence_t::likely;
@@ -1345,11 +1784,13 @@ std::vector<taint_path_t> TaintEngine::trace_paths(ea_t source_ea, ea_t sink_ea,
     sink_match_t sm0 = find_sink_signature(func_name_for(sink_func_ea));
     int sink_arg_index_for_path = -1;
     int sink_cwe = 0;
-    if (sm0.sink != nullptr)
+    if (sm0.matched())
     {
-        sink_name_for_path = std::string(sm0.sink->name);
-        sink_cwe = sm0.sink->primary_cwe;
-        sink_arg_index_for_path = sm0.sink->len_arg_index >= 0 ? sm0.sink->len_arg_index : 0;
+        sink_name_for_path = sm0.sink != nullptr
+                             ? std::string(sm0.sink->name)
+                             : sm0.category;
+        sink_cwe = sm0.primary_cwe;
+        sink_arg_index_for_path = sm0.len_arg_index >= 0 ? sm0.len_arg_index : 0;
     }
 
     std::string source_name_for_path = func_name_for(source_func_ea);
@@ -1376,6 +1817,8 @@ std::vector<taint_path_t> TaintEngine::trace_paths(ea_t source_ea, ea_t sink_ea,
             p.vulnerability_type = vulnerability_label_from_cwe(sink_cwe);
             p.severity   = severity_from_vulnerability_label(p.vulnerability_type);
             const auto* sum = get_summary(cur.func_ea);
+            if (sum != nullptr)
+                p.validator_chain.assign(sum->validators_called.begin(), sum->validators_called.end());
             p.confidence = (sum != nullptr && !sum->validators_called.empty())
                             ? confidence_t::plausible : confidence_t::likely;
             out.push_back(std::move(p));
@@ -1968,6 +2411,1000 @@ TaintEngine& engine()
 {
     static TaintEngine e;
     return e;
+}
+
+// =============================================================================
+// Slice C4 — enumerate_input_callsites
+// =============================================================================
+std::vector<std::tuple<ea_t, ea_t, std::string, taint_kind_t>>
+TaintEngine::enumerate_input_callsites(std::optional<taint_kind_t> only_kind) const
+{
+    std::vector<std::tuple<ea_t, ea_t, std::string, taint_kind_t>> out;
+    std::set<std::pair<ea_t, taint_kind_t>> seen;
+
+    struct row_t { const sig::source_signature_t* arr; size_t n; taint_kind_t kind; };
+    const row_t tables[] = {
+        { sig::INPUT_SOURCES,        std::size(sig::INPUT_SOURCES),        taint_kind_t::user_input    },
+        { sig::RPC_SERVER_SINKS,     std::size(sig::RPC_SERVER_SINKS),     taint_kind_t::rpc_input     },
+        { sig::COM_SERVER_SINKS,     std::size(sig::COM_SERVER_SINKS),     taint_kind_t::com_input     },
+        { sig::ALPC_SOURCES,         std::size(sig::ALPC_SOURCES),         taint_kind_t::alpc_input    },
+        { sig::NAMED_PIPE_SOURCES,   std::size(sig::NAMED_PIPE_SOURCES),   taint_kind_t::named_pipe_input },
+        { sig::SOCKET_ACCEPT_SOURCES,std::size(sig::SOCKET_ACCEPT_SOURCES),taint_kind_t::socket_input  },
+        { sig::HTTP_SERVER_SOURCES,  std::size(sig::HTTP_SERVER_SOURCES),  taint_kind_t::http_input    },
+        { sig::WEBSOCKET_SOURCES,    std::size(sig::WEBSOCKET_SOURCES),    taint_kind_t::websocket_input },
+        { sig::NDIS_WSK_SOURCES,     std::size(sig::NDIS_WSK_SOURCES),     taint_kind_t::ndis_wsk_input  },
+        { sig::KERNEL_IRP_SOURCES,   std::size(sig::KERNEL_IRP_SOURCES),   taint_kind_t::kernel_irp_input },
+    };
+
+    for (const auto& row : tables)
+    {
+        if (only_kind.has_value() &&
+            *only_kind != row.kind &&
+            row.kind != taint_kind_t::user_input)
+            continue;
+        for (size_t i = 0; i < row.n; ++i)
+        {
+            const auto& src = row.arr[i];
+            std::string nm(src.name);
+            taint_kind_t actual_kind = row.kind == taint_kind_t::user_input
+                                       ? kind_from_source_name(nm)
+                                       : row.kind;
+            if (only_kind.has_value() && *only_kind != actual_kind)
+                continue;
+            ea_t sym_ea = get_name_ea(BADADDR, nm.c_str());
+            if (sym_ea == BADADDR) continue;
+            xrefblk_t xb;
+            for (bool ok = xb.first_to(sym_ea, XREF_ALL); ok; ok = xb.next_to())
+            {
+                if (!xb.iscode) continue;
+                if (xb.type != fl_CN && xb.type != fl_CF) continue;
+                func_t* container = get_func(xb.from);
+                ea_t func_ea = container != nullptr ? container->start_ea : BADADDR;
+                if (seen.insert(std::make_pair(xb.from, actual_kind)).second)
+                    out.emplace_back(xb.from, func_ea, nm, actual_kind);
+            }
+        }
+    }
+    return out;
+}
+
+// =============================================================================
+// Slice C5 — enumerate_sink_callsites
+// =============================================================================
+std::vector<std::tuple<ea_t, ea_t, std::string, std::string>>
+TaintEngine::enumerate_sink_callsites() const
+{
+    std::vector<std::tuple<ea_t, ea_t, std::string, std::string>> out;
+    std::set<ea_t> seen_call_eas;
+
+    struct row_t { const sig::sink_signature_t* arr; size_t n; const char* category; };
+    const row_t tables[] = {
+        { sig::BUFFER_OVERFLOW_SINKS,    std::size(sig::BUFFER_OVERFLOW_SINKS),    "buffer_overflow" },
+        { sig::COMMAND_INJECTION_SINKS,  std::size(sig::COMMAND_INJECTION_SINKS),  "command_injection" },
+        { sig::PATH_TRAVERSAL_SINKS,     std::size(sig::PATH_TRAVERSAL_SINKS),     "path_traversal" },
+        { sig::FORMAT_STRING_FUNCS,      std::size(sig::FORMAT_STRING_FUNCS),      "format_string" },
+        { sig::SAFEARRAY_PARSER_SINKS,   std::size(sig::SAFEARRAY_PARSER_SINKS),   "safearray_parser" },
+        { sig::DESERIALIZATION_SINKS,    std::size(sig::DESERIALIZATION_SINKS),    "deserialization" },
+    };
+    for (const auto& row : tables)
+    {
+        for (size_t i = 0; i < row.n; ++i)
+        {
+            std::string nm(row.arr[i].name);
+            ea_t sym_ea = get_name_ea(BADADDR, nm.c_str());
+            if (sym_ea == BADADDR) continue;
+            xrefblk_t xb;
+            for (bool ok = xb.first_to(sym_ea, XREF_ALL); ok; ok = xb.next_to())
+            {
+                if (!xb.iscode) continue;
+                if (xb.type != fl_CN && xb.type != fl_CF) continue;
+                func_t* container = get_func(xb.from);
+                ea_t func_ea = container != nullptr ? container->start_ea : BADADDR;
+                if (seen_call_eas.insert(xb.from).second)
+                    out.emplace_back(xb.from, func_ea, nm, std::string(row.category));
+            }
+        }
+    }
+    int scanned = 0;
+    const std::size_t fq = get_func_qty();
+    for (std::size_t i = 0; i < fq && scanned < kMaxFunctionsToAnalyze; ++i)
+    {
+        func_t* pfn = getn_func(i);
+        if (pfn == nullptr || function_is_skippable(pfn))
+            continue;
+        ++scanned;
+        auto handle = microcode::generate(pfn->start_ea, MMAT_LVARS);
+        if (!handle.has_value() || !handle->mba)
+            continue;
+        mba_t& mba = *handle->mba;
+        for (int b = 0; b < mba.qty; ++b)
+        {
+            mblock_t* blk = mba.get_mblock(static_cast<uint>(b));
+            if (blk == nullptr)
+                continue;
+            for (minsn_t* m = blk->head; m != nullptr; m = m->next)
+            {
+                if (!is_call_op(m->opcode) || m->ea == BADADDR)
+                    continue;
+                funcrole_t role =
+                    (m->d.t == mop_f && m->d.f != nullptr) ? m->d.f->role : ROLE_UNK;
+                sink_match_t sm = sink_match_from_role(role);
+                if (!sm.matched())
+                    continue;
+                if (seen_call_eas.insert(m->ea).second)
+                    out.emplace_back(m->ea, pfn->start_ea, std::string(sink_role_name(role)), sm.category);
+            }
+        }
+    }
+    return out;
+}
+
+// =============================================================================
+// Slice C6 — build_reachability_index (forward + backward)
+// =============================================================================
+const reach_record_t* TaintEngine::forward_reach_for(ea_t func_ea) const
+{
+    auto it = m_forward_reach.find(func_ea);
+    return it == m_forward_reach.end() ? nullptr : &it->second;
+}
+
+const reach_record_t* TaintEngine::backward_reach_for(ea_t func_ea) const
+{
+    auto it = m_backward_reach.find(func_ea);
+    return it == m_backward_reach.end() ? nullptr : &it->second;
+}
+
+void TaintEngine::build_reachability_index(int max_hops)
+{
+    if (max_hops <= 0) max_hops = 8;
+    if (max_hops > 16) max_hops = 16;
+
+    m_forward_reach.clear();
+    m_backward_reach.clear();
+
+    // 1) Build call graph (caller/callee) over analyzed functions, skipping
+    //    FUNC_THUNK/FUNC_LIB.
+    std::unordered_map<ea_t, std::vector<ea_t>> callees;
+    std::unordered_map<ea_t, std::vector<ea_t>> callers;
+
+    const std::size_t fq = get_func_qty();
+    for (std::size_t i = 0; i < fq; ++i)
+    {
+        func_t* pfn = getn_func(i);
+        if (pfn == nullptr) continue;
+        if (function_is_skippable(pfn)) continue;
+        xrefblk_t xb;
+        for (bool ok = xb.first_to(pfn->start_ea, XREF_ALL); ok; ok = xb.next_to())
+        {
+            if (!xb.iscode) continue;
+            if (xb.type != fl_CN && xb.type != fl_CF) continue;
+            func_t* caller = get_func(xb.from);
+            if (caller == nullptr) continue;
+            if (function_is_skippable(caller)) continue;
+            callees[caller->start_ea].push_back(pfn->start_ea);
+            callers[pfn->start_ea].push_back(caller->start_ea);
+        }
+    }
+
+    // 2) Seed forward_reach with sink callsites (C5).
+    auto sinks = enumerate_sink_callsites();
+    for (const auto& tup : sinks)
+    {
+        ea_t call_ea       = std::get<0>(tup);
+        ea_t containing    = std::get<1>(tup);
+        const std::string& nm  = std::get<2>(tup);
+        const std::string& cat = std::get<3>(tup);
+        if (containing == BADADDR) continue;
+        auto& rec = m_forward_reach[containing];
+        rec.sink_categories.insert(cat);
+        if (rec.sink_callsites.size() < 32)
+            rec.sink_callsites.emplace_back(call_ea, nm);
+        else
+            rec.capped = true;
+        rec.min_hops_to_sink = 0;
+    }
+
+    for (auto& kv : m_forward_reach)
+    {
+        const func_summary_t* sum = get_summary(kv.first);
+        if (sum == nullptr) continue;
+        for (const auto& v : sum->validators_called)
+            kv.second.dominant_validators.insert(v);
+    }
+
+    // 3) BFS backward across callers — propagate min_hops_to_sink + categories.
+    std::deque<ea_t> bfs;
+    for (auto& kv : m_forward_reach)
+        bfs.push_back(kv.first);
+    while (!bfs.empty())
+    {
+        ea_t cur = bfs.front();
+        bfs.pop_front();
+        reach_record_t cur_rec = m_forward_reach[cur];
+        int next_hops = cur_rec.min_hops_to_sink + 1;
+        if (next_hops > max_hops) continue;
+        auto it = callers.find(cur);
+        if (it == callers.end()) continue;
+        for (ea_t parent : it->second)
+        {
+            auto& prec = m_forward_reach[parent];
+            bool changed = false;
+            if (next_hops < prec.min_hops_to_sink) {
+                prec.min_hops_to_sink = next_hops;
+                changed = true;
+            }
+            for (const auto& c : cur_rec.sink_categories)
+                if (prec.sink_categories.insert(c).second) changed = true;
+            for (const auto& v : cur_rec.dominant_validators)
+                if (prec.dominant_validators.insert(v).second) changed = true;
+            for (const auto& sc : cur_rec.sink_callsites)
+            {
+                if (prec.sink_callsites.size() >= 32) { prec.capped = true; break; }
+                bool exists = false;
+                for (const auto& have : prec.sink_callsites)
+                {
+                    if (have.first == sc.first)
+                    {
+                        exists = true;
+                        break;
+                    }
+                }
+                if (!exists)
+                {
+                    prec.sink_callsites.push_back(sc);
+                    changed = true;
+                }
+            }
+            if (changed)
+                bfs.push_back(parent);
+        }
+    }
+
+    // 4) Seed backward_reach with input callsites (C4).
+    auto inputs = enumerate_input_callsites();
+    for (const auto& tup : inputs)
+    {
+        ea_t containing = std::get<1>(tup);
+        ea_t call_ea = std::get<0>(tup);
+        const std::string& name = std::get<2>(tup);
+        taint_kind_t k  = std::get<3>(tup);
+        if (containing == BADADDR) continue;
+        auto& rec = m_backward_reach[containing];
+        rec.input_kinds.insert(k);
+        if (rec.input_callsites.size() < 32)
+            rec.input_callsites.emplace_back(call_ea, name);
+        else
+            rec.capped = true;
+        rec.min_hops_from_source = 0;
+    }
+    // BFS forward across callees.
+    std::deque<ea_t> bfs2;
+    for (auto& kv : m_backward_reach)
+        bfs2.push_back(kv.first);
+    while (!bfs2.empty())
+    {
+        ea_t cur = bfs2.front();
+        bfs2.pop_front();
+        reach_record_t cur_rec = m_backward_reach[cur];
+        int next_hops = cur_rec.min_hops_from_source + 1;
+        if (next_hops > max_hops) continue;
+        auto it = callees.find(cur);
+        if (it == callees.end()) continue;
+        for (ea_t child : it->second)
+        {
+            auto& crec = m_backward_reach[child];
+            bool changed = false;
+            if (next_hops < crec.min_hops_from_source) {
+                crec.min_hops_from_source = next_hops;
+                changed = true;
+            }
+            for (auto k : cur_rec.input_kinds)
+                if (crec.input_kinds.insert(k).second) changed = true;
+            for (const auto& ic : cur_rec.input_callsites)
+            {
+                if (crec.input_callsites.size() >= 32) { crec.capped = true; break; }
+                bool exists = false;
+                for (const auto& have : crec.input_callsites)
+                {
+                    if (have.first == ic.first)
+                    {
+                        exists = true;
+                        break;
+                    }
+                }
+                if (!exists)
+                {
+                    crec.input_callsites.push_back(ic);
+                    changed = true;
+                }
+            }
+            if (changed)
+                bfs2.push_back(child);
+        }
+    }
+
+    // 5) Dominant validators per forward_reach node from func_summary_t.
+    for (auto& kv : m_forward_reach)
+    {
+        const func_summary_t* sum = get_summary(kv.first);
+        if (sum == nullptr) continue;
+        for (const auto& v : sum->validators_called)
+            kv.second.dominant_validators.insert(v);
+    }
+}
+
+// =============================================================================
+// Slice C7 — path_sensitive_sanitizer_gate
+// =============================================================================
+std::vector<std::string>
+TaintEngine::path_sensitive_sanitizer_gate(ea_t func_ea, ea_t source_ea, ea_t sink_ea) const
+{
+    std::vector<std::string> out;
+    func_t* pfn = get_func(func_ea);
+    if (pfn == nullptr) return out;
+    auto handle = microcode::generate(func_ea, MMAT_LVARS);
+    if (!handle.has_value() || !handle->mba) return out;
+    mba_t& mba = *handle->mba;
+
+    bool started = false;
+    bool stopped = false;
+    auto match_helper = [](const std::string& nm) -> bool {
+        for (const auto& v : sig::LENGTH_VALIDATOR_HELPERS)
+            if (name_matches_signature(nm, v)) return true;
+        for (const auto& v : sig::AUTH_GATE_HELPERS)
+            if (name_matches_signature(nm, v)) return true;
+        return false;
+    };
+
+    for (int b = 0; b < mba.qty && !stopped; ++b)
+    {
+        mblock_t* blk = mba.get_mblock(static_cast<uint>(b));
+        if (blk == nullptr) continue;
+        for (minsn_t* m = blk->head; m != nullptr; m = m->next)
+        {
+            if (m->ea == source_ea) { started = true; continue; }
+            if (m->ea == sink_ea)   { stopped = true; break; }
+            if (!started) continue;
+            if (!is_call_op(m->opcode)) continue;
+            std::string nm; ea_t ce = BADADDR;
+            if (!resolve_callee_simple(*m, nm, ce)) continue;
+            if (match_helper(nm))
+                out.push_back(nm);
+        }
+    }
+    // Deduplicate preserving order.
+    std::set<std::string> seen;
+    std::vector<std::string> dedup;
+    for (auto& s : out) if (seen.insert(s).second) dedup.push_back(std::move(s));
+    return dedup;
+}
+
+// =============================================================================
+// Slice C8 — trace_paths_reverse (BFS backward via callers).
+// =============================================================================
+std::vector<taint_path_t>
+TaintEngine::trace_paths_reverse(ea_t sink_ea, int max_paths, int max_depth)
+{
+    std::vector<taint_path_t> out;
+    if (max_paths <= 0) max_paths = 16;
+    if (max_paths > 64) max_paths = 64;
+    if (max_depth <= 0) max_depth = 10;
+    if (max_depth > 16) max_depth = 16;
+    if (!m_analyzed) analyze_all();
+    if (m_forward_reach.empty() || m_backward_reach.empty())
+        build_reachability_index(max_depth);
+
+    ea_t sink_func_ea = containing_func_ea(sink_ea);
+    if (sink_func_ea == BADADDR) return out;
+
+    TaintCallGraph cg; cg.build();
+
+    struct frame_t {
+        ea_t func_ea;
+        std::vector<taint_path_step_t> steps;
+        std::set<ea_t> visited;
+    };
+    std::deque<frame_t> queue;
+    frame_t start; start.func_ea = sink_func_ea; start.visited.insert(sink_func_ea);
+    taint_path_step_t s0;
+    s0.ea = sink_ea; s0.func_ea = sink_func_ea;
+    s0.func_name = func_name_for(sink_func_ea);
+    s0.description = OBFSTR("sink callsite");
+    start.steps.push_back(std::move(s0));
+    queue.push_back(std::move(start));
+
+    while (!queue.empty() && static_cast<int>(out.size()) < max_paths)
+    {
+        frame_t cur = std::move(queue.front()); queue.pop_front();
+        // Source-detection: if current function has input_kinds, emit a path.
+        const reach_record_t* br = backward_reach_for(cur.func_ea);
+        if (br != nullptr && !br->input_kinds.empty())
+        {
+            taint_path_t p;
+            p.origin.source_func_ea = cur.func_ea;
+            p.origin.source_ea      = br->input_callsites.empty()
+                                      ? cur.func_ea
+                                      : br->input_callsites.front().first;
+            p.origin.source_name    = br->input_callsites.empty()
+                                      ? func_name_for(cur.func_ea)
+                                      : br->input_callsites.front().second;
+            p.origin.kind           = *br->input_kinds.begin();
+            p.sink_ea       = sink_ea;
+            p.sink_func_ea  = sink_func_ea;
+            p.sink_name     = func_name_for(sink_func_ea);
+            p.steps         = cur.steps;
+            p.vulnerability_type = "tainted_sink";
+            p.severity      = severity_t::medium;
+            p.confidence    = confidence_t::plausible;
+            const func_summary_t* sum = get_summary(cur.func_ea);
+            if (sum != nullptr)
+                p.validator_chain.assign(sum->validators_called.begin(), sum->validators_called.end());
+            out.push_back(std::move(p));
+            continue;
+        }
+        if (static_cast<int>(cur.steps.size()) >= max_depth) continue;
+        const auto& cs = cg.callers_of(cur.func_ea);
+        for (ea_t parent : cs)
+        {
+            if (cur.visited.count(parent)) continue;
+            // Pruning via forward_reach: only walk parents that reach the sink.
+            const reach_record_t* fr = forward_reach_for(parent);
+            if (fr == nullptr) continue;
+            frame_t nf = cur; nf.func_ea = parent; nf.visited.insert(parent);
+            taint_path_step_t st;
+            st.ea = BADADDR; st.func_ea = parent;
+            st.func_name = func_name_for(parent);
+            st.description = OBFSTR("caller hop");
+            nf.steps.push_back(std::move(st));
+            queue.push_back(std::move(nf));
+        }
+    }
+    return out;
+}
+
+// =============================================================================
+// Slice C9 — trace_all_network_to_sinks
+// =============================================================================
+std::vector<taint_path_t>
+TaintEngine::trace_all_network_to_sinks(bool require_unsanitized, int max_paths,
+                                        int max_depth,
+                                        std::optional<taint_kind_t> only_kind)
+{
+    std::vector<taint_path_t> out;
+    if (max_paths <= 0) max_paths = 64;
+    if (max_paths > 256) max_paths = 256;
+    if (!m_analyzed) analyze_all();
+    if (m_forward_reach.empty()) build_reachability_index(max_depth);
+
+    auto inputs = enumerate_input_callsites(only_kind);
+    struct scored_t { taint_path_t path; int score; };
+    std::vector<scored_t> ranked;
+
+    for (const auto& tup : inputs)
+    {
+        if (static_cast<int>(ranked.size()) >= max_paths * 2) break;
+        ea_t src_call_ea = std::get<0>(tup);
+        ea_t src_func    = std::get<1>(tup);
+        const std::string& src_nm = std::get<2>(tup);
+        taint_kind_t k   = std::get<3>(tup);
+        if (src_func == BADADDR) continue;
+        const reach_record_t* fr = forward_reach_for(src_func);
+        if (fr == nullptr) continue;
+        if (fr->sink_callsites.empty()) continue;
+
+        for (const auto& sc : fr->sink_callsites)
+        {
+            std::vector<std::string> validators(fr->dominant_validators.begin(),
+                                                fr->dominant_validators.end());
+            ea_t sink_func = containing_func_ea(sc.first);
+            if (sink_func == src_func)
+            {
+                std::vector<std::string> local =
+                    path_sensitive_sanitizer_gate(src_func, src_call_ea, sc.first);
+                validators.insert(validators.end(), local.begin(), local.end());
+            }
+            std::sort(validators.begin(), validators.end());
+            validators.erase(std::unique(validators.begin(), validators.end()), validators.end());
+            if (require_unsanitized && !validators.empty())
+                continue;
+
+            taint_path_t p;
+            p.origin.source_ea      = src_call_ea;
+            p.origin.source_func_ea = src_func;
+            p.origin.source_name    = src_nm;
+            p.origin.kind           = k;
+            p.sink_ea       = sc.first;
+            p.sink_func_ea  = sink_func;
+            p.sink_name     = sc.second;
+            p.vulnerability_type = "tainted_sink";
+            p.severity   = severity_t::medium;
+            p.confidence = validators.empty()
+                            ? confidence_t::likely : confidence_t::plausible;
+            p.validator_chain = std::move(validators);
+
+            int validator_count = static_cast<int>(p.validator_chain.size());
+            int path_length     = fr->min_hops_to_sink == INT_MAX
+                                    ? 16 : fr->min_hops_to_sink;
+            int kind_spec       = (k == taint_kind_t::user_input) ? 1 : 2;
+            int score = -(path_length + validator_count * 2) + kind_spec * 10;
+            ranked.push_back({ std::move(p), score });
+        }
+    }
+    std::stable_sort(ranked.begin(), ranked.end(),
+                     [](const scored_t& a, const scored_t& b) { return a.score > b.score; });
+    for (auto& s : ranked)
+    {
+        if (static_cast<int>(out.size()) >= max_paths) break;
+        out.push_back(std::move(s.path));
+    }
+    return out;
+}
+
+// =============================================================================
+// Slice C10 — function_taint_brief
+// =============================================================================
+nlohmann::json TaintEngine::function_taint_brief(ea_t func_ea) const
+{
+    nlohmann::json j;
+    j["func_ea"] = ea_to_hex(func_ea);
+    j["func_name"] = func_name_for(func_ea);
+    const func_summary_t* sum = get_summary(func_ea);
+    if (sum == nullptr) {
+        j["analyzed"] = false;
+        return j;
+    }
+    j["analyzed"]    = sum->analyzed;
+    j["cyclomatic"] = sum->cyclomatic;
+    j["returns_tainted"] = sum->returns_tainted;
+
+    nlohmann::json params = nlohmann::json::object();
+    auto add_param = [&](int p_idx) {
+        nlohmann::json pj;
+        pj["index"] = p_idx;
+        pj["tainted_in"]  = sum->tainted_param_indices.count(p_idx) > 0;
+        pj["tainted_out"] = sum->tainted_out_param_indices.count(p_idx) > 0;
+        pj["passed_to_sink"] = sum->params_passed_to_sinks.count(p_idx) > 0;
+        pj["validated"]      = sum->params_validated.count(p_idx) > 0;
+        pj["freed"]          = sum->params_freed.count(p_idx) > 0;
+        nlohmann::json sink_uses = nlohmann::json::array();
+        auto it = sum->param_sink_uses.find(p_idx);
+        if (it != sum->param_sink_uses.end()) {
+            for (const auto& tup : it->second) {
+                nlohmann::json e;
+                e["sink_name"] = std::get<0>(tup);
+                e["category"]  = std::get<1>(tup);
+                e["arg_idx"]   = std::get<2>(tup);
+                sink_uses.push_back(std::move(e));
+            }
+        }
+        pj["sink_uses"] = std::move(sink_uses);
+        auto vit = sum->param_validators_seen.find(p_idx);
+        nlohmann::json vs = nlohmann::json::array();
+        if (vit != sum->param_validators_seen.end())
+            for (auto& v : vit->second) vs.push_back(v);
+        pj["validators_seen"] = std::move(vs);
+        auto kit = sum->param_inferred_kinds.find(p_idx);
+        nlohmann::json ks = nlohmann::json::array();
+        if (kit != sum->param_inferred_kinds.end())
+            for (auto k : kit->second) ks.push_back(taint_kind_str(k));
+        pj["inferred_kinds"] = std::move(ks);
+        params[std::to_string(p_idx)] = std::move(pj);
+    };
+    std::set<int> all_params;
+    for (int p : sum->tainted_param_indices) all_params.insert(p);
+    for (int p : sum->tainted_out_param_indices) all_params.insert(p);
+    for (int p : sum->params_passed_to_sinks) all_params.insert(p);
+    for (int p : sum->params_validated) all_params.insert(p);
+    for (int p : sum->params_freed) all_params.insert(p);
+    for (auto& kv : sum->param_sink_uses) all_params.insert(kv.first);
+    for (auto& kv : sum->param_validators_seen) all_params.insert(kv.first);
+    for (auto& kv : sum->param_inferred_kinds) all_params.insert(kv.first);
+    for (int p : all_params) add_param(p);
+    j["params"] = std::move(params);
+
+    nlohmann::json sinks_arr = nlohmann::json::array();
+    for (const auto& s : sum->sinks_reached) sinks_arr.push_back(s);
+    j["sinks_reached"] = std::move(sinks_arr);
+    nlohmann::json src_arr = nlohmann::json::array();
+    for (const auto& s : sum->input_sources_called) src_arr.push_back(s);
+    j["input_sources_called"] = std::move(src_arr);
+    nlohmann::json v_arr = nlohmann::json::array();
+    for (const auto& v : sum->validators_called) v_arr.push_back(v);
+    j["validators_called"] = std::move(v_arr);
+
+    std::unordered_map<int, int> lvar_to_param;
+    auto handle = microcode::generate(func_ea, MMAT_LVARS);
+    if (handle.has_value() && handle->mba)
+    {
+        const mba_t& mba = *handle->mba;
+        for (size_t i = 0; i < mba.argidx.size(); ++i)
+            lvar_to_param[mba.argidx[i]] = static_cast<int>(i);
+    }
+
+    nlohmann::json fields = nlohmann::json::array();
+    for (const auto& kv : sum->tainted_fields)
+    {
+        nlohmann::json fj;
+        fj["base_lvar_idx"] = kv.first;
+        auto pit = lvar_to_param.find(kv.first);
+        fj["param_index"] = pit == lvar_to_param.end() ? -1 : pit->second;
+        nlohmann::json offsets = nlohmann::json::array();
+        for (int off : kv.second)
+            offsets.push_back(off);
+        fj["field_offsets"] = std::move(offsets);
+        fields.push_back(std::move(fj));
+    }
+    j["tainted_fields"] = std::move(fields);
+
+    nlohmann::json input_callsites = nlohmann::json::array();
+    for (const auto& row : enumerate_input_callsites())
+    {
+        if (std::get<1>(row) != func_ea)
+            continue;
+        nlohmann::json cj;
+        cj["call_ea"] = ea_to_hex(std::get<0>(row));
+        cj["name"] = std::get<2>(row);
+        cj["kind"] = taint_kind_str(std::get<3>(row));
+        input_callsites.push_back(std::move(cj));
+    }
+    j["input_callsites"] = std::move(input_callsites);
+
+    nlohmann::json sink_callsites = nlohmann::json::array();
+    for (const auto& row : enumerate_sink_callsites())
+    {
+        if (std::get<1>(row) != func_ea)
+            continue;
+        nlohmann::json cj;
+        cj["call_ea"] = ea_to_hex(std::get<0>(row));
+        cj["name"] = std::get<2>(row);
+        cj["category"] = std::get<3>(row);
+        sink_callsites.push_back(std::move(cj));
+    }
+    j["sink_callsites"] = std::move(sink_callsites);
+
+    const reach_record_t* fr = forward_reach_for(func_ea);
+    if (fr != nullptr) {
+        nlohmann::json frj;
+        nlohmann::json cats = nlohmann::json::array();
+        for (auto& c : fr->sink_categories) cats.push_back(c);
+        frj["sink_categories"] = std::move(cats);
+        nlohmann::json scalls = nlohmann::json::array();
+        for (const auto& sc : fr->sink_callsites) {
+            nlohmann::json sj;
+            sj["call_ea"] = ea_to_hex(sc.first);
+            sj["name"] = sc.second;
+            scalls.push_back(std::move(sj));
+        }
+        frj["sink_callsites"] = std::move(scalls);
+        nlohmann::json dvs = nlohmann::json::array();
+        for (const auto& v : fr->dominant_validators) dvs.push_back(v);
+        frj["dominant_validators"] = std::move(dvs);
+        frj["min_hops_to_sink"] = fr->min_hops_to_sink == INT_MAX ? -1 : fr->min_hops_to_sink;
+        frj["capped"] = fr->capped;
+        j["forward_reach"] = std::move(frj);
+    }
+    const reach_record_t* br = backward_reach_for(func_ea);
+    if (br != nullptr) {
+        nlohmann::json brj;
+        nlohmann::json kinds = nlohmann::json::array();
+        for (auto k : br->input_kinds) kinds.push_back(taint_kind_str(k));
+        brj["input_kinds"] = std::move(kinds);
+        nlohmann::json icalls = nlohmann::json::array();
+        for (const auto& ic : br->input_callsites) {
+            nlohmann::json ij;
+            ij["call_ea"] = ea_to_hex(ic.first);
+            ij["name"] = ic.second;
+            icalls.push_back(std::move(ij));
+        }
+        brj["input_callsites"] = std::move(icalls);
+        brj["min_hops_from_source"] = br->min_hops_from_source == INT_MAX ? -1 : br->min_hops_from_source;
+        brj["capped"] = br->capped;
+        j["backward_reach"] = std::move(brj);
+    }
+    return j;
+}
+
+// =============================================================================
+// Slice C11 — persistent summary cache (netnode-backed)
+// =============================================================================
+namespace {
+
+// Slice C11: encode taint_kind_t as int for JSON map keys.
+nlohmann::json summary_to_json(const func_summary_t& s)
+{
+    nlohmann::json j;
+    j["func_ea"] = static_cast<uint64_t>(s.func_ea);
+    j["name"]    = s.name;
+    j["analyzed"] = s.analyzed;
+    j["cyclomatic"] = s.cyclomatic;
+    j["returns_tainted"] = s.returns_tainted;
+    j["returns_alloc"]   = s.returns_alloc;
+    j["returns_free"]    = s.returns_free;
+    auto pack_int_set = [](const std::set<int>& xs) { nlohmann::json a = nlohmann::json::array(); for (int x : xs) a.push_back(x); return a; };
+    auto pack_str_set = [](const std::set<std::string>& xs) { nlohmann::json a = nlohmann::json::array(); for (auto& x : xs) a.push_back(x); return a; };
+    auto pack_kind_set = [](const std::set<taint_kind_t>& xs) { nlohmann::json a = nlohmann::json::array(); for (auto x : xs) a.push_back(static_cast<int>(x)); return a; };
+    j["tainted_param_indices"]     = pack_int_set(s.tainted_param_indices);
+    j["tainted_out_param_indices"] = pack_int_set(s.tainted_out_param_indices);
+    j["params_passed_to_sinks"]    = pack_int_set(s.params_passed_to_sinks);
+    j["params_validated"]          = pack_int_set(s.params_validated);
+    j["params_freed"]              = pack_int_set(s.params_freed);
+    j["sinks_reached"]    = pack_str_set(s.sinks_reached);
+    j["validators_called"]= pack_str_set(s.validators_called);
+    j["allocs_called"]    = pack_str_set(s.allocs_called);
+    j["frees_called"]     = pack_str_set(s.frees_called);
+    j["input_sources_called"] = pack_str_set(s.input_sources_called);
+    nlohmann::json sink_uses = nlohmann::json::object();
+    for (const auto& kv : s.param_sink_uses) {
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& t : kv.second) {
+            nlohmann::json row;
+            row["sink_name"] = std::get<0>(t);
+            row["category"] = std::get<1>(t);
+            row["arg_idx"] = std::get<2>(t);
+            arr.push_back(std::move(row));
+        }
+        sink_uses[std::to_string(kv.first)] = std::move(arr);
+    }
+    j["param_sink_uses"] = std::move(sink_uses);
+    nlohmann::json validators = nlohmann::json::object();
+    for (const auto& kv : s.param_validators_seen)
+        validators[std::to_string(kv.first)] = pack_str_set(kv.second);
+    j["param_validators_seen"] = std::move(validators);
+    nlohmann::json kinds = nlohmann::json::object();
+    for (const auto& kv : s.param_inferred_kinds)
+        kinds[std::to_string(kv.first)] = pack_kind_set(kv.second);
+    j["param_inferred_kinds"] = std::move(kinds);
+    nlohmann::json fields = nlohmann::json::object();
+    for (const auto& kv : s.tainted_fields)
+        fields[std::to_string(kv.first)] = pack_int_set(kv.second);
+    j["tainted_fields"] = std::move(fields);
+    return j;
+}
+void summary_from_json(const nlohmann::json& j, func_summary_t& s)
+{
+    s.func_ea = static_cast<ea_t>(j.value("func_ea", static_cast<std::uint64_t>(BADADDR)));
+    s.name    = j.value("name", std::string());
+    s.analyzed = j.value("analyzed", false);
+    s.cyclomatic = j.value("cyclomatic", 0);
+    s.returns_tainted = j.value("returns_tainted", false);
+    s.returns_alloc   = j.value("returns_alloc", false);
+    s.returns_free    = j.value("returns_free", false);
+    auto load_int_set = [&](const char* k, std::set<int>& dst) {
+        if (j.contains(k) && j[k].is_array()) for (auto& v : j[k]) dst.insert(v.get<int>());
+    };
+    auto load_str_set = [&](const char* k, std::set<std::string>& dst) {
+        if (j.contains(k) && j[k].is_array()) for (auto& v : j[k]) dst.insert(v.get<std::string>());
+    };
+    load_int_set("tainted_param_indices",     s.tainted_param_indices);
+    load_int_set("tainted_out_param_indices", s.tainted_out_param_indices);
+    load_int_set("params_passed_to_sinks",    s.params_passed_to_sinks);
+    load_int_set("params_validated",          s.params_validated);
+    load_int_set("params_freed",              s.params_freed);
+    load_str_set("sinks_reached",     s.sinks_reached);
+    load_str_set("validators_called", s.validators_called);
+    load_str_set("allocs_called",     s.allocs_called);
+    load_str_set("frees_called",      s.frees_called);
+    load_str_set("input_sources_called", s.input_sources_called);
+    auto parse_index = [](const std::string& k) -> int {
+        try {
+            return std::stoi(k);
+        } catch (...) {
+            return -1;
+        }
+    };
+    if (j.contains("param_sink_uses") && j["param_sink_uses"].is_object()) {
+        for (auto it = j["param_sink_uses"].begin(); it != j["param_sink_uses"].end(); ++it) {
+            int idx = parse_index(it.key());
+            if (idx < 0 || !it.value().is_array()) continue;
+            for (const auto& row : it.value()) {
+                if (!row.is_object()) continue;
+                s.param_sink_uses[idx].emplace(
+                    row.value("sink_name", std::string()),
+                    row.value("category", std::string()),
+                    row.value("arg_idx", -1));
+            }
+        }
+    }
+    if (j.contains("param_validators_seen") && j["param_validators_seen"].is_object()) {
+        for (auto it = j["param_validators_seen"].begin(); it != j["param_validators_seen"].end(); ++it) {
+            int idx = parse_index(it.key());
+            if (idx < 0 || !it.value().is_array()) continue;
+            for (const auto& v : it.value())
+                s.param_validators_seen[idx].insert(v.get<std::string>());
+        }
+    }
+    if (j.contains("param_inferred_kinds") && j["param_inferred_kinds"].is_object()) {
+        for (auto it = j["param_inferred_kinds"].begin(); it != j["param_inferred_kinds"].end(); ++it) {
+            int idx = parse_index(it.key());
+            if (idx < 0 || !it.value().is_array()) continue;
+            for (const auto& v : it.value())
+                s.param_inferred_kinds[idx].insert(static_cast<taint_kind_t>(v.get<int>()));
+        }
+    }
+    if (j.contains("tainted_fields") && j["tainted_fields"].is_object()) {
+        for (auto it = j["tainted_fields"].begin(); it != j["tainted_fields"].end(); ++it) {
+            int idx = parse_index(it.key());
+            if (idx < 0 || !it.value().is_array()) continue;
+            for (const auto& v : it.value())
+                s.tainted_fields[idx].insert(v.get<int>());
+        }
+    }
+}
+
+nlohmann::json reach_record_to_json(const reach_record_t& r)
+{
+    nlohmann::json j;
+    nlohmann::json input_kinds = nlohmann::json::array();
+    for (auto k : r.input_kinds)
+        input_kinds.push_back(static_cast<int>(k));
+    j["input_kinds"] = std::move(input_kinds);
+    nlohmann::json input_callsites = nlohmann::json::array();
+    for (const auto& ic : r.input_callsites) {
+        nlohmann::json row;
+        row["ea"] = static_cast<std::uint64_t>(ic.first);
+        row["name"] = ic.second;
+        input_callsites.push_back(std::move(row));
+    }
+    j["input_callsites"] = std::move(input_callsites);
+    nlohmann::json categories = nlohmann::json::array();
+    for (const auto& c : r.sink_categories)
+        categories.push_back(c);
+    j["sink_categories"] = std::move(categories);
+    nlohmann::json sink_callsites = nlohmann::json::array();
+    for (const auto& sc : r.sink_callsites) {
+        nlohmann::json row;
+        row["ea"] = static_cast<std::uint64_t>(sc.first);
+        row["name"] = sc.second;
+        sink_callsites.push_back(std::move(row));
+    }
+    j["sink_callsites"] = std::move(sink_callsites);
+    nlohmann::json validators = nlohmann::json::array();
+    for (const auto& v : r.dominant_validators)
+        validators.push_back(v);
+    j["dominant_validators"] = std::move(validators);
+    j["capped"] = r.capped;
+    j["min_hops_to_sink"] = r.min_hops_to_sink;
+    j["min_hops_from_source"] = r.min_hops_from_source;
+    return j;
+}
+
+void reach_record_from_json(const nlohmann::json& j, reach_record_t& r)
+{
+    if (j.contains("input_kinds") && j["input_kinds"].is_array())
+        for (const auto& v : j["input_kinds"])
+            r.input_kinds.insert(static_cast<taint_kind_t>(v.get<int>()));
+    if (j.contains("input_callsites") && j["input_callsites"].is_array())
+        for (const auto& row : j["input_callsites"])
+            if (row.is_object())
+                r.input_callsites.emplace_back(
+                    static_cast<ea_t>(row.value("ea", static_cast<std::uint64_t>(BADADDR))),
+                    row.value("name", std::string()));
+    if (j.contains("sink_categories") && j["sink_categories"].is_array())
+        for (const auto& v : j["sink_categories"])
+            r.sink_categories.insert(v.get<std::string>());
+    if (j.contains("sink_callsites") && j["sink_callsites"].is_array())
+        for (const auto& row : j["sink_callsites"])
+            if (row.is_object())
+                r.sink_callsites.emplace_back(
+                    static_cast<ea_t>(row.value("ea", static_cast<std::uint64_t>(BADADDR))),
+                    row.value("name", std::string()));
+    if (j.contains("dominant_validators") && j["dominant_validators"].is_array())
+        for (const auto& v : j["dominant_validators"])
+            r.dominant_validators.insert(v.get<std::string>());
+    r.capped = j.value("capped", false);
+    r.min_hops_to_sink = j.value("min_hops_to_sink", INT_MAX);
+    r.min_hops_from_source = j.value("min_hops_from_source", INT_MAX);
+}
+
+nlohmann::json reach_map_to_json(const std::unordered_map<ea_t, reach_record_t>& m)
+{
+    nlohmann::json arr = nlohmann::json::array();
+    for (const auto& kv : m) {
+        nlohmann::json row;
+        row["func_ea"] = static_cast<std::uint64_t>(kv.first);
+        row["record"] = reach_record_to_json(kv.second);
+        arr.push_back(std::move(row));
+    }
+    return arr;
+}
+
+void reach_map_from_json(const nlohmann::json& j, std::unordered_map<ea_t, reach_record_t>& out)
+{
+    if (!j.is_array())
+        return;
+    for (const auto& row : j) {
+        if (!row.is_object() || !row.contains("record"))
+            continue;
+        reach_record_t rec;
+        reach_record_from_json(row["record"], rec);
+        ea_t func_ea = static_cast<ea_t>(row.value("func_ea", static_cast<std::uint64_t>(BADADDR)));
+        if (func_ea == BADADDR)
+            continue;
+        out[func_ea] = std::move(rec);
+    }
+}
+
+std::string compute_binary_cache_key()
+{
+    uchar md5[16] = {0};
+    if (!retrieve_input_file_md5(md5))
+        return {};
+    std::ostringstream ss;
+    for (int i = 0; i < 16; ++i)
+        ss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(md5[i]);
+    ss << ":" << sig::SIGNATURE_DATABASE_REVISION;
+    return ss.str();
+}
+
+constexpr const char kTaintCacheNetnodeName[] = "$ AiDA.taint.cache";
+constexpr uchar      kTaintCacheBlobTag       = 'T';
+constexpr nodeidx_t  kTaintCacheBlobStart     = 0;
+constexpr std::size_t kTaintCacheMaxBlobBytes = 1024u * 1024u;
+
+} // namespace
+
+bool TaintEngine::save_summaries_to_netnode() const
+{
+    std::string key = compute_binary_cache_key();
+    if (key.empty()) return false;
+    nlohmann::json doc;
+    doc["key"] = key;
+    nlohmann::json sums = nlohmann::json::array();
+    for (const auto& kv : m_summaries)
+        sums.push_back(summary_to_json(kv.second));
+    doc["summaries"] = std::move(sums);
+    doc["forward_reach"] = reach_map_to_json(m_forward_reach);
+    doc["backward_reach"] = reach_map_to_json(m_backward_reach);
+    std::vector<std::uint8_t> cbor = nlohmann::json::to_cbor(doc);
+    if (cbor.empty()) return false;
+    if (cbor.size() > kTaintCacheMaxBlobBytes) return false;
+    netnode nn(kTaintCacheNetnodeName, 0, true);
+    if (nn == BADNODE) return false;
+    nn.delblob(kTaintCacheBlobStart, kTaintCacheBlobTag);
+    if (!nn.setblob(cbor.data(), cbor.size(), kTaintCacheBlobStart, kTaintCacheBlobTag))
+        return false;
+    return true;
+}
+
+bool TaintEngine::load_summaries_from_netnode()
+{
+    std::string key = compute_binary_cache_key();
+    if (key.empty()) return false;
+    netnode nn(kTaintCacheNetnodeName, 0, false);
+    if (nn == BADNODE) return false;
+    size_t sz = 0;
+    void* blob = nn.getblob(nullptr, &sz, kTaintCacheBlobStart, kTaintCacheBlobTag);
+    if (blob == nullptr || sz == 0) {
+        if (blob != nullptr) qfree(blob);
+        return false;
+    }
+    std::vector<std::uint8_t> buf(static_cast<std::uint8_t*>(blob),
+                                  static_cast<std::uint8_t*>(blob) + sz);
+    qfree(blob);
+    nlohmann::json doc;
+    try {
+        doc = nlohmann::json::from_cbor(buf);
+    } catch (...) {
+        return false;
+    }
+    std::string have = doc.value("key", std::string());
+    if (have != key) return false;
+    m_summaries.clear();
+    m_forward_reach.clear();
+    m_backward_reach.clear();
+    if (doc.contains("summaries") && doc["summaries"].is_array()) {
+        for (const auto& sj : doc["summaries"]) {
+            func_summary_t s;
+            summary_from_json(sj, s);
+            m_summaries[s.func_ea] = std::move(s);
+        }
+    }
+    if (doc.contains("forward_reach"))
+        reach_map_from_json(doc["forward_reach"], m_forward_reach);
+    if (doc.contains("backward_reach"))
+        reach_map_from_json(doc["backward_reach"], m_backward_reach);
+    m_analyzed = !m_summaries.empty();
+    return m_analyzed;
 }
 
 namespace tools

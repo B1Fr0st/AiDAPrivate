@@ -1,8 +1,10 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
+#include <utility>
 #include <vector>
 #include <string>
 
@@ -41,11 +43,20 @@ mba_maturity_t parse_maturity(const std::string& s);
 const char*    maturity_str(mba_maturity_t mat);
 
 std::optional<mba_handle_t> generate(ea_t func_ea, mba_maturity_t mat = MMAT_LVARS);
+std::vector<mba_handle_t> generate_at_maturities(ea_t func_ea, const std::vector<mba_maturity_t>& mats);
 
 nlohmann::json dump_mba(const mba_t& mba, size_t inst_offset, size_t inst_limit);
 
 nlohmann::json mop_to_json(const mop_t& op);
 nlohmann::json minsn_to_json(const minsn_t& ins);
+
+void iter_with_visitors(mba_t& mba,
+                        const std::function<bool(int, minsn_t&)>& insn_visitor,
+                        const std::function<bool(int, mop_t&, bool)>& mop_visitor = {});
+
+std::pair<mlist_t, mlist_t> build_use_def_lists(mblock_t& blk,
+                                                const minsn_t& ins,
+                                                maymust_t mm = MAY_ACCESS);
 
 struct def_use_t
 {
@@ -86,6 +97,13 @@ bool insn_predates(const mba_t& mba, ea_t earlier_ea, ea_t later_ea);
 
 ea_t find_first_call_to(mba_t& mba, const std::vector<std::string>& callee_names);
 std::vector<ea_t> find_all_calls_to(mba_t& mba, const std::vector<std::string>& callee_names);
+
+bool hexrays_query_use_def(ea_t func_ea,
+                           ea_t at_ea,
+                           const mop_t& op,
+                           bool def_not_use,
+                           mlist_t* out_list,
+                           qstring* err);
 
 }
 }

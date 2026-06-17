@@ -2355,15 +2355,29 @@ namespace driver_bridge
 
     static std::vector<module_info_t> enumerate_modules_usermode(uint32_t pid, HANDLE process)
     {
+        const ULONGLONG t0 = GetTickCount64();
         std::vector<module_info_t> result;
 
-        auto snapshot = make_handle(CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid));
+        SetLastError(ERROR_SUCCESS);
+        HANDLE raw_snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+        DWORD snapshot_error = raw_snapshot == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+        diag::log_tagged_critical_fmt("driver",
+            "enumerate_modules_usermode_toolhelp_snapshot pid=%u process=%p handle=%p gle=%lu elapsed_ms=%llu",
+            pid,
+            process,
+            raw_snapshot == INVALID_HANDLE_VALUE ? nullptr : raw_snapshot,
+            static_cast<unsigned long>(snapshot_error),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        auto snapshot = make_handle(raw_snapshot);
         if (!snapshot)
             return result;
 
         MODULEENTRY32W me = {};
         me.dwSize = sizeof(me);
-        if (Module32FirstW(snapshot.get(), &me)) {
+        SetLastError(ERROR_SUCCESS);
+        BOOL first_ok = Module32FirstW(snapshot.get(), &me);
+        DWORD first_error = first_ok ? ERROR_SUCCESS : GetLastError();
+        if (first_ok) {
             do {
                 module_info_t mod;
                 mod.base = reinterpret_cast<uint64_t>(me.modBaseAddr);
@@ -2377,11 +2391,19 @@ namespace driver_bridge
         std::sort(result.begin(), result.end(), [](const module_info_t& a, const module_info_t& b) {
             return a.base < b.base;
         });
+        diag::log_tagged_critical_fmt("driver",
+            "enumerate_modules_usermode_toolhelp_result pid=%u first_ok=%d first_gle=%lu count=%llu elapsed_ms=%llu",
+            pid,
+            first_ok ? 1 : 0,
+            static_cast<unsigned long>(first_error),
+            static_cast<unsigned long long>(result.size()),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
         return result;
     }
 
     std::vector<module_info_t> enumerate_modules()
     {
+        const ULONGLONG t0 = GetTickCount64();
         diag::log_tagged_critical_fmt("driver", "enumerate_modules_enter tid=%lu", GetCurrentThreadId());
         std::vector<module_info_t> result;
         const uint32_t pid = attached_pid();
@@ -2417,19 +2439,43 @@ namespace driver_bridge
 
         if (!kernel_mode) {
             logf("AiDA Standalone: enumerate_modules: no modules resolved for PID %u.\n", pid);
+            diag::log_tagged_critical_fmt("driver",
+                "enumerate_modules_kernel_unavailable pid=%u elapsed_ms=%llu",
+                pid,
+                static_cast<unsigned long long>(GetTickCount64() - t0));
             return result;
         }
 
         voyager::device_t::peb_info peb{};
-        if (!device->read_peb(peb) || peb.ldr_address == 0) {
+        const ULONGLONG peb_start = GetTickCount64();
+        bool peb_ok = device->read_peb(peb);
+        diag::log_tagged_critical_fmt("driver",
+            "enumerate_modules_kernel_peb pid=%u ok=%d peb=0x%llX image=0x%llX ldr=0x%llX elapsed_ms=%llu",
+            pid,
+            peb_ok ? 1 : 0,
+            static_cast<unsigned long long>(peb.peb_address),
+            static_cast<unsigned long long>(peb.image_base),
+            static_cast<unsigned long long>(peb.ldr_address),
+            static_cast<unsigned long long>(GetTickCount64() - peb_start));
+        if (!peb_ok || peb.ldr_address == 0) {
             logf("AiDA Standalone: enumerate_modules: failed to read PEB/LDR for PID %u.\n", pid);
             return result;
         }
 
         const uint64_t list_head = peb.ldr_address + 0x10;
         uint64_t current = device->read<uint64_t>(list_head);
+        diag::log_tagged_critical_fmt("driver",
+            "enumerate_modules_kernel_ldr_head pid=%u list_head=0x%llX first=0x%llX",
+            pid,
+            static_cast<unsigned long long>(list_head),
+            static_cast<unsigned long long>(current));
         if (current == 0 || current == list_head) {
             logf("AiDA Standalone: enumerate_modules: LDR list empty for PID %u.\n", pid);
+            diag::log_tagged_critical_fmt("driver",
+                "enumerate_modules_kernel_ldr_empty pid=%u list_head=0x%llX first=0x%llX",
+                pid,
+                static_cast<unsigned long long>(list_head),
+                static_cast<unsigned long long>(current));
             return result;
         }
 
@@ -2490,6 +2536,12 @@ namespace driver_bridge
 
         logf("AiDA Standalone: enumerate_modules: resolved %zu modules via kernel LDR walk for PID %u.\n",
              result.size(), pid);
+        diag::log_tagged_critical_fmt("driver",
+            "enumerate_modules_kernel_ldr_result pid=%u count=%llu final_current=0x%llX elapsed_ms=%llu",
+            pid,
+            static_cast<unsigned long long>(result.size()),
+            static_cast<unsigned long long>(current),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
         return result;
     }
 
@@ -2904,6 +2956,7 @@ namespace driver_bridge
         if (data.empty())
             return false;
 
+        constexpr size_t kVerifyLimit = 4096;
         bool kernel_mode = false;
         HANDLE process = nullptr;
         {
@@ -2911,6 +2964,36 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
             process = g_process;
         }
+
+        auto first_mismatch = [](const std::vector<uint8_t>& expected, const std::vector<uint8_t>& actual) -> size_t {
+            const size_t n = std::min(expected.size(), actual.size());
+            for (size_t i = 0; i < n; ++i) {
+                if (expected[i] != actual[i])
+                    return i;
+            }
+            return n;
+        };
+        auto verify_with_rpm = [&](std::vector<uint8_t>& actual, SIZE_T& bytes_read, DWORD& err) -> bool {
+            actual.clear();
+            bytes_read = 0;
+            err = 0;
+            if (!process || data.size() > kVerifyLimit)
+                return false;
+            actual.resize(data.size());
+            BOOL ok = ReadProcessMemory(process,
+                reinterpret_cast<LPCVOID>(static_cast<uintptr_t>(address)),
+                actual.data(), actual.size(), &bytes_read);
+            if (!ok) {
+                err = GetLastError();
+                actual.clear();
+                return false;
+            }
+            if (bytes_read != data.size()) {
+                actual.resize(static_cast<size_t>(bytes_read));
+                return false;
+            }
+            return std::equal(data.begin(), data.end(), actual.begin());
+        };
 
         if (kernel_mode) {
             size_t bytes_written = 0;
@@ -2948,8 +3031,37 @@ namespace driver_bridge
                 }
             }
 
-            if (bytes_written == data.size())
-                return true;
+            if (bytes_written == data.size()) {
+                if (data.size() > kVerifyLimit)
+                    return true;
+                std::vector<uint8_t> bridge_verify;
+                bool bridge_read_ok = read_memory(address, data.size(), bridge_verify);
+                bool bridge_match = bridge_read_ok &&
+                    bridge_verify.size() == data.size() &&
+                    std::equal(data.begin(), data.end(), bridge_verify.begin());
+                if (bridge_match)
+                    return true;
+                std::vector<uint8_t> rpm_verify;
+                SIZE_T rpm_bytes = 0;
+                DWORD rpm_err = 0;
+                bool rpm_match = verify_with_rpm(rpm_verify, rpm_bytes, rpm_err);
+                if (rpm_match)
+                    return true;
+                const size_t mismatch = first_mismatch(data, bridge_verify);
+                const uint8_t expected = mismatch < data.size() ? data[mismatch] : 0;
+                const uint8_t actual = mismatch < bridge_verify.size() ? bridge_verify[mismatch] : 0;
+                diag::log_tagged_fmt("driver",
+                    "write_memory kernel verify_mismatch addr=0x%llX sz=%llu bridge_read=%d bridge_bytes=%llu rpm_bytes=%llu rpm_err=%lu mismatch=%llu expected=0x%02X actual=0x%02X",
+                    static_cast<unsigned long long>(address),
+                    static_cast<unsigned long long>(data.size()),
+                    bridge_read_ok ? 1 : 0,
+                    static_cast<unsigned long long>(bridge_verify.size()),
+                    static_cast<unsigned long long>(rpm_bytes),
+                    static_cast<unsigned long>(rpm_err),
+                    static_cast<unsigned long long>(mismatch),
+                    static_cast<unsigned>(expected),
+                    static_cast<unsigned>(actual));
+            }
             if (bytes_written > 0) {
                 diag::log_tagged_fmt("driver",
                     "write_memory kernel partial addr=0x%llX sz=%llu bytes=%llu",
@@ -2971,8 +3083,30 @@ namespace driver_bridge
                 ok ? 1 : 0,
                 static_cast<unsigned long long>(bytes_written),
                 ok ? 0UL : GetLastError());
-            if (ok && bytes_written == data.size())
+            if (ok && bytes_written == data.size()) {
+                if (data.size() <= kVerifyLimit) {
+                    std::vector<uint8_t> rpm_verify;
+                    SIZE_T rpm_bytes = 0;
+                    DWORD rpm_err = 0;
+                    if (!verify_with_rpm(rpm_verify, rpm_bytes, rpm_err)) {
+                        const size_t mismatch = first_mismatch(data, rpm_verify);
+                        const uint8_t expected = mismatch < data.size() ? data[mismatch] : 0;
+                        const uint8_t actual = mismatch < rpm_verify.size() ? rpm_verify[mismatch] : 0;
+                        diag::log_tagged_fmt("driver",
+                            "write_memory WPM verify_FAILED addr=0x%llX sz=%llu bytes=%llu read_bytes=%llu read_err=%lu mismatch=%llu expected=0x%02X actual=0x%02X",
+                            static_cast<unsigned long long>(address),
+                            static_cast<unsigned long long>(data.size()),
+                            static_cast<unsigned long long>(bytes_written),
+                            static_cast<unsigned long long>(rpm_bytes),
+                            static_cast<unsigned long>(rpm_err),
+                            static_cast<unsigned long long>(mismatch),
+                            static_cast<unsigned>(expected),
+                            static_cast<unsigned>(actual));
+                        return false;
+                    }
+                }
                 return true;
+            }
         }
 
         return false;
@@ -3142,10 +3276,28 @@ namespace driver_bridge
 
     std::vector<module_info_t> enumerate_modules_for(uint32_t pid)
     {
+        const ULONGLONG t0 = GetTickCount64();
         driver_bridge_pid_call::pid_scope_t scope;
-        if (!driver_bridge_pid_call::enter(scope, pid))
+        if (!driver_bridge_pid_call::enter(scope, pid)) {
+            diag::log_tagged_critical_fmt("driver",
+                "enumerate_modules_for_enter_failed requested_pid=%u active_pid=%u status=%s last_error=%s elapsed_ms=%llu",
+                pid,
+                attached_pid(),
+                status().c_str(),
+                last_error().c_str(),
+                static_cast<unsigned long long>(GetTickCount64() - t0));
             return {};
-        return enumerate_modules();
+        }
+        auto result = enumerate_modules();
+        diag::log_tagged_critical_fmt("driver",
+            "enumerate_modules_for_exit requested_pid=%u active_pid=%u count=%llu status=%s last_error=%s elapsed_ms=%llu",
+            pid,
+            attached_pid(),
+            static_cast<unsigned long long>(result.size()),
+            status().c_str(),
+            last_error().c_str(),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        return result;
     }
 
     std::vector<thread_info_t> enumerate_threads_for(uint32_t pid)

@@ -430,8 +430,24 @@ public:
 
     void delete_graph(const std::string& binary_hash);
     bool save_to_file(const std::string& path);
+    bool save_to_file(const std::string& path, const std::string& binary_hash);
     bool load_from_file(const std::string& path);
     std::string get_graph_path(const std::string& binary_hash) const;
+
+    // ---- Slice H2: incremental persistence -----------------------------------
+    // Returns the count of dirty nodes flushed (no-op if path is empty / not dirty).
+    int save_incremental(const std::string& binary_hash, const std::string& path);
+    int dirty_count(const std::string& binary_hash) const;
+
+    // ---- Slice H3: in-memory inverted indices --------------------------------
+    // Maintained incrementally inside upsert_node. rebuild_inverted_indices
+    // is a recovery path (e.g. after load_from_file).
+    void rebuild_inverted_indices(const std::string& binary_hash);
+    // JSON predicate spec: { "binary_hash": "..", "all_flags": [..],
+    // "any_flags": [..], "all_apis": [..], "any_apis": [..],
+    // "risk_levels": [..] }. AND across distinct keys, semantics-per-key.
+    std::vector<graph_node_t*> filter_nodes(const std::string& binary_hash,
+                                            const nlohmann::json& criteria);
 
 private:
     GraphStore() = default;
@@ -445,6 +461,22 @@ private:
     std::unordered_map<int, graph_node_t> m_nodes;
     std::unordered_map<int, graph_edge_t> m_edges;
     std::vector<community_t> m_communities;
+
+    // H2: per-binary dirty node tracking.
+    std::unordered_map<std::string, std::unordered_set<int>> m_dirty_nodes;
+    // H3: inverted indices over node fields.
+    //   m_flag_index: security_flag -> [node_id]
+    //   m_api_index : api_name -> [node_id] (union of network/file/crypto/process apis)
+    // The vectors are kept sorted+unique; modifications use erase-remove
+    // to keep filter_nodes() O(matching) instead of O(all_nodes).
+    std::unordered_map<std::string, std::vector<int>> m_flag_index;
+    std::unordered_map<std::string, std::vector<int>> m_api_index;
+
+    // Internal helpers (must be called with m_mtx held).
+    void index_remove_node_locked(int node_id);
+    void index_add_node_locked(const graph_node_t& node);
+    static void vec_insert_unique(std::vector<int>& v, int id);
+    static void vec_remove(std::vector<int>& v, int id);
 
 
     struct addr_key_t
@@ -472,6 +504,10 @@ private:
 
     std::unordered_map<int, std::vector<int>> m_edges_from;
     std::unordered_map<int, std::vector<int>> m_edges_to;
+    // H15: per-binary edge id list. Lets delete_graph rebuild edge indices in
+    // O(surviving_edges) by only touching the surviving binaries' lists,
+    // instead of O(all_edges).
+    std::unordered_map<std::string, std::vector<int>> m_edges_by_binary;
 };
 
 
@@ -602,6 +638,8 @@ private:
 };
 
 
+struct query_cursor_t;
+
 class QueryEngine
 {
 public:
@@ -616,6 +654,24 @@ public:
     nlohmann::json get_security_analysis(const std::string& binary_hash, int limit = 50);
     nlohmann::json get_activity_analysis(const std::string& binary_hash, const std::string& activity_filter = "");
     nlohmann::json get_all_communities(const std::string& binary_hash);
+
+    // ---- Slice H5: cursor-aware overloads -----------------------------------
+    // When `in_cursor` filters out a node by since_ms or seen_id, that node
+    // is dropped from the response. On return, `out_cursor` carries the new
+    // baseline (since_ms = max(updated_at), seen_node_ids merged with the
+    // emitted set) and `out_has_more` reflects whether the limit/page truncated
+    // a still-larger result set.
+    nlohmann::json get_security_analysis(const std::string& binary_hash, int limit,
+                                         const query_cursor_t& in_cursor,
+                                         query_cursor_t& out_cursor, bool& out_has_more);
+    nlohmann::json get_activity_analysis(const std::string& binary_hash,
+                                         const std::string& activity_filter,
+                                         const query_cursor_t& in_cursor,
+                                         query_cursor_t& out_cursor, bool& out_has_more);
+    nlohmann::json search_semantic(const std::string& binary_hash, const std::string& query,
+                                   int limit,
+                                   const query_cursor_t& in_cursor,
+                                   query_cursor_t& out_cursor, bool& out_has_more);
 
 private:
     GraphStore& m_store;
@@ -645,5 +701,36 @@ void load_vectors(const std::string& binary_hash);
 void initialize(const std::string& binary_hash);
 void save_graph(const std::string& binary_hash);
 void load_graph(const std::string& binary_hash);
+
+// ---- Slice H4: aggregate externally-reachable entry enumeration ------------
+struct external_entry_t
+{
+    ea_t        ea = BADADDR;
+    std::string name;
+    std::string category;   // e.g. "pe_export", "rpc_ndr", "com_idispatch",
+                            //      "driver_dispatch", "winrt_factory",
+                            //      "service_handler", "wsk_callback"
+    std::string source;     // free-form provenance for the operator
+};
+
+std::vector<external_entry_t> extract_externally_reachable_entries();
+
+nlohmann::json build_binary_capability_index(const std::vector<std::string>& filter_apis = {},
+                                             size_t max_callsites_per_api = 64);
+
+nlohmann::json extract_dispatch_tables(bool include_handler_code = false,
+                                       size_t max_handler_code_len = 6000);
+
+// ---- Slice H5: incremental cursor for delta queries ------------------------
+struct query_cursor_t
+{
+    uint64_t           since_ms = 0;
+    std::vector<int>   seen_node_ids;
+};
+
+// Encode/decode cursor as base64-encoded JSON. Returns empty string for an
+// empty/default cursor.
+std::string encode_cursor(const query_cursor_t& c);
+bool        decode_cursor(const std::string& encoded, query_cursor_t& out);
 
 }

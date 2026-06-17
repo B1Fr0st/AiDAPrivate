@@ -3695,8 +3695,7 @@ inline transform_result_t protect_pe(pe_file::pe_image_t& pe, const protect_opti
         const uint32_t expected_visible = llm_poison::detail::k_visible_poison_count;
         const uint32_t expected_spread_sections = llm_poison::detail::k_spread_poison_sections;
         const uint32_t expected_spread_visible = llm_poison::detail::k_spread_poison_count;
-        const uint32_t expected_strings =
-            16u + 16u + 16u + 16u + 10u + 16u + 16u + 16u + 32u + expected_visible + expected_spread_visible;
+        const uint32_t expected_strings = llm_poison::detail::k_total_poison_string_count;
         if (!poison.applied ||
             poison.visible_strings_embedded < expected_visible ||
             poison.spread_sections_embedded != expected_spread_sections ||

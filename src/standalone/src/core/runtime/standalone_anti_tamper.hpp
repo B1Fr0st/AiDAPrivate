@@ -705,7 +705,8 @@ inline bool run_verification_cycle()
         }
 
 
-        auto ai_report = standalone_anti_ai::combined::full_scan();
+        auto ai_scan = standalone_anti_ai::full_scan_runtime_cached(15000ULL, "runtime_verify");
+        auto ai_report = ai_scan.report;
 
         if (ai_report.confirmed_high_risk())
         {
@@ -772,8 +773,10 @@ inline bool run_verification_cycle()
             return false;
         }
 
-        if (ai_report.mcp_detected || ai_report.llm_detected
-            || ai_report.memory_scanner_detected || ai_report.handle_to_us_detected)
+        if (ai_report.memory_scanner_detected || ai_report.handle_to_us_detected ||
+            ai_report.re_tool_detected || ai_report.debugger_tool_detected ||
+            ai_report.dump_tool_detected || ai_report.offensive_mcp_tool_detected ||
+            ai_report.tool_targets_aida)
         {
             uint64_t now_tick = GetTickCount64();
             uint64_t first_tick = rt.soft_violation_window_tick.load(std::memory_order_relaxed);

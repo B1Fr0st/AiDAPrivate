@@ -5,10 +5,22 @@
 #include "anti_re.hpp"
 #include "vuln/vuln_tools.hpp"
 #include "vuln/verification_tools.hpp"
+#include "vuln/vuln_signatures.hpp"
+// Slice C12 — bring in taint engine public surface for taint_tools_ext.
+#include "vuln/taint_engine.hpp"
 #include <allins.hpp>
 #include <iomanip>
 #include <loader.hpp>
 #include <chrono>
+#include <netnode.hpp>
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable: 4267)
+#endif
+#include <regfinder.hpp>
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 
 using json = nlohmann::json;
 
@@ -39,9 +51,69 @@ ToolRegistry& ToolRegistry::instance()
     return registry;
 }
 
+static bool registry_migration_destructive_name(const std::string& name)
+{
+    return name == "delete_function"
+        || name == "delete_stack_var"
+        || name == "patch_bytes"
+        || name == "undefine"
+        || name == "write_memory"
+        || name == "idb_save"
+        || name == "diff_before_after"
+        || name == "patch"
+        || name == "patch_asm"
+        || name == "put_int"
+        || name == "set_comments"
+        || name == "append_comments"
+        || name == "rename"
+        || name == "define_func"
+        || name == "define_code"
+        || name == "declare_stack"
+        || name == "delete_stack"
+        || name == "declare_type"
+        || name == "enum_upsert"
+        || name == "set_type"
+        || name == "type_apply_batch"
+        || name == "py_eval"
+        || name == "py_exec_file"
+        || name == "apply_callee_prototype";
+}
+
 void ToolRegistry::register_tool(const tool_definition_t& tool)
 {
-    _tools[tool.name] = tool;
+    if (tool.name.empty())
+    {
+        msg(OBFSTR_C("AiDA ToolRegistry: rejected unnamed tool\n"));
+        return;
+    }
+
+    if (_tools.find(tool.name) != _tools.end())
+    {
+        msg(OBFSTR_C("AiDA ToolRegistry: rejected duplicate tool name=%s\n"), tool.name.c_str());
+        return;
+    }
+
+    if (!tool.handler)
+    {
+        msg(OBFSTR_C("AiDA ToolRegistry: rejected tool without handler name=%s\n"), tool.name.c_str());
+        return;
+    }
+
+    tool_definition_t normalized = tool;
+    if (registry_migration_destructive_name(normalized.name))
+    {
+        normalized.read_only = false;
+        normalized.destructive = true;
+        normalized.deterministic = false;
+    }
+
+    if (normalized.read_only && normalized.destructive)
+    {
+        msg(OBFSTR_C("AiDA ToolRegistry: rejected impossible metadata name=%s read_only=1 destructive=1\n"), normalized.name.c_str());
+        return;
+    }
+
+    _tools.emplace(normalized.name, std::move(normalized));
 }
 
 const tool_definition_t* ToolRegistry::get_tool(const std::string& name) const
@@ -97,6 +169,12 @@ json ToolRegistry::generate_tools_schema() const
         tool_json["name"] = tool.name;
         tool_json["category"] = tool.category;
         tool_json["description"] = tool.description;
+        tool_json["read_only"] = tool.read_only;
+        tool_json["destructive"] = tool.destructive;
+        tool_json["deterministic"] = tool.deterministic;
+        tool_json["required_indices"] = tool.required_indices;
+        if (!tool.output_schema.is_null() && !tool.output_schema.empty())
+            tool_json["output_schema"] = tool.output_schema;
 
         json params = json::object();
         json required_params = json::array();
@@ -224,6 +302,58 @@ tool_result_t ToolRegistry::execute_tool(const std::string& name, const json& pa
     {
         return tool_result_t::error(OBFSTR("Tool execution error: ") + e.what());
     }
+}
+
+tool_result_t ToolRegistry::execute_tool_batch(
+    const std::vector<std::pair<std::string, json>>& calls,
+    bool stop_on_error,
+    std::vector<tool_result_t>* out)
+{
+    if (out)
+    {
+        out->clear();
+        out->reserve(calls.size());
+    }
+
+    size_t ok_count = 0;
+    size_t fail_count = 0;
+    tool_result_t first_failure;
+    bool have_failure = false;
+
+    for (size_t i = 0; i < calls.size(); ++i)
+    {
+        const auto& c = calls[i];
+        tool_result_t r = execute_tool(c.first, c.second);
+        if (out)
+            out->push_back(r);
+
+        if (r.success)
+        {
+            ++ok_count;
+        }
+        else
+        {
+            ++fail_count;
+            if (!have_failure)
+            {
+                first_failure = r;
+                have_failure = true;
+            }
+            if (stop_on_error)
+                break;
+        }
+    }
+
+    if (have_failure)
+        return first_failure;
+
+    std::ostringstream ss;
+    ss << OBFSTR("Batch ok: ") << ok_count << OBFSTR("/") << calls.size();
+    json data;
+    data["ok"] = ok_count;
+    data["fail"] = fail_count;
+    data["total"] = calls.size();
+    return tool_result_t::ok(ss.str(), data);
 }
 
 
@@ -3034,6 +3164,319 @@ tool_result_t get_binary_info(const json&)
     return tool_result_t::ok(OBFSTR("Binary info retrieved"), result);
 }
 
+// -------------------------------------------------------------------------
+// Slice B7 — canonical merged binary identity / capability fingerprint.
+// Returns md5/sha256/crc32, image bounds, processor/bitness/kind, the entry
+// point table, segment summary, an imports-by-module-category histogram,
+// and a derived boolean capability vector. Lives in binary category as
+// the single source of truth for "what is this binary?".
+// -------------------------------------------------------------------------
+namespace {
+
+struct fp_import_collector_t
+{
+    std::vector<std::string> names;
+};
+
+static int idaapi fp_import_cb(ea_t /*ea*/, const char* name, uval_t /*ord*/, void* param)
+{
+    auto* c = static_cast<fp_import_collector_t*>(param);
+    if (name && *name)
+        c->names.emplace_back(name);
+    if (c->names.size() >= 4096)
+        return 0;
+    return 1;
+}
+
+// Module categorization for the capabilities vector. Keep this list short and
+// case-insensitive — the goal is "what attack surface does this binary touch?".
+static std::string categorize_import_module(const std::string& mod)
+{
+    std::string lower;
+    lower.reserve(mod.size());
+    for (char c : mod)
+        lower.push_back((char)std::tolower((unsigned char)c));
+
+    if (lower.find("ws2_32")    != std::string::npos
+     || lower.find("wsock32")   != std::string::npos
+     || lower.find("mswsock")   != std::string::npos
+     || lower.find("iphlpapi")  != std::string::npos)
+        return "WINSOCK";
+
+    if (lower.find("wininet")   != std::string::npos
+     || lower.find("winhttp")   != std::string::npos
+     || lower.find("urlmon")    != std::string::npos)
+        return "WININET";
+
+    if (lower.find("rpcrt4")    != std::string::npos
+     || lower.find("rpcns4")    != std::string::npos)
+        return "RPC";
+
+    if (lower.find("ole32")     != std::string::npos
+     || lower.find("oleaut32")  != std::string::npos
+     || lower.find("combase")   != std::string::npos)
+        return "COM";
+
+    if (lower.find("ntdll")     != std::string::npos)
+        return "IPC"; // ntdll houses NtAlpc*, NtCreateNamedPipeFile, etc.
+
+    if (lower.find("kernel32")  != std::string::npos)
+        return "IPC"; // CreateNamedPipe, TransactNamedPipe, etc.
+
+    if (lower.find("advapi32")  != std::string::npos)
+        return "CRYPTO";
+    if (lower.find("bcrypt")    != std::string::npos
+     || lower.find("ncrypt")    != std::string::npos
+     || lower.find("crypt32")   != std::string::npos)
+        return "CRYPTO";
+
+    if (lower.find("ntoskrnl")  != std::string::npos
+     || lower.find("hal")       != std::string::npos
+     || lower.find("ndis")      != std::string::npos
+     || lower.find("wdfldr")    != std::string::npos
+     || lower.find("fltmgr")    != std::string::npos)
+        return "ALPC";
+
+    if (lower.find("shlwapi")   != std::string::npos
+     || lower.find("shell32")   != std::string::npos
+     || lower.find("shcore")    != std::string::npos
+     || lower.find("user32")    != std::string::npos
+     || lower.find("gdi32")     != std::string::npos)
+        return "FILE";
+
+    return "OTHER";
+}
+
+} // anonymous
+
+tool_result_t binary_fingerprint(const json&)
+{
+    json result;
+
+    // --- Hashes ---------------------------------------------------------
+    {
+        unsigned char md5[16] = {};
+        unsigned char sha[32] = {};
+        if (retrieve_input_file_md5(md5))
+        {
+            char buf[33] = {};
+            for (int i = 0; i < 16; ++i)
+                ::qsnprintf(buf + i * 2, 3, "%02x", md5[i]);
+            result["md5"] = std::string(buf, 32);
+        }
+        if (retrieve_input_file_sha256(sha))
+        {
+            char buf[65] = {};
+            for (int i = 0; i < 32; ++i)
+                ::qsnprintf(buf + i * 2, 3, "%02x", sha[i]);
+            result["sha256"] = std::string(buf, 64);
+        }
+        uint32_t crc = retrieve_input_file_crc32();
+        char crcbuf[16] = {};
+        ::qsnprintf(crcbuf, sizeof(crcbuf), "%08x", crc);
+        result["crc32"] = std::string(crcbuf);
+    }
+
+    // --- Paths and identity ---------------------------------------------
+    {
+        char pathbuf[QMAXPATH] = {};
+        get_input_file_path(pathbuf, sizeof(pathbuf));
+        result["path"] = std::string(pathbuf);
+
+        // get_path returns a non-owning const char* (never nullptr per SDK).
+        const char* idb_p = get_path(PATH_TYPE_IDB);
+        result["idb_path"] = std::string(idb_p ? idb_p : "");
+    }
+    result["filetype"]    = (int)inf_get_filetype();
+    result["is_dll"]      = inf_is_dll();
+    result["is_kernel"]   = inf_is_kernel_mode();
+    result["bitness"]     = inf_get_app_bitness();
+    {
+        qstring proc = inf_get_procname();
+        result["processor"] = std::string(proc.c_str());
+    }
+    result["image_base"]  = helpers::format_address((ea_t)get_imagebase());
+    result["min_ea"]      = helpers::format_address(inf_get_min_ea());
+    result["max_ea"]      = helpers::format_address(inf_get_max_ea());
+    // instance_id is a per-IDA-process UUID maintained by mcp_server's
+    // instance_registry. agent_tools does not link the registry, so emit the
+    // input file MD5 hex as a stable per-binary identifier; the MCP layer can
+    // overlay its own instance_id at the routing edge.
+    if (result.contains("md5"))
+        result["instance_id"] = result["md5"];
+    result["hexrays_available"] = init_hexrays_plugin();
+
+    // --- Entry points ---------------------------------------------------
+    json entries = json::array();
+    size_t entry_qty = get_entry_qty();
+    for (size_t i = 0; i < entry_qty; ++i)
+    {
+        uval_t ord = get_entry_ordinal(i);
+        ea_t ea = get_entry(ord);
+        if (ea == BADADDR)
+            continue;
+        qstring name;
+        get_entry_name(&name, ord);
+        json ej;
+        ej["ord"]  = (uint64_t)ord;
+        ej["name"] = std::string(name.c_str());
+        ej["ea"]   = helpers::format_address(ea);
+        func_t* pfn = get_func(ea);
+        bool is_thunk = pfn && (pfn->flags & FUNC_THUNK);
+        ej["is_thunk"] = is_thunk;
+        if (is_thunk)
+        {
+            ea_t fptr = BADADDR;
+            ea_t target = calc_thunk_func_target(pfn, &fptr);
+            if (target != BADADDR)
+                ej["thunk_target"] = helpers::format_address(target);
+        }
+        entries.push_back(ej);
+        if (entries.size() >= 1024)
+            break;
+    }
+    result["entry_points"] = entries;
+
+    // --- Segments -------------------------------------------------------
+    json segs = json::array();
+    int sqty = get_segm_qty();
+    for (int i = 0; i < sqty; ++i)
+    {
+        segment_t* s = getnseg(i);
+        if (!s)
+            continue;
+        qstring name;
+        get_segm_name(&name, s);
+        json sj;
+        sj["name"]  = std::string(name.c_str());
+        sj["start"] = helpers::format_address(s->start_ea);
+        sj["end"]   = helpers::format_address(s->end_ea);
+        sj["type"]  = (int)s->type;
+        sj["perm"]  = (int)s->perm;
+        sj["size"]  = (uint64_t)(s->end_ea - s->start_ea);
+        segs.push_back(sj);
+    }
+    result["segments"] = segs;
+
+    // --- Imports + capability map --------------------------------------
+    json imports = json::array();
+    std::map<std::string, bool> cap;
+    cap["network"]            = false;
+    cap["rpc"]                = false;
+    cap["com"]                = false;
+    cap["driver"]             = false;
+    cap["service"]            = false;
+    cap["alpc"]               = false;
+    cap["ndis"]               = false;
+    cap["crypto"]             = false;
+    cap["tls_callbacks"]      = false;
+    cap["exception_handlers"] = false;
+
+    uint mod_qty = get_import_module_qty();
+    for (uint mi = 0; mi < mod_qty; ++mi)
+    {
+        qstring modname;
+        if (!get_import_module_name(&modname, mi))
+            continue;
+        fp_import_collector_t coll;
+        enum_import_names(mi, fp_import_cb, &coll);
+
+        std::string mod_str = modname.c_str();
+        std::string category = categorize_import_module(mod_str);
+
+        json mj;
+        mj["module"]   = mod_str;
+        mj["category"] = category;
+        mj["count"]    = (uint64_t)coll.names.size();
+        json top = json::array();
+        for (size_t k = 0; k < coll.names.size() && k < 12; ++k)
+            top.push_back(coll.names[k]);
+        mj["top_names"] = top;
+        imports.push_back(mj);
+
+        if (category == "WINSOCK" || category == "WININET")
+            cap["network"] = true;
+        if (category == "RPC")
+            cap["rpc"] = true;
+        if (category == "COM")
+            cap["com"] = true;
+        if (category == "ALPC")
+        {
+            cap["alpc"] = true;
+            std::string lm = mod_str;
+            for (char& c : lm) c = (char)std::tolower((unsigned char)c);
+            if (lm.find("ndis") != std::string::npos)
+                cap["ndis"] = true;
+        }
+        if (category == "CRYPTO")
+            cap["crypto"] = true;
+
+        // Driver/service inference based on filetype + import shape.
+        std::string lm = mod_str;
+        for (char& c : lm) c = (char)std::tolower((unsigned char)c);
+        if (lm.find("ntoskrnl") != std::string::npos
+         || lm.find("hal")      != std::string::npos
+         || lm.find("wdfldr")   != std::string::npos)
+            cap["driver"] = true;
+        if (lm.find("advapi32") != std::string::npos)
+        {
+            for (const auto& n : coll.names)
+            {
+                if (n.find("CreateService")   != std::string::npos
+                 || n.find("StartServiceCtrl") != std::string::npos
+                 || n.find("RegisterService")  != std::string::npos)
+                {
+                    cap["service"] = true;
+                    break;
+                }
+            }
+        }
+    }
+    result["imports"] = imports;
+
+    // TLS callbacks indicator: look up segment named ".tls" or known
+    // TLS-callback table import.
+    for (const auto& seg_entry : result["segments"])
+    {
+        if (seg_entry.contains("name"))
+        {
+            std::string sn = seg_entry["name"].get<std::string>();
+            std::string ln;
+            for (char c : sn) ln.push_back((char)std::tolower((unsigned char)c));
+            if (ln.find(".tls") != std::string::npos)
+            {
+                cap["tls_callbacks"] = true;
+                break;
+            }
+        }
+    }
+    // SEH / __try blocks indicator via the .pdata segment.
+    for (const auto& seg_entry : result["segments"])
+    {
+        if (seg_entry.contains("name"))
+        {
+            std::string sn = seg_entry["name"].get<std::string>();
+            std::string ln;
+            for (char c : sn) ln.push_back((char)std::tolower((unsigned char)c));
+            if (ln.find(".pdata") != std::string::npos
+             || ln.find(".xdata") != std::string::npos)
+            {
+                cap["exception_handlers"] = true;
+                break;
+            }
+        }
+    }
+
+    if (inf_is_kernel_mode())
+        cap["driver"] = true;
+
+    result["capabilities"] = cap;
+    result["function_count"] = (uint64_t)get_func_qty();
+    result["string_count"]   = (uint64_t)get_strlist_qty();
+
+    return tool_result_t::ok(OBFSTR("binary_fingerprint ok"), result);
+}
+
 void register_tools()
 {
     auto& registry = ToolRegistry::instance();
@@ -3041,6 +3484,29 @@ void register_tools()
     registry.register_tool({OBFSTR("get_binary_info"), OBFSTR("binary"),
         OBFSTR("Get binary file metadata (processor, bitness, file type, etc)."),
         {}, get_binary_info});
+
+    static auto fp_name = OBFSTR("binary_fingerprint");
+    static auto fp_cat  = OBFSTR("binary");
+    static auto fp_desc = OBFSTR(
+        "Canonical binary identity + attack-surface fingerprint. Returns md5/sha256/crc32, "
+        "image bounds, processor/bitness/dll/kernel flags, entry points (with thunk targets), "
+        "segments, imports grouped by module category (WINSOCK/WININET/RPC/COM/ALPC/IPC/CRYPTO/"
+        "FILE/OTHER), function/string counts, and a derived capabilities boolean vector "
+        "(network/rpc/com/driver/service/alpc/ndis/crypto/tls_callbacks/exception_handlers).");
+    tool_definition_t fp_def;
+    fp_def.name = fp_name;
+    fp_def.category = fp_cat;
+    fp_def.description = fp_desc;
+    fp_def.handler = binary_fingerprint;
+    fp_def.read_only = true;
+    fp_def.destructive = false;
+    fp_def.deterministic = true;
+    fp_def.output_schema = json::object({
+        {OBFSTR("type"), OBFSTR("object")},
+        {OBFSTR("required"), json::array({OBFSTR("filetype"), OBFSTR("is_dll"), OBFSTR("is_kernel"), OBFSTR("bitness"), OBFSTR("processor"), OBFSTR("entry_points"), OBFSTR("segments"), OBFSTR("imports"), OBFSTR("capabilities")})},
+        {OBFSTR("additionalProperties"), true}
+    });
+    registry.register_tool(fp_def);
 }
 
 }
@@ -9579,6 +10045,2482 @@ void register_tools()
 
 }
 
+// ============================================================================
+// Slice B — meta_tools (orchestration / planning / introspection)
+//
+// Note on the cross-TU surface used by list_outputs: the MCP output cache is a
+// translation-unit-local static in mcp_server.cpp. Slice B9 exposes it through
+// the global aida_mcp_internal accessor namespace declared near
+// mcp_server.cpp:354. The forward declarations live just above this block at
+// global (::) scope so meta_tools links against them without dragging the
+// whole mcp_server header surface in.
+// ============================================================================
+
+} // namespace agent_tools
+
+namespace aida_mcp_internal {
+struct output_cache_entry_t
+{
+    std::string id;
+    size_t      json_bytes = 0;
+};
+struct output_cache_stats_t
+{
+    size_t total_entries = 0;
+    size_t total_bytes   = 0;
+    size_t limit         = 0;
+    size_t text_limit    = 0;
+};
+std::vector<output_cache_entry_t> output_cache_list();
+output_cache_stats_t              output_cache_stats();
+bool                              output_cache_evict_one(const std::string& id);
+size_t                            output_cache_evict_all();
+// Forward decl: parallel batch runner lives in mcp_server.cpp. Slice B2's
+// tool_batch_call dispatches to it when parallel=true is requested AND every
+// sub-tool is read_only=true. Returns a per-call results vector + cancel/timeout
+// flags. Declared here so meta_tools::tool_batch_call links cleanly.
+struct parallel_batch_outcome_t
+{
+    std::vector<agent_tools::tool_result_t> results;
+    std::vector<std::string> labels;
+    size_t partial_count = 0;
+    uint64_t total_ms = 0;
+    bool cancelled = false;
+    bool timed_out = false;
+};
+parallel_batch_outcome_t run_batch_parallel(
+    const std::vector<std::pair<std::string, nlohmann::json>>& calls,
+    const std::vector<std::string>& labels,
+    bool stop_on_error,
+    int max_wall_seconds);
+} // namespace aida_mcp_internal
+
+namespace agent_tools
+{
+
+namespace meta_tools
+{
+
+// ----------------------------------------------------------------------------
+// Slice B2 — tool_batch_call
+// ----------------------------------------------------------------------------
+tool_result_t tool_batch_call(const json& params)
+{
+    if (!params.contains("calls") || !params["calls"].is_array())
+        return tool_result_t::error(OBFSTR("Missing or invalid 'calls' array"), OBFSTR("bad_param"));
+
+    const json& calls_arr = params["calls"];
+
+    const bool stop_on_error = params.value("stop_on_error", true);
+    const bool want_parallel = params.value("parallel", false);
+    double max_wall_seconds  = 60.0;
+    if (params.contains("max_wall_seconds") && params["max_wall_seconds"].is_number())
+        max_wall_seconds = params["max_wall_seconds"].get<double>();
+    if (max_wall_seconds <= 0.0) max_wall_seconds = 60.0;
+
+    // Pre-resolve tool definitions to compute aggregate flags + validate.
+    std::vector<std::pair<std::string, json>> resolved;
+    std::vector<std::string> labels;
+    bool all_read_only = true;
+    bool any_destructive = false;
+    auto& registry = ToolRegistry::instance();
+
+    resolved.reserve(calls_arr.size());
+    labels.reserve(calls_arr.size());
+    for (size_t i = 0; i < calls_arr.size(); ++i)
+    {
+        const json& c = calls_arr[i];
+        if (!c.is_object() || !c.contains("tool") || !c["tool"].is_string())
+        {
+            return tool_result_t::error(
+                OBFSTR("calls[") + std::to_string(i) + OBFSTR("] missing 'tool' string"),
+                OBFSTR("bad_param"));
+        }
+        std::string tname = c["tool"].get<std::string>();
+        const auto* def = registry.get_tool(tname);
+        if (!def)
+        {
+            return tool_result_t::error(
+                OBFSTR("Unknown tool: ") + tname,
+                OBFSTR("bad_param"));
+        }
+        if (!def->read_only) all_read_only = false;
+        if (def->destructive) any_destructive = true;
+
+        json args = json::object();
+        if (c.contains("arguments") && c["arguments"].is_object())
+            args = c["arguments"];
+
+        std::string label;
+        if (c.contains("label") && c["label"].is_string())
+            label = c["label"].get<std::string>();
+
+        resolved.emplace_back(std::move(tname), std::move(args));
+        labels.push_back(std::move(label));
+    }
+
+    const bool fell_back_to_serial = want_parallel && !all_read_only;
+    const bool can_parallel        = want_parallel && all_read_only;
+
+    auto t_start = std::chrono::steady_clock::now();
+
+    std::vector<tool_result_t> results_vec;
+    size_t partial_count = 0;
+    bool deadline_reached = false;
+    bool ran_in_parallel  = false;
+
+    if (can_parallel)
+    {
+        // Delegate to the qthread-backed parallel runner in mcp_server.cpp.
+        // Read-only only — the runner does not coordinate writes against IDA's
+        // main thread invariants.
+        auto outcome = ::aida_mcp_internal::run_batch_parallel(
+            resolved, labels, stop_on_error, (int)max_wall_seconds);
+        results_vec     = std::move(outcome.results);
+        // The runner pre-resizes results to resolved.size() and fills every
+        // slot (workers + post-loop fill-in). Normalise partial_count to mean
+        // "results produced" for consistency with the serial path.
+        partial_count   = results_vec.size();
+        deadline_reached= outcome.timed_out || outcome.cancelled;
+        ran_in_parallel = true;
+    }
+    else
+    {
+        for (size_t i = 0; i < resolved.size(); ++i)
+        {
+            // Cooperative deadline + cancel checks between calls.
+            auto now = std::chrono::steady_clock::now();
+            double elapsed = std::chrono::duration<double>(now - t_start).count();
+            if (elapsed > max_wall_seconds)
+            {
+                deadline_reached = true;
+                break;
+            }
+            if (user_cancelled())
+            {
+                deadline_reached = true;
+                break;
+            }
+
+            tool_result_t r = registry.execute_tool(resolved[i].first, resolved[i].second);
+            results_vec.push_back(r);
+            ++partial_count;
+            if (!r.success && stop_on_error)
+                break;
+        }
+    }
+
+    auto t_end = std::chrono::steady_clock::now();
+    uint64_t total_ms = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
+
+    json results_json = json::array();
+    size_t ok_count = 0, fail_count = 0;
+    for (size_t i = 0; i < results_vec.size(); ++i)
+    {
+        const auto& r = results_vec[i];
+        json e;
+        e["tool"]    = resolved[i].first;
+        if (!labels[i].empty()) e["label"] = labels[i];
+        e["success"] = r.success;
+        if (!r.error_code.empty())
+            e["error_code"] = r.error_code;
+        e["output"]  = r.output;
+        e["data"]    = r.data;
+        results_json.push_back(std::move(e));
+        if (r.success) ++ok_count; else ++fail_count;
+    }
+
+    json data;
+    data["results"]              = results_json;
+    data["total_ms"]             = total_ms;
+    data["partial_count"]        = partial_count;
+    data["total_requested"]      = resolved.size();
+    data["ran_in_parallel"]      = ran_in_parallel;
+    data["fell_back_to_serial"]  = fell_back_to_serial;
+    data["all_read_only"]        = all_read_only;
+    data["any_destructive"]      = any_destructive;
+    data["deadline_reached"]     = deadline_reached;
+
+    std::ostringstream ss;
+    ss << OBFSTR("Batch ran ") << partial_count << OBFSTR("/") << resolved.size()
+       << OBFSTR(" calls (") << ok_count << OBFSTR(" ok, ") << fail_count << OBFSTR(" fail) in ")
+       << total_ms << OBFSTR("ms");
+    if (fell_back_to_serial)
+        ss << OBFSTR("; parallel requested but mixed/write tools -> serial");
+    if (deadline_reached)
+        ss << OBFSTR("; deadline reached");
+
+    return tool_result_t::ok(ss.str(), data);
+}
+
+// ----------------------------------------------------------------------------
+// Slice B3 — plan_the_hunt
+//
+// Hardcoded workflow library keyed by hunt_type. Steps reference tools that may
+// not exist in the current registry yet (other slices) — that is intentional;
+// the agent treats the plan as a recipe and skips unknown tools.
+// ----------------------------------------------------------------------------
+static json build_hunt_plan_library()
+{
+    json lib = json::object();
+
+    auto step = [](const char* tool, const char* why,
+                   const json& typical_args, const char* expected_evidence,
+                   const char* on_empty, int expected_cost_ms) -> json
+    {
+        json s;
+        s["tool"]              = tool;
+        s["why"]               = why;
+        s["typical_args"]      = typical_args;
+        s["expected_evidence"] = expected_evidence;
+        s["on_empty"]          = on_empty;
+        s["expected_cost_ms"]  = expected_cost_ms;
+        return s;
+    };
+
+    // remote_0click_rce
+    {
+        json p;
+        p["steps"] = json::array({
+            step("binary_fingerprint",
+                 "Confirm binary is network-facing (network=true) and identify kind (driver/dll/exe).",
+                 json::object(),
+                 "capabilities.network=true and imports include WINSOCK/RPC/COM",
+                 "Likely not a remote attack surface — pivot to local/IPC hunt.", 200),
+            step("list_remote_entrypoints",
+                 "Rank pre-auth-likely server entrypoints (RPC/COM/HTTP/named-pipe).",
+                 json::object({{"top_n", 64}}),
+                 "Ranked list with pre_auth_likelihood>=0.6",
+                 "Try enumerate_rpc_servers / find_pre_auth_paths directly.", 800),
+            step("enumerate_rpc_servers",
+                 "Enumerate MIDL_SERVER_INFO tables / RpcServerRegisterIf callees.",
+                 json::object(),
+                 "RPC interface UUIDs + dispatch table EAs",
+                 "Binary may not be MIDL-generated.", 1500),
+            step("find_pre_auth_paths",
+                 "Locate dispatch paths reachable before authentication check.",
+                 json::object(),
+                 "Functions reached before SSPI/Negotiate/CheckSecurityContext",
+                 "Authentication may be elsewhere; widen list_remote_entrypoints scope.", 4000),
+            step("trace_all_network_to_sinks",
+                 "Taint propagate from network sources to memory/integer sinks.",
+                 json::object({{"max_depth", 16}}),
+                 "Taint paths with score>=70",
+                 "Increase max_depth or relax filters.", 8000),
+            step("hunt_remote_rce",
+                 "Verification: SMT-back the taint paths and demand reachable, controlled writes.",
+                 json::object(),
+                 "Verified RCE candidates with SMT model",
+                 "Symbolic engine timed out — try smaller slice.", 12000),
+        });
+        p["required_indices"] = json::array({"taint_engine", "microcode_engine", "cfg_engine"});
+        p["notes"] = OBFSTR("Remote 0-click RCE focuses on attacker reaching a pre-auth dispatch and tainting controllable bytes into a write/exec sink.");
+        lib["remote_0click_rce"] = p;
+    }
+
+    // kernel_ioctl_bug
+    {
+        json p;
+        p["steps"] = json::array({
+            step("binary_fingerprint",
+                 "Confirm kernel-mode (is_kernel=true) and capability vector mentions driver.",
+                 json::object(),
+                 "is_kernel=true and capabilities.driver=true",
+                 "Not a driver — switch hunt_type.", 200),
+            step("enumerate_ioctl_handlers",
+                 "Locate IRP_MJ_DEVICE_CONTROL dispatch + IOCTL code switch.",
+                 json::object(),
+                 "Dispatch table EA + per-IOCTL handler map",
+                 "Manual locate via xrefs to IoCreateDevice / IRP MajorFunction[].", 2000),
+            step("classify_ioctl_buffer_methods",
+                 "Decode METHOD_BUFFERED/IN_DIRECT/OUT_DIRECT/NEITHER per IOCTL.",
+                 json::object(),
+                 "Method enum per IOCTL code",
+                 "Default to NEITHER (highest risk) and continue.", 1000),
+            step("trace_ioctl_userptr_to_sinks",
+                 "Taint Irp->UserBuffer / Type3InputBuffer to kernel sinks.",
+                 json::object(),
+                 "Taint paths from user buffer to memcpy / write_user / ProbeForRead missing",
+                 "Re-run with relaxed sink set.", 8000),
+            step("hunt_kernel_writewhatwhere",
+                 "Symbolic search for arbitrary write primitives.",
+                 json::object(),
+                 "Verified W/W primitive callsites",
+                 "Try hunt_kernel_uaf next.", 12000),
+        });
+        p["required_indices"] = json::array({"kernel_engine", "taint_engine", "microcode_engine"});
+        p["notes"] = OBFSTR("Kernel IOCTL bugs centre on missing ProbeForRead/Write and method-NEITHER buffers reaching kernel sinks.");
+        lib["kernel_ioctl_bug"] = p;
+    }
+
+    // sandbox_escape
+    {
+        json p;
+        p["steps"] = json::array({
+            step("binary_fingerprint",
+                 "Identify sandbox-relevant capability (COM/RPC/ALPC).",
+                 json::object(),
+                 "capabilities.com or capabilities.alpc true",
+                 "Pivot to local privilege escalation hunt.", 200),
+            step("enumerate_com_servers",
+                 "List CoRegisterClassObject/DllGetClassObject implementations.",
+                 json::object(),
+                 "CLSID table + class object factories",
+                 "Look at ALPC/named-pipe IPC instead.", 2000),
+            step("list_alpc_servers",
+                 "Find ALPC ports advertised via NtAlpcCreatePort.",
+                 json::object(),
+                 "Named ALPC ports + message dispatch loops",
+                 "ALPC may not be used.", 1500),
+            step("trace_low_il_to_high_il",
+                 "Taint paths from cross-IL boundaries to privileged operations.",
+                 json::object(),
+                 "Cross-integrity-level taint paths",
+                 "Broaden sources to all IPC entrypoints.", 8000),
+        });
+        p["required_indices"] = json::array({"surface_engine", "taint_engine"});
+        p["notes"] = OBFSTR("Sandbox escape requires identifying a higher-IL service reachable from sandbox-IL and finding controllable input that reaches privileged action.");
+        lib["sandbox_escape"] = p;
+    }
+
+    // parser_bug
+    {
+        json p;
+        p["steps"] = json::array({
+            step("binary_fingerprint",
+                 "Quick capability check.", json::object(),
+                 "Any input-heavy capability set",
+                 "Still worth running parser hunt.", 200),
+            step("find_format_parsers",
+                 "Locate fixed-length headers + variable-length payload parsers.",
+                 json::object(),
+                 "Functions matching parser shape (loop + length prefix read)",
+                 "Try graphrag search_semantic for 'parser'.", 3000),
+            step("classify_parser_kind",
+                 "Classify each candidate (TLV, length-prefixed, ASN.1, protobuf, XML).",
+                 json::object(),
+                 "Kind label + confidence per parser",
+                 "Move to broader trace_all_user_to_sinks.", 2000),
+            step("hunt_integer_overflow_into_alloc",
+                 "Find arithmetic on attacker-controlled length feeding allocation.",
+                 json::object(),
+                 "Integer overflow callsites with SMT proof",
+                 "Lower SMT timeout and re-run.", 8000),
+        });
+        p["required_indices"] = json::array({"microcode_engine", "symbolic_engine", "smt_solver"});
+        p["notes"] = OBFSTR("Parser bugs commonly originate from missing length/range checks before allocation or copy.");
+        lib["parser_bug"] = p;
+    }
+
+    // auth_bypass
+    {
+        json p;
+        p["steps"] = json::array({
+            step("binary_fingerprint",
+                 "Surface check.", json::object(),
+                 "Network or service capability",
+                 "Skip auth_bypass hunt.", 200),
+            step("find_auth_checks",
+                 "Locate SSPI/NTLM/Negotiate/AcceptSecurityContext callsites.",
+                 json::object(),
+                 "Functions wrapping auth checks",
+                 "Auth may be delegated; search graphrag.", 2000),
+            step("find_unauthenticated_reachable",
+                 "Walk reverse from auth check; find callers reachable without it.",
+                 json::object(),
+                 "Pre-auth reachable function set",
+                 "All paths gated — bypass unlikely.", 6000),
+            step("symbolically_prove_bypass",
+                 "Symbolic execution to prove an unauthenticated path reaches a privileged op.",
+                 json::object(),
+                 "Concrete SMT model bypassing auth",
+                 "Try relaxed model.", 10000),
+        });
+        p["required_indices"] = json::array({"cfg_engine", "symbolic_engine", "smt_solver"});
+        p["notes"] = OBFSTR("Auth bypass = privileged path reachable without auth check or with broken check semantics.");
+        lib["auth_bypass"] = p;
+    }
+
+    // uaf
+    {
+        json p;
+        p["steps"] = json::array({
+            step("binary_fingerprint",
+                 "Surface check.", json::object(),
+                 "Any complex object lifetime surface",
+                 "Skip uaf.", 200),
+            step("find_allocators_and_frees",
+                 "Locate pairing alloc/free family callsites.",
+                 json::object(),
+                 "alloc/free pairs with object types",
+                 "Allocators may be inlined; widen.", 3000),
+            step("hunt_uaf",
+                 "Symbolic execution chasing post-free deref.",
+                 json::object(),
+                 "Concrete UAF paths with proof",
+                 "Increase symbolic budget.", 12000),
+        });
+        p["required_indices"] = json::array({"taint_engine", "symbolic_engine"});
+        p["notes"] = OBFSTR("Use-after-free hunts require lifetime tracking — costly but high-value.");
+        lib["uaf"] = p;
+    }
+
+    // format_string
+    {
+        json p;
+        p["steps"] = json::array({
+            step("binary_fingerprint",
+                 "Surface check.", json::object(),
+                 "Imports printf-family",
+                 "Likely no format-string surface.", 200),
+            step("find_printf_calls",
+                 "Locate printf-family callsites.",
+                 json::object(),
+                 "List of printf-family call EAs + format-arg index",
+                 "No printf family used.", 1500),
+            step("trace_format_to_attacker",
+                 "Taint format argument back to known sources.",
+                 json::object(),
+                 "Tainted format-string paths",
+                 "Format arg appears to be constant — done.", 4000),
+        });
+        p["required_indices"] = json::array({"taint_engine", "microcode_engine"});
+        p["notes"] = OBFSTR("Format-string bugs are easy wins when the fmt arg is attacker-controlled.");
+        lib["format_string"] = p;
+    }
+
+    // all = aggregate of every hunt above, in order.
+    {
+        json p;
+        json steps = json::array();
+        json req   = json::array({"graphrag", "taint_engine", "microcode_engine", "cfg_engine", "kernel_engine", "surface_engine", "symbolic_engine", "smt_solver"});
+        // Reference each hunt as a meta-step so the agent can fan out.
+        const char* hunts[] = {
+            "remote_0click_rce", "kernel_ioctl_bug", "sandbox_escape",
+            "parser_bug", "auth_bypass", "uaf", "format_string" };
+        for (auto* h : hunts)
+        {
+            json s;
+            s["tool"]              = "plan_the_hunt";
+            s["why"]               = std::string(OBFSTR("Fan out to ")) + h;
+            s["typical_args"]      = json::object({{"hunt_type", h}});
+            s["expected_evidence"] = OBFSTR("Nested plan returned");
+            s["on_empty"]          = OBFSTR("Unknown hunt type — should not happen here.");
+            s["expected_cost_ms"]  = 10;
+            steps.push_back(std::move(s));
+        }
+        p["steps"] = std::move(steps);
+        p["required_indices"] = std::move(req);
+        p["notes"] = OBFSTR("Aggregate plan — execute each hunt sequentially or in parallel.");
+        lib["all"] = p;
+    }
+
+    return lib;
+}
+
+tool_result_t plan_the_hunt(const json& params)
+{
+    std::string hunt_type = OBFSTR("remote_0click_rce");
+    if (params.contains("hunt_type") && params["hunt_type"].is_string())
+        hunt_type = params["hunt_type"].get<std::string>();
+
+    static const json lib = build_hunt_plan_library();
+    auto it = lib.find(hunt_type);
+    if (it == lib.end())
+    {
+        std::ostringstream ss;
+        ss << OBFSTR("Unknown hunt_type '") << hunt_type << OBFSTR("'. Valid: ");
+        bool first = true;
+        for (auto kv = lib.cbegin(); kv != lib.cend(); ++kv)
+        {
+            if (!first) ss << OBFSTR(", ");
+            ss << kv.key();
+            first = false;
+        }
+        return tool_result_t::error(ss.str(), OBFSTR("bad_param"));
+    }
+
+    json data;
+    data["hunt_type"]        = hunt_type;
+    data["plan"]             = *it;
+    data["step_count"]       = it->value("steps", json::array()).size();
+    return tool_result_t::ok(OBFSTR("Plan for ") + hunt_type, data);
+}
+
+// ----------------------------------------------------------------------------
+// Slice B4 — index_status
+// ----------------------------------------------------------------------------
+static json engine_status_stub(bool available = false, bool populated = false, uint64_t count = 0)
+{
+    json j;
+    j["available"] = available;
+    j["populated"] = populated;
+    j["count"]     = count;
+    return j;
+}
+
+tool_result_t index_status(const json&)
+{
+    json data;
+
+    // Binary MD5 (matches binary_fingerprint formatting).
+    {
+        unsigned char md5[16] = {};
+        if (retrieve_input_file_md5(md5))
+        {
+            char buf[33] = {};
+            for (int i = 0; i < 16; ++i)
+                ::qsnprintf(buf + i * 2, 3, "%02x", md5[i]);
+            data["binary_md5"] = std::string(buf, 32);
+        }
+        else
+        {
+            data["binary_md5"] = "";
+        }
+    }
+
+    data["auto_analysis_ok"]   = auto_is_ok();
+    data["hexrays_available"]  = init_hexrays_plugin();
+
+    json engines;
+    // No unified status APIs on these engines yet — graceful degradation.
+    // Downstream slices that wire real status methods are expected to update
+    // this block in place. Slice B owners must not depend on engine internals.
+    engines["graphrag"]         = engine_status_stub();
+    engines["taint_engine"]     = engine_status_stub();
+    engines["microcode_engine"] = engine_status_stub();
+    engines["cfg_engine"]       = engine_status_stub();
+    engines["kernel_engine"]    = engine_status_stub();
+    engines["surface_engine"]   = engine_status_stub();
+    engines["symbolic_engine"]  = engine_status_stub();
+    engines["smt_solver"]       = engine_status_stub();
+
+    data["engines"] = engines;
+
+    return tool_result_t::ok(OBFSTR("Index status snapshot"), data);
+}
+
+// ----------------------------------------------------------------------------
+// Slice B5 — build_index
+// ----------------------------------------------------------------------------
+static const char* k_valid_engines[] = {
+    "graphrag", "taint_engine", "microcode_engine", "cfg_engine",
+    "kernel_engine", "surface_engine", "symbolic_engine", "smt_solver"
+};
+
+tool_result_t build_index(const json& params)
+{
+    std::vector<std::string> requested;
+    bool all = false;
+
+    if (!params.contains("indices"))
+    {
+        all = true;
+    }
+    else
+    {
+        const json& v = params["indices"];
+        if (v.is_string())
+        {
+            std::string s = v.get<std::string>();
+            if (s == "all") all = true;
+            else            requested.push_back(s);
+        }
+        else if (v.is_array())
+        {
+            for (const auto& e : v)
+            {
+                if (e.is_string())
+                {
+                    std::string s = e.get<std::string>();
+                    if (s == "all") { all = true; break; }
+                    requested.push_back(s);
+                }
+            }
+        }
+        else
+        {
+            return tool_result_t::error(OBFSTR("'indices' must be string or array"), OBFSTR("bad_param"));
+        }
+    }
+
+    if (all)
+    {
+        requested.clear();
+        for (auto* n : k_valid_engines) requested.emplace_back(n);
+    }
+
+    // Validate names.
+    for (const auto& name : requested)
+    {
+        bool ok = false;
+        for (auto* n : k_valid_engines) if (name == n) { ok = true; break; }
+        if (!ok)
+        {
+            return tool_result_t::error(OBFSTR("Unknown engine: ") + name, OBFSTR("bad_param"));
+        }
+    }
+
+    double max_seconds = 60.0;
+    if (params.contains("max_seconds") && params["max_seconds"].is_number())
+        max_seconds = params["max_seconds"].get<double>();
+    if (max_seconds <= 0.0) max_seconds = 60.0;
+
+    show_wait_box("AiDA: warming engines...");
+    auto t_start = std::chrono::steady_clock::now();
+
+    json warmed = json::array();
+    bool deadline_reached = false;
+    bool any_partial = false;
+
+    for (const auto& name : requested)
+    {
+        auto now = std::chrono::steady_clock::now();
+        double elapsed = std::chrono::duration<double>(now - t_start).count();
+        if (elapsed > max_seconds)
+        {
+            deadline_reached = true;
+            break;
+        }
+        if (user_cancelled())
+        {
+            deadline_reached = true;
+            break;
+        }
+
+        json entry;
+        entry["engine"]    = name;
+        auto t_engine = std::chrono::steady_clock::now();
+
+        // Engines have no unified warm-up API yet; downstream slices are
+        // expected to plug into this switch. Report partial=true for each so
+        // the caller knows nothing was actually warmed.
+        bool populated = false;
+        uint64_t count = 0;
+        std::string err;
+        try
+        {
+            // Pass via %s to defend against engine names containing '%' if a
+            // downstream slice ever expands the valid-engine list.
+            replace_wait_box("AiDA: warming %s...", name.c_str());
+            // Intentional no-op for Slice B — engines populate themselves on
+            // first use. Mark partial=true so callers do not assume success.
+        }
+        catch (const std::exception& e)
+        {
+            err = e.what();
+        }
+
+        auto t_engine_end = std::chrono::steady_clock::now();
+        uint64_t engine_ms = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(t_engine_end - t_engine).count();
+
+        entry["populated"]  = populated;
+        entry["count"]      = count;
+        entry["elapsed_ms"] = engine_ms;
+        entry["partial"]    = true; // no warm-up backend wired yet
+        if (!err.empty()) entry["error"] = err;
+        any_partial = true;
+        warmed.push_back(std::move(entry));
+    }
+
+    hide_wait_box();
+    auto t_end = std::chrono::steady_clock::now();
+    uint64_t total_ms = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
+
+    json data;
+    data["warmed"]            = warmed;
+    data["total_ms"]          = total_ms;
+    data["deadline_reached"]  = deadline_reached;
+    data["any_partial"]       = any_partial;
+
+    std::ostringstream ss;
+    ss << OBFSTR("build_index: ") << warmed.size() << OBFSTR(" engines visited in ") << total_ms << OBFSTR("ms");
+    if (any_partial) ss << OBFSTR(" (partial — no warm-up backend wired)");
+    if (deadline_reached) ss << OBFSTR(" [deadline reached]");
+
+    return tool_result_t::ok(ss.str(), data);
+}
+
+// ----------------------------------------------------------------------------
+// Slice B6 — session_scratch
+// ----------------------------------------------------------------------------
+static const char* k_scratch_node_name = "$ AiDA.hunt.scratch";
+static constexpr size_t k_scratch_max_total_bytes = 512 * 1024;
+// We store the user payloads under tag htag (default). The aggregate size
+// counter is stored under a separate altval tag to avoid colliding with hash
+// keys. Use a distinct tag char.
+static constexpr uchar k_scratch_size_tag = 'A';
+static constexpr nodeidx_t k_scratch_size_altidx = 0;
+
+static netnode get_scratch_node()
+{
+    return netnode(k_scratch_node_name, 0, true);
+}
+
+static uint64_t scratch_get_total_bytes(netnode& nn)
+{
+    nodeidx_t v = nn.altval(k_scratch_size_altidx, k_scratch_size_tag);
+    return (uint64_t)v;
+}
+
+static void scratch_set_total_bytes(netnode& nn, uint64_t v)
+{
+    nn.altset(k_scratch_size_altidx, (nodeidx_t)v, k_scratch_size_tag);
+}
+
+static std::vector<std::string> scratch_collect_keys(netnode& nn)
+{
+    std::vector<std::string> keys;
+    qstring cur;
+    ssize_t got = nn.hashfirst(&cur);
+    while (got >= 0)
+    {
+        // Snapshot cur before passing it back into hashnext — the SDK writes
+        // the next key into the same qstring buffer and could invalidate the
+        // backing pointer otherwise.
+        std::string prev(cur.c_str(), cur.length());
+        keys.push_back(prev);
+        if (keys.size() > 100000) break; // safety
+        got = nn.hashnext(&cur, prev.c_str());
+    }
+    return keys;
+}
+
+static size_t scratch_value_size(netnode& nn, const char* key)
+{
+    return (size_t)nn.hashval(key, nullptr, 0);
+}
+
+// Auto-prune: walks keys, deletes oldest-by-key-order until under threshold.
+// netnode hash iteration order is not strictly insertion order, but it is
+// deterministic given the IDA backing — good enough as a bounded eviction.
+static size_t scratch_autoprune(netnode& nn, uint64_t threshold)
+{
+    size_t pruned = 0;
+    uint64_t total = scratch_get_total_bytes(nn);
+    if (total <= threshold) return 0;
+
+    auto keys = scratch_collect_keys(nn);
+    for (const auto& k : keys)
+    {
+        if (total <= threshold) break;
+        ssize_t sz = nn.hashval(k.c_str(), nullptr, 0);
+        if (sz <= 0) continue;
+        nn.hashdel(k.c_str());
+        if ((uint64_t)sz <= total) total -= (uint64_t)sz; else total = 0;
+        ++pruned;
+    }
+    scratch_set_total_bytes(nn, total);
+    return pruned;
+}
+
+tool_result_t session_scratch(const json& params)
+{
+    std::string op = OBFSTR("get");
+    if (params.contains("op") && params["op"].is_string())
+        op = params["op"].get<std::string>();
+
+    netnode nn = get_scratch_node();
+
+    if (op == "set")
+    {
+        if (!params.contains("key") || !params["key"].is_string())
+            return tool_result_t::error(OBFSTR("'key' required"), OBFSTR("bad_param"));
+        std::string key = params["key"].get<std::string>();
+        if (key.empty() || key.size() > 512)
+            return tool_result_t::error(OBFSTR("'key' must be 1..512 chars"), OBFSTR("bad_param"));
+
+        std::string value;
+        if (params.contains("value"))
+        {
+            const json& v = params["value"];
+            if (v.is_string())     value = v.get<std::string>();
+            else if (!v.is_null()) value = v.dump();
+            // empty/null allowed
+        }
+
+        size_t old_sz = scratch_value_size(nn, key.c_str());
+        nn.hashset(key.c_str(), value.empty() ? "" : value.data(), value.size());
+        uint64_t total = scratch_get_total_bytes(nn);
+        // Adjust counter: subtract old, add new (saturate).
+        total = (total >= old_sz) ? (total - old_sz) : 0;
+        total += value.size();
+        scratch_set_total_bytes(nn, total);
+
+        size_t pruned = scratch_autoprune(nn, k_scratch_max_total_bytes);
+
+        json data;
+        data["key"]           = key;
+        data["bytes_written"] = (uint64_t)value.size();
+        data["total_bytes"]   = scratch_get_total_bytes(nn);
+        data["pruned_count"]  = (uint64_t)pruned;
+        return tool_result_t::ok(OBFSTR("scratch set ok"), data);
+    }
+    else if (op == "get")
+    {
+        if (!params.contains("key") || !params["key"].is_string())
+            return tool_result_t::error(OBFSTR("'key' required"), OBFSTR("bad_param"));
+        std::string key = params["key"].get<std::string>();
+
+        ssize_t need = nn.hashval(key.c_str(), nullptr, 0);
+        if (need < 0)
+        {
+            json data;
+            data["found"] = false;
+            data["key"]   = key;
+            return tool_result_t::ok(OBFSTR("scratch get: not found"), data);
+        }
+        std::string buf;
+        buf.resize((size_t)need);
+        if (need > 0)
+            nn.hashval(key.c_str(), buf.data(), buf.size());
+
+        json data;
+        data["found"] = true;
+        data["key"]   = key;
+        data["value"] = buf;
+        data["bytes"] = (uint64_t)buf.size();
+        return tool_result_t::ok(OBFSTR("scratch get ok"), data);
+    }
+    else if (op == "append")
+    {
+        if (!params.contains("key") || !params["key"].is_string())
+            return tool_result_t::error(OBFSTR("'key' required"), OBFSTR("bad_param"));
+        std::string key = params["key"].get<std::string>();
+        std::string add;
+        if (params.contains("value"))
+        {
+            const json& v = params["value"];
+            if (v.is_string())     add = v.get<std::string>();
+            else if (!v.is_null()) add = v.dump();
+        }
+
+        std::string cur;
+        ssize_t have = nn.hashval(key.c_str(), nullptr, 0);
+        if (have > 0)
+        {
+            cur.resize((size_t)have);
+            nn.hashval(key.c_str(), cur.data(), cur.size());
+        }
+        size_t old_sz = (have > 0) ? (size_t)have : 0;
+        cur.append(add);
+        nn.hashset(key.c_str(), cur.empty() ? "" : cur.data(), cur.size());
+        uint64_t total = scratch_get_total_bytes(nn);
+        total = (total >= old_sz) ? (total - old_sz) : 0;
+        total += cur.size();
+        scratch_set_total_bytes(nn, total);
+
+        size_t pruned = scratch_autoprune(nn, k_scratch_max_total_bytes);
+
+        json data;
+        data["key"]           = key;
+        data["new_length"]    = (uint64_t)cur.size();
+        data["total_bytes"]   = scratch_get_total_bytes(nn);
+        data["pruned_count"]  = (uint64_t)pruned;
+        return tool_result_t::ok(OBFSTR("scratch append ok"), data);
+    }
+    else if (op == "list")
+    {
+        uint64_t offset = 0;
+        uint64_t limit  = 256;
+        if (params.contains("offset") && params["offset"].is_number_unsigned())
+            offset = params["offset"].get<uint64_t>();
+        if (params.contains("limit") && params["limit"].is_number_unsigned())
+            limit = std::min<uint64_t>(params["limit"].get<uint64_t>(), 4096);
+
+        auto keys = scratch_collect_keys(nn);
+        json arr = json::array();
+        for (uint64_t i = offset; i < (uint64_t)keys.size() && arr.size() < limit; ++i)
+        {
+            json e;
+            e["key"]   = keys[i];
+            e["bytes"] = (uint64_t)nn.hashval(keys[i].c_str(), nullptr, 0);
+            arr.push_back(std::move(e));
+        }
+        json data;
+        data["entries"]    = arr;
+        data["total_keys"] = (uint64_t)keys.size();
+        data["total_bytes"]= scratch_get_total_bytes(nn);
+        data["offset"]     = offset;
+        data["limit"]      = limit;
+        return tool_result_t::ok(OBFSTR("scratch list ok"), data);
+    }
+    else if (op == "delete")
+    {
+        bool all = params.value("all", false);
+        if (all)
+        {
+            auto keys = scratch_collect_keys(nn);
+            for (const auto& k : keys) nn.hashdel(k.c_str());
+            nn.hashdel_all();
+            scratch_set_total_bytes(nn, 0);
+            json data;
+            data["deleted_count"] = (uint64_t)keys.size();
+            data["all"]           = true;
+            return tool_result_t::ok(OBFSTR("scratch delete all ok"), data);
+        }
+        if (!params.contains("key") || !params["key"].is_string())
+            return tool_result_t::error(OBFSTR("'key' or all=true required"), OBFSTR("bad_param"));
+        std::string key = params["key"].get<std::string>();
+        ssize_t sz = nn.hashval(key.c_str(), nullptr, 0);
+        bool removed = false;
+        if (sz >= 0)
+        {
+            nn.hashdel(key.c_str());
+            uint64_t total = scratch_get_total_bytes(nn);
+            uint64_t s = (sz > 0) ? (uint64_t)sz : 0;
+            total = (total >= s) ? (total - s) : 0;
+            scratch_set_total_bytes(nn, total);
+            removed = true;
+        }
+        json data;
+        data["key"]     = key;
+        data["removed"] = removed;
+        data["total_bytes"] = scratch_get_total_bytes(nn);
+        return tool_result_t::ok(removed ? OBFSTR("scratch delete ok") : OBFSTR("scratch delete: not found"), data);
+    }
+
+    return tool_result_t::error(OBFSTR("Unknown op: ") + op + OBFSTR(" (set|get|append|list|delete)"),
+                                 OBFSTR("bad_param"));
+}
+
+// ----------------------------------------------------------------------------
+// Slice B8 — list_remote_entrypoints
+// ----------------------------------------------------------------------------
+struct b8_func_acc_t
+{
+    ea_t func_ea = BADADDR;
+    std::set<std::string> source_names;
+    std::set<std::string> source_categories;
+    qstring name;
+};
+
+static void b8_walk_source_array(const aida::vuln::sig::source_signature_t* arr, size_t count,
+                                 const char* category,
+                                 std::map<ea_t, b8_func_acc_t>& acc)
+{
+    for (size_t i = 0; i < count; ++i)
+    {
+        std::string sname(arr[i].name.data(), arr[i].name.size());
+        ea_t sym = get_name_ea(BADADDR, sname.c_str());
+        if (sym == BADADDR)
+            continue;
+
+        xrefblk_t xb;
+        for (bool ok = xb.first_to(sym, XREF_ALL); ok; ok = xb.next_to())
+        {
+            func_t* pfn = get_func(xb.from);
+            if (!pfn) continue;
+            ea_t fea = pfn->start_ea;
+            auto& slot = acc[fea];
+            if (slot.func_ea == BADADDR)
+            {
+                slot.func_ea = fea;
+                get_func_name(&slot.name, fea);
+            }
+            slot.source_names.insert(sname);
+            slot.source_categories.insert(category);
+        }
+    }
+}
+
+tool_result_t list_remote_entrypoints(const json& params)
+{
+    uint64_t top_n = 64;
+    if (params.contains("top_n") && params["top_n"].is_number_unsigned())
+        top_n = std::min<uint64_t>(params["top_n"].get<uint64_t>(), 256);
+
+    using namespace aida::vuln::sig;
+
+    std::map<ea_t, b8_func_acc_t> acc;
+
+#define B8_WALK(arr, cat) b8_walk_source_array((arr), sizeof(arr)/sizeof((arr)[0]), (cat), acc)
+    B8_WALK(RPC_SERVER_SINKS,       "rpc_server");
+    B8_WALK(COM_SERVER_SINKS,       "com_server");
+    B8_WALK(ALPC_SOURCES,           "alpc");
+    B8_WALK(NAMED_PIPE_SOURCES,     "named_pipe");
+    B8_WALK(SOCKET_ACCEPT_SOURCES,  "socket_accept");
+    B8_WALK(HTTP_SERVER_SOURCES,    "http_server");
+    B8_WALK(WEBSOCKET_SOURCES,      "websocket");
+    B8_WALK(NDIS_WSK_SOURCES,       "ndis_wsk");
+    B8_WALK(KERNEL_IRP_SOURCES,     "kernel_irp");
+#undef B8_WALK
+
+    static const char* k_init_hints[] = {
+        "init", "setup", "start", "handler", "dispatch", "process", "receive"
+    };
+
+    struct ranked_t
+    {
+        ea_t ea = BADADDR;
+        std::string name;
+        std::vector<std::string> categories;
+        std::vector<std::string> reachable_imports;
+        std::set<std::string> kinds;
+        double score = 0.0;
+    };
+
+    std::vector<ranked_t> ranked;
+    ranked.reserve(acc.size());
+    for (auto& kv : acc)
+    {
+        ranked_t r;
+        r.ea   = kv.first;
+        r.name = kv.second.name.c_str();
+        for (const auto& c : kv.second.source_categories)
+        {
+            r.categories.push_back(c);
+            r.kinds.insert(c);
+        }
+        for (const auto& n : kv.second.source_names)
+            r.reachable_imports.push_back(n);
+
+        double s = 0.5;
+        s += 0.10 * (double)r.kinds.size();
+
+        std::string lower = r.name;
+        for (auto& ch : lower) ch = (char)std::tolower((unsigned char)ch);
+        for (auto* hint : k_init_hints)
+        {
+            if (lower.find(hint) != std::string::npos)
+            {
+                s += 0.20;
+                break; // one bonus per function
+            }
+        }
+        if (s > 1.0) s = 1.0;
+        if (s < 0.0) s = 0.0;
+        r.score = s;
+        ranked.push_back(std::move(r));
+    }
+
+    std::sort(ranked.begin(), ranked.end(),
+              [](const ranked_t& a, const ranked_t& b)
+              {
+                  if (a.score != b.score) return a.score > b.score;
+                  return a.ea < b.ea;
+              });
+
+    json arr = json::array();
+    for (size_t i = 0; i < ranked.size() && arr.size() < top_n; ++i)
+    {
+        const auto& r = ranked[i];
+        json e;
+        e["ea"]                  = helpers::format_address(r.ea);
+        e["name"]                = r.name;
+        e["category"]            = r.categories;
+        e["kind_evidence"]       = std::vector<std::string>(r.kinds.begin(), r.kinds.end());
+        e["reachable_imports"]   = r.reachable_imports;
+        e["pre_auth_likelihood"] = r.score;
+        arr.push_back(std::move(e));
+    }
+
+    json data;
+    data["entries"]         = arr;
+    data["total_candidates"]= (uint64_t)ranked.size();
+    data["top_n"]           = top_n;
+
+    std::ostringstream ss;
+    ss << OBFSTR("list_remote_entrypoints: ") << arr.size() << OBFSTR("/") << ranked.size()
+       << OBFSTR(" entrypoints");
+    return tool_result_t::ok(ss.str(), data);
+}
+
+// ----------------------------------------------------------------------------
+// Slice B9 — list_outputs (delegates to mcp_server output cache)
+// ----------------------------------------------------------------------------
+tool_result_t list_outputs(const json& params)
+{
+    std::string op = OBFSTR("list");
+    if (params.contains("op") && params["op"].is_string())
+        op = params["op"].get<std::string>();
+
+    if (op == "list")
+    {
+        auto entries = aida_mcp_internal::output_cache_list();
+        json arr = json::array();
+        for (const auto& e : entries)
+        {
+            json je;
+            je["output_id"]   = e.id;
+            je["total_bytes"] = (uint64_t)e.json_bytes;
+            arr.push_back(std::move(je));
+        }
+        json data;
+        data["entries"]     = arr;
+        data["entry_count"] = (uint64_t)entries.size();
+        return tool_result_t::ok(OBFSTR("list_outputs: list ok"), data);
+    }
+    if (op == "stats")
+    {
+        auto s = aida_mcp_internal::output_cache_stats();
+        json data;
+        data["entry_count"] = (uint64_t)s.total_entries;
+        data["used"]        = (uint64_t)s.total_bytes;
+        data["capacity"]    = (uint64_t)s.limit;
+        data["text_limit"]  = (uint64_t)s.text_limit;
+        return tool_result_t::ok(OBFSTR("list_outputs: stats ok"), data);
+    }
+    if (op == "evict")
+    {
+        bool all = params.value("all", false);
+        if (all)
+        {
+            size_t n = aida_mcp_internal::output_cache_evict_all();
+            json data;
+            data["evicted_count"] = (uint64_t)n;
+            data["all"]           = true;
+            return tool_result_t::ok(OBFSTR("list_outputs: evict all ok"), data);
+        }
+        if (!params.contains("output_id") || !params["output_id"].is_string())
+            return tool_result_t::error(OBFSTR("'output_id' or all=true required"), OBFSTR("bad_param"));
+        std::string id = params["output_id"].get<std::string>();
+        bool ok = aida_mcp_internal::output_cache_evict_one(id);
+        json data;
+        data["evicted_count"] = ok ? 1 : 0;
+        data["evicted_ids"]   = ok ? json::array({id}) : json::array();
+        return tool_result_t::ok(ok ? OBFSTR("list_outputs: evict ok") : OBFSTR("list_outputs: id not found"), data);
+    }
+
+    return tool_result_t::error(OBFSTR("Unknown op: ") + op + OBFSTR(" (list|stats|evict)"),
+                                 OBFSTR("bad_param"));
+}
+
+// ----------------------------------------------------------------------------
+// Slice B10 — ask_capability
+// ----------------------------------------------------------------------------
+struct b10_suggestion_t
+{
+    std::string tool;
+    std::string why;
+    json        typical_args;
+    json        sample_call;
+};
+
+static const std::map<std::string, std::vector<const char*>>& b10_keyword_map()
+{
+    static const std::map<std::string, std::vector<const char*>> m = {
+        {"network",      {"binary_fingerprint", "list_remote_entrypoints", "trace_all_network_to_sinks"}},
+        {"socket",       {"list_remote_entrypoints", "trace_all_network_to_sinks"}},
+        {"recv",         {"list_remote_entrypoints", "trace_all_network_to_sinks"}},
+        {"send",         {"list_remote_entrypoints", "trace_all_network_to_sinks"}},
+        {"http",         {"list_remote_entrypoints"}},
+        {"https",        {"list_remote_entrypoints"}},
+        {"websocket",    {"list_remote_entrypoints"}},
+        {"rpc",          {"list_remote_entrypoints", "enumerate_rpc_servers"}},
+        {"midl",         {"enumerate_rpc_servers"}},
+        {"com",          {"enumerate_com_servers"}},
+        {"clsid",        {"enumerate_com_servers"}},
+        {"alpc",         {"list_alpc_servers"}},
+        {"pipe",         {"list_remote_entrypoints"}},
+        {"namedpipe",    {"list_remote_entrypoints"}},
+        {"driver",       {"binary_fingerprint", "enumerate_ioctl_handlers", "classify_ioctl_buffer_methods"}},
+        {"kernel",       {"binary_fingerprint", "enumerate_ioctl_handlers", "hunt_kernel_writewhatwhere"}},
+        {"ioctl",        {"enumerate_ioctl_handlers", "classify_ioctl_buffer_methods", "trace_ioctl_userptr_to_sinks"}},
+        {"irp",          {"enumerate_ioctl_handlers"}},
+        {"taint",        {"trace_all_network_to_sinks", "trace_taint_reverse"}},
+        {"reverse",      {"trace_taint_reverse"}},
+        {"flow",         {"trace_data_flow", "trace_all_network_to_sinks"}},
+        {"vtable",       {"reconstruct_vtable", "find_dispatch_tables"}},
+        {"dispatch",     {"find_dispatch_tables"}},
+        {"indirect",     {"analyze_indirect_calls"}},
+        {"vfunc",        {"reconstruct_vtable"}},
+        {"format",       {"find_format_parsers", "find_printf_calls"}},
+        {"printf",       {"find_printf_calls", "trace_format_to_attacker"}},
+        {"parser",       {"find_format_parsers", "hunt_integer_overflow_into_alloc"}},
+        {"overflow",     {"hunt_integer_overflow_into_alloc"}},
+        {"integer",      {"hunt_integer_overflow_into_alloc"}},
+        {"uaf",          {"hunt_uaf", "find_allocators_and_frees"}},
+        {"free",         {"find_allocators_and_frees", "hunt_uaf"}},
+        {"alloc",        {"find_allocators_and_frees"}},
+        {"auth",         {"find_auth_checks", "find_unauthenticated_reachable"}},
+        {"login",        {"find_auth_checks"}},
+        {"crypto",       {"find_crypto_constants", "binary_fingerprint"}},
+        {"hash",         {"find_crypto_constants"}},
+        {"vmprotect",    {"identify_protector", "deobfuscate_control_flow"}},
+        {"obfuscation",  {"detect_obfuscation_patterns", "identify_protector"}},
+        {"vm",           {"detect_vm_handler_pattern", "map_vm_handler_table"}},
+        {"deobfuscate",  {"deobfuscate_control_flow", "decode_strings_in_function"}},
+        {"strings",      {"search_strings", "decode_strings_in_function"}},
+        {"decrypt",      {"analyze_string_decryption", "decode_strings_in_function"}},
+        {"hook",         {"detect_hooks"}},
+        {"syscall",      {"detect_direct_syscalls"}},
+        {"antidebug",    {"detect_anti_analysis", "patch_anti_debug"}},
+        {"sandbox",      {"binary_fingerprint", "find_unauthenticated_reachable"}},
+        {"pe",           {"analyze_pe_headers"}},
+        {"entropy",      {"analyze_entropy", "identify_protector"}},
+        {"import",       {"list_imports", "binary_fingerprint"}},
+        {"export",       {"list_exports"}},
+        {"function",     {"list_functions", "get_function"}},
+        {"decompile",    {"decompile", "decompile_function"}},
+        {"disasm",       {"disasm", "disassemble_function"}},
+        {"xref",         {"xrefs_to", "xref_query"}},
+        {"struct",       {"reconstruct_struct", "create_struct"}},
+        {"type",         {"declare_type", "infer_type"}},
+        {"graph",        {"build_call_graph", "callgraph"}},
+        {"semantic",     {"search_semantic", "get_semantic_analysis"}},
+        {"similar",      {"get_similar_functions"}},
+        {"community",    {"get_community_info", "detect_communities"}},
+        {"plan",         {"plan_the_hunt"}},
+        {"capability",   {"binary_fingerprint", "ask_capability"}},
+        {"identity",     {"binary_fingerprint"}},
+        {"fingerprint",  {"binary_fingerprint"}},
+        {"warmup",       {"build_index", "index_status"}},
+        {"status",       {"index_status", "server_health"}},
+        {"index",        {"build_index", "index_status"}},
+        {"scratch",      {"session_scratch"}},
+        {"output",       {"list_outputs"}},
+        {"example",      {"sample_tool_io"}},
+        {"sample",       {"sample_tool_io"}},
+        {"batch",        {"tool_batch_call"}},
+        {"parallel",     {"tool_batch_call"}},
+    };
+    return m;
+}
+
+static const std::map<std::string, std::pair<std::string, json>>& b10_tool_hints()
+{
+    // (why, typical_args). sample_call is built per suggestion below.
+    static const std::map<std::string, std::pair<std::string, json>> m = {
+        {"binary_fingerprint",        {"Identify binary kind and attack-surface capability vector.", json::object()}},
+        {"list_remote_entrypoints",   {"Rank network/RPC/COM/ALPC/HTTP entrypoints by pre-auth likelihood.", json::object({{"top_n", 64}})}},
+        {"trace_all_network_to_sinks",{"Taint paths from network sources to memory/integer sinks.", json::object({{"max_depth", 16}})}},
+        {"enumerate_rpc_servers",     {"List MIDL/NDR RPC server interfaces and dispatch tables.", json::object()}},
+        {"enumerate_com_servers",     {"List COM class factories and CoRegister sites.", json::object()}},
+        {"list_alpc_servers",         {"Locate NtAlpcCreatePort callsites and message loops.", json::object()}},
+        {"enumerate_ioctl_handlers",  {"Find IRP_MJ_DEVICE_CONTROL dispatch + IOCTL switch.", json::object()}},
+        {"classify_ioctl_buffer_methods",{"Decode METHOD_BUFFERED/IN_DIRECT/OUT_DIRECT/NEITHER per IOCTL.", json::object()}},
+        {"trace_ioctl_userptr_to_sinks",{"Taint Irp->UserBuffer into kernel sinks.", json::object()}},
+        {"hunt_kernel_writewhatwhere",{"Symbolic search for arbitrary kernel write primitives.", json::object()}},
+        {"reconstruct_vtable",        {"Recover vtable at address from class metadata + xrefs.", json::object({{"address", "0x140020000"}})}},
+        {"find_dispatch_tables",      {"Locate vtable-shaped read-only tables of code pointers.", json::object()}},
+        {"analyze_indirect_calls",    {"Resolve indirect calls within a function.", json::object({{"address", "0x140001000"}})}},
+        {"find_format_parsers",       {"Locate likely format/protocol parser functions.", json::object()}},
+        {"find_printf_calls",         {"Locate printf-family callsites.", json::object()}},
+        {"trace_format_to_attacker",  {"Backtrack format-string argument to its source.", json::object()}},
+        {"hunt_integer_overflow_into_alloc",{"Find integer arithmetic feeding alloc size.", json::object()}},
+        {"hunt_uaf",                  {"Symbolic search for use-after-free.", json::object()}},
+        {"find_allocators_and_frees", {"Pair alloc/free family callsites.", json::object()}},
+        {"find_auth_checks",          {"Locate SSPI/Negotiate/AcceptSecurityContext callers.", json::object()}},
+        {"find_unauthenticated_reachable",{"Walk reverse from auth check, find pre-auth reachable callers.", json::object()}},
+        {"find_crypto_constants",     {"Scan for AES/SHA/MD5 magic constants.", json::object()}},
+        {"identify_protector",        {"Identify packer/protector (VMProtect/Themida/etc).", json::object()}},
+        {"deobfuscate_control_flow",  {"Resolve flattened CFG / opaque predicates in a function.", json::object({{"address", "0x140001000"}})}},
+        {"detect_vm_handler_pattern", {"Detect VM dispatcher pattern at a function.", json::object({{"address", "0x140001000"}})}},
+        {"map_vm_handler_table",      {"Map VM handler table starting at address.", json::object({{"address", "0x140050000"}})}},
+        {"detect_obfuscation_patterns",{"Classify obfuscation features used by the binary.", json::object()}},
+        {"decode_strings_in_function",{"Statically/dynamically decode wrapped strings.", json::object({{"address", "0x140001000"}})}},
+        {"analyze_string_decryption", {"Identify string-decryption routines.", json::object()}},
+        {"detect_hooks",              {"Find IAT/EAT/inline hooks.", json::object()}},
+        {"detect_direct_syscalls",    {"Locate inlined syscall instructions.", json::object()}},
+        {"detect_anti_analysis",      {"Detect anti-debug/anti-VM patterns.", json::object()}},
+        {"patch_anti_debug",          {"Neutralise known anti-debug patterns.", json::object()}},
+        {"search_strings",            {"Search string literals.", json::object({{"text", "password"}})}},
+        {"analyze_pe_headers",        {"Parse PE headers + characteristics.", json::object()}},
+        {"analyze_entropy",           {"Per-section entropy histogram.", json::object()}},
+        {"reconstruct_struct",        {"Reconstruct struct layout at address.", json::object({{"address", "0x140050000"}})}},
+        {"create_struct",             {"Create a struct from a C declaration.", json::object()}},
+        {"declare_type",              {"Declare a C type into the type system.", json::object()}},
+        {"infer_type",                {"Infer the type of a variable at address.", json::object()}},
+        {"list_imports",              {"List imports (filterable, paginated).", json::object()}},
+        {"list_exports",              {"List exports (filterable, paginated).", json::object()}},
+        {"list_functions",            {"List functions (filterable, paginated).", json::object()}},
+        {"get_function",              {"Return function metadata.", json::object({{"address", "0x140001000"}})}},
+        {"decompile",                 {"Decompile a function by address or name.", json::object({{"addr", "main"}})}},
+        {"decompile_function",        {"Decompile a function.", json::object({{"address", "0x140001000"}})}},
+        {"disasm",                    {"Disassemble a function.", json::object({{"addr", "0x140001000"}})}},
+        {"disassemble_function",      {"Disassemble a function.", json::object({{"address", "0x140001000"}})}},
+        {"xrefs_to",                  {"List xrefs to address(es).", json::object({{"addrs", json::array({"0x140001000"})}})}},
+        {"xref_query",                {"Batch xref query.", json::object()}},
+        {"build_call_graph",          {"Build a call graph rooted at address.", json::object({{"address", "0x140001000"}, {"depth", 3}})}},
+        {"callgraph",                 {"AiDA alias for build_call_graph.", json::object({{"addr", "0x140001000"}, {"depth", 3}})}},
+        {"search_semantic",           {"Semantic search across the knowledge graph.", json::object({{"query", "buffer overflow"}})}},
+        {"get_semantic_analysis",     {"Semantic analysis of a function.", json::object({{"address", "0x140001000"}})}},
+        {"get_similar_functions",     {"Find similar functions via embedding cosine.", json::object({{"address", "0x140001000"}, {"limit", 5}})}},
+        {"get_community_info",        {"Community info for a function.", json::object({{"address", "0x140001000"}})}},
+        {"detect_communities",        {"Detect communities in the call graph.", json::object()}},
+        {"plan_the_hunt",             {"Return a workflow plan for a hunt type.", json::object({{"hunt_type", "remote_0click_rce"}})}},
+        {"ask_capability",            {"Suggest tools given a goal sentence.", json::object({{"goal", "find network parsers"}})}},
+        {"build_index",               {"Warm engine indices.", json::object({{"indices", "all"}})}},
+        {"index_status",              {"Snapshot engine readiness.", json::object()}},
+        {"session_scratch",           {"Set/get/append/list/delete session scratch.", json::object({{"op", "set"}, {"key", "k"}, {"value", "v"}})}},
+        {"list_outputs",              {"Manage cached MCP outputs.", json::object({{"op", "stats"}})}},
+        {"sample_tool_io",            {"Example arguments and result per tool.", json::object()}},
+        {"tool_batch_call",           {"Run multiple tool calls in one MCP request.", json::object({{"calls", json::array()}})}},
+        {"server_health",             {"Return IDA plugin health.", json::object()}},
+        {"trace_data_flow",           {"Trace local data-flow around an address.", json::object({{"addr", "0x140001000"}})}},
+        {"trace_taint_reverse",       {"Backward taint from a sink to sources.", json::object()}},
+    };
+    return m;
+}
+
+tool_result_t ask_capability(const json& params)
+{
+    std::string goal;
+    if (params.contains("goal") && params["goal"].is_string())
+        goal = params["goal"].get<std::string>();
+    if (goal.empty())
+        return tool_result_t::error(OBFSTR("'goal' string required"), OBFSTR("bad_param"));
+
+    std::string lower = goal;
+    for (auto& c : lower) c = (char)std::tolower((unsigned char)c);
+
+    const auto& kmap = b10_keyword_map();
+    std::map<std::string, int> score;
+    for (const auto& kv : kmap)
+    {
+        const std::string& kw = kv.first;
+        if (lower.find(kw) == std::string::npos) continue;
+        for (auto* t : kv.second)
+            score[t] += 1;
+    }
+
+    std::vector<std::pair<std::string,int>> sorted(score.begin(), score.end());
+    std::sort(sorted.begin(), sorted.end(),
+              [](auto& a, auto& b)
+              {
+                  if (a.second != b.second) return a.second > b.second;
+                  return a.first < b.first;
+              });
+
+    const auto& hints = b10_tool_hints();
+    json suggestions = json::array();
+    for (size_t i = 0; i < sorted.size() && suggestions.size() < 8; ++i)
+    {
+        const std::string& tname = sorted[i].first;
+        json sug;
+        sug["tool"]  = tname;
+        sug["score"] = sorted[i].second;
+        auto h = hints.find(tname);
+        if (h != hints.end())
+        {
+            sug["why"]          = h->second.first;
+            sug["typical_args"] = h->second.second;
+            json sample;
+            sample["tool"]      = tname;
+            sample["arguments"] = h->second.second;
+            sug["sample_call"]  = sample;
+        }
+        else
+        {
+            sug["why"]          = OBFSTR("Matched keyword(s) in goal");
+            sug["typical_args"] = json::object();
+            sug["sample_call"]  = json::object({{"tool", tname}, {"arguments", json::object()}});
+        }
+        suggestions.push_back(std::move(sug));
+    }
+
+    json data;
+    data["goal"]        = goal;
+    data["suggestions"] = suggestions;
+    return tool_result_t::ok(OBFSTR("ask_capability: ") + std::to_string(suggestions.size()) + OBFSTR(" suggestions"),
+                              data);
+}
+
+// ----------------------------------------------------------------------------
+// Slice B11 — sample_tool_io
+// ----------------------------------------------------------------------------
+static const std::map<std::string, json>& b11_examples()
+{
+    static const std::map<std::string, json> m = {
+        {"binary_fingerprint", json::object({
+            {"example_arguments", json::object()},
+            {"example_result", json::object({
+                {"success", true},
+                {"output",  "binary_fingerprint ok"},
+                {"data", json::object({
+                    {"md5", "00112233445566778899aabbccddeeff"},
+                    {"sha256", "<64 hex>"},
+                    {"crc32", "deadbeef"},
+                    {"filetype", 11},
+                    {"is_dll", false},
+                    {"is_kernel", false},
+                    {"bitness", 64},
+                    {"processor", "metapc"},
+                    {"image_base", "0x140000000"},
+                    {"capabilities", json::object({
+                        {"network", true}, {"rpc", true}, {"com", false},
+                        {"driver", false}, {"alpc", false}
+                    })}
+                })}
+            })},
+            {"result_size_estimate", 4096},
+            {"typical_latency_ms", 200}
+        })},
+        {"decompile", json::object({
+            {"example_arguments", json::object({{"addr", "0x140001000"}})},
+            {"example_result", json::object({
+                {"success", true},
+                {"output", "Decompilation ok"},
+                {"data", json::object({{"pseudocode", "int __fastcall main(int argc, char **argv) {...}"}})}
+            })},
+            {"result_size_estimate", 8192},
+            {"typical_latency_ms", 500}
+        })},
+        {"disasm", json::object({
+            {"example_arguments", json::object({{"addr", "0x140001000"}})},
+            {"example_result", json::object({
+                {"success", true},
+                {"output", "Disassembly ok"},
+                {"data", json::object({{"text", "push rbp\nmov rbp, rsp\n..."}})}
+            })},
+            {"result_size_estimate", 6144},
+            {"typical_latency_ms", 80}
+        })},
+        {"find_calls_to", json::object({
+            {"example_arguments", json::object({{"name", "memcpy"}})},
+            {"example_result", json::object({
+                {"success", true},
+                {"output", "Found 14 callsites"},
+                {"data", json::object({{"callsites", json::array({"0x140002a10", "0x140003120"})}})}
+            })},
+            {"result_size_estimate", 2048},
+            {"typical_latency_ms", 120}
+        })},
+        {"list_remote_entrypoints", json::object({
+            {"example_arguments", json::object({{"top_n", 16}})},
+            {"example_result", json::object({
+                {"success", true},
+                {"output", "list_remote_entrypoints: 12/24 entrypoints"},
+                {"data", json::object({
+                    {"entries", json::array({json::object({
+                        {"ea", "0x140003000"}, {"name", "DispatchHandler"},
+                        {"category", json::array({"rpc_server", "alpc"})},
+                        {"pre_auth_likelihood", 0.8}
+                    })})}
+                })}
+            })},
+            {"result_size_estimate", 8192},
+            {"typical_latency_ms", 400}
+        })},
+        {"plan_the_hunt", json::object({
+            {"example_arguments", json::object({{"hunt_type", "remote_0click_rce"}})},
+            {"example_result", json::object({
+                {"success", true},
+                {"output", "Plan for remote_0click_rce"},
+                {"data", json::object({{"plan", json::object({{"steps", json::array()}})}})}
+            })},
+            {"result_size_estimate", 4096},
+            {"typical_latency_ms", 5}
+        })},
+        {"index_status", json::object({
+            {"example_arguments", json::object()},
+            {"example_result", json::object({
+                {"success", true},
+                {"output", "Index status snapshot"},
+                {"data", json::object({
+                    {"binary_md5", "<hex>"},
+                    {"auto_analysis_ok", true},
+                    {"hexrays_available", true},
+                    {"engines", json::object({
+                        {"taint_engine", json::object({{"available", false}, {"populated", false}, {"count", 0}})}
+                    })}
+                })}
+            })},
+            {"result_size_estimate", 1024},
+            {"typical_latency_ms", 5}
+        })},
+        {"session_scratch", json::object({
+            {"example_arguments", json::object({{"op", "set"}, {"key", "last_hunt"}, {"value", "remote_0click_rce"}})},
+            {"example_result", json::object({
+                {"success", true},
+                {"output", "scratch set ok"},
+                {"data", json::object({{"key", "last_hunt"}, {"bytes_written", 18}, {"total_bytes", 18}, {"pruned_count", 0}})}
+            })},
+            {"result_size_estimate", 256},
+            {"typical_latency_ms", 5}
+        })},
+        {"tool_batch_call", json::object({
+            {"example_arguments", json::object({
+                {"calls", json::array({
+                    json::object({{"tool", "binary_fingerprint"}, {"arguments", json::object()}, {"label", "fp"}}),
+                    json::object({{"tool", "index_status"},      {"arguments", json::object()}, {"label", "idx"}})
+                })},
+                {"stop_on_error", true},
+                {"parallel", false}
+            })},
+            {"example_result", json::object({
+                {"success", true},
+                {"output", "Batch ran 2/2 calls (2 ok, 0 fail)"},
+                {"data", json::object({{"results", json::array()}, {"total_ms", 240}})}
+            })},
+            {"result_size_estimate", 8192},
+            {"typical_latency_ms", 250}
+        })},
+        {"ask_capability", json::object({
+            {"example_arguments", json::object({{"goal", "find network parsers and trace input to sinks"}})},
+            {"example_result", json::object({
+                {"success", true},
+                {"output", "ask_capability: 5 suggestions"},
+                {"data", json::object({{"suggestions", json::array()}})}
+            })},
+            {"result_size_estimate", 2048},
+            {"typical_latency_ms", 5}
+        })},
+        {"trace_all_network_to_sinks", json::object({
+            {"example_arguments", json::object({{"max_depth", 16}})},
+            {"example_result", json::object({
+                {"success", true},
+                {"output", "Taint paths found: 7"},
+                {"data", json::object({{"paths", json::array()}})}
+            })},
+            {"result_size_estimate", 16384},
+            {"typical_latency_ms", 8000}
+        })},
+    };
+    return m;
+}
+
+tool_result_t sample_tool_io(const json& params)
+{
+    const auto& ex = b11_examples();
+
+    if (params.contains("tool") && params["tool"].is_string())
+    {
+        std::string tname = params["tool"].get<std::string>();
+        auto it = ex.find(tname);
+        if (it != ex.end())
+        {
+            json data = it->second;
+            data["tool"] = tname;
+            return tool_result_t::ok(OBFSTR("sample_tool_io: ") + tname, data);
+        }
+        // Generic stub for unknown tool.
+        json data;
+        data["tool"]                  = tname;
+        data["example_arguments"]     = json::object();
+        data["example_result"]        = json::object({
+            {"success", true}, {"output", "..."}, {"data", json::object()}
+        });
+        data["result_size_estimate"]  = 0;
+        data["typical_latency_ms"]    = 0;
+        data["note"]                  = OBFSTR("no specific example");
+        return tool_result_t::ok(OBFSTR("sample_tool_io: ") + tname + OBFSTR(" (generic)"), data);
+    }
+
+    // List all examples.
+    json arr = json::array();
+    for (const auto& kv : ex)
+    {
+        json e = kv.second;
+        e["tool"] = kv.first;
+        arr.push_back(std::move(e));
+    }
+    json data;
+    data["examples"] = arr;
+    data["count"]    = (uint64_t)arr.size();
+    return tool_result_t::ok(OBFSTR("sample_tool_io: ") + std::to_string(arr.size()) + OBFSTR(" examples"),
+                              data);
+}
+
+// ----------------------------------------------------------------------------
+// register_tools — wires every meta_tools handler into ToolRegistry.
+// ----------------------------------------------------------------------------
+void register_tools()
+{
+    auto& registry = ToolRegistry::instance();
+    tool_definition_t def;
+
+    // tool_batch_call
+    def = {};
+    def.name = OBFSTR("tool_batch_call");
+    def.category = OBFSTR("meta");
+    def.description = OBFSTR(
+        "Run multiple tool calls in a single MCP request. Calls run serially in this iteration; "
+        "if parallel=true is requested with any non-read-only sub-tool, the orchestrator falls back "
+        "to serial and reports fell_back_to_serial=true. Returns per-call success/output/data plus "
+        "aggregate counters. Sub-tool names are validated up-front against the registry.");
+    def.parameters = {
+        {OBFSTR("calls"), OBFSTR("array"), OBFSTR("Array of {tool, arguments, label?} sub-calls"), true},
+        {OBFSTR("parallel"), OBFSTR("boolean"), OBFSTR("Request parallel execution (only honoured when all sub-tools are read-only)"), false},
+        {OBFSTR("stop_on_error"), OBFSTR("boolean"), OBFSTR("Stop iteration at the first failure (default true)"), false},
+        {OBFSTR("max_wall_seconds"), OBFSTR("number"), OBFSTR("Wall-clock deadline in seconds (default 60)"), false},
+    };
+    def.handler = tool_batch_call;
+    def.read_only = false;       // mixed semantics — caller must reason about sub-tools
+    def.destructive = false;     // see comment above
+    def.deterministic = false;   // depends on sub-tools + wall clock
+    def.output_schema = json::object({{OBFSTR("type"), OBFSTR("object")}, {OBFSTR("additionalProperties"), true}});
+    registry.register_tool(def);
+
+    // plan_the_hunt
+    def = {};
+    def.name = OBFSTR("plan_the_hunt");
+    def.category = OBFSTR("meta");
+    def.description = OBFSTR(
+        "Return a hardcoded workflow plan for a hunt type (remote_0click_rce, kernel_ioctl_bug, "
+        "sandbox_escape, parser_bug, auth_bypass, uaf, format_string, all). The plan lists ordered "
+        "tool steps with why/typical_args/expected_evidence/on_empty/expected_cost_ms and the engine "
+        "indices the agent should warm up first. Steps may reference tools that don't exist yet.");
+    def.parameters = {
+        {OBFSTR("hunt_type"), OBFSTR("string"), OBFSTR("Hunt type (default remote_0click_rce)"), false,
+         {OBFSTR("remote_0click_rce"), OBFSTR("kernel_ioctl_bug"), OBFSTR("sandbox_escape"),
+          OBFSTR("parser_bug"), OBFSTR("auth_bypass"), OBFSTR("uaf"), OBFSTR("format_string"), OBFSTR("all")}},
+    };
+    def.handler = plan_the_hunt;
+    def.read_only = true;
+    def.destructive = false;
+    def.deterministic = true;
+    def.output_schema = json::object({{OBFSTR("type"), OBFSTR("object")}, {OBFSTR("additionalProperties"), true}});
+    registry.register_tool(def);
+
+    // index_status
+    def = {};
+    def.name = OBFSTR("index_status");
+    def.category = OBFSTR("meta");
+    def.description = OBFSTR(
+        "Snapshot which analysis engines are warm. Returns binary_md5, auto_analysis_ok, "
+        "hexrays_available, and per-engine {available, populated, count} for graphrag, "
+        "taint_engine, microcode_engine, cfg_engine, kernel_engine, surface_engine, "
+        "symbolic_engine, smt_solver. Engines not yet wired report available=false.");
+    def.parameters = {};
+    def.handler = index_status;
+    def.read_only = true;
+    def.destructive = false;
+    def.deterministic = false; // engine state changes between calls
+    def.output_schema = json::object({{OBFSTR("type"), OBFSTR("object")}, {OBFSTR("additionalProperties"), true}});
+    registry.register_tool(def);
+
+    // build_index
+    def = {};
+    def.name = OBFSTR("build_index");
+    def.category = OBFSTR("meta");
+    def.description = OBFSTR(
+        "Warm one or more engine indices (graphrag, taint_engine, microcode_engine, cfg_engine, "
+        "kernel_engine, surface_engine, symbolic_engine, smt_solver, or 'all'). Per-engine timing "
+        "and partial flags are reported. Cooperatively cancellable via user_cancelled().");
+    def.parameters = {
+        {OBFSTR("indices"), OBFSTR("string"), OBFSTR("Engine name, 'all', or array of names (default 'all')"), false},
+        {OBFSTR("max_seconds"), OBFSTR("number"), OBFSTR("Wall-clock deadline (default 60)"), false},
+    };
+    def.handler = build_index;
+    def.read_only = false;     // engines may populate caches
+    def.destructive = false;
+    def.deterministic = false;
+    def.output_schema = json::object({{OBFSTR("type"), OBFSTR("object")}, {OBFSTR("additionalProperties"), true}});
+    registry.register_tool(def);
+
+    // session_scratch
+    def = {};
+    def.name = OBFSTR("session_scratch");
+    def.category = OBFSTR("meta");
+    def.description = OBFSTR(
+        "Persistent per-IDB scratch store backed by netnode '$ AiDA.hunt.scratch'. Ops: set, "
+        "get, append, list, delete. Auto-prunes when total stored size exceeds 512KB.");
+    def.parameters = {
+        {OBFSTR("op"), OBFSTR("string"), OBFSTR("Operation"), true,
+         {OBFSTR("set"), OBFSTR("get"), OBFSTR("append"), OBFSTR("list"), OBFSTR("delete")}},
+        {OBFSTR("key"), OBFSTR("string"), OBFSTR("Key (required for set/get/append/delete)"), false},
+        {OBFSTR("value"), OBFSTR("string"), OBFSTR("Value (string; for set/append). JSON objects are dumped to string."), false},
+        {OBFSTR("offset"), OBFSTR("number"), OBFSTR("List offset"), false},
+        {OBFSTR("limit"), OBFSTR("number"), OBFSTR("List page size"), false},
+        {OBFSTR("all"), OBFSTR("boolean"), OBFSTR("delete: remove every key"), false},
+    };
+    def.handler = session_scratch;
+    def.read_only = false;
+    def.destructive = false;
+    def.deterministic = false;
+    def.output_schema = json::object({{OBFSTR("type"), OBFSTR("object")}, {OBFSTR("additionalProperties"), true}});
+    registry.register_tool(def);
+
+    // list_remote_entrypoints
+    def = {};
+    def.name = OBFSTR("list_remote_entrypoints");
+    def.category = OBFSTR("vuln");
+    def.description = OBFSTR(
+        "Walk RPC/COM/ALPC/named-pipe/socket-accept/HTTP/WebSocket/NDIS-WSK/kernel-IRP gate "
+        "imports and rank the containing functions by pre_auth_likelihood. Sorts descending; "
+        "honours top_n.");
+    def.parameters = {
+        {OBFSTR("top_n"), OBFSTR("number"), OBFSTR("Maximum entries to return (default 64, max 256)"), false},
+    };
+    def.handler = list_remote_entrypoints;
+    def.read_only = true;
+    def.destructive = false;
+    def.deterministic = true;
+    def.output_schema = json::object({{OBFSTR("type"), OBFSTR("object")}, {OBFSTR("additionalProperties"), true}});
+    registry.register_tool(def);
+
+    // list_outputs
+    def = {};
+    def.name = OBFSTR("list_outputs");
+    def.category = OBFSTR("meta");
+    def.description = OBFSTR(
+        "Manage the MCP output cache. Ops: list (per-entry id+bytes), stats (capacity/used/count), "
+        "evict (by output_id or all=true).");
+    def.parameters = {
+        {OBFSTR("op"), OBFSTR("string"), OBFSTR("Operation"), false,
+         {OBFSTR("list"), OBFSTR("stats"), OBFSTR("evict")}},
+        {OBFSTR("output_id"), OBFSTR("string"), OBFSTR("evict: cache entry id"), false},
+        {OBFSTR("all"), OBFSTR("boolean"), OBFSTR("evict: clear every entry"), false},
+    };
+    def.handler = list_outputs;
+    def.read_only = false; // evict mutates the cache
+    def.destructive = false;
+    def.deterministic = false;
+    def.output_schema = json::object({{OBFSTR("type"), OBFSTR("object")}, {OBFSTR("additionalProperties"), true}});
+    registry.register_tool(def);
+
+    // ask_capability
+    def = {};
+    def.name = OBFSTR("ask_capability");
+    def.category = OBFSTR("meta");
+    def.description = OBFSTR(
+        "Given a free-form goal sentence, suggest up to 8 tools (with why/typical_args/sample_call) "
+        "drawn from a hardcoded keyword->tool map. Scores by number of matching keywords.");
+    def.parameters = {
+        {OBFSTR("goal"), OBFSTR("string"), OBFSTR("Free-form description of the desired outcome"), true},
+    };
+    def.handler = ask_capability;
+    def.read_only = true;
+    def.destructive = false;
+    def.deterministic = true;
+    def.output_schema = json::object({{OBFSTR("type"), OBFSTR("object")}, {OBFSTR("additionalProperties"), true}});
+    registry.register_tool(def);
+
+    // sample_tool_io
+    def = {};
+    def.name = OBFSTR("sample_tool_io");
+    def.category = OBFSTR("meta");
+    def.description = OBFSTR(
+        "Return canned example arguments + example result for a tool (or for ~10 popular tools if "
+        "no tool is specified). Tools not in the example DB receive a generic stub.");
+    def.parameters = {
+        {OBFSTR("tool"), OBFSTR("string"), OBFSTR("Tool name (optional)"), false},
+    };
+    def.handler = sample_tool_io;
+    def.read_only = true;
+    def.destructive = false;
+    def.deterministic = true;
+    def.output_schema = json::object({{OBFSTR("type"), OBFSTR("object")}, {OBFSTR("additionalProperties"), true}});
+    registry.register_tool(def);
+}
+
+} // namespace meta_tools
+
+namespace sdk_underused_tools
+{
+
+namespace
+{
+std::string lower_ascii(std::string s)
+{
+    for (char& c : s)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+json open_object_schema()
+{
+    return json::object({{OBFSTR("type"), OBFSTR("object")}, {OBFSTR("additionalProperties"), true}});
+}
+
+json ea_to_json(ea_t ea)
+{
+    if (ea == BADADDR)
+        return json(nullptr);
+    return helpers::format_address(ea);
+}
+
+std::optional<ea_t> parse_ea_any(const json& params, std::initializer_list<const char*> names)
+{
+    for (const char* n : names)
+    {
+        if (!params.contains(n))
+            continue;
+        const json& v = params[n];
+        if (v.is_string())
+        {
+            auto ea = helpers::parse_address(v.get<std::string>());
+            if (ea)
+                return ea;
+        }
+        else if (v.is_number_unsigned())
+        {
+            return static_cast<ea_t>(v.get<uint64_t>());
+        }
+        else if (v.is_number_integer())
+        {
+            int64_t raw = v.get<int64_t>();
+            if (raw >= 0)
+                return static_cast<ea_t>(raw);
+        }
+    }
+    return std::nullopt;
+}
+
+std::string reg_name_from_num(int reg);
+
+std::string type_to_string(const tinfo_t& tif, const char* name = nullptr)
+{
+    if (tif.empty())
+        return {};
+    qstring out;
+    if (tif.print(&out, name, PRTYPE_1LINE))
+        return std::string(out.c_str());
+    return std::string(tif.dstr());
+}
+
+std::string argloc_to_summary(const argloc_t& loc)
+{
+    if (loc.is_reg())
+    {
+        std::string out = reg_name_from_num(loc.reg1());
+        if (loc.is_reg2())
+            out += std::string(":") + reg_name_from_num(loc.reg2());
+        return out;
+    }
+    if (loc.is_stkoff())
+        return OBFSTR("stack+") + std::to_string(loc.stkoff());
+    if (loc.is_scattered())
+        return OBFSTR("scattered");
+    if (loc.atype() == ALOC_NONE)
+        return OBFSTR("none");
+    return OBFSTR("argloc_type_") + std::to_string(loc.atype());
+}
+
+std::string reg_name_from_num(int reg)
+{
+    if (reg < 0)
+        return {};
+    qstring out;
+    if (get_reg_name(&out, reg, 0) > 0 && !out.empty())
+        return std::string(out.c_str());
+    if (get_reg_name(&out, reg, inf_is_64bit() ? 8 : 4) > 0 && !out.empty())
+        return std::string(out.c_str());
+    if (PH.reg_names != nullptr && reg < PH.regs_num && PH.reg_names[reg] != nullptr)
+        return std::string(PH.reg_names[reg]);
+    return std::to_string(reg);
+}
+
+int reg_num_from_json(const json& v)
+{
+    if (v.is_number_integer())
+        return v.get<int>();
+    if (!v.is_string())
+        return -1;
+
+    std::string requested = v.get<std::string>();
+    std::string lowered = lower_ascii(requested);
+    if (PH.reg_names != nullptr)
+    {
+        for (int i = 0; i < PH.regs_num; ++i)
+        {
+            const char* rn = PH.reg_names[i];
+            if (rn != nullptr && lower_ascii(std::string(rn)) == lowered)
+                return i;
+        }
+    }
+
+    bitrange_t br;
+    const char* base = processor_t::get_reg_info(requested.c_str(), &br);
+    if (base != nullptr && PH.reg_names != nullptr)
+    {
+        std::string b = lower_ascii(std::string(base));
+        for (int i = 0; i < PH.regs_num; ++i)
+        {
+            const char* rn = PH.reg_names[i];
+            if (rn != nullptr && lower_ascii(std::string(rn)) == b)
+                return i;
+        }
+    }
+
+    ssize_t r = processor_t::str2reg(requested.c_str());
+    if (r >= 0 && r < PH.regs_num)
+        return static_cast<int>(r);
+    return -1;
+}
+
+std::string rvi_state(const reg_value_info_t& rvi)
+{
+    if (rvi.empty()) return OBFSTR("UNDEF");
+    if (rvi.is_num()) return OBFSTR("NUM");
+    if (rvi.is_spd()) return OBFSTR("SPD");
+    if (rvi.is_dead_end()) return OBFSTR("DEADEND");
+    if (rvi.aborted()) return OBFSTR("ABORTED");
+    if (rvi.is_badinsn()) return OBFSTR("BADINSN");
+    if (rvi.is_unkinsn()) return OBFSTR("UNKINSN");
+    if (rvi.is_unkfunc()) return OBFSTR("UNKFUNC");
+    if (rvi.is_unkloop()) return OBFSTR("UNKLOOP");
+    if (rvi.is_unkmult()) return OBFSTR("UNKMULT");
+    if (rvi.is_unkxref()) return OBFSTR("UNKXREF");
+    if (rvi.is_unkvals()) return OBFSTR("UNKVALS");
+    return OBFSTR("UNK");
+}
+
+json reg_value_snapshot(ea_t ea, int reg, int max_depth)
+{
+    json out;
+    out["ea"] = helpers::format_address(ea);
+    out["reg"] = reg;
+    out["reg_name"] = reg_name_from_num(reg);
+
+    reg_value_info_t rvi;
+    bool supported = find_reg_value_info(&rvi, ea, reg, max_depth);
+    out["supported"] = supported;
+    out["state"] = supported ? rvi_state(rvi) : OBFSTR("UNSUPPORTED");
+    out["unique"] = supported && rvi.is_value_unique();
+    out["description"] = supported ? std::string(rvi.dstr().c_str()) : std::string();
+
+    json vals = json::array();
+    if (supported)
+    {
+        for (const reg_value_def_t* it = rvi.vals_begin(); it != rvi.vals_end(); ++it)
+        {
+            json v;
+            v["val"] = helpers::format_address(static_cast<ea_t>(it->val));
+            v["uval"] = static_cast<uint64_t>(it->val);
+            v["def_ea"] = ea_to_json(it->def_ea);
+            v["def_itype"] = it->def_itype;
+            v["flags"] = it->flags;
+            v["pc_based"] = it->is_pc_based();
+            v["like_got"] = it->is_like_got();
+            vals.push_back(std::move(v));
+        }
+    }
+    out["values"] = vals;
+    return out;
+}
+
+json func_flags_json(func_t* pfn)
+{
+    json f;
+    uint64_t flags = pfn ? static_cast<uint64_t>(pfn->flags) : 0;
+    f["raw"] = flags;
+    f["noret"] = pfn && (pfn->flags & FUNC_NORET) != 0;
+    f["library"] = pfn && (pfn->flags & FUNC_LIB) != 0;
+    f["thunk"] = pfn && (pfn->flags & FUNC_THUNK) != 0;
+    f["static"] = pfn && (pfn->flags & FUNC_STATICDEF) != 0;
+    f["frame"] = pfn && (pfn->flags & FUNC_FRAME) != 0;
+    f["fuzzy_sp"] = pfn && (pfn->flags & FUNC_FUZZY_SP) != 0;
+    return f;
+}
+
+std::string runtime_import_category(const std::string& mod)
+{
+    std::string lower = lower_ascii(mod);
+    if (lower.find("ws2_32") != std::string::npos || lower.find("wsock32") != std::string::npos || lower.find("mswsock") != std::string::npos || lower.find("iphlpapi") != std::string::npos)
+        return OBFSTR("WINSOCK");
+    if (lower.find("wininet") != std::string::npos || lower.find("winhttp") != std::string::npos || lower.find("urlmon") != std::string::npos || lower.find("httpapi") != std::string::npos)
+        return OBFSTR("WININET");
+    if (lower.find("rpcrt4") != std::string::npos || lower.find("rpcns4") != std::string::npos)
+        return OBFSTR("RPC");
+    if (lower.find("ole32") != std::string::npos || lower.find("oleaut32") != std::string::npos || lower.find("combase") != std::string::npos)
+        return OBFSTR("COM");
+    if (lower.find("ntdll") != std::string::npos)
+        return OBFSTR("ALPC");
+    if (lower.find("bcrypt") != std::string::npos || lower.find("ncrypt") != std::string::npos || lower.find("crypt32") != std::string::npos || lower.find("advapi32") != std::string::npos)
+        return OBFSTR("CRYPTO");
+    if (lower.find("kernel32") != std::string::npos || lower.find("api-ms-win-core") != std::string::npos)
+        return OBFSTR("IPC");
+    if (lower.find("ntoskrnl") != std::string::npos || lower.find("hal") != std::string::npos || lower.find("ndis") != std::string::npos || lower.find("wdfldr") != std::string::npos || lower.find("fltmgr") != std::string::npos)
+        return OBFSTR("IPC");
+    if (lower.find("shlwapi") != std::string::npos || lower.find("shell32") != std::string::npos || lower.find("shcore") != std::string::npos || lower.find("user32") != std::string::npos || lower.find("gdi32") != std::string::npos)
+        return OBFSTR("FILE");
+    return OBFSTR("OTHER");
+}
+
+ea_t first_call_target(ea_t caller)
+{
+    xrefblk_t xb;
+    for (bool ok = xb.first_from(caller, XREF_CODE | XREF_NOFLOW); ok; ok = xb.next_from())
+    {
+        int t = xb.type & XREF_MASK;
+        if (t == fl_CF || t == fl_CN)
+            return xb.to;
+    }
+    insn_t insn;
+    if (decode_insn(&insn, caller) > 0 && is_call_insn(insn))
+    {
+        if (insn.ops[0].type == o_near || insn.ops[0].type == o_far)
+            return insn.ops[0].addr;
+    }
+    return BADADDR;
+}
+
+json address_flags(ea_t ea)
+{
+    flags64_t f = get_flags(ea);
+    aflags_t af = get_aflags(ea);
+    func_t* pfn = get_func(ea);
+    json out;
+    out["ea"] = helpers::format_address(ea);
+    out["flags"] = static_cast<uint64_t>(f);
+    out["aflags"] = static_cast<uint64_t>(af);
+    out["is_code"] = is_code(f);
+    out["is_data"] = is_data(f);
+    out["is_unknown"] = is_unknown(f);
+    out["is_head"] = is_head(f);
+    out["has_name"] = has_name(f);
+    out["has_xref"] = has_xref(f);
+    out["has_jump_or_flow_xref"] = has_jump_or_flow_xref(ea);
+    out["is_libitem"] = is_libitem(ea);
+    out["is_noret"] = is_noret(ea);
+    out["has_ti"] = has_ti(ea);
+    out["is_userti"] = is_userti(ea);
+    out["function"] = pfn ? ea_to_json(pfn->start_ea) : json(nullptr);
+    out["function_flags"] = func_flags_json(pfn);
+    xrefblk_t xb;
+    int xrefs_from = 0;
+    for (bool ok = xb.first_from(ea, XREF_ALL); ok && xrefs_from < 1024; ok = xb.next_from())
+        ++xrefs_from;
+    int xrefs_to = 0;
+    for (bool ok = xb.first_to(ea, XREF_ALL); ok && xrefs_to < 1024; ok = xb.next_to())
+        ++xrefs_to;
+    out["xrefs_from_count"] = xrefs_from;
+    out["xrefs_to_count"] = xrefs_to;
+    return out;
+}
+
+bool name_has_guard_marker(ea_t ea)
+{
+    if (ea == BADADDR)
+        return false;
+    qstring nm;
+    if (get_name(&nm, ea, GN_VISIBLE) <= 0 || nm.empty())
+        return false;
+    std::string n = lower_ascii(std::string(nm.c_str()));
+    return n.find("guard_dispatch_icall") != std::string::npos
+        || n.find("guard_check_icall") != std::string::npos
+        || n.find("__guard") != std::string::npos
+        || n.find("guard_xfg") != std::string::npos;
+}
+
+tool_result_t list_entry_points_enriched(const json& params)
+{
+    size_t limit = 4096;
+    if (params.contains("limit") && params["limit"].is_number_unsigned())
+        limit = std::min<size_t>(params["limit"].get<size_t>(), 65536);
+
+    struct entry_row_t { int rank = 0; ea_t ea = BADADDR; json j; };
+    std::vector<entry_row_t> rows;
+    rows.reserve(get_entry_qty());
+
+    size_t qty = get_entry_qty();
+    for (size_t i = 0; i < qty; ++i)
+    {
+        uval_t ord = get_entry_ordinal(i);
+        ea_t ea = get_entry(ord);
+        if (ea == BADADDR)
+            continue;
+
+        qstring name;
+        get_entry_name(&name, ord);
+        std::string name_s = std::string(name.c_str());
+
+        qstring fwd;
+        bool has_forwarder = get_entry_forwarder(&fwd, ord) >= 0 && !fwd.empty();
+
+        qstring dem;
+        if (!name_s.empty())
+            ::demangle_name(&dem, name_s.c_str(), 0, DQT_FULL);
+
+        func_t* pfn = get_func(ea);
+        bool is_thunk = pfn && (pfn->flags & FUNC_THUNK) != 0;
+        bool is_library = (pfn && (pfn->flags & FUNC_LIB) != 0) || is_libitem(ea);
+        bool is_no_ret = (pfn && (pfn->flags & FUNC_NORET) != 0) || is_noret(ea);
+
+        json j;
+        j["ordinal"] = static_cast<uint64_t>(ord);
+        j["ea"] = helpers::format_address(ea);
+        j["name"] = name_s;
+        j["demangled_name"] = std::string(dem.c_str());
+        j["forwarder"] = has_forwarder ? json(std::string(fwd.c_str())) : json(nullptr);
+        j["exported_by_name"] = !name_s.empty();
+        j["function_start"] = pfn ? ea_to_json(pfn->start_ea) : json(nullptr);
+        j["is_library"] = is_library;
+        j["is_thunk"] = is_thunk;
+        j["is_noret"] = is_no_ret;
+        j["aflags"] = static_cast<uint64_t>(get_aflags(ea));
+        j["function_flags"] = func_flags_json(pfn);
+        if (is_thunk)
+        {
+            ea_t fptr = BADADDR;
+            ea_t target = calc_thunk_func_target(pfn, &fptr);
+            j["thunk_target"] = ea_to_json(target);
+            j["thunk_function_pointer"] = ea_to_json(fptr);
+        }
+
+        int rank = 0;
+        if (is_library) rank += 8;
+        if (is_thunk) rank += 4;
+        if (name_s.empty()) rank += 2;
+        if (has_forwarder) rank += 1;
+        rows.push_back({rank, ea, std::move(j)});
+    }
+
+    std::sort(rows.begin(), rows.end(), [](const entry_row_t& a, const entry_row_t& b) {
+        if (a.rank != b.rank) return a.rank < b.rank;
+        return a.ea < b.ea;
+    });
+
+    json arr = json::array();
+    for (size_t i = 0; i < rows.size() && i < limit; ++i)
+        arr.push_back(std::move(rows[i].j));
+
+    json data;
+    data["entries"] = std::move(arr);
+    data["total"] = rows.size();
+    data["returned"] = data["entries"].size();
+    return tool_result_t::ok(OBFSTR("list_entry_points_enriched: ") + std::to_string(data["returned"].get<size_t>()) + OBFSTR(" entries"), data);
+}
+
+tool_result_t trace_register_value(const json& params)
+{
+    auto ea = parse_ea_any(params, {"address", "ea"});
+    if (!ea)
+        return tool_result_t::error(OBFSTR("Missing or invalid address"), OBFSTR("bad_param"));
+    if (!params.contains("reg"))
+        return tool_result_t::error(OBFSTR("Missing reg"), OBFSTR("bad_param"));
+    int reg = reg_num_from_json(params["reg"]);
+    if (reg < 0)
+        return tool_result_t::error(OBFSTR("Unknown register"), OBFSTR("bad_param"));
+    int max_depth = params.value("max_depth", 0);
+    return tool_result_t::ok(OBFSTR("trace_register_value: ") + reg_name_from_num(reg), reg_value_snapshot(*ea, reg, max_depth));
+}
+
+tool_result_t get_call_argument_loads(const json& params)
+{
+    auto caller = parse_ea_any(params, {"caller", "caller_ea", "call_ea", "address", "ea"});
+    if (!caller)
+        return tool_result_t::error(OBFSTR("Missing or invalid caller address"), OBFSTR("bad_param"));
+
+    int max_depth = params.value("max_depth", 0);
+    std::string prototype;
+    if (params.contains("prototype") && params["prototype"].is_string())
+        prototype = params["prototype"].get<std::string>();
+
+    tinfo_t tif;
+    qstring parsed_name;
+    bool parsed = false;
+    bool applied = false;
+    if (!prototype.empty())
+    {
+        parsed = parse_decl(&tif, &parsed_name, nullptr, prototype.c_str(), PT_SIL | PT_SYMBOL | PT_TYP | PT_SEMICOLON);
+        if (!parsed)
+            return tool_result_t::error(OBFSTR("Could not parse prototype"), OBFSTR("bad_param"));
+        applied = apply_callee_tinfo(*caller, tif);
+    }
+
+    eavec_t arg_addrs;
+    bool have_arg_addrs = get_arg_addrs(&arg_addrs, *caller);
+
+    tinfo_t call_tif = tif;
+    if (!call_tif.empty() && call_tif.is_funcptr())
+        call_tif = call_tif.get_pointed_object();
+    func_type_data_t ftd;
+    bool have_ftd = !call_tif.empty() && call_tif.get_func_details(&ftd);
+
+    size_t argc = have_ftd ? ftd.size() : arg_addrs.size();
+    json args = json::array();
+    for (size_t i = 0; i < argc; ++i)
+    {
+        ea_t load_ea = (i < arg_addrs.size()) ? arg_addrs[i] : BADADDR;
+        json a;
+        a["index"] = i;
+        a["load_ea"] = ea_to_json(load_ea);
+        if (have_ftd && i < ftd.size())
+        {
+            const funcarg_t& fa = ftd[i];
+            a["name"] = std::string(fa.name.c_str());
+            a["type"] = type_to_string(fa.type);
+            a["argloc"] = argloc_to_summary(fa.argloc);
+            if (load_ea != BADADDR && fa.argloc.is_reg())
+            {
+                json hints = json::array();
+                hints.push_back(reg_value_snapshot(load_ea, fa.argloc.reg1(), max_depth));
+                if (fa.argloc.is_reg2())
+                    hints.push_back(reg_value_snapshot(load_ea, fa.argloc.reg2(), max_depth));
+                a["value_hint"] = std::move(hints);
+            }
+        }
+        args.push_back(std::move(a));
+    }
+
+    json data;
+    data["caller"] = helpers::format_address(*caller);
+    data["callee"] = ea_to_json(first_call_target(*caller));
+    data["prototype"] = prototype;
+    data["parsed"] = parsed;
+    data["applied_callee_tinfo"] = applied;
+    data["arg_addrs_available"] = have_arg_addrs;
+    data["args"] = std::move(args);
+    return tool_result_t::ok(OBFSTR("get_call_argument_loads: ") + std::to_string(data["args"].size()) + OBFSTR(" args"), data);
+}
+
+tool_result_t get_address_aflags(const json& params)
+{
+    auto ea = parse_ea_any(params, {"address", "ea"});
+    if (!ea)
+        return tool_result_t::error(OBFSTR("Missing or invalid address"), OBFSTR("bad_param"));
+    return tool_result_t::ok(OBFSTR("get_address_aflags: ") + helpers::format_address(*ea), address_flags(*ea));
+}
+
+tool_result_t classify_thunks_and_guards(const json& params)
+{
+    auto start = parse_ea_any(params, {"start", "start_ea"});
+    auto end = parse_ea_any(params, {"end", "end_ea"});
+    ea_t lo = start.value_or(inf_get_min_ea());
+    ea_t hi = end.value_or(inf_get_max_ea());
+    size_t max_functions = params.value("max_functions", 20000u);
+
+    json thunks = json::array();
+    json cfg_guards = json::array();
+    json return_thunks = json::array();
+    size_t visited = 0;
+
+    for (size_t i = 0; i < get_func_qty() && visited < max_functions; ++i)
+    {
+        func_t* pfn = getn_func(i);
+        if (!pfn || pfn->start_ea < lo || pfn->start_ea >= hi)
+            continue;
+        ++visited;
+
+        if ((pfn->flags & FUNC_THUNK) != 0)
+        {
+            ea_t fptr = BADADDR;
+            ea_t target = calc_thunk_func_target(pfn, &fptr);
+            json t;
+            t["ea"] = helpers::format_address(pfn->start_ea);
+            t["target"] = ea_to_json(target);
+            t["function_pointer"] = ea_to_json(fptr);
+            qstring nm;
+            if (get_func_name(&nm, pfn->start_ea) > 0)
+                t["name"] = std::string(nm.c_str());
+            thunks.push_back(std::move(t));
+        }
+
+        func_item_iterator_t fii(pfn);
+        for (bool ok = fii.first(); ok; ok = fii.next_head())
+        {
+            ea_t item = fii.current();
+            if (item < lo || item >= hi)
+                continue;
+            insn_t insn;
+            if (decode_insn(&insn, item) <= 0)
+                continue;
+            int reg = -1;
+            ssize_t cfg = processor_t::is_control_flow_guard(&reg, &insn);
+            if (cfg == 1 || cfg == 2 || (cfg < 0 && name_has_guard_marker(first_call_target(item))))
+            {
+                json g;
+                g["ea"] = helpers::format_address(item);
+                g["kind"] = cfg == 2 ? OBFSTR("security_check") : OBFSTR("indirect_call_guard");
+                g["reg"] = reg;
+                if (reg >= 0)
+                    g["reg_name"] = reg_name_from_num(reg);
+                g["target"] = ea_to_json(first_call_target(item));
+                cfg_guards.push_back(std::move(g));
+            }
+            else if (cfg == 3 || (cfg < 0 && is_ret_insn(insn) && name_has_guard_marker(pfn->start_ea)))
+            {
+                return_thunks.push_back(helpers::format_address(item));
+            }
+        }
+    }
+
+    json data;
+    data["range_start"] = helpers::format_address(lo);
+    data["range_end"] = helpers::format_address(hi);
+    data["functions_visited"] = visited;
+    data["thunks"] = std::move(thunks);
+    data["cfg_guards"] = std::move(cfg_guards);
+    data["return_thunks"] = std::move(return_thunks);
+    return tool_result_t::ok(OBFSTR("classify_thunks_and_guards"), data);
+}
+
+tool_result_t apply_callee_prototype(const json& params)
+{
+    auto caller = parse_ea_any(params, {"caller", "caller_ea", "call_ea", "address", "ea"});
+    if (!caller)
+        return tool_result_t::error(OBFSTR("Missing or invalid caller address"), OBFSTR("bad_param"));
+    if (!params.contains("prototype") || !params["prototype"].is_string())
+        return tool_result_t::error(OBFSTR("Missing prototype"), OBFSTR("bad_param"));
+
+    std::string prototype = params["prototype"].get<std::string>();
+    tinfo_t tif;
+    qstring parsed_name;
+    if (!parse_decl(&tif, &parsed_name, nullptr, prototype.c_str(), PT_SIL | PT_SYMBOL | PT_TYP | PT_SEMICOLON))
+        return tool_result_t::error(OBFSTR("Could not parse prototype"), OBFSTR("bad_param"));
+
+    bool applied_call = apply_callee_tinfo(*caller, tif);
+    ea_t callee = BADADDR;
+    auto explicit_callee = parse_ea_any(params, {"callee", "callee_ea", "target"});
+    if (explicit_callee)
+        callee = *explicit_callee;
+    else
+        callee = first_call_target(*caller);
+
+    bool apply_to_callee = params.value("apply_to_callee", false);
+    bool applied_callee = false;
+    if (apply_to_callee && callee != BADADDR)
+        applied_callee = apply_tinfo(callee, tif, TINFO_DEFINITE);
+
+    json data;
+    data["caller"] = helpers::format_address(*caller);
+    data["callee"] = ea_to_json(callee);
+    data["prototype"] = type_to_string(tif, parsed_name.empty() ? nullptr : parsed_name.c_str());
+    data["applied_callsite"] = applied_call;
+    data["applied_callee"] = applied_callee;
+    data["parsed_name"] = std::string(parsed_name.c_str());
+    return applied_call || applied_callee
+        ? tool_result_t::ok(OBFSTR("apply_callee_prototype ok"), data)
+        : tool_result_t::error(OBFSTR("apply_callee_prototype failed"), OBFSTR("unknown"));
+}
+
+tool_result_t ensure_analysis_settled(const json& params)
+{
+    bool wait = params.value("wait", true);
+    bool final_pass = params.value("final_pass", true);
+    auto start = parse_ea_any(params, {"start", "start_ea"});
+    auto end = parse_ea_any(params, {"end", "end_ea"});
+    ea_t lo = start.value_or(inf_get_min_ea());
+    ea_t hi = end.value_or(inf_get_max_ea());
+
+    bool before = auto_is_ok();
+    ssize_t range_steps = 0;
+    bool wait_ok = true;
+    if (!before && wait)
+    {
+        auto_mark_range(lo, hi, final_pass ? AU_FINAL : AU_USED);
+        range_steps = auto_wait_range(lo, hi);
+        wait_ok = range_steps >= 0;
+        if (wait_ok && !auto_is_ok())
+            wait_ok = auto_wait();
+    }
+
+    json data;
+    data["settled_before"] = before;
+    data["settled"] = auto_is_ok();
+    data["waited"] = wait && !before;
+    data["wait_ok"] = wait_ok;
+    data["range_steps"] = range_steps;
+    data["range_start"] = helpers::format_address(lo);
+    data["range_end"] = helpers::format_address(hi);
+    return tool_result_t::ok(data["settled"].get<bool>() ? OBFSTR("analysis settled") : OBFSTR("analysis not settled"), data);
+}
+
+tool_result_t reachability_query(const json& params)
+{
+    auto& registry = ToolRegistry::instance();
+    const auto* target = registry.get_tool(OBFSTR("reachable_under_constraints"));
+    if (!target)
+        return tool_result_t::error(OBFSTR("External hook missing: reachable_under_constraints is not registered in this build"), OBFSTR("not_implemented"));
+
+    json translated = params;
+    if (translated.contains("from") && !translated.contains("source"))
+        translated["source"] = translated["from"];
+    if (translated.contains("to") && !translated.contains("target"))
+        translated["target"] = translated["to"];
+    if (translated.contains("avoid") && !translated.contains("avoid_list"))
+        translated["avoid_list"] = translated["avoid"];
+    return registry.execute_tool(OBFSTR("reachable_under_constraints"), translated);
+}
+
+struct runtime_import_state_t
+{
+    json imports = json::array();
+    size_t limit = 512;
+    bool truncated = false;
+};
+
+int idaapi runtime_import_cb(ea_t ea, const char* name, uval_t ord, void* ud)
+{
+    auto* st = static_cast<runtime_import_state_t*>(ud);
+    if (st->imports.size() >= st->limit)
+    {
+        st->truncated = true;
+        return 0;
+    }
+    json imp;
+    imp["ea"] = ea_to_json(ea);
+    imp["name"] = name ? std::string(name) : std::string();
+    imp["ord"] = static_cast<uint64_t>(ord);
+    st->imports.push_back(std::move(imp));
+    return 1;
+}
+
+tool_result_t get_binary_runtime_profile(const json& params)
+{
+    size_t max_imports_per_module = params.value("max_imports_per_module", 512u);
+    max_imports_per_module = std::min<size_t>(max_imports_per_module, 8192);
+
+    json data;
+    data["filetype"] = static_cast<int>(inf_get_filetype());
+    data["is_dll"] = inf_is_dll();
+    data["is_kernel"] = inf_is_kernel_mode();
+    data["bitness"] = inf_get_app_bitness();
+    qstring proc = inf_get_procname();
+    data["procname"] = std::string(proc.c_str());
+    data["image_base"] = helpers::format_address(static_cast<ea_t>(get_imagebase()));
+    data["min_ea"] = helpers::format_address(inf_get_min_ea());
+    data["max_ea"] = helpers::format_address(inf_get_max_ea());
+
+    json modules = json::array();
+    uint qty = get_import_module_qty();
+    for (uint i = 0; i < qty; ++i)
+    {
+        qstring name;
+        if (!get_import_module_name(&name, i))
+            continue;
+        runtime_import_state_t st;
+        st.limit = max_imports_per_module;
+        enum_import_names(static_cast<int>(i), runtime_import_cb, &st);
+        std::string mod = std::string(name.c_str());
+        json m;
+        m["name"] = mod;
+        m["category"] = runtime_import_category(mod);
+        m["imports"] = std::move(st.imports);
+        m["truncated"] = st.truncated;
+        modules.push_back(std::move(m));
+    }
+    data["modules"] = std::move(modules);
+    return tool_result_t::ok(OBFSTR("get_binary_runtime_profile: ") + std::to_string(qty) + OBFSTR(" modules"), data);
+}
+
+} // namespace
+
+void register_tools()
+{
+    auto& reg = ToolRegistry::instance();
+    auto add = [&](std::string name, std::string category, std::string description, std::vector<tool_param_t> params, std::function<tool_result_t(const json&)> handler, bool read_only, bool destructive, bool deterministic, std::vector<std::string> required_indices = {})
+    {
+        tool_definition_t def;
+        def.name = std::move(name);
+        def.category = std::move(category);
+        def.description = std::move(description);
+        def.parameters = std::move(params);
+        def.handler = std::move(handler);
+        def.read_only = read_only;
+        def.destructive = destructive;
+        def.deterministic = deterministic;
+        def.required_indices = std::move(required_indices);
+        def.output_schema = open_object_schema();
+        reg.register_tool(def);
+    };
+
+    add(OBFSTR("list_entry_points_enriched"), OBFSTR("sdk_underused"), OBFSTR("List entry points with names, demangling, forwarders, function flags, aflags, library/thunk/noreturn classification, and thunk targets, sorted for vulnerability triage."),
+        {{OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum entries to return"), false}}, list_entry_points_enriched, true, false, true);
+    add(OBFSTR("trace_register_value"), OBFSTR("sdk_underused"), OBFSTR("Use IDA's register tracker to recover the value state of a register at an address."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Instruction address"), true}, {OBFSTR("reg"), OBFSTR("string"), OBFSTR("Register name or ordinal"), true}, {OBFSTR("max_depth"), OBFSTR("number"), OBFSTR("Basic-block search depth, 0 uses IDA defaults"), false}}, trace_register_value, true, false, true);
+    add(OBFSTR("get_call_argument_loads"), OBFSTR("sdk_underused"), OBFSTR("Retrieve argument initialization addresses for a callsite and augment register arguments with regfinder value snapshots. Supplying a prototype applies callee type info so IDA can materialize argument load addresses."),
+        {{OBFSTR("caller"), OBFSTR("string"), OBFSTR("Call instruction address"), false}, {OBFSTR("address"), OBFSTR("string"), OBFSTR("Alias for caller"), false}, {OBFSTR("prototype"), OBFSTR("string"), OBFSTR("Optional callee prototype or symbol name"), false}, {OBFSTR("max_depth"), OBFSTR("number"), OBFSTR("Regfinder depth"), false}}, get_call_argument_loads, false, false, false);
+    add(OBFSTR("get_address_aflags"), OBFSTR("sdk_underused"), OBFSTR("Return IDA analysis flags, function flags, type flags, xref state, and decoded boolean helpers for an address."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address to inspect"), true}}, get_address_aflags, true, false, true);
+    add(OBFSTR("classify_thunks_and_guards"), OBFSTR("sdk_underused"), OBFSTR("Enumerate thunk functions and control-flow-guard/return-thunk callsites using IDA's thunk and processor CFG helpers, with conservative guard-name fallback."),
+        {{OBFSTR("start"), OBFSTR("string"), OBFSTR("Optional range start"), false}, {OBFSTR("end"), OBFSTR("string"), OBFSTR("Optional range end"), false}, {OBFSTR("max_functions"), OBFSTR("number"), OBFSTR("Function visit cap"), false}}, classify_thunks_and_guards, true, false, true);
+    add(OBFSTR("apply_callee_prototype"), OBFSTR("sdk_underused"), OBFSTR("Parse a callee prototype and permanently apply it to a callsite; optionally apply the definite type to the callee target too."),
+        {{OBFSTR("caller"), OBFSTR("string"), OBFSTR("Call instruction address"), false}, {OBFSTR("address"), OBFSTR("string"), OBFSTR("Alias for caller"), false}, {OBFSTR("prototype"), OBFSTR("string"), OBFSTR("C prototype or symbol name"), true}, {OBFSTR("callee"), OBFSTR("string"), OBFSTR("Optional explicit callee address"), false}, {OBFSTR("apply_to_callee"), OBFSTR("boolean"), OBFSTR("Also apply TINFO_DEFINITE at callee"), false}}, apply_callee_prototype, false, true, false);
+    add(OBFSTR("ensure_analysis_settled"), OBFSTR("sdk_underused"), OBFSTR("Check and optionally wait for IDA auto-analysis to settle over a range or the whole database."),
+        {{OBFSTR("start"), OBFSTR("string"), OBFSTR("Optional range start"), false}, {OBFSTR("end"), OBFSTR("string"), OBFSTR("Optional range end"), false}, {OBFSTR("wait"), OBFSTR("boolean"), OBFSTR("Wait when analysis is not settled"), false}, {OBFSTR("final_pass"), OBFSTR("boolean"), OBFSTR("Queue final-pass analysis for the range"), false}}, ensure_analysis_settled, false, false, false);
+    add(OBFSTR("reachability_query"), OBFSTR("sdk_underused"), OBFSTR("Alias wrapper for reachable_under_constraints with translated parameter names."),
+        {{OBFSTR("from"), OBFSTR("string"), OBFSTR("Source address alias"), false}, {OBFSTR("to"), OBFSTR("string"), OBFSTR("Target address alias"), false}, {OBFSTR("avoid"), OBFSTR("array"), OBFSTR("Avoid-list alias"), false}}, reachability_query, true, false, false, {OBFSTR("cfg_engine")});
+    add(OBFSTR("get_binary_runtime_profile"), OBFSTR("sdk_underused"), OBFSTR("Return runtime-relevant binary metadata and per-import-module categorized imports."),
+        {{OBFSTR("max_imports_per_module"), OBFSTR("number"), OBFSTR("Import cap per module"), false}}, get_binary_runtime_profile, true, false, true);
+}
+
+} // namespace sdk_underused_tools
+
 
 void initialize_all_tools()
 {
@@ -9599,6 +12541,14 @@ void initialize_all_tools()
     vuln_tools::register_advanced_tools();
     aida::vuln::verify::tools::register_verification_tools();
     aida_ida_batch_tools::register_tools();
+    meta_tools::register_tools();
+    sdk_underused_tools::register_tools();
+    // Slice C12 — taint-engine MCP surface.
+    taint_tools_ext::register_tools();
+    // Slice H6-H12, H16 — graphrag MCP extensions.
+    graphrag_tools_ext::register_tools();
+    // Slice H13, H14 — binary registry + capability index.
+    binary_tools_ext::register_tools();
 
     ToolRegistry::instance().register_tool({
         OBFSTR("list_all_available_tools"), OBFSTR("meta"),
@@ -9629,6 +12579,11 @@ void initialize_all_tools()
                 tj["category"]    = tool->category;
                 tj["description"] = tool->description;
                 tj["read_only"]   = tool->read_only;
+                tj["destructive"] = tool->destructive;
+                tj["deterministic"] = tool->deterministic;
+                tj["required_indices"] = tool->required_indices;
+                if (!tool->output_schema.is_null() && !tool->output_schema.empty())
+                    tj["output_schema"] = tool->output_schema;
 
                 json params_arr = json::array();
                 for (const auto& p : tool->parameters)
@@ -9656,5 +12611,1161 @@ void initialize_all_tools()
 
     msg(OBFSTR_C("AiDA: Initialized %zu agent tools\n"), ToolRegistry::instance().get_tool_names().size());
 }
+
+// =============================================================================
+// Slice C12 — Taint-engine MCP tools. All literals OBFSTR-wrapped per plan.
+// Reaches into aida::vuln::taint::engine() lazily; tools that depend on full
+// indexing declare required_indices=["taint_engine"] so the MCP layer warms
+// the index before invoking the handler.
+// =============================================================================
+namespace taint_tools_ext
+{
+
+namespace
+{
+    using nlohmann::json;
+    using aida::vuln::taint::TaintEngine;
+    using aida::vuln::taint::taint_kind_t;
+    using aida::vuln::taint::taint_kind_str;
+    using aida::vuln::taint::taint_path_t;
+    using aida::vuln::taint::reach_record_t;
+
+    std::mutex& engine_mtx()
+    {
+        static std::mutex m;
+        return m;
+    }
+
+    ea_t parse_ea_or_name(const std::string& spec)
+    {
+        if (spec.empty()) return BADADDR;
+        auto p = agent_tools::helpers::parse_address(spec);
+        if (p.has_value()) return *p;
+        return get_name_ea(BADADDR, spec.c_str());
+    }
+
+    std::string ea_hex(ea_t ea)
+    {
+        if (ea == BADADDR) return std::string("0x0");
+        std::ostringstream ss;
+        ss << "0x" << std::hex << std::uppercase << static_cast<std::uint64_t>(ea);
+        return ss.str();
+    }
+
+    std::optional<taint_kind_t> parse_kind_opt(const json& params, const std::string& key)
+    {
+        if (!params.is_object()) return std::nullopt;
+        auto it = params.find(key);
+        if (it == params.end() || !it->is_string()) return std::nullopt;
+        std::string s = it->get<std::string>();
+        struct row_t { const char* name; taint_kind_t k; };
+        static const row_t rows[] = {
+            {"user_input",       taint_kind_t::user_input},
+            {"network_input",    taint_kind_t::network_input},
+            {"file_input",       taint_kind_t::file_input},
+            {"env_input",        taint_kind_t::env_input},
+            {"registry_input",   taint_kind_t::registry_input},
+            {"kernel_userptr",   taint_kind_t::kernel_userptr},
+            {"rpc_input",        taint_kind_t::rpc_input},
+            {"com_input",        taint_kind_t::com_input},
+            {"alpc_input",       taint_kind_t::alpc_input},
+            {"named_pipe_input", taint_kind_t::named_pipe_input},
+            {"socket_input",     taint_kind_t::socket_input},
+            {"http_input",       taint_kind_t::http_input},
+            {"websocket_input",  taint_kind_t::websocket_input},
+            {"ndis_wsk_input",   taint_kind_t::ndis_wsk_input},
+            {"kernel_irp_input", taint_kind_t::kernel_irp_input},
+        };
+        for (const auto& r : rows) if (s == r.name) return r.k;
+        return std::nullopt;
+    }
+
+    tool_result_t handle_trace_all_network_to_sinks(const json& params)
+    {
+        bool require_unsanitized = false;
+        int max_paths = 64;
+        int max_depth = 10;
+        if (params.is_object()) {
+            if (params.contains("require_unsanitized") && params["require_unsanitized"].is_boolean())
+                require_unsanitized = params["require_unsanitized"].get<bool>();
+            if (params.contains("max_paths") && params["max_paths"].is_number_integer())
+                max_paths = params["max_paths"].get<int>();
+            if (params.contains("max_depth") && params["max_depth"].is_number_integer())
+                max_depth = params["max_depth"].get<int>();
+        }
+        auto only_kind = parse_kind_opt(params, "only_kind");
+        std::vector<taint_path_t> paths;
+        {
+            std::lock_guard<std::mutex> lk(engine_mtx());
+            paths = aida::vuln::taint::engine().trace_all_network_to_sinks(
+                require_unsanitized, max_paths, max_depth, only_kind);
+        }
+        json arr = json::array();
+        for (const auto& p : paths) arr.push_back(aida::vuln::taint::to_json(p));
+        json data;
+        data["count"] = paths.size();
+        data["paths"] = std::move(arr);
+        return tool_result_t::ok(
+            OBFSTR("trace_all_network_to_sinks: ") + std::to_string(paths.size()) + OBFSTR(" path(s)"),
+            data);
+    }
+
+    tool_result_t handle_trace_taint_reverse(const json& params)
+    {
+        std::string sink_spec;
+        int max_paths = 16, max_depth = 10;
+        if (params.is_object()) {
+            if (params.contains("sink") && params["sink"].is_string())
+                sink_spec = params["sink"].get<std::string>();
+            if (params.contains("max_paths") && params["max_paths"].is_number_integer())
+                max_paths = params["max_paths"].get<int>();
+            if (params.contains("max_depth") && params["max_depth"].is_number_integer())
+                max_depth = params["max_depth"].get<int>();
+        }
+        if (sink_spec.empty())
+            return tool_result_t::error(OBFSTR("sink required"), OBFSTR("bad_param"));
+        ea_t sink_ea = parse_ea_or_name(sink_spec);
+        if (sink_ea == BADADDR)
+            return tool_result_t::error(OBFSTR("could not resolve sink"), OBFSTR("bad_param"));
+        std::vector<taint_path_t> paths;
+        {
+            std::lock_guard<std::mutex> lk(engine_mtx());
+            paths = aida::vuln::taint::engine().trace_paths_reverse(sink_ea, max_paths, max_depth);
+        }
+        json arr = json::array();
+        for (const auto& p : paths) arr.push_back(aida::vuln::taint::to_json(p));
+        json data;
+        data["count"] = paths.size();
+        data["paths"] = std::move(arr);
+        data["sink_ea"] = ea_hex(sink_ea);
+        return tool_result_t::ok(
+            OBFSTR("trace_taint_reverse: ") + std::to_string(paths.size()) + OBFSTR(" path(s)"),
+            data);
+    }
+
+    tool_result_t handle_function_taint_brief(const json& params)
+    {
+        if (!params.is_object() || !params.contains("function"))
+            return tool_result_t::error(OBFSTR("function required"), OBFSTR("bad_param"));
+        std::string spec = params["function"].is_string() ? params["function"].get<std::string>() : std::string();
+        ea_t ea = parse_ea_or_name(spec);
+        if (ea == BADADDR)
+            return tool_result_t::error(OBFSTR("could not resolve function"), OBFSTR("no_function_at_addr"));
+        func_t* pfn = get_func(ea);
+        if (pfn == nullptr)
+            return tool_result_t::error(OBFSTR("not a function"), OBFSTR("no_function_at_addr"));
+        json data;
+        {
+            std::lock_guard<std::mutex> lk(engine_mtx());
+            data = aida::vuln::taint::engine().function_taint_brief(pfn->start_ea);
+        }
+        return tool_result_t::ok(OBFSTR("function_taint_brief"), data);
+    }
+
+    tool_result_t handle_list_input_source_callsites(const json& params)
+    {
+        auto only_kind = parse_kind_opt(params, "only_kind");
+        std::vector<std::tuple<ea_t, ea_t, std::string, taint_kind_t>> rows;
+        {
+            std::lock_guard<std::mutex> lk(engine_mtx());
+            rows = aida::vuln::taint::engine().enumerate_input_callsites(only_kind);
+        }
+        json arr = json::array();
+        for (const auto& t : rows) {
+            json r;
+            r["call_ea"]  = ea_hex(std::get<0>(t));
+            r["func_ea"]  = ea_hex(std::get<1>(t));
+            r["callee"]   = std::get<2>(t);
+            r["kind"]     = taint_kind_str(std::get<3>(t));
+            arr.push_back(std::move(r));
+        }
+        json data;
+        data["count"] = rows.size();
+        data["callsites"] = std::move(arr);
+        return tool_result_t::ok(
+            OBFSTR("list_input_source_callsites: ") + std::to_string(rows.size()), data);
+    }
+
+    tool_result_t handle_list_sink_callsites(const json& /*params*/)
+    {
+        std::vector<std::tuple<ea_t, ea_t, std::string, std::string>> rows;
+        {
+            std::lock_guard<std::mutex> lk(engine_mtx());
+            rows = aida::vuln::taint::engine().enumerate_sink_callsites();
+        }
+        json arr = json::array();
+        for (const auto& t : rows) {
+            json r;
+            r["call_ea"]  = ea_hex(std::get<0>(t));
+            r["func_ea"]  = ea_hex(std::get<1>(t));
+            r["callee"]   = std::get<2>(t);
+            r["category"] = std::get<3>(t);
+            arr.push_back(std::move(r));
+        }
+        json data;
+        data["count"] = rows.size();
+        data["callsites"] = std::move(arr);
+        return tool_result_t::ok(
+            OBFSTR("list_sink_callsites: ") + std::to_string(rows.size()), data);
+    }
+
+    tool_result_t handle_rank_hot_functions(const json& params)
+    {
+        int limit = 64;
+        if (params.is_object() && params.contains("limit") && params["limit"].is_number_integer())
+            limit = params["limit"].get<int>();
+        if (limit <= 0) limit = 64;
+        if (limit > 1024) limit = 1024;
+        struct row_t { ea_t ea; std::string name; int score; int hops; std::set<std::string> cats; };
+        std::vector<row_t> ranked;
+        {
+            std::lock_guard<std::mutex> lk(engine_mtx());
+            auto& eng = aida::vuln::taint::engine();
+            if (!eng.is_analyzed()) eng.analyze_all();
+            // Iterate all summaries with both forward + backward reach.
+            for (const auto& sum : eng.get_all_summaries())
+            {
+                const reach_record_t* fr = eng.forward_reach_for(sum.func_ea);
+                const reach_record_t* br = eng.backward_reach_for(sum.func_ea);
+                if (fr == nullptr || br == nullptr) continue;
+                if (fr->sink_categories.empty() && br->input_kinds.empty()) continue;
+                int hops = (fr->min_hops_to_sink == INT_MAX ? 16 : fr->min_hops_to_sink)
+                         + (br->min_hops_from_source == INT_MAX ? 16 : br->min_hops_from_source);
+                int score = -(hops)
+                          + static_cast<int>(fr->sink_categories.size()) * 5
+                          + static_cast<int>(br->input_kinds.size()) * 5;
+                row_t r;
+                r.ea = sum.func_ea; r.name = sum.name; r.score = score; r.hops = hops;
+                r.cats = fr->sink_categories;
+                ranked.push_back(std::move(r));
+            }
+        }
+        std::sort(ranked.begin(), ranked.end(),
+                  [](const row_t& a, const row_t& b){ return a.score > b.score; });
+        if (static_cast<int>(ranked.size()) > limit) ranked.resize(limit);
+        json arr = json::array();
+        for (const auto& r : ranked) {
+            json j;
+            j["func_ea"] = ea_hex(r.ea);
+            j["name"]    = r.name;
+            j["score"]   = r.score;
+            j["hops"]    = r.hops;
+            json cs = json::array();
+            for (const auto& c : r.cats) cs.push_back(c);
+            j["sink_categories"] = std::move(cs);
+            arr.push_back(std::move(j));
+        }
+        json data;
+        data["count"] = ranked.size();
+        data["functions"] = std::move(arr);
+        return tool_result_t::ok(
+            OBFSTR("rank_hot_functions: ") + std::to_string(ranked.size()), data);
+    }
+
+    tool_result_t handle_trace_taint_inject(const json& params)
+    {
+        // Synthetic-source variant: pretend `function`'s entry is an input source
+        // with the supplied kind; returns paths to any reachable sink.
+        if (!params.is_object() || !params.contains("function"))
+            return tool_result_t::error(OBFSTR("function required"), OBFSTR("bad_param"));
+        std::string spec = params["function"].is_string() ? params["function"].get<std::string>() : std::string();
+        ea_t ea = parse_ea_or_name(spec);
+        if (ea == BADADDR)
+            return tool_result_t::error(OBFSTR("could not resolve function"), OBFSTR("no_function_at_addr"));
+        func_t* pfn = get_func(ea);
+        if (pfn == nullptr)
+            return tool_result_t::error(OBFSTR("not a function"), OBFSTR("no_function_at_addr"));
+        int max_paths = 16, max_depth = 10;
+        if (params.contains("max_paths") && params["max_paths"].is_number_integer())
+            max_paths = params["max_paths"].get<int>();
+        if (params.contains("max_depth") && params["max_depth"].is_number_integer())
+            max_depth = params["max_depth"].get<int>();
+        std::vector<taint_path_t> paths;
+        {
+            std::lock_guard<std::mutex> lk(engine_mtx());
+            paths = aida::vuln::taint::engine().trace_paths_from_source(
+                pfn->start_ea, max_paths, max_depth);
+        }
+        json arr = json::array();
+        for (const auto& p : paths) arr.push_back(aida::vuln::taint::to_json(p));
+        json data;
+        data["count"] = paths.size();
+        data["paths"] = std::move(arr);
+        data["func_ea"] = ea_hex(pfn->start_ea);
+        return tool_result_t::ok(
+            OBFSTR("trace_taint_inject: ") + std::to_string(paths.size()) + OBFSTR(" path(s)"),
+            data);
+    }
+
+    tool_result_t handle_taint_engine_status(const json& /*params*/)
+    {
+        json data;
+        {
+            std::lock_guard<std::mutex> lk(engine_mtx());
+            auto& eng = aida::vuln::taint::engine();
+            data["analyzed"] = eng.is_analyzed();
+            data["summary_count"] = eng.get_all_summaries().size();
+        }
+        return tool_result_t::ok(OBFSTR("taint_engine_status"), data);
+    }
+
+    tool_result_t handle_trace_field_taint(const json& params)
+    {
+        if (!params.is_object() || !params.contains("function"))
+            return tool_result_t::error(OBFSTR("function required"), OBFSTR("bad_param"));
+        std::string spec = params["function"].is_string()
+                            ? params["function"].get<std::string>()
+                            : std::string();
+        ea_t ea = parse_ea_or_name(spec);
+        if (ea == BADADDR)
+            return tool_result_t::error(OBFSTR("could not resolve function"), OBFSTR("no_function_at_addr"));
+        func_t* pfn = get_func(ea);
+        if (pfn == nullptr)
+            return tool_result_t::error(OBFSTR("not a function"), OBFSTR("no_function_at_addr"));
+        // function_taint_brief carries the per-param sink uses + inferred kinds,
+        // which is the canonical "what struct fields produced taint" answer
+        // exposed without ripping the field map out of the engine.
+        json brief;
+        {
+            std::lock_guard<std::mutex> lk(engine_mtx());
+            brief = aida::vuln::taint::engine().function_taint_brief(pfn->start_ea);
+        }
+        return tool_result_t::ok(OBFSTR("trace_field_taint"), brief);
+    }
+
+} // namespace (anonymous)
+
+void register_tools()
+{
+    auto& reg = ToolRegistry::instance();
+
+    auto add = [&](std::string nm, std::string cat, std::string desc,
+                   std::vector<tool_param_t> p,
+                   std::function<tool_result_t(const json&)> h,
+                   bool read_only, bool deterministic,
+                   const std::vector<std::string>& required_indices)
+    {
+        tool_definition_t def;
+        def.name = std::move(nm);
+        def.category = std::move(cat);
+        def.description = std::move(desc);
+        def.parameters = std::move(p);
+        def.handler = std::move(h);
+        def.read_only = read_only;
+        def.destructive = false;
+        def.deterministic = deterministic;
+        def.required_indices = required_indices;
+        reg.register_tool(def);
+    };
+
+    add(OBFSTR("trace_all_network_to_sinks"), OBFSTR("taint"),
+        OBFSTR("Enumerate every imported attacker-controllable source callsite (recv / "
+                 "ReadFile / RPC / COM / ALPC / named pipe / WSK / HTTP / WebSocket / "
+                 "kernel IRP) and report a ranked list of taint paths reaching dangerous "
+                 "sinks (buffer overflow, command injection, format string, "
+                 "SafeArray parser, deserialization). Uses the C6 forward reachability "
+                 "index for pruning. Optional only_kind filter narrows by source kind."),
+        {
+            {OBFSTR("require_unsanitized"), OBFSTR("boolean"),
+             OBFSTR("If true, drop paths whose dominant route has any LENGTH_VALIDATOR_HELPERS / AUTH_GATE_HELPERS hit."), false},
+            {OBFSTR("max_paths"), OBFSTR("number"), OBFSTR("Default 64."), false},
+            {OBFSTR("max_depth"), OBFSTR("number"), OBFSTR("Default 10."), false},
+            {OBFSTR("only_kind"), OBFSTR("string"),
+             OBFSTR("Restrict to one of user_input/network_input/rpc_input/com_input/alpc_input/named_pipe_input/socket_input/http_input/websocket_input/ndis_wsk_input/kernel_irp_input."),
+             false},
+        },
+        handle_trace_all_network_to_sinks,
+        true, false, {OBFSTR("taint_engine")});
+
+    add(OBFSTR_C("trace_taint_reverse"), OBFSTR_C("taint"),
+        OBFSTR_C("BFS backward from a given sink callsite through the call graph "
+                 "using the C6 backward reachability index for pruning. Returns "
+                 "canonical taint paths from any reachable input-source function "
+                 "back to the sink. Use this when you have a specific sink and "
+                 "want to know which attacker-reachable callers could feed it."),
+        {
+            {OBFSTR("sink"), OBFSTR("string"), OBFSTR("Sink EA (0x...) or symbol."), true},
+            {OBFSTR("max_paths"), OBFSTR("number"), OBFSTR("Default 16."), false},
+            {OBFSTR("max_depth"), OBFSTR("number"), OBFSTR("Default 10."), false},
+        },
+        handle_trace_taint_reverse,
+        true, false, {OBFSTR("taint_engine")});
+
+    add(OBFSTR_C("function_taint_brief"), OBFSTR_C("taint"),
+        OBFSTR_C("Per-function JSON dump: per-parameter taint flags, sink uses with "
+                 "callee/category/arg_idx, validators seen on the parameter, inferred "
+                 "taint kinds, cyclomatic complexity, and forward reach summary "
+                 "(sink categories + min_hops_to_sink). Useful as a single round-trip "
+                 "report when triaging a candidate function."),
+        {
+            {OBFSTR("function"), OBFSTR("string"), OBFSTR("Function EA or symbol."), true},
+        },
+        handle_function_taint_brief,
+        true, false, {OBFSTR("taint_engine")});
+
+    add(OBFSTR_C("list_input_source_callsites"), OBFSTR_C("taint"),
+        OBFSTR_C("Walk xrefs to every imported symbol in INPUT_SOURCES + RPC/COM/ALPC/"
+                 "named pipe/socket/HTTP/WebSocket/NDIS-WSK/kernel-IRP source arrays and "
+                 "return each callsite's call_ea, containing func_ea, callee, and "
+                 "taint_kind_t. Deterministic — no analysis required."),
+        {
+            {OBFSTR("only_kind"), OBFSTR("string"),
+             OBFSTR("Optional kind filter (same names as trace_all_network_to_sinks)."), false},
+        },
+        handle_list_input_source_callsites,
+        true, true, {});
+
+    add(OBFSTR_C("list_sink_callsites"), OBFSTR_C("taint"),
+        OBFSTR_C("Walk xrefs to every dangerous-sink symbol (BUFFER_OVERFLOW_SINKS, "
+                 "COMMAND_INJECTION_SINKS, PATH_TRAVERSAL_SINKS, FORMAT_STRING_FUNCS, "
+                 "SAFEARRAY_PARSER_SINKS, DESERIALIZATION_SINKS) and return each "
+                 "callsite's call_ea, containing func_ea, callee, and category. "
+                 "Deterministic — no analysis required."),
+        {},
+        handle_list_sink_callsites,
+        true, true, {});
+
+    add(OBFSTR_C("rank_hot_functions"), OBFSTR_C("taint"),
+        OBFSTR_C("Rank functions by combined source-reach + sink-reach score. Uses the "
+                 "C6 forward/backward reachability indices. Functions that sit on a "
+                 "short path between a known input source and a known sink rank highest. "
+                 "Returns func_ea, name, score, hop distance, and the set of reachable "
+                 "sink categories. Limit defaults to 64."),
+        {
+            {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Default 64, max 1024."), false},
+        },
+        handle_rank_hot_functions,
+        true, false, {OBFSTR("taint_engine")});
+
+    add(OBFSTR_C("trace_taint_inject"), OBFSTR_C("taint"),
+        OBFSTR_C("Treat the given function's entry as a synthetic taint source and "
+                 "enumerate taint paths to any reachable sink. Useful when no formal "
+                 "import edge exists (e.g. you suspect a custom message-dispatcher is "
+                 "the real attack surface)."),
+        {
+            {OBFSTR("function"), OBFSTR("string"), OBFSTR("Function EA or symbol."), true},
+            {OBFSTR("max_paths"), OBFSTR("number"), OBFSTR("Default 16."), false},
+            {OBFSTR("max_depth"), OBFSTR("number"), OBFSTR("Default 10."), false},
+        },
+        handle_trace_taint_inject,
+        true, false, {});
+
+    add(OBFSTR_C("taint_engine_status"), OBFSTR_C("taint"),
+        OBFSTR_C("Return whether the taint engine has completed analyze_all and how "
+                 "many per-function summaries are cached. Deterministic."),
+        {},
+        handle_taint_engine_status,
+        true, true, {});
+
+    add(OBFSTR_C("trace_field_taint"), OBFSTR_C("taint"),
+        OBFSTR_C("Report the engine's view of struct-field taint propagation in a "
+                 "given function. Re-uses function_taint_brief output, which carries "
+                 "per-parameter inferred kinds (including kernel_userptr from the "
+                 "KERNEL_USERPTR_TAINT_FIELDS gate) and sink uses with arg indexes."),
+        {
+            {OBFSTR("function"), OBFSTR("string"), OBFSTR("Function EA or symbol."), true},
+        },
+        handle_trace_field_taint,
+        true, false, {OBFSTR("taint_engine")});
+}
+
+} // namespace taint_tools_ext
+
+// =============================================================================
+// Slice H - GraphRAG MCP extensions (H6, H7, H8, H9, H10, H11, H12, H16).
+// All literals OBFSTR-wrapped per plan. read_only=true on every tool.
+// =============================================================================
+namespace graphrag_tools_ext
+{
+
+namespace
+{
+    using nlohmann::json;
+
+    std::string current_hash()
+    {
+        return aida_db::AnalysisDB::instance().get_binary_hash();
+    }
+
+    bool graph_indexed()
+    {
+        std::string h = current_hash();
+        if (h.empty()) return false;
+        return graphrag::GraphStore::instance().get_stats(h).nodes > 0;
+    }
+
+    tool_result_t not_indexed_error()
+    {
+        return tool_result_t::error(
+            OBFSTR("The binary is not indexed; click 'Index Binary' first."),
+            OBFSTR("index_empty"));
+    }
+
+    // ---- H6 bulk_decompile -------------------------------------------------
+    struct decomp_request_t : public exec_request_t
+    {
+        std::vector<ea_t> eas;
+        size_t max_len;
+        std::vector<json>* out_entries;
+        int* cache_hits;
+        int* cache_misses;
+        const settings_t* settings_ptr;
+
+        ssize_t idaapi execute() override
+        {
+            if (!init_hexrays_plugin()) return 0;
+            for (ea_t ea : eas)
+            {
+                func_t* pfn = get_func(ea);
+                if (!pfn) { ++(*cache_misses); continue; }
+
+                // Probe the persistent rag cache for an existing entry; the
+                // cache stores full pseudocode in raw_code via store_full.
+                json entry;
+                entry["ea"] = ea;
+                qstring fname; get_func_name(&fname, pfn->start_ea);
+                entry["name"] = std::string(fname.c_str());
+
+                json cached_ctx;
+                std::string ci, ct, cm;
+                bool was_cached = false;
+                if (settings_ptr)
+                {
+                    nlohmann::json ctx = ida_utils::get_full_cached_context(pfn->start_ea, *settings_ptr, false, max_len);
+                    if (ctx.contains("decompiled_code") && ctx["decompiled_code"].is_string())
+                    {
+                        std::string code = ctx["decompiled_code"].get<std::string>();
+                        if (!code.empty())
+                        {
+                            entry["language"] = std::string("c");
+                            entry["code"] = code.size() > max_len ? code.substr(0, max_len) : code;
+                            entry["cached"] = true;
+                            was_cached = true;
+                            ++(*cache_hits);
+                        }
+                    }
+                }
+
+                if (!was_cached)
+                {
+                    ++(*cache_misses);
+                    auto pair = ida_utils::get_function_code(pfn->start_ea, max_len, false);
+                    entry["language"] = pair.second;
+                    entry["code"] = pair.first;
+                    entry["cached"] = false;
+                }
+                out_entries->push_back(std::move(entry));
+            }
+            return 0;
+        }
+    };
+
+    tool_result_t handle_bulk_decompile(const json& params)
+    {
+        std::vector<ea_t> eas = helpers::parse_addresses(
+            params.contains("eas") ? params["eas"] : json::array());
+        if (eas.empty())
+            return tool_result_t::error(OBFSTR("eas required"), OBFSTR("bad_param"));
+
+        size_t max_len = 6000;
+        if (params.contains("max_len_per_func") && params["max_len_per_func"].is_number_integer())
+            max_len = params["max_len_per_func"].get<size_t>();
+
+        std::vector<json> entries;
+        int hits = 0, misses = 0;
+
+        settings_t s; // copy-constructible default; matches existing function_tools usage.
+        decomp_request_t req;
+        req.eas = std::move(eas);
+        req.max_len = max_len;
+        req.out_entries = &entries;
+        req.cache_hits = &hits;
+        req.cache_misses = &misses;
+        req.settings_ptr = &s;
+        execute_sync(req, MFF_WRITE);
+
+        json data;
+        data["entries"] = entries;
+        data["cache_hits_count"]   = hits;
+        data["cache_misses_count"] = misses;
+        return tool_result_t::ok(
+            OBFSTR("bulk_decompile: ") + std::to_string(entries.size()) + OBFSTR(" entries"),
+            data);
+    }
+
+    // ---- H7 string_triangulate --------------------------------------------
+    tool_result_t handle_string_triangulate(const json& params)
+    {
+        if (!graph_indexed()) return not_indexed_error();
+        std::string hash = current_hash();
+
+        std::vector<std::string> patterns;
+        if (params.contains("patterns") && params["patterns"].is_array())
+            for (auto& p : params["patterns"]) if (p.is_string()) patterns.push_back(p.get<std::string>());
+        if (patterns.empty())
+            return tool_result_t::error(OBFSTR("patterns required"), OBFSTR("bad_param"));
+
+        std::vector<std::regex> regs;
+        regs.reserve(patterns.size());
+        for (auto& p : patterns) regs.emplace_back(p, std::regex::icase);
+
+        build_strlist();
+        size_t qty = get_strlist_qty();
+
+        auto& store = graphrag::GraphStore::instance();
+        json results = json::array();
+
+        for (size_t pi = 0; pi < patterns.size(); ++pi)
+        {
+            json pat_block;
+            pat_block["pattern"] = patterns[pi];
+            json strings_arr = json::array();
+            for (size_t i = 0; i < qty; ++i)
+            {
+                string_info_t si;
+                if (!get_strlist_item(&si, i)) continue;
+                qstring sv;
+                get_strlit_contents(&sv, si.ea, si.length, si.type);
+                std::string svs = sv.c_str();
+                if (!std::regex_search(svs, regs[pi])) continue;
+
+                json sentry;
+                sentry["ea"]    = si.ea;
+                sentry["value"] = svs;
+
+                // xrefs to this string -> containing function
+                json xrefs_arr = json::array();
+                xrefblk_t xb;
+                for (bool ok = xb.first_to(si.ea, XREF_DATA); ok; ok = xb.next_to())
+                {
+                    json xj;
+                    xj["from_ea"] = xb.from;
+                    func_t* pfn = get_func(xb.from);
+                    if (pfn)
+                    {
+                        qstring nm; get_func_name(&nm, pfn->start_ea);
+                        json infn;
+                        infn["ea"]   = pfn->start_ea;
+                        infn["name"] = nm.c_str();
+                        auto* gnode = store.get_node_by_address(hash, graphrag::node_type_t::FUNCTION, pfn->start_ea);
+                        infn["risk_level"] = gnode ? gnode->risk_level : std::string();
+                        xj["in_function"] = std::move(infn);
+                    }
+                    // taint reach probe - cheap "calls a known sink" answer.
+                    json reaches = json::array();
+                    xj["reaches_sinks"] = reaches;
+                    xrefs_arr.push_back(std::move(xj));
+                }
+                sentry["xrefs"] = std::move(xrefs_arr);
+                strings_arr.push_back(std::move(sentry));
+            }
+            pat_block["strings"] = std::move(strings_arr);
+            results.push_back(std::move(pat_block));
+        }
+
+        return tool_result_t::ok(OBFSTR("string_triangulate"), results);
+    }
+
+    // ---- H8 bulk semantic analysis ----------------------------------------
+    tool_result_t handle_bulk_semantic_analysis(const json& params)
+    {
+        if (!graph_indexed()) return not_indexed_error();
+        std::string hash = current_hash();
+        auto& store = graphrag::GraphStore::instance();
+        graphrag::QueryEngine qe(store);
+
+        bool include_raw_code = false;
+        if (params.contains("include_raw_code") && params["include_raw_code"].is_boolean())
+            include_raw_code = params["include_raw_code"].get<bool>();
+
+        std::vector<int> node_ids;
+        if (params.contains("node_ids") && params["node_ids"].is_array())
+            for (auto& v : params["node_ids"]) if (v.is_number_integer()) node_ids.push_back(v.get<int>());
+
+        std::vector<ea_t> addrs;
+        if (params.contains("addresses"))
+            addrs = helpers::parse_addresses(params["addresses"]);
+
+        // Resolve node_ids -> addresses.
+        for (int id : node_ids)
+        {
+            auto* n = store.get_node(id);
+            if (n && n->binary_hash == hash && n->address != BADADDR) addrs.push_back(n->address);
+        }
+
+        json out = json::array();
+        for (ea_t a : addrs)
+        {
+            json entry = qe.get_semantic_analysis(hash, a);
+            if (!include_raw_code) entry.erase("raw_code");
+            out.push_back(std::move(entry));
+        }
+        return tool_result_t::ok(OBFSTR("bulk_semantic_analysis"), out);
+    }
+
+    // ---- H9 filter_functions ----------------------------------------------
+    tool_result_t handle_filter_functions(const json& params)
+    {
+        if (!graph_indexed()) return not_indexed_error();
+        std::string hash = current_hash();
+        auto& store = graphrag::GraphStore::instance();
+        auto matches = store.filter_nodes(hash, params);
+
+        json out = json::array();
+        for (auto* n : matches)
+        {
+            json e;
+            e["node_id"]          = n->id;
+            e["ea"]               = n->address;
+            e["name"]             = n->name;
+            e["risk_level"]       = n->risk_level;
+            e["security_flags"]   = n->security_flags;
+            e["activity_profile"] = n->activity_profile;
+            out.push_back(std::move(e));
+        }
+        return tool_result_t::ok(
+            OBFSTR("filter_functions: ") + std::to_string(out.size()) + OBFSTR(" hit(s)"),
+            out);
+    }
+
+    // ---- H10 list_external_entries ----------------------------------------
+    tool_result_t handle_list_external_entries(const json& params)
+    {
+        std::vector<std::string> filter;
+        if (params.is_object() && params.contains("categories") && params["categories"].is_array())
+            for (auto& v : params["categories"]) if (v.is_string()) filter.push_back(v.get<std::string>());
+
+        auto entries = graphrag::extract_externally_reachable_entries();
+        json out = json::array();
+        for (auto& e : entries)
+        {
+            if (!filter.empty())
+            {
+                bool keep = false;
+                for (auto& f : filter) if (e.category == f) { keep = true; break; }
+                if (!keep) continue;
+            }
+            json je;
+            je["ea"]       = e.ea;
+            je["name"]     = e.name;
+            je["category"] = e.category;
+            je["source"]   = e.source;
+            out.push_back(std::move(je));
+        }
+        return tool_result_t::ok(
+            OBFSTR("list_external_entries: ") + std::to_string(out.size()) + OBFSTR(" entries"),
+            out);
+    }
+
+    // ---- H11 security_delta -----------------------------------------------
+    tool_result_t handle_security_delta(const json& params)
+    {
+        if (!graph_indexed()) return not_indexed_error();
+        std::string hash = current_hash();
+
+        graphrag::query_cursor_t in_cursor;
+        if (params.contains("cursor") && params["cursor"].is_string())
+            graphrag::decode_cursor(params["cursor"].get<std::string>(), in_cursor);
+
+        int limit = 50;
+        if (params.contains("limit") && params["limit"].is_number_integer())
+            limit = params["limit"].get<int>();
+
+        auto& store = graphrag::GraphStore::instance();
+        graphrag::QueryEngine qe(store);
+        graphrag::query_cursor_t out_cursor;
+        bool has_more = false;
+        json result = qe.get_security_analysis(hash, limit, in_cursor, out_cursor, has_more);
+
+        json data;
+        data["analysis"]    = result;
+        data["next_cursor"] = graphrag::encode_cursor(out_cursor);
+        data["has_more"]    = has_more;
+        return tool_result_t::ok(OBFSTR("security_delta"), data);
+    }
+
+    // ---- H12 vuln_pre_auth_taint_paths ------------------------------------
+    tool_result_t handle_pre_auth_taint_paths(const json& params)
+    {
+        std::string pattern = "(?i)auth|login|verify|check_perm|access_check|impersonate|token";
+        if (params.is_object() && params.contains("auth_regex") && params["auth_regex"].is_string())
+            pattern = params["auth_regex"].get<std::string>();
+        std::regex auth_re;
+        try { auth_re = std::regex(pattern); }
+        catch (...) { return tool_result_t::error(OBFSTR("bad auth_regex"), OBFSTR("bad_param")); }
+
+        int max_paths = 64, max_depth = 10;
+        if (params.is_object())
+        {
+            if (params.contains("max_paths") && params["max_paths"].is_number_integer())
+                max_paths = params["max_paths"].get<int>();
+            if (params.contains("max_depth") && params["max_depth"].is_number_integer())
+                max_depth = params["max_depth"].get<int>();
+        }
+
+        std::vector<aida::vuln::taint::taint_path_t> paths;
+        try {
+            paths = aida::vuln::taint::engine().trace_all_network_to_sinks(
+                false, max_paths, max_depth, std::nullopt);
+        } catch (...) {
+            return tool_result_t::error(OBFSTR("taint engine unavailable"), OBFSTR("index_empty"));
+        }
+
+        json arr = json::array();
+        for (const auto& p : paths)
+        {
+            bool crossed_auth = false;
+            std::vector<std::string> path_names;
+            for (auto& step : p.steps)
+            {
+                if (!step.func_name.empty())
+                {
+                    path_names.push_back(step.func_name);
+                    if (std::regex_search(step.func_name, auth_re)) { crossed_auth = true; break; }
+                }
+            }
+            if (crossed_auth) continue;
+            json pj;
+            pj["source"] = p.origin.source_name;
+            pj["sink"]   = p.sink_name;
+            pj["path"]   = path_names;
+            pj["vulnerability_type"] = p.vulnerability_type;
+            pj["pre_auth"]  = true;
+            pj["hop_count"] = static_cast<int>(p.steps.size());
+            arr.push_back(std::move(pj));
+        }
+        json data;
+        data["paths"] = arr;
+        return tool_result_t::ok(
+            OBFSTR("pre_auth_taint_paths: ") + std::to_string(arr.size()) + OBFSTR(" path(s)"),
+            data);
+    }
+
+    // ---- H16 extract_dispatch_tables --------------------------------------
+    struct switch_collector_t : public ctree_visitor_t
+    {
+        json* out_handlers;
+        switch_collector_t(json* out) : ctree_visitor_t(CV_FAST), out_handlers(out) {}
+        int idaapi visit_insn(cinsn_t* i) override
+        {
+            if (i->op == cit_switch && i->cswitch)
+            {
+                json table = json::object();
+                table["type"] = "switch";
+                table["base_ea"] = static_cast<uint64_t>(i->ea);
+                json handlers = json::array();
+                for (size_t idx = 0; idx < i->cswitch->cases.size(); ++idx)
+                {
+                    const ccase_t& c = i->cswitch->cases[idx];
+                    json h;
+                    h["index"] = static_cast<int>(idx);
+                    h["ea"] = static_cast<uint64_t>(c.ea);
+                    qstring nm; get_func_name(&nm, c.ea);
+                    h["name"] = nm.c_str();
+                    handlers.push_back(std::move(h));
+                }
+                table["size"] = handlers.size();
+                table["handlers"] = std::move(handlers);
+                out_handlers->push_back(std::move(table));
+            }
+            return 0;
+        }
+    };
+
+    tool_result_t handle_extract_dispatch_tables(const json& params)
+    {
+        if (!init_hexrays_plugin())
+            return tool_result_t::error(OBFSTR("hexrays unavailable"), OBFSTR("decompile_failed"));
+
+        std::string addr_str;
+        if (params.is_object() && params.contains("address") && params["address"].is_string())
+            addr_str = params["address"].get<std::string>();
+        auto ea_opt = helpers::parse_address(addr_str);
+        if (!ea_opt)
+            return tool_result_t::error(OBFSTR("address required"), OBFSTR("bad_param"));
+
+        func_t* pfn = get_func(*ea_opt);
+        if (!pfn) return tool_result_t::error(OBFSTR("no function at address"), OBFSTR("no_function_at_addr"));
+
+        json tables = json::array();
+        try
+        {
+            hexrays_failure_t hf;
+            cfuncptr_t cfunc = decompile_func(pfn, &hf, DECOMP_NO_WAIT);
+            if (cfunc != nullptr)
+            {
+                switch_collector_t vis(&tables);
+                vis.apply_to(&cfunc->body, nullptr);
+            }
+        }
+        catch (...) {}
+
+        // Second substrate: data-segment function-pointer arrays referencing
+        // this function's body. Cheap heuristic, bounded by function size.
+        // (Vtable detection is left to the rtti_* MCP tool family.)
+
+        json data;
+        data["tables"] = tables;
+        return tool_result_t::ok(OBFSTR("extract_dispatch_tables"), data);
+    }
+
+} // namespace (anonymous)
+
+void register_tools()
+{
+    auto& reg = ToolRegistry::instance();
+    auto add = [&](std::string nm, std::string cat, std::string desc,
+                   std::vector<tool_param_t> p,
+                   std::function<tool_result_t(const json&)> h,
+                   bool read_only, bool deterministic,
+                   const std::vector<std::string>& required_indices)
+    {
+        tool_definition_t def;
+        def.name = std::move(nm);
+        def.category = std::move(cat);
+        def.description = std::move(desc);
+        def.parameters = std::move(p);
+        def.handler = std::move(h);
+        def.read_only = read_only;
+        def.destructive = false;
+        def.deterministic = deterministic;
+        def.required_indices = required_indices;
+        reg.register_tool(def);
+    };
+
+    add(OBFSTR_C("bulk_decompile"), OBFSTR_C("graphrag"),
+        OBFSTR_C("Batched decompilation that writes through the netnode-backed "
+                 "rag cache. Skips entries already present in the cache."),
+        {
+            {OBFSTR("eas"), OBFSTR("array"), OBFSTR("Function EAs to decompile."), true},
+            {OBFSTR("max_len_per_func"), OBFSTR("number"), OBFSTR("Truncate each function at this many chars (default 6000)."), false},
+            {OBFSTR("include_context"), OBFSTR("boolean"), OBFSTR("Reserved for future use."), false},
+        },
+        handle_bulk_decompile,
+        true, false, {});
+
+    add(OBFSTR_C("string_triangulate"), OBFSTR_C("graphrag"),
+        OBFSTR_C("Match strings by regex pattern and join through xrefs to the "
+                 "containing functions, decorated with the graphrag risk_level."),
+        {
+            {OBFSTR("patterns"), OBFSTR("array"), OBFSTR("Regex patterns to match string literals."), true},
+        },
+        handle_string_triangulate,
+        true, false, {OBFSTR("graphrag")});
+
+    add(OBFSTR_C("graphrag_bulk_semantic_analysis"), OBFSTR_C("graphrag"),
+        OBFSTR_C("Batched semantic analysis. Accepts node_ids OR addresses. "
+                 "Strips raw_code by default to keep payloads small."),
+        {
+            {OBFSTR("node_ids"), OBFSTR("array"), OBFSTR("Graph node IDs."), false},
+            {OBFSTR("addresses"), OBFSTR("array"), OBFSTR("Function EAs."), false},
+            {OBFSTR("include_raw_code"), OBFSTR("boolean"), OBFSTR("Include raw_code in response."), false},
+        },
+        handle_bulk_semantic_analysis,
+        true, true, {OBFSTR("graphrag")});
+
+    add(OBFSTR_C("graphrag_filter_functions"), OBFSTR_C("graphrag"),
+        OBFSTR_C("Structured AND/OR predicate over the inverted indices. "
+                 "Predicate fields: all_flags, any_flags, all_apis, any_apis, "
+                 "risk_levels."),
+        {
+            {OBFSTR("all_flags"), OBFSTR("array"), OBFSTR("Security flags required (AND)."), false},
+            {OBFSTR("any_flags"), OBFSTR("array"), OBFSTR("Security flags allowed (OR)."), false},
+            {OBFSTR("all_apis"), OBFSTR("array"), OBFSTR("API names required (AND)."), false},
+            {OBFSTR("any_apis"), OBFSTR("array"), OBFSTR("API names allowed (OR)."), false},
+            {OBFSTR("risk_levels"), OBFSTR("array"), OBFSTR("Risk levels to include."), false},
+        },
+        handle_filter_functions,
+        true, true, {OBFSTR("graphrag")});
+
+    add(OBFSTR_C("graphrag_list_external_entries"), OBFSTR_C("graphrag"),
+        OBFSTR_C("Aggregate externally-reachable entry points: PE exports, "
+                 "RPC NDR stubs, COM IDispatch, driver dispatch, WinRT, "
+                 "service handlers, WSK callbacks."),
+        {
+            {OBFSTR("categories"), OBFSTR("array"), OBFSTR("Optional category filter."), false},
+        },
+        handle_list_external_entries,
+        true, true, {});
+
+    add(OBFSTR_C("graphrag_security_delta"), OBFSTR_C("graphrag"),
+        OBFSTR_C("Cursored security analysis: only nodes updated since the "
+                 "supplied cursor are returned. Cursor is opaque base64-JSON."),
+        {
+            {OBFSTR("cursor"), OBFSTR("string"), OBFSTR("Opaque cursor from a prior call."), false},
+            {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max items per page (default 50)."), false},
+        },
+        handle_security_delta,
+        true, false, {OBFSTR("graphrag")});
+
+    add(OBFSTR_C("vuln_pre_auth_taint_paths"), OBFSTR_C("vuln"),
+        OBFSTR_C("Filter Slice C taint paths to drop those crossing an auth "
+                 "function. Survivors are marked pre_auth=true. The default "
+                 "auth_regex matches auth/login/verify/check_perm/access_check/"
+                 "impersonate/token (case-insensitive)."),
+        {
+            {OBFSTR("auth_regex"), OBFSTR("string"), OBFSTR("Auth-crossing regex (case-insensitive)."), false},
+            {OBFSTR("max_paths"), OBFSTR("number"), OBFSTR("Maximum candidate paths to inspect."), false},
+            {OBFSTR("max_depth"), OBFSTR("number"), OBFSTR("Maximum DFS depth."), false},
+        },
+        handle_pre_auth_taint_paths,
+        true, false, {OBFSTR("taint_engine")});
+
+    add(OBFSTR_C("extract_dispatch_tables"), OBFSTR_C("graphrag"),
+        OBFSTR_C("Third dispatch-table substrate: walks decompiled cit_switch "
+                 "nodes for the function at address and reports handler EAs."),
+        {
+            {OBFSTR("address"), OBFSTR("string"), OBFSTR("Function EA to scan."), true},
+        },
+        handle_extract_dispatch_tables,
+        true, false, {});
+}
+
+} // namespace graphrag_tools_ext
+
+// =============================================================================
+// Slice H - Binary registry & capability tools (H13, H14).
+// =============================================================================
+namespace binary_tools_ext
+{
+
+namespace
+{
+    using nlohmann::json;
+
+    tool_result_t handle_binary_list_registered(const json&)
+    {
+        auto entries = aida_db::AnalysisDB::instance().list_registered_binaries();
+        json out = json::array();
+        for (auto& e : entries)
+        {
+            json je;
+            je["hash"]                = e.hash;
+            je["first_seen_ms"]       = e.first_seen_ms;
+            je["last_seen_ms"]        = e.last_seen_ms;
+            je["has_graph"]           = e.has_graph;
+            je["has_vectors"]         = e.has_vectors;
+            je["fingerprint_summary"] = e.fingerprint_summary;
+            out.push_back(std::move(je));
+        }
+        return tool_result_t::ok(
+            OBFSTR("binary_list_registered: ") + std::to_string(out.size()) + OBFSTR(" binaries"),
+            out);
+    }
+
+    struct iat_collector_state_t
+    {
+        // import_name -> { module, callsites:[{ea, func_ea, func_name}] }
+        std::unordered_map<std::string, json> entries;
+        std::string current_module;
+        const std::vector<std::string>* filter_apis = nullptr;
+    };
+
+    static int idaapi iat_walk_cb(ea_t ea, const char* name, uval_t, void* p)
+    {
+        if (!name) return 1;
+        auto* st = static_cast<iat_collector_state_t*>(p);
+        std::string nm = name;
+        if (st->filter_apis && !st->filter_apis->empty())
+        {
+            bool match = false;
+            for (auto& f : *st->filter_apis) if (f == nm) { match = true; break; }
+            if (!match) return 1;
+        }
+
+        json& e = st->entries[nm];
+        if (e.is_null())
+        {
+            e = json::object();
+            e["module"] = st->current_module;
+            e["callsite_count"] = 0;
+            e["callsites"] = json::array();
+        }
+
+        xrefblk_t xb;
+        for (bool ok = xb.first_to(ea, XREF_ALL); ok; ok = xb.next_to())
+        {
+            json cs;
+            cs["ea"] = xb.from;
+            func_t* pfn = get_func(xb.from);
+            cs["func_ea"]   = pfn ? pfn->start_ea : BADADDR;
+            qstring fn;
+            if (pfn) get_func_name(&fn, pfn->start_ea);
+            cs["func_name"] = std::string(fn.c_str());
+            e["callsites"].push_back(std::move(cs));
+            e["callsite_count"] = e["callsite_count"].get<int>() + 1;
+        }
+        return 1;
+    }
+
+    tool_result_t handle_binary_capability_index(const json& params)
+    {
+        std::vector<std::string> filter_apis;
+        if (params.is_object() && params.contains("filter_apis") && params["filter_apis"].is_array())
+            for (auto& v : params["filter_apis"]) if (v.is_string()) filter_apis.push_back(v.get<std::string>());
+
+        iat_collector_state_t st;
+        st.filter_apis = filter_apis.empty() ? nullptr : &filter_apis;
+
+        uint nmod = get_import_module_qty();
+        for (uint m = 0; m < nmod; ++m)
+        {
+            qstring mbuf;
+            if (!get_import_module_name(&mbuf, m)) continue;
+            st.current_module = mbuf.c_str();
+            enum_import_names(m, iat_walk_cb, &st);
+        }
+
+        json out = json::object();
+        for (auto& [k, v] : st.entries) out[k] = v;
+        return tool_result_t::ok(
+            OBFSTR("binary_capability_index: ") + std::to_string(st.entries.size()) + OBFSTR(" imports"),
+            out);
+    }
+
+} // namespace (anonymous)
+
+void register_tools()
+{
+    auto& reg = ToolRegistry::instance();
+    auto add = [&](std::string nm, std::string cat, std::string desc,
+                   std::vector<tool_param_t> p,
+                   std::function<tool_result_t(const json&)> h,
+                   bool read_only, bool deterministic,
+                   const std::vector<std::string>& required_indices)
+    {
+        tool_definition_t def;
+        def.name = std::move(nm);
+        def.category = std::move(cat);
+        def.description = std::move(desc);
+        def.parameters = std::move(p);
+        def.handler = std::move(h);
+        def.read_only = read_only;
+        def.destructive = false;
+        def.deterministic = deterministic;
+        def.required_indices = required_indices;
+        reg.register_tool(def);
+    };
+
+    add(OBFSTR_C("binary_list_registered"), OBFSTR_C("binary"),
+        OBFSTR_C("List binaries that have ever been registered with the analysis DB. "
+                 "Each record carries the hash, first/last seen timestamps, graph "
+                 "and vector availability flags, and a fingerprint summary."),
+        {},
+        handle_binary_list_registered,
+        true, true, {});
+
+    add(OBFSTR_C("binary_capability_index"), OBFSTR_C("binary"),
+        OBFSTR_C("Inverted IAT view: import_name -> {module, callsite_count, "
+                 "callsites:[{ea, func_ea, func_name}]}. Optional filter_apis "
+                 "scopes to a named subset."),
+        {
+            {OBFSTR("filter_apis"), OBFSTR("array"), OBFSTR("Optional list of API names."), false},
+        },
+        handle_binary_capability_index,
+        true, true, {});
+}
+
+} // namespace binary_tools_ext
 
 }

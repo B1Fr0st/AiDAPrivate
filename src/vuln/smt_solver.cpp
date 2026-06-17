@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <utility>
 
@@ -726,6 +727,11 @@ solve_result_t SmtContext::check_with_timeout(uint32_t timeout_ms)
 
 std::optional<uint64_t> SmtContext::max_value_bv(const std::string& var, int width)
 {
+    return max_value_bv(var, width, 0);
+}
+
+std::optional<uint64_t> SmtContext::max_value_bv(const std::string& var, int width, uint32_t timeout_ms)
+{
     if (!is_available())
     {
         if (m_impl) m_impl->last_err = k_unavailable;
@@ -751,6 +757,12 @@ std::optional<uint64_t> SmtContext::max_value_bv(const std::string& var, int wid
     try
     {
         z3::optimize opt(m_impl->ctx);
+        if (timeout_ms > 0)
+        {
+            z3::params p(m_impl->ctx);
+            p.set(":timeout", static_cast<unsigned>(timeout_ms));
+            opt.set(p);
+        }
         z3::expr_vector cur = m_impl->solver->assertions();
         for (unsigned i = 0; i < cur.size(); ++i)
             opt.add(cur[i]);
@@ -779,6 +791,11 @@ std::optional<uint64_t> SmtContext::max_value_bv(const std::string& var, int wid
 
 std::optional<uint64_t> SmtContext::min_value_bv(const std::string& var, int width)
 {
+    return min_value_bv(var, width, 0);
+}
+
+std::optional<uint64_t> SmtContext::min_value_bv(const std::string& var, int width, uint32_t timeout_ms)
+{
     if (!is_available())
     {
         if (m_impl) m_impl->last_err = k_unavailable;
@@ -804,6 +821,12 @@ std::optional<uint64_t> SmtContext::min_value_bv(const std::string& var, int wid
     try
     {
         z3::optimize opt(m_impl->ctx);
+        if (timeout_ms > 0)
+        {
+            z3::params p(m_impl->ctx);
+            p.set(":timeout", static_cast<unsigned>(timeout_ms));
+            opt.set(p);
+        }
         z3::expr_vector cur = m_impl->solver->assertions();
         for (unsigned i = 0; i < cur.size(); ++i)
             opt.add(cur[i]);
@@ -836,6 +859,21 @@ std::string SmtContext::to_smtlib2() const
         return std::string();
     std::lock_guard<std::mutex> lk(m_impl->mtx);
     return solver_to_smtlib2(*m_impl->solver);
+}
+
+SmtContextPool::SmtContextPool(uint32_t default_timeout_ms)
+    : m_default_timeout_ms(default_timeout_ms == 0 ? 5000 : default_timeout_ms)
+{
+}
+
+std::unique_ptr<SmtContext> SmtContextPool::create_context() const
+{
+    return std::make_unique<SmtContext>();
+}
+
+uint32_t SmtContextPool::default_timeout_ms() const
+{
+    return m_default_timeout_ms;
 }
 
 bool SmtContext::smtlib2_quick_check(const std::string& formula,

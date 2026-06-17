@@ -461,6 +461,224 @@ inline std::vector<uint32_t> collect_ioctl_codes(ea_t handler_ea)
     return scan_ioctl_codes_disasm(handler_ea);
 }
 
+inline ea_t read_ptr_kernel(ea_t ea)
+{
+    if (ea == BADADDR || !is_loaded(ea))
+        return BADADDR;
+    return inf_is_64bit() ? static_cast<ea_t>(get_qword(ea)) : static_cast<ea_t>(get_dword(ea));
+}
+
+inline bool valid_func_start_kernel(ea_t ea)
+{
+    if (ea == BADADDR || !is_loaded(ea))
+        return false;
+    func_t* pfn = get_func(ea);
+    return pfn != nullptr && pfn->start_ea == ea;
+}
+
+inline void add_handler_record(std::vector<ioctl_handler_t>& result,
+                               std::unordered_set<ea_t>& seen,
+                               ea_t handler_ea,
+                               const std::string& source,
+                               const std::string& evidence,
+                               uint32_t major,
+                               const std::vector<std::string>& metadata)
+{
+    if (!valid_func_start_kernel(handler_ea))
+        return;
+    if (!seen.insert(handler_ea).second)
+        return;
+    ioctl_handler_t h;
+    h.handler_ea = handler_ea;
+    h.handler_name = format_address_string(handler_ea);
+    qstring nm;
+    if (get_func_name(&nm, handler_ea) > 0 && !nm.empty())
+        h.handler_name = nm.c_str();
+    h.ioctl_codes = collect_ioctl_codes(handler_ea);
+    h.source_model = source;
+    h.evidence = evidence;
+    h.major_function = major;
+    h.fallback_metadata = metadata;
+    result.push_back(std::move(h));
+}
+
+inline ea_t object_arg_from_call(ea_t func_ea, ea_t call_ea, int arg_idx)
+{
+    if (!init_hexrays_plugin())
+        return BADADDR;
+    func_t* pfn = get_func(func_ea);
+    if (pfn == nullptr || !ida_utils::is_safely_decompilable(pfn))
+        return BADADDR;
+    cfuncptr_t cf(nullptr);
+    try
+    {
+        cf = decompile_func(pfn, nullptr, DECOMP_NO_WAIT);
+    }
+    catch (...)
+    {
+        cf.reset();
+    }
+    if (!cf)
+        return BADADDR;
+    ea_t out = BADADDR;
+    struct object_arg_visitor_t : public ctree_visitor_t
+    {
+        ea_t call_ea = BADADDR;
+        int arg_idx = -1;
+        ea_t out = BADADDR;
+        object_arg_visitor_t(ea_t c, int a) : ctree_visitor_t(CV_FAST), call_ea(c), arg_idx(a) {}
+        int idaapi visit_expr(cexpr_t* e) override
+        {
+            if (e == nullptr || e->op != cot_call || e->ea != call_ea || e->a == nullptr)
+                return 0;
+            if (arg_idx < 0 || static_cast<std::size_t>(arg_idx) >= e->a->size())
+                return 0;
+            cexpr_t* arg = static_cast<cexpr_t*>(&(*e->a)[arg_idx]);
+            arg = skip_expr_casts(arg);
+            if (arg != nullptr && arg->op == cot_obj)
+            {
+                out = arg->obj_ea;
+                return 1;
+            }
+            return 0;
+        }
+    };
+    object_arg_visitor_t v(call_ea, arg_idx);
+    v.apply_to(&cf->body, nullptr);
+    out = v.out;
+    return out;
+}
+
+void collect_wdf_queue_handlers(std::vector<ioctl_handler_t>& result, std::unordered_set<ea_t>& seen)
+{
+    std::vector<std::string> names = {"WdfIoQueueCreate"};
+    std::vector<callsite_t> calls = aida::vuln::callsites::all_calls_to(names);
+    std::vector<std::string> metadata;
+    tid_t tid = get_named_type_tid("_WDF_IO_QUEUE_CONFIG");
+    if (tid == BADADDR || tid == 0)
+        metadata.push_back("wdf_named_type_missing_fallback_offsets");
+    else
+        metadata.push_back("wdf_named_type_present_offsets_still_cross_checked");
+    const ea_t ptrsz = inf_is_64bit() ? 8 : 4;
+    const std::vector<ea_t> offsets = {0x20, 0x28, 0x30, 0x38, 0x40, 0x48, 0x50, 0x58, 0x60, 0x68, 0x70, 0x78};
+    for (const auto& cs : calls)
+    {
+        ea_t cfg = object_arg_from_call(cs.func_ea, cs.call_ea, 1);
+        if (cfg == BADADDR)
+        {
+            std::vector<std::string> md = metadata;
+            md.push_back("wdf_config_arg_not_static_object");
+            add_handler_record(result, seen, cs.func_ea, "wdf_queue_create_fallback_caller",
+                               "WdfIoQueueCreate caller used as fallback handler", 0xFFFFFFFFu, md);
+            continue;
+        }
+        for (ea_t off : offsets)
+        {
+            ea_t h = read_ptr_kernel(cfg + off);
+            if (!valid_func_start_kernel(h))
+                continue;
+            std::vector<std::string> md = metadata;
+            std::ostringstream ev;
+            ev << "WDF_IO_QUEUE_CONFIG candidate at " << format_address_string(cfg)
+               << " offset 0x" << std::hex << std::uppercase << static_cast<std::uint64_t>(off);
+            add_handler_record(result, seen, h, "wdf_queue_config", ev.str(), 0xFFFFFFFFu, md);
+        }
+    }
+}
+
+struct fastio_assignment_visitor_t : public ctree_visitor_t
+{
+    std::vector<ea_t> handlers;
+    cfunc_t* cfunc = nullptr;
+    fastio_assignment_visitor_t(cfunc_t* cf) : ctree_visitor_t(CV_FAST), cfunc(cf) {}
+    int idaapi visit_expr(cexpr_t* e) override
+    {
+        if (e == nullptr || e->op != cot_asg || e->x == nullptr || e->y == nullptr)
+            return 0;
+        qstring lhs;
+        e->x->print1(&lhs, cfunc);
+        tag_remove(&lhs);
+        std::string s = lhs.c_str();
+        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (s.find("fastio") == std::string::npos)
+            return 0;
+        cexpr_t* rhs = skip_expr_casts(e->y);
+        if (rhs != nullptr && rhs->op == cot_obj && valid_func_start_kernel(rhs->obj_ea))
+            handlers.push_back(rhs->obj_ea);
+        return 0;
+    }
+};
+
+void collect_fastio_handlers(std::vector<ioctl_handler_t>& result, std::unordered_set<ea_t>& seen)
+{
+    if (!init_hexrays_plugin())
+        return;
+    const size_t fq = get_func_qty();
+    for (size_t i = 0; i < fq; ++i)
+    {
+        func_t* pfn = getn_func(i);
+        if (pfn == nullptr || !ida_utils::is_safely_decompilable(pfn))
+            continue;
+        cfuncptr_t cf(nullptr);
+        try
+        {
+            cf = decompile_func(pfn, nullptr, DECOMP_NO_WAIT);
+        }
+        catch (...)
+        {
+            cf.reset();
+        }
+        if (!cf)
+            continue;
+        fastio_assignment_visitor_t v(cf.operator->());
+        v.apply_to(&cf->body, nullptr);
+        for (ea_t h : v.handlers)
+            add_handler_record(result, seen, h, "fastio_dispatch", "FastIoDispatch assignment", 0xFFFFFFFFu, {});
+    }
+}
+
+void collect_minifilter_handlers(std::vector<ioctl_handler_t>& result, std::unordered_set<ea_t>& seen)
+{
+    std::vector<callsite_t> calls = aida::vuln::callsites::all_calls_to({"FltRegisterFilter"});
+    const ea_t ptrsz = inf_is_64bit() ? 8 : 4;
+    const std::vector<ea_t> reg_offsets = {0x20, 0x28, 0x30, 0x38, 0x40, 0x48, 0x50};
+    for (const auto& cs : calls)
+    {
+        ea_t reg = object_arg_from_call(cs.func_ea, cs.call_ea, 1);
+        if (reg == BADADDR)
+        {
+            add_handler_record(result, seen, cs.func_ea, "minifilter_fallback_caller",
+                               "FltRegisterFilter registration object not statically resolved", 0xFFFFFFFFu,
+                               {"flt_registration_arg_not_static_object"});
+            continue;
+        }
+        for (ea_t off : reg_offsets)
+        {
+            ea_t ops = read_ptr_kernel(reg + off);
+            if (ops == BADADDR || !is_loaded(ops))
+                continue;
+            for (int i = 0; i < 128; ++i)
+            {
+                ea_t entry = ops + static_cast<ea_t>(i) * (ptrsz * 4);
+                if (!is_loaded(entry))
+                    break;
+                uint32_t major = get_dword(entry);
+                if (major == 0xFFFFFFFFu)
+                    break;
+                if (major > 0x1Bu)
+                    continue;
+                ea_t pre = read_ptr_kernel(entry + ptrsz);
+                ea_t post = read_ptr_kernel(entry + ptrsz * 2);
+                std::ostringstream ev;
+                ev << "FLT_OPERATION_REGISTRATION candidate at " << format_address_string(entry)
+                   << " major " << major;
+                add_handler_record(result, seen, pre, "minifilter_preop", ev.str(), major, {});
+                add_handler_record(result, seen, post, "minifilter_postop", ev.str(), major, {});
+            }
+        }
+    }
+}
+
 struct user_pointer_use_t
 {
     ea_t        deref_ea = BADADDR;
@@ -705,42 +923,55 @@ std::vector<ioctl_handler_t> find_ioctl_handlers()
     std::vector<ioctl_handler_t> result;
     if (!is_kernel_driver())
         return result;
+    std::unordered_set<ea_t> seen_handlers;
     if (!init_hexrays_plugin())
         return result;
     ea_t entry_ea = locate_driver_entry();
     if (entry_ea == BADADDR)
+    {
+        collect_wdf_queue_handlers(result, seen_handlers);
+        collect_fastio_handlers(result, seen_handlers);
+        collect_minifilter_handlers(result, seen_handlers);
         return result;
+    }
     func_t* pfn = get_func(entry_ea);
-    if (pfn == nullptr)
-        return result;
-    if (!ida_utils::is_safely_decompilable(pfn))
-        return result;
-    cfuncptr_t cfunc(nullptr);
-    try
+    if (pfn != nullptr && ida_utils::is_safely_decompilable(pfn))
     {
-        cfunc = decompile_func(pfn, nullptr, DECOMP_NO_WAIT);
+        cfuncptr_t cfunc(nullptr);
+        try
+        {
+            cfunc = decompile_func(pfn, nullptr, DECOMP_NO_WAIT);
+        }
+        catch (const vd_failure_t&)
+        {
+            cfunc.reset();
+        }
+        catch (...)
+        {
+            cfunc.reset();
+        }
+        if (cfunc != nullptr)
+        {
+            dispatch_collector_t collector;
+            collector.apply_to(&cfunc->body, nullptr);
+            result.reserve(collector.handlers.size());
+            for (auto& kv : collector.handlers)
+            {
+                ioctl_handler_t h = std::move(kv.second);
+                if (!seen_handlers.insert(h.handler_ea).second)
+                    continue;
+                h.ioctl_codes = collect_ioctl_codes(h.handler_ea);
+                h.source_model = "driver_object_major_function";
+                h.evidence = "DriverObject->MajorFunction assignment";
+                if (h.major_function == 0xFFFFFFFFu)
+                    h.major_function = IRP_MJ_DEVICE_CONTROL_INDEX;
+                result.push_back(std::move(h));
+            }
+        }
     }
-    catch (const vd_failure_t&)
-    {
-        cfunc.reset();
-    }
-    catch (...)
-    {
-        cfunc.reset();
-    }
-    if (cfunc == nullptr)
-        return result;
-    dispatch_collector_t collector;
-    collector.apply_to(&cfunc->body, nullptr);
-    if (collector.handlers.empty())
-        return result;
-    result.reserve(collector.handlers.size());
-    for (auto& kv : collector.handlers)
-    {
-        ioctl_handler_t h = std::move(kv.second);
-        h.ioctl_codes = collect_ioctl_codes(h.handler_ea);
-        result.push_back(std::move(h));
-    }
+    collect_wdf_queue_handlers(result, seen_handlers);
+    collect_fastio_handlers(result, seen_handlers);
+    collect_minifilter_handlers(result, seen_handlers);
     std::sort(result.begin(), result.end(), [](const ioctl_handler_t& a, const ioctl_handler_t& b) {
         return a.handler_ea < b.handler_ea;
     });
@@ -985,6 +1216,10 @@ agent_tools::tool_result_t handle_find_kernel_ioctl_handlers(const nlohmann::jso
         nlohmann::json hj;
         hj["handler_ea"] = format_address_string(h.handler_ea);
         hj["name"] = h.handler_name;
+        hj["source_model"] = h.source_model;
+        hj["evidence"] = h.evidence;
+        hj["major_function"] = h.major_function;
+        hj["fallback_metadata"] = h.fallback_metadata;
         nlohmann::json codes = nlohmann::json::array();
         for (uint32_t c : h.ioctl_codes)
             codes.push_back(decoded_to_json(decode_ioctl(c)));

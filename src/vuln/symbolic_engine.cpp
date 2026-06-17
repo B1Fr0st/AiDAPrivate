@@ -9,6 +9,8 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <queue>
+#include <set>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -18,8 +20,11 @@
 
 #include <hexrays.hpp>
 #include <ida.hpp>
+#include <funcs.hpp>
+#include <kernwin.hpp>
 #include <name.hpp>
 #include <pro.h>
+#include <tryblks.hpp>
 
 #include "microcode_engine.hpp"
 #include "smt_solver.hpp"
@@ -209,6 +214,77 @@ int op_size_to_bits(int op_size)
 bool is_branch_opcode(mcode_t op)
 {
     return is_mcode_jcond(op);
+}
+
+bool block_has_noret_call_tail(const mblock_t& blk)
+{
+    const minsn_t* tail = blk.tail;
+    if (tail == nullptr || !is_mcode_call(tail->opcode))
+        return false;
+    ea_t callee = BADADDR;
+    std::string name;
+    if (!aida::vuln::microcode::resolve_call_target(*tail, callee, name) || callee == BADADDR)
+        return false;
+    return !func_does_return(callee);
+}
+
+bool range_contains_ea(const rangevec_t& ranges, ea_t ea)
+{
+    for (size_t i = 0; i < ranges.size(); ++i)
+    {
+        if (ranges[i].contains(ea))
+            return true;
+    }
+    return false;
+}
+
+bool seh_handler_contains_ea(const tryblk_t& tb, ea_t ea)
+{
+    if (tb.is_seh())
+    {
+        const seh_t& seh = tb.seh();
+        if (range_contains_ea(seh, ea))
+            return true;
+        if (range_contains_ea(seh.filter, ea))
+            return true;
+        return false;
+    }
+    if (tb.is_cpp())
+    {
+        const catchvec_t& catches = tb.cpp();
+        for (size_t i = 0; i < catches.size(); ++i)
+        {
+            if (range_contains_ea(catches[i], ea))
+                return true;
+        }
+    }
+    return false;
+}
+
+bool path_reaches_seh_handler(func_t* pfn, const std::vector<int>& path_blocks, const mba_t& mba, ea_t target_ea)
+{
+    if (pfn == nullptr)
+        return false;
+    tryblks_t tbv;
+    range_t fr(pfn->start_ea, pfn->end_ea);
+    if (get_tryblks(&tbv, fr) == 0)
+        return false;
+    for (size_t i = 0; i < tbv.size(); ++i)
+    {
+        const tryblk_t& tb = tbv[i];
+        if (!seh_handler_contains_ea(tb, target_ea))
+            continue;
+        for (int serial : path_blocks)
+        {
+            const mblock_t* blk = mba.get_mblock(static_cast<uint>(serial));
+            if (blk == nullptr)
+                continue;
+            if (seh_handler_contains_ea(tb, blk->start) || seh_handler_contains_ea(tb, blk->end))
+                return true;
+        }
+        return true;
+    }
+    return false;
 }
 
 }
@@ -1085,7 +1161,7 @@ const char* SymbolicEngine::last_error() const
     return m_impl->last_err.c_str();
 }
 
-bool SymbolicEngine::load_function(ea_t func_ea)
+bool SymbolicEngine::load_function(ea_t func_ea, mba_maturity_t mat)
 {
     if (!m_impl)
         return false;
@@ -1100,7 +1176,7 @@ bool SymbolicEngine::load_function(ea_t func_ea)
 
     try
     {
-        auto handle_opt = aida::vuln::microcode::generate(func_ea, MMAT_LVARS);
+        auto handle_opt = aida::vuln::microcode::generate(func_ea, mat);
         if (!handle_opt.has_value())
         {
             m_impl->last_err = "microcode generation failed";
@@ -1176,33 +1252,115 @@ std::vector<path_constraint_t> SymbolicEngine::collect_path_to(ea_t target_ea, i
     if (!m_impl->find_block_for_ea(*mba_ptr, target_ea, target_serial))
         return out;
 
-    std::unordered_set<int> visited;
-    std::vector<int> path_blocks;
-    int cur = target_serial;
-    int safety = 0;
-    while (cur >= 0 && safety < mba_ptr->qty + 16)
+    mbl_graph_t* graph = mba_ptr->get_graph();
+    if (graph == nullptr)
+        return out;
+
+    graph_chains_t* ud_raw = graph->get_ud(GC_REGS_AND_STKVARS);
+    graph_chains_t* du_raw = graph->get_du(GC_REGS_AND_STKVARS);
+    std::unique_ptr<chain_keeper_t> ud_keeper;
+    std::unique_ptr<chain_keeper_t> du_keeper;
+    if (ud_raw != nullptr)
+        ud_keeper = std::make_unique<chain_keeper_t>(ud_raw);
+    if (du_raw != nullptr)
+        du_keeper = std::make_unique<chain_keeper_t>(du_raw);
+
+    array_of_node_bitset_t dominators;
+    graph->compute_dominators(dominators, false);
+
+    std::vector<int> parent(static_cast<size_t>(mba_ptr->qty), -1);
+    std::vector<unsigned char> visited(static_cast<size_t>(mba_ptr->qty), 0);
+    std::queue<int> q;
+    if (mba_ptr->qty <= 0)
+        return out;
+    q.push(0);
+    visited[0] = 1;
+
+    while (!q.empty())
     {
-        if (visited.find(cur) != visited.end())
+        if (user_cancelled())
             break;
-        visited.insert(cur);
-        path_blocks.push_back(cur);
+        int cur = q.front();
+        q.pop();
+        if (cur == target_serial)
+            break;
         const mblock_t* blk = mba_ptr->get_mblock(static_cast<uint>(cur));
         if (blk == nullptr)
-            break;
-        if (blk->predset.size() == 0)
-            break;
-        int next_pred = blk->predset[0];
-        for (size_t pi = 1; pi < blk->predset.size(); ++pi)
+            continue;
+        if (block_has_noret_call_tail(*blk))
+            continue;
+
+        std::vector<int> succs;
+        const int nsucc = graph->nsucc(cur);
+        succs.reserve(static_cast<size_t>(nsucc));
+        for (int si = 0; si < nsucc; ++si)
         {
-            int candidate = blk->predset[pi];
-            if (candidate < next_pred)
-                next_pred = candidate;
+            int succ = graph->succ(cur, si);
+            if (succ >= 0 && succ < mba_ptr->qty)
+                succs.push_back(succ);
         }
-        cur = next_pred;
-        ++safety;
+        auto reaches_target = [&](int start) -> bool {
+            if (start == target_serial)
+                return true;
+            if (start < 0 || start >= mba_ptr->qty)
+                return false;
+            std::vector<unsigned char> seen(static_cast<size_t>(mba_ptr->qty), 0);
+            std::queue<int> rq;
+            seen[static_cast<size_t>(start)] = 1;
+            rq.push(start);
+            while (!rq.empty())
+            {
+                int node = rq.front();
+                rq.pop();
+                const int node_succs = graph->nsucc(node);
+                for (int rsi = 0; rsi < node_succs; ++rsi)
+                {
+                    int next = graph->succ(node, rsi);
+                    if (next == target_serial)
+                        return true;
+                    if (next < 0 || next >= mba_ptr->qty || seen[static_cast<size_t>(next)])
+                        continue;
+                    seen[static_cast<size_t>(next)] = 1;
+                    rq.push(next);
+                }
+            }
+            return false;
+        };
+        std::stable_sort(succs.begin(), succs.end(), [&](int a, int b) {
+            const bool a_dom_target = static_cast<size_t>(target_serial) < dominators.size() && dominators[target_serial].has(a);
+            const bool b_dom_target = static_cast<size_t>(target_serial) < dominators.size() && dominators[target_serial].has(b);
+            if (a_dom_target != b_dom_target)
+                return a_dom_target;
+            const bool a_reaches = reaches_target(a);
+            const bool b_reaches = reaches_target(b);
+            if (a_reaches != b_reaches)
+                return a_reaches;
+            return a < b;
+        });
+        for (int succ : succs)
+        {
+            if (visited[succ])
+                continue;
+            if (!reaches_target(succ) && succ != target_serial)
+                continue;
+            visited[succ] = 1;
+            parent[succ] = cur;
+            q.push(succ);
+        }
     }
 
+    if (!visited[target_serial])
+        return out;
+
+    std::vector<int> path_blocks;
+    for (int cur = target_serial; cur >= 0; cur = parent[cur])
+    {
+        path_blocks.push_back(cur);
+        if (cur == 0)
+            break;
+    }
     std::reverse(path_blocks.begin(), path_blocks.end());
+    const bool via_seh = path_reaches_seh_handler(get_func(m_impl->loaded_func), path_blocks, *mba_ptr, target_ea);
 
     for (size_t i = 0; i + 1 < path_blocks.size(); ++i)
     {
@@ -1225,6 +1383,7 @@ std::vector<path_constraint_t> SymbolicEngine::collect_path_to(ea_t target_ea, i
         auto ea_it = m_impl->block_branch_eas.find(from);
         pc.branch_ea = ea_it != m_impl->block_branch_eas.end() ? ea_it->second : BADADDR;
         pc.taken     = taken;
+        pc.via_seh_handler = via_seh;
 
         try
         {
@@ -1250,6 +1409,138 @@ std::vector<path_constraint_t> SymbolicEngine::collect_path_to(ea_t target_ea, i
     }
 
     return out;
+}
+
+std::string SymbolicEngine::path_smtlib2(ea_t target_ea, int max_branches)
+{
+    auto pcs = collect_path_to(target_ea, max_branches);
+    std::ostringstream ss;
+    ss << "(set-logic QF_BV)\n";
+    std::set<std::string> declared;
+    for (const auto& pc : pcs)
+    {
+        const std::string& text = pc.predicate_smt2;
+        for (size_t i = 0; i < text.size();)
+        {
+            unsigned char c = static_cast<unsigned char>(text[i]);
+            if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_'))
+            {
+                ++i;
+                continue;
+            }
+            size_t start = i++;
+            while (i < text.size())
+            {
+                unsigned char k = static_cast<unsigned char>(text[i]);
+                if (!((k >= 'A' && k <= 'Z') || (k >= 'a' && k <= 'z') ||
+                      (k >= '0' && k <= '9') || k == '_' || k == '!' || k == '.' || k == '@' || k == '$'))
+                    break;
+                ++i;
+            }
+            std::string token = text.substr(start, i - start);
+            if (token == "_" || token == "assert" || token == "not" || token == "and" || token == "or" ||
+                token == "true" || token == "false" || token == "bvult" || token == "bvule" ||
+                token == "bvugt" || token == "bvuge" || token == "bvslt" || token == "bvsle" ||
+                token == "bvsgt" || token == "bvsge" || token == "bvadd" || token == "bvsub" ||
+                token == "bvmul" || token == "concat" || token == "extract" || token == "BitVec" ||
+                token == "let" || token == "ite" || token == "zero_extend" || token == "sign_extend")
+            {
+                continue;
+            }
+            if (token.size() > 2 && token[0] == 'b' && token[1] == 'v')
+                continue;
+            if (declared.insert(token).second)
+                ss << "(declare-const " << token << " (_ BitVec " << kDefaultBitWidth << "))\n";
+        }
+    }
+    for (const auto& pc : pcs)
+    {
+        if (pc.predicate_smt2.empty() || pc.predicate_smt2.find("<smt-error>") != std::string::npos)
+            continue;
+        ss << "(assert " << pc.predicate_smt2 << ")\n";
+    }
+    ss << "(check-sat)\n(get-model)\n";
+    return ss.str();
+}
+
+smt::solve_result_t SymbolicEngine::solve_path_to(ea_t target_ea,
+                                                  const std::string& extra_smtlib2_assertions,
+                                                  uint32_t timeout_ms,
+                                                  int max_branches)
+{
+    smt::solve_result_t out;
+    auto formula = path_smtlib2(target_ea, max_branches);
+    smt::SmtContext local;
+    if (!local.is_available())
+    {
+        out.result = smt::result_t::unknown;
+        out.reason = local.last_error() != nullptr ? std::string(local.last_error()) : std::string("smt unavailable");
+        return out;
+    }
+    if (!local.assert_smtlib2(formula))
+    {
+        smt::result_t quick = smt::result_t::unknown;
+        if (smt::SmtContext::smtlib2_quick_check(formula + "\n" + extra_smtlib2_assertions, quick, timeout_ms))
+        {
+            out.result = quick;
+            out.reason = "quick-check fallback";
+            return out;
+        }
+        out.result = smt::result_t::unknown;
+        out.reason = local.last_error() != nullptr ? std::string(local.last_error()) : std::string("smtlib assert failed");
+        out.smtlib_dump = formula;
+        return out;
+    }
+    if (!extra_smtlib2_assertions.empty() && !local.assert_smtlib2(extra_smtlib2_assertions))
+    {
+        out.result = smt::result_t::unknown;
+        out.reason = local.last_error() != nullptr ? std::string(local.last_error()) : std::string("extra assertions failed");
+        out.smtlib_dump = local.to_smtlib2();
+        return out;
+    }
+    return local.check_with_timeout(timeout_ms);
+}
+
+bool SymbolicEngine::constrain_taint_source_at(ea_t source_ea)
+{
+    if (!m_impl || !m_impl->available || !m_impl->mba_handle.has_value())
+        return false;
+    mba_t* mba_ptr = m_impl->mba_handle->mba.get();
+    if (mba_ptr == nullptr)
+        return false;
+    for (int i = 0; i < mba_ptr->qty; ++i)
+    {
+        const mblock_t* blk = mba_ptr->get_mblock(static_cast<uint>(i));
+        if (blk == nullptr)
+            continue;
+        for (const minsn_t* m = blk->head; m != nullptr; m = m->next)
+        {
+            if (m->ea != source_ea)
+                continue;
+            triton::ast::SharedAbstractNode node = m_impl->mop_to_ast(m->d, 0);
+            if (!node)
+                node = m_impl->minsn_to_ast(*m, 0);
+            if (!node)
+                return false;
+            path_constraint_t pc;
+            pc.branch_ea = source_ea;
+            pc.taken = true;
+            try
+            {
+                std::string s = clamp_text(node->str());
+                pc.predicate_smt2 = "(= " + s + " " + s + ")";
+                pc.predicate_text = "source symbolic at " + ea_to_hex(source_ea);
+            }
+            catch (...)
+            {
+                pc.predicate_smt2 = "true";
+                pc.predicate_text = "source symbolic at " + ea_to_hex(source_ea);
+            }
+            m_impl->all_constraints.push_back(std::move(pc));
+            return true;
+        }
+    }
+    return false;
 }
 
 std::vector<path_constraint_t> SymbolicEngine::all_path_constraints(int limit)
@@ -1745,7 +2036,9 @@ simplification_t SymbolicEngine::simplify_subtree_at(ea_t insn_ea, const std::st
     return out;
 }
 
-alias_proof_t SymbolicEngine::prove_alias(const std::string& ptr1_spec, const std::string& ptr2_spec)
+alias_proof_t SymbolicEngine::prove_alias(const std::string& ptr1_spec,
+                                          const std::string& ptr2_spec,
+                                          uint32_t timeout_ms)
 {
     alias_proof_t out;
     if (!m_impl || !m_impl->available || !m_impl->mba_handle.has_value())
@@ -1772,6 +2065,8 @@ alias_proof_t SymbolicEngine::prove_alias(const std::string& ptr1_spec, const st
             out.must_alias = true;
             out.may_alias  = true;
             out.no_alias   = false;
+            out.verdict = alias_proof_t::verdict_t::must_alias;
+            out.verdict_label = "must_alias";
             out.reason     = "both concrete and equal";
         }
         else
@@ -1779,6 +2074,8 @@ alias_proof_t SymbolicEngine::prove_alias(const std::string& ptr1_spec, const st
             out.must_alias = false;
             out.may_alias  = false;
             out.no_alias   = true;
+            out.verdict = alias_proof_t::verdict_t::no_alias;
+            out.verdict_label = "no_alias";
             out.reason     = "both concrete and distinct";
         }
         return out;
@@ -1815,7 +2112,7 @@ alias_proof_t SymbolicEngine::prove_alias(const std::string& ptr1_spec, const st
         out.reason = std::string("assert eq failed: ") + (smt.last_error() ? smt.last_error() : "?");
         return out;
     }
-    auto r_eq = smt.check_with_timeout(5000);
+    auto r_eq = smt.check_with_timeout(timeout_ms == 0 ? 5000 : timeout_ms);
     bool eq_sat = r_eq.result == aida::vuln::smt::result_t::sat;
     bool eq_unsat = r_eq.result == aida::vuln::smt::result_t::unsat;
 
@@ -1847,7 +2144,7 @@ alias_proof_t SymbolicEngine::prove_alias(const std::string& ptr1_spec, const st
     neq_formula << "(assert (not (= " << ptr_a << " " << ptr_b << ")))";
     if (smt.assert_smtlib2(neq_formula.str()))
     {
-        auto r_neq = smt.check_with_timeout(5000);
+        auto r_neq = smt.check_with_timeout(timeout_ms == 0 ? 5000 : timeout_ms);
         if (r_neq.result == aida::vuln::smt::result_t::unsat)
         {
             out.must_alias = true;
@@ -1865,6 +2162,27 @@ alias_proof_t SymbolicEngine::prove_alias(const std::string& ptr1_spec, const st
     {
         out.no_alias = true;
         out.may_alias = false;
+    }
+
+    if (out.must_alias)
+    {
+        out.verdict = alias_proof_t::verdict_t::must_alias;
+        out.verdict_label = "must_alias";
+    }
+    else if (out.no_alias)
+    {
+        out.verdict = alias_proof_t::verdict_t::no_alias;
+        out.verdict_label = "no_alias";
+    }
+    else if (out.may_alias)
+    {
+        out.verdict = alias_proof_t::verdict_t::may_alias;
+        out.verdict_label = "may_alias";
+    }
+    else
+    {
+        out.verdict = alias_proof_t::verdict_t::inconclusive;
+        out.verdict_label = "inconclusive";
     }
 
     std::ostringstream rs;
@@ -1965,6 +2283,7 @@ nlohmann::json to_json(const path_constraint_t& c)
     nlohmann::json j;
     j["branch_ea"] = ea_to_hex(c.branch_ea);
     j["taken"]     = c.taken;
+    j["via_seh_handler"] = c.via_seh_handler;
     j["smt2"]      = clamp_text(c.predicate_smt2);
     j["text"]      = clamp_text(c.predicate_text);
     return j;
@@ -1998,6 +2317,7 @@ nlohmann::json to_json(const alias_proof_t& a)
     j["must_alias"]     = a.must_alias;
     j["may_alias"]      = a.may_alias;
     j["no_alias"]       = a.no_alias;
+    j["verdict"]        = a.verdict_label.empty() ? std::string("inconclusive") : a.verdict_label;
     j["ptr1_concrete"]  = a.ptr1_concrete;
     j["ptr2_concrete"]  = a.ptr2_concrete;
     j["have_witness"]   = a.have_witness;

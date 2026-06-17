@@ -156,6 +156,7 @@ bool                     s_server_started = false;
 bool                     s_initialized    = false;
 bool                     s_mcp_tools_registered = false;
 std::atomic<bool>        s_ide_ready_for_mcp_services{false};
+std::atomic<bool>        s_mcp_shutdown_in_flight{false};
 
 
 bool                  s_mcp_clients_connected = false;
@@ -173,6 +174,76 @@ struct tool_approval_t {
 tool_approval_t s_tool_approval;
 
 thread_local std::string t_tool_approval_deny_reason;
+
+void queue_mcp_services_shutdown(const char* reason, bool stop_server, bool disconnect_clients)
+{
+    if (!stop_server && !disconnect_clients)
+        return;
+
+    const bool already = s_mcp_shutdown_in_flight.exchange(true, std::memory_order_acq_rel);
+    if (already) {
+        diag::log_tagged_fmt("init_chat",
+            "authorized_mcp_services_shutdown_already_in_flight reason=%s stop_server=%d disconnect_clients=%d",
+            reason ? reason : "<null>",
+            stop_server ? 1 : 0,
+            disconnect_clients ? 1 : 0);
+        return;
+    }
+
+    std::string reason_copy = reason ? reason : "unknown";
+    auto task = [reason_copy, stop_server, disconnect_clients]() {
+        const uint64_t started = static_cast<uint64_t>(GetTickCount64());
+        diag::log_tagged_fmt("init_chat",
+            "authorized_mcp_services_shutdown_worker_enter reason=%s stop_server=%d disconnect_clients=%d tid=%lu",
+            reason_copy.c_str(),
+            stop_server ? 1 : 0,
+            disconnect_clients ? 1 : 0,
+            GetCurrentThreadId());
+        try {
+            if (stop_server) {
+                diag::log_tagged("init_chat", "authorized_mcp_server_stop_worker_start");
+                s_mcp_server.stop();
+                diag::log_tagged("init_chat", "authorized_mcp_server_stop_worker_done");
+            }
+        } catch (const std::exception& e) {
+            diag::log_tagged_fmt("init_chat", "authorized_mcp_server_stop_worker_exception what=%s", e.what());
+        } catch (...) {
+            diag::log_tagged("init_chat", "authorized_mcp_server_stop_worker_exception what=<unknown>");
+        }
+
+        try {
+            if (disconnect_clients) {
+                diag::log_tagged("init_chat", "authorized_mcp_client_disconnect_worker_start");
+                s_mcp_client_mgr.disconnect_all();
+                diag::log_tagged("init_chat", "authorized_mcp_client_disconnect_worker_done");
+            }
+        } catch (const std::exception& e) {
+            diag::log_tagged_fmt("init_chat", "authorized_mcp_client_disconnect_worker_exception what=%s", e.what());
+        } catch (...) {
+            diag::log_tagged("init_chat", "authorized_mcp_client_disconnect_worker_exception what=<unknown>");
+        }
+
+        s_mcp_shutdown_in_flight.store(false, std::memory_order_release);
+        diag::log_tagged_fmt("init_chat",
+            "authorized_mcp_services_shutdown_worker_exit reason=%s elapsed_ms=%llu",
+            reason_copy.c_str(),
+            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
+    };
+
+    bool posted = work_queue::post_service(task);
+    if (!posted)
+        posted = critical_work_queue::post(task);
+    if (!posted)
+        posted = work_queue::post(std::move(task));
+    if (!posted) {
+        s_mcp_shutdown_in_flight.store(false, std::memory_order_release);
+        diag::log_tagged_fmt("init_chat",
+            "authorized_mcp_services_shutdown_post_failed reason=%s stop_server=%d disconnect_clients=%d",
+            reason_copy.c_str(),
+            stop_server ? 1 : 0,
+            disconnect_clients ? 1 : 0);
+    }
+}
 
 const std::string& tool_approval_last_deny_reason()
 {
@@ -1885,6 +1956,18 @@ void start_authorized_mcp_services()
     if (!s_initialized)
         return;
 
+    if (s_mcp_shutdown_in_flight.load(std::memory_order_acquire)) {
+        static auto s_last_shutdown_wait_log = std::chrono::steady_clock::time_point{};
+        auto now = std::chrono::steady_clock::now();
+        if (s_last_shutdown_wait_log == std::chrono::steady_clock::time_point{} ||
+            std::chrono::duration_cast<std::chrono::seconds>(now - s_last_shutdown_wait_log).count() >= 2)
+        {
+            diag::log_tagged("init_chat", "authorized_mcp_services_start_deferred_shutdown_in_flight");
+            s_last_shutdown_wait_log = now;
+        }
+        return;
+    }
+
     if (!anti_tamper::mcp_posture::is_current_posture_trusted())
     {
         mcp_standalone::set_ide_lifecycle_ready(false);
@@ -2274,16 +2357,17 @@ void poll_ai_chat()
                 GetCurrentThreadId(), runtime_locked ? 1 : 0, license::error_msg.c_str());
             mcp_standalone::set_ide_lifecycle_ready(false);
             s_ide_ready_for_mcp_services.store(false, std::memory_order_release);
-            if (s_server_started) {
+            const bool stop_server = s_server_started;
+            const bool disconnect_clients = s_mcp_clients_connected;
+            s_server_started = false;
+            s_mcp_clients_connected = false;
+            if (stop_server) {
                 diag::log_tagged("init_chat", "authorized_mcp_server_stop_auth_lost");
-                s_mcp_server.stop();
-                s_server_started = false;
             }
-            if (s_mcp_clients_connected) {
+            if (disconnect_clients) {
                 diag::log_tagged("init_chat", "authorized_mcp_client_disconnect_auth_lost");
-                s_mcp_client_mgr.disconnect_all();
-                s_mcp_clients_connected = false;
             }
+            queue_mcp_services_shutdown("auth_lost", stop_server, disconnect_clients);
         }
     }
 
@@ -2297,14 +2381,11 @@ void poll_ai_chat()
                 lifecycle_reason.c_str());
             mcp_standalone::set_ide_lifecycle_ready(false);
             s_ide_ready_for_mcp_services.store(false, std::memory_order_release);
-            if (s_server_started) {
-                s_mcp_server.stop();
-                s_server_started = false;
-            }
-            if (s_mcp_clients_connected) {
-                s_mcp_client_mgr.disconnect_all();
-                s_mcp_clients_connected = false;
-            }
+            const bool stop_server = s_server_started;
+            const bool disconnect_clients = s_mcp_clients_connected;
+            s_server_started = false;
+            s_mcp_clients_connected = false;
+            queue_mcp_services_shutdown(lifecycle_reason.c_str(), stop_server, disconnect_clients);
         }
     }
 

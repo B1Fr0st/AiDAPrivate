@@ -19,6 +19,7 @@
 #include <mutex>
 #include <set>
 #include <sstream>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -357,6 +358,119 @@ std::uint64_t socket_resolution_app_scan_reserve_ms(const scan_deadline_t& deadl
     return (std::max<std::uint64_t>)(100, (std::min<std::uint64_t>)(750, deadline.timeout_ms / 4));
 }
 
+struct local_module_lookup_result_t {
+    HMODULE module = nullptr;
+    DWORD gle = ERROR_SUCCESS;
+    DWORD seh = 0;
+    std::uint64_t elapsed_ms = 0;
+};
+
+struct local_export_cache_entry_t {
+    bool ok = false;
+    bool module_loaded = false;
+    std::uint64_t rva = 0;
+    std::uint64_t module_size = 0;
+    std::uint64_t remote_read_bytes = 0;
+    HMODULE module = nullptr;
+    std::string source;
+    DWORD getmodule_gle = ERROR_SUCCESS;
+    DWORD remote_read_gle = ERROR_SUCCESS;
+    DWORD getmodule_seh = 0;
+    DWORD parse_seh = 0;
+    std::uint64_t getmodule_elapsed_ms = 0;
+    std::uint64_t remote_read_elapsed_ms = 0;
+    std::uint64_t parse_elapsed_ms = 0;
+    std::string reason;
+};
+
+struct export_rva_lookup_result_t {
+    bool ok = false;
+    bool forwarded = false;
+    std::uint64_t rva = 0;
+    std::uint64_t module_size = 0;
+    std::uint64_t remote_read_bytes = 0;
+    DWORD gle = ERROR_SUCCESS;
+    DWORD seh = 0;
+    std::uint64_t elapsed_ms = 0;
+    std::uint64_t remote_read_elapsed_ms = 0;
+    std::string source;
+    std::string reason;
+};
+
+std::mutex& local_export_cache_mutex()
+{
+    static std::mutex m;
+    return m;
+}
+
+std::map<std::string, local_export_cache_entry_t>& local_export_cache()
+{
+    static std::map<std::string, local_export_cache_entry_t> cache;
+    return cache;
+}
+
+local_module_lookup_result_t local_get_module_handle_w_seh(const wchar_t* dll)
+{
+    local_module_lookup_result_t r;
+    const ULONGLONG t0 = GetTickCount64();
+    __try {
+        SetLastError(ERROR_SUCCESS);
+        r.module = GetModuleHandleW(dll);
+        r.gle = GetLastError();
+    }
+    __except(EXCEPTION_EXECUTE_HANDLER) {
+        r.seh = GetExceptionCode();
+        r.gle = GetLastError();
+        r.module = nullptr;
+    }
+    r.elapsed_ms = GetTickCount64() - t0;
+    return r;
+}
+
+const char* socket_module_dll_label(const std::string& lower_name)
+{
+    const socket_module_kind_t kind = socket_module_kind(lower_name);
+    if (kind == socket_module_kind_t::ws2_32)
+        return "ws2_32.dll";
+    if (kind == socket_module_kind_t::wsock32)
+        return "wsock32.dll";
+    if (kind == socket_module_kind_t::mswsock)
+        return "mswsock.dll";
+    return "";
+}
+
+std::string local_export_cache_key(const std::string& lower_module_name, const char* export_name)
+{
+    std::string key = lower_module_name;
+    key.push_back('!');
+    if (export_name)
+        key += export_name;
+    return key;
+}
+
+void apply_local_export_cache_entry(nlohmann::json& diag, const local_export_cache_entry_t& entry)
+{
+    diag["ok"] = entry.ok;
+    diag["cache_hit"] = true;
+    diag["module"] = fmt_addr(reinterpret_cast<std::uint64_t>(entry.module));
+    diag["module_size"] = entry.module_size;
+    diag["remote_read_bytes"] = entry.remote_read_bytes;
+    diag["module_loaded"] = entry.module_loaded;
+    if (!entry.source.empty())
+        diag["resolution_source"] = entry.source;
+    diag["getmodule_gle"] = entry.getmodule_gle;
+    diag["remote_read_gle"] = entry.remote_read_gle;
+    diag["getmodule_seh"] = entry.getmodule_seh;
+    diag["parse_seh"] = entry.parse_seh;
+    diag["getmodule_elapsed_ms"] = entry.getmodule_elapsed_ms;
+    diag["remote_read_elapsed_ms"] = entry.remote_read_elapsed_ms;
+    diag["parse_elapsed_ms"] = entry.parse_elapsed_ms;
+    if (entry.rva)
+        diag["rva"] = fmt_addr(entry.rva);
+    if (!entry.reason.empty())
+        diag["reason"] = entry.reason;
+}
+
 std::string scan_module_skip_reason(const driver_bridge::module_info_t& module)
 {
     const std::string name = lower_copy(module.name);
@@ -386,50 +500,449 @@ std::uint64_t local_image_size(HMODULE module)
     return nt->OptionalHeader.SizeOfImage;
 }
 
+bool image_range_available(std::uint64_t image_size, std::uint32_t rva, std::uint64_t bytes)
+{
+    return rva <= image_size && bytes <= image_size - rva;
+}
+
+bool image_export_name_equals(const std::uint8_t* image, std::uint64_t image_size, std::uint32_t rva, const char* expected)
+{
+    if (!image || !expected || !image_range_available(image_size, rva, 1))
+        return false;
+    std::uint64_t offset = rva;
+    for (std::size_t i = 0; expected[i] != '\0'; ++i, ++offset) {
+        if (offset >= image_size)
+            return false;
+        if (image[offset] != static_cast<std::uint8_t>(expected[i]))
+            return false;
+    }
+    return offset < image_size && image[offset] == 0;
+}
+
+export_rva_lookup_result_t resolve_export_rva_from_mapped_image(const std::uint8_t* image,
+                                                                std::uint64_t image_size,
+                                                                const char* export_name,
+                                                                const char* source)
+{
+    export_rva_lookup_result_t result;
+    result.source = source ? source : "mapped_image";
+    const ULONGLONG t0 = GetTickCount64();
+    if (!image || image_size < sizeof(IMAGE_DOS_HEADER) || !export_name || !*export_name) {
+        result.reason = "invalid_export_image_input";
+        result.elapsed_ms = GetTickCount64() - t0;
+        return result;
+    }
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(image);
+    const std::uint64_t nt_offset = dos->e_lfanew > 0 ? static_cast<std::uint64_t>(dos->e_lfanew) : 0;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || nt_offset == 0 || nt_offset > image_size || image_size - nt_offset < sizeof(IMAGE_NT_HEADERS)) {
+        result.reason = "invalid_dos_or_nt_header";
+        result.elapsed_ms = GetTickCount64() - t0;
+        return result;
+    }
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(image + nt_offset);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) {
+        result.reason = "invalid_nt_signature";
+        result.elapsed_ms = GetTickCount64() - t0;
+        return result;
+    }
+    result.module_size = nt->OptionalHeader.SizeOfImage;
+    if (nt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_EXPORT) {
+        result.reason = "export_directory_index_missing";
+        result.elapsed_ms = GetTickCount64() - t0;
+        return result;
+    }
+    const IMAGE_DATA_DIRECTORY& export_dir_entry = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (export_dir_entry.VirtualAddress == 0 || export_dir_entry.Size < sizeof(IMAGE_EXPORT_DIRECTORY)) {
+        result.reason = "export_directory_missing";
+        result.elapsed_ms = GetTickCount64() - t0;
+        return result;
+    }
+    if (!image_range_available(image_size, export_dir_entry.VirtualAddress, sizeof(IMAGE_EXPORT_DIRECTORY))) {
+        result.reason = "export_directory_out_of_range";
+        result.elapsed_ms = GetTickCount64() - t0;
+        return result;
+    }
+    const auto* exports = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(image + export_dir_entry.VirtualAddress);
+    if (exports->NumberOfNames == 0 || exports->NumberOfFunctions == 0) {
+        result.reason = "export_name_table_empty";
+        result.elapsed_ms = GetTickCount64() - t0;
+        return result;
+    }
+    const std::uint64_t names_bytes = static_cast<std::uint64_t>(exports->NumberOfNames) * sizeof(DWORD);
+    const std::uint64_t ordinals_bytes = static_cast<std::uint64_t>(exports->NumberOfNames) * sizeof(WORD);
+    const std::uint64_t functions_bytes = static_cast<std::uint64_t>(exports->NumberOfFunctions) * sizeof(DWORD);
+    if (!image_range_available(image_size, exports->AddressOfNames, names_bytes) ||
+        !image_range_available(image_size, exports->AddressOfNameOrdinals, ordinals_bytes) ||
+        !image_range_available(image_size, exports->AddressOfFunctions, functions_bytes)) {
+        result.reason = "export_tables_out_of_range";
+        result.elapsed_ms = GetTickCount64() - t0;
+        return result;
+    }
+    const auto* names = reinterpret_cast<const DWORD*>(image + exports->AddressOfNames);
+    const auto* ordinals = reinterpret_cast<const WORD*>(image + exports->AddressOfNameOrdinals);
+    const auto* functions = reinterpret_cast<const DWORD*>(image + exports->AddressOfFunctions);
+    const std::uint64_t export_start = export_dir_entry.VirtualAddress;
+    const std::uint64_t export_end = export_start + export_dir_entry.Size;
+    for (DWORD i = 0; i < exports->NumberOfNames; ++i) {
+        if (!image_export_name_equals(image, image_size, names[i], export_name))
+            continue;
+        const WORD ordinal_index = ordinals[i];
+        if (ordinal_index >= exports->NumberOfFunctions) {
+            result.reason = "export_ordinal_out_of_range";
+            result.elapsed_ms = GetTickCount64() - t0;
+            return result;
+        }
+        const DWORD function_rva = functions[ordinal_index];
+        if (function_rva >= export_start && function_rva < export_end) {
+            result.forwarded = true;
+            result.reason = "forwarded_export";
+            result.elapsed_ms = GetTickCount64() - t0;
+            return result;
+        }
+        if (function_rva == 0 || !image_range_available(image_size, function_rva, 1)) {
+            result.reason = "export_rva_out_of_range";
+            result.elapsed_ms = GetTickCount64() - t0;
+            return result;
+        }
+        result.ok = true;
+        result.rva = function_rva;
+        result.elapsed_ms = GetTickCount64() - t0;
+        return result;
+    }
+    result.reason = "export_missing";
+    result.elapsed_ms = GetTickCount64() - t0;
+    return result;
+}
+
+export_rva_lookup_result_t resolve_loaded_module_export_rva(HMODULE module, const char* export_name)
+{
+    export_rva_lookup_result_t result;
+    result.source = "local_loaded_image";
+    const ULONGLONG t0 = GetTickCount64();
+    const std::uint64_t size = local_image_size(module);
+    result.module_size = size;
+    if (!module || size == 0)
+        result.reason = "local_module_image_unavailable";
+    else
+        result = resolve_export_rva_from_mapped_image(reinterpret_cast<const std::uint8_t*>(module), size, export_name, "local_loaded_image");
+    result.elapsed_ms = GetTickCount64() - t0;
+    return result;
+}
+
+export_rva_lookup_result_t resolve_remote_module_export_rva(std::uint32_t pid,
+                                                            const driver_bridge::module_info_t& module,
+                                                            const char* export_name,
+                                                            scan_deadline_t& deadline)
+{
+    export_rva_lookup_result_t result;
+    result.source = "remote_mapped_image";
+    const ULONGLONG t0 = GetTickCount64();
+    if (module.base == 0 || module.size < sizeof(IMAGE_DOS_HEADER)) {
+        result.reason = "remote_module_image_unavailable";
+        result.elapsed_ms = GetTickCount64() - t0;
+        return result;
+    }
+    const std::uint64_t reserve = socket_resolution_app_scan_reserve_ms(deadline);
+    const std::uint64_t remaining_before = deadline.remaining_ms();
+    if (deadline.expired("remote_export_before_read")) {
+        result.reason = "deadline_before_remote_export_read";
+        result.elapsed_ms = GetTickCount64() - t0;
+        return result;
+    }
+    if (remaining_before <= reserve + 50) {
+        result.reason = "remote_export_read_skipped_deadline_reserve";
+        result.elapsed_ms = GetTickCount64() - t0;
+        return result;
+    }
+    const std::size_t to_read = static_cast<std::size_t>((std::min<std::uint64_t>)(module.size, 16777216));
+    std::vector<std::uint8_t> bytes;
+    diag::log_tagged_fmt("net_proto",
+        "socket_export_remote_read_begin pid=%u module=%s base=%s size=%llu export=%s read_bytes=%zu remaining_ms=%llu elapsed_ms=%llu",
+        pid,
+        module.name.c_str(),
+        fmt_addr(module.base).c_str(),
+        static_cast<unsigned long long>(module.size),
+        export_name ? export_name : "",
+        to_read,
+        static_cast<unsigned long long>(deadline.remaining_ms()),
+        static_cast<unsigned long long>(deadline.elapsed_ms()));
+    const ULONGLONG read_t0 = GetTickCount64();
+    const bool read_ok = driver_bridge::read_memory_for(pid, module.base, to_read, bytes);
+    result.remote_read_elapsed_ms = GetTickCount64() - read_t0;
+    result.remote_read_bytes = bytes.size();
+    result.gle = GetLastError();
+    diag::log_tagged_fmt("net_proto",
+        "socket_export_remote_read_done pid=%u module=%s export=%s ok=%d bytes=%zu gle=%lu read_elapsed_ms=%llu remaining_ms=%llu elapsed_ms=%llu",
+        pid,
+        module.name.c_str(),
+        export_name ? export_name : "",
+        read_ok ? 1 : 0,
+        bytes.size(),
+        result.gle,
+        static_cast<unsigned long long>(result.remote_read_elapsed_ms),
+        static_cast<unsigned long long>(deadline.remaining_ms()),
+        static_cast<unsigned long long>(deadline.elapsed_ms()));
+    if (!read_ok || bytes.size() < sizeof(IMAGE_DOS_HEADER)) {
+        result.reason = read_ok ? "remote_export_read_too_small" : "remote_export_read_failed";
+        result.elapsed_ms = GetTickCount64() - t0;
+        return result;
+    }
+    if (deadline.expired("remote_export_after_read")) {
+        result.reason = "deadline_after_remote_export_read";
+        result.elapsed_ms = GetTickCount64() - t0;
+        return result;
+    }
+    export_rva_lookup_result_t parsed = resolve_export_rva_from_mapped_image(bytes.data(), bytes.size(), export_name, "remote_mapped_image");
+    parsed.remote_read_elapsed_ms = result.remote_read_elapsed_ms;
+    parsed.remote_read_bytes = result.remote_read_bytes;
+    parsed.gle = result.gle;
+    parsed.elapsed_ms = GetTickCount64() - t0;
+    return parsed;
+}
+
 std::uint64_t resolve_local_export_rva(const std::string& lower_module_name,
                                        const char* export_name,
+                                       const driver_bridge::module_info_t& remote_module,
+                                       std::uint32_t pid,
+                                       scan_deadline_t& deadline,
                                        nlohmann::json& diag)
 {
+    const ULONGLONG started = GetTickCount64();
     diag = nlohmann::json::object();
     diag["export"] = export_name ? export_name : "";
-    diag["source"] = "local_rva";
+    diag["source"] = "socket_export_rva";
+    diag["cache_hit"] = false;
+    diag["deadline_remaining_ms_entry"] = deadline.remaining_ms();
     const wchar_t* dll = socket_module_dll_name(lower_module_name);
+    const char* dll_label = socket_module_dll_label(lower_module_name);
     if (!dll) {
         diag["ok"] = false;
         diag["reason"] = "not_a_known_socket_module";
         return 0;
     }
-    HMODULE module = GetModuleHandleW(dll);
-    bool loaded_for_lookup = false;
-    if (!module) {
-        module = LoadLibraryExW(dll, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32 | DONT_RESOLVE_DLL_REFERENCES);
-        loaded_for_lookup = module != nullptr;
+    diag["dll"] = dll_label;
+    diag["remote_module"] = remote_module.name;
+    diag["remote_base"] = fmt_addr(remote_module.base);
+    diag["remote_size"] = remote_module.size;
+    diag["remote_path"] = remote_module.path;
+    const std::string cache_key = local_export_cache_key(lower_module_name, export_name) + "@" + lower_copy(remote_module.path) + "#" + std::to_string(remote_module.size);
+    {
+        std::lock_guard<std::mutex> lock(local_export_cache_mutex());
+        auto it = local_export_cache().find(cache_key);
+        if (it != local_export_cache().end()) {
+            apply_local_export_cache_entry(diag, it->second);
+            diag["elapsed_ms"] = GetTickCount64() - started;
+            diag["deadline_remaining_ms_exit"] = deadline.remaining_ms();
+            diag["source"] = "local_rva_cache";
+            diag::log_tagged_fmt("net_proto",
+                "socket_export_local_cache_hit pid=%u module=%s dll=%s export=%s ok=%d rva=%s reason=%s remaining_ms=%llu elapsed_ms=%llu",
+                pid,
+                lower_module_name.c_str(),
+                dll_label,
+                export_name ? export_name : "",
+                it->second.ok ? 1 : 0,
+                it->second.rva ? fmt_addr(it->second.rva).c_str() : "0x0",
+                it->second.reason.c_str(),
+                static_cast<unsigned long long>(deadline.remaining_ms()),
+                static_cast<unsigned long long>(GetTickCount64() - started));
+            return it->second.rva;
+        }
     }
-    if (!module) {
+
+    if (deadline.expired("local_export_before_getmodule")) {
         diag["ok"] = false;
-        diag["reason"] = "local_module_unavailable";
-        diag["gle"] = GetLastError();
+        diag["reason"] = "deadline_before_getmodule";
+        diag["deadline_hit"] = true;
         return 0;
     }
-    const auto base = reinterpret_cast<std::uint64_t>(module);
-    const std::uint64_t size = local_image_size(module);
-    FARPROC proc = export_name ? GetProcAddress(module, export_name) : nullptr;
-    std::uint64_t rva = 0;
-    if (proc && size) {
-        const std::uint64_t addr = reinterpret_cast<std::uint64_t>(proc);
-        if (addr >= base && addr < base + size)
-            rva = addr - base;
+
+    diag::log_tagged_fmt("net_proto",
+        "socket_export_getmodule_begin pid=%u module=%s dll=%s export=%s remaining_ms=%llu elapsed_ms=%llu",
+        pid,
+        lower_module_name.c_str(),
+        dll_label,
+        export_name ? export_name : "",
+        static_cast<unsigned long long>(deadline.remaining_ms()),
+        static_cast<unsigned long long>(GetTickCount64() - started));
+    const local_module_lookup_result_t getmodule = local_get_module_handle_w_seh(dll);
+    HMODULE module = getmodule.module;
+    diag["getmodule_gle"] = getmodule.gle;
+    diag["getmodule_seh"] = getmodule.seh;
+    diag["getmodule_elapsed_ms"] = getmodule.elapsed_ms;
+    diag["getmodule_handle"] = fmt_addr(reinterpret_cast<std::uint64_t>(getmodule.module));
+    diag::log_tagged_fmt("net_proto",
+        "socket_export_getmodule_done pid=%u module=%s dll=%s export=%s handle=%p gle=%lu seh=0x%08lX phase_elapsed_ms=%llu remaining_ms=%llu elapsed_ms=%llu",
+        pid,
+        lower_module_name.c_str(),
+        dll_label,
+        export_name ? export_name : "",
+        getmodule.module,
+        getmodule.gle,
+        getmodule.seh,
+        static_cast<unsigned long long>(getmodule.elapsed_ms),
+        static_cast<unsigned long long>(deadline.remaining_ms()),
+        static_cast<unsigned long long>(GetTickCount64() - started));
+
+    auto cache_success = [&](const export_rva_lookup_result_t& parsed, HMODULE cached_module, bool module_loaded) {
+        local_export_cache_entry_t entry;
+        entry.ok = parsed.ok;
+        entry.module_loaded = module_loaded;
+        entry.rva = parsed.rva;
+        entry.module_size = parsed.module_size;
+        entry.remote_read_bytes = parsed.remote_read_bytes;
+        entry.module = cached_module;
+        entry.source = parsed.source;
+        entry.getmodule_gle = getmodule.gle;
+        entry.remote_read_gle = parsed.gle;
+        entry.getmodule_seh = getmodule.seh;
+        entry.parse_seh = parsed.seh;
+        entry.getmodule_elapsed_ms = getmodule.elapsed_ms;
+        entry.remote_read_elapsed_ms = parsed.remote_read_elapsed_ms;
+        entry.parse_elapsed_ms = parsed.elapsed_ms;
+        entry.reason = parsed.reason;
+        std::lock_guard<std::mutex> lock(local_export_cache_mutex());
+        local_export_cache()[cache_key] = entry;
+    };
+
+    if (module) {
+        if (deadline.expired("local_export_before_parse_loaded")) {
+            diag["ok"] = false;
+            diag["reason"] = "deadline_before_local_export_parse";
+            diag["deadline_hit"] = true;
+            diag["elapsed_ms"] = GetTickCount64() - started;
+            diag["deadline_remaining_ms_exit"] = deadline.remaining_ms();
+            return 0;
+        }
+        diag::log_tagged_fmt("net_proto",
+            "socket_export_loaded_parse_begin pid=%u module=%s dll=%s export=%s handle=%p remaining_ms=%llu elapsed_ms=%llu",
+            pid,
+            lower_module_name.c_str(),
+            dll_label,
+            export_name ? export_name : "",
+            module,
+            static_cast<unsigned long long>(deadline.remaining_ms()),
+            static_cast<unsigned long long>(GetTickCount64() - started));
+        export_rva_lookup_result_t parsed = resolve_loaded_module_export_rva(module, export_name);
+        diag["local_loaded"] = nlohmann::json{
+            {"ok", parsed.ok},
+            {"source", parsed.source},
+            {"rva", parsed.rva ? nlohmann::json(fmt_addr(parsed.rva)) : nlohmann::json(nullptr)},
+            {"module_size", parsed.module_size},
+            {"forwarded", parsed.forwarded},
+            {"reason", parsed.reason},
+            {"seh", static_cast<unsigned long>(parsed.seh)},
+            {"elapsed_ms", parsed.elapsed_ms}
+        };
+        diag::log_tagged_fmt("net_proto",
+            "socket_export_loaded_parse_done pid=%u module=%s dll=%s export=%s ok=%d rva=%s reason=%s forwarded=%d parse_elapsed_ms=%llu remaining_ms=%llu elapsed_ms=%llu",
+            pid,
+            lower_module_name.c_str(),
+            dll_label,
+            export_name ? export_name : "",
+            parsed.ok ? 1 : 0,
+            parsed.rva ? fmt_addr(parsed.rva).c_str() : "0x0",
+            parsed.reason.c_str(),
+            parsed.forwarded ? 1 : 0,
+            static_cast<unsigned long long>(parsed.elapsed_ms),
+            static_cast<unsigned long long>(deadline.remaining_ms()),
+            static_cast<unsigned long long>(GetTickCount64() - started));
+        if (parsed.ok) {
+            cache_success(parsed, module, true);
+            diag["ok"] = true;
+            diag["module_loaded"] = true;
+            diag["module_size"] = parsed.module_size;
+            diag["resolution_source"] = parsed.source;
+            diag["rva"] = fmt_addr(parsed.rva);
+            diag["elapsed_ms"] = GetTickCount64() - started;
+            diag["deadline_remaining_ms_exit"] = deadline.remaining_ms();
+            return parsed.rva;
+        }
+    } else {
+        diag["local_loaded"] = nlohmann::json{
+            {"ok", false},
+            {"source", "local_loaded_image"},
+            {"reason", "local_module_not_loaded"}
+        };
+        diag::log_tagged_fmt("net_proto",
+            "socket_export_local_module_absent pid=%u module=%s dll=%s export=%s remaining_ms=%llu elapsed_ms=%llu",
+            pid,
+            lower_module_name.c_str(),
+            dll_label,
+            export_name ? export_name : "",
+            static_cast<unsigned long long>(deadline.remaining_ms()),
+            static_cast<unsigned long long>(GetTickCount64() - started));
     }
-    diag["ok"] = rva != 0;
-    diag["module_size"] = size;
-    diag["loaded_for_lookup"] = loaded_for_lookup;
-    if (rva)
-        diag["rva"] = fmt_addr(rva);
-    else
-        diag["reason"] = proc ? "local_export_forwarded_or_outside_module" : "local_export_missing";
-    if (loaded_for_lookup)
-        FreeLibrary(module);
-    return rva;
+
+    if (!deadline.expired("remote_export_parse")) {
+        export_rva_lookup_result_t remote = resolve_remote_module_export_rva(pid, remote_module, export_name, deadline);
+        diag["remote_mapped"] = nlohmann::json{
+            {"ok", remote.ok},
+            {"source", remote.source},
+            {"rva", remote.rva ? nlohmann::json(fmt_addr(remote.rva)) : nlohmann::json(nullptr)},
+            {"module_size", remote.module_size},
+            {"remote_read_bytes", remote.remote_read_bytes},
+            {"remote_read_gle", static_cast<unsigned long>(remote.gle)},
+            {"remote_read_elapsed_ms", remote.remote_read_elapsed_ms},
+            {"forwarded", remote.forwarded},
+            {"reason", remote.reason},
+            {"seh", static_cast<unsigned long>(remote.seh)},
+            {"elapsed_ms", remote.elapsed_ms}
+        };
+        if (remote.ok) {
+            cache_success(remote, module, module != nullptr);
+            diag["ok"] = true;
+            diag["module_loaded"] = module != nullptr;
+            diag["module_size"] = remote.module_size;
+            diag["remote_read_bytes"] = remote.remote_read_bytes;
+            diag["remote_read_elapsed_ms"] = remote.remote_read_elapsed_ms;
+            diag["resolution_source"] = remote.source;
+            diag["rva"] = fmt_addr(remote.rva);
+            diag["elapsed_ms"] = GetTickCount64() - started;
+            diag["deadline_remaining_ms_exit"] = deadline.remaining_ms();
+            diag::log_tagged_fmt("net_proto",
+                "socket_export_local_done pid=%u module=%s dll=%s export=%s ok=1 rva=%s source=%s remaining_ms=%llu elapsed_ms=%llu",
+                pid,
+                lower_module_name.c_str(),
+                dll_label,
+                export_name ? export_name : "",
+                fmt_addr(remote.rva).c_str(),
+                remote.source.c_str(),
+                static_cast<unsigned long long>(deadline.remaining_ms()),
+                static_cast<unsigned long long>(GetTickCount64() - started));
+            return remote.rva;
+        }
+    } else {
+        diag["remote_mapped"] = nlohmann::json{
+            {"ok", false},
+            {"source", "remote_mapped_image"},
+            {"reason", "deadline_before_remote_export_parse"}
+        };
+    }
+
+    const std::string local_reason = diag.contains("local_loaded") && diag["local_loaded"].is_object()
+        ? diag["local_loaded"].value("reason", std::string())
+        : std::string();
+    const std::string remote_reason = diag.contains("remote_mapped") && diag["remote_mapped"].is_object()
+        ? diag["remote_mapped"].value("reason", std::string())
+        : std::string();
+    diag["ok"] = false;
+    diag["module_loaded"] = module != nullptr;
+    diag["deadline_hit"] = deadline.hit;
+    diag["reason"] = deadline.hit ? "deadline_during_socket_export_resolution" : (!remote_reason.empty() ? remote_reason : (!local_reason.empty() ? local_reason : "socket_export_rva_unresolved"));
+    diag["elapsed_ms"] = GetTickCount64() - started;
+    diag["deadline_remaining_ms_exit"] = deadline.remaining_ms();
+    diag::log_tagged_fmt("net_proto",
+        "socket_export_local_done pid=%u module=%s dll=%s export=%s ok=0 rva=0x0 reason=%s module_loaded=%d deadline_hit=%d remaining_ms=%llu elapsed_ms=%llu",
+        pid,
+        lower_module_name.c_str(),
+        dll_label,
+        export_name ? export_name : "",
+        diag.value("reason", std::string()).c_str(),
+        module ? 1 : 0,
+        deadline.hit ? 1 : 0,
+        static_cast<unsigned long long>(deadline.remaining_ms()),
+        static_cast<unsigned long long>(GetTickCount64() - started));
+    return 0;
 }
 
 std::vector<api_target_t> resolve_socket_apis(const std::vector<driver_bridge::module_info_t>& modules,
@@ -455,10 +968,20 @@ std::vector<api_target_t> resolve_socket_apis(const std::vector<driver_bridge::m
     diagnostics["export_resolution"] = nlohmann::json::array();
     diagnostics["ordered_socket_modules"] = nlohmann::json::array();
     diagnostics["local_rva_hits"] = 0;
+    diagnostics["local_rva_cache_hits"] = 0;
+    diagnostics["local_loaded_rva_hits"] = 0;
+    diagnostics["remote_mapped_rva_hits"] = 0;
     diagnostics["remote_fallback_attempts"] = 0;
     diagnostics["remote_fallback_hits"] = 0;
     diagnostics["remote_fallback_skips"] = 0;
     diagnostics["app_scan_reserve_ms"] = socket_resolution_app_scan_reserve_ms(deadline);
+    diag::log_tagged_fmt("net_proto",
+        "resolve_socket_apis_begin pid=%u module_count=%zu timeout_ms=%u remaining_ms=%llu elapsed_ms=%llu",
+        pid,
+        modules.size(),
+        deadline.timeout_ms,
+        static_cast<unsigned long long>(deadline.remaining_ms()),
+        static_cast<unsigned long long>(deadline.elapsed_ms()));
     std::vector<const driver_bridge::module_info_t*> socket_modules;
     socket_modules.reserve(4);
     for (const auto& module : modules) {
@@ -466,6 +989,12 @@ std::vector<api_target_t> resolve_socket_apis(const std::vector<driver_bridge::m
         if (socket_module_kind(lower_name) != socket_module_kind_t::none)
             socket_modules.push_back(&module);
     }
+    diag::log_tagged_fmt("net_proto",
+        "resolve_socket_apis_socket_modules pid=%u socket_module_count=%zu remaining_ms=%llu elapsed_ms=%llu",
+        pid,
+        socket_modules.size(),
+        static_cast<unsigned long long>(deadline.remaining_ms()),
+        static_cast<unsigned long long>(deadline.elapsed_ms()));
     std::stable_sort(socket_modules.begin(), socket_modules.end(),
         [](const driver_bridge::module_info_t* a, const driver_bridge::module_info_t* b) {
             const socket_module_kind_t ak = socket_module_kind(lower_copy(a ? a->name : std::string()));
@@ -481,8 +1010,15 @@ std::vector<api_target_t> resolve_socket_apis(const std::vector<driver_bridge::m
             return (a ? a->base : 0) < (b ? b->base : 0);
         });
     for (const auto* module_ptr : socket_modules) {
-        if (deadline.expired("resolve_socket_exports_module"))
+        if (deadline.expired("resolve_socket_exports_module")) {
+            diag::log_tagged_fmt("net_proto",
+                "resolve_socket_apis_deadline pid=%u stage=resolve_socket_exports_module apis=%zu remaining_ms=%llu elapsed_ms=%llu",
+                pid,
+                apis.size(),
+                static_cast<unsigned long long>(deadline.remaining_ms()),
+                static_cast<unsigned long long>(deadline.elapsed_ms()));
             break;
+        }
         if (!module_ptr)
             continue;
         const auto& module = *module_ptr;
@@ -492,45 +1028,103 @@ std::vector<api_target_t> resolve_socket_apis(const std::vector<driver_bridge::m
             diagnostics["ordered_socket_modules"].push_back(nlohmann::json{{"name", module.name}, {"kind", socket_module_kind_name(kind)}, {"base", fmt_addr(module.base)}, {"size", module.size}, {"path", module.path}, {"rank", socket_module_rank(kind)}});
         if (diagnostics["socket_modules"].size() < 8)
             diagnostics["socket_modules"].push_back(nlohmann::json{{"name", module.name}, {"kind", socket_module_kind_name(kind)}, {"base", fmt_addr(module.base)}, {"size", module.size}, {"path", module.path}});
+        diag::log_tagged_fmt("net_proto",
+            "resolve_socket_module_begin pid=%u module=%s kind=%s base=%s size=%llu exports=%zu remaining_ms=%llu elapsed_ms=%llu",
+            pid,
+            module.name.c_str(),
+            socket_module_kind_name(kind),
+            fmt_addr(module.base).c_str(),
+            static_cast<unsigned long long>(module.size),
+            sizeof(names) / sizeof(names[0]),
+            static_cast<unsigned long long>(deadline.remaining_ms()),
+            static_cast<unsigned long long>(deadline.elapsed_ms()));
         for (const auto& n : names) {
-            if (deadline.expired("resolve_socket_exports_export"))
+            if (deadline.expired("resolve_socket_exports_export")) {
+                diag::log_tagged_fmt("net_proto",
+                    "resolve_socket_export_deadline pid=%u module=%s export=%s apis=%zu remaining_ms=%llu elapsed_ms=%llu",
+                    pid,
+                    module.name.c_str(),
+                    n.name,
+                    apis.size(),
+                    static_cast<unsigned long long>(deadline.remaining_ms()),
+                    static_cast<unsigned long long>(deadline.elapsed_ms()));
                 break;
+            }
             nlohmann::json rdiag;
             rdiag["module"] = module.name;
             rdiag["module_kind"] = socket_module_kind_name(kind);
             rdiag["module_base"] = fmt_addr(module.base);
             rdiag["export"] = n.name;
             rdiag["deadline_remaining_ms"] = deadline.remaining_ms();
+            diag::log_tagged_fmt("net_proto",
+                "resolve_socket_export_begin pid=%u module=%s kind=%s export=%s remaining_ms=%llu elapsed_ms=%llu",
+                pid,
+                module.name.c_str(),
+                socket_module_kind_name(kind),
+                n.name,
+                static_cast<unsigned long long>(deadline.remaining_ms()),
+                static_cast<unsigned long long>(deadline.elapsed_ms()));
             if (!socket_module_exports_requested_api(kind, n.name)) {
                 rdiag["ok"] = false;
                 rdiag["resolution_source"] = "skipped";
                 rdiag["skip_reason"] = "module_does_not_export_requested_socket_api";
                 if (diagnostics["export_resolution"].size() < 32)
                     diagnostics["export_resolution"].push_back(std::move(rdiag));
+                diag::log_tagged_fmt("net_proto",
+                    "resolve_socket_export_skip pid=%u module=%s export=%s reason=module_does_not_export_requested_socket_api remaining_ms=%llu elapsed_ms=%llu",
+                    pid,
+                    module.name.c_str(),
+                    n.name,
+                    static_cast<unsigned long long>(deadline.remaining_ms()),
+                    static_cast<unsigned long long>(deadline.elapsed_ms()));
                 continue;
             }
-            const std::uint64_t rva = resolve_local_export_rva(lower_name, n.name, rdiag);
+            const std::uint64_t rva = resolve_local_export_rva(lower_name, n.name, module, pid, deadline, rdiag);
+            if (rdiag.value("cache_hit", false))
+                diagnostics["local_rva_cache_hits"] = diagnostics.value("local_rva_cache_hits", 0) + 1;
             std::uint64_t va = 0;
             if (rva != 0 && (module.size == 0 || rva < module.size)) {
+                const std::string rva_source = rdiag.value("resolution_source", std::string("socket_export_rva"));
                 va = module.base + rva;
                 rdiag["remote_va"] = fmt_addr(va);
-                rdiag["resolution_source"] = "local_rva";
+                rdiag["resolution_source"] = rva_source;
+                rdiag["va_resolution_source"] = "rva_plus_remote_module_base";
                 diagnostics["local_rva_hits"] = diagnostics.value("local_rva_hits", 0) + 1;
+                if (rva_source == "local_loaded_image")
+                    diagnostics["local_loaded_rva_hits"] = diagnostics.value("local_loaded_rva_hits", 0) + 1;
+                if (rva_source == "remote_mapped_image")
+                    diagnostics["remote_mapped_rva_hits"] = diagnostics.value("remote_mapped_rva_hits", 0) + 1;
             } else {
                 if (rva != 0)
                     rdiag["reason"] = "local_rva_outside_remote_module_size";
                 const std::string local_reason = rdiag.value("reason", std::string());
                 const std::uint64_t remaining_before = deadline.remaining_ms();
                 const std::uint64_t reserve = socket_resolution_app_scan_reserve_ms(deadline);
-                const bool export_absent = local_reason == "local_export_missing";
+                const bool export_absent = local_reason == "local_export_missing" || local_reason == "export_missing";
                 if (export_absent) {
                     rdiag["remote_fallback_skipped"] = true;
                     rdiag["remote_fallback_skip_reason"] = "local_export_absent";
                     rdiag["resolution_source"] = "local_absence";
                     diagnostics["remote_fallback_skips"] = diagnostics.value("remote_fallback_skips", 0) + 1;
+                    diag::log_tagged_fmt("net_proto",
+                        "socket_export_fallback_skip pid=%u module=%s export=%s reason=local_export_absent remaining_ms=%llu elapsed_ms=%llu",
+                        pid,
+                        module.name.c_str(),
+                        n.name,
+                        static_cast<unsigned long long>(deadline.remaining_ms()),
+                        static_cast<unsigned long long>(deadline.elapsed_ms()));
                 } else if (remaining_before > reserve + 75) {
                     diagnostics["remote_fallback_attempts"] = diagnostics.value("remote_fallback_attempts", 0) + 1;
                     const ULONGLONG t0 = GetTickCount64();
+                    diag::log_tagged_fmt("net_proto",
+                        "socket_export_fallback_begin pid=%u module=%s export=%s base=%s remaining_before=%llu reserve_ms=%llu elapsed_ms=%llu",
+                        pid,
+                        module.name.c_str(),
+                        n.name,
+                        fmt_addr(module.base).c_str(),
+                        static_cast<unsigned long long>(remaining_before),
+                        static_cast<unsigned long long>(reserve),
+                        static_cast<unsigned long long>(deadline.elapsed_ms()));
                     va = driver_bridge::resolve_export_for(pid, module.base, n.name);
                     const ULONGLONG fallback_elapsed = GetTickCount64() - t0;
                     const std::uint64_t remaining_after = deadline.remaining_ms();
@@ -560,6 +1154,14 @@ std::vector<api_target_t> resolve_socket_apis(const std::vector<driver_bridge::m
                     rdiag["app_scan_reserve_ms"] = reserve;
                     rdiag["resolution_source"] = "skipped";
                     diagnostics["remote_fallback_skips"] = diagnostics.value("remote_fallback_skips", 0) + 1;
+                    diag::log_tagged_fmt("net_proto",
+                        "socket_export_fallback_skip pid=%u module=%s export=%s reason=deadline_remaining_too_small remaining_before=%llu reserve_ms=%llu elapsed_ms=%llu",
+                        pid,
+                        module.name.c_str(),
+                        n.name,
+                        static_cast<unsigned long long>(remaining_before),
+                        static_cast<unsigned long long>(reserve),
+                        static_cast<unsigned long long>(deadline.elapsed_ms()));
                 }
             }
             rdiag["module"] = module.name;
@@ -569,14 +1171,56 @@ std::vector<api_target_t> resolve_socket_apis(const std::vector<driver_bridge::m
             rdiag["deadline_remaining_ms"] = deadline.remaining_ms();
             if (diagnostics["export_resolution"].size() < 32)
                 diagnostics["export_resolution"].push_back(std::move(rdiag));
+            diag::log_tagged_fmt("net_proto",
+                "resolve_socket_export_done pid=%u module=%s export=%s va=%s local_rva=%s apis=%zu deadline_hit=%d remaining_ms=%llu elapsed_ms=%llu",
+                pid,
+                module.name.c_str(),
+                n.name,
+                va ? fmt_addr(va).c_str() : "0x0",
+                rva ? fmt_addr(rva).c_str() : "0x0",
+                apis.size(),
+                deadline.hit ? 1 : 0,
+                static_cast<unsigned long long>(deadline.remaining_ms()),
+                static_cast<unsigned long long>(deadline.elapsed_ms()));
             if (va == 0)
                 continue;
             apis.push_back({n.name, n.direction, va});
         }
+        diag::log_tagged_fmt("net_proto",
+            "resolve_socket_module_done pid=%u module=%s apis=%zu deadline_hit=%d remaining_ms=%llu elapsed_ms=%llu",
+            pid,
+            module.name.c_str(),
+            apis.size(),
+            deadline.hit ? 1 : 0,
+            static_cast<unsigned long long>(deadline.remaining_ms()),
+            static_cast<unsigned long long>(deadline.elapsed_ms()));
     }
     diagnostics["api_count"] = apis.size();
     diagnostics["deadline_hit"] = deadline.hit;
     diagnostics["stage"] = deadline.stage;
+    diagnostics["deadline_remaining_ms"] = deadline.remaining_ms();
+    diagnostics["elapsed_ms"] = deadline.elapsed_ms();
+    if (apis.empty()) {
+        diagnostics["dependency_unavailable"] = true;
+        if (deadline.hit)
+            diagnostics["root_cause"] = "socket_export_resolution_deadline";
+        else if (socket_modules.empty())
+            diagnostics["root_cause"] = "socket_runtime_module_not_loaded_in_target";
+        else
+            diagnostics["root_cause"] = "socket_exports_unresolved";
+    } else {
+        diagnostics["dependency_unavailable"] = false;
+        diagnostics["root_cause"] = "socket_exports_resolved";
+    }
+    diag::log_tagged_fmt("net_proto",
+        "resolve_socket_apis_done pid=%u api_count=%zu deadline_hit=%d stage=%s root=%s remaining_ms=%llu elapsed_ms=%llu",
+        pid,
+        apis.size(),
+        deadline.hit ? 1 : 0,
+        deadline.stage.c_str(),
+        diagnostics["root_cause"].get<std::string>().c_str(),
+        static_cast<unsigned long long>(deadline.remaining_ms()),
+        static_cast<unsigned long long>(deadline.elapsed_ms()));
     return apis;
 }
 
@@ -1027,17 +1671,46 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
         options.timeout_ms);
     deadline.stage = "enumerate_modules";
     auto modules = driver_bridge::enumerate_modules_for(pid);
+    diag::log_tagged_fmt("net_proto",
+        "find_sendrecv enumerate_modules_done pid=%u module_count=%zu deadline_hit=%d remaining_ms=%llu elapsed_ms=%llu",
+        pid,
+        modules.size(),
+        deadline.hit ? 1 : 0,
+        static_cast<unsigned long long>(deadline.remaining_ms()),
+        static_cast<unsigned long long>(deadline.elapsed_ms()));
     nlohmann::json socket_resolution = nlohmann::json::object();
+    socket_resolution["enumerated_module_count"] = modules.size();
+    socket_resolution["deadline_remaining_ms_after_enumeration"] = deadline.remaining_ms();
+    socket_resolution["elapsed_ms_after_enumeration"] = deadline.elapsed_ms();
     if (!deadline.expired("resolve_socket_exports"))
         socket_resolution["module_count"] = modules.size();
+    diag::log_tagged_fmt("net_proto",
+        "find_sendrecv resolve_socket_exports_begin pid=%u module_count=%zu deadline_hit=%d remaining_ms=%llu elapsed_ms=%llu",
+        pid,
+        modules.size(),
+        deadline.hit ? 1 : 0,
+        static_cast<unsigned long long>(deadline.remaining_ms()),
+        static_cast<unsigned long long>(deadline.elapsed_ms()));
     const auto apis = deadline.hit ? std::vector<api_target_t>() : resolve_socket_apis(modules, pid, deadline, socket_resolution);
+    diag::log_tagged_fmt("net_proto",
+        "find_sendrecv resolve_socket_exports_done pid=%u api_count=%zu deadline_hit=%d stage=%s remaining_ms=%llu elapsed_ms=%llu",
+        pid,
+        apis.size(),
+        deadline.hit ? 1 : 0,
+        deadline.stage.c_str(),
+        static_cast<unsigned long long>(deadline.remaining_ms()),
+        static_cast<unsigned long long>(deadline.elapsed_ms()));
     if (apis.empty()) {
+        const std::string root_cause = socket_resolution.value("root_cause", deadline.hit ? std::string("socket_export_resolution_deadline") : std::string("socket_exports_unresolved"));
         out["process_id"] = pid;
+        out["dependency_unavailable"] = true;
+        out["root_cause"] = root_cause;
         out["results"] = nlohmann::json::array();
         out["result_count"] = 0;
         out["count"] = 0;
         out["deadline_hit"] = deadline.hit;
         out["elapsed_ms"] = deadline.elapsed_ms();
+        out["deadline_remaining_ms"] = deadline.remaining_ms();
         out["timeout_ms"] = options.timeout_ms;
         out["scanned_modules"] = nlohmann::json::array();
         out["app_modules_scanned"] = nlohmann::json::array();
@@ -1047,21 +1720,31 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
         out["stage"] = deadline.stage;
         out["deadline_stage"] = deadline.stage;
         out["socket_api_count"] = 0;
+        out["dependency_result"] = nlohmann::json{
+            {"ok", false},
+            {"root_cause", root_cause},
+            {"deadline_hit", deadline.hit},
+            {"stage", deadline.stage},
+            {"deadline_remaining_ms", deadline.remaining_ms()},
+            {"elapsed_ms", deadline.elapsed_ms()}
+        };
         out["diagnostics"] = nlohmann::json{
             {"socket_resolution", socket_resolution},
             {"app_modules_scanned", nlohmann::json::array()},
             {"scanned_bytes", 0},
             {"candidate_hit_count", 0},
-            {"deadline_stage", deadline.stage}
+            {"deadline_stage", deadline.stage},
+            {"deadline_remaining_ms", deadline.remaining_ms()}
         };
-        out["evidence"] = nlohmann::json::array({"socket API exports not resolved in loaded modules"});
+        out["evidence"] = nlohmann::json::array({"socket API exports not resolved from loaded-module or remote-module export tables"});
         out["limitations"] = nlohmann::json::array({
             "socket API export resolution stopped before scanning application modules",
             "no send/recv callsite results are fabricated when socket exports are unavailable"
         });
         diag::log_tagged_fmt("net_proto",
-            "find_sendrecv done pid=%u results=0 apis=0 scanned_modules=0 scanned_bytes=0 deadline_hit=%d elapsed_ms=%llu stage=%s",
+            "find_sendrecv done pid=%u results=0 apis=0 scanned_modules=0 scanned_bytes=0 dependency_unavailable=1 root=%s deadline_hit=%d elapsed_ms=%llu stage=%s",
             pid,
+            root_cause.c_str(),
             deadline.hit ? 1 : 0,
             static_cast<unsigned long long>(deadline.elapsed_ms()),
             deadline.stage.c_str());
@@ -1095,15 +1778,52 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
 
     for (const auto& module : modules) {
         if (deadline.expired("module_loop")) {
+            diag::log_tagged_fmt("net_proto",
+                "find_sendrecv module_loop_deadline pid=%u scanned_modules=%u scanned_bytes=%llu remaining_ms=%llu elapsed_ms=%llu",
+                pid,
+                scanned_count,
+                static_cast<unsigned long long>(scanned_bytes),
+                static_cast<unsigned long long>(deadline.remaining_ms()),
+                static_cast<unsigned long long>(deadline.elapsed_ms()));
             stop_scan("deadline_before_module", "module_loop");
             break;
         }
-        if (results.size() >= options.max_results)
-            break;
-        if (scanned_count >= options.max_modules || scanned_bytes >= options.max_scan_bytes) {
-            stop_reason = scanned_count >= options.max_modules ? "max_modules_reached" : "max_scan_bytes_reached";
+        if (results.size() >= options.max_results) {
+            stop_reason = "max_results_reached";
+            diag::log_tagged_fmt("net_proto",
+                "find_sendrecv stop pid=%u reason=max_results_reached results=%zu scanned_modules=%u scanned_bytes=%llu remaining_ms=%llu elapsed_ms=%llu",
+                pid,
+                results.size(),
+                scanned_count,
+                static_cast<unsigned long long>(scanned_bytes),
+                static_cast<unsigned long long>(deadline.remaining_ms()),
+                static_cast<unsigned long long>(deadline.elapsed_ms()));
             break;
         }
+        if (scanned_count >= options.max_modules || scanned_bytes >= options.max_scan_bytes) {
+            stop_reason = scanned_count >= options.max_modules ? "max_modules_reached" : "max_scan_bytes_reached";
+            diag::log_tagged_fmt("net_proto",
+                "find_sendrecv stop pid=%u reason=%s results=%zu scanned_modules=%u scanned_bytes=%llu remaining_ms=%llu elapsed_ms=%llu",
+                pid,
+                stop_reason.c_str(),
+                results.size(),
+                scanned_count,
+                static_cast<unsigned long long>(scanned_bytes),
+                static_cast<unsigned long long>(deadline.remaining_ms()),
+                static_cast<unsigned long long>(deadline.elapsed_ms()));
+            break;
+        }
+        diag::log_tagged_fmt("net_proto",
+            "find_sendrecv module_consider pid=%u name=%s base=%s size=%llu path=%s scanned_modules=%u scanned_bytes=%llu remaining_ms=%llu elapsed_ms=%llu",
+            pid,
+            module.name.c_str(),
+            fmt_addr(module.base).c_str(),
+            static_cast<unsigned long long>(module.size),
+            module.path.c_str(),
+            scanned_count,
+            static_cast<unsigned long long>(scanned_bytes),
+            static_cast<unsigned long long>(deadline.remaining_ms()),
+            static_cast<unsigned long long>(deadline.elapsed_ms()));
         std::string module_skip = scan_module_skip_reason(module);
         if (module.base == 0)
             module_skip = "zero_module_base";
@@ -1113,6 +1833,15 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
             increment_json_counter(app_module_skip_histogram, module_skip);
             if (app_module_skips.size() < 32)
                 app_module_skips.push_back(nlohmann::json{{"name", module.name}, {"base", fmt_addr(module.base)}, {"size", module.size}, {"path", module.path}, {"skip_reason", module_skip}});
+            diag::log_tagged_fmt("net_proto",
+                "find_sendrecv module_skip pid=%u name=%s base=%s size=%llu reason=%s remaining_ms=%llu elapsed_ms=%llu",
+                pid,
+                module.name.c_str(),
+                fmt_addr(module.base).c_str(),
+                static_cast<unsigned long long>(module.size),
+                module_skip.c_str(),
+                static_cast<unsigned long long>(deadline.remaining_ms()),
+                static_cast<unsigned long long>(deadline.elapsed_ms()));
             continue;
         }
 
@@ -1127,16 +1856,54 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
         module_diag["requested_read_bytes"] = to_read;
         module_diag["scan_index"] = scanned_count;
         deadline.stage = "module_read";
+        module_diag["deadline_remaining_ms_before_read"] = deadline.remaining_ms();
+        diag::log_tagged_fmt("net_proto",
+            "find_sendrecv module_read_begin pid=%u name=%s base=%s request_bytes=%zu scanned_bytes=%llu remaining_ms=%llu elapsed_ms=%llu",
+            pid,
+            module.name.c_str(),
+            fmt_addr(module.base).c_str(),
+            to_read,
+            static_cast<unsigned long long>(scanned_bytes),
+            static_cast<unsigned long long>(deadline.remaining_ms()),
+            static_cast<unsigned long long>(deadline.elapsed_ms()));
         const ULONGLONG read_t0 = GetTickCount64();
         const bool read_ok = driver_bridge::read_memory_for(pid, module.base, to_read, bytes);
         module_diag["read_ok"] = read_ok;
         module_diag["read_elapsed_ms"] = GetTickCount64() - read_t0;
         module_diag["bytes_read"] = bytes.size();
+        module_diag["deadline_remaining_ms_after_read"] = deadline.remaining_ms();
+        diag::log_tagged_fmt("net_proto",
+            "find_sendrecv module_read_done pid=%u name=%s base=%s ok=%d requested_bytes=%zu bytes_read=%zu read_elapsed_ms=%llu scanned_bytes_before=%llu remaining_ms=%llu elapsed_ms=%llu",
+            pid,
+            module.name.c_str(),
+            fmt_addr(module.base).c_str(),
+            read_ok ? 1 : 0,
+            to_read,
+            bytes.size(),
+            static_cast<unsigned long long>(module_diag["read_elapsed_ms"].get<std::uint64_t>()),
+            static_cast<unsigned long long>(scanned_bytes),
+            static_cast<unsigned long long>(deadline.remaining_ms()),
+            static_cast<unsigned long long>(deadline.elapsed_ms()));
         if (!read_ok || bytes.size() < 16) {
             module_diag["rejection_reason"] = read_ok ? "read_too_small" : "read_failed";
+            diag::log_tagged_fmt("net_proto",
+                "find_sendrecv module_read_reject pid=%u name=%s reason=%s bytes_read=%zu deadline_hit=%d remaining_ms=%llu elapsed_ms=%llu",
+                pid,
+                module.name.c_str(),
+                module_diag["rejection_reason"].get<std::string>().c_str(),
+                bytes.size(),
+                deadline.hit ? 1 : 0,
+                static_cast<unsigned long long>(deadline.remaining_ms()),
+                static_cast<unsigned long long>(deadline.elapsed_ms()));
             if (module_diagnostics.size() < 32)
                 module_diagnostics.push_back(std::move(module_diag));
             if (deadline.expired("after_module_read")) {
+                diag::log_tagged_fmt("net_proto",
+                    "find_sendrecv deadline_after_module_read pid=%u name=%s remaining_ms=%llu elapsed_ms=%llu",
+                    pid,
+                    module.name.c_str(),
+                    static_cast<unsigned long long>(deadline.remaining_ms()),
+                    static_cast<unsigned long long>(deadline.elapsed_ms()));
                 stop_scan("deadline_after_module_read", "after_module_read");
                 break;
             }
@@ -1144,6 +1911,13 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
         }
         if (deadline.expired("after_module_read")) {
             module_diag["deadline_hit_after_read"] = true;
+            diag::log_tagged_fmt("net_proto",
+                "find_sendrecv deadline_after_module_read pid=%u name=%s bytes_read=%zu remaining_ms=%llu elapsed_ms=%llu",
+                pid,
+                module.name.c_str(),
+                bytes.size(),
+                static_cast<unsigned long long>(deadline.remaining_ms()),
+                static_cast<unsigned long long>(deadline.elapsed_ms()));
             if (module_diagnostics.size() < 32)
                 module_diagnostics.push_back(std::move(module_diag));
             stop_scan("deadline_after_module_read", "after_module_read");
@@ -1156,8 +1930,25 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
 
         std::map<std::uint64_t, const api_target_t*> import_slots;
         std::uint64_t module_candidate_hits = 0;
+        const ULONGLONG import_slots_t0 = GetTickCount64();
+        diag::log_tagged_fmt("net_proto",
+            "find_sendrecv scan_import_slots_begin pid=%u name=%s bytes=%zu api_targets=%zu remaining_ms=%llu elapsed_ms=%llu",
+            pid,
+            module.name.c_str(),
+            bytes.size(),
+            apis.size(),
+            static_cast<unsigned long long>(deadline.remaining_ms()),
+            static_cast<unsigned long long>(deadline.elapsed_ms()));
         for (std::size_t i = 0; i + 8 <= bytes.size(); i += 1) {
             if ((i & 0x3fffu) == 0 && deadline.expired("scan_import_slots")) {
+                diag::log_tagged_fmt("net_proto",
+                    "find_sendrecv scan_import_slots_deadline pid=%u name=%s offset=%zu import_slots=%zu remaining_ms=%llu elapsed_ms=%llu",
+                    pid,
+                    module.name.c_str(),
+                    i,
+                    import_slots.size(),
+                    static_cast<unsigned long long>(deadline.remaining_ms()),
+                    static_cast<unsigned long long>(deadline.elapsed_ms()));
                 stop_scan("deadline_import_slot_scan", "scan_import_slots");
                 break;
             }
@@ -1167,6 +1958,16 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
                 import_slots[module.base + i] = it->second;
         }
         module_diag["import_slot_count"] = import_slots.size();
+        module_diag["import_slot_scan_elapsed_ms"] = GetTickCount64() - import_slots_t0;
+        diag::log_tagged_fmt("net_proto",
+            "find_sendrecv scan_import_slots_done pid=%u name=%s import_slots=%zu stopped=%d scan_elapsed_ms=%llu remaining_ms=%llu elapsed_ms=%llu",
+            pid,
+            module.name.c_str(),
+            import_slots.size(),
+            stopped ? 1 : 0,
+            static_cast<unsigned long long>(module_diag["import_slot_scan_elapsed_ms"].get<std::uint64_t>()),
+            static_cast<unsigned long long>(deadline.remaining_ms()),
+            static_cast<unsigned long long>(deadline.elapsed_ms()));
         if (stopped) {
             module_diag["stop_reason"] = stop_reason;
             if (module_diagnostics.size() < 32)
@@ -1175,8 +1976,25 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
         }
 
         std::map<std::uint64_t, const api_target_t*> thunks;
+        const ULONGLONG thunks_t0 = GetTickCount64();
+        diag::log_tagged_fmt("net_proto",
+            "find_sendrecv scan_import_thunks_begin pid=%u name=%s bytes=%zu import_slots=%zu remaining_ms=%llu elapsed_ms=%llu",
+            pid,
+            module.name.c_str(),
+            bytes.size(),
+            import_slots.size(),
+            static_cast<unsigned long long>(deadline.remaining_ms()),
+            static_cast<unsigned long long>(deadline.elapsed_ms()));
         for (std::size_t i = 0; i + 6 <= bytes.size(); ++i) {
             if ((i & 0x3fffu) == 0 && deadline.expired("scan_import_thunks")) {
+                diag::log_tagged_fmt("net_proto",
+                    "find_sendrecv scan_import_thunks_deadline pid=%u name=%s offset=%zu thunks=%zu remaining_ms=%llu elapsed_ms=%llu",
+                    pid,
+                    module.name.c_str(),
+                    i,
+                    thunks.size(),
+                    static_cast<unsigned long long>(deadline.remaining_ms()),
+                    static_cast<unsigned long long>(deadline.elapsed_ms()));
                 stop_scan("deadline_import_thunk_scan", "scan_import_thunks");
                 break;
             }
@@ -1192,6 +2010,16 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
         for (const auto& t : thunks)
             excluded_targets.insert(t.first);
         module_diag["import_thunk_count"] = thunks.size();
+        module_diag["import_thunk_scan_elapsed_ms"] = GetTickCount64() - thunks_t0;
+        diag::log_tagged_fmt("net_proto",
+            "find_sendrecv scan_import_thunks_done pid=%u name=%s thunks=%zu stopped=%d scan_elapsed_ms=%llu remaining_ms=%llu elapsed_ms=%llu",
+            pid,
+            module.name.c_str(),
+            thunks.size(),
+            stopped ? 1 : 0,
+            static_cast<unsigned long long>(module_diag["import_thunk_scan_elapsed_ms"].get<std::uint64_t>()),
+            static_cast<unsigned long long>(deadline.remaining_ms()),
+            static_cast<unsigned long long>(deadline.elapsed_ms()));
         if (stopped) {
             module_diag["stop_reason"] = stop_reason;
             if (module_diagnostics.size() < 32)
@@ -1199,8 +2027,28 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
             break;
         }
 
+        const ULONGLONG callsites_t0 = GetTickCount64();
+        diag::log_tagged_fmt("net_proto",
+            "find_sendrecv scan_callsites_begin pid=%u name=%s bytes=%zu import_slots=%zu thunks=%zu results=%zu remaining_ms=%llu elapsed_ms=%llu",
+            pid,
+            module.name.c_str(),
+            bytes.size(),
+            import_slots.size(),
+            thunks.size(),
+            results.size(),
+            static_cast<unsigned long long>(deadline.remaining_ms()),
+            static_cast<unsigned long long>(deadline.elapsed_ms()));
         for (std::size_t i = 0; i + 6 <= bytes.size() && results.size() < options.max_results; ++i) {
             if ((i & 0x3fffu) == 0 && deadline.expired("scan_callsites")) {
+                diag::log_tagged_fmt("net_proto",
+                    "find_sendrecv scan_callsites_deadline pid=%u name=%s offset=%zu results=%zu candidate_hits=%llu remaining_ms=%llu elapsed_ms=%llu",
+                    pid,
+                    module.name.c_str(),
+                    i,
+                    results.size(),
+                    static_cast<unsigned long long>(candidate_hits),
+                    static_cast<unsigned long long>(deadline.remaining_ms()),
+                    static_cast<unsigned long long>(deadline.elapsed_ms()));
                 stop_scan("deadline_callsite_scan", "scan_callsites");
                 break;
             }
@@ -1233,10 +2081,24 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
             const std::uint64_t handler = find_probable_function_start(bytes, i, module.base);
             add_sendrecv_result(results, seen_callsites, module, bytes, *api, callsite, handler, 0, iat, excluded_targets, options.max_results);
         }
+        module_diag["callsite_scan_elapsed_ms"] = GetTickCount64() - callsites_t0;
         module_diag["candidate_hit_count"] = module_candidate_hits;
         module_diag["results_after_module"] = results.size();
         module_diag["deadline_hit"] = deadline.hit;
+        module_diag["deadline_remaining_ms_after_scan"] = deadline.remaining_ms();
         module_diag["elapsed_ms"] = deadline.elapsed_ms();
+        diag::log_tagged_fmt("net_proto",
+            "find_sendrecv scan_callsites_done pid=%u name=%s module_candidate_hits=%llu total_candidate_hits=%llu results=%zu stopped=%d scan_elapsed_ms=%llu scanned_bytes_total=%llu remaining_ms=%llu elapsed_ms=%llu",
+            pid,
+            module.name.c_str(),
+            static_cast<unsigned long long>(module_candidate_hits),
+            static_cast<unsigned long long>(candidate_hits),
+            results.size(),
+            stopped ? 1 : 0,
+            static_cast<unsigned long long>(module_diag["callsite_scan_elapsed_ms"].get<std::uint64_t>()),
+            static_cast<unsigned long long>(scanned_bytes),
+            static_cast<unsigned long long>(deadline.remaining_ms()),
+            static_cast<unsigned long long>(deadline.elapsed_ms()));
         if (module_diagnostics.size() < 32)
             module_diagnostics.push_back(std::move(module_diag));
         if (stopped)
@@ -1244,11 +2106,14 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
     }
 
     out["process_id"] = pid;
+    out["dependency_unavailable"] = false;
+    out["root_cause"] = deadline.hit ? std::string("scan_deadline") : (stop_reason.empty() ? std::string("complete") : stop_reason);
     out["results"] = std::move(results);
     out["result_count"] = out["results"].size();
     out["count"] = out["result_count"];
     out["deadline_hit"] = deadline.hit;
     out["elapsed_ms"] = deadline.elapsed_ms();
+    out["deadline_remaining_ms"] = deadline.remaining_ms();
     out["timeout_ms"] = options.timeout_ms;
     out["scanned_modules"] = std::move(scanned_modules);
     out["app_modules_scanned"] = out["scanned_modules"];
@@ -1268,7 +2133,8 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
         {"candidate_hit_count", candidate_hits},
         {"app_modules_scanned", out["app_modules_scanned"]},
         {"scanned_bytes", scanned_bytes},
-        {"deadline_stage", deadline.stage}
+        {"deadline_stage", deadline.stage},
+        {"deadline_remaining_ms", deadline.remaining_ms()}
     };
     out["limitations"] = nlohmann::json::array({
         "IAT and direct relative calls are detected; custom syscall wrappers may require manual follow-up",

@@ -88,6 +88,26 @@ struct custom_signature_t {
 	std::vector<uint8_t> pattern;
 };
 
+struct label_scan_diagnostics_t {
+	size_t      result_count = 0;
+	size_t      module_count = 0;
+	size_t      scanned_regions = 0;
+	size_t      candidate_references = 0;
+	size_t      labels_written = 0;
+	uint64_t    first_target_va = 0;
+	uint64_t    first_module_base = 0;
+	uint64_t    first_module_end = 0;
+	std::string first_module_name;
+};
+
+struct label_query_diagnostics_t {
+	uint64_t    query_va = 0;
+	bool        found = false;
+	size_t      map_size = 0;
+	std::string label;
+	std::string source;
+};
+
 struct scan_state_t {
 	std::vector<crypto_hit_t> results;
 	std::vector<entropy_region_t> entropy_map;
@@ -99,6 +119,8 @@ struct scan_state_t {
 	bool                      active = false;
 	std::unordered_map<uint64_t, std::string> function_labels;
 	float                     entropy_threshold = 7.0f;
+	label_scan_diagnostics_t  last_label_scan;
+	label_query_diagnostics_t last_label_query;
 };
 
 inline scan_state_t g_state;
@@ -113,6 +135,8 @@ struct snapshot_t {
 	bool                      active = false;
 	std::unordered_map<uint64_t, std::string> function_labels;
 	float                     entropy_threshold = 7.0f;
+	label_scan_diagnostics_t  last_label_scan;
+	label_query_diagnostics_t last_label_query;
 };
 
 inline std::unique_ptr<snapshot_t> detach_snapshot() {
@@ -127,6 +151,8 @@ inline std::unique_ptr<snapshot_t> detach_snapshot() {
 	out->active = g_state.active;
 	out->function_labels = std::move(g_state.function_labels);
 	out->entropy_threshold = g_state.entropy_threshold;
+	out->last_label_scan = std::move(g_state.last_label_scan);
+	out->last_label_query = std::move(g_state.last_label_query);
 	g_state.results.clear();
 	g_state.entropy_map.clear();
 	g_state.custom_sigs.clear();
@@ -136,6 +162,8 @@ inline std::unique_ptr<snapshot_t> detach_snapshot() {
 	g_state.active = false;
 	g_state.function_labels.clear();
 	g_state.entropy_threshold = 7.0f;
+	g_state.last_label_scan = {};
+	g_state.last_label_query = {};
 	return out;
 }
 
@@ -151,6 +179,8 @@ inline void attach_snapshot(std::unique_ptr<snapshot_t> snap) {
 	g_state.active = snap->active;
 	g_state.function_labels = std::move(snap->function_labels);
 	g_state.entropy_threshold = snap->entropy_threshold;
+	g_state.last_label_scan = std::move(snap->last_label_scan);
+	g_state.last_label_query = std::move(snap->last_label_query);
 }
 
 namespace constants {
@@ -947,9 +977,16 @@ inline void auto_label_references()
 		results_copy = g_state.results;
 	}
 
-	if (results_copy.empty()) return;
+	if (results_copy.empty()) {
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		g_state.last_label_scan = {};
+		return;
+	}
 
 	auto modules = driver_bridge::enumerate_modules();
+	label_scan_diagnostics_t diag;
+	diag.result_count = results_copy.size();
+	diag.module_count = modules.size();
 
 	struct module_cache_t {
 		uint64_t base = 0;
@@ -962,10 +999,17 @@ inline void auto_label_references()
 
 	for (auto& hit : results_copy) {
 		if (g_state.cancel.load()) break;
+		if (diag.first_target_va == 0)
+			diag.first_target_va = hit.address;
 
 		for (auto& m : modules) {
 			if (hit.address < m.base || hit.address >= m.base + m.size)
 				continue;
+			if (diag.first_module_base == 0) {
+				diag.first_module_base = m.base;
+				diag.first_module_end = m.base + m.size;
+				diag.first_module_name = m.name;
+			}
 
 			auto cache_it = mod_cache.find(m.base);
 			if (cache_it == mod_cache.end()) {
@@ -975,6 +1019,7 @@ inline void auto_label_references()
 				size_t read_size = static_cast<size_t>((std::min)(static_cast<uint64_t>(m.size), static_cast<uint64_t>(0x400000)));
 				driver_bridge::read_memory(m.base, read_size, mc.data);
 				if (mc.data.empty()) break;
+				++diag.scanned_regions;
 				cache_it = mod_cache.emplace(m.base, std::move(mc)).first;
 			}
 
@@ -1012,6 +1057,7 @@ inline void auto_label_references()
 					if (target == hit.address) {
 						hit.referencing_functions.push_back(ins_addr);
 						labels[ins_addr] = label;
+						++diag.candidate_references;
 					}
 				}
 				else if (is_lea) {
@@ -1025,6 +1071,7 @@ inline void auto_label_references()
 					if (target == hit.address) {
 						hit.referencing_functions.push_back(ins_addr);
 						labels[ins_addr] = label;
+						++diag.candidate_references;
 					}
 				}
 			}
@@ -1039,6 +1086,8 @@ inline void auto_label_references()
 		for (auto& [addr, lbl] : labels) {
 			g_state.function_labels[addr] = lbl;
 		}
+		diag.labels_written = labels.size();
+		g_state.last_label_scan = std::move(diag);
 	}
 }
 
@@ -1046,7 +1095,17 @@ inline std::string get_function_label(uint64_t addr)
 {
 	std::lock_guard<std::mutex> lk(g_state.mutex);
 	auto it = g_state.function_labels.find(addr);
-	if (it != g_state.function_labels.end()) return it->second;
+	g_state.last_label_query.query_va = addr;
+	g_state.last_label_query.map_size = g_state.function_labels.size();
+	if (it != g_state.function_labels.end()) {
+		g_state.last_label_query.found = true;
+		g_state.last_label_query.label = it->second;
+		g_state.last_label_query.source = "function_labels";
+		return it->second;
+	}
+	g_state.last_label_query.found = false;
+	g_state.last_label_query.label.clear();
+	g_state.last_label_query.source = "none";
 	return {};
 }
 

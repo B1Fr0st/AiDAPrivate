@@ -13,8 +13,10 @@
 #include <Windows.h>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -61,6 +63,32 @@ static void log_msg(HANDLE hf, const char* tag, const char* fmt, ...) {
 static long long elapsed_us_since(std::chrono::steady_clock::time_point t0) {
     return static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - t0).count());
+}
+
+static bool decode_float32(const std::vector<uint8_t>& bytes, float& out) {
+    if (bytes.size() != sizeof(out))
+        return false;
+    std::memcpy(&out, bytes.data(), sizeof(out));
+    return std::isfinite(out);
+}
+
+static bool decode_float64(const std::vector<uint8_t>& bytes, double& out) {
+    if (bytes.size() != sizeof(out))
+        return false;
+    std::memcpy(&out, bytes.data(), sizeof(out));
+    return std::isfinite(out);
+}
+
+static bool parse_formatted_float32(const std::string& text, float& out) {
+    char* end = nullptr;
+    out = std::strtof(text.c_str(), &end);
+    return end != text.c_str() && *end == '\0' && std::isfinite(out);
+}
+
+static bool parse_formatted_float64(const std::string& text, double& out) {
+    char* end = nullptr;
+    out = std::strtod(text.c_str(), &end);
+    return end != text.c_str() && *end == '\0' && std::isfinite(out);
 }
 
 static constexpr uint64_t k_marker_u64 = 0xCAFEBABE00000001ULL;
@@ -262,6 +290,18 @@ static bool seed_pointer_fixture_map(size_t& before_entries, size_t& after_entri
     }
 
     after_entries = pointer_scanner::g_state.map_entry_count;
+    pointer_scanner::g_state.last_map_diagnostics.pid = driver_bridge::attached_pid();
+    pointer_scanner::g_state.last_map_diagnostics.module_count = 1;
+    pointer_scanner::g_state.last_map_diagnostics.raw_region_count = 1;
+    pointer_scanner::g_state.last_map_diagnostics.scanned_region_count = 1;
+    pointer_scanner::g_state.last_map_diagnostics.scanned_bytes = k_anchor_page;
+    pointer_scanner::g_state.last_map_diagnostics.candidate_pointer_count =
+        level1_refs.size() + level0_refs.size();
+    pointer_scanner::g_state.last_map_diagnostics.map_key_count = pointer_scanner::g_state.reverse_map.size();
+    pointer_scanner::g_state.last_map_diagnostics.map_entry_count = after_entries;
+    pointer_scanner::g_state.last_map_diagnostics.duration_ms = 0;
+    pointer_scanner::g_state.last_map_diagnostics.cancelled = false;
+    pointer_scanner::g_state.last_map_diagnostics.source = "fixture_seed";
     return true;
 }
 
@@ -1515,15 +1555,82 @@ static void test_pointer_build_reverse_map(HANDLE hf, std::atomic<int>& passed, 
     bool idle = true;
 
     size_t entries = 0;
+    size_t map_keys = 0;
+    size_t target_candidates = 0;
+    size_t level1_candidates = 0;
+    pointer_scanner::map_diagnostics_t map_diag;
     {
         std::lock_guard<std::mutex> lk(pointer_scanner::g_state.map_mutex);
         entries = pointer_scanner::g_state.map_entry_count;
+        map_keys = pointer_scanner::g_state.reverse_map.size();
+        auto target_it = pointer_scanner::g_state.reverse_map.find(g_anchor.ptr_target);
+        if (target_it != pointer_scanner::g_state.reverse_map.end())
+            target_candidates = target_it->second.size();
+        auto level1_it = pointer_scanner::g_state.reverse_map.find(g_anchor.ptr_level1);
+        if (level1_it != pointer_scanner::g_state.reverse_map.end())
+            level1_candidates = level1_it->second.size();
+        map_diag = pointer_scanner::g_state.last_map_diagnostics;
+    }
+
+    pointer_scanner::g_state.config.target_address = g_anchor.ptr_target;
+    pointer_scanner::g_state.config.max_depth = 4;
+    pointer_scanner::g_state.config.max_offset = 256;
+    pointer_scanner::g_state.config.struct_size = 256;
+    pointer_scanner::g_state.config.negative_offsets = false;
+    pointer_scanner::g_state.config.only_static_bases = false;
+    pointer_scanner::clear_results();
+    if (seeded && entries > 0)
+        pointer_scanner::start_scan();
+
+    bool scan_idle = true;
+    if (seeded && entries > 0) {
+        scan_idle = false;
+        for (int i = 0; i < 100; ++i) {
+            if (!pointer_scanner::g_state.scanning.load()) { scan_idle = true; break; }
+            Sleep(25);
+        }
+    }
+
+    size_t chains = 0;
+    bool found_level1 = false;
+    bool found_level0 = false;
+    {
+        std::lock_guard<std::mutex> lk(pointer_scanner::g_state.results_mutex);
+        chains = pointer_scanner::g_state.results.size();
+        for (const auto& c : pointer_scanner::g_state.results) {
+            if (c.base_offset == g_anchor.ptr_level1) found_level1 = true;
+            if (c.base_offset == g_anchor.ptr_level0) found_level0 = true;
+        }
+    }
+    pointer_scanner::scan_diagnostics_t scan_diag;
+    {
+        std::lock_guard<std::mutex> lk(pointer_scanner::g_state.map_mutex);
+        scan_diag = pointer_scanner::g_state.last_scan_diagnostics;
     }
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "ptr_map", "RESULT seeded=%d idle=%d entries=%zu before=%zu after=%zu had_l1=%d had_l0=%d",
-        static_cast<int>(seeded), static_cast<int>(idle), entries, seed_before, seed_after,
-        static_cast<int>(had_level1), static_cast<int>(had_level0));
+    log_msg(hf, "ptr_map", "RESULT coverage=fixture_reverse_map target_va=0x%llX module=<anchor_fixture> module_base=0x%llX module_end=0x%llX seeded=%d map_idle=%d scan_idle=%d entries=%zu before=%zu after=%zu keys=%zu diag_keys=%zu scanned_regions=%zu candidate_pointers=%zu target_candidates=%zu level1_candidates=%zu chains=%zu diag_chains=%zu found_l1=%d found_l0=%d map_source=%s scan_ms=%llu",
+        (unsigned long long)g_anchor.ptr_target,
+        (unsigned long long)g_anchor.region_base,
+        (unsigned long long)(g_anchor.region_base + k_anchor_page),
+        static_cast<int>(seeded),
+        static_cast<int>(idle),
+        static_cast<int>(scan_idle),
+        entries,
+        seed_before,
+        seed_after,
+        map_keys,
+        map_diag.map_key_count,
+        map_diag.scanned_region_count,
+        map_diag.candidate_pointer_count,
+        target_candidates,
+        level1_candidates,
+        chains,
+        scan_diag.chain_count,
+        static_cast<int>(found_level1),
+        static_cast<int>(found_level0),
+        map_diag.source.c_str(),
+        static_cast<unsigned long long>(scan_diag.duration_ms));
 
     if (!seeded || entries == 0) {
         log_msg(hf, "ptr_map", "FAIL -- reverse map fixture was not seeded (seeded=%d entries=%zu) (elapsed %lld ms)",
@@ -1532,8 +1639,28 @@ static void test_pointer_build_reverse_map(HANDLE hf, std::atomic<int>& passed, 
         failed.fetch_add(1);
         return;
     }
+    if (!scan_idle) {
+        pointer_scanner::cancel_all();
+        log_msg(hf, "ptr_map", "FAIL -- fixture reverse-map chain scan did not finish target=0x%llX progress=%.3f (elapsed %lld ms)",
+            (unsigned long long)g_anchor.ptr_target,
+            static_cast<double>(pointer_scanner::g_state.scan_progress.load()), (long long)ms);
+        failed.fetch_add(1);
+        return;
+    }
+    if (target_candidates == 0 || level1_candidates == 0 || chains == 0 || !found_level1) {
+        log_msg(hf, "ptr_map", "FAIL -- reverse map evidence insufficient target_candidates=%zu level1_candidates=%zu chains=%zu found_l1=%d found_l0=%d (elapsed %lld ms)",
+            target_candidates,
+            level1_candidates,
+            chains,
+            static_cast<int>(found_level1),
+            static_cast<int>(found_level0),
+            (long long)ms);
+        failed.fetch_add(1);
+        return;
+    }
 
-    log_msg(hf, "ptr_map", "PASS -- reverse map seeded with %zu entries for planted chain (elapsed %lld ms)", entries, (long long)ms);
+    log_msg(hf, "ptr_map", "FIXTURE-PASS -- reverse map seeded %zu entries and produced %zu chains for target=0x%llX (elapsed %lld ms)",
+        entries, chains, (unsigned long long)g_anchor.ptr_target, (long long)ms);
     passed.fetch_add(1);
 }
 
@@ -2765,19 +2892,33 @@ static void test_format_parse_float(HANDLE hf, std::atomic<int>& passed, std::at
     log_msg(hf, "scan_fpfl", "START -- format/parse float roundtrip");
     auto t0 = std::chrono::steady_clock::now();
 
+    const float expected = 1.5f;
+    const float tolerance = 0.000001f;
     std::vector<uint8_t> parsed = memory_scanner::parse_value("1.5", memory_scanner::value_type_t::float_val, false);
     std::string formatted = memory_scanner::format_value(parsed, memory_scanner::value_type_t::float_val);
+    float decoded = 0.f;
+    float formatted_value = 0.f;
+    bool decoded_ok = decode_float32(parsed, decoded);
+    bool formatted_ok = parse_formatted_float32(formatted, formatted_value);
+    bool bytes_close = decoded_ok && std::fabs(decoded - expected) <= tolerance;
+    bool formatted_close = formatted_ok && std::fabs(formatted_value - expected) <= tolerance;
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "scan_fpfl", "RESULT parsed_bytes=%zu formatted=\"%s\"", parsed.size(), formatted.c_str());
-    bool close = parsed.size() == 4 && !formatted.empty() && formatted.find("1.5") != std::string::npos;
+    log_msg(hf, "scan_fpfl", "RESULT parsed_bytes=%zu decoded_ok=%d decoded=%.9g formatted=\"%s\" formatted_ok=%d formatted_value=%.9g expected=%.9g tolerance=%.9g",
+        parsed.size(), static_cast<int>(decoded_ok), static_cast<double>(decoded),
+        formatted.c_str(), static_cast<int>(formatted_ok), static_cast<double>(formatted_value),
+        static_cast<double>(expected), static_cast<double>(tolerance));
+    bool close = parsed.size() == 4 && bytes_close && formatted_close;
     if (close) {
-        log_msg(hf, "scan_fpfl", "PASS -- roundtrip float: 1.5 => %zu bytes => \"%s\" (elapsed %lld ms)",
-            parsed.size(), formatted.c_str(), (long long)ms);
+        log_msg(hf, "scan_fpfl", "PASS -- roundtrip float bytes/formatted numeric match decoded=%.9g formatted_value=%.9g bytes=%zu (elapsed %lld ms)",
+            static_cast<double>(decoded), static_cast<double>(formatted_value), parsed.size(), (long long)ms);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "scan_fpfl", "FAIL -- expected 4 bytes/~\"1.5\" got %zu/\"%s\" (elapsed %lld ms)",
-            parsed.size(), formatted.c_str(), (long long)ms);
+        log_msg(hf, "scan_fpfl", "FAIL -- float roundtrip mismatch bytes=%zu decoded_ok=%d decoded=%.9g formatted_ok=%d formatted_value=%.9g expected=%.9g bytes_close=%d formatted_close=%d (elapsed %lld ms)",
+            parsed.size(), static_cast<int>(decoded_ok), static_cast<double>(decoded),
+            static_cast<int>(formatted_ok), static_cast<double>(formatted_value),
+            static_cast<double>(expected), static_cast<int>(bytes_close), static_cast<int>(formatted_close),
+            (long long)ms);
         failed.fetch_add(1);
     }
 }
@@ -2786,19 +2927,32 @@ static void test_format_parse_double(HANDLE hf, std::atomic<int>& passed, std::a
     log_msg(hf, "scan_fpdl", "START -- format/parse double roundtrip");
     auto t0 = std::chrono::steady_clock::now();
 
+    const double expected = 2.71828;
+    const double tolerance = 0.000000001;
     std::vector<uint8_t> parsed = memory_scanner::parse_value("2.71828", memory_scanner::value_type_t::double_val, false);
     std::string formatted = memory_scanner::format_value(parsed, memory_scanner::value_type_t::double_val);
+    double decoded = 0.0;
+    double formatted_value = 0.0;
+    bool decoded_ok = decode_float64(parsed, decoded);
+    bool formatted_ok = parse_formatted_float64(formatted, formatted_value);
+    bool bytes_close = decoded_ok && std::fabs(decoded - expected) <= tolerance;
+    bool formatted_close = formatted_ok && std::fabs(formatted_value - expected) <= tolerance;
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "scan_fpdl", "RESULT parsed_bytes=%zu formatted=\"%s\"", parsed.size(), formatted.c_str());
-    bool close = parsed.size() == 8 && !formatted.empty() && formatted.find("2.71") != std::string::npos;
+    log_msg(hf, "scan_fpdl", "RESULT parsed_bytes=%zu decoded_ok=%d decoded=%.17g formatted=\"%s\" formatted_ok=%d formatted_value=%.17g expected=%.17g tolerance=%.17g",
+        parsed.size(), static_cast<int>(decoded_ok), decoded,
+        formatted.c_str(), static_cast<int>(formatted_ok), formatted_value,
+        expected, tolerance);
+    bool close = parsed.size() == 8 && bytes_close && formatted_close;
     if (close) {
-        log_msg(hf, "scan_fpdl", "PASS -- roundtrip double: 2.71828 => %zu bytes => \"%s\" (elapsed %lld ms)",
-            parsed.size(), formatted.c_str(), (long long)ms);
+        log_msg(hf, "scan_fpdl", "PASS -- roundtrip double bytes/formatted numeric match decoded=%.17g formatted_value=%.17g bytes=%zu (elapsed %lld ms)",
+            decoded, formatted_value, parsed.size(), (long long)ms);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "scan_fpdl", "FAIL -- expected 8 bytes/~2.71828 got %zu/\"%s\" (elapsed %lld ms)",
-            parsed.size(), formatted.c_str(), (long long)ms);
+        log_msg(hf, "scan_fpdl", "FAIL -- double roundtrip mismatch bytes=%zu decoded_ok=%d decoded=%.17g formatted_ok=%d formatted_value=%.17g expected=%.17g bytes_close=%d formatted_close=%d (elapsed %lld ms)",
+            parsed.size(), static_cast<int>(decoded_ok), decoded,
+            static_cast<int>(formatted_ok), formatted_value, expected,
+            static_cast<int>(bytes_close), static_cast<int>(formatted_close), (long long)ms);
         failed.fetch_add(1);
     }
 }
@@ -3174,20 +3328,92 @@ static void test_crypto_category_name(HANDLE hf, std::atomic<int>& passed, std::
 }
 
 static void test_crypto_get_function_label(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-    log_msg(hf, "crypto_gl", "START -- crypto scanner get_function_label (unmapped addr => empty)");
+    log_msg(hf, "crypto_gl", "START -- crypto scanner get_function_label deterministic fixture label");
     auto t0 = std::chrono::steady_clock::now();
 
-    std::string label = crypto_scanner::get_function_label(0xDEADBEEFDEADBEEFULL);
+    if (!g_anchor.planted) {
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        log_msg(hf, "crypto_gl", "FAIL -- no planted anchor; cannot seed deterministic function label (elapsed %lld ms)",
+            (long long)ms);
+        failed.fetch_add(1);
+        return;
+    }
+
+    const uint64_t query_va = g_anchor.region_base + 0x2A0;
+    const uint64_t missing_va = g_anchor.region_base + 0x2A8;
+    const char* expected_label = "crypto_fixture_aes_sbox";
+    size_t map_before = 0;
+    size_t map_after = 0;
+    bool had_previous = false;
+    std::string previous_label;
+    {
+        std::lock_guard<std::mutex> lk(crypto_scanner::g_state.mutex);
+        map_before = crypto_scanner::g_state.function_labels.size();
+        auto it = crypto_scanner::g_state.function_labels.find(query_va);
+        if (it != crypto_scanner::g_state.function_labels.end()) {
+            had_previous = true;
+            previous_label = it->second;
+        }
+        crypto_scanner::g_state.function_labels[query_va] = expected_label;
+        crypto_scanner::g_state.last_label_scan.result_count = 1;
+        crypto_scanner::g_state.last_label_scan.module_count = 1;
+        crypto_scanner::g_state.last_label_scan.scanned_regions = 1;
+        crypto_scanner::g_state.last_label_scan.candidate_references = 1;
+        crypto_scanner::g_state.last_label_scan.labels_written = 1;
+        crypto_scanner::g_state.last_label_scan.first_target_va = g_anchor.addr_aes_sbox;
+        crypto_scanner::g_state.last_label_scan.first_module_base = g_anchor.region_base;
+        crypto_scanner::g_state.last_label_scan.first_module_end = g_anchor.region_base + k_anchor_page;
+        crypto_scanner::g_state.last_label_scan.first_module_name = "<anchor_fixture>";
+        map_after = crypto_scanner::g_state.function_labels.size();
+    }
+
+    std::string label = crypto_scanner::get_function_label(query_va);
+    crypto_scanner::label_query_diagnostics_t hit_diag;
+    crypto_scanner::label_scan_diagnostics_t scan_diag;
+    {
+        std::lock_guard<std::mutex> lk(crypto_scanner::g_state.mutex);
+        hit_diag = crypto_scanner::g_state.last_label_query;
+        scan_diag = crypto_scanner::g_state.last_label_scan;
+    }
+    std::string missing = crypto_scanner::get_function_label(missing_va);
+    crypto_scanner::label_query_diagnostics_t miss_diag;
+    {
+        std::lock_guard<std::mutex> lk(crypto_scanner::g_state.mutex);
+        miss_diag = crypto_scanner::g_state.last_label_query;
+        if (had_previous) {
+            crypto_scanner::g_state.function_labels[query_va] = previous_label;
+        } else {
+            crypto_scanner::g_state.function_labels.erase(query_va);
+        }
+    }
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "crypto_gl", "RESULT label=\"%s\" (empty expected)", label.c_str());
-    if (label.empty()) {
-        log_msg(hf, "crypto_gl", "PASS -- get_function_label returned empty for unlabeled address (elapsed %lld ms)",
-            (long long)ms);
+    log_msg(hf, "crypto_gl", "RESULT coverage=fixture_label_map target_va=0x%llX module=%s module_base=0x%llX module_end=0x%llX query_va=0x%llX missing_va=0x%llX label=\"%s\" missing=\"%s\" map_before=%zu map_after=%zu scanned_regions=%zu candidate_refs=%zu labels_written=%zu label_source=%s hit_found=%d miss_source=%s miss_found=%d",
+        (unsigned long long)scan_diag.first_target_va,
+        scan_diag.first_module_name.c_str(),
+        (unsigned long long)scan_diag.first_module_base,
+        (unsigned long long)scan_diag.first_module_end,
+        (unsigned long long)query_va,
+        (unsigned long long)missing_va,
+        label.c_str(),
+        missing.c_str(),
+        map_before,
+        map_after,
+        scan_diag.scanned_regions,
+        scan_diag.candidate_references,
+        scan_diag.labels_written,
+        hit_diag.source.c_str(),
+        hit_diag.found ? 1 : 0,
+        miss_diag.source.c_str(),
+        miss_diag.found ? 1 : 0);
+    if (label == expected_label && missing.empty() && hit_diag.found && !miss_diag.found && map_after >= map_before + (had_previous ? 0 : 1)) {
+        log_msg(hf, "crypto_gl", "FIXTURE-PASS -- label lookup and unmapped negative lookup verified source=%s query=0x%llX (elapsed %lld ms)",
+            hit_diag.source.c_str(), (unsigned long long)query_va, (long long)ms);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "crypto_gl", "FAIL -- get_function_label returned \"%s\" for unlabeled address (elapsed %lld ms)",
-            label.c_str(), (long long)ms);
+        log_msg(hf, "crypto_gl", "FAIL -- label lookup evidence mismatch label=\"%s\" expected=\"%s\" missing_len=%zu hit_found=%d miss_found=%d map_before=%zu map_after=%zu (elapsed %lld ms)",
+            label.c_str(), expected_label, missing.size(), hit_diag.found ? 1 : 0,
+            miss_diag.found ? 1 : 0, map_before, map_after, (long long)ms);
         failed.fetch_add(1);
     }
 }

@@ -4,6 +4,7 @@
 #include "graphrag.hpp"
 #include "settings.hpp"
 #include "ida_utils.hpp"
+#include "analysis_db.hpp"
 
 #include <sstream>
 #include <regex>
@@ -14,6 +15,7 @@
 #include <entry.hpp>
 #include <strlist.hpp>
 #include <lines.hpp>
+#include <netnode.hpp>
 
 namespace graphrag
 {
@@ -25,6 +27,90 @@ static uint64_t now_ms()
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()
         ).count());
+}
+
+static uint64_t stable_hash64(const std::string& s)
+{
+    uint64_t h = 1469598103934665603ull;
+    for (unsigned char c : s)
+    {
+        h ^= c;
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+static nodeidx_t stable_netnode_slot(const std::string& s)
+{
+    uint64_t h = stable_hash64(s);
+    if (sizeof(nodeidx_t) < sizeof(uint64_t))
+        h = (h ^ (h >> 32)) & 0x7fffffffull;
+    else
+        h &= 0x7fffffffffffffffull;
+    nodeidx_t slot = static_cast<nodeidx_t>(h);
+    if (slot == BADNODE || slot == 0)
+        slot = static_cast<nodeidx_t>(1);
+    return slot;
+}
+
+static nodeidx_t graph_dirty_slot(const std::string& binary_hash)
+{
+    return stable_netnode_slot(std::string("graph_dirty:") + binary_hash);
+}
+
+static void save_graph_dirty_set(const std::string& binary_hash, const std::unordered_set<int>& dirty)
+{
+    if (binary_hash.empty()) return;
+    netnode nn("$ AiDA.graph.dirty", 0, true);
+    if (nn == BADNODE) return;
+    if (dirty.empty())
+    {
+        nn.delblob(graph_dirty_slot(binary_hash), 'D');
+        return;
+    }
+    std::vector<int> ids(dirty.begin(), dirty.end());
+    std::sort(ids.begin(), ids.end());
+    nlohmann::json j;
+    j["v"] = 1;
+    j["binary_hash"] = binary_hash;
+    j["dirty"] = ids;
+    auto blob = nlohmann::json::to_msgpack(j);
+    if (!blob.empty())
+        nn.setblob(blob.data(), blob.size(), graph_dirty_slot(binary_hash), 'D');
+}
+
+static std::unordered_set<int> load_graph_dirty_set(const std::string& binary_hash)
+{
+    std::unordered_set<int> out;
+    if (binary_hash.empty()) return out;
+    netnode nn("$ AiDA.graph.dirty");
+    if (nn == BADNODE) return out;
+    qvector<uchar> blob;
+    if (nn.getblob(&blob, graph_dirty_slot(binary_hash), 'D') <= 0)
+        return out;
+    try
+    {
+        std::vector<uint8_t> data(blob.begin(), blob.end());
+        auto j = nlohmann::json::from_msgpack(data);
+        if (j.value("binary_hash", std::string()) != binary_hash)
+            return out;
+        if (j.contains("dirty") && j["dirty"].is_array())
+        {
+            for (const auto& id : j["dirty"])
+                if (id.is_number_integer())
+                    out.insert(id.get<int>());
+        }
+    }
+    catch (...) { out.clear(); }
+    return out;
+}
+
+static void clear_graph_dirty_set(const std::string& binary_hash)
+{
+    if (binary_hash.empty()) return;
+    netnode nn("$ AiDA.graph.dirty");
+    if (nn == BADNODE) return;
+    nn.delblob(graph_dirty_slot(binary_hash), 'D');
 }
 
 static bool icontains(const std::string& haystack, const std::string& needle)
@@ -728,14 +814,23 @@ void save_vectors(const std::string& binary_hash)
     auto& lv = get_local_vectorizer();
 
     std::string emb_path = vs.get_embeddings_path(binary_hash);
+    bool saved_vectors = false;
     if (vs.save_to_file(emb_path))
+    {
+        saved_vectors = true;
         msg("[AiDA RAG] Saved %zu embeddings to %s\n", vs.size(), emb_path.c_str());
+    }
 
     if (lv.is_built())
     {
         std::string vec_path = lv.get_vectorizer_path(binary_hash);
-        lv.save_to_file(vec_path);
+        saved_vectors = lv.save_to_file(vec_path) || saved_vectors;
     }
+    if (saved_vectors)
+        aida_db::AnalysisDB::instance().mark_binary_capabilities(
+            binary_hash,
+            GraphStore::instance().get_stats(binary_hash).nodes > 0,
+            true);
 }
 
 void load_vectors(const std::string& binary_hash)
@@ -1111,6 +1206,55 @@ bool SecurityFeatureExtractor::features_t::is_empty() const
 }
 
 
+// ---- Slice H3: inverted-index helpers ---------------------------------------
+void GraphStore::vec_insert_unique(std::vector<int>& v, int id)
+{
+    auto it = std::lower_bound(v.begin(), v.end(), id);
+    if (it == v.end() || *it != id) v.insert(it, id);
+}
+
+void GraphStore::vec_remove(std::vector<int>& v, int id)
+{
+    auto it = std::lower_bound(v.begin(), v.end(), id);
+    if (it != v.end() && *it == id) v.erase(it);
+}
+
+void GraphStore::index_add_node_locked(const graph_node_t& node)
+{
+    for (const auto& f : node.security_flags)
+        vec_insert_unique(m_flag_index[f], node.id);
+    auto add_apis = [&](const std::vector<std::string>& apis) {
+        for (const auto& a : apis) vec_insert_unique(m_api_index[a], node.id);
+    };
+    add_apis(node.network_apis);
+    add_apis(node.file_io_apis);
+    add_apis(node.crypto_apis);
+    add_apis(node.process_apis);
+}
+
+void GraphStore::index_remove_node_locked(int node_id)
+{
+    auto nit = m_nodes.find(node_id);
+    if (nit == m_nodes.end()) return;
+    const graph_node_t& node = nit->second;
+    for (const auto& f : node.security_flags)
+    {
+        auto fit = m_flag_index.find(f);
+        if (fit != m_flag_index.end()) vec_remove(fit->second, node_id);
+    }
+    auto rm_apis = [&](const std::vector<std::string>& apis) {
+        for (const auto& a : apis)
+        {
+            auto ait = m_api_index.find(a);
+            if (ait != m_api_index.end()) vec_remove(ait->second, node_id);
+        }
+    };
+    rm_apis(node.network_apis);
+    rm_apis(node.file_io_apis);
+    rm_apis(node.crypto_apis);
+    rm_apis(node.process_apis);
+}
+
 graph_node_t* GraphStore::upsert_node(graph_node_t node)
 {
     std::lock_guard<std::mutex> lk(m_mtx);
@@ -1124,6 +1268,9 @@ graph_node_t* GraphStore::upsert_node(graph_node_t node)
     if (it != m_addr_index.end())
     {
         auto& existing = m_nodes[it->second];
+        // H3: O(diff) index update — drop old node from indices,
+        // then re-add after we mutate the in-place record below.
+        index_remove_node_locked(existing.id);
 
         existing.name = node.name;
         if (!node.raw_code.empty()) existing.raw_code = node.raw_code;
@@ -1143,6 +1290,10 @@ graph_node_t* GraphStore::upsert_node(graph_node_t node)
         if (node.confidence > 0) existing.confidence = node.confidence;
         existing.is_stale = node.is_stale;
         existing.updated_at = ts;
+        index_add_node_locked(existing);
+        m_dirty_nodes[existing.binary_hash].insert(existing.id);
+        if (m_nodes.size() > 10000)
+            save_graph_dirty_set(existing.binary_hash, m_dirty_nodes[existing.binary_hash]);
         return &existing;
     }
 
@@ -1150,8 +1301,13 @@ graph_node_t* GraphStore::upsert_node(graph_node_t node)
     node.created_at = ts;
     node.updated_at = ts;
     int id = node.id;
+    const std::string bh = node.binary_hash;
     m_nodes[id] = std::move(node);
     m_addr_index[key] = id;
+    index_add_node_locked(m_nodes[id]);
+    m_dirty_nodes[bh].insert(id);
+    if (m_nodes.size() > 10000)
+        save_graph_dirty_set(bh, m_dirty_nodes[bh]);
     return &m_nodes[id];
 }
 
@@ -1196,12 +1352,33 @@ graph_edge_t* GraphStore::add_edge(graph_edge_t edge)
 {
     std::lock_guard<std::mutex> lk(m_mtx);
 
+    if (edge.binary_hash.empty())
+    {
+        auto sit = m_nodes.find(edge.source_id);
+        auto tit = m_nodes.find(edge.target_id);
+        if (sit != m_nodes.end() && tit != m_nodes.end()
+            && sit->second.binary_hash == tit->second.binary_hash)
+            edge.binary_hash = sit->second.binary_hash;
+        else if (sit != m_nodes.end())
+            edge.binary_hash = sit->second.binary_hash;
+        else if (tit != m_nodes.end())
+            edge.binary_hash = tit->second.binary_hash;
+    }
 
     for (auto& eid : m_edges_from[edge.source_id])
     {
         auto& e = m_edges[eid];
         if (e.target_id == edge.target_id && e.edge_type == edge.edge_type)
+        {
+            if (e.binary_hash.empty() && !edge.binary_hash.empty())
+            {
+                e.binary_hash = edge.binary_hash;
+                auto& vec = m_edges_by_binary[e.binary_hash];
+                if (std::find(vec.begin(), vec.end(), eid) == vec.end())
+                    vec.push_back(eid);
+            }
             return &e;
+        }
     }
 
     edge.id = m_next_edge_id++;
@@ -1209,6 +1386,8 @@ graph_edge_t* GraphStore::add_edge(graph_edge_t edge)
     m_edges[id] = std::move(edge);
     m_edges_from[m_edges[id].source_id].push_back(id);
     m_edges_to[m_edges[id].target_id].push_back(id);
+    if (!m_edges[id].binary_hash.empty())
+        m_edges_by_binary[m_edges[id].binary_hash].push_back(id);
     return &m_edges[id];
 }
 
@@ -1482,28 +1661,44 @@ void GraphStore::delete_graph(const std::string& binary_hash)
 {
     std::lock_guard<std::mutex> lk(m_mtx);
 
+    std::unordered_set<int> node_ids;
+    for (const auto& kv : m_nodes)
+        if (kv.second.binary_hash == binary_hash)
+            node_ids.insert(kv.first);
 
-    auto eit = m_edges.begin();
-    while (eit != m_edges.end())
+    std::unordered_set<int> edge_ids;
+    auto ebit = m_edges_by_binary.find(binary_hash);
+    if (ebit != m_edges_by_binary.end())
+        edge_ids.insert(ebit->second.begin(), ebit->second.end());
+
+    for (int nid : node_ids)
     {
-        if (eit->second.binary_hash == binary_hash)
-            eit = m_edges.erase(eit);
-        else ++eit;
+        auto fit = m_edges_from.find(nid);
+        if (fit != m_edges_from.end())
+            edge_ids.insert(fit->second.begin(), fit->second.end());
+        auto tit = m_edges_to.find(nid);
+        if (tit != m_edges_to.end())
+            edge_ids.insert(tit->second.begin(), tit->second.end());
     }
 
+    for (int eid : edge_ids)
+        m_edges.erase(eid);
+
+    if (ebit != m_edges_by_binary.end())
+        m_edges_by_binary.erase(ebit);
 
     auto nit = m_nodes.begin();
     while (nit != m_nodes.end())
     {
         if (nit->second.binary_hash == binary_hash)
         {
+            index_remove_node_locked(nit->second.id);
             addr_key_t key{binary_hash, nit->second.node_type, nit->second.address};
             m_addr_index.erase(key);
             nit = m_nodes.erase(nit);
         }
         else ++nit;
     }
-
 
     auto cit = m_communities.begin();
     while (cit != m_communities.end())
@@ -1512,14 +1707,30 @@ void GraphStore::delete_graph(const std::string& binary_hash)
             cit = m_communities.erase(cit);
         else ++cit;
     }
-
+    m_dirty_nodes.erase(binary_hash);
+    clear_graph_dirty_set(binary_hash);
 
     m_edges_from.clear();
     m_edges_to.clear();
-    for (auto& [id, edge] : m_edges)
+    for (auto bit = m_edges_by_binary.begin(); bit != m_edges_by_binary.end(); )
     {
-        m_edges_from[edge.source_id].push_back(id);
-        m_edges_to[edge.target_id].push_back(id);
+        auto& ids = bit->second;
+        ids.erase(std::remove_if(ids.begin(), ids.end(), [&](int eid) {
+            return m_edges.find(eid) == m_edges.end();
+        }), ids.end());
+        if (ids.empty())
+        {
+            bit = m_edges_by_binary.erase(bit);
+            continue;
+        }
+        for (int eid : ids)
+        {
+            auto eit = m_edges.find(eid);
+            if (eit == m_edges.end()) continue;
+            m_edges_from[eit->second.source_id].push_back(eid);
+            m_edges_to[eit->second.target_id].push_back(eid);
+        }
+        ++bit;
     }
 }
 
@@ -1541,6 +1752,11 @@ std::string GraphStore::get_graph_path(const std::string& binary_hash) const
 
 bool GraphStore::save_to_file(const std::string& path)
 {
+    return save_to_file(path, std::string());
+}
+
+bool GraphStore::save_to_file(const std::string& path, const std::string& binary_hash)
+{
     std::lock_guard<std::mutex> lk(m_mtx);
 
     nlohmann::json j;
@@ -1550,18 +1766,203 @@ bool GraphStore::save_to_file(const std::string& path)
 
     j["nodes"] = nlohmann::json::array();
     for (auto& [id, node] : m_nodes)
-        j["nodes"].push_back(node);
+        if (binary_hash.empty() || node.binary_hash == binary_hash)
+            j["nodes"].push_back(node);
 
     j["edges"] = nlohmann::json::array();
     for (auto& [id, edge] : m_edges)
-        j["edges"].push_back(edge);
+        if (binary_hash.empty() || edge.binary_hash == binary_hash)
+            j["edges"].push_back(edge);
 
-    j["communities"] = m_communities;
+    j["communities"] = nlohmann::json::array();
+    for (const auto& c : m_communities)
+        if (binary_hash.empty() || c.binary_hash == binary_hash)
+            j["communities"].push_back(c);
 
     std::ofstream ofs(path, std::ios::binary);
     if (!ofs.is_open()) return false;
     ofs << j.dump(2);
+    if (binary_hash.empty())
+    {
+        for (const auto& kv : m_dirty_nodes)
+            clear_graph_dirty_set(kv.first);
+        m_dirty_nodes.clear();
+    }
+    else
+    {
+        m_dirty_nodes.erase(binary_hash);
+        clear_graph_dirty_set(binary_hash);
+    }
     return true;
+}
+
+int GraphStore::save_incremental(const std::string& binary_hash, const std::string& path)
+{
+    std::lock_guard<std::mutex> lk(m_mtx);
+
+    auto dit = m_dirty_nodes.find(binary_hash);
+    if (dit == m_dirty_nodes.end() || dit->second.empty())
+    {
+        auto recovered = load_graph_dirty_set(binary_hash);
+        if (!recovered.empty())
+        {
+            auto& dst = m_dirty_nodes[binary_hash];
+            dst.insert(recovered.begin(), recovered.end());
+            dit = m_dirty_nodes.find(binary_hash);
+        }
+    }
+    if (dit == m_dirty_nodes.end() || dit->second.empty()) return 0;
+
+    nlohmann::json j;
+    j["version"] = 1;
+    j["next_node_id"] = m_next_node_id;
+    j["next_edge_id"] = m_next_edge_id;
+    j["nodes"] = nlohmann::json::array();
+    for (auto& [id, node] : m_nodes)
+        if (node.binary_hash == binary_hash)
+            j["nodes"].push_back(node);
+    j["edges"] = nlohmann::json::array();
+    for (auto& [id, edge] : m_edges)
+        if (edge.binary_hash == binary_hash)
+            j["edges"].push_back(edge);
+    j["communities"] = nlohmann::json::array();
+    for (const auto& c : m_communities)
+        if (c.binary_hash == binary_hash)
+            j["communities"].push_back(c);
+
+    std::ofstream ofs(path, std::ios::binary);
+    if (!ofs.is_open()) return 0;
+    ofs << j.dump(2);
+
+    int n_flushed = static_cast<int>(dit->second.size());
+
+    m_dirty_nodes.erase(dit);
+    clear_graph_dirty_set(binary_hash);
+    return n_flushed;
+}
+
+int GraphStore::dirty_count(const std::string& binary_hash) const
+{
+    std::lock_guard<std::mutex> lk(m_mtx);
+    auto it = m_dirty_nodes.find(binary_hash);
+    return it == m_dirty_nodes.end() ? 0 : static_cast<int>(it->second.size());
+}
+
+void GraphStore::rebuild_inverted_indices(const std::string& binary_hash)
+{
+    std::lock_guard<std::mutex> lk(m_mtx);
+    // Wipe entries that belong to this binary, then re-add.
+    auto drop_from = [&](std::unordered_map<std::string, std::vector<int>>& idx) {
+        for (auto& [k, v] : idx)
+        {
+            v.erase(std::remove_if(v.begin(), v.end(), [&](int id) {
+                auto nit = m_nodes.find(id);
+                return nit == m_nodes.end() || nit->second.binary_hash == binary_hash;
+            }), v.end());
+        }
+    };
+    drop_from(m_flag_index);
+    drop_from(m_api_index);
+    for (auto& [id, node] : m_nodes)
+        if (node.binary_hash == binary_hash) index_add_node_locked(node);
+}
+
+std::vector<graph_node_t*> GraphStore::filter_nodes(const std::string& binary_hash,
+                                                    const nlohmann::json& criteria)
+{
+    std::lock_guard<std::mutex> lk(m_mtx);
+    std::vector<graph_node_t*> out;
+    if (!criteria.is_object()) return out;
+
+    auto str_list = [](const nlohmann::json& j, const char* key,
+                       std::vector<std::string>& out) {
+        if (!j.contains(key) || !j[key].is_array()) return;
+        for (auto& v : j[key])
+            if (v.is_string()) out.push_back(v.get<std::string>());
+    };
+
+    std::vector<std::string> all_flags, any_flags, all_apis, any_apis, risk_levels;
+    str_list(criteria, "all_flags", all_flags);
+    str_list(criteria, "any_flags", any_flags);
+    str_list(criteria, "all_apis",  all_apis);
+    str_list(criteria, "any_apis",  any_apis);
+    str_list(criteria, "risk_levels", risk_levels);
+
+    auto intersect_apply = [&](std::vector<int>& acc,
+                               const std::unordered_map<std::string, std::vector<int>>& idx,
+                               const std::string& key, bool& seeded) {
+        auto it = idx.find(key);
+        if (it == idx.end())
+        {
+            // missing flag/api => intersection becomes empty.
+            acc.clear();
+            seeded = true;
+            return;
+        }
+        if (!seeded) { acc = it->second; seeded = true; return; }
+        std::vector<int> next;
+        std::set_intersection(acc.begin(), acc.end(),
+                              it->second.begin(), it->second.end(),
+                              std::back_inserter(next));
+        acc = std::move(next);
+    };
+
+    // Start with all_flags intersection.
+    std::vector<int> candidates;
+    bool seeded = false;
+    for (const auto& f : all_flags) intersect_apply(candidates, m_flag_index, f, seeded);
+    for (const auto& a : all_apis)  intersect_apply(candidates, m_api_index,  a, seeded);
+
+    if (!seeded)
+    {
+        // No all-* constraints; iterate full node list for this binary.
+        candidates.reserve(m_nodes.size());
+        for (auto& [id, node] : m_nodes)
+            if (node.binary_hash == binary_hash) candidates.push_back(id);
+        std::sort(candidates.begin(), candidates.end());
+    }
+
+    // Apply any_flags / any_apis (OR of sets, intersected with candidates).
+    auto any_filter = [&](const std::vector<std::string>& items,
+                          const std::unordered_map<std::string, std::vector<int>>& idx) {
+        if (items.empty()) return;
+        std::vector<int> union_acc;
+        for (const auto& k : items)
+        {
+            auto it = idx.find(k);
+            if (it == idx.end()) continue;
+            std::vector<int> merged;
+            std::set_union(union_acc.begin(), union_acc.end(),
+                           it->second.begin(), it->second.end(),
+                           std::back_inserter(merged));
+            union_acc = std::move(merged);
+        }
+        std::vector<int> next;
+        std::set_intersection(candidates.begin(), candidates.end(),
+                              union_acc.begin(), union_acc.end(),
+                              std::back_inserter(next));
+        candidates = std::move(next);
+    };
+    any_filter(any_flags, m_flag_index);
+    any_filter(any_apis,  m_api_index);
+
+    // Finally project to nodes and apply binary_hash + risk_levels filter.
+    out.reserve(candidates.size());
+    for (int id : candidates)
+    {
+        auto nit = m_nodes.find(id);
+        if (nit == m_nodes.end()) continue;
+        auto& n = nit->second;
+        if (n.binary_hash != binary_hash) continue;
+        if (!risk_levels.empty())
+        {
+            bool ok = false;
+            for (const auto& r : risk_levels) if (n.risk_level == r) { ok = true; break; }
+            if (!ok) continue;
+        }
+        out.push_back(&n);
+    }
+    return out;
 }
 
 bool GraphStore::load_from_file(const std::string& path)
@@ -1581,6 +1982,10 @@ bool GraphStore::load_from_file(const std::string& path)
         m_addr_index.clear();
         m_edges_from.clear();
         m_edges_to.clear();
+        m_edges_by_binary.clear();
+        m_flag_index.clear();
+        m_api_index.clear();
+        m_dirty_nodes.clear();
 
         m_next_node_id = j.value("next_node_id", 1);
         m_next_edge_id = j.value("next_edge_id", 1);
@@ -1594,6 +1999,7 @@ bool GraphStore::load_from_file(const std::string& path)
                 addr_key_t key{n.binary_hash, n.node_type, n.address};
                 m_addr_index[key] = id;
                 m_nodes[id] = std::move(n);
+                index_add_node_locked(m_nodes[id]);
             }
         }
 
@@ -1603,14 +2009,39 @@ bool GraphStore::load_from_file(const std::string& path)
             {
                 graph_edge_t e = ej.get<graph_edge_t>();
                 int id = e.id;
+                if (e.binary_hash.empty())
+                {
+                    auto sit = m_nodes.find(e.source_id);
+                    auto tit = m_nodes.find(e.target_id);
+                    if (sit != m_nodes.end() && tit != m_nodes.end()
+                        && sit->second.binary_hash == tit->second.binary_hash)
+                        e.binary_hash = sit->second.binary_hash;
+                    else if (sit != m_nodes.end())
+                        e.binary_hash = sit->second.binary_hash;
+                    else if (tit != m_nodes.end())
+                        e.binary_hash = tit->second.binary_hash;
+                }
                 m_edges_from[e.source_id].push_back(id);
                 m_edges_to[e.target_id].push_back(id);
+                if (!e.binary_hash.empty())
+                    m_edges_by_binary[e.binary_hash].push_back(id);
                 m_edges[id] = std::move(e);
             }
         }
 
         if (j.contains("communities"))
             m_communities = j["communities"].get<std::vector<community_t>>();
+
+        std::unordered_set<std::string> hashes;
+        for (const auto& kv : m_nodes)
+            if (!kv.second.binary_hash.empty())
+                hashes.insert(kv.second.binary_hash);
+        for (const auto& h : hashes)
+        {
+            auto recovered = load_graph_dirty_set(h);
+            if (!recovered.empty())
+                m_dirty_nodes[h].insert(recovered.begin(), recovered.end());
+        }
 
         return true;
     }
@@ -3097,13 +3528,693 @@ void save_graph(const std::string& binary_hash)
     if (binary_hash.empty()) return;
     auto& store = GraphStore::instance();
     std::string path = store.get_graph_path(binary_hash);
-    if (store.save_to_file(path))
+    int flushed = store.save_incremental(binary_hash, path);
+    if (flushed > 0)
+    {
+        aida_db::AnalysisDB::instance().mark_binary_capabilities(
+            binary_hash,
+            store.get_stats(binary_hash).nodes > 0,
+            get_vector_store().size() > 0);
         msg("[AiDA RAG] Graph saved to %s\n", path.c_str());
+        return;
+    }
+    if (store.save_to_file(path, binary_hash))
+    {
+        aida_db::AnalysisDB::instance().mark_binary_capabilities(
+            binary_hash,
+            store.get_stats(binary_hash).nodes > 0,
+            get_vector_store().size() > 0);
+        msg("[AiDA RAG] Graph saved to %s\n", path.c_str());
+    }
 }
 
 void load_graph(const std::string& binary_hash)
 {
     initialize(binary_hash);
+}
+
+// ===========================================================================
+// Slice H5 - cursor overloads
+// ===========================================================================
+nlohmann::json QueryEngine::get_security_analysis(const std::string& binary_hash, int limit,
+                                                  const query_cursor_t& in_cursor,
+                                                  query_cursor_t& out_cursor, bool& out_has_more)
+{
+    auto nodes = m_store.get_nodes_by_type(binary_hash, node_type_t::FUNCTION);
+
+    std::unordered_set<int> seen(in_cursor.seen_node_ids.begin(), in_cursor.seen_node_ids.end());
+    uint64_t max_updated = in_cursor.since_ms;
+
+    nlohmann::json j;
+    j["total_functions"] = nodes.size();
+
+    int critical = 0, high = 0, medium = 0, low = 0;
+    nlohmann::json risky_funcs = nlohmann::json::array();
+    std::map<std::string, int> flag_counts;
+
+    out_cursor = in_cursor;
+    int eligible = 0;
+    for (auto* n : nodes)
+    {
+        if (n->updated_at <= in_cursor.since_ms) continue;
+        if (seen.count(n->id)) continue;
+
+        if (n->risk_level == "CRITICAL") ++critical;
+        else if (n->risk_level == "HIGH") ++high;
+        else if (n->risk_level == "MEDIUM") ++medium;
+        else if (n->risk_level == "LOW") ++low;
+        for (auto& f : n->security_flags) ++flag_counts[f];
+
+        if (n->risk_level == "CRITICAL" || n->risk_level == "HIGH")
+        {
+            ++eligible;
+            if (static_cast<int>(risky_funcs.size()) < limit)
+            {
+                risky_funcs.push_back({
+                    {"name", node_display_name(n)},
+                    {"address", n->address},
+                    {"risk_level", n->risk_level},
+                    {"security_flags", n->security_flags},
+                    {"activity_profile", n->activity_profile},
+                    {"node_id", n->id},
+                    {"updated_at", n->updated_at}
+                });
+                out_cursor.seen_node_ids.push_back(n->id);
+                if (n->updated_at > max_updated) max_updated = n->updated_at;
+            }
+        }
+    }
+    out_cursor.since_ms = max_updated;
+    out_has_more = (eligible > limit);
+
+    j["risk_summary"] = {
+        {"critical", critical}, {"high", high}, {"medium", medium}, {"low", low}
+    };
+    j["high_risk_functions"] = risky_funcs;
+    nlohmann::json flags_j = nlohmann::json::object();
+    for (auto& [flag, count] : flag_counts) flags_j[flag] = count;
+    j["security_flag_distribution"] = flags_j;
+    return j;
+}
+
+nlohmann::json QueryEngine::get_activity_analysis(const std::string& binary_hash,
+                                                  const std::string& activity_filter,
+                                                  const query_cursor_t& in_cursor,
+                                                  query_cursor_t& out_cursor, bool& out_has_more)
+{
+    auto nodes = m_store.get_nodes_by_type(binary_hash, node_type_t::FUNCTION);
+    std::unordered_set<int> seen(in_cursor.seen_node_ids.begin(), in_cursor.seen_node_ids.end());
+    uint64_t max_updated = in_cursor.since_ms;
+
+    std::map<std::string, std::vector<nlohmann::json>> by_activity;
+    out_cursor = in_cursor;
+    out_has_more = false;
+    for (auto* n : nodes)
+    {
+        if (n->activity_profile.empty()) continue;
+        if (n->updated_at <= in_cursor.since_ms) continue;
+        if (seen.count(n->id)) continue;
+
+        std::istringstream iss(n->activity_profile);
+        std::string token;
+        bool emitted = false;
+        while (std::getline(iss, token, ','))
+        {
+            if (!activity_filter.empty() && token != activity_filter) continue;
+            nlohmann::json entry;
+            entry["name"] = node_display_name(n);
+            entry["address"] = n->address;
+            entry["risk_level"] = n->risk_level;
+            entry["node_id"] = n->id;
+            entry["updated_at"] = n->updated_at;
+            by_activity[token].push_back(entry);
+            emitted = true;
+        }
+        if (emitted)
+        {
+            out_cursor.seen_node_ids.push_back(n->id);
+            if (n->updated_at > max_updated) max_updated = n->updated_at;
+        }
+    }
+    out_cursor.since_ms = max_updated;
+
+    nlohmann::json j;
+    int total = 0;
+    nlohmann::json activities = nlohmann::json::object();
+    for (auto& [activity, funcs] : by_activity)
+    {
+        activities[activity] = {{"count", funcs.size()}, {"functions", funcs}};
+        total += static_cast<int>(funcs.size());
+    }
+    j["total_functions_with_activity"] = total;
+    j["activities"] = activities;
+    return j;
+}
+
+nlohmann::json QueryEngine::search_semantic(const std::string& binary_hash,
+                                            const std::string& query, int limit,
+                                            const query_cursor_t& in_cursor,
+                                            query_cursor_t& out_cursor, bool& out_has_more)
+{
+    // Reuse non-cursor implementation, then filter by cursor.
+    nlohmann::json full = search_semantic(binary_hash, query, limit);
+    std::unordered_set<int> seen(in_cursor.seen_node_ids.begin(), in_cursor.seen_node_ids.end());
+    uint64_t max_updated = in_cursor.since_ms;
+
+    nlohmann::json out = nlohmann::json::array();
+    out_cursor = in_cursor;
+    if (!full.is_array()) { out_has_more = false; return out; }
+    for (auto& entry : full)
+    {
+        // The base search_semantic doesn't populate node_id/updated_at; derive
+        // from the GraphStore via address lookup so cursor logic still works.
+        ea_t addr = BADADDR;
+        if (entry.contains("address") && entry["address"].is_number())
+            addr = entry["address"].get<ea_t>();
+        auto* node = (addr == BADADDR) ? nullptr
+                       : m_store.get_node_by_address(binary_hash, node_type_t::FUNCTION, addr);
+        if (node)
+        {
+            if (node->updated_at <= in_cursor.since_ms) continue;
+            if (seen.count(node->id)) continue;
+            entry["node_id"] = node->id;
+            entry["updated_at"] = node->updated_at;
+            out_cursor.seen_node_ids.push_back(node->id);
+            if (node->updated_at > max_updated) max_updated = node->updated_at;
+        }
+        out.push_back(entry);
+    }
+    out_cursor.since_ms = max_updated;
+    out_has_more = (static_cast<int>(out.size()) == limit);
+    return out;
+}
+
+// ===========================================================================
+// Slice H4 - extract_externally_reachable_entries
+// ===========================================================================
+static const char* g_b64chars =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static std::string base64_encode(const std::string& in)
+{
+    std::string out;
+    int val = 0, valb = -6;
+    for (unsigned char c : in)
+    {
+        val = (val << 8) + c;
+        valb += 8;
+        while (valb >= 0) { out.push_back(g_b64chars[(val >> valb) & 0x3F]); valb -= 6; }
+    }
+    if (valb > -6) out.push_back(g_b64chars[((val << 8) >> (valb + 8)) & 0x3F]);
+    while (out.size() % 4) out.push_back('=');
+    return out;
+}
+
+static bool base64_decode(const std::string& in, std::string& out)
+{
+    static const int8_t T_init = -1;
+    static int8_t T[256];
+    static bool inited = false;
+    if (!inited)
+    {
+        for (int i = 0; i < 256; ++i) T[i] = T_init;
+        for (int i = 0; i < 64; ++i) T[(unsigned char)g_b64chars[i]] = i;
+        inited = true;
+    }
+    int val = 0, valb = -8;
+    out.clear();
+    for (unsigned char c : in)
+    {
+        if (T[c] < 0) { if (c == '=') break; else continue; }
+        val = (val << 6) + T[c];
+        valb += 6;
+        if (valb >= 0) { out.push_back(char((val >> valb) & 0xFF)); valb -= 8; }
+    }
+    return true;
+}
+
+std::string encode_cursor(const query_cursor_t& c)
+{
+    if (c.since_ms == 0 && c.seen_node_ids.empty()) return {};
+    nlohmann::json j;
+    j["since_ms"] = c.since_ms;
+    j["seen_node_ids"] = c.seen_node_ids;
+    return base64_encode(j.dump());
+}
+
+bool decode_cursor(const std::string& encoded, query_cursor_t& out)
+{
+    out = {};
+    if (encoded.empty()) return false;
+    std::string raw;
+    if (!base64_decode(encoded, raw)) return false;
+    try
+    {
+        auto j = nlohmann::json::parse(raw);
+        out.since_ms = j.value("since_ms", uint64_t(0));
+        out.seen_node_ids = j.value("seen_node_ids", std::vector<int>{});
+        return true;
+    }
+    catch (...) { return false; }
+}
+
+// Driver dispatch slot count (IRP_MJ_MAXIMUM_FUNCTION + 1 = 28).
+static constexpr int IRP_MAJOR_FUNCTION_SLOTS = 28;
+
+static std::string name_for_ea(ea_t ea)
+{
+    qstring q;
+    get_ea_name(&q, ea);
+    return std::string(q.c_str());
+}
+
+static std::string func_name_for_ea(ea_t ea)
+{
+    qstring q;
+    get_func_name(&q, ea);
+    if (!q.empty()) return std::string(q.c_str());
+    return name_for_ea(ea);
+}
+
+static std::string lower_copy(std::string s)
+{
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return s;
+}
+
+static bool filter_allows_api(const std::string& api, const std::vector<std::string>& filters)
+{
+    if (filters.empty()) return true;
+    std::string low = lower_copy(api);
+    for (const auto& f : filters)
+    {
+        std::string lf = lower_copy(f);
+        if (low == lf || low.find(lf) != std::string::npos)
+            return true;
+    }
+    return false;
+}
+
+static bool is_function_start_ea(ea_t ea)
+{
+    if (ea == BADADDR) return false;
+    func_t* pfn = get_func(ea);
+    return pfn != nullptr && pfn->start_ea == ea;
+}
+
+static nlohmann::json handler_record_json(uint64_t index, ea_t ea, const std::string& name,
+                                          bool include_code, size_t max_code_len)
+{
+    nlohmann::json h;
+    h["index"] = index;
+    h["ea"] = ea;
+    h["name"] = name;
+    if (include_code && is_function_start_ea(ea))
+    {
+        auto code = ida_utils::get_function_code(ea, max_code_len, false);
+        h["code"] = code.second;
+    }
+    return h;
+}
+
+struct binary_capability_index_ctx_t
+{
+    nlohmann::json* out = nullptr;
+    std::string module;
+    std::vector<std::string> filters;
+    size_t max_callsites = 64;
+};
+
+static int idaapi binary_capability_import_cb(ea_t ea, const char* name, uval_t ord, void* param)
+{
+    auto* ctx = static_cast<binary_capability_index_ctx_t*>(param);
+    if (ctx == nullptr || ctx->out == nullptr) return 0;
+
+    std::string api = name != nullptr ? std::string(name) : std::string("ord_") + std::to_string(static_cast<uint64_t>(ord));
+    if (!filter_allows_api(api, ctx->filters)) return 1;
+
+    nlohmann::json entry;
+    entry["module"] = ctx->module;
+    entry["callsite_count"] = 0;
+    entry["callsites"] = nlohmann::json::array();
+
+    int count = 0;
+    xrefblk_t xb;
+    for (bool ok = xb.first_to(ea, XREF_ALL); ok; ok = xb.next_to())
+    {
+        ++count;
+        if (entry["callsites"].size() >= ctx->max_callsites)
+            continue;
+        func_t* pfn = get_func(xb.from);
+        nlohmann::json cs;
+        cs["ea"] = xb.from;
+        cs["func_name"] = pfn ? func_name_for_ea(pfn->start_ea) : std::string();
+        cs["func_ea"] = pfn ? pfn->start_ea : BADADDR;
+        entry["callsites"].push_back(std::move(cs));
+    }
+    entry["callsite_count"] = count;
+
+    nlohmann::json& root = *ctx->out;
+    if (root.contains(api))
+    {
+        auto& existing = root[api];
+        existing["callsite_count"] = existing.value("callsite_count", 0) + count;
+        if (existing.value("module", std::string()).find(ctx->module) == std::string::npos)
+            existing["module"] = existing.value("module", std::string()) + "," + ctx->module;
+        for (const auto& cs : entry["callsites"])
+        {
+            if (existing["callsites"].size() < ctx->max_callsites)
+                existing["callsites"].push_back(cs);
+        }
+    }
+    else
+    {
+        root[api] = std::move(entry);
+    }
+    return 1;
+}
+
+std::vector<external_entry_t> extract_externally_reachable_entries()
+{
+    std::vector<external_entry_t> out;
+    std::unordered_set<ea_t> seen;
+    auto add = [&](ea_t ea, std::string name, const char* category, const char* source)
+    {
+        if (ea == BADADDR) return;
+        if (!seen.insert(ea).second) return;
+        out.push_back({ea, std::move(name), category, source});
+    };
+
+    auto name_of = [](ea_t ea) -> std::string {
+        qstring q; get_ea_name(&q, ea); return std::string(q.c_str());
+    };
+
+    // 1. PE exports via entry.hpp.
+    {
+        size_t qty = get_entry_qty();
+        for (size_t i = 0; i < qty; ++i)
+        {
+            uval_t ord = get_entry_ordinal(i);
+            ea_t ea = get_entry(ord);
+            qstring nm; get_entry_name(&nm, ord);
+            std::string nstr = nm.c_str();
+            if (nstr.empty()) nstr = name_of(ea);
+            add(ea, nstr, "pe_export", "entry.hpp/get_entry");
+        }
+    }
+
+    // Walk all functions once to bucket by name pattern (RPC NDR, COM
+    // IDispatch surrogate names, WinRT activation factories, service handlers,
+    // WSK callbacks, driver dispatch).
+    const std::regex re_rpc_ndr(R"(^Ndr(64)?\w*(Client|Server)Call\w*)");
+    const std::regex re_winrt(R"(^DllGetActivationFactory$|ActivationFactoryFor|GetActivationFactory)");
+    const std::regex re_service(R"(ServiceMain$|ServiceHandlerEx?$|ServiceCtrlHandlerEx?$)");
+    const std::regex re_wsk(R"(^Wsk\w+Event)");
+    const std::regex re_idispatch(R"(IDispatch::Invoke|::Invoke$|IDispatch_Invoke)");
+
+    for (size_t i = 0, n = get_func_qty(); i < n; ++i)
+    {
+        func_t* pfn = getn_func(i);
+        if (!pfn) continue;
+        std::string nm = name_of(pfn->start_ea);
+        if (nm.empty()) continue;
+        if (std::regex_search(nm, re_rpc_ndr))
+            add(pfn->start_ea, nm, "rpc_ndr", "name pattern Ndr*ClientCall*/Ndr*ServerCall*");
+        else if (std::regex_search(nm, re_winrt))
+            add(pfn->start_ea, nm, "winrt_factory", "name pattern DllGetActivationFactory/ActivationFactoryFor");
+        else if (std::regex_search(nm, re_service))
+            add(pfn->start_ea, nm, "service_handler", "name pattern ServiceMain/ServiceHandlerEx");
+        else if (std::regex_search(nm, re_wsk))
+            add(pfn->start_ea, nm, "wsk_callback", "name pattern Wsk*Event");
+        else if (std::regex_search(nm, re_idispatch))
+            add(pfn->start_ea, nm, "com_idispatch", "name pattern IDispatch::Invoke");
+    }
+
+    auto add_registration_callers = [&](const std::vector<std::string>& apis,
+                                        const char* category,
+                                        const char* source)
+    {
+        nlohmann::json caps = build_binary_capability_index(apis, 256);
+        if (!caps.contains("imports") || !caps["imports"].is_object()) return;
+        for (auto it = caps["imports"].begin(); it != caps["imports"].end(); ++it)
+        {
+            const auto& entry = it.value();
+            if (!entry.contains("callsites") || !entry["callsites"].is_array()) continue;
+            for (const auto& cs : entry["callsites"])
+            {
+                if (!cs.contains("func_ea") || !cs["func_ea"].is_number()) continue;
+                ea_t fea = cs["func_ea"].get<ea_t>();
+                if (fea == BADADDR) continue;
+                add(fea, func_name_for_ea(fea), category, source);
+            }
+        }
+    };
+
+    add_registration_callers({"RpcServerRegisterIf", "RpcServerRegisterIf2", "RpcServerRegisterIfEx",
+                              "NdrServerCall", "Ndr64ServerCall"},
+                             "rpc_ndr", "RPC/NDR registration import caller");
+    add_registration_callers({"CoRegisterClassObject", "DllGetClassObject", "IDispatch"},
+                             "com_idispatch", "COM registration import caller");
+    add_registration_callers({"StartServiceCtrlDispatcher", "RegisterServiceCtrlHandler",
+                              "RegisterServiceCtrlHandlerEx"},
+                             "service_handler", "service-control registration import caller");
+    add_registration_callers({"WskRegister", "WskCaptureProviderNPI"},
+                             "wsk_callback", "WSK registration import caller");
+
+    // 2. Driver dispatch table: scan for "mov [reg+offset], imm" style stores
+    //    targeting DriverObject->MajorFunction by walking xrefs from data
+    //    segments to known functions. We approximate via DriverEntry: find the
+    //    entry symbol and harvest writes within it that reference functions.
+    {
+        ea_t drv_entry = get_name_ea(BADADDR, "DriverEntry");
+        if (drv_entry == BADADDR) drv_entry = get_name_ea(BADADDR, "GsDriverEntry");
+        if (drv_entry != BADADDR)
+        {
+            func_t* pfn = get_func(drv_entry);
+            if (pfn)
+            {
+                // Walk function code for code refs to other functions; capture
+                // any code ref whose target is itself a function (heuristic).
+                ea_t ea = pfn->start_ea;
+                int captured = 0;
+                while (ea < pfn->end_ea && ea != BADADDR && captured < IRP_MAJOR_FUNCTION_SLOTS * 2)
+                {
+                    xrefblk_t xb;
+                    for (bool ok = xb.first_from(ea, XREF_CODE | XREF_NOFLOW); ok; ok = xb.next_from())
+                    {
+                        if (xb.to == BADADDR) continue;
+                        func_t* tgt = get_func(xb.to);
+                        if (tgt && tgt->start_ea == xb.to)
+                        {
+                            insn_t insn;
+                            if (decode_insn(&insn, ea) > 0 && is_call_insn(insn))
+                                continue;
+                            add(xb.to, name_of(xb.to), "driver_dispatch", "DriverEntry-resident function pointer write");
+                            ++captured;
+                        }
+                    }
+                    ea = next_head(ea, pfn->end_ea);
+                }
+            }
+        }
+    }
+
+    return out;
+}
+
+nlohmann::json build_binary_capability_index(const std::vector<std::string>& filter_apis,
+                                             size_t max_callsites_per_api)
+{
+    nlohmann::json j;
+    j["imports"] = nlohmann::json::object();
+    j["filter_apis"] = filter_apis;
+
+    uint qty = get_import_module_qty();
+    for (uint i = 0; i < qty; ++i)
+    {
+        qstring mod;
+        if (!get_import_module_name(&mod, static_cast<int>(i)))
+            continue;
+        binary_capability_index_ctx_t ctx;
+        ctx.out = &j["imports"];
+        ctx.module = mod.c_str();
+        ctx.filters = filter_apis;
+        ctx.max_callsites = max_callsites_per_api;
+        enum_import_names(static_cast<int>(i), binary_capability_import_cb, &ctx);
+    }
+
+    j["api_count"] = j["imports"].size();
+    return j;
+}
+
+struct dispatch_ctree_visitor_t : public ctree_visitor_t
+{
+    nlohmann::json* tables = nullptr;
+    ea_t func_ea = BADADDR;
+    std::string func_name;
+    bool include_code = false;
+    size_t max_code_len = 6000;
+    std::vector<nlohmann::json> vtable_handlers;
+    std::set<std::pair<ea_t, uint64_t>> vtable_seen;
+
+    dispatch_ctree_visitor_t(nlohmann::json* out, ea_t ea, std::string name,
+                             bool code, size_t max_len)
+        : ctree_visitor_t(CV_PARENTS),
+          tables(out),
+          func_ea(ea),
+          func_name(std::move(name)),
+          include_code(code),
+          max_code_len(max_len)
+    {
+    }
+
+    int idaapi visit_insn(cinsn_t* insn) override
+    {
+        if (insn == nullptr || insn->op != cit_switch || insn->cswitch == nullptr || tables == nullptr)
+            return 0;
+
+        nlohmann::json t;
+        t["type"] = "switch";
+        t["base_ea"] = insn->ea;
+        t["function_ea"] = func_ea;
+        t["function_name"] = func_name;
+        t["handlers"] = nlohmann::json::array();
+
+        int idx = 0;
+        for (const auto& cc : insn->cswitch->cases)
+        {
+            uint64_t index = cc.values.empty() ? uint64_t(-1) : cc.values[0];
+            std::string name = cc.values.empty()
+                ? std::string("case_default")
+                : std::string("case_") + std::to_string(index);
+            auto h = handler_record_json(index, cc.ea != BADADDR ? cc.ea : insn->ea,
+                                         name, include_code, max_code_len);
+            h["case_values"] = nlohmann::json::array();
+            for (uint64_t v : cc.values)
+                h["case_values"].push_back(v);
+            h["ordinal"] = idx++;
+            t["handlers"].push_back(std::move(h));
+        }
+        t["size"] = t["handlers"].size();
+        tables->push_back(std::move(t));
+        return 0;
+    }
+
+    int idaapi visit_expr(cexpr_t* expr) override
+    {
+        if (expr == nullptr || expr->op != cot_memptr)
+            return 0;
+        if (!expr->is_call_object_of(parent_item()))
+            return 0;
+        auto key = std::make_pair(expr->ea, static_cast<uint64_t>(expr->m));
+        if (!vtable_seen.insert(key).second)
+            return 0;
+        uint64_t index = expr->ptrsize > 0 ? static_cast<uint64_t>(expr->m / expr->ptrsize)
+                                           : static_cast<uint64_t>(expr->m);
+        auto h = handler_record_json(index, expr->ea, std::string("vtable_slot_") + std::to_string(index),
+                                     include_code, max_code_len);
+        h["offset"] = static_cast<uint64_t>(expr->m);
+        vtable_handlers.push_back(std::move(h));
+        return 0;
+    }
+};
+
+static void append_fn_array_table(nlohmann::json& tables, ea_t base, const std::vector<ea_t>& handlers,
+                                  bool include_code, size_t max_code_len)
+{
+    if (handlers.size() < 2) return;
+    nlohmann::json t;
+    t["type"] = "fn_array";
+    t["base_ea"] = base;
+    t["size"] = handlers.size();
+    t["handlers"] = nlohmann::json::array();
+    for (size_t i = 0; i < handlers.size(); ++i)
+    {
+        ea_t target = handlers[i];
+        t["handlers"].push_back(handler_record_json(
+            static_cast<uint64_t>(i),
+            target,
+            func_name_for_ea(target),
+            include_code,
+            max_code_len));
+    }
+    tables.push_back(std::move(t));
+}
+
+nlohmann::json extract_dispatch_tables(bool include_handler_code,
+                                       size_t max_handler_code_len)
+{
+    nlohmann::json result;
+    result["tables"] = nlohmann::json::array();
+
+    if (init_hexrays_plugin())
+    {
+        for (size_t i = 0, n = get_func_qty(); i < n; ++i)
+        {
+            func_t* pfn = getn_func(i);
+            if (pfn == nullptr || !ida_utils::is_safely_decompilable(pfn))
+                continue;
+            hexrays_failure_t hf;
+            cfuncptr_t cf = decompile_func(pfn, &hf, DECOMP_NO_WAIT | DECOMP_WARNINGS);
+            if (cf == nullptr)
+                continue;
+            dispatch_ctree_visitor_t vis(&result["tables"], pfn->start_ea,
+                                         func_name_for_ea(pfn->start_ea),
+                                         include_handler_code,
+                                         max_handler_code_len);
+            vis.apply_to(&cf->body, nullptr);
+            if (!vis.vtable_handlers.empty())
+            {
+                nlohmann::json t;
+                t["type"] = "vtable";
+                t["base_ea"] = pfn->start_ea;
+                t["function_ea"] = pfn->start_ea;
+                t["function_name"] = func_name_for_ea(pfn->start_ea);
+                t["size"] = vis.vtable_handlers.size();
+                t["handlers"] = std::move(vis.vtable_handlers);
+                result["tables"].push_back(std::move(t));
+            }
+        }
+    }
+
+    const int ptr_size = inf_is_64bit() ? 8 : 4;
+    for (int si = 0, sn = get_segm_qty(); si < sn; ++si)
+    {
+        segment_t* seg = getnseg(si);
+        if (seg == nullptr || seg->type == SEG_XTRN || (seg->perm & SEGPERM_EXEC) != 0)
+            continue;
+
+        std::vector<ea_t> current;
+        ea_t current_base = BADADDR;
+        for (ea_t ea = seg->start_ea; ea != BADADDR && ea + ptr_size <= seg->end_ea; ea += ptr_size)
+        {
+            flags64_t f = get_flags(ea);
+            ea_t target = BADADDR;
+            if (has_value(f))
+                target = ptr_size == 8 ? static_cast<ea_t>(get_qword(ea))
+                                       : static_cast<ea_t>(get_dword(ea));
+
+            if (is_function_start_ea(target))
+            {
+                if (current.empty())
+                    current_base = ea;
+                current.push_back(target);
+                continue;
+            }
+
+            append_fn_array_table(result["tables"], current_base, current,
+                                  include_handler_code, max_handler_code_len);
+            current.clear();
+            current_base = BADADDR;
+        }
+        append_fn_array_table(result["tables"], current_base, current,
+                              include_handler_code, max_handler_code_len);
+    }
+
+    result["table_count"] = result["tables"].size();
+    return result;
 }
 
 }

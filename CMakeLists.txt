@@ -2027,7 +2027,7 @@ if(WIN32)
 
         option(AIDA_CAMOUFOX_STAGE_SIDECAR_DEPS "Stage Camoufox runtime sidecars beside AiDAStandalone for development" OFF)
         option(AIDA_CAMOUFOX_STAGE_REVERSE_MCP_SOURCE "Stage private camoufox-reverse-mcp source beside AiDAStandalone for local development" OFF)
-        option(AIDA_CAMOUFOX_BUILD_REVERSE_MCP_EXE "Build the frozen Camoufox reverse MCP executable during the CMake build" OFF)
+        option(AIDA_CAMOUFOX_BUILD_REVERSE_MCP_EXE "Build the frozen Camoufox reverse MCP executable during the CMake build" ON)
 
         set(AIDA_CAMOUFOX_MCP_DIR "")
         if(AIDA_CAMOUFOX_STAGE_REVERSE_MCP_SOURCE)
@@ -2067,7 +2067,8 @@ if(WIN32)
                 set(AIDA_CAMOUFOX_REVERSE_MCP_SOURCE_DIR "${AIDA_CAMOUFOX_REVERSE_MCP_SOURCE_CANDIDATE}")
             endif()
         endforeach()
-        set(AIDA_CAMOUFOX_REVERSE_MCP_CANONICAL_EXE "${CMAKE_CURRENT_SOURCE_DIR}/.deps/AiDA_CamoufoxReverseMcp.exe")
+        set(AIDA_CAMOUFOX_REVERSE_MCP_CANONICAL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.deps/AiDA_CamoufoxReverseMcp")
+        set(AIDA_CAMOUFOX_REVERSE_MCP_CANONICAL_EXE "${AIDA_CAMOUFOX_REVERSE_MCP_CANONICAL_DIR}/AiDA_CamoufoxReverseMcp.exe")
         set(AIDA_CAMOUFOX_REVERSE_MCP_BUILD_TARGET_READY OFF)
         if(AIDA_CAMOUFOX_BUILD_REVERSE_MCP_EXE AND EXISTS "${AIDA_CAMOUFOX_REVERSE_MCP_BUILD_SCRIPT}" AND AIDA_CAMOUFOX_REVERSE_MCP_SOURCE_DIR)
             find_program(AIDA_POWERSHELL_EXECUTABLE NAMES powershell.exe powershell pwsh.exe pwsh)
@@ -2104,12 +2105,14 @@ if(WIN32)
             )
             set(AIDA_CAMOUFOX_REVERSE_MCP_BUILD_TARGET_READY ON)
         elseif(EXISTS "${AIDA_CAMOUFOX_REVERSE_MCP_BUILD_SCRIPT}" AND AIDA_CAMOUFOX_REVERSE_MCP_SOURCE_DIR)
-            message(STATUS "AiDA Camoufox reverse MCP source detected; frozen executable build is opt-in via AIDA_CAMOUFOX_BUILD_REVERSE_MCP_EXE=ON")
+            message(STATUS "AiDA Camoufox reverse MCP source detected; frozen executable build disabled, existing frozen candidate must pass contract validation before staging")
         endif()
 
         set(AIDA_CAMOUFOX_REVERSE_MCP_EXE_CANDIDATES
+            "${CMAKE_CURRENT_SOURCE_DIR}/.deps/AiDA_CamoufoxReverseMcp/AiDA_CamoufoxReverseMcp.exe"
             "${CMAKE_CURRENT_SOURCE_DIR}/.deps/AiDA_CamoufoxReverseMcp.exe"
             "${CMAKE_CURRENT_SOURCE_DIR}/.deps/camoufox-reverse-mcp.exe"
+            "${CMAKE_CURRENT_SOURCE_DIR}/camoufox-reverse-mcp/dist/AiDA_CamoufoxReverseMcp/AiDA_CamoufoxReverseMcp.exe"
             "${CMAKE_CURRENT_SOURCE_DIR}/camoufox-reverse-mcp/dist/AiDA_CamoufoxReverseMcp.exe"
             "${CMAKE_CURRENT_SOURCE_DIR}/camoufox-reverse-mcp/dist/camoufox-reverse-mcp.exe"
             "${CMAKE_CURRENT_SOURCE_DIR}/AiDA_CamoufoxReverseMcp.exe"
@@ -2124,6 +2127,41 @@ if(WIN32)
                     set(AIDA_CAMOUFOX_REVERSE_MCP_EXE "${AIDA_CAMOUFOX_REVERSE_MCP_EXE_CANDIDATE}")
                 endif()
             endforeach()
+        endif()
+
+        if(AIDA_CAMOUFOX_REVERSE_MCP_EXE AND NOT AIDA_CAMOUFOX_REVERSE_MCP_BUILD_TARGET_READY)
+            if(NOT EXISTS "${AIDA_CAMOUFOX_REVERSE_MCP_BUILD_SCRIPT}")
+                message(FATAL_ERROR "AiDA Camoufox frozen reverse MCP staging found ${AIDA_CAMOUFOX_REVERSE_MCP_EXE} but contract validation script is missing")
+            endif()
+            if(NOT AIDA_POWERSHELL_EXECUTABLE)
+                find_program(AIDA_POWERSHELL_EXECUTABLE NAMES powershell.exe powershell pwsh.exe pwsh)
+            endif()
+            if(NOT AIDA_POWERSHELL_EXECUTABLE)
+                message(FATAL_ERROR "AiDA Camoufox frozen reverse MCP contract validation requires PowerShell")
+            endif()
+            execute_process(
+                COMMAND "${AIDA_POWERSHELL_EXECUTABLE}" -NoProfile -ExecutionPolicy Bypass
+                    -File "${AIDA_CAMOUFOX_REVERSE_MCP_BUILD_SCRIPT}"
+                    -ContractCheckOnly
+                    -ExistingExecutable "${AIDA_CAMOUFOX_REVERSE_MCP_EXE}"
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+                RESULT_VARIABLE AIDA_CAMOUFOX_REVERSE_MCP_CONTRACT_RESULT
+                OUTPUT_VARIABLE AIDA_CAMOUFOX_REVERSE_MCP_CONTRACT_STDOUT
+                ERROR_VARIABLE AIDA_CAMOUFOX_REVERSE_MCP_CONTRACT_STDERR
+                TIMEOUT 20
+            )
+            set(AIDA_CAMOUFOX_REVERSE_MCP_CONTRACT_OUTPUT "${AIDA_CAMOUFOX_REVERSE_MCP_CONTRACT_STDOUT}\n${AIDA_CAMOUFOX_REVERSE_MCP_CONTRACT_STDERR}")
+            string(FIND "${AIDA_CAMOUFOX_REVERSE_MCP_CONTRACT_OUTPUT}" "aida_initiator_contract_v2_page_marker" AIDA_CAMOUFOX_REVERSE_MCP_CONTRACT_MARKER_POS)
+            string(FIND "${AIDA_CAMOUFOX_REVERSE_MCP_CONTRACT_OUTPUT}" "request_id" AIDA_CAMOUFOX_REVERSE_MCP_CONTRACT_REQUEST_POS)
+            string(FIND "${AIDA_CAMOUFOX_REVERSE_MCP_CONTRACT_OUTPUT}" "page_id" AIDA_CAMOUFOX_REVERSE_MCP_CONTRACT_PAGE_POS)
+            string(FIND "${AIDA_CAMOUFOX_REVERSE_MCP_CONTRACT_OUTPUT}" "marker" AIDA_CAMOUFOX_REVERSE_MCP_CONTRACT_MARKER_PARAM_POS)
+            if(NOT AIDA_CAMOUFOX_REVERSE_MCP_CONTRACT_RESULT STREQUAL "0"
+                OR AIDA_CAMOUFOX_REVERSE_MCP_CONTRACT_MARKER_POS LESS 0
+                OR AIDA_CAMOUFOX_REVERSE_MCP_CONTRACT_REQUEST_POS LESS 0
+                OR AIDA_CAMOUFOX_REVERSE_MCP_CONTRACT_PAGE_POS LESS 0
+                OR AIDA_CAMOUFOX_REVERSE_MCP_CONTRACT_MARKER_PARAM_POS LESS 0)
+                message(FATAL_ERROR "AiDA Camoufox frozen reverse MCP executable failed contract validation before staging: exe=${AIDA_CAMOUFOX_REVERSE_MCP_EXE} result=${AIDA_CAMOUFOX_REVERSE_MCP_CONTRACT_RESULT} stdout=${AIDA_CAMOUFOX_REVERSE_MCP_CONTRACT_STDOUT} stderr=${AIDA_CAMOUFOX_REVERSE_MCP_CONTRACT_STDERR}")
+            endif()
         endif()
 
         set(AIDA_BUNDLED_PYTHON_CANDIDATES
@@ -2156,11 +2194,14 @@ if(WIN32)
             if(NOT AIDA_CAMOUFOX_BROWSER_DIR)
                 message(FATAL_ERROR "AiDA Camoufox sidecar staging enabled but camoufox-135.0.1-beta.24-win.x86_64/camoufox.exe was not found")
             endif()
-            if(NOT AIDA_BUNDLED_PYTHON_DIR AND NOT AIDA_CAMOUFOX_REVERSE_MCP_EXE)
-                message(FATAL_ERROR "AiDA Camoufox sidecar staging enabled but neither frozen reverse MCP executable nor camoufox-runtime/python.exe was found")
+            if(NOT AIDA_CAMOUFOX_REVERSE_MCP_EXE)
+                message(FATAL_ERROR "AiDA Camoufox sidecar staging enabled but the frozen reverse MCP executable was not found")
             endif()
-        elseif(AIDA_CAMOUFOX_BROWSER_DIR AND (AIDA_BUNDLED_PYTHON_DIR OR AIDA_CAMOUFOX_REVERSE_MCP_EXE))
-            message(STATUS "AiDA Camoufox app-local sidecar assets detected; staging is opt-in via AIDA_CAMOUFOX_STAGE_SIDECAR_DEPS=ON")
+        elseif(AIDA_CAMOUFOX_BROWSER_DIR AND AIDA_CAMOUFOX_REVERSE_MCP_EXE)
+            set(AIDA_CAMOUFOX_STAGE_EFFECTIVE ON)
+            message(STATUS "AiDA Camoufox app-local sidecar assets detected; staging enabled")
+        elseif(AIDA_CAMOUFOX_BROWSER_DIR OR AIDA_BUNDLED_PYTHON_DIR OR AIDA_CAMOUFOX_REVERSE_MCP_EXE)
+            message(STATUS "AiDA Camoufox app-local sidecar assets incomplete; staging disabled")
         endif()
 
         if(AIDA_CAMOUFOX_STAGE_EFFECTIVE)
@@ -2171,7 +2212,7 @@ if(WIN32)
             if(AIDA_CAMOUFOX_STAGE_REVERSE_MCP_SOURCE)
                 add_custom_command(TARGET AiDAStandalone POST_BUILD
                     COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:AiDAStandalone>/deps"
-                    COMMAND ${CMAKE_COMMAND} -E copy_directory
+                    COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different
                         "${AIDA_CAMOUFOX_MCP_DIR}"
                         "$<TARGET_FILE_DIR:AiDAStandalone>/deps/camoufox-reverse-mcp"
                     COMMENT "Staging local-development camoufox-reverse-mcp source beside AiDAStandalone.exe..."
@@ -2181,7 +2222,7 @@ if(WIN32)
 
             add_custom_command(TARGET AiDAStandalone POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:AiDAStandalone>/deps"
-                COMMAND ${CMAKE_COMMAND} -E copy_directory
+                COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different
                     "${AIDA_CAMOUFOX_BROWSER_DIR}"
                     "$<TARGET_FILE_DIR:AiDAStandalone>/deps/camoufox-135.0.1-beta.24-win.x86_64"
                 COMMENT "Staging app-local Camoufox browser payload beside AiDAStandalone.exe..."
@@ -2189,6 +2230,18 @@ if(WIN32)
             )
 
             if(AIDA_CAMOUFOX_REVERSE_MCP_EXE)
+                get_filename_component(AIDA_CAMOUFOX_REVERSE_MCP_EXE_DIR "${AIDA_CAMOUFOX_REVERSE_MCP_EXE}" DIRECTORY)
+                get_filename_component(AIDA_CAMOUFOX_REVERSE_MCP_EXE_PARENT_NAME "${AIDA_CAMOUFOX_REVERSE_MCP_EXE_DIR}" NAME)
+                if(AIDA_CAMOUFOX_REVERSE_MCP_EXE_PARENT_NAME STREQUAL "AiDA_CamoufoxReverseMcp")
+                    add_custom_command(TARGET AiDAStandalone POST_BUILD
+                        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:AiDAStandalone>/deps"
+                        COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different
+                            "${AIDA_CAMOUFOX_REVERSE_MCP_EXE_DIR}"
+                            "$<TARGET_FILE_DIR:AiDAStandalone>/deps/AiDA_CamoufoxReverseMcp"
+                        COMMENT "Staging app-local frozen Camoufox reverse MCP onedir beside AiDAStandalone.exe..."
+                        VERBATIM
+                    )
+                else()
                 add_custom_command(TARGET AiDAStandalone POST_BUILD
                     COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:AiDAStandalone>/deps"
                     COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -2197,13 +2250,14 @@ if(WIN32)
                     COMMENT "Staging app-local frozen Camoufox reverse MCP executable beside AiDAStandalone.exe..."
                     VERBATIM
                 )
+                endif()
                 message(STATUS "AiDA Camoufox frozen reverse MCP executable: ${AIDA_CAMOUFOX_REVERSE_MCP_EXE}")
             endif()
 
             if(AIDA_BUNDLED_PYTHON_DIR)
                 add_custom_command(TARGET AiDAStandalone POST_BUILD
                     COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:AiDAStandalone>/deps"
-                    COMMAND ${CMAKE_COMMAND} -E copy_directory
+                    COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different
                         "${AIDA_BUNDLED_PYTHON_DIR}"
                         "$<TARGET_FILE_DIR:AiDAStandalone>/deps/camoufox-runtime"
                     COMMENT "Staging app-local Python runtime beside AiDAStandalone.exe..."
@@ -2275,7 +2329,7 @@ if(WIN32)
             if(AIDA_CAMOUFOX_WHEELHOUSE_DIR)
                 add_custom_command(TARGET AiDAStandalone POST_BUILD
                     COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:AiDAStandalone>/deps"
-                    COMMAND ${CMAKE_COMMAND} -E copy_directory
+                    COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different
                         "${AIDA_CAMOUFOX_WHEELHOUSE_DIR}"
                         "$<TARGET_FILE_DIR:AiDAStandalone>/deps/camoufox-wheelhouse"
                     COMMENT "Staging app-local Camoufox Python wheelhouse beside AiDAStandalone.exe..."
@@ -2947,6 +3001,26 @@ if(BUILD_PROTECTOR)
         VERBATIM
     )
 
+    add_executable(AiDAProtectorDiag tools/protector/test_payload/protector_diag.c)
+    target_compile_options(AiDAProtectorDiag PRIVATE /W3 $<IF:$<CONFIG:Debug>,/Od,/O2> /MD)
+    target_compile_definitions(AiDAProtectorDiag PRIVATE
+        _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN
+    )
+    set_target_properties(AiDAProtectorDiag PROPERTIES
+        OUTPUT_NAME "aida_protector_diag"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
+    )
+    add_dependencies(AiDAProtectorDiag AiDAProtector)
+
+    add_custom_command(TARGET AiDAProtectorDiag POST_BUILD
+        COMMAND ${CMAKE_COMMAND}
+            "-DRETRY_LABEL=aida_protector_diag.exe-protect"
+            "-DRETRY_CMD=$<TARGET_FILE:AiDAProtector>;--input;$<TARGET_FILE:AiDAProtectorDiag>;--output;$<TARGET_FILE:AiDAProtectorDiag>;--all;--no-encrypt-imports;--tamper-level;3;--jit;--verbose"
+            -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
+        COMMENT "Protecting aida_protector_diag.exe with the AiDAStandalone protector profile..."
+        VERBATIM
+    )
+
     add_library(AiDAHelloDll SHARED tools/protector/test_payload/hello_dll.cpp)
     target_compile_options(AiDAHelloDll PRIVATE /W3 /O2 /MD /EHsc /std:c++17 /Zc:threadSafeInit)
     target_compile_definitions(AiDAHelloDll PRIVATE
@@ -3130,6 +3204,8 @@ if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/test_target/CMak
         if(TARGET AiDAStandalone)
             add_dependencies(AiDAStandalone AiDA_TestTarget)
             add_custom_command(TARGET AiDAStandalone POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E make_directory
+                    "$<TARGET_FILE_DIR:AiDAStandalone>"
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
                     "$<TARGET_FILE:AiDA_TestTarget>"
                     "$<TARGET_FILE_DIR:AiDAStandalone>/AiDA_TestTarget.exe"
@@ -3143,5 +3219,17 @@ if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/test_target/CMak
     endif()
     if(TARGET AiDAStandalone AND TARGET AiDA_TargetProtocolFixture)
         add_dependencies(AiDAStandalone AiDA_TargetProtocolFixture)
+        add_custom_command(TARGET AiDAStandalone POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                "$<TARGET_FILE_DIR:AiDAStandalone>/test_binaries/target_protocol"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:AiDA_TargetProtocolFixture>"
+                "$<TARGET_FILE_DIR:AiDAStandalone>/test_binaries/target_protocol/target_protocol.exe"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_PDB_FILE:AiDA_TargetProtocolFixture>"
+                "$<TARGET_FILE_DIR:AiDAStandalone>/test_binaries/target_protocol/target_protocol.pdb"
+            COMMENT "Staging target_protocol fixture and PDB beside AiDAStandalone.exe..."
+            VERBATIM
+        )
     endif()
 endif()

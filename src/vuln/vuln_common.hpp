@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <set>
 #include <string>
 #include <vector>
 #include <nlohmann/json.hpp>
@@ -10,6 +11,25 @@ namespace aida
 {
 namespace vuln
 {
+
+// Slice C1: forward-declare the taint kind enum from taint_engine.hpp. Because
+// the underlying type is fixed (int), this forward declaration is sufficient
+// for any code that only needs to hold a taint_kind_t value or store it inside
+// a struct/container. Consumers that need to compare against enumerators must
+// include taint_engine.hpp explicitly.
+namespace taint { enum class taint_kind_t : int; }
+
+// Slice C1: per-lvar taint tag. Replaces a bare unordered_set<int> of tainted
+// lvar indices with richer per-lvar metadata: the kind of taint, whether the
+// data only ever reaches a conditional branch (control-only, vs flowing into
+// memory or a sink argument), and the set of input-source callsite indices
+// that contributed to this lvar's taint.
+struct taint_tag_t
+{
+    taint::taint_kind_t kind = static_cast<taint::taint_kind_t>(0);
+    bool                control_only = false;
+    std::set<int>       source_callsite_idxs;
+};
 
 enum class severity_t
 {

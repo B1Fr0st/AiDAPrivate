@@ -45,6 +45,35 @@ struct scan_config_t {
 	bool     only_static_bases = true;
 };
 
+struct map_diagnostics_t {
+	uint32_t    pid = 0;
+	size_t      module_count = 0;
+	size_t      raw_region_count = 0;
+	size_t      scanned_region_count = 0;
+	uint64_t    scanned_bytes = 0;
+	size_t      candidate_pointer_count = 0;
+	size_t      map_key_count = 0;
+	size_t      map_entry_count = 0;
+	uint64_t    duration_ms = 0;
+	bool        cancelled = false;
+	std::string source;
+};
+
+struct scan_diagnostics_t {
+	uint32_t pid = 0;
+	uint64_t target_address = 0;
+	int      max_depth = 0;
+	int64_t  max_offset = 0;
+	int64_t  struct_size = 0;
+	bool     negative_offsets = false;
+	bool     only_static_bases = false;
+	size_t   map_key_count = 0;
+	size_t   map_entry_count = 0;
+	size_t   chain_count = 0;
+	uint64_t duration_ms = 0;
+	bool     cancelled = false;
+};
+
 struct state_t {
 	std::map<uint64_t, std::vector<pointer_data_t>> reverse_map;
 	std::mutex                                       map_mutex;
@@ -64,6 +93,8 @@ struct state_t {
 
 	scan_config_t                                    config;
 	std::vector<driver_bridge::module_info_t>         cached_modules;
+	map_diagnostics_t                                last_map_diagnostics;
+	scan_diagnostics_t                               last_scan_diagnostics;
 
 	int                                              selected_result = -1;
 	float                                            scroll_y = 0.f;
@@ -214,6 +245,12 @@ inline void build_reverse_map()
 	g_state.map_building.store(true);
 	g_state.map_cancel.store(false);
 	g_state.map_progress.store(0.f);
+	{
+		std::lock_guard<std::mutex> lk(g_state.map_mutex);
+		g_state.last_map_diagnostics = {};
+		g_state.last_map_diagnostics.pid = driver_bridge::attached_pid();
+		g_state.last_map_diagnostics.source = "build_reverse_map";
+	}
 
 	work_queue::post([]() {
 		auto t_start = std::chrono::steady_clock::now();
@@ -296,16 +333,31 @@ inline void build_reverse_map()
 		}
 
 		size_t module_count = modules.size();
+		size_t raw_region_count = regions.size();
 		size_t region_count = readable.size();
 		{
 			std::lock_guard<std::mutex> lk(g_state.map_mutex);
 			g_state.reverse_map = std::move(new_map);
 			g_state.map_entry_count = entry_count;
 			g_state.cached_modules = std::move(modules);
+			g_state.last_map_diagnostics.pid = driver_bridge::attached_pid();
+			g_state.last_map_diagnostics.module_count = module_count;
+			g_state.last_map_diagnostics.raw_region_count = raw_region_count;
+			g_state.last_map_diagnostics.scanned_region_count = region_count;
+			g_state.last_map_diagnostics.scanned_bytes = total_bytes;
+			g_state.last_map_diagnostics.candidate_pointer_count = entry_count;
+			g_state.last_map_diagnostics.map_key_count = g_state.reverse_map.size();
+			g_state.last_map_diagnostics.map_entry_count = entry_count;
+			g_state.last_map_diagnostics.source = "build_reverse_map";
 		}
 
 		auto t_end = std::chrono::steady_clock::now();
 		uint64_t dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
+		{
+			std::lock_guard<std::mutex> lk(g_state.map_mutex);
+			g_state.last_map_diagnostics.duration_ms = dur_ms;
+			g_state.last_map_diagnostics.cancelled = g_state.map_cancel.load();
+		}
 		diag::log_tagged_fmt("pointer_scan", "build_reverse_map done entries=%zu modules=%zu regions=%zu bytes=%llu duration_ms=%llu cancelled=%d",
 			entry_count, module_count, region_count,
 			static_cast<unsigned long long>(total_bytes),
@@ -351,6 +403,19 @@ inline void start_scan()
 		static_cast<long long>(g_state.config.struct_size),
 		static_cast<int>(g_state.config.negative_offsets),
 		static_cast<int>(g_state.config.only_static_bases));
+	{
+		std::lock_guard<std::mutex> lk(g_state.map_mutex);
+		g_state.last_scan_diagnostics = {};
+		g_state.last_scan_diagnostics.pid = driver_bridge::attached_pid();
+		g_state.last_scan_diagnostics.target_address = g_state.config.target_address;
+		g_state.last_scan_diagnostics.max_depth = g_state.config.max_depth;
+		g_state.last_scan_diagnostics.max_offset = g_state.config.max_offset;
+		g_state.last_scan_diagnostics.struct_size = g_state.config.struct_size;
+		g_state.last_scan_diagnostics.negative_offsets = g_state.config.negative_offsets;
+		g_state.last_scan_diagnostics.only_static_bases = g_state.config.only_static_bases;
+		g_state.last_scan_diagnostics.map_key_count = g_state.reverse_map.size();
+		g_state.last_scan_diagnostics.map_entry_count = g_state.map_entry_count;
+	}
 
 	g_state.scanning.store(true);
 	g_state.scan_cancel.store(false);
@@ -379,6 +444,13 @@ inline void start_scan()
 		});
 
 		size_t chain_count = results.size();
+		size_t map_key_count = 0;
+		size_t map_entry_count = 0;
+		{
+			std::lock_guard<std::mutex> lk(g_state.map_mutex);
+			map_key_count = g_state.reverse_map.size();
+			map_entry_count = g_state.map_entry_count;
+		}
 		{
 			std::lock_guard<std::mutex> lk(g_state.results_mutex);
 			g_state.results = std::move(results);
@@ -389,6 +461,21 @@ inline void start_scan()
 
 		auto t_end = std::chrono::steady_clock::now();
 		uint64_t dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
+		{
+			std::lock_guard<std::mutex> lk(g_state.map_mutex);
+			g_state.last_scan_diagnostics.pid = driver_bridge::attached_pid();
+			g_state.last_scan_diagnostics.target_address = g_state.config.target_address;
+			g_state.last_scan_diagnostics.max_depth = g_state.config.max_depth;
+			g_state.last_scan_diagnostics.max_offset = g_state.config.max_offset;
+			g_state.last_scan_diagnostics.struct_size = g_state.config.struct_size;
+			g_state.last_scan_diagnostics.negative_offsets = g_state.config.negative_offsets;
+			g_state.last_scan_diagnostics.only_static_bases = g_state.config.only_static_bases;
+			g_state.last_scan_diagnostics.map_key_count = map_key_count;
+			g_state.last_scan_diagnostics.map_entry_count = map_entry_count;
+			g_state.last_scan_diagnostics.chain_count = chain_count;
+			g_state.last_scan_diagnostics.duration_ms = dur_ms;
+			g_state.last_scan_diagnostics.cancelled = g_state.scan_cancel.load();
+		}
 		diag::log_tagged_fmt("pointer_scan", "start_scan done chains=%zu duration_ms=%llu cancelled=%d",
 			chain_count, static_cast<unsigned long long>(dur_ms),
 			static_cast<int>(g_state.scan_cancel.load()));
@@ -626,6 +713,8 @@ inline void clear_map()
 	size_t had = g_state.map_entry_count;
 	g_state.reverse_map.clear();
 	g_state.map_entry_count = 0;
+	g_state.last_map_diagnostics = {};
+	g_state.last_scan_diagnostics = {};
 	diag::log_tagged_fmt("pointer_scan", "clear_map cleared=%zu", had);
 }
 

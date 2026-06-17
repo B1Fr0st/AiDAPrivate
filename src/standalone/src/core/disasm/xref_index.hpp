@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -9,6 +10,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -31,6 +33,34 @@ namespace xref_index {
 		bool        up = false;
 		uint64_t    source_addr = 0;
 		std::string source_label;
+	};
+
+	struct bounded_live_range_result_t {
+		bool        ok = false;
+		uint32_t    pid = 0;
+		std::string module;
+		uint64_t    module_base = 0;
+		uint32_t    module_size = 0;
+		uint64_t    requested_lo = 0;
+		uint64_t    requested_hi = 0;
+		uint64_t    clipped_lo = 0;
+		uint64_t    clipped_hi = 0;
+		size_t      pages_read = 0;
+		size_t      pages_failed = 0;
+		size_t      bytes_read = 0;
+		size_t      targets_found = 0;
+		size_t      xrefs_found = 0;
+		uint64_t    proof_target = 0;
+		uint64_t    proof_source = 0;
+		std::string proof_label;
+		uint32_t    state_before = 0;
+		uint32_t    state_after = 0;
+		bool        table_built_before = false;
+		bool        table_built_after = false;
+		bool        rebuild_in_flight_before = false;
+		bool        rebuild_in_flight_after = false;
+		uint64_t    elapsed_us = 0;
+		std::string error;
 	};
 
 	namespace detail {
@@ -894,6 +924,146 @@ namespace xref_index {
 		for (auto& mod : targets) {
 			detail::schedule_build_locked(mod);
 		}
+	}
+
+	inline bounded_live_range_result_t build_bounded_live_range(uint64_t lo_addr, uint64_t hi_addr, uint32_t timeout_ms = 2000) {
+		bounded_live_range_result_t result{};
+		result.requested_lo = lo_addr;
+		result.requested_hi = hi_addr;
+		result.pid = driver_bridge::attached_pid();
+		auto started = std::chrono::steady_clock::now();
+		auto& reg = detail::registry();
+		result.table_built_before = reg.table_built.load(std::memory_order_acquire);
+		result.rebuild_in_flight_before = reg.rebuild_in_flight.load(std::memory_order_acquire);
+
+		std::shared_ptr<detail::module_index_t> mod;
+		auto finish = [&](const char* error, bool ok) {
+			result.ok = ok;
+			if (error && error[0] != '\0')
+				result.error = error;
+			if (mod)
+				result.state_after = mod->state.load(std::memory_order_acquire);
+			result.table_built_after = reg.table_built.load(std::memory_order_acquire);
+			result.rebuild_in_flight_after = reg.rebuild_in_flight.load(std::memory_order_acquire);
+			result.elapsed_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+				std::chrono::steady_clock::now() - started).count());
+			return result;
+		};
+
+		if (hi_addr <= lo_addr)
+			return finish("invalid_range", false);
+		if (result.pid == 0)
+			return finish("no_attached_pid", false);
+
+		if (!reg.table_built.load(std::memory_order_acquire)) {
+			bool expected = false;
+			if (reg.rebuild_in_flight.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+				detail::rebuild_module_table_offlock(reg);
+				reg.rebuild_in_flight.store(false, std::memory_order_release);
+			} else {
+				const auto wait_limit = started + std::chrono::milliseconds(timeout_ms > 250 ? 250 : timeout_ms);
+				while (!reg.table_built.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < wait_limit) {
+					std::this_thread::sleep_for(std::chrono::milliseconds(10));
+				}
+				if (!reg.table_built.load(std::memory_order_acquire))
+					detail::rebuild_module_table_offlock(reg);
+			}
+		}
+
+		if (!reg.table_built.load(std::memory_order_acquire))
+			return finish("module_table_not_built", false);
+
+		{
+			std::shared_lock<std::shared_mutex> lk(reg.rw);
+			for (const auto& r : reg.table) {
+				if (r.end_va <= lo_addr || r.start_va >= hi_addr) continue;
+				if (!r.index) continue;
+				mod = r.index;
+				result.module = r.name;
+				result.module_base = r.start_va;
+				uint64_t size64 = r.end_va > r.start_va ? (r.end_va - r.start_va) : 0;
+				if (size64 > 0xFFFFFFFFull)
+					size64 = 0xFFFFFFFFull;
+				result.module_size = static_cast<uint32_t>(size64);
+				break;
+			}
+		}
+
+		if (!mod)
+			return finish("covering_module_not_found", false);
+
+		result.state_before = mod->state.load(std::memory_order_acquire);
+		if (result.module.empty())
+			result.module = mod->name;
+		if (result.module_base == 0)
+			result.module_base = mod->base;
+		if (result.module_size == 0)
+			result.module_size = mod->size;
+
+		const uint64_t module_end = result.module_base + result.module_size;
+		result.clipped_lo = std::max(lo_addr, result.module_base);
+		result.clipped_hi = std::min(hi_addr, module_end);
+		if (result.clipped_hi <= result.clipped_lo)
+			return finish("range_outside_module", false);
+
+		pe_parser::pe_info_t pe;
+		std::vector<pe_parser::section_info_t> sections;
+		if (pe_parser::parse(result.module_base, pe))
+			sections = pe.sections;
+		if (sections.empty())
+			return finish("pe_sections_unavailable", false);
+
+		auto fns = detail::snapshot_functions(result.module_base, result.module_size);
+		std::unordered_map<uint64_t, std::vector<annotation_t>> map;
+		map.reserve(1024);
+
+		const size_t page_size = 4096;
+		for (const auto& s : sections) {
+			if (!detail::section_is_code(s.characteristics))
+				continue;
+			const uint64_t section_start = result.module_base + s.virtual_address;
+			const uint64_t section_size = s.virtual_size != 0 ? s.virtual_size : s.raw_size;
+			const uint64_t section_end = section_start + section_size;
+			uint64_t cursor = std::max(result.clipped_lo, section_start);
+			const uint64_t end = std::min(result.clipped_hi, section_end);
+			while (cursor < end) {
+				size_t chunk = page_size;
+				if (cursor + chunk > end)
+					chunk = static_cast<size_t>(end - cursor);
+				std::vector<uint8_t> page_data;
+				const bool read_ok = driver_bridge::read_memory_for(result.pid, cursor, chunk, page_data);
+				if (read_ok && !page_data.empty()) {
+					++result.pages_read;
+					result.bytes_read += page_data.size();
+					detail::scan_block_for_xrefs(page_data.data(), page_data.size(), cursor, fns, sections, result.module_base, result.module, map);
+				} else {
+					++result.pages_failed;
+				}
+				cursor += chunk;
+			}
+		}
+
+		for (auto& kv : map) {
+			if (kv.first != 0)
+				++result.targets_found;
+			std::sort(kv.second.begin(), kv.second.end(), detail::sort_less);
+			for (const auto& ann : kv.second) {
+				if (kv.first == 0 || ann.source_addr == 0)
+					continue;
+				++result.xrefs_found;
+				if (result.proof_target == 0) {
+					result.proof_target = kv.first;
+					result.proof_source = ann.source_addr;
+					result.proof_label = ann.source_label;
+				}
+			}
+		}
+
+		if (result.pages_read == 0)
+			return finish("range_read_empty", false);
+		if (result.xrefs_found == 0 || result.proof_target == 0 || result.proof_source == 0)
+			return finish("xref_proof_empty", false);
+		return finish("", true);
 	}
 
 	inline void on_attach_changed() {

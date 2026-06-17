@@ -1088,28 +1088,94 @@ namespace read_intercept
         }
     }
 
-    inline bool address_in_trusted_system_image(uint64_t address)
+    struct trusted_system_image_info
     {
         MEMORY_BASIC_INFORMATION mbi{};
-        if (VirtualQuery(reinterpret_cast<void*>(address), &mbi, sizeof(mbi)) == 0)
-            return false;
-        if (mbi.State != MEM_COMMIT || mbi.Type != MEM_IMAGE)
-            return false;
-        const DWORD protect = mbi.Protect & 0xFFu;
-        if ((mbi.Protect & PAGE_GUARD) != 0 || protect == PAGE_NOACCESS)
-            return false;
-        const DWORD writable = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
-        if ((protect & writable) != 0)
-            return false;
+        DWORD vq_ok = 0;
+        DWORD path_ok = 0;
+        bool committed_image = false;
+        bool non_writable = false;
+        bool system32 = false;
+        bool name_allowlisted = false;
+        bool allowlisted = false;
+        HMODULE module = nullptr;
+        uint64_t module_base = 0;
+        uint64_t module_offset = 0;
+        char module_name[96] = "<unknown>";
+        char module_path[MAX_PATH] = "<unknown>";
+    };
 
-        HMODULE mod = nullptr;
-        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            reinterpret_cast<LPCWSTR>(address), &mod) || !mod)
+    struct orphan_stack_evidence
+    {
+        int first_aida_return_index = -1;
+        DWORD readable_slots = 0;
+        DWORD read_failed = 0;
+        char top_qwords[960] = "<none>";
+    };
+
+    inline const char* basename_from_path_a(const char* path)
+    {
+        if (!path || path[0] == '\0')
+            return "<unknown>";
+        const char* name = path;
+        for (const char* p = path; *p; ++p)
+        {
+            if (*p == '\\' || *p == '/')
+                name = p + 1;
+        }
+        return name && *name ? name : "<unknown>";
+    }
+
+    inline const wchar_t* basename_from_path_w(const wchar_t* path, DWORD len)
+    {
+        if (!path || len == 0)
+            return L"<unknown>";
+        const wchar_t* name = path;
+        for (DWORD i = 0; i < len; ++i)
+        {
+            if (path[i] == L'\\' || path[i] == L'/')
+                name = path + i + 1;
+        }
+        return name && *name ? name : L"<unknown>";
+    }
+
+    inline bool is_trusted_orphan_system_module_name(const wchar_t* name)
+    {
+        return lstrcmpiW(name, L"user32.dll") == 0 ||
+            lstrcmpiW(name, L"win32u.dll") == 0 ||
+            lstrcmpiW(name, L"ntdll.dll") == 0 ||
+            lstrcmpiW(name, L"bcrypt.dll") == 0 ||
+            lstrcmpiW(name, L"kernelbase.dll") == 0 ||
+            lstrcmpiW(name, L"kernel32.dll") == 0;
+    }
+
+    inline bool collect_trusted_system_image_info(uint64_t address, trusted_system_image_info& info)
+    {
+        info = trusted_system_image_info{};
+        info.vq_ok = VirtualQuery(reinterpret_cast<void*>(address), &info.mbi, sizeof(info.mbi)) != 0 ? 1u : 0u;
+        if (!info.vq_ok)
             return false;
+        info.committed_image = info.mbi.State == MEM_COMMIT && info.mbi.Type == MEM_IMAGE;
+        const DWORD protect = info.mbi.Protect & 0xFFu;
+        const DWORD writable = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        info.non_writable = (info.mbi.Protect & PAGE_GUARD) == 0 && protect != PAGE_NOACCESS && (protect & writable) == 0;
+
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(address), &info.module) || !info.module)
+            return false;
+        info.module_base = reinterpret_cast<uint64_t>(info.module);
+        info.module_offset = info.module_base != 0 && address >= info.module_base ? address - info.module_base : 0;
 
         wchar_t path[MAX_PATH] = {};
-        DWORD len = GetModuleFileNameW(mod, path, MAX_PATH);
+        DWORD len = GetModuleFileNameW(info.module, path, MAX_PATH);
         if (len == 0 || len >= MAX_PATH)
+            return false;
+        info.path_ok = 1;
+        GetModuleFileNameA(info.module, info.module_path, MAX_PATH);
+        _snprintf_s(info.module_name, sizeof(info.module_name), _TRUNCATE, "%s", basename_from_path_a(info.module_path));
+        const wchar_t* name = basename_from_path_w(path, len);
+        info.name_allowlisted = is_trusted_orphan_system_module_name(name);
+        if (!info.committed_image || !info.non_writable)
             return false;
 
         wchar_t system_dir[MAX_PATH] = {};
@@ -1120,24 +1186,54 @@ namespace read_intercept
             return false;
         if (path[system_len] != L'\\' && path[system_len] != L'/')
             return false;
+        info.system32 = true;
 
-        const wchar_t* name = path;
-        for (DWORD i = 0; i < len; ++i)
-        {
-            if (path[i] == L'\\' || path[i] == L'/')
-                name = path + i + 1;
-        }
-        return lstrcmpiW(name, L"user32.dll") == 0 ||
-            lstrcmpiW(name, L"win32u.dll") == 0 ||
-            lstrcmpiW(name, L"ntdll.dll") == 0 ||
-            lstrcmpiW(name, L"bcrypt.dll") == 0 ||
-            lstrcmpiW(name, L"kernelbase.dll") == 0;
+        info.allowlisted = info.committed_image && info.non_writable && info.system32 && info.name_allowlisted;
+        return info.allowlisted;
     }
 
-    inline bool stack_has_current_image_return(uint64_t rsp)
+    inline bool address_in_trusted_system_image(uint64_t address)
     {
+        trusted_system_image_info info{};
+        return collect_trusted_system_image_info(address, info);
+    }
+
+    inline void format_module_label(uint64_t address, char* out, size_t out_size)
+    {
+        if (!out || out_size == 0)
+            return;
+        out[0] = '\0';
+        if (address == 0)
+        {
+            _snprintf_s(out, out_size, _TRUNCATE, "<null>");
+            return;
+        }
+        HMODULE mod = nullptr;
+        char path[MAX_PATH] = "<unmapped>";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCSTR>(address), &mod) && mod)
+        {
+            GetModuleFileNameA(mod, path, MAX_PATH);
+            const uint64_t base = reinterpret_cast<uint64_t>(mod);
+            const uint64_t off = address >= base ? address - base : 0;
+            _snprintf_s(out, out_size, _TRUNCATE, "%s+0x%llX", basename_from_path_a(path), static_cast<unsigned long long>(off));
+            return;
+        }
+        _snprintf_s(out, out_size, _TRUNCATE, "<unmapped>");
+    }
+
+    inline orphan_stack_evidence inspect_orphan_stack(uint64_t rsp)
+    {
+        orphan_stack_evidence evidence{};
         if (rsp == 0)
-            return false;
+        {
+            _snprintf_s(evidence.top_qwords, sizeof(evidence.top_qwords), _TRUNCATE, "<rsp_null>");
+            evidence.read_failed = 1;
+            return evidence;
+        }
+
+        int off = 0;
+        evidence.top_qwords[0] = '\0';
         for (uint32_t i = 0; i < 32; ++i)
         {
             uint64_t value = 0;
@@ -1147,12 +1243,34 @@ namespace read_intercept
             }
             __except (EXCEPTION_EXECUTE_HANDLER)
             {
-                return false;
+                evidence.read_failed = 1;
+                break;
             }
-            if (address_in_current_image(value))
-                return true;
+
+            evidence.readable_slots = i + 1;
+            if (evidence.first_aida_return_index < 0 && address_in_current_image(value))
+                evidence.first_aida_return_index = static_cast<int>(i);
+
+            if (i < 8 && off < static_cast<int>(sizeof(evidence.top_qwords) - 96))
+            {
+                char label[128] = {};
+                format_module_label(value, label, sizeof(label));
+                off += _snprintf_s(evidence.top_qwords + off, sizeof(evidence.top_qwords) - off, _TRUNCATE,
+                    "%s[%u]=0x%016llX{%s}",
+                    i == 0 ? "" : " ",
+                    i,
+                    static_cast<unsigned long long>(value),
+                    label);
+            }
         }
-        return false;
+        if (evidence.top_qwords[0] == '\0')
+            _snprintf_s(evidence.top_qwords, sizeof(evidence.top_qwords), _TRUNCATE, "<unreadable>");
+        return evidence;
+    }
+
+    inline bool stack_has_current_image_return(uint64_t rsp)
+    {
+        return inspect_orphan_stack(rsp).first_aida_return_index >= 0;
     }
 
     inline void log_orphan_single_step_reject(
@@ -1177,20 +1295,14 @@ namespace read_intercept
         const uint64_t dr7 = ctx ? static_cast<uint64_t>(ctx->Dr7) : 0;
         const DWORD eflags = ctx ? ctx->EFlags : 0;
 
-        MEMORY_BASIC_INFORMATION mbi{};
-        DWORD vq_ok = VirtualQuery(reinterpret_cast<void*>(rip), &mbi, sizeof(mbi)) != 0 ? 1u : 0u;
-        HMODULE mod = nullptr;
-        char mod_path[MAX_PATH] = "<unknown>";
-        if (rip != 0 &&
-            GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                reinterpret_cast<LPCSTR>(rip), &mod) && mod)
-        {
-            GetModuleFileNameA(mod, mod_path, MAX_PATH);
-        }
+        trusted_system_image_info image{};
+        collect_trusted_system_image_info(rip, image);
+        orphan_stack_evidence stack = inspect_orphan_stack(rsp);
+        const bool stack_check_skipped_non_allowlisted = !rip_current_image && !image.allowlisted;
 
-        char dbg[1024];
+        char dbg[4096];
         _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-            "orphan_single_step_reject #%llu source=%s reason=%s rip=0x%llX rsp=0x%llX tid=%lu dr6=0x%llX dr7=0x%llX eflags=0x%08lX active=%d grace_until=%llu remaining_ms=%llu current_image=%d trusted_system=%d stack_current_image=%d vq=%lu mbi_base=0x%llX mbi_alloc=0x%llX mbi_size=0x%llX mbi_state=0x%08lX mbi_protect=0x%08lX mbi_type=0x%08lX module=%s iat=0x%llX/0x%X trap=0x%llX/0x%X text=0x%llX/0x%X",
+            "orphan_single_step_reject #%llu source=%s reason=%s rip=0x%llX rsp=0x%llX tid=%lu dr6=0x%llX dr7=0x%llX eflags=0x%08lX active=%d grace_until=%llu remaining_ms=%llu current_image=%d trusted_system=%d stack_current_image=%d allowlisted=%d name_allowlisted=%d system32=%d committed_image=%d non_writable=%d stack_check_skipped_non_allowlisted=%d first_aida_stack_index=%d stack_slots=%lu stack_read_failed=%lu module_name=%s module_offset=0x%llX module=%s vq=%lu path_ok=%lu mbi_base=0x%llX mbi_alloc=0x%llX mbi_size=0x%llX mbi_state=0x%08lX mbi_protect=0x%08lX mbi_type=0x%08lX top_stack=\"%s\" iat=0x%llX/0x%X trap=0x%llX/0x%X text=0x%llX/0x%X",
             static_cast<unsigned long long>(n),
             source ? source : "veh",
             reason ? reason : "unknown",
@@ -1206,14 +1318,27 @@ namespace read_intercept
             rip_current_image ? 1 : 0,
             rip_trusted_system ? 1 : 0,
             stack_current_image ? 1 : 0,
-            static_cast<unsigned long>(vq_ok),
-            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(mbi.BaseAddress)),
-            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(mbi.AllocationBase)),
-            static_cast<unsigned long long>(mbi.RegionSize),
-            mbi.State,
-            mbi.Protect,
-            mbi.Type,
-            mod_path,
+            image.allowlisted ? 1 : 0,
+            image.name_allowlisted ? 1 : 0,
+            image.system32 ? 1 : 0,
+            image.committed_image ? 1 : 0,
+            image.non_writable ? 1 : 0,
+            stack_check_skipped_non_allowlisted ? 1 : 0,
+            stack.first_aida_return_index,
+            static_cast<unsigned long>(stack.readable_slots),
+            static_cast<unsigned long>(stack.read_failed),
+            image.module_name,
+            static_cast<unsigned long long>(image.module_offset),
+            image.module_path,
+            static_cast<unsigned long>(image.vq_ok),
+            static_cast<unsigned long>(image.path_ok),
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(image.mbi.BaseAddress)),
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(image.mbi.AllocationBase)),
+            static_cast<unsigned long long>(image.mbi.RegionSize),
+            image.mbi.State,
+            image.mbi.Protect,
+            image.mbi.Type,
+            stack.top_qwords,
             static_cast<unsigned long long>(iat_guard::iat_base().load(std::memory_order_acquire)),
             iat_guard::iat_size().load(std::memory_order_acquire),
             static_cast<unsigned long long>(trap_page_base.load(std::memory_order_acquire)),
@@ -1412,9 +1537,11 @@ namespace read_intercept
 
         const uint64_t rip = static_cast<uint64_t>(ep->ContextRecord->Rip);
         const bool rip_current_image = address_in_current_image(rip);
-        const bool rip_trusted_system = !rip_current_image && address_in_trusted_system_image(rip);
-        const bool stack_current_image = rip_trusted_system &&
-            stack_has_current_image_return(static_cast<uint64_t>(ep->ContextRecord->Rsp));
+        trusted_system_image_info image{};
+        const bool rip_system_allowlisted = collect_trusted_system_image_info(rip, image);
+        const bool rip_trusted_system = !rip_current_image && rip_system_allowlisted;
+        orphan_stack_evidence stack = inspect_orphan_stack(static_cast<uint64_t>(ep->ContextRecord->Rsp));
+        const bool stack_current_image = rip_trusted_system && stack.first_aida_return_index >= 0;
         const bool rip_trusted_system_with_app_stack =
             rip_trusted_system && stack_current_image;
         if (!rip_current_image && !rip_trusted_system_with_app_stack)
@@ -1432,9 +1559,9 @@ namespace read_intercept
         const uint64_t n = orphan_single_step_count().fetch_add(1, std::memory_order_relaxed) + 1;
         if (n <= 16 || (n % 128ULL) == 0ULL)
         {
-            char dbg[448];
+            char dbg[4096];
             _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                "orphan_single_step_consumed #%llu source=%s rip=0x%llX scope=%s tid=%lu dr6=0x%llX dr7=0x%llX old_eflags=0x%08lX remaining_ms=%llu iat=0x%llX/0x%X trap=0x%llX/0x%X text=0x%llX/0x%X",
+                "orphan_single_step_consumed #%llu source=%s rip=0x%llX scope=%s tid=%lu dr6=0x%llX dr7=0x%llX old_eflags=0x%08lX remaining_ms=%llu allowlisted=%d name_allowlisted=%d system32=%d committed_image=%d non_writable=%d first_aida_stack_index=%d stack_slots=%lu stack_read_failed=%lu module_name=%s module_offset=0x%llX module=%s top_stack=\"%s\" iat=0x%llX/0x%X trap=0x%llX/0x%X text=0x%llX/0x%X",
                 static_cast<unsigned long long>(n),
                 source ? source : "veh",
                 static_cast<unsigned long long>(rip),
@@ -1444,6 +1571,18 @@ namespace read_intercept
                 static_cast<unsigned long long>(dr7),
                 static_cast<unsigned long>(old_eflags),
                 static_cast<unsigned long long>(grace_until >= now ? grace_until - now : 0),
+                image.allowlisted ? 1 : 0,
+                image.name_allowlisted ? 1 : 0,
+                image.system32 ? 1 : 0,
+                image.committed_image ? 1 : 0,
+                image.non_writable ? 1 : 0,
+                stack.first_aida_return_index,
+                static_cast<unsigned long>(stack.readable_slots),
+                static_cast<unsigned long>(stack.read_failed),
+                image.module_name,
+                static_cast<unsigned long long>(image.module_offset),
+                image.module_path,
+                stack.top_qwords,
                 static_cast<unsigned long long>(iat_guard::iat_base().load(std::memory_order_acquire)),
                 iat_guard::iat_size().load(std::memory_order_acquire),
                 static_cast<unsigned long long>(trap_page_base.load(std::memory_order_acquire)),

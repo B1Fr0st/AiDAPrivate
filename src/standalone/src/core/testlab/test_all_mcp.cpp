@@ -151,6 +151,9 @@ namespace {
     std::string g_pdb_fixture_failure_reason;
     bool g_api_monitor_start_ready = false;
     std::string g_api_monitor_start_failure;
+    std::atomic<uint64_t> g_mcp_phase_instance_counter{0};
+    std::atomic<int> g_mcp_phase_enter_count{0};
+    std::atomic<bool> g_mcp_phase_active{false};
     constexpr DWORD k_camoufox_testlab_launch_timeout_ms = 75000;
     constexpr DWORD k_camoufox_dependency_probe_timeout_ms = 9000;
     constexpr long long k_camoufox_reverse_tool_sidecar_timeout_ms = 65000;
@@ -194,6 +197,7 @@ namespace {
     std::map<std::string, std::string> g_mcp_zero_output_reasons;
     std::map<std::string, int> g_mcp_expected_empty_nonfunctional;
     std::map<std::string, std::string> g_mcp_expected_empty_reasons;
+    std::map<std::string, std::string> g_mcp_functional_capture_reasons;
 
     std::string lower_copy(std::string v) {
         std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) {
@@ -2065,7 +2069,7 @@ namespace {
         if (tool_name_s.empty())
             tool_name_s = mcp_tool_name_from_tag(tag);
         const std::string tool_lc = lower_copy(tool_name_s);
-        const bool security_guard = tool_lc == "drv_hook_manage";
+        const bool security_guard = mcp_tool_has_safe_external_guard_exemption(tool_lc);
         if (!tool_name_s.empty()) {
             g_invoked_tools.insert(tool_name_s);
             record_tool_status(tool_name_s, security_guard ? mcp_tool_call_status_t::security_guard_pass : mcp_tool_call_status_t::dependency_blocked);
@@ -3056,6 +3060,13 @@ namespace {
             g_mcp_expected_empty_reasons[tool_name] = proof;
     }
 
+    void record_mcp_functional_capture_evidence(const std::string& tool_name, const std::string& proof) {
+        if (tool_name.empty())
+            return;
+        if (!proof.empty())
+            g_mcp_functional_capture_reasons[tool_name] = proof;
+    }
+
     bool is_zero_output_failure_reason(const std::string& reason) {
         const std::string lc = lower_copy(reason);
         return lc.find("unexpected_zero_output") != std::string::npos ||
@@ -3285,8 +3296,8 @@ namespace {
             args_u64_equals(args, "max_exports", 0)) {
             size_t modules = 0;
             if (payload_array_count(ir.data, "modules", modules) && modules > 0) {
-                status = mcp_tool_call_status_t::functional_pass;
-                proof = "functional max_exports=0 request accepted modules=" + std::to_string(modules) + " zero_reason=" + zero_reason;
+                status = mcp_tool_call_status_t::contract_pass;
+                proof = "contract max_exports=0 request accepted modules=" + std::to_string(modules) + " zero_reason=" + zero_reason;
                 return true;
             }
         }
@@ -3300,10 +3311,51 @@ namespace {
             uint64_t capture_count = 0;
             const bool has_returned = payload_u64_field(ir.data, "returned", returned);
             const bool has_capture_count = payload_u64_field(ir.data, "capture_count", capture_count);
-            if (backend_snapshot && event_inactive && has_returned && has_capture_count && returned > 0 && capture_count > 0) {
+            size_t captures_array = 0;
+            payload_array_count(ir.data, "captures", captures_array);
+            if (backend_snapshot && event_inactive && has_capture_count && capture_count == 0 &&
+                (!has_returned || returned == 0) && captures_array == 0) {
+                status = mcp_tool_call_status_t::contract_pass;
+                proof = "heap snapshot_diff armed before stimulus backend=snapshot_diff capture_count=0 returned=" +
+                    std::to_string(static_cast<unsigned long long>(returned)) + " captures=0 zero_reason=" + zero_reason;
+                return true;
+            }
+            if (backend_snapshot && event_inactive && has_capture_count &&
+                (capture_count > 0 || returned > 0 || captures_array > 0)) {
                 status = mcp_tool_call_status_t::functional_pass;
-                proof = "functional snapshot_diff heap capture returned=" + std::to_string(returned) +
-                    " capture_count=" + std::to_string(capture_count) + " zero_reason=" + zero_reason;
+                proof = "functional snapshot_diff heap capture returned=" + std::to_string(static_cast<unsigned long long>(returned)) +
+                    " capture_count=" + std::to_string(static_cast<unsigned long long>(capture_count)) +
+                    " captures=" + std::to_string(static_cast<unsigned long long>(captures_array)) +
+                    " zero_reason=" + zero_reason;
+                return true;
+            }
+        }
+        if (tool_lc == "dx_hook_manage" &&
+            (action_lc == "present" || action_lc == "draw") &&
+            zero_reason.find("thread_count=0") != std::string::npos) {
+            std::string hook_id;
+            std::string backend;
+            payload_string_field(ir.data, "hook_id", hook_id);
+            payload_string_field(ir.data, "backend", backend);
+            if (backend.empty())
+                payload_string_field(ir.data, "capture_backend", backend);
+            const bool backend_snapshot = lower_copy(backend).find("snapshot") != std::string::npos;
+            uint64_t capture_count = 0;
+            size_t captures_array = 0;
+            payload_u64_field(ir.data, "capture_count", capture_count);
+            payload_array_count(ir.data, "captures", captures_array);
+            if (backend_snapshot && !hook_id.empty() && capture_count == 0 && captures_array == 0) {
+                status = mcp_tool_call_status_t::contract_pass;
+                proof = "dx hook armed before stimulus hook_id=" + hook_id + " backend=" + backend +
+                    " capture_count=0 captures=0 zero_reason=" + zero_reason;
+                return true;
+            }
+            if (backend_snapshot && !hook_id.empty() && (capture_count > 0 || captures_array > 0)) {
+                status = mcp_tool_call_status_t::functional_pass;
+                proof = "functional dx snapshot capture hook_id=" + hook_id + " backend=" + backend +
+                    " capture_count=" + std::to_string(static_cast<unsigned long long>(capture_count)) +
+                    " captures=" + std::to_string(static_cast<unsigned long long>(captures_array)) +
+                    " zero_reason=" + zero_reason;
                 return true;
             }
         }
@@ -3338,8 +3390,8 @@ namespace {
             (zero_reason.find("count=0") != std::string::npos ||
              zero_reason.find("entries=[]") != std::string::npos ||
              zero_reason.find("seh") != std::string::npos)) {
-            status = mcp_tool_call_status_t::functional_pass;
-            proof = "empty SEH chain is valid for the active target/thread zero_reason=" + zero_reason;
+            status = mcp_tool_call_status_t::state_contract_pass;
+            proof = "empty SEH chain state is valid for the active target/thread zero_reason=" + zero_reason;
             return true;
         }
         if (tool_lc == "live_monitor_manage" &&
@@ -3390,7 +3442,7 @@ namespace {
         if (zero_reason.find("candidate") != std::string::npos) {
             std::string privacy_reason;
             if (payload_webrtc_zero_candidate_expected(ir.data, privacy_reason)) {
-                status = mcp_tool_call_status_t::functional_pass;
+                status = mcp_tool_call_status_t::state_contract_pass;
                 proof = privacy_reason + " zero_reason=" + zero_reason;
                 return true;
             }
@@ -3780,9 +3832,15 @@ namespace {
             std::string status;
             std::string data_location;
             std::string warning;
+            bool active_page_instrumented = false;
+            bool installed = false;
+            bool log_ready = false;
             payload_string_field(ir.data, "status", status);
             payload_string_field(ir.data, "data_location", data_location);
             payload_string_field(ir.data, "warning", warning);
+            const bool has_active_page_instrumented = payload_bool_field(ir.data, "active_page_instrumented", active_page_instrumented);
+            const bool has_installed = payload_bool_field(ir.data, "installed", installed);
+            const bool has_log_ready = payload_bool_field(ir.data, "log_ready", log_ready);
             const std::string status_lc = lower_copy(status);
             if (status_lc != "instrumented") {
                 reason = status.empty() ? "jsvmp_status_missing" : "jsvmp_status=" + status;
@@ -3794,6 +3852,17 @@ namespace {
             }
             if (lower_copy(warning).find("timed out") != std::string::npos) {
                 reason = "jsvmp_partial_timeout_warning";
+                return true;
+            }
+            if (!has_active_page_instrumented || !active_page_instrumented ||
+                !has_installed || !installed ||
+                !has_log_ready || !log_ready) {
+                reason = "jsvmp_instrumented_proof_missing active_present=" + std::to_string(has_active_page_instrumented ? 1 : 0) +
+                    " active=" + std::to_string(active_page_instrumented ? 1 : 0) +
+                    " installed_present=" + std::to_string(has_installed ? 1 : 0) +
+                    " installed=" + std::to_string(installed ? 1 : 0) +
+                    " log_ready_present=" + std::to_string(has_log_ready ? 1 : 0) +
+                    " log_ready=" + std::to_string(log_ready ? 1 : 0);
                 return true;
             }
         }
@@ -4851,6 +4920,16 @@ namespace {
             std::string zero_reason;
             if (!scan_zero_output_payload(data, std::string(), std::string(), zero_reason))
                 return false;
+            if (tool_lc == "browser_interaction" && action_lc == "evaluate" && zero_reason.find("ice") != std::string::npos) {
+                std::string privacy_reason;
+                if (payload_webrtc_zero_candidate_expected(data, privacy_reason)) {
+                    if (expected_empty_status)
+                        *expected_empty_status = mcp_tool_call_status_t::state_contract_pass;
+                    if (expected_empty_proof)
+                        *expected_empty_proof = std::string(source ? source : "payload") + " " + privacy_reason + " zero_reason=" + zero_reason;
+                    return false;
+                }
+            }
             mcp_tool_call_status_t classified = mcp_tool_call_status_t::functional_pass;
             std::string proof;
             invoke_result_t classified_ir = ir;
@@ -5832,6 +5911,15 @@ namespace {
             payload_dependency_available_value(evidence.data) ? 1 : 0,
             reason.empty() ? "<empty>" : compact_text(reason, 700).c_str(),
             seq);
+        std::string capture_proof;
+        if (mcp_status_is_functional(classification) && payload_capture_or_result_evidence(evidence.data, capture_proof)) {
+            std::string proof = capture_proof;
+            if (!functional_evidence.empty())
+                proof += " functional_evidence=" + compact_text(functional_evidence, 500);
+            if (!delta_s.empty())
+                proof += " delta=" + compact_text(delta_s, 250);
+            record_mcp_functional_capture_evidence(tool_name, proof);
+        }
     }
 
     bool dx_hook_snapshot_functional_payload(const mcp_standalone::json& data, std::string& reason) {
@@ -5854,7 +5942,14 @@ namespace {
             reason = "dx_hook_capture_evidence_missing hook_id=" + hook_id + " " + capture_reason;
             return false;
         }
-        reason = "dx_hook_snapshot_capture hook_id=" + hook_id + " " + capture_reason;
+        uint64_t capture_count = 0;
+        size_t capture_array = 0;
+        payload_u64_field(data, "capture_count", capture_count);
+        payload_array_count(data, "captures", capture_array);
+        reason = "dx_hook_snapshot_capture hook_id=" + hook_id + " backend=" + backend +
+            " capture_count=" + std::to_string(static_cast<unsigned long long>(capture_count)) +
+            " captures=" + std::to_string(static_cast<unsigned long long>(capture_array)) +
+            " " + capture_reason;
         return true;
     }
 
@@ -10810,6 +10905,18 @@ namespace {
         }
     }
 
+    std::string network_hook_sidecar_output_tail(const network_hook_sidecar_proc_t& proc, size_t cap) {
+        if (proc.output.size() <= cap)
+            return proc.output;
+        return proc.output.substr(proc.output.size() - cap);
+    }
+
+    DWORD network_hook_sidecar_event_state(HANDLE event_handle) {
+        if (!event_handle)
+            return WAIT_FAILED;
+        return WaitForSingleObject(event_handle, 0);
+    }
+
     std::string find_network_hook_sidecar_path(bool protected_mode) {
         const char* exe = protected_mode ? "AiDA_NetworkHookSidecar_Protected.exe" : "AiDA_NetworkHookSidecar.exe";
         const std::string self = get_self_path_narrow();
@@ -11010,13 +11117,51 @@ namespace {
             DWORD exit_code = 0;
             if (network_hook_sidecar_exited(proc, exit_code)) {
                 flush_network_hook_sidecar_partial(hf, tag, proc);
-                log_msg(hf, tag, "FAIL -- sidecar exited before ready exit=0x%08lX",
-                    static_cast<unsigned long>(exit_code));
+                const DWORD elapsed = GetTickCount() - start;
+                log_msg(hf, tag, "FAIL -- sidecar exited before ready exit=0x%08lX elapsed_ms=%lu output_len=%zu pending_len=%zu output_tail=%s",
+                    static_cast<unsigned long>(exit_code),
+                    static_cast<unsigned long>(elapsed),
+                    proc.output.size(),
+                    proc.pending_line.size(),
+                    compact_text(network_hook_sidecar_output_tail(proc, 1400), 1400).c_str());
                 return false;
             }
             if (GetTickCount() - start >= timeout_ms) {
                 flush_network_hook_sidecar_partial(hf, tag, proc);
-                log_msg(hf, tag, "FAIL -- sidecar ready timeout after %lu ms", static_cast<unsigned long>(timeout_ms));
+                DWORD probe_exit = 0;
+                const BOOL probe_ok = proc.process ? GetExitCodeProcess(proc.process, &probe_exit) : FALSE;
+                const DWORD probe_err = probe_ok ? 0 : GetLastError();
+                const bool alive = probe_ok && probe_exit == STILL_ACTIVE;
+                const DWORD elapsed = GetTickCount() - start;
+                const DWORD ready_state = network_hook_sidecar_event_state(proc.ready_event);
+                const DWORD go_state = network_hook_sidecar_event_state(proc.go_event);
+                const DWORD done_state = network_hook_sidecar_event_state(proc.done_event);
+                log_msg(hf, tag, "FAIL -- sidecar ready timeout after %lu ms elapsed_ms=%lu",
+                    static_cast<unsigned long>(timeout_ms),
+                    static_cast<unsigned long>(elapsed));
+                log_msg(hf, tag, "READY-TIMEOUT-DIAG -- pid=%lu alive=%d process=%p probe_ok=%d probe_err=%lu probe_text=%s exit=0x%08lX output_len=%zu pending_len=%zu ready_event=%p ready_state=0x%08lX go_event=%p go_state=0x%08lX done_event=%p done_state=0x%08lX stdout_read=%p stdout_write=%p pg_buffer=0x%016llX pg_size=%llu send=0x%016llX WSASend=0x%016llX output_tail=%s",
+                    static_cast<unsigned long>(proc.pid),
+                    alive ? 1 : 0,
+                    proc.process,
+                    probe_ok ? 1 : 0,
+                    static_cast<unsigned long>(probe_err),
+                    probe_ok ? "success" : format_win32_error(probe_err).c_str(),
+                    probe_ok ? static_cast<unsigned long>(probe_exit) : 0UL,
+                    proc.output.size(),
+                    proc.pending_line.size(),
+                    proc.ready_event,
+                    static_cast<unsigned long>(ready_state),
+                    proc.go_event,
+                    static_cast<unsigned long>(go_state),
+                    proc.done_event,
+                    static_cast<unsigned long>(done_state),
+                    proc.stdout_read,
+                    proc.stdout_write,
+                    static_cast<unsigned long long>(proc.pg_buffer),
+                    static_cast<unsigned long long>(proc.pg_size),
+                    static_cast<unsigned long long>(proc.send_addr),
+                    static_cast<unsigned long long>(proc.wsasend_addr),
+                    compact_text(network_hook_sidecar_output_tail(proc, 1800), 1800).c_str());
                 return false;
             }
         }
@@ -11047,20 +11192,51 @@ namespace {
                 DWORD probe_exit = 0;
                 const BOOL probe_ok = proc.process ? GetExitCodeProcess(proc.process, &probe_exit) : FALSE;
                 const DWORD probe_err = probe_ok ? 0 : GetLastError();
+                DWORD thread_exit = 0;
+                const BOOL thread_ok = proc.thread ? GetExitCodeThread(proc.thread, &thread_exit) : FALSE;
+                const DWORD thread_err = thread_ok ? 0 : GetLastError();
+                const DWORD ready_state = network_hook_sidecar_event_state(proc.ready_event);
+                const DWORD go_state = network_hook_sidecar_event_state(proc.go_event);
+                const DWORD done_state = network_hook_sidecar_event_state(proc.done_event);
+                uint32_t hook_attached_pid = 0;
+                size_t hook_targets = 0;
+                size_t hook_captures = 0;
+                {
+                    std::lock_guard<std::mutex> lk(pre_encrypt_hook::g_state.mutex);
+                    hook_attached_pid = pre_encrypt_hook::g_state.attached_pid;
+                    hook_targets = pre_encrypt_hook::g_state.targets.size();
+                    hook_captures = pre_encrypt_hook::g_state.captures.size();
+                }
                 log_msg(hf, tag, "FAIL -- sidecar done timeout after %lu ms",
                     static_cast<unsigned long>(timeout_ms));
-                log_msg(hf, tag, "DONE-TIMEOUT-DIAG -- pid=%lu process=%p probe_ok=%d probe_err=%lu probe_text=%s probe_exit=0x%08lX output_len=%zu pending_len=%zu ready_event=%p go_event=%p done_event=%p",
+                log_msg(hf, tag, "DONE-TIMEOUT-DIAG -- pid=%lu process=%p thread=%p probe_ok=%d probe_err=%lu probe_text=%s probe_exit=0x%08lX thread_ok=%d thread_err=%lu thread_exit=0x%08lX output_len=%zu pending_len=%zu ready_event=%p ready_state=0x%08lX go_event=%p go_state=0x%08lX done_event=%p done_state=0x%08lX hook_active=%d hook_polling=%d hook_debug_attached=%d hook_debug_loop_running=%d hook_debug_loop_tid=%lu hook_error=%lu hook_attached_pid=%u hook_targets=%zu hook_captures=%zu",
                     static_cast<unsigned long>(proc.pid),
                     proc.process,
+                    proc.thread,
                     probe_ok ? 1 : 0,
                     static_cast<unsigned long>(probe_err),
                     probe_ok ? "success" : format_win32_error(probe_err).c_str(),
                     probe_ok ? static_cast<unsigned long>(probe_exit) : 0UL,
+                    thread_ok ? 1 : 0,
+                    static_cast<unsigned long>(thread_err),
+                    thread_ok ? static_cast<unsigned long>(thread_exit) : 0UL,
                     proc.output.size(),
                     proc.pending_line.size(),
                     proc.ready_event,
+                    static_cast<unsigned long>(ready_state),
                     proc.go_event,
-                    proc.done_event);
+                    static_cast<unsigned long>(go_state),
+                    proc.done_event,
+                    static_cast<unsigned long>(done_state),
+                    pre_encrypt_hook::g_state.active.load() ? 1 : 0,
+                    pre_encrypt_hook::g_state.polling.load() ? 1 : 0,
+                    pre_encrypt_hook::g_state.debug_attached.load() ? 1 : 0,
+                    pre_encrypt_hook::g_state.debug_loop_running.load() ? 1 : 0,
+                    static_cast<unsigned long>(pre_encrypt_hook::g_state.debug_loop_tid.load()),
+                    static_cast<unsigned long>(pre_encrypt_hook::g_state.debugger_error.load()),
+                    hook_attached_pid,
+                    hook_targets,
+                    hook_captures);
                 return STILL_ACTIVE;
             }
         }
@@ -11877,11 +12053,23 @@ namespace {
             log_msg(hf, tag, "HOOK-PROOF -- WSASend %s", proof.c_str());
         }
 
-        if (!SetEvent(proc.go_event))
-            return fail_case("failed to signal sidecar Go event");
+        SetLastError(ERROR_SUCCESS);
+        const BOOL go_set = SetEvent(proc.go_event);
+        const DWORD go_set_err = go_set ? ERROR_SUCCESS : GetLastError();
+        const DWORD ready_state_after_go = network_hook_sidecar_event_state(proc.ready_event);
+        const DWORD go_state_after_go = network_hook_sidecar_event_state(proc.go_event);
+        const DWORD done_state_after_go = network_hook_sidecar_event_state(proc.done_event);
+        if (!go_set)
+            return fail_case("failed to signal sidecar Go event err=" + std::to_string(go_set_err));
         signaled_go = true;
-        log_msg(hf, tag, "GO -- sidecar released mode=%s pid=%lu",
-            proc.mode.c_str(), static_cast<unsigned long>(proc.pid));
+        log_msg(hf, tag, "GO -- sidecar released mode=%s pid=%lu set_ok=%d err=%lu ready_state=0x%08lX go_state=0x%08lX done_state=0x%08lX",
+            proc.mode.c_str(),
+            static_cast<unsigned long>(proc.pid),
+            go_set ? 1 : 0,
+            static_cast<unsigned long>(go_set_err),
+            static_cast<unsigned long>(ready_state_after_go),
+            static_cast<unsigned long>(go_state_after_go),
+            static_cast<unsigned long>(done_state_after_go));
 
         std::string pg_aggregate;
         sidecar_capture_coverage_t pg_coverage;
@@ -14555,10 +14743,20 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         for (const auto& expected : g_mcp_expected_empty_nonfunctional) {
             if (is_ai_related_mcp_tool(expected.first))
                 continue;
-            ++expected_empty_nonfunctional_tools;
             auto stats_it = g_tool_attempt_stats.find(expected.first);
             const auto reason_it = g_mcp_expected_empty_reasons.find(expected.first);
             const int functional_pass = stats_it != g_tool_attempt_stats.end() ? stats_it->second.passed : 0;
+            const auto capture_it = g_mcp_functional_capture_reasons.find(expected.first);
+            if (functional_pass > 0 && capture_it != g_mcp_functional_capture_reasons.end()) {
+                log_msg(hf, tag, "EXPECTED-EMPTY-SUPPRESSED -- tool=\"%s\" count=%d functional_pass=%d expected_empty_proof=%s functional_capture_proof=%s",
+                    expected.first.c_str(),
+                    expected.second,
+                    functional_pass,
+                    reason_it == g_mcp_expected_empty_reasons.end() ? "<empty>" : compact_text(reason_it->second, 900).c_str(),
+                    compact_text(capture_it->second, 900).c_str());
+                continue;
+            }
+            ++expected_empty_nonfunctional_tools;
             log_msg(hf, tag, "EXPECTED-EMPTY-NONFUNCTIONAL -- tool=\"%s\" count=%d functional_pass=%d proof=%s",
                 expected.first.c_str(),
                 expected.second,
@@ -15719,6 +15917,82 @@ void test_tool_driver_find_references(HANDLE hf, std::atomic<int>& passed, std::
     }
 
 
+    bool dbg_compare_positive_memory_diff_proof(const mcp_standalone::json& data,
+                                                const std::string& expected_a,
+                                                const std::string& expected_b,
+                                                uint64_t mutation_va,
+                                                size_t mutation_size,
+                                                std::string& proof) {
+        std::string snapshot_a;
+        std::string snapshot_b;
+        uint64_t register_changes = 0;
+        uint64_t memory_changes = 0;
+        const bool has_a = payload_string_field(data, "snapshot_a", snapshot_a);
+        const bool has_b = payload_string_field(data, "snapshot_b", snapshot_b);
+        const bool has_register_changes = payload_u64_field(data, "register_changes", register_changes);
+        const bool has_memory_changes = payload_u64_field(data, "memory_changes", memory_changes);
+        size_t memory_diff_regions = 0;
+        const bool has_memory_diffs = payload_array_count(data, "memory_diffs", memory_diff_regions);
+        if (!has_a || !has_b || snapshot_a != expected_a || snapshot_b != expected_b) {
+            proof = "snapshot_id_proof_missing expected_a=" + expected_a +
+                " expected_b=" + expected_b +
+                " has_a=" + std::to_string(has_a ? 1 : 0) +
+                " has_b=" + std::to_string(has_b ? 1 : 0) +
+                " actual_a=" + (snapshot_a.empty() ? "<empty>" : snapshot_a) +
+                " actual_b=" + (snapshot_b.empty() ? "<empty>" : snapshot_b);
+            return false;
+        }
+        if (!has_register_changes || !has_memory_changes || !has_memory_diffs || memory_changes == 0 || memory_diff_regions == 0) {
+            proof = "positive_diff_counts_missing snapshot_a=" + snapshot_a +
+                " snapshot_b=" + snapshot_b +
+                " has_register_changes=" + std::to_string(has_register_changes ? 1 : 0) +
+                " register_changes=" + std::to_string(static_cast<unsigned long long>(register_changes)) +
+                " has_memory_changes=" + std::to_string(has_memory_changes ? 1 : 0) +
+                " memory_changes=" + std::to_string(static_cast<unsigned long long>(memory_changes)) +
+                " has_memory_diffs=" + std::to_string(has_memory_diffs ? 1 : 0) +
+                " memory_diff_regions=" + std::to_string(static_cast<unsigned long long>(memory_diff_regions));
+            return false;
+        }
+        bool mutation_region_matched = false;
+        uint64_t matched_diff_count = 0;
+        const auto* diffs = find_payload_key_recursive(data, "memory_diffs");
+        if (diffs && diffs->is_array()) {
+            for (const auto& item : *diffs) {
+                uint64_t region_va = 0;
+                uint64_t diff_count = 0;
+                payload_u64_or_string_field(item, "address", region_va);
+                payload_u64_field(item, "diff_count", diff_count);
+                const bool covers_region = region_va <= mutation_va &&
+                    mutation_va < region_va + static_cast<uint64_t>((std::max)(mutation_size, static_cast<size_t>(1)));
+                if (region_va == mutation_va || covers_region) {
+                    mutation_region_matched = true;
+                    matched_diff_count = diff_count;
+                    break;
+                }
+            }
+        }
+        if (!mutation_region_matched) {
+            proof = "mutation_region_diff_missing snapshot_a=" + snapshot_a +
+                " snapshot_b=" + snapshot_b +
+                " mutation_va=" + hex_u64(mutation_va) +
+                " mutation_size=" + std::to_string(static_cast<unsigned long long>(mutation_size)) +
+                " register_changes=" + std::to_string(static_cast<unsigned long long>(register_changes)) +
+                " memory_changes=" + std::to_string(static_cast<unsigned long long>(memory_changes)) +
+                " memory_diff_regions=" + std::to_string(static_cast<unsigned long long>(memory_diff_regions)) +
+                " data=" + compact_json(data, 1400);
+            return false;
+        }
+        proof = "snapshot_a=" + snapshot_a +
+            " snapshot_b=" + snapshot_b +
+            " mutation_va=" + hex_u64(mutation_va) +
+            " mutation_size=" + std::to_string(static_cast<unsigned long long>(mutation_size)) +
+            " register_changes=" + std::to_string(static_cast<unsigned long long>(register_changes)) +
+            " memory_changes=" + std::to_string(static_cast<unsigned long long>(memory_changes)) +
+            " memory_diff_regions=" + std::to_string(static_cast<unsigned long long>(memory_diff_regions)) +
+            " matched_diff_count=" + std::to_string(static_cast<unsigned long long>(matched_diff_count));
+        return true;
+    }
+
     void test_tool_dbg_snapshot_state(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args;
         args["tid"] = "0";
@@ -15727,10 +16001,130 @@ void test_tool_driver_find_references(HANDLE hf, std::atomic<int>& passed, std::
     }
 
     void test_tool_dbg_compare_snapshots(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        const uint32_t pid = g_mcp_target_pid != 0 ? g_mcp_target_pid : driver_bridge::attached_pid();
+        if (pid == 0) {
+            log_msg(hf, "mcp.dbg_compare_snapshots", "FAIL -- no attached target pid available for snapshot mutation fixture");
+            record_fixture_failed_tool("dbg_compare_snapshots", failed);
+            return;
+        }
+        uint64_t snapshot_addr = 0;
+        const std::vector<uint8_t> initial_bytes = {
+            0x41, 0x49, 0x44, 0x41, 0x5F, 0x53, 0x4E, 0x41,
+            0x50, 0x5F, 0x41, 0x5F, 0x30, 0x31, 0x21, 0x00
+        };
+        if (!ensure_mcp_private_bytes(hf, "mcp.dbg_compare_snapshots", snapshot_addr, 4096, initial_bytes)) {
+            log_msg(hf, "mcp.dbg_compare_snapshots", "FAIL -- snapshot mutation fixture allocation/write failed");
+            record_fixture_failed_tool("dbg_compare_snapshots", failed);
+            return;
+        }
+        auto cleanup_snapshot_memory = [&]() {
+            if (snapshot_addr != 0) {
+                driver_bridge::free_memory(snapshot_addr);
+                snapshot_addr = 0;
+            }
+        };
+        const size_t mutation_size = initial_bytes.size();
+        std::vector<uint8_t> before_bytes;
+        std::string read_reason;
+        if (!testlab_read_remote_exact(pid, snapshot_addr, mutation_size, before_bytes, read_reason)) {
+            log_msg(hf, "mcp.dbg_compare_snapshots", "FAIL -- unable to read mutation fixture before snapshot pid=%u va=0x%016llX size=%zu reason=%s",
+                pid,
+                static_cast<unsigned long long>(snapshot_addr),
+                mutation_size,
+                compact_text(read_reason, 700).c_str());
+            cleanup_snapshot_memory();
+            record_fixture_failed_tool("dbg_compare_snapshots", failed);
+            return;
+        }
+        const std::string suffix = std::to_string(static_cast<unsigned long long>(GetTickCount64()));
+        const std::string snapshot_before = "test_snapshot_before_" + suffix;
+        const std::string snapshot_after = "test_snapshot_after_" + suffix;
+        auto make_snapshot_args = [&](const std::string& name) {
+            mcp_standalone::json args;
+            args["tid"] = "0";
+            args["name"] = name;
+            args["process_id"] = pid;
+            args["memory_regions"] = mcp_standalone::json::array({
+                mcp_standalone::json{{"address", hex_u64(snapshot_addr)}, {"size", static_cast<int>(mutation_size)}}
+            });
+            return args;
+        };
+        mcp_standalone::tool_result_t before_snapshot_result;
+        auto before_status = test_tool_call(hf, "mcp.dbg_compare_snapshots.before", get_server(), "dbg_snapshot_state",
+            make_snapshot_args(snapshot_before), passed, failed, skipped, false, &before_snapshot_result);
+        if (before_status != mcp_tool_call_status_t::passed) {
+            cleanup_snapshot_memory();
+            return;
+        }
+        std::vector<uint8_t> after_bytes = before_bytes;
+        if (after_bytes.size() >= 8) {
+            after_bytes[0] ^= 0x7A;
+            after_bytes[3] ^= 0x55;
+            after_bytes[7] ^= 0x33;
+        } else if (!after_bytes.empty()) {
+            after_bytes[0] ^= 0x7A;
+        }
+        if (!driver_bridge::write_memory_for(pid, snapshot_addr, after_bytes)) {
+            log_msg(hf, "mcp.dbg_compare_snapshots", "FAIL -- mutation write failed pid=%u va=0x%016llX size=%zu status=\"%s\" last_error=\"%s\"",
+                pid,
+                static_cast<unsigned long long>(snapshot_addr),
+                after_bytes.size(),
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            cleanup_snapshot_memory();
+            record_fixture_failed_tool("dbg_compare_snapshots", failed);
+            return;
+        }
+        std::vector<uint8_t> readback_after;
+        if (!testlab_read_remote_exact(pid, snapshot_addr, mutation_size, readback_after, read_reason) || readback_after.size() < mutation_size ||
+            !std::equal(after_bytes.begin(), after_bytes.end(), readback_after.begin())) {
+            log_msg(hf, "mcp.dbg_compare_snapshots", "FAIL -- mutation readback mismatch pid=%u va=0x%016llX size=%zu reason=%s expected=[%s] actual=[%s]",
+                pid,
+                static_cast<unsigned long long>(snapshot_addr),
+                mutation_size,
+                compact_text(read_reason, 700).c_str(),
+                hex_preview(after_bytes, mutation_size).c_str(),
+                hex_preview(readback_after, mutation_size).c_str());
+            cleanup_snapshot_memory();
+            record_fixture_failed_tool("dbg_compare_snapshots", failed);
+            return;
+        }
+        mcp_standalone::tool_result_t after_snapshot_result;
+        auto after_status = test_tool_call(hf, "mcp.dbg_compare_snapshots.after", get_server(), "dbg_snapshot_state",
+            make_snapshot_args(snapshot_after), passed, failed, skipped, false, &after_snapshot_result);
+        if (after_status != mcp_tool_call_status_t::passed) {
+            cleanup_snapshot_memory();
+            return;
+        }
+        log_msg(hf, "mcp.dbg_compare_snapshots", "SNAPSHOT-MUTATION -- snapshot_before=%s snapshot_after=%s pid=%u va=0x%016llX size=%zu before=[%s] after=[%s]",
+            snapshot_before.c_str(),
+            snapshot_after.c_str(),
+            pid,
+            static_cast<unsigned long long>(snapshot_addr),
+            mutation_size,
+            hex_preview(before_bytes, mutation_size).c_str(),
+            hex_preview(readback_after, mutation_size).c_str());
         mcp_standalone::json args;
-        args["snapshot_a"] = "test_snapshot";
-        args["snapshot_b"] = "test_snapshot";
-        test_tool_call(hf, "mcp.dbg_compare_snapshots", get_server(), "dbg_compare_snapshots", args, passed, failed, skipped);
+        args["snapshot_a"] = snapshot_before;
+        args["snapshot_b"] = snapshot_after;
+        mcp_standalone::tool_result_t compare_result;
+        auto compare_status = test_tool_call(hf, "mcp.dbg_compare_snapshots", get_server(), "dbg_compare_snapshots", args, passed, failed, skipped, false, &compare_result);
+        if (compare_status == mcp_tool_call_status_t::passed) {
+            std::string proof;
+            if (!dbg_compare_positive_memory_diff_proof(compare_result.data, snapshot_before, snapshot_after, snapshot_addr, mutation_size, proof)) {
+                log_msg(hf, "mcp.dbg_compare_snapshots", "FAIL -- compare succeeded without required positive diff proof reason=%s before=[%s] after=[%s]",
+                    compact_text(proof, 1400).c_str(),
+                    hex_preview(before_bytes, mutation_size).c_str(),
+                    hex_preview(readback_after, mutation_size).c_str());
+                convert_last_pass_to_fixture_failure("dbg_compare_snapshots", passed, failed);
+            } else {
+                log_msg(hf, "mcp.dbg_compare_snapshots", "DIFF-PROOF -- %s before=[%s] after=[%s]",
+                    compact_text(proof, 1400).c_str(),
+                    hex_preview(before_bytes, mutation_size).c_str(),
+                    hex_preview(readback_after, mutation_size).c_str());
+            }
+        }
+        cleanup_snapshot_memory();
     }
 
     void test_tool_dbg_detect_vm_handler(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -16927,7 +17321,7 @@ void test_tool_scanner_struct_manage_define(HANDLE hf, std::atomic<int>& passed,
         mcp_standalone::json args;
         args["target_address"] = hex_u64(hunt_addr);
         args["target_size"] = 128;
-        args["duration_ms"] = 1000;
+        args["duration_ms"] = 2500;
         size_t events_before = 0;
         {
             std::lock_guard<std::mutex> lk(integrity_hunter::g_state.mutex);
@@ -16942,99 +17336,149 @@ void test_tool_scanner_struct_manage_define(HANDLE hf, std::atomic<int>& passed,
             events_before,
             static_cast<unsigned long long>(hunt_addr),
             static_cast<unsigned long>(sidecar.pid));
-        std::atomic<bool> hunt_call_done{false};
-        std::atomic<uint32_t> rpm_attempts{0};
-        std::atomic<uint32_t> rpm_ok{0};
-        std::atomic<uint32_t> driver_attempts{0};
-        std::atomic<uint32_t> driver_ok{0};
-        std::atomic<uint32_t> target_read_attempts{0};
-        std::atomic<uint32_t> target_read_ok{0};
-        std::atomic<uint64_t> target_read_result{0};
-        std::atomic<uint64_t> stimulus_bytes{0};
-        auto run_hunt_stimulus = [&, hunt_addr, target_read_fn, target_read_kind]() {
+        struct hunt_stimulus_state_t {
+            std::atomic<bool> hunt_call_done{false};
+            std::atomic<bool> started{false};
+            std::atomic<bool> done{false};
+            std::atomic<bool> install_seen{false};
+            std::atomic<uint32_t> rpm_attempts{0};
+            std::atomic<uint32_t> rpm_ok{0};
+            std::atomic<uint32_t> driver_attempts{0};
+            std::atomic<uint32_t> driver_ok{0};
+            std::atomic<uint32_t> target_read_attempts{0};
+            std::atomic<uint32_t> target_read_ok{0};
+            std::atomic<uint32_t> install_wait_elapsed_ms{0};
+            std::atomic<uint32_t> observed_session{0};
+            std::atomic<uint64_t> observed_generation{0};
+            std::atomic<uint64_t> target_read_result{0};
+            std::atomic<uint64_t> stimulus_bytes{0};
+        };
+        struct hunt_stimulus_process_handle_t {
+            HANDLE handle = nullptr;
+            ~hunt_stimulus_process_handle_t() {
+                if (handle)
+                    CloseHandle(handle);
+            }
+        };
+        auto stimulus = std::make_shared<hunt_stimulus_state_t>();
+        auto stimulus_process = std::make_shared<hunt_stimulus_process_handle_t>();
+        if (sidecar.process) {
+            SetLastError(0);
+            const BOOL dup_ok = DuplicateHandle(GetCurrentProcess(), sidecar.process, GetCurrentProcess(), &stimulus_process->handle, 0, FALSE, DUPLICATE_SAME_ACCESS);
+            const DWORD dup_err = dup_ok ? 0 : GetLastError();
+            log_msg(hf, tag, "STIMULUS-PROCESS-HANDLE -- duplicate ok=%d err=%lu handle=0x%p sidecar_pid=%lu",
+                dup_ok ? 1 : 0,
+                static_cast<unsigned long>(dup_err),
+                stimulus_process->handle,
+                static_cast<unsigned long>(sidecar.pid));
+        }
+        const uint64_t hunt_generation_before = integrity_hunter::g_state.generation.load(std::memory_order_acquire);
+        auto run_hunt_stimulus = [stimulus, stimulus_process, hf, tag, sidecar_pid = sidecar.pid, hunt_addr, target_read_fn, target_read_kind, hunt_generation_before]() {
+            stimulus->started.store(true, std::memory_order_release);
+            struct done_guard_t {
+                std::shared_ptr<hunt_stimulus_state_t> state;
+                ~done_guard_t() {
+                    if (state)
+                        state->done.store(true, std::memory_order_release);
+                }
+            };
+            done_guard_t done_guard{stimulus};
             const DWORD wait_start = GetTickCount();
             bool install_seen = false;
-            while (!hunt_call_done.load(std::memory_order_acquire) && GetTickCount() - wait_start < 4000) {
-                if (integrity_hunter::g_state.install_complete.load(std::memory_order_acquire) &&
-                    integrity_hunter::g_state.install_success.load(std::memory_order_acquire)) {
+            uint64_t observed_generation = 0;
+            uint32_t observed_session = 0;
+            while (!stimulus->hunt_call_done.load(std::memory_order_acquire) && GetTickCount() - wait_start < 5000) {
+                const uint64_t generation_now = integrity_hunter::g_state.generation.load(std::memory_order_acquire);
+                const uint32_t session_now = integrity_hunter::g_state.pg_session_id.load(std::memory_order_acquire);
+                if (generation_now > hunt_generation_before &&
+                    integrity_hunter::g_state.install_complete.load(std::memory_order_acquire) &&
+                    integrity_hunter::g_state.install_success.load(std::memory_order_acquire) &&
+                    session_now != 0) {
                     install_seen = true;
+                    observed_generation = generation_now;
+                    observed_session = session_now;
                     break;
                 }
-                Sleep(25);
+                Sleep(15);
             }
+            stimulus->install_seen.store(install_seen, std::memory_order_release);
+            stimulus->observed_generation.store(observed_generation, std::memory_order_release);
+            stimulus->observed_session.store(observed_session, std::memory_order_release);
+            stimulus->install_wait_elapsed_ms.store(GetTickCount() - wait_start, std::memory_order_release);
             {
                 std::lock_guard<std::mutex> lk(integrity_hunter::g_state.mutex);
-                log_msg(hf, tag, "STIMULUS-WAIT -- install_seen=%d elapsed_ms=%lu install_complete=%d install_success=%d pg_session=%u total_reads=%llu events=%zu",
+                log_msg(hf, tag, "STIMULUS-WAIT -- install_seen=%d elapsed_ms=%lu generation_before=%llu generation_now=%llu observed_generation=%llu install_complete=%d install_success=%d pg_session=%u observed_session=%u total_reads=%llu events=%zu",
                     install_seen ? 1 : 0,
                     static_cast<unsigned long>(GetTickCount() - wait_start),
+                    static_cast<unsigned long long>(hunt_generation_before),
+                    static_cast<unsigned long long>(integrity_hunter::g_state.generation.load()),
+                    static_cast<unsigned long long>(observed_generation),
                     integrity_hunter::g_state.install_complete.load() ? 1 : 0,
                     integrity_hunter::g_state.install_success.load() ? 1 : 0,
                     integrity_hunter::g_state.pg_session_id.load(),
+                    observed_session,
                     static_cast<unsigned long long>(integrity_hunter::g_state.total_reads.load()),
                     integrity_hunter::g_state.event_log.size());
             }
-            if (!install_seen)
+            if (!install_seen) {
+                stimulus->done.store(true, std::memory_order_release);
                 return;
+            }
             const DWORD stim_start = GetTickCount();
-            while (!hunt_call_done.load(std::memory_order_acquire) && GetTickCount() - stim_start < 1800) {
+            while (!stimulus->hunt_call_done.load(std::memory_order_acquire) && GetTickCount() - stim_start < 3200) {
                 uint8_t stack_buf[128] = {};
                 SIZE_T got = 0;
-                rpm_attempts.fetch_add(1, std::memory_order_acq_rel);
-                if (ReadProcessMemory(sidecar.process, reinterpret_cast<LPCVOID>(hunt_addr), stack_buf, sizeof(stack_buf), &got) && got != 0) {
-                    rpm_ok.fetch_add(1, std::memory_order_acq_rel);
-                    stimulus_bytes.fetch_add(static_cast<uint64_t>(got), std::memory_order_acq_rel);
+                stimulus->rpm_attempts.fetch_add(1, std::memory_order_acq_rel);
+                if (stimulus_process->handle &&
+                    ReadProcessMemory(stimulus_process->handle, reinterpret_cast<LPCVOID>(hunt_addr), stack_buf, sizeof(stack_buf), &got) && got != 0) {
+                    stimulus->rpm_ok.fetch_add(1, std::memory_order_acq_rel);
+                    stimulus->stimulus_bytes.fetch_add(static_cast<uint64_t>(got), std::memory_order_acq_rel);
                 }
                 std::vector<uint8_t> readback;
-                driver_attempts.fetch_add(1, std::memory_order_acq_rel);
+                stimulus->driver_attempts.fetch_add(1, std::memory_order_acq_rel);
                 if (driver_bridge::read_memory(hunt_addr, 128, readback) && !readback.empty()) {
-                    driver_ok.fetch_add(1, std::memory_order_acq_rel);
-                    stimulus_bytes.fetch_add(static_cast<uint64_t>(readback.size()), std::memory_order_acq_rel);
+                    stimulus->driver_ok.fetch_add(1, std::memory_order_acq_rel);
+                    stimulus->stimulus_bytes.fetch_add(static_cast<uint64_t>(readback.size()), std::memory_order_acq_rel);
                 }
                 if (target_read_fn != 0) {
-                    target_read_attempts.fetch_add(1, std::memory_order_acq_rel);
+                    stimulus->target_read_attempts.fetch_add(1, std::memory_order_acq_rel);
                     const std::uint64_t result = target_read_kind == "RtlComputeCrc32"
-                        ? page_guard_engine::remote_thread_call(sidecar.pid, target_read_fn, 0, hunt_addr, 128, 0, 2500, "hunt_integrity_RtlComputeCrc32")
-                        : page_guard_engine::remote_thread_call(sidecar.pid, target_read_fn, hunt_addr, hunt_addr, 128, 0, 2500, "hunt_integrity_RtlCompareMemory");
-                    target_read_result.store(result, std::memory_order_release);
+                        ? page_guard_engine::remote_thread_call(sidecar_pid, target_read_fn, 0, hunt_addr, 128, 0, 1000, "hunt_integrity_RtlComputeCrc32")
+                        : page_guard_engine::remote_thread_call(sidecar_pid, target_read_fn, hunt_addr, hunt_addr, 128, 0, 1000, "hunt_integrity_RtlCompareMemory");
+                    stimulus->target_read_result.store(result, std::memory_order_release);
                     if (result != 0)
-                        target_read_ok.fetch_add(1, std::memory_order_acq_rel);
-                    stimulus_bytes.fetch_add(128, std::memory_order_acq_rel);
+                        stimulus->target_read_ok.fetch_add(1, std::memory_order_acq_rel);
+                    stimulus->stimulus_bytes.fetch_add(128, std::memory_order_acq_rel);
                 }
-                Sleep(35);
+                Sleep(20);
             }
             {
                 std::lock_guard<std::mutex> lk(integrity_hunter::g_state.mutex);
                 log_msg(hf, tag, "STIMULUS-END -- elapsed_ms=%lu rpm_attempts=%u rpm_ok=%u driver_attempts=%u driver_ok=%u target_read_kind=%s target_read_attempts=%u target_read_ok=%u target_read_result=0x%016llX bytes=%llu total_reads=%llu events=%zu pg_session=%u install_complete=%d install_success=%d",
                     static_cast<unsigned long>(GetTickCount() - stim_start),
-                    rpm_attempts.load(),
-                    rpm_ok.load(),
-                    driver_attempts.load(),
-                    driver_ok.load(),
+                    stimulus->rpm_attempts.load(),
+                    stimulus->rpm_ok.load(),
+                    stimulus->driver_attempts.load(),
+                    stimulus->driver_ok.load(),
                     target_read_kind.empty() ? "<none>" : target_read_kind.c_str(),
-                    target_read_attempts.load(),
-                    target_read_ok.load(),
-                    static_cast<unsigned long long>(target_read_result.load()),
-                    static_cast<unsigned long long>(stimulus_bytes.load()),
+                    stimulus->target_read_attempts.load(),
+                    stimulus->target_read_ok.load(),
+                    static_cast<unsigned long long>(stimulus->target_read_result.load()),
+                    static_cast<unsigned long long>(stimulus->stimulus_bytes.load()),
                     static_cast<unsigned long long>(integrity_hunter::g_state.total_reads.load()),
                     integrity_hunter::g_state.event_log.size(),
                     integrity_hunter::g_state.pg_session_id.load(),
                     integrity_hunter::g_state.install_complete.load() ? 1 : 0,
                     integrity_hunter::g_state.install_success.load() ? 1 : 0);
             }
+            stimulus->done.store(true, std::memory_order_release);
         };
-        aida::infra::win_thread::joinable_thread_t stimulus_thread;
-        std::string stimulus_thread_error;
-        const bool stimulus_thread_started = stimulus_thread.start(
-            run_hunt_stimulus,
-            &stimulus_thread_error,
-            aida::infra::win_thread::fixture_stack_reserve,
-            "testlab_hunt_integrity_stimulus");
-        if (!stimulus_thread_started) {
+        const bool stimulus_posted = work_queue::post(run_hunt_stimulus);
+        if (!stimulus_posted) {
             const auto cq = critical_work_queue::stats();
             const auto wq = work_queue::stats();
             const auto sq = work_queue::service_stats();
-            log_msg(hf, tag, "STIMULUS-THREAD-START-FAILED -- err=%s cq_alive=%d cq_pending=%llu cq_active=%u cq_rejected=%llu wq_alive=%d wq_pending=%llu wq_active=%u wq_rejected=%llu svc_alive=%d svc_pending=%llu svc_active=%u svc_rejected=%llu",
-                stimulus_thread_error.empty() ? "<empty>" : stimulus_thread_error.c_str(),
+            log_msg(hf, tag, "STIMULUS-QUEUE-FAILED -- cq_alive=%d cq_pending=%llu cq_active=%u cq_rejected=%llu wq_alive=%d wq_pending=%llu wq_active=%u wq_rejected=%llu svc_alive=%d svc_pending=%llu svc_active=%u svc_rejected=%llu",
                 cq.alive ? 1 : 0,
                 static_cast<unsigned long long>(cq.pending),
                 cq.active,
@@ -17049,15 +17493,45 @@ void test_tool_scanner_struct_manage_define(HANDLE hf, std::atomic<int>& passed,
                 static_cast<unsigned long long>(sq.rejected));
         }
         auto status = test_tool_call(hf, tag, get_server(), "hunt_integrity_checkers", args, passed, failed, skipped);
-        hunt_call_done.store(true, std::memory_order_release);
-        if (stimulus_thread.joinable()) {
-            if (!stimulus_thread.join_for(10000)) {
-                log_msg(hf, tag, "STIMULUS-JOIN-TIMEOUT -- forcing blocking join after bounded wait hunt_done=1");
-                stimulus_thread.join();
-            }
-        }
+        stimulus->hunt_call_done.store(true, std::memory_order_release);
         integrity_hunter::stop_hunt();
         const bool idle = integrity_hunter::wait_until_idle(12000);
+        bool sidecar_closed = false;
+        if (stimulus_posted) {
+            const DWORD wait_start = GetTickCount();
+            while (!stimulus->done.load(std::memory_order_acquire) && GetTickCount() - wait_start < 6000)
+                Sleep(25);
+            if (!stimulus->done.load(std::memory_order_acquire)) {
+                log_msg(hf, tag, "STIMULUS-WAIT-TIMEOUT -- closing sidecar after bounded wait started=%d install_seen=%d elapsed_ms=%lu generation_before=%llu observed_generation=%llu observed_session=%u rpm_attempts=%u driver_attempts=%u target_read_attempts=%u",
+                    stimulus->started.load() ? 1 : 0,
+                    stimulus->install_seen.load() ? 1 : 0,
+                    static_cast<unsigned long>(GetTickCount() - wait_start),
+                    static_cast<unsigned long long>(hunt_generation_before),
+                    static_cast<unsigned long long>(stimulus->observed_generation.load()),
+                    stimulus->observed_session.load(),
+                    stimulus->rpm_attempts.load(),
+                    stimulus->driver_attempts.load(),
+                    stimulus->target_read_attempts.load());
+                close_hunt_integrity_sidecar(hf, tag, sidecar, true);
+                sidecar_closed = true;
+                const DWORD close_wait_start = GetTickCount();
+                while (!stimulus->done.load(std::memory_order_acquire) && GetTickCount() - close_wait_start < 5000)
+                    Sleep(25);
+                if (!stimulus->done.load(std::memory_order_acquire)) {
+                    log_msg(hf, tag, "STIMULUS-ABANDONED -- continuing after sidecar close started=%d install_seen=%d rpm_attempts=%u rpm_ok=%u driver_attempts=%u driver_ok=%u target_read_attempts=%u target_read_ok=%u target_read_result=0x%016llX bytes=%llu",
+                        stimulus->started.load() ? 1 : 0,
+                        stimulus->install_seen.load() ? 1 : 0,
+                        stimulus->rpm_attempts.load(),
+                        stimulus->rpm_ok.load(),
+                        stimulus->driver_attempts.load(),
+                        stimulus->driver_ok.load(),
+                        stimulus->target_read_attempts.load(),
+                        stimulus->target_read_ok.load(),
+                        static_cast<unsigned long long>(stimulus->target_read_result.load()),
+                        static_cast<unsigned long long>(stimulus->stimulus_bytes.load()));
+                }
+            }
+        }
         DWORD sidecar_exit = 0;
         const bool sidecar_exited = hunt_sidecar_exited(sidecar, sidecar_exit);
         bool fixture_freed = false;
@@ -17086,16 +17560,17 @@ void test_tool_scanner_struct_manage_define(HANDLE hf, std::atomic<int>& passed,
             static_cast<unsigned long long>(reads_after),
             events_before,
             events_after,
-            rpm_attempts.load(),
-            rpm_ok.load(),
-            driver_attempts.load(),
-            driver_ok.load(),
+            stimulus->rpm_attempts.load(),
+            stimulus->rpm_ok.load(),
+            stimulus->driver_attempts.load(),
+            stimulus->driver_ok.load(),
             target_read_kind.empty() ? "<none>" : target_read_kind.c_str(),
-            target_read_attempts.load(),
-            target_read_ok.load(),
-            static_cast<unsigned long long>(target_read_result.load()),
-            static_cast<unsigned long long>(stimulus_bytes.load()));
-        close_hunt_integrity_sidecar(hf, tag, sidecar, true);
+            stimulus->target_read_attempts.load(),
+            stimulus->target_read_ok.load(),
+            static_cast<unsigned long long>(stimulus->target_read_result.load()),
+            static_cast<unsigned long long>(stimulus->stimulus_bytes.load()));
+        if (!sidecar_closed)
+            close_hunt_integrity_sidecar(hf, tag, sidecar, true);
         const bool primary_restored = restore_primary();
         if (status == mcp_tool_call_status_t::passed && !idle)
             record_fixture_failed_tool("hunt_integrity_checkers", failed);
@@ -17103,15 +17578,15 @@ void test_tool_scanner_struct_manage_define(HANDLE hf, std::atomic<int>& passed,
             record_fixture_failed_tool("hunt_integrity_checkers", failed);
         if (status == mcp_tool_call_status_t::passed && reads_after == 0 && events_after == 0) {
             log_msg(hf, tag, "FAIL -- production handler passed without read evidence after deterministic stimulus rpm_attempts=%u rpm_ok=%u driver_attempts=%u driver_ok=%u target_read_kind=%s target_read_attempts=%u target_read_ok=%u target_read_result=0x%016llX stimulus_bytes=%llu install_complete=%d install_success=%d pg_session=%u",
-                rpm_attempts.load(),
-                rpm_ok.load(),
-                driver_attempts.load(),
-                driver_ok.load(),
+                stimulus->rpm_attempts.load(),
+                stimulus->rpm_ok.load(),
+                stimulus->driver_attempts.load(),
+                stimulus->driver_ok.load(),
                 target_read_kind.empty() ? "<none>" : target_read_kind.c_str(),
-                target_read_attempts.load(),
-                target_read_ok.load(),
-                static_cast<unsigned long long>(target_read_result.load()),
-                static_cast<unsigned long long>(stimulus_bytes.load()),
+                stimulus->target_read_attempts.load(),
+                stimulus->target_read_ok.load(),
+                static_cast<unsigned long long>(stimulus->target_read_result.load()),
+                static_cast<unsigned long long>(stimulus->stimulus_bytes.load()),
                 integrity_hunter::g_state.install_complete.load() ? 1 : 0,
                 integrity_hunter::g_state.install_success.load() ? 1 : 0,
                 integrity_hunter::g_state.pg_session_id.load());
@@ -17297,7 +17772,78 @@ void test_tool_scanner_struct_manage_define(HANDLE hf, std::atomic<int>& passed,
         test_tool_action_call(hf, "mcp.analysis_query.imports", "analysis_query", "imports", {}, passed, failed, skipped);
     }
 
-void test_tool_analysis_query_exports(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+    uint64_t stable_export_name_hash(const std::string& name) {
+        uint64_t h = 1469598103934665603ULL;
+        const std::string lc = lower_copy(name);
+        for (unsigned char c : lc) {
+            h ^= static_cast<uint64_t>(c);
+            h *= 1099511628211ULL;
+        }
+        return h;
+    }
+
+    bool export_result_names(const mcp_standalone::json& data, std::vector<std::string>& names, std::string& shape) {
+        names.clear();
+        const auto* exports_value = find_payload_key_recursive(data, "exports");
+        if (!exports_value) {
+            shape = "exports_key_missing data=" + compact_json(data, 900);
+            return false;
+        }
+        if (!exports_value->is_array()) {
+            shape = "exports_not_array value=" + compact_json(*exports_value, 900);
+            return false;
+        }
+        size_t unnamed = 0;
+        for (const auto& item : *exports_value) {
+            std::string name;
+            if (item.is_string()) {
+                name = item.get<std::string>();
+            } else if (item.is_object()) {
+                json_string_any_field(item, name, { "name", "export", "symbol", "function", "decorated_name", "undecorated_name" });
+            }
+            if (name.empty()) {
+                ++unnamed;
+                continue;
+            }
+            names.push_back(name);
+        }
+        if (names.empty()) {
+            shape = "exports_array_without_names size=" + std::to_string(static_cast<unsigned long long>(exports_value->size())) +
+                " unnamed=" + std::to_string(static_cast<unsigned long long>(unnamed)) +
+                " sample=" + compact_json(*exports_value, 1200);
+            return false;
+        }
+        shape = "exports_array size=" + std::to_string(static_cast<unsigned long long>(exports_value->size())) +
+            " parsed_names=" + std::to_string(static_cast<unsigned long long>(names.size())) +
+            " unnamed=" + std::to_string(static_cast<unsigned long long>(unnamed));
+        return true;
+    }
+
+    bool export_names_contain_ci(const std::vector<std::string>& names, const char* expected) {
+        if (!expected || !*expected)
+            return false;
+        const std::string needle = lower_copy(expected);
+        for (const auto& name : names) {
+            if (lower_copy(name) == needle)
+                return true;
+        }
+        return false;
+    }
+
+    std::string bounded_export_name_evidence(const std::vector<std::string>& names) {
+        std::ostringstream oss;
+        const size_t limit = std::min<size_t>(names.size(), 16);
+        for (size_t i = 0; i < limit; ++i) {
+            if (i)
+                oss << ",";
+            oss << names[i] << "#0x" << std::hex << std::uppercase << stable_export_name_hash(names[i]) << std::dec;
+        }
+        if (names.size() > limit)
+            oss << ",... total=" << names.size();
+        return oss.str();
+    }
+
+    void test_tool_analysis_query_exports(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args;
         args["module_name"] = "AiDA_TestTarget.exe";
         args["max_entries"] = 128;
@@ -17305,104 +17851,415 @@ void test_tool_analysis_query_exports(HANDLE hf, std::atomic<int>& passed, std::
         auto status = test_tool_action_call(hf, "mcp.analysis_query.exports", "analysis_query", "exports", args, passed, failed, skipped, false, &result);
         if (status != mcp_tool_call_status_t::passed)
             return;
+        std::string module_path;
+        std::string module_name;
+        uint64_t module_base = 0;
+        bool truncated = false;
+        bool parse_complete = false;
+        json_string_field(result.data, "module_path", module_path);
+        if (module_path.empty())
+            json_string_field(result.data, "path", module_path);
+        json_string_field(result.data, "module", module_name);
+        payload_u64_or_string_field(result.data, "module_base", module_base);
+        if (module_base == 0)
+            payload_u64_or_string_field(result.data, "base", module_base);
+        payload_bool_field(result.data, "truncated", truncated);
+        payload_bool_field(result.data, "parse_complete", parse_complete);
         uint64_t count = 0;
         const bool has_count = payload_u64_field(result.data, "count", count);
-        size_t exports = 0;
-        const bool has_exports = payload_array_count(result.data, "exports", exports);
-        if (!has_count || count == 0 || !has_exports || exports == 0) {
-            log_msg(hf, "mcp.analysis_query.exports", "FAIL -- selected module export list empty count_present=%d count=%llu exports_present=%d exports=%zu data=%s",
+        std::vector<std::string> names;
+        std::string shape;
+        const bool has_structured_names = export_result_names(result.data, names, shape);
+        if (!has_structured_names) {
+            log_msg(hf, "mcp.analysis_query.exports", "FAIL -- structured exports unavailable module_path=%s module=%s module_base=0x%016llX count_present=%d count=%llu truncated=%d parse_complete=%d shape=%s",
+                module_path.empty() ? "<empty>" : compact_text(module_path, 600).c_str(),
+                module_name.empty() ? "<empty>" : compact_text(module_name, 260).c_str(),
+                static_cast<unsigned long long>(module_base),
                 has_count ? 1 : 0,
                 static_cast<unsigned long long>(count),
-                has_exports ? 1 : 0,
-                exports,
-                compact_json(result.data, 900).c_str());
-            if (passed.load(std::memory_order_acquire) > 0)
-                passed.fetch_sub(1, std::memory_order_acq_rel);
-            failed.fetch_add(1, std::memory_order_acq_rel);
-            convert_tool_pass_to_fail("analysis_query");
+                truncated ? 1 : 0,
+                parse_complete ? 1 : 0,
+                compact_text(shape, 1200).c_str());
+            convert_last_pass_to_fixture_failure("analysis_query", passed, failed);
             return;
         }
-        const std::string combined = lower_copy(result.text + " " + compact_json(result.data, 5000));
-        const bool has_branch = combined.find("aida_test_re_analysis_branch") != std::string::npos;
-        const bool has_callgraph = combined.find("aida_test_re_analysis_callgraph") != std::string::npos;
-        const bool has_dispatch = combined.find("aida_test_re_analysis_dispatch") != std::string::npos;
-        if (!has_branch || !has_callgraph || !has_dispatch) {
-            log_msg(hf, "mcp.analysis_query.exports", "FAIL -- AiDA_TestTarget export evidence missing branch=%d callgraph=%d dispatch=%d data=%s",
+        const bool has_protected_entry = export_names_contain_ci(names, "aida_test_protected_entry");
+        const bool has_re_descriptor = export_names_contain_ci(names, "aida_test_protected_re_descriptor");
+        const bool has_re_get_descriptor = export_names_contain_ci(names, "aida_test_protected_re_get_descriptor");
+        const bool has_proto_emit_capture = export_names_contain_ci(names, "aida_test_proto_emit_capture");
+        const bool has_branch = export_names_contain_ci(names, "aida_test_re_analysis_branch");
+        const bool has_callgraph = export_names_contain_ci(names, "aida_test_re_analysis_callgraph");
+        const bool has_dispatch = export_names_contain_ci(names, "aida_test_re_analysis_dispatch");
+        log_msg(hf, "mcp.analysis_query.exports", "EXPORT-STRUCTURE -- module_path=%s module=%s module_base=0x%016llX count_present=%d count=%llu names=%zu truncated=%d parse_complete=%d shape=%s exports=%s expected protected_entry=%d re_descriptor=%d re_get_descriptor=%d proto_emit_capture=%d legacy_branch=%d legacy_callgraph=%d legacy_dispatch=%d",
+            module_path.empty() ? "<empty>" : compact_text(module_path, 600).c_str(),
+            module_name.empty() ? "<empty>" : compact_text(module_name, 260).c_str(),
+            static_cast<unsigned long long>(module_base),
+            has_count ? 1 : 0,
+            static_cast<unsigned long long>(count),
+            names.size(),
+            truncated ? 1 : 0,
+            parse_complete ? 1 : 0,
+            compact_text(shape, 700).c_str(),
+            compact_text(bounded_export_name_evidence(names), 1400).c_str(),
+            has_protected_entry ? 1 : 0,
+            has_re_descriptor ? 1 : 0,
+            has_re_get_descriptor ? 1 : 0,
+            has_proto_emit_capture ? 1 : 0,
+            has_branch ? 1 : 0,
+            has_callgraph ? 1 : 0,
+            has_dispatch ? 1 : 0);
+        if (!has_count || count == 0 || names.empty() ||
+            !has_protected_entry || !has_re_descriptor || !has_re_get_descriptor || !has_proto_emit_capture) {
+            log_msg(hf, "mcp.analysis_query.exports", "FAIL -- AiDA_TestTarget structured export proof incomplete count_present=%d count=%llu names=%zu protected_entry=%d re_descriptor=%d re_get_descriptor=%d proto_emit_capture=%d legacy_branch=%d legacy_callgraph=%d legacy_dispatch=%d exports=%s data=%s",
+                has_count ? 1 : 0,
+                static_cast<unsigned long long>(count),
+                names.size(),
+                has_protected_entry ? 1 : 0,
+                has_re_descriptor ? 1 : 0,
+                has_re_get_descriptor ? 1 : 0,
+                has_proto_emit_capture ? 1 : 0,
                 has_branch ? 1 : 0,
                 has_callgraph ? 1 : 0,
                 has_dispatch ? 1 : 0,
+                compact_text(bounded_export_name_evidence(names), 1200).c_str(),
                 compact_json(result.data, 1600).c_str());
-            if (passed.load(std::memory_order_acquire) > 0)
-                passed.fetch_sub(1, std::memory_order_acq_rel);
-            failed.fetch_add(1, std::memory_order_acq_rel);
-            convert_tool_pass_to_fail("analysis_query");
+            convert_last_pass_to_fixture_failure("analysis_query", passed, failed);
             return;
         }
-        log_msg(hf, "mcp.analysis_query.exports", "EXPORT-PROOF -- module=AiDA_TestTarget.exe exports=%zu count=%llu branch=1 callgraph=1 dispatch=1",
-            exports,
-            static_cast<unsigned long long>(count));
+        log_msg(hf, "mcp.analysis_query.exports", "EXPORT-PROOF -- module=AiDA_TestTarget.exe names=%zu count=%llu protected_entry=1 re_descriptor=1 re_get_descriptor=1 proto_emit_capture=1 module_base=0x%016llX",
+            names.size(),
+            static_cast<unsigned long long>(count),
+            static_cast<unsigned long long>(module_base));
     }
 
-    bool pdb_fixture_loaded_counts(size_t& symbols, size_t& types, std::string& status_text) {
+    struct pdb_fixture_candidate_t {
+        std::string source;
+        std::filesystem::path path;
+    };
+
+    std::string get_env_var_narrow(const char* name) {
+        if (!name || !*name)
+            return {};
+        char buf[32767] = {};
+        DWORD n = GetEnvironmentVariableA(name, buf, static_cast<DWORD>(sizeof(buf)));
+        if (n == 0 || n >= static_cast<DWORD>(sizeof(buf)))
+            return {};
+        return std::string(buf, buf + n);
+    }
+
+    void append_pdb_fixture_candidate(std::vector<pdb_fixture_candidate_t>& out,
+                                      std::set<std::string>& seen,
+                                      const std::string& source,
+                                      const std::filesystem::path& path) {
+        if (path.empty())
+            return;
+        std::error_code ec;
+        std::filesystem::path abs = std::filesystem::absolute(path, ec);
+        const std::filesystem::path normalized = (ec ? path : abs).lexically_normal();
+        const std::string key = lower_copy(normalized.string());
+        if (!seen.insert(key).second)
+            return;
+        out.push_back({ source, normalized });
+    }
+
+    void append_pdb_fixture_root_candidates(std::vector<pdb_fixture_candidate_t>& out,
+                                            std::set<std::string>& seen,
+                                            const std::string& source,
+                                            const std::filesystem::path& root) {
+        if (root.empty())
+            return;
+        append_pdb_fixture_candidate(out, seen, source + ".test_binaries",
+            root / "test_binaries" / "target_protocol" / "target_protocol.pdb");
+        append_pdb_fixture_candidate(out, seen, source + ".build_ninja",
+            root / "build-ninja" / "test_binaries" / "target_protocol" / "target_protocol.pdb");
+        append_pdb_fixture_candidate(out, seen, source + ".build",
+            root / "build" / "test_binaries" / "target_protocol" / "target_protocol.pdb");
+        append_pdb_fixture_candidate(out, seen, source + ".package_deps",
+            root / "deps" / "test_binaries" / "target_protocol" / "target_protocol.pdb");
+        append_pdb_fixture_candidate(out, seen, source + ".package_fixtures",
+            root / "fixtures" / "target_protocol" / "target_protocol.pdb");
+        append_pdb_fixture_candidate(out, seen, source + ".target_protocol_dir",
+            root / "target_protocol" / "target_protocol.pdb");
+        append_pdb_fixture_candidate(out, seen, source + ".direct_file",
+            root / "target_protocol.pdb");
+    }
+
+    std::vector<pdb_fixture_candidate_t> pdb_fixture_candidates() {
+        std::vector<pdb_fixture_candidate_t> candidates;
+        std::set<std::string> seen;
+        const char* file_envs[] = {
+            "AIDA_TARGET_PROTOCOL_PDB",
+            "AIDA_TESTLAB_TARGET_PROTOCOL_PDB",
+            "AIDA_PDB_FIXTURE_PATH"
+        };
+        for (const char* env_name : file_envs) {
+            const std::string value = get_env_var_narrow(env_name);
+            if (!value.empty())
+                append_pdb_fixture_candidate(candidates, seen, std::string("env.") + env_name, std::filesystem::path(value));
+        }
+        const char* dir_envs[] = {
+            "AIDA_TARGET_PROTOCOL_FIXTURE_DIR",
+            "AIDA_TESTLAB_FIXTURE_DIR",
+            "AIDA_TEST_BINARY_DIR",
+            "AIDA_PACKAGE_DIR"
+        };
+        for (const char* env_name : dir_envs) {
+            const std::string value = get_env_var_narrow(env_name);
+            if (!value.empty()) {
+                std::filesystem::path root(value);
+                append_pdb_fixture_candidate(candidates, seen, std::string("env.") + env_name + ".direct",
+                    root / "target_protocol.pdb");
+                append_pdb_fixture_root_candidates(candidates, seen, std::string("env.") + env_name, root);
+            }
+        }
+
+        const std::filesystem::path self_path(get_self_path_narrow());
+        const std::filesystem::path app_dir = self_path.parent_path();
+        const std::filesystem::path app_parent = app_dir.parent_path();
+        append_pdb_fixture_root_candidates(candidates, seen, "app_dir", app_dir);
+        append_pdb_fixture_root_candidates(candidates, seen, "app_parent", app_parent);
+
+        std::error_code cwd_ec;
+        const std::filesystem::path cwd = std::filesystem::current_path(cwd_ec);
+        if (!cwd_ec) {
+            append_pdb_fixture_root_candidates(candidates, seen, "cwd", cwd);
+            append_pdb_fixture_root_candidates(candidates, seen, "cwd.parent", cwd.parent_path());
+        }
+
+        append_pdb_fixture_candidate(candidates, seen, "repo.default_build_ninja",
+            std::filesystem::path("C:\\Users\\ruar1337\\AiDAPrivate\\build-ninja\\test_binaries\\target_protocol\\target_protocol.pdb"));
+        append_pdb_fixture_candidate(candidates, seen, "repo.default_test_binaries",
+            std::filesystem::path("C:\\Users\\ruar1337\\AiDAPrivate\\test_binaries\\target_protocol\\target_protocol.pdb"));
+        return candidates;
+    }
+
+    std::string pdb_fixture_file_evidence(const std::filesystem::path& pdb_path) {
+        std::error_code ec;
+        const bool exists = std::filesystem::exists(pdb_path, ec);
+        uintmax_t size = 0;
+        if (exists && !ec)
+            size = std::filesystem::file_size(pdb_path, ec);
+        std::ostringstream oss;
+        oss << "path=" << pdb_path.string()
+            << " exists=" << (exists && !ec ? 1 : 0)
+            << " size=" << static_cast<unsigned long long>(ec ? 0 : size)
+            << " ec=" << ec.value()
+            << " msg=" << ec.message();
+        return oss.str();
+    }
+
+    bool select_pdb_fixture_path(HANDLE hf, const char* tag, std::filesystem::path& selected_path, std::string& selected_evidence) {
+        const auto candidates = pdb_fixture_candidates();
+        bool found = false;
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            const std::string evidence = pdb_fixture_file_evidence(candidates[i].path);
+            log_msg(hf, tag, "PDB-FIXTURE-CANDIDATE -- index=%zu source=%s %s",
+                i,
+                candidates[i].source.c_str(),
+                evidence.c_str());
+            std::error_code ec;
+            if (!found && std::filesystem::exists(candidates[i].path, ec) && !ec) {
+                selected_path = candidates[i].path;
+                selected_evidence = evidence;
+                found = true;
+            }
+        }
+        return found;
+    }
+
+    bool pdb_fixture_state(size_t& symbols, size_t& types, std::string& status_text, bool& loaded, bool& module_present, bool& failed) {
         std::lock_guard<std::mutex> lk(symbol_store::g_state.mutex);
         auto it = symbol_store::g_state.modules.find("target_protocol.exe");
         if (it == symbol_store::g_state.modules.end()) {
             status_text = "module entry missing";
             symbols = 0;
             types = 0;
+            loaded = false;
+            module_present = false;
+            failed = false;
             return false;
         }
         const auto& mod = it->second;
         status_text = mod.status_text;
         symbols = mod.pdb.symbols.size();
         types = mod.pdb.structs.size() + mod.pdb.enums.size();
-        return mod.pdb.loaded && symbols > 0 && types > 0;
+        loaded = mod.pdb.loaded;
+        module_present = true;
+        failed = mod.failed;
+        return loaded && symbols > 0 && types > 0;
+    }
+
+    bool pdb_fixture_loaded_counts(size_t& symbols, size_t& types, std::string& status_text) {
+        bool loaded = false;
+        bool module_present = false;
+        bool failed = false;
+        return pdb_fixture_state(symbols, types, status_text, loaded, module_present, failed);
+    }
+
+    bool pdb_fixture_terminal_failed(bool module_present,
+                                     bool failed,
+                                     bool loaded,
+                                     size_t symbols,
+                                     size_t types,
+                                     const std::string& status_text) {
+        if (loaded && symbols > 0 && types > 0)
+            return false;
+        if (!module_present)
+            return false;
+        if (failed)
+            return true;
+        const std::string status_lc = lower_copy(status_text);
+        static const char* terminal_markers[] = {
+            "preloaded_rejected",
+            "loadlibraryw_failed",
+            "worker_start_failed",
+            "syminitializew failed",
+            "symloadmoduleexw failed",
+            "failed to parse",
+            "failed to queue",
+            "download failed",
+            "pdb not found",
+            "parse_pdb_failed",
+            "pdb load failed",
+            "load failed",
+            "rejected"
+        };
+        for (const char* marker : terminal_markers) {
+            if (status_lc.find(marker) != std::string::npos)
+                return true;
+        }
+        return false;
     }
 
     bool ensure_pdb_fixture_loaded(HANDLE hf, const char* tag) {
         size_t symbols = 0;
         size_t types = 0;
         std::string status_text;
-        if (pdb_fixture_loaded_counts(symbols, types, status_text)) {
+        bool loaded = false;
+        bool module_present = false;
+        bool failed = false;
+        std::filesystem::path pdb_path;
+        std::string file_evidence;
+        if (pdb_fixture_state(symbols, types, status_text, loaded, module_present, failed)) {
             g_pdb_fixture_attempted = true;
             g_pdb_fixture_ready = true;
             g_pdb_fixture_failure_reason.clear();
-            log_msg(hf, tag, "PDB fixture already loaded module=target_protocol.exe symbols=%zu types=%zu", symbols, types);
+            log_msg(hf, tag, "PDB-FIXTURE-READY -- module=target_protocol.exe loaded=%d module_present=%d failed=%d symbols=%zu types=%zu status=\"%s\" elapsed_ms=0 dependency_reason=already_loaded",
+                loaded ? 1 : 0,
+                module_present ? 1 : 0,
+                failed ? 1 : 0,
+                symbols,
+                types,
+                status_text.c_str());
             return true;
+        }
+        if (pdb_fixture_terminal_failed(module_present, failed, loaded, symbols, types, status_text)) {
+            g_pdb_fixture_attempted = true;
+            g_pdb_fixture_ready = false;
+            g_pdb_fixture_failure_reason = "dependency_reason=parser_terminal_failed loaded=" + std::to_string(loaded ? 1 : 0) +
+                " module_present=" + std::to_string(module_present ? 1 : 0) +
+                " failed=" + std::to_string(failed ? 1 : 0) +
+                " symbols=" + std::to_string(symbols) +
+                " types=" + std::to_string(types) +
+                " parser_status=\"" + status_text + "\"";
+            log_msg(hf, tag, "FAIL -- %s", g_pdb_fixture_failure_reason.c_str());
+            return false;
         }
         if (g_pdb_fixture_attempted) {
             if (g_pdb_fixture_ready) {
                 g_pdb_fixture_ready = false;
-                g_pdb_fixture_failure_reason = "PDB fixture cache was previously ready but symbol store no longer exposes loaded symbols";
+                g_pdb_fixture_failure_reason = "dependency_reason=previous_ready_state_lost loaded=" + std::to_string(loaded ? 1 : 0) +
+                    " module_present=" + std::to_string(module_present ? 1 : 0) +
+                    " failed=" + std::to_string(failed ? 1 : 0) +
+                    " symbols=" + std::to_string(symbols) +
+                    " types=" + std::to_string(types) +
+                    " parser_status=\"" + status_text + "\"";
             }
-            log_msg(hf, tag, "BLOCKED-FAIL -- PDB fixture unavailable from earlier root failure: %s", g_pdb_fixture_failure_reason.empty() ? "<empty>" : compact_text(g_pdb_fixture_failure_reason, 900).c_str());
+            log_msg(hf, tag, "BLOCKED-FAIL -- PDB fixture unavailable from earlier root failure loaded=%d module_present=%d failed=%d symbols=%zu types=%zu parser_status=\"%s\" dependency_reason=%s",
+                loaded ? 1 : 0,
+                module_present ? 1 : 0,
+                failed ? 1 : 0,
+                symbols,
+                types,
+                status_text.c_str(),
+                g_pdb_fixture_failure_reason.empty() ? "<empty>" : compact_text(g_pdb_fixture_failure_reason, 900).c_str());
             return false;
         }
         g_pdb_fixture_attempted = true;
 
-        std::filesystem::path pdb_path = std::filesystem::current_path() / "test_binaries" / "target_protocol" / "target_protocol.pdb";
-        std::error_code ec;
-        if (!std::filesystem::exists(pdb_path, ec) || ec) {
+        if (!select_pdb_fixture_path(hf, tag, pdb_path, file_evidence)) {
             g_pdb_fixture_ready = false;
-            g_pdb_fixture_failure_reason = "PDB fixture missing path=" + pdb_path.string() + " ec=" + std::to_string(ec.value()) + " msg=" + ec.message();
+            g_pdb_fixture_failure_reason = "dependency_reason=pdb_file_missing candidates=" + std::to_string(pdb_fixture_candidates().size());
             log_msg(hf, tag, "FAIL -- %s", g_pdb_fixture_failure_reason.c_str());
             return false;
         }
 
+        const auto start = std::chrono::steady_clock::now();
+        log_msg(hf, tag, "PDB-FIXTURE-LOAD -- module=target_protocol.exe loaded=%d module_present=%d symbols=%zu types=%zu parser_status=\"%s\" elapsed_ms=0 %s dependency_reason=starting_explicit_load",
+            loaded ? 1 : 0,
+            module_present ? 1 : 0,
+            symbols,
+            types,
+            status_text.c_str(),
+            file_evidence.c_str());
         symbol_store::load_pdb_from_explicit_path("target_protocol.exe", 0x140000000ull, 0x100000ull, pdb_path.string());
         auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(90);
+        auto last_progress_log = start;
         while (std::chrono::steady_clock::now() < deadline) {
-            if (pdb_fixture_loaded_counts(symbols, types, status_text)) {
+            const auto now = std::chrono::steady_clock::now();
+            if (pdb_fixture_state(symbols, types, status_text, loaded, module_present, failed)) {
                 g_pdb_fixture_ready = true;
                 g_pdb_fixture_failure_reason.clear();
-                log_msg(hf, tag, "PDB fixture loaded module=target_protocol.exe symbols=%zu types=%zu status=\"%s\"", symbols, types, status_text.c_str());
+                const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
+                log_msg(hf, tag, "PDB-FIXTURE-READY -- module=target_protocol.exe loaded=%d module_present=%d failed=%d symbols=%zu types=%zu parser_status=\"%s\" elapsed_ms=%lld %s dependency_reason=loaded",
+                    loaded ? 1 : 0,
+                    module_present ? 1 : 0,
+                    failed ? 1 : 0,
+                    symbols,
+                    types,
+                    status_text.c_str(),
+                    static_cast<long long>(elapsed_ms),
+                    file_evidence.c_str());
                 return true;
+            }
+            if (pdb_fixture_terminal_failed(module_present, failed, loaded, symbols, types, status_text)) {
+                const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
+                g_pdb_fixture_ready = false;
+                g_pdb_fixture_failure_reason = "dependency_reason=parser_terminal_failed elapsed_ms=" + std::to_string(static_cast<long long>(elapsed_ms)) +
+                    " loaded=" + std::to_string(loaded ? 1 : 0) +
+                    " module_present=" + std::to_string(module_present ? 1 : 0) +
+                    " failed=" + std::to_string(failed ? 1 : 0) +
+                    " symbols=" + std::to_string(symbols) +
+                    " types=" + std::to_string(types) +
+                    " parser_status=\"" + status_text + "\" " + file_evidence;
+                log_msg(hf, tag, "FAIL -- %s", g_pdb_fixture_failure_reason.c_str());
+                return false;
+            }
+            if (std::chrono::duration_cast<std::chrono::seconds>(now - last_progress_log).count() >= 5) {
+                const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
+                log_msg(hf, tag, "PDB-FIXTURE-PROGRESS -- module=target_protocol.exe loaded=%d module_present=%d failed=%d symbols=%zu types=%zu parser_status=\"%s\" elapsed_ms=%lld %s dependency_reason=parser_pending",
+                    loaded ? 1 : 0,
+                    module_present ? 1 : 0,
+                    failed ? 1 : 0,
+                    symbols,
+                    types,
+                    status_text.c_str(),
+                    static_cast<long long>(elapsed_ms),
+                    file_evidence.c_str());
+                last_progress_log = now;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
-        pdb_fixture_loaded_counts(symbols, types, status_text);
+        const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+        pdb_fixture_state(symbols, types, status_text, loaded, module_present, failed);
         g_pdb_fixture_ready = false;
-        g_pdb_fixture_failure_reason = "PDB fixture did not load within timeout symbols=" + std::to_string(symbols) + " types=" + std::to_string(types) + " status=\"" + status_text + "\"";
+        g_pdb_fixture_failure_reason = "dependency_reason=parser_timeout elapsed_ms=" + std::to_string(static_cast<long long>(elapsed_ms)) +
+            " loaded=" + std::to_string(loaded ? 1 : 0) +
+            " module_present=" + std::to_string(module_present ? 1 : 0) +
+            " failed=" + std::to_string(failed ? 1 : 0) +
+            " symbols=" + std::to_string(symbols) +
+            " types=" + std::to_string(types) +
+            " parser_status=\"" + status_text + "\" " + file_evidence;
         log_msg(hf, tag, "FAIL -- %s", g_pdb_fixture_failure_reason.c_str());
         return false;
     }
@@ -18160,6 +19017,87 @@ void test_tool_sessions_manage_open_file(HANDLE hf, std::atomic<int>& passed, st
         });
         args["max_instructions"] = 32;
         test_tool_call(hf, "mcp.emulate_multi_trace", get_server(), "emulate_multi_trace", args, passed, failed, skipped);
+    }
+
+    bool vm_bridge_status_payload_valid(const mcp_standalone::json& data, const std::string& text, std::string& proof) {
+        if (!data.is_object()) {
+            proof = "data_not_object type=" + std::string(data.type_name());
+            return false;
+        }
+        bool active = false;
+        bool guest_status_available = false;
+        uint64_t started_ms = 0;
+        std::string action;
+        std::string status;
+        std::string bridge_status;
+        std::string guest_status;
+        std::string guest_status_error;
+        std::string bridge_kind;
+        std::string backend;
+        std::string session_dir;
+        std::string bridge_dir;
+        const bool has_active = payload_bool_field(data, "active", active);
+        const bool has_started_ms = payload_u64_field(data, "started_ms", started_ms);
+        const bool has_action = payload_string_field(data, "action", action);
+        const bool has_status =
+            payload_string_field(data, "status", status) ||
+            payload_string_field(data, "bridge_status", bridge_status) ||
+            payload_string_field(data, "guest_status", guest_status) ||
+            payload_string_field(data, "guest_status_error", guest_status_error) ||
+            payload_bool_field(data, "guest_status_available", guest_status_available);
+        const bool has_kind = payload_string_field(data, "bridge_kind", bridge_kind);
+        const bool has_backend = payload_string_field(data, "backend", backend);
+        const bool has_session_dir = payload_string_field(data, "session_dir", session_dir);
+        const bool has_bridge_dir =
+            payload_string_field(data, "bridge_dir", bridge_dir) ||
+            payload_string_field(data, "vm_bridge_dir", bridge_dir);
+        const bool text_status = lower_copy(text).find("status") != std::string::npos;
+        if (!has_active || !has_started_ms || (!has_action && !has_status && !text_status) ||
+            (!has_kind && !has_backend) || !has_session_dir || !has_bridge_dir) {
+            proof = "missing_fields active=" + std::to_string(has_active ? 1 : 0) +
+                " started_ms=" + std::to_string(has_started_ms ? 1 : 0) +
+                " action=" + std::to_string(has_action ? 1 : 0) +
+                " status=" + std::to_string(has_status ? 1 : 0) +
+                " text_status=" + std::to_string(text_status ? 1 : 0) +
+                " kind=" + std::to_string(has_kind ? 1 : 0) +
+                " backend=" + std::to_string(has_backend ? 1 : 0) +
+                " session_dir=" + std::to_string(has_session_dir ? 1 : 0) +
+                " bridge_dir=" + std::to_string(has_bridge_dir ? 1 : 0);
+            return false;
+        }
+        if (active && bridge_kind.empty() && backend.empty()) {
+            proof = "active_bridge_backend_empty";
+            return false;
+        }
+        proof = "active=" + std::to_string(active ? 1 : 0) +
+            " started_ms=" + std::to_string(static_cast<unsigned long long>(started_ms)) +
+            " action=" + (action.empty() ? "<empty>" : action) +
+            " status=" + (status.empty() ? (bridge_status.empty() ? (guest_status.empty() ? (guest_status_error.empty() ? (guest_status_available ? "guest_available" : "<empty>") : guest_status_error) : guest_status) : bridge_status) : status) +
+            " bridge_kind=" + (bridge_kind.empty() ? "<empty>" : bridge_kind) +
+            " backend=" + (backend.empty() ? "<empty>" : backend) +
+            " session_dir_len=" + std::to_string(session_dir.size()) +
+            " bridge_dir_len=" + std::to_string(bridge_dir.size());
+        return true;
+    }
+
+    void test_tool_vm_bridge_manage_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        const char* tag = "mcp.vm_bridge_manage.status";
+        mcp_standalone::json args;
+        mcp_standalone::tool_result_t result;
+        auto status = test_tool_action_call(hf, tag, "vm_bridge_manage", "status", args, passed, failed, skipped, false, &result);
+        if (status != mcp_tool_call_status_t::passed)
+            return;
+        std::string proof;
+        if (!vm_bridge_status_payload_valid(result.data, result.text, proof)) {
+            log_msg(hf, tag, "FAIL -- vm_bridge_manage.status lacked structured functional status evidence proof=%s text=%s data=%s",
+                compact_text(proof, 900).c_str(),
+                compact_text(result.text, 900).c_str(),
+                compact_json(result.data, 1200).c_str());
+            convert_last_pass_to_fixture_failure("vm_bridge_manage", passed, failed);
+            return;
+        }
+        log_msg(hf, tag, "PASS -- vm_bridge_manage.status structured proof=%s",
+            compact_text(proof, 900).c_str());
     }
 
 
@@ -20607,6 +21545,76 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
             (status != mcp_tool_call_status_t::passed && browser_infrastructure_text(result.text)))
             g_burp_dom_xss_browser_infra_failed = true;
     }
+
+    bool dom_xss_scan_schema_filter_supported(mcp_standalone::json& args, std::string& reason) {
+        const auto* tool = find_registered_tool(get_server(), "burp_dom_xss_manage");
+        if (!tool) {
+            reason = "burp_dom_xss_manage tool schema missing";
+            return false;
+        }
+        bool required = false;
+        bool configured = false;
+        if (tool_has_param(*tool, "insertion_point_kind", &required)) {
+            args["insertion_point_kind"] = "query";
+            configured = true;
+        } else if (tool_has_param(*tool, "point_kind", &required)) {
+            args["point_kind"] = "query";
+            configured = true;
+        }
+        if (tool_has_param(*tool, "insertion_point_name", &required)) {
+            args["insertion_point_name"] = "q";
+            configured = true;
+        } else if (tool_has_param(*tool, "point_name", &required)) {
+            args["point_name"] = "q";
+            configured = true;
+        } else if (tool_has_param(*tool, "param_name", &required)) {
+            args["param_name"] = "q";
+            configured = true;
+        } else if (tool_has_param(*tool, "insertion_point", &required)) {
+            args["insertion_point"] = "query:q";
+            configured = true;
+        }
+        if (!configured) {
+            std::ostringstream oss;
+            oss << "burp_dom_xss_manage scan schema lacks insertion-point filter support required for deterministic one-point fixture params=";
+            for (size_t i = 0; i < tool->params.size(); ++i) {
+                if (i)
+                    oss << ",";
+                oss << tool->params[i].name;
+            }
+            reason = oss.str();
+            return false;
+        }
+        reason = "insertion point filter configured args=" + compact_json(args, 700);
+        return true;
+    }
+
+    bool dom_xss_scan_one_point_proof(const mcp_standalone::json& data, std::string& proof) {
+        uint64_t points_scanned = 0;
+        const bool has_points_scanned = payload_u64_field(data, "points_scanned", points_scanned);
+        bool timed_out = false;
+        const bool has_timed_out = payload_bool_field(data, "timed_out", timed_out) || payload_bool_field(data, "timeout", timed_out);
+        const auto* per_point = find_payload_key_recursive(data, "per_point");
+        std::string point_kind;
+        std::string point_name;
+        if (per_point && per_point->is_array() && !per_point->empty() && (*per_point)[0].is_object()) {
+            json_string_any_field((*per_point)[0], point_kind, { "kind", "point_kind", "type" });
+            json_string_any_field((*per_point)[0], point_name, { "name", "point_name", "param", "parameter" });
+        }
+        if (!has_points_scanned || points_scanned != 1 || (has_timed_out && timed_out) || point_kind.empty() || point_name.empty()) {
+            proof = "dom_xss_scan_one_point_proof_missing has_points_scanned=" + std::to_string(has_points_scanned ? 1 : 0) +
+                " points_scanned=" + std::to_string(static_cast<unsigned long long>(points_scanned)) +
+                " has_timed_out=" + std::to_string(has_timed_out ? 1 : 0) +
+                " timed_out=" + std::to_string(timed_out ? 1 : 0) +
+                " point_kind=" + (point_kind.empty() ? "<empty>" : point_kind) +
+                " point_name=" + (point_name.empty() ? "<empty>" : point_name) +
+                " data=" + compact_json(data, 1400);
+            return false;
+        }
+        proof = "points_scanned=1 point_kind=" + point_kind + " point_name=" + point_name + " timed_out=0";
+        return true;
+    }
+
     void test_tool_burp_dom_xss_manage_scan(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         (void)skipped;
         if (g_burp_dom_xss_browser_infra_failed) {
@@ -20626,7 +21634,27 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
         args["max_payloads_per_point"] = 1;
         args["per_payload_timeout_ms"] = 6000;
         args["scan_timeout_ms"] = 35000;
-        test_tool_action_call(hf, "mcp.burp_dom_xss_manage.scan", "burp_dom_xss_manage", "scan", args, passed, failed, skipped);
+        std::string filter_reason;
+        if (!dom_xss_scan_schema_filter_supported(args, filter_reason)) {
+            log_msg(hf, "mcp.burp_dom_xss_manage.scan", "FAIL -- %s", compact_text(filter_reason, 1200).c_str());
+            record_fixture_failed_tool("burp_dom_xss_manage", failed);
+            return;
+        }
+        log_msg(hf, "mcp.burp_dom_xss_manage.scan", "FIXTURE -- constrained deterministic insertion point proof=%s",
+            compact_text(filter_reason, 900).c_str());
+        mcp_standalone::tool_result_t result;
+        auto status = test_tool_action_call(hf, "mcp.burp_dom_xss_manage.scan", "burp_dom_xss_manage", "scan", args, passed, failed, skipped, false, &result);
+        if (status == mcp_tool_call_status_t::passed) {
+            std::string proof;
+            if (!dom_xss_scan_one_point_proof(result.data, proof)) {
+                log_msg(hf, "mcp.burp_dom_xss_manage.scan", "FAIL -- deterministic scan did not prove exactly one insertion point: %s",
+                    compact_text(proof, 1500).c_str());
+                convert_last_pass_to_fixture_failure("burp_dom_xss_manage", passed, failed);
+            } else {
+                log_msg(hf, "mcp.burp_dom_xss_manage.scan", "DOM-XSS-POINT-PROOF -- %s",
+                    compact_text(proof, 900).c_str());
+            }
+        }
     }
     void test_tool_burp_crawler_manage_start(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args; args["start_urls"] = mcp_standalone::json::array({burp_fixture_url(hf, "mcp.burp_crawler_manage.start")}); args["max_depth"] = 1; args["max_pages"] = 2; args["concurrency"] = 1; args["respect_robots"] = false;
@@ -21158,7 +22186,9 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
         test_tool_action_call(hf, "mcp.burp_logger_manage.clear", "burp_logger_manage", "clear", {}, passed, failed, skipped);
     }
     void test_tool_burp_logger_manage_export_csv(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args; args["path"] = "C:\\temp\\aida_logger_test.csv";
+        const std::string output_path = temp_file_narrow("aida_logger_test.csv");
+        log_msg(hf, "mcp.burp_logger_manage.export_csv", "EXPORT-PATH -- path=%s", output_path.c_str());
+        mcp_standalone::json args; args["path"] = output_path;
         test_tool_action_call(hf, "mcp.burp_logger_manage.export_csv", "burp_logger_manage", "export_csv", args, passed, failed, skipped);
     }
     void test_tool_burp_report_generate(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -21274,9 +22304,15 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
         }
     }
 
-    bool unique_camoufox_request_id_for_marker(const mcp_standalone::json& value, const std::string& marker, uint64_t& out, std::string& reason) {
+    bool unique_camoufox_request_id_for_marker(const mcp_standalone::json& value,
+                                               const std::string& marker,
+                                               uint64_t& out,
+                                               std::string& reason,
+                                               uint64_t* match_count_out = nullptr) {
         camoufox_request_match_t match;
         collect_camoufox_request_matches(value, marker, match);
+        if (match_count_out)
+            *match_count_out = static_cast<uint64_t>(match.matches);
         if (match.matches != 1 || match.id == 0) {
             reason = "request_marker=" + marker + " matches=" + std::to_string(match.matches) + " id=" + std::to_string(match.id);
             return false;
@@ -21286,18 +22322,66 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
         return true;
     }
 
-    bool camoufox_initiator_payload_correlates(const mcp_standalone::json& value, const std::string& marker, std::string& reason) {
+    bool camoufox_initiator_payload_correlates(const mcp_standalone::json& value,
+                                               const std::string& marker,
+                                               uint64_t expected_request_id,
+                                               uint64_t marker_request_count,
+                                               std::string& reason) {
         std::string url;
         std::string source;
         std::string initiator_type;
         std::string stack;
+        std::string active_page_id;
+        std::string captured_page_id;
+        std::string hook_page_id;
+        uint64_t matched_request_id = 0;
+        uint64_t fetch_log_count = 0;
+        bool has_fetch_log_count = false;
         payload_string_field(value, "url", url);
+        if (url.empty())
+            payload_string_field(value, "request_url", url);
         payload_string_field(value, "source", source);
         payload_string_field(value, "initiator_type", initiator_type);
         payload_string_field(value, "initiator_stack", stack);
+        payload_string_field(value, "active_page_id", active_page_id);
+        payload_string_field(value, "captured_page_id", captured_page_id);
+        payload_string_field(value, "hook_page_id", hook_page_id);
+        const bool has_matched_request_id =
+            payload_u64_field(value, "matched_request_id", matched_request_id) ||
+            payload_u64_field(value, "request_id", matched_request_id) ||
+            payload_u64_field(value, "id", matched_request_id);
+        has_fetch_log_count =
+            payload_u64_field(value, "fetch_log_count", fetch_log_count) ||
+            payload_u64_field(value, "fetchLogCount", fetch_log_count) ||
+            payload_u64_field(value, "captured_request_count", fetch_log_count) ||
+            payload_u64_field(value, "request_count", fetch_log_count);
         const std::string source_lc = lower_copy(source.empty() ? initiator_type : source);
         if (marker.empty() || url.find(marker) == std::string::npos) {
             reason = "initiator_url_not_correlated marker=" + marker + " url_len=" + std::to_string(url.size());
+            return false;
+        }
+        if (expected_request_id == 0 || !has_matched_request_id || matched_request_id != expected_request_id) {
+            reason = "initiator_request_id_not_correlated expected=" + std::to_string(static_cast<unsigned long long>(expected_request_id)) +
+                " has_matched=" + std::to_string(has_matched_request_id ? 1 : 0) +
+                " matched=" + std::to_string(static_cast<unsigned long long>(matched_request_id));
+            return false;
+        }
+        if (marker_request_count == 0 && (!has_fetch_log_count || fetch_log_count == 0)) {
+            reason = "initiator_fetch_log_count_missing marker_request_count=" + std::to_string(static_cast<unsigned long long>(marker_request_count)) +
+                " has_fetch_log_count=" + std::to_string(has_fetch_log_count ? 1 : 0) +
+                " fetch_log_count=" + std::to_string(static_cast<unsigned long long>(fetch_log_count));
+            return false;
+        }
+        if (active_page_id.empty() && captured_page_id.empty() && hook_page_id.empty()) {
+            reason = "initiator_page_id_proof_missing";
+            return false;
+        }
+        if (!active_page_id.empty() && !captured_page_id.empty() && active_page_id != captured_page_id) {
+            reason = "initiator_page_id_mismatch active=" + active_page_id + " captured=" + captured_page_id;
+            return false;
+        }
+        if (!hook_page_id.empty() && !captured_page_id.empty() && hook_page_id != captured_page_id) {
+            reason = "initiator_hook_page_id_mismatch hook=" + hook_page_id + " captured=" + captured_page_id;
             return false;
         }
         if (source_lc.empty() || source_lc == "unknown" || source_lc == "null") {
@@ -21308,7 +22392,15 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
             reason = "initiator_stack_missing source=" + source_lc;
             return false;
         }
-        reason = "initiator_correlated marker=" + marker + " source=" + source_lc + " stack_len=" + std::to_string(stack.size());
+        reason = "initiator_correlated marker=" + marker +
+            " source=" + source_lc +
+            " stack_len=" + std::to_string(stack.size()) +
+            " request_id=" + std::to_string(static_cast<unsigned long long>(matched_request_id)) +
+            " marker_request_count=" + std::to_string(static_cast<unsigned long long>(marker_request_count)) +
+            " fetch_log_count=" + std::to_string(static_cast<unsigned long long>(fetch_log_count)) +
+            " active_page_id=" + (active_page_id.empty() ? "<empty>" : active_page_id) +
+            " captured_page_id=" + (captured_page_id.empty() ? "<empty>" : captured_page_id) +
+            " hook_page_id=" + (hook_page_id.empty() ? "<empty>" : hook_page_id);
         return true;
     }
 
@@ -21491,13 +22583,16 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
         uint64_t page_count = 0;
         uint64_t browser_instances = 0;
         std::string ua_policy;
+        const bool has_ua_policy = payload_string_field(launch_data, "effective_ua_policy", ua_policy);
+        const std::string ua_policy_lc = lower_copy(ua_policy);
+        const bool ua_policy_accepted = ua_policy_lc == "camoufox_native" || ua_policy_lc == "camoufox_macos";
         if (!payload_bool_field(launch_data, "ready", ready) || !ready ||
             !payload_bool_field(launch_data, "browser_open", browser_open) || !browser_open ||
             !payload_bool_field(launch_data, "child_alive", child_alive) || !child_alive ||
             !payload_bool_field(launch_data, "page_verified", page_verified) || !page_verified ||
             !payload_bool_field(launch_data, "privacy_verified", privacy_verified) || !privacy_verified ||
             !payload_bool_field(launch_data, "webrtc_blocked", webrtc_blocked) || !webrtc_blocked ||
-            !payload_string_field(launch_data, "effective_ua_policy", ua_policy) || lower_copy(ua_policy) != "camoufox_macos" ||
+            !has_ua_policy || !ua_policy_accepted ||
             !payload_u64_field(launch_data, "browser_instance_count", browser_instances) || browser_instances != 1 ||
             !payload_u64_field(launch_data, "page_count", page_count) || page_count != 1 ||
             !payload_bool_field(launch_data, "ice_probe_ok", ice_ok) || !ice_ok ||
@@ -21594,7 +22689,7 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
         mcp_standalone::json launch_args;
         launch_args["headless"] = false;
         launch_args["block_webrtc"] = true;
-        launch_args["ua_policy"] = "camoufox_macos";
+        launch_args["ua_policy"] = "camoufox_native";
         launch_args["launch_timeout_ms"] = k_camoufox_testlab_launch_timeout_ms;
         launch_args["aida_testlab_fast_probe"] = false;
         launch_args["enable_trace"] = false;
@@ -21669,26 +22764,30 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
             privacy_eval_args, passed, failed, skipped, false, &privacy_eval_result);
         if (privacy_eval_status == mcp_tool_call_status_t::passed) {
             const mcp_standalone::json* value = camoufox_eval_value(privacy_eval_result.data);
-            std::string ua;
-            bool has_firefox = false;
-            bool blocked = false;
-            bool ice_leak = true;
-            uint64_t ice_count = 0;
-            payload_string_field(*value, "userAgent", ua);
-            payload_bool_field(*value, "userAgentHasFirefox", has_firefox);
-            payload_bool_field(*value, "webrtcBlocked", blocked);
-            payload_bool_field(*value, "iceLeak", ice_leak);
-            payload_u64_field(*value, "iceCandidateCount", ice_count);
-            if (ua.empty() || !has_firefox) {
-                fail_camoufox_assertion(hf, tag, "browser_interaction", "navigator.userAgent did not expose Camoufox-native privacy profile", privacy_eval_result.data, failed);
-            } else if (!blocked) {
-                fail_camoufox_assertion(hf, tag, "browser_interaction", "WebRTC constructors remain exposed despite Camoufox privacy launch requesting blocking", privacy_eval_result.data, failed);
-            } else if (ice_leak || ice_count != 0) {
-                fail_camoufox_assertion(hf, tag, "browser_interaction", "WebRTC ICE anti-leak probe observed candidates or leak evidence", privacy_eval_result.data, failed);
+            if (!value || !value->is_object()) {
+                fail_camoufox_assertion(hf, tag, "browser_interaction", "privacy evaluation returned no structured value", privacy_eval_result.data, failed);
             } else {
-                log_msg(hf, tag, "PASS -- Camoufox UA/privacy assertion user_agent_len=%zu ice_count=%llu",
-                    ua.size(),
-                    static_cast<unsigned long long>(ice_count));
+                std::string ua;
+                bool has_firefox = false;
+                bool blocked = false;
+                bool ice_leak = true;
+                uint64_t ice_count = 0;
+                payload_string_field(*value, "userAgent", ua);
+                payload_bool_field(*value, "userAgentHasFirefox", has_firefox);
+                payload_bool_field(*value, "webrtcBlocked", blocked);
+                payload_bool_field(*value, "iceLeak", ice_leak);
+                payload_u64_field(*value, "iceCandidateCount", ice_count);
+                if (ua.empty() || !has_firefox) {
+                    fail_camoufox_assertion(hf, tag, "browser_interaction", "navigator.userAgent did not expose Camoufox-native privacy profile", privacy_eval_result.data, failed);
+                } else if (!blocked) {
+                    fail_camoufox_assertion(hf, tag, "browser_interaction", "WebRTC constructors remain exposed despite Camoufox privacy launch requesting blocking", privacy_eval_result.data, failed);
+                } else if (ice_leak || ice_count != 0) {
+                    fail_camoufox_assertion(hf, tag, "browser_interaction", "WebRTC ICE anti-leak probe observed candidates or leak evidence", privacy_eval_result.data, failed);
+                } else {
+                    log_msg(hf, tag, "PASS -- Camoufox UA/privacy assertion user_agent_len=%zu ice_count=%llu",
+                        ua.size(),
+                        static_cast<unsigned long long>(ice_count));
+                }
             }
         }
 
@@ -21872,9 +22971,15 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
         preset_args["persistent"] = false;
         test_tool_action_call(hf, "mcp.camoufox.browser_hooks.preset", "browser_hooks", "preset", preset_args, passed, failed, skipped);
 
+        mcp_standalone::tool_result_t preset_before_marker_result;
+        auto preset_before_marker_status = test_tool_action_call(hf, "mcp.camoufox.browser_hooks.preset.before_marker", "browser_hooks", "preset",
+            preset_args, passed, failed, skipped, false, &preset_before_marker_result);
+
         mcp_standalone::json capture_clear_before_marker;
         capture_clear_before_marker["payload"] = mcp_standalone::json::object({{"action", "clear"}});
-        test_tool_action_call(hf, "mcp.camoufox.browser_network.capture_clear.before_marker", "browser_network", "capture", capture_clear_before_marker, passed, failed, skipped);
+        mcp_standalone::tool_result_t capture_clear_result;
+        auto capture_clear_status = test_tool_action_call(hf, "mcp.camoufox.browser_network.capture_clear.before_marker", "browser_network", "capture",
+            capture_clear_before_marker, passed, failed, skipped, false, &capture_clear_result);
 
         mcp_standalone::json capture_restart_before_marker;
         capture_restart_before_marker["payload"] = mcp_standalone::json::object({
@@ -21882,12 +22987,34 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
             {"url_pattern", "*"},
             {"capture_body", true}
         });
-        test_tool_action_call(hf, "mcp.camoufox.browser_network.capture_restart.before_marker", "browser_network", "capture", capture_restart_before_marker, passed, failed, skipped);
+        mcp_standalone::tool_result_t capture_restart_result;
+        auto capture_restart_status = test_tool_action_call(hf, "mcp.camoufox.browser_network.capture_restart.before_marker", "browser_network", "capture",
+            capture_restart_before_marker, passed, failed, skipped, false, &capture_restart_result);
+        log_msg(hf, tag, "FETCH-SETUP -- hook_preset_status=%s capture_clear_status=%s capture_restart_status=%s hook_data=%s clear_data=%s restart_data=%s",
+            mcp_status_classification_name(preset_before_marker_status),
+            mcp_status_classification_name(capture_clear_status),
+            mcp_status_classification_name(capture_restart_status),
+            compact_json(preset_before_marker_result.data, 700).c_str(),
+            compact_json(capture_clear_result.data, 700).c_str(),
+            compact_json(capture_restart_result.data, 700).c_str());
 
         mcp_standalone::json eval_args;
         eval_args["expression"] = "(async()=>{console.log('AIDA_CAMOUFOX_CONSOLE');localStorage.setItem('aida_storage','ok');document.cookie='" + cookie_name + "=ok; path=/';let fetch_status=0;let fetch_url='';try{const r=await fetch('/aida-fixture.js?capture=" + network_marker + "',{cache:'no-store'});fetch_status=r.status;fetch_url=r.url;await r.text();}catch(e){fetch_status=-1;}const hook_value=window.aidaHookTarget?window.aidaHookTarget('x'):'missing';return {hook_value,fetch_status,fetch_url,network_marker:'" + network_marker + "',cookie_name:'" + cookie_name + "',cookie_present:document.cookie.indexOf('" + cookie_name + "=')>=0,storage:localStorage.getItem('aida_storage')};})()";
         eval_args["await_promise"] = true;
-        test_tool_action_call(hf, "mcp.camoufox.browser_interaction.evaluate", "browser_interaction", "evaluate", eval_args, passed, failed, skipped);
+        mcp_standalone::tool_result_t eval_result;
+        auto eval_status = test_tool_action_call(hf, "mcp.camoufox.browser_interaction.evaluate", "browser_interaction", "evaluate",
+            eval_args, passed, failed, skipped, false, &eval_result);
+        uint64_t fetch_status_code = 0;
+        std::string fetch_url;
+        const bool has_fetch_status = payload_u64_field(eval_result.data, "fetch_status", fetch_status_code);
+        payload_string_field(eval_result.data, "fetch_url", fetch_url);
+        log_msg(hf, tag, "FETCH-STIMULUS -- eval_status=%s has_fetch_status=%d fetch_status=%llu fetch_url_marker=%d marker=%s data=%s",
+            mcp_status_classification_name(eval_status),
+            has_fetch_status ? 1 : 0,
+            static_cast<unsigned long long>(fetch_status_code),
+            (!fetch_url.empty() && fetch_url.find(network_marker) != std::string::npos) ? 1 : 0,
+            network_marker.c_str(),
+            compact_json(eval_result.data, 900).c_str());
 
         mcp_standalone::json click_args;
         click_args["selector"] = "body";
@@ -21929,32 +23056,73 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
         auto list_req_status = test_tool_action_call(hf, "mcp.camoufox.browser_network.list", "browser_network", "list",
             list_req_args, passed, failed, skipped, false, &list_req_result);
         uint64_t request_id = 0;
+        uint64_t request_marker_matches = 0;
         std::string request_match_reason;
         bool have_request_id = list_req_status == mcp_tool_call_status_t::passed &&
-            unique_camoufox_request_id_for_marker(list_req_result.data, network_marker, request_id, request_match_reason);
-        log_msg(hf, tag, "NETWORK-EVIDENCE -- marker=%s have_request_id=%d request_id=%llu proof=%s data=%s",
+            unique_camoufox_request_id_for_marker(list_req_result.data, network_marker, request_id, request_match_reason, &request_marker_matches);
+        log_msg(hf, tag, "NETWORK-EVIDENCE -- marker=%s have_request_id=%d request_id=%llu marker_matches=%llu proof=%s data=%s",
             network_marker.c_str(),
             have_request_id ? 1 : 0,
             static_cast<unsigned long long>(request_id),
+            static_cast<unsigned long long>(request_marker_matches),
             request_match_reason.empty() ? "<empty>" : compact_text(request_match_reason, 700).c_str(),
             compact_json(list_req_result.data, 900).c_str());
         if (!have_request_id) {
             log_msg(hf, tag, "WARN -- browser_network list did not expose an id; forcing fixture fetch and retrying capture list");
+            mcp_standalone::tool_result_t retry_preset_result;
+            auto retry_preset_status = test_tool_action_call(hf, "mcp.camoufox.browser_hooks.preset.retry_marker", "browser_hooks", "preset",
+                preset_args, passed, failed, skipped, false, &retry_preset_result);
+            mcp_standalone::json retry_capture_clear;
+            retry_capture_clear["payload"] = mcp_standalone::json::object({{"action", "clear"}});
+            mcp_standalone::tool_result_t retry_clear_result;
+            auto retry_clear_status = test_tool_action_call(hf, "mcp.camoufox.browser_network.capture_clear.retry_marker", "browser_network", "capture",
+                retry_capture_clear, passed, failed, skipped, false, &retry_clear_result);
+            mcp_standalone::json retry_capture_restart;
+            retry_capture_restart["payload"] = mcp_standalone::json::object({
+                {"action", "start"},
+                {"url_pattern", "*"},
+                {"capture_body", true}
+            });
+            mcp_standalone::tool_result_t retry_restart_result;
+            auto retry_restart_status = test_tool_action_call(hf, "mcp.camoufox.browser_network.capture_restart.retry_marker", "browser_network", "capture",
+                retry_capture_restart, passed, failed, skipped, false, &retry_restart_result);
+            log_msg(hf, tag, "FETCH-SETUP-RETRY -- hook_preset_status=%s capture_clear_status=%s capture_restart_status=%s hook_data=%s clear_data=%s restart_data=%s",
+                mcp_status_classification_name(retry_preset_status),
+                mcp_status_classification_name(retry_clear_status),
+                mcp_status_classification_name(retry_restart_status),
+                compact_json(retry_preset_result.data, 700).c_str(),
+                compact_json(retry_clear_result.data, 700).c_str(),
+                compact_json(retry_restart_result.data, 700).c_str());
             mcp_standalone::json recapture_eval_args;
             recapture_eval_args["expression"] = "(async()=>{const r=await fetch('/aida-fixture.js?capture=" + network_retry_marker + "',{cache:'no-store'});await r.text();return {status:r.status,url:r.url,network_marker:'" + network_retry_marker + "'};})()";
             recapture_eval_args["await_promise"] = true;
-            test_tool_action_call(hf, "mcp.camoufox.browser_interaction.evaluate.network_capture_retry", "browser_interaction", "evaluate", recapture_eval_args, passed, failed, skipped);
+            mcp_standalone::tool_result_t retry_eval_result;
+            auto retry_eval_status = test_tool_action_call(hf, "mcp.camoufox.browser_interaction.evaluate.network_capture_retry", "browser_interaction", "evaluate",
+                recapture_eval_args, passed, failed, skipped, false, &retry_eval_result);
+            uint64_t retry_fetch_status = 0;
+            std::string retry_fetch_url;
+            const bool has_retry_fetch_status = payload_u64_field(retry_eval_result.data, "status", retry_fetch_status);
+            payload_string_field(retry_eval_result.data, "url", retry_fetch_url);
+            log_msg(hf, tag, "FETCH-STIMULUS-RETRY -- eval_status=%s has_fetch_status=%d fetch_status=%llu fetch_url_marker=%d marker=%s data=%s",
+                mcp_status_classification_name(retry_eval_status),
+                has_retry_fetch_status ? 1 : 0,
+                static_cast<unsigned long long>(retry_fetch_status),
+                (!retry_fetch_url.empty() && retry_fetch_url.find(network_retry_marker) != std::string::npos) ? 1 : 0,
+                network_retry_marker.c_str(),
+                compact_json(retry_eval_result.data, 900).c_str());
             list_req_result = {};
             list_req_args["url_filter"] = network_retry_marker;
             list_req_status = test_tool_action_call(hf, "mcp.camoufox.browser_network.list.retry", "browser_network", "list",
                 list_req_args, passed, failed, skipped, false, &list_req_result);
             request_match_reason.clear();
+            request_marker_matches = 0;
             have_request_id = list_req_status == mcp_tool_call_status_t::passed &&
-                unique_camoufox_request_id_for_marker(list_req_result.data, network_retry_marker, request_id, request_match_reason);
-            log_msg(hf, tag, "NETWORK-EVIDENCE -- retry_marker=%s have_request_id=%d request_id=%llu proof=%s data=%s",
+                unique_camoufox_request_id_for_marker(list_req_result.data, network_retry_marker, request_id, request_match_reason, &request_marker_matches);
+            log_msg(hf, tag, "NETWORK-EVIDENCE -- retry_marker=%s have_request_id=%d request_id=%llu marker_matches=%llu proof=%s data=%s",
                 network_retry_marker.c_str(),
                 have_request_id ? 1 : 0,
                 static_cast<unsigned long long>(request_id),
+                static_cast<unsigned long long>(request_marker_matches),
                 request_match_reason.empty() ? "<empty>" : compact_text(request_match_reason, 700).c_str(),
                 compact_json(list_req_result.data, 900).c_str());
         }
@@ -21964,6 +23132,7 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
                 compact_json(list_req_result.data, 900).c_str());
             record_fixture_failed_tool("browser_network", failed);
         } else {
+            const std::string active_marker = list_req_args.value("url_filter", network_marker);
             mcp_standalone::json req_detail_args;
             req_detail_args["request_id"] = request_id;
             req_detail_args["include_body"] = true;
@@ -21973,12 +23142,14 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
 
             mcp_standalone::json req_init_args;
             req_init_args["request_id"] = request_id;
+            req_init_args["page_id"] = page_a;
+            req_init_args["marker"] = active_marker;
+            req_init_args["url_filter"] = active_marker;
             mcp_standalone::tool_result_t req_init_result;
             auto req_init_status = test_tool_action_call(hf, "mcp.camoufox.browser_network.initiator", "browser_network", "initiator", req_init_args, passed, failed, skipped, false, &req_init_result);
             if (req_init_status == mcp_tool_call_status_t::passed) {
-                const std::string active_marker = list_req_args.value("url_filter", network_marker);
                 std::string initiator_reason;
-                if (!camoufox_initiator_payload_correlates(req_init_result.data, active_marker, initiator_reason)) {
+                if (!camoufox_initiator_payload_correlates(req_init_result.data, active_marker, request_id, request_marker_matches, initiator_reason)) {
                     log_msg(hf, tag, "FAIL -- browser_network initiator did not prove correlated unique source request_id=%llu reason=%s data=%s",
                         static_cast<unsigned long long>(request_id),
                         compact_text(initiator_reason, 900).c_str(),
@@ -21989,6 +23160,12 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
                         static_cast<unsigned long long>(request_id),
                         compact_text(initiator_reason, 700).c_str());
                 }
+            } else {
+                log_msg(hf, tag, "FAIL -- browser_network initiator status was not pass request_id=%llu status=%s data=%s text=%s",
+                    static_cast<unsigned long long>(request_id),
+                    mcp_status_classification_name(req_init_status),
+                    compact_json(req_init_result.data, 1200).c_str(),
+                    compact_text(req_init_result.text, 900).c_str());
             }
         }
 
@@ -22049,25 +23226,107 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
         test_tool_action_call(hf, "mcp.camoufox.browser_state.import", "browser_state", "import", import_args, passed, failed, skipped);
 
         const std::string minimal_page = "aida_testlab_minimal_" + page_suffix;
+        const std::string jsvmp_marker = "AIDA_CAMOUFOX_JSVMP_" + page_suffix;
         mcp_standalone::json minimal_page_args;
         minimal_page_args["page_id"] = minimal_page;
         minimal_page_args["make_active"] = true;
         test_tool_action_call(hf, "mcp.camoufox.browser_lifecycle.new.minimal", "browser_lifecycle", "new", minimal_page_args, passed, failed, skipped);
         mcp_standalone::json minimal_nav_args;
         minimal_nav_args["page_id"] = minimal_page;
-        minimal_nav_args["url"] = "about:blank";
+        const std::string jsvmp_fixture_path = "/?q=" + jsvmp_marker;
+        minimal_nav_args["url"] = burp_fixture_url(hf, tag, jsvmp_fixture_path.c_str());
         minimal_nav_args["wait_until"] = "load";
         minimal_nav_args["clear_network_capture"] = false;
-        minimal_nav_args["include_title"] = false;
+        minimal_nav_args["include_title"] = true;
         test_tool_action_call(hf, "mcp.camoufox.browser_navigation.navigate.minimal", "browser_navigation", "navigate", minimal_nav_args, passed, failed, skipped);
 
         mcp_standalone::json jsvmp_args;
-        jsvmp_args["persistent"] = false;
+        jsvmp_args["page_id"] = minimal_page;
+        jsvmp_args["persistent"] = true;
         jsvmp_args["mode"] = "proxy";
         jsvmp_args["track_calls"] = true;
         jsvmp_args["track_props"] = true;
         jsvmp_args["max_entries"] = 32;
-        test_tool_action_call(hf, "mcp.camoufox.browser_instrumentation.jsvmp", "browser_instrumentation", "jsvmp", jsvmp_args, passed, failed, skipped);
+        mcp_standalone::tool_result_t jsvmp_result;
+        auto jsvmp_status = test_tool_action_call(hf, "mcp.camoufox.browser_instrumentation.jsvmp", "browser_instrumentation", "jsvmp", jsvmp_args, passed, failed, skipped, false, &jsvmp_result);
+        if (jsvmp_status == mcp_tool_call_status_t::passed) {
+            bool active_page_instrumented = false;
+            bool installed = false;
+            bool log_ready = false;
+            uint64_t log_count = 0;
+            const bool has_active_page_instrumented = payload_bool_field(jsvmp_result.data, "active_page_instrumented", active_page_instrumented);
+            const bool has_installed = payload_bool_field(jsvmp_result.data, "installed", installed);
+            const bool has_log_ready = payload_bool_field(jsvmp_result.data, "log_ready", log_ready);
+            const bool has_log_count = payload_u64_field(jsvmp_result.data, "log_count", log_count);
+            if (!has_active_page_instrumented || !active_page_instrumented ||
+                !has_installed || !installed ||
+                !has_log_ready || !log_ready) {
+                log_msg(hf, tag, "FAIL -- browser_instrumentation jsvmp setup did not provide installed active-page proof active_present=%d active=%d installed_present=%d installed=%d log_ready_present=%d log_ready=%d log_count_present=%d log_count=%llu data=%s",
+                    has_active_page_instrumented ? 1 : 0,
+                    active_page_instrumented ? 1 : 0,
+                    has_installed ? 1 : 0,
+                    installed ? 1 : 0,
+                    has_log_ready ? 1 : 0,
+                    log_ready ? 1 : 0,
+                    has_log_count ? 1 : 0,
+                    static_cast<unsigned long long>(log_count),
+                    compact_json(jsvmp_result.data, 1200).c_str());
+                convert_last_pass_to_fixture_failure("browser_instrumentation", passed, failed);
+            } else {
+                mcp_standalone::json jsvmp_probe_eval_args;
+                jsvmp_probe_eval_args["page_id"] = minimal_page;
+                jsvmp_probe_eval_args["expression"] = "(()=>{const marker='" + jsvmp_marker + "';for(let i=0;i<4;i++){try{void navigator.userAgent;void document.cookie;Reflect.get(navigator,'userAgent');if(typeof window.aidaHookTarget==='function')window.aidaHookTarget(marker);}catch(e){}}const log=Array.isArray(window.__mcp_jsvmp_log)?window.__mcp_jsvmp_log:[];return {marker,installed:Array.isArray(window.__mcp_jsvmp_log),proxy_installed:!!window.__mcp_jsvmp_proxy_installed,transparent_installed:!!window.__mcp_jsvmp_transparent_installed,log_ready:Array.isArray(window.__mcp_jsvmp_log),log_count:log.length,page_url:String(location.href||''),page_has_marker:String(location.href||'').indexOf(marker)>=0};})()";
+                jsvmp_probe_eval_args["await_promise"] = true;
+                mcp_standalone::tool_result_t jsvmp_probe_result;
+                auto jsvmp_probe_status = test_tool_action_call(hf, "mcp.camoufox.browser_interaction.evaluate.jsvmp_probe", "browser_interaction", "evaluate", jsvmp_probe_eval_args, passed, failed, skipped, false, &jsvmp_probe_result);
+                if (jsvmp_probe_status == mcp_tool_call_status_t::passed) {
+                    const mcp_standalone::json* value = camoufox_eval_value(jsvmp_probe_result.data);
+                    if (!value || !value->is_object()) {
+                        log_msg(hf, tag, "FAIL -- browser_instrumentation jsvmp page probe returned no structured eval value data=%s text=%s",
+                            compact_json(jsvmp_probe_result.data, 1200).c_str(),
+                            compact_text(jsvmp_probe_result.text, 900).c_str());
+                        convert_tool_pass_to_fail("browser_instrumentation");
+                        convert_last_pass_to_fixture_failure("browser_interaction", passed, failed);
+                    } else {
+                        bool probe_installed = false;
+                        bool probe_log_ready = false;
+                        bool page_has_marker = false;
+                        uint64_t probe_log_count = 0;
+                        const bool has_probe_installed = payload_bool_field(*value, "installed", probe_installed);
+                        const bool has_probe_log_ready = payload_bool_field(*value, "log_ready", probe_log_ready);
+                        const bool has_page_marker = payload_bool_field(*value, "page_has_marker", page_has_marker);
+                        const bool has_probe_log_count = payload_u64_field(*value, "log_count", probe_log_count);
+                        if (!has_probe_installed || !probe_installed ||
+                            !has_probe_log_ready || !probe_log_ready ||
+                            !has_page_marker || !page_has_marker ||
+                            !has_probe_log_count || probe_log_count == 0) {
+                            log_msg(hf, tag, "FAIL -- browser_instrumentation jsvmp page probe lacked instrumented output proof installed_present=%d installed=%d log_ready_present=%d log_ready=%d marker_present=%d marker=%d log_count_present=%d log_count=%llu data=%s",
+                                has_probe_installed ? 1 : 0,
+                                probe_installed ? 1 : 0,
+                                has_probe_log_ready ? 1 : 0,
+                                probe_log_ready ? 1 : 0,
+                                has_page_marker ? 1 : 0,
+                                page_has_marker ? 1 : 0,
+                                has_probe_log_count ? 1 : 0,
+                                static_cast<unsigned long long>(probe_log_count),
+                                compact_json(jsvmp_probe_result.data, 1200).c_str());
+                            convert_tool_pass_to_fail("browser_instrumentation");
+                            convert_last_pass_to_fixture_failure("browser_interaction", passed, failed);
+                        } else {
+                            log_msg(hf, tag, "PASS -- browser_instrumentation jsvmp fixture proof marker=%s log_count=%llu",
+                                jsvmp_marker.c_str(),
+                                static_cast<unsigned long long>(probe_log_count));
+                        }
+                    }
+                } else {
+                    log_msg(hf, tag, "FAIL -- browser_instrumentation jsvmp probe evaluation failed status=%s data=%s text=%s",
+                        mcp_status_classification_name(jsvmp_probe_status),
+                        compact_json(jsvmp_probe_result.data, 1200).c_str(),
+                        compact_text(jsvmp_probe_result.text, 900).c_str());
+                    convert_tool_pass_to_fail("browser_instrumentation");
+                }
+            }
+        }
 
         mcp_standalone::json compare_args;
         compare_args["properties"] = mcp_standalone::json::array({"navigator.userAgent", "navigator.webdriver", "screen.width"});
@@ -23498,7 +24757,50 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
 
 }
 void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& global_skipped, bool(*cancelled)()) {
-    log_msg(hf, "mcp_phase", "=== MCP TOOL TESTS START (AI/agent tools excluded from counters) ===");
+    const char* phase_tag = "mcp_phase";
+    const uint64_t phase_instance = g_mcp_phase_instance_counter.fetch_add(1, std::memory_order_acq_rel) + 1;
+    const int enter_count = g_mcp_phase_enter_count.fetch_add(1, std::memory_order_acq_rel) + 1;
+    const DWORD phase_pid = GetCurrentProcessId();
+    const DWORD phase_tid = GetCurrentThreadId();
+    const uint64_t phase_started_ms = GetTickCount64();
+    const bool active_before = g_mcp_phase_active.exchange(true, std::memory_order_acq_rel);
+    log_msg(hf, phase_tag, "REENTRY-GUARD-ENTER -- instance=%llu enter_count=%d pid=%lu tid=%lu active_before=%d tick_ms=%llu",
+        static_cast<unsigned long long>(phase_instance),
+        enter_count,
+        static_cast<unsigned long>(phase_pid),
+        static_cast<unsigned long>(phase_tid),
+        active_before ? 1 : 0,
+        static_cast<unsigned long long>(phase_started_ms));
+    if (active_before) {
+        const int remaining = g_mcp_phase_enter_count.fetch_sub(1, std::memory_order_acq_rel) - 1;
+        log_msg(hf, phase_tag, "FAIL -- concurrent MCP phase reentry blocked instance=%llu enter_count=%d remaining=%d pid=%lu tid=%lu elapsed_ms=%llu",
+            static_cast<unsigned long long>(phase_instance),
+            enter_count,
+            remaining,
+            static_cast<unsigned long>(phase_pid),
+            static_cast<unsigned long>(phase_tid),
+            static_cast<unsigned long long>(GetTickCount64() - phase_started_ms));
+        failed.fetch_add(1, std::memory_order_acq_rel);
+        return;
+    }
+    struct mcp_phase_reentry_scope_t {
+        HANDLE hf;
+        const char* tag;
+        uint64_t instance;
+        uint64_t started_ms;
+        DWORD pid;
+        ~mcp_phase_reentry_scope_t() {
+            const int remaining = g_mcp_phase_enter_count.fetch_sub(1, std::memory_order_acq_rel) - 1;
+            g_mcp_phase_active.store(false, std::memory_order_release);
+            log_msg(hf, tag, "REENTRY-GUARD-END -- instance=%llu remaining=%d pid=%lu tid=%lu elapsed_ms=%llu",
+                static_cast<unsigned long long>(instance),
+                remaining,
+                static_cast<unsigned long>(pid),
+                static_cast<unsigned long>(GetCurrentThreadId()),
+                static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        }
+    } phase_reentry_scope{hf, phase_tag, phase_instance, phase_started_ms, phase_pid};
+    log_msg(hf, phase_tag, "=== MCP TOOL TESTS START (AI/agent tools excluded from counters) ===");
     auto t0 = std::chrono::steady_clock::now();
     const int start_passed = passed.load(std::memory_order_acquire);
     const int start_failed = failed.load(std::memory_order_acquire);
@@ -23760,6 +25062,7 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_trace_execution_unicorn(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_analyze_vm_handler(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_emulate_multi_trace(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_vm_bridge_manage_status(hf, passed, failed, skipped);
 
     if (!cancelled()) cleanup_mcp_network_state(hf, "before MCP network tools");
     if (!cancelled()) test_tool_api_monitor_start(hf, passed, failed, skipped);

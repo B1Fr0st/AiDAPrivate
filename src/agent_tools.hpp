@@ -107,6 +107,16 @@ public:
     nlohmann::json generate_tools_schema() const;
     std::string generate_tools_description() const;
     tool_result_t execute_tool(const std::string& name, const nlohmann::json& params);
+    // Slice B1: batched serial execution. Iterates `calls` in order. When
+    // `stop_on_error` is true the iteration halts at the first failure.
+    // If `out` is non-null every per-call result is appended in order
+    // (including the failing one). Returns aggregate ok with summary text
+    // when all succeeded, otherwise returns the first failing result so the
+    // caller has a stable error_code to branch on.
+    tool_result_t execute_tool_batch(
+        const std::vector<std::pair<std::string, nlohmann::json>>& calls,
+        bool stop_on_error,
+        std::vector<tool_result_t>* out);
 
 private:
     ToolRegistry() = default;
@@ -208,6 +218,57 @@ namespace segment_tools
 namespace binary_tools
 {
     tool_result_t get_binary_info(const nlohmann::json& params);
+    // Slice B7 — canonical merged binary identity/capability tool.
+    tool_result_t binary_fingerprint(const nlohmann::json& params);
+    void register_tools();
+}
+
+namespace meta_tools
+{
+    // Slice B2 — orchestrator that runs N tool calls serially or in parallel.
+    tool_result_t tool_batch_call(const nlohmann::json& params);
+    // Slice B3 — hardcoded hunt-type → workflow planner.
+    tool_result_t plan_the_hunt(const nlohmann::json& params);
+    // Slice B4 — engine population / IDB readiness snapshot.
+    tool_result_t index_status(const nlohmann::json& params);
+    // Slice B5 — warm named engines.
+    tool_result_t build_index(const nlohmann::json& params);
+    // Slice B6 — netnode-backed session scratch (set/get/append/list/delete).
+    tool_result_t session_scratch(const nlohmann::json& params);
+    // Slice B8 — pre-auth-likely entrypoint enumeration.
+    tool_result_t list_remote_entrypoints(const nlohmann::json& params);
+    // Slice B9 — expose mcp_output_cache_t to MCP agents.
+    tool_result_t list_outputs(const nlohmann::json& params);
+    // Slice B10 — keyword→tool capability map.
+    tool_result_t ask_capability(const nlohmann::json& params);
+    // Slice B11 — example arguments / sample result per tool.
+    tool_result_t sample_tool_io(const nlohmann::json& params);
+
+    void register_tools();
+}
+
+// Slice C12 — taint-engine MCP surface (forward declared mirror of meta_tools).
+namespace sdk_underused_tools
+{
+    void register_tools();
+}
+
+namespace taint_tools_ext
+{
+    void register_tools();
+}
+
+// Slice H6-H12, H16 — graphrag MCP extensions (bulk decompile, string triangulation,
+// bulk semantic analysis, structured filter, external-entries enumeration,
+// security delta cursor, pre-auth taint, dispatch table extraction).
+namespace graphrag_tools_ext
+{
+    void register_tools();
+}
+
+// Slice H13-H14 — binary-level extensions (registry list + IAT capability map).
+namespace binary_tools_ext
+{
     void register_tools();
 }
 

@@ -23,6 +23,7 @@
 #include "../scanner/aob_view.hpp"
 #include "../scanner/scan_hub_view.hpp"
 #include "../settings/standalone_settings.hpp"
+#include "../runtime/diagnostic_exception_scope.hpp"
 
 #include <Windows.h>
 #include <algorithm>
@@ -727,6 +728,7 @@ struct ui_state_guard_t {
         }
         {
             std::lock_guard<std::mutex> log_lk(output_log::mutex);
+            output_log::owner_scope log_owner(14, -1);
             for (int i = 0; i < static_cast<int>(bottom_tab_t::COUNT); ++i) {
                 log_lines[static_cast<std::size_t>(i)] = output_log::lines[i];
                 log_auto_scroll[static_cast<std::size_t>(i)] = output_log::auto_scroll[i];
@@ -788,6 +790,7 @@ struct ui_state_guard_t {
         code_editor_widget::cancel_agent_edit();
         {
             std::lock_guard<std::mutex> log_lk(output_log::mutex);
+            output_log::owner_scope log_owner(15, -1);
             for (int i = 0; i < static_cast<int>(bottom_tab_t::COUNT); ++i) {
                 output_log::lines[i] = log_lines[static_cast<std::size_t>(i)];
                 output_log::auto_scroll[i] = log_auto_scroll[static_cast<std::size_t>(i)];
@@ -2069,6 +2072,20 @@ void phase_ui_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& faile
 void pump_ui_thread_jobs() {
     const DWORD ui_tid = GetCurrentThreadId();
     g_ui_phase_thread_id.store(ui_tid, std::memory_order_release);
+    std::size_t initial_pending = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_ui_phase_mtx);
+        initial_pending = g_ui_phase_jobs.size();
+    }
+    static std::atomic<std::uint64_t> s_pump_seq{0};
+    const std::uint64_t pump_seq = s_pump_seq.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (initial_pending > 0) {
+        diag::log_tagged_critical_fmt("ui_phase",
+            "pump_enter seq=%llu ui_tid=%lu pending=%llu",
+            static_cast<unsigned long long>(pump_seq),
+            static_cast<unsigned long>(ui_tid),
+            static_cast<unsigned long long>(initial_pending));
+    }
 
     for (;;) {
         std::shared_ptr<ui_phase_job_t> job;
@@ -2091,9 +2108,28 @@ void pump_ui_thread_jobs() {
             static_cast<unsigned long>(job->worker_tid),
             static_cast<unsigned long long>(job->started_ms >= job->queued_ms ? job->started_ms - job->queued_ms : 0),
             static_cast<unsigned long long>(remaining));
+        diag::log_tagged_critical_fmt("ui_phase",
+            "job_start seq=%llu ui_tid=%lu worker_tid=%lu wait_ms=%llu remaining=%llu hf=0x%llX",
+            static_cast<unsigned long long>(pump_seq),
+            static_cast<unsigned long>(ui_tid),
+            static_cast<unsigned long>(job->worker_tid),
+            static_cast<unsigned long long>(job->started_ms >= job->queued_ms ? job->started_ms - job->queued_ms : 0),
+            static_cast<unsigned long long>(remaining),
+            static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(job->hf)));
 
-        if (job->passed && job->failed && job->skipped)
-            phase_ui_tests_inline(job->hf, *job->passed, *job->failed, *job->skipped, job->cancelled);
+        if (job->passed && job->failed && job->skipped) {
+            try {
+                aida::diagnostic_exception_scope::scope_t exception_scope("test_all_features.pump_ui_thread_jobs.phase_ui_tests_inline");
+                phase_ui_tests_inline(job->hf, *job->passed, *job->failed, *job->skipped, job->cancelled);
+            } catch (...) {
+                fail_pending_ui_dispatch(job->hf, *job->failed, "cpp_exception", job->worker_tid, ui_tid, 0);
+                diag::log_tagged_critical_fmt("ui_phase",
+                    "job_cpp_exception seq=%llu ui_tid=%lu worker_tid=%lu",
+                    static_cast<unsigned long long>(pump_seq),
+                    static_cast<unsigned long>(ui_tid),
+                    static_cast<unsigned long>(job->worker_tid));
+            }
+        }
         else if (job->failed)
             fail_pending_ui_dispatch(job->hf, *job->failed, "bad_job_state", job->worker_tid, ui_tid, 0);
 
@@ -2108,6 +2144,18 @@ void pump_ui_thread_jobs() {
             static_cast<unsigned long>(ui_tid),
             static_cast<unsigned long>(job->worker_tid),
             static_cast<unsigned long long>(job->finished_ms >= job->started_ms ? job->finished_ms - job->started_ms : 0));
+        diag::log_tagged_critical_fmt("ui_phase",
+            "job_end seq=%llu ui_tid=%lu worker_tid=%lu run_ms=%llu",
+            static_cast<unsigned long long>(pump_seq),
+            static_cast<unsigned long>(ui_tid),
+            static_cast<unsigned long>(job->worker_tid),
+            static_cast<unsigned long long>(job->finished_ms >= job->started_ms ? job->finished_ms - job->started_ms : 0));
+    }
+    if (initial_pending > 0) {
+        diag::log_tagged_critical_fmt("ui_phase",
+            "pump_exit seq=%llu ui_tid=%lu",
+            static_cast<unsigned long long>(pump_seq),
+            static_cast<unsigned long>(ui_tid));
     }
 }
 

@@ -915,35 +915,52 @@ namespace detail {
         if (total_threads < 2)
             return false;
 
-        if (suspended_count == 0)
+        static std::atomic<uint32_t> s_candidate_hits{0};
+        static std::atomic<uint64_t> s_candidate_until{0};
+        const uint64_t now = static_cast<uint64_t>(GetTickCount64());
+
+        if (suspended_count == 0) {
+            const uint32_t prior_hits = s_candidate_hits.exchange(0, std::memory_order_acq_rel);
+            const uint64_t prior_until = s_candidate_until.exchange(0, std::memory_order_acq_rel);
+            if (prior_hits != 0) {
+                char rb[192];
+                _snprintf_s(rb, sizeof(rb), _TRUNCATE,
+                    "thread_suspended_probe_clean_reset total=%d prior_hits=%u prior_until=%llu worker_tid=%lu watchdog_tid=%lu",
+                    total_threads,
+                    prior_hits,
+                    static_cast<unsigned long long>(prior_until),
+                    static_cast<unsigned long>(worker_tid),
+                    static_cast<unsigned long>(watchdog_tid));
+                webhook::write_log("re_thread_probe", rb);
+            }
             return false;
+        }
 
         const bool high_ratio = total_threads >= 4 && suspended_count * 4 >= total_threads * 3;
         const bool high_count = suspended_count >= 6;
         const bool critical = critical_suspended > 0;
         const bool candidate = critical || high_ratio || high_count;
-        static std::atomic<uint32_t> s_candidate_hits{0};
-        static std::atomic<uint64_t> s_candidate_until{0};
-        const uint64_t now = static_cast<uint64_t>(GetTickCount64());
         uint32_t hits = 0;
+        uint32_t required_hits = candidate ? 2u : 0u;
         const uint64_t until = s_candidate_until.load(std::memory_order_acquire);
         if (candidate) {
             if (now >= until) {
                 s_candidate_hits.store(1, std::memory_order_release);
-                s_candidate_until.store(now + 3000, std::memory_order_release);
+                s_candidate_until.store(now + 5000, std::memory_order_release);
                 hits = 1;
             } else {
                 hits = s_candidate_hits.fetch_add(1, std::memory_order_acq_rel) + 1;
-                s_candidate_until.store(now + 3000, std::memory_order_release);
+                s_candidate_until.store(now + 5000, std::memory_order_release);
             }
         } else {
             s_candidate_hits.store(0, std::memory_order_release);
             s_candidate_until.store(0, std::memory_order_release);
         }
+        const bool enforce = required_hits != 0 && hits >= required_hits;
 
         char buf[896];
         _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-            "thread_suspended_probe_sample total=%d suspended=%d critical=%d high_ratio=%d high_count=%d candidate=%d hits=%u enforce=%d worker_tid=%lu watchdog_tid=%lu sample=%s",
+            "thread_suspended_probe_sample total=%d suspended=%d critical=%d high_ratio=%d high_count=%d candidate=%d hits=%u required=%u window_ms=5000 enforce=%d worker_tid=%lu watchdog_tid=%lu sample=%s",
             total_threads,
             suspended_count,
             critical_suspended,
@@ -951,13 +968,14 @@ namespace detail {
             high_count ? 1 : 0,
             candidate ? 1 : 0,
             hits,
-            (critical || hits >= 2) ? 1 : 0,
+            required_hits,
+            enforce ? 1 : 0,
             static_cast<unsigned long>(worker_tid),
             static_cast<unsigned long>(watchdog_tid),
             sample_len != 0 ? sample : "none");
         webhook::write_log("re_thread_probe", buf);
 
-        return critical || hits >= 2;
+        return enforce;
     }
 
     inline bool detect_veh_tampered()

@@ -78,7 +78,7 @@ static ID3D11ShaderResourceView* g_loader_icon_srv  = nullptr;
 static int                        g_loader_icon_w    = 0;
 static int                        g_loader_icon_h    = 0;
 DisasmState                       g_disasm;
-const char*                       g_render_section = "idle";
+render_section_state_t            g_render_section;
 
 namespace {
 	std::atomic<bool>          g_settings_dirty{false};
@@ -86,6 +86,7 @@ namespace {
 	std::mutex                 g_settings_cv_mtx;
 	std::atomic<bool>          g_settings_saver_running{false};
 	std::atomic<bool>          g_settings_saver_started{false};
+	std::atomic<bool>          g_chrome_shutdown_requested{false};
 
 	void settings_saver_loop()
 	{
@@ -117,6 +118,62 @@ namespace {
 			}
 		}
 		g_settings_cv.notify_one();
+	}
+
+	void request_chrome_shutdown_from_render(const char* source, const char* cleanup_reason)
+	{
+		HWND hwnd = g_hwnd;
+		BOOL is_window = hwnd ? ::IsWindow(hwnd) : FALSE;
+		bool already_requested = g_chrome_shutdown_requested.exchange(true, std::memory_order_acq_rel);
+		POINT cursor{};
+		::GetCursorPos(&cursor);
+		diag::log_tagged_critical_fmt("chrome",
+			"shutdown_request source=%s hwnd=0x%llX is_window=%d already=%d cursor=%ld,%ld tid=%lu section=%s",
+			source ? source : "<null>",
+			(unsigned long long)reinterpret_cast<UINT_PTR>(hwnd),
+			is_window ? 1 : 0,
+			already_requested ? 1 : 0,
+			cursor.x,
+			cursor.y,
+			::GetCurrentThreadId(),
+			g_render_section.c_str());
+		if (already_requested) {
+			return;
+		}
+
+		file_tabs::write_hot_exit_snapshot_all();
+		try {
+			test_all_features::cancel_tests();
+			aida::burp::camoufox::force_cleanup(cleanup_reason ? cleanup_reason : "chrome.shutdown");
+		} catch (...) {
+			diag::log_tagged_critical_fmt("chrome",
+				"shutdown_camoufox_cleanup_exception source=%s",
+				source ? source : "<null>");
+		}
+
+		hwnd = g_hwnd;
+		is_window = hwnd ? ::IsWindow(hwnd) : FALSE;
+		if (hwnd && is_window) {
+			::SetLastError(0);
+			BOOL posted = ::PostMessageW(hwnd, WM_CLOSE, 0, 0);
+			DWORD gle = ::GetLastError();
+			diag::log_tagged_critical_fmt("chrome",
+				"shutdown_post_wm_close source=%s hwnd=0x%llX ok=%d gle=%lu",
+				source ? source : "<null>",
+				(unsigned long long)reinterpret_cast<UINT_PTR>(hwnd),
+				posted ? 1 : 0,
+				(unsigned long)gle);
+			if (posted) {
+				return;
+			}
+		}
+
+		diag::log_tagged_critical_fmt("chrome",
+			"shutdown_post_quit_fallback source=%s hwnd=0x%llX is_window=%d",
+			source ? source : "<null>",
+			(unsigned long long)reinterpret_cast<UINT_PTR>(hwnd),
+			is_window ? 1 : 0);
+		::PostQuitMessage(0);
 	}
 
 	const char* center_view_name(center_view_t view)
@@ -181,6 +238,79 @@ namespace {
 				vh,
 				static_cast<unsigned long>(GetCurrentThreadId()));
 		}
+	}
+
+	void log_bottom_panel_lock_busy(const char* op, int tab, unsigned long long known_version, size_t cached_lines, size_t total_lines)
+	{
+		static std::atomic<unsigned long long> s_last_log_ms{0};
+		static std::atomic<unsigned long long> s_busy_count{0};
+		const unsigned long long now = GetTickCount64();
+		unsigned long long count = s_busy_count.fetch_add(1, std::memory_order_acq_rel) + 1ULL;
+		unsigned long long last = s_last_log_ms.load(std::memory_order_acquire);
+		if (count != 1ULL && now - last < 500ULL)
+			return;
+		if (count != 1ULL && !s_last_log_ms.compare_exchange_strong(last, now, std::memory_order_acq_rel))
+			return;
+		unsigned long owner_tid = 0;
+		unsigned long long owner_age = 0;
+		int owner_tab = -1;
+		int owner_op = 0;
+		output_log::snapshot_owner(owner_tid, owner_age, owner_tab, owner_op);
+		diag::log_tagged_fmt("ui",
+			"BOTTOM_PANEL_LOCK_BUSY op=%s tab=%d known_version=%llu cached=%zu total=%zu busy_count=%llu owner_tid=%lu owner_age_ms=%llu owner_tab=%d owner_op=%s owner_op_id=%d frame=%d section=%s tid=%lu",
+			op ? op : "<null>",
+			tab,
+			known_version,
+			cached_lines,
+			total_lines,
+			count,
+			owner_tid,
+			owner_age,
+			owner_tab,
+			output_log::op_name(owner_op),
+			owner_op,
+			ImGui::GetFrameCount(),
+			g_render_section.c_str(),
+			static_cast<unsigned long>(GetCurrentThreadId()));
+	}
+
+	bool text_has_token(const std::string& text, const char* token)
+	{
+		return token && text.find(token) != std::string::npos;
+	}
+
+	std::string runtime_lock_user_message(const std::string& reason, const std::string& detail)
+	{
+		const std::string joined = reason + " " + detail;
+		if (text_has_token(joined, "HANDLE_WRITE") || text_has_token(joined, "HANDLE_VMOP") ||
+			text_has_token(joined, "HANDLE_THREAD") || text_has_token(joined, "foreign_handle") ||
+			text_has_token(joined, "foreign_mutating_handle"))
+			return "Suspicious process handle to AiDA detected. Close that process, then restart AiDAStandalone.exe.";
+		if (text_has_token(joined, "TARGET_AIDA") || text_has_token(joined, "targeting_aida"))
+			return "External tooling is targeting AiDA. Close the tool targeting AiDA, then restart AiDAStandalone.exe.";
+		if (text_has_token(joined, "DBG_TOOL") || text_has_token(joined, "debugger"))
+			return "Debugger activity detected. Close the debugger, then restart AiDAStandalone.exe.";
+		if (text_has_token(joined, "RE_TOOL") || text_has_token(joined, "reverse_engineering") ||
+			text_has_token(joined, "ai_tool_posture_re_tool"))
+			return "Reverse-engineering tool activity detected. Close that tool, then restart AiDAStandalone.exe.";
+		if (text_has_token(joined, "DUMP_TOOL") || text_has_token(joined, "dump_tool"))
+			return "Dumping tool activity detected. Close that tool, then restart AiDAStandalone.exe.";
+		if (text_has_token(joined, "MEM_SCANNER") || text_has_token(joined, "memory_scanner"))
+			return "Memory scanner activity detected. Close the scanner, then restart AiDAStandalone.exe.";
+		if (text_has_token(joined, "MCP_OFFENSIVE_TOOL") || text_has_token(joined, "offensive_mcp"))
+			return "Offensive MCP tooling detected. Close that MCP tool, then restart AiDAStandalone.exe.";
+		if (text_has_token(joined, "MCP_PIPE") || text_has_token(joined, "MCP_PROCESS") ||
+			text_has_token(joined, "MCP_PORT") || text_has_token(joined, "MCP_CMD") ||
+			text_has_token(joined, "mcp_bridge"))
+			return "Untrusted MCP bridge activity detected. Close the bridge/tool, then restart AiDAStandalone.exe.";
+		if (text_has_token(joined, "LOCAL_LLM") || text_has_token(joined, "local_llm"))
+			return "Local LLM analysis context detected near AiDA. Close it, then restart AiDAStandalone.exe.";
+		if (text_has_token(joined, "code_integrity") || text_has_token(joined, "page_mac") ||
+			text_has_token(joined, "block_chain"))
+			return "Runtime code integrity changed. Close suspicious tooling, then restart AiDAStandalone.exe.";
+		if (text_has_token(joined, "kernel_debugger"))
+			return "Kernel debugger activity detected. Close it, then restart AiDAStandalone.exe.";
+		return "AiDA stopped this runtime session after an integrity failure. Close suspicious tools, then restart AiDAStandalone.exe.";
 	}
 }
 
@@ -2296,6 +2426,14 @@ void helpers::render_title()
 		if (runtime_locked) {
 			dl->AddRectFilled(card_a, card_b, aida::ui::with_alpha(th.panel_bg, 0.82f * la), 16.f);
 			dl->AddRect(card_a, card_b, aida::ui::with_alpha(th.border_subtle, la), 16.f, 0, 1.2f);
+			std::string reason;
+			std::string detail;
+			{
+				auto& rt = anti_tamper::state::get();
+				std::lock_guard<std::mutex> lk(rt.mtx);
+				reason = rt.violation_reason;
+				detail = rt.violation_detail;
+			}
 
 			const char* title = "Runtime integrity lock";
 			float title_size = 25.f;
@@ -2304,19 +2442,13 @@ void helpers::render_title()
 				ImVec2(cx - title_ts.x * 0.5f + shake_x, content_y + 76.f),
 				aida::ui::with_alpha(th.text_primary, la), title);
 
-			const char* sub = "AiDA stopped this runtime session. Restart AiDAStandalone.exe.";
+			std::string sub = runtime_lock_user_message(reason, detail);
 			float sub_size = body->FontSize;
-			ImVec2 sub_ts = body->CalcTextSizeA(sub_size, inner_w, 0.f, sub);
+			ImVec2 sub_ts = body->CalcTextSizeA(sub_size, inner_w, 0.f, sub.c_str());
 			dl->AddText(body, sub_size,
 				ImVec2(cx - sub_ts.x * 0.5f + shake_x, content_y + 76.f + title_size + 16.f),
-				aida::ui::with_alpha(th.text_secondary, la), sub);
+				aida::ui::with_alpha(th.text_secondary, la), sub.c_str(), nullptr, inner_w);
 
-			std::string reason;
-			{
-				auto& rt = anti_tamper::state::get();
-				std::lock_guard<std::mutex> lk(rt.mtx);
-				reason = rt.violation_reason;
-			}
 			if (!reason.empty()) {
 				std::string msg = "Reason: " + reason;
 				ImFont* code = aida::ui::fonts::code();
@@ -3062,19 +3194,7 @@ void helpers::render_title()
 				close_b.x,
 				close_b.y,
 				ui_input_gate::chrome_input_blocked() ? 1 : 0);
-			file_tabs::write_hot_exit_snapshot_all();
-			try {
-				test_all_features::cancel_tests();
-				aida::burp::camoufox::force_cleanup("chrome.close_button");
-			} catch (...) {
-				diag::log_tagged_critical("chrome", "close_button_camoufox_cleanup_exception");
-			}
-			diag::log_tagged_critical("chrome", "close_button_destroy_window_pre");
-			DestroyWindow(g_hwnd);
-			diag::log_tagged_critical("chrome", "close_button_post_quit_pre");
-			PostQuitMessage(0);
-			diag::log_tagged_critical("chrome", "close_button_exit_process_pre");
-			ExitProcess(0);
+			request_chrome_shutdown_from_render("close_button", "chrome.close_button");
 		}
 		ctl_off += 22.f + 6.f;
 
@@ -3833,19 +3953,7 @@ void helpers::render_title()
 								(unsigned long long)reinterpret_cast<UINT_PTR>(g_hwnd),
 								cursor.x,
 								cursor.y);
-							file_tabs::write_hot_exit_snapshot_all();
-							try {
-								test_all_features::cancel_tests();
-								aida::burp::camoufox::force_cleanup("chrome.file_menu_exit");
-							} catch (...) {
-								diag::log_tagged_critical("chrome", "file_menu_exit_camoufox_cleanup_exception");
-							}
-							diag::log_tagged_critical("chrome", "file_menu_exit_destroy_window_pre");
-							DestroyWindow(g_hwnd);
-							diag::log_tagged_critical("chrome", "file_menu_exit_post_quit_pre");
-							PostQuitMessage(0);
-							diag::log_tagged_critical("chrome", "file_menu_exit_exit_process_pre");
-							ExitProcess(0);
+							request_chrome_shutdown_from_render("file_menu_exit", "chrome.file_menu_exit");
 						}
 						break;
 					}
@@ -6265,7 +6373,29 @@ void helpers::render_title()
 
 
 	mark_center_render_section("center_pump_ui_thread_jobs", globals::ui::active_center_view, false, 0.f, 0.f);
+	static std::atomic<unsigned long long> s_last_pump_jobs_log_ms{0};
+	const unsigned long long ui_jobs_start_ms = GetTickCount64();
+	unsigned long long last_pump_jobs_log_ms = s_last_pump_jobs_log_ms.load(std::memory_order_acquire);
+	const bool log_pump_jobs = ui_jobs_start_ms - last_pump_jobs_log_ms >= 1000ULL &&
+		s_last_pump_jobs_log_ms.compare_exchange_strong(last_pump_jobs_log_ms, ui_jobs_start_ms, std::memory_order_acq_rel);
+	if (log_pump_jobs) {
+		diag::log_tagged_critical_fmt("render_center",
+			"pump_ui_thread_jobs_enter view=%s view_id=%d frame=%d tid=%lu",
+			center_view_name(globals::ui::active_center_view),
+			static_cast<int>(globals::ui::active_center_view),
+			ImGui::GetFrameCount(),
+			static_cast<unsigned long>(GetCurrentThreadId()));
+	}
 	test_all_features::pump_ui_thread_jobs();
+	if (log_pump_jobs) {
+		diag::log_tagged_critical_fmt("render_center",
+			"pump_ui_thread_jobs_exit view=%s view_id=%d elapsed_ms=%llu frame=%d tid=%lu",
+			center_view_name(globals::ui::active_center_view),
+			static_cast<int>(globals::ui::active_center_view),
+			static_cast<unsigned long long>(GetTickCount64() - ui_jobs_start_ms),
+			ImGui::GetFrameCount(),
+			static_cast<unsigned long>(GetCurrentThreadId()));
+	}
 	g_render_section = "center_resolve_view";
 	auto cv = globals::ui::active_center_view;
 
@@ -8084,10 +8214,15 @@ void helpers::render_title()
 					if (globals::ui::active_bottom_tab == bottom_tab_t::terminal) {
 						auto& tmgr_clear = globals::terminal_mgr;
 						if (!tmgr_clear.sessions.empty() && tmgr_clear.sessions[0]) {
-							terminal_view::clear_session(*tmgr_clear.sessions[0]);
+							if (!terminal_view::try_clear_session(*tmgr_clear.sessions[0])) {
+								log_bottom_panel_lock_busy("terminal_clear", static_cast<int>(bottom_tab_t::terminal), 0, 0, 0);
+							}
 						}
 					} else {
-						output_log::clear(globals::ui::active_bottom_tab);
+						int tab_idx_clear = output_log::tab_index(globals::ui::active_bottom_tab);
+						if (!output_log::try_clear(static_cast<bottom_tab_t>(tab_idx_clear))) {
+							log_bottom_panel_lock_busy("log_clear", tab_idx_clear, 0, 0, 0);
+						}
 					}
 				}
 
@@ -8109,15 +8244,8 @@ void helpers::render_title()
 						if (!tmgr_cpy.sessions.empty() && tmgr_cpy.sessions[0]) {
 							auto* ts_cpy = tmgr_cpy.sessions[0];
 							std::string all_text;
-							{
-								std::lock_guard<std::mutex> lk(ts_cpy->buffer_mtx);
-								for (auto& row : ts_cpy->lines) {
-									for (auto& cell : row)
-										all_text += cell.ch;
-									while (!all_text.empty() && all_text.back() == ' ')
-										all_text.pop_back();
-									all_text += '\n';
-								}
+							if (!terminal_view::try_copy_all_text(*ts_cpy, all_text)) {
+								log_bottom_panel_lock_busy("terminal_copy", static_cast<int>(bottom_tab_t::terminal), 0, 0, 0);
 							}
 							if (!all_text.empty())
 								ImGui::SetClipboardText(all_text.c_str());
@@ -8125,7 +8253,9 @@ void helpers::render_title()
 					} else {
 						int tab_idx_cpy = output_log::tab_index(globals::ui::active_bottom_tab);
 						std::deque<std::string> log_lines_cpy;
-						output_log::snapshot_all(static_cast<bottom_tab_t>(tab_idx_cpy), log_lines_cpy);
+						if (!output_log::try_snapshot_all(static_cast<bottom_tab_t>(tab_idx_cpy), log_lines_cpy)) {
+							log_bottom_panel_lock_busy("log_copy", tab_idx_cpy, 0, 0, 0);
+						}
 						std::string all_text;
 						all_text.reserve(log_lines_cpy.size() * 80);
 						for (const auto& ln : log_lines_cpy) {
@@ -8178,16 +8308,8 @@ void helpers::render_title()
 						if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C, false)) {
 							if (s_term_select_all) {
 								std::string all_text;
-								{
-									std::lock_guard<std::mutex> lk(ts->buffer_mtx);
-									for (auto& row : ts->lines) {
-										for (auto& cell : row)
-											all_text += cell.ch;
-
-										while (!all_text.empty() && all_text.back() == ' ')
-											all_text.pop_back();
-										all_text += '\n';
-									}
+								if (!terminal_view::try_copy_all_text(*ts, all_text)) {
+									log_bottom_panel_lock_busy("terminal_ctrl_c_copy", static_cast<int>(bottom_tab_t::terminal), 0, 0, 0);
 								}
 								if (!all_text.empty())
 									ImGui::SetClipboardText(all_text.c_str());
@@ -8256,12 +8378,18 @@ void helpers::render_title()
 
 				ULONGLONG log_render_start = GetTickCount64();
 				g_render_section = "bottom_panel_log_snapshot";
-				uint64_t cur_version = output_log::current_version(static_cast<bottom_tab_t>(tab_idx));
-				if (cur_version != s_log_last_version[tab_idx]) {
-					size_t cur_total = 0;
-					output_log::snapshot_tail(static_cast<bottom_tab_t>(tab_idx), output_log::MAX_RENDER_LINES,
-						s_log_snapshot[tab_idx], &cur_total, &cur_version);
-					s_log_last_version[tab_idx] = cur_version;
+				size_t cur_total = s_log_total_lines[tab_idx];
+				if (!output_log::try_snapshot_tail_if_changed(static_cast<bottom_tab_t>(tab_idx),
+					output_log::MAX_RENDER_LINES,
+					s_log_last_version[tab_idx],
+					s_log_snapshot[tab_idx],
+					&cur_total,
+					nullptr)) {
+					log_bottom_panel_lock_busy("log_snapshot", tab_idx,
+						static_cast<unsigned long long>(s_log_last_version[tab_idx]),
+						s_log_snapshot[tab_idx].size(),
+						s_log_total_lines[tab_idx]);
+				} else {
 					s_log_total_lines[tab_idx] = cur_total;
 				}
 
@@ -8280,7 +8408,14 @@ void helpers::render_title()
 						ImGui::TextUnformatted(line.c_str(), line.c_str() + line.size());
 					}
 				}
-				if (output_log::is_auto_scroll(static_cast<bottom_tab_t>(tab_idx)) && near_bottom)
+				bool auto_scroll_enabled = true;
+				if (!output_log::try_is_auto_scroll(static_cast<bottom_tab_t>(tab_idx), auto_scroll_enabled)) {
+					log_bottom_panel_lock_busy("log_auto_scroll", tab_idx,
+						static_cast<unsigned long long>(s_log_last_version[tab_idx]),
+						view_lines.size(),
+						s_log_total_lines[tab_idx]);
+				}
+				if (auto_scroll_enabled && near_bottom)
 					ImGui::SetScrollHereY(1.0f);
 				ULONGLONG log_render_elapsed = GetTickCount64() - log_render_start;
 				if (log_render_elapsed > 50 && GetTickCount64() - s_log_last_slow_report[tab_idx] > 2000) {
@@ -8308,12 +8443,15 @@ void helpers::render_title()
 
 
 	{
+		g_render_section = "post_bottom_license_check";
 		static int s_lic_check_counter = 0;
 		if (++s_lic_check_counter >= 120) {
 			s_lic_check_counter = 0;
 			if (license::validated && !standalone_license::is_valid()) {
+				g_render_section = "post_bottom_license_invalid";
 				const bool runtime_locked = anti_tamper::state::get().violation_latched.load(std::memory_order_acquire);
 				if (license::preserve_valid_state(runtime_locked, test_all_features::is_running())) {
+					g_render_section = "post_bottom_license_preserve";
 					license::checking = false;
 					license::check_failed = false;
 					license::error_msg.clear();
@@ -8322,6 +8460,7 @@ void helpers::render_title()
 						ImGui::GetFrameCount(),
 						standalone_license::is_arc_loaded() ? 1 : 0);
 				} else {
+					g_render_section = "post_bottom_license_fail_closed";
 					license::validated = false;
 					license::error_msg = runtime_locked
 						? std::string("Runtime integrity check failed. Restart AiDAStandalone.exe.")
@@ -8337,8 +8476,11 @@ void helpers::render_title()
 		}
 	}
 
+	g_render_section = "post_bottom_tick_ai_chat";
 	tick_ai_chat();
+	g_render_section = "post_bottom_poll_ai_chat";
 	poll_ai_chat();
+	g_render_section = "post_bottom_poll_ai_chat_done";
 
 	g_render_section = "popups";
 

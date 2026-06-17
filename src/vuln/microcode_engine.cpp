@@ -7,7 +7,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <optional>
+#include <queue>
+#include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -26,6 +29,8 @@
 #include "../ida_utils.hpp"
 #include "../obfuscation.hpp"
 #include "microcode_engine.hpp"
+#include "symbolic_engine.hpp"
+#include "smt_solver.hpp"
 #include "vuln_common.hpp"
 #include "vuln_signatures.hpp"
 #include "vuln_tools.hpp"
@@ -502,32 +507,204 @@ bool collect_first_pointer_arg(const minsn_t& call_ins, mop_t& out_ptr)
 
 void traverse_topinsns(mba_t& mba, std::function<bool(int, minsn_t&)> visitor)
 {
-    for (int i = 0; i < mba.qty; ++i)
+    struct visitor_t : public minsn_visitor_t
     {
-        mblock_t* blk = mba.get_mblock(static_cast<uint>(i));
-        if (blk == nullptr)
-            continue;
-        for (minsn_t* m = blk->head; m != nullptr; m = m->next)
+        std::function<bool(int, minsn_t&)> cb;
+        visitor_t(mba_t* m, std::function<bool(int, minsn_t&)> f)
+            : minsn_visitor_t(m), cb(std::move(f))
         {
-            if (!visitor(i, *m))
-                return;
         }
-    }
+        int idaapi visit_minsn() override
+        {
+            if (curins == nullptr)
+                return 0;
+            int serial = blk != nullptr ? blk->serial : -1;
+            return cb(serial, *curins) ? 0 : 1;
+        }
+    };
+    visitor_t v(&mba, std::move(visitor));
+    mba.for_all_insns(v);
 }
 
 void traverse_topinsns_const(const mba_t& mba, std::function<bool(int, const minsn_t&)> visitor)
 {
-    for (int i = 0; i < mba.qty; ++i)
+    mba_t& mutable_mba = const_cast<mba_t&>(mba);
+    traverse_topinsns(mutable_mba, [&](int block_serial, minsn_t& ins) -> bool {
+        return visitor(block_serial, ins);
+    });
+}
+
+std::string mlist_to_string(const mlist_t& list)
+{
+    qstring qs;
+    list.print(&qs);
+    return qs.empty() ? std::string() : std::string(qs.c_str());
+}
+
+bool mlist_for_operand(const mblock_t& blk, const mop_t& op, bool def_not_use, maymust_t mm, mlist_t& out)
+{
+    out.clear();
+    if (op.t == mop_z)
+        return false;
+    if (def_not_use)
+        blk.append_def_list(&out, op, mm);
+    else
+        blk.append_use_list(&out, op, mm);
+    return !out.empty();
+}
+
+bool block_ends_with_noret_call(const mblock_t& blk)
+{
+    const minsn_t* tail = blk.tail;
+    if (tail == nullptr || !is_mcode_call(tail->opcode))
+        return false;
+    ea_t callee_ea = BADADDR;
+    std::string callee_name;
+    if (!resolve_call_target(*tail, callee_ea, callee_name) || callee_ea == BADADDR)
+        return false;
+    return !func_does_return(callee_ea);
+}
+
+nlohmann::json chain_to_json(const chain_t& ch)
+{
+    nlohmann::json j;
+    qstring qs;
+    ch.print(&qs);
+    j["text"] = qs.empty() ? std::string() : std::string(qs.c_str());
+    j["width"] = ch.width;
+    j["varnum"] = ch.varnum;
+    j["is_reg"] = ch.is_reg();
+    j["is_stkoff"] = ch.is_stkoff();
+    j["is_term"] = ch.is_term();
+    j["is_pass_through"] = ch.is_passreg();
+    nlohmann::json blocks = nlohmann::json::array();
+    for (size_t i = 0; i < ch.size(); ++i)
+        blocks.push_back(ch[i]);
+    j["blocks"] = std::move(blocks);
+    return j;
+}
+
+gctype_t parse_gctype(const std::string& s)
+{
+    const std::string lower = ascii_lower(s);
+    if (lower == "asr")
+        return GC_ASR;
+    if (lower == "xdsu")
+        return GC_XDSU;
+    return GC_REGS_AND_STKVARS;
+}
+
+maymust_t parse_maymust(const std::string& s)
+{
+    return ascii_lower(s) == "must" ? MUST_ACCESS : MAY_ACCESS;
+}
+
+bool parse_bool_param(const nlohmann::json& params, const char* key, bool def)
+{
+    if (!params.contains(key))
+        return def;
+    const auto& v = params.at(key);
+    if (v.is_boolean())
+        return v.get<bool>();
+    if (v.is_number_integer())
+        return v.get<int>() != 0;
+    if (v.is_string())
     {
-        const mblock_t* blk = mba.get_mblock(static_cast<uint>(i));
-        if (blk == nullptr)
-            continue;
-        for (const minsn_t* m = blk->head; m != nullptr; m = m->next)
+        const std::string lower = ascii_lower(v.get<std::string>());
+        return lower == "1" || lower == "true" || lower == "yes";
+    }
+    return def;
+}
+
+template <typename T, size_t N>
+bool source_name_in(const std::string& lower_name, const T (&items)[N], int& arg_index)
+{
+    for (const auto& item : items)
+    {
+        const std::string needle = ascii_lower(std::string(item.name));
+        if (!needle.empty() && lower_name.find(needle) != std::string::npos)
         {
-            if (!visitor(i, *m))
-                return;
+            arg_index = item.taint_arg_index;
+            return true;
         }
     }
+    return false;
+}
+
+template <size_t N>
+bool sink_name_in(const std::string& lower_name,
+                  const sig::sink_signature_t (&items)[N],
+                  int& cwe,
+                  int& len_arg,
+                  int& sensitive_arg)
+{
+    for (const auto& item : items)
+    {
+        const std::string needle = ascii_lower(std::string(item.name));
+        if (!needle.empty() && lower_name.find(needle) != std::string::npos)
+        {
+            cwe = item.primary_cwe;
+            len_arg = item.len_arg_index;
+            sensitive_arg = item.sensitive_arg_index;
+            return true;
+        }
+    }
+    return false;
+}
+
+template <size_t N>
+bool helper_name_in(const std::string& lower_name, const std::string_view (&items)[N])
+{
+    for (const auto& item : items)
+    {
+        const std::string needle = ascii_lower(std::string(item));
+        if (!needle.empty() && lower_name.find(needle) != std::string::npos)
+            return true;
+    }
+    return false;
+}
+
+void collect_numeric_mops(const mop_t& op, std::vector<uint64_t>& out, int depth = 0)
+{
+    if (depth > kMaxMopJsonDepth || op.t == mop_z)
+        return;
+    if (op.t == mop_n && op.nnn != nullptr)
+    {
+        out.push_back(static_cast<uint64_t>(op.nnn->value));
+        return;
+    }
+    if (op.t == mop_d && op.d != nullptr)
+    {
+        collect_numeric_mops(op.d->l, out, depth + 1);
+        collect_numeric_mops(op.d->r, out, depth + 1);
+        collect_numeric_mops(op.d->d, out, depth + 1);
+        return;
+    }
+    if (op.t == mop_f && op.f != nullptr)
+    {
+        for (size_t i = 0; i < op.f->args.size(); ++i)
+            collect_numeric_mops(static_cast<const mop_t&>(op.f->args[i]), out, depth + 1);
+        return;
+    }
+    if (op.t == mop_a && op.a != nullptr)
+        collect_numeric_mops(static_cast<const mop_t&>(*op.a), out, depth + 1);
+    if (op.t == mop_p && op.pair != nullptr)
+    {
+        collect_numeric_mops(op.pair->lop, out, depth + 1);
+        collect_numeric_mops(op.pair->hop, out, depth + 1);
+    }
+}
+
+std::unordered_map<std::string, nlohmann::json>& microcode_session_constraints()
+{
+    static std::unordered_map<std::string, nlohmann::json> constraints;
+    return constraints;
+}
+
+std::mutex& microcode_session_constraints_mutex()
+{
+    static std::mutex m;
+    return m;
 }
 
 }
@@ -603,6 +780,57 @@ std::optional<mba_handle_t> generate(ea_t func_ea, mba_maturity_t mat)
     {
         return std::nullopt;
     }
+}
+
+std::vector<mba_handle_t> generate_at_maturities(ea_t func_ea, const std::vector<mba_maturity_t>& mats)
+{
+    std::vector<mba_handle_t> out;
+    out.reserve(mats.size());
+    std::set<mba_maturity_t> seen;
+    for (mba_maturity_t mat : mats)
+    {
+        if (!seen.insert(mat).second)
+            continue;
+        auto handle = generate(func_ea, mat);
+        if (handle.has_value() && handle->mba != nullptr)
+            out.push_back(std::move(*handle));
+    }
+    return out;
+}
+
+void iter_with_visitors(mba_t& mba,
+                        const std::function<bool(int, minsn_t&)>& insn_visitor,
+                        const std::function<bool(int, mop_t&, bool)>& mop_visitor)
+{
+    if (insn_visitor)
+        traverse_topinsns(mba, insn_visitor);
+    if (!mop_visitor)
+        return;
+
+    struct visitor_t : public mop_visitor_t
+    {
+        std::function<bool(int, mop_t&, bool)> cb;
+        visitor_t(mba_t* m, std::function<bool(int, mop_t&, bool)> f)
+            : mop_visitor_t(m), cb(std::move(f))
+        {
+        }
+        int idaapi visit_mop(mop_t* op, const tinfo_t*, bool is_target) override
+        {
+            if (op == nullptr)
+                return 0;
+            int serial = blk != nullptr ? blk->serial : -1;
+            return cb(serial, *op, is_target) ? 0 : 1;
+        }
+    };
+    visitor_t v(&mba, mop_visitor);
+    mba.for_all_ops(v);
+}
+
+std::pair<mlist_t, mlist_t> build_use_def_lists(mblock_t& blk,
+                                                const minsn_t& ins,
+                                                maymust_t mm)
+{
+    return {blk.build_use_list(ins, mm), blk.build_def_list(ins, mm)};
 }
 
 nlohmann::json minsn_to_json(const minsn_t& ins)
@@ -693,59 +921,7 @@ nlohmann::json dump_mba(const mba_t& mba, size_t inst_offset, size_t inst_limit)
 
 bool mop_equal(const mop_t& a, const mop_t& b)
 {
-    if (a.t != b.t)
-        return false;
-    if (a.size != b.size)
-        return false;
-
-    switch (a.t)
-    {
-    case mop_z:
-        return true;
-    case mop_r:
-        return a.r == b.r;
-    case mop_n:
-        if (a.nnn == nullptr || b.nnn == nullptr)
-            return a.nnn == b.nnn;
-        return a.nnn->value == b.nnn->value;
-    case mop_str:
-        if (a.cstr == nullptr || b.cstr == nullptr)
-            return a.cstr == b.cstr;
-        return std::strcmp(a.cstr, b.cstr) == 0;
-    case mop_v:
-        return a.g == b.g;
-    case mop_l:
-        if (a.l == nullptr || b.l == nullptr)
-            return a.l == b.l;
-        return a.l->idx == b.l->idx && a.l->off == b.l->off;
-    case mop_S:
-        if (a.s == nullptr || b.s == nullptr)
-            return a.s == b.s;
-        return a.s->off == b.s->off;
-    case mop_b:
-        return a.b == b.b;
-    case mop_h:
-        if (a.helper == nullptr || b.helper == nullptr)
-            return a.helper == b.helper;
-        return std::strcmp(a.helper, b.helper) == 0;
-    case mop_d:
-        return a.d == b.d;
-    case mop_f:
-        return a.f == b.f;
-    case mop_a:
-        return a.a == b.a;
-    case mop_c:
-        return a.c == b.c;
-    case mop_fn:
-        return a.fpc == b.fpc;
-    case mop_p:
-        return a.pair == b.pair;
-    case mop_sc:
-        return a.scif == b.scif;
-    default:
-        break;
-    }
-    return false;
+    return a.equal_mops(b, 0);
 }
 
 bool mop_aliases(const mop_t& a, const mop_t& b)
@@ -933,14 +1109,46 @@ def_use_t def_use_chain(mba_t& mba, const mop_t& tracked)
     if (tracked.t == mop_z)
         return result;
 
+    mlist_t tracked_use;
+    mlist_t tracked_def;
+    bool have_tracked_list = false;
+    for (int i = 0; i < mba.qty && !have_tracked_list; ++i)
+    {
+        mblock_t* blk = mba.get_mblock(static_cast<uint>(i));
+        if (blk == nullptr)
+            continue;
+        have_tracked_list = mlist_for_operand(*blk, tracked, false, MAY_ACCESS, tracked_use);
+        mlist_t def_tmp;
+        if (mlist_for_operand(*blk, tracked, true, MAY_ACCESS, def_tmp))
+        {
+            tracked_def.add(def_tmp);
+            have_tracked_list = true;
+        }
+    }
+    if (!tracked_def.empty())
+        tracked_use.add(tracked_def);
+
     std::unordered_set<std::uint64_t> def_set;
     std::unordered_set<std::uint64_t> use_set;
     ea_t last_def_ea = BADADDR;
 
-    traverse_topinsns(mba, [&](int, minsn_t& ins) -> bool {
-        bool used_in_args = false;
-        const bool is_use = insn_uses_tracked(ins, tracked, used_in_args);
-        const bool is_def = insn_defines_tracked(ins, tracked);
+    traverse_topinsns(mba, [&](int block_serial, minsn_t& ins) -> bool {
+        mblock_t* blk = nullptr;
+        for (int b = 0; b < mba.qty; ++b)
+        {
+            mblock_t* candidate = mba.get_mblock(static_cast<uint>(b));
+            if (candidate != nullptr && candidate->serial == block_serial)
+            {
+                blk = candidate;
+                break;
+            }
+        }
+        if (blk == nullptr)
+            return true;
+
+        auto lists = build_use_def_lists(*blk, ins, MAY_ACCESS);
+        const bool is_use = !tracked_use.empty() && lists.first.has_common(tracked_use);
+        const bool is_def = !tracked_use.empty() && lists.second.has_common(tracked_use);
 
         if (is_use)
         {
@@ -952,7 +1160,6 @@ def_use_t def_use_chain(mba_t& mba, const mop_t& tracked)
                 rd << "def@" << ea_to_hex(last_def_ea) << " -> use@" << ea_to_hex(ins.ea);
                 result.reaching_defs.push_back(rd.str());
             }
-            (void)used_in_args;
         }
 
         if (is_def)
@@ -995,6 +1202,49 @@ def_use_t def_use_chain_for_reg(mba_t& mba, mreg_t reg)
     mop_t synth;
     synth._make_reg(reg, 1);
     return def_use_chain(mba, synth);
+}
+
+bool hexrays_query_use_def(ea_t func_ea,
+                           ea_t at_ea,
+                           const mop_t& op,
+                           bool def_not_use,
+                           mlist_t* out_list,
+                           qstring* err)
+{
+    if (out_list != nullptr)
+        out_list->clear();
+    auto handle = generate(func_ea, MMAT_LVARS);
+    if (!handle.has_value() || handle->mba == nullptr)
+    {
+        if (err != nullptr)
+            *err = "microcode generation failed";
+        return false;
+    }
+    mba_t& mba = *handle->mba;
+    for (int i = 0; i < mba.qty; ++i)
+    {
+        mblock_t* blk = mba.get_mblock(static_cast<uint>(i));
+        if (blk == nullptr)
+            continue;
+        for (minsn_t* ins = blk->head; ins != nullptr; ins = ins->next)
+        {
+            if (ins->ea != at_ea)
+                continue;
+            mlist_t list;
+            if (!mlist_for_operand(*blk, op, def_not_use, MAY_ACCESS, list))
+            {
+                if (err != nullptr)
+                    *err = "operand has no SDK location list";
+                return false;
+            }
+            if (out_list != nullptr)
+                *out_list = list;
+            return true;
+        }
+    }
+    if (err != nullptr)
+        *err = "instruction address not found in function microcode";
+    return false;
 }
 
 bool is_freed_then_used(mba_t& mba, const mop_t& ptr, ea_t& free_ea, ea_t& use_ea)
@@ -1222,6 +1472,657 @@ nlohmann::json def_use_to_json(const def_use_t& du)
     return j;
 }
 
+std::optional<ea_t> parse_required_address_param(const nlohmann::json& params,
+                                                 const char* key,
+                                                 agent_tools::tool_result_t& err)
+{
+    if (!params.contains(key) || !params.at(key).is_string())
+    {
+        err = agent_tools::tool_result_t::error(std::string("Missing address parameter: ") + key, "bad_param");
+        return std::nullopt;
+    }
+    auto ea = agent_tools::helpers::parse_address(params.at(key).get<std::string>());
+    if (!ea.has_value())
+        err = agent_tools::tool_result_t::error(std::string("Invalid address parameter: ") + key, "bad_param");
+    return ea;
+}
+
+int int_param(const nlohmann::json& params, const char* key, int def, int min_v, int max_v)
+{
+    int v = def;
+    if (params.contains(key))
+    {
+        const auto& raw = params.at(key);
+        if (raw.is_number_integer())
+            v = raw.get<int>();
+        else if (raw.is_number_unsigned())
+            v = static_cast<int>(raw.get<uint64_t>());
+        else if (raw.is_number_float())
+            v = static_cast<int>(raw.get<double>());
+        else if (raw.is_string())
+        {
+            char* endp = nullptr;
+            const std::string s = raw.get<std::string>();
+            const char* cstr = s.c_str();
+            long parsed = std::strtol(cstr, &endp, 0);
+            if (endp != nullptr && endp != cstr)
+                v = static_cast<int>(parsed);
+        }
+    }
+    if (v < min_v)
+        v = min_v;
+    if (v > max_v)
+        v = max_v;
+    return v;
+}
+
+int64_t int64_param(const nlohmann::json& params, const char* key, int64_t def)
+{
+    if (!params.contains(key))
+        return def;
+    const auto& raw = params.at(key);
+    if (raw.is_number_integer())
+        return raw.get<int64_t>();
+    if (raw.is_number_unsigned())
+        return static_cast<int64_t>(raw.get<uint64_t>());
+    if (raw.is_number_float())
+        return static_cast<int64_t>(raw.get<double>());
+    if (raw.is_string())
+    {
+        const std::string s = raw.get<std::string>();
+        char* endp = nullptr;
+        const char* cstr = s.c_str();
+        long long parsed = std::strtoll(cstr, &endp, 0);
+        if (endp != nullptr && endp != cstr)
+            return static_cast<int64_t>(parsed);
+    }
+    return def;
+}
+
+std::string string_param(const nlohmann::json& params, const char* key, const std::string& def = {})
+{
+    if (!params.contains(key))
+        return def;
+    const auto& raw = params.at(key);
+    if (raw.is_string())
+        return raw.get<std::string>();
+    if (raw.is_number_integer())
+        return std::to_string(raw.get<int64_t>());
+    if (raw.is_number_unsigned())
+        return std::to_string(raw.get<uint64_t>());
+    return def;
+}
+
+bool resolve_variable_mop(mba_t& mba, const std::string& variable, mop_t& out, nlohmann::json& meta, std::string& err)
+{
+    out.zero();
+    auto colon = variable.find(':');
+    if (colon == std::string::npos)
+    {
+        err = "invalid variable spec";
+        return false;
+    }
+    const std::string kind = ascii_lower(variable.substr(0, colon));
+    const std::string value = variable.substr(colon + 1);
+    meta["kind"] = kind;
+    meta["value"] = value;
+    if (kind == "lvar")
+    {
+        int idx = -1;
+        if (!value.empty())
+        {
+            char* endp = nullptr;
+            long parsed = std::strtol(value.c_str(), &endp, 0);
+            if (endp != nullptr && *endp == '\0' && endp != value.c_str())
+                idx = static_cast<int>(parsed);
+        }
+        if (idx < 0)
+            idx = find_lvar_by_name(mba, value);
+        if (idx < 0 || static_cast<size_t>(idx) >= mba.vars.size())
+        {
+            err = "lvar not found";
+            return false;
+        }
+        out._make_lvar(&mba, idx, 0);
+        out.size = mba.vars[idx].width > 0 ? mba.vars[idx].width : 1;
+        meta["lvar_idx"] = idx;
+        meta["lvar_name"] = std::string(mba.vars[idx].name.c_str());
+        return true;
+    }
+    if (kind == "reg")
+    {
+        mreg_t reg = reg_name_to_mreg(value);
+        if (reg == mr_none)
+        {
+            err = "register not found";
+            return false;
+        }
+        out._make_reg(reg, 1);
+        meta["reg"] = static_cast<int>(reg);
+        return true;
+    }
+    if (kind == "stk")
+    {
+        std::int64_t off = 0;
+        if (!parse_int64(value, off))
+        {
+            err = "invalid stack offset";
+            return false;
+        }
+        out._make_stkvar(&mba, static_cast<sval_t>(off));
+        out.size = 1;
+        meta["stk_off"] = off;
+        return true;
+    }
+    err = "unsupported variable kind";
+    return false;
+}
+
+nlohmann::json path_constraints_to_json(const std::vector<aida::vuln::symbolic::path_constraint_t>& pcs)
+{
+    nlohmann::json arr = nlohmann::json::array();
+    for (const auto& pc : pcs)
+        arr.push_back(aida::vuln::symbolic::to_json(pc));
+    return arr;
+}
+
+agent_tools::tool_result_t handle_mc_path_smtlib(const nlohmann::json& params)
+{
+    agent_tools::tool_result_t err;
+    auto ea_opt = parse_required_address_param(params, "address", err);
+    if (!ea_opt)
+        return err;
+    auto sink_opt = parse_required_address_param(params, "sink_ea", err);
+    if (!sink_opt)
+        return err;
+    const int max_branches = int_param(params, "max_branches", 64, 1, 1024);
+    const std::string maturity = string_param(params, "maturity", "glbopt3");
+
+    aida::vuln::symbolic::SymbolicEngine sym;
+    if (!sym.is_available())
+        return agent_tools::tool_result_t::error(OBFSTR("symbolic engine unavailable"), "microcode_failed");
+    if (!sym.load_function(*ea_opt, parse_maturity(maturity)))
+        return agent_tools::tool_result_t::error(OBFSTR("symbolic load failed: ") + std::string(sym.last_error()), "microcode_failed");
+
+    auto pcs = sym.collect_path_to(*sink_opt, max_branches);
+    nlohmann::json data;
+    data["function_ea"] = ea_to_hex(sym.current_function_ea());
+    data["sink_ea"] = ea_to_hex(*sink_opt);
+    data["maturity"] = maturity_str(parse_maturity(maturity));
+    data["constraints"] = path_constraints_to_json(pcs);
+    data["smt2_formula"] = sym.path_smtlib2(*sink_opt, max_branches);
+    data["constraint_count"] = pcs.size();
+    return agent_tools::tool_result_t::ok(OBFSTR("Microcode path SMT-LIB2 generated"), data);
+}
+
+agent_tools::tool_result_t handle_mc_solve_path(const nlohmann::json& params)
+{
+    agent_tools::tool_result_t err;
+    auto ea_opt = parse_required_address_param(params, "address", err);
+    if (!ea_opt)
+        return err;
+    auto sink_opt = parse_required_address_param(params, "sink_ea", err);
+    if (!sink_opt)
+        return err;
+    const int max_branches = int_param(params, "max_branches", 64, 1, 1024);
+    const int timeout_ms = int_param(params, "timeout_ms", 5000, 100, 60000);
+    const std::string maturity = string_param(params, "maturity", "glbopt3");
+    const std::string extra = string_param(params, "extra_smtlib2_assertions");
+
+    aida::vuln::symbolic::SymbolicEngine sym;
+    if (!sym.is_available())
+        return agent_tools::tool_result_t::error(OBFSTR("symbolic engine unavailable"), "microcode_failed");
+    if (!sym.load_function(*ea_opt, parse_maturity(maturity)))
+        return agent_tools::tool_result_t::error(OBFSTR("symbolic load failed: ") + std::string(sym.last_error()), "microcode_failed");
+
+    auto result = sym.solve_path_to(*sink_opt, extra, static_cast<uint32_t>(timeout_ms), max_branches);
+    nlohmann::json data = aida::vuln::smt::to_json(result);
+    data["function_ea"] = ea_to_hex(sym.current_function_ea());
+    data["sink_ea"] = ea_to_hex(*sink_opt);
+    data["maturity"] = maturity_str(parse_maturity(maturity));
+    std::ostringstream msg;
+    msg << OBFSTR("Microcode path solve: ") << aida::vuln::smt::result_str(result.result)
+        << OBFSTR(" (solve_ms=") << result.solve_ms << OBFSTR(")");
+    return agent_tools::tool_result_t::ok(msg.str(), data);
+}
+
+agent_tools::tool_result_t handle_mc_dataflow_ssa(const nlohmann::json& params)
+{
+    agent_tools::tool_result_t err;
+    auto ea_opt = parse_required_address_param(params, "address", err);
+    if (!ea_opt)
+        return err;
+    const std::string variable = string_param(params, "variable");
+    if (variable.empty())
+        return agent_tools::tool_result_t::error(OBFSTR("variable is required"), "bad_param");
+    const std::string chain_kind = ascii_lower(string_param(params, "chain_kind", "ud"));
+    const gctype_t gctype = parse_gctype(string_param(params, "gctype", "regs_stk"));
+
+    auto handle = generate(*ea_opt, MMAT_LVARS);
+    if (!handle.has_value() || handle->mba == nullptr)
+        return agent_tools::tool_result_t::error(OBFSTR("Failed to generate microcode"), "microcode_failed");
+    mba_t& mba = *handle->mba;
+    mop_t target;
+    nlohmann::json target_meta;
+    std::string var_err;
+    if (!resolve_variable_mop(mba, variable, target, target_meta, var_err))
+        return agent_tools::tool_result_t::error(var_err, "bad_param");
+
+    mbl_graph_t* graph = mba.get_graph();
+    if (graph == nullptr)
+        return agent_tools::tool_result_t::error(OBFSTR("microcode graph unavailable"), "microcode_failed");
+    graph_chains_t* raw = chain_kind == "du" ? graph->get_du(gctype) : graph->get_ud(gctype);
+    if (raw == nullptr)
+        return agent_tools::tool_result_t::error(OBFSTR("use-def chains unavailable"), "microcode_failed");
+    chain_keeper_t keeper(raw);
+
+    nlohmann::json chains = nlohmann::json::array();
+    for (size_t b = 0; b < raw->size(); ++b)
+    {
+        const block_chains_t& block_chains = (*raw)[b];
+        for (auto it = block_chains.begin(); it != block_chains.end(); ++it)
+        {
+            mlist_t chain_list;
+            it->append_list(&mba, &chain_list);
+            mblock_t* blk = mba.get_mblock(static_cast<uint>(b));
+            if (blk == nullptr)
+                continue;
+            mlist_t target_list;
+            if (!mlist_for_operand(*blk, target, false, MAY_ACCESS, target_list))
+                continue;
+            if (!chain_list.has_common(target_list))
+                continue;
+            nlohmann::json cj = chain_to_json(*it);
+            cj["block"] = static_cast<int>(b);
+            chains.push_back(std::move(cj));
+        }
+    }
+
+    nlohmann::json data;
+    data["function_ea"] = ea_to_hex(handle->func_ea);
+    data["chain_kind"] = chain_kind == "du" ? "du" : "ud";
+    data["gctype"] = string_param(params, "gctype", "regs_stk");
+    data["target"] = std::move(target_meta);
+    data["chains"] = std::move(chains);
+    data["chain_count"] = data["chains"].size();
+    return agent_tools::tool_result_t::ok(OBFSTR("Microcode SSA chains retrieved"), data);
+}
+
+agent_tools::tool_result_t handle_mc_find_uses_in_range(const nlohmann::json& params)
+{
+    agent_tools::tool_result_t err;
+    auto ea_opt = parse_required_address_param(params, "address", err);
+    if (!ea_opt)
+        return err;
+    const std::string variable = string_param(params, "variable");
+    if (variable.empty())
+        return agent_tools::tool_result_t::error(OBFSTR("variable is required"), "bad_param");
+    auto from_opt = parse_required_address_param(params, "from_ea", err);
+    if (!from_opt)
+        return err;
+    auto to_opt = parse_required_address_param(params, "to_ea", err);
+    if (!to_opt)
+        return err;
+
+    auto handle = generate(*ea_opt, MMAT_LVARS);
+    if (!handle.has_value() || handle->mba == nullptr)
+        return agent_tools::tool_result_t::error(OBFSTR("Failed to generate microcode"), "microcode_failed");
+    mba_t& mba = *handle->mba;
+    mop_t target;
+    nlohmann::json target_meta;
+    std::string var_err;
+    if (!resolve_variable_mop(mba, variable, target, target_meta, var_err))
+        return agent_tools::tool_result_t::error(var_err, "bad_param");
+
+    const minsn_t* first_use = nullptr;
+    const minsn_t* first_redef = nullptr;
+    for (int i = 0; i < mba.qty; ++i)
+    {
+        mblock_t* blk = mba.get_mblock(static_cast<uint>(i));
+        if (blk == nullptr)
+            continue;
+        minsn_t* from = nullptr;
+        const minsn_t* to = nullptr;
+        for (minsn_t* m = blk->head; m != nullptr; m = m->next)
+        {
+            if (m->ea == *from_opt)
+                from = m;
+            if (m->ea == *to_opt)
+                to = m;
+        }
+        if (from == nullptr)
+            continue;
+        if (to == nullptr)
+            to = blk->tail != nullptr && blk->tail->ea == *to_opt ? blk->tail : nullptr;
+        mlist_t list;
+        if (!mlist_for_operand(*blk, target, false, MAY_ACCESS, list))
+            continue;
+        mop_t roundtrip;
+        roundtrip.zero();
+        const bool roundtrip_ok = roundtrip.create_from_mlist(&mba, list, mba.fullsize);
+        mlist_t use_list = list;
+        first_use = blk->find_first_use(&use_list, from, to, parse_maymust(string_param(params, "maymust", "may")));
+        first_redef = blk->find_redefinition(list, from, to, parse_maymust(string_param(params, "maymust", "may")));
+        target_meta["sdk_mlist"] = mlist_to_string(list);
+        target_meta["roundtrip_ok"] = roundtrip_ok;
+        target_meta["roundtrip_mop"] = roundtrip_ok ? mop_describe(roundtrip) : std::string();
+        break;
+    }
+
+    nlohmann::json data;
+    data["function_ea"] = ea_to_hex(handle->func_ea);
+    data["target"] = std::move(target_meta);
+    data["first_use_ea"] = first_use != nullptr ? ea_to_hex(first_use->ea) : "";
+    data["first_redefinition_ea"] = first_redef != nullptr ? ea_to_hex(first_redef->ea) : "";
+    data["has_use"] = first_use != nullptr;
+    data["has_redefinition"] = first_redef != nullptr;
+    return agent_tools::tool_result_t::ok(OBFSTR("Microcode range use/redefinition query complete"), data);
+}
+
+agent_tools::tool_result_t handle_mc_global_reachability(const nlohmann::json& params)
+{
+    agent_tools::tool_result_t err;
+    auto ea_opt = parse_required_address_param(params, "address", err);
+    if (!ea_opt)
+        return err;
+    const std::string variable = string_param(params, "variable");
+    if (variable.empty())
+        return agent_tools::tool_result_t::error(OBFSTR("variable is required"), "bad_param");
+    const int from_block = int_param(params, "from_block", 0, 0, 1000000);
+    const int to_block = int_param(params, "to_block", -1, -1, 1000000);
+    const bool write = parse_bool_param(params, "write", false);
+
+    auto handle = generate(*ea_opt, MMAT_LVARS);
+    if (!handle.has_value() || handle->mba == nullptr)
+        return agent_tools::tool_result_t::error(OBFSTR("Failed to generate microcode"), "microcode_failed");
+    mba_t& mba = *handle->mba;
+    if (from_block >= mba.qty || (to_block >= 0 && to_block >= mba.qty))
+        return agent_tools::tool_result_t::error(OBFSTR("block index out of range"), "bad_param");
+    mop_t target;
+    nlohmann::json target_meta;
+    std::string var_err;
+    if (!resolve_variable_mop(mba, variable, target, target_meta, var_err))
+        return agent_tools::tool_result_t::error(var_err, "bad_param");
+    mblock_t* blk = mba.get_mblock(static_cast<uint>(from_block));
+    if (blk == nullptr)
+        return agent_tools::tool_result_t::error(OBFSTR("source block unavailable"), "bad_param");
+    mlist_t list;
+    if (!mlist_for_operand(*blk, target, false, MAY_ACCESS, list))
+        return agent_tools::tool_result_t::error(OBFSTR("variable has no SDK location list"), "bad_param");
+
+    mbl_graph_t* graph = mba.get_graph();
+    if (graph == nullptr)
+        return agent_tools::tool_result_t::error(OBFSTR("microcode graph unavailable"), "microcode_failed");
+    bool accessed = write
+        ? graph->is_redefined_globally(list, from_block, to_block, nullptr, nullptr, parse_maymust(string_param(params, "maymust", "may")))
+        : graph->is_used_globally(list, from_block, to_block, nullptr, nullptr, parse_maymust(string_param(params, "maymust", "may")));
+    nlohmann::json data;
+    data["function_ea"] = ea_to_hex(handle->func_ea);
+    data["target"] = std::move(target_meta);
+    data["from_block"] = from_block;
+    data["to_block"] = to_block;
+    data["access_type"] = write ? "write" : "read";
+    data["reachable_access"] = accessed;
+    return agent_tools::tool_result_t::ok(OBFSTR("Microcode global reachability query complete"), data);
+}
+
+agent_tools::tool_result_t handle_mc_recognize_kernel_sinks(const nlohmann::json& params)
+{
+    agent_tools::tool_result_t err;
+    auto ea_opt = parse_required_address_param(params, "address", err);
+    if (!ea_opt)
+        return err;
+    auto handle = generate(*ea_opt, MMAT_LVARS);
+    if (!handle.has_value() || handle->mba == nullptr)
+        return agent_tools::tool_result_t::error(OBFSTR("Failed to generate microcode"), "microcode_failed");
+
+    nlohmann::json calls = nlohmann::json::array();
+    traverse_topinsns(*handle->mba, [&](int block_serial, minsn_t& ins) -> bool {
+        if (!is_mcode_call(ins.opcode))
+            return true;
+        ea_t callee_ea = BADADDR;
+        std::string name;
+        if (!resolve_call_target(ins, callee_ea, name))
+            return true;
+        const std::string lower = ascii_lower(name);
+        std::string role = "unknown";
+        int cwe = 0;
+        int len_arg = -1;
+        int sensitive_arg = -1;
+        int taint_arg = -1;
+        if (sink_name_in(lower, sig::BUFFER_OVERFLOW_SINKS, cwe, len_arg, sensitive_arg) ||
+            sink_name_in(lower, sig::COMMAND_INJECTION_SINKS, cwe, len_arg, sensitive_arg) ||
+            sink_name_in(lower, sig::PATH_TRAVERSAL_SINKS, cwe, len_arg, sensitive_arg) ||
+            sink_name_in(lower, sig::SAFEARRAY_PARSER_SINKS, cwe, len_arg, sensitive_arg) ||
+            sink_name_in(lower, sig::DESERIALIZATION_SINKS, cwe, len_arg, sensitive_arg))
+        {
+            role = "sink";
+        }
+        else if (source_name_in(lower, sig::KERNEL_IRP_SOURCES, taint_arg) ||
+                 source_name_in(lower, sig::NDIS_WSK_SOURCES, taint_arg) ||
+                 source_name_in(lower, sig::INPUT_SOURCES, taint_arg))
+        {
+            role = "source";
+        }
+        else if (helper_name_in(lower, sig::KERNEL_VALIDATORS) ||
+                 helper_name_in(lower, sig::LENGTH_VALIDATOR_HELPERS) ||
+                 helper_name_in(lower, sig::AUTH_GATE_HELPERS))
+        {
+            role = "sanitizer";
+        }
+        if (role == "unknown")
+            return true;
+        nlohmann::json cj;
+        cj["call_ea"] = ea_to_hex(ins.ea);
+        cj["block"] = block_serial;
+        cj["callee_ea"] = callee_ea != BADADDR ? ea_to_hex(callee_ea) : "";
+        cj["callee_name"] = name;
+        cj["role"] = role;
+        cj["primary_cwe"] = cwe;
+        cj["length_arg_index"] = len_arg;
+        cj["sensitive_arg_index"] = sensitive_arg;
+        cj["taint_arg_index"] = taint_arg;
+        cj["does_return"] = callee_ea != BADADDR ? func_does_return(callee_ea) : true;
+        calls.push_back(std::move(cj));
+        return true;
+    });
+
+    nlohmann::json data;
+    data["function_ea"] = ea_to_hex(handle->func_ea);
+    data["calls"] = std::move(calls);
+    data["count"] = data["calls"].size();
+    return agent_tools::tool_result_t::ok(OBFSTR("Microcode kernel source/sink recognition complete"), data);
+}
+
+agent_tools::tool_result_t handle_mc_ioctl_dispatch_summary(const nlohmann::json& params)
+{
+    agent_tools::tool_result_t err;
+    auto ea_opt = parse_required_address_param(params, "address", err);
+    if (!ea_opt)
+        return err;
+    auto handle = generate(*ea_opt, MMAT_LVARS);
+    if (!handle.has_value() || handle->mba == nullptr)
+        return agent_tools::tool_result_t::error(OBFSTR("Failed to generate microcode"), "microcode_failed");
+
+    std::set<uint32_t> codes;
+    traverse_topinsns(*handle->mba, [&](int, minsn_t& ins) -> bool {
+        std::vector<uint64_t> nums;
+        collect_numeric_mops(ins.l, nums);
+        collect_numeric_mops(ins.r, nums);
+        collect_numeric_mops(ins.d, nums);
+        for (uint64_t n : nums)
+        {
+            if (n > 0xFFFFu && n <= 0xFFFFFFFFull)
+                codes.insert(static_cast<uint32_t>(n));
+        }
+        return true;
+    });
+
+    auto method_name = [](uint32_t code) -> const char* {
+        switch (code & 3u)
+        {
+        case 0: return "METHOD_BUFFERED";
+        case 1: return "METHOD_IN_DIRECT";
+        case 2: return "METHOD_OUT_DIRECT";
+        case 3: return "METHOD_NEITHER";
+        }
+        return "UNKNOWN";
+    };
+
+    nlohmann::json arr = nlohmann::json::array();
+    for (uint32_t code : codes)
+    {
+        nlohmann::json cj;
+        char buf[16];
+        ::qsnprintf(buf, sizeof(buf), "0x%08X", code);
+        cj["ioctl"] = std::string(buf);
+        cj["device_type"] = (code >> 16) & 0xFFFFu;
+        cj["function"] = (code >> 2) & 0xFFFu;
+        cj["method"] = code & 3u;
+        cj["method_name"] = method_name(code);
+        cj["access"] = (code >> 14) & 3u;
+        cj["uses_user_pointer"] = (code & 3u) == 3u;
+        arr.push_back(std::move(cj));
+    }
+
+    nlohmann::json data;
+    data["function_ea"] = ea_to_hex(handle->func_ea);
+    data["ioctls"] = std::move(arr);
+    data["count"] = data["ioctls"].size();
+    return agent_tools::tool_result_t::ok(OBFSTR("Microcode IOCTL dispatch summary complete"), data);
+}
+
+agent_tools::tool_result_t handle_mc_set_input_constraint(const nlohmann::json& params)
+{
+    const std::string name = string_param(params, "name");
+    if (name.empty())
+        return agent_tools::tool_result_t::error(OBFSTR("name is required"), "bad_param");
+    nlohmann::json record = params;
+    record["kind"] = "input_constraint";
+    {
+        std::lock_guard<std::mutex> lk(microcode_session_constraints_mutex());
+        microcode_session_constraints()[name] = record;
+    }
+    nlohmann::json data;
+    data["name"] = name;
+    data["constraint"] = std::move(record);
+    return agent_tools::tool_result_t::ok(OBFSTR("Microcode input constraint stored"), data);
+}
+
+agent_tools::tool_result_t handle_mc_assume_attacker_buffer(const nlohmann::json& params)
+{
+    const std::string name = string_param(params, "name", "attacker_buffer");
+    const int argidx = int_param(params, "argidx", 0, 0, 1024);
+    const int size = int_param(params, "size", 256, 1, 1048576);
+    nlohmann::json record = params;
+    record["kind"] = "attacker_buffer";
+    record["argidx"] = argidx;
+    record["size"] = size;
+    {
+        std::lock_guard<std::mutex> lk(microcode_session_constraints_mutex());
+        microcode_session_constraints()[name] = record;
+    }
+    nlohmann::json data;
+    data["name"] = name;
+    data["assumption"] = std::move(record);
+    return agent_tools::tool_result_t::ok(OBFSTR("Microcode attacker buffer assumption stored"), data);
+}
+
+agent_tools::tool_result_t handle_mc_smt_bv_extremum(const nlohmann::json& params)
+{
+    const std::string var = string_param(params, "variable");
+    if (var.empty())
+        return agent_tools::tool_result_t::error(OBFSTR("variable is required"), "bad_param");
+    const int width = int_param(params, "width", 64, 1, 64);
+    const int timeout_ms = int_param(params, "timeout_ms", 5000, 100, 60000);
+    const std::string formula = string_param(params, "formula");
+    const std::string mode = ascii_lower(string_param(params, "mode", "max"));
+
+    aida::vuln::smt::SmtContext local;
+    if (!local.is_available())
+        return agent_tools::tool_result_t::error(OBFSTR("SMT unavailable: ") + std::string(local.last_error()), "smt_unsat");
+    if (!local.declare_bv(var, width))
+        return agent_tools::tool_result_t::error(OBFSTR("SMT declaration failed: ") + std::string(local.last_error()), "bad_param");
+    if (!formula.empty() && !local.assert_smtlib2(formula))
+        return agent_tools::tool_result_t::error(OBFSTR("SMT formula rejected: ") + std::string(local.last_error()), "bad_param");
+    auto value = mode == "min" ? local.min_value_bv(var, width, static_cast<uint32_t>(timeout_ms))
+                               : local.max_value_bv(var, width, static_cast<uint32_t>(timeout_ms));
+    nlohmann::json data;
+    data["variable"] = var;
+    data["width"] = width;
+    data["mode"] = mode == "min" ? "min" : "max";
+    data["satisfiable"] = value.has_value();
+    data["value"] = value.has_value() ? *value : 0;
+    data["smtlib_dump"] = local.to_smtlib2();
+    return agent_tools::tool_result_t::ok(OBFSTR("Bit-vector extremum query complete"), data);
+}
+
+agent_tools::tool_result_t handle_query_value_ranges(const nlohmann::json& params)
+{
+    agent_tools::tool_result_t err;
+    auto ea_opt = parse_required_address_param(params, "ea", err);
+    if (!ea_opt)
+        return err;
+    auto handle = generate(*ea_opt, MMAT_LVARS);
+    if (!handle.has_value() || handle->mba == nullptr)
+        return agent_tools::tool_result_t::error(OBFSTR("Failed to generate microcode"), "microcode_failed");
+    mba_t& mba = *handle->mba;
+    mblock_t* found_blk = nullptr;
+    minsn_t* found_ins = nullptr;
+    for (int i = 0; i < mba.qty && found_ins == nullptr; ++i)
+    {
+        mblock_t* blk = mba.get_mblock(static_cast<uint>(i));
+        if (blk == nullptr)
+            continue;
+        for (minsn_t* m = blk->head; m != nullptr; m = m->next)
+        {
+            if (m->ea == *ea_opt)
+            {
+                found_blk = blk;
+                found_ins = m;
+                break;
+            }
+        }
+    }
+    if (found_blk == nullptr)
+        return agent_tools::tool_result_t::error(OBFSTR("instruction not found in microcode"), "bad_param");
+
+    vivl_t vivl;
+    const int width = int_param(params, "width", 8, 1, 8);
+    const std::string reg = string_param(params, "reg");
+    if (!reg.empty())
+    {
+        mreg_t mr = reg_name_to_mreg(reg);
+        if (mr == mr_none)
+            return agent_tools::tool_result_t::error(OBFSTR("unknown register"), "bad_param");
+        vivl.set_reg(mr, width);
+    }
+    else
+    {
+        const std::int64_t stk = int64_param(params, "stkvar_offset", 0);
+        vivl.set_stkoff(static_cast<sval_t>(stk), width);
+    }
+    const std::string pos = ascii_lower(string_param(params, "position", "exact"));
+    int flags = pos == "end" ? VR_AT_END : VR_AT_START;
+    if (pos == "exact")
+        flags |= VR_EXACT;
+    valrng_t range(width);
+    bool ok = found_blk->get_valranges(&range, vivl, found_ins, flags);
+    qstring text;
+    if (ok)
+        range.print(&text);
+
+    nlohmann::json data;
+    data["function_ea"] = ea_to_hex(handle->func_ea);
+    data["ea"] = ea_to_hex(*ea_opt);
+    data["available"] = ok;
+    data["range"] = ok && !text.empty() ? std::string(text.c_str()) : std::string();
+    data["all_values"] = ok && range.all_values();
+    data["unknown"] = ok && range.is_unknown();
+    data["empty"] = ok && range.empty();
+    return agent_tools::tool_result_t::ok(OBFSTR("Value range query complete"), data);
+}
+
 agent_tools::tool_result_t handle_decompile_with_microcode(const nlohmann::json& params)
 {
     std::optional<ea_t> ea_opt;
@@ -1408,6 +2309,159 @@ void register_tier1_microcode_tools()
              OBFSTR("Variable spec: lvar:NAME or lvar:INDEX or reg:NAME or stk:OFFSET"), true},
         },
         handle_get_microcode_dataflow,
+        true,
+    });
+
+    registry.register_tool({
+        OBFSTR("mc_path_smtlib"),
+        OBFSTR("vuln"),
+        OBFSTR("Collect branch predicates along a real microcode CFG path from function entry to sink_ea and emit SMT-LIB2."),
+        {
+            {OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address or name."), true},
+            {OBFSTR("sink_ea"), OBFSTR("string"), OBFSTR("Target instruction address."), true},
+            {OBFSTR("maturity"), OBFSTR("string"), OBFSTR("Microcode maturity, default glbopt3."), false},
+            {OBFSTR("max_branches"), OBFSTR("number"), OBFSTR("Maximum branch predicates to emit."), false},
+        },
+        handle_mc_path_smtlib,
+        true,
+    });
+
+    registry.register_tool({
+        OBFSTR("mc_solve_path"),
+        OBFSTR("vuln"),
+        OBFSTR("Solve feasibility for a real microcode CFG path from function entry to sink_ea with optional extra SMT-LIB2 assertions."),
+        {
+            {OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address or name."), true},
+            {OBFSTR("sink_ea"), OBFSTR("string"), OBFSTR("Target instruction address."), true},
+            {OBFSTR("maturity"), OBFSTR("string"), OBFSTR("Microcode maturity, default glbopt3."), false},
+            {OBFSTR("extra_smtlib2_assertions"), OBFSTR("string"), OBFSTR("Additional SMT-LIB2 assertions."), false},
+            {OBFSTR("timeout_ms"), OBFSTR("number"), OBFSTR("Solver timeout in milliseconds."), false},
+            {OBFSTR("max_branches"), OBFSTR("number"), OBFSTR("Maximum branch predicates to emit."), false},
+        },
+        handle_mc_solve_path,
+        true,
+    });
+
+    registry.register_tool({
+        OBFSTR("mc_dataflow_ssa"),
+        OBFSTR("vuln"),
+        OBFSTR("Query Hex-Rays microcode use-def or def-use SSA chains for one lvar, register, or stack slot."),
+        {
+            {OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address or name."), true},
+            {OBFSTR("variable"), OBFSTR("string"), OBFSTR("Variable spec lvar:NAME, reg:rax, or stk:OFFSET."), true},
+            {OBFSTR("chain_kind"), OBFSTR("string"), OBFSTR("ud or du."), false},
+            {OBFSTR("gctype"), OBFSTR("string"), OBFSTR("regs_stk, asr, or xdsu."), false},
+        },
+        handle_mc_dataflow_ssa,
+        true,
+    });
+
+    registry.register_tool({
+        OBFSTR("mc_find_uses_in_range"),
+        OBFSTR("vuln"),
+        OBFSTR("Use Hex-Rays microcode location lists to find first use and redefinition of a variable in an instruction range."),
+        {
+            {OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address or name."), true},
+            {OBFSTR("variable"), OBFSTR("string"), OBFSTR("Variable spec lvar:NAME, reg:rax, or stk:OFFSET."), true},
+            {OBFSTR("from_ea"), OBFSTR("string"), OBFSTR("Range start instruction EA."), true},
+            {OBFSTR("to_ea"), OBFSTR("string"), OBFSTR("Range end instruction EA."), true},
+            {OBFSTR("maymust"), OBFSTR("string"), OBFSTR("may or must."), false},
+        },
+        handle_mc_find_uses_in_range,
+        true,
+    });
+
+    registry.register_tool({
+        OBFSTR("mc_global_reachability"),
+        OBFSTR("vuln"),
+        OBFSTR("Ask the Hex-Rays microcode graph whether a variable is read or written globally between blocks."),
+        {
+            {OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address or name."), true},
+            {OBFSTR("variable"), OBFSTR("string"), OBFSTR("Variable spec lvar:NAME, reg:rax, or stk:OFFSET."), true},
+            {OBFSTR("from_block"), OBFSTR("number"), OBFSTR("Source microcode block serial."), false},
+            {OBFSTR("to_block"), OBFSTR("number"), OBFSTR("Destination microcode block serial, -1 for any."), false},
+            {OBFSTR("write"), OBFSTR("boolean"), OBFSTR("Check writes instead of reads."), false},
+            {OBFSTR("maymust"), OBFSTR("string"), OBFSTR("may or must."), false},
+        },
+        handle_mc_global_reachability,
+        true,
+    });
+
+    registry.register_tool({
+        OBFSTR("mc_recognize_kernel_sinks"),
+        OBFSTR("vuln"),
+        OBFSTR("Classify microcode calls as kernel/user-input sources, sinks, or sanitizers using the signature database."),
+        {
+            {OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address or name."), true},
+        },
+        handle_mc_recognize_kernel_sinks,
+        true,
+    });
+
+    registry.register_tool({
+        OBFSTR("mc_ioctl_dispatch_summary"),
+        OBFSTR("vuln"),
+        OBFSTR("Summarize IOCTL constants seen in a dispatcher function and decode method/access fields."),
+        {
+            {OBFSTR("address"), OBFSTR("string"), OBFSTR("Dispatcher function address or name."), true},
+        },
+        handle_mc_ioctl_dispatch_summary,
+        true,
+    });
+
+    registry.register_tool({
+        OBFSTR("mc_set_input_constraint"),
+        OBFSTR("vuln"),
+        OBFSTR("Store a symbolic input constraint in the microcode analysis session."),
+        {
+            {OBFSTR("name"), OBFSTR("string"), OBFSTR("Constraint name."), true},
+            {OBFSTR("width"), OBFSTR("number"), OBFSTR("Bit width."), false},
+            {OBFSTR("unsigned_lt"), OBFSTR("number"), OBFSTR("Unsigned upper bound."), false},
+        },
+        handle_mc_set_input_constraint,
+        false,
+    });
+
+    registry.register_tool({
+        OBFSTR("mc_assume_attacker_buffer"),
+        OBFSTR("vuln"),
+        OBFSTR("Store an attacker-controlled buffer assumption for a function argument in the microcode analysis session."),
+        {
+            {OBFSTR("name"), OBFSTR("string"), OBFSTR("Assumption name."), false},
+            {OBFSTR("argidx"), OBFSTR("number"), OBFSTR("Function argument index."), true},
+            {OBFSTR("size"), OBFSTR("number"), OBFSTR("Symbolic byte length."), false},
+        },
+        handle_mc_assume_attacker_buffer,
+        false,
+    });
+
+    registry.register_tool({
+        OBFSTR("mc_smt_bv_extremum"),
+        OBFSTR("vuln"),
+        OBFSTR("Use Z3 optimize to compute a min or max value for a bit-vector variable under optional SMT-LIB2 constraints."),
+        {
+            {OBFSTR("variable"), OBFSTR("string"), OBFSTR("Bit-vector variable name."), true},
+            {OBFSTR("width"), OBFSTR("number"), OBFSTR("Bit width, 1..64."), true},
+            {OBFSTR("mode"), OBFSTR("string"), OBFSTR("max or min."), false},
+            {OBFSTR("formula"), OBFSTR("string"), OBFSTR("Optional SMT-LIB2 assertions."), false},
+            {OBFSTR("timeout_ms"), OBFSTR("number"), OBFSTR("Optimizer timeout in milliseconds."), false},
+        },
+        handle_mc_smt_bv_extremum,
+        true,
+    });
+
+    registry.register_tool({
+        OBFSTR("query_value_ranges"),
+        OBFSTR("vuln"),
+        OBFSTR("Query Hex-Rays value ranges for a register or stack interval at a microcode instruction."),
+        {
+            {OBFSTR("ea"), OBFSTR("string"), OBFSTR("Instruction address."), true},
+            {OBFSTR("reg"), OBFSTR("string"), OBFSTR("Register name."), false},
+            {OBFSTR("stkvar_offset"), OBFSTR("number"), OBFSTR("Stack offset if no register is provided."), false},
+            {OBFSTR("width"), OBFSTR("number"), OBFSTR("Width in bytes."), false},
+            {OBFSTR("position"), OBFSTR("string"), OBFSTR("start, end, or exact."), false},
+        },
+        handle_query_value_ranges,
         true,
     });
 }

@@ -210,6 +210,9 @@ json session_json(const store::heap_session_t& session)
     out["thread_count"] = session.tids.size();
     out["baseline_count"] = session.baseline.size();
     out["capture_count"] = session.captures.size();
+    out["positive_capture_count"] = session.captures.size();
+    out["snapshot_capture_count"] = session.hw_slot >= 0 && !session.tids.empty() ? 0 : session.captures.size();
+    out["event_capture_count"] = session.hw_slot >= 0 && !session.tids.empty() ? session.captures.size() : 0;
     out["backend"] = session.hw_slot >= 0 && !session.tids.empty() ? "rtlallocateheap_return_debug_event" : "snapshot_diff";
     out["event_capture_active"] = session.hw_slot >= 0 && !session.tids.empty();
     out["snapshot_diff_available"] = true;
@@ -734,6 +737,10 @@ tool_result_t start_session(const json& params)
     result["requested_backend"] = backend;
     result["capture_backend"] = event_started ? "rtlallocateheap_return_debug_event" : "snapshot_diff";
     result["fallback_reason"] = event_started ? json(nullptr) : json(event_error.empty() ? "snapshot_diff backend selected" : event_error);
+    result["stimulus_required"] = !event_started;
+    result["pre_stimulus"] = session.captures.empty();
+    result["functional_snapshot_evidence"] = false;
+    result["functional_event_evidence"] = event_started && !session.captures.empty();
     result["evidence"] = {
         {"rtl_allocate_heap_resolved", session.rtl_allocate_heap != 0},
         {"debug_event_consumer", event_started},
@@ -776,6 +783,8 @@ tool_result_t results_session(const json& params)
     json result = session_json(session);
     result["events"] = std::move(arr);
     result["returned"] = result["events"].size();
+    result["functional_snapshot_evidence"] = (session.hw_slot < 0 || session.tids.empty()) && session.captures.size() > 0;
+    result["functional_event_evidence"] = session.hw_slot >= 0 && !session.tids.empty() && session.captures.size() > 0;
     result["evidence"] = {
         {"backend", result["backend"]},
         {"snapshot_diff_baseline_count", session.baseline.size()},
@@ -806,6 +815,8 @@ tool_result_t stop_session(const json& params)
     session.active = false;
     json result = session_json(session);
     result["stopped"] = true;
+    result["functional_snapshot_evidence"] = (session.hw_slot < 0 || session.tids.empty()) && session.captures.size() > 0;
+    result["functional_event_evidence"] = session.hw_slot >= 0 && !session.tids.empty() && session.captures.size() > 0;
     result["evidence"] = {
         {"breakpoints_cleared", session.hw_slot >= 0},
         {"debug_event_consumer_stopped", session.hw_slot >= 0}

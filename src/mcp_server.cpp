@@ -346,6 +346,97 @@ static bool get_cached_mcp_output_payload(const std::string& id, json& out)
     return true;
 }
 
+// Slice B9 — extern accessor for meta_tools::list_outputs (lives in
+// agent_tools.cpp). The cache itself is a translation-unit-local static so
+// meta_tools cannot reach it directly; this helper exposes the three ops the
+// MCP tool needs (list / stats / evict-by-id / evict-all). Keep the function
+// signatures stable — meta_tools::list_outputs is the only consumer.
+namespace aida_mcp_internal {
+
+struct output_cache_entry_t
+{
+    std::string id;
+    size_t      json_bytes = 0;
+};
+
+struct output_cache_stats_t
+{
+    size_t total_entries = 0;
+    size_t total_bytes   = 0;
+    size_t limit         = 0;
+    size_t text_limit    = 0;
+};
+
+std::vector<output_cache_entry_t> output_cache_list();
+output_cache_stats_t              output_cache_stats();
+bool                              output_cache_evict_one(const std::string& id);
+size_t                            output_cache_evict_all();
+
+} // namespace aida_mcp_internal
+
+std::vector<aida_mcp_internal::output_cache_entry_t>
+aida_mcp_internal::output_cache_list()
+{
+    std::vector<output_cache_entry_t> out;
+    auto& cache = get_mcp_output_cache();
+    std::lock_guard<std::mutex> lock(cache.mtx);
+    out.reserve(cache.order.size());
+    for (const auto& id : cache.order)
+    {
+        auto it = cache.payloads.find(id);
+        if (it == cache.payloads.end())
+            continue;
+        output_cache_entry_t e;
+        e.id = id;
+        try { e.json_bytes = json_dump_safe(it->second).size(); }
+        catch (...) { e.json_bytes = 0; }
+        out.push_back(std::move(e));
+    }
+    return out;
+}
+
+aida_mcp_internal::output_cache_stats_t
+aida_mcp_internal::output_cache_stats()
+{
+    output_cache_stats_t s;
+    auto& cache = get_mcp_output_cache();
+    std::lock_guard<std::mutex> lock(cache.mtx);
+    s.total_entries = cache.order.size();
+    s.limit         = MCP_OUTPUT_CACHE_LIMIT;
+    s.text_limit    = MCP_OUTPUT_TEXT_LIMIT;
+    for (const auto& kv : cache.payloads)
+    {
+        try { s.total_bytes += json_dump_safe(kv.second).size(); }
+        catch (...) {}
+    }
+    return s;
+}
+
+bool aida_mcp_internal::output_cache_evict_one(const std::string& id)
+{
+    auto& cache = get_mcp_output_cache();
+    std::lock_guard<std::mutex> lock(cache.mtx);
+    auto it = cache.payloads.find(id);
+    if (it == cache.payloads.end())
+        return false;
+    cache.payloads.erase(it);
+    for (auto oit = cache.order.begin(); oit != cache.order.end(); ++oit)
+    {
+        if (*oit == id) { cache.order.erase(oit); break; }
+    }
+    return true;
+}
+
+size_t aida_mcp_internal::output_cache_evict_all()
+{
+    auto& cache = get_mcp_output_cache();
+    std::lock_guard<std::mutex> lock(cache.mtx);
+    size_t n = cache.payloads.size();
+    cache.payloads.clear();
+    cache.order.clear();
+    return n;
+}
+
 static json make_mcp_structured_content(const json& data)
 {
     if (data.is_null() || data.empty())
@@ -806,9 +897,276 @@ static const std::vector<mcp_prompt_def_t>& get_prompt_definitions()
     return defs;
 }
 
+// SSE session — hoisted earlier so progress emission can reuse it. The
+// definition and format_sse_event helper used to live ~line 2060; moved here
+// to keep mcp_emit_progress's transitive dependencies in source order.
+struct sse_session_t
+{
+    std::string id;
+    std::mutex mtx;
+    std::condition_variable cv;
+    std::queue<std::string> events;
+    std::atomic<bool> closed{false};
+
+    void push_event(const std::string& event)
+    {
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            events.push(event);
+        }
+        cv.notify_one();
+    }
+
+    bool wait_event(std::string& out, int timeout_ms)
+    {
+        std::unique_lock<std::mutex> lk(mtx);
+        if (cv.wait_for(lk, std::chrono::milliseconds(timeout_ms),
+            [this] { return !events.empty() || closed.load(std::memory_order_relaxed); }))
+        {
+            if (closed.load(std::memory_order_relaxed))
+                return false;
+            if (!events.empty())
+            {
+                out = std::move(events.front());
+                events.pop();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void close()
+    {
+        closed.store(true, std::memory_order_relaxed);
+        cv.notify_all();
+    }
+};
+
+static std::string format_sse_event(const std::string& event_type, const std::string& data)
+{
+    std::string result;
+    if (!event_type.empty())
+        result += "event: " + event_type + "\n";
+
+    std::istringstream iss(data);
+    std::string line;
+    while (std::getline(iss, line))
+        result += "data: " + line + "\n";
+
+    result += "\n";
+    return result;
+}
+
+// ----------------------------------------------------------------------------
+// Slice B15 — Deterministic tool LRU result cache.
+// SHA256(tool_name + json::dump(args)) → tool_result_t. Up to 64 entries,
+// 5-minute TTL. Used to short-circuit repeated reads when the tool is
+// registered with deterministic=true. The cache is *globally flushed* on any
+// destructive tool call so we never return stale data from before a mutation.
+// ----------------------------------------------------------------------------
+struct mcp_dedup_entry_t
+{
+    agent_tools::tool_result_t result;
+    std::chrono::steady_clock::time_point inserted_at;
+};
+
+struct mcp_dedup_cache_t
+{
+    std::mutex mtx;
+    std::deque<std::string> order;
+    std::map<std::string, mcp_dedup_entry_t> entries;
+};
+
+static constexpr size_t MCP_DEDUP_CACHE_LIMIT = 64;
+static constexpr std::chrono::seconds MCP_DEDUP_TTL{300};
+
+static mcp_dedup_cache_t& get_mcp_dedup_cache()
+{
+    static mcp_dedup_cache_t c;
+    return c;
+}
+
+// SHA256 helper backed by bcrypt (already linked).
+static std::string sha256_hex(const std::string& input)
+{
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    unsigned char digest[32] = {};
+    std::string out;
+
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0)
+        return out;
+    if (BCryptCreateHash(alg, &hash, nullptr, 0, nullptr, 0, 0) != 0)
+    {
+        BCryptCloseAlgorithmProvider(alg, 0);
+        return out;
+    }
+    if (BCryptHashData(hash, (PUCHAR)input.data(), (ULONG)input.size(), 0) != 0)
+    {
+        BCryptDestroyHash(hash);
+        BCryptCloseAlgorithmProvider(alg, 0);
+        return out;
+    }
+    if (BCryptFinishHash(hash, digest, sizeof(digest), 0) != 0)
+    {
+        BCryptDestroyHash(hash);
+        BCryptCloseAlgorithmProvider(alg, 0);
+        return out;
+    }
+    BCryptDestroyHash(hash);
+    BCryptCloseAlgorithmProvider(alg, 0);
+
+    static const char hex[] = "0123456789abcdef";
+    out.reserve(64);
+    for (unsigned char b : digest)
+    {
+        out.push_back(hex[b >> 4]);
+        out.push_back(hex[b & 0x0f]);
+    }
+    return out;
+}
+
+static std::string make_dedup_key(const std::string& tool, const json& args)
+{
+    std::string compact = tool + "|" + json_dump_safe(args);
+    return sha256_hex(compact);
+}
+
+static bool dedup_lookup(const std::string& key, agent_tools::tool_result_t& out)
+{
+    auto& c = get_mcp_dedup_cache();
+    std::lock_guard<std::mutex> lk(c.mtx);
+    auto it = c.entries.find(key);
+    if (it == c.entries.end())
+        return false;
+    auto age = std::chrono::steady_clock::now() - it->second.inserted_at;
+    if (age > MCP_DEDUP_TTL)
+    {
+        c.entries.erase(it);
+        // Lazily evict from order on next insert.
+        return false;
+    }
+    out = it->second.result;
+    return true;
+}
+
+static void dedup_store(const std::string& key, const agent_tools::tool_result_t& res)
+{
+    auto& c = get_mcp_dedup_cache();
+    std::lock_guard<std::mutex> lk(c.mtx);
+    auto& e = c.entries[key];
+    e.result = res;
+    e.inserted_at = std::chrono::steady_clock::now();
+    c.order.push_back(key);
+    while (c.order.size() > MCP_DEDUP_CACHE_LIMIT)
+    {
+        const std::string& victim = c.order.front();
+        c.entries.erase(victim);
+        c.order.pop_front();
+    }
+}
+
+static void dedup_flush_all()
+{
+    auto& c = get_mcp_dedup_cache();
+    std::lock_guard<std::mutex> lk(c.mtx);
+    c.entries.clear();
+    c.order.clear();
+}
+
+static bool is_destructive_tool_legacy(const std::string& name);
+
+// ----------------------------------------------------------------------------
+// Slice B13 — Progress SSE notifications.
+// The active SSE sessions map is keyed by session id. mcp_emit_progress
+// broadcasts a notifications/progress JSON-RPC envelope to every live SSE
+// peer. POST /mcp clients do not have a session attached; for them this is a
+// silent no-op (the response body is the only delivery channel).
+// ----------------------------------------------------------------------------
+struct mcp_progress_broadcast_t
+{
+    std::mutex mtx;
+    // Pointers borrowed from the server thread's local sse_sessions map.
+    std::vector<std::shared_ptr<sse_session_t>> active;
+};
+
+static mcp_progress_broadcast_t& get_progress_broadcast()
+{
+    static mcp_progress_broadcast_t b;
+    return b;
+}
+
+static void progress_register_session(const std::shared_ptr<sse_session_t>& s)
+{
+    auto& b = get_progress_broadcast();
+    std::lock_guard<std::mutex> lk(b.mtx);
+    b.active.push_back(s);
+}
+
+static void progress_unregister_session(const std::shared_ptr<sse_session_t>& s)
+{
+    auto& b = get_progress_broadcast();
+    std::lock_guard<std::mutex> lk(b.mtx);
+    for (auto it = b.active.begin(); it != b.active.end(); )
+    {
+        if (it->get() == s.get())
+            it = b.active.erase(it);
+        else
+            ++it;
+    }
+}
+
+static void mcp_emit_progress(const std::string& tool,
+                              const std::string& stage,
+                              double fraction)
+{
+    json msg_obj;
+    msg_obj["jsonrpc"] = "2.0";
+    msg_obj["method"]  = "notifications/progress";
+    json p;
+    p["tool"]     = tool;
+    p["stage"]    = stage;
+    if (fraction >= 0.0 && fraction <= 1.0)
+        p["progress"] = fraction;
+    p["timestamp_ms"] = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    msg_obj["params"] = p;
+
+    std::string body = json_dump_safe(msg_obj);
+    std::string event = format_sse_event("message", body);
+
+    auto& b = get_progress_broadcast();
+    std::vector<std::shared_ptr<sse_session_t>> snapshot;
+    {
+        std::lock_guard<std::mutex> lk(b.mtx);
+        snapshot = b.active;
+    }
+    for (auto& s : snapshot)
+    {
+        if (s && !s->closed.load(std::memory_order_relaxed))
+            s->push_event(event);
+    }
+}
+
+// Lightweight wrappers for heavy tools. Currently progress_update is the
+// primary call site; begin/end are convenience markers.
+static inline void progress_begin(const std::string& tool, const std::string& stage = "begin")
+{
+    mcp_emit_progress(tool, stage, 0.0);
+}
+static inline void progress_update(const std::string& tool, const std::string& stage, double fraction)
+{
+    mcp_emit_progress(tool, stage, fraction);
+}
+static inline void progress_end(const std::string& tool, const std::string& stage = "end")
+{
+    mcp_emit_progress(tool, stage, 1.0);
+}
+
 static agent_tools::tool_result_t execute_tool_in_main_thread(
     const std::string& name,
-    const json& params)
+    const json& params,
+    const std::atomic<bool>* cancel_flag /* Slice B14 */)
 {
     if (ida_utils::is_self_target_database())
         return agent_tools::tool_result_t::error("Operation blocked.");
@@ -816,6 +1174,29 @@ static agent_tools::tool_result_t execute_tool_in_main_thread(
     const auto* tool_def = agent_tools::ToolRegistry::instance().get_tool(name);
     if (!tool_def)
         return agent_tools::tool_result_t::error("Unknown tool: " + name);
+
+    // Slice B14 — bail before scheduling on the main thread if the caller has
+    // already cancelled (HTTP disconnect). Avoids tying up the IDA thread.
+    if (cancel_flag && cancel_flag->load(std::memory_order_relaxed))
+    {
+        agent_tools::tool_result_t r;
+        r.success = false;
+        r.output = "Cancelled by client";
+        r.error_code = "timeout";
+        return r;
+    }
+
+    // Slice B15 — deterministic-cache short-circuit. Only applies when the tool
+    // self-declares deterministic and the destructive flag is clear.
+    std::string dedup_key;
+    const bool dedup_eligible = tool_def->deterministic && !tool_def->destructive;
+    if (dedup_eligible)
+    {
+        dedup_key = make_dedup_key(name, params);
+        agent_tools::tool_result_t cached;
+        if (!dedup_key.empty() && dedup_lookup(dedup_key, cached))
+            return cached;
+    }
 
     mcp_tool_exec_request_t req;
     req.tool_name = name;
@@ -839,7 +1220,206 @@ static agent_tools::tool_result_t execute_tool_in_main_thread(
         static_cast<unsigned long long>(req.exec_ms),
         static_cast<unsigned long long>(queue_wait_ms));
 
+    // Slice B15 — destructive tools flush the entire dedup cache so any
+    // subsequent deterministic read reflects post-mutation state.
+    if (tool_def->destructive || is_destructive_tool_legacy(name))
+        dedup_flush_all();
+    else if (dedup_eligible && req.result.success && !dedup_key.empty())
+        dedup_store(dedup_key, req.result);
+
     return req.result;
+}
+
+// Backward-compatible overload — existing call sites pass nullptr cancel flag.
+static inline agent_tools::tool_result_t execute_tool_in_main_thread(
+    const std::string& name,
+    const json& params)
+{
+    return execute_tool_in_main_thread(name, params, nullptr);
+}
+
+// ----------------------------------------------------------------------------
+// Slice B2 — internal parallel batch helper.
+// Spawns qthread workers, each of which acquires its own MFF_READ execute_sync
+// slice. A semaphore acts as a completion barrier. user_cancelled() and a wall
+// clock guard control early exit. ALL sub-calls MUST be read-only: the caller
+// is required to enforce this. Mixed-mode batches must use the serial path.
+// ----------------------------------------------------------------------------
+struct mcp_batch_worker_arg_t
+{
+    std::string tool_name;
+    json args;
+    std::string label;
+    agent_tools::tool_result_t result;
+    qsemaphore_t done_sem = nullptr;
+    std::atomic<bool>* cancel = nullptr;
+    std::atomic<int>* finished_counter = nullptr;
+};
+
+static int idaapi mcp_batch_worker_thread(void* user_data)
+{
+    auto* arg = static_cast<mcp_batch_worker_arg_t*>(user_data);
+    try
+    {
+        if (!arg->cancel || !arg->cancel->load(std::memory_order_relaxed))
+        {
+            // Each parallel worker uses a *separate* execute_sync slice — that
+            // is safe because every sub-call is read-only (verified by caller).
+            arg->result = execute_tool_in_main_thread(arg->tool_name, arg->args, arg->cancel);
+        }
+        else
+        {
+            arg->result.success = false;
+            arg->result.output = "Cancelled before dispatch";
+            arg->result.error_code = "timeout";
+        }
+    }
+    catch (const std::exception& e)
+    {
+        arg->result.success = false;
+        arg->result.output = std::string("worker exception: ") + e.what();
+        arg->result.error_code = "unknown";
+    }
+    catch (...)
+    {
+        arg->result.success = false;
+        arg->result.output = "worker crashed";
+        arg->result.error_code = "unknown";
+    }
+
+    if (arg->finished_counter)
+        arg->finished_counter->fetch_add(1, std::memory_order_release);
+    if (arg->done_sem)
+        qsem_post(arg->done_sem);
+    return 0;
+}
+
+namespace aida_mcp_internal {
+
+struct parallel_batch_outcome_t
+{
+    std::vector<agent_tools::tool_result_t> results;
+    std::vector<std::string> labels;
+    size_t partial_count = 0;
+    uint64_t total_ms = 0;
+    bool cancelled = false;
+    bool timed_out = false;
+};
+
+// Externally linkable helper used by meta_tools::tool_batch_call (in
+// agent_tools.cpp). Not declared in agent_tools.hpp because the parameters
+// reference internal MCP types.
+parallel_batch_outcome_t run_batch_parallel(
+    const std::vector<std::pair<std::string, json>>& calls,
+    const std::vector<std::string>& labels,
+    bool stop_on_error,
+    int max_wall_seconds);
+
+} // namespace aida_mcp_internal
+
+using mcp_parallel_batch_outcome_t = aida_mcp_internal::parallel_batch_outcome_t;
+
+aida_mcp_internal::parallel_batch_outcome_t aida_mcp_internal::run_batch_parallel(
+    const std::vector<std::pair<std::string, json>>& calls,
+    const std::vector<std::string>& labels,
+    bool stop_on_error,
+    int max_wall_seconds)
+{
+    mcp_parallel_batch_outcome_t outcome;
+    outcome.results.resize(calls.size());
+    outcome.labels = labels;
+    if (calls.empty())
+        return outcome;
+
+    auto t0 = std::chrono::steady_clock::now();
+    std::atomic<bool> cancel{false};
+    std::atomic<int> finished{0};
+
+    qsemaphore_t sem = qsem_create(nullptr, 0);
+    std::vector<mcp_batch_worker_arg_t> args(calls.size());
+    std::vector<qthread_t> threads(calls.size(), nullptr);
+
+    show_wait_box("AiDA MCP: tool_batch_call parallel (%zu)...", calls.size());
+
+    for (size_t i = 0; i < calls.size(); ++i)
+    {
+        args[i].tool_name = calls[i].first;
+        args[i].args      = calls[i].second;
+        args[i].label     = (i < labels.size()) ? labels[i] : std::string();
+        args[i].done_sem  = sem;
+        args[i].cancel    = &cancel;
+        args[i].finished_counter = &finished;
+        threads[i] = qthread_create(mcp_batch_worker_thread, &args[i]);
+        if (!threads[i])
+        {
+            // Could not spawn — run inline so result is populated.
+            mcp_batch_worker_thread(&args[i]);
+        }
+    }
+
+    const int total = (int)calls.size();
+    const auto deadline = (max_wall_seconds > 0)
+        ? t0 + std::chrono::seconds(max_wall_seconds)
+        : std::chrono::steady_clock::time_point::max();
+
+    while (finished.load(std::memory_order_acquire) < total)
+    {
+        if (user_cancelled())
+        {
+            cancel.store(true, std::memory_order_release);
+            outcome.cancelled = true;
+            break;
+        }
+        if (std::chrono::steady_clock::now() >= deadline)
+        {
+            cancel.store(true, std::memory_order_release);
+            outcome.timed_out = true;
+            break;
+        }
+        // Wait up to 100 ms for a completion to avoid busy-spin.
+        qsem_wait(sem, 100);
+
+        if (stop_on_error)
+        {
+            // Bail out early if any completed worker failed.
+            int f = finished.load(std::memory_order_acquire);
+            for (int i = 0; i < f; ++i)
+            {
+                if (!args[i].result.success && !args[i].result.output.empty())
+                {
+                    cancel.store(true, std::memory_order_release);
+                    break;
+                }
+            }
+        }
+    }
+
+    for (size_t i = 0; i < threads.size(); ++i)
+    {
+        if (threads[i])
+            qthread_join(threads[i]);
+    }
+    if (sem)
+        qsem_free(sem);
+
+    hide_wait_box();
+
+    for (size_t i = 0; i < args.size(); ++i)
+    {
+        if (finished.load() <= (int)i && (outcome.cancelled || outcome.timed_out))
+        {
+            // Slot was never filled by its worker.
+            args[i].result.success = false;
+            args[i].result.output = outcome.timed_out ? "timed out" : "cancelled";
+            args[i].result.error_code = "timeout";
+            outcome.partial_count++;
+        }
+        outcome.results[i] = std::move(args[i].result);
+    }
+
+    outcome.total_ms = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    return outcome;
 }
 
 static json record_to_public_json(const ida_instance_record_t& r);
@@ -982,7 +1562,11 @@ static std::string compact_tool_text(const std::string& text, std::size_t max_le
     return compact;
 }
 
-static bool is_destructive_tool(const std::string& name)
+// Legacy migration fallback list — kept for one release cycle so we can detect
+// drift between the old hard-coded list and the new tool_definition_t::destructive
+// flag. Both is_destructive_tool_legacy() and the new flag are consulted by
+// reconcile_destructive(); a startup audit logs warnings when they disagree.
+static bool is_destructive_tool_legacy(const std::string& name)
 {
     return name == "delete_function"
         || name == "delete_stack_var"
@@ -1009,13 +1593,65 @@ static bool is_destructive_tool(const std::string& name)
         || name == "py_exec_file";
 }
 
+// Slice B12 — data-driven destructive/idempotent classification. Prefers the
+// per-tool `destructive` / `deterministic` fields registered by Slice A; falls
+// back to the legacy string list when a tool registration predates the flag
+// (which still happens during the migration window).
+static bool is_destructive_tool(const std::string& name)
+{
+    const auto* tool = agent_tools::ToolRegistry::instance().get_tool(name);
+    if (tool)
+    {
+        // Read the flag first. The flag default is `false`, which collides with
+        // legacy destructive tools that haven't yet been migrated; if the flag
+        // is unset we fall through to the legacy list.
+        if (tool->destructive)
+            return true;
+    }
+    return is_destructive_tool_legacy(name);
+}
+
 static bool is_idempotent_tool(const std::string& name, bool read_only)
 {
+    const auto* tool = agent_tools::ToolRegistry::instance().get_tool(name);
+    if (tool)
+    {
+        // `deterministic` defaults to true. When the registration explicitly
+        // sets it false we trust that. Otherwise apply the legacy fallback.
+        if (!tool->deterministic)
+            return false;
+    }
     if (read_only)
         return true;
     if (name == "execute_python" || name == "py_eval" || name == "py_exec_file" || name == "write_memory")
         return false;
-    return !is_destructive_tool(name);
+    return !is_destructive_tool_legacy(name);
+}
+
+// Logs disagreements between the legacy destructive list and the new flag.
+// Invoked once at server start; safe to call without a registered tool table.
+static void audit_destructive_flag_drift()
+{
+    auto names = agent_tools::ToolRegistry::instance().get_tool_names();
+    size_t warned = 0;
+    for (const auto& n : names)
+    {
+        const auto* tool = agent_tools::ToolRegistry::instance().get_tool(n);
+        if (!tool)
+            continue;
+        bool legacy = is_destructive_tool_legacy(n);
+        bool flag   = tool->destructive;
+        if (legacy != flag)
+        {
+            msg(OBFSTR_C("AiDA MCP: destructive flag drift for tool=%s legacy=%d flag=%d\n"),
+                n.c_str(), int(legacy), int(flag));
+            if (++warned > 32)
+            {
+                msg(OBFSTR_C("AiDA MCP: ... further drift warnings suppressed\n"));
+                break;
+            }
+        }
+    }
 }
 
 static bool is_mcp_exposed_tool(const agent_tools::tool_definition_t* tool)
@@ -1174,10 +1810,18 @@ static json build_mcp_tools_list()
         t[OBFSTR_C("name")]        = tool->name;
         t[OBFSTR_C("description")] = compact_tool_text(tool->description, 320);
         t[OBFSTR_C("inputSchema")] = input_schema;
-        t["outputSchema"] = json::object({
-            {OBFSTR_C("type"), "object"},
-            {"additionalProperties", true}
-        });
+        if (!tool->output_schema.is_null() && !tool->output_schema.empty())
+        {
+            t["outputSchema"] = tool->output_schema;
+        }
+        else
+        {
+            t["outputSchema"] = json::object({
+                {OBFSTR_C("type"), "object"},
+                {"additionalProperties", true}
+            });
+        }
+        t["requiredIndices"] = tool->required_indices;
         t["annotations"] = annotations;
         tools.push_back(t);
     }
@@ -1758,63 +2402,6 @@ static std::string handle_mcp_body(const std::string& body)
     return json_dump_safe(response);
 }
 
-struct sse_session_t
-{
-    std::string id;
-    std::mutex mtx;
-    std::condition_variable cv;
-    std::queue<std::string> events;
-    std::atomic<bool> closed{false};
-
-    void push_event(const std::string& event)
-    {
-        {
-            std::lock_guard<std::mutex> lk(mtx);
-            events.push(event);
-        }
-        cv.notify_one();
-    }
-
-    bool wait_event(std::string& out, int timeout_ms)
-    {
-        std::unique_lock<std::mutex> lk(mtx);
-        if (cv.wait_for(lk, std::chrono::milliseconds(timeout_ms),
-            [this] { return !events.empty() || closed.load(std::memory_order_relaxed); }))
-        {
-            if (closed.load(std::memory_order_relaxed))
-                return false;
-            if (!events.empty())
-            {
-                out = std::move(events.front());
-                events.pop();
-                return true;
-            }
-        }
-        return false;
-    }
-
-    void close()
-    {
-        closed.store(true, std::memory_order_relaxed);
-        cv.notify_all();
-    }
-};
-
-static std::string format_sse_event(const std::string& event_type, const std::string& data)
-{
-    std::string result;
-    if (!event_type.empty())
-        result += "event: " + event_type + "\n";
-
-    std::istringstream iss(data);
-    std::string line;
-    while (std::getline(iss, line))
-        result += "data: " + line + "\n";
-
-    result += "\n";
-    return result;
-}
-
 static std::once_flag g_aggregator_tools_registered;
 
 static json record_to_public_json(const ida_instance_record_t& r)
@@ -2132,6 +2719,10 @@ bool mcp_server_t::start(int port)
     }
 
     register_aggregator_tools_once();
+
+    // Slice B12 — log any disagreement between the legacy destructive list and
+    // the new tool_definition_t::destructive flag. Runs once per start().
+    audit_destructive_flag_drift();
 
     _stop_requested = false;
     _bind_failed = false;
@@ -2488,6 +3079,9 @@ void mcp_server_t::server_thread_func(int port)
             std::lock_guard<std::mutex> lk(sse_mtx);
             sse_sessions[session->id] = session;
         }
+        // Slice B13 — also register with the progress broadcaster so
+        // mcp_emit_progress reaches this peer.
+        progress_register_session(session);
 
         res.set_header("Cache-Control", "no-cache");
         res.set_header("Connection", "keep-alive");
@@ -2539,6 +3133,7 @@ void mcp_server_t::server_thread_func(int port)
             },
             [session, &sse_sessions, &sse_mtx](bool ) {
                 session->close();
+                progress_unregister_session(session);
                 std::lock_guard<std::mutex> lk(sse_mtx);
                 sse_sessions.erase(session->id);
             }

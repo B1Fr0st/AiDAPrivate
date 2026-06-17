@@ -101,7 +101,7 @@ const char* kHookPresets[] = {
 };
 constexpr int kHookPresetCount = static_cast<int>(sizeof(kHookPresets) / sizeof(kHookPresets[0]));
 
-const char* kOsPresets[] = { "auto", "windows", "linux", "macos" };
+const char* kOsPresets[] = { "windows" };
 constexpr int kOsPresetCount = static_cast<int>(sizeof(kOsPresets) / sizeof(kOsPresets[0]));
 
 const char* kLocalePresets[] = { "auto", "en-US", "en-GB", "de-DE", "fr-FR", "es-ES", "ja-JP", "zh-CN" };
@@ -1254,7 +1254,7 @@ void render_advanced_section(const aida::ui::theme_t& th, float alpha)
 
     ImGui::SetNextItemWidth(140.f);
     const char* os_cur = (g_state.selected_os >= 0 && g_state.selected_os < kOsPresetCount)
-                            ? kOsPresets[g_state.selected_os] : "auto";
+                            ? kOsPresets[g_state.selected_os] : "windows";
     if (ImGui::BeginCombo("##headless_os", os_cur)) {
         for (int i = 0; i < kOsPresetCount; ++i) {
             bool sel = (i == g_state.selected_os);

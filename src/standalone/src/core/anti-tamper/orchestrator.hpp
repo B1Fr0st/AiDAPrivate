@@ -533,6 +533,78 @@ inline bool ai_tool_posture_unconfirmed_core_system_foreign_handle(const standal
     return true;
 }
 
+inline bool ai_tool_posture_trusted_system_handle_kernel_clean(
+    const standalone_anti_ai::combined::threat_report_t& report,
+    const char* log_tag,
+    const char* phase_name)
+{
+    using namespace standalone_anti_ai;
+    constexpr uint32_t foreign_mutating_mask =
+        category_foreign_write_handle |
+        category_foreign_vm_operation |
+        category_foreign_create_thread;
+    constexpr uint32_t allowed_correlated_mask =
+        category_mcp_pipe |
+        category_mcp_process |
+        category_mcp_port |
+        category_mcp_command_server |
+        category_local_llm |
+        category_ai_coding_tool |
+        category_clipboard_monitor |
+        foreign_mutating_mask;
+    if ((report.high_risk_mask & foreign_mutating_mask) == 0)
+        return false;
+    if ((report.high_risk_mask & ~allowed_correlated_mask) != 0)
+        return false;
+    if (!report.handle_to_us_detected || report.observed_handle_count != 1)
+        return false;
+    if (!report.first_handle_owner_query_ok || !report.first_handle_owner_trusted_system_process)
+        return false;
+    if (report.first_handle_owner_tool || report.first_handle_owner_targets_aida ||
+        report.handle_owner_tool || report.tool_targets_aida)
+        return false;
+
+    const bool kernel_ready =
+        driver_bridge::is_loaded() &&
+        driver_bridge::using_kernel_driver() &&
+        driver_bridge::dynamic_ioctls_ready();
+    driver_bridge::anti_debug_result_t query{};
+    bool query_ok = false;
+    uint64_t scan_pid = 0;
+    bool scan_ok = false;
+    bool kernel_confirmed = false;
+    if (kernel_ready)
+    {
+        query_ok = driver_bridge::kernel_anti_debug_query(query);
+        scan_ok = driver_bridge::kernel_anti_debug_scan_debuggers(&scan_pid);
+        kernel_confirmed =
+            query_ok &&
+            (kernel_adbg_hard_flags_present(query.result_flags) || query.detected_debugger_pid != 0);
+    }
+    const bool kernel_clean = kernel_ready && query_ok && scan_ok && !kernel_confirmed && scan_pid == 0;
+    webhook::write_log_critical_fmt(log_tag,
+        "ai_tool_posture_trusted_system_handle_kernel_eval phase=%s suppress=%d kernel_ready=%d query_ok=%d query_flags=0x%08X query_pid=%llu scan_ok=%d scan_pid=%llu handle_any=%d observed_handles=%u first_owner_pid=%lu first_owner_image=%s first_owner_path=%s first_access=0x%08lX first_owner_hash=0x%016llX first_trusted_system=%d high_risk_mask=0x%08X summary_hash=0x%016llX",
+        phase_name,
+        kernel_clean ? 1 : 0,
+        kernel_ready ? 1 : 0,
+        query_ok ? 1 : 0,
+        query.result_flags,
+        static_cast<unsigned long long>(query.detected_debugger_pid),
+        scan_ok ? 1 : 0,
+        static_cast<unsigned long long>(scan_pid),
+        report.handle_to_us_detected ? 1 : 0,
+        report.observed_handle_count,
+        static_cast<unsigned long>(report.first_handle_owner_pid),
+        report.first_handle_owner_image.empty() ? "<empty>" : report.first_handle_owner_image.c_str(),
+        report.first_handle_owner_path.empty() ? "<empty>" : report.first_handle_owner_path.c_str(),
+        static_cast<unsigned long>(report.first_handle_access_mask),
+        static_cast<unsigned long long>(report.first_handle_owner_hash),
+        report.first_handle_owner_trusted_system_process ? 1 : 0,
+        report.high_risk_mask,
+        static_cast<unsigned long long>(report.summary_hash));
+    return kernel_clean;
+}
+
 inline bool ai_tool_posture_full_test_tail_active(uint64_t* expired_ms = nullptr, uint64_t* tail_remaining_ms = nullptr)
 {
     constexpr uint64_t kTailMs = 30ULL * 60ULL * 1000ULL;
@@ -627,15 +699,6 @@ inline bool enforce_ai_tool_posture(const char* phase, bool runtime)
     auto& rt = state::get();
     const char* phase_name = phase ? phase : "unknown";
     const char* log_tag = runtime ? "guard" : "init";
-    static std::atomic<uint64_t> s_last_runtime_scan_ms{0};
-    if (runtime)
-    {
-        uint64_t now_ms = static_cast<uint64_t>(GetTickCount64());
-        uint64_t last_ms = s_last_runtime_scan_ms.load(std::memory_order_relaxed);
-        if (last_ms != 0 && now_ms - last_ms < 5000ULL)
-            return true;
-        s_last_runtime_scan_ms.store(now_ms, std::memory_order_relaxed);
-    }
     uint64_t pre_post_full_test_ms = 0;
     uint64_t pre_post_full_test_expired_ms = 0;
     uint64_t pre_post_full_test_tail_ms = 0;
@@ -658,9 +721,12 @@ inline bool enforce_ai_tool_posture(const char* phase, bool runtime)
         pre_post_full_test_tail ? 1 : 0,
         static_cast<unsigned long long>(pre_post_full_test_expired_ms),
         static_cast<unsigned long long>(pre_post_full_test_tail_ms));
-    auto report = standalone_anti_ai::full_scan();
+    standalone_anti_ai::runtime_scan_result_t runtime_scan{};
+    auto report = runtime
+        ? (runtime_scan = standalone_anti_ai::full_scan_runtime_cached(15000ULL, "orchestrator")).report
+        : standalone_anti_ai::full_scan();
     webhook::write_log_critical_fmt(log_tag,
-        "ai_tool_posture_scan_post phase=%s category_mask=0x%08X high_risk_mask=0x%08X high_risk_count=%u evidence_count=%u evidence_hash=0x%016llX summary_hash=0x%016llX elapsed_ms=%llu summary=%s",
+        "ai_tool_posture_scan_post phase=%s category_mask=0x%08X high_risk_mask=0x%08X high_risk_count=%u evidence_count=%u evidence_hash=0x%016llX summary_hash=0x%016llX elapsed_ms=%llu cached=%d cache_age_ms=%llu wait_ms=%llu summary=%s",
         phase_name,
         report.category_mask,
         report.high_risk_mask,
@@ -669,6 +735,9 @@ inline bool enforce_ai_tool_posture(const char* phase, bool runtime)
         static_cast<unsigned long long>(report.evidence_hash),
         static_cast<unsigned long long>(report.summary_hash),
         static_cast<unsigned long long>(GetTickCount64() - scan_tick),
+        runtime_scan.cached ? 1 : 0,
+        static_cast<unsigned long long>(runtime_scan.cache_age_ms),
+        static_cast<unsigned long long>(runtime_scan.lock_wait_ms),
         report.summary.c_str());
     uint64_t full_test_suppression_remaining = 0;
     uint64_t full_test_suppression_expired_ms = 0;
@@ -710,6 +779,26 @@ inline bool enforce_ai_tool_posture(const char* phase, bool runtime)
             report.first_handle_owner_core_system ? 1 : 0,
             report.first_handle_owner_tool ? 1 : 0,
             report.first_handle_owner_targets_aida ? 1 : 0,
+            report.summary.c_str());
+        return true;
+    }
+    if (ai_tool_posture_trusted_system_handle_kernel_clean(report, log_tag, phase_name))
+    {
+        webhook::write_log_critical_fmt(log_tag,
+            "ai_tool_posture_trusted_system_handle_suppressed phase=%s category_mask=0x%08X high_risk_mask=0x%08X high_risk_count=%u summary_hash=0x%016llX handle_any=%d observed_handles=%u first_owner_pid=%lu first_owner_image=%s first_owner_path=%s first_access=0x%08lX first_owner_hash=0x%016llX trusted_system_ignored=%u summary=%s",
+            phase_name,
+            report.category_mask,
+            report.high_risk_mask,
+            report.high_risk_count,
+            static_cast<unsigned long long>(report.summary_hash),
+            report.handle_to_us_detected ? 1 : 0,
+            report.observed_handle_count,
+            static_cast<unsigned long>(report.first_handle_owner_pid),
+            report.first_handle_owner_image.empty() ? "<empty>" : report.first_handle_owner_image.c_str(),
+            report.first_handle_owner_path.empty() ? "<empty>" : report.first_handle_owner_path.c_str(),
+            static_cast<unsigned long>(report.first_handle_access_mask),
+            static_cast<unsigned long long>(report.first_handle_owner_hash),
+            report.trusted_system_handle_ignored_count,
             report.summary.c_str());
         return true;
     }
@@ -780,7 +869,7 @@ inline bool enforce_ai_tool_posture(const char* phase, bool runtime)
             report.trusted_system_handle_ignored_count);
         return true;
     }
-    char detail[1024];
+    char detail[2048];
     _snprintf_s(detail, sizeof(detail), _TRUNCATE,
         "phase=%s category_mask=0x%08X high_risk_mask=0x%08X high_risk_count=%u evidence_count=%u evidence_hash=0x%016llX summary_hash=0x%016llX full_test_active=%d post_full_test_active=%d post_full_test_ms=%llu post_full_test_tail=%d post_full_test_expired_ms=%llu handle_any=%d observed_handles=%u first_owner_pid=%lu first_owner_image=%s first_owner_path=%s first_access=0x%08lX first_owner_hash=0x%016llX first_query_ok=%d first_core_system=%d first_trusted_system=%d first_owner_tool=%d first_owner_targets_aida=%d summary=%s",
         phase_name,

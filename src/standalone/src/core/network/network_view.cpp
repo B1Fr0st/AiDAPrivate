@@ -489,12 +489,16 @@ static bool driver_feature_ready(const char* feature, int iter = -1) {
 
 static void connection_poll_thread(state_t& state) {
     diag::log_tagged_fmt("network", "connection_poll_thread_started auto_refresh=%d filter_pid=%u filter_proto=%u",
-        state.conn_auto_refresh ? 1 : 0, state.conn_filter_pid, state.conn_filter_protocol);
+        state.conn_auto_refresh_enabled.load(std::memory_order_acquire) ? 1 : 0, state.conn_filter_pid, state.conn_filter_protocol);
     int poll_iter = 0;
     while (state.conn_polling.load()) {
         bool drv_ok = driver_feature_ready("connection_poll", poll_iter);
         ++poll_iter;
-        if (drv_ok && state.conn_auto_refresh) {
+        const uint64_t now_ms = static_cast<uint64_t>(GetTickCount64());
+        const uint64_t last_render_ms = state.last_render_tick_ms.load(std::memory_order_acquire);
+        const bool rendered_recently = last_render_ms != 0 && now_ms >= last_render_ms && (now_ms - last_render_ms) <= 2500ULL;
+        const bool auto_refresh = state.conn_auto_refresh_enabled.load(std::memory_order_acquire);
+        if (drv_ok && auto_refresh && rendered_recently) {
             auto raw_conns = driver_bridge::enumerate_connections(
                 state.conn_filter_pid, state.conn_filter_protocol);
 
@@ -522,8 +526,8 @@ static void connection_poll_thread(state_t& state) {
                 diag::log_tagged_fmt("network", "connection_poll iter=%d drv_ok=1 count=%zu", poll_iter, count);
             }
         } else if (poll_iter <= 3 || (poll_iter % 60) == 0) {
-            diag::log_tagged_fmt("network", "connection_poll iter=%d drv_ok=%d auto_refresh=%d skipped",
-                poll_iter, drv_ok ? 1 : 0, state.conn_auto_refresh ? 1 : 0);
+            diag::log_tagged_fmt("network", "connection_poll iter=%d drv_ok=%d auto_refresh=%d rendered_recently=%d skipped",
+                poll_iter, drv_ok ? 1 : 0, auto_refresh ? 1 : 0, rendered_recently ? 1 : 0);
         }
 
         std::unique_lock<std::mutex> lk(state.conn_cv_mutex);
@@ -1223,6 +1227,7 @@ static void render_connections(state_t& state, float x, float y, float w, float 
     if (!driver_ok) ImGui::BeginDisabled();
     bool prev_auto = state.conn_auto_refresh;
     aida::ui::toggle_switch("Auto refresh##conn_auto", &state.conn_auto_refresh);
+    state.conn_auto_refresh_enabled.store(state.conn_auto_refresh, std::memory_order_release);
     if (prev_auto != state.conn_auto_refresh) {
         diag::log_tagged_fmt("network", "connections_auto_refresh_toggled enabled=%d",
             state.conn_auto_refresh ? 1 : 0);
@@ -5882,6 +5887,7 @@ void render(float pos_x, float pos_y, float width, float height,
             alpha, aida::ui::empty_state::glyph_t::network);
         return;
     }
+    g_state.last_render_tick_ms.store(static_cast<uint64_t>(GetTickCount64()), std::memory_order_release);
 
     const float kNetMinWidth = 320.f;
     if (width < kNetMinWidth) {

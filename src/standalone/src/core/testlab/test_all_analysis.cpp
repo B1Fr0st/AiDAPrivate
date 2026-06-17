@@ -26,9 +26,11 @@
 #include <Windows.h>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <string>
@@ -946,8 +948,13 @@ static source_recon_fixture_t make_source_recon_fixture(HANDLE hf, const char* t
         return fx;
     }
 
-    log_msg(hf, tag, "fixture addr=0x%016llX size=%zu old_protect=0x%08X",
-        static_cast<unsigned long long>(fx.address), fx.size, old_protect);
+    log_msg(hf, tag, "fixture target_pid=%u tid=%lu base=0x%016llX end=0x%016llX size=%zu old_protect=0x%08X",
+        driver_bridge::attached_pid(),
+        GetCurrentThreadId(),
+        static_cast<unsigned long long>(fx.address),
+        static_cast<unsigned long long>(fx.address + fx.size),
+        fx.size,
+        old_protect);
     return fx;
 }
 
@@ -1036,9 +1043,11 @@ static aida::binary_map::map_t make_binary_map_fixture() {
     return map;
 }
 
+static constexpr const char* k_xref_fixture_module_key = "fixture_xref_module";
+
 static void seed_xref_db_fixture(uint64_t from, uint64_t to) {
     xref_db::module_index_t mod;
-    mod.name = "fixture_xref_module";
+    mod.name = k_xref_fixture_module_key;
     mod.base = from & ~0xFFFULL;
     mod.size = 0x1000;
     mod.timestamp = static_cast<uint64_t>(
@@ -1296,20 +1305,64 @@ static void test_code_patcher_find_caves(HANDLE hf, std::atomic<int>& passed, st
 }
 
 static void test_integrity_hunter_state(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-    log_msg(hf, "integ_st", "START -- integrity hunter check state");
+    log_msg(hf, "integ_st", "START -- integrity hunter state contract check");
     auto t0 = std::chrono::steady_clock::now();
 
     bool hunting = integrity_hunter::g_state.hunting.load();
+    bool cancel = integrity_hunter::g_state.cancel.load();
+    bool worker = integrity_hunter::g_state.worker_active.load();
+    bool install_complete = integrity_hunter::g_state.install_complete.load();
+    bool install_success = integrity_hunter::g_state.install_success.load();
     uint64_t reads = integrity_hunter::g_state.total_reads.load();
+    uint64_t generation = integrity_hunter::g_state.generation.load();
+    uint32_t session = integrity_hunter::g_state.pg_session_id.load();
+    size_t node_count = 0;
+    size_t event_count = 0;
+    int first_node_reads = 0;
+    std::string status;
+    {
+        std::lock_guard<std::mutex> lk(integrity_hunter::g_state.mutex);
+        node_count = integrity_hunter::g_state.nodes.size();
+        event_count = integrity_hunter::g_state.event_log.size();
+        if (!integrity_hunter::g_state.nodes.empty())
+            first_node_reads = integrity_hunter::g_state.nodes.front().read_count;
+        status = integrity_hunter::g_state.status_text;
+    }
+    bool lifecycle_ok = hunting || !worker || install_complete || !status.empty();
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "integ_st", "PASS -- hunting=%d total_reads=%llu (elapsed %lld ms)",
-        hunting, (unsigned long long)reads, (long long)ms);
-    passed.fetch_add(1);
+    log_msg(hf, "integ_st", "STATE target_pid=%u tid=%lu hunting=%d cancel=%d worker=%d install_complete=%d install_success=%d session=%u generation=%llu nodes=%zu events=%zu total_reads=%llu first_node_reads=%d status_len=%zu status=\"%s\" bridge_status=\"%s\" last_error=\"%s\" elapsed_ms=%lld",
+        driver_bridge::attached_pid(),
+        GetCurrentThreadId(),
+        hunting ? 1 : 0,
+        cancel ? 1 : 0,
+        worker ? 1 : 0,
+        install_complete ? 1 : 0,
+        install_success ? 1 : 0,
+        session,
+        (unsigned long long)generation,
+        node_count,
+        event_count,
+        (unsigned long long)reads,
+        first_node_reads,
+        status.size(),
+        status.c_str(),
+        driver_bridge::status().c_str(),
+        driver_bridge::last_error().c_str(),
+        (long long)ms);
+    if (lifecycle_ok) {
+        log_msg(hf, "integ_st", "CONTRACT-PASS -- integrity hunter idle/state contract coherent; live guard coverage comes from fixture tests elapsed_ms=%lld",
+            (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "integ_st", "FAIL -- integrity hunter state incoherent hunting=%d worker=%d install_complete=%d status_len=%zu elapsed_ms=%lld",
+            hunting ? 1 : 0, worker ? 1 : 0, install_complete ? 1 : 0, status.size(), (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_binary_map_generate(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-    log_msg(hf, "binmap", "START -- binary map generate");
+    log_msg(hf, "binmap", "START -- binary map render fixture coverage");
     auto t0 = std::chrono::steady_clock::now();
 
     aida::binary_map::map_options_t opts;
@@ -1319,28 +1372,85 @@ static void test_binary_map_generate(HANDLE hf, std::atomic<int>& passed, std::a
 
     aida::binary_map::map_t map = make_binary_map_fixture();
     std::string text = aida::binary_map::render_text(map, opts);
-    bool ok = !text.empty() && text.find("fixture.exe") != std::string::npos;
+    bool ok = !text.empty() &&
+        text.find("fixture.exe") != std::string::npos &&
+        text.find("fixture_entry") != std::string::npos &&
+        text.find("fixture_counter") != std::string::npos;
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    log_msg(hf, "binmap", "RESULT coverage=fixture module=%s path=%s base=0x%llX end=0x%llX image_size=0x%llX sections=%zu functions=%zu globals=%zu imports=%zu exports=%zu text_chars=%zu last_error=\"%s\" elapsed_ms=%lld",
+        map.module_name.c_str(),
+        map.module_path.c_str(),
+        (unsigned long long)map.image_base,
+        (unsigned long long)(map.image_base + map.image_size),
+        (unsigned long long)map.image_size,
+        map.sections.size(),
+        map.functions.size(),
+        map.globals.size(),
+        map.imports.size(),
+        map.exports.size(),
+        text.size(),
+        aida::binary_map::last_error().c_str(),
+        (long long)ms);
     if (!ok) {
-        log_msg(hf, "binmap", "FAIL -- fixture map render missing module text (chars=%zu) (elapsed %lld ms)",
-            text.size(), (long long)ms);
+        log_msg(hf, "binmap", "FAIL -- fixture map render missing required evidence chars=%zu module_hit=%d function_hit=%d global_hit=%d (elapsed %lld ms)",
+            text.size(),
+            text.find("fixture.exe") != std::string::npos ? 1 : 0,
+            text.find("fixture_entry") != std::string::npos ? 1 : 0,
+            text.find("fixture_counter") != std::string::npos ? 1 : 0,
+            (long long)ms);
         failed.fetch_add(1);
         return;
     }
-    log_msg(hf, "binmap", "PASS -- fixture module=%s arch=%s sections=%zu functions=%zu (elapsed %lld ms)",
+    log_msg(hf, "binmap", "FIXTURE-PASS -- binary map render proved deterministic fixture module=%s arch=%s sections=%zu functions=%zu globals=%zu (elapsed %lld ms)",
         map.module_name.c_str(), map.architecture.c_str(),
-        map.sections.size(), map.functions.size(), (long long)ms);
+        map.sections.size(), map.functions.size(), map.globals.size(), (long long)ms);
     passed.fetch_add(1);
 }
 
 static void test_source_reconstructor_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-    log_msg(hf, "srcrecon", "START -- source reconstructor status check (no execution)");
+    log_msg(hf, "srcrecon", "START -- source reconstructor idle state contract check");
     auto t0 = std::chrono::steady_clock::now();
 
+    bool running = source_reconstructor::is_running();
+    float progress = source_reconstructor::get_progress();
+    int stage = static_cast<int>(source_reconstructor::get_stage());
+    std::string status = source_reconstructor::get_status();
+    source_reconstructor::reconstruction_result_t result{};
+    {
+        std::lock_guard<std::mutex> lk(source_reconstructor::g_state.mutex);
+        result = source_reconstructor::g_state.last_result;
+    }
+    bool progress_ok = progress >= 0.f && progress <= 1.f;
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "srcrecon", "PASS -- source_reconstructor namespace accessible (elapsed %lld ms)", (long long)ms);
-    passed.fetch_add(1);
+    log_msg(hf, "srcrecon", "STATE target_pid=%u tid=%lu running=%d progress=%.3f stage=%d status_len=%zu status=\"%s\" last_success=%d last_error_len=%zu last_error=\"%s\" module=%s base=0x%llX size=0x%X funcs=%d decompiled=%d files=%zu preload_read=%zu elapsed_ms=%lld",
+        driver_bridge::attached_pid(),
+        GetCurrentThreadId(),
+        running ? 1 : 0,
+        static_cast<double>(progress),
+        stage,
+        status.size(),
+        status.c_str(),
+        result.success ? 1 : 0,
+        result.error.size(),
+        result.error.c_str(),
+        result.module_name.c_str(),
+        (unsigned long long)result.module_base,
+        result.module_size,
+        result.total_functions,
+        result.decompiled_functions,
+        result.files_created.size(),
+        result.preload.total_read,
+        (long long)ms);
+    if (progress_ok) {
+        log_msg(hf, "srcrecon", "CONTRACT-PASS -- source reconstructor state accessible and coherent; functional coverage is source_recon_last_result elapsed_ms=%lld",
+            (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "srcrecon", "FAIL -- source reconstructor progress out of range progress=%.3f elapsed_ms=%lld",
+            static_cast<double>(progress), (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_xref_find(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -1618,14 +1728,56 @@ static void test_symbolic_solve_for_path(HANDLE hf, std::atomic<int>& passed, st
 }
 
 static void test_symbolic_state_check(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-    log_msg(hf, "sym_stch", "START -- symbolic engine state check");
+    log_msg(hf, "sym_stch", "START -- symbolic engine state contract check");
     auto t0 = std::chrono::steady_clock::now();
 
     bool processing = symbolic_engine::g_state.processing.load();
+    uint32_t progress_current = symbolic_engine::g_state.progress_current.load();
+    uint32_t progress_total = symbolic_engine::g_state.progress_total.load();
+    size_t trace_count = 0;
+    size_t slice_count = 0;
+    size_t taint_count = 0;
+    size_t solve_vars = 0;
+    std::string last_error;
+    {
+        std::lock_guard<std::mutex> lk(symbolic_engine::g_state.mutex);
+        trace_count = symbolic_engine::g_state.last_result.trace.size();
+        slice_count = symbolic_engine::g_state.last_slice.effective_instructions.size();
+        taint_count = symbolic_engine::g_state.last_taint.tainted_instructions.size();
+        solve_vars = symbolic_engine::g_state.last_solve.variable_values.size();
+        if (!symbolic_engine::g_state.last_result.error.empty())
+            last_error = symbolic_engine::g_state.last_result.error;
+        else if (!symbolic_engine::g_state.last_slice.error.empty())
+            last_error = symbolic_engine::g_state.last_slice.error;
+        else if (!symbolic_engine::g_state.last_taint.error.empty())
+            last_error = symbolic_engine::g_state.last_taint.error;
+        else
+            last_error = symbolic_engine::g_state.last_solve.error;
+    }
+    bool progress_ok = progress_total == 0 || progress_current <= progress_total;
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "sym_stch", "PASS -- processing=%d (elapsed %lld ms)", processing, (long long)ms);
-    passed.fetch_add(1);
+    log_msg(hf, "sym_stch", "STATE target_pid=%u tid=%lu processing=%d progress=%u/%u trace=%zu slice=%zu taint=%zu solve_vars=%zu last_error_len=%zu elapsed_ms=%lld",
+        driver_bridge::attached_pid(),
+        GetCurrentThreadId(),
+        processing ? 1 : 0,
+        progress_current,
+        progress_total,
+        trace_count,
+        slice_count,
+        taint_count,
+        solve_vars,
+        last_error.size(),
+        (long long)ms);
+    if (progress_ok) {
+        log_msg(hf, "sym_stch", "CONTRACT-PASS -- symbolic idle/state counters are coherent; no live fixture claimed elapsed_ms=%lld",
+            (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "sym_stch", "FAIL -- symbolic progress counters incoherent current=%u total=%u elapsed_ms=%lld",
+            progress_current, progress_total, (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_deobfusc_deobfuscate_function(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -1686,7 +1838,7 @@ static void test_deobfusc_export_asm(HANDLE hf, std::atomic<int>& passed, std::a
 }
 
 static void test_deobfusc_export_stats(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-    log_msg(hf, "deob_stat", "START -- deobfuscation engine export_statistics");
+    log_msg(hf, "deob_stat", "START -- deobfuscation engine export_statistics pure helper coverage");
     auto t0 = std::chrono::steady_clock::now();
 
     deobfuscation_engine::deobfuscated_result_t result;
@@ -1699,14 +1851,30 @@ static void test_deobfusc_export_stats(HANDLE hf, std::atomic<int>& passed, std:
     result.junk_ratio = 0.15f;
 
     std::string stats = deobfuscation_engine::export_statistics(result);
+    bool has_original = stats.find("100") != std::string::npos;
+    bool has_clean = stats.find("80") != std::string::npos;
+    bool has_ratio = stats.find("15") != std::string::npos || stats.find("0.15") != std::string::npos;
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    if (!stats.empty()) {
-        log_msg(hf, "deob_stat", "PASS -- export_statistics returned %zu chars (elapsed %lld ms)",
+    log_msg(hf, "deob_stat", "RESULT coverage=pure_helper chars=%zu original=%u clean=%u removed=%u opaque=%u constants=%u junk_ratio=%.3f has_original=%d has_clean=%d has_ratio=%d elapsed_ms=%lld",
+        stats.size(),
+        result.total_original,
+        result.total_clean,
+        result.removed_junk,
+        result.opaque_predicates_found,
+        result.constants_resolved,
+        static_cast<double>(result.junk_ratio),
+        has_original ? 1 : 0,
+        has_clean ? 1 : 0,
+        has_ratio ? 1 : 0,
+        (long long)ms);
+    if (!stats.empty() && has_original && has_clean && has_ratio) {
+        log_msg(hf, "deob_stat", "PURE-PASS -- export_statistics reflected supplied fixture counters chars=%zu elapsed_ms=%lld",
             stats.size(), (long long)ms);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "deob_stat", "FAIL -- export_statistics returned empty (elapsed %lld ms)", (long long)ms);
+        log_msg(hf, "deob_stat", "FAIL -- export_statistics evidence missing chars=%zu has_original=%d has_clean=%d has_ratio=%d elapsed_ms=%lld",
+            stats.size(), has_original ? 1 : 0, has_clean ? 1 : 0, has_ratio ? 1 : 0, (long long)ms);
         failed.fetch_add(1);
     }
 }
@@ -1732,15 +1900,30 @@ static void test_code_patcher_format_parse(HANDLE hf, std::atomic<int>& passed, 
 }
 
 static void test_code_patcher_count(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-    log_msg(hf, "patch_cnt", "START -- code patcher count/active_count");
+    log_msg(hf, "patch_cnt", "START -- code patcher count/active_count state contract");
     auto t0 = std::chrono::steady_clock::now();
 
     size_t total = code_patcher::count();
     size_t active = code_patcher::active_count();
+    bool counts_ok = active <= total;
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "patch_cnt", "PASS -- total=%zu active=%zu (elapsed %lld ms)", total, active, (long long)ms);
-    passed.fetch_add(1);
+    log_msg(hf, "patch_cnt", "STATE target_pid=%u tid=%lu total=%zu active=%zu last_error=\"%s\" elapsed_ms=%lld",
+        driver_bridge::attached_pid(),
+        GetCurrentThreadId(),
+        total,
+        active,
+        driver_bridge::last_error().c_str(),
+        (long long)ms);
+    if (counts_ok) {
+        log_msg(hf, "patch_cnt", "CONTRACT-PASS -- patch registry counts coherent; no live patch fixture claimed elapsed_ms=%lld",
+            (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "patch_cnt", "FAIL -- active patch count exceeds total active=%zu total=%zu elapsed_ms=%lld",
+            active, total, (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_integrity_hunter_start_stop(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -2125,7 +2308,7 @@ static void test_integrity_hunter_nodes(HANDLE hf, std::atomic<int>& passed, std
 }
 
 static void test_binary_map_options(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-    log_msg(hf, "binmap_op", "START -- binary map generate with different options");
+    log_msg(hf, "binmap_op", "START -- binary map fixture render with import/export options");
     auto t0 = std::chrono::steady_clock::now();
 
     aida::binary_map::map_options_t opts;
@@ -2137,13 +2320,34 @@ static void test_binary_map_options(HANDLE hf, std::atomic<int>& passed, std::at
 
     aida::binary_map::map_t map = make_binary_map_fixture();
     std::string text = aida::binary_map::render_text(map, opts);
-    bool ok = !text.empty();
+    bool has_import = text.find("kernel32!CloseHandle") != std::string::npos;
+    bool has_export = text.find("FixtureExport") != std::string::npos;
+    bool ok = !text.empty() && has_import && has_export && text.size() <= opts.max_chars;
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "binmap_op", "PASS -- generate returned %d, sections=%zu funcs=%zu imports=%zu exports=%zu (elapsed %lld ms)",
-        ok, map.sections.size(), map.functions.size(),
-        map.imports.size(), map.exports.size(), (long long)ms);
-    passed.fetch_add(1);
+    log_msg(hf, "binmap_op", "RESULT coverage=fixture module=%s base=0x%llX end=0x%llX max_chars=%zu text_chars=%zu sections=%zu funcs=%zu globals=%zu imports=%zu exports=%zu has_import=%d has_export=%d elapsed_ms=%lld",
+        map.module_name.c_str(),
+        (unsigned long long)map.image_base,
+        (unsigned long long)(map.image_base + map.image_size),
+        opts.max_chars,
+        text.size(),
+        map.sections.size(),
+        map.functions.size(),
+        map.globals.size(),
+        map.imports.size(),
+        map.exports.size(),
+        has_import ? 1 : 0,
+        has_export ? 1 : 0,
+        (long long)ms);
+    if (ok) {
+        log_msg(hf, "binmap_op", "FIXTURE-PASS -- binary map options rendered fixture import/export evidence elapsed_ms=%lld",
+            (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "binmap_op", "FAIL -- option render evidence missing text_chars=%zu has_import=%d has_export=%d max_chars=%zu elapsed_ms=%lld",
+            text.size(), has_import ? 1 : 0, has_export ? 1 : 0, opts.max_chars, (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_binary_map_pin_unpin(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -2169,7 +2373,8 @@ static void test_binary_map_pin_unpin(HANDLE hf, std::atomic<int>& passed, std::
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (found && !found_after) {
-        log_msg(hf, "binmap_pin", "PASS -- pin/unpin correct (elapsed %lld ms)", (long long)ms);
+        log_msg(hf, "binmap_pin", "CONTRACT-PASS -- pin/unpin registry roundtrip correct va=0x%llX pinned_before=%zu pinned_after=%zu elapsed_ms=%lld",
+            (unsigned long long)test_va, pinned.size(), pinned_after.size(), (long long)ms);
         passed.fetch_add(1);
     } else {
         log_msg(hf, "binmap_pin", "FAIL -- pinned=%d unpinned=%d (elapsed %lld ms)", found, !found_after, (long long)ms);
@@ -2178,18 +2383,19 @@ static void test_binary_map_pin_unpin(HANDLE hf, std::atomic<int>& passed, std::
 }
 
 static void test_binary_map_clear_cache(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-    log_msg(hf, "binmap_cc", "START -- binary map clear_cache");
+    log_msg(hf, "binmap_cc", "START -- binary map clear_cache contract");
     auto t0 = std::chrono::steady_clock::now();
 
     bool ok = aida::binary_map::clear_cache();
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "binmap_cc", "PASS -- clear_cache returned %d (elapsed %lld ms)", ok, (long long)ms);
+    log_msg(hf, "binmap_cc", "CONTRACT-PASS -- clear_cache returned %d last_error=\"%s\" elapsed_ms=%lld",
+        ok ? 1 : 0, aida::binary_map::last_error().c_str(), (long long)ms);
     passed.fetch_add(1);
 }
 
 static void test_binary_map_render_text(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-    log_msg(hf, "binmap_rt", "START -- binary map render_text");
+    log_msg(hf, "binmap_rt", "START -- binary map render_text fixture coverage");
     auto t0 = std::chrono::steady_clock::now();
 
     aida::binary_map::map_options_t opts;
@@ -2200,24 +2406,75 @@ static void test_binary_map_render_text(HANDLE hf, std::atomic<int>& passed, std
     aida::binary_map::map_t map = make_binary_map_fixture();
 
     std::string text = aida::binary_map::render_text(map, opts);
+    bool has_module = text.find(map.module_name) != std::string::npos;
+    bool has_function = text.find("fixture_entry") != std::string::npos;
+    bool has_section = text.find(".text") != std::string::npos;
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "binmap_rt", "PASS -- render_text returned %zu chars (elapsed %lld ms)", text.size(), (long long)ms);
-    passed.fetch_add(1);
+    log_msg(hf, "binmap_rt", "RESULT coverage=fixture module=%s path=%s base=0x%llX end=0x%llX sections=%zu funcs=%zu globals=%zu text_chars=%zu has_module=%d has_function=%d has_section=%d elapsed_ms=%lld",
+        map.module_name.c_str(),
+        map.module_path.c_str(),
+        (unsigned long long)map.image_base,
+        (unsigned long long)(map.image_base + map.image_size),
+        map.sections.size(),
+        map.functions.size(),
+        map.globals.size(),
+        text.size(),
+        has_module ? 1 : 0,
+        has_function ? 1 : 0,
+        has_section ? 1 : 0,
+        (long long)ms);
+    if (!text.empty() && has_module && has_function && has_section) {
+        log_msg(hf, "binmap_rt", "FIXTURE-PASS -- render_text returned expected fixture content chars=%zu elapsed_ms=%lld",
+            text.size(), (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "binmap_rt", "FAIL -- render_text fixture evidence missing chars=%zu module=%d function=%d section=%d elapsed_ms=%lld",
+            text.size(), has_module ? 1 : 0, has_function ? 1 : 0, has_section ? 1 : 0, (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_source_reconstructor_running(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-    log_msg(hf, "srcrecon_r", "START -- source reconstructor is_running/get_progress");
+    log_msg(hf, "srcrecon_r", "START -- source reconstructor running/progress state contract");
     auto t0 = std::chrono::steady_clock::now();
 
     bool running = source_reconstructor::is_running();
     float progress = source_reconstructor::get_progress();
     std::string status = source_reconstructor::get_status();
+    int stage = static_cast<int>(source_reconstructor::get_stage());
+    source_reconstructor::reconstruction_result_t result{};
+    {
+        std::lock_guard<std::mutex> lk(source_reconstructor::g_state.mutex);
+        result = source_reconstructor::g_state.last_result;
+    }
+    bool progress_ok = progress >= 0.f && progress <= 1.f;
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "srcrecon_r", "PASS -- running=%d progress=%.2f status=\"%s\" (elapsed %lld ms)",
-        running, progress, status.c_str(), (long long)ms);
-    passed.fetch_add(1);
+    log_msg(hf, "srcrecon_r", "STATE target_pid=%u tid=%lu running=%d progress=%.3f stage=%d status_len=%zu status=\"%s\" last_success=%d last_error_len=%zu last_error=\"%s\" result_funcs=%d result_files=%zu preload_read=%zu elapsed_ms=%lld",
+        driver_bridge::attached_pid(),
+        GetCurrentThreadId(),
+        running ? 1 : 0,
+        static_cast<double>(progress),
+        stage,
+        status.size(),
+        status.c_str(),
+        result.success ? 1 : 0,
+        result.error.size(),
+        result.error.c_str(),
+        result.total_functions,
+        result.files_created.size(),
+        result.preload.total_read,
+        (long long)ms);
+    if (progress_ok) {
+        log_msg(hf, "srcrecon_r", "CONTRACT-PASS -- running/progress state coherent; no source generation claimed elapsed_ms=%lld",
+            (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "srcrecon_r", "FAIL -- invalid source reconstructor progress %.3f elapsed_ms=%lld",
+            static_cast<double>(progress), (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_source_reconstructor_last_result(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -2259,11 +2516,18 @@ static void test_source_reconstructor_last_result(HANDLE hf, std::atomic<int>& p
     config.use_ai_refinement = false;
     config.max_functions = 1;
 
-    log_msg(hf, "srcrecon_lr", "RUN -- reconstruct base=0x%016llX size=%u output=\"%s\" max_functions=%d",
+    log_msg(hf, "srcrecon_lr", "RUN -- reconstruct target_pid=%u tid=%lu base=0x%016llX end=0x%016llX size=%u output=\"%s\" max_functions=%d running=%d progress=%.3f stage=%d status=\"%s\"",
+        driver_bridge::attached_pid(),
+        GetCurrentThreadId(),
         static_cast<unsigned long long>(config.module_base),
+        static_cast<unsigned long long>(config.module_base + config.module_size),
         static_cast<unsigned>(config.module_size),
         config.output_dir.c_str(),
-        config.max_functions);
+        config.max_functions,
+        source_reconstructor::is_running() ? 1 : 0,
+        static_cast<double>(source_reconstructor::get_progress()),
+        static_cast<int>(source_reconstructor::get_stage()),
+        source_reconstructor::get_status().c_str());
 
     source_reconstructor::reconstruct(config);
     if (!source_reconstructor::is_running()) {
@@ -2384,7 +2648,12 @@ static void test_source_reconstructor_last_result(HANDLE hf, std::atomic<int>& p
         result.preload.mz && result.preload.pe_header_ok;
 
     if (!ok) {
-        log_msg(hf, "srcrecon_lr", "FAIL -- reconstruction result success=%d error=\"%s\" total_funcs=%d decompiled=%d modules=%d files=%zu existing=%zu source_files=%zu source_content=%d bytes=%llu preload_read=%zu mz=%d pe=%d chunks_ok=%zu chunks_failed=%zu output=\"%s\" (elapsed %lld ms)",
+        log_msg(hf, "srcrecon_lr", "FAIL -- reconstruction result target_pid=%u tid=%lu fixture_base=0x%llX fixture_end=0x%llX fixture_size=%zu success=%d error=\"%s\" total_funcs=%d decompiled=%d modules=%d files=%zu existing=%zu source_files=%zu source_content=%d bytes=%llu preload_base=0x%llX preload_requested=%zu preload_read=%zu mz=%d pe=%d chunks_ok=%zu chunks_failed=%zu chunks_skipped=%zu query_ok=%zu query_failed=%zu output=\"%s\" status=\"%s\" (elapsed %lld ms)",
+            driver_bridge::attached_pid(),
+            GetCurrentThreadId(),
+            (unsigned long long)fx.address,
+            (unsigned long long)(fx.address + fx.size),
+            fx.size,
             result.success ? 1 : 0,
             result.error.c_str(),
             result.total_functions,
@@ -2395,33 +2664,52 @@ static void test_source_reconstructor_last_result(HANDLE hf, std::atomic<int>& p
             source_files,
             source_content_ok ? 1 : 0,
             total_bytes,
+            (unsigned long long)result.preload.base,
+            result.preload.requested_size,
             result.preload.total_read,
             result.preload.mz ? 1 : 0,
             result.preload.pe_header_ok ? 1 : 0,
             result.preload.chunks_ok,
             result.preload.chunks_failed,
+            result.preload.chunks_skipped,
+            result.preload.query_ok,
+            result.preload.query_failed,
             result.output_dir.c_str(),
+            source_reconstructor::get_status().c_str(),
             (long long)ms);
         failed.fetch_add(1);
         return;
     }
 
-    log_msg(hf, "srcrecon_lr", "PASS -- success=%d total_funcs=%d decompiled=%d fallback_only=%d modules=%d files=%zu bytes=%llu preload_read=%zu output=\"%s\" (elapsed %lld ms)",
+    log_msg(hf, "srcrecon_lr", "FIXTURE-PASS -- target_pid=%u tid=%lu fixture_base=0x%llX fixture_end=0x%llX fixture_size=%zu success=%d total_funcs=%d decompiled=%d fallback_only=%d modules=%d files=%zu existing=%zu source_files=%zu bytes=%llu preload_base=0x%llX preload_requested=%zu preload_read=%zu chunks_ok=%zu chunks_failed=%zu query_ok=%zu query_failed=%zu output=\"%s\" (elapsed %lld ms)",
+        driver_bridge::attached_pid(),
+        GetCurrentThreadId(),
+        (unsigned long long)fx.address,
+        (unsigned long long)(fx.address + fx.size),
+        fx.size,
         result.success ? 1 : 0,
         result.total_functions,
         result.decompiled_functions,
         result.decompiled_functions == 0 ? 1 : 0,
         result.modules_created,
         result.files_created.size(),
+        existing_files,
+        source_files,
         total_bytes,
+        (unsigned long long)result.preload.base,
+        result.preload.requested_size,
         result.preload.total_read,
+        result.preload.chunks_ok,
+        result.preload.chunks_failed,
+        result.preload.query_ok,
+        result.preload.query_failed,
         result.output_dir.c_str(),
         (long long)ms);
     passed.fetch_add(1);
 }
 
 static void test_xref_engine_scan_state(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-    log_msg(hf, "xref_st", "START -- xref engine scanning state");
+    log_msg(hf, "xref_st", "START -- xref engine scan/cancel state contract");
     auto t0 = std::chrono::steady_clock::now();
 
     bool scanning_before = xref_engine::is_scanning();
@@ -2432,7 +2720,9 @@ static void test_xref_engine_scan_state(HANDLE hf, std::atomic<int>& passed, std
         std::lock_guard<std::mutex> lk(xref_engine::g_state.mutex);
         results_before = xref_engine::g_state.results.size();
     }
-    log_msg(hf, "xref_st", "STATE before_cancel scanning=%d cancel=%d progress=%.3f results=%zu",
+    log_msg(hf, "xref_st", "STATE before_cancel target_pid=%u tid=%lu scanning=%d cancel=%d progress=%.3f results=%zu",
+        driver_bridge::attached_pid(),
+        GetCurrentThreadId(),
         scanning_before ? 1 : 0,
         cancel_before ? 1 : 0,
         static_cast<double>(progress_before),
@@ -2452,7 +2742,9 @@ static void test_xref_engine_scan_state(HANDLE hf, std::atomic<int>& passed, std
 
     long long us = elapsed_us_since(t0);
     bool progress_ok = progress_before >= 0.f && progress_before <= 1.f && progress_after >= 0.f && progress_after <= 1.f;
-    log_msg(hf, "xref_st", "STATE after_cancel scanning=%d cancel=%d progress=%.3f results=%zu idle_after_cancel=%d elapsed_us=%lld",
+    log_msg(hf, "xref_st", "STATE after_cancel target_pid=%u tid=%lu scanning=%d cancel=%d progress=%.3f results=%zu idle_after_cancel=%d elapsed_us=%lld",
+        driver_bridge::attached_pid(),
+        GetCurrentThreadId(),
         scanning_after ? 1 : 0,
         cancel_after ? 1 : 0,
         static_cast<double>(progress_after),
@@ -2460,7 +2752,7 @@ static void test_xref_engine_scan_state(HANDLE hf, std::atomic<int>& passed, std
         idle_after_cancel ? 1 : 0,
         us);
     if (progress_ok && idle_after_cancel && (!scanning_before || !scanning_after)) {
-        log_msg(hf, "xref_st", "PASS -- cancel path and state invariants verified before(scanning=%d results=%zu) after(scanning=%d results=%zu) elapsed_us=%lld",
+        log_msg(hf, "xref_st", "CONTRACT-PASS -- xref cancel/state invariants verified before(scanning=%d results=%zu) after(scanning=%d results=%zu); no live xref coverage claimed elapsed_us=%lld",
             scanning_before ? 1 : 0,
             results_before,
             scanning_after ? 1 : 0,
@@ -2504,7 +2796,7 @@ static void test_xref_type_names(HANDLE hf, std::atomic<int>& passed, std::atomi
 }
 
 static void test_xref_db_state(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-    log_msg(hf, "xrefdb_st", "START -- xref_db state check");
+    log_msg(hf, "xrefdb_st", "START -- xref_db fixture store state check");
     auto t0 = std::chrono::steady_clock::now();
 
     uint64_t from = 0x140001020;
@@ -2518,7 +2810,8 @@ static void test_xref_db_state(HANDLE hf, std::atomic<int>& passed, std::atomic<
         module_count_before = xref_db::g_state.modules.size();
         query_count_before = xref_db::g_state.query_results.size();
     }
-    log_msg(hf, "xrefdb_st", "STATE before_seed building=%d progress=%.3f modules=%zu query_results=%zu fixture_from=0x%llX fixture_to=0x%llX",
+    log_msg(hf, "xrefdb_st", "STATE before_seed module_key=%s building=%d progress=%.3f modules=%zu query_results=%zu fixture_from=0x%llX fixture_to=0x%llX",
+        k_xref_fixture_module_key,
         building_before ? 1 : 0,
         static_cast<double>(progress_before),
         module_count_before,
@@ -2532,11 +2825,13 @@ static void test_xref_db_state(HANDLE hf, std::atomic<int>& passed, std::atomic<
     size_t module_count = 0;
     size_t built_count = 0;
     size_t total_xrefs = 0;
+    size_t query_count_after = 0;
     bool fixture_to_found = false;
     bool fixture_from_found = false;
     {
         std::lock_guard<std::mutex> lk(xref_db::g_state.mutex);
         module_count = xref_db::g_state.modules.size();
+        query_count_after = xref_db::g_state.query_results.size();
         for (const auto& kv : xref_db::g_state.modules) {
             if (kv.second.built) {
                 ++built_count;
@@ -2562,10 +2857,14 @@ static void test_xref_db_state(HANDLE hf, std::atomic<int>& passed, std::atomic<
     long long us = elapsed_us_since(t0);
     bool progress_ok = progress_after >= 0.f && progress_after <= 1.f;
     if (!building && (module_count == 0 || built_count == 0 || total_xrefs == 0 || !fixture_to_found || !fixture_from_found || !progress_ok)) {
-        log_msg(hf, "xrefdb_st", "FAIL -- xref_db fixture state invalid modules=%zu built=%zu total_xrefs=%zu fixture_to=%d fixture_from=%d progress=%.3f progress_ok=%d elapsed_us=%lld",
+        log_msg(hf, "xrefdb_st", "FAIL -- xref_db fixture state invalid module_key=%s modules=%zu built=%zu total_xrefs=%zu query_results=%zu from=0x%llX to=0x%llX fixture_to=%d fixture_from=%d progress=%.3f progress_ok=%d elapsed_us=%lld",
+            k_xref_fixture_module_key,
             module_count,
             built_count,
             total_xrefs,
+            query_count_after,
+            (unsigned long long)from,
+            (unsigned long long)addr,
             fixture_to_found ? 1 : 0,
             fixture_from_found ? 1 : 0,
             static_cast<double>(progress_after),
@@ -2574,7 +2873,10 @@ static void test_xref_db_state(HANDLE hf, std::atomic<int>& passed, std::atomic<
         failed.fetch_add(1);
         return;
     }
-    log_msg(hf, "xrefdb_st", "PASS -- before(modules=%zu query=%zu building=%d progress=%.3f) after(building=%d modules=%zu built=%zu total_xrefs=%zu fixture_to=%d fixture_from=%d progress=%.3f) elapsed_us=%lld",
+    log_msg(hf, "xrefdb_st", "FIXTURE-PASS -- module_key=%s from=0x%llX to=0x%llX before(modules=%zu query=%zu building=%d progress=%.3f) after(building=%d modules=%zu built=%zu total_xrefs=%zu query_results=%zu fixture_to=%d fixture_from=%d progress=%.3f) elapsed_us=%lld",
+        k_xref_fixture_module_key,
+        (unsigned long long)from,
+        (unsigned long long)addr,
         module_count_before,
         query_count_before,
         building_before ? 1 : 0,
@@ -2583,6 +2885,7 @@ static void test_xref_db_state(HANDLE hf, std::atomic<int>& passed, std::atomic<
         module_count,
         built_count,
         total_xrefs,
+        query_count_after,
         fixture_to_found ? 1 : 0,
         fixture_from_found ? 1 : 0,
         static_cast<double>(progress_after),
@@ -2591,7 +2894,7 @@ static void test_xref_db_state(HANDLE hf, std::atomic<int>& passed, std::atomic<
 }
 
 static void test_xref_db_query_to(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-    log_msg(hf, "xrefdb_qt", "START -- xref_db query_xrefs_to");
+    log_msg(hf, "xrefdb_qt", "START -- xref_db query_xrefs_to fixture store");
     auto t0 = std::chrono::steady_clock::now();
 
     uint64_t from = 0x140001020;
@@ -2600,17 +2903,48 @@ static void test_xref_db_query_to(HANDLE hf, std::atomic<int>& passed, std::atom
     xref_db::query_xrefs_to(addr);
 
     size_t results = 0;
+    size_t total_xrefs = 0;
+    size_t module_count = 0;
+    bool query_addr_ok = false;
+    bool query_is_to = false;
     {
         std::lock_guard<std::mutex> lk(xref_db::g_state.mutex);
         results = xref_db::g_state.query_results.size();
+        module_count = xref_db::g_state.modules.size();
+        query_addr_ok = xref_db::g_state.query_addr == addr;
+        query_is_to = xref_db::g_state.query_is_to;
+        auto it = xref_db::g_state.modules.find(k_xref_fixture_module_key);
+        if (it != xref_db::g_state.modules.end())
+            total_xrefs = it->second.total_xrefs;
     }
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    if (results == 0) {
-        log_msg(hf, "xrefdb_qt", "FAIL -- query_xrefs_to found 0 results (elapsed %lld ms)", (long long)ms);
+    log_msg(hf, "xrefdb_qt", "RESULT coverage=fixture_store module_key=%s modules=%zu total_xrefs=%zu from=0x%llX to=0x%llX query_results=%zu query_addr_ok=%d query_is_to=%d elapsed_ms=%lld",
+        k_xref_fixture_module_key,
+        module_count,
+        total_xrefs,
+        (unsigned long long)from,
+        (unsigned long long)addr,
+        results,
+        query_addr_ok ? 1 : 0,
+        query_is_to ? 1 : 0,
+        (long long)ms);
+    if (results == 0 || total_xrefs == 0 || !query_addr_ok || !query_is_to) {
+        log_msg(hf, "xrefdb_qt", "FAIL -- fixture query evidence insufficient module_key=%s total_xrefs=%zu query_results=%zu query_addr_ok=%d query_is_to=%d elapsed_ms=%lld",
+            k_xref_fixture_module_key,
+            total_xrefs,
+            results,
+            query_addr_ok ? 1 : 0,
+            query_is_to ? 1 : 0,
+            (long long)ms);
         failed.fetch_add(1); return;
     }
-    log_msg(hf, "xrefdb_qt", "PASS -- query_xrefs_to found %zu results (elapsed %lld ms)", results, (long long)ms);
+    log_msg(hf, "xrefdb_qt", "FIXTURE-PASS -- query_xrefs_to returned %zu fixture results module_key=%s from=0x%llX to=0x%llX elapsed_ms=%lld",
+        results,
+        k_xref_fixture_module_key,
+        (unsigned long long)from,
+        (unsigned long long)addr,
+        (long long)ms);
     passed.fetch_add(1);
 }
 
@@ -2778,7 +3112,9 @@ static void test_fuzzer_state(HANDLE hf, std::atomic<int>& passed, std::atomic<i
     long long us = elapsed_us_since(t0);
     bool counters_ok = total_crash <= total_exec && unique_crash <= total_crash && crashes_size >= unique_crashes_size;
     bool lifecycle_ok = running || !worker_active || setup_complete || !setup_error.empty();
-    log_msg(hf, "fuzz_st", "STATE running=%d cancel=%d minimizing=%d analyzing=%d worker_active=%d setup_complete=%d setup_success=%d active=%d execs=%llu crashes=%llu unique=%llu new_cov=%llu eps=%llu elapsed_s=%.3f corpus_stat=%u corpus_size=%zu crashes_size=%zu unique_size=%zu edge_cov=%u rate_history=%zu setup_error_len=%zu elapsed_us=%lld",
+    log_msg(hf, "fuzz_st", "STATE target_pid=%u tid=%lu running=%d cancel=%d minimizing=%d analyzing=%d worker_active=%d setup_complete=%d setup_success=%d active=%d execs=%llu crashes=%llu unique=%llu new_cov=%llu eps=%llu elapsed_s=%.3f corpus_stat=%u corpus_size=%zu crashes_size=%zu unique_size=%zu edge_cov=%u rate_history=%zu setup_error_len=%zu setup_error=\"%s\" elapsed_us=%lld",
+        driver_bridge::attached_pid(),
+        GetCurrentThreadId(),
         running ? 1 : 0,
         cancel ? 1 : 0,
         minimizing ? 1 : 0,
@@ -2800,9 +3136,10 @@ static void test_fuzzer_state(HANDLE hf, std::atomic<int>& passed, std::atomic<i
         edge_coverage,
         rate_history_size,
         setup_error.size(),
+        setup_error.c_str(),
         us);
     if (counters_ok && lifecycle_ok) {
-        log_msg(hf, "fuzz_st", "PASS -- fuzzer state counters and lifecycle flags are coherent elapsed_us=%lld", us);
+        log_msg(hf, "fuzz_st", "CONTRACT-PASS -- fuzzer idle/state counters and lifecycle flags are coherent; no live fuzz run claimed elapsed_us=%lld", us);
         passed.fetch_add(1);
     } else {
         log_msg(hf, "fuzz_st", "FAIL -- fuzzer state incoherent counters_ok=%d lifecycle_ok=%d execs=%llu crashes=%llu unique=%llu worker_active=%d setup_complete=%d setup_error_len=%zu elapsed_us=%lld",
@@ -2881,7 +3218,9 @@ static void test_stealth_state(HANDLE hf, std::atomic<int>& passed, std::atomic<
     bool attached_coherent = attached_pid == 0 || !active || active_for_attached;
 
     long long us = elapsed_us_since(t0);
-    log_msg(hf, "stealth_st", "STATE active=%d attached_pid=%u active_for_attached=%d session_pid=%u peb=%d context=%d rdtsc=%d hooks=%zu allocs=%zu status_len=%zu status=\"%s\" elapsed_us=%lld",
+    log_msg(hf, "stealth_st", "STATE target_pid=%u tid=%lu active=%d attached_pid=%u active_for_attached=%d session_pid=%u peb=%d context=%d rdtsc=%d hooks=%zu allocs=%zu status_len=%zu status=\"%s\" elapsed_us=%lld",
+        driver_bridge::attached_pid(),
+        GetCurrentThreadId(),
         active ? 1 : 0,
         attached_pid,
         active_for_attached ? 1 : 0,
@@ -2895,7 +3234,7 @@ static void test_stealth_state(HANDLE hf, std::atomic<int>& passed, std::atomic<
         status.c_str(),
         us);
     if (session_coherent && attached_coherent) {
-        log_msg(hf, "stealth_st", "PASS -- stealth state coherent active=%d session_pid=%u attached_pid=%u elapsed_us=%lld",
+        log_msg(hf, "stealth_st", "CONTRACT-PASS -- stealth idle/session state coherent active=%d session_pid=%u attached_pid=%u elapsed_us=%lld",
             active ? 1 : 0, session.pid, attached_pid, us);
         passed.fetch_add(1);
     } else {
@@ -2963,7 +3302,9 @@ static void test_struct_recon_state(HANDLE hf, std::atomic<int>& passed, std::at
 
     long long us = elapsed_us_since(t0);
     bool progress_ok = progress >= 0.f && progress <= 1.f;
-    log_msg(hf, "strecon_st", "STATE monitoring=%d cancel=%d ai_naming=%d active=%d progress=%.3f fields=%zu accesses=%zu history=%zu saved=%zu disk_cache=%d elapsed_us=%lld",
+    log_msg(hf, "strecon_st", "STATE target_pid=%u tid=%lu monitoring=%d cancel=%d ai_naming=%d active=%d progress=%.3f fields=%zu accesses=%zu history=%zu saved=%zu disk_cache=%d elapsed_us=%lld",
+        driver_bridge::attached_pid(),
+        GetCurrentThreadId(),
         monitoring ? 1 : 0,
         cancel ? 1 : 0,
         ai_naming ? 1 : 0,
@@ -2976,7 +3317,7 @@ static void test_struct_recon_state(HANDLE hf, std::atomic<int>& passed, std::at
         disk_cache_loaded ? 1 : 0,
         us);
     if (progress_ok) {
-        log_msg(hf, "strecon_st", "PASS -- struct recon state progress and snapshots are coherent elapsed_us=%lld", us);
+        log_msg(hf, "strecon_st", "CONTRACT-PASS -- struct recon idle/state progress and snapshots are coherent; no live monitor claimed elapsed_us=%lld", us);
         passed.fetch_add(1);
     } else {
         log_msg(hf, "strecon_st", "FAIL -- progress out of range progress=%.3f elapsed_us=%lld", static_cast<double>(progress), us);
@@ -3037,7 +3378,9 @@ static void test_decrypt_oracle_state(HANDLE hf, std::atomic<int>& passed, std::
     long long us = elapsed_us_since(t0);
     bool progress_ok = progress >= 0.f && progress <= 1.f;
     bool counts_ok = total_xrefs >= 0 && processed_xrefs >= 0 && (total_xrefs == 0 || processed_xrefs <= total_xrefs);
-    log_msg(hf, "decr_st", "STATE scanning=%d cancel=%d timed_out=%d progress=%.3f total_xrefs=%d processed=%d results=%zu status_len=%zu status=\"%s\" elapsed_us=%lld",
+    log_msg(hf, "decr_st", "STATE target_pid=%u tid=%lu scanning=%d cancel=%d timed_out=%d progress=%.3f total_xrefs=%d processed=%d results=%zu status_len=%zu status=\"%s\" elapsed_us=%lld",
+        driver_bridge::attached_pid(),
+        GetCurrentThreadId(),
         scanning ? 1 : 0,
         cancel ? 1 : 0,
         timed_out ? 1 : 0,
@@ -3049,7 +3392,7 @@ static void test_decrypt_oracle_state(HANDLE hf, std::atomic<int>& passed, std::
         status.c_str(),
         us);
     if (progress_ok && counts_ok) {
-        log_msg(hf, "decr_st", "PASS -- decrypt oracle state progress and counters are coherent elapsed_us=%lld", us);
+        log_msg(hf, "decr_st", "CONTRACT-PASS -- decrypt oracle idle/state progress and counters are coherent; no live oracle scan claimed elapsed_us=%lld", us);
         passed.fetch_add(1);
     } else {
         log_msg(hf, "decr_st", "FAIL -- invalid decrypt oracle state progress_ok=%d counts_ok=%d progress=%.3f total=%d processed=%d elapsed_us=%lld",
@@ -3094,29 +3437,79 @@ static void test_decrypt_oracle_config(HANDLE hf, std::atomic<int>& passed, std:
 }
 
 static void test_pdb_resolve_cache_path(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-    log_msg(hf, "pdb_cache", "START -- pdb downloader resolve_cache_path");
+    log_msg(hf, "pdb_cache", "START -- pdb downloader resolve_cache_path dummy cache fixture");
     auto t0 = std::chrono::steady_clock::now();
 
     pdb_downloader::download_request_t req;
-    req.pdb_name = "ntdll.pdb";
-    req.pdb_guid = "00000000000000000000000000000000";
-    req.pdb_age = 1;
+    req.pdb_name = "aida_dummy.pdb";
+    req.pdb_guid = "11111111222233334444555555555555";
+    req.pdb_age = 2;
 
-    char* appdata = nullptr;
-    size_t len = 0;
-    _dupenv_s(&appdata, &len, "APPDATA");
-    if (appdata) {
-        req.cache_root = std::string(appdata) + "\\AiDA\\Standalone\\symbols";
-        free(appdata);
+    char tmp[MAX_PATH + 1] = {};
+    DWORD tmp_len = GetTempPathA(MAX_PATH, tmp);
+    std::filesystem::path cache_root = (tmp_len > 0 && tmp_len < MAX_PATH)
+        ? std::filesystem::path(std::string(tmp, tmp_len))
+        : std::filesystem::current_path();
+    cache_root /= "AiDA_TestLab";
+    cache_root /= "pdb_cache_dummy";
+    cache_root /= std::to_string(GetCurrentProcessId());
+    cache_root /= std::to_string(GetCurrentThreadId());
+    req.cache_root = cache_root.string();
+
+    char age_buf[16];
+    std::snprintf(age_buf, sizeof(age_buf), "%X", static_cast<unsigned>(req.pdb_age));
+    std::filesystem::path expected_path = cache_root / req.pdb_name / (req.pdb_guid + std::string(age_buf)) / req.pdb_name;
+    std::error_code ec;
+    bool dirs_ok = std::filesystem::create_directories(expected_path.parent_path(), ec) || std::filesystem::exists(expected_path.parent_path(), ec);
+    const char marker[] = "AIDA_PDB_CACHE_DUMMY_V1";
+    bool write_ok = false;
+    if (dirs_ok) {
+        std::ofstream ofs(expected_path, std::ios::binary | std::ios::trunc);
+        ofs.write(marker, static_cast<std::streamsize>(sizeof(marker) - 1));
+        write_ok = ofs.good();
     }
+    ec.clear();
+    std::uintmax_t expected_size = std::filesystem::exists(expected_path, ec) ? std::filesystem::file_size(expected_path, ec) : 0;
 
     std::string out_path;
     bool resolved = pdb_downloader::resolve_cache_path(req, out_path);
+    ec.clear();
+    std::filesystem::path resolved_path(out_path);
+    std::uintmax_t resolved_size = resolved && std::filesystem::exists(resolved_path, ec) ? std::filesystem::file_size(resolved_path, ec) : 0;
+    std::string expected_string = expected_path.string();
+    bool path_match = resolved && _stricmp(out_path.c_str(), expected_string.c_str()) == 0;
+    bool size_match = expected_size == sizeof(marker) - 1 && resolved_size == expected_size;
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "pdb_cache", "PASS -- resolve_cache_path returned %d path=\"%s\" (elapsed %lld ms)",
-        resolved, out_path.c_str(), (long long)ms);
-    passed.fetch_add(1);
+    log_msg(hf, "pdb_cache", "RESULT coverage=dummy_cache_fixture root=\"%s\" expected=\"%s\" resolved=%d path=\"%s\" dirs_ok=%d write_ok=%d expected_size=%llu resolved_size=%llu path_match=%d size_match=%d elapsed_ms=%lld",
+        req.cache_root.c_str(),
+        expected_string.c_str(),
+        resolved ? 1 : 0,
+        out_path.c_str(),
+        dirs_ok ? 1 : 0,
+        write_ok ? 1 : 0,
+        static_cast<unsigned long long>(expected_size),
+        static_cast<unsigned long long>(resolved_size),
+        path_match ? 1 : 0,
+        size_match ? 1 : 0,
+        (long long)ms);
+    std::filesystem::remove_all(cache_root, ec);
+    if (dirs_ok && write_ok && resolved && path_match && size_match) {
+        log_msg(hf, "pdb_cache", "FIXTURE-PASS -- resolve_cache_path found dummy cache file with exact path and size bytes=%llu elapsed_ms=%lld",
+            static_cast<unsigned long long>(resolved_size), (long long)ms);
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "pdb_cache", "FAIL -- dummy cache resolve evidence insufficient dirs_ok=%d write_ok=%d resolved=%d path_match=%d size_match=%d expected_size=%llu resolved_size=%llu elapsed_ms=%lld",
+            dirs_ok ? 1 : 0,
+            write_ok ? 1 : 0,
+            resolved ? 1 : 0,
+            path_match ? 1 : 0,
+            size_match ? 1 : 0,
+            static_cast<unsigned long long>(expected_size),
+            static_cast<unsigned long long>(resolved_size),
+            (long long)ms);
+        failed.fetch_add(1);
+    }
 }
 
 static void test_comment_store_multiple(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {

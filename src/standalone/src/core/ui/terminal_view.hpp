@@ -14,6 +14,7 @@
 #include "fonts.hpp"
 
 #include <atomic>
+#include <algorithm>
 #include <cstdint>
 #include <deque>
 #include <mutex>
@@ -507,6 +508,39 @@ inline void clear_session(TerminalSession& s)
     s.prev_line_count = 0;
 }
 
+inline bool try_clear_session(TerminalSession& s)
+{
+    std::unique_lock<std::mutex> lk(s.buffer_mtx, std::try_to_lock);
+    if (!lk.owns_lock())
+        return false;
+    s.lines.clear();
+    s.line_entrance_time.clear();
+    s.cursor_row = 0;
+    s.cursor_col = 0;
+    s.scroll_y = 0.f;
+    s.scroll_to_bottom = true;
+    s.auto_follow = true;
+    s.prev_line_count = 0;
+    return true;
+}
+
+inline bool try_copy_all_text(TerminalSession& s, std::string& all_text)
+{
+    std::unique_lock<std::mutex> lk(s.buffer_mtx, std::try_to_lock);
+    if (!lk.owns_lock())
+        return false;
+    all_text.clear();
+    all_text.reserve(s.lines.size() * static_cast<size_t>(std::max(1, s.cols + 1)));
+    for (auto& row : s.lines) {
+        for (auto& cell : row)
+            all_text += cell.ch;
+        while (!all_text.empty() && all_text.back() == ' ')
+            all_text.pop_back();
+        all_text += '\n';
+    }
+    return true;
+}
+
 inline void send_key(TerminalSession& s, char ch)
 {
     send_input(s, &ch, 1);
@@ -623,7 +657,14 @@ inline void render_terminal(TerminalSession& s, const ImVec2& size, ImU32 bg_col
     int new_lines_added = 0;
     int lines_popped_front = 0;
     {
-        std::lock_guard<std::mutex> lk(s.buffer_mtx);
+        std::unique_lock<std::mutex> lk(s.buffer_mtx, std::try_to_lock);
+        if (!lk.owns_lock()) {
+            if (pushed_font) ImGui::PopFont();
+            ImGui::EndChild();
+            ImGui::PopStyleVar();
+            ImGui::PopStyleColor();
+            return;
+        }
         total_lines = static_cast<int>(s.lines.size());
         int raw_delta = total_lines - s.prev_line_count;
         if (raw_delta >= 0) {
@@ -687,13 +728,21 @@ inline void render_terminal(TerminalSession& s, const ImVec2& size, ImU32 bg_col
     const float entrance_dur = 0.080f;
 
     {
-        std::lock_guard<std::mutex> lk(s.buffer_mtx);
+        std::unique_lock<std::mutex> lk(s.buffer_mtx, std::try_to_lock);
+        if (!lk.owns_lock()) {
+            if (pushed_font) ImGui::PopFont();
+            ImGui::EndChild();
+            ImGui::PopStyleVar();
+            ImGui::PopStyleColor();
+            return;
+        }
 
+        const int render_total_lines = static_cast<int>(s.lines.size());
         size_t entrance_offset = 0;
-        if (s.line_entrance_time.size() < static_cast<size_t>(total_lines))
-            entrance_offset = static_cast<size_t>(total_lines) - s.line_entrance_time.size();
+        if (s.line_entrance_time.size() < static_cast<size_t>(render_total_lines))
+            entrance_offset = static_cast<size_t>(render_total_lines) - s.line_entrance_time.size();
 
-        for (int vi = 0; vi < vis_rows && (start_line + vi) < total_lines; ++vi) {
+        for (int vi = 0; vi < vis_rows && (start_line + vi) < render_total_lines; ++vi) {
             int line_idx = start_line + vi;
             const auto& row = s.lines[line_idx];
 

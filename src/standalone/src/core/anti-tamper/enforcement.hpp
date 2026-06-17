@@ -622,6 +622,7 @@ inline void enforce_violation_id(uint64_t reason_id, const std::string& extra = 
         {
             std::lock_guard<std::mutex> lk(rt.mtx);
             rt.violation_reason = std::string("rid_") + reason_short + "_suppressed";
+            rt.violation_detail = extra;
         }
         enforcement_detail::log_destructive_enforcement_suppressed(
             extra.empty() ? "enforce_violation_id" : extra.c_str(),
@@ -642,6 +643,7 @@ inline void enforce_violation_id(uint64_t reason_id, const std::string& extra = 
         {
             std::lock_guard<std::mutex> lk(rt.mtx);
             rt.violation_reason = std::string("rid_") + reason_short;
+            rt.violation_detail = extra;
         }
         diag::log_tagged_critical("enforce", "ev_cff_state_0_done_goto_1");
         CFF_GOTO(ev_cff, 1);

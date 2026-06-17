@@ -42,7 +42,12 @@ namespace anti_tamper::mcp_posture
     struct finding_t
     {
         std::string source;
+        std::string config_path;
+        std::string server_name;
         std::string reason;
+        std::string command;
+        std::string url;
+        std::string remediation;
         std::uint64_t path_hash = 0;
         std::uint64_t server_hash = 0;
         std::uint64_t command_hash = 0;
@@ -101,6 +106,7 @@ namespace anti_tamper::mcp_posture
         struct server_entry_t
         {
             std::string source;
+            std::string config_path;
             std::uint64_t path_hash = 0;
             std::string name;
             std::string url;
@@ -162,6 +168,20 @@ namespace anti_tamper::mcp_posture
             if (first == std::string::npos)
                 return {};
             return s.substr(first, s.find_last_not_of(" \t\r\n") - first + 1);
+        }
+
+        inline std::string display_limited(std::string text, std::size_t limit = 260)
+        {
+            text = trim(std::move(text));
+            for (char& c : text) {
+                const unsigned char u = static_cast<unsigned char>(c);
+                if (u < 0x20 || u == 0x7F)
+                    c = ' ';
+            }
+            text = trim(std::move(text));
+            if (text.size() > limit)
+                text = text.substr(0, limit) + "...";
+            return text;
         }
 
         inline std::string lower_ascii(std::string text)
@@ -583,10 +603,11 @@ namespace anti_tamper::mcp_posture
             append_json_tool_metadata_value(obj, out, false, 0);
         }
 
-        inline bool add_json_server_entry(const std::string& source, std::uint64_t path_hash, const std::string& name, const json& value, std::vector<server_entry_t>& out)
+        inline bool add_json_server_entry(const std::string& source, std::uint64_t path_hash, const std::string& path, const std::string& name, const json& value, std::vector<server_entry_t>& out)
         {
             server_entry_t e;
             e.source = source;
+            e.config_path = path;
             e.path_hash = path_hash;
             e.name = name;
             if (value.is_string()) {
@@ -641,12 +662,12 @@ namespace anti_tamper::mcp_posture
             return true;
         }
 
-        inline void add_json_server_map(const std::string& source, std::uint64_t path_hash, const json& obj, std::vector<server_entry_t>& out)
+        inline void add_json_server_map(const std::string& source, std::uint64_t path_hash, const std::string& path, const json& obj, std::vector<server_entry_t>& out)
         {
             if (!obj.is_object())
                 return;
             for (auto it = obj.begin(); it != obj.end(); ++it)
-                add_json_server_entry(source, path_hash, it.key(), it.value(), out);
+                add_json_server_entry(source, path_hash, path, it.key(), it.value(), out);
         }
 
         inline bool json_value_looks_like_server(const json& value)
@@ -670,20 +691,20 @@ namespace anti_tamper::mcp_posture
             if (!root.is_object())
                 return entries;
             if (root.contains("mcpServers") && root["mcpServers"].is_object())
-                add_json_server_map(source, path_hash, root["mcpServers"], entries);
+                add_json_server_map(source, path_hash, path, root["mcpServers"], entries);
             if (root.contains("mcp_servers") && root["mcp_servers"].is_object())
-                add_json_server_map(source, path_hash, root["mcp_servers"], entries);
+                add_json_server_map(source, path_hash, path, root["mcp_servers"], entries);
             if (root.contains("context_servers") && root["context_servers"].is_object())
-                add_json_server_map(source, path_hash, root["context_servers"], entries);
+                add_json_server_map(source, path_hash, path, root["context_servers"], entries);
             if (root.contains("mcp") && root["mcp"].is_object()) {
                 const auto& mcp = root["mcp"];
                 if (mcp.contains("servers") && mcp["servers"].is_object())
-                    add_json_server_map(source, path_hash, mcp["servers"], entries);
+                    add_json_server_map(source, path_hash, path, mcp["servers"], entries);
                 else
-                    add_json_server_map(source, path_hash, mcp, entries);
+                    add_json_server_map(source, path_hash, path, mcp, entries);
             }
             if (root.contains("servers") && root["servers"].is_object() && path_has_mcp_marker(path))
-                add_json_server_map(source, path_hash, root["servers"], entries);
+                add_json_server_map(source, path_hash, path, root["servers"], entries);
             if (entries.empty() && path_has_mcp_marker(path)) {
                 bool direct_map = false;
                 for (auto it = root.begin(); it != root.end(); ++it) {
@@ -693,7 +714,7 @@ namespace anti_tamper::mcp_posture
                     }
                 }
                 if (direct_map)
-                    add_json_server_map(source, path_hash, root, entries);
+                    add_json_server_map(source, path_hash, path, root, entries);
             }
             return entries;
         }
@@ -798,7 +819,7 @@ namespace anti_tamper::mcp_posture
             return toml_unquote(s);
         }
 
-        inline bool extract_toml_entries(const std::string& source, std::uint64_t path_hash, const std::string& raw, std::vector<server_entry_t>& out, bool& saw_mcp_marker)
+        inline bool extract_toml_entries(const std::string& source, std::uint64_t path_hash, const std::string& path, const std::string& raw, std::vector<server_entry_t>& out, bool& saw_mcp_marker)
         {
             saw_mcp_marker = lower_ascii(raw).find("mcp_servers") != std::string::npos;
             server_entry_t current;
@@ -834,6 +855,7 @@ namespace anti_tamper::mcp_posture
                         in_server = true;
                         current = server_entry_t{};
                         current.source = source;
+                        current.config_path = path;
                         current.path_hash = path_hash;
                         current.name = name;
                     }
@@ -1153,6 +1175,39 @@ namespace anti_tamper::mcp_posture
             return false;
         }
 
+        inline std::string redacted_url_display(std::string url)
+        {
+            url = display_limited(std::move(url));
+            const auto scheme = url.find("://");
+            if (scheme == std::string::npos)
+                return url;
+            const auto authority = scheme + 3;
+            const auto slash = url.find('/', authority);
+            const auto at = url.rfind('@', slash == std::string::npos ? url.size() : slash);
+            if (at != std::string::npos && at > authority)
+                url.replace(authority, at - authority, "<redacted>");
+            return url;
+        }
+
+        inline std::string remediation_for_finding(const finding_t& f)
+        {
+            if (f.reason == "high_risk_command")
+                return "Remove or disable this MCP server entry. AiDA blocks enabled stdio MCP servers that expose reverse-engineering, debugger, shell, dump, memory, proxy, or AiDA-targeting command surfaces.";
+            if (f.reason == "managed_name_spoof")
+                return "Remove this spoofed managed-name entry. Only AiDA may write managed AiDA MCP entries, and they must point to the exact localhost endpoint.";
+            if (f.reason == "high_risk_url")
+                return "Remove or disable this MCP server entry. AiDA only accepts its managed localhost MCP endpoint during startup.";
+            if (f.reason == "offensive_tool_metadata")
+                return "Remove or disable this MCP server entry. Its advertised tool metadata exposes offensive or process-memory capabilities.";
+            if (f.reason == "config_parse_failure")
+                return "Fix or remove this MCP config file. AiDA fails closed when a file containing MCP configuration cannot be parsed.";
+            if (f.reason == "config_inaccessible")
+                return "Remove, unlock, or fix permissions for this MCP config file. AiDA fails closed when it cannot read MCP configuration.";
+            if (f.reason == "enabled_unknown")
+                return "Disable or remove this unknown enabled MCP server, or replace it with AiDA's managed localhost MCP entry.";
+            return "Remove or disable this MCP server entry, then restart the MCP client and AiDA.";
+        }
+
         inline bool is_camoufox_managed_name(const std::string& name)
         {
             const std::string n = normalized_name_key(name);
@@ -1228,6 +1283,10 @@ namespace anti_tamper::mcp_posture
                 add_unique_camoufox_root(roots, aida_root);
                 add_unique_camoufox_root(roots, join_path_string(join_path_string(aida_root, "camoufox"), "current"));
                 add_unique_camoufox_root(roots, join_path_string(join_path_string(join_path_string(aida_root, "embedded"), "camoufox"), "current"));
+                const std::string standalone_root = join_path_string(aida_root, "Standalone");
+                add_unique_camoufox_root(roots, standalone_root);
+                add_unique_camoufox_root(roots, join_path_string(join_path_string(standalone_root, "camoufox"), "current"));
+                add_unique_camoufox_root(roots, join_path_string(join_path_string(join_path_string(standalone_root, "embedded"), "camoufox"), "current"));
             }
             const std::string temp = read_env("TEMP").empty() ? read_env("TMP") : read_env("TEMP");
             if (!temp.empty()) {
@@ -1270,6 +1329,10 @@ namespace anti_tamper::mcp_posture
                 const std::string aida_root = join_path_string(local, "AiDA");
                 add_unique_camoufox_root(roots, join_path_string(join_path_string(aida_root, "camoufox"), "current"));
                 add_unique_camoufox_root(roots, join_path_string(join_path_string(join_path_string(aida_root, "embedded"), "camoufox"), "current"));
+                const std::string standalone_root = join_path_string(aida_root, "Standalone");
+                add_unique_camoufox_root(roots, standalone_root);
+                add_unique_camoufox_root(roots, join_path_string(join_path_string(standalone_root, "camoufox"), "current"));
+                add_unique_camoufox_root(roots, join_path_string(join_path_string(join_path_string(standalone_root, "embedded"), "camoufox"), "current"));
             }
             return roots;
         }
@@ -1360,6 +1423,11 @@ namespace anti_tamper::mcp_posture
                 add_unique_camoufox_root(roots, join_path_string(aida_root, "current"));
                 add_unique_camoufox_root(roots, join_path_string(aida_root, "runtime"));
                 add_unique_camoufox_root(roots, join_path_string(aida_root, "embedded"));
+                const std::string standalone_root = join_path_string(aida_root, "Standalone");
+                add_unique_camoufox_root(roots, standalone_root);
+                add_unique_camoufox_root(roots, join_path_string(join_path_string(standalone_root, "camoufox"), "current"));
+                add_unique_camoufox_root(roots, join_path_string(standalone_root, "runtime"));
+                add_unique_camoufox_root(roots, join_path_string(standalone_root, "embedded"));
             }
             for (const auto& root : roots) {
                 const std::string deps_dir = join_path_string(root, "deps");
@@ -1692,6 +1760,8 @@ namespace anti_tamper::mcp_posture
 
         inline void apply_decision(report_t& report, finding_t finding)
         {
+            if (finding.remediation.empty())
+                finding.remediation = remediation_for_finding(finding);
             report.findings.push_back(finding);
             if (finding.deny) {
                 report.trusted = false;
@@ -1727,11 +1797,15 @@ namespace anti_tamper::mcp_posture
         {
             finding_t f;
             f.source = e.source;
+            f.config_path = display_limited(e.config_path, 360);
+            f.server_name = display_limited(e.name, 160);
             f.enabled = force_enabled ? true : e.enabled;
             f.transport = e.transport;
             f.path_hash = e.path_hash;
             f.server_hash = fnv1a_string(normalized_name_key(e.name));
             f.name_len = e.name.size();
+            f.command = display_limited(unquote_path_token(e.command), 260);
+            f.url = redacted_url_display(e.url);
             f.managed_name = is_managed_name(e.name);
             f.high_risk_command = command_has_high_risk(e);
             f.launcher_command = command_uses_launcher(e);
@@ -1925,6 +1999,7 @@ namespace anti_tamper::mcp_posture
             if (!detail::read_file_limited(path, raw)) {
                 finding_t f;
                 f.source = source.label;
+                f.config_path = detail::display_limited(path, 360);
                 f.path_hash = path_hash;
                 f.reason = "config_inaccessible";
                 f.deny = true;
@@ -1937,7 +2012,7 @@ namespace anti_tamper::mcp_posture
             bool parsed = true;
             bool saw_toml_mcp = false;
             if (source.format == detail::source_format_t::toml) {
-                parsed = detail::extract_toml_entries(source.label, path_hash, raw, entries, saw_toml_mcp);
+                parsed = detail::extract_toml_entries(source.label, path_hash, path, raw, entries, saw_toml_mcp);
             } else {
                 detail::json root;
                 parsed = detail::parse_json_text(raw, root);
@@ -1947,6 +2022,7 @@ namespace anti_tamper::mcp_posture
             if (!parsed && (marker || saw_toml_mcp)) {
                 finding_t f;
                 f.source = source.label;
+                f.config_path = detail::display_limited(path, 360);
                 f.path_hash = path_hash;
                 f.reason = "config_parse_failure";
                 f.deny = true;

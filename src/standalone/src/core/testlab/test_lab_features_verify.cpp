@@ -341,15 +341,17 @@ namespace {
 		return any_io;
 	}
 
-	bool issue_raw_tcp_probe_to_one_one(std::string& diag) {
+	bool issue_raw_tcp_probe_to_one_one(std::string& diag, int max_attempts = 3) {
 		wsa_guard_t g;
 		if (!g.ok) {
 			diag = "WSAStartup failed";
 			return false;
 		}
+		if (max_attempts < 1) max_attempts = 1;
+		if (max_attempts > 16) max_attempts = 16;
 		const DWORD start_tick = GetTickCount();
 		std::string last_diag;
-		for (int attempt = 1; attempt <= 16; ++attempt) {
+		for (int attempt = 1; attempt <= max_attempts; ++attempt) {
 			SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 			if (s == INVALID_SOCKET) {
 				int err = WSAGetLastError();
@@ -361,7 +363,7 @@ namespace {
 					attempt,
 					static_cast<unsigned long>(GetTickCount() - start_tick),
 					last_diag.c_str());
-				if (attempt < 16) Sleep(200);
+				if (attempt < max_attempts) Sleep(200);
 				continue;
 			}
 			u_long nb = 1;
@@ -434,10 +436,170 @@ namespace {
 				attempt,
 				static_cast<unsigned long>(GetTickCount() - start_tick),
 				last_diag.c_str());
-			if (attempt < 16) Sleep(200);
+			if (attempt < max_attempts) Sleep(200);
 		}
 		diag = last_diag.empty() ? "connect() did not initiate after retry budget" : last_diag;
 		return false;
+	}
+
+	bool issue_loopback_tcp_stats_probe(std::string& diag) {
+		wsa_guard_t g;
+		if (!g.ok) {
+			diag = "WSAStartup failed";
+			return false;
+		}
+		const DWORD start_tick = GetTickCount();
+		SOCKET listener = INVALID_SOCKET;
+		SOCKET client = INVALID_SOCKET;
+		SOCKET accepted = INVALID_SOCKET;
+		auto cleanup = [&]() {
+			if (client != INVALID_SOCKET) {
+				closesocket(client);
+				client = INVALID_SOCKET;
+			}
+			if (accepted != INVALID_SOCKET) {
+				closesocket(accepted);
+				accepted = INVALID_SOCKET;
+			}
+			if (listener != INVALID_SOCKET) {
+				closesocket(listener);
+				listener = INVALID_SOCKET;
+			}
+		};
+		listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+		if (listener == INVALID_SOCKET) {
+			int err = WSAGetLastError();
+			char b[96];
+			std::snprintf(b, sizeof(b), "loopback listener socket err=%d", err);
+			diag = b;
+			test_lab_format::testlab_diag_log_step("verify", "Network stats sanity", "loopback_tcp_probe",
+				"ok=0 phase=listener_socket elapsed_ms=%lu err=%d",
+				static_cast<unsigned long>(GetTickCount() - start_tick),
+				err);
+			return false;
+		}
+		DWORD timeout_ms = 1000u;
+		setsockopt(listener, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+		sockaddr_in bind_addr{};
+		bind_addr.sin_family = AF_INET;
+		bind_addr.sin_port = 0;
+		bind_addr.sin_addr.s_addr = htonl(0x7f000001u);
+		if (bind(listener, reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr)) == SOCKET_ERROR) {
+			int err = WSAGetLastError();
+			char b[96];
+			std::snprintf(b, sizeof(b), "loopback bind err=%d", err);
+			diag = b;
+			test_lab_format::testlab_diag_log_step("verify", "Network stats sanity", "loopback_tcp_probe",
+				"ok=0 phase=bind elapsed_ms=%lu err=%d",
+				static_cast<unsigned long>(GetTickCount() - start_tick),
+				err);
+			cleanup();
+			return false;
+		}
+		if (listen(listener, 1) == SOCKET_ERROR) {
+			int err = WSAGetLastError();
+			char b[96];
+			std::snprintf(b, sizeof(b), "loopback listen err=%d", err);
+			diag = b;
+			test_lab_format::testlab_diag_log_step("verify", "Network stats sanity", "loopback_tcp_probe",
+				"ok=0 phase=listen elapsed_ms=%lu err=%d",
+				static_cast<unsigned long>(GetTickCount() - start_tick),
+				err);
+			cleanup();
+			return false;
+		}
+		int name_len = sizeof(bind_addr);
+		if (getsockname(listener, reinterpret_cast<sockaddr*>(&bind_addr), &name_len) == SOCKET_ERROR) {
+			int err = WSAGetLastError();
+			char b[96];
+			std::snprintf(b, sizeof(b), "loopback getsockname err=%d", err);
+			diag = b;
+			test_lab_format::testlab_diag_log_step("verify", "Network stats sanity", "loopback_tcp_probe",
+				"ok=0 phase=getsockname elapsed_ms=%lu err=%d",
+				static_cast<unsigned long>(GetTickCount() - start_tick),
+				err);
+			cleanup();
+			return false;
+		}
+		const std::uint32_t port = static_cast<std::uint32_t>(ntohs(bind_addr.sin_port));
+		client = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+		if (client == INVALID_SOCKET) {
+			int err = WSAGetLastError();
+			char b[96];
+			std::snprintf(b, sizeof(b), "loopback client socket err=%d", err);
+			diag = b;
+			test_lab_format::testlab_diag_log_step("verify", "Network stats sanity", "loopback_tcp_probe",
+				"ok=0 phase=client_socket elapsed_ms=%lu err=%d port=%u",
+				static_cast<unsigned long>(GetTickCount() - start_tick),
+				err,
+				port);
+			cleanup();
+			return false;
+		}
+		setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+		setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+		if (connect(client, reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr)) == SOCKET_ERROR) {
+			int err = WSAGetLastError();
+			char b[96];
+			std::snprintf(b, sizeof(b), "loopback connect err=%d", err);
+			diag = b;
+			test_lab_format::testlab_diag_log_step("verify", "Network stats sanity", "loopback_tcp_probe",
+				"ok=0 phase=connect elapsed_ms=%lu err=%d port=%u",
+				static_cast<unsigned long>(GetTickCount() - start_tick),
+				err,
+				port);
+			cleanup();
+			return false;
+		}
+		accepted = accept(listener, nullptr, nullptr);
+		if (accepted == INVALID_SOCKET) {
+			int err = WSAGetLastError();
+			char b[96];
+			std::snprintf(b, sizeof(b), "loopback accept err=%d", err);
+			diag = b;
+			test_lab_format::testlab_diag_log_step("verify", "Network stats sanity", "loopback_tcp_probe",
+				"ok=0 phase=accept elapsed_ms=%lu err=%d port=%u",
+				static_cast<unsigned long>(GetTickCount() - start_tick),
+				err,
+				port);
+			cleanup();
+			return false;
+		}
+		const char request[] = "GET /aida-nsts-loopback HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+		int sent = send(client, request, static_cast<int>(sizeof(request) - 1), 0);
+		int send_err = sent == SOCKET_ERROR ? WSAGetLastError() : 0;
+		char recv_buf[256];
+		int recvd = sent == SOCKET_ERROR ? 0 : recv(accepted, recv_buf, sizeof(recv_buf), 0);
+		int recv_err = recvd == SOCKET_ERROR ? WSAGetLastError() : 0;
+		const char response[] = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+		int response_sent = recvd > 0 ? send(accepted, response, static_cast<int>(sizeof(response) - 1), 0) : 0;
+		int response_err = response_sent == SOCKET_ERROR ? WSAGetLastError() : 0;
+		char response_buf[128];
+		int response_recv = response_sent > 0 ? recv(client, response_buf, sizeof(response_buf), 0) : 0;
+		if (response_recv == SOCKET_ERROR) response_recv = 0;
+		char b[192];
+		std::snprintf(b, sizeof(b), "loopback 127.0.0.1:%u sent=%d recv=%d response_sent=%d send_err=%d recv_err=%d response_err=%d",
+			static_cast<unsigned>(port),
+			sent == SOCKET_ERROR ? 0 : sent,
+			recvd == SOCKET_ERROR ? 0 : recvd,
+			response_sent == SOCKET_ERROR ? 0 : response_sent,
+			send_err,
+			recv_err,
+			response_err);
+		diag = b;
+		test_lab_format::testlab_diag_log_step("verify", "Network stats sanity", "loopback_tcp_probe",
+			"ok=%d phase=done elapsed_ms=%lu port=%u sent=%d recv=%d response_sent=%d send_err=%d recv_err=%d response_err=%d",
+			(sent != SOCKET_ERROR && recvd > 0) ? 1 : 0,
+			static_cast<unsigned long>(GetTickCount() - start_tick),
+			port,
+			sent == SOCKET_ERROR ? 0 : sent,
+			recvd == SOCKET_ERROR ? 0 : recvd,
+			response_sent == SOCKET_ERROR ? 0 : response_sent,
+			send_err,
+			recv_err,
+			response_err);
+		cleanup();
+		return sent != SOCKET_ERROR && recvd > 0;
 	}
 
 	bool build_dns_query_packet(const char* host, std::vector<unsigned char>& packet, std::uint16_t& qid, std::string& diag) {
@@ -1194,6 +1356,8 @@ namespace {
 
 		std::string attempted_hosts;
 		std::uint32_t any_io_count = 0u;
+		std::uint32_t tcp_dns_diag_ok_count = 0u;
+		std::uint32_t tcp_dns_enobufs_count = 0u;
 
 		for (std::size_t i = 0; i < kCandidateHostCount; ++i) {
 			if (finish_cancelled())
@@ -1203,38 +1367,46 @@ namespace {
 
 			std::string udp_diag;
 			dns_mark_stage(ctx, dns_log_stage_e::udp_probe);
-			bool lookup_ok = issue_udp_dns_probe_to_one_one(host, udp_diag);
+			bool udp_ok = issue_udp_dns_probe_to_one_one(host, udp_diag);
 			::diag::log_tagged_fmt("verify_dns", "candidate[%zu] udp_done ok=%d diag=%s",
-				i, lookup_ok ? 1 : 0, udp_diag.c_str());
+				i, udp_ok ? 1 : 0, udp_diag.c_str());
 			std::string tcp_diag;
 			dns_mark_stage(ctx, dns_log_stage_e::tcp_probe);
 			bool tcp_ok = issue_tcp_dns_probe_to_one_one(host, tcp_diag);
+			if (tcp_ok)
+				++tcp_dns_diag_ok_count;
+			if (tcp_diag.find("10055") != std::string::npos)
+				++tcp_dns_enobufs_count;
 			::diag::log_tagged_fmt("verify_dns", "candidate[%zu] tcp_done ok=%d diag=%s",
 				i, tcp_ok ? 1 : 0, tcp_diag.c_str());
 			dns_mark_stage(ctx, dns_log_stage_e::windns_probe);
 			bool gai_ok = resolve_host_with_timeout(host, 2000);
 			::diag::log_tagged_fmt("verify_dns", "candidate[%zu] gai_done ok=%d", i, gai_ok ? 1 : 0);
-			lookup_ok = lookup_ok || tcp_ok || gai_ok;
+			const bool authoritative_lookup_ok = udp_ok || gai_ok;
 
 			char label[40];
 			std::snprintf(label, sizeof(label), "step1_gai[%zu]", i);
 			char val[360];
-			std::snprintf(val, sizeof(val), "host=%s ok=%d udp={%s} tcp={%s} gai=%d",
+			std::snprintf(val, sizeof(val), "host=%s authoritative_ok=%d udp_ok=%d tcp_diag_ok=%d udp={%s} tcp={%s} gai=%d",
 				host,
-				lookup_ok ? 1 : 0,
+				authoritative_lookup_ok ? 1 : 0,
+				udp_ok ? 1 : 0,
+				tcp_ok ? 1 : 0,
 				udp_diag.c_str(),
 				tcp_diag.c_str(),
 				gai_ok ? 1 : 0);
 			r.parsed.push_back({ std::string(label), std::string(val) });
 			if (!attempted_hosts.empty()) attempted_hosts.append(",");
 			attempted_hosts.append(host);
-			if (lookup_ok) ++any_io_count;
+			if (authoritative_lookup_ok) ++any_io_count;
 		}
 		if (finish_cancelled())
 			return;
 
 		r.parsed.push_back({ "step1_attempted_hosts", attempted_hosts });
-		r.parsed.push_back({ "step1_any_lookup_attempts", fmt_u32(any_io_count) });
+		r.parsed.push_back({ "step1_authoritative_lookup_attempts", fmt_u32(any_io_count) });
+		r.parsed.push_back({ "step1_tcp_dns_diagnostic_ok", fmt_u32(tcp_dns_diag_ok_count) });
+		r.parsed.push_back({ "step1_tcp_dns_enobufs_diagnostic", fmt_u32(tcp_dns_enobufs_count) });
 
 		std::uint32_t after_total = 0u;
 		std::uint32_t matches_name_and_pid = 0u;
@@ -1363,6 +1535,8 @@ namespace {
 
 		std::uint32_t captured_dns_packets = 0u;
 		std::uint32_t captured_probe_packets = 0u;
+		std::uint32_t captured_udp_probe_packets = 0u;
+		std::uint32_t captured_tcp_probe_packets = 0u;
 		std::uint32_t captured_total_packets = 0u;
 		std::uint32_t capture_batches = 0u;
 		std::uint32_t capture_drain_failures = 0u;
@@ -1411,6 +1585,10 @@ namespace {
 				std::string host_match;
 				if (dns_payload_matches_probe_hosts(p.payload, p.payload_size, kCandidateHosts, kCandidateHostCount, host_match)) {
 					++captured_probe_packets;
+					if (p.protocol == 17u)
+						++captured_udp_probe_packets;
+					else if (p.protocol == 6u)
+						++captured_tcp_probe_packets;
 					if (captured_probe_host.empty())
 						captured_probe_host = host_match;
 				}
@@ -1425,6 +1603,8 @@ namespace {
 		r.parsed.push_back({ "dns_capture_drain_failures", fmt_u32(capture_drain_failures) });
 		r.parsed.push_back({ "captured_dns_packets", fmt_u32(captured_dns_packets) });
 		r.parsed.push_back({ "captured_probe_dns_packets", fmt_u32(captured_probe_packets) });
+		r.parsed.push_back({ "captured_udp_probe_dns_packets", fmt_u32(captured_udp_probe_packets) });
+		r.parsed.push_back({ "captured_tcp_probe_dns_packets_diagnostic", fmt_u32(captured_tcp_probe_packets) });
 		if (!captured_probe_host.empty())
 			r.parsed.push_back({ "captured_probe_host", captured_probe_host });
 
@@ -1469,14 +1649,16 @@ namespace {
 		r.parsed.push_back({ "dns_ndns_self_pid_probe_matches", fmt_u32(combined_self_pid_matches) });
 		r.parsed.push_back({ "dns_ndns_self_or_unknown_probe_matches", fmt_u32(combined_self_or_unknown_matches) });
 		r.parsed.push_back({ "dns_ndns_any_pid_probe_matches", fmt_u32(combined_any_pid_matches) });
-		r.parsed.push_back({ "dns_packet_fallback_probe_matches", fmt_u32(captured_probe_packets) });
+		r.parsed.push_back({ "dns_packet_fallback_probe_matches", fmt_u32(captured_udp_probe_packets) });
+		r.parsed.push_back({ "dns_packet_fallback_probe_matches_total", fmt_u32(captured_probe_packets) });
+		r.parsed.push_back({ "dns_packet_fallback_tcp_probe_matches_diagnostic", fmt_u32(captured_tcp_probe_packets) });
 		r.parsed.push_back({ "dns_packet_fallback_dns_packets", fmt_u32(captured_dns_packets) });
 		const std::string dns_eval_host = !matched_host.empty() ? matched_host : (!captured_probe_host.empty() ? captured_probe_host : attempted_hosts);
 		if (!dns_eval_host.empty()) {
 			r.parsed.push_back({ "dns_eval_hostname", dns_eval_host });
 			r.parsed.push_back({ "dns_hostname", dns_eval_host });
 		}
-		const bool packet_probe_seen = captured_probe_packets > 0u;
+		const bool packet_probe_seen = captured_udp_probe_packets > 0u;
 		const bool ndns_hostname_seen = combined_any_pid_matches > 0u;
 		const bool ndns_pid_attributed = combined_self_or_unknown_matches > 0u;
 		const bool dns_counter_verified = packet_probe_seen && dns_counter_comparable && delta_total_dns_logged > 0u;
@@ -1636,11 +1818,21 @@ namespace {
 		r.parsed.push_back({ "baseline_packets_sent", fmt_u64(base_req.packets_sent) });
 		r.parsed.push_back({ "baseline_packets_received", fmt_u64(base_req.packets_received) });
 
-		std::string probe_diag;
-		bool probed = issue_raw_tcp_probe_to_one_one(probe_diag);
-		r.parsed.push_back({ "probe_initiated", probed ? "1" : "0" });
-		if (!probe_diag.empty()) {
-			r.parsed.push_back({ "probe_diag", probe_diag });
+		std::string loopback_probe_diag;
+		bool loopback_probed = issue_loopback_tcp_stats_probe(loopback_probe_diag);
+		r.parsed.push_back({ "probe_initiated", loopback_probed ? "1" : "0" });
+		r.parsed.push_back({ "primary_probe_mode", "loopback_tcp" });
+		r.parsed.push_back({ "loopback_probe_initiated", loopback_probed ? "1" : "0" });
+		if (!loopback_probe_diag.empty()) {
+			r.parsed.push_back({ "loopback_probe_diag", loopback_probe_diag });
+		}
+
+		std::string external_probe_diag;
+		bool external_probed = issue_raw_tcp_probe_to_one_one(external_probe_diag, 1);
+		r.parsed.push_back({ "external_probe_diagnostic_only", "1" });
+		r.parsed.push_back({ "external_probe_initiated", external_probed ? "1" : "0" });
+		if (!external_probe_diag.empty()) {
+			r.parsed.push_back({ "external_probe_diag", external_probe_diag });
 		}
 
 		std::this_thread::sleep_for(std::chrono::milliseconds(300));
@@ -1679,12 +1871,16 @@ namespace {
 		r.parsed.push_back({ "delta_packets_received", fmt_u64(d_pr) });
 
 		bool any_increase = (d_bs > 0ull) || (d_br_v > 0ull) || (d_ps > 0ull) || (d_pr > 0ull);
-		if (any_increase) {
+		if (loopback_probed && any_increase) {
 			r.ntstatus = 0;
 			r.ok = true;
+		} else if (!loopback_probed) {
+			r.ok = false;
+			r.error = "deterministic loopback TCP stats stimulus failed before NSTS comparison";
+			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
 		} else {
 			r.ok = false;
-			r.error = "NSTS counters did not increase after generating traffic -- stats collection may be broken";
+			r.error = "NSTS counters did not increase after deterministic loopback TCP stimulus -- stats collection may be broken";
 			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
 		}
 	}
@@ -2125,7 +2321,7 @@ TESTLAB_REGISTER(g_reg_verify_dns_log,
 	"verify",
 	test_lab::driver_e::whoswho,
 	"DNS query log round-trip",
-	"NCAP/NDNS around UDP, TCP, and resolver DNS probes -> assert NDNS attributed one probe hostname to the current or unknown PID.",
+	"NCAP/NDNS around UDP and WinDNS probes -> assert NDNS attributed one probe hostname to the current or unknown PID; TCP DNS is recorded as diagnostic-only.",
 	&render_inputs_empty,
 	&run_verify_dns_log);
 
@@ -2133,7 +2329,7 @@ TESTLAB_REGISTER(g_reg_verify_net_stats,
 	"verify",
 	test_lab::driver_e::whoswho,
 	"Network stats sanity",
-	"NSTS baseline -> raw TCP probe to 1.1.1.1:80 -> NSTS again -> assert at least one of bytes_in/out or packets_in/out increased.",
+	"NSTS baseline -> deterministic loopback TCP stimulus with external 1.1.1.1 diagnostic probe -> NSTS again -> assert counters increased.",
 	&render_inputs_empty,
 	&run_verify_net_stats);
 

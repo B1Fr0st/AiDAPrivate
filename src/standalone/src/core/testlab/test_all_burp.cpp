@@ -1628,7 +1628,12 @@ namespace {
     }
 
     bool ensure_content_discovery_fixture(HANDLE hf, const char* tag) {
+        const ULONGLONG list_t0 = GetTickCount64();
+        log_msg(hf, tag, "fixture_content_discovery preflight_list_begin");
         auto jobs = aida::burp::content_discovery::list();
+        log_msg(hf, tag, "fixture_content_discovery preflight_list_end jobs=%zu elapsed_ms=%llu",
+            jobs.size(),
+            static_cast<unsigned long long>(GetTickCount64() - list_t0));
         if (!jobs.empty()) return true;
         if (!ensure_burp_loopback_fixture(hf, tag)) return false;
         aida::burp::content_discovery::initialize();
@@ -1639,16 +1644,22 @@ namespace {
         cfg.request_timeout_ms = 1500;
         cfg.auto_calibrate = false;
         cfg.match_status = {200};
+        const ULONGLONG start_t0 = GetTickCount64();
         uint64_t id = aida::burp::content_discovery::start(cfg);
-        log_msg(hf, tag, "fixture_content_discovery start id=%llu target=%s wordlist=%s err=%s",
+        log_msg(hf, tag, "fixture_content_discovery start id=%llu target=%s wordlist=%s elapsed_ms=%llu err=%s",
             static_cast<unsigned long long>(id), cfg.target_url.c_str(), cfg.wordlist_file.c_str(),
+            static_cast<unsigned long long>(GetTickCount64() - start_t0),
             aida::burp::content_discovery::last_error().c_str());
         if (id == 0)
             return false;
         wait_briefly_for_async_state();
+        const ULONGLONG status_t0 = GetTickCount64();
         auto st = aida::burp::content_discovery::status(id);
-        log_msg(hf, tag, "fixture_content_discovery status id=%llu attempts=%d total=%d hits=%d errors=%d",
-            static_cast<unsigned long long>(id), st.attempts, st.total, st.hits, st.errors);
+        log_msg(hf, tag, "fixture_content_discovery status id=%llu attempts=%d total=%d hits=%d errors=%d phase=%d elapsed_ms=%llu last_error=%s",
+            static_cast<unsigned long long>(id), st.attempts, st.total, st.hits, st.errors,
+            static_cast<int>(st.phase),
+            static_cast<unsigned long long>(GetTickCount64() - status_t0),
+            st.last_error.c_str());
         return true;
     }
 
@@ -3751,12 +3762,23 @@ namespace {
             fail_empty_evidence(hf, tag, failed, "content discovery fixture setup failed before list; startup/probe/action evidence is above");
             return;
         }
+        const ULONGLONG list_t0 = GetTickCount64();
+        log_msg(hf, tag, "final_list_begin");
         auto jobs = aida::burp::content_discovery::list();
-        log_msg(hf, tag, "job count = %zu", jobs.size());
+        log_msg(hf, tag, "job count = %zu elapsed_ms=%llu", jobs.size(),
+            static_cast<unsigned long long>(GetTickCount64() - list_t0));
         if (jobs.empty()) {
             fail_empty_evidence(hf, tag, failed, "content discovery list returned zero jobs after discovery fixture/action should have created a job");
             return;
         }
+        log_msg(hf, tag, "first_job id=%llu phase=%d attempts=%d total=%d hits=%d errors=%d last_error=%s",
+            static_cast<unsigned long long>(jobs.front().id),
+            static_cast<int>(jobs.front().phase),
+            jobs.front().attempts,
+            jobs.front().total,
+            jobs.front().hits,
+            jobs.front().errors,
+            jobs.front().last_error.c_str());
         log_msg(hf, tag, "PASS -- list returned %zu entries", jobs.size());
         passed.fetch_add(1);
     }
